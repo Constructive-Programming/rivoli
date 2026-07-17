@@ -44,6 +44,38 @@ fn scale_at(scale: &[u8], o: usize) -> f32 {
     f32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
 
+/// Accumulate `scalar × row(o)` of an int4 matrix into `acc` (length `i_dim`):
+/// `acc[i] += scalar * (nibble(o,i) - 8) * scale[o]`. The MLA absorb primitive
+/// (colibri `qt_addrow`): folds a query component through one `kv_b` row.
+pub fn addrow(w: &Int4Matrix, o: usize, scalar: f32, acc: &mut [f32]) {
+    debug_assert_eq!(acc.len(), w.i_dim);
+    let rb = row_bytes(w.i_dim);
+    let row = &w.packed[o * rb..(o + 1) * rb];
+    let s = scalar * scale_at(w.scale, o);
+    for (i, a) in acc.iter_mut().enumerate() {
+        *a += nibble(row, i) as f32 * s;
+    }
+}
+
+/// GEMV over a contiguous row range `[row0, row0+y.len())` of an int4 matrix:
+/// `y[j] = scale[row0+j] * Σ_i x[i] * nibble(row0+j, i)`. The MLA value
+/// projection (colibri `qt_matvec_rows`): projects the weighted latent through
+/// `kv_b`'s value rows for one head.
+pub fn matvec_i4_rows(y: &mut [f32], x: &[f32], w: &Int4Matrix, row0: usize) {
+    debug_assert_eq!(x.len(), w.i_dim);
+    debug_assert!(row0 + y.len() <= w.o_dim);
+    let rb = row_bytes(w.i_dim);
+    for (j, yj) in y.iter_mut().enumerate() {
+        let o = row0 + j;
+        let row = &w.packed[o * rb..(o + 1) * rb];
+        let mut acc = 0.0f32;
+        for (i, &xi) in x.iter().enumerate() {
+            acc += xi * nibble(row, i) as f32;
+        }
+        *yj = acc * scale_at(w.scale, o);
+    }
+}
+
 /// Reference GEMV against a validated int4 matrix: `y[o] = scale[o] * Σ_i
 /// x[i] * w(o,i)`, where `w = nibble(o,i)` (the accessor applies the −8
 /// offset). The scale is decoded inline from bytes — no per-expert `Vec<f32>`

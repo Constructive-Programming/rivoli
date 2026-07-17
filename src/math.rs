@@ -26,6 +26,21 @@ pub fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+/// Truncate f32 → bf16 (round to nearest even). The KV cache stores latents in
+/// bf16 — a free 2× on KV bandwidth with no accuracy story (decided 2026-07-18).
+#[inline]
+pub fn f32_to_bf16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let round = ((bits >> 16) & 1) + 0x7fff;
+    ((bits + round) >> 16) as u16
+}
+
+/// Widen bf16 → f32 (exact — bf16 is the high 16 bits of f32).
+#[inline]
+pub fn bf16_to_f32(b: u16) -> f32 {
+    f32::from_bits((b as u32) << 16)
+}
+
 /// In-place softmax over a slice (numerically stable).
 pub fn softmax(v: &mut [f32]) {
     let max = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);

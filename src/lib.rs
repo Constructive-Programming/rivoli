@@ -1,3 +1,4 @@
+pub mod attn;
 pub mod config;
 pub mod hip;
 pub mod math;
