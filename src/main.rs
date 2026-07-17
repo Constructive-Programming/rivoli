@@ -110,8 +110,35 @@ async fn run(cfg: Config) -> Result<()> {
         Err(e) => info!("HIP probe unavailable: {e}"),
     }
 
+    // M1 smoke: run the real int4 weights through the new MLP/MoE path. Embed
+    // the last prompt token and feed it (raw — attention isn't wired yet) into
+    // the dense MLP (layer 0) and the first MoE block. This exercises embedding
+    // + SwiGLU + sigmoid routing on real weights; magnitudes are indicative,
+    // not the final forward (that needs attention + the per-layer norms).
+    let last = prompt_ids.last().copied().context("empty prompt")?;
+    // embed_tokens is int8 (one byte/weight), not int4 — a small distinct class.
+    let embed_bytes = snap.require("model.embed_tokens.weight")?;
+    let embed_scale = snap.require("model.embed_tokens.weight.qs")?;
+    let mut x = vec![0.0f32; mc.hidden];
+    rivoli::quant::dequant_int8_row(embed_bytes, embed_scale, last as usize, &mut x);
+    let l2 = |v: &[f32]| v.iter().map(|&a| a * a).sum::<f32>().sqrt();
+    info!("embed[{last}]: l2={:.3} x[0..3]={:?}", l2(&x), &x[..3]);
+
+    let max_inter = mc.dense_inter.max(mc.moe_inter);
+    let mut scratch = rivoli::moe::MlpScratch::new(mc.hidden, max_inter);
+    let mut out = vec![0.0f32; mc.hidden];
+    rivoli::moe::dense_mlp(&snap, &mc, 0, &x, &mut scratch, &mut out)?;
+    info!("dense MLP L0: l2={:.3} out[0..3]={:?}", l2(&out), &out[..3]);
+    rivoli::moe::moe_block(&snap, &mc, mc.dense_layers, &x, &mut scratch, &mut out)?;
+    info!(
+        "MoE L{}: l2={:.3} out[0..3]={:?}",
+        mc.dense_layers,
+        l2(&out),
+        &out[..3]
+    );
+
     match cfg.bench {
-        Some(n) => info!("bench mode ({n} tokens) — decode engine lands in M1"),
+        Some(n) => info!("bench mode ({n} tokens) — decode loop needs attention next"),
         None => bail!("server mode not yet implemented; use -bench <tokens>"),
     }
     Ok(())

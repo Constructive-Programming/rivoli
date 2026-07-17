@@ -20,6 +20,12 @@ pub fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
+/// Logistic sigmoid — the MoE router's scoring function (scoring_func=sigmoid).
+#[inline]
+pub fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
 /// In-place softmax over a slice (numerically stable).
 pub fn softmax(v: &mut [f32]) {
     let max = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);

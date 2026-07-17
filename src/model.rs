@@ -36,6 +36,9 @@ pub struct ModelConfig {
     pub top_k: usize,
     #[serde(rename = "moe_intermediate_size")]
     pub moe_inter: usize,
+    /// Dense-layer MLP intermediate width (the first `dense_layers` layers).
+    #[serde(rename = "intermediate_size")]
+    pub dense_inter: usize,
     #[serde(rename = "n_shared_experts")]
     pub n_shared: usize,
     /// First `dense_layers` layers are dense MLP, not MoE (first_k_dense_replace).

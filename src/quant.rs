@@ -63,6 +63,31 @@ pub fn matvec_i4(y: &mut [f32], x: &[f32], w: &Int4Matrix) {
     }
 }
 
+/// Dequantize row `row` of a per-row **int8** matrix into `out` (length =
+/// row width): `out[i] = (int8)packed[row*dim + i] * scale[row]`. Used for the
+/// embedding table and lm_head, which the snapshot keeps as int8 (one byte per
+/// weight) rather than int4 — a distinct, small tensor class from the int4
+/// expert weights that dominate per-token traffic.
+pub fn dequant_int8_row(packed: &[u8], scale_bytes: &[u8], row: usize, out: &mut [f32]) {
+    let dim = out.len();
+    let s = scale_at(scale_bytes, row);
+    let base = row * dim;
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = (packed[base + i] as i8) as f32 * s;
+    }
+}
+
+/// Reference GEMV against a plain f32 weight matrix `W[o_dim, i_dim]` (row
+/// major). Used only for the small F32 router gate (`mlp.gate.weight`), which
+/// the snapshot keeps unquantized — everything else is int4.
+pub fn matvec_f32(y: &mut [f32], x: &[f32], w: &[f32], i_dim: usize) {
+    debug_assert_eq!(x.len(), i_dim);
+    debug_assert_eq!(w.len(), y.len() * i_dim);
+    for (yo, row) in y.iter_mut().zip(w.chunks_exact(i_dim)) {
+        *yo = row.iter().zip(x).map(|(&a, &b)| a * b).sum();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

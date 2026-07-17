@@ -16,10 +16,11 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
-/// On-disk element type. The int4 snapshot uses exactly two: `F32` (norm
-/// weights, embeddings, and the per-row int4 scales `.qs`) and `U8` (packed
-/// int4 nibbles, `<name>.weight`). Any other dtype is rejected at index time —
-/// this engine is int4-only by construction.
+/// On-disk element type. The snapshot uses exactly two: `F32` (norm weights,
+/// the router gate, and per-row scales `.qs`) and `U8` (packed int4 expert
+/// nibbles, and the int8 embedding/lm_head). Any other dtype is rejected at
+/// index time. Expert weights are int4-only; the int8 U8 tensors are a small
+/// distinct class reached through their own accessors, never [`Int4Matrix`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dtype {
     F32,
@@ -186,46 +187,42 @@ impl Snapshot {
             .with_context(|| format!("required tensor {name} not found in snapshot"))
     }
 
-    /// Locate an int4 weight matrix by its base name (expects `<name>.weight`
-    /// U8 packed + `<name>.weight.qs` F32 scales). Validates the pairing, the
-    /// dtypes, and the byte lengths — the only constructor of [`Int4Matrix`],
-    /// so every downstream expert read is provably int4.
-    pub fn int4(&self, name: &str) -> Result<Int4Matrix<'_>> {
+    /// Locate an int4 weight matrix `W[o_dim, i_dim]` by base name (expects
+    /// `<name>.weight` U8 packed nibbles + `<name>.weight.qs` F32 per-row
+    /// scales). Weight/scale tensors are stored 1-D (raw byte/element counts,
+    /// not `[o,i]`), so `i_dim` — known from the model config (hidden or
+    /// moe_inter) — is supplied; `o_dim` is derived from the scale count and
+    /// cross-checked against the packed byte count, which also rejects a tensor
+    /// that isn't int4-packed (e.g. an int8 embedding). Only constructor of
+    /// [`Int4Matrix`], so every downstream expert read is a valid int4 matrix.
+    pub fn int4(&self, name: &str, i_dim: usize) -> Result<Int4Matrix<'_>> {
         let wname = format!("{name}.weight");
         let sname = format!("{name}.weight.qs");
-        let wloc = self
+        let wdt = self
             .index
             .get(&wname)
-            .with_context(|| format!("int4 weight {wname} not found"))?;
-        let sloc = self
+            .with_context(|| format!("int4 weight {wname} not found"))?
+            .dtype;
+        let sdt = self
             .index
             .get(&sname)
-            .with_context(|| format!("int4 scale {sname} not found"))?;
-        if wloc.dtype != Dtype::U8 {
-            bail!("{wname} is {:?}, expected U8 packed int4", wloc.dtype);
+            .with_context(|| format!("int4 scale {sname} not found"))?
+            .dtype;
+        if wdt != Dtype::U8 {
+            bail!("{wname} is {wdt:?}, expected U8 packed int4");
         }
-        if sloc.dtype != Dtype::F32 {
-            bail!("{sname} is {:?}, expected F32 scale", sloc.dtype);
+        if sdt != Dtype::F32 {
+            bail!("{sname} is {sdt:?}, expected F32 scale");
         }
-        // Weight shape is [o_dim, i_dim]; scale is [o_dim].
-        let [o_dim, i_dim] = match wloc.shape.as_slice() {
-            &[o, i] => [o, i],
-            other => bail!("{wname} shape {other:?} is not 2-D"),
-        };
         let packed = self.require(&wname)?;
         let scale = self.require(&sname)?;
+        let o_dim = scale.len() / 4;
         let want_packed = o_dim * crate::quant::row_bytes(i_dim);
         if packed.len() != want_packed {
             bail!(
-                "{wname}: {} packed bytes, expected {want_packed}",
+                "{wname}: {} packed bytes for o_dim={o_dim} i_dim={i_dim}, expected {want_packed} \
+                 (wrong i_dim, or tensor isn't int4)",
                 packed.len()
-            );
-        }
-        if scale.len() != o_dim * 4 {
-            bail!(
-                "{sname}: {} scale bytes, expected {}",
-                scale.len(),
-                o_dim * 4
             );
         }
         Ok(Int4Matrix {
