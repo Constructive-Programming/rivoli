@@ -54,8 +54,37 @@ async fn run(cfg: Config) -> Result<()> {
     // Model dimensions from config.json.
     let mc = rivoli::model::ModelConfig::load(&cfg.snapshot)?;
     info!(
-        "model: {} layers ({} dense) hidden={} experts={} top{} moe_inter={} vocab={}",
-        mc.n_layers, mc.dense_layers, mc.hidden, mc.n_experts, mc.top_k, mc.moe_inter, mc.vocab
+        "model: {} layers ({} dense) hidden={} heads={} experts={} top{} moe_inter={} vocab={}",
+        mc.n_layers,
+        mc.dense_layers,
+        mc.hidden,
+        mc.n_heads,
+        mc.n_experts,
+        mc.top_k,
+        mc.moe_inter,
+        mc.vocab
+    );
+    info!(
+        "mla: q_lora={} kv_lora={} qk={}+{} v_head={} rope_theta={}",
+        mc.q_lora_rank,
+        mc.kv_lora_rank,
+        mc.qk_nope_head_dim,
+        mc.qk_rope_head_dim,
+        mc.v_head_dim,
+        mc.rope_theta()
+    );
+
+    // Tokenizer (tokenizer.json). Round-trip the fixed bench prompt as a
+    // liveness check. Bench input is fixed by design — it's a benchmark, not a
+    // knob; real prompts arrive via the server API (later).
+    const BENCH_PROMPT: &str = "The sky is blue because";
+    let tok = rivoli::tokenizer::Tokenizer::load(&cfg.snapshot)?;
+    let prompt_ids = tok.encode(BENCH_PROMPT)?;
+    info!(
+        "tokenizer: prompt {BENCH_PROMPT:?} -> {} tokens {:?}; eos={:?}",
+        prompt_ids.len(),
+        &prompt_ids[..prompt_ids.len().min(12)],
+        tok.eos
     );
 
     // M0 gate: mmap + index every shard, under 5s.

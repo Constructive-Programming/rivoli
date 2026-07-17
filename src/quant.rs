@@ -14,6 +14,17 @@ pub fn row_bytes(i_dim: usize) -> usize {
     i_dim.div_ceil(2)
 }
 
+/// Read an F32 tensor's raw little-endian bytes into a `Vec<f32>`. Used for
+/// norm weights and per-row int4 scales (the `.qs` tensors). Copies — these
+/// are small (O values), and the mmap has no 4-byte alignment guarantee, so a
+/// zero-copy cast would be unsound.
+pub fn read_f32(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
 /// Decode one nibble at column `i` of a packed row.
 #[inline]
 fn nibble(row: &[u8], i: usize) -> i32 {
@@ -95,6 +106,16 @@ mod tests {
         // row0: (1-2+3+0)=2 *0.5 = 1.0 ; row1: (-1+4-8+7)=2 *2.0 = 4.0
         assert!((y[0] - 1.0).abs() < 1e-6, "y0={}", y[0]);
         assert!((y[1] - 4.0).abs() < 1e-6, "y1={}", y[1]);
+    }
+
+    #[test]
+    fn read_f32_roundtrips() {
+        let vals = [1.5f32, -2.25, 0.0, 3.75];
+        let mut bytes = Vec::new();
+        for v in vals {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(read_f32(&bytes), vals);
     }
 
     #[test]
