@@ -1,0 +1,28 @@
+[package]
+name = "rolibri"
+version = "0.1.0"
+edition = "2024"
+description = "GLM-5.2 MoE decode engine for AMD Strix Halo — Rust + tokio streaming + HIP/ROCm"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+memmap2 = "0.9"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+default = []
+rocm = []          # build.rs compiles kernels/*.hip via hipcc when enabled
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+[profile.release]
+lto = true
+opt-level = 3
