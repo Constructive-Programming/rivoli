@@ -247,6 +247,45 @@ is revisited only for the future batched/server path (S>1 rows share weights).
 - **M6 (stretch) — NPU dense offload; device-tier stability ladder toward the
   full pin.**
 
+## M3 kernel contracts (locked by the M2 review)
+
+The M2 kernels are the correctness oracle; M3 rewrites them for residency. Two of
+these must change *before* wiring the resident tier or they silently reintroduce
+colibri's copy-pool (bottleneck #2). Numbers below are per-token at GLM-5.2 dims
+(hidden 6144, dense_inter 12288, moe_inter 2048, n_shared 1, 64 heads, 78 layers,
+kv_lora 512, 200k KV) and ~60 GB/s effective streaming.
+
+- **D1 (MoE signature → per-expert descriptor array) — MUST FIX for M3.** The M2
+  kernel addresses expert `e` as `base + e*stride`, assuming all batched experts
+  are contiguous and each projection is one flat array. In M3 the routed experts
+  live at arbitrary pin-pool offsets; satisfying the contiguous signature forces
+  a gather+stage+re-read repack ≈ 34 GB/token (~3× the 11.3 GB honest budget).
+  Fix: pass a descriptor `{gate_ptr,up_ptr,down_ptr,gate_scale,up_scale,down_scale,
+  inter,hidden}` per block so the kernel dereferences whatever the pin/slab holds
+  and reads the weights once. (The batch-union `atomicAdd`-into-one-`out` shape is
+  already M3-correct.)
+- **D2 (attention → token-tiled flash) — MUST FIX for M3** (this is the deferred
+  P1; the review confirms it is mandatory, not a nicety). One-thread-per-head
+  re-streams the whole KV cache H≈64× ⇒ ~1.5 TB/token at 200k (fatal). Fix:
+  stage each `L_t` tile into LDS once and let all heads in the block consume it —
+  H× DRAM → 1× DRAM + H× LDS. The `Lc/Rc + nt` signature is already the resident
+  per-layer KV-slab shape, so only the loop changes, not the interface.
+- **D3 (wave-coalesced weight load) — M3 perf.** Row-per-thread makes adjacent
+  lanes read addresses `rb_h`≈3 KB apart, so wavefront loads don't burst-coalesce
+  — a cap on the achievable fraction of the ~225 GB/s peak. Fix: cooperative
+  wave32 co-load of a row's bytes into LDS/regs then reduce; int4 packing stays
+  bit-locked (quant.rs). Prototype alongside D1 (same inner loop).
+- **D6 (fold the shared expert into the routed batch) — M3 launch-count.** With
+  n_shared=1, the shared expert's inter (2048) equals the routed inter, so it can
+  be the 9th block of the routed batch (weight 1.0) instead of its own launch —
+  folds ~78 launches/token toward the ≤100 budget. If a future config has
+  n_shared>1, D1's descriptor array handles the mixed width instead.
+
+Confirmed M2-ok (no change): `x` re-read from L2 in MoE phase A (<0.1% of budget);
+the attention `out[i]` RMW accumulator (2 KB/head, L2-resident — the P1 note
+targets the *KV* read, not this); per-call `hipMemcpy` (M4 resident-slab replaces
+it, no signature change needed).
+
 ## Risks
 
 | Risk | Mitigation |
