@@ -24,6 +24,20 @@ unsafe extern "C" {
         wexpert: *const f32,
         out: *mut f32,
     ) -> i32;
+
+    #[allow(clippy::too_many_arguments)]
+    fn rivoli_mla_attend(
+        qabs: *const f32,
+        qrope: *const f32,
+        lc: *const u16,
+        rc: *const u16,
+        h: i32,
+        nt: i32,
+        kvl: i32,
+        rope: i32,
+        scale: f32,
+        clat: *mut f32,
+    ) -> i32;
 }
 
 /// Liveness probe: launch the axpy kernel and confirm the device computed the
@@ -125,4 +139,71 @@ pub fn moe_experts(
         bail!("rivoli_moe_experts failed (code {r})");
     }
     Ok(out)
+}
+
+/// MLA flash attention over the compressed KV cache: for each head, returns the
+/// attention-weighted latent `clat_h = Σ_t softmax((qabs_h·L_t + qrope_h·R_t)·
+/// scale)·L_t` as `H` contiguous `kvl`-length rows. `lc`/`rc` are the bf16 cache
+/// (`nt` rows of `kvl`/`rope`). Query-side absorb through `kv_b` and the value
+/// projection back stay on the reference path for M2; this validates the
+/// long-context score/softmax/weighted-sum kernel against the scalar oracle.
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+pub fn mla_attend(
+    qabs: &[f32],
+    qrope: &[f32],
+    lc: &[u16],
+    rc: &[u16],
+    h: usize,
+    nt: usize,
+    kvl: usize,
+    rope: usize,
+    scale: f32,
+) -> Result<Vec<f32>> {
+    anyhow::ensure!(
+        qabs.len() == h * kvl,
+        "qabs len {} != h*kvl {}",
+        qabs.len(),
+        h * kvl
+    );
+    anyhow::ensure!(
+        qrope.len() == h * rope,
+        "qrope len {} != h*rope {}",
+        qrope.len(),
+        h * rope
+    );
+    anyhow::ensure!(
+        lc.len() == nt * kvl,
+        "lc len {} != nt*kvl {}",
+        lc.len(),
+        nt * kvl
+    );
+    anyhow::ensure!(
+        rc.len() == nt * rope,
+        "rc len {} != nt*rope {}",
+        rc.len(),
+        nt * rope
+    );
+    let mut clat = vec![0.0f32; h * kvl];
+    // SAFETY: every pointer is valid for the length asserted above; the C
+    // launcher copies inputs in, launches, writes exactly h*kvl floats into
+    // `clat`, and frees its device allocations before returning.
+    let r = unsafe {
+        rivoli_mla_attend(
+            qabs.as_ptr(),
+            qrope.as_ptr(),
+            lc.as_ptr(),
+            rc.as_ptr(),
+            h as i32,
+            nt as i32,
+            kvl as i32,
+            rope as i32,
+            scale,
+            clat.as_mut_ptr(),
+        )
+    };
+    if r != 0 {
+        bail!("rivoli_mla_attend failed (code {r})");
+    }
+    Ok(clat)
 }

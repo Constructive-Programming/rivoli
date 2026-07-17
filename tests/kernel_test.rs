@@ -9,7 +9,7 @@
 // A test binary: expect/panic on setup failure is the correct, readable idiom.
 #![allow(clippy::expect_used)]
 
-use rivoli::math::silu;
+use rivoli::math::{bf16_to_f32, f32_to_bf16, silu, softmax};
 use rivoli::quant::{matvec_i4, row_bytes};
 use rivoli::snapshot::Int4Matrix;
 
@@ -171,4 +171,89 @@ fn moe_batch_matches_scalar_odd_dims() {
 fn moe_batch_single_expert() {
     // Batch of one: isolates the fused path from cross-expert accumulation.
     check(0xdead_beef, 512, 256, 1);
+}
+
+/// Scalar reference for the MLA latent attention core, mirroring attn.rs: score
+/// each cached token (kvl dot then rope dot, bf16 widened), two-pass softmax,
+/// weighted sum of latents. The kernel's flash online-softmax must reproduce it.
+#[allow(clippy::too_many_arguments)]
+fn attend_reference(
+    qabs: &[f32],
+    qrope: &[f32],
+    lc: &[u16],
+    rc: &[u16],
+    h: usize,
+    nt: usize,
+    kvl: usize,
+    rope: usize,
+    scale: f32,
+) -> Vec<f32> {
+    let mut clat = vec![0.0f32; h * kvl];
+    let mut scores = vec![0.0f32; nt];
+    for head in 0..h {
+        let qa = &qabs[head * kvl..(head + 1) * kvl];
+        let qr = &qrope[head * rope..(head + 1) * rope];
+        for (t, sc) in scores.iter_mut().enumerate() {
+            let lrow = &lc[t * kvl..(t + 1) * kvl];
+            let rrow = &rc[t * rope..(t + 1) * rope];
+            let mut a = 0.0f32;
+            for (i, &lb) in lrow.iter().enumerate() {
+                a += qa[i] * bf16_to_f32(lb);
+            }
+            for (d, &rb) in rrow.iter().enumerate() {
+                a += qr[d] * bf16_to_f32(rb);
+            }
+            *sc = a * scale;
+        }
+        softmax(&mut scores);
+        let out = &mut clat[head * kvl..(head + 1) * kvl];
+        for (t, &sc) in scores.iter().enumerate() {
+            let lrow = &lc[t * kvl..(t + 1) * kvl];
+            for (i, &lb) in lrow.iter().enumerate() {
+                out[i] += sc * bf16_to_f32(lb);
+            }
+        }
+    }
+    clat
+}
+
+fn check_attend(seed: u64, h: usize, nt: usize, kvl: usize, rope: usize) {
+    let mut rng = Lcg(seed);
+    let qabs: Vec<f32> = (0..h * kvl).map(|_| rng.f()).collect();
+    let qrope: Vec<f32> = (0..h * rope).map(|_| rng.f()).collect();
+    // Cache values round-tripped through bf16 so kernel and reference widen the
+    // exact same u16 bits — the only algorithmic difference under test is the
+    // flash (online) vs two-pass softmax.
+    let lc: Vec<u16> = (0..nt * kvl).map(|_| f32_to_bf16(rng.f())).collect();
+    let rc: Vec<u16> = (0..nt * rope).map(|_| f32_to_bf16(rng.f())).collect();
+    let scale = 1.0 / ((kvl + rope) as f32).sqrt();
+
+    let want = attend_reference(&qabs, &qrope, &lc, &rc, h, nt, kvl, rope, scale);
+    let got = rivoli::hip::mla_attend(&qabs, &qrope, &lc, &rc, h, nt, kvl, rope, scale)
+        .expect("attention kernel launch");
+
+    let max_ref = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let max_err = want
+        .iter()
+        .zip(&got)
+        .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+    let tol = 1e-3 * max_ref + 1e-4;
+    assert!(
+        max_err <= tol,
+        "h={h} nt={nt} kvl={kvl} rope={rope}: max_err={max_err:.3e} tol={tol:.3e} (max_ref={max_ref:.3e})"
+    );
+}
+
+#[test]
+fn mla_attend_matches_scalar_glm_dims() {
+    // GLM MLA: kv_lora=512, qk_rope=64, a few hundred cached tokens.
+    check_attend(0x0a5e_1102, 16, 300, 512, 64);
+}
+
+#[test]
+fn mla_attend_matches_scalar_tiny() {
+    // Small/odd: single cached token and short context stress the online-softmax
+    // init (m=-inf on the first token) and tail behavior.
+    check_attend(0x00c0_ffee, 4, 1, 32, 8);
+    check_attend(0xfeed_face, 3, 17, 40, 8);
 }
