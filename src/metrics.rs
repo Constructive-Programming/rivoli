@@ -1,7 +1,8 @@
 //! Per-token profile buckets, colibri-PROFILE-style. Two hard rules from the
-//! campaign: (1) every report begins with the full config line; (2) a "GPU
-//! run" with zero kernel launches is reported as CPU FALLBACK, loudly — the
-//! silent-fallback runs cost us a day of wrong conclusions.
+//! campaign: (1) every report begins with the full discovered config; (2) the
+//! GPU is the ONLY engine — a run that finishes with zero kernel launches is
+//! an ERROR, not a fallback (the silent-CPU runs of the colibri campaign cost
+//! a day of wrong conclusions and are impossible by construction here).
 
 use std::time::Duration;
 
@@ -13,9 +14,9 @@ pub struct Profile {
     pub router: Duration,
     pub sample: Duration,
     pub other: Duration,
-    /// GPU kernel launches actually submitted. Zero + rocm feature on = fallback.
+    /// GPU kernel launches actually submitted. Budget: ≤100 per token.
     pub gpu_launches: u64,
-    /// Expert cache/pin hits and total activations, for the hit-rate line.
+    /// Expert residency hits (device tier + host slab) and total activations.
     pub hits: u64,
     pub activations: u64,
 }
@@ -28,12 +29,17 @@ impl Profile {
         self.hits as f64 / self.activations as f64
     }
 
+    /// Single-engine invariant: a completed run must have launched kernels.
+    pub fn engine_engaged(&self) -> bool {
+        self.gpu_launches > 0
+    }
+
     pub fn report(&self, tokens: usize, wall: Duration) -> String {
         let toks = tokens as f64 / wall.as_secs_f64().max(1e-9);
-        let engine = if self.gpu_launches > 0 {
+        let engine = if self.engine_engaged() {
             "gpu"
         } else {
-            "CPU-FALLBACK"
+            "ERROR-NO-GPU-LAUNCHES"
         };
         format!(
             "decode {tokens} tokens in {:.2}s ({toks:.2} tok/s) | hit {:.1}% | engine={engine} launches={} \

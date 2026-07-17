@@ -34,9 +34,9 @@ Every number below was measured on this box, July 15–17 2026.
    Mitigations that must be *designed in*, not bolted on:
    - allocate the device tier **once at startup** and never again (first-alloc
      of a fresh context is far safer; mid-session re-allocations are what die);
-   - never share the GPU with llama-swap (its 21 GB GTT load mid-run was the
-     aggravator behind most wedges) — refuse to start if
-     `mem_info_gtt_used` > threshold;
+   - **sole-tenant rule**: never share the GPU with another process (a 21 GB
+     foreign GTT allocation landing mid-run was the aggravator behind most
+     wedges) — refuse to start if `mem_info_gtt_used` shows another tenant;
    - watchdog for D-state + `drm_suballoc` wchan stays in the runner.
 7. **Boot params that matter** (already on rh-anine): `ttm.pages_limit=26214400`
    `ttm.page_pool_size=1048576` `transparent_hugepage=madvise` `amd_iommu=off`
@@ -51,6 +51,52 @@ Every number below was measured on this box, July 15–17 2026.
   unified LPDDR5X): **~5 tok/s ceiling** → 1 tok/s has 5× margin. The whole
   game is keeping engines fed and dispatches coarse.
 
+### The four bottlenecks — the design wins by removing them
+
+Every module decision answers to one of these; anything that serves none of
+them is cut.
+
+1. **NVMe bandwidth** — never on the critical path: 95%+ residency via the
+   usage-ranked pin, misses prefetched by the pilot ahead of need, demand
+   fetches overlapped with resident compute. Disk time budget: ≤5% of a token.
+2. **RAM bandwidth** — the only *honest* limit (11.3 GB/token). Spend it once:
+   weights stream through exactly one engine per layer, no double reads, no
+   host↔device copies (unified memory, zero-copy by construction).
+3. **Synchronization points** — colibri died here (~920k barriers/run,
+   4800 GPU submits, one big fence per layer-chunk). Budget: ≤100 kernel
+   launches and ≤1 join point per token; feed↔decode contact is lock-free
+   bounded channels only.
+4. **Synchronization cost** — what remains must be cheap: no fork/join pools
+   (persistent workers), no fence spins (HIP events + async streams), no
+   SMT-oversubscription (pool = physical cores, sized once at startup).
+
+## Zero-knob operation
+
+**No environment variables. One flag.**
+
+```
+rolibri <snapshot-dir> -bench <tokens>     # benchmark mode: decode N tokens, print PROFILE
+rolibri <snapshot-dir>                     # (later) OpenAI-compatible server mode
+```
+
+Everything else is **auto-discovered at startup** and printed as the first
+line of the run:
+
+- **Memory budget** = `MemAvailable` − **16 GB OS reserve** − engine overhead
+  (dense weights ~9.6 GB, KV cache, slab pool, dispatch scratch — computed
+  from the snapshot config, not guessed). What remains is the expert pin,
+  filled byte-accurately from the usage ranking, hottest first.
+- **Device tier** = as much of the pin as the GPU can hold, from live free
+  GTT/unified memory at startup (single allocation, sole tenant already
+  verified). A stability ladder may cap it from *observed* device-loss data,
+  never from a config knob.
+- **Feed pool** (tokio workers + pread tasks) = physical cores ÷ 2 (the
+  measured optimum; SMT-logical count is the proven pathology). Detected,
+  not configured. The CPU never computes experts — it routes, samples, and
+  keeps the GPU fed.
+- **Usage ranking** = `<snapshot>/.coli_usage`, read at startup, accumulated
+  during the run, written back at exit.
+
 ## Architecture
 
 Single crate, flat modules (ollama-router layout), edition 2024, tokio.
@@ -62,9 +108,9 @@ rolibri/
   kernels/
     moe_fused.hip       # per-layer fused batch: int4 dequant × (gate,up) → silu⊙ → down → weighted-accum
   src/
-    main.rs             # CLI: rolibri <snapshot> [--ngen N]; tokio runtime (multi_thread, workers = cfg)
+    main.rs             # CLI: rolibri <snapshot> [-bench N]; tokio runtime (multi_thread, workers = discovered)
     lib.rs
-    config.rs           # env-first config (RAM_GB, PIN_GB, DEV_GB, THREADS, …) — printed in full at startup
+    config.rs           # zero-knob auto-discovery (memory budgets, device tier, CPU pool) — printed in full at startup
     snapshot.rs         # safetensors mmap; tensor index; int4/int8 layouts (colibri-compatible snapshot)
     usage.rs            # .coli_usage reader/writer — pin ranking + online accumulation
     pin.rs              # resident store: device tier + host tier, built ONCE at startup
@@ -73,12 +119,12 @@ rolibri/
     router.rs           # gate softmax + top-8 (CPU, trivial)
     hip.rs              # minimal HIP FFI (hand-rolled extern "C": hipMalloc/Memcpy/LaunchKernel/Stream/Event)
     moe.rs              # per-layer batch-union assembly → ONE fused kernel launch per layer
-    cpu.rs              # AVX-512 VNNI int4 GEMV fallback path; fixed 8-thread pool (NO per-matmul fork/join)
-    attn.rs             # MLA attention (CPU first; NPU candidate later)
+    attn.rs             # MLA attention (HIP kernels; NPU candidate later)
     engine.rs           # decode loop; per-token profile buckets
     metrics.rs          # colibri-style PROFILE line + submit/launch counters; refuses to report a "GPU run" with 0 launches
   tests/
-    kernel_test.rs      # GPU kernel vs CPU reference, per-layer bit-exactness tolerance
+    reference.rs        # scalar CPU reference impl (TEST-ONLY: kernel correctness oracle)
+    kernel_test.rs      # GPU kernel vs scalar reference, per-layer tolerance
     stream_test.rs      # backpressure/ordering of the feed pipeline
   build.sh test.sh .githooks/   # ollama-router conventions; version-guarded build
 ```
@@ -100,9 +146,22 @@ Async owns the **feed side**, where colibri serialized and starved:
   misses are queued to the pread pool (spawn_blocking / io-uring later), decode
   overlaps GPU compute of resident experts with fetch of the ~5% cold set — the
   measured colibri pattern (PIPE + VK_OVERLAP) rebuilt on honest primitives.
+
+**NVMe → iGPU direct (the unified-memory play).** The slab pool is allocated
+once as *cacheable, coherent* GPU-visible unified memory (`hipHostMalloc`,
+APU-coherent path). NVMe reads land **directly in those slabs** and the fused
+kernels consume them in place — the byte path is NVMe DMA → LPDDR5X → GPU
+read, with **zero intermediate copies** (colibri paid a memcpy per cold expert
+into its copy-pool, and its design-c attempt at direct pread died on
+write-combined/uncached Vulkan mappings — the HIP coherent path is the fix
+this hardware actually offers). Refinement inside M4: io_uring with O_DIRECT
+into the registered slabs, so cold-tail experts skip the page cache entirely
+(they are rarely re-read at 95% residency; skipping saves the page-cache
+copy and halves the RAM traffic of every miss).
 - Bounded channels give backpressure for free; no unbounded queue can OOM us.
-- The GPU stream is fed via HIP events; CPU cold-set compute joins by channel,
-  not pthread_join.
+- The GPU stream is fed via HIP events; cold-set fetches land in unified-memory
+  slabs the same fused kernels consume — completion joins by channel, never
+  pthread_join.
 
 ### GPU strategy (gfx1151-specific)
 
@@ -110,23 +169,27 @@ Async owns the **feed side**, where colibri serialized and starved:
   token, vs colibri's ~4800 submits): kernel takes the batch-union of routed
   experts (device-resident weights, indices, per-row weights) and does
   dequant→gate/up→silu→down→accumulate in LDS-tiled wave32 workgroups.
-- Weights live in **unified device memory allocated once** (hipMalloc up to
-  DEV_GB; start 32 GB — never device-lost in 3 days of testing — grow to 48/64
-  only as stability data accumulates; the rest of the 64 GB pin stays host-side
-  for the CPU path).
+- Weights live in **unified device memory allocated once**, sized from live
+  free memory at startup (see Zero-knob operation); the remainder of the pin
+  stays in host-side unified slabs the GPU reads zero-copy on demand. A
+stability ladder caps the device tier only from
+  *observed* device-loss events, never from configuration.
 - rocBLAS/hipBLASLt have no int4 GEMV path worth using at batch-1 — custom
   kernel from the start; correctness pinned by `kernel_test.rs` against cpu.rs.
-- `HSA_OVERRIDE_GFX_VERSION` not needed (gfx1151 native in current ROCm), but
-  config plumbs HSA env through and prints it.
+- `HSA_OVERRIDE_GFX_VERSION` not needed (gfx1151 native in current ROCm).
 
-### CPU path is a first-class citizen, not a fallback
+### One engine — no CPU fallback
 
-0.87 tok/s @ 8 threads is the bar the GPU must beat per-layer. `cpu.rs` uses a
-**fixed worker pool = physical-core count (default 8)**, parallelism *across*
-experts (one expert per task), silu/accumulate inside the task — zero global
-barriers per token. Engine picks GPU/CPU **per layer** from live measurements
-(first 16 tokens are a calibration window), so the faster engine wins
-empirically, per this machine, per run.
+The GPU is the only compute path. Cold (non-resident) experts are fetched into
+unified-memory slabs the GPU reads zero-copy, and the same per-layer fused
+kernel consumes resident and freshly-fetched experts alike — one code path,
+no engine chooser, no divergent numerics. The CPU's jobs are exactly: routing
+(softmax/top-8), sampling, and driving the feed pipeline. A scalar CPU
+implementation exists **only in tests** as the correctness reference for the
+kernels (colibri's measured 0.87 tok/s CPU number remains the external
+sanity bar the GPU must clear, but it is not shipped code). Zero kernel
+launches in a run is a **hard error**, not a fallback — the silent-CPU runs
+of the colibri campaign are impossible by construction.
 
 ### NPU (stretch, M6)
 
@@ -136,39 +199,44 @@ scope until ≥1 tok/s is banked.
 
 ## Milestones — each gated on a measured number
 
-- **M0 — toolchain + skeleton.** Emerge HIP (`dev-util/hip`, hipcc) on
-  rh-anine; `cargo check` clean; snapshot mmap + tensor index reads GLM-5.2
-  snapshot; config prints full env. *Gate: parse + index the snapshot < 5 s.*
-- **M1 — CPU reference decode.** router + cpu.rs + attn.rs + engine.rs; pin.rs
-  host tier from `.coli_usage`. *Gate: coherent 32-token output; ≥ 0.8 tok/s
-  CPU-only (colibri parity with sane threading).*
-- **M2 — HIP kernel correctness.** `moe_fused.hip` vs CPU reference.
-  *Gate: max abs error within int4 dequant tolerance on all 75 layers.*
-- **M3 — GPU resident tier.** One-shot 32 GB device tier, per-layer fused
+- **M0 — toolchain + skeleton.** HIP (hipcc) installed on rh-anine;
+  `cargo check` clean; snapshot mmap + tensor index reads GLM-5.2 snapshot;
+  auto-discovered config printed as first line. *Gate: parse + index the
+  snapshot < 5 s.*
+- **M1 — reference decode (test-only path).** router + engine skeleton + pin.rs
+  from `.coli_usage`; scalar reference impl in `tests/`. *Gate: coherent
+  32-token output through the reference path (correctness, not speed).*
+- **M2 — HIP kernel correctness.** `moe_fused.hip` + attention kernels vs the
+  scalar reference. *Gate: max abs error within int4 dequant tolerance on all
+  75 layers.*
+- **M3 — GPU resident tier.** One-shot auto-sized device tier, per-layer fused
   launches, calibration chooser. *Gate: ≥ 1.0 tok/s over 128 tokens, launch
   count ≤ 100/token, zero DEVICE_LOST.*
 - **M4 — streaming feed.** pilot.rs + cold-set overlap + usage accumulation.
   *Gate: ≥ 1.0 tok/s sustained over 512 tokens at ≥ 93% hit; disk wait
   ≤ 5% of token time.*
-- **M5 — hardening.** GTT co-tenancy guard, wedge watchdog in-process, PROFILE
-  metrics + optional OTLP (ollama-router telemetry pattern), build.sh/test.sh,
-  git hooks. *Gate: 3 consecutive 512-token runs, variance < 10%, llama-swap
-  loaded on purpose → clean refusal, not a wedge.*
-- **M6 (stretch) — NPU dense offload; DEV_GB 48/64 stability ladder.**
+- **M5 — hardening.** Sole-tenant guard, wedge watchdog in-process, PROFILE
+  metrics + optional OTLP (telemetry pattern from the router project),
+  build.sh/test.sh, git hooks. *Gate: 3 consecutive 512-token runs, variance
+  < 10%; a foreign GPU tenant present at startup → clean refusal, not a wedge.*
+- **M6 (stretch) — NPU dense offload; device-tier stability ladder toward the
+  full pin.**
 
 ## Risks
 
 | Risk | Mitigation |
 |---|---|
-| ROCm gfx1151 maturity (known PERMISSION_FAULT reports upstream) | one-shot allocation; calibration chooser means CPU path always shippable; kernel bug watchdog |
-| Same amdgpu underneath → BO_VA -12 class bugs reachable from HIP too | DEV_GB=32 default; single allocation; GTT guard; grow tier only with stability data |
+| ROCm gfx1151 maturity (known PERMISSION_FAULT reports upstream) | one-shot allocation; kernel-bug watchdog; single-engine design means a driver regression blocks loudly instead of silently degrading |
+| Same amdgpu underneath → BO_VA -12 class bugs reachable from HIP too | single startup allocation; sole-tenant guard; stability ladder grows the tier only from observed device-loss data |
 | hipcc/Gentoo packaging friction | M0 is exactly this, nothing else blocks on it; CPU milestones (M1) proceed in parallel |
 | int4 layout mismatch vs colibri snapshot | snapshot.rs ports colibri's exact packing (glm.c `pack_int4`); kernel_test locks it |
 
 ## Conventions
 
 - **No `unwrap`/`expect` outside tests** (workspace lint, deny).
-- Every benchmark/report prints its **full env + config line first** and its
+- **No environment variables, no config files** — one CLI flag (`-bench`);
+  everything else discovered and printed.
+- Every benchmark/report prints its **full discovered config first** and its
   engine engagement counters (launches, submits) — a "GPU number" with zero
   launches is reported as CPU fallback, loudly.
 - ollama-router repo conventions: flat modules, `tests/`, `.githooks`
