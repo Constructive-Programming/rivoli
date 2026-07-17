@@ -19,10 +19,9 @@ extern "C" int rivoli_probe(int n) {
     if (hipMalloc(&dy, bytes) != hipSuccess) { hipFree(dx); return -2; }
     if (hipMemset(dx, 0, bytes) != hipSuccess) { hipFree(dx); hipFree(dy); return -3; }
     if (hipMemset(dy, 0, bytes) != hipSuccess) { hipFree(dx); hipFree(dy); return -4; }
-    // dx = 1.0f everywhere via a tiny host copy of one page.
+    // Set dx[0] = 1.0f (the only element we read back); the rest stay 0.
     float one = 1.0f;
-    for (int i = 0; i < n && i < 1; ++i)
-        (void)hipMemcpy(dx, &one, sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(dx, &one, sizeof(float), hipMemcpyHostToDevice);
 
     dim3 block(256), grid((n + 255) / 256);
     hipLaunchKernelGGL(axpy, grid, block, 0, 0, 2.0f, dx, dy, n);

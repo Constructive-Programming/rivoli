@@ -35,13 +35,15 @@ impl Usage {
         Ok(Self { counts })
     }
 
-    /// (layer, expert) pairs ranked hottest-first — the pin fill order.
-    pub fn ranked(&self) -> Vec<(u16, u16)> {
+    /// (layer, expert) pairs ranked hottest-first — the pin fill order. Returns
+    /// the counts too; the pin-fill loop ignores them. One allocation, no
+    /// second collect just to drop the count.
+    pub fn ranked(&self) -> Vec<((u16, u16), u64)> {
         let mut v: Vec<_> = self.counts.iter().map(|(&k, &c)| (k, c)).collect();
         // Descending by count; (layer, expert) as a stable tiebreak so the
         // ranking is deterministic across runs (no Math.random-style drift).
         v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        v.into_iter().map(|(k, _)| k).collect()
+        v
     }
 
     pub fn total_selections(&self) -> u64 {
@@ -60,9 +62,9 @@ mod tests {
         u.counts.insert((3, 1), 500);
         u.counts.insert((4, 0), 500); // tie with (3,1) → lower key first
         let r = u.ranked();
-        assert_eq!(r[0], (3, 1));
-        assert_eq!(r[1], (4, 0));
-        assert_eq!(r[2], (3, 5));
+        assert_eq!(r[0].0, (3, 1));
+        assert_eq!(r[1].0, (4, 0));
+        assert_eq!(r[2].0, (3, 5));
         assert_eq!(u.total_selections(), 1100);
     }
 }

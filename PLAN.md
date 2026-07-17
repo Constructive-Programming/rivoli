@@ -142,7 +142,19 @@ Async owns the **feed side**, where colibri serialized and starved:
   [usage accumulator]◄────────────────────────────(selections)
 ```
 
-- `stream.rs` exposes `ExpertFeed`: `poll_expert(layer, id) -> Ready | Pending`;
+**Slab ownership (M4 contract, decided by review).** `ExpertSlab` must NOT own
+its bytes (no `bytes::Bytes`, no `Vec<u8>`): an owned host buffer is a
+per-expert heap allocation *and* not GPU-visible, so it would force a copy into
+the unified pool — exactly colibri's copy-pool, the thing bottleneck #2
+forbids. The feed channel carries a **pooled slab handle** — an index/offset
+into the one `hipHostMalloc` coherent pool allocated at startup — that NVMe
+`pread` writes into directly and the kernel reads in place; on drop the handle
+returns to a free-list. The bounded channel then bounds slab *occupancy*, not a
+stream of heap buffers. (The M0 skeleton `stream.rs`/`metrics.rs` were removed
+after review — they had no consumer and encoded the wrong, owned-bytes shape;
+they return in M3/M4 built against a real one.)
+
+- the feed exposes `poll_expert(layer, id) -> Ready | Pending`;
   misses are queued to the pread pool (spawn_blocking / io-uring later), decode
   overlaps GPU compute of resident experts with fetch of the ~5% cold set — the
   measured colibri pattern (PIPE + VK_OVERLAP) rebuilt on honest primitives.

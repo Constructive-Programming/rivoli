@@ -16,13 +16,33 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
+/// Tensor element type, validated at index time so downstream code matches on
+/// an enum rather than a raw string. Only the dtypes this model uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dtype {
+    F32,
+    U8,
+    I8,
+}
+
+impl Dtype {
+    fn parse(s: &str) -> Result<Self> {
+        Ok(match s {
+            "F32" => Dtype::F32,
+            "U8" => Dtype::U8,
+            "I8" => Dtype::I8,
+            other => bail!("unsupported tensor dtype {other:?}"),
+        })
+    }
+}
+
 /// Where one tensor's bytes live: which mmap'd shard and the byte range within.
 #[derive(Debug, Clone)]
 pub struct TensorLoc {
     pub shard: usize,
     pub begin: usize,
     pub end: usize,
-    pub dtype: String,
+    pub dtype: Dtype,
     pub shape: Vec<usize>,
 }
 
@@ -30,6 +50,14 @@ impl TensorLoc {
     pub fn nbytes(&self) -> usize {
         self.end - self.begin
     }
+}
+
+/// One raw header entry as written by safetensors.
+#[derive(serde::Deserialize)]
+struct RawTensor {
+    dtype: String,
+    shape: Vec<usize>,
+    data_offsets: [usize; 2],
 }
 
 /// One shard's mmap plus the tensors located within it (offsets absolute).
@@ -87,22 +115,33 @@ impl Snapshot {
         if hlen > (512 << 20) || 8 + hlen > mmap.len() {
             bail!("implausible safetensors header length {hlen}");
         }
-        let header: serde_json_header::Header = serde_json_header::parse(&mmap[8..8 + hlen])
-            .context("parse safetensors header json")?;
         let data_start = 8 + hlen;
+        let data_len = mmap.len() - data_start;
 
-        let mut entries = Vec::with_capacity(header.tensors.len());
-        for (name, t) in header.tensors {
+        // The header is a flat object of {name: RawTensor}, plus an optional
+        // "__metadata__" object we skip via serde's untagged tolerance below.
+        let raw: HashMap<String, serde_json::Value> = serde_json::from_slice(&mmap[8..data_start])
+            .context("parse safetensors header json")?;
+
+        let mut entries = Vec::with_capacity(raw.len());
+        for (name, val) in raw {
             if name == "__metadata__" {
                 continue;
+            }
+            let t: RawTensor = serde_json::from_value(val)
+                .with_context(|| format!("tensor {name} header fields"))?;
+            let [begin, end] = t.data_offsets;
+            // Validate offsets before trusting them as slice bounds.
+            if begin > end || end > data_len {
+                bail!("tensor {name} offsets [{begin},{end}] out of data range {data_len}");
             }
             entries.push((
                 name,
                 TensorLoc {
                     shard: 0, // set by caller
-                    begin: data_start + t.begin,
-                    end: data_start + t.end,
-                    dtype: t.dtype,
+                    begin: data_start + begin,
+                    end: data_start + end,
+                    dtype: Dtype::parse(&t.dtype)?,
                     shape: t.shape,
                 },
             ));
@@ -126,75 +165,5 @@ impl Snapshot {
     pub fn bytes(&self, name: &str) -> Option<&[u8]> {
         let loc = self.index.get(name)?;
         self.shards.get(loc.shard)?.get(loc.begin..loc.end)
-    }
-}
-
-/// Tiny hand-rolled safetensors-header parser: pulls exactly the fields we
-/// need without adding a serde_json dependency for one flat object of objects.
-mod serde_json_header {
-    use anyhow::{Result, bail};
-
-    pub struct Tensor {
-        pub dtype: String,
-        pub shape: Vec<usize>,
-        pub begin: usize,
-        pub end: usize,
-    }
-
-    pub struct Header {
-        pub tensors: Vec<(String, Tensor)>,
-    }
-
-    /// The header is a single JSON object: {"name":{"dtype":..,"shape":[..],
-    /// "data_offsets":[b,e]}, ..., "__metadata__":{...}}. We parse structurally
-    /// (no general JSON) — string keys, then per-tensor the three fields.
-    pub fn parse(bytes: &[u8]) -> Result<Header> {
-        let s = std::str::from_utf8(bytes)?;
-        let v = crate::json::parse(s)?;
-        let obj = v
-            .as_object()
-            .ok_or_else(|| anyhow::anyhow!("header not an object"))?;
-        let mut tensors = Vec::with_capacity(obj.len());
-        for (name, tv) in obj {
-            if name == "__metadata__" {
-                continue;
-            }
-            let t = tv
-                .as_object()
-                .ok_or_else(|| anyhow::anyhow!("tensor {name} not object"))?;
-            let dtype = t
-                .get("dtype")
-                .and_then(|d| d.as_str())
-                .ok_or_else(|| anyhow::anyhow!("tensor {name} missing dtype"))?
-                .to_string();
-            let shape = t
-                .get("shape")
-                .and_then(|s| s.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|n| n.as_u64().map(|n| n as usize))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let off = t
-                .get("data_offsets")
-                .and_then(|o| o.as_array())
-                .ok_or_else(|| anyhow::anyhow!("tensor {name} missing data_offsets"))?;
-            if off.len() != 2 {
-                bail!("tensor {name} data_offsets not [begin,end]");
-            }
-            let begin = off[0].as_u64().unwrap_or(0) as usize;
-            let end = off[1].as_u64().unwrap_or(0) as usize;
-            tensors.push((
-                name.clone(),
-                Tensor {
-                    dtype,
-                    shape,
-                    begin,
-                    end,
-                },
-            ));
-        }
-        Ok(Header { tensors })
     }
 }

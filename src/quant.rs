@@ -22,9 +22,11 @@ fn nibble(row: &[u8], i: usize) -> i32 {
     n as i32 - 8
 }
 
-/// Reference GEMV: `y[o] = scale[o] * Σ_i x[i] * (nibble(o,i) - 8)`, for a
-/// single activation row `x` of length `i_dim` against `W[o_dim, i_dim]`.
-/// This is the scalar oracle the HIP kernel is validated against (M2).
+/// Reference GEMV: `y[o] = scale[o] * Σ_i x[i] * w(o,i)`, where the signed
+/// weight `w = nibble(o,i)` (the `nibble` accessor already applies the −8
+/// offset). For a single activation row `x` of length `i_dim` against
+/// `W[o_dim, i_dim]`. This is the scalar oracle the HIP kernel is validated
+/// against (M2).
 pub fn matvec_i4(
     y: &mut [f32],
     x: &[f32],
