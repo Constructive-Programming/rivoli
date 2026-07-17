@@ -51,6 +51,13 @@ async fn run(cfg: Config) -> Result<()> {
         bail!("snapshot dir not found: {}", cfg.snapshot);
     }
 
+    // Model dimensions from config.json.
+    let mc = rivoli::model::ModelConfig::load(&cfg.snapshot)?;
+    info!(
+        "model: {} layers ({} dense) hidden={} experts={} top{} moe_inter={} vocab={}",
+        mc.n_layers, mc.dense_layers, mc.hidden, mc.n_experts, mc.top_k, mc.moe_inter, mc.vocab
+    );
+
     // M0 gate: mmap + index every shard, under 5s.
     let t0 = std::time::Instant::now();
     let snap = rivoli::snapshot::Snapshot::open(&cfg.snapshot)?;
@@ -58,6 +65,14 @@ async fn run(cfg: Config) -> Result<()> {
         "indexed {} tensors in {:.2}s",
         snap.len(),
         t0.elapsed().as_secs_f64()
+    );
+
+    // Expert usage ranking (drives the pin). Missing file = cold start.
+    let usage = rivoli::usage::Usage::load(&cfg.snapshot)?;
+    info!(
+        "usage: {} selections over {} (layer,expert) pairs",
+        usage.total_selections(),
+        usage.counts.len()
     );
 
     // M0 gate: GPU toolchain is live end-to-end (real launch), or say why not.
