@@ -12,7 +12,7 @@ __global__ void axpy(float a, const float* x, float* y, int n) {
 // Runs a==2 axpy over n elements on-device; returns y[0] (== 2*1+0 == 2 on
 // success) or a negative HIP error code. Zero device allocation persists —
 // this is a liveness probe, not a compute path.
-extern "C" int rolibri_probe(int n) {
+extern "C" int rivoli_probe(int n) {
     float *dx = nullptr, *dy = nullptr;
     size_t bytes = (size_t)n * sizeof(float);
     if (hipMalloc(&dx, bytes) != hipSuccess) return -1;

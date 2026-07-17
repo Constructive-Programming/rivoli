@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 
 #[cfg(feature = "rocm")]
 unsafe extern "C" {
-    fn rolibri_probe(n: i32) -> i32;
+    fn rivoli_probe(n: i32) -> i32;
 }
 
 /// Liveness probe: launch the axpy kernel and confirm the device computed the
@@ -17,7 +17,7 @@ pub fn probe() -> Result<()> {
     {
         // SAFETY: FFI to the hipcc-built launcher; it owns its own device
         // allocations and frees them before returning.
-        let r = unsafe { rolibri_probe(4096) };
+        let r = unsafe { rivoli_probe(4096) };
         if r == 2 {
             Ok(())
         } else {

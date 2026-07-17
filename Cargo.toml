@@ -1,5 +1,5 @@
 [package]
-name = "rolibri"
+name = "rivoli"
 version = "0.1.0"
 edition = "2024"
 description = "GLM-5.2 MoE decode engine for AMD Strix Halo — Rust + tokio streaming + HIP/ROCm"

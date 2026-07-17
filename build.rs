@@ -37,8 +37,8 @@ fn main() {
         objs.push(obj);
     }
 
-    // Archive the objects into a static lib rolibri links against.
-    let lib = format!("{out_dir}/librolibrikernels.a");
+    // Archive the objects into a static lib rivoli links against.
+    let lib = format!("{out_dir}/librivolikernels.a");
     let mut ar = Command::new("ar");
     ar.arg("crs").arg(&lib);
     for o in &objs {
@@ -47,7 +47,7 @@ fn main() {
     assert!(ar.status().expect("run ar").success(), "ar failed");
 
     println!("cargo:rustc-link-search=native={out_dir}");
-    println!("cargo:rustc-link-lib=static=rolibrikernels");
+    println!("cargo:rustc-link-lib=static=rivolikernels");
     // HIP runtime. ROCm's lib dir varies; probe the common Gentoo/ROCm spots.
     for dir in ["/usr/lib64", "/opt/rocm/lib", "/usr/lib"] {
         if Path::new(dir).join("libamdhip64.so").exists() {

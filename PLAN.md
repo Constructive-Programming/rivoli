@@ -197,6 +197,19 @@ XDNA2 spike measured int8 GEMM at 2.78 TOPS (10× one CPU core). Dense mlp +
 attention projections are NPU-shaped (static shapes, resident weights). Out of
 scope until ≥1 tok/s is banked.
 
+## Weight format (decided)
+
+Reuse colibri's per-row int4 snapshot for now. Verified on this hardware
+(clang builtin gating, 2026-07-17): **MXFP4/MXINT4 microscaling matmul is
+CDNA4-only** (`gfx950-insts`); gfx1151 (RDNA 3.5) has plain int4 WMMA
+(`gfx11-insts`) but no block-scale operand, and WMMA is a matrix instruction
+that a batch-1 GEMV can't fill anyway — so MX buys us nothing here (and its
+4.25 bits/weight is *worse* for our bandwidth ceiling than per-row int4's
+~4.0). **Follow-up, after ≥1 tok/s is proven:** a converter from HF GLM-5.2's
+fp8 (e4m3, block-scaled 128×128) to **group-scaled int4** (group ~32–128) —
+an accuracy gain at the same ~4 bits/weight, no bandwidth penalty. int4 WMMA
+is revisited only for the future batched/server path (S>1 rows share weights).
+
 ## Milestones — each gated on a measured number
 
 - **M0 — toolchain + skeleton.** HIP (hipcc) installed on rh-anine;
