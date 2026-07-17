@@ -16,13 +16,14 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
-/// Tensor element type, validated at index time so downstream code matches on
-/// an enum rather than a raw string. Only the dtypes this model uses.
+/// On-disk element type. The int4 snapshot uses exactly two: `F32` (norm
+/// weights, embeddings, and the per-row int4 scales `.qs`) and `U8` (packed
+/// int4 nibbles, `<name>.weight`). Any other dtype is rejected at index time —
+/// this engine is int4-only by construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dtype {
     F32,
     U8,
-    I8,
 }
 
 impl Dtype {
@@ -30,10 +31,23 @@ impl Dtype {
         Ok(match s {
             "F32" => Dtype::F32,
             "U8" => Dtype::U8,
-            "I8" => Dtype::I8,
-            other => bail!("unsupported tensor dtype {other:?}"),
+            other => bail!("unsupported tensor dtype {other:?} (this engine is int4-only)"),
         })
     }
+}
+
+/// A per-row int4 weight matrix located in the mmap: `packed` nibbles and their
+/// per-output-row `scale` bytes, borrowed zero-copy. The only way to obtain one
+/// is [`Snapshot::int4`], which validates the `.weight`/`.qs` pairing and the
+/// byte lengths — so "an expert weight that isn't int4" is unrepresentable.
+#[derive(Debug, Clone, Copy)]
+pub struct Int4Matrix<'a> {
+    /// `o_dim` rows × `row_bytes(i_dim)` packed nibbles (`(nibble-8)*scale`).
+    pub packed: &'a [u8],
+    /// `o_dim` little-endian f32 scales (raw bytes; decoded per row on read).
+    pub scale: &'a [u8],
+    pub o_dim: usize,
+    pub i_dim: usize,
 }
 
 /// Where one tensor's bytes live: which mmap'd shard and the byte range within.
@@ -95,7 +109,11 @@ impl Snapshot {
             let shard = Self::index_shard(path)
                 .with_context(|| format!("index shard {}", path.display()))?;
             for (name, loc) in shard.entries {
-                index.insert(name, TensorLoc { shard: si, ..loc });
+                // A name appearing in two shards means a corrupt/misassembled
+                // snapshot — fail loudly rather than silently keep the last.
+                if let Some(prev) = index.insert(name.clone(), TensorLoc { shard: si, ..loc }) {
+                    bail!("tensor {name} present in shard {} and {si}", prev.shard);
+                }
             }
             shards.push(shard.mmap);
         }
@@ -159,6 +177,63 @@ impl Snapshot {
 
     pub fn get(&self, name: &str) -> Option<&TensorLoc> {
         self.index.get(name)
+    }
+
+    /// Bytes of a required tensor, failing loudly with the name if missing —
+    /// the decode path wants context, not a silent `None` at every call site.
+    pub fn require(&self, name: &str) -> Result<&[u8]> {
+        self.bytes(name)
+            .with_context(|| format!("required tensor {name} not found in snapshot"))
+    }
+
+    /// Locate an int4 weight matrix by its base name (expects `<name>.weight`
+    /// U8 packed + `<name>.weight.qs` F32 scales). Validates the pairing, the
+    /// dtypes, and the byte lengths — the only constructor of [`Int4Matrix`],
+    /// so every downstream expert read is provably int4.
+    pub fn int4(&self, name: &str) -> Result<Int4Matrix<'_>> {
+        let wname = format!("{name}.weight");
+        let sname = format!("{name}.weight.qs");
+        let wloc = self
+            .index
+            .get(&wname)
+            .with_context(|| format!("int4 weight {wname} not found"))?;
+        let sloc = self
+            .index
+            .get(&sname)
+            .with_context(|| format!("int4 scale {sname} not found"))?;
+        if wloc.dtype != Dtype::U8 {
+            bail!("{wname} is {:?}, expected U8 packed int4", wloc.dtype);
+        }
+        if sloc.dtype != Dtype::F32 {
+            bail!("{sname} is {:?}, expected F32 scale", sloc.dtype);
+        }
+        // Weight shape is [o_dim, i_dim]; scale is [o_dim].
+        let [o_dim, i_dim] = match wloc.shape.as_slice() {
+            &[o, i] => [o, i],
+            other => bail!("{wname} shape {other:?} is not 2-D"),
+        };
+        let packed = self.require(&wname)?;
+        let scale = self.require(&sname)?;
+        let want_packed = o_dim * crate::quant::row_bytes(i_dim);
+        if packed.len() != want_packed {
+            bail!(
+                "{wname}: {} packed bytes, expected {want_packed}",
+                packed.len()
+            );
+        }
+        if scale.len() != o_dim * 4 {
+            bail!(
+                "{sname}: {} scale bytes, expected {}",
+                scale.len(),
+                o_dim * 4
+            );
+        }
+        Ok(Int4Matrix {
+            packed,
+            scale,
+            o_dim,
+            i_dim,
+        })
     }
 
     /// Raw bytes of a tensor, straight out of the mmap (zero copy).

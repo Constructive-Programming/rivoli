@@ -3,6 +3,7 @@
 //! not reinvent; this is a 19 MB trained vocab.
 
 use anyhow::{Context, Result, anyhow};
+use tracing::warn;
 
 pub struct Tokenizer {
     inner: tokenizers::Tokenizer,
@@ -15,7 +16,19 @@ impl Tokenizer {
         let path = format!("{snapshot_dir}/tokenizer.json");
         let inner =
             tokenizers::Tokenizer::from_file(&path).map_err(|e| anyhow!("load {path}: {e}"))?;
-        let eos = Self::load_eos(snapshot_dir).unwrap_or_default();
+        // An empty eos means decode can never stop on an end token (runaway
+        // generation) — surface a broken generation_config loudly, don't swallow.
+        let eos = match Self::load_eos(snapshot_dir) {
+            Ok(e) if !e.is_empty() => e,
+            Ok(_) => {
+                warn!("generation_config has no eos_token_id — decode won't stop on EOS");
+                Vec::new()
+            }
+            Err(e) => {
+                warn!("could not read eos ids ({e}) — decode won't stop on EOS");
+                Vec::new()
+            }
+        };
         Ok(Self { inner, eos })
     }
 
@@ -44,14 +57,51 @@ impl Tokenizer {
         Ok(enc.get_ids().to_vec())
     }
 
-    /// Decode a single token id to its text piece.
-    pub fn decode1(&self, id: u32) -> Result<String> {
-        self.inner
-            .decode(&[id], false)
-            .map_err(|e| anyhow!("decode: {e}"))
+    /// A streaming decoder for the generation loop. Byte-level BPE routinely
+    /// splits one codepoint across several tokens, so decoding ids in isolation
+    /// mangles multi-token characters; this holds the running id buffer and
+    /// emits only the newly-stable text suffix per step.
+    pub fn decoder(&self) -> Decoder<'_> {
+        Decoder {
+            tok: self,
+            ids: Vec::new(),
+            emitted: 0,
+        }
     }
 
     pub fn is_eos(&self, id: u32) -> bool {
         self.eos.contains(&id)
+    }
+}
+
+/// Incremental detokenizer. Re-decodes the growing id buffer and returns the
+/// character delta beyond what was already emitted — so a codepoint split
+/// across tokens surfaces once, whole, when its last token arrives.
+pub struct Decoder<'a> {
+    tok: &'a Tokenizer,
+    ids: Vec<u32>,
+    emitted: usize,
+}
+
+impl Decoder<'_> {
+    /// Feed one generated id; returns the new text to append (possibly empty
+    /// while a multi-token codepoint is still incomplete).
+    pub fn step(&mut self, id: u32) -> Result<String> {
+        self.ids.push(id);
+        let text = self
+            .tok
+            .inner
+            .decode(&self.ids, false)
+            .map_err(|e| anyhow!("decode: {e}"))?;
+        // Emit the stable prefix (everything up to a trailing replacement char,
+        // which marks an incomplete codepoint) beyond what we've already sent.
+        let stable = text.trim_end_matches('\u{FFFD}');
+        let stable_chars = stable.chars().count();
+        if stable_chars <= self.emitted {
+            return Ok(String::new());
+        }
+        let out: String = stable.chars().skip(self.emitted).collect();
+        self.emitted = stable_chars;
+        Ok(out)
     }
 }

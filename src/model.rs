@@ -57,7 +57,33 @@ impl ModelConfig {
     pub fn load(snapshot_dir: &str) -> Result<Self> {
         let path = format!("{snapshot_dir}/config.json");
         let text = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
-        serde_json::from_str(&text).with_context(|| format!("parse {path}"))
+        let cfg: Self = serde_json::from_str(&text).with_context(|| format!("parse {path}"))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Cheap semantic checks at the boundary, so a mismatched snapshot fails
+    /// here with a clear message rather than as an out-of-bounds panic deep in
+    /// the decode loop.
+    fn validate(&self) -> Result<()> {
+        if self.dense_layers > self.n_layers {
+            anyhow::bail!(
+                "dense_layers {} > n_layers {}",
+                self.dense_layers,
+                self.n_layers
+            );
+        }
+        if self.top_k > self.n_experts {
+            anyhow::bail!("top_k {} > n_experts {}", self.top_k, self.n_experts);
+        }
+        if !self.hidden.is_multiple_of(self.n_heads) {
+            anyhow::bail!(
+                "hidden {} not divisible by n_heads {}",
+                self.hidden,
+                self.n_heads
+            );
+        }
+        Ok(())
     }
 
     pub fn rope_theta(&self) -> f64 {

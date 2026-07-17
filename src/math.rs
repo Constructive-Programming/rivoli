@@ -20,12 +20,6 @@ pub fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
-/// Logistic sigmoid.
-#[inline]
-pub fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
-}
-
 /// In-place softmax over a slice (numerically stable).
 pub fn softmax(v: &mut [f32]) {
     let max = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -42,19 +36,27 @@ pub fn softmax(v: &mut [f32]) {
 }
 
 /// Indices of the `k` largest values, descending by value, with index as a
-/// deterministic tiebreak. `k` is clamped to `scores.len()`.
+/// deterministic tiebreak. `k` is clamped to `scores.len()`. Partitions with
+/// `select_nth_unstable` (≈O(n)) and sorts only the `k` selected, instead of a
+/// full O(n log n) sort of all n — on the per-token MoE path n=256, k=8.
 pub fn topk(scores: &[f32], k: usize) -> Vec<usize> {
     let k = k.min(scores.len());
+    if k == 0 {
+        return Vec::new();
+    }
     let mut idx: Vec<usize> = (0..scores.len()).collect();
-    // Partial order would suffice, but n_experts is small (256) and this keeps
-    // the tiebreak explicit and deterministic across runs.
-    idx.sort_by(|&a, &b| {
-        scores[b]
-            .partial_cmp(&scores[a])
+    // value-desc, index-asc tiebreak — deterministic across runs.
+    let cmp = |a: &usize, b: &usize| {
+        scores[*b]
+            .partial_cmp(&scores[*a])
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.cmp(&b))
-    });
-    idx.truncate(k);
+            .then(a.cmp(b))
+    };
+    if k < idx.len() {
+        idx.select_nth_unstable_by(k - 1, cmp);
+        idx.truncate(k);
+    }
+    idx.sort_by(cmp);
     idx
 }
 
@@ -74,8 +76,7 @@ mod tests {
     }
 
     #[test]
-    fn silu_and_sigmoid_known_points() {
-        assert!((sigmoid(0.0) - 0.5).abs() < 1e-6);
+    fn silu_known_points() {
         assert!(silu(0.0).abs() < 1e-6);
         // silu(x) = x*sigmoid(x); at large x it approaches x.
         assert!((silu(20.0) - 20.0).abs() < 1e-3);

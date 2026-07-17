@@ -9,16 +9,20 @@
 //!
 //! Dequantized weight `W[o,i] = (nibble - 8) * scale[o]`.
 
+use crate::snapshot::Int4Matrix;
+
 /// Row stride in bytes for an int4 matrix with `i_dim` input columns.
 pub fn row_bytes(i_dim: usize) -> usize {
     i_dim.div_ceil(2)
 }
 
-/// Read an F32 tensor's raw little-endian bytes into a `Vec<f32>`. Used for
-/// norm weights and per-row int4 scales (the `.qs` tensors). Copies — these
-/// are small (O values), and the mmap has no 4-byte alignment guarantee, so a
-/// zero-copy cast would be unsound.
+/// Read an F32 tensor's raw little-endian bytes into a `Vec<f32>`. For
+/// **O-length** tensors only — norm weights and embeddings — loaded once at
+/// startup. NEVER call this on a packed `.weight` tensor: that would dequant an
+/// int4 expert into host f32 and blow up per-token RAM traffic ~4×. Expert
+/// weights are reached only as packed bytes via [`Int4Matrix`].
 pub fn read_f32(bytes: &[u8]) -> Vec<f32> {
+    debug_assert_eq!(bytes.len() % 4, 0, "F32 tensor length not a multiple of 4");
     bytes
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -33,31 +37,29 @@ fn nibble(row: &[u8], i: usize) -> i32 {
     n as i32 - 8
 }
 
-/// Reference GEMV: `y[o] = scale[o] * Σ_i x[i] * w(o,i)`, where the signed
-/// weight `w = nibble(o,i)` (the `nibble` accessor already applies the −8
-/// offset). For a single activation row `x` of length `i_dim` against
-/// `W[o_dim, i_dim]`. This is the scalar oracle the HIP kernel is validated
-/// against (M2).
-pub fn matvec_i4(
-    y: &mut [f32],
-    x: &[f32],
-    packed: &[u8],
-    scale: &[f32],
-    i_dim: usize,
-    o_dim: usize,
-) {
-    debug_assert_eq!(y.len(), o_dim);
-    debug_assert_eq!(x.len(), i_dim);
-    debug_assert_eq!(scale.len(), o_dim);
-    let rb = row_bytes(i_dim);
-    debug_assert_eq!(packed.len(), rb * o_dim);
-    for o in 0..o_dim {
-        let row = &packed[o * rb..(o + 1) * rb];
+/// One little-endian f32 scale at row `o` of the raw scale bytes.
+#[inline]
+fn scale_at(scale: &[u8], o: usize) -> f32 {
+    let b = &scale[o * 4..o * 4 + 4];
+    f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
+/// Reference GEMV against a validated int4 matrix: `y[o] = scale[o] * Σ_i
+/// x[i] * w(o,i)`, where `w = nibble(o,i)` (the accessor applies the −8
+/// offset). The scale is decoded inline from bytes — no per-expert `Vec<f32>`
+/// allocation on the hot path. `w`'s length invariants are guaranteed by
+/// `Int4Matrix`'s constructor. This is the scalar oracle the HIP kernel is
+/// validated against (M2).
+pub fn matvec_i4(y: &mut [f32], x: &[f32], w: &Int4Matrix) {
+    debug_assert_eq!(y.len(), w.o_dim);
+    debug_assert_eq!(x.len(), w.i_dim);
+    let rb = row_bytes(w.i_dim);
+    for (o, (yo, row)) in y.iter_mut().zip(w.packed.chunks_exact(rb)).enumerate() {
         let mut acc = 0.0f32;
         for (i, &xi) in x.iter().enumerate() {
             acc += xi * nibble(row, i) as f32;
         }
-        y[o] = acc * scale[o];
+        *yo = acc * scale_at(w.scale, o);
     }
 }
 
@@ -91,18 +93,27 @@ mod tests {
         assert_eq!(nibble(&row, 3), 3);
     }
 
+    /// Little-endian scale bytes for a set of f32 scales.
+    fn scale_bytes(vals: &[f32]) -> Vec<u8> {
+        vals.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
     #[test]
     fn matvec_matches_hand_dot() {
         // W = [[1,-2, 3, 0], [-1, 4,-8, 7]], scale = [0.5, 2.0], x = [1,1,1,1].
-        let i_dim = 4;
-        let o_dim = 2;
         let mut packed = Vec::new();
         packed.extend(pack_row(&[1, -2, 3, 0]));
         packed.extend(pack_row(&[-1, 4, -8, 7]));
-        let scale = [0.5f32, 2.0];
+        let scale = scale_bytes(&[0.5, 2.0]);
+        let w = Int4Matrix {
+            packed: &packed,
+            scale: &scale,
+            o_dim: 2,
+            i_dim: 4,
+        };
         let x = [1.0f32, 1.0, 1.0, 1.0];
         let mut y = [0.0f32; 2];
-        matvec_i4(&mut y, &x, &packed, &scale, i_dim, o_dim);
+        matvec_i4(&mut y, &x, &w);
         // row0: (1-2+3+0)=2 *0.5 = 1.0 ; row1: (-1+4-8+7)=2 *2.0 = 4.0
         assert!((y[0] - 1.0).abs() < 1e-6, "y0={}", y[0]);
         assert!((y[1] - 4.0).abs() < 1e-6, "y1={}", y[1]);
@@ -123,10 +134,16 @@ mod tests {
         // I=5 → rb=3 bytes; last byte holds one used nibble + one pad.
         assert_eq!(row_bytes(5), 3);
         let packed = pack_row(&[2, 2, 2, 2, 2]); // 5 nibbles
+        let scale = scale_bytes(&[1.0]);
+        let w = Int4Matrix {
+            packed: &packed,
+            scale: &scale,
+            o_dim: 1,
+            i_dim: 5,
+        };
         let x = [1.0f32; 5];
-        let scale = [1.0f32];
         let mut y = [0.0f32; 1];
-        matvec_i4(&mut y, &x, &packed, &scale, 5, 1);
+        matvec_i4(&mut y, &x, &w);
         assert!((y[0] - 10.0).abs() < 1e-6, "y0={}", y[0]);
     }
 }
