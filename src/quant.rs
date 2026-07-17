@@ -84,15 +84,8 @@ pub fn matvec_i4_rows(y: &mut [f32], x: &[f32], w: &Int4Matrix, row0: usize) {
 /// validated against (M2).
 pub fn matvec_i4(y: &mut [f32], x: &[f32], w: &Int4Matrix) {
     debug_assert_eq!(y.len(), w.o_dim);
-    debug_assert_eq!(x.len(), w.i_dim);
-    let rb = row_bytes(w.i_dim);
-    for (o, (yo, row)) in y.iter_mut().zip(w.packed.chunks_exact(rb)).enumerate() {
-        let mut acc = 0.0f32;
-        for (i, &xi) in x.iter().enumerate() {
-            acc += xi * nibble(row, i) as f32;
-        }
-        *yo = acc * scale_at(w.scale, o);
-    }
+    // The full GEMV is the row-range GEMV starting at row 0.
+    matvec_i4_rows(y, x, w, 0);
 }
 
 /// Dequantize row `row` of a per-row **int8** matrix into `out` (length =

@@ -14,22 +14,33 @@ use crate::math::{bf16_to_f32, f32_to_bf16, rmsnorm, softmax};
 use crate::model::ModelConfig;
 use crate::quant::{addrow, matvec_i4, matvec_i4_rows, read_f32};
 use crate::snapshot::Snapshot;
-use anyhow::Result;
+use anyhow::{Result, ensure};
 
 /// Compressed MLA KV cache: per layer, bf16 latents and roped keys, one row per
 /// cached token. Grows by one row per layer per decoded token.
+///
+/// DEFERRED (profiling P2): the per-layer `Vec`s start empty and grow via
+/// `extend`, so at 200k they realloc repeatedly and their base pointer moves.
+/// Pre-reserving to a `max_ctx` and (eventually) backing them with one stable
+/// per-layer slab from the unified pool is the M4 pin/streaming contract — it
+/// needs the decode loop's context cap and couples with the `hipHostMalloc`
+/// coherent-slab design, so it lands there, not in this reference.
 pub struct KvCache {
     lc: Vec<Vec<u16>>, // [n_layers] flat, len = tokens * kv_lora
     rc: Vec<Vec<u16>>, // [n_layers] flat, len = tokens * qk_rope
     kv_lora: usize,
+    qk_rope: usize,
 }
 
 impl KvCache {
-    pub fn new(n_layers: usize, kv_lora: usize) -> Self {
+    /// Strides come from the model config so they can't disagree with the
+    /// weights the decode step reads.
+    pub fn new(cfg: &ModelConfig) -> Self {
         Self {
-            lc: vec![Vec::new(); n_layers],
-            rc: vec![Vec::new(); n_layers],
-            kv_lora,
+            lc: vec![Vec::new(); cfg.n_layers],
+            rc: vec![Vec::new(); cfg.n_layers],
+            kv_lora: cfg.kv_lora_rank,
+            qk_rope: cfg.qk_rope_head_dim,
         }
     }
 
@@ -39,6 +50,8 @@ impl KvCache {
     }
 
     fn append(&mut self, layer: usize, latent: &[f32], rope: &[f32]) {
+        debug_assert_eq!(latent.len(), self.kv_lora);
+        debug_assert_eq!(rope.len(), self.qk_rope);
         self.lc[layer].extend(latent.iter().map(|&v| f32_to_bf16(v)));
         self.rc[layer].extend(rope.iter().map(|&v| f32_to_bf16(v)));
     }
@@ -48,7 +61,7 @@ impl KvCache {
 pub struct AttnScratch {
     qr: Vec<f32>,     // q_lora
     q: Vec<f32>,      // n_heads * qk_head
-    comp: Vec<f32>,   // kv_lora + qk_rope
+    comp: Vec<f32>,   // kv_lora + qk_rope  (latent | key, normed/roped in place)
     qabs: Vec<f32>,   // kv_lora
     clat: Vec<f32>,   // kv_lora
     ctx: Vec<f32>,    // n_heads * v_head
@@ -69,17 +82,26 @@ impl AttnScratch {
     }
 }
 
+/// Largest RoPE dimension we support without heap (GLM qk_rope = 64; colibri
+/// caps the interleave buffer at 256).
+const MAX_ROPE: usize = 256;
+
 /// Interleaved RoPE on a `qk_rope`-length vector at position `pos` (colibri
 /// `rope_interleave`): pairs (2j, 2j+1) rotate by angle `pos·θ^(-2j/dim)`,
-/// output halves are [rotated-first | rotated-second].
-fn rope_interleave(v: &mut [f32], pos: usize, theta: f32) {
+/// output halves are [rotated-first | rotated-second]. Angles are computed in
+/// f64 (colibri does too) — f32 argument reduction drifts ~pos·1e-7 rad and
+/// would widen the M2 kernel-vs-reference tolerance at long context.
+fn rope_interleave(v: &mut [f32], pos: usize, theta: f64) {
     let n = v.len();
+    debug_assert!(n.is_multiple_of(2), "rope dim must be even");
+    debug_assert!(n <= MAX_ROPE, "rope dim {n} exceeds MAX_ROPE");
     let half = n / 2;
-    let inbuf: Vec<f32> = v.to_vec();
+    let mut inbuf = [0.0f32; MAX_ROPE];
+    inbuf[..n].copy_from_slice(v);
     for j in 0..half {
-        let inv = theta.powf(-2.0 * j as f32 / n as f32);
-        let ang = pos as f32 * inv;
-        let (cs, sn) = (ang.cos(), ang.sin());
+        let inv = theta.powf(-2.0 * j as f64 / n as f64);
+        let ang = pos as f64 * inv;
+        let (cs, sn) = (ang.cos() as f32, ang.sin() as f32);
         let (a, b) = (inbuf[2 * j], inbuf[2 * j + 1]);
         v[j] = a * cs - b * sn;
         v[half + j] = b * cs + a * sn;
@@ -88,7 +110,8 @@ fn rope_interleave(v: &mut [f32], pos: usize, theta: f32) {
 
 /// One MLA attention decode step for `layer`. `x` is the RMSNorm'd hidden
 /// (input_layernorm applied by the caller). Appends this token's latent/key to
-/// `kv` and writes the attention output (pre-residual) into `out[hidden]`.
+/// `kv` and writes the attention output (pre-residual, `hidden`-length) into
+/// `out`. `pos` must equal the layer's current cached-token count.
 #[allow(clippy::too_many_arguments)]
 pub fn attention(
     snap: &Snapshot,
@@ -107,30 +130,62 @@ pub fn attention(
     let kvl = cfg.kv_lora_rank;
     let vh = cfg.v_head_dim;
     let eps = cfg.rms_norm_eps as f32;
-    let theta = cfg.rope_theta() as f32;
+    let theta = cfg.rope_theta();
     let scale = 1.0 / (qh as f32).sqrt();
+    debug_assert_eq!(out.len(), cfg.hidden);
+    debug_assert_eq!(pos, kv.tokens(layer), "pos out of step with cache");
     let base = format!("model.layers.{layer}.self_attn");
 
-    // 1) Q path: q_a → rmsnorm → q_b.
+    // DEFERRED (profiling P3): these five int4 locates + two layernorm reads
+    // re-resolve constant-per-layer weights every token (format! + HashMap +
+    // Vec copy). Resolving them once at startup into a per-(layer) table is the
+    // same resolved-tensor contract as the MoE pin path; it lands with the pin
+    // milestone (M3/M4), not in this reference. Here we validate shapes loudly.
     let q_a = snap.int4(&format!("{base}.q_a_proj"), cfg.hidden)?;
     let q_b = snap.int4(&format!("{base}.q_b_proj"), cfg.q_lora_rank)?;
+    let kv_a = snap.int4(&format!("{base}.kv_a_proj_with_mqa"), cfg.hidden)?;
+    let kv_b = snap.int4(&format!("{base}.kv_b_proj"), kvl)?;
+    let o_proj = snap.int4(&format!("{base}.o_proj"), h * vh)?;
+    ensure!(
+        q_a.o_dim == cfg.q_lora_rank,
+        "q_a o_dim {} != {}",
+        q_a.o_dim,
+        cfg.q_lora_rank
+    );
+    ensure!(q_b.o_dim == h * qh, "q_b o_dim {} != {}", q_b.o_dim, h * qh);
+    ensure!(
+        kv_a.o_dim == kvl + rope,
+        "kv_a o_dim {} != {}",
+        kv_a.o_dim,
+        kvl + rope
+    );
+    ensure!(
+        kv_b.o_dim == h * (nope + vh),
+        "kv_b o_dim {} != {}",
+        kv_b.o_dim,
+        h * (nope + vh)
+    );
+    ensure!(
+        o_proj.o_dim == cfg.hidden,
+        "o_proj o_dim {} != {}",
+        o_proj.o_dim,
+        cfg.hidden
+    );
     let q_a_ln = read_f32(snap.require(&format!("{base}.q_a_layernorm.weight"))?);
+    let kv_a_ln = read_f32(snap.require(&format!("{base}.kv_a_layernorm.weight"))?);
+
+    // 1) Q path: q_a → rmsnorm(q_a_ln) → q_b (both norms in place on scratch).
     matvec_i4(&mut s.qr, x, &q_a);
-    let qr_norm = s.qr.clone();
-    rmsnorm(&mut s.qr, &qr_norm, &q_a_ln, eps);
+    rmsnorm(&mut s.qr, &q_a_ln, eps);
     matvec_i4(&mut s.q, &s.qr, &q_b);
 
-    // 2) KV path: kv_a → split latent/rope, normalize latent, RoPE the key.
-    let kv_a = snap.int4(&format!("{base}.kv_a_proj_with_mqa"), cfg.hidden)?;
-    let kv_a_ln = read_f32(snap.require(&format!("{base}.kv_a_layernorm.weight"))?);
+    // 2) KV path: kv_a → [latent | key]; normalize the latent, RoPE the key —
+    //    both in place on comp — then append the token to the bf16 cache.
     matvec_i4(&mut s.comp, x, &kv_a);
-    let (latent_raw, rope_raw) = s.comp.split_at(kvl);
-    let mut latent = latent_raw.to_vec();
-    let latent_in = latent.clone();
-    rmsnorm(&mut latent, &latent_in, &kv_a_ln, eps);
-    let mut rkey = rope_raw.to_vec();
-    rope_interleave(&mut rkey, pos, theta);
-    kv.append(layer, &latent, &rkey);
+    rmsnorm(&mut s.comp[..kvl], &kv_a_ln, eps);
+    rope_interleave(&mut s.comp[kvl..], pos, theta);
+    let (latent, rkey) = s.comp.split_at(kvl);
+    kv.append(layer, latent, rkey);
 
     // RoPE each head's query rope segment.
     for head in 0..h {
@@ -139,7 +194,15 @@ pub fn attention(
     }
 
     // 3) Absorb-path attention core, per head.
-    let kv_b = snap.int4(&format!("{base}.kv_b_proj"), kvl)?;
+    //
+    // DEFERRED (profiling P1): this is head-outer / token-inner, so each cached
+    // latent is widened bf16→f32 once per head (~H× per token). The 200k fix is
+    // a token-outer / head-inner (flash-style) tiling that reads each latent
+    // once and reuses it across heads. That is the *kernel's* contract (M2/M3),
+    // not the reference's: this scalar oracle only ever runs at test-scale
+    // context, stays correct as written, and restructuring it now would
+    // complicate the thing the kernel is checked against. Kept simple on
+    // purpose; the kernel does the tiling.
     let nt = kv.tokens(layer);
     if s.scores.len() < nt {
         s.scores.resize(nt, 0.0);
@@ -183,7 +246,6 @@ pub fn attention(
     }
 
     // 4) Output projection.
-    let o_proj = snap.int4(&format!("{base}.o_proj"), h * vh)?;
     matvec_i4(out, &s.ctx, &o_proj);
     Ok(())
 }

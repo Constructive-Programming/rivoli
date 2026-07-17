@@ -2,15 +2,16 @@
 //! these are the oracle the HIP kernels are validated against (M2), not the
 //! shipped compute. Everything operates on `f32` slices in place where it can.
 
-/// RMSNorm: `y = x / sqrt(mean(x²) + eps) * weight`. In-place into `out`.
-pub fn rmsnorm(out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
-    debug_assert_eq!(out.len(), x.len());
-    debug_assert_eq!(weight.len(), x.len());
-    let n = x.len() as f32;
-    let ms = x.iter().map(|&v| v * v).sum::<f32>() / n;
+/// RMSNorm in place: `v = v / sqrt(mean(v²) + eps) * weight`. The mean is fully
+/// computed before any write, so a single mutable slice is sound (callers that
+/// need the input preserved copy it into the destination first).
+pub fn rmsnorm(v: &mut [f32], weight: &[f32], eps: f32) {
+    debug_assert_eq!(weight.len(), v.len());
+    let n = v.len() as f32;
+    let ms = v.iter().map(|&x| x * x).sum::<f32>() / n;
     let inv = 1.0 / (ms + eps).sqrt();
-    for ((o, &xi), &w) in out.iter_mut().zip(x).zip(weight) {
-        *o = xi * inv * w;
+    for (vi, &w) in v.iter_mut().zip(weight) {
+        *vi = *vi * inv * w;
     }
 }
 
@@ -31,6 +32,11 @@ pub fn sigmoid(x: f32) -> f32 {
 #[inline]
 pub fn f32_to_bf16(x: f32) -> u16 {
     let bits = x.to_bits();
+    // Non-finite: keep the top 16 bits verbatim (the RNE carry could turn a NaN
+    // into an Inf), so Inf/NaN survive the round-trip as themselves.
+    if !x.is_finite() {
+        return (bits >> 16) as u16;
+    }
     let round = ((bits >> 16) & 1) + 0x7fff;
     ((bits + round) >> 16) as u16
 }
@@ -87,13 +93,12 @@ mod tests {
 
     #[test]
     fn rmsnorm_unit_weight_normalizes() {
-        let x = [3.0f32, 4.0, 0.0, 0.0]; // mean sq = 25/4 = 6.25, rms = 2.5
         let w = [1.0f32; 4];
-        let mut out = [0.0f32; 4];
-        rmsnorm(&mut out, &x, &w, 0.0);
+        let mut v = [3.0f32, 4.0, 0.0, 0.0]; // mean sq = 25/4 = 6.25, rms = 2.5
+        rmsnorm(&mut v, &w, 0.0);
         // x / 2.5
-        assert!((out[0] - 1.2).abs() < 1e-5, "{out:?}");
-        assert!((out[1] - 1.6).abs() < 1e-5, "{out:?}");
+        assert!((v[0] - 1.2).abs() < 1e-5, "{v:?}");
+        assert!((v[1] - 1.6).abs() < 1e-5, "{v:?}");
     }
 
     #[test]

@@ -140,13 +140,14 @@ async fn run(cfg: Config) -> Result<()> {
     // MLA attention smoke: input_layernorm → attention on layer 0, appending to
     // the KV cache. Exercises the full absorb path (q_a/q_b/kv_a/kv_b/o + RoPE +
     // bf16 latents) on real weights for the first two positions.
-    let mut kv = rivoli::attn::KvCache::new(mc.n_layers, mc.kv_lora_rank);
+    let mut kv = rivoli::attn::KvCache::new(&mc);
     let mut ascr = rivoli::attn::AttnScratch::new(&mc);
     let in_ln = rivoli::quant::read_f32(snap.require("model.layers.0.input_layernorm.weight")?);
     let mut xn = vec![0.0f32; mc.hidden];
     let mut aout = vec![0.0f32; mc.hidden];
     for pos in 0..2 {
-        rivoli::math::rmsnorm(&mut xn, &x, &in_ln, mc.rms_norm_eps as f32);
+        xn.copy_from_slice(&x);
+        rivoli::math::rmsnorm(&mut xn, &in_ln, mc.rms_norm_eps as f32);
         rivoli::attn::attention(&snap, &mc, 0, &xn, pos, &mut kv, &mut ascr, &mut aout)?;
         info!(
             "attn L0 pos{pos}: l2={:.3} out[0..3]={:?}",
