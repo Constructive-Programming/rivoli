@@ -70,7 +70,9 @@ extern "C" int rivoli_mla_attend(
     const unsigned short* Lc, const unsigned short* Rc,
     int H, int nt, int kvl, int rope, float scale,
     float* clat) {
-    if (H <= 0 || nt <= 0 || kvl <= 0 || rope <= 0) return -100;
+    // Return-code convention (see moe_fused.hip): 0 = success, POSITIVE = arg
+    // guard here, NEGATIVE = -(hipError_t). Guards stay out of HIP's enum range.
+    if (H <= 0 || nt <= 0 || kvl <= 0 || rope <= 0) return 1001;
     size_t qabs_n = (size_t)H * kvl;
     size_t qrope_n = (size_t)H * rope;
     size_t l_n = (size_t)nt * kvl;

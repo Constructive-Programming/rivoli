@@ -89,6 +89,19 @@ impl ModelConfig {
                 self.n_heads
             );
         }
+        // The fused MoE kernel (moe_fused.hip) stages one SwiGLU intermediate row
+        // per workgroup in dynamic LDS = inter*4 bytes, capped by gfx1151's 64KB
+        // LDS budget → inter ≤ 16384. Fail at load with the cause, not at first
+        // MoE launch. GLM-5.2: dense_inter=12288, moe_inter*n_shared=2048 — fit.
+        const MAX_FUSED_INTER: usize = 16384;
+        let shared_inter = self.moe_inter * self.n_shared;
+        if self.dense_inter > MAX_FUSED_INTER || shared_inter > MAX_FUSED_INTER {
+            anyhow::bail!(
+                "intermediate width exceeds fused-kernel LDS ceiling {MAX_FUSED_INTER} \
+                 (dense_inter={}, moe_inter*n_shared={shared_inter})",
+                self.dense_inter
+            );
+        }
         Ok(())
     }
 

@@ -149,4 +149,48 @@ mod tests {
         assert_eq!(topk(&s, 3), vec![1, 3, 2]);
         assert_eq!(topk(&s, 10), vec![1, 3, 2, 0]);
     }
+
+    /// The MLA attention kernel (attn.hip) replaces the reference two-pass
+    /// softmax with a single-pass flash recurrence. The scalar oracle only ever
+    /// runs at test-scale context, so this locks — GPU-free, in CI — that the two
+    /// forms agree at the 200k regime the kernel actually targets, where the
+    /// online rescaling accumulates over the most steps. Mirrors the kernel's
+    /// reduction (score → weighted value) with a scalar value per token.
+    #[test]
+    fn online_softmax_matches_two_pass_at_200k() {
+        let n = 200_000usize;
+        // Deterministic scores/values (no rand; no Math.random drift).
+        let mut st = 0x243f_6a88_85a3_08d3u64;
+        let mut next = || {
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (st >> 33) as f32 / (1u64 << 31) as f32 - 1.0 // [-1, 1)
+        };
+        let s: Vec<f32> = (0..n).map(|_| next() * 8.0).collect(); // spread scores
+        let v: Vec<f32> = (0..n).map(|_| next()).collect();
+
+        // Two-pass reference: softmax(s) then Σ p_t·v_t.
+        let mut p = s.clone();
+        softmax(&mut p);
+        let two_pass: f32 = p.iter().zip(&v).map(|(&pi, &vi)| pi * vi).sum();
+
+        // Flash online form (as in mla_latent_attend): running max/sum/acc.
+        let (mut m, mut l, mut acc) = (f32::NEG_INFINITY, 0.0f32, 0.0f32);
+        for (&si, &vi) in s.iter().zip(&v) {
+            let m_new = m.max(si);
+            let corr = (m - m_new).exp();
+            let pi = (si - m_new).exp();
+            l = l * corr + pi;
+            acc = acc * corr + pi * vi;
+            m = m_new;
+        }
+        let online = acc / l;
+
+        assert!(
+            (online - two_pass).abs() <= 1e-4,
+            "online={online} two_pass={two_pass} diff={}",
+            (online - two_pass).abs()
+        );
+    }
 }

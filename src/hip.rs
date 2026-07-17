@@ -86,6 +86,12 @@ pub fn moe_experts(
 ) -> Result<Vec<f32>> {
     let rb_h = hidden.div_ceil(2);
     let rb_i = inter.div_ceil(2);
+    // Dims cross the FFI as i32; guard the truncating cast (unreachable at GLM
+    // scale, but the boundary parses the invariant rather than trusting it).
+    anyhow::ensure!(
+        hidden <= i32::MAX as usize && inter <= i32::MAX as usize && e <= i32::MAX as usize,
+        "moe dims exceed i32 (hidden={hidden} inter={inter} e={e})"
+    );
     anyhow::ensure!(x.len() == hidden, "x len {} != hidden {hidden}", x.len());
     anyhow::ensure!(wexpert.len() == e, "wexpert len {} != e {e}", wexpert.len());
     let gate_bytes = e * inter * rb_h;
@@ -136,7 +142,8 @@ pub fn moe_experts(
         )
     };
     if r != 0 {
-        bail!("rivoli_moe_experts failed (code {r})");
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("rivoli_moe_experts failed ({kind}, code {r})");
     }
     Ok(out)
 }
@@ -160,6 +167,14 @@ pub fn mla_attend(
     rope: usize,
     scale: f32,
 ) -> Result<Vec<f32>> {
+    // Dims cross the FFI as i32; guard the truncating cast (see moe_experts).
+    anyhow::ensure!(
+        h <= i32::MAX as usize
+            && nt <= i32::MAX as usize
+            && kvl <= i32::MAX as usize
+            && rope <= i32::MAX as usize,
+        "attn dims exceed i32 (h={h} nt={nt} kvl={kvl} rope={rope})"
+    );
     anyhow::ensure!(
         qabs.len() == h * kvl,
         "qabs len {} != h*kvl {}",
@@ -203,7 +218,8 @@ pub fn mla_attend(
         )
     };
     if r != 0 {
-        bail!("rivoli_mla_attend failed (code {r})");
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("rivoli_mla_attend failed ({kind}, code {r})");
     }
     Ok(clat)
 }

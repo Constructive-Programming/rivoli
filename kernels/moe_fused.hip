@@ -82,7 +82,11 @@ extern "C" int rivoli_moe_experts(
     const unsigned char* up_packed, const float* up_scale,
     const unsigned char* down_packed, const float* down_scale,
     const float* wexpert, float* out) {
-    if (hidden <= 0 || inter <= 0 || E <= 0) return -100;
+    // Return-code convention: 0 = success, POSITIVE = an argument guard in this
+    // launcher, NEGATIVE = -(hipError_t) from the runtime. Guards must stay out
+    // of HIP's enum range (hipErrorNoDevice=100, hipErrorInvalidDevice=101, ...)
+    // so a device fault is never misreported as "bad args".
+    if (hidden <= 0 || inter <= 0 || E <= 0) return 1001;
     size_t rb_h = (size_t)(hidden + 1) / 2;
     size_t rb_i = (size_t)(inter + 1) / 2;
     size_t gate_bytes = (size_t)E * inter * rb_h;  // == up_bytes
@@ -92,7 +96,7 @@ extern "C" int rivoli_moe_experts(
     size_t lds = (size_t)inter * sizeof(float);
     // gfx1151 LDS ceiling is 64KB/workgroup; fail loudly rather than launch
     // with clamped shared memory (M2 shapes stay well under this).
-    if (lds > 65536) return -101;
+    if (lds > 65536) return 1002;
 
     hipError_t err;
     float *dx = 0, *dgs = 0, *dus = 0, *dds = 0, *dw = 0, *dout = 0;
