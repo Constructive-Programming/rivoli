@@ -110,6 +110,21 @@ pub fn dequant_int8_row(packed: &[u8], scale_bytes: &[u8], row: usize, out: &mut
     }
 }
 
+/// GEMV against a per-row **int8** matrix `W[o_dim, i_dim]` (row major, one
+/// byte per weight + per-row f32 scale) — the lm_head projection to logits.
+/// `y[o] = scale[o] * Σ_i (int8)packed[o·i_dim+i] * x[i]`.
+pub fn matvec_i8(y: &mut [f32], x: &[f32], packed: &[u8], scale_bytes: &[u8], i_dim: usize) {
+    debug_assert_eq!(x.len(), i_dim);
+    debug_assert_eq!(packed.len(), y.len() * i_dim);
+    for (o, (yo, row)) in y.iter_mut().zip(packed.chunks_exact(i_dim)).enumerate() {
+        let mut acc = 0.0f32;
+        for (&b, &xi) in row.iter().zip(x) {
+            acc += (b as i8) as f32 * xi;
+        }
+        *yo = acc * scale_at(scale_bytes, o);
+    }
+}
+
 /// GEMV against a plain f32 weight matrix `W[o_dim, i_dim]` (row major),
 /// borrowing the raw little-endian bytes from the mmap and decoding inline —
 /// no `Vec<f32>` materialization. Used for the F32 router gate on the per-token

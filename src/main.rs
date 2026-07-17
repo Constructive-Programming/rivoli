@@ -110,55 +110,27 @@ async fn run(cfg: Config) -> Result<()> {
         Err(e) => info!("HIP probe unavailable: {e}"),
     }
 
-    // M1 smoke: run the real int4 weights through the new MLP/MoE path. Embed
-    // the last prompt token and feed it (raw — attention isn't wired yet) into
-    // the dense MLP (layer 0) and the first MoE block. This exercises embedding
-    // + SwiGLU + sigmoid routing on real weights; magnitudes are indicative,
-    // not the final forward (that needs attention + the per-layer norms).
-    let last = prompt_ids.last().copied().context("empty prompt")?;
-    // embed_tokens is int8 (one byte/weight), not int4 — a small distinct class.
-    let embed_bytes = snap.require("model.embed_tokens.weight")?;
-    let embed_scale = snap.require("model.embed_tokens.weight.qs")?;
-    let mut x = vec![0.0f32; mc.hidden];
-    rivoli::quant::dequant_int8_row(embed_bytes, embed_scale, last as usize, &mut x);
-    let l2 = |v: &[f32]| v.iter().map(|&a| a * a).sum::<f32>().sqrt();
-    info!("embed[{last}]: l2={:.3} x[0..3]={:?}", l2(&x), &x[..3]);
-
-    let max_inter = mc.dense_inter.max(mc.moe_inter * mc.n_shared);
-    let mut scratch = rivoli::moe::MlpScratch::new(mc.hidden, max_inter);
-    let mut out = vec![0.0f32; mc.hidden];
-    rivoli::moe::dense_mlp(&snap, &mc, 0, &x, &mut scratch, &mut out)?;
-    info!("dense MLP L0: l2={:.3} out[0..3]={:?}", l2(&out), &out[..3]);
-    rivoli::moe::moe_block(&snap, &mc, mc.dense_layers, &x, &mut scratch, &mut out)?;
+    // M1 gate: greedy-decode the bench prompt through the full forward pass and
+    // print the continuation. Coherence is the gate; speed is a later milestone.
+    let ngen = cfg
+        .bench
+        .context("server mode not yet implemented; use -bench <tokens>")?;
+    let mut engine = rivoli::engine::Engine::new(&snap, &mc);
+    let t0 = std::time::Instant::now();
+    let mut text = String::new();
+    let mut dec = tok.decoder();
+    let ids = engine.generate(&prompt_ids, ngen, &|id| tok.is_eos(id), |id| {
+        if let Ok(piece) = dec.step(id) {
+            text.push_str(&piece);
+        }
+    })?;
+    let dt = t0.elapsed().as_secs_f64();
     info!(
-        "MoE L{}: l2={:.3} out[0..3]={:?}",
-        mc.dense_layers,
-        l2(&out),
-        &out[..3]
+        "generated {} tokens in {:.1}s ({:.2} tok/s)",
+        ids.len(),
+        dt,
+        ids.len() as f64 / dt
     );
-
-    // MLA attention smoke: input_layernorm → attention on layer 0, appending to
-    // the KV cache. Exercises the full absorb path (q_a/q_b/kv_a/kv_b/o + RoPE +
-    // bf16 latents) on real weights for the first two positions.
-    let mut kv = rivoli::attn::KvCache::new(&mc);
-    let mut ascr = rivoli::attn::AttnScratch::new(&mc);
-    let in_ln = rivoli::quant::read_f32(snap.require("model.layers.0.input_layernorm.weight")?);
-    let mut xn = vec![0.0f32; mc.hidden];
-    let mut aout = vec![0.0f32; mc.hidden];
-    for pos in 0..2 {
-        xn.copy_from_slice(&x);
-        rivoli::math::rmsnorm(&mut xn, &in_ln, mc.rms_norm_eps as f32);
-        rivoli::attn::attention(&snap, &mc, 0, &xn, pos, &mut kv, &mut ascr, &mut aout)?;
-        info!(
-            "attn L0 pos{pos}: l2={:.3} out[0..3]={:?}",
-            l2(&aout),
-            &aout[..3]
-        );
-    }
-
-    match cfg.bench {
-        Some(n) => info!("bench mode ({n} tokens) — full decode loop wiring is next"),
-        None => bail!("server mode not yet implemented; use -bench <tokens>"),
-    }
+    info!("{BENCH_PROMPT}{text}");
     Ok(())
 }
