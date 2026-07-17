@@ -1,5 +1,6 @@
 pub mod attn;
 pub mod config;
+pub mod device;
 pub mod engine;
 pub mod hip;
 pub mod math;
