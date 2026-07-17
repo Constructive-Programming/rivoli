@@ -7,12 +7,12 @@
 //! M1 gate is coherence, not sampling strategy.
 
 use crate::attn::{AttnScratch, KvCache, attention};
-use crate::math::rmsnorm;
+use crate::math::rmsnorm_into_bytes;
 use crate::model::ModelConfig;
 use crate::moe::{MlpScratch, dense_mlp, moe_block};
-use crate::quant::{dequant_int8_row, matvec_i8, read_f32};
+use crate::quant::{dequant_int8_row, matvec_i8};
 use crate::snapshot::Snapshot;
-use anyhow::Result;
+use anyhow::{Result, bail, ensure};
 
 pub struct Engine<'a> {
     snap: &'a Snapshot,
@@ -28,13 +28,12 @@ pub struct Engine<'a> {
 
 impl<'a> Engine<'a> {
     pub fn new(snap: &'a Snapshot, cfg: &'a ModelConfig) -> Self {
-        let max_inter = cfg.dense_inter.max(cfg.moe_inter * cfg.n_shared);
         Self {
             snap,
             cfg,
             kv: KvCache::new(cfg),
             ascr: AttnScratch::new(cfg),
-            mscr: MlpScratch::new(cfg.hidden, max_inter),
+            mscr: MlpScratch::new(cfg),
             x: vec![0.0; cfg.hidden],
             xn: vec![0.0; cfg.hidden],
             sub: vec![0.0; cfg.hidden],
@@ -48,17 +47,15 @@ impl<'a> Engine<'a> {
         let cfg = self.cfg;
         let eps = cfg.rms_norm_eps as f32;
 
-        // Embedding (int8 table).
-        let eb = self.snap.require("model.embed_tokens.weight")?;
-        let es = self.snap.require("model.embed_tokens.weight.qs")?;
-        dequant_int8_row(eb, es, token as usize, &mut self.x);
+        // Embedding (int8 table, validated).
+        let embed = self.snap.int8("model.embed_tokens", cfg.hidden)?;
+        dequant_int8_row(&embed, token as usize, &mut self.x);
 
         for layer in 0..cfg.n_layers {
             let lb = format!("model.layers.{layer}");
-            // Attention sublayer.
-            let in_ln = read_f32(self.snap.require(&format!("{lb}.input_layernorm.weight"))?);
-            self.xn.copy_from_slice(&self.x);
-            rmsnorm(&mut self.xn, &in_ln, eps);
+            // Attention sublayer: rmsnorm(input_ln) into xn (residual x survives).
+            let in_ln = self.snap.require(&format!("{lb}.input_layernorm.weight"))?;
+            rmsnorm_into_bytes(&mut self.xn, &self.x, in_ln, eps);
             attention(
                 self.snap,
                 cfg,
@@ -74,12 +71,10 @@ impl<'a> Engine<'a> {
             }
 
             // MLP sublayer (dense for the first layers, MoE after).
-            let post_ln = read_f32(
-                self.snap
-                    .require(&format!("{lb}.post_attention_layernorm.weight"))?,
-            );
-            self.xn.copy_from_slice(&self.x);
-            rmsnorm(&mut self.xn, &post_ln, eps);
+            let post_ln = self
+                .snap
+                .require(&format!("{lb}.post_attention_layernorm.weight"))?;
+            rmsnorm_into_bytes(&mut self.xn, &self.x, post_ln, eps);
             if layer < cfg.dense_layers {
                 dense_mlp(
                     self.snap,
@@ -104,16 +99,18 @@ impl<'a> Engine<'a> {
             }
         }
 
-        // Final norm + lm_head → logits.
-        let norm = read_f32(self.snap.require("model.norm.weight")?);
-        rmsnorm(&mut self.x, &norm, eps);
-        let hb = self.snap.require("lm_head.weight")?;
-        let hs = self.snap.require("lm_head.weight.qs")?;
-        matvec_i8(&mut self.logits, &self.x, hb, hs, cfg.hidden);
+        // Final norm (into xn; x no longer needed) + lm_head → logits.
+        let norm = self.snap.require("model.norm.weight")?;
+        rmsnorm_into_bytes(&mut self.xn, &self.x, norm, eps);
+        let head = self.snap.int8("lm_head", cfg.hidden)?;
+        matvec_i8(&mut self.logits, &self.xn, &head);
         Ok(())
     }
 
-    fn argmax(&self) -> u32 {
+    /// Greedy argmax over the current logits; errors if the winner is
+    /// non-finite (a NaN anywhere in the forward pass would otherwise silently
+    /// return token 0, i.e. coherent-looking garbage).
+    fn argmax(&self) -> Result<u32> {
         let mut best = 0usize;
         let mut bv = f32::NEG_INFINITY;
         for (i, &l) in self.logits.iter().enumerate() {
@@ -122,18 +119,16 @@ impl<'a> Engine<'a> {
                 best = i;
             }
         }
-        best as u32
+        if !bv.is_finite() {
+            bail!("logits are non-finite (NaN/Inf in the forward pass)");
+        }
+        Ok(best as u32)
     }
 
-    /// Greedy-decode `ngen` tokens continuing `prompt_ids`. Calls `emit` with
-    /// each generated id in order; stops early on `is_eos`. Returns the ids.
-    pub fn generate(
-        &mut self,
-        prompt_ids: &[u32],
-        ngen: usize,
-        is_eos: &dyn Fn(u32) -> bool,
-        mut emit: impl FnMut(u32),
-    ) -> Result<Vec<u32>> {
+    /// Greedy-decode up to `ngen` tokens continuing `prompt_ids`, stopping early
+    /// on any `eos` id. Returns the generated ids (the caller detokenizes).
+    pub fn generate(&mut self, prompt_ids: &[u32], ngen: usize, eos: &[u32]) -> Result<Vec<u32>> {
+        ensure!(!prompt_ids.is_empty(), "empty prompt");
         let mut pos = 0usize;
         // Prefill: run every prompt token; the last one's logits start decode.
         for &tok in prompt_ids {
@@ -142,12 +137,11 @@ impl<'a> Engine<'a> {
         }
         let mut generated = Vec::with_capacity(ngen);
         for _ in 0..ngen {
-            let next = self.argmax();
-            if is_eos(next) {
+            let next = self.argmax()?;
+            if eos.contains(&next) {
                 break;
             }
             generated.push(next);
-            emit(next);
             self.forward(next, pos)?;
             pos += 1;
         }

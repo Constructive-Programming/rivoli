@@ -51,6 +51,20 @@ pub struct Int4Matrix<'a> {
     pub i_dim: usize,
 }
 
+/// A per-row **int8** weight matrix (the embedding table and lm_head, which the
+/// snapshot keeps at int8 — one signed byte per weight + one f32 scale per row).
+/// Obtained only via [`Snapshot::int8`], which validates the pairing/lengths so
+/// a mismatched snapshot fails loudly instead of yielding stale/OOB logits.
+#[derive(Debug, Clone, Copy)]
+pub struct Int8Matrix<'a> {
+    /// `o_dim` rows × `i_dim` signed bytes.
+    pub packed: &'a [u8],
+    /// `o_dim` little-endian f32 scales (raw bytes).
+    pub scale: &'a [u8],
+    pub o_dim: usize,
+    pub i_dim: usize,
+}
+
 /// Where one tensor's bytes live: which mmap'd shard and the byte range within.
 #[derive(Debug, Clone)]
 pub struct TensorLoc {
@@ -222,6 +236,50 @@ impl Snapshot {
             );
         }
         Ok(Int4Matrix {
+            packed,
+            scale,
+            o_dim,
+            i_dim,
+        })
+    }
+
+    /// Locate an int8 weight matrix `W[o_dim, i_dim]` by base name (`<name>.weight`
+    /// U8 + `<name>.weight.qs` F32). `o_dim` is derived from the scale count and
+    /// cross-checked against the packed byte count (`o_dim * i_dim`, one byte per
+    /// weight). Only constructor of [`Int8Matrix`].
+    pub fn int8(&self, name: &str, i_dim: usize) -> Result<Int8Matrix<'_>> {
+        let wname = format!("{name}.weight");
+        let sname = format!("{name}.weight.qs");
+        let wdt = self
+            .index
+            .get(&wname)
+            .with_context(|| format!("int8 weight {wname} not found"))?
+            .dtype;
+        let sdt = self
+            .index
+            .get(&sname)
+            .with_context(|| format!("int8 scale {sname} not found"))?
+            .dtype;
+        if wdt != Dtype::U8 {
+            bail!("{wname} is {wdt:?}, expected U8 int8");
+        }
+        if sdt != Dtype::F32 {
+            bail!("{sname} is {sdt:?}, expected F32 scale");
+        }
+        let packed = self.require(&wname)?;
+        let scale = self.require(&sname)?;
+        if !scale.len().is_multiple_of(4) {
+            bail!("{sname}: {} scale bytes, not a multiple of 4", scale.len());
+        }
+        let o_dim = scale.len() / 4;
+        if packed.len() != o_dim * i_dim {
+            bail!(
+                "{wname}: {} bytes for o_dim={o_dim} i_dim={i_dim}, expected {}",
+                packed.len(),
+                o_dim * i_dim
+            );
+        }
+        Ok(Int8Matrix {
             packed,
             scale,
             o_dim,

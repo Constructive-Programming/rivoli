@@ -117,13 +117,7 @@ async fn run(cfg: Config) -> Result<()> {
         .context("server mode not yet implemented; use -bench <tokens>")?;
     let mut engine = rivoli::engine::Engine::new(&snap, &mc);
     let t0 = std::time::Instant::now();
-    let mut text = String::new();
-    let mut dec = tok.decoder();
-    let ids = engine.generate(&prompt_ids, ngen, &|id| tok.is_eos(id), |id| {
-        if let Ok(piece) = dec.step(id) {
-            text.push_str(&piece);
-        }
-    })?;
+    let ids = engine.generate(&prompt_ids, ngen, &tok.eos)?;
     let dt = t0.elapsed().as_secs_f64();
     info!(
         "generated {} tokens in {:.1}s ({:.2} tok/s)",
@@ -131,6 +125,6 @@ async fn run(cfg: Config) -> Result<()> {
         dt,
         ids.len() as f64 / dt
     );
-    info!("{BENCH_PROMPT}{text}");
+    info!("{BENCH_PROMPT}{}", tok.decode_all(&ids)?);
     Ok(())
 }

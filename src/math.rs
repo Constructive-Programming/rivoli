@@ -15,6 +15,23 @@ pub fn rmsnorm(v: &mut [f32], weight: &[f32], eps: f32) {
     }
 }
 
+/// RMSNorm writing into `dst` from `src`, with the weight read inline from raw
+/// little-endian f32 bytes (the mmap tensor) — no `Vec<f32>` decode and no
+/// separate copy pass: `dst = src / sqrt(mean(src²)+eps) * weight`, `src`
+/// untouched (so the residual survives). Fuses the copy+norm+weight-decode the
+/// decode loop otherwise does in three passes.
+pub fn rmsnorm_into_bytes(dst: &mut [f32], src: &[f32], weight_bytes: &[u8], eps: f32) {
+    debug_assert_eq!(dst.len(), src.len());
+    debug_assert_eq!(weight_bytes.len(), src.len() * 4);
+    let n = src.len() as f32;
+    let ms = src.iter().map(|&x| x * x).sum::<f32>() / n;
+    let inv = 1.0 / (ms + eps).sqrt();
+    for ((d, &s), wc) in dst.iter_mut().zip(src).zip(weight_bytes.chunks_exact(4)) {
+        let w = f32::from_le_bytes([wc[0], wc[1], wc[2], wc[3]]);
+        *d = s * inv * w;
+    }
+}
+
 /// SiLU (a.k.a. swish): `x * sigmoid(x)`.
 #[inline]
 pub fn silu(x: f32) -> f32 {
@@ -67,11 +84,21 @@ pub fn softmax(v: &mut [f32]) {
 /// `select_nth_unstable` (≈O(n)) and sorts only the `k` selected, instead of a
 /// full O(n log n) sort of all n — on the per-token MoE path n=256, k=8.
 pub fn topk(scores: &[f32], k: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    topk_into(scores, k, &mut out);
+    out
+}
+
+/// Like [`topk`] but fills a caller-owned buffer (reused across calls, so the
+/// per-token MoE router allocates nothing). `out` doubles as the index
+/// workspace: filled with `0..n`, partitioned, truncated to `k`, sorted.
+pub fn topk_into(scores: &[f32], k: usize, out: &mut Vec<usize>) {
     let k = k.min(scores.len());
+    out.clear();
     if k == 0 {
-        return Vec::new();
+        return;
     }
-    let mut idx: Vec<usize> = (0..scores.len()).collect();
+    out.extend(0..scores.len());
     // value-desc, index-asc tiebreak — deterministic across runs.
     let cmp = |a: &usize, b: &usize| {
         scores[*b]
@@ -79,12 +106,11 @@ pub fn topk(scores: &[f32], k: usize) -> Vec<usize> {
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.cmp(b))
     };
-    if k < idx.len() {
-        idx.select_nth_unstable_by(k - 1, cmp);
-        idx.truncate(k);
+    if k < out.len() {
+        out.select_nth_unstable_by(k - 1, cmp);
+        out.truncate(k);
     }
-    idx.sort_by(cmp);
-    idx
+    out.sort_by(cmp);
 }
 
 #[cfg(test)]

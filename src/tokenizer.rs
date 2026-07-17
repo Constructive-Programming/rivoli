@@ -57,51 +57,14 @@ impl Tokenizer {
         Ok(enc.get_ids().to_vec())
     }
 
-    /// A streaming decoder for the generation loop. Byte-level BPE routinely
-    /// splits one codepoint across several tokens, so decoding ids in isolation
-    /// mangles multi-token characters; this holds the running id buffer and
-    /// emits only the newly-stable text suffix per step.
-    pub fn decoder(&self) -> Decoder<'_> {
-        Decoder {
-            tok: self,
-            ids: Vec::new(),
-            emitted: 0,
-        }
-    }
-
-    pub fn is_eos(&self, id: u32) -> bool {
-        self.eos.contains(&id)
-    }
-}
-
-/// Incremental detokenizer. Re-decodes the growing id buffer and returns the
-/// character delta beyond what was already emitted — so a codepoint split
-/// across tokens surfaces once, whole, when its last token arrives.
-pub struct Decoder<'a> {
-    tok: &'a Tokenizer,
-    ids: Vec<u32>,
-    emitted: usize,
-}
-
-impl Decoder<'_> {
-    /// Feed one generated id; returns the new text to append (possibly empty
-    /// while a multi-token codepoint is still incomplete).
-    pub fn step(&mut self, id: u32) -> Result<String> {
-        self.ids.push(id);
-        let text = self
-            .tok
-            .inner
-            .decode(&self.ids, false)
-            .map_err(|e| anyhow!("decode: {e}"))?;
-        // Emit the stable prefix (everything up to a trailing replacement char,
-        // which marks an incomplete codepoint) beyond what we've already sent.
-        let stable = text.trim_end_matches('\u{FFFD}');
-        let stable_chars = stable.chars().count();
-        if stable_chars <= self.emitted {
-            return Ok(String::new());
-        }
-        let out: String = stable.chars().skip(self.emitted).collect();
-        self.emitted = stable_chars;
-        Ok(out)
+    /// Decode a whole id sequence to text at once. Byte-level BPE splits one
+    /// codepoint across several tokens, so decoding the complete sequence is
+    /// what keeps multi-token characters (and any trailing partial one) intact —
+    /// there is no incremental-flush footgun. Streaming detok belongs to server
+    /// mode; it can be added there when it exists.
+    pub fn decode_all(&self, ids: &[u32]) -> Result<String> {
+        self.inner
+            .decode(ids, false)
+            .map_err(|e| anyhow!("decode: {e}"))
     }
 }

@@ -9,7 +9,7 @@
 //!
 //! Dequantized weight `W[o,i] = (nibble - 8) * scale[o]`.
 
-use crate::snapshot::Int4Matrix;
+use crate::snapshot::{Int4Matrix, Int8Matrix};
 
 /// Row stride in bytes for an int4 matrix with `i_dim` input columns.
 pub fn row_bytes(i_dim: usize) -> usize {
@@ -93,35 +93,28 @@ pub fn matvec_i4(y: &mut [f32], x: &[f32], w: &Int4Matrix) {
 /// embedding table and lm_head, which the snapshot keeps as int8 (one byte per
 /// weight) rather than int4 — a distinct, small tensor class from the int4
 /// expert weights that dominate per-token traffic.
-pub fn dequant_int8_row(packed: &[u8], scale_bytes: &[u8], row: usize, out: &mut [f32]) {
-    let dim = out.len();
-    debug_assert!(
-        (row + 1) * dim <= packed.len(),
-        "int8 row {row} out of range"
-    );
-    debug_assert!(
-        (row + 1) * 4 <= scale_bytes.len(),
-        "int8 scale {row} out of range"
-    );
-    let s = scale_at(scale_bytes, row);
-    let base = row * dim;
+pub fn dequant_int8_row(w: &Int8Matrix, row: usize, out: &mut [f32]) {
+    debug_assert_eq!(out.len(), w.i_dim);
+    debug_assert!(row < w.o_dim, "int8 row {row} >= o_dim {}", w.o_dim);
+    let s = scale_at(w.scale, row);
+    let base = row * w.i_dim;
     for (i, o) in out.iter_mut().enumerate() {
-        *o = (packed[base + i] as i8) as f32 * s;
+        *o = (w.packed[base + i] as i8) as f32 * s;
     }
 }
 
 /// GEMV against a per-row **int8** matrix `W[o_dim, i_dim]` (row major, one
 /// byte per weight + per-row f32 scale) — the lm_head projection to logits.
 /// `y[o] = scale[o] * Σ_i (int8)packed[o·i_dim+i] * x[i]`.
-pub fn matvec_i8(y: &mut [f32], x: &[f32], packed: &[u8], scale_bytes: &[u8], i_dim: usize) {
-    debug_assert_eq!(x.len(), i_dim);
-    debug_assert_eq!(packed.len(), y.len() * i_dim);
-    for (o, (yo, row)) in y.iter_mut().zip(packed.chunks_exact(i_dim)).enumerate() {
+pub fn matvec_i8(y: &mut [f32], x: &[f32], w: &Int8Matrix) {
+    debug_assert_eq!(y.len(), w.o_dim);
+    debug_assert_eq!(x.len(), w.i_dim);
+    for (o, (yo, row)) in y.iter_mut().zip(w.packed.chunks_exact(w.i_dim)).enumerate() {
         let mut acc = 0.0f32;
         for (&b, &xi) in row.iter().zip(x) {
             acc += (b as i8) as f32 * xi;
         }
-        *yo = acc * scale_at(scale_bytes, o);
+        *yo = acc * scale_at(w.scale, o);
     }
 }
 
