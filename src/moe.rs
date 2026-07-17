@@ -11,7 +11,7 @@
 
 use crate::math::{silu, topk};
 use crate::model::ModelConfig;
-use crate::quant::{matvec_f32, matvec_i4, read_f32};
+use crate::quant::{matvec_f32_bytes, matvec_i4, read_f32};
 use crate::snapshot::Snapshot;
 use anyhow::Result;
 
@@ -49,6 +49,15 @@ fn swiglu_accum(
     let gate_w = snap.int4(&format!("{base}.gate_proj"), hidden)?;
     let up_w = snap.int4(&format!("{base}.up_proj"), hidden)?;
     let down_w = snap.int4(&format!("{base}.down_proj"), inter)?;
+    // Widths must match the scratch slices; a mismatch would silently truncate
+    // via zip in release, so fail loudly at the boundary instead.
+    anyhow::ensure!(
+        gate_w.o_dim == inter && up_w.o_dim == inter && down_w.o_dim == hidden,
+        "{base}: projection width mismatch (gate {} up {} down {} vs inter {inter} hidden {hidden})",
+        gate_w.o_dim,
+        up_w.o_dim,
+        down_w.o_dim
+    );
     let g = &mut scratch.gate[..inter];
     let u = &mut scratch.up[..inter];
     matvec_i4(g, x, &gate_w);
@@ -91,12 +100,18 @@ pub fn moe_block(
     out.fill(0.0);
     let lbase = format!("model.layers.{layer}.mlp");
 
-    // Router gate (F32) → sigmoid scores + correction bias for selection.
+    // Router gate (F32) → sigmoid scores + correction bias for selection. The
+    // gate weight is read inline from the mmap bytes (no per-token 6 MB copy).
     let gate_bytes = snap.require(&format!("{lbase}.gate.weight"))?;
-    let gate_w = read_f32(gate_bytes);
     let bias = read_f32(snap.require(&format!("{lbase}.gate.e_score_correction_bias"))?);
+    anyhow::ensure!(
+        bias.len() == cfg.n_experts,
+        "{lbase}.gate.e_score_correction_bias has {} entries, expected {}",
+        bias.len(),
+        cfg.n_experts
+    );
     let mut logits = vec![0.0f32; cfg.n_experts];
-    matvec_f32(&mut logits, x, &gate_w, cfg.hidden);
+    matvec_f32_bytes(&mut logits, x, gate_bytes, cfg.hidden);
 
     let scores: Vec<f32> = logits.iter().map(|&l| crate::math::sigmoid(l)).collect();
     let choice: Vec<f32> = scores.iter().zip(&bias).map(|(&s, &b)| s + b).collect();
@@ -118,9 +133,18 @@ pub fn moe_block(
         let base = format!("{lbase}.experts.{e}");
         swiglu_accum(snap, &base, x, cfg.moe_inter, we, scratch, out)?;
     }
-    // Shared expert (always, weight 1).
+    // Shared expert(s), always on (weight 1). The shared MLP's intermediate
+    // width is moe_inter × n_shared (HF Glm4MoeMLP / colibri glm.c).
     let shared = format!("{lbase}.shared_experts");
-    swiglu_accum(snap, &shared, x, cfg.moe_inter, 1.0, scratch, out)?;
+    swiglu_accum(
+        snap,
+        &shared,
+        x,
+        cfg.moe_inter * cfg.n_shared,
+        1.0,
+        scratch,
+        out,
+    )?;
     Ok(())
 }
 

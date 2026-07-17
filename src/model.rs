@@ -79,6 +79,9 @@ impl ModelConfig {
         if self.top_k > self.n_experts {
             anyhow::bail!("top_k {} > n_experts {}", self.top_k, self.n_experts);
         }
+        if self.n_shared < 1 {
+            anyhow::bail!("n_shared_experts {} < 1", self.n_shared);
+        }
         if !self.hidden.is_multiple_of(self.n_heads) {
             anyhow::bail!(
                 "hidden {} not divisible by n_heads {}",

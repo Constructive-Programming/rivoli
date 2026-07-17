@@ -61,12 +61,6 @@ pub struct TensorLoc {
     pub shape: Vec<usize>,
 }
 
-impl TensorLoc {
-    pub fn nbytes(&self) -> usize {
-        self.end - self.begin
-    }
-}
-
 /// One raw header entry as written by safetensors.
 #[derive(serde::Deserialize)]
 struct RawTensor {
@@ -176,10 +170,6 @@ impl Snapshot {
         self.index.is_empty()
     }
 
-    pub fn get(&self, name: &str) -> Option<&TensorLoc> {
-        self.index.get(name)
-    }
-
     /// Bytes of a required tensor, failing loudly with the name if missing —
     /// the decode path wants context, not a silent `None` at every call site.
     pub fn require(&self, name: &str) -> Result<&[u8]> {
@@ -216,6 +206,12 @@ impl Snapshot {
         }
         let packed = self.require(&wname)?;
         let scale = self.require(&sname)?;
+        if !scale.len().is_multiple_of(4) {
+            bail!("{sname}: {} scale bytes, not a multiple of 4", scale.len());
+        }
+        // NOTE: row_bytes = ceil(i_dim/2) can't distinguish i_dim=2k from 2k-1,
+        // so a wrong ODD i_dim would pass the byte check. Harmless for GLM
+        // (all dims even); revisit if an odd projection width ever appears.
         let o_dim = scale.len() / 4;
         let want_packed = o_dim * crate::quant::row_bytes(i_dim);
         if packed.len() != want_packed {

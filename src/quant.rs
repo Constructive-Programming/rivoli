@@ -70,6 +70,14 @@ pub fn matvec_i4(y: &mut [f32], x: &[f32], w: &Int4Matrix) {
 /// expert weights that dominate per-token traffic.
 pub fn dequant_int8_row(packed: &[u8], scale_bytes: &[u8], row: usize, out: &mut [f32]) {
     let dim = out.len();
+    debug_assert!(
+        (row + 1) * dim <= packed.len(),
+        "int8 row {row} out of range"
+    );
+    debug_assert!(
+        (row + 1) * 4 <= scale_bytes.len(),
+        "int8 scale {row} out of range"
+    );
     let s = scale_at(scale_bytes, row);
     let base = row * dim;
     for (i, o) in out.iter_mut().enumerate() {
@@ -77,14 +85,19 @@ pub fn dequant_int8_row(packed: &[u8], scale_bytes: &[u8], row: usize, out: &mut
     }
 }
 
-/// Reference GEMV against a plain f32 weight matrix `W[o_dim, i_dim]` (row
-/// major). Used only for the small F32 router gate (`mlp.gate.weight`), which
-/// the snapshot keeps unquantized — everything else is int4.
-pub fn matvec_f32(y: &mut [f32], x: &[f32], w: &[f32], i_dim: usize) {
+/// GEMV against a plain f32 weight matrix `W[o_dim, i_dim]` (row major),
+/// borrowing the raw little-endian bytes from the mmap and decoding inline —
+/// no `Vec<f32>` materialization. Used for the F32 router gate on the per-token
+/// path (the gate is the only unquantized weight; everything else is int4).
+pub fn matvec_f32_bytes(y: &mut [f32], x: &[f32], w_bytes: &[u8], i_dim: usize) {
     debug_assert_eq!(x.len(), i_dim);
-    debug_assert_eq!(w.len(), y.len() * i_dim);
-    for (yo, row) in y.iter_mut().zip(w.chunks_exact(i_dim)) {
-        *yo = row.iter().zip(x).map(|(&a, &b)| a * b).sum();
+    debug_assert_eq!(w_bytes.len(), y.len() * i_dim * 4);
+    for (yo, row) in y.iter_mut().zip(w_bytes.chunks_exact(i_dim * 4)) {
+        let mut acc = 0.0f32;
+        for (c, &xi) in row.chunks_exact(4).zip(x) {
+            acc += f32::from_le_bytes([c[0], c[1], c[2], c[3]]) * xi;
+        }
+        *yo = acc;
     }
 }
 

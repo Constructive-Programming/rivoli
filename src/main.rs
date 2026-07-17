@@ -124,7 +124,7 @@ async fn run(cfg: Config) -> Result<()> {
     let l2 = |v: &[f32]| v.iter().map(|&a| a * a).sum::<f32>().sqrt();
     info!("embed[{last}]: l2={:.3} x[0..3]={:?}", l2(&x), &x[..3]);
 
-    let max_inter = mc.dense_inter.max(mc.moe_inter);
+    let max_inter = mc.dense_inter.max(mc.moe_inter * mc.n_shared);
     let mut scratch = rivoli::moe::MlpScratch::new(mc.hidden, max_inter);
     let mut out = vec![0.0f32; mc.hidden];
     rivoli::moe::dense_mlp(&snap, &mc, 0, &x, &mut scratch, &mut out)?;
