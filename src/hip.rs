@@ -55,6 +55,10 @@ unsafe extern "C" {
         y: *mut f32,
     ) -> i32;
 
+    fn rivoli_rmsnorm(x: *const f32, w: *const f32, n: i32, eps: f32, y: *mut f32) -> i32;
+
+    fn rivoli_rope(base: *mut f32, count: i32, stride: i32, seg: i32, pos: i32, theta: f64) -> i32;
+
     #[allow(clippy::too_many_arguments)]
     fn rivoli_mla_attend(
         qabs: *const f32,
@@ -257,6 +261,70 @@ pub unsafe fn launch_gemv_i8(
     if r != 0 {
         let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
         bail!("launch_gemv_i8 failed ({kind}, code {r})");
+    }
+    Ok(())
+}
+
+/// Launch RMSNorm `y = x·(1/√(mean(x²)+eps))·w` over a device vector of `n` f32.
+///
+/// # Safety
+/// Async — `x`/`w`/`y` (each `n` f32 device pointers) must stay valid until the
+/// next [`device_sync`] returns.
+#[cfg(feature = "rocm")]
+pub unsafe fn launch_rmsnorm(
+    x: *const f32,
+    w: *const f32,
+    n: usize,
+    eps: f32,
+    y: *mut f32,
+) -> Result<()> {
+    anyhow::ensure!(n <= i32::MAX as usize, "rmsnorm n exceeds i32 ({n})");
+    // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
+    let r = unsafe { rivoli_rmsnorm(x, w, n as i32, eps, y) };
+    if r != 0 {
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("launch_rmsnorm failed ({kind}, code {r})");
+    }
+    Ok(())
+}
+
+/// Launch interleaved RoPE at position `pos` on `count` device segments of `seg`
+/// f32 each, segment `s` at `base[s*stride ..]` (matching attn.rs). Used for the
+/// KV key (count=1) and the per-head query rope segments (count=H, stride=qh).
+///
+/// # Safety
+/// Async — `base` must cover `count*stride` f32 and stay valid until the next
+/// [`device_sync`] returns.
+#[cfg(feature = "rocm")]
+pub unsafe fn launch_rope(
+    base: *mut f32,
+    count: usize,
+    stride: usize,
+    seg: usize,
+    pos: usize,
+    theta: f64,
+) -> Result<()> {
+    anyhow::ensure!(
+        count <= i32::MAX as usize
+            && stride <= i32::MAX as usize
+            && seg <= i32::MAX as usize
+            && pos <= i32::MAX as usize,
+        "rope dims exceed i32 (count={count} stride={stride} seg={seg} pos={pos})"
+    );
+    // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
+    let r = unsafe {
+        rivoli_rope(
+            base,
+            count as i32,
+            stride as i32,
+            seg as i32,
+            pos as i32,
+            theta,
+        )
+    };
+    if r != 0 {
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("launch_rope failed ({kind}, code {r})");
     }
     Ok(())
 }

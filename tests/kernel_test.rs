@@ -12,6 +12,7 @@
 use rivoli::device::{DeviceBuf, DeviceTier};
 use rivoli::hip::{
     ExpertDesc, device_sync, launch_attend, launch_gemv_i4, launch_gemv_i8, launch_moe,
+    launch_rmsnorm, launch_rope,
 };
 use rivoli::math::{bf16_to_f32, f32_to_bf16, silu, softmax};
 use rivoli::quant::{matvec_i4, matvec_i8, row_bytes};
@@ -463,6 +464,65 @@ fn gemv_i8_matches_scalar() {
         &f32_vec(&y_buf.copy_out().expect("copy out")),
         "gemv_i8",
     );
+}
+
+#[test]
+fn rmsnorm_matches_scalar() {
+    let mut rng = Lcg(0x5551_0001);
+    let n = 6144usize;
+    let x: Vec<f32> = (0..n).map(|_| rng.f() * 3.0).collect();
+    let w: Vec<f32> = (0..n).map(|_| rng.f()).collect();
+    let mut want = x.clone();
+    rivoli::math::rmsnorm(&mut want, &w, 1e-5);
+
+    let x_buf = DeviceBuf::from_bytes(&f32_bytes(&x)).expect("place x");
+    let w_buf = DeviceBuf::from_bytes(&f32_bytes(&w)).expect("place w");
+    let mut y_buf = DeviceBuf::zeroed(n * 4).expect("alloc y");
+    // SAFETY: device pointers valid for n; y outlives the sync.
+    unsafe {
+        launch_rmsnorm(
+            x_buf.ptr() as *const f32,
+            w_buf.ptr() as *const f32,
+            n,
+            1e-5,
+            y_buf.ptr_mut() as *mut f32,
+        )
+        .expect("launch rmsnorm");
+    }
+    device_sync().expect("device sync");
+    assert_close(
+        &want,
+        &f32_vec(&y_buf.copy_out().expect("copy out")),
+        "rmsnorm",
+    );
+}
+
+#[test]
+fn rope_matches_scalar() {
+    // Batched per-head rope: H segments of `seg` at stride `qh`, rope applied to
+    // the [nope, nope+seg) slice of each head (as in attention). Compare to
+    // attn::rope_interleave on each segment.
+    let mut rng = Lcg(0x600d_600d);
+    let (h, qh, nope, seg, pos) = (16usize, 192usize, 128usize, 64usize, 137usize);
+    let theta = 8_000_000.0f64;
+    let mut q: Vec<f32> = (0..h * qh).map(|_| rng.f()).collect();
+
+    let mut want = q.clone();
+    for head in 0..h {
+        let off = head * qh + nope;
+        rivoli::attn::rope_interleave(&mut want[off..off + seg], pos, theta);
+    }
+
+    let mut q_buf = DeviceBuf::from_bytes(&f32_bytes(&q)).expect("place q");
+    // base points at the first head's rope segment; stride qh strides heads.
+    // SAFETY: base+count*stride within the h*qh buffer; outlives the sync.
+    unsafe {
+        let base = (q_buf.ptr_mut() as *mut f32).add(nope);
+        launch_rope(base, h, qh, seg, pos, theta).expect("launch rope");
+    }
+    device_sync().expect("device sync");
+    q = f32_vec(&q_buf.copy_out().expect("copy out"));
+    assert_close(&want, &q, "rope");
 }
 
 #[test]

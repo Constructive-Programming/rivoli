@@ -91,7 +91,7 @@ const MAX_ROPE: usize = 256;
 /// output halves are [rotated-first | rotated-second]. Angles are computed in
 /// f64 (colibri does too) — f32 argument reduction drifts ~pos·1e-7 rad and
 /// would widen the M2 kernel-vs-reference tolerance at long context.
-fn rope_interleave(v: &mut [f32], pos: usize, theta: f64) {
+pub fn rope_interleave(v: &mut [f32], pos: usize, theta: f64) {
     let n = v.len();
     debug_assert!(n.is_multiple_of(2), "rope dim must be even");
     debug_assert!(n <= MAX_ROPE, "rope dim {n} exceeds MAX_ROPE");
