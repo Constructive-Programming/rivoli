@@ -66,6 +66,10 @@ pub struct GpuEngine<'a> {
     scores: Vec<f32>,
     choice: Vec<f32>,
     sel: Vec<usize>,
+    // Online usage accumulation (merged back into .coli_usage at exit) so the
+    // pin progressively matches the real workload — the M4 fix for the pin/prompt
+    // hit-rate mismatch.
+    acc: crate::usage::Usage,
 }
 
 impl<'a> GpuEngine<'a> {
@@ -114,6 +118,7 @@ impl<'a> GpuEngine<'a> {
             scores: vec![0.0; cfg.n_experts],
             choice: vec![0.0; cfg.n_experts],
             sel: Vec::with_capacity(cfg.top_k),
+            acc: crate::usage::Usage::default(),
             pin,
         })
     }
@@ -123,6 +128,10 @@ impl<'a> GpuEngine<'a> {
     }
     pub fn misses(&self) -> u64 {
         self.pin.misses
+    }
+    /// The routing selections recorded this run (merge back into `.coli_usage`).
+    pub fn accumulated(&self) -> &crate::usage::Usage {
+        &self.acc
     }
 
     /// One forward pass for `token` at `pos`, leaving next-token logits device-
@@ -223,7 +232,7 @@ impl<'a> GpuEngine<'a> {
             // --- MLP sublayer ---
             self.moe_out.zero()?;
             if is_dense {
-                let m = dense_mlp.expect("dense mlp");
+                let m = dense_mlp.ok_or_else(|| anyhow::anyhow!("dense layer {l} missing mlp"))?;
                 let d = [desc_of(&m)];
                 self.descs_buf.copy_in_at(0, desc_bytes(&d))?;
                 self.wexpert_buf.copy_in_at(0, &f32_le(&[1.0]))?;
@@ -247,6 +256,9 @@ impl<'a> GpuEngine<'a> {
                 let gl = self.gate_logits.copy_out()?;
                 let bias = self.pin.moe_bias(l).to_vec();
                 self.route(&gl, &bias);
+                for &e in &self.sel {
+                    self.acc.record(l as u16, e as u16); // online usage accumulation
+                }
                 self.pin.begin_layer();
                 // Resolve selected experts (+ shared), build the descriptor batch.
                 let ke = self.sel.len();

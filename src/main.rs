@@ -143,7 +143,18 @@ async fn run(cfg: Config) -> Result<()> {
             100.0 * hits as f64 / (hits + misses).max(1) as f64,
         );
         info!("{BENCH_PROMPT}{}", tok.decode_all(&ids)?);
-        return Ok(());
+
+        // Merge this run's routing back into .coli_usage so the next pin matches
+        // the workload better (online usage accumulation — M4).
+        let acc = engine.accumulated().clone();
+        let mut merged = rivoli::usage::Usage::load(&cfg.snapshot)?;
+        merged.merge(&acc);
+        merged.write(&cfg.snapshot)?;
+        info!(
+            "usage: recorded {} selections this run, merged → .coli_usage",
+            acc.total_selections()
+        );
+        Ok(())
     }
 
     #[cfg(not(feature = "rocm"))]

@@ -7,12 +7,39 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 
 /// Accumulated selection counts, keyed by (layer, expert).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Usage {
     pub counts: HashMap<(u16, u16), u64>,
 }
 
 impl Usage {
+    /// Record one routed-expert selection (online accumulation during decode).
+    pub fn record(&mut self, layer: u16, expert: u16) {
+        *self.counts.entry((layer, expert)).or_insert(0) += 1;
+    }
+
+    /// Add another accumulator's counts into this one (merging a run's
+    /// selections back into the on-disk history before write-back).
+    pub fn merge(&mut self, other: &Usage) {
+        for (&k, &c) in &other.counts {
+            *self.counts.entry(k).or_insert(0) += c;
+        }
+    }
+
+    /// Write `<dir>/.coli_usage` in the shared `layer expert count` text format.
+    pub fn write(&self, dir: &str) -> Result<()> {
+        use std::fmt::Write as _;
+        let path = format!("{dir}/.coli_usage");
+        let mut s = String::with_capacity(self.counts.len() * 12);
+        // Deterministic order so the file is stable diff-to-diff.
+        let mut rows: Vec<_> = self.counts.iter().collect();
+        rows.sort_by_key(|&(&k, _)| k);
+        for (&(l, e), &c) in rows {
+            let _ = writeln!(s, "{l} {e} {c}");
+        }
+        std::fs::write(&path, s).with_context(|| format!("write {path}"))?;
+        Ok(())
+    }
     /// Load `<dir>/.coli_usage`. A missing file is not an error — it means no
     /// history yet (cold start), so the pin falls back to natural order.
     pub fn load(dir: &str) -> Result<Self> {
@@ -54,6 +81,22 @@ impl Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_and_merge_accumulate() {
+        let mut a = Usage::default();
+        a.record(3, 5);
+        a.record(3, 5);
+        a.record(4, 1);
+        let mut b = Usage::default();
+        b.record(3, 5); // overlaps a
+        b.record(7, 2);
+        a.merge(&b);
+        assert_eq!(a.counts[&(3, 5)], 3); // 2 + 1
+        assert_eq!(a.counts[&(4, 1)], 1);
+        assert_eq!(a.counts[&(7, 2)], 1);
+        assert_eq!(a.total_selections(), 5);
+    }
 
     #[test]
     fn ranks_hottest_first_deterministically() {
