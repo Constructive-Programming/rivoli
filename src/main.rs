@@ -119,8 +119,8 @@ async fn run(cfg: Config) -> Result<()> {
     #[cfg(feature = "rocm")]
     {
         let (free, _total) = rivoli::device::mem_info()?;
-        // Leave 6 GiB free; cap the first-run tier so startup placement is bounded.
-        let cap = free.saturating_sub(6 << 30).min(24 << 30);
+        // Leave 6 GiB free; cap the tier (48 GiB proven safe for one-shot alloc).
+        let cap = free.saturating_sub(6 << 30).min(48 << 30);
         let t = std::time::Instant::now();
         let pin = rivoli::pin::Pin::build(&snap, &mc, &usage, cap)?;
         info!(
