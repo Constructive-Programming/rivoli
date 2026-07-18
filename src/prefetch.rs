@@ -12,7 +12,7 @@
 //! `rocm`-only (its sole consumer is the GPU engine).
 #![cfg(feature = "rocm")]
 
-use std::sync::mpsc::{Sender, channel};
+use crossbeam_channel::{Sender, unbounded};
 use std::thread::JoinHandle;
 
 /// A batch of `(addr, len)` read-only mmap ranges to fault into the page cache.
@@ -25,7 +25,7 @@ pub struct Prefetcher {
 
 impl Prefetcher {
     pub fn new() -> Self {
-        let (tx, rx) = channel::<Batch>();
+        let (tx, rx) = unbounded::<Batch>();
         let handle = std::thread::spawn(move || {
             let mut sink = 0u8;
             // Drain batches until the sender is dropped (Drop closes the channel).

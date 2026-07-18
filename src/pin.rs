@@ -18,6 +18,7 @@ use crate::model::ModelConfig;
 use crate::snapshot::Snapshot;
 use crate::usage::Usage;
 use anyhow::{Context, Result, ensure};
+use rayon::prelude::*;
 
 /// Drop the page-cache copy of a just-placed mmap range (`MADV_DONTNEED`) so the
 /// resident pin doesn't pollute the cache the cold-expert set needs. Only whole
@@ -363,15 +364,16 @@ impl<'a> Pin<'a> {
             }
             return;
         }
-        let nthreads = ranges.len().min(8);
-        let per = ranges.len().div_ceil(nthreads);
-        std::thread::scope(|s| {
-            for chunk in ranges.chunks(per) {
-                s.spawn(move || {
-                    for &(addr, len) in chunk {
-                        touch(addr, len);
-                    }
-                });
+        // Dispatch the page-faulting to rayon's persistent global pool instead of
+        // spawning OS threads per call (~600/token). Chunk so at most ~8 chunks are
+        // produced (matching the old `.min(8)` fan-out); `par_chunks(..).for_each`
+        // uses the lazily-initialized global workers and blocks until every page is
+        // faulted — the synchronous barrier the serial `copy_in` depends on.
+        let nchunks = ranges.len().min(8);
+        let per = ranges.len().div_ceil(nchunks);
+        ranges.par_chunks(per).for_each(|chunk| {
+            for &(addr, len) in chunk {
+                touch(addr, len);
             }
         });
     }
