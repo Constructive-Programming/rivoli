@@ -88,7 +88,7 @@ APU the host grant succeeds, the CPU writes in place, and the GPU reads it at
 fill = exact, rel_err 0). This is the primitive `device::VmmBuf` (via the C ABI
 shim `kernels/vmm.hip`: `rivoli_vmm_alloc`/`rivoli_vmm_free`).
 
-Microbench (`scratchpad/vmm_probe.cpp`, 1 GiB, gfx1151):
+Microbench (`docs/probes/vmm_probe.cpp`, 1 GiB, gfx1151):
 
 | memory | read BW | CPU-fillable |
 |---|---|---|

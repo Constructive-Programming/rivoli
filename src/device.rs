@@ -360,17 +360,25 @@ mod tier {
         }
 
         /// Host memcpy `bytes` at `off` (device-local memory is host-writable via
-        /// the VMM host grant — no `hipMemcpy`, no sync; the GPU sees it at the
-        /// next launch, verified CPU->GPU coherent).
+        /// the VMM host grant — no `hipMemcpy`, no sync).
+        ///
+        /// Ordering: the GPU sees these stores at the next kernel launch on THIS
+        /// (the single HIP/decode) thread — the launch's dispatch packet carries a
+        /// release fence (drains the CPU store buffer) + a system-scope acquire
+        /// (invalidates GPU caches), and gfx1151's coherent fabric lets the
+        /// host-granted device-local mapping participate. Verified CPU->GPU
+        /// coherent on this APU (docs/probes/vmm_probe.cpp). NOT a HIP contract for
+        /// arbitrary hardware: a port off gfx1151, or issuing the fill from a
+        /// background HIP thread, must re-verify or insert an explicit fence.
         pub fn write_at(&mut self, off: usize, bytes: &[u8]) -> Result<()> {
             ensure!(
-                off + bytes.len() <= self.len,
+                bytes.len() <= self.len.saturating_sub(off),
                 "vmm write {off}+{} > len {}",
                 bytes.len(),
                 self.len
             );
-            // SAFETY: off+len ≤ len (checked); ptr is host-addressable; src (mmap)
-            // and dst (this slab) are distinct regions.
+            // SAFETY: off+len ≤ len (checked, overflow-safe); ptr is host-
+            // addressable; src (mmap) and dst (this slab) are distinct regions.
             unsafe {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(off), bytes.len());
             }
