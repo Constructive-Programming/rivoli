@@ -30,11 +30,11 @@ extern "C" __global__ void mla_absorb(
     int head = idx / kvl;
     int i = idx % kvl;
     size_t rb = (size_t)(kvl + 1) / 2;
-    int rbase = head * (nope + vh);
+    size_t rbase = (size_t)head * (nope + vh);  // 64-bit so the row index can't wrap
     const float* qh_ptr = q + (size_t)head * qh;
     float acc = 0.0f;
     for (int d = 0; d < nope; ++d) {
-        const unsigned char* row = kvb_packed + (size_t)(rbase + d) * rb;
+        const unsigned char* row = kvb_packed + (rbase + d) * rb;
         acc += qh_ptr[d] * (float)nib_i4(row, i) * kvb_scale[rbase + d];
     }
     qabs[(size_t)head * kvl + i] = acc;
@@ -53,8 +53,8 @@ extern "C" __global__ void mla_value(
     int head = idx / vh;
     int j = idx % vh;
     size_t rb = (size_t)(kvl + 1) / 2;
-    int row_idx = head * (nope + vh) + nope + j;
-    const unsigned char* row = kvb_packed + (size_t)row_idx * rb;
+    size_t row_idx = (size_t)head * (nope + vh) + nope + j;  // 64-bit row index
+    const unsigned char* row = kvb_packed + row_idx * rb;
     const float* cl = clat + (size_t)head * kvl;
     float acc = 0.0f;
     for (int i = 0; i < kvl; ++i) acc += cl[i] * (float)nib_i4(row, i);

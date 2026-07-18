@@ -503,11 +503,9 @@ fn gemv_i8_matches_scalar() {
     );
 }
 
-#[test]
-fn mla_absorb_and_value_match_scalar() {
+fn check_mla(seed: u64, h: usize, qh: usize, nope: usize, vh: usize, kvl: usize) {
     // MLA-ish dims: kv_b [H*(nope+vh), kvl]; q [H*qh]; clat [H*kvl].
-    let (h, qh, nope, vh, kvl) = (8usize, 192usize, 128usize, 128usize, 512usize);
-    let mut rng = Lcg(0x3c0f_fee5);
+    let mut rng = Lcg(seed);
     let kvb = gen_mat(&mut rng, h * (nope + vh), kvl);
     let q: Vec<f32> = (0..h * qh).map(|_| rng.f()).collect();
     let clat: Vec<f32> = (0..h * kvl).map(|_| rng.f()).collect();
@@ -581,6 +579,14 @@ fn mla_absorb_and_value_match_scalar() {
         &f32_vec(&ctx_buf.copy_out().expect("copy ctx")),
         "mla_value",
     );
+}
+
+#[test]
+fn mla_absorb_and_value_match_scalar() {
+    // nope≠vh so a value-row offset swap (rbase+nope vs rbase+vh) can't hide;
+    // qh≠nope covers the absorb stride. Plus an odd-kvl case for the rb ceil.
+    check_mla(0x3c0f_fee5, 8, 192, 128, 96, 512);
+    check_mla(0x0dd_c0de5, 4, 96, 64, 48, 129);
 }
 
 #[test]
