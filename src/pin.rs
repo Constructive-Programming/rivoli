@@ -103,6 +103,14 @@ pub struct Pin<'a> {
     /// Stats over the run.
     pub hits: u64,
     pub misses: u64,
+    /// Cold-LRU reuse probe: distinct cold (layer,expert) pairs seen, and how many
+    /// cold selections were REPEATS (would hit a cross-token cache). reuse =
+    /// repeats/misses is the LRU ceiling; `cold_seen.len()` is the size it needs.
+    cold_seen: std::collections::HashSet<u32>,
+    pub cold_repeat: u64,
+    /// Every routed (layer,expert) selection this run — to simulate an LRU-only
+    /// routed tier of various sizes (probe: is the LRU better than the static pin?).
+    cold_trace: Vec<u32>,
 }
 
 /// Place a norm/f32 tensor (O-length) into the tier: reserve, then `pread` the
@@ -170,7 +178,7 @@ fn place_mlp(
 
 /// Bytes one routed expert (gate+up+down int4 + scales) occupies — the cold-slot
 /// and pin-budget accounting unit.
-fn expert_bytes(cfg: &ModelConfig) -> usize {
+pub fn expert_bytes(cfg: &ModelConfig) -> usize {
     let rb_h = cfg.hidden.div_ceil(2);
     let rb_i = cfg.moe_inter.div_ceil(2);
     // gate+up: [moe_inter, hidden]; down: [hidden, moe_inter]; + f32 scales.
@@ -329,6 +337,9 @@ impl<'a> Pin<'a> {
             stream,
             hits: 0,
             misses: 0,
+            cold_seen: std::collections::HashSet::new(),
+            cold_repeat: 0,
+            cold_trace: Vec::new(),
         })
     }
 
@@ -346,6 +357,42 @@ impl<'a> Pin<'a> {
     /// means colibri never selected it — a routing-divergence signal.
     pub fn expert_rank(&self, layer: usize, expert: usize) -> Option<u32> {
         self.rank.get(&(layer as u16, expert as u16)).copied()
+    }
+
+    /// Distinct cold (layer,expert) pairs streamed so far — the size a cross-token
+    /// cold LRU would need to hold the whole working set.
+    pub fn cold_distinct(&self) -> usize {
+        self.cold_seen.len()
+    }
+
+    /// Simulate an LRU-only routed tier of each `size` (slots) over this run's
+    /// selection trace: returns `(size, hit_fraction)`. Answers "would replacing
+    /// the static frequency pin with an adaptive LRU of N slots hit more?".
+    pub fn lru_sim(&self, sizes: &[usize]) -> Vec<(usize, f64)> {
+        use std::collections::{BTreeMap, HashMap};
+        sizes
+            .iter()
+            .map(|&cap| {
+                let mut at: HashMap<u32, u64> = HashMap::new(); // key -> last tick
+                let mut order: BTreeMap<u64, u32> = BTreeMap::new(); // tick -> key (LRU=first)
+                let (mut hits, mut tick) = (0u64, 0u64);
+                for &k in &self.cold_trace {
+                    tick += 1;
+                    if let Some(&old) = at.get(&k) {
+                        hits += 1;
+                        order.remove(&old);
+                    } else if at.len() >= cap
+                        && let Some((&t, &victim)) = order.iter().next()
+                    {
+                        order.remove(&t);
+                        at.remove(&victim);
+                    }
+                    at.insert(k, tick);
+                    order.insert(tick, k);
+                }
+                (cap, hits as f64 / self.cold_trace.len().max(1) as f64)
+            })
+            .collect()
     }
 
     /// Total number of ranked (layer,expert) pairs in the usage file.
@@ -388,12 +435,18 @@ impl<'a> Pin<'a> {
         // Phase 1: resident hit, or assign a slot and QUEUE the miss's 6 reads.
         let mut plan = Vec::with_capacity(sel.len());
         for &e in sel {
+            self.cold_trace.push(((layer as u32) << 16) | e as u32); // LRU-sim trace
             if let Some(m) = self.experts[sparse][e] {
                 self.hits += 1;
                 plan.push(R::Hit(m));
                 continue;
             }
             self.misses += 1;
+            // Cold-LRU reuse probe: has this (layer,expert) been streamed before?
+            let key = ((layer as u32) << 16) | e as u32;
+            if !self.cold_seen.insert(key) {
+                self.cold_repeat += 1; // a repeat → an LRU would have hit here
+            }
             ensure!(
                 self.cold_next < cfg.top_k,
                 "cold-slot pool exhausted ({} slots) — >top_k misses in a layer",

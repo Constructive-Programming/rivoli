@@ -513,6 +513,38 @@ impl<'a> GpuEngine<'a> {
         self.prof.report();
         self.prof
             .report_hitgap(self.pin.pinned_experts(), self.pin.ranked_len());
+        // Cold-LRU reuse ceiling: what fraction of misses were repeats (an LRU
+        // would have caught), and how many distinct cold experts to hold them.
+        let (miss, rep, distinct) = (
+            self.pin.misses,
+            self.pin.cold_repeat,
+            self.pin.cold_distinct(),
+        );
+        let per_expert_gib = (crate::pin::expert_bytes(self.cfg) as f64) / (1u64 << 30) as f64;
+        tracing::info!(
+            "COLD-LRU probe: {miss} misses, {rep} repeats ({:.1}% LRU-recoverable) over \
+             {distinct} distinct experts (~{:.1} GiB to cache all); with an LRU the hit rate \
+             would rise {:.1}% -> {:.1}%",
+            100.0 * rep as f64 / miss.max(1) as f64,
+            distinct as f64 * per_expert_gib,
+            100.0 * self.pin.hits as f64 / (self.pin.hits + miss).max(1) as f64,
+            100.0 * (self.pin.hits + rep) as f64 / (self.pin.hits + miss).max(1) as f64,
+        );
+        // LRU-only routed tier sim: hit rate if the static frequency pin were
+        // replaced by an adaptive LRU of N slots (~18.9 GiB per 1000 slots).
+        let sizes = [2156usize, 3200, 4200, 5200, 8000];
+        let sim = self.pin.lru_sim(&sizes);
+        let msg: Vec<String> = sim
+            .iter()
+            .map(|(n, h)| {
+                format!(
+                    "{n}({:.1}GiB)={:.1}%",
+                    *n as f64 * per_expert_gib,
+                    100.0 * h
+                )
+            })
+            .collect();
+        tracing::info!("LRU-tier sim (vs static-pin 42.9%): {}", msg.join("  "));
         Ok(generated)
     }
 }
