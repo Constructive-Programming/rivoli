@@ -72,7 +72,7 @@ extern "C" int rivoli_gemv_i4(
     if (o_dim <= 0 || i_dim <= 0) return 1001;
     hipGetLastError();
     hipLaunchKernelGGL(gemv_i4, dim3((o_dim + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
-                       dim3(256), 0, 0, x, packed, scale, o_dim, i_dim, y);
+                       dim3(ROWS_PER_BLOCK * WAVE), 0, 0, x, packed, scale, o_dim, i_dim, y);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
@@ -83,7 +83,7 @@ extern "C" int rivoli_gemv_i8(
     if (o_dim <= 0 || i_dim <= 0) return 1001;
     hipGetLastError();
     hipLaunchKernelGGL(gemv_i8, dim3((o_dim + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
-                       dim3(256), 0, 0, x, packed, scale, o_dim, i_dim, y);
+                       dim3(ROWS_PER_BLOCK * WAVE), 0, 0, x, packed, scale, o_dim, i_dim, y);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
@@ -149,7 +149,7 @@ extern "C" int rivoli_gemv_f32(
     if (o_dim <= 0 || i_dim <= 0) return 1001;
     hipGetLastError();
     hipLaunchKernelGGL(gemv_f32, dim3((o_dim + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
-                       dim3(256), 0, 0, x, w, o_dim, i_dim, y);
+                       dim3(ROWS_PER_BLOCK * WAVE), 0, 0, x, w, o_dim, i_dim, y);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

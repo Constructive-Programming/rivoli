@@ -12,7 +12,7 @@
 //! `rocm`-only (its sole consumer is the GPU engine).
 #![cfg(feature = "rocm")]
 
-use crossbeam_channel::{Sender, unbounded};
+use std::sync::mpsc::{Sender, channel};
 use std::thread::JoinHandle;
 
 /// A batch of `(addr, len)` read-only mmap ranges to fault into the page cache.
@@ -25,7 +25,11 @@ pub struct Prefetcher {
 
 impl Prefetcher {
     pub fn new() -> Self {
-        let (tx, rx) = unbounded::<Batch>();
+        // stdlib mpsc has been the crossbeam-channel implementation since Rust
+        // 1.67 (queue ops lock-free; recv parks) — nothing crossbeam-specific is
+        // used here (SPSC, unbounded, drain-until-disconnect), so stdlib is the
+        // lazy lock-free channel. No extra crate.
+        let (tx, rx) = channel::<Batch>();
         let handle = std::thread::spawn(move || {
             let mut sink = 0u8;
             // Drain batches until the sender is dropped (Drop closes the channel).
@@ -52,8 +56,9 @@ impl Prefetcher {
         }
     }
 
-    /// Queue mmap ranges to warm. Non-blocking, best-effort (a full/closed queue
-    /// just means the decode thread pays the cold read itself — never wrong).
+    /// Queue mmap ranges to warm. Non-blocking, best-effort (a closed queue —
+    /// worker gone — just means the decode thread pays the cold read itself,
+    /// never wrong; the channel is unbounded so a send never blocks/fails full).
     pub fn warm(&self, ranges: Batch) {
         if ranges.is_empty() {
             return;
