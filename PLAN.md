@@ -336,16 +336,30 @@ pool** (`hipHostMalloc` on the cold-fetch slots), NOT the resident pin:
   coherent+hugepage** (`madvise(MADV_HUGEPAGE)`) **673** | both 676. The `mlp` tax
   is INVARIANT (672–678, never near 616) → it is NOT fine-grained-coherence (L1
   disproved) and NOT TLB/page-size (L2 disproved; madvise likely a no-op on
-  non-THP HSA memory). Conclusion: the ~6 % penalty is a fundamental property of
-  how `hipHostMalloc` host-pool memory is mapped for GPU reads on gfx1151 — the
-  driver won't give it the `hipMalloc` device-bandwidth L2 path regardless of
-  flag. **The tax CANNOT be engineered away; treat it as a fixed cost.** The
-  robust, lever-independent effect is the fetch-fill offset (`fetch` 447→~365 ms,
-  host memcpy skips 3× H2D/miss). A3 arithmetic still favors building it: ~+46
-  ms/tok tax (6 % of ~770 ms compute, no fetch offset on resident hits) vs ~500 ms
-  potential from halving RAM → fitting the 67 %-hit set in ~48 GiB → cutting the
-  55 % miss that drives 1339 ms warm+fetch. A3 = build-and-measure; tax is now a
-  known line item, not a blocker.
+  non-THP HSA memory). The behavioral read was "the tax can't be engineered away"
+  — **that conclusion was WRONG (corrected via kernel source, below).**
+- **SOURCE-CONFIRMED MECHANISM (2026-07-18, /usr/src/linux amdgpu/amdkfd on
+  rh-anine).** gfx1151 = GC IP 11.5.1. `amdgpu_amdkfd_gpuvm.c::get_pte_flags`
+  sets `AMDGPU_VM_MTYPE_DEFAULT` → `gmc_v11_0_get_vm_pte` maps DEFAULT/NC →
+  **MTYPE_NC (L2-CACHEABLE)**, BUT its tail forces **MTYPE_UC (uncached, L2
+  BYPASSED)** when the BO has `AMDGPU_GEM_CREATE_COHERENT/EXT_COHERENT/UNCACHED`
+  (set from the KFD `COHERENT` alloc flag, line ~1756). So fine-grained coherent
+  host mem → MTYPE_UC → the ~6 % tax: CONFIRMED, definitive. `svm_range_get_pte_
+  flags` (managed path) agrees: gfx11 falls to `default: coherent?UC:NC`.
+- **The tax IS avoidable at the kernel level** — non-coherent/DEFAULT host mem
+  maps MTYPE_NC (cached). So why did the L1 (`hipHostMallocNonCoherent`) run NOT
+  recover it? That's a USERSPACE question (HIP `clr` / HSA `ROCR-Runtime` pool
+  selection: does the HIP NonCoherent flag actually clear the KFD COHERENT bit on
+  APU, or are host pools always fine-grained?). ROCR/clr source is NOT on the box
+  (only libhsa-runtime64.so / libamdhip64.so binaries) — on GitHub. **UNRESOLVED:
+  the tax is likely avoidable if we can force an MTYPE_NC (cached, non-coherent)
+  host mapping; the flag flip didn't do it and the reason is upstream in ROCR/clr.**
+- Robust lever-independent win regardless = the fetch-fill offset (`fetch`
+  447→~365 ms, host memcpy skips 3× H2D/miss). A3 arithmetic still favors
+  build-and-measure: ~+46 ms/tok tax (IF unavoidable) vs ~500 ms potential from
+  halving RAM → fitting the 67 %-hit set in ~48 GiB → cutting the 55 % miss that
+  drives 1339 ms warm+fetch. If the MTYPE_NC path can be forced, the tax may
+  largely vanish and A3 gets stronger.
 
 **(3) priming — DEFERRED indefinitely; we TRUST colibri's priming.** The shipped
 `.coli_usage` IS colibri's priming artifact, and routing was verified correct
