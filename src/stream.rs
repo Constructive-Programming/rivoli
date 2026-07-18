@@ -1,12 +1,19 @@
 //! io_uring O_DIRECT cold-expert streamer. A single NVMe read is latency-bound
-//! (~4 GB/s here); io_uring keeps the queue full and the NVMe delivers ~16 GB/s
-//! (QD≥4, `docs/probes/iouring_vmm.cpp`). So a MoE layer submits all its cold
-//! reads at once, straight into the VMM slots, and joins once — folding the old
-//! mmap-warm + memcpy-fetch into one overlapped DMA stream.
+//! (~4 GB/s here); io_uring keeps the queue full and the NVMe delivers ~5.8 GB/s
+//! random (QD≥4). So a MoE layer submits all its cold reads at once and joins
+//! once — folding the old mmap-warm + memcpy-fetch into one overlapped stream.
+//!
+//! Two destination modes (chosen at `Streamer::new`, `queue`'s `dst` is the VMM
+//! slot either way): DIRECT DMAs the read straight into VMM (fast path, default);
+//! BOUNCE (`--skip-vmm-dma`) reads into a pinned host arena then `hipMemcpy`s into
+//! VMM. Bounce is a WORKAROUND for an amdgpu kernel bug (6.18.38-gentoo, 2026-07-
+//! 17) that EFAULTs on io_uring/O_DIRECT DMA into VMM device memory (can't
+//! `get_user_pages` those pages; regression vs ≤6.18.35-r1). Revert path + repro
+//! in `kernels/stream.hip`.
 //!
 //! Thin Rust owner over `kernels/stream.hip`'s liburing ring: this side does the
 //! O_DIRECT alignment math (block-aligned offset/length/buffer) and owns the fds
-//! and destination buffers.
+//! and VMM destination pointers.
 //!
 //! `rocm`-only (its sole consumer is the GPU decode pin).
 #![cfg(feature = "rocm")]
@@ -23,7 +30,7 @@ pub const ALIGN: usize = 4096;
 mod ffi {
     use std::ffi::c_void;
     unsafe extern "C" {
-        pub fn rivoli_ring_new(entries: u32) -> *mut c_void;
+        pub fn rivoli_ring_new(entries: u32, span: u32, bounce: i32) -> *mut c_void;
         pub fn rivoli_ring_read(
             ring: *mut c_void,
             fd: i32,
@@ -60,6 +67,13 @@ fn min_completion(begin: usize, len: usize) -> u64 {
 pub struct Streamer {
     ring: *mut c_void,
     queued: u32,
+    /// Bounce mode (`--skip-vmm-dma`): reads land in a pinned host arena and are
+    /// `hipMemcpy`d into VMM. False = DMA straight into the VMM slot (fast path).
+    bounce: bool,
+    /// Per-read pinned-bounce stride (bounce mode only): the largest aligned
+    /// superset any single read may deliver. A `queue` whose superset exceeds this
+    /// can't fit its bounce slot. Unused (0) in direct mode.
+    span: usize,
     /// Per-queued-read minimum completion length (sub-block offset + useful len),
     /// indexed by the read's `user_data`. `drain` hands this to the shim so a real
     /// mid-file short read is caught while EOF-padding truncation is tolerated.
@@ -67,12 +81,27 @@ pub struct Streamer {
 }
 
 impl Streamer {
-    pub fn new(entries: u32) -> Result<Self> {
-        let ring = unsafe { ffi::rivoli_ring_new(entries) };
-        ensure!(!ring.is_null(), "io_uring_queue_init({entries}) failed");
+    /// `entries` = max in-flight reads; `span` = the largest aligned superset a
+    /// single read may deliver (`slot_span` of the biggest projection tensor).
+    /// `bounce` selects the destination path: true (`--skip-vmm-dma`) reads into an
+    /// `entries * span` pinned host arena then `hipMemcpy`s into VMM (kernel-bug
+    /// workaround); false DMAs straight into the VMM slot (no arena allocated).
+    pub fn new(entries: u32, span: usize, bounce: bool) -> Result<Self> {
+        let ring = unsafe { ffi::rivoli_ring_new(entries, span as u32, i32::from(bounce)) };
+        ensure!(
+            !ring.is_null(),
+            "ring init failed (entries={entries}, bounce={bounce}, {:.0} MiB pinned)",
+            if bounce {
+                (entries as usize * span) as f64 / (1u64 << 20) as f64
+            } else {
+                0.0
+            }
+        );
         Ok(Self {
             ring,
             queued: 0,
+            bounce,
+            span,
             min_res: Vec::with_capacity(entries as usize),
         })
     }
@@ -101,6 +130,11 @@ impl Streamer {
         let ab = begin & !(ALIGN - 1);
         let ae = (begin + len).div_ceil(ALIGN) * ALIGN;
         let nbytes = ae - ab;
+        ensure!(
+            !self.bounce || nbytes <= self.span,
+            "read superset {nbytes} exceeds bounce span {} (raise Streamer span)",
+            self.span
+        );
         let sub = begin - ab; // useful bytes start `sub` into the aligned read
         let r = unsafe {
             ffi::rivoli_ring_read(

@@ -2,16 +2,22 @@ use anyhow::{Context, Result, bail};
 use rivoli::config::Config;
 use tracing::info;
 
-/// CLI: `rivoli <snapshot-dir> [-bench <tokens>] [--pre-seed]`. No environment
-/// variables, no other flags — everything else is auto-discovered (see config.rs).
+/// CLI: `rivoli <snapshot-dir> [-bench <tokens>] [--pre-seed] [--direct-vmm-dma]`.
+/// No environment variables — everything else is auto-discovered (see config.rs).
 /// `--pre-seed` warms the routed-expert LRU from `.coli_usage` at build time
 /// (+~6.8pt on the first tokens, ~23s slower build); default OFF gives a fast
 /// build and the LRU self-warms within a few tokens.
-fn parse_args() -> Result<(String, Option<usize>, bool)> {
-    const USAGE: &str = "usage: rivoli <snapshot-dir> [-bench <tokens>] [--pre-seed]";
+/// `--direct-vmm-dma` opts out of the default pinned-host bounce and DMAs cold
+/// reads straight into VMM. The bounce is default because it measures ~13% faster
+/// (avoids the coherent tax on DMA into host-mapped device pages) and survives NFS
+/// sources; use this only to force raw DMA. See stream.hip for the details.
+fn parse_args() -> Result<(String, Option<usize>, bool, bool)> {
+    const USAGE: &str =
+        "usage: rivoli <snapshot-dir> [-bench <tokens>] [--pre-seed] [--direct-vmm-dma]";
     let mut snapshot = None;
     let mut bench = None;
     let mut pre_seed = false;
+    let mut direct_vmm_dma = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -20,12 +26,13 @@ fn parse_args() -> Result<(String, Option<usize>, bool)> {
                 bench = Some(n.parse().context("-bench takes an integer")?);
             }
             "--pre-seed" => pre_seed = true,
+            "--direct-vmm-dma" => direct_vmm_dma = true,
             _ if snapshot.is_none() => snapshot = Some(a),
             _ => bail!("unexpected argument: {a}\n{USAGE}"),
         }
     }
     let snapshot = snapshot.context(USAGE)?;
-    Ok((snapshot, bench, pre_seed))
+    Ok((snapshot, bench, pre_seed, direct_vmm_dma))
 }
 
 fn main() -> Result<()> {
@@ -35,8 +42,8 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let (snapshot, bench, pre_seed) = parse_args()?;
-    let cfg = Config::discover(snapshot, bench, pre_seed)?;
+    let (snapshot, bench, pre_seed, direct_vmm_dma) = parse_args()?;
+    let cfg = Config::discover(snapshot, bench, pre_seed, direct_vmm_dma)?;
 
     // Rule 1: the full discovered config is the first line of every run.
     info!("rivoli {} | {cfg}", env!("CARGO_PKG_VERSION"));
@@ -134,7 +141,8 @@ async fn run(cfg: Config) -> Result<()> {
         // headroom for scratch/KV. The pin splits this into resident tier + LRU.
         let cap = free.saturating_sub(16 << 30).min(80 << 30);
         let t = std::time::Instant::now();
-        let pin = rivoli::pin::Pin::build(&snap, &mc, &usage, cap, cfg.pre_seed)?;
+        let pin =
+            rivoli::pin::Pin::build(&snap, &mc, &usage, cap, cfg.pre_seed, !cfg.direct_vmm_dma)?;
         info!("pin built in {:.1}s", t.elapsed().as_secs_f64());
         let max_ctx = prompt_ids.len() + ngen + 1;
         let mut engine = rivoli::gpu::GpuEngine::new(pin, &mc, max_ctx)?;

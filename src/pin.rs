@@ -302,6 +302,7 @@ impl<'a> Pin<'a> {
         usage: &Usage,
         capacity: usize,
         pre_seed: bool,
+        bounce: bool,
     ) -> Result<Self> {
         let (free, _total) = mem_info()?;
         ensure!(
@@ -409,7 +410,11 @@ impl<'a> Pin<'a> {
         let mut lru = Lru::new(n_slots);
         // Ring sized for one layer's worst case: top_k misses x 3 proj x 2 tensors.
         let ring = (cfg.top_k * 6).next_power_of_two() * 2;
-        let mut stream = Streamer::new(ring as u32)?;
+        // Bounce span = largest single projection superset (gate/up packed =
+        // moe_inter*rb(hidden); down packed = hidden*rb(moe_inter)); scales are tiny.
+        let span = slot_span(cfg.moe_inter * cfg.hidden.div_ceil(2))
+            .max(slot_span(cfg.hidden * cfg.moe_inter.div_ceil(2)));
+        let mut stream = Streamer::new(ring as u32, span, bounce)?;
         // Optional warm start (`--pre-seed`): seed the pool with the hottest experts
         // from .coli_usage so the first tokens hit at colibri's rate while the LRU
         // adapts. Worth ~+6.8pt on the first tokens but transient (the LRU warms up
