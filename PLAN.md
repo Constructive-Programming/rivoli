@@ -329,6 +329,23 @@ pool** (`hipHostMalloc` on the cold-fetch slots), NOT the resident pin:
   pay the tax on all hit-reads and must justify it purely by fitting ~2× experts
   → higher hit → less I/O. **A3 (resident pin) still needs its OWN build+measure.**
   Conflict-resolved coherent artifact preserved in `git stash@{0}` as the base.
+- **TAX-ELIMINATION EXPERIMENT (2026-07-18) — both clever levers NULL.** Ran a
+  4-way A/B (32-tok, same pin) via env knobs (`RIVOLI_COH_FLAGS`,
+  `RIVOLI_HUGEPAGE`, in stash@{0}): baseline `mlp` 616 | fine-grained coherent 672
+  | **L1 non-coherent** (`hipHostMallocNonCoherent` 0x80000002) **678** | **L2
+  coherent+hugepage** (`madvise(MADV_HUGEPAGE)`) **673** | both 676. The `mlp` tax
+  is INVARIANT (672–678, never near 616) → it is NOT fine-grained-coherence (L1
+  disproved) and NOT TLB/page-size (L2 disproved; madvise likely a no-op on
+  non-THP HSA memory). Conclusion: the ~6 % penalty is a fundamental property of
+  how `hipHostMalloc` host-pool memory is mapped for GPU reads on gfx1151 — the
+  driver won't give it the `hipMalloc` device-bandwidth L2 path regardless of
+  flag. **The tax CANNOT be engineered away; treat it as a fixed cost.** The
+  robust, lever-independent effect is the fetch-fill offset (`fetch` 447→~365 ms,
+  host memcpy skips 3× H2D/miss). A3 arithmetic still favors building it: ~+46
+  ms/tok tax (6 % of ~770 ms compute, no fetch offset on resident hits) vs ~500 ms
+  potential from halving RAM → fitting the 67 %-hit set in ~48 GiB → cutting the
+  55 % miss that drives 1339 ms warm+fetch. A3 = build-and-measure; tax is now a
+  known line item, not a blocker.
 
 **(3) priming — DEFERRED indefinitely; we TRUST colibri's priming.** The shipped
 `.coli_usage` IS colibri's priming artifact, and routing was verified correct
