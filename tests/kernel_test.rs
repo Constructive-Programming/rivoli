@@ -380,10 +380,8 @@ fn gen_i8(rng: &mut Lcg, o: usize, i: usize) -> (Vec<u8>, Vec<u8>) {
     (packed, scale)
 }
 
-#[test]
-fn gemv_i4_matches_scalar() {
-    let mut rng = Lcg(0x0991_1337);
-    let (o, i) = (1536usize, 2048usize);
+fn check_gemv_i4(seed: u64, o: usize, i: usize) {
+    let mut rng = Lcg(seed);
     let m = gen_mat(&mut rng, o, i);
     let x: Vec<f32> = (0..i).map(|_| rng.f()).collect();
     let mut want = vec![0.0f32; o];
@@ -421,6 +419,12 @@ fn gemv_i4_matches_scalar() {
         &f32_vec(&y_buf.copy_out().expect("copy out")),
         "gemv_i4",
     );
+}
+
+#[test]
+fn gemv_i4_matches_scalar() {
+    check_gemv_i4(0x0991_1337, 1536, 2048); // even i_dim
+    check_gemv_i4(0x0991_1338, 100, 257); // odd i_dim → last byte's high nibble is pad
 }
 
 #[test]

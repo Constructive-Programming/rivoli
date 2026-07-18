@@ -293,8 +293,8 @@ pub unsafe fn launch_rmsnorm(
 /// KV key (count=1) and the per-head query rope segments (count=H, stride=qh).
 ///
 /// # Safety
-/// Async — `base` must cover `count*stride` f32 and stay valid until the next
-/// [`device_sync`] returns.
+/// Async — `base` must cover `(count-1)*stride + seg` f32 (the kernel's max
+/// access) and stay valid until the next [`device_sync`] returns.
 #[cfg(feature = "rocm")]
 pub unsafe fn launch_rope(
     base: *mut f32,

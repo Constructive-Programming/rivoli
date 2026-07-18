@@ -16,10 +16,12 @@
 extern "C" __global__ void gemv_i4(
     const float* __restrict__ x, const unsigned char* __restrict__ packed,
     const float* __restrict__ scale, int o_dim, int i_dim, float* __restrict__ y) {
-    int o = blockIdx.x * blockDim.x + threadIdx.x;
-    if (o >= o_dim) return;
+    // size_t row index so a huge grid can't wrap to a negative int (the guard is
+    // never approached at GLM dims, but keeps the address arithmetic honest).
+    size_t o = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= (size_t)o_dim) return;
     size_t rb = (size_t)(i_dim + 1) / 2;
-    const unsigned char* row = packed + (size_t)o * rb;
+    const unsigned char* row = packed + o * rb;
     float acc = 0.0f;
     for (int i = 0; i < i_dim; ++i) {
         unsigned char b = row[i >> 1];
@@ -33,9 +35,9 @@ extern "C" __global__ void gemv_i4(
 extern "C" __global__ void gemv_i8(
     const float* __restrict__ x, const unsigned char* __restrict__ packed,
     const float* __restrict__ scale, int o_dim, int i_dim, float* __restrict__ y) {
-    int o = blockIdx.x * blockDim.x + threadIdx.x;
-    if (o >= o_dim) return;
-    const unsigned char* row = packed + (size_t)o * i_dim;
+    size_t o = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= (size_t)o_dim) return;
+    const unsigned char* row = packed + o * (size_t)i_dim;
     float acc = 0.0f;
     for (int i = 0; i < i_dim; ++i) acc += (float)((signed char)row[i]) * x[i];
     y[o] = acc * scale[o];
@@ -115,7 +117,10 @@ extern "C" int rivoli_rmsnorm(
 
 extern "C" int rivoli_rope(
     float* base, int count, int stride, int seg, int pos, double theta) {
-    if (count <= 0 || seg <= 0 || (seg & 1)) return 1001;
+    if (count <= 0 || seg <= 0 || (seg & 1) || (seg / 2) > 1024) return 1001;
+    // Overlapping segments (stride < seg) would race across blocks (no inter-
+    // block sync); the intended callers use stride ≥ seg (per-head qh, or count=1).
+    if (count > 1 && stride < seg) return 1001;
     hipGetLastError();
     // block = seg/2 EXACTLY so every thread reaches the barrier (no divergence).
     hipLaunchKernelGGL(rope_interleave, dim3(count), dim3(seg / 2), 0, 0,
