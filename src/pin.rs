@@ -15,10 +15,10 @@
 
 use crate::device::{DeviceTier, VmmBuf, mem_info};
 use crate::model::ModelConfig;
-use crate::snapshot::{Int4Matrix, Snapshot};
+use crate::snapshot::Snapshot;
+use crate::stream::{Streamer, slot_span};
 use crate::usage::Usage;
 use anyhow::{Context, Result, ensure};
-use rayon::prelude::*;
 
 /// A resolved int4 weight matrix in the tier: device pointers + dims.
 #[derive(Clone, Copy)]
@@ -89,13 +89,17 @@ pub struct Pin<'a> {
     /// means colibri never selected it. The hit-rate-gap diagnostic.
     rank: std::collections::HashMap<(u16, u16), u32>,
     ranked_len: usize,
-    /// Reused device slots for cold routed experts: one `Mlp` worth of bytes
-    /// each, filled via `copy_in` on a miss (no per-token allocation). Sized to
-    /// the worst case of one layer's misses (top_k slots).
+    /// Reused device slots for cold routed experts: one projection each, sized to
+    /// hold O_DIRECT aligned supersets of its packed + scale tensors. Filled by the
+    /// io_uring streamer on a miss (no per-token allocation). top_k slots = the
+    /// worst case of one layer's misses.
     cold_gate: Vec<VmmBuf>,
     cold_up: Vec<VmmBuf>,
     cold_down: Vec<VmmBuf>,
     cold_next: usize,
+    /// io_uring O_DIRECT reader — a layer's cold reads submit as one queue-depth
+    /// batch straight into the slots above (folds the old mmap-warm + memcpy).
+    stream: Streamer,
     /// Stats over the run.
     pub hits: u64,
     pub misses: u64,
@@ -285,20 +289,26 @@ impl<'a> Pin<'a> {
             pinned += 1;
         }
 
-        // Cold pool: top_k reusable slots, one Mlp's three tensors each.
+        // Cold pool: top_k reusable slots per projection. Each slot holds an
+        // O_DIRECT aligned superset of the packed tensor, then of the scale tensor
+        // (each `slot_span` — block-aligned start + room for the straddle pad), so
+        // the io_uring reads land directly in place and the descriptor points at
+        // the sub-block offsets.
         let rb_h = cfg.hidden.div_ceil(2);
         let rb_i = cfg.moe_inter.div_ceil(2);
-        let (gate_bytes, down_bytes) = (cfg.moe_inter * rb_h, cfg.hidden * rb_i);
+        let gate_slot = slot_span(cfg.moe_inter * rb_h) + slot_span(cfg.moe_inter * 4);
+        let down_slot = slot_span(cfg.hidden * rb_i) + slot_span(cfg.hidden * 4);
         let mut cold_gate = Vec::with_capacity(cfg.top_k);
         let mut cold_up = Vec::with_capacity(cfg.top_k);
         let mut cold_down = Vec::with_capacity(cfg.top_k);
         for _ in 0..cfg.top_k {
-            // gate/up carry their scale inline after the packed nibbles; keep
-            // packed and scale in one buffer per projection to halve slot count.
-            cold_gate.push(VmmBuf::new(gate_bytes + cfg.moe_inter * 4)?);
-            cold_up.push(VmmBuf::new(gate_bytes + cfg.moe_inter * 4)?);
-            cold_down.push(VmmBuf::new(down_bytes + cfg.hidden * 4)?);
+            cold_gate.push(VmmBuf::new(gate_slot)?);
+            cold_up.push(VmmBuf::new(gate_slot)?);
+            cold_down.push(VmmBuf::new(down_slot)?);
         }
+        // Ring sized for a layer's worst case: top_k misses × 3 projections × 2
+        // tensors, with margin.
+        let stream = Streamer::new((cfg.top_k * 6).next_power_of_two() as u32 * 2)?;
 
         Ok(Self {
             snap,
@@ -316,6 +326,7 @@ impl<'a> Pin<'a> {
             cold_up,
             cold_down,
             cold_next: 0,
+            stream,
             hits: 0,
             misses: 0,
         })
@@ -342,55 +353,6 @@ impl<'a> Pin<'a> {
         self.ranked_len
     }
 
-    /// Fault a layer's COLD experts' pages into the cache CONCURRENTLY (multiple
-    /// threads → NVMe queue depth) right before the serial `copy_in`s, so the
-    /// per-layer NVMe reads overlap instead of stalling one-at-a-time (QD1). The
-    /// subsequent `expert()` copies then read a warm cache. Best-effort.
-    pub fn warm_cold(&self, layer: usize, experts: &[usize]) {
-        let mut ranges = Vec::new();
-        for &e in experts {
-            let _ = self.cold_warm_ranges(layer, e, &mut ranges);
-        }
-        if ranges.len() < 2 {
-            for &(addr, len) in &ranges {
-                touch(addr, len);
-            }
-            return;
-        }
-        // Dispatch the page-faulting to rayon's persistent global pool instead of
-        // spawning OS threads per call (~600/token). Chunk so at most ~8 chunks are
-        // produced (matching the old `.min(8)` fan-out); `par_chunks(..).for_each`
-        // uses the lazily-initialized global workers and blocks until every page is
-        // faulted — the synchronous barrier the serial `copy_in` depends on.
-        let nchunks = ranges.len().min(8);
-        let per = ranges.len().div_ceil(nchunks);
-        ranges.par_chunks(per).for_each(|chunk| {
-            for &(addr, len) in chunk {
-                touch(addr, len);
-            }
-        });
-    }
-
-    /// Append the mmap byte ranges of a COLD routed expert's packed weights to
-    /// `out`, for background page-cache warming. A resident (pinned) expert
-    /// appends nothing — it is already on device, no NVMe read to overlap.
-    pub fn cold_warm_ranges(
-        &self,
-        layer: usize,
-        expert: usize,
-        out: &mut Vec<(usize, usize)>,
-    ) -> Result<()> {
-        if self.experts[layer - self.cfg.dense_layers][expert].is_some() {
-            return Ok(());
-        }
-        let base = format!("model.layers.{layer}.mlp.experts.{expert}");
-        for proj in ["gate_proj", "up_proj", "down_proj"] {
-            let w = self.snap.require(&format!("{base}.{proj}.weight"))?;
-            out.push((w.as_ptr() as usize, w.len()));
-        }
-        Ok(())
-    }
-
     pub fn pinned_experts(&self) -> usize {
         self.experts
             .iter()
@@ -399,99 +361,116 @@ impl<'a> Pin<'a> {
             .count()
     }
 
-    /// Reset the cold-slot ring at the start of a layer's MoE block (the previous
-    /// layer's misses have been consumed and joined).
-    pub fn begin_layer(&mut self) {
+    /// Whether a routed expert is resident (a hit) — for the hit-rate diagnostic.
+    pub fn is_resident(&self, layer: usize, expert: usize) -> bool {
+        self.experts[layer - self.cfg.dense_layers][expert].is_some()
+    }
+
+    /// Resolve a MoE layer's `sel` routed experts to their `Mlp` descriptors,
+    /// batching every cold miss through the io_uring O_DIRECT streamer: submit ALL
+    /// of the layer's cold reads at once (queue depth → full NVMe bandwidth),
+    /// straight into the VMM slots, join ONCE, then build the descriptors. Resident
+    /// hits contribute their pinned pointers; misses come from reused cold slots,
+    /// valid until the next call. Replaces the old mmap-warm + per-expert copy.
+    pub fn resolve_layer(&mut self, layer: usize, sel: &[usize]) -> Result<Vec<Mlp>> {
         self.cold_next = 0;
-    }
-
-    /// Resolve a routed expert's `Mlp` for `layer`: a resident hit returns its
-    /// pinned pointers; a miss fetches the three int4 tensors from the snapshot
-    /// mmap into the next cold slot (reused, no allocation) and returns those.
-    /// The returned pointers stay valid until the next `begin_layer`.
-    pub fn expert(&mut self, layer: usize, expert: usize) -> Result<Mlp> {
-        if let Some(m) = self.experts[layer - self.cfg.dense_layers][expert] {
-            self.hits += 1;
-            return Ok(m);
-        }
-        self.misses += 1;
-        ensure!(
-            self.cold_next < self.cfg.top_k,
-            "cold-slot pool exhausted ({} slots) — more than top_k misses in a layer",
-            self.cfg.top_k
-        );
-        let slot = self.cold_next;
-        self.cold_next += 1;
-        let base = format!("model.layers.{layer}.mlp.experts.{expert}");
         let (cfg, snap) = (self.cfg, self.snap);
-        let (gname, uname, dname) = (
-            format!("{base}.gate_proj"),
-            format!("{base}.up_proj"),
-            format!("{base}.down_proj"),
-        );
-        let g = snap.int4(&gname, cfg.hidden)?;
-        let u = snap.int4(&uname, cfg.hidden)?;
-        let d = snap.int4(&dname, cfg.moe_inter)?;
-        // Fill the slot buffers: packed nibbles then f32 scale bytes, contiguous.
-        fill_slot(&mut self.cold_gate[slot], snap, &gname, &g).context("cold gate")?;
-        fill_slot(&mut self.cold_up[slot], snap, &uname, &u).context("cold up")?;
-        fill_slot(&mut self.cold_down[slot], snap, &dname, &d).context("cold down")?;
-        let gp = self.cold_gate[slot].ptr();
-        let up = self.cold_up[slot].ptr();
-        let dp = self.cold_down[slot].ptr();
-        Ok(Mlp {
-            gate: Weight {
-                packed: gp,
-                scale: unsafe { gp.add(g.packed.len()) } as *const f32,
-                o_dim: g.o_dim,
-                i_dim: g.i_dim,
+        let sparse = layer - cfg.dense_layers;
+        enum R {
+            Hit(Mlp),
+            Cold {
+                slot: usize,
+                g: (usize, usize),
+                u: (usize, usize),
+                d: (usize, usize),
             },
-            up: Weight {
-                packed: up,
-                scale: unsafe { up.add(u.packed.len()) } as *const f32,
-                o_dim: u.o_dim,
-                i_dim: u.i_dim,
-            },
-            down: Weight {
-                packed: dp,
-                scale: unsafe { dp.add(d.packed.len()) } as *const f32,
-                o_dim: d.o_dim,
-                i_dim: d.i_dim,
-            },
-        })
+        }
+        // Phase 1: resident hit, or assign a slot and QUEUE the miss's 6 reads.
+        let mut plan = Vec::with_capacity(sel.len());
+        for &e in sel {
+            if let Some(m) = self.experts[sparse][e] {
+                self.hits += 1;
+                plan.push(R::Hit(m));
+                continue;
+            }
+            self.misses += 1;
+            ensure!(
+                self.cold_next < cfg.top_k,
+                "cold-slot pool exhausted ({} slots) — >top_k misses in a layer",
+                cfg.top_k
+            );
+            let slot = self.cold_next;
+            self.cold_next += 1;
+            let base = format!("model.layers.{layer}.mlp.experts.{e}");
+            // self.stream and self.cold_* are distinct fields → disjoint &mut.
+            let g = queue_proj(
+                &mut self.stream,
+                snap,
+                &mut self.cold_gate[slot],
+                &format!("{base}.gate_proj"),
+            )?;
+            let u = queue_proj(
+                &mut self.stream,
+                snap,
+                &mut self.cold_up[slot],
+                &format!("{base}.up_proj"),
+            )?;
+            let d = queue_proj(
+                &mut self.stream,
+                snap,
+                &mut self.cold_down[slot],
+                &format!("{base}.down_proj"),
+            )?;
+            plan.push(R::Cold { slot, g, u, d });
+        }
+        // Phase 2: ONE join for the whole layer's cold reads.
+        self.stream.drain()?;
+        // Phase 3: build descriptors (slots now filled). gate/up are [moe_inter,
+        // hidden]; down is [hidden, moe_inter].
+        let (gate_o, gate_i) = (cfg.moe_inter, cfg.hidden);
+        let (down_o, down_i) = (cfg.hidden, cfg.moe_inter);
+        let mk = |buf: &VmmBuf, off: (usize, usize), o_dim: usize, i_dim: usize| Weight {
+            // SAFETY: off within the slot; the reads that filled them have joined.
+            packed: unsafe { buf.ptr().add(off.0) },
+            scale: unsafe { buf.ptr().add(off.1) } as *const f32,
+            o_dim,
+            i_dim,
+        };
+        let mut out = Vec::with_capacity(sel.len());
+        for r in &plan {
+            match r {
+                R::Hit(m) => out.push(*m),
+                R::Cold { slot, g, u, d } => out.push(Mlp {
+                    gate: mk(&self.cold_gate[*slot], *g, gate_o, gate_i),
+                    up: mk(&self.cold_up[*slot], *u, gate_o, gate_i),
+                    down: mk(&self.cold_down[*slot], *d, down_o, down_i),
+                }),
+            }
+        }
+        Ok(out)
     }
 }
 
-/// Fault a read-only mmap range into the page cache: one byte per 4 KiB page.
-/// The `black_box` keeps the compiler from eliding the loads.
-fn touch(addr: usize, len: usize) {
-    let p = addr as *const u8;
-    let mut off = 0usize;
-    let mut sink = 0u8;
-    while off < len {
-        // SAFETY: [addr,addr+len) is a live read-only snapshot mmap range.
-        sink = sink.wrapping_add(unsafe { *p.add(off) });
-        off += 4096;
-    }
-    std::hint::black_box(sink);
-}
-
-/// Copy packed nibbles then scale bytes into one contiguous device slot.
-fn fill_slot(buf: &mut VmmBuf, snap: &Snapshot, name: &str, m: &Int4Matrix) -> Result<()> {
-    let (plen, slen) = (m.packed.len(), m.scale.len());
-    ensure!(
-        plen + slen == buf.len(),
-        "cold slot size {} != packed {plen} + scale {slen}",
-        buf.len()
-    );
-    // pread packed nibbles then f32 scales, contiguous, straight into device-local
-    // memory (no mmap fault, no H2D copy). evict=false: keep the file pages warm —
-    // a cold expert may be re-selected next token.
-    let dst = buf.ptr_mut();
-    // SAFETY: dst owns buf.len() = plen+slen bytes; the two ranges are disjoint.
-    unsafe {
-        snap.read_into(&format!("{name}.weight"), dst, plen, false)?;
-        snap.read_into(&format!("{name}.weight.qs"), dst.add(plen), slen, false)?;
-    }
-    Ok(())
+/// Queue one projection's packed + scale O_DIRECT reads into `slot`: packed in the
+/// first `slot_span`, scale in the next. Returns the sub-block offsets where the
+/// useful bytes land within the slot: `(packed_off, scale_off)`.
+fn queue_proj(
+    stream: &mut Streamer,
+    snap: &Snapshot,
+    slot: &mut VmmBuf,
+    proj: &str,
+) -> Result<(usize, usize)> {
+    let base = slot.ptr_mut();
+    let (pfd, pb, plen) = snap
+        .read_spec(&format!("{proj}.weight"))
+        .with_context(|| format!("cold read_spec {proj}.weight"))?;
+    // SAFETY: base is VMM (block-aligned); slot sized >= slot_span(plen)+slot_span(slen).
+    let poff = unsafe { stream.queue(pfd, pb, plen, base)? };
+    let sreg = slot_span(plen); // block-aligned scale region within the slot
+    let (sfd, sb, slen) = snap
+        .read_spec(&format!("{proj}.weight.qs"))
+        .with_context(|| format!("cold read_spec {proj}.weight.qs"))?;
+    // SAFETY: base+sreg is block-aligned and within the slot's second region.
+    let soff = unsafe { stream.queue(sfd, sb, slen, base.add(sreg))? };
+    Ok((poff, sreg + soff))
 }

@@ -13,7 +13,16 @@ fn main() {
     }
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR set by cargo");
-    let kernels = ["probe", "moe_fused", "attn", "linalg", "mla", "fwd", "vmm"];
+    let kernels = [
+        "probe",
+        "moe_fused",
+        "attn",
+        "linalg",
+        "mla",
+        "fwd",
+        "vmm",
+        "stream",
+    ];
     let hipcc = std::env::var("HIPCC").unwrap_or_else(|_| "hipcc".into());
 
     let mut objs = Vec::new();
@@ -56,4 +65,6 @@ fn main() {
         }
     }
     println!("cargo:rustc-link-lib=dylib=amdhip64");
+    // liburing (kernels/stream.hip) — the io_uring O_DIRECT cold streamer.
+    println!("cargo:rustc-link-lib=dylib=uring");
 }

@@ -167,11 +167,6 @@ pub struct GpuEngine<'a> {
     scores: Vec<f32>,
     choice: Vec<f32>,
     sel: Vec<usize>,
-    // Background page-cache warmer + the previous token's routed selection per
-    // sparse layer (the predictor): at each token's start we warm the experts the
-    // last token routed to, overlapping their fetch with this token's compute.
-    prefetch: crate::prefetch::Prefetcher,
-    last_sel: Vec<Vec<usize>>,
     prof: Profile,
 }
 
@@ -222,8 +217,6 @@ impl<'a> GpuEngine<'a> {
             scores: vec![0.0; cfg.n_experts],
             choice: vec![0.0; cfg.n_experts],
             sel: Vec::with_capacity(cfg.top_k),
-            prefetch: crate::prefetch::Prefetcher::new(),
-            last_sel: vec![Vec::new(); cfg.n_layers - cfg.dense_layers],
             prof: Profile::default(),
             pin,
         })
@@ -281,21 +274,8 @@ impl<'a> GpuEngine<'a> {
             )?;
         }
 
-        // Streaming feed: warm the pages of the experts the PREVIOUS token routed
-        // to (a stable predictor) so their NVMe read overlaps this token's compute
-        // and the later copy_in hits the page cache, not cold disk.
-        {
-            let t = std::time::Instant::now();
-            let mut ranges = Vec::new();
-            for (si, sel) in self.last_sel.iter().enumerate() {
-                let layer = si + cfg.dense_layers;
-                for &e in sel {
-                    self.pin.cold_warm_ranges(layer, e, &mut ranges)?;
-                }
-            }
-            self.prefetch.warm(ranges);
-            self.prof.prefetch_ns += t.elapsed().as_nanos();
-        }
+        // Cold experts stream in per-MoE-layer via io_uring O_DIRECT (see
+        // pin::resolve_layer) — no separate page-cache warm step.
 
         for l in 0..cfg.n_layers {
             // Copy the layer's weight pointers out (ends the &pin.layers borrow).
@@ -378,32 +358,23 @@ impl<'a> GpuEngine<'a> {
                 let bias = self.pin.moe_bias(l).to_vec();
                 self.route(&gl, &bias);
                 self.prof.route_ns += t.elapsed().as_nanos();
-                // Remember this layer's selection to prefetch next token (stable).
-                let ls = &mut self.last_sel[l - cfg.dense_layers];
-                ls.clear();
-                ls.extend_from_slice(&self.sel);
-                self.pin.begin_layer();
-                // Overlap this layer's cold-expert NVMe reads (parallel page-warm)
-                // before the serial copy_in's below — reaches the NVMe bandwidth
-                // floor. Safe now that the MoE reduction is deterministic (its
-                // timing perturbation can no longer change the output).
+                // Batch every cold miss through io_uring O_DIRECT (queue depth →
+                // full NVMe bandwidth, straight into the VMM slots, one join) and
+                // get the resolved descriptors back.
+                let miss0 = self.pin.misses;
                 let t = std::time::Instant::now();
-                self.pin.warm_cold(l, &self.sel);
-                self.prof.warm_ns += t.elapsed().as_nanos();
-                // Resolve selected experts (+ shared), build the descriptor batch.
+                let mlps = self.pin.resolve_layer(l, &self.sel)?;
+                self.prof.fetch_ns += t.elapsed().as_nanos();
+                self.prof.fetch_n += self.pin.misses - miss0;
+                // Build the descriptor batch (+ record the hit-rate diagnostic).
                 let ke = self.sel.len();
                 let mut descs = Vec::with_capacity(ke + cfg.n_shared);
                 let mut w = Vec::with_capacity(ke + cfg.n_shared);
-                for i in 0..ke {
+                for (i, m) in mlps.iter().enumerate() {
                     let e = self.sel[i];
-                    let miss0 = self.pin.misses;
-                    let t = std::time::Instant::now();
-                    let m = self.pin.expert(l, e)?;
-                    self.prof.fetch_ns += t.elapsed().as_nanos();
-                    let missed = self.pin.misses > miss0;
-                    self.prof.fetch_n += u64::from(missed);
-                    self.prof.record_sel(self.pin.expert_rank(l, e), missed);
-                    descs.push(desc_of(&m));
+                    self.prof
+                        .record_sel(self.pin.expert_rank(l, e), !self.pin.is_resident(l, e));
+                    descs.push(desc_of(m));
                     w.push(self.scores[e]);
                 }
                 // Weight = original sigmoid score, sum-normalized then scaled.

@@ -14,7 +14,8 @@ use anyhow::{Context, Result, bail, ensure};
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 /// On-disk element type. The snapshot uses exactly two: `F32` (norm weights,
@@ -94,7 +95,8 @@ struct IndexedShard {
 
 pub struct Snapshot {
     shards: Vec<Mmap>,
-    files: Vec<File>, // same order as `shards`; for pread weight loads
+    files: Vec<File>, // same order as `shards`; buffered pread (resident build)
+    odirect_fds: Vec<File>, // same order; O_DIRECT, for the io_uring cold streamer
     index: HashMap<String, TensorLoc>,
 }
 
@@ -117,6 +119,7 @@ impl Snapshot {
 
         let mut shards = Vec::with_capacity(paths.len());
         let mut files = Vec::with_capacity(paths.len());
+        let mut odirect_fds = Vec::with_capacity(paths.len());
         let mut index = HashMap::new();
 
         for (si, path) in paths.iter().enumerate() {
@@ -131,12 +134,32 @@ impl Snapshot {
             }
             shards.push(shard.mmap);
             files.push(shard.file);
+            // A second fd opened O_DIRECT for the io_uring cold streamer (NVMe DMA
+            // straight into the VMM slots, bypassing the page cache).
+            let od = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(path)
+                .with_context(|| format!("open O_DIRECT {}", path.display()))?;
+            odirect_fds.push(od);
         }
         Ok(Self {
             shards,
             files,
+            odirect_fds,
             index,
         })
+    }
+
+    /// O_DIRECT read spec for a tensor: `(fd, file_begin, len)`. The fd + range the
+    /// io_uring streamer submits (it does the block-alignment). `None` if missing.
+    pub fn read_spec(&self, name: &str) -> Option<(RawFd, usize, usize)> {
+        let loc = self.index.get(name)?;
+        Some((
+            self.odirect_fds.get(loc.shard)?.as_raw_fd(),
+            loc.begin,
+            loc.end - loc.begin,
+        ))
     }
 
     fn index_shard(path: &Path) -> Result<IndexedShard> {

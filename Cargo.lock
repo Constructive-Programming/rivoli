@@ -570,7 +570,6 @@ dependencies = [
  "anyhow",
  "libc",
  "memmap2",
- "rayon",
  "serde",
  "serde_json",
  "tokenizers",
