@@ -313,11 +313,12 @@ pool** (`hipHostMalloc` on the cold-fetch slots), NOT the resident pin:
   experiment ran while we were compute-bound, where the tax was clearly bad.
 - Post-D3 the calculus *may* have flipped (now I/O-bound: 6 % of ~770 ms compute
   ≈ 46 ms vs halving RAM/expert → ~2× more resident experts → fewer of the 55 %
-  misses → cuts into 1343 ms warm+fetch). **But this is a hypothesis, not a
-  result.** Only worth testing AFTER priming — no point paying the read tax to fit
-  more experts until priming makes "more resident" mean "more *useful*". The
-  `madvise(MADV_DONTNEED)` interim (`5b2212b`) is the safe half and is already
-  shipped.
+  misses → cuts into 1343 ms warm+fetch). **This is a hypothesis to MEASURE.**
+- **UNGATED FROM PRIMING (2026-07-18).** Earlier this was "test only after
+  priming"; that coupling is removed — the coherent approach is being re-measured
+  on its own merits now that the profile is I/O-bound, independent of whether we
+  ever prime. The `madvise(MADV_DONTNEED)` interim (`5b2212b`) is the safe half
+  and is already shipped.
 
 **(3) priming — DEFERRED indefinitely; we TRUST colibri's priming.** The shipped
 `.coli_usage` IS colibri's priming artifact, and routing was verified correct
@@ -325,8 +326,8 @@ against it (0.2 % absent, 0 misses below cutoff). Re-running our own
 workload-matched priming pass is NOT on the near-term roadmap — we accept
 colibri's ranking as the pin order. Consequence: the 67 % pinning ceiling / 45 %
 hit on the "sky is blue" bench is a *known, accepted* breadth gap for now, not a
-bug to chase. (This also parks the coherent-pin hypothesis above, which was gated
-behind priming.)
+bug to chase. (Priming being parked no longer parks the coherent pin — see the
+"UNGATED FROM PRIMING" note above; the two are now decoupled.)
 
 **Near-term levers that remain (given priming is parked):** (a) MoE fused-kernel
 inner-dot coalescing — the 29 % `mlp` bucket, the last big *compute* win; (b) NVMe
