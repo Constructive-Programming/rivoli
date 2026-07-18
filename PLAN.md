@@ -247,6 +247,50 @@ is revisited only for the future batched/server path (S>1 rows share weights).
 - **M6 (stretch) — NPU dense offload; device-tier stability ladder toward the
   full pin.**
 
+## Measured bottlenecks & the coherent-pin fix (2026-07-18, real snapshot)
+
+Profiled the M3 (4/4) engine on the LOCAL snapshot (`/var/db/llama-server/
+glm52-colibri-int4`, not the NFS `/swarm/storage` copy — the network was masking
+everything). Per-token buckets, "sky is blue", 48 GiB pin:
+
+- **COMPUTE-bound, not I/O-bound.** attn 36–39% | fetch 34–38% | mlp 16% |
+  lmhead 9%. Local storage cut per-miss 86 ms → 4.6 ms (NFS was the whole story).
+- **#1 bottleneck = the attention int4 GEMV** (row-per-thread, uncoalesced),
+  hit-rate-independent. The fused MoE kernel is 2× more efficient at 8× the work,
+  because it's LDS-staged/batched and the attention projections aren't. → a
+  coalesced/LDS int4 GEMV (the D3 tune) is the single largest tok/s lever.
+- **Routing is CORRECT** — 0.2 % of selections absent from `.coli_usage`, 0 misses
+  below the pin cutoff. The 45 % hit is pure workload BREADTH (this prompt routes
+  to rank ~9000). Pin-vs-hit curve: 45/53/67 % at 48/64/94 GiB (the 94 GiB
+  one-shot alloc SURVIVED — no wedge, de-risks large pins). 85 % would need
+  ~10 000 experts ≈ 189 GiB (2× the device) — **pinning cannot reach 85 %; a
+  workload-matched priming pass can** (routing being correct is what makes
+  priming clean).
+
+**THE MEMORY FIX (apply to the resident pin, not just the cold feed).** Per-expert
+bytes are already minimal and identical to colibri (gate+up+down int4 @ 4 bits +
+~40 KB f32 scales ≈ 18.9 MB; int4 is the floor). The waste is that the M3 pin
+DOUBLE-STORES on the unified APU: `pread`/mmap lands the expert in the **page
+cache** (host copy) and then `hipMemcpy` H2D duplicates it into the `hipMalloc`
+**device tier** — ~2× LPDDR5X per pinned expert. colibri (CPU) used the single
+host copy AS its pin. This is why the 94 GiB tier starved the page cache and
+per-miss ROSE to 6.17 ms (device tier + duplicate cache saturated 128 GB → cold
+set thrashed).
+
+Fix: **pin into `hipHostMalloc` coherent unified memory** (the "NVMe → iGPU
+direct" design, already specced for the cold feed — now extend it to the resident
+pin). `pread` NVMe straight into the coherent slab; the GPU reads it in place
+(APU-coherent); no device carveout, no page-cache duplicate → **~halves RAM per
+expert**, so ~2× more experts fit the same 128 GB AND the page cache stays free
+for the cold set (fast misses). Interim cheap version: `madvise(MADV_DONTNEED)`
+each pinned expert's mmap range right after the H2D copy to reclaim the duplicate
+(~40 GB at a 48 GiB tier). This does NOT replace the GEMV work — it makes the pin
+memory-efficient so a primed/matched pin can hold the working set.
+
+Priorities from the data: (1) coalesced int4 GEMV kernel (biggest tok/s lever,
+workload-independent); (2) coherent-memory pin (~2× RAM efficiency); (3) usage
+priming to lift hit past the 67 % pinning ceiling toward 85 %.
+
 ## M3 kernel contracts (locked by the M2 review)
 
 The M2 kernels are the correctness oracle; M3 rewrites them for residency. Two of
