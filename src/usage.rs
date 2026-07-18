@@ -27,9 +27,16 @@ impl Usage {
     }
 
     /// Write `<dir>/.coli_usage` in the shared `layer expert count` text format.
+    /// Atomic: write a same-dir temp, fsync, then rename over the target — so a
+    /// crash/kill/power-loss (cf. the Jul-15 event) leaves the precious golden
+    /// file intact rather than truncated (which `load`'s lenient parser would
+    /// silently accept as wrong counts). Single-writer assumed — two concurrent
+    /// rivoli instances would contend for the GPU tier long before this races.
     pub fn write(&self, dir: &str) -> Result<()> {
         use std::fmt::Write as _;
+        use std::io::Write as _;
         let path = format!("{dir}/.coli_usage");
+        let tmp = format!("{dir}/.coli_usage.tmp.{}", std::process::id());
         let mut s = String::with_capacity(self.counts.len() * 12);
         // Deterministic order so the file is stable diff-to-diff.
         let mut rows: Vec<_> = self.counts.iter().collect();
@@ -37,7 +44,11 @@ impl Usage {
         for (&(l, e), &c) in rows {
             let _ = writeln!(s, "{l} {e} {c}");
         }
-        std::fs::write(&path, s).with_context(|| format!("write {path}"))?;
+        let mut f = std::fs::File::create(&tmp).with_context(|| format!("create {tmp}"))?;
+        f.write_all(s.as_bytes())
+            .with_context(|| format!("write {tmp}"))?;
+        f.sync_all().with_context(|| format!("fsync {tmp}"))?; // durable before rename
+        std::fs::rename(&tmp, &path).with_context(|| format!("rename {tmp} -> {path}"))?;
         Ok(())
     }
     /// Load `<dir>/.coli_usage`. A missing file is not an error — it means no
