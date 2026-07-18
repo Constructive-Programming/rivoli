@@ -55,6 +55,8 @@ unsafe extern "C" {
         y: *mut f32,
     ) -> i32;
 
+    fn rivoli_gemv_f32(x: *const f32, w: *const f32, o_dim: i32, i_dim: i32, y: *mut f32) -> i32;
+
     fn rivoli_rmsnorm(x: *const f32, w: *const f32, n: i32, eps: f32, y: *mut f32) -> i32;
 
     fn rivoli_rope(base: *mut f32, count: i32, stride: i32, seg: i32, pos: i32, theta: f64) -> i32;
@@ -286,6 +288,33 @@ pub unsafe fn launch_gemv_i8(
     if r != 0 {
         let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
         bail!("launch_gemv_i8 failed ({kind}, code {r})");
+    }
+    Ok(())
+}
+
+/// Launch a batch-1 f32 GEMV `y = W·x` (`W` = `w`, `o_dim × i_dim`, no scale) —
+/// the MoE router gate. Device pointers, launch-only.
+///
+/// # Safety
+/// Async — `x` (`i_dim` f32), `w` (`o_dim·i_dim` f32), `y` (`o_dim` f32) must be
+/// valid device pointers live until the next [`device_sync`] returns.
+#[cfg(feature = "rocm")]
+pub unsafe fn launch_gemv_f32(
+    x: *const f32,
+    w: *const f32,
+    o_dim: usize,
+    i_dim: usize,
+    y: *mut f32,
+) -> Result<()> {
+    anyhow::ensure!(
+        o_dim <= i32::MAX as usize && i_dim <= i32::MAX as usize,
+        "gemv_f32 dims exceed i32 (o={o_dim} i={i_dim})"
+    );
+    // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
+    let r = unsafe { rivoli_gemv_f32(x, w, o_dim as i32, i_dim as i32, y) };
+    if r != 0 {
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("launch_gemv_f32 failed ({kind}, code {r})");
     }
     Ok(())
 }

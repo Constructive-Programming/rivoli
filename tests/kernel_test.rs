@@ -11,11 +11,11 @@
 
 use rivoli::device::{DeviceBuf, DeviceTier};
 use rivoli::hip::{
-    ExpertDesc, device_sync, launch_attend, launch_gemv_i4, launch_gemv_i8, launch_mla_absorb,
-    launch_mla_value, launch_moe, launch_rmsnorm, launch_rope,
+    ExpertDesc, device_sync, launch_attend, launch_gemv_f32, launch_gemv_i4, launch_gemv_i8,
+    launch_mla_absorb, launch_mla_value, launch_moe, launch_rmsnorm, launch_rope,
 };
 use rivoli::math::{bf16_to_f32, f32_to_bf16, silu, softmax};
-use rivoli::quant::{addrow, matvec_i4, matvec_i4_rows, matvec_i8, row_bytes};
+use rivoli::quant::{addrow, matvec_f32_bytes, matvec_i4, matvec_i4_rows, matvec_i8, row_bytes};
 use rivoli::snapshot::{Int4Matrix, Int8Matrix};
 
 /// Little-endian bytes of an f32 slice (device is LE, matching this host).
@@ -425,6 +425,39 @@ fn check_gemv_i4(seed: u64, o: usize, i: usize) {
 fn gemv_i4_matches_scalar() {
     check_gemv_i4(0x0991_1337, 1536, 2048); // even i_dim
     check_gemv_i4(0x0991_1338, 100, 257); // odd i_dim → last byte's high nibble is pad
+}
+
+#[test]
+fn gemv_f32_matches_scalar() {
+    // MoE router gate shape: o_dim = n_experts, i_dim = hidden.
+    let mut rng = Lcg(0x0f32_1337);
+    let (o, i) = (256usize, 6144usize);
+    let w: Vec<f32> = (0..o * i).map(|_| rng.f() * 0.1).collect();
+    let x: Vec<f32> = (0..i).map(|_| rng.f()).collect();
+    let w_bytes = f32_bytes(&w);
+    let mut want = vec![0.0f32; o];
+    matvec_f32_bytes(&mut want, &x, &w_bytes, i);
+
+    let w_buf = DeviceBuf::from_bytes(&w_bytes).expect("place w");
+    let x_buf = DeviceBuf::from_bytes(&f32_bytes(&x)).expect("place x");
+    let mut y_buf = DeviceBuf::zeroed(o * 4).expect("alloc y");
+    // SAFETY: device pointers valid for the dims; y outlives the sync.
+    unsafe {
+        launch_gemv_f32(
+            x_buf.ptr() as *const f32,
+            w_buf.ptr() as *const f32,
+            o,
+            i,
+            y_buf.ptr_mut() as *mut f32,
+        )
+        .expect("launch gemv_f32");
+    }
+    device_sync().expect("device sync");
+    assert_close(
+        &want,
+        &f32_vec(&y_buf.copy_out().expect("copy out")),
+        "gemv_f32",
+    );
 }
 
 #[test]

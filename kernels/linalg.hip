@@ -65,6 +65,19 @@ extern "C" int rivoli_gemv_i8(
     return e == hipSuccess ? 0 : -(int)e;
 }
 
+// y[o] = Σ_i x[i]·w[o·i_dim+i]  — plain f32 GEMV, no scale. The MoE router gate
+// (gate.weight is F32; matches quant.rs matvec_f32_bytes). One thread per row.
+extern "C" __global__ void gemv_f32(
+    const float* __restrict__ x, const float* __restrict__ w, int o_dim, int i_dim,
+    float* __restrict__ y) {
+    size_t o = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= (size_t)o_dim) return;
+    const float* row = w + o * (size_t)i_dim;
+    float acc = 0.0f;
+    for (int i = 0; i < i_dim; ++i) acc += x[i] * row[i];
+    y[o] = acc;
+}
+
 // y[i] = x[i] · (1/sqrt(mean(x²)+eps)) · w[i]  — RMSNorm, matching math.rs. One
 // block reduces Σx² in LDS (tree order → ms differs from the scalar sequential
 // sum by f32 rounding), then every thread scales. w is the f32 norm weight.
@@ -104,6 +117,16 @@ extern "C" __global__ void rope_interleave(
     float cs = (float)cos(ang), sn = (float)sin(ang);
     v[j] = a * cs - b * sn;
     v[half + j] = b * cs + a * sn;
+}
+
+extern "C" int rivoli_gemv_f32(
+    const float* x, const float* w, int o_dim, int i_dim, float* y) {
+    if (o_dim <= 0 || i_dim <= 0) return 1001;
+    hipGetLastError();
+    hipLaunchKernelGGL(gemv_f32, dim3((o_dim + 255) / 256), dim3(256), 0, 0,
+                       x, w, o_dim, i_dim, y);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
 }
 
 extern "C" int rivoli_rmsnorm(
