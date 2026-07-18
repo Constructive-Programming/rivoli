@@ -19,6 +19,23 @@ use crate::snapshot::Snapshot;
 use crate::usage::Usage;
 use anyhow::{Context, Result, ensure};
 
+/// Drop the page-cache copy of a just-placed mmap range (`MADV_DONTNEED`) so the
+/// resident pin doesn't pollute the cache the cold-expert set needs. Only whole
+/// pages inside the range are dropped; best-effort — a failure just leaves the
+/// duplicate, never wrong (the pages are clean file-backed, re-faulted on access).
+fn drop_pages(bytes: &[u8]) {
+    const PAGE: usize = 4096;
+    let start = bytes.as_ptr() as usize;
+    let end = start + bytes.len();
+    let a = start.div_ceil(PAGE) * PAGE; // round up to a page
+    let b = (end / PAGE) * PAGE; // round down to a page
+    if b > a {
+        // SAFETY: [a,b) is a page-aligned subrange of the live snapshot mmap;
+        // MADV_DONTNEED discards clean file pages, never corrupts.
+        unsafe { libc::madvise(a as *mut libc::c_void, b - a, libc::MADV_DONTNEED) };
+    }
+}
+
 /// A resolved int4 weight matrix in the tier: device pointers + dims.
 #[derive(Clone, Copy)]
 pub struct Weight {
@@ -101,16 +118,21 @@ pub struct Pin<'a> {
 }
 
 /// Place a norm/f32 tensor (O-length) into the tier, returning its device ptr.
+/// Drops the source page-cache copy after the H2D (see [`drop_pages`]).
 fn place_f32(tier: &mut DeviceTier, snap: &Snapshot, name: &str) -> Result<*const f32> {
     let bytes = snap.require(name)?;
-    Ok(tier.place(bytes)? as *const f32)
+    let p = tier.place(bytes)? as *const f32;
+    drop_pages(bytes);
+    Ok(p)
 }
 
 /// Place an int4 weight (`<name>.weight` + `.qs`) into the tier.
 fn place_i4(tier: &mut DeviceTier, snap: &Snapshot, name: &str, i_dim: usize) -> Result<Weight> {
     let m = snap.int4(name, i_dim)?;
     let packed = tier.place(m.packed)?;
+    drop_pages(m.packed);
     let scale = tier.place(m.scale)? as *const f32;
+    drop_pages(m.scale);
     Ok(Weight {
         packed,
         scale,
@@ -123,7 +145,9 @@ fn place_i4(tier: &mut DeviceTier, snap: &Snapshot, name: &str, i_dim: usize) ->
 fn place_i8(tier: &mut DeviceTier, snap: &Snapshot, name: &str, i_dim: usize) -> Result<Weight8> {
     let m = snap.int8(name, i_dim)?;
     let packed = tier.place(m.packed)?;
+    drop_pages(m.packed);
     let scale = tier.place(m.scale)? as *const f32;
+    drop_pages(m.scale);
     Ok(Weight8 {
         packed,
         scale,
