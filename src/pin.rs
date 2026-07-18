@@ -101,9 +101,36 @@ pub struct Pin<'a> {
     /// io_uring O_DIRECT reader — a layer's cold misses submit as one queue-depth
     /// batch straight into their LRU slots (folds the old mmap-warm + memcpy).
     stream: Streamer,
+    /// Cross-layer prefetch (`--prefetch`): a SECOND io_uring ring, dedicated to the
+    /// predicted next-layer experts. `Some` iff prefetch is enabled. Its reads are
+    /// SUBMITTED (non-blocking) after the current layer's own `resolve_layer` drain,
+    /// run on the NVMe/DMA side during the current layer's MoE compute, and are
+    /// DRAINED at the next `resolve_layer` — hiding the ~5ms/miss fetch behind
+    /// compute. A separate ring keeps in-flight prefetch reads from entangling with a
+    /// layer's synchronous miss batch.
+    prefetch_stream: Option<Streamer>,
+    /// Max predicted experts prefetched per layer (`--prefetch-depth`, the top-N by
+    /// router score). Bounded by the idle-NVMe-during-compute window on this
+    /// bandwidth-bound path; the caller slices to this before `prefetch_layer`.
+    prefetch_depth: usize,
+    /// An outstanding prefetch batch is in flight and must be drained by the next
+    /// `resolve_layer` before its slots are read.
+    prefetch_pending: bool,
+    /// The predicted expert set submitted for the layer named in `predicted_layer`
+    /// (recall accounting at the matching `resolve_layer`).
+    predicted: Vec<usize>,
+    predicted_layer: usize,
     /// Stats over the run.
     pub hits: u64,
     pub misses: u64,
+    /// Prefetch recall: `pred_correct` predicted experts were actually selected out
+    /// of `pred_total` predicted (over all prefetched layers).
+    pub pred_total: u64,
+    pub pred_correct: u64,
+    /// Nanoseconds spent blocked in the prefetch-ring drain (the part of the fetch
+    /// that did NOT overlap the previous layer's compute). Near-zero means the reads
+    /// were fully hidden; large means the overlap window was too small / NVMe-bound.
+    pub prefetch_wait_ns: u128,
     /// Optional access-trace sink (`--trace`): one line per resolved MoE layer, the
     /// space-separated `(layer,expert)` keys the LRU looked up, in access order.
     /// Feeds the offline cache-policy simulator (`src/cache.rs`, `bin/replay`).
@@ -279,6 +306,23 @@ impl Pool {
         Ok(slot)
     }
 
+    /// Like [`alloc`], but for a PREFETCHED (predicted) key: the policy parks it at
+    /// the cold/probation end (`insert_cold`) so an unused prediction is evicted
+    /// before any genuinely-accessed expert, and never pollutes the hot set. A later
+    /// real selection of the key (`get`) promotes it normally.
+    fn alloc_cold(&mut self, key: u32) -> Result<usize> {
+        let evicted = self.policy.insert_cold(key);
+        let slot = self.reuse(evicted)?;
+        self.bind(key, slot);
+        Ok(slot)
+    }
+
+    /// Is `key` currently resident in the policy? (Used to skip prefetching an
+    /// expert the pool already holds.)
+    fn contains(&self, key: u32) -> bool {
+        self.policy.contains(key)
+    }
+
     /// Map a policy eviction (or spare capacity) to a concrete slab slot.
     fn reuse(&mut self, evicted: Option<u32>) -> Result<usize> {
         match evicted {
@@ -327,6 +371,8 @@ impl<'a> Pin<'a> {
         bounce: bool,
         trace_path: Option<&str>,
         cache_policy: &str,
+        prefetch: bool,
+        prefetch_depth: usize,
     ) -> Result<Self> {
         let (free, _total) = mem_info()?;
         ensure!(
@@ -469,6 +515,17 @@ impl<'a> Pin<'a> {
             tracing::info!("LRU seeded {n} experts from .coli_usage (warm start)");
         }
 
+        // Cross-layer prefetch (`--prefetch`): a second ring, same geometry as the
+        // synchronous one, dedicated to the predicted next-layer experts.
+        let prefetch_stream = if prefetch {
+            tracing::info!(
+                "cross-layer expert prefetch ENABLED (single-layer lookahead, depth {prefetch_depth})"
+            );
+            Some(Streamer::new(ring as u32, span, bounce)?)
+        } else {
+            None
+        };
+
         Ok(Self {
             snap,
             cfg,
@@ -482,8 +539,16 @@ impl<'a> Pin<'a> {
             expert_slot,
             pool,
             stream,
+            prefetch_stream,
+            prefetch_depth,
+            prefetch_pending: false,
+            predicted: Vec::new(),
+            predicted_layer: usize::MAX,
             hits: 0,
             misses: 0,
+            pred_total: 0,
+            pred_correct: 0,
+            prefetch_wait_ns: 0,
             trace: trace_path
                 .map(|p| -> Result<_> {
                     Ok(std::io::BufWriter::new(
@@ -510,6 +575,26 @@ impl<'a> Pin<'a> {
     /// submit as ONE queue-depth io_uring O_DIRECT batch, joined once.
     pub fn resolve_layer(&mut self, layer: usize, sel: &[usize]) -> Result<Vec<Mlp>> {
         let (cfg, snap) = (self.cfg, self.snap);
+        // Cross-layer prefetch consume: an outstanding prefetch batch (submitted
+        // during the PREVIOUS layer's compute) targets THIS layer. Wait for its reads
+        // + bounce copy (+ device sync inside `drain`), so every predicted-correct
+        // expert is resident in VMM BEFORE phase 1a's hit scan and this layer's MoE
+        // read it. The predicted-correct keys were already `alloc_cold`-bound to their
+        // slots with `off` set (at submit time), so they now surface as normal hits.
+        if self.prefetch_pending {
+            if let Some(s) = self.prefetch_stream.as_mut() {
+                let t = std::time::Instant::now();
+                s.drain()?;
+                self.prefetch_wait_ns += t.elapsed().as_nanos();
+            }
+            self.prefetch_pending = false;
+            // Recall: how many predicted experts are in this layer's actual `sel`.
+            if self.predicted_layer == layer {
+                let hit = self.predicted.iter().filter(|e| sel.contains(e)).count();
+                self.pred_total += self.predicted.len() as u64;
+                self.pred_correct += hit as u64;
+            }
+        }
         // Trace sink (--trace): the exact LRU keys this layer looks up, access order.
         if let Some(w) = &mut self.trace {
             use std::io::Write;
@@ -577,6 +662,66 @@ impl<'a> Pin<'a> {
             });
         }
         Ok(out)
+    }
+
+    /// Is cross-layer prefetch enabled (`--prefetch`)?
+    pub fn prefetch_enabled(&self) -> bool {
+        self.prefetch_stream.is_some()
+    }
+
+    /// Max predicted experts to prefetch per layer (`--prefetch-depth`).
+    pub fn prefetch_depth(&self) -> usize {
+        self.prefetch_depth
+    }
+
+    /// Submit io_uring reads for `pred` — the predicted routed experts of `layer`
+    /// (the NEXT MoE layer) — on the prefetch ring, NON-blocking. Already-resident
+    /// predictions are skipped; the rest are `alloc_cold`-bound to fresh slots (with
+    /// `off` set now, from cfg geometry) and their reads submitted so they run during
+    /// the current layer's GPU compute. The batch is drained by the matching
+    /// `resolve_layer(layer)`. Call this AFTER the current layer's own `resolve_layer`
+    /// drain (main ring quiescent) and BEFORE its `launch_moe`.
+    ///
+    /// Correctness: `alloc_cold` may evict a resident slot, but the prefetch reads
+    /// only physically land in the reused slot at DRAIN time (next `resolve_layer`,
+    /// after this layer's end-of-layer `device_sync`), so a slot the current layer's
+    /// in-flight MoE still reads is never overwritten under it.
+    pub fn prefetch_layer(&mut self, layer: usize, pred: &[usize]) -> Result<()> {
+        if self.prefetch_stream.is_none() {
+            return Ok(());
+        }
+        let (cfg, snap) = (self.cfg, self.snap);
+        // Record the full predicted set (recall is measured over all predictions,
+        // including those skipped below as already resident).
+        self.predicted.clear();
+        self.predicted.extend_from_slice(pred);
+        self.predicted_layer = layer;
+        // Raw slab ptr (no borrow held across the &mut stream reads), mirroring
+        // `resolve_layer`'s phase 1b.
+        let slab = self.lru_pool.ptr_mut();
+        // Disjoint field borrows: `prefetch_stream` and `pool` are distinct fields.
+        let stream = match self.prefetch_stream.as_mut() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        let pool = &mut self.pool;
+        let mut queued = 0usize;
+        for &e in pred {
+            let key = expert_key(layer, e);
+            if pool.contains(key) {
+                continue; // already resident — no fetch needed
+            }
+            let slot = pool.alloc_cold(key)?;
+            let base = format!("model.layers.{layer}.mlp.experts.{e}");
+            pool.off[slot] = stream_expert(stream, snap, cfg, slab, slot, &base)?;
+            queued += 1;
+        }
+        if queued > 0 {
+            // Kick the reads off NOW so they overlap this layer's compute.
+            stream.submit()?;
+            self.prefetch_pending = true;
+        }
+        Ok(())
     }
 }
 

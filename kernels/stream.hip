@@ -101,6 +101,16 @@ extern "C" int rivoli_ring_read(void* ring, int fd, void* dst, unsigned nbytes,
     return 0;
 }
 
+// Submit the queued SQEs to the kernel WITHOUT waiting (the reads start running
+// now — used by the prefetch ring so cross-layer reads proceed on the NVMe/DMA
+// side during the current layer's GPU compute). A later `rivoli_ring_wait` reaps
+// the same completions (its own submit is then a no-op, the SQ already drained).
+// Returns the number of SQEs submitted (>= 0) or a negative -errno.
+extern "C" int rivoli_ring_submit(void* ring) {
+    Ring* r = (Ring*)ring;
+    return io_uring_submit(&r->uring);
+}
+
 // Submit all queued reads, wait for `count` completions, and — in bounce mode, only
 // if every read succeeded — hipMemcpy each bounce slot into its VMM dst (async on
 // the null stream, one sync). Returns 0, or the first negative completion result

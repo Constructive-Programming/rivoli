@@ -96,6 +96,12 @@ pub struct GpuEngine<'a> {
     clat: DeviceBuf,
     ctx: DeviceBuf,
     gate_logits: DeviceBuf,
+    // Cross-layer prefetch (`--prefetch`) scratch: L+1's router-gate prediction.
+    // `pred_xn` = L's post-attn residual normed with L+1's input_ln; `pred_gl` = the
+    // L+1 gate logits over it. Small, allocated unconditionally (cheap), used only
+    // when `prefetch`.
+    pred_xn: DeviceBuf,
+    pred_gl: DeviceBuf,
     moe_out: DeviceBuf,
     moe_partial: DeviceBuf, // [slots*hidden] per-expert outputs (deterministic reduce)
     moe_h: DeviceBuf,       // [E*inter] SwiGLU hidden scratch (two-pass coalesced MoE)
@@ -109,6 +115,14 @@ pub struct GpuEngine<'a> {
     scores: Vec<f32>,
     choice: Vec<f32>,
     sel: Vec<usize>,
+    // Cross-layer prefetch: separate host scratch for the L+1 prediction top-k, so
+    // it never clobbers `scores`/`choice`/`sel` (still needed for L's own MoE
+    // weights after the prediction runs).
+    pred_scores: Vec<f32>,
+    pred_choice: Vec<f32>,
+    pred_sel: Vec<usize>,
+    prefetch: bool,
+    prefetch_depth: usize,
     prof: Profile,
 }
 
@@ -149,6 +163,8 @@ impl<'a> GpuEngine<'a> {
             clat: f(h * kvl)?,
             ctx: f(h * cfg.v_head_dim)?,
             gate_logits: f(cfg.n_experts)?,
+            pred_xn: f(cfg.hidden)?,
+            pred_gl: f(cfg.n_experts)?,
             moe_out: f(cfg.hidden)?,
             moe_partial: f(slots * cfg.hidden)?,
             moe_h: f((slots * cfg.moe_inter).max(cfg.dense_inter))?,
@@ -160,6 +176,11 @@ impl<'a> GpuEngine<'a> {
             scores: vec![0.0; cfg.n_experts],
             choice: vec![0.0; cfg.n_experts],
             sel: Vec::with_capacity(cfg.top_k),
+            pred_scores: vec![0.0; cfg.n_experts],
+            pred_choice: vec![0.0; cfg.n_experts],
+            pred_sel: Vec::with_capacity(cfg.top_k),
+            prefetch: pin.prefetch_enabled(),
+            prefetch_depth: pin.prefetch_depth(),
             prof: Profile::default(),
             pin,
         })
@@ -170,6 +191,14 @@ impl<'a> GpuEngine<'a> {
     }
     pub fn misses(&self) -> u64 {
         self.pin.misses
+    }
+    /// Cross-layer prefetch recall: (predicted experts actually selected, predicted).
+    pub fn prefetch_recall(&self) -> (u64, u64) {
+        (self.pin.pred_correct, self.pin.pred_total)
+    }
+    /// Total ms blocked in the prefetch drain (fetch NOT hidden behind compute).
+    pub fn prefetch_wait_ms(&self) -> f64 {
+        self.pin.prefetch_wait_ns as f64 / 1e6
     }
 
     /// One forward pass for `token` at `pos`, leaving next-token logits device-
@@ -291,16 +320,61 @@ impl<'a> GpuEngine<'a> {
                     )?;
                 }
             } else {
+                // Cross-layer prefetch: if the NEXT layer is also MoE, predict its
+                // routed experts from L's post-attn residual `xp` (the cheap proxy
+                // for L+1's input — the true input adds L's MLP delta we don't have
+                // yet). The router gate + input_ln are always resident, so this is a
+                // small norm + gemv folded under the same attention sync below.
+                let predict = self.prefetch && l + 1 < cfg.n_layers && l + 1 >= cfg.dense_layers;
+                let next_pred = if predict {
+                    let nl = &self.pin.layers[l + 1];
+                    if let LayerMlp::Moe { gate_w, .. } = &nl.mlp {
+                        Some((nl.input_ln, *gate_w))
+                    } else {
+                        None // guarded MoE; stay safe rather than assume
+                    }
+                } else {
+                    None
+                };
                 // Router gate on device, then read logits to route on host.
                 // SAFETY: gate_w resident F32; glp device scratch.
                 unsafe { launch_gemv_f32(xnp, gate_w, cfg.n_experts, hidden, glp)? };
+                if let Some((next_ln, next_gate)) = next_pred {
+                    // SAFETY: `xp` is the live post-attn residual; `next_ln`/
+                    // `next_gate` are resident L+1 weights; pred_xn/pred_gl are device
+                    // scratch. Same default stream → ordered after the gate above and
+                    // drained by the sync that follows.
+                    unsafe {
+                        launch_rmsnorm(
+                            xp,
+                            next_ln,
+                            hidden,
+                            eps,
+                            self.pred_xn.ptr_mut() as *mut f32,
+                        )?;
+                        launch_gemv_f32(
+                            self.pred_xn.ptr() as *const f32,
+                            next_gate,
+                            cfg.n_experts,
+                            hidden,
+                            self.pred_gl.ptr_mut() as *mut f32,
+                        )?;
+                    }
+                }
                 let t = std::time::Instant::now();
-                device_sync()?; // wait attention+gate compute
+                device_sync()?; // wait attention+gate (+ L+1 prediction) compute
                 self.prof.attn_ns += t.elapsed().as_nanos();
                 let t = std::time::Instant::now();
                 let gl = self.gate_logits.copy_out()?;
                 let bias = self.pin.moe_bias(l).to_vec();
                 self.route(&gl, &bias);
+                // Predicted L+1 top-k (separate scratch; L's `scores`/`sel` still
+                // feed L's own MoE weights below).
+                if next_pred.is_some() {
+                    let pgl = self.pred_gl.copy_out()?;
+                    let nbias = self.pin.moe_bias(l + 1).to_vec();
+                    self.route_pred(&pgl, &nbias);
+                }
                 self.prof.route_ns += t.elapsed().as_nanos();
                 // Batch every cold miss through io_uring O_DIRECT (queue depth →
                 // full NVMe bandwidth, straight into the VMM slots, one join) and
@@ -310,6 +384,22 @@ impl<'a> GpuEngine<'a> {
                 let mlps = self.pin.resolve_layer(l, &self.sel)?;
                 self.prof.fetch_ns += t.elapsed().as_nanos();
                 self.prof.fetch_n += self.pin.misses - miss0;
+                // Submit L+1's predicted-expert reads NOW (non-blocking): the main
+                // ring is quiescent (its drain just returned), and these reads run on
+                // the NVMe/DMA side during this layer's MoE compute below. They are
+                // reaped by `resolve_layer(l+1)`'s prefetch drain — hiding the fetch.
+                //
+                // Only the top `prefetch_depth` predictions (highest router score,
+                // `pred_sel` is score-desc) are prefetched: the NVMe is bandwidth-
+                // bound (~one 18 MB expert read saturates it), so the exploitable
+                // budget is just the ~idle-during-compute window — a couple of experts
+                // per layer. Higher-ranked predictions also have far higher per-expert
+                // recall, so capping slashes the wasted-read volume that a full top_k
+                // prefetch (36% mispredict) spends against the same saturated NVMe.
+                if next_pred.is_some() {
+                    let n = self.prefetch_depth.min(self.pred_sel.len());
+                    self.pin.prefetch_layer(l + 1, &self.pred_sel[..n])?;
+                }
                 // Build the descriptor batch (+ record the hit-rate diagnostic).
                 let ke = self.sel.len();
                 let mut descs = Vec::with_capacity(ke + cfg.n_shared);
@@ -391,6 +481,21 @@ impl<'a> GpuEngine<'a> {
             *c = s + b;
         }
         topk_into(&self.choice, self.cfg.top_k, &mut self.sel);
+    }
+
+    /// Host top-k for the cross-layer L+1 PREDICTION — identical math to [`route`]
+    /// but on separate scratch (`pred_scores`/`pred_choice`/`pred_sel`), so it never
+    /// clobbers `scores`/`choice`/`sel`, which still feed the current layer's MoE
+    /// weights. Only the selected expert indices matter (which to prefetch); the
+    /// scores are not reused, so no normalization is done.
+    fn route_pred(&mut self, gate_logits: &[u8], bias: &[f32]) {
+        for (s, c) in gate_logits.chunks_exact(4).zip(self.pred_scores.iter_mut()) {
+            *c = sigmoid(f32::from_le_bytes([s[0], s[1], s[2], s[3]]));
+        }
+        for ((c, &s), &b) in self.pred_choice.iter_mut().zip(&self.pred_scores).zip(bias) {
+            *c = s + b;
+        }
+        topk_into(&self.pred_choice, self.cfg.top_k, &mut self.pred_sel);
     }
 
     /// Greedy argmax over the device logits (one D2H after the final join).

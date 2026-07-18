@@ -39,6 +39,7 @@ mod ffi {
             off: u64,
             user_data: u64,
         ) -> i32;
+        pub fn rivoli_ring_submit(ring: *mut c_void) -> i32;
         pub fn rivoli_ring_wait(ring: *mut c_void, count: u32, min_res: *const u64) -> i32;
         pub fn rivoli_ring_free(ring: *mut c_void);
     }
@@ -158,6 +159,27 @@ impl Streamer {
         self.min_res.push(min_completion(begin, len));
         self.queued += 1;
         Ok(sub)
+    }
+
+    /// Submit the queued reads to the kernel WITHOUT waiting, so they start running
+    /// on the NVMe/DMA side immediately. Used by the cross-layer prefetch ring: the
+    /// reads overlap the current layer's GPU compute, and a later [`Streamer::drain`]
+    /// reaps the same completions (its `submit_and_wait` then submits nothing new).
+    /// The `queued`/`min_res` bookkeeping is deliberately left intact for that drain.
+    /// No-op if nothing is queued.
+    pub fn submit(&self) -> Result<()> {
+        if self.queued == 0 {
+            return Ok(());
+        }
+        // SAFETY: `ring` is live; submitting only hands the already-prepped SQEs to
+        // the kernel — the CQEs are reaped by the matching `drain`.
+        let r = unsafe { ffi::rivoli_ring_submit(self.ring) };
+        ensure!(
+            r >= 0,
+            "io_uring submit failed: {}",
+            std::io::Error::from_raw_os_error(-r)
+        );
+        Ok(())
     }
 
     /// Submit all queued reads and block until every one completes; errors on the

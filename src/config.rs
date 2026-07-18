@@ -42,6 +42,15 @@ pub struct Config {
     /// 2Q/ARC add scan resistance that matters once prefetch injects a
     /// misprediction stream; without prefetch they measure ≈ LRU.
     pub cache_policy: String,
+    /// Cross-layer expert prefetch (`--prefetch`). Default false (baseline). When on,
+    /// each MoE layer predicts the NEXT MoE layer's routed experts from its post-attn
+    /// residual and submits their cold reads on a second io_uring ring, so the fetch
+    /// overlaps this layer's GPU compute instead of stalling the next layer.
+    pub prefetch: bool,
+    /// Max predicted experts prefetched per layer (`--prefetch-depth`, top-N by
+    /// router score). The NVMe is bandwidth-bound, so only the ~idle-during-compute
+    /// window is exploitable — a small N (default 2). Ignored unless `prefetch`.
+    pub prefetch_depth: usize,
     /// Total budget for expert residency (pin + slab pool), bytes:
     /// MemAvailable − OS_RESERVE − engine overhead (refined at snapshot load).
     pub mem_budget: u64,
@@ -89,6 +98,9 @@ fn gtt_info() -> Option<(u64, u64)> {
 impl Config {
     /// Discover the machine. Fails loudly if another GPU tenant is active —
     /// sole tenancy is a startup invariant, not a runtime hope.
+    // Each arg is a distinct discovered/passed runtime knob threaded from the CLI;
+    // bundling them into a struct used at one call site is churn.
+    #[allow(clippy::too_many_arguments)]
     pub fn discover(
         snapshot: String,
         bench: Option<usize>,
@@ -97,6 +109,8 @@ impl Config {
         trace: Option<String>,
         prompt: Option<String>,
         cache_policy: String,
+        prefetch: bool,
+        prefetch_depth: usize,
     ) -> Result<Self> {
         let avail = mem_available()?;
         if avail <= OS_RESERVE {
@@ -126,6 +140,8 @@ impl Config {
             trace,
             prompt,
             cache_policy,
+            prefetch,
+            prefetch_depth,
             mem_budget: avail - OS_RESERVE,
             gtt_free: gtt_total.saturating_sub(gtt_used),
             threads,
@@ -138,12 +154,14 @@ impl fmt::Display for Config {
         const GIB: f64 = (1u64 << 30) as f64;
         write!(
             f,
-            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} cache_policy={} trace={:?} prompt={:?} mem_budget={:.1}GiB gtt_free={:.1}GiB os_reserve={:.0}GiB threads={}",
+            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} cache_policy={} prefetch={} prefetch_depth={} trace={:?} prompt={:?} mem_budget={:.1}GiB gtt_free={:.1}GiB os_reserve={:.0}GiB threads={}",
             self.snapshot,
             self.bench,
             self.pre_seed,
             self.direct_vmm_dma,
             self.cache_policy,
+            self.prefetch,
+            self.prefetch_depth,
             self.trace,
             self.prompt,
             self.mem_budget as f64 / GIB,

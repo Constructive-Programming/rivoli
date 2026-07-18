@@ -22,11 +22,14 @@ struct Args {
     trace: Option<String>,
     prompt: Option<String>,
     cache_policy: String,
+    prefetch: bool,
+    prefetch_depth: usize,
 }
 
 fn parse_args() -> Result<Args> {
     const USAGE: &str = "usage: rivoli <snapshot-dir> [-bench <tokens>] [--pre-seed] \
-         [--direct-vmm-dma] [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc]";
+         [--direct-vmm-dma] [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc] \
+         [--prefetch] [--prefetch-depth <n>]";
     let mut snapshot = None;
     let mut a = Args {
         snapshot: String::new(),
@@ -36,6 +39,8 @@ fn parse_args() -> Result<Args> {
         trace: None,
         prompt: None,
         cache_policy: "lru".to_string(),
+        prefetch: false,
+        prefetch_depth: 2,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -50,6 +55,14 @@ fn parse_args() -> Result<Args> {
             "--prompt" => a.prompt = Some(args.next().context("--prompt requires text")?),
             "--cache-policy" => {
                 a.cache_policy = args.next().context("--cache-policy requires lru|2q|arc")?;
+            }
+            "--prefetch" => a.prefetch = true,
+            "--prefetch-depth" => {
+                a.prefetch_depth = args
+                    .next()
+                    .context("--prefetch-depth requires an integer")?
+                    .parse()
+                    .context("--prefetch-depth takes an integer")?;
             }
             _ if snapshot.is_none() => snapshot = Some(arg),
             _ => bail!("unexpected argument: {arg}\n{USAGE}"),
@@ -75,6 +88,8 @@ fn main() -> Result<()> {
         a.trace,
         a.prompt,
         a.cache_policy,
+        a.prefetch,
+        a.prefetch_depth,
     )?;
 
     // Rule 1: the full discovered config is the first line of every run.
@@ -182,6 +197,8 @@ async fn run(cfg: Config) -> Result<()> {
             !cfg.direct_vmm_dma,
             cfg.trace.as_deref(),
             &cfg.cache_policy,
+            cfg.prefetch,
+            cfg.prefetch_depth,
         )?;
         info!("pin built in {:.1}s", t.elapsed().as_secs_f64());
         let max_ctx = prompt_ids.len() + ngen + 1;
@@ -197,6 +214,16 @@ async fn run(cfg: Config) -> Result<()> {
             ids.len() as f64 / dt,
             100.0 * hits as f64 / (hits + misses).max(1) as f64,
         );
+        if cfg.prefetch {
+            let (correct, total) = engine.prefetch_recall();
+            info!(
+                "prefetch: recall {:.1}% ({correct} of {total} predicted experts selected) \
+                 | drain-wait {:.0}ms total ({:.1}ms/tok not hidden)",
+                100.0 * correct as f64 / total.max(1) as f64,
+                engine.prefetch_wait_ms(),
+                engine.prefetch_wait_ms() / ids.len().max(1) as f64,
+            );
+        }
         info!("{bench_prompt}{}", tok.decode_all(&ids)?);
         Ok(())
     }
