@@ -10,6 +10,15 @@
 #![allow(clippy::expect_used)]
 
 use rivoli::device::{DeviceBuf, DeviceTier};
+
+/// Test helper: place synthetic bytes into the tier (no shard file to `pread`
+/// from), filling the device-local host-mapped slab in place.
+fn place_bytes(tier: &mut DeviceTier, bytes: &[u8]) -> *const u8 {
+    let dst = tier.reserve(bytes.len()).expect("reserve");
+    // SAFETY: dst owns bytes.len() host-writable bytes just reserved.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
+    dst as *const u8
+}
 use rivoli::hip::{
     ExpertDesc, device_sync, launch_attend, launch_gemv_f32, launch_gemv_i4, launch_gemv_i8,
     launch_mla_absorb, launch_mla_value, launch_moe, launch_rmsnorm, launch_rope,
@@ -164,12 +173,12 @@ fn check(seed: u64, hidden: usize, inter: usize, e: usize) {
     let mut tier = DeviceTier::new(256 << 20).expect("alloc tier");
     let descs: Vec<ExpertDesc> = (0..e)
         .map(|i| {
-            let gp = tier.place(&gates[i].packed).expect("place gate");
-            let gs = tier.place(&gates[i].scale_bytes).expect("place gate scale");
-            let up = tier.place(&ups[i].packed).expect("place up");
-            let us = tier.place(&ups[i].scale_bytes).expect("place up scale");
-            let dp = tier.place(&downs[i].packed).expect("place down");
-            let ds = tier.place(&downs[i].scale_bytes).expect("place down scale");
+            let gp = place_bytes(&mut tier, &gates[i].packed);
+            let gs = place_bytes(&mut tier, &gates[i].scale_bytes);
+            let up = place_bytes(&mut tier, &ups[i].packed);
+            let us = place_bytes(&mut tier, &ups[i].scale_bytes);
+            let dp = place_bytes(&mut tier, &downs[i].packed);
+            let ds = place_bytes(&mut tier, &downs[i].scale_bytes);
             ExpertDesc {
                 gate_packed: gp,
                 gate_scale: gs as *const f32,
@@ -400,8 +409,8 @@ fn check_gemv_i4(seed: u64, o: usize, i: usize) {
     );
 
     let mut tier = DeviceTier::new(64 << 20).expect("alloc tier");
-    let pp = tier.place(&m.packed).expect("place packed");
-    let ps = tier.place(&m.scale_bytes).expect("place scale");
+    let pp = place_bytes(&mut tier, &m.packed);
+    let ps = place_bytes(&mut tier, &m.scale_bytes);
     let x_buf = DeviceBuf::from_bytes(&f32_bytes(&x)).expect("place x");
     let mut y_buf = DeviceBuf::zeroed(o * 4).expect("alloc y");
     // SAFETY: device pointers valid for the dims; y outlives the sync.
@@ -482,8 +491,8 @@ fn gemv_i8_matches_scalar() {
     );
 
     let mut tier = DeviceTier::new(64 << 20).expect("alloc tier");
-    let pp = tier.place(&packed).expect("place packed");
-    let ps = tier.place(&scale).expect("place scale");
+    let pp = place_bytes(&mut tier, &packed);
+    let ps = place_bytes(&mut tier, &scale);
     let x_buf = DeviceBuf::from_bytes(&f32_bytes(&x)).expect("place x");
     let mut y_buf = DeviceBuf::zeroed(o * 4).expect("alloc y");
     // SAFETY: device pointers valid for the dims; y outlives the sync.
@@ -538,8 +547,8 @@ fn check_mla(seed: u64, h: usize, qh: usize, nope: usize, vh: usize, kvl: usize)
     }
 
     let mut tier = DeviceTier::new(64 << 20).expect("alloc tier");
-    let kp = tier.place(&kvb.packed).expect("place kv_b packed");
-    let ks = tier.place(&kvb.scale_bytes).expect("place kv_b scale") as *const f32;
+    let kp = place_bytes(&mut tier, &kvb.packed);
+    let ks = place_bytes(&mut tier, &kvb.scale_bytes) as *const f32;
     let q_buf = DeviceBuf::from_bytes(&f32_bytes(&q)).expect("place q");
     let clat_buf = DeviceBuf::from_bytes(&f32_bytes(&clat)).expect("place clat");
     let mut qabs_buf = DeviceBuf::zeroed(h * kvl * 4).expect("alloc qabs");

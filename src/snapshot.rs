@@ -10,10 +10,11 @@
 //! nibbles, `(lo+8)|((hi+8)<<4)`) and `<name>.weight.qs` (F32 per-row scale).
 //! Dequant lands in M2 against colibri's kernel as the oracle; M0 only indexes.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 
 /// On-disk element type. The snapshot uses exactly two: `F32` (norm weights,
@@ -83,14 +84,17 @@ struct RawTensor {
     data_offsets: [usize; 2],
 }
 
-/// One shard's mmap plus the tensors located within it (offsets absolute).
+/// One shard's mmap + open file (mmap serves header/dims/warm; the file serves
+/// `pread` weight loads) plus the tensors located within it.
 struct IndexedShard {
     mmap: Mmap,
+    file: File,
     entries: Vec<(String, TensorLoc)>,
 }
 
 pub struct Snapshot {
     shards: Vec<Mmap>,
+    files: Vec<File>, // same order as `shards`; for pread weight loads
     index: HashMap<String, TensorLoc>,
 }
 
@@ -112,6 +116,7 @@ impl Snapshot {
         }
 
         let mut shards = Vec::with_capacity(paths.len());
+        let mut files = Vec::with_capacity(paths.len());
         let mut index = HashMap::new();
 
         for (si, path) in paths.iter().enumerate() {
@@ -125,8 +130,13 @@ impl Snapshot {
                 }
             }
             shards.push(shard.mmap);
+            files.push(shard.file);
         }
-        Ok(Self { shards, index })
+        Ok(Self {
+            shards,
+            files,
+            index,
+        })
     }
 
     fn index_shard(path: &Path) -> Result<IndexedShard> {
@@ -134,6 +144,7 @@ impl Snapshot {
         // SAFETY: the shard is a read-only model file; we never mutate the map
         // and it outlives no borrow past Snapshot's own lifetime.
         let mmap = unsafe { Mmap::map(&file) }.context("mmap shard")?;
+        // `file` is kept open (returned below) for pread weight loads.
         if mmap.len() < 8 {
             bail!("shard shorter than 8-byte header length");
         }
@@ -173,7 +184,70 @@ impl Snapshot {
                 },
             ));
         }
-        Ok(IndexedShard { mmap, entries })
+        Ok(IndexedShard {
+            mmap,
+            file,
+            entries,
+        })
+    }
+
+    /// `pread` a tensor's raw bytes directly into `dst` (must own `cap` bytes) —
+    /// straight from the shard file into device-local host-mapped memory (a
+    /// `VmmBuf`), no mmap fault and no H2D copy. If `evict`, drop the file's
+    /// page-cache copy of the range afterward (`POSIX_FADV_DONTNEED`): resident
+    /// weights are read once, so they shouldn't also pollute the cache the cold set
+    /// needs (the pread equivalent of the old placement `madvise`). Cold loads pass
+    /// `evict = false` — their file pages stay warm for re-hits.
+    ///
+    /// # Safety
+    /// `dst` must point to at least `cap` writable bytes valid for this call.
+    pub unsafe fn read_into(
+        &self,
+        name: &str,
+        dst: *mut u8,
+        cap: usize,
+        evict: bool,
+    ) -> Result<usize> {
+        let loc = self
+            .index
+            .get(name)
+            .with_context(|| format!("tensor {name} not found for pread"))?;
+        let len = loc.end - loc.begin;
+        ensure!(len <= cap, "read_into {name}: {len} bytes > dst cap {cap}");
+        let fd = self.files[loc.shard].as_raw_fd();
+        let mut done = 0usize;
+        while done < len {
+            // SAFETY: dst[done..len] is within the caller's `cap` bytes (checked);
+            // pread writes at most len-done bytes there.
+            let n = unsafe {
+                libc::pread(
+                    fd,
+                    dst.add(done) as *mut libc::c_void,
+                    len - done,
+                    (loc.begin + done) as libc::off_t,
+                )
+            };
+            ensure!(
+                n > 0,
+                "pread {name} (shard {} off {}): {}",
+                loc.shard,
+                loc.begin + done,
+                std::io::Error::last_os_error()
+            );
+            done += n as usize;
+        }
+        if evict {
+            // SAFETY: fd is a live open shard; advisory, never corrupts.
+            unsafe {
+                libc::posix_fadvise(
+                    fd,
+                    loc.begin as libc::off_t,
+                    len as libc::off_t,
+                    libc::POSIX_FADV_DONTNEED,
+                );
+            }
+        }
+        Ok(len)
     }
 
     pub fn len(&self) -> usize {

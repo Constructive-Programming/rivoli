@@ -15,27 +15,10 @@
 
 use crate::device::{DeviceTier, VmmBuf, mem_info};
 use crate::model::ModelConfig;
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Int4Matrix, Snapshot};
 use crate::usage::Usage;
 use anyhow::{Context, Result, ensure};
 use rayon::prelude::*;
-
-/// Drop the page-cache copy of a just-placed mmap range (`MADV_DONTNEED`) so the
-/// resident pin doesn't pollute the cache the cold-expert set needs. Only whole
-/// pages inside the range are dropped; best-effort — a failure just leaves the
-/// duplicate, never wrong (the pages are clean file-backed, re-faulted on access).
-fn drop_pages(bytes: &[u8]) {
-    const PAGE: usize = 4096;
-    let start = bytes.as_ptr() as usize;
-    let end = start + bytes.len();
-    let a = start.div_ceil(PAGE) * PAGE; // round up to a page
-    let b = (end / PAGE) * PAGE; // round down to a page
-    if b > a {
-        // SAFETY: [a,b) is a page-aligned subrange of the live snapshot mmap;
-        // MADV_DONTNEED discards clean file pages, never corrupts.
-        unsafe { libc::madvise(a as *mut libc::c_void, b - a, libc::MADV_DONTNEED) };
-    }
-}
 
 /// A resolved int4 weight matrix in the tier: device pointers + dims.
 #[derive(Clone, Copy)]
@@ -118,42 +101,52 @@ pub struct Pin<'a> {
     pub misses: u64,
 }
 
-/// Place a norm/f32 tensor (O-length) into the tier, returning its device ptr.
-/// Drops the source page-cache copy after the H2D (see [`drop_pages`]).
+/// Place a norm/f32 tensor (O-length) into the tier: reserve, then `pread` the
+/// bytes straight from the shard file into the device-local slab (evict the
+/// page-cache copy — resident weights are read once, never re-loaded).
 fn place_f32(tier: &mut DeviceTier, snap: &Snapshot, name: &str) -> Result<*const f32> {
-    let bytes = snap.require(name)?;
-    let p = tier.place(bytes)? as *const f32;
-    drop_pages(bytes);
-    Ok(p)
+    let len = snap.require(name)?.len();
+    let dst = tier.reserve(len)?;
+    // SAFETY: dst owns `len` reserved bytes.
+    unsafe { snap.read_into(name, dst, len, true)? };
+    Ok(dst as *const f32)
 }
 
-/// Place an int4 weight (`<name>.weight` + `.qs`) into the tier.
+/// Place an int4 weight (`<name>.weight` + `.qs`) into the tier via `pread`.
 fn place_i4(tier: &mut DeviceTier, snap: &Snapshot, name: &str, i_dim: usize) -> Result<Weight> {
     let m = snap.int4(name, i_dim)?;
-    let packed = tier.place(m.packed)?;
-    drop_pages(m.packed);
-    let scale = tier.place(m.scale)? as *const f32;
-    drop_pages(m.scale);
+    let (plen, slen, o_dim) = (m.packed.len(), m.scale.len(), m.o_dim);
+    let packed = tier.reserve(plen)?;
+    let scale = tier.reserve(slen)?;
+    // SAFETY: packed/scale each own their reserved byte counts.
+    unsafe {
+        snap.read_into(&format!("{name}.weight"), packed, plen, true)?;
+        snap.read_into(&format!("{name}.weight.qs"), scale, slen, true)?;
+    }
     Ok(Weight {
         packed,
-        scale,
-        o_dim: m.o_dim,
-        i_dim: m.i_dim,
+        scale: scale as *const f32,
+        o_dim,
+        i_dim,
     })
 }
 
-/// Place an int8 weight into the tier.
+/// Place an int8 weight into the tier via `pread`.
 fn place_i8(tier: &mut DeviceTier, snap: &Snapshot, name: &str, i_dim: usize) -> Result<Weight8> {
     let m = snap.int8(name, i_dim)?;
-    let packed = tier.place(m.packed)?;
-    drop_pages(m.packed);
-    let scale = tier.place(m.scale)? as *const f32;
-    drop_pages(m.scale);
+    let (plen, slen, o_dim) = (m.packed.len(), m.scale.len(), m.o_dim);
+    let packed = tier.reserve(plen)?;
+    let scale = tier.reserve(slen)?;
+    // SAFETY: packed/scale each own their reserved byte counts.
+    unsafe {
+        snap.read_into(&format!("{name}.weight"), packed, plen, true)?;
+        snap.read_into(&format!("{name}.weight.qs"), scale, slen, true)?;
+    }
     Ok(Weight8 {
         packed,
-        scale,
-        o_dim: m.o_dim,
-        i_dim: m.i_dim,
+        scale: scale as *const f32,
+        o_dim,
+        i_dim,
     })
 }
 
@@ -430,16 +423,19 @@ impl<'a> Pin<'a> {
         let slot = self.cold_next;
         self.cold_next += 1;
         let base = format!("model.layers.{layer}.mlp.experts.{expert}");
-        let cfg = self.cfg;
-        let g = self.snap.int4(&format!("{base}.gate_proj"), cfg.hidden)?;
-        let u = self.snap.int4(&format!("{base}.up_proj"), cfg.hidden)?;
-        let d = self
-            .snap
-            .int4(&format!("{base}.down_proj"), cfg.moe_inter)?;
+        let (cfg, snap) = (self.cfg, self.snap);
+        let (gname, uname, dname) = (
+            format!("{base}.gate_proj"),
+            format!("{base}.up_proj"),
+            format!("{base}.down_proj"),
+        );
+        let g = snap.int4(&gname, cfg.hidden)?;
+        let u = snap.int4(&uname, cfg.hidden)?;
+        let d = snap.int4(&dname, cfg.moe_inter)?;
         // Fill the slot buffers: packed nibbles then f32 scale bytes, contiguous.
-        fill_slot(&mut self.cold_gate[slot], g.packed, g.scale).context("cold gate")?;
-        fill_slot(&mut self.cold_up[slot], u.packed, u.scale).context("cold up")?;
-        fill_slot(&mut self.cold_down[slot], d.packed, d.scale).context("cold down")?;
+        fill_slot(&mut self.cold_gate[slot], snap, &gname, &g).context("cold gate")?;
+        fill_slot(&mut self.cold_up[slot], snap, &uname, &u).context("cold up")?;
+        fill_slot(&mut self.cold_down[slot], snap, &dname, &d).context("cold down")?;
         let gp = self.cold_gate[slot].ptr();
         let up = self.cold_up[slot].ptr();
         let dp = self.cold_down[slot].ptr();
@@ -481,16 +477,21 @@ fn touch(addr: usize, len: usize) {
 }
 
 /// Copy packed nibbles then scale bytes into one contiguous device slot.
-fn fill_slot(buf: &mut VmmBuf, packed: &[u8], scale: &[u8]) -> Result<()> {
+fn fill_slot(buf: &mut VmmBuf, snap: &Snapshot, name: &str, m: &Int4Matrix) -> Result<()> {
+    let (plen, slen) = (m.packed.len(), m.scale.len());
     ensure!(
-        packed.len() + scale.len() == buf.len(),
-        "cold slot size {} != packed {} + scale {}",
-        buf.len(),
-        packed.len(),
-        scale.len()
+        plen + slen == buf.len(),
+        "cold slot size {} != packed {plen} + scale {slen}",
+        buf.len()
     );
-    // Host memcpy straight into device-local memory (no H2D copy, no sync).
-    buf.write_at(0, packed)?;
-    buf.write_at(packed.len(), scale)?;
+    // pread packed nibbles then f32 scales, contiguous, straight into device-local
+    // memory (no mmap fault, no H2D copy). evict=false: keep the file pages warm —
+    // a cold expert may be re-selected next token.
+    let dst = buf.ptr_mut();
+    // SAFETY: dst owns buf.len() = plen+slen bytes; the two ranges are disjoint.
+    unsafe {
+        snap.read_into(&format!("{name}.weight"), dst, plen, false)?;
+        snap.read_into(&format!("{name}.weight.qs"), dst.add(plen), slen, false)?;
+    }
     Ok(())
 }

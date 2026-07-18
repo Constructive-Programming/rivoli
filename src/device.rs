@@ -68,7 +68,7 @@ mod tier {
     /// resident for the run; the kernels read them by the returned device
     /// pointer. Freed as a unit on drop.
     pub struct DeviceTier {
-        base: *mut u8,
+        slab: VmmBuf, // device-local, host-fillable — weights load straight in
         capacity: usize,
         used: usize,
     }
@@ -92,16 +92,12 @@ mod tier {
                 "device tier {capacity} + {} headroom > free {free}",
                 Self::HEADROOM
             );
-            let mut base: *mut c_void = std::ptr::null_mut();
-            // SAFETY: base is a valid out-pointer; on success it owns `capacity`
-            // bytes of device memory freed in Drop.
-            let e = unsafe { hipMalloc(&mut base, capacity) };
-            ensure!(
-                e == HIP_SUCCESS && !base.is_null(),
-                "hipMalloc({capacity}) failed ({e})"
-            );
+            // Device-local (MTYPE_RW, full bandwidth) AND host-fillable, so weights
+            // load straight into the slab (no separate hipMalloc + H2D). `VmmBuf`
+            // owns/frees the mapping.
+            let slab = VmmBuf::new(capacity)?;
             Ok(Self {
-                base: base as *mut u8,
+                slab,
                 capacity,
                 used: 0,
             })
@@ -141,58 +137,23 @@ mod tier {
             Ok(())
         }
 
-        /// Copy `bytes` into the tier (256-aligned) and return the device pointer.
-        /// Errors if the tier is full — the pin is sized to fit, so OOM here is a
-        /// budgeting bug, not a runtime condition to absorb.
-        pub fn place(&mut self, bytes: &[u8]) -> Result<*const u8> {
+        /// Reserve `len` bytes (256-aligned) and return a host-writable pointer to
+        /// fill in place (`pread`/memcpy). Errors if the tier is full — the pin is
+        /// sized to fit, so OOM here is a budgeting bug, not a runtime condition.
+        pub fn reserve(&mut self, len: usize) -> Result<*mut u8> {
             let off = (self.used + 255) & !255;
             ensure!(
-                off + bytes.len() <= self.capacity,
-                "device tier OOM: need {} at offset {off}, capacity {}",
-                bytes.len(),
+                off + len <= self.capacity,
+                "device tier OOM: need {len} at offset {off}, capacity {}",
                 self.capacity
             );
-            // SAFETY: off+len ≤ capacity (checked); dst is within the slab.
-            let dst = unsafe { self.base.add(off) };
-            let e = unsafe {
-                hipMemcpy(
-                    dst as *mut c_void,
-                    bytes.as_ptr() as *const c_void,
-                    bytes.len(),
-                    HIP_MEMCPY_H2D,
-                )
-            };
-            ensure!(e == HIP_SUCCESS, "hipMemcpy H2D failed ({e})");
-            self.used = off + bytes.len();
-            Ok(dst as *const u8)
-        }
-
-        /// Copy `len` bytes back from a device pointer (verification/debug — the
-        /// hot path never reads device memory back to host).
-        pub fn copy_out(&self, ptr: *const u8, len: usize) -> Result<Vec<u8>> {
-            let mut out = vec![0u8; len];
-            // SAFETY: caller passes a pointer + len returned by `place`.
-            let e = unsafe {
-                hipMemcpy(
-                    out.as_mut_ptr() as *mut c_void,
-                    ptr as *const c_void,
-                    len,
-                    HIP_MEMCPY_D2H,
-                )
-            };
-            ensure!(e == HIP_SUCCESS, "hipMemcpy D2H failed ({e})");
-            Ok(out)
+            self.used = off + len;
+            // SAFETY: off+len ≤ capacity (checked); within the slab.
+            Ok(unsafe { self.slab.ptr_mut().add(off) })
         }
 
         pub fn used(&self) -> usize {
             self.used
-        }
-    }
-
-    impl Drop for DeviceTier {
-        fn drop(&mut self) {
-            // SAFETY: base came from hipMalloc and is freed exactly once.
-            unsafe { hipFree(self.base as *mut c_void) };
         }
     }
 
@@ -359,34 +320,22 @@ mod tier {
             })
         }
 
-        /// Host memcpy `bytes` at `off` (device-local memory is host-writable via
-        /// the VMM host grant — no `hipMemcpy`, no sync).
+        /// GPU-usable pointer (device-local under unified addressing).
+        pub fn ptr(&self) -> *const u8 {
+            self.ptr
+        }
+        /// Host-writable pointer — the caller fills in place (`pread`/memcpy), no
+        /// `hipMemcpy`/sync.
         ///
-        /// Ordering: the GPU sees these stores at the next kernel launch on THIS
+        /// Ordering: the GPU sees the host stores at the next kernel launch on THIS
         /// (the single HIP/decode) thread — the launch's dispatch packet carries a
         /// release fence (drains the CPU store buffer) + a system-scope acquire
         /// (invalidates GPU caches), and gfx1151's coherent fabric lets the
-        /// host-granted device-local mapping participate. Verified CPU->GPU
-        /// coherent on this APU (docs/probes/vmm_probe.cpp). NOT a HIP contract for
-        /// arbitrary hardware: a port off gfx1151, or issuing the fill from a
-        /// background HIP thread, must re-verify or insert an explicit fence.
-        pub fn write_at(&mut self, off: usize, bytes: &[u8]) -> Result<()> {
-            ensure!(
-                bytes.len() <= self.len.saturating_sub(off),
-                "vmm write {off}+{} > len {}",
-                bytes.len(),
-                self.len
-            );
-            // SAFETY: off+len ≤ len (checked, overflow-safe); ptr is host-
-            // addressable; src (mmap) and dst (this slab) are distinct regions.
-            unsafe {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(off), bytes.len());
-            }
-            Ok(())
-        }
-
-        /// GPU-usable pointer (device-local under unified addressing).
-        pub fn ptr(&self) -> *const u8 {
+        /// host-granted device-local mapping participate. Verified CPU->GPU coherent
+        /// on this APU (docs/probes/vmm_probe.cpp, incl. `pread`). NOT a HIP contract
+        /// for arbitrary hardware: a port off gfx1151, or a fill from a background
+        /// HIP thread, must re-verify or insert an explicit fence.
+        pub fn ptr_mut(&mut self) -> *mut u8 {
             self.ptr
         }
         pub fn len(&self) -> usize {
@@ -411,16 +360,28 @@ mod tier {
 
         #[test]
         fn tier_roundtrips_placed_bytes() {
-            // Small tier; place two patterns, read both back, check alignment gap
+            // Small tier; reserve+fill two patterns via the host-writable ptr, read
+            // both back in place (VMM is host-readable), check the 256-align gap
             // doesn't corrupt either.
             let mut tier = DeviceTier::new(4 << 20).expect("alloc tier");
             let a: Vec<u8> = (0..1000u32).map(|i| (i & 0xff) as u8).collect();
             let b: Vec<u8> = (0..500u32).map(|i| ((i * 7) & 0xff) as u8).collect();
-            let pa = tier.place(&a).expect("place a");
-            let pb = tier.place(&b).expect("place b");
+            let pa = tier.reserve(a.len()).expect("reserve a");
+            // SAFETY: pa owns a.len() host-writable bytes just reserved.
+            unsafe { std::ptr::copy_nonoverlapping(a.as_ptr(), pa, a.len()) };
+            let pb = tier.reserve(b.len()).expect("reserve b");
+            // SAFETY: pb owns b.len() host-writable bytes just reserved.
+            unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), pb, b.len()) };
             assert_ne!(pa, pb);
-            assert_eq!(tier.copy_out(pa, a.len()).unwrap(), a);
-            assert_eq!(tier.copy_out(pb, b.len()).unwrap(), b);
+            // SAFETY: read back the bytes just written (device-local, host-mapped).
+            let (ra, rb) = unsafe {
+                (
+                    std::slice::from_raw_parts(pa, a.len()),
+                    std::slice::from_raw_parts(pb, b.len()),
+                )
+            };
+            assert_eq!(ra, &a[..]);
+            assert_eq!(rb, &b[..]);
             // 1000 bumps to 1024 (256-aligned) before b lands.
             assert_eq!(tier.used(), 1024 + 500);
         }
@@ -428,7 +389,7 @@ mod tier {
         #[test]
         fn tier_rejects_overflow() {
             let mut tier = DeviceTier::new(1 << 20).expect("alloc tier");
-            assert!(tier.place(&vec![0u8; (1 << 20) + 1]).is_err());
+            assert!(tier.reserve((1 << 20) + 1).is_err());
         }
     }
 }
