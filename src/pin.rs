@@ -335,7 +335,6 @@ impl<'a> Pin<'a> {
         // reads land in place and descriptors point at the sub-block offsets). Size
         // to the budget left after the always-resident set. `usage` is reserved for
         // future warm-start seeding; the LRU warms up in a few tokens regardless.
-        let _ = usage;
         let rb_h = cfg.hidden.div_ceil(2);
         let rb_i = cfg.moe_inter.div_ceil(2);
         let gate_slot = slot_span(cfg.moe_inter * rb_h) + slot_span(cfg.moe_inter * 4);
@@ -343,15 +342,43 @@ impl<'a> Pin<'a> {
         let expert_slot = 2 * gate_slot + down_slot; // gate | up | down, one slot
         let budget = capacity.saturating_sub(RESIDENT_CAP);
         let n_slots = (budget / expert_slot).max(cfg.top_k);
-        let lru_pool = VmmBuf::new(n_slots * expert_slot)?; // ONE slab
+        let mut lru_pool = VmmBuf::new(n_slots * expert_slot)?; // ONE slab
         tracing::info!(
             "routed LRU: {n_slots} slots ({:.1} GiB) + {:.1} GiB always-resident",
             (n_slots * expert_slot) as f64 / (1u64 << 30) as f64,
             tier.used() as f64 / (1u64 << 30) as f64,
         );
-        let lru = Lru::new(n_slots);
+        let mut lru = Lru::new(n_slots);
         // Ring sized for one layer's worst case: top_k misses x 3 proj x 2 tensors.
-        let stream = Streamer::new((cfg.top_k * 6).next_power_of_two() as u32 * 2)?;
+        let mut stream = Streamer::new((cfg.top_k * 6).next_power_of_two() as u32 * 2)?;
+        // Warm start: seed the pool with the hottest experts from .coli_usage so
+        // the first tokens hit at colibri's rate while the LRU adapts to this
+        // workload. Bounded by the pool size; drained in queue-depth batches.
+        {
+            let pool = lru_pool.ptr_mut();
+            let ring = (cfg.top_k * 6).next_power_of_two() * 2;
+            let batch = (ring / 6).max(1); // experts per drain (6 reads each)
+            let mut n = 0usize;
+            for &((l, e), _) in usage.ranked().iter() {
+                if n >= n_slots {
+                    break;
+                }
+                let (l, e) = (l as usize, e as usize);
+                if l < cfg.dense_layers || l >= cfg.n_layers || e >= cfg.n_experts {
+                    continue; // stale ranking entry
+                }
+                let slot = lru.alloc(((l as u32) << 16) | e as u32)?;
+                let base = format!("model.layers.{l}.mlp.experts.{e}");
+                lru.off[slot] =
+                    stream_expert(&mut stream, snap, pool, expert_slot, gate_slot, slot, &base)?;
+                n += 1;
+                if n.is_multiple_of(batch) {
+                    stream.drain()?;
+                }
+            }
+            stream.drain()?;
+            tracing::info!("LRU seeded {n} experts from .coli_usage (warm start)");
+        }
 
         Ok(Self {
             snap,
@@ -400,27 +427,18 @@ impl<'a> Pin<'a> {
             self.misses += 1;
             let slot = self.lru.alloc(key)?;
             let base = format!("model.layers.{layer}.mlp.experts.{e}");
-            // Region pointers into the one slab (raw, so no borrow of lru_pool is
-            // held across the &mut self.stream calls). gate|up|down per slot.
-            let (gs, es) = (self.gate_slot, self.expert_slot);
-            let sb = self.lru_pool.ptr_mut();
-            // SAFETY: slot*es + 2*gs + down_slot <= pool len (slot < n_slots).
-            let (gp, up, dp) = unsafe {
-                (
-                    sb.add(slot * es),
-                    sb.add(slot * es + gs),
-                    sb.add(slot * es + 2 * gs),
-                )
-            };
-            // SAFETY: each region is block-aligned and sized for its supersets.
-            let (pg, sg) =
-                unsafe { queue_proj(&mut self.stream, snap, gp, &format!("{base}.gate_proj"))? };
-            let (pu, su) =
-                unsafe { queue_proj(&mut self.stream, snap, up, &format!("{base}.up_proj"))? };
-            let (pd, sd) =
-                unsafe { queue_proj(&mut self.stream, snap, dp, &format!("{base}.down_proj"))? };
-            // Offsets stored RELATIVE to the slot base.
-            self.lru.off[slot] = [pg, sg, gs + pu, gs + su, 2 * gs + pd, 2 * gs + sd];
+            // ptr_mut() yields a raw ptr, so no borrow of lru_pool is held across
+            // the &mut self.stream reads.
+            let pool = self.lru_pool.ptr_mut();
+            self.lru.off[slot] = stream_expert(
+                &mut self.stream,
+                snap,
+                pool,
+                self.expert_slot,
+                self.gate_slot,
+                slot,
+                &base,
+            )?;
             slots.push(slot);
         }
         // Phase 2: ONE join for the whole layer's cold reads.
@@ -450,6 +468,42 @@ impl<'a> Pin<'a> {
         }
         Ok(out)
     }
+}
+
+/// Queue an expert's 6 O_DIRECT reads into pool slot `slot` (regions gate|up|down
+/// at `slot*expert_slot`), returning the 6 slot-relative sub-block offsets
+/// `[gate_p, gate_s, up_p, up_s, down_p, down_s]`. Shared by the decode-miss path
+/// and the build-time warm-start seed.
+fn stream_expert(
+    stream: &mut Streamer,
+    snap: &Snapshot,
+    pool: *mut u8,
+    expert_slot: usize,
+    gate_slot: usize,
+    slot: usize,
+    base: &str,
+) -> Result<[usize; 6]> {
+    let o = slot * expert_slot;
+    // SAFETY: o + 2*gate_slot + down region <= pool len (slot < n_slots).
+    let (gp, up, dp) = unsafe {
+        (
+            pool.add(o),
+            pool.add(o + gate_slot),
+            pool.add(o + 2 * gate_slot),
+        )
+    };
+    // SAFETY: each region is block-aligned and sized for its two supersets.
+    let (pg, sg) = unsafe { queue_proj(stream, snap, gp, &format!("{base}.gate_proj"))? };
+    let (pu, su) = unsafe { queue_proj(stream, snap, up, &format!("{base}.up_proj"))? };
+    let (pd, sd) = unsafe { queue_proj(stream, snap, dp, &format!("{base}.down_proj"))? };
+    Ok([
+        pg,
+        sg,
+        gate_slot + pu,
+        gate_slot + su,
+        2 * gate_slot + pd,
+        2 * gate_slot + sd,
+    ])
 }
 
 /// Queue one projection's packed + scale O_DIRECT reads into `region` (a
