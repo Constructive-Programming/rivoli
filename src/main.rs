@@ -121,19 +121,14 @@ async fn run(cfg: Config) -> Result<()> {
     #[cfg(feature = "rocm")]
     {
         let (free, _total) = rivoli::device::mem_info()?;
-        // 48 GiB tier: measured, pinning past this plateaus hit (45→53→67% at
-        // 48/64/94 GiB — 85% needs ~189 GiB, 2x the device) while starving the
-        // cold-expert page cache; the real lever is compute + workload-matched
-        // priming, not raw pin size.
-        let cap = free.saturating_sub(6 << 30).min(48 << 30);
+        // Budget = always-resident (~11 GiB) + the routed-expert LRU. Fill most of
+        // device memory: the LRU is online priming, so a bigger pool captures more
+        // of this run's working set (sim: 3200 slots→72%, 4200→75% hit) — leave
+        // headroom for scratch/KV. The pin splits this into resident tier + LRU.
+        let cap = free.saturating_sub(16 << 30).min(80 << 30);
         let t = std::time::Instant::now();
         let pin = rivoli::pin::Pin::build(&snap, &mc, &usage, cap)?;
-        info!(
-            "pin: {:.1} GiB resident, {} routed experts, built in {:.1}s",
-            pin.used() as f64 / (1u64 << 30) as f64,
-            pin.pinned_experts(),
-            t.elapsed().as_secs_f64()
-        );
+        info!("pin built in {:.1}s", t.elapsed().as_secs_f64());
         let max_ctx = prompt_ids.len() + ngen + 1;
         let mut engine = rivoli::gpu::GpuEngine::new(pin, &mc, max_ctx)?;
         let t0 = std::time::Instant::now();

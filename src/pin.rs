@@ -2,13 +2,14 @@
 //! [`DeviceTier`] once at startup and resolves each to a raw device pointer, so
 //! per-token decode never touches the host for weights (PLAN.md D1/P3).
 //!
-//! Always resident (read every token, ~11 GB): the per-layer norms, the full
-//! attention stack (q_a/q_b/kv_a/kv_b/o_proj + their layernorms), the dense-layer
-//! MLPs, and — for MoE layers — the router gate, its bias, and the shared expert.
-//! Routed experts are pinned hottest-first from the `.coli_usage` ranking until
-//! the tier's expert budget is exhausted (~90–95% hit at colibri's numbers); the
-//! cold tail is fetched on demand into a small pool of reused device slots (never
-//! a per-token allocation — that is the amdgpu-GTT-wedge trigger, PLAN.md #6).
+//! Always resident (read every token, ~10 GiB static tier): the per-layer norms,
+//! the full attention stack (q_a/q_b/kv_a/kv_b/o_proj + their layernorms), the
+//! dense-layer MLPs, and — for MoE layers — the router gate, its bias, and the
+//! shared expert. The 256 routed experts/layer are served by an ADAPTIVE LRU pool
+//! ([`Lru`] + one VMM slab): a hit reuses the resident slot; a miss evicts the
+//! coldest and streams the expert in via io_uring O_DIRECT. The LRU adapts to the
+//! actual workload (online priming) — measured ~74% hit vs ~43% for a static
+//! frequency pin of the same size.
 //!
 //! `rocm`-only: without a device there is nothing to pin.
 #![cfg(feature = "rocm")]
@@ -82,35 +83,23 @@ pub struct Pin<'a> {
     /// Router correction bias per MoE layer, kept HOST-side (the sigmoid/bias/
     /// top-k routing runs on the CPU). `moe_bias[sparse_idx]`, len n_experts.
     moe_bias: Vec<Vec<f32>>,
-    /// `experts[sparse_idx][expert]` — resident routed experts (None = cold).
-    /// `sparse_idx = layer - dense_layers`.
-    experts: Vec<Vec<Option<Mlp>>>,
-    /// (layer,expert) → rank in the `.coli_usage` ranking (0 = hottest); absent
-    /// means colibri never selected it. The hit-rate-gap diagnostic.
-    rank: std::collections::HashMap<(u16, u16), u32>,
-    ranked_len: usize,
-    /// Reused device slots for cold routed experts: one projection each, sized to
-    /// hold O_DIRECT aligned supersets of its packed + scale tensors. Filled by the
-    /// io_uring streamer on a miss (no per-token allocation). top_k slots = the
-    /// worst case of one layer's misses.
-    cold_gate: Vec<VmmBuf>,
-    cold_up: Vec<VmmBuf>,
-    cold_down: Vec<VmmBuf>,
-    cold_next: usize,
-    /// io_uring O_DIRECT reader — a layer's cold reads submit as one queue-depth
-    /// batch straight into the slots above (folds the old mmap-warm + memcpy).
+    /// The routed-expert LRU pool: ONE device-local VMM slab of `n_slots`
+    /// contiguous expert slots (slot i at `i * expert_slot`), each laid out
+    /// gate|up|down, every region an O_DIRECT aligned superset. One allocation
+    /// (no per-slot granularity waste). Which (layer,expert) occupies each slot is
+    /// managed by `lru`; `expert_slot`/`gate_slot` are the region strides.
+    lru_pool: VmmBuf,
+    expert_slot: usize,
+    gate_slot: usize,
+    /// Adaptive routed tier: (layer,expert) -> slot, LRU-evicted. Replaces the
+    /// static frequency pin — online priming that keeps this run's hot experts.
+    lru: Lru,
+    /// io_uring O_DIRECT reader — a layer's cold misses submit as one queue-depth
+    /// batch straight into their LRU slots (folds the old mmap-warm + memcpy).
     stream: Streamer,
     /// Stats over the run.
     pub hits: u64,
     pub misses: u64,
-    /// Cold-LRU reuse probe: distinct cold (layer,expert) pairs seen, and how many
-    /// cold selections were REPEATS (would hit a cross-token cache). reuse =
-    /// repeats/misses is the LRU ceiling; `cold_seen.len()` is the size it needs.
-    cold_seen: std::collections::HashSet<u32>,
-    pub cold_repeat: u64,
-    /// Every routed (layer,expert) selection this run — to simulate an LRU-only
-    /// routed tier of various sizes (probe: is the LRU better than the static pin?).
-    cold_trace: Vec<u32>,
 }
 
 /// Place a norm/f32 tensor (O-length) into the tier: reserve, then `pread` the
@@ -185,6 +174,74 @@ pub fn expert_bytes(cfg: &ModelConfig) -> usize {
     2 * cfg.moe_inter * rb_h + cfg.hidden * rb_i + (2 * cfg.moe_inter + cfg.hidden) * 4
 }
 
+/// The routed-expert LRU: maps `(layer,expert)` keys to pool slot indices, evicting
+/// the least-recently-used when full. Exact LRU via a tick clock + a BTreeMap
+/// ordering (O(log N) touch/evict — trivial next to the ~19 MB NVMe read a miss
+/// triggers). `off[slot]` caches each resident expert's 6 sub-block offsets.
+struct Lru {
+    slot_of: std::collections::HashMap<u32, usize>,
+    key_of: Vec<Option<u32>>,
+    off: Vec<[usize; 6]>, // [gate_p, gate_s, up_p, up_s, down_p, down_s]
+    order: std::collections::BTreeMap<u64, usize>, // tick -> slot (front = LRU)
+    at: Vec<u64>,         // slot -> its current tick
+    clock: u64,
+    free: Vec<usize>,
+}
+
+impl Lru {
+    fn new(n: usize) -> Self {
+        Self {
+            slot_of: std::collections::HashMap::with_capacity(n),
+            key_of: vec![None; n],
+            off: vec![[0; 6]; n],
+            order: std::collections::BTreeMap::new(),
+            at: vec![0; n],
+            clock: 0,
+            free: (0..n).rev().collect(), // pop() hands out 0,1,2,...
+        }
+    }
+
+    /// Mark `slot` most-recently-used.
+    fn touch(&mut self, slot: usize) {
+        self.order.remove(&self.at[slot]);
+        self.clock += 1;
+        self.at[slot] = self.clock;
+        self.order.insert(self.clock, slot);
+    }
+
+    /// Resident slot for `key`, touched — or `None` (miss).
+    fn get(&mut self, key: u32) -> Option<usize> {
+        let slot = *self.slot_of.get(&key)?;
+        self.touch(slot);
+        Some(slot)
+    }
+
+    /// Allocate a slot for a NEW `key` (miss): a free slot, else evict the LRU. The
+    /// caller then fills the slot's buffers and sets `off[slot]`.
+    fn alloc(&mut self, key: u32) -> Result<usize> {
+        let slot = if let Some(s) = self.free.pop() {
+            s
+        } else {
+            // Full pool → evict the front of `order` (least-recently-used). Non-empty
+            // by construction (n_slots ≥ top_k ≥ 1), but fail loud rather than panic.
+            let (&t, &victim) = self
+                .order
+                .iter()
+                .next()
+                .context("LRU eviction on an empty ordering (n_slots == 0?)")?;
+            self.order.remove(&t);
+            if let Some(old) = self.key_of[victim] {
+                self.slot_of.remove(&old);
+            }
+            victim
+        };
+        self.key_of[slot] = Some(key);
+        self.slot_of.insert(key, slot);
+        self.touch(slot);
+        Ok(slot)
+    }
+}
+
 impl<'a> Pin<'a> {
     /// Build the resident set. `capacity` is the tier size (auto-discovered).
     pub fn build(
@@ -198,7 +255,11 @@ impl<'a> Pin<'a> {
             capacity < free,
             "pin capacity {capacity} >= free device memory {free}"
         );
-        let mut tier = DeviceTier::new(capacity)?;
+        // The static tier holds only the always-resident set (~7 GiB); the rest of
+        // the budget goes to the routed LRU. Size it modestly (not `capacity`, or
+        // it hogs the memory the LRU needs).
+        const RESIDENT_CAP: usize = 12 << 30;
+        let mut tier = DeviceTier::new(RESIDENT_CAP)?;
 
         // Global tensors.
         let embed = place_i8(&mut tier, snap, "model.embed_tokens", cfg.hidden)?;
@@ -267,55 +328,29 @@ impl<'a> Pin<'a> {
             });
         }
 
-        // Pin routed experts hottest-first until the remaining budget runs out.
-        let sparse = cfg.n_layers - cfg.dense_layers;
-        let mut experts: Vec<Vec<Option<Mlp>>> =
-            (0..sparse).map(|_| vec![None; cfg.n_experts]).collect();
-        let ebytes = expert_bytes(cfg);
-        // Reserve the cold pool (top_k slots) before spending the rest on the pin.
-        let cold_reserve = cfg.top_k * ebytes;
-        let budget = capacity.saturating_sub(tier.used() + cold_reserve);
-        // Rank each (layer,expert) by its .coli_usage position (0 = hottest), so
-        // decode can report the rank of missed experts (routing-vs-breadth diag).
-        let ranked = usage.ranked();
-        let mut rank = std::collections::HashMap::with_capacity(ranked.len());
-        for (i, &((l, e), _)) in ranked.iter().enumerate() {
-            rank.insert((l, e), i as u32);
-        }
-        let mut pinned = 0usize;
-        for &((layer, expert), _count) in &ranked {
-            let (layer, expert) = (layer as usize, expert as usize);
-            if layer < cfg.dense_layers || layer >= cfg.n_layers || expert >= cfg.n_experts {
-                continue; // stale ranking entry
-            }
-            if (pinned + 1) * ebytes > budget {
-                break; // budget exhausted
-            }
-            let base = format!("model.layers.{layer}.mlp.experts.{expert}");
-            let m = place_mlp(&mut tier, snap, &base, cfg.hidden, cfg.moe_inter)?;
-            experts[layer - cfg.dense_layers][expert] = Some(m);
-            pinned += 1;
-        }
-
-        // Cold pool: top_k reusable slots per projection. Each slot holds an
-        // O_DIRECT aligned superset of the packed tensor, then of the scale tensor
-        // (each `slot_span` — block-aligned start + room for the straddle pad), so
-        // the io_uring reads land directly in place and the descriptor points at
-        // the sub-block offsets.
+        // The routed tier is an adaptive LRU, not a static frequency pin: N reused
+        // slots stream experts in on demand and keep this run's actually-hot ones
+        // (online priming). Each slot holds a projection's O_DIRECT aligned superset
+        // (packed then scale, each `slot_span` — block-aligned + straddle pad — so
+        // reads land in place and descriptors point at the sub-block offsets). Size
+        // to the budget left after the always-resident set. `usage` is reserved for
+        // future warm-start seeding; the LRU warms up in a few tokens regardless.
+        let _ = usage;
         let rb_h = cfg.hidden.div_ceil(2);
         let rb_i = cfg.moe_inter.div_ceil(2);
         let gate_slot = slot_span(cfg.moe_inter * rb_h) + slot_span(cfg.moe_inter * 4);
         let down_slot = slot_span(cfg.hidden * rb_i) + slot_span(cfg.hidden * 4);
-        let mut cold_gate = Vec::with_capacity(cfg.top_k);
-        let mut cold_up = Vec::with_capacity(cfg.top_k);
-        let mut cold_down = Vec::with_capacity(cfg.top_k);
-        for _ in 0..cfg.top_k {
-            cold_gate.push(VmmBuf::new(gate_slot)?);
-            cold_up.push(VmmBuf::new(gate_slot)?);
-            cold_down.push(VmmBuf::new(down_slot)?);
-        }
-        // Ring sized for a layer's worst case: top_k misses × 3 projections × 2
-        // tensors, with margin.
+        let expert_slot = 2 * gate_slot + down_slot; // gate | up | down, one slot
+        let budget = capacity.saturating_sub(RESIDENT_CAP);
+        let n_slots = (budget / expert_slot).max(cfg.top_k);
+        let lru_pool = VmmBuf::new(n_slots * expert_slot)?; // ONE slab
+        tracing::info!(
+            "routed LRU: {n_slots} slots ({:.1} GiB) + {:.1} GiB always-resident",
+            (n_slots * expert_slot) as f64 / (1u64 << 30) as f64,
+            tier.used() as f64 / (1u64 << 30) as f64,
+        );
+        let lru = Lru::new(n_slots);
+        // Ring sized for one layer's worst case: top_k misses x 3 proj x 2 tensors.
         let stream = Streamer::new((cfg.top_k * 6).next_power_of_two() as u32 * 2)?;
 
         Ok(Self {
@@ -327,19 +362,13 @@ impl<'a> Pin<'a> {
             final_norm,
             layers,
             moe_bias,
-            experts,
-            ranked_len: ranked.len(),
-            rank,
-            cold_gate,
-            cold_up,
-            cold_down,
-            cold_next: 0,
+            lru_pool,
+            expert_slot,
+            gate_slot,
+            lru,
             stream,
             hits: 0,
             misses: 0,
-            cold_seen: std::collections::HashSet::new(),
-            cold_repeat: 0,
-            cold_trace: Vec::new(),
         })
     }
 
@@ -353,167 +382,90 @@ impl<'a> Pin<'a> {
         &self.moe_bias[layer - self.cfg.dense_layers]
     }
 
-    /// Rank of a routed expert in the `.coli_usage` ranking (0 = hottest); None
-    /// means colibri never selected it — a routing-divergence signal.
-    pub fn expert_rank(&self, layer: usize, expert: usize) -> Option<u32> {
-        self.rank.get(&(layer as u16, expert as u16)).copied()
-    }
-
-    /// Distinct cold (layer,expert) pairs streamed so far — the size a cross-token
-    /// cold LRU would need to hold the whole working set.
-    pub fn cold_distinct(&self) -> usize {
-        self.cold_seen.len()
-    }
-
-    /// Simulate an LRU-only routed tier of each `size` (slots) over this run's
-    /// selection trace: returns `(size, hit_fraction)`. Answers "would replacing
-    /// the static frequency pin with an adaptive LRU of N slots hit more?".
-    pub fn lru_sim(&self, sizes: &[usize]) -> Vec<(usize, f64)> {
-        use std::collections::{BTreeMap, HashMap};
-        sizes
-            .iter()
-            .map(|&cap| {
-                let mut at: HashMap<u32, u64> = HashMap::new(); // key -> last tick
-                let mut order: BTreeMap<u64, u32> = BTreeMap::new(); // tick -> key (LRU=first)
-                let (mut hits, mut tick) = (0u64, 0u64);
-                for &k in &self.cold_trace {
-                    tick += 1;
-                    if let Some(&old) = at.get(&k) {
-                        hits += 1;
-                        order.remove(&old);
-                    } else if at.len() >= cap
-                        && let Some((&t, &victim)) = order.iter().next()
-                    {
-                        order.remove(&t);
-                        at.remove(&victim);
-                    }
-                    at.insert(k, tick);
-                    order.insert(tick, k);
-                }
-                (cap, hits as f64 / self.cold_trace.len().max(1) as f64)
-            })
-            .collect()
-    }
-
-    /// Total number of ranked (layer,expert) pairs in the usage file.
-    pub fn ranked_len(&self) -> usize {
-        self.ranked_len
-    }
-
-    pub fn pinned_experts(&self) -> usize {
-        self.experts
-            .iter()
-            .flat_map(|l| l.iter())
-            .filter(|e| e.is_some())
-            .count()
-    }
-
-    /// Whether a routed expert is resident (a hit) — for the hit-rate diagnostic.
-    pub fn is_resident(&self, layer: usize, expert: usize) -> bool {
-        self.experts[layer - self.cfg.dense_layers][expert].is_some()
-    }
-
-    /// Resolve a MoE layer's `sel` routed experts to their `Mlp` descriptors,
-    /// batching every cold miss through the io_uring O_DIRECT streamer: submit ALL
-    /// of the layer's cold reads at once (queue depth → full NVMe bandwidth),
-    /// straight into the VMM slots, join ONCE, then build the descriptors. Resident
-    /// hits contribute their pinned pointers; misses come from reused cold slots,
-    /// valid until the next call. Replaces the old mmap-warm + per-expert copy.
+    /// Resolve a MoE layer's `sel` routed experts to `Mlp` descriptors via the
+    /// adaptive LRU: a hit returns its resident slot's pointers (no I/O); a miss
+    /// evicts the coldest slot and streams the expert in. All of the layer's misses
+    /// submit as ONE queue-depth io_uring O_DIRECT batch, joined once.
     pub fn resolve_layer(&mut self, layer: usize, sel: &[usize]) -> Result<Vec<Mlp>> {
-        self.cold_next = 0;
         let (cfg, snap) = (self.cfg, self.snap);
-        let sparse = layer - cfg.dense_layers;
-        enum R {
-            Hit(Mlp),
-            Cold {
-                slot: usize,
-                g: (usize, usize),
-                u: (usize, usize),
-                d: (usize, usize),
-            },
-        }
-        // Phase 1: resident hit, or assign a slot and QUEUE the miss's 6 reads.
-        let mut plan = Vec::with_capacity(sel.len());
+        // Phase 1: LRU lookup; each miss allocates a slot and QUEUEs its 6 reads.
+        let mut slots = Vec::with_capacity(sel.len());
         for &e in sel {
-            self.cold_trace.push(((layer as u32) << 16) | e as u32); // LRU-sim trace
-            if let Some(m) = self.experts[sparse][e] {
+            let key = ((layer as u32) << 16) | e as u32;
+            if let Some(slot) = self.lru.get(key) {
                 self.hits += 1;
-                plan.push(R::Hit(m));
+                slots.push(slot);
                 continue;
             }
             self.misses += 1;
-            // Cold-LRU reuse probe: has this (layer,expert) been streamed before?
-            let key = ((layer as u32) << 16) | e as u32;
-            if !self.cold_seen.insert(key) {
-                self.cold_repeat += 1; // a repeat → an LRU would have hit here
-            }
-            ensure!(
-                self.cold_next < cfg.top_k,
-                "cold-slot pool exhausted ({} slots) — >top_k misses in a layer",
-                cfg.top_k
-            );
-            let slot = self.cold_next;
-            self.cold_next += 1;
+            let slot = self.lru.alloc(key)?;
             let base = format!("model.layers.{layer}.mlp.experts.{e}");
-            // self.stream and self.cold_* are distinct fields → disjoint &mut.
-            let g = queue_proj(
-                &mut self.stream,
-                snap,
-                &mut self.cold_gate[slot],
-                &format!("{base}.gate_proj"),
-            )?;
-            let u = queue_proj(
-                &mut self.stream,
-                snap,
-                &mut self.cold_up[slot],
-                &format!("{base}.up_proj"),
-            )?;
-            let d = queue_proj(
-                &mut self.stream,
-                snap,
-                &mut self.cold_down[slot],
-                &format!("{base}.down_proj"),
-            )?;
-            plan.push(R::Cold { slot, g, u, d });
+            // Region pointers into the one slab (raw, so no borrow of lru_pool is
+            // held across the &mut self.stream calls). gate|up|down per slot.
+            let (gs, es) = (self.gate_slot, self.expert_slot);
+            let sb = self.lru_pool.ptr_mut();
+            // SAFETY: slot*es + 2*gs + down_slot <= pool len (slot < n_slots).
+            let (gp, up, dp) = unsafe {
+                (
+                    sb.add(slot * es),
+                    sb.add(slot * es + gs),
+                    sb.add(slot * es + 2 * gs),
+                )
+            };
+            // SAFETY: each region is block-aligned and sized for its supersets.
+            let (pg, sg) =
+                unsafe { queue_proj(&mut self.stream, snap, gp, &format!("{base}.gate_proj"))? };
+            let (pu, su) =
+                unsafe { queue_proj(&mut self.stream, snap, up, &format!("{base}.up_proj"))? };
+            let (pd, sd) =
+                unsafe { queue_proj(&mut self.stream, snap, dp, &format!("{base}.down_proj"))? };
+            // Offsets stored RELATIVE to the slot base.
+            self.lru.off[slot] = [pg, sg, gs + pu, gs + su, 2 * gs + pd, 2 * gs + sd];
+            slots.push(slot);
         }
         // Phase 2: ONE join for the whole layer's cold reads.
         self.stream.drain()?;
-        // Phase 3: build descriptors (slots now filled). gate/up are [moe_inter,
-        // hidden]; down is [hidden, moe_inter].
+        // Phase 3: build descriptors from each slot's stored sub-block offsets.
+        // gate/up are [moe_inter, hidden]; down is [hidden, moe_inter].
         let (gate_o, gate_i) = (cfg.moe_inter, cfg.hidden);
         let (down_o, down_i) = (cfg.hidden, cfg.moe_inter);
-        let mk = |buf: &VmmBuf, off: (usize, usize), o_dim: usize, i_dim: usize| Weight {
-            // SAFETY: off within the slot; the reads that filled them have joined.
-            packed: unsafe { buf.ptr().add(off.0) },
-            scale: unsafe { buf.ptr().add(off.1) } as *const f32,
-            o_dim,
-            i_dim,
-        };
+        let pool = self.lru_pool.ptr();
+        let es = self.expert_slot;
         let mut out = Vec::with_capacity(sel.len());
-        for r in &plan {
-            match r {
-                R::Hit(m) => out.push(*m),
-                R::Cold { slot, g, u, d } => out.push(Mlp {
-                    gate: mk(&self.cold_gate[*slot], *g, gate_o, gate_i),
-                    up: mk(&self.cold_up[*slot], *u, gate_o, gate_i),
-                    down: mk(&self.cold_down[*slot], *d, down_o, down_i),
-                }),
-            }
+        for &slot in &slots {
+            let o = self.lru.off[slot];
+            // SAFETY: slot base within the slab; reads that filled it have joined.
+            let b = unsafe { pool.add(slot * es) };
+            let w = |poff: usize, soff: usize, o_dim: usize, i_dim: usize| Weight {
+                packed: unsafe { b.add(poff) },
+                scale: unsafe { b.add(soff) } as *const f32,
+                o_dim,
+                i_dim,
+            };
+            out.push(Mlp {
+                gate: w(o[0], o[1], gate_o, gate_i),
+                up: w(o[2], o[3], gate_o, gate_i),
+                down: w(o[4], o[5], down_o, down_i),
+            });
         }
         Ok(out)
     }
 }
 
-/// Queue one projection's packed + scale O_DIRECT reads into `slot`: packed in the
-/// first `slot_span`, scale in the next. Returns the sub-block offsets where the
-/// useful bytes land within the slot: `(packed_off, scale_off)`.
-fn queue_proj(
+/// Queue one projection's packed + scale O_DIRECT reads into `region` (a
+/// block-aligned pointer owning `>= slot_span(plen)+slot_span(slen)` bytes):
+/// packed in the first `slot_span`, scale in the next. Returns the sub-block
+/// offsets RELATIVE to `region` where the useful bytes land.
+///
+/// # Safety
+/// `region` must be block-aligned and own the projection's two supersets.
+unsafe fn queue_proj(
     stream: &mut Streamer,
     snap: &Snapshot,
-    slot: &mut VmmBuf,
+    region: *mut u8,
     proj: &str,
 ) -> Result<(usize, usize)> {
-    let base = slot.ptr_mut();
+    let base = region;
     let (pfd, pb, plen) = snap
         .read_spec(&format!("{proj}.weight"))
         .with_context(|| format!("cold read_spec {proj}.weight"))?;

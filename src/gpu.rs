@@ -46,83 +46,25 @@ fn desc_bytes(d: &[ExpertDesc]) -> &[u8] {
 /// into I/O (fetch) vs GPU compute (attn/mlp/lmhead) vs host routing.
 #[derive(Default)]
 struct Profile {
-    fetch_ns: u128, // cold-expert copy_in (NVMe→device); fetch_n = miss count
-    fetch_n: u64,
-    warm_ns: u128,     // parallel page-warm of the layer's cold experts (overlap)
-    attn_ns: u128,     // mid-layer sync — attention+gate GPU compute
-    mlp_ns: u128,      // end-of-layer sync — MLP GPU compute (+ dense-layer attn)
-    lmhead_ns: u128,   // final sync — norm + lm_head
-    route_ns: u128,    // gate-logits D2H + host sigmoid/bias/topk
-    prefetch_ns: u128, // building/queuing the prefetch range set
-    wall_ns: u128,     // total decode wall time
+    fetch_ns: u128,  // io_uring O_DIRECT cold stream (NVMe->VMM)
+    fetch_n: u64,    // miss count
+    attn_ns: u128,   // mid-layer sync — attention+gate GPU compute
+    mlp_ns: u128,    // end-of-layer sync — MLP GPU compute (+ dense-layer attn)
+    lmhead_ns: u128, // final sync — norm + lm_head
+    route_ns: u128,  // gate-logits D2H + host sigmoid/bias/topk
+    wall_ns: u128,   // total decode wall time
     tokens: u64,
-    // Hit-rate-gap diagnostic: where do rivoli's selections sit in colibri's
-    // ranking? A miss just past the pin cutoff = breadth; a miss that's low-rank
-    // or ABSENT = rivoli routes to experts colibri didn't (divergence).
-    hit_rank_sum: u128,
-    hit_n: u64,
-    miss_absent: u64,    // selected, colibri never ranked it
-    miss_rank_sum: u128, // present misses only
-    miss_present: u64,
-    miss_band: [u64; 4], // present-miss rank bands: <2k, <5k, <10k, >=10k
 }
 
 impl Profile {
-    fn record_sel(&mut self, rank: Option<u32>, miss: bool) {
-        match (rank, miss) {
-            (Some(r), false) => {
-                self.hit_rank_sum += r as u128;
-                self.hit_n += 1;
-            }
-            (Some(r), true) => {
-                self.miss_rank_sum += r as u128;
-                self.miss_present += 1;
-                let b = if r < 2000 {
-                    0
-                } else if r < 5000 {
-                    1
-                } else if r < 10000 {
-                    2
-                } else {
-                    3
-                };
-                self.miss_band[b] += 1;
-            }
-            (None, true) => self.miss_absent += 1,
-            (None, false) => {} // resident hit for an unranked expert (rare)
-        }
-    }
-
-    fn report_hitgap(&self, pinned: usize, ranked_len: usize) {
-        tracing::info!(
-            "HITGAP: pin={pinned} of {ranked_len} ranked pairs | hits avg-rank {:.0} | \
-             misses: absent {} + rank<2k {} + 2-5k {} + 5-10k {} + >=10k {} (avg present {:.0})",
-            self.hit_rank_sum as f64 / self.hit_n.max(1) as f64,
-            self.miss_absent,
-            self.miss_band[0],
-            self.miss_band[1],
-            self.miss_band[2],
-            self.miss_band[3],
-            self.miss_rank_sum as f64 / self.miss_present.max(1) as f64,
-        );
-    }
-
     fn report(&self) {
         let tok = self.tokens.max(1) as f64;
         let per = |ns: u128| ns as f64 / 1e6 / tok; // ms/token
         let pct = |ns: u128| 100.0 * ns as f64 / self.wall_ns.max(1) as f64;
-        let accounted = self.warm_ns
-            + self.fetch_ns
-            + self.attn_ns
-            + self.mlp_ns
-            + self.lmhead_ns
-            + self.route_ns
-            + self.prefetch_ns;
+        let accounted = self.fetch_ns + self.attn_ns + self.mlp_ns + self.lmhead_ns + self.route_ns;
         tracing::info!(
-            "PROFILE/tok: {:.0}ms wall | warm {:.0}ms {:.0}% | fetch {:.0}ms {:.0}% ({} miss, {:.2}ms/miss) | attn {:.0}ms {:.0}% | mlp {:.0}ms {:.0}% | lmhead {:.0}ms {:.0}% | route {:.0}ms | prefetch {:.1}ms | other {:.0}ms",
+            "PROFILE/tok: {:.0}ms wall | fetch {:.0}ms {:.0}% ({} miss, {:.2}ms/miss) | attn {:.0}ms {:.0}% | mlp {:.0}ms {:.0}% | lmhead {:.0}ms {:.0}% | route {:.0}ms | other {:.0}ms",
             per(self.wall_ns),
-            per(self.warm_ns),
-            pct(self.warm_ns),
             per(self.fetch_ns),
             pct(self.fetch_ns),
             self.fetch_n / self.tokens.max(1),
@@ -134,7 +76,6 @@ impl Profile {
             per(self.lmhead_ns),
             pct(self.lmhead_ns),
             per(self.route_ns),
-            per(self.prefetch_ns),
             per(self.wall_ns.saturating_sub(accounted)),
         );
     }
@@ -371,11 +312,8 @@ impl<'a> GpuEngine<'a> {
                 let mut descs = Vec::with_capacity(ke + cfg.n_shared);
                 let mut w = Vec::with_capacity(ke + cfg.n_shared);
                 for (i, m) in mlps.iter().enumerate() {
-                    let e = self.sel[i];
-                    self.prof
-                        .record_sel(self.pin.expert_rank(l, e), !self.pin.is_resident(l, e));
                     descs.push(desc_of(m));
-                    w.push(self.scores[e]);
+                    w.push(self.scores[self.sel[i]]);
                 }
                 // Weight = original sigmoid score, sum-normalized then scaled.
                 let mut sm: f32 = w.iter().sum();
@@ -511,40 +449,6 @@ impl<'a> GpuEngine<'a> {
         self.prof.wall_ns = decode_wall.elapsed().as_nanos();
         self.prof.tokens = generated.len() as u64;
         self.prof.report();
-        self.prof
-            .report_hitgap(self.pin.pinned_experts(), self.pin.ranked_len());
-        // Cold-LRU reuse ceiling: what fraction of misses were repeats (an LRU
-        // would have caught), and how many distinct cold experts to hold them.
-        let (miss, rep, distinct) = (
-            self.pin.misses,
-            self.pin.cold_repeat,
-            self.pin.cold_distinct(),
-        );
-        let per_expert_gib = (crate::pin::expert_bytes(self.cfg) as f64) / (1u64 << 30) as f64;
-        tracing::info!(
-            "COLD-LRU probe: {miss} misses, {rep} repeats ({:.1}% LRU-recoverable) over \
-             {distinct} distinct experts (~{:.1} GiB to cache all); with an LRU the hit rate \
-             would rise {:.1}% -> {:.1}%",
-            100.0 * rep as f64 / miss.max(1) as f64,
-            distinct as f64 * per_expert_gib,
-            100.0 * self.pin.hits as f64 / (self.pin.hits + miss).max(1) as f64,
-            100.0 * (self.pin.hits + rep) as f64 / (self.pin.hits + miss).max(1) as f64,
-        );
-        // LRU-only routed tier sim: hit rate if the static frequency pin were
-        // replaced by an adaptive LRU of N slots (~18.9 GiB per 1000 slots).
-        let sizes = [2156usize, 3200, 4200, 5200, 8000];
-        let sim = self.pin.lru_sim(&sizes);
-        let msg: Vec<String> = sim
-            .iter()
-            .map(|(n, h)| {
-                format!(
-                    "{n}({:.1}GiB)={:.1}%",
-                    *n as f64 * per_expert_gib,
-                    100.0 * h
-                )
-            })
-            .collect();
-        tracing::info!("LRU-tier sim (vs static-pin 42.9%): {}", msg.join("  "));
         Ok(generated)
     }
 }
