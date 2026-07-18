@@ -10,13 +10,18 @@
 #![allow(clippy::expect_used)]
 
 use rivoli::device::{DeviceBuf, DeviceTier};
-use rivoli::hip::{ExpertDesc, device_sync, launch_moe};
+use rivoli::hip::{ExpertDesc, device_sync, launch_attend, launch_moe};
 use rivoli::math::{bf16_to_f32, f32_to_bf16, silu, softmax};
 use rivoli::quant::{matvec_i4, row_bytes};
 use rivoli::snapshot::Int4Matrix;
 
 /// Little-endian bytes of an f32 slice (device is LE, matching this host).
 fn f32_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// Little-endian bytes of a u16 (bf16) slice.
+fn u16_bytes(v: &[u16]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
@@ -274,8 +279,37 @@ fn check_attend(seed: u64, h: usize, nt: usize, kvl: usize, rope: usize) {
     let scale = 1.0 / ((kvl + rope) as f32).sqrt();
 
     let want = attend_reference(&qabs, &qrope, &lc, &rc, h, nt, kvl, rope, scale);
-    let got = rivoli::hip::mla_attend(&qabs, &qrope, &lc, &rc, h, nt, kvl, rope, scale)
-        .expect("attention kernel launch");
+
+    // Device-resident query + KV cache; the kernel reads them in place.
+    let qabs_buf = DeviceBuf::from_bytes(&f32_bytes(&qabs)).expect("place qabs");
+    let qrope_buf = DeviceBuf::from_bytes(&f32_bytes(&qrope)).expect("place qrope");
+    let lc_buf = DeviceBuf::from_bytes(&u16_bytes(&lc)).expect("place lc");
+    let rc_buf = DeviceBuf::from_bytes(&u16_bytes(&rc)).expect("place rc");
+    let mut clat_buf = DeviceBuf::zeroed(h * kvl * 4).expect("alloc clat");
+
+    // SAFETY: all pointers are device-resident for the dims.
+    unsafe {
+        launch_attend(
+            qabs_buf.ptr() as *const f32,
+            qrope_buf.ptr() as *const f32,
+            lc_buf.ptr() as *const u16,
+            rc_buf.ptr() as *const u16,
+            h,
+            nt,
+            kvl,
+            rope,
+            scale,
+            clat_buf.ptr_mut() as *mut f32,
+        )
+        .expect("launch attend");
+    }
+    device_sync().expect("device sync");
+    let got: Vec<f32> = clat_buf
+        .copy_out()
+        .expect("copy out")
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
 
     let max_ref = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     let max_err = want
@@ -301,4 +335,13 @@ fn mla_attend_matches_scalar_tiny() {
     // init (m=-inf on the first token) and tail behavior.
     check_attend(0x00c0_ffee, 4, 1, 32, 8);
     check_attend(0xfeed_face, 3, 17, 40, 8);
+}
+
+#[test]
+fn mla_attend_head_tiling_boundaries() {
+    // Real GLM head count (64 = 8 full HB=8 blocks), and H=20 → a partial second
+    // block (4 active + 4 inactive lanes) exercising the head<H guard. nt spans
+    // many TILE=16 steps.
+    check_attend(0xb10c_c0de, 64, 130, 512, 64);
+    check_attend(0x2020_2020, 20, 96, 512, 64);
 }

@@ -52,6 +52,62 @@ unsafe extern "C" {
     ) -> i32;
 }
 
+/// Launch MLA flash attention over the resident KV cache: for each head, writes
+/// the attention-weighted latent `clat_h = Σ_t softmax((qabs_h·L_t + qrope_h·R_t)
+/// ·scale)·L_t` as `H` contiguous `kvl`-length rows. All arguments are DEVICE
+/// pointers — `qabs`/`qrope` (`h*kvl`/`h*rope` f32), the bf16 cache `lc`/`rc`
+/// (`nt*kvl`/`nt*rope` u16), and `clat` (`h*kvl` f32, fully written). Does NOT
+/// synchronize — call [`device_sync`] once per token.
+///
+/// # Safety
+/// The launch is ASYNCHRONOUS: the kernel reads/writes the pointers below AFTER
+/// this call returns, so all must stay valid until the next [`device_sync`]
+/// RETURNS. Shapes (all device pointers in the current HIP context): `qabs`
+/// `h*kvl` f32, `qrope` `h*rope` f32, `lc` `nt*kvl` u16, `rc` `nt*rope` u16,
+/// `clat` `h*kvl` f32.
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_attend(
+    qabs: *const f32,
+    qrope: *const f32,
+    lc: *const u16,
+    rc: *const u16,
+    h: usize,
+    nt: usize,
+    kvl: usize,
+    rope: usize,
+    scale: f32,
+    clat: *mut f32,
+) -> Result<()> {
+    anyhow::ensure!(
+        h <= i32::MAX as usize
+            && nt <= i32::MAX as usize
+            && kvl <= i32::MAX as usize
+            && rope <= i32::MAX as usize,
+        "attn dims exceed i32 (h={h} nt={nt} kvl={kvl} rope={rope})"
+    );
+    // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
+    let r = unsafe {
+        rivoli_mla_attend(
+            qabs,
+            qrope,
+            lc,
+            rc,
+            h as i32,
+            nt as i32,
+            kvl as i32,
+            rope as i32,
+            scale,
+            clat,
+        )
+    };
+    if r != 0 {
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("launch_attend failed ({kind}, code {r})");
+    }
+    Ok(())
+}
+
 /// Liveness probe: launch the axpy kernel and confirm the device computed the
 /// expected value. Returns Ok(()) only if a real launch reached the GPU.
 pub fn probe() -> Result<()> {
@@ -136,80 +192,4 @@ pub fn device_sync() -> Result<()> {
         bail!("device_sync failed (HIP runtime, code {r})");
     }
     Ok(())
-}
-
-/// MLA flash attention over the compressed KV cache: for each head, returns the
-/// attention-weighted latent `clat_h = Σ_t softmax((qabs_h·L_t + qrope_h·R_t)·
-/// scale)·L_t` as `H` contiguous `kvl`-length rows. `lc`/`rc` are the bf16 cache
-/// (`nt` rows of `kvl`/`rope`). Query-side absorb through `kv_b` and the value
-/// projection back stay on the reference path for M2; this validates the
-/// long-context score/softmax/weighted-sum kernel against the scalar oracle.
-#[cfg(feature = "rocm")]
-#[allow(clippy::too_many_arguments)]
-pub fn mla_attend(
-    qabs: &[f32],
-    qrope: &[f32],
-    lc: &[u16],
-    rc: &[u16],
-    h: usize,
-    nt: usize,
-    kvl: usize,
-    rope: usize,
-    scale: f32,
-) -> Result<Vec<f32>> {
-    // Dims cross the FFI as i32; guard the truncating cast (see moe_experts).
-    anyhow::ensure!(
-        h <= i32::MAX as usize
-            && nt <= i32::MAX as usize
-            && kvl <= i32::MAX as usize
-            && rope <= i32::MAX as usize,
-        "attn dims exceed i32 (h={h} nt={nt} kvl={kvl} rope={rope})"
-    );
-    anyhow::ensure!(
-        qabs.len() == h * kvl,
-        "qabs len {} != h*kvl {}",
-        qabs.len(),
-        h * kvl
-    );
-    anyhow::ensure!(
-        qrope.len() == h * rope,
-        "qrope len {} != h*rope {}",
-        qrope.len(),
-        h * rope
-    );
-    anyhow::ensure!(
-        lc.len() == nt * kvl,
-        "lc len {} != nt*kvl {}",
-        lc.len(),
-        nt * kvl
-    );
-    anyhow::ensure!(
-        rc.len() == nt * rope,
-        "rc len {} != nt*rope {}",
-        rc.len(),
-        nt * rope
-    );
-    let mut clat = vec![0.0f32; h * kvl];
-    // SAFETY: every pointer is valid for the length asserted above; the C
-    // launcher copies inputs in, launches, writes exactly h*kvl floats into
-    // `clat`, and frees its device allocations before returning.
-    let r = unsafe {
-        rivoli_mla_attend(
-            qabs.as_ptr(),
-            qrope.as_ptr(),
-            lc.as_ptr(),
-            rc.as_ptr(),
-            h as i32,
-            nt as i32,
-            kvl as i32,
-            rope as i32,
-            scale,
-            clat.as_mut_ptr(),
-        )
-    };
-    if r != 0 {
-        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
-        bail!("rivoli_mla_attend failed ({kind}, code {r})");
-    }
-    Ok(clat)
 }

@@ -1,17 +1,29 @@
-// M2 MLA attention kernel: flash online-softmax over the compressed KV cache in
-// latent space. For one decoded token, per head:
+// M3 MLA attention kernel (D2): token-tiled flash online-softmax over the
+// compressed KV cache in latent space. For one decoded token, per head:
 //
 //     clat_h = Σ_t softmax_t( (qabs_h·L_t + qrope_h·R_t) · scale ) · L_t
 //
-// where L_t (kv_lora latent) and R_t (roped key) are the bf16 cache rows. This
-// is the O(nt·kvl) work that dominates at long context (the 200k bandwidth
-// sink) — the absorb of q_nope through kv_b and the value projection back
-// through kv_b stay on the reference path for M2 (small int4 GEMVs, folded into
-// this kernel in M3). Mirrors attn.rs: per token the score sums kvl then rope,
-// bf16 widened to f32; the flash form replaces the two-pass softmax with a
-// single stable online pass (same result to f32 rounding).
+// where L_t (kv_lora latent) and R_t (roped key) are the bf16 cache rows shared
+// by ALL heads (MLA — one latent per token, not per head). The M2 kernel ran one
+// thread per head and re-streamed the whole cache H× from DRAM (~1.5 TB/token at
+// 200k — fatal). Here a block owns HB heads (one wavefront each) and stages each
+// token tile's L/R into LDS ONCE, reused across all HB heads: DRAM reads of the
+// cache drop from H× to ⌈H/HB⌉× (PLAN.md D2). All pointers are device-resident;
+// the launcher only launches (caller joins via rivoli_device_sync).
+//
+// Numerics match attn.rs to f32 rounding: per-token score sums kvl then rope over
+// bf16-widened values (wave-reduced, so summation order differs from the scalar
+// oracle by ~1e-5 rel), and the flash online form replaces the two-pass softmax
+// with one numerically-stable pass.
+//
+// HB/TILE are occupancy/LDS tuning knobs (LDS = (HB+TILE)*kvl + TILE*rope floats);
+// the ≥1 tok/s pass (M3 4/4) tunes them. Correctness is independent of their value.
 
 #include <hip/hip_runtime.h>
+
+#define HB 8        // heads per block (one width-32 subgroup each)
+#define TILE 16     // KV tokens staged into LDS per step
+#define SUBW 32     // score-reduction subgroup width (wave32; wave64 splits into two)
 
 // bf16 → f32: bf16 is the high 16 bits of f32 (matches math.rs bf16_to_f32).
 __device__ __forceinline__ float bf16f(unsigned short b) {
@@ -21,12 +33,8 @@ __device__ __forceinline__ float bf16f(unsigned short b) {
     return f;
 }
 
-// One thread per head. `clat` (= global out) doubles as the online accumulator,
-// rescaled in place each token — no LDS, correctness over speed.
-//
-// ponytail: one-thread-per-head with a global-memory accumulator is the M2
-// correctness shape; the block-cooperative flash tiling that stages each L_t
-// once and reuses it across heads (deferred P1) is the M3 perf step.
+// grid = ⌈H/HB⌉ blocks; block = HB*SUBW threads; dynamic LDS holds the per-head
+// accumulators plus the current L/R token tile.
 extern "C" __global__ void mla_latent_attend(
     const float* __restrict__ qabs,         // [H*kvl]
     const float* __restrict__ qrope,        // [H*rope]
@@ -34,72 +42,83 @@ extern "C" __global__ void mla_latent_attend(
     const unsigned short* __restrict__ Rc,  // [nt*rope] bf16
     int H, int nt, int kvl, int rope, float scale,
     float* __restrict__ clat) {             // [H*kvl]
-    int head = blockIdx.x * blockDim.x + threadIdx.x;
-    if (head >= H) return;
-    const float* qa = qabs + (size_t)head * kvl;
-    const float* qr = qrope + (size_t)head * rope;
-    float* out = clat + (size_t)head * kvl;
+    extern __shared__ float smem[];
+    float* acc = smem;              // [HB*kvl] online accumulator, persists all tiles
+    float* Lt = acc + HB * kvl;     // [TILE*kvl] staged latent tile
+    float* Rt = Lt + TILE * kvl;    // [TILE*rope] staged roped-key tile
 
-    for (int i = 0; i < kvl; ++i) out[i] = 0.0f;
+    int tid = threadIdx.x;
+    int lane = tid & (SUBW - 1);    // 0..31 within the head's subgroup
+    int hb = tid / SUBW;            // 0..HB-1 which head in this block
+    int head = blockIdx.x * HB + hb;
+    bool active = head < H;
+
+    // Online-softmax running max/sum, kept in registers replicated across the
+    // head's lanes (every lane sees the same broadcast score, so they stay in
+    // lockstep — no LDS/sync needed for m/l).
     float m = -INFINITY, l = 0.0f;
-    for (int t = 0; t < nt; ++t) {
-        const unsigned short* Lt = Lc + (size_t)t * kvl;
-        const unsigned short* Rt = Rc + (size_t)t * rope;
-        float s = 0.0f;
-        for (int i = 0; i < kvl; ++i) s += qa[i] * bf16f(Lt[i]);
-        for (int d = 0; d < rope; ++d) s += qr[d] * bf16f(Rt[d]);
-        s *= scale;
-        // Online softmax: rescale the running sum and accumulator to the new max.
-        // At t=0, m=-inf ⇒ corr=exp(-inf)=0, p=1: out=L_0, l=1 (clean init).
-        float m_new = fmaxf(m, s);
-        float corr = expf(m - m_new);
-        float p = expf(s - m_new);
-        l = l * corr + p;
-        for (int i = 0; i < kvl; ++i) out[i] = out[i] * corr + p * bf16f(Lt[i]);
-        m = m_new;
+    if (active) {
+        for (int i = lane; i < kvl; i += SUBW) acc[hb * kvl + i] = 0.0f;
     }
-    float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
-    for (int i = 0; i < kvl; ++i) out[i] *= inv;
+
+    const float* qa = qabs + (size_t)(active ? head : 0) * kvl;
+    const float* qr = qrope + (size_t)(active ? head : 0) * rope;
+
+    for (int t0 = 0; t0 < nt; t0 += TILE) {
+        int tcount = min(TILE, nt - t0);
+        // Cooperative tile load (all threads), widening bf16→f32 into LDS.
+        for (int idx = tid; idx < tcount * kvl; idx += blockDim.x)
+            Lt[idx] = bf16f(Lc[(size_t)t0 * kvl + idx]);
+        for (int idx = tid; idx < tcount * rope; idx += blockDim.x)
+            Rt[idx] = bf16f(Rc[(size_t)t0 * rope + idx]);
+        __syncthreads();
+
+        if (active) {
+            for (int tt = 0; tt < tcount; ++tt) {
+                // score = scale · (qa·L_tt + qr·R_tt), reduced across the subgroup.
+                float part = 0.0f;
+                for (int i = lane; i < kvl; i += SUBW) part += qa[i] * Lt[tt * kvl + i];
+                for (int d = lane; d < rope; d += SUBW) part += qr[d] * Rt[tt * rope + d];
+                for (int off = SUBW / 2; off > 0; off >>= 1)
+                    part += __shfl_down(part, off, SUBW);
+                float s = __shfl(part, 0, SUBW) * scale;  // broadcast the reduced sum
+
+                // Online-softmax update (identical on every lane).
+                float m_new = fmaxf(m, s);
+                float corr = expf(m - m_new);
+                float p = expf(s - m_new);
+                for (int i = lane; i < kvl; i += SUBW)
+                    acc[hb * kvl + i] = acc[hb * kvl + i] * corr + p * Lt[tt * kvl + i];
+                l = l * corr + p;
+                m = m_new;
+            }
+        }
+        __syncthreads();  // tile fully consumed before the next overwrites LDS
+    }
+
+    if (active) {
+        float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
+        for (int i = lane; i < kvl; i += SUBW)
+            clat[(size_t)head * kvl + i] = acc[hb * kvl + i] * inv;
+    }
 }
 
-// Host launcher: copy query + cache to device, launch one thread per head, copy
-// the per-head latents back. Per-call alloc (M2 correctness); the resident KV
-// slab the kernel reads zero-copy is M3/M4. Returns 0 or a negative HIP error.
+// Launch the flash attention over already-resident device memory. Does NOT
+// allocate/copy/synchronize — the caller owns qabs/qrope/Lc/Rc/clat and joins
+// once per token via rivoli_device_sync. Return-code convention (shared with
+// moe_fused.hip): 0 = success, POSITIVE = arg guard here, NEGATIVE = -(hipError_t).
 extern "C" int rivoli_mla_attend(
     const float* qabs, const float* qrope,
     const unsigned short* Lc, const unsigned short* Rc,
     int H, int nt, int kvl, int rope, float scale,
     float* clat) {
-    // Return-code convention (see moe_fused.hip): 0 = success, POSITIVE = arg
-    // guard here, NEGATIVE = -(hipError_t). Guards stay out of HIP's enum range.
     if (H <= 0 || nt <= 0 || kvl <= 0 || rope <= 0) return 1001;
-    size_t qabs_n = (size_t)H * kvl;
-    size_t qrope_n = (size_t)H * rope;
-    size_t l_n = (size_t)nt * kvl;
-    size_t r_n = (size_t)nt * rope;
-
-    hipError_t err;
-    float *dqa = 0, *dqr = 0, *dcl = 0;
-    unsigned short *dL = 0, *dR = 0;
-#define CK(call) do { err = (call); if (err != hipSuccess) goto fail; } while (0)
-    CK(hipMalloc(&dqa, qabs_n * sizeof(float)));
-    CK(hipMalloc(&dqr, qrope_n * sizeof(float)));
-    CK(hipMalloc(&dcl, qabs_n * sizeof(float)));
-    CK(hipMalloc(&dL, l_n * sizeof(unsigned short)));
-    CK(hipMalloc(&dR, r_n * sizeof(unsigned short)));
-    CK(hipMemcpy(dqa, qabs, qabs_n * sizeof(float), hipMemcpyHostToDevice));
-    CK(hipMemcpy(dqr, qrope, qrope_n * sizeof(float), hipMemcpyHostToDevice));
-    CK(hipMemcpy(dL, Lc, l_n * sizeof(unsigned short), hipMemcpyHostToDevice));
-    CK(hipMemcpy(dR, Rc, r_n * sizeof(unsigned short), hipMemcpyHostToDevice));
-
-    hipLaunchKernelGGL(mla_latent_attend, dim3((H + 255) / 256), dim3(256), 0, 0,
-                       dqa, dqr, dL, dR, H, nt, kvl, rope, scale, dcl);
-    CK(hipGetLastError());
-    CK(hipDeviceSynchronize());
-    CK(hipMemcpy(clat, dcl, qabs_n * sizeof(float), hipMemcpyDeviceToHost));
-    err = hipSuccess;
-fail:
-    hipFree(dqa); hipFree(dqr); hipFree(dcl); hipFree(dL); hipFree(dR);
-    return err == hipSuccess ? 0 : -(int)err;
-#undef CK
+    size_t lds = ((size_t)(HB + TILE) * kvl + (size_t)TILE * rope) * sizeof(float);
+    if (lds > 65536) return 1002;  // exceeds gfx1151 LDS (shrink TILE/HB)
+    int blocks = (H + HB - 1) / HB;
+    hipGetLastError();  // drain any stale error so the check below is this launch's
+    hipLaunchKernelGGL(mla_latent_attend, dim3(blocks), dim3(HB * SUBW), lds, 0,
+                       qabs, qrope, Lc, Rc, H, nt, kvl, rope, scale, clat);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
 }
