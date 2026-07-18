@@ -191,9 +191,11 @@ fn check(seed: u64, hidden: usize, inter: usize, e: usize) {
     let descs_buf = DeviceBuf::from_bytes(desc_bytes).expect("place descs");
     let x_buf = DeviceBuf::from_bytes(&f32_bytes(&x)).expect("place x");
     let w_buf = DeviceBuf::from_bytes(&f32_bytes(&w)).expect("place w");
-    let mut out_buf = DeviceBuf::zeroed(hidden * 4).expect("alloc out");
+    let mut partial_buf = DeviceBuf::new(e * hidden * 4).expect("alloc partial");
+    let mut out_buf = DeviceBuf::new(hidden * 4).expect("alloc out");
 
-    // SAFETY: all pointers are device-resident for the dims; out is zeroed.
+    // SAFETY: all pointers are device-resident for the dims; partial/out are
+    // fully written by the batch + reduce (no pre-zero needed).
     unsafe {
         launch_moe(
             x_buf.ptr() as *const f32,
@@ -202,6 +204,7 @@ fn check(seed: u64, hidden: usize, inter: usize, e: usize) {
             e,
             descs_buf.ptr() as *const ExpertDesc,
             w_buf.ptr() as *const f32,
+            partial_buf.ptr_mut() as *mut f32,
             out_buf.ptr_mut() as *mut f32,
         )
         .expect("launch moe");

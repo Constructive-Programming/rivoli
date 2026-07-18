@@ -48,6 +48,7 @@ fn desc_bytes(d: &[ExpertDesc]) -> &[u8] {
 struct Profile {
     fetch_ns: u128, // cold-expert copy_in (NVMe→device); fetch_n = miss count
     fetch_n: u64,
+    warm_ns: u128,     // parallel page-warm of the layer's cold experts (overlap)
     attn_ns: u128,     // mid-layer sync — attention+gate GPU compute
     mlp_ns: u128,      // end-of-layer sync — MLP GPU compute (+ dense-layer attn)
     lmhead_ns: u128,   // final sync — norm + lm_head
@@ -110,15 +111,18 @@ impl Profile {
         let tok = self.tokens.max(1) as f64;
         let per = |ns: u128| ns as f64 / 1e6 / tok; // ms/token
         let pct = |ns: u128| 100.0 * ns as f64 / self.wall_ns.max(1) as f64;
-        let accounted = self.fetch_ns
+        let accounted = self.warm_ns
+            + self.fetch_ns
             + self.attn_ns
             + self.mlp_ns
             + self.lmhead_ns
             + self.route_ns
             + self.prefetch_ns;
         tracing::info!(
-            "PROFILE/tok: {:.0}ms wall | fetch {:.0}ms {:.0}% ({} miss, {:.2}ms/miss) | attn {:.0}ms {:.0}% | mlp {:.0}ms {:.0}% | lmhead {:.0}ms {:.0}% | route {:.0}ms {:.0}% | prefetch {:.1}ms | other {:.0}ms",
+            "PROFILE/tok: {:.0}ms wall | warm {:.0}ms {:.0}% | fetch {:.0}ms {:.0}% ({} miss, {:.2}ms/miss) | attn {:.0}ms {:.0}% | mlp {:.0}ms {:.0}% | lmhead {:.0}ms {:.0}% | route {:.0}ms | prefetch {:.1}ms | other {:.0}ms",
             per(self.wall_ns),
+            per(self.warm_ns),
+            pct(self.warm_ns),
             per(self.fetch_ns),
             pct(self.fetch_ns),
             self.fetch_n / self.tokens.max(1),
@@ -130,7 +134,6 @@ impl Profile {
             per(self.lmhead_ns),
             pct(self.lmhead_ns),
             per(self.route_ns),
-            pct(self.route_ns),
             per(self.prefetch_ns),
             per(self.wall_ns.saturating_sub(accounted)),
         );
@@ -153,6 +156,7 @@ pub struct GpuEngine<'a> {
     ctx: DeviceBuf,
     gate_logits: DeviceBuf,
     moe_out: DeviceBuf,
+    moe_partial: DeviceBuf, // [slots*hidden] per-expert outputs (deterministic reduce)
     descs_buf: DeviceBuf,
     wexpert_buf: DeviceBuf,
     logits: DeviceBuf,
@@ -209,6 +213,7 @@ impl<'a> GpuEngine<'a> {
             ctx: f(h * cfg.v_head_dim)?,
             gate_logits: f(cfg.n_experts)?,
             moe_out: f(cfg.hidden)?,
+            moe_partial: f(slots * cfg.hidden)?,
             descs_buf: DeviceBuf::new(slots * std::mem::size_of::<ExpertDesc>())?,
             wexpert_buf: f(slots)?,
             logits: f(cfg.vocab)?,
@@ -342,8 +347,7 @@ impl<'a> GpuEngine<'a> {
                 launch_rmsnorm(xp, post_ln, hidden, eps, xnp)?; // pre-MLP norm → xn
             }
 
-            // --- MLP sublayer ---
-            self.moe_out.zero()?;
+            // --- MLP sublayer (out fully written by the reduce; no pre-zero) ---
             if is_dense {
                 let m = dense_mlp.ok_or_else(|| anyhow::anyhow!("dense layer {l} missing mlp"))?;
                 let d = [desc_of(&m)];
@@ -358,6 +362,7 @@ impl<'a> GpuEngine<'a> {
                         1,
                         self.descs_buf.ptr() as *const ExpertDesc,
                         self.wexpert_buf.ptr() as *const f32,
+                        self.moe_partial.ptr_mut() as *mut f32,
                         self.moe_out.ptr_mut() as *mut f32,
                     )?;
                 }
@@ -378,6 +383,11 @@ impl<'a> GpuEngine<'a> {
                 ls.clear();
                 ls.extend_from_slice(&self.sel);
                 self.pin.begin_layer();
+                // Overlap this layer's cold-expert NVMe reads (parallel page-warm)
+                // before the serial copy_in's below. DISABLED for isolation test.
+                let t = std::time::Instant::now();
+                // self.pin.warm_cold(l, &self.sel);
+                self.prof.warm_ns += t.elapsed().as_nanos();
                 // Resolve selected experts (+ shared), build the descriptor batch.
                 let ke = self.sel.len();
                 let mut descs = Vec::with_capacity(ke + cfg.n_shared);
@@ -413,7 +423,7 @@ impl<'a> GpuEngine<'a> {
                 self.descs_buf.copy_in_at(0, desc_bytes(&descs))?;
                 self.wexpert_buf.copy_in_at(0, &f32_le(&w))?;
                 // SAFETY: descs point at resident/cold-slot weights valid until
-                // the end-of-layer sync; out zeroed; all device-resident.
+                // the end-of-layer sync; all device-resident.
                 unsafe {
                     launch_moe(
                         xnp,
@@ -422,6 +432,7 @@ impl<'a> GpuEngine<'a> {
                         descs.len(),
                         self.descs_buf.ptr() as *const ExpertDesc,
                         self.wexpert_buf.ptr() as *const f32,
+                        self.moe_partial.ptr_mut() as *mut f32,
                         self.moe_out.ptr_mut() as *mut f32,
                     )?;
                 }

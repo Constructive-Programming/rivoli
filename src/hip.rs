@@ -32,6 +32,7 @@ unsafe extern "C" {
         e: i32,
         descs: *const ExpertDesc,
         wexpert: *const f32,
+        partial: *mut f32,
         out: *mut f32,
     ) -> i32;
 
@@ -221,13 +222,18 @@ pub fn probe() -> Result<()> {
 /// [`device_sync`] RETURNS. Dropping any of them before that join is a GPU
 /// use-after-free. Shapes the kernel assumes (all device pointers in the current
 /// HIP context):
-///   - `x`: `hidden` f32; `out`: `hidden` f32, pre-zeroed; `wexpert`: `e` f32
+///   - `x`: `hidden` f32; `wexpert`: `e` f32
+///   - `partial`: `e * hidden` f32 scratch (each expert writes its own row; the
+///     fixed-order reduce sums them → `out`, so both are fully written — no
+///     pre-zero needed)
+///   - `out`: `hidden` f32
 ///   - `descs`: ≥ `e` contiguous `ExpertDesc`, each pointing at
 ///     - `gate_packed`, `up_packed`: `inter * ((hidden+1)/2)` bytes
 ///     - `gate_scale`, `up_scale`: `inter` f32
 ///     - `down_packed`: `hidden * ((inter+1)/2)` bytes
 ///     - `down_scale`: `hidden` f32
 #[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn launch_moe(
     x: *const f32,
     hidden: usize,
@@ -235,6 +241,7 @@ pub unsafe fn launch_moe(
     e: usize,
     descs: *const ExpertDesc,
     wexpert: *const f32,
+    partial: *mut f32,
     out: *mut f32,
 ) -> Result<()> {
     anyhow::ensure!(
@@ -250,6 +257,7 @@ pub unsafe fn launch_moe(
             e as i32,
             descs,
             wexpert,
+            partial,
             out,
         )
     };

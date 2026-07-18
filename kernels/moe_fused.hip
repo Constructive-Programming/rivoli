@@ -46,10 +46,13 @@ __device__ __forceinline__ float siluf(float x) {
 }
 
 // grid = E blocks (one per expert); block = 256 threads; dynamic LDS = inter floats.
+// Each expert writes its weighted contribution to its OWN partial[e] row — no
+// atomicAdd — so the result is independent of GPU scheduling. The fixed-order sum
+// happens in moe_reduce (determinism: greedy decode is reproducible).
 extern "C" __global__ void moe_expert_batch(
     const float* __restrict__ x, int hidden, int inter,
     const ExpertDesc* __restrict__ descs, const float* __restrict__ wexpert,
-    float* __restrict__ out) {
+    float* __restrict__ partial) {
     extern __shared__ float h[];  // [inter]
     int e = blockIdx.x;
     int t = threadIdx.x;
@@ -67,30 +70,46 @@ extern "C" __global__ void moe_expert_batch(
     }
     __syncthreads();
 
-    // Phase B: out[o] += w[e] * scale_d[o] · (down_o · h).
+    // Phase B: partial[e][o] = w[e] * scale_d[o] · (down_o · h). Own row, no atomic.
     float we = wexpert[e];
+    float* prow = partial + (size_t)e * hidden;
     for (int o = t; o < hidden; o += nt) {
         float dv = dot_i4(h, d.down_packed + (size_t)o * rb_i, inter) * d.down_scale[o];
-        atomicAdd(&out[o], we * dv);
+        prow[o] = we * dv;
     }
 }
 
-// Launch the batch over already-resident device memory. Does NOT allocate, copy,
-// or synchronize — the caller owns x/descs/wexpert/out (out must be pre-zeroed)
-// and joins once per token. Return-code convention (shared with attn.hip):
-// 0 = success, POSITIVE = an argument guard here, NEGATIVE = -(hipError_t), so a
-// device fault is never misreported as bad args (hipErrorNoDevice=100 etc.).
+// out[o] = Σ_e partial[e][o], e ASCENDING — a fixed, schedule-independent
+// summation order, so the MoE output (and thus greedy decode) is deterministic.
+extern "C" __global__ void moe_reduce(
+    const float* __restrict__ partial, int e_count, int hidden, float* __restrict__ out) {
+    int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= hidden) return;
+    float acc = 0.0f;
+    for (int e = 0; e < e_count; ++e) acc += partial[(size_t)e * hidden + o];
+    out[o] = acc;
+}
+
+// Launch the batch over already-resident device memory: each expert into its own
+// `partial[E*hidden]` row, then the fixed-order reduce into `out` (fully written,
+// no pre-zero needed). Does NOT allocate/copy/synchronize — the caller owns
+// x/descs/wexpert/partial/out and joins once per token. Return codes: 0 ok,
+// POSITIVE arg guard, NEGATIVE -(hipError_t).
 extern "C" int rivoli_moe_experts(
     const float* x, int hidden, int inter, int E,
-    const void* descs, const float* wexpert, float* out) {
+    const void* descs, const float* wexpert, float* partial, float* out) {
     if (hidden <= 0 || inter <= 0 || E <= 0) return 1001;
     size_t lds = (size_t)inter * sizeof(float);
     // gfx1151 LDS ceiling is 64KB/workgroup (also asserted at model load).
     if (lds > 65536) return 1002;
     hipGetLastError();  // drain any stale error so the check below is this launch's
     hipLaunchKernelGGL(moe_expert_batch, dim3(E), dim3(256), lds, 0,
-                       x, hidden, inter, (const ExpertDesc*)descs, wexpert, out);
+                       x, hidden, inter, (const ExpertDesc*)descs, wexpert, partial);
     hipError_t e = hipGetLastError();
+    if (e != hipSuccess) return -(int)e;
+    hipLaunchKernelGGL(moe_reduce, dim3((hidden + 255) / 256), dim3(256), 0, 0,
+                       partial, E, hidden, out);
+    e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
 

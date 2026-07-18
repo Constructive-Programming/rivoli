@@ -348,6 +348,34 @@ impl<'a> Pin<'a> {
         self.ranked_len
     }
 
+    /// Fault a layer's COLD experts' pages into the cache CONCURRENTLY (multiple
+    /// threads → NVMe queue depth) right before the serial `copy_in`s, so the
+    /// per-layer NVMe reads overlap instead of stalling one-at-a-time (QD1). The
+    /// subsequent `expert()` copies then read a warm cache. Best-effort.
+    pub fn warm_cold(&self, layer: usize, experts: &[usize]) {
+        let mut ranges = Vec::new();
+        for &e in experts {
+            let _ = self.cold_warm_ranges(layer, e, &mut ranges);
+        }
+        if ranges.len() < 2 {
+            for &(addr, len) in &ranges {
+                touch(addr, len);
+            }
+            return;
+        }
+        let nthreads = ranges.len().min(8);
+        let per = ranges.len().div_ceil(nthreads);
+        std::thread::scope(|s| {
+            for chunk in ranges.chunks(per) {
+                s.spawn(move || {
+                    for &(addr, len) in chunk {
+                        touch(addr, len);
+                    }
+                });
+            }
+        });
+    }
+
     /// Append the mmap byte ranges of a COLD routed expert's packed weights to
     /// `out`, for background page-cache warming. A resident (pinned) expert
     /// appends nothing — it is already on device, no NVMe read to overlap.
@@ -434,6 +462,20 @@ impl<'a> Pin<'a> {
             },
         })
     }
+}
+
+/// Fault a read-only mmap range into the page cache: one byte per 4 KiB page.
+/// The `black_box` keeps the compiler from eliding the loads.
+fn touch(addr: usize, len: usize) {
+    let p = addr as *const u8;
+    let mut off = 0usize;
+    let mut sink = 0u8;
+    while off < len {
+        // SAFETY: [addr,addr+len) is a live read-only snapshot mmap range.
+        sink = sink.wrapping_add(unsafe { *p.add(off) });
+        off += 4096;
+    }
+    std::hint::black_box(sink);
 }
 
 /// Copy packed nibbles then scale bytes into one contiguous device slot.
