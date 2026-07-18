@@ -291,6 +291,49 @@ Priorities from the data: (1) coalesced int4 GEMV kernel (biggest tok/s lever,
 workload-independent); (2) coherent-memory pin (~2× RAM efficiency); (3) usage
 priming to lift hit past the 67 % pinning ceiling toward 85 %.
 
+### Update 2026-07-18 (post-D3) — reconciling the coherent pin & priming with evidence
+
+**(1) DONE.** D3 coalesced wave-per-row GEMV shipped (`a89d7ea`): attn ~1450→155
+ms/tok (~9×), lm_head ~350→7 ms, wall ~3900→2140 ms/tok (~1.8×). This **moved the
+bottleneck**: the engine is now **I/O-bound, not compute-bound** — per-token
+`warm` 904 ms (42 %) + `fetch` 439 ms (21 %) = **63 % cold-expert paging**; `mlp`
+616 ms (29 %, the MoE fused kernel's still-uncoalesced inner dot — the next
+compute lever); `attn` 155 ms (7 %). ~0.47 tok/s wall.
+
+**(2) coherent pin — DO NOT schedule as a plain task; it's an UNMEASURED
+HYPOTHESIS gated behind priming.** What we actually ran was the coherent **cold
+pool** (`hipHostMalloc` on the cold-fetch slots), NOT the resident pin:
+- Result: **`mlp` 617→675 ms, +9 % REGRESSION** → git `stash@{0}` ("revisit for
+  async streaming"). Cause: coherent reads measured **207 GB/s vs 220 GB/s device
+  (~6 % slower)**, and cold misses are *read*-bound (GPU reads the expert in place
+  during the MoE dot), not copy-bound — so the tax hit compute with no offsetting
+  H2D saving.
+- The 6 % read tax applies to the **resident pin too**, which is the most
+  read-heavy memory in the engine (every token, every GEMV + MoE). That
+  experiment ran while we were compute-bound, where the tax was clearly bad.
+- Post-D3 the calculus *may* have flipped (now I/O-bound: 6 % of ~770 ms compute
+  ≈ 46 ms vs halving RAM/expert → ~2× more resident experts → fewer of the 55 %
+  misses → cuts into 1343 ms warm+fetch). **But this is a hypothesis, not a
+  result.** Only worth testing AFTER priming — no point paying the read tax to fit
+  more experts until priming makes "more resident" mean "more *useful*". The
+  `madvise(MADV_DONTNEED)` interim (`5b2212b`) is the safe half and is already
+  shipped.
+
+**(3) priming — DEFERRED indefinitely; we TRUST colibri's priming.** The shipped
+`.coli_usage` IS colibri's priming artifact, and routing was verified correct
+against it (0.2 % absent, 0 misses below cutoff). Re-running our own
+workload-matched priming pass is NOT on the near-term roadmap — we accept
+colibri's ranking as the pin order. Consequence: the 67 % pinning ceiling / 45 %
+hit on the "sky is blue" bench is a *known, accepted* breadth gap for now, not a
+bug to chase. (This also parks the coherent-pin hypothesis above, which was gated
+behind priming.)
+
+**Near-term levers that remain (given priming is parked):** (a) MoE fused-kernel
+inner-dot coalescing — the 29 % `mlp` bucket, the last big *compute* win; (b) NVMe
+fault throughput for the 63 % warm+fetch I/O (io-uring / pread pool — the I/O
+itself, threading already fixed). Device-side routing / ≤1-join stays SKIPPED
+(blocked while cold-fetching; only reachable fully-resident, i.e. post-priming).
+
 ## M3 kernel contracts (locked by the M2 review)
 
 The M2 kernels are the correctness oracle; M3 rewrites them for residency. Two of
