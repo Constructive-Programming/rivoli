@@ -19,15 +19,12 @@
 use std::collections::{BTreeMap, HashMap};
 
 /// Recency-ordered set of keys: O(log n) MRU-insert / arbitrary-remove / pop-LRU
-/// via a monotonic tick clock + a `BTreeMap` whose front is the LRU end. Cold
-/// inserts use a separate DECREASING clock so they sort below every normal key
-/// (evicted first); a later `touch` promotes them with a normal ascending tick.
+/// via a monotonic tick clock + a `BTreeMap` whose front is the LRU end.
 #[derive(Default)]
 struct OrderedSet {
     at: HashMap<u32, i64>,
     order: BTreeMap<i64, u32>,
-    clock: i64,      // ascending: normal MRU inserts
-    cold_clock: i64, // descending from 0: cold-end inserts sort below all normals
+    clock: i64, // ascending MRU inserts
 }
 
 impl OrderedSet {
@@ -50,12 +47,6 @@ impl OrderedSet {
         let t = self.clock;
         self.stamp(k, t);
     }
-    /// Insert `k` at the LRU/cold end (evicted before any normal entry).
-    fn touch_cold(&mut self, k: u32) {
-        self.cold_clock -= 1;
-        let t = self.cold_clock;
-        self.stamp(k, t);
-    }
     fn remove(&mut self, k: u32) -> bool {
         if let Some(t) = self.at.remove(&k) {
             self.order.remove(&t);
@@ -75,13 +66,21 @@ impl OrderedSet {
 /// A routed-expert cache policy. `get` reports a hit and promotes on hit;
 /// `insert` admits a known-miss key and returns the RESIDENT key it evicted (for
 /// the pin to reuse that slot), or `None` if spare capacity absorbed it.
-/// `insert_cold` is the same but parks the key cold (for prefetch). `access_batch`
+/// `insert_cold` admits a PREFETCHED (predicted, maybe-wrong) key into the
+/// policy's probation segment so it does NOT enter the scan-resistant/protected set
+/// on a speculative guess — 2Q parks it in A1in (never promoting via the A1out
+/// ghost), ARC in T1 (never adapting `p` or promoting via B1/B2). CRITICAL: a batch
+/// of `insert_cold`s at capacity must COEXIST — each evicts an OLDER resident, never
+/// a just-inserted batch sibling (a pure single-segment recency cache can't do both
+/// coexist AND cold-first, so `Lru` uses the default = normal `insert`). `access_batch`
 /// runs one layer's keys two-pass (hits first, then misses), mirroring
 /// `resolve_layer`. `seed` pre-fills the protected/frequency segment.
 pub trait Cache {
     fn contains(&self, k: u32) -> bool;
     fn get(&mut self, k: u32) -> bool;
     fn insert(&mut self, k: u32) -> Option<u32>;
+    /// Default = normal `insert` (correct for single-segment `Lru`: a batch coexists,
+    /// evicting old normals). Segmented policies override to force probation.
     fn insert_cold(&mut self, k: u32) -> Option<u32> {
         self.insert(k)
     }
@@ -141,13 +140,9 @@ impl Cache for Lru {
         self.set.touch(k);
         ev
     }
-    fn insert_cold(&mut self, k: u32) -> Option<u32> {
-        let ev = (self.set.len() >= self.cap)
-            .then(|| self.set.pop_lru())
-            .flatten();
-        self.set.touch_cold(k);
-        ev
-    }
+    // insert_cold: uses the trait default (= insert). A single-segment recency cache
+    // cannot both coexist a prefetch batch and cold-park it, so LRU prefetches land
+    // as normal MRU inserts (they decay normally if unused). Use 2q/arc to cold-park.
     fn seed(&mut self, keys: &[u32]) {
         for &k in keys.iter().take(self.cap) {
             self.set.touch(k);
@@ -221,6 +216,15 @@ impl Cache for TwoQ {
         } else {
             self.a1in.touch(k); // first sighting → probation FIFO
         }
+        ev
+    }
+    fn insert_cold(&mut self, k: u32) -> Option<u32> {
+        // Prefetch: force into A1in probation, NEVER promoting via the A1out ghost —
+        // a speculative (maybe-wrong) prediction must not enter the protected Am set.
+        // A batch coexists: reclaim evicts the oldest A1in/Am, never a fresh sibling.
+        let ev = self.reclaim();
+        self.a1out.remove(k); // drop any stale ghost; do NOT promote
+        self.a1in.touch(k);
         ev
     }
     fn seed(&mut self, keys: &[u32]) {
@@ -319,6 +323,33 @@ impl Cache for Arc {
             }
             self.t1.touch(k);
         }
+        evicted
+    }
+    fn insert_cold(&mut self, k: u32) -> Option<u32> {
+        // Prefetch: force into T1 recency probation, NEVER adapting `p` or promoting
+        // via the B1/B2 ghosts — a speculative prediction must not corrupt ARC's
+        // adaptation signal. Mirrors insert's cold-miss branch (a batch coexists:
+        // replace evicts a T1/T2 LRU, never a fresh sibling).
+        self.b1.remove(k);
+        self.b2.remove(k);
+        let c = self.c;
+        let total = self.t1.len() + self.t2.len() + self.b1.len() + self.b2.len();
+        let evicted = if self.t1.len() + self.b1.len() == c {
+            if self.t1.len() < c {
+                self.b1.pop_lru();
+                self.replace(false)
+            } else {
+                self.t1.pop_lru()
+            }
+        } else if total >= c {
+            if total == 2 * c {
+                self.b2.pop_lru();
+            }
+            self.replace(false)
+        } else {
+            None
+        };
+        self.t1.touch(k);
         evicted
     }
     fn seed(&mut self, keys: &[u32]) {
@@ -428,7 +459,8 @@ mod tests {
     }
 
     /// Residency never exceeds capacity, and evicted keys are always resident (the
-    /// invariant the live pin relies on to reuse the evicted key's slot).
+    /// invariant the live pin relies on to reuse the evicted key's slot). Alternates
+    /// insert and insert_cold so the prefetch cold-park path is covered too.
     #[test]
     fn eviction_returns_resident_and_respects_cap() {
         for pol in ["lru", "2q", "arc"] {
@@ -436,7 +468,12 @@ mod tests {
             let mut resident = std::collections::HashSet::new();
             for k in 0..200u32 {
                 if !c.get(k) {
-                    if let Some(ev) = c.insert(k) {
+                    let ev = if k.is_multiple_of(3) {
+                        c.insert_cold(k)
+                    } else {
+                        c.insert(k)
+                    };
+                    if let Some(ev) = ev {
                         assert!(resident.remove(&ev), "{pol}: evicted {ev} was not resident");
                     }
                     resident.insert(k);
@@ -444,6 +481,62 @@ mod tests {
                 assert!(resident.len() <= 16, "{pol}: over cap ({})", resident.len());
                 assert_eq!(resident.len(), c.resident_len(), "{pol}: pin/policy drift");
             }
+        }
+    }
+
+    /// Finding A regression: a prefetch batch must COEXIST. At capacity, consecutive
+    /// insert_cold calls must each evict an OLD resident, never a just-inserted batch
+    /// sibling. The old LRU `touch_cold` made the 2nd cold insert evict the 1st.
+    #[test]
+    fn cold_batch_coexists_at_capacity() {
+        for pol in ["lru", "2q", "arc"] {
+            let mut c = boxed(pol, 16);
+            for k in 0..16u32 {
+                c.insert(k); // fill to capacity
+            }
+            let (a, b, d) = (1000u32, 1001, 1002);
+            c.insert_cold(a);
+            c.insert_cold(b);
+            c.insert_cold(d);
+            assert!(
+                c.contains(a),
+                "{pol}: 1st prefetch evicted by a later batch sibling"
+            );
+            assert!(c.contains(b), "{pol}: 2nd prefetch not resident");
+            assert!(c.contains(d), "{pol}: 3rd prefetch not resident");
+            assert!(c.resident_len() <= 16, "{pol}: over cap");
+        }
+    }
+
+    /// Finding B regression: cold-inserting a key that is currently a GHOST must NOT
+    /// promote it into the protected/frequency segment (2Q Am / ARC T2) — a
+    /// speculative prefetch stays in probation, so a later probation-churning scan
+    /// evicts it. If it had been promoted, it would survive the churn.
+    #[test]
+    fn cold_insert_does_not_promote_ghosts() {
+        for pol in ["2q", "arc"] {
+            let mut c = boxed(pol, 8);
+            let g = 500u32;
+            c.insert(g);
+            for k in 0..8u32 {
+                c.insert(k); // displace g → it becomes a ghost
+            }
+            assert!(
+                !c.contains(g),
+                "{pol}: setup — g should be a ghost, not resident"
+            );
+            c.insert_cold(g); // prefetch the ghost
+            assert!(
+                c.contains(g),
+                "{pol}: g should be resident after cold insert"
+            );
+            for k in 100..140u32 {
+                c.insert_cold(k); // probation-churning prefetch stream
+            }
+            assert!(
+                !c.contains(g),
+                "{pol}: ghost prefetch was promoted to the protected set (survived churn)"
+            );
         }
     }
 }
