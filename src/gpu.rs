@@ -98,6 +98,7 @@ pub struct GpuEngine<'a> {
     gate_logits: DeviceBuf,
     moe_out: DeviceBuf,
     moe_partial: DeviceBuf, // [slots*hidden] per-expert outputs (deterministic reduce)
+    moe_h: DeviceBuf,       // [E*inter] SwiGLU hidden scratch (two-pass coalesced MoE)
     descs_buf: DeviceBuf,
     wexpert_buf: DeviceBuf,
     logits: DeviceBuf,
@@ -150,6 +151,7 @@ impl<'a> GpuEngine<'a> {
             gate_logits: f(cfg.n_experts)?,
             moe_out: f(cfg.hidden)?,
             moe_partial: f(slots * cfg.hidden)?,
+            moe_h: f((slots * cfg.moe_inter).max(cfg.dense_inter))?,
             descs_buf: DeviceBuf::new(slots * std::mem::size_of::<ExpertDesc>())?,
             wexpert_buf: f(slots)?,
             logits: f(cfg.vocab)?,
@@ -283,6 +285,7 @@ impl<'a> GpuEngine<'a> {
                         1,
                         self.descs_buf.ptr() as *const ExpertDesc,
                         self.wexpert_buf.ptr() as *const f32,
+                        self.moe_h.ptr_mut() as *mut f32,
                         self.moe_partial.ptr_mut() as *mut f32,
                         self.moe_out.ptr_mut() as *mut f32,
                     )?;
@@ -343,6 +346,7 @@ impl<'a> GpuEngine<'a> {
                         descs.len(),
                         self.descs_buf.ptr() as *const ExpertDesc,
                         self.wexpert_buf.ptr() as *const f32,
+                        self.moe_h.ptr_mut() as *mut f32,
                         self.moe_partial.ptr_mut() as *mut f32,
                         self.moe_out.ptr_mut() as *mut f32,
                     )?;
