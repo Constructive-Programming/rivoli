@@ -70,6 +70,11 @@ pub struct GpuEngine<'a> {
     // pin progressively matches the real workload — the M4 fix for the pin/prompt
     // hit-rate mismatch.
     acc: crate::usage::Usage,
+    // Background page-cache warmer + the previous token's routed selection per
+    // sparse layer (the predictor): at each token's start we warm the experts the
+    // last token routed to, overlapping their NVMe read with this token's compute.
+    prefetch: crate::prefetch::Prefetcher,
+    last_sel: Vec<Vec<usize>>,
 }
 
 impl<'a> GpuEngine<'a> {
@@ -119,6 +124,8 @@ impl<'a> GpuEngine<'a> {
             choice: vec![0.0; cfg.n_experts],
             sel: Vec::with_capacity(cfg.top_k),
             acc: crate::usage::Usage::default(),
+            prefetch: crate::prefetch::Prefetcher::new(),
+            last_sel: vec![Vec::new(); cfg.n_layers - cfg.dense_layers],
             pin,
         })
     }
@@ -177,6 +184,20 @@ impl<'a> GpuEngine<'a> {
                 hidden,
                 xp,
             )?;
+        }
+
+        // Streaming feed: warm the pages of the experts the PREVIOUS token routed
+        // to (a stable predictor) so their NVMe read overlaps this token's compute
+        // and the later copy_in hits the page cache, not cold disk.
+        {
+            let mut ranges = Vec::new();
+            for (si, sel) in self.last_sel.iter().enumerate() {
+                let layer = si + cfg.dense_layers;
+                for &e in sel {
+                    self.pin.cold_warm_ranges(layer, e, &mut ranges)?;
+                }
+            }
+            self.prefetch.warm(ranges);
         }
 
         for l in 0..cfg.n_layers {
@@ -259,6 +280,10 @@ impl<'a> GpuEngine<'a> {
                 for &e in &self.sel {
                     self.acc.record(l as u16, e as u16); // online usage accumulation
                 }
+                // Remember this layer's selection to prefetch next token (stable).
+                let ls = &mut self.last_sel[l - cfg.dense_layers];
+                ls.clear();
+                ls.extend_from_slice(&self.sel);
                 self.pin.begin_layer();
                 // Resolve selected experts (+ shared), build the descriptor batch.
                 let ke = self.sel.len();

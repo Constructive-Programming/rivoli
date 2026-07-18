@@ -300,6 +300,26 @@ impl<'a> Pin<'a> {
         &self.moe_bias[layer - self.cfg.dense_layers]
     }
 
+    /// Append the mmap byte ranges of a COLD routed expert's packed weights to
+    /// `out`, for background page-cache warming. A resident (pinned) expert
+    /// appends nothing — it is already on device, no NVMe read to overlap.
+    pub fn cold_warm_ranges(
+        &self,
+        layer: usize,
+        expert: usize,
+        out: &mut Vec<(usize, usize)>,
+    ) -> Result<()> {
+        if self.experts[layer - self.cfg.dense_layers][expert].is_some() {
+            return Ok(());
+        }
+        let base = format!("model.layers.{layer}.mlp.experts.{expert}");
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            let w = self.snap.require(&format!("{base}.{proj}.weight"))?;
+            out.push((w.as_ptr() as usize, w.len()));
+        }
+        Ok(())
+    }
+
     pub fn pinned_experts(&self) -> usize {
         self.experts
             .iter()

@@ -145,15 +145,20 @@ async fn run(cfg: Config) -> Result<()> {
         info!("{BENCH_PROMPT}{}", tok.decode_all(&ids)?);
 
         // Merge this run's routing back into .coli_usage so the next pin matches
-        // the workload better (online usage accumulation — M4).
+        // the workload better (online usage accumulation — M4). BEST-EFFORT: a
+        // read-only snapshot dir just means no accumulation, never a failed run.
         let acc = engine.accumulated().clone();
-        let mut merged = rivoli::usage::Usage::load(&cfg.snapshot)?;
-        merged.merge(&acc);
-        merged.write(&cfg.snapshot)?;
-        info!(
-            "usage: recorded {} selections this run, merged → .coli_usage",
-            acc.total_selections()
-        );
+        let writeback = rivoli::usage::Usage::load(&cfg.snapshot).and_then(|mut m| {
+            m.merge(&acc);
+            m.write(&cfg.snapshot)
+        });
+        match writeback {
+            Ok(()) => info!(
+                "usage: recorded {} selections this run, merged → .coli_usage",
+                acc.total_selections()
+            ),
+            Err(e) => info!("usage: writeback skipped ({e:#})"),
+        }
         Ok(())
     }
 
