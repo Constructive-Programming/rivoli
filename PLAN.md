@@ -319,6 +319,16 @@ pool** (`hipHostMalloc` on the cold-fetch slots), NOT the resident pin:
   on its own merits now that the profile is I/O-bound, independent of whether we
   ever prime. The `madvise(MADV_DONTNEED)` interim (`5b2212b`) is the safe half
   and is already shipped.
+- **RE-RAN the coherent COLD pool post-D3 (2026-07-18) — now a WASH, not a
+  regression.** vs D3 baseline: `fetch` 439→**368 ms** (1.30→1.09 ms/miss, the
+  host-memcpy fill skips 3× H2D/miss) but `mlp` 616→**672 ms** (+9 %, the 6 %
+  coherent read tax on the cold-expert dot); wall 2140→**2135 ms** (net ≈0). The
+  6 % tax is RECONFIRMED. This isolates the TAX (real, ~6 % on coherent reads) but
+  NOT the resident-pin's RAM-fit benefit — the cold pool is read once/miss WITH a
+  fill offset; the RESIDENT pin is read every token with NO offset, so A3 would
+  pay the tax on all hit-reads and must justify it purely by fitting ~2× experts
+  → higher hit → less I/O. **A3 (resident pin) still needs its OWN build+measure.**
+  Conflict-resolved coherent artifact preserved in `git stash@{0}` as the base.
 
 **(3) priming — DEFERRED indefinitely; we TRUST colibri's priming.** The shipped
 `.coli_usage` IS colibri's priming artifact, and routing was verified correct
