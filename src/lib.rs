@@ -1,4 +1,5 @@
 pub mod attn;
+pub mod cache;
 pub mod config;
 pub mod device;
 pub mod engine;

@@ -11,28 +11,47 @@ use tracing::info;
 /// reads straight into VMM. The bounce is default because it measures ~13% faster
 /// (avoids the coherent tax on DMA into host-mapped device pages) and survives NFS
 /// sources; use this only to force raw DMA. See stream.hip for the details.
-fn parse_args() -> Result<(String, Option<usize>, bool, bool)> {
-    const USAGE: &str =
-        "usage: rivoli <snapshot-dir> [-bench <tokens>] [--pre-seed] [--direct-vmm-dma]";
+/// `--trace <path>` dumps the routed-expert access trace for the offline cache-
+/// policy sim (bin/replay). `--prompt <text>` overrides the fixed bench prompt so
+/// diverse, request-like inputs can be traced.
+struct Args {
+    snapshot: String,
+    bench: Option<usize>,
+    pre_seed: bool,
+    direct_vmm_dma: bool,
+    trace: Option<String>,
+    prompt: Option<String>,
+}
+
+fn parse_args() -> Result<Args> {
+    const USAGE: &str = "usage: rivoli <snapshot-dir> [-bench <tokens>] [--pre-seed] \
+         [--direct-vmm-dma] [--trace <path>] [--prompt <text>]";
     let mut snapshot = None;
-    let mut bench = None;
-    let mut pre_seed = false;
-    let mut direct_vmm_dma = false;
+    let mut a = Args {
+        snapshot: String::new(),
+        bench: None,
+        pre_seed: false,
+        direct_vmm_dma: false,
+        trace: None,
+        prompt: None,
+    };
     let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        match a.as_str() {
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
             "-bench" => {
                 let n = args.next().context("-bench requires a token count")?;
-                bench = Some(n.parse().context("-bench takes an integer")?);
+                a.bench = Some(n.parse().context("-bench takes an integer")?);
             }
-            "--pre-seed" => pre_seed = true,
-            "--direct-vmm-dma" => direct_vmm_dma = true,
-            _ if snapshot.is_none() => snapshot = Some(a),
-            _ => bail!("unexpected argument: {a}\n{USAGE}"),
+            "--pre-seed" => a.pre_seed = true,
+            "--direct-vmm-dma" => a.direct_vmm_dma = true,
+            "--trace" => a.trace = Some(args.next().context("--trace requires a path")?),
+            "--prompt" => a.prompt = Some(args.next().context("--prompt requires text")?),
+            _ if snapshot.is_none() => snapshot = Some(arg),
+            _ => bail!("unexpected argument: {arg}\n{USAGE}"),
         }
     }
-    let snapshot = snapshot.context(USAGE)?;
-    Ok((snapshot, bench, pre_seed, direct_vmm_dma))
+    a.snapshot = snapshot.context(USAGE)?;
+    Ok(a)
 }
 
 fn main() -> Result<()> {
@@ -42,8 +61,15 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let (snapshot, bench, pre_seed, direct_vmm_dma) = parse_args()?;
-    let cfg = Config::discover(snapshot, bench, pre_seed, direct_vmm_dma)?;
+    let a = parse_args()?;
+    let cfg = Config::discover(
+        a.snapshot,
+        a.bench,
+        a.pre_seed,
+        a.direct_vmm_dma,
+        a.trace,
+        a.prompt,
+    )?;
 
     // Rule 1: the full discovered config is the first line of every run.
     info!("rivoli {} | {cfg}", env!("CARGO_PKG_VERSION"));
@@ -90,11 +116,11 @@ async fn run(cfg: Config) -> Result<()> {
     // Tokenizer (tokenizer.json). Round-trip the fixed bench prompt as a
     // liveness check. Bench input is fixed by design — it's a benchmark, not a
     // knob; real prompts arrive via the server API (later).
-    const BENCH_PROMPT: &str = "The sky is blue because";
+    let bench_prompt = cfg.prompt.as_deref().unwrap_or("The sky is blue because");
     let tok = rivoli::tokenizer::Tokenizer::load(&cfg.snapshot)?;
-    let prompt_ids = tok.encode(BENCH_PROMPT)?;
+    let prompt_ids = tok.encode(bench_prompt)?;
     info!(
-        "tokenizer: prompt {BENCH_PROMPT:?} -> {} tokens {:?}; eos={:?}",
+        "tokenizer: prompt {bench_prompt:?} -> {} tokens {:?}; eos={:?}",
         prompt_ids.len(),
         &prompt_ids[..prompt_ids.len().min(12)],
         tok.eos
@@ -141,8 +167,15 @@ async fn run(cfg: Config) -> Result<()> {
         // headroom for scratch/KV. The pin splits this into resident tier + LRU.
         let cap = free.saturating_sub(16 << 30).min(80 << 30);
         let t = std::time::Instant::now();
-        let pin =
-            rivoli::pin::Pin::build(&snap, &mc, &usage, cap, cfg.pre_seed, !cfg.direct_vmm_dma)?;
+        let pin = rivoli::pin::Pin::build(
+            &snap,
+            &mc,
+            &usage,
+            cap,
+            cfg.pre_seed,
+            !cfg.direct_vmm_dma,
+            cfg.trace.as_deref(),
+        )?;
         info!("pin built in {:.1}s", t.elapsed().as_secs_f64());
         let max_ctx = prompt_ids.len() + ngen + 1;
         let mut engine = rivoli::gpu::GpuEngine::new(pin, &mc, max_ctx)?;
@@ -157,7 +190,7 @@ async fn run(cfg: Config) -> Result<()> {
             ids.len() as f64 / dt,
             100.0 * hits as f64 / (hits + misses).max(1) as f64,
         );
-        info!("{BENCH_PROMPT}{}", tok.decode_all(&ids)?);
+        info!("{bench_prompt}{}", tok.decode_all(&ids)?);
         Ok(())
     }
 
@@ -173,7 +206,7 @@ async fn run(cfg: Config) -> Result<()> {
             dt,
             ids.len() as f64 / dt
         );
-        info!("{BENCH_PROMPT}{}", tok.decode_all(&ids)?);
+        info!("{bench_prompt}{}", tok.decode_all(&ids)?);
         Ok(())
     }
 }

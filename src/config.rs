@@ -31,6 +31,13 @@ pub struct Config {
     /// kernels (e.g. 6.18.38-gentoo; see stream.hip). Set this only to force the
     /// raw-DMA path (local source, and a kernel where it's actually faster).
     pub direct_vmm_dma: bool,
+    /// Dump the routed-expert access trace to this path (`--trace`): one line per
+    /// MoE layer, the LRU keys it looked up. Feeds the offline cache-policy sim.
+    /// None = no trace (the normal decode path).
+    pub trace: Option<String>,
+    /// Override the fixed bench prompt (`--prompt`), for capturing routing traces of
+    /// diverse, request-like inputs. None = the default "The sky is blue because".
+    pub prompt: Option<String>,
     /// Total budget for expert residency (pin + slab pool), bytes:
     /// MemAvailable − OS_RESERVE − engine overhead (refined at snapshot load).
     pub mem_budget: u64,
@@ -83,6 +90,8 @@ impl Config {
         bench: Option<usize>,
         pre_seed: bool,
         direct_vmm_dma: bool,
+        trace: Option<String>,
+        prompt: Option<String>,
     ) -> Result<Self> {
         let avail = mem_available()?;
         if avail <= OS_RESERVE {
@@ -109,6 +118,8 @@ impl Config {
             bench,
             pre_seed,
             direct_vmm_dma,
+            trace,
+            prompt,
             mem_budget: avail - OS_RESERVE,
             gtt_free: gtt_total.saturating_sub(gtt_used),
             threads,
@@ -121,11 +132,13 @@ impl fmt::Display for Config {
         const GIB: f64 = (1u64 << 30) as f64;
         write!(
             f,
-            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} mem_budget={:.1}GiB gtt_free={:.1}GiB os_reserve={:.0}GiB threads={}",
+            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} trace={:?} prompt={:?} mem_budget={:.1}GiB gtt_free={:.1}GiB os_reserve={:.0}GiB threads={}",
             self.snapshot,
             self.bench,
             self.pre_seed,
             self.direct_vmm_dma,
+            self.trace,
+            self.prompt,
             self.mem_budget as f64 / GIB,
             self.gtt_free as f64 / GIB,
             OS_RESERVE as f64 / GIB,

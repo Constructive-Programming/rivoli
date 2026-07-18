@@ -103,6 +103,10 @@ pub struct Pin<'a> {
     /// Stats over the run.
     pub hits: u64,
     pub misses: u64,
+    /// Optional access-trace sink (`--trace`): one line per resolved MoE layer, the
+    /// space-separated `(layer,expert)` keys the LRU looked up, in access order.
+    /// Feeds the offline cache-policy simulator (`src/cache.rs`, `bin/replay`).
+    trace: Option<std::io::BufWriter<std::fs::File>>,
 }
 
 /// Place a norm/f32 tensor (O-length) into the tier: reserve, then `pread` the
@@ -303,6 +307,7 @@ impl<'a> Pin<'a> {
         capacity: usize,
         pre_seed: bool,
         bounce: bool,
+        trace_path: Option<&str>,
     ) -> Result<Self> {
         let (free, _total) = mem_info()?;
         ensure!(
@@ -460,6 +465,13 @@ impl<'a> Pin<'a> {
             stream,
             hits: 0,
             misses: 0,
+            trace: trace_path
+                .map(|p| -> Result<_> {
+                    Ok(std::io::BufWriter::new(
+                        std::fs::File::create(p).with_context(|| format!("open trace {p}"))?,
+                    ))
+                })
+                .transpose()?,
         })
     }
 
@@ -479,6 +491,15 @@ impl<'a> Pin<'a> {
     /// submit as ONE queue-depth io_uring O_DIRECT batch, joined once.
     pub fn resolve_layer(&mut self, layer: usize, sel: &[usize]) -> Result<Vec<Mlp>> {
         let (cfg, snap) = (self.cfg, self.snap);
+        // Trace sink (--trace): the exact LRU keys this layer looks up, access order.
+        if let Some(w) = &mut self.trace {
+            use std::io::Write;
+            let line: Vec<String> = sel
+                .iter()
+                .map(|&e| expert_key(layer, e).to_string())
+                .collect();
+            writeln!(w, "{}", line.join(" ")).context("write trace")?;
+        }
         // Phase 1a: touch EVERY hit first. Doing this before any miss's `alloc()`
         // bumps each hit's LRU tick above the eviction candidates, so a later miss
         // cannot evict a same-layer would-be hit out from under itself (which would
