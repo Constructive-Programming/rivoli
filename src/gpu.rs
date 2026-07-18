@@ -392,7 +392,12 @@ impl<'a> GpuEngine<'a> {
             pos += 1;
         }
         let mut generated = Vec::with_capacity(ngen);
-        for _ in 0..ngen {
+        // Windowed timing so the cache-warming trend is visible (does per-token
+        // time drop as the working set caches?).
+        const WIN: usize = 8;
+        let mut win_t = std::time::Instant::now();
+        let (mut win_hit, mut win_miss) = (self.pin.hits, self.pin.misses);
+        for i in 0..ngen {
             let next = self.argmax()?;
             if eos.contains(&next) {
                 break;
@@ -400,6 +405,18 @@ impl<'a> GpuEngine<'a> {
             generated.push(next);
             self.forward(next, pos)?;
             pos += 1;
+            if (i + 1) % WIN == 0 {
+                let dt = win_t.elapsed().as_secs_f64();
+                let (dh, dm) = (self.pin.hits - win_hit, self.pin.misses - win_miss);
+                let hit_pct = 100.0 * dh as f64 / (dh + dm).max(1) as f64;
+                tracing::info!(
+                    "  tok {}/{ngen}: {:.3} tok/s (window), hit {hit_pct:.1}%",
+                    i + 1,
+                    WIN as f64 / dt.max(1e-9),
+                );
+                win_t = std::time::Instant::now();
+                (win_hit, win_miss) = (self.pin.hits, self.pin.misses);
+            }
         }
         Ok(generated)
     }

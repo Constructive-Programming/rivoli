@@ -33,10 +33,14 @@ impl Usage {
     /// silently accept as wrong counts). Single-writer assumed — two concurrent
     /// rivoli instances would contend for the GPU tier long before this races.
     pub fn write(&self, dir: &str) -> Result<()> {
+        self.write_to(&format!("{dir}/.coli_usage"))
+    }
+
+    /// Atomic write to an explicit path (see [`Usage::write`]).
+    pub fn write_to(&self, path: &str) -> Result<()> {
         use std::fmt::Write as _;
         use std::io::Write as _;
-        let path = format!("{dir}/.coli_usage");
-        let tmp = format!("{dir}/.coli_usage.tmp.{}", std::process::id());
+        let tmp = format!("{path}.tmp.{}", std::process::id());
         let mut s = String::with_capacity(self.counts.len() * 12);
         // Deterministic order so the file is stable diff-to-diff.
         let mut rows: Vec<_> = self.counts.iter().collect();
@@ -48,14 +52,28 @@ impl Usage {
         f.write_all(s.as_bytes())
             .with_context(|| format!("write {tmp}"))?;
         f.sync_all().with_context(|| format!("fsync {tmp}"))?; // durable before rename
-        std::fs::rename(&tmp, &path).with_context(|| format!("rename {tmp} -> {path}"))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("rename {tmp} -> {path}"))?;
         Ok(())
     }
-    /// Load `<dir>/.coli_usage`. A missing file is not an error — it means no
-    /// history yet (cold start), so the pin falls back to natural order.
+    /// Load `<dir>/.coli_usage` (the snapshot's read-only seed).
     pub fn load(dir: &str) -> Result<Self> {
-        let path = format!("{dir}/.coli_usage");
-        let text = match std::fs::read_to_string(&path) {
+        Self::load_from(&format!("{dir}/.coli_usage"))
+    }
+
+    /// The user-writable accumulator path for a snapshot — where rivoli persists
+    /// its own recorded routing (the snapshot dir is typically read-only, so the
+    /// seed there stays fixed and additions live here). Env-free per the zero-knob
+    /// rule: `/var/tmp/rivoli/<snapshot-name>.coli_usage`.
+    pub fn accumulator_path(snapshot_dir: &str) -> Option<String> {
+        let name = std::path::Path::new(snapshot_dir).file_name()?.to_str()?;
+        let dir = std::path::Path::new("/var/tmp/rivoli");
+        std::fs::create_dir_all(dir).ok()?;
+        Some(dir.join(format!("{name}.coli_usage")).to_str()?.to_string())
+    }
+
+    /// Load a `.coli_usage` file by explicit path. Missing = empty (cold start).
+    pub fn load_from(path: &str) -> Result<Self> {
+        let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(e).with_context(|| format!("read {path}")),

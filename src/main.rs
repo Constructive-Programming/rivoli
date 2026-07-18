@@ -96,11 +96,20 @@ async fn run(cfg: Config) -> Result<()> {
         t0.elapsed().as_secs_f64()
     );
 
-    // Expert usage ranking (drives the pin). Missing file = cold start.
-    let usage = rivoli::usage::Usage::load(&cfg.snapshot)?;
+    // Expert usage ranking (drives the pin) = the snapshot's read-only seed +
+    // rivoli's own writable accumulator (its recorded routing from prior runs).
+    let mut usage = rivoli::usage::Usage::load(&cfg.snapshot)?;
+    let seed = usage.total_selections();
+    if let Some(p) = rivoli::usage::Usage::accumulator_path(&cfg.snapshot)
+        && let Ok(a) = rivoli::usage::Usage::load_from(&p)
+    {
+        usage.merge(&a);
+    }
     info!(
-        "usage: {} selections over {} (layer,expert) pairs",
+        "usage: {} selections ({} seed + {} accumulated) over {} pairs",
         usage.total_selections(),
+        seed,
+        usage.total_selections() - seed,
         usage.counts.len()
     );
 
@@ -144,20 +153,23 @@ async fn run(cfg: Config) -> Result<()> {
         );
         info!("{BENCH_PROMPT}{}", tok.decode_all(&ids)?);
 
-        // Merge this run's routing back into .coli_usage so the next pin matches
-        // the workload better (online usage accumulation — M4). BEST-EFFORT: a
-        // read-only snapshot dir just means no accumulation, never a failed run.
+        // Accumulate this run's routing into the WRITABLE accumulator (the
+        // snapshot seed is read-only) so the next pin matches the workload better.
+        // Best-effort — a failed write is never a failed run.
         let acc = engine.accumulated().clone();
-        let writeback = rivoli::usage::Usage::load(&cfg.snapshot).and_then(|mut m| {
-            m.merge(&acc);
-            m.write(&cfg.snapshot)
-        });
-        match writeback {
-            Ok(()) => info!(
-                "usage: recorded {} selections this run, merged → .coli_usage",
-                acc.total_selections()
-            ),
-            Err(e) => info!("usage: writeback skipped ({e:#})"),
+        if let Some(p) = rivoli::usage::Usage::accumulator_path(&cfg.snapshot) {
+            let writeback = rivoli::usage::Usage::load_from(&p).and_then(|mut a| {
+                a.merge(&acc);
+                a.write_to(&p)?;
+                Ok(a.total_selections())
+            });
+            match writeback {
+                Ok(total) => info!(
+                    "usage: +{} selections this run → {p} ({total} accumulated total)",
+                    acc.total_selections()
+                ),
+                Err(e) => info!("usage: writeback skipped ({e:#})"),
+            }
         }
         Ok(())
     }
