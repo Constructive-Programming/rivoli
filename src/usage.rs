@@ -13,62 +13,11 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// Record one routed-expert selection (online accumulation during decode).
-    pub fn record(&mut self, layer: u16, expert: u16) {
-        *self.counts.entry((layer, expert)).or_insert(0) += 1;
-    }
-
-    /// Add another accumulator's counts into this one (merging a run's
-    /// selections back into the on-disk history before write-back).
-    pub fn merge(&mut self, other: &Usage) {
-        for (&k, &c) in &other.counts {
-            *self.counts.entry(k).or_insert(0) += c;
-        }
-    }
-
-    /// Write `<dir>/.coli_usage` in the shared `layer expert count` text format.
-    /// Atomic: write a same-dir temp, fsync, then rename over the target — so a
-    /// crash/kill/power-loss (cf. the Jul-15 event) leaves the precious golden
-    /// file intact rather than truncated (which `load`'s lenient parser would
-    /// silently accept as wrong counts). Single-writer assumed — two concurrent
-    /// rivoli instances would contend for the GPU tier long before this races.
-    pub fn write(&self, dir: &str) -> Result<()> {
-        self.write_to(&format!("{dir}/.coli_usage"))
-    }
-
-    /// Atomic write to an explicit path (see [`Usage::write`]).
-    pub fn write_to(&self, path: &str) -> Result<()> {
-        use std::fmt::Write as _;
-        use std::io::Write as _;
-        let tmp = format!("{path}.tmp.{}", std::process::id());
-        let mut s = String::with_capacity(self.counts.len() * 12);
-        // Deterministic order so the file is stable diff-to-diff.
-        let mut rows: Vec<_> = self.counts.iter().collect();
-        rows.sort_by_key(|&(&k, _)| k);
-        for (&(l, e), &c) in rows {
-            let _ = writeln!(s, "{l} {e} {c}");
-        }
-        let mut f = std::fs::File::create(&tmp).with_context(|| format!("create {tmp}"))?;
-        f.write_all(s.as_bytes())
-            .with_context(|| format!("write {tmp}"))?;
-        f.sync_all().with_context(|| format!("fsync {tmp}"))?; // durable before rename
-        std::fs::rename(&tmp, path).with_context(|| format!("rename {tmp} -> {path}"))?;
-        Ok(())
-    }
-    /// Load `<dir>/.coli_usage` (the snapshot's read-only seed).
+    /// Load `<dir>/.coli_usage` — the primed, READ-ONLY expert-usage ranking.
+    /// Priming (accumulating routing from a representative workload) is a
+    /// deliberate offline pass; inference only reads this artifact.
     pub fn load(dir: &str) -> Result<Self> {
         Self::load_from(&format!("{dir}/.coli_usage"))
-    }
-
-    /// The user-writable accumulator path for a snapshot — where rivoli persists
-    /// its own recorded routing (the snapshot dir is typically read-only, so the
-    /// seed there stays fixed and additions live here). Env-free per the zero-knob
-    /// rule: `/var/tmp/rivoli/<snapshot-name>.coli_usage`.
-    pub fn accumulator_path(snapshot_dir: &str) -> Option<String> {
-        let name = std::path::Path::new(snapshot_dir).file_name()?.to_str()?;
-        let dir = std::path::Path::new("/var/tmp/rivoli");
-        std::fs::create_dir_all(dir).ok()?;
-        Some(dir.join(format!("{name}.coli_usage")).to_str()?.to_string())
     }
 
     /// Load a `.coli_usage` file by explicit path. Missing = empty (cold start).
@@ -110,22 +59,6 @@ impl Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn record_and_merge_accumulate() {
-        let mut a = Usage::default();
-        a.record(3, 5);
-        a.record(3, 5);
-        a.record(4, 1);
-        let mut b = Usage::default();
-        b.record(3, 5); // overlaps a
-        b.record(7, 2);
-        a.merge(&b);
-        assert_eq!(a.counts[&(3, 5)], 3); // 2 + 1
-        assert_eq!(a.counts[&(4, 1)], 1);
-        assert_eq!(a.counts[&(7, 2)], 1);
-        assert_eq!(a.total_selections(), 5);
-    }
 
     #[test]
     fn ranks_hottest_first_deterministically() {

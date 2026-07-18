@@ -66,13 +66,9 @@ pub struct GpuEngine<'a> {
     scores: Vec<f32>,
     choice: Vec<f32>,
     sel: Vec<usize>,
-    // Online usage accumulation (merged back into .coli_usage at exit) so the
-    // pin progressively matches the real workload — the M4 fix for the pin/prompt
-    // hit-rate mismatch.
-    acc: crate::usage::Usage,
     // Background page-cache warmer + the previous token's routed selection per
     // sparse layer (the predictor): at each token's start we warm the experts the
-    // last token routed to, overlapping their NVMe read with this token's compute.
+    // last token routed to, overlapping their fetch with this token's compute.
     prefetch: crate::prefetch::Prefetcher,
     last_sel: Vec<Vec<usize>>,
 }
@@ -123,7 +119,6 @@ impl<'a> GpuEngine<'a> {
             scores: vec![0.0; cfg.n_experts],
             choice: vec![0.0; cfg.n_experts],
             sel: Vec::with_capacity(cfg.top_k),
-            acc: crate::usage::Usage::default(),
             prefetch: crate::prefetch::Prefetcher::new(),
             last_sel: vec![Vec::new(); cfg.n_layers - cfg.dense_layers],
             pin,
@@ -135,10 +130,6 @@ impl<'a> GpuEngine<'a> {
     }
     pub fn misses(&self) -> u64 {
         self.pin.misses
-    }
-    /// The routing selections recorded this run (merge back into `.coli_usage`).
-    pub fn accumulated(&self) -> &crate::usage::Usage {
-        &self.acc
     }
 
     /// One forward pass for `token` at `pos`, leaving next-token logits device-
@@ -277,9 +268,6 @@ impl<'a> GpuEngine<'a> {
                 let gl = self.gate_logits.copy_out()?;
                 let bias = self.pin.moe_bias(l).to_vec();
                 self.route(&gl, &bias);
-                for &e in &self.sel {
-                    self.acc.record(l as u16, e as u16); // online usage accumulation
-                }
                 // Remember this layer's selection to prefetch next token (stable).
                 let ls = &mut self.last_sel[l - cfg.dense_layers];
                 ls.clear();

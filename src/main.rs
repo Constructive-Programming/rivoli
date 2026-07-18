@@ -96,20 +96,13 @@ async fn run(cfg: Config) -> Result<()> {
         t0.elapsed().as_secs_f64()
     );
 
-    // Expert usage ranking (drives the pin) = the snapshot's read-only seed +
-    // rivoli's own writable accumulator (its recorded routing from prior runs).
-    let mut usage = rivoli::usage::Usage::load(&cfg.snapshot)?;
-    let seed = usage.total_selections();
-    if let Some(p) = rivoli::usage::Usage::accumulator_path(&cfg.snapshot)
-        && let Ok(a) = rivoli::usage::Usage::load_from(&p)
-    {
-        usage.merge(&a);
-    }
+    // Expert usage ranking (drives the pin) — a primed, READ-ONLY profiling
+    // artifact (colibri's .coli_usage). Priming is a deliberate offline pass, not
+    // a side effect of inference; the decode path never writes it.
+    let usage = rivoli::usage::Usage::load(&cfg.snapshot)?;
     info!(
-        "usage: {} selections ({} seed + {} accumulated) over {} pairs",
+        "usage: {} selections over {} (layer,expert) pairs",
         usage.total_selections(),
-        seed,
-        usage.total_selections() - seed,
         usage.counts.len()
     );
 
@@ -152,25 +145,6 @@ async fn run(cfg: Config) -> Result<()> {
             100.0 * hits as f64 / (hits + misses).max(1) as f64,
         );
         info!("{BENCH_PROMPT}{}", tok.decode_all(&ids)?);
-
-        // Accumulate this run's routing into the WRITABLE accumulator (the
-        // snapshot seed is read-only) so the next pin matches the workload better.
-        // Best-effort — a failed write is never a failed run.
-        let acc = engine.accumulated().clone();
-        if let Some(p) = rivoli::usage::Usage::accumulator_path(&cfg.snapshot) {
-            let writeback = rivoli::usage::Usage::load_from(&p).and_then(|mut a| {
-                a.merge(&acc);
-                a.write_to(&p)?;
-                Ok(a.total_selections())
-            });
-            match writeback {
-                Ok(total) => info!(
-                    "usage: +{} selections this run → {p} ({total} accumulated total)",
-                    acc.total_selections()
-                ),
-                Err(e) => info!("usage: writeback skipped ({e:#})"),
-            }
-        }
         Ok(())
     }
 
