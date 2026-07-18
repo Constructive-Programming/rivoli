@@ -60,6 +60,31 @@ unsafe extern "C" {
     fn rivoli_rope(base: *mut f32, count: i32, stride: i32, seg: i32, pos: i32, theta: f64) -> i32;
 
     #[allow(clippy::too_many_arguments)]
+    fn rivoli_mla_absorb(
+        q: *const f32,
+        kvb_packed: *const u8,
+        kvb_scale: *const f32,
+        h: i32,
+        qh: i32,
+        nope: i32,
+        vh: i32,
+        kvl: i32,
+        qabs: *mut f32,
+    ) -> i32;
+
+    #[allow(clippy::too_many_arguments)]
+    fn rivoli_mla_value(
+        clat: *const f32,
+        kvb_packed: *const u8,
+        kvb_scale: *const f32,
+        h: i32,
+        nope: i32,
+        vh: i32,
+        kvl: i32,
+        ctx: *mut f32,
+    ) -> i32;
+
+    #[allow(clippy::too_many_arguments)]
     fn rivoli_mla_attend(
         qabs: *const f32,
         qrope: *const f32,
@@ -325,6 +350,105 @@ pub unsafe fn launch_rope(
     if r != 0 {
         let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
         bail!("launch_rope failed ({kind}, code {r})");
+    }
+    Ok(())
+}
+
+/// Launch the MLA absorb: `qabs[head][i] = Σ_d q[head·qh+d]·kv_b[rbase+d][i]·
+/// scale[rbase+d]` (rbase = head·(nope+vh)), folding each head's q_nope through
+/// kv_b's `nope` rows into `H·kvl` latent-space queries. Device pointers,
+/// launch-only.
+///
+/// # Safety
+/// Async — `q` (`H·qh` f32), `kvb_packed`/`kvb_scale` (kv_b int4: `H·(nope+vh)`
+/// rows × `⌈kvl/2⌉` bytes / `H·(nope+vh)` f32), `qabs` (`H·kvl` f32) must be
+/// valid device pointers live until the next [`device_sync`] returns.
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_mla_absorb(
+    q: *const f32,
+    kvb_packed: *const u8,
+    kvb_scale: *const f32,
+    h: usize,
+    qh: usize,
+    nope: usize,
+    vh: usize,
+    kvl: usize,
+    qabs: *mut f32,
+) -> Result<()> {
+    anyhow::ensure!(
+        h <= i32::MAX as usize
+            && qh <= i32::MAX as usize
+            && nope <= i32::MAX as usize
+            && vh <= i32::MAX as usize
+            && kvl <= i32::MAX as usize,
+        "mla_absorb dims exceed i32"
+    );
+    // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
+    let r = unsafe {
+        rivoli_mla_absorb(
+            q,
+            kvb_packed,
+            kvb_scale,
+            h as i32,
+            qh as i32,
+            nope as i32,
+            vh as i32,
+            kvl as i32,
+            qabs,
+        )
+    };
+    if r != 0 {
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("launch_mla_absorb failed ({kind}, code {r})");
+    }
+    Ok(())
+}
+
+/// Launch the MLA value projection: `ctx[head][j] = scale[rbase+nope+j]·Σ_i
+/// clat[head][i]·kv_b[rbase+nope+j][i]`, projecting each head's attention-
+/// weighted latent through kv_b's `vh` value rows to `H·vh`. Device pointers,
+/// launch-only.
+///
+/// # Safety
+/// Async — `clat` (`H·kvl` f32), `kvb_packed`/`kvb_scale` (as in
+/// [`launch_mla_absorb`]), `ctx` (`H·vh` f32) must be valid device pointers live
+/// until the next [`device_sync`] returns.
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_mla_value(
+    clat: *const f32,
+    kvb_packed: *const u8,
+    kvb_scale: *const f32,
+    h: usize,
+    nope: usize,
+    vh: usize,
+    kvl: usize,
+    ctx: *mut f32,
+) -> Result<()> {
+    anyhow::ensure!(
+        h <= i32::MAX as usize
+            && nope <= i32::MAX as usize
+            && vh <= i32::MAX as usize
+            && kvl <= i32::MAX as usize,
+        "mla_value dims exceed i32"
+    );
+    // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
+    let r = unsafe {
+        rivoli_mla_value(
+            clat,
+            kvb_packed,
+            kvb_scale,
+            h as i32,
+            nope as i32,
+            vh as i32,
+            kvl as i32,
+            ctx,
+        )
+    };
+    if r != 0 {
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("launch_mla_value failed ({kind}, code {r})");
     }
     Ok(())
 }

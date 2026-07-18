@@ -11,11 +11,11 @@
 
 use rivoli::device::{DeviceBuf, DeviceTier};
 use rivoli::hip::{
-    ExpertDesc, device_sync, launch_attend, launch_gemv_i4, launch_gemv_i8, launch_moe,
-    launch_rmsnorm, launch_rope,
+    ExpertDesc, device_sync, launch_attend, launch_gemv_i4, launch_gemv_i8, launch_mla_absorb,
+    launch_mla_value, launch_moe, launch_rmsnorm, launch_rope,
 };
 use rivoli::math::{bf16_to_f32, f32_to_bf16, silu, softmax};
-use rivoli::quant::{matvec_i4, matvec_i8, row_bytes};
+use rivoli::quant::{addrow, matvec_i4, matvec_i4_rows, matvec_i8, row_bytes};
 use rivoli::snapshot::{Int4Matrix, Int8Matrix};
 
 /// Little-endian bytes of an f32 slice (device is LE, matching this host).
@@ -467,6 +467,86 @@ fn gemv_i8_matches_scalar() {
         &want,
         &f32_vec(&y_buf.copy_out().expect("copy out")),
         "gemv_i8",
+    );
+}
+
+#[test]
+fn mla_absorb_and_value_match_scalar() {
+    // MLA-ish dims: kv_b [H*(nope+vh), kvl]; q [H*qh]; clat [H*kvl].
+    let (h, qh, nope, vh, kvl) = (8usize, 192usize, 128usize, 128usize, 512usize);
+    let mut rng = Lcg(0x3c0f_fee5);
+    let kvb = gen_mat(&mut rng, h * (nope + vh), kvl);
+    let q: Vec<f32> = (0..h * qh).map(|_| rng.f()).collect();
+    let clat: Vec<f32> = (0..h * kvl).map(|_| rng.f()).collect();
+    let kvb_m = Int4Matrix {
+        packed: &kvb.packed,
+        scale: &kvb.scale_bytes,
+        o_dim: h * (nope + vh),
+        i_dim: kvl,
+    };
+
+    // Scalar oracle: absorb via addrow, value via matvec_i4_rows (attn.rs core).
+    let mut qabs_ref = vec![0.0f32; h * kvl];
+    let mut ctx_ref = vec![0.0f32; h * vh];
+    for head in 0..h {
+        let rbase = head * (nope + vh);
+        let qnope = &q[head * qh..head * qh + nope];
+        let seg = &mut qabs_ref[head * kvl..(head + 1) * kvl];
+        for (d, &qd) in qnope.iter().enumerate() {
+            addrow(&kvb_m, rbase + d, qd, seg);
+        }
+        matvec_i4_rows(
+            &mut ctx_ref[head * vh..(head + 1) * vh],
+            &clat[head * kvl..(head + 1) * kvl],
+            &kvb_m,
+            rbase + nope,
+        );
+    }
+
+    let mut tier = DeviceTier::new(64 << 20).expect("alloc tier");
+    let kp = tier.place(&kvb.packed).expect("place kv_b packed");
+    let ks = tier.place(&kvb.scale_bytes).expect("place kv_b scale") as *const f32;
+    let q_buf = DeviceBuf::from_bytes(&f32_bytes(&q)).expect("place q");
+    let clat_buf = DeviceBuf::from_bytes(&f32_bytes(&clat)).expect("place clat");
+    let mut qabs_buf = DeviceBuf::zeroed(h * kvl * 4).expect("alloc qabs");
+    let mut ctx_buf = DeviceBuf::zeroed(h * vh * 4).expect("alloc ctx");
+
+    // SAFETY: device pointers valid for the dims; outputs outlive the sync.
+    unsafe {
+        launch_mla_absorb(
+            q_buf.ptr() as *const f32,
+            kp,
+            ks,
+            h,
+            qh,
+            nope,
+            vh,
+            kvl,
+            qabs_buf.ptr_mut() as *mut f32,
+        )
+        .expect("launch absorb");
+        launch_mla_value(
+            clat_buf.ptr() as *const f32,
+            kp,
+            ks,
+            h,
+            nope,
+            vh,
+            kvl,
+            ctx_buf.ptr_mut() as *mut f32,
+        )
+        .expect("launch value");
+    }
+    device_sync().expect("device sync");
+    assert_close(
+        &qabs_ref,
+        &f32_vec(&qabs_buf.copy_out().expect("copy qabs")),
+        "mla_absorb",
+    );
+    assert_close(
+        &ctx_ref,
+        &f32_vec(&ctx_buf.copy_out().expect("copy ctx")),
+        "mla_value",
     );
 }
 
