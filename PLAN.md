@@ -391,6 +391,39 @@ pool** (`hipHostMalloc` on the cold-fetch slots), NOT the resident pin:
   drives 1339 ms warm+fetch. If the MTYPE_NC path can be forced, the tax may
   largely vanish and A3 gets stronger.
 
+- **CORRECTION + REVIEW OUTCOME (2026-07-18) — supersedes the "~2× experts fit"
+  claims above (lines ~284, ~329, ~384) and the "resident-tier VMM is the payoff"
+  bullet.** Two errors, now fixed:
+  1. **"VMM resident pin → ~2× experts fit" is WRONG — double-counting.** The
+     resident tier is ALREADY single-copy: it's a device-local `hipMalloc` slab and
+     we already `madvise(MADV_DONTNEED)` the mmap page-cache dup after each H2D
+     (commit 5b2212b). Steady state = 1× device-local. VMM device-local is the SAME
+     bytes in the SAME domain → same RAM, same 220 GB/s read. So converting the
+     resident tier to VMM is **perf-neutral** (no RAM saving, no bandwidth gain),
+     not a 2×-experts payoff. The "~500 ms potential" above assumed a RAM halving
+     that madvise already banked.
+  2. **VMM delivers NO unique net perf win in the current architecture.** Cold pool
+     = rewrite-per-miss → can't use VMM's device bandwidth (112 GB/s interleaved);
+     its ~2% wall win is the fill offset, which a plain coherent `hipHostMalloc`
+     buffer gives too. Resident pin = already device-local → VMM redundant. So
+     VMM's unique property (device-BW + host-fill) isn't load-bearing anywhere here.
+  - **DECISION — resident-tier VMM conversion: NOT doing it.** Only upside is ~10
+     fewer lines + unifying the two fill paths (H2D placement + host-memcpy cold)
+     onto one — a modest code dedup, perf-neutral, on the hot core allocator. Not
+     worth the churn/re-test. (Ponytail review independently: don't unify
+     VmmBuf/DeviceBuf into a trait/enum either — the load-bearing methods diverge.)
+  - **DECISION — cold-pool VmmBuf: keep as-is (marginal net win, primitive built,
+     correct/coherent), but CONDITIONAL.** It's the "wrong tier" for VMM; if we ever
+     want to simplify, revert it to a coherent `hipHostMalloc` buffer (same fill
+     offset, less machinery) and drop `VmmBuf`/`vmm.hip` as YAGNI. Trigger: if no
+     write-once VMM consumer ever lands.
+  - **REVIEWS (both clean).** Correctness: no blockers/bugs — cross-slot reuse
+     protected by the per-layer `device_sync`, `VmmBuf` `!Send`/drop-once-safe,
+     decode byte-identical; only asked to document the CPU→GPU ordering source (done,
+     commit 863eb48). Ponytail: already lean — one path-ref fix (done), everything
+     else endorsed minimal. VMM stays a validated, documented primitive + the
+     hip-apu-memory.md findings; its lasting value is the KNOWLEDGE, not a tok/s win.
+
 **(3) priming — DEFERRED indefinitely; we TRUST colibri's priming.** The shipped
 `.coli_usage` IS colibri's priming artifact, and routing was verified correct
 against it (0.2 % absent, 0 misses below cutoff). Re-running our own

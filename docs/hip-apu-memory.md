@@ -106,16 +106,26 @@ coherence traffic halves the read (220→112 GB/s). So:
   via the fill offset (host memcpy 364 vs H2D 447 ms `fetch`) → wall 2086 vs 2136.
   That's why the cold pool now uses `VmmBuf` — fill-dominated net win, not a read
   win.
-- **Resident pin (A3)**: filled ONCE at build, read every token for the whole run
-  = the write-once-read-many pattern = the 220 GB/s device path. **This is where
-  VMM pays off**: single host copy (drop the mmap page-cache duplicate AND the
-  device-tier `hipMalloc` slab — no double-store), device bandwidth (no ~9% tax),
-  and ~2× experts fit the same RAM. The microbench + interleave test de-risk it;
-  the resident-tier VMM conversion is the concrete A3 build.
+- **Resident pin**: filled ONCE at build, read every token = write-once-read-many
+  = the 220 GB/s path. VMM *would* work here — but it turns out to be
+  **perf-neutral**, because the resident tier is ALREADY device-local and
+  single-copy: it's a `hipMalloc` slab, and we already `madvise(MADV_DONTNEED)` the
+  mmap page-cache dup after each H2D (commit 5b2212b). Steady state = 1× device.
+  VMM device-local is the same bytes in the same domain → same RAM, same bandwidth.
+  So the earlier "single copy → ~2× experts fit" idea was **double-counting the
+  duplicate madvise already reclaims** — there is no RAM to recover and no read
+  tax to remove on the resident tier. A VMM resident tier would only *unify the
+  fill path* (host-memcpy instead of H2D) for ~10 fewer lines — a code nicety, not
+  a speedup; not worth churning the core allocator. Decision: not doing it.
 
 Net: my "you can't have single-copy AND device bandwidth from host memory" was
 true for `hipHostMalloc` but FALSE in general — VMM crosses the domain boundary.
-The constraint that remains is the access *pattern* (write-once), not the API.
+BUT: in rivoli's architecture VMM yields no *unique* net perf win — the resident
+tier is already device-local (VMM redundant) and the cold pool can't use VMM's
+bandwidth (rewrite-per-miss → 112 GB/s) so its ~2% win is just the fill offset a
+coherent buffer also gives. The VMM work's lasting value is the **knowledge**
+(this doc + the probe), not tok/s. `device::VmmBuf` stays as a validated primitive;
+the cold-pool use is conditional (revert to a coherent buffer if we ever simplify).
 
 ## Epistemic note
 
