@@ -17,6 +17,7 @@
 //! `rocm`-only: without a device there is nothing to pin.
 #![cfg(feature = "rocm")]
 
+use crate::cache;
 use crate::device::{DeviceTier, VmmBuf, mem_info};
 use crate::model::ModelConfig;
 use crate::snapshot::Snapshot;
@@ -94,9 +95,9 @@ pub struct Pin<'a> {
     /// strides are re-derived from `cfg` via [`slot_geom`]).
     lru_pool: VmmBuf,
     expert_slot: usize,
-    /// Adaptive routed tier: (layer,expert) -> slot, LRU-evicted. Replaces the
-    /// static frequency pin — online priming that keeps this run's hot experts.
-    lru: Lru,
+    /// Adaptive routed tier: (layer,expert) -> slot, policy-evicted (`--cache-policy`).
+    /// Online priming that keeps this run's hot experts resident.
+    pool: Pool,
     /// io_uring O_DIRECT reader — a layer's cold misses submit as one queue-depth
     /// batch straight into their LRU slots (folds the old mmap-warm + memcpy).
     stream: Streamer,
@@ -230,76 +231,93 @@ fn expert_key(layer: usize, expert: usize) -> u32 {
     ((layer as u32) << 16) | expert as u32
 }
 
-/// The routed-expert LRU: maps `(layer,expert)` keys to pool slot indices, evicting
-/// the least-recently-used when full. Exact LRU via a tick clock + a BTreeMap
-/// ordering (O(log N) touch/evict — trivial next to the ~19 MB NVMe read a miss
-/// triggers). `off[slot]` caches each resident expert's 6 sub-block offsets.
-struct Lru {
+/// The routed-expert pool: maps `(layer,expert)` keys to slab slot indices, with
+/// eviction delegated to a pluggable `cache::Cache` policy (`--cache-policy`
+/// lru|2q|arc). The policy owns residency + eviction order; the pool owns the
+/// key↔slot maps and `off` (each resident expert's 6 sub-block offsets). On a miss
+/// the policy names the evicted key (if any) and the pool reuses that key's slot —
+/// `slot_of` stays in lockstep with the policy's residency (debug-asserted).
+struct Pool {
+    policy: Box<dyn cache::Cache>,
     slot_of: std::collections::HashMap<u32, usize>,
     key_of: Vec<Option<u32>>,
     off: Vec<[usize; 6]>, // [gate_p, gate_s, up_p, up_s, down_p, down_s]
-    order: std::collections::BTreeMap<u64, usize>, // tick -> slot (front = LRU)
-    at: Vec<u64>,         // slot -> its current tick
-    clock: u64,
     free: Vec<usize>,
 }
 
-impl Lru {
-    fn new(n: usize) -> Self {
-        Self {
+impl Pool {
+    fn new(n: usize, policy: &str) -> Result<Self> {
+        Ok(Self {
+            policy: cache::make(policy, n)
+                .with_context(|| format!("unknown --cache-policy {policy:?} (lru|2q|arc)"))?,
             slot_of: std::collections::HashMap::with_capacity(n),
             key_of: vec![None; n],
             off: vec![[0; 6]; n],
-            order: std::collections::BTreeMap::new(),
-            at: vec![0; n],
-            clock: 0,
             free: (0..n).rev().collect(), // pop() hands out 0,1,2,...
+        })
+    }
+
+    /// Resident slot for `key` (a hit, promoted by the policy), or `None` (a miss).
+    fn get(&mut self, key: u32) -> Option<usize> {
+        if self.policy.get(key) {
+            let slot = self.slot_of[&key];
+            // The slot must actually hold THIS key's streamed data (else a hit reads
+            // a different expert's weights — stale-data corruption).
+            debug_assert_eq!(self.key_of[slot], Some(key), "hit slot holds wrong key");
+            Some(slot)
+        } else {
+            None
         }
     }
 
-    /// Mark `slot` most-recently-used.
-    fn touch(&mut self, slot: usize) {
-        self.order.remove(&self.at[slot]);
-        self.clock += 1;
-        self.at[slot] = self.clock;
-        self.order.insert(self.clock, slot);
-    }
-
-    /// Resident slot for `key`, touched — or `None` (miss).
-    fn get(&mut self, key: u32) -> Option<usize> {
-        let slot = *self.slot_of.get(&key)?;
-        self.touch(slot);
-        Some(slot)
-    }
-
-    /// Allocate a slot for a NEW `key` (miss): a free slot, else evict the LRU. The
-    /// caller then fills the slot's buffers and sets `off[slot]`.
+    /// Allocate a slot for a NEW `key` (miss): reuse the policy-evicted key's slot,
+    /// else a free slot. The caller then fills the slot and sets `off[slot]`.
     fn alloc(&mut self, key: u32) -> Result<usize> {
-        let slot = if let Some(s) = self.free.pop() {
-            s
-        } else {
-            // Full pool → evict the front of `order` (least-recently-used). Non-empty
-            // by construction (n_slots ≥ top_k ≥ 1), but fail loud rather than panic.
-            let (&t, &victim) = self
-                .order
-                .iter()
-                .next()
-                .context("LRU eviction on an empty ordering (n_slots == 0?)")?;
-            self.order.remove(&t);
-            if let Some(old) = self.key_of[victim] {
-                self.slot_of.remove(&old);
+        let evicted = self.policy.insert(key);
+        let slot = self.reuse(evicted)?;
+        self.bind(key, slot);
+        Ok(slot)
+    }
+
+    /// Map a policy eviction (or spare capacity) to a concrete slab slot.
+    fn reuse(&mut self, evicted: Option<u32>) -> Result<usize> {
+        match evicted {
+            Some(ev) => {
+                // The evicted key must no longer be resident in the policy, else two
+                // keys would share a slot (stale-data corruption).
+                debug_assert!(
+                    !self.policy.contains(ev),
+                    "evicted key {ev} still resident (identity drift)"
+                );
+                self.slot_of
+                    .remove(&ev)
+                    .context("evicted key had no slot (pool/policy drift)")
             }
-            victim
-        };
+            None => self
+                .free
+                .pop()
+                .context("no free slot and policy evicted nothing"),
+        }
+    }
+
+    fn bind(&mut self, key: u32, slot: usize) {
         self.key_of[slot] = Some(key);
         self.slot_of.insert(key, slot);
-        self.touch(slot);
-        Ok(slot)
+        // The just-inserted key must be resident, and slot_of must mirror residency.
+        debug_assert!(self.policy.contains(key), "inserted key {key} not resident");
+        debug_assert_eq!(
+            self.slot_of.len(),
+            self.policy.resident_len(),
+            "pool/policy residency drift"
+        );
     }
 }
 
 impl<'a> Pin<'a> {
     /// Build the resident set. `capacity` is the tier size (auto-discovered).
+    // Each arg is a distinct, independent input (snapshot/model/usage + four
+    // runtime knobs); bundling them into a struct used at one call site is churn.
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         snap: &'a Snapshot,
         cfg: &'a ModelConfig,
@@ -308,6 +326,7 @@ impl<'a> Pin<'a> {
         pre_seed: bool,
         bounce: bool,
         trace_path: Option<&str>,
+        cache_policy: &str,
     ) -> Result<Self> {
         let (free, _total) = mem_info()?;
         ensure!(
@@ -408,11 +427,11 @@ impl<'a> Pin<'a> {
         let n_slots = (budget / expert_slot).max(cfg.top_k);
         let mut lru_pool = VmmBuf::new(n_slots * expert_slot)?; // ONE slab
         tracing::info!(
-            "routed LRU: {n_slots} slots ({:.1} GiB) + {:.1} GiB always-resident",
+            "routed pool [{cache_policy}]: {n_slots} slots ({:.1} GiB) + {:.1} GiB always-resident",
             (n_slots * expert_slot) as f64 / (1u64 << 30) as f64,
             tier.used() as f64 / (1u64 << 30) as f64,
         );
-        let mut lru = Lru::new(n_slots);
+        let mut pool = Pool::new(n_slots, cache_policy)?;
         // Ring sized for one layer's worst case: top_k misses x 3 proj x 2 tensors.
         let ring = (cfg.top_k * 6).next_power_of_two() * 2;
         // Bounce span = largest single projection superset (gate/up packed =
@@ -427,7 +446,7 @@ impl<'a> Pin<'a> {
         // OFF by default — enable it only for slow disks. Bounded by the pool size;
         // drained in queue-depth batches.
         if pre_seed {
-            let pool = lru_pool.ptr_mut();
+            let slab = lru_pool.ptr_mut();
             let batch = (ring / 6).max(1); // experts per drain (6 reads each)
             let mut n = 0usize;
             for &((l, e), _) in usage.ranked().iter() {
@@ -438,9 +457,9 @@ impl<'a> Pin<'a> {
                 if l < cfg.dense_layers || l >= cfg.n_layers || e >= cfg.n_experts {
                     continue; // stale ranking entry
                 }
-                let slot = lru.alloc(expert_key(l, e))?;
+                let slot = pool.alloc(expert_key(l, e))?;
                 let base = format!("model.layers.{l}.mlp.experts.{e}");
-                lru.off[slot] = stream_expert(&mut stream, snap, cfg, pool, slot, &base)?;
+                pool.off[slot] = stream_expert(&mut stream, snap, cfg, slab, slot, &base)?;
                 n += 1;
                 if n.is_multiple_of(batch) {
                     stream.drain()?;
@@ -461,7 +480,7 @@ impl<'a> Pin<'a> {
             moe_bias,
             lru_pool,
             expert_slot,
-            lru,
+            pool,
             stream,
             hits: 0,
             misses: 0,
@@ -507,7 +526,7 @@ impl<'a> Pin<'a> {
         // slot still to be filled in phase 1b.
         let mut slots: Vec<Option<usize>> = Vec::with_capacity(sel.len());
         for &e in sel {
-            match self.lru.get(expert_key(layer, e)) {
+            match self.pool.get(expert_key(layer, e)) {
                 Some(slot) => {
                     self.hits += 1;
                     slots.push(Some(slot));
@@ -521,12 +540,12 @@ impl<'a> Pin<'a> {
                 continue;
             }
             self.misses += 1;
-            let slot = self.lru.alloc(expert_key(layer, e))?;
+            let slot = self.pool.alloc(expert_key(layer, e))?;
             let base = format!("model.layers.{layer}.mlp.experts.{e}");
             // ptr_mut() yields a raw ptr, so no borrow of lru_pool is held across
             // the &mut self.stream reads.
-            let pool = self.lru_pool.ptr_mut();
-            self.lru.off[slot] = stream_expert(&mut self.stream, snap, cfg, pool, slot, &base)?;
+            let slab = self.lru_pool.ptr_mut();
+            self.pool.off[slot] = stream_expert(&mut self.stream, snap, cfg, slab, slot, &base)?;
             slots[i] = Some(slot);
         }
         // Phase 2: ONE join for the whole layer's cold reads.
@@ -535,16 +554,16 @@ impl<'a> Pin<'a> {
         // gate/up are [moe_inter, hidden]; down is [hidden, moe_inter].
         let (gate_o, gate_i) = (cfg.moe_inter, cfg.hidden);
         let (down_o, down_i) = (cfg.hidden, cfg.moe_inter);
-        let pool = self.lru_pool.ptr();
+        let slab = self.lru_pool.ptr();
         let es = self.expert_slot;
         let mut out = Vec::with_capacity(sel.len());
         for &slot in &slots {
             // Every entry was filled in phase 1a/1b; a `None` here is an internal
             // invariant break, not a data condition — fail loud rather than panic.
             let slot = slot.context("resolve_layer: unresolved expert slot")?;
-            let o = self.lru.off[slot];
+            let o = self.pool.off[slot];
             // SAFETY: slot base within the slab; reads that filled it have joined.
-            let b = unsafe { pool.add(slot * es) };
+            let b = unsafe { slab.add(slot * es) };
             let w = |poff: usize, soff: usize, o_dim: usize, i_dim: usize| Weight {
                 packed: unsafe { b.add(poff) },
                 scale: unsafe { b.add(soff) } as *const f32,

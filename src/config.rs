@@ -38,6 +38,10 @@ pub struct Config {
     /// Override the fixed bench prompt (`--prompt`), for capturing routing traces of
     /// diverse, request-like inputs. None = the default "The sky is blue because".
     pub prompt: Option<String>,
+    /// Routed-expert eviction policy (`--cache-policy` lru|2q|arc). Default "lru".
+    /// 2Q/ARC add scan resistance that matters once prefetch injects a
+    /// misprediction stream; without prefetch they measure ≈ LRU.
+    pub cache_policy: String,
     /// Total budget for expert residency (pin + slab pool), bytes:
     /// MemAvailable − OS_RESERVE − engine overhead (refined at snapshot load).
     pub mem_budget: u64,
@@ -92,6 +96,7 @@ impl Config {
         direct_vmm_dma: bool,
         trace: Option<String>,
         prompt: Option<String>,
+        cache_policy: String,
     ) -> Result<Self> {
         let avail = mem_available()?;
         if avail <= OS_RESERVE {
@@ -120,6 +125,7 @@ impl Config {
             direct_vmm_dma,
             trace,
             prompt,
+            cache_policy,
             mem_budget: avail - OS_RESERVE,
             gtt_free: gtt_total.saturating_sub(gtt_used),
             threads,
@@ -132,11 +138,12 @@ impl fmt::Display for Config {
         const GIB: f64 = (1u64 << 30) as f64;
         write!(
             f,
-            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} trace={:?} prompt={:?} mem_budget={:.1}GiB gtt_free={:.1}GiB os_reserve={:.0}GiB threads={}",
+            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} cache_policy={} trace={:?} prompt={:?} mem_budget={:.1}GiB gtt_free={:.1}GiB os_reserve={:.0}GiB threads={}",
             self.snapshot,
             self.bench,
             self.pre_seed,
             self.direct_vmm_dma,
+            self.cache_policy,
             self.trace,
             self.prompt,
             self.mem_budget as f64 / GIB,

@@ -21,11 +21,12 @@ struct Args {
     direct_vmm_dma: bool,
     trace: Option<String>,
     prompt: Option<String>,
+    cache_policy: String,
 }
 
 fn parse_args() -> Result<Args> {
     const USAGE: &str = "usage: rivoli <snapshot-dir> [-bench <tokens>] [--pre-seed] \
-         [--direct-vmm-dma] [--trace <path>] [--prompt <text>]";
+         [--direct-vmm-dma] [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc]";
     let mut snapshot = None;
     let mut a = Args {
         snapshot: String::new(),
@@ -34,6 +35,7 @@ fn parse_args() -> Result<Args> {
         direct_vmm_dma: false,
         trace: None,
         prompt: None,
+        cache_policy: "lru".to_string(),
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -46,6 +48,9 @@ fn parse_args() -> Result<Args> {
             "--direct-vmm-dma" => a.direct_vmm_dma = true,
             "--trace" => a.trace = Some(args.next().context("--trace requires a path")?),
             "--prompt" => a.prompt = Some(args.next().context("--prompt requires text")?),
+            "--cache-policy" => {
+                a.cache_policy = args.next().context("--cache-policy requires lru|2q|arc")?;
+            }
             _ if snapshot.is_none() => snapshot = Some(arg),
             _ => bail!("unexpected argument: {arg}\n{USAGE}"),
         }
@@ -69,6 +74,7 @@ fn main() -> Result<()> {
         a.direct_vmm_dma,
         a.trace,
         a.prompt,
+        a.cache_policy,
     )?;
 
     // Rule 1: the full discovered config is the first line of every run.
@@ -175,6 +181,7 @@ async fn run(cfg: Config) -> Result<()> {
             cfg.pre_seed,
             !cfg.direct_vmm_dma,
             cfg.trace.as_deref(),
+            &cfg.cache_policy,
         )?;
         info!("pin built in {:.1}s", t.elapsed().as_secs_f64());
         let max_ctx = prompt_ids.len() + ngen + 1;

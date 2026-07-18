@@ -1,27 +1,33 @@
-//! Cache-policy simulator for the routed-expert pool. Pure key-only replay: given
-//! the deterministic `(layer,expert)` access trace (one batch per MoE layer, the
-//! same keys `resolve_layer` looks up), it computes the hit rate under LRU, 2Q, or
-//! ARC at a chosen slot count — decoupled from the GPU, so policies A/B in
-//! milliseconds instead of ~90s decode runs. The live pin keeps its own recency
-//! LRU; this module proves a policy (and its usage seed) before wiring the winner.
+//! Routed-expert cache policies — LRU, 2Q, ARC — usable BOTH offline (key-only
+//! hit-rate replay, `simulate`) and LIVE (the pin delegates eviction here while it
+//! owns the slot data). Decode is hit-rate-bound and, once prefetch lands, the
+//! misprediction stream is a scan the policy must resist — so the policy is a
+//! runtime choice (`--cache-policy`).
 //!
-//! Why bother: decode is now hit-rate-bound (tok/s tracks hit%), and a plain
-//! recency LRU has no scan resistance — a token's cold-tail experts evict the
-//! recurring hot set. 2Q and ARC protect a frequency segment. Complexity gradient:
-//! LRU (recency only) < 2Q (frequency, fixed split) < ARC (frequency, adaptive
-//! split + ghosts). ARC fits unusually well here: the value is ~18 MB but the key
-//! is 4 bytes, so ghost history is nearly free and can far exceed the cache.
+//! Live contract: the pin maps `key -> slot`; the policy owns residency + eviction
+//! order. `insert`/`insert_cold` return the RESIDENT key they evicted (if any) so
+//! the pin reuses that key's slot; `None` means spare capacity (the pin pops a free
+//! slot). `insert_cold` parks a PREFETCHED key at the cold/probation end so an
+//! unused prediction is evicted first and never pollutes the hot set. The pin's
+//! `slot_of` keys stay in lockstep with `resident_len()` (a debug-asserted
+//! invariant).
+//!
+//! Complexity gradient: LRU (recency) < 2Q (frequency, fixed split) < ARC
+//! (frequency, adaptive split + ghosts). ARC fits well here: value ~18 MB, key 4
+//! bytes, so ghost history is nearly free.
 
 use std::collections::{BTreeMap, HashMap};
 
 /// Recency-ordered set of keys: O(log n) MRU-insert / arbitrary-remove / pop-LRU
-/// via a monotonic tick clock + a `BTreeMap` whose front is the LRU end. FIFO
-/// lists use `push` (as MRU) + `pop_lru` (oldest) and never re-touch on hit.
+/// via a monotonic tick clock + a `BTreeMap` whose front is the LRU end. Cold
+/// inserts use a separate DECREASING clock so they sort below every normal key
+/// (evicted first); a later `touch` promotes them with a normal ascending tick.
 #[derive(Default)]
 struct OrderedSet {
-    at: HashMap<u32, u64>,
-    order: BTreeMap<u64, u32>,
-    clock: u64,
+    at: HashMap<u32, i64>,
+    order: BTreeMap<i64, u32>,
+    clock: i64,      // ascending: normal MRU inserts
+    cold_clock: i64, // descending from 0: cold-end inserts sort below all normals
 }
 
 impl OrderedSet {
@@ -31,14 +37,24 @@ impl OrderedSet {
     fn len(&self) -> usize {
         self.at.len()
     }
-    /// Insert `k`, or move it to the MRU end if already present.
-    fn touch(&mut self, k: u32) {
+    fn stamp(&mut self, k: u32, tick: i64) {
         if let Some(&t) = self.at.get(&k) {
             self.order.remove(&t);
         }
+        self.at.insert(k, tick);
+        self.order.insert(tick, k);
+    }
+    /// Insert `k`, or move it to the MRU end if already present.
+    fn touch(&mut self, k: u32) {
         self.clock += 1;
-        self.at.insert(k, self.clock);
-        self.order.insert(self.clock, k);
+        let t = self.clock;
+        self.stamp(k, t);
+    }
+    /// Insert `k` at the LRU/cold end (evicted before any normal entry).
+    fn touch_cold(&mut self, k: u32) {
+        self.cold_clock -= 1;
+        let t = self.cold_clock;
+        self.stamp(k, t);
     }
     fn remove(&mut self, k: u32) -> bool {
         if let Some(t) = self.at.remove(&k) {
@@ -56,15 +72,21 @@ impl OrderedSet {
     }
 }
 
-/// A replayable cache policy. `probe` reports a hit and promotes on hit (no
-/// residency change on a miss); `load` admits a known-miss key (evicting/adapting
-/// as the policy dictates). `access_batch` runs one layer's keys two-pass —
-/// hits first, then misses — mirroring `resolve_layer` (a miss can't evict a
-/// same-batch hit). `seed` pre-fills the policy's protected/frequency segment.
+/// A routed-expert cache policy. `get` reports a hit and promotes on hit;
+/// `insert` admits a known-miss key and returns the RESIDENT key it evicted (for
+/// the pin to reuse that slot), or `None` if spare capacity absorbed it.
+/// `insert_cold` is the same but parks the key cold (for prefetch). `access_batch`
+/// runs one layer's keys two-pass (hits first, then misses), mirroring
+/// `resolve_layer`. `seed` pre-fills the protected/frequency segment.
 pub trait Cache {
-    fn probe(&mut self, k: u32) -> bool;
-    fn load(&mut self, k: u32);
+    fn contains(&self, k: u32) -> bool;
+    fn get(&mut self, k: u32) -> bool;
+    fn insert(&mut self, k: u32) -> Option<u32>;
+    fn insert_cold(&mut self, k: u32) -> Option<u32> {
+        self.insert(k)
+    }
     fn seed(&mut self, keys: &[u32]);
+    fn resident_len(&self) -> usize;
 
     fn access_batch(&mut self, keys: &[u32]) -> usize {
         // top_k is small (≤8 + shared); a fixed miss scratch avoids an alloc.
@@ -72,7 +94,7 @@ pub trait Cache {
         let mut nm = 0;
         let mut hits = 0;
         for &k in keys {
-            if self.probe(k) {
+            if self.get(k) {
                 hits += 1;
             } else if nm < miss.len() {
                 miss[nm] = k;
@@ -80,14 +102,14 @@ pub trait Cache {
             }
         }
         for &k in &miss[..nm] {
-            self.load(k);
+            self.insert(k);
         }
         hits
     }
 }
 
 // ---------------------------------------------------------------------------
-// LRU — pure recency (mirrors the live pin's Lru; the fidelity baseline).
+// LRU — pure recency (mirrors the pin's original hand-rolled Lru).
 // ---------------------------------------------------------------------------
 pub struct Lru {
     cap: usize,
@@ -102,35 +124,49 @@ impl Lru {
     }
 }
 impl Cache for Lru {
-    fn probe(&mut self, k: u32) -> bool {
+    fn contains(&self, k: u32) -> bool {
+        self.set.contains(k)
+    }
+    fn get(&mut self, k: u32) -> bool {
         if self.set.contains(k) {
             self.set.touch(k);
             return true;
         }
         false
     }
-    fn load(&mut self, k: u32) {
-        if self.set.len() >= self.cap {
-            self.set.pop_lru();
-        }
+    fn insert(&mut self, k: u32) -> Option<u32> {
+        let ev = (self.set.len() >= self.cap)
+            .then(|| self.set.pop_lru())
+            .flatten();
         self.set.touch(k);
+        ev
+    }
+    fn insert_cold(&mut self, k: u32) -> Option<u32> {
+        let ev = (self.set.len() >= self.cap)
+            .then(|| self.set.pop_lru())
+            .flatten();
+        self.set.touch_cold(k);
+        ev
     }
     fn seed(&mut self, keys: &[u32]) {
         for &k in keys.iter().take(self.cap) {
             self.set.touch(k);
         }
     }
+    fn resident_len(&self) -> usize {
+        self.set.len()
+    }
 }
 
 // ---------------------------------------------------------------------------
 // 2Q (Johnson & Shasha) — frequency with a FIXED split. A1in FIFO holds
-// first-timers; a second *distinct* access (via the A1out ghost) promotes into
-// the Am LRU, which scans can't pollute. No adaptation.
+// first-timers; a second distinct access (via the A1out ghost) promotes into the
+// Am LRU, which scans can't pollute. Prefetches naturally park in A1in already.
 // ---------------------------------------------------------------------------
 pub struct TwoQ {
     cap: usize,
-    kin: usize,  // A1in cap (first-timer FIFO)
-    kout: usize, // A1out cap (ghost of A1in)
+    kin: usize,
+    kout: usize,
     a1in: OrderedSet,
     a1out: OrderedSet,
     am: OrderedSet,
@@ -146,51 +182,60 @@ impl TwoQ {
             am: OrderedSet::default(),
         }
     }
-    /// Free one resident page for a new admission (paper's "reclaimfor"): trim an
-    /// oversized A1in into the ghost, else evict Am's LRU.
-    fn reclaim(&mut self) {
+    /// Free one RESIDENT page for a new admission (paper's "reclaimfor"): trim an
+    /// oversized A1in into the ghost, else evict Am's LRU. Returns the resident key
+    /// that left residency (moved to ghost, or dropped from Am).
+    fn reclaim(&mut self) -> Option<u32> {
         if self.a1in.len() + self.am.len() < self.cap {
-            return;
+            return None;
         }
         if self.a1in.len() > self.kin {
-            if let Some(v) = self.a1in.pop_lru() {
+            let v = self.a1in.pop_lru();
+            if let Some(v) = v {
                 self.a1out.touch(v);
                 while self.a1out.len() > self.kout {
                     self.a1out.pop_lru();
                 }
             }
+            v
         } else {
-            self.am.pop_lru();
+            self.am.pop_lru()
         }
     }
 }
 impl Cache for TwoQ {
-    fn probe(&mut self, k: u32) -> bool {
+    fn contains(&self, k: u32) -> bool {
+        self.am.contains(k) || self.a1in.contains(k)
+    }
+    fn get(&mut self, k: u32) -> bool {
         if self.am.contains(k) {
-            self.am.touch(k); // Am is LRU
+            self.am.touch(k);
             return true;
         }
         self.a1in.contains(k) // hit but stays put (FIFO); ghosts are not resident
     }
-    fn load(&mut self, k: u32) {
-        self.reclaim();
+    fn insert(&mut self, k: u32) -> Option<u32> {
+        let ev = self.reclaim();
         if self.a1out.remove(k) {
             self.am.touch(k); // second distinct access → promote to protected
         } else {
             self.a1in.touch(k); // first sighting → probation FIFO
         }
+        ev
     }
     fn seed(&mut self, keys: &[u32]) {
         for &k in keys.iter().take(self.cap) {
-            self.am.touch(k); // seed straight into the scan-protected segment
+            self.am.touch(k);
         }
+    }
+    fn resident_len(&self) -> usize {
+        self.a1in.len() + self.am.len()
     }
 }
 
 // ---------------------------------------------------------------------------
 // ARC (Megiddo & Modha) — frequency with an ADAPTIVE split. T1 (recency) / T2
-// (frequency) resident; B1 / B2 key-only ghosts drive the target `p` that splits
-// them. A B1 ghost-hit grows T1 (recency); a B2 ghost-hit grows T2 (frequency).
+// (frequency) resident; B1 / B2 key-only ghosts drive the target `p`.
 // ---------------------------------------------------------------------------
 pub struct Arc {
     c: usize,
@@ -211,78 +256,95 @@ impl Arc {
             b2: OrderedSet::default(),
         }
     }
-    /// Evict one resident page to a ghost list to make room (paper's REPLACE).
-    /// `in_b2` = the key being admitted is a B2 ghost-hit (biases toward evicting
-    /// from T1 at the boundary).
-    fn replace(&mut self, in_b2: bool) {
+    /// Evict one RESIDENT page to a ghost (paper's REPLACE); returns the evicted
+    /// resident key. `in_b2` biases toward evicting T1 at the boundary.
+    fn replace(&mut self, in_b2: bool) -> Option<u32> {
         if self.t1.len() >= 1 && (self.t1.len() > self.p || (in_b2 && self.t1.len() == self.p)) {
-            if let Some(v) = self.t1.pop_lru() {
+            let v = self.t1.pop_lru();
+            if let Some(v) = v {
                 self.b1.touch(v);
             }
-        } else if let Some(v) = self.t2.pop_lru() {
-            self.b2.touch(v);
+            v
+        } else {
+            let v = self.t2.pop_lru();
+            if let Some(v) = v {
+                self.b2.touch(v);
+            }
+            v
         }
     }
 }
 impl Cache for Arc {
-    fn probe(&mut self, k: u32) -> bool {
-        // Hit in T1 or T2 → move to MRU of T2 (it's now used ≥twice).
+    fn contains(&self, k: u32) -> bool {
+        self.t1.contains(k) || self.t2.contains(k)
+    }
+    fn get(&mut self, k: u32) -> bool {
         if self.t1.remove(k) || self.t2.contains(k) {
             self.t2.touch(k);
             return true;
         }
         false
     }
-    fn load(&mut self, k: u32) {
+    fn insert(&mut self, k: u32) -> Option<u32> {
         let c = self.c;
+        let evicted;
         if self.b1.contains(k) {
-            // Ghost-hit in B1: recency was undersized → grow p.
             let delta = (self.b2.len() / self.b1.len().max(1)).max(1);
             self.p = (self.p + delta).min(c);
-            self.replace(false);
+            evicted = self.replace(false);
             self.b1.remove(k);
             self.t2.touch(k);
         } else if self.b2.contains(k) {
-            // Ghost-hit in B2: frequency was undersized → shrink p.
             let delta = (self.b1.len() / self.b2.len().max(1)).max(1);
             self.p = self.p.saturating_sub(delta);
-            self.replace(true);
+            evicted = self.replace(true);
             self.b2.remove(k);
             self.t2.touch(k);
         } else {
-            // Cold miss. Keep the L1 (T1+B1) and total (T1+T2+B1+B2) invariants.
+            let total = self.t1.len() + self.t2.len() + self.b1.len() + self.b2.len();
             if self.t1.len() + self.b1.len() == c {
                 if self.t1.len() < c {
                     self.b1.pop_lru();
-                    self.replace(false);
+                    evicted = self.replace(false);
                 } else {
-                    self.t1.pop_lru();
+                    evicted = self.t1.pop_lru(); // resident T1 dropped
                 }
-            } else if self.t1.len() + self.t2.len() + self.b1.len() + self.b2.len() >= c {
-                if self.t1.len() + self.t2.len() + self.b1.len() + self.b2.len() == 2 * c {
+            } else if total >= c {
+                if total == 2 * c {
                     self.b2.pop_lru();
                 }
-                self.replace(false);
+                evicted = self.replace(false);
+            } else {
+                evicted = None; // spare capacity
             }
             self.t1.touch(k);
         }
+        evicted
     }
     fn seed(&mut self, keys: &[u32]) {
         for &k in keys.iter().take(self.c) {
-            self.t2.touch(k); // seed straight into the frequency segment
+            self.t2.touch(k);
         }
+    }
+    fn resident_len(&self) -> usize {
+        self.t1.len() + self.t2.len()
+    }
+}
+
+/// Construct a policy by name (`lru`|`2q`|`arc`) at `cap` slots.
+pub fn make(policy: &str, cap: usize) -> Option<Box<dyn Cache>> {
+    match policy {
+        "lru" => Some(Box::new(Lru::new(cap))),
+        "2q" => Some(Box::new(TwoQ::new(cap))),
+        "arc" => Some(Box::new(Arc::new(cap))),
+        _ => None,
     }
 }
 
 /// Replay `batches` through a fresh `policy` at `cap` slots, optionally seeding the
 /// protected segment first. Returns `(hits, accesses)`.
 pub fn simulate(policy: &str, cap: usize, seed: &[u32], batches: &[Vec<u32>]) -> (u64, u64) {
-    let mut cache: Box<dyn Cache> = match policy {
-        "lru" => Box::new(Lru::new(cap)),
-        "2q" => Box::new(TwoQ::new(cap)),
-        "arc" => Box::new(Arc::new(cap)),
-        other => panic!("unknown policy {other:?} (lru|2q|arc)"),
-    };
+    let mut cache = make(policy, cap).unwrap_or_else(|| panic!("unknown policy {policy:?}"));
     if !seed.is_empty() {
         cache.seed(seed);
     }
@@ -298,16 +360,23 @@ pub fn simulate(policy: &str, cap: usize, seed: &[u32], batches: &[Vec<u32>]) ->
 mod tests {
     use super::*;
 
-    /// The property that motivates the whole exercise: a key established as frequent
-    /// must survive a later UNINTERRUPTED cold scan longer than the cache. A
-    /// frequency policy promotes it to a protected segment (which the first-timer
-    /// scan can't reach); pure recency ages it out. `hot` is promoted by touching it
-    /// with just enough churn between touches to age it into the ghost and back
-    /// (a burst of `kin+1`), then left untouched through the scan.
-    fn survives_cold_scan<C: Cache>(mut c: C, cap: usize) -> bool {
+    /// Box a policy by name without `unwrap` (denied even in tests).
+    fn boxed(p: &str, cap: usize) -> Box<dyn Cache> {
+        match p {
+            "2q" => Box::new(TwoQ::new(cap)),
+            "arc" => Box::new(Arc::new(cap)),
+            _ => Box::new(Lru::new(cap)),
+        }
+    }
+
+    /// A key established as frequent must survive a later UNINTERRUPTED cold scan
+    /// longer than the cache. Frequency policies promote it to a protected segment;
+    /// pure recency ages it out. `hot` is promoted with just enough churn between
+    /// touches to age it into the ghost and back, then left untouched through the scan.
+    fn survives_cold_scan(mut c: Box<dyn Cache>, cap: usize) -> bool {
         let hot = 999_999u32;
         let mut churn = 1_000_000u32;
-        let burst = cap / 4 + 1; // push hot out of probation into the ghost, not past it
+        let burst = cap / 4 + 1;
         for _ in 0..6 {
             c.access_batch(&[hot]);
             for _ in 0..burst {
@@ -315,53 +384,66 @@ mod tests {
                 churn += 1;
             }
         }
-        c.access_batch(&[hot]); // final protected touch
-        // Uninterrupted cold scan, 5x the cache, hot never touched.
+        c.access_batch(&[hot]);
         for _ in 0..(cap * 5) {
             c.access_batch(&[churn]);
             churn += 1;
         }
-        c.probe(hot)
+        c.contains(hot)
     }
 
     #[test]
     fn lru_has_no_scan_resistance() {
         assert!(
-            !survives_cold_scan(Lru::new(8), 8),
+            !survives_cold_scan(boxed("lru", 8), 8),
             "recency LRU should drop the hot key under a cold scan"
         );
     }
 
     #[test]
     fn twoq_and_arc_survive_scan() {
+        assert!(survives_cold_scan(boxed("2q", 8), 8), "2Q must protect hot");
         assert!(
-            survives_cold_scan(TwoQ::new(8), 8),
-            "2Q must protect the hot key"
-        );
-        assert!(
-            survives_cold_scan(Arc::new(8), 8),
-            "ARC must protect the hot key"
+            survives_cold_scan(boxed("arc", 8), 8),
+            "ARC must protect hot"
         );
     }
 
     #[test]
     fn all_hit_when_working_set_fits() {
-        // Working set of 4 keys, cap 8: after warm-up every access hits, all policies.
         let batches: Vec<Vec<u32>> = (0..50).map(|_| vec![1, 2, 3, 4]).collect();
         for pol in ["lru", "2q", "arc"] {
             let (hits, total) = simulate(pol, 8, &[], &batches);
-            // Only the first sighting of each of the 4 keys misses.
             assert_eq!(total - hits, 4, "{pol}: only cold-start misses expected");
         }
     }
 
     #[test]
     fn seed_gives_immediate_hits() {
-        // With the working set pre-seeded, even the first batch is all hits.
         let batches = vec![vec![1u32, 2, 3, 4]];
         for pol in ["lru", "2q", "arc"] {
             let (hits, total) = simulate(pol, 8, &[1, 2, 3, 4], &batches);
             assert_eq!(hits, total, "{pol}: seeded working set should fully hit");
+        }
+    }
+
+    /// Residency never exceeds capacity, and evicted keys are always resident (the
+    /// invariant the live pin relies on to reuse the evicted key's slot).
+    #[test]
+    fn eviction_returns_resident_and_respects_cap() {
+        for pol in ["lru", "2q", "arc"] {
+            let mut c = boxed(pol, 16);
+            let mut resident = std::collections::HashSet::new();
+            for k in 0..200u32 {
+                if !c.get(k) {
+                    if let Some(ev) = c.insert(k) {
+                        assert!(resident.remove(&ev), "{pol}: evicted {ev} was not resident");
+                    }
+                    resident.insert(k);
+                }
+                assert!(resident.len() <= 16, "{pol}: over cap ({})", resident.len());
+                assert_eq!(resident.len(), c.resident_len(), "{pol}: pin/policy drift");
+            }
         }
     }
 }
