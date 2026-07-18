@@ -346,14 +346,29 @@ pool** (`hipHostMalloc` on the cold-fetch slots), NOT the resident pin:
   (set from the KFD `COHERENT` alloc flag, line ~1756). So fine-grained coherent
   host mem → MTYPE_UC → the ~6 % tax: CONFIRMED, definitive. `svm_range_get_pte_
   flags` (managed path) agrees: gfx11 falls to `default: coherent?UC:NC`.
-- **The tax IS avoidable at the kernel level** — non-coherent/DEFAULT host mem
-  maps MTYPE_NC (cached). So why did the L1 (`hipHostMallocNonCoherent`) run NOT
-  recover it? That's a USERSPACE question (HIP `clr` / HSA `ROCR-Runtime` pool
-  selection: does the HIP NonCoherent flag actually clear the KFD COHERENT bit on
-  APU, or are host pools always fine-grained?). ROCR/clr source is NOT on the box
-  (only libhsa-runtime64.so / libamdhip64.so binaries) — on GitHub. **UNRESOLVED:
-  the tax is likely avoidable if we can force an MTYPE_NC (cached, non-coherent)
-  host mapping; the flag flip didn't do it and the reason is upstream in ROCR/clr.**
+- **RESOLVED via full userspace trace (ROCm/clr amd-staging) + live topology.**
+  Traced hipHostMallocNonCoherent end to end: ihipHostMalloc clears
+  CL_MEM_SVM_ATOMICS → getHostMemorySegment (rocmemory.hpp) ATOMICS==0 → kNoAtomics
+  → getHostMemoryPool (rocdevice.cpp) kNoAtomics → coarse_grain_pool IF it exists →
+  `rocminfo` confirms the CPU agent DOES expose a COARSE GRAINED ~128GB pool. So L1
+  DID land in the coarse (cached, MTYPE_NC) pool — and still didn't help. **The tax
+  is NOT coherence-grain: our own data shows ALL host-pool variants 672–678 ms
+  regardless of UC vs NC, only the DEVICE pool (hipMalloc) hits 616.** The real
+  axis is SYSTEM-memory domain vs DEVICE-LOCAL domain: baseline = GPU-agent
+  device-local pool (MTYPE_RW, GPU-owned, large pages, no snoop); every hipHostMalloc
+  grain = CPU-agent system pool (MTYPE_NC/UC + AMDGPU_PTE_SYSTEM + PTE_SNOOPED, 4 KiB
+  pages). The coherence flag flips UC↔NC within the system domain but can't cross
+  into device-local, so it never recovers bandwidth. **CONCLUSION (now source-
+  grounded): no hipHostMalloc flag eliminates the tax — A3's "single host copy read
+  in place" is inherently a system-domain read that pays ~9%; only device-local
+  (hipMalloc = the double-store) avoids it.** You can't have both single-copy AND
+  device bandwidth from hipHostMalloc. Narrow escape hatches left, uncertain payoff:
+  large-page system mapping via hipHostRegister over MAP_HUGETLB (attacks only the
+  TLB component), or VMM/hipMemPool APIs to make a device-local pool host-fillable.
+  Epistemic note: first "fundamental, no flag fixes it" was asserted w/o source
+  (right direction, wrong stated mechanism); kernel source alone over-corrected to
+  "avoidable"; the full trace confirms no-flag-fixes-it for the RIGHT reason
+  (system-vs-device domain). Read the source before saying "definitively".
 - Robust lever-independent win regardless = the fetch-fill offset (`fetch`
   447→~365 ms, host memcpy skips 3× H2D/miss). A3 arithmetic still favors
   build-and-measure: ~+46 ms/tok tax (IF unavoidable) vs ~500 ms potential from
