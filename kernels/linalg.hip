@@ -1,55 +1,78 @@
 // M3 (4/4) per-layer linear-algebra primitives — the projections the forward
 // pass needs on-device alongside the fused MoE/attention kernels, so the whole
-// token stays resident (no host round-trip = no per-layer join). Each is a plain
-// batch-1 GEMV: one thread per output row, summing i ascending to match the
-// scalar oracle (quant.rs matvec_i4_rows / matvec_i8) bit-for-bit. All pointers
-// are device-resident; the launchers only launch (caller joins via
-// rivoli_device_sync). Return codes: 0 ok, POSITIVE arg guard, NEGATIVE -hipError.
+// token stays resident (no host round-trip = no per-layer join). Each is a
+// batch-1 GEMV. All pointers are device-resident; the launchers only launch
+// (caller joins via rivoli_device_sync). Return codes: 0 ok, POSITIVE arg guard,
+// NEGATIVE -hipError.
 //
-// Coalescing is row-per-thread (adjacent lanes stride one weight row apart) —
-// the D3 wave-coalesced-load tune applies here too, deferred to the measurement
-// pass; correctness first.
+// D3 COALESCED FORM (was: one thread per row, summing the whole row alone —
+// adjacent threads strode one weight ROW apart, so every global load was a
+// separate cache line; measured ~38% of decode). Now one WAVE cooperates on one
+// output row: adjacent lanes read adjacent columns (coalesced cache lines), then
+// a fixed-order wave-shuffle reduces the partials. The reduction order differs
+// from the scalar oracle's ascending sum by f32 rounding (well within the test's
+// 1e-3 dequant tolerance) but is SCHEDULE-INDEPENDENT, so greedy decode stays
+// deterministic.
+//
+// ponytail: WAVE=32 hardcoded for gfx1151 (RDNA3.5, native wave32); __shfl_down
+// width=32 also keeps it correct on a wave64 part (reduces within 32-lane
+// groups, matching the logical wave = threadIdx/32). A part with warpSize<32
+// would need WAVE lowered.
 
 #include <hip/hip_runtime.h>
+
+#define WAVE 32
+#define ROWS_PER_BLOCK 8  // block = 256 threads = 8 waves → 8 rows/block
+
+// Sum a wave's partials into lane 0 (fixed shuffle order → deterministic).
+__device__ __forceinline__ float wave_sum(float v) {
+    for (int o = WAVE / 2; o > 0; o >>= 1) v += __shfl_down(v, o, WAVE);
+    return v;
+}
 
 // y[o] = scale[o] · Σ_i x[i]·(nibble(row_o,i) - 8)   — int4, per-row scale.
 extern "C" __global__ void gemv_i4(
     const float* __restrict__ x, const unsigned char* __restrict__ packed,
     const float* __restrict__ scale, int o_dim, int i_dim, float* __restrict__ y) {
+    int lane = threadIdx.x & (WAVE - 1);
     // size_t row index so a huge grid can't wrap to a negative int (the guard is
     // never approached at GLM dims, but keeps the address arithmetic honest).
-    size_t o = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t o = (size_t)blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x / WAVE);
     if (o >= (size_t)o_dim) return;
     size_t rb = (size_t)(i_dim + 1) / 2;
     const unsigned char* row = packed + o * rb;
     float acc = 0.0f;
-    for (int i = 0; i < i_dim; ++i) {
+    for (int i = lane; i < i_dim; i += WAVE) {
         unsigned char b = row[i >> 1];
         int n = (i & 1) ? (b >> 4) : (b & 0x0F);
         acc += x[i] * (float)(n - 8);
     }
-    y[o] = acc * scale[o];
+    acc = wave_sum(acc);
+    if (lane == 0) y[o] = acc * scale[o];
 }
 
 // y[o] = scale[o] · Σ_i x[i]·(int8)packed[o·i_dim+i]   — int8, per-row scale.
 extern "C" __global__ void gemv_i8(
     const float* __restrict__ x, const unsigned char* __restrict__ packed,
     const float* __restrict__ scale, int o_dim, int i_dim, float* __restrict__ y) {
-    size_t o = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int lane = threadIdx.x & (WAVE - 1);
+    size_t o = (size_t)blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x / WAVE);
     if (o >= (size_t)o_dim) return;
     const unsigned char* row = packed + o * (size_t)i_dim;
     float acc = 0.0f;
-    for (int i = 0; i < i_dim; ++i) acc += (float)((signed char)row[i]) * x[i];
-    y[o] = acc * scale[o];
+    for (int i = lane; i < i_dim; i += WAVE) acc += (float)((signed char)row[i]) * x[i];
+    acc = wave_sum(acc);
+    if (lane == 0) y[o] = acc * scale[o];
 }
 
+// grid = ceil(o_dim / ROWS_PER_BLOCK) blocks of 256 threads (one wave per row).
 extern "C" int rivoli_gemv_i4(
     const float* x, const unsigned char* packed, const float* scale,
     int o_dim, int i_dim, float* y) {
     if (o_dim <= 0 || i_dim <= 0) return 1001;
     hipGetLastError();
-    hipLaunchKernelGGL(gemv_i4, dim3((o_dim + 255) / 256), dim3(256), 0, 0,
-                       x, packed, scale, o_dim, i_dim, y);
+    hipLaunchKernelGGL(gemv_i4, dim3((o_dim + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
+                       dim3(256), 0, 0, x, packed, scale, o_dim, i_dim, y);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
@@ -59,23 +82,25 @@ extern "C" int rivoli_gemv_i8(
     int o_dim, int i_dim, float* y) {
     if (o_dim <= 0 || i_dim <= 0) return 1001;
     hipGetLastError();
-    hipLaunchKernelGGL(gemv_i8, dim3((o_dim + 255) / 256), dim3(256), 0, 0,
-                       x, packed, scale, o_dim, i_dim, y);
+    hipLaunchKernelGGL(gemv_i8, dim3((o_dim + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
+                       dim3(256), 0, 0, x, packed, scale, o_dim, i_dim, y);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
 
 // y[o] = Σ_i x[i]·w[o·i_dim+i]  — plain f32 GEMV, no scale. The MoE router gate
-// (gate.weight is F32; matches quant.rs matvec_f32_bytes). One thread per row.
+// (gate.weight is F32; matches quant.rs matvec_f32_bytes). Coalesced wave-per-row.
 extern "C" __global__ void gemv_f32(
     const float* __restrict__ x, const float* __restrict__ w, int o_dim, int i_dim,
     float* __restrict__ y) {
-    size_t o = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int lane = threadIdx.x & (WAVE - 1);
+    size_t o = (size_t)blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x / WAVE);
     if (o >= (size_t)o_dim) return;
     const float* row = w + o * (size_t)i_dim;
     float acc = 0.0f;
-    for (int i = 0; i < i_dim; ++i) acc += x[i] * row[i];
-    y[o] = acc;
+    for (int i = lane; i < i_dim; i += WAVE) acc += x[i] * row[i];
+    acc = wave_sum(acc);
+    if (lane == 0) y[o] = acc;
 }
 
 // y[i] = x[i] · (1/sqrt(mean(x²)+eps)) · w[i]  — RMSNorm, matching math.rs. One
@@ -123,8 +148,8 @@ extern "C" int rivoli_gemv_f32(
     const float* x, const float* w, int o_dim, int i_dim, float* y) {
     if (o_dim <= 0 || i_dim <= 0) return 1001;
     hipGetLastError();
-    hipLaunchKernelGGL(gemv_f32, dim3((o_dim + 255) / 256), dim3(256), 0, 0,
-                       x, w, o_dim, i_dim, y);
+    hipLaunchKernelGGL(gemv_f32, dim3((o_dim + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
+                       dim3(256), 0, 0, x, w, o_dim, i_dim, y);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
