@@ -13,7 +13,7 @@ fn main() {
     }
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR set by cargo");
-    let kernels = ["probe", "moe_fused", "attn"];
+    let kernels = ["probe", "moe_fused", "attn", "linalg"];
     let hipcc = std::env::var("HIPCC").unwrap_or_else(|_| "hipcc".into());
 
     let mut objs = Vec::new();

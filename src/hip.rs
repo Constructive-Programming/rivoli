@@ -37,6 +37,24 @@ unsafe extern "C" {
 
     fn rivoli_device_sync() -> i32;
 
+    fn rivoli_gemv_i4(
+        x: *const f32,
+        packed: *const u8,
+        scale: *const f32,
+        o_dim: i32,
+        i_dim: i32,
+        y: *mut f32,
+    ) -> i32;
+
+    fn rivoli_gemv_i8(
+        x: *const f32,
+        packed: *const u8,
+        scale: *const f32,
+        o_dim: i32,
+        i_dim: i32,
+        y: *mut f32,
+    ) -> i32;
+
     #[allow(clippy::too_many_arguments)]
     fn rivoli_mla_attend(
         qabs: *const f32,
@@ -178,6 +196,67 @@ pub unsafe fn launch_moe(
     if r != 0 {
         let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
         bail!("launch_moe failed ({kind}, code {r})");
+    }
+    Ok(())
+}
+
+/// Launch a batch-1 int4 GEMV `y = scale ⊙ (W·x)` over resident device memory
+/// (`W` = `packed` per-row nibbles + per-row `scale`, `o_dim × i_dim`). Device
+/// pointers, launch-only. The workhorse for the attention projections
+/// (q_a/q_b/kv_a/o_proj) that must stay on-device to avoid per-layer joins.
+///
+/// # Safety
+/// Async — `x` (`i_dim` f32), `packed` (`o_dim·⌈i_dim/2⌉` bytes), `scale`
+/// (`o_dim` f32), `y` (`o_dim` f32) must be valid device pointers that stay live
+/// until the next [`device_sync`] returns.
+#[cfg(feature = "rocm")]
+pub unsafe fn launch_gemv_i4(
+    x: *const f32,
+    packed: *const u8,
+    scale: *const f32,
+    o_dim: usize,
+    i_dim: usize,
+    y: *mut f32,
+) -> Result<()> {
+    anyhow::ensure!(
+        o_dim <= i32::MAX as usize && i_dim <= i32::MAX as usize,
+        "gemv_i4 dims exceed i32 (o={o_dim} i={i_dim})"
+    );
+    // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
+    let r = unsafe { rivoli_gemv_i4(x, packed, scale, o_dim as i32, i_dim as i32, y) };
+    if r != 0 {
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("launch_gemv_i4 failed ({kind}, code {r})");
+    }
+    Ok(())
+}
+
+/// Launch a batch-1 int8 GEMV `y = scale ⊙ (W·x)` (`W` = `packed` signed bytes +
+/// per-row `scale`, `o_dim × i_dim`) — the lm_head projection. Device pointers,
+/// launch-only.
+///
+/// # Safety
+/// Async — `x` (`i_dim` f32), `packed` (`o_dim·i_dim` bytes), `scale` (`o_dim`
+/// f32), `y` (`o_dim` f32) must be valid device pointers live until the next
+/// [`device_sync`] returns.
+#[cfg(feature = "rocm")]
+pub unsafe fn launch_gemv_i8(
+    x: *const f32,
+    packed: *const u8,
+    scale: *const f32,
+    o_dim: usize,
+    i_dim: usize,
+    y: *mut f32,
+) -> Result<()> {
+    anyhow::ensure!(
+        o_dim <= i32::MAX as usize && i_dim <= i32::MAX as usize,
+        "gemv_i8 dims exceed i32 (o={o_dim} i={i_dim})"
+    );
+    // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
+    let r = unsafe { rivoli_gemv_i8(x, packed, scale, o_dim as i32, i_dim as i32, y) };
+    if r != 0 {
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("launch_gemv_i8 failed ({kind}, code {r})");
     }
     Ok(())
 }

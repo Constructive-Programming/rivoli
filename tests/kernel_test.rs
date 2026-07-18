@@ -10,10 +10,12 @@
 #![allow(clippy::expect_used)]
 
 use rivoli::device::{DeviceBuf, DeviceTier};
-use rivoli::hip::{ExpertDesc, device_sync, launch_attend, launch_moe};
+use rivoli::hip::{
+    ExpertDesc, device_sync, launch_attend, launch_gemv_i4, launch_gemv_i8, launch_moe,
+};
 use rivoli::math::{bf16_to_f32, f32_to_bf16, silu, softmax};
-use rivoli::quant::{matvec_i4, row_bytes};
-use rivoli::snapshot::Int4Matrix;
+use rivoli::quant::{matvec_i4, matvec_i8, row_bytes};
+use rivoli::snapshot::{Int4Matrix, Int8Matrix};
 
 /// Little-endian bytes of an f32 slice (device is LE, matching this host).
 fn f32_bytes(v: &[f32]) -> Vec<u8> {
@@ -23,6 +25,28 @@ fn f32_bytes(v: &[f32]) -> Vec<u8> {
 /// Little-endian bytes of a u16 (bf16) slice.
 fn u16_bytes(v: &[u16]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// f32 values from little-endian device bytes (kernel output readback).
+fn f32_vec(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Assert a kernel result matches its scalar reference within int4/f32 tolerance.
+fn assert_close(want: &[f32], got: &[f32], label: &str) {
+    let max_ref = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let max_err = want
+        .iter()
+        .zip(got)
+        .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+    let tol = 1e-3 * max_ref + 1e-3;
+    assert!(
+        max_err <= tol,
+        "{label}: max_err={max_err:.3e} tol={tol:.3e} (max_ref={max_ref:.3e})"
+    );
 }
 
 /// Deterministic PRNG (SplitMix-style LCG). No `rand` dependency, and no
@@ -344,6 +368,101 @@ fn mla_attend_head_tiling_boundaries() {
     // many TILE=16 steps.
     check_attend(0xb10c_c0de, 64, 130, 512, 64);
     check_attend(0x2020_2020, 20, 96, 512, 64);
+}
+
+/// Random int8 matrix `[o, i]`: signed bytes + per-row f32 scale bytes.
+fn gen_i8(rng: &mut Lcg, o: usize, i: usize) -> (Vec<u8>, Vec<u8>) {
+    let packed: Vec<u8> = (0..o * i).map(|_| (rng.next_u32() & 0xff) as u8).collect();
+    let scale: Vec<u8> = (0..o)
+        .flat_map(|_| (rng.f() * 0.05).to_le_bytes())
+        .collect();
+    (packed, scale)
+}
+
+#[test]
+fn gemv_i4_matches_scalar() {
+    let mut rng = Lcg(0x0991_1337);
+    let (o, i) = (1536usize, 2048usize);
+    let m = gen_mat(&mut rng, o, i);
+    let x: Vec<f32> = (0..i).map(|_| rng.f()).collect();
+    let mut want = vec![0.0f32; o];
+    matvec_i4(
+        &mut want,
+        &x,
+        &Int4Matrix {
+            packed: &m.packed,
+            scale: &m.scale_bytes,
+            o_dim: o,
+            i_dim: i,
+        },
+    );
+
+    let mut tier = DeviceTier::new(64 << 20).expect("alloc tier");
+    let pp = tier.place(&m.packed).expect("place packed");
+    let ps = tier.place(&m.scale_bytes).expect("place scale");
+    let x_buf = DeviceBuf::from_bytes(&f32_bytes(&x)).expect("place x");
+    let mut y_buf = DeviceBuf::zeroed(o * 4).expect("alloc y");
+    // SAFETY: device pointers valid for the dims; y outlives the sync.
+    unsafe {
+        launch_gemv_i4(
+            x_buf.ptr() as *const f32,
+            pp,
+            ps as *const f32,
+            o,
+            i,
+            y_buf.ptr_mut() as *mut f32,
+        )
+        .expect("launch gemv_i4");
+    }
+    device_sync().expect("device sync");
+    assert_close(
+        &want,
+        &f32_vec(&y_buf.copy_out().expect("copy out")),
+        "gemv_i4",
+    );
+}
+
+#[test]
+fn gemv_i8_matches_scalar() {
+    let mut rng = Lcg(0x0088_1337);
+    let (o, i) = (2048usize, 1024usize);
+    let (packed, scale) = gen_i8(&mut rng, o, i);
+    let x: Vec<f32> = (0..i).map(|_| rng.f()).collect();
+    let mut want = vec![0.0f32; o];
+    matvec_i8(
+        &mut want,
+        &x,
+        &Int8Matrix {
+            packed: &packed,
+            scale: &scale,
+            o_dim: o,
+            i_dim: i,
+        },
+    );
+
+    let mut tier = DeviceTier::new(64 << 20).expect("alloc tier");
+    let pp = tier.place(&packed).expect("place packed");
+    let ps = tier.place(&scale).expect("place scale");
+    let x_buf = DeviceBuf::from_bytes(&f32_bytes(&x)).expect("place x");
+    let mut y_buf = DeviceBuf::zeroed(o * 4).expect("alloc y");
+    // SAFETY: device pointers valid for the dims; y outlives the sync.
+    unsafe {
+        launch_gemv_i8(
+            x_buf.ptr() as *const f32,
+            pp,
+            ps as *const f32,
+            o,
+            i,
+            y_buf.ptr_mut() as *mut f32,
+        )
+        .expect("launch gemv_i8");
+    }
+    device_sync().expect("device sync");
+    assert_close(
+        &want,
+        &f32_vec(&y_buf.copy_out().expect("copy out")),
+        "gemv_i8",
+    );
 }
 
 #[test]
