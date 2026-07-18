@@ -384,9 +384,11 @@ impl<'a> GpuEngine<'a> {
                 ls.extend_from_slice(&self.sel);
                 self.pin.begin_layer();
                 // Overlap this layer's cold-expert NVMe reads (parallel page-warm)
-                // before the serial copy_in's below. DISABLED for isolation test.
+                // before the serial copy_in's below — reaches the NVMe bandwidth
+                // floor. Safe now that the MoE reduction is deterministic (its
+                // timing perturbation can no longer change the output).
                 let t = std::time::Instant::now();
-                // self.pin.warm_cold(l, &self.sel);
+                self.pin.warm_cold(l, &self.sel);
                 self.prof.warm_ns += t.elapsed().as_nanos();
                 // Resolve selected experts (+ shared), build the descriptor batch.
                 let ke = self.sel.len();
