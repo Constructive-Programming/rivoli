@@ -27,13 +27,26 @@ mod ffi {
         pub fn hipMemset(ptr: *mut c_void, value: i32, size: usize) -> i32;
         pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
     }
+    // VMM device-local host-fillable allocator (kernels/vmm.hip, in
+    // librivolikernels.a). Gives MTYPE_RW device-bandwidth memory the CPU can fill
+    // in place — see docs/hip-apu-memory.md.
+    unsafe extern "C" {
+        pub fn rivoli_vmm_alloc(
+            size: usize,
+            dev: i32,
+            out_ptr: *mut *mut c_void,
+            out_handle: *mut u64,
+            out_mapped: *mut usize,
+        ) -> i32;
+        pub fn rivoli_vmm_free(ptr: *mut c_void, handle: u64, mapped: usize) -> i32;
+    }
     pub const HIP_MEMCPY_H2D: i32 = 1;
     pub const HIP_MEMCPY_D2H: i32 = 2;
     pub const HIP_SUCCESS: i32 = 0;
 }
 
 #[cfg(feature = "rocm")]
-pub use tier::{DeviceBuf, DeviceTier, mem_info};
+pub use tier::{DeviceBuf, DeviceTier, VmmBuf, mem_info};
 
 #[cfg(feature = "rocm")]
 mod tier {
@@ -310,6 +323,76 @@ mod tier {
         fn drop(&mut self) {
             // SAFETY: ptr came from hipMalloc and is freed exactly once.
             unsafe { hipFree(self.ptr as *mut c_void) };
+        }
+    }
+
+    /// Device-local memory (MTYPE_RW, full ~220 GB/s GPU bandwidth) that the CPU
+    /// can also fill IN PLACE — HIP VMM allocates the physical pages device-local
+    /// and grants the host an access mapping (APU unified addressing). So a cold
+    /// expert is `pread`/memcpy'd straight in ([`VmmBuf::write_at`], a plain host
+    /// memcpy, no `hipMemcpy`/sync) and the GPU reads it with NO coherent-pool read
+    /// tax — unlike a `hipHostMalloc` slot, which always maps system-domain and
+    /// reads ~9% slower. `ptr()` is GPU-usable. See docs/hip-apu-memory.md.
+    pub struct VmmBuf {
+        ptr: *mut u8,
+        handle: u64,
+        mapped: usize, // granularity-rounded size, needed verbatim to free
+        len: usize,    // usable bytes requested
+    }
+
+    impl VmmBuf {
+        pub fn new(len: usize) -> Result<Self> {
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            let mut handle: u64 = 0;
+            let mut mapped: usize = 0;
+            // SAFETY: out-pointers are valid; the shim owns the mapping until free.
+            let e = unsafe { rivoli_vmm_alloc(len, 0, &mut ptr, &mut handle, &mut mapped) };
+            ensure!(
+                e == 0 && !ptr.is_null(),
+                "rivoli_vmm_alloc({len}) failed ({e})"
+            );
+            Ok(Self {
+                ptr: ptr as *mut u8,
+                handle,
+                mapped,
+                len,
+            })
+        }
+
+        /// Host memcpy `bytes` at `off` (device-local memory is host-writable via
+        /// the VMM host grant — no `hipMemcpy`, no sync; the GPU sees it at the
+        /// next launch, verified CPU->GPU coherent).
+        pub fn write_at(&mut self, off: usize, bytes: &[u8]) -> Result<()> {
+            ensure!(
+                off + bytes.len() <= self.len,
+                "vmm write {off}+{} > len {}",
+                bytes.len(),
+                self.len
+            );
+            // SAFETY: off+len ≤ len (checked); ptr is host-addressable; src (mmap)
+            // and dst (this slab) are distinct regions.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(off), bytes.len());
+            }
+            Ok(())
+        }
+
+        /// GPU-usable pointer (device-local under unified addressing).
+        pub fn ptr(&self) -> *const u8 {
+            self.ptr
+        }
+        pub fn len(&self) -> usize {
+            self.len
+        }
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+    }
+
+    impl Drop for VmmBuf {
+        fn drop(&mut self) {
+            // SAFETY: (ptr,handle,mapped) came from rivoli_vmm_alloc, freed once.
+            unsafe { rivoli_vmm_free(self.ptr as *mut c_void, self.handle, self.mapped) };
         }
     }
 

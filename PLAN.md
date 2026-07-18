@@ -369,6 +369,21 @@ pool** (`hipHostMalloc` on the cold-fetch slots), NOT the resident pin:
   (right direction, wrong stated mechanism); kernel source alone over-corrected to
   "avoidable"; the full trace confirms no-flag-fixes-it for the RIGHT reason
   (system-vs-device domain). Read the source before saying "definitively".
+- **VMM ESCAPE HATCH — DONE + WORKS (2026-07-18).** `device::VmmBuf` (C ABI shim
+  `kernels/vmm.hip`; probe `docs/probes/vmm_probe.cpp`): `hipMemCreate` device-local
+  physical + `hipMemSetAccess(hipMemLocationTypeHost)` → CPU fills in place, GPU
+  reads at **220 GB/s = device speed** (vs 215 hipHostMalloc), verified CPU→GPU
+  coherent. So the "can't have both single-copy AND device bandwidth" wall is FALSE
+  for VMM — it crosses the domain boundary hipHostMalloc can't. **Caveat (measured,
+  decisive):** device bandwidth holds ONLY write-once-read-many; interleaved
+  CPU-rewrite+GPU-read halves it (220→112 GB/s). Wired into the cold pool as a
+  proof: correct/coherent decode, but `mlp` stayed 673 (cold = refill-every-miss =
+  the 112 antipattern), kept only for the fill-offset net win (wall 2086 vs 2136,
+  fetch 447→364). **The real payoff is the RESIDENT PIN (A3): filled once, read all
+  run = the 220 path → single host copy (drop BOTH the mmap page-cache dup and the
+  device-tier hipMalloc slab, no double-store) + device bandwidth + ~2× experts
+  fit.** Next concrete A3 step: convert the resident DeviceTier to VMM-backed,
+  pread experts straight in. See docs/hip-apu-memory.md.
 - Robust lever-independent win regardless = the fetch-fill offset (`fetch`
   447→~365 ms, host memcpy skips 3× H2D/miss). A3 arithmetic still favors
   build-and-measure: ~+46 ms/tok tax (IF unavoidable) vs ~500 ms potential from

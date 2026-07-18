@@ -13,7 +13,7 @@
 //! `rocm`-only: without a device there is nothing to pin.
 #![cfg(feature = "rocm")]
 
-use crate::device::{DeviceBuf, DeviceTier, mem_info};
+use crate::device::{DeviceTier, VmmBuf, mem_info};
 use crate::model::ModelConfig;
 use crate::snapshot::Snapshot;
 use crate::usage::Usage;
@@ -109,9 +109,9 @@ pub struct Pin<'a> {
     /// Reused device slots for cold routed experts: one `Mlp` worth of bytes
     /// each, filled via `copy_in` on a miss (no per-token allocation). Sized to
     /// the worst case of one layer's misses (top_k slots).
-    cold_gate: Vec<DeviceBuf>,
-    cold_up: Vec<DeviceBuf>,
-    cold_down: Vec<DeviceBuf>,
+    cold_gate: Vec<VmmBuf>,
+    cold_up: Vec<VmmBuf>,
+    cold_down: Vec<VmmBuf>,
     cold_next: usize,
     /// Stats over the run.
     pub hits: u64,
@@ -302,9 +302,9 @@ impl<'a> Pin<'a> {
         for _ in 0..cfg.top_k {
             // gate/up carry their scale inline after the packed nibbles; keep
             // packed and scale in one buffer per projection to halve slot count.
-            cold_gate.push(DeviceBuf::new(gate_bytes + cfg.moe_inter * 4)?);
-            cold_up.push(DeviceBuf::new(gate_bytes + cfg.moe_inter * 4)?);
-            cold_down.push(DeviceBuf::new(down_bytes + cfg.hidden * 4)?);
+            cold_gate.push(VmmBuf::new(gate_bytes + cfg.moe_inter * 4)?);
+            cold_up.push(VmmBuf::new(gate_bytes + cfg.moe_inter * 4)?);
+            cold_down.push(VmmBuf::new(down_bytes + cfg.hidden * 4)?);
         }
 
         Ok(Self {
@@ -481,7 +481,7 @@ fn touch(addr: usize, len: usize) {
 }
 
 /// Copy packed nibbles then scale bytes into one contiguous device slot.
-fn fill_slot(buf: &mut DeviceBuf, packed: &[u8], scale: &[u8]) -> Result<()> {
+fn fill_slot(buf: &mut VmmBuf, packed: &[u8], scale: &[u8]) -> Result<()> {
     ensure!(
         packed.len() + scale.len() == buf.len(),
         "cold slot size {} != packed {} + scale {}",
@@ -489,7 +489,8 @@ fn fill_slot(buf: &mut DeviceBuf, packed: &[u8], scale: &[u8]) -> Result<()> {
         packed.len(),
         scale.len()
     );
-    buf.copy_in_at(0, packed)?;
-    buf.copy_in_at(packed.len(), scale)?;
+    // Host memcpy straight into device-local memory (no H2D copy, no sync).
+    buf.write_at(0, packed)?;
+    buf.write_at(packed.len(), scale)?;
     Ok(())
 }
