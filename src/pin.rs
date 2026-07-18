@@ -84,6 +84,10 @@ pub struct Pin<'a> {
     /// `experts[sparse_idx][expert]` — resident routed experts (None = cold).
     /// `sparse_idx = layer - dense_layers`.
     experts: Vec<Vec<Option<Mlp>>>,
+    /// (layer,expert) → rank in the `.coli_usage` ranking (0 = hottest); absent
+    /// means colibri never selected it. The hit-rate-gap diagnostic.
+    rank: std::collections::HashMap<(u16, u16), u32>,
+    ranked_len: usize,
     /// Reused device slots for cold routed experts: one `Mlp` worth of bytes
     /// each, filled via `copy_in` on a miss (no per-token allocation). Sized to
     /// the worst case of one layer's misses (top_k slots).
@@ -241,8 +245,15 @@ impl<'a> Pin<'a> {
         // Reserve the cold pool (top_k slots) before spending the rest on the pin.
         let cold_reserve = cfg.top_k * ebytes;
         let budget = capacity.saturating_sub(tier.used() + cold_reserve);
+        // Rank each (layer,expert) by its .coli_usage position (0 = hottest), so
+        // decode can report the rank of missed experts (routing-vs-breadth diag).
+        let ranked = usage.ranked();
+        let mut rank = std::collections::HashMap::with_capacity(ranked.len());
+        for (i, &((l, e), _)) in ranked.iter().enumerate() {
+            rank.insert((l, e), i as u32);
+        }
         let mut pinned = 0usize;
-        for ((layer, expert), _count) in usage.ranked() {
+        for &((layer, expert), _count) in &ranked {
             let (layer, expert) = (layer as usize, expert as usize);
             if layer < cfg.dense_layers || layer >= cfg.n_layers || expert >= cfg.n_experts {
                 continue; // stale ranking entry
@@ -281,6 +292,8 @@ impl<'a> Pin<'a> {
             layers,
             moe_bias,
             experts,
+            ranked_len: ranked.len(),
+            rank,
             cold_gate,
             cold_up,
             cold_down,
@@ -298,6 +311,17 @@ impl<'a> Pin<'a> {
     /// Host router correction bias for a MoE `layer` (len n_experts).
     pub fn moe_bias(&self, layer: usize) -> &[f32] {
         &self.moe_bias[layer - self.cfg.dense_layers]
+    }
+
+    /// Rank of a routed expert in the `.coli_usage` ranking (0 = hottest); None
+    /// means colibri never selected it — a routing-divergence signal.
+    pub fn expert_rank(&self, layer: usize, expert: usize) -> Option<u32> {
+        self.rank.get(&(layer as u16, expert as u16)).copied()
+    }
+
+    /// Total number of ranked (layer,expert) pairs in the usage file.
+    pub fn ranked_len(&self) -> usize {
+        self.ranked_len
     }
 
     /// Append the mmap byte ranges of a COLD routed expert's packed weights to

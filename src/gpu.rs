@@ -40,6 +40,103 @@ fn desc_bytes(d: &[ExpertDesc]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(d.as_ptr() as *const u8, std::mem::size_of_val(d)) }
 }
 
+/// Per-token time buckets, measured (not theorized). The mid-layer sync drains
+/// the attention kernels; the end-of-layer sync drains the MLP; the cold-expert
+/// copy_in's between them are pure H2D (no kernel-wait). So these split cleanly
+/// into I/O (fetch) vs GPU compute (attn/mlp/lmhead) vs host routing.
+#[derive(Default)]
+struct Profile {
+    fetch_ns: u128, // cold-expert copy_in (NVMe→device); fetch_n = miss count
+    fetch_n: u64,
+    attn_ns: u128,     // mid-layer sync — attention+gate GPU compute
+    mlp_ns: u128,      // end-of-layer sync — MLP GPU compute (+ dense-layer attn)
+    lmhead_ns: u128,   // final sync — norm + lm_head
+    route_ns: u128,    // gate-logits D2H + host sigmoid/bias/topk
+    prefetch_ns: u128, // building/queuing the prefetch range set
+    wall_ns: u128,     // total decode wall time
+    tokens: u64,
+    // Hit-rate-gap diagnostic: where do rivoli's selections sit in colibri's
+    // ranking? A miss just past the pin cutoff = breadth; a miss that's low-rank
+    // or ABSENT = rivoli routes to experts colibri didn't (divergence).
+    hit_rank_sum: u128,
+    hit_n: u64,
+    miss_absent: u64,    // selected, colibri never ranked it
+    miss_rank_sum: u128, // present misses only
+    miss_present: u64,
+    miss_band: [u64; 4], // present-miss rank bands: <2k, <5k, <10k, >=10k
+}
+
+impl Profile {
+    fn record_sel(&mut self, rank: Option<u32>, miss: bool) {
+        match (rank, miss) {
+            (Some(r), false) => {
+                self.hit_rank_sum += r as u128;
+                self.hit_n += 1;
+            }
+            (Some(r), true) => {
+                self.miss_rank_sum += r as u128;
+                self.miss_present += 1;
+                let b = if r < 2000 {
+                    0
+                } else if r < 5000 {
+                    1
+                } else if r < 10000 {
+                    2
+                } else {
+                    3
+                };
+                self.miss_band[b] += 1;
+            }
+            (None, true) => self.miss_absent += 1,
+            (None, false) => {} // resident hit for an unranked expert (rare)
+        }
+    }
+
+    fn report_hitgap(&self, pinned: usize, ranked_len: usize) {
+        tracing::info!(
+            "HITGAP: pin={pinned} of {ranked_len} ranked pairs | hits avg-rank {:.0} | \
+             misses: absent {} + rank<2k {} + 2-5k {} + 5-10k {} + >=10k {} (avg present {:.0})",
+            self.hit_rank_sum as f64 / self.hit_n.max(1) as f64,
+            self.miss_absent,
+            self.miss_band[0],
+            self.miss_band[1],
+            self.miss_band[2],
+            self.miss_band[3],
+            self.miss_rank_sum as f64 / self.miss_present.max(1) as f64,
+        );
+    }
+
+    fn report(&self) {
+        let tok = self.tokens.max(1) as f64;
+        let per = |ns: u128| ns as f64 / 1e6 / tok; // ms/token
+        let pct = |ns: u128| 100.0 * ns as f64 / self.wall_ns.max(1) as f64;
+        let accounted = self.fetch_ns
+            + self.attn_ns
+            + self.mlp_ns
+            + self.lmhead_ns
+            + self.route_ns
+            + self.prefetch_ns;
+        tracing::info!(
+            "PROFILE/tok: {:.0}ms wall | fetch {:.0}ms {:.0}% ({} miss, {:.2}ms/miss) | attn {:.0}ms {:.0}% | mlp {:.0}ms {:.0}% | lmhead {:.0}ms {:.0}% | route {:.0}ms {:.0}% | prefetch {:.1}ms | other {:.0}ms",
+            per(self.wall_ns),
+            per(self.fetch_ns),
+            pct(self.fetch_ns),
+            self.fetch_n / self.tokens.max(1),
+            self.fetch_ns as f64 / 1e6 / self.fetch_n.max(1) as f64,
+            per(self.attn_ns),
+            pct(self.attn_ns),
+            per(self.mlp_ns),
+            pct(self.mlp_ns),
+            per(self.lmhead_ns),
+            pct(self.lmhead_ns),
+            per(self.route_ns),
+            pct(self.route_ns),
+            per(self.prefetch_ns),
+            per(self.wall_ns.saturating_sub(accounted)),
+        );
+    }
+}
+
 pub struct GpuEngine<'a> {
     pin: Pin<'a>,
     cfg: &'a ModelConfig,
@@ -71,6 +168,7 @@ pub struct GpuEngine<'a> {
     // last token routed to, overlapping their fetch with this token's compute.
     prefetch: crate::prefetch::Prefetcher,
     last_sel: Vec<Vec<usize>>,
+    prof: Profile,
 }
 
 impl<'a> GpuEngine<'a> {
@@ -121,6 +219,7 @@ impl<'a> GpuEngine<'a> {
             sel: Vec::with_capacity(cfg.top_k),
             prefetch: crate::prefetch::Prefetcher::new(),
             last_sel: vec![Vec::new(); cfg.n_layers - cfg.dense_layers],
+            prof: Profile::default(),
             pin,
         })
     }
@@ -181,6 +280,7 @@ impl<'a> GpuEngine<'a> {
         // to (a stable predictor) so their NVMe read overlaps this token's compute
         // and the later copy_in hits the page cache, not cold disk.
         {
+            let t = std::time::Instant::now();
             let mut ranges = Vec::new();
             for (si, sel) in self.last_sel.iter().enumerate() {
                 let layer = si + cfg.dense_layers;
@@ -189,6 +289,7 @@ impl<'a> GpuEngine<'a> {
                 }
             }
             self.prefetch.warm(ranges);
+            self.prof.prefetch_ns += t.elapsed().as_nanos();
         }
 
         for l in 0..cfg.n_layers {
@@ -264,10 +365,14 @@ impl<'a> GpuEngine<'a> {
                 // Router gate on device, then read logits to route on host.
                 // SAFETY: gate_w resident F32; glp device scratch.
                 unsafe { launch_gemv_f32(xnp, gate_w, cfg.n_experts, hidden, glp)? };
-                device_sync()?; // read gate logits
+                let t = std::time::Instant::now();
+                device_sync()?; // wait attention+gate compute
+                self.prof.attn_ns += t.elapsed().as_nanos();
+                let t = std::time::Instant::now();
                 let gl = self.gate_logits.copy_out()?;
                 let bias = self.pin.moe_bias(l).to_vec();
                 self.route(&gl, &bias);
+                self.prof.route_ns += t.elapsed().as_nanos();
                 // Remember this layer's selection to prefetch next token (stable).
                 let ls = &mut self.last_sel[l - cfg.dense_layers];
                 ls.clear();
@@ -279,7 +384,13 @@ impl<'a> GpuEngine<'a> {
                 let mut w = Vec::with_capacity(ke + cfg.n_shared);
                 for i in 0..ke {
                     let e = self.sel[i];
+                    let miss0 = self.pin.misses;
+                    let t = std::time::Instant::now();
                     let m = self.pin.expert(l, e)?;
+                    self.prof.fetch_ns += t.elapsed().as_nanos();
+                    let missed = self.pin.misses > miss0;
+                    self.prof.fetch_n += u64::from(missed);
+                    self.prof.record_sel(self.pin.expert_rank(l, e), missed);
                     descs.push(desc_of(&m));
                     w.push(self.scores[e]);
                 }
@@ -319,7 +430,9 @@ impl<'a> GpuEngine<'a> {
             unsafe { launch_vadd(xp, self.moe_out.ptr() as *const f32, hidden)? };
             // End-of-layer join: protects the reused descs/wexpert/moe_out
             // buffers before the next layer overwrites them, and surfaces faults.
+            let t = std::time::Instant::now();
             device_sync()?;
+            self.prof.mlp_ns += t.elapsed().as_nanos();
         }
 
         // Final norm → lm_head → logits (device); caller reads via argmax.
@@ -336,7 +449,9 @@ impl<'a> GpuEngine<'a> {
                 self.logits.ptr_mut() as *mut f32,
             )?;
         }
+        let t = std::time::Instant::now();
         device_sync()?;
+        self.prof.lmhead_ns += t.elapsed().as_nanos();
         Ok(())
     }
 
@@ -379,6 +494,9 @@ impl<'a> GpuEngine<'a> {
             self.forward(tok, pos)?;
             pos += 1;
         }
+        // Profile the DECODE loop only (prefill is warm-up).
+        self.prof = Profile::default();
+        let decode_wall = std::time::Instant::now();
         let mut generated = Vec::with_capacity(ngen);
         // Windowed timing so the cache-warming trend is visible (does per-token
         // time drop as the working set caches?).
@@ -406,6 +524,11 @@ impl<'a> GpuEngine<'a> {
                 (win_hit, win_miss) = (self.pin.hits, self.pin.misses);
             }
         }
+        self.prof.wall_ns = decode_wall.elapsed().as_nanos();
+        self.prof.tokens = generated.len() as u64;
+        self.prof.report();
+        self.prof
+            .report_hitgap(self.pin.pinned_experts(), self.pin.ranked_len());
         Ok(generated)
     }
 }

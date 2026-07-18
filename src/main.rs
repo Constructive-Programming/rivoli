@@ -121,7 +121,10 @@ async fn run(cfg: Config) -> Result<()> {
     #[cfg(feature = "rocm")]
     {
         let (free, _total) = rivoli::device::mem_info()?;
-        // Leave 6 GiB free; cap the tier (48 GiB proven safe for one-shot alloc).
+        // 48 GiB tier: measured, pinning past this plateaus hit (45→53→67% at
+        // 48/64/94 GiB — 85% needs ~189 GiB, 2x the device) while starving the
+        // cold-expert page cache; the real lever is compute + workload-matched
+        // priming, not raw pin size.
         let cap = free.saturating_sub(6 << 30).min(48 << 30);
         let t = std::time::Instant::now();
         let pin = rivoli::pin::Pin::build(&snap, &mc, &usage, cap)?;
