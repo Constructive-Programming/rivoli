@@ -70,6 +70,17 @@ pub struct GpuEngine<'a> {
 
 impl<'a> GpuEngine<'a> {
     pub fn new(pin: Pin<'a>, cfg: &'a ModelConfig, max_ctx: usize) -> Result<Self> {
+        // The MoE block folds the shared expert into the routed batch (D6) at a
+        // single kernel `inter = moe_inter`. That is only valid when the shared
+        // expert has the routed width, i.e. n_shared == 1 (GLM-5.2). A wider
+        // shared expert would need its own launch at moe_inter*n_shared — refuse
+        // loudly rather than silently misread its rows.
+        ensure!(
+            cfg.n_shared == 1,
+            "GPU decode assumes n_shared==1 (shared folded into the routed batch); \
+             n_shared={} needs a separate shared launch",
+            cfg.n_shared
+        );
         let f = |n: usize| DeviceBuf::new(n * 4); // f32 buffer of n elems
         let kvl = cfg.kv_lora_rank;
         let rope = cfg.qk_rope_head_dim;
