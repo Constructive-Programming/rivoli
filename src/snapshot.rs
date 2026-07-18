@@ -93,6 +93,11 @@ struct IndexedShard {
     entries: Vec<(String, TensorLoc)>,
 }
 
+// THREE handles per shard, one per access pattern: `shards` (mmap) serves the
+// header/dims/bias and any zero-copy `bytes()` read; `files` (buffered File) serves
+// the one-shot resident `pread` load (page cache, then evicted); `odirect_fds`
+// (O_DIRECT File) feeds the io_uring cold-expert streamer (NVMe DMA straight into
+// the VMM slots, bypassing the page cache). All three are index-parallel by shard.
 pub struct Snapshot {
     shards: Vec<Mmap>,
     files: Vec<File>, // same order as `shards`; buffered pread (resident build)

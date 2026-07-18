@@ -2,11 +2,16 @@ use anyhow::{Context, Result, bail};
 use rivoli::config::Config;
 use tracing::info;
 
-/// CLI: `rivoli <snapshot-dir> [-bench <tokens>]`. No environment variables,
-/// no other flags — everything else is auto-discovered (see config.rs).
-fn parse_args() -> Result<(String, Option<usize>)> {
+/// CLI: `rivoli <snapshot-dir> [-bench <tokens>] [--pre-seed]`. No environment
+/// variables, no other flags — everything else is auto-discovered (see config.rs).
+/// `--pre-seed` warms the routed-expert LRU from `.coli_usage` at build time
+/// (+~6.8pt on the first tokens, ~23s slower build); default OFF gives a fast
+/// build and the LRU self-warms within a few tokens.
+fn parse_args() -> Result<(String, Option<usize>, bool)> {
+    const USAGE: &str = "usage: rivoli <snapshot-dir> [-bench <tokens>] [--pre-seed]";
     let mut snapshot = None;
     let mut bench = None;
+    let mut pre_seed = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -14,12 +19,13 @@ fn parse_args() -> Result<(String, Option<usize>)> {
                 let n = args.next().context("-bench requires a token count")?;
                 bench = Some(n.parse().context("-bench takes an integer")?);
             }
+            "--pre-seed" => pre_seed = true,
             _ if snapshot.is_none() => snapshot = Some(a),
-            _ => bail!("unexpected argument: {a}"),
+            _ => bail!("unexpected argument: {a}\n{USAGE}"),
         }
     }
-    let snapshot = snapshot.context("usage: rivoli <snapshot-dir> [-bench <tokens>]")?;
-    Ok((snapshot, bench))
+    let snapshot = snapshot.context(USAGE)?;
+    Ok((snapshot, bench, pre_seed))
 }
 
 fn main() -> Result<()> {
@@ -29,8 +35,8 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let (snapshot, bench) = parse_args()?;
-    let cfg = Config::discover(snapshot, bench)?;
+    let (snapshot, bench, pre_seed) = parse_args()?;
+    let cfg = Config::discover(snapshot, bench, pre_seed)?;
 
     // Rule 1: the full discovered config is the first line of every run.
     info!("rivoli {} | {cfg}", env!("CARGO_PKG_VERSION"));
@@ -121,13 +127,14 @@ async fn run(cfg: Config) -> Result<()> {
     #[cfg(feature = "rocm")]
     {
         let (free, _total) = rivoli::device::mem_info()?;
-        // Budget = always-resident (~11 GiB) + the routed-expert LRU. Fill most of
+        // Budget = the always-resident set (footprint computed from cfg in
+        // Pin::build, ~9-10 GiB for GLM-5.2) + the routed-expert LRU. Fill most of
         // device memory: the LRU is online priming, so a bigger pool captures more
         // of this run's working set (sim: 3200 slots→72%, 4200→75% hit) — leave
         // headroom for scratch/KV. The pin splits this into resident tier + LRU.
         let cap = free.saturating_sub(16 << 30).min(80 << 30);
         let t = std::time::Instant::now();
-        let pin = rivoli::pin::Pin::build(&snap, &mc, &usage, cap)?;
+        let pin = rivoli::pin::Pin::build(&snap, &mc, &usage, cap, cfg.pre_seed)?;
         info!("pin built in {:.1}s", t.elapsed().as_secs_f64());
         let max_ctx = prompt_ids.len() + ngen + 1;
         let mut engine = rivoli::gpu::GpuEngine::new(pin, &mc, max_ctx)?;

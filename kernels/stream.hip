@@ -11,6 +11,7 @@
 // rest (build.rs links -luring). Return codes mirror the rest: 0 ok, negative
 // -errno / -(cqe res).
 #include <liburing.h>
+#include <cerrno>
 #include <cstdlib>
 
 // Create a ring sized for `entries` in-flight reads. Returns an opaque handle or
@@ -39,10 +40,19 @@ extern "C" int rivoli_ring_read(void* ring, int fd, void* buf, unsigned nbytes,
 }
 
 // Submit all queued reads and wait for exactly `count` completions, draining them.
-// Returns 0 if all succeeded, else the first negative completion result (-errno)
-// or a submit error. `count` must equal the number of reads queued since the last
-// wait.
-extern "C" int rivoli_ring_wait(void* ring, unsigned count) {
+// Returns 0 if all succeeded, else the first negative completion result (-errno),
+// -EIO for a real mid-file short read, or a submit error. `count` must equal the
+// number of reads queued since the last wait.
+//
+// `min_res` (len `count`, indexed by each read's user_data) is the minimum byte
+// count each completion MUST deliver — the sub-block offset plus the useful
+// [begin,begin+len) length. O_DIRECT reads the aligned SUPERSET, which may extend
+// past EOF on a shard's last tensor, so a short completion is legitimate ONLY when
+// it still covers the useful window (`res >= min_res[ud]`); a shorter one is a real
+// mid-file truncation that would leave stale bytes in the slot tail, so it errors.
+// `min_res` may be null to skip the check (caller opts in).
+extern "C" int rivoli_ring_wait(void* ring, unsigned count,
+                                const unsigned long long* min_res) {
     struct io_uring* r = (struct io_uring*)ring;
     if (count == 0) return 0;
     int sub = io_uring_submit_and_wait(r, count);
@@ -55,7 +65,15 @@ extern "C" int rivoli_ring_wait(void* ring, unsigned count) {
             if (err == 0) err = w;
             break;
         }
-        if (c->res < 0 && err == 0) err = c->res; // first failing read
+        long long res = c->res;
+        unsigned long long ud = io_uring_cqe_get_data64(c);
+        if (res < 0) {
+            if (err == 0) err = (int)res; // first failing read (-errno)
+        } else if (min_res && (unsigned long long)res < min_res[ud]) {
+            // Short read that doesn't cover the useful window — real truncation,
+            // not benign EOF padding of the aligned superset.
+            if (err == 0) err = -EIO;
+        }
         io_uring_cqe_seen(r, c);
     }
     return err;

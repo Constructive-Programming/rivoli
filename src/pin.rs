@@ -2,10 +2,13 @@
 //! [`DeviceTier`] once at startup and resolves each to a raw device pointer, so
 //! per-token decode never touches the host for weights (PLAN.md D1/P3).
 //!
-//! Always resident (read every token, ~10 GiB static tier): the per-layer norms,
-//! the full attention stack (q_a/q_b/kv_a/kv_b/o_proj + their layernorms), the
-//! dense-layer MLPs, and — for MoE layers — the router gate, its bias, and the
-//! shared expert. The 256 routed experts/layer are served by an ADAPTIVE LRU pool
+//! Always resident (read every token): the per-layer norms, the full attention
+//! stack (q_a/q_b/kv_a/kv_b/o_proj + their layernorms), the dense-layer MLPs, and
+//! — for MoE layers — the router gate, its bias, and the shared expert. Its exact
+//! device footprint is computed from `cfg` at build ([`resident_bytes`]; ~9-10 GiB
+//! for GLM-5.2) and logged, so the tier is sized to what it holds and the rest of
+//! the device budget grows the LRU. The 256 routed experts/layer are served by an
+//! ADAPTIVE LRU pool
 //! ([`Lru`] + one VMM slab): a hit reuses the resident slot; a miss evicts the
 //! coldest and streams the expert in via io_uring O_DIRECT. The LRU adapts to the
 //! actual workload (online priming) — measured ~74% hit vs ~43% for a static
@@ -87,10 +90,10 @@ pub struct Pin<'a> {
     /// contiguous expert slots (slot i at `i * expert_slot`), each laid out
     /// gate|up|down, every region an O_DIRECT aligned superset. One allocation
     /// (no per-slot granularity waste). Which (layer,expert) occupies each slot is
-    /// managed by `lru`; `expert_slot`/`gate_slot` are the region strides.
+    /// managed by `lru`; `expert_slot` is the slot stride (the per-region gate/down
+    /// strides are re-derived from `cfg` via [`slot_geom`]).
     lru_pool: VmmBuf,
     expert_slot: usize,
-    gate_slot: usize,
     /// Adaptive routed tier: (layer,expert) -> slot, LRU-evicted. Replaces the
     /// static frequency pin — online priming that keeps this run's hot experts.
     lru: Lru,
@@ -165,13 +168,62 @@ fn place_mlp(
     })
 }
 
-/// Bytes one routed expert (gate+up+down int4 + scales) occupies — the cold-slot
-/// and pin-budget accounting unit.
-pub fn expert_bytes(cfg: &ModelConfig) -> usize {
-    let rb_h = cfg.hidden.div_ceil(2);
-    let rb_i = cfg.moe_inter.div_ceil(2);
-    // gate+up: [moe_inter, hidden]; down: [hidden, moe_inter]; + f32 scales.
-    2 * cfg.moe_inter * rb_h + cfg.hidden * rb_i + (2 * cfg.moe_inter + cfg.hidden) * 4
+/// Device bytes the always-resident set occupies — everything the forward pass
+/// reads every token EXCEPT the routed experts: the int8 embed/lm_head tables +
+/// final norm, and per layer the four norms, the five MLA projections, and either
+/// the dense MLP (dense layers) or the router gate f32 + shared expert (MoE
+/// layers). Summed from `cfg` so the resident tier is sized to what it actually
+/// holds and the rest of the device budget grows the routed LRU (rather than a
+/// fixed cap stranding several GiB). Byte counts mirror the placement path:
+/// int4 `[o,i]` = `o*row_bytes(i)` packed + `o*4` scale; int8 `[o,i]` = `o*i` +
+/// `o*4`; an f32 norm of `n` = `n*4`.
+fn resident_bytes(cfg: &ModelConfig) -> usize {
+    let rb = crate::quant::row_bytes;
+    let i4 = |o: usize, i: usize| o * rb(i) + o * 4;
+    let i8 = |o: usize, i: usize| o * i + o * 4;
+    let f32n = |n: usize| n * 4;
+
+    let qk = cfg.qk_head_dim();
+    // Global int8 tables + final norm.
+    let mut total = i8(cfg.vocab, cfg.hidden) // embed_tokens
+        + i8(cfg.vocab, cfg.hidden)           // lm_head
+        + f32n(cfg.hidden); // model.norm
+
+    for l in 0..cfg.n_layers {
+        // Norms: input, post-attn, q_a, kv_a.
+        total += 2 * f32n(cfg.hidden) + f32n(cfg.q_lora_rank) + f32n(cfg.kv_lora_rank);
+        // MLA projections (o_dim as placed by `Pin::build`).
+        total += i4(cfg.q_lora_rank, cfg.hidden); // q_a
+        total += i4(cfg.n_heads * qk, cfg.q_lora_rank); // q_b
+        total += i4(cfg.kv_lora_rank + cfg.qk_rope_head_dim, cfg.hidden); // kv_a
+        total += i4(
+            cfg.n_heads * (cfg.qk_nope_head_dim + cfg.v_head_dim),
+            cfg.kv_lora_rank,
+        ); // kv_b
+        total += i4(cfg.hidden, cfg.n_heads * cfg.v_head_dim); // o_proj
+        // MLP: dense for the first `dense_layers`, else router gate + shared expert.
+        if l < cfg.dense_layers {
+            total += 2 * i4(cfg.dense_inter, cfg.hidden); // gate, up
+            total += i4(cfg.hidden, cfg.dense_inter); // down
+        } else {
+            total += f32n(cfg.n_experts * cfg.hidden); // router gate (F32, device)
+            let si = cfg.moe_inter * cfg.n_shared;
+            total += 2 * i4(si, cfg.hidden); // shared gate, up
+            total += i4(cfg.hidden, si); // shared down
+        }
+    }
+    total
+}
+
+/// Pack `(layer, expert)` into the LRU key. Both must fit in 16 bits — GLM is
+/// ≤92 layers × 256 routed experts, comfortably under 2^16, but assert it so a
+/// larger config can't silently collide keys.
+fn expert_key(layer: usize, expert: usize) -> u32 {
+    debug_assert!(
+        layer < (1 << 16) && expert < (1 << 16),
+        "layer {layer}/expert {expert} exceed the 16-bit LRU key packing"
+    );
+    ((layer as u32) << 16) | expert as u32
 }
 
 /// The routed-expert LRU: maps `(layer,expert)` keys to pool slot indices, evicting
@@ -249,17 +301,28 @@ impl<'a> Pin<'a> {
         cfg: &'a ModelConfig,
         usage: &Usage,
         capacity: usize,
+        pre_seed: bool,
     ) -> Result<Self> {
         let (free, _total) = mem_info()?;
         ensure!(
             capacity < free,
             "pin capacity {capacity} >= free device memory {free}"
         );
-        // The static tier holds only the always-resident set (~7 GiB); the rest of
-        // the budget goes to the routed LRU. Size it modestly (not `capacity`, or
-        // it hogs the memory the LRU needs).
-        const RESIDENT_CAP: usize = 12 << 30;
-        let mut tier = DeviceTier::new(RESIDENT_CAP)?;
+        // The static tier holds only the always-resident set; the rest of the
+        // budget goes to the routed LRU. Size the tier to the footprint computed
+        // from `cfg` (not a fixed cap that strands 1-5 GiB the LRU could use, and
+        // not `capacity`, which would hog everything the LRU needs). The slack
+        // absorbs the per-reservation 256-byte alignment padding and a small
+        // margin; anything left over widens the LRU below.
+        const SLACK: usize = 256 << 20; // 256 MiB
+        let resident = resident_bytes(cfg);
+        let tier_cap = resident + SLACK;
+        tracing::info!(
+            "computed resident footprint {:.2} GiB (tier {:.2} GiB incl. slack)",
+            resident as f64 / (1u64 << 30) as f64,
+            tier_cap as f64 / (1u64 << 30) as f64,
+        );
+        let mut tier = DeviceTier::new(tier_cap)?;
 
         // Global tensors.
         let embed = place_i8(&mut tier, snap, "model.embed_tokens", cfg.hidden)?;
@@ -333,14 +396,9 @@ impl<'a> Pin<'a> {
         // (online priming). Each slot holds a projection's O_DIRECT aligned superset
         // (packed then scale, each `slot_span` — block-aligned + straddle pad — so
         // reads land in place and descriptors point at the sub-block offsets). Size
-        // to the budget left after the always-resident set. `usage` is reserved for
-        // future warm-start seeding; the LRU warms up in a few tokens regardless.
-        let rb_h = cfg.hidden.div_ceil(2);
-        let rb_i = cfg.moe_inter.div_ceil(2);
-        let gate_slot = slot_span(cfg.moe_inter * rb_h) + slot_span(cfg.moe_inter * 4);
-        let down_slot = slot_span(cfg.hidden * rb_i) + slot_span(cfg.hidden * 4);
-        let expert_slot = 2 * gate_slot + down_slot; // gate | up | down, one slot
-        let budget = capacity.saturating_sub(RESIDENT_CAP);
+        // to the budget left after the always-resident set.
+        let (_, expert_slot) = slot_geom(cfg);
+        let budget = capacity.saturating_sub(tier_cap);
         let n_slots = (budget / expert_slot).max(cfg.top_k);
         let mut lru_pool = VmmBuf::new(n_slots * expert_slot)?; // ONE slab
         tracing::info!(
@@ -350,13 +408,16 @@ impl<'a> Pin<'a> {
         );
         let mut lru = Lru::new(n_slots);
         // Ring sized for one layer's worst case: top_k misses x 3 proj x 2 tensors.
-        let mut stream = Streamer::new((cfg.top_k * 6).next_power_of_two() as u32 * 2)?;
-        // Warm start: seed the pool with the hottest experts from .coli_usage so
-        // the first tokens hit at colibri's rate while the LRU adapts to this
-        // workload. Bounded by the pool size; drained in queue-depth batches.
-        {
+        let ring = (cfg.top_k * 6).next_power_of_two() * 2;
+        let mut stream = Streamer::new(ring as u32)?;
+        // Optional warm start (`--pre-seed`): seed the pool with the hottest experts
+        // from .coli_usage so the first tokens hit at colibri's rate while the LRU
+        // adapts. Worth ~+6.8pt on the first tokens but transient (the LRU warms up
+        // in a few tokens regardless) and it dominates build time (~23s), so it is
+        // OFF by default — enable it only for slow disks. Bounded by the pool size;
+        // drained in queue-depth batches.
+        if pre_seed {
             let pool = lru_pool.ptr_mut();
-            let ring = (cfg.top_k * 6).next_power_of_two() * 2;
             let batch = (ring / 6).max(1); // experts per drain (6 reads each)
             let mut n = 0usize;
             for &((l, e), _) in usage.ranked().iter() {
@@ -367,10 +428,9 @@ impl<'a> Pin<'a> {
                 if l < cfg.dense_layers || l >= cfg.n_layers || e >= cfg.n_experts {
                     continue; // stale ranking entry
                 }
-                let slot = lru.alloc(((l as u32) << 16) | e as u32)?;
+                let slot = lru.alloc(expert_key(l, e))?;
                 let base = format!("model.layers.{l}.mlp.experts.{e}");
-                lru.off[slot] =
-                    stream_expert(&mut stream, snap, pool, expert_slot, gate_slot, slot, &base)?;
+                lru.off[slot] = stream_expert(&mut stream, snap, cfg, pool, slot, &base)?;
                 n += 1;
                 if n.is_multiple_of(batch) {
                     stream.drain()?;
@@ -391,7 +451,6 @@ impl<'a> Pin<'a> {
             moe_bias,
             lru_pool,
             expert_slot,
-            gate_slot,
             lru,
             stream,
             hits: 0,
@@ -415,31 +474,34 @@ impl<'a> Pin<'a> {
     /// submit as ONE queue-depth io_uring O_DIRECT batch, joined once.
     pub fn resolve_layer(&mut self, layer: usize, sel: &[usize]) -> Result<Vec<Mlp>> {
         let (cfg, snap) = (self.cfg, self.snap);
-        // Phase 1: LRU lookup; each miss allocates a slot and QUEUEs its 6 reads.
-        let mut slots = Vec::with_capacity(sel.len());
+        // Phase 1a: touch EVERY hit first. Doing this before any miss's `alloc()`
+        // bumps each hit's LRU tick above the eviction candidates, so a later miss
+        // cannot evict a same-layer would-be hit out from under itself (which would
+        // force a needless re-stream and understate the hit rate). `None` marks a
+        // slot still to be filled in phase 1b.
+        let mut slots: Vec<Option<usize>> = Vec::with_capacity(sel.len());
         for &e in sel {
-            let key = ((layer as u32) << 16) | e as u32;
-            if let Some(slot) = self.lru.get(key) {
-                self.hits += 1;
-                slots.push(slot);
+            match self.lru.get(expert_key(layer, e)) {
+                Some(slot) => {
+                    self.hits += 1;
+                    slots.push(Some(slot));
+                }
+                None => slots.push(None),
+            }
+        }
+        // Phase 1b: allocate + QUEUE the misses, now that all hits are protected.
+        for (i, &e) in sel.iter().enumerate() {
+            if slots[i].is_some() {
                 continue;
             }
             self.misses += 1;
-            let slot = self.lru.alloc(key)?;
+            let slot = self.lru.alloc(expert_key(layer, e))?;
             let base = format!("model.layers.{layer}.mlp.experts.{e}");
             // ptr_mut() yields a raw ptr, so no borrow of lru_pool is held across
             // the &mut self.stream reads.
             let pool = self.lru_pool.ptr_mut();
-            self.lru.off[slot] = stream_expert(
-                &mut self.stream,
-                snap,
-                pool,
-                self.expert_slot,
-                self.gate_slot,
-                slot,
-                &base,
-            )?;
-            slots.push(slot);
+            self.lru.off[slot] = stream_expert(&mut self.stream, snap, cfg, pool, slot, &base)?;
+            slots[i] = Some(slot);
         }
         // Phase 2: ONE join for the whole layer's cold reads.
         self.stream.drain()?;
@@ -451,6 +513,9 @@ impl<'a> Pin<'a> {
         let es = self.expert_slot;
         let mut out = Vec::with_capacity(sel.len());
         for &slot in &slots {
+            // Every entry was filled in phase 1a/1b; a `None` here is an internal
+            // invariant break, not a data condition — fail loud rather than panic.
+            let slot = slot.context("resolve_layer: unresolved expert slot")?;
             let o = self.lru.off[slot];
             // SAFETY: slot base within the slab; reads that filled it have joined.
             let b = unsafe { pool.add(slot * es) };
@@ -474,15 +539,39 @@ impl<'a> Pin<'a> {
 /// at `slot*expert_slot`), returning the 6 slot-relative sub-block offsets
 /// `[gate_p, gate_s, up_p, up_s, down_p, down_s]`. Shared by the decode-miss path
 /// and the build-time warm-start seed.
+/// One routed expert's pool-slot geometry, derived from `cfg`: `(gate_slot,
+/// expert_slot)`. A slot is laid out gate|up|down; `gate` and `up` each span
+/// `gate_slot` (packed superset + scale superset), `down` the rest, and the whole
+/// expert occupies `expert_slot`. The single source of truth for both the pool
+/// sizing in [`Pin::build`] and the per-region offsets in [`stream_expert`].
+fn slot_geom(cfg: &ModelConfig) -> (usize, usize) {
+    let rb_h = cfg.hidden.div_ceil(2);
+    let rb_i = cfg.moe_inter.div_ceil(2);
+    let gate_slot = slot_span(cfg.moe_inter * rb_h) + slot_span(cfg.moe_inter * 4);
+    let down_slot = slot_span(cfg.hidden * rb_i) + slot_span(cfg.hidden * 4);
+    (gate_slot, 2 * gate_slot + down_slot) // gate | up | down, one slot
+}
+
 fn stream_expert(
     stream: &mut Streamer,
     snap: &Snapshot,
+    cfg: &ModelConfig,
     pool: *mut u8,
-    expert_slot: usize,
-    gate_slot: usize,
     slot: usize,
     base: &str,
 ) -> Result<[usize; 6]> {
+    let (gate_slot, expert_slot) = slot_geom(cfg);
+    // cfg-expected packed/scale byte lengths per projection — the SAME budget the
+    // slot regions (`gate_slot`/`down_slot` in `build`) were sized from. The cold
+    // io_uring path reads a RAW file length (`read_spec`) with no dim, so cross-check
+    // it here exactly as the resident path does via `Snapshot::int4`: a config/
+    // snapshot dim mismatch would otherwise overrun one projection's region into the
+    // next (or the last slot's `down` past the slab) and stream wrong-expert bytes.
+    let rb_h = cfg.hidden.div_ceil(2);
+    let rb_i = cfg.moe_inter.div_ceil(2);
+    // gate/up: [moe_inter, hidden]; down: [hidden, moe_inter]; one f32 scale per row.
+    let (gate_p, gate_s) = (cfg.moe_inter * rb_h, cfg.moe_inter * 4);
+    let (down_p, down_s) = (cfg.hidden * rb_i, cfg.hidden * 4);
     let o = slot * expert_slot;
     // SAFETY: o + 2*gate_slot + down region <= pool len (slot < n_slots).
     let (gp, up, dp) = unsafe {
@@ -493,9 +582,28 @@ fn stream_expert(
         )
     };
     // SAFETY: each region is block-aligned and sized for its two supersets.
-    let (pg, sg) = unsafe { queue_proj(stream, snap, gp, &format!("{base}.gate_proj"))? };
-    let (pu, su) = unsafe { queue_proj(stream, snap, up, &format!("{base}.up_proj"))? };
-    let (pd, sd) = unsafe { queue_proj(stream, snap, dp, &format!("{base}.down_proj"))? };
+    let (pg, sg) = unsafe {
+        queue_proj(
+            stream,
+            snap,
+            gp,
+            &format!("{base}.gate_proj"),
+            gate_p,
+            gate_s,
+        )?
+    };
+    let (pu, su) =
+        unsafe { queue_proj(stream, snap, up, &format!("{base}.up_proj"), gate_p, gate_s)? };
+    let (pd, sd) = unsafe {
+        queue_proj(
+            stream,
+            snap,
+            dp,
+            &format!("{base}.down_proj"),
+            down_p,
+            down_s,
+        )?
+    };
     Ok([
         pg,
         sg,
@@ -511,24 +619,41 @@ fn stream_expert(
 /// packed in the first `slot_span`, scale in the next. Returns the sub-block
 /// offsets RELATIVE to `region` where the useful bytes land.
 ///
+/// `exp_packed`/`exp_scale` are the cfg-derived byte lengths the region was sized
+/// for; the RAW `read_spec` lengths are `ensure!`d to match them (fail loud on a
+/// config/snapshot dim mismatch, like the resident `Snapshot::int4` path).
+///
 /// # Safety
-/// `region` must be block-aligned and own the projection's two supersets.
+/// `region` must be block-aligned and own the projection's two supersets
+/// (`slot_span(exp_packed) + slot_span(exp_scale)` bytes).
 unsafe fn queue_proj(
     stream: &mut Streamer,
     snap: &Snapshot,
     region: *mut u8,
     proj: &str,
+    exp_packed: usize,
+    exp_scale: usize,
 ) -> Result<(usize, usize)> {
     let base = region;
     let (pfd, pb, plen) = snap
         .read_spec(&format!("{proj}.weight"))
         .with_context(|| format!("cold read_spec {proj}.weight"))?;
+    ensure!(
+        plen == exp_packed,
+        "cold {proj}.weight: {plen} packed bytes, cfg expects {exp_packed} \
+         (config/snapshot dim mismatch)"
+    );
     // SAFETY: base is VMM (block-aligned); slot sized >= slot_span(plen)+slot_span(slen).
     let poff = unsafe { stream.queue(pfd, pb, plen, base)? };
     let sreg = slot_span(plen); // block-aligned scale region within the slot
     let (sfd, sb, slen) = snap
         .read_spec(&format!("{proj}.weight.qs"))
         .with_context(|| format!("cold read_spec {proj}.weight.qs"))?;
+    ensure!(
+        slen == exp_scale,
+        "cold {proj}.weight.qs: {slen} scale bytes, cfg expects {exp_scale} \
+         (config/snapshot dim mismatch)"
+    );
     // SAFETY: base+sreg is block-aligned and within the slot's second region.
     let soff = unsafe { stream.queue(sfd, sb, slen, base.add(sreg))? };
     Ok((poff, sreg + soff))

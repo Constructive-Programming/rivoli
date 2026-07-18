@@ -20,6 +20,9 @@ pub struct Config {
     /// Benchmark mode: decode this many tokens then print PROFILE and exit.
     /// None = server mode (later milestone).
     pub bench: Option<usize>,
+    /// Warm-start the routed-expert LRU from `.coli_usage` at build time
+    /// (`--pre-seed`). Default false: fast build, LRU self-warms in a few tokens.
+    pub pre_seed: bool,
     /// Total budget for expert residency (pin + slab pool), bytes:
     /// MemAvailable − OS_RESERVE − engine overhead (refined at snapshot load).
     pub mem_budget: u64,
@@ -67,7 +70,7 @@ fn gtt_info() -> Option<(u64, u64)> {
 impl Config {
     /// Discover the machine. Fails loudly if another GPU tenant is active —
     /// sole tenancy is a startup invariant, not a runtime hope.
-    pub fn discover(snapshot: String, bench: Option<usize>) -> Result<Self> {
+    pub fn discover(snapshot: String, bench: Option<usize>, pre_seed: bool) -> Result<Self> {
         let avail = mem_available()?;
         if avail <= OS_RESERVE {
             bail!(
@@ -91,6 +94,7 @@ impl Config {
         Ok(Self {
             snapshot,
             bench,
+            pre_seed,
             mem_budget: avail - OS_RESERVE,
             gtt_free: gtt_total.saturating_sub(gtt_used),
             threads,
@@ -103,9 +107,10 @@ impl fmt::Display for Config {
         const GIB: f64 = (1u64 << 30) as f64;
         write!(
             f,
-            "snap={} bench={:?} mem_budget={:.1}GiB gtt_free={:.1}GiB os_reserve={:.0}GiB threads={}",
+            "snap={} bench={:?} pre_seed={} mem_budget={:.1}GiB gtt_free={:.1}GiB os_reserve={:.0}GiB threads={}",
             self.snapshot,
             self.bench,
+            self.pre_seed,
             self.mem_budget as f64 / GIB,
             self.gtt_free as f64 / GIB,
             OS_RESERVE as f64 / GIB,

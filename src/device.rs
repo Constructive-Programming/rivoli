@@ -1,5 +1,6 @@
-//! The resident device tier: one `hipMalloc` slab allocated ONCE at startup,
-//! into which hot weights are placed and handed to the kernels as raw device
+//! The resident device tier: one device-local, host-fillable VMM slab
+//! ([`VmmBuf`]) allocated ONCE at startup, into which hot weights are filled in
+//! place (`pread`/memcpy, no separate H2D) and handed to the kernels as raw device
 //! pointers. This is the foundation the descriptor-array MoE kernel (D1) and the
 //! flash attention kernel (D2) read from — weights stream through the GPU
 //! exactly once, no host↔device copy on the hot path.
@@ -324,17 +325,28 @@ mod tier {
         pub fn ptr(&self) -> *const u8 {
             self.ptr
         }
-        /// Host-writable pointer — the caller fills in place (`pread`/memcpy), no
-        /// `hipMemcpy`/sync.
+        /// Host-writable pointer — the caller fills in place (`pread`/memcpy, or an
+        /// io_uring O_DIRECT DMA), no `hipMemcpy`/sync.
         ///
-        /// Ordering: the GPU sees the host stores at the next kernel launch on THIS
-        /// (the single HIP/decode) thread — the launch's dispatch packet carries a
-        /// release fence (drains the CPU store buffer) + a system-scope acquire
-        /// (invalidates GPU caches), and gfx1151's coherent fabric lets the
-        /// host-granted device-local mapping participate. Verified CPU->GPU coherent
-        /// on this APU (docs/probes/vmm_probe.cpp, incl. `pread`). NOT a HIP contract
-        /// for arbitrary hardware: a port off gfx1151, or a fill from a background
-        /// HIP thread, must re-verify or insert an explicit fence.
+        /// Ordering, CPU memcpy fill: the GPU sees the host stores at the next kernel
+        /// launch on THIS (the single HIP/decode) thread — the launch's dispatch
+        /// packet carries a release fence (drains the CPU store buffer) + a
+        /// system-scope acquire (invalidates GPU caches), and gfx1151's coherent
+        /// fabric lets the host-granted device-local mapping participate.
+        ///
+        /// Ordering, io_uring DMA fill (the cold-expert stream): the bytes are
+        /// written by the kernel's DMA engine, NOT CPU stores, so the store-buffer
+        /// release fence above does not apply to them. Visibility rests instead on
+        /// (a) the dispatch packet's system-scope ACQUIRE invalidating the GPU caches
+        /// before the reading kernel, and (b) the completed io_uring drain
+        /// (`Streamer::drain`) happening-before that launch, plus the end-of-layer
+        /// [`crate::hip::device_sync`] fencing slot reuse. No CPU store fence is
+        /// involved on this path.
+        ///
+        /// Verified CPU->GPU coherent on this APU (docs/probes/vmm_probe.cpp, incl.
+        /// `pread`). NOT a HIP contract for arbitrary hardware: a port off gfx1151,
+        /// or a fill from a background HIP thread, must re-verify or insert an
+        /// explicit fence.
         pub fn ptr_mut(&mut self) -> *mut u8 {
             self.ptr
         }
