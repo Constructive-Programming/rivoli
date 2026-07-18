@@ -32,6 +32,7 @@ unsafe extern "C" {
         e: i32,
         descs: *const ExpertDesc,
         wexpert: *const f32,
+        h: *mut f32,
         partial: *mut f32,
         out: *mut f32,
     ) -> i32;
@@ -241,6 +242,7 @@ pub unsafe fn launch_moe(
     e: usize,
     descs: *const ExpertDesc,
     wexpert: *const f32,
+    h: *mut f32,
     partial: *mut f32,
     out: *mut f32,
 ) -> Result<()> {
@@ -257,6 +259,7 @@ pub unsafe fn launch_moe(
             e as i32,
             descs,
             wexpert,
+            h,
             partial,
             out,
         )

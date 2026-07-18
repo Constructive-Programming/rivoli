@@ -27,56 +27,74 @@ struct ExpertDesc {
     const float*         down_scale;   // [hidden]
 };
 
-// Σ_i v[i] * (nibble(row,i) - 8), matching quant.rs: low nibble = even col,
-// high nibble = odd col; signed value = nibble - 8.
-__device__ __forceinline__ float dot_i4(const float* __restrict__ v,
-                                        const unsigned char* __restrict__ row,
-                                        int dim) {
+#define WAVE 32          // gfx1151 native wave32
+#define ROWS_PER_BLOCK 8 // 256 threads = 8 waves → 8 output rows/block
+
+// Sum a wave's partials into lane 0 (fixed __shfl_down order → deterministic).
+__device__ __forceinline__ float wave_sum(float v) {
+    for (int o = WAVE / 2; o > 0; o >>= 1) v += __shfl_down(v, o, WAVE);
+    return v;
+}
+
+// Wave-cooperative int4 dot: lane `l` sums columns i ≡ l (mod WAVE) — adjacent
+// lanes read adjacent packed bytes (one coalesced transaction). Result on lane 0.
+// Matches quant.rs: low nibble = even col, high = odd; signed value = nibble - 8.
+__device__ __forceinline__ float dot_i4_wave(const float* __restrict__ v,
+                                             const unsigned char* __restrict__ row,
+                                             int dim, int lane) {
     float acc = 0.0f;
-    for (int i = 0; i < dim; ++i) {
+    for (int i = lane; i < dim; i += WAVE) {
         unsigned char b = row[i >> 1];
         int n = (i & 1) ? (b >> 4) : (b & 0x0F);
         acc += v[i] * (float)(n - 8);
     }
-    return acc;
+    return wave_sum(acc);
 }
 
 __device__ __forceinline__ float siluf(float x) {
     return x / (1.0f + expf(-x));
 }
 
-// grid = E blocks (one per expert); block = 256 threads; dynamic LDS = inter floats.
-// Each expert writes its weighted contribution to its OWN partial[e] row — no
-// atomicAdd — so the result is independent of GPU scheduling. The fixed-order sum
-// happens in moe_reduce (determinism: greedy decode is reproducible).
-extern "C" __global__ void moe_expert_batch(
-    const float* __restrict__ x, int hidden, int inter,
-    const ExpertDesc* __restrict__ descs, const float* __restrict__ wexpert,
-    float* __restrict__ partial) {
-    extern __shared__ float h[];  // [inter]
-    int e = blockIdx.x;
-    int t = threadIdx.x;
-    int nt = blockDim.x;
+// The fused MoE is UNFUSED into two coalesced, MANY-block GEMV passes so the grid
+// carries the parallelism (the old one-block-per-expert form launched only E≤9
+// workgroups — half the iGPU idle — and its thread-per-row reads were uncoalesced).
+// Pass 1 (this) computes the SwiGLU hidden h[e][j] for every (expert, inter-row);
+// pass 2 (moe_down) consumes h. One WAVE per output row, coalesced + shuffle-reduce
+// (D3), grid = ceil(E*inter / ROWS_PER_BLOCK) blocks → full occupancy.
+//
+// h[e*inter + j] = silu(scale_g[j]·(gate_ej·x)) * scale_u[j]·(up_ej·x).
+extern "C" __global__ void moe_gateup(
+    const float* __restrict__ x, int hidden, int inter, int E,
+    const ExpertDesc* __restrict__ descs, float* __restrict__ h_out) {
+    int lane = threadIdx.x & (WAVE - 1);
+    size_t r = (size_t)blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / WAVE;
+    if (r >= (size_t)E * inter) return; // wave-uniform (all lanes share r)
+    int e = (int)(r / inter);
+    int j = (int)(r % inter);
     const ExpertDesc d = descs[e];
+    size_t rb_h = (hidden + 1) / 2;
+    float g = dot_i4_wave(x, d.gate_packed + (size_t)j * rb_h, hidden, lane);
+    float u = dot_i4_wave(x, d.up_packed + (size_t)j * rb_h, hidden, lane);
+    if (lane == 0) h_out[r] = siluf(g * d.gate_scale[j]) * (u * d.up_scale[j]);
+}
 
-    size_t rb_h = (hidden + 1) / 2;  // packed bytes per gate/up row
-    size_t rb_i = (inter + 1) / 2;   // packed bytes per down row
-
-    // Phase A: h[j] = silu(scale_g[j]·(gate_j·x)) * scale_u[j]·(up_j·x).
-    for (int j = t; j < inter; j += nt) {
-        float g = dot_i4(x, d.gate_packed + (size_t)j * rb_h, hidden) * d.gate_scale[j];
-        float u = dot_i4(x, d.up_packed + (size_t)j * rb_h, hidden) * d.up_scale[j];
-        h[j] = siluf(g) * u;
-    }
-    __syncthreads();
-
-    // Phase B: partial[e][o] = w[e] * scale_d[o] · (down_o · h). Own row, no atomic.
-    float we = wexpert[e];
-    float* prow = partial + (size_t)e * hidden;
-    for (int o = t; o < hidden; o += nt) {
-        float dv = dot_i4(h, d.down_packed + (size_t)o * rb_i, inter) * d.down_scale[o];
-        prow[o] = we * dv;
-    }
+// Pass 2: partial[e][o] = w[e] * scale_d[o] · (down_eo · h[e]). Each expert writes
+// its OWN partial[e] row (no atomicAdd → schedule-independent; moe_reduce sums in
+// fixed order). One WAVE per output row, coalesced; grid = ceil(E*hidden / RPB).
+extern "C" __global__ void moe_down(
+    int hidden, int inter, int E, const ExpertDesc* __restrict__ descs,
+    const float* __restrict__ wexpert, const float* __restrict__ h_in,
+    float* __restrict__ partial) {
+    int lane = threadIdx.x & (WAVE - 1);
+    size_t r = (size_t)blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / WAVE;
+    if (r >= (size_t)E * hidden) return;
+    int e = (int)(r / hidden);
+    int o = (int)(r % hidden);
+    const ExpertDesc d = descs[e];
+    size_t rb_i = (inter + 1) / 2;
+    const float* he = h_in + (size_t)e * inter;
+    float dv = dot_i4_wave(he, d.down_packed + (size_t)o * rb_i, inter, lane);
+    if (lane == 0) partial[r] = wexpert[e] * dv * d.down_scale[o];
 }
 
 // out[o] = Σ_e partial[e][o], e ASCENDING — a fixed, schedule-independent
@@ -90,22 +108,29 @@ extern "C" __global__ void moe_reduce(
     out[o] = acc;
 }
 
-// Launch the batch over already-resident device memory: each expert into its own
-// `partial[E*hidden]` row, then the fixed-order reduce into `out` (fully written,
-// no pre-zero needed). Does NOT allocate/copy/synchronize — the caller owns
-// x/descs/wexpert/partial/out and joins once per token. Return codes: 0 ok,
+// Launch the batch over already-resident device memory: pass 1 writes the SwiGLU
+// hidden into `h` (caller-owned scratch, ≥ E*inter floats), pass 2 writes each
+// expert's `partial[E*hidden]` row, then the fixed-order reduce into `out` (fully
+// written, no pre-zero). Does NOT allocate/copy/synchronize — the caller owns
+// x/descs/wexpert/h/partial/out and joins once per token. Return codes: 0 ok,
 // POSITIVE arg guard, NEGATIVE -(hipError_t).
 extern "C" int rivoli_moe_experts(
     const float* x, int hidden, int inter, int E,
-    const void* descs, const float* wexpert, float* partial, float* out) {
+    const void* descs, const float* wexpert, float* h, float* partial, float* out) {
     if (hidden <= 0 || inter <= 0 || E <= 0) return 1001;
-    size_t lds = (size_t)inter * sizeof(float);
-    // gfx1151 LDS ceiling is 64KB/workgroup (also asserted at model load).
-    if (lds > 65536) return 1002;
+    const ExpertDesc* d = (const ExpertDesc*)descs;
     hipGetLastError();  // drain any stale error so the check below is this launch's
-    hipLaunchKernelGGL(moe_expert_batch, dim3(E), dim3(256), lds, 0,
-                       x, hidden, inter, (const ExpertDesc*)descs, wexpert, partial);
+    // Pass 1: gate/up → h (grid = ceil(E*inter / ROWS_PER_BLOCK) coalesced waves).
+    size_t rows_a = (size_t)E * inter;
+    hipLaunchKernelGGL(moe_gateup, dim3((rows_a + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
+                       dim3(256), 0, 0, x, hidden, inter, E, d, h);
     hipError_t e = hipGetLastError();
+    if (e != hipSuccess) return -(int)e;
+    // Pass 2: down · h → partial (grid = ceil(E*hidden / ROWS_PER_BLOCK)).
+    size_t rows_b = (size_t)E * hidden;
+    hipLaunchKernelGGL(moe_down, dim3((rows_b + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
+                       dim3(256), 0, 0, hidden, inter, E, d, wexpert, h, partial);
+    e = hipGetLastError();
     if (e != hipSuccess) return -(int)e;
     hipLaunchKernelGGL(moe_reduce, dim3((hidden + 255) / 256), dim3(256), 0, 0,
                        partial, E, hidden, out);
