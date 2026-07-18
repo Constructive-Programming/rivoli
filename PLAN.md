@@ -578,3 +578,17 @@ ignored:
   launches is reported as CPU fallback, loudly.
 - ollama-router repo conventions: flat modules, `tests/`, `.githooks`
   pre-commit (fmt+clippy) / pre-push (test), version-guarded `build.sh`.
+
+### io_uring O_DIRECT queue-depth probe — GO (2026-07-18, feat/direct-load)
+
+The direct-load regression traced to access pattern, not bandwidth. Probe
+(`docs/probes/iouring_vmm.cpp`, O_DIRECT NVMe→VMM, coherent/MATCH):
+QD=1 4.1 GB/s | QD=4 16.3 | QD=16 16.0 | QD=128 17.0. NVMe is latency-bound at
+QD=1; at depth ≥4 it delivers **~16 GB/s = ~3× the current cold-path effective
+bandwidth** (warm 793 + fetch 364 ≈ 1157 ms for ~6.3 GB/token ≈ 5.4 GB/s).
+Projected: fold warm+fetch into one overlapped O_DIRECT stream → cold I/O
+~390-630 ms/token → wall ~1320-1560 ms → **~0.64-0.76 tok/s** (vs 0.47 now;
+colibri 0.8). GO. NEXT: implement io_uring O_DIRECT streaming into the cold VMM
+slots (replace mmap-warm + memcpy-fetch) + O_DIRECT for the resident build.
+Caveats to verify in-engine: random ~19 MB expert reads vs the probe's sequential
+1 MiB; some of 16 GB/s may be drive-side.
