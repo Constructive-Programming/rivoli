@@ -345,3 +345,11 @@ fn mla_attend_head_tiling_boundaries() {
     check_attend(0xb10c_c0de, 64, 130, 512, 64);
     check_attend(0x2020_2020, 20, 96, 512, 64);
 }
+
+#[test]
+fn mla_attend_long_context() {
+    // On-device tile loop at scale: 40k tokens = ~2500 TILE=16 steps, so the
+    // per-lane bit-exact online-softmax replication is OBSERVED over thousands of
+    // iterations (not just proven), at the GLM latent width.
+    check_attend(0x1eaf_1eaf, 8, 40_000, 512, 64);
+}

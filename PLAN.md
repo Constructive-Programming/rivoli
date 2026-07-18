@@ -325,6 +325,30 @@ ignored:
   the shared expert into the routed batch when `n_shared==1` (D6, GLM-5.2) but
   CANNOT express mixed-width experts — a future `n_shared>1` config would need
   per-descriptor `inter`/`hidden` added to the struct (validated at model load).
+- **KV cache = per-layer resident slab (P2), grown in place.** The attention
+  kernel's `Lc[nt*kvl]/Rc[nt*rope] + nt` signature is already device-slab-shaped
+  (verified) — do NOT change it. Wiring: one `DeviceBuf` per layer sized to
+  `max_ctx` up front (200k → ~205MB L + 26MB R/layer, ~18GB total, fits with the
+  64GB pin), append = write ONE token's 1152 bytes at `nt*row_bytes` via a new
+  `DeviceBuf::copy_in_at(off, bytes)` + increment `nt`. NEVER `from_bytes` the
+  whole cache per token (18GB H2D + a per-token hipMalloc = the wedge). The
+  append value is `s.comp[..kvl]` f32 → convert to bf16 into a hoisted
+  `[u16; kvl+rope]` scratch, then `copy_in_at`.
+- **Value projection + o_proj stay on device.** The kernel writes `clat`
+  device-side. If the `clat→ctx` projection through `kv_b` value rows (attn.rs
+  matvec_i4_rows) or o_proj run on host, every layer must D2H-copy clat + join to
+  read it = ~78 joins/token, breaking ≤1 join. Keep the whole layer a device
+  pipeline with one token-end join. (qabs/qrope PRODUCTION can stay host — a
+  pre-launch H2D input adds no join; only post-kernel outputs force a join.)
+- **Attention KV re-read is a 200k tune, not a gate blocker.** HB=8 → ⌈H/HB⌉=8×
+  DRAM KV re-read: fatal at 200k (~640ms–2.4s/token) but negligible at the M3
+  128-token gate (KV ≪ the 11.3GB expert stream there). Fix is FFI-unchanged
+  (internal kernel): move the accumulator LDS→registers so HB can rise to 32 (2×)
+  or SUBW=16→HB=64 (1× honest). Do it in the measurement pass (VGPR-vs-occupancy
+  is empirical), AFTER the 128-token gate proves the pipeline.
+- **Per-token fault gate.** `device_sync()` returns the async execution fault
+  (the launch return code only catches launch-config errors); the decode loop
+  must check its `Result` every token.
 
 ## Risks
 

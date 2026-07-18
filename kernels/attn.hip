@@ -8,8 +8,7 @@
 // thread per head and re-streamed the whole cache H× from DRAM (~1.5 TB/token at
 // 200k — fatal). Here a block owns HB heads (one wavefront each) and stages each
 // token tile's L/R into LDS ONCE, reused across all HB heads: DRAM reads of the
-// cache drop from H× to ⌈H/HB⌉× (PLAN.md D2). All pointers are device-resident;
-// the launcher only launches (caller joins via rivoli_device_sync).
+// cache drop from H× to ⌈H/HB⌉× (PLAN.md D2). All pointers are device-resident.
 //
 // Numerics match attn.rs to f32 rounding: per-token score sums kvl then rope over
 // bf16-widened values (wave-reduced, so summation order differs from the scalar
@@ -17,13 +16,22 @@
 // with one numerically-stable pass.
 //
 // HB/TILE are occupancy/LDS tuning knobs (LDS = (HB+TILE)*kvl + TILE*rope floats);
-// the ≥1 tok/s pass (M3 4/4) tunes them. Correctness is independent of their value.
+// the ≥1 tok/s pass (M3 4/4) tunes them. Correctness is independent of their
+// value. NOTE: HB is also the DRAM KV re-read multiplier (⌈H/HB⌉×) — the
+// dominant term at 200k. Raising HB past 14 needs the accumulator moved from LDS
+// to registers (acc[HB*kvl] is what caps it); that's the measurement-driven
+// 200k tune, FFI-unchanged.
 
 #include <hip/hip_runtime.h>
 
 #define HB 8        // heads per block (one width-32 subgroup each)
 #define TILE 16     // KV tokens staged into LDS per step
-#define SUBW 32     // score-reduction subgroup width (wave32; wave64 splits into two)
+// Score-reduction subgroup width. MUST stay a divisor of the physical wavefront
+// (32 on gfx1151, 64 if ever compiled wave64) so a head's HB-th 32-lane group
+// never straddles two wavefronts: with SUBW=32 and 32|64, head hb owns lanes
+// [hb*32, hb*32+32), always inside one wave half, so __shfl(_,_,32) reduces and
+// broadcasts within that head only. A future tuner must preserve this invariant.
+#define SUBW 32
 
 // bf16 → f32: bf16 is the high 16 bits of f32 (matches math.rs bf16_to_f32).
 __device__ __forceinline__ float bf16f(unsigned short b) {
