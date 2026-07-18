@@ -81,9 +81,18 @@ pub fn probe() -> Result<()> {
 /// [`device_sync`] once per token (≤1 join/token).
 ///
 /// # Safety
-/// `x`/`out`/`wexpert` must be valid device pointers for `hidden`/`hidden`/`e`
-/// elements; `descs` must point at `e` valid `ExpertDesc` in device memory whose
-/// weight pointers cover the projection shapes; all must outlive the launch.
+/// The launch is ASYNCHRONOUS: the kernel dereferences every pointer below
+/// AFTER this call returns, so all of them — and the device buffers the
+/// `ExpertDesc` weight pointers address — must stay valid until the next
+/// [`device_sync`] RETURNS. Dropping any of them before that join is a GPU
+/// use-after-free. Shapes the kernel assumes (all device pointers in the current
+/// HIP context):
+///   - `x`: `hidden` f32; `out`: `hidden` f32, pre-zeroed; `wexpert`: `e` f32
+///   - `descs`: ≥ `e` contiguous `ExpertDesc`, each pointing at
+///     - `gate_packed`, `up_packed`: `inter * ((hidden+1)/2)` bytes
+///     - `gate_scale`, `up_scale`: `inter` f32
+///     - `down_packed`: `hidden * ((inter+1)/2)` bytes
+///     - `down_scale`: `hidden` f32
 #[cfg(feature = "rocm")]
 pub unsafe fn launch_moe(
     x: *const f32,

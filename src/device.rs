@@ -33,13 +33,14 @@ mod ffi {
 }
 
 #[cfg(feature = "rocm")]
-pub use tier::{DeviceBuf, DeviceTier};
+pub use tier::{DeviceBuf, DeviceTier, mem_info};
 
 #[cfg(feature = "rocm")]
 mod tier {
     use super::ffi::*;
     use anyhow::{Result, bail, ensure};
     use std::ffi::c_void;
+    use tracing::warn;
 
     /// Free device memory and total, in bytes.
     pub fn mem_info() -> Result<(usize, usize)> {
@@ -100,11 +101,22 @@ mod tier {
             // ponytail: card0 hardcoded — this box has one amdgpu. Generalize to
             // scan /sys/class/drm/card*/device only if a second GPU ever appears.
             let path = "/sys/class/drm/card0/device/mem_info_gtt_used";
+            // The guard fails OPEN (a bad read → proceed) so a non-amdgpu or
+            // containerized box isn't blocked — but it says so LOUDLY, because a
+            // silently-inert safety guard is worse than none (the operator would
+            // believe they're protected). M5's clean-refusal gate depends on this.
             let gtt: u64 = match std::fs::read_to_string(path) {
-                Ok(s) => s.trim().parse().unwrap_or(0),
-                // No sysfs (non-amdgpu or containerized) — can't verify tenancy;
-                // proceed rather than block, the allocation itself will fail loud.
-                Err(_) => return Ok(()),
+                Ok(s) => match s.trim().parse() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("sole-tenant guard DISABLED: {path} unparseable ({e})");
+                        return Ok(());
+                    }
+                },
+                Err(e) => {
+                    warn!("sole-tenant guard DISABLED: {path} unreadable ({e})");
+                    return Ok(());
+                }
             };
             if gtt > Self::SOLE_TENANT_MAX_GTT {
                 bail!(
@@ -162,9 +174,6 @@ mod tier {
         pub fn used(&self) -> usize {
             self.used
         }
-        pub fn capacity(&self) -> usize {
-            self.capacity
-        }
     }
 
     impl Drop for DeviceTier {
@@ -184,8 +193,9 @@ mod tier {
     }
 
     impl DeviceBuf {
-        /// Allocate `len` uninitialized device bytes.
-        pub fn new(len: usize) -> Result<Self> {
+        /// Allocate `len` uninitialized device bytes (internal — callers use
+        /// [`DeviceBuf::zeroed`] or [`DeviceBuf::from_bytes`]).
+        fn new(len: usize) -> Result<Self> {
             let mut ptr: *mut c_void = std::ptr::null_mut();
             // SAFETY: ptr is a valid out-pointer; owns `len` bytes freed in Drop.
             let e = unsafe { hipMalloc(&mut ptr, len) };
@@ -265,12 +275,6 @@ mod tier {
         }
         pub fn ptr_mut(&mut self) -> *mut u8 {
             self.ptr
-        }
-        pub fn len(&self) -> usize {
-            self.len
-        }
-        pub fn is_empty(&self) -> bool {
-            self.len == 0
         }
     }
 

@@ -87,6 +87,7 @@ extern "C" int rivoli_moe_experts(
     size_t lds = (size_t)inter * sizeof(float);
     // gfx1151 LDS ceiling is 64KB/workgroup (also asserted at model load).
     if (lds > 65536) return 1002;
+    hipGetLastError();  // drain any stale error so the check below is this launch's
     hipLaunchKernelGGL(moe_expert_batch, dim3(E), dim3(256), lds, 0,
                        x, hidden, inter, (const ExpertDesc*)descs, wexpert, out);
     hipError_t e = hipGetLastError();

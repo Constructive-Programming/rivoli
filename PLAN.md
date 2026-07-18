@@ -286,6 +286,46 @@ the attention `out[i]` RMW accumulator (2 KB/head, L2-resident — the P1 note
 targets the *KV* read, not this); per-call `hipMemcpy` (M4 resident-slab replaces
 it, no signature change needed).
 
+## M3 (4/4) wiring contracts (locked by the M3 residency review)
+
+The DeviceTier + descriptor MoE kernel are sound, but raw device pointers erase
+the borrow checker's lifetime tracking. When engine.rs wires the resident path,
+these are mandatory — several are the exact bottleneck-#6 wedge trigger if
+ignored:
+
+- **Async lifetime = join, not call.** `launch_moe` enqueues and returns; the
+  kernel reads x/out/wexpert/descs and the weights they point at *after* it
+  returns. Everything referenced must stay valid until the next `device_sync()`
+  RETURNS. A `?` between launch and sync that drops a buffer = GPU UAF.
+- **Own the device memory in one place with a sync-on-Drop.** A `DeviceCtx`
+  holding the tier + per-token buffers, whose `Drop` calls `device_sync()`
+  before any `hipFree`, so teardown (incl. unwinding) never frees under a live
+  kernel. `device_sync()` must be reached on every path, error paths included.
+  The type-honest form is a launch→join guard.
+- **No per-token `hipMalloc`.** The test idiom (`from_bytes`/`zeroed` per call)
+  is the mid-session re-allocation the amdgpu GTT wedge punishes. Hoist
+  `x_buf`/`out_buf`/`descs_buf` into the Engine, allocate once, reuse via
+  `copy_in`/`zero` (already alloc-free). Reusable `[ExpertDesc; MAX_TOPK+1]`.
+- **Zero-copy host→device bridge.** Do NOT use the test's `f32_bytes` (allocs a
+  Vec/token). Reinterpret `&[f32]→&[u8]` with `bytemuck::cast_slice` (host is
+  LE) straight into `copy_in`. Add a borrowing `DeviceBuf::copy_out_into(&mut
+  [u8])` for logits readback into the engine's existing `logits` Vec.
+- **Pin builder feeds the tier from mmap directly.** Pass `Int4Matrix.packed` /
+  `.scale` straight to `place` — never `read_f32` (it dequants to host f32, 4×
+  the traffic). Resolve `(layer, expert)→device ptr` ONCE into a flat table
+  indexed `layer*n_experts+id` (P3), so per-token descriptor assembly is pointer
+  reads, not `format!`-key map lookups.
+- **Threading.** `DeviceTier`/`DeviceBuf` are `!Send` by design and that's
+  correct — `block_on` needs no `Send`, only `tokio::spawn` does (the engine
+  never spawns). Every HIP call (place, launch, sync, Drop) runs on the one
+  `block_on` thread. NEVER `unsafe impl Send` — HIP null-stream ordering isn't
+  thread-safe.
+- **Descriptor shape is uniform (D1/D6 reconcile).** The built `ExpertDesc`
+  carries pointers only; `hidden`/`inter` are uniform kernel params. This folds
+  the shared expert into the routed batch when `n_shared==1` (D6, GLM-5.2) but
+  CANNOT express mixed-width experts — a future `n_shared>1` config would need
+  per-descriptor `inter`/`hidden` added to the struct (validated at model load).
+
 ## Risks
 
 | Risk | Mitigation |
