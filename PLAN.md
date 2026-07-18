@@ -423,6 +423,23 @@ pool** (`hipHostMalloc` on the cold-fetch slots), NOT the resident pin:
      commit 863eb48). Ponytail: already lean — one path-ref fix (done), everything
      else endorsed minimal. VMM stays a validated, documented primitive + the
      hip-apu-memory.md findings; its lasting value is the KNOWLEDGE, not a tok/s win.
+  - **UNIFIED VMM+pread LOAD PATH — TRIED, MEASURED REGRESSION, REVERTED
+     (2026-07-18).** Built the full unification: resident `DeviceTier` VMM-backed +
+     both resident and cold loaded by `pread` straight from the shard file into the
+     device-local slab (Snapshot kept the shard `File`s + a `read_into` pread;
+     `DeviceTier::place`→`reserve`; `drop_pages` madvise→`posix_fadvise` evict). It
+     WORKS (decode coherent, 28 tests green) but is a **net loss, not the expected
+     marginal win**: pin build 24.7→33.9 s (+37%), cold fetch 1.08→1.96 ms/miss
+     (+81%), wall 2086→2326 ms (+11%). TWO measured causes: (1) a VMM resident tier
+     must be **CPU-filled** (pread/memcpy) whereas the `hipMalloc` tier fills via
+     **`hipMemcpy` H2D = DMA engine** — DMA wins for the one-time 48 GiB bulk load
+     (VMM-resident is read-neutral, but I'd ignored *fill* cost); (2) **`pread`
+     `copy_to_user` into device-local host-granted pages is ~2× slower than a
+     userspace `memcpy`** from the warm mmap. The two load paths diverge for a
+     REASON: resident = bulk one-time → DMA-H2D; cold = per-miss host-write →
+     VMM+memcpy. Reverted to `a52a800`. Probe `scratchpad/pread_vmm.cpp` confirms
+     pread→VMM is correct+GPU-coherent — the regression is throughput, not
+     correctness. DO NOT retry unless a bulk async DMA-into-VMM path exists.
 
 **(3) priming — DEFERRED indefinitely; we TRUST colibri's priming.** The shipped
 `.coli_usage` IS colibri's priming artifact, and routing was verified correct
