@@ -6,6 +6,7 @@ pub mod hip;
 pub mod math;
 pub mod model;
 pub mod moe;
+pub mod pin;
 pub mod quant;
 pub mod snapshot;
 pub mod tokenizer;

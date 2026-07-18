@@ -193,9 +193,9 @@ mod tier {
     }
 
     impl DeviceBuf {
-        /// Allocate `len` uninitialized device bytes (internal — callers use
-        /// [`DeviceBuf::zeroed`] or [`DeviceBuf::from_bytes`]).
-        fn new(len: usize) -> Result<Self> {
+        /// Allocate `len` uninitialized device bytes (e.g. a cold-expert slot
+        /// filled later via [`DeviceBuf::copy_in_at`]).
+        pub fn new(len: usize) -> Result<Self> {
             let mut ptr: *mut c_void = std::ptr::null_mut();
             // SAFETY: ptr is a valid out-pointer; owns `len` bytes freed in Drop.
             let e = unsafe { hipMalloc(&mut ptr, len) };
@@ -246,6 +246,28 @@ mod tier {
             Ok(())
         }
 
+        /// Overwrite `bytes` at byte offset `off` (partial H2D) — grows a KV
+        /// slab by one token or fills a cold-expert slot without reallocating.
+        pub fn copy_in_at(&mut self, off: usize, bytes: &[u8]) -> Result<()> {
+            ensure!(
+                off + bytes.len() <= self.len,
+                "copy_in_at {off}+{} > buf len {}",
+                bytes.len(),
+                self.len
+            );
+            // SAFETY: off+len ≤ len (checked); dst is within the buffer.
+            let e = unsafe {
+                hipMemcpy(
+                    self.ptr.add(off) as *mut c_void,
+                    bytes.as_ptr() as *const c_void,
+                    bytes.len(),
+                    HIP_MEMCPY_H2D,
+                )
+            };
+            ensure!(e == HIP_SUCCESS, "hipMemcpy H2D failed ({e})");
+            Ok(())
+        }
+
         /// Zero the buffer (before an accumulating kernel).
         pub fn zero(&mut self) -> Result<()> {
             // SAFETY: ptr owns len bytes.
@@ -275,6 +297,12 @@ mod tier {
         }
         pub fn ptr_mut(&mut self) -> *mut u8 {
             self.ptr
+        }
+        pub fn len(&self) -> usize {
+            self.len
+        }
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
         }
     }
 
