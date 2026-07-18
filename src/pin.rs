@@ -49,9 +49,8 @@ pub struct Mlp {
 pub enum LayerMlp {
     Dense(Mlp),
     Moe {
-        gate_w: *const f32,    // router gate [n_experts, hidden] (F32)
-        gate_bias: *const f32, // e_score_correction_bias [n_experts]
-        shared: Mlp,           // shared expert (always resident)
+        gate_w: *const f32, // router gate [n_experts, hidden] (F32), device
+        shared: Mlp,        // shared expert (always resident)
     },
 }
 
@@ -79,6 +78,9 @@ pub struct Pin<'a> {
     pub lm_head: Weight8,
     pub final_norm: *const f32,
     pub layers: Vec<LayerPin>,
+    /// Router correction bias per MoE layer, kept HOST-side (the sigmoid/bias/
+    /// top-k routing runs on the CPU). `moe_bias[sparse_idx]`, len n_experts.
+    moe_bias: Vec<Vec<f32>>,
     /// `experts[sparse_idx][expert]` — resident routed experts (None = cold).
     /// `sparse_idx = layer - dense_layers`.
     experts: Vec<Vec<Option<Mlp>>>,
@@ -171,6 +173,7 @@ impl<'a> Pin<'a> {
 
         // Per-layer always-resident weights.
         let mut layers = Vec::with_capacity(cfg.n_layers);
+        let mut moe_bias = Vec::new();
         for l in 0..cfg.n_layers {
             let lb = format!("model.layers.{l}");
             let a = format!("{lb}.self_attn");
@@ -184,11 +187,15 @@ impl<'a> Pin<'a> {
                 )?)
             } else {
                 let gate_w = place_f32(&mut tier, snap, &format!("{lb}.mlp.gate.weight"))?;
-                let gate_bias = place_f32(
-                    &mut tier,
-                    snap,
-                    &format!("{lb}.mlp.gate.e_score_correction_bias"),
-                )?;
+                let bias = snap.require(&format!("{lb}.mlp.gate.e_score_correction_bias"))?;
+                let bias = crate::quant::read_f32(bias);
+                ensure!(
+                    bias.len() == cfg.n_experts,
+                    "layer {l} gate bias has {} entries, expected {}",
+                    bias.len(),
+                    cfg.n_experts
+                );
+                moe_bias.push(bias);
                 let shared = place_mlp(
                     &mut tier,
                     snap,
@@ -196,11 +203,7 @@ impl<'a> Pin<'a> {
                     cfg.hidden,
                     cfg.moe_inter * cfg.n_shared,
                 )?;
-                LayerMlp::Moe {
-                    gate_w,
-                    gate_bias,
-                    shared,
-                }
+                LayerMlp::Moe { gate_w, shared }
             };
             layers.push(LayerPin {
                 input_ln: place_f32(&mut tier, snap, &format!("{lb}.input_layernorm.weight"))?,
@@ -276,6 +279,7 @@ impl<'a> Pin<'a> {
             lm_head,
             final_norm,
             layers,
+            moe_bias,
             experts,
             cold_gate,
             cold_up,
@@ -289,6 +293,11 @@ impl<'a> Pin<'a> {
     /// Device bytes used by the resident set.
     pub fn used(&self) -> usize {
         self.tier.used()
+    }
+
+    /// Host router correction bias for a MoE `layer` (len n_experts).
+    pub fn moe_bias(&self, layer: usize) -> &[f32] {
+        &self.moe_bias[layer - self.cfg.dense_layers]
     }
 
     pub fn pinned_experts(&self) -> usize {

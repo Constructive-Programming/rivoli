@@ -37,6 +37,35 @@ unsafe extern "C" {
 
     fn rivoli_device_sync() -> i32;
 
+    fn rivoli_embed_i8_row(
+        packed: *const u8,
+        scale: *const f32,
+        token: i32,
+        hidden: i32,
+        x: *mut f32,
+    ) -> i32;
+
+    fn rivoli_append_kv(
+        latent: *const f32,
+        rope: *const f32,
+        lc: *mut u16,
+        rc: *mut u16,
+        pos: i32,
+        kvl: i32,
+        ropn: i32,
+    ) -> i32;
+
+    fn rivoli_gather_rope(
+        q: *const f32,
+        qrope: *mut f32,
+        h: i32,
+        qh: i32,
+        nope: i32,
+        ropn: i32,
+    ) -> i32;
+
+    fn rivoli_vadd(x: *mut f32, y: *const f32, n: i32) -> i32;
+
     fn rivoli_gemv_i4(
         x: *const f32,
         packed: *const u8,
@@ -478,6 +507,111 @@ pub unsafe fn launch_mla_value(
     if r != 0 {
         let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
         bail!("launch_mla_value failed ({kind}, code {r})");
+    }
+    Ok(())
+}
+
+/// Launch the embedding row lookup: `x[i] = (int8)embed[token·hidden+i]·
+/// scale[token]`. Device pointers, launch-only.
+///
+/// # Safety
+/// Async — `packed`/`scale` (the int8 embed table + row scales), `x` (`hidden`
+/// f32) valid device pointers live until the next [`device_sync`] returns.
+#[cfg(feature = "rocm")]
+pub unsafe fn launch_embed_i8_row(
+    packed: *const u8,
+    scale: *const f32,
+    token: usize,
+    hidden: usize,
+    x: *mut f32,
+) -> Result<()> {
+    anyhow::ensure!(
+        token <= i32::MAX as usize && hidden <= i32::MAX as usize,
+        "embed dims exceed i32"
+    );
+    // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
+    let r = unsafe { rivoli_embed_i8_row(packed, scale, token as i32, hidden as i32, x) };
+    if r != 0 {
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("launch_embed_i8_row failed ({kind}, code {r})");
+    }
+    Ok(())
+}
+
+/// Launch the KV append: bf16-quantize `latent` (`kvl` f32) and `rope` (`ropn`
+/// f32) into the per-layer bf16 slabs `lc`/`rc` at row `pos`. Launch-only.
+///
+/// # Safety
+/// Async — `latent`/`rope` inputs and `lc`/`rc` slabs (with room for row `pos`)
+/// must be valid device pointers live until the next [`device_sync`] returns.
+#[cfg(feature = "rocm")]
+pub unsafe fn launch_append_kv(
+    latent: *const f32,
+    rope: *const f32,
+    lc: *mut u16,
+    rc: *mut u16,
+    pos: usize,
+    kvl: usize,
+    ropn: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        pos <= i32::MAX as usize && kvl <= i32::MAX as usize && ropn <= i32::MAX as usize,
+        "append_kv dims exceed i32"
+    );
+    // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
+    let r = unsafe { rivoli_append_kv(latent, rope, lc, rc, pos as i32, kvl as i32, ropn as i32) };
+    if r != 0 {
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("launch_append_kv failed ({kind}, code {r})");
+    }
+    Ok(())
+}
+
+/// Launch the roped-query gather: `qrope[head·ropn+d] = q[head·qh+nope+d]`,
+/// collecting each head's rope segment into contiguous `qrope[H·ropn]`.
+/// Launch-only.
+///
+/// # Safety
+/// Async — `q` (`h·qh` f32) and `qrope` (`h·ropn` f32) valid device pointers live
+/// until the next [`device_sync`] returns.
+#[cfg(feature = "rocm")]
+pub unsafe fn launch_gather_rope(
+    q: *const f32,
+    qrope: *mut f32,
+    h: usize,
+    qh: usize,
+    nope: usize,
+    ropn: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        h <= i32::MAX as usize
+            && qh <= i32::MAX as usize
+            && nope <= i32::MAX as usize
+            && ropn <= i32::MAX as usize,
+        "gather_rope dims exceed i32"
+    );
+    // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
+    let r = unsafe { rivoli_gather_rope(q, qrope, h as i32, qh as i32, nope as i32, ropn as i32) };
+    if r != 0 {
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("launch_gather_rope failed ({kind}, code {r})");
+    }
+    Ok(())
+}
+
+/// Launch the residual add `x[i] += y[i]` over `n` device f32. Launch-only.
+///
+/// # Safety
+/// Async — `x`/`y` (`n` f32) valid device pointers live until the next
+/// [`device_sync`] returns.
+#[cfg(feature = "rocm")]
+pub unsafe fn launch_vadd(x: *mut f32, y: *const f32, n: usize) -> Result<()> {
+    anyhow::ensure!(n <= i32::MAX as usize, "vadd n exceeds i32 ({n})");
+    // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
+    let r = unsafe { rivoli_vadd(x, y, n as i32) };
+    if r != 0 {
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("launch_vadd failed ({kind}, code {r})");
     }
     Ok(())
 }

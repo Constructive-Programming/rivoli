@@ -110,21 +110,55 @@ async fn run(cfg: Config) -> Result<()> {
         Err(e) => info!("HIP probe unavailable: {e}"),
     }
 
-    // M1 gate: greedy-decode the bench prompt through the full forward pass and
-    // print the continuation. Coherence is the gate; speed is a later milestone.
     let ngen = cfg
         .bench
         .context("server mode not yet implemented; use -bench <tokens>")?;
-    let mut engine = rivoli::engine::Engine::new(&snap, &mc);
-    let t0 = std::time::Instant::now();
-    let ids = engine.generate(&prompt_ids, ngen, &tok.eos)?;
-    let dt = t0.elapsed().as_secs_f64();
-    info!(
-        "generated {} tokens in {:.1}s ({:.2} tok/s)",
-        ids.len(),
-        dt,
-        ids.len() as f64 / dt
-    );
-    info!("{BENCH_PROMPT}{}", tok.decode_all(&ids)?);
-    Ok(())
+
+    // M3: resident GPU decode. Build the pin (auto-sized tier), then decode on
+    // device. Falls back to the scalar reference path without the `rocm` feature.
+    #[cfg(feature = "rocm")]
+    {
+        let (free, _total) = rivoli::device::mem_info()?;
+        // Leave 6 GiB free; cap the first-run tier so startup placement is bounded.
+        let cap = free.saturating_sub(6 << 30).min(24 << 30);
+        let t = std::time::Instant::now();
+        let pin = rivoli::pin::Pin::build(&snap, &mc, &usage, cap)?;
+        info!(
+            "pin: {:.1} GiB resident, {} routed experts, built in {:.1}s",
+            pin.used() as f64 / (1u64 << 30) as f64,
+            pin.pinned_experts(),
+            t.elapsed().as_secs_f64()
+        );
+        let max_ctx = prompt_ids.len() + ngen + 1;
+        let mut engine = rivoli::gpu::GpuEngine::new(pin, &mc, max_ctx)?;
+        let t0 = std::time::Instant::now();
+        let ids = engine.generate(&prompt_ids, ngen, &tok.eos)?;
+        let dt = t0.elapsed().as_secs_f64();
+        let (hits, misses) = (engine.hits(), engine.misses());
+        info!(
+            "GPU: {} tokens in {:.1}s ({:.2} tok/s) | expert hit {:.1}% ({hits} hit / {misses} miss)",
+            ids.len(),
+            dt,
+            ids.len() as f64 / dt,
+            100.0 * hits as f64 / (hits + misses).max(1) as f64,
+        );
+        info!("{BENCH_PROMPT}{}", tok.decode_all(&ids)?);
+        return Ok(());
+    }
+
+    #[cfg(not(feature = "rocm"))]
+    {
+        let mut engine = rivoli::engine::Engine::new(&snap, &mc);
+        let t0 = std::time::Instant::now();
+        let ids = engine.generate(&prompt_ids, ngen, &tok.eos)?;
+        let dt = t0.elapsed().as_secs_f64();
+        info!(
+            "generated {} tokens in {:.1}s ({:.2} tok/s)",
+            ids.len(),
+            dt,
+            ids.len() as f64 / dt
+        );
+        info!("{BENCH_PROMPT}{}", tok.decode_all(&ids)?);
+        Ok(())
+    }
 }
