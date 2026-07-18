@@ -9,9 +9,16 @@
 // A test binary: expect/panic on setup failure is the correct, readable idiom.
 #![allow(clippy::expect_used)]
 
+use rivoli::device::{DeviceBuf, DeviceTier};
+use rivoli::hip::{ExpertDesc, device_sync, launch_moe};
 use rivoli::math::{bf16_to_f32, f32_to_bf16, silu, softmax};
 use rivoli::quant::{matvec_i4, row_bytes};
 use rivoli::snapshot::Int4Matrix;
+
+/// Little-endian bytes of an f32 slice (device is LE, matching this host).
+fn f32_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
 
 /// Deterministic PRNG (SplitMix-style LCG). No `rand` dependency, and no
 /// `Math.random`-style nondeterminism — same seed reproduces the same weights.
@@ -33,11 +40,11 @@ impl Lcg {
     }
 }
 
-/// A random per-row int4 matrix `[o_dim, i_dim]`: packed nibbles, f32 scales,
-/// plus the little-endian scale bytes the `Int4Matrix` reference reads.
+/// A random per-row int4 matrix `[o_dim, i_dim]`: packed nibbles and the
+/// little-endian per-row f32 scale bytes (read both by the `Int4Matrix`
+/// reference and, placed as-is, by the kernel via its descriptor).
 struct Mat {
     packed: Vec<u8>,
-    scale_f32: Vec<f32>,
     scale_bytes: Vec<u8>,
 }
 
@@ -54,11 +61,11 @@ fn gen_mat(rng: &mut Lcg, o_dim: usize, i_dim: usize) -> Mat {
             }
         }
     }
-    let scale_f32: Vec<f32> = (0..o_dim).map(|_| rng.f() * 0.05).collect();
-    let scale_bytes: Vec<u8> = scale_f32.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let scale_bytes: Vec<u8> = (0..o_dim)
+        .flat_map(|_| (rng.f() * 0.05).to_le_bytes())
+        .collect();
     Mat {
         packed,
-        scale_f32,
         scale_bytes,
     }
 }
@@ -112,17 +119,6 @@ fn reference(
     out
 }
 
-/// Concatenate per-expert matrices into the flat buffers the kernel expects.
-fn flatten(mats: &[Mat]) -> (Vec<u8>, Vec<f32>) {
-    let mut packed = Vec::new();
-    let mut scale = Vec::new();
-    for m in mats {
-        packed.extend_from_slice(&m.packed);
-        scale.extend_from_slice(&m.scale_f32);
-    }
-    (packed, scale)
-}
-
 fn check(seed: u64, hidden: usize, inter: usize, e: usize) {
     let mut rng = Lcg(seed);
     let x: Vec<f32> = (0..hidden).map(|_| rng.f()).collect();
@@ -133,11 +129,60 @@ fn check(seed: u64, hidden: usize, inter: usize, e: usize) {
 
     let want = reference(&x, hidden, inter, &gates, &ups, &downs, &w);
 
-    let (gp, gs) = flatten(&gates);
-    let (up, us) = flatten(&ups);
-    let (dp, ds) = flatten(&downs);
-    let got = rivoli::hip::moe_experts(&x, hidden, inter, e, &gp, &gs, &up, &us, &dp, &ds, &w)
-        .expect("kernel launch");
+    // Place every expert's weights in the resident tier and address them by
+    // device pointer through a descriptor array — the D1 zero-copy path.
+    let mut tier = DeviceTier::new(256 << 20).expect("alloc tier");
+    let descs: Vec<ExpertDesc> = (0..e)
+        .map(|i| {
+            let gp = tier.place(&gates[i].packed).expect("place gate");
+            let gs = tier.place(&gates[i].scale_bytes).expect("place gate scale");
+            let up = tier.place(&ups[i].packed).expect("place up");
+            let us = tier.place(&ups[i].scale_bytes).expect("place up scale");
+            let dp = tier.place(&downs[i].packed).expect("place down");
+            let ds = tier.place(&downs[i].scale_bytes).expect("place down scale");
+            ExpertDesc {
+                gate_packed: gp,
+                gate_scale: gs as *const f32,
+                up_packed: up,
+                up_scale: us as *const f32,
+                down_packed: dp,
+                down_scale: ds as *const f32,
+            }
+        })
+        .collect();
+
+    // Descriptor array, x, per-expert weights, and the accumulator all device-side.
+    let desc_bytes = unsafe {
+        std::slice::from_raw_parts(
+            descs.as_ptr() as *const u8,
+            std::mem::size_of_val(&descs[..]),
+        )
+    };
+    let descs_buf = DeviceBuf::from_bytes(desc_bytes).expect("place descs");
+    let x_buf = DeviceBuf::from_bytes(&f32_bytes(&x)).expect("place x");
+    let w_buf = DeviceBuf::from_bytes(&f32_bytes(&w)).expect("place w");
+    let mut out_buf = DeviceBuf::zeroed(hidden * 4).expect("alloc out");
+
+    // SAFETY: all pointers are device-resident for the dims; out is zeroed.
+    unsafe {
+        launch_moe(
+            x_buf.ptr() as *const f32,
+            hidden,
+            inter,
+            e,
+            descs_buf.ptr() as *const ExpertDesc,
+            w_buf.ptr() as *const f32,
+            out_buf.ptr_mut() as *mut f32,
+        )
+        .expect("launch moe");
+    }
+    device_sync().expect("device sync");
+    let got: Vec<f32> = out_buf
+        .copy_out()
+        .expect("copy out")
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
 
     let max_ref = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     let max_err = want

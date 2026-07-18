@@ -24,6 +24,7 @@ mod ffi {
         pub fn hipMalloc(ptr: *mut *mut c_void, size: usize) -> i32;
         pub fn hipFree(ptr: *mut c_void) -> i32;
         pub fn hipMemcpy(dst: *mut c_void, src: *const c_void, size: usize, kind: i32) -> i32;
+        pub fn hipMemset(ptr: *mut c_void, value: i32, size: usize) -> i32;
         pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
     }
     pub const HIP_MEMCPY_H2D: i32 = 1;
@@ -32,7 +33,7 @@ mod ffi {
 }
 
 #[cfg(feature = "rocm")]
-pub use tier::DeviceTier;
+pub use tier::{DeviceBuf, DeviceTier};
 
 #[cfg(feature = "rocm")]
 mod tier {
@@ -170,6 +171,113 @@ mod tier {
         fn drop(&mut self) {
             // SAFETY: base came from hipMalloc and is freed exactly once.
             unsafe { hipFree(self.base as *mut c_void) };
+        }
+    }
+
+    /// A standalone mutable device buffer — for per-token activations, the
+    /// descriptor array, and the MoE accumulator that the kernels write. Unlike
+    /// [`DeviceTier`] (append-only resident weights), a `DeviceBuf` is sized once
+    /// and rewritten each token via `copy_in`/`zero`. Freed on drop.
+    pub struct DeviceBuf {
+        ptr: *mut u8,
+        len: usize,
+    }
+
+    impl DeviceBuf {
+        /// Allocate `len` uninitialized device bytes.
+        pub fn new(len: usize) -> Result<Self> {
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            // SAFETY: ptr is a valid out-pointer; owns `len` bytes freed in Drop.
+            let e = unsafe { hipMalloc(&mut ptr, len) };
+            ensure!(
+                e == HIP_SUCCESS && !ptr.is_null(),
+                "hipMalloc({len}) failed ({e})"
+            );
+            Ok(Self {
+                ptr: ptr as *mut u8,
+                len,
+            })
+        }
+
+        /// Allocate `len` device bytes, zeroed.
+        pub fn zeroed(len: usize) -> Result<Self> {
+            let b = Self::new(len)?;
+            // SAFETY: ptr owns len bytes.
+            let e = unsafe { hipMemset(b.ptr as *mut c_void, 0, len) };
+            ensure!(e == HIP_SUCCESS, "hipMemset failed ({e})");
+            Ok(b)
+        }
+
+        /// Allocate and fill from host bytes.
+        pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+            let mut b = Self::new(bytes.len())?;
+            b.copy_in(bytes)?;
+            Ok(b)
+        }
+
+        /// Overwrite the buffer from host bytes (`bytes.len()` must be `len`).
+        pub fn copy_in(&mut self, bytes: &[u8]) -> Result<()> {
+            ensure!(
+                bytes.len() == self.len,
+                "copy_in {} != buf len {}",
+                bytes.len(),
+                self.len
+            );
+            // SAFETY: both regions are `len` bytes.
+            let e = unsafe {
+                hipMemcpy(
+                    self.ptr as *mut c_void,
+                    bytes.as_ptr() as *const c_void,
+                    self.len,
+                    HIP_MEMCPY_H2D,
+                )
+            };
+            ensure!(e == HIP_SUCCESS, "hipMemcpy H2D failed ({e})");
+            Ok(())
+        }
+
+        /// Zero the buffer (before an accumulating kernel).
+        pub fn zero(&mut self) -> Result<()> {
+            // SAFETY: ptr owns len bytes.
+            let e = unsafe { hipMemset(self.ptr as *mut c_void, 0, self.len) };
+            ensure!(e == HIP_SUCCESS, "hipMemset failed ({e})");
+            Ok(())
+        }
+
+        /// Copy the whole buffer back to host.
+        pub fn copy_out(&self) -> Result<Vec<u8>> {
+            let mut out = vec![0u8; self.len];
+            // SAFETY: both regions are `len` bytes.
+            let e = unsafe {
+                hipMemcpy(
+                    out.as_mut_ptr() as *mut c_void,
+                    self.ptr as *const c_void,
+                    self.len,
+                    HIP_MEMCPY_D2H,
+                )
+            };
+            ensure!(e == HIP_SUCCESS, "hipMemcpy D2H failed ({e})");
+            Ok(out)
+        }
+
+        pub fn ptr(&self) -> *const u8 {
+            self.ptr
+        }
+        pub fn ptr_mut(&mut self) -> *mut u8 {
+            self.ptr
+        }
+        pub fn len(&self) -> usize {
+            self.len
+        }
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+    }
+
+    impl Drop for DeviceBuf {
+        fn drop(&mut self) {
+            // SAFETY: ptr came from hipMalloc and is freed exactly once.
+            unsafe { hipFree(self.ptr as *mut c_void) };
         }
     }
 

@@ -5,25 +5,37 @@
 
 use anyhow::{Result, bail};
 
+/// One MoE expert's six weight tensors, as raw DEVICE pointers into the resident
+/// tier (or a cold-fetch slab). `repr(C)` matching `struct ExpertDesc` in
+/// moe_fused.hip — the kernel reads a `[E]` array of these so experts may live
+/// at arbitrary device offsets (no contiguous-stride assumption; PLAN.md D1).
+#[cfg(feature = "rocm")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ExpertDesc {
+    pub gate_packed: *const u8,
+    pub gate_scale: *const f32,
+    pub up_packed: *const u8,
+    pub up_scale: *const f32,
+    pub down_packed: *const u8,
+    pub down_scale: *const f32,
+}
+
 #[cfg(feature = "rocm")]
 unsafe extern "C" {
     fn rivoli_probe(n: i32) -> i32;
 
-    #[allow(clippy::too_many_arguments)]
     fn rivoli_moe_experts(
         x: *const f32,
         hidden: i32,
         inter: i32,
         e: i32,
-        gate_packed: *const u8,
-        gate_scale: *const f32,
-        up_packed: *const u8,
-        up_scale: *const f32,
-        down_packed: *const u8,
-        down_scale: *const f32,
+        descs: *const ExpertDesc,
         wexpert: *const f32,
         out: *mut f32,
     ) -> i32;
+
+    fn rivoli_device_sync() -> i32;
 
     #[allow(clippy::too_many_arguments)]
     fn rivoli_mla_attend(
@@ -60,92 +72,61 @@ pub fn probe() -> Result<()> {
     }
 }
 
-/// One fused MoE expert-batch on the GPU: every expert `e` shares the input `x`
-/// and the `(hidden, inter)` shape, and the batch is computed in a single kernel
-/// launch as `out = Σ_e w[e] · down_e(silu(gate_e·x) ⊙ up_e·x)`. Returns the
-/// batch's `hidden`-length contribution (the caller adds it to the residual;
-/// routed and shared experts are separate batches because their `inter` differ).
+/// Launch one fused MoE expert-batch over resident device memory: every expert
+/// `e` shares `x` and the `(hidden, inter)` shape, accumulating
+/// `out += Σ_e w[e] · down_e(silu(gate_e·x) ⊙ up_e·x)`. All arguments are DEVICE
+/// pointers — `x`, `out`, the `[e]` weight array `wexpert`, the `[e]` descriptor
+/// array `descs`, and the per-expert weights the descriptors point at. `out`
+/// must be pre-zeroed (the kernel accumulates). Does NOT synchronize — call
+/// [`device_sync`] once per token (≤1 join/token).
 ///
-/// M2 correctness path — copies weights in per call. The resident device tier
-/// and zero-copy feed are M3; this validates the kernel numerics against the
-/// scalar oracle first.
+/// # Safety
+/// `x`/`out`/`wexpert` must be valid device pointers for `hidden`/`hidden`/`e`
+/// elements; `descs` must point at `e` valid `ExpertDesc` in device memory whose
+/// weight pointers cover the projection shapes; all must outlive the launch.
 #[cfg(feature = "rocm")]
-#[allow(clippy::too_many_arguments)]
-pub fn moe_experts(
-    x: &[f32],
+pub unsafe fn launch_moe(
+    x: *const f32,
     hidden: usize,
     inter: usize,
     e: usize,
-    gate_packed: &[u8],
-    gate_scale: &[f32],
-    up_packed: &[u8],
-    up_scale: &[f32],
-    down_packed: &[u8],
-    down_scale: &[f32],
-    wexpert: &[f32],
-) -> Result<Vec<f32>> {
-    let rb_h = hidden.div_ceil(2);
-    let rb_i = inter.div_ceil(2);
-    // Dims cross the FFI as i32; guard the truncating cast (unreachable at GLM
-    // scale, but the boundary parses the invariant rather than trusting it).
+    descs: *const ExpertDesc,
+    wexpert: *const f32,
+    out: *mut f32,
+) -> Result<()> {
     anyhow::ensure!(
         hidden <= i32::MAX as usize && inter <= i32::MAX as usize && e <= i32::MAX as usize,
         "moe dims exceed i32 (hidden={hidden} inter={inter} e={e})"
     );
-    anyhow::ensure!(x.len() == hidden, "x len {} != hidden {hidden}", x.len());
-    anyhow::ensure!(wexpert.len() == e, "wexpert len {} != e {e}", wexpert.len());
-    let gate_bytes = e * inter * rb_h;
-    anyhow::ensure!(
-        gate_packed.len() == gate_bytes && up_packed.len() == gate_bytes,
-        "gate/up packed len ({}, {}) != e*inter*rb_h {gate_bytes}",
-        gate_packed.len(),
-        up_packed.len()
-    );
-    anyhow::ensure!(
-        down_packed.len() == e * hidden * rb_i,
-        "down packed len {} != e*hidden*rb_i {}",
-        down_packed.len(),
-        e * hidden * rb_i
-    );
-    anyhow::ensure!(
-        gate_scale.len() == e * inter && up_scale.len() == e * inter,
-        "gate/up scale len ({}, {}) != e*inter {}",
-        gate_scale.len(),
-        up_scale.len(),
-        e * inter
-    );
-    anyhow::ensure!(
-        down_scale.len() == e * hidden,
-        "down scale len {} != e*hidden {}",
-        down_scale.len(),
-        e * hidden
-    );
-
-    let mut out = vec![0.0f32; hidden];
-    // SAFETY: every pointer is valid for the length asserted above; the C
-    // launcher copies inputs in, launches, writes exactly `hidden` floats into
-    // `out`, and frees its device allocations before returning.
+    // SAFETY: caller's contract (see # Safety) covers pointer validity.
     let r = unsafe {
         rivoli_moe_experts(
-            x.as_ptr(),
+            x,
             hidden as i32,
             inter as i32,
             e as i32,
-            gate_packed.as_ptr(),
-            gate_scale.as_ptr(),
-            up_packed.as_ptr(),
-            up_scale.as_ptr(),
-            down_packed.as_ptr(),
-            down_scale.as_ptr(),
-            wexpert.as_ptr(),
-            out.as_mut_ptr(),
+            descs,
+            wexpert,
+            out,
         )
     };
     if r != 0 {
         let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
-        bail!("rivoli_moe_experts failed ({kind}, code {r})");
+        bail!("launch_moe failed ({kind}, code {r})");
     }
-    Ok(out)
+    Ok(())
+}
+
+/// Block until all launched kernels retire (one join point per token), surfacing
+/// any async execution fault.
+#[cfg(feature = "rocm")]
+pub fn device_sync() -> Result<()> {
+    // SAFETY: no arguments; hipDeviceSynchronize is always safe to call.
+    let r = unsafe { rivoli_device_sync() };
+    if r != 0 {
+        bail!("device_sync failed (HIP runtime, code {r})");
+    }
+    Ok(())
 }
 
 /// MLA flash attention over the compressed KV cache: for each head, returns the
