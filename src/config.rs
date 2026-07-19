@@ -131,15 +131,18 @@ impl Config {
         // Prefetch's slot-safety rests on cold reads landing in VMM only at the
         // drain-time hipMemcpy (bounce mode), strictly after this layer's MoE sync.
         // In direct mode the async O_DIRECT DMA into VMM is NOT gated to drain time
-        // and can land under the running MoE kernel → silent corruption. Refuse it.
-        if prefetch && direct_vmm_dma {
-            bail!(
-                "--prefetch is unsound with --direct-vmm-dma: the speculative reads \
-                 DMA straight into VMM asynchronously and can overwrite a slot while \
-                 the current layer's MoE kernel reads it. Prefetch requires bounce \
-                 mode (the default); drop --direct-vmm-dma."
+        // and can land under the running MoE kernel → silent corruption. Prefetch is
+        // on by default, so DON'T error on the rare --direct-vmm-dma escape hatch —
+        // just disable prefetch for that run (the sound choice) and say so.
+        let prefetch = if prefetch && direct_vmm_dma {
+            tracing::warn!(
+                "--direct-vmm-dma is unsound with prefetch (async DMA into VMM can \
+                 land under the running MoE kernel); disabling prefetch for this run"
             );
-        }
+            false
+        } else {
+            prefetch
+        };
         // available_parallelism() is the LOGICAL count (SMT included): /2 gives
         // physical cores, /2 again is the measured feed-pool optimum.
         let threads =

@@ -14,6 +14,9 @@ use tracing::info;
 /// `--trace <path>` dumps the routed-expert access trace for the offline cache-
 /// policy sim (bin/replay). `--prompt <text>` overrides the fixed bench prompt so
 /// diverse, request-like inputs can be traced.
+/// DEFAULTS are the validated winning config: `--cache-policy arc` + prefetch on.
+/// `--no-prefetch` and `--cache-policy lru|2q` opt out (for A/B benching). Prefetch
+/// is auto-disabled under `--direct-vmm-dma` (unsound together; see config.rs).
 struct Args {
     snapshot: String,
     bench: Option<usize>,
@@ -29,8 +32,10 @@ struct Args {
 fn parse_args() -> Result<Args> {
     const USAGE: &str = "usage: rivoli <snapshot-dir> [-bench <tokens>] [--pre-seed] \
          [--direct-vmm-dma] [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc] \
-         [--prefetch] [--prefetch-depth <n>]";
+         [--no-prefetch] [--prefetch-depth <n>]";
     let mut snapshot = None;
+    // Defaults are the validated winning config: ARC eviction + cross-layer prefetch
+    // (best hit% on realistic multi-request sessions + the ~+11% prefetch overlap).
     let mut a = Args {
         snapshot: String::new(),
         bench: None,
@@ -38,8 +43,8 @@ fn parse_args() -> Result<Args> {
         direct_vmm_dma: false,
         trace: None,
         prompt: None,
-        cache_policy: "lru".to_string(),
-        prefetch: false,
+        cache_policy: "arc".to_string(),
+        prefetch: true,
         prefetch_depth: 2,
     };
     let mut args = std::env::args().skip(1);
@@ -56,7 +61,8 @@ fn parse_args() -> Result<Args> {
             "--cache-policy" => {
                 a.cache_policy = args.next().context("--cache-policy requires lru|2q|arc")?;
             }
-            "--prefetch" => a.prefetch = true,
+            "--prefetch" => a.prefetch = true, // default already on; explicit is fine
+            "--no-prefetch" => a.prefetch = false,
             "--prefetch-depth" => {
                 a.prefetch_depth = args
                     .next()
