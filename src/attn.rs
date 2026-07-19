@@ -42,8 +42,24 @@ pub enum AttnMode {
     Misa { active_heads: usize },
 }
 
-/// Compressed MLA KV cache: per layer, bf16 latents and roped keys, one row per
-/// cached token. Grows by one row per layer per decoded token.
+/// How the compressed MLA latent (the `kv_lora`-dim NoPE half) is stored per
+/// token per layer. The roped key half is always bf16 — quantizing it hurts
+/// accuracy (DeepSeek keeps it bf16 too).
+enum LatentStore {
+    /// bf16: `kv_lora` u16 per token. 1152 B/token/layer with the rope half.
+    Bf16(Vec<Vec<u16>>),
+    /// fp8 e4m3 + per-128 f32 block scales (DeepSeek's shipped MLA layout):
+    /// `kv_lora` u8 + `kv_lora/128` f32 per token. 656 B/token/layer. Halves
+    /// KV bandwidth and capacity; ~e4m3 precision loss on the latent.
+    Fp8 {
+        data: Vec<Vec<u8>>,
+        scales: Vec<Vec<f32>>,
+    },
+}
+
+/// Compressed MLA KV cache: per layer, the latent (bf16 or fp8, see
+/// [`LatentStore`]) and the bf16 roped key, one row per cached token. Grows by
+/// one row per layer per decoded token.
 ///
 /// DEFERRED (profiling P2): the per-layer `Vec`s start empty and grow via
 /// `extend`, so at 200k they realloc repeatedly and their base pointer moves.
@@ -52,34 +68,82 @@ pub enum AttnMode {
 /// needs the decode loop's context cap and couples with the `hipHostMalloc`
 /// coherent-slab design, so it lands there, not in this reference.
 pub struct KvCache {
-    lc: Vec<Vec<u16>>, // [n_layers] flat, len = tokens * kv_lora
+    lat: LatentStore,
     rc: Vec<Vec<u16>>, // [n_layers] flat, len = tokens * qk_rope
     kv_lora: usize,
     qk_rope: usize,
+    n_blocks: usize, // kv_lora / E4M3_BLOCK (fp8 scales per token)
 }
 
 impl KvCache {
     /// Strides come from the model config so they can't disagree with the
-    /// weights the decode step reads.
-    pub fn new(cfg: &ModelConfig) -> Self {
+    /// weights the decode step reads. `fp8` selects the latent storage.
+    pub fn new(cfg: &ModelConfig, fp8: bool) -> Self {
+        let n = cfg.n_layers;
+        let lat = if fp8 {
+            LatentStore::Fp8 {
+                data: vec![Vec::new(); n],
+                scales: vec![Vec::new(); n],
+            }
+        } else {
+            LatentStore::Bf16(vec![Vec::new(); n])
+        };
         Self {
-            lc: vec![Vec::new(); cfg.n_layers],
-            rc: vec![Vec::new(); cfg.n_layers],
+            lat,
+            rc: vec![Vec::new(); n],
             kv_lora: cfg.kv_lora_rank,
             qk_rope: cfg.qk_rope_head_dim,
+            n_blocks: cfg.kv_lora_rank / crate::math::E4M3_BLOCK,
         }
     }
 
     /// Number of tokens cached for a layer.
     fn tokens(&self, layer: usize) -> usize {
-        self.lc[layer].len() / self.kv_lora
+        match &self.lat {
+            LatentStore::Bf16(lc) => lc[layer].len() / self.kv_lora,
+            LatentStore::Fp8 { data, .. } => data[layer].len() / self.kv_lora,
+        }
     }
 
     fn append(&mut self, layer: usize, latent: &[f32], rope: &[f32]) {
         debug_assert_eq!(latent.len(), self.kv_lora);
         debug_assert_eq!(rope.len(), self.qk_rope);
-        self.lc[layer].extend(latent.iter().map(|&v| f32_to_bf16(v)));
+        match &mut self.lat {
+            LatentStore::Bf16(lc) => lc[layer].extend(latent.iter().map(|&v| f32_to_bf16(v))),
+            LatentStore::Fp8 { data, scales } => {
+                let base = data[layer].len();
+                data[layer].resize(base + self.kv_lora, 0);
+                let sb = scales[layer].len();
+                scales[layer].resize(sb + self.n_blocks, 0.0);
+                crate::math::quantize_latent_fp8(
+                    latent,
+                    &mut data[layer][base..],
+                    &mut scales[layer][sb..],
+                );
+            }
+        }
         self.rc[layer].extend(rope.iter().map(|&v| f32_to_bf16(v)));
+    }
+
+    /// Dequantize cached latent row `t` of `layer` into `out` (len `kv_lora`).
+    /// Hides the bf16/fp8 storage from the attention core.
+    fn latent_into(&self, layer: usize, t: usize, out: &mut [f32]) {
+        let kvl = self.kv_lora;
+        match &self.lat {
+            LatentStore::Bf16(lc) => {
+                let row = &lc[layer][t * kvl..(t + 1) * kvl];
+                for (o, &b) in out.iter_mut().zip(row) {
+                    *o = bf16_to_f32(b);
+                }
+            }
+            LatentStore::Fp8 { data, scales } => {
+                let row = &data[layer][t * kvl..(t + 1) * kvl];
+                let srow = &scales[layer][t * self.n_blocks..(t + 1) * self.n_blocks];
+                for (i, (o, &byte)) in out.iter_mut().zip(row).enumerate() {
+                    *o = crate::math::dequant_latent_fp8(byte, srow[i / crate::math::E4M3_BLOCK]);
+                }
+            }
+        }
     }
 }
 
@@ -90,6 +154,7 @@ pub struct AttnScratch {
     comp: Vec<f32>,   // kv_lora + qk_rope  (latent | key, normed/roped in place)
     qabs: Vec<f32>,   // kv_lora
     clat: Vec<f32>,   // kv_lora
+    lrow: Vec<f32>,   // kv_lora — one dequantized latent row (bf16/fp8-agnostic)
     ctx: Vec<f32>,    // n_heads * v_head
     scores: Vec<f32>, // up to context length
     rows: Vec<u32>,   // token rows attended this step (ascending)
@@ -103,6 +168,7 @@ impl AttnScratch {
             comp: vec![0.0; cfg.kv_lora_rank + cfg.qk_rope_head_dim],
             qabs: vec![0.0; cfg.kv_lora_rank],
             clat: vec![0.0; cfg.kv_lora_rank],
+            lrow: vec![0.0; cfg.kv_lora_rank],
             ctx: vec![0.0; cfg.n_heads * cfg.v_head_dim],
             scores: Vec::new(),
             rows: Vec::new(),
@@ -292,14 +358,15 @@ pub fn attention(
             addrow(&kv_b, rbase + d, qd, &mut s.qabs);
         }
 
-        // Scores over the selected rows: qabs·L + qrope·R, scaled.
+        // Scores over the selected rows: qabs·L + qrope·R, scaled. The latent
+        // is dequantized (bf16 or fp8) into `s.lrow` by the cache.
         for (&r, sc) in s.rows.iter().zip(s.scores[..nr].iter_mut()) {
             let t = r as usize;
-            let lrow = &kv.lc[layer][t * kvl..(t + 1) * kvl];
+            kv.latent_into(layer, t, &mut s.lrow);
             let rrow = &kv.rc[layer][t * rope..(t + 1) * rope];
             let mut a = 0.0f32;
-            for (i, &lb) in lrow.iter().enumerate() {
-                a += s.qabs[i] * bf16_to_f32(lb);
+            for (i, &lf) in s.lrow.iter().enumerate() {
+                a += s.qabs[i] * lf;
             }
             for (d, &rb) in rrow.iter().enumerate() {
                 a += qrope[d] * bf16_to_f32(rb);
@@ -313,9 +380,9 @@ pub fn attention(
         s.clat.iter_mut().for_each(|c| *c = 0.0);
         for (&r, &sc) in s.rows.iter().zip(s.scores[..nr].iter()) {
             let t = r as usize;
-            let lrow = &kv.lc[layer][t * kvl..(t + 1) * kvl];
-            for (i, &lb) in lrow.iter().enumerate() {
-                s.clat[i] += sc * bf16_to_f32(lb);
+            kv.latent_into(layer, t, &mut s.lrow);
+            for (i, &lf) in s.lrow.iter().enumerate() {
+                s.clat[i] += sc * lf;
             }
         }
         let cx = &mut s.ctx[head * vh..head * vh + vh];

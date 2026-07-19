@@ -39,7 +39,18 @@ fn run_mode(
     mode: &AttnMode,
     steps: usize,
 ) -> anyhow::Result<Vec<Vec<f32>>> {
-    let mut kv = KvCache::new(cfg);
+    run_mode_kv(snap, cfg, layers, mode, steps, false)
+}
+
+fn run_mode_kv(
+    snap: &Snapshot,
+    cfg: &ModelConfig,
+    layers: &[usize],
+    mode: &AttnMode,
+    steps: usize,
+    kv_fp8: bool,
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    let mut kv = KvCache::new(cfg, kv_fp8);
     let mut scr = AttnScratch::new(cfg);
     let mut indexer = match mode {
         AttnMode::Dsa | AttnMode::Misa { .. } => Some(Indexer::new(snap, cfg)?),
@@ -118,6 +129,21 @@ fn modes_agree_below_sparsity_thresholds() -> anyhow::Result<()> {
     )?;
     for (i, d) in dense.iter().enumerate() {
         assert_eq!(d, &misa[i], "dense vs misa diverged at step-layer {i}");
+    }
+
+    // fp8 latent cache: NOT bit-identical to bf16 (lossy by design) but close.
+    // The attention output stays within a small tolerance of the bf16 result.
+    let dense_fp8 = run_mode_kv(&snap, &cfg, &layers, &AttnMode::Dense, steps, true)?;
+    for (i, d) in dense.iter().enumerate() {
+        let max_ref = d.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let max_err = d
+            .iter()
+            .zip(&dense_fp8[i])
+            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(
+            max_err <= 0.05 * max_ref + 1e-3,
+            "fp8 latent cache diverged too far at step-layer {i}: max_err={max_err:.3e} (ref {max_ref:.3e})"
+        );
     }
     Ok(())
 }

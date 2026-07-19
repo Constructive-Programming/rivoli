@@ -71,6 +71,10 @@ pub struct Config {
     /// Attention row-selection mechanism (`--attn dense|streaming|dsa|misa`,
     /// with `--sinks`/`--window` shaping streaming). See `attn::AttnMode`.
     pub attn: AttnMode,
+    /// Store the MLA latent cache as fp8-e4m3 + per-128 block scales instead of
+    /// bf16 (`--kv-fp8`). Halves KV bandwidth/capacity; ~e4m3 precision loss on
+    /// the latent (the rope half stays bf16). Default false (bf16).
+    pub kv_fp8: bool,
 }
 
 fn mem_available() -> Result<u64> {
@@ -108,6 +112,7 @@ impl Config {
         max_pool_size: u64,
         direct_io: bool,
         attn: AttnMode,
+        kv_fp8: bool,
     ) -> Result<Self> {
         let avail = mem_available()?;
         if avail <= OS_RESERVE {
@@ -143,6 +148,7 @@ impl Config {
             max_pool_size,
             direct_io,
             attn,
+            kv_fp8,
         })
     }
 }
@@ -152,7 +158,7 @@ impl fmt::Display for Config {
         const GIB: f64 = (1u64 << 30) as f64;
         write!(
             f,
-            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} direct_io={} cache_policy={} prefetch={} prefetch_depth={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_pool_size={:.0}GiB threads={} attn={:?}",
+            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} direct_io={} cache_policy={} prefetch={} prefetch_depth={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_pool_size={:.0}GiB threads={} attn={:?} kv_fp8={}",
             self.snapshot,
             self.bench,
             self.pre_seed,
@@ -166,7 +172,8 @@ impl fmt::Display for Config {
             OS_RESERVE as f64 / GIB,
             self.max_pool_size as f64 / GIB,
             self.threads,
-            self.attn
+            self.attn,
+            self.kv_fp8
         )
     }
 }

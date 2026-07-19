@@ -33,7 +33,12 @@ impl<'a> Engine<'a> {
     /// Fails at construction (not mid-decode) when a sparse mode is requested
     /// but the snapshot/config lacks the indexer — the out-idx shard and the
     /// indexer dims are validated here.
-    pub fn new(snap: &'a Snapshot, cfg: &'a ModelConfig, mode: AttnMode) -> Result<Self> {
+    pub fn new(
+        snap: &'a Snapshot,
+        cfg: &'a ModelConfig,
+        mode: AttnMode,
+        kv_fp8: bool,
+    ) -> Result<Self> {
         let indexer = match mode {
             AttnMode::Dsa | AttnMode::Misa { .. } => Some(Indexer::new(snap, cfg)?),
             AttnMode::Dense | AttnMode::Streaming { .. } => None,
@@ -43,7 +48,7 @@ impl<'a> Engine<'a> {
             cfg,
             mode,
             indexer,
-            kv: KvCache::new(cfg),
+            kv: KvCache::new(cfg, kv_fp8),
             ascr: AttnScratch::new(cfg),
             mscr: MlpScratch::new(cfg),
             x: vec![0.0; cfg.hidden],

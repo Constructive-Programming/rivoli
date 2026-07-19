@@ -42,13 +42,14 @@ struct Args {
     sinks: usize,
     window: usize,
     misa_heads: usize,
+    kv_fp8: bool,
 }
 
 fn parse_args() -> Result<Args> {
     const USAGE: &str = "usage: rivoli <snapshot-dir> [-bench <tokens>] [--pre-seed] \
          [--direct-vmm-dma] [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc] \
          [--no-prefetch] [--prefetch-depth <n>] [--max-pool-size <GiB>] [--direct-io] \
-         [--attn dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>]";
+         [--attn dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>] [--kv-fp8]";
     let mut snapshot = None;
     // Defaults are the validated winning config: ARC eviction + cross-layer prefetch
     // (best hit% on realistic multi-request sessions + the ~+11% prefetch overlap).
@@ -68,6 +69,7 @@ fn parse_args() -> Result<Args> {
         sinks: 4,
         window: 8192,
         misa_heads: 8, // the MISA paper's validated GLM-5 setting
+        kv_fp8: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -133,6 +135,7 @@ fn parse_args() -> Result<Args> {
                     bail!("--misa-heads must be >= 1");
                 }
             }
+            "--kv-fp8" => a.kv_fp8 = true,
             _ if snapshot.is_none() => snapshot = Some(arg),
             _ => bail!("unexpected argument: {arg}\n{USAGE}"),
         }
@@ -174,6 +177,7 @@ fn main() -> Result<()> {
         a.max_pool_size,
         a.direct_io,
         attn,
+        a.kv_fp8,
     )?;
 
     // Rule 1: the full discovered config is the first line of every run.
@@ -343,7 +347,7 @@ async fn run(cfg: Config) -> Result<()> {
 
     #[cfg(not(feature = "rocm"))]
     {
-        let mut engine = rivoli::engine::Engine::new(&snap, &mc, cfg.attn.clone())?;
+        let mut engine = rivoli::engine::Engine::new(&snap, &mc, cfg.attn.clone(), cfg.kv_fp8)?;
         let t0 = std::time::Instant::now();
         let ids = engine.generate(&prompt_ids, ngen, &tok.eos)?;
         let dt = t0.elapsed().as_secs_f64();

@@ -64,6 +64,98 @@ pub fn bf16_to_f32(b: u16) -> f32 {
     f32::from_bits((b as u32) << 16)
 }
 
+/// Largest finite magnitude representable in OCP `e4m3` (S.1111.110 = 448).
+pub const E4M3_MAX: f32 = 448.0;
+
+/// Quantize f32 → OCP `float8_e4m3` (1 sign, 4 exp bias-7, 3 mantissa), round to
+/// nearest even, saturating to ±448 (e4m3 has no infinities; the only NaN is
+/// 0x7f/0xff). The DeepSeek MLA latent cache stores its NoPE half this way with
+/// a per-128 block scale (so inputs here are pre-scaled into e4m3's range). The
+/// mirror of [`e4m3_to_f32`].
+pub fn f32_to_e4m3(x: f32) -> u8 {
+    if x.is_nan() {
+        return 0x7f;
+    }
+    let sign = if x.is_sign_negative() { 0x80u8 } else { 0 };
+    let a = x.abs();
+    if a >= E4M3_MAX {
+        return sign | 0x7e; // saturate to ±448 (S.1111.110)
+    }
+    // Smallest positive subnormal = 2^-9 (2^-6 · 1/8); below half of it → 0.
+    if a < 2f32.powi(-10) {
+        return sign;
+    }
+    let bits = a.to_bits();
+    let e = ((bits >> 23) & 0xff) as i32 - 127; // unbiased f32 exponent
+    if e < -6 {
+        // Subnormal e4m3: value = m/8 · 2^-6, m in 1..=7. Round a·2^9 to nearest.
+        let m = (a * 512.0).round() as u8; // 2^9 = 8 · 2^6
+        return sign | m.min(7);
+    }
+    // Normal: exp field e+7 in 1..=15, 3 mantissa bits rounded to nearest even.
+    let mant = bits & 0x007f_ffff;
+    let mut m3 = (mant >> 20) as u8; // top 3 mantissa bits
+    let rem = mant & 0x000f_ffff; // remaining 20 bits
+    let half = 0x0008_0000;
+    if rem > half || (rem == half && (m3 & 1) == 1) {
+        m3 += 1;
+    }
+    let mut exp = e + 7;
+    if m3 == 8 {
+        m3 = 0; // mantissa carry → bump exponent
+        exp += 1;
+    }
+    if exp >= 15 && m3 >= 7 {
+        return sign | 0x7e; // rounded up into NaN territory → saturate
+    }
+    sign | ((exp as u8) << 3) | m3
+}
+
+/// The MLA fp8 latent cache's block size: one f32 scale per 128 latent values
+/// (DeepSeek's 1×128 tile quantization). `kv_lora_rank` must be a multiple.
+pub const E4M3_BLOCK: usize = 128;
+
+/// Block-quantize a latent row (`len` a multiple of [`E4M3_BLOCK`]) into fp8:
+/// per 128-element block, scale = amax/448, then each value → e4m3(v/scale).
+/// Writes `len` bytes into `data` and `len/128` scales into `scales`.
+pub fn quantize_latent_fp8(latent: &[f32], data: &mut [u8], scales: &mut [f32]) {
+    debug_assert_eq!(latent.len() % E4M3_BLOCK, 0);
+    debug_assert_eq!(data.len(), latent.len());
+    debug_assert_eq!(scales.len(), latent.len() / E4M3_BLOCK);
+    for (b, blk) in latent.chunks_exact(E4M3_BLOCK).enumerate() {
+        let amax = blk.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        // amax==0 → the block is all zeros; any positive scale reproduces them.
+        let scale = if amax > 0.0 { amax / E4M3_MAX } else { 1.0 };
+        scales[b] = scale;
+        let inv = 1.0 / scale;
+        for (i, &x) in blk.iter().enumerate() {
+            data[b * E4M3_BLOCK + i] = f32_to_e4m3(x * inv);
+        }
+    }
+}
+
+/// Dequantize one fp8 latent element at flat index `i`: `e4m3(data[i]) *
+/// scales[i / 128]`. Inverse of [`quantize_latent_fp8`].
+#[inline]
+pub fn dequant_latent_fp8(byte: u8, scale: f32) -> f32 {
+    e4m3_to_f32(byte) * scale
+}
+
+/// Widen OCP `float8_e4m3` → f32 (exact). Mirror of [`f32_to_e4m3`].
+pub fn e4m3_to_f32(b: u8) -> f32 {
+    let sign = if b & 0x80 != 0 { -1.0f32 } else { 1.0 };
+    let exp = ((b >> 3) & 0x0f) as i32;
+    let mant = (b & 0x07) as f32;
+    if exp == 0 {
+        // Subnormal (or zero): value = m/8 · 2^-6.
+        sign * (mant / 8.0) * 2f32.powi(-6)
+    } else if exp == 15 && mant == 7.0 {
+        f32::NAN
+    } else {
+        sign * (1.0 + mant / 8.0) * 2f32.powi(exp - 7)
+    }
+}
+
 /// LayerNorm in place: `v = (v - mean) / sqrt(var + eps) * weight + bias`.
 /// The DSA indexer's `k_norm` is a true LayerNorm (it ships a bias), unlike
 /// every other norm in the model (RMSNorm).
@@ -212,6 +304,33 @@ mod tests {
             "online={online} two_pass={two_pass} diff={}",
             (online - two_pass).abs()
         );
+    }
+
+    #[test]
+    fn e4m3_roundtrip_and_known_values() {
+        // Exact power-of-two and simple mantissa values round-trip bit-exact.
+        for &(x, want) in &[
+            (0.0f32, 0.0f32),
+            (1.0, 1.0),
+            (-2.0, -2.0),
+            (448.0, 448.0),   // max normal
+            (1.5, 1.5),       // 1 + 4/8
+            (0.0625, 0.0625), // 2^-4
+        ] {
+            let r = e4m3_to_f32(f32_to_e4m3(x));
+            assert_eq!(r, want, "{x} -> {r}");
+        }
+        // Saturation, not inf/NaN, past the max.
+        assert_eq!(e4m3_to_f32(f32_to_e4m3(1000.0)), 448.0);
+        assert_eq!(e4m3_to_f32(f32_to_e4m3(-1000.0)), -448.0);
+        // In-range values land within e4m3's ~2^-3 relative step.
+        for &x in &[0.3f32, -1.7, 12.5, 100.0, 0.011, -55.0] {
+            let r = e4m3_to_f32(f32_to_e4m3(x));
+            let tol = x.abs() * 0.07 + 1e-3; // 3 mantissa bits ≈ 6.25% + subnormal floor
+            assert!((r - x).abs() <= tol, "{x} -> {r} (tol {tol})");
+        }
+        // NaN maps to the e4m3 NaN code and back to NaN.
+        assert!(e4m3_to_f32(f32_to_e4m3(f32::NAN)).is_nan());
     }
 
     #[test]
