@@ -9,6 +9,7 @@
 //! `rocm`-only.
 #![cfg(feature = "rocm")]
 
+use crate::attn::{AttnMode, streaming_rows};
 use crate::device::DeviceBuf;
 use crate::hip::{
     ExpertDesc, device_sync, launch_append_kv, launch_argmax, launch_attend, launch_embed_i8_row,
@@ -42,6 +43,13 @@ fn desc_bytes(d: &[ExpertDesc]) -> &[u8] {
 /// with no staging buffer.
 fn f32_le_bytes(v: &[f32]) -> &[u8] {
     // SAFETY: f32 is POD; the bytes are the LE serialization on this LE host.
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+/// Little-endian byte view of a u32 slice (same idiom as [`f32_le_bytes`]).
+/// Feeds the per-token attention-rows H2D.
+fn u32_le_bytes(v: &[u32]) -> &[u8] {
+    // SAFETY: u32 is POD; the bytes are the LE serialization on this LE host.
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
@@ -113,6 +121,13 @@ impl Profile {
 pub struct GpuEngine<'a> {
     pin: Pin<'a>,
     cfg: &'a ModelConfig,
+    /// Attention row-selection mode. Dense and Streaming run on device today;
+    /// Dsa/Misa are rejected at construction until the indexer kernel lands.
+    mode: AttnMode,
+    /// Device copy of the selected rows (streaming) — uploaded once per token,
+    /// shared by every layer (the selection is position-based, layer-blind).
+    rows_buf: DeviceBuf,
+    rows_host: Vec<u32>,
     // Per-token device scratch (allocated once, reused).
     x: DeviceBuf,
     xn: DeviceBuf,
@@ -170,7 +185,12 @@ pub struct GpuEngine<'a> {
 }
 
 impl<'a> GpuEngine<'a> {
-    pub fn new(pin: Pin<'a>, cfg: &'a ModelConfig, max_ctx: usize) -> Result<Self> {
+    pub fn new(pin: Pin<'a>, cfg: &'a ModelConfig, max_ctx: usize, mode: AttnMode) -> Result<Self> {
+        ensure!(
+            matches!(mode, AttnMode::Dense | AttnMode::Streaming { .. }),
+            "GPU engine does not implement {mode:?} yet (indexer kernel pending); \
+             dense and streaming only"
+        );
         // The MoE block folds the shared expert into the routed batch (D6) at a
         // single kernel `inter = moe_inter`. That is only valid when the shared
         // expert has the routed width, i.e. n_shared == 1 (GLM-5.2). A wider
@@ -195,6 +215,9 @@ impl<'a> GpuEngine<'a> {
         }
         Ok(Self {
             cfg,
+            mode,
+            rows_buf: DeviceBuf::new(max_ctx * 4)?,
+            rows_host: Vec::new(),
             x: f(cfg.hidden)?,
             xn: f(cfg.hidden)?,
             sub: f(cfg.hidden)?,
@@ -281,6 +304,27 @@ impl<'a> GpuEngine<'a> {
         let ctxp = self.ctx.ptr_mut() as *mut f32;
         let glp = self.gate_logits.ptr_mut() as *mut f32;
 
+        // Attention row selection for this token — position-based and layer-
+        // blind (streaming), so it's computed and uploaded ONCE per token and
+        // reused by all 78 launch_attend calls. Dense passes a null rows
+        // pointer (zero-overhead path in the kernel).
+        let (rows_ptr, nr) = match &self.mode {
+            AttnMode::Dense => (std::ptr::null(), pos + 1),
+            AttnMode::Streaming { sinks, window } => {
+                streaming_rows(pos + 1, *sinks, *window, &mut self.rows_host);
+                if self.rows_host.len() == pos + 1 {
+                    // Everything selected → dense; skip the H2D entirely.
+                    (std::ptr::null(), pos + 1)
+                } else {
+                    self.rows_buf.copy_in_at(0, u32_le_bytes(&self.rows_host))?;
+                    (self.rows_buf.ptr() as *const u32, self.rows_host.len())
+                }
+            }
+            // Rejected in `new`; unreachable-by-construction, keep the bail
+            // rather than a panic.
+            other => bail!("GPU forward with unimplemented attention mode {other:?}"),
+        };
+
         // Embedding row → x.
         // SAFETY: all pointers below are device-resident scratch/weights valid
         // for their dims; each launch's inputs are produced by a prior launch on
@@ -335,7 +379,9 @@ impl<'a> GpuEngine<'a> {
                 launch_append_kv(compp, compp.add(kvl), lcp, rcp, pos, kvl, rope)?;
                 launch_mla_absorb(qp, kv_b.packed, kv_b.scale, h, qh, nope, vh, kvl, qabsp)?;
                 launch_gather_rope(qp, qropep, h, qh, nope, rope)?;
-                launch_attend(qabsp, qropep, lcp, rcp, h, pos + 1, kvl, rope, scale, clatp)?;
+                launch_attend(
+                    qabsp, qropep, lcp, rcp, rows_ptr, h, nr, kvl, rope, scale, clatp,
+                )?;
                 launch_mla_value(clatp, kv_b.packed, kv_b.scale, h, nope, vh, kvl, ctxp)?;
                 launch_gemv_i4(
                     ctxp,

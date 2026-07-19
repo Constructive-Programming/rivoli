@@ -251,13 +251,16 @@ async fn run(cfg: Config) -> Result<()> {
     // device. Falls back to the scalar reference path without the `rocm` feature.
     #[cfg(feature = "rocm")]
     {
-        // The resident GPU path only implements dense attention today; the
-        // sparse gather kernel is the D2 follow-on. Fail before the
+        // The resident GPU path runs dense + streaming (sparse gather kernel);
+        // dsa/misa still need the on-device indexer. Fail before the
         // multi-minute pin build, not after.
-        if cfg.attn != rivoli::attn::AttnMode::Dense {
+        if matches!(
+            cfg.attn,
+            rivoli::attn::AttnMode::Dsa | rivoli::attn::AttnMode::Misa { .. }
+        ) {
             bail!(
-                "--attn {:?} is scalar-reference only for now; the GPU path supports dense \
-                 (build without the rocm feature to use the reference engine)",
+                "--attn {:?} is scalar-reference only for now (GPU indexer pending); \
+                 build without the rocm feature to use the reference engine",
                 cfg.attn
             );
         }
@@ -298,7 +301,7 @@ async fn run(cfg: Config) -> Result<()> {
         )?;
         info!("pin built in {:.1}s", t.elapsed().as_secs_f64());
         let max_ctx = prompt_ids.len() + ngen + 1;
-        let mut engine = rivoli::gpu::GpuEngine::new(pin, &mc, max_ctx)?;
+        let mut engine = rivoli::gpu::GpuEngine::new(pin, &mc, max_ctx, cfg.attn.clone())?;
         let t0 = std::time::Instant::now();
         let ids = engine.generate(&prompt_ids, ngen, &tok.eos)?;
         let dt = t0.elapsed().as_secs_f64();

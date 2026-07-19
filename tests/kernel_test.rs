@@ -286,17 +286,18 @@ fn attend_reference(
     lc: &[u16],
     rc: &[u16],
     h: usize,
-    nt: usize,
+    rows: &[u32],
     kvl: usize,
     rope: usize,
     scale: f32,
 ) -> Vec<f32> {
     let mut clat = vec![0.0f32; h * kvl];
-    let mut scores = vec![0.0f32; nt];
+    let mut scores = vec![0.0f32; rows.len()];
     for head in 0..h {
         let qa = &qabs[head * kvl..(head + 1) * kvl];
         let qr = &qrope[head * rope..(head + 1) * rope];
-        for (t, sc) in scores.iter_mut().enumerate() {
+        for (&r, sc) in rows.iter().zip(scores.iter_mut()) {
+            let t = r as usize;
             let lrow = &lc[t * kvl..(t + 1) * kvl];
             let rrow = &rc[t * rope..(t + 1) * rope];
             let mut a = 0.0f32;
@@ -310,7 +311,8 @@ fn attend_reference(
         }
         softmax(&mut scores);
         let out = &mut clat[head * kvl..(head + 1) * kvl];
-        for (t, &sc) in scores.iter().enumerate() {
+        for (&r, &sc) in rows.iter().zip(scores.iter()) {
+            let t = r as usize;
             let lrow = &lc[t * kvl..(t + 1) * kvl];
             for (i, &lb) in lrow.iter().enumerate() {
                 out[i] += sc * bf16_to_f32(lb);
@@ -320,7 +322,11 @@ fn attend_reference(
     clat
 }
 
-fn check_attend(seed: u64, h: usize, nt: usize, kvl: usize, rope: usize) {
+/// `sel` = None → dense over all `nt` rows (kernel gets a null rows pointer);
+/// Some(rows) → sparse gather of those rows (kernel reads them from a device
+/// buffer). The scalar reference always iterates the effective row list, so
+/// both paths check the same math.
+fn check_attend_sel(seed: u64, h: usize, nt: usize, kvl: usize, rope: usize, sel: Option<&[u32]>) {
     let mut rng = Lcg(seed);
     let qabs: Vec<f32> = (0..h * kvl).map(|_| rng.f()).collect();
     let qrope: Vec<f32> = (0..h * rope).map(|_| rng.f()).collect();
@@ -331,7 +337,9 @@ fn check_attend(seed: u64, h: usize, nt: usize, kvl: usize, rope: usize) {
     let rc: Vec<u16> = (0..nt * rope).map(|_| f32_to_bf16(rng.f())).collect();
     let scale = 1.0 / ((kvl + rope) as f32).sqrt();
 
-    let want = attend_reference(&qabs, &qrope, &lc, &rc, h, nt, kvl, rope, scale);
+    let dense: Vec<u32> = (0..nt as u32).collect();
+    let rows = sel.unwrap_or(&dense);
+    let want = attend_reference(&qabs, &qrope, &lc, &rc, h, rows, kvl, rope, scale);
 
     // Device-resident query + KV cache; the kernel reads them in place.
     let qabs_buf = dev_bytes(&f32_bytes(&qabs));
@@ -339,6 +347,13 @@ fn check_attend(seed: u64, h: usize, nt: usize, kvl: usize, rope: usize) {
     let lc_buf = dev_bytes(&u16_bytes(&lc));
     let rc_buf = dev_bytes(&u16_bytes(&rc));
     let mut clat_buf = dev_zeroed(h * kvl * 4);
+    let rows_bytes: Vec<u8> = rows.iter().flat_map(|r| r.to_le_bytes()).collect();
+    let rows_buf = dev_bytes(&rows_bytes); // kept alive even on the dense path
+    let rows_ptr = if sel.is_some() {
+        rows_buf.ptr() as *const u32
+    } else {
+        std::ptr::null()
+    };
 
     // SAFETY: all pointers are device-resident for the dims.
     unsafe {
@@ -347,8 +362,9 @@ fn check_attend(seed: u64, h: usize, nt: usize, kvl: usize, rope: usize) {
             qrope_buf.ptr() as *const f32,
             lc_buf.ptr() as *const u16,
             rc_buf.ptr() as *const u16,
+            rows_ptr,
             h,
-            nt,
+            rows.len(),
             kvl,
             rope,
             scale,
@@ -372,8 +388,13 @@ fn check_attend(seed: u64, h: usize, nt: usize, kvl: usize, rope: usize) {
     let tol = 1e-3 * max_ref + 1e-4;
     assert!(
         max_err <= tol,
-        "h={h} nt={nt} kvl={kvl} rope={rope}: max_err={max_err:.3e} tol={tol:.3e} (max_ref={max_ref:.3e})"
+        "h={h} nt={nt} kvl={kvl} rope={rope} nr={}: max_err={max_err:.3e} tol={tol:.3e} (max_ref={max_ref:.3e})",
+        rows.len()
     );
+}
+
+fn check_attend(seed: u64, h: usize, nt: usize, kvl: usize, rope: usize) {
+    check_attend_sel(seed, h, nt, kvl, rope, None);
 }
 
 #[test]
@@ -397,6 +418,20 @@ fn mla_attend_head_tiling_boundaries() {
     // many TILE=16 steps.
     check_attend(0xb10c_c0de, 64, 130, 512, 64);
     check_attend(0x2020_2020, 20, 96, 512, 64);
+}
+
+#[test]
+fn mla_attend_gather_matches_scalar() {
+    // Sparse gather at GLM dims: a scattered subset (every 3rd row + the last,
+    // non-contiguous strides through the slab) and a streaming-shaped subset
+    // (sinks 0..4 + trailing window) — both against the row-list reference.
+    // Rows counts straddle TILE=16 boundaries (101 and 36).
+    let scattered: Vec<u32> = (0..300u32).step_by(3).chain([299]).collect();
+    check_attend_sel(0x5ca7_7e8d, 64, 300, 512, 64, Some(&scattered));
+    let streaming: Vec<u32> = (0..4u32).chain(268..300).collect();
+    check_attend_sel(0x51de_ca8e, 20, 300, 512, 64, Some(&streaming));
+    // Single selected row (the degenerate softmax-of-one path).
+    check_attend_sel(0x0000_0001, 4, 50, 32, 8, Some(&[49]));
 }
 
 /// Random int8 matrix `[o, i]`: signed bytes + per-row f32 scale bytes.

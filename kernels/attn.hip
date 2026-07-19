@@ -43,12 +43,20 @@ __device__ __forceinline__ float bf16f(unsigned short b) {
 
 // grid = ⌈H/HB⌉ blocks; block = HB*SUBW threads; dynamic LDS holds the per-head
 // accumulators plus the current L/R token tile.
+//
+// Sparse gather (dsa/streaming/misa modes): `rows` (nullable) lists the `nr`
+// cache rows to attend, ascending — the tile loader indirects through it, and
+// everything downstream is unchanged (the online softmax normalizes over
+// whatever was staged). rows==nullptr means dense: row t0+tt is read directly,
+// zero overhead vs the pre-gather kernel. The HOST guarantees every rows[i]
+// < the cache's token count — the kernel cannot bounds-check the slab.
 extern "C" __global__ void mla_latent_attend(
     const float* __restrict__ qabs,         // [H*kvl]
     const float* __restrict__ qrope,        // [H*rope]
-    const unsigned short* __restrict__ Lc,  // [nt*kvl] bf16
-    const unsigned short* __restrict__ Rc,  // [nt*rope] bf16
-    int H, int nt, int kvl, int rope, float scale,
+    const unsigned short* __restrict__ Lc,  // [tokens*kvl] bf16
+    const unsigned short* __restrict__ Rc,  // [tokens*rope] bf16
+    const unsigned int* __restrict__ rows,  // [nr] gather rows, or nullptr = dense
+    int H, int nr, int kvl, int rope, float scale,
     float* __restrict__ clat) {             // [H*kvl]
     extern __shared__ float smem[];
     float* acc = smem;              // [HB*kvl] online accumulator, persists all tiles
@@ -72,13 +80,21 @@ extern "C" __global__ void mla_latent_attend(
     const float* qa = qabs + (size_t)(active ? head : 0) * kvl;
     const float* qr = qrope + (size_t)(active ? head : 0) * rope;
 
-    for (int t0 = 0; t0 < nt; t0 += TILE) {
-        int tcount = min(TILE, nt - t0);
-        // Cooperative tile load (all threads), widening bf16→f32 into LDS.
-        for (int idx = tid; idx < tcount * kvl; idx += blockDim.x)
-            Lt[idx] = bf16f(Lc[(size_t)t0 * kvl + idx]);
-        for (int idx = tid; idx < tcount * rope; idx += blockDim.x)
-            Rt[idx] = bf16f(Rc[(size_t)t0 * rope + idx]);
+    for (int t0 = 0; t0 < nr; t0 += TILE) {
+        int tcount = min(TILE, nr - t0);
+        // Cooperative tile load (all threads), widening bf16→f32 into LDS,
+        // indirecting through `rows` when gathering. kvl/rope are powers of two
+        // in GLM (512/64), so the div/mod compile to shifts.
+        for (int idx = tid; idx < tcount * kvl; idx += blockDim.x) {
+            int tt = idx / kvl, i = idx - tt * kvl;
+            size_t t = rows ? (size_t)rows[t0 + tt] : (size_t)(t0 + tt);
+            Lt[idx] = bf16f(Lc[t * kvl + i]);
+        }
+        for (int idx = tid; idx < tcount * rope; idx += blockDim.x) {
+            int tt = idx / rope, d = idx - tt * rope;
+            size_t t = rows ? (size_t)rows[t0 + tt] : (size_t)(t0 + tt);
+            Rt[idx] = bf16f(Rc[t * rope + d]);
+        }
         __syncthreads();
 
         if (active) {
@@ -118,15 +134,15 @@ extern "C" __global__ void mla_latent_attend(
 extern "C" int rivoli_mla_attend(
     const float* qabs, const float* qrope,
     const unsigned short* Lc, const unsigned short* Rc,
-    int H, int nt, int kvl, int rope, float scale,
+    const unsigned int* rows, int H, int nr, int kvl, int rope, float scale,
     float* clat) {
-    if (H <= 0 || nt <= 0 || kvl <= 0 || rope <= 0) return 1001;
+    if (H <= 0 || nr <= 0 || kvl <= 0 || rope <= 0) return 1001;
     size_t lds = ((size_t)(HB + TILE) * kvl + (size_t)TILE * rope) * sizeof(float);
     if (lds > 65536) return 1002;  // exceeds gfx1151 LDS (shrink TILE/HB)
     int blocks = (H + HB - 1) / HB;
     hipGetLastError();  // drain any stale error so the check below is this launch's
     hipLaunchKernelGGL(mla_latent_attend, dim3(blocks), dim3(HB * SUBW), lds, 0,
-                       qabs, qrope, Lc, Rc, H, nt, kvl, rope, scale, clat);
+                       qabs, qrope, Lc, Rc, rows, H, nr, kvl, rope, scale, clat);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
