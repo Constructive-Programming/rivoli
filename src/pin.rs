@@ -111,6 +111,31 @@ pub struct LayerPin {
     pub indexer: Option<IndexerPin>,
 }
 
+/// The MTP (layer-`n_layers`) resident weights for the device draft path: a full
+/// transformer layer (attention + `n_experts` routed experts + shared) plus the
+/// MTP glue (enorm/hnorm/eh_proj) and the pre-head norm. Experts are placed
+/// RESIDENT here for M2's oracle-match gate; M3 will stream them through the
+/// shared LRU pool. `Some` only when the pin is built with `want_mtp`.
+pub struct MtpPin {
+    pub input_ln: *const f32,
+    pub post_ln: *const f32,
+    pub enorm: *const f32,   // RMSNorm on the next-token embedding
+    pub hnorm: *const f32,   // RMSNorm on the trunk hidden
+    pub shnorm: *const f32,  // shared_head.norm (pre-head)
+    pub eh_proj: *const u16, // bf16 [hidden, 2*hidden]
+    pub q_a: Weight,
+    pub q_a_ln: *const f32,
+    pub q_b: Weight,
+    pub kv_a: Weight,
+    pub kv_a_ln: *const f32,
+    pub kv_b: Weight,
+    pub o_proj: Weight,
+    pub gate_w: *const f32,  // router gate [n_experts, hidden] F32
+    pub gate_bias: Vec<f32>, // e_score_correction_bias, host (routing)
+    pub experts: Vec<Mlp>,   // n_experts resident routed experts
+    pub shared: Mlp,
+}
+
 /// The resident weight set + cold-expert streaming pool. Borrows the snapshot for
 /// its lifetime (cold fetches read the mmap in place).
 pub struct Pin<'a> {
@@ -191,6 +216,9 @@ pub struct Pin<'a> {
     /// space-separated `(layer,expert)` keys the LRU looked up, in access order.
     /// Feeds the offline cache-policy simulator (`src/cache.rs`, `bin/replay`).
     trace: Option<std::io::BufWriter<std::fs::File>>,
+    /// The resident MTP (layer-`n_layers`) weights for the device draft path;
+    /// `Some` only when built with `want_mtp`. See [`MtpPin`].
+    mtp: Option<MtpPin>,
 }
 
 /// Place a norm/f32 tensor (O-length) into the tier: reserve, then `pread` the
@@ -278,6 +306,89 @@ fn place_indexer(tier: &mut DeviceTier, snap: &Snapshot, layer: usize) -> Result
         k_norm_w: place_bf16_as_f32(tier, snap, &format!("{base}.k_norm.weight"))?,
         k_norm_b: place_bf16_as_f32(tier, snap, &format!("{base}.k_norm.bias"))?,
     })
+}
+
+/// Place the MTP layer (index `cfg.n_layers`) resident: glue + attention stack +
+/// gate + shared + all `n_experts` routed experts. Footprint = [`mtp_bytes`].
+fn place_mtp(tier: &mut DeviceTier, snap: &Snapshot, cfg: &ModelConfig) -> Result<MtpPin> {
+    let l = cfg.n_layers;
+    let lb = format!("model.layers.{l}");
+    let a = format!("{lb}.self_attn");
+    let mut experts = Vec::with_capacity(cfg.n_experts);
+    for e in 0..cfg.n_experts {
+        experts.push(place_mlp(
+            tier,
+            snap,
+            &format!("{lb}.mlp.experts.{e}"),
+            cfg.hidden,
+            cfg.moe_inter,
+        )?);
+    }
+    let gate_bias = crate::quant::read_f32(snap.typed(
+        &format!("{lb}.mlp.gate.e_score_correction_bias"),
+        Dtype::F32,
+    )?);
+    ensure!(
+        gate_bias.len() == cfg.n_experts,
+        "MTP gate bias has {} entries, expected {}",
+        gate_bias.len(),
+        cfg.n_experts
+    );
+    Ok(MtpPin {
+        input_ln: place_f32(tier, snap, &format!("{lb}.input_layernorm.weight"))?,
+        post_ln: place_f32(tier, snap, &format!("{lb}.post_attention_layernorm.weight"))?,
+        enorm: place_f32(tier, snap, &format!("{lb}.enorm.weight"))?,
+        hnorm: place_f32(tier, snap, &format!("{lb}.hnorm.weight"))?,
+        shnorm: place_f32(tier, snap, &format!("{lb}.shared_head.norm.weight"))?,
+        eh_proj: place_bf16(tier, snap, &format!("{lb}.eh_proj.weight"))?,
+        q_a: place_i4(tier, snap, &format!("{a}.q_a_proj"), cfg.hidden)?,
+        q_a_ln: place_f32(tier, snap, &format!("{a}.q_a_layernorm.weight"))?,
+        q_b: place_i4(tier, snap, &format!("{a}.q_b_proj"), cfg.q_lora_rank)?,
+        kv_a: place_i4(tier, snap, &format!("{a}.kv_a_proj_with_mqa"), cfg.hidden)?,
+        kv_a_ln: place_f32(tier, snap, &format!("{a}.kv_a_layernorm.weight"))?,
+        kv_b: place_i4(tier, snap, &format!("{a}.kv_b_proj"), cfg.kv_lora_rank)?,
+        o_proj: place_i4(
+            tier,
+            snap,
+            &format!("{a}.o_proj"),
+            cfg.n_heads * cfg.v_head_dim,
+        )?,
+        gate_w: place_f32(tier, snap, &format!("{lb}.mlp.gate.weight"))?,
+        gate_bias,
+        shared: place_mlp(
+            tier,
+            snap,
+            &format!("{lb}.mlp.shared_experts"),
+            cfg.hidden,
+            cfg.moe_inter * cfg.n_shared,
+        )?,
+        experts,
+    })
+}
+
+/// Resident bytes for the MTP layer (`place_mtp`) — one MoE layer's attn + gate +
+/// shared + `n_experts` experts, plus the bf16 eh_proj and the extra f32 norms.
+fn mtp_bytes(cfg: &ModelConfig) -> usize {
+    let rb = crate::quant::row_bytes;
+    let i4 = |o: usize, i: usize| o * rb(i) + o * 4;
+    let f32n = |n: usize| n * 4;
+    let qk = cfg.qk_head_dim();
+    // norms: input, post, enorm, hnorm, shnorm (hidden) + q_a_ln + kv_a_ln
+    let mut t = 5 * f32n(cfg.hidden) + f32n(cfg.q_lora_rank) + f32n(cfg.kv_lora_rank);
+    t += i4(cfg.q_lora_rank, cfg.hidden); // q_a
+    t += i4(cfg.n_heads * qk, cfg.q_lora_rank); // q_b
+    t += i4(cfg.kv_lora_rank + cfg.qk_rope_head_dim, cfg.hidden); // kv_a
+    t += i4(
+        cfg.n_heads * (cfg.qk_nope_head_dim + cfg.v_head_dim),
+        cfg.kv_lora_rank,
+    ); // kv_b
+    t += i4(cfg.hidden, cfg.n_heads * cfg.v_head_dim); // o_proj
+    t += f32n(cfg.n_experts * cfg.hidden); // gate
+    t += cfg.hidden * (2 * cfg.hidden) * 2; // eh_proj bf16 [hidden, 2*hidden]
+    let si = cfg.moe_inter * cfg.n_shared;
+    t += 2 * i4(si, cfg.hidden) + i4(cfg.hidden, si); // shared
+    t += cfg.n_experts * (2 * i4(cfg.moe_inter, cfg.hidden) + i4(cfg.hidden, cfg.moe_inter));
+    t
 }
 
 fn place_mlp(
@@ -493,6 +604,7 @@ impl<'a> Pin<'a> {
         prefetch_depth: usize,
         direct_io: bool,
         want_indexer: bool,
+        want_mtp: bool,
     ) -> Result<Self> {
         let (free, _total) = mem_info()?;
         // Full layers own a resident DSA indexer (dsa/misa modes). Empty when
@@ -514,7 +626,9 @@ impl<'a> Pin<'a> {
         // margin; anything left over widens the LRU below.
         const SLACK: usize = 256 << 20; // 256 MiB
         let n_full = full.iter().filter(|&&f| f).count();
-        let resident = resident_bytes(cfg) + n_full * indexer_bytes(cfg);
+        let resident = resident_bytes(cfg)
+            + n_full * indexer_bytes(cfg)
+            + if want_mtp { mtp_bytes(cfg) } else { 0 };
         let tier_cap = resident + SLACK;
         tracing::info!(
             "computed resident footprint {:.2} GiB (tier {:.2} GiB incl. slack)",
@@ -600,6 +714,13 @@ impl<'a> Pin<'a> {
                 },
             });
         }
+
+        // The MTP (layer-n_layers) draft layer, resident when requested.
+        let mtp = if want_mtp {
+            Some(place_mtp(&mut tier, snap, cfg)?)
+        } else {
+            None
+        };
 
         // The routed tier is an adaptive LRU, not a static frequency pin: N reused
         // slots stream experts in on demand and keep this run's actually-hot ones
@@ -713,7 +834,13 @@ impl<'a> Pin<'a> {
                     ))
                 })
                 .transpose()?,
+            mtp,
         })
+    }
+
+    /// The resident MTP layer weights (`Some` iff built with `want_mtp`).
+    pub fn mtp(&self) -> Option<&MtpPin> {
+        self.mtp.as_ref()
     }
 
     /// Host router correction bias for a MoE `layer` (len n_experts).

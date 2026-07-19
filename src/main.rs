@@ -310,6 +310,7 @@ async fn run(cfg: Config) -> Result<()> {
             cfg.prefetch_depth,
             cfg.direct_io,
             want_indexer,
+            false, // want_mtp: the speculative decode loop wires this in (M3)
         )?;
         info!("pin built in {:.1}s", t.elapsed().as_secs_f64());
         let max_ctx = prompt_ids.len() + ngen + 1;

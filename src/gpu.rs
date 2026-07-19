@@ -211,6 +211,12 @@ pub struct GpuEngine<'a> {
     lc_scale: Vec<DeviceBuf>, // empty unless kv_fp8
     kv_fp8: bool,
     n_kv_blocks: usize, // kvl / E4M3_BLOCK (fp8 scales per token)
+    // MTP (layer-n_layers) device draft scratch — allocated only when the pin
+    // carries the resident MTP layer. Its attention has its own bf16 KV slab.
+    mtp_concat: DeviceBuf, // [2*hidden] f32: [enorm(emb) | hnorm(trunk)]
+    mtp_x: DeviceBuf,      // [hidden] f32: the MTP residual stream
+    mtp_lc: DeviceBuf,     // [max_ctx*kvl] bf16 latent
+    mtp_rc: DeviceBuf,     // [max_ctx*rope] bf16 roped key
     // Host routing/argmax scratch.
     scores: Vec<f32>,
     choice: Vec<f32>,
@@ -325,6 +331,10 @@ impl<'a> GpuEngine<'a> {
             crate::math::E4M3_BLOCK
         );
         let n_kv_blocks = kvl / crate::math::E4M3_BLOCK;
+        // MTP scratch is sized only when the pin carries the resident MTP layer;
+        // a non-MTP run must not pay for the (potentially large) MTP KV slabs.
+        let has_mtp = pin.mtp().is_some();
+        let mtp_kv = |elems: usize| DeviceBuf::new(if has_mtp { elems } else { 1 });
         let mut lc = Vec::with_capacity(cfg.n_layers);
         let mut rc = Vec::with_capacity(cfg.n_layers);
         let mut lc_scale = Vec::with_capacity(if kv_fp8 { cfg.n_layers } else { 0 });
@@ -368,6 +378,10 @@ impl<'a> GpuEngine<'a> {
             lc_scale,
             kv_fp8,
             n_kv_blocks,
+            mtp_concat: mtp_kv(2 * cfg.hidden * 4)?,
+            mtp_x: mtp_kv(cfg.hidden * 4)?,
+            mtp_lc: mtp_kv(max_ctx * kvl * 2)?,
+            mtp_rc: mtp_kv(max_ctx * rope * 2)?,
             scores: vec![0.0; cfg.n_experts],
             choice: vec![0.0; cfg.n_experts],
             sel: Vec::with_capacity(cfg.top_k),
@@ -570,6 +584,206 @@ impl<'a> GpuEngine<'a> {
         idx.last_dense = false;
         idx.last_nr = idx.rows.len();
         Ok((self.rows_buf.ptr() as *const u32, idx.rows.len()))
+    }
+
+    /// One main forward step: run the pass for `token` at `pos` and return the
+    /// greedy prediction. The trunk hidden is left in `self.x` for a following
+    /// [`mtp_draft`](Self::mtp_draft). (The MTP validation drives this.)
+    pub fn step(&mut self, token: u32, pos: usize) -> Result<u32> {
+        self.forward(token, pos)?;
+        self.argmax()
+    }
+
+    /// Device MTP draft (M2). Given the just-completed main forward's trunk
+    /// hidden (`self.x`, valid after [`forward`]) and the token it emitted,
+    /// drafts token t+2 through the resident MTP layer, mirroring the scalar
+    /// oracle (src/mtp.rs): eh_proj([enorm(embed(next)) | hnorm(trunk)]) → the
+    /// layer-`n_layers` transformer layer (its own bf16 KV, Dense attention) →
+    /// tied lm_head. `pos` is the MTP KV's current token count. Every op is an
+    /// already-validated launcher; no new kernels. Returns the greedy draft.
+    pub fn mtp_draft(&mut self, next_token: u32, pos: usize) -> Result<u32> {
+        // The MTP KV slabs are sized to max_ctx; writing row `pos` beyond that is
+        // an out-of-bounds device write (same guard forward() has). M3's decode
+        // loop can advance past the main pos, so refuse rather than corrupt.
+        ensure!(
+            pos < self.max_ctx,
+            "mtp_draft pos {pos} exceeds engine capacity max_ctx={}",
+            self.max_ctx
+        );
+        let cfg = self.cfg;
+        let hidden = cfg.hidden;
+        let eps = cfg.rms_norm_eps as f32;
+        let (h, qh, nope, rope, kvl, vh) = (
+            cfg.n_heads,
+            cfg.qk_head_dim(),
+            cfg.qk_nope_head_dim,
+            cfg.qk_rope_head_dim,
+            cfg.kv_lora_rank,
+            cfg.v_head_dim,
+        );
+        let theta = cfg.rope_theta();
+        let scale = 1.0 / (qh as f32).sqrt();
+
+        // Copy the resident MTP pointers/weights out (all Copy → ends the &pin
+        // borrow so the scratch below can borrow &mut self freely).
+        let mp = self
+            .pin
+            .mtp()
+            .ok_or_else(|| anyhow::anyhow!("mtp_draft without a resident MTP layer"))?;
+        let (input_ln, post_ln, enorm, hnorm, shnorm, eh_proj, gate_w) = (
+            mp.input_ln,
+            mp.post_ln,
+            mp.enorm,
+            mp.hnorm,
+            mp.shnorm,
+            mp.eh_proj,
+            mp.gate_w,
+        );
+        let (q_a, q_a_ln, q_b, kv_a, kv_a_ln, kv_b, o_proj) = (
+            mp.q_a, mp.q_a_ln, mp.q_b, mp.kv_a, mp.kv_a_ln, mp.kv_b, mp.o_proj,
+        );
+        let shared = mp.shared;
+
+        let xp = self.x.ptr() as *const f32; // trunk hidden from the main forward
+        let concatp = self.mtp_concat.ptr_mut() as *mut f32;
+        let xmp = self.mtp_x.ptr_mut() as *mut f32;
+        let xnp = self.xn.ptr_mut() as *mut f32;
+        let subp = self.sub.ptr_mut() as *mut f32;
+        let qrp = self.qr.ptr_mut() as *mut f32;
+        let qp = self.q.ptr_mut() as *mut f32;
+        let compp = self.comp.ptr_mut() as *mut f32;
+        let qabsp = self.qabs.ptr_mut() as *mut f32;
+        let qropep = self.qrope.ptr_mut() as *mut f32;
+        let clatp = self.clat.ptr_mut() as *mut f32;
+        let ctxp = self.ctx.ptr_mut() as *mut f32;
+        let glp = self.gate_logits.ptr_mut() as *mut f32;
+        let lcp = self.mtp_lc.ptr_mut() as *mut u16;
+        let rcp = self.mtp_rc.ptr_mut() as *mut u16;
+
+        // Glue + MTP-layer attention (Dense over the MTP's own KV).
+        // SAFETY: every pointer is resident/scratch, valid until the sync below.
+        unsafe {
+            launch_embed_i8_row(
+                self.pin.embed.packed,
+                self.pin.embed.scale,
+                next_token as usize,
+                hidden,
+                concatp,
+            )?;
+            launch_rmsnorm(concatp, enorm, hidden, eps, concatp)?; // enorm(emb)
+            launch_rmsnorm(xp, hnorm, hidden, eps, concatp.add(hidden))?; // hnorm(trunk)
+            launch_gemv_bf16(concatp, eh_proj, hidden, 2 * hidden, xmp)?; // x = eh_proj·concat
+            launch_rmsnorm(xmp, input_ln, hidden, eps, xnp)?;
+            launch_gemv_i4(xnp, q_a.packed, q_a.scale, q_a.o_dim, q_a.i_dim, qrp)?;
+            launch_rmsnorm(qrp, q_a_ln, cfg.q_lora_rank, eps, qrp)?;
+            launch_gemv_i4(qrp, q_b.packed, q_b.scale, q_b.o_dim, q_b.i_dim, qp)?;
+            launch_gemv_i4(xnp, kv_a.packed, kv_a.scale, kv_a.o_dim, kv_a.i_dim, compp)?;
+            launch_rmsnorm(compp, kv_a_ln, kvl, eps, compp)?;
+            launch_rope(compp.add(kvl), 1, rope, rope, pos, theta)?;
+            launch_rope(qp.add(nope), h, qh, rope, pos, theta)?;
+            launch_append_kv(compp, compp.add(kvl), lcp, rcp, pos, kvl, rope)?;
+            launch_mla_absorb(qp, kv_b.packed, kv_b.scale, h, qh, nope, vh, kvl, qabsp)?;
+            launch_gather_rope(qp, qropep, h, qh, nope, rope)?;
+            launch_attend(
+                qabsp,
+                qropep,
+                lcp,
+                rcp,
+                std::ptr::null(),
+                h,
+                pos + 1,
+                kvl,
+                rope,
+                scale,
+                clatp,
+            )?;
+            launch_mla_value(clatp, kv_b.packed, kv_b.scale, h, nope, vh, kvl, ctxp)?;
+            launch_gemv_i4(
+                ctxp,
+                o_proj.packed,
+                o_proj.scale,
+                o_proj.o_dim,
+                o_proj.i_dim,
+                subp,
+            )?;
+            launch_vadd(xmp, subp, hidden)?; // attn residual
+            launch_rmsnorm(xmp, post_ln, hidden, eps, xnp)?; // pre-MoE norm
+            launch_gemv_f32(xnp, gate_w, cfg.n_experts, hidden, glp)?; // router gate
+        }
+        device_sync()?;
+
+        // Route on host over the 256 resident MTP experts (gate_bias borrowed
+        // out of &self.pin while the routing scratch is &mut — disjoint fields).
+        self.gate_logits.copy_out_into(&mut self.gl_host)?;
+        route_into(
+            &self.gl_host,
+            &self
+                .pin
+                .mtp()
+                .ok_or_else(|| anyhow::anyhow!("mtp gate_bias vanished"))?
+                .gate_bias,
+            cfg.top_k,
+            &mut self.scores,
+            &mut self.choice,
+            &mut self.sel,
+        );
+        // Descriptors: routed experts[sel] (score-weighted) + shared (1.0).
+        self.descs.clear();
+        self.w.clear();
+        for i in 0..self.sel.len() {
+            let e = self.sel[i];
+            let m = self
+                .pin
+                .mtp()
+                .ok_or_else(|| anyhow::anyhow!("mtp experts vanished"))?
+                .experts[e];
+            self.descs.push(desc_of(&m));
+            self.w.push(self.scores[e]);
+        }
+        let mut sm: f32 = self.w.iter().sum();
+        if cfg.norm_topk_prob {
+            sm += 1e-20;
+            for wi in self.w.iter_mut() {
+                *wi /= sm;
+            }
+        }
+        for wi in self.w.iter_mut() {
+            *wi *= cfg.routed_scale as f32;
+        }
+        self.descs.push(desc_of(&shared));
+        self.w.push(1.0);
+        let ndesc = self.descs.len();
+        self.descs_buf.copy_in_at(0, desc_bytes(&self.descs))?;
+        self.wexpert_buf.copy_in_at(0, f32_le_bytes(&self.w))?;
+
+        // MoE → residual → tied head → argmax.
+        // SAFETY: descs/weights/moe scratch resident; lm_head resident.
+        unsafe {
+            launch_moe(
+                xnp,
+                hidden,
+                cfg.moe_inter,
+                ndesc,
+                self.descs_buf.ptr() as *const ExpertDesc,
+                self.wexpert_buf.ptr() as *const f32,
+                self.moe_h.ptr_mut() as *mut f32,
+                self.moe_partial.ptr_mut() as *mut f32,
+                self.moe_out.ptr_mut() as *mut f32,
+            )?;
+            launch_vadd(xmp, self.moe_out.ptr() as *const f32, hidden)?; // MoE residual
+            launch_rmsnorm(xmp, shnorm, hidden, eps, xnp)?; // shared_head.norm
+            let head = self.pin.lm_head;
+            launch_gemv_i8(
+                xnp,
+                head.packed,
+                head.scale,
+                head.o_dim,
+                head.i_dim,
+                self.logits.ptr_mut() as *mut f32,
+            )?;
+        }
+        device_sync()?;
+        self.argmax()
     }
 
     /// One forward pass for `token` at `pos`, leaving next-token logits device-
