@@ -253,7 +253,11 @@ pub fn attention(
             AttnMode::Dsa | AttnMode::Misa { .. } => {
                 let ix = indexer
                     .ok_or_else(|| anyhow::anyhow!("{mode:?} attention mode without an indexer"))?;
-                ix.select(snap, cfg, layer, x, &s.qr, pos, &mut rows)?;
+                let active = match mode {
+                    AttnMode::Misa { active_heads } => Some(*active_heads),
+                    _ => None,
+                };
+                ix.select(snap, cfg, layer, x, &s.qr, pos, active, &mut rows)?;
             }
         }
         s.rows = rows;

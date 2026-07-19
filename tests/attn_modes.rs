@@ -108,5 +108,77 @@ fn modes_agree_below_sparsity_thresholds() -> anyhow::Result<()> {
             "dense vs streaming diverged at step-layer {i}"
         );
     }
+
+    let misa = run_mode(
+        &snap,
+        &cfg,
+        &layers,
+        &AttnMode::Misa { active_heads: 8 },
+        steps,
+    )?;
+    for (i, d) in dense.iter().enumerate() {
+        assert_eq!(d, &misa[i], "dense vs misa diverged at step-layer {i}");
+    }
+    Ok(())
+}
+
+/// Sparse-regime indexer mechanics (the equivalence test above never leaves
+/// the dense-fallback path): push layer 0 past index_topk cached tokens, then
+/// check DSA returns exactly topk sorted unique rows and MISA's 8-head routed
+/// selection substantially agrees with the full 32-head DSA selection (the
+/// paper reports >92% per-layer recovery; 0.5 IoU is a loose floor that still
+/// catches broken routing, e.g. bottom-scored heads or a stale pool).
+#[test]
+fn indexer_sparse_regime_topk_and_misa_overlap() -> anyhow::Result<()> {
+    let Some(dir) = snapshot_dir() else {
+        eprintln!("skipping: no snapshot (set RIVOLI_SNAPSHOT or provide ~/glm52-snap)");
+        return Ok(());
+    };
+    let snap = Snapshot::open(&dir)?;
+    let cfg = ModelConfig::load(&dir)?;
+    if snap
+        .bf16("model.layers.0.self_attn.indexer.wk.weight", cfg.hidden)
+        .is_err()
+    {
+        eprintln!("skipping: snapshot has no out-idx indexer shard");
+        return Ok(());
+    }
+
+    let steps = cfg.index_topk + 8;
+    let qr_len = cfg.q_lora_rank;
+    // Two indexers fed identical streams — selections at each step are
+    // comparable because the key caches are identical.
+    let mut dsa = Indexer::new(&cfg)?;
+    let mut misa = Indexer::new(&cfg)?;
+    let mut rows_dsa = Vec::new();
+    let mut rows_misa = Vec::new();
+    for pos in 0..steps {
+        let x = hidden(&cfg, pos as u32);
+        let qr: Vec<f32> = hidden(&cfg, (pos + 7_000_000) as u32)[..qr_len.min(cfg.hidden)]
+            .iter()
+            .cycle()
+            .take(qr_len)
+            .copied()
+            .collect();
+        dsa.select(&snap, &cfg, 0, &x, &qr, pos, None, &mut rows_dsa)?;
+        misa.select(&snap, &cfg, 0, &x, &qr, pos, Some(8), &mut rows_misa)?;
+    }
+
+    assert_eq!(rows_dsa.len(), cfg.index_topk, "dsa row count");
+    assert!(
+        rows_dsa.windows(2).all(|w| w[0] < w[1]),
+        "rows not sorted-unique"
+    );
+    assert!(
+        rows_dsa.iter().all(|&r| (r as usize) < steps),
+        "row out of range"
+    );
+    assert_eq!(rows_misa.len(), cfg.index_topk, "misa row count");
+
+    let set: std::collections::HashSet<u32> = rows_dsa.iter().copied().collect();
+    let inter = rows_misa.iter().filter(|r| set.contains(r)).count();
+    let iou = inter as f64 / (2 * cfg.index_topk - inter) as f64;
+    eprintln!("misa-vs-dsa selection IoU at nt={steps}: {iou:.3}");
+    assert!(iou > 0.5, "misa selection diverged from dsa (IoU {iou:.3})");
     Ok(())
 }
