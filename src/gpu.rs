@@ -12,11 +12,11 @@
 use crate::attn::{AttnMode, streaming_rows};
 use crate::device::DeviceBuf;
 use crate::hip::{
-    ExpertDesc, device_sync, launch_append_kv, launch_argmax, launch_attend, launch_embed_i8_row,
-    launch_gather_rope, launch_gemv_bf16, launch_gemv_f32, launch_gemv_i4, launch_gemv_i8,
-    launch_index_append, launch_index_head_route, launch_index_pool_push, launch_index_score,
-    launch_layernorm, launch_mla_absorb, launch_mla_value, launch_moe, launch_rmsnorm, launch_rope,
-    launch_vadd,
+    ExpertDesc, device_sync, launch_append_kv, launch_append_kv_fp8, launch_argmax, launch_attend,
+    launch_attend_fp8, launch_embed_i8_row, launch_gather_rope, launch_gemv_bf16, launch_gemv_f32,
+    launch_gemv_i4, launch_gemv_i8, launch_index_append, launch_index_head_route,
+    launch_index_pool_push, launch_index_score, launch_layernorm, launch_mla_absorb,
+    launch_mla_value, launch_moe, launch_rmsnorm, launch_rope, launch_vadd,
 };
 use crate::math::{sigmoid, topk_into};
 use crate::model::ModelConfig;
@@ -202,9 +202,15 @@ pub struct GpuEngine<'a> {
     // kernel writes it and only these 8 bytes come back per token (vs the full
     // vocab×f32 logits), preserving the host argmax's tie-break + finiteness bail.
     argmax_dev: DeviceBuf,
-    // Per-layer bf16 KV slabs, grown in place to max_ctx.
+    // Per-layer latent KV slabs, grown in place to max_ctx. `lc` is bf16
+    // (max_ctx*kvl u16) by default, or fp8-e4m3 (max_ctx*kvl u8) when `kv_fp8`,
+    // in which case `lc_scale` holds the per-128 block scales (max_ctx*n_blocks
+    // f32). `rc` (roped key) is always bf16.
     lc: Vec<DeviceBuf>,
     rc: Vec<DeviceBuf>,
+    lc_scale: Vec<DeviceBuf>, // empty unless kv_fp8
+    kv_fp8: bool,
+    n_kv_blocks: usize, // kvl / E4M3_BLOCK (fp8 scales per token)
     // Host routing/argmax scratch.
     scores: Vec<f32>,
     choice: Vec<f32>,
@@ -231,7 +237,13 @@ pub struct GpuEngine<'a> {
 }
 
 impl<'a> GpuEngine<'a> {
-    pub fn new(pin: Pin<'a>, cfg: &'a ModelConfig, max_ctx: usize, mode: AttnMode) -> Result<Self> {
+    pub fn new(
+        pin: Pin<'a>,
+        cfg: &'a ModelConfig,
+        max_ctx: usize,
+        mode: AttnMode,
+        kv_fp8: bool,
+    ) -> Result<Self> {
         ensure!(
             matches!(
                 mode,
@@ -307,11 +319,17 @@ impl<'a> GpuEngine<'a> {
         let rope = cfg.qk_rope_head_dim;
         let h = cfg.n_heads;
         let slots = cfg.top_k + cfg.n_shared; // routed + shared per MoE launch
+        let n_kv_blocks = kvl / crate::math::E4M3_BLOCK;
         let mut lc = Vec::with_capacity(cfg.n_layers);
         let mut rc = Vec::with_capacity(cfg.n_layers);
+        let mut lc_scale = Vec::with_capacity(if kv_fp8 { cfg.n_layers } else { 0 });
         for _ in 0..cfg.n_layers {
-            lc.push(DeviceBuf::new(max_ctx * kvl * 2)?);
+            // fp8: kvl u8 latent + n_kv_blocks f32 scales; bf16: kvl u16 latent.
+            lc.push(DeviceBuf::new(max_ctx * kvl * if kv_fp8 { 1 } else { 2 })?);
             rc.push(DeviceBuf::new(max_ctx * rope * 2)?);
+            if kv_fp8 {
+                lc_scale.push(DeviceBuf::new(max_ctx * n_kv_blocks * 4)?);
+            }
         }
         Ok(Self {
             cfg,
@@ -342,6 +360,9 @@ impl<'a> GpuEngine<'a> {
             argmax_dev: DeviceBuf::new(8)?, // [i32 index | f32 value]
             lc,
             rc,
+            lc_scale,
+            kv_fp8,
+            n_kv_blocks,
             scores: vec![0.0; cfg.n_experts],
             choice: vec![0.0; cfg.n_experts],
             sel: Vec::with_capacity(cfg.top_k),
@@ -602,8 +623,10 @@ impl<'a> GpuEngine<'a> {
                     Some((self.rows_buf.ptr() as *const u32, self.rows_host.len()))
                 }
             }
-            AttnMode::Dsa => None, // per-layer, inside the loop
-            other => bail!("GPU forward with unimplemented attention mode {other:?}"),
+            // dsa/misa select per full layer inside the loop (they need the
+            // mid-attention q-LoRA residual); `dsa_select_layer` reads the mode
+            // to decide DSA vs MISA head routing.
+            AttnMode::Dsa | AttnMode::Misa { .. } => None,
         };
 
         // Embedding row → x.
@@ -643,8 +666,19 @@ impl<'a> GpuEngine<'a> {
                 (std::ptr::null(), None)
             };
 
-            let lcp = self.lc[l].ptr_mut() as *mut u16;
             let rcp = self.rc[l].ptr_mut() as *mut u16;
+            // fp8: `lc` is a u8 latent slab + `lc_scale` block scales; bf16:
+            // `lc` is the u16 slab (lc8p/lscalep unused). One raw pointer each,
+            // taken before the borrow-heavy launches.
+            let lcp = self.lc[l].ptr_mut() as *mut u16;
+            let lc8p = self.lc[l].ptr_mut();
+            let lscalep = if self.kv_fp8 {
+                self.lc_scale[l].ptr_mut() as *mut f32
+            } else {
+                std::ptr::null_mut()
+            };
+            let nb = self.n_kv_blocks;
+            let kv_fp8 = self.kv_fp8;
 
             let indexer_pin = lw.indexer;
 
@@ -660,7 +694,21 @@ impl<'a> GpuEngine<'a> {
                 launch_rmsnorm(compp, kv_a_ln, kvl, eps, compp)?; // normalize latent (first kvl)
                 launch_rope(compp.add(kvl), 1, rope, rope, pos, theta)?; // rope the key
                 launch_rope(qp.add(nope), h, qh, rope, pos, theta)?; // rope per-head query
-                launch_append_kv(compp, compp.add(kvl), lcp, rcp, pos, kvl, rope)?;
+                if kv_fp8 {
+                    launch_append_kv_fp8(
+                        compp,
+                        compp.add(kvl),
+                        lc8p,
+                        lscalep,
+                        rcp,
+                        pos,
+                        kvl,
+                        rope,
+                        nb,
+                    )?;
+                } else {
+                    launch_append_kv(compp, compp.add(kvl), lcp, rcp, pos, kvl, rope)?;
+                }
                 launch_mla_absorb(qp, kv_b.packed, kv_b.scale, h, qh, nope, vh, kvl, qabsp)?;
                 launch_gather_rope(qp, qropep, h, qh, nope, rope)?;
             }
@@ -677,9 +725,16 @@ impl<'a> GpuEngine<'a> {
             //     value projection, output projection, residual, pre-MLP norm. ---
             // SAFETY: see the forward-level note; every pointer is live scratch.
             unsafe {
-                launch_attend(
-                    qabsp, qropep, lcp, rcp, rows_ptr, h, nr, kvl, rope, scale, clatp,
-                )?;
+                if kv_fp8 {
+                    launch_attend_fp8(
+                        qabsp, qropep, lc8p, lscalep, rcp, rows_ptr, h, nr, kvl, rope, nb, scale,
+                        clatp,
+                    )?;
+                } else {
+                    launch_attend(
+                        qabsp, qropep, lcp, rcp, rows_ptr, h, nr, kvl, rope, scale, clatp,
+                    )?;
+                }
                 launch_mla_value(clatp, kv_b.packed, kv_b.scale, h, nope, vh, kvl, ctxp)?;
                 launch_gemv_i4(
                     ctxp,

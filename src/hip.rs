@@ -168,6 +168,34 @@ unsafe extern "C" {
         hd: i32,
         e: *mut f32,
     ) -> i32;
+
+    fn rivoli_append_kv_fp8(
+        latent: *const f32,
+        rope: *const f32,
+        lc8: *mut u8,
+        lscale: *mut f32,
+        rc: *mut u16,
+        pos: i32,
+        kvl: i32,
+        ropn: i32,
+        n_blocks: i32,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn rivoli_mla_attend_fp8(
+        qabs: *const f32,
+        qrope: *const f32,
+        lc8: *const u8,
+        lscale: *const f32,
+        rc: *const u16,
+        rows: *const u32,
+        h: i32,
+        nr: i32,
+        kvl: i32,
+        rope: i32,
+        n_blocks: i32,
+        scale: f32,
+        clat: *mut f32,
+    ) -> i32;
 }
 
 /// Launch MLA flash attention over the resident KV cache: for each head, writes
@@ -227,6 +255,113 @@ pub unsafe fn launch_attend(
     if r != 0 {
         let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
         bail!("launch_attend failed ({kind}, code {r})");
+    }
+    Ok(())
+}
+
+/// fp8 variant of [`launch_attend`]: the latent cache is fp8-e4m3 (`lc8`,
+/// `nr*kvl` u8) + per-128 block scales (`lscale`, `nr*n_blocks` f32) instead of
+/// bf16; the rope cache `rc` stays bf16. Launch-only.
+///
+/// # Safety
+/// Same async contract as [`launch_attend`]; `lc8`/`lscale` (and `rc`/`rows`/
+/// `qabs`/`qrope`/`clat`) must stay valid device pointers until the next
+/// [`device_sync`] returns, and every `rows` entry a valid cache row.
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_attend_fp8(
+    qabs: *const f32,
+    qrope: *const f32,
+    lc8: *const u8,
+    lscale: *const f32,
+    rc: *const u16,
+    rows: *const u32,
+    h: usize,
+    nr: usize,
+    kvl: usize,
+    rope: usize,
+    n_blocks: usize,
+    scale: f32,
+    clat: *mut f32,
+) -> Result<()> {
+    anyhow::ensure!(
+        h <= i32::MAX as usize
+            && nr <= i32::MAX as usize
+            && kvl <= i32::MAX as usize
+            && rope <= i32::MAX as usize
+            && n_blocks <= i32::MAX as usize,
+        "attn_fp8 dims exceed i32 (h={h} nr={nr} kvl={kvl} rope={rope} n_blocks={n_blocks})"
+    );
+    // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
+    let r = unsafe {
+        rivoli_mla_attend_fp8(
+            qabs,
+            qrope,
+            lc8,
+            lscale,
+            rc,
+            rows,
+            h as i32,
+            nr as i32,
+            kvl as i32,
+            rope as i32,
+            n_blocks as i32,
+            scale,
+            clat,
+        )
+    };
+    if r != 0 {
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("launch_attend_fp8 failed ({kind}, code {r})");
+    }
+    Ok(())
+}
+
+/// fp8 variant of [`launch_append_kv`]: quantizes `latent` to fp8-e4m3 into
+/// `lc8` (row `pos`) with per-128 block scales into `lscale`, and appends the
+/// bf16 rope key to `rc`. Launch-only.
+///
+/// # Safety
+/// Async — `latent`/`rope` inputs and `lc8`/`lscale`/`rc` slabs (with room for
+/// row `pos`) must stay valid device pointers until the next [`device_sync`]
+/// returns.
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_append_kv_fp8(
+    latent: *const f32,
+    rope: *const f32,
+    lc8: *mut u8,
+    lscale: *mut f32,
+    rc: *mut u16,
+    pos: usize,
+    kvl: usize,
+    ropn: usize,
+    n_blocks: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        pos <= i32::MAX as usize
+            && kvl <= i32::MAX as usize
+            && ropn <= i32::MAX as usize
+            && n_blocks <= i32::MAX as usize,
+        "append_kv_fp8 dims exceed i32"
+    );
+    // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
+    let r = unsafe {
+        rivoli_append_kv_fp8(
+            latent,
+            rope,
+            lc8,
+            lscale,
+            rc,
+            pos as i32,
+            kvl as i32,
+            ropn as i32,
+            n_blocks as i32,
+        )
+    };
+    if r != 0 {
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("launch_append_kv_fp8 failed ({kind}, code {r})");
     }
     Ok(())
 }

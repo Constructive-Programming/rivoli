@@ -313,7 +313,8 @@ async fn run(cfg: Config) -> Result<()> {
         )?;
         info!("pin built in {:.1}s", t.elapsed().as_secs_f64());
         let max_ctx = prompt_ids.len() + ngen + 1;
-        let mut engine = rivoli::gpu::GpuEngine::new(pin, &mc, max_ctx, cfg.attn.clone())?;
+        let mut engine =
+            rivoli::gpu::GpuEngine::new(pin, &mc, max_ctx, cfg.attn.clone(), cfg.kv_fp8)?;
         let t0 = std::time::Instant::now();
         let ids = engine.generate(&prompt_ids, ngen, &tok.eos)?;
         let dt = t0.elapsed().as_secs_f64();

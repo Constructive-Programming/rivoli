@@ -1035,3 +1035,114 @@ fn index_head_route_matches_scalar() {
         "index_head_route",
     );
 }
+
+// --- fp8 latent-cache device kernels vs the scalar path ---
+
+/// append_kv_fp8 must produce byte-identical fp8 + scales to the host
+/// quantizer (math.rs::quantize_latent_fp8) — the device f2e4m3 mirrors it.
+#[test]
+fn append_kv_fp8_matches_host_quantize() {
+    use rivoli::math::{E4M3_BLOCK, quantize_latent_fp8};
+    let mut rng = Lcg(0x0f_08_00_01u64);
+    let (kvl, ropn) = (512usize, 64usize);
+    let nb = kvl / E4M3_BLOCK;
+    let latent: Vec<f32> = (0..kvl).map(|_| rng.f() * 3.0).collect();
+    let rope: Vec<f32> = (0..ropn).map(|_| rng.f()).collect();
+    // Host reference.
+    let mut want_data = vec![0u8; kvl];
+    let mut want_scale = vec![0.0f32; nb];
+    quantize_latent_fp8(&latent, &mut want_data, &mut want_scale);
+    // Device.
+    let lat_buf = dev_bytes(&f32_bytes(&latent));
+    let rope_buf = dev_bytes(&f32_bytes(&rope));
+    let mut lc8 = dev_zeroed(kvl); // pos 0 only
+    let mut lscale = dev_zeroed(nb * 4);
+    let mut rc = dev_zeroed(ropn * 2);
+    // SAFETY: device pointers sized for one token at pos 0.
+    unsafe {
+        rivoli::hip::launch_append_kv_fp8(
+            lat_buf.ptr() as *const f32,
+            rope_buf.ptr() as *const f32,
+            lc8.ptr_mut(),
+            lscale.ptr_mut() as *mut f32,
+            rc.ptr_mut() as *mut u16,
+            0,
+            kvl,
+            ropn,
+            nb,
+        )
+        .expect("append_kv_fp8");
+    }
+    device_sync().expect("sync");
+    assert_eq!(lc8.copy_out().expect("out"), want_data, "fp8 bytes differ");
+    let got_scale = f32_vec(&lscale.copy_out().expect("out"));
+    for (g, w) in got_scale.iter().zip(&want_scale) {
+        assert!((g - w).abs() <= w.abs() * 1e-6 + 1e-9, "scale {g} vs {w}");
+    }
+}
+
+/// mla_latent_attend_fp8 over an fp8 latent cache must match the scalar attend
+/// reference computed over the SAME dequantized latents (so the only thing
+/// under test is the kernel's dequant+flash, not the quantization error).
+#[test]
+fn mla_attend_fp8_matches_scalar() {
+    use rivoli::math::{E4M3_BLOCK, dequant_latent_fp8, quantize_latent_fp8};
+    let mut rng = Lcg(0x0f_08_a1_1e_u64);
+    let (h, nt, kvl, rope) = (16usize, 200usize, 512usize, 64usize);
+    let nb = kvl / E4M3_BLOCK;
+    let qabs: Vec<f32> = (0..h * kvl).map(|_| rng.f()).collect();
+    let qrope: Vec<f32> = (0..h * rope).map(|_| rng.f()).collect();
+    // Quantize each token's latent to fp8 (host), keep both the bytes/scales
+    // (for the device) and the exact dequantized f32 (for the reference).
+    let mut lc8 = vec![0u8; nt * kvl];
+    let mut lscale = vec![0.0f32; nt * nb];
+    let mut lc_deq = vec![0u16; nt * kvl]; // dequantized then bf16-packed for attend_reference
+    for t in 0..nt {
+        let row: Vec<f32> = (0..kvl).map(|_| rng.f()).collect();
+        quantize_latent_fp8(
+            &row,
+            &mut lc8[t * kvl..(t + 1) * kvl],
+            &mut lscale[t * nb..(t + 1) * nb],
+        );
+        for i in 0..kvl {
+            let f = dequant_latent_fp8(lc8[t * kvl + i], lscale[t * nb + i / E4M3_BLOCK]);
+            lc_deq[t * kvl + i] = f32_to_bf16(f); // reference reads bf16; f is already e4m3-exact
+        }
+    }
+    let rc: Vec<u16> = (0..nt * rope).map(|_| f32_to_bf16(rng.f())).collect();
+    let scale = 1.0 / ((kvl + rope) as f32).sqrt();
+    let rows: Vec<u32> = (0..nt as u32).collect();
+    let want = attend_reference(&qabs, &qrope, &lc_deq, &rc, h, &rows, kvl, rope, scale);
+
+    let qabs_buf = dev_bytes(&f32_bytes(&qabs));
+    let qrope_buf = dev_bytes(&f32_bytes(&qrope));
+    let lc8_buf = dev_bytes(&lc8);
+    let lscale_buf = dev_bytes(&f32_bytes(&lscale));
+    let rc_buf = dev_bytes(&u16_bytes(&rc));
+    let mut clat_buf = dev_zeroed(h * kvl * 4);
+    // SAFETY: device pointers sized for the dims; rows=null → dense over nt.
+    unsafe {
+        rivoli::hip::launch_attend_fp8(
+            qabs_buf.ptr() as *const f32,
+            qrope_buf.ptr() as *const f32,
+            lc8_buf.ptr(),
+            lscale_buf.ptr() as *const f32,
+            rc_buf.ptr() as *const u16,
+            std::ptr::null(),
+            h,
+            nt,
+            kvl,
+            rope,
+            nb,
+            scale,
+            clat_buf.ptr_mut() as *mut f32,
+        )
+        .expect("attend_fp8");
+    }
+    device_sync().expect("sync");
+    assert_close(
+        &want,
+        &f32_vec(&clat_buf.copy_out().expect("out")),
+        "attend_fp8",
+    );
+}
