@@ -7,13 +7,19 @@ use crate::attn::AttnMode;
 use anyhow::{Context, Result, bail};
 use std::fmt;
 
-/// Reserved for the OS and other on-system processes, bytes.
-pub const OS_RESERVE: u64 = 16 << 30;
+/// Reserved for the OS and other on-system processes, bytes. 8 GiB on the
+/// 124 GiB Strix Halo box (uses ~2 GiB idle + ~40 GiB reclaimable page cache) —
+/// the old 16 GiB left ~40 GiB of unified RAM unused while decode was
+/// cold-miss-fetch-bound (65% of the token). Lower = larger expert cache = fewer
+/// cold misses. Re-raise if the OS/pinned-arena footprint ever presses.
+pub const OS_RESERVE: u64 = 8 << 30;
 
 /// Upper bound on the device expert pool (tier + routed slab), bytes. Fill most
 /// of device memory but cap here so scratch/KV keep headroom; the pool is online
-/// priming, so a bigger cap only captures more of this run's working set.
-pub const MAX_POOL: u64 = 80 << 30;
+/// priming, so a bigger cap only captures more of this run's working set. 100 GiB
+/// so `free − OS_RESERVE` (~92 GiB of the GTT-visible ~100) is the binding limit,
+/// not this cap — decode is cold-miss-bound and every extra slot lifts hit rate.
+pub const MAX_POOL: u64 = 100 << 30;
 
 #[derive(Debug, Clone)]
 pub struct Config {
