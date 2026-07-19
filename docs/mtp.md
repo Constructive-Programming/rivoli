@@ -15,7 +15,9 @@ glue:
 
 - `model.layers.78.enorm.weight` `[6144]` — RMSNorm on the previous hidden `h`.
 - `model.layers.78.hnorm.weight` `[6144]` — RMSNorm on the next token's embedding.
-- `model.layers.78.eh_proj.weight` `[6144, 12288]` — Linear `2·hidden → hidden`.
+- `model.layers.78.eh_proj.weight` `[6144, 12288]` — Linear `2·hidden → hidden`,
+  kept **bf16** (high dynamic range: mean|w|≈0.012, max≈1.5 → per-row int4 zeros
+  ~all of it, 99% rel-err; validated during M0).
 - `model.layers.78.shared_head.norm.weight` `[6144]` — pre-head RMSNorm.
 - `model.layers.78.shared_head.head.weight` — **absent** ⇒ output head is **tied
   to the main `lm_head`** (reuse it).
@@ -46,7 +48,8 @@ engine's formats, matching colibri's math exactly (`convert_fp8_to_int4.py`):
 - fp8 e4m3 with `*.weight_scale_inv` → 128×128-block dequant to f32.
 - int4 per-row: `s = max(|w|.max(axis=1)/7, 1e-8)`, `q = clip(rint(w/s), -8, 7)`,
   pack low nibble = col 2j, high nibble = col 2j+1, each `+8`; `.qs` = f32 row
-  scale. (Experts, attn projections, eh_proj.)
+  scale. (Experts, shared, attn projections.)
+- eh_proj kept bf16 (see above); norms/gate/bias f32; indexer skipped (in out-idx).
 - Norms/`enorm`/`hnorm`/`shared_head.norm` → f32 (widened from bf16).
 - Indexer projections → bf16 (as the main indexer shard).
 Write `out-mtp-*.safetensors` next to the snapshot (indexed by `snapshot.rs`).

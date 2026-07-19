@@ -52,8 +52,10 @@ def quant_int4(w):  # w: [O,I] f32 -> (U8 [O*ceil(I/2)], f32 scale [O])  (colibr
     return out.reshape(-1), s[:, 0].astype(np.float32)
 
 def kind(name):
+    if name.endswith("eh_proj.weight"):
+        return "bf16"  # high dynamic range — int4 destroys it
     if ".indexer" in name:
-        return "skip"  # layer-78 indexer already lives in out-idx (dedup)
+        return "skip"  # already in out-idx (dedup)
     if name.endswith(("norm.weight", "layernorm.weight", "enorm.weight",
                       "hnorm.weight", "e_score_correction_bias")) or name.endswith("mlp.gate.weight"):
         return "f32"
