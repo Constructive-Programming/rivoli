@@ -138,6 +138,103 @@ extern "C" int rivoli_moe_experts(
     return e == hipSuccess ? 0 : -(int)e;
 }
 
+// --- batched (S positions) MoE for MTP speculative verify -------------------
+// One launch applies the UNION of the S positions' experts to all S input rows,
+// reading each int4 expert's weights ONCE (the fetch amortization: overlapping
+// expert sets → far fewer unique reads than S separate S=1 calls). Each position
+// weights only the experts it selected (wexpert[s*E+e] = 0 for the rest), so the
+// output matches S independent S=1 MoE calls. x/out are [S*hidden] row-major;
+// wexpert is [S*E]; h is [S*E*inter]; partial is [S*E*hidden].
+#define MAXS 8 // max drafts verified per batch (1-token MTP head uses S=2)
+
+// S wave-dots of the SAME int4 row against S input rows (base + s*xstride), so
+// the row's nibbles are decoded once and reused across positions. Results (one
+// per position) land on lane 0 in out[0..S).
+__device__ __forceinline__ void dot_i4_wave_batched(
+    const float* __restrict__ x, int dim, int S, size_t xstride,
+    const unsigned char* __restrict__ row, int lane, float* out) {
+    float acc[MAXS];
+    for (int s = 0; s < S; ++s) acc[s] = 0.0f;
+    for (int i = lane; i < dim; i += WAVE) {
+        unsigned char b = row[i >> 1];
+        float wv = (float)(((i & 1) ? (b >> 4) : (b & 0x0F)) - 8);
+        for (int s = 0; s < S; ++s) acc[s] += x[(size_t)s * xstride + i] * wv;
+    }
+    for (int s = 0; s < S; ++s) out[s] = wave_sum(acc[s]);
+}
+
+extern "C" __global__ void moe_gateup_batched(
+    const float* __restrict__ x, int hidden, int inter, int E, int S,
+    const ExpertDesc* __restrict__ descs, float* __restrict__ h_out) {
+    int lane = threadIdx.x & (WAVE - 1);
+    size_t r = (size_t)blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / WAVE;
+    if (r >= (size_t)E * inter) return;
+    int e = (int)(r / inter), j = (int)(r % inter);
+    const ExpertDesc d = descs[e];
+    size_t rb_h = (hidden + 1) / 2;
+    float g[MAXS], u[MAXS];
+    dot_i4_wave_batched(x, hidden, S, (size_t)hidden, d.gate_packed + (size_t)j * rb_h, lane, g);
+    dot_i4_wave_batched(x, hidden, S, (size_t)hidden, d.up_packed + (size_t)j * rb_h, lane, u);
+    if (lane == 0)
+        for (int s = 0; s < S; ++s)
+            h_out[(size_t)s * E * inter + r] = siluf(g[s] * d.gate_scale[j]) * (u[s] * d.up_scale[j]);
+}
+
+extern "C" __global__ void moe_down_batched(
+    int hidden, int inter, int E, int S, const ExpertDesc* __restrict__ descs,
+    const float* __restrict__ wexpert, const float* __restrict__ h_in,
+    float* __restrict__ partial) {
+    int lane = threadIdx.x & (WAVE - 1);
+    size_t r = (size_t)blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / WAVE;
+    if (r >= (size_t)E * hidden) return;
+    int e = (int)(r / hidden), o = (int)(r % hidden);
+    const ExpertDesc d = descs[e];
+    size_t rb_i = (inter + 1) / 2;
+    // position s's h for expert e: base h_in + e*inter, stride E*inter between s.
+    float dv[MAXS];
+    dot_i4_wave_batched(h_in + (size_t)e * inter, inter, S, (size_t)E * inter,
+                        d.down_packed + (size_t)o * rb_i, lane, dv);
+    if (lane == 0)
+        for (int s = 0; s < S; ++s)
+            partial[(size_t)s * E * hidden + r] = wexpert[(size_t)s * E + e] * dv[s] * d.down_scale[o];
+}
+
+// out[s*hidden + o] = Σ_e partial[s][e][o], e ASCENDING (deterministic).
+extern "C" __global__ void moe_reduce_batched(
+    const float* __restrict__ partial, int E, int hidden, int S,
+    float* __restrict__ out) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)S * hidden) return;
+    int s = (int)(idx / hidden), o = (int)(idx % hidden);
+    float acc = 0.0f;
+    for (int e = 0; e < E; ++e) acc += partial[(size_t)s * E * hidden + (size_t)e * hidden + o];
+    out[idx] = acc;
+}
+
+extern "C" int rivoli_moe_experts_batched(
+    const float* x, int hidden, int inter, int E, int S,
+    const void* descs, const float* wexpert, float* h, float* partial, float* out) {
+    if (hidden <= 0 || inter <= 0 || E <= 0 || S <= 0) return 1001;
+    if (S > MAXS) return 1002;
+    const ExpertDesc* d = (const ExpertDesc*)descs;
+    hipGetLastError();
+    size_t rows_a = (size_t)E * inter;
+    hipLaunchKernelGGL(moe_gateup_batched, dim3((rows_a + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
+                       dim3(256), 0, 0, x, hidden, inter, E, S, d, h);
+    hipError_t e = hipGetLastError();
+    if (e != hipSuccess) return -(int)e;
+    size_t rows_b = (size_t)E * hidden;
+    hipLaunchKernelGGL(moe_down_batched, dim3((rows_b + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
+                       dim3(256), 0, 0, hidden, inter, E, S, d, wexpert, h, partial);
+    e = hipGetLastError();
+    if (e != hipSuccess) return -(int)e;
+    size_t rows_c = (size_t)S * hidden;
+    hipLaunchKernelGGL(moe_reduce_batched, dim3((rows_c + 255) / 256), dim3(256), 0, 0,
+                       partial, E, hidden, S, out);
+    e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
 // One join point per token: block until all launched kernels retire, surfacing
 // any async execution fault. Returns 0 or -(hipError_t).
 extern "C" int rivoli_device_sync() {

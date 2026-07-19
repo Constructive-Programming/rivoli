@@ -36,7 +36,8 @@ fn dev_zeroed(len: usize) -> DeviceBuf {
 use rivoli::hip::{
     ExpertDesc, device_sync, launch_attend, launch_gemv_bf16, launch_gemv_f32, launch_gemv_i4,
     launch_gemv_i8, launch_index_head_route, launch_index_pool_push, launch_index_score,
-    launch_layernorm, launch_mla_absorb, launch_mla_value, launch_moe, launch_rmsnorm, launch_rope,
+    launch_layernorm, launch_mla_absorb, launch_mla_value, launch_moe, launch_moe_batched,
+    launch_rmsnorm, launch_rope,
 };
 use rivoli::math::{bf16_to_f32, f32_to_bf16, silu, softmax};
 use rivoli::quant::{addrow, matvec_f32_bytes, matvec_i4, matvec_i4_rows, matvec_i8, row_bytes};
@@ -261,6 +262,101 @@ fn check(seed: u64, hidden: usize, inter: usize, e: usize) {
         max_err <= tol,
         "hidden={hidden} inter={inter} e={e}: max_err={max_err:.3e} tol={tol:.3e} (max_ref={max_ref:.3e})"
     );
+}
+
+/// Batched MoE (S positions over the UNION of e experts) must equal S separate
+/// S=1 MoE calls: position 0 weights experts [0,e/2), position 1 weights
+/// [e/2,e) (each zero elsewhere), so the batched kernel — which applies every
+/// union expert to both positions but zeroes the non-selected weights — matches
+/// two independent `reference()` outputs.
+fn check_moe_batched(seed: u64, hidden: usize, inter: usize, e: usize) {
+    let mut rng = Lcg(seed);
+    let x0: Vec<f32> = (0..hidden).map(|_| rng.f()).collect();
+    let x1: Vec<f32> = (0..hidden).map(|_| rng.f()).collect();
+    let gates: Vec<Mat> = (0..e).map(|_| gen_mat(&mut rng, inter, hidden)).collect();
+    let ups: Vec<Mat> = (0..e).map(|_| gen_mat(&mut rng, inter, hidden)).collect();
+    let downs: Vec<Mat> = (0..e).map(|_| gen_mat(&mut rng, hidden, inter)).collect();
+    // Per-position weights: position 0 selects the first half, position 1 the
+    // second half (0 elsewhere) — exercises the union + per-position weighting.
+    let half = e / 2;
+    let w0: Vec<f32> = (0..e)
+        .map(|i| if i < half { rng.f() } else { 0.0 })
+        .collect();
+    let w1: Vec<f32> = (0..e)
+        .map(|i| if i >= half { rng.f() } else { 0.0 })
+        .collect();
+
+    let want0 = reference(&x0, hidden, inter, &gates, &ups, &downs, &w0);
+    let want1 = reference(&x1, hidden, inter, &gates, &ups, &downs, &w1);
+
+    let mut tier = DeviceTier::new(256 << 20).expect("alloc tier");
+    let descs: Vec<ExpertDesc> = (0..e)
+        .map(|i| {
+            let gp = place_bytes(&mut tier, &gates[i].packed);
+            let gs = place_bytes(&mut tier, &gates[i].scale_bytes);
+            let up = place_bytes(&mut tier, &ups[i].packed);
+            let us = place_bytes(&mut tier, &ups[i].scale_bytes);
+            let dp = place_bytes(&mut tier, &downs[i].packed);
+            let ds = place_bytes(&mut tier, &downs[i].scale_bytes);
+            ExpertDesc {
+                gate_packed: gp,
+                gate_scale: gs as *const f32,
+                up_packed: up,
+                up_scale: us as *const f32,
+                down_packed: dp,
+                down_scale: ds as *const f32,
+            }
+        })
+        .collect();
+    let desc_bytes = unsafe {
+        std::slice::from_raw_parts(
+            descs.as_ptr() as *const u8,
+            std::mem::size_of_val(&descs[..]),
+        )
+    };
+    let descs_buf = dev_bytes(desc_bytes);
+    // x = [x0 | x1]; wexpert = [w0 | w1] (S*e).
+    let mut xcat = f32_bytes(&x0);
+    xcat.extend(f32_bytes(&x1));
+    let mut wcat = f32_bytes(&w0);
+    wcat.extend(f32_bytes(&w1));
+    let x_buf = dev_bytes(&xcat);
+    let w_buf = dev_bytes(&wcat);
+    let mut h_buf = DeviceBuf::new(2 * e * inter * 4).expect("alloc h");
+    let mut partial_buf = DeviceBuf::new(2 * e * hidden * 4).expect("alloc partial");
+    let mut out_buf = DeviceBuf::new(2 * hidden * 4).expect("alloc out");
+    // SAFETY: device buffers sized for S=2; kernels fully write h/partial/out.
+    unsafe {
+        launch_moe_batched(
+            x_buf.ptr() as *const f32,
+            hidden,
+            inter,
+            e,
+            2,
+            descs_buf.ptr() as *const ExpertDesc,
+            w_buf.ptr() as *const f32,
+            h_buf.ptr_mut() as *mut f32,
+            partial_buf.ptr_mut() as *mut f32,
+            out_buf.ptr_mut() as *mut f32,
+        )
+        .expect("launch moe_batched");
+    }
+    device_sync().expect("device sync");
+    let got = f32_vec(&out_buf.copy_out().expect("copy out"));
+    let mut want = want0.clone();
+    want.extend(&want1);
+    assert_close(
+        &want,
+        &got,
+        &format!("moe_batched hidden={hidden} inter={inter} e={e}"),
+    );
+}
+
+#[test]
+fn moe_batched_matches_two_s1() {
+    // Realistic GLM MoE dims, e experts split across the two positions.
+    check_moe_batched(0xb47c_4ed0, 6144, 2048, 8);
+    check_moe_batched(0x0002_0002, 512, 256, 4);
 }
 
 #[test]

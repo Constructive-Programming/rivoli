@@ -37,6 +37,20 @@ unsafe extern "C" {
         out: *mut f32,
     ) -> i32;
 
+    #[allow(clippy::too_many_arguments)]
+    fn rivoli_moe_experts_batched(
+        x: *const f32,
+        hidden: i32,
+        inter: i32,
+        e: i32,
+        s: i32,
+        descs: *const ExpertDesc,
+        wexpert: *const f32,
+        h: *mut f32,
+        partial: *mut f32,
+        out: *mut f32,
+    ) -> i32;
+
     fn rivoli_device_sync() -> i32;
 
     fn rivoli_embed_i8_row(
@@ -445,6 +459,58 @@ pub unsafe fn launch_moe(
     if r != 0 {
         let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
         bail!("launch_moe failed ({kind}, code {r})");
+    }
+    Ok(())
+}
+
+/// Batched (`s` positions) MoE: applies the UNION of the positions' experts to
+/// all `s` input rows, reading each int4 expert ONCE (the MTP speculative-verify
+/// fetch amortization). `x`/`out` are `[s*hidden]`; `wexpert` `[s*e]` (per-
+/// position weights, 0 for unselected); `h` `[s*e*inter]`; `partial`
+/// `[s*e*hidden]`. Output matches `s` independent [`launch_moe`] calls. `s ≤ 8`.
+///
+/// # Safety
+/// Async — every pointer must be a valid device buffer of the size above, live
+/// until the next [`device_sync`] returns.
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_moe_batched(
+    x: *const f32,
+    hidden: usize,
+    inter: usize,
+    e: usize,
+    s: usize,
+    descs: *const ExpertDesc,
+    wexpert: *const f32,
+    h: *mut f32,
+    partial: *mut f32,
+    out: *mut f32,
+) -> Result<()> {
+    anyhow::ensure!(
+        hidden <= i32::MAX as usize
+            && inter <= i32::MAX as usize
+            && e <= i32::MAX as usize
+            && s <= i32::MAX as usize,
+        "moe_batched dims exceed i32 (hidden={hidden} inter={inter} e={e} s={s})"
+    );
+    // SAFETY: caller's contract (see # Safety) covers pointer validity.
+    let r = unsafe {
+        rivoli_moe_experts_batched(
+            x,
+            hidden as i32,
+            inter as i32,
+            e as i32,
+            s as i32,
+            descs,
+            wexpert,
+            h,
+            partial,
+            out,
+        )
+    };
+    if r != 0 {
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("launch_moe_batched failed ({kind}, code {r})");
     }
     Ok(())
 }
