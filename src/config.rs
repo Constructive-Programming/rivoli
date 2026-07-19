@@ -3,6 +3,7 @@
 //! first line of every run — a benchmark whose parameters aren't in its log
 //! never happened (lesson from the colibri campaign).
 
+use crate::attn::AttnMode;
 use anyhow::{Context, Result, bail};
 use std::fmt;
 
@@ -67,6 +68,9 @@ pub struct Config {
     /// queue/drain/bounce/`hipMemcpy` path is byte-identical either way, so decode is
     /// bit-identical between modes; only the cache-vs-no-cache mechanism differs.
     pub direct_io: bool,
+    /// Attention row-selection mechanism (`--attn dense|streaming|dsa|misa`,
+    /// with `--sinks`/`--window` shaping streaming). See `attn::AttnMode`.
+    pub attn: AttnMode,
 }
 
 fn mem_available() -> Result<u64> {
@@ -103,6 +107,7 @@ impl Config {
         prefetch_depth: usize,
         max_pool_size: u64,
         direct_io: bool,
+        attn: AttnMode,
     ) -> Result<Self> {
         let avail = mem_available()?;
         if avail <= OS_RESERVE {
@@ -137,6 +142,7 @@ impl Config {
             threads,
             max_pool_size,
             direct_io,
+            attn,
         })
     }
 }
@@ -146,7 +152,7 @@ impl fmt::Display for Config {
         const GIB: f64 = (1u64 << 30) as f64;
         write!(
             f,
-            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} direct_io={} cache_policy={} prefetch={} prefetch_depth={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_pool_size={:.0}GiB threads={}",
+            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} direct_io={} cache_policy={} prefetch={} prefetch_depth={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_pool_size={:.0}GiB threads={} attn={:?}",
             self.snapshot,
             self.bench,
             self.pre_seed,
@@ -159,7 +165,8 @@ impl fmt::Display for Config {
             self.prompt,
             OS_RESERVE as f64 / GIB,
             self.max_pool_size as f64 / GIB,
-            self.threads
+            self.threads,
+            self.attn
         )
     }
 }

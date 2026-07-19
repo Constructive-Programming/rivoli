@@ -29,6 +29,19 @@ pub struct ModelConfig {
     pub qk_nope_head_dim: usize,
     pub v_head_dim: usize,
 
+    // --- DSA lightning indexer (sparse attention; absent fields = no indexer
+    // info, and the dsa/misa attention modes fail loudly at startup) ---
+    #[serde(default)]
+    pub index_n_heads: usize,
+    #[serde(default)]
+    pub index_head_dim: usize,
+    #[serde(default)]
+    pub index_topk: usize,
+    /// Per-layer "full" (owns an indexer) / "shared" (reuses the nearest
+    /// preceding full layer's top-k) — GLM-5.2's trained-in IndexShare.
+    #[serde(default)]
+    pub indexer_types: Vec<String>,
+
     // --- MoE ---
     #[serde(rename = "n_routed_experts")]
     pub n_experts: usize,
@@ -107,6 +120,38 @@ impl ModelConfig {
 
     pub fn rope_theta(&self) -> f64 {
         self.rope.rope_theta
+    }
+
+    /// Validate the indexer config for the dsa/misa attention modes and return
+    /// the per-layer full/shared flags (`true` = full). Called only when a
+    /// sparse mode is requested — dense/streaming decode must keep working on
+    /// snapshots whose config predates the indexer fields.
+    pub fn indexer_layout(&self) -> Result<Vec<bool>> {
+        if self.index_n_heads == 0 || self.index_head_dim == 0 || self.index_topk == 0 {
+            anyhow::bail!(
+                "config.json has no DSA indexer dims (index_n_heads/index_head_dim/index_topk)"
+            );
+        }
+        if self.indexer_types.len() != self.n_layers {
+            anyhow::bail!(
+                "indexer_types has {} entries, expected n_layers={}",
+                self.indexer_types.len(),
+                self.n_layers
+            );
+        }
+        let full: Vec<bool> = self
+            .indexer_types
+            .iter()
+            .map(|t| match t.as_str() {
+                "full" => Ok(true),
+                "shared" => Ok(false),
+                other => Err(anyhow::anyhow!("unknown indexer type {other:?}")),
+            })
+            .collect::<Result<_>>()?;
+        if !full[0] {
+            anyhow::bail!("layer 0 is 'shared' but has no preceding full layer");
+        }
+        Ok(full)
     }
 
     /// Total per-head query/key dimension (nope + rope).

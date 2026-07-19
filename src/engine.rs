@@ -6,7 +6,8 @@
 //! the fused GPU kernels are later milestones). Greedy sampling for now — the
 //! M1 gate is coherence, not sampling strategy.
 
-use crate::attn::{AttnScratch, KvCache, attention};
+use crate::attn::{AttnMode, AttnScratch, KvCache, attention};
+use crate::indexer::Indexer;
 use crate::math::rmsnorm_into_bytes;
 use crate::model::ModelConfig;
 use crate::moe::{MlpScratch, dense_mlp, moe_block};
@@ -17,6 +18,8 @@ use anyhow::{Result, bail, ensure};
 pub struct Engine<'a> {
     snap: &'a Snapshot,
     cfg: &'a ModelConfig,
+    mode: AttnMode,
+    indexer: Option<Indexer>,
     kv: KvCache,
     ascr: AttnScratch,
     mscr: MlpScratch,
@@ -27,10 +30,19 @@ pub struct Engine<'a> {
 }
 
 impl<'a> Engine<'a> {
-    pub fn new(snap: &'a Snapshot, cfg: &'a ModelConfig) -> Self {
-        Self {
+    /// Fails at construction (not mid-decode) when a sparse mode is requested
+    /// but the snapshot/config lacks the indexer — the out-idx shard and the
+    /// indexer dims are validated here.
+    pub fn new(snap: &'a Snapshot, cfg: &'a ModelConfig, mode: AttnMode) -> Result<Self> {
+        let indexer = match mode {
+            AttnMode::Dsa | AttnMode::Misa { .. } => Some(Indexer::new(cfg)?),
+            AttnMode::Dense | AttnMode::Streaming { .. } => None,
+        };
+        Ok(Self {
             snap,
             cfg,
+            mode,
+            indexer,
             kv: KvCache::new(cfg),
             ascr: AttnScratch::new(cfg),
             mscr: MlpScratch::new(cfg),
@@ -38,7 +50,7 @@ impl<'a> Engine<'a> {
             xn: vec![0.0; cfg.hidden],
             sub: vec![0.0; cfg.hidden],
             logits: vec![0.0; cfg.vocab],
-        }
+        })
     }
 
     /// One forward pass for `token` at `pos`, leaving next-token logits in
@@ -62,6 +74,8 @@ impl<'a> Engine<'a> {
                 layer,
                 &self.xn,
                 pos,
+                &self.mode,
+                self.indexer.as_mut(),
                 &mut self.kv,
                 &mut self.ascr,
                 &mut self.sub,

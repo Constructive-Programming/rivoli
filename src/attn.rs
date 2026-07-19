@@ -10,11 +10,35 @@
 //! latents directly, and the attention-weighted latent is projected back
 //! through `kv_b`'s value rows.
 
+use crate::indexer::Indexer;
 use crate::math::{bf16_to_f32, f32_to_bf16, rmsnorm, softmax};
 use crate::model::ModelConfig;
 use crate::quant::{addrow, matvec_i4, matvec_i4_rows, read_f32};
 use crate::snapshot::Snapshot;
 use anyhow::{Result, ensure};
+
+/// Which tokens each decode step attends over. Selected once per layer per
+/// token; the MLA absorb core is identical across modes — only the row set
+/// differs (`AttnScratch::rows`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttnMode {
+    /// Full softmax over every cached token. Exactly the trained model at
+    /// ≤ index_topk (2048) context; mildly out-of-distribution beyond.
+    Dense,
+    /// StreamingLLM: first `sinks` tokens + last `window` tokens, position
+    /// based, no weights needed. Bounds attention BANDWIDTH, not cache memory
+    /// (rows outside the set stay cached — the M4 slab owns eviction policy).
+    /// Discards mid-context: fine for throughput-shaped overnight work, wrong
+    /// for whole-context retrieval.
+    Streaming { sinks: usize, window: usize },
+    /// Native DSA: the trained lightning indexer picks top-2048 tokens per
+    /// full layer; shared layers reuse (IndexShare). Needs the out-idx shard.
+    Dsa,
+    /// DSA with MISA head routing (arXiv 2605.07363): only `active_heads` of
+    /// the 32 indexer heads score tokens. Falls back to full DSA scoring until
+    /// the router lands.
+    Misa { active_heads: usize },
+}
 
 /// Compressed MLA KV cache: per layer, bf16 latents and roped keys, one row per
 /// cached token. Grows by one row per layer per decoded token.
@@ -66,6 +90,7 @@ pub struct AttnScratch {
     clat: Vec<f32>,   // kv_lora
     ctx: Vec<f32>,    // n_heads * v_head
     scores: Vec<f32>, // up to context length
+    rows: Vec<u32>,   // token rows attended this step (ascending)
 }
 
 impl AttnScratch {
@@ -78,6 +103,7 @@ impl AttnScratch {
             clat: vec![0.0; cfg.kv_lora_rank],
             ctx: vec![0.0; cfg.n_heads * cfg.v_head_dim],
             scores: Vec::new(),
+            rows: Vec::new(),
         }
     }
 }
@@ -108,10 +134,24 @@ pub fn rope_interleave(v: &mut [f32], pos: usize, theta: f64) {
     }
 }
 
+/// StreamingLLM row set over `nt` cached tokens: the first `sinks` tokens plus
+/// the last `window` tokens, ascending, overlap-free. Never empty for `nt ≥ 1`
+/// (a zero-sink zero-window config still attends the current token — the
+/// window floor is the row that was just appended).
+pub fn streaming_rows(nt: usize, sinks: usize, window: usize, rows: &mut Vec<u32>) {
+    rows.clear();
+    let sink_end = sinks.min(nt);
+    let win_start = nt.saturating_sub(window.max(1)).max(sink_end);
+    rows.extend(0..sink_end as u32);
+    rows.extend(win_start as u32..nt as u32);
+}
+
 /// One MLA attention decode step for `layer`. `x` is the RMSNorm'd hidden
 /// (input_layernorm applied by the caller). Appends this token's latent/key to
 /// `kv` and writes the attention output (pre-residual, `hidden`-length) into
-/// `out`. `pos` must equal the layer's current cached-token count.
+/// `out`. `pos` must equal the layer's current cached-token count. `mode`
+/// picks the attended row set; `indexer` must be `Some` for the dsa/misa
+/// modes (enforced at engine construction, re-checked here).
 #[allow(clippy::too_many_arguments)]
 pub fn attention(
     snap: &Snapshot,
@@ -119,6 +159,8 @@ pub fn attention(
     layer: usize,
     x: &[f32],
     pos: usize,
+    mode: &AttnMode,
+    indexer: Option<&mut Indexer>,
     kv: &mut KvCache,
     s: &mut AttnScratch,
     out: &mut [f32],
@@ -193,6 +235,31 @@ pub fn attention(
         rope_interleave(&mut s.q[off..off + rope], pos, theta);
     }
 
+    // Select the rows this step attends over (ascending token order). The
+    // absorb core below is mode-agnostic; only this set differs.
+    let nt = kv.tokens(layer);
+    {
+        // `rows` is taken out of the scratch so the indexer can borrow `s.qr`
+        // immutably while filling it.
+        let mut rows = std::mem::take(&mut s.rows);
+        match mode {
+            AttnMode::Dense => {
+                rows.clear();
+                rows.extend(0..nt as u32);
+            }
+            AttnMode::Streaming { sinks, window } => {
+                streaming_rows(nt, *sinks, *window, &mut rows);
+            }
+            AttnMode::Dsa | AttnMode::Misa { .. } => {
+                let ix = indexer
+                    .ok_or_else(|| anyhow::anyhow!("{mode:?} attention mode without an indexer"))?;
+                ix.select(snap, cfg, layer, x, &s.qr, pos, &mut rows)?;
+            }
+        }
+        s.rows = rows;
+    }
+    ensure!(!s.rows.is_empty(), "empty attention row selection");
+
     // 3) Absorb-path attention core, per head.
     //
     // DEFERRED (profiling P1): this is head-outer / token-inner, so each cached
@@ -203,9 +270,9 @@ pub fn attention(
     // context, stays correct as written, and restructuring it now would
     // complicate the thing the kernel is checked against. Kept simple on
     // purpose; the kernel does the tiling.
-    let nt = kv.tokens(layer);
-    if s.scores.len() < nt {
-        s.scores.resize(nt, 0.0);
+    let nr = s.rows.len();
+    if s.scores.len() < nr {
+        s.scores.resize(nr, 0.0);
     }
     for head in 0..h {
         let qp = &s.q[head * qh..head * qh + qh];
@@ -218,8 +285,9 @@ pub fn attention(
             addrow(&kv_b, rbase + d, qd, &mut s.qabs);
         }
 
-        // Scores over every cached token: qabs·L + qrope·R, scaled.
-        for (t, sc) in s.scores[..nt].iter_mut().enumerate() {
+        // Scores over the selected rows: qabs·L + qrope·R, scaled.
+        for (&r, sc) in s.rows.iter().zip(s.scores[..nr].iter_mut()) {
+            let t = r as usize;
             let lrow = &kv.lc[layer][t * kvl..(t + 1) * kvl];
             let rrow = &kv.rc[layer][t * rope..(t + 1) * rope];
             let mut a = 0.0f32;
@@ -231,11 +299,13 @@ pub fn attention(
             }
             *sc = a * scale;
         }
-        softmax(&mut s.scores[..nt]);
+        softmax(&mut s.scores[..nr]);
 
-        // Weighted sum of latents, then project through kv_b value rows.
+        // Weighted sum of the selected latents, then project through kv_b
+        // value rows.
         s.clat.iter_mut().for_each(|c| *c = 0.0);
-        for (t, &sc) in s.scores[..nt].iter().enumerate() {
+        for (&r, &sc) in s.rows.iter().zip(s.scores[..nr].iter()) {
+            let t = r as usize;
             let lrow = &kv.lc[layer][t * kvl..(t + 1) * kvl];
             for (i, &lb) in lrow.iter().enumerate() {
                 s.clat[i] += sc * bf16_to_f32(lb);
@@ -261,6 +331,24 @@ mod tests {
         let mut v = vec![1.0, 2.0, 3.0, 4.0];
         rope_interleave(&mut v, 0, 8_000_000.0);
         assert_eq!(v, vec![1.0, 3.0, 2.0, 4.0]);
+    }
+
+    #[test]
+    fn streaming_rows_shapes() {
+        let mut r = Vec::new();
+        // Fewer tokens than sinks+window → everything (dense-equivalent).
+        streaming_rows(5, 4, 100, &mut r);
+        assert_eq!(r, vec![0, 1, 2, 3, 4]);
+        // Disjoint sinks + window.
+        streaming_rows(100, 4, 10, &mut r);
+        assert_eq!(&r[..4], &[0, 1, 2, 3]);
+        assert_eq!(&r[4..], (90u32..100).collect::<Vec<_>>().as_slice());
+        // Window overlapping the sinks clips, no duplicates.
+        streaming_rows(10, 8, 5, &mut r);
+        assert_eq!(r, (0u32..10).collect::<Vec<_>>());
+        // Degenerate zero-sink zero-window still attends the current token.
+        streaming_rows(50, 0, 0, &mut r);
+        assert_eq!(r, vec![49]);
     }
 
     #[test]

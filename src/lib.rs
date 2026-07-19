@@ -5,6 +5,7 @@ pub mod device;
 pub mod engine;
 pub mod gpu;
 pub mod hip;
+pub mod indexer;
 pub mod math;
 pub mod model;
 pub mod moe;

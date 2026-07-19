@@ -64,6 +64,21 @@ pub fn bf16_to_f32(b: u16) -> f32 {
     f32::from_bits((b as u32) << 16)
 }
 
+/// LayerNorm in place: `v = (v - mean) / sqrt(var + eps) * weight + bias`.
+/// The DSA indexer's `k_norm` is a true LayerNorm (it ships a bias), unlike
+/// every other norm in the model (RMSNorm).
+pub fn layernorm(v: &mut [f32], weight: &[f32], bias: &[f32], eps: f32) {
+    debug_assert_eq!(weight.len(), v.len());
+    debug_assert_eq!(bias.len(), v.len());
+    let n = v.len() as f32;
+    let mean = v.iter().sum::<f32>() / n;
+    let var = v.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / n;
+    let inv = 1.0 / (var + eps).sqrt();
+    for ((vi, &w), &b) in v.iter_mut().zip(weight).zip(bias) {
+        *vi = (*vi - mean) * inv * w + b;
+    }
+}
+
 /// In-place softmax over a slice (numerically stable).
 pub fn softmax(v: &mut [f32]) {
     let max = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -196,6 +211,27 @@ mod tests {
             (online - two_pass).abs() <= 1e-4,
             "online={online} two_pass={two_pass} diff={}",
             (online - two_pass).abs()
+        );
+    }
+
+    #[test]
+    fn layernorm_zero_mean_unit_var() {
+        // With weight=1 bias=0, output must have ~zero mean and ~unit variance.
+        let mut v = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 100.0];
+        let w = vec![1.0f32; 6];
+        let b = vec![0.0f32; 6];
+        layernorm(&mut v, &w, &b, 1e-6);
+        let mean: f32 = v.iter().sum::<f32>() / 6.0;
+        let var: f32 = v.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / 6.0;
+        assert!(mean.abs() < 1e-5, "mean {mean}");
+        assert!((var - 1.0).abs() < 1e-3, "var {var}");
+        // Bias shifts, weight scales: check one element algebraically.
+        let mut v2 = vec![2.0f32, 4.0];
+        layernorm(&mut v2, &[3.0, 3.0], &[10.0, 10.0], 0.0);
+        // mean=3, var=1 → normed = [-1, 1] → *3 + 10 = [7, 13]
+        assert!(
+            (v2[0] - 7.0).abs() < 1e-4 && (v2[1] - 13.0).abs() < 1e-4,
+            "{v2:?}"
         );
     }
 }

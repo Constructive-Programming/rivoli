@@ -19,15 +19,18 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
-/// On-disk element type. The snapshot uses exactly two: `F32` (norm weights,
-/// the router gate, and per-row scales `.qs`) and `U8` (packed int4 expert
-/// nibbles, and the int8 embedding/lm_head). Any other dtype is rejected at
-/// index time. Expert weights are int4-only; the int8 U8 tensors are a small
-/// distinct class reached through their own accessors, never [`Int4Matrix`].
+/// On-disk element type. The snapshot uses three: `F32` (norm weights, the
+/// router gate, and per-row scales `.qs`), `U8` (packed int4 expert nibbles,
+/// and the int8 embedding/lm_head), and `BF16` (the DSA lightning-indexer
+/// weights in the optional `out-idx-*` shard, shipped verbatim from the HF
+/// checkpoint). Any other dtype is rejected at index time. Expert weights are
+/// int4-only; U8/BF16 tensors are small distinct classes reached through their
+/// own accessors, never [`Int4Matrix`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dtype {
     F32,
     U8,
+    Bf16,
 }
 
 impl Dtype {
@@ -35,6 +38,7 @@ impl Dtype {
         Ok(match s {
             "F32" => Dtype::F32,
             "U8" => Dtype::U8,
+            "BF16" => Dtype::Bf16,
             other => bail!("unsupported tensor dtype {other:?} (this engine is int4-only)"),
         })
     }
@@ -64,6 +68,18 @@ pub struct Int8Matrix<'a> {
     pub packed: &'a [u8],
     /// `o_dim` little-endian f32 scales (raw bytes).
     pub scale: &'a [u8],
+    pub o_dim: usize,
+    pub i_dim: usize,
+}
+
+/// A **bf16** weight matrix (the DSA lightning-indexer projections, kept at
+/// their checkpoint precision — the indexer is bandwidth-trivial next to the
+/// experts, so no repack). Obtained only via [`Snapshot::bf16`], which
+/// validates dtype and the header shape against the expected `i_dim`.
+#[derive(Debug, Clone, Copy)]
+pub struct Bf16Matrix<'a> {
+    /// `o_dim` rows × `i_dim` little-endian bf16 values.
+    pub data: &'a [u8],
     pub o_dim: usize,
     pub i_dim: usize,
 }
@@ -379,6 +395,37 @@ impl Snapshot {
             o_dim,
             i_dim,
         })
+    }
+
+    /// Locate a bf16 weight matrix `W[o_dim, i_dim]` by FULL tensor name (the
+    /// `out-idx-*` shard keeps original HF names, `.weight` included, so no
+    /// suffix convention is applied here). The header shape — 2-D in the HF
+    /// export, unlike the 1-D colibri layout — supplies `o_dim`; `i_dim` is
+    /// cross-checked. Only constructor of [`Bf16Matrix`].
+    pub fn bf16(&self, name: &str, i_dim: usize) -> Result<Bf16Matrix<'_>> {
+        let loc = self
+            .index
+            .get(name)
+            .with_context(|| format!("bf16 tensor {name} not found (missing out-idx shard?)"))?;
+        if loc.dtype != Dtype::Bf16 {
+            bail!("{name} is {:?}, expected BF16", loc.dtype);
+        }
+        let (o_dim, want_i) = match loc.shape.as_slice() {
+            [o, i] => (*o, *i),
+            other => bail!("{name}: expected 2-D shape, got {other:?}"),
+        };
+        if want_i != i_dim {
+            bail!("{name}: i_dim {want_i} != expected {i_dim}");
+        }
+        let data = self.loc_bytes(name, loc)?;
+        if data.len() != o_dim * i_dim * 2 {
+            bail!(
+                "{name}: {} bytes for o_dim={o_dim} i_dim={i_dim} bf16, expected {}",
+                data.len(),
+                o_dim * i_dim * 2
+            );
+        }
+        Ok(Bf16Matrix { data, o_dim, i_dim })
     }
 
     /// Locate an int8 weight matrix `W[o_dim, i_dim]` by base name (`<name>.weight`

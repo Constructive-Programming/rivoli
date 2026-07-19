@@ -22,6 +22,10 @@ use tracing::info;
 /// 80 GiB); the resolved pool budget is `min(free − OS_RESERVE, max_pool_size)`.
 /// `--direct-io` makes the cold-expert reads use O_DIRECT (bypass the OS page
 /// cache); default is buffered reads through the page cache.
+/// `--attn dense|streaming|dsa|misa` picks the attention row-selection
+/// mechanism (see attn::AttnMode). `--sinks`/`--window` shape streaming mode
+/// (defaults 4 / 8192, the StreamingLLM shape). dsa/misa need the `out-idx-*`
+/// indexer shard in the snapshot dir.
 struct Args {
     snapshot: String,
     bench: Option<usize>,
@@ -34,12 +38,16 @@ struct Args {
     prefetch_depth: usize,
     max_pool_size: u64,
     direct_io: bool,
+    attn: String,
+    sinks: usize,
+    window: usize,
 }
 
 fn parse_args() -> Result<Args> {
     const USAGE: &str = "usage: rivoli <snapshot-dir> [-bench <tokens>] [--pre-seed] \
          [--direct-vmm-dma] [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc] \
-         [--no-prefetch] [--prefetch-depth <n>] [--max-pool-size <GiB>] [--direct-io]";
+         [--no-prefetch] [--prefetch-depth <n>] [--max-pool-size <GiB>] [--direct-io] \
+         [--attn dense|streaming|dsa|misa] [--sinks <n>] [--window <n>]";
     let mut snapshot = None;
     // Defaults are the validated winning config: ARC eviction + cross-layer prefetch
     // (best hit% on realistic multi-request sessions + the ~+11% prefetch overlap).
@@ -55,6 +63,9 @@ fn parse_args() -> Result<Args> {
         prefetch_depth: 2,
         max_pool_size: rivoli::config::MAX_POOL,
         direct_io: false,
+        attn: "dense".to_string(),
+        sinks: 4,
+        window: 8192,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -91,6 +102,25 @@ fn parse_args() -> Result<Args> {
                 a.max_pool_size = gib << 30;
             }
             "--direct-io" => a.direct_io = true,
+            "--attn" => {
+                a.attn = args
+                    .next()
+                    .context("--attn requires dense|streaming|dsa|misa")?;
+            }
+            "--sinks" => {
+                a.sinks = args
+                    .next()
+                    .context("--sinks requires an integer")?
+                    .parse()
+                    .context("--sinks takes an integer")?;
+            }
+            "--window" => {
+                a.window = args
+                    .next()
+                    .context("--window requires an integer")?
+                    .parse()
+                    .context("--window takes an integer")?;
+            }
             _ if snapshot.is_none() => snapshot = Some(arg),
             _ => bail!("unexpected argument: {arg}\n{USAGE}"),
         }
@@ -107,6 +137,17 @@ fn main() -> Result<()> {
         .init();
 
     let a = parse_args()?;
+    let attn = match a.attn.as_str() {
+        "dense" => rivoli::attn::AttnMode::Dense,
+        "streaming" => rivoli::attn::AttnMode::Streaming {
+            sinks: a.sinks,
+            window: a.window,
+        },
+        "dsa" => rivoli::attn::AttnMode::Dsa,
+        // 8 active heads of 32 — the MISA paper's validated GLM-5 setting.
+        "misa" => rivoli::attn::AttnMode::Misa { active_heads: 8 },
+        other => bail!("unknown --attn mode {other:?} (dense|streaming|dsa|misa)"),
+    };
     let cfg = Config::discover(
         a.snapshot,
         a.bench,
@@ -119,6 +160,7 @@ fn main() -> Result<()> {
         a.prefetch_depth,
         a.max_pool_size,
         a.direct_io,
+        attn,
     )?;
 
     // Rule 1: the full discovered config is the first line of every run.
@@ -209,6 +251,16 @@ async fn run(cfg: Config) -> Result<()> {
     // device. Falls back to the scalar reference path without the `rocm` feature.
     #[cfg(feature = "rocm")]
     {
+        // The resident GPU path only implements dense attention today; the
+        // sparse gather kernel is the D2 follow-on. Fail before the
+        // multi-minute pin build, not after.
+        if cfg.attn != rivoli::attn::AttnMode::Dense {
+            bail!(
+                "--attn {:?} is scalar-reference only for now; the GPU path supports dense \
+                 (build without the rocm feature to use the reference engine)",
+                cfg.attn
+            );
+        }
         let (free, _total) = rivoli::device::mem_info()?;
         // Budget = the always-resident set (footprint computed from cfg in
         // Pin::build, ~9-10 GiB for GLM-5.2) + the routed-expert LRU. Fill most of
@@ -274,7 +326,7 @@ async fn run(cfg: Config) -> Result<()> {
 
     #[cfg(not(feature = "rocm"))]
     {
-        let mut engine = rivoli::engine::Engine::new(&snap, &mc);
+        let mut engine = rivoli::engine::Engine::new(&snap, &mc, cfg.attn.clone())?;
         let t0 = std::time::Instant::now();
         let ids = engine.generate(&prompt_ids, ngen, &tok.eos)?;
         let dt = t0.elapsed().as_secs_f64();

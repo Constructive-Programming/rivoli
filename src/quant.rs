@@ -9,7 +9,8 @@
 //!
 //! Dequantized weight `W[o,i] = (nibble - 8) * scale[o]`.
 
-use crate::snapshot::{Int4Matrix, Int8Matrix};
+use crate::math::bf16_to_f32;
+use crate::snapshot::{Bf16Matrix, Int4Matrix, Int8Matrix};
 
 /// Row stride in bytes for an int4 matrix with `i_dim` input columns.
 pub fn row_bytes(i_dim: usize) -> usize {
@@ -132,6 +133,31 @@ pub fn matvec_f32_bytes(y: &mut [f32], x: &[f32], w_bytes: &[u8], i_dim: usize) 
         }
         *yo = acc;
     }
+}
+
+/// GEMV against a **bf16** weight matrix `W[o_dim, i_dim]` (row major), widening
+/// each weight inline — no `Vec<f32>` materialization. The DSA lightning-indexer
+/// projections (`wq_b`, `wk`, `weights_proj`) are the only bf16 weights.
+pub fn matvec_bf16(y: &mut [f32], x: &[f32], w: &Bf16Matrix) {
+    debug_assert_eq!(y.len(), w.o_dim);
+    debug_assert_eq!(x.len(), w.i_dim);
+    for (yo, row) in y.iter_mut().zip(w.data.chunks_exact(w.i_dim * 2)) {
+        let mut acc = 0.0f32;
+        for (c, &xi) in row.chunks_exact(2).zip(x) {
+            acc += bf16_to_f32(u16::from_le_bytes([c[0], c[1]])) * xi;
+        }
+        *yo = acc;
+    }
+}
+
+/// Read a bf16 tensor's raw bytes into a `Vec<f32>`. For O-length tensors only
+/// (the indexer's `k_norm` weight/bias) — loaded once at startup.
+pub fn read_bf16(bytes: &[u8]) -> Vec<f32> {
+    debug_assert_eq!(bytes.len() % 2, 0, "bf16 tensor length not a multiple of 2");
+    bytes
+        .chunks_exact(2)
+        .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .collect()
 }
 
 #[cfg(test)]
