@@ -94,6 +94,21 @@ indexed; shapes validated at load.**
   ring, drain in `resolve_layer(l+1)` (mirror `forward`'s prefetch). Without it the
   batched-fetch amortization is dominated by the prefetch it gave up.
 
+  **M4 DONE (2026-07-19): prefetch restored, spec STILL loses — investigation
+  closed with a definitive negative result.** `forward_batch` now predicts + submits
+  L+1's union (per position, deduped, capped at `prefetch_depth`) exactly like
+  `forward`; regression test greedy-identical *with prefetch active*. Measured: spec
+  **0.55** tok/s vs baseline **0.70** (was 0.53 pre-M4; hit 69.6→73.8%, drain-wait
+  down to 16ms/tok — fetch now hidden). **Root cause (definitive): decode is NVMe-
+  BANDWIDTH-bound and prefetch already hides fetch LATENCY in both paths, so
+  batching's fetch-*amortization* lever is moot — and batching *raises* bytes/token:
+  spec reads 184 misses/tok vs baseline 159 (+16%), because a 2-position union has
+  more distinct experts than one top-8 and 57% of rounds are rejects that fetched a
+  wasted draft's experts.** At 43% accept the round-count drop (64→44) can't beat
+  +16% bytes on the bandwidth floor. Spec would only win with much higher accept
+  (>~70%) AND high union overlap — not reachable with a 1-token MTP head here.
+  `--spec` stays in as a verified-correct, opt-in mechanism; not the default.
+
 ## Why this is the right lever (recap)
 
 Decode is NVMe-read-bound and `attn`/`mlp` can't overlap (sequential residual

@@ -229,10 +229,11 @@ pub struct GpuEngine<'a> {
     smoe: DeviceBuf,     // [MAX_SPEC*hidden] f32: batched MoE output
     swexpert: DeviceBuf, // [MAX_SPEC*(MAX_SPEC*top_k+1)] f32: batched per-position weights
     swexpert_host: Vec<f32>,
-    sh: DeviceBuf,       // batched MoE SwiGLU scratch [MAX_SPEC*Emax*moe_inter]
-    spartial: DeviceBuf, // batched MoE partials [MAX_SPEC*Emax*hidden]
-    wtab: Vec<f32>,      // host [MAX_SPEC*n_experts] per-position weight table
-    union: Vec<usize>,   // host union expert set this layer
+    sh: DeviceBuf,          // batched MoE SwiGLU scratch [MAX_SPEC*Emax*moe_inter]
+    spartial: DeviceBuf,    // batched MoE partials [MAX_SPEC*Emax*hidden]
+    wtab: Vec<f32>,         // host [MAX_SPEC*n_experts] per-position weight table
+    union: Vec<usize>,      // host union expert set this layer
+    pred_union: Vec<usize>, // host union of the S positions' predicted L+1 experts (prefetch)
     // Host routing/argmax scratch.
     scores: Vec<f32>,
     choice: Vec<f32>,
@@ -419,6 +420,7 @@ impl<'a> GpuEngine<'a> {
             spartial: mtp_kv(MAX_SPEC * (MAX_SPEC * cfg.top_k + 1) * cfg.hidden * 4)?,
             wtab: vec![0.0; MAX_SPEC * cfg.n_experts],
             union: Vec::with_capacity(MAX_SPEC * cfg.top_k),
+            pred_union: Vec::with_capacity(MAX_SPEC * cfg.top_k),
             scores: vec![0.0; cfg.n_experts],
             choice: vec![0.0; cfg.n_experts],
             sel: Vec::with_capacity(cfg.top_k),
@@ -779,14 +781,51 @@ impl<'a> GpuEngine<'a> {
                     )?;
                 }
             } else {
-                // Route each position → per-position weight table `wtab`.
+                // Cross-layer prefetch (mirror forward()): predict L+1's routed
+                // experts from each position's post-attn residual `sx[s]` (the cheap
+                // proxy for L+1's input) and submit their cold reads after this
+                // layer's demand fetch, so they overlap the batched MoE compute
+                // below and are drained by resolve_layer(l+1) next iteration. This
+                // is what makes the batched verify actually beat baseline — without
+                // it the union fetch sits on the critical path (M3 was 0.53 vs 0.71).
+                let predict = self.prefetch && l + 1 < cfg.n_layers && l + 1 >= cfg.dense_layers;
+                let next_pred = if predict {
+                    if let LayerMlp::Moe { gate_w, .. } = &self.pin.layers[l + 1].mlp {
+                        Some((self.pin.layers[l + 1].input_ln, *gate_w))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                // Route each position → per-position weight table `wtab`, and
+                // accumulate the predicted L+1 union across positions.
                 for w in self.wtab.iter_mut() {
                     *w = 0.0;
                 }
+                self.pred_union.clear();
                 for s in 0..s_n {
-                    // SAFETY: gate_w resident; sxn[s]/glp device scratch.
+                    // SAFETY: gate_w resident; sxn[s]/glp device scratch. When
+                    // predicting, also norm+gate sx[s] with L+1's weights into the
+                    // pred scratch — same null stream, drained by the sync below.
                     unsafe {
-                        launch_gemv_f32(sxnp.add(s * hidden), gate_w, cfg.n_experts, hidden, glp)?
+                        launch_gemv_f32(sxnp.add(s * hidden), gate_w, cfg.n_experts, hidden, glp)?;
+                        if let Some((next_ln, next_gate)) = next_pred {
+                            launch_rmsnorm(
+                                sxp.add(s * hidden),
+                                next_ln,
+                                hidden,
+                                eps,
+                                self.pred_xn.ptr_mut() as *mut f32,
+                            )?;
+                            launch_gemv_f32(
+                                self.pred_xn.ptr() as *const f32,
+                                next_gate,
+                                cfg.n_experts,
+                                hidden,
+                                self.pred_gl.ptr_mut() as *mut f32,
+                            )?;
+                        }
                     };
                     device_sync()?;
                     self.gate_logits.copy_out_into(&mut self.gl_host)?;
@@ -809,6 +848,25 @@ impl<'a> GpuEngine<'a> {
                         }
                         self.wtab[s * cfg.n_experts + e] = wv * cfg.routed_scale as f32;
                     }
+                    // Predicted L+1 top-k for this position → merge the top
+                    // `prefetch_depth` into the cross-position prefetch union.
+                    if next_pred.is_some() {
+                        self.pred_gl.copy_out_into(&mut self.pgl_host)?;
+                        route_into(
+                            &self.pgl_host,
+                            self.pin.moe_bias(l + 1),
+                            cfg.top_k,
+                            &mut self.pred_scores,
+                            &mut self.pred_choice,
+                            &mut self.pred_sel,
+                        );
+                        let n = self.prefetch_depth.min(self.pred_sel.len());
+                        for &e in &self.pred_sel[..n] {
+                            if !self.pred_union.contains(&e) {
+                                self.pred_union.push(e);
+                            }
+                        }
+                    }
                 }
                 // Union of selected experts, fetched once.
                 self.union.clear();
@@ -818,6 +876,11 @@ impl<'a> GpuEngine<'a> {
                     }
                 }
                 self.pin.resolve_layer(l, &self.union, &mut self.mlps)?;
+                // Submit L+1's predicted reads now: the demand ring just drained, so
+                // these run on the NVMe/DMA side during the batched MoE compute below.
+                if next_pred.is_some() && !self.pred_union.is_empty() {
+                    self.pin.prefetch_layer(l + 1, &self.pred_union)?;
+                }
                 self.descs.clear();
                 for m in &self.mlps {
                     self.descs.push(desc_of(m));

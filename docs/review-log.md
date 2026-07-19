@@ -68,6 +68,14 @@ indexing, kernel stride/int4/reduce math. 5 findings, all fixed before commit.
 cross-layer prefetch and baseline's prefetch dominates the batched-fetch win. Perf
 follow-up (M4): restore prefetch in the batched path. See `docs/mtp.md` M3 status.
 
+**M4 (prefetch restored in the batched path): gate STILL not met — investigation
+closed.** spec 0.55 tok/s vs baseline 0.70; regression greedy-identical *with
+prefetch active* (pure fetch-scheduling, output unchanged → correct). Definitive
+root cause: decode is NVMe-**bandwidth**-bound and prefetch already hides fetch
+latency in both paths, so batching's amortization lever is moot; batching *raises*
+bytes/token (spec 184 vs baseline 159 misses/tok, +16%: larger 2-position union +
+57% rejected-draft waste). Negative result recorded in `docs/mtp.md` M3/M4 status.
+
 ---
 
 ## Open / deferred — to discuss together
