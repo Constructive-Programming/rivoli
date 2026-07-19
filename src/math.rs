@@ -88,9 +88,12 @@ pub fn f32_to_e4m3(x: f32) -> u8 {
     let bits = a.to_bits();
     let e = ((bits >> 23) & 0xff) as i32 - 127; // unbiased f32 exponent
     if e < -6 {
-        // Subnormal e4m3: value = m/8 · 2^-6, m in 1..=7. Round a·2^9 to nearest.
+        // Subnormal e4m3: value = m/8 · 2^-6. Round a·2^9 to nearest; m==8 means
+        // it rounded up to 2^-6 = the smallest NORMAL (exp=1, m3=0), so PROMOTE
+        // rather than clamp to 7 — the subnormal analogue of the normal path's
+        // m3==8 carry (clamping would return the 2nd-nearest value at that edge).
         let m = (a * 512.0).round() as u8; // 2^9 = 8 · 2^6
-        return sign | m.min(7);
+        return if m >= 8 { sign | 0x08 } else { sign | m };
     }
     // Normal: exp field e+7 in 1..=15, 3 mantissa bits rounded to nearest even.
     let mant = bits & 0x007f_ffff;
@@ -127,9 +130,11 @@ pub fn quantize_latent_fp8(latent: &[f32], data: &mut [u8], scales: &mut [f32]) 
         // amax==0 → the block is all zeros; any positive scale reproduces them.
         let scale = if amax > 0.0 { amax / E4M3_MAX } else { 1.0 };
         scales[b] = scale;
-        let inv = 1.0 / scale;
+        // Divide (not multiply-by-reciprocal) to match the device kernel's
+        // `latent[i] / scl` exactly — a single correctly-rounded op, so
+        // host- and device-quantized bytes agree bit-for-bit.
         for (i, &x) in blk.iter().enumerate() {
-            data[b * E4M3_BLOCK + i] = f32_to_e4m3(x * inv);
+            data[b * E4M3_BLOCK + i] = f32_to_e4m3(x / scale);
         }
     }
 }

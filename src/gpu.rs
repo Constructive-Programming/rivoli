@@ -319,6 +319,11 @@ impl<'a> GpuEngine<'a> {
         let rope = cfg.qk_rope_head_dim;
         let h = cfg.n_heads;
         let slots = cfg.top_k + cfg.n_shared; // routed + shared per MoE launch
+        ensure!(
+            !kv_fp8 || kvl.is_multiple_of(crate::math::E4M3_BLOCK),
+            "--kv-fp8 needs kv_lora_rank ({kvl}) a multiple of {} (fp8 block size)",
+            crate::math::E4M3_BLOCK
+        );
         let n_kv_blocks = kvl / crate::math::E4M3_BLOCK;
         let mut lc = Vec::with_capacity(cfg.n_layers);
         let mut rc = Vec::with_capacity(cfg.n_layers);

@@ -138,8 +138,9 @@ __device__ __forceinline__ unsigned char f2e4m3(float x) {
     int e = (int)((bits >> 23) & 0xff) - 127;
     if (e < -6) {
         // Subnormal e4m3: m/8 · 2^-6; round half away from zero (as Rust .round()).
+        // m==8 rounds up to 2^-6 = smallest normal (exp=1,m3=0) — promote, don't clamp.
         int m = (int)floorf(a * 512.0f + 0.5f);
-        if (m > 7) m = 7;
+        if (m >= 8) return sign | 0x08;
         return sign | (unsigned char)m;
     }
     unsigned int mant = bits & 0x007fffffu;
@@ -183,7 +184,8 @@ extern "C" int rivoli_append_kv_fp8(
     const float* latent, const float* rope, unsigned char* lc8, float* lscale,
     unsigned short* rc, int pos, int kvl, int ropn, int n_blocks) {
     if (pos < 0 || kvl <= 0 || ropn <= 0 || n_blocks <= 0) return 1001;
-    if (kvl > 1024 || ropn > kvl) return 1002; // one-block reduction assumes this
+    // The one-block per-128 reduction needs kvl a multiple of 128 in [128,1024].
+    if (kvl > 1024 || kvl < 128 || (kvl % 128) != 0 || ropn > kvl) return 1002;
     hipGetLastError();
     hipLaunchKernelGGL(append_kv_fp8, dim3(1), dim3(kvl), (size_t)kvl * sizeof(float), 0,
                        latent, rope, lc8, lscale, rc, pos, kvl, ropn, n_blocks);
