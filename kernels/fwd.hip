@@ -125,6 +125,72 @@ extern "C" int rivoli_append_kv(
     return e == hipSuccess ? 0 : -(int)e;
 }
 
+// f32 → OCP e4m3 (mirrors math.rs::f32_to_e4m3 bit-for-bit: RNE on the normal
+// mantissa, round-half-up on the subnormal, saturating to ±448, 0x7f = NaN).
+__device__ __forceinline__ unsigned char f2e4m3(float x) {
+    if (isnan(x)) return 0x7f;
+    unsigned char sign = signbit(x) ? 0x80 : 0;
+    float a = fabsf(x);
+    if (a >= 448.0f) return sign | 0x7e;
+    if (a < 0.0009765625f) return sign; // < 2^-10 → 0
+    unsigned int bits;
+    __builtin_memcpy(&bits, &a, sizeof(bits));
+    int e = (int)((bits >> 23) & 0xff) - 127;
+    if (e < -6) {
+        // Subnormal e4m3: m/8 · 2^-6; round half away from zero (as Rust .round()).
+        int m = (int)floorf(a * 512.0f + 0.5f);
+        if (m > 7) m = 7;
+        return sign | (unsigned char)m;
+    }
+    unsigned int mant = bits & 0x007fffffu;
+    unsigned char m3 = (unsigned char)(mant >> 20);
+    unsigned int rem = mant & 0x000fffffu;
+    unsigned int half = 0x00080000u;
+    if (rem > half || (rem == half && (m3 & 1u))) m3 += 1;
+    int exp = e + 7;
+    if (m3 == 8) { m3 = 0; exp += 1; }
+    if (exp >= 15 && m3 >= 7) return sign | 0x7e;
+    return sign | ((unsigned char)exp << 3) | m3;
+}
+
+// Append one token's latent as fp8-e4m3 + per-128 block scales (lc8/lscale) and
+// its roped key as bf16 (rc), at row `pos`. One block of `kvl` threads: each
+// 128-lane group reduces its block amax in LDS, writes scale = amax/448, then
+// quantizes. n_blocks = kvl/128. The rope half (ropn ≤ kvl) rides the same block.
+extern "C" __global__ void append_kv_fp8(
+    const float* __restrict__ latent, const float* __restrict__ rope,
+    unsigned char* __restrict__ lc8, float* __restrict__ lscale,
+    unsigned short* __restrict__ rc, int pos, int kvl, int ropn, int n_blocks) {
+    extern __shared__ float red[]; // kvl floats
+    int i = threadIdx.x;
+    red[i] = fabsf(latent[i]);
+    __syncthreads();
+    int base = (i / 128) * 128;
+    int lane = i - base;
+    for (int s = 64; s > 0; s >>= 1) {
+        if (lane < s) red[base + lane] = fmaxf(red[base + lane], red[base + lane + s]);
+        __syncthreads();
+    }
+    int b = i / 128;
+    float amax = red[b * 128];
+    float scl = amax > 0.0f ? amax / 448.0f : 1.0f;
+    if (lane == 0) lscale[(size_t)pos * n_blocks + b] = scl;
+    lc8[(size_t)pos * kvl + i] = f2e4m3(latent[i] / scl);
+    if (i < ropn) rc[(size_t)pos * ropn + i] = f2bf16(rope[i]);
+}
+
+extern "C" int rivoli_append_kv_fp8(
+    const float* latent, const float* rope, unsigned char* lc8, float* lscale,
+    unsigned short* rc, int pos, int kvl, int ropn, int n_blocks) {
+    if (pos < 0 || kvl <= 0 || ropn <= 0 || n_blocks <= 0) return 1001;
+    if (kvl > 1024 || ropn > kvl) return 1002; // one-block reduction assumes this
+    hipGetLastError();
+    hipLaunchKernelGGL(append_kv_fp8, dim3(1), dim3(kvl), (size_t)kvl * sizeof(float), 0,
+                       latent, rope, lc8, lscale, rc, pos, kvl, ropn, n_blocks);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
 extern "C" int rivoli_gather_rope(
     const float* q, float* qrope, int h, int qh, int nope, int ropn) {
     if (h <= 0 || qh <= 0 || nope < 0 || ropn <= 0) return 1001;

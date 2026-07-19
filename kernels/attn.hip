@@ -146,3 +146,102 @@ extern "C" int rivoli_mla_attend(
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
+
+// --- fp8 latent-cache variant ---------------------------------------------
+// Identical to mla_latent_attend except the latent tile is dequantized from
+// fp8-e4m3 + per-128 block scales (the --kv-fp8 KV layout) instead of bf16.
+// The roped key Rc stays bf16. Lc8 is `tokens*kvl` u8; Lscale is
+// `tokens*n_blocks` f32 (n_blocks = kvl/128). Everything downstream — the flash
+// online softmax, the head tiling — is unchanged.
+
+// OCP e4m3 → f32 (mirrors math.rs::e4m3_to_f32).
+__device__ __forceinline__ float e4m3f(unsigned char b) {
+    float sign = (b & 0x80) ? -1.0f : 1.0f;
+    int exp = (b >> 3) & 0x0f;
+    float mant = (float)(b & 0x07);
+    if (exp == 0) return sign * (mant * 0.125f) * 0.015625f; // 2^-6
+    if (exp == 15 && mant == 7.0f) return NAN;
+    return sign * (1.0f + mant * 0.125f) * exp2f((float)(exp - 7));
+}
+
+extern "C" __global__ void mla_latent_attend_fp8(
+    const float* __restrict__ qabs, const float* __restrict__ qrope,
+    const unsigned char* __restrict__ Lc8, const float* __restrict__ Lscale,
+    const unsigned short* __restrict__ Rc, const unsigned int* __restrict__ rows,
+    int H, int nr, int kvl, int rope, int n_blocks, float scale,
+    float* __restrict__ clat) {
+    extern __shared__ float smem[];
+    float* acc = smem;
+    float* Lt = acc + HB * kvl;
+    float* Rt = Lt + TILE * kvl;
+
+    int tid = threadIdx.x;
+    int lane = tid & (SUBW - 1);
+    int hb = tid / SUBW;
+    int head = blockIdx.x * HB + hb;
+    bool active = head < H;
+
+    float m = -INFINITY, l = 0.0f;
+    if (active)
+        for (int i = lane; i < kvl; i += SUBW) acc[hb * kvl + i] = 0.0f;
+
+    const float* qa = qabs + (size_t)(active ? head : 0) * kvl;
+    const float* qr = qrope + (size_t)(active ? head : 0) * rope;
+
+    for (int t0 = 0; t0 < nr; t0 += TILE) {
+        int tcount = min(TILE, nr - t0);
+        for (int idx = tid; idx < tcount * kvl; idx += blockDim.x) {
+            int tt = idx / kvl, i = idx - tt * kvl;
+            size_t t = rows ? (size_t)rows[t0 + tt] : (size_t)(t0 + tt);
+            Lt[idx] = e4m3f(Lc8[t * kvl + i]) * Lscale[t * n_blocks + i / 128];
+        }
+        for (int idx = tid; idx < tcount * rope; idx += blockDim.x) {
+            int tt = idx / rope, d = idx - tt * rope;
+            size_t t = rows ? (size_t)rows[t0 + tt] : (size_t)(t0 + tt);
+            Rt[idx] = bf16f(Rc[t * rope + d]);
+        }
+        __syncthreads();
+
+        if (active) {
+            for (int tt = 0; tt < tcount; ++tt) {
+                float part = 0.0f;
+                for (int i = lane; i < kvl; i += SUBW) part += qa[i] * Lt[tt * kvl + i];
+                for (int d = lane; d < rope; d += SUBW) part += qr[d] * Rt[tt * rope + d];
+                for (int off = SUBW / 2; off > 0; off >>= 1)
+                    part += __shfl_down(part, off, SUBW);
+                float s = __shfl(part, 0, SUBW) * scale;
+                float m_new = fmaxf(m, s);
+                float corr = expf(m - m_new);
+                float p = expf(s - m_new);
+                for (int i = lane; i < kvl; i += SUBW)
+                    acc[hb * kvl + i] = acc[hb * kvl + i] * corr + p * Lt[tt * kvl + i];
+                l = l * corr + p;
+                m = m_new;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (active) {
+        float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
+        for (int i = lane; i < kvl; i += SUBW)
+            clat[(size_t)head * kvl + i] = acc[hb * kvl + i] * inv;
+    }
+}
+
+extern "C" int rivoli_mla_attend_fp8(
+    const float* qabs, const float* qrope,
+    const unsigned char* Lc8, const float* Lscale,
+    const unsigned short* Rc, const unsigned int* rows,
+    int H, int nr, int kvl, int rope, int n_blocks, float scale, float* clat) {
+    if (H <= 0 || nr <= 0 || kvl <= 0 || rope <= 0 || n_blocks <= 0) return 1001;
+    size_t lds = ((size_t)(HB + TILE) * kvl + (size_t)TILE * rope) * sizeof(float);
+    if (lds > 65536) return 1002;
+    int blocks = (H + HB - 1) / HB;
+    hipGetLastError();
+    hipLaunchKernelGGL(mla_latent_attend_fp8, dim3(blocks), dim3(HB * SUBW), lds, 0,
+                       qabs, qrope, Lc8, Lscale, Rc, rows, H, nr, kvl, rope, n_blocks,
+                       scale, clat);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
