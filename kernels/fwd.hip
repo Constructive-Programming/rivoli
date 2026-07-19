@@ -57,6 +57,53 @@ extern "C" __global__ void vadd(float* __restrict__ x, const float* __restrict__
     if (i < n) x[i] += y[i];
 }
 
+// Greedy argmax over `logits[0..n]`, reproducing the host fold in gpu.rs::argmax
+// EXACTLY: best=0, bv=-inf; for i: if logits[i] > bv { bv=logits[i]; best=i }.
+// The combine below is associative + commutative and yields the SAME result set
+// as that sequential `>` fold: the maximum VALUE wins; NaN never wins (every
+// comparison against NaN is false, so it loses to any finite value and to the
+// -inf identity); on an exact tie the SMALLER index wins. So `best` = the lowest
+// index of the maximum value, and the returned value = logits[best] — matching
+// the host's `bv`, so the caller's `!bv.is_finite()` bail is reproduced verbatim.
+// One block, LDS tree reduce; out[0]=index (int), out_val[0]=value (float).
+__device__ __forceinline__ void amax_combine(
+    float va, int ia, float vb, int ib, float* vo, int* io) {
+    if (vb > va)       { *vo = vb; *io = ib; }   // b strictly greater (b not NaN)
+    else if (va > vb)  { *vo = va; *io = ia; }   // a strictly greater (a not NaN)
+    else if (va != va) { *vo = vb; *io = ib; }   // a is NaN -> a loses, take b
+    else if (vb != vb) { *vo = va; *io = ia; }   // b is NaN -> b loses, take a
+    else               { if (ia <= ib) { *vo = va; *io = ia; }  // equal -> smaller index
+                         else          { *vo = vb; *io = ib; } }
+}
+
+extern "C" __global__ void argmax_reduce(
+    const float* __restrict__ logits, int n, int* __restrict__ out_idx,
+    float* __restrict__ out_val) {
+    __shared__ float sval[256];
+    __shared__ int   sidx[256];
+    int t = threadIdx.x;
+    // Identity mirrors the host initial (best=0, bv=-inf): only wins if EVERY
+    // element is NaN/-inf, which the host bails on (value stays non-finite) too.
+    float best = -INFINITY;
+    int   bidx = 0;
+    for (int i = t; i < n; i += blockDim.x) {
+        amax_combine(best, bidx, logits[i], i, &best, &bidx);
+    }
+    sval[t] = best;
+    sidx[t] = bidx;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (t < s) {
+            amax_combine(sval[t], sidx[t], sval[t + s], sidx[t + s], &sval[t], &sidx[t]);
+        }
+        __syncthreads();
+    }
+    if (t == 0) {
+        *out_idx = sidx[0];
+        *out_val = sval[0];
+    }
+}
+
 extern "C" int rivoli_embed_i8_row(
     const unsigned char* packed, const float* scale, int token, int hidden, float* x) {
     if (hidden <= 0 || token < 0) return 1001;
@@ -92,6 +139,17 @@ extern "C" int rivoli_vadd(float* x, const float* y, int n) {
     if (n <= 0) return 1001;
     hipGetLastError();
     hipLaunchKernelGGL(vadd, dim3((n + 255) / 256), dim3(256), 0, 0, x, y, n);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+// Single-block argmax reduction (256 threads, grid-stride). `out_idx`/`out_val`
+// are one device word each (the caller's 8-byte result buffer). Launch-only.
+extern "C" int rivoli_argmax(
+    const float* logits, int n, int* out_idx, float* out_val) {
+    if (n <= 0) return 1001;
+    hipGetLastError();
+    hipLaunchKernelGGL(argmax_reduce, dim3(1), dim3(256), 0, 0, logits, n, out_idx, out_val);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

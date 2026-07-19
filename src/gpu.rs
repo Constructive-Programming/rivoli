@@ -11,7 +11,7 @@
 
 use crate::device::DeviceBuf;
 use crate::hip::{
-    ExpertDesc, device_sync, launch_append_kv, launch_attend, launch_embed_i8_row,
+    ExpertDesc, device_sync, launch_append_kv, launch_argmax, launch_attend, launch_embed_i8_row,
     launch_gather_rope, launch_gemv_f32, launch_gemv_i4, launch_gemv_i8, launch_mla_absorb,
     launch_mla_value, launch_moe, launch_rmsnorm, launch_rope, launch_vadd,
 };
@@ -31,19 +31,18 @@ fn desc_of(m: &Mlp) -> ExpertDesc {
     }
 }
 
-/// Serialize `v` as little-endian f32 into a caller-owned byte buffer, reused
-/// across tokens (cleared then refilled) so the per-token weight upload allocates
-/// nothing once `dst` has grown to size.
-fn fill_le(dst: &mut Vec<u8>, v: &[f32]) {
-    dst.clear();
-    for x in v {
-        dst.extend_from_slice(&x.to_le_bytes());
-    }
-}
-
 fn desc_bytes(d: &[ExpertDesc]) -> &[u8] {
     // SAFETY: ExpertDesc is repr(C) POD (six pointers); this is its byte view.
     unsafe { std::slice::from_raw_parts(d.as_ptr() as *const u8, std::mem::size_of_val(d)) }
+}
+
+/// Little-endian byte view of an f32 slice — zero-copy, since on this LE host
+/// `[f32]`'s in-memory representation IS its little-endian serialization (the
+/// same transmute idiom `desc_bytes` relies on). Feeds the per-token weight H2D
+/// with no staging buffer.
+fn f32_le_bytes(v: &[f32]) -> &[u8] {
+    // SAFETY: f32 is POD; the bytes are the LE serialization on this LE host.
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
 /// Host routing: sigmoid the gate logits into `scores`, add the router `bias` into
@@ -138,6 +137,10 @@ pub struct GpuEngine<'a> {
     descs_buf: DeviceBuf,
     wexpert_buf: DeviceBuf,
     logits: DeviceBuf,
+    // Device argmax result: 8 bytes [i32 index | f32 max-value]. The reduction
+    // kernel writes it and only these 8 bytes come back per token (vs the full
+    // vocab×f32 logits), preserving the host argmax's tie-break + finiteness bail.
+    argmax_dev: DeviceBuf,
     // Per-layer bf16 KV slabs, grown in place to max_ctx.
     lc: Vec<DeviceBuf>,
     rc: Vec<DeviceBuf>,
@@ -147,15 +150,14 @@ pub struct GpuEngine<'a> {
     sel: Vec<usize>,
     // Per-token host build scratch — reused (cleared+refilled) every layer so the
     // forward hot path allocates nothing: resolved expert descriptors + weights, the
-    // little-endian weight-upload staging bytes, the resolved `Mlp` batch, and the
-    // three D2H staging buffers for the gate/prediction/final-logits reads.
+    // resolved `Mlp` batch, and the D2H staging buffers for the gate/prediction reads
+    // (the weight H2D uploads a zero-copy LE view of `w`; the argmax D2H is 8 bytes).
     descs: Vec<ExpertDesc>,
     w: Vec<f32>,
-    wbytes: Vec<u8>,
     mlps: Vec<Mlp>,
     gl_host: Vec<u8>,
     pgl_host: Vec<u8>,
-    logits_host: Vec<u8>,
+    argmax_host: Vec<u8>,
     // Cross-layer prefetch: separate host scratch for the L+1 prediction top-k, so
     // it never clobbers `scores`/`choice`/`sel` (still needed for L's own MoE
     // weights after the prediction runs).
@@ -212,6 +214,7 @@ impl<'a> GpuEngine<'a> {
             descs_buf: DeviceBuf::new(slots * std::mem::size_of::<ExpertDesc>())?,
             wexpert_buf: f(slots)?,
             logits: f(cfg.vocab)?,
+            argmax_dev: DeviceBuf::new(8)?, // [i32 index | f32 value]
             lc,
             rc,
             scores: vec![0.0; cfg.n_experts],
@@ -219,11 +222,10 @@ impl<'a> GpuEngine<'a> {
             sel: Vec::with_capacity(cfg.top_k),
             descs: Vec::with_capacity(slots),
             w: Vec::with_capacity(slots),
-            wbytes: Vec::with_capacity(slots * 4),
             mlps: Vec::with_capacity(cfg.top_k),
             gl_host: Vec::with_capacity(cfg.n_experts * 4),
             pgl_host: Vec::with_capacity(cfg.n_experts * 4),
-            logits_host: Vec::with_capacity(cfg.vocab * 4),
+            argmax_host: Vec::with_capacity(8),
             pred_scores: vec![0.0; cfg.n_experts],
             pred_choice: vec![0.0; cfg.n_experts],
             pred_sel: Vec::with_capacity(cfg.top_k),
@@ -352,9 +354,8 @@ impl<'a> GpuEngine<'a> {
                 let m = dense_mlp.ok_or_else(|| anyhow::anyhow!("dense layer {l} missing mlp"))?;
                 self.descs.clear();
                 self.descs.push(desc_of(&m));
-                fill_le(&mut self.wbytes, &[1.0]);
                 self.descs_buf.copy_in_at(0, desc_bytes(&self.descs))?;
-                self.wexpert_buf.copy_in_at(0, &self.wbytes)?;
+                self.wexpert_buf.copy_in_at(0, f32_le_bytes(&[1.0f32]))?;
                 // SAFETY: descs/wexpert/out are device scratch; weights resident.
                 unsafe {
                     launch_moe(
@@ -489,10 +490,9 @@ impl<'a> GpuEngine<'a> {
                     self.descs.push(desc_of(&s));
                     self.w.push(1.0);
                 }
-                fill_le(&mut self.wbytes, &self.w);
                 let ndesc = self.descs.len();
                 self.descs_buf.copy_in_at(0, desc_bytes(&self.descs))?;
-                self.wexpert_buf.copy_in_at(0, &self.wbytes)?;
+                self.wexpert_buf.copy_in_at(0, f32_le_bytes(&self.w))?;
                 // SAFETY: descs point at resident/cold-slot weights valid until
                 // the end-of-layer sync; all device-resident.
                 unsafe {
@@ -538,23 +538,44 @@ impl<'a> GpuEngine<'a> {
         Ok(())
     }
 
-    /// Greedy argmax over the device logits (one D2H, into reused host scratch,
-    /// after the final join).
+    /// Greedy argmax over the device logits — reduced ON DEVICE, so only 8 bytes
+    /// (winning index + its value) come back per token instead of the full
+    /// `vocab×f32` logits. The kernel reproduces the host fold EXACTLY: strict `>`
+    /// (so ties keep the FIRST/lowest index and NaN never wins), returning
+    /// `logits[best]` as the value; the finiteness bail is then the same
+    /// `!value.is_finite()` check the host loop applied to `bv`.
     fn argmax(&mut self) -> Result<u32> {
-        self.logits.copy_out_into(&mut self.logits_host)?;
-        let mut best = 0usize;
-        let mut bv = f32::NEG_INFINITY;
-        for (i, c) in self.logits_host.chunks_exact(4).enumerate() {
-            let l = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-            if l > bv {
-                bv = l;
-                best = i;
-            }
+        // SAFETY: logits is `vocab` device f32 (written + joined by the final
+        // forward sync); argmax_dev owns 8 device bytes for [i32 index|f32 value].
+        unsafe {
+            launch_argmax(
+                self.logits.ptr() as *const f32,
+                self.cfg.vocab,
+                self.argmax_dev.ptr_mut() as *mut i32,
+                self.argmax_dev.ptr_mut().add(4) as *mut f32,
+            )?;
         }
-        if !bv.is_finite() {
+        // 8-byte D2H (blocking hipMemcpy, ordered after the kernel on the null stream).
+        self.argmax_dev.copy_out_into(&mut self.argmax_host)?;
+        ensure!(self.argmax_host.len() == 8, "argmax result must be 8 bytes");
+        let idx = i32::from_le_bytes([
+            self.argmax_host[0],
+            self.argmax_host[1],
+            self.argmax_host[2],
+            self.argmax_host[3],
+        ]);
+        let val = f32::from_le_bytes([
+            self.argmax_host[4],
+            self.argmax_host[5],
+            self.argmax_host[6],
+            self.argmax_host[7],
+        ]);
+        // Same bail as the host loop: `bv` == logits[best] == `val`.
+        if !val.is_finite() {
             bail!("logits are non-finite (NaN/Inf in the GPU forward pass)");
         }
-        Ok(best as u32)
+        ensure!(idx >= 0, "argmax returned negative index {idx}");
+        Ok(idx as u32)
     }
 
     /// Greedy-decode up to `ngen` tokens continuing `prompt_ids`, stopping on any

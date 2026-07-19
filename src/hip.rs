@@ -68,6 +68,8 @@ unsafe extern "C" {
 
     fn rivoli_vadd(x: *mut f32, y: *const f32, n: i32) -> i32;
 
+    fn rivoli_argmax(logits: *const f32, n: i32, out_idx: *mut i32, out_val: *mut f32) -> i32;
+
     fn rivoli_gemv_i4(
         x: *const f32,
         packed: *const u8,
@@ -623,6 +625,32 @@ pub unsafe fn launch_vadd(x: *mut f32, y: *const f32, n: usize) -> Result<()> {
     if r != 0 {
         let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
         bail!("launch_vadd failed ({kind}, code {r})");
+    }
+    Ok(())
+}
+
+/// Launch the greedy argmax reduction over `logits[0..n]` (one block, LDS tree
+/// reduce), writing the winning index to `out_idx` and its value to `out_val`
+/// (the caller's small device result buffer). Matches the host fold's tie-break
+/// (first/lowest index) and NaN handling exactly. Device pointers, launch-only.
+///
+/// # Safety
+/// Async — `logits` (`n` f32), `out_idx` (one i32), `out_val` (one f32) must be
+/// valid device pointers live until the next join (here: the caller's D2H of the
+/// result, which serializes after this launch on the null stream).
+#[cfg(feature = "rocm")]
+pub unsafe fn launch_argmax(
+    logits: *const f32,
+    n: usize,
+    out_idx: *mut i32,
+    out_val: *mut f32,
+) -> Result<()> {
+    anyhow::ensure!(n <= i32::MAX as usize, "argmax n exceeds i32 ({n})");
+    // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
+    let r = unsafe { rivoli_argmax(logits, n as i32, out_idx, out_val) };
+    if r != 0 {
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("launch_argmax failed ({kind}, code {r})");
     }
     Ok(())
 }

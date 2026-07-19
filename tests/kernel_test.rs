@@ -683,3 +683,70 @@ fn mla_attend_long_context() {
     // iterations (not just proven), at the GLM latent width.
     check_attend(0x1eaf_1eaf, 8, 40_000, 512, 64);
 }
+
+#[test]
+fn argmax_matches_host_fold() {
+    use rivoli::hip::launch_argmax;
+    // The EXACT host fold from gpu.rs::argmax: best=0, bv=-inf; strict `>` so ties
+    // keep the first index and NaN never wins. Returns (index, winning value).
+    fn host(logits: &[f32]) -> (i32, f32) {
+        let mut best = 0i32;
+        let mut bv = f32::NEG_INFINITY;
+        for (i, &l) in logits.iter().enumerate() {
+            if l > bv {
+                bv = l;
+                best = i as i32;
+            }
+        }
+        (best, bv)
+    }
+    let mut rng = Lcg(0x0a11_5eed);
+    let mut cases: Vec<Vec<f32>> = vec![
+        vec![1.0],                     // single element
+        vec![-3.0, -3.0, -3.0],        // all tie -> lowest index 0
+        vec![0.5, 2.0, 2.0, 1.0],      // tie at max -> first (index 1)
+        vec![-1.0, -5.0, -0.25, -9.0], // negatives
+        vec![0.1, 0.2, f32::NAN, 0.4], // NaN interior, finite max 0.4@3
+        vec![f32::NAN, 5.0, 3.0],      // NaN at 0, max 5@1
+    ];
+    // A vocab-scale vector: exercises the grid-stride loop + full tree reduce, with
+    // many ties (both host and device must pick the LOWEST index of the max).
+    cases.push(
+        (0..154_880usize)
+            .map(|i| (i.wrapping_mul(2_654_435_761) & 0xffff) as f32)
+            .collect(),
+    );
+    // A random vector with a planted unique max.
+    cases.push({
+        let mut v: Vec<f32> = (0..1000).map(|_| rng.f()).collect();
+        v[737] = 9.9;
+        v
+    });
+
+    for (ci, logits) in cases.iter().enumerate() {
+        let (wi, wv) = host(logits);
+        let mut lbuf = dev_bytes(&f32_bytes(logits));
+        let mut out = DeviceBuf::new(8).expect("alloc argmax out");
+        // SAFETY: lbuf holds logits.len() f32; out holds 8 bytes [i32 idx|f32 val].
+        unsafe {
+            launch_argmax(
+                lbuf.ptr_mut() as *const f32,
+                logits.len(),
+                out.ptr_mut() as *mut i32,
+                out.ptr_mut().add(4) as *mut f32,
+            )
+            .expect("launch argmax");
+        }
+        device_sync().expect("device sync");
+        let bytes = out.copy_out().expect("copy out");
+        let gi = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let gv = f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        assert_eq!(gi, wi, "case {ci}: device index != host fold");
+        // Value bits identical: the reduce only compares + copies logits, no math.
+        assert_eq!(
+            gv.to_bits(),
+            wv.to_bits(),
+            "case {ci}: device value bits differ"
+        );
+    }
+}
