@@ -78,6 +78,22 @@ indexed; shapes validated at load.**
   MLA + fused-MoE kernels (today S=1). *Gate: end-to-end tok/s > the dense
   baseline at equal quality (greedy-equivalent accepted tokens), on 512 tokens.*
 
+  **Status (2026-07-19): mechanism DONE + greedy-equivalence VERIFIED; perf gate
+  NOT met.** `GpuEngine::{forward_batch,generate_spec}` (S=2), batched fused-MoE
+  kernel (`rivoli_moe_experts_batched`), MTP-KV lockstep, accept/reject rollback,
+  `--spec` CLI. Validation `tests/mtp_spec.rs`: spec output byte-identical to
+  greedy (24/24). **Measured (64 tok, "The sky is blue because"): spec 0.53 tok/s
+  vs baseline 0.71 tok/s — SLOWER.** 44 verify rounds, 19 accepted (43.2%); expert
+  hit 69.6% vs baseline 75.4%. Root cause is measured, not a bug: `forward_batch`
+  runs **without cross-layer prefetch**, and baseline's prefetch is what hides the
+  fetch (drives its 75% hit + ~1.4s/pass). Each S=2 round costs ~2.74s (~1.9× a
+  baseline pass) with the union fetch back on the critical path, so even at 60–80%
+  accept the round-count drop (64→40→36) can't beat ~1.9× per round.
+  → **M4 (perf): restore prefetch in the batched path** — predict the next layer's
+  union from both positions' post-attn residuals, submit the reads on the second
+  ring, drain in `resolve_layer(l+1)` (mirror `forward`'s prefetch). Without it the
+  batched-fetch amortization is dominated by the prefetch it gave up.
+
 ## Why this is the right lever (recap)
 
 Decode is NVMe-read-bound and `attn`/`mlp` can't overlap (sequential residual

@@ -49,6 +49,25 @@ Commit `c0a1b0e`. Numeric port confirmed exact; 2 defensive/resource findings, f
 | 1 | `mtp_draft` lacked the `pos<max_ctx` guard `forward()` has → M3 could OOB-write the MTP KV | correctness (latent) | added the guard |
 | 2 | MTP scratch (esp. `mtp_lc`/`mtp_rc`) allocated unconditionally → non-MTP runs pay VRAM / risk OOM | resource | gated on `pin.mtp().is_some()` |
 
+## Review 6 — MTP M3 batched-verify speculative loop
+Two parallel finder passes (correctness/KV-bookkeeping + batched-MoE kernel).
+Dense-bf16 path (the benchmark path) confirmed correct: KV/MTP-KV lockstep,
+accept/reject rollback, trunk preservation, eos/ngen equivalence, union/weight
+indexing, kernel stride/int4/reduce math. 5 findings, all fixed before commit.
+
+| # | Finding | Severity | Resolution |
+|---|---|---|---|
+| 1 | `forward_batch` hardcoded bf16 KV path — `--kv-fp8` engine would reinterpret the fp8 slab as bf16 | correctness | `generate_spec` bails unless `!kv_fp8` (+ CLI fail-fast) |
+| 2 | `forward_batch` hardcoded dense attention, ignoring `self.mode` — `--attn streaming/dsa/misa` would attend the wrong rows | correctness | `generate_spec` bails unless `mode==Dense` (+ CLI fail-fast) |
+| 3 | Batched `sh` SwiGLU scratch omitted `.max(dense_inter)` moe_h has → latent OOB for models with large dense FFN (safe at GLM dims) | correctness (latent) | sized to `max(Emax*moe_inter, dense_inter)` |
+| 4 | Comments over-claimed "bit-identical" output; batched MoE reduces experts in union order vs `forward`'s score-desc → ULP diffs can flip a near-tie | docs | reworded to "greedy-equivalent"; caveat in code + test |
+| 5 | Near-capacity fallback (`pos+MAX_SPEC>max_ctx`) truncates instead of decoding to ngen | correctness (low) | left as a graceful stop (generate() itself bails there); documented |
+
+**M3 measured result: gate NOT met.** spec 0.53 tok/s vs baseline 0.71 (64 tok);
+43.2% accept; hit 69.6% vs 75.4%. Correct but slower — `forward_batch` gave up
+cross-layer prefetch and baseline's prefetch dominates the batched-fetch win. Perf
+follow-up (M4): restore prefetch in the batched path. See `docs/mtp.md` M3 status.
+
 ---
 
 ## Open / deferred — to discuss together

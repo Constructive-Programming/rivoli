@@ -16,12 +16,16 @@ use crate::hip::{
     launch_attend_fp8, launch_embed_i8_row, launch_gather_rope, launch_gemv_bf16, launch_gemv_f32,
     launch_gemv_i4, launch_gemv_i8, launch_index_append, launch_index_head_route,
     launch_index_pool_push, launch_index_score, launch_layernorm, launch_mla_absorb,
-    launch_mla_value, launch_moe, launch_rmsnorm, launch_rope, launch_vadd,
+    launch_mla_value, launch_moe, launch_moe_batched, launch_rmsnorm, launch_rope, launch_vadd,
 };
 use crate::math::{sigmoid, topk_into};
 use crate::model::ModelConfig;
 use crate::pin::{IndexerPin, LayerMlp, Mlp, Pin};
 use anyhow::{Result, bail, ensure};
+
+/// Max positions verified in one speculative batch. A 1-token MTP head drafts
+/// one token, so the verify batch is S=2 (the confirmed token + the draft).
+const MAX_SPEC: usize = 2;
 
 fn desc_of(m: &Mlp) -> ExpertDesc {
     ExpertDesc {
@@ -217,6 +221,18 @@ pub struct GpuEngine<'a> {
     mtp_x: DeviceBuf,      // [hidden] f32: the MTP residual stream
     mtp_lc: DeviceBuf,     // [max_ctx*kvl] bf16 latent
     mtp_rc: DeviceBuf,     // [max_ctx*rope] bf16 roped key
+    // Speculative batched-verify scratch (S positions in one forward). Allocated
+    // only with a resident MTP layer. `wtab` is the per-position dense expert
+    // weight table (S*n_experts) for building the batched-MoE union weights.
+    sx: DeviceBuf,       // [MAX_SPEC*hidden] f32: S residual streams
+    sxn: DeviceBuf,      // [MAX_SPEC*hidden] f32: S post-attn-normed inputs
+    smoe: DeviceBuf,     // [MAX_SPEC*hidden] f32: batched MoE output
+    swexpert: DeviceBuf, // [MAX_SPEC*(MAX_SPEC*top_k+1)] f32: batched per-position weights
+    swexpert_host: Vec<f32>,
+    sh: DeviceBuf,       // batched MoE SwiGLU scratch [MAX_SPEC*Emax*moe_inter]
+    spartial: DeviceBuf, // batched MoE partials [MAX_SPEC*Emax*hidden]
+    wtab: Vec<f32>,      // host [MAX_SPEC*n_experts] per-position weight table
+    union: Vec<usize>,   // host union expert set this layer
     // Host routing/argmax scratch.
     scores: Vec<f32>,
     choice: Vec<f32>,
@@ -369,7 +385,13 @@ impl<'a> GpuEngine<'a> {
             moe_out: f(cfg.hidden)?,
             moe_partial: f(slots * cfg.hidden)?,
             moe_h: f((slots * cfg.moe_inter).max(cfg.dense_inter))?,
-            descs_buf: DeviceBuf::new(slots * std::mem::size_of::<ExpertDesc>())?,
+            // Shared by the single path (≤ `slots` descriptors) AND the batched
+            // verify, whose per-layer union of S positions' experts can reach
+            // MAX_SPEC*top_k + shared — size for the larger.
+            descs_buf: DeviceBuf::new(
+                (MAX_SPEC * cfg.top_k + cfg.n_shared).max(slots)
+                    * std::mem::size_of::<ExpertDesc>(),
+            )?,
             wexpert_buf: f(slots)?,
             logits: f(cfg.vocab)?,
             argmax_dev: DeviceBuf::new(8)?, // [i32 index | f32 value]
@@ -382,6 +404,21 @@ impl<'a> GpuEngine<'a> {
             mtp_x: mtp_kv(cfg.hidden * 4)?,
             mtp_lc: mtp_kv(max_ctx * kvl * 2)?,
             mtp_rc: mtp_kv(max_ctx * rope * 2)?,
+            sx: mtp_kv(MAX_SPEC * cfg.hidden * 4)?,
+            sxn: mtp_kv(MAX_SPEC * cfg.hidden * 4)?,
+            smoe: mtp_kv(MAX_SPEC * cfg.hidden * 4)?,
+            // batched-MoE union size ceiling: S disjoint top-k sets + 1 shared.
+            swexpert: mtp_kv(MAX_SPEC * (MAX_SPEC * cfg.top_k + 1) * 4)?,
+            swexpert_host: Vec::new(),
+            // SwiGLU scratch: cover BOTH the MoE union path (Emax*moe_inter) and
+            // the dense path (E=1, dense_inter) — same `.max` moe_h uses (line 387),
+            // or the dense branch overruns `sh` on models where dense_inter is large.
+            sh: mtp_kv(
+                MAX_SPEC * ((MAX_SPEC * cfg.top_k + 1) * cfg.moe_inter).max(cfg.dense_inter) * 4,
+            )?,
+            spartial: mtp_kv(MAX_SPEC * (MAX_SPEC * cfg.top_k + 1) * cfg.hidden * 4)?,
+            wtab: vec![0.0; MAX_SPEC * cfg.n_experts],
+            union: Vec::with_capacity(MAX_SPEC * cfg.top_k),
             scores: vec![0.0; cfg.n_experts],
             choice: vec![0.0; cfg.n_experts],
             sel: Vec::with_capacity(cfg.top_k),
@@ -594,6 +631,261 @@ impl<'a> GpuEngine<'a> {
         self.argmax()
     }
 
+    /// Batched main forward over `tokens` at positions `base_pos..base_pos+S`
+    /// (S ≤ MAX_SPEC): the S positions run through all 78 layers with **one**
+    /// batched MoE per layer — the union of their routed experts is fetched once
+    /// (the speculative-verify fetch amortization). Dense attention only (the
+    /// spec loop runs below the sparsity threshold). Returns the S greedy
+    /// predictions; each position's trunk is left in `sx[s*hidden]` for drafting.
+    /// Appends KV at `base_pos+s` for every position — the caller rolls back
+    /// (by not advancing `pos`) any positions whose draft was rejected.
+    fn forward_batch(&mut self, tokens: &[u32], base_pos: usize) -> Result<Vec<u32>> {
+        let cfg = self.cfg;
+        let s_n = tokens.len();
+        ensure!(s_n >= 1 && s_n <= MAX_SPEC, "spec batch size {s_n}");
+        ensure!(
+            base_pos + s_n <= self.max_ctx,
+            "spec batch [{base_pos},{}) exceeds max_ctx {}",
+            base_pos + s_n,
+            self.max_ctx
+        );
+        let hidden = cfg.hidden;
+        let eps = cfg.rms_norm_eps as f32;
+        let (h, qh, nope, rope, kvl, vh) = (
+            cfg.n_heads,
+            cfg.qk_head_dim(),
+            cfg.qk_nope_head_dim,
+            cfg.qk_rope_head_dim,
+            cfg.kv_lora_rank,
+            cfg.v_head_dim,
+        );
+        let theta = cfg.rope_theta();
+        let scale = 1.0 / (qh as f32).sqrt();
+        let sxp = self.sx.ptr_mut() as *mut f32;
+        let sxnp = self.sxn.ptr_mut() as *mut f32;
+        let smoep = self.smoe.ptr_mut() as *mut f32;
+        let xnp = self.xn.ptr_mut() as *mut f32;
+        let subp = self.sub.ptr_mut() as *mut f32;
+        let qrp = self.qr.ptr_mut() as *mut f32;
+        let qp = self.q.ptr_mut() as *mut f32;
+        let compp = self.comp.ptr_mut() as *mut f32;
+        let qabsp = self.qabs.ptr_mut() as *mut f32;
+        let qropep = self.qrope.ptr_mut() as *mut f32;
+        let clatp = self.clat.ptr_mut() as *mut f32;
+        let ctxp = self.ctx.ptr_mut() as *mut f32;
+        let glp = self.gate_logits.ptr_mut() as *mut f32;
+
+        // SAFETY: all pointers are resident/scratch, valid until each device_sync.
+        unsafe {
+            for (s, &t) in tokens.iter().enumerate() {
+                launch_embed_i8_row(
+                    self.pin.embed.packed,
+                    self.pin.embed.scale,
+                    t as usize,
+                    hidden,
+                    sxp.add(s * hidden),
+                )?;
+            }
+        }
+
+        for l in 0..cfg.n_layers {
+            let lw = &self.pin.layers[l];
+            let (input_ln, post_ln) = (lw.input_ln, lw.post_ln);
+            let (q_a, q_a_ln, q_b) = (lw.q_a, lw.q_a_ln, lw.q_b);
+            let (kv_a, kv_a_ln, kv_b) = (lw.kv_a, lw.kv_a_ln, lw.kv_b);
+            let o_proj = lw.o_proj;
+            let is_dense = matches!(lw.mlp, LayerMlp::Dense(_));
+            let dense_mlp = if let LayerMlp::Dense(m) = &lw.mlp {
+                Some(*m)
+            } else {
+                None
+            };
+            let (gate_w, shared) = if let LayerMlp::Moe { gate_w, shared } = &lw.mlp {
+                (*gate_w, Some(*shared))
+            } else {
+                (std::ptr::null(), None)
+            };
+            let lcp = self.lc[l].ptr_mut() as *mut u16;
+            let rcp = self.rc[l].ptr_mut() as *mut u16;
+
+            // --- Attention, per position (Dense over its causal prefix). ---
+            // SAFETY: null-stream ordered; each position appends its KV before
+            // the next attends, so position s+1 sees position s.
+            unsafe {
+                for s in 0..s_n {
+                    let pos = base_pos + s;
+                    let xsp = sxp.add(s * hidden);
+                    launch_rmsnorm(xsp, input_ln, hidden, eps, xnp)?;
+                    launch_gemv_i4(xnp, q_a.packed, q_a.scale, q_a.o_dim, q_a.i_dim, qrp)?;
+                    launch_rmsnorm(qrp, q_a_ln, cfg.q_lora_rank, eps, qrp)?;
+                    launch_gemv_i4(qrp, q_b.packed, q_b.scale, q_b.o_dim, q_b.i_dim, qp)?;
+                    launch_gemv_i4(xnp, kv_a.packed, kv_a.scale, kv_a.o_dim, kv_a.i_dim, compp)?;
+                    launch_rmsnorm(compp, kv_a_ln, kvl, eps, compp)?;
+                    launch_rope(compp.add(kvl), 1, rope, rope, pos, theta)?;
+                    launch_rope(qp.add(nope), h, qh, rope, pos, theta)?;
+                    launch_append_kv(compp, compp.add(kvl), lcp, rcp, pos, kvl, rope)?;
+                    launch_mla_absorb(qp, kv_b.packed, kv_b.scale, h, qh, nope, vh, kvl, qabsp)?;
+                    launch_gather_rope(qp, qropep, h, qh, nope, rope)?;
+                    launch_attend(
+                        qabsp,
+                        qropep,
+                        lcp,
+                        rcp,
+                        std::ptr::null(),
+                        h,
+                        pos + 1,
+                        kvl,
+                        rope,
+                        scale,
+                        clatp,
+                    )?;
+                    launch_mla_value(clatp, kv_b.packed, kv_b.scale, h, nope, vh, kvl, ctxp)?;
+                    launch_gemv_i4(
+                        ctxp,
+                        o_proj.packed,
+                        o_proj.scale,
+                        o_proj.o_dim,
+                        o_proj.i_dim,
+                        subp,
+                    )?;
+                    launch_vadd(xsp, subp, hidden)?; // residual
+                    launch_rmsnorm(xsp, post_ln, hidden, eps, sxnp.add(s * hidden))?; // → sxn[s]
+                }
+            }
+
+            // --- MoE (batched over the S positions). ---
+            if is_dense {
+                let m = dense_mlp.ok_or_else(|| anyhow::anyhow!("dense layer {l} missing mlp"))?;
+                self.descs.clear();
+                self.descs.push(desc_of(&m));
+                self.swexpert_host.clear();
+                self.swexpert_host.resize(s_n, 1.0); // E=1, weight 1.0 each position
+                self.descs_buf.copy_in_at(0, desc_bytes(&self.descs))?;
+                self.swexpert
+                    .copy_in_at(0, f32_le_bytes(&self.swexpert_host))?;
+                // SAFETY: batched scratch sized for E=1; sxn/smoe device.
+                unsafe {
+                    launch_moe_batched(
+                        sxnp,
+                        hidden,
+                        cfg.dense_inter,
+                        1,
+                        s_n,
+                        self.descs_buf.ptr() as *const ExpertDesc,
+                        self.swexpert.ptr() as *const f32,
+                        self.sh.ptr_mut() as *mut f32,
+                        self.spartial.ptr_mut() as *mut f32,
+                        smoep,
+                    )?;
+                }
+            } else {
+                // Route each position → per-position weight table `wtab`.
+                for w in self.wtab.iter_mut() {
+                    *w = 0.0;
+                }
+                for s in 0..s_n {
+                    // SAFETY: gate_w resident; sxn[s]/glp device scratch.
+                    unsafe {
+                        launch_gemv_f32(sxnp.add(s * hidden), gate_w, cfg.n_experts, hidden, glp)?
+                    };
+                    device_sync()?;
+                    self.gate_logits.copy_out_into(&mut self.gl_host)?;
+                    route_into(
+                        &self.gl_host,
+                        self.pin.moe_bias(l),
+                        cfg.top_k,
+                        &mut self.scores,
+                        &mut self.choice,
+                        &mut self.sel,
+                    );
+                    let mut sm: f32 = self.sel.iter().map(|&e| self.scores[e]).sum();
+                    if cfg.norm_topk_prob {
+                        sm += 1e-20;
+                    }
+                    for &e in &self.sel {
+                        let mut wv = self.scores[e];
+                        if cfg.norm_topk_prob {
+                            wv /= sm;
+                        }
+                        self.wtab[s * cfg.n_experts + e] = wv * cfg.routed_scale as f32;
+                    }
+                }
+                // Union of selected experts, fetched once.
+                self.union.clear();
+                for e in 0..cfg.n_experts {
+                    if (0..s_n).any(|s| self.wtab[s * cfg.n_experts + e] != 0.0) {
+                        self.union.push(e);
+                    }
+                }
+                self.pin.resolve_layer(l, &self.union, &mut self.mlps)?;
+                self.descs.clear();
+                for m in &self.mlps {
+                    self.descs.push(desc_of(m));
+                }
+                let shared_expert =
+                    shared.ok_or_else(|| anyhow::anyhow!("moe layer {l} missing shared"))?;
+                self.descs.push(desc_of(&shared_expert));
+                let e_total = self.descs.len();
+                // Per-position weights over the union descs (+ shared, weight 1.0).
+                self.swexpert_host.clear();
+                self.swexpert_host.resize(s_n * e_total, 0.0);
+                for s in 0..s_n {
+                    for (i, &e) in self.union.iter().enumerate() {
+                        self.swexpert_host[s * e_total + i] = self.wtab[s * cfg.n_experts + e];
+                    }
+                    self.swexpert_host[s * e_total + self.union.len()] = 1.0; // shared
+                }
+                self.descs_buf.copy_in_at(0, desc_bytes(&self.descs))?;
+                self.swexpert
+                    .copy_in_at(0, f32_le_bytes(&self.swexpert_host))?;
+                // SAFETY: descs point at resident/streamed experts; batched scratch sized.
+                unsafe {
+                    launch_moe_batched(
+                        sxnp,
+                        hidden,
+                        cfg.moe_inter,
+                        e_total,
+                        s_n,
+                        self.descs_buf.ptr() as *const ExpertDesc,
+                        self.swexpert.ptr() as *const f32,
+                        self.sh.ptr_mut() as *mut f32,
+                        self.spartial.ptr_mut() as *mut f32,
+                        smoep,
+                    )?;
+                }
+            }
+            // Residual add per position.
+            // SAFETY: sx[s]/smoe[s] device scratch.
+            unsafe {
+                for s in 0..s_n {
+                    launch_vadd(sxp.add(s * hidden), smoep.add(s * hidden), hidden)?;
+                }
+            }
+            device_sync()?;
+        }
+
+        // Final norm + tied head + argmax, per position.
+        let mut preds = Vec::with_capacity(s_n);
+        for s in 0..s_n {
+            // SAFETY: final_norm/lm_head resident; sx[s]/xn/logits device.
+            unsafe {
+                launch_rmsnorm(sxp.add(s * hidden), self.pin.final_norm, hidden, eps, xnp)?;
+                let head = self.pin.lm_head;
+                launch_gemv_i8(
+                    xnp,
+                    head.packed,
+                    head.scale,
+                    head.o_dim,
+                    head.i_dim,
+                    self.logits.ptr_mut() as *mut f32,
+                )?;
+            }
+            device_sync()?;
+            preds.push(self.argmax()?);
+        }
+        Ok(preds)
+    }
+
     /// Device MTP draft (M2). Given the just-completed main forward's trunk
     /// hidden (`self.x`, valid after [`forward`]) and the token it emitted,
     /// drafts token t+2 through the resident MTP layer, mirroring the scalar
@@ -602,6 +894,14 @@ impl<'a> GpuEngine<'a> {
     /// tied lm_head. `pos` is the MTP KV's current token count. Every op is an
     /// already-validated launcher; no new kernels. Returns the greedy draft.
     pub fn mtp_draft(&mut self, next_token: u32, pos: usize) -> Result<u32> {
+        let trunk = self.x.ptr() as *const f32;
+        self.mtp_draft_trunk(trunk, next_token, pos)
+    }
+
+    /// [`mtp_draft`](Self::mtp_draft) from an explicit device trunk pointer. The
+    /// speculative loop drafts from each batched position's trunk left in `sx`,
+    /// not the single `self.x` — so it passes the right `sx[s*hidden]` here.
+    fn mtp_draft_trunk(&mut self, trunk: *const f32, next_token: u32, pos: usize) -> Result<u32> {
         // The MTP KV slabs are sized to max_ctx; writing row `pos` beyond that is
         // an out-of-bounds device write (same guard forward() has). M3's decode
         // loop can advance past the main pos, so refuse rather than corrupt.
@@ -644,7 +944,7 @@ impl<'a> GpuEngine<'a> {
         );
         let shared = mp.shared;
 
-        let xp = self.x.ptr() as *const f32; // trunk hidden from the main forward
+        let xp = trunk; // trunk hidden (self.x for mtp_draft, sx[s] for the spec loop)
         let concatp = self.mtp_concat.ptr_mut() as *mut f32;
         let xmp = self.mtp_x.ptr_mut() as *mut f32;
         let xnp = self.xn.ptr_mut() as *mut f32;
@@ -1239,5 +1539,135 @@ impl<'a> GpuEngine<'a> {
         self.prof.tokens = generated.len() as u64;
         self.prof.report();
         Ok(generated)
+    }
+
+    /// MTP speculative decode: draft the next token with the layer-78 module, then
+    /// **verify** it by running the main model over `[cur, draft]` as one batched
+    /// forward (the two positions share a single union expert-fetch — the whole
+    /// point). On a correct draft both tokens land per main-model forward; on a
+    /// wrong one only `cur`'s successor is committed and the draft's KV is rolled
+    /// back (overwritten next iteration). The emitted tokens are always the main
+    /// model's greedy argmaxes, so the output is **greedy-equivalent** to
+    /// [`generate`]: the draft only changes batching, never the result. Not
+    /// bit-identical by construction — the batched MoE reduces a position's experts
+    /// in union (ascending-id) order while `generate` reduces in score-desc order,
+    /// so logits can differ by a ULP and flip a genuine near-tie argmax. That is
+    /// vanishingly rare (0 divergence over the M3 validation) and is the same
+    /// FP-order freedom greedy decode already has. Returns the generated ids.
+    pub fn generate_spec(
+        &mut self,
+        prompt_ids: &[u32],
+        ngen: usize,
+        eos: &[u32],
+    ) -> Result<Vec<u32>> {
+        ensure!(
+            self.pin.mtp().is_some(),
+            "generate_spec needs a resident MTP layer — build the snapshot with --mtp"
+        );
+        // `forward_batch` implements only the dense bf16 attention path. Refuse
+        // rather than silently attend the wrong rows / reinterpret an fp8 KV slab
+        // as bf16 — either would make the verify diverge from the main model.
+        ensure!(
+            matches!(self.mode, AttnMode::Dense),
+            "generate_spec: the batched verify supports Dense attention only (mode is {:?})",
+            self.mode
+        );
+        ensure!(
+            !self.kv_fp8,
+            "generate_spec: the batched verify uses the bf16 KV path; --kv-fp8 is unsupported"
+        );
+        ensure!(!prompt_ids.is_empty(), "empty prompt");
+        let hidden = self.cfg.hidden;
+
+        // --- Prefill: main KV + MTP KV built in lockstep over the prompt. The
+        // last prompt token's forward yields the first generated token (`cur`) and
+        // its MTP draft (the guess for the token after it). ---
+        let mut pos = 0usize;
+        let mut cur = 0u32;
+        let mut draft = 0u32;
+        let n = prompt_ids.len();
+        for (i, &tok) in prompt_ids.iter().enumerate() {
+            self.forward(tok, pos)?; // main KV @pos; self.x = trunk_pos; logits ready
+            let pred = self.argmax()?; // token at pos+1 (the real next for the last)
+            let next = if i + 1 < n { prompt_ids[i + 1] } else { pred };
+            let d = self.mtp_draft(next, pos)?; // MTP KV @pos (uses self.x); draft pos+2
+            if i + 1 == n {
+                cur = next; // == pred: first generated token, at position `pos`
+                draft = d; // MTP guess for position pos+1
+            }
+            pos += 1;
+        }
+        // pos == n; main & MTP KV hold 0..pos-1; `cur` is the token at position `pos`.
+
+        self.prof = Profile::default();
+        let decode_wall = std::time::Instant::now();
+        let mut out: Vec<u32> = Vec::with_capacity(ngen);
+        let mut accepted = 0usize; // drafts that verified
+        let mut spec_iters = 0usize; // batched-verify rounds
+
+        loop {
+            if eos.contains(&cur) {
+                break;
+            }
+            out.push(cur);
+            if out.len() >= ngen {
+                break;
+            }
+            // Need room to append KV for both `cur`@pos and `draft`@pos+1.
+            if pos + MAX_SPEC > self.max_ctx {
+                // Out of context to batch a draft — finish `cur`'s successor with a
+                // plain step and stop (benchmarks stay well under max_ctx).
+                self.forward(cur, pos)?;
+                let last = self.argmax()?;
+                if !eos.contains(&last) && out.len() < ngen {
+                    out.push(last);
+                }
+                break;
+            }
+
+            spec_iters += 1;
+            let preds = self.forward_batch(&[cur, draft], pos)?; // KV @pos, @pos+1
+            let pa = preds[0]; // real token at pos+1
+            let pb = preds[1]; // token at pos+2 (real iff draft == pa)
+            // sx[0] = trunk_pos (predicts pa); sx[1] = trunk_{pos+1} (predicts pb).
+            let sx = self.sx.ptr() as *const f32;
+
+            if draft == pa {
+                // ACCEPT — draft matched the main model; pa@pos+1 and pb@pos+2 real.
+                accepted += 1;
+                if eos.contains(&pa) {
+                    cur = pa; // loop head breaks without emitting eos
+                    continue;
+                }
+                out.push(pa);
+                if out.len() >= ngen {
+                    break;
+                }
+                // MTP KV lockstep: append @pos (trunk sx[0], next pa) and @pos+1
+                // (trunk sx[1], next pb); keep the second draft for pos+3.
+                self.mtp_draft_trunk(sx, pa, pos)?;
+                let d2 = self.mtp_draft_trunk(unsafe { sx.add(hidden) }, pb, pos + 1)?;
+                cur = pb;
+                draft = d2;
+                pos += 2;
+            } else {
+                // REJECT — draft wrong; only pa@pos+1 real. cur's KV @pos stays; the
+                // draft's stale KV @pos+1 is overwritten next round (not advanced past).
+                let d1 = self.mtp_draft_trunk(sx, pa, pos)?; // MTP KV @pos; draft pos+2
+                cur = pa;
+                draft = d1;
+                pos += 1;
+            }
+        }
+
+        self.prof.wall_ns = decode_wall.elapsed().as_nanos();
+        self.prof.tokens = out.len() as u64;
+        self.prof.report();
+        let acc_pct = 100.0 * accepted as f64 / spec_iters.max(1) as f64;
+        tracing::info!(
+            "spec: {} tokens in {spec_iters} verify rounds, {accepted} accepted ({acc_pct:.1}%)",
+            out.len(),
+        );
+        Ok(out)
     }
 }
