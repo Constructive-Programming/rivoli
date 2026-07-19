@@ -42,7 +42,7 @@ fn run_mode(
     let mut kv = KvCache::new(cfg);
     let mut scr = AttnScratch::new(cfg);
     let mut indexer = match mode {
-        AttnMode::Dsa | AttnMode::Misa { .. } => Some(Indexer::new(cfg)?),
+        AttnMode::Dsa | AttnMode::Misa { .. } => Some(Indexer::new(snap, cfg)?),
         _ => None,
     };
     let mut outs = Vec::new();
@@ -123,11 +123,20 @@ fn modes_agree_below_sparsity_thresholds() -> anyhow::Result<()> {
 }
 
 /// Sparse-regime indexer mechanics (the equivalence test above never leaves
-/// the dense-fallback path): push layer 0 past index_topk cached tokens, then
-/// check DSA returns exactly topk sorted unique rows and MISA's 8-head routed
-/// selection substantially agrees with the full 32-head DSA selection (the
-/// paper reports >92% per-layer recovery; 0.5 IoU is a loose floor that still
-/// catches broken routing, e.g. bottom-scored heads or a stale pool).
+/// the dense-fallback path): push layer 0 well past index_topk cached tokens,
+/// then check DSA returns exactly topk sorted unique rows, the selection is
+/// score-driven (not a degenerate tie-break prefix), and MISA's 8-head routed
+/// selection substantially agrees with the full 32-head DSA selection.
+///
+/// The margin matters: at nt = topk + m, ANY two selections overlap in at
+/// least topk−m rows, so IoU ≥ (topk−m)/(topk+m) is forced. With m = 512 the
+/// forced floor is 0.6 and a broken router (random/inverted heads) lands near
+/// E[IoU] ≈ 0.66. The healthy measurement HERE is ~0.84, not the paper's >92%:
+/// at nt=2560 the router sees only ⌈nt/1024⌉ = 3 pooled blocks (the paper's
+/// contexts give it 8–128), and synthetic activations are not what the gates
+/// were trained on. The 0.75 floor cleanly separates broken (≈0.66) from
+/// healthy (≈0.84) in this regime; true routing QUALITY is a real-decode
+/// long-context eval, not this harness's job.
 #[test]
 fn indexer_sparse_regime_topk_and_misa_overlap() -> anyhow::Result<()> {
     let Some(dir) = snapshot_dir() else {
@@ -144,24 +153,44 @@ fn indexer_sparse_regime_topk_and_misa_overlap() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let steps = cfg.index_topk + 8;
-    let qr_len = cfg.q_lora_rank;
+    let steps = cfg.index_topk + 512;
     // Two indexers fed identical streams — selections at each step are
-    // comparable because the key caches are identical.
-    let mut dsa = Indexer::new(&cfg)?;
-    let mut misa = Indexer::new(&cfg)?;
+    // comparable because the key caches are identical. The stream must be
+    // REALISTIC in shape, not iid noise: MISA's premise is that a query's
+    // relevant heads drift slowly along the prefix, which holds for real
+    // activation streams and fails for white noise. So: x is a slow random
+    // walk, and qr is the model's ACTUAL q-LoRA residual of x (q_a projection
+    // + rmsnorm with the trained weights), exactly what attention() computes.
+    //
+    // Only the FINAL step's selection is asserted, so the cache-building steps
+    // run under an inflated index_topk (fast path: append + pool only, no
+    // scoring) — identical kcache/pool state at a fraction of the cost — and
+    // the last step scores once under the real config.
+    let mut cfg_grow = cfg.clone();
+    cfg_grow.index_topk = steps + 1;
+    let q_a = snap.int4("model.layers.0.self_attn.q_a_proj", cfg.hidden)?;
+    let q_a_ln = rivoli::quant::read_f32(snap.typed(
+        "model.layers.0.self_attn.q_a_layernorm.weight",
+        rivoli::snapshot::Dtype::F32,
+    )?);
+    let mut dsa = Indexer::new(&snap, &cfg)?;
+    let mut misa = Indexer::new(&snap, &cfg)?;
     let mut rows_dsa = Vec::new();
     let mut rows_misa = Vec::new();
+    let mut x = hidden(&cfg, 0);
+    let mut qr = vec![0.0f32; cfg.q_lora_rank];
     for pos in 0..steps {
-        let x = hidden(&cfg, pos as u32);
-        let qr: Vec<f32> = hidden(&cfg, (pos + 7_000_000) as u32)[..qr_len.min(cfg.hidden)]
-            .iter()
-            .cycle()
-            .take(qr_len)
-            .copied()
-            .collect();
-        dsa.select(&snap, &cfg, 0, &x, &qr, pos, None, &mut rows_dsa)?;
-        misa.select(&snap, &cfg, 0, &x, &qr, pos, Some(8), &mut rows_misa)?;
+        for (xi, &n) in x.iter_mut().zip(&hidden(&cfg, pos as u32)) {
+            *xi = 0.95 * *xi + 0.3 * n;
+        }
+        let last = pos == steps - 1;
+        let step_cfg = if last { &cfg } else { &cfg_grow };
+        if last {
+            rivoli::quant::matvec_i4(&mut qr, &x, &q_a);
+            rivoli::math::rmsnorm(&mut qr, &q_a_ln, cfg.rms_norm_eps as f32);
+        }
+        dsa.select(&snap, step_cfg, 0, &x, &qr, pos, None, &mut rows_dsa)?;
+        misa.select(&snap, step_cfg, 0, &x, &qr, pos, Some(8), &mut rows_misa)?;
     }
 
     assert_eq!(rows_dsa.len(), cfg.index_topk, "dsa row count");
@@ -174,11 +203,19 @@ fn indexer_sparse_regime_topk_and_misa_overlap() -> anyhow::Result<()> {
         "row out of range"
     );
     assert_eq!(rows_misa.len(), cfg.index_topk, "misa row count");
+    // Score-driven, not degenerate: all-zero scores would tie-break to the
+    // contiguous prefix 0..topk. Real scores must have dropped some early
+    // token in favor of a later one.
+    let prefix: Vec<u32> = (0..cfg.index_topk as u32).collect();
+    assert_ne!(rows_dsa, prefix, "dsa selection is the tie-break prefix");
 
     let set: std::collections::HashSet<u32> = rows_dsa.iter().copied().collect();
     let inter = rows_misa.iter().filter(|r| set.contains(r)).count();
     let iou = inter as f64 / (2 * cfg.index_topk - inter) as f64;
     eprintln!("misa-vs-dsa selection IoU at nt={steps}: {iou:.3}");
-    assert!(iou > 0.5, "misa selection diverged from dsa (IoU {iou:.3})");
+    assert!(
+        iou > 0.75,
+        "misa selection diverged from dsa (IoU {iou:.3})"
+    );
     Ok(())
 }

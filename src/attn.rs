@@ -1,7 +1,9 @@
 //! MLA (multi-head latent attention) decode — the absorb path, ported from
 //! colibri `attention_rows` (glm.c). Reference scalar implementation for a
-//! single new token (S=1), dense over the whole cached context (DSA sparse
-//! selection is a later addition once the indexer weights are re-exported).
+//! single new token (S=1). The attended row set is picked per step by
+//! [`AttnMode`] — dense, StreamingLLM sinks+window, or the DSA/MISA lightning
+//! indexer (indexer.rs, weights from the out-idx shard) — and the absorb core
+//! is row-set-agnostic.
 //!
 //! The compressed KV cache stores, per token per layer, only the normed latent
 //! `L[kv_lora]` and the roped shared key `R[qk_rope]` — in bf16 (decided
@@ -14,7 +16,7 @@ use crate::indexer::Indexer;
 use crate::math::{bf16_to_f32, f32_to_bf16, rmsnorm, softmax};
 use crate::model::ModelConfig;
 use crate::quant::{addrow, matvec_i4, matvec_i4_rows, read_f32};
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Dtype, Snapshot};
 use anyhow::{Result, ensure};
 
 /// Which tokens each decode step attends over. Selected once per layer per
@@ -213,8 +215,8 @@ pub fn attention(
         o_proj.o_dim,
         cfg.hidden
     );
-    let q_a_ln = read_f32(snap.require(&format!("{base}.q_a_layernorm.weight"))?);
-    let kv_a_ln = read_f32(snap.require(&format!("{base}.kv_a_layernorm.weight"))?);
+    let q_a_ln = read_f32(snap.typed(&format!("{base}.q_a_layernorm.weight"), Dtype::F32)?);
+    let kv_a_ln = read_f32(snap.typed(&format!("{base}.kv_a_layernorm.weight"), Dtype::F32)?);
 
     // 1) Q path: q_a → rmsnorm(q_a_ln) → q_b (both norms in place on scratch).
     matvec_i4(&mut s.qr, x, &q_a);
@@ -222,47 +224,48 @@ pub fn attention(
     matvec_i4(&mut s.q, &s.qr, &q_b);
 
     // 2) KV path: kv_a → [latent | key]; normalize the latent, RoPE the key —
-    //    both in place on comp — then append the token to the bf16 cache.
+    //    both in place on comp. The cache append is deliberately AFTER the row
+    //    selection below: the indexer's weight loads are the only fallible step
+    //    in selection, and appending first would leave this layer's kv cache
+    //    one token ahead of the indexer's key cache on that error path — a
+    //    silent desync for any caller that survives the error.
     matvec_i4(&mut s.comp, x, &kv_a);
     rmsnorm(&mut s.comp[..kvl], &kv_a_ln, eps);
     rope_interleave(&mut s.comp[kvl..], pos, theta);
+
+    // Select the rows this step attends over (ascending token order, over the
+    // pos+1 tokens the caches hold after the appends). The absorb core below
+    // is mode-agnostic; only this set differs. Disjoint field borrows (s.qr
+    // shared, s.rows mut) are fine through one `&mut s`.
+    let nt = pos + 1;
+    match mode {
+        AttnMode::Dense => {
+            s.rows.clear();
+            s.rows.extend(0..nt as u32);
+        }
+        AttnMode::Streaming { sinks, window } => {
+            streaming_rows(nt, *sinks, *window, &mut s.rows);
+        }
+        AttnMode::Dsa | AttnMode::Misa { .. } => {
+            let ix = indexer
+                .ok_or_else(|| anyhow::anyhow!("{mode:?} attention mode without an indexer"))?;
+            let active = match mode {
+                AttnMode::Misa { active_heads } => Some(*active_heads),
+                _ => None,
+            };
+            ix.select(snap, cfg, layer, x, &s.qr, pos, active, &mut s.rows)?;
+        }
+    }
+    ensure!(!s.rows.is_empty(), "empty attention row selection");
+
+    // Selection succeeded — commit this token to the kv cache and RoPE each
+    // head's query rope segment.
     let (latent, rkey) = s.comp.split_at(kvl);
     kv.append(layer, latent, rkey);
-
-    // RoPE each head's query rope segment.
     for head in 0..h {
         let off = head * qh + nope;
         rope_interleave(&mut s.q[off..off + rope], pos, theta);
     }
-
-    // Select the rows this step attends over (ascending token order). The
-    // absorb core below is mode-agnostic; only this set differs.
-    let nt = kv.tokens(layer);
-    {
-        // `rows` is taken out of the scratch so the indexer can borrow `s.qr`
-        // immutably while filling it.
-        let mut rows = std::mem::take(&mut s.rows);
-        match mode {
-            AttnMode::Dense => {
-                rows.clear();
-                rows.extend(0..nt as u32);
-            }
-            AttnMode::Streaming { sinks, window } => {
-                streaming_rows(nt, *sinks, *window, &mut rows);
-            }
-            AttnMode::Dsa | AttnMode::Misa { .. } => {
-                let ix = indexer
-                    .ok_or_else(|| anyhow::anyhow!("{mode:?} attention mode without an indexer"))?;
-                let active = match mode {
-                    AttnMode::Misa { active_heads } => Some(*active_heads),
-                    _ => None,
-                };
-                ix.select(snap, cfg, layer, x, &s.qr, pos, active, &mut rows)?;
-            }
-        }
-        s.rows = rows;
-    }
-    ensure!(!s.rows.is_empty(), "empty attention row selection");
 
     // 3) Absorb-path attention core, per head.
     //

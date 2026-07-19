@@ -346,6 +346,23 @@ impl Snapshot {
             .with_context(|| format!("required tensor {name} not found in snapshot"))
     }
 
+    /// [`require`](Self::require) plus an on-disk dtype check. Guards the raw
+    /// decode paths (`read_f32` / `matvec_f32_bytes` / `read_bf16`): with BF16
+    /// now indexable (the out-idx shard), an unchecked `require` would hand
+    /// bf16 bytes to the f32 decoder and yield half-length garbage weights
+    /// instead of an error at load. Every call site that decodes raw bytes by
+    /// assumed dtype goes through here.
+    pub fn typed(&self, name: &str, want: Dtype) -> Result<&[u8]> {
+        let loc = self
+            .index
+            .get(name)
+            .with_context(|| format!("required tensor {name} not found in snapshot"))?;
+        if loc.dtype != want {
+            bail!("{name} is {:?}, expected {want:?}", loc.dtype);
+        }
+        self.loc_bytes(name, loc)
+    }
+
     /// Locate an int4 weight matrix `W[o_dim, i_dim]` by base name (expects
     /// `<name>.weight` U8 packed nibbles + `<name>.weight.qs` F32 per-row
     /// scales). Weight/scale tensors are stored 1-D (raw byte/element counts,

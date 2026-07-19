@@ -17,14 +17,14 @@
 //! MISA (block-pooled head routing, arXiv 2605.07363) is a restriction of the
 //! head sum to a routed subset: a per-1024-token running-mean key pool feeds a
 //! cheap per-head estimate E_j = mean_b |w_j·ReLU(q_j·k̄_b)|, and only the
-//! top-`active_heads` run the O(nt) token scan (~4× cheaper at h=8 of 32;
-//! measured selection IoU vs full DSA ≈ 0.996 — see tests/attn_modes.rs).
+//! top-`active_heads` run the O(nt) token scan (~4× cheaper at h=8 of 32; the
+//! routed selection's IoU vs full DSA is asserted in tests/attn_modes.rs).
 
 use crate::attn::rope_interleave;
 use crate::math::{layernorm, topk_into};
 use crate::model::ModelConfig;
 use crate::quant::{matvec_bf16, read_bf16};
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Dtype, Snapshot};
 use anyhow::{Result, ensure};
 
 /// MISA router block size (pooled tokens per key). The paper's validated
@@ -60,11 +60,17 @@ pub struct Indexer {
     /// Most recent full layer's selection this token (token rows, ascending).
     topk: Vec<u32>,
     /// Per layer, MISA block-pooled keys: ⌈tokens/MISA_BLOCK⌉ rows of
-    /// index_head_dim f32 (running mean, maintained on every append so a
-    /// mid-run mode switch never sees a stale pool). Empty for shared layers.
+    /// index_head_dim f32 (running mean). MISA-only bookkeeping — the engine's
+    /// mode is fixed at construction, so DSA runs never maintain it. Empty for
+    /// shared layers.
     pooled: Vec<Vec<f32>>,
+    /// Per full layer, the k_norm LayerNorm weight+bias, widened once at
+    /// construction (they never change; loading them per token was the only
+    /// per-step heap allocation in the indexer path). None for shared layers.
+    knorm: Vec<Option<(Vec<f32>, Vec<f32>)>>,
     // Scratch (allocation-free per step).
     k: Vec<f32>,      // index_head_dim
+    kf: Vec<f32>,     // index_head_dim — one widened cached key row
     q: Vec<f32>,      // index_n_heads * index_head_dim
     w: Vec<f32>,      // index_n_heads
     scores: Vec<f32>, // up to context length
@@ -73,15 +79,42 @@ pub struct Indexer {
     heads: Vec<usize>,     // routed active head set
 }
 
+/// The indexer's `k_norm` epsilon. Hardcoded in the HF reference
+/// (`nn.LayerNorm(head_dim, eps=1e-6)` in modeling_deepseek_v32/glm_moe_dsa) —
+/// NOT the model's rms_norm_eps (1e-5 for GLM-5.2).
+const K_NORM_EPS: f32 = 1e-6;
+
 impl Indexer {
-    pub fn new(cfg: &ModelConfig) -> Result<Self> {
+    pub fn new(snap: &Snapshot, cfg: &ModelConfig) -> Result<Self> {
         let full = cfg.indexer_layout()?;
+        let knorm = full
+            .iter()
+            .enumerate()
+            .map(|(layer, &is_full)| {
+                if !is_full {
+                    return Ok(None);
+                }
+                let base = format!("model.layers.{layer}.self_attn.indexer.k_norm");
+                let w = read_bf16(snap.typed(&format!("{base}.weight"), Dtype::Bf16)?);
+                let b = read_bf16(snap.typed(&format!("{base}.bias"), Dtype::Bf16)?);
+                ensure!(
+                    w.len() == cfg.index_head_dim && b.len() == cfg.index_head_dim,
+                    "layer {layer} k_norm dims {}/{} != {}",
+                    w.len(),
+                    b.len(),
+                    cfg.index_head_dim
+                );
+                Ok(Some((w, b)))
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             kcache: vec![Vec::new(); full.len()],
             pooled: vec![Vec::new(); full.len()],
+            knorm,
             full,
             topk: Vec::new(),
             k: vec![0.0; cfg.index_head_dim],
+            kf: vec![0.0; cfg.index_head_dim],
             q: vec![0.0; cfg.index_n_heads * cfg.index_head_dim],
             w: vec![0.0; cfg.index_n_heads],
             scores: Vec::new(),
@@ -113,11 +146,16 @@ impl Indexer {
         active_heads: Option<usize>,
         out: &mut Vec<u32>,
     ) -> Result<()> {
+        if let Some(h) = active_heads {
+            ensure!(h > 0, "misa active_heads must be >= 1");
+        }
         if !self.full[layer] {
             // IndexShare: reuse the nearest preceding full layer's selection.
             // All layer caches hold the same token count, so rows transfer.
+            // Layer 0 is always full (enforced at config load), so a non-empty
+            // topk exists by the time any shared layer runs — unconditionally.
             ensure!(
-                !self.topk.is_empty() || pos == 0,
+                !self.topk.is_empty(),
                 "shared layer {layer} selecting before any full layer ran"
             );
             out.clear();
@@ -148,17 +186,22 @@ impl Indexer {
             "weights_proj o_dim {} != {nh}",
             wproj.o_dim
         );
-        let kn_w = read_bf16(snap.require(&format!("{base}.k_norm.weight"))?);
-        let kn_b = read_bf16(snap.require(&format!("{base}.k_norm.bias"))?);
+        let (kn_w, kn_b) = self.knorm[layer]
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("full layer {layer} missing hoisted k_norm"))?;
 
-        // Key for the current token: wk → LayerNorm → RoPE, then cache (bf16)
-        // and fold into the MISA block pool (kept warm regardless of mode).
+        // Key for the current token: wk → LayerNorm (eps hardcoded to match
+        // the HF reference, see K_NORM_EPS) → RoPE, then cache (bf16). The
+        // MISA block pool is maintained only when routing is on — the mode is
+        // fixed per engine, so a DSA run never reads it.
         matvec_bf16(&mut self.k, x, &wk);
-        layernorm(&mut self.k, &kn_w, &kn_b, cfg.rms_norm_eps as f32);
+        layernorm(&mut self.k, kn_w, kn_b, K_NORM_EPS);
         rope_interleave(&mut self.k[..rope], pos, theta);
         self.kcache[layer].extend(self.k.iter().map(|&v| crate::math::f32_to_bf16(v)));
         let nt = self.kcache[layer].len() / hd;
-        pool_push(&mut self.pooled[layer], &self.k, nt - 1, hd);
+        if active_heads.is_some() {
+            pool_push(&mut self.pooled[layer], &self.k, nt - 1, hd);
+        }
 
         // Everything causal fits in the budget → exactly dense; skip scoring.
         if nt <= cfg.index_topk {
@@ -206,24 +249,31 @@ impl Indexer {
 
         // Score every cached token with the active heads:
         // I_t = Σ_{h∈active} w_h · ReLU(q_h·k_t · d^-0.5).
+        // Each key row is widened bf16→f32 ONCE into the kf scratch, then
+        // reused across heads (the |heads|× re-widening the attn.rs P1 note
+        // warns about, avoided here from the start).
         if self.scores.len() < nt {
             self.scores.resize(nt, 0.0);
         }
         for (t, sc) in self.scores[..nt].iter_mut().enumerate() {
             let krow = &self.kcache[layer][t * hd..(t + 1) * hd];
+            for (f, &kb) in self.kf.iter_mut().zip(krow) {
+                *f = crate::math::bf16_to_f32(kb);
+            }
             let mut acc = 0.0f32;
             for &head in &self.heads {
                 let wh = self.w[head];
                 let qh = &self.q[head * hd..(head + 1) * hd];
-                let mut dot = 0.0f32;
-                for (i, &kb) in krow.iter().enumerate() {
-                    dot += qh[i] * crate::math::bf16_to_f32(kb);
-                }
+                let dot: f32 = qh.iter().zip(&self.kf).map(|(&a, &b)| a * b).sum();
                 acc += wh * wscale * (dot * dscale).max(0.0);
             }
             *sc = acc;
         }
 
+        // Plain causal top-k, faithfully mirroring the HF reference
+        // (`index_scores.topk(...)`): the current token is NOT force-included —
+        // if its own key scores outside the top-k it is dropped, exactly as in
+        // the trained model.
         topk_into(&self.scores[..nt], cfg.index_topk, &mut self.picks);
         self.picks.sort_unstable(); // ascending token order for the gather
         out.clear();

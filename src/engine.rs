@@ -12,7 +12,7 @@ use crate::math::rmsnorm_into_bytes;
 use crate::model::ModelConfig;
 use crate::moe::{MlpScratch, dense_mlp, moe_block};
 use crate::quant::{dequant_int8_row, matvec_i8};
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Dtype, Snapshot};
 use anyhow::{Result, bail, ensure};
 
 pub struct Engine<'a> {
@@ -35,7 +35,7 @@ impl<'a> Engine<'a> {
     /// indexer dims are validated here.
     pub fn new(snap: &'a Snapshot, cfg: &'a ModelConfig, mode: AttnMode) -> Result<Self> {
         let indexer = match mode {
-            AttnMode::Dsa | AttnMode::Misa { .. } => Some(Indexer::new(cfg)?),
+            AttnMode::Dsa | AttnMode::Misa { .. } => Some(Indexer::new(snap, cfg)?),
             AttnMode::Dense | AttnMode::Streaming { .. } => None,
         };
         Ok(Self {
@@ -66,7 +66,9 @@ impl<'a> Engine<'a> {
         for layer in 0..cfg.n_layers {
             let lb = format!("model.layers.{layer}");
             // Attention sublayer: rmsnorm(input_ln) into xn (residual x survives).
-            let in_ln = self.snap.require(&format!("{lb}.input_layernorm.weight"))?;
+            let in_ln = self
+                .snap
+                .typed(&format!("{lb}.input_layernorm.weight"), Dtype::F32)?;
             rmsnorm_into_bytes(&mut self.xn, &self.x, in_ln, eps);
             attention(
                 self.snap,
@@ -87,7 +89,7 @@ impl<'a> Engine<'a> {
             // MLP sublayer (dense for the first layers, MoE after).
             let post_ln = self
                 .snap
-                .require(&format!("{lb}.post_attention_layernorm.weight"))?;
+                .typed(&format!("{lb}.post_attention_layernorm.weight"), Dtype::F32)?;
             rmsnorm_into_bytes(&mut self.xn, &self.x, post_ln, eps);
             if layer < cfg.dense_layers {
                 dense_mlp(
@@ -114,7 +116,7 @@ impl<'a> Engine<'a> {
         }
 
         // Final norm (into xn; x no longer needed) + lm_head → logits.
-        let norm = self.snap.require("model.norm.weight")?;
+        let norm = self.snap.typed("model.norm.weight", Dtype::F32)?;
         rmsnorm_into_bytes(&mut self.xn, &self.x, norm, eps);
         let head = self.snap.int8("lm_head", cfg.hidden)?;
         matvec_i8(&mut self.logits, &self.xn, &head);

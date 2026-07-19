@@ -128,6 +128,9 @@ pub struct GpuEngine<'a> {
     /// shared by every layer (the selection is position-based, layer-blind).
     rows_buf: DeviceBuf,
     rows_host: Vec<u32>,
+    /// KV-slab + rows_buf capacity in tokens; forward() refuses pos beyond it
+    /// (the append/copy would otherwise write past the device buffers).
+    max_ctx: usize,
     // Per-token device scratch (allocated once, reused).
     x: DeviceBuf,
     xn: DeviceBuf,
@@ -218,6 +221,7 @@ impl<'a> GpuEngine<'a> {
             mode,
             rows_buf: DeviceBuf::new(max_ctx * 4)?,
             rows_host: Vec::new(),
+            max_ctx,
             x: f(cfg.hidden)?,
             xn: f(cfg.hidden)?,
             sub: f(cfg.hidden)?,
@@ -303,6 +307,15 @@ impl<'a> GpuEngine<'a> {
         let clatp = self.clat.ptr_mut() as *mut f32;
         let ctxp = self.ctx.ptr_mut() as *mut f32;
         let glp = self.gate_logits.ptr_mut() as *mut f32;
+
+        // The KV slabs and rows_buf are sized to max_ctx; writing row pos
+        // beyond that is a device-side out-of-bounds write, so refuse here
+        // rather than corrupt device memory.
+        ensure!(
+            pos < self.max_ctx,
+            "pos {pos} exceeds engine capacity max_ctx={}",
+            self.max_ctx
+        );
 
         // Attention row selection for this token — position-based and layer-
         // blind (streaming), so it's computed and uploaded ONCE per token and

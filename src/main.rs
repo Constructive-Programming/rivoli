@@ -41,13 +41,14 @@ struct Args {
     attn: String,
     sinks: usize,
     window: usize,
+    misa_heads: usize,
 }
 
 fn parse_args() -> Result<Args> {
     const USAGE: &str = "usage: rivoli <snapshot-dir> [-bench <tokens>] [--pre-seed] \
          [--direct-vmm-dma] [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc] \
          [--no-prefetch] [--prefetch-depth <n>] [--max-pool-size <GiB>] [--direct-io] \
-         [--attn dense|streaming|dsa|misa] [--sinks <n>] [--window <n>]";
+         [--attn dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>]";
     let mut snapshot = None;
     // Defaults are the validated winning config: ARC eviction + cross-layer prefetch
     // (best hit% on realistic multi-request sessions + the ~+11% prefetch overlap).
@@ -66,6 +67,7 @@ fn parse_args() -> Result<Args> {
         attn: "dense".to_string(),
         sinks: 4,
         window: 8192,
+        misa_heads: 8, // the MISA paper's validated GLM-5 setting
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -121,6 +123,16 @@ fn parse_args() -> Result<Args> {
                     .parse()
                     .context("--window takes an integer")?;
             }
+            "--misa-heads" => {
+                a.misa_heads = args
+                    .next()
+                    .context("--misa-heads requires an integer")?
+                    .parse()
+                    .context("--misa-heads takes an integer")?;
+                if a.misa_heads == 0 {
+                    bail!("--misa-heads must be >= 1");
+                }
+            }
             _ if snapshot.is_none() => snapshot = Some(arg),
             _ => bail!("unexpected argument: {arg}\n{USAGE}"),
         }
@@ -144,8 +156,9 @@ fn main() -> Result<()> {
             window: a.window,
         },
         "dsa" => rivoli::attn::AttnMode::Dsa,
-        // 8 active heads of 32 — the MISA paper's validated GLM-5 setting.
-        "misa" => rivoli::attn::AttnMode::Misa { active_heads: 8 },
+        "misa" => rivoli::attn::AttnMode::Misa {
+            active_heads: a.misa_heads,
+        },
         other => bail!("unknown --attn mode {other:?} (dense|streaming|dsa|misa)"),
     };
     let cfg = Config::discover(

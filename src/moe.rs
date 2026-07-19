@@ -12,7 +12,7 @@
 use crate::math::{silu, topk_into};
 use crate::model::ModelConfig;
 use crate::quant::{matvec_f32_bytes, matvec_i4, read_f32};
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Dtype, Snapshot};
 use anyhow::{Result, ensure};
 
 /// Upper bound on top-k so the routed-expert loop uses stack arrays (avoids
@@ -119,8 +119,8 @@ pub fn moe_block(
         "top_k {} exceeds MAX_TOPK",
         cfg.top_k
     );
-    let gate_bytes = snap.require(&format!("{lbase}.gate.weight"))?;
-    let bias = read_f32(snap.require(&format!("{lbase}.gate.e_score_correction_bias"))?);
+    let gate_bytes = snap.typed(&format!("{lbase}.gate.weight"), Dtype::F32)?;
+    let bias = read_f32(snap.typed(&format!("{lbase}.gate.e_score_correction_bias"), Dtype::F32)?);
     ensure!(
         bias.len() == cfg.n_experts,
         "{lbase}.gate.e_score_correction_bias has {} entries, expected {}",

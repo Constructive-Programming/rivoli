@@ -51,6 +51,11 @@ fn u16_bytes(v: &[u16]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
+/// Little-endian bytes of a u32 slice (row/selection uploads).
+fn u32_bytes(v: &[u32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
 /// f32 values from little-endian device bytes (kernel output readback).
 fn f32_vec(bytes: &[u8]) -> Vec<f32> {
     bytes
@@ -347,8 +352,7 @@ fn check_attend_sel(seed: u64, h: usize, nt: usize, kvl: usize, rope: usize, sel
     let lc_buf = dev_bytes(&u16_bytes(&lc));
     let rc_buf = dev_bytes(&u16_bytes(&rc));
     let mut clat_buf = dev_zeroed(h * kvl * 4);
-    let rows_bytes: Vec<u8> = rows.iter().flat_map(|r| r.to_le_bytes()).collect();
-    let rows_buf = dev_bytes(&rows_bytes); // kept alive even on the dense path
+    let rows_buf = dev_bytes(&u32_bytes(rows)); // kept alive even on the dense path
     let rows_ptr = if sel.is_some() {
         rows_buf.ptr() as *const u32
     } else {

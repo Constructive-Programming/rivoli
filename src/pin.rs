@@ -20,7 +20,7 @@
 use crate::cache;
 use crate::device::{DeviceTier, VmmBuf, mem_info};
 use crate::model::ModelConfig;
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Dtype, Snapshot};
 use crate::stream::{ALIGN, Streamer, slot_span};
 use crate::usage::Usage;
 use anyhow::{Context, Result, ensure};
@@ -469,7 +469,10 @@ impl<'a> Pin<'a> {
                 )?)
             } else {
                 let gate_w = place_f32(&mut tier, snap, &format!("{lb}.mlp.gate.weight"))?;
-                let bias = snap.require(&format!("{lb}.mlp.gate.e_score_correction_bias"))?;
+                let bias = snap.typed(
+                    &format!("{lb}.mlp.gate.e_score_correction_bias"),
+                    Dtype::F32,
+                )?;
                 let bias = crate::quant::read_f32(bias);
                 ensure!(
                     bias.len() == cfg.n_experts,
