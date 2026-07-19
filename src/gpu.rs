@@ -31,13 +31,43 @@ fn desc_of(m: &Mlp) -> ExpertDesc {
     }
 }
 
-fn f32_le(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+/// Serialize `v` as little-endian f32 into a caller-owned byte buffer, reused
+/// across tokens (cleared then refilled) so the per-token weight upload allocates
+/// nothing once `dst` has grown to size.
+fn fill_le(dst: &mut Vec<u8>, v: &[f32]) {
+    dst.clear();
+    for x in v {
+        dst.extend_from_slice(&x.to_le_bytes());
+    }
 }
 
 fn desc_bytes(d: &[ExpertDesc]) -> &[u8] {
     // SAFETY: ExpertDesc is repr(C) POD (six pointers); this is its byte view.
     unsafe { std::slice::from_raw_parts(d.as_ptr() as *const u8, std::mem::size_of_val(d)) }
+}
+
+/// Host routing: sigmoid the gate logits into `scores`, add the router `bias` into
+/// `choice`, and select the top-`top_k` into `sel` (mirrors moe.rs exactly). A free
+/// fn taking disjoint slices — so the caller can borrow `bias` out of `&self.pin`
+/// while it mutably borrows its own routing scratch, no per-token bias clone. Used
+/// for BOTH the current layer's routing and the cross-layer L+1 prediction (each
+/// with its own scratch triple); only the selected indices matter, so no
+/// normalization is done here (the caller weights the current layer's picks).
+fn route_into(
+    gate_logits: &[u8],
+    bias: &[f32],
+    top_k: usize,
+    scores: &mut [f32],
+    choice: &mut [f32],
+    sel: &mut Vec<usize>,
+) {
+    for (s, c) in gate_logits.chunks_exact(4).zip(scores.iter_mut()) {
+        *c = sigmoid(f32::from_le_bytes([s[0], s[1], s[2], s[3]]));
+    }
+    for ((c, &s), &b) in choice.iter_mut().zip(scores.iter()).zip(bias) {
+        *c = s + b;
+    }
+    topk_into(choice, top_k, sel);
 }
 
 /// Per-token time buckets, measured (not theorized). The mid-layer sync drains
@@ -115,6 +145,17 @@ pub struct GpuEngine<'a> {
     scores: Vec<f32>,
     choice: Vec<f32>,
     sel: Vec<usize>,
+    // Per-token host build scratch — reused (cleared+refilled) every layer so the
+    // forward hot path allocates nothing: resolved expert descriptors + weights, the
+    // little-endian weight-upload staging bytes, the resolved `Mlp` batch, and the
+    // three D2H staging buffers for the gate/prediction/final-logits reads.
+    descs: Vec<ExpertDesc>,
+    w: Vec<f32>,
+    wbytes: Vec<u8>,
+    mlps: Vec<Mlp>,
+    gl_host: Vec<u8>,
+    pgl_host: Vec<u8>,
+    logits_host: Vec<u8>,
     // Cross-layer prefetch: separate host scratch for the L+1 prediction top-k, so
     // it never clobbers `scores`/`choice`/`sel` (still needed for L's own MoE
     // weights after the prediction runs).
@@ -176,6 +217,13 @@ impl<'a> GpuEngine<'a> {
             scores: vec![0.0; cfg.n_experts],
             choice: vec![0.0; cfg.n_experts],
             sel: Vec::with_capacity(cfg.top_k),
+            descs: Vec::with_capacity(slots),
+            w: Vec::with_capacity(slots),
+            wbytes: Vec::with_capacity(slots * 4),
+            mlps: Vec::with_capacity(cfg.top_k),
+            gl_host: Vec::with_capacity(cfg.n_experts * 4),
+            pgl_host: Vec::with_capacity(cfg.n_experts * 4),
+            logits_host: Vec::with_capacity(cfg.vocab * 4),
             pred_scores: vec![0.0; cfg.n_experts],
             pred_choice: vec![0.0; cfg.n_experts],
             pred_sel: Vec::with_capacity(cfg.top_k),
@@ -302,9 +350,11 @@ impl<'a> GpuEngine<'a> {
             // --- MLP sublayer (out fully written by the reduce; no pre-zero) ---
             if is_dense {
                 let m = dense_mlp.ok_or_else(|| anyhow::anyhow!("dense layer {l} missing mlp"))?;
-                let d = [desc_of(&m)];
-                self.descs_buf.copy_in_at(0, desc_bytes(&d))?;
-                self.wexpert_buf.copy_in_at(0, &f32_le(&[1.0]))?;
+                self.descs.clear();
+                self.descs.push(desc_of(&m));
+                fill_le(&mut self.wbytes, &[1.0]);
+                self.descs_buf.copy_in_at(0, desc_bytes(&self.descs))?;
+                self.wexpert_buf.copy_in_at(0, &self.wbytes)?;
                 // SAFETY: descs/wexpert/out are device scratch; weights resident.
                 unsafe {
                     launch_moe(
@@ -365,15 +415,30 @@ impl<'a> GpuEngine<'a> {
                 device_sync()?; // wait attention+gate (+ L+1 prediction) compute
                 self.prof.attn_ns += t.elapsed().as_nanos();
                 let t = std::time::Instant::now();
-                let gl = self.gate_logits.copy_out()?;
-                let bias = self.pin.moe_bias(l).to_vec();
-                self.route(&gl, &bias);
+                // Split borrows: read the gate logits into a reused host buffer, then
+                // route with `bias` borrowed straight out of `&self.pin` while the
+                // routing scratch is borrowed mutably — no per-token bias clone.
+                self.gate_logits.copy_out_into(&mut self.gl_host)?;
+                route_into(
+                    &self.gl_host,
+                    self.pin.moe_bias(l),
+                    cfg.top_k,
+                    &mut self.scores,
+                    &mut self.choice,
+                    &mut self.sel,
+                );
                 // Predicted L+1 top-k (separate scratch; L's `scores`/`sel` still
                 // feed L's own MoE weights below).
                 if next_pred.is_some() {
-                    let pgl = self.pred_gl.copy_out()?;
-                    let nbias = self.pin.moe_bias(l + 1).to_vec();
-                    self.route_pred(&pgl, &nbias);
+                    self.pred_gl.copy_out_into(&mut self.pgl_host)?;
+                    route_into(
+                        &self.pgl_host,
+                        self.pin.moe_bias(l + 1),
+                        cfg.top_k,
+                        &mut self.pred_scores,
+                        &mut self.pred_choice,
+                        &mut self.pred_sel,
+                    );
                 }
                 self.prof.route_ns += t.elapsed().as_nanos();
                 // Batch every cold miss through io_uring O_DIRECT (queue depth →
@@ -381,7 +446,7 @@ impl<'a> GpuEngine<'a> {
                 // get the resolved descriptors back.
                 let miss0 = self.pin.misses;
                 let t = std::time::Instant::now();
-                let mlps = self.pin.resolve_layer(l, &self.sel)?;
+                self.pin.resolve_layer(l, &self.sel, &mut self.mlps)?;
                 self.prof.fetch_ns += t.elapsed().as_nanos();
                 self.prof.fetch_n += self.pin.misses - miss0;
                 // Submit L+1's predicted-expert reads NOW (non-blocking): the main
@@ -400,32 +465,34 @@ impl<'a> GpuEngine<'a> {
                     let n = self.prefetch_depth.min(self.pred_sel.len());
                     self.pin.prefetch_layer(l + 1, &self.pred_sel[..n])?;
                 }
-                // Build the descriptor batch (+ record the hit-rate diagnostic).
-                let ke = self.sel.len();
-                let mut descs = Vec::with_capacity(ke + cfg.n_shared);
-                let mut w = Vec::with_capacity(ke + cfg.n_shared);
-                for (i, m) in mlps.iter().enumerate() {
-                    descs.push(desc_of(m));
-                    w.push(self.scores[self.sel[i]]);
+                // Build the descriptor batch (+ record the hit-rate diagnostic) into
+                // the reused `descs`/`w` fields — cleared, so no per-token alloc.
+                self.descs.clear();
+                self.w.clear();
+                for (i, m) in self.mlps.iter().enumerate() {
+                    self.descs.push(desc_of(m));
+                    self.w.push(self.scores[self.sel[i]]);
                 }
                 // Weight = original sigmoid score, sum-normalized then scaled.
-                let mut sm: f32 = w.iter().sum();
+                let mut sm: f32 = self.w.iter().sum();
                 if cfg.norm_topk_prob {
                     sm += 1e-20;
-                    for wi in w.iter_mut() {
+                    for wi in self.w.iter_mut() {
                         *wi /= sm;
                     }
                 }
-                for wi in w.iter_mut() {
+                for wi in self.w.iter_mut() {
                     *wi *= cfg.routed_scale as f32;
                 }
                 // Shared expert(s), weight 1.0.
                 if let Some(s) = shared {
-                    descs.push(desc_of(&s));
-                    w.push(1.0);
+                    self.descs.push(desc_of(&s));
+                    self.w.push(1.0);
                 }
-                self.descs_buf.copy_in_at(0, desc_bytes(&descs))?;
-                self.wexpert_buf.copy_in_at(0, &f32_le(&w))?;
+                fill_le(&mut self.wbytes, &self.w);
+                let ndesc = self.descs.len();
+                self.descs_buf.copy_in_at(0, desc_bytes(&self.descs))?;
+                self.wexpert_buf.copy_in_at(0, &self.wbytes)?;
                 // SAFETY: descs point at resident/cold-slot weights valid until
                 // the end-of-layer sync; all device-resident.
                 unsafe {
@@ -433,7 +500,7 @@ impl<'a> GpuEngine<'a> {
                         xnp,
                         hidden,
                         cfg.moe_inter,
-                        descs.len(),
+                        ndesc,
                         self.descs_buf.ptr() as *const ExpertDesc,
                         self.wexpert_buf.ptr() as *const f32,
                         self.moe_h.ptr_mut() as *mut f32,
@@ -471,39 +538,13 @@ impl<'a> GpuEngine<'a> {
         Ok(())
     }
 
-    /// Host routing: sigmoid scores into `self.scores`, `choice = score + bias`,
-    /// top-k into `self.sel` (mirrors moe.rs exactly).
-    fn route(&mut self, gate_logits: &[u8], bias: &[f32]) {
-        for (s, c) in gate_logits.chunks_exact(4).zip(self.scores.iter_mut()) {
-            *c = sigmoid(f32::from_le_bytes([s[0], s[1], s[2], s[3]]));
-        }
-        for ((c, &s), &b) in self.choice.iter_mut().zip(&self.scores).zip(bias) {
-            *c = s + b;
-        }
-        topk_into(&self.choice, self.cfg.top_k, &mut self.sel);
-    }
-
-    /// Host top-k for the cross-layer L+1 PREDICTION — identical math to [`route`]
-    /// but on separate scratch (`pred_scores`/`pred_choice`/`pred_sel`), so it never
-    /// clobbers `scores`/`choice`/`sel`, which still feed the current layer's MoE
-    /// weights. Only the selected expert indices matter (which to prefetch); the
-    /// scores are not reused, so no normalization is done.
-    fn route_pred(&mut self, gate_logits: &[u8], bias: &[f32]) {
-        for (s, c) in gate_logits.chunks_exact(4).zip(self.pred_scores.iter_mut()) {
-            *c = sigmoid(f32::from_le_bytes([s[0], s[1], s[2], s[3]]));
-        }
-        for ((c, &s), &b) in self.pred_choice.iter_mut().zip(&self.pred_scores).zip(bias) {
-            *c = s + b;
-        }
-        topk_into(&self.pred_choice, self.cfg.top_k, &mut self.pred_sel);
-    }
-
-    /// Greedy argmax over the device logits (one D2H after the final join).
-    fn argmax(&self) -> Result<u32> {
-        let logits = self.logits.copy_out()?;
+    /// Greedy argmax over the device logits (one D2H, into reused host scratch,
+    /// after the final join).
+    fn argmax(&mut self) -> Result<u32> {
+        self.logits.copy_out_into(&mut self.logits_host)?;
         let mut best = 0usize;
         let mut bv = f32::NEG_INFINITY;
-        for (i, c) in logits.chunks_exact(4).enumerate() {
+        for (i, c) in self.logits_host.chunks_exact(4).enumerate() {
             let l = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
             if l > bv {
                 bv = l;

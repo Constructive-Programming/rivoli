@@ -6,10 +6,10 @@
 //
 // TWO DESTINATION MODES, chosen once at rivoli_ring_new:
 //
-//   DIRECT (bounce=0, default): prep_read straight into the caller's VMM device
-//   slot. The fast path — the read DMA lands in device memory, no copy.
+//   DIRECT (bounce=0, `--direct-vmm-dma`): prep_read straight into the caller's
+//   VMM device slot — the read DMA lands in device memory, no copy.
 //
-//   BOUNCE (bounce=1, `--skip-vmm-dma`): read into a PINNED HOST arena, then
+//   BOUNCE (bounce=1, the default): read into a PINNED HOST arena, then
 //   hipMemcpy each into the VMM slot.
 //   ------------------------------------------------------------------------
 //   WORKAROUND (kernel bug, amdgpu, first seen 6.18.38-gentoo 2026-07-17):
@@ -23,8 +23,9 @@
 //     device-fill, ~free vs the NVMe read), keeping O_DIRECT + QD without ever
 //     DMA'ing into VMM.
 //     REVERT: once a fixed amdgpu lands, the DIRECT mode works again — re-probe
-//     with docs/probes/iouring_vmm.cpp (no `read err -14` => fixed) and drop
-//     `--skip-vmm-dma`. Eventually delete the bounce arm entirely.
+//     with docs/probes/iouring_vmm.cpp (no `read err -14` => fixed), then flip the
+//     default back to DIRECT (making `--direct-vmm-dma` unnecessary). Eventually
+//     delete the bounce arm entirely.
 //   ------------------------------------------------------------------------
 //
 // A thin C ABI over liburing (on-box). The caller (src/stream.rs) does all the

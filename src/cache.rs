@@ -260,6 +260,32 @@ impl Arc {
             b2: OrderedSet::default(),
         }
     }
+    /// Admit `k` into T1 recency on a fresh miss (no ghost hit): make room per the
+    /// paper's Case IV cases, evict one resident to a ghost if at capacity, then
+    /// touch `k` into T1. Returns the evicted resident key (if any). Shared by
+    /// `insert`'s cold-miss branch and `insert_cold` (which first strips any ghost).
+    fn admit_t1(&mut self, k: u32) -> Option<u32> {
+        let c = self.c;
+        let total = self.t1.len() + self.t2.len() + self.b1.len() + self.b2.len();
+        let evicted = if self.t1.len() + self.b1.len() == c {
+            if self.t1.len() < c {
+                self.b1.pop_lru();
+                self.replace(false)
+            } else {
+                self.t1.pop_lru() // resident T1 dropped
+            }
+        } else if total >= c {
+            if total == 2 * c {
+                self.b2.pop_lru();
+            }
+            self.replace(false)
+        } else {
+            None // spare capacity
+        };
+        self.t1.touch(k);
+        evicted
+    }
+
     /// Evict one RESIDENT page to a ghost (paper's REPLACE); returns the evicted
     /// resident key. `in_b2` biases toward evicting T1 at the boundary.
     fn replace(&mut self, in_b2: bool) -> Option<u32> {
@@ -305,52 +331,19 @@ impl Cache for Arc {
             self.b2.remove(k);
             self.t2.touch(k);
         } else {
-            let total = self.t1.len() + self.t2.len() + self.b1.len() + self.b2.len();
-            if self.t1.len() + self.b1.len() == c {
-                if self.t1.len() < c {
-                    self.b1.pop_lru();
-                    evicted = self.replace(false);
-                } else {
-                    evicted = self.t1.pop_lru(); // resident T1 dropped
-                }
-            } else if total >= c {
-                if total == 2 * c {
-                    self.b2.pop_lru();
-                }
-                evicted = self.replace(false);
-            } else {
-                evicted = None; // spare capacity
-            }
-            self.t1.touch(k);
+            evicted = self.admit_t1(k);
         }
         evicted
     }
     fn insert_cold(&mut self, k: u32) -> Option<u32> {
         // Prefetch: force into T1 recency probation, NEVER adapting `p` or promoting
         // via the B1/B2 ghosts — a speculative prediction must not corrupt ARC's
-        // adaptation signal. Mirrors insert's cold-miss branch (a batch coexists:
-        // replace evicts a T1/T2 LRU, never a fresh sibling).
+        // adaptation signal. Strip any stale ghost, then take the same cold-miss T1
+        // admission as `insert` (a batch coexists: replace evicts a T1/T2 LRU, never
+        // a fresh sibling).
         self.b1.remove(k);
         self.b2.remove(k);
-        let c = self.c;
-        let total = self.t1.len() + self.t2.len() + self.b1.len() + self.b2.len();
-        let evicted = if self.t1.len() + self.b1.len() == c {
-            if self.t1.len() < c {
-                self.b1.pop_lru();
-                self.replace(false)
-            } else {
-                self.t1.pop_lru()
-            }
-        } else if total >= c {
-            if total == 2 * c {
-                self.b2.pop_lru();
-            }
-            self.replace(false)
-        } else {
-            None
-        };
-        self.t1.touch(k);
-        evicted
+        self.admit_t1(k)
     }
     fn seed(&mut self, keys: &[u32]) {
         for &k in keys.iter().take(self.c) {

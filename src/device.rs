@@ -25,7 +25,6 @@ mod ffi {
         pub fn hipMalloc(ptr: *mut *mut c_void, size: usize) -> i32;
         pub fn hipFree(ptr: *mut c_void) -> i32;
         pub fn hipMemcpy(dst: *mut c_void, src: *const c_void, size: usize, kind: i32) -> i32;
-        pub fn hipMemset(ptr: *mut c_void, value: i32, size: usize) -> i32;
         pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
     }
     // VMM device-local host-fillable allocator (kernels/vmm.hip, in
@@ -108,25 +107,30 @@ mod tier {
         /// amdgpu GTT counter directly (the HIP API reports our own view, not the
         /// whole-device tenancy this guard needs).
         fn guard_sole_tenant() -> Result<()> {
-            // ponytail: card0 hardcoded — this box has one amdgpu. Generalize to
-            // scan /sys/class/drm/card*/device only if a second GPU ever appears.
-            let path = "/sys/class/drm/card0/device/mem_info_gtt_used";
-            // The guard fails OPEN (a bad read → proceed) so a non-amdgpu or
+            // Scan card0 then card1 — this box has one amdgpu today, but a second
+            // GPU must not silently defeat the guard; the first readable node wins.
+            // The guard fails OPEN (no readable node → proceed) so a non-amdgpu or
             // containerized box isn't blocked — but it says so LOUDLY, because a
             // silently-inert safety guard is worse than none (the operator would
             // believe they're protected). M5's clean-refusal gate depends on this.
-            let gtt: u64 = match std::fs::read_to_string(path) {
-                Ok(s) => match s.trim().parse() {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!("sole-tenant guard DISABLED: {path} unparseable ({e})");
-                        return Ok(());
+            let gtt: u64 = 'read: {
+                for card in ["card0", "card1"] {
+                    let path = format!("/sys/class/drm/{card}/device/mem_info_gtt_used");
+                    match std::fs::read_to_string(&path) {
+                        Ok(s) => match s.trim().parse() {
+                            Ok(v) => break 'read v,
+                            Err(e) => {
+                                warn!("sole-tenant guard DISABLED: {path} unparseable ({e})");
+                                return Ok(());
+                            }
+                        },
+                        Err(_) => continue, // absent card — try the next
                     }
-                },
-                Err(e) => {
-                    warn!("sole-tenant guard DISABLED: {path} unreadable ({e})");
-                    return Ok(());
                 }
+                warn!(
+                    "sole-tenant guard DISABLED: no /sys/class/drm/card{{0,1}}/device/mem_info_gtt_used readable"
+                );
+                return Ok(());
             };
             if gtt > Self::SOLE_TENANT_MAX_GTT {
                 bail!(
@@ -161,7 +165,7 @@ mod tier {
     /// A standalone mutable device buffer — for per-token activations, the
     /// descriptor array, and the MoE accumulator that the kernels write. Unlike
     /// [`DeviceTier`] (append-only resident weights), a `DeviceBuf` is sized once
-    /// and rewritten each token via `copy_in`/`zero`. Freed on drop.
+    /// and rewritten each token via `copy_in_at`. Freed on drop.
     pub struct DeviceBuf {
         ptr: *mut u8,
         len: usize,
@@ -182,43 +186,6 @@ mod tier {
                 ptr: ptr as *mut u8,
                 len,
             })
-        }
-
-        /// Allocate `len` device bytes, zeroed.
-        pub fn zeroed(len: usize) -> Result<Self> {
-            let b = Self::new(len)?;
-            // SAFETY: ptr owns len bytes.
-            let e = unsafe { hipMemset(b.ptr as *mut c_void, 0, len) };
-            ensure!(e == HIP_SUCCESS, "hipMemset failed ({e})");
-            Ok(b)
-        }
-
-        /// Allocate and fill from host bytes.
-        pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-            let mut b = Self::new(bytes.len())?;
-            b.copy_in(bytes)?;
-            Ok(b)
-        }
-
-        /// Overwrite the buffer from host bytes (`bytes.len()` must be `len`).
-        pub fn copy_in(&mut self, bytes: &[u8]) -> Result<()> {
-            ensure!(
-                bytes.len() == self.len,
-                "copy_in {} != buf len {}",
-                bytes.len(),
-                self.len
-            );
-            // SAFETY: both regions are `len` bytes.
-            let e = unsafe {
-                hipMemcpy(
-                    self.ptr as *mut c_void,
-                    bytes.as_ptr() as *const c_void,
-                    self.len,
-                    HIP_MEMCPY_H2D,
-                )
-            };
-            ensure!(e == HIP_SUCCESS, "hipMemcpy H2D failed ({e})");
-            Ok(())
         }
 
         /// Overwrite `bytes` at byte offset `off` (partial H2D) — grows a KV
@@ -243,17 +210,21 @@ mod tier {
             Ok(())
         }
 
-        /// Zero the buffer (before an accumulating kernel).
-        pub fn zero(&mut self) -> Result<()> {
-            // SAFETY: ptr owns len bytes.
-            let e = unsafe { hipMemset(self.ptr as *mut c_void, 0, self.len) };
-            ensure!(e == HIP_SUCCESS, "hipMemset failed ({e})");
-            Ok(())
+        /// Copy the whole buffer back to host as a fresh `Vec` (the ergonomic form;
+        /// the per-token decode path uses [`DeviceBuf::copy_out_into`] to reuse a
+        /// buffer instead).
+        pub fn copy_out(&self) -> Result<Vec<u8>> {
+            let mut out = Vec::new();
+            self.copy_out_into(&mut out)?;
+            Ok(out)
         }
 
-        /// Copy the whole buffer back to host.
-        pub fn copy_out(&self) -> Result<Vec<u8>> {
-            let mut out = vec![0u8; self.len];
+        /// Copy the whole buffer back into `out` (a caller-owned buffer reused
+        /// across tokens: cleared then refilled to `len`, so the per-token decode
+        /// D2H allocates nothing once `out` has grown to size).
+        pub fn copy_out_into(&self, out: &mut Vec<u8>) -> Result<()> {
+            out.clear();
+            out.resize(self.len, 0);
             // SAFETY: both regions are `len` bytes.
             let e = unsafe {
                 hipMemcpy(
@@ -264,7 +235,7 @@ mod tier {
                 )
             };
             ensure!(e == HIP_SUCCESS, "hipMemcpy D2H failed ({e})");
-            Ok(out)
+            Ok(())
         }
 
         pub fn ptr(&self) -> *const u8 {

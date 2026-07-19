@@ -192,8 +192,21 @@ async fn run(cfg: Config) -> Result<()> {
         // Pin::build, ~9-10 GiB for GLM-5.2) + the routed-expert LRU. Fill most of
         // device memory: the LRU is online priming, so a bigger pool captures more
         // of this run's working set (sim: 3200 slots→72%, 4200→75% hit) — leave
-        // headroom for scratch/KV. The pin splits this into resident tier + LRU.
-        let cap = free.saturating_sub(16 << 30).min(80 << 30);
+        // OS_RESERVE headroom for scratch/KV, capped at MAX_POOL. The pin splits
+        // this into resident tier + LRU. This is the ACTUAL residency budget — the
+        // config log carries the two bounds, this line carries the resolved value.
+        use rivoli::config::{MAX_POOL, OS_RESERVE};
+        const GIB: f64 = (1u64 << 30) as f64;
+        let cap = free
+            .saturating_sub(OS_RESERVE as usize)
+            .min(MAX_POOL as usize);
+        info!(
+            "device pool budget {:.1} GiB (free {:.1} GiB − {:.0} GiB OS reserve, capped at {:.0} GiB)",
+            cap as f64 / GIB,
+            free as f64 / GIB,
+            OS_RESERVE as f64 / GIB,
+            MAX_POOL as f64 / GIB,
+        );
         let t = std::time::Instant::now();
         let pin = rivoli::pin::Pin::build(
             &snap,

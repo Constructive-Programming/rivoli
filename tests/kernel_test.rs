@@ -19,6 +19,20 @@ fn place_bytes(tier: &mut DeviceTier, bytes: &[u8]) -> *const u8 {
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
     dst as *const u8
 }
+
+/// Test helper: a fresh device buffer filled with `bytes`. Production `DeviceBuf`
+/// exposes `new` + `copy_in_at`; the old `from_bytes`/`zeroed` conveniences were
+/// removed as dead in production, so the tests build the equivalents here.
+fn dev_bytes(bytes: &[u8]) -> DeviceBuf {
+    let mut b = DeviceBuf::new(bytes.len()).expect("alloc dev buf");
+    b.copy_in_at(0, bytes).expect("fill dev buf");
+    b
+}
+
+/// Test helper: a zero-initialized device buffer of `len` bytes.
+fn dev_zeroed(len: usize) -> DeviceBuf {
+    dev_bytes(&vec![0u8; len])
+}
 use rivoli::hip::{
     ExpertDesc, device_sync, launch_attend, launch_gemv_f32, launch_gemv_i4, launch_gemv_i8,
     launch_mla_absorb, launch_mla_value, launch_moe, launch_rmsnorm, launch_rope,
@@ -197,9 +211,9 @@ fn check(seed: u64, hidden: usize, inter: usize, e: usize) {
             std::mem::size_of_val(&descs[..]),
         )
     };
-    let descs_buf = DeviceBuf::from_bytes(desc_bytes).expect("place descs");
-    let x_buf = DeviceBuf::from_bytes(&f32_bytes(&x)).expect("place x");
-    let w_buf = DeviceBuf::from_bytes(&f32_bytes(&w)).expect("place w");
+    let descs_buf = dev_bytes(desc_bytes);
+    let x_buf = dev_bytes(&f32_bytes(&x));
+    let w_buf = dev_bytes(&f32_bytes(&w));
     let mut h_buf = DeviceBuf::new(e * inter * 4).expect("alloc h");
     let mut partial_buf = DeviceBuf::new(e * hidden * 4).expect("alloc partial");
     let mut out_buf = DeviceBuf::new(hidden * 4).expect("alloc out");
@@ -320,11 +334,11 @@ fn check_attend(seed: u64, h: usize, nt: usize, kvl: usize, rope: usize) {
     let want = attend_reference(&qabs, &qrope, &lc, &rc, h, nt, kvl, rope, scale);
 
     // Device-resident query + KV cache; the kernel reads them in place.
-    let qabs_buf = DeviceBuf::from_bytes(&f32_bytes(&qabs)).expect("place qabs");
-    let qrope_buf = DeviceBuf::from_bytes(&f32_bytes(&qrope)).expect("place qrope");
-    let lc_buf = DeviceBuf::from_bytes(&u16_bytes(&lc)).expect("place lc");
-    let rc_buf = DeviceBuf::from_bytes(&u16_bytes(&rc)).expect("place rc");
-    let mut clat_buf = DeviceBuf::zeroed(h * kvl * 4).expect("alloc clat");
+    let qabs_buf = dev_bytes(&f32_bytes(&qabs));
+    let qrope_buf = dev_bytes(&f32_bytes(&qrope));
+    let lc_buf = dev_bytes(&u16_bytes(&lc));
+    let rc_buf = dev_bytes(&u16_bytes(&rc));
+    let mut clat_buf = dev_zeroed(h * kvl * 4);
 
     // SAFETY: all pointers are device-resident for the dims.
     unsafe {
@@ -413,8 +427,8 @@ fn check_gemv_i4(seed: u64, o: usize, i: usize) {
     let mut tier = DeviceTier::new(64 << 20).expect("alloc tier");
     let pp = place_bytes(&mut tier, &m.packed);
     let ps = place_bytes(&mut tier, &m.scale_bytes);
-    let x_buf = DeviceBuf::from_bytes(&f32_bytes(&x)).expect("place x");
-    let mut y_buf = DeviceBuf::zeroed(o * 4).expect("alloc y");
+    let x_buf = dev_bytes(&f32_bytes(&x));
+    let mut y_buf = dev_zeroed(o * 4);
     // SAFETY: device pointers valid for the dims; y outlives the sync.
     unsafe {
         launch_gemv_i4(
@@ -452,9 +466,9 @@ fn gemv_f32_matches_scalar() {
     let mut want = vec![0.0f32; o];
     matvec_f32_bytes(&mut want, &x, &w_bytes, i);
 
-    let w_buf = DeviceBuf::from_bytes(&w_bytes).expect("place w");
-    let x_buf = DeviceBuf::from_bytes(&f32_bytes(&x)).expect("place x");
-    let mut y_buf = DeviceBuf::zeroed(o * 4).expect("alloc y");
+    let w_buf = dev_bytes(&w_bytes);
+    let x_buf = dev_bytes(&f32_bytes(&x));
+    let mut y_buf = dev_zeroed(o * 4);
     // SAFETY: device pointers valid for the dims; y outlives the sync.
     unsafe {
         launch_gemv_f32(
@@ -495,8 +509,8 @@ fn gemv_i8_matches_scalar() {
     let mut tier = DeviceTier::new(64 << 20).expect("alloc tier");
     let pp = place_bytes(&mut tier, &packed);
     let ps = place_bytes(&mut tier, &scale);
-    let x_buf = DeviceBuf::from_bytes(&f32_bytes(&x)).expect("place x");
-    let mut y_buf = DeviceBuf::zeroed(o * 4).expect("alloc y");
+    let x_buf = dev_bytes(&f32_bytes(&x));
+    let mut y_buf = dev_zeroed(o * 4);
     // SAFETY: device pointers valid for the dims; y outlives the sync.
     unsafe {
         launch_gemv_i8(
@@ -551,10 +565,10 @@ fn check_mla(seed: u64, h: usize, qh: usize, nope: usize, vh: usize, kvl: usize)
     let mut tier = DeviceTier::new(64 << 20).expect("alloc tier");
     let kp = place_bytes(&mut tier, &kvb.packed);
     let ks = place_bytes(&mut tier, &kvb.scale_bytes) as *const f32;
-    let q_buf = DeviceBuf::from_bytes(&f32_bytes(&q)).expect("place q");
-    let clat_buf = DeviceBuf::from_bytes(&f32_bytes(&clat)).expect("place clat");
-    let mut qabs_buf = DeviceBuf::zeroed(h * kvl * 4).expect("alloc qabs");
-    let mut ctx_buf = DeviceBuf::zeroed(h * vh * 4).expect("alloc ctx");
+    let q_buf = dev_bytes(&f32_bytes(&q));
+    let clat_buf = dev_bytes(&f32_bytes(&clat));
+    let mut qabs_buf = dev_zeroed(h * kvl * 4);
+    let mut ctx_buf = dev_zeroed(h * vh * 4);
 
     // SAFETY: device pointers valid for the dims; outputs outlive the sync.
     unsafe {
@@ -612,9 +626,9 @@ fn rmsnorm_matches_scalar() {
     let mut want = x.clone();
     rivoli::math::rmsnorm(&mut want, &w, 1e-5);
 
-    let x_buf = DeviceBuf::from_bytes(&f32_bytes(&x)).expect("place x");
-    let w_buf = DeviceBuf::from_bytes(&f32_bytes(&w)).expect("place w");
-    let mut y_buf = DeviceBuf::zeroed(n * 4).expect("alloc y");
+    let x_buf = dev_bytes(&f32_bytes(&x));
+    let w_buf = dev_bytes(&f32_bytes(&w));
+    let mut y_buf = dev_zeroed(n * 4);
     // SAFETY: device pointers valid for n; y outlives the sync.
     unsafe {
         launch_rmsnorm(
@@ -650,7 +664,7 @@ fn rope_matches_scalar() {
         rivoli::attn::rope_interleave(&mut want[off..off + seg], pos, theta);
     }
 
-    let mut q_buf = DeviceBuf::from_bytes(&f32_bytes(&q)).expect("place q");
+    let mut q_buf = dev_bytes(&f32_bytes(&q));
     // base points at the first head's rope segment; stride qh strides heads.
     // SAFETY: base+count*stride within the h*qh buffer; outlives the sync.
     unsafe {

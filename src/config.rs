@@ -9,9 +9,10 @@ use std::fmt;
 /// Reserved for the OS and other on-system processes, bytes.
 pub const OS_RESERVE: u64 = 16 << 30;
 
-/// Foreign GTT usage above this means another GPU tenant is active → refuse
-/// to start (a foreign allocation landing mid-run is the proven wedge path).
-pub const SOLE_TENANT_MAX_GTT: u64 = 1 << 30;
+/// Upper bound on the device expert pool (tier + routed slab), bytes. Fill most
+/// of device memory but cap here so scratch/KV keep headroom; the pool is online
+/// priming, so a bigger cap only captures more of this run's working set.
+pub const MAX_POOL: u64 = 80 << 30;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -51,13 +52,6 @@ pub struct Config {
     /// router score). The NVMe is bandwidth-bound, so only the ~idle-during-compute
     /// window is exploitable — a small N (default 2). Ignored unless `prefetch`.
     pub prefetch_depth: usize,
-    /// Total budget for expert residency (pin + slab pool), bytes:
-    /// MemAvailable − OS_RESERVE − engine overhead (refined at snapshot load).
-    pub mem_budget: u64,
-    /// Free unified/GTT memory observed at startup, bytes. The device tier is
-    /// carved from this in one allocation (stability ladder may cap it from
-    /// observed device-loss data — never from configuration).
-    pub gtt_free: u64,
     /// Feed pool (tokio workers + pread tasks). Physical cores ÷ 2 — the
     /// measured optimum; the SMT-logical default is the proven pathology
     /// (0.35 vs 0.86 tok/s). The CPU never computes experts — it routes,
@@ -79,20 +73,6 @@ fn mem_available() -> Result<u64> {
         }
     }
     bail!("MemAvailable not found in /proc/meminfo")
-}
-
-/// (total, used) GTT bytes from the amdgpu sysfs node, if present.
-fn gtt_info() -> Option<(u64, u64)> {
-    let read = |name: &str| -> Option<u64> {
-        for card in ["card0", "card1"] {
-            let p = format!("/sys/class/drm/{card}/device/{name}");
-            if let Ok(s) = std::fs::read_to_string(&p) {
-                return s.trim().parse().ok();
-            }
-        }
-        None
-    };
-    Some((read("mem_info_gtt_total")?, read("mem_info_gtt_used")?))
 }
 
 impl Config {
@@ -120,14 +100,9 @@ impl Config {
                 OS_RESERVE as f64 / 1e9
             );
         }
-        let (gtt_total, gtt_used) = gtt_info().unwrap_or((0, 0));
-        if gtt_used > SOLE_TENANT_MAX_GTT {
-            bail!(
-                "another GPU tenant holds {:.1} GB of GTT — refusing to start \
-                 (sole tenancy required; free the GPU and retry)",
-                gtt_used as f64 / 1e9
-            );
-        }
+        // Sole-tenant enforcement lives in `device::DeviceTier::new` (the single
+        // owner of the GTT guard) — it reads the whole-device counter right before
+        // the one big allocation, closer to the failure it prevents.
         // Prefetch + --direct-vmm-dma are SOUND together: the pin floors the pool at
         // `top_k + prefetch_depth`, so prefetch's evictions are provably disjoint from
         // the current layer's live experts — the async DMA into VMM (direct mode)
@@ -147,8 +122,6 @@ impl Config {
             cache_policy,
             prefetch,
             prefetch_depth,
-            mem_budget: avail - OS_RESERVE,
-            gtt_free: gtt_total.saturating_sub(gtt_used),
             threads,
         })
     }
@@ -159,7 +132,7 @@ impl fmt::Display for Config {
         const GIB: f64 = (1u64 << 30) as f64;
         write!(
             f,
-            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} cache_policy={} prefetch={} prefetch_depth={} trace={:?} prompt={:?} mem_budget={:.1}GiB gtt_free={:.1}GiB os_reserve={:.0}GiB threads={}",
+            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} cache_policy={} prefetch={} prefetch_depth={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_pool={:.0}GiB threads={}",
             self.snapshot,
             self.bench,
             self.pre_seed,
@@ -169,9 +142,8 @@ impl fmt::Display for Config {
             self.prefetch_depth,
             self.trace,
             self.prompt,
-            self.mem_budget as f64 / GIB,
-            self.gtt_free as f64 / GIB,
             OS_RESERVE as f64 / GIB,
+            MAX_POOL as f64 / GIB,
             self.threads
         )
     }

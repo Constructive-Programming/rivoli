@@ -4,12 +4,12 @@
 //! once — folding the old mmap-warm + memcpy-fetch into one overlapped stream.
 //!
 //! Two destination modes (chosen at `Streamer::new`, `queue`'s `dst` is the VMM
-//! slot either way): DIRECT DMAs the read straight into VMM (fast path, default);
-//! BOUNCE (`--skip-vmm-dma`) reads into a pinned host arena then `hipMemcpy`s into
-//! VMM. Bounce is a WORKAROUND for an amdgpu kernel bug (6.18.38-gentoo, 2026-07-
-//! 17) that EFAULTs on io_uring/O_DIRECT DMA into VMM device memory (can't
-//! `get_user_pages` those pages; regression vs ≤6.18.35-r1). Revert path + repro
-//! in `kernels/stream.hip`.
+//! slot either way): BOUNCE (the default) reads into a pinned host arena then
+//! `hipMemcpy`s into VMM; DIRECT (`--direct-vmm-dma`) DMAs the read straight into
+//! VMM. Bounce is the default AND a WORKAROUND for an amdgpu kernel bug (6.18.38-
+//! gentoo, 2026-07-17) that EFAULTs on io_uring/O_DIRECT DMA into VMM device
+//! memory (can't `get_user_pages` those pages; regression vs ≤6.18.35-r1). Revert
+//! path + repro in `kernels/stream.hip`.
 //!
 //! Thin Rust owner over `kernels/stream.hip`'s liburing ring: this side does the
 //! O_DIRECT alignment math (block-aligned offset/length/buffer) and owns the fds
@@ -68,8 +68,9 @@ fn min_completion(begin: usize, len: usize) -> u64 {
 pub struct Streamer {
     ring: *mut c_void,
     queued: u32,
-    /// Bounce mode (`--skip-vmm-dma`): reads land in a pinned host arena and are
-    /// `hipMemcpy`d into VMM. False = DMA straight into the VMM slot (fast path).
+    /// Bounce mode (the default): reads land in a pinned host arena and are
+    /// `hipMemcpy`d into VMM. False (`--direct-vmm-dma`) = DMA straight into the
+    /// VMM slot.
     bounce: bool,
     /// Per-read pinned-bounce stride (bounce mode only): the largest aligned
     /// superset any single read may deliver. A `queue` whose superset exceeds this
@@ -84,9 +85,10 @@ pub struct Streamer {
 impl Streamer {
     /// `entries` = max in-flight reads; `span` = the largest aligned superset a
     /// single read may deliver (`slot_span` of the biggest projection tensor).
-    /// `bounce` selects the destination path: true (`--skip-vmm-dma`) reads into an
+    /// `bounce` selects the destination path: true (the default) reads into an
     /// `entries * span` pinned host arena then `hipMemcpy`s into VMM (kernel-bug
-    /// workaround); false DMAs straight into the VMM slot (no arena allocated).
+    /// workaround); false (`--direct-vmm-dma`) DMAs straight into the VMM slot (no
+    /// arena allocated).
     pub fn new(entries: u32, span: usize, bounce: bool) -> Result<Self> {
         let ring = unsafe { ffi::rivoli_ring_new(entries, span as u32, i32::from(bounce)) };
         ensure!(

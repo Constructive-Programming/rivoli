@@ -83,6 +83,11 @@ pub fn softmax(v: &mut [f32]) {
 /// deterministic tiebreak. `k` is clamped to `scores.len()`. Partitions with
 /// `select_nth_unstable` (≈O(n)) and sorts only the `k` selected, instead of a
 /// full O(n log n) sort of all n — on the per-token MoE path n=256, k=8.
+///
+/// Test-only: production routes through [`topk_into`] (zero per-call allocation);
+/// this Vec-returning form survives only as an ergonomic oracle for unit tests
+/// (here and in `moe.rs`).
+#[cfg(test)]
 pub fn topk(scores: &[f32], k: usize) -> Vec<usize> {
     let mut out = Vec::new();
     topk_into(scores, k, &mut out);

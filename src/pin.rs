@@ -79,6 +79,10 @@ pub struct LayerPin {
 pub struct Pin<'a> {
     snap: &'a Snapshot,
     cfg: &'a ModelConfig,
+    /// The resident weight slab. Never read through after `build` — held purely as
+    /// the RAII owner of the VMM allocation that `embed`/`lm_head`/`final_norm`/
+    /// `layers`/`moe_bias` point into; its `Drop` frees the slab at run end.
+    #[allow(dead_code)]
     tier: DeviceTier,
     pub embed: Weight8,
     pub lm_head: Weight8,
@@ -267,6 +271,10 @@ fn expert_key(layer: usize, expert: usize) -> u32 {
 struct Pool {
     policy: Box<dyn cache::Cache>,
     slot_of: std::collections::HashMap<u32, usize>,
+    /// Reverse slot→key map, used ONLY to feed the stale-slot `debug_assert_eq!` in
+    /// `get`. It carries no release-build behaviour, so the field, its writes, and
+    /// the assertion all compile out in release.
+    #[cfg(debug_assertions)]
     key_of: Vec<Option<u32>>,
     off: Vec<[usize; 6]>, // [gate_p, gate_s, up_p, up_s, down_p, down_s]
     free: Vec<usize>,
@@ -278,6 +286,7 @@ impl Pool {
             policy: cache::make(policy, n)
                 .with_context(|| format!("unknown --cache-policy {policy:?} (lru|2q|arc)"))?,
             slot_of: std::collections::HashMap::with_capacity(n),
+            #[cfg(debug_assertions)]
             key_of: vec![None; n],
             off: vec![[0; 6]; n],
             free: (0..n).rev().collect(), // pop() hands out 0,1,2,...
@@ -290,6 +299,7 @@ impl Pool {
             let slot = self.slot_of[&key];
             // The slot must actually hold THIS key's streamed data (else a hit reads
             // a different expert's weights — stale-data corruption).
+            #[cfg(debug_assertions)]
             debug_assert_eq!(self.key_of[slot], Some(key), "hit slot holds wrong key");
             Some(slot)
         } else {
@@ -345,7 +355,10 @@ impl Pool {
     }
 
     fn bind(&mut self, key: u32, slot: usize) {
-        self.key_of[slot] = Some(key);
+        #[cfg(debug_assertions)]
+        {
+            self.key_of[slot] = Some(key);
+        }
         self.slot_of.insert(key, slot);
         // The just-inserted key must be resident, and slot_of must mirror residency.
         debug_assert!(self.policy.contains(key), "inserted key {key} not resident");
@@ -570,11 +583,6 @@ impl<'a> Pin<'a> {
         })
     }
 
-    /// Device bytes used by the resident set.
-    pub fn used(&self) -> usize {
-        self.tier.used()
-    }
-
     /// Host router correction bias for a MoE `layer` (len n_experts).
     pub fn moe_bias(&self, layer: usize) -> &[f32] {
         &self.moe_bias[layer - self.cfg.dense_layers]
@@ -583,9 +591,18 @@ impl<'a> Pin<'a> {
     /// Resolve a MoE layer's `sel` routed experts to `Mlp` descriptors via the
     /// adaptive LRU: a hit returns its resident slot's pointers (no I/O); a miss
     /// evicts the coldest slot and streams the expert in. All of the layer's misses
-    /// submit as ONE queue-depth io_uring O_DIRECT batch, joined once.
-    pub fn resolve_layer(&mut self, layer: usize, sel: &[usize]) -> Result<Vec<Mlp>> {
+    /// submit as ONE queue-depth io_uring O_DIRECT batch, joined once. Fills the
+    /// caller-owned `out` (cleared first, reused across tokens) so the decode hot
+    /// path allocates nothing here on the all-hits steady state.
+    pub fn resolve_layer(&mut self, layer: usize, sel: &[usize], out: &mut Vec<Mlp>) -> Result<()> {
         let (cfg, snap) = (self.cfg, self.snap);
+        // `sel` is one layer's routed pick (top_k + shared); a fixed slot scratch
+        // avoids a per-layer alloc, mirroring `cache::access_batch`'s 32-wide buffer.
+        ensure!(
+            sel.len() <= 32,
+            "resolve_layer: {} experts exceeds the 32-slot scratch",
+            sel.len()
+        );
         // Cross-layer prefetch consume: an outstanding prefetch batch (submitted
         // during the PREVIOUS layer's compute) targets THIS layer. Wait for its reads
         // + bounce copy (+ device sync inside `drain`), so every predicted-correct
@@ -620,14 +637,11 @@ impl<'a> Pin<'a> {
         // cannot evict a same-layer would-be hit out from under itself (which would
         // force a needless re-stream and understate the hit rate). `None` marks a
         // slot still to be filled in phase 1b.
-        let mut slots: Vec<Option<usize>> = Vec::with_capacity(sel.len());
-        for &e in sel {
-            match self.pool.get(expert_key(layer, e)) {
-                Some(slot) => {
-                    self.hits += 1;
-                    slots.push(Some(slot));
-                }
-                None => slots.push(None),
+        let mut slots: [Option<usize>; 32] = [None; 32];
+        for (i, &e) in sel.iter().enumerate() {
+            if let Some(slot) = self.pool.get(expert_key(layer, e)) {
+                self.hits += 1;
+                slots[i] = Some(slot);
             }
         }
         // Phase 1b: allocate + QUEUE the misses, now that all hits are protected.
@@ -652,8 +666,8 @@ impl<'a> Pin<'a> {
         let (down_o, down_i) = (cfg.hidden, cfg.moe_inter);
         let slab = self.lru_pool.ptr();
         let es = self.expert_slot;
-        let mut out = Vec::with_capacity(sel.len());
-        for &slot in &slots {
+        out.clear();
+        for &slot in &slots[..sel.len()] {
             // Every entry was filled in phase 1a/1b; a `None` here is an internal
             // invariant break, not a data condition — fail loud rather than panic.
             let slot = slot.context("resolve_layer: unresolved expert slot")?;
@@ -672,7 +686,7 @@ impl<'a> Pin<'a> {
                 down: w(o[4], o[5], down_o, down_i),
             });
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Is cross-layer prefetch enabled (`--prefetch`)?
