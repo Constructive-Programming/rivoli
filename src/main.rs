@@ -16,7 +16,8 @@ use tracing::info;
 /// diverse, request-like inputs can be traced.
 /// DEFAULTS are the validated winning config: `--cache-policy arc` + prefetch on.
 /// `--no-prefetch` and `--cache-policy lru|2q` opt out (for A/B benching). Prefetch
-/// is auto-disabled under `--direct-vmm-dma` (unsound together; see config.rs).
+/// composes with `--direct-vmm-dma` (sound via the pool's disjointness floor — see
+/// Pin::build's slot_floor + prefetch_layer's correctness note).
 struct Args {
     snapshot: String,
     bench: Option<usize>,

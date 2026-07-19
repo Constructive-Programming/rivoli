@@ -470,7 +470,18 @@ impl<'a> Pin<'a> {
         // to the budget left after the always-resident set.
         let (_, expert_slot) = slot_geom(cfg);
         let budget = capacity.saturating_sub(tier_cap);
-        let n_slots = (budget / expert_slot).max(cfg.top_k);
+        // Floor the pool at `top_k + prefetch_depth` when prefetching: this makes
+        // cross-layer prefetch's evictions provably DISJOINT from the current layer's
+        // live experts. The current layer's `top_k` routed experts are the
+        // most-recently-touched (MRU / protected) after `resolve_layer`; `alloc_cold`
+        // evicts the LRU. With this many slots, the `prefetch_depth` cold evictions
+        // can never reach those MRU experts — so the prefetch DMA (whenever it lands:
+        // async in direct mode, or at the drain memcpy in bounce mode) writes slots
+        // the running MoE never reads. Disjoint memory ⇒ safe concurrency with NO
+        // ordering barrier, in BOTH modes. (In practice n_slots ≫ this; the floor
+        // just makes the invariant explicit and rejects a degenerate tiny tier.)
+        let slot_floor = cfg.top_k + if prefetch { prefetch_depth } else { 0 };
+        let n_slots = (budget / expert_slot).max(slot_floor);
         let mut lru_pool = VmmBuf::new(n_slots * expert_slot)?; // ONE slab
         tracing::info!(
             "routed pool [{cache_policy}]: {n_slots} slots ({:.1} GiB) + {:.1} GiB always-resident",
@@ -682,10 +693,15 @@ impl<'a> Pin<'a> {
     /// `resolve_layer(layer)`. Call this AFTER the current layer's own `resolve_layer`
     /// drain (main ring quiescent) and BEFORE its `launch_moe`.
     ///
-    /// Correctness: `alloc_cold` may evict a resident slot, but the prefetch reads
-    /// only physically land in the reused slot at DRAIN time (next `resolve_layer`,
-    /// after this layer's end-of-layer `device_sync`), so a slot the current layer's
-    /// in-flight MoE still reads is never overwritten under it.
+    /// Correctness (BOTH bounce and direct-DMA modes): `alloc_cold` evicts only the
+    /// LRU, and the current layer's `top_k` experts are the most-recently-touched
+    /// (MRU / protected) after its `resolve_layer`. With `n_slots >= top_k +
+    /// prefetch_depth` (enforced in `build`), the `prefetch_depth` cold evictions here
+    /// can NEVER reuse a slot in the current layer's live descriptor set. So the
+    /// prefetch reads target slots DISJOINT from what the running MoE reads — whether
+    /// they land async (direct DMA into VMM) or at the drain-time memcpy (bounce),
+    /// they never overwrite live data. The matching `resolve_layer(layer)` drains the
+    /// ring before use, so the data is present before L+1's MoE reads it.
     pub fn prefetch_layer(&mut self, layer: usize, pred: &[usize]) -> Result<()> {
         if self.prefetch_stream.is_none() {
             return Ok(());
