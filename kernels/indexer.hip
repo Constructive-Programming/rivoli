@@ -13,6 +13,9 @@
 
 #define WAVE 32
 #define ROWS_PER_BLOCK 8
+// MISA router block size (pooled tokens per key). MUST match
+// crate::indexer::MISA_BLOCK — the running-mean pool the router scores over.
+#define MISA_BLOCK 1024
 
 __device__ __forceinline__ float bf16f(unsigned short b) {
     unsigned int u = ((unsigned int)b) << 16;
@@ -170,4 +173,82 @@ extern "C" int rivoli_index_score(
                        q, w, kcache, heads, nt, nh, nact, hd, wscale, dscale, scores);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
+}
+
+// MISA block pool (device port of src/indexer.rs::pool_push). Fold token `t`'s
+// indexer key `k` (hd f32) into its block's running mean: block b = t/MISA_BLOCK
+// covers tokens [b·B, (b+1)·B); in_block = t%MISA_BLOCK. in_block==0 opens the
+// block verbatim, else folds with weight 1/(in_block+1) — yielding the exact
+// arithmetic mean of the block's keys. Maintained EVERY token (like the append),
+// from the SAME roped key that lands in the key cache. pool holds ⌈(t+1)/B⌉ rows
+// of hd f32.
+extern "C" __global__ void index_pool_push(
+    const float* __restrict__ k, float* __restrict__ pool, int t, int hd) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= hd) return;
+    int in_block = t % MISA_BLOCK;
+    float* m = pool + (size_t)(t / MISA_BLOCK) * hd;
+    if (in_block == 0) {
+        m[i] = k[i];
+    } else {
+        m[i] += (k[i] - m[i]) / (float)(in_block + 1);
+    }
+}
+
+// MISA head router (paper arXiv 2605.07363 Eq. 7-8; device port of the scalar
+// router in src/indexer.rs::select). One block per head j (grid = nh):
+//   e[j] = (1/m_blocks) · Σ_{b<m_blocks} |w[j] · ReLU(Σ_i q[j·hd+i]·pool[b·hd+i])|
+// The block reduces each hd-dim dot in LDS, thread 0 accumulates the per-block
+// |w·ReLU(dot)| term. Matches the scalar `(w[j]·dot.max(0)).abs()` sum exactly —
+// no wscale/dscale in the router (raw ranking). q/w/pool/e all f32.
+extern "C" __global__ void index_head_route(
+    const float* __restrict__ q, const float* __restrict__ w,
+    const float* __restrict__ pool, int m_blocks, int nh, int hd,
+    float* __restrict__ e) {
+    __shared__ float red[256];
+    int j = blockIdx.x;
+    if (j >= nh) return;
+    int tid = threadIdx.x;
+    const float* qj = q + (size_t)j * hd;
+    float wj = w[j];
+    float sum = 0.0f;
+    for (int b = 0; b < m_blocks; ++b) {
+        const float* kb = pool + (size_t)b * hd;
+        float p = 0.0f;
+        for (int i = tid; i < hd; i += blockDim.x) p += qj[i] * kb[i];
+        red[tid] = p;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) sum += fabsf(wj * fmaxf(red[0], 0.0f));
+        __syncthreads();
+    }
+    if (tid == 0) e[j] = sum / (float)(m_blocks > 0 ? m_blocks : 1);
+}
+
+extern "C" int rivoli_index_pool_push(
+    const float* k, float* pool, int t, int hd) {
+    if (hd <= 0 || t < 0) return 1001;
+    hipGetLastError();
+    hipLaunchKernelGGL(index_pool_push, dim3((hd + 255) / 256), dim3(256), 0, 0,
+                       k, pool, t, hd);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+extern "C" int rivoli_index_head_route(
+    const float* q, const float* w, const float* pool,
+    int m_blocks, int nh, int hd, float* e) {
+    if (m_blocks <= 0 || nh <= 0 || hd <= 0) return 1001;
+    // block = next pow2 ≥ hd (the LDS reduction assumes it), capped at red[256].
+    int bd = 1;
+    while (bd < hd) bd <<= 1;
+    if (bd > 256) bd = 256;
+    hipGetLastError();
+    hipLaunchKernelGGL(index_head_route, dim3(nh), dim3(bd), 0, 0,
+                       q, w, pool, m_blocks, nh, hd, e);
+    hipError_t err = hipGetLastError();
+    return err == hipSuccess ? 0 : -(int)err;
 }

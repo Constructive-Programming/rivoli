@@ -35,8 +35,8 @@ fn dev_zeroed(len: usize) -> DeviceBuf {
 }
 use rivoli::hip::{
     ExpertDesc, device_sync, launch_attend, launch_gemv_bf16, launch_gemv_f32, launch_gemv_i4,
-    launch_gemv_i8, launch_index_score, launch_layernorm, launch_mla_absorb, launch_mla_value,
-    launch_moe, launch_rmsnorm, launch_rope,
+    launch_gemv_i8, launch_index_head_route, launch_index_pool_push, launch_index_score,
+    launch_layernorm, launch_mla_absorb, launch_mla_value, launch_moe, launch_rmsnorm, launch_rope,
 };
 use rivoli::math::{bf16_to_f32, f32_to_bf16, silu, softmax};
 use rivoli::quant::{addrow, matvec_f32_bytes, matvec_i4, matvec_i4_rows, matvec_i8, row_bytes};
@@ -922,5 +922,116 @@ fn index_score_matches_scalar() {
         &want,
         &f32_vec(&sc_buf.copy_out().expect("out")),
         "index_score",
+    );
+}
+
+/// MISA_BLOCK, mirrored from src/indexer.rs (and the `#define` in indexer.hip).
+const MISA_BLOCK: usize = 1024;
+
+/// Host reference for the MISA block pool — the exact 5-line running mean from
+/// src/indexer.rs::pool_push, but resizing a flat buffer (the device kernel
+/// writes into a pre-sized slab, so opening a block just fills its row).
+fn pool_push_ref(pool: &mut Vec<f32>, k: &[f32], t: usize, hd: usize) {
+    let b = t / MISA_BLOCK;
+    let in_block = t % MISA_BLOCK;
+    if pool.len() < (b + 1) * hd {
+        pool.resize((b + 1) * hd, 0.0);
+    }
+    let m = &mut pool[b * hd..(b + 1) * hd];
+    if in_block == 0 {
+        m.copy_from_slice(k);
+    } else {
+        let inv = 1.0 / (in_block + 1) as f32;
+        for (mi, &ki) in m.iter_mut().zip(k) {
+            *mi += (ki - *mi) * inv;
+        }
+    }
+}
+
+/// index_pool_push: the block-pooled running-mean key pool. Drives a sequence of
+/// tokens (a partial block 0, then across the block boundary into block 1)
+/// through the kernel and the scalar reference, asserting the pool matches. Each
+/// token's key uses a fresh device buffer (kept alive) so the in-place folds on
+/// the null stream serialize against distinct inputs.
+#[test]
+fn index_pool_push_matches_scalar() {
+    let mut rng = Lcg(0x5115_a001);
+    let hd = 128usize; // index_head_dim
+    // Two blocks' worth of rows (block 0 + block 1). The kernel writes row
+    // t/MISA_BLOCK, so a 2-block slab covers t up to 2·MISA_BLOCK-1.
+    let mut pool_buf = dev_zeroed(2 * hd * 4);
+    let mut want: Vec<f32> = Vec::new();
+    // Token stream: 6 in block 0, then the block-1 open + two folds.
+    let tokens: [usize; 9] = [0, 1, 2, 3, 4, 5, MISA_BLOCK, MISA_BLOCK + 1, MISA_BLOCK + 2];
+    let mut keep: Vec<DeviceBuf> = Vec::new(); // hold key buffers alive across launches
+    for &t in &tokens {
+        let k: Vec<f32> = (0..hd).map(|_| rng.f()).collect();
+        pool_push_ref(&mut want, &k, t, hd);
+        let k_buf = dev_bytes(&f32_bytes(&k));
+        // SAFETY: k_buf/pool_buf sized hd / 2·hd·f32; row t/MISA_BLOCK in range.
+        unsafe {
+            launch_index_pool_push(
+                k_buf.ptr() as *const f32,
+                pool_buf.ptr_mut() as *mut f32,
+                t,
+                hd,
+            )
+            .expect("index_pool_push");
+        }
+        keep.push(k_buf);
+    }
+    device_sync().expect("sync");
+    // want only spans 2·hd (block 0 + block 1); the slab is exactly that.
+    assert_eq!(want.len(), 2 * hd);
+    let got = f32_vec(&pool_buf.copy_out().expect("out"));
+    assert_close(&want, &got, "index_pool_push");
+}
+
+/// index_head_route: E_j = mean_b |w[j]·ReLU(q_j·pool_b)| — the MISA router
+/// (paper Eq. 7-8). Reference mirrors the scalar `(w[j]·dot.max(0)).abs()` mean
+/// form exactly (relu before abs, w inside abs, no wscale/dscale).
+#[test]
+fn index_head_route_matches_scalar() {
+    let mut rng = Lcg(0x1100_1e00);
+    let (nh, hd, m_blocks) = (32usize, 128usize, 5usize); // GLM indexer dims, 5 pooled blocks
+    let q: Vec<f32> = (0..nh * hd).map(|_| rng.f()).collect();
+    let w: Vec<f32> = (0..nh).map(|_| rng.f()).collect();
+    let pool: Vec<f32> = (0..m_blocks * hd).map(|_| rng.f()).collect();
+    let want: Vec<f32> = (0..nh)
+        .map(|j| {
+            let qj = &q[j * hd..(j + 1) * hd];
+            let wj = w[j];
+            let sum: f32 = (0..m_blocks)
+                .map(|b| {
+                    let kb = &pool[b * hd..(b + 1) * hd];
+                    let dot: f32 = qj.iter().zip(kb).map(|(&a, &c)| a * c).sum();
+                    (wj * dot.max(0.0)).abs()
+                })
+                .sum();
+            sum / m_blocks as f32
+        })
+        .collect();
+    let q_buf = dev_bytes(&f32_bytes(&q));
+    let w_buf = dev_bytes(&f32_bytes(&w));
+    let pool_buf = dev_bytes(&f32_bytes(&pool));
+    let mut e_buf = dev_zeroed(nh * 4);
+    // SAFETY: device pointers sized nh·hd / nh / m_blocks·hd / nh.
+    unsafe {
+        launch_index_head_route(
+            q_buf.ptr() as *const f32,
+            w_buf.ptr() as *const f32,
+            pool_buf.ptr() as *const f32,
+            m_blocks,
+            nh,
+            hd,
+            e_buf.ptr_mut() as *mut f32,
+        )
+        .expect("index_head_route");
+    }
+    device_sync().expect("sync");
+    assert_close(
+        &want,
+        &f32_vec(&e_buf.copy_out().expect("out")),
+        "index_head_route",
     );
 }

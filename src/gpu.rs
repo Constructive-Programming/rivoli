@@ -14,8 +14,9 @@ use crate::device::DeviceBuf;
 use crate::hip::{
     ExpertDesc, device_sync, launch_append_kv, launch_argmax, launch_attend, launch_embed_i8_row,
     launch_gather_rope, launch_gemv_bf16, launch_gemv_f32, launch_gemv_i4, launch_gemv_i8,
-    launch_index_append, launch_index_score, launch_layernorm, launch_mla_absorb, launch_mla_value,
-    launch_moe, launch_rmsnorm, launch_rope, launch_vadd,
+    launch_index_append, launch_index_head_route, launch_index_pool_push, launch_index_score,
+    launch_layernorm, launch_mla_absorb, launch_mla_value, launch_moe, launch_rmsnorm, launch_rope,
+    launch_vadd,
 };
 use crate::math::{sigmoid, topk_into};
 use crate::model::ModelConfig;
@@ -119,10 +120,13 @@ impl Profile {
     }
 }
 
-/// Device-side DSA indexer state (dsa mode only). Mirrors the scalar
+/// Device-side DSA/MISA indexer state (dsa or misa mode). Mirrors the scalar
 /// `Indexer` but everything is device-resident: per full layer a bf16 key slab
 /// grown in place, plus per-token scratch and the host top-k buffers (the
 /// selection's only host round-trip is the score D2H + top-k per full layer).
+/// MISA additionally maintains a per-full-layer block-pooled key pool and routes
+/// the top-`active_heads` indexer heads via a cheap device estimate (`e`), whose
+/// nh-float D2H picks the head set host-side (`head_sel`/`heads_u32`/`heads_buf`).
 struct DeviceIndexer {
     /// Per layer: `Some(slab_index)` for full layers, `None` for shared.
     slab_of: Vec<Option<usize>>,
@@ -141,13 +145,23 @@ struct DeviceIndexer {
     /// live in `rows_buf`.
     last_nr: usize,
     last_dense: bool,
+    // --- MISA head routing (empty/unused in dsa mode) ---
+    /// Per full layer, the block-pooled running-mean keys (⌈max_ctx/MISA_BLOCK⌉
+    /// rows of index_head_dim f32). Indexed by slab like `kc`. Empty for dsa.
+    pool: Vec<DeviceBuf>,
+    e: DeviceBuf,         // index_n_heads f32 — router estimates E_j
+    e_host: Vec<u8>,      // E_j D2H staging (nh f32)
+    e_f: Vec<f32>,        // E_j widened for host top-k
+    head_sel: Vec<usize>, // routed head indices (topk_into output)
+    heads_u32: Vec<u32>,  // head indices uploaded to `heads_buf`
+    heads_buf: DeviceBuf, // index_n_heads u32 — active head set for index_score
 }
 
 pub struct GpuEngine<'a> {
     pin: Pin<'a>,
     cfg: &'a ModelConfig,
-    /// Attention row-selection mode. Dense/Streaming/Dsa run on device; Misa
-    /// is rejected at construction (device head-router pending).
+    /// Attention row-selection mode. Dense/Streaming/Dsa/Misa all run on device
+    /// (Misa adds the block-pool head router over the resident DSA indexer).
     mode: AttnMode,
     /// Device copy of the selected rows — uploaded per token (streaming: once,
     /// layer-blind; dsa: per full layer). Shared by every layer's attend.
@@ -221,20 +235,36 @@ impl<'a> GpuEngine<'a> {
         ensure!(
             matches!(
                 mode,
-                AttnMode::Dense | AttnMode::Streaming { .. } | AttnMode::Dsa
+                AttnMode::Dense
+                    | AttnMode::Streaming { .. }
+                    | AttnMode::Dsa
+                    | AttnMode::Misa { .. }
             ),
-            "GPU engine does not implement {mode:?} yet (misa device head-router pending); \
-             dense, streaming, and dsa only"
+            "GPU engine does not implement {mode:?} yet; dense, streaming, dsa, and misa only"
         );
-        let idx = if matches!(mode, AttnMode::Dsa) {
+        // dsa and misa both need the resident indexer; misa additionally routes
+        // heads via the block pool (active_heads = Some(h)).
+        let active_heads = match mode {
+            AttnMode::Dsa => Some(None),
+            AttnMode::Misa { active_heads } => Some(Some(active_heads)),
+            _ => None,
+        };
+        let idx = if let Some(active_heads) = active_heads {
+            let misa = active_heads.is_some();
             let full = cfg.indexer_layout()?;
             let hd = cfg.index_head_dim;
+            let n_blocks = max_ctx.div_ceil(crate::indexer::MISA_BLOCK);
             let mut slab_of = vec![None; cfg.n_layers];
             let mut kc = Vec::new();
+            let mut pool = Vec::new();
             for (l, &is_full) in full.iter().enumerate() {
                 if is_full {
                     slab_of[l] = Some(kc.len());
                     kc.push(DeviceBuf::new(max_ctx * hd * 2)?);
+                    // Pool is misa-only; dsa leaves it empty (never indexed).
+                    if misa {
+                        pool.push(DeviceBuf::new(n_blocks * hd * 4)?);
+                    }
                 }
             }
             Some(DeviceIndexer {
@@ -250,6 +280,13 @@ impl<'a> GpuEngine<'a> {
                 rows: Vec::new(),
                 last_nr: 0,
                 last_dense: true,
+                pool,
+                e: DeviceBuf::new(cfg.index_n_heads * 4)?,
+                e_host: Vec::new(),
+                e_f: Vec::new(),
+                head_sel: Vec::new(),
+                heads_u32: Vec::new(),
+                heads_buf: DeviceBuf::new(cfg.index_n_heads * 4)?,
             })
         } else {
             None
@@ -339,14 +376,19 @@ impl<'a> GpuEngine<'a> {
         self.pin.prefetch_wait_ns as f64 / 1e6
     }
 
-    /// DSA row selection for one full/shared layer at `pos`, returning the
+    /// DSA/MISA row selection for one full/shared layer at `pos`, returning the
     /// attend row set `(rows_ptr, nr)` — null pointer = dense over `0..nr`.
     /// `xnp` is the layer input (post input_layernorm), `qrp` the main path's
     /// q-LoRA residual (both device pointers, valid until the next sync). Full
     /// layers append this token's indexer key, then score + host top-k when the
     /// cache exceeds index_topk (below that it's exactly dense); shared layers
-    /// reuse the nearest preceding full layer's selection (IndexShare). Syncs
-    /// once (the score D2H) on the scoring path only.
+    /// reuse the nearest preceding full layer's selection (IndexShare).
+    ///
+    /// In MISA mode (`self.mode == AttnMode::Misa { active_heads }`) each token
+    /// also folds its key into the block pool, and the scoring path first routes
+    /// the top-`active_heads` indexer heads (a device estimate + nh-float D2H)
+    /// and scores only those. DSA syncs once (the score D2H); MISA syncs twice on
+    /// the scoring path (the router E_j D2H, then the score D2H).
     fn dsa_select_layer(
         &mut self,
         l: usize,
@@ -362,6 +404,12 @@ impl<'a> GpuEngine<'a> {
         let theta = cfg.rope_theta();
         let topk = cfg.index_topk;
         let nt = pos + 1;
+        // MISA routes a head subset; DSA scores all heads. Read the mode before
+        // borrowing `self.idx` (usize is Copy — no move of self.mode).
+        let active_heads = match self.mode {
+            AttnMode::Misa { active_heads } => Some(active_heads),
+            _ => None,
+        };
         // Disjoint field borrows: idx (mut) and rows_buf (mut) are distinct fields.
         let idx = self
             .idx
@@ -385,12 +433,19 @@ impl<'a> GpuEngine<'a> {
         let iqp = idx.q.ptr_mut() as *mut f32;
         let iwp = idx.w.ptr_mut() as *mut f32;
         let scp = idx.scores.ptr_mut() as *mut f32;
+        // MISA-only: this full layer's block pool (aligned with `kc` by slab).
+        let poolp = if active_heads.is_some() {
+            idx.pool[slab].ptr_mut() as *mut f32
+        } else {
+            std::ptr::null_mut()
+        };
 
         // Key: wk·xn → LayerNorm(k_norm) → RoPE(first `rope` dims) → append. The
         // append runs EVERY token so the cache is ready when we cross the
-        // threshold, even while the selection is still dense.
-        // SAFETY: indexer weights are resident; scratch/kc are live device bufs;
-        // ordering is the null-stream program order; a sync precedes the D2H.
+        // threshold, even while the selection is still dense. MISA folds the same
+        // roped key into the block pool on every token, for the same reason.
+        // SAFETY: indexer weights are resident; scratch/kc/pool are live device
+        // bufs; ordering is the null-stream program order; a sync precedes the D2H.
         unsafe {
             launch_gemv_bf16(xnp, ip.wk, hd, cfg.hidden, kp)?;
             launch_layernorm(
@@ -403,6 +458,9 @@ impl<'a> GpuEngine<'a> {
             )?;
             launch_rope(kp, 1, rope, rope, pos, theta)?;
             launch_index_append(kp, kcp, pos, hd)?;
+            if active_heads.is_some() {
+                launch_index_pool_push(kp as *const f32, poolp, pos, hd)?;
+            }
         }
         if nt <= topk {
             idx.last_dense = true;
@@ -414,19 +472,56 @@ impl<'a> GpuEngine<'a> {
         // score every cached token and pick the top-k host-side.
         let wscale = 1.0 / (nh as f32).sqrt();
         let dscale = 1.0 / (hd as f32).sqrt();
-        // SAFETY: as above; iqp/iwp/scp are live scratch sized nh·hd / nh / max_ctx.
+        // SAFETY: as above; iqp/iwp are live scratch sized nh·hd / nh.
         unsafe {
             launch_gemv_bf16(qrp, ip.wq_b, nh * hd, cfg.q_lora_rank, iqp)?;
             launch_rope(iqp, nh, hd, rope, pos, theta)?; // per head: stride hd, seg rope
             launch_gemv_bf16(xnp, ip.weights_proj, nh, cfg.hidden, iwp)?;
+        }
+
+        // Active head set for the O(nt) token scan: all `nh` heads (DSA), or the
+        // MISA-routed top-h. The router (paper Eq. 7-8) estimates each head's
+        // contribution E_j = mean_b |w_j·ReLU(q_j·k̄_b)| from the block pool on
+        // device, then a tiny nh-float D2H drives the host top-k pick. `h >= nh`
+        // degenerates to "all heads" (the standard DSA path), so guard on h < nh.
+        let (heads_ptr, nact): (*const u32, usize) = match active_heads {
+            Some(h) if h < nh => {
+                let m_blocks = nt.div_ceil(crate::indexer::MISA_BLOCK);
+                let ppool = idx.pool[slab].ptr() as *const f32;
+                let ep = idx.e.ptr_mut() as *mut f32;
+                // SAFETY: iqp/iwp/ppool/ep are live device scratch sized nh·hd /
+                // nh / m_blocks·hd / nh; a sync precedes the E_j D2H below.
+                unsafe {
+                    launch_index_head_route(iqp, iwp, ppool, m_blocks, nh, hd, ep)?;
+                }
+                device_sync()?;
+                idx.e.copy_out_prefix(&mut idx.e_host, nh * 4)?;
+                idx.e_f.clear();
+                idx.e_f.extend(
+                    idx.e_host
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+                );
+                topk_into(&idx.e_f, h, &mut idx.head_sel);
+                idx.heads_u32.clear();
+                idx.heads_u32.extend(idx.head_sel.iter().map(|&i| i as u32));
+                idx.heads_buf.copy_in_at(0, u32_le_bytes(&idx.heads_u32))?;
+                (idx.heads_buf.ptr() as *const u32, idx.heads_u32.len())
+            }
+            _ => (std::ptr::null(), nh),
+        };
+
+        // SAFETY: iqp/iwp/kcp/scp are live scratch; heads_ptr is null (DSA) or
+        // the just-uploaded `nact`-entry head buffer (MISA).
+        unsafe {
             launch_index_score(
                 iqp,
                 iwp,
                 kcp as *const u16,
-                std::ptr::null(),
+                heads_ptr,
                 nt,
                 nh,
-                nh,
+                nact,
                 hd,
                 wscale,
                 dscale,

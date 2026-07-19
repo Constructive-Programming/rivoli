@@ -158,6 +158,16 @@ unsafe extern "C" {
         dscale: f32,
         scores: *mut f32,
     ) -> i32;
+    fn rivoli_index_pool_push(k: *const f32, pool: *mut f32, t: i32, hd: i32) -> i32;
+    fn rivoli_index_head_route(
+        q: *const f32,
+        w: *const f32,
+        pool: *const f32,
+        m_blocks: i32,
+        nh: i32,
+        hd: i32,
+        e: *mut f32,
+    ) -> i32;
 }
 
 /// Launch MLA flash attention over the resident KV cache: for each head, writes
@@ -813,6 +823,66 @@ pub unsafe fn launch_index_score(
     if r != 0 {
         let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
         bail!("launch_index_score failed ({kind}, code {r})");
+    }
+    Ok(())
+}
+
+/// Launch the MISA block-pool update: fold indexer key `k` (`hd` f32) into its
+/// running-mean block at token `t` (block `t / MISA_BLOCK`). Runs every token so
+/// the pool is ready when context crosses `index_topk`. Launch-only.
+///
+/// # Safety
+/// Async — `k` (`hd` f32) and `pool` (room for row `t / MISA_BLOCK`, `hd` f32)
+/// valid device pointers live until the next [`device_sync`] returns.
+#[cfg(feature = "rocm")]
+pub unsafe fn launch_index_pool_push(
+    k: *const f32,
+    pool: *mut f32,
+    t: usize,
+    hd: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        t <= i32::MAX as usize && hd <= i32::MAX as usize,
+        "index_pool_push dims exceed i32 (t={t} hd={hd})"
+    );
+    // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
+    let r = unsafe { rivoli_index_pool_push(k, pool, t as i32, hd as i32) };
+    if r != 0 {
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("launch_index_pool_push failed ({kind}, code {r})");
+    }
+    Ok(())
+}
+
+/// Launch the MISA head router: `e[j] = mean_b |w[j]·ReLU(q_j·pool_b)|` over the
+/// `m_blocks` pooled blocks and `nh` heads (paper Eq. 7-8; raw ranking, no
+/// wscale/dscale). The caller D2Hs `e` and picks the top-`active_heads` host-side.
+/// Launch-only.
+///
+/// # Safety
+/// Async — `q` (`nh·hd` f32), `w` (`nh` f32), `pool` (`m_blocks·hd` f32), and
+/// `e` (`nh` f32) valid device pointers live until the next join (the caller's
+/// D2H of `e`).
+#[cfg(feature = "rocm")]
+pub unsafe fn launch_index_head_route(
+    q: *const f32,
+    w: *const f32,
+    pool: *const f32,
+    m_blocks: usize,
+    nh: usize,
+    hd: usize,
+    e: *mut f32,
+) -> Result<()> {
+    anyhow::ensure!(
+        m_blocks <= i32::MAX as usize && nh <= i32::MAX as usize && hd <= i32::MAX as usize,
+        "index_head_route dims exceed i32 (m_blocks={m_blocks} nh={nh} hd={hd})"
+    );
+    // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
+    let r =
+        unsafe { rivoli_index_head_route(q, w, pool, m_blocks as i32, nh as i32, hd as i32, e) };
+    if r != 0 {
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("launch_index_head_route failed ({kind}, code {r})");
     }
     Ok(())
 }
