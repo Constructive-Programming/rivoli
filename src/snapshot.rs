@@ -13,6 +13,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use memmap2::Mmap;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fs::File;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
@@ -85,6 +86,20 @@ struct RawTensor {
     data_offsets: [usize; 2],
 }
 
+/// One header map entry: either a tensor spec or the optional `__metadata__`
+/// object (a flat string→string map per the safetensors spec). Untagged so the
+/// header parses in a SINGLE pass — each value is decoded straight into this
+/// (tensor first, metadata as the fallback), with no second `from_value` walk.
+/// A genuinely malformed tensor matches neither variant and still fails loudly.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum HeaderEntry {
+    Tensor(RawTensor),
+    // The value is validated as a string→string map (so a malformed TENSOR still
+    // matches neither variant and fails loudly) but never read — we only skip it.
+    Metadata(#[allow(dead_code)] HashMap<String, String>),
+}
+
 /// One shard's mmap + open file (mmap serves header/dims/warm; the file serves
 /// `pread` weight loads) plus the tensors located within it.
 struct IndexedShard {
@@ -125,16 +140,27 @@ impl Snapshot {
         let mut shards = Vec::with_capacity(paths.len());
         let mut files = Vec::with_capacity(paths.len());
         let mut odirect_fds = Vec::with_capacity(paths.len());
-        let mut index = HashMap::new();
+        let mut index: HashMap<String, TensorLoc> = HashMap::new();
 
         for (si, path) in paths.iter().enumerate() {
             let shard = Self::index_shard(path)
                 .with_context(|| format!("index shard {}", path.display()))?;
             for (name, loc) in shard.entries {
                 // A name appearing in two shards means a corrupt/misassembled
-                // snapshot — fail loudly rather than silently keep the last.
-                if let Some(prev) = index.insert(name.clone(), TensorLoc { shard: si, ..loc }) {
-                    bail!("tensor {name} present in shard {} and {si}", prev.shard);
+                // snapshot — fail loudly rather than silently keep the last. The
+                // entry API moves `name` in WITHOUT a clone; the loud named error
+                // recovers it from the occupied key on the rare collision.
+                match index.entry(name) {
+                    Entry::Occupied(e) => {
+                        bail!(
+                            "tensor {} present in shard {} and {si}",
+                            e.key(),
+                            e.get().shard
+                        );
+                    }
+                    Entry::Vacant(e) => {
+                        e.insert(TensorLoc { shard: si, ..loc });
+                    }
                 }
             }
             shards.push(shard.mmap);
@@ -185,17 +211,18 @@ impl Snapshot {
         let data_len = mmap.len() - data_start;
 
         // The header is a flat object of {name: RawTensor}, plus an optional
-        // "__metadata__" object we skip via serde's untagged tolerance below.
-        let raw: HashMap<String, serde_json::Value> = serde_json::from_slice(&mmap[8..data_start])
+        // "__metadata__" object. Deserialize each value ONCE into `HeaderEntry`
+        // (untagged: tensor, else the metadata map) — no separate `from_value`
+        // re-walk per tensor.
+        let raw: HashMap<String, HeaderEntry> = serde_json::from_slice(&mmap[8..data_start])
             .context("parse safetensors header json")?;
 
         let mut entries = Vec::with_capacity(raw.len());
-        for (name, val) in raw {
-            if name == "__metadata__" {
-                continue;
-            }
-            let t: RawTensor = serde_json::from_value(val)
-                .with_context(|| format!("tensor {name} header fields"))?;
+        for (name, entry) in raw {
+            let t = match entry {
+                HeaderEntry::Tensor(t) => t,
+                HeaderEntry::Metadata(_) => continue, // __metadata__ — not a tensor
+            };
             let [begin, end] = t.data_offsets;
             // Validate offsets before trusting them as slice bounds.
             if begin > end || end > data_len {
@@ -304,24 +331,23 @@ impl Snapshot {
     pub fn int4(&self, name: &str, i_dim: usize) -> Result<Int4Matrix<'_>> {
         let wname = format!("{name}.weight");
         let sname = format!("{name}.weight.qs");
-        let wdt = self
+        // One `index` probe per tensor: grab the loc, then read dtype AND bytes off it.
+        let wloc = self
             .index
             .get(&wname)
-            .with_context(|| format!("int4 weight {wname} not found"))?
-            .dtype;
-        let sdt = self
+            .with_context(|| format!("int4 weight {wname} not found"))?;
+        let sloc = self
             .index
             .get(&sname)
-            .with_context(|| format!("int4 scale {sname} not found"))?
-            .dtype;
-        if wdt != Dtype::U8 {
-            bail!("{wname} is {wdt:?}, expected U8 packed int4");
+            .with_context(|| format!("int4 scale {sname} not found"))?;
+        if wloc.dtype != Dtype::U8 {
+            bail!("{wname} is {:?}, expected U8 packed int4", wloc.dtype);
         }
-        if sdt != Dtype::F32 {
-            bail!("{sname} is {sdt:?}, expected F32 scale");
+        if sloc.dtype != Dtype::F32 {
+            bail!("{sname} is {:?}, expected F32 scale", sloc.dtype);
         }
-        let packed = self.require(&wname)?;
-        let scale = self.require(&sname)?;
+        let packed = self.loc_bytes(&wname, wloc)?;
+        let scale = self.loc_bytes(&sname, sloc)?;
         if !scale.len().is_multiple_of(4) {
             bail!("{sname}: {} scale bytes, not a multiple of 4", scale.len());
         }
@@ -352,24 +378,23 @@ impl Snapshot {
     pub fn int8(&self, name: &str, i_dim: usize) -> Result<Int8Matrix<'_>> {
         let wname = format!("{name}.weight");
         let sname = format!("{name}.weight.qs");
-        let wdt = self
+        // One `index` probe per tensor: grab the loc, then read dtype AND bytes off it.
+        let wloc = self
             .index
             .get(&wname)
-            .with_context(|| format!("int8 weight {wname} not found"))?
-            .dtype;
-        let sdt = self
+            .with_context(|| format!("int8 weight {wname} not found"))?;
+        let sloc = self
             .index
             .get(&sname)
-            .with_context(|| format!("int8 scale {sname} not found"))?
-            .dtype;
-        if wdt != Dtype::U8 {
-            bail!("{wname} is {wdt:?}, expected U8 int8");
+            .with_context(|| format!("int8 scale {sname} not found"))?;
+        if wloc.dtype != Dtype::U8 {
+            bail!("{wname} is {:?}, expected U8 int8", wloc.dtype);
         }
-        if sdt != Dtype::F32 {
-            bail!("{sname} is {sdt:?}, expected F32 scale");
+        if sloc.dtype != Dtype::F32 {
+            bail!("{sname} is {:?}, expected F32 scale", sloc.dtype);
         }
-        let packed = self.require(&wname)?;
-        let scale = self.require(&sname)?;
+        let packed = self.loc_bytes(&wname, wloc)?;
+        let scale = self.loc_bytes(&sname, sloc)?;
         if !scale.len().is_multiple_of(4) {
             bail!("{sname}: {} scale bytes, not a multiple of 4", scale.len());
         }
@@ -393,5 +418,15 @@ impl Snapshot {
     pub fn bytes(&self, name: &str) -> Option<&[u8]> {
         let loc = self.index.get(name)?;
         self.shards.get(loc.shard)?.get(loc.begin..loc.end)
+    }
+
+    /// Zero-copy bytes for an already-located tensor — avoids re-probing `index`
+    /// when the caller already holds the `TensorLoc` (the int4/int8 accessors grab
+    /// the loc once, then read dtype AND bytes from it).
+    fn loc_bytes(&self, name: &str, loc: &TensorLoc) -> Result<&[u8]> {
+        self.shards
+            .get(loc.shard)
+            .and_then(|m| m.get(loc.begin..loc.end))
+            .with_context(|| format!("tensor {name} bytes out of shard range"))
     }
 }
