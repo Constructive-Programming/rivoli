@@ -45,6 +45,19 @@ number**, not a vibe.
    the sparsity threshold" invariant). Gate: the milestone's tok/s / correctness
    number in `PLAN.md`.
 
+## Review before you pause — not after
+
+Whenever you're about to hand control back to the user — asking a question,
+hitting a checkpoint, or wrapping a chunk of code changes — **run the review
+first, then pause.** Never pause or ask with un-reviewed changes sitting in the
+working tree waiting on the user. The order is: make the changes → review them
+(and validate on the GPU if the change has a device surface) → address the
+findings → *then* pause/ask with a clean, reviewed state. A pause is a
+commitment that what you've written so far holds; earn it with the review, don't
+defer the review to after the user replies. (The numerical M0 review that caught
+`eh_proj` int4 destruction is why this rule exists — it ran before continuing,
+not after.)
+
 ## Deferred-optimization discipline
 
 The reference stays simple on purpose. When you see an optimization the oracle

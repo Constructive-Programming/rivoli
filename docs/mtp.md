@@ -13,8 +13,10 @@ GLM-5.2 ships **one** MTP layer at index `num_hidden_layers` = 78
 (MLA attention + 256 routed experts + shared expert + DSA indexer) plus the MTP
 glue:
 
-- `model.layers.78.enorm.weight` `[6144]` — RMSNorm on the previous hidden `h`.
-- `model.layers.78.hnorm.weight` `[6144]` — RMSNorm on the next token's embedding.
+- `model.layers.78.enorm.weight` `[6144]` — RMSNorm on the next token's
+  **embedding** (e = embedding).
+- `model.layers.78.hnorm.weight` `[6144]` — RMSNorm on the previous **hidden**
+  `h` (h = hidden).
 - `model.layers.78.eh_proj.weight` `[6144, 12288]` — Linear `2·hidden → hidden`,
   kept **bf16** (high dynamic range: mean|w|≈0.012, max≈1.5 → per-row int4 zeros
   ~all of it, 99% rel-err; validated during M0).
@@ -30,7 +32,7 @@ glue:
 given the main model's final hidden `h` (pre-lm_head, at the position that just
 produced token t+1) and the embedding of the just-emitted token t+1,
 ```
-h'  = eh_proj( concat[ rmsnorm(h, enorm) , rmsnorm(embed(t+1), hnorm) ] )   # [hidden]
+h'  = eh_proj( concat[ enorm(embed(t+1)) , hnorm(h) ] )   # [hidden]; e=embed, h=hidden
 h'' = mtp_layer_forward(h')     # input_layernorm→attn(reuse main top-k)→+res→post_norm→moe→+res
 logits_{t+2} = lm_head( rmsnorm(h'', shared_head.norm) )
 draft t+2 = argmax(logits_{t+2})

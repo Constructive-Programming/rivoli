@@ -79,7 +79,14 @@ impl KvCache {
     /// Strides come from the model config so they can't disagree with the
     /// weights the decode step reads. `fp8` selects the latent storage.
     pub fn new(cfg: &ModelConfig, fp8: bool) -> Self {
-        let n = cfg.n_layers;
+        Self::new_n(cfg.n_layers, cfg, fp8)
+    }
+
+    /// Like [`new`](Self::new) but sizes for `n_layers` layers — the MTP module
+    /// needs index `cfg.n_layers` (layer 78) for its own attention KV, one past
+    /// the main stack, so it constructs a cache with `cfg.n_layers + 1` layers.
+    pub fn new_n(n_layers: usize, cfg: &ModelConfig, fp8: bool) -> Self {
+        let n = n_layers;
         let lat = if fp8 {
             LatentStore::Fp8 {
                 data: vec![Vec::new(); n],

@@ -9,6 +9,7 @@ pub mod indexer;
 pub mod math;
 pub mod model;
 pub mod moe;
+pub mod mtp;
 pub mod pin;
 pub mod quant;
 pub mod snapshot;

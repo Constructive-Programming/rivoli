@@ -146,6 +146,21 @@ impl<'a> Engine<'a> {
         Ok(best as u32)
     }
 
+    /// The trunk hidden after the last main layer (residual pre `model.norm`) —
+    /// the MTP module's input `h`. Valid after [`forward`](Self::forward) /
+    /// [`step`](Self::step): the final norm writes `xn`, leaving `x` = the trunk.
+    pub fn trunk(&self) -> &[f32] {
+        &self.x
+    }
+
+    /// One reference forward step: run the pass for `token` at `pos` and return
+    /// the greedy next-token prediction. Exposes the step for MTP validation
+    /// (the trunk hidden is then readable via [`trunk`](Self::trunk)).
+    pub fn step(&mut self, token: u32, pos: usize) -> Result<u32> {
+        self.forward(token, pos)?;
+        self.argmax()
+    }
+
     /// Greedy-decode up to `ngen` tokens continuing `prompt_ids`, stopping early
     /// on any `eos` id. Returns the generated ids (the caller detokenizes).
     pub fn generate(&mut self, prompt_ids: &[u32], ngen: usize, eos: &[u32]) -> Result<Vec<u32>> {
