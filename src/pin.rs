@@ -26,15 +26,17 @@ use crate::usage::Usage;
 use anyhow::{Context, Result, ensure};
 use std::os::fd::RawFd;
 
-/// The six O_DIRECT reads that stream one routed expert into a pool slot, resolved
+/// The six cold reads that stream one routed expert into a pool slot, resolved
 /// ONCE at [`Pin::build`] so the per-miss path never re-derives them. Order is
 /// slot-layout order: gate packed, gate scale, up packed, up scale, down packed,
 /// down scale — the same order as [`Pin::slot_dst`], into which each read lands.
 ///
 /// - `reads[k]` = `(fd, file_begin, len)` from [`Snapshot::read_spec`] — a fixed
 ///   `(RawFd, offset, length)` for the whole run (the mmap'd shard never moves).
+///   The fd is O_DIRECT or buffered per `Pin::build`'s `direct_io`; the offset/len
+///   are identical either way, so the aligned superset read is mode-agnostic.
 /// - `off[k]` = the slot-relative offset where read `k`'s USEFUL bytes land
-///   (`slot_dst[k] + (file_begin & (ALIGN-1))`, the O_DIRECT sub-block padding).
+///   (`slot_dst[k] + (file_begin & (ALIGN-1))`, the block-aligned sub-block padding).
 ///   Precomputed so descriptor build is a pure index, not a re-computation.
 ///
 /// All cfg-dim cross-checks (packed/scale byte lengths vs the slot geometry) are
@@ -407,7 +409,9 @@ impl Pool {
 
 impl<'a> Pin<'a> {
     /// Build the resident set. `capacity` is the tier size (auto-discovered).
-    // Each arg is a distinct, independent input (snapshot/model/usage + four
+    /// `direct_io` selects the cold-read fd set for the `moe_table`: `true` =
+    /// O_DIRECT (page-cache bypass), `false` = buffered (through the OS page cache).
+    // Each arg is a distinct, independent input (snapshot/model/usage + the
     // runtime knobs); bundling them into a struct used at one call site is churn.
     #[allow(clippy::too_many_arguments)]
     pub fn build(
@@ -421,6 +425,7 @@ impl<'a> Pin<'a> {
         cache_policy: &str,
         prefetch: bool,
         prefetch_depth: usize,
+        direct_io: bool,
     ) -> Result<Self> {
         let (free, _total) = mem_info()?;
         ensure!(
@@ -521,7 +526,7 @@ impl<'a> Pin<'a> {
         // (fd, begin, len) reads + slot-relative useful-byte offsets, cfg-dim cross-
         // checked here. The miss/prefetch paths then just index + queue.
         let slot_dst = slot_dst_of(cfg);
-        let moe_table = build_moe_table(snap, cfg, &slot_dst)?;
+        let moe_table = build_moe_table(snap, cfg, &slot_dst, direct_io)?;
         let budget = capacity.saturating_sub(tier_cap);
         // Floor the pool at `top_k + prefetch_depth` when prefetching: this makes
         // cross-layer prefetch's evictions provably DISJOINT from the current layer's
@@ -860,6 +865,7 @@ fn build_moe_table(
     snap: &Snapshot,
     cfg: &ModelConfig,
     slot_dst: &[usize; 6],
+    direct_io: bool,
 ) -> Result<Vec<ExpertReads>> {
     // cfg-expected packed/scale byte lengths (the same budget the slot regions were
     // sized from). gate/up: [moe_inter, hidden]; down: [hidden, moe_inter].
@@ -883,7 +889,7 @@ fn build_moe_table(
             for (pi, &(proj, exp_p, exp_s)) in projs.iter().enumerate() {
                 let (kp, ks) = (pi * 2, pi * 2 + 1); // packed/scale slot indices
                 let (pfd, pb, plen) = snap
-                    .read_spec(&format!("{base}.{proj}.weight"))
+                    .read_spec(&format!("{base}.{proj}.weight"), direct_io)
                     .with_context(|| format!("read_spec {base}.{proj}.weight"))?;
                 ensure!(
                     plen == exp_p,
@@ -891,7 +897,7 @@ fn build_moe_table(
                      (config/snapshot dim mismatch)"
                 );
                 let (sfd, sb, slen) = snap
-                    .read_spec(&format!("{base}.{proj}.weight.qs"))
+                    .read_spec(&format!("{base}.{proj}.weight.qs"), direct_io)
                     .with_context(|| format!("read_spec {base}.{proj}.weight.qs"))?;
                 ensure!(
                     slen == exp_s,

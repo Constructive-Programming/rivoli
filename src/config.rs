@@ -57,6 +57,16 @@ pub struct Config {
     /// (0.35 vs 0.86 tok/s). The CPU never computes experts — it routes,
     /// samples, and keeps the GPU fed.
     pub threads: usize,
+    /// Upper bound on the device expert pool (tier + routed slab), bytes
+    /// (`--max-pool-size <GiB>`). Default [`MAX_POOL`]. `main` caps the resolved
+    /// pool budget at `min(free − OS_RESERVE, max_pool_size)`.
+    pub max_pool_size: u64,
+    /// Cold-expert read path (`--direct-io`). `true` = O_DIRECT (bypass the OS page
+    /// cache, DMA straight from NVMe), `false` (default) = buffered reads through the
+    /// page cache. Only selects which fd the io_uring cold reads use — the
+    /// queue/drain/bounce/`hipMemcpy` path is byte-identical either way, so decode is
+    /// bit-identical between modes; only the cache-vs-no-cache mechanism differs.
+    pub direct_io: bool,
 }
 
 fn mem_available() -> Result<u64> {
@@ -91,6 +101,8 @@ impl Config {
         cache_policy: String,
         prefetch: bool,
         prefetch_depth: usize,
+        max_pool_size: u64,
+        direct_io: bool,
     ) -> Result<Self> {
         let avail = mem_available()?;
         if avail <= OS_RESERVE {
@@ -123,6 +135,8 @@ impl Config {
             prefetch,
             prefetch_depth,
             threads,
+            max_pool_size,
+            direct_io,
         })
     }
 }
@@ -132,18 +146,19 @@ impl fmt::Display for Config {
         const GIB: f64 = (1u64 << 30) as f64;
         write!(
             f,
-            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} cache_policy={} prefetch={} prefetch_depth={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_pool={:.0}GiB threads={}",
+            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} direct_io={} cache_policy={} prefetch={} prefetch_depth={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_pool_size={:.0}GiB threads={}",
             self.snapshot,
             self.bench,
             self.pre_seed,
             self.direct_vmm_dma,
+            self.direct_io,
             self.cache_policy,
             self.prefetch,
             self.prefetch_depth,
             self.trace,
             self.prompt,
             OS_RESERVE as f64 / GIB,
-            MAX_POOL as f64 / GIB,
+            self.max_pool_size as f64 / GIB,
             self.threads
         )
     }

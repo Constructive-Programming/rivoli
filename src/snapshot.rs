@@ -182,12 +182,22 @@ impl Snapshot {
         })
     }
 
-    /// O_DIRECT read spec for a tensor: `(fd, file_begin, len)`. The fd + range the
+    /// Cold-read spec for a tensor: `(fd, file_begin, len)`. The fd + range the
     /// io_uring streamer submits (it does the block-alignment). `None` if missing.
-    pub fn read_spec(&self, name: &str) -> Option<(RawFd, usize, usize)> {
+    /// `direct` selects the fd set: `true` = the O_DIRECT fd (page-cache-bypassing
+    /// NVMe DMA), `false` = the buffered fd (reads through the OS page cache). Both
+    /// sets are index-parallel by shard, so the begin/len are identical either way —
+    /// only the fd differs. The aligned-superset read the streamer issues is harmless
+    /// on a buffered fd, and the page-aligned bounce arena satisfies O_DIRECT.
+    pub fn read_spec(&self, name: &str, direct: bool) -> Option<(RawFd, usize, usize)> {
         let loc = self.index.get(name)?;
+        let fds = if direct {
+            &self.odirect_fds
+        } else {
+            &self.files
+        };
         Some((
-            self.odirect_fds.get(loc.shard)?.as_raw_fd(),
+            fds.get(loc.shard)?.as_raw_fd(),
             loc.begin,
             loc.end - loc.begin,
         ))

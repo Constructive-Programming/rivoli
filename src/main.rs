@@ -18,6 +18,10 @@ use tracing::info;
 /// `--no-prefetch` and `--cache-policy lru|2q` opt out (for A/B benching). Prefetch
 /// composes with `--direct-vmm-dma` (sound via the pool's disjointness floor — see
 /// Pin::build's slot_floor + prefetch_layer's correctness note).
+/// `--max-pool-size <GiB>` overrides the default device-pool cap (config::MAX_POOL,
+/// 80 GiB); the resolved pool budget is `min(free − OS_RESERVE, max_pool_size)`.
+/// `--direct-io` makes the cold-expert reads use O_DIRECT (bypass the OS page
+/// cache); default is buffered reads through the page cache.
 struct Args {
     snapshot: String,
     bench: Option<usize>,
@@ -28,12 +32,14 @@ struct Args {
     cache_policy: String,
     prefetch: bool,
     prefetch_depth: usize,
+    max_pool_size: u64,
+    direct_io: bool,
 }
 
 fn parse_args() -> Result<Args> {
     const USAGE: &str = "usage: rivoli <snapshot-dir> [-bench <tokens>] [--pre-seed] \
          [--direct-vmm-dma] [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc] \
-         [--no-prefetch] [--prefetch-depth <n>]";
+         [--no-prefetch] [--prefetch-depth <n>] [--max-pool-size <GiB>] [--direct-io]";
     let mut snapshot = None;
     // Defaults are the validated winning config: ARC eviction + cross-layer prefetch
     // (best hit% on realistic multi-request sessions + the ~+11% prefetch overlap).
@@ -47,6 +53,8 @@ fn parse_args() -> Result<Args> {
         cache_policy: "arc".to_string(),
         prefetch: true,
         prefetch_depth: 2,
+        max_pool_size: rivoli::config::MAX_POOL,
+        direct_io: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -71,6 +79,18 @@ fn parse_args() -> Result<Args> {
                     .parse()
                     .context("--prefetch-depth takes an integer")?;
             }
+            "--max-pool-size" => {
+                let gib: u64 = args
+                    .next()
+                    .context("--max-pool-size requires a GiB integer")?
+                    .parse()
+                    .context("--max-pool-size takes an integer number of GiB")?;
+                if gib == 0 {
+                    bail!("--max-pool-size must be a positive integer number of GiB");
+                }
+                a.max_pool_size = gib << 30;
+            }
+            "--direct-io" => a.direct_io = true,
             _ if snapshot.is_none() => snapshot = Some(arg),
             _ => bail!("unexpected argument: {arg}\n{USAGE}"),
         }
@@ -97,6 +117,8 @@ fn main() -> Result<()> {
         a.cache_policy,
         a.prefetch,
         a.prefetch_depth,
+        a.max_pool_size,
+        a.direct_io,
     )?;
 
     // Rule 1: the full discovered config is the first line of every run.
@@ -192,20 +214,21 @@ async fn run(cfg: Config) -> Result<()> {
         // Pin::build, ~9-10 GiB for GLM-5.2) + the routed-expert LRU. Fill most of
         // device memory: the LRU is online priming, so a bigger pool captures more
         // of this run's working set (sim: 3200 slots→72%, 4200→75% hit) — leave
-        // OS_RESERVE headroom for scratch/KV, capped at MAX_POOL. The pin splits
-        // this into resident tier + LRU. This is the ACTUAL residency budget — the
-        // config log carries the two bounds, this line carries the resolved value.
-        use rivoli::config::{MAX_POOL, OS_RESERVE};
+        // OS_RESERVE headroom for scratch/KV, capped at cfg.max_pool_size
+        // (--max-pool-size, default MAX_POOL). The pin splits this into resident tier
+        // + LRU. This is the ACTUAL residency budget — the config log carries the two
+        // bounds, this line carries the resolved value.
+        use rivoli::config::OS_RESERVE;
         const GIB: f64 = (1u64 << 30) as f64;
         let cap = free
             .saturating_sub(OS_RESERVE as usize)
-            .min(MAX_POOL as usize);
+            .min(cfg.max_pool_size as usize);
         info!(
             "device pool budget {:.1} GiB (free {:.1} GiB − {:.0} GiB OS reserve, capped at {:.0} GiB)",
             cap as f64 / GIB,
             free as f64 / GIB,
             OS_RESERVE as f64 / GIB,
-            MAX_POOL as f64 / GIB,
+            cfg.max_pool_size as f64 / GIB,
         );
         let t = std::time::Instant::now();
         let pin = rivoli::pin::Pin::build(
@@ -219,6 +242,7 @@ async fn run(cfg: Config) -> Result<()> {
             &cfg.cache_policy,
             cfg.prefetch,
             cfg.prefetch_depth,
+            cfg.direct_io,
         )?;
         info!("pin built in {:.1}s", t.elapsed().as_secs_f64());
         let max_ctx = prompt_ids.len() + ngen + 1;
