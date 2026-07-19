@@ -21,9 +21,29 @@ use crate::cache;
 use crate::device::{DeviceTier, VmmBuf, mem_info};
 use crate::model::ModelConfig;
 use crate::snapshot::Snapshot;
-use crate::stream::{Streamer, slot_span};
+use crate::stream::{ALIGN, Streamer, slot_span};
 use crate::usage::Usage;
 use anyhow::{Context, Result, ensure};
+use std::os::fd::RawFd;
+
+/// The six O_DIRECT reads that stream one routed expert into a pool slot, resolved
+/// ONCE at [`Pin::build`] so the per-miss path never re-derives them. Order is
+/// slot-layout order: gate packed, gate scale, up packed, up scale, down packed,
+/// down scale — the same order as [`Pin::slot_dst`], into which each read lands.
+///
+/// - `reads[k]` = `(fd, file_begin, len)` from [`Snapshot::read_spec`] — a fixed
+///   `(RawFd, offset, length)` for the whole run (the mmap'd shard never moves).
+/// - `off[k]` = the slot-relative offset where read `k`'s USEFUL bytes land
+///   (`slot_dst[k] + (file_begin & (ALIGN-1))`, the O_DIRECT sub-block padding).
+///   Precomputed so descriptor build is a pure index, not a re-computation.
+///
+/// All cfg-dim cross-checks (packed/scale byte lengths vs the slot geometry) are
+/// done at build when this table is populated, so the miss path trusts it blindly.
+#[derive(Clone, Copy)]
+struct ExpertReads {
+    reads: [(RawFd, usize, usize); 6],
+    off: [usize; 6],
+}
 
 /// A resolved int4 weight matrix in the tier: device pointers + dims.
 #[derive(Clone, Copy)]
@@ -77,6 +97,11 @@ pub struct LayerPin {
 /// The resident weight set + cold-expert streaming pool. Borrows the snapshot for
 /// its lifetime (cold fetches read the mmap in place).
 pub struct Pin<'a> {
+    /// The borrow that keeps the snapshot — and thus the O_DIRECT fds the
+    /// `moe_table` reads hold as raw `RawFd`s — alive for the run. Not read
+    /// through after `build` (the table captured every `(fd, begin, len)` it
+    /// needs); it is purely the lifetime/fd anchor.
+    #[allow(dead_code)]
     snap: &'a Snapshot,
     cfg: &'a ModelConfig,
     /// The resident weight slab. Never read through after `build` — held purely as
@@ -99,6 +124,16 @@ pub struct Pin<'a> {
     /// strides are re-derived from `cfg` via [`slot_geom`]).
     lru_pool: VmmBuf,
     expert_slot: usize,
+    /// Per-(MoE layer, expert) precomputed streaming plan (A1/A2): the six fixed
+    /// `(fd, begin, len)` reads + their slot-relative useful-byte offsets. Indexed
+    /// by `(layer - dense_layers) * n_experts + expert`. Built ONCE; the miss and
+    /// prefetch paths index it and queue reads with zero allocation, zero string
+    /// hashing, and zero re-validation.
+    moe_table: Vec<ExpertReads>,
+    /// Slot-relative aligned DESTINATION offset of each of the six reads (gate
+    /// packed | gate scale | up packed | up scale | down packed | down scale).
+    /// Pure function of `cfg` (run-invariant), computed once at build.
+    slot_dst: [usize; 6],
     /// Adaptive routed tier: (layer,expert) -> slot, policy-evicted (`--cache-policy`).
     /// Online priming that keeps this run's hot experts resident.
     pool: Pool,
@@ -265,9 +300,11 @@ fn expert_key(layer: usize, expert: usize) -> u32 {
 /// The routed-expert pool: maps `(layer,expert)` keys to slab slot indices, with
 /// eviction delegated to a pluggable `cache::Cache` policy (`--cache-policy`
 /// lru|2q|arc). The policy owns residency + eviction order; the pool owns the
-/// key↔slot maps and `off` (each resident expert's 6 sub-block offsets). On a miss
-/// the policy names the evicted key (if any) and the pool reuses that key's slot —
-/// `slot_of` stays in lockstep with the policy's residency (debug-asserted).
+/// key↔slot maps. On a miss the policy names the evicted key (if any) and the pool
+/// reuses that key's slot — `slot_of` stays in lockstep with the policy's residency
+/// (debug-asserted). The per-expert streaming offsets live in [`Pin::moe_table`]
+/// (keyed by (layer,expert), run-invariant), NOT per slot, so the pool holds no
+/// geometry.
 struct Pool {
     policy: Box<dyn cache::Cache>,
     slot_of: std::collections::HashMap<u32, usize>,
@@ -276,7 +313,6 @@ struct Pool {
     /// the assertion all compile out in release.
     #[cfg(debug_assertions)]
     key_of: Vec<Option<u32>>,
-    off: Vec<[usize; 6]>, // [gate_p, gate_s, up_p, up_s, down_p, down_s]
     free: Vec<usize>,
 }
 
@@ -288,7 +324,6 @@ impl Pool {
             slot_of: std::collections::HashMap::with_capacity(n),
             #[cfg(debug_assertions)]
             key_of: vec![None; n],
-            off: vec![[0; 6]; n],
             free: (0..n).rev().collect(), // pop() hands out 0,1,2,...
         })
     }
@@ -482,6 +517,11 @@ impl<'a> Pin<'a> {
         // reads land in place and descriptors point at the sub-block offsets). Size
         // to the budget left after the always-resident set.
         let (_, expert_slot) = slot_geom(cfg);
+        // Precompute the per-(layer,expert) streaming plan ONCE (A1/A2): six fixed
+        // (fd, begin, len) reads + slot-relative useful-byte offsets, cfg-dim cross-
+        // checked here. The miss/prefetch paths then just index + queue.
+        let slot_dst = slot_dst_of(cfg);
+        let moe_table = build_moe_table(snap, cfg, &slot_dst)?;
         let budget = capacity.saturating_sub(tier_cap);
         // Floor the pool at `top_k + prefetch_depth` when prefetching: this makes
         // cross-layer prefetch's evictions provably DISJOINT from the current layer's
@@ -528,8 +568,8 @@ impl<'a> Pin<'a> {
                     continue; // stale ranking entry
                 }
                 let slot = pool.alloc(expert_key(l, e))?;
-                let base = format!("model.layers.{l}.mlp.experts.{e}");
-                pool.off[slot] = stream_expert(&mut stream, snap, cfg, slab, slot, &base)?;
+                let entry = &moe_table[(l - cfg.dense_layers) * cfg.n_experts + e];
+                stream_expert(&mut stream, entry, &slot_dst, slab, slot, expert_slot)?;
                 n += 1;
                 if n.is_multiple_of(batch) {
                     stream.drain()?;
@@ -561,6 +601,8 @@ impl<'a> Pin<'a> {
             moe_bias,
             lru_pool,
             expert_slot,
+            moe_table,
+            slot_dst,
             pool,
             stream,
             prefetch_stream,
@@ -595,7 +637,8 @@ impl<'a> Pin<'a> {
     /// caller-owned `out` (cleared first, reused across tokens) so the decode hot
     /// path allocates nothing here on the all-hits steady state.
     pub fn resolve_layer(&mut self, layer: usize, sel: &[usize], out: &mut Vec<Mlp>) -> Result<()> {
-        let (cfg, snap) = (self.cfg, self.snap);
+        let cfg = self.cfg;
+        let sparse = (layer - cfg.dense_layers) * cfg.n_experts; // moe_table row base
         // `sel` is one layer's routed pick (top_k + shared); a fixed slot scratch
         // avoids a per-layer alloc, mirroring `cache::access_batch`'s 32-wide buffer.
         ensure!(
@@ -624,13 +667,18 @@ impl<'a> Pin<'a> {
             }
         }
         // Trace sink (--trace): the exact LRU keys this layer looks up, access order.
+        // Write each key straight to the BufWriter (no per-layer Vec<String>+join);
+        // a leading space before all but the first keeps the output byte-identical
+        // (space-separated keys, no trailing space, one newline per layer).
         if let Some(w) = &mut self.trace {
             use std::io::Write;
-            let line: Vec<String> = sel
-                .iter()
-                .map(|&e| expert_key(layer, e).to_string())
-                .collect();
-            writeln!(w, "{}", line.join(" ")).context("write trace")?;
+            for (j, &e) in sel.iter().enumerate() {
+                if j > 0 {
+                    write!(w, " ").context("write trace")?;
+                }
+                write!(w, "{}", expert_key(layer, e)).context("write trace")?;
+            }
+            writeln!(w).context("write trace")?;
         }
         // Phase 1a: touch EVERY hit first. Doing this before any miss's `alloc()`
         // bumps each hit's LRU tick above the eviction candidates, so a later miss
@@ -651,27 +699,36 @@ impl<'a> Pin<'a> {
             }
             self.misses += 1;
             let slot = self.pool.alloc(expert_key(layer, e))?;
-            let base = format!("model.layers.{layer}.mlp.experts.{e}");
             // ptr_mut() yields a raw ptr, so no borrow of lru_pool is held across
-            // the &mut self.stream reads.
+            // the &mut self.stream reads. Table entry + slot_dst are disjoint fields
+            // from stream — no alloc, no string hashing, no re-validation per miss.
             let slab = self.lru_pool.ptr_mut();
-            self.pool.off[slot] = stream_expert(&mut self.stream, snap, cfg, slab, slot, &base)?;
+            let entry = &self.moe_table[sparse + e];
+            stream_expert(
+                &mut self.stream,
+                entry,
+                &self.slot_dst,
+                slab,
+                slot,
+                self.expert_slot,
+            )?;
             slots[i] = Some(slot);
         }
         // Phase 2: ONE join for the whole layer's cold reads.
         self.stream.drain()?;
-        // Phase 3: build descriptors from each slot's stored sub-block offsets.
+        // Phase 3: build descriptors from each expert's precomputed sub-block offsets
+        // (in `moe_table`, keyed by (layer,expert) — run-invariant, not per slot).
         // gate/up are [moe_inter, hidden]; down is [hidden, moe_inter].
         let (gate_o, gate_i) = (cfg.moe_inter, cfg.hidden);
         let (down_o, down_i) = (cfg.hidden, cfg.moe_inter);
         let slab = self.lru_pool.ptr();
         let es = self.expert_slot;
         out.clear();
-        for &slot in &slots[..sel.len()] {
+        for (i, &e) in sel.iter().enumerate() {
             // Every entry was filled in phase 1a/1b; a `None` here is an internal
             // invariant break, not a data condition — fail loud rather than panic.
-            let slot = slot.context("resolve_layer: unresolved expert slot")?;
-            let o = self.pool.off[slot];
+            let slot = slots[i].context("resolve_layer: unresolved expert slot")?;
+            let o = self.moe_table[sparse + e].off;
             // SAFETY: slot base within the slab; reads that filled it have joined.
             let b = unsafe { slab.add(slot * es) };
             let w = |poff: usize, soff: usize, o_dim: usize, i_dim: usize| Weight {
@@ -720,7 +777,8 @@ impl<'a> Pin<'a> {
         if self.prefetch_stream.is_none() {
             return Ok(());
         }
-        let (cfg, snap) = (self.cfg, self.snap);
+        let cfg = self.cfg;
+        let sparse = (layer - cfg.dense_layers) * cfg.n_experts; // moe_table row base
         // Record the full predicted set (recall is measured over all predictions,
         // including those skipped below as already resident).
         self.predicted.clear();
@@ -729,7 +787,11 @@ impl<'a> Pin<'a> {
         // Raw slab ptr (no borrow held across the &mut stream reads), mirroring
         // `resolve_layer`'s phase 1b.
         let slab = self.lru_pool.ptr_mut();
-        // Disjoint field borrows: `prefetch_stream` and `pool` are distinct fields.
+        // Disjoint field borrows: `prefetch_stream`, `pool`, `moe_table`, `slot_dst`
+        // are distinct fields.
+        let table = &self.moe_table;
+        let slot_dst = &self.slot_dst;
+        let expert_slot = self.expert_slot;
         let stream = match self.prefetch_stream.as_mut() {
             Some(s) => s,
             None => return Ok(()),
@@ -742,8 +804,8 @@ impl<'a> Pin<'a> {
                 continue; // already resident — no fetch needed
             }
             let slot = pool.alloc_cold(key)?;
-            let base = format!("model.layers.{layer}.mlp.experts.{e}");
-            pool.off[slot] = stream_expert(stream, snap, cfg, slab, slot, &base)?;
+            let entry = &table[sparse + e];
+            stream_expert(stream, entry, slot_dst, slab, slot, expert_slot)?;
             queued += 1;
         }
         if queued > 0 {
@@ -755,15 +817,11 @@ impl<'a> Pin<'a> {
     }
 }
 
-/// Queue an expert's 6 O_DIRECT reads into pool slot `slot` (regions gate|up|down
-/// at `slot*expert_slot`), returning the 6 slot-relative sub-block offsets
-/// `[gate_p, gate_s, up_p, up_s, down_p, down_s]`. Shared by the decode-miss path
-/// and the build-time warm-start seed.
 /// One routed expert's pool-slot geometry, derived from `cfg`: `(gate_slot,
 /// expert_slot)`. A slot is laid out gate|up|down; `gate` and `up` each span
 /// `gate_slot` (packed superset + scale superset), `down` the rest, and the whole
 /// expert occupies `expert_slot`. The single source of truth for both the pool
-/// sizing in [`Pin::build`] and the per-region offsets in [`stream_expert`].
+/// sizing in [`Pin::build`] and the per-region offsets in [`slot_dst_of`].
 fn slot_geom(cfg: &ModelConfig) -> (usize, usize) {
     let rb_h = cfg.hidden.div_ceil(2);
     let rb_i = cfg.moe_inter.div_ceil(2);
@@ -772,109 +830,107 @@ fn slot_geom(cfg: &ModelConfig) -> (usize, usize) {
     (gate_slot, 2 * gate_slot + down_slot) // gate | up | down, one slot
 }
 
-fn stream_expert(
-    stream: &mut Streamer,
-    snap: &Snapshot,
-    cfg: &ModelConfig,
-    pool: *mut u8,
-    slot: usize,
-    base: &str,
-) -> Result<[usize; 6]> {
-    let (gate_slot, expert_slot) = slot_geom(cfg);
-    // cfg-expected packed/scale byte lengths per projection — the SAME budget the
-    // slot regions (`gate_slot`/`down_slot` in `build`) were sized from. The cold
-    // io_uring path reads a RAW file length (`read_spec`) with no dim, so cross-check
-    // it here exactly as the resident path does via `Snapshot::int4`: a config/
-    // snapshot dim mismatch would otherwise overrun one projection's region into the
-    // next (or the last slot's `down` past the slab) and stream wrong-expert bytes.
-    let rb_h = cfg.hidden.div_ceil(2);
-    let rb_i = cfg.moe_inter.div_ceil(2);
-    // gate/up: [moe_inter, hidden]; down: [hidden, moe_inter]; one f32 scale per row.
-    let (gate_p, gate_s) = (cfg.moe_inter * rb_h, cfg.moe_inter * 4);
-    let (down_p, down_s) = (cfg.hidden * rb_i, cfg.hidden * 4);
-    let o = slot * expert_slot;
-    // SAFETY: o + 2*gate_slot + down region <= pool len (slot < n_slots).
-    let (gp, up, dp) = unsafe {
-        (
-            pool.add(o),
-            pool.add(o + gate_slot),
-            pool.add(o + 2 * gate_slot),
-        )
-    };
-    // SAFETY: each region is block-aligned and sized for its two supersets.
-    let (pg, sg) = unsafe {
-        queue_proj(
-            stream,
-            snap,
-            gp,
-            &format!("{base}.gate_proj"),
-            gate_p,
-            gate_s,
-        )?
-    };
-    let (pu, su) =
-        unsafe { queue_proj(stream, snap, up, &format!("{base}.up_proj"), gate_p, gate_s)? };
-    let (pd, sd) = unsafe {
-        queue_proj(
-            stream,
-            snap,
-            dp,
-            &format!("{base}.down_proj"),
-            down_p,
-            down_s,
-        )?
-    };
-    Ok([
-        pg,
-        sg,
-        gate_slot + pu,
-        gate_slot + su,
-        2 * gate_slot + pd,
-        2 * gate_slot + sd,
-    ])
+/// The six slot-relative, block-aligned DESTINATION offsets a slot's reads land
+/// at — gate packed | gate scale | up packed | up scale | down packed | down
+/// scale — a pure function of `cfg` (run-invariant). Within each `gate_slot`/
+/// `down` region the packed superset comes first, the scale superset next
+/// (`slot_span(packed_len)` in). Matches the layout the old `stream_expert` built
+/// per miss; now computed once.
+fn slot_dst_of(cfg: &ModelConfig) -> [usize; 6] {
+    let (gate_slot, _) = slot_geom(cfg);
+    let gate_p = cfg.moe_inter * cfg.hidden.div_ceil(2);
+    let down_p = cfg.hidden * cfg.moe_inter.div_ceil(2);
+    let sp = slot_span; // packed superset length within a region
+    [
+        0,                          // gate packed
+        sp(gate_p),                 // gate scale
+        gate_slot,                  // up packed
+        gate_slot + sp(gate_p),     // up scale
+        2 * gate_slot,              // down packed
+        2 * gate_slot + sp(down_p), // down scale
+    ]
 }
 
-/// Queue one projection's packed + scale O_DIRECT reads into `region` (a
-/// block-aligned pointer owning `>= slot_span(plen)+slot_span(slen)` bytes):
-/// packed in the first `slot_span`, scale in the next. Returns the sub-block
-/// offsets RELATIVE to `region` where the useful bytes land.
-///
-/// `exp_packed`/`exp_scale` are the cfg-derived byte lengths the region was sized
-/// for; the RAW `read_spec` lengths are `ensure!`d to match them (fail loud on a
-/// config/snapshot dim mismatch, like the resident `Snapshot::int4` path).
-///
-/// # Safety
-/// `region` must be block-aligned and own the projection's two supersets
-/// (`slot_span(exp_packed) + slot_span(exp_scale)` bytes).
-unsafe fn queue_proj(
-    stream: &mut Streamer,
+/// Resolve every routed expert's six `(fd, begin, len)` reads + useful-byte
+/// offsets ONCE (A1/A2), indexed `(layer - dense_layers) * n_experts + expert`.
+/// The cfg-dim cross-checks that used to run per miss (packed/scale byte lengths
+/// vs the slot geometry that sized each region) run HERE, so the miss path trusts
+/// the table blindly. A missing/mismatched expert tensor fails loud at build.
+fn build_moe_table(
     snap: &Snapshot,
-    region: *mut u8,
-    proj: &str,
-    exp_packed: usize,
-    exp_scale: usize,
-) -> Result<(usize, usize)> {
-    let base = region;
-    let (pfd, pb, plen) = snap
-        .read_spec(&format!("{proj}.weight"))
-        .with_context(|| format!("cold read_spec {proj}.weight"))?;
-    ensure!(
-        plen == exp_packed,
-        "cold {proj}.weight: {plen} packed bytes, cfg expects {exp_packed} \
-         (config/snapshot dim mismatch)"
-    );
-    // SAFETY: base is VMM (block-aligned); slot sized >= slot_span(plen)+slot_span(slen).
-    let poff = unsafe { stream.queue(pfd, pb, plen, base)? };
-    let sreg = slot_span(plen); // block-aligned scale region within the slot
-    let (sfd, sb, slen) = snap
-        .read_spec(&format!("{proj}.weight.qs"))
-        .with_context(|| format!("cold read_spec {proj}.weight.qs"))?;
-    ensure!(
-        slen == exp_scale,
-        "cold {proj}.weight.qs: {slen} scale bytes, cfg expects {exp_scale} \
-         (config/snapshot dim mismatch)"
-    );
-    // SAFETY: base+sreg is block-aligned and within the slot's second region.
-    let soff = unsafe { stream.queue(sfd, sb, slen, base.add(sreg))? };
-    Ok((poff, sreg + soff))
+    cfg: &ModelConfig,
+    slot_dst: &[usize; 6],
+) -> Result<Vec<ExpertReads>> {
+    // cfg-expected packed/scale byte lengths (the same budget the slot regions were
+    // sized from). gate/up: [moe_inter, hidden]; down: [hidden, moe_inter].
+    let rb_h = cfg.hidden.div_ceil(2);
+    let rb_i = cfg.moe_inter.div_ceil(2);
+    let (gate_p, gate_s) = (cfg.moe_inter * rb_h, cfg.moe_inter * 4);
+    let (down_p, down_s) = (cfg.hidden * rb_i, cfg.hidden * 4);
+    // (proj suffix, expected packed len, expected scale len), in slot-layout order.
+    let projs = [
+        ("gate_proj", gate_p, gate_s),
+        ("up_proj", gate_p, gate_s),
+        ("down_proj", down_p, down_s),
+    ];
+    let n_moe = cfg.n_layers - cfg.dense_layers;
+    let mut table = Vec::with_capacity(n_moe * cfg.n_experts);
+    for l in cfg.dense_layers..cfg.n_layers {
+        for e in 0..cfg.n_experts {
+            let base = format!("model.layers.{l}.mlp.experts.{e}");
+            let mut reads = [(0 as RawFd, 0usize, 0usize); 6];
+            let mut off = [0usize; 6];
+            for (pi, &(proj, exp_p, exp_s)) in projs.iter().enumerate() {
+                let (kp, ks) = (pi * 2, pi * 2 + 1); // packed/scale slot indices
+                let (pfd, pb, plen) = snap
+                    .read_spec(&format!("{base}.{proj}.weight"))
+                    .with_context(|| format!("read_spec {base}.{proj}.weight"))?;
+                ensure!(
+                    plen == exp_p,
+                    "{base}.{proj}.weight: {plen} packed bytes, cfg expects {exp_p} \
+                     (config/snapshot dim mismatch)"
+                );
+                let (sfd, sb, slen) = snap
+                    .read_spec(&format!("{base}.{proj}.weight.qs"))
+                    .with_context(|| format!("read_spec {base}.{proj}.weight.qs"))?;
+                ensure!(
+                    slen == exp_s,
+                    "{base}.{proj}.weight.qs: {slen} scale bytes, cfg expects {exp_s} \
+                     (config/snapshot dim mismatch)"
+                );
+                reads[kp] = (pfd, pb, plen);
+                reads[ks] = (sfd, sb, slen);
+                // Useful bytes land `sub` (= begin's O_DIRECT sub-block offset) past
+                // the aligned region destination — exactly `Streamer::queue`'s return.
+                off[kp] = slot_dst[kp] + (pb & (ALIGN - 1));
+                off[ks] = slot_dst[ks] + (sb & (ALIGN - 1));
+            }
+            table.push(ExpertReads { reads, off });
+        }
+    }
+    Ok(table)
+}
+
+/// Queue an expert's 6 O_DIRECT reads into pool slot `slot` (regions gate|up|down
+/// at `slot*expert_slot`), from its precomputed [`ExpertReads`]. The miss path and
+/// the build-time warm-start seed share this: pure indexing + queueing, NO
+/// allocation, string hashing, or re-validation (all done at [`build_moe_table`]).
+fn stream_expert(
+    stream: &mut Streamer,
+    entry: &ExpertReads,
+    slot_dst: &[usize; 6],
+    pool: *mut u8,
+    slot: usize,
+    expert_slot: usize,
+) -> Result<()> {
+    let slot_base = slot * expert_slot;
+    for (i, &(fd, begin, len)) in entry.reads.iter().enumerate() {
+        // SAFETY: slot_base + slot_dst[i] is block-aligned (both multiples of ALIGN)
+        // and within the slot's region (slot < n_slots; regions sized to hold each
+        // read's superset), owning >= slot_span(len) writable bytes until the drain.
+        let dst = unsafe { pool.add(slot_base + slot_dst[i]) };
+        // SAFETY: dst is block-aligned and owns the read's aligned superset.
+        unsafe { stream.queue(fd, begin, len, dst)? };
+    }
+    Ok(())
 }
