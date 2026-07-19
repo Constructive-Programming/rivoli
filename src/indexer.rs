@@ -82,7 +82,7 @@ pub struct Indexer {
 /// The indexer's `k_norm` epsilon. Hardcoded in the HF reference
 /// (`nn.LayerNorm(head_dim, eps=1e-6)` in modeling_deepseek_v32/glm_moe_dsa) —
 /// NOT the model's rms_norm_eps (1e-5 for GLM-5.2).
-const K_NORM_EPS: f32 = 1e-6;
+pub const K_NORM_EPS: f32 = 1e-6;
 
 impl Indexer {
     pub fn new(snap: &Snapshot, cfg: &ModelConfig) -> Result<Self> {

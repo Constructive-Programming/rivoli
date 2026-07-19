@@ -20,6 +20,7 @@ fn main() {
         "linalg",
         "mla",
         "fwd",
+        "indexer",
         "vmm",
         "stream",
     ];

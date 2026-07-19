@@ -82,6 +82,18 @@ pub enum LayerMlp {
     },
 }
 
+/// A full layer's resident DSA lightning-indexer weights (bf16 projections +
+/// the widened f32 k_norm). Only "full" layers own one; shared layers reuse a
+/// preceding full layer's selection and carry `None`.
+#[derive(Clone, Copy)]
+pub struct IndexerPin {
+    pub wk: *const u16,           // [index_head_dim, hidden] bf16
+    pub wq_b: *const u16,         // [n_heads·head_dim, q_lora_rank] bf16
+    pub weights_proj: *const u16, // [n_heads, hidden] bf16
+    pub k_norm_w: *const f32,     // [index_head_dim] (widened at placement)
+    pub k_norm_b: *const f32,     // [index_head_dim]
+}
+
 /// One layer's resolved weights.
 pub struct LayerPin {
     pub input_ln: *const f32,
@@ -94,6 +106,9 @@ pub struct LayerPin {
     pub kv_b: Weight,
     pub o_proj: Weight,
     pub mlp: LayerMlp,
+    /// The DSA indexer weights, `Some` for full layers (see [`IndexerPin`]).
+    /// Populated only when the pin is built for a sparse attention mode.
+    pub indexer: Option<IndexerPin>,
 }
 
 /// The resident weight set + cold-expert streaming pool. Borrows the snapshot for
@@ -227,6 +242,44 @@ fn place_i8(tier: &mut DeviceTier, snap: &Snapshot, name: &str, i_dim: usize) ->
     })
 }
 
+/// Place a raw bf16 tensor (by full name) into the tier via `pread`, returning
+/// the device `u16` pointer. For the indexer projections, which ship at bf16 in
+/// the out-idx shard and are read as bf16 by `gemv_bf16` (no widening).
+fn place_bf16(tier: &mut DeviceTier, snap: &Snapshot, name: &str) -> Result<*const u16> {
+    let len = snap.typed(name, Dtype::Bf16)?.len();
+    let dst = tier.reserve(len)?;
+    // SAFETY: dst owns `len` reserved bytes.
+    unsafe { snap.read_into(name, dst, len, true)? };
+    Ok(dst as *const u16)
+}
+
+/// Place a bf16 tensor WIDENED to f32 into the tier (the indexer `k_norm`
+/// weight/bias, read as f32 by the `layernorm` kernel). The tier slab is
+/// host-writable, so widen on host then copy the f32 bytes in.
+fn place_bf16_as_f32(tier: &mut DeviceTier, snap: &Snapshot, name: &str) -> Result<*const f32> {
+    let vals = crate::quant::read_bf16(snap.typed(name, Dtype::Bf16)?);
+    // SAFETY: f32 is POD; this is its LE byte serialization on this LE host.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(vals.as_ptr() as *const u8, std::mem::size_of_val(&vals[..]))
+    };
+    let dst = tier.reserve(bytes.len())?;
+    // SAFETY: dst owns `bytes.len()` reserved host-writable bytes.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
+    Ok(dst as *const f32)
+}
+
+/// Place a full layer's DSA indexer weights (bf16 projections + f32 k_norm).
+fn place_indexer(tier: &mut DeviceTier, snap: &Snapshot, layer: usize) -> Result<IndexerPin> {
+    let base = format!("model.layers.{layer}.self_attn.indexer");
+    Ok(IndexerPin {
+        wk: place_bf16(tier, snap, &format!("{base}.wk.weight"))?,
+        wq_b: place_bf16(tier, snap, &format!("{base}.wq_b.weight"))?,
+        weights_proj: place_bf16(tier, snap, &format!("{base}.weights_proj.weight"))?,
+        k_norm_w: place_bf16_as_f32(tier, snap, &format!("{base}.k_norm.weight"))?,
+        k_norm_b: place_bf16_as_f32(tier, snap, &format!("{base}.k_norm.bias"))?,
+    })
+}
+
 fn place_mlp(
     tier: &mut DeviceTier,
     snap: &Snapshot,
@@ -286,6 +339,19 @@ fn resident_bytes(cfg: &ModelConfig) -> usize {
         }
     }
     total
+}
+
+/// Resident bytes for ONE full layer's DSA indexer weights (bf16 projections +
+/// the f32-widened k_norm), mirroring `place_indexer`. Multiply by the full-
+/// layer count for the indexer footprint.
+fn indexer_bytes(cfg: &ModelConfig) -> usize {
+    let hd = cfg.index_head_dim;
+    let nh = cfg.index_n_heads;
+    let bf16 = |o: usize, i: usize| o * i * 2;
+    bf16(hd, cfg.hidden)          // wk
+        + bf16(nh * hd, cfg.q_lora_rank) // wq_b
+        + bf16(nh, cfg.hidden)    // weights_proj
+        + 2 * hd * 4 // k_norm weight + bias, widened to f32
 }
 
 /// Pack `(layer, expert)` into the LRU key. Both must fit in 16 bits — GLM is
@@ -426,8 +492,16 @@ impl<'a> Pin<'a> {
         prefetch: bool,
         prefetch_depth: usize,
         direct_io: bool,
+        want_indexer: bool,
     ) -> Result<Self> {
         let (free, _total) = mem_info()?;
+        // Full layers own a resident DSA indexer (dsa/misa modes). Empty when
+        // dense/streaming — the mask drives both placement and the footprint.
+        let full = if want_indexer {
+            cfg.indexer_layout()?
+        } else {
+            vec![false; cfg.n_layers]
+        };
         ensure!(
             capacity < free,
             "pin capacity {capacity} >= free device memory {free}"
@@ -439,7 +513,8 @@ impl<'a> Pin<'a> {
         // absorbs the per-reservation 256-byte alignment padding and a small
         // margin; anything left over widens the LRU below.
         const SLACK: usize = 256 << 20; // 256 MiB
-        let resident = resident_bytes(cfg);
+        let n_full = full.iter().filter(|&&f| f).count();
+        let resident = resident_bytes(cfg) + n_full * indexer_bytes(cfg);
         let tier_cap = resident + SLACK;
         tracing::info!(
             "computed resident footprint {:.2} GiB (tier {:.2} GiB incl. slack)",
@@ -456,6 +531,9 @@ impl<'a> Pin<'a> {
         // Per-layer always-resident weights.
         let mut layers = Vec::with_capacity(cfg.n_layers);
         let mut moe_bias = Vec::new();
+        // `l` indexes both the weight-name format!s and the `full` mask; iterating
+        // `full` directly would lose the layer number the names need.
+        #[allow(clippy::needless_range_loop)]
         for l in 0..cfg.n_layers {
             let lb = format!("model.layers.{l}");
             let a = format!("{lb}.self_attn");
@@ -515,6 +593,11 @@ impl<'a> Pin<'a> {
                     cfg.n_heads * cfg.v_head_dim,
                 )?,
                 mlp,
+                indexer: if full[l] {
+                    Some(place_indexer(&mut tier, snap, l)?)
+                } else {
+                    None
+                },
             });
         }
 

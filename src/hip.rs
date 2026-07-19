@@ -133,6 +133,31 @@ unsafe extern "C" {
         scale: f32,
         clat: *mut f32,
     ) -> i32;
+
+    fn rivoli_gemv_bf16(x: *const f32, w: *const u16, o_dim: i32, i_dim: i32, y: *mut f32) -> i32;
+    fn rivoli_layernorm(
+        x: *const f32,
+        w: *const f32,
+        b: *const f32,
+        n: i32,
+        eps: f32,
+        y: *mut f32,
+    ) -> i32;
+    fn rivoli_index_append(k: *const f32, kcache: *mut u16, pos: i32, hd: i32) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn rivoli_index_score(
+        q: *const f32,
+        w: *const f32,
+        kcache: *const u16,
+        heads: *const u32,
+        nt: i32,
+        nh: i32,
+        nact: i32,
+        hd: i32,
+        wscale: f32,
+        dscale: f32,
+        scores: *mut f32,
+    ) -> i32;
 }
 
 /// Launch MLA flash attention over the resident KV cache: for each head, writes
@@ -657,6 +682,137 @@ pub unsafe fn launch_argmax(
     if r != 0 {
         let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
         bail!("launch_argmax failed ({kind}, code {r})");
+    }
+    Ok(())
+}
+
+/// Launch a bf16 GEMV `y[o] = Σ_i x[i]·bf16(w[o·i_dim+i])` — the DSA indexer's
+/// `wk`/`wq_b`/`weights_proj`. `x` f32, `w` bf16, `y` f32. Launch-only.
+///
+/// # Safety
+/// Async — `x` (`i_dim` f32), `w` (`o_dim·i_dim` u16), `y` (`o_dim` f32) valid
+/// device pointers live until the next [`device_sync`] returns.
+#[cfg(feature = "rocm")]
+pub unsafe fn launch_gemv_bf16(
+    x: *const f32,
+    w: *const u16,
+    o_dim: usize,
+    i_dim: usize,
+    y: *mut f32,
+) -> Result<()> {
+    anyhow::ensure!(
+        o_dim <= i32::MAX as usize && i_dim <= i32::MAX as usize,
+        "gemv_bf16 dims exceed i32 (o_dim={o_dim} i_dim={i_dim})"
+    );
+    // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
+    let r = unsafe { rivoli_gemv_bf16(x, w, o_dim as i32, i_dim as i32, y) };
+    if r != 0 {
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("launch_gemv_bf16 failed ({kind}, code {r})");
+    }
+    Ok(())
+}
+
+/// Launch LayerNorm `y = (x-mean)/sqrt(var+eps)·w + b` over `n` device f32 — the
+/// indexer `k_norm` (the one norm in the model with a bias). Launch-only.
+///
+/// # Safety
+/// Async — `x`/`w`/`b`/`y` (each `n` f32) valid device pointers live until the
+/// next [`device_sync`] returns.
+#[cfg(feature = "rocm")]
+pub unsafe fn launch_layernorm(
+    x: *const f32,
+    w: *const f32,
+    b: *const f32,
+    n: usize,
+    eps: f32,
+    y: *mut f32,
+) -> Result<()> {
+    anyhow::ensure!(n <= i32::MAX as usize, "layernorm n exceeds i32 ({n})");
+    // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
+    let r = unsafe { rivoli_layernorm(x, w, b, n as i32, eps, y) };
+    if r != 0 {
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("launch_layernorm failed ({kind}, code {r})");
+    }
+    Ok(())
+}
+
+/// Launch the indexer key append: bf16-quantize `k` (`hd` f32) into the
+/// per-full-layer key slab `kcache` at row `pos`. Launch-only.
+///
+/// # Safety
+/// Async — `k` (`hd` f32) and `kcache` (room for row `pos`) valid device
+/// pointers live until the next [`device_sync`] returns.
+#[cfg(feature = "rocm")]
+pub unsafe fn launch_index_append(
+    k: *const f32,
+    kcache: *mut u16,
+    pos: usize,
+    hd: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        pos <= i32::MAX as usize && hd <= i32::MAX as usize,
+        "index_append dims exceed i32 (pos={pos} hd={hd})"
+    );
+    // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
+    let r = unsafe { rivoli_index_append(k, kcache, pos as i32, hd as i32) };
+    if r != 0 {
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("launch_index_append failed ({kind}, code {r})");
+    }
+    Ok(())
+}
+
+/// Launch the indexer scoring: `scores[t] = Σ_{h∈active} w[h]·wscale·
+/// ReLU((q_h·k_t)·dscale)` over `nt` cached tokens. `heads` (null = all `nh`)
+/// lists the `nact` active heads (MISA). Launch-only.
+///
+/// # Safety
+/// Async — `q` (`nh·hd` f32), `w` (`nh` f32), `kcache` (`nt·hd` u16), `heads`
+/// (`nact` u32 or null), `scores` (`nt` f32) valid device pointers live until
+/// the next join (the caller's D2H of `scores`).
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_index_score(
+    q: *const f32,
+    w: *const f32,
+    kcache: *const u16,
+    heads: *const u32,
+    nt: usize,
+    nh: usize,
+    nact: usize,
+    hd: usize,
+    wscale: f32,
+    dscale: f32,
+    scores: *mut f32,
+) -> Result<()> {
+    anyhow::ensure!(
+        nt <= i32::MAX as usize
+            && nh <= i32::MAX as usize
+            && nact <= i32::MAX as usize
+            && hd <= i32::MAX as usize,
+        "index_score dims exceed i32 (nt={nt} nh={nh} nact={nact} hd={hd})"
+    );
+    // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
+    let r = unsafe {
+        rivoli_index_score(
+            q,
+            w,
+            kcache,
+            heads,
+            nt as i32,
+            nh as i32,
+            nact as i32,
+            hd as i32,
+            wscale,
+            dscale,
+            scores,
+        )
+    };
+    if r != 0 {
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("launch_index_score failed ({kind}, code {r})");
     }
     Ok(())
 }

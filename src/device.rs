@@ -219,6 +219,31 @@ mod tier {
             Ok(out)
         }
 
+        /// Copy the FIRST `len` bytes back into `out` (reused: cleared then
+        /// resized). For partially-written buffers — e.g. the indexer's score
+        /// slab, sized to max_ctx but holding only `nt` scores this step — so
+        /// the D2H moves nt·4 bytes, not the whole slab.
+        pub fn copy_out_prefix(&self, out: &mut Vec<u8>, len: usize) -> Result<()> {
+            ensure!(
+                len <= self.len,
+                "copy_out_prefix {len} > buf len {}",
+                self.len
+            );
+            out.clear();
+            out.resize(len, 0);
+            // SAFETY: source has `len <= self.len` bytes; dest has `len` bytes.
+            let e = unsafe {
+                hipMemcpy(
+                    out.as_mut_ptr() as *mut c_void,
+                    self.ptr as *const c_void,
+                    len,
+                    HIP_MEMCPY_D2H,
+                )
+            };
+            ensure!(e == HIP_SUCCESS, "hipMemcpy D2H failed ({e})");
+            Ok(())
+        }
+
         /// Copy the whole buffer back into `out` (a caller-owned buffer reused
         /// across tokens: cleared then refilled to `len`, so the per-token decode
         /// D2H allocates nothing once `out` has grown to size).

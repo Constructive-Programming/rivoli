@@ -34,8 +34,9 @@ fn dev_zeroed(len: usize) -> DeviceBuf {
     dev_bytes(&vec![0u8; len])
 }
 use rivoli::hip::{
-    ExpertDesc, device_sync, launch_attend, launch_gemv_f32, launch_gemv_i4, launch_gemv_i8,
-    launch_mla_absorb, launch_mla_value, launch_moe, launch_rmsnorm, launch_rope,
+    ExpertDesc, device_sync, launch_attend, launch_gemv_bf16, launch_gemv_f32, launch_gemv_i4,
+    launch_gemv_i8, launch_index_score, launch_layernorm, launch_mla_absorb, launch_mla_value,
+    launch_moe, launch_rmsnorm, launch_rope,
 };
 use rivoli::math::{bf16_to_f32, f32_to_bf16, silu, softmax};
 use rivoli::quant::{addrow, matvec_f32_bytes, matvec_i4, matvec_i4_rows, matvec_i8, row_bytes};
@@ -788,4 +789,138 @@ fn argmax_matches_host_fold() {
             "case {ci}: device value bits differ"
         );
     }
+}
+
+// --- DSA lightning-indexer device kernels vs the scalar oracle (src/indexer.rs) ---
+
+/// gemv_bf16: y[o] = Σ_i x[i]·bf16(w[o·i_dim+i]). Reference widens the same u16
+/// bits the kernel does, so the only difference under test is reduction order.
+#[test]
+fn gemv_bf16_matches_scalar() {
+    let mut rng = Lcg(0x9e37_79b9);
+    let (o_dim, i_dim) = (4096usize, 2048usize); // wq_b shape
+    let x: Vec<f32> = (0..i_dim).map(|_| rng.f()).collect();
+    let w: Vec<u16> = (0..o_dim * i_dim)
+        .map(|_| f32_to_bf16(rng.f() * 0.1))
+        .collect();
+    let want: Vec<f32> = (0..o_dim)
+        .map(|o| {
+            let row = &w[o * i_dim..(o + 1) * i_dim];
+            x.iter()
+                .zip(row)
+                .map(|(&xi, &wb)| xi * bf16_to_f32(wb))
+                .sum()
+        })
+        .collect();
+    let x_buf = dev_bytes(&f32_bytes(&x));
+    let w_buf = dev_bytes(&u16_bytes(&w));
+    let mut y_buf = dev_zeroed(o_dim * 4);
+    // SAFETY: device pointers sized for the dims.
+    unsafe {
+        launch_gemv_bf16(
+            x_buf.ptr() as *const f32,
+            w_buf.ptr() as *const u16,
+            o_dim,
+            i_dim,
+            y_buf.ptr_mut() as *mut f32,
+        )
+        .expect("gemv_bf16");
+    }
+    device_sync().expect("sync");
+    assert_close(
+        &want,
+        &f32_vec(&y_buf.copy_out().expect("out")),
+        "gemv_bf16",
+    );
+}
+
+/// layernorm: y = (x-mean)/sqrt(var+eps)·w + b, matching math.rs::layernorm.
+#[test]
+fn layernorm_matches_scalar() {
+    let mut rng = Lcg(0x1234_5678);
+    let n = 128usize; // index_head_dim
+    let x: Vec<f32> = (0..n).map(|_| rng.f() * 3.0).collect();
+    let w: Vec<f32> = (0..n).map(|_| rng.f() * 0.5 + 1.0).collect();
+    let b: Vec<f32> = (0..n).map(|_| rng.f() * 0.1).collect();
+    let mut want = x.clone();
+    rivoli::math::layernorm(&mut want, &w, &b, 1e-6);
+    let x_buf = dev_bytes(&f32_bytes(&x));
+    let w_buf = dev_bytes(&f32_bytes(&w));
+    let b_buf = dev_bytes(&f32_bytes(&b));
+    let mut y_buf = dev_zeroed(n * 4);
+    // SAFETY: device pointers sized n.
+    unsafe {
+        launch_layernorm(
+            x_buf.ptr() as *const f32,
+            w_buf.ptr() as *const f32,
+            b_buf.ptr() as *const f32,
+            n,
+            1e-6,
+            y_buf.ptr_mut() as *mut f32,
+        )
+        .expect("layernorm");
+    }
+    device_sync().expect("sync");
+    assert_close(
+        &want,
+        &f32_vec(&y_buf.copy_out().expect("out")),
+        "layernorm",
+    );
+}
+
+/// index_score: scores[t] = Σ_h w[h]·wscale·ReLU((q_h·k_t)·dscale) — the DSA
+/// scoring core, all 32 heads active (DSA; heads=null). Reference mirrors the
+/// scalar indexer's inner loop over the same bf16-widened keys.
+#[test]
+fn index_score_matches_scalar() {
+    let mut rng = Lcg(0xabcd_1234);
+    let (nt, nh, hd) = (600usize, 32usize, 128usize); // GLM indexer dims
+    let q: Vec<f32> = (0..nh * hd).map(|_| rng.f()).collect();
+    let w: Vec<f32> = (0..nh).map(|_| rng.f()).collect();
+    let kc: Vec<u16> = (0..nt * hd).map(|_| f32_to_bf16(rng.f())).collect();
+    let wscale = 1.0 / (nh as f32).sqrt();
+    let dscale = 1.0 / (hd as f32).sqrt();
+    let want: Vec<f32> = (0..nt)
+        .map(|t| {
+            let krow = &kc[t * hd..(t + 1) * hd];
+            (0..nh)
+                .map(|hh| {
+                    let qh = &q[hh * hd..(hh + 1) * hd];
+                    let dot: f32 = qh
+                        .iter()
+                        .zip(krow)
+                        .map(|(&a, &kb)| a * bf16_to_f32(kb))
+                        .sum();
+                    w[hh] * wscale * (dot * dscale).max(0.0)
+                })
+                .sum()
+        })
+        .collect();
+    let q_buf = dev_bytes(&f32_bytes(&q));
+    let w_buf = dev_bytes(&f32_bytes(&w));
+    let kc_buf = dev_bytes(&u16_bytes(&kc));
+    let mut sc_buf = dev_zeroed(nt * 4);
+    // SAFETY: device pointers sized for the dims; heads=null → all nh active.
+    unsafe {
+        launch_index_score(
+            q_buf.ptr() as *const f32,
+            w_buf.ptr() as *const f32,
+            kc_buf.ptr() as *const u16,
+            std::ptr::null(),
+            nt,
+            nh,
+            nh,
+            hd,
+            wscale,
+            dscale,
+            sc_buf.ptr_mut() as *mut f32,
+        )
+        .expect("index_score");
+    }
+    device_sync().expect("sync");
+    assert_close(
+        &want,
+        &f32_vec(&sc_buf.copy_out().expect("out")),
+        "index_score",
+    );
 }

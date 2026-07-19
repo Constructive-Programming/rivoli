@@ -264,17 +264,17 @@ async fn run(cfg: Config) -> Result<()> {
     // device. Falls back to the scalar reference path without the `rocm` feature.
     #[cfg(feature = "rocm")]
     {
-        // The resident GPU path runs dense + streaming (sparse gather kernel);
-        // dsa/misa still need the on-device indexer. Fail before the
-        // multi-minute pin build, not after.
-        if matches!(
+        // dsa/misa need the resident DSA indexer (placed by Pin::build when
+        // want_indexer). misa additionally needs the block-pool head router
+        // ported to device — not yet — so only dsa runs sparse on the GPU.
+        let want_indexer = matches!(
             cfg.attn,
             rivoli::attn::AttnMode::Dsa | rivoli::attn::AttnMode::Misa { .. }
-        ) {
+        );
+        if matches!(cfg.attn, rivoli::attn::AttnMode::Misa { .. }) {
             bail!(
-                "--attn {:?} is scalar-reference only for now (GPU indexer pending); \
-                 build without the rocm feature to use the reference engine",
-                cfg.attn
+                "--attn misa is scalar-reference only for now (device head-router pending); \
+                 use --attn dsa on the GPU path, or build without the rocm feature"
             );
         }
         let (free, _total) = rivoli::device::mem_info()?;
@@ -311,6 +311,7 @@ async fn run(cfg: Config) -> Result<()> {
             cfg.prefetch,
             cfg.prefetch_depth,
             cfg.direct_io,
+            want_indexer,
         )?;
         info!("pin built in {:.1}s", t.elapsed().as_secs_f64());
         let max_ctx = prompt_ids.len() + ngen + 1;
