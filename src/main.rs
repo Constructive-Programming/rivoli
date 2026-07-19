@@ -268,19 +268,13 @@ async fn run(cfg: Config) -> Result<()> {
     // device. Falls back to the scalar reference path without the `rocm` feature.
     #[cfg(feature = "rocm")]
     {
-        // dsa/misa need the resident DSA indexer (placed by Pin::build when
-        // want_indexer). misa additionally needs the block-pool head router
-        // ported to device — not yet — so only dsa runs sparse on the GPU.
+        // dsa/misa both need the resident DSA indexer (placed by Pin::build when
+        // want_indexer); misa additionally routes heads via the block pool the
+        // engine maintains on device.
         let want_indexer = matches!(
             cfg.attn,
             rivoli::attn::AttnMode::Dsa | rivoli::attn::AttnMode::Misa { .. }
         );
-        if matches!(cfg.attn, rivoli::attn::AttnMode::Misa { .. }) {
-            bail!(
-                "--attn misa is scalar-reference only for now (device head-router pending); \
-                 use --attn dsa on the GPU path, or build without the rocm feature"
-            );
-        }
         let (free, _total) = rivoli::device::mem_info()?;
         // Budget = the always-resident set (footprint computed from cfg in
         // Pin::build, ~9-10 GiB for GLM-5.2) + the routed-expert LRU. Fill most of
