@@ -286,8 +286,16 @@ deleted; the MTP salvage branches are archived as `deadend/*`.
   commit `16bae7f`'s "grow pool to ~92 GiB" as unsafe — it was never run past
   256 tokens. Footgun still stands: io_uring→VMM EFAULTs on NFS fds (kernel
   6.18.38) — the model must live on **local** `/var/db`, not `/swarm`.
-  Follow-up (recover the ~18 GiB the conservative reserve leaves on the table):
-  find the true backable ceiling, or shard the pool into multiple VMM handles.
+  Pool sizing is settled — no memory left to recover. The ~26 GiB reserve is not
+  waste: a larger footprint either corrupts (≥ ~92 GiB total) or thrashes via OS
+  page reclaim (~84 GiB total measured *slower*, 0.98 vs 1.31 tok/s at lower hit),
+  so ~64 GiB is the throughput-optimal pool. Sharding into multiple VMM handles
+  would not help — the ceiling is total device footprint, not per-handle size (a
+  single 82 GiB handle commits+reads back fine in isolation). And the slots are
+  already byte-optimal: int4 weights with 0.13% O_DIRECT alignment padding
+  (~24 KiB per 18 MiB slot); fp8 would *double* each expert (int4 is 4-bit, fp8
+  8-bit) and halve capacity. The only lever left for more resident experts is a
+  sub-int4 quant, which is a quality tradeoff, not a layout change.
 - **M5 hardening — MET (2026-07-20).** Sole-tenant guard
   (`device::DeviceTier::guard_sole_tenant`, refuses to start on foreign GTT
   > 1 GiB — the gate's "clean refusal, not a wedge"), in-process **wedge
