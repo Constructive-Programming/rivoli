@@ -288,10 +288,16 @@ deleted; the MTP salvage branches are archived as `deadend/*`.
   6.18.38) — the model must live on **local** `/var/db`, not `/swarm`.
   Follow-up (recover the ~18 GiB the conservative reserve leaves on the table):
   find the true backable ceiling, or shard the pool into multiple VMM handles.
-- **M5 hardening — PARTIAL.** *Have:* sole-tenant guard, PROFILE metrics,
-  `build.sh`/`test.sh`, git hooks, and the `--kv-fp8` / `--direct-io` /
-  `--cache-policy` / attention-mode knobs. *Not done:* in-process wedge watchdog;
-  the 3× 512-run < 10%-variance stability gate; optional OTLP export.
+- **M5 hardening — MET (2026-07-20).** Sole-tenant guard
+  (`device::DeviceTier::guard_sole_tenant`, refuses to start on foreign GTT
+  > 1 GiB — the gate's "clean refusal, not a wedge"), in-process **wedge
+  watchdog** (`src/watchdog.rs`: a background thread aborts with a clear message
+  if no token lands for 60 s, since a hung `hipDeviceSynchronize` can't be caught
+  in-loop), PROFILE metrics, `build.sh`/`test.sh`, git hooks, and the `--kv-fp8`
+  / `--direct-io` / `--cache-policy` / attention-mode knobs. **Stability gate: 3
+  consecutive 512-token runs = 1.31 / 1.31 / 1.31 tok/s at 90.9% hit, 0.0%
+  variance — PASS** (target < 10%). *Optional, deferred:* OTLP export (the
+  router-project telemetry pattern); PROFILE stdout metrics cover current needs.
 - **M6 stretch — NPU dense offload — not started.** The colibri-npu spike proved
   int8 GEMM at 2.78 TOPS (~10× CPU); nothing wired into rivoli yet.
 
