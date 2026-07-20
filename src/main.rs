@@ -44,6 +44,10 @@ struct Args {
     misa_heads: usize,
     kv_fp8: bool,
     spec: bool,
+    spec_gate: bool,
+    spec_gate_warmup: usize,
+    spec_gate_margin: f64,
+    spec_gate_probe: usize,
 }
 
 fn parse_args() -> Result<Args> {
@@ -51,7 +55,8 @@ fn parse_args() -> Result<Args> {
          [--direct-vmm-dma] [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc] \
          [--no-prefetch] [--prefetch-depth <n>] [--max-pool-size <GiB>] [--direct-io] \
          [--attn dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>] [--kv-fp8] \
-         [--spec]";
+         [--spec] [--no-spec-gate] [--spec-gate-warmup <n>] [--spec-gate-margin <f>] \
+         [--spec-gate-probe <n>]";
     let mut snapshot = None;
     // Defaults are the validated winning config: ARC eviction + cross-layer prefetch
     // (best hit% on realistic multi-request sessions + the ~+11% prefetch overlap).
@@ -73,6 +78,13 @@ fn parse_args() -> Result<Args> {
         misa_heads: 8, // the MISA paper's validated GLM-5 setting
         kv_fp8: false,
         spec: false,
+        // Spec-overlap gate defaults (mirror gpu::SpecGate::default()); active only
+        // with --spec. The gate is ON by default — pay for a speculative round only
+        // when its marginal expert fetch is ~byte-free or accept amortizes it.
+        spec_gate: true,
+        spec_gate_warmup: 8,
+        spec_gate_margin: 1.0,
+        spec_gate_probe: 32,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -140,6 +152,32 @@ fn parse_args() -> Result<Args> {
             }
             "--kv-fp8" => a.kv_fp8 = true,
             "--spec" => a.spec = true,
+            "--spec-gate" => a.spec_gate = true, // default already on; explicit is fine
+            "--no-spec-gate" => a.spec_gate = false,
+            "--spec-gate-warmup" => {
+                a.spec_gate_warmup = args
+                    .next()
+                    .context("--spec-gate-warmup requires an integer")?
+                    .parse()
+                    .context("--spec-gate-warmup takes an integer")?;
+            }
+            "--spec-gate-margin" => {
+                a.spec_gate_margin = args
+                    .next()
+                    .context("--spec-gate-margin requires a float")?
+                    .parse()
+                    .context("--spec-gate-margin takes a float")?;
+                if !(a.spec_gate_margin.is_finite() && a.spec_gate_margin >= 0.0) {
+                    bail!("--spec-gate-margin must be a finite, non-negative number");
+                }
+            }
+            "--spec-gate-probe" => {
+                a.spec_gate_probe = args
+                    .next()
+                    .context("--spec-gate-probe requires an integer")?
+                    .parse()
+                    .context("--spec-gate-probe takes an integer")?;
+            }
             _ if snapshot.is_none() => snapshot = Some(arg),
             _ => bail!("unexpected argument: {arg}\n{USAGE}"),
         }
@@ -183,6 +221,10 @@ fn main() -> Result<()> {
         attn,
         a.kv_fp8,
         a.spec,
+        a.spec_gate,
+        a.spec_gate_warmup,
+        a.spec_gate_margin,
+        a.spec_gate_probe,
     )?;
 
     // Rule 1: the full discovered config is the first line of every run.
@@ -331,6 +373,12 @@ async fn run(cfg: Config) -> Result<()> {
                 !cfg.kv_fp8,
                 "--spec is incompatible with --kv-fp8 (bf16 KV path only)"
             );
+            engine.set_spec_gate(rivoli::gpu::SpecGate {
+                enabled: cfg.spec_gate,
+                warmup: cfg.spec_gate_warmup,
+                margin: cfg.spec_gate_margin,
+                probe: cfg.spec_gate_probe,
+            });
         }
         let t0 = std::time::Instant::now();
         let ids = if cfg.spec {

@@ -964,6 +964,14 @@ impl<'a> Pin<'a> {
         Ok(())
     }
 
+    /// Is routed `expert` of MoE `layer` currently resident (or already bound by an
+    /// in-flight prefetch) in the expert pool? The spec-overlap gate prices a
+    /// draft's marginal fetch with this: a resident — or overlap-prefetched, since
+    /// `prefetch_layer` binds the key at submit time — expert costs ~no extra bytes.
+    pub fn expert_resident(&self, layer: usize, expert: usize) -> bool {
+        self.pool.contains(expert_key(layer, expert))
+    }
+
     /// Is cross-layer prefetch enabled (`--prefetch`)?
     pub fn prefetch_enabled(&self) -> bool {
         self.prefetch_stream.is_some()

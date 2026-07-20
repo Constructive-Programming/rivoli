@@ -86,6 +86,21 @@ pub struct Config {
     /// share one union expert-fetch). Emits the same tokens as greedy decode;
     /// requires the snapshot's out-mtp shard and Dense attention. Default false.
     pub spec: bool,
+    /// Round-level spec-overlap gate (`--spec-gate` / `--no-spec-gate`, default on
+    /// when `--spec`). When on, each round decides whether to run the S=2 batched
+    /// verify or fall back to a plain S=1 step, based on the measured marginal fetch
+    /// cost — speculation only pays when its extra experts are ~byte-free or the
+    /// accept rate is high enough. Ignored unless `spec`. See `gpu::SpecGate`.
+    pub spec_gate: bool,
+    /// Prime the gate with this many unconditional spec rounds before it can fire
+    /// (`--spec-gate-warmup`, default 8).
+    pub spec_gate_warmup: usize,
+    /// Break-even multiplier for the gate (`--spec-gate-margin`, default 1.0):
+    /// speculate when `ema_marginal < margin * ema_accept * ema_base`.
+    pub spec_gate_margin: f64,
+    /// Force a probe spec round every N gated-off steps so the gate can re-open
+    /// (`--spec-gate-probe`, default 32; 0 disables re-probing).
+    pub spec_gate_probe: usize,
 }
 
 fn mem_available() -> Result<u64> {
@@ -125,6 +140,10 @@ impl Config {
         attn: AttnMode,
         kv_fp8: bool,
         spec: bool,
+        spec_gate: bool,
+        spec_gate_warmup: usize,
+        spec_gate_margin: f64,
+        spec_gate_probe: usize,
     ) -> Result<Self> {
         let avail = mem_available()?;
         if avail <= OS_RESERVE {
@@ -162,6 +181,10 @@ impl Config {
             attn,
             kv_fp8,
             spec,
+            spec_gate,
+            spec_gate_warmup,
+            spec_gate_margin,
+            spec_gate_probe,
         })
     }
 }
@@ -171,7 +194,7 @@ impl fmt::Display for Config {
         const GIB: f64 = (1u64 << 30) as f64;
         write!(
             f,
-            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} direct_io={} cache_policy={} prefetch={} prefetch_depth={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_pool_size={:.0}GiB threads={} attn={:?} kv_fp8={} spec={}",
+            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} direct_io={} cache_policy={} prefetch={} prefetch_depth={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_pool_size={:.0}GiB threads={} attn={:?} kv_fp8={} spec={} spec_gate={} spec_gate_warmup={} spec_gate_margin={} spec_gate_probe={}",
             self.snapshot,
             self.bench,
             self.pre_seed,
@@ -187,7 +210,11 @@ impl fmt::Display for Config {
             self.threads,
             self.attn,
             self.kv_fp8,
-            self.spec
+            self.spec,
+            self.spec_gate,
+            self.spec_gate_warmup,
+            self.spec_gate_margin,
+            self.spec_gate_probe
         )
     }
 }

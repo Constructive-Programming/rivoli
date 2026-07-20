@@ -27,6 +27,53 @@ use anyhow::{Result, bail, ensure};
 /// one token, so the verify batch is S=2 (the confirmed token + the draft).
 const MAX_SPEC: usize = 2;
 
+/// EMA smoothing for the spec-overlap gate's running stats (accept rate + per-
+/// round marginal/base misses). 0.2 ≈ a 5-round horizon — responsive to a
+/// changing residency regime without chattering on a single reject.
+const SPEC_GATE_ALPHA: f64 = 0.2;
+
+/// Round-level gate for MTP speculation (`--spec-gate`). Decode here is NVMe-
+/// bandwidth-bound, and the S=2 batched verify reads a 2-position expert union
+/// that is strictly larger than one top-8 — a net loss unless the draft's extra
+/// experts were mostly already resident/prefetched (~byte-free) OR the accept
+/// rate is high enough to amortize them. This gate decides, PER ROUND, whether to
+/// run the batched verify or fall back to a plain S=1 [`GpuEngine::forward`] step.
+///
+/// Break-even (derived): a spec round costs `base + marginal` non-resident expert
+/// fetches and yields `1 + accept` committed tokens on average, so its bytes per
+/// accepted token `(base + marginal)/(1 + accept)` beats the S=1 baseline `base`
+/// exactly when `marginal < accept * base`. The gate speculates when the EMAs
+/// satisfy that (scaled by [`margin`](SpecGate::margin)); otherwise it decodes one
+/// token normally. It NEVER changes which token is emitted — both paths emit the
+/// main model's argmax — only whether a step is batched.
+#[derive(Debug, Clone, Copy)]
+pub struct SpecGate {
+    /// Master enable. `false` speculates every round (the pre-gate behavior, kept
+    /// for A/B benching via `--no-spec-gate`).
+    pub enabled: bool,
+    /// Speculate unconditionally for the first `warmup` rounds to seed the EMAs
+    /// before the gate can fire.
+    pub warmup: usize,
+    /// Break-even multiplier: speculate when `ema_marginal < margin * ema_accept *
+    /// ema_base`. 1.0 = exact break-even; <1 more conservative, >1 more aggressive.
+    pub margin: f64,
+    /// Force one probe spec round every `probe` gated-off steps so the EMAs keep
+    /// refreshing and the gate can re-open if residency/accept improve. 0 disables
+    /// re-probing (the gate, once shut, stays shut until warmup stats age out).
+    pub probe: usize,
+}
+
+impl Default for SpecGate {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            warmup: 8,
+            margin: 1.0,
+            probe: 32,
+        }
+    }
+}
+
 fn desc_of(m: &Mlp) -> ExpertDesc {
     ExpertDesc {
         gate_packed: m.gate.packed,
@@ -256,6 +303,15 @@ pub struct GpuEngine<'a> {
     pred_sel: Vec<usize>,
     prefetch: bool,
     prefetch_depth: usize,
+    // Spec-overlap gate (`--spec-gate`). `spec_gate` holds the config; `forward_batch`
+    // tallies, per call and only when the gate is enabled, `round_base_misses` (the
+    // committed position s=0's own non-resident experts — bytes a plain S=1 step
+    // would pay anyway) and `round_marginal_misses` (experts ONLY a draft position
+    // s>=1 needed and were not already resident/prefetched — the marginal cost of
+    // speculating). `generate_spec` reads them after each round to drive the gate.
+    spec_gate: SpecGate,
+    round_base_misses: u64,
+    round_marginal_misses: u64,
     prof: Profile,
 }
 
@@ -435,9 +491,18 @@ impl<'a> GpuEngine<'a> {
             pred_sel: Vec::with_capacity(cfg.top_k),
             prefetch: pin.prefetch_enabled(),
             prefetch_depth: pin.prefetch_depth(),
+            spec_gate: SpecGate::default(),
+            round_base_misses: 0,
+            round_marginal_misses: 0,
             prof: Profile::default(),
             pin,
         })
+    }
+
+    /// Configure the spec-overlap gate used by [`generate_spec`](Self::generate_spec)
+    /// (`--spec-gate` and its threshold knobs). No effect on the non-spec path.
+    pub fn set_spec_gate(&mut self, gate: SpecGate) {
+        self.spec_gate = gate;
     }
 
     pub fn hits(&self) -> u64 {
@@ -644,7 +709,7 @@ impl<'a> GpuEngine<'a> {
     fn forward_batch(&mut self, tokens: &[u32], base_pos: usize) -> Result<Vec<u32>> {
         let cfg = self.cfg;
         let s_n = tokens.len();
-        ensure!(s_n >= 1 && s_n <= MAX_SPEC, "spec batch size {s_n}");
+        ensure!((1..=MAX_SPEC).contains(&s_n), "spec batch size {s_n}");
         ensure!(
             base_pos + s_n <= self.max_ctx,
             "spec batch [{base_pos},{}) exceeds max_ctx {}",
@@ -676,6 +741,11 @@ impl<'a> GpuEngine<'a> {
         let clatp = self.clat.ptr_mut() as *mut f32;
         let ctxp = self.ctx.ptr_mut() as *mut f32;
         let glp = self.gate_logits.ptr_mut() as *mut f32;
+
+        // Spec-gate instrumentation reset (see the fields' doc): this round's
+        // committed-position and draft-marginal non-resident-expert tallies.
+        self.round_base_misses = 0;
+        self.round_marginal_misses = 0;
 
         // SAFETY: all pointers are resident/scratch, valid until each device_sync.
         unsafe {
@@ -873,6 +943,25 @@ impl<'a> GpuEngine<'a> {
                 for e in 0..cfg.n_experts {
                     if (0..s_n).any(|s| self.wtab[s * cfg.n_experts + e] != 0.0) {
                         self.union.push(e);
+                    }
+                }
+                // Spec-gate: price this layer's fetch BEFORE `resolve_layer` makes the
+                // union resident. `s=0` is the committed position — its non-resident
+                // experts (`base`) would be fetched by a plain S=1 step too. An expert
+                // only a draft position (`s>=1`) needs, and that is not already resident
+                // or bound by an in-flight prefetch, is a `marginal` byte the speculation
+                // cost. Cheap (union is ≤ ~S*top_k), and skipped when the gate is off so
+                // `--no-spec-gate` stays byte-for-byte the old pure-spec path.
+                if self.spec_gate.enabled {
+                    for &e in &self.union {
+                        if self.pin.expert_resident(l, e) {
+                            continue;
+                        }
+                        if self.wtab[e] != 0.0 {
+                            self.round_base_misses += 1; // committed position s=0
+                        } else {
+                            self.round_marginal_misses += 1; // draft-only, non-resident
+                        }
                     }
                 }
                 self.pin.resolve_layer(l, &self.union, &mut self.mlps)?;
@@ -1666,7 +1755,18 @@ impl<'a> GpuEngine<'a> {
         let decode_wall = std::time::Instant::now();
         let mut out: Vec<u32> = Vec::with_capacity(ngen);
         let mut accepted = 0usize; // drafts that verified
-        let mut spec_iters = 0usize; // batched-verify rounds
+        let mut spec_iters = 0usize; // batched-verify rounds run
+        let mut normal_steps = 0usize; // gated-off plain S=1 decode steps
+        // Spec-overlap gate state (see [`SpecGate`]). EMAs of the accept rate and the
+        // per-round marginal/base non-resident-expert counts; `ema_init` guards the
+        // first observation (seed, not blend); `since_probe` counts gated-off steps
+        // since the last spec round for the periodic re-probe.
+        let gate = self.spec_gate;
+        let mut ema_accept = 0.0f64;
+        let mut ema_marginal = 0.0f64;
+        let mut ema_base = 0.0f64;
+        let mut ema_init = false;
+        let mut since_probe = 0usize;
 
         loop {
             if eos.contains(&cur) {
@@ -1688,14 +1788,66 @@ impl<'a> GpuEngine<'a> {
                 break;
             }
 
+            // --- The gate: speculate this round, or decode one token normally? ---
+            // Both paths emit the main model's argmax (greedy-equivalent); the gate
+            // only chooses whether the step is the S=2 batched verify or a plain S=1
+            // `forward`. Speculate while warming up (to seed the EMAs), unconditionally
+            // when disabled, on a periodic probe, or when the break-even holds:
+            // `ema_marginal < margin * ema_accept * ema_base` (marginal draft bytes are
+            // cheaper than the accepted-token throughput they buy).
+            let do_spec = !gate.enabled
+                || spec_iters < gate.warmup
+                || !ema_init
+                || (gate.probe > 0 && since_probe >= gate.probe)
+                || ema_marginal < gate.margin * ema_accept * ema_base;
+
+            if !do_spec {
+                // Gated fallback: a plain S=1 step — fetches only `cur`'s own experts,
+                // no draft union, no marginal bytes — mirroring the reject branch but
+                // via `forward` (byte-for-byte the `generate` path). `self.x` holds the
+                // fresh trunk for the MTP draft; the draft stays in lockstep.
+                self.forward(cur, pos)?;
+                let pa = self.argmax()?;
+                let d1 = self.mtp_draft(pa, pos)?; // MTP KV @pos (uses self.x); draft pos+2
+                cur = pa;
+                draft = d1;
+                pos += 1;
+                since_probe += 1;
+                normal_steps += 1;
+                continue;
+            }
+
             spec_iters += 1;
+            since_probe = 0;
             let preds = self.forward_batch(&[cur, draft], pos)?; // KV @pos, @pos+1
             let pa = preds[0]; // real token at pos+1
             let pb = preds[1]; // token at pos+2 (real iff draft == pa)
             // sx[0] = trunk_pos (predicts pa); sx[1] = trunk_{pos+1} (predicts pb).
             let sx = self.sx.ptr() as *const f32;
+            let accept = draft == pa;
 
-            if draft == pa {
+            // Refresh the gate EMAs from this round's outcome + `forward_batch`'s
+            // marginal/base tally (only meaningful, and only tallied, when enabled).
+            if gate.enabled {
+                let (acc, mm, mb) = (
+                    if accept { 1.0 } else { 0.0 },
+                    self.round_marginal_misses as f64,
+                    self.round_base_misses as f64,
+                );
+                if ema_init {
+                    const A: f64 = SPEC_GATE_ALPHA;
+                    ema_accept = A * acc + (1.0 - A) * ema_accept;
+                    ema_marginal = A * mm + (1.0 - A) * ema_marginal;
+                    ema_base = A * mb + (1.0 - A) * ema_base;
+                } else {
+                    ema_accept = acc;
+                    ema_marginal = mm;
+                    ema_base = mb;
+                    ema_init = true;
+                }
+            }
+
+            if accept {
                 // ACCEPT — draft matched the main model; pa@pos+1 and pb@pos+2 real.
                 accepted += 1;
                 if eos.contains(&pa) {
@@ -1728,8 +1880,14 @@ impl<'a> GpuEngine<'a> {
         self.prof.report();
         let acc_pct = 100.0 * accepted as f64 / spec_iters.max(1) as f64;
         tracing::info!(
-            "spec: {} tokens in {spec_iters} verify rounds, {accepted} accepted ({acc_pct:.1}%)",
+            "spec: {} tokens; {spec_iters} verify rounds ({accepted} accepted, {acc_pct:.1}%), \
+             {normal_steps} gated-off normal steps; gate ema_accept={:.2} ema_marginal={:.1} \
+             ema_base={:.1} (enabled={})",
             out.len(),
+            ema_accept,
+            ema_marginal,
+            ema_base,
+            gate.enabled,
         );
         Ok(out)
     }
