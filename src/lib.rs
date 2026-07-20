@@ -13,6 +13,7 @@ pub mod pin;
 pub mod quant;
 pub mod snapshot;
 pub mod stream;
+pub mod telemetry;
 pub mod tokenizer;
 pub mod usage;
 pub mod watchdog;

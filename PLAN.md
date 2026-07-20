@@ -296,8 +296,11 @@ deleted; the MTP salvage branches are archived as `deadend/*`.
   in-loop), PROFILE metrics, `build.sh`/`test.sh`, git hooks, and the `--kv-fp8`
   / `--direct-io` / `--cache-policy` / attention-mode knobs. **Stability gate: 3
   consecutive 512-token runs = 1.31 / 1.31 / 1.31 tok/s at 90.9% hit, 0.0%
-  variance — PASS** (target < 10%). *Optional, deferred:* OTLP export (the
-  router-project telemetry pattern); PROFILE stdout metrics cover current needs.
+  variance — PASS** (target < 10%). **OTLP span export** (`src/telemetry.rs`,
+  mirroring the ollama-router pattern): opt-in via `OTEL_EXPORTER_OTLP_ENDPOINT`,
+  batch-exports a `rivoli.decode` span (tokens / tok_per_s / hit_pct attributes +
+  the PROFILE/summary events) over OTLP-HTTP to the fleet Tempo pipeline; unset ⇒
+  log-only. **M5 CLOSED** — all items done.
 - **M6 stretch — NPU dense offload — not started.** The colibri-npu spike proved
   int8 GEMM at 2.78 TOPS (~10× CPU); nothing wired into rivoli yet.
 

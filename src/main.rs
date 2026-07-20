@@ -146,12 +146,6 @@ fn parse_args() -> Result<Args> {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-
     let a = parse_args()?;
     let attn = match a.attn.as_str() {
         "dense" => rivoli::attn::AttnMode::Dense,
@@ -181,9 +175,6 @@ fn main() -> Result<()> {
         a.kv_fp8,
     )?;
 
-    // Rule 1: the full discovered config is the first line of every run.
-    info!("rivoli {} | {cfg}", env!("CARGO_PKG_VERSION"));
-
     // Decode is synchronous; tokio owns the feed side only. Worker count is
     // the discovered CPU pool size — never the SMT-logical count.
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -196,6 +187,33 @@ fn main() -> Result<()> {
 }
 
 async fn run(cfg: Config) -> Result<()> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    // Subscriber init lives here (inside the tokio runtime) so the OTLP batch
+    // processor can spawn its export task. OTLP is opt-in via
+    // OTEL_EXPORTER_OTLP_ENDPOINT; unset ⇒ log-only (the fmt layer).
+    let version = env!("CARGO_PKG_VERSION");
+    let env_filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    let (otel_layer, tracer_provider) = match rivoli::telemetry::otlp_layer(version) {
+        Ok(Some((layer, provider))) => (Some(layer), Some(provider)),
+        Ok(None) => (None, None),
+        Err(e) => {
+            eprintln!("OTLP init failed ({e}); continuing log-only");
+            (None, None)
+        }
+    };
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(otel_layer)
+        .init();
+    if tracer_provider.is_some() {
+        info!("OTLP tracing enabled");
+    }
+    // Rule 1: the full discovered config is the first line of every run.
+    info!("rivoli {version} | {cfg}");
+
     if !std::path::Path::new(&cfg.snapshot).is_dir() {
         bail!("snapshot dir not found: {}", cfg.snapshot);
     }
@@ -325,28 +343,46 @@ async fn run(cfg: Config) -> Result<()> {
         // a background thread aborts the process if no token lands for 60 s (healthy
         // tokens are ~1-2 s here — this only trips on a real device wedge).
         engine.set_heartbeat(rivoli::watchdog::spawn(std::time::Duration::from_secs(60))?);
-        let t0 = std::time::Instant::now();
-        let ids = engine.generate(&prompt_ids, ngen, &tok.eos)?;
-        let dt = t0.elapsed().as_secs_f64();
-        let (hits, misses) = (engine.hits(), engine.misses());
-        info!(
-            "GPU: {} tokens in {:.1}s ({:.2} tok/s) | expert hit {:.1}% ({hits} hit / {misses} miss)",
-            ids.len(),
-            dt,
-            ids.len() as f64 / dt,
-            100.0 * hits as f64 / (hits + misses).max(1) as f64,
+        // One OTLP span per decode run; the per-token/PROFILE/summary events below
+        // attach to it, and the top-line metrics are recorded as queryable fields.
+        // The block holds no `.await`, so entering the span guard is race-free.
+        let decode_span = tracing::info_span!(
+            "rivoli.decode",
+            tokens = tracing::field::Empty,
+            tok_per_s = tracing::field::Empty,
+            hit_pct = tracing::field::Empty,
         );
-        if cfg.prefetch {
-            let (correct, total) = engine.prefetch_recall();
+        {
+            let _g = decode_span.enter();
+            let t0 = std::time::Instant::now();
+            let ids = engine.generate(&prompt_ids, ngen, &tok.eos)?;
+            let dt = t0.elapsed().as_secs_f64();
+            let (hits, misses) = (engine.hits(), engine.misses());
+            let tok_per_s = ids.len() as f64 / dt;
+            let hit_pct = 100.0 * hits as f64 / (hits + misses).max(1) as f64;
+            decode_span.record("tokens", ids.len() as u64);
+            decode_span.record("tok_per_s", tok_per_s);
+            decode_span.record("hit_pct", hit_pct);
             info!(
-                "prefetch: recall {:.1}% ({correct} of {total} predicted experts selected) \
-                 | drain-wait {:.0}ms total ({:.1}ms/tok not hidden)",
-                100.0 * correct as f64 / total.max(1) as f64,
-                engine.prefetch_wait_ms(),
-                engine.prefetch_wait_ms() / ids.len().max(1) as f64,
+                "GPU: {} tokens in {:.1}s ({tok_per_s:.2} tok/s) | expert hit {hit_pct:.1}% ({hits} hit / {misses} miss)",
+                ids.len(),
+                dt,
             );
+            if cfg.prefetch {
+                let (correct, total) = engine.prefetch_recall();
+                info!(
+                    "prefetch: recall {:.1}% ({correct} of {total} predicted experts selected) \
+                     | drain-wait {:.0}ms total ({:.1}ms/tok not hidden)",
+                    100.0 * correct as f64 / total.max(1) as f64,
+                    engine.prefetch_wait_ms(),
+                    engine.prefetch_wait_ms() / ids.len().max(1) as f64,
+                );
+            }
+            info!("{bench_prompt}{}", tok.decode_all(&ids)?);
         }
-        info!("{bench_prompt}{}", tok.decode_all(&ids)?);
+        if let Some(p) = tracer_provider {
+            let _ = p.shutdown(); // flush batched spans before exit
+        }
         Ok(())
     }
 
@@ -363,6 +399,9 @@ async fn run(cfg: Config) -> Result<()> {
             ids.len() as f64 / dt
         );
         info!("{bench_prompt}{}", tok.decode_all(&ids)?);
+        if let Some(p) = tracer_provider {
+            let _ = p.shutdown();
+        }
         Ok(())
     }
 }
