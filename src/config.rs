@@ -7,13 +7,12 @@ use crate::attn::AttnMode;
 use anyhow::{Context, Result, bail};
 use std::fmt;
 
-/// Reserved for the OS and other on-system processes, bytes.
-pub const OS_RESERVE: u64 = 16 << 30;
-
-/// Upper bound on the device expert pool (tier + routed slab), bytes. Fill most
-/// of device memory but cap here so scratch/KV keep headroom; the pool is online
-/// priming, so a bigger cap only captures more of this run's working set.
-pub const MAX_POOL: u64 = 80 << 30;
+/// Safety headroom left free for the OS + the pinned io_uring arena, bytes. The
+/// expert pool takes `free − OS_RESERVE` by default (`--max-mem` caps below that);
+/// 8 GiB is the validated floor on the 124 GiB Strix Halo box (idle uses ~2 GiB +
+/// reclaimable page cache). Decode is cold-miss-fetch-bound, so every GiB not
+/// reserved becomes cache and lifts the hit rate — hence "take all safe free".
+pub const OS_RESERVE: u64 = 8 << 30;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -58,10 +57,12 @@ pub struct Config {
     /// (0.35 vs 0.86 tok/s). The CPU never computes experts — it routes,
     /// samples, and keeps the GPU fed.
     pub threads: usize,
-    /// Upper bound on the device expert pool (tier + routed slab), bytes
-    /// (`--max-pool-size <GiB>`). Default [`MAX_POOL`]. `main` caps the resolved
-    /// pool budget at `min(free − OS_RESERVE, max_pool_size)`.
-    pub max_pool_size: u64,
+    /// Device expert-pool budget cap, bytes (`--max-mem <GiB>`). `None` (the
+    /// default) means take all safe free memory: `main` sets the pool to
+    /// `free − OS_RESERVE`. `Some(n)` caps it lower — the resolved budget is
+    /// `min(free − OS_RESERVE, n)`. Bigger = more resident experts = higher hit
+    /// rate on this cold-miss-fetch-bound decode.
+    pub max_mem: Option<u64>,
     /// Cold-expert read path (`--direct-io`). `true` = O_DIRECT (bypass the OS page
     /// cache, DMA straight from NVMe), `false` (default) = buffered reads through the
     /// page cache. Only selects which fd the io_uring cold reads use — the
@@ -109,7 +110,7 @@ impl Config {
         cache_policy: String,
         prefetch: bool,
         prefetch_depth: usize,
-        max_pool_size: u64,
+        max_mem: Option<u64>,
         direct_io: bool,
         attn: AttnMode,
         kv_fp8: bool,
@@ -145,7 +146,7 @@ impl Config {
             prefetch,
             prefetch_depth,
             threads,
-            max_pool_size,
+            max_mem,
             direct_io,
             attn,
             kv_fp8,
@@ -158,7 +159,7 @@ impl fmt::Display for Config {
         const GIB: f64 = (1u64 << 30) as f64;
         write!(
             f,
-            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} direct_io={} cache_policy={} prefetch={} prefetch_depth={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_pool_size={:.0}GiB threads={} attn={:?} kv_fp8={}",
+            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} direct_io={} cache_policy={} prefetch={} prefetch_depth={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={} threads={} attn={:?} kv_fp8={}",
             self.snapshot,
             self.bench,
             self.pre_seed,
@@ -170,7 +171,10 @@ impl fmt::Display for Config {
             self.trace,
             self.prompt,
             OS_RESERVE as f64 / GIB,
-            self.max_pool_size as f64 / GIB,
+            match self.max_mem {
+                Some(n) => format!("{:.0}GiB", n as f64 / GIB),
+                None => "auto(all free)".to_string(),
+            },
             self.threads,
             self.attn,
             self.kv_fp8

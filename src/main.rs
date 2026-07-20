@@ -18,8 +18,9 @@ use tracing::info;
 /// `--no-prefetch` and `--cache-policy lru|2q` opt out (for A/B benching). Prefetch
 /// composes with `--direct-vmm-dma` (sound via the pool's disjointness floor — see
 /// Pin::build's slot_floor + prefetch_layer's correctness note).
-/// `--max-pool-size <GiB>` overrides the default device-pool cap (config::MAX_POOL,
-/// 80 GiB); the resolved pool budget is `min(free − OS_RESERVE, max_pool_size)`.
+/// `--max-mem <GiB>` caps the device expert-pool budget; default (unset) takes all
+/// safe free memory (`free − OS_RESERVE`), and a value caps it lower:
+/// `min(free − OS_RESERVE, max_mem)`. Bigger = more resident experts = higher hit.
 /// `--direct-io` makes the cold-expert reads use O_DIRECT (bypass the OS page
 /// cache); default is buffered reads through the page cache.
 /// `--attn dense|streaming|dsa|misa` picks the attention row-selection
@@ -36,7 +37,7 @@ struct Args {
     cache_policy: String,
     prefetch: bool,
     prefetch_depth: usize,
-    max_pool_size: u64,
+    max_mem: Option<u64>,
     direct_io: bool,
     attn: String,
     sinks: usize,
@@ -48,7 +49,7 @@ struct Args {
 fn parse_args() -> Result<Args> {
     const USAGE: &str = "usage: rivoli <snapshot-dir> [-bench <tokens>] [--pre-seed] \
          [--direct-vmm-dma] [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc] \
-         [--no-prefetch] [--prefetch-depth <n>] [--max-pool-size <GiB>] [--direct-io] \
+         [--no-prefetch] [--prefetch-depth <n>] [--max-mem <GiB>] [--direct-io] \
          [--attn dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>] [--kv-fp8]";
     let mut snapshot = None;
     // Defaults are the validated winning config: ARC eviction + cross-layer prefetch
@@ -63,7 +64,7 @@ fn parse_args() -> Result<Args> {
         cache_policy: "arc".to_string(),
         prefetch: true,
         prefetch_depth: 2,
-        max_pool_size: rivoli::config::MAX_POOL,
+        max_mem: None, // default: take all safe free memory (free − OS_RESERVE)
         direct_io: false,
         attn: "dense".to_string(),
         sinks: 4,
@@ -94,16 +95,16 @@ fn parse_args() -> Result<Args> {
                     .parse()
                     .context("--prefetch-depth takes an integer")?;
             }
-            "--max-pool-size" => {
+            "--max-mem" => {
                 let gib: u64 = args
                     .next()
-                    .context("--max-pool-size requires a GiB integer")?
+                    .context("--max-mem requires a GiB integer")?
                     .parse()
-                    .context("--max-pool-size takes an integer number of GiB")?;
+                    .context("--max-mem takes an integer number of GiB")?;
                 if gib == 0 {
-                    bail!("--max-pool-size must be a positive integer number of GiB");
+                    bail!("--max-mem must be a positive integer number of GiB");
                 }
-                a.max_pool_size = gib << 30;
+                a.max_mem = Some(gib << 30);
             }
             "--direct-io" => a.direct_io = true,
             "--attn" => {
@@ -174,7 +175,7 @@ fn main() -> Result<()> {
         a.cache_policy,
         a.prefetch,
         a.prefetch_depth,
-        a.max_pool_size,
+        a.max_mem,
         a.direct_io,
         attn,
         a.kv_fp8,
@@ -279,22 +280,27 @@ async fn run(cfg: Config) -> Result<()> {
         // Budget = the always-resident set (footprint computed from cfg in
         // Pin::build, ~9-10 GiB for GLM-5.2) + the routed-expert LRU. Fill most of
         // device memory: the LRU is online priming, so a bigger pool captures more
-        // of this run's working set (sim: 3200 slots→72%, 4200→75% hit) — leave
-        // OS_RESERVE headroom for scratch/KV, capped at cfg.max_pool_size
-        // (--max-pool-size, default MAX_POOL). The pin splits this into resident tier
-        // + LRU. This is the ACTUAL residency budget — the config log carries the two
-        // bounds, this line carries the resolved value.
+        // of this run's working set (sim: 3200 slots→72%, 4200→75% hit). Default
+        // takes all safe free memory (free − OS_RESERVE); `--max-mem <GiB>` caps it
+        // lower. The pin splits this into resident tier + LRU. This is the ACTUAL
+        // residency budget — the config log carries the bounds, this line the
+        // resolved value.
         use rivoli::config::OS_RESERVE;
         const GIB: f64 = (1u64 << 30) as f64;
-        let cap = free
-            .saturating_sub(OS_RESERVE as usize)
-            .min(cfg.max_pool_size as usize);
+        let safe = free.saturating_sub(OS_RESERVE as usize);
+        let cap = match cfg.max_mem {
+            Some(m) => safe.min(m as usize),
+            None => safe,
+        };
         info!(
-            "device pool budget {:.1} GiB (free {:.1} GiB − {:.0} GiB OS reserve, capped at {:.0} GiB)",
+            "device pool budget {:.1} GiB (free {:.1} GiB − {:.0} GiB OS reserve{})",
             cap as f64 / GIB,
             free as f64 / GIB,
             OS_RESERVE as f64 / GIB,
-            cfg.max_pool_size as f64 / GIB,
+            match cfg.max_mem {
+                Some(m) => format!(", capped at --max-mem {:.0} GiB", m as f64 / GIB),
+                None => String::new(),
+            },
         );
         let t = std::time::Instant::now();
         let pin = rivoli::pin::Pin::build(
