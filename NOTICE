@@ -1,0 +1,28 @@
+rivoli
+Copyright (c) 2026 Constructive Programming
+
+This product is licensed under the MIT License (see LICENSE).
+
+------------------------------------------------------------------------
+Attribution
+------------------------------------------------------------------------
+
+This project was inspired by colibri, and used it as a reference during
+development:
+
+    colibri — https://github.com/JustVugg/colibri
+    Copyright (c) JustVugg and colibri contributors
+    Licensed under the Apache License, Version 2.0
+    https://www.apache.org/licenses/LICENSE-2.0
+
+rivoli is an independent implementation written from scratch in Rust. It
+is not a fork or a derivative distribution of colibri, and contains no
+copied colibri source. colibri's `glm.c` was consulted as a reference
+oracle to validate numerical parity (int4 snapshot layout, MoE gating,
+and attention row projection), and rivoli reads colibri's on-disk int4
+snapshot and usage-ranking file formats so that artifacts transfer
+between the two engines.
+
+Credit to the colibri authors for demonstrating that a 744B
+mixture-of-experts model can be decoded on consumer hardware, and for
+publishing the work openly.

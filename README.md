@@ -75,3 +75,6 @@ GEMV decode.
 ## License
 
 MIT. See [`LICENSE`](LICENSE).
+
+[`NOTICE`](NOTICE) credits [colibri](https://github.com/JustVugg/colibri)
+(Apache-2.0), which inspired this work and served as its reference oracle.
