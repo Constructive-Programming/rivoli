@@ -1,4 +1,4 @@
-# rolibri — GLM-5.2 MoE decode engine in Rust + ROCm for Strix Halo
+# rivoli — GLM-5.2 MoE decode engine in Rust + ROCm for Strix Halo
 
 Goal: **stable ≥ 1 tok/s** GLM-5.2 (744B int4, 78 layers, 256 experts, top-8)
 single-stream decode on rh-anine (AMD Ryzen AI MAX+ 395, Radeon 8060S gfx1151,
@@ -75,8 +75,8 @@ them is cut.
 **No environment variables. One flag.**
 
 ```
-rolibri <snapshot-dir> -bench <tokens>     # benchmark mode: decode N tokens, print PROFILE
-rolibri <snapshot-dir>                     # (later) OpenAI-compatible server mode
+rivoli <snapshot-dir> -bench <tokens>     # benchmark mode: decode N tokens, print PROFILE
+rivoli <snapshot-dir>                     # (later) OpenAI-compatible server mode
 ```
 
 Everything else is **auto-discovered at startup** and printed as the first
@@ -102,13 +102,13 @@ line of the run:
 Single crate, flat modules (ollama-router layout), edition 2024, tokio.
 
 ```
-rolibri/
+rivoli/
   Cargo.toml
   build.rs              # feature "rocm": compile kernels/*.hip via hipcc
   kernels/
     moe_fused.hip       # per-layer fused batch: int4 dequant × (gate,up) → silu⊙ → down → weighted-accum
   src/
-    main.rs             # CLI: rolibri <snapshot> [-bench N]; tokio runtime (multi_thread, workers = discovered)
+    main.rs             # CLI: rivoli <snapshot> [-bench N]; tokio runtime (multi_thread, workers = discovered)
     lib.rs
     config.rs           # zero-knob auto-discovery (memory budgets, device tier, CPU pool) — printed in full at startup
     snapshot.rs         # safetensors mmap; tensor index; int4/int8 layouts (colibri-compatible snapshot)
