@@ -15,3 +15,4 @@ pub mod snapshot;
 pub mod stream;
 pub mod tokenizer;
 pub mod usage;
+pub mod watchdog;

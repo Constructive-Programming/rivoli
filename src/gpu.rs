@@ -211,6 +211,8 @@ pub struct GpuEngine<'a> {
     lc_scale: Vec<DeviceBuf>, // empty unless kv_fp8
     kv_fp8: bool,
     n_kv_blocks: usize, // kvl / E4M3_BLOCK (fp8 scales per token)
+    // Optional wedge watchdog heartbeat, beaten once per decoded token.
+    heartbeat: Option<crate::watchdog::Heartbeat>,
     // Host routing/argmax scratch.
     scores: Vec<f32>,
     choice: Vec<f32>,
@@ -383,8 +385,14 @@ impl<'a> GpuEngine<'a> {
             prefetch: pin.prefetch_enabled(),
             prefetch_depth: pin.prefetch_depth(),
             prof: Profile::default(),
+            heartbeat: None,
             pin,
         })
+    }
+
+    /// Attach a wedge-watchdog heartbeat; the decode loop beats it each token.
+    pub fn set_heartbeat(&mut self, hb: crate::watchdog::Heartbeat) {
+        self.heartbeat = Some(hb);
     }
 
     pub fn hits(&self) -> u64 {
@@ -1001,6 +1009,9 @@ impl<'a> GpuEngine<'a> {
         let mut win_t = std::time::Instant::now();
         let (mut win_hit, mut win_miss) = (self.pin.hits, self.pin.misses);
         for i in 0..ngen {
+            if let Some(hb) = &self.heartbeat {
+                hb.beat();
+            }
             let next = self.argmax()?;
             if eos.contains(&next) {
                 break;

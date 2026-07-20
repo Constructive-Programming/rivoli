@@ -321,6 +321,10 @@ async fn run(cfg: Config) -> Result<()> {
         let max_ctx = prompt_ids.len() + ngen + 1;
         let mut engine =
             rivoli::gpu::GpuEngine::new(pin, &mc, max_ctx, cfg.attn.clone(), cfg.kv_fp8)?;
+        // Wedge watchdog: a hung GPU join can't be caught inside the decode loop, so
+        // a background thread aborts the process if no token lands for 60 s (healthy
+        // tokens are ~1-2 s here — this only trips on a real device wedge).
+        engine.set_heartbeat(rivoli::watchdog::spawn(std::time::Duration::from_secs(60))?);
         let t0 = std::time::Instant::now();
         let ids = engine.generate(&prompt_ids, ngen, &tok.eos)?;
         let dt = t0.elapsed().as_secs_f64();
