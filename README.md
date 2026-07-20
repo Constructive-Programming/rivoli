@@ -9,21 +9,28 @@ A GLM-5.2 mixture-of-experts decode engine for the **AMD Strix Halo** APU
 streaming architecture and HIP/ROCm compute. Goal: **stable ≥ 1 tok/s**
 single-stream int4 decode of the full 744B model on one 128 GB machine.
 
-## Lineage
+## Inspiration
 
-rivoli is the successor to **colibri** — a from-scratch C engine that ran the
-same model on the same box. *Colibri* is Spanish for hummingbird; **Rivoli's
-hummingbird** keeps the name and honors François Victor Masséna, 2nd Duke of
-Rivoli, for whom the species is named. rivoli inherits colibri's hard-won
-evidence and its usage-ranking snapshot format directly, but rebuilds the
-architecture around what that campaign proved:
+rivoli is **not** a successor to, or a fork of,
+[**colibri**](https://github.com/JustVugg/colibri) — it is a separate engine
+that colibri inspired. colibri (JustVugg, Apache-2.0) is a C inference engine
+that runs the same GLM-5.2 744B model on consumer hardware; rivoli is written
+from scratch in Rust, and reads colibri's `glm.c` only as a reference oracle
+for numerical parity. *Colibrí* is Spanish for hummingbird; **Rivoli's
+hummingbird** keeps the theme and honors François Victor Masséna, 2nd Duke of
+Rivoli, for whom the species is named.
+
+What rivoli inherits is not code but a starting hypothesis. Running colibri on
+the target machine is what produced the evidence below — these are our own
+measurements on one 128 GB Strix Halo box, not colibri's published figures, and
+they are what the architecture is built around:
 
 - the decode is **dispatch-bound, not bandwidth-bound** — at 0.72 tok/s the
   memory bus sat ~96 % idle; the cost was ~920k OpenMP fork/joins per run and
   single-threaded glue, not weight traffic;
 - **pinning the hot experts** (usage-ranked, ~95 % hit) takes NVMe off the
   critical path;
-- **one fused kernel launch per layer** beats per-expert dispatch (colibri's
+- **one fused kernel launch per layer** beats per-expert dispatch (the measured
   ~4800 submits/token lost seconds to fence-waits);
 - **streaming the feed** — overlapping cold-expert fetch with resident
   compute — is what keeps the engine from starving serially.
