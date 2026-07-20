@@ -44,6 +44,7 @@ struct Args {
     misa_heads: usize,
     kv_fp8: bool,
     spec: bool,
+    spec_width: usize,
 }
 
 fn parse_args() -> Result<Args> {
@@ -51,7 +52,7 @@ fn parse_args() -> Result<Args> {
          [--direct-vmm-dma] [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc] \
          [--no-prefetch] [--prefetch-depth <n>] [--max-pool-size <GiB>] [--direct-io] \
          [--attn dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>] [--kv-fp8] \
-         [--spec]";
+         [--spec] [--spec-width <1|2>]";
     let mut snapshot = None;
     // Defaults are the validated winning config: ARC eviction + cross-layer prefetch
     // (best hit% on realistic multi-request sessions + the ~+11% prefetch overlap).
@@ -73,6 +74,7 @@ fn parse_args() -> Result<Args> {
         misa_heads: 8, // the MISA paper's validated GLM-5 setting
         kv_fp8: false,
         spec: false,
+        spec_width: 1,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -140,6 +142,16 @@ fn parse_args() -> Result<Args> {
             }
             "--kv-fp8" => a.kv_fp8 = true,
             "--spec" => a.spec = true,
+            "--spec-width" => {
+                a.spec_width = args
+                    .next()
+                    .context("--spec-width requires 1 or 2")?
+                    .parse()
+                    .context("--spec-width takes an integer")?;
+                if a.spec_width != 1 && a.spec_width != 2 {
+                    bail!("--spec-width must be 1 or 2 (got {})", a.spec_width);
+                }
+            }
             _ if snapshot.is_none() => snapshot = Some(arg),
             _ => bail!("unexpected argument: {arg}\n{USAGE}"),
         }
@@ -183,6 +195,7 @@ fn main() -> Result<()> {
         attn,
         a.kv_fp8,
         a.spec,
+        a.spec_width,
     )?;
 
     // Rule 1: the full discovered config is the first line of every run.
@@ -330,6 +343,13 @@ async fn run(cfg: Config) -> Result<()> {
             anyhow::ensure!(
                 !cfg.kv_fp8,
                 "--spec is incompatible with --kv-fp8 (bf16 KV path only)"
+            );
+            engine.set_spec_width(cfg.spec_width)?;
+        } else {
+            anyhow::ensure!(
+                cfg.spec_width == 1,
+                "--spec-width {} requires --spec",
+                cfg.spec_width
             );
         }
         let t0 = std::time::Instant::now();

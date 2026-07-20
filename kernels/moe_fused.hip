@@ -145,7 +145,7 @@ extern "C" int rivoli_moe_experts(
 // weights only the experts it selected (wexpert[s*E+e] = 0 for the rest), so the
 // output matches S independent S=1 MoE calls. x/out are [S*hidden] row-major;
 // wexpert is [S*E]; h is [S*E*inter]; partial is [S*E*hidden].
-#define MAXS 8 // max drafts verified per batch (1-token MTP head uses S=2)
+#define MAXS 8 // max positions verified per batch (chain S=2; width-2 tree S=3)
 
 // S wave-dots of the SAME int4 row against S input rows (base + s*xstride), so
 // the row's nibbles are decoded once and reused across positions. Results (one

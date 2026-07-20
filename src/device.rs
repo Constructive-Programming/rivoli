@@ -42,6 +42,7 @@ mod ffi {
     }
     pub const HIP_MEMCPY_H2D: i32 = 1;
     pub const HIP_MEMCPY_D2H: i32 = 2;
+    pub const HIP_MEMCPY_D2D: i32 = 3;
     pub const HIP_SUCCESS: i32 = 0;
 }
 
@@ -207,6 +208,30 @@ mod tier {
                 )
             };
             ensure!(e == HIP_SUCCESS, "hipMemcpy H2D failed ({e})");
+            Ok(())
+        }
+
+        /// Device-to-device copy of `len` bytes from byte offset `src_off` to
+        /// `dst_off` within THIS buffer. The spec-tree verify uses it to relocate
+        /// the winning sibling's KV row into the canonical position slot. The
+        /// source and destination regions must not overlap.
+        pub fn copy_within(&mut self, dst_off: usize, src_off: usize, len: usize) -> Result<()> {
+            ensure!(
+                dst_off + len <= self.len && src_off + len <= self.len,
+                "copy_within dst={dst_off} src={src_off} len={len} > buf len {}",
+                self.len
+            );
+            // SAFETY: both regions are within the buffer (checked); non-overlap is
+            // the caller's contract (distinct KV rows).
+            let e = unsafe {
+                hipMemcpy(
+                    self.ptr.add(dst_off) as *mut c_void,
+                    self.ptr.add(src_off) as *const c_void,
+                    len,
+                    HIP_MEMCPY_D2D,
+                )
+            };
+            ensure!(e == HIP_SUCCESS, "hipMemcpy D2D failed ({e})");
             Ok(())
         }
 

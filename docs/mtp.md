@@ -109,6 +109,46 @@ indexed; shapes validated at load.**
   (>~70%) AND high union overlap — not reachable with a 1-token MTP head here.
   `--spec` stays in as a verified-correct, opt-in mechanism; not the default.
 
+- **M5 — shared-union tree drafting (`--spec-width 2`).** M4 proved depth-1
+  batching loses on the bandwidth floor because a wasted-draft reject fetches its
+  experts for nothing (+16% bytes/token at 43% accept). The lever M4 leaves on the
+  table is **breadth, not depth**: raise *accepted-tokens-per-fetched-byte* by
+  covering more probability mass inside ONE shared expert union rather than adding
+  a second serial fetch. So instead of drafting the single top-1 candidate for the
+  next position, draft the MTP head's **top-2** (`da`,`db`) and verify BOTH in one
+  **S=3** batched forward `[cur, da, db]` where the two siblings SHARE the
+  per-layer expert union. Two near-tie candidates route through heavily
+  overlapping experts, so the union grows sub-linearly (≪2×) while the effective
+  accept rises (either candidate can match). Whichever sibling equals the main
+  model's argmax `pa` is confirmed and its own next-token prediction commits for
+  free; if neither matches, only `pa` is emitted (chain-style reject).
+
+  **Geometry.** Positions 1 and 2 are *siblings* at sequence `pos+1`: both roped
+  there, but sibling 2 lands at physical KV row `pos+2` and attends a GATHERED row
+  list `[0..=pos, pos+2]` (the shared prefix plus its own row, SKIPPING sibling
+  1's row) so the candidates never see each other. This reuses the attention
+  kernel's existing nullable `rows` gather (`kernels/attn.hip`) — no new attention
+  kernel. The fused-MoE kernel was already S-generic (`rivoli_moe_experts_batched`,
+  `MAXS=8`); only `MAX_SPEC` (2→3, scratch sizing) changed. When sibling 2 wins,
+  its KV row is relocated `pos+2 → pos+1` (a per-layer bf16 D2D copy,
+  `DeviceBuf::copy_within`) so the confirmed token occupies the canonical slot.
+
+  **Greedy-equivalence** holds by construction, unchanged from width 1: the
+  emitted token is ALWAYS the main model's argmax at the committed position
+  (`pa`, or `cur` at the loop head). The tree only decides whether the NEXT token
+  is confirmed early from a draft that provably equals `pa` — it never emits a
+  non-argmax token. `--spec-width 1` (default) is byte-identical to the pre-tree
+  `--spec` path (the `tests/mtp_spec.rs` intent).
+
+  **Status: IMPLEMENTED, not yet GPU-measured** (GPU was sole-tenant/off-limits at
+  build time; verified only via `cargo build/clippy/fmt --features rocm`, which
+  compiles the .hip kernels through hipcc). Wired: `GpuEngine::generate_spec_tree`,
+  `forward_batch(topo=Tree2)`, `mtp_draft2_trunk` (top-2), `spec_relocate_kv`,
+  `SpecTopo`, the `--spec-width` CLI. Open perf question the tree is designed to
+  answer: does the *union overlap* between the top-2 candidates keep bytes/token
+  below M4's +16% while lifting accept enough to beat baseline? Needs the 64/128-
+  tok A/B below.
+
 ## Why this is the right lever (recap)
 
 Decode is NVMe-read-bound and `attn`/`mlp` can't overlap (sequential residual

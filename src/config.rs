@@ -86,6 +86,11 @@ pub struct Config {
     /// share one union expert-fetch). Emits the same tokens as greedy decode;
     /// requires the snapshot's out-mtp shard and Dense attention. Default false.
     pub spec: bool,
+    /// Speculative verify width (`--spec-width`): 1 = the S=2 linear chain
+    /// (default), 2 = the shared-union tree (S=3, the MTP head's top-2 candidates
+    /// for the next position verified together, sharing one expert union). Only
+    /// meaningful with `--spec`.
+    pub spec_width: usize,
 }
 
 fn mem_available() -> Result<u64> {
@@ -125,6 +130,7 @@ impl Config {
         attn: AttnMode,
         kv_fp8: bool,
         spec: bool,
+        spec_width: usize,
     ) -> Result<Self> {
         let avail = mem_available()?;
         if avail <= OS_RESERVE {
@@ -162,6 +168,7 @@ impl Config {
             attn,
             kv_fp8,
             spec,
+            spec_width,
         })
     }
 }
@@ -171,7 +178,7 @@ impl fmt::Display for Config {
         const GIB: f64 = (1u64 << 30) as f64;
         write!(
             f,
-            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} direct_io={} cache_policy={} prefetch={} prefetch_depth={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_pool_size={:.0}GiB threads={} attn={:?} kv_fp8={} spec={}",
+            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} direct_io={} cache_policy={} prefetch={} prefetch_depth={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_pool_size={:.0}GiB threads={} attn={:?} kv_fp8={} spec={} spec_width={}",
             self.snapshot,
             self.bench,
             self.pre_seed,
@@ -187,7 +194,8 @@ impl fmt::Display for Config {
             self.threads,
             self.attn,
             self.kv_fp8,
-            self.spec
+            self.spec,
+            self.spec_width
         )
     }
 }

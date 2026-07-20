@@ -23,9 +23,30 @@ use crate::model::ModelConfig;
 use crate::pin::{IndexerPin, LayerMlp, Mlp, Pin};
 use anyhow::{Result, bail, ensure};
 
-/// Max positions verified in one speculative batch. A 1-token MTP head drafts
-/// one token, so the verify batch is S=2 (the confirmed token + the draft).
-const MAX_SPEC: usize = 2;
+/// Max positions verified in one speculative batch. The width-1 chain verifies
+/// S=2 (the confirmed token + one draft). The width-2 SHARED-UNION TREE verifies
+/// S=3 (the confirmed token + the MTP head's top-2 candidates for the next
+/// position, both siblings sharing the per-layer expert union). Sized for the
+/// larger; the fused-MoE kernel is S-generic (kernels/moe_fused.hip, `MAXS=8`).
+const MAX_SPEC: usize = 3;
+
+/// Topology of a [`GpuEngine::forward_batch`] batch: how the S positions map to
+/// sequence positions and which KV rows each attends.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SpecTopo {
+    /// Linear chain: position `s` sits at sequence `base_pos+s`, roped at
+    /// `base_pos+s`, and attends the dense causal prefix `0..=base_pos+s`
+    /// (each position sees the ones before it). The width-1 verify path.
+    Chain,
+    /// Width-2 tree, S=3: position 0 = the committed token at `base_pos`;
+    /// positions 1 and 2 are SIBLINGS at sequence `base_pos+1` (both roped at
+    /// `base_pos+1`). Position 1 lands at physical row `base_pos+1` and attends
+    /// the dense prefix `0..=base_pos+1`; position 2 lands at physical row
+    /// `base_pos+2` (a scratch slot) and attends the GATHERED prefix
+    /// `[0..=base_pos, base_pos+2]` — the shared prefix plus its own row,
+    /// SKIPPING sibling 1's row so the two candidates never see each other.
+    Tree2,
+}
 
 fn desc_of(m: &Mlp) -> ExpertDesc {
     ExpertDesc {
@@ -234,6 +255,13 @@ pub struct GpuEngine<'a> {
     wtab: Vec<f32>,         // host [MAX_SPEC*n_experts] per-position weight table
     union: Vec<usize>,      // host union expert set this layer
     pred_union: Vec<usize>, // host union of the S positions' predicted L+1 experts (prefetch)
+    // Speculative width: 1 = the S=2 linear chain (today's --spec); 2 = the
+    // SHARED-UNION TREE (S=3, MTP top-2 candidates for the next position share
+    // one expert union). Default 1; set via `set_spec_width`.
+    spec_width: usize,
+    tree_rows: DeviceBuf, // [max_ctx] u32: the gathered-KV-row list for sibling 2
+    tree_rows_host: Vec<u32>, // host build buffer for `tree_rows`
+    logits_host: Vec<u8>, // D2H staging for the MTP top-2 draft (width-2 only)
     // Host routing/argmax scratch.
     scores: Vec<f32>,
     choice: Vec<f32>,
@@ -421,6 +449,10 @@ impl<'a> GpuEngine<'a> {
             wtab: vec![0.0; MAX_SPEC * cfg.n_experts],
             union: Vec::with_capacity(MAX_SPEC * cfg.top_k),
             pred_union: Vec::with_capacity(MAX_SPEC * cfg.top_k),
+            spec_width: 1,
+            tree_rows: mtp_kv(max_ctx * 4)?, // [max_ctx] u32
+            tree_rows_host: Vec::with_capacity(max_ctx),
+            logits_host: Vec::new(),
             scores: vec![0.0; cfg.n_experts],
             choice: vec![0.0; cfg.n_experts],
             sel: Vec::with_capacity(cfg.top_k),
@@ -438,6 +470,19 @@ impl<'a> GpuEngine<'a> {
             prof: Profile::default(),
             pin,
         })
+    }
+
+    /// Select the speculative verify width: 1 = the S=2 linear chain (default),
+    /// 2 = the shared-union tree (S=3, MTP top-2 candidates). Width 2 needs the
+    /// resident MTP layer (same as any `--spec` run). Values other than 1 or 2
+    /// are rejected — the tree scratch is sized for S ≤ [`MAX_SPEC`].
+    pub fn set_spec_width(&mut self, width: usize) -> Result<()> {
+        ensure!(
+            width == 1 || width == 2,
+            "spec width must be 1 or 2 (got {width})"
+        );
+        self.spec_width = width;
+        Ok(())
     }
 
     pub fn hits(&self) -> u64 {
@@ -633,24 +678,56 @@ impl<'a> GpuEngine<'a> {
         self.argmax()
     }
 
-    /// Batched main forward over `tokens` at positions `base_pos..base_pos+S`
-    /// (S ≤ MAX_SPEC): the S positions run through all 78 layers with **one**
-    /// batched MoE per layer — the union of their routed experts is fetched once
-    /// (the speculative-verify fetch amortization). Dense attention only (the
-    /// spec loop runs below the sparsity threshold). Returns the S greedy
-    /// predictions; each position's trunk is left in `sx[s*hidden]` for drafting.
-    /// Appends KV at `base_pos+s` for every position — the caller rolls back
-    /// (by not advancing `pos`) any positions whose draft was rejected.
-    fn forward_batch(&mut self, tokens: &[u32], base_pos: usize) -> Result<Vec<u32>> {
+    /// Batched main forward over `tokens` through all 78 layers with **one**
+    /// batched MoE per layer — the union of the S positions' routed experts is
+    /// fetched once (the speculative-verify fetch amortization). Dense attention
+    /// only (the spec loop runs below the sparsity threshold). Returns the S
+    /// greedy predictions; each position's trunk is left in `sx[s*hidden]` for
+    /// drafting. Appends KV at physical row `base_pos+s` for every position — the
+    /// caller rolls back (by not advancing `pos`) any position whose draft was
+    /// rejected.
+    ///
+    /// `topo` fixes the sequence geometry ([`SpecTopo`]): [`SpecTopo::Chain`]
+    /// runs a linear causal chain (position `s` at sequence `base_pos+s`);
+    /// [`SpecTopo::Tree2`] (requires S=3) makes positions 1 and 2 SIBLINGS at
+    /// sequence `base_pos+1` — position 2 is roped there but lives at physical
+    /// row `base_pos+2` and attends a GATHERED prefix that skips sibling 1, so
+    /// the two candidates never see each other. In both topologies each of the S
+    /// positions still routes independently, so the batched MoE output equals S
+    /// separate forwards — only the KV geometry differs.
+    fn forward_batch(
+        &mut self,
+        tokens: &[u32],
+        base_pos: usize,
+        topo: SpecTopo,
+    ) -> Result<Vec<u32>> {
         let cfg = self.cfg;
         let s_n = tokens.len();
-        ensure!(s_n >= 1 && s_n <= MAX_SPEC, "spec batch size {s_n}");
+        ensure!((1..=MAX_SPEC).contains(&s_n), "spec batch size {s_n}");
         ensure!(
-            base_pos + s_n <= self.max_ctx,
-            "spec batch [{base_pos},{}) exceeds max_ctx {}",
-            base_pos + s_n,
+            topo != SpecTopo::Tree2 || s_n == 3,
+            "Tree2 topology needs exactly S=3 positions (got {s_n})"
+        );
+        // Tree2 physically uses rows base_pos..=base_pos+2; Chain uses ..base_pos+s_n.
+        let rows_end = base_pos + s_n;
+        ensure!(
+            rows_end <= self.max_ctx,
+            "spec batch [{base_pos},{rows_end}) exceeds max_ctx {}",
             self.max_ctx
         );
+        // Build the sibling-2 gather list once (same for all layers): the shared
+        // prefix rows 0..=base_pos plus its own physical row base_pos+2, ascending,
+        // SKIPPING sibling 1's row base_pos+1. Empty pointer for the chain path.
+        let tree_rows_ptr: *const u32 = if topo == SpecTopo::Tree2 {
+            self.tree_rows_host.clear();
+            self.tree_rows_host.extend(0..=base_pos as u32);
+            self.tree_rows_host.push(base_pos as u32 + 2);
+            self.tree_rows
+                .copy_in_at(0, u32_le_bytes(&self.tree_rows_host))?;
+            self.tree_rows.ptr() as *const u32
+        } else {
+            std::ptr::null()
+        };
         let hidden = cfg.hidden;
         let eps = cfg.rms_norm_eps as f32;
         let (h, qh, nope, rope, kvl, vh) = (
@@ -712,10 +789,20 @@ impl<'a> GpuEngine<'a> {
 
             // --- Attention, per position (Dense over its causal prefix). ---
             // SAFETY: null-stream ordered; each position appends its KV before
-            // the next attends, so position s+1 sees position s.
+            // the next attends. In Chain, position s+1 sees position s; in Tree2,
+            // sibling 2's gather list excludes sibling 1's row, so it does not.
             unsafe {
                 for s in 0..s_n {
-                    let pos = base_pos + s;
+                    let phys = base_pos + s; // physical KV row this position writes
+                    // Sequence geometry: Tree2's sibling 2 (s==2) is roped at
+                    // base_pos+1 and attends the gathered prefix (skipping sibling
+                    // 1's row base_pos+1); every other position is a chain node
+                    // roped at its physical row over the dense causal prefix.
+                    let (rope_pos, attend_len, rows_ptr): (usize, usize, *const u32) =
+                        match (topo, s) {
+                            (SpecTopo::Tree2, 2) => (base_pos + 1, base_pos + 2, tree_rows_ptr),
+                            _ => (phys, phys + 1, std::ptr::null()),
+                        };
                     let xsp = sxp.add(s * hidden);
                     launch_rmsnorm(xsp, input_ln, hidden, eps, xnp)?;
                     launch_gemv_i4(xnp, q_a.packed, q_a.scale, q_a.o_dim, q_a.i_dim, qrp)?;
@@ -723,23 +810,13 @@ impl<'a> GpuEngine<'a> {
                     launch_gemv_i4(qrp, q_b.packed, q_b.scale, q_b.o_dim, q_b.i_dim, qp)?;
                     launch_gemv_i4(xnp, kv_a.packed, kv_a.scale, kv_a.o_dim, kv_a.i_dim, compp)?;
                     launch_rmsnorm(compp, kv_a_ln, kvl, eps, compp)?;
-                    launch_rope(compp.add(kvl), 1, rope, rope, pos, theta)?;
-                    launch_rope(qp.add(nope), h, qh, rope, pos, theta)?;
-                    launch_append_kv(compp, compp.add(kvl), lcp, rcp, pos, kvl, rope)?;
+                    launch_rope(compp.add(kvl), 1, rope, rope, rope_pos, theta)?;
+                    launch_rope(qp.add(nope), h, qh, rope, rope_pos, theta)?;
+                    launch_append_kv(compp, compp.add(kvl), lcp, rcp, phys, kvl, rope)?;
                     launch_mla_absorb(qp, kv_b.packed, kv_b.scale, h, qh, nope, vh, kvl, qabsp)?;
                     launch_gather_rope(qp, qropep, h, qh, nope, rope)?;
                     launch_attend(
-                        qabsp,
-                        qropep,
-                        lcp,
-                        rcp,
-                        std::ptr::null(),
-                        h,
-                        pos + 1,
-                        kvl,
-                        rope,
-                        scale,
-                        clatp,
+                        qabsp, qropep, lcp, rcp, rows_ptr, h, attend_len, kvl, rope, scale, clatp,
                     )?;
                     launch_mla_value(clatp, kv_b.packed, kv_b.scale, h, nope, vh, kvl, ctxp)?;
                     launch_gemv_i4(
@@ -965,6 +1042,57 @@ impl<'a> GpuEngine<'a> {
     /// speculative loop drafts from each batched position's trunk left in `sx`,
     /// not the single `self.x` — so it passes the right `sx[s*hidden]` here.
     fn mtp_draft_trunk(&mut self, trunk: *const f32, next_token: u32, pos: usize) -> Result<u32> {
+        self.mtp_logits_trunk(trunk, next_token, pos)?;
+        self.argmax()
+    }
+
+    /// Width-2 draft: the MTP head's TOP-2 candidate tokens for the next position
+    /// (`(top1, top2)`, top1 == the [`mtp_draft_trunk`](Self::mtp_draft_trunk)
+    /// argmax). Same forward as `mtp_draft_trunk`; only the tail differs (a host
+    /// top-2 over the draft logits instead of the device argmax). Greedy-equiv is
+    /// unaffected — these are only *candidates*; the emitted token is always the
+    /// main model's argmax, confirmed in the batched verify.
+    fn mtp_draft2_trunk(
+        &mut self,
+        trunk: *const f32,
+        next_token: u32,
+        pos: usize,
+    ) -> Result<(u32, u32)> {
+        self.mtp_logits_trunk(trunk, next_token, pos)?;
+        // The draft logits are device-side in `self.logits`; a single D2H (drafts
+        // happen once or twice per verify round, off the per-layer hot path) then
+        // a host top-2 with the SAME lowest-index tie-break the device argmax uses,
+        // so `top1` matches `mtp_draft_trunk` exactly.
+        self.logits.copy_out_into(&mut self.logits_host)?;
+        ensure!(
+            self.logits_host.len() == self.cfg.vocab * 4,
+            "draft logits D2H size mismatch"
+        );
+        let (mut i1, mut v1) = (0usize, f32::NEG_INFINITY);
+        let (mut i2, mut v2) = (0usize, f32::NEG_INFINITY);
+        for (i, c) in self.logits_host.chunks_exact(4).enumerate() {
+            let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            if v > v1 {
+                v2 = v1;
+                i2 = i1;
+                v1 = v;
+                i1 = i;
+            } else if v > v2 {
+                v2 = v;
+                i2 = i;
+            }
+        }
+        if !v1.is_finite() {
+            bail!("MTP draft logits non-finite (NaN/Inf in the MTP forward)");
+        }
+        Ok((i1 as u32, i2 as u32))
+    }
+
+    /// Shared core of the MTP draft: runs the full layer-`n_layers` MTP forward
+    /// from `trunk` + `next_token`, leaving the draft logits in `self.logits`
+    /// (device) after the join. The public drafts wrap this with an argmax /
+    /// top-2 tail. See [`mtp_draft`](Self::mtp_draft) for the formulation.
+    fn mtp_logits_trunk(&mut self, trunk: *const f32, next_token: u32, pos: usize) -> Result<()> {
         // The MTP KV slabs are sized to max_ctx; writing row `pos` beyond that is
         // an out-of-bounds device write (same guard forward() has). M3's decode
         // loop can advance past the main pos, so refuse rather than corrupt.
@@ -1146,7 +1274,7 @@ impl<'a> GpuEngine<'a> {
             )?;
         }
         device_sync()?;
-        self.argmax()
+        Ok(())
     }
 
     /// One forward pass for `token` at `pos`, leaving next-token logits device-
@@ -1640,6 +1768,11 @@ impl<'a> GpuEngine<'a> {
             "generate_spec: the batched verify uses the bf16 KV path; --kv-fp8 is unsupported"
         );
         ensure!(!prompt_ids.is_empty(), "empty prompt");
+        // Width 2 dispatches to the shared-union tree; width 1 is the S=2 chain
+        // below (byte-identical to the pre-tree --spec path).
+        if self.spec_width >= 2 {
+            return self.generate_spec_tree(prompt_ids, ngen, eos);
+        }
         let hidden = self.cfg.hidden;
 
         // --- Prefill: main KV + MTP KV built in lockstep over the prompt. The
@@ -1689,7 +1822,7 @@ impl<'a> GpuEngine<'a> {
             }
 
             spec_iters += 1;
-            let preds = self.forward_batch(&[cur, draft], pos)?; // KV @pos, @pos+1
+            let preds = self.forward_batch(&[cur, draft], pos, SpecTopo::Chain)?; // KV @pos, @pos+1
             let pa = preds[0]; // real token at pos+1
             let pb = preds[1]; // token at pos+2 (real iff draft == pa)
             // sx[0] = trunk_pos (predicts pa); sx[1] = trunk_{pos+1} (predicts pb).
@@ -1729,6 +1862,161 @@ impl<'a> GpuEngine<'a> {
         let acc_pct = 100.0 * accepted as f64 / spec_iters.max(1) as f64;
         tracing::info!(
             "spec: {} tokens in {spec_iters} verify rounds, {accepted} accepted ({acc_pct:.1}%)",
+            out.len(),
+        );
+        Ok(out)
+    }
+
+    /// Relocate one bf16 KV row (`from_row` → `to_row`) in every layer's latent
+    /// and roped-key slab. The width-2 tree writes sibling 2's KV at physical row
+    /// `base_pos+2`, but when that sibling wins its token is the confirmed one at
+    /// sequence position `base_pos+1`, so its KV must occupy the canonical row
+    /// `base_pos+1` before decode continues. The two rows are distinct, so each
+    /// copy is a non-overlapping device-to-device move.
+    fn spec_relocate_kv(&mut self, from_row: usize, to_row: usize) -> Result<()> {
+        debug_assert_ne!(from_row, to_row, "relocate would alias a KV row");
+        let n_layers = self.cfg.n_layers;
+        let lat = self.cfg.kv_lora_rank * 2; // bf16 latent bytes per row
+        let key = self.cfg.qk_rope_head_dim * 2; // bf16 roped-key bytes per row
+        for l in 0..n_layers {
+            self.lc[l].copy_within(to_row * lat, from_row * lat, lat)?;
+            self.rc[l].copy_within(to_row * key, from_row * key, key)?;
+        }
+        Ok(())
+    }
+
+    /// Width-2 speculative decode — the SHARED-UNION TREE. Each round drafts the
+    /// MTP head's TOP-2 candidates (`da`, `db`) for the next position and verifies
+    /// BOTH in one S=3 batched forward `[cur, da, db]` ([`SpecTopo::Tree2`]) that
+    /// shares the per-layer expert union across the two siblings — two near-tie
+    /// candidates route through overlapping experts, so the union grows
+    /// sub-linearly while covering more probability mass per fetched byte.
+    /// Whichever candidate equals the main model's argmax `pa` is confirmed and
+    /// its own next-token prediction is committed for free; if neither matches,
+    /// only `pa` is emitted (like the chain reject). Greedy-equivalent by
+    /// construction: every emitted token is the main model's argmax at its
+    /// committed position — the tree only decides whether the NEXT token is
+    /// confirmed early, never WHICH token is emitted.
+    fn generate_spec_tree(
+        &mut self,
+        prompt_ids: &[u32],
+        ngen: usize,
+        eos: &[u32],
+    ) -> Result<Vec<u32>> {
+        let hidden = self.cfg.hidden;
+
+        // --- Prefill: main + MTP KV in lockstep (as the chain path), but the
+        // final step drafts the TOP-2 candidates for the first predicted position. ---
+        let mut pos = 0usize;
+        let mut cur = 0u32;
+        let (mut da, mut db) = (0u32, 0u32); // top-2 candidates for position pos+1
+        let n = prompt_ids.len();
+        for (i, &tok) in prompt_ids.iter().enumerate() {
+            self.forward(tok, pos)?; // main KV @pos; self.x = trunk_pos
+            let pred = self.argmax()?; // token at pos+1 (real next for the last)
+            let next = if i + 1 < n { prompt_ids[i + 1] } else { pred };
+            let trunk = self.x.ptr() as *const f32;
+            let (a, b) = self.mtp_draft2_trunk(trunk, next, pos)?; // MTP KV @pos
+            if i + 1 == n {
+                cur = next; // == pred: first generated token, at position `pos`
+                da = a;
+                db = b;
+            }
+            pos += 1;
+        }
+
+        self.prof = Profile::default();
+        let decode_wall = std::time::Instant::now();
+        let mut out: Vec<u32> = Vec::with_capacity(ngen);
+        let mut accepted = 0usize; // rounds where a candidate confirmed
+        let mut spec_iters = 0usize; // batched-verify rounds
+
+        loop {
+            if eos.contains(&cur) {
+                break;
+            }
+            out.push(cur);
+            if out.len() >= ngen {
+                break;
+            }
+            // Need physical rows pos, pos+1, pos+2 for the S=3 tree.
+            if pos + MAX_SPEC > self.max_ctx {
+                self.forward(cur, pos)?;
+                let last = self.argmax()?;
+                if !eos.contains(&last) && out.len() < ngen {
+                    out.push(last);
+                }
+                break;
+            }
+
+            spec_iters += 1;
+            // S=3 tree verify: position 0 = cur@pos; siblings da,db @pos+1.
+            let preds = self.forward_batch(&[cur, da, db], pos, SpecTopo::Tree2)?;
+            let pa = preds[0]; // real token at pos+1 (the main model's argmax)
+            // sx[s] = trunk of position s; sx[1]/sx[2] predict pos+2 given da/db.
+            let sx = self.sx.ptr() as *const f32;
+
+            // Confirm a candidate: prefer da (the top-1 draft). When da == db == pa
+            // the choice is immaterial; da is checked first so sibling 1's already-
+            // canonical KV row is used and no relocation is needed.
+            let win = if da == pa {
+                Some((1usize, preds[1])) // sibling 1: trunk sx[1], KV already @pos+1
+            } else if db == pa {
+                Some((2usize, preds[2])) // sibling 2: trunk sx[2], KV @pos+2
+            } else {
+                None
+            };
+
+            match win {
+                Some((s_win, pb)) => {
+                    // CONFIRM — pa@pos+1 real, and pb@pos+2 real (the winning
+                    // sibling's input matched pa, so its forward is the true one).
+                    accepted += 1;
+                    if eos.contains(&pa) {
+                        cur = pa; // loop head breaks without emitting eos
+                        continue;
+                    }
+                    out.push(pa);
+                    if out.len() >= ngen {
+                        break;
+                    }
+                    // The confirmed token pa's canonical KV must live at row pos+1.
+                    // Sibling 1 already wrote it there; sibling 2 wrote it at pos+2,
+                    // so relocate that row into pos+1 across every layer.
+                    if s_win == 2 {
+                        self.spec_relocate_kv(pos + 2, pos + 1)?;
+                    }
+                    // SAFETY: sx[s_win] is within the S*hidden `sx` slab (s_win ≤ 2).
+                    let win_trunk = unsafe { sx.add(s_win * hidden) };
+                    // MTP KV lockstep: append @pos (sx[0], next pa) and @pos+1
+                    // (winning trunk, next pb); redraft top-2 for pos+3 from pb.
+                    self.mtp_draft_trunk(sx, pa, pos)?;
+                    let (a2, b2) = self.mtp_draft2_trunk(win_trunk, pb, pos + 1)?;
+                    cur = pb;
+                    da = a2;
+                    db = b2;
+                    pos += 2;
+                }
+                None => {
+                    // REJECT — neither candidate matched; only pa@pos+1 real. cur's
+                    // KV @pos stays; the stale sibling KV @pos+1,@pos+2 is overwritten
+                    // next round (pos advances by 1, never attended before rewrite).
+                    let (a1, b1) = self.mtp_draft2_trunk(sx, pa, pos)?; // MTP KV @pos
+                    cur = pa;
+                    da = a1;
+                    db = b1;
+                    pos += 1;
+                }
+            }
+        }
+
+        self.prof.wall_ns = decode_wall.elapsed().as_nanos();
+        self.prof.tokens = out.len() as u64;
+        self.prof.report();
+        let acc_pct = 100.0 * accepted as f64 / spec_iters.max(1) as f64;
+        tracing::info!(
+            "spec tree(width=2): {} tokens in {spec_iters} verify rounds, \
+             {accepted} confirmed ({acc_pct:.1}%)",
             out.len(),
         );
         Ok(out)
