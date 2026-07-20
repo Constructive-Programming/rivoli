@@ -247,6 +247,53 @@ is revisited only for the future batched/server path (S>1 rows share weights).
 - **M6 (stretch) — NPU dense offload; device-tier stability ladder toward the
   full pin.**
 
+## Milestone status — 2026-07-20 (post branch-integration)
+
+All feature branches merged into `main` (36 commits); `main` == `feat/direct-load`.
+Redundant branches (`moe-gemv`, `xlayer-prefetch`, `prefetch`, `misa-gpu-routing`)
+deleted; the MTP salvage branches are archived as `deadend/*`.
+
+- **M0 toolchain + skeleton — DONE.** hipcc live on rh-anine; snapshot indexes
+  ~118k tensors in < 0.15 s.
+- **M1 reference decode — DONE.** scalar reference path + `pin.rs` from
+  `.coli_usage`; coherent output verified.
+- **M2 HIP kernel correctness — DONE.** `moe_fused` + attention kernels vs the
+  scalar reference within int4 tolerance. Since extended with pluggable
+  attention modes (Dense / StreamingLLM / DSA), MISA 8-of-32 indexer head
+  routing, a device-side DSA indexer, and fp8-e4m3 latent-KV kernels — all
+  code-reviewed.
+- **M3 GPU resident tier — MET (warm).** One-shot auto-sized device tier
+  (`--max-mem`, default `free − 8 GiB`), per-layer fused launches, coalesced
+  wave-per-row GEMV (attn 1450→155 µs; mlp 2.6×), device-side argmax, zero-copy
+  upload. **Warm 256-tok = 1.05 tok/s** overall, warm windows 1.0–1.32, no
+  DEVICE_LOST. (The strict "1.0 over 128 overall" gate is borderline at 0.87;
+  it clears at 256.)
+- **M4 streaming feed — PARTIAL.** *Landed:* io_uring O_DIRECT cold-expert
+  streaming (`817744c`, beats fast-mmap), unified VMM+pread direct-to-device
+  load, pinned-host bounce for cold reads (default), cross-layer expert prefetch
+  (default, depth 2 — validated optimal), ARC/LRU/2Q cache policies (ARC
+  default), adaptive routed-expert LRU + warm-start seeding from `.coli_usage`.
+  *Not met:* the gate — **≥ 1.0 tok/s sustained over 512 tokens at ≥ 93% hit,
+  disk wait ≤ 5%.** Cold path is still ~0.47 tok/s; the QD≥4 O_DIRECT rework
+  (~16 GB/s, ~3× current cold bandwidth — probe GO 2026-07-18) is the open lever.
+  Footgun: io_uring→VMM EFAULTs on NFS fds (kernel 6.18.38) — the model must live
+  on **local** `/var/db`, not `/swarm`; pinned-host bounce is the current default
+  because of it.
+- **M5 hardening — PARTIAL.** *Have:* sole-tenant guard, PROFILE metrics,
+  `build.sh`/`test.sh`, git hooks, and the `--kv-fp8` / `--direct-io` /
+  `--cache-policy` / attention-mode knobs. *Not done:* in-process wedge watchdog;
+  the 3× 512-run < 10%-variance stability gate; optional OTLP export.
+- **M6 stretch — NPU dense offload — not started.** The colibri-npu spike proved
+  int8 GEMM at 2.78 TOPS (~10× CPU); nothing wired into rivoli yet.
+
+**MTP / speculation — CLOSED (negative result), confirming item 5 above.** Built
+and measured all three salvage ideas at 256 tokens; all lose. Decode is
+bandwidth-bound cold (+16% bytes/tok) but *compute*-bound warm (the MTP draft is
+a full extra 256-expert MoE layer every round → `other` 638 ms/tok at 84%
+accept), so speculation loses in both regimes. The cache — not speculation — is
+the lever that crosses 1 tok/s. Full write-up + numbers in `docs/mtp.md`; branches
+`deadend/{mtp,spec-overlap-gate,spec-warm-budget,spec-union-tree}`.
+
 ## Measured bottlenecks & the coherent-pin fix (2026-07-18, real snapshot)
 
 Profiled the M3 (4/4) engine on the LOCAL snapshot (`/var/db/llama-server/
