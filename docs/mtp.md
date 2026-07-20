@@ -124,3 +124,42 @@ don't assume.
 M1 is CPU-only (scalar) and can be built + validated while a GPU job runs. M2/M3
 need the sole-tenant GPU — queue them for when the current 10k benchmark frees
 it (`AGENTS.md` § sole-tenant).
+
+## INVESTIGATION CLOSED — 2026-07-20 (256-token sweep, all salvage branches dead)
+
+Three salvage ideas were built off `mtp` and benchmarked at **256 tokens** (the
+prior M3/M4 numbers were 64-token only, which hid the regime flip below). All
+lose; the two branches with new device paths also have 256-token correctness
+bugs. Snapshot for `--spec`: `~/glm52-snap` (int4 experts + bf16 eh_proj) — NOT
+`/var/db/.../glm52-colibri-int4`, whose `out-mtp-*` are a stale all-int8
+extraction that won't load.
+
+| Config | tok/s @256 | vs base | Notes |
+|--------|-----------|---------|-------|
+| baseline (no spec) | **1.05** | — | warm, 86.8% hit, fetch 51% |
+| overlap-gate (`--spec`) | NaN@256 | — | ran @64 (0.69, gate shut spec 50/64); KV-lockstep bug in the gate's forward/forward_batch toggle at longer context |
+| warm-budget (`--spec`) | **0.95** | −10% | budget isolation ✓ (pool stayed 4634), warm gate engaged @tok86 ✓, **84% accept** ✓ — still loses |
+| union-tree width-1 | 0.68 | −35% | raw always-on chain, 56% accept |
+| union-tree width-2 | NaN@256 | — | S=3 tree attention geometry bug (decoupled RoPE-pos + sibling gather); never validated on device |
+
+**Definitive finding — the bottleneck is regime-dependent, and speculation loses
+in BOTH regimes for opposite reasons:**
+- **Cold** (short ctx, ~63% fetch): NVMe-**bandwidth**-bound. Batched verify's
+  2-position union reads **+16% bytes/tok**; at 43% accept the round-count drop
+  can't beat it. (M3/M4.)
+- **Warm** (long ctx, cache ~87%, fetch drops to 24–51%): **compute**-bound. The
+  MTP draft head is a *full extra MoE layer (layer 78, 256 experts) every round*;
+  `warm-budget` hit 84% accept yet `other` ballooned to **638 ms/tok (63%)**, so
+  the draft+batched-verify compute exceeds the tokens saved.
+
+`warm-budget`'s STRUCTURE is correct (warm-only gate + isolated MTP budget are
+keepers, and it reached 84% accept). The only thing beating it is the draft's
+compute cost. The single un-tested path that could flip it positive: a **cheap
+approximate draft** (top-k experts only, or a distilled/low-rank layer-78)
+instead of the full 256-expert forward — if the draft drops below the ~200 ms/tok
+that 84% accept saves. Not pursued.
+
+**Verdict: MTP speculation as structured (full layer-78 draft) cannot win on this
+engine in either regime.** All four branches marked `deadend/*`. The lever that
+actually crosses 1 tok/s is the warm expert cache (commit 16bae7f), not
+speculation — speculation only steals from it.
