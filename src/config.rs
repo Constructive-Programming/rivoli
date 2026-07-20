@@ -8,11 +8,19 @@ use anyhow::{Context, Result, bail};
 use std::fmt;
 
 /// Safety headroom left free for the OS + the pinned io_uring arena, bytes. The
-/// expert pool takes `free − OS_RESERVE` by default (`--max-mem` caps below that);
-/// 8 GiB is the validated floor on the 124 GiB Strix Halo box (idle uses ~2 GiB +
-/// reclaimable page cache). Decode is cold-miss-fetch-bound, so every GiB not
-/// reserved becomes cache and lifts the hit rate — hence "take all safe free".
-pub const OS_RESERVE: u64 = 8 << 30;
+/// expert pool takes `free − OS_RESERVE` by default (`--max-mem` caps below that).
+///
+/// 26 GiB, NOT 8: `hipMemGetInfo` on this 124 GiB Strix Halo APU reports ~100 GiB
+/// free, but the driver will not durably back a device footprint that large under
+/// live decode. With the old 8 GiB reserve the pool grew to ~82 GiB (~92 GiB with
+/// the resident tier); a long run then streams enough experts to over-subscribe
+/// physical memory, high VMM slots get reclaimed, and an expert reads back as NaN
+/// — deterministically killing decode around token ~290 (invisible below ~256
+/// tokens, which is why 64/128/256-token benches never caught it). Measured on
+/// this box: ~74 GiB total footprint is clean to 512 tokens, ~92 GiB corrupts. A
+/// 26 GiB reserve keeps the default in the verified-safe zone; raise `--max-mem`
+/// only after confirming a longer safe ceiling on the hardware in hand.
+pub const OS_RESERVE: u64 = 26 << 30;
 
 #[derive(Debug, Clone)]
 pub struct Config {

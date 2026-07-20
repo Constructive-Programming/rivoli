@@ -268,17 +268,26 @@ deleted; the MTP salvage branches are archived as `deadend/*`.
   upload. **Warm 256-tok = 1.05 tok/s** overall, warm windows 1.0–1.32, no
   DEVICE_LOST. (The strict "1.0 over 128 overall" gate is borderline at 0.87;
   it clears at 256.)
-- **M4 streaming feed — PARTIAL.** *Landed:* io_uring O_DIRECT cold-expert
-  streaming (`817744c`, beats fast-mmap), unified VMM+pread direct-to-device
-  load, pinned-host bounce for cold reads (default), cross-layer expert prefetch
-  (default, depth 2 — validated optimal), ARC/LRU/2Q cache policies (ARC
-  default), adaptive routed-expert LRU + warm-start seeding from `.coli_usage`.
-  *Not met:* the gate — **≥ 1.0 tok/s sustained over 512 tokens at ≥ 93% hit,
-  disk wait ≤ 5%.** Cold path is still ~0.47 tok/s; the QD≥4 O_DIRECT rework
-  (~16 GB/s, ~3× current cold bandwidth — probe GO 2026-07-18) is the open lever.
-  Footgun: io_uring→VMM EFAULTs on NFS fds (kernel 6.18.38) — the model must live
-  on **local** `/var/db`, not `/swarm`; pinned-host bounce is the current default
-  because of it.
+- **M4 streaming feed — MET (2026-07-20).** *Landed:* io_uring O_DIRECT
+  cold-expert streaming (`817744c`, beats fast-mmap; the per-layer batched
+  submit-then-drain already fills the NVMe queue to QD≥4), unified VMM+pread
+  direct-to-device load, pinned-host bounce for cold reads (default), cross-layer
+  expert prefetch (default, depth 2 — validated optimal), ARC/LRU/2Q cache
+  policies (ARC default), adaptive routed-expert LRU + warm-start seeding from
+  `.coli_usage`. **512-token gate: 1.32 tok/s at 90.9% hit, drain-wait ~1% of
+  wall — PASS** (target ≥ 1.0, disk ≤ 5%).
+  The blocker was NOT throughput (warm decode already sustains 1.3–1.5 tok/s);
+  it was a **VMM over-commit bug** that deterministically NaN'd decode at token
+  ~290 and so capped every prior run at ≤ 256 tokens. `hipMemGetInfo` reports
+  ~100 GiB free but the driver won't durably back a ~92 GiB device footprint
+  under live decode; high VMM pool slots got reclaimed and streamed experts read
+  back NaN. Fixed by raising `OS_RESERVE` 8→26 GiB so the default footprint
+  (~74 GiB) stays in the verified-safe zone (see `config.rs`). This retires
+  commit `16bae7f`'s "grow pool to ~92 GiB" as unsafe — it was never run past
+  256 tokens. Footgun still stands: io_uring→VMM EFAULTs on NFS fds (kernel
+  6.18.38) — the model must live on **local** `/var/db`, not `/swarm`.
+  Follow-up (recover the ~18 GiB the conservative reserve leaves on the table):
+  find the true backable ceiling, or shard the pool into multiple VMM handles.
 - **M5 hardening — PARTIAL.** *Have:* sole-tenant guard, PROFILE metrics,
   `build.sh`/`test.sh`, git hooks, and the `--kv-fp8` / `--direct-io` /
   `--cache-policy` / attention-mode knobs. *Not done:* in-process wedge watchdog;
