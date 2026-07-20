@@ -86,6 +86,13 @@ pub struct Config {
     /// share one union expert-fetch). Emits the same tokens as greedy decode;
     /// requires the snapshot's out-mtp shard and Dense attention. Default false.
     pub spec: bool,
+    /// Warm-regime gate for `--spec` (`--spec-warm-hit <f>`, default 0.85). Speculation
+    /// stays OFF (plain S=1 decode) until the routed-cache hit-rate over the most recent
+    /// decode window reaches this fraction, then latches ON. Below it the 2-position
+    /// union fetch raises bytes/token on the NVMe floor and spec loses; above it the
+    /// union is mostly cache-resident (the warm regime that crosses 1 tok/s). Ignored
+    /// unless `--spec`.
+    pub spec_warm_hit: f64,
 }
 
 fn mem_available() -> Result<u64> {
@@ -125,6 +132,7 @@ impl Config {
         attn: AttnMode,
         kv_fp8: bool,
         spec: bool,
+        spec_warm_hit: f64,
     ) -> Result<Self> {
         let avail = mem_available()?;
         if avail <= OS_RESERVE {
@@ -162,6 +170,7 @@ impl Config {
             attn,
             kv_fp8,
             spec,
+            spec_warm_hit,
         })
     }
 }
@@ -171,7 +180,7 @@ impl fmt::Display for Config {
         const GIB: f64 = (1u64 << 30) as f64;
         write!(
             f,
-            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} direct_io={} cache_policy={} prefetch={} prefetch_depth={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_pool_size={:.0}GiB threads={} attn={:?} kv_fp8={} spec={}",
+            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} direct_io={} cache_policy={} prefetch={} prefetch_depth={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_pool_size={:.0}GiB threads={} attn={:?} kv_fp8={} spec={} spec_warm_hit={}",
             self.snapshot,
             self.bench,
             self.pre_seed,
@@ -187,7 +196,8 @@ impl fmt::Display for Config {
             self.threads,
             self.attn,
             self.kv_fp8,
-            self.spec
+            self.spec,
+            self.spec_warm_hit
         )
     }
 }

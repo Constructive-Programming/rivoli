@@ -626,10 +626,20 @@ impl<'a> Pin<'a> {
         // margin; anything left over widens the LRU below.
         const SLACK: usize = 256 << 20; // 256 MiB
         let n_full = full.iter().filter(|&&f| f).count();
-        let resident = resident_bytes(cfg)
-            + n_full * indexer_bytes(cfg)
-            + if want_mtp { mtp_bytes(cfg) } else { 0 };
+        // The MTP draft layer's ~4.8 GiB is accounted separately: it lives in the
+        // tier (below), but its bytes are carved out of the OS_RESERVE headroom, NOT
+        // the routed budget — see `budget` below.
+        let mtp_resident = if want_mtp { mtp_bytes(cfg) } else { 0 };
+        let resident = resident_bytes(cfg) + n_full * indexer_bytes(cfg) + mtp_resident;
         let tier_cap = resident + SLACK;
+        // The routed budget draws down `capacity` by the tier minus the MTP bytes, so
+        // enabling `--spec` allocates the MTP layer on top (out of headroom) rather
+        // than evicting routed slots — the physical footprint is `capacity +
+        // mtp_resident`, which must still fit.
+        ensure!(
+            capacity + mtp_resident < free,
+            "pin capacity {capacity} + MTP resident {mtp_resident} >= free device memory {free}"
+        );
         tracing::info!(
             "computed resident footprint {:.2} GiB (tier {:.2} GiB incl. slack)",
             resident as f64 / (1u64 << 30) as f64,
@@ -734,7 +744,13 @@ impl<'a> Pin<'a> {
         // checked here. The miss/prefetch paths then just index + queue.
         let slot_dst = slot_dst_of(cfg);
         let moe_table = build_moe_table(snap, cfg, &slot_dst, direct_io)?;
-        let budget = capacity.saturating_sub(tier_cap);
+        // Routed pool budget. Deduct the tier MINUS the MTP resident bytes: the MTP
+        // draft layer is carved from OS headroom, not the routed tier, so `--spec`
+        // leaves the routed slot count IDENTICAL to a non-spec run (the MTP layer no
+        // longer shrinks the cache that is the real decode lever). `tier_cap -
+        // mtp_resident == resident_bytes + n_full*indexer_bytes + SLACK`, independent
+        // of `want_mtp`.
+        let budget = capacity.saturating_sub(tier_cap - mtp_resident);
         // Floor the pool at `top_k + prefetch_depth` when prefetching: this makes
         // cross-layer prefetch's evictions provably DISJOINT from the current layer's
         // live experts. The current layer's `top_k` routed experts are the

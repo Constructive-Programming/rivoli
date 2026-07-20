@@ -57,7 +57,9 @@ fn spec_decode_matches_greedy() -> anyhow::Result<()> {
 
     // Speculative first, then the plain greedy reference on the same engine
     // (its pos-0 prefill overwrites the KV, so the runs are independent).
-    let spec = gpu.generate_spec(&toks, ngen, &eos)?;
+    // warm_hit=0.0 engages the batched verify as soon as the gate window fills, so
+    // this test still exercises the speculative path (not just the plain S=1 fallback).
+    let spec = gpu.generate_spec(&toks, ngen, &eos, 0.0)?;
     let greedy = gpu.generate(&toks, ngen, &eos)?;
 
     eprintln!("spec   ({:2}): {spec:?}", spec.len());

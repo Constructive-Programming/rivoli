@@ -644,7 +644,7 @@ impl<'a> GpuEngine<'a> {
     fn forward_batch(&mut self, tokens: &[u32], base_pos: usize) -> Result<Vec<u32>> {
         let cfg = self.cfg;
         let s_n = tokens.len();
-        ensure!(s_n >= 1 && s_n <= MAX_SPEC, "spec batch size {s_n}");
+        ensure!((1..=MAX_SPEC).contains(&s_n), "spec batch size {s_n}");
         ensure!(
             base_pos + s_n <= self.max_ctx,
             "spec batch [{base_pos},{}) exceeds max_ctx {}",
@@ -1622,7 +1622,12 @@ impl<'a> GpuEngine<'a> {
         prompt_ids: &[u32],
         ngen: usize,
         eos: &[u32],
+        warm_hit: f64,
     ) -> Result<Vec<u32>> {
+        ensure!(
+            (0.0..=1.0).contains(&warm_hit),
+            "generate_spec: warm_hit must be in [0,1] (got {warm_hit})"
+        );
         ensure!(
             self.pin.mtp().is_some(),
             "generate_spec needs a resident MTP layer — build the snapshot with --mtp"
@@ -1668,6 +1673,20 @@ impl<'a> GpuEngine<'a> {
         let mut accepted = 0usize; // drafts that verified
         let mut spec_iters = 0usize; // batched-verify rounds
 
+        // Warm-regime gate. Speculation stays OFF until the routed-cache hit-rate over
+        // the last GATE_WIN decode passes reaches `warm_hit`, then LATCHES on. The
+        // latch means pre-engagement only plain S=1 steps run, so the window measures a
+        // clean single-position hit-rate — never the inflated 2-position union that a
+        // spec round fetches — and there is no oscillation around the threshold. In
+        // both regimes the emitted tokens are the main model's greedy argmaxes, so the
+        // gate changes speed, never output.
+        const GATE_WIN: usize = 8;
+        let mut win = [(0u64, 0u64); GATE_WIN]; // (hit_delta, miss_delta) per pass
+        let mut win_i = 0usize;
+        let mut win_len = 0usize;
+        let (mut last_hit, mut last_miss) = (self.pin.hits, self.pin.misses);
+        let mut engaged = false;
+
         loop {
             if eos.contains(&cur) {
                 break;
@@ -1686,6 +1705,43 @@ impl<'a> GpuEngine<'a> {
                     out.push(last);
                 }
                 break;
+            }
+
+            // Latch spec on once the recent window is warm enough. Only evaluated
+            // while cold (below, only plain steps feed the window), so `win` is a pure
+            // single-position hit-rate.
+            if !engaged && win_len == GATE_WIN {
+                let (wh, wm) = win
+                    .iter()
+                    .fold((0u64, 0u64), |(h, m), &(dh, dm)| (h + dh, m + dm));
+                let rate = wh as f64 / (wh + wm).max(1) as f64;
+                if rate >= warm_hit {
+                    engaged = true;
+                    tracing::info!(
+                        "spec ENGAGED at tok {}: window hit {:.1}% >= {:.1}% (warm)",
+                        out.len(),
+                        100.0 * rate,
+                        100.0 * warm_hit,
+                    );
+                }
+            }
+
+            if !engaged {
+                // COLD regime: plain S=1 decode (bit-identical to `generate`), with the
+                // MTP KV kept in lockstep so spec can resume the instant the cache warms.
+                self.forward(cur, pos)?; // main KV @pos; self.x = trunk_pos
+                let pa = self.argmax()?; // real token at pos+1
+                let d = self.mtp_draft(pa, pos)?; // MTP KV @pos; draft for pos+1
+                cur = pa;
+                draft = d;
+                pos += 1;
+                // Feed this pass's routed-cache accounting into the recent window.
+                let (h, m) = (self.pin.hits, self.pin.misses);
+                win[win_i] = (h - last_hit, m - last_miss);
+                (last_hit, last_miss) = (h, m);
+                win_i = (win_i + 1) % GATE_WIN;
+                win_len = (win_len + 1).min(GATE_WIN);
+                continue;
             }
 
             spec_iters += 1;
@@ -1728,8 +1784,11 @@ impl<'a> GpuEngine<'a> {
         self.prof.report();
         let acc_pct = 100.0 * accepted as f64 / spec_iters.max(1) as f64;
         tracing::info!(
-            "spec: {} tokens in {spec_iters} verify rounds, {accepted} accepted ({acc_pct:.1}%)",
+            "spec: {} tokens in {spec_iters} verify rounds, {accepted} accepted ({acc_pct:.1}%); \
+             warm-gate {} (threshold {:.1}%)",
             out.len(),
+            if engaged { "engaged" } else { "never engaged" },
+            100.0 * warm_hit,
         );
         Ok(out)
     }

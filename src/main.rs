@@ -22,6 +22,9 @@ use tracing::info;
 /// 80 GiB); the resolved pool budget is `min(free − OS_RESERVE, max_pool_size)`.
 /// `--direct-io` makes the cold-expert reads use O_DIRECT (bypass the OS page
 /// cache); default is buffered reads through the page cache.
+/// `--spec-warm-hit <f>` (default 0.85) gates `--spec`: speculation stays off (plain
+/// S=1 decode) until the routed-cache hit-rate over a recent window reaches `f`, then
+/// latches on — keeping spec out of the cold, bandwidth-bound regime where it loses.
 /// `--attn dense|streaming|dsa|misa` picks the attention row-selection
 /// mechanism (see attn::AttnMode). `--sinks`/`--window` shape streaming mode
 /// (defaults 4 / 8192, the StreamingLLM shape). dsa/misa need the `out-idx-*`
@@ -44,6 +47,7 @@ struct Args {
     misa_heads: usize,
     kv_fp8: bool,
     spec: bool,
+    spec_warm_hit: f64,
 }
 
 fn parse_args() -> Result<Args> {
@@ -51,7 +55,7 @@ fn parse_args() -> Result<Args> {
          [--direct-vmm-dma] [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc] \
          [--no-prefetch] [--prefetch-depth <n>] [--max-pool-size <GiB>] [--direct-io] \
          [--attn dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>] [--kv-fp8] \
-         [--spec]";
+         [--spec] [--spec-warm-hit <f>]";
     let mut snapshot = None;
     // Defaults are the validated winning config: ARC eviction + cross-layer prefetch
     // (best hit% on realistic multi-request sessions + the ~+11% prefetch overlap).
@@ -73,6 +77,7 @@ fn parse_args() -> Result<Args> {
         misa_heads: 8, // the MISA paper's validated GLM-5 setting
         kv_fp8: false,
         spec: false,
+        spec_warm_hit: 0.85,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -140,6 +145,16 @@ fn parse_args() -> Result<Args> {
             }
             "--kv-fp8" => a.kv_fp8 = true,
             "--spec" => a.spec = true,
+            "--spec-warm-hit" => {
+                a.spec_warm_hit = args
+                    .next()
+                    .context("--spec-warm-hit requires a fraction in [0,1]")?
+                    .parse()
+                    .context("--spec-warm-hit takes a float")?;
+                if !(0.0..=1.0).contains(&a.spec_warm_hit) {
+                    bail!("--spec-warm-hit must be in [0,1]");
+                }
+            }
             _ if snapshot.is_none() => snapshot = Some(arg),
             _ => bail!("unexpected argument: {arg}\n{USAGE}"),
         }
@@ -183,6 +198,7 @@ fn main() -> Result<()> {
         attn,
         a.kv_fp8,
         a.spec,
+        a.spec_warm_hit,
     )?;
 
     // Rule 1: the full discovered config is the first line of every run.
@@ -334,7 +350,7 @@ async fn run(cfg: Config) -> Result<()> {
         }
         let t0 = std::time::Instant::now();
         let ids = if cfg.spec {
-            engine.generate_spec(&prompt_ids, ngen, &tok.eos)?
+            engine.generate_spec(&prompt_ids, ngen, &tok.eos, cfg.spec_warm_hit)?
         } else {
             engine.generate(&prompt_ids, ngen, &tok.eos)?
         };
