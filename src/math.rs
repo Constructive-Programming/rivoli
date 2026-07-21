@@ -35,7 +35,7 @@ pub fn rmsnorm_into_bytes(dst: &mut [f32], src: &[f32], weight_bytes: &[u8], eps
 /// SiLU (a.k.a. swish): `x * sigmoid(x)`.
 #[inline]
 pub fn silu(x: f32) -> f32 {
-    x / (1.0 + (-x).exp())
+    x * sigmoid(x)
 }
 
 /// Logistic sigmoid — the MoE router's scoring function (scoring_func=sigmoid).

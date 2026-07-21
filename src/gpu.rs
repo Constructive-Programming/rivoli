@@ -405,9 +405,27 @@ impl<'a> GpuEngine<'a> {
     pub fn prefetch_recall(&self) -> (u64, u64) {
         (self.pin.pred_correct, self.pin.pred_total)
     }
+    /// Where a routed expert's bytes actually came from, splitting the single
+    /// `hits` counter (which conflates the two) plus the demand misses:
+    ///   `loaded`    — already resident, NO disk read at all
+    ///   `preloading`— a prefetch had streamed it in, read overlapped prior compute
+    ///   `cold`      — demand miss, read on the critical path
+    /// Also `pf_evict_unused` (prefetched keys evicted before any use) and
+    /// `pf_evict_then_missed` (those later demanded anyway = read twice).
+    pub fn source_split(&self) -> (u64, u64, u64, u64, u64) {
+        self.pin.source_split()
+    }
     /// Total ms blocked in the prefetch drain (fetch NOT hidden behind compute).
     pub fn prefetch_wait_ms(&self) -> f64 {
         self.pin.prefetch_wait_ns as f64 / 1e6
+    }
+    /// `prefetch_layer` cost split in ms: (cache admission, SQE prep, submit).
+    pub fn prefetch_cost_ms(&self) -> (f64, f64, f64) {
+        (
+            self.pin.pf_alloc_ns as f64 / 1e6,
+            self.pin.pf_queue_ns as f64 / 1e6,
+            self.pin.pf_submit_ns as f64 / 1e6,
+        )
     }
 
     /// DSA/MISA row selection for one full/shared layer at `pos`, returning the

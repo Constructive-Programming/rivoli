@@ -37,6 +37,7 @@
 #include <hip/hip_runtime.h>
 #include <cerrno>
 #include <cstdlib>
+#include <cstring>
 
 // hipError_t codes are small positive ints; offset them well below -errno space so
 // a copy failure is distinguishable from an io_uring/-errno failure in the log.
@@ -56,10 +57,27 @@ struct Ring {
 // `bounce` != 0, allocate an `entries * span` pinned host arena + per-read
 // bookkeeping (the kernel-bug workaround); otherwise reads DMA straight into the
 // caller's VMM dst. Returns an opaque handle or null on failure.
-extern "C" void* rivoli_ring_new(unsigned entries, unsigned span, int bounce) {
+// `sqpoll` != 0 asks the kernel to run a submission-poller thread, so
+// io_uring_submit becomes a shared-memory tail update with NO io_uring_enter
+// syscall on the caller's thread. This matters ONLY for the prefetch ring:
+// measured, a plain io_uring_submit of one expert's 6 O_DIRECT reads blocks the
+// decode thread for ~2.96 ms — about 61% of the 4.85 ms the read itself takes —
+// because the submitting task drives the btrfs/blk-mq dispatch inline. That made
+// "async" prefetch effectively synchronous: it never overlapped GPU compute, it
+// just moved the read out of the `fetch` bucket into untimed `other`.
+// Falls back to a normal ring if SQPOLL is unavailable (older kernel, no perm).
+extern "C" void* rivoli_ring_new(unsigned entries, unsigned span, int bounce, int sqpoll) {
     Ring* r = (Ring*)calloc(1, sizeof(Ring));
     if (!r) return nullptr;
-    if (io_uring_queue_init(entries, &r->uring, 0) < 0) { free(r); return nullptr; }
+    int ok = -1;
+    if (sqpoll) {
+        struct io_uring_params p;
+        memset(&p, 0, sizeof(p));
+        p.flags = IORING_SETUP_SQPOLL;
+        p.sq_thread_idle = 2000;  // ms before the poller sleeps; re-armed on submit
+        ok = io_uring_queue_init_params(entries, &r->uring, &p);
+    }
+    if (ok < 0 && io_uring_queue_init(entries, &r->uring, 0) < 0) { free(r); return nullptr; }
     r->span = span;
     r->entries = entries;
     r->bounce_mode = bounce;

@@ -3,16 +3,7 @@
 // round-trips to the host mid-layer. All launch-only; caller joins via
 // rivoli_device_sync. Return codes: 0 ok, POSITIVE arg guard, NEGATIVE -hipError.
 
-#include <hip/hip_runtime.h>
-
-// f32 → bf16, round-to-nearest-even, non-finite verbatim (matches math.rs).
-__device__ __forceinline__ unsigned short f2bf16(float x) {
-    unsigned int b;
-    __builtin_memcpy(&b, &x, sizeof(b));
-    if (!isfinite(x)) return (unsigned short)(b >> 16);
-    unsigned int r = ((b >> 16) & 1u) + 0x7fffu;
-    return (unsigned short)((b + r) >> 16);
-}
+#include "common.hpp"
 
 // x[i] = (int8)embed[token·hidden + i] · scale[token]  — embedding row lookup.
 extern "C" __global__ void embed_i8_row(

@@ -320,6 +320,103 @@ accept), so speculation loses in both regimes. The cache — not speculation —
 the lever that crosses 1 tok/s. Full write-up + numbers in `docs/mtp.md`; branches
 `deadend/{mtp,spec-overlap-gate,spec-warm-budget,spec-union-tree}`.
 
+## OPEN: attention modes are unmeasured where they differ (followup, 2026-07-20)
+
+The `--attn dense|streaming|dsa|misa` knobs and `--kv-fp8` are shipped,
+code-reviewed and kernel-validated, but **no mode has ever been benchmarked or
+quality-checked in the regime where the modes actually differ.** Recording it
+here because these gaps were previously written down only in
+`docs/review-log.md`, which lives on `deadend/*` and is invisible from `main`.
+
+What is NOT known (do not cite a mode ranking until this runs):
+
+- **No valid throughput comparison exists.** The one recorded figure —
+  dsa/misa 1.28 vs dense 0.80 tok/s @ 512 (`git show
+  8d267c5:docs/review-log.md`) — is self-labeled "unconfirmed", collapses dsa
+  and misa into ONE number, and attributes the gain to the **MoE prefetch path,
+  not attention** (hit 79→91→95%, `attn` flat ~204 ms across all modes). The
+  `--no-prefetch` A/B that would isolate the cause was interrupted at ~112/512.
+- **`streaming` has never been measured at all** — no throughput or quality
+  number exists for it anywhere.
+- **The sparse regime has never been run end-to-end.** `index_topk` = 2048
+  (model `config.json`), so below 2048 context every mode takes the dense
+  fallback and is bit-identical by construction — which is all
+  `tests/attn_modes.rs` certifies. Benchmarks at 64/128/512 tokens say NOTHING
+  about mode choice.
+- **No quality measurement in the sparse regime.** No perplexity, no
+  cross-check vs the HF reference. The MISA-vs-DSA IoU 0.84
+  (`tests/attn_modes.rs:151`) is selection overlap on synthetic activations;
+  its own comment says "true routing QUALITY is a real-decode long-context
+  eval, not this harness's job". (An earlier 0.996 IoU claim was retracted in
+  `f58d70e` as near-vacuous.)
+- **`--kv-fp8` is uncalibrated and unvalidated at long context.** Measured only
+  as within 5 % of bf16, dense, short context. vLLM reported MLA-fp8 accuracy
+  drift without calibration.
+
+**Run dsa/misa against `~/glm52-snap`, NOT the bare colibri dir.** The colibri
+converter skipped the DSA indexer (AGENTS.md "Weights the snapshot doesn't
+have"), so `/var/db/llama-server/glm52-colibri-int4` alone bails with `required
+tensor model.layers.0.self_attn.indexer.wk.weight not found in snapshot`.
+`~/glm52-snap` is the documented symlink-overlay: symlinks to all 147 real
+shards + the range-extracted `out-idx-00000.safetensors` (412 MB, 110 indexer
+tensors). Against it, `--attn misa` indexes 118587 tensors vs 118478 and runs.
+Note the repo's `.snapshot_path` still points at the bare colibri dir, so any
+tooling that reads it gets the indexer-less path.
+
+### Measured 2026-07-20: at 128 tok the modes are indistinguishable, and the fp8 "win" is a routing artefact
+
+16 runs (4 modes × `--kv-fp8` on/off × 2 reps, 128 tok, `~/glm52-snap`).
+Reproducibility is tight (rep1 vs rep2 within 0.01 tok/s), so the spreads below
+are real — but they are **not** caused by what they appear to be.
+
+| config | tok/s | hit % | miss | attn ms |
+|---|---|---|---|---|
+| dense / streaming / dsa / misa, fp8 **off** | 0.85–0.86 | 78.1–78.3 | 122–123 | 173–174 |
+| dense + fp8, streaming + fp8 | 0.89–0.90 | 79.9 | 112 | 173–176 |
+| dsa + fp8, misa + fp8 | 0.81–0.82 | 76.6 | 132 | 173–175 |
+
+Two things this establishes:
+
+1. **All four modes are identical below `index_topk`** — with fp8 off, every
+   mode produced byte-identical output (md5 `285c4923`) at identical cost. The
+   dense-fallback equivalence is now confirmed end-to-end on the real snapshot,
+   not just by construction in `tests/attn_modes.rs`.
+2. **`attn` is FLAT at 173–176 ms across all 16 runs** — invariant to mode and
+   to fp8. Meanwhile `ms/miss` is constant at 4.78–4.90, so
+   `fetch ≈ miss_count × 4.85 ms`, and tok/s is a strict monotonic function of
+   the expert cache hit rate. **The entire tok/s spread is expert-fetch, not
+   attention.**
+
+Mechanism: fp8 is lossy, so it perturbs the sampled token stream (different
+output md5), which routes to different experts, which changes the cache hit
+rate, which changes fetch time. The sign flips by mode — fp8 *helps*
+dense/streaming (+1.6 pp hit) and *hurts* dsa/misa (−1.5 pp hit) — which is
+conclusive that this is a routing draw, not a bandwidth property. At 128 tok the
+KV cache is ~133 rows, far too small for fp8's 656-vs-1152 B/token/layer saving
+to register, and the flat `attn` confirms it does not.
+
+**Do not read "dense+fp8 = 0.90" as fp8 being faster.** This is the same
+confound that made the un-merged 512-token dsa/misa figure uninterpretable.
+Any future A/B must hold the token stream fixed (or average over many prompts)
+before attributing a tok/s delta to an attention or KV change.
+
+The run that would settle it:
+
+1. Context **> 2048** (the whole point — ≥ 8k, ideally toward 40k) so the sparse
+   paths actually engage. Fixed prompt, fixed token count, all four modes.
+2. **`--no-prefetch` as a control arm** alongside the default prefetch arm, to
+   separate attention cost from the prefetch hit-rate effect that confounded the
+   original measurement. Report the PROFILE `attn` ms/tok, not just tok/s.
+3. **A quality arm**: agreement vs `--attn dense` output at the same context
+   (note dense itself is "mildly out-of-distribution" beyond index_topk per
+   `attn.rs:26`, so it is a reference, not ground truth).
+4. dsa and misa reported **separately**; `--kv-fp8` crossed with each mode, since
+   fp8 composes with all of them and its KV-bandwidth saving (656 vs 1152
+   B/token/layer) only pays off once the cache is large.
+
+Until then `--attn dense`, `--kv-fp8` off remain the defaults — chosen as the
+conservative exact-model path, NOT because they won a benchmark.
+
 ## Measured bottlenecks & the coherent-pin fix (2026-07-18, real snapshot)
 
 Profiled the M3 (4/4) engine on the LOCAL snapshot (`/var/db/llama-server/
@@ -528,6 +625,510 @@ inner-dot coalescing — the 29 % `mlp` bucket, the last big *compute* win; (b) 
 fault throughput for the 63 % warm+fetch I/O (io-uring / pread pool — the I/O
 itself, threading already fixed). Device-side routing / ≤1-join stays SKIPPED
 (blocked while cold-fetching; only reachable fully-resident, i.e. post-priming).
+
+## HIP KERNEL REVIEW → target 2 tok/s warm (2026-07-20)
+
+Broadened from "(a) MoE inner-dot coalescing" above into a full review of all six
+kernel translation units. Everything below is **measured on rh-anine**, not
+projected from theory; four new probes in `docs/probes/` reproduce it.
+
+### Baseline
+
+`rivoli /var/db/llama-server/glm52-colibri-int4 -bench 128 --pre-seed`:
+
+```
+PROFILE/tok: 1080ms wall | fetch 596ms 55% (121 miss, 4.89ms/miss)
+           | attn 175ms 16% | mlp 203ms 19% | lmhead 7ms 1% | route 2ms | other 96ms
+0.88 tok/s overall, expert hit 79.1% (climbing 71%→88% across the run)
+```
+
+**Compute = wall − fetch = 481 ms/token.** That is the budget this section
+attacks. Note the arithmetic that frames everything: at 481 ms of compute, a
+*zero-miss* run would already be 2.08 tok/s. So "2 tok/s warm" is a statement
+about **compute AND hit rate jointly** — see "What 2 tok/s actually requires".
+
+### THE finding: every int4 kernel reads ONE BYTE per lane per step
+
+`dot_i4_wave` (moe_fused.hip), `gemv_i4` (linalg.hip) and `nib_i4` (mla.hip) all
+have lane `l` load `row[i>>1]` for column `i ≡ l (mod 32)`. Lanes `l` and `l+1`
+read the *same* byte, so a 32-lane wave touches **16 consecutive bytes per load
+instruction** — one eighth of a 128 B cache line. The loop therefore issues ~8×
+more loads than the traffic needs and keeps far too few bytes in flight. The D3
+rewrite fixed the *stride* (adjacent lanes now read adjacent addresses) but never
+fixed the *width*.
+
+`docs/probes/i4gemv_probe.cpp` — one MoE layer's routed batch (E=9, hidden 6144,
+moe_inter 2048, 162 MB int4, far past any cache):
+
+| variant | ms/layer | GB/s | speedup | ms/token (75 layers) |
+|---|---|---|---|---|
+| A byte (shipped, 16 B/wave-load) | 2.282 | 74.4 | 1.00× | 171 |
+| B `uint` (4 B/lane, 128 B/wave-load) | 0.883 | 192.4 | 2.58× | 66 |
+| C `uint4` (16 B/lane, 512 B/wave-load) | 0.791 | **214.6** | **2.88×** | **59** |
+
+214.6 GB/s is **93 % of the ~230 GB/s LPDDR5X peak** — variant C is DRAM-bound,
+i.e. there is nothing left in the MoE inner dot after this change. The shipped
+form runs at 32 % of peak. The same `dot` is used by every other int4 kernel.
+
+**Take variant B (`uint`), not C — the snapshot's alignment decides it.** Checked
+the real shards: the safetensors header is 101512 bytes, so **all 852 tensors in a
+shard sit at data offset ≡ 8 (mod 16)** (relative offsets are 16-aligned; the
+header length shifts every one of them by 8). Pool placement preserves that skew —
+`packed = slot_base + slot_dst + (file_begin & 4095)` with both slot terms
+4096-aligned, so `packed % 16 == file_begin % 16 == 8` for **every** expert. A
+`uint4` pointer cast is therefore misaligned on all of them.
+
+`docs/probes/` alignment probe: the `uint` path costs only **2 %** for the skew
+(203.9 GB/s at 16 B-aligned vs **199.7 GB/s at the real ≡8 offset**), and needs
+only 4 B alignment, which every tensor satisfies. Variant C's extra ~7 ms/token
+is not worth a runtime alignment dispatch and a fallback tier. **One code path,
+`uint`, no tiering** — worth **~105 ms/token** on `mlp` alone.
+
+### Per-kernel review
+
+Weight bytes/token at GLM-5.2 dims (hidden 6144, q_lora 2048, kv_lora 512,
+qk_nope 192, qk_rope 64, v_head 256, H=64, 78 layers, 75 sparse):
+
+| kernel | file | bytes/tok | shipped | after `uint` | verdict |
+|---|---|---|---|---|---|
+| `moe_gateup`/`moe_down` | moe_fused.hip | 12.7 GB | ~171 ms | ~66 ms | **FIX — byte loads** |
+| `gemv_i4` (q_a,q_b,kv_a,o_proj) | linalg.hip | 5.9 GB | ~79 ms | ~31 ms | **FIX — byte loads** |
+| `mla_value` | mla.hip | 0.33 GB | ~9 ms | ~2 ms | **FIX — worst pattern, small payoff** |
+| `mla_absorb` | mla.hip | 0.25 GB | ~4 ms | ~3 ms | fix opportunistically |
+| `gemv_i8` (lm_head) | linalg.hip | 0.95 GB | 7 ms | ~5 ms | minor |
+| `gemv_f32` (gate + predict) | linalg.hip | 0.95 GB | ~5 ms | n/a | already coalesced, leave |
+| `mla_latent_attend` | attn.hip | KV-only | ~15 ms | — | **grid = ⌈H/HB⌉ = 8 blocks** (see below) |
+| `rmsnorm`/`layernorm`/`argmax` | linalg/indexer/fwd | — | ~1.6 ms | — | leave (measured: not occupancy-bound) |
+
+`mla_value` deserves a note even though the payoff is small: it is the *only*
+kernel still in the pre-D3 thread-per-row shape, so a wave's 32 lanes read 32
+different rows 256 B apart — **32 separate cache lines per load instruction**.
+`docs/probes/mla_proj_probe.cpp` measures the fix at **5.45×** (wave-per-row alone
+gives 2.57×; the probe’s uint4 variant reaches 5.45×, the shipped-alignment `uint` form lands between). It is a correctness-neutral 10-line change
+and removes the last inconsistency with the D3 contract.
+
+### Measured NON-problems — do not spend effort here
+
+`docs/probes/` overhead probe, gfx1151:
+
+- **host launch dispatch 1.29 µs** → ~1800 launches/token (≈23/layer × 78) ≈ **2.3 ms**. Not a lever.
+- **`hipDeviceSynchronize` on an idle queue 0.10 µs**; launch+sync serialized
+  7.49 µs vs 1.29 µs pipelined, so the drain penalty is ~6.2 µs. The engine's
+  **~150 syncs/token cost ~0.9 ms.**
+- **`rmsnorm` at grid=1 is 6.73 µs; at grid=40 it is 6.90 µs** — identical. It is
+  launch-latency bound, not occupancy bound. 234/token ≈ 1.6 ms.
+
+**This retires the "≤1 join/token" line of work as a throughput lever.** PLAN's
+bottleneck #3 budget (≤100 launches, ≤1 join per token) was written from colibri's
+OpenMP fork/join costs; on HIP the same pattern costs ~3 ms/token total. Device-side
+routing to reach ≤1 join is **not** worth building for speed. (It stays interesting
+only if it enables overlapping fetch with compute — a *different* argument, on the
+I/O side.) Likewise: do not multi-block the norms.
+
+### What 2 tok/s actually requires
+
+Vectorising every int4 dot onto the `uint` path: compute **481 → ~315 ms/token**
+(−166 ms).
+
+| hit rate | fetch ms/tok | wall | tok/s |
+|---|---|---|---|
+| 79.1 % (today's 128-tok bench) | 596 | 911 | 1.10 |
+| 90.9 % (today's 512-tok warm) | ~270 | ~585 | **1.71** |
+| 95 % | ~147 | ~462 | **2.16** |
+| 100 % (unreachable, bound) | 0 | 315 | 3.17 |
+
+So **the kernel work alone does not reach 2 tok/s at the current 90.9 % warm hit
+rate** — it reaches ~1.71. Closing the last gap needs one of:
+
+1. **Cold-path bandwidth.** 4.89 ms per 18.9 MB miss = **3.9 GB/s**, against the
+   16 GB/s the `iouring_vmm` probe measured at QD≥4. A 4× gap already documented
+   and never chased. At 8 GB/s, 90.9 % hit gives ~132 ms fetch → **2.28 tok/s**.
+   This is now the single largest remaining lever, larger than any kernel.
+2. Hit rate to ~95 % (priming — deliberately parked, see above).
+
+**Consequence to internalise: after the kernel fixes, rivoli is I/O-bound again**
+(fetch ~270 of ~585 ms = 46 %). The kernel work is necessary but not sufficient.
+
+### Unexplained: `other` = 96 ms/token (9 %)
+
+Dispatch accounts for only ~3 ms of it. The rest is host-side work between syncs —
+descriptor assembly, pin bookkeeping, prefetch accounting, tokenizer, argmax
+readback. 96 ms/token is 9 % of wall and nobody has ever profiled it. Worth one
+`perf record` pass before assuming it is irreducible.
+
+### Implementation order
+
+1. **`dot_i4_wave` → `uint` vectorised load** in `common.hpp` (one definition, all
+   callers inherit it): main loop over `uint` words while `dim - i ≥ WAVE*8`, then
+   a scalar tail. Lane `l` owns columns `[base + l*8, +8)`, so a wave-load covers
+   128 B = one cache line instead of 16 B.
+   - Every contraction dim divides by `WAVE*8 = 256` (6144, 2048, 12288, 16384,
+     512), so the tail is dead code at GLM dims — but keep it, it is three lines
+     and makes the helper total.
+   - Alignment holds: every `rb` is a multiple of 4 (3072/1024/8192/256/6144) and
+     every tensor offset is ≡ 8 mod 16, hence 4 B-aligned. **No runtime dispatch,
+     no fallback tier** — measured 2 % skew cost, see above.
+2. **`gemv_i4` + `gemv_i8`** onto the same helper (int8 needs its own 4-byte
+   unpack — it is already 32 B/wave-load, so the win there is smaller).
+3. **`mla_value` → wave-per-row** (matching every other D3 kernel), then the same
+   helper. `mla_absorb` opportunistically.
+4. Re-measure. Stop here if `mlp` lands near 66 ms and `attn` near 95 ms.
+5. Only then: `mla_latent_attend`'s 8-block grid — a split-KV (flash-decoding)
+   grid of `⌈H/HB⌉ × n_splits` blocks. **Low priority at short context** (~15 ms)
+   but it is the kernel that decides the still-unrun >2048-context benchmark, so
+   fix it as part of that work, not this one.
+
+### SHIPPED + MEASURED (2026-07-20) — compute halved, tok/s unchanged
+
+Implemented steps 1–3: `dot_i4_wave`/`dot_i8_wave` moved into `common.hpp` on the
+dword-per-lane shape, `gemv_i4`/`gemv_i8` onto them, `mla_value` rewritten
+wave-per-row. `mla_absorb` deliberately left alone (1.10× measured, not worth a
+second load path). **52/52 tests pass** against the scalar oracle; decode output
+stays coherent.
+
+Same command as the baseline (`-bench 128 --pre-seed`, local snapshot):
+
+| bucket | before | after | change |
+|---|---|---|---|
+| `attn` | 175 ms | **87 ms** | **2.01×** |
+| `mlp` | 203 ms | **102 ms** | **1.99×** |
+| `lmhead` | 7 ms | 5 ms | 1.4× |
+| `other` | 96 ms | 133 ms | ↑ (tracks miss count) |
+| **compute (wall − fetch)** | **481 ms** | **327 ms** | **1.47×** |
+| `fetch` | 596 ms (121 miss) | 757 ms (156 miss) | ↑ hit 79.1 % → 73.6 % |
+| wall / tok-s | 1080 ms / 0.88 | 1086 ms / 0.88 | **unchanged** |
+
+**The compute prediction was right (327 measured vs ~315 projected) and the
+throughput win was eaten by a hit-rate draw** — exactly the confound this section
+warned about. Different f32 rounding → different sampled tokens → different expert
+routing → 35 more misses/token → +161 ms of fetch that cancels the −154 ms of
+compute. `ms/miss` is rock stable across every run ever recorded (4.89 / 4.85 /
+4.84), so fetch is a strict linear function of miss count and the two effects can
+be separated: **normalised to the baseline's 121 misses, wall goes 1080 → 914 ms,
+i.e. +18 %.** That is the honest size of the kernel win.
+
+512-token run: `1093ms wall | fetch 712ms 65% | attn 118ms | mlp 104ms | lmhead
+4ms | other 153ms`, 0.90 tok/s at 75.3 % hit. Note `attn` grows 87 → 118 ms with
+context while `mlp` is flat — that is `mla_latent_attend`'s 8-block grid (step 5),
+now the only kernel whose cost scales with context.
+
+**Conclusion: the kernel side is done and rivoli is decisively I/O-bound.** Fetch
+is 65–70 % of wall; compute is 30 %. Halving compute again would buy under 15 %.
+**Every remaining path to 2 tok/s runs through the cold path** (3.9 GB/s per miss
+vs 16 GB/s probed) or the hit rate — not through HIP kernels. Two follow-ups that
+are now visible and were not before:
+
+- **`other` is 133–153 ms/token (12–14 % of wall), larger than `attn` or `mlp`.**
+  It scales with miss count, so it is likely per-miss host bookkeeping in
+  `resolve_layer`/descriptor assembly. Never profiled. This is now a bigger lever
+  than any remaining kernel.
+- The 512-token hit rate (75.3 %) is far below the 90.9 % this PLAN records for
+  the M4 gate. Either that figure came from an already-warm pool or the token
+  stream matters more than assumed — **worth re-establishing before any future
+  run cites 90.9 % as the warm baseline.**
+
+### PREFETCH IS NOW A NET LOSS — measured A/B (2026-07-20)
+
+Prompted by the miss-count rise above. **This A/B is clean**: prefetch depth does
+not change the token stream (routing is a deterministic function of the weights),
+so all four arms route the *identical* expert sequence and only cache/IO behaviour
+differs. No hit-rate confound. 128 tok, `--pre-seed`, local snapshot.
+
+| depth | wall | fetch (miss) | attn | mlp | **other** | tok/s | hit | recall | nvme0 GB |
+|---|---|---|---|---|---|---|---|---|---|
+| **0 (`--no-prefetch`)** | **1040** | 870 (185) | 77 | 77 | **10** | **0.91** | 68.7 % | — | 368 |
+| 2 (default) | 1085 | 755 (156) | 87 | 101 | 134 | 0.88 | 73.6 % | 79.6 % | 382 |
+| 4 | 1174 | 658 (131) | 88 | 112 | 310 | 0.81 | 77.9 % | 73.5 % | 417 |
+| 8 | 1557 | 529 (94) | 85 | 113 | **823** | 0.61 | 84.2 % | 59.1 % | 556 |
+
+**Prefetch does its job and still loses.** It monotonically improves hit rate
+(68.7 → 84.2 %), cuts demand misses (185 → 94) and cuts `fetch` (870 → 529 ms).
+But `other` explodes 10 → 823 ms, and total disk bytes rise 368 → 556 GB (+51 %).
+Net: deeper is strictly worse, and **the current default (depth 2) is already a
+net loss versus no prefetch at all.**
+
+Mechanism: `other` is wall minus the timed buckets, and `prefetch_layer` is the
+one call in the forward pass that is not inside a timed region — so `other` is
+**disguised I/O wait**, `Streamer::submit` blocking once the ring fills against a
+saturated disk. The host-side work itself (`pool.contains` / `alloc_cold` /
+6× `io_uring_prep_read`) is microseconds; nothing in it can cost 1.4 ms/expert.
+
+The root cause is simple: **prefetch buys hit rate with disk bandwidth, and disk
+bandwidth is precisely the scarce resource.** At recall 59 % (depth 8), 41 % of
+prefetched bytes are thrown away against a device that is the bottleneck.
+
+**Why this regressed now:** depth 2 was validated as optimal when compute was
+481 ms/token. The kernel work cut compute to ~170 ms (no-prefetch arm: attn 77 +
+mlp 77 + lmhead 5 + other 10 + route 1), so **the compute window prefetch used to
+hide under shrank by ~2.8×.** The prefetch tuning simply did not survive making
+the GPU faster.
+
+### Measured hardware ceiling — the disk is NOT 16 GB/s
+
+`/` is **btrfs RAID0 across both NVMes** (`nvme0n1p6` 1.45 TiB + `nvme1n1`
+465 GiB); reads stripe evenly (byte counters match to <1 % in every sample). Direct
+O_DIRECT 19 MB random reads, caches not dropped, parallelism swept:
+
+| parallelism | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|---|---|
+| GB/s | 2.53 | 5.30 | **6.69** | 6.29 | 6.47 | 6.41 |
+
+**The array tops out at ~6.5 GB/s at P≥4.** This *retires the 16 GB/s figure* from
+the io_uring probe note above — that number was sequential 1 MiB and did not
+survive contact with expert-sized random reads. rivoli's no-prefetch arm sustains
+185 × 18.9 MB / 870 ms = **4.0 GB/s, about 62 % of the ceiling** — so the cold-path
+headroom is ~1.6×, not the ~4× this PLAN previously claimed.
+
+**Revised path to 2 tok/s** (compute now ~170 ms, so fetch must be ≤ 330 ms):
+at the 6.5 GB/s ceiling, 330 ms buys ~113 experts/token, so it needs **both** the
+I/O path taken to ~ceiling (1.6×) **and** hit rate ≥ 81 %. Notably depth-8 prefetch
+already *achieves* 84.2 % hit / 94 misses — 94 × 18.9 MB at 6.5 GB/s would be
+273 ms fetch → **2.26 tok/s** — but only if that hit rate can be had without the
++51 % wasted traffic. **The lever is prediction ACCURACY, not depth.**
+
+### Double-fetch: dedup exists, with one gap
+
+Answering "do we load the same expert twice (prefetch + cold miss)?" — **no, not
+on the normal path.** `prefetch_layer` skips already-resident keys
+(`pool.contains`) and `alloc_cold` *binds the key to its slot at submit time*, so
+`resolve_layer` drains the prefetch ring first and the predicted-correct experts
+then surface in phase 1a as ordinary hits. No second read is issued.
+
+Two consequences worth writing down:
+
+1. **The reported hit rate counts prefetched-off-disk experts as HITS.** "hit
+   73.6 %" means "did not need a *demand* read at resolve time", not "was already
+   resident". True disk traffic is `misses + prefetch-queued`, which is why the
+   nvme byte counter rises with depth while the miss count falls. Any future
+   residency claim must use bytes, not the hit counter.
+2. **Gap (hypothesis) — TESTED AND REFUTED, see below.**
+
+### loaded / preloading / cold instrumentation (2026-07-20)
+
+The single `hits` counter conflated "already resident" with "a prefetch just
+streamed it off disk". Split three ways in `Pool` (`pending_pf` set + `hit_loaded`
+/ `hit_preload` / `misses`), reported as `expert source:` and `disk traffic:`.
+128 tok, `--pre-seed`, identical routed sequence in every arm:
+
+| depth | **loaded** | preloading | cold | reads/tok | GB/tok | wasted | tok/s |
+|---|---|---|---|---|---|---|---|
+| 0 | **68.7 %** (54794) | 0 | 31.3 % (25006) | 195.4 | 3.69 | — | **0.96** |
+| 2 | **68.8 %** (54888) | 4.8 % (3855) | 26.4 % (21057) | 204.0 | 3.86 | 4.6 % | 0.89 |
+| 4 | **68.6 %** (54769) | 9.2 % (7357) | 22.1 % (17674) | 226.6 | 4.28 | 17.6 % | 0.83 |
+| 8 | **68.1 %** (54368) | 16.1 % (12859) | 15.8 % (12573) | 317.3 | 6.00 | 37.4 % | 0.62 |
+
+**`loaded` is FLAT at 68.1–68.8 % across every arm.** Prefetch does not improve
+true residency by even one point — it only relabels disk reads as "hits". The
+apparent hit-rate climb 68.7 → 84.2 % is **entirely fictitious**: the same experts
+are read off the same disk, just earlier and under a different counter. Meanwhile
+real traffic rises 3.69 → 6.00 GB/tok (+63 %). At the measured 6.5 GB/s array
+ceiling, depth 8's 6.00 GB/tok needs ~920 ms of pure disk time per token — which
+is the whole story of its 1509 ms wall.
+
+**Never quote the hit rate again without the split.** It is not a residency metric.
+
+### Eviction-before-use hypothesis: REFUTED
+
+Direct test (`pf_evict_then_missed`): mark every prefetched key evicted while
+still unclaimed, then count demand misses that land on one — i.e. the expert
+really was wanted, we really did read it, and we threw it away in time to pay for
+it twice.
+
+| depth | wasted (evicted unused) | of those, later demanded | share |
+|---|---|---|---|
+| 2 | 1205 of 5060 queued (23.8 %) | **127** | 10.5 % |
+| 8 | 15179 of 28038 queued (54.1 %) | **609** | 4.0 % |
+
+Eviction-before-use is real but **negligible** — 127 and 609 re-reads against
+26 k and 41 k total reads (0.5 % and 1.5 %). And the share *falls* with depth
+(10.5 → 4.0 %), the opposite of what the hypothesis predicted. The
+`n_slots >= top_k + prefetch_depth` invariant plus the phase-1a-before-phase-1b
+ordering in `resolve_layer` (all `get`s precede any `alloc`) really is sufficient.
+
+**The waste is plain misprediction.** At depth 8, 54 % of queued prefetch reads
+are for experts that are simply never selected. The prefetcher's accuracy, not
+the cache's eviction discipline, is what fails.
+
+### Depth 1, and the policy re-examination at the winning depth (2026-07-20)
+
+Depth 1 completes the sweep. It is far better behaved than depth 2 — traffic
+within 0.5 % of no-prefetch, waste 1.6 %, and the best recall of any depth (82.3 %) —
+but wall still rises monotonically with depth:
+
+| depth | wall | fetch (miss) | other | loaded | reads/tok | GB/tok | waste | recall | tok/s |
+|---|---|---|---|---|---|---|---|---|---|
+| **0** | **1026** | 857 (185) | **10** | 68.7 % | 195.4 | 3.69 | 0 % | — | **0.93** |
+| 1 | 1041 | 792 (167) | 63 | 69.0 % | 196.3 | 3.71 | 1.6 % | 82.3 % | 0.91 |
+| 2 | 1075 | 747 (156) | 130 | 68.8 % | 204.0 | 3.86 | 4.6 % | 79.6 % | 0.89 |
+
+The trade is explicit: depth 1 moves 65 ms out of `fetch` and puts 53 ms into
+`other` (net +15 ms); depth 2 moves 110 ms and puts back 120 ms. **Prefetch's
+overlap benefit is real but its submit cost is always slightly larger.** Note
+`other`/prefetched-expert ≈ 3.3 ms at depth 1 — about one expert read — which says
+`Streamer::submit` is effectively *synchronous* against a busy disk rather than
+fire-and-forget. If that is fixable, depth 1 becomes a small win rather than a
+small loss; it is the only version of prefetch worth revisiting.
+
+**Cache policy at depth 0 (`--no-prefetch`).** These deltas are EXACT, not noisy:
+with the routed sequence fixed and prefetch off, the cache simulation is
+deterministic, so the miss counts are reproducible to the unit.
+
+| policy | wall | fetch (miss) | **loaded** | reads/tok | GB/tok | tok/s |
+|---|---|---|---|---|---|---|
+| `arc` (shipped default) | 1021 | 852 (185) | 68.7 % | 195.4 | 3.69 | 0.93 |
+| `lru` | 1007 | 837 (179) | 69.7 % | 189.0 | 3.57 | 0.94 |
+| **`2q`** | **1003** | 834 (175) | **70.2 %** | **185.6** | **3.51** | **0.95** |
+
+**ARC — the shipped default — is the WORST of the three.** 2Q gives +1.5 pp
+residency and −5.0 % disk traffic over it; even plain LRU beats it. ARC was
+presumably chosen while prefetch was on, where `insert_cold` feeds its ghost
+lists; with prefetch off that machinery never runs and ARC's adaptivity only
+costs. Since residency is now the critical path (below), a policy that buys
+1.5 pp of `loaded` for free is worth more than it looks.
+
+~~**Recommended default change: `--no-prefetch` + `--cache-policy 2q`.**~~
+**SUPERSEDED — the reason prefetch lost was a BUG, see next section.** 2Q vs ARC
+stands; "prefetch off" does not.
+
+## THE PREFETCH BUG: io_uring_submit was synchronous (2026-07-21)
+
+Chasing why `other` grew ~60 ms per unit of prefetch depth, `prefetch_layer` was
+instrumented in three parts. The answer is not subtle:
+
+```
+prefetch cost: alloc 15ms (0.12ms/tok) | sqe-prep 3ms (0.02ms/tok)
+             | io_uring_submit 14959ms (116.87ms/tok)      <-- 99%
+```
+
+**`io_uring_submit` blocked the decode thread for 2.96 ms per queued expert** —
+about 61 % of the 4.85 ms the read itself takes. The ring was created with
+`io_uring_queue_init(entries, &r->uring, 0)`, so `io_uring_submit` is an
+`io_uring_enter` syscall in which the submitting task drives the btrfs/blk-mq
+dispatch inline. **The "asynchronous, overlaps GPU compute" prefetch was doing
+most of the read synchronously**, then hiding the cost in the one part of the
+forward pass no PROFILE bucket covers. Every conclusion built on prefetch being
+free was measuring an artifact — including this PLAN's own "depth 2 validated
+optimal" and yesterday's "prefetch is a net loss".
+
+**Fix: `IORING_SETUP_SQPOLL` on the prefetch ring** (kernel poller thread; submit
+becomes a shared-memory tail write, no syscall), with a graceful fallback to a
+plain ring. Main ring left alone — its submit is immediately followed by a
+blocking drain, so it has nothing to gain. `io_uring_submit` → **0.00 ms/tok**.
+52/52 tests pass; output stays coherent.
+
+### Result — this is the largest single win in the project
+
+128 tok, `--cache-policy 2q`:
+
+| config | wall | fetch (miss) | **loaded** | reads/tok | GB/tok | tok/s |
+|---|---|---|---|---|---|---|
+| no prefetch | 1003 | 834 (175) | 70.2 % | 185.6 | 3.51 | 0.95 |
+| **SQPOLL depth 1** | **631** | 456 (84) | **83.7 %** | **102.7** | **1.94** | **1.45** |
+| SQPOLL depth 2 | 1280 | 1099 (126) | 73.6 % | 169.7 | 3.21 | 0.75 |
+
+**512 tok warm, SQPOLL + 2q + depth 1:**
+```
+PROFILE/tok: 531ms wall | fetch 325ms 61% (43 miss, 7.55ms/miss)
+           | attn 114ms 22% | mlp 74ms 14% | lmhead 5ms | route 3ms | other 11ms
+1.83 tok/s | expert hit 92.5% | loaded 91.8% | 50.6 reads/tok (0.96 GB/tok)
+```
+
+**1.83 tok/s**, against the M4 gate's recorded 1.31 and this morning's measured
+0.90. Disk traffic fell 3.51 → **0.96 GB/tok (−73 %)**.
+
+**Why residency jumped (70 → 92 %), which scheduling alone cannot explain:** the
+routed sequence is identical (79800 selections either way), so prefetch is
+changing *admission*, not selection. Under 2Q a demand miss enters A1in and needs
+a SECOND access to reach the protected Am set; a prefetched expert enters A1in and
+its first real `get` promotes it straight to Am. Prefetch is therefore acting as a
+one-touch admission filter that converges the hot set far faster. That is a real
+cache-quality effect, and it is why prefetch + 2Q compounds rather than just adds.
+
+**Depth 1 only.** Depth 2 is now *worse than no prefetch* (0.75 tok/s, ms/miss
+doubles to 8.67): with submit genuinely async the extra reads really do run in the
+background and oversubscribe the disk, and the lower-confidence second prediction
+pollutes A1in, displacing entries before they can promote. The confidence ranking
+matters more than the count — consistent with recall falling with depth.
+
+### Full 512-token grid: depth {1,2} × policy {lru,arc,2q} (2026-07-21)
+
+All six cells, `--pre-seed`, SQPOLL prefetch ring, identical routed sequence:
+
+| depth | policy | wall | fetch (miss) | attn | mlp | **loaded** | reads/tok | GB/tok | tok/s |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | lru | 1293 | 1083 (156) | 114 | 77 | 71.1 % | 178.0 | 3.36 | 0.76 |
+| 1 | arc | 1189 | 978 (159) | 114 | 78 | 70.7 % | 183.1 | 3.46 | 0.83 |
+| **1** | **2q** | **505** | **300 (43)** | 114 | 74 | **91.8 %** | **50.6** | **0.96** | **1.92** |
+| 2 | lru | 1323 | 1112 (144) | 115 | 78 | 70.6 % | 185.5 | 3.51 | 0.75 |
+| 2 | arc | 1228 | 1015 (147) | 115 | 78 | 70.6 % | 193.6 | 3.66 | 0.80 |
+| 2 | 2q | 1033 | 826 (120) | 113 | 75 | 75.5 % | 154.6 | 2.92 | 0.95 |
+
+**`2q` + depth 1 is not a trend, it is a sharp peak.** Everything else clusters at
+70.6–75.5 % residency and 0.75–0.95 tok/s; that one cell is 91.8 % and 1.92 tok/s
+— 2× the next best. LRU and ARC are indistinguishable from each other and barely
+respond to depth at all (70.6–71.1 % in all four of their cells), so the
+interaction is specifically **2Q's structure × exactly one high-confidence
+prediction**.
+
+Mechanism, consistent with the numbers: 2Q's A1in probation queue is bounded. At
+depth 1 the single best prediction enters A1in and its first real `get` promotes
+it to the protected Am set, so the hot set converges fast and holds. At depth 2
+the cold-insert rate into A1in doubles, churning entries out of probation *before*
+their `get` arrives — fewer promotions, worse Am quality, residency collapses back
+to 75.5 %. LRU and ARC have no probation/protection split for this to exploit,
+which is why they sit flat. **The prediction's confidence rank matters far more
+than the number of predictions.**
+
+Also note `attn` is 113–115 ms and `mlp` 74–78 ms in **all six cells** — the
+compute buckets are completely invariant to cache configuration, as they should
+be. That is a good internal consistency check on the whole grid.
+
+### Where 2 tok/s stands now
+
+**505 ms/token against a 500 ms target — 1 % short, i.e. at the threshold within
+run variance** (the two `2q`+depth-1 runs measured 531 ms / 1.83 tok/s and 505 ms
+/ 1.92 tok/s, with byte-identical cache counters — so the spread is pure
+wall-clock noise, not behaviour). The profile has inverted again:
+
+- `fetch` 325 ms (61 %) but only **43 misses at 7.55 ms/miss** and 0.96 GB/tok =
+  **2.9 GB/s, against the 6.5 GB/s ceiling.** The cold path is now
+  LATENCY-bound, not bandwidth-bound — too few reads per layer to fill the queue.
+  Batching misses across layers, or a deeper (but still depth-1-confidence)
+  lookahead, is the lever.
+- `attn` 114 ms (22 %) is now the #2 bucket and the only one that grows with
+  context — that is `mla_latent_attend`'s ⌈H/HB⌉ = **8-block grid** (step 5 of the
+  kernel plan, previously deprioritised). At 22 % it is worth doing now.
+
+Either one alone plausibly covers the 31 ms.
+
+### Consequence for 2 tok/s
+
+Compute is ~170 ms/token. For a 500 ms budget, fetch must be ≤ 330 ms, which at
+the 6.5 GB/s ceiling is ~2.15 GB/tok ≈ 113 expert reads/tok. Today's best arm
+(no-prefetch) reads 195/tok at 68.7 % residency.
+
+So **2 tok/s needs residency ~83 %, and prefetch provably cannot supply it** —
+`loaded` does not move. The only levers on residency are pool contents: priming
+(parked), a better eviction policy, or a bigger pool (settled as byte-optimal).
+That is now the critical path, and it is a cache-admission problem, not an I/O or
+kernel problem.
+
+### Measurement protocol — the confound this project keeps hitting
+
+Changing the summation order changes f32 rounding, which perturbs the sampled
+token stream, which routes to different experts, which changes the cache hit
+rate, which changes `fetch`, which changes tok/s. This is **exactly** the
+artefact that made the `--kv-fp8` and dsa/misa numbers uninterpretable (see the
+attention-modes section above). Therefore:
+
+- Gate correctness on `tests/kernel_test.rs` against the scalar oracle (1e-3
+  int4 dequant tolerance), not on output identity.
+- Report **`attn` and `mlp` ms/token**, which are hit-rate-independent, as the
+  primary result. Report tok/s only alongside the hit rate.
+- Determinism is preserved: lane `l` owning a contiguous column block and then
+  `wave_sum` is still schedule-independent, so greedy decode stays reproducible.
+- The `i4gemv_probe` numbers are the ceiling; if the in-engine `mlp` bucket does
+  not approach 66 ms, the gap is dispatch/serialisation, not the dot.
 
 ## M3 kernel contracts (locked by the M2 review)
 

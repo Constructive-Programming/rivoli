@@ -13,22 +13,8 @@
 // from the scalar oracle's ascending sum by f32 rounding (well within the test's
 // 1e-3 dequant tolerance) but is SCHEDULE-INDEPENDENT, so greedy decode stays
 // deterministic.
-//
-// ponytail: WAVE=32 hardcoded for gfx1151 (RDNA3.5, native wave32); __shfl_down
-// width=32 also keeps it correct on a wave64 part (reduces within 32-lane
-// groups, matching the logical wave = threadIdx/32). A part with warpSize<32
-// would need WAVE lowered.
 
-#include <hip/hip_runtime.h>
-
-#define WAVE 32
-#define ROWS_PER_BLOCK 8  // block = 256 threads = 8 waves → 8 rows/block
-
-// Sum a wave's partials into lane 0 (fixed shuffle order → deterministic).
-__device__ __forceinline__ float wave_sum(float v) {
-    for (int o = WAVE / 2; o > 0; o >>= 1) v += __shfl_down(v, o, WAVE);
-    return v;
-}
+#include "common.hpp"
 
 // y[o] = scale[o] · Σ_i x[i]·(nibble(row_o,i) - 8)   — int4, per-row scale.
 extern "C" __global__ void gemv_i4(
@@ -40,14 +26,7 @@ extern "C" __global__ void gemv_i4(
     size_t o = (size_t)blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x / WAVE);
     if (o >= (size_t)o_dim) return;
     size_t rb = (size_t)(i_dim + 1) / 2;
-    const unsigned char* row = packed + o * rb;
-    float acc = 0.0f;
-    for (int i = lane; i < i_dim; i += WAVE) {
-        unsigned char b = row[i >> 1];
-        int n = (i & 1) ? (b >> 4) : (b & 0x0F);
-        acc += x[i] * (float)(n - 8);
-    }
-    acc = wave_sum(acc);
+    float acc = dot_i4_wave(x, packed + o * rb, i_dim, lane);
     if (lane == 0) y[o] = acc * scale[o];
 }
 
@@ -58,10 +37,7 @@ extern "C" __global__ void gemv_i8(
     int lane = threadIdx.x & (WAVE - 1);
     size_t o = (size_t)blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x / WAVE);
     if (o >= (size_t)o_dim) return;
-    const unsigned char* row = packed + o * (size_t)i_dim;
-    float acc = 0.0f;
-    for (int i = lane; i < i_dim; i += WAVE) acc += (float)((signed char)row[i]) * x[i];
-    acc = wave_sum(acc);
+    float acc = dot_i8_wave(x, packed + o * (size_t)i_dim, i_dim, lane);
     if (lane == 0) y[o] = acc * scale[o];
 }
 
@@ -129,8 +105,9 @@ extern "C" __global__ void rmsnorm(
 // Angles in double (as the reference) so long-context argument reduction doesn't
 // drift. One block per segment, seg/2 threads; all pairs are read before any
 // write (barrier), so the in-place de-interleave is race-free.
+// `count` is the grid dim, not a kernel arg — one block per segment.
 extern "C" __global__ void rope_interleave(
-    float* __restrict__ base, int count, int stride, int seg, int pos, double theta) {
+    float* __restrict__ base, int stride, int seg, int pos, double theta) {
     int s = blockIdx.x;
     int j = threadIdx.x;
     int half = seg / 2;
@@ -172,7 +149,7 @@ extern "C" int rivoli_rope(
     hipGetLastError();
     // block = seg/2 EXACTLY so every thread reaches the barrier (no divergence).
     hipLaunchKernelGGL(rope_interleave, dim3(count), dim3(seg / 2), 0, 0,
-                       base, count, stride, seg, pos, theta);
+                       base, stride, seg, pos, theta);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

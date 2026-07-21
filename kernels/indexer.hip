@@ -9,31 +9,11 @@
 // gather. All pointers device-resident; launch-only (no sync/alloc/copy).
 // Return codes: 0 ok, POSITIVE arg guard, NEGATIVE -hipError (shared convention).
 
-#include <hip/hip_runtime.h>
+#include "common.hpp"
 
-#define WAVE 32
-#define ROWS_PER_BLOCK 8
 // MISA router block size (pooled tokens per key). MUST match
 // crate::indexer::MISA_BLOCK — the running-mean pool the router scores over.
 #define MISA_BLOCK 1024
-
-__device__ __forceinline__ float bf16f(unsigned short b) {
-    unsigned int u = ((unsigned int)b) << 16;
-    float f;
-    __builtin_memcpy(&f, &u, sizeof(f));
-    return f;
-}
-__device__ __forceinline__ unsigned short f2bf16(float f) {
-    unsigned int u;
-    __builtin_memcpy(&u, &f, sizeof(u));
-    if ((u & 0x7fffffffu) > 0x7f800000u) return (unsigned short)(u >> 16); // NaN
-    u += 0x7fffu + ((u >> 16) & 1u); // round-to-nearest-even
-    return (unsigned short)(u >> 16);
-}
-__device__ __forceinline__ float wave_sum(float v) {
-    for (int o = WAVE / 2; o > 0; o >>= 1) v += __shfl_down(v, o, WAVE);
-    return v;
-}
 
 // y[o] = Σ_i x[i]·bf16(w[o·i_dim+i])  — GEMV against a row-major bf16 weight
 // (the indexer's wk / wq_b / weights_proj). Coalesced wave-per-row, mirroring
@@ -98,7 +78,7 @@ extern "C" __global__ void index_append(
 extern "C" __global__ void index_score(
     const float* __restrict__ q, const float* __restrict__ w,
     const unsigned short* __restrict__ kcache, const unsigned int* __restrict__ heads,
-    int nt, int nh, int nact, int hd, float wscale, float dscale,
+    int nt, int nact, int hd, float wscale, float dscale,
     float* __restrict__ scores) {
     extern __shared__ float smem[];
     float* kf = smem;             // [hd] staged key row
@@ -170,7 +150,7 @@ extern "C" int rivoli_index_score(
     if (lds > 65536) return 1002;
     hipGetLastError();
     hipLaunchKernelGGL(index_score, dim3(nt), dim3(bd), lds, 0,
-                       q, w, kcache, heads, nt, nh, nact, hd, wscale, dscale, scores);
+                       q, w, kcache, heads, nt, nact, hd, wscale, dscale, scores);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

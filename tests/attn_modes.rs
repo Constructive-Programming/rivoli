@@ -131,6 +131,25 @@ fn modes_agree_below_sparsity_thresholds() -> anyhow::Result<()> {
         assert_eq!(d, &misa[i], "dense vs misa diverged at step-layer {i}");
     }
 
+    // The same below-threshold equivalence must hold with the fp8 latent cache:
+    // fp8 changes the CACHE, not which rows are selected, so dsa/misa still fall
+    // back to dense row selection and must match dense-fp8 EXACTLY. (The bf16
+    // cross above would not catch a divergence that only appears under fp8.)
+    let dense_fp8_eq = run_mode_kv(&snap, &cfg, &layers, &AttnMode::Dense, steps, true)?;
+    let dsa_fp8 = run_mode_kv(&snap, &cfg, &layers, &AttnMode::Dsa, steps, true)?;
+    let misa_fp8 = run_mode_kv(
+        &snap,
+        &cfg,
+        &layers,
+        &AttnMode::Misa { active_heads: 8 },
+        steps,
+        true,
+    )?;
+    for (i, d) in dense_fp8_eq.iter().enumerate() {
+        assert_eq!(d, &dsa_fp8[i], "dense-fp8 vs dsa-fp8 diverged at {i}");
+        assert_eq!(d, &misa_fp8[i], "dense-fp8 vs misa-fp8 diverged at {i}");
+    }
+
     // fp8 latent cache: NOT bit-identical to bf16 (lossy by design) but close.
     // The attention output stays within a small tolerance of the bf16 result.
     let dense_fp8 = run_mode_kv(&snap, &cfg, &layers, &AttnMode::Dense, steps, true)?;

@@ -14,8 +14,10 @@ use tracing::info;
 /// `--trace <path>` dumps the routed-expert access trace for the offline cache-
 /// policy sim (bin/replay). `--prompt <text>` overrides the fixed bench prompt so
 /// diverse, request-like inputs can be traced.
-/// DEFAULTS are the validated winning config: `--cache-policy arc` + prefetch on.
-/// `--no-prefetch` and `--cache-policy lru|2q` opt out (for A/B benching). Prefetch
+/// DEFAULTS are the winning cell of the 512-token grid in benchmarks.md:
+/// `--cache-policy 2q` + prefetch on at `--prefetch-depth 1`. The pair is a sharp
+/// optimum, not two independent choices — see the note in `parse_args`.
+/// `--no-prefetch` and `--cache-policy lru|arc` opt out (for A/B benching). Prefetch
 /// composes with `--direct-vmm-dma` (sound via the pool's disjointness floor — see
 /// Pin::build's slot_floor + prefetch_layer's correctness note).
 /// `--max-mem <GiB>` caps the device expert-pool budget; default (unset) takes all
@@ -23,10 +25,14 @@ use tracing::info;
 /// `min(free − OS_RESERVE, max_mem)`. Bigger = more resident experts = higher hit.
 /// `--direct-io` makes the cold-expert reads use O_DIRECT (bypass the OS page
 /// cache); default is buffered reads through the page cache.
-/// `--attn dense|streaming|dsa|misa` picks the attention row-selection
+/// `--attn auto|dense|streaming|dsa|misa` picks the attention row-selection
 /// mechanism (see attn::AttnMode). `--sinks`/`--window` shape streaming mode
 /// (defaults 4 / 8192, the StreamingLLM shape). dsa/misa need the `out-idx-*`
-/// indexer shard in the snapshot dir.
+/// indexer shard in the snapshot dir; the default `auto` picks `dsa` when that
+/// shard is present (the model's native trained mechanism) and `dense` when it
+/// is not, printing which — zero-knob: discovered, not configured. An EXPLICIT
+/// `--attn dsa|misa` never silently downgrades; it fails loudly if the shard is
+/// missing.
 struct Args {
     snapshot: String,
     bench: Option<usize>,
@@ -50,10 +56,18 @@ fn parse_args() -> Result<Args> {
     const USAGE: &str = "usage: rivoli <snapshot-dir> [-bench <tokens>] [--pre-seed] \
          [--direct-vmm-dma] [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc] \
          [--no-prefetch] [--prefetch-depth <n>] [--max-mem <GiB>] [--direct-io] \
-         [--attn dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>] [--kv-fp8]";
+         [--attn auto|dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>] [--kv-fp8]";
     let mut snapshot = None;
-    // Defaults are the validated winning config: ARC eviction + cross-layer prefetch
-    // (best hit% on realistic multi-request sessions + the ~+11% prefetch overlap).
+    // Defaults are the winning cell of the 512-token depth x policy grid (see
+    // benchmarks.md): 2Q eviction + cross-layer prefetch at depth ONE.
+    //
+    // Both values are load-bearing and they only pay off TOGETHER — 2q+depth1 is a
+    // sharp peak (91.8% residency, 1.92 tok/s), while every other cell sits at
+    // 70.6-75.5% and 0.75-0.95 tok/s. Depth 1 because 2Q's A1in probation queue is
+    // bounded: one high-confidence prediction per layer gets promoted to the
+    // protected Am set by its first real use, whereas depth 2 doubles the
+    // cold-insert rate and churns entries out of probation before that use lands.
+    // Raising the depth does not add coverage, it destroys the cache.
     let mut a = Args {
         snapshot: String::new(),
         bench: None,
@@ -61,12 +75,12 @@ fn parse_args() -> Result<Args> {
         direct_vmm_dma: false,
         trace: None,
         prompt: None,
-        cache_policy: "arc".to_string(),
+        cache_policy: "2q".to_string(),
         prefetch: true,
-        prefetch_depth: 2,
+        prefetch_depth: 1,
         max_mem: None, // default: take all safe free memory (free − OS_RESERVE)
         direct_io: false,
-        attn: "dense".to_string(),
+        attn: "auto".to_string(),
         sinks: 4,
         window: 8192,
         misa_heads: 8, // the MISA paper's validated GLM-5 setting
@@ -86,7 +100,6 @@ fn parse_args() -> Result<Args> {
             "--cache-policy" => {
                 a.cache_policy = args.next().context("--cache-policy requires lru|2q|arc")?;
             }
-            "--prefetch" => a.prefetch = true, // default already on; explicit is fine
             "--no-prefetch" => a.prefetch = false,
             "--prefetch-depth" => {
                 a.prefetch_depth = args
@@ -110,7 +123,7 @@ fn parse_args() -> Result<Args> {
             "--attn" => {
                 a.attn = args
                     .next()
-                    .context("--attn requires dense|streaming|dsa|misa")?;
+                    .context("--attn requires auto|dense|streaming|dsa|misa")?;
             }
             "--sinks" => {
                 a.sinks = args
@@ -147,7 +160,25 @@ fn parse_args() -> Result<Args> {
 
 fn main() -> Result<()> {
     let a = parse_args()?;
-    let attn = match a.attn.as_str() {
+    // Zero-knob default: `dsa` (the model's native trained mechanism) when the
+    // out-idx indexer shard sits next to the snapshot, `dense` otherwise. Read
+    // off the directory rather than the opened Snapshot because the mode is
+    // needed before `Snapshot::open`. An explicit --attn is honoured verbatim,
+    // so a requested sparse mode still fails loudly on an indexer-less snapshot
+    // instead of quietly decoding as dense.
+    let resolved = if a.attn == "auto" {
+        let has_idx = std::fs::read_dir(&a.snapshot)
+            .with_context(|| format!("snapshot dir {} not readable", a.snapshot))?
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with("out-idx"));
+        // No log here: the subscriber is not up yet (it starts inside the tokio
+        // runtime, below). The startup config line prints the RESOLVED mode
+        // (`attn=Dsa` / `attn=Dense`), which is the zero-knob contract.
+        if has_idx { "dsa" } else { "dense" }.to_string()
+    } else {
+        a.attn.clone()
+    };
+    let attn = match resolved.as_str() {
         "dense" => rivoli::attn::AttnMode::Dense,
         "streaming" => rivoli::attn::AttnMode::Streaming {
             sinks: a.sinks,
@@ -157,7 +188,7 @@ fn main() -> Result<()> {
         "misa" => rivoli::attn::AttnMode::Misa {
             active_heads: a.misa_heads,
         },
-        other => bail!("unknown --attn mode {other:?} (dense|streaming|dsa|misa)"),
+        other => bail!("unknown --attn mode {other:?} (auto|dense|streaming|dsa|misa)"),
     };
     let cfg = Config::discover(
         a.snapshot,
@@ -273,12 +304,6 @@ async fn run(cfg: Config) -> Result<()> {
         usage.counts.len()
     );
 
-    // M0 gate: GPU toolchain is live end-to-end (real launch), or say why not.
-    match rivoli::hip::probe() {
-        Ok(()) => info!("HIP probe ok — gfx1151 engine live"),
-        Err(e) => info!("HIP probe unavailable: {e}"),
-    }
-
     let ngen = cfg
         .bench
         .context("server mode not yet implemented; use -bench <tokens>")?;
@@ -368,6 +393,50 @@ async fn run(cfg: Config) -> Result<()> {
                 ids.len(),
                 dt,
             );
+            // Where the bytes came from. `hits` conflates residency with prefetched
+            // disk reads, so it overstates how much of the model is actually resident:
+            // only `loaded` costs no I/O. `read` = the experts that touched the disk.
+            let (loaded, preloading, cold, pf_waste, pf_refetch) = engine.source_split();
+            // Selections, by where the bytes came from. Only `loaded` is I/O-free.
+            let total = (loaded + preloading + cold).max(1);
+            let ntok = ids.len().max(1) as f64;
+            // Disk reads INCLUDE wasted prefetches, which serve no selection at all —
+            // so reads > selections-that-needed-I/O whenever prefetch is on.
+            let reads = preloading + cold + pf_waste;
+            info!(
+                "expert source: loaded {:.1}% ({loaded}) | preloading {:.1}% ({preloading}) \
+                 | cold {:.1}% ({cold})",
+                100.0 * loaded as f64 / total as f64,
+                100.0 * preloading as f64 / total as f64,
+                100.0 * cold as f64 / total as f64,
+            );
+            info!(
+                "disk traffic: {:.1} expert reads/tok ({:.2} GB/tok), of which {:.1}% wasted",
+                reads as f64 / ntok,
+                reads as f64 / ntok * 18.9 / 1000.0,
+                100.0 * pf_waste as f64 / reads.max(1) as f64,
+            );
+            if cfg.prefetch {
+                let (pa, pq, ps) = engine.prefetch_cost_ms();
+                info!(
+                    "prefetch cost: alloc {:.0}ms ({:.2}ms/tok) | sqe-prep {:.0}ms ({:.2}ms/tok) \
+                     | io_uring_submit {:.0}ms ({:.2}ms/tok)",
+                    pa,
+                    pa / ntok,
+                    pq,
+                    pq / ntok,
+                    ps,
+                    ps / ntok,
+                );
+                let queued = preloading + pf_waste;
+                info!(
+                    "prefetch waste: {pf_waste} of {queued} queued reads evicted before use \
+                     ({:.1}% ) | of those, {pf_refetch} were demanded later and re-read \
+                     ({:.1}% of wasted = evicted-BEFORE-USE, not misprediction)",
+                    100.0 * pf_waste as f64 / queued.max(1) as f64,
+                    100.0 * pf_refetch as f64 / pf_waste.max(1) as f64,
+                );
+            }
             if cfg.prefetch {
                 let (correct, total) = engine.prefetch_recall();
                 info!(

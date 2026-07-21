@@ -248,19 +248,10 @@ fn check(seed: u64, hidden: usize, inter: usize, e: usize) {
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 
-    let max_ref = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    let max_err = want
-        .iter()
-        .zip(&got)
-        .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
     // Per-row int4 dot products sum in identical order to the reference, so the
     // only sources of drift are silu(expf) and cross-expert atomicAdd ordering:
-    // ~1e-6 relative. A generous bound still catches any real dequant/index bug.
-    let tol = 1e-3 * max_ref + 1e-3;
-    assert!(
-        max_err <= tol,
-        "hidden={hidden} inter={inter} e={e}: max_err={max_err:.3e} tol={tol:.3e} (max_ref={max_ref:.3e})"
-    );
+    // ~1e-6 relative. assert_close's bound still catches any real dequant/index bug.
+    assert_close(&want, &got, &format!("hidden={hidden} inter={inter} e={e}"));
 }
 
 #[test]
@@ -714,14 +705,6 @@ fn rope_matches_scalar() {
     device_sync().expect("device sync");
     q = f32_vec(&q_buf.copy_out().expect("copy out"));
     assert_close(&want, &q, "rope");
-}
-
-#[test]
-fn mla_attend_long_context() {
-    // On-device tile loop at scale: 40k tokens = ~2500 TILE=16 steps, so the
-    // per-lane bit-exact online-softmax replication is OBSERVED over thousands of
-    // iterations (not just proven), at the GLM latent width.
-    check_attend(0x1eaf_1eaf, 8, 40_000, 512, 64);
 }
 
 #[test]

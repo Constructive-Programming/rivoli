@@ -16,7 +16,7 @@
 // Numerics are identical to the M2 kernel (validated bit-close to quant.rs):
 // per output row one thread sums i ascending, matching matvec_i4_rows.
 
-#include <hip/hip_runtime.h>
+#include "common.hpp"
 
 struct ExpertDesc {
     const unsigned char* gate_packed;  // [inter * rb(hidden)]
@@ -27,29 +27,8 @@ struct ExpertDesc {
     const float*         down_scale;   // [hidden]
 };
 
-#define WAVE 32          // gfx1151 native wave32
-#define ROWS_PER_BLOCK 8 // 256 threads = 8 waves → 8 output rows/block
-
-// Sum a wave's partials into lane 0 (fixed __shfl_down order → deterministic).
-__device__ __forceinline__ float wave_sum(float v) {
-    for (int o = WAVE / 2; o > 0; o >>= 1) v += __shfl_down(v, o, WAVE);
-    return v;
-}
-
-// Wave-cooperative int4 dot: lane `l` sums columns i ≡ l (mod WAVE) — adjacent
-// lanes read adjacent packed bytes (one coalesced transaction). Result on lane 0.
-// Matches quant.rs: low nibble = even col, high = odd; signed value = nibble - 8.
-__device__ __forceinline__ float dot_i4_wave(const float* __restrict__ v,
-                                             const unsigned char* __restrict__ row,
-                                             int dim, int lane) {
-    float acc = 0.0f;
-    for (int i = lane; i < dim; i += WAVE) {
-        unsigned char b = row[i >> 1];
-        int n = (i & 1) ? (b >> 4) : (b & 0x0F);
-        acc += v[i] * (float)(n - 8);
-    }
-    return wave_sum(acc);
-}
+// dot_i4_wave now lives in common.hpp — linalg.hip and mla.hip share it, and the
+// dword-per-lane load shape is a bandwidth property worth having one definition of.
 
 __device__ __forceinline__ float siluf(float x) {
     return x / (1.0f + expf(-x));

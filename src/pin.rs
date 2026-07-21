@@ -47,18 +47,11 @@ struct ExpertReads {
     off: [usize; 6],
 }
 
-/// A resolved int4 weight matrix in the tier: device pointers + dims.
+/// A resolved quantized weight matrix in the tier: device pointers + dims. The
+/// int4/int8 distinction lives in which launcher consumes it (`launch_gemv_i4`
+/// vs `_i8`), not in the layout — both are packed bytes + per-row f32 scales.
 #[derive(Clone, Copy)]
 pub struct Weight {
-    pub packed: *const u8,
-    pub scale: *const f32,
-    pub o_dim: usize,
-    pub i_dim: usize,
-}
-
-/// A resolved int8 weight matrix (embed table / lm_head).
-#[derive(Clone, Copy)]
-pub struct Weight8 {
     pub packed: *const u8,
     pub scale: *const f32,
     pub o_dim: usize,
@@ -126,8 +119,8 @@ pub struct Pin<'a> {
     /// `layers`/`moe_bias` point into; its `Drop` frees the slab at run end.
     #[allow(dead_code)]
     tier: DeviceTier,
-    pub embed: Weight8,
-    pub lm_head: Weight8,
+    pub embed: Weight,
+    pub lm_head: Weight,
     pub final_norm: *const f32,
     pub layers: Vec<LayerPin>,
     /// Router correction bias per MoE layer, kept HOST-side (the sigmoid/bias/
@@ -187,6 +180,12 @@ pub struct Pin<'a> {
     /// that did NOT overlap the previous layer's compute). Near-zero means the reads
     /// were fully hidden; large means the overlap window was too small / NVMe-bound.
     pub prefetch_wait_ns: u128,
+    /// `prefetch_layer` cost split: cache admission / SQE prep / io_uring_submit.
+    /// The whole call is OUTSIDE every PROFILE bucket, so it lands in `other` —
+    /// which grows ~60 ms per unit of prefetch depth. This says which third it is.
+    pub pf_alloc_ns: u128,
+    pub pf_queue_ns: u128,
+    pub pf_submit_ns: u128,
     /// Optional access-trace sink (`--trace`): one line per resolved MoE layer, the
     /// space-separated `(layer,expert)` keys the LRU looked up, in access order.
     /// Feeds the offline cache-policy simulator (`src/cache.rs`, `bin/replay`).
@@ -224,7 +223,7 @@ fn place_i4(tier: &mut DeviceTier, snap: &Snapshot, name: &str, i_dim: usize) ->
 }
 
 /// Place an int8 weight into the tier via `pread`.
-fn place_i8(tier: &mut DeviceTier, snap: &Snapshot, name: &str, i_dim: usize) -> Result<Weight8> {
+fn place_i8(tier: &mut DeviceTier, snap: &Snapshot, name: &str, i_dim: usize) -> Result<Weight> {
     let m = snap.int8(name, i_dim)?;
     let (plen, slen, o_dim) = (m.packed.len(), m.scale.len(), m.o_dim);
     let packed = tier.reserve(plen)?;
@@ -234,7 +233,7 @@ fn place_i8(tier: &mut DeviceTier, snap: &Snapshot, name: &str, i_dim: usize) ->
         snap.read_into(&format!("{name}.weight"), packed, plen, true)?;
         snap.read_into(&format!("{name}.weight.qs"), scale, slen, true)?;
     }
-    Ok(Weight8 {
+    Ok(Weight {
         packed,
         scale: scale as *const f32,
         o_dim,
@@ -382,6 +381,30 @@ struct Pool {
     #[cfg(debug_assertions)]
     key_of: Vec<Option<u32>>,
     free: Vec<usize>,
+    /// Keys bound by [`alloc_cold`] (a prefetch) whose data has been read off disk
+    /// but which no `get` has claimed yet. A key lives here between its prefetch
+    /// submit and its real selection. Two things read it:
+    ///   - `get` — a hit on a key in here came off the disk THIS layer (preloading),
+    ///     not out of residency (loaded). Without this the two are indistinguishable
+    ///     and the reported hit rate silently counts disk reads as hits.
+    ///   - `reuse` — a key evicted while still in here was read and thrown away
+    ///     before anyone used it: a fully wasted expert read.
+    pending_pf: std::collections::HashSet<u32>,
+    /// Hits on genuinely-resident keys (no disk read behind them).
+    pub hit_loaded: u64,
+    /// Hits on keys a prefetch had just streamed in (disk read, but off the
+    /// critical path — it overlapped the previous layer's compute).
+    pub hit_preload: u64,
+    /// Prefetched keys evicted before any `get` claimed them — wasted reads.
+    pub pf_evict_unused: u64,
+    /// Keys currently in the "was prefetched, evicted unused" state. A demand miss
+    /// on one of these is the DIRECT signature of eviction-before-use: the expert
+    /// really was wanted, we really did read it, and we threw it away in time to
+    /// have to read it again. Distinguishes that from plain misprediction, which
+    /// also lands in `pf_evict_unused` but is never demanded afterwards.
+    evicted_pf: std::collections::HashSet<u32>,
+    /// Demand misses on a key we had already prefetched and evicted unused.
+    pub pf_evict_then_missed: u64,
 }
 
 impl Pool {
@@ -393,6 +416,12 @@ impl Pool {
             #[cfg(debug_assertions)]
             key_of: vec![None; n],
             free: (0..n).rev().collect(), // pop() hands out 0,1,2,...
+            pending_pf: std::collections::HashSet::new(),
+            hit_loaded: 0,
+            hit_preload: 0,
+            pf_evict_unused: 0,
+            evicted_pf: std::collections::HashSet::new(),
+            pf_evict_then_missed: 0,
         })
     }
 
@@ -404,6 +433,14 @@ impl Pool {
             // a different expert's weights — stale-data corruption).
             #[cfg(debug_assertions)]
             debug_assert_eq!(self.key_of[slot], Some(key), "hit slot holds wrong key");
+            // Claim the prediction: a hit on a pending prefetch is a PRELOADING hit
+            // (its bytes came off disk during the previous layer), everything else is
+            // a LOADED hit (already resident, no I/O at all).
+            if self.pending_pf.remove(&key) {
+                self.hit_preload += 1;
+            } else {
+                self.hit_loaded += 1;
+            }
             Some(slot)
         } else {
             None
@@ -413,6 +450,11 @@ impl Pool {
     /// Allocate a slot for a NEW `key` (miss): reuse the policy-evicted key's slot,
     /// else a free slot. The caller then fills the slot and sets `off[slot]`.
     fn alloc(&mut self, key: u32) -> Result<usize> {
+        // Re-reading an expert we prefetched and then evicted unused: the read was
+        // paid twice and the prediction was RIGHT, just too early / evicted too soon.
+        if self.evicted_pf.remove(&key) {
+            self.pf_evict_then_missed += 1;
+        }
         let evicted = self.policy.insert(key);
         let slot = self.reuse(evicted)?;
         self.bind(key, slot);
@@ -427,6 +469,9 @@ impl Pool {
         let evicted = self.policy.insert_cold(key);
         let slot = self.reuse(evicted)?;
         self.bind(key, slot);
+        // Unclaimed until a real `get`; `reuse` charges it as wasted if it is
+        // evicted first.
+        self.pending_pf.insert(key);
         Ok(slot)
     }
 
@@ -446,6 +491,13 @@ impl Pool {
                     !self.policy.contains(ev),
                     "evicted key {ev} still resident (identity drift)"
                 );
+                // Evicting a still-pending prediction throws away an expert read
+                // that nobody ever used — the read cost was paid for nothing, and
+                // a later selection of `ev` has to stream it again.
+                if self.pending_pf.remove(&ev) {
+                    self.pf_evict_unused += 1;
+                    self.evicted_pf.insert(ev);
+                }
                 self.slot_of
                     .remove(&ev)
                     .context("evicted key had no slot (pool/policy drift)")
@@ -463,6 +515,9 @@ impl Pool {
             self.key_of[slot] = Some(key);
         }
         self.slot_of.insert(key, slot);
+        // Rebinding clears the "prefetched then evicted unused" mark: `alloc` has
+        // already charged it above, and a re-prefetch must not charge it again.
+        self.evicted_pf.remove(&key);
         // The just-inserted key must be resident, and slot_of must mirror residency.
         debug_assert!(self.policy.contains(key), "inserted key {key} not resident");
         debug_assert_eq!(
@@ -639,7 +694,7 @@ impl<'a> Pin<'a> {
         // moe_inter*rb(hidden); down packed = hidden*rb(moe_inter)); scales are tiny.
         let span = slot_span(cfg.moe_inter * cfg.hidden.div_ceil(2))
             .max(slot_span(cfg.hidden * cfg.moe_inter.div_ceil(2)));
-        let mut stream = Streamer::new(ring as u32, span, bounce)?;
+        let mut stream = Streamer::new(ring as u32, span, bounce, false)?;
         // Optional warm start (`--pre-seed`): seed the pool with the hottest experts
         // from .coli_usage so the first tokens hit at colibri's rate while the LRU
         // adapts. Worth ~+6.8pt on the first tokens but transient (the LRU warms up
@@ -676,7 +731,7 @@ impl<'a> Pin<'a> {
             tracing::info!(
                 "cross-layer expert prefetch ENABLED (single-layer lookahead, depth {prefetch_depth})"
             );
-            Some(Streamer::new(ring as u32, span, bounce)?)
+            Some(Streamer::new(ring as u32, span, bounce, true)?)
         } else {
             None
         };
@@ -706,6 +761,9 @@ impl<'a> Pin<'a> {
             pred_total: 0,
             pred_correct: 0,
             prefetch_wait_ns: 0,
+            pf_alloc_ns: 0,
+            pf_queue_ns: 0,
+            pf_submit_ns: 0,
             trace: trace_path
                 .map(|p| -> Result<_> {
                     Ok(std::io::BufWriter::new(
@@ -719,6 +777,19 @@ impl<'a> Pin<'a> {
     /// Host router correction bias for a MoE `layer` (len n_experts).
     pub fn moe_bias(&self, layer: usize) -> &[f32] {
         &self.moe_bias[layer - self.cfg.dense_layers]
+    }
+
+    /// `(loaded, preloading, cold, pf_evict_unused)` — where routed experts' bytes
+    /// came from. `hits` alone conflates the first two, so it reports a prefetched
+    /// disk read as if it were residency; only `loaded` is I/O-free.
+    pub fn source_split(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.pool.hit_loaded,
+            self.pool.hit_preload,
+            self.misses,
+            self.pool.pf_evict_unused,
+            self.pool.pf_evict_then_missed,
+        )
     }
 
     /// Resolve a MoE layer's `sel` routed experts to `Mlp` descriptors via the
@@ -889,19 +960,28 @@ impl<'a> Pin<'a> {
         };
         let pool = &mut self.pool;
         let mut queued = 0usize;
+        let (mut alloc_ns, mut queue_ns) = (0u128, 0u128);
         for &e in pred {
             let key = expert_key(layer, e);
             if pool.contains(key) {
                 continue; // already resident — no fetch needed
             }
+            let t = std::time::Instant::now();
             let slot = pool.alloc_cold(key)?;
+            alloc_ns += t.elapsed().as_nanos();
             let entry = &table[sparse + e];
+            let t = std::time::Instant::now();
             stream_expert(stream, entry, slot_dst, slab, slot, expert_slot)?;
+            queue_ns += t.elapsed().as_nanos();
             queued += 1;
         }
+        self.pf_alloc_ns += alloc_ns;
+        self.pf_queue_ns += queue_ns;
         if queued > 0 {
             // Kick the reads off NOW so they overlap this layer's compute.
+            let t = std::time::Instant::now();
             stream.submit()?;
+            self.pf_submit_ns += t.elapsed().as_nanos();
             self.prefetch_pending = true;
         }
         Ok(())

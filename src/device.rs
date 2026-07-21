@@ -269,12 +269,6 @@ mod tier {
         pub fn ptr_mut(&mut self) -> *mut u8 {
             self.ptr
         }
-        pub fn len(&self) -> usize {
-            self.len
-        }
-        pub fn is_empty(&self) -> bool {
-            self.len == 0
-        }
     }
 
     impl Drop for DeviceBuf {
@@ -295,7 +289,6 @@ mod tier {
         ptr: *mut u8,
         handle: u64,
         mapped: usize, // granularity-rounded size, needed verbatim to free
-        len: usize,    // usable bytes requested
     }
 
     impl VmmBuf {
@@ -313,7 +306,6 @@ mod tier {
                 ptr: ptr as *mut u8,
                 handle,
                 mapped,
-                len,
             })
         }
 
@@ -345,12 +337,6 @@ mod tier {
         /// explicit fence.
         pub fn ptr_mut(&mut self) -> *mut u8 {
             self.ptr
-        }
-        pub fn len(&self) -> usize {
-            self.len
-        }
-        pub fn is_empty(&self) -> bool {
-            self.len == 0
         }
     }
 

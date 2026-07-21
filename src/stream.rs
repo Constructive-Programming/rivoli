@@ -30,7 +30,7 @@ pub const ALIGN: usize = 4096;
 mod ffi {
     use std::ffi::c_void;
     unsafe extern "C" {
-        pub fn rivoli_ring_new(entries: u32, span: u32, bounce: i32) -> *mut c_void;
+        pub fn rivoli_ring_new(entries: u32, span: u32, bounce: i32, sqpoll: i32) -> *mut c_void;
         pub fn rivoli_ring_read(
             ring: *mut c_void,
             fd: i32,
@@ -89,8 +89,10 @@ impl Streamer {
     /// `entries * span` pinned host arena then `hipMemcpy`s into VMM (kernel-bug
     /// workaround); false (`--direct-vmm-dma`) DMAs straight into the VMM slot (no
     /// arena allocated).
-    pub fn new(entries: u32, span: usize, bounce: bool) -> Result<Self> {
-        let ring = unsafe { ffi::rivoli_ring_new(entries, span as u32, i32::from(bounce)) };
+    pub fn new(entries: u32, span: usize, bounce: bool, sqpoll: bool) -> Result<Self> {
+        let ring = unsafe {
+            ffi::rivoli_ring_new(entries, span as u32, i32::from(bounce), i32::from(sqpoll))
+        };
         ensure!(
             !ring.is_null(),
             "ring init failed (entries={entries}, bounce={bounce}, {:.0} MiB pinned)",

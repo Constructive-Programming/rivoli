@@ -14,7 +14,6 @@ fn main() {
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR set by cargo");
     let kernels = [
-        "probe",
         "moe_fused",
         "attn",
         "linalg",

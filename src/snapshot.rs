@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fs::File;
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 
 /// On-disk element type. The snapshot uses three: `F32` (norm weights, the
@@ -296,27 +296,12 @@ impl Snapshot {
         let len = loc.end - loc.begin;
         ensure!(len <= cap, "read_into {name}: {len} bytes > dst cap {cap}");
         let fd = self.files[loc.shard].as_raw_fd();
-        let mut done = 0usize;
-        while done < len {
-            // SAFETY: dst[done..len] is within the caller's `cap` bytes (checked);
-            // pread writes at most len-done bytes there.
-            let n = unsafe {
-                libc::pread(
-                    fd,
-                    dst.add(done) as *mut libc::c_void,
-                    len - done,
-                    (loc.begin + done) as libc::off_t,
-                )
-            };
-            ensure!(
-                n > 0,
-                "pread {name} (shard {} off {}): {}",
-                loc.shard,
-                loc.begin + done,
-                std::io::Error::last_os_error()
-            );
-            done += n as usize;
-        }
+        // SAFETY: caller guarantees `dst` is writable for `cap` >= `len` bytes.
+        let buf = unsafe { std::slice::from_raw_parts_mut(dst, len) };
+        // read_exact_at loops over short reads for us (pread under the hood).
+        self.files[loc.shard]
+            .read_exact_at(buf, loc.begin as u64)
+            .with_context(|| format!("pread {name} (shard {} off {})", loc.shard, loc.begin))?;
         if evict {
             // SAFETY: fd is a live open shard; advisory, never corrupts.
             unsafe {

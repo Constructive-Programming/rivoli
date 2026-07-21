@@ -1,8 +1,9 @@
-//! Minimal HIP surface. Under the `rocm` feature this binds the hipcc-built
-//! kernel launchers; without it, the calls return a "not built" error so the
-//! single-engine contract (zero launches = hard error) is visible even in a
-//! CPU-only dev build rather than silently pretending success.
+//! Minimal HIP surface: under the `rocm` feature this binds the hipcc-built
+//! kernel launchers. Without the feature the whole module compiles away — a
+//! CPU-only dev build takes the scalar `engine::Engine` path in main.rs instead,
+//! so there is no GPU surface to stub out.
 
+#[cfg(feature = "rocm")]
 use anyhow::{Result, bail};
 
 /// One MoE expert's six weight tensors, as raw DEVICE pointers into the resident
@@ -23,8 +24,6 @@ pub struct ExpertDesc {
 
 #[cfg(feature = "rocm")]
 unsafe extern "C" {
-    fn rivoli_probe(n: i32) -> i32;
-
     fn rivoli_moe_experts(
         x: *const f32,
         hidden: i32,
@@ -198,6 +197,17 @@ unsafe extern "C" {
     ) -> i32;
 }
 
+/// Shared launcher return-code check. The kernels' convention (see moe_fused.hip):
+/// 0 = success, POSITIVE = the launcher's own arg guard, NEGATIVE = -(hipError_t).
+#[cfg(feature = "rocm")]
+fn check(r: i32, name: &str) -> Result<()> {
+    if r != 0 {
+        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
+        bail!("{name} failed ({kind}, code {r})");
+    }
+    Ok(())
+}
+
 /// Launch MLA flash attention over the resident KV cache: for each head, writes
 /// the attention-weighted latent `clat_h = Σ_t softmax((qabs_h·L_t + qrope_h·R_t)
 /// ·scale)·L_t` as `H` contiguous `kvl`-length rows. All arguments are DEVICE
@@ -252,11 +262,7 @@ pub unsafe fn launch_attend(
             clat,
         )
     };
-    if r != 0 {
-        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
-        bail!("launch_attend failed ({kind}, code {r})");
-    }
-    Ok(())
+    check(r, "launch_attend")
 }
 
 /// fp8 variant of [`launch_attend`]: the latent cache is fp8-e4m3 (`lc8`,
@@ -310,11 +316,7 @@ pub unsafe fn launch_attend_fp8(
             clat,
         )
     };
-    if r != 0 {
-        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
-        bail!("launch_attend_fp8 failed ({kind}, code {r})");
-    }
-    Ok(())
+    check(r, "launch_attend_fp8")
 }
 
 /// fp8 variant of [`launch_append_kv`]: quantizes `latent` to fp8-e4m3 into
@@ -359,31 +361,7 @@ pub unsafe fn launch_append_kv_fp8(
             n_blocks as i32,
         )
     };
-    if r != 0 {
-        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
-        bail!("launch_append_kv_fp8 failed ({kind}, code {r})");
-    }
-    Ok(())
-}
-
-/// Liveness probe: launch the axpy kernel and confirm the device computed the
-/// expected value. Returns Ok(()) only if a real launch reached the GPU.
-pub fn probe() -> Result<()> {
-    #[cfg(feature = "rocm")]
-    {
-        // SAFETY: FFI to the hipcc-built launcher; it owns its own device
-        // allocations and frees them before returning.
-        let r = unsafe { rivoli_probe(4096) };
-        if r == 2 {
-            Ok(())
-        } else {
-            bail!("HIP probe returned {r} (expected 2) — GPU launch failed")
-        }
-    }
-    #[cfg(not(feature = "rocm"))]
-    {
-        bail!("built without the `rocm` feature — no GPU engine compiled in")
-    }
+    check(r, "launch_append_kv_fp8")
 }
 
 /// Launch one fused MoE expert-batch over resident device memory: every expert
@@ -442,11 +420,7 @@ pub unsafe fn launch_moe(
             out,
         )
     };
-    if r != 0 {
-        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
-        bail!("launch_moe failed ({kind}, code {r})");
-    }
-    Ok(())
+    check(r, "launch_moe")
 }
 
 /// Launch a batch-1 int4 GEMV `y = scale ⊙ (W·x)` over resident device memory
@@ -473,11 +447,7 @@ pub unsafe fn launch_gemv_i4(
     );
     // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
     let r = unsafe { rivoli_gemv_i4(x, packed, scale, o_dim as i32, i_dim as i32, y) };
-    if r != 0 {
-        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
-        bail!("launch_gemv_i4 failed ({kind}, code {r})");
-    }
-    Ok(())
+    check(r, "launch_gemv_i4")
 }
 
 /// Launch a batch-1 int8 GEMV `y = scale ⊙ (W·x)` (`W` = `packed` signed bytes +
@@ -503,11 +473,7 @@ pub unsafe fn launch_gemv_i8(
     );
     // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
     let r = unsafe { rivoli_gemv_i8(x, packed, scale, o_dim as i32, i_dim as i32, y) };
-    if r != 0 {
-        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
-        bail!("launch_gemv_i8 failed ({kind}, code {r})");
-    }
-    Ok(())
+    check(r, "launch_gemv_i8")
 }
 
 /// Launch a batch-1 f32 GEMV `y = W·x` (`W` = `w`, `o_dim × i_dim`, no scale) —
@@ -530,11 +496,7 @@ pub unsafe fn launch_gemv_f32(
     );
     // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
     let r = unsafe { rivoli_gemv_f32(x, w, o_dim as i32, i_dim as i32, y) };
-    if r != 0 {
-        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
-        bail!("launch_gemv_f32 failed ({kind}, code {r})");
-    }
-    Ok(())
+    check(r, "launch_gemv_f32")
 }
 
 /// Launch RMSNorm `y = x·(1/√(mean(x²)+eps))·w` over a device vector of `n` f32.
@@ -553,11 +515,7 @@ pub unsafe fn launch_rmsnorm(
     anyhow::ensure!(n <= i32::MAX as usize, "rmsnorm n exceeds i32 ({n})");
     // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
     let r = unsafe { rivoli_rmsnorm(x, w, n as i32, eps, y) };
-    if r != 0 {
-        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
-        bail!("launch_rmsnorm failed ({kind}, code {r})");
-    }
-    Ok(())
+    check(r, "launch_rmsnorm")
 }
 
 /// Launch interleaved RoPE at position `pos` on `count` device segments of `seg`
@@ -594,11 +552,7 @@ pub unsafe fn launch_rope(
             theta,
         )
     };
-    if r != 0 {
-        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
-        bail!("launch_rope failed ({kind}, code {r})");
-    }
-    Ok(())
+    check(r, "launch_rope")
 }
 
 /// Launch the MLA absorb: `qabs[head][i] = Σ_d q[head·qh+d]·kv_b[rbase+d][i]·
@@ -645,11 +599,7 @@ pub unsafe fn launch_mla_absorb(
             qabs,
         )
     };
-    if r != 0 {
-        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
-        bail!("launch_mla_absorb failed ({kind}, code {r})");
-    }
-    Ok(())
+    check(r, "launch_mla_absorb")
 }
 
 /// Launch the MLA value projection: `ctx[head][j] = scale[rbase+nope+j]·Σ_i
@@ -693,11 +643,7 @@ pub unsafe fn launch_mla_value(
             ctx,
         )
     };
-    if r != 0 {
-        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
-        bail!("launch_mla_value failed ({kind}, code {r})");
-    }
-    Ok(())
+    check(r, "launch_mla_value")
 }
 
 /// Launch the embedding row lookup: `x[i] = (int8)embed[token·hidden+i]·
@@ -720,11 +666,7 @@ pub unsafe fn launch_embed_i8_row(
     );
     // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
     let r = unsafe { rivoli_embed_i8_row(packed, scale, token as i32, hidden as i32, x) };
-    if r != 0 {
-        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
-        bail!("launch_embed_i8_row failed ({kind}, code {r})");
-    }
-    Ok(())
+    check(r, "launch_embed_i8_row")
 }
 
 /// Launch the KV append: bf16-quantize `latent` (`kvl` f32) and `rope` (`ropn`
@@ -749,11 +691,7 @@ pub unsafe fn launch_append_kv(
     );
     // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
     let r = unsafe { rivoli_append_kv(latent, rope, lc, rc, pos as i32, kvl as i32, ropn as i32) };
-    if r != 0 {
-        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
-        bail!("launch_append_kv failed ({kind}, code {r})");
-    }
-    Ok(())
+    check(r, "launch_append_kv")
 }
 
 /// Launch the roped-query gather: `qrope[head·ropn+d] = q[head·qh+nope+d]`,
@@ -781,11 +719,7 @@ pub unsafe fn launch_gather_rope(
     );
     // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
     let r = unsafe { rivoli_gather_rope(q, qrope, h as i32, qh as i32, nope as i32, ropn as i32) };
-    if r != 0 {
-        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
-        bail!("launch_gather_rope failed ({kind}, code {r})");
-    }
-    Ok(())
+    check(r, "launch_gather_rope")
 }
 
 /// Launch the residual add `x[i] += y[i]` over `n` device f32. Launch-only.
@@ -798,11 +732,7 @@ pub unsafe fn launch_vadd(x: *mut f32, y: *const f32, n: usize) -> Result<()> {
     anyhow::ensure!(n <= i32::MAX as usize, "vadd n exceeds i32 ({n})");
     // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
     let r = unsafe { rivoli_vadd(x, y, n as i32) };
-    if r != 0 {
-        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
-        bail!("launch_vadd failed ({kind}, code {r})");
-    }
-    Ok(())
+    check(r, "launch_vadd")
 }
 
 /// Launch the greedy argmax reduction over `logits[0..n]` (one block, LDS tree
@@ -824,11 +754,7 @@ pub unsafe fn launch_argmax(
     anyhow::ensure!(n <= i32::MAX as usize, "argmax n exceeds i32 ({n})");
     // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
     let r = unsafe { rivoli_argmax(logits, n as i32, out_idx, out_val) };
-    if r != 0 {
-        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
-        bail!("launch_argmax failed ({kind}, code {r})");
-    }
-    Ok(())
+    check(r, "launch_argmax")
 }
 
 /// Launch a bf16 GEMV `y[o] = Σ_i x[i]·bf16(w[o·i_dim+i])` — the DSA indexer's
@@ -851,11 +777,7 @@ pub unsafe fn launch_gemv_bf16(
     );
     // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
     let r = unsafe { rivoli_gemv_bf16(x, w, o_dim as i32, i_dim as i32, y) };
-    if r != 0 {
-        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
-        bail!("launch_gemv_bf16 failed ({kind}, code {r})");
-    }
-    Ok(())
+    check(r, "launch_gemv_bf16")
 }
 
 /// Launch LayerNorm `y = (x-mean)/sqrt(var+eps)·w + b` over `n` device f32 — the
@@ -876,11 +798,7 @@ pub unsafe fn launch_layernorm(
     anyhow::ensure!(n <= i32::MAX as usize, "layernorm n exceeds i32 ({n})");
     // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
     let r = unsafe { rivoli_layernorm(x, w, b, n as i32, eps, y) };
-    if r != 0 {
-        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
-        bail!("launch_layernorm failed ({kind}, code {r})");
-    }
-    Ok(())
+    check(r, "launch_layernorm")
 }
 
 /// Launch the indexer key append: bf16-quantize `k` (`hd` f32) into the
@@ -902,11 +820,7 @@ pub unsafe fn launch_index_append(
     );
     // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
     let r = unsafe { rivoli_index_append(k, kcache, pos as i32, hd as i32) };
-    if r != 0 {
-        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
-        bail!("launch_index_append failed ({kind}, code {r})");
-    }
-    Ok(())
+    check(r, "launch_index_append")
 }
 
 /// Launch the indexer scoring: `scores[t] = Σ_{h∈active} w[h]·wscale·
@@ -955,11 +869,7 @@ pub unsafe fn launch_index_score(
             scores,
         )
     };
-    if r != 0 {
-        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
-        bail!("launch_index_score failed ({kind}, code {r})");
-    }
-    Ok(())
+    check(r, "launch_index_score")
 }
 
 /// Launch the MISA block-pool update: fold indexer key `k` (`hd` f32) into its
@@ -982,11 +892,7 @@ pub unsafe fn launch_index_pool_push(
     );
     // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
     let r = unsafe { rivoli_index_pool_push(k, pool, t as i32, hd as i32) };
-    if r != 0 {
-        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
-        bail!("launch_index_pool_push failed ({kind}, code {r})");
-    }
-    Ok(())
+    check(r, "launch_index_pool_push")
 }
 
 /// Launch the MISA head router: `e[j] = mean_b |w[j]·ReLU(q_j·pool_b)|` over the
@@ -1015,11 +921,7 @@ pub unsafe fn launch_index_head_route(
     // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
     let r =
         unsafe { rivoli_index_head_route(q, w, pool, m_blocks as i32, nh as i32, hd as i32, e) };
-    if r != 0 {
-        let kind = if r > 0 { "arg guard" } else { "HIP runtime" };
-        bail!("launch_index_head_route failed ({kind}, code {r})");
-    }
-    Ok(())
+    check(r, "launch_index_head_route")
 }
 
 /// Block until all launched kernels retire (one join point per token), surfacing

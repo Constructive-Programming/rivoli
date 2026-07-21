@@ -34,18 +34,14 @@ impl OrderedSet {
     fn len(&self) -> usize {
         self.at.len()
     }
-    fn stamp(&mut self, k: u32, tick: i64) {
-        if let Some(&t) = self.at.get(&k) {
-            self.order.remove(&t);
-        }
-        self.at.insert(k, tick);
-        self.order.insert(tick, k);
-    }
     /// Insert `k`, or move it to the MRU end if already present.
     fn touch(&mut self, k: u32) {
         self.clock += 1;
-        let t = self.clock;
-        self.stamp(k, t);
+        if let Some(&t) = self.at.get(&k) {
+            self.order.remove(&t);
+        }
+        self.at.insert(k, self.clock);
+        self.order.insert(self.clock, k);
     }
     fn remove(&mut self, k: u32) -> bool {
         if let Some(t) = self.at.remove(&k) {
