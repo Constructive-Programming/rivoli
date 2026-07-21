@@ -49,6 +49,7 @@ mod ffi {
         pub fn rivoli_ring_submit(ring: *mut c_void) -> i32;
         pub fn rivoli_ring_wait(ring: *mut c_void, count: u32, min_res: *const u64) -> i32;
         pub fn rivoli_ring_free(ring: *mut c_void);
+        pub fn rivoli_ring_timings(read_ns: *mut u64, copy_ns: *mut u64);
     }
 }
 
@@ -303,4 +304,15 @@ mod tests {
             }
         }
     }
+}
+
+/// Accumulated `(nvme_read_ns, bounce_copy_ns)` across every drain on every ring.
+/// Splits the `fetch` PROFILE bucket into the two halves that want opposite fixes:
+/// waiting on NVMe completions (latency/queue-depth bound) versus the pinned-host
+/// -> device copy and its sync (bandwidth bound, ~2.7 GB/token).
+pub fn ring_timings() -> (u64, u64) {
+    let (mut r, mut c) = (0u64, 0u64);
+    // SAFETY: both out-pointers are valid; the shim only writes two u64s.
+    unsafe { ffi::rivoli_ring_timings(&mut r, &mut c) };
+    (r, c)
 }

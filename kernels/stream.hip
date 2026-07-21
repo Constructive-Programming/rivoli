@@ -44,6 +44,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 
 // hipError_t codes are small positive ints; offset them well below -errno space so
 // a copy failure is distinguishable from an io_uring/-errno failure in the log.
@@ -174,10 +175,31 @@ extern "C" int rivoli_ring_submit(void* ring) {
 // last tensor, so a short completion is legitimate ONLY when it still covers the
 // useful window (`res >= min_res[ud]`); shorter is a real truncation and errors.
 // `min_res` may be null to skip the check.
+// Nanosecond split of the last `rivoli_ring_wait`: [0] = waiting on the NVMe
+// completions, [1] = the bounce H2D copy + its device sync. `fetch` is 73% of a
+// token and both halves live inside it, so which one to attack is not guessable —
+// the H2D moves ~2.7 GB/token and the reads are latency-bound, and those want
+// opposite fixes. Accumulated, never reset by the shim; the caller reads deltas.
+static unsigned long long g_read_ns = 0;
+static unsigned long long g_copy_ns = 0;
+
+static inline unsigned long long now_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (unsigned long long)t.tv_sec * 1000000000ull + (unsigned long long)t.tv_nsec;
+}
+
+// Read the accumulated (read, copy) nanosecond totals.
+extern "C" void rivoli_ring_timings(unsigned long long* read_ns, unsigned long long* copy_ns) {
+    if (read_ns) *read_ns = g_read_ns;
+    if (copy_ns) *copy_ns = g_copy_ns;
+}
+
 extern "C" int rivoli_ring_wait(void* ring, unsigned count,
                                 const unsigned long long* min_res) {
     Ring* r = (Ring*)ring;
     if (count == 0) return 0;
+    unsigned long long t0 = now_ns();
     int sub = io_uring_submit_and_wait(&r->uring, count);
     if (sub < 0) return sub;
     int err = 0;
@@ -196,7 +218,9 @@ extern "C" int rivoli_ring_wait(void* ring, unsigned count,
         }
         io_uring_cqe_seen(&r->uring, c);
     }
+    g_read_ns += now_ns() - t0;
     if (err != 0 || !r->bounce_mode) return err; // direct mode: reads landed in VMM
+    unsigned long long t1 = now_ns();
     // Bounce mode: DMA each pinned-host slot into its VMM device slot. Pinned source
     // => async overlaps the copies; one sync joins them.
     for (unsigned i = 0; i < count; i++) {
@@ -205,6 +229,7 @@ extern "C" int rivoli_ring_wait(void* ring, unsigned count,
         if (he != hipSuccess) return HIP_ERR_BASE - (int)he;
     }
     hipError_t he = hipDeviceSynchronize();
+    g_copy_ns += now_ns() - t1;
     return he == hipSuccess ? 0 : HIP_ERR_BASE - (int)he;
 }
 

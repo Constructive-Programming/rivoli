@@ -125,6 +125,17 @@ impl Profile {
             per(self.route_ns),
             per(self.wall_ns.saturating_sub(accounted)),
         );
+        // Split `fetch` into its two halves. They are bound by different things and
+        // want opposite fixes: the NVMe wait is latency/queue-depth, the bounce copy
+        // is pure H2D bandwidth over ~2.7 GB/token.
+        let (read_ns, copy_ns) = crate::stream::ring_timings();
+        tracing::info!(
+            "  fetch split/tok: nvme-read {:.0}ms {:.0}% of fetch | bounce-copy {:.0}ms {:.0}% of fetch",
+            per(read_ns as u128),
+            100.0 * read_ns as f64 / self.fetch_ns.max(1) as f64,
+            per(copy_ns as u128),
+            100.0 * copy_ns as f64 / self.fetch_ns.max(1) as f64,
+        );
     }
 }
 
