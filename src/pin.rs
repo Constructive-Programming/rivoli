@@ -763,7 +763,18 @@ impl<'a> Pin<'a> {
         );
         let mut pool = Pool::new(n_slots, cache_policy, two_q)?;
         // Ring sized for one layer's worst case: top_k misses x 3 proj x 2 tensors.
+        // `sel` carries the ROUTED picks only — the shared expert is always resident
+        // (placed in the tier above), so it never streams and never takes a ring
+        // entry. Assert the bound the sizing actually rests on: a reader who assumes
+        // the shared expert streams too concludes this ring is undersized, and an
+        // overflow would otherwise surface as a mid-decode "SQ full" from
+        // `Streamer::queue` rather than as a config error at build.
         let ring = (cfg.top_k * 6).next_power_of_two() * 2;
+        ensure!(
+            cfg.top_k * 6 <= ring,
+            "io_uring ring {ring} too small for one layer: top_k {} x 6 reads/expert",
+            cfg.top_k,
+        );
         // Bounce span = largest single projection superset (gate/up packed =
         // moe_inter*rb(hidden); down packed = hidden*rb(moe_inter)); scales are tiny.
         let span = slot_span(cfg.moe_inter * cfg.hidden.div_ceil(2))
@@ -914,8 +925,9 @@ impl<'a> Pin<'a> {
     ) -> Result<DemandBatch> {
         let cfg = self.cfg;
         let sparse = (layer - cfg.dense_layers) * cfg.n_experts; // moe_table row base
-        // `sel` is one layer's routed pick (top_k + shared); a fixed slot scratch
-        // avoids a per-layer alloc, mirroring `cache::access_batch`'s 32-wide buffer.
+        // `sel` is one layer's ROUTED pick (top_k; the shared expert is resident and
+        // never streams); a fixed slot scratch avoids a per-layer alloc, mirroring
+        // `cache::access_batch`'s 32-wide buffer.
         // The bound is cfg-derived and checked once at `build`; per-layer it is a
         // debug assertion only.
         debug_assert!(
