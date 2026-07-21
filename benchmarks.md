@@ -424,6 +424,42 @@ extra rounding layer the combine adds.
 
 ---
 
+## Stripping production overhead (2026-07-21) — a null result
+
+An audit of per-token work a production build should not be doing: profiler
+timers, stat counters, redundant validation, and two `device_sync`s that existed
+only to split PROFILE buckets. Everything measurable was removed or moved behind
+a compile-time `trace` feature (default off). **It bought no measurable
+throughput.**
+
+Interleaved A/B, 512 tok, no `--pre-seed`, `51fccb8` vs `a29c3d1`:
+
+| arm | run 1 | run 2 | counters |
+|---|---|---|---|
+| base `a29c3d1` | 1.62 | 1.66 | 257953 hit / 52247 miss |
+| new `51fccb8` | 1.66 | 1.66 | 257953 hit / 52247 miss |
+
+Three of four runs land on **1.66**; the 1.62 is the first run of the set (cold
+page cache). Counters are byte-identical across all four, so by the rule at the
+top of this file the workload never changed and the spread is environmental.
+
+**A 64-token pair suggested +2.6 % and did not survive at 512.** That is inside
+the documented ~±3 % wall-clock band and should never have been quoted; it was
+in this commit's original subject line and was amended out. Recorded here as the
+cheapest possible reminder that a two-run 64-token delta is not a measurement.
+
+What the change did remove, exactly (counted, not timed), per token:
+~91 `hipDeviceSynchronize`, ~1000–1500 per-launch dim guards, and the
+host-buffer memsets that preceded every fully-overwriting D2H. At 577 ms/token
+with 69–76 % of wall in NVMe fetch, none of that is resolvable — which is itself
+the finding: **this engine is disk-bound to the point that host-side CPU work is
+free.** Do not expect host-side micro-optimisation to move tok/s until the fetch
+bucket shrinks. The justification for the change is a hot path that no longer
+carries diagnostics nobody reads, and a `--features rocm,trace` build that keeps
+every one of them available for tuning.
+
+---
+
 ## Retired claims
 
 Recorded because each was believed, acted on, and then measured false.

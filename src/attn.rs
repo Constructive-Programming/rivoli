@@ -16,7 +16,7 @@ use crate::indexer::Indexer;
 use crate::math::{bf16_to_f32, f32_to_bf16, rmsnorm, softmax};
 use crate::model::ModelConfig;
 use crate::quant::{addrow, matvec_i4, matvec_i4_rows, read_f32};
-use crate::snapshot::{Dtype, Snapshot};
+use crate::snapshot::{Dtype, Int4Matrix, Snapshot};
 use anyhow::{Result, ensure};
 
 /// Which tokens each decode step attends over. Selected once per layer per
@@ -214,15 +214,83 @@ pub fn streaming_rows(nt: usize, sinks: usize, window: usize, rows: &mut Vec<u32
     rows.extend(win_start as u32..nt as u32);
 }
 
+/// One layer's attention weights — the five int4 projections + the two
+/// layernorms — resolved and shape-validated ONCE at engine construction
+/// (the old per-token DEFERRED P3), so `attention` is pure math.
+pub struct AttnWeights<'a> {
+    q_a: Int4Matrix<'a>,
+    q_b: Int4Matrix<'a>,
+    kv_a: Int4Matrix<'a>,
+    kv_b: Int4Matrix<'a>,
+    o_proj: Int4Matrix<'a>,
+    q_a_ln: Vec<f32>,
+    kv_a_ln: Vec<f32>,
+}
+
+impl<'a> AttnWeights<'a> {
+    /// Locate + validate `layer`'s attention weights against `cfg`'s dims.
+    pub fn load(snap: &'a Snapshot, cfg: &ModelConfig, layer: usize) -> Result<Self> {
+        let h = cfg.n_heads;
+        let qh = cfg.qk_head_dim();
+        let nope = cfg.qk_nope_head_dim;
+        let rope = cfg.qk_rope_head_dim;
+        let kvl = cfg.kv_lora_rank;
+        let vh = cfg.v_head_dim;
+        let base = format!("model.layers.{layer}.self_attn");
+        let q_a = snap.int4(&format!("{base}.q_a_proj"), cfg.hidden)?;
+        let q_b = snap.int4(&format!("{base}.q_b_proj"), cfg.q_lora_rank)?;
+        let kv_a = snap.int4(&format!("{base}.kv_a_proj_with_mqa"), cfg.hidden)?;
+        let kv_b = snap.int4(&format!("{base}.kv_b_proj"), kvl)?;
+        let o_proj = snap.int4(&format!("{base}.o_proj"), h * vh)?;
+        ensure!(
+            q_a.o_dim == cfg.q_lora_rank,
+            "q_a o_dim {} != {}",
+            q_a.o_dim,
+            cfg.q_lora_rank
+        );
+        ensure!(q_b.o_dim == h * qh, "q_b o_dim {} != {}", q_b.o_dim, h * qh);
+        ensure!(
+            kv_a.o_dim == kvl + rope,
+            "kv_a o_dim {} != {}",
+            kv_a.o_dim,
+            kvl + rope
+        );
+        ensure!(
+            kv_b.o_dim == h * (nope + vh),
+            "kv_b o_dim {} != {}",
+            kv_b.o_dim,
+            h * (nope + vh)
+        );
+        ensure!(
+            o_proj.o_dim == cfg.hidden,
+            "o_proj o_dim {} != {}",
+            o_proj.o_dim,
+            cfg.hidden
+        );
+        let q_a_ln = read_f32(snap.typed(&format!("{base}.q_a_layernorm.weight"), Dtype::F32)?);
+        let kv_a_ln = read_f32(snap.typed(&format!("{base}.kv_a_layernorm.weight"), Dtype::F32)?);
+        Ok(Self {
+            q_a,
+            q_b,
+            kv_a,
+            kv_b,
+            o_proj,
+            q_a_ln,
+            kv_a_ln,
+        })
+    }
+}
+
 /// One MLA attention decode step for `layer`. `x` is the RMSNorm'd hidden
-/// (input_layernorm applied by the caller). Appends this token's latent/key to
+/// (input_layernorm applied by the caller); `w` is the layer's resolved
+/// weights ([`AttnWeights::load`]). Appends this token's latent/key to
 /// `kv` and writes the attention output (pre-residual, `hidden`-length) into
 /// `out`. `pos` must equal the layer's current cached-token count. `mode`
 /// picks the attended row set; `indexer` must be `Some` for the dsa/misa
 /// modes (enforced at engine construction, re-checked here).
 #[allow(clippy::too_many_arguments)]
 pub fn attention(
-    snap: &Snapshot,
+    w: &AttnWeights,
     cfg: &ModelConfig,
     layer: usize,
     x: &[f32],
@@ -244,49 +312,11 @@ pub fn attention(
     let scale = 1.0 / (qh as f32).sqrt();
     debug_assert_eq!(out.len(), cfg.hidden);
     debug_assert_eq!(pos, kv.tokens(layer), "pos out of step with cache");
-    let base = format!("model.layers.{layer}.self_attn");
-
-    // DEFERRED (profiling P3): these five int4 locates + two layernorm reads
-    // re-resolve constant-per-layer weights every token (format! + HashMap +
-    // Vec copy). Resolving them once at startup into a per-(layer) table is the
-    // same resolved-tensor contract as the MoE pin path; it lands with the pin
-    // milestone (M3/M4), not in this reference. Here we validate shapes loudly.
-    let q_a = snap.int4(&format!("{base}.q_a_proj"), cfg.hidden)?;
-    let q_b = snap.int4(&format!("{base}.q_b_proj"), cfg.q_lora_rank)?;
-    let kv_a = snap.int4(&format!("{base}.kv_a_proj_with_mqa"), cfg.hidden)?;
-    let kv_b = snap.int4(&format!("{base}.kv_b_proj"), kvl)?;
-    let o_proj = snap.int4(&format!("{base}.o_proj"), h * vh)?;
-    ensure!(
-        q_a.o_dim == cfg.q_lora_rank,
-        "q_a o_dim {} != {}",
-        q_a.o_dim,
-        cfg.q_lora_rank
-    );
-    ensure!(q_b.o_dim == h * qh, "q_b o_dim {} != {}", q_b.o_dim, h * qh);
-    ensure!(
-        kv_a.o_dim == kvl + rope,
-        "kv_a o_dim {} != {}",
-        kv_a.o_dim,
-        kvl + rope
-    );
-    ensure!(
-        kv_b.o_dim == h * (nope + vh),
-        "kv_b o_dim {} != {}",
-        kv_b.o_dim,
-        h * (nope + vh)
-    );
-    ensure!(
-        o_proj.o_dim == cfg.hidden,
-        "o_proj o_dim {} != {}",
-        o_proj.o_dim,
-        cfg.hidden
-    );
-    let q_a_ln = read_f32(snap.typed(&format!("{base}.q_a_layernorm.weight"), Dtype::F32)?);
-    let kv_a_ln = read_f32(snap.typed(&format!("{base}.kv_a_layernorm.weight"), Dtype::F32)?);
+    let (q_a, q_b, kv_a, kv_b, o_proj) = (w.q_a, w.q_b, w.kv_a, w.kv_b, w.o_proj);
 
     // 1) Q path: q_a → rmsnorm(q_a_ln) → q_b (both norms in place on scratch).
     matvec_i4(&mut s.qr, x, &q_a);
-    rmsnorm(&mut s.qr, &q_a_ln, eps);
+    rmsnorm(&mut s.qr, &w.q_a_ln, eps);
     matvec_i4(&mut s.q, &s.qr, &q_b);
 
     // 2) KV path: kv_a → [latent | key]; normalize the latent, RoPE the key —
@@ -296,7 +326,7 @@ pub fn attention(
     //    one token ahead of the indexer's key cache on that error path — a
     //    silent desync for any caller that survives the error.
     matvec_i4(&mut s.comp, x, &kv_a);
-    rmsnorm(&mut s.comp[..kvl], &kv_a_ln, eps);
+    rmsnorm(&mut s.comp[..kvl], &w.kv_a_ln, eps);
     rope_interleave(&mut s.comp[kvl..], pos, theta);
 
     // Select the rows this step attends over (ascending token order, over the
@@ -319,7 +349,7 @@ pub fn attention(
                 AttnMode::Misa { active_heads } => Some(*active_heads),
                 _ => None,
             };
-            ix.select(snap, cfg, layer, x, &s.qr, pos, active, &mut s.rows)?;
+            ix.select(cfg, layer, x, &s.qr, pos, active, &mut s.rows)?;
         }
     }
     ensure!(!s.rows.is_empty(), "empty attention row selection");

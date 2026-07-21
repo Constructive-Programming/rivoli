@@ -180,14 +180,23 @@ extern "C" int rivoli_ring_submit(void* ring) {
 // token and both halves live inside it, so which one to attack is not guessable —
 // the H2D moves ~2.7 GB/token and the reads are latency-bound, and those want
 // opposite fixes. Accumulated, never reset by the shim; the caller reads deltas.
+// Armed only by -DRIVOLI_TRACE (cargo feature `trace`); a production build reads
+// no clock here and rivoli_ring_timings reports zeros.
 static unsigned long long g_read_ns = 0;
 static unsigned long long g_copy_ns = 0;
 
+#ifdef RIVOLI_TRACE
 static inline unsigned long long now_ns(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (unsigned long long)t.tv_sec * 1000000000ull + (unsigned long long)t.tv_nsec;
 }
+#define TRACE_T0(v) unsigned long long v = now_ns()
+#define TRACE_ACC(acc, v) (acc) += now_ns() - (v)
+#else
+#define TRACE_T0(v) ((void)0)
+#define TRACE_ACC(acc, v) ((void)0)
+#endif
 
 // Read the accumulated (read, copy) nanosecond totals.
 extern "C" void rivoli_ring_timings(unsigned long long* read_ns, unsigned long long* copy_ns) {
@@ -199,7 +208,7 @@ extern "C" int rivoli_ring_wait(void* ring, unsigned count,
                                 const unsigned long long* min_res) {
     Ring* r = (Ring*)ring;
     if (count == 0) return 0;
-    unsigned long long t0 = now_ns();
+    TRACE_T0(t0);
     int sub = io_uring_submit_and_wait(&r->uring, count);
     if (sub < 0) return sub;
     int err = 0;
@@ -218,9 +227,9 @@ extern "C" int rivoli_ring_wait(void* ring, unsigned count,
         }
         io_uring_cqe_seen(&r->uring, c);
     }
-    g_read_ns += now_ns() - t0;
+    TRACE_ACC(g_read_ns, t0);
     if (err != 0 || !r->bounce_mode) return err; // direct mode: reads landed in VMM
-    unsigned long long t1 = now_ns();
+    TRACE_T0(t1);
     // Bounce mode: DMA each pinned-host slot into its VMM device slot. Pinned source
     // => async overlaps the copies; one sync joins them.
     for (unsigned i = 0; i < count; i++) {
@@ -229,7 +238,7 @@ extern "C" int rivoli_ring_wait(void* ring, unsigned count,
         if (he != hipSuccess) return HIP_ERR_BASE - (int)he;
     }
     hipError_t he = hipDeviceSynchronize();
-    g_copy_ns += now_ns() - t1;
+    TRACE_ACC(g_copy_ns, t1);
     return he == hipSuccess ? 0 : HIP_ERR_BASE - (int)he;
 }
 

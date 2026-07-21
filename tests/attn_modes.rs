@@ -8,7 +8,7 @@
 //! `RIVOLI_SNAPSHOT` or provide `~/glm52-snap`. Skips (pass, with a note) when
 //! absent, so bare CI stays green.
 
-use rivoli::attn::{AttnMode, AttnScratch, KvCache, attention};
+use rivoli::attn::{AttnMode, AttnScratch, AttnWeights, KvCache, attention};
 use rivoli::indexer::Indexer;
 use rivoli::model::ModelConfig;
 use rivoli::snapshot::Snapshot;
@@ -56,13 +56,18 @@ fn run_mode_kv(
         AttnMode::Dsa | AttnMode::Misa { .. } => Some(Indexer::new(snap, cfg)?),
         _ => None,
     };
+    // Weights resolve once (as in Engine::new); the loop is pure math.
+    let weights = layers
+        .iter()
+        .map(|&l| AttnWeights::load(snap, cfg, l))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let mut outs = Vec::new();
     for pos in 0..steps {
-        for &layer in layers {
+        for (li, &layer) in layers.iter().enumerate() {
             let x = hidden(cfg, (pos * 1000 + layer) as u32);
             let mut out = vec![0.0f32; cfg.hidden];
             attention(
-                snap,
+                &weights[li],
                 cfg,
                 layer,
                 &x,
@@ -234,8 +239,8 @@ fn indexer_sparse_regime_topk_and_misa_overlap() -> anyhow::Result<()> {
             rivoli::quant::matvec_i4(&mut qr, &x, &q_a);
             rivoli::math::rmsnorm(&mut qr, &q_a_ln, cfg.rms_norm_eps as f32);
         }
-        dsa.select(&snap, step_cfg, 0, &x, &qr, pos, None, &mut rows_dsa)?;
-        misa.select(&snap, step_cfg, 0, &x, &qr, pos, Some(8), &mut rows_misa)?;
+        dsa.select(step_cfg, 0, &x, &qr, pos, None, &mut rows_dsa)?;
+        misa.select(step_cfg, 0, &x, &qr, pos, Some(8), &mut rows_misa)?;
     }
 
     assert_eq!(rows_dsa.len(), cfg.index_topk, "dsa row count");

@@ -24,22 +24,21 @@ fn main() {
         "stream",
     ];
     let hipcc = std::env::var("HIPCC").unwrap_or_else(|_| "hipcc".into());
+    // The `trace` feature also arms the shim-side fetch timers (stream.hip).
+    let trace = std::env::var("CARGO_FEATURE_TRACE").is_ok();
 
     let mut objs = Vec::new();
     for k in kernels {
         let src = format!("kernels/{k}.hip");
         let obj = format!("{out_dir}/{k}.o");
         println!("cargo:rerun-if-changed={src}");
-        let status = Command::new(&hipcc)
-            .args([
-                "--offload-arch=gfx1151",
-                "-O3",
-                "-fPIC",
-                "-c",
-                &src,
-                "-o",
-                &obj,
-            ])
+        let mut cmd = Command::new(&hipcc);
+        cmd.args(["--offload-arch=gfx1151", "-O3", "-fPIC"]);
+        if trace {
+            cmd.arg("-DRIVOLI_TRACE");
+        }
+        let status = cmd
+            .args(["-c", &src, "-o", &obj])
             .status()
             .expect("run hipcc");
         assert!(status.success(), "hipcc failed on {src}");

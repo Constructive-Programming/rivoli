@@ -79,10 +79,15 @@ fn route_into(
     topk_into(choice, top_k, sel);
 }
 
-/// Per-token time buckets, measured (not theorized). The mid-layer sync drains
-/// the attention kernels; the end-of-layer sync drains the MLP; the cold-expert
-/// copy_in's between them are pure H2D (no kernel-wait). So these split cleanly
-/// into I/O (fetch) vs GPU compute (attn/mlp/lmhead) vs host routing.
+/// Per-token time buckets, measured (not theorized). The end-of-layer sync
+/// drains the MLP; the cold-expert copy_in's are pure H2D (no kernel-wait). So
+/// these split cleanly into I/O (fetch) vs GPU compute (mlp) vs host routing —
+/// the latter now absorbing the attention wait, since the blocking gate-logits
+/// D2H is what joins that chain (the bucket-splitting syncs are gone).
+///
+/// `trace`-only: the ~1000 clock reads per token this costs buy nothing in a
+/// production build, where nothing consumes the report.
+#[cfg(feature = "trace")]
 #[derive(Default)]
 struct Profile {
     fetch_ns: u128, // io_uring O_DIRECT cold stream (NVMe->VMM): submit + join
@@ -101,6 +106,7 @@ struct Profile {
     tokens: u64,
 }
 
+#[cfg(feature = "trace")]
 impl Profile {
     fn report(&self) {
         let tok = self.tokens.max(1) as f64;
@@ -249,10 +255,13 @@ pub struct GpuEngine<'a> {
     w: Vec<f32>,
     mlps: Vec<Mlp>,
     /// DIAGNOSTIC (`--checksum-layer`): hash routed experts on this MoE layer.
+    #[cfg(feature = "trace")]
     checksum_layer: Option<usize>,
     /// DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
+    #[cfg(feature = "trace")]
     checksum_x: bool,
     /// Reused D2H staging for the checksum probe (never allocated when off).
+    #[cfg(feature = "trace")]
     ck_buf: Vec<u8>,
     gl_host: Vec<u8>,
     pgl_host: Vec<u8>,
@@ -265,6 +274,7 @@ pub struct GpuEngine<'a> {
     pred_sel: Vec<usize>,
     prefetch: bool,
     prefetch_depth: usize,
+    #[cfg(feature = "trace")]
     prof: Profile,
 }
 
@@ -407,8 +417,11 @@ impl<'a> GpuEngine<'a> {
             descs: Vec::with_capacity(slots),
             w: Vec::with_capacity(slots),
             mlps: Vec::with_capacity(cfg.top_k),
+            #[cfg(feature = "trace")]
             checksum_layer: None,
+            #[cfg(feature = "trace")]
             checksum_x: false,
+            #[cfg(feature = "trace")]
             ck_buf: Vec::new(),
             gl_host: Vec::with_capacity(cfg.n_experts * 4),
             pgl_host: Vec::with_capacity(cfg.n_experts * 4),
@@ -418,6 +431,7 @@ impl<'a> GpuEngine<'a> {
             pred_sel: Vec::with_capacity(cfg.top_k),
             prefetch: pin.prefetch_enabled(),
             prefetch_depth: pin.prefetch_depth(),
+            #[cfg(feature = "trace")]
             prof: Profile::default(),
             heartbeat: None,
             pin,
@@ -437,11 +451,13 @@ impl<'a> GpuEngine<'a> {
     }
     /// DIAGNOSTIC: hash every routed expert's weights on this MoE layer after they
     /// land (`--checksum-layer`). Off by default; see [`Self::dump_expert_checksums`].
+    #[cfg(feature = "trace")]
     pub fn set_checksum_layer(&mut self, l: Option<usize>) {
         self.checksum_layer = l;
     }
 
     /// DIAGNOSTIC: hash the residual stream after every layer (`--checksum-x`).
+    #[cfg(feature = "trace")]
     pub fn set_checksum_x(&mut self, on: bool) {
         self.checksum_x = on;
     }
@@ -458,6 +474,7 @@ impl<'a> GpuEngine<'a> {
     ///
     /// `ptr` is logged too because it encodes the slot, so a mismatch can be traced
     /// back to which slot held the expert.
+    #[cfg(feature = "trace")]
     fn dump_expert_checksums(&mut self, l: usize) -> Result<()> {
         // FNV-1a: order-sensitive over the whole region, so a single stale byte
         // anywhere in the tensor changes the digest.
@@ -515,6 +532,7 @@ impl<'a> GpuEngine<'a> {
     }
 
     /// Cross-layer prefetch recall: (predicted experts actually selected, predicted).
+    #[cfg(feature = "trace")]
     pub fn prefetch_recall(&self) -> (u64, u64) {
         (self.pin.pred_correct, self.pin.pred_total)
     }
@@ -525,6 +543,7 @@ impl<'a> GpuEngine<'a> {
     ///   `cold`      — demand miss, read on the critical path
     /// Also `pf_evict_unused` (prefetched keys evicted before any use) and
     /// `pf_evict_then_missed` (those later demanded anyway = read twice).
+    #[cfg(feature = "trace")]
     pub fn source_split(&self) -> (u64, u64, u64, u64, u64) {
         self.pin.source_split()
     }
@@ -536,10 +555,12 @@ impl<'a> GpuEngine<'a> {
     }
 
     /// Total ms blocked in the prefetch drain (fetch NOT hidden behind compute).
+    #[cfg(feature = "trace")]
     pub fn prefetch_wait_ms(&self) -> f64 {
         self.pin.prefetch_wait_ns as f64 / 1e6
     }
     /// `prefetch_layer` cost split in ms: (cache admission, SQE prep, submit).
+    #[cfg(feature = "trace")]
     pub fn prefetch_cost_ms(&self) -> (f64, f64, f64) {
         (
             self.pin.pf_alloc_ns as f64 / 1e6,
@@ -963,16 +984,19 @@ impl<'a> GpuEngine<'a> {
                         )?;
                     }
                 }
-                let t = std::time::Instant::now();
-                device_sync()?; // wait attention+gate (+ L+1 prediction) compute
-                self.prof.attn_ns += t.elapsed().as_nanos();
+                // No explicit sync here: the gate-logits D2H below is a blocking
+                // hipMemcpy on the null stream, so it already waits for the
+                // attention+gate (+ L+1 prediction) chain. The sync this replaced
+                // existed to attribute time to the `attn` PROFILE bucket.
                 // DIAGNOSTIC: hash the residual AFTER attention but BEFORE the MLP,
                 // so a divergent layer can be attributed to one sublayer or the
                 // other. Paired with the end-of-layer XSUM: xn same + x different
                 // => the MoE diverged; xn already different => attention did.
+                #[cfg(feature = "trace")]
                 if self.checksum_x {
                     let n = hidden * 4;
-                    // SAFETY: the sync above retired the attention chain that wrote xn.
+                    // SAFETY: the blocking D2H inside copy_out_raw is null-stream
+                    // ordered after the attention chain that wrote xn.
                     unsafe { DeviceBuf::copy_out_raw(self.xn.ptr(), n, &mut self.ck_buf)? };
                     let mut hh: u64 = 0xcbf2_9ce4_8422_2325;
                     for &b in self.ck_buf.iter() {
@@ -981,6 +1005,7 @@ impl<'a> GpuEngine<'a> {
                     }
                     tracing::info!("XNSUM pos={pos} l={l} xn={hh:016x}");
                 }
+                #[cfg(feature = "trace")]
                 let t = std::time::Instant::now();
                 // Split borrows: read the gate logits into a reused host buffer, then
                 // route with `bias` borrowed straight out of `&self.pin` while the
@@ -1007,21 +1032,29 @@ impl<'a> GpuEngine<'a> {
                         &mut self.pred_sel,
                     );
                 }
-                self.prof.route_ns += t.elapsed().as_nanos();
+                #[cfg(feature = "trace")]
+                {
+                    self.prof.route_ns += t.elapsed().as_nanos();
+                }
                 // Batch every cold miss through io_uring O_DIRECT (queue depth →
                 // full NVMe bandwidth, straight into the VMM slots, one join) and
                 // get the resolved descriptors back.
+                #[cfg(feature = "trace")]
                 let miss0 = self.pin.misses;
+                #[cfg(feature = "trace")]
                 let t = std::time::Instant::now();
                 // SUBMIT this layer's cold reads and take the descriptors back
                 // immediately — the slot ADDRESSES are known at allocation time, only
                 // the bytes are still arriving. Everything between here and
                 // `await_layer` below runs with the NVMe busy.
                 let batch = self.pin.submit_layer(l, &self.sel, &mut self.mlps)?;
-                let dt = t.elapsed().as_nanos();
-                self.prof.fetch_ns += dt;
-                self.prof.fetch_submit_ns += dt;
-                self.prof.fetch_n += self.pin.misses - miss0;
+                #[cfg(feature = "trace")]
+                {
+                    let dt = t.elapsed().as_nanos();
+                    self.prof.fetch_ns += dt;
+                    self.prof.fetch_submit_ns += dt;
+                    self.prof.fetch_n += self.pin.misses - miss0;
+                }
                 // Submit L+1's predicted-expert reads NOW (non-blocking), WHILE this
                 // layer's demand reads are still in flight, so both batches sit in the
                 // device queue together (the array wants P>=4 and this path has ~0.6
@@ -1076,15 +1109,20 @@ impl<'a> GpuEngine<'a> {
                 // by the `attn` sync above, and the only device work since is the two
                 // uploads immediately preceding, which must complete before
                 // `launch_moe` regardless.
+                #[cfg(feature = "trace")]
                 let t = std::time::Instant::now();
                 self.pin.await_layer(batch)?;
-                self.prof.fetch_ns += t.elapsed().as_nanos();
+                #[cfg(feature = "trace")]
+                {
+                    self.prof.fetch_ns += t.elapsed().as_nanos();
+                }
                 // DIAGNOSTIC (`--checksum-layer`): the weights for `sel` are now
                 // fully landed and no kernel is live, so this is the one point where
                 // an expert's bytes can be hashed as the MoE kernel will read them.
                 // Two runs that differ ONLY in slot assignment (e.g. `--max-mem`)
                 // must produce identical hashes for the same (layer,expert) key; a
                 // mismatch localises the divergence to the read path.
+                #[cfg(feature = "trace")]
                 if self.checksum_layer == Some(l) {
                     self.dump_expert_checksums(l)?;
                 }
@@ -1108,14 +1146,19 @@ impl<'a> GpuEngine<'a> {
             unsafe { launch_vadd(xp, self.moe_out.ptr() as *const f32, hidden)? };
             // End-of-layer join: protects the reused descs/wexpert/moe_out
             // buffers before the next layer overwrites them, and surfaces faults.
+            #[cfg(feature = "trace")]
             let t = std::time::Instant::now();
             device_sync()?;
-            self.prof.mlp_ns += t.elapsed().as_nanos();
+            #[cfg(feature = "trace")]
+            {
+                self.prof.mlp_ns += t.elapsed().as_nanos();
+            }
             // DIAGNOSTIC (`--checksum-x`): hash the residual stream after every
             // layer. Two configs that differ only in slot assignment must produce
             // identical hashes; the FIRST divergent (pos, layer) is where values
             // actually start differing, which the routed-expert trace cannot show
             // (a selection only changes once the drift flips a near-tie).
+            #[cfg(feature = "trace")]
             if self.checksum_x {
                 let n = hidden * 4;
                 // SAFETY: `x` is `hidden` f32 of live device scratch; the sync above
@@ -1144,9 +1187,9 @@ impl<'a> GpuEngine<'a> {
                 self.logits.ptr_mut() as *mut f32,
             )?;
         }
-        let t = std::time::Instant::now();
-        device_sync()?;
-        self.prof.lmhead_ns += t.elapsed().as_nanos();
+        // No trailing sync: argmax()'s 8-byte D2H is a blocking hipMemcpy on the
+        // null stream, ordered after the norm + lm_head (+ argmax) kernels. The
+        // sync this replaced existed for the `lmhead` PROFILE bucket.
         Ok(())
     }
 
@@ -1169,7 +1212,9 @@ impl<'a> GpuEngine<'a> {
         }
         // 8-byte D2H (blocking hipMemcpy, ordered after the kernel on the null stream).
         self.argmax_dev.copy_out_into(&mut self.argmax_host)?;
-        ensure!(self.argmax_host.len() == 8, "argmax result must be 8 bytes");
+        // Tautological in release (copy_out_into resizes to the buffer's fixed
+        // 8-byte len); keep as a debug invariant only.
+        debug_assert_eq!(self.argmax_host.len(), 8, "argmax result must be 8 bytes");
         let idx = i32::from_le_bytes([
             self.argmax_host[0],
             self.argmax_host[1],
@@ -1186,7 +1231,7 @@ impl<'a> GpuEngine<'a> {
         if !val.is_finite() {
             bail!("logits are non-finite (NaN/Inf in the GPU forward pass)");
         }
-        ensure!(idx >= 0, "argmax returned negative index {idx}");
+        debug_assert!(idx >= 0, "argmax returned negative index {idx}");
         Ok(idx as u32)
     }
 
@@ -1200,15 +1245,23 @@ impl<'a> GpuEngine<'a> {
             pos += 1;
         }
         // Profile the DECODE loop only (prefill is warm-up).
-        self.prof = Profile::default();
+        #[cfg(feature = "trace")]
+        {
+            self.prof = Profile::default();
+        }
+        #[cfg(feature = "trace")]
         let decode_wall = std::time::Instant::now();
         let mut generated = Vec::with_capacity(ngen);
         // Windowed timing so the cache-warming trend is visible (does per-token
         // time drop as the working set caches?).
+        #[cfg(feature = "trace")]
         const WIN: usize = 8;
+        #[cfg(feature = "trace")]
         let mut win_t = std::time::Instant::now();
+        #[cfg(feature = "trace")]
         let (mut win_hit, mut win_miss) = (self.pin.hits, self.pin.misses);
-        for i in 0..ngen {
+        // `i` drives only the trace build's window boundary.
+        for _i in 0..ngen {
             if let Some(hb) = &self.heartbeat {
                 hb.beat();
             }
@@ -1219,22 +1272,26 @@ impl<'a> GpuEngine<'a> {
             generated.push(next);
             self.forward(next, pos)?;
             pos += 1;
-            if (i + 1) % WIN == 0 {
+            #[cfg(feature = "trace")]
+            if (_i + 1) % WIN == 0 {
                 let dt = win_t.elapsed().as_secs_f64();
                 let (dh, dm) = (self.pin.hits - win_hit, self.pin.misses - win_miss);
                 let hit_pct = 100.0 * dh as f64 / (dh + dm).max(1) as f64;
                 tracing::info!(
                     "  tok {}/{ngen}: {:.3} tok/s (window), hit {hit_pct:.1}%",
-                    i + 1,
+                    _i + 1,
                     WIN as f64 / dt.max(1e-9),
                 );
                 win_t = std::time::Instant::now();
                 (win_hit, win_miss) = (self.pin.hits, self.pin.misses);
             }
         }
-        self.prof.wall_ns = decode_wall.elapsed().as_nanos();
-        self.prof.tokens = generated.len() as u64;
-        self.prof.report();
+        #[cfg(feature = "trace")]
+        {
+            self.prof.wall_ns = decode_wall.elapsed().as_nanos();
+            self.prof.tokens = generated.len() as u64;
+            self.prof.report();
+        }
         Ok(generated)
     }
 }

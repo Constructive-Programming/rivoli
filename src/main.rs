@@ -56,8 +56,11 @@ struct Args {
     misa_heads: usize,
     kv_fp8: bool,
     /// DIAGNOSTIC (`--checksum-layer <l>`): hash routed experts on MoE layer `l`.
+    /// `trace` builds only (the probe itself is compiled out otherwise).
+    #[cfg(feature = "trace")]
     checksum_layer: Option<usize>,
     /// DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
+    #[cfg(feature = "trace")]
     checksum_x: bool,
 }
 
@@ -100,7 +103,9 @@ fn parse_args() -> Result<Args> {
         window: 8192,
         misa_heads: 8, // the MISA paper's validated GLM-5 setting
         kv_fp8: false,
+        #[cfg(feature = "trace")]
         checksum_layer: None,
+        #[cfg(feature = "trace")]
         checksum_x: false,
     };
     let mut args = std::env::args().skip(1);
@@ -193,7 +198,9 @@ fn parse_args() -> Result<Args> {
                 }
             }
             "--kv-fp8" => a.kv_fp8 = true,
+            #[cfg(feature = "trace")]
             "--checksum-x" => a.checksum_x = true,
+            #[cfg(feature = "trace")]
             "--checksum-layer" => {
                 a.checksum_layer = Some(
                     args.next()
@@ -214,7 +221,9 @@ fn main() -> Result<()> {
     let a = parse_args()?;
     // Captured before `a` is consumed by `Config::discover` — this is a diagnostic
     // knob, not part of the discovered config.
+    #[cfg(feature = "trace")]
     let checksum_layer = a.checksum_layer;
+    #[cfg(feature = "trace")]
     let checksum_x = a.checksum_x;
     // Zero-knob default: `dsa` (the model's native trained mechanism) when the
     // out-idx indexer shard sits next to the snapshot, `dense` otherwise. Read
@@ -246,6 +255,8 @@ fn main() -> Result<()> {
         },
         other => bail!("unknown --attn mode {other:?} (auto|dense|streaming|dsa|misa)"),
     };
+    // `mut` only for the trace build's checksum knobs, set just below.
+    #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
     let mut cfg = Config::discover(
         a.snapshot,
         a.bench,
@@ -262,8 +273,11 @@ fn main() -> Result<()> {
         attn,
         a.kv_fp8,
     )?;
-    cfg.checksum_layer = checksum_layer;
-    cfg.checksum_x = checksum_x;
+    #[cfg(feature = "trace")]
+    {
+        cfg.checksum_layer = checksum_layer;
+        cfg.checksum_x = checksum_x;
+    }
 
     // Decode is synchronous; tokio owns the feed side only. Worker count is
     // the discovered CPU pool size — never the SMT-logical count.
@@ -434,8 +448,11 @@ async fn run(cfg: Config) -> Result<()> {
         // Wedge watchdog: a hung GPU join can't be caught inside the decode loop, so
         // a background thread aborts the process if no token lands for 60 s (healthy
         // tokens are ~1-2 s here — this only trips on a real device wedge).
-        engine.set_checksum_layer(cfg.checksum_layer);
-        engine.set_checksum_x(cfg.checksum_x);
+        #[cfg(feature = "trace")]
+        {
+            engine.set_checksum_layer(cfg.checksum_layer);
+            engine.set_checksum_x(cfg.checksum_x);
+        }
         engine.set_heartbeat(rivoli::watchdog::spawn(std::time::Duration::from_secs(60))?);
         // One OTLP span per decode run; the per-token/PROFILE/summary events below
         // attach to it, and the top-line metrics are recorded as queryable fields.
@@ -465,64 +482,68 @@ async fn run(cfg: Config) -> Result<()> {
             // Where the bytes came from. `hits` conflates residency with prefetched
             // disk reads, so it overstates how much of the model is actually resident:
             // only `loaded` costs no I/O. `read` = the experts that touched the disk.
-            let (loaded, preloading, cold, pf_waste, pf_refetch) = engine.source_split();
-            // Selections, by where the bytes came from. Only `loaded` is I/O-free.
-            let total = (loaded + preloading + cold).max(1);
-            let ntok = ids.len().max(1) as f64;
-            // Disk reads INCLUDE wasted prefetches, which serve no selection at all —
-            // so reads > selections-that-needed-I/O whenever prefetch is on.
-            let reads = preloading + cold + pf_waste;
-            info!(
-                "expert source: loaded {:.1}% ({loaded}) | preloading {:.1}% ({preloading}) \
+            // The whole breakdown rides on the pool's `trace`-only accounting.
+            #[cfg(feature = "trace")]
+            {
+                let (loaded, preloading, cold, pf_waste, pf_refetch) = engine.source_split();
+                // Selections, by where the bytes came from. Only `loaded` is I/O-free.
+                let total = (loaded + preloading + cold).max(1);
+                let ntok = ids.len().max(1) as f64;
+                // Disk reads INCLUDE wasted prefetches, which serve no selection at all —
+                // so reads > selections-that-needed-I/O whenever prefetch is on.
+                let reads = preloading + cold + pf_waste;
+                info!(
+                    "expert source: loaded {:.1}% ({loaded}) | preloading {:.1}% ({preloading}) \
                  | cold {:.1}% ({cold})",
-                100.0 * loaded as f64 / total as f64,
-                100.0 * preloading as f64 / total as f64,
-                100.0 * cold as f64 / total as f64,
-            );
-            let coll = engine.slot_collisions();
-            if coll > 0 {
-                info!(
-                    "slot-reuse collisions caught: {coll} ({:.2}/tok) — each would have \
+                    100.0 * loaded as f64 / total as f64,
+                    100.0 * preloading as f64 / total as f64,
+                    100.0 * cold as f64 / total as f64,
+                );
+                let coll = engine.slot_collisions();
+                if coll > 0 {
+                    info!(
+                        "slot-reuse collisions caught: {coll} ({:.2}/tok) — each would have \
                      been a silently corrupted expert before the guard",
-                    coll as f64 / ntok,
-                );
-            }
-            info!(
-                "disk traffic: {:.1} expert reads/tok ({:.2} GB/tok), of which {:.1}% wasted",
-                reads as f64 / ntok,
-                reads as f64 / ntok * 18.9 / 1000.0,
-                100.0 * pf_waste as f64 / reads.max(1) as f64,
-            );
-            if cfg.prefetch {
-                let (pa, pq, ps) = engine.prefetch_cost_ms();
+                        coll as f64 / ntok,
+                    );
+                }
                 info!(
-                    "prefetch cost: alloc {:.0}ms ({:.2}ms/tok) | sqe-prep {:.0}ms ({:.2}ms/tok) \
+                    "disk traffic: {:.1} expert reads/tok ({:.2} GB/tok), of which {:.1}% wasted",
+                    reads as f64 / ntok,
+                    reads as f64 / ntok * 18.9 / 1000.0,
+                    100.0 * pf_waste as f64 / reads.max(1) as f64,
+                );
+                if cfg.prefetch {
+                    let (pa, pq, ps) = engine.prefetch_cost_ms();
+                    info!(
+                        "prefetch cost: alloc {:.0}ms ({:.2}ms/tok) | sqe-prep {:.0}ms ({:.2}ms/tok) \
                      | io_uring_submit {:.0}ms ({:.2}ms/tok)",
-                    pa,
-                    pa / ntok,
-                    pq,
-                    pq / ntok,
-                    ps,
-                    ps / ntok,
-                );
-                let queued = preloading + pf_waste;
-                info!(
-                    "prefetch waste: {pf_waste} of {queued} queued reads evicted before use \
+                        pa,
+                        pa / ntok,
+                        pq,
+                        pq / ntok,
+                        ps,
+                        ps / ntok,
+                    );
+                    let queued = preloading + pf_waste;
+                    info!(
+                        "prefetch waste: {pf_waste} of {queued} queued reads evicted before use \
                      ({:.1}% ) | of those, {pf_refetch} were demanded later and re-read \
                      ({:.1}% of wasted = evicted-BEFORE-USE, not misprediction)",
-                    100.0 * pf_waste as f64 / queued.max(1) as f64,
-                    100.0 * pf_refetch as f64 / pf_waste.max(1) as f64,
-                );
-            }
-            if cfg.prefetch {
-                let (correct, total) = engine.prefetch_recall();
-                info!(
-                    "prefetch: recall {:.1}% ({correct} of {total} predicted experts selected) \
+                        100.0 * pf_waste as f64 / queued.max(1) as f64,
+                        100.0 * pf_refetch as f64 / pf_waste.max(1) as f64,
+                    );
+                }
+                if cfg.prefetch {
+                    let (correct, total) = engine.prefetch_recall();
+                    info!(
+                        "prefetch: recall {:.1}% ({correct} of {total} predicted experts selected) \
                      | drain-wait {:.0}ms total ({:.1}ms/tok not hidden)",
-                    100.0 * correct as f64 / total.max(1) as f64,
-                    engine.prefetch_wait_ms(),
-                    engine.prefetch_wait_ms() / ids.len().max(1) as f64,
-                );
+                        100.0 * correct as f64 / total.max(1) as f64,
+                        engine.prefetch_wait_ms(),
+                        engine.prefetch_wait_ms() / ids.len().max(1) as f64,
+                    );
+                }
             }
             info!("{bench_prompt}{}", tok.decode_all(&ids)?);
         }

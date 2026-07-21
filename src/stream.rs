@@ -259,6 +259,17 @@ impl Drop for Streamer {
     }
 }
 
+/// Accumulated `(nvme_read_ns, bounce_copy_ns)` across every drain on every ring.
+/// Splits the `fetch` PROFILE bucket into the two halves that want opposite fixes:
+/// waiting on NVMe completions (latency/queue-depth bound) versus the pinned-host
+/// -> device copy and its sync (bandwidth bound, ~2.7 GB/token).
+pub fn ring_timings() -> (u64, u64) {
+    let (mut r, mut c) = (0u64, 0u64);
+    // SAFETY: both out-pointers are valid; the shim only writes two u64s.
+    unsafe { ffi::rivoli_ring_timings(&mut r, &mut c) };
+    (r, c)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,15 +315,4 @@ mod tests {
             }
         }
     }
-}
-
-/// Accumulated `(nvme_read_ns, bounce_copy_ns)` across every drain on every ring.
-/// Splits the `fetch` PROFILE bucket into the two halves that want opposite fixes:
-/// waiting on NVMe completions (latency/queue-depth bound) versus the pinned-host
-/// -> device copy and its sync (bandwidth bound, ~2.7 GB/token).
-pub fn ring_timings() -> (u64, u64) {
-    let (mut r, mut c) = (0u64, 0u64);
-    // SAFETY: both out-pointers are valid; the shim only writes two u64s.
-    unsafe { ffi::rivoli_ring_timings(&mut r, &mut c) };
-    (r, c)
 }

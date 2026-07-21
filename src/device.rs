@@ -221,9 +221,12 @@ mod tier {
         /// `src` must point to at least `len` readable device bytes, and no kernel
         /// may be concurrently writing them (call after a `device_sync`).
         pub unsafe fn copy_out_raw(src: *const u8, len: usize, out: &mut Vec<u8>) -> Result<()> {
+            // No zero-fill: the D2H overwrites every byte, so reserve + set_len
+            // after the copy (resize(len, 0) was a pure-waste memset per call).
             out.clear();
-            out.resize(len, 0);
-            // SAFETY: caller guarantees `src` is readable for `len`; dst has `len`.
+            out.reserve(len);
+            // SAFETY: caller guarantees `src` is readable for `len`; dst owns
+            // `len` reserved bytes.
             let e = unsafe {
                 hipMemcpy(
                     out.as_mut_ptr() as *mut c_void,
@@ -233,6 +236,8 @@ mod tier {
                 )
             };
             ensure!(e == HIP_SUCCESS, "hipMemcpy D2H (raw) failed ({e})");
+            // SAFETY: the copy above initialized the first `len` bytes.
+            unsafe { out.set_len(len) };
             Ok(())
         }
 
@@ -255,9 +260,10 @@ mod tier {
                 "copy_out_prefix {len} > buf len {}",
                 self.len
             );
+            // No zero-fill: the D2H overwrites the whole range (see copy_out_raw).
             out.clear();
-            out.resize(len, 0);
-            // SAFETY: source has `len <= self.len` bytes; dest has `len` bytes.
+            out.reserve(len);
+            // SAFETY: source has `len <= self.len` bytes; dest owns `len` reserved bytes.
             let e = unsafe {
                 hipMemcpy(
                     out.as_mut_ptr() as *mut c_void,
@@ -267,6 +273,8 @@ mod tier {
                 )
             };
             ensure!(e == HIP_SUCCESS, "hipMemcpy D2H failed ({e})");
+            // SAFETY: the copy above initialized the first `len` bytes.
+            unsafe { out.set_len(len) };
             Ok(())
         }
 
@@ -274,9 +282,10 @@ mod tier {
         /// across tokens: cleared then refilled to `len`, so the per-token decode
         /// D2H allocates nothing once `out` has grown to size).
         pub fn copy_out_into(&self, out: &mut Vec<u8>) -> Result<()> {
+            // No zero-fill: the D2H overwrites the whole buffer (see copy_out_raw).
             out.clear();
-            out.resize(self.len, 0);
-            // SAFETY: both regions are `len` bytes.
+            out.reserve(self.len);
+            // SAFETY: both regions are `len` bytes; dest owns them reserved.
             let e = unsafe {
                 hipMemcpy(
                     out.as_mut_ptr() as *mut c_void,
@@ -286,6 +295,8 @@ mod tier {
                 )
             };
             ensure!(e == HIP_SUCCESS, "hipMemcpy D2H failed ({e})");
+            // SAFETY: the copy above initialized the first `len` bytes.
+            unsafe { out.set_len(self.len) };
             Ok(())
         }
 

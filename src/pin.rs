@@ -189,28 +189,39 @@ pub struct Pin<'a> {
     /// Per-`sel` index, whether the last `submit_layer` served that expert from
     /// residency (true) or streamed it (false). Diagnostic for the slot-corruption
     /// hunt: it says whether a wrong-bytes expert was freshly read or was already
-    /// sitting in the pool with clobbered contents.
+    /// sitting in the pool with clobbered contents. Feeds only the
+    /// `--checksum-layer` probe, so it is maintained only in a `trace` build.
+    #[cfg(feature = "trace")]
     pub last_hit: Vec<bool>,
     /// The predicted expert set submitted for the layer named in `predicted_layer`
     /// (recall accounting at the matching `submit_layer`).
     predicted: Vec<usize>,
     predicted_layer: usize,
-    /// Stats over the run.
+    /// Stats over the run — the two headline counters, always maintained (a plain
+    /// u64 increment each). The `trace` build additionally splits `hits` into
+    /// loaded-vs-preloaded via [`Pool`]'s HashSet accounting.
     pub hits: u64,
     pub misses: u64,
     /// Prefetch recall: `pred_correct` predicted experts were actually selected out
     /// of `pred_total` predicted (over all prefetched layers).
+    #[cfg(feature = "trace")]
     pub pred_total: u64,
+    #[cfg(feature = "trace")]
     pub pred_correct: u64,
     /// Nanoseconds spent blocked in the prefetch-ring drain (the part of the fetch
     /// that did NOT overlap the previous layer's compute). Near-zero means the reads
     /// were fully hidden; large means the overlap window was too small / NVMe-bound.
+    #[cfg(feature = "trace")]
     pub prefetch_wait_ns: u128,
     /// `prefetch_layer` cost split: cache admission / SQE prep / io_uring_submit.
     /// The whole call is OUTSIDE every PROFILE bucket, so it lands in `other` —
     /// which grows ~60 ms per unit of prefetch depth. This says which third it is.
+    /// Two clock reads PER PREFETCHED EXPERT, hence `trace`-only.
+    #[cfg(feature = "trace")]
     pub pf_alloc_ns: u128,
+    #[cfg(feature = "trace")]
     pub pf_queue_ns: u128,
+    #[cfg(feature = "trace")]
     pub pf_submit_ns: u128,
     /// Optional access-trace sink (`--trace`): one line per resolved MoE layer —
     /// the space-separated `(layer,expert)` keys the pool looked up, in access
@@ -419,21 +430,27 @@ struct Pool {
     ///     and the reported hit rate silently counts disk reads as hits.
     ///   - `reuse` — a key evicted while still in here was read and thrown away
     ///     before anyone used it: a fully wasted expert read.
+    #[cfg(feature = "trace")]
     pending_pf: std::collections::HashSet<u32>,
     /// Hits on genuinely-resident keys (no disk read behind them).
+    #[cfg(feature = "trace")]
     pub hit_loaded: u64,
     /// Hits on keys a prefetch had just streamed in (disk read, but off the
     /// critical path — it overlapped the previous layer's compute).
+    #[cfg(feature = "trace")]
     pub hit_preload: u64,
     /// Prefetched keys evicted before any `get` claimed them — wasted reads.
+    #[cfg(feature = "trace")]
     pub pf_evict_unused: u64,
     /// Keys currently in the "was prefetched, evicted unused" state. A demand miss
     /// on one of these is the DIRECT signature of eviction-before-use: the expert
     /// really was wanted, we really did read it, and we threw it away in time to
     /// have to read it again. Distinguishes that from plain misprediction, which
     /// also lands in `pf_evict_unused` but is never demanded afterwards.
+    #[cfg(feature = "trace")]
     evicted_pf: std::collections::HashSet<u32>,
     /// Demand misses on a key we had already prefetched and evicted unused.
+    #[cfg(feature = "trace")]
     pub pf_evict_then_missed: u64,
 }
 
@@ -446,11 +463,17 @@ impl Pool {
             #[cfg(debug_assertions)]
             key_of: vec![None; n],
             free: (0..n).rev().collect(), // pop() hands out 0,1,2,...
+            #[cfg(feature = "trace")]
             pending_pf: std::collections::HashSet::new(),
+            #[cfg(feature = "trace")]
             hit_loaded: 0,
+            #[cfg(feature = "trace")]
             hit_preload: 0,
+            #[cfg(feature = "trace")]
             pf_evict_unused: 0,
+            #[cfg(feature = "trace")]
             evicted_pf: std::collections::HashSet::new(),
+            #[cfg(feature = "trace")]
             pf_evict_then_missed: 0,
         })
     }
@@ -465,7 +488,9 @@ impl Pool {
             debug_assert_eq!(self.key_of[slot], Some(key), "hit slot holds wrong key");
             // Claim the prediction: a hit on a pending prefetch is a PRELOADING hit
             // (its bytes came off disk during the previous layer), everything else is
-            // a LOADED hit (already resident, no I/O at all).
+            // a LOADED hit (already resident, no I/O at all). Accounting only — the
+            // HashSet probe is why it lives behind `trace`.
+            #[cfg(feature = "trace")]
             if self.pending_pf.remove(&key) {
                 self.hit_preload += 1;
             } else {
@@ -482,6 +507,7 @@ impl Pool {
     fn alloc(&mut self, key: u32) -> Result<usize> {
         // Re-reading an expert we prefetched and then evicted unused: the read was
         // paid twice and the prediction was RIGHT, just too early / evicted too soon.
+        #[cfg(feature = "trace")]
         if self.evicted_pf.remove(&key) {
             self.pf_evict_then_missed += 1;
         }
@@ -501,6 +527,7 @@ impl Pool {
         self.bind(key, slot);
         // Unclaimed until a real `get`; `reuse` charges it as wasted if it is
         // evicted first.
+        #[cfg(feature = "trace")]
         self.pending_pf.insert(key);
         Ok(slot)
     }
@@ -530,6 +557,7 @@ impl Pool {
                 // Evicting a still-pending prediction throws away an expert read
                 // that nobody ever used — the read cost was paid for nothing, and
                 // a later selection of `ev` has to stream it again.
+                #[cfg(feature = "trace")]
                 if self.pending_pf.remove(&ev) {
                     self.pf_evict_unused += 1;
                     self.evicted_pf.insert(ev);
@@ -553,6 +581,7 @@ impl Pool {
         self.slot_of.insert(key, slot);
         // Rebinding clears the "prefetched then evicted unused" mark: `alloc` has
         // already charged it above, and a re-prefetch must not charge it again.
+        #[cfg(feature = "trace")]
         self.evicted_pf.remove(&key);
         // The just-inserted key must be resident, and slot_of must mirror residency.
         debug_assert!(self.policy.contains(key), "inserted key {key} not resident");
@@ -597,6 +626,14 @@ impl<'a> Pin<'a> {
         ensure!(
             capacity < free,
             "pin capacity {capacity} >= free device memory {free}"
+        );
+        // One-time bound for `submit_layer`'s fixed 32-slot scratch (checked per
+        // layer only as a debug assertion).
+        ensure!(
+            cfg.top_k + cfg.n_shared <= 32,
+            "top_k {} + n_shared {} exceeds the 32-slot batch scratch",
+            cfg.top_k,
+            cfg.n_shared
         );
         // The static tier holds only the always-resident set; the rest of the
         // budget goes to the routed LRU. Size the tier to the footprint computed
@@ -808,16 +845,23 @@ impl<'a> Pin<'a> {
             prefetch_pending: false,
             inflight: Vec::new(),
             slot_collisions: 0,
+            #[cfg(feature = "trace")]
             last_hit: Vec::new(),
             predicted: Vec::new(),
             predicted_layer: usize::MAX,
             hits: 0,
             misses: 0,
+            #[cfg(feature = "trace")]
             pred_total: 0,
+            #[cfg(feature = "trace")]
             pred_correct: 0,
+            #[cfg(feature = "trace")]
             prefetch_wait_ns: 0,
+            #[cfg(feature = "trace")]
             pf_alloc_ns: 0,
+            #[cfg(feature = "trace")]
             pf_queue_ns: 0,
+            #[cfg(feature = "trace")]
             pf_submit_ns: 0,
             trace: trace_path
                 .map(|p| -> Result<_> {
@@ -834,9 +878,10 @@ impl<'a> Pin<'a> {
         &self.moe_bias[layer - self.cfg.dense_layers]
     }
 
-    /// `(loaded, preloading, cold, pf_evict_unused)` — where routed experts' bytes
-    /// came from. `hits` alone conflates the first two, so it reports a prefetched
-    /// disk read as if it were residency; only `loaded` is I/O-free.
+    /// `(loaded, preloading, cold, pf_evict_unused, pf_evict_then_missed)` —
+    /// where routed experts' bytes came from. `trace` builds only: the split is
+    /// what the pool's HashSet accounting exists to produce.
+    #[cfg(feature = "trace")]
     pub fn source_split(&self) -> (u64, u64, u64, u64, u64) {
         (
             self.pool.hit_loaded,
@@ -871,7 +916,9 @@ impl<'a> Pin<'a> {
         let sparse = (layer - cfg.dense_layers) * cfg.n_experts; // moe_table row base
         // `sel` is one layer's routed pick (top_k + shared); a fixed slot scratch
         // avoids a per-layer alloc, mirroring `cache::access_batch`'s 32-wide buffer.
-        ensure!(
+        // The bound is cfg-derived and checked once at `build`; per-layer it is a
+        // debug assertion only.
+        debug_assert!(
             sel.len() <= 32,
             "submit_layer: {} experts exceeds the 32-slot scratch",
             sel.len()
@@ -897,12 +944,18 @@ impl<'a> Pin<'a> {
         // buys an invariant that needs no pinning machinery to hold.
         if self.prefetch_pending {
             if let Some(s) = self.prefetch_stream.as_mut() {
+                #[cfg(feature = "trace")]
                 let t = std::time::Instant::now();
                 s.drain()?;
-                self.prefetch_wait_ns += t.elapsed().as_nanos();
+                #[cfg(feature = "trace")]
+                {
+                    self.prefetch_wait_ns += t.elapsed().as_nanos();
+                }
             }
             self.prefetch_pending = false;
             // Recall: how many predicted experts are in this layer's actual `sel`.
+            // An O(depth x top_k) scan feeding only the end-of-run recall line.
+            #[cfg(feature = "trace")]
             if self.predicted_layer == layer {
                 let hit = self.predicted.iter().filter(|e| sel.contains(e)).count();
                 self.pred_total += self.predicted.len() as u64;
@@ -942,12 +995,18 @@ impl<'a> Pin<'a> {
         // force a needless re-stream and understate the hit rate). `None` marks a
         // slot still to be filled in phase 1b.
         let mut slots: [Option<usize>; 32] = [None; 32];
-        self.last_hit.clear();
-        self.last_hit.resize(sel.len(), false);
+        #[cfg(feature = "trace")]
+        {
+            self.last_hit.clear();
+            self.last_hit.resize(sel.len(), false);
+        }
         for (i, &e) in sel.iter().enumerate() {
             if let Some(slot) = self.pool.get(expert_key(layer, e)) {
                 self.hits += 1;
-                self.last_hit[i] = true;
+                #[cfg(feature = "trace")]
+                {
+                    self.last_hit[i] = true;
+                }
                 // Hits must survive phase 1b's evictions: `slots[i]` (and the
                 // descriptor built from it) stays live for the whole layer.
                 self.pool.protect(expert_key(layer, e));
@@ -1124,15 +1183,20 @@ impl<'a> Pin<'a> {
         #[cfg(debug_assertions)]
         let inflight = &self.inflight; // disjoint field borrow, alongside `pool`
         let mut queued = 0usize;
+        #[cfg(feature = "trace")]
         let (mut alloc_ns, mut queue_ns) = (0u128, 0u128);
         for &e in pred {
             let key = expert_key(layer, e);
             if pool.contains(key) {
                 continue; // already resident — no fetch needed
             }
+            #[cfg(feature = "trace")]
             let t = std::time::Instant::now();
             let slot = pool.alloc_cold(key)?;
-            alloc_ns += t.elapsed().as_nanos();
+            #[cfg(feature = "trace")]
+            {
+                alloc_ns += t.elapsed().as_nanos();
+            }
             // The disjointness argument above, checked: this prefetch read must never
             // target a slot the demand batch is still filling.
             #[cfg(debug_assertions)]
@@ -1141,18 +1205,29 @@ impl<'a> Pin<'a> {
                 "prefetch slot {slot} collides with an in-flight demand read"
             );
             let entry = &table[sparse + e];
+            #[cfg(feature = "trace")]
             let t = std::time::Instant::now();
             stream_expert(stream, entry, slot_dst, slab, slot, expert_slot)?;
-            queue_ns += t.elapsed().as_nanos();
+            #[cfg(feature = "trace")]
+            {
+                queue_ns += t.elapsed().as_nanos();
+            }
             queued += 1;
         }
-        self.pf_alloc_ns += alloc_ns;
-        self.pf_queue_ns += queue_ns;
+        #[cfg(feature = "trace")]
+        {
+            self.pf_alloc_ns += alloc_ns;
+            self.pf_queue_ns += queue_ns;
+        }
         if queued > 0 {
             // Kick the reads off NOW so they overlap this layer's compute.
+            #[cfg(feature = "trace")]
             let t = std::time::Instant::now();
             stream.submit()?;
-            self.pf_submit_ns += t.elapsed().as_nanos();
+            #[cfg(feature = "trace")]
+            {
+                self.pf_submit_ns += t.elapsed().as_nanos();
+            }
             self.prefetch_pending = true;
         }
         Ok(())

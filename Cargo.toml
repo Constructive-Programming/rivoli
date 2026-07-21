@@ -24,6 +24,11 @@ tracing-opentelemetry = "0.28"
 [features]
 default = []
 rocm = []          # build.rs compiles kernels/*.hip via hipcc when enabled
+# Per-op instrumentation for perf tuning: the PROFILE report + its bucket-
+# boundary syncs, the pin/stream timers, hit-source/prefetch-waste stats, the
+# windowed tok/s log, and the checksum diagnostics. Off by default — a
+# production build carries none of it. Tune with `--features rocm,trace`.
+trace = []
 
 [lints.clippy]
 unwrap_used = "deny"

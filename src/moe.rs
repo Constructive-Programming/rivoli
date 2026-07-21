@@ -12,7 +12,7 @@
 use crate::math::{silu, topk_into};
 use crate::model::ModelConfig;
 use crate::quant::{matvec_f32_bytes, matvec_i4, read_f32};
-use crate::snapshot::{Dtype, Snapshot};
+use crate::snapshot::{Dtype, Int4Matrix, Snapshot};
 use anyhow::{Result, ensure};
 
 /// Upper bound on top-k so the routed-expert loop uses stack arrays (avoids
@@ -44,73 +44,121 @@ impl MlpScratch {
     }
 }
 
-/// One SwiGLU expert/MLP: `out += weight * down(silu(gate·x) ⊙ up·x)`, reading
-/// the three int4 projections at `base` (`<base>.gate_proj` etc). `inter` is
-/// the intermediate width. Accumulates into `out` scaled by `weight`.
-fn swiglu_accum(
-    snap: &Snapshot,
-    base: &str,
-    x: &[f32],
+/// One SwiGLU MLP's three int4 projections, resolved and width-validated ONCE
+/// at engine construction (the old per-token format! + HashMap re-resolution).
+pub struct MlpWeights<'a> {
+    gate: Int4Matrix<'a>,
+    up: Int4Matrix<'a>,
+    down: Int4Matrix<'a>,
     inter: usize,
-    weight: f32,
-    scratch: &mut MlpScratch,
-    out: &mut [f32],
-) -> Result<()> {
-    let hidden = x.len();
-    // gate/up project hidden→inter (i_dim=hidden); down projects inter→hidden.
-    let gate_w = snap.int4(&format!("{base}.gate_proj"), hidden)?;
-    let up_w = snap.int4(&format!("{base}.up_proj"), hidden)?;
-    let down_w = snap.int4(&format!("{base}.down_proj"), inter)?;
-    // Widths must match the scratch slices; a mismatch would silently truncate
-    // via zip in release, so fail loudly at the boundary instead.
-    anyhow::ensure!(
-        gate_w.o_dim == inter && up_w.o_dim == inter && down_w.o_dim == hidden,
-        "{base}: projection width mismatch (gate {} up {} down {} vs inter {inter} hidden {hidden})",
-        gate_w.o_dim,
-        up_w.o_dim,
-        down_w.o_dim
-    );
-    let g = &mut scratch.gate[..inter];
-    let u = &mut scratch.up[..inter];
-    matvec_i4(g, x, &gate_w);
-    matvec_i4(u, x, &up_w);
+}
+
+impl<'a> MlpWeights<'a> {
+    /// Locate + validate the three projections at `base` (`<base>.gate_proj`
+    /// etc). `inter` is the intermediate width.
+    pub fn load(snap: &'a Snapshot, base: &str, hidden: usize, inter: usize) -> Result<Self> {
+        // gate/up project hidden→inter (i_dim=hidden); down projects inter→hidden.
+        let gate = snap.int4(&format!("{base}.gate_proj"), hidden)?;
+        let up = snap.int4(&format!("{base}.up_proj"), hidden)?;
+        let down = snap.int4(&format!("{base}.down_proj"), inter)?;
+        // Widths must match the scratch slices; a mismatch would silently truncate
+        // via zip in release, so fail loudly at the boundary instead.
+        ensure!(
+            gate.o_dim == inter && up.o_dim == inter && down.o_dim == hidden,
+            "{base}: projection width mismatch (gate {} up {} down {} vs inter {inter} hidden {hidden})",
+            gate.o_dim,
+            up.o_dim,
+            down.o_dim
+        );
+        Ok(Self {
+            gate,
+            up,
+            down,
+            inter,
+        })
+    }
+}
+
+/// One MoE layer's resolved weights: the router gate + bias, all routed
+/// experts, and the shared expert.
+pub struct MoeWeights<'a> {
+    /// Router gate F32 bytes `[n_experts, hidden]` (read inline from mmap).
+    gate: &'a [u8],
+    bias: Vec<f32>,
+    experts: Vec<MlpWeights<'a>>,
+    shared: MlpWeights<'a>,
+}
+
+impl<'a> MoeWeights<'a> {
+    pub fn load(snap: &'a Snapshot, cfg: &ModelConfig, layer: usize) -> Result<Self> {
+        let lbase = format!("model.layers.{layer}.mlp");
+        let gate = snap.typed(&format!("{lbase}.gate.weight"), Dtype::F32)?;
+        let bias =
+            read_f32(snap.typed(&format!("{lbase}.gate.e_score_correction_bias"), Dtype::F32)?);
+        ensure!(
+            bias.len() == cfg.n_experts,
+            "{lbase}.gate.e_score_correction_bias has {} entries, expected {}",
+            bias.len(),
+            cfg.n_experts
+        );
+        let experts = (0..cfg.n_experts)
+            .map(|e| {
+                MlpWeights::load(
+                    snap,
+                    &format!("{lbase}.experts.{e}"),
+                    cfg.hidden,
+                    cfg.moe_inter,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let shared = MlpWeights::load(
+            snap,
+            &format!("{lbase}.shared_experts"),
+            cfg.hidden,
+            cfg.moe_inter * cfg.n_shared,
+        )?;
+        Ok(Self {
+            gate,
+            bias,
+            experts,
+            shared,
+        })
+    }
+}
+
+/// One SwiGLU expert/MLP: `out += weight * down(silu(gate·x) ⊙ up·x)` from the
+/// resolved projections `w`. Accumulates into `out` scaled by `weight`.
+fn swiglu_accum(w: &MlpWeights, x: &[f32], weight: f32, scratch: &mut MlpScratch, out: &mut [f32]) {
+    let g = &mut scratch.gate[..w.inter];
+    let u = &mut scratch.up[..w.inter];
+    matvec_i4(g, x, &w.gate);
+    matvec_i4(u, x, &w.up);
     for (gi, &ui) in g.iter_mut().zip(u.iter()) {
         *gi = silu(*gi) * ui;
     }
-    matvec_i4(&mut scratch.expert_out, g, &down_w);
+    matvec_i4(&mut scratch.expert_out, g, &w.down);
     for (o, &e) in out.iter_mut().zip(scratch.expert_out.iter()) {
         *o += weight * e;
     }
-    Ok(())
 }
 
 /// Dense SwiGLU MLP for a pre-MoE layer (`layer < dense_layers`). Writes the
 /// full hidden output into `out`.
-pub fn dense_mlp(
-    snap: &Snapshot,
-    cfg: &ModelConfig,
-    layer: usize,
-    x: &[f32],
-    scratch: &mut MlpScratch,
-    out: &mut [f32],
-) -> Result<()> {
+pub fn dense_mlp(w: &MlpWeights, x: &[f32], scratch: &mut MlpScratch, out: &mut [f32]) {
     out.fill(0.0);
-    let base = format!("model.layers.{layer}.mlp");
-    swiglu_accum(snap, &base, x, cfg.dense_inter, 1.0, scratch, out)
+    swiglu_accum(w, x, 1.0, scratch, out);
 }
 
 /// Sigmoid-gated MoE block for a layer (`layer >= dense_layers`): routed top-k
 /// experts + the shared expert. Writes the full hidden output into `out`.
 pub fn moe_block(
-    snap: &Snapshot,
     cfg: &ModelConfig,
-    layer: usize,
+    w: &MoeWeights,
     x: &[f32],
     scratch: &mut MlpScratch,
     out: &mut [f32],
 ) -> Result<()> {
     out.fill(0.0);
-    let lbase = format!("model.layers.{layer}.mlp");
 
     // Router gate (F32) → sigmoid scores (in scratch.logits) + correction bias
     // for selection (scratch.choice). Gate read inline from mmap bytes.
@@ -119,19 +167,11 @@ pub fn moe_block(
         "top_k {} exceeds MAX_TOPK",
         cfg.top_k
     );
-    let gate_bytes = snap.typed(&format!("{lbase}.gate.weight"), Dtype::F32)?;
-    let bias = read_f32(snap.typed(&format!("{lbase}.gate.e_score_correction_bias"), Dtype::F32)?);
-    ensure!(
-        bias.len() == cfg.n_experts,
-        "{lbase}.gate.e_score_correction_bias has {} entries, expected {}",
-        bias.len(),
-        cfg.n_experts
-    );
-    matvec_f32_bytes(&mut scratch.logits, x, gate_bytes, cfg.hidden);
+    matvec_f32_bytes(&mut scratch.logits, x, w.gate, cfg.hidden);
     for l in scratch.logits.iter_mut() {
         *l = crate::math::sigmoid(*l); // logits now hold sigmoid SCORES
     }
-    for ((c, &s), &b) in scratch.choice.iter_mut().zip(&scratch.logits).zip(&bias) {
+    for ((c, &s), &b) in scratch.choice.iter_mut().zip(&scratch.logits).zip(&w.bias) {
         *c = s + b;
     }
     topk_into(&scratch.choice, cfg.top_k, &mut scratch.sel);
@@ -141,39 +181,29 @@ pub fn moe_block(
     // ORIGINAL sigmoid score; sum-normalize (norm_topk_prob) then scale.
     let ke = scratch.sel.len();
     let mut sel = [0usize; MAX_TOPK];
-    let mut w = [0.0f32; MAX_TOPK];
+    let mut wt = [0.0f32; MAX_TOPK];
     let mut sm = 0.0f32;
     for (i, &e) in scratch.sel.iter().enumerate() {
         sel[i] = e;
-        w[i] = scratch.logits[e];
-        sm += w[i];
+        wt[i] = scratch.logits[e];
+        sm += wt[i];
     }
     if cfg.norm_topk_prob {
         sm += 1e-20;
-        for wi in w[..ke].iter_mut() {
+        for wi in wt[..ke].iter_mut() {
             *wi /= sm;
         }
     }
-    for wi in w[..ke].iter_mut() {
+    for wi in wt[..ke].iter_mut() {
         *wi *= cfg.routed_scale as f32;
     }
 
     for i in 0..ke {
-        let base = format!("{lbase}.experts.{}", sel[i]);
-        swiglu_accum(snap, &base, x, cfg.moe_inter, w[i], scratch, out)?;
+        swiglu_accum(&w.experts[sel[i]], x, wt[i], scratch, out);
     }
     // Shared expert(s), always on (weight 1). The shared MLP's intermediate
     // width is moe_inter × n_shared (HF Glm4MoeMLP / colibri glm.c).
-    let shared = format!("{lbase}.shared_experts");
-    swiglu_accum(
-        snap,
-        &shared,
-        x,
-        cfg.moe_inter * cfg.n_shared,
-        1.0,
-        scratch,
-        out,
-    )?;
+    swiglu_accum(&w.shared, x, 1.0, scratch, out);
     Ok(())
 }
 

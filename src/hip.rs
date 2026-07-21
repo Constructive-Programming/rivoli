@@ -267,7 +267,7 @@ pub unsafe fn launch_attend(
     clat: *mut f32,
     partial: *mut f32,
 ) -> Result<()> {
-    anyhow::ensure!(
+    debug_assert!(
         h <= i32::MAX as usize
             && nr <= i32::MAX as usize
             && kvl <= i32::MAX as usize
@@ -322,7 +322,7 @@ pub unsafe fn launch_attend_fp8(
     clat: *mut f32,
     partial: *mut f32,
 ) -> Result<()> {
-    anyhow::ensure!(
+    debug_assert!(
         h <= i32::MAX as usize
             && nr <= i32::MAX as usize
             && kvl <= i32::MAX as usize
@@ -373,7 +373,7 @@ pub unsafe fn launch_append_kv_fp8(
     ropn: usize,
     n_blocks: usize,
 ) -> Result<()> {
-    anyhow::ensure!(
+    debug_assert!(
         pos <= i32::MAX as usize
             && kvl <= i32::MAX as usize
             && ropn <= i32::MAX as usize
@@ -435,7 +435,7 @@ pub unsafe fn launch_moe(
     partial: *mut f32,
     out: *mut f32,
 ) -> Result<()> {
-    anyhow::ensure!(
+    debug_assert!(
         hidden <= i32::MAX as usize && inter <= i32::MAX as usize && e <= i32::MAX as usize,
         "moe dims exceed i32 (hidden={hidden} inter={inter} e={e})"
     );
@@ -474,7 +474,7 @@ pub unsafe fn launch_gemv_i4(
     i_dim: usize,
     y: *mut f32,
 ) -> Result<()> {
-    anyhow::ensure!(
+    debug_assert!(
         o_dim <= i32::MAX as usize && i_dim <= i32::MAX as usize,
         "gemv_i4 dims exceed i32 (o={o_dim} i={i_dim})"
     );
@@ -500,7 +500,7 @@ pub unsafe fn launch_gemv_i8(
     i_dim: usize,
     y: *mut f32,
 ) -> Result<()> {
-    anyhow::ensure!(
+    debug_assert!(
         o_dim <= i32::MAX as usize && i_dim <= i32::MAX as usize,
         "gemv_i8 dims exceed i32 (o={o_dim} i={i_dim})"
     );
@@ -523,7 +523,7 @@ pub unsafe fn launch_gemv_f32(
     i_dim: usize,
     y: *mut f32,
 ) -> Result<()> {
-    anyhow::ensure!(
+    debug_assert!(
         o_dim <= i32::MAX as usize && i_dim <= i32::MAX as usize,
         "gemv_f32 dims exceed i32 (o={o_dim} i={i_dim})"
     );
@@ -545,7 +545,7 @@ pub unsafe fn launch_rmsnorm(
     eps: f32,
     y: *mut f32,
 ) -> Result<()> {
-    anyhow::ensure!(n <= i32::MAX as usize, "rmsnorm n exceeds i32 ({n})");
+    debug_assert!(n <= i32::MAX as usize, "rmsnorm n exceeds i32 ({n})");
     // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
     let r = unsafe { rivoli_rmsnorm(x, w, n as i32, eps, y) };
     check(r, "launch_rmsnorm")
@@ -567,7 +567,7 @@ pub unsafe fn launch_rope(
     pos: usize,
     theta: f64,
 ) -> Result<()> {
-    anyhow::ensure!(
+    debug_assert!(
         count <= i32::MAX as usize
             && stride <= i32::MAX as usize
             && seg <= i32::MAX as usize
@@ -610,7 +610,7 @@ pub unsafe fn launch_mla_absorb(
     kvl: usize,
     qabs: *mut f32,
 ) -> Result<()> {
-    anyhow::ensure!(
+    debug_assert!(
         h <= i32::MAX as usize
             && qh <= i32::MAX as usize
             && nope <= i32::MAX as usize
@@ -656,7 +656,7 @@ pub unsafe fn launch_mla_value(
     kvl: usize,
     ctx: *mut f32,
 ) -> Result<()> {
-    anyhow::ensure!(
+    debug_assert!(
         h <= i32::MAX as usize
             && nope <= i32::MAX as usize
             && vh <= i32::MAX as usize
@@ -693,7 +693,7 @@ pub unsafe fn launch_embed_i8_row(
     hidden: usize,
     x: *mut f32,
 ) -> Result<()> {
-    anyhow::ensure!(
+    debug_assert!(
         token <= i32::MAX as usize && hidden <= i32::MAX as usize,
         "embed dims exceed i32"
     );
@@ -718,7 +718,7 @@ pub unsafe fn launch_append_kv(
     kvl: usize,
     ropn: usize,
 ) -> Result<()> {
-    anyhow::ensure!(
+    debug_assert!(
         pos <= i32::MAX as usize && kvl <= i32::MAX as usize && ropn <= i32::MAX as usize,
         "append_kv dims exceed i32"
     );
@@ -743,7 +743,7 @@ pub unsafe fn launch_gather_rope(
     nope: usize,
     ropn: usize,
 ) -> Result<()> {
-    anyhow::ensure!(
+    debug_assert!(
         h <= i32::MAX as usize
             && qh <= i32::MAX as usize
             && nope <= i32::MAX as usize
@@ -762,7 +762,7 @@ pub unsafe fn launch_gather_rope(
 /// [`device_sync`] returns.
 #[cfg(feature = "rocm")]
 pub unsafe fn launch_vadd(x: *mut f32, y: *const f32, n: usize) -> Result<()> {
-    anyhow::ensure!(n <= i32::MAX as usize, "vadd n exceeds i32 ({n})");
+    debug_assert!(n <= i32::MAX as usize, "vadd n exceeds i32 ({n})");
     // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
     let r = unsafe { rivoli_vadd(x, y, n as i32) };
     check(r, "launch_vadd")
@@ -784,7 +784,7 @@ pub unsafe fn launch_argmax(
     out_idx: *mut i32,
     out_val: *mut f32,
 ) -> Result<()> {
-    anyhow::ensure!(n <= i32::MAX as usize, "argmax n exceeds i32 ({n})");
+    debug_assert!(n <= i32::MAX as usize, "argmax n exceeds i32 ({n})");
     // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
     let r = unsafe { rivoli_argmax(logits, n as i32, out_idx, out_val) };
     check(r, "launch_argmax")
@@ -804,7 +804,7 @@ pub unsafe fn launch_gemv_bf16(
     i_dim: usize,
     y: *mut f32,
 ) -> Result<()> {
-    anyhow::ensure!(
+    debug_assert!(
         o_dim <= i32::MAX as usize && i_dim <= i32::MAX as usize,
         "gemv_bf16 dims exceed i32 (o_dim={o_dim} i_dim={i_dim})"
     );
@@ -828,7 +828,7 @@ pub unsafe fn launch_layernorm(
     eps: f32,
     y: *mut f32,
 ) -> Result<()> {
-    anyhow::ensure!(n <= i32::MAX as usize, "layernorm n exceeds i32 ({n})");
+    debug_assert!(n <= i32::MAX as usize, "layernorm n exceeds i32 ({n})");
     // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
     let r = unsafe { rivoli_layernorm(x, w, b, n as i32, eps, y) };
     check(r, "launch_layernorm")
@@ -847,7 +847,7 @@ pub unsafe fn launch_index_append(
     pos: usize,
     hd: usize,
 ) -> Result<()> {
-    anyhow::ensure!(
+    debug_assert!(
         pos <= i32::MAX as usize && hd <= i32::MAX as usize,
         "index_append dims exceed i32 (pos={pos} hd={hd})"
     );
@@ -879,7 +879,7 @@ pub unsafe fn launch_index_score(
     dscale: f32,
     scores: *mut f32,
 ) -> Result<()> {
-    anyhow::ensure!(
+    debug_assert!(
         nt <= i32::MAX as usize
             && nh <= i32::MAX as usize
             && nact <= i32::MAX as usize
@@ -919,7 +919,7 @@ pub unsafe fn launch_index_pool_push(
     t: usize,
     hd: usize,
 ) -> Result<()> {
-    anyhow::ensure!(
+    debug_assert!(
         t <= i32::MAX as usize && hd <= i32::MAX as usize,
         "index_pool_push dims exceed i32 (t={t} hd={hd})"
     );
@@ -947,7 +947,7 @@ pub unsafe fn launch_index_head_route(
     hd: usize,
     e: *mut f32,
 ) -> Result<()> {
-    anyhow::ensure!(
+    debug_assert!(
         m_blocks <= i32::MAX as usize && nh <= i32::MAX as usize && hd <= i32::MAX as usize,
         "index_head_route dims exceed i32 (m_blocks={m_blocks} nh={nh} hd={hd})"
     );

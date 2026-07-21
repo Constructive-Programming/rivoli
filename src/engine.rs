@@ -6,20 +6,39 @@
 //! the fused GPU kernels are later milestones). Greedy sampling for now — the
 //! M1 gate is coherence, not sampling strategy.
 
-use crate::attn::{AttnMode, AttnScratch, KvCache, attention};
+use crate::attn::{AttnMode, AttnScratch, AttnWeights, KvCache, attention};
 use crate::indexer::Indexer;
 use crate::math::rmsnorm_into_bytes;
 use crate::model::ModelConfig;
-use crate::moe::{MlpScratch, dense_mlp, moe_block};
+use crate::moe::{MlpScratch, MlpWeights, MoeWeights, dense_mlp, moe_block};
 use crate::quant::{dequant_int8_row, matvec_i8};
-use crate::snapshot::{Dtype, Snapshot};
+use crate::snapshot::{Dtype, Int8Matrix, Snapshot};
 use anyhow::{Result, bail, ensure};
 
+/// One layer's MLP weights: dense for the first `dense_layers`, MoE after.
+enum LayerMlp<'a> {
+    Dense(MlpWeights<'a>),
+    Moe(MoeWeights<'a>),
+}
+
+/// One layer's resolved weights — everything `forward` reads, located and
+/// validated once at [`Engine::new`] so the per-token path does no name
+/// building or index probes (the old DEFERRED P3).
+struct LayerWeights<'a> {
+    input_ln: &'a [u8],
+    post_ln: &'a [u8],
+    attn: AttnWeights<'a>,
+    mlp: LayerMlp<'a>,
+}
+
 pub struct Engine<'a> {
-    snap: &'a Snapshot,
     cfg: &'a ModelConfig,
     mode: AttnMode,
-    indexer: Option<Indexer>,
+    indexer: Option<Indexer<'a>>,
+    layers: Vec<LayerWeights<'a>>,
+    embed: Int8Matrix<'a>,
+    lm_head: Int8Matrix<'a>,
+    final_norm: &'a [u8],
     kv: KvCache,
     ascr: AttnScratch,
     mscr: MlpScratch,
@@ -30,9 +49,9 @@ pub struct Engine<'a> {
 }
 
 impl<'a> Engine<'a> {
-    /// Fails at construction (not mid-decode) when a sparse mode is requested
-    /// but the snapshot/config lacks the indexer — the out-idx shard and the
-    /// indexer dims are validated here.
+    /// Fails at construction (not mid-decode) when the snapshot lacks any
+    /// weight the forward pass reads (incl. the out-idx shard for sparse
+    /// modes) — every tensor is located and shape-validated here.
     pub fn new(
         snap: &'a Snapshot,
         cfg: &'a ModelConfig,
@@ -43,11 +62,35 @@ impl<'a> Engine<'a> {
             AttnMode::Dsa | AttnMode::Misa { .. } => Some(Indexer::new(snap, cfg)?),
             AttnMode::Dense | AttnMode::Streaming { .. } => None,
         };
+        let layers = (0..cfg.n_layers)
+            .map(|layer| {
+                let lb = format!("model.layers.{layer}");
+                Ok(LayerWeights {
+                    input_ln: snap.typed(&format!("{lb}.input_layernorm.weight"), Dtype::F32)?,
+                    post_ln: snap
+                        .typed(&format!("{lb}.post_attention_layernorm.weight"), Dtype::F32)?,
+                    attn: AttnWeights::load(snap, cfg, layer)?,
+                    mlp: if layer < cfg.dense_layers {
+                        LayerMlp::Dense(MlpWeights::load(
+                            snap,
+                            &format!("{lb}.mlp"),
+                            cfg.hidden,
+                            cfg.dense_inter,
+                        )?)
+                    } else {
+                        LayerMlp::Moe(MoeWeights::load(snap, cfg, layer)?)
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            snap,
             cfg,
             mode,
             indexer,
+            layers,
+            embed: snap.int8("model.embed_tokens", cfg.hidden)?,
+            lm_head: snap.int8("lm_head", cfg.hidden)?,
+            final_norm: snap.typed("model.norm.weight", Dtype::F32)?,
             kv: KvCache::new(cfg, kv_fp8),
             ascr: AttnScratch::new(cfg),
             mscr: MlpScratch::new(cfg),
@@ -64,19 +107,14 @@ impl<'a> Engine<'a> {
         let cfg = self.cfg;
         let eps = cfg.rms_norm_eps as f32;
 
-        // Embedding (int8 table, validated).
-        let embed = self.snap.int8("model.embed_tokens", cfg.hidden)?;
-        dequant_int8_row(&embed, token as usize, &mut self.x);
+        // Embedding (int8 table, validated at construction).
+        dequant_int8_row(&self.embed, token as usize, &mut self.x);
 
-        for layer in 0..cfg.n_layers {
-            let lb = format!("model.layers.{layer}");
+        for (layer, lw) in self.layers.iter().enumerate() {
             // Attention sublayer: rmsnorm(input_ln) into xn (residual x survives).
-            let in_ln = self
-                .snap
-                .typed(&format!("{lb}.input_layernorm.weight"), Dtype::F32)?;
-            rmsnorm_into_bytes(&mut self.xn, &self.x, in_ln, eps);
+            rmsnorm_into_bytes(&mut self.xn, &self.x, lw.input_ln, eps);
             attention(
-                self.snap,
+                &lw.attn,
                 cfg,
                 layer,
                 &self.xn,
@@ -92,28 +130,10 @@ impl<'a> Engine<'a> {
             }
 
             // MLP sublayer (dense for the first layers, MoE after).
-            let post_ln = self
-                .snap
-                .typed(&format!("{lb}.post_attention_layernorm.weight"), Dtype::F32)?;
-            rmsnorm_into_bytes(&mut self.xn, &self.x, post_ln, eps);
-            if layer < cfg.dense_layers {
-                dense_mlp(
-                    self.snap,
-                    cfg,
-                    layer,
-                    &self.xn,
-                    &mut self.mscr,
-                    &mut self.sub,
-                )?;
-            } else {
-                moe_block(
-                    self.snap,
-                    cfg,
-                    layer,
-                    &self.xn,
-                    &mut self.mscr,
-                    &mut self.sub,
-                )?;
+            rmsnorm_into_bytes(&mut self.xn, &self.x, lw.post_ln, eps);
+            match &lw.mlp {
+                LayerMlp::Dense(w) => dense_mlp(w, &self.xn, &mut self.mscr, &mut self.sub),
+                LayerMlp::Moe(w) => moe_block(cfg, w, &self.xn, &mut self.mscr, &mut self.sub)?,
             }
             for (h, &m) in self.x.iter_mut().zip(&self.sub) {
                 *h += m;
@@ -121,10 +141,8 @@ impl<'a> Engine<'a> {
         }
 
         // Final norm (into xn; x no longer needed) + lm_head → logits.
-        let norm = self.snap.typed("model.norm.weight", Dtype::F32)?;
-        rmsnorm_into_bytes(&mut self.xn, &self.x, norm, eps);
-        let head = self.snap.int8("lm_head", cfg.hidden)?;
-        matvec_i8(&mut self.logits, &self.xn, &head);
+        rmsnorm_into_bytes(&mut self.xn, &self.x, self.final_norm, eps);
+        matvec_i8(&mut self.logits, &self.xn, &self.lm_head);
         Ok(())
     }
 

@@ -24,7 +24,7 @@ use crate::attn::rope_interleave;
 use crate::math::{layernorm, topk_into};
 use crate::model::ModelConfig;
 use crate::quant::{matvec_bf16, read_bf16};
-use crate::snapshot::{Dtype, Snapshot};
+use crate::snapshot::{Bf16Matrix, Dtype, Snapshot};
 use anyhow::{Result, ensure};
 
 /// MISA router block size (pooled tokens per key). The paper's validated
@@ -49,9 +49,22 @@ fn pool_push(pooled: &mut Vec<f32>, k: &[f32], t: usize, hd: usize) {
     }
 }
 
+/// One full layer's indexer weights, resolved (and dim-validated) once at
+/// [`Indexer::new`] — the per-token path is pure math, no name building or
+/// index probes (the old DEFERRED P3).
+struct IdxWeights<'a> {
+    wk: Bf16Matrix<'a>,
+    wq_b: Bf16Matrix<'a>,
+    wproj: Bf16Matrix<'a>,
+    /// k_norm LayerNorm weight+bias, widened bf16→f32 once.
+    kn_w: Vec<f32>,
+    kn_b: Vec<f32>,
+}
+
 /// Per-full-layer indexer key cache + reusable scratch. One instance per
-/// engine; layers index into `kcache` (empty Vec for shared layers).
-pub struct Indexer {
+/// engine; layers index into `kcache` (empty Vec for shared layers). Borrows
+/// the snapshot for the resolved bf16 projections.
+pub struct Indexer<'a> {
     /// Per layer: `true` = full (owns an indexer), `false` = shared.
     full: Vec<bool>,
     /// Per layer, flat bf16 key rows, len = tokens * index_head_dim. Empty for
@@ -64,10 +77,9 @@ pub struct Indexer {
     /// mode is fixed at construction, so DSA runs never maintain it. Empty for
     /// shared layers.
     pooled: Vec<Vec<f32>>,
-    /// Per full layer, the k_norm LayerNorm weight+bias, widened once at
-    /// construction (they never change; loading them per token was the only
-    /// per-step heap allocation in the indexer path). None for shared layers.
-    knorm: Vec<Option<(Vec<f32>, Vec<f32>)>>,
+    /// Per full layer, the resolved weights (see [`IdxWeights`]). None for
+    /// shared layers.
+    weights: Vec<Option<IdxWeights<'a>>>,
     // Scratch (allocation-free per step).
     k: Vec<f32>,      // index_head_dim
     kf: Vec<f32>,     // index_head_dim — one widened cached key row
@@ -84,33 +96,55 @@ pub struct Indexer {
 /// NOT the model's rms_norm_eps (1e-5 for GLM-5.2).
 pub const K_NORM_EPS: f32 = 1e-6;
 
-impl Indexer {
-    pub fn new(snap: &Snapshot, cfg: &ModelConfig) -> Result<Self> {
+impl<'a> Indexer<'a> {
+    pub fn new(snap: &'a Snapshot, cfg: &ModelConfig) -> Result<Self> {
         let full = cfg.indexer_layout()?;
-        let knorm = full
+        let hd = cfg.index_head_dim;
+        let nh = cfg.index_n_heads;
+        let weights = full
             .iter()
             .enumerate()
             .map(|(layer, &is_full)| {
                 if !is_full {
                     return Ok(None);
                 }
-                let base = format!("model.layers.{layer}.self_attn.indexer.k_norm");
-                let w = read_bf16(snap.typed(&format!("{base}.weight"), Dtype::Bf16)?);
-                let b = read_bf16(snap.typed(&format!("{base}.bias"), Dtype::Bf16)?);
+                let base = format!("model.layers.{layer}.self_attn.indexer");
+                let wk = snap.bf16(&format!("{base}.wk.weight"), cfg.hidden)?;
+                let wq_b = snap.bf16(&format!("{base}.wq_b.weight"), cfg.q_lora_rank)?;
+                let wproj = snap.bf16(&format!("{base}.weights_proj.weight"), cfg.hidden)?;
+                ensure!(wk.o_dim == hd, "wk o_dim {} != {hd}", wk.o_dim);
                 ensure!(
-                    w.len() == cfg.index_head_dim && b.len() == cfg.index_head_dim,
-                    "layer {layer} k_norm dims {}/{} != {}",
-                    w.len(),
-                    b.len(),
-                    cfg.index_head_dim
+                    wq_b.o_dim == nh * hd,
+                    "wq_b o_dim {} != {}",
+                    wq_b.o_dim,
+                    nh * hd
                 );
-                Ok(Some((w, b)))
+                ensure!(
+                    wproj.o_dim == nh,
+                    "weights_proj o_dim {} != {nh}",
+                    wproj.o_dim
+                );
+                let kn_w = read_bf16(snap.typed(&format!("{base}.k_norm.weight"), Dtype::Bf16)?);
+                let kn_b = read_bf16(snap.typed(&format!("{base}.k_norm.bias"), Dtype::Bf16)?);
+                ensure!(
+                    kn_w.len() == hd && kn_b.len() == hd,
+                    "layer {layer} k_norm dims {}/{} != {hd}",
+                    kn_w.len(),
+                    kn_b.len(),
+                );
+                Ok(Some(IdxWeights {
+                    wk,
+                    wq_b,
+                    wproj,
+                    kn_w,
+                    kn_b,
+                }))
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             kcache: vec![Vec::new(); full.len()],
             pooled: vec![Vec::new(); full.len()],
-            knorm,
+            weights,
             full,
             topk: Vec::new(),
             k: vec![0.0; cfg.index_head_dim],
@@ -137,7 +171,6 @@ impl Indexer {
     #[allow(clippy::too_many_arguments)]
     pub fn select(
         &mut self,
-        snap: &Snapshot,
         cfg: &ModelConfig,
         layer: usize,
         x: &[f32],
@@ -167,28 +200,14 @@ impl Indexer {
         let nh = cfg.index_n_heads;
         let rope = cfg.qk_rope_head_dim;
         let theta = cfg.rope_theta();
-        let base = format!("model.layers.{layer}.self_attn.indexer");
 
-        // DEFERRED (same P3 as attn.rs): per-token weight re-resolution; the
-        // resolved-tensor table lands with the pin milestone.
-        let wk = snap.bf16(&format!("{base}.wk.weight"), cfg.hidden)?;
-        let wq_b = snap.bf16(&format!("{base}.wq_b.weight"), cfg.q_lora_rank)?;
-        let wproj = snap.bf16(&format!("{base}.weights_proj.weight"), cfg.hidden)?;
-        ensure!(wk.o_dim == hd, "wk o_dim {} != {hd}", wk.o_dim);
-        ensure!(
-            wq_b.o_dim == nh * hd,
-            "wq_b o_dim {} != {}",
-            wq_b.o_dim,
-            nh * hd
-        );
-        ensure!(
-            wproj.o_dim == nh,
-            "weights_proj o_dim {} != {nh}",
-            wproj.o_dim
-        );
-        let (kn_w, kn_b) = self.knorm[layer]
+        // Weights resolved + validated once at construction; matrices are Copy
+        // views, the k_norm Vecs borrow disjoint fields from the scratch below.
+        let iw = self.weights[layer]
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("full layer {layer} missing hoisted k_norm"))?;
+            .ok_or_else(|| anyhow::anyhow!("full layer {layer} missing resolved weights"))?;
+        let (wk, wq_b, wproj) = (iw.wk, iw.wq_b, iw.wproj);
+        let (kn_w, kn_b) = (&iw.kn_w, &iw.kn_b);
 
         // Key for the current token: wk → LayerNorm (eps hardcoded to match
         // the HF reference, see K_NORM_EPS) → RoPE, then cache (bf16). The
