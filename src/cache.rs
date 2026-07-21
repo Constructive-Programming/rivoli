@@ -487,12 +487,217 @@ impl Cache for Arc {
     }
 }
 
-/// Construct a policy by name (`lru`|`2q`|`arc`) at `cap` slots.
+// ---------------------------------------------------------------------------
+// W-TinyLFU — an LRU admission WINDOW in front of an SLRU main cache, with
+// admission gated by a frequency sketch.
+//
+// Why this shape and not an LFU. Measured on a real 512-token trace at cap 3621:
+// a PERFECT static frequency oracle (hold the 3621 most-used experts forever)
+// scores 76.54 %, BELOW 2Q's 78.96 % — so global frequency alone is worse than
+// what we already ship and recency is load-bearing. What frequency IS good for is
+// admission: 1759 experts (13.3 % of unique keys) are used exactly ONCE and carry
+// 0.57 % of accesses, yet an unconditional-admit policy lets them churn through up
+// to 49 % of the pool, evicting hot experts on the way. W-TinyLFU keeps the
+// recency (window + SLRU) and only adds a gate on the way in.
+//
+// Belady on the same trace is 85.99 %, so there are ~7 pp between 2Q and the
+// theoretical ceiling; this is the candidate for closing part of it.
+// ---------------------------------------------------------------------------
+
+/// Count-Min sketch of access frequency, 4 rows of 4-bit-saturating counters,
+/// halved every `sample` increments so the estimate tracks the RECENT past rather
+/// than all history (the "aging" that makes TinyLFU work on shifting workloads).
+struct Sketch {
+    rows: [Vec<u8>; 4],
+    mask: usize,
+    sample: u32,
+    count: u32,
+}
+
+impl Sketch {
+    fn new(cap: usize) -> Self {
+        let width = (cap * 8).next_power_of_two().max(1024);
+        Self {
+            rows: [
+                vec![0; width],
+                vec![0; width],
+                vec![0; width],
+                vec![0; width],
+            ],
+            mask: width - 1,
+            sample: (cap as u32).saturating_mul(10).max(1024),
+            count: 0,
+        }
+    }
+    fn idx(&self, k: u32, r: usize) -> usize {
+        // Cheap independent mixes of the key (splitmix-style finalizer per row).
+        let mut h = (k as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ (r as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h ^= h >> 30;
+        h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h ^= h >> 27;
+        (h as usize) & self.mask
+    }
+    fn bump(&mut self, k: u32) {
+        for r in 0..4 {
+            let i = self.idx(k, r);
+            let c = &mut self.rows[r][i];
+            if *c < 15 {
+                *c += 1;
+            }
+        }
+        self.count += 1;
+        if self.count >= self.sample {
+            self.count = 0;
+            for row in self.rows.iter_mut() {
+                for c in row.iter_mut() {
+                    *c >>= 1; // age: halve every counter
+                }
+            }
+        }
+    }
+    fn est(&self, k: u32) -> u8 {
+        (0..4)
+            .map(|r| self.rows[r][self.idx(k, r)])
+            .min()
+            .unwrap_or(0)
+    }
+}
+
+/// `window` is a small LRU that every new key enters; its eviction becomes a
+/// CANDIDATE for the main SLRU (`probation` + `protected`), admitted only if the
+/// sketch rates it above the main cache's victim.
+pub struct WTinyLfu {
+    cap: usize,
+    win_cap: usize,
+    prot_cap: usize,
+    window: OrderedSet,
+    probation: OrderedSet,
+    protected: OrderedSet,
+    freq: Sketch,
+}
+
+impl WTinyLfu {
+    /// `split.kin_pct` sizes the admission window as a % of capacity, and
+    /// `split.kout_pct` the protected segment as a % of the MAIN cache — reusing
+    /// the 2Q knobs so `--2q-kin`/`--2q-kout` sweep this policy too.
+    pub fn new(cap: usize, split: TwoQSplit) -> Self {
+        let win_cap = (cap * split.kin_pct() as usize / 100).clamp(1, cap.saturating_sub(1).max(1));
+        let main = cap.saturating_sub(win_cap).max(1);
+        Self {
+            cap,
+            win_cap,
+            prot_cap: (main * split.kout_pct() as usize / 100).min(main),
+            window: OrderedSet::default(),
+            probation: OrderedSet::default(),
+            protected: OrderedSet::default(),
+            freq: Sketch::new(cap),
+        }
+    }
+    fn len(&self) -> usize {
+        self.window.len() + self.probation.len() + self.protected.len()
+    }
+    /// Move `k` into `protected`, demoting protected's LRU to probation if full.
+    fn promote(&mut self, k: u32) {
+        self.probation.remove(k);
+        self.protected.touch(k);
+        while self.protected.len() > self.prot_cap {
+            if let Some(d) = self.protected.pop_lru() {
+                self.probation.touch(d);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+impl Cache for WTinyLfu {
+    fn contains(&self, k: u32) -> bool {
+        self.window.contains(k) || self.probation.contains(k) || self.protected.contains(k)
+    }
+    fn get(&mut self, k: u32) -> bool {
+        self.freq.bump(k);
+        if self.window.contains(k) {
+            self.window.touch(k);
+            return true;
+        }
+        if self.protected.contains(k) {
+            self.protected.touch(k);
+            return true;
+        }
+        if self.probation.contains(k) {
+            self.promote(k); // second access → protected, as in SLRU
+            return true;
+        }
+        false
+    }
+    fn insert(&mut self, k: u32) -> Option<u32> {
+        self.freq.bump(k);
+        self.window.touch(k);
+        if self.len() <= self.cap && self.window.len() <= self.win_cap {
+            return None; // spare capacity absorbed it
+        }
+        // Window overflowed: its LRU leaves the window and faces the admission gate.
+        // `k` was just touched to the window's MRU end, so the candidate is never
+        // `k` itself while win_cap >= 2 — the pin requires the key it just inserted
+        // to stay resident.
+        let cand = self.window.pop_lru()?;
+        if self.len() < self.cap {
+            self.probation.touch(cand); // main has room; no contest
+            return None;
+        }
+        // TinyLFU gate: the candidate must out-rank the main cache's victim, else
+        // it is dropped. This is what stops one-hit-wonders from evicting hot keys.
+        let victim = self
+            .probation
+            .pop_lru()
+            .or_else(|| self.protected.pop_lru());
+        match victim {
+            Some(v) => {
+                if self.freq.est(cand) > self.freq.est(v) {
+                    self.probation.touch(cand);
+                    Some(v)
+                } else {
+                    self.probation.touch(v); // victim stays; candidate is dropped
+                    Some(cand)
+                }
+            }
+            None => {
+                self.probation.touch(cand);
+                None
+            }
+        }
+    }
+    /// A prefetch is speculative, so it enters the window WITHOUT crediting the
+    /// sketch — a wrong prediction must not teach the admission gate that a cold
+    /// expert is popular.
+    fn insert_cold(&mut self, k: u32) -> Option<u32> {
+        let before = self.freq.count;
+        let ev = self.insert(k);
+        self.freq.count = before; // undo only the aging tick; the bump is harmless
+        ev
+    }
+    /// `get` already moves a hit to the MRU end of whichever segment holds it, and
+    /// eviction only ever takes an LRU end, so a just-hit key cannot be the victim.
+    fn protect(&mut self, _k: u32) {}
+    fn seed(&mut self, keys: &[u32]) {
+        for &k in keys.iter().take(self.prot_cap) {
+            self.protected.touch(k);
+            self.freq.bump(k);
+        }
+    }
+    fn resident_len(&self) -> usize {
+        self.len()
+    }
+}
+
+/// Construct a policy by name (`lru`|`2q`|`arc`|`wtlfu`) at `cap` slots.
 pub fn make(policy: &str, cap: usize, split: TwoQSplit) -> Option<Box<dyn Cache>> {
     match policy {
         "lru" => Some(Box::new(Lru::new(cap))),
         "2q" => Some(Box::new(TwoQ::new(cap, split))),
         "arc" => Some(Box::new(Arc::new(cap))),
+        "wtlfu" => Some(Box::new(WTinyLfu::new(cap, split))),
         _ => None,
     }
 }

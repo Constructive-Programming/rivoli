@@ -208,7 +208,7 @@ fn main() -> Result<()> {
         "\n{:<10} {:>8} {:>11} {:>8} {:>8}",
         "policy", "loaded", "preloading", "cold", "hit"
     );
-    for pol in ["lru", "2q", "arc"] {
+    for pol in ["lru", "2q", "arc", "wtlfu"] {
         print_row(pol, run(pol, split)?);
     }
     if split != default {

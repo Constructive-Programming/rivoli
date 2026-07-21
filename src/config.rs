@@ -20,7 +20,35 @@ use std::fmt;
 /// this box: ~74 GiB total footprint is clean to 512 tokens, ~92 GiB corrupts. A
 /// 26 GiB reserve keeps the default in the verified-safe zone; raise `--max-mem`
 /// only after confirming a longer safe ceiling on the hardware in hand.
-pub const OS_RESERVE: u64 = 26 << 30;
+pub const OS_RESERVE: u64 = 12 << 30;
+
+/// Hard ceiling on the TOTAL device budget — the always-resident tier plus the
+/// routed-expert pool. This is the safety bound, and it is the one that matters:
+/// the budget is derived from `MemAvailable`, so on a memory-rich boot the OS
+/// reserve alone would size past the point where the driver can no longer durably
+/// back the VMM allocation, at which point decode silently reads back NaN (PLAN.md
+/// records that failure at ~92 GiB total footprint, around token 290).
+///
+/// 88 GiB = ~10 GiB resident tier + ~78 GiB pool (4415 slots on this box), verified
+/// at 512 tokens with a routed-expert workload byte-identical to a small-pool run —
+/// the same corruption check that caught the 2Q eviction bug. That leaves ~4 GiB of
+/// margin under the recorded cliff. Do NOT raise it without re-running that check.
+pub const MAX_BUDGET: u64 = 88 << 30;
+
+/// Runtime override for [`OS_RESERVE`] (`--os-reserve <GiB>`), for re-testing the
+/// pool-size ceiling. The 26 GiB default was set because a ~84 GiB total footprint
+/// measured SLOWER — but the recorded mechanism was OS page reclaim, i.e. the pool
+/// competing with the page cache, and cold-expert reads are O_DIRECT now and never
+/// touch the page cache. That confound is gone and the ceiling deserves re-testing.
+/// The separate hard limit stands: at >= ~92 GiB total the driver cannot durably
+/// back the VMM pool and decode NaNs (see PLAN.md), so stay well under it.
+pub static OS_RESERVE_OVERRIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The effective OS reserve: the override if set, else [`OS_RESERVE`].
+pub fn os_reserve() -> u64 {
+    let v = OS_RESERVE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if v == 0 { OS_RESERVE } else { v }
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -135,11 +163,12 @@ impl Config {
         kv_fp8: bool,
     ) -> Result<Self> {
         let avail = mem_available()?;
-        if avail <= OS_RESERVE {
+        let reserve = os_reserve();
+        if avail <= reserve {
             bail!(
                 "only {:.1} GB available; need more than the {:.0} GB OS reserve",
                 avail as f64 / 1e9,
-                OS_RESERVE as f64 / 1e9
+                reserve as f64 / 1e9
             );
         }
         // Sole-tenant enforcement lives in `device::DeviceTier::new` (the single

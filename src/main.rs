@@ -65,7 +65,7 @@ fn parse_args() -> Result<Args> {
     const USAGE: &str = "usage: rivoli <snapshot-dir> [-bench <tokens>] [--pre-seed] \
          [--direct-vmm-dma] [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc] \
          [--2q-kin <pct>] [--2q-kout <pct>] \
-         [--no-prefetch] [--prefetch-depth <n>] [--max-mem <GiB>] [--buffered-io] \
+         [--no-prefetch] [--prefetch-depth <n>] [--max-mem <GiB>] [--buffered-io] [--os-reserve <GiB>] \
          [--attn auto|dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>] [--kv-fp8]";
     let mut snapshot = None;
     // Defaults are the winning cell of the 512-token depth x policy grid (see
@@ -151,6 +151,18 @@ fn parse_args() -> Result<Args> {
                 a.max_mem = Some(gib << 30);
             }
             "--buffered-io" => a.direct_io = false,
+            "--os-reserve" => {
+                let gib: u64 = args
+                    .next()
+                    .context("--os-reserve requires a GiB integer")?
+                    .parse()
+                    .context("--os-reserve takes an integer number of GiB")?;
+                if gib == 0 {
+                    bail!("--os-reserve must be a positive integer number of GiB");
+                }
+                rivoli::config::OS_RESERVE_OVERRIDE
+                    .store(gib << 30, std::sync::atomic::Ordering::Relaxed);
+            }
             "--attn" => {
                 a.attn = args
                     .next()
@@ -375,18 +387,25 @@ async fn run(cfg: Config) -> Result<()> {
         // lower. The pin splits this into resident tier + LRU. This is the ACTUAL
         // residency budget — the config log carries the bounds, this line the
         // resolved value.
-        use rivoli::config::OS_RESERVE;
+        use rivoli::config::os_reserve;
+        let reserve = os_reserve() as usize;
         const GIB: f64 = (1u64 << 30) as f64;
-        let safe = free.saturating_sub(OS_RESERVE as usize);
+        // MAX_POOL is the load-bearing bound, not the reserve: the pool is sized
+        // from MemAvailable, so on a memory-rich boot the reserve alone would size
+        // past the driver's durable-backing limit and decode would read back NaN.
+        let safe = free
+            .saturating_sub(reserve)
+            .min(rivoli::config::MAX_BUDGET as usize);
         let cap = match cfg.max_mem {
             Some(m) => safe.min(m as usize),
             None => safe,
         };
         info!(
-            "device pool budget {:.1} GiB (free {:.1} GiB − {:.0} GiB OS reserve{})",
+            "device pool budget {:.1} GiB (free {:.1} GiB − {:.0} GiB OS reserve, capped at {:.0} GiB{})",
             cap as f64 / GIB,
             free as f64 / GIB,
-            OS_RESERVE as f64 / GIB,
+            reserve as f64 / GIB,
+            rivoli::config::MAX_BUDGET as f64 / GIB,
             match cfg.max_mem {
                 Some(m) => format!(", capped at --max-mem {:.0} GiB", m as f64 / GIB),
                 None => String::new(),

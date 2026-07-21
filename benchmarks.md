@@ -32,17 +32,20 @@ commands are given with each table.
 ## Current defaults
 
 `--cache-policy 2q --2q-kin 8 --2q-kout 20 --prefetch-depth 1`, prefetch on,
-SQPOLL on both io_uring rings, split-KV attention.
+O_DIRECT cold reads, SQPOLL on both io_uring rings, split-KV attention,
+12 GiB OS reserve capped at an 88 GiB total device budget.
 
 ```
 rivoli /var/db/llama-server/glm52-colibri-int4 -bench 512 --pre-seed
 ```
 ```
-PROFILE/tok: 860ms wall | fetch 678ms 79% (121 miss, 5.60ms/miss, submit 14ms + join 664ms)
-           | attn 89ms 10% | mlp 78ms 9% | lmhead 4ms 1% | route 2ms | other 9ms
-512 tokens in 447.3s — 1.14 tok/s | hit 79.6%
-expert source: loaded 77.4% | preloading 2.2% | cold 20.4%
-disk traffic: 141.4 expert reads/tok (2.67 GB/tok), 3.4% wasted
+device pool budget 88.0 GiB (free 100.0 GiB - 12 GiB OS reserve, capped at 88 GiB)
+routed pool [2q]: 4415 slots (77.9 GiB)
+PROFILE/tok: 577ms wall | fetch 397ms 69% (96 miss, 4.10ms/miss, submit 7ms + join 389ms)
+           | attn 87ms 15% | mlp 76ms 13% | lmhead 4ms 1% | route 3ms | other 10ms
+512 tokens in 300.1s - 1.71 tok/s | hit 83.7%
+expert source: loaded 82.0% | preloading 1.7% | cold 16.3%
+disk traffic: 112.8 expert reads/tok (2.13 GB/tok), 3.4% wasted
 ```
 
 ### RETRACTION — everything below the correctness fix was re-measured (2026-07-21)
@@ -70,10 +73,12 @@ Honest trajectory, all 512 tok, `--pre-seed`, correct decode:
 |---|---|---|---|---|
 | measured baseline, start of 2026-07-20 | 0.90 | 1093 | — | 3.28 |
 | + all kernel + I/O work, defaults tuned on corrupt data | 0.95 | 1037 | 71.7 % | 3.33 |
-| **+ 2Q Kin/Kout re-tuned on a clean trace** | **1.14** | **860** | **77.4 %** | **2.67** |
+| + 2Q Kin/Kout re-tuned on a clean trace | 1.14 | 860 | 77.4 % | 2.67 |
+| + O_DIRECT cold reads | 1.47 | 682 | 77.4 % | 2.67 |
+| **+ pool 3621 -> 4415 slots** | **1.71** | **577** | **82.0 %** | **2.13** |
 
-So the day's honest gain is **0.90 -> 1.14 tok/s (1.27x)**, not the 2.4x this file
-previously claimed. Compute is genuinely down (`attn` 175 -> 89 ms, `mlp` 203 ->
+So the day's honest gain is **0.90 -> 1.71 tok/s (1.90x)**, not the 2.4x this file
+previously claimed on corrupted output. Compute is genuinely down (`attn` 175 -> 89 ms, `mlp` 203 ->
 78 ms); the engine is now overwhelmingly disk-bound at 79 % of wall.
 
 ### Cache configuration, re-decided on a clean trace
@@ -121,6 +126,85 @@ run-to-run noise, but disk traffic is exact and rises monotonically with depth o
 an engine that is 79 % disk-bound. Depth 1 is kept only because the throughput
 difference is not resolvable; **prefetch is a candidate for removal** and should be
 decided by a repeat measurement, not by this single set.
+
+---
+
+## How much residency is left: Belady, and what closes the gap
+
+`docs/probes/` has no harness for this; it is a short script over the trace. Belady
+(evict the entry whose NEXT use is farthest away) is unimplementable online but is
+the exact upper bound for ANY eviction policy, so it says how much room a smarter
+policy could possibly have. 1 pp of hit rate = ~6 expert reads/token = ~25 ms.
+
+| cap | OPT (Belady) | 2Q tuned | gap |
+|---|---|---|---|
+| 3000 | 83.09 % | 74.37 % | 8.7 pp |
+| 3621 | 85.99 % | 78.96 % | 7.0 pp |
+| **4415 (shipped)** | **88.88 %** | **84.13 %** | **4.75 pp** |
+| 5000 | 90.86 % | 84.74 % | 6.1 pp |
+| 8000 | 95.56 % | 92.27 % | 3.3 pp |
+
+**Do not build an LFU.** A PERFECT static frequency oracle — hold the N most-used
+experts forever — scores 76.54 % at cap 3621, *below* 2Q's 78.96 %. Global frequency
+knowledge alone loses to what we already ship, so recency is load-bearing and the
+Belady gap is not a frequency-estimation problem. It is phase structure: experts run
+hot for a stretch of tokens and then go cold, which only future knowledge exploits.
+
+What frequency IS good for is admission. The reuse distribution is heavy-tailed:
+
+| reuse count | experts | % of unique | % of accesses |
+|---|---|---|---|
+| 1 | 1759 | 13.3 % | **0.57 %** |
+| 1-7 | 5670 | 42.8 % | 5.6 % |
+| 64+ | 1066 | 8.0 % | **45.7 %** |
+
+1759 one-hit-wonders would occupy up to 49 % of the pool while serving 0.57 % of
+traffic, and LRU/2Q/ARC all admit unconditionally on a miss.
+
+**W-TinyLFU: implemented, measured, NOT shipped.** An LRU admission window in front
+of an SLRU main cache, gated by a 4-bit count-min sketch with aging
+(`--cache-policy wtlfu`, window/protected swept via `--2q-kin`/`--2q-kout`).
+
+| cap | best W-TinyLFU (loaded) | 2Q tuned (loaded) |
+|---|---|---|
+| 3621 | 77.76 % (win 8 % / prot 90 %) | 76.70 % |
+| **4415** | **82.52 %** | **82.74 %** |
+
+It wins by 1.06 pp at the OLD capacity and LOSES at the shipped one. Kept
+selectable and documented rather than deleted, because `replay` re-tests it in
+seconds if the capacity or workload changes — but 2Q remains the default.
+
+Also not levers, each measured rather than assumed: per-layer capacity allocation
+(per-layer unique counts are 87-210, median 187, so global sharing is already
+near-right), and workload priming (the `.coli_usage` seed is worth ~0.7 pp at 512
+tokens — 77.4 % seeded vs 76.7 % cold — which independently confirms PLAN.md's
+decision to park it).
+
+---
+
+## Pool capacity — the biggest single residency lever
+
+`OS_RESERVE` was 26 GiB because PLAN.md measured a ~84 GiB footprint as SLOWER,
+"thrash[ing] via OS page reclaim". That mechanism is page-cache contention, and
+cold-expert reads are O_DIRECT now and never touch the page cache — so the
+confound was removed and the ceiling was re-tested:
+
+| OS reserve | slots | loaded | miss/tok | tok/s |
+|---|---|---|---|---|
+| 26 GiB (old default) | 3621 | 77.4 % | 121 | 1.47 |
+| 20 GiB | 3961 | 79.6 % | 109 | 1.58 |
+| 16 GiB | 4188 | 80.9 % | 102 | 1.65 |
+| **12 GiB (new default)** | **4415** | **82.0 %** | **96** | **1.71** |
+
+Monotone, no corruption: a 64-token run at 4415 slots produced a routed-expert
+workload byte-identical to one at 3621 slots.
+
+**The reserve is not the safety bound — `MAX_BUDGET` is.** The budget derives from
+`MemAvailable`, so on a memory-rich boot a reserve alone would size past the point
+where the driver can no longer durably back the VMM pool, and decode reads back NaN
+(PLAN.md: ~92 GiB total, around token 290). The 88 GiB cap holds the footprint at
+the verified point regardless of free memory, with ~4 GiB of margin under the
+recorded cliff.
 
 ---
 
