@@ -237,6 +237,12 @@ pub struct GpuEngine<'a> {
     descs: Vec<ExpertDesc>,
     w: Vec<f32>,
     mlps: Vec<Mlp>,
+    /// DIAGNOSTIC (`--checksum-layer`): hash routed experts on this MoE layer.
+    checksum_layer: Option<usize>,
+    /// DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
+    checksum_x: bool,
+    /// Reused D2H staging for the checksum probe (never allocated when off).
+    ck_buf: Vec<u8>,
     gl_host: Vec<u8>,
     pgl_host: Vec<u8>,
     argmax_host: Vec<u8>,
@@ -390,6 +396,9 @@ impl<'a> GpuEngine<'a> {
             descs: Vec::with_capacity(slots),
             w: Vec::with_capacity(slots),
             mlps: Vec::with_capacity(cfg.top_k),
+            checksum_layer: None,
+            checksum_x: false,
+            ck_buf: Vec::new(),
             gl_host: Vec::with_capacity(cfg.n_experts * 4),
             pgl_host: Vec::with_capacity(cfg.n_experts * 4),
             argmax_host: Vec::with_capacity(8),
@@ -415,6 +424,85 @@ impl<'a> GpuEngine<'a> {
     pub fn misses(&self) -> u64 {
         self.pin.misses
     }
+    /// DIAGNOSTIC: hash every routed expert's weights on this MoE layer after they
+    /// land (`--checksum-layer`). Off by default; see [`Self::dump_expert_checksums`].
+    pub fn set_checksum_layer(&mut self, l: Option<usize>) {
+        self.checksum_layer = l;
+    }
+
+    /// DIAGNOSTIC: hash the residual stream after every layer (`--checksum-x`).
+    pub fn set_checksum_x(&mut self, on: bool) {
+        self.checksum_x = on;
+    }
+
+    /// Hash the three packed weight tensors of each expert routed on layer `l`,
+    /// straight out of the pool slab, and log them keyed by `(layer, expert)`.
+    ///
+    /// The point of the probe: the cache decides only WHERE an expert's bytes live,
+    /// never WHAT they are, so the same `(layer, expert)` must hash identically in
+    /// two runs whose slot assignment differs. It currently does not — decode
+    /// diverges when only `--max-mem` changes — and this pins down whether the bytes
+    /// themselves differ (read-path bug) or are identical (making the divergence
+    /// arithmetic, not data).
+    ///
+    /// `ptr` is logged too because it encodes the slot, so a mismatch can be traced
+    /// back to which slot held the expert.
+    fn dump_expert_checksums(&mut self, l: usize) -> Result<()> {
+        // FNV-1a: order-sensitive over the whole region, so a single stale byte
+        // anywhere in the tensor changes the digest.
+        fn fnv1a(bytes: &[u8]) -> u64 {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for &b in bytes {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x1000_0000_01b3);
+            }
+            h
+        }
+        let cfg = self.cfg;
+        let gate_len = cfg.moe_inter * cfg.hidden.div_ceil(2);
+        let down_len = cfg.hidden * cfg.moe_inter.div_ceil(2);
+        for (i, m) in self.mlps.iter().enumerate() {
+            let e = self.sel.get(i).copied().unwrap_or(usize::MAX);
+            // All SIX reads per expert, not just the three packed tensors: the
+            // per-row f32 scales are separate regions with their own O_DIRECT reads,
+            // and a stale scale perturbs the output exactly as subtly as observed.
+            let mut h = [0u64; 6];
+            for (j, (p, n)) in [
+                (m.gate.packed, gate_len),
+                (m.up.packed, gate_len),
+                (m.down.packed, down_len),
+                (m.gate.scale as *const u8, cfg.moe_inter * 4),
+                (m.up.scale as *const u8, cfg.moe_inter * 4),
+                (m.down.scale as *const u8, cfg.hidden * 4),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                // SAFETY: `p` addresses `n` landed device bytes in the pool slab
+                // (await_layer returned; no kernel live on this stream).
+                unsafe { DeviceBuf::copy_out_raw(p, n, &mut self.ck_buf)? };
+                h[j] = fnv1a(&self.ck_buf);
+            }
+            let src = if self.pin.last_hit.get(i).copied().unwrap_or(false) {
+                "HIT"
+            } else {
+                "MISS"
+            };
+            tracing::info!(
+                "CKSUM l={l} e={e} {src} ptr={:p} gate={:016x} up={:016x} down={:016x} \
+                 gs={:016x} us={:016x} ds={:016x}",
+                m.gate.packed,
+                h[0],
+                h[1],
+                h[2],
+                h[3],
+                h[4],
+                h[5]
+            );
+        }
+        Ok(())
+    }
+
     /// Cross-layer prefetch recall: (predicted experts actually selected, predicted).
     pub fn prefetch_recall(&self) -> (u64, u64) {
         (self.pin.pred_correct, self.pin.pred_total)
@@ -429,6 +517,13 @@ impl<'a> GpuEngine<'a> {
     pub fn source_split(&self) -> (u64, u64, u64, u64, u64) {
         self.pin.source_split()
     }
+    /// Intra-batch slot-reuse collisions caught by `submit_layer`'s guard. Each one
+    /// would have been a silently corrupted expert before the fix; non-zero here is
+    /// the guard doing its job, not a warning.
+    pub fn slot_collisions(&self) -> u64 {
+        self.pin.slot_collisions
+    }
+
     /// Total ms blocked in the prefetch drain (fetch NOT hidden behind compute).
     pub fn prefetch_wait_ms(&self) -> f64 {
         self.pin.prefetch_wait_ns as f64 / 1e6
@@ -860,6 +955,21 @@ impl<'a> GpuEngine<'a> {
                 let t = std::time::Instant::now();
                 device_sync()?; // wait attention+gate (+ L+1 prediction) compute
                 self.prof.attn_ns += t.elapsed().as_nanos();
+                // DIAGNOSTIC: hash the residual AFTER attention but BEFORE the MLP,
+                // so a divergent layer can be attributed to one sublayer or the
+                // other. Paired with the end-of-layer XSUM: xn same + x different
+                // => the MoE diverged; xn already different => attention did.
+                if self.checksum_x {
+                    let n = hidden * 4;
+                    // SAFETY: the sync above retired the attention chain that wrote xn.
+                    unsafe { DeviceBuf::copy_out_raw(self.xn.ptr(), n, &mut self.ck_buf)? };
+                    let mut hh: u64 = 0xcbf2_9ce4_8422_2325;
+                    for &b in self.ck_buf.iter() {
+                        hh ^= b as u64;
+                        hh = hh.wrapping_mul(0x1000_0000_01b3);
+                    }
+                    tracing::info!("XNSUM pos={pos} l={l} xn={hh:016x}");
+                }
                 let t = std::time::Instant::now();
                 // Split borrows: read the gate logits into a reused host buffer, then
                 // route with `bias` borrowed straight out of `&self.pin` while the
@@ -958,6 +1068,15 @@ impl<'a> GpuEngine<'a> {
                 let t = std::time::Instant::now();
                 self.pin.await_layer(batch)?;
                 self.prof.fetch_ns += t.elapsed().as_nanos();
+                // DIAGNOSTIC (`--checksum-layer`): the weights for `sel` are now
+                // fully landed and no kernel is live, so this is the one point where
+                // an expert's bytes can be hashed as the MoE kernel will read them.
+                // Two runs that differ ONLY in slot assignment (e.g. `--max-mem`)
+                // must produce identical hashes for the same (layer,expert) key; a
+                // mismatch localises the divergence to the read path.
+                if self.checksum_layer == Some(l) {
+                    self.dump_expert_checksums(l)?;
+                }
                 // SAFETY: descs point at resident/cold-slot weights valid until
                 // the end-of-layer sync; the cold ones have now landed (`await_layer`).
                 unsafe {
@@ -981,6 +1100,23 @@ impl<'a> GpuEngine<'a> {
             let t = std::time::Instant::now();
             device_sync()?;
             self.prof.mlp_ns += t.elapsed().as_nanos();
+            // DIAGNOSTIC (`--checksum-x`): hash the residual stream after every
+            // layer. Two configs that differ only in slot assignment must produce
+            // identical hashes; the FIRST divergent (pos, layer) is where values
+            // actually start differing, which the routed-expert trace cannot show
+            // (a selection only changes once the drift flips a near-tie).
+            if self.checksum_x {
+                let n = hidden * 4;
+                // SAFETY: `x` is `hidden` f32 of live device scratch; the sync above
+                // retired every kernel writing it.
+                unsafe { DeviceBuf::copy_out_raw(self.x.ptr(), n, &mut self.ck_buf)? };
+                let mut hh: u64 = 0xcbf2_9ce4_8422_2325;
+                for &b in self.ck_buf.iter() {
+                    hh ^= b as u64;
+                    hh = hh.wrapping_mul(0x1000_0000_01b3);
+                }
+                tracing::info!("XSUM pos={pos} l={l} x={hh:016x}");
+            }
         }
 
         // Final norm → lm_head → logits (device); caller reads via argmax.

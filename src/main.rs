@@ -52,6 +52,10 @@ struct Args {
     window: usize,
     misa_heads: usize,
     kv_fp8: bool,
+    /// DIAGNOSTIC (`--checksum-layer <l>`): hash routed experts on MoE layer `l`.
+    checksum_layer: Option<usize>,
+    /// DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
+    checksum_x: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -93,6 +97,8 @@ fn parse_args() -> Result<Args> {
         window: 8192,
         misa_heads: 8, // the MISA paper's validated GLM-5 setting
         kv_fp8: false,
+        checksum_layer: None,
+        checksum_x: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -172,6 +178,15 @@ fn parse_args() -> Result<Args> {
                 }
             }
             "--kv-fp8" => a.kv_fp8 = true,
+            "--checksum-x" => a.checksum_x = true,
+            "--checksum-layer" => {
+                a.checksum_layer = Some(
+                    args.next()
+                        .context("--checksum-layer requires a layer index")?
+                        .parse()
+                        .context("--checksum-layer takes an integer")?,
+                );
+            }
             _ if snapshot.is_none() => snapshot = Some(arg),
             _ => bail!("unexpected argument: {arg}\n{USAGE}"),
         }
@@ -182,6 +197,10 @@ fn parse_args() -> Result<Args> {
 
 fn main() -> Result<()> {
     let a = parse_args()?;
+    // Captured before `a` is consumed by `Config::discover` — this is a diagnostic
+    // knob, not part of the discovered config.
+    let checksum_layer = a.checksum_layer;
+    let checksum_x = a.checksum_x;
     // Zero-knob default: `dsa` (the model's native trained mechanism) when the
     // out-idx indexer shard sits next to the snapshot, `dense` otherwise. Read
     // off the directory rather than the opened Snapshot because the mode is
@@ -212,7 +231,7 @@ fn main() -> Result<()> {
         },
         other => bail!("unknown --attn mode {other:?} (auto|dense|streaming|dsa|misa)"),
     };
-    let cfg = Config::discover(
+    let mut cfg = Config::discover(
         a.snapshot,
         a.bench,
         a.pre_seed,
@@ -228,6 +247,8 @@ fn main() -> Result<()> {
         attn,
         a.kv_fp8,
     )?;
+    cfg.checksum_layer = checksum_layer;
+    cfg.checksum_x = checksum_x;
 
     // Decode is synchronous; tokio owns the feed side only. Worker count is
     // the discovered CPU pool size — never the SMT-logical count.
@@ -391,6 +412,8 @@ async fn run(cfg: Config) -> Result<()> {
         // Wedge watchdog: a hung GPU join can't be caught inside the decode loop, so
         // a background thread aborts the process if no token lands for 60 s (healthy
         // tokens are ~1-2 s here — this only trips on a real device wedge).
+        engine.set_checksum_layer(cfg.checksum_layer);
+        engine.set_checksum_x(cfg.checksum_x);
         engine.set_heartbeat(rivoli::watchdog::spawn(std::time::Duration::from_secs(60))?);
         // One OTLP span per decode run; the per-token/PROFILE/summary events below
         // attach to it, and the top-line metrics are recorded as queryable fields.
@@ -434,6 +457,14 @@ async fn run(cfg: Config) -> Result<()> {
                 100.0 * preloading as f64 / total as f64,
                 100.0 * cold as f64 / total as f64,
             );
+            let coll = engine.slot_collisions();
+            if coll > 0 {
+                info!(
+                    "slot-reuse collisions caught: {coll} ({:.2}/tok) — each would have \
+                     been a silently corrupted expert before the guard",
+                    coll as f64 / ntok,
+                );
+            }
             info!(
                 "disk traffic: {:.1} expert reads/tok ({:.2} GB/tok), of which {:.1}% wasted",
                 reads as f64 / ntok,

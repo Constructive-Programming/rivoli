@@ -178,11 +178,19 @@ pub struct Pin<'a> {
     /// `submit_layer` before its slots are read.
     prefetch_pending: bool,
     /// Slots the demand ring is currently writing (between `submit_layer` and
-    /// `await_layer`). Debug builds only: it turns `prefetch_layer`'s slot-
-    /// disjointness argument into an assertion that fires in the test suite if the
-    /// pool ever hands a live destination to a concurrent prefetch read.
-    #[cfg(debug_assertions)]
+    /// `await_layer`). Load-bearing in release: `submit_layer` phase 1b consults it
+    /// to refuse reusing a slot whose read is still outstanding (the silent
+    /// weight-corruption bug), and it also backs `prefetch_layer`'s slot-
+    /// disjointness assertion in debug builds.
     inflight: Vec<usize>,
+    /// How many times a batch reused a slot whose read was still outstanding —
+    /// each one would have been a silent weight corruption before the guard.
+    pub slot_collisions: u64,
+    /// Per-`sel` index, whether the last `submit_layer` served that expert from
+    /// residency (true) or streamed it (false). Diagnostic for the slot-corruption
+    /// hunt: it says whether a wrong-bytes expert was freshly read or was already
+    /// sitting in the pool with clobbered contents.
+    pub last_hit: Vec<bool>,
     /// The predicted expert set submitted for the layer named in `predicted_layer`
     /// (recall accounting at the matching `submit_layer`).
     predicted: Vec<usize>,
@@ -497,6 +505,12 @@ impl Pool {
         Ok(slot)
     }
 
+    /// Shield a just-hit key from eviction for the rest of this batch (see
+    /// [`cache::Cache::protect`]).
+    fn protect(&mut self, key: u32) {
+        self.policy.protect(key);
+    }
+
     /// Is `key` currently resident in the policy? (Used to skip prefetching an
     /// expert the pool already holds.)
     fn contains(&self, key: u32) -> bool {
@@ -792,8 +806,9 @@ impl<'a> Pin<'a> {
             prefetch_stream,
             prefetch_depth,
             prefetch_pending: false,
-            #[cfg(debug_assertions)]
             inflight: Vec::new(),
+            slot_collisions: 0,
+            last_hit: Vec::new(),
             predicted: Vec::new(),
             predicted_layer: usize::MAX,
             hits: 0,
@@ -923,16 +938,21 @@ impl<'a> Pin<'a> {
         // force a needless re-stream and understate the hit rate). `None` marks a
         // slot still to be filled in phase 1b.
         let mut slots: [Option<usize>; 32] = [None; 32];
+        self.last_hit.clear();
+        self.last_hit.resize(sel.len(), false);
         for (i, &e) in sel.iter().enumerate() {
             if let Some(slot) = self.pool.get(expert_key(layer, e)) {
                 self.hits += 1;
+                self.last_hit[i] = true;
+                // Hits must survive phase 1b's evictions: `slots[i]` (and the
+                // descriptor built from it) stays live for the whole layer.
+                self.pool.protect(expert_key(layer, e));
                 slots[i] = Some(slot);
             }
         }
         // Phase 1b: allocate + QUEUE the misses, now that all hits are protected.
-        // Reset the debug in-flight set here rather than only in `await_layer`, so an
+        // Reset the in-flight set here rather than only in `await_layer`, so an
         // error path that skips the join cannot leave a stale slot recorded.
-        #[cfg(debug_assertions)]
         self.inflight.clear();
         for (i, &e) in sel.iter().enumerate() {
             if slots[i].is_some() {
@@ -940,6 +960,30 @@ impl<'a> Pin<'a> {
             }
             self.misses += 1;
             let slot = self.pool.alloc(expert_key(layer, e))?;
+            // SLOT REUSE WITHIN ONE BATCH — the correctness hazard this guard exists
+            // for. `alloc` may evict a key that an EARLIER miss in this same batch
+            // just inserted, recycling its slot. Both experts' O_DIRECT reads would
+            // then target the same destination, and io_uring completion order is NOT
+            // submission order — so the evicted key's read can land LAST and leave
+            // the slot holding the wrong expert's weights, while `slot_of`/`key_of`
+            // record the new key. The bookkeeping stays self-consistent and the data
+            // is silently wrong.
+            //
+            // Measured before this guard: `2q --no-prefetch --max-mem 50` vs the same
+            // run at full pool diverged at pos=8, layer 31, expert 110 — all six
+            // weight tensors different, correct at five other occurrences of the same
+            // expert. One transient corruption is enough to perturb the residual
+            // stream, reroute experts, and change the whole downstream workload.
+            //
+            // Fix: complete the outstanding reads before reusing their slot. The
+            // earlier read then lands FIRST and this one overwrites it, which is the
+            // correct final state (the evicted key is no longer resident, so nobody
+            // reads its bytes). Costs one extra drain, and only on a real collision.
+            if self.inflight.contains(&slot) {
+                self.stream.drain()?;
+                self.inflight.clear();
+                self.slot_collisions += 1;
+            }
             // ptr_mut() yields a raw ptr, so no borrow of lru_pool is held across
             // the &mut self.stream reads. Table entry + slot_dst are disjoint fields
             // from stream — no alloc, no string hashing, no re-validation per miss.
@@ -954,10 +998,9 @@ impl<'a> Pin<'a> {
                 self.expert_slot,
             )?;
             slots[i] = Some(slot);
-            // Debug-only: record that an O_DIRECT read is writing this slot, so the
-            // disjointness argument that lets `prefetch_layer` allocate while these
-            // reads are in flight is a CHECKED invariant, not just a comment.
-            #[cfg(debug_assertions)]
+            // Record that an O_DIRECT read is writing this slot. Load-bearing in
+            // release now, not just a debug check: the collision guard above reads
+            // it, and it still backs `prefetch_layer`'s disjointness assertion.
             self.inflight.push(slot);
         }
         // Phase 2: hand the whole batch to the kernel NOW, without waiting. With the

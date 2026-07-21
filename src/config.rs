@@ -55,6 +55,12 @@ pub struct Config {
     /// capacity). Ignored by `lru`/`arc`. Unset = [`cache::TwoQSplit::default`],
     /// which reproduces the historical hardcoded `cap/4` / `cap/2` exactly.
     pub two_q: crate::cache::TwoQSplit,
+    /// DIAGNOSTIC (`--checksum-layer <l>`): hash every routed expert's weights on
+    /// MoE layer `l` after they land, keyed by `(layer, expert)`. Set directly by
+    /// `main` rather than discovered — it is a probe, not a tuned knob.
+    pub checksum_layer: Option<usize>,
+    /// DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
+    pub checksum_x: bool,
     /// Cross-layer expert prefetch (`--prefetch`). Default false (baseline). When on,
     /// each MoE layer predicts the NEXT MoE layer's routed experts from its post-attn
     /// residual and submits their cold reads on a second io_uring ring, so the fetch
@@ -157,6 +163,8 @@ impl Config {
             prompt,
             cache_policy,
             two_q,
+            checksum_layer: None,
+            checksum_x: false,
             prefetch,
             prefetch_depth,
             threads,

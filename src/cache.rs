@@ -80,6 +80,20 @@ pub trait Cache {
     fn insert_cold(&mut self, k: u32) -> Option<u32> {
         self.insert(k)
     }
+    /// Make `k` — just reported resident by [`Cache::get`] — safe from eviction by
+    /// a subsequent `insert` in the SAME batch.
+    ///
+    /// The pin resolves a layer two-pass: every hit first, then every miss. That
+    /// ordering is only protective if a `get` moves the key away from the eviction
+    /// end, which is true for `Lru` (touch) and `Arc` (T1->T2 promote) but NOT for
+    /// `TwoQ`: a hit on an A1in entry correctly leaves it in the FIFO, so a later
+    /// `insert` can reclaim it — while the pin still holds its slot in `slots[i]`
+    /// and hands that slot to a miss, whose read then overwrites weights a live
+    /// descriptor points at. MEASURED: 2q at two pool sizes diverged at pos=8,
+    /// layer 31, expert 110 — a HIT whose slot had been reassigned underneath it.
+    ///
+    /// Default is a no-op, correct for any policy whose `get` already promotes.
+    fn protect(&mut self, _k: u32) {}
     fn seed(&mut self, keys: &[u32]);
     fn resident_len(&self) -> usize;
 
@@ -314,6 +328,16 @@ impl Cache for TwoQ {
             self.a1in.touch(k); // first sighting → probation FIFO
         }
         ev
+    }
+    /// A1in is a FIFO and `get` deliberately leaves hits in place, so the pin's
+    /// hits-before-misses ordering does not protect them on its own. Moving an
+    /// accessed entry to the young end of A1in makes it unreclaimable for the rest
+    /// of the batch. This is a deliberate, minimal deviation from strict 2Q, applied
+    /// ONLY to keys the current layer is actively using.
+    fn protect(&mut self, k: u32) {
+        if self.a1in.contains(k) {
+            self.a1in.touch(k);
+        }
     }
     fn insert_cold(&mut self, k: u32) -> Option<u32> {
         // Prefetch: force into A1in probation, NEVER promoting via the A1out ghost —

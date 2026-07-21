@@ -210,6 +210,32 @@ mod tier {
             Ok(())
         }
 
+        /// DIAGNOSTIC: read `len` bytes back from an arbitrary device pointer.
+        ///
+        /// Unlike the other copy_out family this is not tied to a `DeviceBuf` — it
+        /// exists so the expert-checksum probe can hash weights straight out of the
+        /// pool slab, which the engine addresses as raw pointers inside descriptors
+        /// rather than as owned buffers.
+        ///
+        /// # Safety
+        /// `src` must point to at least `len` readable device bytes, and no kernel
+        /// may be concurrently writing them (call after a `device_sync`).
+        pub unsafe fn copy_out_raw(src: *const u8, len: usize, out: &mut Vec<u8>) -> Result<()> {
+            out.clear();
+            out.resize(len, 0);
+            // SAFETY: caller guarantees `src` is readable for `len`; dst has `len`.
+            let e = unsafe {
+                hipMemcpy(
+                    out.as_mut_ptr() as *mut c_void,
+                    src as *const c_void,
+                    len,
+                    HIP_MEMCPY_D2H,
+                )
+            };
+            ensure!(e == HIP_SUCCESS, "hipMemcpy D2H (raw) failed ({e})");
+            Ok(())
+        }
+
         /// Copy the whole buffer back to host as a fresh `Vec` (the ergonomic form;
         /// the per-token decode path uses [`DeviceBuf::copy_out_into`] to reuse a
         /// buffer instead).
