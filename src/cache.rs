@@ -184,20 +184,31 @@ pub struct TwoQSplit {
 }
 
 impl Default for TwoQSplit {
-    /// Tuned by the offline `replay` sweep and confirmed on hardware (benchmarks.md):
-    /// an 11x6 Kin/Kout grid over a real 512-token trace peaks at kin 8 % / kout 100 %,
-    /// 92.21 % predicted -> 92.2 % measured, 2.15 -> 2.33 tok/s.
+    /// Tuned by the offline `replay` sweep on a CLEAN trace (i.e. captured after the
+    /// 2Q mid-layer eviction fix) and confirmed on hardware: predicted 77.56 %
+    /// residency, measured 77.4 %, 0.95 -> 1.14 tok/s at 512 tokens.
     ///
-    /// The shape of that grid is the interesting part: Kout is IRRELEVANT (every
-    /// column is flat to within 0.06 pp — the A1out ghost may as well not exist here),
-    /// while Kin matters and *smaller is better* down to 8 %, falling off again at 3 %.
-    /// Same mechanism as prefetch depth 1 beating depth 2: a tight probation queue
-    /// promotes a prefetched expert into the protected Am set before churn can evict
-    /// it. The historical 25 %/50 % is preserved as `LEGACY_SPLIT` for A/B.
+    /// The optimum is a broad plateau (kin 6-10 % x kout 15-25 %, all within 0.1 pp),
+    /// so these are robust rather than knife-edge. Kout below ~5 % collapses — the
+    /// ghost gets too small to promote anything — but that cliff is far away.
+    ///
+    /// **Kout is the axis that matters**, and small wins: 20 % scores 77.56 % where
+    /// 100 % scores 71.43 %. A large ghost remembers keys evicted long ago, so a
+    /// re-miss on a stale key promotes it into the protected set; with 13k unique
+    /// experts over ~3.6k slots most such re-references are spurious, and the
+    /// protected set fills with one-hit-wonders. A small ghost only promotes keys
+    /// re-referenced RECENTLY, which is a much stronger signal at this breadth.
+    /// (This is also the leading explanation for ARC underperforming here: its B1/B2
+    /// ghosts are full-capacity by construction, pinning it to the bad end of this
+    /// axis with no way to tune off it.)
+    ///
+    /// An EARLIER version of this comment claimed kout was irrelevant and kin was the
+    /// axis. That was measured on a trace corrupted by the 2Q eviction bug; on clean
+    /// data the conclusion inverts. The historical 25 %/50 % is kept as [`Self::LEGACY`].
     fn default() -> Self {
         Self {
             kin_pct: 8,
-            kout_pct: 100,
+            kout_pct: 20,
         }
     }
 }
@@ -659,12 +670,41 @@ mod tests {
         );
     }
 
+    /// Scan resistance is the ALGORITHMIC property 2Q and ARC exist for, and it is
+    /// asserted against 2Q's classical split. It depends on the A1out ghost being big
+    /// enough to still remember the hot key when it is re-referenced after the scan.
     #[test]
     fn twoq_and_arc_survive_scan() {
-        assert!(survives_cold_scan(boxed("2q", 8), 8), "2Q must protect hot");
+        let twoq: Box<dyn Cache> = Box::new(TwoQ::new(8, TwoQSplit::LEGACY));
+        assert!(survives_cold_scan(twoq, 8), "2Q must protect hot");
         assert!(
             survives_cold_scan(boxed("arc", 8), 8),
             "ARC must protect hot"
+        );
+    }
+
+    /// The SHIPPED default deliberately trades that property away, and this records
+    /// the trade rather than letting it disappear silently.
+    ///
+    /// `kout` 20 % beat 100 % by ~6 pp of residency on the measured workload (see
+    /// `TwoQSplit::default`), because at 13k unique experts over ~3.6k slots most
+    /// re-references of long-evicted keys are spurious and promoting them pollutes
+    /// the protected set. The cost is that a small ghost cannot remember a hot key
+    /// across a long scan — at `cap=8` the ghost is a single entry and scan
+    /// resistance is gone entirely.
+    ///
+    /// OVERFITTING RISK, stated plainly: that +6 pp was tuned on ONE prompt's trace.
+    /// A multi-request server workload — the eventual target — has genuine
+    /// cross-request reuse that a large ghost is designed to capture, and this
+    /// default may well be wrong there. Re-tune against a multi-prompt trace before
+    /// trusting it outside the single-prompt bench.
+    #[test]
+    fn shipped_default_trades_scan_resistance_for_residency() {
+        let tuned: Box<dyn Cache> = Box::new(TwoQ::new(8, TwoQSplit::default()));
+        assert!(
+            !survives_cold_scan(tuned, 8),
+            "if the tuned default now survives a cold scan, the residency/scan \
+             trade-off has changed and TwoQSplit::default's rationale needs re-checking"
         );
     }
 

@@ -13,10 +13,17 @@ commands are given with each table.
   This distinction has invalidated conclusions twice; see *Retired claims*.
 - **tok/s comparisons are only valid when the routed expert sequence is fixed.**
   Anything that perturbs f32 rounding changes the sampled tokens, which changes
-  routing, which changes the hit rate, which changes `fetch`. Cache-config A/Bs
-  (policy, depth) are safe — routing is deterministic given the weights. Kernel
-  changes are **not**; compare their `attn`/`mlp` ms buckets instead, which are
-  hit-rate independent.
+  routing, which changes the hit rate, which changes `fetch`. Kernel changes do
+  this; compare their `attn`/`mlp` ms buckets instead, which are hit-rate
+  independent. Cache-config A/Bs (policy, depth, Kin/Kout) ARE safe — but only
+  since commit `f060823`. Before it, a 2Q eviction bug made the cache silently
+  change computed weights, so the workload itself varied with cache settings; see
+  the retraction below.
+- **Check the cache counters before believing any delta.** They are exact, so
+  identical counters across runs prove the workload was identical and any wall-clock
+  difference is environmental. Every wrong conclusion recorded here was caught this
+  way, and one was hidden for hours by a `sort -u` that deduplicated the single
+  differing record.
 - Cache counters are **exact and reproducible** (the two `2q`+depth-1 runs below
   produced byte-identical `loaded`/`cold` counts). Wall-clock carries ~±3 %.
 
@@ -24,160 +31,96 @@ commands are given with each table.
 
 ## Current defaults
 
-`--cache-policy 2q --prefetch-depth 1 --2q-kin 8 --2q-kout 100`, prefetch on,
-SQPOLL on BOTH io_uring rings, split-KV attention.
+`--cache-policy 2q --2q-kin 8 --2q-kout 20 --prefetch-depth 1`, prefetch on,
+SQPOLL on both io_uring rings, split-KV attention.
 
 ```
 rivoli /var/db/llama-server/glm52-colibri-int4 -bench 512 --pre-seed
 ```
 ```
-PROFILE/tok: 458ms wall | fetch 281ms 61% (44 miss, 6.31ms/miss, submit 11ms + join 269ms)
-           | attn 88ms 19% | mlp 74ms 16% | lmhead 5ms 1% | route 2ms | other 9ms
-512 tokens in 242.0s — 2.12 tok/s | hit 92.2%
-expert source: loaded 91.6% | preloading 0.7% | cold 7.8%
-disk traffic: 52.2 expert reads/tok (0.99 GB/tok), 2.3% wasted
+PROFILE/tok: 860ms wall | fetch 678ms 79% (121 miss, 5.60ms/miss, submit 14ms + join 664ms)
+           | attn 89ms 10% | mlp 78ms 9% | lmhead 4ms 1% | route 2ms | other 9ms
+512 tokens in 447.3s — 1.14 tok/s | hit 79.6%
+expert source: loaded 77.4% | preloading 2.2% | cold 20.4%
+disk traffic: 141.4 expert reads/tok (2.67 GB/tok), 3.4% wasted
 ```
 
-Trajectory over 2026-07-20/21, same command, 512 tok:
+### RETRACTION — everything below the correctness fix was re-measured (2026-07-21)
+
+An earlier revision of this file reported **2.12-2.33 tok/s at 91.8-92.2 %
+residency**. Those numbers were produced by a build with a silent
+weight-corruption bug (commit `f060823`): `TwoQ::get` reports a hit on an A1in
+entry without moving it, so the pin's hits-before-misses ordering did not protect
+it, and a same-layer miss could reassign its slot underneath a live descriptor.
+
+The corruption perturbed the token stream into a **different, much easier
+workload** — 10 994 unique experts instead of 13 259 — and the high hit rate was
+real for that stream. It just was not the model's actual output. **The bug was
+2Q-only**; LRU and ARC promote on `get` and were never affected, so their
+historical numbers stand.
+
+Retracted: the "2q + depth 1 sharp peak", the 91.8 %/92.2 % residency figures, the
+first Kin/Kout sweep (run against a corrupted trace), and every tok/s number
+derived from them. **Not** affected, because they move hit-rate-independent
+buckets: the int4 GEMV vectorisation, split-KV attention, and the SQPOLL work.
+
+Honest trajectory, all 512 tok, `--pre-seed`, correct decode:
 
 | state | tok/s | ms/tok | loaded | GB/tok |
 |---|---|---|---|---|
-| M4 gate as recorded in PLAN.md | 1.31 | 763 | — | — |
-| measured baseline before this work | 0.90 | 1093 | — | — |
-| + vectorised int4 kernels | 0.96 | 1033 | 71.3 % | 3.28 |
-| + SQPOLL prefetch ring, 2q, depth 1 | 1.99 | 488 | 91.8 % | 0.96 |
-| + SQPOLL demand ring + split-KV attn | 2.12 | 458 | 91.6 % | 0.99 |
-| + swept 2Q Kin/Kout (8 %/100 %) | **2.10–2.33** | **416–462** | **92.2 %** | **0.95** |
+| measured baseline, start of 2026-07-20 | 0.90 | 1093 | — | 3.28 |
+| + all kernel + I/O work, defaults tuned on corrupt data | 0.95 | 1037 | 71.7 % | 3.33 |
+| **+ 2Q Kin/Kout re-tuned on a clean trace** | **1.14** | **860** | **77.4 %** | **2.67** |
 
-**~2.4x over the day.** Note the two halves: the kernel work took compute from
-481 to 174 ms/token, and the I/O work took `fetch` from ~600 to 281 ms while
-cutting disk traffic 3.7x. Neither alone would have crossed 2 tok/s.
+So the day's honest gain is **0.90 -> 1.14 tok/s (1.27x)**, not the 2.4x this file
+previously claimed. Compute is genuinely down (`attn` 175 -> 89 ms, `mlp` 203 ->
+78 ms); the engine is now overwhelmingly disk-bound at 79 % of wall.
 
-### Parallel-agent validation round (2026-07-21)
+### Cache configuration, re-decided on a clean trace
 
-Five candidate optimisations, each built in an isolated worktree, then validated
-serially (the GPU is sole-tenant and the NVMe is shared — see *Measurement
-hygiene*). 512 tok, defaults + `--pre-seed`, quiet machine:
+Policy, at cap 3621 with the tuned split unavailable to LRU/ARC:
 
-| candidate | wall | fetch (miss) | attn | mlp | loaded | tok/s | verdict |
-|---|---|---|---|---|---|---|---|
-| baseline | 488 | 287 (43) | 113 | 71 | 91.8 % | 1.99 | — |
-| demand-ring SQPOLL | 465 | 261 (43) | 114 | 74 | 91.8 % | 2.08 | **shipped** |
-| split-KV attention | 473 | 295 (44) | **88** | 74 | 91.6 % | 2.05 | **shipped** |
-| **both** | **458** | 281 (44) | **88** | 74 | 91.6 % | **2.12** | **shipped** |
-| both + `uint2` GEMV | 571 | 401 (70) | 88 | **69** | 87.0 % | 1.71 | rejected (routing) |
-| prefetch fetch-depth 4 | 1199 | 984 (106) | 118 | 80 | **71.7 %** | 0.82 | rejected |
-| 2Q Kin/Kout sweep | — | — | — | — | — | — | tooling only |
-
-The two winners compose additively and independently — one is pure I/O
-concurrency, the other pure kernel occupancy, and each preserved the other's
-bucket unchanged.
-
-**`--prefetch-fetch-depth` refuted the hypothesis it was built to test.** The idea
-was that prefetch's *fetch* volume and its *cache admission* are separable, so we
-could fill the NVMe queue without polluting 2Q's A1in probation. Fetch-depth 1
-reproduced baseline byte-identically (the side table is correctly inert), but at
-fetch-depth 4 residency COLLAPSED 91.8 % -> 71.7 % and traffic went 50.6 -> 219.8
-reads/tok. Mechanism: `prefetch_layer` skips keys resident in *either* tier, so a
-hot expert parked in the side table is never re-admitted to the policy and can only
-age out — the side table starves the cache it was meant to protect. Branch
-`worktree-agent-ab265f8e452e3d3f3` if someone wants to try promotion-on-use.
-
-### Measurement hygiene
-
-Running the five agent builds concurrently with a benchmark cost **18 % of
-throughput** and would have been invisible without the counters:
-
-| | quiet machine | during 5 concurrent builds |
+| policy | loaded (replay) | loaded (engine) |
 |---|---|---|
-| cache counters | 286885 / 23315 | **286885 / 23315** (byte-identical) |
-| `attn` / `mlp` | 113 / 71 ms | **113 / 71 ms** (identical) |
-| `ms/miss` | 6.65 | **9.48** (+36 %) |
-| tok/s | 1.99 | 1.58 |
+| **2q, kin 8 / kout 20** | **77.56 %** | **77.4 %** |
+| 2q, kin 8 / kout 100 (previous default) | 71.43 % | 71.7 % |
+| lru | 71.19 % | 71.0 % |
+| arc | 70.77 % | — |
 
-Cache behaviour and compute were bit-for-bit unchanged; only disk service time
-moved. Benchmark on an idle machine, and always check the counters before
-believing a delta.
+`replay` predicted the tuned cell to **0.16 pp**. With the corruption gone it also
+reproduces LRU (71.19 vs 71.0), so cross-policy comparison from the simulator is
+now trustworthy — the >21 pp disagreement documented earlier was the corrupted
+workload, not a model error.
 
----
+**Kout is the axis that matters, and small wins** (20 % -> 77.56 %, 100 % ->
+71.43 %). The optimum is a broad plateau, kin 6-10 % x kout 15-25 %, all within
+0.1 pp; kout below ~5 % collapses. Mechanism: a large ghost remembers keys evicted
+long ago, so a re-miss on a stale key promotes it into the protected set — at 13k
+unique experts over 3.6k slots most such re-references are spurious and the
+protected set fills with one-hit-wonders. This is also the leading explanation for
+**ARC** trailing: its B1/B2 ghosts are full-capacity by construction, pinning it to
+the bad end of this axis with no way to tune off it.
 
-## Offline cache simulation — `replay` (2026-07-21)
+**Two caveats on this tuning.** It sacrifices 2Q's scan resistance (pinned by
+`shipped_default_trades_scan_resistance_for_residency`), and it was tuned on ONE
+prompt's trace. A multi-request server workload has real cross-request reuse that a
+large ghost is designed to capture, so re-tune before trusting this outside the
+single-prompt bench.
 
-The routed-expert sequence does NOT depend on the cache: routing is a deterministic
-function of the weights and the token stream, so which experts each layer asks for
-is fixed no matter what is resident. That makes cache configuration answerable
-offline. `rivoli --trace <path>` captures the access sequence from one real run;
-`bin/replay` replays it through LRU / 2Q / ARC at any capacity and any 2Q Kin/Kout,
-**on CPU in ~2 s**. The 6-cell policy grid above cost 66 minutes of GPU; the 66-cell
-Kin/Kout sweep below cost 2.3 seconds.
+Prefetch depth, at the tuned split:
 
-Two bugs made the pre-existing `simulate` useless for this and are now fixed: it
-only ever called `insert` (never `insert_cold`, so A1in probation admission was
-never exercised), and the trace format **never recorded the predictions** — the
-information was not in the file. Any sweep on the old format modelled a
-*no-prefetch* 2Q, i.e. the ~70 % row, not the ~92 % one. `cache::replay` now
-mirrors `resolve_layer` + `prefetch_layer` ordering exactly (cold-admit predictions,
-then all demand hits, then all misses) and returns the loaded/preloading/cold split.
-
-**Calibration, 512-tok trace, cap = 3621 slots, seeded from `.coli_usage`:**
-
-| | live engine | `replay` | error |
-|---|---|---|---|
-| **2q (default)** | **91.6 %** | **91.74 %** | **0.14 pp** |
-| lru | 71.1 % | 92.85 % | **21.8 pp** |
-| arc | 70.7 % | 93.27 % | **22.6 pp** |
-
-**Use this tool for 2Q parameter work ONLY.** It reproduces 2Q to a seventh of a
-point and is wildly wrong for LRU and ARC — it claims both would beat 2Q, when the
-engine measured them 20 points worse. The cause is unresolved (a leading suspect is
-the seed path: `Pin::build`'s pre-seed goes through `pool.alloc` -> `policy.insert`,
-whereas `replay` calls `Cache::seed`, and the two land in different segments). Until
-that is chased down, **cross-policy comparisons from `replay` are not evidence.**
-
-### 2Q Kin/Kout sweep
-
-```
-rivoli <snap> -bench 512 --pre-seed --trace /tmp/rivoli.trace
-replay /tmp/rivoli.trace 3621 --seed <snap> --sweep
-```
-
-`loaded %`, 11 Kin x 6 Kout:
-
-| kin\kout | 25% | 50% | 100% | 200% | 400% | 800% |
+| depth | wall | fetch (miss) | loaded | reads/tok | wasted | tok/s |
 |---|---|---|---|---|---|---|
-| 3% | 91.83 | 91.87 | 91.92 | 91.92 | 91.92 | 91.92 |
-| 5% | 92.09 | 92.07 | 92.13 | 92.12 | 92.12 | 92.12 |
-| **8%** | 92.19 | 92.16 | **92.21** | 92.20 | 92.20 | 92.20 |
-| 12% | 92.11 | 92.08 | 92.10 | 92.10 | 92.10 | 92.10 |
-| 16% | 92.00 | 92.00 | 92.04 | 92.04 | 92.04 | 92.04 |
-| 20% | 91.93 | 91.89 | 91.98 | 91.97 | 91.97 | 91.97 |
-| 25% (was default) | 91.75 | 91.74 | 91.80 | 91.81 | 91.81 | 91.81 |
-| 33% | 91.49 | 91.57 | 91.63 | 91.63 | 91.63 | 91.63 |
-| 40% | 91.19 | 91.29 | 91.33 | 91.33 | 91.33 | 91.33 |
-| 50% | 90.68 | 90.79 | 90.84 | 90.84 | 90.84 | 90.84 |
-| 66% | 89.46 | 89.63 | 89.77 | 89.82 | 89.82 | 89.82 |
+| 0 | 850 | 678 (132) | 77.7 % | 135.1 | 0.0 % | 1.16 |
+| 1 (default) | 860 | 678 (121) | 77.4 % | 141.4 | 3.4 % | 1.14 |
+| 2 | 886 | 703 (111) | 76.9 % | 153.4 | 8.9 % | 1.11 |
 
-**Kout is irrelevant** — every column is flat to within 0.06 pp, so the A1out ghost
-may as well not exist on this workload. **Kin matters and smaller is better**, down
-to 8 %, falling off again at 3 %. That is the same mechanism as prefetch depth 1
-beating depth 2: a tight probation queue lets a prefetched expert reach the
-protected Am set before churn evicts it. Both knobs say the same thing — 2Q wins
-here because of *fast promotion*, and anything that slows promotion costs residency.
-
-**Hardware confirmation** (kin 8 % / kout 100 %, now the default):
-
-| | before (kin 25/kout 50) | after (kin 8/kout 100) |
-|---|---|---|
-| predicted `loaded` | 91.74 % | 92.21 % |
-| **measured `loaded`** | **91.6 %** | **92.2 %** |
-| miss/tok | 44 | **40** |
-| GB/tok | 0.99 | **0.95** |
-| tok/s | 2.12 / 2.15 | **2.10 / 2.33** |
-
-The model predicted the residency gain to within 0.15 pp. Note the tok/s column:
-the same config measured 2.10 and 2.33 on two runs with **byte-identical cache
-counters**, so wall-clock noise here is ~±10 % and the residency/traffic figures
-are the trustworthy ones. Do not read 2.33 as "the" number.
+`loaded` is FLAT across all three — prefetch does not improve residency, it
+relabels cold reads as preloading and adds waste. The tok/s spread is inside
+run-to-run noise, but disk traffic is exact and rises monotonically with depth on
+an engine that is 79 % disk-bound. Depth 1 is kept only because the throughput
+difference is not resolvable; **prefetch is a candidate for removal** and should be
+decided by a repeat measurement, not by this single set.
 
 ---
 
