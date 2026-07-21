@@ -924,8 +924,12 @@ impl<'a> Pin<'a> {
                 }
                 write!(w, "{}", expert_key(layer, e)).context("write trace")?;
             }
+            // Separator written WITHOUT a leading space: `cut -d'|' -f1` must yield
+            // byte-identical demand lists whether or not a prediction tail follows,
+            // or a whitespace-only artifact reads as a workload divergence. That
+            // false positive has already cost one bogus "second bug" report.
             if self.predicted_layer == layer && !self.predicted.is_empty() {
-                write!(w, " |").context("write trace")?;
+                write!(w, "|").context("write trace")?;
                 for &e in &self.predicted {
                     write!(w, " {}", expert_key(layer, e)).context("write trace")?;
                 }
