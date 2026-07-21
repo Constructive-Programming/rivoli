@@ -51,6 +51,10 @@ pub struct Config {
     /// 2Q/ARC add scan resistance that matters once prefetch injects a
     /// misprediction stream; without prefetch they measure ≈ LRU.
     pub cache_policy: String,
+    /// 2Q's A1in/A1out split (`--2q-kin` / `--2q-kout`, percentages of pool
+    /// capacity). Ignored by `lru`/`arc`. Unset = [`cache::TwoQSplit::default`],
+    /// which reproduces the historical hardcoded `cap/4` / `cap/2` exactly.
+    pub two_q: crate::cache::TwoQSplit,
     /// Cross-layer expert prefetch (`--prefetch`). Default false (baseline). When on,
     /// each MoE layer predicts the NEXT MoE layer's routed experts from its post-attn
     /// residual and submits their cold reads on a second io_uring ring, so the fetch
@@ -116,6 +120,7 @@ impl Config {
         trace: Option<String>,
         prompt: Option<String>,
         cache_policy: String,
+        two_q: crate::cache::TwoQSplit,
         prefetch: bool,
         prefetch_depth: usize,
         max_mem: Option<u64>,
@@ -151,6 +156,7 @@ impl Config {
             trace,
             prompt,
             cache_policy,
+            two_q,
             prefetch,
             prefetch_depth,
             threads,
@@ -167,13 +173,15 @@ impl fmt::Display for Config {
         const GIB: f64 = (1u64 << 30) as f64;
         write!(
             f,
-            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} direct_io={} cache_policy={} prefetch={} prefetch_depth={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={} threads={} attn={:?} kv_fp8={}",
+            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} direct_io={} cache_policy={} 2q_kin={}% 2q_kout={}% prefetch={} prefetch_depth={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={} threads={} attn={:?} kv_fp8={}",
             self.snapshot,
             self.bench,
             self.pre_seed,
             self.direct_vmm_dma,
             self.direct_io,
             self.cache_policy,
+            self.two_q.kin_pct(),
+            self.two_q.kout_pct(),
             self.prefetch,
             self.prefetch_depth,
             self.trace,

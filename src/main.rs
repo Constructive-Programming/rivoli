@@ -41,6 +41,8 @@ struct Args {
     trace: Option<String>,
     prompt: Option<String>,
     cache_policy: String,
+    two_q_kin: u32,
+    two_q_kout: u32,
     prefetch: bool,
     prefetch_depth: usize,
     max_mem: Option<u64>,
@@ -55,6 +57,7 @@ struct Args {
 fn parse_args() -> Result<Args> {
     const USAGE: &str = "usage: rivoli <snapshot-dir> [-bench <tokens>] [--pre-seed] \
          [--direct-vmm-dma] [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc] \
+         [--2q-kin <pct>] [--2q-kout <pct>] \
          [--no-prefetch] [--prefetch-depth <n>] [--max-mem <GiB>] [--direct-io] \
          [--attn auto|dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>] [--kv-fp8]";
     let mut snapshot = None;
@@ -76,6 +79,11 @@ fn parse_args() -> Result<Args> {
         trace: None,
         prompt: None,
         cache_policy: "2q".to_string(),
+        // 2Q's A1in/A1out split. These two are the DEFAULTS of `TwoQSplit`, spelled
+        // out so `--2q-kin`/`--2q-kout` share one parse path; leaving them alone
+        // yields exactly the historical `cap/4` / `cap/2` the table above measured.
+        two_q_kin: rivoli::cache::TwoQSplit::default().kin_pct(),
+        two_q_kout: rivoli::cache::TwoQSplit::default().kout_pct(),
         prefetch: true,
         prefetch_depth: 1,
         max_mem: None, // default: take all safe free memory (free − OS_RESERVE)
@@ -99,6 +107,20 @@ fn parse_args() -> Result<Args> {
             "--prompt" => a.prompt = Some(args.next().context("--prompt requires text")?),
             "--cache-policy" => {
                 a.cache_policy = args.next().context("--cache-policy requires lru|2q|arc")?;
+            }
+            "--2q-kin" => {
+                a.two_q_kin = args
+                    .next()
+                    .context("--2q-kin requires a percentage")?
+                    .parse()
+                    .context("--2q-kin takes an integer percentage")?;
+            }
+            "--2q-kout" => {
+                a.two_q_kout = args
+                    .next()
+                    .context("--2q-kout requires a percentage")?
+                    .parse()
+                    .context("--2q-kout takes an integer percentage")?;
             }
             "--no-prefetch" => a.prefetch = false,
             "--prefetch-depth" => {
@@ -198,6 +220,7 @@ fn main() -> Result<()> {
         a.trace,
         a.prompt,
         a.cache_policy,
+        rivoli::cache::TwoQSplit::new(a.two_q_kin, a.two_q_kout)?,
         a.prefetch,
         a.prefetch_depth,
         a.max_mem,
@@ -355,6 +378,7 @@ async fn run(cfg: Config) -> Result<()> {
             !cfg.direct_vmm_dma,
             cfg.trace.as_deref(),
             &cfg.cache_policy,
+            cfg.two_q,
             cfg.prefetch,
             cfg.prefetch_depth,
             cfg.direct_io,

@@ -24,8 +24,8 @@ commands are given with each table.
 
 ## Current defaults
 
-`--cache-policy 2q --prefetch-depth 1`, prefetch on, SQPOLL on BOTH io_uring
-rings, split-KV attention.
+`--cache-policy 2q --prefetch-depth 1 --2q-kin 8 --2q-kout 100`, prefetch on,
+SQPOLL on BOTH io_uring rings, split-KV attention.
 
 ```
 rivoli /var/db/llama-server/glm52-colibri-int4 -bench 512 --pre-seed
@@ -46,9 +46,10 @@ Trajectory over 2026-07-20/21, same command, 512 tok:
 | measured baseline before this work | 0.90 | 1093 | — | — |
 | + vectorised int4 kernels | 0.96 | 1033 | 71.3 % | 3.28 |
 | + SQPOLL prefetch ring, 2q, depth 1 | 1.99 | 488 | 91.8 % | 0.96 |
-| + SQPOLL demand ring + split-KV attn | **2.12** | **458** | **91.6 %** | **0.99** |
+| + SQPOLL demand ring + split-KV attn | 2.12 | 458 | 91.6 % | 0.99 |
+| + swept 2Q Kin/Kout (8 %/100 %) | **2.10–2.33** | **416–462** | **92.2 %** | **0.95** |
 
-**2.36x over the day.** Note the two halves: the kernel work took compute from
+**~2.4x over the day.** Note the two halves: the kernel work took compute from
 481 to 174 ms/token, and the I/O work took `fetch` from ~600 to 281 ms while
 cutting disk traffic 3.7x. Neither alone would have crossed 2 tok/s.
 
@@ -97,6 +98,86 @@ throughput** and would have been invisible without the counters:
 Cache behaviour and compute were bit-for-bit unchanged; only disk service time
 moved. Benchmark on an idle machine, and always check the counters before
 believing a delta.
+
+---
+
+## Offline cache simulation — `replay` (2026-07-21)
+
+The routed-expert sequence does NOT depend on the cache: routing is a deterministic
+function of the weights and the token stream, so which experts each layer asks for
+is fixed no matter what is resident. That makes cache configuration answerable
+offline. `rivoli --trace <path>` captures the access sequence from one real run;
+`bin/replay` replays it through LRU / 2Q / ARC at any capacity and any 2Q Kin/Kout,
+**on CPU in ~2 s**. The 6-cell policy grid above cost 66 minutes of GPU; the 66-cell
+Kin/Kout sweep below cost 2.3 seconds.
+
+Two bugs made the pre-existing `simulate` useless for this and are now fixed: it
+only ever called `insert` (never `insert_cold`, so A1in probation admission was
+never exercised), and the trace format **never recorded the predictions** — the
+information was not in the file. Any sweep on the old format modelled a
+*no-prefetch* 2Q, i.e. the ~70 % row, not the ~92 % one. `cache::replay` now
+mirrors `resolve_layer` + `prefetch_layer` ordering exactly (cold-admit predictions,
+then all demand hits, then all misses) and returns the loaded/preloading/cold split.
+
+**Calibration, 512-tok trace, cap = 3621 slots, seeded from `.coli_usage`:**
+
+| | live engine | `replay` | error |
+|---|---|---|---|
+| **2q (default)** | **91.6 %** | **91.74 %** | **0.14 pp** |
+| lru | 71.1 % | 92.85 % | **21.8 pp** |
+| arc | 70.7 % | 93.27 % | **22.6 pp** |
+
+**Use this tool for 2Q parameter work ONLY.** It reproduces 2Q to a seventh of a
+point and is wildly wrong for LRU and ARC — it claims both would beat 2Q, when the
+engine measured them 20 points worse. The cause is unresolved (a leading suspect is
+the seed path: `Pin::build`'s pre-seed goes through `pool.alloc` -> `policy.insert`,
+whereas `replay` calls `Cache::seed`, and the two land in different segments). Until
+that is chased down, **cross-policy comparisons from `replay` are not evidence.**
+
+### 2Q Kin/Kout sweep
+
+```
+rivoli <snap> -bench 512 --pre-seed --trace /tmp/rivoli.trace
+replay /tmp/rivoli.trace 3621 --seed <snap> --sweep
+```
+
+`loaded %`, 11 Kin x 6 Kout:
+
+| kin\kout | 25% | 50% | 100% | 200% | 400% | 800% |
+|---|---|---|---|---|---|---|
+| 3% | 91.83 | 91.87 | 91.92 | 91.92 | 91.92 | 91.92 |
+| 5% | 92.09 | 92.07 | 92.13 | 92.12 | 92.12 | 92.12 |
+| **8%** | 92.19 | 92.16 | **92.21** | 92.20 | 92.20 | 92.20 |
+| 12% | 92.11 | 92.08 | 92.10 | 92.10 | 92.10 | 92.10 |
+| 16% | 92.00 | 92.00 | 92.04 | 92.04 | 92.04 | 92.04 |
+| 20% | 91.93 | 91.89 | 91.98 | 91.97 | 91.97 | 91.97 |
+| 25% (was default) | 91.75 | 91.74 | 91.80 | 91.81 | 91.81 | 91.81 |
+| 33% | 91.49 | 91.57 | 91.63 | 91.63 | 91.63 | 91.63 |
+| 40% | 91.19 | 91.29 | 91.33 | 91.33 | 91.33 | 91.33 |
+| 50% | 90.68 | 90.79 | 90.84 | 90.84 | 90.84 | 90.84 |
+| 66% | 89.46 | 89.63 | 89.77 | 89.82 | 89.82 | 89.82 |
+
+**Kout is irrelevant** — every column is flat to within 0.06 pp, so the A1out ghost
+may as well not exist on this workload. **Kin matters and smaller is better**, down
+to 8 %, falling off again at 3 %. That is the same mechanism as prefetch depth 1
+beating depth 2: a tight probation queue lets a prefetched expert reach the
+protected Am set before churn evicts it. Both knobs say the same thing — 2Q wins
+here because of *fast promotion*, and anything that slows promotion costs residency.
+
+**Hardware confirmation** (kin 8 % / kout 100 %, now the default):
+
+| | before (kin 25/kout 50) | after (kin 8/kout 100) |
+|---|---|---|
+| predicted `loaded` | 91.74 % | 92.21 % |
+| **measured `loaded`** | **91.6 %** | **92.2 %** |
+| miss/tok | 44 | **40** |
+| GB/tok | 0.99 | **0.95** |
+| tok/s | 2.12 / 2.15 | **2.10 / 2.33** |
+
+The model predicted the residency gain to within 0.15 pp. Note the tok/s column:
+the same config measured 2.10 and 2.33 on two runs with **byte-identical cache
+counters**, so wall-clock noise here is ~±10 % and the residency/traffic figures
+are the trustworthy ones. Do not read 2.33 as "the" number.
 
 ---
 

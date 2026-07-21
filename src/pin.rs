@@ -204,9 +204,13 @@ pub struct Pin<'a> {
     pub pf_alloc_ns: u128,
     pub pf_queue_ns: u128,
     pub pf_submit_ns: u128,
-    /// Optional access-trace sink (`--trace`): one line per resolved MoE layer, the
-    /// space-separated `(layer,expert)` keys the LRU looked up, in access order.
-    /// Feeds the offline cache-policy simulator (`src/cache.rs`, `bin/replay`).
+    /// Optional access-trace sink (`--trace`): one line per resolved MoE layer —
+    /// the space-separated `(layer,expert)` keys the pool looked up, in access
+    /// order, then (when prefetch is on) ` | ` and the keys the PREVIOUS layer
+    /// prefetched for this one. Feeds the offline cache-policy simulator
+    /// (`src/cache.rs`, `bin/replay`). The prediction half is what lets `replay`
+    /// model `insert_cold` — without it an offline sweep measures a no-prefetch
+    /// engine, which is a materially different (and much worse) cache workload.
     trace: Option<std::io::BufWriter<std::fs::File>>,
 }
 
@@ -426,9 +430,9 @@ struct Pool {
 }
 
 impl Pool {
-    fn new(n: usize, policy: &str) -> Result<Self> {
+    fn new(n: usize, policy: &str, two_q: cache::TwoQSplit) -> Result<Self> {
         Ok(Self {
-            policy: cache::make(policy, n)
+            policy: cache::make(policy, n, two_q)
                 .with_context(|| format!("unknown --cache-policy {policy:?} (lru|2q|arc)"))?,
             slot_of: std::collections::HashMap::with_capacity(n),
             #[cfg(debug_assertions)]
@@ -562,6 +566,7 @@ impl<'a> Pin<'a> {
         bounce: bool,
         trace_path: Option<&str>,
         cache_policy: &str,
+        two_q: cache::TwoQSplit,
         prefetch: bool,
         prefetch_depth: usize,
         direct_io: bool,
@@ -705,7 +710,7 @@ impl<'a> Pin<'a> {
             (n_slots * expert_slot) as f64 / (1u64 << 30) as f64,
             tier.used() as f64 / (1u64 << 30) as f64,
         );
-        let mut pool = Pool::new(n_slots, cache_policy)?;
+        let mut pool = Pool::new(n_slots, cache_policy, two_q)?;
         // Ring sized for one layer's worst case: top_k misses x 3 proj x 2 tensors.
         let ring = (cfg.top_k * 6).next_power_of_two() * 2;
         // Bounce span = largest single projection superset (gate/up packed =
@@ -889,10 +894,13 @@ impl<'a> Pin<'a> {
                 self.pred_correct += hit as u64;
             }
         }
-        // Trace sink (--trace): the exact LRU keys this layer looks up, access order.
-        // Write each key straight to the BufWriter (no per-layer Vec<String>+join);
-        // a leading space before all but the first keeps the output byte-identical
-        // (space-separated keys, no trailing space, one newline per layer).
+        // Trace sink (--trace): the exact keys this layer looks up, access order,
+        // then the set the previous layer prefetched FOR this layer. Write each key
+        // straight to the BufWriter (no per-layer Vec<String>+join); a leading space
+        // before all but the first keeps the demand half byte-identical (space-
+        // separated keys, no trailing space, one newline per layer). The ` |
+        // <predicted>` tail is emitted only when a prediction targeted this layer,
+        // so a `--no-prefetch` trace is byte-for-byte what it always was.
         if let Some(w) = &mut self.trace {
             use std::io::Write;
             for (j, &e) in sel.iter().enumerate() {
@@ -900,6 +908,12 @@ impl<'a> Pin<'a> {
                     write!(w, " ").context("write trace")?;
                 }
                 write!(w, "{}", expert_key(layer, e)).context("write trace")?;
+            }
+            if self.predicted_layer == layer && !self.predicted.is_empty() {
+                write!(w, " |").context("write trace")?;
+                for &e in &self.predicted {
+                    write!(w, " {}", expert_key(layer, e)).context("write trace")?;
+                }
             }
             writeln!(w).context("write trace")?;
         }
