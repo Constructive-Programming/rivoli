@@ -131,7 +131,12 @@ unsafe extern "C" {
         rope: i32,
         scale: f32,
         clat: *mut f32,
+        partial: *mut f32,
     ) -> i32;
+
+    /// f32 count the split-KV partial scratch needs for these dims (worst-case
+    /// split count). Pure arithmetic — no HIP calls, safe to call before init.
+    fn rivoli_mla_attend_scratch_floats(h: i32, kvl: i32) -> usize;
 
     fn rivoli_gemv_bf16(x: *const f32, w: *const u16, o_dim: i32, i_dim: i32, y: *mut f32) -> i32;
     fn rivoli_layernorm(
@@ -194,7 +199,22 @@ unsafe extern "C" {
         n_blocks: i32,
         scale: f32,
         clat: *mut f32,
+        partial: *mut f32,
     ) -> i32;
+}
+
+/// Number of `f32`s the caller must own for [`launch_attend`]'s split-KV partial
+/// scratch at these dims. Sized for the kernel's maximum split count, so ONE
+/// allocation per session covers every context length — mid-session `hipMalloc`
+/// is the amdgpu GTT wedge trigger (PLAN.md M3 wiring contract).
+#[cfg(feature = "rocm")]
+#[must_use]
+pub fn attend_scratch_floats(h: usize, kvl: usize) -> usize {
+    if h > i32::MAX as usize || kvl > i32::MAX as usize {
+        return 0; // the launchers reject these dims anyway
+    }
+    // SAFETY: pure integer arithmetic in the kernel TU; touches no device state.
+    unsafe { rivoli_mla_attend_scratch_floats(h as i32, kvl as i32) }
 }
 
 /// Shared launcher return-code check. The kernels' convention (see moe_fused.hip):
@@ -217,13 +237,20 @@ fn check(r: i32, name: &str) -> Result<()> {
 /// of the `nr` listed rows (ascending). Does NOT synchronize — call
 /// [`device_sync`] once per token.
 ///
+/// `partial` is the caller-owned split-KV scratch: when it is non-null the rows
+/// are partitioned across extra workgroups (filling the GPU instead of the
+/// 8-block head grid) and a second kernel combines the partials into `clat`. A
+/// null `partial` forces the single-split path — correct, just slower.
+///
 /// # Safety
 /// The launch is ASYNCHRONOUS: the kernel reads/writes the pointers below AFTER
 /// this call returns, so all must stay valid until the next [`device_sync`]
 /// RETURNS. Shapes (all device pointers in the current HIP context): `qabs`
 /// `h*kvl` f32, `qrope` `h*rope` f32, `lc`/`rc` at least `(max row)+1` cache
 /// rows, `rows` `nr` u32 (when non-null) with EVERY entry a valid cache row —
-/// the kernel cannot bounds-check the slab — and `clat` `h*kvl` f32.
+/// the kernel cannot bounds-check the slab — `clat` `h*kvl` f32, and `partial`
+/// either null or at least [`attend_scratch_floats(h, kvl)`](attend_scratch_floats)
+/// f32 (the kernel writes it without bounds-checking).
 #[cfg(feature = "rocm")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn launch_attend(
@@ -238,6 +265,7 @@ pub unsafe fn launch_attend(
     rope: usize,
     scale: f32,
     clat: *mut f32,
+    partial: *mut f32,
 ) -> Result<()> {
     anyhow::ensure!(
         h <= i32::MAX as usize
@@ -260,6 +288,7 @@ pub unsafe fn launch_attend(
             rope as i32,
             scale,
             clat,
+            partial,
         )
     };
     check(r, "launch_attend")
@@ -271,8 +300,10 @@ pub unsafe fn launch_attend(
 ///
 /// # Safety
 /// Same async contract as [`launch_attend`]; `lc8`/`lscale` (and `rc`/`rows`/
-/// `qabs`/`qrope`/`clat`) must stay valid device pointers until the next
-/// [`device_sync`] returns, and every `rows` entry a valid cache row.
+/// `qabs`/`qrope`/`clat`/`partial`) must stay valid device pointers until the
+/// next [`device_sync`] returns, every `rows` entry a valid cache row, and
+/// `partial` null or ≥ [`attend_scratch_floats(h, kvl)`](attend_scratch_floats)
+/// f32.
 #[cfg(feature = "rocm")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn launch_attend_fp8(
@@ -289,6 +320,7 @@ pub unsafe fn launch_attend_fp8(
     n_blocks: usize,
     scale: f32,
     clat: *mut f32,
+    partial: *mut f32,
 ) -> Result<()> {
     anyhow::ensure!(
         h <= i32::MAX as usize
@@ -314,6 +346,7 @@ pub unsafe fn launch_attend_fp8(
             n_blocks as i32,
             scale,
             clat,
+            partial,
         )
     };
     check(r, "launch_attend_fp8")

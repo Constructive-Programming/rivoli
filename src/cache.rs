@@ -70,7 +70,7 @@ impl OrderedSet {
 /// a just-inserted batch sibling (a pure single-segment recency cache can't do both
 /// coexist AND cold-first, so `Lru` uses the default = normal `insert`). `access_batch`
 /// runs one layer's keys two-pass (hits first, then misses), mirroring
-/// `resolve_layer`. `seed` pre-fills the protected/frequency segment.
+/// `submit_layer`. `seed` pre-fills the protected/frequency segment.
 pub trait Cache {
     fn contains(&self, k: u32) -> bool;
     fn get(&mut self, k: u32) -> bool;

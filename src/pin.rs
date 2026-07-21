@@ -21,7 +21,7 @@ use crate::cache;
 use crate::device::{DeviceTier, VmmBuf, mem_info};
 use crate::model::ModelConfig;
 use crate::snapshot::{Dtype, Snapshot};
-use crate::stream::{ALIGN, Streamer, slot_span};
+use crate::stream::{ALIGN, Sqpoll, Streamer, slot_span};
 use crate::usage::Usage;
 use anyhow::{Context, Result, ensure};
 use std::os::fd::RawFd;
@@ -104,6 +104,18 @@ pub struct LayerPin {
     pub indexer: Option<IndexerPin>,
 }
 
+/// Proof that a layer's demand reads are in flight on the main ring, and the
+/// obligation to join them. Returned by [`Pin::submit_layer`], consumed by
+/// [`Pin::await_layer`]. Zero-sized: it exists to put the submit/await protocol in
+/// the type system and at the call site, where the alternative is a comment nobody
+/// re-reads while moving code around between the two.
+///
+/// Rust is affine, so this can still be dropped without awaiting — but only on a
+/// `?` error path, where the forward pass is already unwinding and the run is over.
+#[must_use = "the demand reads are still in flight; pass this to Pin::await_layer \
+              before launching anything that reads the returned descriptors"]
+pub struct DemandBatch(());
+
 /// The resident weight set + cold-expert streaming pool. Borrows the snapshot for
 /// its lifetime (cold fetches read the mmap in place).
 pub struct Pin<'a> {
@@ -152,9 +164,9 @@ pub struct Pin<'a> {
     stream: Streamer,
     /// Cross-layer prefetch (`--prefetch`): a SECOND io_uring ring, dedicated to the
     /// predicted next-layer experts. `Some` iff prefetch is enabled. Its reads are
-    /// SUBMITTED (non-blocking) after the current layer's own `resolve_layer` drain,
+    /// SUBMITTED (non-blocking) during the current layer's `submit_layer`..`await_layer`
     /// run on the NVMe/DMA side during the current layer's MoE compute, and are
-    /// DRAINED at the next `resolve_layer` — hiding the ~5ms/miss fetch behind
+    /// window, and DRAINED at the next `submit_layer` — hiding the ~5ms/miss fetch behind
     /// compute. A separate ring keeps in-flight prefetch reads from entangling with a
     /// layer's synchronous miss batch.
     prefetch_stream: Option<Streamer>,
@@ -163,10 +175,16 @@ pub struct Pin<'a> {
     /// bandwidth-bound path; the caller slices to this before `prefetch_layer`.
     prefetch_depth: usize,
     /// An outstanding prefetch batch is in flight and must be drained by the next
-    /// `resolve_layer` before its slots are read.
+    /// `submit_layer` before its slots are read.
     prefetch_pending: bool,
+    /// Slots the demand ring is currently writing (between `submit_layer` and
+    /// `await_layer`). Debug builds only: it turns `prefetch_layer`'s slot-
+    /// disjointness argument into an assertion that fires in the test suite if the
+    /// pool ever hands a live destination to a concurrent prefetch read.
+    #[cfg(debug_assertions)]
+    inflight: Vec<usize>,
     /// The predicted expert set submitted for the layer named in `predicted_layer`
-    /// (recall accounting at the matching `resolve_layer`).
+    /// (recall accounting at the matching `submit_layer`).
     predicted: Vec<usize>,
     predicted_layer: usize,
     /// Stats over the run.
@@ -672,7 +690,7 @@ impl<'a> Pin<'a> {
         // Floor the pool at `top_k + prefetch_depth` when prefetching: this makes
         // cross-layer prefetch's evictions provably DISJOINT from the current layer's
         // live experts. The current layer's `top_k` routed experts are the
-        // most-recently-touched (MRU / protected) after `resolve_layer`; `alloc_cold`
+        // most-recently-touched (MRU / protected) after `submit_layer`; `alloc_cold`
         // evicts the LRU. With this many slots, the `prefetch_depth` cold evictions
         // can never reach those MRU experts — so the prefetch DMA (whenever it lands:
         // async in direct mode, or at the drain memcpy in bounce mode) writes slots
@@ -694,7 +712,14 @@ impl<'a> Pin<'a> {
         // moe_inter*rb(hidden); down packed = hidden*rb(moe_inter)); scales are tiny.
         let span = slot_span(cfg.moe_inter * cfg.hidden.div_ceil(2))
             .max(slot_span(cfg.hidden * cfg.moe_inter.div_ceil(2)));
-        let mut stream = Streamer::new(ring as u32, span, bounce, false)?;
+        // The DEMAND ring gets a poller too. The earlier reasoning — "its submit is
+        // immediately followed by a blocking drain, so it gains nothing" — conflated
+        // two different things: the thread must indeed wait either way, but WITHOUT a
+        // poller the waiting thread dispatches the batch's SQEs serially, so the six
+        // reads of an expert never sit in the device queue together. That is visible
+        // in the profile: 6.97 ms per 19 MB expert is the array's P=1 rate, not its
+        // P>=4 rate. See `Sqpoll`.
+        let mut stream = Streamer::new(ring as u32, span, bounce, Sqpoll::Own)?;
         // Optional warm start (`--pre-seed`): seed the pool with the hottest experts
         // from .coli_usage so the first tokens hit at colibri's rate while the LRU
         // adapts. Worth ~+6.8pt on the first tokens but transient (the LRU warms up
@@ -731,7 +756,15 @@ impl<'a> Pin<'a> {
             tracing::info!(
                 "cross-layer expert prefetch ENABLED (single-layer lookahead, depth {prefetch_depth})"
             );
-            Some(Streamer::new(ring as u32, span, bounce, true)?)
+            // Share the demand ring's poller rather than spinning a second kernel
+            // thread: both rings are fed from the one decode thread, and a spinning
+            // poller is not free on a box whose GPU already wants 214 of 230 GB/s.
+            Some(Streamer::new(
+                ring as u32,
+                span,
+                bounce,
+                Sqpoll::SharedWith(&stream),
+            )?)
         } else {
             None
         };
@@ -754,6 +787,8 @@ impl<'a> Pin<'a> {
             prefetch_stream,
             prefetch_depth,
             prefetch_pending: false,
+            #[cfg(debug_assertions)]
+            inflight: Vec::new(),
             predicted: Vec::new(),
             predicted_layer: usize::MAX,
             hits: 0,
@@ -793,19 +828,32 @@ impl<'a> Pin<'a> {
     }
 
     /// Resolve a MoE layer's `sel` routed experts to `Mlp` descriptors via the
-    /// adaptive LRU: a hit returns its resident slot's pointers (no I/O); a miss
-    /// evicts the coldest slot and streams the expert in. All of the layer's misses
-    /// submit as ONE queue-depth io_uring O_DIRECT batch, joined once. Fills the
-    /// caller-owned `out` (cleared first, reused across tokens) so the decode hot
-    /// path allocates nothing here on the all-hits steady state.
-    pub fn resolve_layer(&mut self, layer: usize, sel: &[usize], out: &mut Vec<Mlp>) -> Result<()> {
+    /// adaptive LRU and SUBMIT (non-blocking) the cold reads: a hit returns its
+    /// resident slot's pointers (no I/O); a miss evicts the coldest slot and queues
+    /// the expert's six O_DIRECT reads. All of the layer's misses go out as ONE
+    /// batch. Fills the caller-owned `out` (cleared first, reused across tokens) so
+    /// the decode hot path allocates nothing here on the all-hits steady state.
+    ///
+    /// **The returned descriptors are valid POINTERS but their bytes are still in
+    /// flight.** Nothing may READ a cold slot until [`Pin::await_layer`] has consumed
+    /// the returned [`DemandBatch`]. Building the descriptors here (rather than after
+    /// the join) is sound because a slot's address is fixed at `pool.alloc` time — it
+    /// is a function of the slot index and `cfg` geometry, not of the data arriving.
+    /// That is what lets the caller do its descriptor build, its small H2D uploads,
+    /// and its next-layer prefetch submit while the NVMe works.
+    pub fn submit_layer(
+        &mut self,
+        layer: usize,
+        sel: &[usize],
+        out: &mut Vec<Mlp>,
+    ) -> Result<DemandBatch> {
         let cfg = self.cfg;
         let sparse = (layer - cfg.dense_layers) * cfg.n_experts; // moe_table row base
         // `sel` is one layer's routed pick (top_k + shared); a fixed slot scratch
         // avoids a per-layer alloc, mirroring `cache::access_batch`'s 32-wide buffer.
         ensure!(
             sel.len() <= 32,
-            "resolve_layer: {} experts exceeds the 32-slot scratch",
+            "submit_layer: {} experts exceeds the 32-slot scratch",
             sel.len()
         );
         // Cross-layer prefetch consume: an outstanding prefetch batch (submitted
@@ -814,6 +862,19 @@ impl<'a> Pin<'a> {
         // expert is resident in VMM BEFORE phase 1a's hit scan and this layer's MoE
         // read it. The predicted-correct keys were already `alloc_cold`-bound to their
         // slots with `off` set (at submit time), so they now surface as normal hits.
+        //
+        // THIS DRAIN CANNOT BE DEFERRED alongside the demand drain, tempting as that
+        // is. It is the barrier that makes phase 1b's `pool.alloc` unconditionally
+        // safe. A prefetched key sits at the policy's cold/probation end by
+        // construction (`alloc_cold`), so it is precisely the kind of entry a demand
+        // miss's `policy.insert` picks as its eviction victim — that is the measured
+        // `pf_evict_unused` path. If the prefetch reads were still in flight, such an
+        // eviction would hand phase 1b a slot an O_DIRECT read is actively filling,
+        // and phase 1b would queue a SECOND read into the same bytes. Whichever
+        // landed last would win while the descriptor claimed the other expert:
+        // silent weight corruption, no error, wrong logits. Draining first costs
+        // whatever `prefetch_wait_ns` reports (near zero when the overlap works) and
+        // buys an invariant that needs no pinning machinery to hold.
         if self.prefetch_pending {
             if let Some(s) = self.prefetch_stream.as_mut() {
                 let t = std::time::Instant::now();
@@ -855,6 +916,10 @@ impl<'a> Pin<'a> {
             }
         }
         // Phase 1b: allocate + QUEUE the misses, now that all hits are protected.
+        // Reset the debug in-flight set here rather than only in `await_layer`, so an
+        // error path that skips the join cannot leave a stale slot recorded.
+        #[cfg(debug_assertions)]
+        self.inflight.clear();
         for (i, &e) in sel.iter().enumerate() {
             if slots[i].is_some() {
                 continue;
@@ -875,9 +940,18 @@ impl<'a> Pin<'a> {
                 self.expert_slot,
             )?;
             slots[i] = Some(slot);
+            // Debug-only: record that an O_DIRECT read is writing this slot, so the
+            // disjointness argument that lets `prefetch_layer` allocate while these
+            // reads are in flight is a CHECKED invariant, not just a comment.
+            #[cfg(debug_assertions)]
+            self.inflight.push(slot);
         }
-        // Phase 2: ONE join for the whole layer's cold reads.
-        self.stream.drain()?;
+        // Phase 2: hand the whole batch to the kernel NOW, without waiting. With the
+        // ring's poller thread this puts all of the layer's reads in the device queue
+        // at once (the array wants P>=4), and returns to the caller so its descriptor
+        // build, uploads and next-layer prefetch submit run while the NVMe works.
+        // The matching join is `await_layer`.
+        self.stream.submit()?;
         // Phase 3: build descriptors from each expert's precomputed sub-block offsets
         // (in `moe_table`, keyed by (layer,expert) — run-invariant, not per slot).
         // gate/up are [moe_inter, hidden]; down is [hidden, moe_inter].
@@ -889,9 +963,10 @@ impl<'a> Pin<'a> {
         for (i, &e) in sel.iter().enumerate() {
             // Every entry was filled in phase 1a/1b; a `None` here is an internal
             // invariant break, not a data condition — fail loud rather than panic.
-            let slot = slots[i].context("resolve_layer: unresolved expert slot")?;
+            let slot = slots[i].context("submit_layer: unresolved expert slot")?;
             let o = self.moe_table[sparse + e].off;
-            // SAFETY: slot base within the slab; reads that filled it have joined.
+            // SAFETY: slot base within the slab. Only ADDRESS arithmetic — the bytes
+            // of a cold slot are still arriving and are not read until `await_layer`.
             let b = unsafe { slab.add(slot * es) };
             let w = |poff: usize, soff: usize, o_dim: usize, i_dim: usize| Weight {
                 packed: unsafe { b.add(poff) },
@@ -905,6 +980,20 @@ impl<'a> Pin<'a> {
                 down: w(o[4], o[5], down_o, down_i),
             });
         }
+        Ok(DemandBatch(()))
+    }
+
+    /// Join the demand batch [`Pin::submit_layer`] put in flight: every cold slot
+    /// holds its expert's bytes when this returns, so the descriptors handed back by
+    /// `submit_layer` are safe to dereference (i.e. to launch MoE against).
+    ///
+    /// Consuming the `DemandBatch` is what makes "await without submit" and "await
+    /// twice" uncompilable; `#[must_use]` covers most of "submit without await".
+    pub fn await_layer(&mut self, batch: DemandBatch) -> Result<()> {
+        let DemandBatch(()) = batch; // consumed: the batch is no longer outstanding
+        self.stream.drain()?;
+        #[cfg(debug_assertions)]
+        self.inflight.clear();
         Ok(())
     }
 
@@ -923,18 +1012,30 @@ impl<'a> Pin<'a> {
     /// predictions are skipped; the rest are `alloc_cold`-bound to fresh slots (with
     /// `off` set now, from cfg geometry) and their reads submitted so they run during
     /// the current layer's GPU compute. The batch is drained by the matching
-    /// `resolve_layer(layer)`. Call this AFTER the current layer's own `resolve_layer`
-    /// drain (main ring quiescent) and BEFORE its `launch_moe`.
+    /// `submit_layer(layer)`. Call this AFTER the current layer's `submit_layer` and
+    /// BEFORE its `launch_moe` — i.e. WHILE the current layer's own demand reads are
+    /// still in flight, which is the point: the two batches then sit in the device
+    /// queue together instead of end to end.
     ///
-    /// Correctness (BOTH bounce and direct-DMA modes): `alloc_cold` evicts only the
-    /// LRU, and the current layer's `top_k` experts are the most-recently-touched
-    /// (MRU / protected) after its `resolve_layer`. With `n_slots >= top_k +
+    /// Correctness (BOTH bounce and direct-DMA modes): `alloc_cold` evicts only from
+    /// the policy's cold end, and the current layer's `top_k` experts are the
+    /// most-recently-touched (MRU / protected) — phase 1a `get`s every hit and phase
+    /// 1b `insert`s every miss immediately before this call. With `n_slots >= top_k +
     /// prefetch_depth` (enforced in `build`), the `prefetch_depth` cold evictions here
-    /// can NEVER reuse a slot in the current layer's live descriptor set. So the
-    /// prefetch reads target slots DISJOINT from what the running MoE reads — whether
-    /// they land async (direct DMA into VMM) or at the drain-time memcpy (bounce),
-    /// they never overwrite live data. The matching `resolve_layer(layer)` drains the
-    /// ring before use, so the data is present before L+1's MoE reads it.
+    /// can NEVER reuse a slot in the current layer's live descriptor set.
+    ///
+    /// That argument is about SLOT IDENTITY — the allocator's state, not the data's
+    /// arrival — so it is unchanged by moving this call ahead of the demand join. The
+    /// sequence of `Pool` operations it depends on (get×hits, alloc×misses, then
+    /// contains/alloc_cold×pred) is byte-identical to before; only `Streamer::drain`,
+    /// which touches no `Pool` state, moved. The slots this writes are therefore
+    /// disjoint from BOTH what the running MoE reads AND what the in-flight demand
+    /// reads are writing. `debug_assert`ed against `inflight` below.
+    ///
+    /// The data lands before anyone reads it in both modes: direct-DMA writes VMM
+    /// asynchronously into a disjoint slot, bounce writes the prefetch ring's OWN
+    /// pinned arena (never VMM) until its drain's memcpy. Either way the matching
+    /// `submit_layer(layer)` drains the ring before L+1's MoE reads it.
     pub fn prefetch_layer(&mut self, layer: usize, pred: &[usize]) -> Result<()> {
         if self.prefetch_stream.is_none() {
             return Ok(());
@@ -947,7 +1048,7 @@ impl<'a> Pin<'a> {
         self.predicted.extend_from_slice(pred);
         self.predicted_layer = layer;
         // Raw slab ptr (no borrow held across the &mut stream reads), mirroring
-        // `resolve_layer`'s phase 1b.
+        // `submit_layer`'s phase 1b.
         let slab = self.lru_pool.ptr_mut();
         // Disjoint field borrows: `prefetch_stream`, `pool`, `moe_table`, `slot_dst`
         // are distinct fields.
@@ -959,6 +1060,8 @@ impl<'a> Pin<'a> {
             None => return Ok(()),
         };
         let pool = &mut self.pool;
+        #[cfg(debug_assertions)]
+        let inflight = &self.inflight; // disjoint field borrow, alongside `pool`
         let mut queued = 0usize;
         let (mut alloc_ns, mut queue_ns) = (0u128, 0u128);
         for &e in pred {
@@ -969,6 +1072,13 @@ impl<'a> Pin<'a> {
             let t = std::time::Instant::now();
             let slot = pool.alloc_cold(key)?;
             alloc_ns += t.elapsed().as_nanos();
+            // The disjointness argument above, checked: this prefetch read must never
+            // target a slot the demand batch is still filling.
+            #[cfg(debug_assertions)]
+            debug_assert!(
+                !inflight.contains(&slot),
+                "prefetch slot {slot} collides with an in-flight demand read"
+            );
             let entry = &table[sparse + e];
             let t = std::time::Instant::now();
             stream_expert(stream, entry, slot_dst, slab, slot, expert_slot)?;

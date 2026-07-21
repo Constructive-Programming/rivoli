@@ -30,7 +30,14 @@ pub const ALIGN: usize = 4096;
 mod ffi {
     use std::ffi::c_void;
     unsafe extern "C" {
-        pub fn rivoli_ring_new(entries: u32, span: u32, bounce: i32, sqpoll: i32) -> *mut c_void;
+        pub fn rivoli_ring_new(
+            entries: u32,
+            span: u32,
+            bounce: i32,
+            sqpoll: i32,
+            attach_fd: i32,
+        ) -> *mut c_void;
+        pub fn rivoli_ring_fd(ring: *mut c_void) -> i32;
         pub fn rivoli_ring_read(
             ring: *mut c_void,
             fd: i32,
@@ -63,6 +70,29 @@ fn min_completion(begin: usize, len: usize) -> u64 {
     ((begin - ab) + len) as u64
 }
 
+/// How a ring's submission path is driven — the single most consequential choice
+/// about a ring on this box.
+///
+/// A plain ring's submit is an `io_uring_enter` in which the CALLING thread walks
+/// the SQEs and drives the btrfs/blk-mq dispatch inline, one at a time. Measured
+/// at ~2.96 ms per expert (6 SQEs). That costs twice over: the call does not
+/// return promptly, AND the reads reach the device serially, so a 6-read batch
+/// behaves like queue depth 1 (2.53 GB/s) instead of the 6.69 GB/s the array
+/// delivers at P≥4. A poller thread fixes both — it takes the whole SQ tail at
+/// once, so the batch is genuinely concurrent.
+pub enum Sqpoll<'a> {
+    /// No poller: submit is a syscall with inline, serial dispatch. Correct, and
+    /// the right choice only for a ring whose reads have no batch-parallelism to
+    /// win (or where a poller thread cannot be had).
+    Off,
+    /// This ring gets its own kernel submission-poller thread.
+    Own,
+    /// Share the given ring's poller thread (`IORING_SETUP_ATTACH_WQ`) rather than
+    /// spinning up a second one. Falls back to [`Sqpoll::Own`], then
+    /// [`Sqpoll::Off`], if the kernel refuses.
+    SharedWith(&'a Streamer),
+}
+
 /// A ring of in-flight reads. `entries` caps how many can be queued before a
 /// `drain` — sized to a layer's cold-read count with margin.
 pub struct Streamer {
@@ -88,10 +118,18 @@ impl Streamer {
     /// `bounce` selects the destination path: true (the default) reads into an
     /// `entries * span` pinned host arena then `hipMemcpy`s into VMM (kernel-bug
     /// workaround); false (`--direct-vmm-dma`) DMAs straight into the VMM slot (no
-    /// arena allocated).
-    pub fn new(entries: u32, span: usize, bounce: bool, sqpoll: bool) -> Result<Self> {
+    /// arena allocated). `sqpoll` selects the submission path — see [`Sqpoll`];
+    /// every ring that submits a batch it wants run in PARALLEL wants a poller.
+    pub fn new(entries: u32, span: usize, bounce: bool, sqpoll: Sqpoll<'_>) -> Result<Self> {
+        let (want_poll, attach) = match sqpoll {
+            Sqpoll::Off => (0, -1),
+            Sqpoll::Own => (1, -1),
+            // SAFETY: `other.ring` is live for `other`'s lifetime, which outlives
+            // this call; the shim only reads its `ring_fd`.
+            Sqpoll::SharedWith(other) => (1, unsafe { ffi::rivoli_ring_fd(other.ring) }),
+        };
         let ring = unsafe {
-            ffi::rivoli_ring_new(entries, span as u32, i32::from(bounce), i32::from(sqpoll))
+            ffi::rivoli_ring_new(entries, span as u32, i32::from(bounce), want_poll, attach)
         };
         ensure!(
             !ring.is_null(),
@@ -166,11 +204,17 @@ impl Streamer {
     }
 
     /// Submit the queued reads to the kernel WITHOUT waiting, so they start running
-    /// on the NVMe/DMA side immediately. Used by the cross-layer prefetch ring: the
-    /// reads overlap the current layer's GPU compute, and a later [`Streamer::drain`]
-    /// reaps the same completions (its `submit_and_wait` then submits nothing new).
-    /// The `queued`/`min_res` bookkeeping is deliberately left intact for that drain.
+    /// on the NVMe/DMA side immediately. A later [`Streamer::drain`] reaps the same
+    /// completions (its `submit_and_wait` then submits nothing new); the
+    /// `queued`/`min_res` bookkeeping is deliberately left intact for that drain.
     /// No-op if nothing is queued.
+    ///
+    /// Both rings use this. The prefetch ring wants the call to RETURN promptly (its
+    /// reads must overlap the current layer's compute). The demand ring wants the
+    /// reads to START promptly and CONCURRENTLY — submitting here rather than letting
+    /// `drain`'s `submit_and_wait` do it puts the whole batch on the device before any
+    /// host work that follows, instead of dispatching it serially at join time. Under
+    /// [`Sqpoll::Off`] neither property holds, which is the point of the poller.
     pub fn submit(&self) -> Result<()> {
         if self.queued == 0 {
             return Ok(());

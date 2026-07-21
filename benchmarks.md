@@ -24,17 +24,18 @@ commands are given with each table.
 
 ## Current defaults
 
-`--cache-policy 2q --prefetch-depth 1`, prefetch on, SQPOLL prefetch ring.
+`--cache-policy 2q --prefetch-depth 1`, prefetch on, SQPOLL on BOTH io_uring
+rings, split-KV attention.
 
 ```
 rivoli /var/db/llama-server/glm52-colibri-int4 -bench 512 --pre-seed
 ```
 ```
-PROFILE/tok: 505ms wall | fetch 300ms 59% (43 miss, 6.97ms/miss)
-           | attn 114ms 23% | mlp 74ms 15% | lmhead 4ms 1% | route 2ms | other 10ms
-512 tokens in 266.5s — 1.92 tok/s | hit 92.5%
-expert source: loaded 91.8% | preloading 0.6% | cold 7.5%
-disk traffic: 50.6 expert reads/tok (0.96 GB/tok), 2.3% wasted
+PROFILE/tok: 458ms wall | fetch 281ms 61% (44 miss, 6.31ms/miss, submit 11ms + join 269ms)
+           | attn 88ms 19% | mlp 74ms 16% | lmhead 5ms 1% | route 2ms | other 9ms
+512 tokens in 242.0s — 2.12 tok/s | hit 92.2%
+expert source: loaded 91.6% | preloading 0.7% | cold 7.8%
+disk traffic: 52.2 expert reads/tok (0.99 GB/tok), 2.3% wasted
 ```
 
 Trajectory over 2026-07-20/21, same command, 512 tok:
@@ -44,7 +45,58 @@ Trajectory over 2026-07-20/21, same command, 512 tok:
 | M4 gate as recorded in PLAN.md | 1.31 | 763 | — | — |
 | measured baseline before this work | 0.90 | 1093 | — | — |
 | + vectorised int4 kernels | 0.96 | 1033 | 71.3 % | 3.28 |
-| + SQPOLL prefetch ring, 2q, depth 1 | **1.92** | **505** | **91.8 %** | **0.96** |
+| + SQPOLL prefetch ring, 2q, depth 1 | 1.99 | 488 | 91.8 % | 0.96 |
+| + SQPOLL demand ring + split-KV attn | **2.12** | **458** | **91.6 %** | **0.99** |
+
+**2.36x over the day.** Note the two halves: the kernel work took compute from
+481 to 174 ms/token, and the I/O work took `fetch` from ~600 to 281 ms while
+cutting disk traffic 3.7x. Neither alone would have crossed 2 tok/s.
+
+### Parallel-agent validation round (2026-07-21)
+
+Five candidate optimisations, each built in an isolated worktree, then validated
+serially (the GPU is sole-tenant and the NVMe is shared — see *Measurement
+hygiene*). 512 tok, defaults + `--pre-seed`, quiet machine:
+
+| candidate | wall | fetch (miss) | attn | mlp | loaded | tok/s | verdict |
+|---|---|---|---|---|---|---|---|
+| baseline | 488 | 287 (43) | 113 | 71 | 91.8 % | 1.99 | — |
+| demand-ring SQPOLL | 465 | 261 (43) | 114 | 74 | 91.8 % | 2.08 | **shipped** |
+| split-KV attention | 473 | 295 (44) | **88** | 74 | 91.6 % | 2.05 | **shipped** |
+| **both** | **458** | 281 (44) | **88** | 74 | 91.6 % | **2.12** | **shipped** |
+| both + `uint2` GEMV | 571 | 401 (70) | 88 | **69** | 87.0 % | 1.71 | rejected (routing) |
+| prefetch fetch-depth 4 | 1199 | 984 (106) | 118 | 80 | **71.7 %** | 0.82 | rejected |
+| 2Q Kin/Kout sweep | — | — | — | — | — | — | tooling only |
+
+The two winners compose additively and independently — one is pure I/O
+concurrency, the other pure kernel occupancy, and each preserved the other's
+bucket unchanged.
+
+**`--prefetch-fetch-depth` refuted the hypothesis it was built to test.** The idea
+was that prefetch's *fetch* volume and its *cache admission* are separable, so we
+could fill the NVMe queue without polluting 2Q's A1in probation. Fetch-depth 1
+reproduced baseline byte-identically (the side table is correctly inert), but at
+fetch-depth 4 residency COLLAPSED 91.8 % -> 71.7 % and traffic went 50.6 -> 219.8
+reads/tok. Mechanism: `prefetch_layer` skips keys resident in *either* tier, so a
+hot expert parked in the side table is never re-admitted to the policy and can only
+age out — the side table starves the cache it was meant to protect. Branch
+`worktree-agent-ab265f8e452e3d3f3` if someone wants to try promotion-on-use.
+
+### Measurement hygiene
+
+Running the five agent builds concurrently with a benchmark cost **18 % of
+throughput** and would have been invisible without the counters:
+
+| | quiet machine | during 5 concurrent builds |
+|---|---|---|
+| cache counters | 286885 / 23315 | **286885 / 23315** (byte-identical) |
+| `attn` / `mlp` | 113 / 71 ms | **113 / 71 ms** (identical) |
+| `ms/miss` | 6.65 | **9.48** (+36 %) |
+| tok/s | 1.99 | 1.58 |
+
+Cache behaviour and compute were bit-for-bit unchanged; only disk service time
+moved. Benchmark on an idle machine, and always check the counters before
+believing a delta.
 
 ---
 
@@ -63,7 +115,8 @@ evenly across `nvme0n1p6` + `nvme1n1` (byte counters match to <1 %):
 `iouring_vmm` probe, which was sequential 1 MiB and did not survive contact with
 expert-sized random reads.
 
-**LPDDR5X** — ~230 GB/s peak; the vectorised int4 GEMV reaches 214.6 GB/s (93 %).
+**LPDDR5X** — ~230 GB/s peak; the shipped `uint` int4 GEMV reaches 190.5 GB/s
+(83 %). A `uint2` variant reaches 211.8 GB/s but is NOT shipped — see below.
 
 **Dispatch** (`docs/probes/dispatch_overhead_probe.cpp`): host launch 1.29 µs,
 `hipDeviceSynchronize` on an idle queue 0.10 µs, `rmsnorm` identical at grid=1 and
@@ -124,9 +177,20 @@ submitting task drives the btrfs/blk-mq dispatch inline. **The "async, overlaps 
 compute" prefetch was doing most of the read synchronously**, then hiding the cost
 in `other` — the one part of the forward pass no PROFILE bucket covers.
 
-Fix: `IORING_SETUP_SQPOLL` on the prefetch ring only (the main ring's submit is
-immediately followed by a blocking drain, so it gains nothing), with graceful
-fallback. `io_uring_submit` → **0.00 ms/tok**.
+Fix: `IORING_SETUP_SQPOLL`, with graceful fallback. `io_uring_submit` →
+**0.00 ms/tok**.
+
+**Correction (later the same day): the DEMAND ring needed it too.** It was
+initially left on a plain ring, reasoning that "its submit is immediately followed
+by a blocking drain, so it gains nothing." That conflates two different things:
+the thread blocks either way, but the reads do not ISSUE concurrently either way.
+Without a poller the calling thread walks the submission queue and hands each read
+to the block layer one at a time before it starts waiting, so a 6-SQE batch behaves
+like queue depth 1. The evidence fit: 6.65 ms for a 19 MB expert is 2.8 GB/s,
+essentially the array's measured **P=1** rate (2.53), not its P≥4 rate (6.69).
+Both rings now use SQPOLL and share one poller via `IORING_SETUP_ATTACH_WQ`;
+`ms/miss` 6.65 → 6.31, tok/s 1.99 → 2.08. Still only ~40 % of the P≥4 rate, so
+demand-read concurrency has headroom left.
 
 Effect at 128 tok, `--cache-policy 2q`:
 
@@ -146,19 +210,75 @@ moe_inter 2048, 162 MiB int4, past any cache):
 | variant | ms/layer | GB/s | speedup | ms/token (75 layers) |
 |---|---|---|---|---|
 | byte per lane (was shipped) | 2.282 | 74.4 | 1.00× | 171 |
-| **`uint` (4 B/lane)** | **0.883** | **192.4** | **2.58×** | **66** |
+| `uint` (4 B/lane) | 0.883 | 192.4 | 2.58× | 66 |
 | `uint4` (16 B/lane) | 0.791 | 214.6 | 2.88× | 59 |
+
+(`uint` is the SHIPPED width. `uint2` below is faster but was rejected in
+end-to-end measurement — read that section before changing this.)
 
 The old form gave lane `l` the columns `i ≡ l (mod 32)`, so lanes `l` and `l+1`
 read the *same* byte and a wave touched only 16 B per load — one eighth of a cache
 line. D3 had fixed the access *stride* but never the *width*.
 
-**`uint` chosen over `uint4` on alignment evidence:** the safetensors header is
-101512 bytes, so all 852 tensors in a shard sit at data offset ≡ 8 (mod 16), and
-pool placement preserves the skew — a `uint4` pointer cast is misaligned on every
-expert. The `uint` path needs only 4 B alignment and costs 2 % for the skew
-(203.9 GB/s aligned vs 199.7 at the real ≡8 offset), so `uint4`'s extra ~7 ms/token
-is not worth a runtime dispatch and fallback tier.
+**`uint4` is unshippable on alignment:** the safetensors header is 101512 bytes,
+so all 852 tensors in a shard sit at data offset ≡ 8 (mod 16), and pool placement
+preserves the skew — a `uint4` pointer cast is misaligned on every expert.
+
+### `uint2` — faster kernel, REJECTED end-to-end (2026-07-21)
+
+8 mod 16 is still **8-byte** aligned, so `uint2` (8 B/lane = 16 columns, wave-load
+256 B) is legal on the real layout and had never been measured. It is a
+genuinely faster kernel and it is NOT shipped; the end-to-end result below is why. `docs/probes/i4gemv_u64_probe.cpp`, same shapes, **min of 9
+interleaved rounds** — run-to-run spread on this part is ~5 % and a single ordered
+pass systematically penalises whichever variant is measured first, so configs are
+swept round-robin:
+
+| variant | base % 16 | ms/layer | GB/s | ms/token |
+|---|---|---|---|---|
+| `uint` (4 B/lane) | 0 | 0.903 | 188.1 | 68 |
+| `uint2` (8 B/lane) | 0 | 0.814 | 208.6 | 61 |
+| `uint4` (16 B/lane) | 0 | 0.780 | 217.7 | 59 |
+| `uint` (4 B/lane) — was shipped | **8** | 0.892 | 190.5 | 67 |
+| **`uint2` (8 B/lane) — not shipped** | **8** | **0.802** | **211.8** | **60** |
+
+**`uint2` takes 80 % of the gap to `uint4` and pays nothing for the skew.** Where
+`uint` loses ~2 % at the real ≡8 offset (`i4_align_probe.cpp`), `uint2` measures
+0.814 aligned vs 0.802 skewed — identical within noise, because its 256 B span
+straddles the same number of cache lines either way. So no runtime dispatch or
+alignment tier is needed: the single 8 B guard is satisfied by every tensor in the
+snapshot. Worth **~7 ms/token**; `mlp` should land near 67 ms against its 74.
+
+`dot_i8_wave` (lm_head, `i8gemv_u64_probe.cpp`, vocab 154880 × hidden 6144, 952 MB,
+min of 7 rounds at skew 8) got the same treatment: **207.5 → 223.6 GB/s**
+(4.59 → 4.25 ms), 97 % of peak. Only ~0.3 ms/token — it rides along with the int4
+change rather than justifying itself.
+
+The implementation makes both helpers three tiers (uint2 → uint → scalar), each
+guarded on the actual row pointer; at GLM dims only the uint2 tier runs. Verified
+against a host scalar oracle over 15 dims × 6 base offsets, plus 50-launch
+bit-identical determinism. It is correct and it is faster. **It is still not
+shipped**, for a reason no micro-benchmark could show:
+
+| build (512 tok, defaults + `--pre-seed`) | `mlp` | miss/tok | **loaded** | tok/s |
+|---|---|---|---|---|
+| without `uint2` | 74 ms | 44 | 91.6 % | **2.12** |
+| with `uint2` | **69 ms** | **70** | **87.0 %** | 1.71 |
+
+`uint2` delivered its 5 ms of `mlp` exactly as predicted — and cost ~120 ms of
+`fetch`. Changing the summation order perturbs f32 rounding, which changes the
+sampled tokens, which reroutes experts, which collapsed residency from 91.6 % to
+87.0 %.
+
+**This is a routing lottery, not a regression.** The same kernel on a different
+prompt could land the other way; nothing about `uint2` is worse. But trading a
+~1 % compute gain for a ~15 % routing variance is not a bet worth taking on the
+default path when the only evidence available is one prompt. Revisit it against a
+prompt SET, where the routing draw averages out and the 5 ms is what remains.
+The patch lives on branch `worktree-agent-add1d8c9d69004b34`.
+
+This is the sharpest illustration of the tok/s-comparability rule at the top of
+this file: the buckets said ship it, the wall clock said don't, and both were
+right about different things.
 
 In-engine effect, 128 tok (buckets, which are hit-rate independent):
 
@@ -175,6 +295,27 @@ wave-per-row, measured 5.45× in isolation but worth only ~7 ms/token.
 
 ---
 
+## Split-KV attention (2026-07-21)
+
+`mla_latent_attend` launched `grid = ceil(H/HB)` = **8 workgroups on a 40-CU GPU**
+(~20 % occupancy), and `attn` was the only bucket that grew with context (77 ms at
+128 tok → 113 ms at 512). The attended rows are now partitioned into `n_splits`
+chunks so `grid = ceil(H/HB) * n_splits` (~80 blocks at 512 rows); each split
+computes a partial online-softmax and a combine kernel merges them by rescaling to
+the global max.
+
+**`attn` 113 → 88 ms (−22 %).** Stability: every exponent formed anywhere is
+non-positive (`s − m_split` inside a split, `m_split − m_global` in the combine),
+so no unshifted exponential ever exists. Determinism: partials are combined in
+fixed split order, no atomics, and `n_splits` depends only on `(H, nr)` — so a
+given context length always produces the same summation order. Scratch is 2.1 MB
+allocated once at engine construction (the M3 contract forbids per-token
+`hipMalloc`). Below 64 rows it degenerates to bit-identical single-split
+behaviour. Cache counters moved only 91.8 % → 91.6 %, consistent with the one
+extra rounding layer the combine adds.
+
+---
+
 ## Retired claims
 
 Recorded because each was believed, acted on, and then measured false.
@@ -187,7 +328,9 @@ Recorded because each was believed, acted on, and then measured false.
 | "ARC is the best policy" | **Wrong.** Worst of the three at depth 1 (0.83 vs 2q's 1.92). |
 | "hit rate ≈ residency" | **Wrong.** Prefetched-off-disk experts count as hits; `loaded` is the real metric. |
 | "≤1 join/token is a throughput lever" (bottleneck #3) | **Retired.** Inherited from colibri's OpenMP costs; on HIP all ~150 syncs cost ~0.9 ms/token. |
-| "prefetched entries are evicted before use" (my hypothesis) | **Refuted.** Only 127/1205 (depth 2) and 609/15179 (depth 8) wasted reads were later demanded, and the share *falls* with depth. Waste is plain misprediction. |
+| "prefetched entries are evicted before use" (hypothesis) | **Refuted.** Only 127/1205 (depth 2) and 609/15179 (depth 8) wasted reads were later demanded, and the share *falls* with depth. Waste is plain misprediction. |
+| "the demand ring gains nothing from SQPOLL" | **Wrong.** Blocking the thread and issuing reads concurrently are different things; the batch was behaving like QD=1. Worth +4.5 %. |
+| "prefetch fetch depth and cache admission are separable" (hypothesis) | **Refuted.** A disjoint side table starves the policy: residency 91.8 % -> 71.7 % at fetch-depth 4. |
 | "resident-tier VMM → ~2× experts fit" | **Retired** earlier (double-counting; madvise already banked it). See PLAN.md. |
 
 ---
@@ -201,8 +344,8 @@ cargo test  --release --features rocm -- --test-threads=1   # 52 tests; serial: 
 ```
 
 Probes (`hipcc -O3 --offload-arch=gfx1151 <file> -o <bin>`):
-`docs/probes/i4gemv_probe.cpp`, `mla_proj_probe.cpp`, `i4_align_probe.cpp`,
-`dispatch_overhead_probe.cpp`.
+`docs/probes/i4gemv_probe.cpp`, `i4gemv_u64_probe.cpp`, `i8gemv_u64_probe.cpp`,
+`mla_proj_probe.cpp`, `i4_align_probe.cpp`, `dispatch_overhead_probe.cpp`.
 
 The GPU must be sole-tenant (the engine refuses to start on >1 GiB foreign GTT),
 and the snapshot must be on **local** storage — io_uring→VMM EFAULTs on NFS fds

@@ -57,24 +57,43 @@ struct Ring {
 // `bounce` != 0, allocate an `entries * span` pinned host arena + per-read
 // bookkeeping (the kernel-bug workaround); otherwise reads DMA straight into the
 // caller's VMM dst. Returns an opaque handle or null on failure.
-// `sqpoll` != 0 asks the kernel to run a submission-poller thread, so
-// io_uring_submit becomes a shared-memory tail update with NO io_uring_enter
-// syscall on the caller's thread. This matters ONLY for the prefetch ring:
-// measured, a plain io_uring_submit of one expert's 6 O_DIRECT reads blocks the
-// decode thread for ~2.96 ms — about 61% of the 4.85 ms the read itself takes —
-// because the submitting task drives the btrfs/blk-mq dispatch inline. That made
-// "async" prefetch effectively synchronous: it never overlapped GPU compute, it
-// just moved the read out of the `fetch` bucket into untimed `other`.
-// Falls back to a normal ring if SQPOLL is unavailable (older kernel, no perm).
-extern "C" void* rivoli_ring_new(unsigned entries, unsigned span, int bounce, int sqpoll) {
+//
+// `sqpoll` != 0 asks the kernel to run a submission-poller thread, so submission
+// becomes a shared-memory tail update with NO io_uring_enter syscall on the
+// caller's thread. Measured, a plain submit of one expert's 6 O_DIRECT reads
+// blocks the submitting thread ~2.96 ms — 61% of the 4.85 ms the read itself
+// takes — because that thread drives the btrfs/blk-mq dispatch INLINE, one SQE
+// at a time. Two consequences, and the second was missed for a long time:
+//   1. an "async" submit is not async (this is the prefetch bug, fixed 2026-07-21);
+//   2. the reads never reach the device CONCURRENTLY, because the inline dispatch
+//      is serial. A batch of 6 SQEs behaves like queue depth 1. That is why the
+//      demand path measured 6.97 ms per 19 MB expert — the array's P=1 rate
+//      (2.53 GB/s) — while the same array does 6.69 GB/s at P>=4.
+// So SQPOLL is wanted on EVERY ring that submits a batch it wants run in
+// parallel, not just on rings whose submit must return immediately.
+//
+// `attach_fd` >= 0 asks this ring to SHARE that (already SQPOLL) ring's poller
+// thread via IORING_SETUP_ATTACH_WQ, rather than starting a second kernel thread
+// that spins on this box's already bandwidth-tight LPDDR5X. Fallback ladder:
+// attached poller -> own poller -> plain ring.
+extern "C" void* rivoli_ring_new(unsigned entries, unsigned span, int bounce, int sqpoll,
+                                 int attach_fd) {
     Ring* r = (Ring*)calloc(1, sizeof(Ring));
     if (!r) return nullptr;
     int ok = -1;
-    if (sqpoll) {
+    if (sqpoll && attach_fd >= 0) {
+        struct io_uring_params p;
+        memset(&p, 0, sizeof(p));
+        p.flags = IORING_SETUP_SQPOLL | IORING_SETUP_ATTACH_WQ;
+        p.sq_thread_idle = 2000;  // ms before the poller sleeps; re-armed on submit
+        p.wq_fd = (unsigned)attach_fd;
+        ok = io_uring_queue_init_params(entries, &r->uring, &p);
+    }
+    if (sqpoll && ok < 0) {
         struct io_uring_params p;
         memset(&p, 0, sizeof(p));
         p.flags = IORING_SETUP_SQPOLL;
-        p.sq_thread_idle = 2000;  // ms before the poller sleeps; re-armed on submit
+        p.sq_thread_idle = 2000;
         ok = io_uring_queue_init_params(entries, &r->uring, &p);
     }
     if (ok < 0 && io_uring_queue_init(entries, &r->uring, 0) < 0) { free(r); return nullptr; }
@@ -94,6 +113,12 @@ extern "C" void* rivoli_ring_new(unsigned entries, unsigned span, int bounce, in
         }
     }
     return r;
+}
+
+// This ring's io_uring fd, for passing as another ring's `attach_fd` so the two
+// share one submission-poller thread. Valid until rivoli_ring_free.
+extern "C" int rivoli_ring_fd(void* ring) {
+    return ((Ring*)ring)->uring.ring_fd;
 }
 
 // Queue one O_DIRECT read: `nbytes` from `fd` at `off`. DIRECT mode reads straight

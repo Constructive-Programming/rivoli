@@ -344,6 +344,9 @@ fn check_attend_sel(seed: u64, h: usize, nt: usize, kvl: usize, rope: usize, sel
     let lc_buf = dev_bytes(&u16_bytes(&lc));
     let rc_buf = dev_bytes(&u16_bytes(&rc));
     let mut clat_buf = dev_zeroed(h * kvl * 4);
+    // Split-KV partial scratch (caller-owned, worst-case sized). Non-null so the
+    // multi-split + combine path is what these oracles actually check.
+    let mut part_buf = dev_zeroed(rivoli::hip::attend_scratch_floats(h, kvl) * 4);
     let rows_buf = dev_bytes(&u32_bytes(rows)); // kept alive even on the dense path
     let rows_ptr = if sel.is_some() {
         rows_buf.ptr() as *const u32
@@ -365,6 +368,7 @@ fn check_attend_sel(seed: u64, h: usize, nt: usize, kvl: usize, rope: usize, sel
             rope,
             scale,
             clat_buf.ptr_mut() as *mut f32,
+            part_buf.ptr_mut() as *mut f32,
         )
         .expect("launch attend");
     }
@@ -417,6 +421,18 @@ fn mla_attend_head_tiling_boundaries() {
 }
 
 #[test]
+fn mla_attend_split_kv_matches_scalar() {
+    // Split-KV: the row range is cut across grid.y and recombined by
+    // mla_attend_combine. These sizes drive the planner to its high end (nr=1000
+    // → ~10 splits at H=64), so the combine's max/rescale/sum is what is under
+    // test, not just the single-split fast path the smaller cases take.
+    check_attend(0x5b11_7000, 64, 1000, 512, 64);
+    // Non-TILE-aligned tail plus a partial head block, so the last split is
+    // short in BOTH dimensions.
+    check_attend(0x5b11_7001, 20, 999, 512, 64);
+}
+
+#[test]
 fn mla_attend_gather_matches_scalar() {
     // Sparse gather at GLM dims: a scattered subset (every 3rd row + the last,
     // non-contiguous strides through the slab) and a streaming-shaped subset
@@ -428,6 +444,11 @@ fn mla_attend_gather_matches_scalar() {
     check_attend_sel(0x51de_ca8e, 20, 300, 512, 64, Some(&streaming));
     // Single selected row (the degenerate softmax-of-one path).
     check_attend_sel(0x0000_0001, 4, 50, 32, 8, Some(&[49]));
+    // Gather WIDE enough to be split across grid.y: the splits partition the
+    // selected row list, not the underlying slab, so each block's tile loader
+    // must indirect through `rows` at its own offset.
+    let wide: Vec<u32> = (0..1200u32).step_by(2).collect();
+    check_attend_sel(0x5ca7_5b11, 64, 1200, 512, 64, Some(&wide));
 }
 
 /// Random int8 matrix `[o, i]`: signed bytes + per-row f32 scale bytes.
@@ -1103,6 +1124,7 @@ fn mla_attend_fp8_matches_scalar() {
     let lscale_buf = dev_bytes(&f32_bytes(&lscale));
     let rc_buf = dev_bytes(&u16_bytes(&rc));
     let mut clat_buf = dev_zeroed(h * kvl * 4);
+    let mut part_buf = dev_zeroed(rivoli::hip::attend_scratch_floats(h, kvl) * 4);
     // SAFETY: device pointers sized for the dims; rows=null → dense over nt.
     unsafe {
         rivoli::hip::launch_attend_fp8(
@@ -1119,6 +1141,7 @@ fn mla_attend_fp8_matches_scalar() {
             nb,
             scale,
             clat_buf.ptr_mut() as *mut f32,
+            part_buf.ptr_mut() as *mut f32,
         )
         .expect("attend_fp8");
     }

@@ -85,7 +85,13 @@ fn route_into(
 /// into I/O (fetch) vs GPU compute (attn/mlp/lmhead) vs host routing.
 #[derive(Default)]
 struct Profile {
-    fetch_ns: u128,  // io_uring O_DIRECT cold stream (NVMe->VMM)
+    fetch_ns: u128, // io_uring O_DIRECT cold stream (NVMe->VMM): submit + join
+    /// The SUBMIT half of `fetch_ns` (prefetch drain + hit scan + alloc + queue +
+    /// non-blocking submit); `fetch_ns - fetch_submit_ns` is the JOIN half, the time
+    /// actually blocked waiting on the NVMe. The split is the diagnostic for whether
+    /// the submit/await restructuring bought anything: work moved out from between
+    /// the submit and the join can only shrink the join.
+    fetch_submit_ns: u128,
     fetch_n: u64,    // miss count
     attn_ns: u128,   // mid-layer sync — attention+gate GPU compute
     mlp_ns: u128,    // end-of-layer sync — MLP GPU compute (+ dense-layer attn)
@@ -102,12 +108,14 @@ impl Profile {
         let pct = |ns: u128| 100.0 * ns as f64 / self.wall_ns.max(1) as f64;
         let accounted = self.fetch_ns + self.attn_ns + self.mlp_ns + self.lmhead_ns + self.route_ns;
         tracing::info!(
-            "PROFILE/tok: {:.0}ms wall | fetch {:.0}ms {:.0}% ({} miss, {:.2}ms/miss) | attn {:.0}ms {:.0}% | mlp {:.0}ms {:.0}% | lmhead {:.0}ms {:.0}% | route {:.0}ms | other {:.0}ms",
+            "PROFILE/tok: {:.0}ms wall | fetch {:.0}ms {:.0}% ({} miss, {:.2}ms/miss, submit {:.0}ms + join {:.0}ms) | attn {:.0}ms {:.0}% | mlp {:.0}ms {:.0}% | lmhead {:.0}ms {:.0}% | route {:.0}ms | other {:.0}ms",
             per(self.wall_ns),
             per(self.fetch_ns),
             pct(self.fetch_ns),
             self.fetch_n / self.tokens.max(1),
             self.fetch_ns as f64 / 1e6 / self.fetch_n.max(1) as f64,
+            per(self.fetch_submit_ns),
+            per(self.fetch_ns.saturating_sub(self.fetch_submit_ns)),
             per(self.attn_ns),
             pct(self.attn_ns),
             per(self.mlp_ns),
@@ -184,6 +192,11 @@ pub struct GpuEngine<'a> {
     qabs: DeviceBuf,
     qrope: DeviceBuf,
     clat: DeviceBuf,
+    /// Split-KV partial scratch for the attend kernel: per (split, head) an
+    /// unnormalised accumulator plus its (max, sum) pair. Sized ONCE for the
+    /// kernel's worst-case split count (`hip::attend_scratch_floats`), so every
+    /// context length reuses it and no token ever allocates.
+    attn_partial: DeviceBuf,
     ctx: DeviceBuf,
     gate_logits: DeviceBuf,
     // Cross-layer prefetch (`--prefetch`) scratch: L+1's router-gate prediction.
@@ -354,6 +367,7 @@ impl<'a> GpuEngine<'a> {
             qabs: f(h * kvl)?,
             qrope: f(h * rope)?,
             clat: f(h * kvl)?,
+            attn_partial: f(crate::hip::attend_scratch_floats(h, kvl))?,
             ctx: f(h * cfg.v_head_dim)?,
             gate_logits: f(cfg.n_experts)?,
             pred_xn: f(cfg.hidden)?,
@@ -625,6 +639,7 @@ impl<'a> GpuEngine<'a> {
         let qabsp = self.qabs.ptr_mut() as *mut f32;
         let qropep = self.qrope.ptr_mut() as *mut f32;
         let clatp = self.clat.ptr_mut() as *mut f32;
+        let apartp = self.attn_partial.ptr_mut() as *mut f32;
         let ctxp = self.ctx.ptr_mut() as *mut f32;
         let glp = self.gate_logits.ptr_mut() as *mut f32;
 
@@ -676,7 +691,7 @@ impl<'a> GpuEngine<'a> {
         }
 
         // Cold experts stream in per-MoE-layer via io_uring O_DIRECT (see
-        // pin::resolve_layer) — no separate page-cache warm step.
+        // pin::submit_layer) — no separate page-cache warm step.
 
         for l in 0..cfg.n_layers {
             // Copy the layer's weight pointers out (ends the &pin.layers borrow).
@@ -759,11 +774,11 @@ impl<'a> GpuEngine<'a> {
                 if kv_fp8 {
                     launch_attend_fp8(
                         qabsp, qropep, lc8p, lscalep, rcp, rows_ptr, h, nr, kvl, rope, nb, scale,
-                        clatp,
+                        clatp, apartp,
                     )?;
                 } else {
                     launch_attend(
-                        qabsp, qropep, lcp, rcp, rows_ptr, h, nr, kvl, rope, scale, clatp,
+                        qabsp, qropep, lcp, rcp, rows_ptr, h, nr, kvl, rope, scale, clatp, apartp,
                     )?;
                 }
                 launch_mla_value(clatp, kv_b.packed, kv_b.scale, h, nope, vh, kvl, ctxp)?;
@@ -877,13 +892,20 @@ impl<'a> GpuEngine<'a> {
                 // get the resolved descriptors back.
                 let miss0 = self.pin.misses;
                 let t = std::time::Instant::now();
-                self.pin.resolve_layer(l, &self.sel, &mut self.mlps)?;
-                self.prof.fetch_ns += t.elapsed().as_nanos();
+                // SUBMIT this layer's cold reads and take the descriptors back
+                // immediately — the slot ADDRESSES are known at allocation time, only
+                // the bytes are still arriving. Everything between here and
+                // `await_layer` below runs with the NVMe busy.
+                let batch = self.pin.submit_layer(l, &self.sel, &mut self.mlps)?;
+                let dt = t.elapsed().as_nanos();
+                self.prof.fetch_ns += dt;
+                self.prof.fetch_submit_ns += dt;
                 self.prof.fetch_n += self.pin.misses - miss0;
-                // Submit L+1's predicted-expert reads NOW (non-blocking): the main
-                // ring is quiescent (its drain just returned), and these reads run on
-                // the NVMe/DMA side during this layer's MoE compute below. They are
-                // reaped by `resolve_layer(l+1)`'s prefetch drain — hiding the fetch.
+                // Submit L+1's predicted-expert reads NOW (non-blocking), WHILE this
+                // layer's demand reads are still in flight, so both batches sit in the
+                // device queue together (the array wants P>=4 and this path has ~0.6
+                // demand misses per layer on its own). They are reaped by
+                // `submit_layer(l+1)`'s prefetch drain.
                 //
                 // Only the top `prefetch_depth` predictions (highest router score,
                 // `pred_sel` is score-desc) are prefetched: the NVMe is bandwidth-
@@ -923,8 +945,21 @@ impl<'a> GpuEngine<'a> {
                 let ndesc = self.descs.len();
                 self.descs_buf.copy_in_at(0, desc_bytes(&self.descs))?;
                 self.wexpert_buf.copy_in_at(0, f32_le_bytes(&self.w))?;
+                // JOIN the cold reads. Everything above — the prefetch submit, the
+                // descriptor/weight build, both H2D uploads — ran with them in flight;
+                // this is the last possible moment, because `launch_moe` below is the
+                // first thing that dereferences a cold slot.
+                //
+                // No kernel is live here, so the `hipDeviceSynchronize` inside the
+                // bounce-mode drain serialises nothing: the attention chain was joined
+                // by the `attn` sync above, and the only device work since is the two
+                // uploads immediately preceding, which must complete before
+                // `launch_moe` regardless.
+                let t = std::time::Instant::now();
+                self.pin.await_layer(batch)?;
+                self.prof.fetch_ns += t.elapsed().as_nanos();
                 // SAFETY: descs point at resident/cold-slot weights valid until
-                // the end-of-layer sync; all device-resident.
+                // the end-of-layer sync; the cold ones have now landed (`await_layer`).
                 unsafe {
                     launch_moe(
                         xnp,
