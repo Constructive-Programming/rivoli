@@ -22,10 +22,16 @@
 //     host (get_user_pages OK) and copies host->device into the VMM slot (220 GB/s
 //     device-fill, ~free vs the NVMe read), keeping O_DIRECT + QD without ever
 //     DMA'ing into VMM.
-//     REVERT: once a fixed amdgpu lands, the DIRECT mode works again — re-probe
-//     with docs/probes/iouring_vmm.cpp (no `read err -14` => fixed), then flip the
-//     default back to DIRECT (making `--direct-vmm-dma` unnecessary). Eventually
-//     delete the bounce arm entirely.
+//     STATUS 2026-07-21: the EFAULT is GONE on this same kernel (6.18.38-gentoo) —
+//     `--direct-vmm-dma` runs clean, with and without O_DIRECT. But do NOT flip the
+//     default: DIRECT is now the slower arm for a DIFFERENT reason. Measured at 512
+//     tokens, identical cache counters, only the destination varying:
+//       O_DIRECT + bounce  fetch 506ms (4.17 ms/miss)  mlp  76ms  1.43 tok/s
+//       O_DIRECT + VMM     fetch 560ms (4.62 ms/miss)  mlp 108ms  1.27 tok/s
+//     The bounce's H2D is not waste — it is what puts the weights in DEVICE-LOCAL
+//     memory. Reading them from host-mapped VMM instead costs ~40% on `mlp`, the
+//     system-vs-device-domain read tax documented in docs/hip-apu-memory.md, which
+//     is far more than the H2D copy it saves. Keep the bounce.
 //   ------------------------------------------------------------------------
 //
 // A thin C ABI over liburing (on-box). The caller (src/stream.rs) does all the

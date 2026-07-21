@@ -23,8 +23,11 @@ use tracing::info;
 /// `--max-mem <GiB>` caps the device expert-pool budget; default (unset) takes all
 /// safe free memory (`free − OS_RESERVE`), and a value caps it lower:
 /// `min(free − OS_RESERVE, max_mem)`. Bigger = more resident experts = higher hit.
-/// `--direct-io` makes the cold-expert reads use O_DIRECT (bypass the OS page
-/// cache); default is buffered reads through the page cache.
+/// Cold-expert reads use O_DIRECT by DEFAULT (bypassing the OS page cache);
+/// `--buffered-io` opts back into buffered reads. O_DIRECT measured 4.17 vs
+/// 5.60 ms/miss and 1.43 vs 1.14 tok/s at 512 tokens — the page cache is pure
+/// overhead here (a ~269 GB model against ~30 GB of free RAM caches nothing
+/// useful) and its copy sits on the critical path.
 /// `--attn auto|dense|streaming|dsa|misa` picks the attention row-selection
 /// mechanism (see attn::AttnMode). `--sinks`/`--window` shape streaming mode
 /// (defaults 4 / 8192, the StreamingLLM shape). dsa/misa need the `out-idx-*`
@@ -62,7 +65,7 @@ fn parse_args() -> Result<Args> {
     const USAGE: &str = "usage: rivoli <snapshot-dir> [-bench <tokens>] [--pre-seed] \
          [--direct-vmm-dma] [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc] \
          [--2q-kin <pct>] [--2q-kout <pct>] \
-         [--no-prefetch] [--prefetch-depth <n>] [--max-mem <GiB>] [--direct-io] \
+         [--no-prefetch] [--prefetch-depth <n>] [--max-mem <GiB>] [--buffered-io] \
          [--attn auto|dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>] [--kv-fp8]";
     let mut snapshot = None;
     // Defaults are the winning cell of the 512-token depth x policy grid (see
@@ -91,7 +94,7 @@ fn parse_args() -> Result<Args> {
         prefetch: true,
         prefetch_depth: 1,
         max_mem: None, // default: take all safe free memory (free − OS_RESERVE)
-        direct_io: false,
+        direct_io: true,
         attn: "auto".to_string(),
         sinks: 4,
         window: 8192,
@@ -147,7 +150,7 @@ fn parse_args() -> Result<Args> {
                 }
                 a.max_mem = Some(gib << 30);
             }
-            "--direct-io" => a.direct_io = true,
+            "--buffered-io" => a.direct_io = false,
             "--attn" => {
                 a.attn = args
                     .next()
