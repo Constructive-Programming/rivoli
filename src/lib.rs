@@ -16,4 +16,5 @@ pub mod stream;
 pub mod telemetry;
 pub mod tokenizer;
 pub mod usage;
+pub mod vqstream;
 pub mod watchdog;
