@@ -30,6 +30,22 @@ extern "C" __global__ void gemv_i4(
     if (lane == 0) y[o] = acc * scale[o];
 }
 
+// y[o] = Σ_subvec scale[o,grp]·codebook[idx]·x  — VQ-int3, per-group bf16 scale
+// applied inside the dot (no per-row post-scale). `codebook` is shared across all
+// rows/experts; `indices`/`scales` are this matrix's packed indices + bf16 groups.
+extern "C" __global__ void gemv_vq(
+    const float* __restrict__ x, const unsigned char* __restrict__ indices,
+    const unsigned short* __restrict__ scales, const float* __restrict__ codebook,
+    int o_dim, int i_dim, float* __restrict__ y) {
+    int lane = threadIdx.x & (WAVE - 1);
+    size_t o = (size_t)blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x / WAVE);
+    if (o >= (size_t)o_dim) return;
+    size_t rb = (size_t)(i_dim / VQ_DIM) * VQ_INDEX_BITS / 8;  // vq_row_bytes
+    size_t ng = (size_t)i_dim / VQ_GROUP;                      // vq_groups
+    float acc = dot_vq_wave(x, indices + o * rb, scales + o * ng, codebook, i_dim, lane);
+    if (lane == 0) y[o] = acc;
+}
+
 // y[o] = scale[o] · Σ_i x[i]·(int8)packed[o·i_dim+i]   — int8, per-row scale.
 extern "C" __global__ void gemv_i8(
     const float* __restrict__ x, const unsigned char* __restrict__ packed,
@@ -49,6 +65,19 @@ extern "C" int rivoli_gemv_i4(
     hipGetLastError();
     hipLaunchKernelGGL(gemv_i4, dim3((o_dim + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
                        dim3(ROWS_PER_BLOCK * WAVE), 0, 0, x, packed, scale, o_dim, i_dim, y);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+// grid = ceil(o_dim / ROWS_PER_BLOCK) blocks of 256 threads (one wave per row).
+extern "C" int rivoli_gemv_vq(
+    const float* x, const unsigned char* indices, const unsigned short* scales,
+    const float* codebook, int o_dim, int i_dim, float* y) {
+    if (o_dim <= 0 || i_dim <= 0) return 1001;
+    hipGetLastError();
+    hipLaunchKernelGGL(gemv_vq, dim3((o_dim + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
+                       dim3(ROWS_PER_BLOCK * WAVE), 0, 0, x, indices, scales, codebook,
+                       o_dim, i_dim, y);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

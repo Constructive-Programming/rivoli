@@ -34,12 +34,16 @@ fn dev_zeroed(len: usize) -> DeviceBuf {
     dev_bytes(&vec![0u8; len])
 }
 use rivoli::hip::{
-    ExpertDesc, device_sync, launch_attend, launch_gemv_bf16, launch_gemv_f32, launch_gemv_i4,
-    launch_gemv_i8, launch_index_head_route, launch_index_pool_push, launch_index_score,
-    launch_layernorm, launch_mla_absorb, launch_mla_value, launch_moe, launch_rmsnorm, launch_rope,
+    ExpertDesc, ExpertDescVq, device_sync, launch_attend, launch_gemv_bf16, launch_gemv_f32,
+    launch_gemv_i4, launch_gemv_i8, launch_gemv_vq, launch_index_head_route,
+    launch_index_pool_push, launch_index_score, launch_layernorm, launch_mla_absorb,
+    launch_mla_value, launch_moe, launch_moe_vq, launch_rmsnorm, launch_rope,
 };
 use rivoli::math::{bf16_to_f32, f32_to_bf16, silu, softmax};
-use rivoli::quant::{addrow, matvec_f32_bytes, matvec_i4, matvec_i4_rows, matvec_i8, row_bytes};
+use rivoli::quant::{
+    VQ_DIM, VQ_K, addrow, matvec_f32_bytes, matvec_i4, matvec_i4_rows, matvec_i8, matvec_vq,
+    quant_vq, row_bytes,
+};
 use rivoli::snapshot::{Int4Matrix, Int8Matrix};
 
 /// Little-endian bytes of an f32 slice (device is LE, matching this host).
@@ -1151,4 +1155,171 @@ fn mla_attend_fp8_matches_scalar() {
         &f32_vec(&clat_buf.copy_out().expect("out")),
         "attend_fp8",
     );
+}
+
+// ── VQ-int3 GEMV (M3) ───────────────────────────────────────────────────────
+// The device `gemv_vq` must reproduce the `matvec_vq` oracle: same indices,
+// scales, and codebook, so any divergence is a device-decode bug (index unpack,
+// codebook gather, or group-scale application), not a quantization difference.
+
+/// Quantize a random `[o_dim,i_dim]` matrix against a random codebook, then check
+/// the GPU VQ GEMV equals the CPU `matvec_vq` on the same bytes.
+fn gemv_vq_check(seed: u64, o_dim: usize, i_dim: usize) {
+    let mut rng = Lcg(seed);
+    let codebook: Vec<f32> = (0..VQ_K * VQ_DIM).map(|_| rng.f()).collect();
+    let w: Vec<f32> = (0..o_dim * i_dim).map(|_| rng.f()).collect();
+    let (indices, scales) = quant_vq(&w, o_dim, i_dim, &codebook);
+    let x: Vec<f32> = (0..i_dim).map(|_| rng.f()).collect();
+
+    let mut want = vec![0.0f32; o_dim];
+    matvec_vq(&mut want, &x, &indices, &scales, &codebook, o_dim, i_dim);
+
+    let xb = dev_bytes(&f32_bytes(&x));
+    let ib = dev_bytes(&indices);
+    let sb = dev_bytes(&u16_bytes(&scales));
+    let cb = dev_bytes(&f32_bytes(&codebook));
+    let mut yb = dev_zeroed(o_dim * 4);
+    // SAFETY: all buffers live until device_sync; dims/lengths match the kernel's
+    // vq_row_bytes/vq_groups expectations.
+    unsafe {
+        launch_gemv_vq(
+            xb.ptr() as *const f32,
+            ib.ptr(),
+            sb.ptr() as *const u16,
+            cb.ptr() as *const f32,
+            o_dim,
+            i_dim,
+            yb.ptr_mut() as *mut f32,
+        )
+        .expect("launch gemv_vq");
+    }
+    device_sync().expect("sync");
+    let got = f32_vec(&yb.copy_out().expect("out"));
+    assert_close(&want, &got, &format!("gemv_vq o={o_dim} i={i_dim}"));
+}
+
+#[test]
+fn gemv_vq_matches_scalar_glm_dims() {
+    gemv_vq_check(0xA1, 2048, 6144); // gate/up: hidden→moe_inter
+    gemv_vq_check(0xB2, 6144, 2048); // down: moe_inter→hidden
+}
+
+#[test]
+fn gemv_vq_matches_scalar_tiny() {
+    gemv_vq_check(0xC3, 8, 64); // one group, few rows — exercises the wave tail
+}
+
+// ── VQ-int3 fused MoE (M3) ──────────────────────────────────────────────────
+// The fused device path (moe_gateup_vq → moe_down_vq → moe_reduce) vs a scalar
+// reference built from matvec_vq + silu on the SAME quantized bytes — so drift is
+// only f32 reduction order (silu/expf, wave-shuffle), not a decode bug.
+
+/// A random `[o_dim,i_dim]` matrix quantized against `cb`.
+fn quant_rand_proj(rng: &mut Lcg, cb: &[f32], o_dim: usize, i_dim: usize) -> (Vec<u8>, Vec<u16>) {
+    let w: Vec<f32> = (0..o_dim * i_dim).map(|_| rng.f()).collect();
+    quant_vq(&w, o_dim, i_dim, cb)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vq_reference(
+    x: &[f32],
+    hidden: usize,
+    inter: usize,
+    cb: &[f32],
+    gates: &[(Vec<u8>, Vec<u16>)],
+    ups: &[(Vec<u8>, Vec<u16>)],
+    downs: &[(Vec<u8>, Vec<u16>)],
+    w: &[f32],
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; hidden];
+    for e in 0..w.len() {
+        let mut gate = vec![0.0f32; inter];
+        let mut up = vec![0.0f32; inter];
+        matvec_vq(&mut gate, x, &gates[e].0, &gates[e].1, cb, inter, hidden);
+        matvec_vq(&mut up, x, &ups[e].0, &ups[e].1, cb, inter, hidden);
+        let h: Vec<f32> = (0..inter).map(|j| silu(gate[j]) * up[j]).collect();
+        let mut down = vec![0.0f32; hidden];
+        matvec_vq(&mut down, &h, &downs[e].0, &downs[e].1, cb, hidden, inter);
+        for o in 0..hidden {
+            out[o] += w[e] * down[o];
+        }
+    }
+    out
+}
+
+fn moe_vq_check(seed: u64, hidden: usize, inter: usize, e: usize) {
+    let mut rng = Lcg(seed);
+    let cb: Vec<f32> = (0..VQ_K * VQ_DIM).map(|_| rng.f()).collect();
+    let x: Vec<f32> = (0..hidden).map(|_| rng.f()).collect();
+    let gates: Vec<_> = (0..e)
+        .map(|_| quant_rand_proj(&mut rng, &cb, inter, hidden))
+        .collect();
+    let ups: Vec<_> = (0..e)
+        .map(|_| quant_rand_proj(&mut rng, &cb, inter, hidden))
+        .collect();
+    let downs: Vec<_> = (0..e)
+        .map(|_| quant_rand_proj(&mut rng, &cb, hidden, inter))
+        .collect();
+    let w: Vec<f32> = (0..e).map(|_| rng.f()).collect();
+
+    let want = vq_reference(&x, hidden, inter, &cb, &gates, &ups, &downs, &w);
+
+    let mut tier = DeviceTier::new(256 << 20).expect("alloc tier");
+    let cb_ptr = place_bytes(&mut tier, &f32_bytes(&cb)) as *const f32;
+    let descs: Vec<ExpertDescVq> = (0..e)
+        .map(|i| ExpertDescVq {
+            gate_indices: place_bytes(&mut tier, &gates[i].0),
+            gate_scales: place_bytes(&mut tier, &u16_bytes(&gates[i].1)) as *const u16,
+            up_indices: place_bytes(&mut tier, &ups[i].0),
+            up_scales: place_bytes(&mut tier, &u16_bytes(&ups[i].1)) as *const u16,
+            down_indices: place_bytes(&mut tier, &downs[i].0),
+            down_scales: place_bytes(&mut tier, &u16_bytes(&downs[i].1)) as *const u16,
+        })
+        .collect();
+    let desc_bytes = unsafe {
+        std::slice::from_raw_parts(
+            descs.as_ptr() as *const u8,
+            std::mem::size_of_val(&descs[..]),
+        )
+    };
+    let descs_buf = dev_bytes(desc_bytes);
+    let x_buf = dev_bytes(&f32_bytes(&x));
+    let w_buf = dev_bytes(&f32_bytes(&w));
+    let mut h_buf = DeviceBuf::new(e * inter * 4).expect("alloc h");
+    let mut partial_buf = DeviceBuf::new(e * hidden * 4).expect("alloc partial");
+    let mut out_buf = DeviceBuf::new(hidden * 4).expect("alloc out");
+
+    // SAFETY: all buffers device-resident for the dims; h/partial/out fully written.
+    unsafe {
+        launch_moe_vq(
+            x_buf.ptr() as *const f32,
+            hidden,
+            inter,
+            e,
+            descs_buf.ptr() as *const ExpertDescVq,
+            cb_ptr,
+            w_buf.ptr() as *const f32,
+            h_buf.ptr_mut() as *mut f32,
+            partial_buf.ptr_mut() as *mut f32,
+            out_buf.ptr_mut() as *mut f32,
+        )
+        .expect("launch moe_vq");
+    }
+    device_sync().expect("device sync");
+    let got = f32_vec(&out_buf.copy_out().expect("copy out"));
+    assert_close(
+        &want,
+        &got,
+        &format!("moe_vq hidden={hidden} inter={inter} e={e}"),
+    );
+}
+
+#[test]
+fn moe_vq_matches_scalar() {
+    moe_vq_check(0xD4, 128, 64, 3); // multi-group hidden (2×64), one-group inter
+}
+
+#[test]
+fn moe_vq_single_expert() {
+    moe_vq_check(0xE5, 256, 128, 1); // isolates the fused path from cross-expert sum
 }

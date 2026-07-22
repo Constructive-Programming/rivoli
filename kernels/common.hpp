@@ -105,3 +105,43 @@ __device__ __forceinline__ unsigned short f2bf16(float x) {
     unsigned int r = ((b >> 16) & 1u) + 0x7fffu;
     return (unsigned short)((b + r) >> 16);
 }
+
+// VQ-int3 codebook parameters — MUST match quant.rs (VQ_DIM/VQ_INDEX_BITS/VQ_GROUP).
+#define VQ_DIM 4
+#define VQ_INDEX_BITS 12
+#define VQ_GROUP 64
+#define VQ_SUBS_PER_GROUP (VQ_GROUP / VQ_DIM)  // subvectors sharing one bf16 scale
+
+// Wave-cooperative VQ-int3 dot for one output row, result on lane 0. Matches
+// quant.rs::matvec_vq: each VQ_DIM-subvector t reads a packed 12-bit codebook
+// index, dots x[t*VQ_DIM..] with codebook[idx*VQ_DIM..], and scales by the
+// subvector's bf16 group scale (group = t / VQ_SUBS_PER_GROUP).
+//
+// Lane `l` owns subvectors t ≡ l (mod WAVE) (strided). Unlike dot_i4_wave there
+// is no dword fast path: the 12-bit indices don't align to lane boundaries and
+// the codebook gather is the real cost, not the index load. `idxrow` is this
+// row's packed indices, `scalerow` its bf16 group scales, `cb` the shared
+// codebook (VQ_K*VQ_DIM f32). The two-byte index read is in-bounds because
+// i_dim is a multiple of 8, so nsub is even and the last (odd) subvector's high
+// byte is the row's last index byte (see quant.rs::get_idx / vq_row_bytes).
+__device__ __forceinline__ float dot_vq_wave(const float* __restrict__ x,
+                                             const unsigned char* __restrict__ idxrow,
+                                             const unsigned short* __restrict__ scalerow,
+                                             const float* __restrict__ cb, int i_dim, int lane) {
+    int nsub = i_dim / VQ_DIM;
+    float acc = 0.0f;
+    for (int t = lane; t < nsub; t += WAVE) {
+        int bitpos = t * VQ_INDEX_BITS;
+        int byte = bitpos >> 3;
+        int shift = bitpos & 7;
+        unsigned int raw = (unsigned int)idxrow[byte] | ((unsigned int)idxrow[byte + 1] << 8);
+        int idx = (int)((raw >> shift) & 0xFFFu);
+        const float* c = cb + (size_t)idx * VQ_DIM;
+        const float* xv = x + t * VQ_DIM;
+        float dot = 0.0f;
+#pragma unroll
+        for (int d = 0; d < VQ_DIM; ++d) dot += xv[d] * c[d];
+        acc += bf16f(scalerow[t / VQ_SUBS_PER_GROUP]) * dot;
+    }
+    return wave_sum(acc);
+}

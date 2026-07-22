@@ -22,6 +22,21 @@ pub struct ExpertDesc {
     pub down_scale: *const f32,
 }
 
+/// VQ-int3 expert descriptor (mirrors `ExpertDescVq` in `moe_fused.hip`): per
+/// projection the packed 12-bit indices + bf16 group scales. The codebook is
+/// shared across all experts and passed to [`launch_moe_vq`] separately.
+#[cfg(feature = "rocm")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ExpertDescVq {
+    pub gate_indices: *const u8,
+    pub gate_scales: *const u16,
+    pub up_indices: *const u8,
+    pub up_scales: *const u16,
+    pub down_indices: *const u8,
+    pub down_scales: *const u16,
+}
+
 #[cfg(feature = "rocm")]
 unsafe extern "C" {
     fn rivoli_moe_experts(
@@ -30,6 +45,19 @@ unsafe extern "C" {
         inter: i32,
         e: i32,
         descs: *const ExpertDesc,
+        wexpert: *const f32,
+        h: *mut f32,
+        partial: *mut f32,
+        out: *mut f32,
+    ) -> i32;
+
+    fn rivoli_moe_experts_vq(
+        x: *const f32,
+        hidden: i32,
+        inter: i32,
+        e: i32,
+        descs: *const ExpertDescVq,
+        codebook: *const f32,
         wexpert: *const f32,
         h: *mut f32,
         partial: *mut f32,
@@ -73,6 +101,16 @@ unsafe extern "C" {
         x: *const f32,
         packed: *const u8,
         scale: *const f32,
+        o_dim: i32,
+        i_dim: i32,
+        y: *mut f32,
+    ) -> i32;
+
+    fn rivoli_gemv_vq(
+        x: *const f32,
+        indices: *const u8,
+        scales: *const u16,
+        codebook: *const f32,
         o_dim: i32,
         i_dim: i32,
         y: *mut f32,
@@ -456,6 +494,52 @@ pub unsafe fn launch_moe(
     check(r, "launch_moe")
 }
 
+/// Launch a fused **VQ-int3** MoE expert batch — the VQ analog of [`launch_moe`].
+/// Group scales are applied inside the decode, so there is no per-row post-scale;
+/// `codebook` is the single shared `VQ_K·VQ_DIM` f32 buffer.
+///
+/// # Safety
+/// Async, device pointers live until the next [`device_sync`]. Per expert
+/// descriptor: `gate_indices`/`up_indices` = `inter·vq_row_bytes(hidden)` bytes,
+/// `gate_scales`/`up_scales` = `inter·vq_groups(hidden)` u16; `down_indices` =
+/// `hidden·vq_row_bytes(inter)` bytes, `down_scales` = `hidden·vq_groups(inter)`
+/// u16. `x`/`wexpert`/`h`/`partial`/`out` sized as in [`launch_moe`].
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_moe_vq(
+    x: *const f32,
+    hidden: usize,
+    inter: usize,
+    e: usize,
+    descs: *const ExpertDescVq,
+    codebook: *const f32,
+    wexpert: *const f32,
+    h: *mut f32,
+    partial: *mut f32,
+    out: *mut f32,
+) -> Result<()> {
+    debug_assert!(
+        hidden <= i32::MAX as usize && inter <= i32::MAX as usize && e <= i32::MAX as usize,
+        "moe_vq dims exceed i32 (hidden={hidden} inter={inter} e={e})"
+    );
+    // SAFETY: caller's contract (see # Safety) covers pointer validity.
+    let r = unsafe {
+        rivoli_moe_experts_vq(
+            x,
+            hidden as i32,
+            inter as i32,
+            e as i32,
+            descs,
+            codebook,
+            wexpert,
+            h,
+            partial,
+            out,
+        )
+    };
+    check(r, "launch_moe_vq")
+}
+
 /// Launch a batch-1 int4 GEMV `y = scale ⊙ (W·x)` over resident device memory
 /// (`W` = `packed` per-row nibbles + per-row `scale`, `o_dim × i_dim`). Device
 /// pointers, launch-only. The workhorse for the attention projections
@@ -481,6 +565,34 @@ pub unsafe fn launch_gemv_i4(
     // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
     let r = unsafe { rivoli_gemv_i4(x, packed, scale, o_dim as i32, i_dim as i32, y) };
     check(r, "launch_gemv_i4")
+}
+
+/// Launch a batch-1 VQ-int3 GEMV `y = W·x` where `W` is `indices` (packed 12-bit
+/// codebook indices) + `scales` (bf16 per-group) decoded against the shared
+/// `codebook`, `o_dim × i_dim`. Group scales are applied inside the dot, so unlike
+/// int4 there is no per-row post-scale. Device pointers, launch-only.
+///
+/// # Safety
+/// Async — `x` (`i_dim` f32), `indices` (`o_dim·vq_row_bytes(i_dim)` bytes),
+/// `scales` (`o_dim·vq_groups(i_dim)` u16), `codebook` (`VQ_K·VQ_DIM` f32), `y`
+/// (`o_dim` f32) must be valid device pointers live until the next [`device_sync`].
+#[cfg(feature = "rocm")]
+pub unsafe fn launch_gemv_vq(
+    x: *const f32,
+    indices: *const u8,
+    scales: *const u16,
+    codebook: *const f32,
+    o_dim: usize,
+    i_dim: usize,
+    y: *mut f32,
+) -> Result<()> {
+    debug_assert!(
+        o_dim <= i32::MAX as usize && i_dim <= i32::MAX as usize,
+        "gemv_vq dims exceed i32 (o={o_dim} i={i_dim})"
+    );
+    // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
+    let r = unsafe { rivoli_gemv_vq(x, indices, scales, codebook, o_dim as i32, i_dim as i32, y) };
+    check(r, "launch_gemv_vq")
 }
 
 /// Launch a batch-1 int8 GEMV `y = scale ⊙ (W·x)` (`W` = `packed` signed bytes +

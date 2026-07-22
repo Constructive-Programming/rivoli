@@ -76,6 +76,60 @@ extern "C" __global__ void moe_down(
     if (lane == 0) partial[r] = wexpert[e] * dv * d.down_scale[o];
 }
 
+// ── VQ-int3 fused MoE (M3) ──────────────────────────────────────────────────
+// Same two-pass shape as the int4 path, but each projection decodes via
+// dot_vq_wave (12-bit codebook indices + per-group bf16 scales). The group scale
+// is applied INSIDE the dot, so there is no per-row post-scale here (unlike int4).
+// The codebook is ONE device buffer shared by every expert — passed to the
+// launcher, not carried per-descriptor.
+struct ExpertDescVq {
+    const unsigned char*  gate_indices;  // [inter * vq_row_bytes(hidden)]
+    const unsigned short* gate_scales;   // [inter * vq_groups(hidden)] bf16
+    const unsigned char*  up_indices;    // [inter * vq_row_bytes(hidden)]
+    const unsigned short* up_scales;     // [inter * vq_groups(hidden)]
+    const unsigned char*  down_indices;  // [hidden * vq_row_bytes(inter)]
+    const unsigned short* down_scales;   // [hidden * vq_groups(inter)]
+};
+
+// h[e*inter + j] = silu(gate_ej·x) * (up_ej·x), gate/up already group-dequantized.
+extern "C" __global__ void moe_gateup_vq(
+    const float* __restrict__ x, int hidden, int inter, int E,
+    const ExpertDescVq* __restrict__ descs, const float* __restrict__ codebook,
+    float* __restrict__ h_out) {
+    int lane = threadIdx.x & (WAVE - 1);
+    size_t r = (size_t)blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / WAVE;
+    if (r >= (size_t)E * inter) return;
+    int e = (int)(r / inter);
+    int j = (int)(r % inter);
+    const ExpertDescVq d = descs[e];
+    size_t rb_h = (size_t)(hidden / VQ_DIM) * VQ_INDEX_BITS / 8;
+    size_t ng_h = (size_t)hidden / VQ_GROUP;
+    float g = dot_vq_wave(x, d.gate_indices + (size_t)j * rb_h, d.gate_scales + (size_t)j * ng_h,
+                          codebook, hidden, lane);
+    float u = dot_vq_wave(x, d.up_indices + (size_t)j * rb_h, d.up_scales + (size_t)j * ng_h,
+                          codebook, hidden, lane);
+    if (lane == 0) h_out[r] = siluf(g) * u;
+}
+
+// partial[e][o] = w[e] * (down_eo · h[e]), down already group-dequantized.
+extern "C" __global__ void moe_down_vq(
+    int hidden, int inter, int E, const ExpertDescVq* __restrict__ descs,
+    const float* __restrict__ codebook, const float* __restrict__ wexpert,
+    const float* __restrict__ h_in, float* __restrict__ partial) {
+    int lane = threadIdx.x & (WAVE - 1);
+    size_t r = (size_t)blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / WAVE;
+    if (r >= (size_t)E * hidden) return;
+    int e = (int)(r / hidden);
+    int o = (int)(r % hidden);
+    const ExpertDescVq d = descs[e];
+    size_t rb_i = (size_t)(inter / VQ_DIM) * VQ_INDEX_BITS / 8;
+    size_t ng_i = (size_t)inter / VQ_GROUP;
+    const float* he = h_in + (size_t)e * inter;
+    float dv = dot_vq_wave(he, d.down_indices + (size_t)o * rb_i, d.down_scales + (size_t)o * ng_i,
+                           codebook, inter, lane);
+    if (lane == 0) partial[r] = wexpert[e] * dv;
+}
+
 // out[o] = Σ_e partial[e][o], e ASCENDING — a fixed, schedule-independent
 // summation order, so the MoE output (and thus greedy decode) is deterministic.
 extern "C" __global__ void moe_reduce(
@@ -109,6 +163,31 @@ extern "C" int rivoli_moe_experts(
     size_t rows_b = (size_t)E * hidden;
     hipLaunchKernelGGL(moe_down, dim3((rows_b + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
                        dim3(256), 0, 0, hidden, inter, E, d, wexpert, h, partial);
+    e = hipGetLastError();
+    if (e != hipSuccess) return -(int)e;
+    hipLaunchKernelGGL(moe_reduce, dim3((hidden + 255) / 256), dim3(256), 0, 0,
+                       partial, E, hidden, out);
+    e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+// VQ analog of rivoli_moe_experts: same two-pass + fixed-order reduce, plus the
+// shared `codebook` pointer. Caller owns x/descs/codebook/wexpert/h/partial/out
+// and joins once per token. Return codes: 0 ok, POSITIVE arg guard, NEGATIVE err.
+extern "C" int rivoli_moe_experts_vq(
+    const float* x, int hidden, int inter, int E, const void* descs,
+    const float* codebook, const float* wexpert, float* h, float* partial, float* out) {
+    if (hidden <= 0 || inter <= 0 || E <= 0) return 1001;
+    const ExpertDescVq* d = (const ExpertDescVq*)descs;
+    hipGetLastError();
+    size_t rows_a = (size_t)E * inter;
+    hipLaunchKernelGGL(moe_gateup_vq, dim3((rows_a + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
+                       dim3(256), 0, 0, x, hidden, inter, E, d, codebook, h);
+    hipError_t e = hipGetLastError();
+    if (e != hipSuccess) return -(int)e;
+    size_t rows_b = (size_t)E * hidden;
+    hipLaunchKernelGGL(moe_down_vq, dim3((rows_b + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
+                       dim3(256), 0, 0, hidden, inter, E, d, codebook, wexpert, h, partial);
     e = hipGetLastError();
     if (e != hipSuccess) return -(int)e;
     hipLaunchKernelGGL(moe_reduce, dim3((hidden + 255) / 256), dim3(256), 0, 0,
