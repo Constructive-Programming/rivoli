@@ -106,8 +106,9 @@ __device__ __forceinline__ unsigned short f2bf16(float x) {
     return (unsigned short)((b + r) >> 16);
 }
 
-// VQ-int3 codebook parameters — MUST match quant.rs (VQ_DIM/VQ_INDEX_BITS/VQ_GROUP).
+// VQ-int3 codebook parameters — MUST match quant.rs (VQ_DIM/VQ_K/VQ_INDEX_BITS/VQ_GROUP).
 #define VQ_DIM 4
+#define VQ_K 4096
 #define VQ_INDEX_BITS 12
 #define VQ_GROUP 64
 #define VQ_SUBS_PER_GROUP (VQ_GROUP / VQ_DIM)  // subvectors sharing one bf16 scale

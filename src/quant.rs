@@ -301,8 +301,9 @@ pub fn vq_expert(layer: &[u8], e: usize, hidden: usize, moe_inter: usize) -> [Vq
 
 /// Write a 12-bit `idx` for the `k`-th subvector of a packed row. Two 12-bit indices
 /// occupy 3 bytes; `12k % 8 ∈ {0,4}`, so the value never spans more than 2 bytes.
+/// Public so the GPU converter (`bin/fp82vq`) packs indices identically to `quant_vq`.
 #[inline]
-fn set_idx(row: &mut [u8], k: usize, idx: u16) {
+pub fn set_idx(row: &mut [u8], k: usize, idx: u16) {
     let (base, shift) = (k * VQ_INDEX_BITS / 8, (k * VQ_INDEX_BITS) % 8);
     let v = (u32::from(idx) & 0xFFF) << shift;
     row[base] |= v as u8;

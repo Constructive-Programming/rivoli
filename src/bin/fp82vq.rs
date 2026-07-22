@@ -5,16 +5,15 @@
 //! `gate ‖ up ‖ down`, each projection = packed 12-bit codebook indices then bf16
 //! group scales. The learned codebook is written once to `<out>/codebook.f32`.
 //!
-//! Pure CPU — build and run without the GPU toolchain. The pass-2 encode is the
-//! expensive part (nearest-of-VQ_K per subvector over all experts); it parallelizes
-//! across experts with `std::thread::scope`.
+//! Builds CPU-only by default (no GPU toolchain needed). The pass-2 encode — the
+//! nearest-of-VQ_K argmin per subvector, ~4096× the other work — parallelizes across
+//! experts with `std::thread::scope`. With `--features rocm` + `--gpu`, that argmin
+//! offloads to the `vq_encode` HIP kernel (~15× faster full conversion, bytes
+//! bit-identical to the CPU path — cross-checked by `--validate`); the host still
+//! threads dequant/normalize/refit/pack, with GPU calls serialized behind a Mutex.
 //!
 //! usage: fp82vq <fp8-dir> <out-dir> [--sample-experts N] [--kmeans-iters N]
-//!
-//! ponytail: pass-2 encode is brute-force nearest over VQ_K centroids — O(K·d) per
-//! subvector, the run-time ceiling. If a full conversion is too slow, the upgrade is
-//! a lattice codebook (analytic O(d) nearest, the reason E8/IQ3 use one) or a k-d
-//! tree over the learned centroids; the on-disk format and the kernel are unchanged.
+//!                [--layer N] [--check] [--gpu] [--validate]
 
 use anyhow::{Context, Result, ensure};
 use memmap2::Mmap;
@@ -25,6 +24,177 @@ use rivoli::quant::{
 };
 use std::collections::HashMap;
 use std::io::Write;
+
+#[cfg(feature = "rocm")]
+mod gpu {
+    //! GPU-accelerated encode: the nearest-codebook argmin (the run-time ceiling,
+    //! ~4096× the other work) offloaded to `rivoli_vq_encode`. Host still does fp8
+    //! dequant, group normalization, the closed-form scale refit, and packing —
+    //! all O(o·i), a fraction of the argmin. Produces bytes BIT-IDENTICAL to
+    //! `quant_vq` (same metric/tie-break in the kernel, same host refit here), so
+    //! the two are interchangeable and cross-validated by `--validate`.
+    use super::*;
+    use rivoli::device::DeviceBuf;
+    use rivoli::hip::{device_sync, launch_vq_encode};
+    use rivoli::quant::set_idx;
+
+    /// Reads a `f32` slice as raw device-upload bytes (LE host == LE device), no copy.
+    fn f32_as_bytes(v: &[f32]) -> &[u8] {
+        // SAFETY: f32 is plain-old-data; the view is `4·len` bytes, read-only.
+        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+    }
+
+    /// Resident codebook + `‖c‖²` on device, plus reusable subvector/index buffers
+    /// sized to the largest projection. One per run (the GPU is one shared tenant).
+    pub struct Encoder {
+        codebook: DeviceBuf,
+        cbnorm: DeviceBuf,
+        sub: DeviceBuf,
+        idx: DeviceBuf,
+        max_sub: usize,
+    }
+
+    // SAFETY: DeviceBuf holds raw device pointers (process-global, valid on any
+    // thread). Every access goes through `encode`, and callers share the Encoder
+    // only behind a Mutex, so device operations are serialized — never concurrent.
+    unsafe impl Send for Encoder {}
+
+    impl Encoder {
+        pub fn new(codebook: &[f32], max_sub: usize) -> Result<Self> {
+            let cbnorm: Vec<f32> = (0..VQ_K)
+                .map(|k| {
+                    codebook[k * VQ_DIM..(k + 1) * VQ_DIM]
+                        .iter()
+                        .map(|&c| c * c)
+                        .sum()
+                })
+                .collect();
+            let mut cb = DeviceBuf::new(codebook.len() * 4)?;
+            cb.copy_in_at(0, f32_as_bytes(codebook))?;
+            let mut nb = DeviceBuf::new(cbnorm.len() * 4)?;
+            nb.copy_in_at(0, f32_as_bytes(&cbnorm))?;
+            Ok(Self {
+                codebook: cb,
+                cbnorm: nb,
+                sub: DeviceBuf::new(max_sub * VQ_DIM * 4)?,
+                idx: DeviceBuf::new(max_sub * 2)?,
+                max_sub,
+            })
+        }
+
+        /// `idx[i] = argmin_k …` for `sub` (`n·VQ_DIM` f32) — upload, launch, read back.
+        /// Takes `&mut` (the device buffers are reused), so callers share one encoder
+        /// behind a `Mutex`: host dequant/refit/pack run parallel, GPU calls serialize.
+        pub fn encode(&mut self, sub: &[f32]) -> Result<Vec<u16>> {
+            let n = sub.len() / VQ_DIM;
+            ensure!(
+                n <= self.max_sub,
+                "encode batch {n} > max_sub {}",
+                self.max_sub
+            );
+            self.sub.copy_in_at(0, f32_as_bytes(sub))?;
+            // SAFETY: buffers sized ≥ n; live until the sync below.
+            unsafe {
+                launch_vq_encode(
+                    self.sub.ptr() as *const f32,
+                    self.codebook.ptr() as *const f32,
+                    self.cbnorm.ptr() as *const f32,
+                    n,
+                    self.idx.ptr_mut() as *mut u16,
+                )?;
+            }
+            device_sync()?;
+            let mut bytes = Vec::new();
+            self.idx.copy_out_prefix(&mut bytes, n * 2)?;
+            Ok(bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect())
+        }
+    }
+
+    /// GPU analog of `quant_vq`: two batched argmin passes (amax-scale, then the
+    /// refit scale) around the same host refit. Bit-identical output to `quant_vq`.
+    /// The encoder is shared behind a `Mutex` — only the two GPU argmin calls lock it;
+    /// the surrounding host dequant/normalize/refit/pack run fully parallel.
+    pub fn quant_vq_gpu(
+        w: &[f32],
+        o_dim: usize,
+        i_dim: usize,
+        codebook: &[f32],
+        enc: &std::sync::Mutex<Encoder>,
+    ) -> Result<(Vec<u8>, Vec<u16>)> {
+        const SUBS: usize = VQ_GROUP / VQ_DIM;
+        let ngroups = i_dim / VQ_GROUP;
+        let nsub_row = i_dim / VQ_DIM;
+        let rb = vq_row_bytes(i_dim);
+        let mut sub = vec![0.0f32; o_dim * nsub_row * VQ_DIM];
+        let mut scales = vec![0u16; o_dim * ngroups];
+        // Pass 1: normalize every group by its amax-derived bf16 scale.
+        for o in 0..o_dim {
+            let wr = &w[o * i_dim..(o + 1) * i_dim];
+            for grp in 0..ngroups {
+                let seg = &wr[grp * VQ_GROUP..(grp + 1) * VQ_GROUP];
+                let amax = seg.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+                let sb = f32_to_bf16(if amax > 0.0 { amax } else { 1.0 });
+                scales[o * ngroups + grp] = sb;
+                let inv = 1.0 / bf16_to_f32(sb);
+                let base = (o * nsub_row + grp * SUBS) * VQ_DIM;
+                for (t, &v) in seg.iter().enumerate() {
+                    sub[base + t] = v * inv;
+                }
+            }
+        }
+        let idx1 = enc
+            .lock()
+            .map_err(|_| anyhow::anyhow!("encoder poisoned"))?
+            .encode(&sub)?;
+        // Refit each group against its pass-1 entries; renormalize only changed groups.
+        let mut changed = false;
+        for o in 0..o_dim {
+            let wr = &w[o * i_dim..(o + 1) * i_dim];
+            for grp in 0..ngroups {
+                let seg = &wr[grp * VQ_GROUP..(grp + 1) * VQ_GROUP];
+                let sbase = o * nsub_row + grp * SUBS;
+                let (mut num, mut den) = (0.0f32, 0.0f32);
+                for t in 0..SUBS {
+                    let c = &codebook[idx1[sbase + t] as usize * VQ_DIM..][..VQ_DIM];
+                    for (d, &v) in seg[t * VQ_DIM..(t + 1) * VQ_DIM].iter().enumerate() {
+                        num += v * c[d];
+                        den += c[d] * c[d];
+                    }
+                }
+                if den > 0.0 && num > 0.0 {
+                    let refit = f32_to_bf16(num / den);
+                    if refit != scales[o * ngroups + grp] {
+                        scales[o * ngroups + grp] = refit;
+                        let inv = 1.0 / bf16_to_f32(refit);
+                        let base = sbase * VQ_DIM;
+                        for (t, &v) in seg.iter().enumerate() {
+                            sub[base + t] = v * inv;
+                        }
+                        changed = true;
+                    }
+                }
+            }
+        }
+        let idx = if changed {
+            enc.lock()
+                .map_err(|_| anyhow::anyhow!("encoder poisoned"))?
+                .encode(&sub)?
+        } else {
+            idx1
+        };
+        let mut indices = vec![0u8; o_dim * rb];
+        for o in 0..o_dim {
+            let ir = &mut indices[o * rb..(o + 1) * rb];
+            for t in 0..nsub_row {
+                set_idx(ir, t, idx[o * nsub_row + t]);
+            }
+        }
+        Ok((indices, scales))
+    }
+}
 
 const FP8_BLOCK: usize = 128; // GLM-5.2 fp8 weight_scale_inv tile (128×128)
 
@@ -319,6 +489,72 @@ fn convert_expert(
     Ok(())
 }
 
+/// One expert via the GPU encoder (bit-identical to [`convert_expert`]). `enc` is the
+/// shared encoder — this runs on many threads, the GPU calls inside serialize on it.
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+fn convert_expert_gpu(
+    src: &Fp8Src,
+    layer: usize,
+    e: usize,
+    hidden: usize,
+    moe_inter: usize,
+    codebook: &[f32],
+    enc: &std::sync::Mutex<gpu::Encoder>,
+    dst: &mut [u8],
+) -> Result<()> {
+    let base = format!("model.layers.{layer}.mlp.experts.{e}");
+    let mut off = 0;
+    for (proj, o_dim, i_dim) in projections(hidden, moe_inter) {
+        let w = deq_proj(src, &base, proj, o_dim, i_dim)?;
+        let (indices, scales) = gpu::quant_vq_gpu(&w, o_dim, i_dim, codebook, enc)?;
+        let pb = vq_proj_bytes(o_dim, i_dim);
+        write_proj(&mut dst[off..off + pb], o_dim, i_dim, &indices, &scales);
+        off += pb;
+    }
+    Ok(())
+}
+
+/// Convert a whole layer's experts on the CPU, `threads`-way parallel over experts.
+#[allow(clippy::too_many_arguments)]
+fn convert_layer_cpu(
+    src: &Fp8Src,
+    l: usize,
+    hidden: usize,
+    moe_inter: usize,
+    codebook: &[f32],
+    threads: usize,
+    stride: usize,
+    n_experts: usize,
+    buf: &mut [u8],
+) -> Result<()> {
+    let per = n_experts.div_ceil(threads);
+    std::thread::scope(|s| -> Result<()> {
+        let mut handles = Vec::new();
+        let mut rest = &mut buf[..];
+        let mut e0 = 0;
+        while e0 < n_experts {
+            let take = per.min(n_experts - e0);
+            let (mine, tail) = rest.split_at_mut(take * stride);
+            rest = tail;
+            let base_e = e0;
+            e0 += take;
+            handles.push(s.spawn(move || -> Result<()> {
+                for (j, dst) in mine.chunks_exact_mut(stride).enumerate() {
+                    convert_expert(src, l, base_e + j, hidden, moe_inter, codebook, dst)?;
+                }
+                Ok(())
+            }));
+        }
+        for h in handles {
+            h.join()
+                .map_err(|_| anyhow::anyhow!("converter worker panicked"))??;
+        }
+        Ok(())
+    })
+    .with_context(|| format!("convert layer {l}"))
+}
+
 /// `--check`: GEMV relative RMS of the on-disk VQ bytes vs the fp8 oracle, with a
 /// per-row int4 (colibri-style, s=amax/7) baseline on the same weights — the M2
 /// acceptance gate: VQ-int3 must ≈ int4.
@@ -405,6 +641,12 @@ struct Args {
     /// Validate an already-converted layer instead of converting: GEMV relative RMS
     /// of the on-disk VQ bytes vs the fp8 oracle, with a per-row int4 baseline.
     check: bool,
+    /// Offload the nearest-codebook argmin to the GPU (`--features rocm`). ~20-100×
+    /// faster encode; output bit-identical to the CPU path.
+    gpu: bool,
+    /// Convert layer `--layer` experts 0..2 both ways and assert byte-equal, then exit
+    /// (implies `--gpu`). The GPU↔CPU cross-check before a full GPU conversion.
+    validate: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -415,6 +657,8 @@ fn parse_args() -> Result<Args> {
         kmeans_iters: 15,
         layer: None,
         check: false,
+        gpu: false,
+        validate: false,
     };
     let mut pos = Vec::new();
     let mut it = std::env::args().skip(1);
@@ -430,12 +674,17 @@ fn parse_args() -> Result<Args> {
                 a.layer = Some(it.next().context("--layer N")?.parse()?);
             }
             "--check" => a.check = true,
+            "--gpu" => a.gpu = true,
+            "--validate" => {
+                a.validate = true;
+                a.gpu = true;
+            }
             _ => pos.push(arg),
         }
     }
     ensure!(
         pos.len() == 2,
-        "usage: fp82vq <fp8-dir> <out-dir> [--sample-experts N] [--kmeans-iters N] [--layer N] [--check]"
+        "usage: fp82vq <fp8-dir> <out-dir> [--sample-experts N] [--kmeans-iters N] [--layer N] [--check] [--gpu] [--validate]"
     );
     a.fp8_dir = pos[0].clone();
     a.out_dir = pos[1].clone();
@@ -532,9 +781,49 @@ fn main() -> Result<()> {
         codebook
     };
 
-    // Pass 2 — convert the selected layers, experts in parallel. Skips layers whose
-    // output already exists and layers whose fp8 tensors haven't downloaded yet, so
-    // re-running converges on a partial checkpoint as shards land.
+    // The GPU encoder's reusable buffers are sized to the largest projection.
+    let max_sub = projections(hidden, moe_inter)
+        .iter()
+        .map(|&(_, o, i)| o * (i / VQ_DIM))
+        .max()
+        .unwrap_or(0);
+    #[cfg(feature = "rocm")]
+    let encoder = match args.gpu {
+        true => Some(std::sync::Mutex::new(gpu::Encoder::new(
+            &codebook, max_sub,
+        )?)),
+        false => None,
+    };
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = max_sub;
+        ensure!(!args.gpu, "--gpu requires building with --features rocm");
+    }
+
+    // `--validate`: convert a few experts both ways, assert the bytes are identical.
+    #[cfg(feature = "rocm")]
+    if args.validate {
+        let enc = encoder.as_ref().context("--validate implies --gpu")?;
+        let l = args.layer.unwrap_or(dense);
+        eprintln!("fp82vq: validating GPU vs CPU encode on layer {l} experts 0..2…");
+        for e in 0..2usize {
+            let mut cpu = vec![0u8; stride];
+            let mut gpu = vec![0u8; stride];
+            convert_expert(&src, l, e, hidden, moe_inter, &codebook, &mut cpu)?;
+            convert_expert_gpu(&src, l, e, hidden, moe_inter, &codebook, enc, &mut gpu)?;
+            ensure!(
+                cpu == gpu,
+                "GPU/CPU encode mismatch at layer {l} expert {e}"
+            );
+            eprintln!("fp82vq:   layer {l} expert {e}: GPU == CPU ✓");
+        }
+        eprintln!("fp82vq: validation OK");
+        return Ok(());
+    }
+
+    // Pass 2 — convert the selected layers. Skips layers whose output already exists
+    // and layers whose fp8 tensors haven't downloaded yet, so re-running converges on
+    // a partial checkpoint as shards land.
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     let layers = args.layer.map_or(dense..n_layers, |l| l..l + 1);
     for l in layers {
@@ -551,35 +840,58 @@ fn main() -> Result<()> {
             continue;
         }
         let mut buf = vec![0u8; n_experts * stride];
-        let src = &src;
-        let codebook = &codebook;
-        // Hand each thread a disjoint index range and its own slice of `buf`; each
-        // returns a Result, so an error propagates without a shared mutex.
-        let per = n_experts.div_ceil(threads);
-        std::thread::scope(|s| -> Result<()> {
-            let mut handles = Vec::new();
-            let mut rest = &mut buf[..];
-            let mut e0 = 0;
-            while e0 < n_experts {
-                let take = per.min(n_experts - e0);
-                let (mine, tail) = rest.split_at_mut(take * stride);
-                rest = tail;
-                let base_e = e0;
-                e0 += take;
-                handles.push(s.spawn(move || -> Result<()> {
-                    for (j, dst) in mine.chunks_exact_mut(stride).enumerate() {
-                        convert_expert(src, l, base_e + j, hidden, moe_inter, codebook, dst)?;
+        // GPU path: experts threaded for the host work (dequant/normalize/refit/pack);
+        // the GPU argmin calls inside serialize on the shared encoder. CPU path: experts
+        // threaded, all on CPU. Both write identical bytes.
+        #[cfg(feature = "rocm")]
+        let done = match encoder.as_ref() {
+            Some(enc) => {
+                let (src, codebook) = (&src, &codebook);
+                let per = n_experts.div_ceil(threads);
+                std::thread::scope(|s| -> Result<()> {
+                    let mut handles = Vec::new();
+                    let mut rest = &mut buf[..];
+                    let mut e0 = 0;
+                    while e0 < n_experts {
+                        let take = per.min(n_experts - e0);
+                        let (mine, tail) = rest.split_at_mut(take * stride);
+                        rest = tail;
+                        let base_e = e0;
+                        e0 += take;
+                        handles.push(s.spawn(move || -> Result<()> {
+                            for (j, dst) in mine.chunks_exact_mut(stride).enumerate() {
+                                convert_expert_gpu(
+                                    src,
+                                    l,
+                                    base_e + j,
+                                    hidden,
+                                    moe_inter,
+                                    codebook,
+                                    enc,
+                                    dst,
+                                )?;
+                            }
+                            Ok(())
+                        }));
+                    }
+                    for h in handles {
+                        h.join()
+                            .map_err(|_| anyhow::anyhow!("gpu converter worker panicked"))??;
                     }
                     Ok(())
-                }));
+                })
+                .with_context(|| format!("convert layer {l}"))?;
+                true
             }
-            for h in handles {
-                h.join()
-                    .map_err(|_| anyhow::anyhow!("converter worker panicked"))??;
-            }
-            Ok(())
-        })
-        .with_context(|| format!("convert layer {l}"))?;
+            None => false,
+        };
+        #[cfg(not(feature = "rocm"))]
+        let done = false;
+        if !done {
+            convert_layer_cpu(
+                &src, l, hidden, moe_inter, &codebook, threads, stride, n_experts, &mut buf,
+            )?;
+        }
         let mut f = std::fs::File::create(&path)?;
         f.write_all(&buf)?;
         eprintln!("fp82vq: wrote {path} ({} experts)", n_experts);

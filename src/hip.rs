@@ -116,6 +116,14 @@ unsafe extern "C" {
         y: *mut f32,
     ) -> i32;
 
+    fn rivoli_vq_encode(
+        sub: *const f32,
+        codebook: *const f32,
+        cbnorm: *const f32,
+        n: i32,
+        idx: *mut u16,
+    ) -> i32;
+
     fn rivoli_gemv_i8(
         x: *const f32,
         packed: *const u8,
@@ -492,6 +500,29 @@ pub unsafe fn launch_moe(
         )
     };
     check(r, "launch_moe")
+}
+
+/// Batched VQ encode: `idx[i] = argmin_k (‖c_k‖² − 2·sub_i·c_k)` over the codebook,
+/// for offline conversion. Bit-identical to `quant::quant_vq`'s nearest, so
+/// GPU-encoded output validates against the CPU oracle. `cbnorm` = per-entry `‖c‖²`
+/// precomputed host-side the same way.
+///
+/// # Safety
+/// Async — `sub` (`n·VQ_DIM` f32), `codebook` (`VQ_K·VQ_DIM` f32), `cbnorm` (`VQ_K`
+/// f32), `idx` (`n` u16) must be valid device pointers live until the next
+/// [`device_sync`].
+#[cfg(feature = "rocm")]
+pub unsafe fn launch_vq_encode(
+    sub: *const f32,
+    codebook: *const f32,
+    cbnorm: *const f32,
+    n: usize,
+    idx: *mut u16,
+) -> Result<()> {
+    debug_assert!(n <= i32::MAX as usize, "vq_encode n exceeds i32 ({n})");
+    // SAFETY: caller's contract (see # Safety) covers pointer validity/lifetime.
+    let r = unsafe { rivoli_vq_encode(sub, codebook, cbnorm, n as i32, idx) };
+    check(r, "launch_vq_encode")
 }
 
 /// Launch a fused **VQ-int3** MoE expert batch — the VQ analog of [`launch_moe`].

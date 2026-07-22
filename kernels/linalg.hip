@@ -69,6 +69,51 @@ extern "C" int rivoli_gemv_i4(
     return e == hipSuccess ? 0 : -(int)e;
 }
 
+// VQ encode: idx[i] = argmin_k (‖c_k‖² − 2·sub_i·c_k) over the VQ_K codebook, tie →
+// lowest k. Matches quant.rs::quant_vq's nearest exactly (same metric, same f32 dot
+// order, same tie-break), so GPU-encoded indices are bit-identical to the CPU oracle
+// — that's what lets the GPU converter's output validate against quant_vq. One
+// thread per subvector; the codebook (64 KB) stays hot in L2 across all threads.
+// `cbnorm[k]` = ‖c_k‖² precomputed host-side identically. `sub` is [n · VQ_DIM].
+extern "C" __global__ void vq_encode(
+    const float* __restrict__ sub, const float* __restrict__ codebook,
+    const float* __restrict__ cbnorm, int n, unsigned short* __restrict__ idx) {
+// Disable mul-add fusion: the CPU oracle (quant.rs) rounds `a*b` then `+` separately,
+// so a fused FMA here would round the dot differently and flip near-tied argmins on
+// the structured learned codebook — making GPU output non-bit-identical to CPU.
+#pragma clang fp contract(off)
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float sv[VQ_DIM];
+#pragma unroll
+    for (int d = 0; d < VQ_DIM; ++d) sv[d] = sub[(size_t)i * VQ_DIM + d];
+    float best = 3.4e38f;
+    int bk = 0;
+    for (int k = 0; k < VQ_K; ++k) {
+        const float* c = codebook + (size_t)k * VQ_DIM;
+        float dot = 0.0f;
+#pragma unroll
+        for (int d = 0; d < VQ_DIM; ++d) dot += sv[d] * c[d];
+        float dist = cbnorm[k] - 2.0f * dot;
+        if (dist < best) {
+            best = dist;
+            bk = k;
+        }
+    }
+    idx[i] = (unsigned short)bk;
+}
+
+extern "C" int rivoli_vq_encode(
+    const float* sub, const float* codebook, const float* cbnorm, int n,
+    unsigned short* idx) {
+    if (n <= 0) return 1001;
+    hipGetLastError();
+    hipLaunchKernelGGL(vq_encode, dim3((n + 255) / 256), dim3(256), 0, 0, sub, codebook,
+                       cbnorm, n, idx);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
 // grid = ceil(o_dim / ROWS_PER_BLOCK) blocks of 256 threads (one wave per row).
 extern "C" int rivoli_gemv_vq(
     const float* x, const unsigned char* indices, const unsigned short* scales,

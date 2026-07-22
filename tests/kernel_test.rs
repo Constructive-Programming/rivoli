@@ -37,7 +37,7 @@ use rivoli::hip::{
     ExpertDesc, ExpertDescVq, device_sync, launch_attend, launch_gemv_bf16, launch_gemv_f32,
     launch_gemv_i4, launch_gemv_i8, launch_gemv_vq, launch_index_head_route,
     launch_index_pool_push, launch_index_score, launch_layernorm, launch_mla_absorb,
-    launch_mla_value, launch_moe, launch_moe_vq, launch_rmsnorm, launch_rope,
+    launch_mla_value, launch_moe, launch_moe_vq, launch_rmsnorm, launch_rope, launch_vq_encode,
 };
 use rivoli::math::{bf16_to_f32, f32_to_bf16, silu, softmax};
 use rivoli::quant::{
@@ -1322,4 +1322,67 @@ fn moe_vq_matches_scalar() {
 #[test]
 fn moe_vq_single_expert() {
     moe_vq_check(0xE5, 256, 128, 1); // isolates the fused path from cross-expert sum
+}
+
+// ── VQ encode kernel (offline converter accelerator) ────────────────────────
+// GPU argmin must be BIT-IDENTICAL to quant_vq's nearest (same ‖c‖²−2·dot metric,
+// same f32 dot order, same lowest-index tie-break) — else GPU-converted .i3 bytes
+// wouldn't match the CPU oracle. Reference replicates that exact formula.
+fn vq_encode_check(seed: u64, n: usize) {
+    let mut rng = Lcg(seed);
+    let codebook: Vec<f32> = (0..VQ_K * VQ_DIM).map(|_| rng.f()).collect();
+    let cbnorm: Vec<f32> = (0..VQ_K)
+        .map(|k| {
+            codebook[k * VQ_DIM..(k + 1) * VQ_DIM]
+                .iter()
+                .map(|&c| c * c)
+                .sum()
+        })
+        .collect();
+    let sub: Vec<f32> = (0..n * VQ_DIM).map(|_| rng.f()).collect();
+
+    let want: Vec<u16> = (0..n)
+        .map(|i| {
+            let s = &sub[i * VQ_DIM..(i + 1) * VQ_DIM];
+            let mut best = (f32::INFINITY, 0u16);
+            for k in 0..VQ_K {
+                let c = &codebook[k * VQ_DIM..(k + 1) * VQ_DIM];
+                let dot: f32 = s.iter().zip(c).map(|(&a, &b)| a * b).sum();
+                let d = cbnorm[k] - 2.0 * dot;
+                if d < best.0 {
+                    best = (d, k as u16);
+                }
+            }
+            best.1
+        })
+        .collect();
+
+    let subb = dev_bytes(&f32_bytes(&sub));
+    let cbb = dev_bytes(&f32_bytes(&codebook));
+    let nb = dev_bytes(&f32_bytes(&cbnorm));
+    let mut idxb = dev_zeroed(n * 2);
+    // SAFETY: buffers live until device_sync; sizes match the kernel contract.
+    unsafe {
+        launch_vq_encode(
+            subb.ptr() as *const f32,
+            cbb.ptr() as *const f32,
+            nb.ptr() as *const f32,
+            n,
+            idxb.ptr_mut() as *mut u16,
+        )
+        .expect("launch vq_encode");
+    }
+    device_sync().expect("sync");
+    let got: Vec<u16> = idxb
+        .copy_out()
+        .expect("out")
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    assert_eq!(want, got, "vq_encode n={n}");
+}
+
+#[test]
+fn vq_encode_matches_cpu() {
+    vq_encode_check(0xF6, 10_000);
 }
