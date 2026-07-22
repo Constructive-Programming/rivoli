@@ -26,24 +26,30 @@ use crate::usage::Usage;
 use anyhow::{Context, Result, ensure};
 use std::os::fd::RawFd;
 
-/// The six cold reads that stream one routed expert into a pool slot, resolved
-/// ONCE at [`Pin::build`] so the per-miss path never re-derives them. Order is
-/// slot-layout order: gate packed, gate scale, up packed, up scale, down packed,
-/// down scale — the same order as [`Pin::slot_dst`], into which each read lands.
+/// The coalesced cold reads that stream one routed expert into a pool slot,
+/// resolved ONCE at [`Pin::build`] so the per-miss path never re-derives them.
+/// The colibri converter writes each expert's three projection weights CONTIGUOUS
+/// on disk in down|gate|up order (and likewise the three scales), so all three
+/// weights normally come in ONE ~18.9 MB O_DIRECT read — which hits the drive's
+/// large-read bandwidth (~5 GB/s) instead of the ~3.6 GB/s three separate 6.3 MB
+/// reads get — and all three scales in one tiny read (2 reads/expert). When an
+/// expert straddles a shard-file boundary (~0.5% of them) the run splits there
+/// into 2-3 reads; [`build_moe_table`] plans the runs so each is one contiguous
+/// O_DIRECT read landing at its own block-aligned slot destination.
 ///
-/// - `reads[k]` = `(fd, file_begin, len)` from [`Snapshot::read_spec`] — a fixed
-///   `(RawFd, offset, length)` for the whole run (the mmap'd shard never moves).
-///   The fd is O_DIRECT or buffered per `Pin::build`'s `direct_io`; the offset/len
-///   are identical either way, so the aligned superset read is mode-agnostic.
-/// - `off[k]` = the slot-relative offset where read `k`'s USEFUL bytes land
-///   (`slot_dst[k] + (file_begin & (ALIGN-1))`, the block-aligned sub-block padding).
-///   Precomputed so descriptor build is a pure index, not a re-computation.
+/// - `reads[k]` = `(fd, file_begin, len, dst)` — a fixed contiguous run and its
+///   block-aligned slot-relative destination. `len == 0` marks an unused entry
+///   (most experts use 2 of the 6). The fd is O_DIRECT or buffered per
+///   `Pin::build`'s `direct_io`; offset/len are identical either way.
+/// - `off` = the six slot-relative offsets where each projection's USEFUL bytes
+///   land, in slot-layout order gate packed, gate scale, up packed, up scale, down
+///   packed, down scale (the order [`Pin::submit_layer`] builds descriptors in).
 ///
-/// All cfg-dim cross-checks (packed/scale byte lengths vs the slot geometry) are
-/// done at build when this table is populated, so the miss path trusts it blindly.
+/// All cfg-dim cross-checks (packed/scale byte lengths) are done at build when
+/// this table is populated, so the miss path trusts it blindly.
 #[derive(Clone, Copy)]
 struct ExpertReads {
-    reads: [(RawFd, usize, usize); 6],
+    reads: [(RawFd, usize, usize, usize); 6],
     off: [usize; 6],
 }
 
@@ -143,19 +149,15 @@ pub struct Pin<'a> {
     /// gate|up|down, every region an O_DIRECT aligned superset. One allocation
     /// (no per-slot granularity waste). Which (layer,expert) occupies each slot is
     /// managed by `lru`; `expert_slot` is the slot stride (the per-region gate/down
-    /// strides are re-derived from `cfg` via [`slot_geom`]).
+    /// stride is re-derived from `cfg` via [`slot_geom`]).
     lru_pool: VmmBuf,
     expert_slot: usize,
-    /// Per-(MoE layer, expert) precomputed streaming plan (A1/A2): the six fixed
-    /// `(fd, begin, len)` reads + their slot-relative useful-byte offsets. Indexed
-    /// by `(layer - dense_layers) * n_experts + expert`. Built ONCE; the miss and
-    /// prefetch paths index it and queue reads with zero allocation, zero string
-    /// hashing, and zero re-validation.
+    /// Per-(MoE layer, expert) precomputed streaming plan (A1/A2): the coalesced
+    /// `(fd, begin, len, dst)` reads (weights then scales, split at shard boundaries)
+    /// plus the six slot-relative useful-byte offsets. Indexed by
+    /// `(layer - dense_layers) * n_experts + expert`. Built ONCE; the miss and
+    /// prefetch paths index it and queue reads with zero allocation or re-validation.
     moe_table: Vec<ExpertReads>,
-    /// Slot-relative aligned DESTINATION offset of each of the six reads (gate
-    /// packed | gate scale | up packed | up scale | down packed | down scale).
-    /// Pure function of `cfg` (run-invariant), computed once at build.
-    slot_dst: [usize; 6],
     /// Adaptive routed tier: (layer,expert) -> slot, policy-evicted (`--cache-policy`).
     /// Online priming that keeps this run's hot experts resident.
     pool: Pool,
@@ -732,16 +734,15 @@ impl<'a> Pin<'a> {
 
         // The routed tier is an adaptive LRU, not a static frequency pin: N reused
         // slots stream experts in on demand and keep this run's actually-hot ones
-        // (online priming). Each slot holds a projection's O_DIRECT aligned superset
-        // (packed then scale, each `slot_span` — block-aligned + straddle pad — so
-        // reads land in place and descriptors point at the sub-block offsets). Size
-        // to the budget left after the always-resident set.
-        let (_, expert_slot) = slot_geom(cfg);
-        // Precompute the per-(layer,expert) streaming plan ONCE (A1/A2): six fixed
-        // (fd, begin, len) reads + slot-relative useful-byte offsets, cfg-dim cross-
-        // checked here. The miss/prefetch paths then just index + queue.
-        let slot_dst = slot_dst_of(cfg);
-        let moe_table = build_moe_table(snap, cfg, &slot_dst, direct_io)?;
+        // (online priming). Each slot holds one expert's two O_DIRECT aligned supersets
+        // — the coalesced weight span then the coalesced scale span, each `slot_span`
+        // (block-aligned + straddle pad) — so reads land in place and descriptors point
+        // at the sub-block offsets. Size to the budget left after the always-resident set.
+        let expert_slot = slot_geom(cfg);
+        // Precompute the per-(layer,expert) streaming plan ONCE (A1/A2): coalesced
+        // (fd, begin, len, dst) reads + six slot-relative useful-byte offsets, cfg-dim
+        // cross-checked here. The miss/prefetch paths then just index + queue.
+        let moe_table = build_moe_table(snap, cfg, direct_io)?;
         let budget = capacity.saturating_sub(tier_cap);
         // Floor the pool at `top_k + prefetch_depth` when prefetching: this makes
         // cross-layer prefetch's evictions provably DISJOINT from the current layer's
@@ -762,7 +763,9 @@ impl<'a> Pin<'a> {
             tier.used() as f64 / (1u64 << 30) as f64,
         );
         let mut pool = Pool::new(n_slots, cache_policy, two_q)?;
-        // Ring sized for one layer's worst case: top_k misses x 3 proj x 2 tensors.
+        // Ring sized for one layer's worst case: top_k misses x 6 reads/expert. An
+        // expert normally coalesces to 2 reads (weights, scales); the 6 bound covers
+        // the pathological case where every projection straddles a shard boundary.
         // `sel` carries the ROUTED picks only — the shared expert is always resident
         // (placed in the tier above), so it never streams and never takes a ring
         // entry. Assert the bound the sizing actually rests on: a reader who assumes
@@ -775,17 +778,16 @@ impl<'a> Pin<'a> {
             "io_uring ring {ring} too small for one layer: top_k {} x 6 reads/expert",
             cfg.top_k,
         );
-        // Bounce span = largest single projection superset (gate/up packed =
-        // moe_inter*rb(hidden); down packed = hidden*rb(moe_inter)); scales are tiny.
-        let span = slot_span(cfg.moe_inter * cfg.hidden.div_ceil(2))
-            .max(slot_span(cfg.hidden * cfg.moe_inter.div_ceil(2)));
+        // Bounce span = largest single read superset. The coalesced weight read
+        // (down|gate|up, ~18.9 MB) dwarfs the coalesced scale read.
+        let (coal_w, coal_s) = coalesced_lens(cfg);
+        let span = slot_span(coal_w).max(slot_span(coal_s));
         // The DEMAND ring gets a poller too. The earlier reasoning — "its submit is
         // immediately followed by a blocking drain, so it gains nothing" — conflated
         // two different things: the thread must indeed wait either way, but WITHOUT a
-        // poller the waiting thread dispatches the batch's SQEs serially, so the six
-        // reads of an expert never sit in the device queue together. That is visible
-        // in the profile: 6.97 ms per 19 MB expert is the array's P=1 rate, not its
-        // P>=4 rate. See `Sqpoll`.
+        // poller the waiting thread dispatches the batch's SQEs serially, so a layer's
+        // reads (now 2 per expert, several experts) never sit in the device queue
+        // together. See `Sqpoll`.
         let mut stream = Streamer::new(ring as u32, span, bounce, Sqpoll::Own)?;
         // Optional warm start (`--pre-seed`): seed the pool with the hottest experts
         // from .coli_usage so the first tokens hit at colibri's rate while the LRU
@@ -795,7 +797,7 @@ impl<'a> Pin<'a> {
         // drained in queue-depth batches.
         if pre_seed {
             let slab = lru_pool.ptr_mut();
-            let batch = (ring / 6).max(1); // experts per drain (6 reads each)
+            let batch = (ring / 6).max(1); // experts per drain (<=6 reads each)
             let mut n = 0usize;
             for &((l, e), _) in usage.ranked().iter() {
                 if n >= n_slots {
@@ -807,7 +809,7 @@ impl<'a> Pin<'a> {
                 }
                 let slot = pool.alloc(expert_key(l, e))?;
                 let entry = &moe_table[(l - cfg.dense_layers) * cfg.n_experts + e];
-                stream_expert(&mut stream, entry, &slot_dst, slab, slot, expert_slot)?;
+                stream_expert(&mut stream, entry, slab, slot, expert_slot)?;
                 n += 1;
                 if n.is_multiple_of(batch) {
                     stream.drain()?;
@@ -848,7 +850,6 @@ impl<'a> Pin<'a> {
             lru_pool,
             expert_slot,
             moe_table,
-            slot_dst,
             pool,
             stream,
             prefetch_stream,
@@ -1060,18 +1061,11 @@ impl<'a> Pin<'a> {
                 self.slot_collisions += 1;
             }
             // ptr_mut() yields a raw ptr, so no borrow of lru_pool is held across
-            // the &mut self.stream reads. Table entry + slot_dst are disjoint fields
+            // the &mut self.stream reads. Table entry + moe_table are disjoint fields
             // from stream — no alloc, no string hashing, no re-validation per miss.
             let slab = self.lru_pool.ptr_mut();
             let entry = &self.moe_table[sparse + e];
-            stream_expert(
-                &mut self.stream,
-                entry,
-                &self.slot_dst,
-                slab,
-                slot,
-                self.expert_slot,
-            )?;
+            stream_expert(&mut self.stream, entry, slab, slot, self.expert_slot)?;
             slots[i] = Some(slot);
             // Record that an O_DIRECT read is writing this slot. Load-bearing in
             // release now, not just a debug check: the collision guard above reads
@@ -1182,10 +1176,9 @@ impl<'a> Pin<'a> {
         // Raw slab ptr (no borrow held across the &mut stream reads), mirroring
         // `submit_layer`'s phase 1b.
         let slab = self.lru_pool.ptr_mut();
-        // Disjoint field borrows: `prefetch_stream`, `pool`, `moe_table`, `slot_dst`
-        // are distinct fields.
+        // Disjoint field borrows: `prefetch_stream`, `pool`, `moe_table` are distinct
+        // fields.
         let table = &self.moe_table;
-        let slot_dst = &self.slot_dst;
         let expert_slot = self.expert_slot;
         let stream = match self.prefetch_stream.as_mut() {
             Some(s) => s,
@@ -1219,7 +1212,7 @@ impl<'a> Pin<'a> {
             let entry = &table[sparse + e];
             #[cfg(feature = "trace")]
             let t = std::time::Instant::now();
-            stream_expert(stream, entry, slot_dst, slab, slot, expert_slot)?;
+            stream_expert(stream, entry, slab, slot, expert_slot)?;
             #[cfg(feature = "trace")]
             {
                 queue_ns += t.elapsed().as_nanos();
@@ -1246,121 +1239,223 @@ impl<'a> Pin<'a> {
     }
 }
 
-/// One routed expert's pool-slot geometry, derived from `cfg`: `(gate_slot,
-/// expert_slot)`. A slot is laid out gate|up|down; `gate` and `up` each span
-/// `gate_slot` (packed superset + scale superset), `down` the rest, and the whole
-/// expert occupies `expert_slot`. The single source of truth for both the pool
-/// sizing in [`Pin::build`] and the per-region offsets in [`slot_dst_of`].
-fn slot_geom(cfg: &ModelConfig) -> (usize, usize) {
-    let rb_h = cfg.hidden.div_ceil(2);
-    let rb_i = cfg.moe_inter.div_ceil(2);
-    let gate_slot = slot_span(cfg.moe_inter * rb_h) + slot_span(cfg.moe_inter * 4);
-    let down_slot = slot_span(cfg.hidden * rb_i) + slot_span(cfg.hidden * 4);
-    (gate_slot, 2 * gate_slot + down_slot) // gate | up | down, one slot
+/// Per-projection packed/scale byte lengths, derived from `cfg`. gate/up are
+/// `[moe_inter, hidden]` (equal), down is `[hidden, moe_inter]`.
+fn proj_lens(cfg: &ModelConfig) -> (usize, usize, usize, usize) {
+    let (gate_p, gate_s) = (cfg.moe_inter * cfg.hidden.div_ceil(2), cfg.moe_inter * 4);
+    let (down_p, down_s) = (cfg.hidden * cfg.moe_inter.div_ceil(2), cfg.hidden * 4);
+    (gate_p, gate_s, down_p, down_s)
 }
 
-/// The six slot-relative, block-aligned DESTINATION offsets a slot's reads land
-/// at — gate packed | gate scale | up packed | up scale | down packed | down
-/// scale — a pure function of `cfg` (run-invariant). Within each `gate_slot`/
-/// `down` region the packed superset comes first, the scale superset next
-/// (`slot_span(packed_len)` in). Matches the layout the old `stream_expert` built
-/// per miss; now computed once.
-fn slot_dst_of(cfg: &ModelConfig) -> [usize; 6] {
-    let (gate_slot, _) = slot_geom(cfg);
-    let gate_p = cfg.moe_inter * cfg.hidden.div_ceil(2);
-    let down_p = cfg.hidden * cfg.moe_inter.div_ceil(2);
-    let sp = slot_span; // packed superset length within a region
-    [
-        0,                          // gate packed
-        sp(gate_p),                 // gate scale
-        gate_slot,                  // up packed
-        gate_slot + sp(gate_p),     // up scale
-        2 * gate_slot,              // down packed
-        2 * gate_slot + sp(down_p), // down scale
-    ]
+/// The largest single coalesced read superset a slot may deliver: the full
+/// down|gate|up weight run (contiguous case) and the full scale run. Sizes the
+/// bounce span.
+fn coalesced_lens(cfg: &ModelConfig) -> (usize, usize) {
+    let (gate_p, gate_s, down_p, down_s) = proj_lens(cfg);
+    (down_p + gate_p + gate_p, down_s + gate_s + gate_s)
 }
 
-/// Resolve every routed expert's six `(fd, begin, len)` reads + useful-byte
-/// offsets ONCE (A1/A2), indexed `(layer - dense_layers) * n_experts + expert`.
-/// The cfg-dim cross-checks that used to run per miss (packed/scale byte lengths
-/// vs the slot geometry that sized each region) run HERE, so the miss path trusts
-/// the table blindly. A missing/mismatched expert tensor fails loud at build.
+/// One routed expert's pool-slot stride (`expert_slot`), derived from `cfg`. A slot
+/// holds each of the six tensors' O_DIRECT aligned superset — the weight region
+/// `[down|gate|up]` then the scale region — so a coalesced run (or a shard-split
+/// pair) always fits, whatever the run boundaries. Single source of truth for the
+/// pool sizing in [`Pin::build`].
+fn slot_geom(cfg: &ModelConfig) -> usize {
+    let (gate_p, gate_s, down_p, down_s) = proj_lens(cfg);
+    slot_span(down_p) + slot_span(gate_p) + slot_span(gate_p)   // weight region
+        + slot_span(down_s) + slot_span(gate_s) + slot_span(gate_s) // scale region
+}
+
+/// Plan the O_DIRECT reads for one three-tensor group (down, gate, up — in that
+/// disk order) into a slot region starting at `base`. Byte-adjacent same-shard
+/// tensors coalesce into one read (the common case: all three → one read); a
+/// shard-file boundary splits the run there. Each read lands at its own
+/// block-aligned destination — the previous read's O_DIRECT superset end — so the
+/// runs never overlap even though io_uring completion order is not submission
+/// order. Appends `(fd, begin, len, dst)` reads at `reads[*n..]`, bumps `n`, and
+/// returns the three tensors' slot-relative USEFUL-byte offsets (down, gate, up).
+fn plan_group(
+    t: &[(RawFd, usize, usize); 3],
+    base: usize,
+    reads: &mut [(RawFd, usize, usize, usize); 6],
+    n: &mut usize,
+) -> [usize; 3] {
+    let mut off = [0usize; 3];
+    let mut dst = base;
+    let mut i = 0;
+    while i < 3 {
+        let (fd, run_begin, _) = t[i];
+        let sub = run_begin & (ALIGN - 1); // O_DIRECT sub-block offset of the run start
+        // Extend the run over byte-adjacent same-shard tensors.
+        let (mut acc, mut j) = (0usize, i);
+        while j < 3 && t[j].0 == fd && t[j].1 == run_begin + acc {
+            off[j] = dst + sub + acc;
+            acc += t[j].2;
+            j += 1;
+        }
+        reads[*n] = (fd, run_begin, acc, dst);
+        *n += 1;
+        // Next run starts at this read's aligned superset end (block-aligned), so the
+        // regions are disjoint.
+        dst += (sub + acc).div_ceil(ALIGN) * ALIGN;
+        i = j;
+    }
+    off
+}
+
+/// Resolve every routed expert's coalesced `(fd, begin, len, dst)` reads + the six
+/// useful-byte offsets ONCE (A1/A2), indexed `(layer - dense_layers) * n_experts +
+/// expert`. The cfg-dim cross-checks (packed/scale byte lengths) run HERE, so the
+/// miss path trusts the table blindly. A missing/mismatched expert tensor fails
+/// loud at build. Coalescing (down|gate|up contiguous → one read) is opportunistic:
+/// [`plan_group`] falls back to per-run reads wherever a shard boundary splits it.
 fn build_moe_table(
     snap: &Snapshot,
     cfg: &ModelConfig,
-    slot_dst: &[usize; 6],
     direct_io: bool,
 ) -> Result<Vec<ExpertReads>> {
-    // cfg-expected packed/scale byte lengths (the same budget the slot regions were
-    // sized from). gate/up: [moe_inter, hidden]; down: [hidden, moe_inter].
-    let rb_h = cfg.hidden.div_ceil(2);
-    let rb_i = cfg.moe_inter.div_ceil(2);
-    let (gate_p, gate_s) = (cfg.moe_inter * rb_h, cfg.moe_inter * 4);
-    let (down_p, down_s) = (cfg.hidden * rb_i, cfg.hidden * 4);
-    // (proj suffix, expected packed len, expected scale len), in slot-layout order.
-    let projs = [
-        ("gate_proj", gate_p, gate_s),
-        ("up_proj", gate_p, gate_s),
-        ("down_proj", down_p, down_s),
-    ];
+    let (gate_p, gate_s, down_p, down_s) = proj_lens(cfg);
+    // Region bases: weights at the slot start, scales after the weight region.
+    let scale_base = slot_span(down_p) + slot_span(gate_p) + slot_span(gate_p);
     let n_moe = cfg.n_layers - cfg.dense_layers;
     let mut table = Vec::with_capacity(n_moe * cfg.n_experts);
     for l in cfg.dense_layers..cfg.n_layers {
         for e in 0..cfg.n_experts {
             let base = format!("model.layers.{l}.mlp.experts.{e}");
-            let mut reads = [(0 as RawFd, 0usize, 0usize); 6];
-            let mut off = [0usize; 6];
-            for (pi, &(proj, exp_p, exp_s)) in projs.iter().enumerate() {
-                let (kp, ks) = (pi * 2, pi * 2 + 1); // packed/scale slot indices
-                let (pfd, pb, plen) = snap
-                    .read_spec(&format!("{base}.{proj}.weight"), direct_io)
-                    .with_context(|| format!("read_spec {base}.{proj}.weight"))?;
+            // (fd, begin, len) for one tensor, cross-checked against its cfg length.
+            let spec = |suffix: &str, want: usize| -> Result<(RawFd, usize, usize)> {
+                let name = format!("{base}.{suffix}");
+                let (fd, b, len) = snap
+                    .read_spec(&name, direct_io)
+                    .with_context(|| format!("read_spec {name}"))?;
                 ensure!(
-                    plen == exp_p,
-                    "{base}.{proj}.weight: {plen} packed bytes, cfg expects {exp_p} \
-                     (config/snapshot dim mismatch)"
+                    len == want,
+                    "{name}: {len} bytes, cfg expects {want} (config/snapshot dim mismatch)"
                 );
-                let (sfd, sb, slen) = snap
-                    .read_spec(&format!("{base}.{proj}.weight.qs"), direct_io)
-                    .with_context(|| format!("read_spec {base}.{proj}.weight.qs"))?;
-                ensure!(
-                    slen == exp_s,
-                    "{base}.{proj}.weight.qs: {slen} scale bytes, cfg expects {exp_s} \
-                     (config/snapshot dim mismatch)"
-                );
-                reads[kp] = (pfd, pb, plen);
-                reads[ks] = (sfd, sb, slen);
-                // Useful bytes land `sub` (= begin's O_DIRECT sub-block offset) past
-                // the aligned region destination — exactly `Streamer::queue`'s return.
-                off[kp] = slot_dst[kp] + (pb & (ALIGN - 1));
-                off[ks] = slot_dst[ks] + (sb & (ALIGN - 1));
-            }
+                Ok((fd, b, len))
+            };
+            // DISK order is down, gate, up — the order the converter lays them out
+            // (contiguously within a shard), so the runs coalesce front-to-back.
+            let w = [
+                spec("down_proj.weight", down_p)?,
+                spec("gate_proj.weight", gate_p)?,
+                spec("up_proj.weight", gate_p)?,
+            ];
+            let s = [
+                spec("down_proj.weight.qs", down_s)?,
+                spec("gate_proj.weight.qs", gate_s)?,
+                spec("up_proj.weight.qs", gate_s)?,
+            ];
+            let mut reads = [(0 as RawFd, 0usize, 0usize, 0usize); 6];
+            let mut n = 0usize;
+            let wo = plan_group(&w, 0, &mut reads, &mut n);
+            let so = plan_group(&s, scale_base, &mut reads, &mut n);
+            // off is in slot-layout order: gate.p, gate.s, up.p, up.s, down.p, down.s.
+            // `plan_group` returns (down, gate, up), so index 1=gate, 2=up, 0=down.
+            let off = [wo[1], so[1], wo[2], so[2], wo[0], so[0]];
             table.push(ExpertReads { reads, off });
         }
     }
     Ok(table)
 }
 
-/// Queue an expert's 6 O_DIRECT reads into pool slot `slot` (regions gate|up|down
-/// at `slot*expert_slot`), from its precomputed [`ExpertReads`]. The miss path and
-/// the build-time warm-start seed share this: pure indexing + queueing, NO
-/// allocation, string hashing, or re-validation (all done at [`build_moe_table`]).
+/// Queue an expert's coalesced O_DIRECT reads (weights then scales; usually one
+/// each, more if a shard boundary split the run) into pool slot `slot` at
+/// `slot*expert_slot`, from its precomputed [`ExpertReads`]. `len == 0` entries are
+/// unused padding in the fixed array. The miss path and the build-time warm-start
+/// seed share this: pure indexing + queueing, NO allocation, string hashing, or
+/// re-validation (all done at [`build_moe_table`]).
 fn stream_expert(
     stream: &mut Streamer,
     entry: &ExpertReads,
-    slot_dst: &[usize; 6],
     pool: *mut u8,
     slot: usize,
     expert_slot: usize,
 ) -> Result<()> {
     let slot_base = slot * expert_slot;
-    for (i, &(fd, begin, len)) in entry.reads.iter().enumerate() {
-        // SAFETY: slot_base + slot_dst[i] is block-aligned (both multiples of ALIGN)
-        // and within the slot's region (slot < n_slots; regions sized to hold each
-        // read's superset), owning >= slot_span(len) writable bytes until the drain.
-        let dst = unsafe { pool.add(slot_base + slot_dst[i]) };
+    for &(fd, begin, len, rdst) in entry.reads.iter() {
+        if len == 0 {
+            continue; // unused array entry
+        }
+        // SAFETY: slot_base + rdst is block-aligned (both multiples of ALIGN) and
+        // within the slot's region (slot < n_slots; regions sized to hold each read's
+        // superset), owning >= slot_span(len) writable bytes until the drain.
+        let dst = unsafe { pool.add(slot_base + rdst) };
         // SAFETY: dst is block-aligned and owns the read's aligned superset.
         unsafe { stream.queue(fd, begin, len, dst)? };
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // plan_group must (a) coalesce a fully-contiguous down|gate|up run into ONE read
+    // with tight useful offsets, and (b) split at a shard boundary into disjoint,
+    // non-overlapping reads — the property that keeps io_uring's out-of-order
+    // completions from clobbering each other.
+    fn superset_end(dst: usize, begin: usize, len: usize) -> usize {
+        let sub = begin & (ALIGN - 1);
+        dst + (sub + len).div_ceil(ALIGN) * ALIGN
+    }
+
+    #[test]
+    fn contiguous_run_coalesces_to_one_read() {
+        let p = 6_291_456; // ALIGN-multiple projection length
+        let t = [(5, ALIGN, p), (5, ALIGN + p, p), (5, ALIGN + 2 * p, p)];
+        let mut reads = [(0, 0, 0, 0); 6];
+        let mut n = 0;
+        let off = plan_group(&t, 0, &mut reads, &mut n);
+        assert_eq!(n, 1, "byte-adjacent same-fd tensors must be ONE read");
+        assert_eq!(reads[0], (5, ALIGN, 3 * p, 0));
+        assert_eq!(off, [0, p, 2 * p]); // aligned begin ⇒ sub=0, tight tiling
+    }
+
+    #[test]
+    fn sub_block_offset_shifts_useful_bytes() {
+        let p = 6_291_456;
+        let t = [
+            (5, ALIGN + 2048, p),
+            (5, ALIGN + 2048 + p, p),
+            (5, ALIGN + 2048 + 2 * p, p),
+        ];
+        let mut reads = [(0, 0, 0, 0); 6];
+        let mut n = 0;
+        let off = plan_group(&t, 0, &mut reads, &mut n);
+        assert_eq!(n, 1);
+        assert_eq!(off, [2048, 2048 + p, 2048 + 2 * p]); // all shifted by the sub-block
+    }
+
+    #[test]
+    fn shard_boundary_splits_into_disjoint_reads() {
+        let p = 6_291_456;
+        // down|gate in shard fd=5, up in shard fd=6 (its own offset/sub).
+        let t = [(5, ALIGN, p), (5, ALIGN + p, p), (6, 8192 + 17, p)];
+        let mut reads = [(0, 0, 0, 0); 6];
+        let mut n = 0;
+        let off = plan_group(&t, 0, &mut reads, &mut n);
+        assert_eq!(n, 2, "a shard boundary forces a second read");
+        // Second read starts exactly at the first read's aligned superset end.
+        let end0 = superset_end(reads[0].3, reads[0].1, reads[0].2);
+        assert_eq!(reads[1].3, end0, "reads must not overlap");
+        // up's useful bytes land at its read dst + its own sub-block offset.
+        assert_eq!(off[2], reads[1].3 + (17 & (ALIGN - 1)));
+        // down/gate still tight within the first read.
+        assert_eq!(off[0], 0);
+        assert_eq!(off[1], p);
+    }
+
+    #[test]
+    fn every_projection_in_its_own_shard_uses_three_reads() {
+        let p = 6_291_456;
+        let t = [(5, ALIGN, p), (6, ALIGN, p), (7, ALIGN, p)];
+        let mut reads = [(0, 0, 0, 0); 6];
+        let mut n = 0;
+        let _ = plan_group(&t, 0, &mut reads, &mut n);
+        assert_eq!(n, 3);
+        // Each read's dst is the prior read's superset end — strictly increasing, disjoint.
+        assert_eq!(reads[1].3, superset_end(reads[0].3, reads[0].1, reads[0].2));
+        assert_eq!(reads[2].3, superset_end(reads[1].3, reads[1].1, reads[1].2));
+    }
 }
