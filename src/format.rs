@@ -93,6 +93,65 @@ impl Dtype {
             _ => return None,
         })
     }
+
+    fn name(self) -> &'static str {
+        match self {
+            Dtype::F32 => "F32",
+            Dtype::U8 => "U8",
+            Dtype::I8 => "I8",
+            Dtype::Bf16 => "BF16",
+            Dtype::F8E4M3 => "F8_E4M3",
+        }
+    }
+}
+
+/// Minimal safetensors writer for the resident artifact — collects tensors, then
+/// serializes `u64 header_len ‖ JSON header ‖ concatenated data`. Owns each tensor's
+/// bytes until `write` (the resident set is ~10 GiB, held once in host RAM).
+#[derive(Default)]
+pub struct SafeWriter {
+    tensors: Vec<(String, Dtype, Vec<usize>, Vec<u8>)>,
+}
+
+impl SafeWriter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add(
+        &mut self,
+        name: impl Into<String>,
+        dtype: Dtype,
+        shape: Vec<usize>,
+        bytes: Vec<u8>,
+    ) {
+        self.tensors.push((name.into(), dtype, shape, bytes));
+    }
+
+    pub fn write(&self, path: &str) -> Result<()> {
+        use std::io::Write;
+        let mut hdr = serde_json::Map::new();
+        let mut offset = 0usize;
+        for (name, dtype, shape, bytes) in &self.tensors {
+            let begin = offset;
+            offset += bytes.len();
+            hdr.insert(
+                name.clone(),
+                serde_json::json!({ "dtype": dtype.name(), "shape": shape, "data_offsets": [begin, offset] }),
+            );
+        }
+        let hjson = serde_json::to_vec(&serde_json::Value::Object(hdr))?;
+        let mut f = std::io::BufWriter::new(
+            std::fs::File::create(path).with_context(|| format!("create {path}"))?,
+        );
+        f.write_all(&(hjson.len() as u64).to_le_bytes())?;
+        f.write_all(&hjson)?;
+        for (_, _, _, bytes) in &self.tensors {
+            f.write_all(bytes)?;
+        }
+        f.flush()?;
+        Ok(())
+    }
 }
 
 struct Loc {
@@ -407,4 +466,52 @@ pub fn load_codebooks(dir: &str) -> Result<[Vec<f32>; 3]> {
         raw[n..2 * n].to_vec(),
         raw[2 * n..].to_vec(),
     ])
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // test setup: panic-on-failure is the readable idiom
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vq3_header_roundtrips() {
+        let h = Vq3Header::new(7, 256, 6144, 2048);
+        let back = Vq3Header::from_bytes(&h.to_bytes()).unwrap();
+        assert_eq!(back.magic, VQ3_MAGIC);
+        assert_eq!(back.layer, 7);
+        assert_eq!(back.n_experts, 256);
+        assert_eq!(back.hidden, 6144);
+        assert_eq!(back.moe_inter, 2048);
+        assert_eq!(back.stride, vq_expert_stride(6144, 2048) as u64);
+        // a corrupt magic must fail
+        let mut bad = h.to_bytes();
+        bad[0] = b'X';
+        assert!(Vq3Header::from_bytes(&bad).is_err());
+    }
+
+    #[test]
+    fn safewriter_roundtrips_through_reader() {
+        let dir = format!(
+            "{}/fmt_test",
+            std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into())
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = format!("{dir}/r.safetensors");
+        let mut w = SafeWriter::new();
+        let a: Vec<u8> = (0..48u8).collect(); // F32 [2,6]
+        let b: Vec<u8> = (100..108u8).collect(); // I8 [2,4]
+        w.add("a", Dtype::F32, vec![2, 6], a.clone());
+        w.add("b", Dtype::I8, vec![2, 4], b.clone());
+        w.write(&path).unwrap();
+
+        let st = Safetensors::open_file(&path).unwrap();
+        assert_eq!(st.bytes("a").unwrap(), &a[..]);
+        assert_eq!(st.shape("a").unwrap(), &[2, 6]);
+        let (bb, sh) = st.typed("b", Dtype::I8).unwrap();
+        assert_eq!(bb, &b[..]);
+        assert_eq!(sh, &[2, 4]);
+        assert!(st.typed("a", Dtype::I8).is_err()); // dtype mismatch fails loud
+        assert!(!st.has("missing"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
