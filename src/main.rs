@@ -13,8 +13,8 @@ use tracing::info;
 /// (default 2q) picks the eviction policy; `--direct-vmm-dma` forces raw DMA over the
 /// default pinned-host bounce; `--trace <path>` dumps the routed-expert access trace
 /// for the offline `replay` sim; `--prompt <text>` overrides the bench prompt;
-/// `--max-mem <GiB>` sets the device budget literally (no OS reserve, no cap — may
-/// OOM); without it the budget auto-sizes to `min(free − 16 GiB, MAX_BUDGET)`.
+/// `--max-mem <GiB>` sets the device budget literally (no OS reserve — may OOM);
+/// without it the budget auto-sizes to `free − 16 GiB`.
 struct Args {
     model: String,
     bench: Option<usize>,
@@ -246,31 +246,28 @@ fn main() -> Result<()> {
 
     #[cfg(feature = "rocm")]
     {
-        use rivoli::config::{MAX_BUDGET, OS_RESERVE};
+        use rivoli::config::OS_RESERVE;
         const GIB: f64 = (1u64 << 30) as f64;
         let (free, _total) = rivoli::device::mem_info()?;
-        // `--max-mem` is honoured LITERALLY — no OS reserve, no NaN-cliff cap; the user
-        // asked for that size, so it's allowed to OOM/fail at pin build. The auto path
-        // leaves OS_RESERVE free and clamps to MAX_BUDGET (the driver's durable-backing
-        // cliff, above which decode silently reads back NaN).
+        // `--max-mem` is honoured LITERALLY — no OS reserve; the user asked for that
+        // size, so it's allowed to OOM/fail at pin build. The auto path just leaves
+        // OS_RESERVE free (there is no hard footprint ceiling — the old NaN cliff was
+        // our own bug, since fixed).
         let cap = match cfg.max_mem {
             Some(m) => {
                 info!(
-                    "device pool budget {:.1} GiB (--max-mem, literal — no reserve/cap; may OOM)",
+                    "device pool budget {:.1} GiB (--max-mem, literal — no reserve; may OOM)",
                     m as f64 / GIB
                 );
                 m as usize
             }
             None => {
-                let cap = free
-                    .saturating_sub(OS_RESERVE as usize)
-                    .min(MAX_BUDGET as usize);
+                let cap = free.saturating_sub(OS_RESERVE as usize);
                 info!(
-                    "device pool budget {:.1} GiB (auto: free {:.1} GiB − {:.0} GiB OS reserve, capped at {:.0} GiB)",
+                    "device pool budget {:.1} GiB (auto: free {:.1} GiB − {:.0} GiB OS reserve)",
                     cap as f64 / GIB,
                     free as f64 / GIB,
                     OS_RESERVE as f64 / GIB,
-                    MAX_BUDGET as f64 / GIB,
                 );
                 cap
             }

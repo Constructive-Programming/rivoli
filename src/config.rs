@@ -6,23 +6,15 @@
 use anyhow::{Context, Result, bail};
 use std::fmt;
 
-/// Safety headroom the AUTO budget leaves free for the OS + the pinned io_uring
-/// arena, bytes. With no `--max-mem`, the total device budget is `free − OS_RESERVE`
-/// (then clamped to [`MAX_BUDGET`]). An explicit `--max-mem` ignores this entirely.
+/// Headroom the AUTO budget leaves free for the OS + the pinned io_uring arena,
+/// bytes. With no `--max-mem`, the total device budget is `free − OS_RESERVE`; an
+/// explicit `--max-mem` ignores this entirely.
 ///
-/// 16 GiB: `hipMemGetInfo` on this 124 GiB Strix Halo APU reports ~100 GiB free, but
-/// the driver will not durably back a device footprint that large under live decode —
-/// too small a reserve grows the pool until a long run over-subscribes physical
-/// memory, high VMM slots get reclaimed, and an expert reads back as NaN (invisible
-/// below ~256 tokens). Applies to the auto path only.
+/// 16 GiB keeps the auto-sized pool from starving the OS + the io_uring bounce arena
+/// on this 124 GiB box. (The old ~92 GiB "driver durable-backing NaN cliff" that a
+/// separate `MAX_BUDGET` ceiling guarded turned out to be a bug in our own code, now
+/// fixed — so there is no hard footprint ceiling any more.)
 pub const OS_RESERVE: u64 = 16 << 30;
-
-/// Hard ceiling on the AUTO device budget — the driver's durable-backing NaN cliff
-/// (~92 GiB total footprint on this box, around token 290; decode silently reads
-/// back NaN above it). 88 GiB leaves ~4 GiB of margin; do NOT raise without re-running
-/// the corruption check. Guards the auto-sized default ONLY — an explicit `--max-mem`
-/// bypasses it (the user asked for that size; let it OOM/NaN if it must).
-pub const MAX_BUDGET: u64 = 88 << 30;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -61,8 +53,8 @@ pub struct Config {
     /// computes experts — it routes, samples, and keeps the GPU fed.
     pub threads: usize,
     /// Device budget override, bytes (`--max-mem <GiB>`). None (default) auto-sizes to
-    /// `min(free − OS_RESERVE, MAX_BUDGET)`. `Some(n)` uses exactly `n` — no OS reserve,
-    /// no NaN-cliff cap; the user asked for it, so it's allowed to OOM/fail at build.
+    /// `free − OS_RESERVE`. `Some(n)` uses exactly `n` — no OS reserve; the user asked
+    /// for it, so it's allowed to OOM/fail at build.
     pub max_mem: Option<u64>,
     /// Attention row-selection mode (`--attn auto|dense|streaming|dsa|misa`, resolved
     /// in `main`). `auto` picks `dsa` when the artifact carries indexer weights, else
