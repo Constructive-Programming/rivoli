@@ -3,8 +3,11 @@
 #![allow(clippy::expect_used)]
 
 use rivoli::device::DeviceBuf;
-use rivoli::hip::{ExpertDescVq, device_sync, launch_gemv_fp8, launch_gemv_vq, launch_moe_vq};
-use rivoli::math::{f32_to_e4m3, silu};
+use rivoli::hip::{
+    ExpertDescVq, device_sync, launch_gemv_fp8, launch_gemv_vq, launch_mla_absorb_fp8,
+    launch_mla_value_fp8, launch_moe_vq,
+};
+use rivoli::math::{e4m3_to_f32, f32_to_e4m3, silu};
 use rivoli::quant::{VQ_DIM, VQ_K, matvec_fp8, matvec_vq, quant_vq};
 
 fn f32b(v: &[f32]) -> Vec<u8> {
@@ -113,6 +116,87 @@ fn gemv_vq_matches_oracle() {
     }
     device_sync().expect("sync");
     assert_close(&want, &f32v(&yb.copy_out().expect("out")), "gemv_vq");
+}
+
+/// MLA absorb + value kernels vs an f32 reference on the dequantized kv_b. kv_b is
+/// fp8-e4m3 block-scaled: [H·(nope+vh) rows, kvl cols], block 128 on both axes.
+#[test]
+fn mla_fp8_matches_reference() {
+    let mut r = Lcg(0x77);
+    let (h, qh, nope, vh, kvl, block) = (4usize, 128usize, 128usize, 64usize, 256usize, 128usize);
+    let rows = h * (nope + vh);
+    let sc_cols = kvl / block;
+    let packed: Vec<u8> = (0..rows * kvl).map(|_| f32_to_e4m3(r.f())).collect();
+    let scale: Vec<f32> = (0..(rows / block).max(1) * sc_cols)
+        .map(|_| (r.f() * 0.1).abs() + 0.01)
+        .collect();
+    // reference reads the exact dequant the kernels see: kvb[row][i] = e4m3·block-scale.
+    let sc_rows = rows.div_ceil(block);
+    let kvbf = |row: usize, i: usize| -> f32 {
+        e4m3_to_f32(packed[row * kvl + i]) * scale[(row / block).min(sc_rows - 1) * sc_cols + i / block]
+    };
+    let q: Vec<f32> = (0..h * qh).map(|_| r.f()).collect();
+    let clat: Vec<f32> = (0..h * kvl).map(|_| r.f()).collect();
+
+    // absorb: qabs[head][i] = Σ_d q[head·qh+d]·kvb[rbase+d][i]
+    let mut want_abs = vec![0.0f32; h * kvl];
+    for head in 0..h {
+        let rbase = head * (nope + vh);
+        for i in 0..kvl {
+            let mut acc = 0.0f32;
+            for d in 0..nope {
+                acc += q[head * qh + d] * kvbf(rbase + d, i);
+            }
+            want_abs[head * kvl + i] = acc;
+        }
+    }
+    // value: ctx[head][j] = Σ_i clat[head][i]·kvb[rbase+nope+j][i]
+    let mut want_val = vec![0.0f32; h * vh];
+    for head in 0..h {
+        let rbase = head * (nope + vh);
+        for j in 0..vh {
+            let mut acc = 0.0f32;
+            for i in 0..kvl {
+                acc += clat[head * kvl + i] * kvbf(rbase + nope + j, i);
+            }
+            want_val[head * vh + j] = acc;
+        }
+    }
+
+    let (kb, sb) = (dev(&packed), dev(&f32b(&scale)));
+    let (qb, clb) = (dev(&f32b(&q)), dev(&f32b(&clat)));
+    let mut absb = dev(&vec![0u8; h * kvl * 4]);
+    let mut valb = dev(&vec![0u8; h * vh * 4]);
+    unsafe {
+        launch_mla_absorb_fp8(
+            qb.ptr() as *const f32,
+            kb.ptr(),
+            sb.ptr() as *const f32,
+            h,
+            qh,
+            nope,
+            vh,
+            kvl,
+            block,
+            absb.ptr_mut() as *mut f32,
+        )
+        .expect("launch absorb");
+        launch_mla_value_fp8(
+            clb.ptr() as *const f32,
+            kb.ptr(),
+            sb.ptr() as *const f32,
+            h,
+            nope,
+            vh,
+            kvl,
+            block,
+            valb.ptr_mut() as *mut f32,
+        )
+        .expect("launch value");
+    }
+    device_sync().expect("sync");
+    assert_close(&want_abs, &f32v(&absb.copy_out().expect("out")), "mla_absorb");
+    assert_close(&want_val, &f32v(&valb.copy_out().expect("out")), "mla_value");
 }
 
 /// Fused VQ MoE (moe_gateup_vq → moe_down_vq → moe_reduce), 3 per-projection

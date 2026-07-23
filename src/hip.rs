@@ -59,6 +59,33 @@ unsafe extern "C" {
         y: *mut f32,
     ) -> i32;
 
+    #[allow(clippy::too_many_arguments)]
+    fn rivoli_mla_absorb_fp8(
+        q: *const f32,
+        kvb: *const u8,
+        kvb_scale: *const f32,
+        h: i32,
+        qh: i32,
+        nope: i32,
+        vh: i32,
+        kvl: i32,
+        block: i32,
+        qabs: *mut f32,
+    ) -> i32;
+
+    #[allow(clippy::too_many_arguments)]
+    fn rivoli_mla_value_fp8(
+        clat: *const f32,
+        kvb: *const u8,
+        kvb_scale: *const f32,
+        h: i32,
+        nope: i32,
+        vh: i32,
+        kvl: i32,
+        block: i32,
+        ctx: *mut f32,
+    ) -> i32;
+
     fn rivoli_gemv_f32(x: *const f32, w: *const f32, o_dim: i32, i_dim: i32, y: *mut f32) -> i32;
     fn rivoli_rmsnorm(x: *const f32, w: *const f32, n: i32, eps: f32, y: *mut f32) -> i32;
     fn rivoli_rope(base: *mut f32, count: i32, stride: i32, seg: i32, pos: i32, theta: f64) -> i32;
@@ -158,6 +185,78 @@ pub unsafe fn launch_gemv_fp8(
         )
     };
     check(r, "gemv_fp8")
+}
+
+/// MLA absorb: `qabs[head][i] = Σ_d q[head·qh+d]·kv_b[rbase+d][i]` over kv_b's `nope`
+/// absorb rows (rbase = head·(nope+vh)), head-batched. kv_b fp8-e4m3 block-scaled.
+///
+/// # Safety
+/// Async device pointers live until the next [`device_sync`]: `q` (`h·qh` f32),
+/// `kvb` (`h·(nope+vh)·kvl` bytes), `kvb_scale` (block-scale f32), `qabs` (`h·kvl` f32).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_mla_absorb_fp8(
+    q: *const f32,
+    kvb: *const u8,
+    kvb_scale: *const f32,
+    h: usize,
+    qh: usize,
+    nope: usize,
+    vh: usize,
+    kvl: usize,
+    block: usize,
+    qabs: *mut f32,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r = unsafe {
+        rivoli_mla_absorb_fp8(
+            q,
+            kvb,
+            kvb_scale,
+            h as i32,
+            qh as i32,
+            nope as i32,
+            vh as i32,
+            kvl as i32,
+            block as i32,
+            qabs,
+        )
+    };
+    check(r, "mla_absorb_fp8")
+}
+
+/// MLA value: `ctx[head][j] = Σ_i clat[head][i]·kv_b[rbase+nope+j][i]` over kv_b's `vh`
+/// value rows, head-batched. kv_b fp8-e4m3 block-scaled.
+///
+/// # Safety
+/// Async device pointers live until the next [`device_sync`]: `clat` (`h·kvl` f32),
+/// `kvb` (`h·(nope+vh)·kvl` bytes), `kvb_scale` (block-scale f32), `ctx` (`h·vh` f32).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_mla_value_fp8(
+    clat: *const f32,
+    kvb: *const u8,
+    kvb_scale: *const f32,
+    h: usize,
+    nope: usize,
+    vh: usize,
+    kvl: usize,
+    block: usize,
+    ctx: *mut f32,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r = unsafe {
+        rivoli_mla_value_fp8(
+            clat,
+            kvb,
+            kvb_scale,
+            h as i32,
+            nope as i32,
+            vh as i32,
+            kvl as i32,
+            block as i32,
+            ctx,
+        )
+    };
+    check(r, "mla_value_fp8")
 }
 
 /// VQ-int3 GEMV `y = W·x` (group scales applied inside the decode).
