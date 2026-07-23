@@ -1153,13 +1153,11 @@ impl<'a> GpuEngine<'a> {
                     self.wexpert_buf.copy_in_at(0, f32_le_bytes(&self.w))?;
                     // Fallback: shared expert still int4 (no shared.i3) → separate desc.
                     let int4_shared = shared_vq.is_none();
-                    if int4_shared {
-                        if let Some(s) = shared {
-                            self.descs.clear();
-                            self.descs.push(desc_of(&s));
-                            self.descs_shared_buf
-                                .copy_in_at(0, desc_bytes(&self.descs))?;
-                        }
+                    if let Some(s) = shared.filter(|_| int4_shared) {
+                        self.descs.clear();
+                        self.descs.push(desc_of(&s));
+                        self.descs_shared_buf
+                            .copy_in_at(0, desc_bytes(&self.descs))?;
                     }
                     self.pin.await_layer(batch)?;
                     // int4-shared fallback: launch it FIRST → moe_out → add, so the
