@@ -13,9 +13,7 @@ fn main() {
     }
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR set by cargo");
-    let kernels = [
-        "moe", "attn", "linalg", "mla", "fwd", "indexer", "vmm", "stream",
-    ];
+    let kernels = ["linalg"];
     let hipcc = std::env::var("HIPCC").unwrap_or_else(|_| "hipcc".into());
     let trace = std::env::var("CARGO_FEATURE_TRACE").is_ok();
 
