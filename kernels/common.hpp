@@ -45,15 +45,26 @@ __device__ __forceinline__ float e4m3f(unsigned char b) {
     return sign * (1.0f + mant * 0.125f) * exp2f((float)(exp - 7));
 }
 
+// Fill a 256-float LDS table with e4m3f(byte) so the hot GEMV decodes fp8 by an
+// LDS read instead of the branchy exp2f path (decode was compute-bound, not load-
+// width-bound — see the failed load-widening experiment). Bit-exact with e4m3f by
+// construction. Caller passes threadIdx.x and __syncthreads() before use; needs a
+// >=256-thread block (both callers launch ROWS_PER_BLOCK*WAVE = 256).
+__device__ __forceinline__ void e4m3_lut_build(float* lut, int tid) {
+    if (tid < 256) lut[tid] = e4m3f((unsigned char)tid);
+}
+
 // Wave-cooperative fp8-e4m3 block-scaled dot for one output row `o`. `wrow` =
 // packed[o*i_dim..], `scalerow` = scale + (o/block)*sc_cols (the row's block-scale
-// row), so element i uses scalerow[i/block]. Matches quant.rs::matvec_fp8.
+// row), so element i uses scalerow[i/block]. `lut` is the block's e4m3_lut_build
+// table. Matches quant.rs::matvec_fp8.
 __device__ __forceinline__ float dot_fp8_wave(const float* __restrict__ x,
                                               const unsigned char* __restrict__ wrow,
                                               const float* __restrict__ scalerow,
-                                              int i_dim, int block, int lane) {
+                                              int i_dim, int block, int lane,
+                                              const float* __restrict__ lut) {
     float acc = 0.0f;
-    for (int i = lane; i < i_dim; i += WAVE) acc += x[i] * e4m3f(wrow[i]) * scalerow[i / block];
+    for (int i = lane; i < i_dim; i += WAVE) acc += x[i] * lut[wrow[i]] * scalerow[i / block];
     return wave_sum(acc);
 }
 

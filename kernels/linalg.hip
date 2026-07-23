@@ -14,12 +14,15 @@
 extern "C" __global__ void gemv_fp8(
     const float* __restrict__ x, const unsigned char* __restrict__ packed,
     const float* __restrict__ scale, int o_dim, int i_dim, int block, float* __restrict__ y) {
+    __shared__ float lut[256];
+    e4m3_lut_build(lut, threadIdx.x);
+    __syncthreads();
     int lane = threadIdx.x & (WAVE - 1);
     size_t o = (size_t)blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x / WAVE);
     if (o >= (size_t)o_dim) return;
     int sc_cols = (i_dim + block - 1) / block;
     float acc = dot_fp8_wave(x, packed + o * (size_t)i_dim, scale + (o / block) * sc_cols,
-                             i_dim, block, lane);
+                             i_dim, block, lane, lut);
     if (lane == 0) y[o] = acc;
 }
 

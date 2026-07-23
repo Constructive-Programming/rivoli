@@ -17,6 +17,9 @@ extern "C" __global__ void mla_absorb_fp8(
     const float* __restrict__ q, const unsigned char* __restrict__ kvb,
     const float* __restrict__ kvb_scale, int H, int qh, int nope, int vh, int kvl, int block,
     float* __restrict__ qabs) {
+    __shared__ float lut[256];
+    e4m3_lut_build(lut, threadIdx.x);
+    __syncthreads();
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (size_t)H * kvl) return;
     int head = (int)(idx / kvl);
@@ -27,7 +30,7 @@ extern "C" __global__ void mla_absorb_fp8(
     float acc = 0.0f;
     for (int d = 0; d < nope; ++d) {
         size_t row = rbase + d;
-        float w = e4m3f(kvb[row * (size_t)kvl + i]) * kvb_scale[(row / block) * sc_cols + i / block];
+        float w = lut[kvb[row * (size_t)kvl + i]] * kvb_scale[(row / block) * sc_cols + i / block];
         acc += qh_ptr[d] * w;
     }
     qabs[(size_t)head * kvl + i] = acc;
@@ -41,6 +44,9 @@ extern "C" __global__ void mla_value_fp8(
     const float* __restrict__ clat, const unsigned char* __restrict__ kvb,
     const float* __restrict__ kvb_scale, int H, int nope, int vh, int kvl, int block,
     float* __restrict__ ctx) {
+    __shared__ float lut[256];
+    e4m3_lut_build(lut, threadIdx.x);
+    __syncthreads();
     int lane = threadIdx.x & (WAVE - 1);
     size_t r = (size_t)blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / WAVE;
     if (r >= (size_t)H * vh) return;
@@ -49,7 +55,7 @@ extern "C" __global__ void mla_value_fp8(
     int sc_cols = (kvl + block - 1) / block;
     size_t row = (size_t)head * (nope + vh) + nope + j;
     float acc = dot_fp8_wave(clat + (size_t)head * kvl, kvb + row * (size_t)kvl,
-                             kvb_scale + (row / block) * sc_cols, kvl, block, lane);
+                             kvb_scale + (row / block) * sc_cols, kvl, block, lane, lut);
     if (lane == 0) ctx[(size_t)head * vh + j] = acc;
 }
 
