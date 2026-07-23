@@ -12,15 +12,15 @@
 use crate::attn::{AttnMode, streaming_rows};
 use crate::device::DeviceBuf;
 use crate::hip::{
-    ExpertDesc, device_sync, launch_append_kv, launch_append_kv_fp8, launch_argmax, launch_attend,
-    launch_attend_fp8, launch_embed_i8_row, launch_gather_rope, launch_gemv_bf16, launch_gemv_f32,
-    launch_gemv_i4, launch_gemv_i8, launch_index_append, launch_index_head_route,
+    ExpertDesc, ExpertDescVq, device_sync, launch_append_kv, launch_append_kv_fp8, launch_argmax,
+    launch_attend, launch_attend_fp8, launch_embed_i8_row, launch_gather_rope, launch_gemv_bf16,
+    launch_gemv_f32, launch_gemv_i4, launch_gemv_i8, launch_index_append, launch_index_head_route,
     launch_index_pool_push, launch_index_score, launch_layernorm, launch_mla_absorb,
-    launch_mla_value, launch_moe, launch_rmsnorm, launch_rope, launch_vadd,
+    launch_mla_value, launch_moe, launch_moe_vq, launch_rmsnorm, launch_rope, launch_vadd,
 };
 use crate::math::{sigmoid, topk_into};
 use crate::model::ModelConfig;
-use crate::pin::{IndexerPin, LayerMlp, Mlp, Pin};
+use crate::pin::{IndexerPin, LayerMlp, Mlp, MlpVq, Pin};
 use anyhow::{Result, bail, ensure};
 
 fn desc_of(m: &Mlp) -> ExpertDesc {
@@ -34,8 +34,24 @@ fn desc_of(m: &Mlp) -> ExpertDesc {
     }
 }
 
+fn desc_of_vq(m: &MlpVq) -> ExpertDescVq {
+    ExpertDescVq {
+        gate_indices: m.gate.indices,
+        gate_scales: m.gate.scales,
+        up_indices: m.up.indices,
+        up_scales: m.up.scales,
+        down_indices: m.down.indices,
+        down_scales: m.down.scales,
+    }
+}
+
 fn desc_bytes(d: &[ExpertDesc]) -> &[u8] {
     // SAFETY: ExpertDesc is repr(C) POD (six pointers); this is its byte view.
+    unsafe { std::slice::from_raw_parts(d.as_ptr() as *const u8, std::mem::size_of_val(d)) }
+}
+
+fn desc_bytes_vq(d: &[ExpertDescVq]) -> &[u8] {
+    // SAFETY: ExpertDescVq is repr(C) POD (six pointers); this is its byte view.
     unsafe { std::slice::from_raw_parts(d.as_ptr() as *const u8, std::mem::size_of_val(d)) }
 }
 
@@ -254,6 +270,15 @@ pub struct GpuEngine<'a> {
     descs: Vec<ExpertDesc>,
     w: Vec<f32>,
     mlps: Vec<Mlp>,
+    /// VQ-int3 routed path (`--vq-dir`): resolved batch + descriptors, and the shared
+    /// expert's own tiny int4 desc/weight buffers (it stays int4, so it launches
+    /// separately from the VQ routed batch). `vq` mirrors `pin.is_vq()`.
+    vq: bool,
+    codebook: *const f32,
+    mlps_vq: Vec<MlpVq>,
+    descs_vq: Vec<ExpertDescVq>,
+    descs_shared_buf: DeviceBuf,
+    wshared_buf: DeviceBuf,
     /// DIAGNOSTIC (`--checksum-layer`): hash routed experts on this MoE layer.
     #[cfg(feature = "trace")]
     checksum_layer: Option<usize>,
@@ -417,6 +442,16 @@ impl<'a> GpuEngine<'a> {
             descs: Vec::with_capacity(slots),
             w: Vec::with_capacity(slots),
             mlps: Vec::with_capacity(cfg.top_k),
+            vq: pin.is_vq(),
+            codebook: pin.codebook(),
+            mlps_vq: Vec::with_capacity(cfg.top_k),
+            descs_vq: Vec::with_capacity(cfg.top_k),
+            descs_shared_buf: DeviceBuf::new(std::mem::size_of::<ExpertDesc>())?,
+            wshared_buf: {
+                let mut b = f(1)?;
+                b.copy_in_at(0, f32_le_bytes(&[1.0f32]))?;
+                b
+            },
             #[cfg(feature = "trace")]
             checksum_layer: None,
             #[cfg(feature = "trace")]
@@ -1047,7 +1082,13 @@ impl<'a> GpuEngine<'a> {
                 // immediately — the slot ADDRESSES are known at allocation time, only
                 // the bytes are still arriving. Everything between here and
                 // `await_layer` below runs with the NVMe busy.
-                let batch = self.pin.submit_layer(l, &self.sel, &mut self.mlps)?;
+                // Format-specific resolve: VQ fills `mlps_vq`, int4 fills `mlps`. The
+                // streaming spine (pool, io_uring, prefetch drain) is shared.
+                let batch = if self.vq {
+                    self.pin.submit_layer_vq(l, &self.sel, &mut self.mlps_vq)?
+                } else {
+                    self.pin.submit_layer(l, &self.sel, &mut self.mlps)?
+                };
                 #[cfg(feature = "trace")]
                 {
                     let dt = t.elapsed().as_nanos();
@@ -1072,15 +1113,13 @@ impl<'a> GpuEngine<'a> {
                     let n = self.prefetch_depth.min(self.pred_sel.len());
                     self.pin.prefetch_layer(l + 1, &self.pred_sel[..n])?;
                 }
-                // Build the descriptor batch (+ record the hit-rate diagnostic) into
-                // the reused `descs`/`w` fields — cleared, so no per-token alloc.
-                self.descs.clear();
+                // Routed weights (both formats): original sigmoid score, sum-normalized
+                // over the routed picks, then scaled. The shared expert (weight 1.0) is
+                // handled per-format below.
                 self.w.clear();
-                for (i, m) in self.mlps.iter().enumerate() {
-                    self.descs.push(desc_of(m));
-                    self.w.push(self.scores[self.sel[i]]);
+                for &e in &self.sel {
+                    self.w.push(self.scores[e]);
                 }
-                // Weight = original sigmoid score, sum-normalized then scaled.
                 let mut sm: f32 = self.w.iter().sum();
                 if cfg.norm_topk_prob {
                     sm += 1e-20;
@@ -1091,55 +1130,106 @@ impl<'a> GpuEngine<'a> {
                 for wi in self.w.iter_mut() {
                     *wi *= cfg.routed_scale as f32;
                 }
-                // Shared expert(s), weight 1.0.
-                if let Some(s) = shared {
-                    self.descs.push(desc_of(&s));
-                    self.w.push(1.0);
-                }
-                let ndesc = self.descs.len();
-                self.descs_buf.copy_in_at(0, desc_bytes(&self.descs))?;
-                self.wexpert_buf.copy_in_at(0, f32_le_bytes(&self.w))?;
-                // JOIN the cold reads. Everything above — the prefetch submit, the
-                // descriptor/weight build, both H2D uploads — ran with them in flight;
-                // this is the last possible moment, because `launch_moe` below is the
-                // first thing that dereferences a cold slot.
-                //
-                // No kernel is live here, so the `hipDeviceSynchronize` inside the
-                // bounce-mode drain serialises nothing: the attention chain was joined
-                // by the `attn` sync above, and the only device work since is the two
-                // uploads immediately preceding, which must complete before
-                // `launch_moe` regardless.
-                #[cfg(feature = "trace")]
-                let t = std::time::Instant::now();
-                self.pin.await_layer(batch)?;
-                #[cfg(feature = "trace")]
-                {
-                    self.prof.fetch_ns += t.elapsed().as_nanos();
-                }
-                // DIAGNOSTIC (`--checksum-layer`): the weights for `sel` are now
-                // fully landed and no kernel is live, so this is the one point where
-                // an expert's bytes can be hashed as the MoE kernel will read them.
-                // Two runs that differ ONLY in slot assignment (e.g. `--max-mem`)
-                // must produce identical hashes for the same (layer,expert) key; a
-                // mismatch localises the divergence to the read path.
-                #[cfg(feature = "trace")]
-                if self.checksum_layer == Some(l) {
-                    self.dump_expert_checksums(l)?;
-                }
-                // SAFETY: descs point at resident/cold-slot weights valid until
-                // the end-of-layer sync; the cold ones have now landed (`await_layer`).
-                unsafe {
-                    launch_moe(
-                        xnp,
-                        hidden,
-                        cfg.moe_inter,
-                        ndesc,
-                        self.descs_buf.ptr() as *const ExpertDesc,
-                        self.wexpert_buf.ptr() as *const f32,
-                        self.moe_h.ptr_mut() as *mut f32,
-                        self.moe_partial.ptr_mut() as *mut f32,
-                        self.moe_out.ptr_mut() as *mut f32,
-                    )?;
+                if self.vq {
+                    // VQ routed descriptors + the shared int4 desc (separate buffer,
+                    // since the shared expert stays int4 and can't join a VQ batch).
+                    self.descs_vq.clear();
+                    for m in &self.mlps_vq {
+                        self.descs_vq.push(desc_of_vq(m));
+                    }
+                    let nrouted = self.descs_vq.len();
+                    self.descs_buf
+                        .copy_in_at(0, desc_bytes_vq(&self.descs_vq))?;
+                    self.wexpert_buf.copy_in_at(0, f32_le_bytes(&self.w))?;
+                    if let Some(s) = shared {
+                        self.descs.clear();
+                        self.descs.push(desc_of(&s));
+                        self.descs_shared_buf
+                            .copy_in_at(0, desc_bytes(&self.descs))?;
+                    }
+                    self.pin.await_layer(batch)?;
+                    // Shared int4 expert FIRST → moe_out → add to residual, so the outer
+                    // vadd (below the MoE block) can add the routed VQ moe_out. Both
+                    // launches are null-stream ordered, so moe_out/moe_h/moe_partial
+                    // reuse across the two is safe without an extra barrier.
+                    // SAFETY: descriptors point at resident/landed slot weights.
+                    if shared.is_some() {
+                        unsafe {
+                            launch_moe(
+                                xnp,
+                                hidden,
+                                cfg.moe_inter,
+                                1,
+                                self.descs_shared_buf.ptr() as *const ExpertDesc,
+                                self.wshared_buf.ptr() as *const f32,
+                                self.moe_h.ptr_mut() as *mut f32,
+                                self.moe_partial.ptr_mut() as *mut f32,
+                                self.moe_out.ptr_mut() as *mut f32,
+                            )?;
+                            launch_vadd(xp, self.moe_out.ptr() as *const f32, hidden)?;
+                        }
+                    }
+                    // Routed VQ experts → moe_out (the outer vadd adds it to xp).
+                    // SAFETY: descs point at landed slot indices/scales + resident codebook.
+                    unsafe {
+                        launch_moe_vq(
+                            xnp,
+                            hidden,
+                            cfg.moe_inter,
+                            nrouted,
+                            self.descs_buf.ptr() as *const ExpertDescVq,
+                            self.codebook,
+                            self.wexpert_buf.ptr() as *const f32,
+                            self.moe_h.ptr_mut() as *mut f32,
+                            self.moe_partial.ptr_mut() as *mut f32,
+                            self.moe_out.ptr_mut() as *mut f32,
+                        )?;
+                    }
+                } else {
+                    // int4: routed + shared fold into ONE launch_moe batch.
+                    self.descs.clear();
+                    for m in &self.mlps {
+                        self.descs.push(desc_of(m));
+                    }
+                    if let Some(s) = shared {
+                        self.descs.push(desc_of(&s));
+                        self.w.push(1.0);
+                    }
+                    let ndesc = self.descs.len();
+                    self.descs_buf.copy_in_at(0, desc_bytes(&self.descs))?;
+                    self.wexpert_buf.copy_in_at(0, f32_le_bytes(&self.w))?;
+                    // JOIN the cold reads — last possible moment (launch_moe below is the
+                    // first deref of a cold slot). No kernel live, so the bounce drain's
+                    // sync serialises nothing.
+                    #[cfg(feature = "trace")]
+                    let t = std::time::Instant::now();
+                    self.pin.await_layer(batch)?;
+                    #[cfg(feature = "trace")]
+                    {
+                        self.prof.fetch_ns += t.elapsed().as_nanos();
+                    }
+                    // DIAGNOSTIC (`--checksum-layer`): weights for `sel` are landed and
+                    // no kernel is live — the one point an expert's bytes hash as the
+                    // kernel will read them.
+                    #[cfg(feature = "trace")]
+                    if self.checksum_layer == Some(l) {
+                        self.dump_expert_checksums(l)?;
+                    }
+                    // SAFETY: descs point at resident/cold-slot weights valid until the
+                    // end-of-layer sync; the cold ones have now landed (`await_layer`).
+                    unsafe {
+                        launch_moe(
+                            xnp,
+                            hidden,
+                            cfg.moe_inter,
+                            ndesc,
+                            self.descs_buf.ptr() as *const ExpertDesc,
+                            self.wexpert_buf.ptr() as *const f32,
+                            self.moe_h.ptr_mut() as *mut f32,
+                            self.moe_partial.ptr_mut() as *mut f32,
+                            self.moe_out.ptr_mut() as *mut f32,
+                        )?;
+                    }
                 }
             }
             // SAFETY: residual add of the MLP contribution.

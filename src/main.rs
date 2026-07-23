@@ -55,6 +55,7 @@ struct Args {
     window: usize,
     misa_heads: usize,
     kv_fp8: bool,
+    vq_dir: Option<String>,
     /// DIAGNOSTIC (`--checksum-layer <l>`): hash routed experts on MoE layer `l`.
     /// `trace` builds only (the probe itself is compiled out otherwise).
     #[cfg(feature = "trace")]
@@ -69,7 +70,8 @@ fn parse_args() -> Result<Args> {
          [--direct-vmm-dma] [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc] \
          [--2q-kin <pct>] [--2q-kout <pct>] \
          [--no-prefetch] [--prefetch-depth <n>] [--max-mem <GiB>] [--buffered-io] [--os-reserve <GiB>] \
-         [--attn auto|dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>] [--kv-fp8]";
+         [--attn auto|dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>] [--kv-fp8] \
+         [--vq-dir <dir>]";
     let mut snapshot = None;
     // Defaults are the winning cell of the 512-token depth x policy grid (see
     // benchmarks.md): 2Q eviction + cross-layer prefetch at depth ONE.
@@ -103,6 +105,7 @@ fn parse_args() -> Result<Args> {
         window: 8192,
         misa_heads: 8, // the MISA paper's validated GLM-5 setting
         kv_fp8: false,
+        vq_dir: None,
         #[cfg(feature = "trace")]
         checksum_layer: None,
         #[cfg(feature = "trace")]
@@ -198,6 +201,7 @@ fn parse_args() -> Result<Args> {
                 }
             }
             "--kv-fp8" => a.kv_fp8 = true,
+            "--vq-dir" => a.vq_dir = Some(args.next().context("--vq-dir requires a path")?),
             #[cfg(feature = "trace")]
             "--checksum-x" => a.checksum_x = true,
             #[cfg(feature = "trace")]
@@ -272,6 +276,7 @@ fn main() -> Result<()> {
         a.direct_io,
         attn,
         a.kv_fp8,
+        a.vq_dir,
     )?;
     #[cfg(feature = "trace")]
     {
@@ -440,6 +445,7 @@ async fn run(cfg: Config) -> Result<()> {
             cfg.prefetch_depth,
             cfg.direct_io,
             want_indexer,
+            cfg.vq_dir.as_deref(),
         )?;
         info!("pin built in {:.1}s", t.elapsed().as_secs_f64());
         let max_ctx = prompt_ids.len() + ngen + 1;
@@ -453,7 +459,15 @@ async fn run(cfg: Config) -> Result<()> {
             engine.set_checksum_layer(cfg.checksum_layer);
             engine.set_checksum_x(cfg.checksum_x);
         }
-        engine.set_heartbeat(rivoli::watchdog::spawn(std::time::Duration::from_secs(60))?);
+        // 60 s default; `RIVOLI_WATCHDOG_SECS` raises it for slow-storage diagnostics
+        // (e.g. streaming the int3 output from NFS instead of local NVMe).
+        let wd_secs = std::env::var("RIVOLI_WATCHDOG_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
+        engine.set_heartbeat(rivoli::watchdog::spawn(std::time::Duration::from_secs(
+            wd_secs,
+        ))?);
         // One OTLP span per decode run; the per-token/PROFILE/summary events below
         // attach to it, and the top-line metrics are recorded as queryable fields.
         // The block holds no `.await`, so entering the span guard is race-free.

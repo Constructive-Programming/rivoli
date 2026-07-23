@@ -122,6 +122,10 @@ pub struct Config {
     /// bf16 (`--kv-fp8`). Halves KV bandwidth/capacity; ~e4m3 precision loss on
     /// the latent (the rope half stays bf16). Default false (bf16).
     pub kv_fp8: bool,
+    /// Directory of VQ-int3 routed-expert files (`--vq-dir`): `L{ll}.i3` per MoE
+    /// layer + `codebook.f32`. When set, routed experts stream as VQ-int3 instead of
+    /// int4; everything else stays int4 from the snapshot. Default `None` (int4).
+    pub vq_dir: Option<String>,
 }
 
 fn mem_available() -> Result<u64> {
@@ -161,6 +165,7 @@ impl Config {
         direct_io: bool,
         attn: AttnMode,
         kv_fp8: bool,
+        vq_dir: Option<String>,
     ) -> Result<Self> {
         let avail = mem_available()?;
         let reserve = os_reserve();
@@ -201,6 +206,7 @@ impl Config {
             direct_io,
             attn,
             kv_fp8,
+            vq_dir,
         })
     }
 }
@@ -210,7 +216,7 @@ impl fmt::Display for Config {
         const GIB: f64 = (1u64 << 30) as f64;
         write!(
             f,
-            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} direct_io={} cache_policy={} 2q_kin={}% 2q_kout={}% prefetch={} prefetch_depth={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={} threads={} attn={:?} kv_fp8={}",
+            "snap={} bench={:?} pre_seed={} direct_vmm_dma={} direct_io={} cache_policy={} 2q_kin={}% 2q_kout={}% prefetch={} prefetch_depth={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={} threads={} attn={:?} kv_fp8={} vq_dir={:?}",
             self.snapshot,
             self.bench,
             self.pre_seed,
@@ -230,7 +236,8 @@ impl fmt::Display for Config {
             },
             self.threads,
             self.attn,
-            self.kv_fp8
+            self.kv_fp8,
+            self.vq_dir
         )
     }
 }

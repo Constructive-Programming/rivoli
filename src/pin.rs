@@ -20,9 +20,11 @@
 use crate::cache;
 use crate::device::{DeviceTier, VmmBuf, mem_info};
 use crate::model::ModelConfig;
+use crate::quant::{vq_expert_bytes, vq_expert_layout, vq_proj_bytes, vq_row_bytes};
 use crate::snapshot::{Dtype, Snapshot};
 use crate::stream::{ALIGN, Sqpoll, Streamer, slot_span};
 use crate::usage::Usage;
+use crate::vqstream::VqExperts;
 use anyhow::{Context, Result, ensure};
 use std::os::fd::RawFd;
 
@@ -70,6 +72,25 @@ pub struct Mlp {
     pub gate: Weight,
     pub up: Weight,
     pub down: Weight,
+}
+
+/// A resolved VQ-int3 projection in a pool slot: packed 12-bit codebook indices +
+/// bf16 group scales (device pointers), decoded against the shared codebook. The VQ
+/// analog of [`Weight`]; consumed by `launch_moe_vq` via `desc_of_vq`.
+#[derive(Clone, Copy)]
+pub struct VqWeight {
+    pub indices: *const u8,
+    pub scales: *const u16,
+    pub o_dim: usize,
+    pub i_dim: usize,
+}
+
+/// A SwiGLU MLP's three VQ-int3 projections, resolved. The VQ analog of [`Mlp`].
+#[derive(Clone, Copy)]
+pub struct MlpVq {
+    pub gate: VqWeight,
+    pub up: VqWeight,
+    pub down: VqWeight,
 }
 
 /// One layer's MLP: dense for the first `dense_layers`, MoE after.
@@ -233,6 +254,15 @@ pub struct Pin<'a> {
     /// model `insert_cold` — without it an offline sweep measures a no-prefetch
     /// engine, which is a materially different (and much worse) cache workload.
     trace: Option<std::io::BufWriter<std::fs::File>>,
+    /// VQ-int3 routed-expert source (`--vq-dir`): the `.i3` fd + codebook anchor,
+    /// mirroring `snap`'s role for the routed-expert reads. `None` ⇒ int4 routed
+    /// experts (the default; `moe_table` then reads the int4 snapshot). The routed
+    /// experts are the ONLY tensors VQ changes — everything else stays int4.
+    #[allow(dead_code)] // fd/codebook lifetime anchor; not read through after build
+    vq: Option<crate::vqstream::VqExperts>,
+    /// Device-resident codebook (`VQ_K·VQ_DIM` f32) the VQ MoE kernel decodes
+    /// against; null under int4.
+    codebook: *const f32,
 }
 
 /// Place a norm/f32 tensor (O-length) into the tier: reserve, then `pread` the
@@ -616,6 +646,7 @@ impl<'a> Pin<'a> {
         prefetch_depth: usize,
         direct_io: bool,
         want_indexer: bool,
+        vq_dir: Option<&str>,
     ) -> Result<Self> {
         let (free, _total) = mem_info()?;
         // Full layers own a resident DSA indexer (dsa/misa modes). Empty when
@@ -653,6 +684,36 @@ impl<'a> Pin<'a> {
             tier_cap as f64 / (1u64 << 30) as f64,
         );
         let mut tier = DeviceTier::new(tier_cap)?;
+
+        // Routed-expert format: VQ-int3 from `.i3` files (`--vq-dir`) or int4 from the
+        // snapshot (default). Only routed experts change format; the shared codebook is
+        // placed resident once here (~64 KiB, fits in SLACK).
+        let (vq, codebook): (Option<VqExperts>, *const f32) = match vq_dir {
+            Some(dir) => {
+                let src = VqExperts::open(
+                    dir,
+                    cfg.dense_layers,
+                    cfg.n_layers,
+                    cfg.n_experts,
+                    cfg.hidden,
+                    cfg.moe_inter,
+                )?;
+                let cb_bytes = src.codebook.len() * 4;
+                let dst = tier.reserve(cb_bytes)?;
+                // SAFETY: dst owns cb_bytes just reserved; codebook is f32 (LE host ==
+                // LE device), copied as raw bytes.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        src.codebook.as_ptr() as *const u8,
+                        dst,
+                        cb_bytes,
+                    );
+                }
+                tracing::info!("routed experts: VQ-int3 from {dir}");
+                (Some(src), dst as *const f32)
+            }
+            None => (None, std::ptr::null()),
+        };
 
         // Global tensors.
         let embed = place_i8(&mut tier, snap, "model.embed_tokens", cfg.hidden)?;
@@ -738,11 +799,14 @@ impl<'a> Pin<'a> {
         // — the coalesced weight span then the coalesced scale span, each `slot_span`
         // (block-aligned + straddle pad) — so reads land in place and descriptors point
         // at the sub-block offsets. Size to the budget left after the always-resident set.
-        let expert_slot = slot_geom(cfg);
-        // Precompute the per-(layer,expert) streaming plan ONCE (A1/A2): coalesced
-        // (fd, begin, len, dst) reads + six slot-relative useful-byte offsets, cfg-dim
-        // cross-checked here. The miss/prefetch paths then just index + queue.
-        let moe_table = build_moe_table(snap, cfg, direct_io)?;
+        // Precompute the per-(layer,expert) streaming plan ONCE (A1/A2). int4:
+        // coalesced (fd, begin, len, dst) reads + six slot offsets. VQ: one aligned
+        // read/expert (the `.i3` block) + the six sub-projection offsets. Both produce
+        // `Vec<ExpertReads>`, so the miss/prefetch paths and `stream_expert` are shared.
+        let (expert_slot, moe_table) = match &vq {
+            Some(src) => (src.expert_slot(), build_moe_table_vq(src, cfg)?),
+            None => (slot_geom(cfg), build_moe_table(snap, cfg, direct_io)?),
+        };
         let budget = capacity.saturating_sub(tier_cap);
         // Floor the pool at `top_k + prefetch_depth` when prefetching: this makes
         // cross-layer prefetch's evictions provably DISJOINT from the current layer's
@@ -778,10 +842,16 @@ impl<'a> Pin<'a> {
             "io_uring ring {ring} too small for one layer: top_k {} x 6 reads/expert",
             cfg.top_k,
         );
-        // Bounce span = largest single read superset. The coalesced weight read
-        // (down|gate|up, ~18.9 MB) dwarfs the coalesced scale read.
-        let (coal_w, coal_s) = coalesced_lens(cfg);
-        let span = slot_span(coal_w).max(slot_span(coal_s));
+        // Bounce span = largest single read superset. int4: the coalesced weight read
+        // (down|gate|up, ~18.9 MB) dwarfs the coalesced scale read. VQ: the whole
+        // expert block is one read.
+        let span = match &vq {
+            Some(_) => slot_span(vq_expert_bytes(cfg.hidden, cfg.moe_inter)),
+            None => {
+                let (coal_w, coal_s) = coalesced_lens(cfg);
+                slot_span(coal_w).max(slot_span(coal_s))
+            }
+        };
         // The DEMAND ring gets a poller too. The earlier reasoning — "its submit is
         // immediately followed by a blocking drain, so it gains nothing" — conflated
         // two different things: the thread must indeed wait either way, but WITHOUT a
@@ -875,6 +945,8 @@ impl<'a> Pin<'a> {
             pf_queue_ns: 0,
             #[cfg(feature = "trace")]
             pf_submit_ns: 0,
+            vq,
+            codebook,
             trace: trace_path
                 .map(|p| -> Result<_> {
                     Ok(std::io::BufWriter::new(
@@ -888,6 +960,17 @@ impl<'a> Pin<'a> {
     /// Host router correction bias for a MoE `layer` (len n_experts).
     pub fn moe_bias(&self, layer: usize) -> &[f32] {
         &self.moe_bias[layer - self.cfg.dense_layers]
+    }
+
+    /// True when routed experts stream as VQ-int3 (`--vq-dir`); the MoE dispatch
+    /// then uses [`Pin::submit_layer_vq`] + `launch_moe_vq`.
+    pub fn is_vq(&self) -> bool {
+        self.vq.is_some()
+    }
+
+    /// Device pointer to the resident VQ codebook (null under int4).
+    pub fn codebook(&self) -> *const f32 {
+        self.codebook
     }
 
     /// `(loaded, preloading, cold, pf_evict_unused, pf_evict_then_missed)` —
@@ -918,12 +1001,16 @@ impl<'a> Pin<'a> {
     /// is a function of the slot index and `cfg` geometry, not of the data arriving.
     /// That is what lets the caller do its descriptor build, its small H2D uploads,
     /// and its next-layer prefetch submit while the NVMe works.
-    pub fn submit_layer(
+    /// The format-agnostic body of `submit_layer`: prefetch-drain barrier, trace,
+    /// phase 1a (hit+protect), phase 1b (alloc + slot-collision guard + `stream_expert`),
+    /// phase 2 (`submit`). Returns the per-`sel` resolved slots + the `moe_table` row
+    /// base. int4 and VQ share this VERBATIM — only the phase-3 slot→descriptor
+    /// resolution forks (see [`Pin::submit_layer`] / [`Pin::submit_layer_vq`]).
+    fn submit_spine(
         &mut self,
         layer: usize,
         sel: &[usize],
-        out: &mut Vec<Mlp>,
-    ) -> Result<DemandBatch> {
+    ) -> Result<([Option<usize>; 32], usize)> {
         let cfg = self.cfg;
         let sparse = (layer - cfg.dense_layers) * cfg.n_experts; // moe_table row base
         // `sel` is one layer's ROUTED pick (top_k; the shared expert is resident and
@@ -1078,6 +1165,20 @@ impl<'a> Pin<'a> {
         // build, uploads and next-layer prefetch submit run while the NVMe works.
         // The matching join is `await_layer`.
         self.stream.submit()?;
+        Ok((slots, sparse))
+    }
+
+    /// Submit one layer's cold reads and resolve each selected int4 expert to its
+    /// `Mlp` (device pointers into the pool slots). See [`Pin::submit_spine`] for the
+    /// streaming half. The matching join is [`Pin::await_layer`].
+    pub fn submit_layer(
+        &mut self,
+        layer: usize,
+        sel: &[usize],
+        out: &mut Vec<Mlp>,
+    ) -> Result<DemandBatch> {
+        let (slots, sparse) = self.submit_spine(layer, sel)?;
+        let cfg = self.cfg;
         // Phase 3: build descriptors from each expert's precomputed sub-block offsets
         // (in `moe_table`, keyed by (layer,expert) — run-invariant, not per slot).
         // gate/up are [moe_inter, hidden]; down is [hidden, moe_inter].
@@ -1104,6 +1205,44 @@ impl<'a> Pin<'a> {
                 gate: w(o[0], o[1], gate_o, gate_i),
                 up: w(o[2], o[3], gate_o, gate_i),
                 down: w(o[4], o[5], down_o, down_i),
+            });
+        }
+        Ok(DemandBatch(()))
+    }
+
+    /// VQ analog of [`Pin::submit_layer`]: same streaming spine, but resolves each
+    /// selected expert to an [`MlpVq`] (packed 12-bit indices + bf16 scale pointers).
+    /// The six `off` values were laid out by `build_moe_table_vq` in the same order as
+    /// int4's (`[gate.idx, gate.sc, up.idx, up.sc, down.idx, down.sc]`).
+    pub fn submit_layer_vq(
+        &mut self,
+        layer: usize,
+        sel: &[usize],
+        out: &mut Vec<MlpVq>,
+    ) -> Result<DemandBatch> {
+        let (slots, sparse) = self.submit_spine(layer, sel)?;
+        let cfg = self.cfg;
+        let (gate_o, gate_i) = (cfg.moe_inter, cfg.hidden);
+        let (down_o, down_i) = (cfg.hidden, cfg.moe_inter);
+        let slab = self.lru_pool.ptr();
+        let es = self.expert_slot;
+        out.clear();
+        for (i, &e) in sel.iter().enumerate() {
+            let slot = slots[i].context("submit_layer_vq: unresolved expert slot")?;
+            let o = self.moe_table[sparse + e].off;
+            // SAFETY: slot base within the slab; address arithmetic only (bytes land
+            // by `await_layer`).
+            let b = unsafe { slab.add(slot * es) };
+            let vw = |ioff: usize, soff: usize, o_dim: usize, i_dim: usize| VqWeight {
+                indices: unsafe { b.add(ioff) },
+                scales: unsafe { b.add(soff) } as *const u16,
+                o_dim,
+                i_dim,
+            };
+            out.push(MlpVq {
+                gate: vw(o[0], o[1], gate_o, gate_i),
+                up: vw(o[2], o[3], gate_o, gate_i),
+                down: vw(o[4], o[5], down_o, down_i),
             });
         }
         Ok(DemandBatch(()))
@@ -1359,6 +1498,45 @@ fn build_moe_table(
     Ok(table)
 }
 
+/// VQ analog of [`build_moe_table`]: each `.i3` expert is ONE aligned read (its whole
+/// `gate‖up‖down` block), so it fits the `ExpertReads` container as a single-read
+/// degenerate case — `stream_expert`, the pool, and prefetch are shared with int4
+/// unchanged. `off` holds the six slot-relative byte offsets `[gate.idx, gate.sc,
+/// up.idx, up.sc, down.idx, down.sc]`, identical for every expert (fixed layout) and
+/// matching [`crate::quant::vq_expert`]'s slicing exactly (the Step-7 test locks this).
+/// The six slot-relative byte offsets `[gate.idx, gate.sc, up.idx, up.sc, down.idx,
+/// down.sc]` of a VQ expert block: per projection, indices then bf16 group scales,
+/// gate/up/down concatenated. MUST match [`crate::quant::vq_expert`]'s slicing (the
+/// `vq_moe_table_offsets_match_loader` test locks this).
+fn vq_slot_offsets(hidden: usize, moe_inter: usize) -> [usize; 6] {
+    let dims = vq_expert_layout(hidden, moe_inter);
+    let mut off = [0usize; 6];
+    let mut base = 0usize;
+    for (p, &(o, i)) in dims.iter().enumerate() {
+        off[p * 2] = base; // projection indices
+        off[p * 2 + 1] = base + o * vq_row_bytes(i); // bf16 group scales
+        base += vq_proj_bytes(o, i);
+    }
+    off
+}
+
+fn build_moe_table_vq(src: &VqExperts, cfg: &ModelConfig) -> Result<Vec<ExpertReads>> {
+    // `begin = e·stride` is VQ_ALIGN-aligned and the slot base is too, so the useful
+    // bytes land at slot-relative offset 0 (sub == 0); offsets are the same for all.
+    let off = vq_slot_offsets(cfg.hidden, cfg.moe_inter);
+    let n_moe = cfg.n_layers - cfg.dense_layers;
+    let mut table = Vec::with_capacity(n_moe * cfg.n_experts);
+    for l in cfg.dense_layers..cfg.n_layers {
+        for e in 0..cfg.n_experts {
+            let (fd, begin, len) = src.read_spec(l, e)?;
+            let mut reads = [(0 as RawFd, 0usize, 0usize, 0usize); 6];
+            reads[0] = (fd, begin, len, 0);
+            table.push(ExpertReads { reads, off });
+        }
+    }
+    Ok(table)
+}
+
 /// Queue an expert's coalesced O_DIRECT reads (weights then scales; usually one
 /// each, more if a shard boundary split the run) into pool slot `slot` at
 /// `slot*expert_slot`, from its precomputed [`ExpertReads`]. `len == 0` entries are
@@ -1390,6 +1568,31 @@ fn stream_expert(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The VQ slot offsets the moe_table hands the kernel MUST equal where the loader
+    // (`quant::vq_expert`) slices each projection's indices/scales out of an expert
+    // block — else the streamed bytes and the descriptor pointers disagree (silent
+    // wrong weights). Locks the single source of truth for the .i3 layout.
+    #[test]
+    fn vq_moe_table_offsets_match_loader() {
+        let (hidden, moe_inter) = (crate::quant::VQ_GROUP, crate::quant::VQ_GROUP);
+        let off = vq_slot_offsets(hidden, moe_inter);
+        let block = vec![0u8; crate::quant::vq_expert_bytes(hidden, moe_inter)];
+        let projs = crate::quant::vq_expert(&block, 0, hidden, moe_inter);
+        let base = block.as_ptr() as usize;
+        for (k, proj) in projs.iter().enumerate() {
+            assert_eq!(
+                proj.indices.as_ptr() as usize - base,
+                off[k * 2],
+                "indices proj {k}"
+            );
+            assert_eq!(
+                proj.scales.as_ptr() as usize - base,
+                off[k * 2 + 1],
+                "scales proj {k}"
+            );
+        }
+    }
 
     // plan_group must (a) coalesce a fully-contiguous down|gate|up run into ONE read
     // with tight useful offsets, and (b) split at a shard boundary into disjoint,
