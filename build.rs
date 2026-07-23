@@ -29,7 +29,10 @@ fn main() {
         if trace {
             cmd.arg("-DRIVOLI_TRACE");
         }
-        let status = cmd.args(["-c", &src, "-o", &obj]).status().expect("run hipcc");
+        let status = cmd
+            .args(["-c", &src, "-o", &obj])
+            .status()
+            .expect("run hipcc");
         assert!(status.success(), "hipcc failed on {src}");
         objs.push(obj);
     }
