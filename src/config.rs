@@ -6,35 +6,23 @@
 use anyhow::{Context, Result, bail};
 use std::fmt;
 
-/// Safety headroom left free for the OS + the pinned io_uring arena, bytes. The
-/// expert pool takes `free − OS_RESERVE` by default (`--max-mem` caps below that).
+/// Safety headroom the AUTO budget leaves free for the OS + the pinned io_uring
+/// arena, bytes. With no `--max-mem`, the total device budget is `free − OS_RESERVE`
+/// (then clamped to [`MAX_BUDGET`]). An explicit `--max-mem` ignores this entirely.
 ///
-/// 12 GiB: `hipMemGetInfo` on this 124 GiB Strix Halo APU reports ~100 GiB free, but
-/// the driver will not durably back a device footprint that large under live decode.
-/// Too small a reserve grows the pool until a long run over-subscribes physical
-/// memory, high VMM slots get reclaimed, and an expert reads back as NaN —
-/// deterministically killing decode (invisible below ~256 tokens). The separate
-/// [`MAX_BUDGET`] hard ceiling is the real guard; this keeps the auto-sized default
-/// clear of it.
-pub const OS_RESERVE: u64 = 12 << 30;
+/// 16 GiB: `hipMemGetInfo` on this 124 GiB Strix Halo APU reports ~100 GiB free, but
+/// the driver will not durably back a device footprint that large under live decode —
+/// too small a reserve grows the pool until a long run over-subscribes physical
+/// memory, high VMM slots get reclaimed, and an expert reads back as NaN (invisible
+/// below ~256 tokens). Applies to the auto path only.
+pub const OS_RESERVE: u64 = 16 << 30;
 
-/// Hard ceiling on the TOTAL device budget — resident tier plus routed-expert pool.
-/// The budget derives from `MemAvailable`, so on a memory-rich boot the OS reserve
-/// alone would size past the point where the driver can no longer durably back the
-/// VMM allocation, at which point decode silently reads back NaN (~92 GiB total
-/// footprint on this box, around token 290). 88 GiB leaves ~4 GiB of margin under
-/// that cliff; do NOT raise it without re-running the corruption check.
+/// Hard ceiling on the AUTO device budget — the driver's durable-backing NaN cliff
+/// (~92 GiB total footprint on this box, around token 290; decode silently reads
+/// back NaN above it). 88 GiB leaves ~4 GiB of margin; do NOT raise without re-running
+/// the corruption check. Guards the auto-sized default ONLY — an explicit `--max-mem`
+/// bypasses it (the user asked for that size; let it OOM/NaN if it must).
 pub const MAX_BUDGET: u64 = 88 << 30;
-
-/// Runtime override for [`OS_RESERVE`] (`--os-reserve <GiB>`), for re-testing the
-/// pool-size ceiling. The hard [`MAX_BUDGET`] limit still stands.
-pub static OS_RESERVE_OVERRIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// The effective OS reserve: the override if set, else [`OS_RESERVE`].
-pub fn os_reserve() -> u64 {
-    let v = OS_RESERVE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
-    if v == 0 { OS_RESERVE } else { v }
-}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -72,9 +60,9 @@ pub struct Config {
     /// optimum; the SMT-logical default is the proven pathology. The CPU never
     /// computes experts — it routes, samples, and keeps the GPU fed.
     pub threads: usize,
-    /// Device expert-pool budget cap, bytes (`--max-mem <GiB>`). None (default) takes
-    /// all safe free memory (`free − OS_RESERVE`); `Some(n)` caps lower. Bigger = more
-    /// resident experts = higher hit rate on this cold-miss-fetch-bound decode.
+    /// Device budget override, bytes (`--max-mem <GiB>`). None (default) auto-sizes to
+    /// `min(free − OS_RESERVE, MAX_BUDGET)`. `Some(n)` uses exactly `n` — no OS reserve,
+    /// no NaN-cliff cap; the user asked for it, so it's allowed to OOM/fail at build.
     pub max_mem: Option<u64>,
     /// Attention row-selection mode (`--attn auto|dense|streaming|dsa|misa`, resolved
     /// in `main`). `auto` picks `dsa` when the artifact carries indexer weights, else
@@ -117,12 +105,12 @@ impl Config {
         attn: crate::attn::AttnMode,
     ) -> Result<Self> {
         let avail = mem_available()?;
-        let reserve = os_reserve();
-        if avail <= reserve {
+        // Only the auto path needs headroom; an explicit --max-mem sizes itself.
+        if max_mem.is_none() && avail <= OS_RESERVE {
             bail!(
                 "only {:.1} GB available; need more than the {:.0} GB OS reserve",
                 avail as f64 / 1e9,
-                reserve as f64 / 1e9
+                OS_RESERVE as f64 / 1e9
             );
         }
         // available_parallelism() is the LOGICAL count (SMT included): /2 gives
@@ -161,7 +149,7 @@ impl fmt::Display for Config {
             self.two_q.kout_pct(),
             self.trace,
             self.prompt,
-            os_reserve() as f64 / GIB,
+            OS_RESERVE as f64 / GIB,
             match self.max_mem {
                 Some(n) => format!("{:.0}GiB", n as f64 / GIB),
                 None => "auto(all free)".to_string(),

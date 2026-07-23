@@ -13,7 +13,8 @@ use tracing::info;
 /// (default 2q) picks the eviction policy; `--direct-vmm-dma` forces raw DMA over the
 /// default pinned-host bounce; `--trace <path>` dumps the routed-expert access trace
 /// for the offline `replay` sim; `--prompt <text>` overrides the bench prompt;
-/// `--max-mem <GiB>` caps the device pool budget.
+/// `--max-mem <GiB>` sets the device budget literally (no OS reserve, no cap — may
+/// OOM); without it the budget auto-sizes to `min(free − 16 GiB, MAX_BUDGET)`.
 struct Args {
     model: String,
     bench: Option<usize>,
@@ -38,7 +39,7 @@ struct Args {
 fn parse_args() -> Result<Args> {
     const USAGE: &str = "usage: rivoli <model-dir> [-bench <tokens>] [--direct-vmm-dma] \
          [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc] [--2q-kin <pct>] \
-         [--2q-kout <pct>] [--max-mem <GiB>] [--os-reserve <GiB>] \
+         [--2q-kout <pct>] [--max-mem <GiB>] \
          [--attn auto|dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>]";
     let mut model = None;
     let mut a = Args {
@@ -95,18 +96,6 @@ fn parse_args() -> Result<Args> {
                     bail!("--max-mem must be a positive integer number of GiB");
                 }
                 a.max_mem = Some(gib << 30);
-            }
-            "--os-reserve" => {
-                let gib: u64 = args
-                    .next()
-                    .context("--os-reserve requires a GiB integer")?
-                    .parse()
-                    .context("--os-reserve takes an integer number of GiB")?;
-                if gib == 0 {
-                    bail!("--os-reserve must be a positive integer number of GiB");
-                }
-                rivoli::config::OS_RESERVE_OVERRIDE
-                    .store(gib << 30, std::sync::atomic::Ordering::Relaxed);
             }
             "--attn" => a.attn = args.next().context("--attn requires a mode")?,
             "--sinks" => {
@@ -257,31 +246,35 @@ fn main() -> Result<()> {
 
     #[cfg(feature = "rocm")]
     {
-        use rivoli::config::os_reserve;
+        use rivoli::config::{MAX_BUDGET, OS_RESERVE};
         const GIB: f64 = (1u64 << 30) as f64;
         let (free, _total) = rivoli::device::mem_info()?;
-        let reserve = os_reserve() as usize;
-        // MAX_BUDGET is the load-bearing bound (not the reserve): the pool is sized
-        // from MemAvailable, so on a memory-rich boot the reserve alone would size
-        // past the driver's durable-backing limit and decode would read back NaN.
-        let safe = free
-            .saturating_sub(reserve)
-            .min(rivoli::config::MAX_BUDGET as usize);
+        // `--max-mem` is honoured LITERALLY — no OS reserve, no NaN-cliff cap; the user
+        // asked for that size, so it's allowed to OOM/fail at pin build. The auto path
+        // leaves OS_RESERVE free and clamps to MAX_BUDGET (the driver's durable-backing
+        // cliff, above which decode silently reads back NaN).
         let cap = match cfg.max_mem {
-            Some(m) => safe.min(m as usize),
-            None => safe,
+            Some(m) => {
+                info!(
+                    "device pool budget {:.1} GiB (--max-mem, literal — no reserve/cap; may OOM)",
+                    m as f64 / GIB
+                );
+                m as usize
+            }
+            None => {
+                let cap = free
+                    .saturating_sub(OS_RESERVE as usize)
+                    .min(MAX_BUDGET as usize);
+                info!(
+                    "device pool budget {:.1} GiB (auto: free {:.1} GiB − {:.0} GiB OS reserve, capped at {:.0} GiB)",
+                    cap as f64 / GIB,
+                    free as f64 / GIB,
+                    OS_RESERVE as f64 / GIB,
+                    MAX_BUDGET as f64 / GIB,
+                );
+                cap
+            }
         };
-        info!(
-            "device pool budget {:.1} GiB (free {:.1} GiB − {:.0} GiB OS reserve, capped at {:.0} GiB{})",
-            cap as f64 / GIB,
-            free as f64 / GIB,
-            reserve as f64 / GIB,
-            rivoli::config::MAX_BUDGET as f64 / GIB,
-            match cfg.max_mem {
-                Some(m) => format!(", capped at --max-mem {:.0} GiB", m as f64 / GIB),
-                None => String::new(),
-            },
-        );
         // dsa/misa need the resident DSA indexer placed by Pin::build.
         let want_indexer = matches!(
             cfg.attn,
