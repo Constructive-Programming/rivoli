@@ -243,6 +243,7 @@ type Enc = ();
 /// Encode one expert (routed or shared) rooted at `base` into `dst`, gate/up/down
 /// against `codebooks[0..3]`. With `enc` (the `--gpu` encoders) the nearest-codebook
 /// argmin offloads to the GPU (bit-identical to the CPU `quant_vq`).
+#[allow(clippy::too_many_arguments)]
 fn encode_expert(
     src: &Safetensors,
     base: &str,
@@ -251,6 +252,7 @@ fn encode_expert(
     codebooks: &[Vec<f32>; 3],
     dst: &mut [u8],
     enc: Option<&Enc>,
+    validate: bool,
 ) -> Result<()> {
     let mut off = 0;
     for (p, (proj, &(o_dim, i_dim))) in PROJ
@@ -261,13 +263,24 @@ fn encode_expert(
         let w = deq(src, base, proj, o_dim, i_dim)?;
         let (indices, scales) = match enc {
             #[cfg(feature = "rocm")]
-            Some(e) => gpu::quant_vq_gpu(&w, o_dim, i_dim, &codebooks[p], &e[p])?,
+            Some(e) => {
+                let g = gpu::quant_vq_gpu(&w, o_dim, i_dim, &codebooks[p], &e[p])?;
+                // `--validate`: the GPU argmin must reproduce the CPU quant_vq
+                // bit-for-bit (same metric, tie-break, and host refit) — else the two
+                // paths would silently disagree on the shipped bytes.
+                if validate {
+                    let c = quant_vq(&w, o_dim, i_dim, &codebooks[p]);
+                    ensure!(g == c, "GPU/CPU encode mismatch at {base} {proj}");
+                }
+                g
+            }
             _ => quant_vq(&w, o_dim, i_dim, &codebooks[p]),
         };
         let pb = vq_proj_bytes(o_dim, i_dim);
         write_proj(&mut dst[off..off + pb], o_dim, i_dim, &indices, &scales);
         off += pb;
     }
+    let _ = validate; // consumed above only under `rocm`; silence the unused warning
     Ok(())
 }
 
@@ -458,6 +471,9 @@ struct Args {
     /// Offload the nearest-codebook argmin to the GPU (`--gpu`, needs `--features
     /// rocm`) — ~VQ_K× the encode work, ~an hour for the full model vs many on CPU.
     gpu: bool,
+    /// Cross-check every GPU-encoded projection against the CPU `quant_vq` (bytes must
+    /// match exactly). Requires `--gpu`; roughly doubles encode time.
+    validate: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -468,6 +484,7 @@ fn parse_args() -> Result<Args> {
         sample_experts: 48,
         kmeans_iters: 40,
         gpu: false,
+        validate: false,
     };
     let mut pos = Vec::new();
     let mut it = std::env::args().skip(1);
@@ -479,12 +496,17 @@ fn parse_args() -> Result<Args> {
             }
             "--kmeans-iters" => a.kmeans_iters = it.next().context("--kmeans-iters N")?.parse()?,
             "--gpu" => a.gpu = true,
+            "--validate" => a.validate = true,
             _ => pos.push(arg),
         }
     }
     ensure!(
         pos.len() == 2,
-        "usage: convert <fp8-dir> <out-dir> [--layers N] [--sample-experts N] [--kmeans-iters N] [--gpu]"
+        "usage: convert <fp8-dir> <out-dir> [--layers N] [--sample-experts N] [--kmeans-iters N] [--gpu] [--validate]"
+    );
+    ensure!(
+        !a.validate || a.gpu,
+        "--validate cross-checks the GPU encode against the CPU path; it needs --gpu"
     );
     a.fp8_dir = pos[0].clone();
     a.out_dir = pos[1].clone();
@@ -595,6 +617,7 @@ fn main() -> Result<()> {
         // disjoint block slices — quant_vq is pure and Safetensors is Sync.
         let (src, cb) = (&src, &codebooks);
         let enc = encoders.as_ref();
+        let validate = args.validate;
         let threads = std::thread::available_parallelism().map_or(4, |t| t.get());
         let per = (d.n_experts + 1).div_ceil(threads);
         std::thread::scope(|s| -> Result<()> {
@@ -623,6 +646,7 @@ fn main() -> Result<()> {
                             cb,
                             &mut slot[..ebytes],
                             enc,
+                            validate,
                         )?;
                     }
                     Ok(())
