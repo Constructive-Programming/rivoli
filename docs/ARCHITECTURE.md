@@ -43,10 +43,11 @@ projection sub-offsets. Validated on open; a dim/version mismatch fails loud.
 ## Kernels (kernels/*.hip, gated on `rocm`)
 
 Keep + prune: `common.hpp` (wave helpers, bf16/e4m3, **dot_vq_wave**; drop
-dot_i4/dot_i8), `attn.hip` (dense bf16 only — no sparse gather, no fp8-KV: this
-checkpoint has no DSA indexer, so the indexer + StreamingLLM + `--kv-fp8` paths are
-all dropped), `fwd.hip` (embed_i8, append_kv, gather_rope, vadd, argmax; drop
-append_kv_fp8), `vmm.hip`, `stream.hip`. **Dropped: `indexer.hip`.**
+dot_i4/dot_i8), `attn.hip` (dense-only — no sparse gather: this checkpoint has no
+DSA indexer, so the indexer + StreamingLLM paths are dropped; the latent cache is
+**fp8-e4m3 + per-128 block scales** (single path, no bf16 KV), roped key bf16),
+`fwd.hip` (embed_i8, append_kv fp8-latent + bf16 key, gather_rope, vadd, argmax),
+`vmm.hip`, `stream.hip`. **Dropped: `indexer.hip`.**
 
 Rewrite for the new formats:
 - `moe.hip` — `moe_gateup_vq`/`moe_down_vq`/`moe_reduce` taking the **3 per-projection

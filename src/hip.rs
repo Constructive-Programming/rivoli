@@ -92,12 +92,14 @@ unsafe extern "C" {
     fn rivoli_mla_attend(
         qabs: *const f32,
         qrope: *const f32,
-        lc: *const u16,
+        lc8: *const u8,
+        lscale: *const f32,
         rc: *const u16,
         h: i32,
         nr: i32,
         kvl: i32,
         rope: i32,
+        n_blocks: i32,
         scale: f32,
         clat: *mut f32,
         partial: *mut f32,
@@ -113,11 +115,13 @@ unsafe extern "C" {
     fn rivoli_append_kv(
         latent: *const f32,
         rope: *const f32,
-        lc: *mut u16,
+        lc8: *mut u8,
+        lscale: *mut f32,
         rc: *mut u16,
         pos: i32,
         kvl: i32,
         ropn: i32,
+        n_blocks: i32,
     ) -> i32;
     fn rivoli_gather_rope(
         q: *const f32,
@@ -239,22 +243,26 @@ pub fn attend_scratch_floats(h: usize, kvl: usize) -> usize {
 }
 
 /// MLA flash attention `clat = Σ_t softmax((qabs·L_t + qrope·R_t)·scale)·L_t` over
-/// the bf16 latent cache, head-batched, split-KV when `partial` is non-null.
+/// the fp8-e4m3 latent cache (per-128 block scales) + bf16 roped key, head-batched,
+/// split-KV when `partial` is non-null.
 ///
 /// # Safety
 /// Async device pointers live until the next [`device_sync`]: `qabs` (`h·kvl` f32),
-/// `qrope` (`h·rope` f32), `lc` (`nr·kvl` bf16), `rc` (`nr·rope` bf16), `clat`
-/// (`h·kvl` f32), `partial` ([`attend_scratch_floats`] f32 or null = single split).
+/// `qrope` (`h·rope` f32), `lc8` (`nr·kvl` e4m3), `lscale` (`nr·n_blocks` f32,
+/// `n_blocks = kvl/128`), `rc` (`nr·rope` bf16), `clat` (`h·kvl` f32), `partial`
+/// ([`attend_scratch_floats`] f32 or null = single split).
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn launch_attend(
     qabs: *const f32,
     qrope: *const f32,
-    lc: *const u16,
+    lc8: *const u8,
+    lscale: *const f32,
     rc: *const u16,
     h: usize,
     nr: usize,
     kvl: usize,
     rope: usize,
+    n_blocks: usize,
     scale: f32,
     clat: *mut f32,
     partial: *mut f32,
@@ -262,7 +270,8 @@ pub unsafe fn launch_attend(
     // SAFETY: caller's pointer contract.
     let r = unsafe {
         rivoli_mla_attend(
-            qabs, qrope, lc, rc, h as i32, nr as i32, kvl as i32, rope as i32, scale, clat, partial,
+            qabs, qrope, lc8, lscale, rc, h as i32, nr as i32, kvl as i32, rope as i32,
+            n_blocks as i32, scale, clat, partial,
         )
     };
     check(r, "mla_attend")
@@ -375,22 +384,31 @@ pub unsafe fn launch_embed_i8_row(
     check(r, "embed_i8_row")
 }
 
-/// Append one token's latent + roped key to the bf16 KV slabs at row `pos`.
+/// Append one token's latent (fp8-e4m3 + per-128 block scale) + roped key (bf16) to
+/// the KV slabs at row `pos`. `kvl` must be a multiple of 128 in `[128, 1024]`.
 ///
 /// # Safety
 /// Device pointers live until the next [`device_sync`]: `latent` (`kvl` f32), `rope`
-/// (`ropn` f32), `lc`/`rc` the KV slabs (row `pos` in-bounds).
+/// (`ropn` f32), `lc8`/`lscale`/`rc` the KV slabs (row `pos` in-bounds; `n_blocks =
+/// kvl/128`).
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn launch_append_kv(
     latent: *const f32,
     rope: *const f32,
-    lc: *mut u16,
+    lc8: *mut u8,
+    lscale: *mut f32,
     rc: *mut u16,
     pos: usize,
     kvl: usize,
     ropn: usize,
+    n_blocks: usize,
 ) -> Result<()> {
     // SAFETY: caller's pointer contract.
-    let r = unsafe { rivoli_append_kv(latent, rope, lc, rc, pos as i32, kvl as i32, ropn as i32) };
+    let r = unsafe {
+        rivoli_append_kv(
+            latent, rope, lc8, lscale, rc, pos as i32, kvl as i32, ropn as i32, n_blocks as i32,
+        )
+    };
     check(r, "append_kv")
 }
 

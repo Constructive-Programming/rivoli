@@ -163,29 +163,33 @@ fn fwd_argmax_and_vadd() {
 }
 
 /// Dense two-pass scalar softmax over the whole cache — the oracle the flash
-/// (online) kernel must match. Widens the same bf16 bits the kernel does.
+/// (online) kernel must match. Latent is fp8-e4m3 × per-128 block scale (the exact
+/// dequant the kernel does); the roped key is bf16.
+#[allow(clippy::too_many_arguments)]
 fn attend_reference(
     qabs: &[f32],
     qrope: &[f32],
-    lc: &[u16],
+    lc8: &[u8],
+    lscale: &[f32],
     rc: &[u16],
     h: usize,
     nt: usize,
     kvl: usize,
     rope: usize,
+    n_blocks: usize,
     scale: f32,
 ) -> Vec<f32> {
+    let lat = |t: usize, i: usize| e4m3_to_f32(lc8[t * kvl + i]) * lscale[t * n_blocks + i / 128];
     let mut clat = vec![0.0f32; h * kvl];
     let mut scores = vec![0.0f32; nt];
     for head in 0..h {
         let qa = &qabs[head * kvl..(head + 1) * kvl];
         let qr = &qrope[head * rope..(head + 1) * rope];
         for (t, sc) in scores.iter_mut().enumerate() {
-            let lrow = &lc[t * kvl..(t + 1) * kvl];
             let rrow = &rc[t * rope..(t + 1) * rope];
             let mut a = 0.0f32;
-            for (i, &lb) in lrow.iter().enumerate() {
-                a += qa[i] * bf16_to_f32(lb);
+            for i in 0..kvl {
+                a += qa[i] * lat(t, i);
             }
             for (d, &rb) in rrow.iter().enumerate() {
                 a += qr[d] * bf16_to_f32(rb);
@@ -195,9 +199,8 @@ fn attend_reference(
         softmax(&mut scores);
         let out = &mut clat[head * kvl..(head + 1) * kvl];
         for (t, &sc) in scores.iter().enumerate() {
-            let lrow = &lc[t * kvl..(t + 1) * kvl];
-            for (i, &lb) in lrow.iter().enumerate() {
-                out[i] += sc * bf16_to_f32(lb);
+            for (i, o) in out.iter_mut().enumerate() {
+                *o += sc * lat(t, i);
             }
         }
     }
@@ -205,18 +208,22 @@ fn attend_reference(
 }
 
 fn check_attend(seed: u64, h: usize, nt: usize, kvl: usize, rope: usize) {
+    assert_eq!(kvl % 128, 0, "fp8 latent cache needs kvl a multiple of 128");
+    let n_blocks = kvl / 128;
     let mut r = Lcg(seed);
     let qabs: Vec<f32> = (0..h * kvl).map(|_| r.f()).collect();
     let qrope: Vec<f32> = (0..h * rope).map(|_| r.f()).collect();
-    // Cache round-tripped through bf16 so kernel and reference widen identical bits
-    // — the only difference under test is flash (online) vs two-pass softmax.
-    let lc: Vec<u16> = (0..nt * kvl).map(|_| f32_to_bf16(r.f())).collect();
+    // Latent as fp8 bytes + positive per-128 block scales; key round-tripped through
+    // bf16. Kernel and reference decode identical bits — the only difference under
+    // test is flash (online) vs two-pass softmax.
+    let lc8: Vec<u8> = (0..nt * kvl).map(|_| f32_to_e4m3(r.f())).collect();
+    let lscale: Vec<f32> = (0..nt * n_blocks).map(|_| (r.f() * 0.1).abs() + 0.01).collect();
     let rc: Vec<u16> = (0..nt * rope).map(|_| f32_to_bf16(r.f())).collect();
     let scale = 1.0 / ((kvl + rope) as f32).sqrt();
-    let want = attend_reference(&qabs, &qrope, &lc, &rc, h, nt, kvl, rope, scale);
+    let want = attend_reference(&qabs, &qrope, &lc8, &lscale, &rc, h, nt, kvl, rope, n_blocks, scale);
 
     let (qab, qrb) = (dev(&f32b(&qabs)), dev(&f32b(&qrope)));
-    let (lcb, rcb) = (dev(&u16b(&lc)), dev(&u16b(&rc)));
+    let (lcb, lsb, rcb) = (dev(&lc8), dev(&f32b(&lscale)), dev(&u16b(&rc)));
     let mut clatb = dev(&vec![0u8; h * kvl * 4]);
     // Non-null worst-case scratch → the multi-split + combine path is what's checked.
     let mut partb = dev(&vec![0u8; attend_scratch_floats(h, kvl) * 4]);
@@ -224,12 +231,14 @@ fn check_attend(seed: u64, h: usize, nt: usize, kvl: usize, rope: usize) {
         launch_attend(
             qab.ptr() as *const f32,
             qrb.ptr() as *const f32,
-            lcb.ptr() as *const u16,
+            lcb.ptr(),
+            lsb.ptr() as *const f32,
             rcb.ptr() as *const u16,
             h,
             nt,
             kvl,
             rope,
+            n_blocks,
             scale,
             clatb.ptr_mut() as *mut f32,
             partb.ptr_mut() as *mut f32,
@@ -250,8 +259,9 @@ fn mla_attend_glm_dims() {
 #[test]
 fn mla_attend_edges() {
     // Single cached token stresses the online init (m=-inf on the first token);
-    // H=20 → a partial second HB block (4 active + 4 inactive lanes).
-    check_attend(0x00c0_ffee, 4, 1, 32, 8);
+    // H=20 → a partial second HB block (4 active + 4 inactive lanes). kvl=128 = the
+    // smallest legal fp8-block latent (n_blocks=1).
+    check_attend(0x00c0_ffee, 4, 1, 128, 8);
     check_attend(0xb10c_c0de, 20, 130, 512, 64);
 }
 

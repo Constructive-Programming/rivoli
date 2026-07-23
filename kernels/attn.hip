@@ -3,17 +3,22 @@
 //
 //     clat_h = Σ_t softmax_t( (qabs_h·L_t + qrope_h·R_t) · scale ) · L_t
 //
-// L_t (kv_lora latent) and R_t (roped key) are the bf16 cache rows shared by ALL
-// heads (MLA — one latent per token, not per head). A block owns HB heads (one
-// wavefront each) and stages each token tile's L/R into LDS ONCE, reused across
-// all HB heads, so DRAM reads of the cache drop from H× to ⌈H/HB⌉×.
+// L_t (kv_lora latent) and R_t (roped key) are the cache rows shared by ALL heads
+// (MLA — one latent per token, not per head). A block owns HB heads (one wavefront
+// each) and stages each token tile's L/R into LDS ONCE (widened to f32), reused
+// across all HB heads, so DRAM reads of the cache drop from H× to ⌈H/HB⌉×.
+//
+// The latent cache is fp8-e4m3 + per-128-block f32 scales (halves KV footprint at
+// long context; DeepSeek's shipped MLA layout): Lc8 is [tokens*kvl] e4m3, Lscale is
+// [tokens*n_blocks] f32, n_blocks = kvl/128, element (t,i) = e4m3(Lc8[t*kvl+i]) *
+// Lscale[t*n_blocks + i/128]. The roped key stays bf16 (quantizing the rope half
+// hurts accuracy — DeepSeek keeps it bf16 too).
 //
 // Dense only: the DSA indexer this checkpoint lacks is gone, so there is no sparse
-// row gather — every head attends every cached token. The cache is bf16 (the
-// --kv-fp8 opt-in is dropped; the fp8-latent widener is the upgrade path if 200k
-// footprint demands it). Numerics match attn.rs to f32 rounding: per-token score
-// sums kvl then rope over bf16-widened values (wave-reduced, so summation order
-// differs from the scalar oracle by ~1e-5 rel), flash online form for stability.
+// row gather — every head attends every cached token. Numerics match the scalar
+// oracle to f32 rounding: per-token score sums kvl then rope over the widened
+// values (wave-reduced, so summation order differs by ~1e-5 rel), flash online form
+// for stability.
 //
 // HB/TILE are occupancy/LDS knobs (LDS = (HB+TILE)*kvl + TILE*rope floats).
 // Correctness is independent of their value. HB is also the DRAM KV re-read
@@ -88,9 +93,10 @@ static inline size_t mla_attend_lds(int kvl, int rope) {
 extern "C" __global__ void mla_latent_attend(
     const float* __restrict__ qabs,         // [H*kvl]
     const float* __restrict__ qrope,        // [H*rope]
-    const unsigned short* __restrict__ Lc,  // [tokens*kvl] bf16 latent cache
+    const unsigned char* __restrict__ Lc8,  // [tokens*kvl] e4m3 latent cache
+    const float* __restrict__ Lscale,       // [tokens*n_blocks] f32 per-128 block scale
     const unsigned short* __restrict__ Rc,  // [tokens*rope] bf16 roped key
-    int H, int nr, int kvl, int rope, float scale, int tps,
+    int H, int nr, int kvl, int rope, int n_blocks, float scale, int tps,
     float* __restrict__ clat,               // [H*kvl], written iff partial==null
     float* __restrict__ partial) {          // split scratch, or null = single split
     extern __shared__ float smem[];
@@ -121,11 +127,13 @@ extern "C" __global__ void mla_latent_attend(
 
     for (int t0 = r_begin; t0 < r_end; t0 += TILE) {
         int tcount = min(TILE, r_end - t0);
-        // Cooperative tile load (all threads), widening bf16→f32 into LDS. kvl/rope
-        // are powers of two in GLM (512/64), so the div/mod compile to shifts.
+        // Cooperative tile load (all threads), widening into LDS: latent fp8→f32
+        // via e4m3 × its per-128 block scale, key bf16→f32. kvl/rope are powers of
+        // two in GLM (512/64), so the div/mod compile to shifts.
         for (int idx = tid; idx < tcount * kvl; idx += blockDim.x) {
             int tt = idx / kvl, i = idx - tt * kvl;
-            Lt[idx] = bf16f(Lc[(size_t)(t0 + tt) * kvl + i]);
+            size_t t = (size_t)(t0 + tt);
+            Lt[idx] = e4m3f(Lc8[t * kvl + i]) * Lscale[t * n_blocks + i / 128];
         }
         for (int idx = tid; idx < tcount * rope; idx += blockDim.x) {
             int tt = idx / rope, d = idx - tt * rope;
@@ -225,10 +233,10 @@ extern "C" __global__ void mla_attend_combine(
 // guard, NEGATIVE = -(hipError_t).
 extern "C" int rivoli_mla_attend(
     const float* qabs, const float* qrope,
-    const unsigned short* Lc, const unsigned short* Rc,
-    int H, int nr, int kvl, int rope, float scale,
+    const unsigned char* Lc8, const float* Lscale, const unsigned short* Rc,
+    int H, int nr, int kvl, int rope, int n_blocks, float scale,
     float* clat, float* partial) {
-    if (H <= 0 || nr <= 0 || kvl <= 0 || rope <= 0) return 1001;
+    if (H <= 0 || nr <= 0 || kvl <= 0 || rope <= 0 || n_blocks <= 0) return 1001;
     size_t lds = mla_attend_lds(kvl, rope);
     if (lds > 65536) return 1002;  // exceeds gfx1151 LDS (shrink TILE/HB)
     int blocks = (H + HB - 1) / HB;
@@ -236,7 +244,8 @@ extern "C" int rivoli_mla_attend(
     float* part = sp.n_splits > 1 ? partial : nullptr;
     hipGetLastError();  // drain any stale error so the check below is this launch's
     hipLaunchKernelGGL(mla_latent_attend, dim3(blocks, sp.n_splits), dim3(HB * SUBW), lds, 0,
-                       qabs, qrope, Lc, Rc, H, nr, kvl, rope, scale, sp.tps, clat, part);
+                       qabs, qrope, Lc8, Lscale, Rc, H, nr, kvl, rope, n_blocks, scale, sp.tps,
+                       clat, part);
     hipError_t e = hipGetLastError();
     if (e != hipSuccess) return -(int)e;
     if (sp.n_splits <= 1) return 0;  // attend wrote clat directly
