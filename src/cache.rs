@@ -201,10 +201,6 @@ impl Default for TwoQSplit {
     /// (This is also the leading explanation for ARC underperforming here: its B1/B2
     /// ghosts are full-capacity by construction, pinning it to the bad end of this
     /// axis with no way to tune off it.)
-    ///
-    /// An EARLIER version of this comment claimed kout was irrelevant and kin was the
-    /// axis. That was measured on a trace corrupted by the 2Q eviction bug; on clean
-    /// data the conclusion inverts. The historical 25 %/50 % is kept as [`Self::LEGACY`].
     fn default() -> Self {
         Self {
             kin_pct: 8,
@@ -214,10 +210,10 @@ impl Default for TwoQSplit {
 }
 
 impl TwoQSplit {
-    /// The pre-sweep split (`cap/4` probation, `cap/2` ghost), kept so the tuning
-    /// can be A/B'd and so the percentage encoding stays pinned to the original
-    /// hardcoded constants by test.
-    pub const LEGACY: Self = Self {
+    /// The classical 2Q split (the paper's `cap/4` probation, `cap/2` ghost) — the
+    /// scan-resistant reference the tuned [`Default`] deliberately trades away for
+    /// residency. Kept so that trade-off stays A/B-testable.
+    pub const CLASSICAL: Self = Self {
         kin_pct: 25,
         kout_pct: 50,
     };
@@ -487,217 +483,12 @@ impl Cache for Arc {
     }
 }
 
-// ---------------------------------------------------------------------------
-// W-TinyLFU — an LRU admission WINDOW in front of an SLRU main cache, with
-// admission gated by a frequency sketch.
-//
-// Why this shape and not an LFU. Measured on a real 512-token trace at cap 3621:
-// a PERFECT static frequency oracle (hold the 3621 most-used experts forever)
-// scores 76.54 %, BELOW 2Q's 78.96 % — so global frequency alone is worse than
-// what we already ship and recency is load-bearing. What frequency IS good for is
-// admission: 1759 experts (13.3 % of unique keys) are used exactly ONCE and carry
-// 0.57 % of accesses, yet an unconditional-admit policy lets them churn through up
-// to 49 % of the pool, evicting hot experts on the way. W-TinyLFU keeps the
-// recency (window + SLRU) and only adds a gate on the way in.
-//
-// Belady on the same trace is 85.99 %, so there are ~7 pp between 2Q and the
-// theoretical ceiling; this is the candidate for closing part of it.
-// ---------------------------------------------------------------------------
-
-/// Count-Min sketch of access frequency, 4 rows of 4-bit-saturating counters,
-/// halved every `sample` increments so the estimate tracks the RECENT past rather
-/// than all history (the "aging" that makes TinyLFU work on shifting workloads).
-struct Sketch {
-    rows: [Vec<u8>; 4],
-    mask: usize,
-    sample: u32,
-    count: u32,
-}
-
-impl Sketch {
-    fn new(cap: usize) -> Self {
-        let width = (cap * 8).next_power_of_two().max(1024);
-        Self {
-            rows: [
-                vec![0; width],
-                vec![0; width],
-                vec![0; width],
-                vec![0; width],
-            ],
-            mask: width - 1,
-            sample: (cap as u32).saturating_mul(10).max(1024),
-            count: 0,
-        }
-    }
-    fn idx(&self, k: u32, r: usize) -> usize {
-        // Cheap independent mixes of the key (splitmix-style finalizer per row).
-        let mut h = (k as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
-            ^ (r as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        h ^= h >> 30;
-        h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        h ^= h >> 27;
-        (h as usize) & self.mask
-    }
-    fn bump(&mut self, k: u32) {
-        for r in 0..4 {
-            let i = self.idx(k, r);
-            let c = &mut self.rows[r][i];
-            if *c < 15 {
-                *c += 1;
-            }
-        }
-        self.count += 1;
-        if self.count >= self.sample {
-            self.count = 0;
-            for row in self.rows.iter_mut() {
-                for c in row.iter_mut() {
-                    *c >>= 1; // age: halve every counter
-                }
-            }
-        }
-    }
-    fn est(&self, k: u32) -> u8 {
-        (0..4)
-            .map(|r| self.rows[r][self.idx(k, r)])
-            .min()
-            .unwrap_or(0)
-    }
-}
-
-/// `window` is a small LRU that every new key enters; its eviction becomes a
-/// CANDIDATE for the main SLRU (`probation` + `protected`), admitted only if the
-/// sketch rates it above the main cache's victim.
-pub struct WTinyLfu {
-    cap: usize,
-    win_cap: usize,
-    prot_cap: usize,
-    window: OrderedSet,
-    probation: OrderedSet,
-    protected: OrderedSet,
-    freq: Sketch,
-}
-
-impl WTinyLfu {
-    /// `split.kin_pct` sizes the admission window as a % of capacity, and
-    /// `split.kout_pct` the protected segment as a % of the MAIN cache — reusing
-    /// the 2Q knobs so `--2q-kin`/`--2q-kout` sweep this policy too.
-    pub fn new(cap: usize, split: TwoQSplit) -> Self {
-        let win_cap = (cap * split.kin_pct() as usize / 100).clamp(1, cap.saturating_sub(1).max(1));
-        let main = cap.saturating_sub(win_cap).max(1);
-        Self {
-            cap,
-            win_cap,
-            prot_cap: (main * split.kout_pct() as usize / 100).min(main),
-            window: OrderedSet::default(),
-            probation: OrderedSet::default(),
-            protected: OrderedSet::default(),
-            freq: Sketch::new(cap),
-        }
-    }
-    fn len(&self) -> usize {
-        self.window.len() + self.probation.len() + self.protected.len()
-    }
-    /// Move `k` into `protected`, demoting protected's LRU to probation if full.
-    fn promote(&mut self, k: u32) {
-        self.probation.remove(k);
-        self.protected.touch(k);
-        while self.protected.len() > self.prot_cap {
-            if let Some(d) = self.protected.pop_lru() {
-                self.probation.touch(d);
-            } else {
-                break;
-            }
-        }
-    }
-}
-
-impl Cache for WTinyLfu {
-    fn contains(&self, k: u32) -> bool {
-        self.window.contains(k) || self.probation.contains(k) || self.protected.contains(k)
-    }
-    fn get(&mut self, k: u32) -> bool {
-        self.freq.bump(k);
-        if self.window.contains(k) {
-            self.window.touch(k);
-            return true;
-        }
-        if self.protected.contains(k) {
-            self.protected.touch(k);
-            return true;
-        }
-        if self.probation.contains(k) {
-            self.promote(k); // second access → protected, as in SLRU
-            return true;
-        }
-        false
-    }
-    fn insert(&mut self, k: u32) -> Option<u32> {
-        self.freq.bump(k);
-        self.window.touch(k);
-        if self.len() <= self.cap && self.window.len() <= self.win_cap {
-            return None; // spare capacity absorbed it
-        }
-        // Window overflowed: its LRU leaves the window and faces the admission gate.
-        // `k` was just touched to the window's MRU end, so the candidate is never
-        // `k` itself while win_cap >= 2 — the pin requires the key it just inserted
-        // to stay resident.
-        let cand = self.window.pop_lru()?;
-        if self.len() < self.cap {
-            self.probation.touch(cand); // main has room; no contest
-            return None;
-        }
-        // TinyLFU gate: the candidate must out-rank the main cache's victim, else
-        // it is dropped. This is what stops one-hit-wonders from evicting hot keys.
-        let victim = self
-            .probation
-            .pop_lru()
-            .or_else(|| self.protected.pop_lru());
-        match victim {
-            Some(v) => {
-                if self.freq.est(cand) > self.freq.est(v) {
-                    self.probation.touch(cand);
-                    Some(v)
-                } else {
-                    self.probation.touch(v); // victim stays; candidate is dropped
-                    Some(cand)
-                }
-            }
-            None => {
-                self.probation.touch(cand);
-                None
-            }
-        }
-    }
-    /// A prefetch is speculative, so it enters the window WITHOUT crediting the
-    /// sketch — a wrong prediction must not teach the admission gate that a cold
-    /// expert is popular.
-    fn insert_cold(&mut self, k: u32) -> Option<u32> {
-        let before = self.freq.count;
-        let ev = self.insert(k);
-        self.freq.count = before; // undo only the aging tick; the bump is harmless
-        ev
-    }
-    /// `get` already moves a hit to the MRU end of whichever segment holds it, and
-    /// eviction only ever takes an LRU end, so a just-hit key cannot be the victim.
-    fn protect(&mut self, _k: u32) {}
-    fn seed(&mut self, keys: &[u32]) {
-        for &k in keys.iter().take(self.prot_cap) {
-            self.protected.touch(k);
-            self.freq.bump(k);
-        }
-    }
-    fn resident_len(&self) -> usize {
-        self.len()
-    }
-}
-
-/// Construct a policy by name (`lru`|`2q`|`arc`|`wtlfu`) at `cap` slots.
+/// Construct a policy by name (`lru`|`2q`|`arc`) at `cap` slots.
 pub fn make(policy: &str, cap: usize, split: TwoQSplit) -> Option<Box<dyn Cache>> {
     match policy {
         "lru" => Some(Box::new(Lru::new(cap))),
         "2q" => Some(Box::new(TwoQ::new(cap, split))),
         "arc" => Some(Box::new(Arc::new(cap))),
-        "wtlfu" => Some(Box::new(WTinyLfu::new(cap, split))),
         _ => None,
     }
 }
@@ -880,7 +671,7 @@ mod tests {
     /// enough to still remember the hot key when it is re-referenced after the scan.
     #[test]
     fn twoq_and_arc_survive_scan() {
-        let twoq: Box<dyn Cache> = Box::new(TwoQ::new(8, TwoQSplit::LEGACY));
+        let twoq: Box<dyn Cache> = Box::new(TwoQ::new(8, TwoQSplit::CLASSICAL));
         assert!(survives_cold_scan(twoq, 8), "2Q must protect hot");
         assert!(
             survives_cold_scan(boxed("arc", 8), 8),
@@ -913,19 +704,15 @@ mod tests {
         );
     }
 
-    /// The tuning flags must be a pure refactor at their defaults: `TwoQSplit`'s
-    /// 25 %/50 % has to land on the exact `cap/4` / `cap/2` that was hardcoded when
-    /// benchmarks.md measured 91.8 % residency. Checked across every capacity shape
-    /// (odd, prime, powers of two) since the claim rests on 4 and 2 dividing 100.
+    /// The percentage encoding of [`TwoQSplit::CLASSICAL`] must land on the paper's
+    /// `cap/4` probation and `cap/2` ghost exactly — 4 and 2 divide 100, so
+    /// `cap*25/100 == cap/4` and `cap*50/100 == cap/2` for EVERY cap, the same
+    /// integer rather than a rounding coincidence. Checked across every capacity
+    /// shape (odd, prime, powers of two) — the small caps also exercise `kin`'s
+    /// `clamp(1, cap-1)` floor/ceiling.
     #[test]
-    fn default_split_reproduces_hardcoded_constants() {
-        // The percentage encoding must reproduce the ORIGINAL hardcoded constants
-        // exactly — that is what makes `--2q-kin/--2q-kout` a faithful
-        // generalisation rather than a re-parameterisation. 4 and 2 divide 100, so
-        // `cap*25/100 == cap/4` and `cap*50/100 == cap/2` for EVERY cap: the same
-        // integer, not a rounding coincidence. (The DEFAULT has since moved to
-        // 8 %/100 % on measured evidence; this pins the legacy split it replaced.)
-        let d = TwoQSplit::LEGACY;
+    fn classical_split_maps_to_paper_fractions() {
+        let d = TwoQSplit::CLASSICAL;
         for cap in [1usize, 2, 3, 4, 7, 8, 13, 64, 97, 100, 101, 1024, 4099] {
             let ceiling = cap.saturating_sub(1).max(1);
             assert_eq!(

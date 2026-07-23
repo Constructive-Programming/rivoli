@@ -57,7 +57,7 @@ pub struct Config {
     /// Override the fixed bench prompt (`--prompt`), for capturing routing traces of
     /// diverse inputs. None = the default prompt.
     pub prompt: Option<String>,
-    /// Routed-expert eviction policy (`--cache-policy` lru|2q|arc|wtlfu). Default
+    /// Routed-expert eviction policy (`--cache-policy` lru|2q|arc). Default
     /// "2q". 2Q/ARC add the scan resistance that matters once prefetch injects a
     /// misprediction stream.
     pub cache_policy: String,
