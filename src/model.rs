@@ -70,8 +70,14 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
-    pub fn load(snapshot_dir: &str) -> Result<Self> {
-        let path = format!("{snapshot_dir}/config.json");
+    /// Load from the artifact's `manifest.json` (the config fields live at top level
+    /// alongside a `format` section; serde ignores the unknown key), falling back to a
+    /// bare `config.json` for reading a raw checkpoint.
+    pub fn load(dir: &str) -> Result<Self> {
+        let path = match std::fs::metadata(format!("{dir}/manifest.json")) {
+            Ok(_) => format!("{dir}/manifest.json"),
+            Err(_) => format!("{dir}/config.json"),
+        };
         let text = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
         let cfg: Self = serde_json::from_str(&text).with_context(|| format!("parse {path}"))?;
         cfg.validate()?;
