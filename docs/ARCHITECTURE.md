@@ -43,8 +43,10 @@ projection sub-offsets. Validated on open; a dim/version mismatch fails loud.
 ## Kernels (kernels/*.hip, gated on `rocm`)
 
 Keep + prune: `common.hpp` (wave helpers, bf16/e4m3, **dot_vq_wave**; drop
-dot_i4/dot_i8), `attn.hip`, `fwd.hip` (embed_i8, append_kv, rope, vadd, argmax),
-`indexer.hip` (bf16), `vmm.hip`, `stream.hip`.
+dot_i4/dot_i8), `attn.hip` (dense bf16 only — no sparse gather, no fp8-KV: this
+checkpoint has no DSA indexer, so the indexer + StreamingLLM + `--kv-fp8` paths are
+all dropped), `fwd.hip` (embed_i8, append_kv, gather_rope, vadd, argmax; drop
+append_kv_fp8), `vmm.hip`, `stream.hip`. **Dropped: `indexer.hip`.**
 
 Rewrite for the new formats:
 - `moe.hip` — `moe_gateup_vq`/`moe_down_vq`/`moe_reduce` taking the **3 per-projection
@@ -56,8 +58,12 @@ Rewrite for the new formats:
 ## Rust modules (src/)
 
 Keep, cleaned: `math`, `model` (ModelConfig), `device` (DeviceTier/DeviceBuf/VmmBuf),
-`stream` (io_uring), `cache` (2Q pool), `attn` (AttnMode), `indexer`, `tokenizer`,
-`watchdog`.
+`stream` (io_uring), `cache` (2Q pool), `tokenizer`, `watchdog`, `config` (no
+snapshot/vq-dir/attn/kv-fp8 knobs; the artifact is the model).
+
+Dropped modules: `attn` (dense-only ⇒ `AttnMode` collapses to `pos+1`, and the CPU
+int4 `attention()` oracle is redundant with `tests/kernel.rs`), `indexer` (no DSA
+indexer in this checkpoint), `snapshot` (int4 loader; replaced by `format`).
 
 Rewrite:
 - `format` (new) — the artifact reader: manifest + resident.bin + `.vq3` mmap/index,
