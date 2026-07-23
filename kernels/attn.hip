@@ -14,11 +14,13 @@
 // Lscale[t*n_blocks + i/128]. The roped key stays bf16 (quantizing the rope half
 // hurts accuracy — DeepSeek keeps it bf16 too).
 //
-// Dense only: the DSA indexer this checkpoint lacks is gone, so there is no sparse
-// row gather — every head attends every cached token. Numerics match the scalar
-// oracle to f32 rounding: per-token score sums kvl then rope over the widened
-// values (wave-reduced, so summation order differs by ~1e-5 rel), flash online form
-// for stability.
+// Attends either the whole causal prefix (dense, `rows` == null ⇒ token = row
+// position) or a DSA-selected subset (`rows[j]` is the cached token index of the
+// j-th attended row). The split-KV plan cuts the `nr` row POSITIONS, so only the
+// tile load dereferences `rows` — everything else is row-position arithmetic.
+// Numerics match the scalar oracle to f32 rounding: per-token score sums kvl then
+// rope over the widened values (wave-reduced, so summation order differs by ~1e-5
+// rel), flash online form for stability.
 //
 // HB/TILE are occupancy/LDS knobs (LDS = (HB+TILE)*kvl + TILE*rope floats).
 // Correctness is independent of their value. HB is also the DRAM KV re-read
@@ -96,6 +98,7 @@ extern "C" __global__ void mla_latent_attend(
     const unsigned char* __restrict__ Lc8,  // [tokens*kvl] e4m3 latent cache
     const float* __restrict__ Lscale,       // [tokens*n_blocks] f32 per-128 block scale
     const unsigned short* __restrict__ Rc,  // [tokens*rope] bf16 roped key
+    const unsigned int* __restrict__ rows,  // [nr] attended token indices, or null = dense
     int H, int nr, int kvl, int rope, int n_blocks, float scale, int tps,
     float* __restrict__ clat,               // [H*kvl], written iff partial==null
     float* __restrict__ partial) {          // split scratch, or null = single split
@@ -132,12 +135,13 @@ extern "C" __global__ void mla_latent_attend(
         // two in GLM (512/64), so the div/mod compile to shifts.
         for (int idx = tid; idx < tcount * kvl; idx += blockDim.x) {
             int tt = idx / kvl, i = idx - tt * kvl;
-            size_t t = (size_t)(t0 + tt);
+            size_t t = rows ? (size_t)rows[t0 + tt] : (size_t)(t0 + tt);
             Lt[idx] = e4m3f(Lc8[t * kvl + i]) * Lscale[t * n_blocks + i / 128];
         }
         for (int idx = tid; idx < tcount * rope; idx += blockDim.x) {
             int tt = idx / rope, d = idx - tt * rope;
-            Rt[idx] = bf16f(Rc[(size_t)(t0 + tt) * rope + d]);
+            size_t t = rows ? (size_t)rows[t0 + tt] : (size_t)(t0 + tt);
+            Rt[idx] = bf16f(Rc[t * rope + d]);
         }
         __syncthreads();
 
@@ -234,7 +238,7 @@ extern "C" __global__ void mla_attend_combine(
 extern "C" int rivoli_mla_attend(
     const float* qabs, const float* qrope,
     const unsigned char* Lc8, const float* Lscale, const unsigned short* Rc,
-    int H, int nr, int kvl, int rope, int n_blocks, float scale,
+    const unsigned int* rows, int H, int nr, int kvl, int rope, int n_blocks, float scale,
     float* clat, float* partial) {
     if (H <= 0 || nr <= 0 || kvl <= 0 || rope <= 0 || n_blocks <= 0) return 1001;
     size_t lds = mla_attend_lds(kvl, rope);
@@ -244,7 +248,7 @@ extern "C" int rivoli_mla_attend(
     float* part = sp.n_splits > 1 ? partial : nullptr;
     hipGetLastError();  // drain any stale error so the check below is this launch's
     hipLaunchKernelGGL(mla_latent_attend, dim3(blocks, sp.n_splits), dim3(HB * SUBW), lds, 0,
-                       qabs, qrope, Lc8, Lscale, Rc, H, nr, kvl, rope, n_blocks, scale, sp.tps,
+                       qabs, qrope, Lc8, Lscale, Rc, rows, H, nr, kvl, rope, n_blocks, scale, sp.tps,
                        clat, part);
     hipError_t e = hipGetLastError();
     if (e != hipSuccess) return -(int)e;

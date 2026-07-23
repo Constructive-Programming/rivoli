@@ -28,6 +28,12 @@ struct Args {
     prefetch: bool,
     prefetch_depth: usize,
     max_mem: Option<u64>,
+    /// Attention mode (`--attn auto|dense|streaming|dsa|misa`). `auto` picks `dsa`
+    /// when the artifact carries indexer weights, else `dense`.
+    attn: String,
+    sinks: usize,
+    window: usize,
+    misa_heads: usize,
     /// DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
     #[cfg(feature = "trace")]
     checksum_x: bool,
@@ -37,7 +43,8 @@ fn parse_args() -> Result<Args> {
     const USAGE: &str = "usage: rivoli <model-dir> [-bench <tokens>] [--direct-vmm-dma] \
          [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc] [--2q-kin <pct>] \
          [--2q-kout <pct>] [--no-prefetch] [--prefetch-depth <n>] [--max-mem <GiB>] \
-         [--os-reserve <GiB>]";
+         [--os-reserve <GiB>] [--attn auto|dense|streaming|dsa|misa] [--sinks <n>] \
+         [--window <n>] [--misa-heads <n>]";
     let mut model = None;
     let mut a = Args {
         model: String::new(),
@@ -51,6 +58,10 @@ fn parse_args() -> Result<Args> {
         prefetch: true,
         prefetch_depth: 1,
         max_mem: None,
+        attn: "auto".to_string(),
+        sinks: 4,
+        window: 8192,
+        misa_heads: 8, // the MISA paper's validated GLM setting
         #[cfg(feature = "trace")]
         checksum_x: false,
     };
@@ -112,6 +123,31 @@ fn parse_args() -> Result<Args> {
                 rivoli::config::OS_RESERVE_OVERRIDE
                     .store(gib << 30, std::sync::atomic::Ordering::Relaxed);
             }
+            "--attn" => a.attn = args.next().context("--attn requires a mode")?,
+            "--sinks" => {
+                a.sinks = args
+                    .next()
+                    .context("--sinks requires an integer")?
+                    .parse()
+                    .context("--sinks takes an integer")?;
+            }
+            "--window" => {
+                a.window = args
+                    .next()
+                    .context("--window requires an integer")?
+                    .parse()
+                    .context("--window takes an integer")?;
+            }
+            "--misa-heads" => {
+                a.misa_heads = args
+                    .next()
+                    .context("--misa-heads requires an integer")?
+                    .parse()
+                    .context("--misa-heads takes an integer")?;
+                if a.misa_heads == 0 {
+                    bail!("--misa-heads must be >= 1");
+                }
+            }
             #[cfg(feature = "trace")]
             "--checksum-x" => a.checksum_x = true,
             _ if model.is_none() => model = Some(arg),
@@ -122,8 +158,45 @@ fn parse_args() -> Result<Args> {
     Ok(a)
 }
 
+/// Does the artifact carry resident DSA indexer weights? (`auto` picks `dsa` iff so.)
+/// Checks layer 0's `wk` — `indexer_layout` guarantees layer 0 is a full layer, so
+/// its indexer is present whenever any is. `open_dir` merges every *.safetensors in
+/// the artifact, so this sees `indexer.safetensors` (added post-hoc) too.
+fn artifact_has_indexer(model_dir: &str) -> bool {
+    rivoli::format::Safetensors::open_dir(model_dir)
+        .map(|st| st.has("model.layers.0.self_attn.indexer.wk.weight"))
+        .unwrap_or(false)
+}
+
+/// Resolve `--attn` (with `auto` → dsa/dense by artifact contents) into an `AttnMode`.
+fn resolve_attn(a: &Args) -> Result<rivoli::attn::AttnMode> {
+    use rivoli::attn::AttnMode;
+    let mode = if a.attn == "auto" {
+        if artifact_has_indexer(&a.model) {
+            "dsa"
+        } else {
+            "dense"
+        }
+    } else {
+        a.attn.as_str()
+    };
+    Ok(match mode {
+        "dense" => AttnMode::Dense,
+        "streaming" => AttnMode::Streaming {
+            sinks: a.sinks,
+            window: a.window,
+        },
+        "dsa" => AttnMode::Dsa,
+        "misa" => AttnMode::Misa {
+            active_heads: a.misa_heads,
+        },
+        other => bail!("unknown --attn mode {other:?} (auto|dense|streaming|dsa|misa)"),
+    })
+}
+
 fn main() -> Result<()> {
     let a = parse_args()?;
+    let attn = resolve_attn(&a)?;
     #[cfg(feature = "trace")]
     let checksum_x = a.checksum_x;
     #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
@@ -138,6 +211,7 @@ fn main() -> Result<()> {
         a.prefetch,
         a.prefetch_depth,
         a.max_mem,
+        attn,
     )?;
     #[cfg(feature = "trace")]
     {
@@ -225,6 +299,11 @@ fn main() -> Result<()> {
                 None => String::new(),
             },
         );
+        // dsa/misa need the resident DSA indexer placed by Pin::build.
+        let want_indexer = matches!(
+            cfg.attn,
+            rivoli::attn::AttnMode::Dsa | rivoli::attn::AttnMode::Misa { .. }
+        );
         let t = std::time::Instant::now();
         let pin = rivoli::pin::Pin::build(
             &cfg.model,
@@ -236,10 +315,11 @@ fn main() -> Result<()> {
             cfg.two_q,
             cfg.prefetch,
             cfg.prefetch_depth,
+            want_indexer,
         )?;
         info!("pin built in {:.1}s", t.elapsed().as_secs_f64());
         let max_ctx = prompt_ids.len() + ngen + 1;
-        let mut engine = rivoli::gpu::GpuEngine::new(pin, &mc, max_ctx)?;
+        let mut engine = rivoli::gpu::GpuEngine::new(pin, &mc, max_ctx, cfg.attn.clone())?;
         #[cfg(feature = "trace")]
         engine.set_checksum_x(cfg.checksum_x);
         // Wedge watchdog: a hung GPU join can't be caught inside the decode loop, so

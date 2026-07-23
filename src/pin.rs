@@ -85,8 +85,20 @@ pub enum LayerMlp {
     },
 }
 
-/// One layer's resolved weights. Dense-only attention (no DSA indexer in this
-/// checkpoint), so there is no per-layer indexer state.
+/// A full layer's resident DSA lightning-indexer weights: the fp8 projections
+/// (`wk`/`wq_b`/`weights_proj` — fp8-e4m3 in this checkpoint) + the f32-widened
+/// `k_norm` (weight + bias). Only "full" layers own one; "shared" layers reuse a
+/// preceding full layer's selection and carry `None`.
+#[derive(Clone, Copy)]
+pub struct IndexerPin {
+    pub wk: Fp8Weight,            // [index_head_dim, hidden] (fp8)
+    pub wq_b: Fp8Weight,          // [index_n_heads·index_head_dim, q_lora_rank] (fp8)
+    pub weights_proj: *const f32, // [index_n_heads, hidden] (bf16→f32; gemv_f32)
+    pub k_norm_w: *const f32,     // [index_head_dim] (widened from bf16)
+    pub k_norm_b: *const f32,     // [index_head_dim]
+}
+
+/// One layer's resolved weights.
 pub struct LayerPin {
     pub input_ln: *const f32,
     pub post_ln: *const f32,
@@ -98,6 +110,9 @@ pub struct LayerPin {
     pub kv_b: Fp8Weight,
     pub o_proj: Fp8Weight,
     pub mlp: LayerMlp,
+    /// The DSA indexer weights, `Some` for full layers when the pin is built with
+    /// `want_indexer` (dsa/misa modes). `None` for dense/streaming or shared layers.
+    pub indexer: Option<IndexerPin>,
 }
 
 /// Proof that a layer's demand reads are in flight on the main ring, and the
@@ -281,6 +296,36 @@ fn place_vq_shared(
         up: vw(off[2], off[3], moe_inter, hidden),
         down: vw(off[4], off[5], hidden, moe_inter),
     })
+}
+
+/// Place a full layer's DSA indexer weights: fp8 `wk`/`wq_b`/`weights_proj` + the
+/// f32-widened `k_norm` weight/bias (the converter stores k_norm as F32).
+fn place_indexer(
+    tier: &mut DeviceTier,
+    st: &Safetensors,
+    layer: usize,
+    block: usize,
+) -> Result<IndexerPin> {
+    let base = format!("model.layers.{layer}.self_attn.indexer");
+    Ok(IndexerPin {
+        wk: place_fp8(tier, st, &format!("{base}.wk"), block)?,
+        wq_b: place_fp8(tier, st, &format!("{base}.wq_b"), block)?,
+        weights_proj: place_f32(tier, st, &format!("{base}.weights_proj.weight"))?,
+        k_norm_w: place_f32(tier, st, &format!("{base}.k_norm.weight"))?,
+        k_norm_b: place_f32(tier, st, &format!("{base}.k_norm.bias"))?,
+    })
+}
+
+/// Device bytes ONE full layer's DSA indexer weights occupy, mirroring
+/// [`place_indexer`]: fp8 `wk`/`wq_b`, f32 `weights_proj` + f32 `k_norm`.
+fn indexer_bytes(cfg: &ModelConfig, block: usize) -> usize {
+    let fp8 = |o: usize, i: usize| o * i + o.div_ceil(block) * i.div_ceil(block) * 4;
+    let hd = cfg.index_head_dim;
+    let nh = cfg.index_n_heads;
+    fp8(hd, cfg.hidden)                 // wk (fp8)
+        + fp8(nh * hd, cfg.q_lora_rank) // wq_b (fp8)
+        + nh * cfg.hidden * 4           // weights_proj (bf16→f32)
+        + 2 * hd * 4 // k_norm weight + bias (f32)
 }
 
 /// Device bytes the always-resident set occupies — everything read every token
@@ -503,6 +548,7 @@ impl<'a> Pin<'a> {
         two_q: cache::TwoQSplit,
         prefetch: bool,
         prefetch_depth: usize,
+        want_indexer: bool,
     ) -> Result<Self> {
         let (free, _total) = mem_info()?;
         ensure!(
@@ -521,7 +567,10 @@ impl<'a> Pin<'a> {
         // the `.vq3` streaming source.
         let fmt = FormatMeta::load(dir)?;
         let block = fmt.fp8_block;
-        let st = Safetensors::open_file(&format!("{dir}/resident.safetensors"))?;
+        // open_dir merges every *.safetensors in the artifact: resident.safetensors
+        // plus, when present, indexer.safetensors (the DSA weights, added post-hoc from
+        // the fp8 stash — see bin/add_indexer). The .vq3/codebooks files are ignored.
+        let st = Safetensors::open_dir(dir)?;
         let cbs = load_codebooks(dir)?;
         let vq = Vq3Set::open(
             dir,
@@ -532,10 +581,19 @@ impl<'a> Pin<'a> {
             cfg.moe_inter,
         )?;
 
+        // Full layers own a resident DSA indexer (dsa/misa modes). Empty when
+        // dense/streaming — the mask drives both placement and the footprint.
+        let full = if want_indexer {
+            cfg.indexer_layout()?
+        } else {
+            vec![false; cfg.n_layers]
+        };
+        let n_full = full.iter().filter(|&&f| f).count();
+
         // Size the tier to the always-resident footprint plus slack (absorbs the
         // per-reservation 256-byte alignment padding); anything left widens the pool.
         const SLACK: usize = 256 << 20; // 256 MiB
-        let resident = resident_bytes(cfg, block);
+        let resident = resident_bytes(cfg, block) + n_full * indexer_bytes(cfg, block);
         let tier_cap = resident + SLACK;
         tracing::info!(
             "computed resident footprint {:.2} GiB (tier {:.2} GiB incl. slack)",
@@ -559,9 +617,11 @@ impl<'a> Pin<'a> {
         let lm_head = place_i8(&mut tier, &st, "lm_head.weight")?;
         let final_norm = place_f32(&mut tier, &st, "model.norm.weight")?;
 
-        // Per-layer always-resident weights.
+        // Per-layer always-resident weights. `l` indexes both the weight-name
+        // format!s and the `full` indexer mask; iterating `full` would lose it.
         let mut layers = Vec::with_capacity(cfg.n_layers);
         let mut moe_bias = Vec::new();
+        #[allow(clippy::needless_range_loop)]
         for l in 0..cfg.n_layers {
             let lb = format!("model.layers.{l}");
             let a = format!("{lb}.self_attn");
@@ -605,6 +665,11 @@ impl<'a> Pin<'a> {
                 kv_b: place_fp8(&mut tier, &st, &format!("{a}.kv_b_proj"), block)?,
                 o_proj: place_fp8(&mut tier, &st, &format!("{a}.o_proj"), block)?,
                 mlp,
+                indexer: if full[l] {
+                    Some(place_indexer(&mut tier, &st, l, block)?)
+                } else {
+                    None
+                },
             });
         }
 

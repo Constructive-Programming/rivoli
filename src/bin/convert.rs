@@ -398,14 +398,6 @@ fn learn_codebook(sample: &[f32], max_iters: usize) -> Vec<f32> {
     c
 }
 
-/// Widen a bf16 tensor's bytes to f32 bytes.
-fn widen_bf16(bytes: &[u8]) -> Vec<u8> {
-    bytes
-        .chunks_exact(2)
-        .flat_map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])).to_le_bytes())
-        .collect()
-}
-
 /// Requantize a bf16 `[o_dim, i_dim]` matrix to per-row int8 → (packed i8, f32 scale).
 fn requant_int8(bytes: &[u8], o_dim: usize, i_dim: usize) -> (Vec<u8>, Vec<u8>) {
     let mut packed = vec![0u8; o_dim * i_dim];
@@ -424,32 +416,6 @@ fn requant_int8(bytes: &[u8], o_dim: usize, i_dim: usize) -> (Vec<u8>, Vec<u8>) 
         }
     }
     (packed, scales)
-}
-
-/// Copy an fp8 projection (weight + weight_scale_inv) into the resident writer.
-fn copy_fp8(src: &Safetensors, w: &mut SafeWriter, name: &str) -> Result<()> {
-    let (bytes, shape) = src.typed(&format!("{name}.weight"), Dtype::F8E4M3)?;
-    w.add(
-        format!("{name}.weight"),
-        Dtype::F8E4M3,
-        shape.to_vec(),
-        bytes.to_vec(),
-    );
-    let (sc, ssh) = src.typed(&format!("{name}.weight_scale_inv"), Dtype::F32)?;
-    w.add(
-        format!("{name}.weight_scale_inv"),
-        Dtype::F32,
-        ssh.to_vec(),
-        sc.to_vec(),
-    );
-    Ok(())
-}
-
-/// Add a bf16 tensor widened to f32 (norms, router gate).
-fn add_f32(src: &Safetensors, w: &mut SafeWriter, name: &str) -> Result<()> {
-    let (bytes, shape) = src.typed(name, Dtype::Bf16)?;
-    w.add(name, Dtype::F32, shape.to_vec(), widen_bf16(bytes));
-    Ok(())
 }
 
 /// Add a bf16 `[o,i]` tensor requantized to int8 (embed, lm_head).
@@ -667,25 +633,13 @@ fn main() -> Result<()> {
     let mut w = SafeWriter::new();
     add_int8(&src, &mut w, "model.embed_tokens.weight")?;
     add_int8(&src, &mut w, "lm_head.weight")?;
-    add_f32(&src, &mut w, "model.norm.weight")?;
+    w.add_widened(&src, "model.norm.weight")?;
     for l in 0..last {
         let lb = format!("model.layers.{l}");
-        add_f32(&src, &mut w, &format!("{lb}.input_layernorm.weight"))?;
-        add_f32(
-            &src,
-            &mut w,
-            &format!("{lb}.post_attention_layernorm.weight"),
-        )?;
-        add_f32(
-            &src,
-            &mut w,
-            &format!("{lb}.self_attn.q_a_layernorm.weight"),
-        )?;
-        add_f32(
-            &src,
-            &mut w,
-            &format!("{lb}.self_attn.kv_a_layernorm.weight"),
-        )?;
+        w.add_widened(&src, &format!("{lb}.input_layernorm.weight"))?;
+        w.add_widened(&src, &format!("{lb}.post_attention_layernorm.weight"))?;
+        w.add_widened(&src, &format!("{lb}.self_attn.q_a_layernorm.weight"))?;
+        w.add_widened(&src, &format!("{lb}.self_attn.kv_a_layernorm.weight"))?;
         for p in [
             "q_a_proj",
             "q_b_proj",
@@ -693,14 +647,14 @@ fn main() -> Result<()> {
             "kv_b_proj",
             "o_proj",
         ] {
-            copy_fp8(&src, &mut w, &format!("{lb}.self_attn.{p}"))?;
+            w.copy_fp8(&src, &format!("{lb}.self_attn.{p}"))?;
         }
         if l < d.dense_layers {
             for p in PROJ {
-                copy_fp8(&src, &mut w, &format!("{lb}.mlp.{p}"))?;
+                w.copy_fp8(&src, &format!("{lb}.mlp.{p}"))?;
             }
         } else {
-            add_f32(&src, &mut w, &format!("{lb}.mlp.gate.weight"))?;
+            w.add_widened(&src, &format!("{lb}.mlp.gate.weight"))?;
             let (bias, bsh) = src.typed(
                 &format!("{lb}.mlp.gate.e_score_correction_bias"),
                 Dtype::F32,

@@ -95,6 +95,7 @@ unsafe extern "C" {
         lc8: *const u8,
         lscale: *const f32,
         rc: *const u16,
+        rows: *const u32,
         h: i32,
         nr: i32,
         kvl: i32,
@@ -152,6 +153,41 @@ unsafe extern "C" {
         cbnorm: *const f32,
         n: i32,
         idx: *mut u16,
+    ) -> i32;
+
+    // DSA lightning indexer (indexer.hip).
+    fn rivoli_layernorm(
+        x: *const f32,
+        w: *const f32,
+        b: *const f32,
+        n: i32,
+        eps: f32,
+        y: *mut f32,
+    ) -> i32;
+    fn rivoli_index_append(k: *const f32, kcache: *mut u16, pos: i32, hd: i32) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn rivoli_index_score(
+        q: *const f32,
+        w: *const f32,
+        kcache: *const u16,
+        heads: *const u32,
+        nt: i32,
+        nh: i32,
+        nact: i32,
+        hd: i32,
+        wscale: f32,
+        dscale: f32,
+        scores: *mut f32,
+    ) -> i32;
+    fn rivoli_index_pool_push(k: *const f32, pool: *mut f32, t: i32, hd: i32) -> i32;
+    fn rivoli_index_head_route(
+        q: *const f32,
+        w: *const f32,
+        pool: *const f32,
+        m_blocks: i32,
+        nh: i32,
+        hd: i32,
+        e: *mut f32,
     ) -> i32;
 }
 
@@ -255,11 +291,14 @@ pub fn attend_scratch_floats(h: usize, kvl: usize) -> usize {
 /// the fp8-e4m3 latent cache (per-128 block scales) + bf16 roped key, head-batched,
 /// split-KV when `partial` is non-null.
 ///
+/// `rows` (nullable) lists the `nr` attended token indices for DSA sparse attention;
+/// null = dense over the whole `0..nr` causal prefix.
+///
 /// # Safety
 /// Async device pointers live until the next [`device_sync`]: `qabs` (`h·kvl` f32),
-/// `qrope` (`h·rope` f32), `lc8` (`nr·kvl` e4m3), `lscale` (`nr·n_blocks` f32,
-/// `n_blocks = kvl/128`), `rc` (`nr·rope` bf16), `clat` (`h·kvl` f32), `partial`
-/// ([`attend_scratch_floats`] f32 or null = single split).
+/// `qrope` (`h·rope` f32), `lc8`/`lscale`/`rc` the KV cache (indexed by token — up to
+/// `pos+1` rows; `n_blocks = kvl/128`), `rows` (`nr` u32 or null), `clat` (`h·kvl`
+/// f32), `partial` ([`attend_scratch_floats`] f32 or null = single split).
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn launch_attend(
     qabs: *const f32,
@@ -267,6 +306,7 @@ pub unsafe fn launch_attend(
     lc8: *const u8,
     lscale: *const f32,
     rc: *const u16,
+    rows: *const u32,
     h: usize,
     nr: usize,
     kvl: usize,
@@ -284,6 +324,7 @@ pub unsafe fn launch_attend(
             lc8,
             lscale,
             rc,
+            rows,
             h as i32,
             nr as i32,
             kvl as i32,
@@ -585,4 +626,115 @@ pub unsafe fn launch_vq_encode(
     // SAFETY: caller's pointer contract.
     let r = unsafe { rivoli_vq_encode(sub, codebook, cbnorm, n as i32, idx) };
     check(r, "vq_encode")
+}
+
+// ── DSA lightning indexer ───────────────────────────────────────────────────────
+
+/// LayerNorm with bias `y = (x-mean)/sqrt(var+eps)·w + b` (the indexer k_norm).
+///
+/// # Safety
+/// Device pointers (`x`, `w`, `b`, `y` each `n` f32) live until the next [`device_sync`].
+pub unsafe fn launch_layernorm(
+    x: *const f32,
+    w: *const f32,
+    b: *const f32,
+    n: usize,
+    eps: f32,
+    y: *mut f32,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r = unsafe { rivoli_layernorm(x, w, b, n as i32, eps, y) };
+    check(r, "layernorm")
+}
+
+/// Append one indexer key row (bf16) at `pos`: `kcache[pos·hd+i] = bf16(k[i])`.
+///
+/// # Safety
+/// Device pointers live until the next [`device_sync`]: `k` (`hd` f32), `kcache`
+/// (row `pos` in-bounds).
+pub unsafe fn launch_index_append(
+    k: *const f32,
+    kcache: *mut u16,
+    pos: usize,
+    hd: usize,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r = unsafe { rivoli_index_append(k, kcache, pos as i32, hd as i32) };
+    check(r, "index_append")
+}
+
+/// Score every cached token against the indexer query heads:
+/// `scores[t] = Σ_{h∈active} w[h]·wscale·ReLU((q_h·k_t)·dscale)`. `heads` (nullable)
+/// lists the `nact` active heads (MISA); null = all `nh` heads (DSA).
+///
+/// # Safety
+/// Device pointers live until the next [`device_sync`]: `q` (`nh·hd` f32), `w` (`nh`
+/// f32), `kcache` (`nt·hd` bf16), `heads` (`nact` u32 or null), `scores` (`nt` f32).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_index_score(
+    q: *const f32,
+    w: *const f32,
+    kcache: *const u16,
+    heads: *const u32,
+    nt: usize,
+    nh: usize,
+    nact: usize,
+    hd: usize,
+    wscale: f32,
+    dscale: f32,
+    scores: *mut f32,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r = unsafe {
+        rivoli_index_score(
+            q,
+            w,
+            kcache,
+            heads,
+            nt as i32,
+            nh as i32,
+            nact as i32,
+            hd as i32,
+            wscale,
+            dscale,
+            scores,
+        )
+    };
+    check(r, "index_score")
+}
+
+/// Fold token `t`'s indexer key into its MISA block pool running mean.
+///
+/// # Safety
+/// Device pointers live until the next [`device_sync`]: `k` (`hd` f32), `pool`
+/// (block `t/MISA_BLOCK` in-bounds).
+pub unsafe fn launch_index_pool_push(
+    k: *const f32,
+    pool: *mut f32,
+    t: usize,
+    hd: usize,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r = unsafe { rivoli_index_pool_push(k, pool, t as i32, hd as i32) };
+    check(r, "index_pool_push")
+}
+
+/// MISA head-router estimate `e[j] = mean_b |w[j]·ReLU(q_j·k̄_b)|` over the block pool.
+///
+/// # Safety
+/// Device pointers live until the next [`device_sync`]: `q` (`nh·hd` f32), `w` (`nh`
+/// f32), `pool` (`m_blocks·hd` f32), `e` (`nh` f32).
+pub unsafe fn launch_index_head_route(
+    q: *const f32,
+    w: *const f32,
+    pool: *const f32,
+    m_blocks: usize,
+    nh: usize,
+    hd: usize,
+    e: *mut f32,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r =
+        unsafe { rivoli_index_head_route(q, w, pool, m_blocks as i32, nh as i32, hd as i32, e) };
+    check(r, "index_head_route")
 }

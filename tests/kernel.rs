@@ -256,6 +256,7 @@ fn check_attend(seed: u64, h: usize, nt: usize, kvl: usize, rope: usize) {
             lcb.ptr(),
             lsb.ptr() as *const f32,
             rcb.ptr() as *const u16,
+            std::ptr::null(), // dense (no row gather)
             h,
             nt,
             kvl,

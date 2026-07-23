@@ -128,6 +128,38 @@ impl SafeWriter {
         self.tensors.push((name.into(), dtype, shape, bytes));
     }
 
+    /// Copy an fp8 tensor (`<name>.weight` F8E4M3 + `.weight_scale_inv` F32) from a
+    /// reader verbatim — the resident attn/dense/indexer projections.
+    pub fn copy_fp8(&mut self, src: &Safetensors, name: &str) -> Result<()> {
+        let (w, shape) = src.typed(&format!("{name}.weight"), Dtype::F8E4M3)?;
+        self.add(
+            format!("{name}.weight"),
+            Dtype::F8E4M3,
+            shape.to_vec(),
+            w.to_vec(),
+        );
+        let (sc, ssh) = src.typed(&format!("{name}.weight_scale_inv"), Dtype::F32)?;
+        self.add(
+            format!("{name}.weight_scale_inv"),
+            Dtype::F32,
+            ssh.to_vec(),
+            sc.to_vec(),
+        );
+        Ok(())
+    }
+
+    /// Add a bf16 tensor from a reader, widened to f32 (norms, router gate,
+    /// weights_proj, k_norm — everything the loader reads as f32).
+    pub fn add_widened(&mut self, src: &Safetensors, name: &str) -> Result<()> {
+        let (bytes, shape) = src.typed(name, Dtype::Bf16)?;
+        let f32b: Vec<u8> = bytes
+            .chunks_exact(2)
+            .flat_map(|c| crate::math::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])).to_le_bytes())
+            .collect();
+        self.add(name, Dtype::F32, shape.to_vec(), f32b);
+        Ok(())
+    }
+
     pub fn write(&self, path: &str) -> Result<()> {
         use std::io::Write;
         let mut hdr = serde_json::Map::new();

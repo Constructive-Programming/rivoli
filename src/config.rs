@@ -87,6 +87,10 @@ pub struct Config {
     /// all safe free memory (`free − OS_RESERVE`); `Some(n)` caps lower. Bigger = more
     /// resident experts = higher hit rate on this cold-miss-fetch-bound decode.
     pub max_mem: Option<u64>,
+    /// Attention row-selection mode (`--attn auto|dense|streaming|dsa|misa`, resolved
+    /// in `main`). `auto` picks `dsa` when the artifact carries indexer weights, else
+    /// `dense`. dsa/misa need the resident DSA indexer.
+    pub attn: crate::attn::AttnMode,
 }
 
 fn mem_available() -> Result<u64> {
@@ -123,6 +127,7 @@ impl Config {
         prefetch: bool,
         prefetch_depth: usize,
         max_mem: Option<u64>,
+        attn: crate::attn::AttnMode,
     ) -> Result<Self> {
         let avail = mem_available()?;
         let reserve = os_reserve();
@@ -151,6 +156,7 @@ impl Config {
             prefetch_depth,
             threads,
             max_mem,
+            attn,
         })
     }
 }
@@ -160,9 +166,10 @@ impl fmt::Display for Config {
         const GIB: f64 = (1u64 << 30) as f64;
         write!(
             f,
-            "model={} bench={:?} direct_vmm_dma={} cache_policy={} 2q_kin={}% 2q_kout={}% prefetch={} prefetch_depth={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={} threads={}",
+            "model={} bench={:?} attn={:?} direct_vmm_dma={} cache_policy={} 2q_kin={}% 2q_kout={}% prefetch={} prefetch_depth={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={} threads={}",
             self.model,
             self.bench,
+            self.attn,
             self.direct_vmm_dma,
             self.cache_policy,
             self.two_q.kin_pct(),
