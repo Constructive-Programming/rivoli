@@ -4,8 +4,9 @@
 
 use rivoli::device::DeviceBuf;
 use rivoli::hip::{
-    ExpertDescVq, attend_scratch_floats, device_sync, launch_attend, launch_gemv_fp8,
-    launch_gemv_vq, launch_mla_absorb_fp8, launch_mla_value_fp8, launch_moe_vq,
+    ExpertDescVq, attend_scratch_floats, device_sync, launch_argmax, launch_attend,
+    launch_gemv_fp8, launch_gemv_vq, launch_mla_absorb_fp8, launch_mla_value_fp8, launch_moe_vq,
+    launch_vadd,
 };
 use rivoli::math::{bf16_to_f32, e4m3_to_f32, f32_to_bf16, f32_to_e4m3, silu, softmax};
 use rivoli::quant::{VQ_DIM, VQ_K, matvec_fp8, matvec_vq, quant_vq};
@@ -116,6 +117,49 @@ fn gemv_vq_matches_oracle() {
     }
     device_sync().expect("sync");
     assert_close(&want, &f32v(&yb.copy_out().expect("out")), "gemv_vq");
+}
+
+/// argmax_reduce: max value wins, ties → lowest index, NaN never wins. Plus vadd
+/// as a residual-add smoke check (both fwd.hip glue).
+#[test]
+fn fwd_argmax_and_vadd() {
+    // argmax: a plateau (tie → lowest index) with a NaN that must lose.
+    let mut logits = vec![0.1f32, 0.5, 0.5, f32::NAN, 0.3, 0.5, -1.0];
+    let want_idx = 1i32; // first 0.5
+    let lb = dev(&f32b(&logits));
+    let mut ib = dev(&vec![0u8; 4]);
+    let mut vb = dev(&vec![0u8; 4]);
+    unsafe {
+        launch_argmax(
+            lb.ptr() as *const f32,
+            logits.len(),
+            ib.ptr_mut() as *mut i32,
+            vb.ptr_mut() as *mut f32,
+        )
+        .expect("launch argmax");
+    }
+    device_sync().expect("sync");
+    let got_idx = i32::from_le_bytes(ib.copy_out().expect("out")[..4].try_into().expect("4 bytes"));
+    let got_val = f32::from_le_bytes(vb.copy_out().expect("out")[..4].try_into().expect("4 bytes"));
+    assert_eq!(got_idx, want_idx, "argmax idx");
+    assert_eq!(got_val, 0.5, "argmax val");
+
+    // vadd: x += y, elementwise.
+    let y: Vec<f32> = logits.iter().map(|v| if v.is_nan() { 0.0 } else { *v }).collect();
+    for l in logits.iter_mut() {
+        if l.is_nan() {
+            *l = 0.0;
+        }
+    }
+    let mut xb = dev(&f32b(&logits));
+    let yb = dev(&f32b(&y));
+    unsafe {
+        launch_vadd(xb.ptr_mut() as *mut f32, yb.ptr() as *const f32, logits.len()).expect("vadd");
+    }
+    device_sync().expect("sync");
+    let got = f32v(&xb.copy_out().expect("out"));
+    let want: Vec<f32> = logits.iter().zip(&y).map(|(a, b)| a + b).collect();
+    assert_close(&want, &got, "vadd");
 }
 
 /// Dense two-pass scalar softmax over the whole cache — the oracle the flash

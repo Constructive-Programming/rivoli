@@ -103,6 +103,33 @@ unsafe extern "C" {
         partial: *mut f32,
     ) -> i32;
 
+    fn rivoli_embed_i8_row(
+        packed: *const u8,
+        scale: *const f32,
+        token: i32,
+        hidden: i32,
+        x: *mut f32,
+    ) -> i32;
+    fn rivoli_append_kv(
+        latent: *const f32,
+        rope: *const f32,
+        lc: *mut u16,
+        rc: *mut u16,
+        pos: i32,
+        kvl: i32,
+        ropn: i32,
+    ) -> i32;
+    fn rivoli_gather_rope(
+        q: *const f32,
+        qrope: *mut f32,
+        h: i32,
+        qh: i32,
+        nope: i32,
+        ropn: i32,
+    ) -> i32;
+    fn rivoli_vadd(x: *mut f32, y: *const f32, n: i32) -> i32;
+    fn rivoli_argmax(logits: *const f32, n: i32, out_idx: *mut i32, out_val: *mut f32) -> i32;
+
     fn rivoli_gemv_f32(x: *const f32, w: *const f32, o_dim: i32, i_dim: i32, y: *mut f32) -> i32;
     fn rivoli_rmsnorm(x: *const f32, w: *const f32, n: i32, eps: f32, y: *mut f32) -> i32;
     fn rivoli_rope(base: *mut f32, count: i32, stride: i32, seg: i32, pos: i32, theta: f64) -> i32;
@@ -329,6 +356,87 @@ pub unsafe fn launch_gemv_vq(
     // SAFETY: caller's pointer contract.
     let r = unsafe { rivoli_gemv_vq(x, indices, scales, codebook, o_dim as i32, i_dim as i32, y) };
     check(r, "gemv_vq")
+}
+
+/// int8 embedding row lookup: `x[i] = embed[token][i]·scale[token]`.
+///
+/// # Safety
+/// Device pointers live until the next [`device_sync`]: `packed` (`≥(token+1)·hidden`
+/// bytes), `scale` (`≥token+1` f32), `x` (`hidden` f32).
+pub unsafe fn launch_embed_i8_row(
+    packed: *const u8,
+    scale: *const f32,
+    token: usize,
+    hidden: usize,
+    x: *mut f32,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r = unsafe { rivoli_embed_i8_row(packed, scale, token as i32, hidden as i32, x) };
+    check(r, "embed_i8_row")
+}
+
+/// Append one token's latent + roped key to the bf16 KV slabs at row `pos`.
+///
+/// # Safety
+/// Device pointers live until the next [`device_sync`]: `latent` (`kvl` f32), `rope`
+/// (`ropn` f32), `lc`/`rc` the KV slabs (row `pos` in-bounds).
+pub unsafe fn launch_append_kv(
+    latent: *const f32,
+    rope: *const f32,
+    lc: *mut u16,
+    rc: *mut u16,
+    pos: usize,
+    kvl: usize,
+    ropn: usize,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r = unsafe { rivoli_append_kv(latent, rope, lc, rc, pos as i32, kvl as i32, ropn as i32) };
+    check(r, "append_kv")
+}
+
+/// Gather each head's roped query segment: `qrope[head·ropn+d] = q[head·qh+nope+d]`.
+///
+/// # Safety
+/// Device pointers live until the next [`device_sync`]: `q` (`h·qh` f32), `qrope`
+/// (`h·ropn` f32).
+pub unsafe fn launch_gather_rope(
+    q: *const f32,
+    qrope: *mut f32,
+    h: usize,
+    qh: usize,
+    nope: usize,
+    ropn: usize,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r = unsafe { rivoli_gather_rope(q, qrope, h as i32, qh as i32, nope as i32, ropn as i32) };
+    check(r, "gather_rope")
+}
+
+/// Residual add `x[i] += y[i]`.
+///
+/// # Safety
+/// Device pointers `x`, `y` (each `n` f32) live until the next [`device_sync`].
+pub unsafe fn launch_vadd(x: *mut f32, y: *const f32, n: usize) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r = unsafe { rivoli_vadd(x, y, n as i32) };
+    check(r, "vadd")
+}
+
+/// Greedy argmax over `logits[0..n]` → (`out_idx`, `out_val`); lowest index on a
+/// tie, NaN never wins (matches the host fold).
+///
+/// # Safety
+/// Device pointers live until the next [`device_sync`]: `logits` (`n` f32),
+/// `out_idx` (one i32), `out_val` (one f32).
+pub unsafe fn launch_argmax(
+    logits: *const f32,
+    n: usize,
+    out_idx: *mut i32,
+    out_val: *mut f32,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r = unsafe { rivoli_argmax(logits, n as i32, out_idx, out_val) };
+    check(r, "argmax")
 }
 
 /// f32 GEMV `y = W·x` (the MoE router gate).
