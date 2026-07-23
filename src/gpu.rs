@@ -56,8 +56,7 @@ fn f32_le_bytes(v: &[f32]) -> &[u8] {
 /// Host routing: sigmoid the gate logits into `scores`, add the router `bias` into
 /// `choice`, and select the top-`top_k` into `sel`. A free fn taking disjoint slices
 /// so the caller can borrow `bias` out of `&self.pin` while it mutably borrows its
-/// own routing scratch. Used for both the current layer's routing and the
-/// cross-layer L+1 prediction (each with its own scratch triple).
+/// own routing scratch.
 fn route_into(
     gate_logits: &[u8],
     bias: &[f32],
@@ -173,9 +172,6 @@ pub struct GpuEngine<'a> {
     attn_partial: DeviceBuf,
     ctx: DeviceBuf,
     gate_logits: DeviceBuf,
-    // Cross-layer prefetch scratch: L+1's router-gate prediction.
-    pred_xn: DeviceBuf,
-    pred_gl: DeviceBuf,
     // Dense-MLP fp8 SwiGLU scratch (gate/up projections, dense_inter wide).
     mlp_g: DeviceBuf,
     mlp_u: DeviceBuf,
@@ -206,14 +202,7 @@ pub struct GpuEngine<'a> {
     mlps_vq: Vec<MlpVq>,
     descs_vq: Vec<ExpertDescVq>,
     gl_host: Vec<u8>,
-    pgl_host: Vec<u8>,
     argmax_host: Vec<u8>,
-    // Cross-layer prefetch: separate host scratch for the L+1 prediction top-k.
-    pred_scores: Vec<f32>,
-    pred_choice: Vec<f32>,
-    pred_sel: Vec<usize>,
-    prefetch: bool,
-    prefetch_depth: usize,
     /// DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
     #[cfg(feature = "trace")]
     checksum_x: bool,
@@ -312,8 +301,6 @@ impl<'a> GpuEngine<'a> {
             attn_partial: f(crate::hip::attend_scratch_floats(h, kvl))?,
             ctx: f(h * cfg.v_head_dim)?,
             gate_logits: f(cfg.n_experts)?,
-            pred_xn: f(cfg.hidden)?,
-            pred_gl: f(cfg.n_experts)?,
             mlp_g: f(cfg.dense_inter)?,
             mlp_u: f(cfg.dense_inter)?,
             moe_out: f(cfg.hidden)?,
@@ -335,13 +322,7 @@ impl<'a> GpuEngine<'a> {
             mlps_vq: Vec::with_capacity(cfg.top_k),
             descs_vq: Vec::with_capacity(slots),
             gl_host: Vec::with_capacity(cfg.n_experts * 4),
-            pgl_host: Vec::with_capacity(cfg.n_experts * 4),
             argmax_host: Vec::with_capacity(8),
-            pred_scores: vec![0.0; cfg.n_experts],
-            pred_choice: vec![0.0; cfg.n_experts],
-            pred_sel: Vec::with_capacity(cfg.top_k),
-            prefetch: pin.prefetch_enabled(),
-            prefetch_depth: pin.prefetch_depth(),
             #[cfg(feature = "trace")]
             checksum_x: false,
             #[cfg(feature = "trace")]
@@ -374,21 +355,6 @@ impl<'a> GpuEngine<'a> {
     #[cfg(feature = "trace")]
     pub fn set_checksum_x(&mut self, on: bool) {
         self.checksum_x = on;
-    }
-
-    /// Cross-layer prefetch recall: (predicted experts actually selected, predicted).
-    #[cfg(feature = "trace")]
-    pub fn prefetch_recall(&self) -> (u64, u64) {
-        (self.pin.pred_correct, self.pin.pred_total)
-    }
-    /// Where routed experts' bytes came from (loaded/preloading/cold/pf_evict_*).
-    #[cfg(feature = "trace")]
-    pub fn source_split(&self) -> (u64, u64, u64, u64, u64) {
-        self.pin.source_split()
-    }
-    #[cfg(feature = "trace")]
-    pub fn prefetch_wait_ms(&self) -> f64 {
-        self.pin.prefetch_wait_ns as f64 / 1e6
     }
 
     /// DSA/MISA row selection for one full/shared layer at `pos`, returning the attend
@@ -783,44 +749,9 @@ impl<'a> GpuEngine<'a> {
                     )?;
                 }
             } else {
-                // Cross-layer prefetch: if the NEXT layer is also MoE, predict its
-                // routed experts from L's post-attn residual `xp` (a cheap proxy for
-                // L+1's input). The router gate + input_ln are resident, so this is a
-                // small norm + gemv folded under the same routing sync below.
-                let predict = self.prefetch && l + 1 < cfg.n_layers && l + 1 >= cfg.dense_layers;
-                let next_pred = if predict {
-                    let nl = &self.pin.layers[l + 1];
-                    if let LayerMlp::Moe { gate_w, .. } = &nl.mlp {
-                        Some((nl.input_ln, *gate_w))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
                 // Router gate on device, then read logits to route on host.
                 // SAFETY: gate_w resident F32; glp device scratch.
                 unsafe { launch_gemv_f32(xnp, gate_w, cfg.n_experts, hidden, glp)? };
-                if let Some((next_ln, next_gate)) = next_pred {
-                    // SAFETY: xp is the live post-attn residual; next_ln/next_gate are
-                    // resident L+1 weights; pred_xn/pred_gl device scratch, same stream.
-                    unsafe {
-                        launch_rmsnorm(
-                            xp,
-                            next_ln,
-                            hidden,
-                            eps,
-                            self.pred_xn.ptr_mut() as *mut f32,
-                        )?;
-                        launch_gemv_f32(
-                            self.pred_xn.ptr() as *const f32,
-                            next_gate,
-                            cfg.n_experts,
-                            hidden,
-                            self.pred_gl.ptr_mut() as *mut f32,
-                        )?;
-                    }
-                }
                 #[cfg(feature = "trace")]
                 let t = std::time::Instant::now();
                 // Read the gate logits, route with `bias` borrowed straight out of
@@ -834,17 +765,6 @@ impl<'a> GpuEngine<'a> {
                     &mut self.choice,
                     &mut self.sel,
                 );
-                if next_pred.is_some() {
-                    self.pred_gl.copy_out_into(&mut self.pgl_host)?;
-                    route_into(
-                        &self.pgl_host,
-                        self.pin.moe_bias(l + 1),
-                        cfg.top_k,
-                        &mut self.pred_scores,
-                        &mut self.pred_choice,
-                        &mut self.pred_sel,
-                    );
-                }
                 #[cfg(feature = "trace")]
                 {
                     self.prof.route_ns += t.elapsed().as_nanos();
@@ -862,13 +782,6 @@ impl<'a> GpuEngine<'a> {
                 {
                     self.prof.fetch_ns += t.elapsed().as_nanos();
                     self.prof.fetch_n += self.pin.misses - miss0;
-                }
-                // Submit L+1's predicted-expert reads NOW (non-blocking) while this
-                // layer's demand reads are still in flight, so both batches sit in the
-                // device queue together. Reaped by `submit_layer(l+1)`'s prefetch drain.
-                if next_pred.is_some() {
-                    let n = self.prefetch_depth.min(self.pred_sel.len());
-                    self.pin.prefetch_layer(l + 1, &self.pred_sel[..n])?;
                 }
                 // Routed weights: sigmoid score, sum-normalized over the routed picks,
                 // then scaled. The VQ shared expert (weight 1.0) folds into the batch.

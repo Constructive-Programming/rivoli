@@ -1,16 +1,13 @@
 //! Offline cache-policy A/B and 2Q Kin/Kout sweep. Replays a routed-expert access
 //! trace (captured with `rivoli --trace`) through LRU / 2Q / ARC at a chosen slot
-//! count and prints the `loaded / preloading / cold` split. Pure CPU, milliseconds:
-//! the whole point is to compare policies without a full GPU decode run.
+//! count and prints the residency split. Pure CPU, milliseconds: the whole point is
+//! to compare policies without a full GPU decode run.
 //!
-//! **Prefetch fidelity.** The live engine's residency comes mostly from *prefetch
-//! admission*: `prefetch_layer` cold-admits L+1's predicted experts into 2Q's A1in
-//! probation, and their first real `get` promotes them into the protected Am set.
-//! A trace therefore only replays faithfully if it records those predictions (the
-//! ` | ` tail then the predicted keys, written whenever prefetch is on). A
-//! `--no-prefetch` capture omits them — for those this tool prints a warning and its
-//! numbers describe a NO-PREFETCH engine, which measures materially lower residency.
-//! Do not tune Kin/Kout against a prediction-less trace.
+//! The engine no longer prefetches (an A/B showed it bought zero throughput on the
+//! bandwidth-bound VQ path — 78.3% vs 76.9% hit, identical tok/s), so traces carry
+//! no predictions and `preloading` is always 0; `loaded` is the residency metric.
+//! The `preloading` column and the prediction (` | `) parsing are retained only so
+//! historical prefetch-era traces still replay.
 //!
 //! usage: replay <trace> <n_slots> [--kin <pct>] [--kout <pct>] [--sweep]
 
@@ -118,20 +115,15 @@ fn main() -> Result<()> {
         "trace {trace_path}: {} layers, {accesses} accesses, {uniq} unique experts, cap={cap}",
         trace.len()
     );
-    if predictions == 0 {
-        println!(
-            "\n!! WARNING: this trace records NO prefetch predictions, so `insert_cold` is\n\
-             !! never exercised and 2Q's probation split has nothing to promote from.\n\
-             !! These numbers describe a NO-PREFETCH engine, not the shipping one. Do NOT\n\
-             !! tune Kin/Kout against them — recapture with `rivoli <model> -bench 512\n\
-             !! --trace <path>` (prefetch is on by default)."
-        );
-    } else {
+    if predictions > 0 {
+        // A historical prefetch-era trace: model the admission it recorded.
         println!(
             "prefetch: {predictions} predictions recorded ({:.2}/layer) — insert_cold modelled",
             predictions as f64 / trace.len().max(1) as f64
         );
     }
+    // A prediction-less trace (the engine no longer prefetches) just means preloading
+    // is 0 and `loaded` is the residency figure — no warning; that is now the norm.
 
     // No seed: the new artifact carries no `.coli_usage` frequency profile, so every
     // policy starts cold (online priming is what the trace measures anyway).

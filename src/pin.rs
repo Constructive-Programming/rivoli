@@ -164,14 +164,6 @@ pub struct Pin<'a> {
     /// io_uring O_DIRECT reader — a layer's cold misses submit as one queue-depth
     /// batch straight into their pool slots.
     stream: Streamer,
-    /// Cross-layer prefetch (`--prefetch`): a SECOND io_uring ring, dedicated to the
-    /// predicted next-layer experts. `Some` iff prefetch is enabled.
-    prefetch_stream: Option<Streamer>,
-    /// Max predicted experts prefetched per layer (`--prefetch-depth`).
-    prefetch_depth: usize,
-    /// An outstanding prefetch batch is in flight and must be drained by the next
-    /// `submit_layer` before its slots are read.
-    prefetch_pending: bool,
     /// Slots the demand ring is currently writing (between `submit_layer` and
     /// `await_layer`). Load-bearing in release: `submit_layer` consults it to refuse
     /// reusing a slot whose read is still outstanding (the silent-corruption guard).
@@ -179,20 +171,11 @@ pub struct Pin<'a> {
     /// How many times a batch reused a slot whose read was still outstanding — each
     /// one would have been a silent weight corruption before the guard.
     pub slot_collisions: u64,
-    /// The predicted expert set submitted for `predicted_layer` (recall accounting).
-    predicted: Vec<usize>,
-    predicted_layer: usize,
     pub hits: u64,
     pub misses: u64,
-    #[cfg(feature = "trace")]
-    pub pred_total: u64,
-    #[cfg(feature = "trace")]
-    pub pred_correct: u64,
-    #[cfg(feature = "trace")]
-    pub prefetch_wait_ns: u128,
     /// Optional access-trace sink (`--trace`): one line per resolved MoE layer — the
-    /// `(layer,expert)` keys looked up, in access order, then ` | ` and the keys the
-    /// PREVIOUS layer prefetched for this one. Feeds the offline `replay` simulator.
+    /// `(layer,expert)` keys looked up, in access order. Feeds the offline `replay`
+    /// simulator.
     trace: Option<std::io::BufWriter<std::fs::File>>,
 }
 
@@ -403,18 +386,6 @@ struct Pool {
     #[cfg(debug_assertions)]
     key_of: Vec<Option<u32>>,
     free: Vec<usize>,
-    #[cfg(feature = "trace")]
-    pending_pf: std::collections::HashSet<u32>,
-    #[cfg(feature = "trace")]
-    pub hit_loaded: u64,
-    #[cfg(feature = "trace")]
-    pub hit_preload: u64,
-    #[cfg(feature = "trace")]
-    pub pf_evict_unused: u64,
-    #[cfg(feature = "trace")]
-    evicted_pf: std::collections::HashSet<u32>,
-    #[cfg(feature = "trace")]
-    pub pf_evict_then_missed: u64,
 }
 
 impl Pool {
@@ -426,18 +397,6 @@ impl Pool {
             #[cfg(debug_assertions)]
             key_of: vec![None; n],
             free: (0..n).rev().collect(), // pop() hands out 0,1,2,...
-            #[cfg(feature = "trace")]
-            pending_pf: std::collections::HashSet::new(),
-            #[cfg(feature = "trace")]
-            hit_loaded: 0,
-            #[cfg(feature = "trace")]
-            hit_preload: 0,
-            #[cfg(feature = "trace")]
-            pf_evict_unused: 0,
-            #[cfg(feature = "trace")]
-            evicted_pf: std::collections::HashSet::new(),
-            #[cfg(feature = "trace")]
-            pf_evict_then_missed: 0,
         })
     }
 
@@ -447,12 +406,6 @@ impl Pool {
             let slot = self.slot_of[&key];
             #[cfg(debug_assertions)]
             debug_assert_eq!(self.key_of[slot], Some(key), "hit slot holds wrong key");
-            #[cfg(feature = "trace")]
-            if self.pending_pf.remove(&key) {
-                self.hit_preload += 1;
-            } else {
-                self.hit_loaded += 1;
-            }
             Some(slot)
         } else {
             None
@@ -462,34 +415,14 @@ impl Pool {
     /// Allocate a slot for a NEW `key` (miss): reuse the policy-evicted key's slot,
     /// else a free slot. The caller then fills the slot.
     fn alloc(&mut self, key: u32) -> Result<usize> {
-        #[cfg(feature = "trace")]
-        if self.evicted_pf.remove(&key) {
-            self.pf_evict_then_missed += 1;
-        }
         let evicted = self.policy.insert(key);
         let slot = self.reuse(evicted)?;
         self.bind(key, slot);
         Ok(slot)
     }
 
-    /// Like [`alloc`], but for a PREFETCHED key: the policy parks it at the
-    /// cold/probation end (`insert_cold`) so an unused prediction is evicted before
-    /// any genuinely-accessed expert. A later real selection promotes it normally.
-    fn alloc_cold(&mut self, key: u32) -> Result<usize> {
-        let evicted = self.policy.insert_cold(key);
-        let slot = self.reuse(evicted)?;
-        self.bind(key, slot);
-        #[cfg(feature = "trace")]
-        self.pending_pf.insert(key);
-        Ok(slot)
-    }
-
     fn protect(&mut self, key: u32) {
         self.policy.protect(key);
-    }
-
-    fn contains(&self, key: u32) -> bool {
-        self.policy.contains(key)
     }
 
     fn reuse(&mut self, evicted: Option<u32>) -> Result<usize> {
@@ -499,11 +432,6 @@ impl Pool {
                     !self.policy.contains(ev),
                     "evicted key {ev} still resident (identity drift)"
                 );
-                #[cfg(feature = "trace")]
-                if self.pending_pf.remove(&ev) {
-                    self.pf_evict_unused += 1;
-                    self.evicted_pf.insert(ev);
-                }
                 self.slot_of
                     .remove(&ev)
                     .context("evicted key had no slot (pool/policy drift)")
@@ -521,8 +449,6 @@ impl Pool {
             self.key_of[slot] = Some(key);
         }
         self.slot_of.insert(key, slot);
-        #[cfg(feature = "trace")]
-        self.evicted_pf.remove(&key);
         debug_assert!(self.policy.contains(key), "inserted key {key} not resident");
         debug_assert_eq!(
             self.slot_of.len(),
@@ -546,8 +472,6 @@ impl<'a> Pin<'a> {
         trace_path: Option<&str>,
         cache_policy: &str,
         two_q: cache::TwoQSplit,
-        prefetch: bool,
-        prefetch_depth: usize,
         want_indexer: bool,
     ) -> Result<Self> {
         let (free, _total) = mem_info()?;
@@ -679,10 +603,7 @@ impl<'a> Pin<'a> {
         let vq_off = vq_slot_offsets(cfg.hidden, cfg.moe_inter);
         let moe_table = build_moe_table(&vq, cfg)?;
         let budget = capacity.saturating_sub(tier_cap);
-        // Floor the pool at `top_k + prefetch_depth` so cross-layer prefetch's cold
-        // evictions are provably disjoint from the current layer's live experts.
-        let slot_floor = cfg.top_k + if prefetch { prefetch_depth } else { 0 };
-        let n_slots = (budget / expert_slot).max(slot_floor);
+        let n_slots = (budget / expert_slot).max(cfg.top_k);
         let lru_pool = VmmBuf::new(n_slots * expert_slot)?; // ONE slab
         tracing::info!(
             "routed pool [{cache_policy}]: {n_slots} slots ({:.1} GiB) + {:.1} GiB always-resident",
@@ -690,31 +611,17 @@ impl<'a> Pin<'a> {
             tier.used() as f64 / (1u64 << 30) as f64,
         );
         let pool = Pool::new(n_slots, cache_policy, two_q)?;
-        // Ring sized for one layer's worst case: top_k demand reads (1/expert), plus
-        // margin for the prefetch depth. One read per expert (VQ block), so far
-        // smaller than int4's six-read coalescing.
-        let ring = (cfg.top_k + prefetch_depth + 4).next_power_of_two();
+        // Ring sized for one layer's worst case: top_k demand reads (1/expert). One
+        // read per expert (VQ block), so far smaller than int4's six-read coalescing.
+        let ring = (cfg.top_k + 4).next_power_of_two();
         ensure!(
-            cfg.top_k <= ring && prefetch_depth <= ring,
-            "io_uring ring {ring} too small: top_k {} / prefetch_depth {prefetch_depth}",
+            cfg.top_k <= ring,
+            "io_uring ring {ring} too small for top_k {}",
             cfg.top_k,
         );
         // Bounce span = the whole expert block (one read).
         let span = slot_span(vq_expert_bytes(cfg.hidden, cfg.moe_inter));
         let stream = Streamer::new(ring as u32, span, bounce, Sqpoll::Own)?;
-        let prefetch_stream = if prefetch {
-            tracing::info!(
-                "cross-layer expert prefetch ENABLED (single-layer lookahead, depth {prefetch_depth})"
-            );
-            Some(Streamer::new(
-                ring as u32,
-                span,
-                bounce,
-                Sqpoll::SharedWith(&stream),
-            )?)
-        } else {
-            None
-        };
 
         Ok(Self {
             cfg,
@@ -732,21 +639,10 @@ impl<'a> Pin<'a> {
             vq_off,
             pool,
             stream,
-            prefetch_stream,
-            prefetch_depth,
-            prefetch_pending: false,
             inflight: Vec::new(),
             slot_collisions: 0,
-            predicted: Vec::new(),
-            predicted_layer: usize::MAX,
             hits: 0,
             misses: 0,
-            #[cfg(feature = "trace")]
-            pred_total: 0,
-            #[cfg(feature = "trace")]
-            pred_correct: 0,
-            #[cfg(feature = "trace")]
-            prefetch_wait_ns: 0,
             trace: trace_path
                 .map(|p| -> Result<_> {
                     Ok(std::io::BufWriter::new(
@@ -767,23 +663,9 @@ impl<'a> Pin<'a> {
         self.codebooks
     }
 
-    /// `(loaded, preloading, cold, pf_evict_unused, pf_evict_then_missed)` — where
-    /// routed experts' bytes came from. `trace` builds only.
-    #[cfg(feature = "trace")]
-    pub fn source_split(&self) -> (u64, u64, u64, u64, u64) {
-        (
-            self.pool.hit_loaded,
-            self.pool.hit_preload,
-            self.misses,
-            self.pool.pf_evict_unused,
-            self.pool.pf_evict_then_missed,
-        )
-    }
-
-    /// The format-agnostic streaming half of `submit_layer`: prefetch-drain barrier,
-    /// trace sink, phase 1a (hit+protect), phase 1b (alloc + slot-collision guard +
-    /// `stream_expert`), phase 2 (`submit`). Returns the per-`sel` resolved slots +
-    /// the `moe_table` row base.
+    /// The format-agnostic streaming half of `submit_layer`: trace sink, phase 1a
+    /// (hit+protect), phase 1b (alloc + slot-collision guard + `stream_expert`), phase
+    /// 2 (`submit`). Returns the per-`sel` resolved slots + the `moe_table` row base.
     fn submit_spine(
         &mut self,
         layer: usize,
@@ -796,34 +678,7 @@ impl<'a> Pin<'a> {
             "submit_layer: {} experts exceeds the 32-slot scratch",
             sel.len()
         );
-        // Cross-layer prefetch consume: an outstanding prefetch batch (submitted
-        // during the PREVIOUS layer's compute) targets THIS layer. Wait for it so
-        // every predicted-correct expert is resident BEFORE phase 1a's hit scan.
-        // This drain CANNOT be deferred: it is the barrier that makes phase 1b's
-        // `pool.alloc` unconditionally safe (a prefetched key sits at the policy's
-        // cold end and is exactly what a demand miss's `insert` may evict; if its
-        // read were still in flight, phase 1b would queue a second read into the same
-        // slot — silent corruption on out-of-order completion).
-        if self.prefetch_pending {
-            if let Some(s) = self.prefetch_stream.as_mut() {
-                #[cfg(feature = "trace")]
-                let t = std::time::Instant::now();
-                s.drain()?;
-                #[cfg(feature = "trace")]
-                {
-                    self.prefetch_wait_ns += t.elapsed().as_nanos();
-                }
-            }
-            self.prefetch_pending = false;
-            #[cfg(feature = "trace")]
-            if self.predicted_layer == layer {
-                let hit = self.predicted.iter().filter(|e| sel.contains(e)).count();
-                self.pred_total += self.predicted.len() as u64;
-                self.pred_correct += hit as u64;
-            }
-        }
-        // Trace sink (--trace): the keys this layer looks up, access order, then the
-        // set the previous layer prefetched for this one after a `|` separator.
+        // Trace sink (--trace): the keys this layer looks up, in access order.
         if let Some(w) = &mut self.trace {
             use std::io::Write;
             for (j, &e) in sel.iter().enumerate() {
@@ -831,12 +686,6 @@ impl<'a> Pin<'a> {
                     write!(w, " ").context("write trace")?;
                 }
                 write!(w, "{}", expert_key(layer, e)).context("write trace")?;
-            }
-            if self.predicted_layer == layer && !self.predicted.is_empty() {
-                write!(w, "|").context("write trace")?;
-                for &e in &self.predicted {
-                    write!(w, " {}", expert_key(layer, e)).context("write trace")?;
-                }
             }
             writeln!(w).context("write trace")?;
         }
@@ -880,8 +729,8 @@ impl<'a> Pin<'a> {
         }
         // Phase 2: hand the whole batch to the kernel NOW, without waiting — with the
         // ring's poller this puts all the layer's reads in the device queue at once
-        // and returns so the caller's descriptor build / uploads / prefetch submit run
-        // while the NVMe works. The matching join is `await_layer`.
+        // and returns so the caller's descriptor build + uploads run while the NVMe
+        // works. The matching join is `await_layer`.
         self.stream.submit()?;
         Ok((slots, sparse))
     }
@@ -936,68 +785,6 @@ impl<'a> Pin<'a> {
         self.stream.drain()?;
         #[cfg(debug_assertions)]
         self.inflight.clear();
-        Ok(())
-    }
-
-    /// Is cross-layer prefetch enabled (`--prefetch`)?
-    pub fn prefetch_enabled(&self) -> bool {
-        self.prefetch_stream.is_some()
-    }
-
-    /// Max predicted experts to prefetch per layer (`--prefetch-depth`).
-    pub fn prefetch_depth(&self) -> usize {
-        self.prefetch_depth
-    }
-
-    /// Submit io_uring reads for `pred` — the predicted routed experts of `layer`
-    /// (the NEXT MoE layer) — on the prefetch ring, NON-blocking. Already-resident
-    /// predictions are skipped; the rest are `alloc_cold`-bound to fresh slots and
-    /// their reads submitted so they run during the current layer's GPU compute. The
-    /// batch is drained by the matching `submit_layer(layer)`.
-    ///
-    /// Correctness: `alloc_cold` evicts only from the policy's cold end, and the
-    /// current layer's `top_k` experts are the most-recently-touched (protected).
-    /// With `n_slots >= top_k + prefetch_depth` (enforced in `build`), the cold
-    /// evictions here can never reuse a slot in the current layer's live set, nor one
-    /// an in-flight demand read is writing (debug-asserted against `inflight`).
-    pub fn prefetch_layer(&mut self, layer: usize, pred: &[usize]) -> Result<()> {
-        if self.prefetch_stream.is_none() {
-            return Ok(());
-        }
-        let cfg = self.cfg;
-        let sparse = (layer - cfg.dense_layers) * cfg.n_experts; // moe_table row base
-        self.predicted.clear();
-        self.predicted.extend_from_slice(pred);
-        self.predicted_layer = layer;
-        let slab = self.lru_pool.ptr_mut();
-        let table = &self.moe_table;
-        let expert_slot = self.expert_slot;
-        let stream = match self.prefetch_stream.as_mut() {
-            Some(s) => s,
-            None => return Ok(()),
-        };
-        let pool = &mut self.pool;
-        #[cfg(debug_assertions)]
-        let inflight = &self.inflight;
-        let mut queued = 0usize;
-        for &e in pred {
-            let key = expert_key(layer, e);
-            if pool.contains(key) {
-                continue; // already resident — no fetch needed
-            }
-            let slot = pool.alloc_cold(key)?;
-            #[cfg(debug_assertions)]
-            debug_assert!(
-                !inflight.contains(&slot),
-                "prefetch slot {slot} collides with an in-flight demand read"
-            );
-            stream_expert(stream, table[sparse + e], slab, slot, expert_slot)?;
-            queued += 1;
-        }
-        if queued > 0 {
-            stream.submit()?;
-            self.prefetch_pending = true;
-        }
         Ok(())
     }
 }

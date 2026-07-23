@@ -9,13 +9,11 @@ use anyhow::{Context, Result, bail};
 use rivoli::config::Config;
 use tracing::info;
 
-/// CLI: `rivoli <model-dir> [-bench <tokens>] [flags]`. Defaults are the winning
-/// cell of the 512-token grid: `--cache-policy 2q` + prefetch on at depth 1 (a
-/// sharp joint optimum, not two independent choices). `--no-prefetch` /
-/// `--cache-policy lru|arc` opt out. `--direct-vmm-dma` forces raw DMA over the
-/// default pinned-host bounce; `--trace <path>` dumps the routed-expert access
-/// trace for the offline `replay` sim; `--prompt <text>` overrides the bench
-/// prompt; `--max-mem <GiB>` caps the device pool budget.
+/// CLI: `rivoli <model-dir> [-bench <tokens>] [flags]`. `--cache-policy lru|2q|arc`
+/// (default 2q) picks the eviction policy; `--direct-vmm-dma` forces raw DMA over the
+/// default pinned-host bounce; `--trace <path>` dumps the routed-expert access trace
+/// for the offline `replay` sim; `--prompt <text>` overrides the bench prompt;
+/// `--max-mem <GiB>` caps the device pool budget.
 struct Args {
     model: String,
     bench: Option<usize>,
@@ -25,8 +23,6 @@ struct Args {
     cache_policy: String,
     two_q_kin: u32,
     two_q_kout: u32,
-    prefetch: bool,
-    prefetch_depth: usize,
     max_mem: Option<u64>,
     /// Attention mode (`--attn auto|dense|streaming|dsa|misa`). `auto` picks `dsa`
     /// when the artifact carries indexer weights, else `dense`.
@@ -42,9 +38,8 @@ struct Args {
 fn parse_args() -> Result<Args> {
     const USAGE: &str = "usage: rivoli <model-dir> [-bench <tokens>] [--direct-vmm-dma] \
          [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc] [--2q-kin <pct>] \
-         [--2q-kout <pct>] [--no-prefetch] [--prefetch-depth <n>] [--max-mem <GiB>] \
-         [--os-reserve <GiB>] [--attn auto|dense|streaming|dsa|misa] [--sinks <n>] \
-         [--window <n>] [--misa-heads <n>]";
+         [--2q-kout <pct>] [--max-mem <GiB>] [--os-reserve <GiB>] \
+         [--attn auto|dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>]";
     let mut model = None;
     let mut a = Args {
         model: String::new(),
@@ -55,8 +50,6 @@ fn parse_args() -> Result<Args> {
         cache_policy: "2q".to_string(),
         two_q_kin: rivoli::cache::TwoQSplit::default().kin_pct(),
         two_q_kout: rivoli::cache::TwoQSplit::default().kout_pct(),
-        prefetch: true,
-        prefetch_depth: 1,
         max_mem: None,
         attn: "auto".to_string(),
         sinks: 4,
@@ -91,14 +84,6 @@ fn parse_args() -> Result<Args> {
                     .context("--2q-kout requires a percentage")?
                     .parse()
                     .context("--2q-kout takes an integer percentage")?;
-            }
-            "--no-prefetch" => a.prefetch = false,
-            "--prefetch-depth" => {
-                a.prefetch_depth = args
-                    .next()
-                    .context("--prefetch-depth requires an integer")?
-                    .parse()
-                    .context("--prefetch-depth takes an integer")?;
             }
             "--max-mem" => {
                 let gib: u64 = args
@@ -208,8 +193,6 @@ fn main() -> Result<()> {
         a.prompt,
         a.cache_policy,
         rivoli::cache::TwoQSplit::new(a.two_q_kin, a.two_q_kout)?,
-        a.prefetch,
-        a.prefetch_depth,
         a.max_mem,
         attn,
     )?;
@@ -313,8 +296,6 @@ fn main() -> Result<()> {
             cfg.trace.as_deref(),
             &cfg.cache_policy,
             cfg.two_q,
-            cfg.prefetch,
-            cfg.prefetch_depth,
             want_indexer,
         )?;
         info!("pin built in {:.1}s", t.elapsed().as_secs_f64());

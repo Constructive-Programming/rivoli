@@ -57,9 +57,7 @@ pub struct Config {
     /// Override the fixed bench prompt (`--prompt`), for capturing routing traces of
     /// diverse inputs. None = the default prompt.
     pub prompt: Option<String>,
-    /// Routed-expert eviction policy (`--cache-policy` lru|2q|arc). Default
-    /// "2q". 2Q/ARC add the scan resistance that matters once prefetch injects a
-    /// misprediction stream.
+    /// Routed-expert eviction policy (`--cache-policy` lru|2q|arc). Default "2q".
     pub cache_policy: String,
     /// 2Q's A1in/A1out split (`--2q-kin` / `--2q-kout`, percentages of pool capacity).
     /// Ignored by `lru`/`arc`. Unset = [`crate::cache::TwoQSplit::default`].
@@ -70,15 +68,6 @@ pub struct Config {
     pub checksum_layer: Option<usize>,
     /// DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
     pub checksum_x: bool,
-    /// Cross-layer expert prefetch (`--prefetch`). Default false. When on, each MoE
-    /// layer predicts the NEXT MoE layer's routed experts from its post-attn residual
-    /// and submits their cold reads on a second io_uring ring, overlapping the fetch
-    /// with this layer's GPU compute.
-    pub prefetch: bool,
-    /// Max predicted experts prefetched per layer (`--prefetch-depth`, top-N by router
-    /// score). NVMe is bandwidth-bound, so only the idle-during-compute window is
-    /// exploitable — a small N (default 2). Ignored unless `prefetch`.
-    pub prefetch_depth: usize,
     /// Feed pool (tokio workers + pread tasks). Physical cores ÷ 2 — the measured
     /// optimum; the SMT-logical default is the proven pathology. The CPU never
     /// computes experts — it routes, samples, and keeps the GPU fed.
@@ -124,8 +113,6 @@ impl Config {
         prompt: Option<String>,
         cache_policy: String,
         two_q: crate::cache::TwoQSplit,
-        prefetch: bool,
-        prefetch_depth: usize,
         max_mem: Option<u64>,
         attn: crate::attn::AttnMode,
     ) -> Result<Self> {
@@ -152,8 +139,6 @@ impl Config {
             two_q,
             checksum_layer: None,
             checksum_x: false,
-            prefetch,
-            prefetch_depth,
             threads,
             max_mem,
             attn,
@@ -166,7 +151,7 @@ impl fmt::Display for Config {
         const GIB: f64 = (1u64 << 30) as f64;
         write!(
             f,
-            "model={} bench={:?} attn={:?} direct_vmm_dma={} cache_policy={} 2q_kin={}% 2q_kout={}% prefetch={} prefetch_depth={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={} threads={}",
+            "model={} bench={:?} attn={:?} direct_vmm_dma={} cache_policy={} 2q_kin={}% 2q_kout={}% trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={} threads={}",
             self.model,
             self.bench,
             self.attn,
@@ -174,8 +159,6 @@ impl fmt::Display for Config {
             self.cache_policy,
             self.two_q.kin_pct(),
             self.two_q.kout_pct(),
-            self.prefetch,
-            self.prefetch_depth,
             self.trace,
             self.prompt,
             os_reserve() as f64 / GIB,
