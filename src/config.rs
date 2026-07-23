@@ -87,10 +87,6 @@ pub struct Config {
     /// all safe free memory (`free − OS_RESERVE`); `Some(n)` caps lower. Bigger = more
     /// resident experts = higher hit rate on this cold-miss-fetch-bound decode.
     pub max_mem: Option<u64>,
-    /// Cold-expert read path (`--direct-io`). true = O_DIRECT (bypass the page cache,
-    /// DMA straight from NVMe), false (default) = buffered. Only selects the fd; the
-    /// queue/drain/bounce path is byte-identical, so decode is bit-identical either way.
-    pub direct_io: bool,
 }
 
 fn mem_available() -> Result<u64> {
@@ -127,7 +123,6 @@ impl Config {
         prefetch: bool,
         prefetch_depth: usize,
         max_mem: Option<u64>,
-        direct_io: bool,
     ) -> Result<Self> {
         let avail = mem_available()?;
         let reserve = os_reserve();
@@ -156,7 +151,6 @@ impl Config {
             prefetch_depth,
             threads,
             max_mem,
-            direct_io,
         })
     }
 }
@@ -166,11 +160,10 @@ impl fmt::Display for Config {
         const GIB: f64 = (1u64 << 30) as f64;
         write!(
             f,
-            "model={} bench={:?} direct_vmm_dma={} direct_io={} cache_policy={} 2q_kin={}% 2q_kout={}% prefetch={} prefetch_depth={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={} threads={}",
+            "model={} bench={:?} direct_vmm_dma={} cache_policy={} 2q_kin={}% 2q_kout={}% prefetch={} prefetch_depth={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={} threads={}",
             self.model,
             self.bench,
             self.direct_vmm_dma,
-            self.direct_io,
             self.cache_policy,
             self.two_q.kin_pct(),
             self.two_q.kout_pct(),

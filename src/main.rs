@@ -28,7 +28,6 @@ struct Args {
     prefetch: bool,
     prefetch_depth: usize,
     max_mem: Option<u64>,
-    direct_io: bool,
     /// DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
     #[cfg(feature = "trace")]
     checksum_x: bool,
@@ -38,7 +37,7 @@ fn parse_args() -> Result<Args> {
     const USAGE: &str = "usage: rivoli <model-dir> [-bench <tokens>] [--direct-vmm-dma] \
          [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc] [--2q-kin <pct>] \
          [--2q-kout <pct>] [--no-prefetch] [--prefetch-depth <n>] [--max-mem <GiB>] \
-         [--buffered-io] [--os-reserve <GiB>]";
+         [--os-reserve <GiB>]";
     let mut model = None;
     let mut a = Args {
         model: String::new(),
@@ -52,7 +51,6 @@ fn parse_args() -> Result<Args> {
         prefetch: true,
         prefetch_depth: 1,
         max_mem: None,
-        direct_io: true,
         #[cfg(feature = "trace")]
         checksum_x: false,
     };
@@ -102,7 +100,6 @@ fn parse_args() -> Result<Args> {
                 }
                 a.max_mem = Some(gib << 30);
             }
-            "--buffered-io" => a.direct_io = false,
             "--os-reserve" => {
                 let gib: u64 = args
                     .next()
@@ -141,7 +138,6 @@ fn main() -> Result<()> {
         a.prefetch,
         a.prefetch_depth,
         a.max_mem,
-        a.direct_io,
     )?;
     #[cfg(feature = "trace")]
     {
