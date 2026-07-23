@@ -6,8 +6,38 @@
 
 use anyhow::{Result, bail};
 
+/// VQ-int3 expert descriptor (mirrors `struct ExpertDescVq` in moe.hip): per
+/// projection the packed 12-bit indices + bf16 group scales. The 3 per-projection
+/// codebooks are shared across all experts and passed to [`launch_moe_vq`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ExpertDescVq {
+    pub gate_indices: *const u8,
+    pub gate_scales: *const u16,
+    pub up_indices: *const u8,
+    pub up_scales: *const u16,
+    pub down_indices: *const u8,
+    pub down_scales: *const u16,
+}
+
 unsafe extern "C" {
     fn rivoli_device_sync() -> i32;
+
+    #[allow(clippy::too_many_arguments)]
+    fn rivoli_moe_experts_vq(
+        x: *const f32,
+        hidden: i32,
+        inter: i32,
+        e: i32,
+        descs: *const ExpertDescVq,
+        gate_cb: *const f32,
+        up_cb: *const f32,
+        down_cb: *const f32,
+        wexpert: *const f32,
+        h: *mut f32,
+        partial: *mut f32,
+        out: *mut f32,
+    ) -> i32;
 
     fn rivoli_gemv_fp8(
         x: *const f32,
@@ -56,6 +86,49 @@ fn check(r: i32, name: &str) -> Result<()> {
 pub fn device_sync() -> Result<()> {
     // SAFETY: hipDeviceSynchronize, no pointers.
     check(unsafe { rivoli_device_sync() }, "device_sync")
+}
+
+/// Launch a fused VQ-int3 MoE expert batch: `out += Σ_e w[e]·down(silu(gate·x)⊙up·x)`.
+/// gate/up/down decode against `gate_cb`/`up_cb`/`down_cb`. Routed + shared experts
+/// fold into one call (shared appended, weight 1.0).
+///
+/// # Safety
+/// Async, device pointers live until the next [`device_sync`]. `descs` ≥ `e`
+/// `ExpertDescVq`; `wexpert` `e` f32; `h` ≥ `e·inter` f32; `partial` `e·hidden` f32;
+/// `out` `hidden` f32; each codebook `VQ_K·VQ_DIM` f32.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_moe_vq(
+    x: *const f32,
+    hidden: usize,
+    inter: usize,
+    e: usize,
+    descs: *const ExpertDescVq,
+    gate_cb: *const f32,
+    up_cb: *const f32,
+    down_cb: *const f32,
+    wexpert: *const f32,
+    h: *mut f32,
+    partial: *mut f32,
+    out: *mut f32,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r = unsafe {
+        rivoli_moe_experts_vq(
+            x,
+            hidden as i32,
+            inter as i32,
+            e as i32,
+            descs,
+            gate_cb,
+            up_cb,
+            down_cb,
+            wexpert,
+            h,
+            partial,
+            out,
+        )
+    };
+    check(r, "moe_vq")
 }
 
 /// fp8-e4m3 block-scaled GEMV `y = W·x` (attention/dense projections).

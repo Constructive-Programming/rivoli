@@ -3,8 +3,8 @@
 #![allow(clippy::expect_used)]
 
 use rivoli::device::DeviceBuf;
-use rivoli::hip::{device_sync, launch_gemv_fp8, launch_gemv_vq};
-use rivoli::math::f32_to_e4m3;
+use rivoli::hip::{ExpertDescVq, device_sync, launch_gemv_fp8, launch_gemv_vq, launch_moe_vq};
+use rivoli::math::{f32_to_e4m3, silu};
 use rivoli::quant::{VQ_DIM, VQ_K, matvec_fp8, matvec_vq, quant_vq};
 
 fn f32b(v: &[f32]) -> Vec<u8> {
@@ -113,4 +113,120 @@ fn gemv_vq_matches_oracle() {
     }
     device_sync().expect("sync");
     assert_close(&want, &f32v(&yb.copy_out().expect("out")), "gemv_vq");
+}
+
+/// Fused VQ MoE (moe_gateup_vq → moe_down_vq → moe_reduce), 3 per-projection
+/// codebooks, vs a matvec_vq+silu reference on the same quantized bytes.
+#[test]
+fn moe_vq_matches_reference() {
+    use rivoli::quant::{vq_expert_layout, vq_groups, vq_row_bytes};
+    let mut r = Lcg(0x33);
+    let (hidden, inter, e) = (128usize, 64usize, 3usize); // multi-group hidden, one-group inter
+    // 3 codebooks
+    let cbs: [Vec<f32>; 3] = std::array::from_fn(|_| (0..VQ_K * VQ_DIM).map(|_| r.f()).collect());
+    let x: Vec<f32> = (0..hidden).map(|_| r.f()).collect();
+    let w: Vec<f32> = (0..e).map(|_| r.f()).collect();
+
+    // per expert per projection: quant to (indices, scales) against the right codebook
+    let dims = vq_expert_layout(hidden, inter); // [(gate o,i),(up o,i),(down o,i)]
+    let mut enc: Vec<[(Vec<u8>, Vec<u16>); 3]> = Vec::new();
+    for _ in 0..e {
+        let mut per = std::array::from_fn(|_| (Vec::new(), Vec::new()));
+        for (p, &(o_dim, i_dim)) in dims.iter().enumerate() {
+            let wv: Vec<f32> = (0..o_dim * i_dim).map(|_| r.f()).collect();
+            per[p] = quant_vq(&wv, o_dim, i_dim, &cbs[p]);
+        }
+        enc.push(per);
+    }
+
+    // reference: Σ_e w[e]·down(silu(gate·x)⊙up·x)
+    let mut want = vec![0.0f32; hidden];
+    for ex in 0..e {
+        let mut g = vec![0.0f32; inter];
+        let mut u = vec![0.0f32; inter];
+        matvec_vq(
+            &mut g,
+            &x,
+            &enc[ex][0].0,
+            &enc[ex][0].1,
+            &cbs[0],
+            inter,
+            hidden,
+        );
+        matvec_vq(
+            &mut u,
+            &x,
+            &enc[ex][1].0,
+            &enc[ex][1].1,
+            &cbs[1],
+            inter,
+            hidden,
+        );
+        let h: Vec<f32> = (0..inter).map(|j| silu(g[j]) * u[j]).collect();
+        let mut down = vec![0.0f32; hidden];
+        matvec_vq(
+            &mut down,
+            &h,
+            &enc[ex][2].0,
+            &enc[ex][2].1,
+            &cbs[2],
+            hidden,
+            inter,
+        );
+        for o in 0..hidden {
+            want[o] += w[ex] * down[o];
+        }
+    }
+
+    // device: hold bufs alive; descriptors point into them
+    let mut bufs: Vec<DeviceBuf> = Vec::new();
+    let mut push = |b: Vec<u8>, bufs: &mut Vec<DeviceBuf>| -> *const u8 {
+        bufs.push(dev(&b));
+        bufs.last().unwrap().ptr()
+    };
+    let descs: Vec<ExpertDescVq> = (0..e)
+        .map(|ex| ExpertDescVq {
+            gate_indices: push(enc[ex][0].0.clone(), &mut bufs),
+            gate_scales: push(u16b(&enc[ex][0].1), &mut bufs) as *const u16,
+            up_indices: push(enc[ex][1].0.clone(), &mut bufs),
+            up_scales: push(u16b(&enc[ex][1].1), &mut bufs) as *const u16,
+            down_indices: push(enc[ex][2].0.clone(), &mut bufs),
+            down_scales: push(u16b(&enc[ex][2].1), &mut bufs) as *const u16,
+        })
+        .collect();
+    let descb = dev(unsafe {
+        std::slice::from_raw_parts(
+            descs.as_ptr() as *const u8,
+            std::mem::size_of_val(&descs[..]),
+        )
+    });
+    let (xb, wb) = (dev(&f32b(&x)), dev(&f32b(&w)));
+    let (g0, g1, g2) = (
+        dev(&f32b(&cbs[0])),
+        dev(&f32b(&cbs[1])),
+        dev(&f32b(&cbs[2])),
+    );
+    let mut hbuf = dev(&vec![0u8; e * inter * 4]);
+    let mut pbuf = dev(&vec![0u8; e * hidden * 4]);
+    let mut obuf = dev(&vec![0u8; hidden * 4]);
+    let _ = (vq_groups(hidden), vq_row_bytes(hidden)); // (layout used by quant/vq_expert)
+    unsafe {
+        launch_moe_vq(
+            xb.ptr() as *const f32,
+            hidden,
+            inter,
+            e,
+            descb.ptr() as *const ExpertDescVq,
+            g0.ptr() as *const f32,
+            g1.ptr() as *const f32,
+            g2.ptr() as *const f32,
+            wb.ptr() as *const f32,
+            hbuf.ptr_mut() as *mut f32,
+            pbuf.ptr_mut() as *mut f32,
+            obuf.ptr_mut() as *mut f32,
+        )
+        .expect("launch moe_vq");
+    }
+    device_sync().expect("sync");
+    assert_close(&want, &f32v(&obuf.copy_out().expect("out")), "moe_vq");
 }
