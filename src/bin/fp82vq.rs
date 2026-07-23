@@ -19,8 +19,8 @@ use anyhow::{Context, Result, ensure};
 use memmap2::Mmap;
 use rivoli::math::{bf16_to_f32, f32_to_bf16};
 use rivoli::quant::{
-    VQ_DIM, VQ_GROUP, VQ_K, dequant_fp8_block, matvec_vq, quant_vq, vq_expert_stride, vq_groups,
-    vq_proj_bytes, vq_row_bytes,
+    VQ_DIM, VQ_GROUP, VQ_K, dequant_fp8_block, matvec_vq, quant_vq, vq_expert_bytes,
+    vq_expert_stride, vq_groups, vq_proj_bytes, vq_row_bytes,
 };
 use std::collections::HashMap;
 use std::io::Write;
@@ -468,19 +468,19 @@ fn write_proj(dst: &mut [u8], o_dim: usize, i_dim: usize, indices: &[u8], scales
 }
 
 /// Quantize one expert into `dst` (length `expert_stride`), against `codebook`.
+/// Quantize the expert (or shared expert) rooted at `base` (`…experts.{e}` or
+/// `…shared_experts`) into `dst`, on the CPU.
 fn convert_expert(
     src: &Fp8Src,
-    layer: usize,
-    e: usize,
+    base: &str,
     hidden: usize,
     moe_inter: usize,
     codebook: &[f32],
     dst: &mut [u8],
 ) -> Result<()> {
-    let base = format!("model.layers.{layer}.mlp.experts.{e}");
     let mut off = 0;
     for (proj, o_dim, i_dim) in projections(hidden, moe_inter) {
-        let w = deq_proj(src, &base, proj, o_dim, i_dim)?;
+        let w = deq_proj(src, base, proj, o_dim, i_dim)?;
         let (indices, scales) = quant_vq(&w, o_dim, i_dim, codebook);
         let pb = vq_proj_bytes(o_dim, i_dim);
         write_proj(&mut dst[off..off + pb], o_dim, i_dim, &indices, &scales);
@@ -492,27 +492,29 @@ fn convert_expert(
 /// One expert via the GPU encoder (bit-identical to [`convert_expert`]). `enc` is the
 /// shared encoder — this runs on many threads, the GPU calls inside serialize on it.
 #[cfg(feature = "rocm")]
-#[allow(clippy::too_many_arguments)]
 fn convert_expert_gpu(
     src: &Fp8Src,
-    layer: usize,
-    e: usize,
+    base: &str,
     hidden: usize,
     moe_inter: usize,
     codebook: &[f32],
     enc: &std::sync::Mutex<gpu::Encoder>,
     dst: &mut [u8],
 ) -> Result<()> {
-    let base = format!("model.layers.{layer}.mlp.experts.{e}");
     let mut off = 0;
     for (proj, o_dim, i_dim) in projections(hidden, moe_inter) {
-        let w = deq_proj(src, &base, proj, o_dim, i_dim)?;
+        let w = deq_proj(src, base, proj, o_dim, i_dim)?;
         let (indices, scales) = gpu::quant_vq_gpu(&w, o_dim, i_dim, codebook, enc)?;
         let pb = vq_proj_bytes(o_dim, i_dim);
         write_proj(&mut dst[off..off + pb], o_dim, i_dim, &indices, &scales);
         off += pb;
     }
     Ok(())
+}
+
+/// The tensor base for one MoE layer's shared expert.
+fn shared_base(layer: usize) -> String {
+    format!("model.layers.{layer}.mlp.shared_experts")
 }
 
 /// Convert a whole layer's experts on the CPU, `threads`-way parallel over experts.
@@ -541,7 +543,14 @@ fn convert_layer_cpu(
             e0 += take;
             handles.push(s.spawn(move || -> Result<()> {
                 for (j, dst) in mine.chunks_exact_mut(stride).enumerate() {
-                    convert_expert(src, l, base_e + j, hidden, moe_inter, codebook, dst)?;
+                    convert_expert(
+                        src,
+                        &format!("model.layers.{l}.mlp.experts.{}", base_e + j),
+                        hidden,
+                        moe_inter,
+                        codebook,
+                        dst,
+                    )?;
                 }
                 Ok(())
             }));
@@ -809,8 +818,23 @@ fn main() -> Result<()> {
         for e in 0..2usize {
             let mut cpu = vec![0u8; stride];
             let mut gpu = vec![0u8; stride];
-            convert_expert(&src, l, e, hidden, moe_inter, &codebook, &mut cpu)?;
-            convert_expert_gpu(&src, l, e, hidden, moe_inter, &codebook, enc, &mut gpu)?;
+            convert_expert(
+                &src,
+                &format!("model.layers.{l}.mlp.experts.{e}"),
+                hidden,
+                moe_inter,
+                &codebook,
+                &mut cpu,
+            )?;
+            convert_expert_gpu(
+                &src,
+                &format!("model.layers.{l}.mlp.experts.{e}"),
+                hidden,
+                moe_inter,
+                &codebook,
+                enc,
+                &mut gpu,
+            )?;
             ensure!(
                 cpu == gpu,
                 "GPU/CPU encode mismatch at layer {l} expert {e}"
@@ -862,8 +886,7 @@ fn main() -> Result<()> {
                             for (j, dst) in mine.chunks_exact_mut(stride).enumerate() {
                                 convert_expert_gpu(
                                     src,
-                                    l,
-                                    base_e + j,
+                                    &format!("model.layers.{l}.mlp.experts.{}", base_e + j),
                                     hidden,
                                     moe_inter,
                                     codebook,
@@ -896,6 +919,46 @@ fn main() -> Result<()> {
         f.write_all(&buf)?;
         eprintln!("fp82vq: wrote {path} ({} experts)", n_experts);
     }
+
+    // Shared expert per MoE layer → shared.i3: one tight `expert_bytes` block per
+    // layer (no O_DIRECT padding — it's placed resident, never streamed). Lets the
+    // engine fold the shared expert into the single VQ MoE launch. Full runs only.
+    let shared_path = format!("{}/shared.i3", args.out_dir);
+    if args.layer.is_none() && std::fs::metadata(&shared_path).is_err() {
+        let ebytes = vq_expert_bytes(hidden, moe_inter);
+        let mut sbuf = vec![0u8; (n_layers - dense) * ebytes];
+        let mut wrote = 0usize;
+        for (li, dst) in sbuf.chunks_exact_mut(ebytes).enumerate() {
+            let base = shared_base(dense + li);
+            if src.loc(&format!("{base}.gate_proj.weight")).is_err() {
+                continue; // partial checkpoint — leave shared.i3 for a later run
+            }
+            #[cfg(feature = "rocm")]
+            let done = match encoder.as_ref() {
+                Some(enc) => {
+                    convert_expert_gpu(&src, &base, hidden, moe_inter, &codebook, enc, dst)?;
+                    true
+                }
+                None => false,
+            };
+            #[cfg(not(feature = "rocm"))]
+            let done = false;
+            if !done {
+                convert_expert(&src, &base, hidden, moe_inter, &codebook, dst)?;
+            }
+            wrote += 1;
+        }
+        if wrote == n_layers - dense {
+            std::fs::write(&shared_path, &sbuf)?;
+            eprintln!("fp82vq: wrote {shared_path} ({wrote} shared experts)");
+        } else {
+            eprintln!(
+                "fp82vq: shared experts incomplete ({wrote}/{}), deferring shared.i3",
+                n_layers - dense
+            );
+        }
+    }
+
     eprintln!(
         "fp82vq: done — {} layers to {}",
         n_layers - dense,

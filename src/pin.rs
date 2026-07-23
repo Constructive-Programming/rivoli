@@ -20,7 +20,7 @@
 use crate::cache;
 use crate::device::{DeviceTier, VmmBuf, mem_info};
 use crate::model::ModelConfig;
-use crate::quant::{vq_expert_bytes, vq_expert_layout, vq_proj_bytes, vq_row_bytes};
+use crate::quant::{VQ_DIM, VQ_K, vq_expert_bytes, vq_expert_layout, vq_proj_bytes, vq_row_bytes};
 use crate::snapshot::{Dtype, Snapshot};
 use crate::stream::{ALIGN, Sqpoll, Streamer, slot_span};
 use crate::usage::Usage;
@@ -98,7 +98,11 @@ pub enum LayerMlp {
     Dense(Mlp),
     Moe {
         gate_w: *const f32, // router gate [n_experts, hidden] (F32), device
-        shared: Mlp,        // shared expert (always resident)
+        shared: Mlp,        // int4 shared expert (always resident; VQ fallback)
+        /// VQ shared expert (resident), `Some` under `--vq-dir` when `shared.i3` is
+        /// present — folded into the single `launch_moe_vq` batch. `None` ⇒ int4
+        /// `shared` launches separately.
+        shared_vq: Option<MlpVq>,
     },
 }
 
@@ -363,6 +367,33 @@ fn place_mlp(
         gate: place_i4(tier, snap, &format!("{base}.gate_proj"), hidden)?,
         up: place_i4(tier, snap, &format!("{base}.up_proj"), hidden)?,
         down: place_i4(tier, snap, &format!("{base}.down_proj"), inter)?,
+    })
+}
+
+/// Place a VQ shared-expert `block` (one `.i3` expert, gate‖up‖down) resident and
+/// resolve it to an `MlpVq`. Its sub-offsets are the routed-expert layout
+/// ([`vq_slot_offsets`]); dims: gate/up `[moe_inter, hidden]`, down `[hidden, moe_inter]`.
+fn place_vq_shared(
+    tier: &mut DeviceTier,
+    block: &[u8],
+    hidden: usize,
+    moe_inter: usize,
+) -> Result<MlpVq> {
+    let dst = tier.reserve(block.len())?;
+    // SAFETY: dst owns block.len() reserved bytes.
+    unsafe { std::ptr::copy_nonoverlapping(block.as_ptr(), dst, block.len()) };
+    let off = vq_slot_offsets(hidden, moe_inter);
+    let vw = |ioff: usize, soff: usize, o_dim: usize, i_dim: usize| VqWeight {
+        // SAFETY: offsets lie within the block just copied into the tier.
+        indices: unsafe { dst.add(ioff) },
+        scales: unsafe { dst.add(soff) } as *const u16,
+        o_dim,
+        i_dim,
+    };
+    Ok(MlpVq {
+        gate: vw(off[0], off[1], moe_inter, hidden),
+        up: vw(off[2], off[3], moe_inter, hidden),
+        down: vw(off[4], off[5], hidden, moe_inter),
     })
 }
 
@@ -676,7 +707,32 @@ impl<'a> Pin<'a> {
         // margin; anything left over widens the LRU below.
         const SLACK: usize = 256 << 20; // 256 MiB
         let n_full = full.iter().filter(|&&f| f).count();
-        let resident = resident_bytes(cfg) + n_full * indexer_bytes(cfg);
+        // Open the VQ source first: its resident footprint (codebook + one shared
+        // expert per MoE layer) must be in the tier budget BEFORE it is sized.
+        let vq_src = match vq_dir {
+            Some(dir) => Some(VqExperts::open(
+                dir,
+                cfg.dense_layers,
+                cfg.n_layers,
+                cfg.n_experts,
+                cfg.hidden,
+                cfg.moe_inter,
+            )?),
+            None => None,
+        };
+        let vq_resident = match &vq_src {
+            Some(v) => {
+                let cb = VQ_K * VQ_DIM * 4;
+                let shared = if v.shared_block(cfg.dense_layers).is_some() {
+                    (cfg.n_layers - cfg.dense_layers) * vq_expert_bytes(cfg.hidden, cfg.moe_inter)
+                } else {
+                    0
+                };
+                cb + shared
+            }
+            None => 0,
+        };
+        let resident = resident_bytes(cfg) + n_full * indexer_bytes(cfg) + vq_resident;
         let tier_cap = resident + SLACK;
         tracing::info!(
             "computed resident footprint {:.2} GiB (tier {:.2} GiB incl. slack)",
@@ -685,19 +741,10 @@ impl<'a> Pin<'a> {
         );
         let mut tier = DeviceTier::new(tier_cap)?;
 
-        // Routed-expert format: VQ-int3 from `.i3` files (`--vq-dir`) or int4 from the
-        // snapshot (default). Only routed experts change format; the shared codebook is
-        // placed resident once here (~64 KiB, fits in SLACK).
-        let (vq, codebook): (Option<VqExperts>, *const f32) = match vq_dir {
-            Some(dir) => {
-                let src = VqExperts::open(
-                    dir,
-                    cfg.dense_layers,
-                    cfg.n_layers,
-                    cfg.n_experts,
-                    cfg.hidden,
-                    cfg.moe_inter,
-                )?;
+        // Place the shared codebook resident (the VQ source was opened above, and its
+        // footprint is already in the tier budget).
+        let (vq, codebook): (Option<VqExperts>, *const f32) = match vq_src {
+            Some(src) => {
                 let cb_bytes = src.codebook.len() * 4;
                 let dst = tier.reserve(cb_bytes)?;
                 // SAFETY: dst owns cb_bytes just reserved; codebook is f32 (LE host ==
@@ -709,7 +756,7 @@ impl<'a> Pin<'a> {
                         cb_bytes,
                     );
                 }
-                tracing::info!("routed experts: VQ-int3 from {dir}");
+                tracing::info!("routed experts: VQ-int3 (codebook + shared placed resident)");
                 (Some(src), dst as *const f32)
             }
             None => (None, std::ptr::null()),
@@ -758,7 +805,16 @@ impl<'a> Pin<'a> {
                     cfg.hidden,
                     cfg.moe_inter * cfg.n_shared,
                 )?;
-                LayerMlp::Moe { gate_w, shared }
+                // VQ shared expert (resident) when `--vq-dir` provided shared.i3.
+                let shared_vq = match vq.as_ref().and_then(|v| v.shared_block(l)) {
+                    Some(blk) => Some(place_vq_shared(&mut tier, blk, cfg.hidden, cfg.moe_inter)?),
+                    None => None,
+                };
+                LayerMlp::Moe {
+                    gate_w,
+                    shared,
+                    shared_vq,
+                }
             };
             layers.push(LayerPin {
                 input_ln: place_f32(&mut tier, snap, &format!("{lb}.input_layernorm.weight"))?,

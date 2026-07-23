@@ -868,10 +868,15 @@ impl<'a> GpuEngine<'a> {
             } else {
                 None
             };
-            let (gate_w, shared) = if let LayerMlp::Moe { gate_w, shared } = &lw.mlp {
-                (*gate_w, Some(*shared))
+            let (gate_w, shared, shared_vq) = if let LayerMlp::Moe {
+                gate_w,
+                shared,
+                shared_vq,
+            } = &lw.mlp
+            {
+                (*gate_w, Some(*shared), *shared_vq)
             } else {
-                (std::ptr::null(), None)
+                (std::ptr::null(), None, None)
             };
 
             let rcp = self.rc[l].ptr_mut() as *mut u16;
@@ -1131,29 +1136,37 @@ impl<'a> GpuEngine<'a> {
                     *wi *= cfg.routed_scale as f32;
                 }
                 if self.vq {
-                    // VQ routed descriptors + the shared int4 desc (separate buffer,
-                    // since the shared expert stays int4 and can't join a VQ batch).
+                    // VQ routed descriptors. When shared.i3 was loaded, the shared
+                    // expert is VQ too (`shared_vq`) and FOLDS into this one batch
+                    // (weight 1.0) — one launch_moe_vq, no separate shared launch.
                     self.descs_vq.clear();
                     for m in &self.mlps_vq {
                         self.descs_vq.push(desc_of_vq(m));
                     }
-                    let nrouted = self.descs_vq.len();
+                    if let Some(s) = shared_vq {
+                        self.descs_vq.push(desc_of_vq(&s));
+                        self.w.push(1.0);
+                    }
+                    let ndesc = self.descs_vq.len();
                     self.descs_buf
                         .copy_in_at(0, desc_bytes_vq(&self.descs_vq))?;
                     self.wexpert_buf.copy_in_at(0, f32_le_bytes(&self.w))?;
-                    if let Some(s) = shared {
-                        self.descs.clear();
-                        self.descs.push(desc_of(&s));
-                        self.descs_shared_buf
-                            .copy_in_at(0, desc_bytes(&self.descs))?;
+                    // Fallback: shared expert still int4 (no shared.i3) → separate desc.
+                    let int4_shared = shared_vq.is_none();
+                    if int4_shared {
+                        if let Some(s) = shared {
+                            self.descs.clear();
+                            self.descs.push(desc_of(&s));
+                            self.descs_shared_buf
+                                .copy_in_at(0, desc_bytes(&self.descs))?;
+                        }
                     }
                     self.pin.await_layer(batch)?;
-                    // Shared int4 expert FIRST → moe_out → add to residual, so the outer
-                    // vadd (below the MoE block) can add the routed VQ moe_out. Both
-                    // launches are null-stream ordered, so moe_out/moe_h/moe_partial
-                    // reuse across the two is safe without an extra barrier.
+                    // int4-shared fallback: launch it FIRST → moe_out → add, so the
+                    // outer vadd can add the routed VQ moe_out. Null-stream ordered, so
+                    // moe_out/moe_h/moe_partial reuse is safe with no extra barrier.
                     // SAFETY: descriptors point at resident/landed slot weights.
-                    if shared.is_some() {
+                    if int4_shared && shared.is_some() {
                         unsafe {
                             launch_moe(
                                 xnp,
@@ -1169,14 +1182,14 @@ impl<'a> GpuEngine<'a> {
                             launch_vadd(xp, self.moe_out.ptr() as *const f32, hidden)?;
                         }
                     }
-                    // Routed VQ experts → moe_out (the outer vadd adds it to xp).
+                    // Routed (+ folded VQ shared) → moe_out (the outer vadd adds it).
                     // SAFETY: descs point at landed slot indices/scales + resident codebook.
                     unsafe {
                         launch_moe_vq(
                             xnp,
                             hidden,
                             cfg.moe_inter,
-                            nrouted,
+                            ndesc,
                             self.descs_buf.ptr() as *const ExpertDescVq,
                             self.codebook,
                             self.wexpert_buf.ptr() as *const f32,

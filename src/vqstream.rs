@@ -23,6 +23,10 @@ pub struct VqExperts {
     files: Vec<std::fs::File>,
     /// The learned codebook (`VQ_K·VQ_DIM` f32); the caller uploads it resident once.
     pub codebook: Vec<f32>,
+    /// The shared expert per MoE layer, `(n_layers − dense) · expert_bytes` bytes
+    /// (`shared.i3`, tight blocks). Loaded to host; the caller places it resident.
+    /// Empty if `shared.i3` is absent (older conversions → int4 shared fallback).
+    shared: Vec<u8>,
     dense_layers: usize,
     n_layers: usize,
     n_experts: usize,
@@ -66,15 +70,40 @@ impl VqExperts {
             );
             files.push(f);
         }
+        // shared.i3 (optional): one tight expert_bytes block per MoE layer, placed
+        // resident by the caller. Absent ⇒ the engine falls back to the int4 shared.
+        let shared = match std::fs::read(format!("{dir}/shared.i3")) {
+            Ok(b) => {
+                let want = (n_layers - dense_layers) * expert_bytes;
+                ensure!(
+                    b.len() == want,
+                    "{dir}/shared.i3: {} bytes, expected (layers)·expert_bytes = {want}",
+                    b.len()
+                );
+                b
+            }
+            Err(_) => Vec::new(),
+        };
         Ok(Self {
             files,
             codebook,
+            shared,
             dense_layers,
             n_layers,
             n_experts,
             stride,
             expert_bytes,
         })
+    }
+
+    /// The shared expert's on-disk block for a MoE layer (`expert_bytes`), or `None`
+    /// if `shared.i3` was absent (int4 shared fallback). The caller places it resident.
+    pub fn shared_block(&self, layer: usize) -> Option<&[u8]> {
+        if self.shared.is_empty() {
+            return None;
+        }
+        let i = (layer - self.dense_layers) * self.expert_bytes;
+        Some(&self.shared[i..i + self.expert_bytes])
     }
 
     /// Cold-read spec for one routed expert: `(fd, begin, useful_len)`. `begin` is
