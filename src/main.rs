@@ -168,7 +168,14 @@ fn main() -> Result<()> {
     let mc = rivoli::model::ModelConfig::load(&cfg.model)?;
     info!(
         "model: {} layers ({} dense) hidden={} heads={} experts={} top{} moe_inter={} vocab={}",
-        mc.n_layers, mc.dense_layers, mc.hidden, mc.n_heads, mc.n_experts, mc.top_k, mc.moe_inter, mc.vocab
+        mc.n_layers,
+        mc.dense_layers,
+        mc.hidden,
+        mc.n_heads,
+        mc.n_experts,
+        mc.top_k,
+        mc.moe_inter,
+        mc.vocab
     );
     info!(
         "mla: q_lora={} kv_lora={} qk={}+{} v_head={} rope_theta={}",

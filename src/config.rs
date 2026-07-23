@@ -140,7 +140,8 @@ impl Config {
         }
         // available_parallelism() is the LOGICAL count (SMT included): /2 gives
         // physical cores, /2 again is the measured feed-pool optimum.
-        let threads = std::thread::available_parallelism().map_or(8, |n| (n.get() / 4).clamp(4, 16));
+        let threads =
+            std::thread::available_parallelism().map_or(8, |n| (n.get() / 4).clamp(4, 16));
         Ok(Self {
             model,
             bench,

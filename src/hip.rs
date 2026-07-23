@@ -279,8 +279,19 @@ pub unsafe fn launch_attend(
     // SAFETY: caller's pointer contract.
     let r = unsafe {
         rivoli_mla_attend(
-            qabs, qrope, lc8, lscale, rc, h as i32, nr as i32, kvl as i32, rope as i32,
-            n_blocks as i32, scale, clat, partial,
+            qabs,
+            qrope,
+            lc8,
+            lscale,
+            rc,
+            h as i32,
+            nr as i32,
+            kvl as i32,
+            rope as i32,
+            n_blocks as i32,
+            scale,
+            clat,
+            partial,
         )
     };
     check(r, "mla_attend")
@@ -415,7 +426,15 @@ pub unsafe fn launch_append_kv(
     // SAFETY: caller's pointer contract.
     let r = unsafe {
         rivoli_append_kv(
-            latent, rope, lc8, lscale, rc, pos as i32, kvl as i32, ropn as i32, n_blocks as i32,
+            latent,
+            rope,
+            lc8,
+            lscale,
+            rc,
+            pos as i32,
+            kvl as i32,
+            ropn as i32,
+            n_blocks as i32,
         )
     };
     check(r, "append_kv")

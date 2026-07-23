@@ -1,0 +1,9 @@
+{
+  "minTokens": 15,
+  "threshold": 3,
+  "reporters": ["console"],
+  "absolute": true,
+  "gitignore": true,
+  "ignore": ["**/target/**"],
+  "format": ["rust"]
+}

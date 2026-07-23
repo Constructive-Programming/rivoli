@@ -341,7 +341,13 @@ impl<'a> GpuEngine<'a> {
         // dims; each launch's inputs are produced by a prior launch on the same
         // (default) stream, so ordering holds; a device_sync precedes every host read.
         unsafe {
-            launch_embed_i8_row(self.pin.embed.packed, self.pin.embed.scale, token as usize, hidden, xp)?;
+            launch_embed_i8_row(
+                self.pin.embed.packed,
+                self.pin.embed.scale,
+                token as usize,
+                hidden,
+                xp,
+            )?;
         }
 
         for l in 0..cfg.n_layers {
@@ -368,15 +374,48 @@ impl<'a> GpuEngine<'a> {
             // SAFETY: see the forward-level note; every pointer is live scratch.
             unsafe {
                 launch_rmsnorm(xp, input_ln, hidden, eps, xnp)?;
-                launch_gemv_fp8(xnp, q_a.packed, q_a.scale, q_a.o_dim, q_a.i_dim, q_a.block, qrp)?;
+                launch_gemv_fp8(
+                    xnp, q_a.packed, q_a.scale, q_a.o_dim, q_a.i_dim, q_a.block, qrp,
+                )?;
                 launch_rmsnorm(qrp, q_a_ln, cfg.q_lora_rank, eps, qrp)?; // in-place
-                launch_gemv_fp8(qrp, q_b.packed, q_b.scale, q_b.o_dim, q_b.i_dim, q_b.block, qp)?;
-                launch_gemv_fp8(xnp, kv_a.packed, kv_a.scale, kv_a.o_dim, kv_a.i_dim, kv_a.block, compp)?;
+                launch_gemv_fp8(
+                    qrp, q_b.packed, q_b.scale, q_b.o_dim, q_b.i_dim, q_b.block, qp,
+                )?;
+                launch_gemv_fp8(
+                    xnp,
+                    kv_a.packed,
+                    kv_a.scale,
+                    kv_a.o_dim,
+                    kv_a.i_dim,
+                    kv_a.block,
+                    compp,
+                )?;
                 launch_rmsnorm(compp, kv_a_ln, kvl, eps, compp)?; // normalize latent (first kvl)
                 launch_rope(compp.add(kvl), 1, rope, rope, pos, theta)?; // rope the key
                 launch_rope(qp.add(nope), h, qh, rope, pos, theta)?; // rope per-head query
-                launch_append_kv(compp, compp.add(kvl), lc8p, lscalep, rcp, pos, kvl, rope, nb)?;
-                launch_mla_absorb_fp8(qp, kv_b.packed, kv_b.scale, h, qh, nope, vh, kvl, kv_b.block, qabsp)?;
+                launch_append_kv(
+                    compp,
+                    compp.add(kvl),
+                    lc8p,
+                    lscalep,
+                    rcp,
+                    pos,
+                    kvl,
+                    rope,
+                    nb,
+                )?;
+                launch_mla_absorb_fp8(
+                    qp,
+                    kv_b.packed,
+                    kv_b.scale,
+                    h,
+                    qh,
+                    nope,
+                    vh,
+                    kvl,
+                    kv_b.block,
+                    qabsp,
+                )?;
                 launch_gather_rope(qp, qropep, h, qh, nope, rope)?;
             }
 
@@ -384,9 +423,29 @@ impl<'a> GpuEngine<'a> {
             //     residual, pre-MLP norm. ---
             // SAFETY: see the forward-level note; every pointer is live scratch.
             unsafe {
-                launch_attend(qabsp, qropep, lc8p, lscalep, rcp, h, nr, kvl, rope, nb, scale, clatp, apartp)?;
-                launch_mla_value_fp8(clatp, kv_b.packed, kv_b.scale, h, nope, vh, kvl, kv_b.block, ctxp)?;
-                launch_gemv_fp8(ctxp, o_proj.packed, o_proj.scale, o_proj.o_dim, o_proj.i_dim, o_proj.block, subp)?;
+                launch_attend(
+                    qabsp, qropep, lc8p, lscalep, rcp, h, nr, kvl, rope, nb, scale, clatp, apartp,
+                )?;
+                launch_mla_value_fp8(
+                    clatp,
+                    kv_b.packed,
+                    kv_b.scale,
+                    h,
+                    nope,
+                    vh,
+                    kvl,
+                    kv_b.block,
+                    ctxp,
+                )?;
+                launch_gemv_fp8(
+                    ctxp,
+                    o_proj.packed,
+                    o_proj.scale,
+                    o_proj.o_dim,
+                    o_proj.i_dim,
+                    o_proj.block,
+                    subp,
+                )?;
                 launch_vadd(xp, subp, hidden)?; // residual
                 launch_rmsnorm(xp, post_ln, hidden, eps, xnp)?; // pre-MLP norm → xn
             }
@@ -400,10 +459,34 @@ impl<'a> GpuEngine<'a> {
                     let gp = self.mlp_g.ptr_mut() as *mut f32;
                     let up = self.mlp_u.ptr_mut() as *mut f32;
                     let outp = self.moe_out.ptr_mut() as *mut f32;
-                    launch_gemv_fp8(xnp, m.gate.packed, m.gate.scale, m.gate.o_dim, m.gate.i_dim, m.gate.block, gp)?;
-                    launch_gemv_fp8(xnp, m.up.packed, m.up.scale, m.up.o_dim, m.up.i_dim, m.up.block, up)?;
+                    launch_gemv_fp8(
+                        xnp,
+                        m.gate.packed,
+                        m.gate.scale,
+                        m.gate.o_dim,
+                        m.gate.i_dim,
+                        m.gate.block,
+                        gp,
+                    )?;
+                    launch_gemv_fp8(
+                        xnp,
+                        m.up.packed,
+                        m.up.scale,
+                        m.up.o_dim,
+                        m.up.i_dim,
+                        m.up.block,
+                        up,
+                    )?;
                     launch_swiglu(gp, up, inter, gp)?; // in place: h = silu(gate)*up
-                    launch_gemv_fp8(gp, m.down.packed, m.down.scale, m.down.o_dim, m.down.i_dim, m.down.block, outp)?;
+                    launch_gemv_fp8(
+                        gp,
+                        m.down.packed,
+                        m.down.scale,
+                        m.down.o_dim,
+                        m.down.i_dim,
+                        m.down.block,
+                        outp,
+                    )?;
                 }
             } else {
                 // Cross-layer prefetch: if the NEXT layer is also MoE, predict its
@@ -428,7 +511,13 @@ impl<'a> GpuEngine<'a> {
                     // SAFETY: xp is the live post-attn residual; next_ln/next_gate are
                     // resident L+1 weights; pred_xn/pred_gl device scratch, same stream.
                     unsafe {
-                        launch_rmsnorm(xp, next_ln, hidden, eps, self.pred_xn.ptr_mut() as *mut f32)?;
+                        launch_rmsnorm(
+                            xp,
+                            next_ln,
+                            hidden,
+                            eps,
+                            self.pred_xn.ptr_mut() as *mut f32,
+                        )?;
                         launch_gemv_f32(
                             self.pred_xn.ptr() as *const f32,
                             next_gate,
@@ -513,7 +602,8 @@ impl<'a> GpuEngine<'a> {
                     self.w.push(1.0);
                 }
                 let ndesc = self.descs_vq.len();
-                self.descs_buf.copy_in_at(0, desc_bytes_vq(&self.descs_vq))?;
+                self.descs_buf
+                    .copy_in_at(0, desc_bytes_vq(&self.descs_vq))?;
                 self.wexpert_buf.copy_in_at(0, f32_le_bytes(&self.w))?;
                 // JOIN the cold reads — last moment before the first deref of a cold
                 // slot. No kernel live, so the bounce drain's sync serialises nothing.
@@ -573,7 +663,14 @@ impl<'a> GpuEngine<'a> {
         unsafe {
             launch_rmsnorm(xp, self.pin.final_norm, hidden, eps, xnp)?;
             let head = self.pin.lm_head;
-            launch_gemv_i8(xnp, head.packed, head.scale, head.o_dim, head.i_dim, self.logits.ptr_mut() as *mut f32)?;
+            launch_gemv_i8(
+                xnp,
+                head.packed,
+                head.scale,
+                head.o_dim,
+                head.i_dim,
+                self.logits.ptr_mut() as *mut f32,
+            )?;
         }
         Ok(())
     }

@@ -139,13 +139,24 @@ fn fwd_argmax_and_vadd() {
         .expect("launch argmax");
     }
     device_sync().expect("sync");
-    let got_idx = i32::from_le_bytes(ib.copy_out().expect("out")[..4].try_into().expect("4 bytes"));
-    let got_val = f32::from_le_bytes(vb.copy_out().expect("out")[..4].try_into().expect("4 bytes"));
+    let got_idx = i32::from_le_bytes(
+        ib.copy_out().expect("out")[..4]
+            .try_into()
+            .expect("4 bytes"),
+    );
+    let got_val = f32::from_le_bytes(
+        vb.copy_out().expect("out")[..4]
+            .try_into()
+            .expect("4 bytes"),
+    );
     assert_eq!(got_idx, want_idx, "argmax idx");
     assert_eq!(got_val, 0.5, "argmax val");
 
     // vadd: x += y, elementwise.
-    let y: Vec<f32> = logits.iter().map(|v| if v.is_nan() { 0.0 } else { *v }).collect();
+    let y: Vec<f32> = logits
+        .iter()
+        .map(|v| if v.is_nan() { 0.0 } else { *v })
+        .collect();
     for l in logits.iter_mut() {
         if l.is_nan() {
             *l = 0.0;
@@ -154,7 +165,12 @@ fn fwd_argmax_and_vadd() {
     let mut xb = dev(&f32b(&logits));
     let yb = dev(&f32b(&y));
     unsafe {
-        launch_vadd(xb.ptr_mut() as *mut f32, yb.ptr() as *const f32, logits.len()).expect("vadd");
+        launch_vadd(
+            xb.ptr_mut() as *mut f32,
+            yb.ptr() as *const f32,
+            logits.len(),
+        )
+        .expect("vadd");
     }
     device_sync().expect("sync");
     let got = f32v(&xb.copy_out().expect("out"));
@@ -217,10 +233,14 @@ fn check_attend(seed: u64, h: usize, nt: usize, kvl: usize, rope: usize) {
     // bf16. Kernel and reference decode identical bits — the only difference under
     // test is flash (online) vs two-pass softmax.
     let lc8: Vec<u8> = (0..nt * kvl).map(|_| f32_to_e4m3(r.f())).collect();
-    let lscale: Vec<f32> = (0..nt * n_blocks).map(|_| (r.f() * 0.1).abs() + 0.01).collect();
+    let lscale: Vec<f32> = (0..nt * n_blocks)
+        .map(|_| (r.f() * 0.1).abs() + 0.01)
+        .collect();
     let rc: Vec<u16> = (0..nt * rope).map(|_| f32_to_bf16(r.f())).collect();
     let scale = 1.0 / ((kvl + rope) as f32).sqrt();
-    let want = attend_reference(&qabs, &qrope, &lc8, &lscale, &rc, h, nt, kvl, rope, n_blocks, scale);
+    let want = attend_reference(
+        &qabs, &qrope, &lc8, &lscale, &rc, h, nt, kvl, rope, n_blocks, scale,
+    );
 
     let (qab, qrb) = (dev(&f32b(&qabs)), dev(&f32b(&qrope)));
     let (lcb, lsb, rcb) = (dev(&lc8), dev(&f32b(&lscale)), dev(&u16b(&rc)));
@@ -280,7 +300,8 @@ fn mla_fp8_matches_reference() {
     // reference reads the exact dequant the kernels see: kvb[row][i] = e4m3·block-scale.
     let sc_rows = rows.div_ceil(block);
     let kvbf = |row: usize, i: usize| -> f32 {
-        e4m3_to_f32(packed[row * kvl + i]) * scale[(row / block).min(sc_rows - 1) * sc_cols + i / block]
+        e4m3_to_f32(packed[row * kvl + i])
+            * scale[(row / block).min(sc_rows - 1) * sc_cols + i / block]
     };
     let q: Vec<f32> = (0..h * qh).map(|_| r.f()).collect();
     let clat: Vec<f32> = (0..h * kvl).map(|_| r.f()).collect();
@@ -342,8 +363,16 @@ fn mla_fp8_matches_reference() {
         .expect("launch value");
     }
     device_sync().expect("sync");
-    assert_close(&want_abs, &f32v(&absb.copy_out().expect("out")), "mla_absorb");
-    assert_close(&want_val, &f32v(&valb.copy_out().expect("out")), "mla_value");
+    assert_close(
+        &want_abs,
+        &f32v(&absb.copy_out().expect("out")),
+        "mla_absorb",
+    );
+    assert_close(
+        &want_val,
+        &f32v(&valb.copy_out().expect("out")),
+        "mla_value",
+    );
 }
 
 /// Fused VQ MoE (moe_gateup_vq → moe_down_vq → moe_reduce), 3 per-projection

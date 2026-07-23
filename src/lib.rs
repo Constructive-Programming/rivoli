@@ -10,10 +10,10 @@ pub mod tokenizer;
 pub mod watchdog;
 
 #[cfg(feature = "rocm")]
-pub mod hip;
+pub mod gpu;
 #[cfg(feature = "rocm")]
-pub mod stream;
+pub mod hip;
 #[cfg(feature = "rocm")]
 pub mod pin;
 #[cfg(feature = "rocm")]
-pub mod gpu;
+pub mod stream;

@@ -20,9 +20,7 @@ use crate::cache;
 use crate::device::{DeviceTier, VmmBuf, mem_info};
 use crate::format::{Dtype, FormatMeta, Safetensors, Vq3Set, load_codebooks};
 use crate::model::ModelConfig;
-use crate::quant::{
-    VQ_DIM, VQ_K, vq_expert_bytes, vq_expert_layout, vq_proj_bytes, vq_row_bytes,
-};
+use crate::quant::{VQ_DIM, VQ_K, vq_expert_bytes, vq_expert_layout, vq_proj_bytes, vq_row_bytes};
 use crate::stream::{Sqpoll, Streamer, slot_span};
 use anyhow::{Context, Result, ensure};
 use std::os::fd::RawFd;
@@ -195,9 +193,17 @@ fn place_f32(tier: &mut DeviceTier, st: &Safetensors, name: &str) -> Result<*con
 
 /// Place an fp8-e4m3 block-scaled weight (`<name>.weight` F8E4M3 + `.weight_scale_inv`
 /// F32) into the tier. Dims come from the weight's `[o_dim, i_dim]` shape.
-fn place_fp8(tier: &mut DeviceTier, st: &Safetensors, name: &str, block: usize) -> Result<Fp8Weight> {
+fn place_fp8(
+    tier: &mut DeviceTier,
+    st: &Safetensors,
+    name: &str,
+    block: usize,
+) -> Result<Fp8Weight> {
     let (w, shape) = st.typed(&format!("{name}.weight"), Dtype::F8E4M3)?;
-    ensure!(shape.len() == 2, "{name}.weight: expected 2-D, got {shape:?}");
+    ensure!(
+        shape.len() == 2,
+        "{name}.weight: expected 2-D, got {shape:?}"
+    );
     let (o_dim, i_dim) = (shape[0], shape[1]);
     let (sc, _) = st.typed(&format!("{name}.weight_scale_inv"), Dtype::F32)?;
     let packed = tier.reserve(w.len())?;
@@ -560,11 +566,18 @@ impl<'a> Pin<'a> {
             let lb = format!("model.layers.{l}");
             let a = format!("{lb}.self_attn");
             let mlp = if l < cfg.dense_layers {
-                LayerMlp::Dense(place_dense_mlp(&mut tier, &st, &format!("{lb}.mlp"), block)?)
+                LayerMlp::Dense(place_dense_mlp(
+                    &mut tier,
+                    &st,
+                    &format!("{lb}.mlp"),
+                    block,
+                )?)
             } else {
                 let gate_w = place_f32(&mut tier, &st, &format!("{lb}.mlp.gate.weight"))?;
-                let (bias, _) =
-                    st.typed(&format!("{lb}.mlp.gate.e_score_correction_bias"), Dtype::F32)?;
+                let (bias, _) = st.typed(
+                    &format!("{lb}.mlp.gate.e_score_correction_bias"),
+                    Dtype::F32,
+                )?;
                 let bias = crate::quant::read_f32(bias);
                 ensure!(
                     bias.len() == cfg.n_experts,

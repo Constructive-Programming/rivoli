@@ -79,7 +79,11 @@ mod gpu {
 
         pub fn encode(&mut self, sub: &[f32]) -> Result<Vec<u16>> {
             let n = sub.len() / VQ_DIM;
-            ensure!(n <= self.max_sub, "encode batch {n} > max_sub {}", self.max_sub);
+            ensure!(
+                n <= self.max_sub,
+                "encode batch {n} > max_sub {}",
+                self.max_sub
+            );
             self.sub.copy_in_at(0, f32_as_bytes(sub))?;
             // SAFETY: buffers sized ≥ n; live until the sync below.
             unsafe {
@@ -611,7 +615,15 @@ fn main() -> Result<()> {
                         } else {
                             format!("model.layers.{l}.mlp.shared_experts")
                         };
-                        encode_expert(src, &base, d.hidden, d.moe_inter, cb, &mut slot[..ebytes], enc)?;
+                        encode_expert(
+                            src,
+                            &base,
+                            d.hidden,
+                            d.moe_inter,
+                            cb,
+                            &mut slot[..ebytes],
+                            enc,
+                        )?;
                     }
                     Ok(())
                 }));
