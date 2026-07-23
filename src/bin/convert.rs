@@ -21,6 +21,168 @@ use rivoli::quant::{
 const FP8_BLOCK: usize = 128;
 const PROJ: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
 
+/// GPU-accelerated encode: the nearest-codebook argmin (the run-time ceiling, ~VQ_K×
+/// the other work) offloaded to `rivoli_vq_encode`. Host still does fp8 dequant,
+/// group normalization, the closed-form scale refit, and packing — all O(o·i), a
+/// fraction of the argmin. Produces bytes BIT-IDENTICAL to `quant_vq` (same
+/// metric/tie-break in the kernel, same host refit here). Ported from `fp82vq`'s
+/// validated GPU path; one encoder per projection codebook, shared behind a `Mutex`
+/// so host dequant/refit/pack run parallel while the GPU argmins serialize.
+#[cfg(feature = "rocm")]
+mod gpu {
+    use super::*;
+    use rivoli::device::DeviceBuf;
+    use rivoli::hip::{device_sync, launch_vq_encode};
+    use rivoli::quant::{set_idx, vq_groups};
+
+    fn f32_as_bytes(v: &[f32]) -> &[u8] {
+        // SAFETY: f32 is POD; the view is `4·len` read-only bytes (LE host == LE device).
+        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+    }
+
+    /// Resident codebook + `‖c‖²` on device, plus reusable subvector/index buffers
+    /// sized to the largest projection.
+    pub struct Encoder {
+        codebook: DeviceBuf,
+        cbnorm: DeviceBuf,
+        sub: DeviceBuf,
+        idx: DeviceBuf,
+        max_sub: usize,
+    }
+
+    // SAFETY: DeviceBuf holds process-global device pointers; every access goes
+    // through `encode` behind the caller's Mutex, so device ops never run concurrent.
+    unsafe impl Send for Encoder {}
+
+    impl Encoder {
+        pub fn new(codebook: &[f32], max_sub: usize) -> Result<Self> {
+            let cbnorm: Vec<f32> = (0..VQ_K)
+                .map(|k| {
+                    codebook[k * VQ_DIM..(k + 1) * VQ_DIM]
+                        .iter()
+                        .map(|&c| c * c)
+                        .sum()
+                })
+                .collect();
+            let mut cb = DeviceBuf::new(codebook.len() * 4)?;
+            cb.copy_in_at(0, f32_as_bytes(codebook))?;
+            let mut nb = DeviceBuf::new(cbnorm.len() * 4)?;
+            nb.copy_in_at(0, f32_as_bytes(&cbnorm))?;
+            Ok(Self {
+                codebook: cb,
+                cbnorm: nb,
+                sub: DeviceBuf::new(max_sub * VQ_DIM * 4)?,
+                idx: DeviceBuf::new(max_sub * 2)?,
+                max_sub,
+            })
+        }
+
+        pub fn encode(&mut self, sub: &[f32]) -> Result<Vec<u16>> {
+            let n = sub.len() / VQ_DIM;
+            ensure!(n <= self.max_sub, "encode batch {n} > max_sub {}", self.max_sub);
+            self.sub.copy_in_at(0, f32_as_bytes(sub))?;
+            // SAFETY: buffers sized ≥ n; live until the sync below.
+            unsafe {
+                launch_vq_encode(
+                    self.sub.ptr() as *const f32,
+                    self.codebook.ptr() as *const f32,
+                    self.cbnorm.ptr() as *const f32,
+                    n,
+                    self.idx.ptr_mut() as *mut u16,
+                )?;
+            }
+            device_sync()?;
+            let mut bytes = Vec::new();
+            self.idx.copy_out_prefix(&mut bytes, n * 2)?;
+            Ok(bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect())
+        }
+    }
+
+    /// GPU analog of `quant_vq`: two batched argmin passes (amax-scale, then the
+    /// refit scale) around the same host refit. Bit-identical output to `quant_vq`.
+    pub fn quant_vq_gpu(
+        w: &[f32],
+        o_dim: usize,
+        i_dim: usize,
+        codebook: &[f32],
+        enc: &std::sync::Mutex<Encoder>,
+    ) -> Result<(Vec<u8>, Vec<u16>)> {
+        const SUBS: usize = VQ_GROUP / VQ_DIM;
+        let ngroups = i_dim / VQ_GROUP;
+        let nsub_row = i_dim / VQ_DIM;
+        let rb = vq_row_bytes(i_dim);
+        let _ = vq_groups(i_dim); // dim sanity (asserts i_dim % VQ_GROUP == 0)
+        let mut sub = vec![0.0f32; o_dim * nsub_row * VQ_DIM];
+        let mut scales = vec![0u16; o_dim * ngroups];
+        // Pass 1: normalize every group by its amax-derived bf16 scale.
+        for o in 0..o_dim {
+            let wr = &w[o * i_dim..(o + 1) * i_dim];
+            for grp in 0..ngroups {
+                let seg = &wr[grp * VQ_GROUP..(grp + 1) * VQ_GROUP];
+                let amax = seg.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+                let sb = f32_to_bf16(if amax > 0.0 { amax } else { 1.0 });
+                scales[o * ngroups + grp] = sb;
+                let inv = 1.0 / bf16_to_f32(sb);
+                let base = (o * nsub_row + grp * SUBS) * VQ_DIM;
+                for (t, &v) in seg.iter().enumerate() {
+                    sub[base + t] = v * inv;
+                }
+            }
+        }
+        let idx1 = enc
+            .lock()
+            .map_err(|_| anyhow::anyhow!("encoder poisoned"))?
+            .encode(&sub)?;
+        // Refit each group against its pass-1 entries; renormalize only changed groups.
+        let mut changed = false;
+        for o in 0..o_dim {
+            let wr = &w[o * i_dim..(o + 1) * i_dim];
+            for grp in 0..ngroups {
+                let seg = &wr[grp * VQ_GROUP..(grp + 1) * VQ_GROUP];
+                let sbase = o * nsub_row + grp * SUBS;
+                let (mut num, mut den) = (0.0f32, 0.0f32);
+                for t in 0..SUBS {
+                    let c = &codebook[idx1[sbase + t] as usize * VQ_DIM..][..VQ_DIM];
+                    for (d, &v) in seg[t * VQ_DIM..(t + 1) * VQ_DIM].iter().enumerate() {
+                        num += v * c[d];
+                        den += c[d] * c[d];
+                    }
+                }
+                if den > 0.0 && num > 0.0 {
+                    let refit = f32_to_bf16(num / den);
+                    if refit != scales[o * ngroups + grp] {
+                        scales[o * ngroups + grp] = refit;
+                        let inv = 1.0 / bf16_to_f32(refit);
+                        let base = sbase * VQ_DIM;
+                        for (t, &v) in seg.iter().enumerate() {
+                            sub[base + t] = v * inv;
+                        }
+                        changed = true;
+                    }
+                }
+            }
+        }
+        let idx = if changed {
+            enc.lock()
+                .map_err(|_| anyhow::anyhow!("encoder poisoned"))?
+                .encode(&sub)?
+        } else {
+            idx1
+        };
+        let mut indices = vec![0u8; o_dim * rb];
+        for o in 0..o_dim {
+            let ir = &mut indices[o * rb..(o + 1) * rb];
+            for t in 0..nsub_row {
+                set_idx(ir, t, idx[o * nsub_row + t]);
+            }
+        }
+        Ok((indices, scales))
+    }
+}
+
 /// Model dims the converter needs (a subset of config.json).
 struct Dims {
     hidden: usize,
@@ -66,8 +228,17 @@ fn write_proj(dst: &mut [u8], o_dim: usize, i_dim: usize, indices: &[u8], scales
     }
 }
 
+/// Per-projection GPU encoders (`--gpu`): one `Encoder` per codebook, each behind a
+/// `Mutex` so the parallel expert encode serializes only the GPU argmin calls. `()`
+/// without the `rocm` feature (where `--gpu` is rejected at parse and never built).
+#[cfg(feature = "rocm")]
+type Enc = [std::sync::Mutex<gpu::Encoder>; 3];
+#[cfg(not(feature = "rocm"))]
+type Enc = ();
+
 /// Encode one expert (routed or shared) rooted at `base` into `dst`, gate/up/down
-/// against `codebooks[0..3]` respectively.
+/// against `codebooks[0..3]`. With `enc` (the `--gpu` encoders) the nearest-codebook
+/// argmin offloads to the GPU (bit-identical to the CPU `quant_vq`).
 fn encode_expert(
     src: &Safetensors,
     base: &str,
@@ -75,6 +246,7 @@ fn encode_expert(
     moe_inter: usize,
     codebooks: &[Vec<f32>; 3],
     dst: &mut [u8],
+    enc: Option<&Enc>,
 ) -> Result<()> {
     let mut off = 0;
     for (p, (proj, &(o_dim, i_dim))) in PROJ
@@ -83,7 +255,11 @@ fn encode_expert(
         .enumerate()
     {
         let w = deq(src, base, proj, o_dim, i_dim)?;
-        let (indices, scales) = quant_vq(&w, o_dim, i_dim, &codebooks[p]);
+        let (indices, scales) = match enc {
+            #[cfg(feature = "rocm")]
+            Some(e) => gpu::quant_vq_gpu(&w, o_dim, i_dim, &codebooks[p], &e[p])?,
+            _ => quant_vq(&w, o_dim, i_dim, &codebooks[p]),
+        };
         let pb = vq_proj_bytes(o_dim, i_dim);
         write_proj(&mut dst[off..off + pb], o_dim, i_dim, &indices, &scales);
         off += pb;
@@ -275,6 +451,9 @@ struct Args {
     layers: Option<usize>,
     sample_experts: usize,
     kmeans_iters: usize,
+    /// Offload the nearest-codebook argmin to the GPU (`--gpu`, needs `--features
+    /// rocm`) — ~VQ_K× the encode work, ~an hour for the full model vs many on CPU.
+    gpu: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -284,6 +463,7 @@ fn parse_args() -> Result<Args> {
         layers: None,
         sample_experts: 48,
         kmeans_iters: 40,
+        gpu: false,
     };
     let mut pos = Vec::new();
     let mut it = std::env::args().skip(1);
@@ -294,12 +474,13 @@ fn parse_args() -> Result<Args> {
                 a.sample_experts = it.next().context("--sample-experts N")?.parse()?
             }
             "--kmeans-iters" => a.kmeans_iters = it.next().context("--kmeans-iters N")?.parse()?,
+            "--gpu" => a.gpu = true,
             _ => pos.push(arg),
         }
     }
     ensure!(
         pos.len() == 2,
-        "usage: convert <fp8-dir> <out-dir> [--layers N] [--sample-experts N] [--kmeans-iters N]"
+        "usage: convert <fp8-dir> <out-dir> [--layers N] [--sample-experts N] [--kmeans-iters N] [--gpu]"
     );
     a.fp8_dir = pos[0].clone();
     a.out_dir = pos[1].clone();
@@ -375,7 +556,27 @@ fn main() -> Result<()> {
         cbs
     };
 
-    // 2. Encode experts → per-layer .vq3 (header + routed + shared block).
+    // 2. Encode experts → per-layer .vq3 (header + routed + shared block). With
+    // `--gpu`, build one resident encoder per projection codebook (reused across all
+    // layers); the parallel encode then offloads only the argmin.
+    #[cfg(feature = "rocm")]
+    let encoders: Option<Enc> = if args.gpu {
+        let max_sub = d.hidden * d.moe_inter / VQ_DIM; // largest projection subvectors
+        eprintln!("convert: GPU encode enabled (argmin offloaded to vq_encode)");
+        Some([
+            std::sync::Mutex::new(gpu::Encoder::new(&codebooks[0], max_sub)?),
+            std::sync::Mutex::new(gpu::Encoder::new(&codebooks[1], max_sub)?),
+            std::sync::Mutex::new(gpu::Encoder::new(&codebooks[2], max_sub)?),
+        ])
+    } else {
+        None
+    };
+    #[cfg(not(feature = "rocm"))]
+    let encoders: Option<Enc> = {
+        ensure!(!args.gpu, "--gpu requires building with --features rocm");
+        None
+    };
+
     let stride = rivoli::quant::vq_expert_stride(d.hidden, d.moe_inter);
     let ebytes = vq_expert_bytes(d.hidden, d.moe_inter);
     for l in d.dense_layers..last {
@@ -389,6 +590,7 @@ fn main() -> Result<()> {
         // Encode all n_experts+1 blocks (routed 0..n, shared = n) in parallel over
         // disjoint block slices — quant_vq is pure and Safetensors is Sync.
         let (src, cb) = (&src, &codebooks);
+        let enc = encoders.as_ref();
         let threads = std::thread::available_parallelism().map_or(4, |t| t.get());
         let per = (d.n_experts + 1).div_ceil(threads);
         std::thread::scope(|s| -> Result<()> {
@@ -409,7 +611,7 @@ fn main() -> Result<()> {
                         } else {
                             format!("model.layers.{l}.mlp.shared_experts")
                         };
-                        encode_expert(src, &base, d.hidden, d.moe_inter, cb, &mut slot[..ebytes])?;
+                        encode_expert(src, &base, d.hidden, d.moe_inter, cb, &mut slot[..ebytes], enc)?;
                     }
                     Ok(())
                 }));
