@@ -479,8 +479,13 @@ fn main() -> Result<()> {
     w.write(&rpath)?;
     eprintln!("convert: wrote {rpath}");
 
-    // 4. manifest.json = source config + a `format` section.
+    // 4. manifest.json = source config + a `format` section. A `--layers`-limited
+    // convert only writes layers `0..last`, so report the reduced count — the loader
+    // iterates `0..num_hidden_layers` and would otherwise demand absent layer files.
     let mut manifest = cfg.clone();
+    if args.layers.is_some() {
+        manifest["num_hidden_layers"] = serde_json::json!(last);
+    }
     manifest["format"] = serde_json::to_value(FormatMeta::current(FP8_BLOCK))?;
     std::fs::write(
         format!("{}/manifest.json", args.out_dir),
