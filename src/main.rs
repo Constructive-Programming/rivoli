@@ -303,14 +303,14 @@ fn main() -> Result<()> {
             wd_secs,
         ))?);
         let t0 = std::time::Instant::now();
-        let ids = engine.generate(&prompt_ids, ngen, &tok.eos)?;
+        let (ids, summary) = engine.generate(&prompt_ids, ngen, &tok.eos)?;
         let dt = t0.elapsed().as_secs_f64();
         let (hits, misses) = (engine.hits(), engine.misses());
-        let tok_per_s = ids.len() as f64 / dt;
-        let hit_pct = 100.0 * hits as f64 / (hits + misses).max(1) as f64;
         info!(
-            "GPU: {} tokens in {dt:.1}s ({tok_per_s:.2} tok/s) | expert hit {hit_pct:.1}% ({hits} hit / {misses} miss)",
+            "GPU: {} tokens in {dt:.1}s ({:.2} tok/s) | expert hit {:.1}% ({hits} hit / {misses} miss)",
             ids.len(),
+            summary.tok_per_s,
+            summary.hit_pct,
         );
         let coll = engine.slot_collisions();
         if coll > 0 {
@@ -319,6 +319,10 @@ fn main() -> Result<()> {
                  corrupted expert before the guard",
             );
         }
+        // OTLP: one decode span carrying the always-on summary (opt-in via
+        // OTEL_EXPORTER_OTLP_ENDPOINT; log-only otherwise). Exported synchronously on
+        // drop — no async runtime.
+        rivoli::telemetry::export_decode(&summary, ids.len());
         info!("{bench_prompt}{}", tok.decode_all(&ids)?);
         Ok(())
     }

@@ -180,12 +180,12 @@ extern "C" int rivoli_ring_submit(void* ring) {
 // token and both halves live inside it, so which one to attack is not guessable —
 // the H2D moves ~2.7 GB/token and the reads are latency-bound, and those want
 // opposite fixes. Accumulated, never reset by the shim; the caller reads deltas.
-// Armed only by -DRIVOLI_TRACE (cargo feature `trace`); a production build reads
-// no clock here and rivoli_ring_timings reports zeros.
+// The nvme-read / bounce-copy split feeds the ALWAYS-ON fetch profile — a couple of
+// clock_gettime calls per drain, negligible against a ~1 tok/s decode, so it is not
+// gated. `rivoli_ring_timings` reports the accumulated totals.
 static unsigned long long g_read_ns = 0;
 static unsigned long long g_copy_ns = 0;
 
-#ifdef RIVOLI_TRACE
 static inline unsigned long long now_ns(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
@@ -193,10 +193,6 @@ static inline unsigned long long now_ns(void) {
 }
 #define TRACE_T0(v) unsigned long long v = now_ns()
 #define TRACE_ACC(acc, v) (acc) += now_ns() - (v)
-#else
-#define TRACE_T0(v) ((void)0)
-#define TRACE_ACC(acc, v) ((void)0)
-#endif
 
 // Read the accumulated (read, copy) nanosecond totals.
 extern "C" void rivoli_ring_timings(unsigned long long* read_ns, unsigned long long* copy_ns) {

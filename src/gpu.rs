@@ -20,6 +20,7 @@ use crate::hip::{
 use crate::math::{E4M3_BLOCK, sigmoid, topk_into};
 use crate::model::ModelConfig;
 use crate::pin::{Fp8Mlp, IndexerPin, LayerMlp, MlpVq, Pin};
+use crate::telemetry::ProfileSummary;
 use anyhow::{Result, bail, ensure};
 
 /// Little-endian byte view of a u32 slice — zero-copy on this LE host. Feeds the
@@ -74,39 +75,41 @@ fn route_into(
     topk_into(choice, top_k, sel);
 }
 
-/// Per-token time buckets, measured (not theorized). `trace`-only: the clock reads
-/// buy nothing in a production build.
-#[cfg(feature = "trace")]
+/// Per-token time buckets. ALWAYS ON: every bucket wraps a join/D2H the forward
+/// pass already pays (the end-of-layer sync, the gate-logits read, the stream
+/// drain), so accumulating them costs only a clock read per layer — no extra GPU
+/// sync, nothing that perturbs the run. The end-of-run [`Profile::report`] is the
+/// engine's standing performance summary; the expensive fine-grained audits and
+/// correctness probes live behind the `trace` feature instead.
 #[derive(Default)]
 struct Profile {
-    fetch_ns: u128,
-    fetch_n: u64,
-    mlp_ns: u128,
-    route_ns: u128,
+    fetch_ns: u128, // NVMe stream: submit + await (the bandwidth-bound term)
+    fetch_n: u64,   // demand misses
+    mlp_ns: u128,   // end-of-layer GPU-compute join
+    route_ns: u128, // host routing (gate D2H + sigmoid/bias/top-k)
     wall_ns: u128,
     tokens: u64,
 }
 
-#[cfg(feature = "trace")]
 impl Profile {
-    fn report(&self) {
+    /// Fold the accumulated buckets into the per-token summary (also fed to OTLP).
+    fn summary(&self, hits: u64, misses: u64, bytes_per_expert: usize) -> ProfileSummary {
         let tok = self.tokens.max(1) as f64;
         let per = |ns: u128| ns as f64 / 1e6 / tok; // ms/token
-        tracing::info!(
-            "PROFILE/tok: {:.0}ms wall | fetch {:.0}ms ({} miss, {:.2}ms/miss) | mlp {:.0}ms | route {:.0}ms",
-            per(self.wall_ns),
-            per(self.fetch_ns),
-            self.fetch_n / self.tokens.max(1),
-            self.fetch_ns as f64 / 1e6 / self.fetch_n.max(1) as f64,
-            per(self.mlp_ns),
-            per(self.route_ns),
-        );
         let (read_ns, copy_ns) = crate::stream::ring_timings();
-        tracing::info!(
-            "  fetch split/tok: nvme-read {:.0}ms | bounce-copy {:.0}ms",
-            per(read_ns as u128),
-            per(copy_ns as u128),
-        );
+        ProfileSummary {
+            tok_per_s: self.tokens as f64 / (self.wall_ns as f64 / 1e9).max(1e-9),
+            hit_pct: 100.0 * hits as f64 / (hits + misses).max(1) as f64,
+            wall_ms: per(self.wall_ns),
+            fetch_ms: per(self.fetch_ns),
+            mlp_ms: per(self.mlp_ns),
+            route_ms: per(self.route_ns),
+            miss_per_tok: self.fetch_n as f64 / tok,
+            ms_per_miss: self.fetch_ns as f64 / 1e6 / self.fetch_n.max(1) as f64,
+            gb_per_tok: self.fetch_n as f64 / tok * bytes_per_expert as f64 / 1e9,
+            nvme_read_ms: per(read_ns as u128),
+            bounce_copy_ms: per(copy_ns as u128),
+        }
     }
 }
 
@@ -203,13 +206,13 @@ pub struct GpuEngine<'a> {
     descs_vq: Vec<ExpertDescVq>,
     gl_host: Vec<u8>,
     argmax_host: Vec<u8>,
-    /// DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
+    /// Always-on cheap per-token profiling (see [`Profile`]).
+    prof: Profile,
+    /// DIAGNOSTIC (`--checksum-x`, `trace` only): hash the residual stream each layer.
     #[cfg(feature = "trace")]
     checksum_x: bool,
     #[cfg(feature = "trace")]
     ck_buf: Vec<u8>,
-    #[cfg(feature = "trace")]
-    prof: Profile,
 }
 
 impl<'a> GpuEngine<'a> {
@@ -323,12 +326,11 @@ impl<'a> GpuEngine<'a> {
             descs_vq: Vec::with_capacity(slots),
             gl_host: Vec::with_capacity(cfg.n_experts * 4),
             argmax_host: Vec::with_capacity(8),
+            prof: Profile::default(),
             #[cfg(feature = "trace")]
             checksum_x: false,
             #[cfg(feature = "trace")]
             ck_buf: Vec::new(),
-            #[cfg(feature = "trace")]
-            prof: Profile::default(),
             heartbeat: None,
             pin,
         })
@@ -752,7 +754,9 @@ impl<'a> GpuEngine<'a> {
                 // Router gate on device, then read logits to route on host.
                 // SAFETY: gate_w resident F32; glp device scratch.
                 unsafe { launch_gemv_f32(xnp, gate_w, cfg.n_experts, hidden, glp)? };
-                #[cfg(feature = "trace")]
+                // The gate-logits D2H is a blocking join, so timing around it is free —
+                // no sync we don't already pay. (All the always-on profile buckets wrap
+                // existing join/D2H points; none add a sync.)
                 let t = std::time::Instant::now();
                 // Read the gate logits, route with `bias` borrowed straight out of
                 // `&self.pin` while the routing scratch is borrowed mutably.
@@ -765,24 +769,16 @@ impl<'a> GpuEngine<'a> {
                     &mut self.choice,
                     &mut self.sel,
                 );
-                #[cfg(feature = "trace")]
-                {
-                    self.prof.route_ns += t.elapsed().as_nanos();
-                }
+                self.prof.route_ns += t.elapsed().as_nanos();
                 // SUBMIT this layer's cold reads and take the descriptors back
                 // immediately — the slot ADDRESSES are known at allocation time, only
                 // the bytes are still arriving. Everything until `await_layer` runs
                 // with the NVMe busy.
-                #[cfg(feature = "trace")]
                 let miss0 = self.pin.misses;
-                #[cfg(feature = "trace")]
                 let t = std::time::Instant::now();
                 let batch = self.pin.submit_layer(l, &self.sel, &mut self.mlps_vq)?;
-                #[cfg(feature = "trace")]
-                {
-                    self.prof.fetch_ns += t.elapsed().as_nanos();
-                    self.prof.fetch_n += self.pin.misses - miss0;
-                }
+                self.prof.fetch_ns += t.elapsed().as_nanos();
+                self.prof.fetch_n += self.pin.misses - miss0;
                 // Routed weights: sigmoid score, sum-normalized over the routed picks,
                 // then scaled. The VQ shared expert (weight 1.0) folds into the batch.
                 self.w.clear();
@@ -814,13 +810,9 @@ impl<'a> GpuEngine<'a> {
                 self.wexpert_buf.copy_in_at(0, f32_le_bytes(&self.w))?;
                 // JOIN the cold reads — last moment before the first deref of a cold
                 // slot. No kernel live, so the bounce drain's sync serialises nothing.
-                #[cfg(feature = "trace")]
                 let t = std::time::Instant::now();
                 self.pin.await_layer(batch)?;
-                #[cfg(feature = "trace")]
-                {
-                    self.prof.fetch_ns += t.elapsed().as_nanos();
-                }
+                self.prof.fetch_ns += t.elapsed().as_nanos();
                 // SAFETY: descs point at landed slot indices/scales + resident codebooks.
                 unsafe {
                     launch_moe_vq(
@@ -842,14 +834,11 @@ impl<'a> GpuEngine<'a> {
             // SAFETY: residual add of the MLP contribution.
             unsafe { launch_vadd(xp, self.moe_out.ptr() as *const f32, hidden)? };
             // End-of-layer join: protects the reused descs/wexpert/moe_out buffers
-            // before the next layer overwrites them, and surfaces faults.
-            #[cfg(feature = "trace")]
+            // before the next layer overwrites them, and surfaces faults. Always
+            // present, so timing it (the `mlp` bucket = GPU compute) is free.
             let t = std::time::Instant::now();
             device_sync()?;
-            #[cfg(feature = "trace")]
-            {
-                self.prof.mlp_ns += t.elapsed().as_nanos();
-            }
+            self.prof.mlp_ns += t.elapsed().as_nanos();
             // DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
             #[cfg(feature = "trace")]
             if self.checksum_x {
@@ -919,22 +908,28 @@ impl<'a> GpuEngine<'a> {
     }
 
     /// Greedy-decode up to `ngen` tokens continuing `prompt_ids`, stopping on any
-    /// `eos`. Returns the generated ids.
-    pub fn generate(&mut self, prompt_ids: &[u32], ngen: usize, eos: &[u32]) -> Result<Vec<u32>> {
+    /// `eos`. Returns the generated ids + the always-on decode-loop [`ProfileSummary`]
+    /// (also logged as the PROFILE line; `main` feeds it to the OTLP span).
+    pub fn generate(
+        &mut self,
+        prompt_ids: &[u32],
+        ngen: usize,
+        eos: &[u32],
+    ) -> Result<(Vec<u32>, ProfileSummary)> {
         ensure!(!prompt_ids.is_empty(), "empty prompt");
         let mut pos = 0usize;
         for &tok in prompt_ids {
             self.forward(tok, pos)?;
             pos += 1;
         }
-        // Profile the DECODE loop only (prefill is warm-up).
-        #[cfg(feature = "trace")]
-        {
-            self.prof = Profile::default();
-        }
-        #[cfg(feature = "trace")]
+        // Profile the DECODE loop only (prefill is warm-up); reset the pin counters
+        // too so hit% and misses/tok describe steady-state decode, not the cold prefill.
+        self.prof = Profile::default();
+        let hit0 = self.pin.hits;
+        let miss0 = self.pin.misses;
         let decode_wall = std::time::Instant::now();
         let mut generated = Vec::with_capacity(ngen);
+        // Per-window throughput trend (verbose) is a `trace`-only audit.
         #[cfg(feature = "trace")]
         const WIN: usize = 8;
         #[cfg(feature = "trace")]
@@ -966,12 +961,15 @@ impl<'a> GpuEngine<'a> {
                 (win_hit, win_miss) = (self.pin.hits, self.pin.misses);
             }
         }
-        #[cfg(feature = "trace")]
-        {
-            self.prof.wall_ns = decode_wall.elapsed().as_nanos();
-            self.prof.tokens = generated.len() as u64;
-            self.prof.report();
-        }
-        Ok(generated)
+        self.prof.wall_ns = decode_wall.elapsed().as_nanos();
+        self.prof.tokens = generated.len() as u64;
+        let bytes_per_expert = crate::quant::vq_expert_bytes(self.cfg.hidden, self.cfg.moe_inter);
+        let summary = self.prof.summary(
+            self.pin.hits - hit0,
+            self.pin.misses - miss0,
+            bytes_per_expert,
+        );
+        summary.report();
+        Ok((generated, summary))
     }
 }

@@ -14,12 +14,22 @@ serde_json = "1"
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# OTLP span export (the `otlp` feature). reqwest-blocking-client is the default OTLP
+# transport and needs no async runtime of ours — the one decode span exports
+# synchronously at run end. Heavy deps, so opt-in at build time.
+opentelemetry = { version = "0.30", optional = true }
+opentelemetry_sdk = { version = "0.30", optional = true }
+opentelemetry-otlp = { version = "0.30", optional = true }
 
 [features]
 default = []
 rocm = []   # build.rs compiles kernels/*.hip via hipcc when enabled
-# Per-op instrumentation (PROFILE report + bucket syncs, pin/stream timers,
-# windowed tok/s). Off by default; tune with `--features rocm,trace`.
+# OTLP export of the always-on decode summary (one span/run, opt-in at runtime via
+# OTEL_EXPORTER_OTLP_ENDPOINT). Off by default — the opentelemetry stack is heavy.
+otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+# EXPENSIVE audits: correctness probes (--checksum-x/XSUM) + fine-grained per-op
+# perf timing + windowed tok/s. Off by default; `--features rocm,trace`. (The cheap
+# per-token profiling + the PROFILE summary are ALWAYS ON, no feature needed.)
 trace = []
 
 [lints.clippy]

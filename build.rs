@@ -17,7 +17,6 @@ fn main() {
         "linalg", "moe", "mla", "attn", "fwd", "vmm", "stream", "indexer",
     ];
     let hipcc = std::env::var("HIPCC").unwrap_or_else(|_| "hipcc".into());
-    let trace = std::env::var("CARGO_FEATURE_TRACE").is_ok();
 
     let mut objs = Vec::new();
     for k in kernels {
@@ -26,9 +25,6 @@ fn main() {
         println!("cargo:rerun-if-changed={src}");
         let mut cmd = Command::new(&hipcc);
         cmd.args(["--offload-arch=gfx1151", "-O3", "-fPIC"]);
-        if trace {
-            cmd.arg("-DRIVOLI_TRACE");
-        }
         let status = cmd
             .args(["-c", &src, "-o", &obj])
             .status()

@@ -8,6 +8,7 @@ pub mod indexer;
 pub mod math;
 pub mod model;
 pub mod quant;
+pub mod telemetry;
 pub mod tokenizer;
 pub mod watchdog;
 
