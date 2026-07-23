@@ -4,10 +4,10 @@
 
 use rivoli::device::DeviceBuf;
 use rivoli::hip::{
-    ExpertDescVq, device_sync, launch_gemv_fp8, launch_gemv_vq, launch_mla_absorb_fp8,
-    launch_mla_value_fp8, launch_moe_vq,
+    ExpertDescVq, attend_scratch_floats, device_sync, launch_attend, launch_gemv_fp8,
+    launch_gemv_vq, launch_mla_absorb_fp8, launch_mla_value_fp8, launch_moe_vq,
 };
-use rivoli::math::{e4m3_to_f32, f32_to_e4m3, silu};
+use rivoli::math::{bf16_to_f32, e4m3_to_f32, f32_to_bf16, f32_to_e4m3, silu, softmax};
 use rivoli::quant::{VQ_DIM, VQ_K, matvec_fp8, matvec_vq, quant_vq};
 
 fn f32b(v: &[f32]) -> Vec<u8> {
@@ -116,6 +116,99 @@ fn gemv_vq_matches_oracle() {
     }
     device_sync().expect("sync");
     assert_close(&want, &f32v(&yb.copy_out().expect("out")), "gemv_vq");
+}
+
+/// Dense two-pass scalar softmax over the whole cache — the oracle the flash
+/// (online) kernel must match. Widens the same bf16 bits the kernel does.
+fn attend_reference(
+    qabs: &[f32],
+    qrope: &[f32],
+    lc: &[u16],
+    rc: &[u16],
+    h: usize,
+    nt: usize,
+    kvl: usize,
+    rope: usize,
+    scale: f32,
+) -> Vec<f32> {
+    let mut clat = vec![0.0f32; h * kvl];
+    let mut scores = vec![0.0f32; nt];
+    for head in 0..h {
+        let qa = &qabs[head * kvl..(head + 1) * kvl];
+        let qr = &qrope[head * rope..(head + 1) * rope];
+        for (t, sc) in scores.iter_mut().enumerate() {
+            let lrow = &lc[t * kvl..(t + 1) * kvl];
+            let rrow = &rc[t * rope..(t + 1) * rope];
+            let mut a = 0.0f32;
+            for (i, &lb) in lrow.iter().enumerate() {
+                a += qa[i] * bf16_to_f32(lb);
+            }
+            for (d, &rb) in rrow.iter().enumerate() {
+                a += qr[d] * bf16_to_f32(rb);
+            }
+            *sc = a * scale;
+        }
+        softmax(&mut scores);
+        let out = &mut clat[head * kvl..(head + 1) * kvl];
+        for (t, &sc) in scores.iter().enumerate() {
+            let lrow = &lc[t * kvl..(t + 1) * kvl];
+            for (i, &lb) in lrow.iter().enumerate() {
+                out[i] += sc * bf16_to_f32(lb);
+            }
+        }
+    }
+    clat
+}
+
+fn check_attend(seed: u64, h: usize, nt: usize, kvl: usize, rope: usize) {
+    let mut r = Lcg(seed);
+    let qabs: Vec<f32> = (0..h * kvl).map(|_| r.f()).collect();
+    let qrope: Vec<f32> = (0..h * rope).map(|_| r.f()).collect();
+    // Cache round-tripped through bf16 so kernel and reference widen identical bits
+    // — the only difference under test is flash (online) vs two-pass softmax.
+    let lc: Vec<u16> = (0..nt * kvl).map(|_| f32_to_bf16(r.f())).collect();
+    let rc: Vec<u16> = (0..nt * rope).map(|_| f32_to_bf16(r.f())).collect();
+    let scale = 1.0 / ((kvl + rope) as f32).sqrt();
+    let want = attend_reference(&qabs, &qrope, &lc, &rc, h, nt, kvl, rope, scale);
+
+    let (qab, qrb) = (dev(&f32b(&qabs)), dev(&f32b(&qrope)));
+    let (lcb, rcb) = (dev(&u16b(&lc)), dev(&u16b(&rc)));
+    let mut clatb = dev(&vec![0u8; h * kvl * 4]);
+    // Non-null worst-case scratch → the multi-split + combine path is what's checked.
+    let mut partb = dev(&vec![0u8; attend_scratch_floats(h, kvl) * 4]);
+    unsafe {
+        launch_attend(
+            qab.ptr() as *const f32,
+            qrb.ptr() as *const f32,
+            lcb.ptr() as *const u16,
+            rcb.ptr() as *const u16,
+            h,
+            nt,
+            kvl,
+            rope,
+            scale,
+            clatb.ptr_mut() as *mut f32,
+            partb.ptr_mut() as *mut f32,
+        )
+        .expect("launch attend");
+    }
+    device_sync().expect("sync");
+    assert_close(&want, &f32v(&clatb.copy_out().expect("out")), "mla_attend");
+}
+
+#[test]
+fn mla_attend_glm_dims() {
+    // GLM MLA (kv_lora=512, qk_rope=64); H=64 = 8 full HB blocks, nt spans many
+    // TILE steps → the split-KV planner picks n_splits>1.
+    check_attend(0x0a5e_1102, 64, 300, 512, 64);
+}
+
+#[test]
+fn mla_attend_edges() {
+    // Single cached token stresses the online init (m=-inf on the first token);
+    // H=20 → a partial second HB block (4 active + 4 inactive lanes).
+    check_attend(0x00c0_ffee, 4, 1, 32, 8);
+    check_attend(0xb10c_c0de, 20, 130, 512, 64);
 }
 
 /// MLA absorb + value kernels vs an f32 reference on the dequantized kv_b. kv_b is

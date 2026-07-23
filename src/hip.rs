@@ -86,6 +86,23 @@ unsafe extern "C" {
         ctx: *mut f32,
     ) -> i32;
 
+    fn rivoli_mla_attend_scratch_floats(h: i32, kvl: i32) -> usize;
+
+    #[allow(clippy::too_many_arguments)]
+    fn rivoli_mla_attend(
+        qabs: *const f32,
+        qrope: *const f32,
+        lc: *const u16,
+        rc: *const u16,
+        h: i32,
+        nr: i32,
+        kvl: i32,
+        rope: i32,
+        scale: f32,
+        clat: *mut f32,
+        partial: *mut f32,
+    ) -> i32;
+
     fn rivoli_gemv_f32(x: *const f32, w: *const f32, o_dim: i32, i_dim: i32, y: *mut f32) -> i32;
     fn rivoli_rmsnorm(x: *const f32, w: *const f32, n: i32, eps: f32, y: *mut f32) -> i32;
     fn rivoli_rope(base: *mut f32, count: i32, stride: i32, seg: i32, pos: i32, theta: f64) -> i32;
@@ -185,6 +202,43 @@ pub unsafe fn launch_gemv_fp8(
         )
     };
     check(r, "gemv_fp8")
+}
+
+/// f32 count for the split-KV partial scratch — allocate once per session (never
+/// per token). Mirrors the kernel's worst-case (MLA_MAX_SPLITS) sizing.
+pub fn attend_scratch_floats(h: usize, kvl: usize) -> usize {
+    // SAFETY: pure arithmetic, no pointers.
+    unsafe { rivoli_mla_attend_scratch_floats(h as i32, kvl as i32) }
+}
+
+/// MLA flash attention `clat = Σ_t softmax((qabs·L_t + qrope·R_t)·scale)·L_t` over
+/// the bf16 latent cache, head-batched, split-KV when `partial` is non-null.
+///
+/// # Safety
+/// Async device pointers live until the next [`device_sync`]: `qabs` (`h·kvl` f32),
+/// `qrope` (`h·rope` f32), `lc` (`nr·kvl` bf16), `rc` (`nr·rope` bf16), `clat`
+/// (`h·kvl` f32), `partial` ([`attend_scratch_floats`] f32 or null = single split).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_attend(
+    qabs: *const f32,
+    qrope: *const f32,
+    lc: *const u16,
+    rc: *const u16,
+    h: usize,
+    nr: usize,
+    kvl: usize,
+    rope: usize,
+    scale: f32,
+    clat: *mut f32,
+    partial: *mut f32,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r = unsafe {
+        rivoli_mla_attend(
+            qabs, qrope, lc, rc, h as i32, nr as i32, kvl as i32, rope as i32, scale, clat, partial,
+        )
+    };
+    check(r, "mla_attend")
 }
 
 /// MLA absorb: `qabs[head][i] = Σ_d q[head·qh+d]·kv_b[rbase+d][i]` over kv_b's `nope`
