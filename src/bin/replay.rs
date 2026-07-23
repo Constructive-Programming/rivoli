@@ -27,7 +27,11 @@ struct Captured {
 /// Parse `k1 k2 k3 | p1 p2` (the ` | ` tail optional) into demand + predicted keys.
 fn parse_line(line: &str) -> Captured {
     let (d, p) = line.split_once('|').unwrap_or((line, ""));
-    let keys = |s: &str| s.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+    let keys = |s: &str| {
+        s.split_whitespace()
+            .filter_map(|t| t.parse().ok())
+            .collect()
+    };
     Captured {
         demand: keys(d),
         predicted: keys(p),

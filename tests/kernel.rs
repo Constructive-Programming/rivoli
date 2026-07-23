@@ -127,8 +127,8 @@ fn fwd_argmax_and_vadd() {
     let mut logits = vec![0.1f32, 0.5, 0.5, f32::NAN, 0.3, 0.5, -1.0];
     let want_idx = 1i32; // first 0.5
     let lb = dev(&f32b(&logits));
-    let mut ib = dev(&vec![0u8; 4]);
-    let mut vb = dev(&vec![0u8; 4]);
+    let mut ib = dev(&[0u8; 4]);
+    let mut vb = dev(&[0u8; 4]);
     unsafe {
         launch_argmax(
             lb.ptr() as *const f32,
@@ -204,6 +204,8 @@ fn attend_reference(
         for (t, sc) in scores.iter_mut().enumerate() {
             let rrow = &rc[t * rope..(t + 1) * rope];
             let mut a = 0.0f32;
+            // `lat(t, i)` needs the index, so a range loop is the clear form here.
+            #[allow(clippy::needless_range_loop)]
             for i in 0..kvl {
                 a += qa[i] * lat(t, i);
             }
@@ -440,9 +442,9 @@ fn moe_vq_matches_reference() {
 
     // device: hold bufs alive; descriptors point into them
     let mut bufs: Vec<DeviceBuf> = Vec::new();
-    let mut push = |b: Vec<u8>, bufs: &mut Vec<DeviceBuf>| -> *const u8 {
+    let push = |b: Vec<u8>, bufs: &mut Vec<DeviceBuf>| -> *const u8 {
         bufs.push(dev(&b));
-        bufs.last().unwrap().ptr()
+        bufs.last().expect("just pushed").ptr()
     };
     let descs: Vec<ExpertDescVq> = (0..e)
         .map(|ex| ExpertDescVq {
