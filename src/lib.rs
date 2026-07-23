@@ -1,4 +1,5 @@
 //! rivoli — int3-vq GLM-5.2 decode engine (rewrite). See docs/ARCHITECTURE.md.
+pub mod cache;
 pub mod device;
 pub mod format;
 pub mod math;
@@ -9,3 +10,5 @@ pub mod watchdog;
 
 #[cfg(feature = "rocm")]
 pub mod hip;
+#[cfg(feature = "rocm")]
+pub mod stream;
