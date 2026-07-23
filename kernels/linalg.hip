@@ -52,6 +52,33 @@ extern "C" __global__ void gemv_f32(
     if (lane == 0) y[o] = acc;
 }
 
+// y[o] = scale[o]·Σ_i x[i]·(int8)packed[o·i_dim+i] — per-row int8 GEMV (lm_head to
+// logits; matches quant.rs matvec_i8). One WAVE per output row, coalesced columns.
+extern "C" __global__ void gemv_i8(
+    const float* __restrict__ x, const signed char* __restrict__ packed,
+    const float* __restrict__ scale, int o_dim, int i_dim, float* __restrict__ y) {
+    int lane = threadIdx.x & (WAVE - 1);
+    size_t o = (size_t)blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x / WAVE);
+    if (o >= (size_t)o_dim) return;
+    const signed char* row = packed + o * (size_t)i_dim;
+    float acc = 0.0f;
+    for (int i = lane; i < i_dim; i += WAVE) acc += x[i] * (float)row[i];
+    acc = wave_sum(acc);
+    if (lane == 0) y[o] = acc * scale[o];
+}
+
+// h[i] = silu(g[i])·u[i], silu(x)=x/(1+e^-x) — the SwiGLU combine for the dense
+// fp8 MLP (moe.hip does this internally for VQ experts; the dense path is three
+// gemv_fp8 + this). Safe in place (h may alias g): each thread reads g[i]/u[i] then
+// writes h[i] independently.
+extern "C" __global__ void swiglu(
+    const float* __restrict__ g, const float* __restrict__ u, int n, float* __restrict__ h) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float gv = g[i];
+    h[i] = (gv / (1.0f + expf(-gv))) * u[i];
+}
+
 // y[i] = x[i]·(1/sqrt(mean(x²)+eps))·w[i] — RMSNorm, matching math.rs. One block
 // reduces Σx² in LDS (tree order), then every thread scales.
 extern "C" __global__ void rmsnorm(
@@ -144,10 +171,27 @@ extern "C" int rivoli_gemv_vq(
     return e == hipSuccess ? 0 : -(int)e;
 }
 
+extern "C" int rivoli_gemv_i8(
+    const float* x, const signed char* packed, const float* scale, int o_dim, int i_dim, float* y) {
+    if (o_dim <= 0 || i_dim <= 0) return 1001;
+    hipGetLastError();
+    hipLaunchKernelGGL(gemv_i8, ROW_GRID(o_dim), ROW_BLOCK, 0, 0, x, packed, scale, o_dim, i_dim, y);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
 extern "C" int rivoli_gemv_f32(const float* x, const float* w, int o_dim, int i_dim, float* y) {
     if (o_dim <= 0 || i_dim <= 0) return 1001;
     hipGetLastError();
     hipLaunchKernelGGL(gemv_f32, ROW_GRID(o_dim), ROW_BLOCK, 0, 0, x, w, o_dim, i_dim, y);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+extern "C" int rivoli_swiglu(const float* g, const float* u, int n, float* h) {
+    if (n <= 0) return 1001;
+    hipGetLastError();
+    hipLaunchKernelGGL(swiglu, dim3((n + 255) / 256), dim3(256), 0, 0, g, u, n, h);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

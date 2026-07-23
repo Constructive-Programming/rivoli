@@ -13,3 +13,7 @@ pub mod watchdog;
 pub mod hip;
 #[cfg(feature = "rocm")]
 pub mod stream;
+#[cfg(feature = "rocm")]
+pub mod pin;
+#[cfg(feature = "rocm")]
+pub mod gpu;

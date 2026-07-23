@@ -486,6 +486,17 @@ fn main() -> Result<()> {
         format!("{}/manifest.json", args.out_dir),
         serde_json::to_vec_pretty(&manifest)?,
     )?;
+
+    // 5. Copy the tokenizer files so the artifact is self-contained (the runtime
+    // loads tokenizer.json + generation_config.json from the model dir).
+    for name in ["tokenizer.json", "generation_config.json"] {
+        let src = format!("{}/{name}", args.fp8_dir);
+        let dst = format!("{}/{name}", args.out_dir);
+        match std::fs::copy(&src, &dst) {
+            Ok(_) => eprintln!("convert: copied {name}"),
+            Err(e) => eprintln!("convert: WARNING: {name} not copied ({e})"),
+        }
+    }
     eprintln!("convert: done — {} → {}", args.fp8_dir, args.out_dir);
     Ok(())
 }

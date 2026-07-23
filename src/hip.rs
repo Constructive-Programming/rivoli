@@ -134,7 +134,16 @@ unsafe extern "C" {
     fn rivoli_vadd(x: *mut f32, y: *const f32, n: i32) -> i32;
     fn rivoli_argmax(logits: *const f32, n: i32, out_idx: *mut i32, out_val: *mut f32) -> i32;
 
+    fn rivoli_gemv_i8(
+        x: *const f32,
+        packed: *const u8,
+        scale: *const f32,
+        o_dim: i32,
+        i_dim: i32,
+        y: *mut f32,
+    ) -> i32;
     fn rivoli_gemv_f32(x: *const f32, w: *const f32, o_dim: i32, i_dim: i32, y: *mut f32) -> i32;
+    fn rivoli_swiglu(g: *const f32, u: *const f32, n: i32, h: *mut f32) -> i32;
     fn rivoli_rmsnorm(x: *const f32, w: *const f32, n: i32, eps: f32, y: *mut f32) -> i32;
     fn rivoli_rope(base: *mut f32, count: i32, stride: i32, seg: i32, pos: i32, theta: f64) -> i32;
     fn rivoli_vq_encode(
@@ -457,6 +466,24 @@ pub unsafe fn launch_argmax(
     check(r, "argmax")
 }
 
+/// Per-row int8 GEMV `y = W·x` (lm_head → logits).
+///
+/// # Safety
+/// Async device pointers live until the next [`device_sync`]: `x` (`i_dim` f32),
+/// `packed` (`o_dim·i_dim` bytes), `scale` (`o_dim` f32), `y` (`o_dim` f32).
+pub unsafe fn launch_gemv_i8(
+    x: *const f32,
+    packed: *const u8,
+    scale: *const f32,
+    o_dim: usize,
+    i_dim: usize,
+    y: *mut f32,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r = unsafe { rivoli_gemv_i8(x, packed, scale, o_dim as i32, i_dim as i32, y) };
+    check(r, "gemv_i8")
+}
+
 /// f32 GEMV `y = W·x` (the MoE router gate).
 ///
 /// # Safety
@@ -471,6 +498,16 @@ pub unsafe fn launch_gemv_f32(
     // SAFETY: caller's pointer contract.
     let r = unsafe { rivoli_gemv_f32(x, w, o_dim as i32, i_dim as i32, y) };
     check(r, "gemv_f32")
+}
+
+/// SwiGLU combine `h = silu(g)·u` (dense fp8 MLP; safe in place, `h` may alias `g`).
+///
+/// # Safety
+/// Device pointers (`g`, `u`, `h` each `n` f32) live until the next [`device_sync`].
+pub unsafe fn launch_swiglu(g: *const f32, u: *const f32, n: usize, h: *mut f32) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r = unsafe { rivoli_swiglu(g, u, n as i32, h) };
+    check(r, "swiglu")
 }
 
 /// RMSNorm `y = x·rsqrt(mean(x²)+eps)·w`.
