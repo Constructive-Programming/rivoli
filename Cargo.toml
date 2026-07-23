@@ -29,11 +29,3 @@ expect_used = "deny"
 [profile.release]
 lto = true
 opt-level = 3
-
-[[bin]]
-name = "rivoli"
-path = "src/main.rs"
-
-[[bin]]
-name = "convert"
-path = "src/bin/convert.rs"
