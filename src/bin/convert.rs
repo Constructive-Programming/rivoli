@@ -56,14 +56,7 @@ mod gpu {
 
     impl Encoder {
         pub fn new(codebook: &[f32], max_sub: usize) -> Result<Self> {
-            let cbnorm: Vec<f32> = (0..VQ_K)
-                .map(|k| {
-                    codebook[k * VQ_DIM..(k + 1) * VQ_DIM]
-                        .iter()
-                        .map(|&c| c * c)
-                        .sum()
-                })
-                .collect();
+            let cbnorm = rivoli::quant::codebook_norms(codebook);
             let mut cb = DeviceBuf::new(codebook.len() * 4)?;
             cb.copy_in_at(0, f32_as_bytes(codebook))?;
             let mut nb = DeviceBuf::new(cbnorm.len() * 4)?;

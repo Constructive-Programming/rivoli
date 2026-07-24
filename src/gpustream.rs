@@ -132,12 +132,6 @@ impl Signal {
         Ok(())
     }
 
-    /// True once resolved (non-blocking) — the collision guard checks this before
-    /// reusing an in-flight slot.
-    pub fn is_ready(&self) -> bool {
-        self.0.done.load(Ordering::Acquire)
-    }
-
     /// Force-resolve from the resolver side without a stream (the reaper's error
     /// path, so awaiters never hang). Idempotent.
     pub fn resolve(&self) {

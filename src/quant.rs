@@ -23,18 +23,6 @@ fn scale_at(scale: &[u8], o: usize) -> f32 {
     f32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
 
-/// Dequantize row `row` of a per-row **int8** matrix (`packed[o·i_dim+i]` +
-/// `scale[o]` f32 bytes) into `out`: `out[i] = (int8)packed[row·i_dim+i]·scale[row]`.
-/// The embedding table lookup.
-pub fn dequant_int8_row(packed: &[u8], scale: &[u8], row: usize, i_dim: usize, out: &mut [f32]) {
-    debug_assert_eq!(out.len(), i_dim);
-    let s = scale_at(scale, row);
-    let base = row * i_dim;
-    for (i, o) in out.iter_mut().enumerate() {
-        *o = (packed[base + i] as i8) as f32 * s;
-    }
-}
-
 /// GEMV against a per-row **int8** matrix `W[o_dim, i_dim]` (one signed byte per
 /// weight + per-row f32 scale) — the lm_head projection to logits.
 pub fn matvec_i8(y: &mut [f32], x: &[f32], packed: &[u8], scale: &[u8], i_dim: usize) {
@@ -71,43 +59,6 @@ pub fn matvec_fp8(
     }
 }
 
-/// GEMV against a plain **f32** weight matrix `W[o_dim, i_dim]`, decoding the raw
-/// LE bytes inline (no `Vec<f32>` materialization) — the F32 router gate.
-pub fn matvec_f32_bytes(y: &mut [f32], x: &[f32], w_bytes: &[u8], i_dim: usize) {
-    debug_assert_eq!(x.len(), i_dim);
-    debug_assert_eq!(w_bytes.len(), y.len() * i_dim * 4);
-    for (yo, row) in y.iter_mut().zip(w_bytes.chunks_exact(i_dim * 4)) {
-        let mut acc = 0.0f32;
-        for (c, &xi) in row.chunks_exact(4).zip(x) {
-            acc += f32::from_le_bytes([c[0], c[1], c[2], c[3]]) * xi;
-        }
-        *yo = acc;
-    }
-}
-
-/// GEMV against a **bf16** weight matrix `W[o_dim, i_dim]`, widening each weight
-/// inline — the DSA lightning-indexer projections (`wq_b`, `wk`, `weights_proj`).
-pub fn matvec_bf16(y: &mut [f32], x: &[f32], data: &[u8], i_dim: usize) {
-    debug_assert_eq!(x.len(), i_dim);
-    for (yo, row) in y.iter_mut().zip(data.chunks_exact(i_dim * 2)) {
-        let mut acc = 0.0f32;
-        for (c, &xi) in row.chunks_exact(2).zip(x) {
-            acc += bf16_to_f32(u16::from_le_bytes([c[0], c[1]])) * xi;
-        }
-        *yo = acc;
-    }
-}
-
-/// Read a bf16 tensor's raw bytes into a `Vec<f32>`. For O-length tensors only
-/// (the indexer's `k_norm` weight/bias) — loaded once at startup.
-pub fn read_bf16(bytes: &[u8]) -> Vec<f32> {
-    debug_assert_eq!(bytes.len() % 2, 0, "bf16 tensor length not a multiple of 2");
-    bytes
-        .chunks_exact(2)
-        .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-        .collect()
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Vector-quantized int3 experts (M1 scalar oracle — see docs/int3.md).
 //
@@ -134,6 +85,20 @@ pub const VQ_K: usize = 4096;
 pub const VQ_INDEX_BITS: usize = 12;
 /// Weights per bf16 group scale (along the input dim).
 pub const VQ_GROUP: usize = 64;
+
+/// ‖c‖² per codebook entry — the argmin-VQ precompute, so nearest is
+/// `argmin(‖c‖² − 2·x·c)` (half the flops of the full squared distance, same
+/// argmin/tie-break). Shared by the CPU encoder and the GPU converter.
+pub fn codebook_norms(codebook: &[f32]) -> Vec<f32> {
+    (0..VQ_K)
+        .map(|k| {
+            codebook[k * VQ_DIM..(k + 1) * VQ_DIM]
+                .iter()
+                .map(|&c| c * c)
+                .sum()
+        })
+        .collect()
+}
 
 /// Packed-index byte stride of one VQ row: `i_dim/VQ_DIM` indices × `VQ_INDEX_BITS`,
 /// rounded to bytes. `i_dim` is a multiple of `VQ_DIM` and 8 for all GLM-5.2 dims,
@@ -330,16 +295,7 @@ pub fn quant_vq(w: &[f32], o_dim: usize, i_dim: usize, codebook: &[f32]) -> (Vec
     let rb = vq_row_bytes(i_dim);
     let mut indices = vec![0u8; o_dim * rb];
     let mut scales = vec![0u16; o_dim * ngroups];
-    // ‖c‖² per entry, so nearest is argmin(‖c‖² − 2·x·c) — half the flops of the
-    // full squared distance on the encode hot path (same argmin, same tie-break).
-    let norms: Vec<f32> = (0..VQ_K)
-        .map(|k| {
-            codebook[k * VQ_DIM..(k + 1) * VQ_DIM]
-                .iter()
-                .map(|&c| c * c)
-                .sum()
-        })
-        .collect();
+    let norms = codebook_norms(codebook);
     let nearest = |sub: &[f32; VQ_DIM]| -> u16 {
         let mut best = (f32::INFINITY, 0u16);
         for k in 0..VQ_K {

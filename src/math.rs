@@ -15,23 +15,6 @@ pub fn rmsnorm(v: &mut [f32], weight: &[f32], eps: f32) {
     }
 }
 
-/// RMSNorm writing into `dst` from `src`, with the weight read inline from raw
-/// little-endian f32 bytes (the mmap tensor) — no `Vec<f32>` decode and no
-/// separate copy pass: `dst = src / sqrt(mean(src²)+eps) * weight`, `src`
-/// untouched (so the residual survives). Fuses the copy+norm+weight-decode the
-/// decode loop otherwise does in three passes.
-pub fn rmsnorm_into_bytes(dst: &mut [f32], src: &[f32], weight_bytes: &[u8], eps: f32) {
-    debug_assert_eq!(dst.len(), src.len());
-    debug_assert_eq!(weight_bytes.len(), src.len() * 4);
-    let n = src.len() as f32;
-    let ms = src.iter().map(|&x| x * x).sum::<f32>() / n;
-    let inv = 1.0 / (ms + eps).sqrt();
-    for ((d, &s), wc) in dst.iter_mut().zip(src).zip(weight_bytes.chunks_exact(4)) {
-        let w = f32::from_le_bytes([wc[0], wc[1], wc[2], wc[3]]);
-        *d = s * inv * w;
-    }
-}
-
 /// SiLU (a.k.a. swish): `x * sigmoid(x)`.
 #[inline]
 pub fn silu(x: f32) -> f32 {
@@ -137,13 +120,6 @@ pub fn quantize_latent_fp8(latent: &[f32], data: &mut [u8], scales: &mut [f32]) 
             data[b * E4M3_BLOCK + i] = f32_to_e4m3(x / scale);
         }
     }
-}
-
-/// Dequantize one fp8 latent element at flat index `i`: `e4m3(data[i]) *
-/// scales[i / 128]`. Inverse of [`quantize_latent_fp8`].
-#[inline]
-pub fn dequant_latent_fp8(byte: u8, scale: f32) -> f32 {
-    e4m3_to_f32(byte) * scale
 }
 
 /// Widen OCP `float8_e4m3` → f32 (exact). Mirror of [`f32_to_e4m3`].
