@@ -17,7 +17,7 @@
 #![cfg(feature = "rocm")]
 
 use crate::cache;
-use crate::device::{DeviceTier, VmmBuf, mem_info};
+use crate::device::{DeviceTier, VmmBuf};
 use crate::format::{Dtype, FormatMeta, Safetensors, Vq3Set, load_codebooks};
 use crate::model::ModelConfig;
 use crate::quant::{VQ_DIM, VQ_K, vq_expert_bytes, vq_expert_layout, vq_proj_bytes, vq_row_bytes};
@@ -474,11 +474,8 @@ impl<'a> Pin<'a> {
         two_q: cache::TwoQSplit,
         want_indexer: bool,
     ) -> Result<Self> {
-        let (free, _total) = mem_info()?;
-        ensure!(
-            capacity < free,
-            "pin capacity {capacity} >= free device memory {free}"
-        );
+        // ponytail: no free-memory pre-check — the budget is the user's literal
+        // request (--max-mem), so let the device allocation itself OOM/fail.
         // One-time bound for `submit_layer`'s fixed 32-slot scratch.
         ensure!(
             cfg.top_k + cfg.n_shared <= 32,
