@@ -23,11 +23,6 @@ extern "C" int rivoli_stream_destroy(void* s) {
     return hipStreamDestroy((hipStream_t)s) == hipSuccess ? 0 : -1;
 }
 
-extern "C" int rivoli_stream_sync(void* s) {
-    hipError_t e = hipStreamSynchronize((hipStream_t)s);
-    return e == hipSuccess ? 0 : HIP_ERR_BASE - (int)e;
-}
-
 // Enqueue a host callback at the current point of `stream`: `cb(user)` fires once
 // every prior op on the stream has completed. This is the async signal — the Rust
 // side turns it into a resolved future.

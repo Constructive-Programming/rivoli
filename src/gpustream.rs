@@ -17,7 +17,6 @@ use std::task::{Context, Poll};
 unsafe extern "C" {
     fn rivoli_stream_create() -> *mut c_void;
     fn rivoli_stream_destroy(s: *mut c_void) -> i32;
-    fn rivoli_stream_sync(s: *mut c_void) -> i32;
     fn rivoli_stream_host_signal(
         s: *mut c_void,
         cb: extern "C" fn(*mut c_void),
@@ -45,16 +44,6 @@ impl HipStream {
     #[inline]
     pub fn raw(&self) -> *mut c_void {
         self.0
-    }
-
-    /// Blocking join — teardown / fallback only; the pipeline uses `signal`.
-    pub fn sync(&self) -> Result<()> {
-        // SAFETY: self.0 is a live stream.
-        let rc = unsafe { rivoli_stream_sync(self.0) };
-        if rc != 0 {
-            bail!("hipStreamSynchronize failed ({rc})");
-        }
-        Ok(())
     }
 
     /// A future that resolves once every op enqueued on this stream *so far* has
