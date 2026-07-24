@@ -3,10 +3,11 @@
 #![allow(clippy::expect_used)]
 
 use rivoli::device::DeviceBuf;
+use rivoli::gpustream::HipStream;
 use rivoli::hip::{
     ExpertDescVq, attend_scratch_floats, device_sync, launch_argmax, launch_attend,
-    launch_gemv_fp8, launch_gemv_vq, launch_mla_absorb_fp8, launch_mla_value_fp8, launch_moe_vq,
-    launch_vadd,
+    launch_gemv_fp8, launch_gemv_vq, launch_mla_absorb_fp8, launch_mla_value_fp8,
+    launch_moe_expert_range, launch_moe_reduce, launch_vadd,
 };
 use rivoli::math::{bf16_to_f32, e4m3_to_f32, f32_to_bf16, f32_to_e4m3, silu, softmax};
 use rivoli::quant::{VQ_DIM, VQ_K, matvec_fp8, matvec_vq, quant_vq};
@@ -473,22 +474,37 @@ fn moe_vq_matches_reference() {
     let mut pbuf = dev(&vec![0u8; e * hidden * 4]);
     let mut obuf = dev(&vec![0u8; hidden * 4]);
     let _ = (vq_groups(hidden), vq_row_bytes(hidden)); // (layout used by quant/vq_expert)
+    // The production path: each expert computes its own partial via a single-expert
+    // range on a compute stream (exercising e_start indexing), then a fixed-order
+    // reduce — same as the async expert stream, minus the load overlap.
+    let stream = HipStream::new().expect("stream");
     unsafe {
-        launch_moe_vq(
-            xb.ptr() as *const f32,
-            hidden,
-            inter,
+        for k in 0..e {
+            launch_moe_expert_range(
+                xb.ptr() as *const f32,
+                hidden,
+                inter,
+                k,
+                1,
+                descb.ptr() as *const ExpertDescVq,
+                g0.ptr() as *const f32,
+                g1.ptr() as *const f32,
+                g2.ptr() as *const f32,
+                wb.ptr() as *const f32,
+                hbuf.ptr_mut() as *mut f32,
+                pbuf.ptr_mut() as *mut f32,
+                stream.raw(),
+            )
+            .expect("launch moe_expert_range");
+        }
+        launch_moe_reduce(
+            pbuf.ptr() as *const f32,
             e,
-            descb.ptr() as *const ExpertDescVq,
-            g0.ptr() as *const f32,
-            g1.ptr() as *const f32,
-            g2.ptr() as *const f32,
-            wb.ptr() as *const f32,
-            hbuf.ptr_mut() as *mut f32,
-            pbuf.ptr_mut() as *mut f32,
+            hidden,
             obuf.ptr_mut() as *mut f32,
+            stream.raw(),
         )
-        .expect("launch moe_vq");
+        .expect("launch moe_reduce");
     }
     device_sync().expect("sync");
     assert_close(&want, &f32v(&obuf.copy_out().expect("out")), "moe_vq");

@@ -9,7 +9,7 @@ use std::ffi::c_void;
 
 /// VQ-int3 expert descriptor (mirrors `struct ExpertDescVq` in moe.hip): per
 /// projection the packed 12-bit indices + bf16 group scales. The 3 per-projection
-/// codebooks are shared across all experts and passed to [`launch_moe_vq`].
+/// codebooks are shared across all experts and passed to [`launch_moe_expert_range`].
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ExpertDescVq {
@@ -23,22 +23,6 @@ pub struct ExpertDescVq {
 
 unsafe extern "C" {
     fn rivoli_device_sync() -> i32;
-
-    #[allow(clippy::too_many_arguments)]
-    fn rivoli_moe_experts_vq(
-        x: *const f32,
-        hidden: i32,
-        inter: i32,
-        e: i32,
-        descs: *const ExpertDescVq,
-        gate_cb: *const f32,
-        up_cb: *const f32,
-        down_cb: *const f32,
-        wexpert: *const f32,
-        h: *mut f32,
-        partial: *mut f32,
-        out: *mut f32,
-    ) -> i32;
 
     #[allow(clippy::too_many_arguments)]
     fn rivoli_moe_expert_range(
@@ -234,56 +218,13 @@ pub fn device_sync() -> Result<()> {
     check(unsafe { rivoli_device_sync() }, "device_sync")
 }
 
-/// Launch a fused VQ-int3 MoE expert batch: `out += Σ_e w[e]·down(silu(gate·x)⊙up·x)`.
-/// gate/up/down decode against `gate_cb`/`up_cb`/`down_cb`. Routed + shared experts
-/// fold into one call (shared appended, weight 1.0).
-///
-/// # Safety
-/// Async, device pointers live until the next [`device_sync`]. `descs` ≥ `e`
-/// `ExpertDescVq`; `wexpert` `e` f32; `h` ≥ `e·inter` f32; `partial` `e·hidden` f32;
-/// `out` `hidden` f32; each codebook `VQ_K·VQ_DIM` f32.
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn launch_moe_vq(
-    x: *const f32,
-    hidden: usize,
-    inter: usize,
-    e: usize,
-    descs: *const ExpertDescVq,
-    gate_cb: *const f32,
-    up_cb: *const f32,
-    down_cb: *const f32,
-    wexpert: *const f32,
-    h: *mut f32,
-    partial: *mut f32,
-    out: *mut f32,
-) -> Result<()> {
-    // SAFETY: caller's pointer contract.
-    let r = unsafe {
-        rivoli_moe_experts_vq(
-            x,
-            hidden as i32,
-            inter as i32,
-            e as i32,
-            descs,
-            gate_cb,
-            up_cb,
-            down_cb,
-            wexpert,
-            h,
-            partial,
-            out,
-        )
-    };
-    check(r, "moe_vq")
-}
-
 /// Streaming MoE: gate/up + down for the absolute expert range `[e_start,
 /// e_start+e_count)` on `stream`, writing each expert's own `h`/`partial` rows.
 /// Reduce with [`launch_moe_reduce`] once every range's partials have landed.
 ///
 /// # Safety
-/// Same pointer contract as [`launch_moe_vq`]; every device pointer must outlive
-/// `stream`'s completion (await its [`StreamSignal`](crate::gpustream::StreamSignal)).
+/// Every device pointer (`descs`/codebooks/`wexpert`/`x`/`h`/`partial`) must outlive
+/// `stream`'s completion — await its [`Signal`](crate::gpustream::Signal).
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn launch_moe_expert_range(
     x: *const f32,

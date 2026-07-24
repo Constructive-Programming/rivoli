@@ -77,17 +77,17 @@ fn route_into(
     topk_into(choice, top_k, sel);
 }
 
+/// Expert-stream concurrency: how many experts' loads are in flight at once. ≥ the
+/// per-layer expert count (top_k + shared ≈ 9) so every expert is launched
+/// concurrently — the misses' fetch overlaps the resident experts' compute.
+const MOE_STREAM_WIDTH: usize = 16;
+
 /// Per-token time buckets. ALWAYS ON: every bucket wraps a join/D2H the forward
 /// pass already pays (the end-of-layer sync, the gate-logits read, the stream
 /// drain), so accumulating them costs only a clock read per layer — no extra GPU
 /// sync, nothing that perturbs the run. The end-of-run [`Profile::report`] is the
 /// engine's standing performance summary; the expensive fine-grained audits and
 /// correctness probes live behind the `trace` feature instead.
-/// Expert-stream concurrency: how many experts' loads are in flight at once. ≥ the
-/// per-layer expert count (top_k + shared ≈ 9) so every expert is launched
-/// concurrently — the misses' fetch overlaps the resident experts' compute.
-const MOE_STREAM_WIDTH: usize = 16;
-
 #[derive(Default)]
 struct Profile {
     fetch_ns: u128, // NVMe stream: submit + await (the bandwidth-bound term)

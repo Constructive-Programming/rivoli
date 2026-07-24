@@ -59,7 +59,7 @@ pub struct Int8Weight {
 
 /// A resolved VQ-int3 projection: packed 12-bit codebook indices + bf16 group
 /// scales (device pointers), decoded against the per-projection codebook. Consumed
-/// by `launch_moe_vq` via `desc_of_vq`.
+/// by `launch_moe_expert_range` via `desc_of_vq`.
 #[derive(Clone, Copy)]
 pub struct VqWeight {
     pub indices: *const u8,
@@ -78,7 +78,7 @@ pub struct MlpVq {
 
 /// One layer's MLP: dense fp8 for the first `dense_layers`, MoE after. The MoE
 /// shared expert is VQ-int3 (from the `.vq3` block `n_experts`), folded into the
-/// single `launch_moe_vq` batch alongside the routed picks.
+/// single `launch_moe_expert_range` batch alongside the routed picks.
 pub enum LayerMlp {
     Dense(Fp8Mlp),
     Moe {
@@ -132,7 +132,7 @@ pub struct Pin<'a> {
     /// routing runs on the CPU). `moe_bias[layer - dense_layers]`, len n_experts.
     moe_bias: Vec<Vec<f32>>,
     /// The three per-projection codebooks (gate/up/down), resident, passed to
-    /// `launch_moe_vq`. Each `VQ_K·VQ_DIM` f32.
+    /// `launch_moe_expert_range`. Each `VQ_K·VQ_DIM` f32.
     codebooks: [*const f32; 3],
     /// The routed-expert pool: ONE device-local VMM slab of `n_slots` expert slots
     /// (slot i at `i * expert_slot`), each one O_DIRECT-aligned `.vq3` block.
@@ -511,7 +511,7 @@ impl<'a> Pin<'a> {
         );
         let mut tier = DeviceTier::new(tier_cap)?;
 
-        // Codebooks resident (gate/up/down), passed to launch_moe_vq.
+        // Codebooks resident (gate/up/down), passed to launch_moe_expert_range.
         let mut codebooks = [std::ptr::null(); 3];
         for (i, cb) in cbs.iter().enumerate() {
             let bytes = cb.len() * 4;
@@ -642,7 +642,7 @@ impl<'a> Pin<'a> {
         &self.moe_bias[layer - self.cfg.dense_layers]
     }
 
-    /// The three per-projection codebooks (gate/up/down) for `launch_moe_vq`.
+    /// The three per-projection codebooks (gate/up/down) for `launch_moe_expert_range`.
     pub fn codebooks(&self) -> [*const f32; 3] {
         self.codebooks
     }

@@ -82,31 +82,6 @@ extern "C" __global__ void moe_reduce(
     out[o] = acc;
 }
 
-// Launch the batch over resident device memory: pass 1 → h (≥ E·inter f32), pass 2
-// → partial (E·hidden f32), fixed-order reduce → out. No alloc/copy/sync; the caller
-// owns everything and joins once per token.
-extern "C" int rivoli_moe_experts_vq(
-    const float* x, int hidden, int inter, int E, const void* descs,
-    const float* gate_cb, const float* up_cb, const float* down_cb,
-    const float* wexpert, float* h, float* partial, float* out) {
-    if (hidden <= 0 || inter <= 0 || E <= 0) return 1001;
-    const ExpertDescVq* d = (const ExpertDescVq*)descs;
-    hipGetLastError();
-    size_t rows_a = (size_t)E * inter;
-    hipLaunchKernelGGL(moe_gateup_vq, dim3((rows_a + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
-                       dim3(256), 0, 0, x, hidden, inter, 0, E, d, gate_cb, up_cb, h);
-    hipError_t e = hipGetLastError();
-    if (e != hipSuccess) return -(int)e;
-    size_t rows_b = (size_t)E * hidden;
-    hipLaunchKernelGGL(moe_down_vq, dim3((rows_b + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
-                       dim3(256), 0, 0, hidden, inter, 0, E, d, down_cb, wexpert, h, partial);
-    e = hipGetLastError();
-    if (e != hipSuccess) return -(int)e;
-    hipLaunchKernelGGL(moe_reduce, dim3((hidden + 255) / 256), dim3(256), 0, 0, partial, E, hidden, out);
-    e = hipGetLastError();
-    return e == hipSuccess ? 0 : -(int)e;
-}
-
 // --- Streaming-pipeline launchers: gate/up + down for an ABSOLUTE expert range on
 //     a caller-owned stream (so load DMA and this compute overlap on the GPU), and
 //     a stream-scoped reduce. The pipeline runs one range per expert (or a batched
