@@ -1,0 +1,132 @@
+#![cfg(feature = "rocm")]
+//! Per-expert async loads: the io_uring→future adapter under the expert stream.
+//!
+//! A reaper thread owns the demand ring and a dedicated fetch [`HipStream`]. Per
+//! MoE layer the pipeline hands it a batch of cold reads; it queues+submits them
+//! (so they run concurrently on the NVMe), then reaps completions one at a time.
+//! Because [`Streamer::reap`] already kicks each read's bounce→slot copy on the
+//! fetch stream, the reaper just arms that read's [`Signal`] on the same stream —
+//! so `load(e)` resolves when the COPY lands, not merely the NVMe read. A cache hit
+//! never enters here; its load is [`Signal::ready`].
+//!
+//! This is the whole concurrency surface: the `StreamExt` pipeline above stays
+//! single-threaded on the decode loop, the reaper blocks off-thread, and the two
+//! meet only through `Signal` wakers.
+
+use crate::gpustream::{HipStream, Signal};
+use crate::stream::Streamer;
+use anyhow::{Result, anyhow};
+use std::os::fd::RawFd;
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::thread::JoinHandle;
+
+/// One cold read: file range → VMM slot. `dst` is a device slot pointer valid
+/// across threads (device memory the ring DMAs into; never CPU-dereferenced here).
+pub struct ReadSpec {
+    pub fd: RawFd,
+    pub begin: usize,
+    pub len: usize,
+    pub dst: *mut u8,
+}
+// SAFETY: `dst` is only handed to io_uring / hipMemcpyAsync on the reaper thread,
+// never dereferenced on the CPU; `fd` is a plain descriptor.
+unsafe impl Send for ReadSpec {}
+
+/// A layer's demand batch: the reads plus one [`Signal`] per read (index =
+/// io_uring `user_data`) that the reaper resolves as each copy lands.
+struct ReapJob {
+    reads: Vec<ReadSpec>,
+    signals: Vec<Signal>,
+}
+
+/// Owns the demand ring + fetch stream on a reaper thread; services one [`ReapJob`]
+/// per MoE layer. Reads submitted via [`submit`](Self::submit) resolve their
+/// per-read [`Signal`] when loaded.
+pub struct AsyncFetch {
+    tx: Option<Sender<ReapJob>>,
+    reaper: Option<JoinHandle<()>>,
+}
+
+impl AsyncFetch {
+    /// Take ownership of the demand `streamer` and spawn the reaper with its own
+    /// fetch stream.
+    pub fn new(streamer: Streamer) -> Result<Self> {
+        let fetch = HipStream::new()?;
+        let (tx, rx) = channel::<ReapJob>();
+        let reaper = std::thread::Builder::new()
+            .name("rivoli-reaper".into())
+            .spawn(move || reaper_loop(streamer, fetch, rx))?;
+        Ok(Self {
+            tx: Some(tx),
+            reaper: Some(reaper),
+        })
+    }
+
+    /// Submit a layer's cold reads; returns one pending [`Signal`] per read, in the
+    /// same order (index = `user_data`). Reads run concurrently on the NVMe; each
+    /// signal resolves when its bounce copy has landed on the fetch stream. Empty
+    /// `reads` returns an empty vec (an all-hit layer).
+    pub fn submit(&self, reads: Vec<ReadSpec>) -> Result<Vec<Signal>> {
+        let signals: Vec<Signal> = reads.iter().map(|_| Signal::pending()).collect();
+        if reads.is_empty() {
+            return Ok(signals);
+        }
+        let job = ReapJob {
+            reads,
+            signals: signals.clone(),
+        };
+        self.tx
+            .as_ref()
+            .ok_or_else(|| anyhow!("AsyncFetch closed"))?
+            .send(job)
+            .map_err(|_| anyhow!("reaper thread gone"))?;
+        Ok(signals)
+    }
+}
+
+impl Drop for AsyncFetch {
+    fn drop(&mut self) {
+        // Close the channel → `reaper_loop`'s `for job in rx` ends → thread exits.
+        self.tx.take();
+        if let Some(h) = self.reaper.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Reaper thread: one job per layer until the channel closes.
+fn reaper_loop(mut streamer: Streamer, fetch: HipStream, rx: Receiver<ReapJob>) {
+    for job in rx {
+        if let Err(e) = run_job(&mut streamer, &fetch, &job) {
+            // Fatal fetch error: log and resolve every signal so no awaiter hangs —
+            // the slots hold stale bytes, which the forward's finiteness guard trips.
+            tracing::error!("reaper: {e:#}");
+            for s in &job.signals {
+                s.resolve();
+            }
+        }
+    }
+}
+
+fn run_job(streamer: &mut Streamer, fetch: &HipStream, job: &ReapJob) -> Result<()> {
+    for r in &job.reads {
+        // SAFETY: `dst` is an ALIGN-aligned device slot the pipeline keeps live until
+        // this read's signal resolves; the VQ blocks are VQ_ALIGN-aligned so the
+        // returned sub-offset is 0 (the slot start IS the block).
+        let sub = unsafe { streamer.queue(r.fd, r.begin, r.len, r.dst)? };
+        debug_assert_eq!(
+            sub, 0,
+            "VQ expert read must be block-aligned (sub-offset 0)"
+        );
+    }
+    streamer.submit()?;
+    for _ in 0..job.reads.len() {
+        // SAFETY: `fetch` is a live stream; `reap` kicks this read's copy on it and
+        // returns the completed read's user_data.
+        let u = unsafe { streamer.reap(fetch.raw())? };
+        // Resolve when the copy (enqueued by `reap`) lands on the fetch stream.
+        job.signals[u].arm_on(fetch)?;
+    }
+    streamer.reset_batch();
+    Ok(())
+}

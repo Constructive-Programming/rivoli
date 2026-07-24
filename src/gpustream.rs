@@ -46,24 +46,12 @@ impl HipStream {
         self.0
     }
 
-    /// A future that resolves once every op enqueued on this stream *so far* has
-    /// completed on the GPU. Enqueue the work first, then call this.
-    pub fn signal(&self) -> Result<StreamSignal> {
-        let state = Arc::new(SignalState {
-            done: AtomicBool::new(false),
-            waker: AtomicWaker::new(),
-        });
-        // Hand one ref to the callback; the trampoline reclaims it exactly once.
-        let user = Arc::into_raw(state.clone()) as *mut c_void;
-        // SAFETY: `trampoline` has the C callback signature; `user` is a live Arc ptr.
-        let rc = unsafe { rivoli_stream_host_signal(self.0, trampoline, user) };
-        if rc != 0 {
-            // Enqueue failed → callback never runs → reclaim the ref here.
-            // SAFETY: `user` came from into_raw and was not consumed.
-            unsafe { drop(Arc::from_raw(user as *const SignalState)) };
-            bail!("hipLaunchHostFunc failed ({rc})");
-        }
-        Ok(StreamSignal(state))
+    /// A [`Signal`] that resolves once every op enqueued on this stream *so far*
+    /// has completed on the GPU. Enqueue the work first, then call this.
+    pub fn signal(&self) -> Result<Signal> {
+        let s = Signal::pending();
+        s.arm_on(self)?;
+        Ok(s)
     }
 }
 
@@ -88,10 +76,62 @@ extern "C" fn trampoline(user: *mut c_void) {
     state.waker.wake();
 }
 
-/// Resolves when its stream's enqueued work has completed on the GPU.
-pub struct StreamSignal(Arc<SignalState>);
+/// A one-shot completion shared between whatever resolves it (a GPU-stream
+/// host-func, an io_uring reaper) and the future that awaits it. `pending()` +
+/// `arm_on(stream)` fires it when a stream reaches a point; `ready()` is an
+/// already-resolved hit. `Clone` (Arc) so the resolver and the awaiter each hold
+/// one; `Send`/`Sync` so a reaper thread can arm what the main task awaits.
+#[derive(Clone)]
+pub struct Signal(Arc<SignalState>);
 
-impl Future for StreamSignal {
+impl Signal {
+    /// An unresolved signal.
+    pub fn pending() -> Self {
+        Signal(Arc::new(SignalState {
+            done: AtomicBool::new(false),
+            waker: AtomicWaker::new(),
+        }))
+    }
+
+    /// An already-resolved signal — a cache hit whose data is already present.
+    pub fn ready() -> Self {
+        let s = Self::pending();
+        s.0.done.store(true, Ordering::Release);
+        s
+    }
+
+    /// Fire this signal when `stream` reaches its current point (a host-func
+    /// callback wakes it), so the enqueued GPU work's completion resolves the
+    /// future. Enqueue the work first, then arm.
+    pub fn arm_on(&self, stream: &HipStream) -> Result<()> {
+        // Hand one ref to the callback; the trampoline reclaims it exactly once.
+        let user = Arc::into_raw(self.0.clone()) as *mut c_void;
+        // SAFETY: `trampoline` has the C callback signature; `user` is a live Arc ptr.
+        let rc = unsafe { rivoli_stream_host_signal(stream.raw(), trampoline, user) };
+        if rc != 0 {
+            // Enqueue failed → callback never runs → reclaim the ref here.
+            // SAFETY: `user` came from into_raw and was not consumed.
+            unsafe { drop(Arc::from_raw(user as *const SignalState)) };
+            bail!("hipLaunchHostFunc failed ({rc})");
+        }
+        Ok(())
+    }
+
+    /// True once resolved (non-blocking) — the collision guard checks this before
+    /// reusing an in-flight slot.
+    pub fn is_ready(&self) -> bool {
+        self.0.done.load(Ordering::Acquire)
+    }
+
+    /// Force-resolve from the resolver side without a stream (the reaper's error
+    /// path, so awaiters never hang). Idempotent.
+    pub fn resolve(&self) {
+        self.0.done.store(true, Ordering::Release);
+        self.0.waker.wake();
+    }
+}
+
+impl Future for Signal {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         if self.0.done.load(Ordering::Acquire) {

@@ -13,6 +13,8 @@ pub mod tokenizer;
 pub mod watchdog;
 
 #[cfg(feature = "rocm")]
+pub mod asyncfetch;
+#[cfg(feature = "rocm")]
 pub mod gpu;
 #[cfg(feature = "rocm")]
 pub mod gpustream;

@@ -115,6 +115,12 @@ pub struct Streamer {
     min_res: Vec<u64>,
 }
 
+// SAFETY: the ring pointer is exclusively owned by whoever holds the `Streamer`.
+// io_uring rings are NOT thread-safe, so this only asserts the handle can MOVE
+// across threads — `AsyncFetch` moves it once into its reaper thread, which is then
+// the sole accessor. Never share a `&Streamer`/`&mut Streamer` across threads.
+unsafe impl Send for Streamer {}
+
 impl Streamer {
     /// `entries` = max in-flight reads; `span` = the largest aligned superset a
     /// single read may deliver (`slot_span` of the biggest projection tensor).
