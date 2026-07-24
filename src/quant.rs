@@ -443,9 +443,57 @@ pub fn quant_i4(w: &[f32], o_dim: usize, i_dim: usize) -> (Vec<u8>, Vec<f32>) {
     (packed, scale)
 }
 
+/// On-disk bytes of one int4 projection `W[o_dim, i_dim]`: `o_dim` packed rows then
+/// `o_dim` f32 per-row scales, back-to-back (one projection = one contiguous span).
+pub fn i4_proj_bytes(o_dim: usize, i_dim: usize) -> usize {
+    o_dim * i4_row_bytes(i_dim) + o_dim * 4
+}
+
+/// Unpadded on-disk bytes of one int4 expert (gate‖gate_scale‖up‖up_scale‖down‖
+/// down_scale). Reuses [`vq_expert_layout`] — the (o,i) dims are format-independent.
+pub fn i4_expert_bytes(hidden: usize, moe_inter: usize) -> usize {
+    vq_expert_layout(hidden, moe_inter)
+        .iter()
+        .map(|&(o, i)| i4_proj_bytes(o, i))
+        .sum()
+}
+
+/// Per-expert on-disk stride: [`i4_expert_bytes`] padded up to [`VQ_ALIGN`], so one
+/// int4 expert is a single block-aligned read (mirrors the `.vq3` stride).
+pub fn i4_expert_stride(hidden: usize, moe_inter: usize) -> usize {
+    i4_expert_bytes(hidden, moe_inter).div_ceil(VQ_ALIGN) * VQ_ALIGN
+}
+
+/// The six byte offsets within one int4 expert block, in [`ExpertDescI4`] field
+/// order: `[gate_packed, gate_scale, up_packed, up_scale, down_packed, down_scale]`.
+/// Every packed span starts 4-byte aligned (rows are `i_dim/2`, i_dim a multiple of
+/// 8), so `dot_i4_wave`'s dword fast path stays valid. `ExpertDescI4` — crate::hip.
+pub fn i4_slot_offsets(hidden: usize, moe_inter: usize) -> [usize; 6] {
+    let [(go, gi), (uo, ui), (dno, dni)] = vq_expert_layout(hidden, moe_inter);
+    let gp = 0;
+    let gs = gp + go * i4_row_bytes(gi);
+    let up = gs + go * 4;
+    let us = up + uo * i4_row_bytes(ui);
+    let dp = us + uo * 4;
+    let ds = dp + dno * i4_row_bytes(dni);
+    [gp, gs, up, us, dp, ds]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn i4_slot_offsets_are_contiguous_and_aligned() {
+        let (hidden, inter) = (6144usize, 2048usize);
+        let off = i4_slot_offsets(hidden, inter);
+        assert_eq!(off[0], 0);
+        for &o in &off {
+            assert_eq!(o % 4, 0, "packed/scale span {o} not 4-byte aligned");
+        }
+        // last span (down_scale) ends exactly at i4_expert_bytes.
+        assert_eq!(off[5] + hidden * 4, i4_expert_bytes(hidden, inter));
+    }
 
     #[test]
     fn i4_quant_matvec_roundtrip() {
