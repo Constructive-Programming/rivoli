@@ -64,7 +64,20 @@ __device__ __forceinline__ float dot_fp8_wave(const float* __restrict__ x,
                                               int i_dim, int block, int lane,
                                               const float* __restrict__ lut) {
     float acc = 0.0f;
-    for (int i = lane; i < i_dim; i += WAVE) acc += x[i] * lut[wrow[i]] * scalerow[i / block];
+    // ponytail-experiment: uint-per-lane weight load (4 fp8/lane → 128B/wave) atop the LUT.
+    const unsigned int* w4 = (const unsigned int*)wrow;
+    int n4 = i_dim >> 2;
+    for (int j = lane; j < n4; j += WAVE) {
+        unsigned int p = w4[j];
+        int i0 = j << 2;
+        float s = scalerow[i0 / block];
+        acc += s * (x[i0]     * lut[(unsigned char)p]
+                  + x[i0 + 1] * lut[(unsigned char)(p >> 8)]
+                  + x[i0 + 2] * lut[(unsigned char)(p >> 16)]
+                  + x[i0 + 3] * lut[(unsigned char)(p >> 24)]);
+    }
+    for (int i = (n4 << 2) + lane; i < i_dim; i += WAVE)
+        acc += x[i] * lut[wrow[i]] * scalerow[i / block];
     return wave_sum(acc);
 }
 
@@ -94,11 +107,11 @@ __device__ __forceinline__ float dot_vq_wave(const float* __restrict__ x,
         int shift = bitpos & 7;
         unsigned int raw = (unsigned int)idxrow[byte] | ((unsigned int)idxrow[byte + 1] << 8);
         int idx = (int)((raw >> shift) & 0xFFFu);
-        const float* c = cb + (size_t)idx * VQ_DIM;
-        const float* xv = x + t * VQ_DIM;
-        float dot = 0.0f;
-#pragma unroll
-        for (int d = 0; d < VQ_DIM; ++d) dot += xv[d] * c[d];
+        // ponytail-experiment: float4 loads for the VQ_DIM=4 subvector (16B/load,
+        // bit-identical to the scalar unroll — same 4 products, same order).
+        float4 cv = *(const float4*)(cb + (size_t)idx * VQ_DIM);
+        float4 xv = *(const float4*)(x + (size_t)t * VQ_DIM);
+        float dot = xv.x * cv.x + xv.y * cv.y + xv.z * cv.z + xv.w * cv.w;
         acc += bf16f(scalerow[t / VQ_SUBS_PER_GROUP]) * dot;
     }
     return wave_sum(acc);

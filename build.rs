@@ -18,6 +18,8 @@ fn main() {
     ];
     let hipcc = std::env::var("HIPCC").unwrap_or_else(|_| "hipcc".into());
 
+    // Headers are #included, not compiled units — track them so an edit forces a rebuild.
+    println!("cargo:rerun-if-changed=kernels/common.hpp");
     let mut objs = Vec::new();
     for k in kernels {
         let src = format!("kernels/{k}.hip");
