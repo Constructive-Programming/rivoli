@@ -48,6 +48,8 @@ mod ffi {
         ) -> i32;
         pub fn rivoli_ring_submit(ring: *mut c_void) -> i32;
         pub fn rivoli_ring_wait(ring: *mut c_void, count: u32, min_res: *const u64) -> i32;
+        pub fn rivoli_ring_reap(ring: *mut c_void, min_res: *const u64, stream: *mut c_void)
+        -> i64;
         pub fn rivoli_ring_free(ring: *mut c_void);
         pub fn rivoli_ring_timings(read_ns: *mut u64, copy_ns: *mut u64);
     }
@@ -229,6 +231,34 @@ impl Streamer {
             std::io::Error::from_raw_os_error(-r)
         );
         Ok(())
+    }
+
+    /// Per-read async reap (the streaming pipeline's alternative to [`drain`]):
+    /// block for the NEXT read to complete, kick its bounce→slot copy on `stream`,
+    /// and return the completed read's `user_data` (the index into the batch). The
+    /// caller reaps exactly `queued` times, then [`reset_batch`](Self::reset_batch).
+    /// Bookkeeping (`queued`/`min_res`) is left intact across a batch's reaps because
+    /// `min_res` is indexed by `user_data` and every reap needs it.
+    ///
+    /// # Safety
+    /// `stream` is a live HipStream handle; the copied read's `dst` slot must stay
+    /// valid until that stream's completion signal fires.
+    pub unsafe fn reap(&mut self, stream: *mut c_void) -> Result<usize> {
+        // SAFETY: `ring` live; `min_res` holds this batch's per-read thresholds.
+        let ud = unsafe { ffi::rivoli_ring_reap(self.ring, self.min_res.as_ptr(), stream) };
+        ensure!(
+            ud >= 0,
+            "io_uring reap failed ({})",
+            std::io::Error::from_raw_os_error(-ud as i32)
+        );
+        Ok(ud as usize)
+    }
+
+    /// Reset the queued/min_res bookkeeping after a full batch has been [`reap`]ed
+    /// (the reap path's equivalent of `drain`'s post-wait reset).
+    pub fn reset_batch(&mut self) {
+        self.queued = 0;
+        self.min_res.clear();
     }
 
     /// Submit all queued reads and block until every one completes; errors on the

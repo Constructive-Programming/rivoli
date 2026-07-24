@@ -238,6 +238,35 @@ extern "C" int rivoli_ring_wait(void* ring, unsigned count,
     return he == hipSuccess ? 0 : HIP_ERR_BASE - (int)he;
 }
 
+// Per-read async reap (streaming pipeline, B). Block for the NEXT completion,
+// validate it exactly as `rivoli_ring_wait` does, and — bounce mode — kick that one
+// read's hipMemcpyAsync(bounce[ud] -> dst[ud]) on `stream` so the caller can fire a
+// host-func on the same stream to wake that expert's load future when the COPY (not
+// just the NVMe read) lands. Returns the completed read's user_data (>=0), or a
+// negative error (-errno / -EIO real truncation / HIP_ERR_BASE-hipError). `min_res`
+// (indexed by user_data) may be null. The caller reaps exactly as many times as it
+// queued+submitted since the last drain/reap-set; reads run concurrently on the
+// NVMe, completions arrive in device order, each resolving its own expert.
+extern "C" long long rivoli_ring_reap(void* ring, const unsigned long long* min_res,
+                                      void* stream) {
+    Ring* r = (Ring*)ring;
+    struct io_uring_cqe* c;
+    int w = io_uring_wait_cqe(&r->uring, &c);
+    if (w < 0) return w;
+    long long res = c->res;
+    unsigned long long ud = io_uring_cqe_get_data64(c);
+    io_uring_cqe_seen(&r->uring, c);
+    if (res < 0) return res;
+    if (min_res && (unsigned long long)res < min_res[ud]) return -EIO;
+    if (r->bounce_mode) {
+        hipError_t he = hipMemcpyAsync(r->dst[ud], r->bounce + (size_t)ud * r->span,
+                                       r->nbytes[ud], hipMemcpyHostToDevice,
+                                       (hipStream_t)stream);
+        if (he != hipSuccess) return HIP_ERR_BASE - (long long)he;
+    }
+    return (long long)ud;
+}
+
 extern "C" void rivoli_ring_free(void* ring) {
     Ring* r = (Ring*)ring;
     if (r->bounce_mode) {
