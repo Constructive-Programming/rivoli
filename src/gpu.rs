@@ -242,9 +242,6 @@ pub struct GpuEngine<'a> {
     /// run here concurrently with the fetch stream's loads (the overlap). Separate
     /// from the null stream the rest of the forward uses.
     compute_stream: HipStream,
-    /// Current-thread runtime that drives the per-layer expert stream. The decode
-    /// loop is serial; GPU/IO concurrency comes from the streams + reaper, not threads.
-    rt: tokio::runtime::Runtime,
     /// Compute-stream span events (bracket the MoE partials+reduce) + the expert
     /// stream's task monitor (idle = load-wait, poll = launch) — the accurate timing
     /// the async overlap hides from wall-clock.
@@ -371,7 +368,6 @@ impl<'a> GpuEngine<'a> {
             argmax_host: Vec::with_capacity(8),
             prof: Profile::default(),
             compute_stream: HipStream::new()?,
-            rt: tokio::runtime::Builder::new_current_thread().build()?,
             moe_ev_start: HipEvent::new()?,
             moe_ev_end: HipEvent::new()?,
             moe_monitor: tokio_metrics::TaskMonitor::new(),
@@ -580,7 +576,7 @@ impl<'a> GpuEngine<'a> {
 
     /// One forward pass for `token` at `pos`, leaving next-token logits device-side
     /// in `self.logits`.
-    fn forward(&mut self, token: u32, pos: usize) -> Result<()> {
+    async fn forward(&mut self, token: u32, pos: usize) -> Result<()> {
         let cfg = self.cfg;
         let eps = cfg.rms_norm_eps as f32;
         let (h, qh, nope, rope, kvl, vh, hidden) = (
@@ -878,32 +874,31 @@ impl<'a> GpuEngine<'a> {
                 // GPU-side timing; read at the end-of-layer join.
                 self.moe_ev_start.record(cs_raw)?;
                 let tm = std::time::Instant::now();
-                self.rt.block_on(async move {
-                    futures_util::stream::iter(0..ndesc)
-                        .map(move |e| {
-                            let sig = signals[e].clone();
-                            // Instrument: idle = time parked on the load Signal (the
-                            // fetch-wait the stream sees), poll = the launch cost.
-                            monitor.instrument(async move {
-                                sig.await;
-                                // SAFETY: descs/codebooks resident; slot loaded (sig
-                                // resolved); h/part device scratch; cs_raw live.
-                                unsafe {
-                                    launch_moe_expert_range(
-                                        x_c, hidden, inter, e, 1, descs_ptr, cb0, cb1, cb2, w_ptr,
-                                        h_c, part_c, cs_raw,
-                                    )
-                                }
-                            })
+                // The expert stream runs inline in this (async) forward — awaited by
+                // the single decode-loop runtime, so no per-layer block_on.
+                futures_util::stream::iter(0..ndesc)
+                    .map(move |e| {
+                        let sig = signals[e].clone();
+                        // Instrument: idle = time parked on the load Signal (the
+                        // fetch-wait the stream sees), poll = the launch cost.
+                        monitor.instrument(async move {
+                            sig.await;
+                            // SAFETY: descs/codebooks resident; slot loaded (sig
+                            // resolved); h/part device scratch; cs_raw live.
+                            unsafe {
+                                launch_moe_expert_range(
+                                    x_c, hidden, inter, e, 1, descs_ptr, cb0, cb1, cb2, w_ptr, h_c,
+                                    part_c, cs_raw,
+                                )
+                            }
                         })
-                        .buffer_unordered(MOE_STREAM_WIDTH)
-                        .try_collect::<Vec<()>>()
-                        .await?;
-                    // SAFETY: partial holds ndesc·hidden f32; out is hidden f32; cs live.
-                    unsafe { launch_moe_reduce(part_c, ndesc, hidden, out_c, cs_raw)? };
-                    stream_signal(cs_raw)?.await;
-                    Ok::<(), anyhow::Error>(())
-                })?;
+                    })
+                    .buffer_unordered(MOE_STREAM_WIDTH)
+                    .try_collect::<Vec<()>>()
+                    .await?;
+                // SAFETY: partial holds ndesc·hidden f32; out is hidden f32; cs live.
+                unsafe { launch_moe_reduce(part_c, ndesc, hidden, out_c, cs_raw)? };
+                stream_signal(cs_raw)?.await;
                 self.prof.moe_wall_ns += tm.elapsed().as_nanos();
                 self.moe_ev_end.record(cs_raw)?;
             }
@@ -1000,50 +995,58 @@ impl<'a> GpuEngine<'a> {
         eos: &[u32],
     ) -> Result<(Vec<u32>, ProfileSummary)> {
         ensure!(!prompt_ids.is_empty(), "empty prompt");
-        let mut pos = 0usize;
-        for &tok in prompt_ids {
-            self.forward(tok, pos)?;
-            pos += 1;
-        }
-        // Profile the DECODE loop only (prefill is warm-up); reset the pin counters
-        // too so hit% and misses/tok describe steady-state decode, not the cold prefill.
-        self.prof = Profile::default();
-        let hit0 = self.pin.hits;
-        let miss0 = self.pin.misses;
-        let decode_wall = std::time::Instant::now();
-        let mut generated = Vec::with_capacity(ngen);
-        // Per-window throughput trend (verbose) is a `trace`-only audit.
+        // The decode as ONE async flow: prefill (warm-up) then the token loop, driven
+        // by a single current-thread runtime — `forward` awaits the expert stream
+        // inline, so there's no per-layer block_on. The token loop is serial by data
+        // dependency (T+1 needs T's argmax); this is the shape MTP/speculative decode
+        // slots into. `rt` is local (not on `self`) so the future can borrow `&mut self`.
         #[cfg(feature = "trace")]
         const WIN: usize = 8;
-        #[cfg(feature = "trace")]
-        let mut win_t = std::time::Instant::now();
-        #[cfg(feature = "trace")]
-        let (mut win_hit, mut win_miss) = (self.pin.hits, self.pin.misses);
-        for _i in 0..ngen {
-            if let Some(hb) = &self.heartbeat {
-                hb.beat();
+        let rt = tokio::runtime::Builder::new_current_thread().build()?;
+        let mut generated = Vec::with_capacity(ngen);
+        let (hit0, miss0, decode_wall) = rt.block_on(async {
+            let mut pos = 0usize;
+            for &tok in prompt_ids {
+                self.forward(tok, pos).await?;
+                pos += 1;
             }
-            let next = self.argmax()?;
-            if eos.contains(&next) {
-                break;
-            }
-            generated.push(next);
-            self.forward(next, pos)?;
-            pos += 1;
+            // Profile the DECODE loop only (prefill is warm-up); reset the pin counters
+            // too so hit%/misses describe steady-state decode, not the cold prefill.
+            self.prof = Profile::default();
+            let hit0 = self.pin.hits;
+            let miss0 = self.pin.misses;
+            let decode_wall = std::time::Instant::now();
             #[cfg(feature = "trace")]
-            if (_i + 1) % WIN == 0 {
-                let dt = win_t.elapsed().as_secs_f64();
-                let (dh, dm) = (self.pin.hits - win_hit, self.pin.misses - win_miss);
-                let hit_pct = 100.0 * dh as f64 / (dh + dm).max(1) as f64;
-                tracing::info!(
-                    "  tok {}/{ngen}: {:.3} tok/s (window), hit {hit_pct:.1}%",
-                    _i + 1,
-                    WIN as f64 / dt.max(1e-9),
-                );
-                win_t = std::time::Instant::now();
-                (win_hit, win_miss) = (self.pin.hits, self.pin.misses);
+            let mut win_t = std::time::Instant::now();
+            #[cfg(feature = "trace")]
+            let (mut win_hit, mut win_miss) = (self.pin.hits, self.pin.misses);
+            for _i in 0..ngen {
+                if let Some(hb) = &self.heartbeat {
+                    hb.beat();
+                }
+                let next = self.argmax()?;
+                if eos.contains(&next) {
+                    break;
+                }
+                generated.push(next);
+                self.forward(next, pos).await?;
+                pos += 1;
+                #[cfg(feature = "trace")]
+                if (_i + 1) % WIN == 0 {
+                    let dt = win_t.elapsed().as_secs_f64();
+                    let (dh, dm) = (self.pin.hits - win_hit, self.pin.misses - win_miss);
+                    let hit_pct = 100.0 * dh as f64 / (dh + dm).max(1) as f64;
+                    tracing::info!(
+                        "  tok {}/{ngen}: {:.3} tok/s (window), hit {hit_pct:.1}%",
+                        _i + 1,
+                        WIN as f64 / dt.max(1e-9),
+                    );
+                    win_t = std::time::Instant::now();
+                    (win_hit, win_miss) = (self.pin.hits, self.pin.misses);
+                }
             }
-        }
+            Ok::<_, anyhow::Error>((hit0, miss0, decode_wall))
+        })?;
         self.prof.wall_ns = decode_wall.elapsed().as_nanos();
         self.prof.tokens = generated.len() as u64;
         let bytes_per_expert = crate::quant::vq_expert_bytes(self.cfg.hidden, self.cfg.moe_inter);
