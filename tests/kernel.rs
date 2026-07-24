@@ -59,36 +59,39 @@ impl Lcg {
 
 #[test]
 fn gemv_fp8_matches_oracle() {
-    // block-scaled fp8 GEMV vs matvec_fp8. Dims a multiple of block on both axes.
-    let mut r = Lcg(0xF8);
-    let (o_dim, i_dim, block) = (256usize, 512usize, 128usize);
-    // build fp8 packed + block scales, then the exact dequant the oracle sees.
-    let packed: Vec<u8> = (0..o_dim * i_dim).map(|_| f32_to_e4m3(r.f())).collect();
-    let sc_cols = i_dim / block;
-    let scale: Vec<f32> = (0..(o_dim / block) * sc_cols)
-        .map(|_| (r.f() * 0.1).abs() + 0.01)
-        .collect();
-    let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
+    // block-scaled fp8 GEMV vs matvec_fp8. Two shapes: a short reduction (plain
+    // wave-per-row path) and a long one (i_dim ≥ 4096 → the split-K path
+    // launch_gemv_fp8 dispatches to for the o_proj-class projections).
+    let block = 128usize;
+    for (o_dim, i_dim, label) in [(256usize, 512usize, "gemv_fp8"), (128, 16384, "gemv_fp8_splitk")] {
+        let mut r = Lcg(0xF8 ^ i_dim as u64);
+        let packed: Vec<u8> = (0..o_dim * i_dim).map(|_| f32_to_e4m3(r.f())).collect();
+        let sc_cols = i_dim / block;
+        let scale: Vec<f32> = (0..(o_dim / block) * sc_cols)
+            .map(|_| (r.f() * 0.1).abs() + 0.01)
+            .collect();
+        let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
 
-    let mut want = vec![0.0f32; o_dim];
-    matvec_fp8(&mut want, &x, &packed, &scale, i_dim, block);
+        let mut want = vec![0.0f32; o_dim];
+        matvec_fp8(&mut want, &x, &packed, &scale, i_dim, block);
 
-    let (xb, pb, sb) = (dev(&f32b(&x)), dev(&packed), dev(&f32b(&scale)));
-    let mut yb = dev(&vec![0u8; o_dim * 4]);
-    unsafe {
-        launch_gemv_fp8(
-            xb.ptr() as *const f32,
-            pb.ptr(),
-            sb.ptr() as *const f32,
-            o_dim,
-            i_dim,
-            block,
-            yb.ptr_mut() as *mut f32,
-        )
-        .expect("launch");
+        let (xb, pb, sb) = (dev(&f32b(&x)), dev(&packed), dev(&f32b(&scale)));
+        let mut yb = dev(&vec![0u8; o_dim * 4]);
+        unsafe {
+            launch_gemv_fp8(
+                xb.ptr() as *const f32,
+                pb.ptr(),
+                sb.ptr() as *const f32,
+                o_dim,
+                i_dim,
+                block,
+                yb.ptr_mut() as *mut f32,
+            )
+            .expect("launch");
+        }
+        device_sync().expect("sync");
+        assert_close(&want, &f32v(&yb.copy_out().expect("out")), label);
     }
-    device_sync().expect("sync");
-    assert_close(&want, &f32v(&yb.copy_out().expect("out")), "gemv_fp8");
 }
 
 #[test]

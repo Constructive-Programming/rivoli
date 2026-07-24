@@ -26,6 +26,51 @@ extern "C" __global__ void gemv_fp8(
     if (lane == 0) y[o] = acc;
 }
 
+// Split-K fp8 GEMV for LONG reductions: ONE block per output row, its ROWS_PER_BLOCK
+// waves each reduce a strided 1/K share of i_dim, combined in LDS in fixed order
+// (deterministic). o_proj (o_dim=6144, i_dim=16384) has too few rows to fill the
+// machine under wave-per-row (768 blocks, each wave grinding a 16384-long chain);
+// one-row-per-block gives K× the blocks so DRAM saturates — measured 128→~250 GB/s.
+// Same LUT + block-scaled e4m3 dot as gemv_fp8; the whole block strides coalesced.
+extern "C" __global__ void gemv_fp8_splitk(
+    const float* __restrict__ x, const unsigned char* __restrict__ packed,
+    const float* __restrict__ scale, int o_dim, int i_dim, int block, float* __restrict__ y) {
+    __shared__ float lut[256];
+    __shared__ float part[ROWS_PER_BLOCK]; // K = ROWS_PER_BLOCK wave partials
+    e4m3_lut_build(lut, threadIdx.x);
+    __syncthreads();
+    size_t o = blockIdx.x; // one output row per block
+    if (o >= (size_t)o_dim) return;
+    int wave = threadIdx.x / WAVE;
+    int lane = threadIdx.x & (WAVE - 1);
+    int sc_cols = (i_dim + block - 1) / block;
+    const unsigned char* wrow = packed + o * (size_t)i_dim;
+    const float* scalerow = scale + (o / block) * sc_cols;
+    const unsigned int* w4 = (const unsigned int*)wrow;
+    int n4 = i_dim >> 2;
+    const int STRIDE = ROWS_PER_BLOCK * WAVE; // all 256 threads stride coalesced
+    float acc = 0.0f;
+    for (int j = threadIdx.x; j < n4; j += STRIDE) {
+        unsigned int p = w4[j];
+        int i0 = j << 2;
+        float s = scalerow[i0 / block];
+        acc += s * (x[i0]     * lut[(unsigned char)p]
+                  + x[i0 + 1] * lut[(unsigned char)(p >> 8)]
+                  + x[i0 + 2] * lut[(unsigned char)(p >> 16)]
+                  + x[i0 + 3] * lut[(unsigned char)(p >> 24)]);
+    }
+    for (int i = (n4 << 2) + threadIdx.x; i < i_dim; i += STRIDE)
+        acc += x[i] * lut[wrow[i]] * scalerow[i / block];
+    acc = wave_sum(acc); // per-wave partial → its lane 0
+    if (lane == 0) part[wave] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = 0.0f;
+        for (int w = 0; w < ROWS_PER_BLOCK; ++w) s += part[w]; // fixed order
+        y[o] = s;
+    }
+}
+
 // y[o] = Σ_subvec scale[o,grp]·codebook[idx]·x — VQ-int3, per-group bf16 scale
 // applied inside the dot. `codebook` is shared across all rows.
 extern "C" __global__ void gemv_vq(
@@ -154,10 +199,28 @@ extern "C" __global__ void vq_encode(
 #define ROW_GRID(o) dim3(((o) + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK)
 #define ROW_BLOCK dim3(ROWS_PER_BLOCK * WAVE)
 
+// Wave-per-row saturates DRAM once o_dim is large enough to fill the machine; below
+// that (o_proj: o_dim=6144, i_dim=16384) too few blocks launch and DRAM starves, so
+// switch to split-K (one block/row). Threshold on i_dim: the plain kernel measures
+// near-peak (255-283 GB/s) for i_dim ≤ 2048 and drops (~128) for i_dim ≥ 8192.
+#define GEMV_SPLITK_MIN_IDIM 4096
+
+extern "C" int rivoli_gemv_fp8_splitk(
+    const float* x, const unsigned char* packed, const float* scale, int o_dim, int i_dim,
+    int block, float* y) {
+    if (o_dim <= 0 || i_dim <= 0 || block <= 0) return 1001;
+    hipGetLastError();
+    hipLaunchKernelGGL(gemv_fp8_splitk, dim3(o_dim), ROW_BLOCK, 0, 0, x, packed, scale, o_dim, i_dim, block, y);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
 extern "C" int rivoli_gemv_fp8(
     const float* x, const unsigned char* packed, const float* scale, int o_dim, int i_dim,
     int block, float* y) {
     if (o_dim <= 0 || i_dim <= 0 || block <= 0) return 1001;
+    if (i_dim >= GEMV_SPLITK_MIN_IDIM)
+        return rivoli_gemv_fp8_splitk(x, packed, scale, o_dim, i_dim, block, y);
     hipGetLastError();
     hipLaunchKernelGGL(gemv_fp8, ROW_GRID(o_dim), ROW_BLOCK, 0, 0, x, packed, scale, o_dim, i_dim, block, y);
     hipError_t e = hipGetLastError();
