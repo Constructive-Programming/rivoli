@@ -647,6 +647,12 @@ impl<'a> Pin<'a> {
         self.codebooks
     }
 
+    /// Accumulated reaper fetch wall (ns) — the off-main-thread load cost the expert
+    /// stream's compute overlaps. The profile reads it against the MoE wall.
+    pub fn fetch_ns(&self) -> u64 {
+        self.fetch.fetch_ns()
+    }
+
     /// The format-agnostic streaming half of `submit_layer`: trace sink, phase 1a
     /// (hit+protect), phase 1b (alloc + slot-collision guard + `stream_expert`), phase
     /// 2 (`submit`). Returns the per-`sel` resolved slots + the `moe_table` row base.

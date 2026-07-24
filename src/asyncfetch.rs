@@ -17,6 +17,8 @@ use crate::gpustream::{HipStream, Signal};
 use crate::stream::Streamer;
 use anyhow::{Result, anyhow};
 use std::os::fd::RawFd;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 
@@ -45,6 +47,10 @@ struct ReapJob {
 pub struct AsyncFetch {
     tx: Option<Sender<ReapJob>>,
     reaper: Option<JoinHandle<()>>,
+    /// Accumulated reaper wall (queue→submit→reap all misses), off the main thread —
+    /// the true fetch cost the overlap hides. The profile reads it against the MoE
+    /// wall to report how much fetch was buried behind compute.
+    fetch_ns: Arc<AtomicU64>,
 }
 
 impl AsyncFetch {
@@ -53,13 +59,21 @@ impl AsyncFetch {
     pub fn new(streamer: Streamer) -> Result<Self> {
         let fetch = HipStream::new()?;
         let (tx, rx) = channel::<ReapJob>();
+        let fetch_ns = Arc::new(AtomicU64::new(0));
+        let fn_reaper = fetch_ns.clone();
         let reaper = std::thread::Builder::new()
             .name("rivoli-reaper".into())
-            .spawn(move || reaper_loop(streamer, fetch, rx))?;
+            .spawn(move || reaper_loop(streamer, fetch, rx, fn_reaper))?;
         Ok(Self {
             tx: Some(tx),
             reaper: Some(reaper),
+            fetch_ns,
         })
+    }
+
+    /// Accumulated reaper fetch wall in ns (across all layers so far).
+    pub fn fetch_ns(&self) -> u64 {
+        self.fetch_ns.load(Ordering::Relaxed)
     }
 
     /// Submit a layer's cold reads; returns one pending [`Signal`] per read, in the
@@ -94,10 +108,19 @@ impl Drop for AsyncFetch {
     }
 }
 
-/// Reaper thread: one job per layer until the channel closes.
-fn reaper_loop(mut streamer: Streamer, fetch: HipStream, rx: Receiver<ReapJob>) {
+/// Reaper thread: one job per layer until the channel closes. Times each job's wall
+/// into `fetch_ns` — the fetch cost the main-thread compute overlaps.
+fn reaper_loop(
+    mut streamer: Streamer,
+    fetch: HipStream,
+    rx: Receiver<ReapJob>,
+    fetch_ns: Arc<AtomicU64>,
+) {
     for job in rx {
-        if let Err(e) = run_job(&mut streamer, &fetch, &job) {
+        let t = std::time::Instant::now();
+        let r = run_job(&mut streamer, &fetch, &job);
+        fetch_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if let Err(e) = r {
             // Fatal fetch error: log and resolve every signal so no awaiter hangs —
             // the slots hold stale bytes, which the forward's finiteness guard trips.
             tracing::error!("reaper: {e:#}");

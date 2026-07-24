@@ -30,3 +30,28 @@ extern "C" int rivoli_stream_host_signal(void* stream, void (*cb)(void*), void* 
     hipError_t e = hipLaunchHostFunc((hipStream_t)stream, cb, user);
     return e == hipSuccess ? 0 : HIP_ERR_BASE - (int)e;
 }
+
+// --- Timing events: bracket GPU work on a stream to recover accurate durations the
+//     async overlap blurs out of wall-clock. `record` enqueues a timestamp on the
+//     stream; `elapsed` reads the ms between two recorded events (both must have
+//     completed — read it behind a join the forward already pays, so no added sync).
+extern "C" void* rivoli_event_create() {
+    hipEvent_t e = nullptr;
+    if (hipEventCreate(&e) != hipSuccess) return nullptr;
+    return (void*)e;
+}
+
+extern "C" int rivoli_event_record(void* ev, void* stream) {
+    hipError_t e = hipEventRecord((hipEvent_t)ev, (hipStream_t)stream);
+    return e == hipSuccess ? 0 : HIP_ERR_BASE - (int)e;
+}
+
+// Milliseconds from `start` to `end` (both recorded + completed) into *ms.
+extern "C" int rivoli_event_elapsed(void* start, void* end, float* ms) {
+    hipError_t e = hipEventElapsedTime(ms, (hipEvent_t)start, (hipEvent_t)end);
+    return e == hipSuccess ? 0 : HIP_ERR_BASE - (int)e;
+}
+
+extern "C" void rivoli_event_destroy(void* ev) {
+    hipEventDestroy((hipEvent_t)ev);
+}

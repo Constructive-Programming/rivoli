@@ -15,33 +15,49 @@ pub struct ProfileSummary {
     pub tok_per_s: f64,
     pub hit_pct: f64,
     pub wall_ms: f64,
-    pub fetch_ms: f64,
-    pub mlp_ms: f64,
     pub route_ms: f64,
+    /// CPU wall of the overlapped MoE phase (the `block_on`).
+    pub moe_wall_ms: f64,
+    /// GPU-event span of the compute stream (partials + reduce).
+    pub compute_gpu_ms: f64,
+    /// Off-thread reaper fetch cost (queue→submit→reap all misses).
+    pub fetch_wall_ms: f64,
+    /// Aggregate expert-stream idle (tokio) — the SUM of per-expert load-waits across
+    /// the ~9 concurrent tasks, so it over-counts the wall; a load-pressure gauge, not
+    /// the exposed fetch (that's `moe_wall − compute_gpu`).
+    pub load_wait_ms: f64,
+    /// The stream's active launch cost (tokio poll).
+    pub launch_ms: f64,
+    /// Percent of `fetch_wall` buried behind compute: `1 − (moe_wall−compute_gpu)/fetch_wall`.
+    pub fetch_hidden_pct: f64,
     pub miss_per_tok: f64,
     pub ms_per_miss: f64,
     pub gb_per_tok: f64,
-    pub nvme_read_ms: f64,
-    pub bounce_copy_ms: f64,
 }
 
 impl ProfileSummary {
-    /// The always-on stdout PROFILE line (per-token ms breakdown + disk traffic).
+    /// The always-on stdout PROFILE line. Under the async overlap, `moe_wall` is the
+    /// real per-token MoE cost; `fetch_wall` is the fetch work, of which
+    /// `fetch_hidden_pct` overlapped compute and only `load_wait` was exposed.
     pub fn report(&self) {
+        let exposed = (self.moe_wall_ms - self.compute_gpu_ms).max(0.0);
         tracing::info!(
-            "PROFILE/tok: {:.0}ms wall | fetch {:.0}ms ({:.2} miss, {:.2}ms/miss, {:.2} GB) | mlp {:.0}ms | route {:.0}ms",
+            "PROFILE/tok: {:.0}ms wall | route {:.0}ms | moe {:.0}ms (gpu {:.0}ms) | fetch {:.0}ms ({:.0}% hidden, {:.0}ms exposed) | {:.2} miss, {:.2}ms/miss, {:.2} GB",
             self.wall_ms,
-            self.fetch_ms,
+            self.route_ms,
+            self.moe_wall_ms,
+            self.compute_gpu_ms,
+            self.fetch_wall_ms,
+            self.fetch_hidden_pct,
+            exposed,
             self.miss_per_tok,
             self.ms_per_miss,
             self.gb_per_tok,
-            self.mlp_ms,
-            self.route_ms,
         );
         tracing::info!(
-            "  fetch split/tok: nvme-read {:.0}ms | bounce-copy {:.0}ms",
-            self.nvme_read_ms,
-            self.bounce_copy_ms,
+            "  stream/tok: load-wait {:.0}ms (Σ over ~9 concurrent tasks) | launch {:.1}ms (poll)",
+            self.load_wait_ms,
+            self.launch_ms,
         );
     }
 }
@@ -98,16 +114,21 @@ mod otlp {
         span.set_attribute(KeyValue::new("tok_per_s", summary.tok_per_s));
         span.set_attribute(KeyValue::new("hit_pct", summary.hit_pct));
         span.set_attribute(KeyValue::new("wall_ms_per_tok", summary.wall_ms));
-        span.set_attribute(KeyValue::new("fetch_ms_per_tok", summary.fetch_ms));
-        span.set_attribute(KeyValue::new("mlp_ms_per_tok", summary.mlp_ms));
         span.set_attribute(KeyValue::new("route_ms_per_tok", summary.route_ms));
+        span.set_attribute(KeyValue::new("moe_wall_ms_per_tok", summary.moe_wall_ms));
+        span.set_attribute(KeyValue::new(
+            "compute_gpu_ms_per_tok",
+            summary.compute_gpu_ms,
+        ));
+        span.set_attribute(KeyValue::new(
+            "fetch_wall_ms_per_tok",
+            summary.fetch_wall_ms,
+        ));
+        span.set_attribute(KeyValue::new("load_wait_ms_per_tok", summary.load_wait_ms));
+        span.set_attribute(KeyValue::new("launch_ms_per_tok", summary.launch_ms));
+        span.set_attribute(KeyValue::new("fetch_hidden_pct", summary.fetch_hidden_pct));
         span.set_attribute(KeyValue::new("miss_per_tok", summary.miss_per_tok));
         span.set_attribute(KeyValue::new("gb_per_tok", summary.gb_per_tok));
-        span.set_attribute(KeyValue::new("nvme_read_ms_per_tok", summary.nvme_read_ms));
-        span.set_attribute(KeyValue::new(
-            "bounce_copy_ms_per_tok",
-            summary.bounce_copy_ms,
-        ));
         span.end();
 
         // Flush the simple processor's export before we return (the run ends here).

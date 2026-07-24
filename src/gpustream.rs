@@ -22,6 +22,59 @@ unsafe extern "C" {
         cb: extern "C" fn(*mut c_void),
         user: *mut c_void,
     ) -> i32;
+    fn rivoli_event_create() -> *mut c_void;
+    fn rivoli_event_record(ev: *mut c_void, stream: *mut c_void) -> i32;
+    fn rivoli_event_elapsed(start: *mut c_void, end: *mut c_void, ms: *mut f32) -> i32;
+    fn rivoli_event_destroy(ev: *mut c_void);
+}
+
+/// A timing event: bracket GPU work on a stream to recover the true duration the
+/// async overlap hides from wall-clock. Record two, then read the ms between them
+/// after a join has retired both (no added sync).
+pub struct HipEvent(*mut c_void);
+unsafe impl Send for HipEvent {}
+
+impl HipEvent {
+    pub fn new() -> Result<Self> {
+        // SAFETY: no args; null on failure.
+        let e = unsafe { rivoli_event_create() };
+        if e.is_null() {
+            bail!("hipEventCreate failed");
+        }
+        Ok(HipEvent(e))
+    }
+
+    /// Enqueue a timestamp at the current point of `stream_raw`.
+    // `stream_raw` is an opaque HIP stream handle passed to the runtime, not memory
+    // this fn dereferences — so a safe signature is honest.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn record(&self, stream_raw: *mut c_void) -> Result<()> {
+        // SAFETY: self.0 live; stream_raw a live stream.
+        let rc = unsafe { rivoli_event_record(self.0, stream_raw) };
+        if rc != 0 {
+            bail!("hipEventRecord failed ({rc})");
+        }
+        Ok(())
+    }
+
+    /// Milliseconds from `start` to `end` — both must have completed (read behind a
+    /// join). Returns 0.0 if either wasn't recorded this window.
+    pub fn elapsed_ms(start: &HipEvent, end: &HipEvent) -> Result<f32> {
+        let mut ms = 0.0f32;
+        // SAFETY: both live; ms is a valid out-ptr.
+        let rc = unsafe { rivoli_event_elapsed(start.0, end.0, &mut ms) };
+        if rc != 0 {
+            bail!("hipEventElapsedTime failed ({rc})");
+        }
+        Ok(ms)
+    }
+}
+
+impl Drop for HipEvent {
+    fn drop(&mut self) {
+        // SAFETY: self.0 from rivoli_event_create, freed once.
+        unsafe { rivoli_event_destroy(self.0) };
+    }
 }
 
 /// An owned non-blocking HIP stream. Work launched on `raw()` overlaps work on
@@ -118,6 +171,8 @@ impl Signal {
 
     /// As [`arm_on`](Self::arm_on) but for a raw stream handle — the expert stream
     /// holds a `*mut c_void` (Copy) inside its async block, not a `&HipStream`.
+    // Opaque HIP handle passed to the runtime, not dereferenced here.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn arm_on_raw(&self, stream_raw: *mut c_void) -> Result<()> {
         // Hand one ref to the callback; the trampoline reclaims it exactly once.
         let user = Arc::into_raw(self.0.clone()) as *mut c_void;

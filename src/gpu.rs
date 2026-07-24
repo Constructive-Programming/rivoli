@@ -10,7 +10,7 @@
 
 use crate::attn::{AttnMode, streaming_rows};
 use crate::device::DeviceBuf;
-use crate::gpustream::{HipStream, Signal, stream_signal};
+use crate::gpustream::{HipEvent, HipStream, Signal, stream_signal};
 use crate::hip::{
     ExpertDescVq, device_sync, launch_append_kv, launch_argmax, launch_attend, launch_embed_i8_row,
     launch_gather_rope, launch_gemv_f32, launch_gemv_fp8, launch_gemv_i8, launch_index_append,
@@ -90,32 +90,55 @@ const MOE_STREAM_WIDTH: usize = 16;
 /// correctness probes live behind the `trace` feature instead.
 #[derive(Default)]
 struct Profile {
-    fetch_ns: u128, // NVMe stream: submit + await (the bandwidth-bound term)
-    fetch_n: u64,   // demand misses
-    mlp_ns: u128,   // end-of-layer GPU-compute join
-    route_ns: u128, // host routing (gate D2H + sigmoid/bias/top-k)
+    fetch_n: u64,         // demand misses
+    route_ns: u128,       // host routing (gate D2H + sigmoid/bias/top-k)
+    moe_wall_ns: u128,    // the block_on wall of the overlapped MoE phase (CPU wall)
+    compute_gpu_ns: u128, // HIP-event span of the compute stream (partials + reduce)
     wall_ns: u128,
     tokens: u64,
 }
 
 impl Profile {
     /// Fold the accumulated buckets into the per-token summary (also fed to OTLP).
-    fn summary(&self, hits: u64, misses: u64, bytes_per_expert: usize) -> ProfileSummary {
+    /// `fetch_wall_ns` is the reaper's off-thread load cost; `idle_ns`/`poll_ns` are
+    /// the expert stream's tokio-metrics (load-wait / launch) — the accurate
+    /// decomposition the async overlap hides from wall-clock.
+    fn summary(
+        &self,
+        hits: u64,
+        misses: u64,
+        bytes_per_expert: usize,
+        fetch_wall_ns: u64,
+        idle_ns: u64,
+        poll_ns: u64,
+    ) -> ProfileSummary {
         let tok = self.tokens.max(1) as f64;
         let per = |ns: u128| ns as f64 / 1e6 / tok; // ms/token
-        let (read_ns, copy_ns) = crate::stream::ring_timings();
+        // Exposed fetch = the MoE wall in excess of the pure compute-stream span
+        // (moe_wall − compute_gpu): the fetch that could NOT hide behind compute. The
+        // rest of the reaper's fetch_wall overlapped. (tokio idle over-counts — it
+        // sums per-expert waits across the ~9 concurrent tasks — so it's reported raw,
+        // not used here.)
+        let exposed_ns = self.moe_wall_ns.saturating_sub(self.compute_gpu_ns) as f64;
+        let hidden = if fetch_wall_ns > 0 {
+            (100.0 * (1.0 - exposed_ns / fetch_wall_ns as f64)).clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
         ProfileSummary {
             tok_per_s: self.tokens as f64 / (self.wall_ns as f64 / 1e9).max(1e-9),
             hit_pct: 100.0 * hits as f64 / (hits + misses).max(1) as f64,
             wall_ms: per(self.wall_ns),
-            fetch_ms: per(self.fetch_ns),
-            mlp_ms: per(self.mlp_ns),
             route_ms: per(self.route_ns),
+            moe_wall_ms: per(self.moe_wall_ns),
+            compute_gpu_ms: per(self.compute_gpu_ns),
+            fetch_wall_ms: per(fetch_wall_ns as u128),
+            load_wait_ms: per(idle_ns as u128),
+            launch_ms: per(poll_ns as u128),
+            fetch_hidden_pct: hidden,
             miss_per_tok: self.fetch_n as f64 / tok,
-            ms_per_miss: self.fetch_ns as f64 / 1e6 / self.fetch_n.max(1) as f64,
+            ms_per_miss: fetch_wall_ns as f64 / 1e6 / self.fetch_n.max(1) as f64,
             gb_per_tok: self.fetch_n as f64 / tok * bytes_per_expert as f64 / 1e9,
-            nvme_read_ms: per(read_ns as u128),
-            bounce_copy_ms: per(copy_ns as u128),
         }
     }
 }
@@ -222,6 +245,12 @@ pub struct GpuEngine<'a> {
     /// Current-thread runtime that drives the per-layer expert stream. The decode
     /// loop is serial; GPU/IO concurrency comes from the streams + reaper, not threads.
     rt: tokio::runtime::Runtime,
+    /// Compute-stream span events (bracket the MoE partials+reduce) + the expert
+    /// stream's task monitor (idle = load-wait, poll = launch) — the accurate timing
+    /// the async overlap hides from wall-clock.
+    moe_ev_start: HipEvent,
+    moe_ev_end: HipEvent,
+    moe_monitor: tokio_metrics::TaskMonitor,
     /// DIAGNOSTIC (`--checksum-x`, `trace` only): hash the residual stream each layer.
     #[cfg(feature = "trace")]
     checksum_x: bool,
@@ -343,6 +372,9 @@ impl<'a> GpuEngine<'a> {
             prof: Profile::default(),
             compute_stream: HipStream::new()?,
             rt: tokio::runtime::Builder::new_current_thread().build()?,
+            moe_ev_start: HipEvent::new()?,
+            moe_ev_end: HipEvent::new()?,
+            moe_monitor: tokio_metrics::TaskMonitor::new(),
             #[cfg(feature = "trace")]
             checksum_x: false,
             #[cfg(feature = "trace")]
@@ -790,9 +822,7 @@ impl<'a> GpuEngine<'a> {
                 // Signal (hit → ready; miss → resolves when its bytes land). The slot
                 // ADDRESSES are known now, so the descriptors below are valid pointers.
                 let miss0 = self.pin.misses;
-                let tf = std::time::Instant::now();
                 let mut signals = self.pin.submit_layer(l, &self.sel, &mut self.mlps_vq)?;
-                self.prof.fetch_ns += tf.elapsed().as_nanos();
                 self.prof.fetch_n += self.pin.misses - miss0;
                 // Routed weights: sigmoid score, sum-normalized over the routed picks,
                 // then scaled. The VQ shared expert (weight 1.0) folds into the batch.
@@ -843,12 +873,18 @@ impl<'a> GpuEngine<'a> {
                 let (cb0, cb1, cb2) = (self.codebooks[0], self.codebooks[1], self.codebooks[2]);
                 let cs_raw = self.compute_stream.raw();
                 let inter = cfg.moe_inter;
+                let monitor = self.moe_monitor.clone();
+                // Bracket the compute-stream span (partials+reduce) for the accurate
+                // GPU-side timing; read at the end-of-layer join.
+                self.moe_ev_start.record(cs_raw)?;
                 let tm = std::time::Instant::now();
                 self.rt.block_on(async move {
                     futures_util::stream::iter(0..ndesc)
                         .map(move |e| {
                             let sig = signals[e].clone();
-                            async move {
+                            // Instrument: idle = time parked on the load Signal (the
+                            // fetch-wait the stream sees), poll = the launch cost.
+                            monitor.instrument(async move {
                                 sig.await;
                                 // SAFETY: descs/codebooks resident; slot loaded (sig
                                 // resolved); h/part device scratch; cs_raw live.
@@ -858,7 +894,7 @@ impl<'a> GpuEngine<'a> {
                                         h_c, part_c, cs_raw,
                                     )
                                 }
-                            }
+                            })
                         })
                         .buffer_unordered(MOE_STREAM_WIDTH)
                         .try_collect::<Vec<()>>()
@@ -868,16 +904,24 @@ impl<'a> GpuEngine<'a> {
                     stream_signal(cs_raw)?.await;
                     Ok::<(), anyhow::Error>(())
                 })?;
-                self.prof.mlp_ns += tm.elapsed().as_nanos();
+                self.prof.moe_wall_ns += tm.elapsed().as_nanos();
+                self.moe_ev_end.record(cs_raw)?;
             }
             // SAFETY: residual add of the MLP contribution.
             unsafe { launch_vadd(xp, self.moe_out.ptr() as *const f32, hidden)? };
             // End-of-layer join: protects the reused descs/wexpert/moe_out buffers
-            // before the next layer overwrites them, and surfaces faults. Always
-            // present, so timing it (the `mlp` bucket = GPU compute) is free.
+            // before the next layer overwrites them, and surfaces faults. Folds into
+            // the MoE wall (near-0 for MoE layers — the compute stream already synced;
+            // the dense MLP compute for the 3 dense layers).
             let t = std::time::Instant::now();
             device_sync()?;
-            self.prof.mlp_ns += t.elapsed().as_nanos();
+            self.prof.moe_wall_ns += t.elapsed().as_nanos();
+            // Both MoE span events retired by the sync — read the compute-stream span
+            // (MoE layers only; dense layers never recorded them).
+            if dense_mlp.is_none() {
+                let ms = HipEvent::elapsed_ms(&self.moe_ev_start, &self.moe_ev_end)?;
+                self.prof.compute_gpu_ns += (ms as f64 * 1e6) as u128;
+            }
             // DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
             #[cfg(feature = "trace")]
             if self.checksum_x {
@@ -1003,10 +1047,16 @@ impl<'a> GpuEngine<'a> {
         self.prof.wall_ns = decode_wall.elapsed().as_nanos();
         self.prof.tokens = generated.len() as u64;
         let bytes_per_expert = crate::quant::vq_expert_bytes(self.cfg.hidden, self.cfg.moe_inter);
+        // The accurate async-side decomposition: reaper fetch wall + the expert
+        // stream's tokio-metrics (idle = load-wait, poll = launch).
+        let tm = self.moe_monitor.cumulative();
         let summary = self.prof.summary(
             self.pin.hits - hit0,
             self.pin.misses - miss0,
             bytes_per_expert,
+            self.pin.fetch_ns(),
+            tm.total_idle_duration.as_nanos() as u64,
+            tm.total_poll_duration.as_nanos() as u64,
         );
         summary.report();
         Ok((generated, summary))

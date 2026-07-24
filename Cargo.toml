@@ -27,11 +27,14 @@ opentelemetry-otlp = { version = "0.30", optional = true }
 tokio = { version = "1", features = ["rt", "sync", "macros"], optional = true }
 futures-util = { version = "0.3", optional = true }
 tokio-stream = { version = "0.1", optional = true }
+# Per-task async metrics: TaskMonitor's idle_duration = the expert stream's load-wait,
+# poll_duration = its launch cost. Recovers the async-side timing the overlap blurs.
+tokio-metrics = { version = "0.4", optional = true }
 
 [features]
 default = []
 # build.rs compiles kernels/*.hip via hipcc; pulls in the async streaming stack.
-rocm = ["dep:tokio", "dep:futures-util", "dep:tokio-stream"]
+rocm = ["dep:tokio", "dep:futures-util", "dep:tokio-stream", "dep:tokio-metrics"]
 # OTLP export of the always-on decode summary (one span/run, opt-in at runtime via
 # OTEL_EXPORTER_OTLP_ENDPOINT). Off by default — the opentelemetry stack is heavy.
 otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]

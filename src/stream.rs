@@ -47,11 +47,9 @@ mod ffi {
             user_data: u64,
         ) -> i32;
         pub fn rivoli_ring_submit(ring: *mut c_void) -> i32;
-        pub fn rivoli_ring_wait(ring: *mut c_void, count: u32, min_res: *const u64) -> i32;
         pub fn rivoli_ring_reap(ring: *mut c_void, min_res: *const u64, stream: *mut c_void)
         -> i64;
         pub fn rivoli_ring_free(ring: *mut c_void);
-        pub fn rivoli_ring_timings(read_ns: *mut u64, copy_ns: *mut u64);
     }
 }
 
@@ -266,26 +264,6 @@ impl Streamer {
         self.queued = 0;
         self.min_res.clear();
     }
-
-    /// Submit all queued reads and block until every one completes; errors on the
-    /// first failed read. No-op if nothing is queued.
-    pub fn drain(&mut self) -> Result<()> {
-        if self.queued == 0 {
-            return Ok(());
-        }
-        let n = self.queued;
-        // SAFETY: `ring` is live; exactly `n` reads were queued since the last drain,
-        // and `min_res` holds `n` entries indexed by their user_data (0..n).
-        let e = unsafe { ffi::rivoli_ring_wait(self.ring, n, self.min_res.as_ptr()) };
-        self.queued = 0;
-        self.min_res.clear();
-        ensure!(
-            e == 0,
-            "io_uring: {n} reads, first error {}",
-            std::io::Error::from_raw_os_error(-e)
-        );
-        Ok(())
-    }
 }
 
 impl Drop for Streamer {
@@ -293,17 +271,6 @@ impl Drop for Streamer {
         // SAFETY: `ring` came from rivoli_ring_new, freed exactly once.
         unsafe { ffi::rivoli_ring_free(self.ring) };
     }
-}
-
-/// Accumulated `(nvme_read_ns, bounce_copy_ns)` across every drain on every ring.
-/// Splits the `fetch` PROFILE bucket into the two halves that want opposite fixes:
-/// waiting on NVMe completions (latency/queue-depth bound) versus the pinned-host
-/// -> device copy and its sync (bandwidth bound, ~2.7 GB/token).
-pub fn ring_timings() -> (u64, u64) {
-    let (mut r, mut c) = (0u64, 0u64);
-    // SAFETY: both out-pointers are valid; the shim only writes two u64s.
-    unsafe { ffi::rivoli_ring_timings(&mut r, &mut c) };
-    (r, c)
 }
 
 #[cfg(test)]
