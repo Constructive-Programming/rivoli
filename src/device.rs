@@ -241,9 +241,9 @@ mod tier {
             Ok(())
         }
 
-        /// Copy the whole buffer back to host as a fresh `Vec` (the ergonomic form;
-        /// the per-token decode path uses [`DeviceBuf::copy_out_into`] to reuse a
-        /// buffer instead).
+        /// Copy the whole buffer back to host as a fresh `Vec` (the ergonomic form
+        /// the kernel oracle tests use; the per-token decode path uses
+        /// [`DeviceBuf::copy_out_into`] to reuse a buffer instead).
         pub fn copy_out(&self) -> Result<Vec<u8>> {
             let mut out = Vec::new();
             self.copy_out_into(&mut out)?;
@@ -363,10 +363,10 @@ mod tier {
         /// written by the kernel's DMA engine, NOT CPU stores, so the store-buffer
         /// release fence above does not apply to them. Visibility rests instead on
         /// (a) the dispatch packet's system-scope ACQUIRE invalidating the GPU caches
-        /// before the reading kernel, and (b) the completed io_uring drain
-        /// (`Streamer::drain`) happening-before that launch, plus the end-of-layer
-        /// [`crate::hip::device_sync`] fencing slot reuse. No CPU store fence is
-        /// involved on this path.
+        /// before the reading kernel, and (b) the read's `Signal` (armed on the fetch
+        /// stream after [`Streamer::reap`] enqueued its copy) happening-before that
+        /// launch, plus the end-of-layer [`crate::hip::device_sync`] fencing slot
+        /// reuse. No CPU store fence is involved on this path.
         ///
         /// Verified CPU->GPU coherent on this APU (docs/probes/vmm_probe.cpp, incl.
         /// `pread`). NOT a HIP contract for arbitrary hardware: a port off gfx1151,

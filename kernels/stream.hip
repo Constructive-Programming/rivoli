@@ -122,12 +122,6 @@ extern "C" void* rivoli_ring_new(unsigned entries, unsigned span, int bounce, in
     return r;
 }
 
-// This ring's io_uring fd, for passing as another ring's `attach_fd` so the two
-// share one submission-poller thread. Valid until rivoli_ring_free.
-extern "C" int rivoli_ring_fd(void* ring) {
-    return ((Ring*)ring)->uring.ring_fd;
-}
-
 // Queue one O_DIRECT read: `nbytes` from `fd` at `off`. DIRECT mode reads straight
 // into `dst` (the VMM slot). BOUNCE mode reads into the bounce slot for `user_data`
 // (< entries) and remembers `dst` for the post-wait copy. `off`/`nbytes` MUST be

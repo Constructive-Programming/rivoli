@@ -603,7 +603,9 @@ pub fn replay(
 /// Replay demand-only `batches` (no prefetch modelled). Returns `(hits, accesses)`.
 /// Thin wrapper over [`replay`]; prefer `replay` when the trace carries predictions,
 /// because prefetch admission is what makes 2Q's probation split pay off at all.
-pub fn simulate(
+/// Test-only: the live engine and `bin/replay` both call `replay` directly.
+#[cfg(test)]
+fn simulate(
     policy: &str,
     cap: usize,
     split: TwoQSplit,

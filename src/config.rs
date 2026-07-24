@@ -48,10 +48,6 @@ pub struct Config {
     pub checksum_layer: Option<usize>,
     /// DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
     pub checksum_x: bool,
-    /// Feed pool (tokio workers + pread tasks). Physical cores ÷ 2 — the measured
-    /// optimum; the SMT-logical default is the proven pathology. The CPU never
-    /// computes experts — it routes, samples, and keeps the GPU fed.
-    pub threads: usize,
     /// Device budget override, bytes (`--max-mem <GiB>`). None (default) auto-sizes to
     /// `free − OS_RESERVE`. `Some(n)` uses exactly `n` — no OS reserve; the user asked
     /// for it, so it's allowed to OOM/fail at build.
@@ -105,10 +101,6 @@ impl Config {
                 OS_RESERVE as f64 / 1e9
             );
         }
-        // available_parallelism() is the LOGICAL count (SMT included): /2 gives
-        // physical cores, /2 again is the measured feed-pool optimum.
-        let threads =
-            std::thread::available_parallelism().map_or(8, |n| (n.get() / 4).clamp(4, 16));
         Ok(Self {
             model,
             bench,
@@ -119,7 +111,6 @@ impl Config {
             two_q,
             checksum_layer: None,
             checksum_x: false,
-            threads,
             max_mem,
             attn,
         })
@@ -131,7 +122,7 @@ impl fmt::Display for Config {
         const GIB: f64 = (1u64 << 30) as f64;
         write!(
             f,
-            "model={} bench={:?} attn={:?} direct_vmm_dma={} cache_policy={} 2q_kin={}% 2q_kout={}% trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={} threads={}",
+            "model={} bench={:?} attn={:?} direct_vmm_dma={} cache_policy={} 2q_kin={}% 2q_kout={}% trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={}",
             self.model,
             self.bench,
             self.attn,
@@ -146,7 +137,6 @@ impl fmt::Display for Config {
                 Some(n) => format!("{:.0}GiB", n as f64 / GIB),
                 None => "auto(all free)".to_string(),
             },
-            self.threads,
         )
     }
 }

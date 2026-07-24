@@ -37,7 +37,6 @@ mod ffi {
             sqpoll: i32,
             attach_fd: i32,
         ) -> *mut c_void;
-        pub fn rivoli_ring_fd(ring: *mut c_void) -> i32;
         pub fn rivoli_ring_read(
             ring: *mut c_void,
             fd: i32,
@@ -71,31 +70,8 @@ fn min_completion(begin: usize, len: usize) -> u64 {
     ((begin - ab) + len) as u64
 }
 
-/// How a ring's submission path is driven — the single most consequential choice
-/// about a ring on this box.
-///
-/// A plain ring's submit is an `io_uring_enter` in which the CALLING thread walks
-/// the SQEs and drives the btrfs/blk-mq dispatch inline, one at a time. Measured
-/// at ~2.96 ms per expert (6 SQEs). That costs twice over: the call does not
-/// return promptly, AND the reads reach the device serially, so a 6-read batch
-/// behaves like queue depth 1 (2.53 GB/s) instead of the 6.69 GB/s the array
-/// delivers at P≥4. A poller thread fixes both — it takes the whole SQ tail at
-/// once, so the batch is genuinely concurrent.
-pub enum Sqpoll<'a> {
-    /// No poller: submit is a syscall with inline, serial dispatch. Correct, and
-    /// the right choice only for a ring whose reads have no batch-parallelism to
-    /// win (or where a poller thread cannot be had).
-    Off,
-    /// This ring gets its own kernel submission-poller thread.
-    Own,
-    /// Share the given ring's poller thread (`IORING_SETUP_ATTACH_WQ`) rather than
-    /// spinning up a second one. Falls back to [`Sqpoll::Own`], then
-    /// [`Sqpoll::Off`], if the kernel refuses.
-    SharedWith(&'a Streamer),
-}
-
 /// A ring of in-flight reads. `entries` caps how many can be queued before a
-/// `drain` — sized to a layer's cold-read count with margin.
+/// `reap` batch — sized to a layer's cold-read count with margin.
 pub struct Streamer {
     ring: *mut c_void,
     queued: u32,
@@ -108,7 +84,7 @@ pub struct Streamer {
     /// can't fit its bounce slot. Unused (0) in direct mode.
     span: usize,
     /// Per-queued-read minimum completion length (sub-block offset + useful len),
-    /// indexed by the read's `user_data`. `drain` hands this to the shim so a real
+    /// indexed by the read's `user_data`. `reap` hands this to the shim so a real
     /// mid-file short read is caught while EOF-padding truncation is tolerated.
     min_res: Vec<u64>,
 }
@@ -125,18 +101,18 @@ impl Streamer {
     /// `bounce` selects the destination path: true (the default) reads into an
     /// `entries * span` pinned host arena then `hipMemcpy`s into VMM (kernel-bug
     /// workaround); false (`--direct-vmm-dma`) DMAs straight into the VMM slot (no
-    /// arena allocated). `sqpoll` selects the submission path — see [`Sqpoll`];
-    /// every ring that submits a batch it wants run in PARALLEL wants a poller.
-    pub fn new(entries: u32, span: usize, bounce: bool, sqpoll: Sqpoll<'_>) -> Result<Self> {
-        let (want_poll, attach) = match sqpoll {
-            Sqpoll::Off => (0, -1),
-            Sqpoll::Own => (1, -1),
-            // SAFETY: `other.ring` is live for `other`'s lifetime, which outlives
-            // this call; the shim only reads its `ring_fd`.
-            Sqpoll::SharedWith(other) => (1, unsafe { ffi::rivoli_ring_fd(other.ring) }),
-        };
+    /// arena allocated).
+    ///
+    /// The ring always gets its own kernel submission-poller. Without one, submit is
+    /// an `io_uring_enter` in which the CALLING thread walks the SQEs and drives the
+    /// btrfs/blk-mq dispatch inline, serially (~2.96 ms/expert at 6 SQEs): the call
+    /// doesn't return promptly AND the batch reaches the device at queue depth 1
+    /// (2.53 GB/s) instead of the 6.69 GB/s the array delivers at P≥4. The poller
+    /// takes the whole SQ tail at once, so the batch is genuinely concurrent.
+    pub fn new(entries: u32, span: usize, bounce: bool) -> Result<Self> {
         let ring = unsafe {
-            ffi::rivoli_ring_new(entries, span as u32, i32::from(bounce), want_poll, attach)
+            // sqpoll=1 (own poller), attach_fd=-1 (no shared WQ).
+            ffi::rivoli_ring_new(entries, span as u32, i32::from(bounce), 1, -1)
         };
         ensure!(
             !ring.is_null(),
@@ -164,7 +140,7 @@ impl Streamer {
     ///
     /// # Safety
     /// `dst` must be `ALIGN`-aligned and valid for `slot_span(len)` writable bytes
-    /// until the next [`Streamer::drain`] completes.
+    /// until this read's [`reap`](Self::reap) completes.
     pub unsafe fn queue(
         &mut self,
         fd: RawFd,
@@ -203,7 +179,7 @@ impl Streamer {
         );
         // The completion must deliver at least the useful window `[begin,begin+len)`
         // from the aligned start; a shorter read is mid-file truncation (checked in
-        // `drain`). Trailing EOF padding beyond this is fine.
+        // `reap` against `min_res`). Trailing EOF padding beyond this is fine.
         debug_assert_eq!(self.min_res.len(), self.queued as usize);
         self.min_res.push(min_completion(begin, len));
         self.queued += 1;
@@ -211,23 +187,20 @@ impl Streamer {
     }
 
     /// Submit the queued reads to the kernel WITHOUT waiting, so they start running
-    /// on the NVMe/DMA side immediately. A later [`Streamer::drain`] reaps the same
-    /// completions (its `submit_and_wait` then submits nothing new); the
-    /// `queued`/`min_res` bookkeeping is deliberately left intact for that drain.
-    /// No-op if nothing is queued.
+    /// on the NVMe/DMA side immediately. The following per-read [`reap`](Self::reap)
+    /// calls collect the same completions; the `queued`/`min_res` bookkeeping is
+    /// deliberately left intact for them. No-op if nothing is queued.
     ///
-    /// Both rings use this. The prefetch ring wants the call to RETURN promptly (its
-    /// reads must overlap the current layer's compute). The demand ring wants the
-    /// reads to START promptly and CONCURRENTLY — submitting here rather than letting
-    /// `drain`'s `submit_and_wait` do it puts the whole batch on the device before any
-    /// host work that follows, instead of dispatching it serially at join time. Under
-    /// [`Sqpoll::Off`] neither property holds, which is the point of the poller.
+    /// Submitting here (rather than at reap time) starts the reads promptly and
+    /// CONCURRENTLY — the whole batch reaches the device before any host work that
+    /// follows, instead of dispatching serially at join time. The own-poller is what
+    /// makes that concurrency real (see [`Streamer::new`]).
     pub fn submit(&self) -> Result<()> {
         if self.queued == 0 {
             return Ok(());
         }
         // SAFETY: `ring` is live; submitting only hands the already-prepped SQEs to
-        // the kernel — the CQEs are reaped by the matching `drain`.
+        // the kernel — the CQEs are collected by the matching `reap` calls.
         let r = unsafe { ffi::rivoli_ring_submit(self.ring) };
         ensure!(
             r >= 0,
@@ -237,8 +210,8 @@ impl Streamer {
         Ok(())
     }
 
-    /// Per-read async reap (the streaming pipeline's alternative to [`drain`]):
-    /// block for the NEXT read to complete, kick its bounce→slot copy on `stream`,
+    /// Per-read async reap: block for the NEXT read to complete, kick its
+    /// bounce→slot copy on `stream`,
     /// and return the completed read's `user_data` (the index into the batch). The
     /// caller reaps exactly `queued` times, then [`reset_batch`](Self::reset_batch).
     /// Bookkeeping (`queued`/`min_res`) is left intact across a batch's reaps because
@@ -258,8 +231,8 @@ impl Streamer {
         Ok(ud as usize)
     }
 
-    /// Reset the queued/min_res bookkeeping after a full batch has been [`reap`]ed
-    /// (the reap path's equivalent of `drain`'s post-wait reset).
+    /// Reset the queued/min_res bookkeeping after a full batch has been [`reap`]ed,
+    /// readying the ring for the next layer's batch.
     pub fn reset_batch(&mut self) {
         self.queued = 0;
         self.min_res.clear();

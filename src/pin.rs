@@ -23,7 +23,7 @@ use crate::format::{Dtype, FormatMeta, Safetensors, Vq3Set, load_codebooks};
 use crate::gpustream::Signal;
 use crate::model::ModelConfig;
 use crate::quant::{VQ_DIM, VQ_K, vq_expert_bytes, vq_expert_layout, vq_proj_bytes, vq_row_bytes};
-use crate::stream::{Sqpoll, Streamer, slot_span};
+use crate::stream::{Streamer, slot_span};
 use anyhow::{Context, Result, bail, ensure};
 use std::os::fd::RawFd;
 
@@ -606,7 +606,7 @@ impl<'a> Pin<'a> {
         );
         // Bounce span = the whole expert block (one read).
         let span = slot_span(vq_expert_bytes(cfg.hidden, cfg.moe_inter));
-        let fetch = AsyncFetch::new(Streamer::new(ring as u32, span, bounce, Sqpoll::Own)?)?;
+        let fetch = AsyncFetch::new(Streamer::new(ring as u32, span, bounce)?)?;
 
         Ok(Self {
             cfg,

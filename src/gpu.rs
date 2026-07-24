@@ -866,7 +866,12 @@ impl<'a> GpuEngine<'a> {
                 let inter = cfg.moe_inter;
                 let monitor = self.moe_monitor.clone();
                 // Bracket the compute-stream span (partials+reduce) for the accurate
-                // GPU-side timing; read at the end-of-layer join.
+                // GPU-side timing; read at the end-of-layer join. Caveat: each partial
+                // launches only after its per-expert `sig.await` resolves on the host,
+                // so the compute stream sits idle between host-gated launches and those
+                // bubbles fall inside this span — `compute_gpu` is thus an UPPER bound,
+                // making the derived `fetch_hidden_pct` (1 − (moe_wall−compute_gpu)/…)
+                // read slightly optimistic. Fine as a gauge; not a hard hidden-fetch %.
                 self.moe_ev_start.record(cs_raw)?;
                 let tm = std::time::Instant::now();
                 // The expert stream runs inline in this (async) forward — awaited by

@@ -79,10 +79,12 @@ impl Drop for HipEvent {
 
 /// An owned non-blocking HIP stream. Work launched on `raw()` overlaps work on
 /// other streams. The handle is an opaque runtime-owned pointer we only pass back
-/// to HIP, so moving it across threads is sound.
+/// to HIP, so MOVING it across threads is sound (the fetch stream moves once into
+/// the reaper). NOT `Sync`: HIP streams aren't thread-safe and `signal(&self)`
+/// mutates stream state, so a `&HipStream` must never be shared across threads —
+/// every stream here is owned by exactly one thread.
 pub struct HipStream(*mut c_void);
 unsafe impl Send for HipStream {}
-unsafe impl Sync for HipStream {}
 
 impl HipStream {
     pub fn new() -> Result<Self> {
