@@ -387,9 +387,92 @@ pub fn matvec_vq(
     }
 }
 
+// ── int4 (colibri layout): the "warm expert" format ─────────────────────────
+// Per-row symmetric int4: `W[o,i] = (nibble(o,i) − 8) · scale[o]`. `packed` = o_dim
+// rows of `i4_row_bytes(i_dim)` bytes (LOW nibble = col 2j, HIGH = col 2j+1); one
+// f32 `scale` per output row. Matches colibri's `.qs` and the old engine's
+// matvec_i4, so the moe_*_i4 kernels are bit-comparable to this reference.
+
+/// Row stride in bytes for a per-row int4 matrix (2 nibbles/byte).
+pub fn i4_row_bytes(i_dim: usize) -> usize {
+    i_dim.div_ceil(2)
+}
+
+/// Reference int4 GEMV `y[o] = scale[o] · Σ_i x[i]·(nibble(o,i) − 8)` — the CPU
+/// oracle the `moe_gateup_i4`/`moe_down_i4` kernels validate against.
+pub fn matvec_i4(y: &mut [f32], x: &[f32], packed: &[u8], scale: &[f32], o_dim: usize, i_dim: usize) {
+    debug_assert_eq!(y.len(), o_dim);
+    debug_assert_eq!(x.len(), i_dim);
+    let rb = i4_row_bytes(i_dim);
+    for (o, yo) in y.iter_mut().enumerate() {
+        let row = &packed[o * rb..(o + 1) * rb];
+        let mut acc = 0.0f32;
+        for (i, &xi) in x.iter().enumerate() {
+            let byte = row[i >> 1];
+            let n = (if i & 1 == 0 { byte & 0x0F } else { byte >> 4 }) as i32 - 8;
+            acc += xi * n as f32;
+        }
+        *yo = acc * scale[o];
+    }
+}
+
+/// Quantize `w[o_dim·i_dim]` (row-major) → per-row symmetric int4 (packed bytes +
+/// per-row f32 scale). `scale[o] = max|row|/7` so the extreme maps to nibble 15
+/// (value +7); nibbles clamp to `[0,15]`. Round-trips through [`matvec_i4`]. Used to
+/// build oracle inputs; the live path reads colibri's already-packed int4.
+pub fn quant_i4(w: &[f32], o_dim: usize, i_dim: usize) -> (Vec<u8>, Vec<f32>) {
+    debug_assert_eq!(w.len(), o_dim * i_dim);
+    let rb = i4_row_bytes(i_dim);
+    let mut packed = vec![0u8; o_dim * rb];
+    let mut scale = vec![0.0f32; o_dim];
+    for o in 0..o_dim {
+        let row = &w[o * i_dim..(o + 1) * i_dim];
+        let amax = row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let s = if amax > 0.0 { amax / 7.0 } else { 1.0 };
+        scale[o] = s;
+        for (i, &wi) in row.iter().enumerate() {
+            let q = ((wi / s).round() as i32 + 8).clamp(0, 15) as u8;
+            let bi = o * rb + (i >> 1);
+            if i & 1 == 0 {
+                packed[bi] = (packed[bi] & 0xF0) | q;
+            } else {
+                packed[bi] = (packed[bi] & 0x0F) | (q << 4);
+            }
+        }
+    }
+    (packed, scale)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn i4_quant_matvec_roundtrip() {
+        // quant_i4 → matvec_i4 approximates the true GEMV within int4 error.
+        let (o, i) = (16usize, 64usize);
+        let mut w = vec![0.0f32; o * i];
+        let mut s = 0x2468u64;
+        let mut rf = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((s >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        for v in w.iter_mut() {
+            *v = rf();
+        }
+        let x: Vec<f32> = (0..i).map(|_| rf()).collect();
+        let mut want = vec![0.0f32; o];
+        for oo in 0..o {
+            want[oo] = (0..i).map(|ii| w[oo * i + ii] * x[ii]).sum();
+        }
+        let (packed, scale) = quant_i4(&w, o, i);
+        let mut got = vec![0.0f32; o];
+        matvec_i4(&mut got, &x, &packed, &scale, o, i);
+        // int4 per-row quant: err bounded by ~scale·Σ|x| worst case; check it tracks.
+        let mx = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let err = want.iter().zip(&got).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(err < 0.15 * mx + 0.1, "i4 roundtrip err={err:.3} max={mx:.3}");
+    }
 
     #[test]
     fn read_f32_roundtrips() {

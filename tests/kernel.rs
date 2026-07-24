@@ -5,9 +5,9 @@
 use rivoli::device::DeviceBuf;
 use rivoli::gpustream::HipStream;
 use rivoli::hip::{
-    ExpertDescVq, attend_scratch_floats, device_sync, launch_argmax, launch_attend,
+    ExpertDescI4, ExpertDescVq, attend_scratch_floats, device_sync, launch_argmax, launch_attend,
     launch_gemv_fp8, launch_gemv_vq, launch_mla_absorb_fp8, launch_mla_value_fp8,
-    launch_moe_expert_range, launch_moe_reduce, launch_vadd,
+    launch_moe_expert_range, launch_moe_expert_range_i4, launch_moe_reduce, launch_vadd,
 };
 use rivoli::math::{bf16_to_f32, e4m3_to_f32, f32_to_bf16, f32_to_e4m3, silu, softmax};
 use rivoli::quant::{VQ_DIM, VQ_K, matvec_fp8, matvec_vq, quant_vq};
@@ -517,4 +517,92 @@ fn moe_vq_matches_reference() {
     }
     device_sync().expect("sync");
     assert_close(&want, &f32v(&obuf.copy_out().expect("out")), "moe_vq");
+}
+
+/// int4 MoE (moe_gateup_i4 → moe_down_i4 → moe_reduce), per-row scale, vs a
+/// matvec_i4+silu reference on the same quantized bytes. hidden ≥ 256 exercises
+/// dot_i4_wave's dword fast path; inter < 256 its scalar tail.
+#[test]
+fn moe_i4_matches_reference() {
+    use rivoli::quant::{matvec_i4, quant_i4};
+    let mut r = Lcg(0x14);
+    let (hidden, inter, e) = (256usize, 128usize, 3usize);
+    let x: Vec<f32> = (0..hidden).map(|_| r.f()).collect();
+    let w: Vec<f32> = (0..e).map(|_| r.f()).collect();
+    let dims = [(inter, hidden), (inter, hidden), (hidden, inter)]; // gate, up, down (o,i)
+    let mut enc: Vec<[(Vec<u8>, Vec<f32>); 3]> = Vec::new();
+    for _ in 0..e {
+        let mut per: [(Vec<u8>, Vec<f32>); 3] = std::array::from_fn(|_| (Vec::new(), Vec::new()));
+        for (p, &(o_dim, i_dim)) in dims.iter().enumerate() {
+            let wv: Vec<f32> = (0..o_dim * i_dim).map(|_| r.f()).collect();
+            per[p] = quant_i4(&wv, o_dim, i_dim);
+        }
+        enc.push(per);
+    }
+
+    // reference: Σ_e w[e]·down(silu(gate·x)⊙up·x)
+    let mut want = vec![0.0f32; hidden];
+    for ex in 0..e {
+        let mut g = vec![0.0f32; inter];
+        let mut u = vec![0.0f32; inter];
+        matvec_i4(&mut g, &x, &enc[ex][0].0, &enc[ex][0].1, inter, hidden);
+        matvec_i4(&mut u, &x, &enc[ex][1].0, &enc[ex][1].1, inter, hidden);
+        let h: Vec<f32> = (0..inter).map(|j| silu(g[j]) * u[j]).collect();
+        let mut down = vec![0.0f32; hidden];
+        matvec_i4(&mut down, &h, &enc[ex][2].0, &enc[ex][2].1, hidden, inter);
+        for o in 0..hidden {
+            want[o] += w[ex] * down[o];
+        }
+    }
+
+    let mut bufs: Vec<DeviceBuf> = Vec::new();
+    let push = |b: Vec<u8>, bufs: &mut Vec<DeviceBuf>| -> *const u8 {
+        bufs.push(dev(&b));
+        bufs.last().expect("just pushed").ptr()
+    };
+    let descs: Vec<ExpertDescI4> = (0..e)
+        .map(|ex| ExpertDescI4 {
+            gate_packed: push(enc[ex][0].0.clone(), &mut bufs),
+            gate_scale: push(f32b(&enc[ex][0].1), &mut bufs) as *const f32,
+            up_packed: push(enc[ex][1].0.clone(), &mut bufs),
+            up_scale: push(f32b(&enc[ex][1].1), &mut bufs) as *const f32,
+            down_packed: push(enc[ex][2].0.clone(), &mut bufs),
+            down_scale: push(f32b(&enc[ex][2].1), &mut bufs) as *const f32,
+        })
+        .collect();
+    let descb = dev(unsafe {
+        std::slice::from_raw_parts(descs.as_ptr() as *const u8, std::mem::size_of_val(&descs[..]))
+    });
+    let (xb, wb) = (dev(&f32b(&x)), dev(&f32b(&w)));
+    let mut hbuf = dev(&vec![0u8; e * inter * 4]);
+    let mut pbuf = dev(&vec![0u8; e * hidden * 4]);
+    let mut obuf = dev(&vec![0u8; hidden * 4]);
+    let stream = HipStream::new().expect("stream");
+    unsafe {
+        for k in 0..e {
+            launch_moe_expert_range_i4(
+                xb.ptr() as *const f32,
+                hidden,
+                inter,
+                k,
+                1,
+                descb.ptr() as *const ExpertDescI4,
+                wb.ptr() as *const f32,
+                hbuf.ptr_mut() as *mut f32,
+                pbuf.ptr_mut() as *mut f32,
+                stream.raw(),
+            )
+            .expect("launch moe_expert_range_i4");
+        }
+        launch_moe_reduce(
+            pbuf.ptr() as *const f32,
+            e,
+            hidden,
+            obuf.ptr_mut() as *mut f32,
+            stream.raw(),
+        )
+        .expect("launch moe_reduce");
+    }
+    device_sync().expect("sync");
+    assert_close(&want, &f32v(&obuf.copy_out().expect("out")), "moe_i4");
 }

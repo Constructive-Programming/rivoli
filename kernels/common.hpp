@@ -81,6 +81,35 @@ __device__ __forceinline__ float dot_fp8_wave(const float* __restrict__ x,
     return wave_sum(acc);
 }
 
+// Wave-cooperative per-row int4 dot for one output row: Σ_i v[i]·(nibble(i) − 8),
+// result on lane 0 (the per-row scale is applied by the CALLER, outside). `row` =
+// packed[o*rb..], rb = (dim+1)/2. Matches quant.rs::matvec_i4. The fast path reads a
+// dword (8 nibbles = 8 consecutive columns) per lane when `row` is 4-byte aligned —
+// colibri's per-row stride (dim/2, dim a multiple of 8) keeps every row aligned.
+__device__ __forceinline__ float dot_i4_wave(const float* __restrict__ v,
+                                             const unsigned char* __restrict__ row,
+                                             int dim, int lane) {
+    float acc = 0.0f;
+    int base = 0;
+    if ((((size_t)row) & 3u) == 0) {
+        const unsigned int* rw = (const unsigned int*)row;
+        for (; base + WAVE * 8 <= dim; base += WAVE * 8) {
+            int col = base + lane * 8;
+            unsigned int w = rw[col >> 3]; // 8 nibbles = 8 consecutive columns
+            const float* vv = v + col;
+#pragma unroll
+            for (int k = 0; k < 8; ++k)
+                acc += vv[k] * (float)((int)((w >> (4 * k)) & 0xFu) - 8);
+        }
+    }
+    for (int i = base + lane; i < dim; i += WAVE) {
+        unsigned char b = row[i >> 1];
+        int n = (i & 1) ? (b >> 4) : (b & 0x0F);
+        acc += v[i] * (float)(n - 8);
+    }
+    return wave_sum(acc);
+}
+
 #include <hip/hip_fp16.h>
 
 // VQ-int3 codebook parameters — MUST match quant.rs (VQ_DIM/VQ_K/VQ_INDEX_BITS/VQ_GROUP).

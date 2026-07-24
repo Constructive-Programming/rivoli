@@ -21,8 +21,36 @@ pub struct ExpertDescVq {
     pub down_scales: *const u16,
 }
 
+/// int4 expert descriptor (mirrors `struct ExpertDescI4` in moe.hip): per projection
+/// the packed 4-bit weights + a per-output-row f32 scale (colibri's `.qs`). The
+/// "warm expert" format — passed to [`launch_moe_expert_range_i4`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ExpertDescI4 {
+    pub gate_packed: *const u8,
+    pub gate_scale: *const f32,
+    pub up_packed: *const u8,
+    pub up_scale: *const f32,
+    pub down_packed: *const u8,
+    pub down_scale: *const f32,
+}
+
 unsafe extern "C" {
     fn rivoli_device_sync() -> i32;
+
+    #[allow(clippy::too_many_arguments)]
+    fn rivoli_moe_expert_range_i4(
+        x: *const f32,
+        hidden: i32,
+        inter: i32,
+        e_start: i32,
+        e_count: i32,
+        descs: *const ExpertDescI4,
+        wexpert: *const f32,
+        h: *mut f32,
+        partial: *mut f32,
+        stream: *mut c_void,
+    ) -> i32;
 
     #[allow(clippy::too_many_arguments)]
     fn rivoli_moe_expert_range(
@@ -260,6 +288,45 @@ pub unsafe fn launch_moe_expert_range(
         )
     };
     check(r, "moe_expert_range")
+}
+
+/// int4 counterpart of [`launch_moe_expert_range`]: gate/up + down for the absolute
+/// range `[e_start, e_start+e_count)` on `stream`, decoding int4 (per-row scale).
+/// `descs` are [`ExpertDescI4`]; partials land in the same `partial` slab and are
+/// summed by [`launch_moe_reduce`], so int4 experts share the VQ reduce.
+///
+/// # Safety
+/// Every device pointer (`descs`/packed weights/`wexpert`/`x`/`h`/`partial`) must
+/// outlive `stream`'s completion — await its [`Signal`](crate::gpustream::Signal).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_moe_expert_range_i4(
+    x: *const f32,
+    hidden: usize,
+    inter: usize,
+    e_start: usize,
+    e_count: usize,
+    descs: *const ExpertDescI4,
+    wexpert: *const f32,
+    h: *mut f32,
+    partial: *mut f32,
+    stream: *mut c_void,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
+    let r = unsafe {
+        rivoli_moe_expert_range_i4(
+            x,
+            hidden as i32,
+            inter as i32,
+            e_start as i32,
+            e_count as i32,
+            descs,
+            wexpert,
+            h,
+            partial,
+            stream,
+        )
+    };
+    check(r, "moe_expert_range_i4")
 }
 
 /// Fixed-order reduce `out[o] = Σ_e partial[e][o]` over all `e` experts, on `stream`.

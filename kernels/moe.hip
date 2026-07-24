@@ -114,3 +114,65 @@ extern "C" int rivoli_moe_reduce_s(const float* partial, int E, int hidden, floa
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
+
+// ── int4 MoE (colibri "warm expert" format): same two-pass shape as the VQ path,
+//    decoding via dot_i4_wave with a per-row f32 scale applied OUTSIDE the dot. One
+//    descriptor per expert (six device pointers), absolute [e_start,e_count) range
+//    on a stream, so it plugs into the same expert-stream + moe_reduce as VQ.
+struct ExpertDescI4 {
+    const unsigned char* gate_packed;  // [inter · (hidden+1)/2]
+    const float*         gate_scale;   // [inter]
+    const unsigned char* up_packed;
+    const float*         up_scale;
+    const unsigned char* down_packed;  // [hidden · (inter+1)/2]
+    const float*         down_scale;   // [hidden]
+};
+
+extern "C" __global__ void moe_gateup_i4(
+    const float* __restrict__ x, int hidden, int inter, int e_start, int e_count,
+    const ExpertDescI4* __restrict__ descs, float* __restrict__ h_out) {
+    int lane = threadIdx.x & (WAVE - 1);
+    size_t r = (size_t)blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / WAVE;
+    if (r >= (size_t)e_count * inter) return;
+    int e = e_start + (int)(r / inter);
+    int j = (int)(r % inter);
+    const ExpertDescI4 d = descs[e];
+    size_t rb_h = (size_t)((hidden + 1) / 2);
+    float g = dot_i4_wave(x, d.gate_packed + (size_t)j * rb_h, hidden, lane);
+    float u = dot_i4_wave(x, d.up_packed + (size_t)j * rb_h, hidden, lane);
+    if (lane == 0) h_out[(size_t)e * inter + j] = siluf(g * d.gate_scale[j]) * (u * d.up_scale[j]);
+}
+
+extern "C" __global__ void moe_down_i4(
+    int hidden, int inter, int e_start, int e_count, const ExpertDescI4* __restrict__ descs,
+    const float* __restrict__ wexpert, const float* __restrict__ h_in, float* __restrict__ partial) {
+    int lane = threadIdx.x & (WAVE - 1);
+    size_t r = (size_t)blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / WAVE;
+    if (r >= (size_t)e_count * hidden) return;
+    int e = e_start + (int)(r / hidden);
+    int o = (int)(r % hidden);
+    const ExpertDescI4 d = descs[e];
+    size_t rb_i = (size_t)((inter + 1) / 2);
+    const float* he = h_in + (size_t)e * inter;
+    float dv = dot_i4_wave(he, d.down_packed + (size_t)o * rb_i, inter, lane);
+    if (lane == 0) partial[(size_t)e * hidden + o] = wexpert[e] * dv * d.down_scale[o];
+}
+
+extern "C" int rivoli_moe_expert_range_i4(
+    const float* x, int hidden, int inter, int e_start, int e_count, const void* descs,
+    const float* wexpert, float* h, float* partial, void* stream) {
+    if (hidden <= 0 || inter <= 0 || e_count <= 0 || e_start < 0) return 1001;
+    const ExpertDescI4* d = (const ExpertDescI4*)descs;
+    hipStream_t s = (hipStream_t)stream;
+    hipGetLastError();
+    size_t rows_a = (size_t)e_count * inter;
+    hipLaunchKernelGGL(moe_gateup_i4, dim3((rows_a + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
+                       dim3(256), 0, s, x, hidden, inter, e_start, e_count, d, h);
+    hipError_t e = hipGetLastError();
+    if (e != hipSuccess) return -(int)e;
+    size_t rows_b = (size_t)e_count * hidden;
+    hipLaunchKernelGGL(moe_down_i4, dim3((rows_b + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
+                       dim3(256), 0, s, hidden, inter, e_start, e_count, d, wexpert, h, partial);
+    e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
