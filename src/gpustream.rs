@@ -62,6 +62,15 @@ impl Drop for HipStream {
     }
 }
 
+/// A fresh [`Signal`] armed on a raw stream handle — resolves when the stream
+/// reaches its current point. The expert stream uses it for the compute-stream
+/// completion (moe_out ready) from inside its async block.
+pub fn stream_signal(stream_raw: *mut c_void) -> Result<Signal> {
+    let s = Signal::pending();
+    s.arm_on_raw(stream_raw)?;
+    Ok(s)
+}
+
 struct SignalState {
     done: AtomicBool,
     waker: AtomicWaker,
@@ -104,10 +113,16 @@ impl Signal {
     /// callback wakes it), so the enqueued GPU work's completion resolves the
     /// future. Enqueue the work first, then arm.
     pub fn arm_on(&self, stream: &HipStream) -> Result<()> {
+        self.arm_on_raw(stream.raw())
+    }
+
+    /// As [`arm_on`](Self::arm_on) but for a raw stream handle — the expert stream
+    /// holds a `*mut c_void` (Copy) inside its async block, not a `&HipStream`.
+    pub fn arm_on_raw(&self, stream_raw: *mut c_void) -> Result<()> {
         // Hand one ref to the callback; the trampoline reclaims it exactly once.
         let user = Arc::into_raw(self.0.clone()) as *mut c_void;
         // SAFETY: `trampoline` has the C callback signature; `user` is a live Arc ptr.
-        let rc = unsafe { rivoli_stream_host_signal(stream.raw(), trampoline, user) };
+        let rc = unsafe { rivoli_stream_host_signal(stream_raw, trampoline, user) };
         if rc != 0 {
             // Enqueue failed → callback never runs → reclaim the ref here.
             // SAFETY: `user` came from into_raw and was not consumed.

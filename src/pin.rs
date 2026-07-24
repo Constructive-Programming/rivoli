@@ -16,13 +16,15 @@
 //! `rocm`-only: without a device there is nothing to pin.
 #![cfg(feature = "rocm")]
 
+use crate::asyncfetch::{AsyncFetch, ReadSpec};
 use crate::cache;
 use crate::device::{DeviceTier, VmmBuf};
 use crate::format::{Dtype, FormatMeta, Safetensors, Vq3Set, load_codebooks};
+use crate::gpustream::Signal;
 use crate::model::ModelConfig;
 use crate::quant::{VQ_DIM, VQ_K, vq_expert_bytes, vq_expert_layout, vq_proj_bytes, vq_row_bytes};
 use crate::stream::{Sqpoll, Streamer, slot_span};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use std::os::fd::RawFd;
 
 /// A resolved fp8-e4m3 block-scaled weight matrix in the tier: device pointers +
@@ -115,17 +117,6 @@ pub struct LayerPin {
     pub indexer: Option<IndexerPin>,
 }
 
-/// Proof that a layer's demand reads are in flight on the main ring, and the
-/// obligation to join them. Returned by [`Pin::submit_layer`], consumed by
-/// [`Pin::await_layer`]. Zero-sized: it puts the submit/await protocol in the type
-/// system, where the alternative is a comment nobody re-reads.
-///
-/// Rust is affine, so this can still be dropped without awaiting — but only on a
-/// `?` error path, where the forward pass is already unwinding and the run is over.
-#[must_use = "the demand reads are still in flight; pass this to Pin::await_layer \
-              before launching anything that reads the returned descriptors"]
-pub struct DemandBatch(());
-
 /// The resident weight set + cold-expert streaming pool.
 pub struct Pin<'a> {
     cfg: &'a ModelConfig,
@@ -161,15 +152,12 @@ pub struct Pin<'a> {
     vq_off: [usize; 6],
     /// Adaptive routed tier: (layer,expert) -> slot, policy-evicted (`--cache-policy`).
     pool: Pool,
-    /// io_uring O_DIRECT reader — a layer's cold misses submit as one queue-depth
-    /// batch straight into their pool slots.
-    stream: Streamer,
-    /// Slots the demand ring is currently writing (between `submit_layer` and
-    /// `await_layer`). Load-bearing in release: `submit_layer` consults it to refuse
-    /// reusing a slot whose read is still outstanding (the silent-corruption guard).
-    inflight: Vec<usize>,
+    /// Per-expert async cold-fetch: owns the io_uring demand ring on a reaper thread
+    /// and resolves each miss's load [`Signal`] when its bytes land. The expert
+    /// stream awaits these; there is no batch join.
+    fetch: AsyncFetch,
     /// How many times a batch reused a slot whose read was still outstanding — each
-    /// one would have been a silent weight corruption before the guard.
+    /// one would have been a silent weight corruption; the async path refuses it.
     pub slot_collisions: u64,
     pub hits: u64,
     pub misses: u64,
@@ -618,7 +606,7 @@ impl<'a> Pin<'a> {
         );
         // Bounce span = the whole expert block (one read).
         let span = slot_span(vq_expert_bytes(cfg.hidden, cfg.moe_inter));
-        let stream = Streamer::new(ring as u32, span, bounce, Sqpoll::Own)?;
+        let fetch = AsyncFetch::new(Streamer::new(ring as u32, span, bounce, Sqpoll::Own)?)?;
 
         Ok(Self {
             cfg,
@@ -635,8 +623,7 @@ impl<'a> Pin<'a> {
             moe_table,
             vq_off,
             pool,
-            stream,
-            inflight: Vec::new(),
+            fetch,
             slot_collisions: 0,
             hits: 0,
             misses: 0,
@@ -667,7 +654,7 @@ impl<'a> Pin<'a> {
         &mut self,
         layer: usize,
         sel: &[usize],
-    ) -> Result<([Option<usize>; 32], usize)> {
+    ) -> Result<([Option<usize>; 32], usize, Vec<Signal>)> {
         let cfg = self.cfg;
         let sparse = (layer - cfg.dense_layers) * cfg.n_experts; // moe_table row base
         debug_assert!(
@@ -696,55 +683,69 @@ impl<'a> Pin<'a> {
                 slots[i] = Some(slot);
             }
         }
-        // Phase 1b: allocate + QUEUE the misses, now that all hits are protected.
-        // Reset inflight here (not only in await) so an error path that skips the
-        // join cannot leave a stale slot recorded.
-        self.inflight.clear();
+        // Phase 1b: allocate the misses and build their cold-read specs, now that all
+        // hits are protected. `batch_slots` is the async slot-collision guard: within
+        // one batch two reads must never target the same slot (io_uring completion
+        // order is NOT submission order, so overlapping writes corrupt silently). It
+        // can only happen if a layer's misses exceed the free pool — impossible in a
+        // real config (misses ≤ top_k ≪ the 2Q probation segment), so refusing is the
+        // lazy-correct guard. ponytail: bail on collision; upgrade to a sub-batch await
+        // (submit + await the colliding slot, then continue) if a tiny pool ever needs it.
+        let base = self.lru_pool.ptr_mut();
+        let mut reads: Vec<ReadSpec> = Vec::new();
+        let mut miss_sel: Vec<usize> = Vec::new(); // sel-index of each read, for signal mapping
+        let mut batch_slots: Vec<usize> = Vec::new();
         for (i, &e) in sel.iter().enumerate() {
             if slots[i].is_some() {
                 continue;
             }
             self.misses += 1;
             let slot = self.pool.alloc(expert_key(layer, e))?;
-            // SLOT REUSE WITHIN ONE BATCH — the correctness hazard this guard exists
-            // for. `alloc` may evict a key an EARLIER miss in this same batch just
-            // inserted, recycling its slot. Both reads would target the same dst, and
-            // io_uring completion order is NOT submission order — so the evicted key's
-            // read can land last, leaving the slot holding the wrong expert while the
-            // bookkeeping records the new key. Fix: complete the outstanding reads
-            // before reusing their slot (costs one extra drain, only on a collision).
-            if self.inflight.contains(&slot) {
-                self.stream.drain()?;
-                self.inflight.clear();
+            if batch_slots.contains(&slot) {
                 self.slot_collisions += 1;
+                bail!(
+                    "slot-collision: layer {layer} batch reuses an in-flight slot \
+                     (misses exceed the free pool) — raise the pool (--max-mem)"
+                );
             }
-            let slab = self.lru_pool.ptr_mut();
-            let entry = self.moe_table[sparse + e];
-            stream_expert(&mut self.stream, entry, slab, slot, self.expert_slot)?;
+            batch_slots.push(slot);
+            let (fd, begin, len) = self.moe_table[sparse + e];
+            // SAFETY: slot*expert_slot is block-aligned (expert_slot is a VQ_ALIGN
+            // multiple) and within the slab; the slot stays live until this expert's
+            // Signal resolves (the pipeline holds it).
+            let dst = unsafe { base.add(slot * self.expert_slot) };
+            reads.push(ReadSpec {
+                fd,
+                begin,
+                len,
+                dst,
+            });
+            miss_sel.push(i);
             slots[i] = Some(slot);
-            self.inflight.push(slot);
         }
-        // Phase 2: hand the whole batch to the kernel NOW, without waiting — with the
-        // ring's poller this puts all the layer's reads in the device queue at once
-        // and returns so the caller's descriptor build + uploads run while the NVMe
-        // works. The matching join is `await_layer`.
-        self.stream.submit()?;
-        Ok((slots, sparse))
+        // Phase 2: hand the whole batch to the reaper — it queues+submits (all reads
+        // start on the NVMe at once) and resolves each miss's Signal when its copy
+        // lands. Hits default to `ready()`; overwrite each miss with its load Signal.
+        let miss_signals = self.fetch.submit(reads)?;
+        let mut signals: Vec<Signal> = (0..sel.len()).map(|_| Signal::ready()).collect();
+        for (k, &i) in miss_sel.iter().enumerate() {
+            signals[i] = miss_signals[k].clone();
+        }
+        Ok((slots, sparse, signals))
     }
 
     /// Submit one layer's cold reads and resolve each selected expert to its
-    /// [`MlpVq`] (device pointers into the pool slots). The returned descriptors are
-    /// valid POINTERS but their bytes are still in flight — nothing may READ a cold
-    /// slot until [`Pin::await_layer`] consumes the returned [`DemandBatch`].
-    /// (A slot's address is fixed at `pool.alloc` time — a function of the slot index
-    /// and geometry, not of the data arriving — so building descriptors here is sound.)
+    /// [`MlpVq`] (device pointers into the pool slots) plus its load [`Signal`]. The
+    /// descriptors are valid POINTERS immediately (a slot's address is fixed at
+    /// `pool.alloc` time); the bytes land when the matching `signals[i]` resolves.
+    /// The expert stream awaits each signal before computing that expert.
     pub fn submit_layer(
         &mut self,
         layer: usize,
         sel: &[usize],
         out: &mut Vec<MlpVq>,
-    ) -> Result<DemandBatch> {
-        let (slots, _sparse) = self.submit_spine(layer, sel)?;
+    ) -> Result<Vec<Signal>> {
+        let (slots, _sparse, signals) = self.submit_spine(layer, sel)?;
         let cfg = self.cfg;
         let (gate_o, gate_i) = (cfg.moe_inter, cfg.hidden);
         let (down_o, down_i) = (cfg.hidden, cfg.moe_inter);
@@ -755,7 +756,7 @@ impl<'a> Pin<'a> {
         for (i, _e) in sel.iter().enumerate() {
             let slot = slots[i].context("submit_layer: unresolved expert slot")?;
             // SAFETY: slot base within the slab; address arithmetic only (the bytes
-            // land by `await_layer`).
+            // land when `signals[i]` resolves).
             let b = unsafe { slab.add(slot * es) };
             let vw = |ioff: usize, soff: usize, o_dim: usize, i_dim: usize| VqWeight {
                 indices: unsafe { b.add(ioff) },
@@ -769,20 +770,7 @@ impl<'a> Pin<'a> {
                 down: vw(o[4], o[5], down_o, down_i),
             });
         }
-        Ok(DemandBatch(()))
-    }
-
-    /// Join the demand batch [`Pin::submit_layer`] put in flight: every cold slot
-    /// holds its expert's bytes when this returns.
-    ///
-    /// Consuming the `DemandBatch` is what makes "await without submit" and "await
-    /// twice" uncompilable; `#[must_use]` covers most of "submit without await".
-    pub fn await_layer(&mut self, batch: DemandBatch) -> Result<()> {
-        let DemandBatch(()) = batch; // consumed: the batch is no longer outstanding
-        self.stream.drain()?;
-        #[cfg(debug_assertions)]
-        self.inflight.clear();
-        Ok(())
+        Ok(signals)
     }
 }
 
@@ -799,27 +787,6 @@ fn build_moe_table(vq: &Vq3Set, cfg: &ModelConfig) -> Result<Vec<(RawFd, usize, 
         }
     }
     Ok(table)
-}
-
-/// Queue an expert's single O_DIRECT read into pool slot `slot` (at
-/// `slot*expert_slot`). Pure indexing + queueing — no allocation or validation
-/// (done at [`Vq3Set::open`] / [`build_moe_table`]).
-fn stream_expert(
-    stream: &mut Streamer,
-    entry: (RawFd, usize, usize),
-    pool: *mut u8,
-    slot: usize,
-    expert_slot: usize,
-) -> Result<()> {
-    let (fd, begin, len) = entry;
-    // SAFETY: slot*expert_slot is block-aligned (expert_slot is a VQ_ALIGN multiple)
-    // and within the slab (slot < n_slots; slot sized to hold the block's superset),
-    // owning >= slot_span(len) writable bytes until the drain.
-    let dst = unsafe { pool.add(slot * expert_slot) };
-    // SAFETY: dst is block-aligned and owns the read's aligned superset; begin is
-    // VQ_ALIGN-aligned (sub == 0), so the useful bytes land at dst.
-    unsafe { stream.queue(fd, begin, len, dst)? };
-    Ok(())
 }
 
 #[cfg(test)]

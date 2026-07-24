@@ -10,18 +10,20 @@
 
 use crate::attn::{AttnMode, streaming_rows};
 use crate::device::DeviceBuf;
+use crate::gpustream::{HipStream, Signal, stream_signal};
 use crate::hip::{
     ExpertDescVq, device_sync, launch_append_kv, launch_argmax, launch_attend, launch_embed_i8_row,
     launch_gather_rope, launch_gemv_f32, launch_gemv_fp8, launch_gemv_i8, launch_index_append,
     launch_index_head_route, launch_index_pool_push, launch_index_score, launch_layernorm,
-    launch_mla_absorb_fp8, launch_mla_value_fp8, launch_moe_vq, launch_rmsnorm, launch_rope,
-    launch_swiglu, launch_vadd,
+    launch_mla_absorb_fp8, launch_mla_value_fp8, launch_moe_expert_range, launch_moe_reduce,
+    launch_rmsnorm, launch_rope, launch_swiglu, launch_vadd,
 };
 use crate::math::{E4M3_BLOCK, sigmoid, topk_into};
 use crate::model::ModelConfig;
 use crate::pin::{Fp8Mlp, IndexerPin, LayerMlp, MlpVq, Pin};
 use crate::telemetry::ProfileSummary;
 use anyhow::{Result, bail, ensure};
+use futures_util::stream::{StreamExt, TryStreamExt};
 
 /// Little-endian byte view of a u32 slice — zero-copy on this LE host. Feeds the
 /// per-token attention-rows H2D.
@@ -81,6 +83,11 @@ fn route_into(
 /// sync, nothing that perturbs the run. The end-of-run [`Profile::report`] is the
 /// engine's standing performance summary; the expensive fine-grained audits and
 /// correctness probes live behind the `trace` feature instead.
+/// Expert-stream concurrency: how many experts' loads are in flight at once. ≥ the
+/// per-layer expert count (top_k + shared ≈ 9) so every expert is launched
+/// concurrently — the misses' fetch overlaps the resident experts' compute.
+const MOE_STREAM_WIDTH: usize = 16;
+
 #[derive(Default)]
 struct Profile {
     fetch_ns: u128, // NVMe stream: submit + await (the bandwidth-bound term)
@@ -208,6 +215,13 @@ pub struct GpuEngine<'a> {
     argmax_host: Vec<u8>,
     /// Always-on cheap per-token profiling (see [`Profile`]).
     prof: Profile,
+    /// The MoE expert stream's compute stream — resident/loaded experts' partials
+    /// run here concurrently with the fetch stream's loads (the overlap). Separate
+    /// from the null stream the rest of the forward uses.
+    compute_stream: HipStream,
+    /// Current-thread runtime that drives the per-layer expert stream. The decode
+    /// loop is serial; GPU/IO concurrency comes from the streams + reaper, not threads.
+    rt: tokio::runtime::Runtime,
     /// DIAGNOSTIC (`--checksum-x`, `trace` only): hash the residual stream each layer.
     #[cfg(feature = "trace")]
     checksum_x: bool,
@@ -327,6 +341,8 @@ impl<'a> GpuEngine<'a> {
             gl_host: Vec::with_capacity(cfg.n_experts * 4),
             argmax_host: Vec::with_capacity(8),
             prof: Profile::default(),
+            compute_stream: HipStream::new()?,
+            rt: tokio::runtime::Builder::new_current_thread().build()?,
             #[cfg(feature = "trace")]
             checksum_x: false,
             #[cfg(feature = "trace")]
@@ -770,14 +786,13 @@ impl<'a> GpuEngine<'a> {
                     &mut self.sel,
                 );
                 self.prof.route_ns += t.elapsed().as_nanos();
-                // SUBMIT this layer's cold reads and take the descriptors back
-                // immediately — the slot ADDRESSES are known at allocation time, only
-                // the bytes are still arriving. Everything until `await_layer` runs
-                // with the NVMe busy.
+                // SUBMIT this layer's cold reads — each selected expert gets a load
+                // Signal (hit → ready; miss → resolves when its bytes land). The slot
+                // ADDRESSES are known now, so the descriptors below are valid pointers.
                 let miss0 = self.pin.misses;
-                let t = std::time::Instant::now();
-                let batch = self.pin.submit_layer(l, &self.sel, &mut self.mlps_vq)?;
-                self.prof.fetch_ns += t.elapsed().as_nanos();
+                let tf = std::time::Instant::now();
+                let mut signals = self.pin.submit_layer(l, &self.sel, &mut self.mlps_vq)?;
+                self.prof.fetch_ns += tf.elapsed().as_nanos();
                 self.prof.fetch_n += self.pin.misses - miss0;
                 // Routed weights: sigmoid score, sum-normalized over the routed picks,
                 // then scaled. The VQ shared expert (weight 1.0) folds into the batch.
@@ -795,7 +810,8 @@ impl<'a> GpuEngine<'a> {
                 for wi in self.w.iter_mut() {
                     *wi *= cfg.routed_scale as f32;
                 }
-                // VQ routed descriptors + the folded VQ shared expert (weight 1.0).
+                // VQ routed descriptors + the folded VQ shared expert (resident, so its
+                // load is `ready()`).
                 self.descs_vq.clear();
                 for m in &self.mlps_vq {
                     self.descs_vq.push(desc_of_vq(m));
@@ -803,33 +819,56 @@ impl<'a> GpuEngine<'a> {
                 if let Some(s) = shared {
                     self.descs_vq.push(desc_of_vq(&s));
                     self.w.push(1.0);
+                    signals.push(Signal::ready());
                 }
                 let ndesc = self.descs_vq.len();
                 self.descs_buf
                     .copy_in_at(0, desc_bytes_vq(&self.descs_vq))?;
                 self.wexpert_buf.copy_in_at(0, f32_le_bytes(&self.w))?;
-                // JOIN the cold reads — last moment before the first deref of a cold
-                // slot. No kernel live, so the bounce drain's sync serialises nothing.
-                let t = std::time::Instant::now();
-                self.pin.await_layer(batch)?;
-                self.prof.fetch_ns += t.elapsed().as_nanos();
-                // SAFETY: descs point at landed slot indices/scales + resident codebooks.
-                unsafe {
-                    launch_moe_vq(
-                        xnp,
-                        hidden,
-                        cfg.moe_inter,
-                        ndesc,
-                        self.descs_buf.ptr() as *const ExpertDescVq,
-                        self.codebooks[0],
-                        self.codebooks[1],
-                        self.codebooks[2],
-                        self.wexpert_buf.ptr() as *const f32,
-                        self.moe_h.ptr_mut() as *mut f32,
-                        self.moe_partial.ptr_mut() as *mut f32,
-                        self.moe_out.ptr_mut() as *mut f32,
-                    )?;
-                }
+                // THE EXPERT STREAM (stream 1): each expert, once its load Signal
+                // resolves, launches its own partial on the compute stream. Concurrent
+                // loads (buffer_unordered) overlap the misses' fetch with the resident/
+                // loaded experts' compute; partials are independent rows so completion
+                // order is irrelevant. Then a fixed-order reduce on the same stream,
+                // awaited so moe_out is ready for the residual add. mlp bucket = the
+                // whole overlapped wall (fetch now hidden inside it).
+                let x_c = xnp as *const f32;
+                let (h_c, part_c, out_c) = (
+                    self.moe_h.ptr_mut() as *mut f32,
+                    self.moe_partial.ptr_mut() as *mut f32,
+                    self.moe_out.ptr_mut() as *mut f32,
+                );
+                let descs_ptr = self.descs_buf.ptr() as *const ExpertDescVq;
+                let w_ptr = self.wexpert_buf.ptr() as *const f32;
+                let (cb0, cb1, cb2) = (self.codebooks[0], self.codebooks[1], self.codebooks[2]);
+                let cs_raw = self.compute_stream.raw();
+                let inter = cfg.moe_inter;
+                let tm = std::time::Instant::now();
+                self.rt.block_on(async move {
+                    futures_util::stream::iter(0..ndesc)
+                        .map(move |e| {
+                            let sig = signals[e].clone();
+                            async move {
+                                sig.await;
+                                // SAFETY: descs/codebooks resident; slot loaded (sig
+                                // resolved); h/part device scratch; cs_raw live.
+                                unsafe {
+                                    launch_moe_expert_range(
+                                        x_c, hidden, inter, e, 1, descs_ptr, cb0, cb1, cb2, w_ptr,
+                                        h_c, part_c, cs_raw,
+                                    )
+                                }
+                            }
+                        })
+                        .buffer_unordered(MOE_STREAM_WIDTH)
+                        .try_collect::<Vec<()>>()
+                        .await?;
+                    // SAFETY: partial holds ndesc·hidden f32; out is hidden f32; cs live.
+                    unsafe { launch_moe_reduce(part_c, ndesc, hidden, out_c, cs_raw)? };
+                    stream_signal(cs_raw)?.await;
+                    Ok::<(), anyhow::Error>(())
+                })?;
+                self.prof.mlp_ns += tm.elapsed().as_nanos();
             }
             // SAFETY: residual add of the MLP contribution.
             unsafe { launch_vadd(xp, self.moe_out.ptr() as *const f32, hidden)? };
