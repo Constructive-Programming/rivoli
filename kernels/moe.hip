@@ -40,8 +40,8 @@ __device__ __forceinline__ size_t vq_ng(int i_dim) {
 // independent streams and they all land in the same schedule-independent `h`.
 extern "C" __global__ void moe_gateup_vq(
     const float* __restrict__ x, int hidden, int inter, int e_start, int e_count,
-    const ExpertDescVq* __restrict__ descs, const float* __restrict__ gate_cb,
-    const float* __restrict__ up_cb, float* __restrict__ h_out) {
+    const ExpertDescVq* __restrict__ descs, const __half* __restrict__ gate_cb,
+    const __half* __restrict__ up_cb, float* __restrict__ h_out) {
     int lane = threadIdx.x & (WAVE - 1);
     size_t r = (size_t)blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / WAVE;
     if (r >= (size_t)e_count * inter) return;
@@ -58,7 +58,7 @@ extern "C" __global__ void moe_gateup_vq(
 // own partial row (no atomics → schedule-independent). Same absolute-range form.
 extern "C" __global__ void moe_down_vq(
     int hidden, int inter, int e_start, int e_count, const ExpertDescVq* __restrict__ descs,
-    const float* __restrict__ down_cb, const float* __restrict__ wexpert,
+    const __half* __restrict__ down_cb, const float* __restrict__ wexpert,
     const float* __restrict__ h_in, float* __restrict__ partial) {
     int lane = threadIdx.x & (WAVE - 1);
     size_t r = (size_t)blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / WAVE;
@@ -88,7 +88,7 @@ extern "C" __global__ void moe_reduce(
 //     resident range), each on its stream, then reduces once all `partial` rows land.
 extern "C" int rivoli_moe_expert_range(
     const float* x, int hidden, int inter, int e_start, int e_count, const void* descs,
-    const float* gate_cb, const float* up_cb, const float* down_cb, const float* wexpert,
+    const __half* gate_cb, const __half* up_cb, const __half* down_cb, const float* wexpert,
     float* h, float* partial, void* stream) {
     if (hidden <= 0 || inter <= 0 || e_count <= 0 || e_start < 0) return 1001;
     const ExpertDescVq* d = (const ExpertDescVq*)descs;

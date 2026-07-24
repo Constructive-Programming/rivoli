@@ -47,6 +47,57 @@ pub fn bf16_to_f32(b: u16) -> f32 {
     f32::from_bits((b as u32) << 16)
 }
 
+/// Narrow f32 → IEEE-754 binary16 (fp16) bits, round to nearest even. Overflow
+/// saturates to ±inf, underflow flushes through the subnormals to ±0. The VQ
+/// codebook is stored fp16 (its centroid values sit well inside fp16's normal
+/// range, and the per-group bf16 scale carries the magnitude), decoded on the GPU
+/// via `__half`; fp16's 10-bit mantissa clears the kernel-oracle tol where bf16's 8
+/// does not. Mirror of the device `__float2half`.
+pub fn f32_to_f16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let biased = (bits >> 23) & 0xff;
+    let mant = bits & 0x007f_ffff;
+    if biased == 0xff {
+        // Inf/NaN: keep a mantissa bit set for NaN so it doesn't collapse to Inf.
+        return sign | 0x7c00 | if mant != 0 { 0x0200 } else { 0 };
+    }
+    let exp = biased as i32 - 127 + 15; // rebias 127 → 15
+    if exp >= 0x1f {
+        return sign | 0x7c00; // overflow → inf
+    }
+    if exp <= 0 {
+        if exp < -10 {
+            return sign; // underflow → ±0
+        }
+        // Subnormal: restore the implicit 1, shift into place with RNE.
+        let m = mant | 0x0080_0000;
+        let shift = (14 - exp) as u32; // 14..=24
+        let half = 1u32 << (shift - 1);
+        let rem = m & ((1u32 << shift) - 1);
+        let mut out = m >> shift;
+        if rem > half || (rem == half && (out & 1) == 1) {
+            out += 1;
+        }
+        return sign | out as u16;
+    }
+    // Normal: 10-bit mantissa, RNE on the dropped 13 bits.
+    let mut e = exp as u32;
+    let mut m = mant >> 13;
+    let rem = mant & 0x1fff;
+    if rem > 0x1000 || (rem == 0x1000 && (m & 1) == 1) {
+        m += 1;
+        if m == 0x400 {
+            m = 0; // mantissa carry bumps the exponent
+            e += 1;
+            if e >= 0x1f {
+                return sign | 0x7c00;
+            }
+        }
+    }
+    sign | ((e as u16) << 10) | m as u16
+}
+
 /// Largest finite magnitude representable in OCP `e4m3` (S.1111.110 = 448).
 pub const E4M3_MAX: f32 = 448.0;
 
@@ -218,6 +269,26 @@ mod tests {
         // x / 2.5
         assert!((v[0] - 1.2).abs() < 1e-5, "{v:?}");
         assert!((v[1] - 1.6).abs() < 1e-5, "{v:?}");
+    }
+
+    #[test]
+    fn f32_to_f16_known_bit_patterns() {
+        // Exact-representable values and a sign.
+        assert_eq!(f32_to_f16(0.0), 0x0000);
+        assert_eq!(f32_to_f16(1.0), 0x3c00);
+        assert_eq!(f32_to_f16(2.0), 0x4000);
+        assert_eq!(f32_to_f16(0.5), 0x3800);
+        assert_eq!(f32_to_f16(-1.0), 0xbc00);
+        // Round to nearest even: 1 + 2^-11 sits exactly between 0x3c00 and 0x3c01,
+        // ties to even (0x3c00); 1 + 2^-10 is the next representable step.
+        assert_eq!(f32_to_f16(1.0 + 2f32.powi(-11)), 0x3c00);
+        assert_eq!(f32_to_f16(1.0 + 2f32.powi(-10)), 0x3c01);
+        // Max finite fp16 (65504) and overflow → inf.
+        assert_eq!(f32_to_f16(65504.0), 0x7bff);
+        assert_eq!(f32_to_f16(1e30), 0x7c00);
+        // Underflow → ±0; a NaN keeps a mantissa bit (stays NaN, not inf).
+        assert_eq!(f32_to_f16(1e-30), 0x0000);
+        assert_ne!(f32_to_f16(f32::NAN) & 0x03ff, 0);
     }
 
     #[test]

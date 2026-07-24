@@ -226,7 +226,8 @@ pub struct GpuEngine<'a> {
     // Per-token host build scratch — reused every layer so the hot path allocates
     // nothing: resolved VQ descriptors + weights, the resolved batch, D2H staging.
     w: Vec<f32>,
-    codebooks: [*const f32; 3],
+    /// The three per-projection VQ codebooks (gate/up/down), fp16, resident.
+    codebooks: [*const u16; 3],
     mlps_vq: Vec<MlpVq>,
     descs_vq: Vec<ExpertDescVq>,
     gl_host: Vec<u8>,

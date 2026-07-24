@@ -30,7 +30,7 @@ extern "C" __global__ void gemv_fp8(
 // applied inside the dot. `codebook` is shared across all rows.
 extern "C" __global__ void gemv_vq(
     const float* __restrict__ x, const unsigned char* __restrict__ indices,
-    const unsigned short* __restrict__ scales, const float* __restrict__ codebook,
+    const unsigned short* __restrict__ scales, const __half* __restrict__ codebook,
     int o_dim, int i_dim, float* __restrict__ y) {
     int lane = threadIdx.x & (WAVE - 1);
     size_t o = (size_t)blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x / WAVE);
@@ -166,7 +166,7 @@ extern "C" int rivoli_gemv_fp8(
 
 extern "C" int rivoli_gemv_vq(
     const float* x, const unsigned char* indices, const unsigned short* scales,
-    const float* codebook, int o_dim, int i_dim, float* y) {
+    const __half* codebook, int o_dim, int i_dim, float* y) {
     if (o_dim <= 0 || i_dim <= 0) return 1001;
     hipGetLastError();
     hipLaunchKernelGGL(gemv_vq, ROW_GRID(o_dim), ROW_BLOCK, 0, 0, x, indices, scales, codebook, o_dim, i_dim, y);

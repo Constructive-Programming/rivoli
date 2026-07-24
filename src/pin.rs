@@ -132,8 +132,10 @@ pub struct Pin<'a> {
     /// routing runs on the CPU). `moe_bias[layer - dense_layers]`, len n_experts.
     moe_bias: Vec<Vec<f32>>,
     /// The three per-projection codebooks (gate/up/down), resident, passed to
-    /// `launch_moe_expert_range`. Each `VQ_K·VQ_DIM` f32.
-    codebooks: [*const f32; 3],
+    /// `launch_moe_expert_range`. Each `VQ_K·VQ_DIM` fp16 (narrowed from the f32
+    /// source at load — the random idx→cb gather is the MoE hot path, and fp16
+    /// halves it into L1; see math::f32_to_f16 / dot_vq_wave).
+    codebooks: [*const u16; 3],
     /// The routed-expert pool: ONE device-local VMM slab of `n_slots` expert slots
     /// (slot i at `i * expert_slot`), each one O_DIRECT-aligned `.vq3` block.
     #[allow(dead_code)] // RAII owner of the pool slab; addressed via `lru_pool.ptr()`
@@ -335,7 +337,7 @@ fn resident_bytes(cfg: &ModelConfig, block: usize) -> usize {
             total += vq_expert_bytes(cfg.hidden, cfg.moe_inter); // VQ shared expert
         }
     }
-    total + 3 * VQ_K * VQ_DIM * 4 // 3 per-projection codebooks
+    total + 3 * VQ_K * VQ_DIM * 2 // 3 per-projection codebooks (fp16)
 }
 
 /// Pack `(layer, expert)` into the pool key. Both must fit in 16 bits — GLM is
@@ -511,14 +513,16 @@ impl<'a> Pin<'a> {
         );
         let mut tier = DeviceTier::new(tier_cap)?;
 
-        // Codebooks resident (gate/up/down), passed to launch_moe_expert_range.
+        // Codebooks resident (gate/up/down), narrowed f32 → fp16 at load and passed
+        // to launch_moe_expert_range. fp16 halves the hot idx→cb gather into L1.
         let mut codebooks = [std::ptr::null(); 3];
         for (i, cb) in cbs.iter().enumerate() {
-            let bytes = cb.len() * 4;
+            let half: Vec<u16> = cb.iter().map(|&v| crate::math::f32_to_f16(v)).collect();
+            let bytes = half.len() * 2;
             let dst = tier.reserve(bytes)?;
-            // SAFETY: dst owns bytes just reserved; f32 LE host == LE device.
-            unsafe { std::ptr::copy_nonoverlapping(cb.as_ptr() as *const u8, dst, bytes) };
-            codebooks[i] = dst as *const f32;
+            // SAFETY: dst owns bytes just reserved; u16 LE host == LE device.
+            unsafe { std::ptr::copy_nonoverlapping(half.as_ptr() as *const u8, dst, bytes) };
+            codebooks[i] = dst as *const u16;
         }
 
         // Global tensors.
@@ -642,8 +646,8 @@ impl<'a> Pin<'a> {
         &self.moe_bias[layer - self.cfg.dense_layers]
     }
 
-    /// The three per-projection codebooks (gate/up/down) for `launch_moe_expert_range`.
-    pub fn codebooks(&self) -> [*const f32; 3] {
+    /// The three per-projection codebooks (gate/up/down), fp16, for `launch_moe_expert_range`.
+    pub fn codebooks(&self) -> [*const u16; 3] {
         self.codebooks
     }
 

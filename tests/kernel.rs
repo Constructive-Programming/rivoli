@@ -18,6 +18,12 @@ fn f32b(v: &[f32]) -> Vec<u8> {
 fn u16b(v: &[u16]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
+/// f32 → fp16 bytes — the VQ codebook is uploaded fp16 (the kernel decodes __half),
+/// while the CPU reference keeps the f32 codebook, so these oracles measure exactly
+/// the fp16 codebook-rounding error against the tol.
+fn f16b(v: &[f32]) -> Vec<u8> {
+    u16b(&v.iter().map(|&x| rivoli::math::f32_to_f16(x)).collect::<Vec<_>>())
+}
 fn f32v(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -101,7 +107,7 @@ fn gemv_vq_matches_oracle() {
         dev(&f32b(&x)),
         dev(&indices),
         dev(&u16b(&scales)),
-        dev(&f32b(&codebook)),
+        dev(&f16b(&codebook)),
     );
     let mut yb = dev(&vec![0u8; o_dim * 4]);
     unsafe {
@@ -109,7 +115,7 @@ fn gemv_vq_matches_oracle() {
             xb.ptr() as *const f32,
             ib.ptr(),
             sb.ptr() as *const u16,
-            cb.ptr() as *const f32,
+            cb.ptr() as *const u16,
             o_dim,
             i_dim,
             yb.ptr_mut() as *mut f32,
@@ -466,9 +472,9 @@ fn moe_vq_matches_reference() {
     });
     let (xb, wb) = (dev(&f32b(&x)), dev(&f32b(&w)));
     let (g0, g1, g2) = (
-        dev(&f32b(&cbs[0])),
-        dev(&f32b(&cbs[1])),
-        dev(&f32b(&cbs[2])),
+        dev(&f16b(&cbs[0])),
+        dev(&f16b(&cbs[1])),
+        dev(&f16b(&cbs[2])),
     );
     let mut hbuf = dev(&vec![0u8; e * inter * 4]);
     let mut pbuf = dev(&vec![0u8; e * hidden * 4]);
@@ -487,9 +493,9 @@ fn moe_vq_matches_reference() {
                 k,
                 1,
                 descb.ptr() as *const ExpertDescVq,
-                g0.ptr() as *const f32,
-                g1.ptr() as *const f32,
-                g2.ptr() as *const f32,
+                g0.ptr() as *const u16,
+                g1.ptr() as *const u16,
+                g2.ptr() as *const u16,
                 wb.ptr() as *const f32,
                 hbuf.ptr_mut() as *mut f32,
                 pbuf.ptr_mut() as *mut f32,

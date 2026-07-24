@@ -81,6 +81,8 @@ __device__ __forceinline__ float dot_fp8_wave(const float* __restrict__ x,
     return wave_sum(acc);
 }
 
+#include <hip/hip_fp16.h>
+
 // VQ-int3 codebook parameters — MUST match quant.rs (VQ_DIM/VQ_K/VQ_INDEX_BITS/VQ_GROUP).
 #define VQ_DIM 4
 #define VQ_K 4096
@@ -95,10 +97,16 @@ __device__ __forceinline__ float dot_fp8_wave(const float* __restrict__ x,
 // subvectors t ≡ l (mod WAVE). The two-byte index read is in-bounds because
 // i_dim is a multiple of 8 (nsub even; the last odd subvector's high byte is the
 // row's last index byte — see quant.rs::get_idx / vq_row_bytes).
+//
+// The codebook is fp16: the random idx→cb[idx] gather is the latency-bound step,
+// and at 8B/entry (VQ_K·VQ_DIM·2 = 32KB) the whole codebook fits in the 32KB L1,
+// so the gather is an L1 hit instead of L2 (f32 was 64KB, L2-resident). fp16 keeps
+// x in f32 for the products; its 10-bit mantissa on the centroids clears the
+// oracle tol (bf16's 8 does not — see math::f32_to_f16).
 __device__ __forceinline__ float dot_vq_wave(const float* __restrict__ x,
                                              const unsigned char* __restrict__ idxrow,
                                              const unsigned short* __restrict__ scalerow,
-                                             const float* __restrict__ cb, int i_dim, int lane) {
+                                             const __half* __restrict__ cb, int i_dim, int lane) {
     int nsub = i_dim / VQ_DIM;
     float acc = 0.0f;
     for (int t = lane; t < nsub; t += WAVE) {
@@ -107,11 +115,13 @@ __device__ __forceinline__ float dot_vq_wave(const float* __restrict__ x,
         int shift = bitpos & 7;
         unsigned int raw = (unsigned int)idxrow[byte] | ((unsigned int)idxrow[byte + 1] << 8);
         int idx = (int)((raw >> shift) & 0xFFFu);
-        // ponytail-experiment: float4 loads for the VQ_DIM=4 subvector (16B/load,
-        // bit-identical to the scalar unroll — same 4 products, same order).
-        float4 cv = *(const float4*)(cb + (size_t)idx * VQ_DIM);
+        // 8B fp16 gather (two __half2) for the VQ_DIM=4 subvector; products in f32,
+        // same 4 terms in the same order as the f32 path.
+        const __half* c = cb + (size_t)idx * VQ_DIM;
+        float2 c01 = __half22float2(*(const __half2*)c);
+        float2 c23 = __half22float2(*(const __half2*)(c + 2));
         float4 xv = *(const float4*)(x + (size_t)t * VQ_DIM);
-        float dot = xv.x * cv.x + xv.y * cv.y + xv.z * cv.z + xv.w * cv.w;
+        float dot = xv.x * c01.x + xv.y * c01.y + xv.z * c23.x + xv.w * c23.y;
         acc += bf16f(scalerow[t / VQ_SUBS_PER_GROUP]) * dot;
     }
     return wave_sum(acc);
