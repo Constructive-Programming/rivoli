@@ -20,10 +20,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 opentelemetry = { version = "0.30", optional = true }
 opentelemetry_sdk = { version = "0.30", optional = true }
 opentelemetry-otlp = { version = "0.30", optional = true }
+# Async streaming MoE pipeline (rocm only): the futures-util StreamExt stack from
+# ollama-router drives the per-expert load‖compute overlap, with GPU/io_uring
+# completions bridged to futures via async signals. Current-thread runtime — the
+# decode loop is serial; the GPU streams are the concurrency, not CPU threads.
+tokio = { version = "1", features = ["rt", "sync", "macros"], optional = true }
+futures-util = { version = "0.3", optional = true }
+tokio-stream = { version = "0.1", optional = true }
 
 [features]
 default = []
-rocm = []   # build.rs compiles kernels/*.hip via hipcc when enabled
+# build.rs compiles kernels/*.hip via hipcc; pulls in the async streaming stack.
+rocm = ["dep:tokio", "dep:futures-util", "dep:tokio-stream"]
 # OTLP export of the always-on decode summary (one span/run, opt-in at runtime via
 # OTEL_EXPORTER_OTLP_ENDPOINT). Off by default — the opentelemetry stack is heavy.
 otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]

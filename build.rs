@@ -14,9 +14,14 @@ fn main() {
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR set by cargo");
     let kernels = [
-        "linalg", "moe", "mla", "attn", "fwd", "vmm", "stream", "indexer",
+        "linalg", "moe", "mla", "attn", "fwd", "vmm", "stream", "indexer", "async",
     ];
     let hipcc = std::env::var("HIPCC").unwrap_or_else(|_| "hipcc".into());
+    // ponytail: default gfx1151 (Strix Halo); override for other ROCm nodes (e.g.
+    // gfx1010 on rh-desktop's RX 5700) with RIVOLI_OFFLOAD_ARCH.
+    println!("cargo:rerun-if-env-changed=RIVOLI_OFFLOAD_ARCH");
+    let arch = std::env::var("RIVOLI_OFFLOAD_ARCH").unwrap_or_else(|_| "gfx1151".into());
+    let offload = format!("--offload-arch={arch}");
 
     // Headers are #included, not compiled units — track them so an edit forces a rebuild.
     println!("cargo:rerun-if-changed=kernels/common.hpp");
@@ -26,7 +31,7 @@ fn main() {
         let obj = format!("{out_dir}/{k}.o");
         println!("cargo:rerun-if-changed={src}");
         let mut cmd = Command::new(&hipcc);
-        cmd.args(["--offload-arch=gfx1151", "-O3", "-fPIC"]);
+        cmd.args([&offload, "-O3", "-fPIC"]);
         let status = cmd
             .args(["-c", &src, "-o", &obj])
             .status()
