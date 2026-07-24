@@ -164,4 +164,12 @@ impl ModelConfig {
     pub fn qk_head_dim(&self) -> usize {
         self.qk_nope_head_dim + self.qk_rope_head_dim
     }
+
+    /// Experts computed per MoE layer per token: the `top_k` routed picks the router
+    /// selects (`num_experts_per_tok`) plus the `n_shared` always-on shared experts.
+    /// Fixed by the trained model — the size of every MoE launch and of the expert
+    /// stream, and the concurrency the stream needs to run them all at once.
+    pub fn experts_per_layer(&self) -> usize {
+        self.top_k + self.n_shared
+    }
 }

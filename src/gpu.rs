@@ -77,11 +77,6 @@ fn route_into(
     topk_into(choice, top_k, sel);
 }
 
-/// Expert-stream concurrency: how many experts' loads are in flight at once. ≥ the
-/// per-layer expert count (top_k + shared ≈ 9) so every expert is launched
-/// concurrently — the misses' fetch overlaps the resident experts' compute.
-const MOE_STREAM_WIDTH: usize = 16;
-
 /// Per-token time buckets. ALWAYS ON: every bucket wraps a join/D2H the forward
 /// pass already pays (the end-of-layer sync, the gate-logits read, the stream
 /// drain), so accumulating them costs only a clock read per layer — no extra GPU
@@ -311,7 +306,7 @@ impl<'a> GpuEngine<'a> {
         let kvl = cfg.kv_lora_rank;
         let rope = cfg.qk_rope_head_dim;
         let h = cfg.n_heads;
-        let slots = cfg.top_k + cfg.n_shared; // routed + shared per MoE launch
+        let slots = cfg.experts_per_layer(); // routed + shared per MoE launch
         ensure!(
             kvl.is_multiple_of(E4M3_BLOCK),
             "kv_lora_rank ({kvl}) must be a multiple of {E4M3_BLOCK} (fp8 KV block size)",
@@ -893,7 +888,10 @@ impl<'a> GpuEngine<'a> {
                             }
                         })
                     })
-                    .buffer_unordered(MOE_STREAM_WIDTH)
+                    // Width = the whole batch (ndesc = experts_per_layer), so every
+                    // expert's load is in flight at once — the misses fetch while the
+                    // resident/loaded experts compute.
+                    .buffer_unordered(ndesc)
                     .try_collect::<Vec<()>>()
                     .await?;
                 // SAFETY: partial holds ndesc·hidden f32; out is hidden f32; cs live.

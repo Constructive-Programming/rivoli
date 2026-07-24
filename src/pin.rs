@@ -466,7 +466,7 @@ impl<'a> Pin<'a> {
         // request (--max-mem), so let the device allocation itself OOM/fail.
         // One-time bound for `submit_layer`'s fixed 32-slot scratch.
         ensure!(
-            cfg.top_k + cfg.n_shared <= 32,
+            cfg.experts_per_layer() <= 32,
             "top_k {} + n_shared {} exceeds the 32-slot batch scratch",
             cfg.top_k,
             cfg.n_shared
