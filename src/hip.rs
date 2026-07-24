@@ -5,6 +5,7 @@
 #![cfg(feature = "rocm")]
 
 use anyhow::{Result, bail};
+use std::ffi::c_void;
 
 /// VQ-int3 expert descriptor (mirrors `struct ExpertDescVq` in moe.hip): per
 /// projection the packed 12-bit indices + bf16 group scales. The 3 per-projection
@@ -37,6 +38,31 @@ unsafe extern "C" {
         h: *mut f32,
         partial: *mut f32,
         out: *mut f32,
+    ) -> i32;
+
+    #[allow(clippy::too_many_arguments)]
+    fn rivoli_moe_expert_range(
+        x: *const f32,
+        hidden: i32,
+        inter: i32,
+        e_start: i32,
+        e_count: i32,
+        descs: *const ExpertDescVq,
+        gate_cb: *const f32,
+        up_cb: *const f32,
+        down_cb: *const f32,
+        wexpert: *const f32,
+        h: *mut f32,
+        partial: *mut f32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    fn rivoli_moe_reduce_s(
+        partial: *const f32,
+        e: i32,
+        hidden: i32,
+        out: *mut f32,
+        stream: *mut c_void,
     ) -> i32;
 
     fn rivoli_gemv_fp8(
@@ -249,6 +275,66 @@ pub unsafe fn launch_moe_vq(
         )
     };
     check(r, "moe_vq")
+}
+
+/// Streaming MoE: gate/up + down for the absolute expert range `[e_start,
+/// e_start+e_count)` on `stream`, writing each expert's own `h`/`partial` rows.
+/// Reduce with [`launch_moe_reduce`] once every range's partials have landed.
+///
+/// # Safety
+/// Same pointer contract as [`launch_moe_vq`]; every device pointer must outlive
+/// `stream`'s completion (await its [`StreamSignal`](crate::gpustream::StreamSignal)).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_moe_expert_range(
+    x: *const f32,
+    hidden: usize,
+    inter: usize,
+    e_start: usize,
+    e_count: usize,
+    descs: *const ExpertDescVq,
+    gate_cb: *const f32,
+    up_cb: *const f32,
+    down_cb: *const f32,
+    wexpert: *const f32,
+    h: *mut f32,
+    partial: *mut f32,
+    stream: *mut c_void,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
+    let r = unsafe {
+        rivoli_moe_expert_range(
+            x,
+            hidden as i32,
+            inter as i32,
+            e_start as i32,
+            e_count as i32,
+            descs,
+            gate_cb,
+            up_cb,
+            down_cb,
+            wexpert,
+            h,
+            partial,
+            stream,
+        )
+    };
+    check(r, "moe_expert_range")
+}
+
+/// Fixed-order reduce `out[o] = Σ_e partial[e][o]` over all `e` experts, on `stream`.
+///
+/// # Safety
+/// `partial` holds `e·hidden` f32 (all ranges landed); `out` holds `hidden` f32.
+pub unsafe fn launch_moe_reduce(
+    partial: *const f32,
+    e: usize,
+    hidden: usize,
+    out: *mut f32,
+    stream: *mut c_void,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
+    let r = unsafe { rivoli_moe_reduce_s(partial, e as i32, hidden as i32, out, stream) };
+    check(r, "moe_reduce")
 }
 
 /// fp8-e4m3 block-scaled GEMV `y = W·x` (attention/dense projections).

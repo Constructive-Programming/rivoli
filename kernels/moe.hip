@@ -35,38 +35,41 @@ __device__ __forceinline__ size_t vq_ng(int i_dim) {
 }
 
 // Pass 1: h[e·inter + j] = silu(gate_ej·x) · (up_ej·x). One WAVE per (expert,row).
+// Processes the ABSOLUTE expert range [e_start, e_start+e_count) of `descs`, writing
+// its own `h` rows — so the streaming pipeline can launch experts (or a subrange) on
+// independent streams and they all land in the same schedule-independent `h`.
 extern "C" __global__ void moe_gateup_vq(
-    const float* __restrict__ x, int hidden, int inter, int E,
+    const float* __restrict__ x, int hidden, int inter, int e_start, int e_count,
     const ExpertDescVq* __restrict__ descs, const float* __restrict__ gate_cb,
     const float* __restrict__ up_cb, float* __restrict__ h_out) {
     int lane = threadIdx.x & (WAVE - 1);
     size_t r = (size_t)blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / WAVE;
-    if (r >= (size_t)E * inter) return;
-    int e = (int)(r / inter);
+    if (r >= (size_t)e_count * inter) return;
+    int e = e_start + (int)(r / inter);
     int j = (int)(r % inter);
     const ExpertDescVq d = descs[e];
     size_t rb = vq_rb(hidden), ng = vq_ng(hidden);
     float g = dot_vq_wave(x, d.gate_indices + (size_t)j * rb, d.gate_scales + (size_t)j * ng, gate_cb, hidden, lane);
     float u = dot_vq_wave(x, d.up_indices + (size_t)j * rb, d.up_scales + (size_t)j * ng, up_cb, hidden, lane);
-    if (lane == 0) h_out[r] = siluf(g) * u;
+    if (lane == 0) h_out[(size_t)e * inter + j] = siluf(g) * u;
 }
 
 // Pass 2: partial[e·hidden + o] = w[e] · (down_eo · h[e]). Each expert writes its
-// own partial row (no atomics → schedule-independent).
+// own partial row (no atomics → schedule-independent). Same absolute-range form.
 extern "C" __global__ void moe_down_vq(
-    int hidden, int inter, int E, const ExpertDescVq* __restrict__ descs,
+    int hidden, int inter, int e_start, int e_count, const ExpertDescVq* __restrict__ descs,
     const float* __restrict__ down_cb, const float* __restrict__ wexpert,
     const float* __restrict__ h_in, float* __restrict__ partial) {
     int lane = threadIdx.x & (WAVE - 1);
     size_t r = (size_t)blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / WAVE;
-    if (r >= (size_t)E * hidden) return;
-    int e = (int)(r / hidden);
+    if (r >= (size_t)e_count * hidden) return;
+    int e = e_start + (int)(r / hidden);
     int o = (int)(r % hidden);
     const ExpertDescVq d = descs[e];
     size_t rb = vq_rb(inter), ng = vq_ng(inter);
     const float* he = h_in + (size_t)e * inter;
     float dv = dot_vq_wave(he, d.down_indices + (size_t)o * rb, d.down_scales + (size_t)o * ng, down_cb, inter, lane);
-    if (lane == 0) partial[r] = wexpert[e] * dv;
+    if (lane == 0) partial[(size_t)e * hidden + o] = wexpert[e] * dv;
 }
 
 // out[o] = Σ_e partial[e][o], e ASCENDING — fixed order → deterministic decode.
@@ -91,15 +94,48 @@ extern "C" int rivoli_moe_experts_vq(
     hipGetLastError();
     size_t rows_a = (size_t)E * inter;
     hipLaunchKernelGGL(moe_gateup_vq, dim3((rows_a + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
-                       dim3(256), 0, 0, x, hidden, inter, E, d, gate_cb, up_cb, h);
+                       dim3(256), 0, 0, x, hidden, inter, 0, E, d, gate_cb, up_cb, h);
     hipError_t e = hipGetLastError();
     if (e != hipSuccess) return -(int)e;
     size_t rows_b = (size_t)E * hidden;
     hipLaunchKernelGGL(moe_down_vq, dim3((rows_b + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
-                       dim3(256), 0, 0, hidden, inter, E, d, down_cb, wexpert, h, partial);
+                       dim3(256), 0, 0, hidden, inter, 0, E, d, down_cb, wexpert, h, partial);
     e = hipGetLastError();
     if (e != hipSuccess) return -(int)e;
     hipLaunchKernelGGL(moe_reduce, dim3((hidden + 255) / 256), dim3(256), 0, 0, partial, E, hidden, out);
     e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+// --- Streaming-pipeline launchers: gate/up + down for an ABSOLUTE expert range on
+//     a caller-owned stream (so load DMA and this compute overlap on the GPU), and
+//     a stream-scoped reduce. The pipeline runs one range per expert (or a batched
+//     resident range), each on its stream, then reduces once all `partial` rows land.
+extern "C" int rivoli_moe_expert_range(
+    const float* x, int hidden, int inter, int e_start, int e_count, const void* descs,
+    const float* gate_cb, const float* up_cb, const float* down_cb, const float* wexpert,
+    float* h, float* partial, void* stream) {
+    if (hidden <= 0 || inter <= 0 || e_count <= 0 || e_start < 0) return 1001;
+    const ExpertDescVq* d = (const ExpertDescVq*)descs;
+    hipStream_t s = (hipStream_t)stream;
+    hipGetLastError();
+    size_t rows_a = (size_t)e_count * inter;
+    hipLaunchKernelGGL(moe_gateup_vq, dim3((rows_a + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
+                       dim3(256), 0, s, x, hidden, inter, e_start, e_count, d, gate_cb, up_cb, h);
+    hipError_t e = hipGetLastError();
+    if (e != hipSuccess) return -(int)e;
+    size_t rows_b = (size_t)e_count * hidden;
+    hipLaunchKernelGGL(moe_down_vq, dim3((rows_b + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
+                       dim3(256), 0, s, hidden, inter, e_start, e_count, d, down_cb, wexpert, h, partial);
+    e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+extern "C" int rivoli_moe_reduce_s(const float* partial, int E, int hidden, float* out, void* stream) {
+    if (hidden <= 0 || E <= 0) return 1001;
+    hipGetLastError();
+    hipLaunchKernelGGL(moe_reduce, dim3((hidden + 255) / 256), dim3(256), 0, (hipStream_t)stream,
+                       partial, E, hidden, out);
+    hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
