@@ -18,7 +18,7 @@ use crate::stream::Streamer;
 use anyhow::{Result, anyhow};
 use std::os::fd::RawFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 
@@ -51,6 +51,11 @@ pub struct AsyncFetch {
     /// the true fetch cost the overlap hides. The profile reads it against the MoE
     /// wall to report how much fetch was buried behind compute.
     fetch_ns: Arc<AtomicU64>,
+    /// Set once by the reaper on any fetch error: the ring is left dirty by a
+    /// mid-batch bail, so it's abandoned rather than reused (reusing it would index
+    /// stale `user_data` → C-side OOB / signal-index panic). `submit` then fails
+    /// fast so the decode returns a clean `Err` instead of streaming garbage.
+    poisoned: Arc<AtomicBool>,
 }
 
 impl AsyncFetch {
@@ -60,14 +65,17 @@ impl AsyncFetch {
         let fetch = HipStream::new()?;
         let (tx, rx) = channel::<ReapJob>();
         let fetch_ns = Arc::new(AtomicU64::new(0));
+        let poisoned = Arc::new(AtomicBool::new(false));
         let fn_reaper = fetch_ns.clone();
+        let poison_reaper = poisoned.clone();
         let reaper = std::thread::Builder::new()
             .name("rivoli-reaper".into())
-            .spawn(move || reaper_loop(streamer, fetch, rx, fn_reaper))?;
+            .spawn(move || reaper_loop(streamer, fetch, rx, fn_reaper, poison_reaper))?;
         Ok(Self {
             tx: Some(tx),
             reaper: Some(reaper),
             fetch_ns,
+            poisoned,
         })
     }
 
@@ -81,6 +89,9 @@ impl AsyncFetch {
     /// signal resolves when its bounce copy has landed on the fetch stream. Empty
     /// `reads` returns an empty vec (an all-hit layer).
     pub fn submit(&self, reads: Vec<ReadSpec>) -> Result<Vec<Signal>> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(anyhow!("AsyncFetch poisoned by an earlier reaper error"));
+        }
         let signals: Vec<Signal> = reads.iter().map(|_| Signal::pending()).collect();
         if reads.is_empty() {
             return Ok(signals);
@@ -115,15 +126,28 @@ fn reaper_loop(
     fetch: HipStream,
     rx: Receiver<ReapJob>,
     fetch_ns: Arc<AtomicU64>,
+    poisoned: Arc<AtomicBool>,
 ) {
     for job in rx {
+        // Once poisoned, the ring is dirty (a prior job bailed mid-batch, leaving
+        // undrained CQEs and stale queued/min_res). Touching it again would index a
+        // stale user_data → C-side OOB or a signals[u] panic that kills this thread
+        // and hangs every later awaiter. So don't: just resolve so nothing hangs (the
+        // slots hold stale bytes, which the forward's finiteness guard trips).
+        if poisoned.load(Ordering::Acquire) {
+            for s in &job.signals {
+                s.resolve();
+            }
+            continue;
+        }
         let t = std::time::Instant::now();
         let r = run_job(&mut streamer, &fetch, &job);
         fetch_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if let Err(e) = r {
-            // Fatal fetch error: log and resolve every signal so no awaiter hangs —
-            // the slots hold stale bytes, which the forward's finiteness guard trips.
+            // Fatal fetch error: poison (abandon the dirty ring for all later jobs),
+            // log, and resolve this job's signals so no awaiter hangs.
             tracing::error!("reaper: {e:#}");
+            poisoned.store(true, Ordering::Release);
             for s in &job.signals {
                 s.resolve();
             }
