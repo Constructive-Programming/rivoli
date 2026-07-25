@@ -27,6 +27,8 @@ struct Args {
     max_mem: Option<u64>,
     /// Route MoE experts through the int4 (`.i4`) path instead of int3-VQ (`--i4`).
     i4: bool,
+    /// Hybrid: percent of routed-pool bytes for the int4 hot slab (`--hot-pct`).
+    hot_pct: Option<u32>,
     /// Attention mode (`--attn auto|dense|streaming|dsa|misa`). `auto` picks `dsa`
     /// when the artifact carries indexer weights, else `dense`.
     attn: String,
@@ -55,6 +57,7 @@ fn parse_args() -> Result<Args> {
         two_q_kout: rivoli::cache::TwoQSplit::default().kout_pct(),
         max_mem: None,
         i4: false,
+        hot_pct: None,
         attn: "auto".to_string(),
         sinks: 4,
         window: 8192,
@@ -71,6 +74,14 @@ fn parse_args() -> Result<Args> {
             }
             "--direct-vmm-dma" => a.direct_vmm_dma = true,
             "--i4" => a.i4 = true,
+            "--hot-pct" => {
+                a.hot_pct = Some(
+                    args.next()
+                        .context("--hot-pct requires a percentage")?
+                        .parse()
+                        .context("--hot-pct takes an integer percentage")?,
+                );
+            }
             "--trace" => a.trace = Some(args.next().context("--trace requires a path")?),
             "--prompt" => a.prompt = Some(args.next().context("--prompt requires text")?),
             "--cache-policy" => {
@@ -194,6 +205,12 @@ fn main() -> Result<()> {
         cfg.checksum_x = checksum_x;
     }
     cfg.i4 = a.i4;
+    cfg.hot_pct = a.hot_pct;
+    // A hot-pct implies the hybrid → both formats stream, so route through int4-aware
+    // placement. (Without --hot-pct, --i4 alone = whole-run int4.)
+    if a.hot_pct.is_some() {
+        cfg.i4 = true;
+    }
 
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;

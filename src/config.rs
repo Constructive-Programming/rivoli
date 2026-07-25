@@ -53,6 +53,11 @@ pub struct Config {
     /// the VQ `.vq3` (gather-bound). Requires `L{l}.i4` present in the artifact. Set
     /// by `main`, like the checksum diagnostics.
     pub i4: bool,
+    /// HYBRID (`--hot-pct <n>`, implies both formats): percent of the routed-pool
+    /// BYTES given to the int4 "hot" slab (the 2Q Am / frequent tier); the rest is the
+    /// int3-VQ "cold" slab (A1in / probation). `None` ⇒ `100 - 2q-kin` (cold gets the
+    /// probation share). Only 2Q partitions by format; other policies stay single.
+    pub hot_pct: Option<u32>,
     /// Device budget override, bytes (`--max-mem <GiB>`). None (default) auto-sizes to
     /// `free − OS_RESERVE`. `Some(n)` uses exactly `n` — no OS reserve; the user asked
     /// for it, so it's allowed to OOM/fail at build.
@@ -117,6 +122,7 @@ impl Config {
             checksum_layer: None,
             checksum_x: false,
             i4: false,
+            hot_pct: None,
             max_mem,
             attn,
         })

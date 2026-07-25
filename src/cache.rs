@@ -292,6 +292,12 @@ pub struct TwoQ {
     cap: usize,
     kin: usize,
     kout: usize,
+    /// `None` = paper-dynamic (A1in ≤ kin, Am absorbs the rest, reclaim on total ≥
+    /// cap). `Some(n_hot)` = FIXED PARTITION (the format hybrid): A1in hard-capped at
+    /// `kin`, Am hard-capped at `n_hot`, each mapped to its own slab. Trades adaptivity
+    /// for two right-sized slabs; an insert into a segment only evicts from THAT
+    /// segment, so evicted_tier == insert_tier.
+    am_cap: Option<usize>,
     a1in: OrderedSet,
     a1out: OrderedSet,
     am: OrderedSet,
@@ -302,10 +308,37 @@ impl TwoQ {
             cap,
             kin: split.kin(cap),
             kout: split.kout(cap),
+            am_cap: None,
             a1in: OrderedSet::default(),
             a1out: OrderedSet::default(),
             am: OrderedSet::default(),
         }
+    }
+
+    /// Fixed-partition 2Q for the format hybrid: A1in (cold/vq3 slab) capped at
+    /// `a1in_cap`, Am (hot/int4 slab) capped at `am_cap`, ghost = `kout`.
+    pub fn fixed(a1in_cap: usize, am_cap: usize, kout: usize) -> Self {
+        Self {
+            cap: a1in_cap + am_cap,
+            kin: a1in_cap.max(1),
+            kout: kout.max(1),
+            am_cap: Some(am_cap.max(1)),
+            a1in: OrderedSet::default(),
+            a1out: OrderedSet::default(),
+            am: OrderedSet::default(),
+        }
+    }
+
+    /// Evict A1in's LRU into the ghost (trimmed to `kout`) — frees one cold slot.
+    fn evict_a1in(&mut self) -> Option<u32> {
+        let v = self.a1in.pop_lru();
+        if let Some(v) = v {
+            self.a1out.touch(v);
+            while self.a1out.len() > self.kout {
+                self.a1out.pop_lru();
+            }
+        }
+        v
     }
     /// Free one RESIDENT page for a new admission (paper's "reclaimfor"): trim an
     /// oversized A1in into the ghost, else evict Am's LRU. Returns the resident key
@@ -315,14 +348,7 @@ impl TwoQ {
             return None;
         }
         if self.a1in.len() > self.kin {
-            let v = self.a1in.pop_lru();
-            if let Some(v) = v {
-                self.a1out.touch(v);
-                while self.a1out.len() > self.kout {
-                    self.a1out.pop_lru();
-                }
-            }
-            v
+            self.evict_a1in()
         } else {
             self.am.pop_lru()
         }
@@ -340,15 +366,31 @@ impl Cache for TwoQ {
         self.a1in.contains(k) // hit but stays put (FIFO); ghosts are not resident
     }
     fn insert(&mut self, k: u32) -> (Option<u32>, Tier) {
-        let ev = self.reclaim();
-        let tier = if self.a1out.remove(k) {
-            self.am.touch(k); // second distinct access → promote to protected (Am)
-            Tier::Hot
+        // Promotion (a second distinct access via the ghost) → Am/Hot; else → A1in/Cold.
+        let promote = self.a1out.remove(k);
+        if let Some(am_cap) = self.am_cap {
+            // FIXED PARTITION: evict from the SAME segment the key enters, so the freed
+            // slot is in the destination slab (evicted_tier == insert_tier).
+            if promote {
+                let ev = (self.am.len() >= am_cap).then(|| self.am.pop_lru()).flatten();
+                self.am.touch(k);
+                (ev, Tier::Hot)
+            } else {
+                let ev = (self.a1in.len() >= self.kin).then(|| self.evict_a1in()).flatten();
+                self.a1in.touch(k);
+                (ev, Tier::Cold)
+            }
         } else {
-            self.a1in.touch(k); // first sighting → probation FIFO (A1in)
-            Tier::Cold
-        };
-        (ev, tier)
+            // DYNAMIC (paper): reclaim on total, Am absorbs the slack.
+            let ev = self.reclaim();
+            if promote {
+                self.am.touch(k);
+                (ev, Tier::Hot)
+            } else {
+                self.a1in.touch(k);
+                (ev, Tier::Cold)
+            }
+        }
     }
     /// A1in is a FIFO and `get` deliberately leaves hits in place, so the pin's
     /// hits-before-misses ordering does not protect them on its own. Moving an
@@ -363,9 +405,14 @@ impl Cache for TwoQ {
     fn insert_cold(&mut self, k: u32) -> (Option<u32>, Tier) {
         // Prefetch: force into A1in probation, NEVER promoting via the A1out ghost —
         // a speculative (maybe-wrong) prediction must not enter the protected Am set.
-        // A batch coexists: reclaim evicts the oldest A1in/Am, never a fresh sibling.
-        let ev = self.reclaim();
+        // A batch coexists: reclaim evicts the oldest A1in (or Am, dynamic), never a
+        // fresh sibling.
         self.a1out.remove(k); // drop any stale ghost; do NOT promote
+        let ev = if self.am_cap.is_some() {
+            (self.a1in.len() >= self.kin).then(|| self.evict_a1in()).flatten()
+        } else {
+            self.reclaim()
+        };
         self.a1in.touch(k);
         (ev, Tier::Cold)
     }
@@ -774,6 +821,41 @@ mod tests {
         assert_eq!(TwoQSplit::new(100, 50), Err(SplitError::KinRange(100)));
         assert_eq!(TwoQSplit::new(25, 0), Err(SplitError::KoutRange(0)));
         assert_eq!(TwoQSplit::new(25, 1001), Err(SplitError::KoutRange(1001)));
+    }
+
+    // The format hybrid's load-bearing invariant: in fixed-partition 2Q an insert
+    // only ever evicts from the SAME tier it enters (so the pool frees + allocates in
+    // one slab), and each segment stays within its cap.
+    #[test]
+    fn fixed_partition_evicts_same_tier() {
+        use std::collections::HashMap;
+        let (n_cold, n_hot) = (4usize, 8usize);
+        // Ghost bigger than the working set so a key survives in A1out between passes
+        // (evicted from A1in → ghost → re-accessed → promoted to Am).
+        let mut c = TwoQ::fixed(n_cold, n_hot, 64);
+        let mut tier_of: HashMap<u32, Tier> = HashMap::new();
+        for _pass in 0..6 {
+            for k in 0..14u32 {
+                if c.get(k) {
+                    continue;
+                }
+                let (ev, tier) = c.insert(k);
+                if let Some(ev) = ev {
+                    assert_eq!(
+                        tier_of.remove(&ev),
+                        Some(tier),
+                        "evicted {ev} was not in the {tier:?} tier that {k} entered"
+                    );
+                }
+                tier_of.insert(k, tier);
+                let hot = tier_of.values().filter(|&&t| t == Tier::Hot).count();
+                let cold = tier_of.values().filter(|&&t| t == Tier::Cold).count();
+                assert!(hot <= n_hot && cold <= n_cold, "over cap: hot {hot} cold {cold}");
+                assert_eq!(hot + cold, c.resident_len(), "tier tally != resident_len");
+            }
+        }
+        // Promotions must have actually happened (else the test proves nothing).
+        assert!(tier_of.values().any(|&t| t == Tier::Hot), "no key ever promoted to Hot");
     }
 
     /// `replay` must model the prefetch admission path the live engine depends on:
