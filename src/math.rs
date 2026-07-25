@@ -16,22 +16,24 @@ pub fn sigmoid(x: f32) -> f32 {
 
 /// Truncate f32 → bf16 (round to nearest even). The KV cache stores latents in
 /// bf16 — a free 2× on KV bandwidth with no accuracy story (decided 2026-07-18).
+///
+/// Delegates to the `half` crate (round-to-nearest-even). Bit-identical to the
+/// former hand-rolled RNE for every finite value, zero, subnormal, and infinity;
+/// the two differ only on NaN payload bits (never present in the KV/latent/scale
+/// data path), where `half` keeps a NaN as a NaN rather than truncating a
+/// signaling NaN into an Inf. The kernel's f2bf16 (common.hpp) still matches on
+/// this finite domain — the oracle tests never feed NaN.
 #[inline]
 pub fn f32_to_bf16(x: f32) -> u16 {
-    let bits = x.to_bits();
-    // Non-finite: keep the top 16 bits verbatim (the RNE carry could turn a NaN
-    // into an Inf), so Inf/NaN survive the round-trip as themselves.
-    if !x.is_finite() {
-        return (bits >> 16) as u16;
-    }
-    let round = ((bits >> 16) & 1) + 0x7fff;
-    ((bits + round) >> 16) as u16
+    half::bf16::from_f32(x).to_bits()
 }
 
-/// Widen bf16 → f32 (exact — bf16 is the high 16 bits of f32).
+/// Widen bf16 → f32 (exact — bf16 is the high 16 bits of f32). Delegates to
+/// `half`; bit-identical to the former `(b as u32) << 16` for every non-NaN
+/// pattern.
 #[inline]
 pub fn bf16_to_f32(b: u16) -> f32 {
-    f32::from_bits((b as u32) << 16)
+    half::bf16::from_bits(b).to_f32()
 }
 
 /// Narrow f32 → IEEE-754 binary16 (fp16) bits, round to nearest even. Overflow
@@ -297,6 +299,26 @@ mod tests {
             "online={online} two_pass={two_pass} diff={}",
             (online - two_pass).abs()
         );
+    }
+
+    #[test]
+    fn bf16_known_patterns_and_rne() {
+        // Exact high-16-bit truncation for representable values.
+        assert_eq!(f32_to_bf16(0.0), 0x0000);
+        assert_eq!(f32_to_bf16(1.0), 0x3f80);
+        assert_eq!(f32_to_bf16(-2.0), 0xc000);
+        assert_eq!(bf16_to_f32(0x3f80), 1.0);
+        assert_eq!(bf16_to_f32(0xc000), -2.0);
+        // Round-to-nearest-even at the tie: 1.0 + 2^-8 sits exactly between two
+        // bf16 values; the even neighbour is 1.0 (mantissa LSB 0), so it rounds
+        // DOWN to 0x3f80 rather than up to 0x3f81.
+        assert_eq!(f32_to_bf16(1.0 + 2f32.powi(-8)), 0x3f80);
+        // Just past the tie rounds up to the odd neighbour.
+        assert_eq!(f32_to_bf16(1.0 + 2f32.powi(-8) + 2f32.powi(-16)), 0x3f81);
+        // Non-finite: Inf survives; NaN stays a NaN.
+        assert_eq!(f32_to_bf16(f32::INFINITY), 0x7f80);
+        assert_eq!(bf16_to_f32(0x7f80), f32::INFINITY);
+        assert!(bf16_to_f32(f32_to_bf16(f32::NAN)).is_nan());
     }
 
     #[test]
