@@ -1,6 +1,6 @@
-//! Minimal HIP surface: under `rocm` this binds the hipcc-built kernel launchers.
-//! Without the feature the whole module compiles away. int4-free; grows as kernels
-//! land (linalg now; moe/mla/attn/fwd next).
+//! Minimal HIP surface: under `rocm` this binds the hipcc-built kernel launchers
+//! (fp8/int8/f32 linalg, VQ-int3 and int4 MoE, MLA, fwd glue). Without the feature
+//! the whole module compiles away.
 
 #![cfg(feature = "rocm")]
 

@@ -5,13 +5,14 @@
 //! Always resident (read every token): the per-layer norms, the full attention
 //! stack (q_a/q_b/kv_a/kv_b/o_proj + their layernorms, all fp8-e4m3 block-scaled),
 //! the dense-layer MLPs (fp8), and — for MoE layers — the router gate (f32) and the
-//! VQ-int3 shared expert. The int8 embed/lm_head + f32 final norm are global. The
-//! footprint is computed from `cfg` at build ([`resident_bytes`]) so the tier is
-//! sized to what it holds and the rest of the device budget grows the routed pool.
+//! routed-format shared expert (VQ-int3, or int4 under `--i4`). The int8 embed and
+//! lm_head plus the f32 final norm are global. The footprint is computed from `cfg`
+//! at build ([`resident_bytes`]) so the tier is sized to what it holds and the rest
+//! of the device budget grows the routed pool.
 //!
 //! The 256 routed experts/layer are served by an adaptive pool ([`cache`] policy +
 //! one VMM slab): a hit reuses the resident slot; a miss evicts the coldest and
-//! streams the expert in via io_uring O_DIRECT (`.vq3` block = one aligned read).
+//! streams the expert in via io_uring O_DIRECT (`.vq3`/`.i4` block = one aligned read).
 //!
 //! `rocm`-only: without a device there is nothing to pin.
 #![cfg(feature = "rocm")]
@@ -26,6 +27,9 @@ use crate::quant::{
     VQ_DIM, VQ_K, i4_expert_bytes, i4_slot_offsets, vq_expert_bytes, vq_expert_layout,
     vq_proj_bytes, vq_row_bytes,
 };
+use crate::stream::{Streamer, slot_span};
+use anyhow::{Context, Result, bail, ensure};
+use std::os::fd::RawFd;
 
 /// The routed-expert streaming source: `.vq3` (int3-VQ) or `.i4` (colibri int4).
 /// Owns the O_DIRECT fds that back `moe_table`, and answers the format-independent
@@ -56,9 +60,6 @@ impl MoeSrc {
         }
     }
 }
-use crate::stream::{Streamer, slot_span};
-use anyhow::{Context, Result, bail, ensure};
-use std::os::fd::RawFd;
 
 /// A resolved fp8-e4m3 block-scaled weight matrix in the tier: device pointers +
 /// dims + the `weight_scale_inv` block size. Consumed by `launch_gemv_fp8` (attn +
@@ -90,18 +91,19 @@ pub struct Int8Weight {
     pub i_dim: usize,
 }
 
-/// A resolved VQ-int3 projection: packed 12-bit codebook indices + bf16 group
-/// scales (device pointers), decoded against the per-projection codebook. Consumed
-/// by `launch_moe_expert_range` via `desc_of_vq`.
+/// One MoE projection resolved to two device pointers into its expert slot. For VQ
+/// these are the packed 12-bit indices + bf16 group scales (decoded against a
+/// codebook); reused as the int4 carrier — then `indices` is the packed 4-bit
+/// weights and `scales` holds the f32 per-row-scale *address* (reinterpreted at the
+/// launch site, see `place_shared`). The dims are the kernel's args, not carried
+/// here. Consumed by `launch_moe_expert_range`(`_i4`) via `desc_of_vq`.
 #[derive(Clone, Copy)]
 pub struct VqWeight {
     pub indices: *const u8,
     pub scales: *const u16,
-    pub o_dim: usize,
-    pub i_dim: usize,
 }
 
-/// A SwiGLU MLP's three VQ-int3 projections, resolved (routed or shared expert).
+/// A SwiGLU MLP's three resolved projections (routed or shared expert), one format.
 #[derive(Clone, Copy)]
 pub struct MlpVq {
     pub gate: VqWeight,
@@ -109,14 +111,26 @@ pub struct MlpVq {
     pub down: VqWeight,
 }
 
+/// Resolve one projection's two pointers at slot-relative offsets `(ioff, soff)`
+/// from an expert-block base — the single builder shared by the resident shared
+/// expert ([`place_shared`]) and the streamed routed experts (`submit_layer`).
+#[inline]
+fn vqweight_at(base: *const u8, ioff: usize, soff: usize) -> VqWeight {
+    VqWeight {
+        // SAFETY: both offsets lie within the expert block at `base` (fixed layout).
+        indices: unsafe { base.add(ioff) },
+        scales: unsafe { base.add(soff) } as *const u16,
+    }
+}
+
 /// One layer's MLP: dense fp8 for the first `dense_layers`, MoE after. The MoE
-/// shared expert is VQ-int3 (from the `.vq3` block `n_experts`), folded into the
-/// single `launch_moe_expert_range` batch alongside the routed picks.
+/// shared expert is the routed format (VQ-int3, or int4 under `--i4`; from block
+/// `n_experts`), folded into the single MoE batch alongside the routed picks.
 pub enum LayerMlp {
     Dense(Fp8Mlp),
     Moe {
         gate_w: *const f32, // router gate [n_experts, hidden] (F32), device
-        shared: MlpVq,      // VQ-int3 shared expert (always resident)
+        shared: MlpVq,      // routed-format shared expert (always resident)
     },
 }
 
@@ -167,10 +181,11 @@ pub struct Pin<'a> {
     /// The three per-projection codebooks (gate/up/down), resident, passed to
     /// `launch_moe_expert_range`. Each `VQ_K·VQ_DIM` fp16 (narrowed from the f32
     /// source at load — the random idx→cb gather is the MoE hot path, and fp16
-    /// halves it into L1; see math::f32_to_f16 / dot_vq_wave).
+    /// halves it into L1; see math::f32_to_f16 / dot_vq_wave). Null in `--i4` (int4
+    /// decodes without a codebook).
     codebooks: [*const u16; 3],
     /// The routed-expert pool: ONE device-local VMM slab of `n_slots` expert slots
-    /// (slot i at `i * expert_slot`), each one O_DIRECT-aligned `.vq3` block.
+    /// (slot i at `i * expert_slot`), each one O_DIRECT-aligned `.vq3`/`.i4` block.
     #[allow(dead_code)] // RAII owner of the pool slab; addressed via `lru_pool.ptr()`
     lru_pool: VmmBuf,
     expert_slot: usize,
@@ -282,31 +297,21 @@ fn place_dense_mlp(
     })
 }
 
-/// Place a shared-expert `block` (gate‖up‖down) resident and resolve it to an
-/// `MlpVq` (a carrier of six device pointers — for int4 `scales` holds the f32
-/// per-row-scale address, reinterpreted at the launch site). `off` = the format's
-/// slot offsets (VQ or int4), so the same code places either.
-fn place_vq_shared(
+/// Place a shared-expert `block` (gate‖up‖down) resident and resolve its six
+/// pointers. `off` = the format's slot offsets (VQ or int4), so the same code
+/// places either. The shared expert is the routed format (`--i4` ⇒ int4).
+fn place_shared(
     tier: &mut DeviceTier,
     block: &[u8],
     off: &[usize; 6],
-    hidden: usize,
-    moe_inter: usize,
 ) -> Result<MlpVq> {
     let dst = tier.reserve(block.len())?;
     // SAFETY: dst owns block.len() reserved bytes.
     unsafe { std::ptr::copy_nonoverlapping(block.as_ptr(), dst, block.len()) };
-    let vw = |ioff: usize, soff: usize, o_dim: usize, i_dim: usize| VqWeight {
-        // SAFETY: offsets lie within the block just copied into the tier.
-        indices: unsafe { dst.add(ioff) },
-        scales: unsafe { dst.add(soff) } as *const u16,
-        o_dim,
-        i_dim,
-    };
     Ok(MlpVq {
-        gate: vw(off[0], off[1], moe_inter, hidden),
-        up: vw(off[2], off[3], moe_inter, hidden),
-        down: vw(off[4], off[5], hidden, moe_inter),
+        gate: vqweight_at(dst, off[0], off[1]),
+        up: vqweight_at(dst, off[2], off[3]),
+        down: vqweight_at(dst, off[4], off[5]),
     })
 }
 
@@ -346,7 +351,7 @@ fn indexer_bytes(cfg: &ModelConfig, block: usize) -> usize {
 /// the placement path: fp8 `[o,i]` = `o·i` packed + `⌈o/block⌉·⌈i/block⌉·4` scale;
 /// int8 `[o,i]` = `o·i` + `o·4`; an f32 norm of `n` = `n·4`; plus the 3 codebooks
 /// and one VQ shared expert per MoE layer.
-fn resident_bytes(cfg: &ModelConfig, block: usize) -> usize {
+fn resident_bytes(cfg: &ModelConfig, block: usize, i4: bool) -> usize {
     let fp8 = |o: usize, i: usize| o * i + o.div_ceil(block) * i.div_ceil(block) * 4;
     let i8 = |o: usize, i: usize| o * i + o * 4;
     let f32n = |n: usize| n * 4;
@@ -373,10 +378,16 @@ fn resident_bytes(cfg: &ModelConfig, block: usize) -> usize {
             total += fp8(cfg.hidden, cfg.dense_inter); // down
         } else {
             total += f32n(cfg.n_experts * cfg.hidden); // router gate (F32, device)
-            total += vq_expert_bytes(cfg.hidden, cfg.moe_inter); // VQ shared expert
+            // Shared expert, in the routed format (int4 blocks are larger than VQ).
+            total += if i4 {
+                i4_expert_bytes(cfg.hidden, cfg.moe_inter)
+            } else {
+                vq_expert_bytes(cfg.hidden, cfg.moe_inter)
+            };
         }
     }
-    total + 3 * VQ_K * VQ_DIM * 2 // 3 per-projection codebooks (fp16)
+    // 3 per-projection fp16 codebooks — VQ only; int4 uploads none.
+    total + if i4 { 0 } else { 3 * VQ_K * VQ_DIM * 2 }
 }
 
 /// Pack `(layer, expert)` into the pool key. Both must fit in 16 bits — GLM is
@@ -559,7 +570,7 @@ impl<'a> Pin<'a> {
         // Size the tier to the always-resident footprint plus slack (absorbs the
         // per-reservation 256-byte alignment padding); anything left widens the pool.
         const SLACK: usize = 256 << 20; // 256 MiB
-        let resident = resident_bytes(cfg, block) + n_full * indexer_bytes(cfg, block);
+        let resident = resident_bytes(cfg, block, i4) + n_full * indexer_bytes(cfg, block);
         let tier_cap = resident + SLACK;
         tracing::info!(
             "computed resident footprint {:.2} GiB (tier {:.2} GiB incl. slack)",
@@ -618,7 +629,7 @@ impl<'a> Pin<'a> {
                 );
                 moe_bias.push(bias);
                 let shared =
-                    place_vq_shared(&mut tier, &src.shared_block(l)?, &slot_off, cfg.hidden, cfg.moe_inter)?;
+                    place_shared(&mut tier, &src.shared_block(l)?, &slot_off)?;
                 LayerMlp::Moe { gate_w, shared }
             };
             layers.push(LayerPin {
@@ -658,7 +669,7 @@ impl<'a> Pin<'a> {
         );
         let pool = Pool::new(n_slots, cache_policy, two_q)?;
         // Ring sized for one layer's worst case: top_k demand reads (1/expert). One
-        // read per expert (VQ block), so far smaller than int4's six-read coalescing.
+        // read per expert — one aligned `.vq3`/`.i4` block, either format.
         let ring = (cfg.top_k + 4).next_power_of_two();
         ensure!(
             cfg.top_k <= ring,
@@ -826,9 +837,6 @@ impl<'a> Pin<'a> {
         out: &mut Vec<MlpVq>,
     ) -> Result<Vec<Signal>> {
         let (slots, _sparse, signals) = self.submit_spine(layer, sel)?;
-        let cfg = self.cfg;
-        let (gate_o, gate_i) = (cfg.moe_inter, cfg.hidden);
-        let (down_o, down_i) = (cfg.hidden, cfg.moe_inter);
         let slab = self.lru_pool.ptr();
         let es = self.expert_slot;
         let o = self.slot_off;
@@ -838,16 +846,10 @@ impl<'a> Pin<'a> {
             // SAFETY: slot base within the slab; address arithmetic only (the bytes
             // land when `signals[i]` resolves).
             let b = unsafe { slab.add(slot * es) };
-            let vw = |ioff: usize, soff: usize, o_dim: usize, i_dim: usize| VqWeight {
-                indices: unsafe { b.add(ioff) },
-                scales: unsafe { b.add(soff) } as *const u16,
-                o_dim,
-                i_dim,
-            };
             out.push(MlpVq {
-                gate: vw(o[0], o[1], gate_o, gate_i),
-                up: vw(o[2], o[3], gate_o, gate_i),
-                down: vw(o[4], o[5], down_o, down_i),
+                gate: vqweight_at(b, o[0], o[1]),
+                up: vqweight_at(b, o[2], o[3]),
+                down: vqweight_at(b, o[4], o[5]),
             });
         }
         Ok(signals)
@@ -855,9 +857,9 @@ impl<'a> Pin<'a> {
 }
 
 /// Resolve every routed expert's cold-read spec `(fd, begin, len)` ONCE, indexed
-/// `(layer - dense_layers) * n_experts + expert`. Each `.vq3` expert is a single
-/// O_DIRECT-aligned block, so this is just [`Vq3Set::read_spec`] tabulated (the
-/// range/dim checks run at `Vq3Set::open`).
+/// `(layer - dense_layers) * n_experts + expert`. Each `.vq3`/`.i4` expert is a
+/// single O_DIRECT-aligned block, so this is just [`MoeSrc::read_spec`] tabulated
+/// (the range/dim checks ran at open).
 fn build_moe_table(src: &MoeSrc, cfg: &ModelConfig) -> Result<Vec<(RawFd, usize, usize)>> {
     let n_moe = cfg.n_layers - cfg.dense_layers;
     let mut table = Vec::with_capacity(n_moe * cfg.n_experts);

@@ -7,6 +7,8 @@
 //! resident.safetensors   # every resident weight (fp8 attn/dense, int8 embed, f32 norms, bf16 indexer)
 //! L{03..NN}.vq3          # per MoE layer: header + (n_experts + 1) expert blocks,
 //!                        #   block = gate‖up‖down; block n_experts = the shared expert
+//! L{03..NN}.i4           # optional int4 twin of the .vq3 (bin/pack_i4): headerless,
+//!                        #   (n_experts + 1) blocks from offset 0. Streamed under --i4.
 //! ```
 
 use anyhow::{Context, Result, ensure};

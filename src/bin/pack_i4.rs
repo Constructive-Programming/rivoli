@@ -136,7 +136,9 @@ fn main() -> Result<()> {
             fill_block(&sh, &prefix, &mut blk, &off, hidden, inter)?;
             out.write_all(&blk)?;
         }
-        // Shared expert at block index `ne` (loader reads it there).
+        // Shared expert written right after the routed blocks (index `n_exp`). With
+        // the full run (n_exp == ne) that's block `ne`, where I4Set::shared_block
+        // reads it; a `--experts M` smoke pack is deliberately not loadable.
         blk.iter_mut().for_each(|b| *b = 0);
         fill_block(&sh, &format!("model.layers.{l}.mlp.shared_experts"), &mut blk, &off, hidden, inter)?;
         out.write_all(&blk)?;

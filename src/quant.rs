@@ -1,6 +1,6 @@
 //! Weight decode + the VQ-int3 quantizer. CPU oracles the HIP kernels are
-//! validated against, plus the offline `quant_vq` encode. All formats here are
-//! int4-free: VQ-int3 (experts), fp8-e4m3 block (attention/dense), int8 per-row
+//! validated against, plus the offline `quant_vq` encode. The formats: VQ-int3 and
+//! colibri int4 (routed experts), fp8-e4m3 block (attention/dense), int8 per-row
 //! (embed/lm_head), bf16 (indexer), f32 (norms/gate). Functions take raw byte
 //! slices + dims — no snapshot-struct coupling.
 
@@ -153,7 +153,7 @@ pub fn vq_expert_bytes(hidden: usize, moe_inter: usize) -> usize {
 }
 
 /// Per-expert on-disk stride: [`vq_expert_bytes`] padded up to [`VQ_ALIGN`]. The
-/// fixed stride at which experts sit in a per-layer `.i3` file.
+/// fixed stride at which experts sit in a per-layer `.vq3` file.
 pub fn vq_expert_stride(hidden: usize, moe_inter: usize) -> usize {
     vq_expert_bytes(hidden, moe_inter).div_ceil(VQ_ALIGN) * VQ_ALIGN
 }
@@ -189,7 +189,7 @@ impl VqProj<'_> {
     }
 }
 
-/// Slice expert `e`'s three [`VqProj`] out of a per-layer `.i3` buffer (`n_experts`
+/// Slice expert `e`'s three [`VqProj`] out of a per-layer `.vq3` buffer (`n_experts`
 /// blocks at [`vq_expert_stride`]). The layout the converter writes: each expert is
 /// `gate ‖ up ‖ down`, each projection indices-then-scales.
 pub fn vq_expert(layer: &[u8], e: usize, hidden: usize, moe_inter: usize) -> [VqProj<'_>; 3] {
@@ -546,7 +546,7 @@ mod tests {
 
     #[test]
     fn vq_expert_slicing_roundtrips_gemv() {
-        // Build a 1-expert `.i3` block from quant_vq of synthetic gate/up/down, slice
+        // Build a 1-expert `.vq3` block from quant_vq of synthetic gate/up/down, slice
         // it back with vq_expert, and check each projection's gemv equals matvec_vq on
         // the original arrays — the converter→loader byte contract for a whole expert.
         let (hidden, moe_inter) = (VQ_GROUP, VQ_GROUP); // tiny but valid (one group each)

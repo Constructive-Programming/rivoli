@@ -33,6 +33,17 @@ fn u32_le_bytes(v: &[u32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
+// The int4 path uploads these ExpertDescVq bytes and reinterprets them as
+// ExpertDescI4 at the launch site (see the expert stream + Pin::i4). Both are
+// repr(C) six-pointer structs — lock the shared size/align so a future field on one
+// can't silently break the reinterpret.
+const _: () = assert!(
+    std::mem::size_of::<ExpertDescVq>() == std::mem::size_of::<ExpertDescI4>()
+        && std::mem::align_of::<ExpertDescVq>() == std::mem::align_of::<ExpertDescI4>(),
+);
+
+/// Build one expert's descriptor (six device pointers) from its resolved `MlpVq`.
+/// For int4 the same bytes are reinterpreted as `ExpertDescI4` downstream.
 fn desc_of_vq(m: &MlpVq) -> ExpertDescVq {
     ExpertDescVq {
         gate_indices: m.gate.indices,
