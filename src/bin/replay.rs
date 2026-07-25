@@ -1,55 +1,47 @@
 //! Offline cache-policy A/B and 2Q Kin/Kout sweep. Replays a routed-expert access
-//! trace (captured with `rivoli --trace`) through LRU / 2Q / ARC at a chosen slot
-//! count and prints the residency split. Pure CPU, milliseconds: the whole point is
-//! to compare policies without a full GPU decode run.
-//!
-//! The engine no longer prefetches (an A/B showed it bought zero throughput on the
-//! bandwidth-bound VQ path — 78.3% vs 76.9% hit, identical tok/s), so traces carry
-//! no predictions and `preloading` is always 0; `loaded` is the residency metric.
-//! The `preloading` column and the prediction (` | `) parsing are retained only so
-//! historical prefetch-era traces still replay.
+//! trace (captured with `rivoli --trace`) through the SAME byte-aware policies the
+//! engine runs ([`rivoli::hybrid`]) at a chosen slot count — unit strides make the byte
+//! budget a plain slot count — and prints the residency (loaded %). Pure CPU,
+//! milliseconds: compare policies without a full GPU decode run.
 //!
 //! usage: replay <trace> <n_slots> [--kin <pct>] [--kout <pct>] [--sweep]
 
 use anyhow::{Context, Result, bail};
-use rivoli::cache::{Layer, Residency, TwoQSplit, replay};
+use rivoli::cache::TwoQSplit;
+use rivoli::hybrid::{self, HybridPolicy};
 use std::io::BufRead;
 
-/// One captured MoE layer, owning its keys (`Layer` borrows from these).
-struct Captured {
-    demand: Vec<u32>,
-    predicted: Vec<u32>,
-}
-
-/// Parse `k1 k2 k3 | p1 p2` (the ` | ` tail optional) into demand + predicted keys.
-fn parse_line(line: &str) -> Captured {
-    let (d, p) = line.split_once('|').unwrap_or((line, ""));
-    let keys = |s: &str| {
-        s.split_whitespace()
-            .filter_map(|t| t.parse().ok())
-            .collect()
-    };
-    Captured {
-        demand: keys(d),
-        predicted: keys(p),
-    }
-}
-
 /// The Kin/Kout grid a `--sweep` walks. Kin is a resident probation bound so it is
-/// swept fine-grained around the default; Kout is a key-only ghost (4 bytes an
-/// entry), cheap enough to sweep well past 100 % of capacity.
+/// swept fine-grained around the default; Kout is a key-only ghost (4 bytes an entry),
+/// cheap enough to sweep well past 100 % of capacity.
 const KIN_GRID: [u32; 11] = [3, 5, 8, 12, 16, 20, 25, 33, 40, 50, 66];
 const KOUT_GRID: [u32; 6] = [25, 50, 100, 200, 400, 800];
 
-fn print_row(label: &str, r: Residency) {
-    let pct = |n: u64| 100.0 * n as f64 / r.accesses().max(1) as f64;
-    println!(
-        "{label:<10} {:>8.2}% {:>11.2}% {:>8.2}% {:>8.2}%",
-        r.loaded_pct(),
-        pct(r.preloading),
-        pct(r.cold),
-        r.hit_pct(),
-    );
+/// Replay `trace` (each inner Vec = one MoE layer's demand keys) through `policy` at
+/// `cap` unit slots; return the `loaded` (resident-hit) count. Two-pass per layer —
+/// hits first (protected), then misses — mirroring the pin's `submit_layer`.
+fn loaded_count(policy: &str, cap: usize, split: TwoQSplit, trace: &[Vec<u32>]) -> Result<u64> {
+    // Unit strides: budget `cap` bytes == `cap` slots, cold==hot so the split is by
+    // slot count exactly as the single-format engine sees it.
+    let mut p: Box<dyn HybridPolicy> =
+        hybrid::make(policy, cap, 1, 1, split).with_context(|| format!("unknown policy {policy}"))?;
+    let mut loaded = 0u64;
+    let mut miss: Vec<u32> = Vec::new();
+    for layer in trace {
+        miss.clear();
+        for &k in layer {
+            if p.get(k) {
+                loaded += 1;
+                p.protect(k);
+            } else {
+                miss.push(k);
+            }
+        }
+        for &k in &miss {
+            p.admit(k);
+        }
+    }
+    Ok(loaded)
 }
 
 fn main() -> Result<()> {
@@ -75,56 +67,40 @@ fn main() -> Result<()> {
     }
     let split = TwoQSplit::new(kin, kout)?;
 
-    // Load the trace: one MoE layer per line, `demand... [| predicted...]`.
+    // Load the trace: one MoE layer per line, whitespace-separated demand keys. (A
+    // legacy `| predicted` tail from the retired prefetch era is ignored.)
     let f = std::fs::File::open(&trace_path).with_context(|| format!("open trace {trace_path}"))?;
-    let captured: Vec<Captured> = std::io::BufReader::new(f)
+    let trace: Vec<Vec<u32>> = std::io::BufReader::new(f)
         .lines()
-        .map(|l| l.map(|l| parse_line(&l)))
+        .map(|l| {
+            l.map(|l| {
+                let demand = l.split('|').next().unwrap_or("");
+                demand.split_whitespace().filter_map(|t| t.parse().ok()).collect::<Vec<u32>>()
+            })
+        })
         .collect::<std::io::Result<Vec<_>>>()
         .context("read trace")?
         .into_iter()
-        .filter(|c| !c.demand.is_empty())
-        .collect();
-    let trace: Vec<Layer<'_>> = captured
-        .iter()
-        .map(|c| Layer {
-            demand: &c.demand,
-            predicted: &c.predicted,
-        })
+        .filter(|l| !l.is_empty())
         .collect();
 
-    let accesses: usize = captured.iter().map(|c| c.demand.len()).sum();
-    let predictions: usize = captured.iter().map(|c| c.predicted.len()).sum();
-    let uniq = captured
+    let accesses: usize = trace.iter().map(|l| l.len()).sum();
+    let uniq = trace
         .iter()
-        .flat_map(|c| c.demand.iter().copied())
+        .flatten()
+        .copied()
         .collect::<std::collections::HashSet<u32>>()
         .len();
     println!(
         "trace {trace_path}: {} layers, {accesses} accesses, {uniq} unique experts, cap={cap}",
         trace.len()
     );
-    if predictions > 0 {
-        // A historical prefetch-era trace: model the admission it recorded.
-        println!(
-            "prefetch: {predictions} predictions recorded ({:.2}/layer) — insert_cold modelled",
-            predictions as f64 / trace.len().max(1) as f64
-        );
-    }
-    // A prediction-less trace (the engine no longer prefetches) just means preloading
-    // is 0 and `loaded` is the residency figure — no warning; that is now the norm.
-
-    // No seed: the new artifact carries no `.coli_usage` frequency profile, so every
-    // policy starts cold (online priming is what the trace measures anyway).
-    let run = |pol: &str, split: TwoQSplit| -> Result<Residency> {
-        replay(pol, cap, split, &[], &trace).with_context(|| format!("unknown policy {pol}"))
-    };
+    let pct = |n: u64| 100.0 * n as f64 / accesses.max(1) as f64;
 
     if sweep {
         println!(
-            "\n2Q Kin/Kout sweep at cap={cap} — cells are `loaded %`, the only I/O-free\n\
-             metric. Kin bounds the A1in probation queue, Kout the A1out ghost; both\n\
-             are percentages of capacity.\n"
+            "\n2Q Kin/Kout sweep at cap={cap} — cells are `loaded %`. Kin bounds the A1in\n\
+             probation queue, Kout the A1out ghost; both are percentages of capacity.\n"
         );
         print!("{:<9}", "kin\\kout");
         for ko in KOUT_GRID {
@@ -136,7 +112,7 @@ fn main() -> Result<()> {
             print!("{:<9}", format!("{ki}%"));
             for ko in KOUT_GRID {
                 let s = TwoQSplit::new(ki, ko)?;
-                let loaded = run("2q", s)?.loaded_pct();
+                let loaded = pct(loaded_count("2q", cap, s, &trace)?);
                 if loaded > best.1 {
                     best = (s, loaded);
                 }
@@ -144,7 +120,7 @@ fn main() -> Result<()> {
             }
             println!();
         }
-        let base = run("2q", default)?.loaded_pct();
+        let base = pct(loaded_count("2q", cap, default, &trace)?);
         println!(
             "\ndefault (kin {}% / kout {}%): {base:.2}% loaded\n\
              best    (kin {}% / kout {}%): {:.2}% loaded  ({:+.2} pp)",
@@ -158,12 +134,9 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    println!(
-        "\n{:<10} {:>8} {:>11} {:>8} {:>8}",
-        "policy", "loaded", "preloading", "cold", "hit"
-    );
+    println!("\n{:<10} {:>8}", "policy", "loaded");
     for pol in ["lru", "2q", "arc"] {
-        print_row(pol, run(pol, split)?);
+        println!("{pol:<10} {:>7.2}%", pct(loaded_count(pol, cap, split, &trace)?));
     }
     if split != default {
         println!("\n(2q ran with kin {kin}% / kout {kout}%)");
