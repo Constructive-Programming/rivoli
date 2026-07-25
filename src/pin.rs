@@ -295,16 +295,32 @@ fn place_indexer(
     })
 }
 
+/// Device bytes an fp8-e4m3 block-scaled `[o,i]` weight occupies: `o·i` packed +
+/// `⌈o/block⌉·⌈i/block⌉·4` for the F32 block-scale. Single source for the sizing
+/// formulas below (`place_fp8` reserves the shard's own byte length, which this
+/// mirrors) — write the layout once so it can't drift between the two sizers.
+fn fp8_bytes(o: usize, i: usize, block: usize) -> usize {
+    o * i + o.div_ceil(block) * i.div_ceil(block) * 4
+}
+/// Device bytes an int8 per-row `[o,i]` weight occupies: `o·i` packed + `o·4` F32 scale.
+fn i8_bytes(o: usize, i: usize) -> usize {
+    o * i + o * 4
+}
+/// Device bytes an f32 vector of `n` elements occupies.
+fn f32_bytes(n: usize) -> usize {
+    n * 4
+}
+
 /// Device bytes ONE full layer's DSA indexer weights occupy, mirroring
 /// [`place_indexer`]: fp8 `wk`/`wq_b`, f32 `weights_proj` + f32 `k_norm`.
 fn indexer_bytes(cfg: &ModelConfig, block: usize) -> usize {
-    let fp8 = |o: usize, i: usize| o * i + o.div_ceil(block) * i.div_ceil(block) * 4;
+    let fp8 = |o: usize, i: usize| fp8_bytes(o, i, block);
     let hd = cfg.index_head_dim;
     let nh = cfg.index_n_heads;
-    fp8(hd, cfg.hidden)                 // wk (fp8)
-        + fp8(nh * hd, cfg.q_lora_rank) // wq_b (fp8)
-        + nh * cfg.hidden * 4           // weights_proj (bf16→f32)
-        + 2 * hd * 4 // k_norm weight + bias (f32)
+    fp8(hd, cfg.hidden)                  // wk (fp8)
+        + fp8(nh * hd, cfg.q_lora_rank)  // wq_b (fp8)
+        + f32_bytes(nh * cfg.hidden)     // weights_proj (bf16→f32)
+        + 2 * f32_bytes(hd) // k_norm weight + bias (f32)
 }
 
 /// Device bytes the always-resident set occupies — everything read every token
@@ -316,9 +332,9 @@ fn indexer_bytes(cfg: &ModelConfig, block: usize) -> usize {
 /// `shared_i4`: the always-resident shared expert is int4 (else int3-VQ).
 /// `cb_resident`: the 3 fp16 VQ codebooks are resident (any VQ slab present).
 fn resident_bytes(cfg: &ModelConfig, block: usize, shared_i4: bool, cb_resident: bool) -> usize {
-    let fp8 = |o: usize, i: usize| o * i + o.div_ceil(block) * i.div_ceil(block) * 4;
-    let i8 = |o: usize, i: usize| o * i + o * 4;
-    let f32n = |n: usize| n * 4;
+    let fp8 = |o: usize, i: usize| fp8_bytes(o, i, block);
+    let i8 = i8_bytes;
+    let f32n = f32_bytes;
 
     let qk = cfg.qk_head_dim();
     let mut total = i8(cfg.vocab, cfg.hidden) // embed_tokens

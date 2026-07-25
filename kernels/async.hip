@@ -9,7 +9,9 @@
 // call any HIP API and must not block — ours only sets a flag + wakes a Waker.
 #include <hip/hip_runtime.h>
 
-#define HIP_ERR_BASE 1000000  // negative-return encoding shared with the other shims
+// hipError_t → a distinct nonzero return the Rust side treats as an error (it only
+// tests rc != 0; the exact value just has to not collide with 0 or an -errno).
+#define HIP_ERR_BASE 1000000
 
 // A non-blocking stream: work on it never implicitly serialises against the null
 // stream, so a compute launch here truly overlaps a copy on another stream.
