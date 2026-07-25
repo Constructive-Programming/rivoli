@@ -310,6 +310,7 @@ fn main() -> Result<()> {
             cfg.two_q,
             want_indexer,
             cfg.i4,
+            cfg.hot_pct,
         )?;
         info!("pin built in {:.1}s", t.elapsed().as_secs_f64());
         let max_ctx = prompt_ids.len() + ngen + 1;

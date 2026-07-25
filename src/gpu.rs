@@ -242,6 +242,11 @@ pub struct GpuEngine<'a> {
     codebooks: [*const u16; 3],
     mlps_vq: Vec<MlpVq>,
     descs_vq: Vec<ExpertDescVq>,
+    /// Per-expert format for the current layer's batch: `true` = int4 slab (launch the
+    /// int4 kernel + reinterpret the descriptor as `ExpertDescI4`), `false` = int3-VQ.
+    /// Filled by [`Pin::submit_layer`] for routed experts; the folded shared expert
+    /// appends [`Pin::shared_i4`].
+    fmt: Vec<bool>,
     gl_host: Vec<u8>,
     argmax_host: Vec<u8>,
     /// Always-on cheap per-token profiling (see [`Profile`]).
@@ -372,6 +377,7 @@ impl<'a> GpuEngine<'a> {
             codebooks: pin.codebooks(),
             mlps_vq: Vec::with_capacity(cfg.top_k),
             descs_vq: Vec::with_capacity(slots),
+            fmt: Vec::with_capacity(slots),
             gl_host: Vec::with_capacity(cfg.n_experts * 4),
             argmax_host: Vec::with_capacity(8),
             prof: Profile::default(),
@@ -826,7 +832,8 @@ impl<'a> GpuEngine<'a> {
                 // Signal (hit → ready; miss → resolves when its bytes land). The slot
                 // ADDRESSES are known now, so the descriptors below are valid pointers.
                 let miss0 = self.pin.misses;
-                let mut signals = self.pin.submit_layer(l, &self.sel, &mut self.mlps_vq)?;
+                let mut signals =
+                    self.pin.submit_layer(l, &self.sel, &mut self.mlps_vq, &mut self.fmt)?;
                 self.prof.fetch_n += self.pin.misses - miss0;
                 // Routed weights: sigmoid score, sum-normalized over the routed picks,
                 // then scaled. The VQ shared expert (weight 1.0) folds into the batch.
@@ -853,6 +860,7 @@ impl<'a> GpuEngine<'a> {
                 if let Some(s) = shared {
                     self.descs_vq.push(desc_of_vq(&s));
                     self.w.push(1.0);
+                    self.fmt.push(self.pin.shared_i4());
                     signals.push(Signal::ready());
                 }
                 let ndesc = self.descs_vq.len();
@@ -876,7 +884,10 @@ impl<'a> GpuEngine<'a> {
                 // Same descriptor bytes (six device pointers, at int4 slot offsets)
                 // reinterpreted for the int4 kernel — see Pin::i4 / ExpertDescI4.
                 let descs_i4_ptr = self.descs_buf.ptr() as *const ExpertDescI4;
-                let i4 = self.pin.i4();
+                // Per-expert format (routed experts from their slab; shared appended
+                // above). Cloned so the expert stream owns it (the small bool vec moves
+                // into the async closure). Hybrid mixes int4/vq3 within one batch.
+                let fmt = self.fmt.clone();
                 let w_ptr = self.wexpert_buf.ptr() as *const f32;
                 let (cb0, cb1, cb2) = (self.codebooks[0], self.codebooks[1], self.codebooks[2]);
                 let cs_raw = self.compute_stream.raw();
@@ -896,6 +907,7 @@ impl<'a> GpuEngine<'a> {
                 futures_util::stream::iter(0..ndesc)
                     .map(move |e| {
                         let sig = signals[e].clone();
+                        let i4 = fmt[e];
                         // Instrument: idle = time parked on the load Signal (the
                         // fetch-wait the stream sees), poll = the launch cost.
                         monitor.instrument(async move {

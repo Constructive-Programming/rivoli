@@ -31,35 +31,6 @@ use crate::stream::{Streamer, slot_span};
 use anyhow::{Context, Result, bail, ensure};
 use std::os::fd::RawFd;
 
-/// The routed-expert streaming source: `.vq3` (int3-VQ) or `.i4` (colibri int4).
-/// Owns the O_DIRECT fds that back `moe_table`, and answers the format-independent
-/// pool queries. All-int4 vs int3-vq is a whole-run mode; the per-expert hybrid
-/// (warm=i4/cold=vq) will later hold both and pick per read.
-enum MoeSrc {
-    Vq3(Vq3Set),
-    I4(I4Set),
-}
-
-impl MoeSrc {
-    fn read_spec(&self, layer: usize, expert: usize) -> Result<(RawFd, usize, usize)> {
-        match self {
-            MoeSrc::Vq3(s) => s.read_spec(layer, expert),
-            MoeSrc::I4(s) => s.read_spec(layer, expert),
-        }
-    }
-    fn shared_block(&self, layer: usize) -> Result<Vec<u8>> {
-        match self {
-            MoeSrc::Vq3(s) => s.shared_block(layer),
-            MoeSrc::I4(s) => s.shared_block(layer),
-        }
-    }
-    fn expert_slot(&self) -> usize {
-        match self {
-            MoeSrc::Vq3(s) => s.expert_slot(),
-            MoeSrc::I4(s) => s.expert_slot(),
-        }
-    }
-}
 
 /// A resolved fp8-e4m3 block-scaled weight matrix in the tier: device pointers +
 /// dims + the `weight_scale_inv` block size. Consumed by `launch_gemv_fp8` (attn +
@@ -184,26 +155,19 @@ pub struct Pin<'a> {
     /// halves it into L1; see math::f32_to_f16 / dot_vq_wave). Null in `--i4` (int4
     /// decodes without a codebook).
     codebooks: [*const u16; 3],
-    /// The routed-expert pool: ONE device-local VMM slab of `n_slots` expert slots
-    /// (slot i at `i * expert_slot`), each one O_DIRECT-aligned `.vq3`/`.i4` block.
-    #[allow(dead_code)] // RAII owner of the pool slab; addressed via `lru_pool.ptr()`
-    lru_pool: VmmBuf,
-    expert_slot: usize,
-    /// The routed-expert streaming source (`.vq3` or `.i4`) — its O_DIRECT fds back
-    /// every `moe_table` read. Held for the run (fd owner); not read through after
-    /// `build` populated the table.
+    /// The routed-expert slabs: `[cold]` (single-format) or `[cold vq3, hot int4]`
+    /// (hybrid). Each owns its VMM slab, read-spec table, and slot layout. The `Pool`
+    /// maps a key's tier to a slab index.
+    slabs: Vec<Slab>,
+    /// The `.vq3` / `.i4` streaming sources — fd owners backing the slabs' read tables;
+    /// held for the run, not read through after `build`.
     #[allow(dead_code)]
-    src: MoeSrc,
-    /// True when routed experts are int4 (`.i4`): gpu.rs launches the int4 MoE kernel
-    /// (no codebooks) and reinterprets each descriptor as `ExpertDescI4`.
-    i4: bool,
-    /// Per-(MoE layer, expert) cold-read spec `(fd, begin, len)`, indexed by
-    /// `(layer - dense_layers) * n_experts + expert`. One aligned read per expert.
-    moe_table: Vec<(RawFd, usize, usize)>,
-    /// The six slot-relative byte offsets of an expert block — `[gate.idx, gate.sc,
-    /// up.idx, up.sc, down.idx, down.sc]` for VQ, or `[gate.packed, gate.scale, …]`
-    /// for int4. Fixed per expert, stored once. Selected by the mode at build.
-    slot_off: [usize; 6],
+    vq_src: Option<Vq3Set>,
+    #[allow(dead_code)]
+    i4_src: Option<I4Set>,
+    /// The always-resident shared expert's format: int4 in `--i4`/hybrid, else vq3.
+    /// gpu.rs launches the folded shared expert with the matching kernel.
+    shared_i4: bool,
     /// Adaptive routed tier: (layer,expert) -> slot, policy-evicted (`--cache-policy`).
     pool: Pool,
     /// Per-expert async cold-fetch: owns the io_uring demand ring on a reaper thread
@@ -351,7 +315,9 @@ fn indexer_bytes(cfg: &ModelConfig, block: usize) -> usize {
 /// the placement path: fp8 `[o,i]` = `o·i` packed + `⌈o/block⌉·⌈i/block⌉·4` scale;
 /// int8 `[o,i]` = `o·i` + `o·4`; an f32 norm of `n` = `n·4`; plus the 3 codebooks
 /// and one VQ shared expert per MoE layer.
-fn resident_bytes(cfg: &ModelConfig, block: usize, i4: bool) -> usize {
+/// `shared_i4`: the always-resident shared expert is int4 (else int3-VQ).
+/// `cb_resident`: the 3 fp16 VQ codebooks are resident (any VQ slab present).
+fn resident_bytes(cfg: &ModelConfig, block: usize, shared_i4: bool, cb_resident: bool) -> usize {
     let fp8 = |o: usize, i: usize| o * i + o.div_ceil(block) * i.div_ceil(block) * 4;
     let i8 = |o: usize, i: usize| o * i + o * 4;
     let f32n = |n: usize| n * 4;
@@ -379,15 +345,15 @@ fn resident_bytes(cfg: &ModelConfig, block: usize, i4: bool) -> usize {
         } else {
             total += f32n(cfg.n_experts * cfg.hidden); // router gate (F32, device)
             // Shared expert, in the routed format (int4 blocks are larger than VQ).
-            total += if i4 {
+            total += if shared_i4 {
                 i4_expert_bytes(cfg.hidden, cfg.moe_inter)
             } else {
                 vq_expert_bytes(cfg.hidden, cfg.moe_inter)
             };
         }
     }
-    // 3 per-projection fp16 codebooks — VQ only; int4 uploads none.
-    total + if i4 { 0 } else { 3 * VQ_K * VQ_DIM * 2 }
+    // 3 per-projection fp16 codebooks — resident whenever a VQ slab is present.
+    total + if cb_resident { 3 * VQ_K * VQ_DIM * 2 } else { 0 }
 }
 
 /// Pack `(layer, expert)` into the pool key. Both must fit in 16 bits — GLM is
@@ -416,79 +382,128 @@ fn vq_slot_offsets(hidden: usize, moe_inter: usize) -> [usize; 6] {
     off
 }
 
-/// The routed-expert pool: maps `(layer,expert)` keys to slab slot indices, with
-/// eviction delegated to a pluggable `cache::Cache` policy. The policy owns
-/// residency + eviction order; the pool owns the key↔slot maps. Format-agnostic —
-/// the per-expert geometry lives in [`Pin::moe_table`], not per slot.
+/// Slab indices, named by the tier's FUNCTION (residency role), not the weights it
+/// carries. The hybrid maps 2Q's probation segment → `COLD`, its frequent segment →
+/// `HOT`; single-format keeps everything in `COLD`. Which weight format sits in each
+/// (int4 vs int3-VQ) is the slab's `Slab::int4` payload flag, a separate concern.
+const COLD: usize = 0;
+const HOT: usize = 1;
+
+/// A key's residence: which slab and which slot in it. Single-format uses [`COLD`]
+/// only; the hybrid uses [`COLD`] (probation, vq3) and [`HOT`] (frequent, int4).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Slot {
+    slab: usize,
+    slot: usize,
+}
+
+/// One resident slab: a VMM buffer of same-size, same-format expert slots, its
+/// per-`(layer,expert)` O_DIRECT read-spec table, and the slot byte layout. The pin
+/// holds 1 (single-format) or 2 (hybrid: [`COLD`]/[`HOT`]). Named by function; the
+/// weights it carries are the `int4` flag (int4 vs int3-VQ), what gpu.rs launches.
+struct Slab {
+    #[allow(dead_code)] // RAII owner; addressed via ptr()
+    buf: VmmBuf,
+    base: *mut u8,
+    slot_bytes: usize,
+    /// The weights this slab carries: `true` = int4 (colibri `.i4`), `false` = int3-VQ
+    /// (`.vq3`). Read at the launch site to pick the kernel; independent of the slab's
+    /// hot/cold role (single-format `COLD` may carry either).
+    int4: bool,
+    off: [usize; 6],
+    table: Vec<(RawFd, usize, usize)>, // read spec per (layer-dense)*n_experts+expert
+}
+
+/// The routed-expert pool: maps `(layer,expert)` keys to a [`Slot`] (slab + index),
+/// eviction delegated to a `cache::Cache` policy. The policy owns residency + order
+/// and reports the [`Tier`](cache::Tier) each insert lands in; the pool maps that to
+/// a slab (hybrid) or ignores it (single-format). Fixed-partition 2Q guarantees an
+/// insert only evicts from the tier it enters, so a reuse stays in one slab.
 struct Pool {
     policy: Box<dyn cache::Cache>,
-    slot_of: std::collections::HashMap<u32, usize>,
+    hybrid: bool, // 2-slab: Tier::Hot → HOT slab, else COLD
+    slot_of: std::collections::HashMap<u32, Slot>,
     #[cfg(debug_assertions)]
-    key_of: Vec<Option<u32>>,
-    free: Vec<usize>,
+    key_of: Vec<Vec<Option<u32>>>, // per slab
+    free: Vec<Vec<usize>>,         // per-slab free lists
 }
 
 impl Pool {
-    fn new(n: usize, policy: &str, two_q: cache::TwoQSplit) -> Result<Self> {
-        Ok(Self {
-            policy: cache::make(policy, n, two_q)
-                .with_context(|| format!("unknown --cache-policy {policy:?} (lru|2q|arc)"))?,
-            slot_of: std::collections::HashMap::with_capacity(n),
+    /// `policy` is pre-built (fixed-partition 2Q for the hybrid, else `cache::make`);
+    /// `slab_slots[i]` = slot count of slab i. `hybrid` ⇒ tier selects the slab.
+    fn new(policy: Box<dyn cache::Cache>, slab_slots: &[usize], hybrid: bool) -> Self {
+        let total: usize = slab_slots.iter().sum();
+        Self {
+            policy,
+            hybrid,
+            slot_of: std::collections::HashMap::with_capacity(total),
             #[cfg(debug_assertions)]
-            key_of: vec![None; n],
-            free: (0..n).rev().collect(), // pop() hands out 0,1,2,...
-        })
+            key_of: slab_slots.iter().map(|&n| vec![None; n]).collect(),
+            free: slab_slots.iter().map(|&n| (0..n).rev().collect()).collect(),
+        }
     }
 
-    /// Resident slot for `key` (a hit, promoted by the policy), or `None` (a miss).
-    fn get(&mut self, key: u32) -> Option<usize> {
+    fn slab_of(&self, tier: cache::Tier) -> usize {
+        if self.hybrid && tier == cache::Tier::Hot {
+            HOT
+        } else {
+            COLD
+        }
+    }
+
+    /// Resident slot for `key` (a hit), or `None` (a miss).
+    fn get(&mut self, key: u32) -> Option<Slot> {
         if self.policy.get(key) {
-            let slot = self.slot_of[&key];
+            let s = self.slot_of[&key];
             #[cfg(debug_assertions)]
-            debug_assert_eq!(self.key_of[slot], Some(key), "hit slot holds wrong key");
-            Some(slot)
+            debug_assert_eq!(self.key_of[s.slab][s.slot], Some(key), "hit slot holds wrong key");
+            Some(s)
         } else {
             None
         }
     }
 
-    /// Allocate a slot for a NEW `key` (miss): reuse the policy-evicted key's slot,
-    /// else a free slot. The caller then fills the slot.
-    fn alloc(&mut self, key: u32) -> Result<usize> {
-        let (evicted, _tier) = self.policy.insert(key); // _tier: milestone 2 (slab select)
-        let slot = self.reuse(evicted)?;
-        self.bind(key, slot);
-        Ok(slot)
+    /// Allocate a slot for a NEW `key` (miss): the policy picks the tier → slab;
+    /// reuse the evicted key's slot (same slab) else a free slot in that slab.
+    fn alloc(&mut self, key: u32) -> Result<Slot> {
+        let (evicted, tier) = self.policy.insert(key);
+        let slab = self.slab_of(tier);
+        let slot = self.reuse(evicted, slab)?;
+        let s = Slot { slab, slot };
+        self.bind(key, s);
+        Ok(s)
     }
 
     fn protect(&mut self, key: u32) {
         self.policy.protect(key);
     }
 
-    fn reuse(&mut self, evicted: Option<u32>) -> Result<usize> {
+    fn reuse(&mut self, evicted: Option<u32>, slab: usize) -> Result<usize> {
         match evicted {
             Some(ev) => {
                 debug_assert!(
                     !self.policy.contains(ev),
                     "evicted key {ev} still resident (identity drift)"
                 );
-                self.slot_of
+                let s = self
+                    .slot_of
                     .remove(&ev)
-                    .context("evicted key had no slot (pool/policy drift)")
+                    .context("evicted key had no slot (pool/policy drift)")?;
+                debug_assert_eq!(s.slab, slab, "evicted slab != insert slab (fixed-partition broken)");
+                Ok(s.slot)
             }
-            None => self
-                .free
+            None => self.free[slab]
                 .pop()
                 .context("no free slot and policy evicted nothing"),
         }
     }
 
-    fn bind(&mut self, key: u32, slot: usize) {
+    fn bind(&mut self, key: u32, s: Slot) {
         #[cfg(debug_assertions)]
         {
-            self.key_of[slot] = Some(key);
+            self.key_of[s.slab][s.slot] = Some(key);
         }
-        self.slot_of.insert(key, slot);
+        self.slot_of.insert(key, s);
         debug_assert!(self.policy.contains(key), "inserted key {key} not resident");
         debug_assert_eq!(
             self.slot_of.len(),
@@ -514,7 +529,9 @@ impl<'a> Pin<'a> {
         two_q: cache::TwoQSplit,
         want_indexer: bool,
         i4: bool,
+        hot_pct: Option<u32>,
     ) -> Result<Self> {
+        let hybrid = hot_pct.is_some(); // both formats stream; 2Q fixed-partitions
         // ponytail: no free-memory pre-check — the budget is the user's literal
         // request (--max-mem), so let the device allocation itself OOM/fail.
         // One-time bound for `submit_layer`'s fixed 32-slot scratch.
@@ -534,29 +551,41 @@ impl<'a> Pin<'a> {
         // the fp8 stash — see bin/add_indexer). The .vq3/codebooks files are ignored.
         let st = Safetensors::open_dir(dir)?;
         let cbs = load_codebooks(dir)?;
-        // Routed-expert source + its slot layout: int4 (.i4) or int3-VQ (.vq3). The
-        // whole-run mode; both file sets sit in the artifact side by side.
-        let (src, slot_off) = if i4 {
-            let s = I4Set::open(
-                dir,
-                cfg.dense_layers,
-                cfg.n_layers,
-                cfg.n_experts,
-                cfg.hidden,
-                cfg.moe_inter,
-            )?;
-            (MoeSrc::I4(s), i4_slot_offsets(cfg.hidden, cfg.moe_inter))
-        } else {
-            let s = Vq3Set::open(
-                dir,
-                cfg.dense_layers,
-                cfg.n_layers,
-                cfg.n_experts,
-                cfg.hidden,
-                cfg.moe_inter,
-            )?;
-            (MoeSrc::Vq3(s), vq_slot_offsets(cfg.hidden, cfg.moe_inter))
-        };
+        // Routed-expert sources. Single-format opens one; the hybrid opens BOTH (cold
+        // vq3 + hot int4) and 2Q's fixed partition routes each key to its slab. Both
+        // file sets sit in the artifact side by side. `shared_i4`: the always-resident
+        // shared expert rides the primary/hot format (int4 in --i4 and hybrid).
+        let vq_present = !i4 || hybrid;
+        let vq_src = vq_present
+            .then(|| {
+                Vq3Set::open(
+                    dir,
+                    cfg.dense_layers,
+                    cfg.n_layers,
+                    cfg.n_experts,
+                    cfg.hidden,
+                    cfg.moe_inter,
+                )
+            })
+            .transpose()?;
+        let i4_src = i4
+            .then(|| {
+                I4Set::open(
+                    dir,
+                    cfg.dense_layers,
+                    cfg.n_layers,
+                    cfg.n_experts,
+                    cfg.hidden,
+                    cfg.moe_inter,
+                )
+            })
+            .transpose()?;
+        let shared_i4 = i4;
+        // Slot byte layouts, one per format (which projection's indices/scales sit
+        // where in an expert block). Shared expert + routed slabs reuse these.
+        let vq_off = vq_slot_offsets(cfg.hidden, cfg.moe_inter);
+        let i4_off = i4_slot_offsets(cfg.hidden, cfg.moe_inter);
+        let shared_off = if shared_i4 { i4_off } else { vq_off };
 
         // Full layers own a resident DSA indexer (dsa/misa modes). Empty when
         // dense/streaming — the mask drives both placement and the footprint.
@@ -570,7 +599,8 @@ impl<'a> Pin<'a> {
         // Size the tier to the always-resident footprint plus slack (absorbs the
         // per-reservation 256-byte alignment padding); anything left widens the pool.
         const SLACK: usize = 256 << 20; // 256 MiB
-        let resident = resident_bytes(cfg, block, i4) + n_full * indexer_bytes(cfg, block);
+        let resident =
+            resident_bytes(cfg, block, shared_i4, vq_present) + n_full * indexer_bytes(cfg, block);
         let tier_cap = resident + SLACK;
         tracing::info!(
             "computed resident footprint {:.2} GiB (tier {:.2} GiB incl. slack)",
@@ -581,9 +611,10 @@ impl<'a> Pin<'a> {
 
         // Codebooks resident (gate/up/down), narrowed f32 → fp16 at load and passed
         // to launch_moe_expert_range. fp16 halves the hot idx→cb gather into L1.
-        // int4 experts decode without a codebook, so skip the upload in that mode.
+        // Uploaded whenever a VQ slab is present (vq-only or the hybrid cold slab);
+        // int4-only decodes without a codebook.
         let mut codebooks = [std::ptr::null(); 3];
-        if !i4 {
+        if vq_present {
             for (i, cb) in cbs.iter().enumerate() {
                 let half: Vec<u16> = cb.iter().map(|&v| crate::math::f32_to_f16(v)).collect();
                 let bytes = half.len() * 2;
@@ -628,8 +659,12 @@ impl<'a> Pin<'a> {
                     cfg.n_experts
                 );
                 moe_bias.push(bias);
-                let shared =
-                    place_shared(&mut tier, &src.shared_block(l)?, &slot_off)?;
+                let shared_block = if shared_i4 {
+                    i4_src.as_ref().context("i4 shared: source missing")?.shared_block(l)?
+                } else {
+                    vq_src.as_ref().context("vq shared: source missing")?.shared_block(l)?
+                };
+                let shared = place_shared(&mut tier, &shared_block, &shared_off)?;
                 LayerMlp::Moe { gate_w, shared }
             };
             layers.push(LayerPin {
@@ -656,18 +691,64 @@ impl<'a> Pin<'a> {
         }
 
         // Routed pool: each expert (.vq3 or .i4) is ONE aligned block read into a slot
-        // of `expert_slot` bytes. Size the pool to the budget left after the resident set.
-        let expert_slot = src.expert_slot();
-        let moe_table = build_moe_table(&src, cfg)?;
+        // of its slab's `slot_bytes`. The budget left after the resident set splits into
+        // slabs: single-format → one slab; hybrid → [cold vq3, hot int4], `--hot-pct` of
+        // the pool BYTES to the int4/hot slab (default `100 - 2q-kin`), 2Q fixed-partition.
         let budget = capacity.saturating_sub(tier_cap);
-        let n_slots = (budget / expert_slot).max(cfg.top_k);
-        let lru_pool = VmmBuf::new(n_slots * expert_slot)?; // ONE slab
-        tracing::info!(
-            "routed pool [{cache_policy}]: {n_slots} slots ({:.1} GiB) + {:.1} GiB always-resident",
-            (n_slots * expert_slot) as f64 / (1u64 << 30) as f64,
-            tier.used() as f64 / (1u64 << 30) as f64,
-        );
-        let pool = Pool::new(n_slots, cache_policy, two_q)?;
+        // Build one slab of a given format: its VMM buffer + per-(layer,expert) O_DIRECT
+        // read table. These are the format mechanics; the caller binds them to a role.
+        let vq_slab = |slots: usize| -> Result<Slab> {
+            let s = vq_src.as_ref().context("vq slab: source missing")?;
+            let mut buf = VmmBuf::new(slots * s.expert_slot())?;
+            let base = buf.ptr_mut();
+            let table = build_moe_table(cfg, |l, e| s.read_spec(l, e))?;
+            Ok(Slab { buf, base, slot_bytes: s.expert_slot(), int4: false, off: vq_off, table })
+        };
+        let i4_slab = |slots: usize| -> Result<Slab> {
+            let s = i4_src.as_ref().context("i4 slab: source missing")?;
+            let mut buf = VmmBuf::new(slots * s.expert_slot())?;
+            let base = buf.ptr_mut();
+            let table = build_moe_table(cfg, |l, e| s.read_spec(l, e))?;
+            Ok(Slab { buf, base, slot_bytes: s.expert_slot(), int4: true, off: i4_off, table })
+        };
+        let (slabs, slab_slots, policy): (Vec<Slab>, Vec<usize>, Box<dyn cache::Cache>) = if hybrid
+        {
+            // Two slabs by ROLE: COLD (probation, vq3) + HOT (frequent, int4). `--hot-pct`
+            // of the pool BYTES goes to HOT (default `100 - 2q-kin`); 2Q fixed-partition
+            // hard-caps each segment so an insert only evicts from its own slab.
+            let (cold_bytes, hot_bytes) = {
+                let hot_frac = hot_pct.unwrap_or(100 - two_q.kin_pct()).clamp(1, 99) as usize;
+                let hot = budget * hot_frac / 100;
+                (budget.saturating_sub(hot), hot)
+            };
+            let n_cold = (cold_bytes / vq_src.as_ref().context("hybrid: vq source")?.expert_slot())
+                .max(1);
+            let n_hot = (hot_bytes / i4_src.as_ref().context("hybrid: i4 source")?.expert_slot())
+                .max(1);
+            let kout = ((n_cold + n_hot) * two_q.kout_pct() as usize / 100).max(1);
+            tracing::info!(
+                "routed pool [2q hybrid]: {n_cold} COLD vq3 + {n_hot} HOT int4 slots"
+            );
+            let (cold, hot) = (vq_slab(n_cold)?, i4_slab(n_hot)?);
+            (
+                vec![cold, hot],
+                vec![n_cold, n_hot],
+                Box::new(cache::TwoQ::fixed(n_cold, n_hot, kout)),
+            )
+        } else {
+            let slot_bytes = if i4 {
+                i4_src.as_ref().context("single-format: i4 source missing")?.expert_slot()
+            } else {
+                vq_src.as_ref().context("single-format: vq source missing")?.expert_slot()
+            };
+            let n_slots = (budget / slot_bytes).max(cfg.top_k);
+            tracing::info!("routed pool [{cache_policy}]: {n_slots} slots ({} B each)", slot_bytes);
+            let slab = if i4 { i4_slab(n_slots)? } else { vq_slab(n_slots)? };
+            let policy = cache::make(cache_policy, n_slots, two_q)
+                .with_context(|| format!("unknown cache policy {cache_policy}"))?;
+            (vec![slab], vec![n_slots], policy)
+        };
+        let pool = Pool::new(policy, &slab_slots, hybrid);
         // Ring sized for one layer's worst case: top_k demand reads (1/expert). One
         // read per expert — one aligned `.vq3`/`.i4` block, either format.
         let ring = (cfg.top_k + 4).next_power_of_two();
@@ -676,12 +757,8 @@ impl<'a> Pin<'a> {
             "io_uring ring {ring} too small for top_k {}",
             cfg.top_k,
         );
-        // Bounce span = the whole expert block (one read); int4 blocks are larger.
-        let ebytes = if i4 {
-            i4_expert_bytes(cfg.hidden, cfg.moe_inter)
-        } else {
-            vq_expert_bytes(cfg.hidden, cfg.moe_inter)
-        };
+        // Bounce span = the largest expert block across the resident slabs (one read).
+        let ebytes = slabs.iter().map(|s| s.slot_bytes).max().unwrap_or(0);
         let span = slot_span(ebytes);
         let fetch = AsyncFetch::new(Streamer::new(ring as u32, span, bounce)?)?;
 
@@ -694,12 +771,10 @@ impl<'a> Pin<'a> {
             layers,
             moe_bias,
             codebooks,
-            lru_pool,
-            expert_slot,
-            src,
-            i4,
-            moe_table,
-            slot_off,
+            slabs,
+            vq_src,
+            i4_src,
+            shared_i4,
             pool,
             fetch,
             slot_collisions: 0,
@@ -726,10 +801,11 @@ impl<'a> Pin<'a> {
         self.codebooks
     }
 
-    /// True when routed experts are int4 (`.i4`): gpu.rs launches the int4 MoE kernel
-    /// and reinterprets each expert descriptor as `ExpertDescI4`.
-    pub fn i4(&self) -> bool {
-        self.i4
+    /// The always-resident shared expert's format: int4 (`--i4`/hybrid) vs int3-VQ.
+    /// gpu.rs appends the folded shared expert with this format flag; routed experts
+    /// carry their own per-expert flag from [`submit_layer`].
+    pub fn shared_i4(&self) -> bool {
+        self.shared_i4
     }
 
     /// Accumulated reaper fetch wall (ns) — the off-main-thread load cost the expert
@@ -745,7 +821,7 @@ impl<'a> Pin<'a> {
         &mut self,
         layer: usize,
         sel: &[usize],
-    ) -> Result<([Option<usize>; 32], usize, Vec<Signal>)> {
+    ) -> Result<([Option<Slot>; 32], usize, Vec<Signal>)> {
         let cfg = self.cfg;
         let sparse = (layer - cfg.dense_layers) * cfg.n_experts; // moe_table row base
         debug_assert!(
@@ -766,7 +842,7 @@ impl<'a> Pin<'a> {
         }
         // Phase 1a: touch EVERY hit first so a later miss's `alloc()` cannot evict a
         // same-layer would-be hit out from under itself.
-        let mut slots: [Option<usize>; 32] = [None; 32];
+        let mut slots: [Option<Slot>; 32] = [None; 32];
         for (i, &e) in sel.iter().enumerate() {
             if let Some(slot) = self.pool.get(expert_key(layer, e)) {
                 self.hits += 1;
@@ -782,10 +858,9 @@ impl<'a> Pin<'a> {
         // real config (misses ≤ top_k ≪ the 2Q probation segment), so refusing is the
         // lazy-correct guard. ponytail: bail on collision; upgrade to a sub-batch await
         // (submit + await the colliding slot, then continue) if a tiny pool ever needs it.
-        let base = self.lru_pool.ptr_mut();
         let mut reads: Vec<ReadSpec> = Vec::new();
         let mut miss_sel: Vec<usize> = Vec::new(); // sel-index of each read, for signal mapping
-        let mut batch_slots: Vec<usize> = Vec::new();
+        let mut batch_slots: Vec<Slot> = Vec::new();
         for (i, &e) in sel.iter().enumerate() {
             if slots[i].is_some() {
                 continue;
@@ -800,11 +875,12 @@ impl<'a> Pin<'a> {
                 );
             }
             batch_slots.push(slot);
-            let (fd, begin, len) = self.moe_table[sparse + e];
-            // SAFETY: slot*expert_slot is block-aligned (expert_slot is a VQ_ALIGN
+            let sl = &self.slabs[slot.slab];
+            let (fd, begin, len) = sl.table[sparse + e];
+            // SAFETY: slot.slot*slot_bytes is block-aligned (slot_bytes is a VQ_ALIGN
             // multiple) and within the slab; the slot stays live until this expert's
             // Signal resolves (the pipeline holds it).
-            let dst = unsafe { base.add(slot * self.expert_slot) };
+            let dst = unsafe { sl.base.add(slot.slot * sl.slot_bytes) };
             reads.push(ReadSpec {
                 fd,
                 begin,
@@ -835,22 +911,25 @@ impl<'a> Pin<'a> {
         layer: usize,
         sel: &[usize],
         out: &mut Vec<MlpVq>,
+        fmt: &mut Vec<bool>,
     ) -> Result<Vec<Signal>> {
         let (slots, _sparse, signals) = self.submit_spine(layer, sel)?;
-        let slab = self.lru_pool.ptr();
-        let es = self.expert_slot;
-        let o = self.slot_off;
         out.clear();
+        fmt.clear();
         for (i, _e) in sel.iter().enumerate() {
             let slot = slots[i].context("submit_layer: unresolved expert slot")?;
+            let sl = &self.slabs[slot.slab];
+            let o = sl.off;
             // SAFETY: slot base within the slab; address arithmetic only (the bytes
-            // land when `signals[i]` resolves).
-            let b = unsafe { slab.add(slot * es) };
+            // land when `signals[i]` resolves). The six pointers are identical for both
+            // formats (gpu.rs reinterprets as ExpertDescI4 when `fmt[i]`).
+            let b = unsafe { sl.base.add(slot.slot * sl.slot_bytes) };
             out.push(MlpVq {
                 gate: vqweight_at(b, o[0], o[1]),
                 up: vqweight_at(b, o[2], o[3]),
                 down: vqweight_at(b, o[4], o[5]),
             });
+            fmt.push(sl.int4);
         }
         Ok(signals)
     }
@@ -858,14 +937,17 @@ impl<'a> Pin<'a> {
 
 /// Resolve every routed expert's cold-read spec `(fd, begin, len)` ONCE, indexed
 /// `(layer - dense_layers) * n_experts + expert`. Each `.vq3`/`.i4` expert is a
-/// single O_DIRECT-aligned block, so this is just [`MoeSrc::read_spec`] tabulated
-/// (the range/dim checks ran at open).
-fn build_moe_table(src: &MoeSrc, cfg: &ModelConfig) -> Result<Vec<(RawFd, usize, usize)>> {
+/// single O_DIRECT-aligned block, so this just tabulates `read` (the source's
+/// `read_spec`; range/dim checks ran at open).
+fn build_moe_table(
+    cfg: &ModelConfig,
+    read: impl Fn(usize, usize) -> Result<(RawFd, usize, usize)>,
+) -> Result<Vec<(RawFd, usize, usize)>> {
     let n_moe = cfg.n_layers - cfg.dense_layers;
     let mut table = Vec::with_capacity(n_moe * cfg.n_experts);
     for l in cfg.dense_layers..cfg.n_layers {
         for e in 0..cfg.n_experts {
-            table.push(src.read_spec(l, e)?);
+            table.push(read(l, e)?);
         }
     }
     Ok(table)
