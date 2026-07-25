@@ -1,4 +1,5 @@
-//! rivoli — int3-vq GLM-5.2 decode engine. The artifact IS the model: point
+//! rivoli — GLM-5.2 MoE decode engine (routed experts int3-vq/int4/hybrid, default
+//! hybrid; see MODES.md). The artifact IS the model: point
 //! `rivoli` at a converted artifact directory (manifest.json + codebooks.f32 +
 //! resident.safetensors + `L{ll}.vq3` + tokenizer) and it decodes on device.
 //!

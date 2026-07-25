@@ -1,4 +1,5 @@
-//! rivoli — int3-vq GLM-5.2 decode engine (rewrite). See docs/ARCHITECTURE.md.
+//! rivoli — GLM-5.2 MoE decode engine (int3-vq / int4 / hybrid routed experts).
+//! See docs/ARCHITECTURE.md for the module map and MODES.md for the run modes.
 pub mod arena;
 pub mod attn;
 pub mod cache;

@@ -125,9 +125,10 @@ hot-85% run → 80% hit → 2.61 tok/s. **The faster number was the broken outpu
 tok/s sweep partly measures *which config degenerated*, not efficiency.
 
 Use instead:
-- **The sim** — `replay <trace> --hybrid` replays *one fixed trace* across every split,
-  isolating residency + compute from the trajectory. Confound-free; milliseconds. This
-  is how the ~80–85% hot optimum was found.
+- **The residency sim** — `replay <trace> <n_slots> [--sweep]` replays *one fixed trace*
+  through the same byte-aware policies the engine runs and reports the resident-hit %,
+  isolating residency from the decode trajectory. Confound-free; milliseconds. Ranks
+  policies and 2Q Kin/Kout, not compute.
 - **A fixed forced-token bench** (same tokens every run → same trace) for a trustworthy
   wall-clock number per config.
 - **The dot microbench** (`examples/dot_bench.rs`) for pure per-format compute (this is
