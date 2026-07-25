@@ -93,11 +93,11 @@ impl Arena {
         self.budget - self.cold_hi * self.cold_stride - self.hot_hi * self.hot_stride
     }
 
-    /// Release slot `idx` of the `hot` tier. Cascades: if it (now) sits at the frontier,
-    /// retreat the frontier — and keep retreating while the new top is also free — so
-    /// the freed bytes rejoin the gap and the free list never holds a frontier−1 slot.
-    pub fn free(&mut self, hot: bool, idx: usize) {
-        self.free_list(hot).push(idx);
+    /// Retreat the `hot` frontier while its top slot is free — so freed top bytes rejoin
+    /// the gap and the free list never holds a frontier−1 slot. MUST run after anything
+    /// that lowers a frontier or frees a top slot ([`free`] and the compaction in
+    /// [`alloc_step`]), else a later compaction could relocate a keyless hole.
+    fn retreat(&mut self, hot: bool) {
         loop {
             let f = self.frontier(hot);
             if f == 0 {
@@ -112,6 +112,12 @@ impl Arena {
                 break;
             }
         }
+    }
+
+    /// Release slot `idx` of the `hot` tier (cascade-retreats the frontier).
+    pub fn free(&mut self, hot: bool, idx: usize) {
+        self.free_list(hot).push(idx);
+        self.retreat(hot);
     }
 
     /// One step toward placing a slot of the `hot` tier. See the module contract.
@@ -137,6 +143,8 @@ impl Arena {
         let top = ohi - 1;
         if let Some(h) = self.free_list(other).pop() {
             self.set_frontier(other, top); // top vacated → gap grows by the other stride
+            self.retreat(other); // cascade past any hole now exposed at the frontier, so
+                                 // the NEXT compaction never relocates a keyless hole
             return Step::Relocated(Reloc { hot: other, from: top, to: h });
         }
         // 4) Other tier is packed solid (no holes) — caller must evict one of its slots.
@@ -256,6 +264,47 @@ mod tests {
         a.free(false, 0);
         assert_eq!(a.cold_hi, 2);
         assert_eq!(a.alloc_step(false), Step::Placed(0));
+    }
+
+    // Regression: compaction must cascade the frontier retreat, so a SECOND compaction
+    // step never relocates a keyless hole. Without the `retreat` in alloc_step this
+    // panics ("relocated a keyless hole"). Scenario: 5 cold + 1 hot fill the budget with
+    // non-adjacent cold holes {1,3}; admitting a hot slot forces two compaction steps.
+    #[test]
+    fn compaction_never_relocates_a_hole() {
+        let mut a = Arena::new(19, 3, 4); // cs=3 (vq), hs=4 (i4)
+        let mut key_at: HashMap<(bool, usize), u32> = HashMap::new();
+        for k in 0..5u32 {
+            match a.alloc_step(false) {
+                Step::Placed(i) => { key_at.insert((false, i), k); }
+                s => panic!("cold grow: unexpected {s:?}"),
+            }
+        }
+        match a.alloc_step(true) {
+            Step::Placed(i) => { key_at.insert((true, i), 100); }
+            s => panic!("hot grow: unexpected {s:?}"),
+        }
+        // Free non-adjacent cold holes (keys at slots 3 then 1) — neither is the frontier.
+        key_at.remove(&(false, 3));
+        a.free(false, 3);
+        key_at.remove(&(false, 1));
+        a.free(false, 1);
+        // Admit a hot slot: drives compaction; every Reloc's `from` MUST hold a key.
+        let mut steps = 0;
+        loop {
+            match a.alloc_step(true) {
+                Step::Placed(_) => break,
+                Step::Relocated(r) => {
+                    let k = key_at
+                        .remove(&(r.hot, r.from))
+                        .unwrap_or_else(|| panic!("relocated a keyless hole at {:?}", (r.hot, r.from)));
+                    key_at.insert((r.hot, r.to), k);
+                }
+                Step::NeedFree => panic!("unexpected NeedFree with free bytes available"),
+            }
+            steps += 1;
+            assert!(steps < 10, "compaction did not converge");
+        }
     }
 
     #[test]
