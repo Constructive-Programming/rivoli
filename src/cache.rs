@@ -113,25 +113,6 @@ pub trait Cache {
     fn protect(&mut self, _k: u32) {}
     fn seed(&mut self, keys: &[u32]);
     fn resident_len(&self) -> usize;
-
-    fn access_batch(&mut self, keys: &[u32]) -> usize {
-        // top_k is small (≤8 + shared); a fixed miss scratch avoids an alloc.
-        let mut miss = [0u32; 32];
-        let mut nm = 0;
-        let mut hits = 0;
-        for &k in keys {
-            if self.get(k) {
-                hits += 1;
-            } else if nm < miss.len() {
-                miss[nm] = k;
-                nm += 1;
-            }
-        }
-        for &k in &miss[..nm] {
-            self.insert(k);
-        }
-        hits
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -660,19 +641,24 @@ mod tests {
     /// pure recency ages it out. `hot` is promoted with just enough churn between
     /// touches to age it into the ghost and back, then left untouched through the scan.
     fn survives_cold_scan(mut c: Box<dyn Cache>, cap: usize) -> bool {
+        fn touch(c: &mut dyn Cache, k: u32) {
+            if !c.get(k) {
+                c.insert(k);
+            }
+        }
         let hot = 999_999u32;
         let mut churn = 1_000_000u32;
         let burst = cap / 4 + 1;
         for _ in 0..6 {
-            c.access_batch(&[hot]);
+            touch(&mut *c, hot);
             for _ in 0..burst {
-                c.access_batch(&[churn]);
+                touch(&mut *c, churn);
                 churn += 1;
             }
         }
-        c.access_batch(&[hot]);
+        touch(&mut *c, hot);
         for _ in 0..(cap * 5) {
-            c.access_batch(&[churn]);
+            touch(&mut *c, churn);
             churn += 1;
         }
         c.contains(hot)

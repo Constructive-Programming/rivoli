@@ -26,10 +26,11 @@ use crate::telemetry::ProfileSummary;
 use anyhow::{Result, bail, ensure};
 use futures_util::stream::{StreamExt, TryStreamExt};
 
-/// Little-endian byte view of a u32 slice — zero-copy on this LE host. Feeds the
-/// per-token attention-rows H2D.
-fn u32_le_bytes(v: &[u32]) -> &[u8] {
-    // SAFETY: u32 is POD; the bytes are the LE serialization on this LE host.
+/// Little-endian byte view of a POD slice — zero-copy on this LE host (a `[T]`'s
+/// in-memory bytes ARE its LE serialization). Feeds the per-token H2D uploads (attn
+/// rows/heads u32, expert descriptors, weights f32) with no staging buffer.
+fn as_le_bytes<T: Copy>(v: &[T]) -> &[u8] {
+    // SAFETY: `T: Copy` POD (u32/f32/repr(C) ExpertDescVq); LE host == LE bytes.
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
@@ -55,18 +56,6 @@ fn desc_of_vq(m: &MlpVq) -> ExpertDescVq {
     }
 }
 
-fn desc_bytes_vq(d: &[ExpertDescVq]) -> &[u8] {
-    // SAFETY: ExpertDescVq is repr(C) POD (six pointers); this is its byte view.
-    unsafe { std::slice::from_raw_parts(d.as_ptr() as *const u8, std::mem::size_of_val(d)) }
-}
-
-/// Little-endian byte view of an f32 slice — zero-copy, since on this LE host
-/// `[f32]`'s in-memory representation IS its little-endian serialization. Feeds the
-/// per-token weight/scalar H2D with no staging buffer.
-fn f32_le_bytes(v: &[f32]) -> &[u8] {
-    // SAFETY: f32 is POD; the bytes are the LE serialization on this LE host.
-    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
-}
 
 /// Host routing: sigmoid the gate logits into `scores`, add the router `bias` into
 /// `choice`, and select the top-`top_k` into `sel`. A free fn taking disjoint slices
@@ -542,7 +531,7 @@ impl<'a> GpuEngine<'a> {
                 topk_into(&idx.e_f, hh, &mut idx.head_sel);
                 idx.heads_u32.clear();
                 idx.heads_u32.extend(idx.head_sel.iter().map(|&i| i as u32));
-                idx.heads_buf.copy_in_at(0, u32_le_bytes(&idx.heads_u32))?;
+                idx.heads_buf.copy_in_at(0, as_le_bytes(&idx.heads_u32))?;
                 (idx.heads_buf.ptr() as *const u32, idx.heads_u32.len())
             }
             _ => (std::ptr::null(), nh),
@@ -577,7 +566,7 @@ impl<'a> GpuEngine<'a> {
         idx.sel.sort_unstable(); // ascending token order for the gather
         idx.rows.clear();
         idx.rows.extend(idx.sel.iter().map(|&i| i as u32));
-        self.rows_buf.copy_in_at(0, u32_le_bytes(&idx.rows))?;
+        self.rows_buf.copy_in_at(0, as_le_bytes(&idx.rows))?;
         idx.last_dense = false;
         idx.last_nr = idx.rows.len();
         Ok((self.rows_buf.ptr() as *const u32, idx.rows.len()))
@@ -634,7 +623,7 @@ impl<'a> GpuEngine<'a> {
                 if self.rows_host.len() == pos + 1 {
                     Some((std::ptr::null(), pos + 1)) // all selected → dense fast path
                 } else {
-                    self.rows_buf.copy_in_at(0, u32_le_bytes(&self.rows_host))?;
+                    self.rows_buf.copy_in_at(0, as_le_bytes(&self.rows_host))?;
                     Some((self.rows_buf.ptr() as *const u32, self.rows_host.len()))
                 }
             }
@@ -860,8 +849,8 @@ impl<'a> GpuEngine<'a> {
                 }
                 let ndesc = self.descs_vq.len();
                 self.descs_buf
-                    .copy_in_at(0, desc_bytes_vq(&self.descs_vq))?;
-                self.wexpert_buf.copy_in_at(0, f32_le_bytes(&self.w))?;
+                    .copy_in_at(0, as_le_bytes(&self.descs_vq))?;
+                self.wexpert_buf.copy_in_at(0, as_le_bytes(&self.w))?;
                 // THE EXPERT STREAM (stream 1): each expert, once its load Signal
                 // resolves, launches its own partial on the compute stream. Concurrent
                 // loads (buffer_unordered) overlap the misses' fetch with the resident/

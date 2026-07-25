@@ -156,10 +156,6 @@ mod tier {
             // SAFETY: off+len ≤ capacity (checked); within the slab.
             Ok(unsafe { self.slab.ptr_mut().add(off) })
         }
-
-        pub fn used(&self) -> usize {
-            self.used
-        }
     }
 
     /// A standalone mutable device buffer — for per-token activations, the
@@ -346,10 +342,6 @@ mod tier {
             })
         }
 
-        /// GPU-usable pointer (device-local under unified addressing).
-        pub fn ptr(&self) -> *const u8 {
-            self.ptr
-        }
         /// Host-writable pointer — the caller fills in place (`pread`/memcpy, or an
         /// io_uring O_DIRECT DMA), no `hipMemcpy`/sync.
         ///
@@ -414,7 +406,7 @@ mod tier {
             assert_eq!(ra, &a[..]);
             assert_eq!(rb, &b[..]);
             // 1000 bumps to 1024 (256-aligned) before b lands.
-            assert_eq!(tier.used(), 1024 + 500);
+            assert_eq!(tier.used, 1024 + 500);
         }
 
         #[test]

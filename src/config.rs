@@ -83,10 +83,6 @@ pub struct Config {
     /// 2Q's A1in/A1out split (`--2q-kin` / `--2q-kout`, percentages of pool capacity).
     /// Ignored by `lru`/`arc`. Unset = [`crate::cache::TwoQSplit::default`].
     pub two_q: crate::cache::TwoQSplit,
-    /// DIAGNOSTIC (`--checksum-layer <l>`): hash every routed expert's weights on MoE
-    /// layer `l` after they land, keyed by `(layer, expert)` — the corruption probe
-    /// that caught the 2Q eviction bug. Set by `main`, not discovered.
-    pub checksum_layer: Option<usize>,
     /// DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
     pub checksum_x: bool,
     /// Routed-expert format mode (`--mode int3-vq|int4|hybrid`, default `hybrid`). See
@@ -153,7 +149,6 @@ impl Config {
             prompt,
             cache_policy,
             two_q,
-            checksum_layer: None,
             checksum_x: false,
             mode: Mode::default(),
             max_mem,

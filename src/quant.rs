@@ -16,26 +16,6 @@ pub fn read_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// One little-endian f32 scale at row `o` of the raw per-row scale bytes.
-#[inline]
-fn scale_at(scale: &[u8], o: usize) -> f32 {
-    let b = &scale[o * 4..o * 4 + 4];
-    f32::from_le_bytes([b[0], b[1], b[2], b[3]])
-}
-
-/// GEMV against a per-row **int8** matrix `W[o_dim, i_dim]` (one signed byte per
-/// weight + per-row f32 scale) — the lm_head projection to logits.
-pub fn matvec_i8(y: &mut [f32], x: &[f32], packed: &[u8], scale: &[u8], i_dim: usize) {
-    debug_assert_eq!(x.len(), i_dim);
-    for (o, (yo, row)) in y.iter_mut().zip(packed.chunks_exact(i_dim)).enumerate() {
-        let mut acc = 0.0f32;
-        for (&b, &xi) in row.iter().zip(x) {
-            acc += (b as i8) as f32 * xi;
-        }
-        *yo = acc * scale_at(scale, o);
-    }
-}
-
 /// GEMV against an **fp8-e4m3** block-scaled matrix `W[o_dim, i_dim]` — the CPU
 /// oracle the HIP `gemv_fp8` kernel (attention/dense projections) is validated
 /// against. `scale` is the F32 `weight_scale_inv`, one value per `block × block`
@@ -687,16 +667,5 @@ mod tests {
         matvec_fp8(&mut y, &x, &packed, &scale, 2, 1);
         // row0: 10·3 + 200·5 = 1030 ; row1: -1000·3 + 0·5 = -3000
         assert_eq!(y, [1030.0, -3000.0]);
-    }
-
-    #[test]
-    fn matvec_i8_matches_dot() {
-        // W=[[1,-2],[3,4]] int8, scale=[0.5,2.0], x=[1,1].
-        let packed = [1u8, (-2i8) as u8, 3, 4];
-        let scale: Vec<u8> = [0.5f32, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
-        let x = [1.0f32, 1.0];
-        let mut y = [0.0f32; 2];
-        matvec_i8(&mut y, &x, &packed, &scale, 2);
-        assert_eq!(y, [(1.0 - 2.0) * 0.5, (3.0 + 4.0) * 2.0]);
     }
 }
