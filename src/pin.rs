@@ -667,7 +667,11 @@ impl<'a> Pin<'a> {
         // format (single-format: uniform stride, so a compaction relocation is always a
         // single cheap same-size move) or int3-VQ/int4 (hybrid). The byte-aware policy
         // floats the split; a cross-tier rebalance relocates a slot.
-        let budget = capacity.saturating_sub(tier_cap);
+        // Round the pool budget DOWN to the O_DIRECT block so the arena's HIGH-end
+        // anchor is aligned: HOT slots sit at `budget − (idx+1)*hot_stride`, so an
+        // unaligned `budget` makes every hot-slot dst violate the O_DIRECT alignment
+        // the streamer asserts (base + strides are already 4096-aligned). Costs <4 KiB.
+        let budget = capacity.saturating_sub(tier_cap) & !(crate::stream::ALIGN - 1);
         let vq_tier = || -> Result<TierFmt> {
             let s = vq_src.as_ref().context("vq source missing")?;
             Ok(TierFmt {
