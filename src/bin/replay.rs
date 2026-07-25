@@ -11,9 +11,22 @@
 //!
 //! usage: replay <trace> <n_slots> [--kin <pct>] [--kout <pct>] [--sweep]
 
-use anyhow::{Context, Result, bail};
-use rivoli::cache::{Layer, Residency, TwoQSplit, replay};
+use anyhow::{Context, Result};
+use rivoli::cache::{Cache, Layer, Residency, Tier, TwoQ, TwoQSplit, replay};
+use rivoli::quant::{i4_expert_stride, vq_expert_stride};
+use std::collections::HashMap;
 use std::io::BufRead;
+
+// GLM-5.2 MoE dims — this crate targets one model, so the expert slot sizes are
+// fixed (ponytail: constants, not CLI knobs nobody varies).
+const HIDDEN: usize = 6144;
+const MOE_INTER: usize = 2048;
+/// Measured pool budget at `--max-mem 115` (98.6 GiB left after the 16.4 GiB resident
+/// tier). Overridable with `--budget-gib` for other budgets.
+const DEFAULT_BUDGET_GIB: f64 = 98.6;
+/// Compute cost of one vq3 (COLD) expert relative to an int4 (HOT) expert = 1.0.
+/// From the dot microbench: int4 decodes ~1.8× faster than int3-VQ.
+const COLD_COMPUTE: f64 = 1.8;
 
 /// One captured MoE layer, owning its keys (`Layer` borrows from these).
 struct Captured {
@@ -52,36 +65,151 @@ fn print_row(label: &str, r: Residency) {
     );
 }
 
+/// One split's confound-free result: the SAME trace, this `(n_cold, n_hot)` fixed
+/// partition. Hits/misses split by the slab (format) that served them.
+struct HybridResult {
+    hot_pct: u32,
+    n_cold: usize,
+    n_hot: usize,
+    hot_hit: u64,
+    cold_hit: u64,
+    miss_hot: u64,  // a miss whose insert landed (fetched) into the HOT/int4 slab
+    miss_cold: u64, // ... into the COLD/vq3 slab
+}
+impl HybridResult {
+    fn accesses(&self) -> u64 {
+        self.hot_hit + self.cold_hit + self.miss_hot + self.miss_cold
+    }
+    fn hit_pct(&self) -> f64 {
+        100.0 * (self.hot_hit + self.cold_hit) as f64 / self.accesses().max(1) as f64
+    }
+    /// Throughput proxy in int4-compute units (LOWER = faster). A resident hit costs
+    /// its slab's compute (int4=1.0, vq3=[`COLD_COMPUTE`]); a miss adds `miss_penalty`
+    /// (the exposed fetch + host-gated launch bubble a stream miss pays on top).
+    fn cost(&self, miss_penalty: f64) -> f64 {
+        self.hot_hit as f64
+            + self.cold_hit as f64 * COLD_COMPUTE
+            + self.miss_hot as f64 * (1.0 + miss_penalty)
+            + self.miss_cold as f64 * (COLD_COMPUTE + miss_penalty)
+    }
+}
+
+/// Replay `trace` through a fixed-partition 2Q with `n_cold`/`n_hot` slabs, mirroring
+/// `Pin::submit_spine`: touch every hit first (protect it so a same-layer miss cannot
+/// evict it), then admit the misses — each insert's tier picks its slab. `slab_of`
+/// mirrors the pin's key→slab map (a hit stays in its slab; only an evict+refetch
+/// migrates format), so hits/misses split cleanly by format. Confound-free: identical
+/// trace for every split, so only the partition varies.
+fn hybrid_replay(
+    trace: &[Layer<'_>],
+    hot_pct: u32,
+    n_cold: usize,
+    n_hot: usize,
+    kout: usize,
+) -> HybridResult {
+    let mut policy = TwoQ::fixed(n_cold, n_hot, kout);
+    let mut slab_of: HashMap<u32, bool> = HashMap::new(); // key -> is_hot
+    let (mut hot_hit, mut cold_hit, mut miss_hot, mut miss_cold) = (0u64, 0u64, 0u64, 0u64);
+    let mut misses: Vec<u32> = Vec::new();
+    for layer in trace {
+        misses.clear();
+        for &k in layer.demand {
+            if policy.get(k) {
+                if slab_of[&k] {
+                    hot_hit += 1;
+                } else {
+                    cold_hit += 1;
+                }
+                policy.protect(k);
+            } else {
+                misses.push(k);
+            }
+        }
+        for &k in &misses {
+            let (evicted, tier) = policy.insert(k);
+            if let Some(ev) = evicted {
+                slab_of.remove(&ev);
+            }
+            let is_hot = tier == Tier::Hot;
+            slab_of.insert(k, is_hot);
+            if is_hot {
+                miss_hot += 1;
+            } else {
+                miss_cold += 1;
+            }
+        }
+    }
+    HybridResult { hot_pct, n_cold, n_hot, hot_hit, cold_hit, miss_hot, miss_cold }
+}
+
+/// Sweep `--hot-pct` over the fixed trace: for each split derive `(n_cold, n_hot)`
+/// from the byte budget + the two slot strides, replay, print the format breakdown +
+/// the cost proxy, and report the min-cost split. This is the confound-free optimum
+/// the empirical bench can't give (each bench run generates a DIFFERENT trace).
+fn run_hybrid(trace: &[Layer<'_>], budget_gib: f64, kout_pct: u32, miss_penalty: f64) {
+    let vq3 = vq_expert_stride(HIDDEN, MOE_INTER);
+    let i4 = i4_expert_stride(HIDDEN, MOE_INTER);
+    let budget = (budget_gib * (1u64 << 30) as f64) as usize;
+    println!(
+        "\nhybrid sim: budget {budget_gib:.1} GiB, vq3 slot {:.1}MB / int4 slot {:.1}MB, \
+         kout {kout_pct}%, cold_compute {COLD_COMPUTE}×, miss_penalty {miss_penalty}",
+        vq3 as f64 / 1e6,
+        i4 as f64 / 1e6,
+    );
+    println!(
+        "{:>4} {:>7} {:>7} {:>8} {:>8} {:>7} {:>7} {:>6} {:>9}",
+        "hot%", "nCold", "nHot", "hotHit", "coldHit", "missH", "missC", "hit%", "cost",
+    );
+    let mut best: Option<(HybridResult, f64)> = None;
+    for hp in (20..=90).step_by(5) {
+        let hot_bytes = budget * hp / 100;
+        let n_hot = (hot_bytes / i4).max(1);
+        let n_cold = (budget.saturating_sub(hot_bytes) / vq3).max(1);
+        let kout = ((n_cold + n_hot) * kout_pct as usize / 100).max(1);
+        let r = hybrid_replay(trace, hp as u32, n_cold, n_hot, kout);
+        let cost = r.cost(miss_penalty);
+        println!(
+            "{:>3}% {:>7} {:>7} {:>8} {:>8} {:>7} {:>7} {:>5.1}% {:>9.0}",
+            hp, r.n_cold, r.n_hot, r.hot_hit, r.cold_hit, r.miss_hot, r.miss_cold, r.hit_pct(), cost,
+        );
+        if best.as_ref().is_none_or(|(_, bc)| cost < *bc) {
+            best = Some((r, cost));
+        }
+    }
+    if let Some((b, cost)) = best {
+        println!(
+            "\noptimum: hot {}% ({} cold vq3 + {} hot int4), hit {:.1}%, cost {cost:.0}",
+            b.hot_pct, b.n_cold, b.n_hot, b.hit_pct(),
+        );
+    }
+}
+
 fn main() -> Result<()> {
-    const USAGE: &str = "usage: replay <trace> <n_slots> [--kin <pct>] [--kout <pct>] [--sweep]";
+    const USAGE: &str = "usage: replay <trace> <n_slots> [--kin <pct>] [--kout <pct>] [--sweep]\n\
+                         \x20      replay <trace> --hybrid [--budget-gib <f>] [--kout <pct>] [--miss-penalty <f>]";
     let mut args = std::env::args().skip(1);
     let trace_path = args.next().context(USAGE)?;
-    let cap: usize = args
-        .next()
-        .context("n_slots required")?
-        .parse()
-        .context("n_slots must be an integer")?;
+    let mut cap: Option<usize> = None;
     let mut sweep = false;
+    let mut hybrid = false;
     let default = TwoQSplit::default();
     let (mut kin, mut kout) = (default.kin_pct(), default.kout_pct());
+    let mut budget_gib = DEFAULT_BUDGET_GIB;
+    let mut miss_penalty = 0.5;
     while let Some(a) = args.next() {
+        let mut val = |what: &str| args.next().with_context(|| format!("{what} needs a value"));
         match a.as_str() {
             "--sweep" => sweep = true,
-            "--kin" => {
-                kin = args
-                    .next()
-                    .context("--kin needs a percentage")?
-                    .parse()
-                    .context("--kin takes an integer percentage")?;
+            "--hybrid" => hybrid = true,
+            "--kin" => kin = val("--kin")?.parse().context("--kin takes an integer percentage")?,
+            "--kout" => kout = val("--kout")?.parse().context("--kout takes an integer percentage")?,
+            "--budget-gib" => budget_gib = val("--budget-gib")?.parse().context("--budget-gib takes a number")?,
+            "--miss-penalty" => {
+                miss_penalty = val("--miss-penalty")?.parse().context("--miss-penalty takes a number")?
             }
-            "--kout" => {
-                kout = args
-                    .next()
-                    .context("--kout needs a percentage")?
-                    .parse()
-                    .context("--kout takes an integer percentage")?;
+            other => {
+                cap = Some(other.parse().with_context(|| format!("unexpected arg {other}\n{USAGE}"))?)
             }
-            other => bail!("unexpected arg {other}\n{USAGE}"),
         }
     }
     let split = TwoQSplit::new(kin, kout)?;
@@ -111,6 +239,15 @@ fn main() -> Result<()> {
         .flat_map(|c| c.demand.iter().copied())
         .collect::<std::collections::HashSet<u32>>()
         .len();
+    if hybrid {
+        println!(
+            "trace {trace_path}: {} layers, {accesses} accesses, {uniq} unique experts",
+            trace.len()
+        );
+        run_hybrid(&trace, budget_gib, kout, miss_penalty);
+        return Ok(());
+    }
+    let cap = cap.context("n_slots required (or pass --hybrid)")?;
     println!(
         "trace {trace_path}: {} layers, {accesses} accesses, {uniq} unique experts, cap={cap}",
         trace.len()
