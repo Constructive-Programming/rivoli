@@ -325,12 +325,17 @@ impl Streamer {
 
 impl Drop for Streamer {
     fn drop(&mut self) {
-        // Tear the ring DOWN FIRST: io_uring teardown cancels/drains any still-in-flight
-        // reads, so a read can never DMA into the pinned arena after it's freed. The
-        // poison/panic path (asyncfetch) can drop a Streamer with reads still queued —
-        // Rust would otherwise run this whole body (the arena free) BEFORE dropping the
-        // `ring` field, i.e. free-then-drain. ManuallyDrop lets us order it correctly.
-        // SAFETY: `ring` is never touched again; `ManuallyDrop::drop` runs exactly once.
+        // Drop the ring BEFORE freeing the arena its SQEs point into. On every live path
+        // a batch is fully reaped before the Streamer drops (normal: per-batch reap;
+        // abandoned-poison: those reads complete into CQEs long before the reaper thread
+        // exits and drops this), so no read is actually in flight at this point. The
+        // ordering is belt-and-suspenders — it does NOT rely on io_uring teardown being a
+        // synchronous drain (the kernel defers cancel-and-wait to a workqueue after
+        // close()), only on not freeing first, which is strictly no worse than the
+        // reverse. Rust runs this Drop body before dropping fields, so without ManuallyDrop
+        // the arena would free first.
+        // SAFETY: `ring` is never touched again; `ManuallyDrop::drop` runs exactly once
+        // (single owner, no Clone).
         unsafe { ManuallyDrop::drop(&mut self.ring) };
         if !self.arena.is_null() {
             // SAFETY: `arena` came from rivoli_pinned_alloc, freed exactly once.
