@@ -455,7 +455,7 @@ impl Pool {
     /// Allocate a slot for a NEW `key` (miss): reuse the policy-evicted key's slot,
     /// else a free slot. The caller then fills the slot.
     fn alloc(&mut self, key: u32) -> Result<usize> {
-        let evicted = self.policy.insert(key);
+        let (evicted, _tier) = self.policy.insert(key); // _tier: milestone 2 (slab select)
         let slot = self.reuse(evicted)?;
         self.bind(key, slot);
         Ok(slot)

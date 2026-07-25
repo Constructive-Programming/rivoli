@@ -71,13 +71,25 @@ impl OrderedSet {
 /// coexist AND cold-first, so `Lru` uses the default = normal `insert`). `access_batch`
 /// runs one layer's keys two-pass (hits first, then misses), mirroring
 /// `submit_layer`. `seed` pre-fills the protected/frequency segment.
+/// Which residency tier an [`insert`](Cache::insert) landed a key in — the ONLY thing
+/// the pool needs to pick a key's slab (the format hybrid: `Hot` → int4, `Cold` →
+/// int3-VQ). A policy-agnostic residency concept, NOT a 2Q segment: `Hot` is the
+/// proven-frequent tier (2Q's Am), `Cold` the probation tier (2Q's A1in). Single-tier
+/// policies (`Lru`) and `Arc` (for now) report `Cold` — a single-format fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    Cold,
+    Hot,
+}
+
 pub trait Cache {
     fn contains(&self, k: u32) -> bool;
     fn get(&mut self, k: u32) -> bool;
-    fn insert(&mut self, k: u32) -> Option<u32>;
+    /// Admit `k`; return `(evicted resident key, the tier k landed in)`.
+    fn insert(&mut self, k: u32) -> (Option<u32>, Tier);
     /// Default = normal `insert` (correct for single-segment `Lru`: a batch coexists,
-    /// evicting old normals). Segmented policies override to force probation.
-    fn insert_cold(&mut self, k: u32) -> Option<u32> {
+    /// evicting old normals). Segmented policies override to force probation (`Cold`).
+    fn insert_cold(&mut self, k: u32) -> (Option<u32>, Tier) {
         self.insert(k)
     }
     /// Make `k` — just reported resident by [`Cache::get`] — safe from eviction by
@@ -143,12 +155,12 @@ impl Cache for Lru {
         }
         false
     }
-    fn insert(&mut self, k: u32) -> Option<u32> {
+    fn insert(&mut self, k: u32) -> (Option<u32>, Tier) {
         let ev = (self.set.len() >= self.cap)
             .then(|| self.set.pop_lru())
             .flatten();
         self.set.touch(k);
-        ev
+        (ev, Tier::Cold) // single segment → always the cold/vq3 tier
     }
     // insert_cold: uses the trait default (= insert). A single-segment recency cache
     // cannot both coexist a prefetch batch and cold-park it, so LRU prefetches land
@@ -327,14 +339,16 @@ impl Cache for TwoQ {
         }
         self.a1in.contains(k) // hit but stays put (FIFO); ghosts are not resident
     }
-    fn insert(&mut self, k: u32) -> Option<u32> {
+    fn insert(&mut self, k: u32) -> (Option<u32>, Tier) {
         let ev = self.reclaim();
-        if self.a1out.remove(k) {
-            self.am.touch(k); // second distinct access → promote to protected
+        let tier = if self.a1out.remove(k) {
+            self.am.touch(k); // second distinct access → promote to protected (Am)
+            Tier::Hot
         } else {
-            self.a1in.touch(k); // first sighting → probation FIFO
-        }
-        ev
+            self.a1in.touch(k); // first sighting → probation FIFO (A1in)
+            Tier::Cold
+        };
+        (ev, tier)
     }
     /// A1in is a FIFO and `get` deliberately leaves hits in place, so the pin's
     /// hits-before-misses ordering does not protect them on its own. Moving an
@@ -346,14 +360,14 @@ impl Cache for TwoQ {
             self.a1in.touch(k);
         }
     }
-    fn insert_cold(&mut self, k: u32) -> Option<u32> {
+    fn insert_cold(&mut self, k: u32) -> (Option<u32>, Tier) {
         // Prefetch: force into A1in probation, NEVER promoting via the A1out ghost —
         // a speculative (maybe-wrong) prediction must not enter the protected Am set.
         // A batch coexists: reclaim evicts the oldest A1in/Am, never a fresh sibling.
         let ev = self.reclaim();
         self.a1out.remove(k); // drop any stale ghost; do NOT promote
         self.a1in.touch(k);
-        ev
+        (ev, Tier::Cold)
     }
     fn seed(&mut self, keys: &[u32]) {
         for &k in keys.iter().take(self.cap) {
@@ -443,7 +457,7 @@ impl Cache for Arc {
         }
         false
     }
-    fn insert(&mut self, k: u32) -> Option<u32> {
+    fn insert(&mut self, k: u32) -> (Option<u32>, Tier) {
         let c = self.c;
         let evicted;
         if self.b1.contains(k) {
@@ -461,9 +475,11 @@ impl Cache for Arc {
         } else {
             evicted = self.admit_t1(k);
         }
-        evicted
+        // ponytail: ARC reports Cold (single-format fallback) — mapping T2→Hot is a
+        // future refinement; the format hybrid is 2Q-specific today.
+        (evicted, Tier::Cold)
     }
-    fn insert_cold(&mut self, k: u32) -> Option<u32> {
+    fn insert_cold(&mut self, k: u32) -> (Option<u32>, Tier) {
         // Prefetch: force into T1 recency probation, NEVER adapting `p` or promoting
         // via the B1/B2 ghosts — a speculative prediction must not corrupt ARC's
         // adaptation signal. Strip any stale ghost, then take the same cold-miss T1
@@ -471,7 +487,7 @@ impl Cache for Arc {
         // a fresh sibling).
         self.b1.remove(k);
         self.b2.remove(k);
-        self.admit_t1(k)
+        (self.admit_t1(k), Tier::Cold)
     }
     fn seed(&mut self, keys: &[u32]) {
         for &k in keys.iter().take(self.c) {
@@ -823,7 +839,7 @@ mod tests {
             let mut resident = std::collections::HashSet::new();
             for k in 0..200u32 {
                 if !c.get(k) {
-                    let ev = if k.is_multiple_of(3) {
+                    let (ev, _tier) = if k.is_multiple_of(3) {
                         c.insert_cold(k)
                     } else {
                         c.insert(k)
