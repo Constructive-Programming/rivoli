@@ -34,6 +34,7 @@ use anyhow::{Result, ensure};
 use io_uring::{IoUring, opcode, types};
 use std::ffi::c_void;
 use std::io;
+use std::mem::ManuallyDrop;
 use std::os::fd::RawFd;
 
 /// O_DIRECT block alignment. 4 KiB is a safe superset of any real logical block
@@ -78,7 +79,10 @@ fn min_completion(begin: usize, len: usize) -> u64 {
 /// A ring of in-flight reads. `entries` caps how many can be queued before a
 /// `reap` batch — sized to a layer's cold-read count with margin.
 pub struct Streamer {
-    ring: IoUring,
+    /// `ManuallyDrop` so `Drop` can tear the ring down BEFORE freeing the arena the
+    /// ring's SQEs point into (Rust would otherwise run the `Drop` body — the arena
+    /// free — before dropping this field). Access is transparent via `Deref`.
+    ring: ManuallyDrop<IoUring>,
     queued: u32,
     /// Bounce mode (the default): reads land in a pinned host arena and are
     /// `hipMemcpy`d into VMM. False (`--direct-vmm-dma`) = DMA straight into the
@@ -117,6 +121,15 @@ impl Streamer {
     /// workaround); false (`--direct-vmm-dma`) DMAs straight into the VMM slot (no
     /// arena allocated).
     pub fn new(entries: u32, span: usize, bounce: bool) -> Result<Self> {
+        // The bounce arena has exactly `entries` slots and `queue` indexes it by the
+        // SQE's user_data. io_uring rounds the SQ up to a power of two, so `entries` MUST
+        // be a power of two for the arena to match the SQ capacity — otherwise a push
+        // could succeed for a user_data past the arena's last slot (OOB pinned write).
+        // The sole caller passes `(top_k+4).next_power_of_two()`.
+        debug_assert!(
+            entries.is_power_of_two(),
+            "Streamer entries ({entries}) must be a power of two (arena ↔ SQ capacity)"
+        );
         // Own SQPOLL poller (sq_thread_idle 2000ms, re-armed on submit); fall back to a
         // plain ring if the kernel refuses SQPOLL (the QD1 perf arm, still correct).
         let ring = IoUring::builder()
@@ -138,7 +151,7 @@ impl Streamer {
         };
 
         Ok(Self {
-            ring,
+            ring: ManuallyDrop::new(ring),
             queued: 0,
             bounce,
             span,
@@ -182,8 +195,9 @@ impl Streamer {
         let ud = self.queued;
         // BOUNCE reads into this slot's arena window; DIRECT reads straight into dst.
         let into = if self.bounce {
-            // SAFETY: `ud < entries` (checked below via ensure on push failure); the
-            // arena owns `entries * span` bytes, so `ud * span + nbytes <= arena len`.
+            // SAFETY: `entries` is a power of two (asserted in `new`) == the io_uring SQ
+            // capacity, and the caller bounds a batch by `entries` reads, so `ud < entries`
+            // — the arena (`entries*span`, each read's `nbytes <= span`) owns this slot.
             unsafe { self.arena.add(ud as usize * self.span) }
         } else {
             dst
@@ -218,19 +232,17 @@ impl Streamer {
     /// Submit the queued reads to the kernel WITHOUT waiting, so they start running
     /// on the NVMe/DMA side immediately. The following per-read [`reap`](Self::reap)
     /// calls collect the same completions; the bookkeeping is deliberately left intact
-    /// for them. No-op if nothing is queued.
+    /// for them.
     ///
     /// Submitting here (rather than at reap time) starts the reads promptly and
     /// CONCURRENTLY — the whole batch reaches the device before any host work that
     /// follows, instead of dispatching serially at join time. The own-poller is what
     /// makes that concurrency real (see [`Streamer::new`]).
     pub fn submit(&self) -> Result<()> {
-        if self.queued == 0 {
-            return Ok(());
-        }
         // With SQPOLL this wakes the poller if idle; otherwise it does the io_uring_enter
         // submit. Either way the already-pushed SQEs are handed to the kernel and the
-        // CQEs are collected by the matching `reap` calls.
+        // CQEs are collected by the matching `reap` calls. (The sole caller only submits
+        // non-empty batches; an empty SQ would be a harmless no-op regardless.)
         self.ring
             .submit()
             .map_err(|e| anyhow::anyhow!("io_uring submit failed: {e}"))?;
@@ -254,9 +266,14 @@ impl Streamer {
             if let Some(rd) = self.next_cqe() {
                 break rd;
             }
-            self.ring
-                .submit_and_wait(1)
-                .map_err(|e| anyhow::anyhow!("io_uring wait failed: {e}"))?;
+            // Park until at least one more completion lands. A caught signal (EINTR) is
+            // benign — the batch is still queued in the kernel — so retry rather than
+            // poison the whole fetch on e.g. a SIGWINCH delivered to the reaper thread.
+            match self.ring.submit_and_wait(1) {
+                Ok(_) => {}
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
+                Err(e) => return Err(anyhow::anyhow!("io_uring wait failed: {e}")),
+            }
         };
         ensure!(
             res >= 0,
@@ -308,11 +325,17 @@ impl Streamer {
 
 impl Drop for Streamer {
     fn drop(&mut self) {
+        // Tear the ring DOWN FIRST: io_uring teardown cancels/drains any still-in-flight
+        // reads, so a read can never DMA into the pinned arena after it's freed. The
+        // poison/panic path (asyncfetch) can drop a Streamer with reads still queued —
+        // Rust would otherwise run this whole body (the arena free) BEFORE dropping the
+        // `ring` field, i.e. free-then-drain. ManuallyDrop lets us order it correctly.
+        // SAFETY: `ring` is never touched again; `ManuallyDrop::drop` runs exactly once.
+        unsafe { ManuallyDrop::drop(&mut self.ring) };
         if !self.arena.is_null() {
             // SAFETY: `arena` came from rivoli_pinned_alloc, freed exactly once.
             unsafe { ffi::rivoli_pinned_free(self.arena as *mut c_void) };
         }
-        // `ring` (IoUring) tears itself down on drop.
     }
 }
 
