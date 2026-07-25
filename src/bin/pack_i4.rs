@@ -47,8 +47,11 @@ impl Shards {
                 if name == "__metadata__" {
                     continue;
                 }
-                if let Some(off) = v.get("data_offsets").and_then(|o| o.as_array()) {
-                    let (s, e) = (off[0].as_u64().unwrap(), off[1].as_u64().unwrap());
+                if let Some((s, e)) = v
+                    .get("data_offsets")
+                    .and_then(|o| o.as_array())
+                    .and_then(|off| Some((off.first()?.as_u64()?, off.get(1)?.as_u64()?)))
+                {
                     loc.insert(name.clone(), (p.clone(), base + s, (e - s) as usize));
                 }
             }
@@ -104,7 +107,10 @@ fn main() -> Result<()> {
     }
     let (colibri, artifact) = (&args[1], &args[2]);
     let flag = |name: &str| -> Option<usize> {
-        args.iter().position(|a| a == name).map(|i| args[i + 1].parse().unwrap())
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .and_then(|s| s.parse().ok())
     };
     let cfg = ModelConfig::load(artifact).context("load artifact manifest")?;
     let (hidden, inter, ne) = (cfg.hidden, cfg.moe_inter, cfg.n_experts);

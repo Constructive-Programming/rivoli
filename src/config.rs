@@ -48,6 +48,11 @@ pub struct Config {
     pub checksum_layer: Option<usize>,
     /// DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
     pub checksum_x: bool,
+    /// Route MoE experts through the int4 (`.i4`) path instead of int3-VQ (`--i4`):
+    /// stream/decode colibri int4 experts (sequential, ~250 GB/s class) rather than
+    /// the VQ `.vq3` (gather-bound). Requires `L{l}.i4` present in the artifact. Set
+    /// by `main`, like the checksum diagnostics.
+    pub i4: bool,
     /// Device budget override, bytes (`--max-mem <GiB>`). None (default) auto-sizes to
     /// `free − OS_RESERVE`. `Some(n)` uses exactly `n` — no OS reserve; the user asked
     /// for it, so it's allowed to OOM/fail at build.
@@ -111,6 +116,7 @@ impl Config {
             two_q,
             checksum_layer: None,
             checksum_x: false,
+            i4: false,
             max_mem,
             attn,
         })

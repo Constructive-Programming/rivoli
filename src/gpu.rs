@@ -12,11 +12,12 @@ use crate::attn::{AttnMode, streaming_rows};
 use crate::device::DeviceBuf;
 use crate::gpustream::{HipEvent, HipStream, Signal, stream_signal};
 use crate::hip::{
-    ExpertDescVq, device_sync, launch_append_kv, launch_argmax, launch_attend, launch_embed_i8_row,
-    launch_gather_rope, launch_gemv_f32, launch_gemv_fp8, launch_gemv_i8, launch_index_append,
-    launch_index_head_route, launch_index_pool_push, launch_index_score, launch_layernorm,
-    launch_mla_absorb_fp8, launch_mla_value_fp8, launch_moe_expert_range, launch_moe_reduce,
-    launch_rmsnorm, launch_rope, launch_swiglu, launch_vadd,
+    ExpertDescI4, ExpertDescVq, device_sync, launch_append_kv, launch_argmax, launch_attend,
+    launch_embed_i8_row, launch_gather_rope, launch_gemv_f32, launch_gemv_fp8, launch_gemv_i8,
+    launch_index_append, launch_index_head_route, launch_index_pool_push, launch_index_score,
+    launch_layernorm, launch_mla_absorb_fp8, launch_mla_value_fp8, launch_moe_expert_range,
+    launch_moe_expert_range_i4, launch_moe_reduce, launch_rmsnorm, launch_rope, launch_swiglu,
+    launch_vadd,
 };
 use crate::math::{E4M3_BLOCK, sigmoid, topk_into};
 use crate::model::ModelConfig;
@@ -861,6 +862,10 @@ impl<'a> GpuEngine<'a> {
                     self.moe_out.ptr_mut() as *mut f32,
                 );
                 let descs_ptr = self.descs_buf.ptr() as *const ExpertDescVq;
+                // Same descriptor bytes (six device pointers, at int4 slot offsets)
+                // reinterpreted for the int4 kernel — see Pin::i4 / ExpertDescI4.
+                let descs_i4_ptr = self.descs_buf.ptr() as *const ExpertDescI4;
+                let i4 = self.pin.i4();
                 let w_ptr = self.wexpert_buf.ptr() as *const f32;
                 let (cb0, cb1, cb2) = (self.codebooks[0], self.codebooks[1], self.codebooks[2]);
                 let cs_raw = self.compute_stream.raw();
@@ -887,10 +892,17 @@ impl<'a> GpuEngine<'a> {
                             // SAFETY: descs/codebooks resident; slot loaded (sig
                             // resolved); h/part device scratch; cs_raw live.
                             unsafe {
-                                launch_moe_expert_range(
-                                    x_c, hidden, inter, e, 1, descs_ptr, cb0, cb1, cb2, w_ptr, h_c,
-                                    part_c, cs_raw,
-                                )
+                                if i4 {
+                                    launch_moe_expert_range_i4(
+                                        x_c, hidden, inter, e, 1, descs_i4_ptr, w_ptr, h_c, part_c,
+                                        cs_raw,
+                                    )
+                                } else {
+                                    launch_moe_expert_range(
+                                        x_c, hidden, inter, e, 1, descs_ptr, cb0, cb1, cb2, w_ptr,
+                                        h_c, part_c, cs_raw,
+                                    )
+                                }
                             }
                         })
                     })

@@ -25,6 +25,8 @@ struct Args {
     two_q_kin: u32,
     two_q_kout: u32,
     max_mem: Option<u64>,
+    /// Route MoE experts through the int4 (`.i4`) path instead of int3-VQ (`--i4`).
+    i4: bool,
     /// Attention mode (`--attn auto|dense|streaming|dsa|misa`). `auto` picks `dsa`
     /// when the artifact carries indexer weights, else `dense`.
     attn: String,
@@ -52,6 +54,7 @@ fn parse_args() -> Result<Args> {
         two_q_kin: rivoli::cache::TwoQSplit::default().kin_pct(),
         two_q_kout: rivoli::cache::TwoQSplit::default().kout_pct(),
         max_mem: None,
+        i4: false,
         attn: "auto".to_string(),
         sinks: 4,
         window: 8192,
@@ -67,6 +70,7 @@ fn parse_args() -> Result<Args> {
                 a.bench = Some(n.parse().context("-bench takes an integer")?);
             }
             "--direct-vmm-dma" => a.direct_vmm_dma = true,
+            "--i4" => a.i4 = true,
             "--trace" => a.trace = Some(args.next().context("--trace requires a path")?),
             "--prompt" => a.prompt = Some(args.next().context("--prompt requires text")?),
             "--cache-policy" => {
@@ -189,6 +193,7 @@ fn main() -> Result<()> {
     {
         cfg.checksum_x = checksum_x;
     }
+    cfg.i4 = a.i4;
 
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -287,6 +292,7 @@ fn main() -> Result<()> {
             &cfg.cache_policy,
             cfg.two_q,
             want_indexer,
+            cfg.i4,
         )?;
         info!("pin built in {:.1}s", t.elapsed().as_secs_f64());
         let max_ctx = prompt_ids.len() + ngen + 1;

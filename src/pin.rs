@@ -19,10 +19,43 @@
 use crate::asyncfetch::{AsyncFetch, ReadSpec};
 use crate::cache;
 use crate::device::{DeviceTier, VmmBuf};
-use crate::format::{Dtype, FormatMeta, Safetensors, Vq3Set, load_codebooks};
+use crate::format::{Dtype, FormatMeta, I4Set, Safetensors, Vq3Set, load_codebooks};
 use crate::gpustream::Signal;
 use crate::model::ModelConfig;
-use crate::quant::{VQ_DIM, VQ_K, vq_expert_bytes, vq_expert_layout, vq_proj_bytes, vq_row_bytes};
+use crate::quant::{
+    VQ_DIM, VQ_K, i4_expert_bytes, i4_slot_offsets, vq_expert_bytes, vq_expert_layout,
+    vq_proj_bytes, vq_row_bytes,
+};
+
+/// The routed-expert streaming source: `.vq3` (int3-VQ) or `.i4` (colibri int4).
+/// Owns the O_DIRECT fds that back `moe_table`, and answers the format-independent
+/// pool queries. All-int4 vs int3-vq is a whole-run mode; the per-expert hybrid
+/// (warm=i4/cold=vq) will later hold both and pick per read.
+enum MoeSrc {
+    Vq3(Vq3Set),
+    I4(I4Set),
+}
+
+impl MoeSrc {
+    fn read_spec(&self, layer: usize, expert: usize) -> Result<(RawFd, usize, usize)> {
+        match self {
+            MoeSrc::Vq3(s) => s.read_spec(layer, expert),
+            MoeSrc::I4(s) => s.read_spec(layer, expert),
+        }
+    }
+    fn shared_block(&self, layer: usize) -> Result<Vec<u8>> {
+        match self {
+            MoeSrc::Vq3(s) => s.shared_block(layer),
+            MoeSrc::I4(s) => s.shared_block(layer),
+        }
+    }
+    fn expert_slot(&self) -> usize {
+        match self {
+            MoeSrc::Vq3(s) => s.expert_slot(),
+            MoeSrc::I4(s) => s.expert_slot(),
+        }
+    }
+}
 use crate::stream::{Streamer, slot_span};
 use anyhow::{Context, Result, bail, ensure};
 use std::os::fd::RawFd;
@@ -141,17 +174,21 @@ pub struct Pin<'a> {
     #[allow(dead_code)] // RAII owner of the pool slab; addressed via `lru_pool.ptr()`
     lru_pool: VmmBuf,
     expert_slot: usize,
-    /// The `.vq3` streaming source — its O_DIRECT fds back every `moe_table` read.
-    /// Held for the run; not read through after `build` populated the table.
+    /// The routed-expert streaming source (`.vq3` or `.i4`) — its O_DIRECT fds back
+    /// every `moe_table` read. Held for the run (fd owner); not read through after
+    /// `build` populated the table.
     #[allow(dead_code)]
-    vq: Vq3Set,
+    src: MoeSrc,
+    /// True when routed experts are int4 (`.i4`): gpu.rs launches the int4 MoE kernel
+    /// (no codebooks) and reinterprets each descriptor as `ExpertDescI4`.
+    i4: bool,
     /// Per-(MoE layer, expert) cold-read spec `(fd, begin, len)`, indexed by
     /// `(layer - dense_layers) * n_experts + expert`. One aligned read per expert.
     moe_table: Vec<(RawFd, usize, usize)>,
-    /// The six slot-relative byte offsets `[gate.idx, gate.sc, up.idx, up.sc,
-    /// down.idx, down.sc]` of a VQ expert block — identical for every expert (fixed
-    /// layout), so stored once here rather than per `moe_table` row.
-    vq_off: [usize; 6],
+    /// The six slot-relative byte offsets of an expert block — `[gate.idx, gate.sc,
+    /// up.idx, up.sc, down.idx, down.sc]` for VQ, or `[gate.packed, gate.scale, …]`
+    /// for int4. Fixed per expert, stored once. Selected by the mode at build.
+    slot_off: [usize; 6],
     /// Adaptive routed tier: (layer,expert) -> slot, policy-evicted (`--cache-policy`).
     pool: Pool,
     /// Per-expert async cold-fetch: owns the io_uring demand ring on a reaper thread
@@ -245,18 +282,20 @@ fn place_dense_mlp(
     })
 }
 
-/// Place a VQ shared-expert `block` (gate‖up‖down) resident and resolve it to an
-/// `MlpVq`. Its sub-offsets are the routed-expert layout ([`vq_slot_offsets`]).
+/// Place a shared-expert `block` (gate‖up‖down) resident and resolve it to an
+/// `MlpVq` (a carrier of six device pointers — for int4 `scales` holds the f32
+/// per-row-scale address, reinterpreted at the launch site). `off` = the format's
+/// slot offsets (VQ or int4), so the same code places either.
 fn place_vq_shared(
     tier: &mut DeviceTier,
     block: &[u8],
+    off: &[usize; 6],
     hidden: usize,
     moe_inter: usize,
 ) -> Result<MlpVq> {
     let dst = tier.reserve(block.len())?;
     // SAFETY: dst owns block.len() reserved bytes.
     unsafe { std::ptr::copy_nonoverlapping(block.as_ptr(), dst, block.len()) };
-    let off = vq_slot_offsets(hidden, moe_inter);
     let vw = |ioff: usize, soff: usize, o_dim: usize, i_dim: usize| VqWeight {
         // SAFETY: offsets lie within the block just copied into the tier.
         indices: unsafe { dst.add(ioff) },
@@ -463,6 +502,7 @@ impl<'a> Pin<'a> {
         cache_policy: &str,
         two_q: cache::TwoQSplit,
         want_indexer: bool,
+        i4: bool,
     ) -> Result<Self> {
         // ponytail: no free-memory pre-check — the budget is the user's literal
         // request (--max-mem), so let the device allocation itself OOM/fail.
@@ -483,14 +523,29 @@ impl<'a> Pin<'a> {
         // the fp8 stash — see bin/add_indexer). The .vq3/codebooks files are ignored.
         let st = Safetensors::open_dir(dir)?;
         let cbs = load_codebooks(dir)?;
-        let vq = Vq3Set::open(
-            dir,
-            cfg.dense_layers,
-            cfg.n_layers,
-            cfg.n_experts,
-            cfg.hidden,
-            cfg.moe_inter,
-        )?;
+        // Routed-expert source + its slot layout: int4 (.i4) or int3-VQ (.vq3). The
+        // whole-run mode; both file sets sit in the artifact side by side.
+        let (src, slot_off) = if i4 {
+            let s = I4Set::open(
+                dir,
+                cfg.dense_layers,
+                cfg.n_layers,
+                cfg.n_experts,
+                cfg.hidden,
+                cfg.moe_inter,
+            )?;
+            (MoeSrc::I4(s), i4_slot_offsets(cfg.hidden, cfg.moe_inter))
+        } else {
+            let s = Vq3Set::open(
+                dir,
+                cfg.dense_layers,
+                cfg.n_layers,
+                cfg.n_experts,
+                cfg.hidden,
+                cfg.moe_inter,
+            )?;
+            (MoeSrc::Vq3(s), vq_slot_offsets(cfg.hidden, cfg.moe_inter))
+        };
 
         // Full layers own a resident DSA indexer (dsa/misa modes). Empty when
         // dense/streaming — the mask drives both placement and the footprint.
@@ -515,14 +570,17 @@ impl<'a> Pin<'a> {
 
         // Codebooks resident (gate/up/down), narrowed f32 → fp16 at load and passed
         // to launch_moe_expert_range. fp16 halves the hot idx→cb gather into L1.
+        // int4 experts decode without a codebook, so skip the upload in that mode.
         let mut codebooks = [std::ptr::null(); 3];
-        for (i, cb) in cbs.iter().enumerate() {
-            let half: Vec<u16> = cb.iter().map(|&v| crate::math::f32_to_f16(v)).collect();
-            let bytes = half.len() * 2;
-            let dst = tier.reserve(bytes)?;
-            // SAFETY: dst owns bytes just reserved; u16 LE host == LE device.
-            unsafe { std::ptr::copy_nonoverlapping(half.as_ptr() as *const u8, dst, bytes) };
-            codebooks[i] = dst as *const u16;
+        if !i4 {
+            for (i, cb) in cbs.iter().enumerate() {
+                let half: Vec<u16> = cb.iter().map(|&v| crate::math::f32_to_f16(v)).collect();
+                let bytes = half.len() * 2;
+                let dst = tier.reserve(bytes)?;
+                // SAFETY: dst owns bytes just reserved; u16 LE host == LE device.
+                unsafe { std::ptr::copy_nonoverlapping(half.as_ptr() as *const u8, dst, bytes) };
+                codebooks[i] = dst as *const u16;
+            }
         }
 
         // Global tensors.
@@ -560,7 +618,7 @@ impl<'a> Pin<'a> {
                 );
                 moe_bias.push(bias);
                 let shared =
-                    place_vq_shared(&mut tier, &vq.shared_block(l)?, cfg.hidden, cfg.moe_inter)?;
+                    place_vq_shared(&mut tier, &src.shared_block(l)?, &slot_off, cfg.hidden, cfg.moe_inter)?;
                 LayerMlp::Moe { gate_w, shared }
             };
             layers.push(LayerPin {
@@ -586,11 +644,10 @@ impl<'a> Pin<'a> {
             });
         }
 
-        // Routed pool: each `.vq3` expert is ONE aligned block read into a slot of
-        // `expert_slot` bytes. Size the pool to the budget left after the resident set.
-        let expert_slot = vq.expert_slot();
-        let vq_off = vq_slot_offsets(cfg.hidden, cfg.moe_inter);
-        let moe_table = build_moe_table(&vq, cfg)?;
+        // Routed pool: each expert (.vq3 or .i4) is ONE aligned block read into a slot
+        // of `expert_slot` bytes. Size the pool to the budget left after the resident set.
+        let expert_slot = src.expert_slot();
+        let moe_table = build_moe_table(&src, cfg)?;
         let budget = capacity.saturating_sub(tier_cap);
         let n_slots = (budget / expert_slot).max(cfg.top_k);
         let lru_pool = VmmBuf::new(n_slots * expert_slot)?; // ONE slab
@@ -608,8 +665,13 @@ impl<'a> Pin<'a> {
             "io_uring ring {ring} too small for top_k {}",
             cfg.top_k,
         );
-        // Bounce span = the whole expert block (one read).
-        let span = slot_span(vq_expert_bytes(cfg.hidden, cfg.moe_inter));
+        // Bounce span = the whole expert block (one read); int4 blocks are larger.
+        let ebytes = if i4 {
+            i4_expert_bytes(cfg.hidden, cfg.moe_inter)
+        } else {
+            vq_expert_bytes(cfg.hidden, cfg.moe_inter)
+        };
+        let span = slot_span(ebytes);
         let fetch = AsyncFetch::new(Streamer::new(ring as u32, span, bounce)?)?;
 
         Ok(Self {
@@ -623,9 +685,10 @@ impl<'a> Pin<'a> {
             codebooks,
             lru_pool,
             expert_slot,
-            vq,
+            src,
+            i4,
             moe_table,
-            vq_off,
+            slot_off,
             pool,
             fetch,
             slot_collisions: 0,
@@ -647,8 +710,15 @@ impl<'a> Pin<'a> {
     }
 
     /// The three per-projection codebooks (gate/up/down), fp16, for `launch_moe_expert_range`.
+    /// Null pointers in int4 mode (int4 decodes without a codebook).
     pub fn codebooks(&self) -> [*const u16; 3] {
         self.codebooks
+    }
+
+    /// True when routed experts are int4 (`.i4`): gpu.rs launches the int4 MoE kernel
+    /// and reinterprets each expert descriptor as `ExpertDescI4`.
+    pub fn i4(&self) -> bool {
+        self.i4
     }
 
     /// Accumulated reaper fetch wall (ns) — the off-main-thread load cost the expert
@@ -761,7 +831,7 @@ impl<'a> Pin<'a> {
         let (down_o, down_i) = (cfg.hidden, cfg.moe_inter);
         let slab = self.lru_pool.ptr();
         let es = self.expert_slot;
-        let o = self.vq_off;
+        let o = self.slot_off;
         out.clear();
         for (i, _e) in sel.iter().enumerate() {
             let slot = slots[i].context("submit_layer: unresolved expert slot")?;
@@ -788,12 +858,12 @@ impl<'a> Pin<'a> {
 /// `(layer - dense_layers) * n_experts + expert`. Each `.vq3` expert is a single
 /// O_DIRECT-aligned block, so this is just [`Vq3Set::read_spec`] tabulated (the
 /// range/dim checks run at `Vq3Set::open`).
-fn build_moe_table(vq: &Vq3Set, cfg: &ModelConfig) -> Result<Vec<(RawFd, usize, usize)>> {
+fn build_moe_table(src: &MoeSrc, cfg: &ModelConfig) -> Result<Vec<(RawFd, usize, usize)>> {
     let n_moe = cfg.n_layers - cfg.dense_layers;
     let mut table = Vec::with_capacity(n_moe * cfg.n_experts);
     for l in cfg.dense_layers..cfg.n_layers {
         for e in 0..cfg.n_experts {
-            table.push(vq.read_spec(l, e)?);
+            table.push(src.read_spec(l, e)?);
         }
     }
     Ok(table)
