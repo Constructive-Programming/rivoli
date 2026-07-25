@@ -21,21 +21,21 @@ use std::collections::{BTreeMap, HashMap};
 /// Recency-ordered set of keys: O(log n) MRU-insert / arbitrary-remove / pop-LRU
 /// via a monotonic tick clock + a `BTreeMap` whose front is the LRU end.
 #[derive(Default)]
-struct OrderedSet {
+pub(crate) struct OrderedSet {
     at: HashMap<u32, i64>,
     order: BTreeMap<i64, u32>,
     clock: i64, // ascending MRU inserts
 }
 
 impl OrderedSet {
-    fn contains(&self, k: u32) -> bool {
+    pub(crate) fn contains(&self, k: u32) -> bool {
         self.at.contains_key(&k)
     }
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.at.len()
     }
     /// Insert `k`, or move it to the MRU end if already present.
-    fn touch(&mut self, k: u32) {
+    pub(crate) fn touch(&mut self, k: u32) {
         self.clock += 1;
         if let Some(&t) = self.at.get(&k) {
             self.order.remove(&t);
@@ -43,7 +43,7 @@ impl OrderedSet {
         self.at.insert(k, self.clock);
         self.order.insert(self.clock, k);
     }
-    fn remove(&mut self, k: u32) -> bool {
+    pub(crate) fn remove(&mut self, k: u32) -> bool {
         if let Some(t) = self.at.remove(&k) {
             self.order.remove(&t);
             return true;
@@ -51,11 +51,16 @@ impl OrderedSet {
         false
     }
     /// Evict and return the LRU (oldest) key.
-    fn pop_lru(&mut self) -> Option<u32> {
+    pub(crate) fn pop_lru(&mut self) -> Option<u32> {
         let (&t, &k) = self.order.iter().next()?;
         self.order.remove(&t);
         self.at.remove(&k);
         Some(k)
+    }
+    /// The LRU (oldest) key and its tick, without removing — for cross-set recency
+    /// comparison (the hybrid LRU picks the globally oldest across both tiers).
+    pub(crate) fn peek_lru(&self) -> Option<(i64, u32)> {
+        self.order.iter().next().map(|(&t, &k)| (t, k))
     }
 }
 
