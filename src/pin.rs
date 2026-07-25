@@ -751,9 +751,8 @@ impl<'a> Pin<'a> {
             let policy: Box<dyn cache::Cache> = match cache_policy {
                 "2q" => Box::new(cache::TwoQ::fixed(n_cold, n_hot, kout)),
                 "arc" => Box::new(cache::Arc::fixed(n_cold, n_hot, kout)),
-                other => bail!(
-                    "hybrid: --cache-policy {other:?} not yet supported (use 2q/arc; lru pending)"
-                ),
+                "lru" => Box::new(cache::Lru::fixed(n_cold, n_hot)),
+                other => bail!("hybrid: unknown --cache-policy {other:?} (lru|2q|arc)"),
             };
             tracing::info!("routed pool [{cache_policy} hybrid]: {n_cold} COLD vq3 + {n_hot} HOT int4 slots");
             let (cold, hot) = (vq_slab(n_cold)?, i4_slab(n_hot)?);

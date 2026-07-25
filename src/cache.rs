@@ -130,25 +130,85 @@ pub trait Cache {
 }
 
 // ---------------------------------------------------------------------------
-// LRU — pure recency (mirrors the pin's original hand-rolled Lru).
+// LRU — pure recency (mirrors the pin's original hand-rolled Lru). In the format
+// hybrid it gains a FREQUENCY-COUNTER admission layer (LRU has no ghost/frequency
+// signal of its own): LRU still evicts (per segment), a decaying per-key count
+// decides placement. See MODES.md.
 // ---------------------------------------------------------------------------
+/// Recent-frequency threshold: a miss whose key has been accessed ≥ this many times
+/// within the current decay window is admitted to HOT/int4, else COLD/vq3.
+const LRU_HOT_THRESHOLD: u32 = 2;
+
 pub struct Lru {
     cap: usize,
-    set: OrderedSet,
+    /// `None` = pure LRU (one segment). `Some((n_cold, n_hot))` = FIXED PARTITION for
+    /// the hybrid: `set` = COLD/vq3 (cap n_cold), `hot` = HOT/int4 (cap n_hot), and
+    /// `freq` gates admission. Each segment is an independent LRU, so an insert only
+    /// evicts from the tier it enters → evicted_tier == insert_tier.
+    fixed: Option<(usize, usize)>,
+    set: OrderedSet, // dynamic: the pool; fixed: the COLD segment
+    hot: OrderedSet, // fixed only: the HOT segment
+    /// Fixed only: decayed per-key access count (recent frequency). Halved every `cap`
+    /// accesses so a cooled expert falls below threshold instead of staying
+    /// HOT-eligible forever (all-time counts would collapse the split to all-int4).
+    freq: HashMap<u32, u32>,
+    accesses: u64,
 }
 impl Lru {
     pub fn new(cap: usize) -> Self {
         Self {
-            cap,
+            cap: cap.max(1),
+            fixed: None,
             set: OrderedSet::default(),
+            hot: OrderedSet::default(),
+            freq: HashMap::new(),
+            accesses: 0,
+        }
+    }
+
+    /// Fixed-partition LRU for the format hybrid: `n_cold` = COLD/vq3 cap, `n_hot` =
+    /// HOT/int4 cap. Placement is by recent frequency; eviction is per-segment LRU.
+    pub fn fixed(n_cold: usize, n_hot: usize) -> Self {
+        Self {
+            cap: (n_cold + n_hot).max(1),
+            fixed: Some((n_cold.max(1), n_hot.max(1))),
+            set: OrderedSet::default(),
+            hot: OrderedSet::default(),
+            freq: HashMap::new(),
+            accesses: 0,
+        }
+    }
+
+    /// Count one access to `k` and periodically decay (halve) all counts so the signal
+    /// tracks RECENT frequency. Fixed-partition only; called once per access (in `get`).
+    fn bump(&mut self, k: u32) {
+        *self.freq.entry(k).or_insert(0) += 1;
+        self.accesses += 1;
+        if self.accesses % self.cap as u64 == 0 {
+            self.freq.retain(|_, v| {
+                *v /= 2;
+                *v > 0
+            });
         }
     }
 }
 impl Cache for Lru {
     fn contains(&self, k: u32) -> bool {
-        self.set.contains(k)
+        self.set.contains(k) || self.hot.contains(k)
     }
     fn get(&mut self, k: u32) -> bool {
+        if self.fixed.is_some() {
+            self.bump(k); // one count per access; a hit stays in its segment (no migration)
+            if self.set.contains(k) {
+                self.set.touch(k);
+                return true;
+            }
+            if self.hot.contains(k) {
+                self.hot.touch(k);
+                return true;
+            }
+            return false;
+        }
         if self.set.contains(k) {
             self.set.touch(k);
             return true;
@@ -156,22 +216,43 @@ impl Cache for Lru {
         false
     }
     fn insert(&mut self, k: u32) -> (Option<u32>, Tier) {
-        let ev = (self.set.len() >= self.cap)
-            .then(|| self.set.pop_lru())
-            .flatten();
-        self.set.touch(k);
-        (ev, Tier::Cold) // single segment → always the cold/vq3 tier
+        if let Some((n_cold, n_hot)) = self.fixed {
+            // Miss (get already counted this access). Recent frequency picks the tier;
+            // evict the chosen segment's LRU so evicted_tier == insert_tier.
+            if self.freq.get(&k).copied().unwrap_or(0) >= LRU_HOT_THRESHOLD {
+                let ev = (self.hot.len() >= n_hot).then(|| self.hot.pop_lru()).flatten();
+                self.hot.touch(k);
+                (ev, Tier::Hot)
+            } else {
+                let ev = (self.set.len() >= n_cold).then(|| self.set.pop_lru()).flatten();
+                self.set.touch(k);
+                (ev, Tier::Cold)
+            }
+        } else {
+            let ev = (self.set.len() >= self.cap).then(|| self.set.pop_lru()).flatten();
+            self.set.touch(k);
+            (ev, Tier::Cold) // single segment → always the cold/vq3 tier
+        }
     }
-    // insert_cold: uses the trait default (= insert). A single-segment recency cache
-    // cannot both coexist a prefetch batch and cold-park it, so LRU prefetches land
-    // as normal MRU inserts (they decay normally if unused). Use 2q/arc to cold-park.
-    fn seed(&mut self, keys: &[u32]) {
-        for &k in keys.iter().take(self.cap) {
+    fn protect(&mut self, k: u32) {
+        // Mirror 2Q/ARC: keep an actively-used COLD hit off the block this batch. HOT
+        // hits are already MRU-refreshed by `get`.
+        if self.fixed.is_some() && self.set.contains(k) {
             self.set.touch(k);
         }
     }
+    // insert_cold: uses the trait default (= insert). A recency cache cannot both
+    // coexist a prefetch batch and cold-park it, so LRU prefetches land as normal
+    // inserts (they decay if unused). Use 2q/arc to cold-park.
+    fn seed(&mut self, keys: &[u32]) {
+        // Seed the frequent segment when partitioned, else the single pool.
+        let dst = if self.fixed.is_some() { &mut self.hot } else { &mut self.set };
+        for &k in keys.iter().take(self.cap) {
+            dst.touch(k);
+        }
+    }
     fn resident_len(&self) -> usize {
-        self.set.len()
+        self.set.len() + self.hot.len()
     }
 }
 
@@ -972,6 +1053,67 @@ mod tests {
             }
         }
         assert!(tier_of.values().any(|&t| t == Tier::Hot), "no key ever promoted to Hot");
+    }
+
+    // Fixed-partition LRU (frequency-counter admission): the same slab invariant
+    // (evicted_tier == insert_tier, caps hold) under a SKEWED workload — hot keys 0/1
+    // reused each pass with ≥n_cold fillers between reuses, so they evict from COLD,
+    // re-miss, and promote to HOT (a uniform workload never promotes — correctly).
+    #[test]
+    fn lru_fixed_partition_evicts_same_tier() {
+        use std::collections::HashMap;
+        let (n_cold, n_hot) = (8usize, 16usize);
+        let mut c = Lru::fixed(n_cold, n_hot);
+        let mut tier_of: HashMap<u32, Tier> = HashMap::new();
+
+        fn touch(c: &mut Lru, k: u32, tier_of: &mut HashMap<u32, Tier>, n_cold: usize, n_hot: usize) {
+            if c.get(k) {
+                return;
+            }
+            let (ev, tier) = c.insert(k);
+            if let Some(ev) = ev {
+                assert_eq!(
+                    tier_of.remove(&ev),
+                    Some(tier),
+                    "evicted {ev} was not in the {tier:?} tier that {k} entered"
+                );
+            }
+            tier_of.insert(k, tier);
+            let hot = tier_of.values().filter(|&&t| t == Tier::Hot).count();
+            let cold = tier_of.values().filter(|&&t| t == Tier::Cold).count();
+            assert!(hot <= n_hot && cold <= n_cold, "over cap: hot {hot} cold {cold}");
+            assert_eq!(hot + cold, c.resident_len(), "tier tally != resident_len");
+        }
+
+        for pass in 0..12u32 {
+            touch(&mut c, 0, &mut tier_of, n_cold, n_hot);
+            touch(&mut c, 1, &mut tier_of, n_cold, n_hot);
+            for f in 0..(n_cold as u32 + 2) {
+                touch(&mut c, 1000 + pass * 100 + f, &mut tier_of, n_cold, n_hot);
+            }
+            // second reuse after the fillers evicted them → re-miss, freq climbs → HOT
+            touch(&mut c, 0, &mut tier_of, n_cold, n_hot);
+            touch(&mut c, 1, &mut tier_of, n_cold, n_hot);
+        }
+        assert!(tier_of.values().any(|&t| t == Tier::Hot), "no key ever promoted to Hot");
+    }
+
+    // A first-seen key admits COLD; a key re-accessed after eviction (freq crosses the
+    // threshold) admits HOT — the whole point of frequency-counter admission. n_cold=1
+    // so a cold key evicts on the very next cold miss, giving a clean re-miss on `x`.
+    #[test]
+    fn lru_hybrid_admits_by_frequency() {
+        let mut c = Lru::fixed(1, 4); // cap 5 → decay only at 5 accesses; we stay under
+        let x = 10u32;
+        // First access to x: miss → COLD (freq 1).
+        assert!(!c.get(x));
+        assert_eq!(c.insert(x).1, Tier::Cold, "first-seen must admit COLD");
+        // A different cold key evicts x from the 1-slot COLD segment.
+        assert!(!c.get(20));
+        assert_eq!(c.insert(20).1, Tier::Cold);
+        // Second access to x: now a miss (evicted) with freq 2 → HOT.
+        assert!(!c.get(x));
+        assert_eq!(c.insert(x).1, Tier::Hot, "a re-accessed key must admit HOT");
     }
 
     /// `replay` must model the prefetch admission path the live engine depends on:
