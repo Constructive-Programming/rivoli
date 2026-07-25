@@ -147,28 +147,6 @@ pub struct VqProj<'a> {
     pub i_dim: usize,
 }
 
-impl VqProj<'_> {
-    /// `y[o] = Σ_subvec scale · codebook[idx]·x`. Decodes the borrowed bf16 scale
-    /// bytes into a scratch and dispatches to [`matvec_vq`] — the CPU reference the
-    /// HIP VQ kernel is validated against, not the perf hot path.
-    pub fn gemv(&self, x: &[f32], codebook: &[f32], y: &mut [f32]) {
-        let scales: Vec<u16> = self
-            .scales
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
-        matvec_vq(
-            y,
-            x,
-            self.indices,
-            &scales,
-            codebook,
-            self.o_dim,
-            self.i_dim,
-        );
-    }
-}
-
 /// Slice expert `e`'s three [`VqProj`] out of a per-layer `.vq3` buffer (`n_experts`
 /// blocks at [`vq_expert_stride`]). The layout the converter writes: each expert is
 /// `gate ‖ up ‖ down`, each projection indices-then-scales.
@@ -236,22 +214,6 @@ pub fn dequant_fp8_block(
     out
 }
 
-/// Nearest codebook entry (by squared Euclidean distance) to a `VQ_DIM`-subvector.
-/// `codebook` is `VQ_K · VQ_DIM` f32, row-major. The converter's per-subvector
-/// encode; ties break to the lowest index (deterministic).
-pub fn vq_nearest(sub: &[f32], codebook: &[f32]) -> u16 {
-    debug_assert_eq!(sub.len(), VQ_DIM);
-    debug_assert_eq!(codebook.len(), VQ_K * VQ_DIM);
-    let mut best = (f32::INFINITY, 0u16);
-    for k in 0..VQ_K {
-        let c = &codebook[k * VQ_DIM..(k + 1) * VQ_DIM];
-        let d: f32 = sub.iter().zip(c).map(|(&a, &b)| (a - b) * (a - b)).sum();
-        if d < best.0 {
-            best = (d, k as u16);
-        }
-    }
-    best.1
-}
 
 /// Quantize a row-major f32 weight matrix `W[o_dim, i_dim]` to VQ-int3 against a
 /// learned `codebook` (`VQ_K · VQ_DIM` f32). Returns `(indices, scales)`: `indices`
@@ -557,7 +519,11 @@ mod tests {
             let x: Vec<f32> = (0..*i_dim).map(|k| (k + 1) as f32).collect();
             let mut y_load = vec![0.0f32; *o_dim];
             let mut y_ref = vec![0.0f32; *o_dim];
-            proj.gemv(&x, &cb, &mut y_load);
+            // GEMV the SLICED projection (decoding its borrowed bf16 scale bytes) and
+            // the ORIGINAL arrays — the converter→loader byte contract for an expert.
+            let ps: Vec<u16> =
+                proj.scales.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            matvec_vq(&mut y_load, &x, proj.indices, &ps, &cb, proj.o_dim, proj.i_dim);
             matvec_vq(&mut y_ref, &x, indices, scales, &cb, *o_dim, *i_dim);
             assert_eq!(y_load, y_ref);
         }
@@ -576,18 +542,6 @@ mod tests {
         for (k, &v) in vals.iter().enumerate() {
             assert_eq!(get_idx(&row, k), v as usize, "slot {k}");
         }
-    }
-
-    #[test]
-    fn vq_nearest_picks_closest_and_ties_low() {
-        let cb = tiny_codebook(&[
-            [0.0, 0.0, 0.0, 0.0],
-            [1.0, 1.0, 1.0, 1.0],
-            [1.0, 1.0, 1.0, 1.0],
-        ]);
-        assert_eq!(vq_nearest(&[0.1, 0.0, 0.0, 0.0], &cb), 0); // nearest 0
-        assert_eq!(vq_nearest(&[0.9, 1.0, 1.0, 1.0], &cb), 1); // nearest 1
-        assert_eq!(vq_nearest(&[1.0, 1.0, 1.0, 1.0], &cb), 1); // exact tie 1==2 → lowest
     }
 
     #[test]

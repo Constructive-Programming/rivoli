@@ -2,19 +2,6 @@
 //! these are the oracle the HIP kernels are validated against (M2), not the
 //! shipped compute. Everything operates on `f32` slices in place where it can.
 
-/// RMSNorm in place: `v = v / sqrt(mean(v²) + eps) * weight`. The mean is fully
-/// computed before any write, so a single mutable slice is sound (callers that
-/// need the input preserved copy it into the destination first).
-pub fn rmsnorm(v: &mut [f32], weight: &[f32], eps: f32) {
-    debug_assert_eq!(weight.len(), v.len());
-    let n = v.len() as f32;
-    let ms = v.iter().map(|&x| x * x).sum::<f32>() / n;
-    let inv = 1.0 / (ms + eps).sqrt();
-    for (vi, &w) in v.iter_mut().zip(weight) {
-        *vi = *vi * inv * w;
-    }
-}
-
 /// SiLU (a.k.a. swish): `x * sigmoid(x)`.
 #[inline]
 pub fn silu(x: f32) -> f32 {
@@ -152,27 +139,6 @@ pub fn f32_to_e4m3(x: f32) -> u8 {
 /// (DeepSeek's 1×128 tile quantization). `kv_lora_rank` must be a multiple.
 pub const E4M3_BLOCK: usize = 128;
 
-/// Block-quantize a latent row (`len` a multiple of [`E4M3_BLOCK`]) into fp8:
-/// per 128-element block, scale = amax/448, then each value → e4m3(v/scale).
-/// Writes `len` bytes into `data` and `len/128` scales into `scales`.
-pub fn quantize_latent_fp8(latent: &[f32], data: &mut [u8], scales: &mut [f32]) {
-    debug_assert_eq!(latent.len() % E4M3_BLOCK, 0);
-    debug_assert_eq!(data.len(), latent.len());
-    debug_assert_eq!(scales.len(), latent.len() / E4M3_BLOCK);
-    for (b, blk) in latent.chunks_exact(E4M3_BLOCK).enumerate() {
-        let amax = blk.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
-        // amax==0 → the block is all zeros; any positive scale reproduces them.
-        let scale = if amax > 0.0 { amax / E4M3_MAX } else { 1.0 };
-        scales[b] = scale;
-        // Divide (not multiply-by-reciprocal) to match the device kernel's
-        // `latent[i] / scl` exactly — a single correctly-rounded op, so
-        // host- and device-quantized bytes agree bit-for-bit.
-        for (i, &x) in blk.iter().enumerate() {
-            data[b * E4M3_BLOCK + i] = f32_to_e4m3(x / scale);
-        }
-    }
-}
-
 /// Widen OCP `float8_e4m3` → f32 (exact). Mirror of [`f32_to_e4m3`].
 pub fn e4m3_to_f32(b: u8) -> f32 {
     let sign = if b & 0x80 != 0 { -1.0f32 } else { 1.0 };
@@ -185,21 +151,6 @@ pub fn e4m3_to_f32(b: u8) -> f32 {
         f32::NAN
     } else {
         sign * (1.0 + mant / 8.0) * 2f32.powi(exp - 7)
-    }
-}
-
-/// LayerNorm in place: `v = (v - mean) / sqrt(var + eps) * weight + bias`.
-/// The DSA indexer's `k_norm` is a true LayerNorm (it ships a bias), unlike
-/// every other norm in the model (RMSNorm).
-pub fn layernorm(v: &mut [f32], weight: &[f32], bias: &[f32], eps: f32) {
-    debug_assert_eq!(weight.len(), v.len());
-    debug_assert_eq!(bias.len(), v.len());
-    let n = v.len() as f32;
-    let mean = v.iter().sum::<f32>() / n;
-    let var = v.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / n;
-    let inv = 1.0 / (var + eps).sqrt();
-    for ((vi, &w), &b) in v.iter_mut().zip(weight).zip(bias) {
-        *vi = (*vi - mean) * inv * w + b;
     }
 }
 
@@ -260,16 +211,6 @@ pub fn topk_into(scores: &[f32], k: usize, out: &mut Vec<usize>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn rmsnorm_unit_weight_normalizes() {
-        let w = [1.0f32; 4];
-        let mut v = [3.0f32, 4.0, 0.0, 0.0]; // mean sq = 25/4 = 6.25, rms = 2.5
-        rmsnorm(&mut v, &w, 0.0);
-        // x / 2.5
-        assert!((v[0] - 1.2).abs() < 1e-5, "{v:?}");
-        assert!((v[1] - 1.6).abs() < 1e-5, "{v:?}");
-    }
 
     #[test]
     fn f32_to_f16_known_bit_patterns() {
@@ -383,26 +324,5 @@ mod tests {
         }
         // NaN maps to the e4m3 NaN code and back to NaN.
         assert!(e4m3_to_f32(f32_to_e4m3(f32::NAN)).is_nan());
-    }
-
-    #[test]
-    fn layernorm_zero_mean_unit_var() {
-        // With weight=1 bias=0, output must have ~zero mean and ~unit variance.
-        let mut v = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 100.0];
-        let w = vec![1.0f32; 6];
-        let b = vec![0.0f32; 6];
-        layernorm(&mut v, &w, &b, 1e-6);
-        let mean: f32 = v.iter().sum::<f32>() / 6.0;
-        let var: f32 = v.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / 6.0;
-        assert!(mean.abs() < 1e-5, "mean {mean}");
-        assert!((var - 1.0).abs() < 1e-3, "var {var}");
-        // Bias shifts, weight scales: check one element algebraically.
-        let mut v2 = vec![2.0f32, 4.0];
-        layernorm(&mut v2, &[3.0, 3.0], &[10.0, 10.0], 0.0);
-        // mean=3, var=1 → normed = [-1, 1] → *3 + 10 = [7, 13]
-        assert!(
-            (v2[0] - 7.0).abs() < 1e-4 && (v2[1] - 13.0).abs() < 1e-4,
-            "{v2:?}"
-        );
     }
 }

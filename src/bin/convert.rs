@@ -772,7 +772,9 @@ mod tests {
             let x: Vec<f32> = (0..*i_dim).map(|v| (v + 1) as f32).collect();
             let mut yl = vec![0.0f32; *o_dim];
             let mut yr = vec![0.0f32; *o_dim];
-            proj.gemv(&x, &cbs[k], &mut yl);
+            let ps: Vec<u16> =
+                proj.scales.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            matvec_vq(&mut yl, &x, proj.indices, &ps, &cbs[k], proj.o_dim, proj.i_dim);
             matvec_vq(&mut yr, &x, indices, scales, &cbs[k], *o_dim, *i_dim);
             assert_eq!(yl, yr);
         }
