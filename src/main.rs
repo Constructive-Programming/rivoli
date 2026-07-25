@@ -25,9 +25,9 @@ struct Args {
     two_q_kin: u32,
     two_q_kout: u32,
     max_mem: Option<u64>,
-    /// Route MoE experts through the int4 (`.i4`) path instead of int3-VQ (`--i4`).
-    i4: bool,
-    /// Hybrid: percent of routed-pool bytes for the int4 hot slab (`--hot-pct`).
+    /// Routed-expert format (`--mode int3-vq|int4|hybrid`, default hybrid).
+    mode: rivoli::config::Mode,
+    /// Hybrid split: percent of routed-pool bytes for the int4 hot slab (`--hot-pct`).
     hot_pct: Option<u32>,
     /// Attention mode (`--attn auto|dense|streaming|dsa|misa`). `auto` picks `dsa`
     /// when the artifact carries indexer weights, else `dense`.
@@ -41,7 +41,8 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args> {
-    const USAGE: &str = "usage: rivoli <model-dir> [-bench <tokens>] [--direct-vmm-dma] \
+    const USAGE: &str = "usage: rivoli <model-dir> [-bench <tokens>] \
+         [--mode int3-vq|int4|hybrid] [--hot-pct <pct>] [--direct-vmm-dma] \
          [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc] [--2q-kin <pct>] \
          [--2q-kout <pct>] [--max-mem <GiB>] \
          [--attn auto|dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>]";
@@ -56,7 +57,7 @@ fn parse_args() -> Result<Args> {
         two_q_kin: rivoli::cache::TwoQSplit::default().kin_pct(),
         two_q_kout: rivoli::cache::TwoQSplit::default().kout_pct(),
         max_mem: None,
-        i4: false,
+        mode: rivoli::config::Mode::default(),
         hot_pct: None,
         attn: "auto".to_string(),
         sinks: 4,
@@ -73,7 +74,11 @@ fn parse_args() -> Result<Args> {
                 a.bench = Some(n.parse().context("-bench takes an integer")?);
             }
             "--direct-vmm-dma" => a.direct_vmm_dma = true,
-            "--i4" => a.i4 = true,
+            "--mode" => {
+                a.mode = rivoli::config::Mode::parse(
+                    &args.next().context("--mode requires int3-vq|int4|hybrid")?,
+                )?;
+            }
             "--hot-pct" => {
                 a.hot_pct = Some(
                     args.next()
@@ -204,12 +209,11 @@ fn main() -> Result<()> {
     {
         cfg.checksum_x = checksum_x;
     }
-    cfg.i4 = a.i4;
+    cfg.mode = a.mode;
     cfg.hot_pct = a.hot_pct;
-    // A hot-pct implies the hybrid → both formats stream, so route through int4-aware
-    // placement. (Without --hot-pct, --i4 alone = whole-run int4.)
-    if a.hot_pct.is_some() {
-        cfg.i4 = true;
+    // --hot-pct tunes the hybrid byte split; it's meaningless in a single-format mode.
+    if a.hot_pct.is_some() && a.mode != rivoli::config::Mode::Hybrid {
+        bail!("--hot-pct requires --mode hybrid (got --mode {})", a.mode);
     }
 
     use tracing_subscriber::layer::SubscriberExt;
@@ -309,7 +313,7 @@ fn main() -> Result<()> {
             &cfg.cache_policy,
             cfg.two_q,
             want_indexer,
-            cfg.i4,
+            cfg.mode,
             cfg.hot_pct,
         )?;
         info!("pin built in {:.1}s", t.elapsed().as_secs_f64());

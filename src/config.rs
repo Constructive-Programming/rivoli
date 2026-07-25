@@ -16,6 +16,47 @@ use std::fmt;
 /// fixed — so there is no hard footprint ceiling any more.)
 pub const OS_RESERVE: u64 = 16 << 30;
 
+/// Routed-expert format mode. The always-resident set (attention, dense MLPs, shared
+/// expert) is unaffected; this only picks how the 256 routed experts/layer decode.
+/// See MODES.md for the tradeoffs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// Every routed expert is int3-VQ (`.vq3`): smallest, most slots, gather-bound.
+    Int3Vq,
+    /// Every routed expert is int4 (`.i4`): ~1.8× faster compute, bigger, fewer slots.
+    Int4,
+    /// Frequent experts int4 (HOT slab), the rest int3-VQ (COLD slab). Needs both
+    /// file sets; `--hot-pct` tunes the byte split.
+    #[default]
+    Hybrid,
+}
+
+impl Mode {
+    /// Parse the `--mode` value. Accepts the hyphen/underscore/plain spellings.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "int3-vq" | "int3vq" | "vq" | "vq3" => Ok(Mode::Int3Vq),
+            "int4" | "i4" => Ok(Mode::Int4),
+            "hybrid" => Ok(Mode::Hybrid),
+            other => bail!("unknown --mode {other:?} (int3-vq|int4|hybrid)"),
+        }
+    }
+    /// The routed experts decode from int4 (int4 mode, or the hybrid HOT slab + shared).
+    pub fn uses_int4(self) -> bool {
+        self != Mode::Int3Vq
+    }
+}
+
+impl fmt::Display for Mode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Mode::Int3Vq => "int3-vq",
+            Mode::Int4 => "int4",
+            Mode::Hybrid => "hybrid",
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Path to the self-contained VQ artifact directory (manifest.json + codebooks
@@ -48,15 +89,13 @@ pub struct Config {
     pub checksum_layer: Option<usize>,
     /// DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
     pub checksum_x: bool,
-    /// Route MoE experts through the int4 (`.i4`) path instead of int3-VQ (`--i4`):
-    /// stream/decode colibri int4 experts (sequential, ~250 GB/s class) rather than
-    /// the VQ `.vq3` (gather-bound). Requires `L{l}.i4` present in the artifact. Set
-    /// by `main`, like the checksum diagnostics.
-    pub i4: bool,
-    /// HYBRID (`--hot-pct <n>`, implies both formats): percent of the routed-pool
-    /// BYTES given to the int4 "hot" slab (the 2Q Am / frequent tier); the rest is the
-    /// int3-VQ "cold" slab (A1in / probation). `None` ⇒ `100 - 2q-kin` (cold gets the
-    /// probation share). Only 2Q partitions by format; other policies stay single.
+    /// Routed-expert format mode (`--mode int3-vq|int4|hybrid`, default `hybrid`). See
+    /// [`Mode`] and MODES.md. Set by `main`, like the checksum diagnostics.
+    pub mode: Mode,
+    /// HYBRID split (`--hot-pct <n>`): percent of the routed-pool BYTES given to the
+    /// int4 HOT slab (frequent tier); the rest is the int3-VQ COLD slab (probation).
+    /// Hybrid mode only (rejected otherwise). `None` ⇒ the cold-floor default (give the
+    /// probation slab a floor, rest to HOT — see `Pin::build`).
     pub hot_pct: Option<u32>,
     /// Device budget override, bytes (`--max-mem <GiB>`). None (default) auto-sizes to
     /// `free − OS_RESERVE`. `Some(n)` uses exactly `n` — no OS reserve; the user asked
@@ -121,7 +160,7 @@ impl Config {
             two_q,
             checksum_layer: None,
             checksum_x: false,
-            i4: false,
+            mode: Mode::default(),
             hot_pct: None,
             max_mem,
             attn,
@@ -134,9 +173,11 @@ impl fmt::Display for Config {
         const GIB: f64 = (1u64 << 30) as f64;
         write!(
             f,
-            "model={} bench={:?} attn={:?} direct_vmm_dma={} cache_policy={} 2q_kin={}% 2q_kout={}% trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={}",
+            "model={} bench={:?} mode={} hot_pct={:?} attn={:?} direct_vmm_dma={} cache_policy={} 2q_kin={}% 2q_kout={}% trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={}",
             self.model,
             self.bench,
+            self.mode,
+            self.hot_pct,
             self.attn,
             self.direct_vmm_dma,
             self.cache_policy,

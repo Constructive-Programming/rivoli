@@ -19,6 +19,7 @@
 
 use crate::asyncfetch::{AsyncFetch, ReadSpec};
 use crate::cache;
+use crate::config::Mode;
 use crate::device::{DeviceTier, VmmBuf};
 use crate::format::{Dtype, FormatMeta, I4Set, Safetensors, Vq3Set, load_codebooks};
 use crate::gpustream::Signal;
@@ -528,10 +529,14 @@ impl<'a> Pin<'a> {
         cache_policy: &str,
         two_q: cache::TwoQSplit,
         want_indexer: bool,
-        i4: bool,
+        mode: Mode,
         hot_pct: Option<u32>,
     ) -> Result<Self> {
-        let hybrid = hot_pct.is_some(); // both formats stream; 2Q fixed-partitions
+        // Internal flags: `hybrid` = two format slabs; `i4` = the int4 placement path
+        // is needed (int4 mode or the hybrid HOT slab + shared expert). int3-VQ uses
+        // neither. These two reproduce every mode (see MODES.md).
+        let hybrid = mode == Mode::Hybrid;
+        let i4 = mode.uses_int4();
         // ponytail: no free-memory pre-check — the budget is the user's literal
         // request (--max-mem), so let the device allocation itself OOM/fail.
         // One-time bound for `submit_layer`'s fixed 32-slot scratch.
@@ -713,28 +718,45 @@ impl<'a> Pin<'a> {
         };
         let (slabs, slab_slots, policy): (Vec<Slab>, Vec<usize>, Box<dyn cache::Cache>) = if hybrid
         {
-            // Two slabs by ROLE: COLD (probation, vq3) + HOT (frequent, int4). `--hot-pct`
-            // of the pool BYTES goes to HOT (default `100 - 2q-kin`); 2Q fixed-partition
-            // hard-caps each segment so an insert only evicts from its own slab.
-            let (cold_bytes, hot_bytes) = {
-                let hot_frac = hot_pct.unwrap_or(100 - two_q.kin_pct()).clamp(1, 99) as usize;
-                let hot = budget * hot_frac / 100;
-                (budget.saturating_sub(hot), hot)
+            // Two slabs by ROLE: COLD (probation, vq3) + HOT (frequent, int4). The
+            // fixed-partition policy hard-caps each segment so an insert only evicts
+            // from its own slab.
+            let vqs = vq_src.as_ref().context("hybrid: vq source")?.expert_slot();
+            let i4s = i4_src.as_ref().context("hybrid: i4 source")?.expert_slot();
+            let (n_cold, n_hot) = match hot_pct {
+                // Explicit split: `--hot-pct` percent of the pool BYTES to HOT.
+                Some(pct) => {
+                    let hot_bytes = budget * (pct.clamp(1, 99) as usize) / 100;
+                    (
+                        (budget.saturating_sub(hot_bytes) / vqs).max(1),
+                        (hot_bytes / i4s).max(1),
+                    )
+                }
+                // Default: give COLD/probation a floor (≈2 tokens of routed accesses,
+                // safely above the ~600-slot starvation cliff), the rest to HOT — "push
+                // hot as high as possible without starving cold". Robust to budget; a
+                // flat percent isn't (too high and probation collapses). Capped at half
+                // the budget so HOT stays viable at tiny budgets (never binds normally).
+                None => {
+                    let floor = 2 * cfg.top_k * (cfg.n_layers - cfg.dense_layers);
+                    let n_cold = floor.min(budget / vqs / 2).max(1);
+                    let n_hot = (budget.saturating_sub(n_cold * vqs) / i4s).max(1);
+                    (n_cold, n_hot)
+                }
             };
-            let n_cold = (cold_bytes / vq_src.as_ref().context("hybrid: vq source")?.expert_slot())
-                .max(1);
-            let n_hot = (hot_bytes / i4_src.as_ref().context("hybrid: i4 source")?.expert_slot())
-                .max(1);
             let kout = ((n_cold + n_hot) * two_q.kout_pct() as usize / 100).max(1);
-            tracing::info!(
-                "routed pool [2q hybrid]: {n_cold} COLD vq3 + {n_hot} HOT int4 slots"
-            );
+            // The hybrid needs a FREQUENCY-AWARE fixed-partition policy (COLD=probation,
+            // HOT=frequent). Each policy has its own variant; unlike single-format, the
+            // policy is NOT ignored here.
+            let policy: Box<dyn cache::Cache> = match cache_policy {
+                "2q" => Box::new(cache::TwoQ::fixed(n_cold, n_hot, kout)),
+                other => bail!(
+                    "hybrid: --cache-policy {other:?} not yet supported (use 2q; arc/lru pending)"
+                ),
+            };
+            tracing::info!("routed pool [{cache_policy} hybrid]: {n_cold} COLD vq3 + {n_hot} HOT int4 slots");
             let (cold, hot) = (vq_slab(n_cold)?, i4_slab(n_hot)?);
-            (
-                vec![cold, hot],
-                vec![n_cold, n_hot],
-                Box::new(cache::TwoQ::fixed(n_cold, n_hot, kout)),
-            )
+            (vec![cold, hot], vec![n_cold, n_hot], policy)
         } else {
             let slot_bytes = if i4 {
                 i4_src.as_ref().context("single-format: i4 source missing")?.expert_slot()
