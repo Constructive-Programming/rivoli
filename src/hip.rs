@@ -37,6 +37,7 @@ pub struct ExpertDescI4 {
 
 unsafe extern "C" {
     fn rivoli_device_sync() -> i32;
+    fn rivoli_memcpy_dtod(dst: *mut u8, src: *const u8, bytes: usize) -> i32;
 
     #[allow(clippy::too_many_arguments)]
     fn rivoli_moe_expert_range_i4(
@@ -252,6 +253,17 @@ fn check(r: i32, name: &str) -> Result<()> {
 pub fn device_sync() -> Result<()> {
     // SAFETY: hipDeviceSynchronize, no pointers.
     check(unsafe { rivoli_device_sync() }, "device_sync")
+}
+
+/// Synchronous device-to-device copy of `bytes` from `src` to `dst` — the routed
+/// arena's slot relocation (compaction). BLOCKS, so the moved expert is in place before
+/// any later kernel reads the new slot.
+///
+/// # Safety
+/// `dst` and `src` must be valid, `bytes`-sized, NON-OVERLAPPING device regions (the
+/// arena guarantees distinct slots).
+pub unsafe fn memcpy_dtod(dst: *mut u8, src: *const u8, bytes: usize) -> Result<()> {
+    check(unsafe { rivoli_memcpy_dtod(dst, src, bytes) }, "memcpy_dtod")
 }
 
 /// Streaming MoE: gate/up + down for the absolute expert range `[e_start,

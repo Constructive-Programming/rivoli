@@ -318,3 +318,12 @@ extern "C" int rivoli_device_sync() {
     hipError_t e = hipDeviceSynchronize();
     return e == hipSuccess ? 0 : -(int)e;
 }
+
+// Synchronous device-to-device copy — the routed arena's slot relocation (compaction).
+// Blocks so the moved expert's bytes are in place before the layer's MoE compute (or a
+// later cold read) touches the new location. `dst`/`src` are distinct slots, so the
+// regions never overlap.
+extern "C" int rivoli_memcpy_dtod(void* dst, const void* src, size_t bytes) {
+    hipError_t e = hipMemcpy(dst, src, bytes, hipMemcpyDeviceToDevice);
+    return e == hipSuccess ? 0 : -(int)e;
+}
