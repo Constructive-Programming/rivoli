@@ -47,7 +47,9 @@ dot_i4/dot_i8), `attn.hip` (dense-only — no sparse gather: this checkpoint has
 DSA indexer, so the indexer + StreamingLLM paths are dropped; the latent cache is
 **fp8-e4m3 + per-128 block scales** (single path, no bf16 KV), roped key bf16),
 `fwd.hip` (embed_i8, append_kv fp8-latent + bf16 key, gather_rope, vadd, argmax),
-`vmm.hip`, `stream.hip`. **Dropped: `indexer.hip`.**
+`vmm.hip`, `async.hip` (HIP stream/event/host-func bridge + the io_uring bounce
+arena's pinned-alloc + async-H2D helpers). The cold-expert io_uring streamer is the
+`io-uring` crate in `src/stream.rs` (no liburing). **Dropped: `indexer.hip`.**
 
 Rewrite for the new formats:
 - `moe.hip` — `moe_gateup_vq`/`moe_down_vq`/`moe_reduce` taking the **3 per-projection

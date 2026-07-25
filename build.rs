@@ -1,8 +1,10 @@
 //! Build script: panics are the correct failure mode for a broken toolchain.
 #![allow(clippy::expect_used)]
 
-//! Compile the HIP kernels with hipcc and link libamdhip64 + liburing — only under
-//! the `rocm` feature, so `cargo check` / CPU-side dev needs no GPU toolchain.
+//! Compile the HIP kernels with hipcc and link libamdhip64 — only under the `rocm`
+//! feature, so `cargo check` / CPU-side dev needs no GPU toolchain. (The cold-expert
+//! io_uring streamer is the `io-uring` crate now, talking to the syscalls directly —
+//! no liburing system lib.)
 
 use std::path::Path;
 use std::process::Command;
@@ -14,7 +16,7 @@ fn main() {
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR set by cargo");
     let kernels = [
-        "linalg", "moe", "mla", "attn", "fwd", "vmm", "stream", "indexer", "async",
+        "linalg", "moe", "mla", "attn", "fwd", "vmm", "indexer", "async",
     ];
     let hipcc = std::env::var("HIPCC").unwrap_or_else(|_| "hipcc".into());
     // ponytail: default gfx1151 (Strix Halo); override for other ROCm nodes (e.g.
@@ -57,5 +59,4 @@ fn main() {
         }
     }
     println!("cargo:rustc-link-lib=dylib=amdhip64");
-    println!("cargo:rustc-link-lib=dylib=uring"); // kernels/stream.hip io_uring streamer
 }

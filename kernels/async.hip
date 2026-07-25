@@ -55,3 +55,27 @@ extern "C" int rivoli_event_elapsed(void* start, void* end, float* ms) {
 extern "C" void rivoli_event_destroy(void* ev) {
     hipEventDestroy((hipEvent_t)ev);
 }
+
+// --- io_uring bounce arena (src/stream.rs owns the ring via the io-uring crate; the
+//     two HIP ops stay here, next to the other rivoli_* HIP wrappers). O_DIRECT reads
+//     land in this PINNED host arena (get_user_pages OK on pinned host — the amdgpu
+//     kernel-bug workaround from stream.rs), then an async H2D copy fills the VMM slot.
+extern "C" void* rivoli_pinned_alloc(unsigned long long bytes) {
+    void* p = nullptr;
+    if (hipHostMalloc(&p, (size_t)bytes, hipHostMallocDefault) != hipSuccess) return nullptr;
+    return p;
+}
+
+extern "C" void rivoli_pinned_free(void* p) {
+    hipHostFree(p);
+}
+
+// Async host->device copy on `stream`: bounce slot -> VMM expert slot. The caller arms
+// a signal on the same stream, so the load future resolves when the COPY lands (not
+// merely the NVMe read). Returns 0 or HIP_ERR_BASE - hipError.
+extern "C" int rivoli_memcpy_h2d_async(void* dst, const void* src, unsigned long long n,
+                                       void* stream) {
+    hipError_t e = hipMemcpyAsync(dst, src, (size_t)n, hipMemcpyHostToDevice,
+                                  (hipStream_t)stream);
+    return e == hipSuccess ? 0 : HIP_ERR_BASE - (int)e;
+}

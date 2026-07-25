@@ -31,11 +31,15 @@ tokio-stream = { version = "0.1", optional = true }
 # Per-task async metrics: TaskMonitor's idle_duration = the expert stream's load-wait,
 # poll_duration = its launch cost. Recovers the async-side timing the overlap blurs.
 tokio-metrics = { version = "0.4", optional = true }
+# io_uring O_DIRECT cold-expert streamer (rocm only). Talks to the io_uring syscalls
+# directly — no liburing system lib. The HIP bounce arena + async H2D copy stay in
+# kernels/async.hip (the codebase keeps HIP behind rivoli_* C wrappers).
+io-uring = { version = "0.7", optional = true }
 
 [features]
 default = []
 # build.rs compiles kernels/*.hip via hipcc; pulls in the async streaming stack.
-rocm = ["dep:tokio", "dep:futures-util", "dep:tokio-stream", "dep:tokio-metrics"]
+rocm = ["dep:tokio", "dep:futures-util", "dep:tokio-stream", "dep:tokio-metrics", "dep:io-uring"]
 # OTLP export of the always-on decode summary (one span/run, opt-in at runtime via
 # OTEL_EXPORTER_OTLP_ENDPOINT). Off by default — the opentelemetry stack is heavy.
 otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]

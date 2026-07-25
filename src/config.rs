@@ -69,7 +69,7 @@ pub struct Config {
     /// memory (`--direct-vmm-dma`). Default false = bounce (read into pinned host,
     /// then `hipMemcpy` into VMM) — measures faster (sidesteps the coherent/snoop tax
     /// on DMA into host-mapped device pages) and survives kernels whose amdgpu path
-    /// EFAULTs on direct io_uring DMA into VMM (see stream.hip). Set only to force the
+    /// EFAULTs on direct io_uring DMA into VMM (see src/stream.rs). Set only to force the
     /// raw-DMA path.
     pub direct_vmm_dma: bool,
     /// Dump the routed-expert access trace to this path (`--trace`): one line per MoE
