@@ -46,21 +46,9 @@ extern "C" __global__ void gemv_fp8_splitk(
     int sc_cols = (i_dim + block - 1) / block;
     const unsigned char* wrow = packed + o * (size_t)i_dim;
     const float* scalerow = scale + (o / block) * sc_cols;
-    const unsigned int* w4 = (const unsigned int*)wrow;
-    int n4 = i_dim >> 2;
-    const int STRIDE = ROWS_PER_BLOCK * WAVE; // all 256 threads stride coalesced
-    float acc = 0.0f;
-    for (int j = threadIdx.x; j < n4; j += STRIDE) {
-        unsigned int p = w4[j];
-        int i0 = j << 2;
-        float s = scalerow[i0 / block];
-        acc += s * (x[i0]     * lut[(unsigned char)p]
-                  + x[i0 + 1] * lut[(unsigned char)(p >> 8)]
-                  + x[i0 + 2] * lut[(unsigned char)(p >> 16)]
-                  + x[i0 + 3] * lut[(unsigned char)(p >> 24)]);
-    }
-    for (int i = (n4 << 2) + threadIdx.x; i < i_dim; i += STRIDE)
-        acc += x[i] * lut[wrow[i]] * scalerow[i / block];
+    const int STRIDE = ROWS_PER_BLOCK * WAVE; // all 256 threads stride coalesced (split-K)
+    // Same strided fp8 MAC as dot_fp8_wave, but split-K across every wave in the block.
+    float acc = fp8_dot_strided(x, wrow, scalerow, i_dim, block, lut, threadIdx.x, STRIDE);
     acc = wave_sum(acc); // per-wave partial → its lane 0
     if (lane == 0) part[wave] = acc;
     __syncthreads();

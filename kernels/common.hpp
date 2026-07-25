@@ -58,16 +58,20 @@ __device__ __forceinline__ void e4m3_lut_build(float* lut, int tid) {
 // packed[o*i_dim..], `scalerow` = scale + (o/block)*sc_cols (the row's block-scale
 // row), so element i uses scalerow[i/block]. `lut` is the block's e4m3_lut_build
 // table. Matches quant.rs::matvec_fp8.
-__device__ __forceinline__ float dot_fp8_wave(const float* __restrict__ x,
-                                              const unsigned char* __restrict__ wrow,
-                                              const float* __restrict__ scalerow,
-                                              int i_dim, int block, int lane,
-                                              const float* __restrict__ lut) {
+// Strided fp8 dot accumulation (NO cross-thread reduction): Σ over the columns this
+// thread owns of `x·lut[w]·scale`, using a uint-per-lane load (4 fp8 → 128B/wave) atop
+// the LUT + a scalar tail. Shared by `dot_fp8_wave` (one wave, stride WAVE) and
+// `gemv_fp8_splitk` (all block threads, split-K over one row). The caller reduces.
+__device__ __forceinline__ float fp8_dot_strided(const float* __restrict__ x,
+                                                 const unsigned char* __restrict__ wrow,
+                                                 const float* __restrict__ scalerow,
+                                                 int i_dim, int block,
+                                                 const float* __restrict__ lut,
+                                                 int start, int stride) {
     float acc = 0.0f;
-    // ponytail-experiment: uint-per-lane weight load (4 fp8/lane → 128B/wave) atop the LUT.
     const unsigned int* w4 = (const unsigned int*)wrow;
     int n4 = i_dim >> 2;
-    for (int j = lane; j < n4; j += WAVE) {
+    for (int j = start; j < n4; j += stride) {
         unsigned int p = w4[j];
         int i0 = j << 2;
         float s = scalerow[i0 / block];
@@ -76,9 +80,18 @@ __device__ __forceinline__ float dot_fp8_wave(const float* __restrict__ x,
                   + x[i0 + 2] * lut[(unsigned char)(p >> 16)]
                   + x[i0 + 3] * lut[(unsigned char)(p >> 24)]);
     }
-    for (int i = (n4 << 2) + lane; i < i_dim; i += WAVE)
+    for (int i = (n4 << 2) + start; i < i_dim; i += stride)
         acc += x[i] * lut[wrow[i]] * scalerow[i / block];
-    return wave_sum(acc);
+    return acc;
+}
+
+// One WAVE reduces one row: strided MAC over the wave's lanes, then a wave-sum.
+__device__ __forceinline__ float dot_fp8_wave(const float* __restrict__ x,
+                                              const unsigned char* __restrict__ wrow,
+                                              const float* __restrict__ scalerow,
+                                              int i_dim, int block, int lane,
+                                              const float* __restrict__ lut) {
+    return wave_sum(fp8_dot_strided(x, wrow, scalerow, i_dim, block, lut, lane, WAVE));
 }
 
 // Wave-cooperative per-row int4 dot for one output row: Σ_i v[i]·(nibble(i) − 8),
