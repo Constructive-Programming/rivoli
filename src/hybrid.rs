@@ -91,7 +91,7 @@ impl HybridLru {
     fn bump(&mut self, k: u32) {
         *self.freq.entry(k).or_insert(0) += 1;
         self.accesses += 1;
-        if self.accesses % LRU_DECAY == 0 {
+        if self.accesses.is_multiple_of(LRU_DECAY) {
             self.freq.retain(|_, v| {
                 *v /= 2;
                 *v > 0
@@ -343,6 +343,7 @@ impl HybridPolicy for HybridArc {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use crate::cache::TwoQSplit;
 

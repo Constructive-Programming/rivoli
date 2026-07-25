@@ -135,85 +135,23 @@ pub trait Cache {
 }
 
 // ---------------------------------------------------------------------------
-// LRU — pure recency (mirrors the pin's original hand-rolled Lru). In the format
-// hybrid it gains a FREQUENCY-COUNTER admission layer (LRU has no ghost/frequency
-// signal of its own): LRU still evicts (per segment), a decaying per-key count
-// decides placement. See MODES.md.
+// LRU — pure recency (single-format / offline replay). The format hybrid uses the
+// byte-aware `hybrid::HybridLru` instead (frequency-counter admission over the arena).
 // ---------------------------------------------------------------------------
-/// Recent-frequency threshold: a miss whose key has been accessed ≥ this many times
-/// within the current decay window is admitted to HOT/int4, else COLD/vq3.
-const LRU_HOT_THRESHOLD: u32 = 2;
-
 pub struct Lru {
     cap: usize,
-    /// `None` = pure LRU (one segment). `Some((n_cold, n_hot))` = FIXED PARTITION for
-    /// the hybrid: `set` = COLD/vq3 (cap n_cold), `hot` = HOT/int4 (cap n_hot), and
-    /// `freq` gates admission. Each segment is an independent LRU, so an insert only
-    /// evicts from the tier it enters → evicted_tier == insert_tier.
-    fixed: Option<(usize, usize)>,
-    set: OrderedSet, // dynamic: the pool; fixed: the COLD segment
-    hot: OrderedSet, // fixed only: the HOT segment
-    /// Fixed only: decayed per-key access count (recent frequency). Halved every `cap`
-    /// accesses so a cooled expert falls below threshold instead of staying
-    /// HOT-eligible forever (all-time counts would collapse the split to all-int4).
-    freq: HashMap<u32, u32>,
-    accesses: u64,
+    set: OrderedSet,
 }
 impl Lru {
     pub fn new(cap: usize) -> Self {
-        Self {
-            cap: cap.max(1),
-            fixed: None,
-            set: OrderedSet::default(),
-            hot: OrderedSet::default(),
-            freq: HashMap::new(),
-            accesses: 0,
-        }
-    }
-
-    /// Fixed-partition LRU for the format hybrid: `n_cold` = COLD/vq3 cap, `n_hot` =
-    /// HOT/int4 cap. Placement is by recent frequency; eviction is per-segment LRU.
-    pub fn fixed(n_cold: usize, n_hot: usize) -> Self {
-        Self {
-            cap: (n_cold + n_hot).max(1),
-            fixed: Some((n_cold.max(1), n_hot.max(1))),
-            set: OrderedSet::default(),
-            hot: OrderedSet::default(),
-            freq: HashMap::new(),
-            accesses: 0,
-        }
-    }
-
-    /// Count one access to `k` and periodically decay (halve) all counts so the signal
-    /// tracks RECENT frequency. Fixed-partition only; called once per access (in `get`).
-    fn bump(&mut self, k: u32) {
-        *self.freq.entry(k).or_insert(0) += 1;
-        self.accesses += 1;
-        if self.accesses % self.cap as u64 == 0 {
-            self.freq.retain(|_, v| {
-                *v /= 2;
-                *v > 0
-            });
-        }
+        Self { cap: cap.max(1), set: OrderedSet::default() }
     }
 }
 impl Cache for Lru {
     fn contains(&self, k: u32) -> bool {
-        self.set.contains(k) || self.hot.contains(k)
+        self.set.contains(k)
     }
     fn get(&mut self, k: u32) -> bool {
-        if self.fixed.is_some() {
-            self.bump(k); // one count per access; a hit stays in its segment (no migration)
-            if self.set.contains(k) {
-                self.set.touch(k);
-                return true;
-            }
-            if self.hot.contains(k) {
-                self.hot.touch(k);
-                return true;
-            }
-            return false;
-        }
         if self.set.contains(k) {
             self.set.touch(k);
             return true;
@@ -221,43 +159,20 @@ impl Cache for Lru {
         false
     }
     fn insert(&mut self, k: u32) -> (Option<u32>, Tier) {
-        if let Some((n_cold, n_hot)) = self.fixed {
-            // Miss (get already counted this access). Recent frequency picks the tier;
-            // evict the chosen segment's LRU so evicted_tier == insert_tier.
-            if self.freq.get(&k).copied().unwrap_or(0) >= LRU_HOT_THRESHOLD {
-                let ev = (self.hot.len() >= n_hot).then(|| self.hot.pop_lru()).flatten();
-                self.hot.touch(k);
-                (ev, Tier::Hot)
-            } else {
-                let ev = (self.set.len() >= n_cold).then(|| self.set.pop_lru()).flatten();
-                self.set.touch(k);
-                (ev, Tier::Cold)
-            }
-        } else {
-            let ev = (self.set.len() >= self.cap).then(|| self.set.pop_lru()).flatten();
-            self.set.touch(k);
-            (ev, Tier::Cold) // single segment → always the cold/vq3 tier
-        }
-    }
-    fn protect(&mut self, k: u32) {
-        // Mirror 2Q/ARC: keep an actively-used COLD hit off the block this batch. HOT
-        // hits are already MRU-refreshed by `get`.
-        if self.fixed.is_some() && self.set.contains(k) {
-            self.set.touch(k);
-        }
+        let ev = (self.set.len() >= self.cap).then(|| self.set.pop_lru()).flatten();
+        self.set.touch(k);
+        (ev, Tier::Cold) // single segment → always the cold tier
     }
     // insert_cold: uses the trait default (= insert). A recency cache cannot both
     // coexist a prefetch batch and cold-park it, so LRU prefetches land as normal
     // inserts (they decay if unused). Use 2q/arc to cold-park.
     fn seed(&mut self, keys: &[u32]) {
-        // Seed the frequent segment when partitioned, else the single pool.
-        let dst = if self.fixed.is_some() { &mut self.hot } else { &mut self.set };
         for &k in keys.iter().take(self.cap) {
-            dst.touch(k);
+            self.set.touch(k);
         }
     }
     fn resident_len(&self) -> usize {
-        self.set.len() + self.hot.len()
+        self.set.len()
     }
 }
 
@@ -378,12 +293,6 @@ pub struct TwoQ {
     cap: usize,
     kin: usize,
     kout: usize,
-    /// `None` = paper-dynamic (A1in ≤ kin, Am absorbs the rest, reclaim on total ≥
-    /// cap). `Some(n_hot)` = FIXED PARTITION (the format hybrid): A1in hard-capped at
-    /// `kin`, Am hard-capped at `n_hot`, each mapped to its own slab. Trades adaptivity
-    /// for two right-sized slabs; an insert into a segment only evicts from THAT
-    /// segment, so evicted_tier == insert_tier.
-    am_cap: Option<usize>,
     a1in: OrderedSet,
     a1out: OrderedSet,
     am: OrderedSet,
@@ -394,21 +303,6 @@ impl TwoQ {
             cap,
             kin: split.kin(cap),
             kout: split.kout(cap),
-            am_cap: None,
-            a1in: OrderedSet::default(),
-            a1out: OrderedSet::default(),
-            am: OrderedSet::default(),
-        }
-    }
-
-    /// Fixed-partition 2Q for the format hybrid: A1in (cold/vq3 slab) capped at
-    /// `a1in_cap`, Am (hot/int4 slab) capped at `am_cap`, ghost = `kout`.
-    pub fn fixed(a1in_cap: usize, am_cap: usize, kout: usize) -> Self {
-        Self {
-            cap: a1in_cap + am_cap,
-            kin: a1in_cap.max(1),
-            kout: kout.max(1),
-            am_cap: Some(am_cap.max(1)),
             a1in: OrderedSet::default(),
             a1out: OrderedSet::default(),
             am: OrderedSet::default(),
@@ -453,29 +347,15 @@ impl Cache for TwoQ {
     }
     fn insert(&mut self, k: u32) -> (Option<u32>, Tier) {
         // Promotion (a second distinct access via the ghost) → Am/Hot; else → A1in/Cold.
+        // Reclaim on total (Am absorbs the slack).
         let promote = self.a1out.remove(k);
-        if let Some(am_cap) = self.am_cap {
-            // FIXED PARTITION: evict from the SAME segment the key enters, so the freed
-            // slot is in the destination slab (evicted_tier == insert_tier).
-            if promote {
-                let ev = (self.am.len() >= am_cap).then(|| self.am.pop_lru()).flatten();
-                self.am.touch(k);
-                (ev, Tier::Hot)
-            } else {
-                let ev = (self.a1in.len() >= self.kin).then(|| self.evict_a1in()).flatten();
-                self.a1in.touch(k);
-                (ev, Tier::Cold)
-            }
+        let ev = self.reclaim();
+        if promote {
+            self.am.touch(k);
+            (ev, Tier::Hot)
         } else {
-            // DYNAMIC (paper): reclaim on total, Am absorbs the slack.
-            let ev = self.reclaim();
-            if promote {
-                self.am.touch(k);
-                (ev, Tier::Hot)
-            } else {
-                self.a1in.touch(k);
-                (ev, Tier::Cold)
-            }
+            self.a1in.touch(k);
+            (ev, Tier::Cold)
         }
     }
     /// A1in is a FIFO and `get` deliberately leaves hits in place, so the pin's
@@ -494,11 +374,7 @@ impl Cache for TwoQ {
         // A batch coexists: reclaim evicts the oldest A1in (or Am, dynamic), never a
         // fresh sibling.
         self.a1out.remove(k); // drop any stale ghost; do NOT promote
-        let ev = if self.am_cap.is_some() {
-            (self.a1in.len() >= self.kin).then(|| self.evict_a1in()).flatten()
-        } else {
-            self.reclaim()
-        };
+        let ev = self.reclaim();
         self.a1in.touch(k);
         (ev, Tier::Cold)
     }
@@ -519,17 +395,6 @@ impl Cache for TwoQ {
 pub struct Arc {
     c: usize,
     p: usize,
-    /// `None` = dynamic ARC (adaptive `p`, promote-on-hit). `Some((n_cold, n_hot))` =
-    /// FIXED PARTITION for the format hybrid: T1 (recency) hard-capped at `n_cold`
-    /// (COLD/vq3 slab), T2 (frequency) at `n_hot` (HOT/int4). Like [`TwoQ::fixed`]: a
-    /// hit stays in its tier (a resident expert can't migrate slabs without a refetch),
-    /// promotion T1→T2 rides the B1/B2 ghost on a MISS, and an insert only evicts from
-    /// its own tier → evicted_tier == insert_tier. Drops ARC's adaptivity for two
-    /// right-sized slabs. The two ghosts are ARC's flavour vs 2Q's single A1out.
-    fixed: Option<(usize, usize)>,
-    /// Fixed-partition ghost bound (each of B1/B2 trimmed to this) — 0 in dynamic ARC,
-    /// where the ghosts are bounded implicitly by the paper's invariants.
-    kout: usize,
     t1: OrderedSet,
     t2: OrderedSet,
     b1: OrderedSet,
@@ -540,8 +405,6 @@ impl Arc {
         Self {
             c: cap.max(1),
             p: 0,
-            fixed: None,
-            kout: 0,
             t1: OrderedSet::default(),
             t2: OrderedSet::default(),
             b1: OrderedSet::default(),
@@ -549,40 +412,6 @@ impl Arc {
         }
     }
 
-    /// Fixed-partition ARC for the format hybrid (see the `fixed` field). `n_cold` =
-    /// T1/COLD/vq3 cap, `n_hot` = T2/HOT/int4 cap, `kout` = each ghost's bound (how far
-    /// back a returning expert is still remembered → promoted to HOT).
-    pub fn fixed(n_cold: usize, n_hot: usize, kout: usize) -> Self {
-        Self {
-            c: (n_cold + n_hot).max(1),
-            p: 0,
-            fixed: Some((n_cold.max(1), n_hot.max(1))),
-            kout: kout.max(1),
-            t1: OrderedSet::default(),
-            t2: OrderedSet::default(),
-            b1: OrderedSet::default(),
-            b2: OrderedSet::default(),
-        }
-    }
-
-    /// Fixed-partition eviction: pop the tier's LRU into its ghost, trimmed to `kout`.
-    /// `hot` picks T2/B2 (else T1/B1). Frees one slot in that tier's slab.
-    fn evict_tier(&mut self, hot: bool) -> Option<u32> {
-        let kout = self.kout;
-        let (resident, ghost) = if hot {
-            (&mut self.t2, &mut self.b2)
-        } else {
-            (&mut self.t1, &mut self.b1)
-        };
-        let v = resident.pop_lru();
-        if let Some(v) = v {
-            ghost.touch(v);
-            while ghost.len() > kout {
-                ghost.pop_lru();
-            }
-        }
-        v
-    }
     /// Admit `k` into T1 recency on a fresh miss (no ghost hit): make room per the
     /// paper's Case IV cases, evict one resident to a ghost if at capacity, then
     /// touch `k` into T1. Returns the evicted resident key (if any). Shared by
@@ -632,19 +461,6 @@ impl Cache for Arc {
         self.t1.contains(k) || self.t2.contains(k)
     }
     fn get(&mut self, k: u32) -> bool {
-        if self.fixed.is_some() {
-            // Fixed partition: a hit STAYS in its tier (it can't migrate slabs) — just
-            // refresh recency in-tier. Promotion happens only on a miss (via a ghost).
-            if self.t1.contains(k) {
-                self.t1.touch(k);
-                return true;
-            }
-            if self.t2.contains(k) {
-                self.t2.touch(k);
-                return true;
-            }
-            return false;
-        }
         if self.t1.remove(k) || self.t2.contains(k) {
             self.t2.touch(k);
             return true;
@@ -652,46 +468,26 @@ impl Cache for Arc {
         false
     }
     fn insert(&mut self, k: u32) -> (Option<u32>, Tier) {
-        if let Some((n_cold, n_hot)) = self.fixed {
-            // FIXED PARTITION: a ghost hit (seen before, in B1 or B2) → T2/HOT; a fresh
-            // miss → T1/COLD. Evict from the SAME tier so evicted_tier == insert_tier.
-            let promote = self.b1.remove(k) | self.b2.remove(k);
-            if promote {
-                let ev = (self.t2.len() >= n_hot).then(|| self.evict_tier(true)).flatten();
-                self.t2.touch(k);
-                (ev, Tier::Hot)
-            } else {
-                let ev = (self.t1.len() >= n_cold).then(|| self.evict_tier(false)).flatten();
-                self.t1.touch(k);
-                (ev, Tier::Cold)
-            }
+        let c = self.c;
+        let evicted;
+        if self.b1.contains(k) {
+            let delta = (self.b2.len() / self.b1.len().max(1)).max(1);
+            self.p = (self.p + delta).min(c);
+            evicted = self.replace(false);
+            self.b1.remove(k);
+            self.t2.touch(k);
+        } else if self.b2.contains(k) {
+            let delta = (self.b1.len() / self.b2.len().max(1)).max(1);
+            self.p = self.p.saturating_sub(delta);
+            evicted = self.replace(true);
+            self.b2.remove(k);
+            self.t2.touch(k);
         } else {
-            let c = self.c;
-            let evicted;
-            if self.b1.contains(k) {
-                let delta = (self.b2.len() / self.b1.len().max(1)).max(1);
-                self.p = (self.p + delta).min(c);
-                evicted = self.replace(false);
-                self.b1.remove(k);
-                self.t2.touch(k);
-            } else if self.b2.contains(k) {
-                let delta = (self.b1.len() / self.b2.len().max(1)).max(1);
-                self.p = self.p.saturating_sub(delta);
-                evicted = self.replace(true);
-                self.b2.remove(k);
-                self.t2.touch(k);
-            } else {
-                evicted = self.admit_t1(k);
-            }
-            (evicted, Tier::Cold)
+            evicted = self.admit_t1(k);
         }
-    }
-    fn protect(&mut self, k: u32) {
-        // Mirror TwoQ: keep an actively-used COLD hit off the eviction block for the
-        // rest of the batch. T2 hits are already MRU-refreshed by `get`.
-        if self.fixed.is_some() && self.t1.contains(k) {
-            self.t1.touch(k);
-        }
+        // Single-format / offline replay reports Cold; the byte-aware `hybrid::HybridArc`
+        // owns the Hot/Cold split (the pin never uses this impl for the hybrid).
+        (evicted, Tier::Cold)
     }
     fn insert_cold(&mut self, k: u32) -> (Option<u32>, Tier) {
         // Prefetch: force into T1 recency probation, NEVER adapting `p` or promoting
@@ -699,13 +495,7 @@ impl Cache for Arc {
         // adaptation signal. Strip any stale ghost, then admit to T1/COLD.
         self.b1.remove(k);
         self.b2.remove(k);
-        if let Some((n_cold, _)) = self.fixed {
-            let ev = (self.t1.len() >= n_cold).then(|| self.evict_tier(false)).flatten();
-            self.t1.touch(k);
-            (ev, Tier::Cold)
-        } else {
-            (self.admit_t1(k), Tier::Cold)
-        }
+        (self.admit_t1(k), Tier::Cold)
     }
     fn seed(&mut self, keys: &[u32]) {
         for &k in keys.iter().take(self.c) {
@@ -992,133 +782,6 @@ mod tests {
         assert_eq!(TwoQSplit::new(100, 50), Err(SplitError::KinRange(100)));
         assert_eq!(TwoQSplit::new(25, 0), Err(SplitError::KoutRange(0)));
         assert_eq!(TwoQSplit::new(25, 1001), Err(SplitError::KoutRange(1001)));
-    }
-
-    // The format hybrid's load-bearing invariant: in fixed-partition 2Q an insert
-    // only ever evicts from the SAME tier it enters (so the pool frees + allocates in
-    // one slab), and each segment stays within its cap.
-    #[test]
-    fn fixed_partition_evicts_same_tier() {
-        use std::collections::HashMap;
-        let (n_cold, n_hot) = (4usize, 8usize);
-        // Ghost bigger than the working set so a key survives in A1out between passes
-        // (evicted from A1in → ghost → re-accessed → promoted to Am).
-        let mut c = TwoQ::fixed(n_cold, n_hot, 64);
-        let mut tier_of: HashMap<u32, Tier> = HashMap::new();
-        for _pass in 0..6 {
-            for k in 0..14u32 {
-                if c.get(k) {
-                    continue;
-                }
-                let (ev, tier) = c.insert(k);
-                if let Some(ev) = ev {
-                    assert_eq!(
-                        tier_of.remove(&ev),
-                        Some(tier),
-                        "evicted {ev} was not in the {tier:?} tier that {k} entered"
-                    );
-                }
-                tier_of.insert(k, tier);
-                let hot = tier_of.values().filter(|&&t| t == Tier::Hot).count();
-                let cold = tier_of.values().filter(|&&t| t == Tier::Cold).count();
-                assert!(hot <= n_hot && cold <= n_cold, "over cap: hot {hot} cold {cold}");
-                assert_eq!(hot + cold, c.resident_len(), "tier tally != resident_len");
-            }
-        }
-        // Promotions must have actually happened (else the test proves nothing).
-        assert!(tier_of.values().any(|&t| t == Tier::Hot), "no key ever promoted to Hot");
-    }
-
-    // Same load-bearing invariant for fixed-partition ARC: an insert only evicts from
-    // the tier it enters, caps hold, and B1/B2 ghost hits promote to T2/HOT.
-    #[test]
-    fn arc_fixed_partition_evicts_same_tier() {
-        use std::collections::HashMap;
-        let (n_cold, n_hot) = (4usize, 8usize);
-        let mut c = Arc::fixed(n_cold, n_hot, 64); // big ghost so keys survive to promote
-        let mut tier_of: HashMap<u32, Tier> = HashMap::new();
-        for _pass in 0..6 {
-            for k in 0..14u32 {
-                if c.get(k) {
-                    continue;
-                }
-                let (ev, tier) = c.insert(k);
-                if let Some(ev) = ev {
-                    assert_eq!(
-                        tier_of.remove(&ev),
-                        Some(tier),
-                        "evicted {ev} was not in the {tier:?} tier that {k} entered"
-                    );
-                }
-                tier_of.insert(k, tier);
-                let hot = tier_of.values().filter(|&&t| t == Tier::Hot).count();
-                let cold = tier_of.values().filter(|&&t| t == Tier::Cold).count();
-                assert!(hot <= n_hot && cold <= n_cold, "over cap: hot {hot} cold {cold}");
-                assert_eq!(hot + cold, c.resident_len(), "tier tally != resident_len");
-            }
-        }
-        assert!(tier_of.values().any(|&t| t == Tier::Hot), "no key ever promoted to Hot");
-    }
-
-    // Fixed-partition LRU (frequency-counter admission): the same slab invariant
-    // (evicted_tier == insert_tier, caps hold) under a SKEWED workload — hot keys 0/1
-    // reused each pass with ≥n_cold fillers between reuses, so they evict from COLD,
-    // re-miss, and promote to HOT (a uniform workload never promotes — correctly).
-    #[test]
-    fn lru_fixed_partition_evicts_same_tier() {
-        use std::collections::HashMap;
-        let (n_cold, n_hot) = (8usize, 16usize);
-        let mut c = Lru::fixed(n_cold, n_hot);
-        let mut tier_of: HashMap<u32, Tier> = HashMap::new();
-
-        fn touch(c: &mut Lru, k: u32, tier_of: &mut HashMap<u32, Tier>, n_cold: usize, n_hot: usize) {
-            if c.get(k) {
-                return;
-            }
-            let (ev, tier) = c.insert(k);
-            if let Some(ev) = ev {
-                assert_eq!(
-                    tier_of.remove(&ev),
-                    Some(tier),
-                    "evicted {ev} was not in the {tier:?} tier that {k} entered"
-                );
-            }
-            tier_of.insert(k, tier);
-            let hot = tier_of.values().filter(|&&t| t == Tier::Hot).count();
-            let cold = tier_of.values().filter(|&&t| t == Tier::Cold).count();
-            assert!(hot <= n_hot && cold <= n_cold, "over cap: hot {hot} cold {cold}");
-            assert_eq!(hot + cold, c.resident_len(), "tier tally != resident_len");
-        }
-
-        for pass in 0..12u32 {
-            touch(&mut c, 0, &mut tier_of, n_cold, n_hot);
-            touch(&mut c, 1, &mut tier_of, n_cold, n_hot);
-            for f in 0..(n_cold as u32 + 2) {
-                touch(&mut c, 1000 + pass * 100 + f, &mut tier_of, n_cold, n_hot);
-            }
-            // second reuse after the fillers evicted them → re-miss, freq climbs → HOT
-            touch(&mut c, 0, &mut tier_of, n_cold, n_hot);
-            touch(&mut c, 1, &mut tier_of, n_cold, n_hot);
-        }
-        assert!(tier_of.values().any(|&t| t == Tier::Hot), "no key ever promoted to Hot");
-    }
-
-    // A first-seen key admits COLD; a key re-accessed after eviction (freq crosses the
-    // threshold) admits HOT — the whole point of frequency-counter admission. n_cold=1
-    // so a cold key evicts on the very next cold miss, giving a clean re-miss on `x`.
-    #[test]
-    fn lru_hybrid_admits_by_frequency() {
-        let mut c = Lru::fixed(1, 4); // cap 5 → decay only at 5 accesses; we stay under
-        let x = 10u32;
-        // First access to x: miss → COLD (freq 1).
-        assert!(!c.get(x));
-        assert_eq!(c.insert(x).1, Tier::Cold, "first-seen must admit COLD");
-        // A different cold key evicts x from the 1-slot COLD segment.
-        assert!(!c.get(20));
-        assert_eq!(c.insert(20).1, Tier::Cold);
-        // Second access to x: now a miss (evicted) with freq 2 → HOT.
-        assert!(!c.get(x));
-        assert_eq!(c.insert(x).1, Tier::Hot, "a re-accessed key must admit HOT");
     }
 
     /// `replay` must model the prefetch admission path the live engine depends on:
