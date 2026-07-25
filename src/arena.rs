@@ -142,11 +142,6 @@ impl Arena {
         // 4) Other tier is packed solid (no holes) — caller must evict one of its slots.
         Step::NeedFree
     }
-
-    /// Upper bound on live slots across both tiers, for sizing the pin's reverse map.
-    pub fn max_slots(&self) -> usize {
-        self.budget / self.cold_stride.min(self.hot_stride) + 1
-    }
 }
 
 #[cfg(test)]

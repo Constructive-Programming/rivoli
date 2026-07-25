@@ -32,11 +32,11 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// Parse the `--mode` value. Accepts the hyphen/underscore/plain spellings.
+    /// Parse the `--mode` value.
     pub fn parse(s: &str) -> Result<Self> {
         match s {
-            "int3-vq" | "int3vq" | "vq" | "vq3" => Ok(Mode::Int3Vq),
-            "int4" | "i4" => Ok(Mode::Int4),
+            "int3-vq" => Ok(Mode::Int3Vq),
+            "int4" => Ok(Mode::Int4),
             "hybrid" => Ok(Mode::Hybrid),
             other => bail!("unknown --mode {other:?} (int3-vq|int4|hybrid)"),
         }

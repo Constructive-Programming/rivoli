@@ -557,10 +557,10 @@ impl<'a> Pin<'a> {
         let st = Safetensors::open_dir(dir)?;
         let cbs = load_codebooks(dir)?;
         // Routed-expert sources. Single-format opens one; the hybrid opens BOTH (cold
-        // vq3 + hot int4) and 2Q's fixed partition routes each key to its slab. Both
-        // file sets sit in the artifact side by side. `shared_i4`: the always-resident
-        // shared expert rides the primary/hot format (int4 in --i4 and hybrid).
-        let vq_present = !i4 || hybrid;
+        // vq3 + hot int4) and the fixed-partition policy routes each key to its slab.
+        // Both file sets sit in the artifact side by side. `shared_i4`: the
+        // always-resident shared expert rides the primary/hot format (int4 in hybrid).
+        let vq_present = mode != Mode::Int4; // int3-vq or hybrid needs a vq slab
         let vq_src = vq_present
             .then(|| {
                 Vq3Set::open(
