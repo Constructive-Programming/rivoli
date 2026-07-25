@@ -29,8 +29,7 @@ use crate::format::{Dtype, ExpertSet, FormatMeta, Safetensors, load_codebooks};
 use crate::gpustream::Signal;
 use crate::model::ModelConfig;
 use crate::quant::{
-    VQ_DIM, VQ_K, i4_expert_bytes, i4_slot_offsets, vq_expert_bytes, vq_expert_layout,
-    vq_proj_bytes, vq_row_bytes,
+    VQ_DIM, VQ_K, i4_expert_bytes, i4_slot_offsets, vq_expert_bytes, vq_slot_offsets,
 };
 use crate::stream::{Streamer, slot_span};
 use anyhow::{Context, Result, bail, ensure};
@@ -363,22 +362,6 @@ fn expert_key(layer: usize, expert: usize) -> u32 {
         "layer {layer}/expert {expert} exceed the 16-bit pool key packing"
     );
     ((layer as u32) << 16) | expert as u32
-}
-
-/// The six slot-relative byte offsets `[gate.idx, gate.sc, up.idx, up.sc, down.idx,
-/// down.sc]` of a VQ expert block: per projection, indices then bf16 group scales,
-/// gate‖up‖down concatenated. MUST match [`crate::quant::vq_expert`]'s slicing (the
-/// `vq_offsets_match_loader` test locks this).
-fn vq_slot_offsets(hidden: usize, moe_inter: usize) -> [usize; 6] {
-    let dims = vq_expert_layout(hidden, moe_inter);
-    let mut off = [0usize; 6];
-    let mut base = 0usize;
-    for (p, &(o, i)) in dims.iter().enumerate() {
-        off[p * 2] = base; // projection indices
-        off[p * 2 + 1] = base + o * vq_row_bytes(i); // bf16 group scales
-        base += vq_proj_bytes(o, i);
-    }
-    off
 }
 
 /// Everything `submit_layer` needs to turn a resolved slot into an expert descriptor:
@@ -902,34 +885,4 @@ fn build_moe_table(
         }
     }
     Ok(table)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // The VQ slot offsets the descriptor build hands the kernel MUST equal where the
-    // loader (`quant::vq_expert`) slices each projection's indices/scales out of an
-    // expert block — else the streamed bytes and the descriptor pointers disagree
-    // (silent wrong weights). Locks the single source of truth for the .vq3 layout.
-    #[test]
-    fn vq_offsets_match_loader() {
-        let (hidden, moe_inter) = (crate::quant::VQ_GROUP, crate::quant::VQ_GROUP);
-        let off = vq_slot_offsets(hidden, moe_inter);
-        let block = vec![0u8; crate::quant::vq_expert_bytes(hidden, moe_inter)];
-        let projs = crate::quant::vq_expert(&block, 0, hidden, moe_inter);
-        let base = block.as_ptr() as usize;
-        for (k, proj) in projs.iter().enumerate() {
-            assert_eq!(
-                proj.indices.as_ptr() as usize - base,
-                off[k * 2],
-                "indices proj {k}"
-            );
-            assert_eq!(
-                proj.scales.as_ptr() as usize - base,
-                off[k * 2 + 1],
-                "scales proj {k}"
-            );
-        }
-    }
 }

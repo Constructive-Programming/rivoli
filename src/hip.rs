@@ -7,32 +7,22 @@
 use anyhow::{Result, bail};
 use std::ffi::c_void;
 
-/// VQ-int3 expert descriptor (mirrors `struct ExpertDescVq` in moe.hip): per
-/// projection the packed 12-bit indices + bf16 group scales. The 3 per-projection
-/// codebooks are shared across all experts and passed to [`launch_moe_expert_range`].
+/// One routed expert's six device pointers (per projection: a data ptr + a scale
+/// ptr). ONE layout for both formats — byte-identical six-pointer `repr(C)` structs,
+/// the kernel picks the interpretation: for int3-VQ (`launch_moe_expert_range`) the
+/// pairs are packed 12-bit indices + bf16 group scales (`moe.hip ExpertDescVq`); for
+/// int4 (`launch_moe_expert_range_i4`) they are packed 4-bit weights + a per-row f32
+/// scale (`moe.hip ExpertDescI4`). The scale pointer is typed `*const u16` here
+/// (built from the VQ carrier) but its VALUE just addresses whatever the kernel reads.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct ExpertDescVq {
+pub struct ExpertDesc {
     pub gate_indices: *const u8,
     pub gate_scales: *const u16,
     pub up_indices: *const u8,
     pub up_scales: *const u16,
     pub down_indices: *const u8,
     pub down_scales: *const u16,
-}
-
-/// int4 expert descriptor (mirrors `struct ExpertDescI4` in moe.hip): per projection
-/// the packed 4-bit weights + a per-output-row f32 scale (colibri's `.qs`). The
-/// "warm expert" format — passed to [`launch_moe_expert_range_i4`].
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct ExpertDescI4 {
-    pub gate_packed: *const u8,
-    pub gate_scale: *const f32,
-    pub up_packed: *const u8,
-    pub up_scale: *const f32,
-    pub down_packed: *const u8,
-    pub down_scale: *const f32,
 }
 
 unsafe extern "C" {
@@ -46,7 +36,7 @@ unsafe extern "C" {
         inter: i32,
         e_start: i32,
         e_count: i32,
-        descs: *const ExpertDescI4,
+        descs: *const ExpertDesc,
         wexpert: *const f32,
         h: *mut f32,
         partial: *mut f32,
@@ -60,7 +50,7 @@ unsafe extern "C" {
         inter: i32,
         e_start: i32,
         e_count: i32,
-        descs: *const ExpertDescVq,
+        descs: *const ExpertDesc,
         gate_cb: *const u16,
         up_cb: *const u16,
         down_cb: *const u16,
@@ -280,7 +270,7 @@ pub unsafe fn launch_moe_expert_range(
     inter: usize,
     e_start: usize,
     e_count: usize,
-    descs: *const ExpertDescVq,
+    descs: *const ExpertDesc,
     gate_cb: *const u16,
     up_cb: *const u16,
     down_cb: *const u16,
@@ -312,7 +302,7 @@ pub unsafe fn launch_moe_expert_range(
 
 /// int4 counterpart of [`launch_moe_expert_range`]: gate/up + down for the absolute
 /// range `[e_start, e_start+e_count)` on `stream`, decoding int4 (per-row scale).
-/// `descs` are [`ExpertDescI4`]; partials land in the same `partial` slab and are
+/// `descs` are [`ExpertDesc`]; partials land in the same `partial` slab and are
 /// summed by [`launch_moe_reduce`], so int4 experts share the VQ reduce.
 ///
 /// # Safety
@@ -325,7 +315,7 @@ pub unsafe fn launch_moe_expert_range_i4(
     inter: usize,
     e_start: usize,
     e_count: usize,
-    descs: *const ExpertDescI4,
+    descs: *const ExpertDesc,
     wexpert: *const f32,
     h: *mut f32,
     partial: *mut f32,

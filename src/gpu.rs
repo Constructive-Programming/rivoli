@@ -12,7 +12,7 @@ use crate::attn::{AttnMode, streaming_rows};
 use crate::device::DeviceBuf;
 use crate::gpustream::{HipEvent, HipStream, Signal, stream_signal};
 use crate::hip::{
-    ExpertDescI4, ExpertDescVq, device_sync, launch_append_kv, launch_argmax, launch_attend,
+    ExpertDesc, device_sync, launch_append_kv, launch_argmax, launch_attend,
     launch_embed_i8_row, launch_gather_rope, launch_gemv_f32, launch_gemv_fp8, launch_gemv_i8,
     launch_index_append, launch_index_head_route, launch_index_pool_push, launch_index_score,
     launch_layernorm, launch_mla_absorb_fp8, launch_mla_value_fp8, launch_moe_expert_range,
@@ -30,23 +30,14 @@ use futures_util::stream::{StreamExt, TryStreamExt};
 /// in-memory bytes ARE its LE serialization). Feeds the per-token H2D uploads (attn
 /// rows/heads u32, expert descriptors, weights f32) with no staging buffer.
 fn as_le_bytes<T: Copy>(v: &[T]) -> &[u8] {
-    // SAFETY: `T: Copy` POD (u32/f32/repr(C) ExpertDescVq); LE host == LE bytes.
+    // SAFETY: `T: Copy` POD (u32/f32/repr(C) ExpertDesc); LE host == LE bytes.
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
-// The int4 path uploads these ExpertDescVq bytes and reinterprets them as
-// ExpertDescI4 at the launch site (see the expert stream + Pin::i4). Both are
-// repr(C) six-pointer structs — lock the shared size/align so a future field on one
-// can't silently break the reinterpret.
-const _: () = assert!(
-    std::mem::size_of::<ExpertDescVq>() == std::mem::size_of::<ExpertDescI4>()
-        && std::mem::align_of::<ExpertDescVq>() == std::mem::align_of::<ExpertDescI4>(),
-);
-
 /// Build one expert's descriptor (six device pointers) from its resolved `MlpVq`.
-/// For int4 the same bytes are reinterpreted as `ExpertDescI4` downstream.
-fn desc_of_vq(m: &MlpVq) -> ExpertDescVq {
-    ExpertDescVq {
+/// One `ExpertDesc` for both formats — the int4 kernel reinterprets the same bytes.
+fn desc_of_vq(m: &MlpVq) -> ExpertDesc {
+    ExpertDesc {
         gate_indices: m.gate.indices,
         gate_scales: m.gate.scales,
         up_indices: m.up.indices,
@@ -230,9 +221,9 @@ pub struct GpuEngine<'a> {
     /// The three per-projection VQ codebooks (gate/up/down), fp16, resident.
     codebooks: [*const u16; 3],
     mlps_vq: Vec<MlpVq>,
-    descs_vq: Vec<ExpertDescVq>,
+    descs_vq: Vec<ExpertDesc>,
     /// Per-expert format for the current layer's batch: `true` = int4 slab (launch the
-    /// int4 kernel + reinterpret the descriptor as `ExpertDescI4`), `false` = int3-VQ.
+    /// int4 kernel + reinterprets the descriptor bytes), `false` = int3-VQ.
     /// Filled by [`Pin::submit_layer`] for routed experts; the folded shared expert
     /// appends [`Pin::shared_i4`].
     fmt: Vec<bool>,
@@ -351,7 +342,7 @@ impl<'a> GpuEngine<'a> {
             moe_out: f(cfg.hidden)?,
             moe_partial: f(slots * cfg.hidden)?,
             moe_h: f(slots * cfg.moe_inter)?,
-            descs_buf: DeviceBuf::new(slots * std::mem::size_of::<ExpertDescVq>())?,
+            descs_buf: DeviceBuf::new(slots * std::mem::size_of::<ExpertDesc>())?,
             wexpert_buf: f(slots)?,
             logits: f(cfg.vocab)?,
             argmax_dev: DeviceBuf::new(8)?, // [i32 index | f32 value]
@@ -864,10 +855,9 @@ impl<'a> GpuEngine<'a> {
                     self.moe_partial.ptr_mut() as *mut f32,
                     self.moe_out.ptr_mut() as *mut f32,
                 );
-                let descs_ptr = self.descs_buf.ptr() as *const ExpertDescVq;
-                // Same descriptor bytes (six device pointers, at int4 slot offsets)
-                // reinterpreted for the int4 kernel — see Pin::i4 / ExpertDescI4.
-                let descs_i4_ptr = self.descs_buf.ptr() as *const ExpertDescI4;
+                // One descriptor buffer for both kernels — the int4 kernel reinterprets
+                // the same six-pointer bytes (at its slot offsets).
+                let descs_ptr = self.descs_buf.ptr() as *const ExpertDesc;
                 // Per-expert format (routed experts from their slab; shared appended
                 // above). Cloned so the expert stream owns it (the small bool vec moves
                 // into the async closure). Hybrid mixes int4/vq3 within one batch.
@@ -906,7 +896,7 @@ impl<'a> GpuEngine<'a> {
                             unsafe {
                                 if i4 {
                                     launch_moe_expert_range_i4(
-                                        x_c, hidden, inter, e, 1, descs_i4_ptr, w_ptr, h_c, part_c,
+                                        x_c, hidden, inter, e, 1, descs_ptr, w_ptr, h_c, part_c,
                                         cs_raw,
                                     )
                                 } else {

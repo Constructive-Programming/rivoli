@@ -154,19 +154,17 @@ pub fn vq_expert(layer: &[u8], e: usize, hidden: usize, moe_inter: usize) -> [Vq
     let stride = vq_expert_stride(hidden, moe_inter);
     let blk = &layer[e * stride..e * stride + vq_expert_bytes(hidden, moe_inter)];
     let dims = vq_expert_layout(hidden, moe_inter);
-    let mut off = 0;
+    let off = vq_slot_offsets(hidden, moe_inter); // the single source of the layout
     core::array::from_fn(|k| {
         let (o_dim, i_dim) = dims[k];
-        let idx_bytes = o_dim * vq_row_bytes(i_dim);
-        let sc_bytes = o_dim * vq_groups(i_dim) * 2;
-        let proj = VqProj {
-            indices: &blk[off..off + idx_bytes],
-            scales: &blk[off + idx_bytes..off + idx_bytes + sc_bytes],
+        let (io, so) = (off[k * 2], off[k * 2 + 1]); // indices start, scales start
+        let sc_end = so + o_dim * vq_groups(i_dim) * 2;
+        VqProj {
+            indices: &blk[io..so], // indices span [io, so): scales begin at so
+            scales: &blk[so..sc_end],
             o_dim,
             i_dim,
-        };
-        off += idx_bytes + sc_bytes;
-        proj
+        }
     })
 }
 
@@ -406,10 +404,27 @@ pub fn i4_expert_stride(hidden: usize, moe_inter: usize) -> usize {
     i4_expert_bytes(hidden, moe_inter).div_ceil(VQ_ALIGN) * VQ_ALIGN
 }
 
-/// The six byte offsets within one int4 expert block, in [`ExpertDescI4`] field
-/// order: `[gate_packed, gate_scale, up_packed, up_scale, down_packed, down_scale]`.
+/// The six byte offsets within one int3-VQ expert block:
+/// `[gate.indices, gate.scales, up.indices, up.scales, down.indices, down.scales]`.
+/// The SINGLE source of the `.vq3` slot layout — [`vq_expert`] slices by it and the pin
+/// points its descriptors at it, so the two cannot disagree.
+pub fn vq_slot_offsets(hidden: usize, moe_inter: usize) -> [usize; 6] {
+    let dims = vq_expert_layout(hidden, moe_inter);
+    let mut off = [0usize; 6];
+    let mut base = 0usize;
+    for (p, &(o, i)) in dims.iter().enumerate() {
+        off[p * 2] = base; // projection indices
+        off[p * 2 + 1] = base + o * vq_row_bytes(i); // bf16 group scales
+        base += vq_proj_bytes(o, i);
+    }
+    off
+}
+
+/// The six byte offsets within one int4 expert block, in expert-descriptor field
+/// order: `[gate_packed, gate_scale, up_packed, up_scale, down_packed, down_scale]`
+/// (moe.hip's int4 interpretation of the shared `ExpertDesc` six-pointer layout).
 /// Every packed span starts 4-byte aligned (rows are `i_dim/2`, i_dim a multiple of
-/// 8), so `dot_i4_wave`'s dword fast path stays valid. `ExpertDescI4` — crate::hip.
+/// 8), so `dot_i4_wave`'s dword fast path stays valid.
 pub fn i4_slot_offsets(hidden: usize, moe_inter: usize) -> [usize; 6] {
     let [(go, gi), (uo, ui), (dno, dni)] = vq_expert_layout(hidden, moe_inter);
     let gp = 0;

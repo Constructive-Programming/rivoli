@@ -5,7 +5,7 @@
 use rivoli::device::DeviceBuf;
 use rivoli::gpustream::HipStream;
 use rivoli::hip::{
-    ExpertDescI4, ExpertDescVq, attend_scratch_floats, device_sync, launch_argmax, launch_attend,
+    ExpertDesc, attend_scratch_floats, device_sync, launch_argmax, launch_attend,
     launch_gemv_fp8, launch_gemv_vq, launch_mla_absorb_fp8, launch_mla_value_fp8,
     launch_moe_expert_range, launch_moe_expert_range_i4, launch_moe_reduce, launch_vadd,
 };
@@ -457,8 +457,8 @@ fn moe_vq_matches_reference() {
         bufs.push(dev(&b));
         bufs.last().expect("just pushed").ptr()
     };
-    let descs: Vec<ExpertDescVq> = (0..e)
-        .map(|ex| ExpertDescVq {
+    let descs: Vec<ExpertDesc> = (0..e)
+        .map(|ex| ExpertDesc {
             gate_indices: push(enc[ex][0].0.clone(), &mut bufs),
             gate_scales: push(u16b(&enc[ex][0].1), &mut bufs) as *const u16,
             up_indices: push(enc[ex][1].0.clone(), &mut bufs),
@@ -495,7 +495,7 @@ fn moe_vq_matches_reference() {
                 inter,
                 k,
                 1,
-                descb.ptr() as *const ExpertDescVq,
+                descb.ptr() as *const ExpertDesc,
                 g0.ptr() as *const u16,
                 g1.ptr() as *const u16,
                 g2.ptr() as *const u16,
@@ -560,14 +560,17 @@ fn moe_i4_matches_reference() {
         bufs.push(dev(&b));
         bufs.last().expect("just pushed").ptr()
     };
-    let descs: Vec<ExpertDescI4> = (0..e)
-        .map(|ex| ExpertDescI4 {
-            gate_packed: push(enc[ex][0].0.clone(), &mut bufs),
-            gate_scale: push(f32b(&enc[ex][0].1), &mut bufs) as *const f32,
-            up_packed: push(enc[ex][1].0.clone(), &mut bufs),
-            up_scale: push(f32b(&enc[ex][1].1), &mut bufs) as *const f32,
-            down_packed: push(enc[ex][2].0.clone(), &mut bufs),
-            down_scale: push(f32b(&enc[ex][2].1), &mut bufs) as *const f32,
+    // One ExpertDesc for both formats: the int4 kernel reads the six pointers as
+    // packed weights + f32 row-scale (the scale ptr is typed *const u16 but only its
+    // ADDRESS matters — cast the f32 buffer ptr through it).
+    let descs: Vec<ExpertDesc> = (0..e)
+        .map(|ex| ExpertDesc {
+            gate_indices: push(enc[ex][0].0.clone(), &mut bufs),
+            gate_scales: push(f32b(&enc[ex][0].1), &mut bufs) as *const u16,
+            up_indices: push(enc[ex][1].0.clone(), &mut bufs),
+            up_scales: push(f32b(&enc[ex][1].1), &mut bufs) as *const u16,
+            down_indices: push(enc[ex][2].0.clone(), &mut bufs),
+            down_scales: push(f32b(&enc[ex][2].1), &mut bufs) as *const u16,
         })
         .collect();
     let descb = dev(unsafe {
@@ -586,7 +589,7 @@ fn moe_i4_matches_reference() {
                 inter,
                 k,
                 1,
-                descb.ptr() as *const ExpertDescI4,
+                descb.ptr() as *const ExpertDesc,
                 wb.ptr() as *const f32,
                 hbuf.ptr_mut() as *mut f32,
                 pbuf.ptr_mut() as *mut f32,
