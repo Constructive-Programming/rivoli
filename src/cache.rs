@@ -433,6 +433,17 @@ impl Cache for TwoQ {
 pub struct Arc {
     c: usize,
     p: usize,
+    /// `None` = dynamic ARC (adaptive `p`, promote-on-hit). `Some((n_cold, n_hot))` =
+    /// FIXED PARTITION for the format hybrid: T1 (recency) hard-capped at `n_cold`
+    /// (COLD/vq3 slab), T2 (frequency) at `n_hot` (HOT/int4). Like [`TwoQ::fixed`]: a
+    /// hit stays in its tier (a resident expert can't migrate slabs without a refetch),
+    /// promotion T1→T2 rides the B1/B2 ghost on a MISS, and an insert only evicts from
+    /// its own tier → evicted_tier == insert_tier. Drops ARC's adaptivity for two
+    /// right-sized slabs. The two ghosts are ARC's flavour vs 2Q's single A1out.
+    fixed: Option<(usize, usize)>,
+    /// Fixed-partition ghost bound (each of B1/B2 trimmed to this) — 0 in dynamic ARC,
+    /// where the ghosts are bounded implicitly by the paper's invariants.
+    kout: usize,
     t1: OrderedSet,
     t2: OrderedSet,
     b1: OrderedSet,
@@ -443,11 +454,48 @@ impl Arc {
         Self {
             c: cap.max(1),
             p: 0,
+            fixed: None,
+            kout: 0,
             t1: OrderedSet::default(),
             t2: OrderedSet::default(),
             b1: OrderedSet::default(),
             b2: OrderedSet::default(),
         }
+    }
+
+    /// Fixed-partition ARC for the format hybrid (see the `fixed` field). `n_cold` =
+    /// T1/COLD/vq3 cap, `n_hot` = T2/HOT/int4 cap, `kout` = each ghost's bound (how far
+    /// back a returning expert is still remembered → promoted to HOT).
+    pub fn fixed(n_cold: usize, n_hot: usize, kout: usize) -> Self {
+        Self {
+            c: (n_cold + n_hot).max(1),
+            p: 0,
+            fixed: Some((n_cold.max(1), n_hot.max(1))),
+            kout: kout.max(1),
+            t1: OrderedSet::default(),
+            t2: OrderedSet::default(),
+            b1: OrderedSet::default(),
+            b2: OrderedSet::default(),
+        }
+    }
+
+    /// Fixed-partition eviction: pop the tier's LRU into its ghost, trimmed to `kout`.
+    /// `hot` picks T2/B2 (else T1/B1). Frees one slot in that tier's slab.
+    fn evict_tier(&mut self, hot: bool) -> Option<u32> {
+        let kout = self.kout;
+        let (resident, ghost) = if hot {
+            (&mut self.t2, &mut self.b2)
+        } else {
+            (&mut self.t1, &mut self.b1)
+        };
+        let v = resident.pop_lru();
+        if let Some(v) = v {
+            ghost.touch(v);
+            while ghost.len() > kout {
+                ghost.pop_lru();
+            }
+        }
+        v
     }
     /// Admit `k` into T1 recency on a fresh miss (no ghost hit): make room per the
     /// paper's Case IV cases, evict one resident to a ghost if at capacity, then
@@ -498,6 +546,19 @@ impl Cache for Arc {
         self.t1.contains(k) || self.t2.contains(k)
     }
     fn get(&mut self, k: u32) -> bool {
+        if self.fixed.is_some() {
+            // Fixed partition: a hit STAYS in its tier (it can't migrate slabs) — just
+            // refresh recency in-tier. Promotion happens only on a miss (via a ghost).
+            if self.t1.contains(k) {
+                self.t1.touch(k);
+                return true;
+            }
+            if self.t2.contains(k) {
+                self.t2.touch(k);
+                return true;
+            }
+            return false;
+        }
         if self.t1.remove(k) || self.t2.contains(k) {
             self.t2.touch(k);
             return true;
@@ -505,36 +566,60 @@ impl Cache for Arc {
         false
     }
     fn insert(&mut self, k: u32) -> (Option<u32>, Tier) {
-        let c = self.c;
-        let evicted;
-        if self.b1.contains(k) {
-            let delta = (self.b2.len() / self.b1.len().max(1)).max(1);
-            self.p = (self.p + delta).min(c);
-            evicted = self.replace(false);
-            self.b1.remove(k);
-            self.t2.touch(k);
-        } else if self.b2.contains(k) {
-            let delta = (self.b1.len() / self.b2.len().max(1)).max(1);
-            self.p = self.p.saturating_sub(delta);
-            evicted = self.replace(true);
-            self.b2.remove(k);
-            self.t2.touch(k);
+        if let Some((n_cold, n_hot)) = self.fixed {
+            // FIXED PARTITION: a ghost hit (seen before, in B1 or B2) → T2/HOT; a fresh
+            // miss → T1/COLD. Evict from the SAME tier so evicted_tier == insert_tier.
+            let promote = self.b1.remove(k) | self.b2.remove(k);
+            if promote {
+                let ev = (self.t2.len() >= n_hot).then(|| self.evict_tier(true)).flatten();
+                self.t2.touch(k);
+                (ev, Tier::Hot)
+            } else {
+                let ev = (self.t1.len() >= n_cold).then(|| self.evict_tier(false)).flatten();
+                self.t1.touch(k);
+                (ev, Tier::Cold)
+            }
         } else {
-            evicted = self.admit_t1(k);
+            let c = self.c;
+            let evicted;
+            if self.b1.contains(k) {
+                let delta = (self.b2.len() / self.b1.len().max(1)).max(1);
+                self.p = (self.p + delta).min(c);
+                evicted = self.replace(false);
+                self.b1.remove(k);
+                self.t2.touch(k);
+            } else if self.b2.contains(k) {
+                let delta = (self.b1.len() / self.b2.len().max(1)).max(1);
+                self.p = self.p.saturating_sub(delta);
+                evicted = self.replace(true);
+                self.b2.remove(k);
+                self.t2.touch(k);
+            } else {
+                evicted = self.admit_t1(k);
+            }
+            (evicted, Tier::Cold)
         }
-        // ponytail: ARC reports Cold (single-format fallback) — mapping T2→Hot is a
-        // future refinement; the format hybrid is 2Q-specific today.
-        (evicted, Tier::Cold)
+    }
+    fn protect(&mut self, k: u32) {
+        // Mirror TwoQ: keep an actively-used COLD hit off the eviction block for the
+        // rest of the batch. T2 hits are already MRU-refreshed by `get`.
+        if self.fixed.is_some() && self.t1.contains(k) {
+            self.t1.touch(k);
+        }
     }
     fn insert_cold(&mut self, k: u32) -> (Option<u32>, Tier) {
         // Prefetch: force into T1 recency probation, NEVER adapting `p` or promoting
         // via the B1/B2 ghosts — a speculative prediction must not corrupt ARC's
-        // adaptation signal. Strip any stale ghost, then take the same cold-miss T1
-        // admission as `insert` (a batch coexists: replace evicts a T1/T2 LRU, never
-        // a fresh sibling).
+        // adaptation signal. Strip any stale ghost, then admit to T1/COLD.
         self.b1.remove(k);
         self.b2.remove(k);
-        (self.admit_t1(k), Tier::Cold)
+        if let Some((n_cold, _)) = self.fixed {
+            let ev = (self.t1.len() >= n_cold).then(|| self.evict_tier(false)).flatten();
+            self.t1.touch(k);
+            (ev, Tier::Cold)
+        } else {
+            (self.admit_t1(k), Tier::Cold)
+        }
     }
     fn seed(&mut self, keys: &[u32]) {
         for &k in keys.iter().take(self.c) {
@@ -855,6 +940,37 @@ mod tests {
             }
         }
         // Promotions must have actually happened (else the test proves nothing).
+        assert!(tier_of.values().any(|&t| t == Tier::Hot), "no key ever promoted to Hot");
+    }
+
+    // Same load-bearing invariant for fixed-partition ARC: an insert only evicts from
+    // the tier it enters, caps hold, and B1/B2 ghost hits promote to T2/HOT.
+    #[test]
+    fn arc_fixed_partition_evicts_same_tier() {
+        use std::collections::HashMap;
+        let (n_cold, n_hot) = (4usize, 8usize);
+        let mut c = Arc::fixed(n_cold, n_hot, 64); // big ghost so keys survive to promote
+        let mut tier_of: HashMap<u32, Tier> = HashMap::new();
+        for _pass in 0..6 {
+            for k in 0..14u32 {
+                if c.get(k) {
+                    continue;
+                }
+                let (ev, tier) = c.insert(k);
+                if let Some(ev) = ev {
+                    assert_eq!(
+                        tier_of.remove(&ev),
+                        Some(tier),
+                        "evicted {ev} was not in the {tier:?} tier that {k} entered"
+                    );
+                }
+                tier_of.insert(k, tier);
+                let hot = tier_of.values().filter(|&&t| t == Tier::Hot).count();
+                let cold = tier_of.values().filter(|&&t| t == Tier::Cold).count();
+                assert!(hot <= n_hot && cold <= n_cold, "over cap: hot {hot} cold {cold}");
+                assert_eq!(hot + cold, c.resident_len(), "tier tally != resident_len");
+            }
+        }
         assert!(tier_of.values().any(|&t| t == Tier::Hot), "no key ever promoted to Hot");
     }
 
