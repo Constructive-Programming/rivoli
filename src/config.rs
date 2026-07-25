@@ -25,8 +25,8 @@ pub enum Mode {
     Int3Vq,
     /// Every routed expert is int4 (`.i4`): ~1.8× faster compute, bigger, fewer slots.
     Int4,
-    /// Frequent experts int4 (HOT slab), the rest int3-VQ (COLD slab). Needs both
-    /// file sets; `--hot-pct` tunes the byte split.
+    /// Frequent experts int4 (HOT), the rest int3-VQ (COLD). Needs both file sets; the
+    /// byte-aware policy floats the split.
     #[default]
     Hybrid,
 }
@@ -92,11 +92,6 @@ pub struct Config {
     /// Routed-expert format mode (`--mode int3-vq|int4|hybrid`, default `hybrid`). See
     /// [`Mode`] and MODES.md. Set by `main`, like the checksum diagnostics.
     pub mode: Mode,
-    /// HYBRID split (`--hot-pct <n>`): percent of the routed-pool BYTES given to the
-    /// int4 HOT slab (frequent tier); the rest is the int3-VQ COLD slab (probation).
-    /// Hybrid mode only (rejected otherwise). `None` ⇒ the cold-floor default (give the
-    /// probation slab a floor, rest to HOT — see `Pin::build`).
-    pub hot_pct: Option<u32>,
     /// Device budget override, bytes (`--max-mem <GiB>`). None (default) auto-sizes to
     /// `free − OS_RESERVE`. `Some(n)` uses exactly `n` — no OS reserve; the user asked
     /// for it, so it's allowed to OOM/fail at build.
@@ -161,7 +156,6 @@ impl Config {
             checksum_layer: None,
             checksum_x: false,
             mode: Mode::default(),
-            hot_pct: None,
             max_mem,
             attn,
         })
@@ -173,11 +167,10 @@ impl fmt::Display for Config {
         const GIB: f64 = (1u64 << 30) as f64;
         write!(
             f,
-            "model={} bench={:?} mode={} hot_pct={:?} attn={:?} direct_vmm_dma={} cache_policy={} 2q_kin={}% 2q_kout={}% trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={}",
+            "model={} bench={:?} mode={} attn={:?} direct_vmm_dma={} cache_policy={} 2q_kin={}% 2q_kout={}% trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={}",
             self.model,
             self.bench,
             self.mode,
-            self.hot_pct,
             self.attn,
             self.direct_vmm_dma,
             self.cache_policy,

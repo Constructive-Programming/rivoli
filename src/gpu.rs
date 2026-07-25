@@ -405,11 +405,6 @@ impl<'a> GpuEngine<'a> {
     pub fn misses(&self) -> u64 {
         self.pin.misses
     }
-    /// Intra-batch slot-reuse collisions caught by the streaming guard (each one
-    /// would have been a silently corrupted expert before the fix).
-    pub fn slot_collisions(&self) -> u64 {
-        self.pin.slot_collisions
-    }
 
     /// DIAGNOSTIC: hash the residual stream after every layer (`--checksum-x`).
     #[cfg(feature = "trace")]

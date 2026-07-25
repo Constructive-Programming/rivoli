@@ -27,8 +27,6 @@ struct Args {
     max_mem: Option<u64>,
     /// Routed-expert format (`--mode int3-vq|int4|hybrid`, default hybrid).
     mode: rivoli::config::Mode,
-    /// Hybrid split: percent of routed-pool bytes for the int4 hot slab (`--hot-pct`).
-    hot_pct: Option<u32>,
     /// Attention mode (`--attn auto|dense|streaming|dsa|misa`). `auto` picks `dsa`
     /// when the artifact carries indexer weights, else `dense`.
     attn: String,
@@ -42,7 +40,7 @@ struct Args {
 
 fn parse_args() -> Result<Args> {
     const USAGE: &str = "usage: rivoli <model-dir> [-bench <tokens>] \
-         [--mode int3-vq|int4|hybrid] [--hot-pct <pct>] [--direct-vmm-dma] \
+         [--mode int3-vq|int4|hybrid] [--direct-vmm-dma] \
          [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc] [--2q-kin <pct>] \
          [--2q-kout <pct>] [--max-mem <GiB>] \
          [--attn auto|dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>]";
@@ -58,7 +56,6 @@ fn parse_args() -> Result<Args> {
         two_q_kout: rivoli::cache::TwoQSplit::default().kout_pct(),
         max_mem: None,
         mode: rivoli::config::Mode::default(),
-        hot_pct: None,
         attn: "auto".to_string(),
         sinks: 4,
         window: 8192,
@@ -78,14 +75,6 @@ fn parse_args() -> Result<Args> {
                 a.mode = rivoli::config::Mode::parse(
                     &args.next().context("--mode requires int3-vq|int4|hybrid")?,
                 )?;
-            }
-            "--hot-pct" => {
-                a.hot_pct = Some(
-                    args.next()
-                        .context("--hot-pct requires a percentage")?
-                        .parse()
-                        .context("--hot-pct takes an integer percentage")?,
-                );
             }
             "--trace" => a.trace = Some(args.next().context("--trace requires a path")?),
             "--prompt" => a.prompt = Some(args.next().context("--prompt requires text")?),
@@ -210,11 +199,6 @@ fn main() -> Result<()> {
         cfg.checksum_x = checksum_x;
     }
     cfg.mode = a.mode;
-    cfg.hot_pct = a.hot_pct;
-    // --hot-pct tunes the hybrid byte split; it's meaningless in a single-format mode.
-    if a.hot_pct.is_some() && a.mode != rivoli::config::Mode::Hybrid {
-        bail!("--hot-pct requires --mode hybrid (got --mode {})", a.mode);
-    }
 
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -314,7 +298,6 @@ fn main() -> Result<()> {
             cfg.two_q,
             want_indexer,
             cfg.mode,
-            cfg.hot_pct,
         )?;
         info!("pin built in {:.1}s", t.elapsed().as_secs_f64());
         let max_ctx = prompt_ids.len() + ngen + 1;
@@ -340,13 +323,6 @@ fn main() -> Result<()> {
             summary.tok_per_s,
             summary.hit_pct,
         );
-        let coll = engine.slot_collisions();
-        if coll > 0 {
-            info!(
-                "slot-reuse collisions caught: {coll} — each would have been a silently \
-                 corrupted expert before the guard",
-            );
-        }
         // OTLP: one decode span carrying the always-on summary (opt-in via
         // OTEL_EXPORTER_OTLP_ENDPOINT; log-only otherwise). Exported synchronously on
         // drop — no async runtime.

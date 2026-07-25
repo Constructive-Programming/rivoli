@@ -100,14 +100,6 @@ impl HipStream {
     pub fn raw(&self) -> *mut c_void {
         self.0
     }
-
-    /// A [`Signal`] that resolves once every op enqueued on this stream *so far*
-    /// has completed on the GPU. Enqueue the work first, then call this.
-    pub fn signal(&self) -> Result<Signal> {
-        let s = Signal::pending();
-        s.arm_on(self)?;
-        Ok(s)
-    }
 }
 
 impl Drop for HipStream {
@@ -220,17 +212,24 @@ mod tests {
     // Proves the bridge resolves on GPU completion AND measures per-signal
     // round-trip latency — the number that decides whether per-expert async
     // signals (~9/layer × 75 layers/token) are affordable vs the overlap they buy.
+    // A Signal that resolves once every op enqueued on `stream` so far completes.
+    fn signal(stream: &HipStream) -> Result<Signal> {
+        let s = Signal::pending();
+        s.arm_on(stream)?;
+        Ok(s)
+    }
+
     #[test]
     fn signal_resolves_and_latency() -> Result<()> {
         let stream = HipStream::new()?;
         let rt = tokio::runtime::Builder::new_current_thread().build()?;
         // Warm the runtime + the host-func machinery.
-        rt.block_on(stream.signal()?);
+        rt.block_on(signal(&stream)?);
         let n = 2000u32;
         let t = std::time::Instant::now();
         rt.block_on(async {
             for _ in 0..n {
-                stream.signal()?.await;
+                signal(&stream)?.await;
             }
             Ok::<(), anyhow::Error>(())
         })?;

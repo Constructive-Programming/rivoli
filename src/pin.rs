@@ -176,9 +176,6 @@ pub struct Pin<'a> {
     /// and resolves each miss's load [`Signal`] when its bytes land. The expert
     /// stream awaits these; there is no batch join.
     fetch: AsyncFetch,
-    /// How many times a batch reused a slot whose read was still outstanding — each
-    /// one would have been a silent weight corruption; the async path refuses it.
-    pub slot_collisions: u64,
     pub hits: u64,
     pub misses: u64,
     /// Optional access-trace sink (`--trace`): one line per resolved MoE layer — the
@@ -396,7 +393,8 @@ struct ResolvedSlot {
 
 /// One arena tier's format: the projection offsets, the format flag, the slot stride,
 /// and the per-`(layer,expert)` O_DIRECT read-spec table. COLD/HOT are the SAME format
-/// in single-format modes (uniform stride; compaction never fires) or int3-VQ vs int4.
+/// in single-format modes (uniform stride; any compaction is a cheap same-size move)
+/// or int3-VQ vs int4 (hybrid).
 #[derive(Clone)]
 struct TierFmt {
     off: [usize; 6],
@@ -419,7 +417,6 @@ struct ArenaPool {
     key_at: HashMap<(bool, usize), u32>,  // (hot, idx) -> key, for relocation remap
     cold: TierFmt,
     hot: TierFmt,
-    relocations: u64,
 }
 
 impl ArenaPool {
@@ -483,7 +480,6 @@ impl ArenaPool {
         unsafe { memcpy_dtod(dst, src, stride)? };
         self.slot_of.insert(moved, (r.hot, r.to));
         self.key_at.insert((r.hot, r.to), moved);
-        self.relocations += 1;
         Ok(())
     }
 }
@@ -504,7 +500,6 @@ impl<'a> Pin<'a> {
         two_q: cache::TwoQSplit,
         want_indexer: bool,
         mode: Mode,
-        hot_pct: Option<u32>,
     ) -> Result<Self> {
         // `i4` = the int4 placement path is needed (int4 mode, or the hybrid HOT tier +
         // shared expert). int3-VQ uses neither. See MODES.md.
@@ -669,10 +664,9 @@ impl<'a> Pin<'a> {
 
         // Routed pool: a two-ended byte Arena over the budget left after the resident
         // set. Each expert is ONE aligned block read into a slot. COLD/HOT tiers are one
-        // format (single-format: uniform stride, arena never compacts) or int3-VQ/int4
-        // (hybrid). The byte-aware policy FLOATS the split; `--hot-pct` no longer sets a
-        // hard boundary (advisory only). A cross-tier rebalance relocates a slot.
-        let _ = hot_pct; // split self-sizes now; flag retained but advisory
+        // format (single-format: uniform stride, so a compaction relocation is always a
+        // single cheap same-size move) or int3-VQ/int4 (hybrid). The byte-aware policy
+        // floats the split; a cross-tier rebalance relocates a slot.
         let budget = capacity.saturating_sub(tier_cap);
         let vq_tier = || -> Result<TierFmt> {
             let s = vq_src.as_ref().context("vq source missing")?;
@@ -723,7 +717,6 @@ impl<'a> Pin<'a> {
             key_at: HashMap::new(),
             cold,
             hot,
-            relocations: 0,
         };
         // Ring sized for one layer's worst case: top_k demand reads (1/expert). One
         // read per expert — one aligned `.vq3`/`.i4` block, either format.
@@ -751,7 +744,6 @@ impl<'a> Pin<'a> {
             shared_i4,
             routed,
             fetch,
-            slot_collisions: 0,
             hits: 0,
             misses: 0,
             trace: trace_path

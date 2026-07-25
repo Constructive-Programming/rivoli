@@ -222,16 +222,6 @@ impl Default for TwoQSplit {
     }
 }
 
-impl TwoQSplit {
-    /// The classical 2Q split (the paper's `cap/4` probation, `cap/2` ghost) — the
-    /// scan-resistant reference the tuned [`Default`] deliberately trades away for
-    /// residency. Kept so that trade-off stays A/B-testable.
-    pub const CLASSICAL: Self = Self {
-        kin_pct: 25,
-        kout_pct: 50,
-    };
-}
-
 /// Why a `(kin_pct, kout_pct)` pair was rejected. Both carry the offending value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitError {
@@ -652,6 +642,10 @@ fn simulate(
 mod tests {
     use super::*;
 
+    /// The classical 2Q split (paper's `cap/4` probation, `cap/2` ghost) — the
+    /// scan-resistant reference the tuned `Default` trades away for residency.
+    const CLASSICAL: TwoQSplit = TwoQSplit { kin_pct: 25, kout_pct: 50 };
+
     /// Box a policy by name without `unwrap` (denied even in tests).
     fn boxed(p: &str, cap: usize) -> Box<dyn Cache> {
         match p {
@@ -697,7 +691,7 @@ mod tests {
     /// enough to still remember the hot key when it is re-referenced after the scan.
     #[test]
     fn twoq_and_arc_survive_scan() {
-        let twoq: Box<dyn Cache> = Box::new(TwoQ::new(8, TwoQSplit::CLASSICAL));
+        let twoq: Box<dyn Cache> = Box::new(TwoQ::new(8, CLASSICAL));
         assert!(survives_cold_scan(twoq, 8), "2Q must protect hot");
         assert!(
             survives_cold_scan(boxed("arc", 8), 8),
@@ -730,7 +724,7 @@ mod tests {
         );
     }
 
-    /// The percentage encoding of [`TwoQSplit::CLASSICAL`] must land on the paper's
+    /// The percentage encoding of [`CLASSICAL`] must land on the paper's
     /// `cap/4` probation and `cap/2` ghost exactly — 4 and 2 divide 100, so
     /// `cap*25/100 == cap/4` and `cap*50/100 == cap/2` for EVERY cap, the same
     /// integer rather than a rounding coincidence. Checked across every capacity
@@ -738,7 +732,7 @@ mod tests {
     /// `clamp(1, cap-1)` floor/ceiling.
     #[test]
     fn classical_split_maps_to_paper_fractions() {
-        let d = TwoQSplit::CLASSICAL;
+        let d = CLASSICAL;
         for cap in [1usize, 2, 3, 4, 7, 8, 13, 64, 97, 100, 101, 1024, 4099] {
             let ceiling = cap.saturating_sub(1).max(1);
             assert_eq!(
