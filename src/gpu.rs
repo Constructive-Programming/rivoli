@@ -1030,6 +1030,12 @@ impl<'a> GpuEngine<'a> {
         let (hit0, miss0, decode_wall) = rt.block_on(async {
             let mut pos = 0usize;
             for &tok in prompt_ids {
+                // Beat the watchdog per prefill token too — a long/cold prompt can
+                // exceed the deadline mid-prefill while making normal progress, and only
+                // the decode loop beat before, so it would kill a healthy process.
+                if let Some(hb) = &self.heartbeat {
+                    hb.beat();
+                }
                 self.forward(tok, pos).await?;
                 pos += 1;
             }

@@ -27,8 +27,9 @@ pub trait HybridPolicy {
     fn get(&mut self, k: u32) -> bool;
     /// Admit a known-miss key: pick its tier, evict until it fits the byte budget.
     fn admit(&mut self, k: u32) -> Admission;
-    /// Keep a just-hit COLD key off the eviction block for the rest of this batch
-    /// (mirrors [`cache::Cache::protect`](crate::cache::Cache::protect)).
+    /// Keep a just-hit key off the eviction block for the rest of this batch. Default
+    /// no-op: only needed when `get` does NOT move the hit off the eviction end (TwoQ's
+    /// FIFO A1in); LRU/ARC `get` already promote to MRU.
     fn protect(&mut self, _k: u32) {}
     /// Bytes currently resident — the pin/tests check this never exceeds the budget.
     fn resident_bytes(&self) -> usize;
@@ -149,11 +150,9 @@ impl HybridPolicy for HybridLru {
         }
         Admission { tier, evicted }
     }
-    fn protect(&mut self, k: u32) {
-        if self.cold.contains(k) {
-            self.cold.touch(k);
-        }
-    }
+    // protect: trait default no-op — `get` already touches the hit to MRU, so a
+    // same-batch miss's eviction (LRU end) can't take it. Only TwoQ (FIFO A1in) needs
+    // an override.
     fn resident_bytes(&self) -> usize {
         self.cold.len() * self.g.cold_stride + self.hot.len() * self.g.hot_stride
     }
@@ -335,11 +334,7 @@ impl HybridPolicy for HybridArc {
             Admission { tier: Tier::Cold, evicted }
         }
     }
-    fn protect(&mut self, k: u32) {
-        if self.t1.contains(k) {
-            self.t1.touch(k);
-        }
-    }
+    // protect: trait default no-op — `get` already promotes the hit to T2/T1 MRU.
     fn resident_bytes(&self) -> usize {
         self.t1.len() * self.g.cold_stride + self.t2.len() * self.g.hot_stride
     }
