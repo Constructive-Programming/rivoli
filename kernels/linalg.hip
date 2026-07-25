@@ -115,6 +115,21 @@ extern "C" __global__ void gemv_i8(
     if (lane == 0) y[o] = acc * scale[o];
 }
 
+// y[o] = scale[o]·Σ_i x[i]·(nibble(o,i)-8) — per-row int4, wave-per-row (the exact
+// dot_i4_wave the MoE kernels use). Exists so the dot's decode throughput can be
+// measured in isolation against gemv_vq / gemv_fp8 at the MoE projection dims,
+// free of the routing/miss-count confound the decode bench has.
+extern "C" __global__ void gemv_i4(
+    const float* __restrict__ x, const unsigned char* __restrict__ packed,
+    const float* __restrict__ scale, int o_dim, int i_dim, float* __restrict__ y) {
+    int lane = threadIdx.x & (WAVE - 1);
+    size_t o = (size_t)blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x / WAVE);
+    if (o >= (size_t)o_dim) return;
+    size_t rb = (size_t)((i_dim + 1) / 2);
+    float dv = dot_i4_wave(x, packed + o * rb, i_dim, lane);
+    if (lane == 0) y[o] = dv * scale[o];
+}
+
 // h[i] = silu(g[i])·u[i], silu(x)=x/(1+e^-x) — the SwiGLU combine for the dense
 // fp8 MLP (moe.hip does this internally for VQ experts; the dense path is three
 // gemv_fp8 + this). Safe in place (h may alias g): each thread reads g[i]/u[i] then
@@ -233,6 +248,16 @@ extern "C" int rivoli_gemv_vq(
     if (o_dim <= 0 || i_dim <= 0) return 1001;
     hipGetLastError();
     hipLaunchKernelGGL(gemv_vq, ROW_GRID(o_dim), ROW_BLOCK, 0, 0, x, indices, scales, codebook, o_dim, i_dim, y);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+extern "C" int rivoli_gemv_i4(
+    const float* x, const unsigned char* packed, const float* scale, int o_dim, int i_dim,
+    float* y) {
+    if (o_dim <= 0 || i_dim <= 0) return 1001;
+    hipGetLastError();
+    hipLaunchKernelGGL(gemv_i4, ROW_GRID(o_dim), ROW_BLOCK, 0, 0, x, packed, scale, o_dim, i_dim, y);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

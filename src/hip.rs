@@ -96,6 +96,14 @@ unsafe extern "C" {
         i_dim: i32,
         y: *mut f32,
     ) -> i32;
+    fn rivoli_gemv_i4(
+        x: *const f32,
+        packed: *const u8,
+        scale: *const f32,
+        o_dim: i32,
+        i_dim: i32,
+        y: *mut f32,
+    ) -> i32;
 
     #[allow(clippy::too_many_arguments)]
     fn rivoli_mla_absorb_fp8(
@@ -520,6 +528,24 @@ pub unsafe fn launch_gemv_vq(
     // SAFETY: caller's pointer contract.
     let r = unsafe { rivoli_gemv_vq(x, indices, scales, codebook, o_dim as i32, i_dim as i32, y) };
     check(r, "gemv_vq")
+}
+
+/// Per-row int4 GEMV `y[o] = scale[o]·Σ x·(nibble-8)` — the MoE `dot_i4_wave`
+/// wave-per-row, for the dot-throughput microbench.
+///
+/// # Safety
+/// Device pointers live until the next [`device_sync`].
+pub unsafe fn launch_gemv_i4(
+    x: *const f32,
+    packed: *const u8,
+    scale: *const f32,
+    o_dim: usize,
+    i_dim: usize,
+    y: *mut f32,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r = unsafe { rivoli_gemv_i4(x, packed, scale, o_dim as i32, i_dim as i32, y) };
+    check(r, "gemv_i4")
 }
 
 /// int8 embedding row lookup: `x[i] = embed[token][i]·scale[token]`.
