@@ -86,28 +86,36 @@ __device__ __forceinline__ float dot_fp8_wave(const float* __restrict__ x,
 // packed[o*rb..], rb = (dim+1)/2. Matches quant.rs::matvec_i4. The fast path reads a
 // dword (8 nibbles = 8 consecutive columns) per lane when `row` is 4-byte aligned —
 // colibri's per-row stride (dim/2, dim a multiple of 8) keeps every row aligned.
+__device__ __forceinline__ float nib(unsigned int w, int k) {
+    return (float)((int)((w >> (4 * k)) & 0xFu) - 8); // nibble k → signed weight
+}
 __device__ __forceinline__ float dot_i4_wave(const float* __restrict__ v,
                                              const unsigned char* __restrict__ row,
                                              int dim, int lane) {
-    float acc = 0.0f;
+    // Two accumulators + two float4 x-loads per lane per step: the 8 columns split
+    // into independent FMA chains (ILP), and x streams as 2×16B vector loads instead
+    // of 8 scalar loads. int4 is sequential-coalesced, so this saturates the L1/x
+    // bandwidth and keeps the ALUs busy (nibble-decode) — unlike the VQ dot's random
+    // codebook gather. Fast path needs `row` 4-byte aligned (colibri's dim/2 stride).
+    float a0 = 0.0f, a1 = 0.0f;
     int base = 0;
     if ((((size_t)row) & 3u) == 0) {
         const unsigned int* rw = (const unsigned int*)row;
         for (; base + WAVE * 8 <= dim; base += WAVE * 8) {
             int col = base + lane * 8;
             unsigned int w = rw[col >> 3]; // 8 nibbles = 8 consecutive columns
-            const float* vv = v + col;
-#pragma unroll
-            for (int k = 0; k < 8; ++k)
-                acc += vv[k] * (float)((int)((w >> (4 * k)) & 0xFu) - 8);
+            float4 x0 = *(const float4*)(v + col);
+            float4 x1 = *(const float4*)(v + col + 4);
+            a0 += x0.x * nib(w, 0) + x0.y * nib(w, 1) + x0.z * nib(w, 2) + x0.w * nib(w, 3);
+            a1 += x1.x * nib(w, 4) + x1.y * nib(w, 5) + x1.z * nib(w, 6) + x1.w * nib(w, 7);
         }
     }
     for (int i = base + lane; i < dim; i += WAVE) {
         unsigned char b = row[i >> 1];
         int n = (i & 1) ? (b >> 4) : (b & 0x0F);
-        acc += v[i] * (float)(n - 8);
+        a0 += v[i] * (float)(n - 8);
     }
-    return wave_sum(acc);
+    return wave_sum(a0 + a1);
 }
 
 #include <hip/hip_fp16.h>
