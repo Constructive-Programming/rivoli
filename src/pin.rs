@@ -25,7 +25,7 @@ use crate::device::{DeviceTier, VmmBuf};
 use crate::hip::memcpy_dtod;
 use crate::hybrid::HybridPolicy;
 use std::collections::HashMap;
-use crate::format::{Dtype, FormatMeta, I4Set, Safetensors, Vq3Set, load_codebooks};
+use crate::format::{Dtype, ExpertSet, FormatMeta, Safetensors, load_codebooks};
 use crate::gpustream::Signal;
 use crate::model::ModelConfig;
 use crate::quant::{
@@ -163,9 +163,9 @@ pub struct Pin<'a> {
     /// The `.vq3` / `.i4` streaming sources — fd owners backing the routed pool's read
     /// tables; held for the run, not read through after `build`.
     #[allow(dead_code)]
-    vq_src: Option<Vq3Set>,
+    vq_src: Option<ExpertSet>,
     #[allow(dead_code)]
-    i4_src: Option<I4Set>,
+    i4_src: Option<ExpertSet>,
     /// The always-resident shared expert's format: int4 in `--i4`/hybrid, else vq3.
     /// gpu.rs launches the folded shared expert with the matching kernel.
     shared_i4: bool,
@@ -530,7 +530,7 @@ impl<'a> Pin<'a> {
         let vq_present = mode != Mode::Int4; // int3-vq or hybrid needs a vq slab
         let vq_src = vq_present
             .then(|| {
-                Vq3Set::open(
+                ExpertSet::open_vq3(
                     dir,
                     cfg.dense_layers,
                     cfg.n_layers,
@@ -542,7 +542,7 @@ impl<'a> Pin<'a> {
             .transpose()?;
         let i4_src = i4
             .then(|| {
-                I4Set::open(
+                ExpertSet::open_i4(
                     dir,
                     cfg.dense_layers,
                     cfg.n_layers,

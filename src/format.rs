@@ -373,24 +373,25 @@ impl Vq3Header {
     }
 }
 
-/// The per-layer expert files, opened O_DIRECT. Routed experts (0..n_experts) stream
-/// via [`read_spec`]; the shared expert (block n_experts) is read once for resident
-/// placement via [`shared_block`]. Header-validated against `cfg` on open.
-pub struct Vq3Set {
+/// The per-layer expert files, opened O_DIRECT — one type for BOTH routed formats
+/// (`.vq3` and `.i4`), which differ only by the block-start offset `hbytes` (one
+/// aligned header block for `.vq3`, 0 for the headerless `.i4`) and `.vq3`'s header
+/// validation on open. Routed experts (0..n_experts) stream via [`read_spec`]; the
+/// shared expert (block n_experts) is read once for resident placement via
+/// [`shared_block`]. An `.i4` block is gate‖gate_scale‖up‖up_scale‖down‖down_scale.
+pub struct ExpertSet {
     files: Vec<std::fs::File>, // O_DIRECT, index = layer - dense_layers
     dense_layers: usize,
     n_layers: usize,
     n_experts: usize,
     stride: usize,
     expert_bytes: usize,
-    hbytes: usize, // header bytes, block 0 starts at hbytes (aligned)
+    hbytes: usize, // block 0 starts at hbytes (aligned): VQ_ALIGN for .vq3, 0 for .i4
 }
 
-impl Vq3Set {
-    /// Open every `<dir>/L{ll}.vq3`, validating each header against the config dims.
-    /// Block 0 begins at a `VQ_ALIGN`-aligned offset after the header so routed reads
-    /// stay O_DIRECT-aligned.
-    pub fn open(
+impl ExpertSet {
+    /// Open the int3-VQ `.vq3` set, validating each header against the config dims.
+    pub fn open_vq3(
         dir: &str,
         dense_layers: usize,
         n_layers: usize,
@@ -398,31 +399,77 @@ impl Vq3Set {
         hidden: usize,
         moe_inter: usize,
     ) -> Result<Self> {
-        let stride = vq_expert_stride(hidden, moe_inter);
-        let expert_bytes = vq_expert_bytes(hidden, moe_inter);
-        let hbytes = crate::quant::VQ_ALIGN; // one aligned block reserved for the header
-        let blocks = n_experts + 1; // routed + shared
-        let want = hbytes + blocks * stride;
+        Self::open(
+            dir,
+            "vq3",
+            crate::quant::VQ_ALIGN, // one aligned block reserved for the header
+            vq_expert_stride(hidden, moe_inter),
+            vq_expert_bytes(hidden, moe_inter),
+            dense_layers,
+            n_layers,
+            n_experts,
+            |path, l| {
+                // Validate the header via a separate buffered read (the O_DIRECT fd is
+                // for the streamer). Dims must match the config.
+                let hdr = std::fs::read(path)
+                    .ok()
+                    .filter(|b| b.len() >= VQ3_HEADER_BYTES)
+                    .with_context(|| format!("read {path} header"))?;
+                let h = Vq3Header::from_bytes(&hdr)?;
+                ensure!(
+                    h.layer as usize == l
+                        && h.n_experts as usize == n_experts
+                        && h.hidden as usize == hidden
+                        && h.moe_inter as usize == moe_inter,
+                    "{path}: header dims disagree with config"
+                );
+                Ok(())
+            },
+        )
+    }
+
+    /// Open the colibri int4 `.i4` set (headerless, blocks from offset 0).
+    pub fn open_i4(
+        dir: &str,
+        dense_layers: usize,
+        n_layers: usize,
+        n_experts: usize,
+        hidden: usize,
+        moe_inter: usize,
+    ) -> Result<Self> {
+        Self::open(
+            dir,
+            "i4",
+            0,
+            i4_expert_stride(hidden, moe_inter),
+            i4_expert_bytes(hidden, moe_inter),
+            dense_layers,
+            n_layers,
+            n_experts,
+            |_, _| Ok(()), // no header
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open(
+        dir: &str,
+        ext: &str,
+        hbytes: usize,
+        stride: usize,
+        expert_bytes: usize,
+        dense_layers: usize,
+        n_layers: usize,
+        n_experts: usize,
+        validate: impl Fn(&str, usize) -> Result<()>,
+    ) -> Result<Self> {
+        let want = hbytes + (n_experts + 1) * stride; // header + routed + shared
         let mut files = Vec::with_capacity(n_layers - dense_layers);
         for l in dense_layers..n_layers {
-            let path = format!("{dir}/L{l:02}.vq3");
+            let path = format!("{dir}/L{l:02}.{ext}");
             let f = open_direct(&path).with_context(|| format!("open {path}"))?;
             let len = f.metadata()?.len() as usize;
             ensure!(len == want, "{path}: {len} bytes, expected {want}");
-            // Validate the header (a small buffered read; the O_DIRECT fd is only for
-            // the streamer, so read the header via a separate buffered handle).
-            let hdr = std::fs::read(&path)
-                .ok()
-                .filter(|b| b.len() >= VQ3_HEADER_BYTES);
-            let hdr = hdr.with_context(|| format!("read {path} header"))?;
-            let h = Vq3Header::from_bytes(&hdr)?;
-            ensure!(
-                h.layer as usize == l
-                    && h.n_experts as usize == n_experts
-                    && h.hidden as usize == hidden
-                    && h.moe_inter as usize == moe_inter,
-                "{path}: header dims disagree with config"
-            );
+            validate(&path, l)?;
             files.push(f);
         }
         Ok(Self {
@@ -436,95 +483,7 @@ impl Vq3Set {
         })
     }
 
-    /// Cold-read spec for a routed expert: `(fd, begin, useful_len)`, `begin` VQ_ALIGN-aligned.
-    pub fn read_spec(&self, layer: usize, expert: usize) -> Result<(RawFd, usize, usize)> {
-        ensure!(
-            (self.dense_layers..self.n_layers).contains(&layer),
-            "layer {layer} out of MoE range"
-        );
-        ensure!(
-            expert < self.n_experts,
-            "expert {expert} >= {}",
-            self.n_experts
-        );
-        let fd = self.files[layer - self.dense_layers].as_raw_fd();
-        Ok((fd, self.hbytes + expert * self.stride, self.expert_bytes))
-    }
-
-    /// Read the shared expert's block (index `n_experts`) for resident placement.
-    /// Uses a buffered pread (loaded once at startup).
-    pub fn shared_block(&self, layer: usize) -> Result<Vec<u8>> {
-        use std::os::unix::fs::FileExt;
-        ensure!(
-            (self.dense_layers..self.n_layers).contains(&layer),
-            "layer {layer} out of MoE range"
-        );
-        let off = self.hbytes + self.n_experts * self.stride;
-        // O_DIRECT fd can't do an unaligned buffered read; reopen buffered for this
-        // one-time startup read. (Path reconstructed from the layer.)
-        let mut buf = vec![0u8; self.expert_bytes];
-        let f = &self.files[layer - self.dense_layers];
-        // The O_DIRECT fd requires aligned buffer+offset+len; `off` and expert_bytes'
-        // superset are aligned via the block stride, so read the full aligned stride.
-        let mut aligned = vec![0u8; self.stride];
-        f.read_exact_at(&mut aligned, off as u64)
-            .with_context(|| format!("read shared block layer {layer}"))?;
-        buf.copy_from_slice(&aligned[..self.expert_bytes]);
-        Ok(buf)
-    }
-
-    pub fn expert_slot(&self) -> usize {
-        self.stride
-    }
-}
-
-/// The `.i4` streaming source — colibri int4 experts repacked (bin/pack_i4) into one
-/// aligned block per expert (block index `n_experts` = the shared expert), no header,
-/// blocks from offset 0. The int4 twin of [`Vq3Set`]; the pool streams whichever
-/// format the run uses. A block is gate‖gate_scale‖up‖up_scale‖down‖down_scale
-/// ([`crate::quant::i4_slot_offsets`]).
-pub struct I4Set {
-    files: Vec<std::fs::File>, // O_DIRECT, index = layer - dense_layers
-    dense_layers: usize,
-    n_layers: usize,
-    n_experts: usize,
-    stride: usize,
-    expert_bytes: usize,
-}
-
-impl I4Set {
-    /// Open every `<dir>/L{ll}.i4`, validating each against `(n_experts+1)·stride`.
-    pub fn open(
-        dir: &str,
-        dense_layers: usize,
-        n_layers: usize,
-        n_experts: usize,
-        hidden: usize,
-        moe_inter: usize,
-    ) -> Result<Self> {
-        let stride = i4_expert_stride(hidden, moe_inter);
-        let expert_bytes = i4_expert_bytes(hidden, moe_inter);
-        let want = (n_experts + 1) * stride; // routed + shared, no header
-        let mut files = Vec::with_capacity(n_layers - dense_layers);
-        for l in dense_layers..n_layers {
-            let path = format!("{dir}/L{l:02}.i4");
-            let f = open_direct(&path).with_context(|| format!("open {path}"))?;
-            let len = f.metadata()?.len() as usize;
-            ensure!(len == want, "{path}: {len} bytes, expected {want}");
-            files.push(f);
-        }
-        Ok(Self {
-            files,
-            dense_layers,
-            n_layers,
-            n_experts,
-            stride,
-            expert_bytes,
-        })
-    }
-
-    /// Cold-read spec for a routed expert: `(fd, begin, useful_len)`, `begin`
-    /// VQ_ALIGN-aligned (block `expert` at `expert·stride`).
+    /// Cold-read spec for a routed expert: `(fd, begin, useful_len)`, `begin` aligned.
     pub fn read_spec(&self, layer: usize, expert: usize) -> Result<(RawFd, usize, usize)> {
         ensure!(
             (self.dense_layers..self.n_layers).contains(&layer),
@@ -532,22 +491,23 @@ impl I4Set {
         );
         ensure!(expert < self.n_experts, "expert {expert} >= {}", self.n_experts);
         let fd = self.files[layer - self.dense_layers].as_raw_fd();
-        Ok((fd, expert * self.stride, self.expert_bytes))
+        Ok((fd, self.hbytes + expert * self.stride, self.expert_bytes))
     }
 
-    /// Read the shared expert's block (index `n_experts`) for resident placement.
+    /// Read the shared expert's block (index `n_experts`) for resident placement, via a
+    /// one-time buffered aligned pread.
     pub fn shared_block(&self, layer: usize) -> Result<Vec<u8>> {
         use std::os::unix::fs::FileExt;
         ensure!(
             (self.dense_layers..self.n_layers).contains(&layer),
             "layer {layer} out of MoE range"
         );
-        let off = self.n_experts * self.stride;
-        let f = &self.files[layer - self.dense_layers];
+        let off = self.hbytes + self.n_experts * self.stride;
         // O_DIRECT needs aligned buffer+offset+len; read the full aligned stride.
+        let f = &self.files[layer - self.dense_layers];
         let mut aligned = vec![0u8; self.stride];
         f.read_exact_at(&mut aligned, off as u64)
-            .with_context(|| format!("read shared i4 block layer {layer}"))?;
+            .with_context(|| format!("read shared block layer {layer}"))?;
         aligned.truncate(self.expert_bytes);
         Ok(aligned)
     }

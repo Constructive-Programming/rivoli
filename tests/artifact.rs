@@ -4,7 +4,7 @@
 //! it skips, so CI without a checkpoint stays green.
 #![allow(clippy::unwrap_used)]
 
-use rivoli::format::{Dtype, FormatMeta, Safetensors, Vq3Set, load_codebooks};
+use rivoli::format::{Dtype, FormatMeta, ExpertSet, Safetensors, load_codebooks};
 use rivoli::model::ModelConfig;
 use rivoli::quant::{VQ_ALIGN, VQ_DIM, VQ_K, vq_expert_bytes};
 
@@ -47,7 +47,7 @@ fn artifact_reads_back() {
         })
         .count();
     let last = cfg.dense_layers + n_present;
-    let vq = Vq3Set::open(
+    let vq = ExpertSet::open_vq3(
         &dir,
         cfg.dense_layers,
         last,

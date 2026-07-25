@@ -84,8 +84,10 @@ extern "C" __global__ void moe_reduce(
 
 // --- Streaming-pipeline launchers: gate/up + down for an ABSOLUTE expert range on
 //     a caller-owned stream (so load DMA and this compute overlap on the GPU), and
-//     a stream-scoped reduce. The pipeline runs one range per expert (or a batched
-//     resident range), each on its stream, then reduces once all `partial` rows land.
+//     a stream-scoped reduce. The pipeline currently launches ONE expert per range
+//     (e_count=1, per-expert Signal overlap); the [e_start,e_count) range form is the
+//     hook for a future batching of RESIDENT experts (whose Signals are already ready)
+//     into a single launch, to cut host-gated launch bubbles.
 extern "C" int rivoli_moe_expert_range(
     const float* x, int hidden, int inter, int e_start, int e_count, const void* descs,
     const __half* gate_cb, const __half* up_cb, const __half* down_cb, const float* wexpert,

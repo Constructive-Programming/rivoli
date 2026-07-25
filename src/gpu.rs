@@ -899,8 +899,13 @@ impl<'a> GpuEngine<'a> {
                 let tm = std::time::Instant::now();
                 // The expert stream runs inline in this (async) forward — awaited by
                 // the single decode-loop runtime, so no per-layer block_on.
+                // Width = the whole batch (ndesc = experts_per_layer), so every expert's
+                // load is in flight at once — the misses fetch while the resident/loaded
+                // experts compute. try_for_each_concurrent drives all to completion and
+                // short-circuits on the first Err (no collected Vec).
                 futures_util::stream::iter(0..ndesc)
-                    .map(move |e| {
+                    .map(Ok::<usize, anyhow::Error>)
+                    .try_for_each_concurrent(ndesc, move |e| {
                         let sig = signals[e].clone();
                         let i4 = fmt[e];
                         // Instrument: idle = time parked on the load Signal (the
@@ -924,11 +929,6 @@ impl<'a> GpuEngine<'a> {
                             }
                         })
                     })
-                    // Width = the whole batch (ndesc = experts_per_layer), so every
-                    // expert's load is in flight at once — the misses fetch while the
-                    // resident/loaded experts compute.
-                    .buffer_unordered(ndesc)
-                    .try_collect::<Vec<()>>()
                     .await?;
                 // SAFETY: partial holds ndesc·hidden f32; out is hidden f32; cs live.
                 unsafe { launch_moe_reduce(part_c, ndesc, hidden, out_c, cs_raw)? };

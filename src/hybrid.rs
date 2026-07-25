@@ -68,8 +68,8 @@ pub fn make(
 }
 
 // ---------------------------------------------------------------------------
-// LRU — recency eviction (globally oldest across both tiers), frequency-counter
-// admission (LRU has no native hot/cold signal). See MODES.md.
+// LRU — recency eviction, frequency-counter admission (LRU has no native hot/cold
+// signal). See MODES.md.
 // ---------------------------------------------------------------------------
 const LRU_HOT_THRESHOLD: u32 = 2;
 /// Halve `freq` every this many accesses so the count tracks RECENT frequency (a cooled
@@ -98,7 +98,11 @@ impl HybridLru {
             });
         }
     }
-    /// Evict the globally least-recently-used key across both tiers (real LRU).
+    /// Evict the older of the two tiers' LRU keys. NOTE: `cold` and `hot` are separate
+    /// OrderedSets with independent clocks, so this is NOT a true global LRU — the tick
+    /// comparison drifts by the cold:hot access ratio, biasing eviction toward the less
+    /// frequently touched tier. That segments recency per tier (protecting the busier
+    /// HOT tier), which is fine here; a true global LRU would need a shared clock.
     fn evict_lru(&mut self) -> Option<u32> {
         match (self.cold.peek_lru(), self.hot.peek_lru()) {
             (Some((tc, _)), Some((th, _))) => {
