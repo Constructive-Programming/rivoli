@@ -1,4 +1,5 @@
 //! rivoli — int3-vq GLM-5.2 decode engine (rewrite). See docs/ARCHITECTURE.md.
+pub mod arena;
 pub mod attn;
 pub mod cache;
 pub mod config;
