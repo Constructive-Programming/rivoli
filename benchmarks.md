@@ -329,6 +329,50 @@ made the unsupported low-swap ratio tempting in the first place.
 
 ---
 
+## Running these benches — detach anything multi-cell
+
+**A GPU run longer than the agent harness's background-task lifetime must be detached into
+its own process group, or a task reap kills the engine with it.** This is invisible from
+the code and cost a cell before it was understood.
+
+Concrete numbers from the run that hit it: a 5,185-token perplexity cell is **~44 minutes**
+(~2,613 s of scoring plus ~100 s of pin build), and the harness stopped the task at
+**~60 minutes**. One cell fits; two never can. The engine was a child of that task, so it
+died with it — `base` had completed, `j4m9` was killed 12 minutes into scoring, `j4m10`
+never started.
+
+The fix is `setsid`, and it applies to any multi-cell sweep regardless of how the script is
+invoked:
+
+```sh
+setsid nohup ./tests/ppl-sweep-powered.sh <out-dir> > resume.out 2>&1 < /dev/null &
+disown
+```
+
+**Verify detachment rather than assuming it** — "I ran setsid" and "it is actually
+detached" are different claims, and the second is the one that matters:
+
+```sh
+ps -o pid,ppid,pgid,cmd -C rivoli
+# PID 2005651  PPID 2005649  PGID 2005649  -> own process group, not a harness child
+```
+
+If `PGID` equals the process's own `PID` (and `PPID` is not the harness shell), the run
+will survive a task reap.
+
+Two related traps from the same run, both of which produce a confident wrong number rather
+than an error:
+
+- **Watchers must be keyed on content, not existence.** `--ppl-out` creates its file
+  *before* writing 5,184 lines, so a watcher testing `[ -f x.nll ]` can fire on a partial
+  file and hand the analysis a truncated cell. Key on line count.
+- **Do not re-run a completed cell "for consistency".** After a partial failure, mixing a
+  surviving cell with relaunched ones is legitimate *because* of the prefix checksum below,
+  not in spite of it. Reproducing a verified artifact costs ~44 minutes of sole-tenant
+  device time to learn nothing.
+
+---
+
 ## Measurement caveat
 
 Free-running greedy `tok/s` cannot rank modes on its own: a degenerate run routes to the

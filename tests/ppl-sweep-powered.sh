@@ -17,6 +17,14 @@
 # One process per cell — sequencing cells inside one process lets an earlier cell leave the
 # pool warm for a later one, which flatters whichever runs second.
 #
+# RUN THIS DETACHED. Each cell is ~44 min and an agent harness reaps background tasks at
+# ~60 min, killing the engine with them — one cell fits, two never do. See
+# "Running these benches — detach anything multi-cell" in benchmarks.md for the numbers and
+# the PGID check that distinguishes "I ran setsid" from "it is actually detached".
+#
+#   setsid nohup ./tests/ppl-sweep-powered.sh <out-dir> > resume.out 2>&1 < /dev/null &
+#   disown
+#
 # usage: ppl-sweep-powered.sh <out-dir> [max-mem-gib]
 set -u
 W="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
