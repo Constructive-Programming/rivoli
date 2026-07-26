@@ -71,6 +71,17 @@ unsafe extern "system" fn debug_callback(
     if !ty.contains(vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE) {
         VALIDATION_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    // stderr UNCONDITIONALLY, in addition to `tracing`.
+    //
+    // Not belt-and-braces: `tracing` alone is a NULL SINK in the binary that matters.
+    // The test harness installs no subscriber, so the counter above would move while
+    // the message text vanished — a validation failure would report as a bare number
+    // with no way to learn what the layer said, and the counter moving would make the
+    // messenger look like it worked. The alternative fix (install a subscriber in the
+    // test binary) leaves the same hole for anything else that links this crate
+    // without one. eprintln has no such dependency.
+    let level = if err { "ERROR" } else { "WARNING" };
+    eprintln!("vk validation {level}: {msg}");
     if err {
         tracing::error!("vk validation: {msg}");
     } else {

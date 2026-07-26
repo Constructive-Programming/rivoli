@@ -304,16 +304,36 @@ is real, not because the plan exists.
   concrete shape of that failure: `gemv_f32.comp` maps rows by `gl_SubgroupID`, so a
   wave64 subgroup halves `gl_NumSubgroups` and rows 4..7 of every workgroup are simply
   never written — stale contents, no fault, no diagnostic. Only an oracle catches it.
-- **No validation layer on this box** (standing, unmitigated). `VK_LAYER_KHRONOS_validation`
-  is not installed on the gfx1151 node and installing it needs root
-  (`media-libs/vulkan-layers` on Gentoo). This is the worst gap in the port: passing
-  every buffer as a bare device address with no descriptor sets means a wrong address
-  or a missing barrier reads plausible **garbage** rather than faulting, and that is
-  exactly the class the layer exists to catch. What we have instead: `spirv-val` on
-  every module in `build.rs` (static wellformedness only — it sees nothing about
-  synchronisation, descriptors, or BDA), and the numeric oracles. Init logs at WARN
-  when the layer is absent so a green run is never mistaken for a validated one.
-  Re-run the whole suite under the layer the moment it is installed.
+- ~~No validation layer on this box~~ **RESOLVED.** `VK_LAYER_KHRONOS_validation`
+  1.4.341 is installed. `Gpu::validation_layer` enables it automatically whenever the
+  loader advertises it, so **the suite runs under validation by default** — there is no
+  longer an opt-in step to forget. To get an un-validated baseline, force it off with
+  `VK_LOADER_LAYERS_DISABLE='*'` (confirmed supported by this loader).
+
+  The opt-in checkers are the part that is easy to get wrong, because the default
+  config runs neither and a clean run under it says nothing about either:
+
+  | check | how | covers |
+  |---|---|---|
+  | core (VUIDs) | on by default | API misuse, object lifetimes |
+  | synchronisation | `VK_LAYER_VALIDATE_SYNC=1` | **the `Gpu::enqueue` barrier**, hazards |
+  | GPU-assisted | `VK_LAYER_GPUAV_ENABLE=1` | shader-side buffer-device-address reads |
+
+  Use the modern env vars, not `khronos_validation.enables` in a settings file — the
+  deprecated key makes the layer emit two configuration warnings of its own, which
+  `assert_validation_clean` then counts as findings. Config noise must not look like a
+  result. Run GPU-AV in its own pass: with core validation also on, the layer warns
+  that the combination is slow, and that warning is likewise counted.
+
+  Status as of the first validated run: **core and synchronisation validation both
+  clean across all four tests.** GPU-AV clean too, but see the caveat below.
+- **GPU-AV's buffer-address checker has not been proven to fire** (open). Core
+  validation was proven by tripping `VUID-VkBufferCreateInfo-size-00912`, and
+  synchronisation validation by tripping `SYNC-HAZARD-WRITE-AFTER-WRITE` with two
+  unsynchronised `vkCmdFillBuffer`s. The equivalent for GPU-AV — a deliberate
+  out-of-bounds read through a buffer reference — has NOT been done, so "GPU-AV found
+  nothing" currently means "GPU-AV was enabled and reported nothing", which is weaker.
+  Since bare device addresses are the whole design, close this before trusting it.
 - **Push-constant budget** is 128 bytes guaranteed. Buffer device addresses collapse
   every buffer argument to 8 bytes, which may retire this risk outright: `gemv_f32`
   fits in 32 bytes with zero descriptor sets, and the worst case — `moe_gateup_vq`
