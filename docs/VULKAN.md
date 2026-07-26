@@ -137,6 +137,38 @@ Two rejected alternatives, for the record:
 `DeviceBuf` needs none of this: it already does an explicit `copy_in_at`/`copy_out`,
 so it maps straight onto `vkCmdCopyBuffer` or a mapped write.
 
+### Same seam, different mechanism
+
+Where a backend cannot do a thing the same way, it must still expose the same seam.
+Moving work host-side to preserve exactness is a legitimate port, not an admission of
+defeat — and keeping the launcher signature identical is what lets `backend.rs` stay a
+build-time `pub use` instead of growing a trait.
+
+`rope_interleave` is the worked example. HIP evaluates `pow`/`cos`/`sin` in **f64**;
+GLSL has no double transcendentals at all (Float64 gives arithmetic and `floor`, not
+these), and f32 in-shader is not good enough for a reason that had to be derived rather
+than assumed:
+
+> The relative error in `inv = theta^(-2j/seg)` is **amplified by `pos`**. At j=0,
+> inv=1 and ang=pos exactly — but a 1e-7 relative error in `inv` becomes ~`ang`x1e-7
+> absolute angle error, i.e. **~1e-3 rad at pos=1e4**. That is a visibly wrong rotation,
+> not a rounding difference.
+
+So the f64 in the HIP source is load-bearing, which nobody could tell by reading it.
+`launch_rope` therefore evaluates the same f64 expression on the CPU and uploads a
+`seg/2`-entry table. The result is **bit-identical** rather than merely close, because
+both backends round the same f64 value to f32 — an in-shader f32 scheme would have been
+an approximation dressed as a port.
+
+The cost is one small upload per call and a `Cmd::scratch` list for buffers that must
+outlive recording but not the sync. The drop ordering there is not arbitrary: they are
+taken out under the mutex and dropped *after* releasing it, because `Buf::drop` calls
+`Gpu::sync`, which takes the same non-reentrant lock.
+
+Generalisation for the remaining kernels: **if a mechanism cannot be reproduced, move
+the work rather than approximating it, and keep the seam.** Ask what the HIP code is
+buying with the construct you cannot mirror, and whether the host can buy the same thing.
+
 ### Memory: copy, don't import
 
 The obvious design — import the io_uring bounce arena as a `VkBuffer` via
@@ -307,6 +339,16 @@ Two mitigations, both mechanical:
 When porting the remaining kernels, **disassemble anything whose bit-exactness matters**
 rather than trusting that the source says what it means.
 
+**And the toolchain is only one of the two sources.** The other is the porter reaching
+for the idiomatic spelling. `1.0/sqrt(z)` and `inversesqrt(z)` compute different numbers
+— Vulkan specifies the latter to 2 ULP as a single operation, HIP does a
+correctly-rounded `sqrt` then a correctly-rounded divide — and `inversesqrt` is exactly
+what a reviewer would "tidy" the explicit form into. The reciprocal guard cannot see
+this: it inspects an `OpFMul` constant, and a function substitution has none. `build.rs`
+now rejects the GLSL.std.450 `InverseSqrt` opcode by name, as a denylist that grows each
+time another such pair is identified. A one-entry denylist that fires exactly beats no
+guard.
+
 ### Bit-exactness with `math.rs`
 
 `bf16f`/`f2bf16`/`e4m3f` in `common.hpp` are bit-exact with `src/math.rs` **on the
@@ -398,6 +440,26 @@ subsumes every per-kernel oracle — nothing can be wrong in a way that survives
 interleaved A/B produced 256 greedy argmaxes byte-identical between arms across a real
 decode. So the property does hold for a correct change here, and a Vulkan run that fails
 it has a defect rather than an unrealistic target.
+
+**PRE-REGISTERED: what happens if `swiglu` breaks this gate.** `swiglu` computes
+`x/(1+exp(-x))`, and `exp` is a library function whose last bits are unspecified in both
+GLSL and HIP — two correct implementations disagree. It is therefore the first suspect if
+the token-ID comparison fails, and the options are written down **now, before the
+result**, because choosing after a red gate is when motivated reasoning is strongest:
+
+  (a) **Implement a bit-exact `exp` on both sides.** Expensive, and it changes the HIP
+      kernel — so it needs its own oracle and its own quality gate before it can be
+      trusted. Buys a genuinely identical backend.
+  (b) **Redefine the gate as identical token IDs for K tokens, K MEASURED not chosen.**
+      Honest and weaker. Makes the divergence point a reported number rather than a
+      hidden one, and a K in the hundreds is still strong evidence.
+  (c) **Accept and document the divergence, with the mechanism named.** Cheapest, and
+      only defensible if the divergence is shown to be confined to `exp` — which means
+      demonstrating it, not asserting it.
+
+The gate may well pass regardless: a low-bit `exp` difference has to survive 78 layers
+and a 154,880-way argmax to flip a single token. If it does pass, this paragraph cost
+nothing and is the contingency that was not needed.
 
 **Expect to fight the toolchain for it.** This is not a bar you meet by writing careful
 GLSL. `glslc -O` rewrote `a / 448.0` into a multiply by `fl(1/448)` under an explicit

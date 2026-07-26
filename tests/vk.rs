@@ -38,10 +38,11 @@
 #![allow(clippy::expect_used)]
 
 use rivoli::device::{DeviceBuf, DeviceTier};
-use rivoli::math::{E4M3_BLOCK, E4M3_MAX, f32_to_bf16, f32_to_e4m3};
+use rivoli::math::{E4M3_BLOCK, E4M3_MAX, f32_to_bf16, f32_to_e4m3, silu};
 use rivoli::vk::{
     Buf, ROWS_PER_BLOCK, VALIDATION_ERRORS, device_sync, gpu, launch_append_kv, launch_argmax,
-    launch_embed_i8_row, launch_gather_rope, launch_gemv_f32, launch_vadd, memcpy_dtod,
+    launch_embed_i8_row, launch_gather_rope, launch_gemv_f32, launch_rmsnorm, launch_rope,
+    launch_swiglu, launch_vadd, memcpy_dtod,
 };
 use std::sync::atomic::Ordering;
 
@@ -1308,4 +1309,390 @@ fn fwd_guards_reject_degenerate_arguments() {
     }
     // Rejecting a bad argument must not itself trip the layer.
     v.check("fwd_guards_reject_degenerate_arguments");
+}
+
+// ---------------------------------------------------------------------------
+// linalg.hip glue: swiglu, rmsnorm, rope_interleave.
+//
+// Oracles derived from kernels/linalg.hip and src/math.rs — the SPECIFICATION — and
+// from nothing else. See the header: a test written from the shader it checks agrees
+// with the shader by construction.
+// ---------------------------------------------------------------------------
+
+/// `h[i] = silu(g[i])·u[i]`, in and out of place.
+///
+/// TOLERANCE, NOT BYTES, AND DELIBERATELY. linalg.hip writes `gv / (1 + expf(-gv))`;
+/// `math.rs::silu` writes `x * (1 / (1 + (-x).exp()))`. Those are the same function and
+/// different roundings — a divide versus a multiply by a reciprocal — and underneath
+/// both sits `exp`, a library routine whose last bits are unspecified in HIP and in
+/// Vulkan alike (the SPIR-V extended instruction set promises 3 ULP on `Exp`, not
+/// correct rounding). There is no bit pattern to agree on here, so the byte-exact rule
+/// in this file's header does not apply and `assert_close` is the honest comparison.
+///
+/// ALIASING IS THE POINT OF THE SECOND ARM. linalg.hip states `h` may alias `g`, and
+/// promises it by having each thread read `g[i]` before writing `h[i]`. A shader that
+/// widened the write, reordered it ahead of a neighbouring read, or staged through a
+/// shared tile would still be perfectly correct with distinct buffers and wrong here.
+/// Running only the distinct case would leave the documented in-place contract untested.
+#[test]
+fn swiglu_matches_silu_times_u() {
+    let v = Validation::new();
+    let mut r = Lcg(0x51D);
+    // 1 (one live thread in one workgroup), 255/257 either side of the 256-thread
+    // workgroup, then ragged multi-workgroup sizes. None is a multiple of 256.
+    for n in [1usize, 255, 257, 1000, 4097] {
+        let mut g: Vec<f32> = (0..n).map(|_| r.f() * 12.0).collect();
+        // Both saturating ends, planted rather than hoped for: silu(-30) is ~-2.8e-12
+        // (the sigmoid has underflowed), silu(30) is 30 to within f32, and silu(0) is
+        // 0. -0.5 leads so that even n = 1 exercises a value the shader has to compute
+        // rather than one any implementation returns by accident.
+        let specials = [-0.5f32, 0.0, -30.0, 30.0];
+        let k = specials.len().min(n);
+        g[..k].copy_from_slice(&specials[..k]);
+        let u: Vec<f32> = (0..n).map(|_| r.f() * 2.0).collect();
+        let want: Vec<f32> = g.iter().zip(&u).map(|(a, b)| silu(*a) * b).collect();
+
+        let ub = dev(&f32b(&u));
+        for alias in [false, true] {
+            let mut gb = poison(n * 4 + GUARD);
+            gb.write_at(0, &f32b(&g)).expect("fill g");
+            let mut hb = poison(n * 4 + GUARD);
+            let (gp, hp) = if alias {
+                // ONE buffer, handed in as both operands — the in-place contract.
+                let p = gb.ptr_mut();
+                (p as *const f32, p as *mut f32)
+            } else {
+                (gb.ptr() as *const f32, hb.ptr_mut() as *mut f32)
+            };
+            // SAFETY: `g`/`u`/`h` are live Buf device addresses holding n f32 plus a
+            // guard band; aliasing g and h is explicitly permitted by the kernel. None
+            // is dropped before the sync.
+            unsafe {
+                launch_swiglu(gp, ub.ptr() as *const f32, n, hp).expect("launch");
+            }
+            device_sync().expect("sync");
+            let out = if alias {
+                readb(&gb, n * 4 + GUARD)
+            } else {
+                readb(&hb, n * 4 + GUARD)
+            };
+            let label = format!("swiglu n={n} {}", if alias { "aliased" } else { "distinct" });
+            assert_untouched(&out, n * 4, &label);
+            assert_close(&want, &f32v(&out[..n * 4]), &label);
+            // With distinct buffers `g` is an input and must come back untouched. BYTES
+            // here, unlike the result: no arithmetic is supposed to have happened to it,
+            // so any tolerance would be slack for a bug. This is what makes a shader
+            // that writes through the wrong pointer fail — in the aliased arm that bug
+            // is invisible, because the wrong pointer is the right one.
+            if !alias {
+                assert_bytes(&f32b(&g), &readb(&gb, n * 4), &format!("{label}: g unmodified"));
+            }
+        }
+    }
+    v.check("swiglu_matches_silu_times_u");
+}
+
+/// `y[i] = x[i]·(1/sqrt(mean(x²)+eps))·w[i]`, exactly as linalg.hip orders it:
+/// `(x·inv)·w`, so the only thing that can differ from the kernel is `inv` itself.
+///
+/// The mean accumulates in f64 — the kernel sums a strided partial per thread and then
+/// an LDS tree, an order no host loop reproduces, so a "reference" f32 sum would be
+/// just another arbitrary order rather than the right answer. f64 is the answer both
+/// are approximating.
+fn rmsnorm_oracle(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+    let sum: f64 = x.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+    let mean = (sum / x.len() as f64) as f32;
+    let inv = 1.0f32 / (mean + eps).sqrt();
+    x.iter().zip(w).map(|(a, b)| a * inv * b).collect()
+}
+
+/// RMSNorm against the host oracle, over sizes and over two regimes the reduction can
+/// get wrong in opposite directions.
+#[test]
+fn rmsnorm_matches_the_host_oracle() {
+    let v = Validation::new();
+    let mut r = Lcg(0x8A5);
+    let eps = 1e-6f32;
+
+    let chk = |x: &[f32], w: &[f32], label: &str| {
+        let n = x.len();
+        let want = rmsnorm_oracle(x, w, eps);
+        let (xb, wb) = (dev(&f32b(x)), dev(&f32b(w)));
+        let mut yb = poison(n * 4 + GUARD);
+        // SAFETY: `x` and `w` are n f32, `y` is n f32 plus the guard band; all three
+        // live until the sync.
+        unsafe {
+            launch_rmsnorm(
+                xb.ptr() as *const f32,
+                wb.ptr() as *const f32,
+                n,
+                eps,
+                yb.ptr_mut() as *mut f32,
+            )
+            .expect("launch");
+        }
+        device_sync().expect("sync");
+        let got = readb(&yb, n * 4 + GUARD);
+        assert_untouched(&got, n * 4, label);
+        assert_close(&want, &f32v(&got[..n * 4]), label);
+    };
+
+    // 1 (one live thread; the other 255 tree slots hold the identity and must not
+    // corrupt it), 255/256/257 around the workgroup, and 5000 — ~20 grid-stride passes
+    // per thread, ragged, so the last pass is partial.
+    for n in [1usize, 255, 256, 257, 5000] {
+        let x: Vec<f32> = (0..n).map(|_| r.f()).collect();
+        // A DISTINCT weight per element: a kernel reading `w[0]`, or dropping `w`
+        // entirely, is a coincidence away from passing on a uniform weight vector.
+        let w: Vec<f32> = (0..n).map(|_| r.f()).collect();
+        chk(&x, &w, &format!("rmsnorm n={n}"));
+    }
+
+    // LARGE DYNAMIC RANGE. One element carries the entire sum of squares: 500² = 2.5e5
+    // against ~1e-8 apiece from the other 999. Lose that one slot and the mean falls by
+    // ~1e8, `inv` rises ~1.6e4×, and EVERY output is wrong by that factor — so a
+    // dropped reduction slot is visible rather than buried under the tolerance.
+    // 777 % 256 = 9, so it lands in thread 9's strided partial and then in tree slot 9,
+    // neither of which is the identity-heavy edge of the reduction.
+    let n = 1000usize;
+    let mut x: Vec<f32> = (0..n).map(|_| r.f() * 1e-4).collect();
+    x[777] = 500.0;
+    let w: Vec<f32> = (0..n).map(|_| r.f()).collect();
+    // Only the spike's own output is checked meaningfully here — `assert_close` scales
+    // its tolerance to the largest wanted value, which is the spike's. That is fine:
+    // this case exists to move `inv`, and every other size above checks the elementwise
+    // scaling at a uniform magnitude.
+    chk(&x, &w, "rmsnorm dynamic range");
+
+    // EPS-DOMINATED. mean(x²) ~ 1e-13, three orders below eps, so `inv` is decided
+    // almost entirely by eps. Drop the eps term and `inv` goes from ~1e3 to ~1e6 — the
+    // one arrangement in which the `+ eps` could be deleted and still look right
+    // everywhere else, since at unit scale it moves the answer by 5e-7 relative.
+    let x: Vec<f32> = (0..500).map(|_| r.f() * 1e-6).collect();
+    let w: Vec<f32> = (0..500).map(|_| r.f()).collect();
+    chk(&x, &w, "rmsnorm eps-dominated");
+
+    v.check("rmsnorm_matches_the_host_oracle");
+}
+
+/// RMSNorm reduces Σx² in LDS, so it gets the bit-reproducibility test every reduction
+/// in this backend gets. Stricter than the oracle above: a reduce whose order varies
+/// with workgroup scheduling clears a 1e-3 tolerance easily, and here it would move
+/// `inv` and therefore EVERY element of the output, silently, run to run.
+///
+/// The input spans six decades on purpose. Summation order only matters when the
+/// addends differ in magnitude — over a uniform [-1,1) the f32 sum is nearly
+/// order-independent and a nondeterministic reduction would produce identical bytes
+/// anyway, making the test green for the wrong reason.
+#[test]
+fn rmsnorm_is_bit_reproducible() {
+    let v = Validation::new();
+    let mut r = Lcg(0x2E5);
+    let (n, eps) = (5003usize, 1e-6f32);
+    let x: Vec<f32> = (0..n)
+        .map(|i| r.f() * 10f32.powi(i as i32 % 7 - 3))
+        .collect();
+    let w: Vec<f32> = (0..n).map(|_| r.f()).collect();
+    let (xb, wb) = (dev(&f32b(&x)), dev(&f32b(&w)));
+    // Zero-filled, not poisoned: the all-zero guard at the end has to be able to fail.
+    let mut yb = dev(&vec![0u8; n * 4]);
+
+    // A decoy of a different shape, dispatched between repeats so the two runs do not
+    // see identical queue state. 301 is under one workgroup, so it is a different
+    // grid-stride shape as well as a different size.
+    let (dx, dw) = (dev(&f32b(&x[..301])), dev(&f32b(&w[..301])));
+    let mut dy = dev(&vec![0u8; 301 * 4]);
+
+    let run = |x: &Buf, w: &Buf, y: &mut Buf, n: usize| {
+        // SAFETY: sizes as allocated above; every Buf outlives the sync.
+        unsafe {
+            launch_rmsnorm(
+                x.ptr() as *const f32,
+                w.ptr() as *const f32,
+                n,
+                eps,
+                y.ptr_mut() as *mut f32,
+            )
+            .expect("launch");
+        }
+        device_sync().expect("sync");
+        readb(y, n * 4)
+    };
+
+    let first = run(&xb, &wb, &mut yb, n);
+    for i in 1..5 {
+        run(&dx, &dw, &mut dy, 301);
+        assert_bytes(&first, &run(&xb, &wb, &mut yb, n), &format!("rmsnorm repeat {i}"));
+    }
+    // Guard against comparing two buffers of zeros and calling it determinism.
+    assert!(
+        f32v(&first).iter().any(|v| v.abs() > 1e-6),
+        "output is all zero — the test proves nothing"
+    );
+    v.check("rmsnorm_is_bit_reproducible");
+}
+
+/// One row of `rope_interleave`, transcribed from linalg.hip: the angle in f64, `cos`
+/// and `sin` rounded to f32, and the rotation itself in f32.
+///
+/// EVERY READ COMES FROM `v` AND EVERY WRITE GOES TO `out`. That is the contract the
+/// HIP spends a `__syncthreads()` on — the destination halves `(j, half+j)` overlap the
+/// source pairs `(2j, 2j+1)`, so an implementation that writes as it goes shreds its own
+/// input. An oracle that updated in place would reproduce that bug instead of catching
+/// it.
+fn rope_row(v: &[f32], seg: usize, pos: usize, theta: f64) -> Vec<f32> {
+    let half = seg / 2;
+    let mut out = v[..seg].to_vec();
+    for j in 0..half {
+        let (a, b) = (v[2 * j], v[2 * j + 1]);
+        let inv = theta.powf(-2.0 * j as f64 / seg as f64);
+        let ang = pos as f64 * inv;
+        let (cs, sn) = (ang.cos() as f32, ang.sin() as f32);
+        out[j] = a * cs - b * sn;
+        out[half + j] = b * cs + a * sn;
+    }
+    out
+}
+
+/// Interleaved RoPE over `count` rows of `stride`, rotating each row's first `seg`.
+///
+/// WHAT THIS DOES AND DOES NOT PROVE. The trig table is a f64 `powf`/`cos`/`sin` chain,
+/// and both this oracle and the launcher evaluate it with the same Rust libm — so the
+/// ANGLES are a consistency check, not an independent one, and a misread exponent in
+/// the HIP would be reproduced identically on both sides. What is independently checked
+/// is everything downstream of the table: the interleave-to-halves permutation, the
+/// rotation's sign convention, the per-row `stride` addressing, and the read-before-
+/// write discipline. The `pos = 0` shape below is the strongest of these precisely
+/// because it removes the trig from the picture entirely.
+///
+/// TOLERANCE for pos > 0: the rotation is `a·cs - b·sn` in f32, which SPIR-V may
+/// contract into an FMA unless the shader forbids it. That is a legitimate one-ULP
+/// difference from the oracle's two roundings, so bytes are not available.
+#[test]
+fn rope_interleave_rotates_each_row() {
+    let v = Validation::new();
+    let mut r = Lcg(0x60E);
+    // (count, stride, seg, pos, theta):
+    //   3/40/32/0      pos = 0 -> a pure permutation, checked as BYTES (see below).
+    //   4/100/34/4096  half = 17: ragged, a partial subgroup, and every lane past 17
+    //                  idle. pos = 4096 is where the angle actually has to be right —
+    //                  the relative error in theta^(-2j/seg) is multiplied by pos.
+    //   2/2100/2048    seg/2 = 1024, the documented cap, and four times the workgroup
+    //                  so the in-block loop over `half` runs several iterations.
+    //   1/16/16        count = 1, stride == seg: no in-row tail, grid of one.
+    for (count, stride, seg, pos, theta) in [
+        (3usize, 40usize, 32usize, 0usize, 10000.0f64),
+        (4, 100, 34, 4096, 10000.0),
+        (2, 2100, 2048, 7, 10000.0),
+        (1, 16, 16, 1, 500000.0),
+    ] {
+        // Distinct data per row, so a kernel that ignored blockIdx and rotated row 0
+        // `count` times fails rather than coincides.
+        let rows: Vec<Vec<f32>> = (0..count)
+            .map(|_| (0..seg).map(|_| r.f()).collect())
+            .collect();
+        let bytes = count * stride * 4;
+        let mut bb = poison(bytes + GUARD);
+        for (s, row) in rows.iter().enumerate() {
+            bb.write_at(s * stride * 4, &f32b(row)).expect("fill row");
+        }
+        // SAFETY: `base` is a live Buf device address holding count*stride f32 plus the
+        // guard band; it outlives the sync.
+        unsafe {
+            launch_rope(bb.ptr_mut() as *mut f32, count, stride, seg, pos, theta)
+                .expect("launch");
+        }
+        device_sync().expect("sync");
+        let got = readb(&bb, bytes + GUARD);
+        let label = format!("rope c{count} st{stride} seg{seg} pos{pos}");
+        assert_untouched(&got, bytes, &label);
+
+        for (s, row) in rows.iter().enumerate() {
+            let base = s * stride * 4;
+            // The row's tail past `seg` is a guard region of its own — the kernel is
+            // documented to touch only the first `seg` elements of each row, and a
+            // stride/seg mix-up (or a `half` computed from stride) lands here, INSIDE
+            // the allocation where the trailing guard band cannot see it.
+            assert!(
+                got[base + seg * 4..base + stride * 4]
+                    .iter()
+                    .all(|&b| b == 0xFF),
+                "{label} row {s}: wrote past element {seg} of the row"
+            );
+            let want = rope_row(row, seg, pos, theta);
+            let g = &got[base..base + seg * 4];
+            let rl = format!("{label} row {s}");
+            if pos == 0 {
+                // BYTES. At pos = 0 every angle is 0, so cs = 1.0 and sn = 0.0 exactly
+                // and the kernel reduces to `v[j] = a`, `v[half+j] = b` — a pure
+                // de-interleave in which no value is rounded at all, contraction or not.
+                // The header's precondition for a byte-exact compare is therefore met
+                // trivially: the inputs are the outputs. `Lcg::f` cannot return exactly
+                // zero (it would need (u>>32) = 2147483647.5), so the one ambiguity
+                // that could arise — a signed zero out of `a - b*0.0`, which Vulkan does
+                // not promise to preserve — is out of reach of this data.
+                assert_bytes(&f32b(&want), g, &rl);
+            } else {
+                assert_close(&want, &f32v(g), &rl);
+            }
+        }
+    }
+    v.check("rope_interleave_rotates_each_row");
+}
+
+/// The linalg launchers' argument guards report errors rather than dispatching a
+/// degenerate grid or tripping a VUID.
+///
+/// Each rope guard gets a POSITIVE control beside its negative, because every one of
+/// them could be deleted and replaced by something stricter with the negatives still
+/// green — `stride >= seg` unconditionally would reject the legal single-row case, and
+/// `seg <= 32` would reject everything this kernel is for.
+#[test]
+fn linalg_guards_reject_degenerate_arguments() {
+    let v = Validation::new();
+    let src = dev(&[0u8; 4096]);
+    let mut dst = dev(&[0u8; 4096]);
+    let (p, q) = (src.ptr(), dst.ptr_mut());
+
+    let rope = |count: usize, stride: usize, seg: usize| {
+        // SAFETY: `dst` is a live 4096-byte Buf and outlives the sync below; the cases
+        // that are ACCEPTED here write at most 32 f32 into it. The rejected ones never
+        // reach a pointer.
+        unsafe { launch_rope(q as *mut f32, count, stride, seg, 3, 10000.0) }
+    };
+
+    // SAFETY: n = 0 is rejected before any pointer is used.
+    unsafe {
+        assert!(
+            launch_swiglu(p as *const f32, p as *const f32, 0, q as *mut f32).is_err(),
+            "swiglu n = 0"
+        );
+        assert!(
+            launch_rmsnorm(p as *const f32, p as *const f32, 0, 1e-6, q as *mut f32).is_err(),
+            "rmsnorm n = 0"
+        );
+    }
+
+    assert!(rope(0, 16, 16).is_err(), "rope count = 0");
+    assert!(rope(1, 16, 0).is_err(), "rope seg = 0");
+    // Odd seg: `half = seg/2` would truncate and the last element would never be read
+    // or written, so the guard is the only thing standing between that and silence.
+    assert!(rope(1, 16, 15).is_err(), "rope odd seg");
+    assert!(rope(1, 16, 16).is_ok(), "rope even seg must still be accepted");
+    // seg/2 > 1024 — one past the cap. The ACCEPTED boundary, seg = 2048, is exercised
+    // for real in `rope_interleave_rotates_each_row` rather than here, where the 4096
+    // byte buffer could not hold its output.
+    assert!(rope(1, 4096, 2050).is_err(), "rope seg/2 > 1024");
+    // count > 1 with stride < seg: the rows would overlap and each block would rotate
+    // bytes another block is mid-rotation on.
+    assert!(rope(2, 8, 16).is_err(), "rope count > 1 with stride < seg");
+    assert!(rope(1, 8, 16).is_ok(), "rope count = 1 ignores stride");
+    assert!(rope(2, 16, 16).is_ok(), "rope stride == seg must be accepted");
+
+    // Retire the accepted dispatches while their buffer is still alive. The guard test
+    // is about the rejections, but the controls are real launches.
+    device_sync().expect("sync");
+    // Rejecting a bad argument must not itself trip the layer — a guard that returns
+    // Err while leaving a half-built Vulkan object behind would show up here.
+    v.check("linalg_guards_reject_degenerate_arguments");
 }

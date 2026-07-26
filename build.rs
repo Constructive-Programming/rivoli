@@ -144,6 +144,7 @@ fn vulkan() {
         failures.extend(spirv_val(&spv));
         failures.extend(no_subgroup_arithmetic(&spv));
         failures.extend(no_reciprocal_rewrite(&spv));
+        failures.extend(no_banned_builtins(&spv));
     }
     assert!(
         failures.is_empty(),
@@ -240,6 +241,52 @@ fn no_reciprocal_rewrite(spv: &str) -> Vec<String> {
                 line.trim(),
                 1.0 / v
             ));
+        }
+    }
+    found
+}
+
+/// Fail the build if a module calls a GLSL.std.450 builtin whose accuracy contract
+/// differs from the HIP expression it would replace.
+///
+/// The ninth mechanised rule, and it covers a source of divergence the reciprocal guard
+/// structurally cannot: that one inspects an `OpFMul` constant, and these are FUNCTION
+/// SUBSTITUTIONS with no constant to look at.
+///
+/// The risk is not the optimiser here — it is the porter reaching for the idiomatic
+/// spelling. `inversesqrt(z)` is what a GLSL author writes, and what a reviewer would
+/// "tidy" `1.0/sqrt(z)` into; Vulkan specifies it to 2 ULP as a SINGLE operation, where
+/// HIP computes a correctly-rounded `sqrtf` and then a correctly-rounded divide. Two
+/// different numbers, from a change that reads as cleanup.
+///
+/// A denylist of one entry that fires exactly is worth more than no guard. It grows as
+/// more are identified; each needs the divergence it prevents named, or the next person
+/// cannot judge whether an exemption is safe.
+fn no_banned_builtins(spv: &str) -> Vec<String> {
+    /// `(instruction, what to write instead, why)`.
+    const BANNED: &[(&str, &str, &str)] = &[(
+        "InverseSqrt",
+        "1.0 / sqrt(z)",
+        "Vulkan specifies inversesqrt to 2 ULP as one operation; HIP does a \
+         correctly-rounded sqrt then a correctly-rounded divide, so the results differ",
+    )];
+
+    let Some(text) = disassemble(spv) else { return Vec::new() };
+    let mut found = Vec::new();
+    for line in text.lines() {
+        // Match the operand position exactly: `%n = OpExtInst %type %set <Instr> ...`.
+        // A substring search would also hit a name or a debug string.
+        let Some((_, rest)) = line.split_once(" = OpExtInst ") else { continue };
+        let Some(instr) = rest.split_whitespace().nth(2) else { continue };
+        for (banned, instead, why) in BANNED {
+            if instr == *banned {
+                found.push(format!(
+                    "{spv}: calls GLSL.std.450 `{banned}`\n  {}\n  Use `{instead}` \
+                     instead — {why}. If this call is deliberate and the divergence is \
+                     acceptable, remove it from BANNED in build.rs and say why.",
+                    line.trim()
+                ));
+            }
         }
     }
     found
