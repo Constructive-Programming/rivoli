@@ -8,6 +8,13 @@
 #ifndef RIVOLI_COMMON_GLSL
 #define RIVOLI_COMMON_GLSL
 
+// Requested HERE, not left to each includer. `wave_sum`/`wave_max` are declared
+// unconditionally, so a shader that includes this header needs the extensions whether
+// or not it calls them — making it the header's job. Leaving it to the caller means
+// every new kernel starts with the same compile error.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+
 // WAVE and ROWS_PER_BLOCK are injected by build.rs with -D, from the SAME constants
 // it uses to generate the Rust side's copy. They are deliberately NOT #defined here:
 // the launcher's grid arithmetic and the shader's row mapping must agree, and a
@@ -37,7 +44,65 @@ float wave_sum(float v) {
     return v;
 }
 
-// bf16f / f2bf16 / e4m3f are NOT here yet, on purpose. They are not conveniences —
+// Max across a subgroup, into LANE 0. Same shuffle ladder and the same lane-0-only
+// caveat as wave_sum above. Unlike a sum this is EXACT — max does no rounding, so the
+// order genuinely does not matter — but it still uses shuffles rather than
+// subgroupMax, because build.rs rejects the GroupNonUniformArithmetic capability
+// outright and a per-op exemption is not worth the hole in that guard.
+float wave_max(float v) {
+    for (uint o = WAVE / 2u; o > 0u; o >>= 1) v = max(v, subgroupShuffleDown(v, o));
+    return v;
+}
+
+// EDITING f2bf16 OR f2e4m3? Update tests/glsl_numerics.rs to match. It holds literal
+// Rust transcriptions of both and diffs them against math.rs over ~1.2M values on the
+// CPU, so it catches a mistranscribed branch without needing the GPU — but only while
+// the transcription still mirrors what is written here.
+
+// f32 -> bf16, round-to-nearest-even. MUST stay bit-exact with math.rs::f32_to_bf16 on
+// the finite domain; append_kv's roped keys are compared as BYTES against it.
+//
+// Non-finite keeps its top 16 bits verbatim, matching common.hpp — an RNE carry could
+// turn a NaN into an Inf. Note this DIVERGES from math.rs for NaN, which goes through
+// half::bf16::from_f32 and forces the quiet bit. The divergence predates the port and
+// the rule is to mirror HIP, not math.rs (docs/VULKAN.md, "Numerics").
+uint f2bf16(float x) {
+    uint b = floatBitsToUint(x);
+    if ((b & 0x7f800000u) == 0x7f800000u) return b >> 16; // inf/nan: verbatim
+    return (b + (((b >> 16) & 1u) + 0x7fffu)) >> 16;
+}
+
+// f32 -> OCP e4m3, bit-for-bit with math.rs::f32_to_e4m3 AND fwd.hip::f2e4m3: RNE on
+// the normal mantissa, round-half-away-from-zero on the subnormal, saturating to +-448,
+// 0x7f for NaN. The latent cache's quantizer; append_kv compares its output as bytes.
+//
+// The subnormal branch is the one that bites: it rounds half AWAY from zero (matching
+// Rust's `.round()`), NOT to even like the normal path, and m==8 promotes to the
+// smallest normal rather than clamping.
+uint f2e4m3(float x) {
+    if (isnan(x)) return 0x7fu;
+    uint sign = (floatBitsToUint(x) & 0x80000000u) != 0u ? 0x80u : 0u;
+    float a = abs(x);
+    if (a >= 448.0) return sign | 0x7eu;
+    if (a < 0.0009765625) return sign; // < 2^-10 rounds to zero
+    uint bits = floatBitsToUint(a);
+    int e = int((bits >> 23) & 0xffu) - 127;
+    if (e < -6) {
+        uint m = uint(floor(a * 512.0 + 0.5));
+        return m >= 8u ? (sign | 0x08u) : (sign | m);
+    }
+    uint mant = bits & 0x007fffffu;
+    uint m3 = mant >> 20;
+    uint rem = mant & 0x000fffffu;
+    const uint half_ulp = 0x00080000u;
+    if (rem > half_ulp || (rem == half_ulp && (m3 & 1u) != 0u)) m3 += 1u;
+    int exp = e + 7;
+    if (m3 == 8u) { m3 = 0u; exp += 1; }
+    if (exp >= 15 && m3 >= 7u) return sign | 0x7eu;
+    return sign | (uint(exp) << 3) | m3;
+}
+
+// bf16f / e4m3f (the DECODE directions) are NOT here yet, on purpose. They are not conveniences —
 // they are a BIT-EXACTNESS CONTRACT with src/math.rs, and unexercised code carrying a
 // correctness contract is worse than absent code, because it reads as coverage. Unused
 // GLSL is optimised out of every module, so porting them ahead of a caller ships

@@ -1,0 +1,77 @@
+// Greedy argmax over logits[0..n]. GLSL twin of fwd.hip::argmax_reduce, reproducing
+// the host fold in gpu.rs::argmax EXACTLY: best=0, bv=-inf; for i: if logits[i] > bv
+// { bv=logits[i]; best=i }.
+//
+// The combine is associative and commutative and yields the same result set as that
+// sequential `>` fold: the maximum VALUE wins; NaN NEVER wins (every compare against
+// NaN is false, so it loses to any finite value and to the -inf identity); on an exact
+// tie the SMALLER index wins. So best = lowest index of the maximum value, and the
+// returned value is logits[best] — matching the host's `bv`, so the caller's
+// `!bv.is_finite()` bail is reproduced verbatim.
+//
+// This is the last op before the sampled token. A wrong answer here is a wrong output
+// with no numeric smell — nothing downstream looks odd — so the oracle for it is
+// adversarial rather than random.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+#include "common.glsl"
+
+#define ARGMAX_THREADS (ROWS_PER_BLOCK * WAVE)
+
+layout(local_size_x = ARGMAX_THREADS) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RoF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer RwI32 { int v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer RwF32 { float v[]; };
+
+layout(push_constant) uniform Push {
+    RoF32 logits;
+    RwI32 out_idx;
+    RwF32 out_val;
+    int n;
+} pc;
+
+shared float sval[ARGMAX_THREADS];
+shared int sidx[ARGMAX_THREADS];
+
+// Written as explicit ordered branches rather than anything cleverer, because the NaN
+// behaviour IS the specification. `max()` on a NaN operand is undefined in GLSL, and a
+// `va < vb` reformulation silently changes which side a NaN loses to.
+void combine(float va, int ia, float vb, int ib, out float vo, out int io) {
+    if (vb > va)      { vo = vb; io = ib; }  // b strictly greater (b not NaN)
+    else if (va > vb) { vo = va; io = ia; }  // a strictly greater (a not NaN)
+    else if (va != va) { vo = vb; io = ib; } // a is NaN -> a loses, take b
+    else if (vb != vb) { vo = va; io = ia; } // b is NaN -> b loses, take a
+    else if (ia <= ib) { vo = va; io = ia; } // equal -> smaller index
+    else               { vo = vb; io = ib; }
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    // Identity mirrors the host initial (best=0, bv=-inf): it only wins if EVERY
+    // element is NaN or -inf, which the host also bails on because bv stays non-finite.
+    float best = -1.0 / 0.0;
+    int bidx = 0;
+    for (uint i = t; i < uint(pc.n); i += ARGMAX_THREADS) {
+        combine(best, bidx, pc.logits.v[i], int(i), best, bidx);
+    }
+    sval[t] = best;
+    sidx[t] = bidx;
+    barrier();
+
+    // Fixed-order LDS tree, not a subgroup reduce: the order is part of the contract
+    // (ties resolve to the lower index) and build.rs rejects subgroup arithmetic anyway.
+    for (uint s = ARGMAX_THREADS / 2u; s > 0u; s >>= 1) {
+        if (t < s) {
+            combine(sval[t], sidx[t], sval[t + s], sidx[t + s], sval[t], sidx[t]);
+        }
+        barrier();
+    }
+    if (t == 0u) {
+        pc.out_idx.v[0] = sidx[0];
+        pc.out_val.v[0] = sval[0];
+    }
+}

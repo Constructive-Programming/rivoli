@@ -171,6 +171,11 @@ struct Pipe {
 /// Every kernel, compiled once at init. Grows one field per ported kernel.
 struct Pipes {
     gemv_f32: Pipe,
+    embed_i8_row: Pipe,
+    append_kv: Pipe,
+    gather_rope: Pipe,
+    vadd: Pipe,
+    argmax_reduce: Pipe,
 }
 
 // SAFETY: needed because ash models the DISPATCHABLE handles (`vk::Queue`,
@@ -789,15 +794,31 @@ pub fn device_sync() -> Result<()> {
 // Pipelines
 // ---------------------------------------------------------------------------
 
+/// `Pipe::new(device, include_bytes!(<name>.spv), size_of::<PushTy>())`, so adding a
+/// kernel is one line rather than five and the .spv name cannot drift from the field.
+macro_rules! pipes {
+    ($device:expr, $($field:ident : $push:ty),+ $(,)?) => {
+        Pipes {
+            $($field: Pipe::new(
+                $device,
+                include_bytes!(concat!(env!("OUT_DIR"), "/", stringify!($field), ".spv")),
+                size_of::<$push>() as u32,
+            )?),+
+        }
+    };
+}
+
 impl Pipes {
     fn new(device: &ash::Device) -> Result<Self> {
-        Ok(Self {
-            gemv_f32: Pipe::new(
-                device,
-                include_bytes!(concat!(env!("OUT_DIR"), "/gemv_f32.spv")),
-                size_of::<GemvF32Push>() as u32,
-            )?,
-        })
+        Ok(pipes!(
+            device,
+            gemv_f32: GemvF32Push,
+            embed_i8_row: EmbedI8Push,
+            append_kv: AppendKvPush,
+            gather_rope: GatherRopePush,
+            vadd: VaddPush,
+            argmax_reduce: ArgmaxPush,
+        ))
     }
 }
 
@@ -1161,6 +1182,11 @@ push_struct! {
     }
 }
 
+/// Workgroups needed to cover `n` elements at one element per invocation.
+fn groups(n: usize) -> u32 {
+    n.div_ceil(BLOCK as usize) as u32
+}
+
 /// f32 GEMV `y = W·x` (the MoE router gate).
 ///
 /// # Safety
@@ -1471,4 +1497,224 @@ fn timeline_waiter(g: &'static Gpu) {
             s.resolve();
         }
     }
+}
+
+// --- fwd.hip tranche -------------------------------------------------------
+
+push_struct! {
+    /// Mirror of `embed_i8_row.comp`'s push block.
+    EmbedI8Push {
+        packed: u64,
+        scale: u64,
+        x: u64,
+        token: i32,
+        hidden: i32,
+    }
+}
+
+/// Embedding row lookup `x[i] = (i8)packed[token*hidden + i] * scale[token]`.
+///
+/// # Safety
+/// Device addresses of live [`Buf`]s, valid until the next [`device_sync`]: `packed`
+/// (`>= (token+1)*hidden` bytes), `scale` (`> token` f32), `x` (`hidden` f32).
+pub unsafe fn launch_embed_i8_row(
+    packed: *const u8,
+    scale: *const f32,
+    token: usize,
+    hidden: usize,
+    x: *mut f32,
+) -> Result<()> {
+    ensure!(hidden > 0, "embed_i8_row: argument guard rejected");
+    let g = gpu()?;
+    let push = EmbedI8Push {
+        packed: packed as u64,
+        scale: scale as u64,
+        x: x as u64,
+        token: token as i32,
+        hidden: hidden as i32,
+    };
+    g.dispatch(&g.pipes.embed_i8_row, &push, groups(hidden))
+}
+
+push_struct! {
+    /// Mirror of `append_kv.comp`'s push block.
+    AppendKvPush {
+        latent: u64,
+        rope: u64,
+        lc8: u64,
+        lscale: u64,
+        rc: u64,
+        pos: i32,
+        kvl: i32,
+        ropn: i32,
+        n_blocks: i32,
+    }
+}
+
+/// Append one token's latent (fp8-e4m3 + per-128 block scale) and roped key (bf16) at
+/// row `pos`.
+///
+/// # Safety
+/// Device addresses of live [`Buf`]s, valid until the next [`device_sync`]: `latent`
+/// (`kvl` f32), `rope` (`ropn` f32), `lc8` (`(pos+1)*kvl` bytes), `lscale`
+/// (`(pos+1)*n_blocks` f32), `rc` (`(pos+1)*ropn` u16).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_append_kv(
+    latent: *const f32,
+    rope: *const f32,
+    lc8: *mut u8,
+    lscale: *mut f32,
+    rc: *mut u16,
+    pos: usize,
+    kvl: usize,
+    ropn: usize,
+    n_blocks: usize,
+) -> Result<()> {
+    ensure!(
+        kvl > 0 && ropn > 0 && n_blocks > 0,
+        "append_kv: argument guard rejected"
+    );
+    // Same envelope as the HIP guard: the per-128 reduction needs kvl a multiple of 128
+    // in [128, 1024]. Here 1024 is also MAX_BLOCKS*128, one 128-block per subgroup.
+    ensure!(
+        (128..=1024).contains(&kvl) && kvl.is_multiple_of(128) && ropn <= kvl,
+        "append_kv: kvl {kvl} must be a multiple of 128 in [128,1024] and ropn {ropn} <= kvl"
+    );
+    ensure!(
+        n_blocks == kvl / 128,
+        "append_kv: n_blocks {n_blocks} != kvl/128 ({})",
+        kvl / 128
+    );
+    // STRICTER THAN THE HIP GUARD, on purpose. `rc` is u16 and this shader writes it as
+    // packed u32 words, so both the row base (pos*ropn) and the element count must be
+    // even or a word write would straddle two keys and the odd tail would be dropped.
+    // The HIP kernel writes u16 directly and does not care. Every real ropn is even (it
+    // is a rope dimension), so this is a loud refusal for a case that does not occur
+    // rather than a silently different result — which is the failure mode that matters
+    // when the two backends are supposed to agree bit for bit.
+    ensure!(
+        ropn.is_multiple_of(2),
+        "append_kv: ropn {ropn} must be even under the Vulkan backend (u16 keys are \
+         written as packed u32 words); the HIP backend accepts odd ropn"
+    );
+    let g = gpu()?;
+    let push = AppendKvPush {
+        latent: latent as u64,
+        rope: rope as u64,
+        lc8: lc8 as u64,
+        lscale: lscale as u64,
+        rc: rc as u64,
+        pos: pos as i32,
+        kvl: kvl as i32,
+        ropn: ropn as i32,
+        n_blocks: n_blocks as i32,
+    };
+    // One workgroup, like the HIP launch: the per-block reduction is workgroup-local.
+    g.dispatch(&g.pipes.append_kv, &push, 1)
+}
+
+push_struct! {
+    /// Mirror of `gather_rope.comp`'s push block.
+    GatherRopePush {
+        q: u64,
+        qrope: u64,
+        h: i32,
+        qh: i32,
+        nope: i32,
+        ropn: i32,
+    }
+}
+
+/// Gather each head's roped query segment: `qrope[head*ropn + d] = q[head*qh + nope + d]`.
+///
+/// # Safety
+/// Device addresses of live [`Buf`]s, valid until the next [`device_sync`]: `q`
+/// (`h*qh` f32), `qrope` (`h*ropn` f32).
+pub unsafe fn launch_gather_rope(
+    q: *const f32,
+    qrope: *mut f32,
+    h: usize,
+    qh: usize,
+    nope: usize,
+    ropn: usize,
+) -> Result<()> {
+    ensure!(
+        h > 0 && qh > 0 && ropn > 0 && nope + ropn <= qh,
+        "gather_rope: argument guard rejected"
+    );
+    let g = gpu()?;
+    let push = GatherRopePush {
+        q: q as u64,
+        qrope: qrope as u64,
+        h: h as i32,
+        qh: qh as i32,
+        nope: nope as i32,
+        ropn: ropn as i32,
+    };
+    g.dispatch(&g.pipes.gather_rope, &push, groups(h * ropn))
+}
+
+push_struct! {
+    /// Mirror of `vadd.comp`'s push block. `_pad` keeps the struct padding-free so
+    /// `push_struct!`'s assertion holds; the shader simply does not read it.
+    VaddPush {
+        x: u64,
+        y: u64,
+        n: i32,
+        _pad: i32,
+    }
+}
+
+/// Residual add `x[i] += y[i]`, in place.
+///
+/// # Safety
+/// Device addresses of live [`Buf`]s holding `n` f32 each, valid until the next
+/// [`device_sync`].
+pub unsafe fn launch_vadd(x: *mut f32, y: *const f32, n: usize) -> Result<()> {
+    ensure!(n > 0, "vadd: argument guard rejected");
+    let g = gpu()?;
+    let push = VaddPush {
+        x: x as u64,
+        y: y as u64,
+        n: n as i32,
+        _pad: 0,
+    };
+    g.dispatch(&g.pipes.vadd, &push, groups(n))
+}
+
+push_struct! {
+    /// Mirror of `argmax_reduce.comp`'s push block.
+    ArgmaxPush {
+        logits: u64,
+        out_idx: u64,
+        out_val: u64,
+        n: i32,
+        _pad: i32,
+    }
+}
+
+/// Greedy argmax over `logits[0..n]` → (`out_idx`, `out_val`); lowest index on a tie,
+/// NaN never wins (matches the host fold in `gpu.rs::argmax`).
+///
+/// # Safety
+/// Device addresses of live [`Buf`]s, valid until the next [`device_sync`]: `logits`
+/// (`n` f32), `out_idx` (one i32), `out_val` (one f32).
+pub unsafe fn launch_argmax(
+    logits: *const f32,
+    n: usize,
+    out_idx: *mut i32,
+    out_val: *mut f32,
+) -> Result<()> {
+    ensure!(n > 0, "argmax: argument guard rejected");
+    let g = gpu()?;
+    let push = ArgmaxPush {
+        logits: logits as u64,
+        out_idx: out_idx as u64,
+        out_val: out_val as u64,
+        n: n as i32,
+        _pad: 0,
+    };
+    // ONE workgroup: the reduction is workgroup-local and the grid-stride loop inside
+    // covers any n. Matches the HIP launch.
+    g.dispatch(&g.pipes.argmax_reduce, &push, 1)
 }
