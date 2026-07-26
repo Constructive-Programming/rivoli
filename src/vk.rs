@@ -902,15 +902,47 @@ impl Drop for Buf {
 // Kernel launchers — the `hip.rs` surface, one fn per ported kernel.
 // ---------------------------------------------------------------------------
 
-/// Mirror of `gemv_f32.comp`'s `push_constant` block. std430: three 8-byte buffer
-/// references then two ints — 32 bytes, well inside the 128-byte guaranteed budget.
-#[repr(C)]
-struct GemvF32Push {
-    x: u64,
-    w: u64,
-    y: u64,
-    o_dim: i32,
-    i_dim: i32,
+/// Declare a `push_constant` mirror struct, with both of its invariants checked AT
+/// COMPILE TIME rather than left as rules a porter has to remember at kernel 11 of 16:
+///
+/// - **No padding.** `dispatch` reads the struct as its own bytes; padding bytes are
+///   uninitialised, and reading them as `u8` is UB. std430 would also place the
+///   shader's fields differently than a padded Rust struct does, so the values would
+///   silently land in the wrong slots. A `u64` after an `i32` introduces four bytes of
+///   it, which is one field reorder away at every future launcher.
+/// - **Fits the guaranteed budget.** 128 bytes is all Vulkan promises. Exceeding it is
+///   the "push-constant budget" risk in docs/VULKAN.md; this makes it a build error
+///   instead of a device-dependent surprise, so the params-buffer fallback gets built
+///   the day it is actually needed and not before.
+///
+/// Order fields largest-first (8-byte device addresses, then 4-byte scalars) and the
+/// no-padding check is satisfied naturally.
+macro_rules! push_struct {
+    ($(#[$m:meta])* $name:ident { $($f:ident: $t:ty),+ $(,)? }) => {
+        $(#[$m])*
+        #[repr(C)]
+        struct $name { $($f: $t),+ }
+        const _: () = assert!(
+            size_of::<$name>() == 0 $(+ size_of::<$t>())+,
+            concat!(stringify!($name), " has padding: reorder fields largest-first"),
+        );
+        const _: () = assert!(
+            size_of::<$name>() <= 128,
+            concat!(stringify!($name), " exceeds the 128-byte guaranteed push budget"),
+        );
+    };
+}
+
+push_struct! {
+    /// Mirror of `gemv_f32.comp`'s `push_constant` block. std430: three 8-byte buffer
+    /// references then two ints — 32 bytes.
+    GemvF32Push {
+        x: u64,
+        w: u64,
+        y: u64,
+        o_dim: i32,
+        i_dim: i32,
+    }
 }
 
 /// f32 GEMV `y = W·x` (the MoE router gate).
