@@ -44,6 +44,10 @@ hit rate to apply.
 
 ## Where the time goes (hybrid+lru, 512 tok, the best coherent config)
 
+**Status of `route`: the per-kernel tranche on `feat/perf` measures `route` 112 → 104 ms
+in-engine** (interleaved A/B, flat control, identical miss counts, byte-identical output).
+The 115 ms below is the pre-tranche figure. See benchmarks.md, "In-engine confirmation".
+
 ```
 2.85 tok/s = 351 ms/tok
   route      115 ms   attention: MLA projections (fp8 GEMV) + absorb/value + flash attend
@@ -130,6 +134,12 @@ Grounded in the measured kernel profile.
    of x for 16 KB of weights, 402 MB of x traffic against 100 MB of weights — which is a
    cache-hierarchy question the ISA cannot answer and `ROWS_PER_BLOCK` tiling is the fix
    for. See benchmarks.md, "Read the ISA before you book the device".
+   **THIS ITEM IS MIS-SCOPED AS AN o_proj FIX — it is route-wide.** `fp8_dot_strided` is
+   the shared helper behind *every* fp8 block-scaled GEMV: `o_proj`, `q_a`, `q_b`, `kv_a`
+   and the dense MLP. Measured in-engine by a three-arm decomposition, the shift was worth
+   **−2.5 ms/tok, 2.5× the −0.98 ms o_proj alone accounts for.** Any further work on this
+   helper — load widening, x re-read tiling — inherits the same multiplier, so it is worth
+   more than its o_proj row suggests.
 
 3. **`mla_latent_attend` occupancy** *(route; scales with context — do before any
    long-context push).* ~20 ms @ nr512, grows ~linearly with context. LDS-capped to 1

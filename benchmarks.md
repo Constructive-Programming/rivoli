@@ -360,24 +360,132 @@ separate experiments (6 samples/arm) because its effect is close to the between-
 of its own baseline: all 6 base samples (534.2–548.1) sit above all 6 fix samples
 (524.7–531.7).
 
-### Per-token, which is what the plan is denominated in
+### Per-token, from the microbench — the prediction, since superseded
 
-×78 attention layers. **These are microbench conditions, so treat them as an UPPER BOUND
-on what the engine will show** — in the engine these kernels run interleaved with MoE work
-that evicts the caches they are enjoying here. Pending an in-engine run.
+×78 attention layers. Recorded as the *prediction* because the in-engine run below
+measured something different, and the gap is the interesting part.
 
 | | Δ/call | ×78 |
 |---|---:|---:|
-| `mla_absorb` | −35.50 µs | **−2.77 ms** |
-| `mla_attend` | −30.87 µs | **−2.41 ms** |
-| `o_proj` | −12.60 µs | **−0.98 ms** |
-| `mla_value` | −6.70 µs | **−0.52 ms** |
-| **total** | | **−6.68 ms/tok** |
+| `mla_absorb` | −35.50 µs | −2.77 ms |
+| `mla_attend` | −30.87 µs | −2.41 ms |
+| `o_proj` | −12.60 µs | −0.98 ms |
+| `mla_value` | −6.70 µs | −0.52 ms |
+| **predicted total** | | **−6.68 ms/tok** |
 
-≈**1.9% of the 351 ms/token budget**; `route` 115 → ~108 ms. A real but modest win, and
-worth stating plainly next to the 1.97×: a large multiple on a 72 µs kernel is a small
-number of milliseconds. **Report kernel work in the unit the budget is denominated in.**
-A subject line saying "1.97×" outlives the body that qualifies it.
+**Report kernel work in the unit the budget is denominated in.** A large multiple on a
+72 µs kernel is a small number of milliseconds, and a subject line saying "1.97×" outlives
+the body that qualifies it.
+
+## In-engine confirmation — the number a merge decision rests on
+
+`-bench 256 --mode int3-vq --cache-policy lru --max-mem 100 --attn dense`, fixed prompt,
+**interleaved** base/fix/base/fix. Same binary except the kernels.
+
+**Why `-bench` is a fixed-token bench here despite being greedy decode:** in `int3-vq`
+residency cannot reach the numerics, and all four changes are bit-identical, so both arms
+*must* decode the same tokens. Verified, not assumed — see below.
+
+| run | wall | **route** | **moe-gpu** (control) | fetch | miss/tok |
+|---|---:|---:|---:|---:|---:|
+| base.1 | 368 | **112** | 232 | 204 | 157.36 |
+| fix.1 | 382 | **103** | **253** | **224** | 157.36 |
+| base.2 | 366 | **112** | 230 | 202 | 157.36 |
+| fix.2 | 357 | **104** | 230 | 202 | 157.36 |
+
+**Clean pair (base.2 / fix.2, both uncontaminated): `route` 112 → 104, control flat at
+230, wall 366 → 357, 2.73 → 2.80 tok/s.** Miss counts identical to the decimal in every
+run (157.36/tok, 118115 hit / 45085 miss, 73.8%), so the arms are comparable.
+
+**Measured −8.5 ms in `route` against a −6.68 ms prediction — the microbench UNDER-predicted.**
+That is the opposite of the direction assumed throughout this work ("microbench caches are
+friendlier than the engine's, so treat it as an upper bound"), and it should be assumed
+*less* here still, because the prediction used `mla_attend` at nr=512 while this run's
+context only reaches ~272. **That assumption is not supported by this measurement, and no
+mechanism for the surplus is offered here.** The decomposition below establishes where
+*part* of it comes from and leaves the rest explicitly unexplained.
+
+### Interleaving flipped the conclusion — the concrete case
+
+**Round 1 alone reads as a 4% REGRESSION**: wall 368 → 382, and `moe-gpu` — the control —
+moved 232 → 253, *further than the signal did*. Round 2 shows `fix.2` at moe-gpu 230 and
+fetch 202, matching base exactly. `fix.1` was an I/O outlier; every contaminated number sat
+in the fetch-coupled buckets while `route` read 103/104 in both rounds regardless.
+
+Had the slot allowed only one round, the honest report would have been the opposite
+conclusion — a bit-identical change apparently slowing the engine by 4%. Interleaved arms
+are not a refinement here; they are the difference between the right answer and the wrong
+one.
+
+### Choosing a control bucket: `route` is insulated, `moe-gpu` is not
+
+The control was badly chosen and it is worth writing down why, because the reasoning
+generalises. **Attention runs entirely on resident weights**, so `route` never waits on the
+streamer and is structurally insulated from fetch variance. **`moe-gpu` absorbs stalls on
+streamed experts**, so it moves with NVMe and page-cache state for reasons having nothing
+to do with the kernels under test — which is precisely what it did. A control has to be
+insensitive to the noise source, not merely untouched by the change.
+
+### End-to-end bit-identity — evidence the repo has no test for
+
+The generated text is **byte-identical between arms** (1251 bytes, timestamps stripped):
+**256 greedy argmaxes over a 154,880-way vocabulary, every one landing on the same token.**
+A single-ULP shift anywhere in attention would eventually flip a near-tie and diverge the
+sequence. Every kernel oracle in this repo compares at `1e-3 * mx + 1e-3`, two to three
+orders of magnitude looser than bit-identity, while `attn.hip` states bit-identity as a
+requirement ("greedy decode needs it"). **This run is the only end-to-end check of that
+property that exists**, and it is a by-product of an A/B rather than a test. A golden-bits
+test remains an open gap.
+
+### Decomposition: `fp8_dot_strided` reaches further than o_proj
+
+The −8.5 ms exceeded prediction, so a third arm isolated the cause: `nofp8` is identical to
+`fix` except `fp8_dot_strided` reverted to the signed divide, with the MLA and attend
+changes retained. Interleaved, 2 rounds.
+
+| arm | route (r1, r2) | attributable to |
+|---|---|---|
+| base | 112, 112 | — |
+| `nofp8` | 106, 106 | MLA + attend = **−6.0 ms** |
+| `fix` | 103, 104 | fp8 helper = **−2.5 ms** |
+| | | **total −8.5 ms** |
+
+`fix` reproduced 103/104 across two independent sessions, and the parts sum to the whole.
+
+**The shared-helper reach is confirmed. `fp8_dot_strided` is worth −2.5 ms, 2.5× the
+−0.98 ms that o_proj alone accounts for** — because it is the shared helper behind *every*
+fp8 block-scaled GEMV in `route`: `o_proj`, `q_a`, `q_b`, `kv_a` and the dense MLP. **This
+matters for what gets optimised next: PERF.md described that lever as an o_proj fix, and it
+is a route-wide one.** Any future change to this helper — load widening, x re-read tiling —
+inherits the same multiplier.
+
+**Verdict: the shared-helper mechanism accounts for most of the gap, not all of it.**
+Against the prediction table above, per component:
+
+| component | predicted | measured | surplus |
+|---|---:|---:|---:|
+| fp8 helper (predicted as o_proj alone) | −0.98 | **−2.50** | **+1.52** |
+| MLA + attend (−2.77 −0.52 −2.41) | −5.70 | **−6.00** | +0.30 |
+| total | −6.68 | −8.50 | +1.82 |
+
+**The fp8 helper's extra reach explains 1.52 of the 1.82 ms — ~84%.** MLA+attend came in
+0.30 ms over, which is at the edge of what a 1 ms-resolution bucket can resolve.
+
+Two honest limits. Counting thread-iterations puts the non-o_proj fp8 GEMVs at ~0.5×
+o_proj, predicting ~−1.46 ms where −2.50 was measured, so the *size* of the reach is not
+fully derived even though its existence is now measured. And the prediction's attend term
+came from nr=512 while this run averages shorter context, so MLA+attend's context-adjusted
+expectation is below −5.70 and its true surplus is larger than +0.30. **The residue is left
+unexplained.** No second mechanism is proposed for it: one unverified explanation is a
+caveat, two stacked is a story.
+
+### Caveat: `--max-mem 100`, and what transfers
+
+This ran at `--max-mem 100` (to stay clear of concurrent agents), not the 115 behind the
+351 ms profile at the top of this file — hence 157 miss/tok and 2.41 GB/tok here against
+116 and 1.78 there, and wall ~366 vs 351. **`route` transfers** (112 measured vs 115
+recorded; attention is resident-only and budget-insensitive). **`wall` and `moe` do not** —
+they are dominated by the miss rate, which the budget sets.
 
 ### Convert to per-token even when you don't need the number — it forces contact with ground truth
 
