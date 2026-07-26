@@ -52,6 +52,29 @@ Two physical slabs. The cache policy routes each expert to one:
 - **Idea:** spend int4's size premium only where its compute win lands (the hot set),
   and keep residency high everywhere else with cheap vq3 slots. Best of both.
 
+#### Hybrid's numerics depend on cache state — read this before comparing two hybrid runs
+
+In `int3-vq` and `int4` every expert decodes from the *same* format, so residency decides
+which **reads** happen and never which **arithmetic** runs. Output is a function of the
+weights and the token prefix alone.
+
+**Hybrid breaks that.** Residency decides which *slab* an expert lands in, and the slab
+decides its *format* — int4 or int3-vq — so the numerics themselves become a function of
+cache state. Two consequences, and the distinction between them matters:
+
+- **Reproducible at a fixed configuration.** Same prompt, same `--max-mem`, same
+  `--cache-policy`, same `--hot-pct`: the pool starts empty and residency evolves
+  identically, so the output is identical run to run. Hybrid is not nondeterministic.
+- **NOT comparable across budgets or policies.** Change `--max-mem`, the policy, or
+  `--hot-pct` and you change which experts sit in which format — which changes the
+  arithmetic. **Two hybrid runs at different budgets are not the same computation**, so a
+  difference in output or quality between them cannot be attributed to the thing you were
+  varying. The format mix moved underneath the comparison.
+
+So an A/B across budgets is sound in the single-format modes and is confounded by
+construction in hybrid. If you need a cross-budget quality comparison, run it in
+`int3-vq`, where residency cannot touch the numerics.
+
 **`--hot-pct <n>`** (hybrid only; errors in other modes) sets the byte split — n% of
 the pool to the int4 HOT slab. **Default:** a *cold-slab floor* (probation must hold
 ≳2 tokens' worth of experts so it can't starve) with the rest to HOT — i.e. "push hot
@@ -134,4 +157,14 @@ Use instead:
 - **The dot microbench** (`examples/dot_bench.rs`) for pure per-format compute (this is
   where int4's 1.8× is established, with no routing in the loop).
 - **Output quality** (perplexity on fixed text / longer prompts) — *orthogonal* to the
-  split; never inferred from decode tok/s.
+  split; never inferred from decode tok/s. Use `--ppl <text> --ppl-out <path>`, which
+  scores **teacher-forced** (every position is fed the known next token, never the model's
+  own argmax) and writes one NLL per position; `bin/ppl` then compares runs **paired** at
+  each position. Pairing is what gives it the resolution — a ~1% perplexity bar is ~0.01
+  nats of mean ΔNLL, which two independently measured perplexities cannot separate from
+  sampling noise at a few hundred tokens. Report the standard error, not just the mean:
+  an underpowered null is not evidence of no harm.
+
+**And in `hybrid`, a cross-budget or cross-policy quality comparison is confounded by
+construction** — see "Hybrid's numerics depend on cache state" above. Vary the budget in
+`int3-vq`, where residency cannot reach the arithmetic.
