@@ -4,7 +4,7 @@
 //! what both need: [`OrderedSet`] (the recency structure), [`Tier`] (which residency
 //! tier a key landed in → which format slab), and [`TwoQSplit`] (2Q's Kin/Kout knobs).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Recency-ordered set of keys: O(log n) MRU-insert / arbitrary-remove / pop-LRU
 /// via a monotonic tick clock + a `BTreeMap` whose front is the LRU end.
@@ -45,10 +45,21 @@ impl OrderedSet {
         self.at.remove(&k);
         Some(k)
     }
-    /// The LRU (oldest) key and its tick, without removing — for cross-set recency
-    /// comparison (the hybrid LRU picks the globally oldest across both tiers).
-    pub(crate) fn peek_lru(&self) -> Option<(i64, u32)> {
-        self.order.iter().next().map(|(&t, &k)| (t, k))
+    /// The LRU key (and tick) not in `skip`, without removing — for cross-set recency
+    /// comparison (the hybrid LRU picks the globally oldest across both tiers). `skip` =
+    /// keys touched in the current batch, which eviction must never take (see
+    /// [`pop_lru_skip`]).
+    pub(crate) fn peek_lru_skip(&self, skip: &HashSet<u32>) -> Option<(i64, u32)> {
+        self.order.iter().find(|(_, k)| !skip.contains(k)).map(|(&t, &k)| (t, k))
+    }
+    /// Evict and return the LRU key NOT in `skip`. Per-batch pinning: a key touched
+    /// (hit or admitted) earlier in the same batch must stay resident so the pin can
+    /// resolve its slot — evicting it would surface as "expert not resident after alloc".
+    pub(crate) fn pop_lru_skip(&mut self, skip: &HashSet<u32>) -> Option<u32> {
+        let t = *self.order.iter().find(|(_, k)| !skip.contains(k))?.0;
+        let k = self.order.remove(&t)?;
+        self.at.remove(&k);
+        Some(k)
     }
 }
 

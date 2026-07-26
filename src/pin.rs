@@ -430,6 +430,11 @@ impl ArenaPool {
         let t = self.tier(hot);
         ResolvedSlot { ptr: self.ptr(hot, idx), off: t.off, int4: t.int4 }
     }
+    /// Start a batch: reset the policy's per-batch pin set so evictions this batch never
+    /// reclaim a key this batch touches (would surface as "expert not resident").
+    fn begin_batch(&mut self) {
+        self.policy.begin_batch();
+    }
     /// A hit: the policy refreshes recency; the physical slot is unchanged and read from
     /// `slot_of` LATER (after any same-batch relocations settle).
     fn get(&mut self, key: u32) -> bool {
@@ -801,6 +806,9 @@ impl<'a> Pin<'a> {
             "submit_layer: {} experts exceeds the 32-slot scratch",
             sel.len()
         );
+        // New batch: clear the policy's per-batch pin set. Phase 1a's protect() and 1b's
+        // admit() then pin every touched key so a later miss's eviction can't reclaim it.
+        self.routed.begin_batch();
         // Trace sink (--trace): the keys this layer looks up, in access order.
         if let Some(w) = &mut self.trace {
             use std::io::Write;

@@ -28,6 +28,7 @@ fn loaded_count(policy: &str, cap: usize, split: TwoQSplit, trace: &[Vec<u32>]) 
     let mut loaded = 0u64;
     let mut miss: Vec<u32> = Vec::new();
     for layer in trace {
+        p.begin_batch(); // one MoE layer = one batch (mirrors the pin)
         miss.clear();
         for &k in layer {
             if p.get(k) {
