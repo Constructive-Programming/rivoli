@@ -251,6 +251,16 @@ believe the +15pp screen at all.
 762 predicted tokens, fixed corpus, one process per cell, paired per-token NLL.
 `dPPL%` is the headline; the paired **mean dNLL ± SE** is the evidence.
 
+`bin/ppl` reports one of four verdicts, and they are four different next actions rather than
+a severity scale. **PASS** — upper bound below the bar; ship-able. **FAIL** — lower bound
+above the bar; rejected. **COST ESTABLISHED, MAGNITUDE UNRESOLVED** — interval clears zero
+but not the bar; the cost is real, its size is not known, and more text refines the number
+without changing the decision, because "not demonstrably within budget" is already enough
+not to ship. **INCONCLUSIVE** — interval straddles zero; nothing is established and more
+text could genuinely change the answer. The last two are the pair worth keeping apart: one
+says stop measuring, the other says measure more if you care, and flattening them is how a
+decision gets relitigated later as "we never checked properly".
+
 int3-vq — baseline PPL 5.275434, hit 73.67%:
 
 | cell | PPL | dPPL% | mean dNLL | SE | 95% CI (nats) | worse% | hit% | swap% |
@@ -272,6 +282,12 @@ re-measured.** It fails outright on int4 at +12.700% with the interval entirely 
 bar (6.91 SE above zero), and on int3-vq its lower bound is +0.68% around a +3.63% point
 estimate (2.42 SE above zero). Nothing about a larger corpus rescues a cell whose interval
 is already above the bar; more text would only tighten it around a failing value.
+
+**The one FAIL in this program was not better measured than the cells around it — it was
+just enormous.** A reader scanning a single FAIL beside several INCONCLUSIVEs will infer the
+FAIL rested on stronger evidence. It did not: `int4 J=2/M=12` earned that label from a
++12.7% effect on a run that was underpowered by exactly the same margin as every other cell
+here. The asymmetry is effect size, not measurement quality.
 
 **Three of the four cells are UNDERPOWERED, and that is the headline.** One standard error
 exceeds the 0.00995-nat bar (a 1% PPL change) in every cell, so at 762 tokens the

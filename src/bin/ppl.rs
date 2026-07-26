@@ -161,27 +161,26 @@ fn main() -> Result<()> {
             format!("PASS — upper bound {hi:+.5} < bar{odd}")
         } else if *lo > bar {
             "FAIL — interval entirely worse than +1%".to_string()
-        } else if *m >= bar {
-            // The point estimate sits at or past the bar, but the interval still straddles
-            // it. Calling that a FAIL would overstate what we know by exactly as much as
-            // calling it a PASS would: with SE this large the estimate is consistent with
-            // no effect AND with the bar simultaneously. Report the n that would make the
-            // question decidable either way rather than pretending it is already decided.
-            let se = (hi - lo) / (2.0 * 1.96);
-            let n_dec = ((1.96 * sd / (bar / 2.0)).powi(2)).ceil() as u64;
+        } else if *lo > 0.0 {
+            // Distinct from INCONCLUSIVE and the difference decides what to do next. The
+            // cost is established as real (interval clears zero) but its magnitude is not
+            // (interval clears the bar too). More text refines the number without changing
+            // the decision, because "not demonstrably within budget" is already sufficient
+            // not to ship. Collapsing this into INCONCLUSIVE is how "we decided against it"
+            // gets relitigated later as "we never checked properly".
             format!(
-                "INCONCLUSIVE — estimate {m:+.5} is at/past the bar but SE {se:.5} straddles it \
-                 ({:.2} SE from zero); ~{n_dec} tokens for a decisive interval, and it may \
-                 resolve either way",
-                m / se
+                "COST ESTABLISHED, MAGNITUDE UNRESOLVED — interval [{lo:+.5}, {hi:+.5}] clears \
+                 zero but not the bar. NOT ship-able; more text refines the number, not the \
+                 decision."
             )
         } else {
-            // n to drive the upper bound under the bar AT THIS OBSERVED EFFECT SIZE. The
-            // margin is (bar - mean), so a cell whose true cost is near zero needs far
-            // less text than one sitting just under the bar. This is the number that says
-            // what to buy.
+            // Interval straddles zero: nothing is established, and more text genuinely
+            // could change the answer. n to drive the upper bound under the bar AT THIS
+            // OBSERVED EFFECT SIZE — the margin is (bar - mean), so a cell whose true cost
+            // is near zero needs far less text than one sitting just under the bar.
             format!(
-                "INCONCLUSIVE — upper bound {hi:+.5} > bar; needs ~{} tokens at this effect size",
+                "INCONCLUSIVE — interval straddles zero, nothing established; needs ~{} tokens \
+                 at this effect size, and it may resolve either way",
                 required_n(*sd, *m, bar)
             )
         };
@@ -242,6 +241,34 @@ mod tests {
         assert_ne!(a.len(), b.len(), "fixture must differ in length");
         // Mirrors main's guard; kept as a test so the guard cannot be dropped silently.
         assert!(a.len() != b.len());
+    }
+
+    /// The four verdicts are four different next actions, so the boundaries between them
+    /// have to be exact. In particular "cost established, magnitude unresolved" and
+    /// "inconclusive" are separated by whether the interval clears ZERO — the first says
+    /// stop measuring and do not ship, the second says measure more if you care.
+    #[test]
+    fn the_four_verdicts_partition_on_zero_and_the_bar() {
+        let bar = 1.01f64.ln();
+        let classify = |lo: f64, hi: f64| {
+            if hi < bar {
+                "PASS"
+            } else if lo > bar {
+                "FAIL"
+            } else if lo > 0.0 {
+                "COST"
+            } else {
+                "INCONCLUSIVE"
+            }
+        };
+        assert_eq!(classify(-0.002, 0.005), "PASS", "upper bound inside the bar");
+        assert_eq!(classify(0.012, 0.030), "FAIL", "wholly past the bar");
+        assert_eq!(classify(0.002, 0.018), "COST", "clears zero, not the bar");
+        assert_eq!(classify(-0.011, 0.031), "INCONCLUSIVE", "straddles zero");
+        // The boundary case that matters: lower bound exactly at zero is NOT established.
+        assert_eq!(classify(0.0, 0.018), "INCONCLUSIVE");
+        // And a cell can be PASS even with a negative lower bound — acceptance is one-sided.
+        assert_eq!(classify(-0.020, 0.008), "PASS");
     }
 
     /// The distinction the whole acceptance decision turns on: a near-zero mean can mean
