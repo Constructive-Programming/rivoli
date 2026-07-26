@@ -155,6 +155,33 @@ the implementation.
 > failure, and no author to catch it in review, so the technique has to be safe by
 > construction rather than by careful reading at the end of each cycle.
 
+#### What break-verification does NOT establish
+
+This is the strongest technique in this document and it has a boundary, written down
+because the practice is now good enough that its limit is the useful part.
+
+**Breaking a thing and watching it go red proves the guard fires. It says nothing about
+whether it fires CORRECTLY in every transition.** Three defects got through a full
+break-verification pass of fifteen guards, and none was reachable by the technique:
+
+- **Interactions between findings.** Each guard was broken alone, so nothing exercised
+  two firing at once — which is exactly where one masked the other (see "A guard can mask
+  another guard" below).
+- **Deletion.** Every break ADDS or CHANGES something. A per-item check is driven by the
+  items that exist, so the transition it structurally cannot observe is an item ceasing to
+  exist — a renamed shader left an orphaned exemption that would silently pre-authorise
+  any future shader taking the name back.
+- **The guard's own new failure modes.** Adding an argument to `spirv-val` created a
+  failure class that could not exist when it took none: its argument-parsing diagnostic
+  goes to stdout, which the reporter discarded, so a wrong spelling would have failed
+  every shader with an empty body and blamed the modules for a broken invocation.
+
+All three were found by a correctness review reading the diff, not by breaking anything.
+So: **break-verification is the positive case, and review is the only thing covering the
+interaction, deletion, and self-inflicted cases.** Budget both. The same conclusion the
+synchronisation-validation risk reached from the other direction — on this stack, review
+is the primary defence and the mechanised layer is secondary.
+
 **A guard that is never exercised.** It is correct, it is present, and no test
 distinguishes it from its absence — the suite would be equally green with the guard
 deleted. `n_blocks == kvl/128` was unreachable because an earlier arm rejected every
@@ -260,6 +287,32 @@ there (one message is already a failure worth investigating) but it means the co
 the message is a floor, and the phrasing should never imply otherwise.
 
 Ask of any check: **if there were three problems, would this tell me three?**
+
+### A guard can mask another guard
+
+The same disease one level up: not the first FAILURE aborting the rest, but the first
+FINDING doing it. A guard that `return`s as soon as it has something to say cannot report
+the second thing it knows.
+
+The case, and it is worse than a lost message. `build.rs` has one rule that encourages
+replacing an LDS reduction with the `wave_sum` shuffle ladder, and another that refuses to
+judge barriers in modules holding shared memory. Perform the encouraged conversion and the
+module drops its shared storage while keeping a bare `barrier()` over buffer traffic —
+bit-for-bit the `rope_interleave` signature that the second rule exists to catch. The
+bookkeeping finding ("this module is listed as exempt but no longer needs to be") fired
+first and returned, swallowing "barrier that orders NOTHING". **A developer following the
+stated remedy would have introduced a live ordering bug and been told the build was
+clean** — and the substituted message reads as trivial admin, which is exactly when nobody
+looks harder.
+
+Two lessons, and the second is the general one:
+
+- A guard should ACCUMULATE its findings and fall through, for the same reason the build
+  accumulates across shaders.
+- **Rules interact.** One rule's recommended fix can walk code into another rule's blind
+  spot. When adding a rule, ask what the OTHER rules tell people to do, and whether any of
+  those edits lands in the new rule's exempt case — a question no amount of breaking the
+  new rule on its own will answer.
 
 ### A correct guard resting on a false rationale
 
