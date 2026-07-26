@@ -216,6 +216,7 @@ unsafe extern "C" {
         dscale: f32,
         scores: *mut f32,
     ) -> i32;
+    fn rivoli_index_topk(scores: *const f32, nt: i32, k: i32, rows: *mut u32) -> i32;
     fn rivoli_index_pool_push(k: *const f32, pool: *mut f32, t: i32, hd: i32) -> i32;
     fn rivoli_index_head_route(
         q: *const f32,
@@ -823,6 +824,29 @@ pub unsafe fn launch_index_score(
         )
     };
     check(r, "index_score")
+}
+
+/// Select the DSA attend row set on device: `rows[0..min(k,nt))`, ASCENDING by index.
+///
+/// Writes device-side only — no D2H, no host top-k, and no `device_sync`: the attend
+/// consumes `rows` on the same stream, so program order is the whole requirement.
+///
+/// **Intended** to be bit-identical to the `topk_into(..) + sort_unstable()` it
+/// replaces; `tests/kernel.rs::index_topk_matches_host_selection` is the gate for that
+/// claim. The tiebreak rule and its rationale live at the kernel, once.
+///
+/// # Safety
+/// Device pointers live until the next [`device_sync`]: `scores` (`nt` f32), `rows`
+/// (at least `min(k, nt)` u32 — the kernel writes exactly that many).
+pub unsafe fn launch_index_topk(
+    scores: *const f32,
+    nt: usize,
+    k: usize,
+    rows: *mut u32,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r = unsafe { rivoli_index_topk(scores, nt as i32, k as i32, rows) };
+    check(r, "index_topk")
 }
 
 /// Fold token `t`'s indexer key into its MISA block pool running mean.

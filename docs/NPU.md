@@ -249,8 +249,15 @@ text than reaching 2.4k — which turns out to matter.
   it** — longer context changing the routing distribution, different subject matter routing
   elsewhere, and the longer run accumulating more NVMe/page-cache pressure all fit. The
   honest statement is that the MoE term moved for reasons this pair cannot separate.
-  **This applies to every context sweep this engine can run, not just to 32k** — reaching a
-  longer context always requires more text. And it cuts both ways: the extrapolated 32k
+  **This is a standing constraint on any future measurement here, not a quirk of this
+  pair.** Varying context while holding content fixed does not happen by default — a longer
+  prompt is a different prompt. Anyone measuring context-dependence in this engine has to
+  construct it deliberately: the same text padded to several lengths, or several distinct
+  prompts at matched length so content varies *within* a context point rather than between
+  them, or a synthetic-KV harness that skips prefill entirely. Absent one of those, a wall
+  or MoE difference between two context points is uninterpretable, and only `route` — which
+  benchmarks.md notes is structurally insulated from fetch variance — can be compared
+  directly. And it cuts both ways: the extrapolated 32k
   wall below is built from `route` and `moe` taken from these same two runs, so **that
   denominator inherits the same confound** and the "~9% of wall" figure is softer than its
   components suggest.
@@ -399,7 +406,17 @@ a GPU∥NPU one.**
   window 2 clears, at 32k only against the engine's real MoE wall rather than its compute
   floor.
 
-- **Device top-k (NO NPU). DO THIS FIRST.** MEASURED in-engine at **52% of the prize at
+- **Device top-k (NO NPU). KERNEL BUILT, NOT YET WIRED OR RUN.** `index_topk`
+  (kernels/indexer.hip) implements the selection exactly — a 4-pass radix select on the
+  order-preserving float key, then a compaction whose output slot has a closed form, so
+  the rows come out sorted with no atomics and no second scan. The gate before it goes
+  anywhere near the decode path is `tests/kernel.rs::index_topk_matches_host_selection`,
+  which asserts it against the engine's own `topk_into + sort_unstable` on the realistic
+  ReLU-sparse shape and checks a sentinel tail so over-selection cannot hide. **That test
+  has not been run — no device yet.** Wiring is a separate commit; note that
+  `idx.last_nr` becomes an implicit `min(topk, nt)` invariant rather than an observed
+  `rows.len()`, and the mid-layer `device_sync` can then be deleted outright.
+  MEASURED in-engine at **52% of the prize at
   2.4k and 60% at 5.2k**, extrapolating to ~76% at 32k — the host round-trip is 4.5 → 7.0
   ms/token measured, all of it GPU-idle. One kernel: same selection, exact, no quality gate,
   no staleness, no toolchain, no per-layer handoff. Three independent reasons it comes
