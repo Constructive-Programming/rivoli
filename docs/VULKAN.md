@@ -358,35 +358,59 @@ the oracles for the 16 ported kernels pass**, plus a coherent 32-token decode on
 partial artifact (the `convert --layers 1` stub path used for the HIP end-to-end
 bring-up).
 
-### The real bar: byte-identical output against the HIP path
+### The real bar: an identical TOKEN ID sequence against the HIP path
 
-Per-kernel oracles are necessary and they are not the acceptance test. Each one checks a
-kernel against a CPU reference *in isolation*, with tolerances; none of them can see an
-error that only appears once 78 layers compose, and none of them constrains the sampled
-token at all.
+**NOT ATTAINABLE TODAY, and that is the point of writing it down.** The Vulkan backend
+cannot run the model — no MoE, no attention, no integration — so nothing here can be
+executed until phase 4 puts a whole forward pass on the Vulkan path. A gate nobody *can*
+run reads like a gate nobody *has* run, and those are different claims; this one is the
+former, and the section says so up front so it is never quietly counted as passed.
 
-The end-to-end bar is: **the same prompt, same seed, same artifact, decoded through the
-Vulkan backend and through the HIP backend, produces byte-identical text.** Greedy
-decode makes that a legitimate demand rather than an aspiration — every token is an
-argmax over a 154,880-way vocabulary, so a single differing logit that crosses a
-boundary anywhere in the run changes the output and the comparison fails loudly. It
-subsumes every per-kernel oracle: nothing can be wrong in a way that survives it.
+Per-kernel oracles are necessary and are not the acceptance test. Each checks a kernel
+against a CPU reference *in isolation*, at 1e-3, on the shapes someone chose. None sees
+an error that appears only once 78 layers compose, none exercises the shapes and
+accumulation lengths the real model actually reaches, and none constrains the sampled
+token at all. "Coherent output" is a human judgement that a wrong-but-plausible decode
+passes.
 
-Two reasons to write it down now, long before it can be run:
+**The bar: the same prompt decoded through both backends yields an identical sequence of
+TOKEN IDs.**
 
-- It is **achievable, and demonstrated** — not on this backend, but by the perf work on
-  the HIP side, whose interleaved A/B produced 256 greedy argmaxes byte-identical
-  between arms across a real decode. That is proof the property holds for a correct
-  change on this hardware, so a Vulkan run that fails it has a real defect rather than
-  an unrealistic bar.
-- It is the answer to *"the oracles are green, is the backend right?"*, and that question
-  will be asked at the point where the answer is expensive to get. It cannot be run
-  until phase 4 puts a whole forward pass on the Vulkan path.
+Compare IDs, not decoded text. Two different ID sequences can decode to the same string —
+tokenizers round-trip whitespace and multi-byte boundaries in ways that absorb a
+difference — so text equality is the weaker claim, and the weakness is exactly in the
+direction that hides a defect. Comparing text happens to be sufficient when a single-ULP
+shift is unsurvivable over hundreds of argmaxes; the strict form is what to write down.
+
+Pin every condition or it is not a comparison: **fixed prompt, greedy decode, same
+artifact, same `--mode`, same `--max-mem` budget, same cache policy.** The budget and
+policy matter as much as the prompt — they determine residency and therefore which
+experts are recomputed versus reused, and an unpinned difference there produces a
+divergence that has nothing to do with the backend. The same discipline the perf A/B
+needed when it matched miss counts to the decimal.
+
+Greedy decode is what makes this a legitimate demand rather than an aspiration: every
+token is an argmax over a 154,880-way vocabulary, so one differing logit that crosses a
+boundary anywhere in the run changes the ID sequence and the comparison fails loudly. It
+subsumes every per-kernel oracle — nothing can be wrong in a way that survives it.
+
+**It is demonstrated achievable on this hardware.** Not on this backend: the perf work's
+interleaved A/B produced 256 greedy argmaxes byte-identical between arms across a real
+decode. So the property does hold for a correct change here, and a Vulkan run that fails
+it has a defect rather than an unrealistic target.
+
+**Expect to fight the toolchain for it.** This is not a bar you meet by writing careful
+GLSL. `glslc -O` rewrote `a / 448.0` into a multiply by `fl(1/448)` under an explicit
+bit-identity contract, and 55.1% of block scales diverged — see "The toolchain rewrites
+float arithmetic" above. Meeting cross-backend identity will need more defences of that
+shape: operands the optimiser cannot see, more build-time rejections, and disassembly of
+anything whose exactness matters. Whoever attempts this should know that before the
+first mismatch, not after a day of auditing their own shader.
 
 Until then, do not describe the port as verified end to end. The oracles are per-kernel
-evidence and nothing in this repo currently tests the composition — on either backend,
-which is why the perf run's byte-identity result arrived as a side effect rather than
-from a test.
+evidence, and **nothing in this repo tests composition on either backend** — which is
+why that byte-identity result arrived as a side effect of a performance experiment
+rather than from a test.
 
 Scoped, not "unmodified", on purpose: the suite also covers `gemv_vq`/`gemv_i4`, which
 are microbench kernels the decode path never calls. Gate those oracles on the ported
