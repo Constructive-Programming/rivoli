@@ -376,7 +376,31 @@ that evicts the caches they are enjoying here. Pending an in-engine run.
 
 ≈**1.9% of the 351 ms/token budget**; `route` 115 → ~108 ms. A real but modest win, and
 worth stating plainly next to the 1.97×: a large multiple on a 72 µs kernel is a small
-number of milliseconds.
+number of milliseconds. **Report kernel work in the unit the budget is denominated in.**
+A subject line saying "1.97×" outlives the body that qualifies it.
+
+### Convert to per-token even when you don't need the number — it forces contact with ground truth
+
+The `mla_absorb` and `mla_value` rows above were first measured at **guessed dims**:
+`run_mla` had been called with nope=128, vh=128, qh=192. The manifest says **192 / 256 /
+256**. Those kernels read `H*nope*kvl` and `H*vh*kvl`, so the bench was moving **4.2 MB
+where the engine moves 6.3 and 8.4** — a different working set, a different cache regime,
+and a per-token figure that would have been wrong by a factor no reader could have
+recovered from the report.
+
+**Nothing in the measurement caught it. The conversion did.** The A/B was clean, the arms
+were non-overlapping, the controls were flat, and the numbers were internally consistent —
+a wrong-shape benchmark is still a perfectly self-consistent benchmark. What surfaced the
+error was multiplying by call counts, because that required opening `manifest.json`, and
+the manifest disagreed. That it happened to be *understating* the win is luck, not a
+mitigating factor.
+
+So: **do the per-token conversion as a matter of course, including when the ratio is the
+only thing you plan to quote.** Its value is not the arithmetic. It is that the arithmetic
+cannot be done without going and looking at what the engine actually runs. Any step that
+forces contact with ground truth is worth more than the step's own output — and a
+microbench, which fabricates its own inputs, has no other moment where that contact is
+compulsory.
 
 ### The instruments agreed — and that is *why* the earlier refusal was right
 
