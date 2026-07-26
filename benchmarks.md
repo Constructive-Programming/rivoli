@@ -95,12 +95,43 @@ slots). Fix: each policy keeps a per-batch `pinned` set (`begin_batch` clears it
 + admit add to it); `OrderedSet::{peek,pop}_lru_skip` skip pinned keys during eviction.
 All three arc cells and int4/lru now run clean (above).
 
-### int4 provenance (in progress)
+### int4 provenance — MEASURED, and it inverts hybrid's stated premise
 
 These int4/hybrid numbers use `.i4` re-derived from **vq3** (itself a lossy 3-bit
-quantization). The higher-fidelity source is the original **GLM-5.2-FP8** checkpoint;
-`fp8_to_i4` (deriving `.i4` straight from fp8 via `quant_i4`) is pending a re-download of
-that checkpoint, after which int4/hybrid will be re-benched against this baseline.
+quantization). `bin/vq3_to_i4` does this deliberately: colibri's own int4 was a mismatched
+per-row RTN quantization (R≈0.96 against vq3, scales 5–9% inflated) that made all-int4
+decode degenerate under the fp8 router. So the chain in the artifact anyone actually runs
+is **fp8 → vq3 → int4**, and **the int4 set cannot be better than the vq3 it was derived
+from, by construction.**
+
+That is no longer just a caveat — it is measured. Teacher-forced perplexity on a fixed
+762-token corpus, `--max-mem 100`, LRU, no substitution:
+
+| mode | PPL | hit% |
+|---|---:|---:|
+| int3-vq | **5.275** | 73.67% |
+| int4 | **9.083** | 69.67% |
+
+int4 is **72% worse in perplexity** before any cache policy touches it. This is the
+arithmetic of double quantization, not a surprise — but it inverts the design rationale on
+record for hybrid mode. Hybrid is described as putting the hot set in int4 to buy accuracy
+along with int4's ~1.8× compute. **In this artifact int4 has no accuracy to offer**: it is
+strictly a re-quantization of the vq3 set, so hybrid currently trades quality *away* for
+compute rather than buying quality with it. `docs/CACHE_ROUTE.md` carried the same inverted
+claim ("int4 is both more accurate and ~1.8× faster") and has been corrected.
+
+Every int4 or hybrid quality number in this file must be read as *this artifact's* int4,
+not as rivoli's int4.
+
+**The fix path, which now exists.** The colibri sister project switched its converter to
+**group-scaled int4 (gs64) by default** at commit `21cbc29` (2026-07-24), for exactly this
+defect: per-row int4 measured **−9.3pp mean acc_norm** against **−2.2…−3.4pp** for
+group-scaled. A gs64 container would plausibly give a faithful int4 genuinely better than
+vq3 and restore hybrid's premise. Recommended source:
+`mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp`. That is a **`pack_i4` job, not a
+`vq3_to_i4` job** — `pack_i4` imports a colibri container directly, which is the whole
+point, since the defect that deprecated it was per-row scaling and gs64 removes it.
+Until then, `--mode int4` and `--mode hybrid` quality numbers are bounded above by vq3.
 
 ---
 

@@ -105,8 +105,15 @@ heuristic is redundant, because the router already tells us which experts matter
 replace it rather than layer on top of it:
 
 - **Sacred top-J → int4.** These run every time this layer is visited and are the
-  highest-value experts in the layer. int4 is both more accurate and ~1.8× faster to
-  compute (isolated: gate/up int4 669 vs vq3 353 GElem/s).
+  highest-value experts in the layer. int4 is ~1.8× faster to compute (isolated: gate/up
+  int4 669 vs vq3 353 GElem/s).
+  **It is NOT more accurate in the artifact we run, and an earlier draft of this line
+  claimed it was.** `bin/vq3_to_i4` re-derives `.i4` from our own `.vq3`, so the chain is
+  fp8 → vq3 (lossy 3-bit) → int4 and the int4 set cannot be better than the vq3 it came
+  from, by construction. Measured on a 762-token teacher-forced corpus: int4 PPL 9.083 vs
+  int3-vq 5.275. So promoting to int4 buys speed and *costs* quality here. See
+  "int4 provenance" in `../benchmarks.md` for the fix path (a group-scaled colibri
+  container), after which this bullet's original premise would hold again.
 - **Top-M window → marked for int4 load, horizon L+2.** Membership in the window is a
   prediction that this expert is about to be worth running. Issue its int4 load
   speculatively, two layers ahead.
