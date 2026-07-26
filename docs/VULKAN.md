@@ -84,7 +84,50 @@ this, and the hot loops already unpack manually, so the extension buys nothing.
 
 Use a **dedicated compute queue**, not the universal graphics queue (colibri `4d4cacc`).
 
-## Three things that are not mechanical
+## Four things that are not mechanical
+
+### Host pointer ≠ device address
+
+The single biggest structural difference between the backends, and the one the
+mapping table above quietly assumes away. Under HIP unified addressing the host
+pointer and the device pointer are the SAME NUMBER, and the engine leans on it:
+`DeviceTier::reserve` returns one pointer that `pin.rs` uses for both jobs at once.
+
+```rust
+// src/pin.rs:190 (place_f32), and the same shape at 211-212, 234-235, 270, 597
+let dst = tier.reserve(bytes.len())?;
+unsafe { copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };  // host write
+Ok(dst as *const f32)                                              // device pointer
+```
+
+Same conflation at `pin.rs:717-718`, where `VmmBuf::ptr_mut()` becomes
+`ArenaPool.base` — simultaneously the io_uring O_DIRECT DMA target (a host address)
+and the base every expert descriptor's six device pointers are computed from
+(`pin.rs:427`).
+
+Under Vulkan these are two unrelated numbers. A mapped `VkDeviceMemory` pointer and
+the buffer's device address have no fixed relationship, and
+`VK_EXT_external_memory_host` would not make them equal either (and is rejected above
+on measured performance grounds regardless).
+
+**Resolution: `reserve()` returns the DEVICE pointer, and host filling goes through
+`DeviceTier::write_at(dev_ptr, bytes)`.** The tier owns both bases, so the
+translation happens inside the type that knows them, once per placement at startup —
+never per operation, and never on the hot path. `VmmBuf` splits the same way: `ptr()`
+is the device base for descriptor arithmetic, `host_mut()` is the DMA target.
+
+Two rejected alternatives, for the record:
+
+- *Keep returning the host pointer and add a `tier.dev(host_ptr)` sibling.* Same
+  number of call sites touched, but leaves a host pointer typed as a device pointer
+  in every intermediate — a bug waiting for a maintainer.
+- *A global (host_base, len, dev_base) table translated inside the launchers.* Zero
+  change to `pin.rs`, but it puts a lookup on the hot path — six pointers per expert
+  × ~9 experts × 78 layers per token in a latency-bound decoder — to hide a
+  distinction that is real and should be visible.
+
+`DeviceBuf` needs none of this: it already does an explicit `copy_in_at`/`copy_out`,
+so it maps straight onto `vkCmdCopyBuffer` or a mapped write.
 
 ### Memory: copy, don't import
 
