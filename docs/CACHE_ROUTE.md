@@ -62,6 +62,14 @@ Do **not** fork a `HybridTopM` struct. This repo deleted three duplicate policy
 families in `08db745`; re-adding one by copy-paste is the same mistake with a new name.
 `HybridLru` gains a tier-rule field; everything else is shared.
 
+**Staging note, because this sentence overstates what the first step does.** The
+tier-rule replacement described here is the *hybrid* rank-driven tiering, and it is a
+later step. In the shipped single-format work `HybridLru` gains an **advice** field only;
+`LRU_HOT_THRESHOLD` and the `freq` map are untouched and still drive admission. That is
+correct for `int3-vq` and `int4`, where both tiers hold the same format and the tier
+choice is cosmetic — and the frequency threshold *cannot* be replaced until the hybrid
+work lands. Read "gains a tier-rule field" as describing the end state, not step 2.
+
 What `top-m` adds is one trait method the other policies leave defaulted:
 
 ```rust
@@ -131,6 +139,61 @@ should help *more* in `int4` and `hybrid` than in `int3-vq`, because int4 slots 
 attacking is higher. If the measurement contradicts this, the implementation is
 suspect, not the prediction.
 
+**MEASURED: it is not supported.** On the offline grid (512-token traces, `--max-mem
+100`, LRU), relative miss removal at the widest window is **88.0% int3-vq / 87.9% int4 /
+88.5% hybrid** — the effect is essentially mode-independent. In *absolute* pp the ranking
+is the opposite of the prediction at the paper's own defaults (J=2, M=12): int3-vq
++15.24, hybrid +15.13, int4 +15.05. Absolute gain simply tracks headroom — hybrid starts
+from the highest baseline (74.35% vs 72.70% vs 71.15%) so it has the least to win.
+
+Do not claim the prediction confirmed, and do not treat this as the implementation being
+suspect either: the mechanism is intact.
+
+**Why it washed — and a trap to avoid when reading these numbers.** It is tempting to
+observe that int4 holds 4,744 slots against int3-vq's 5,870 (19% fewer) for only 1.55pp
+less hit, and conclude the working set is so concentrated that slot count barely matters.
+**That conclusion is wrong**, and it is wrong because comparing each mode at *its own*
+capacity conflates two different things: how many slots the mode gets, and what its trace
+is. Every mode decodes its own trajectory, so the three traces are not the same workload.
+
+Separating them (LRU, same trace, matched capacity):
+
+| | cap 4,744 | cap 5,852 |
+|---|---:|---:|
+| int3-vq trace | 66.42% | 72.60% |
+| int4 trace | 71.15% | 76.07% |
+| hybrid trace | 68.28% | 74.35% |
+
+Slot count matters **a lot** — for the int3-vq trace, +23% slots is +6.18pp — and int4's
+trace is simply ~4.7pp more cacheable than int3-vq's at equal capacity. The decomposition
+is exact: −6.18pp from the smaller pool, +4.73pp from the easier trace, net −1.45pp
+against the −1.55pp observed. There is no concentration effect doing the work.
+
+So: **read the cross-mode grid at matched capacity, not at each mode's own slot count.**
+With one 512-token trajectory per mode, the trace-to-trace differences here are of the
+same order as plausible run-to-run variance, and none of the cross-mode claims should be
+leaned on. The *within*-trace (J, M) results are unaffected by any of this — each grid is
+scored against its own baseline — which is why the screen itself stands.
+
+**The steep saturation curve is good news for `top-m`, not bad, and it is the strongest
+honest argument for the feature.** Hit rate is still climbing steeply with pool size right
+where we operate, so squeezing more out of the slots we have is worth a great deal — and
+**we cannot buy those slots.** The box has ~120 GiB total and the capture already ran at
+`--max-mem 100`; there is no meaningful headroom left to grow the pool into. `top-m` is
+valuable in direct proportion to how hard capacity is to add, and on this node it is
+nearly impossible to add at all.
+
+Stated in the currency the engine thinks in, and **never state the first half without the
+second**:
+
+> `top-m` at the paper's defaults (J=2, M=12) buys what growing the pool from 5,852 to
+> ~10,950 slots would — an **~1.9× effective pool — at 17.8% swap, with the quality cost
+> unmeasured.** The cheapest passing cell (J=4, M=10) is worth ~1.4× at 9.6% swap.
+
+Pool growth is free; substitution is not. The moment "1.9× effective pool" is quoted
+without the swap figure beside it, it reads as costless, and it is not — 17.8% swap means
+nearly one chosen expert in five is not what the router asked for.
+
 ## Staging
 
 Shared with [CACHE_PILOT.md](CACHE_PILOT.md) — see its build order; these are one
@@ -176,6 +239,27 @@ compare hit%, the resulting int4/int3-vq resident mix, and `moe-gpu`.
 One number, not three. **`swap%`** — the fraction of chosen slots that were not in the
 true top-K — reported in the PROFILE summary whenever the policy is `top-m`, alongside
 the existing hit%, `GB/tok`, and `moe-gpu`.
+
+**Denominator: total chosen slots over the profiled decode window**, which equals
+`hits + misses` because `submit_layer` looks each selected expert up exactly once. That is
+deliberately the same denominator `hit%` uses, so the two numbers printed beside each
+other are directly comparable, and it is what `bin/replay` reports too. Per-decision and
+per-token means would both differ once batches vary; pick this one and stay with it.
+
+## `top-m` is incompatible with `--trace`, and the engine rejects the combination
+
+Not an implementation detail — a real interaction between two features this document
+treats as independent. The v2 trace format promises `window[..top_k] == sel`;
+`submit_spine` debug-asserts it and `bin/replay` hard-fails a trace that violates it.
+Substitution is *precisely* what breaks that prefix, because `sel` is then no longer the
+rank-order head of the window. A `--trace --cache-policy top-m` run would therefore either
+trip the assert or write a corrupt capture that the next (J, M) screen would read as
+ground truth. The config layer refuses the pair outright.
+
+If a trace of a *substituted* run is ever wanted, it needs its own format that records the
+pre-substitution ranking and the post-substitution selection separately. Do not quietly
+relax the prefix invariant to allow it — that invariant is what makes a captured trace
+trustworthy.
 
 Colibri reports `swap%`, `route_agree` and `route_kl`; the first two are the same
 measurement (a chosen slot outside the true top-K *is* a swap, so
