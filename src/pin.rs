@@ -418,6 +418,15 @@ impl ArenaPool {
     fn tier(&self, hot: bool) -> &TierFmt {
         if hot { &self.hot } else { &self.cold }
     }
+    /// The slot's pointer, valid TODAY as both a host DMA target (`ReadSpec.dst`, the
+    /// io_uring O_DIRECT destination) and a device address (the base every expert
+    /// descriptor's six projection pointers are built from). Those are one number
+    /// only because HIP unified addressing makes them one.
+    ///
+    /// A second backend must split this per consumer — descriptors take the device
+    /// base, `ReadSpec.dst` takes the host base — with both bases still resolved once
+    /// at setup, so this stays a single `add`. See docs/VULKAN.md, "Host pointer !=
+    /// device address".
     fn ptr(&self, hot: bool, idx: usize) -> *mut u8 {
         // SAFETY: arena.offset < budget, within the pool VMM.
         unsafe { self.base.add(self.arena.offset(hot, idx)) }
