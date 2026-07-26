@@ -1096,6 +1096,44 @@ hope. The first task of 2d is the isolate-and-disassemble treatment that
 because the mix above is not attributable to specific products while inlined into the
 whole kernel. Do that before writing the shader, not after the oracle disagrees.
 
+### Three places the two backends legitimately differ, so nobody reads them as porting bugs
+
+Surfaced while writing 2d's oracles. All three are recorded rather than fixed — the first
+is a pre-existing HIP-side issue that costs nothing today, and moving `main` would diverge
+the bases of concurrent work for no benefit.
+
+**1. `math.rs::silu` is not bit-identical to `moe.hip::siluf`, and the existing ROCm test
+cannot see it.** `kernels/moe.hip:25` computes `x / (1.0f + expf(-x))` — a DIVIDE.
+`src/math.rs` computes `x * sigmoid(x)`, a reciprocal-then-multiply. Those round
+differently. `tests/kernel.rs::moe_vq_matches_reference` compares the kernel against
+`math::silu` at `1e-3 * mx + 1e-3`, which is orders of magnitude looser than the
+disagreement, so it passes and always has.
+
+> **The concrete consequence: `moe_vq_matches_reference` CANNOT be tightened past ~1e-3
+> until its reference is changed to divide.** Anyone who tries — and tightening a tolerance
+> is exactly what a later bit-exactness push would do — will find a mismatch that looks
+> like a kernel defect and is in the oracle. That afternoon is what this paragraph exists
+> to save.
+
+The Vulkan shader writes the divide, matching the HIP. So the two BACKENDS agree; it is
+`math.rs` that is the outlier, and the standing rule (mirror HIP, not `math.rs`, because
+the backends are what must agree) resolves it the same way it resolved the bf16 NaN case.
+
+**2. The Vulkan launcher is deliberately STRICTER on VQ dimensions.** `moe.hip` never
+checks `hidden % VQ_GROUP` or `inter % VQ_GROUP`; its `vq_rb`/`vq_ng` are raw integer
+divides that truncate silently, so a bad dimension mis-sizes every row on device with no
+diagnostic. `launch_moe_expert_range` rejects it. That is one of the few places this
+backend refuses input the HIP accepts, and it is deliberate: the Rust `vq_row_bytes` /
+`vq_groups` already `debug_assert` the same condition, so the guard makes the release-build
+device path agree with the debug-build host path.
+
+**3. The 16-byte alignment requirement on `x` is a HIP-only artefact, and the port
+correctly does not inherit it.** `dot_vq_wave` in `common.hpp` reads
+`*(const float4*)(x + t*VQ_DIM)`, which needs `x` 16-byte aligned. The GLSL twin reads four
+scalar floats through a `buffer_reference`, so it has no such constraint — only the 4-byte
+alignment every f32 access already implies. A reader comparing the two launchers will find
+an alignment guard on one side and none on the other; that asymmetry is correct.
+
 ## Phase 4 needs two queues, not one — and the acceptance gate cannot see it
 
 Written before integration starts, because the failure it describes is invisible to every

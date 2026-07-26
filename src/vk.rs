@@ -204,6 +204,9 @@ struct Pipes {
     mla_absorb_fp8: Pipe,
     mla_latent_attend: Pipe,
     mla_attend_combine: Pipe,
+    moe_gateup_vq: Pipe,
+    moe_down_vq: Pipe,
+    moe_reduce: Pipe,
 }
 
 // SAFETY: needed because ash models the DISPATCHABLE handles (`vk::Queue`,
@@ -949,6 +952,9 @@ impl Pipes {
             mla_absorb_fp8: MlaAbsorbPush,
             mla_latent_attend: MlaAttendPush,
             mla_attend_combine: MlaCombinePush,
+            moe_gateup_vq: MoeGateUpPush,
+            moe_down_vq: MoeDownPush,
+            moe_reduce: MoeReducePush,
         ))
     }
 }
@@ -2533,4 +2539,186 @@ pub unsafe fn launch_attend(
         max_splits: MLA_MAX_SPLITS as i32,
     };
     g.dispatch(&g.pipes.mla_attend_combine, &cpush, h as u32)
+}
+
+// --- moe.hip: the fused VQ-int3 expert batch -------------------------------
+
+/// Per-expert descriptor: six device addresses, laid out exactly as `moe.hip`'s
+/// `ExpertDescVq` and `hip.rs`'s `ExpertDesc`. Same name and same fields as the HIP one so
+/// `pin.rs` builds one array for either backend.
+///
+/// `#[repr(C)]` and pointer-sized fields make the Rust layout the six consecutive
+/// `uint64` the shader reads at stride 48.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ExpertDesc {
+    pub gate_indices: *const u8,
+    pub gate_scales: *const u16,
+    pub up_indices: *const u8,
+    pub up_scales: *const u16,
+    pub down_indices: *const u8,
+    pub down_scales: *const u16,
+}
+
+const _: () = assert!(
+    size_of::<ExpertDesc>() == 48,
+    "ExpertDesc must be six consecutive 8-byte addresses — the shader indexes it as uint64[6]"
+);
+
+push_struct! {
+    /// Mirror of `moe_gateup_vq.comp`'s push block.
+    MoeGateUpPush {
+        x: u64,
+        descs: u64,
+        gate_cb: u64,
+        up_cb: u64,
+        h_out: u64,
+        hidden: i32,
+        inter: i32,
+        e_start: i32,
+        e_count: i32,
+    }
+}
+
+push_struct! {
+    /// Mirror of `moe_down_vq.comp`'s push block.
+    MoeDownPush {
+        descs: u64,
+        down_cb: u64,
+        wexpert: u64,
+        h_in: u64,
+        partial: u64,
+        hidden: i32,
+        inter: i32,
+        e_start: i32,
+        e_count: i32,
+    }
+}
+
+push_struct! {
+    /// Mirror of `moe_reduce.comp`'s push block.
+    MoeReducePush {
+        partial: u64,
+        out: u64,
+        e_count: i32,
+        hidden: i32,
+    }
+}
+
+/// Guards shared by the VQ MoE launchers, mirroring `moe.hip`'s 1001 arm plus this
+/// backend's word-addressing requirements.
+fn moe_vq_guards(hidden: usize, inter: usize, e_count: usize, what: &str) -> Result<()> {
+    ensure!(
+        hidden > 0 && inter > 0 && e_count > 0,
+        "{what}: argument guard rejected"
+    );
+    // STRICTER THAN HIP, and both are properties of `dot_vq_wave`'s packing that the HIP
+    // relies on without checking. `vq_row_bytes` is `(i_dim/VQ_DIM)*VQ_INDEX_BITS/8`, which
+    // is only a whole number of bytes when the subvector count is even — the same
+    // condition that makes the two-byte index read in-bounds at the last subvector. And
+    // the group scale needs whole groups.
+    for (dim, name) in [(hidden, "hidden"), (inter, "inter")] {
+        ensure!(
+            dim.is_multiple_of(VQ_GROUP),
+            "{what}: {name} {dim} must be a multiple of {VQ_GROUP} (VQ group size)"
+        );
+    }
+    Ok(())
+}
+
+/// VQ group size — `VQ_GROUP` in `common.hpp` and `kernels/vk/vq.glsl`. A dimension that
+/// is a multiple of this is also a multiple of `VQ_DIM`, so one guard covers both.
+const VQ_GROUP: usize = 64;
+
+/// Pass 1 + pass 2 of the VQ expert batch for an ABSOLUTE expert range, matching
+/// `hip.rs::launch_moe_expert_range`.
+///
+/// The `stream` parameter is accepted and IGNORED, and that is a deliberate placeholder
+/// rather than an oversight: this backend has one queue today, so there is nothing to
+/// place work on. Keeping the parameter means `gpu.rs` compiles unchanged against either
+/// backend; making it meaningful is the multi-queue work in docs/VULKAN.md, which is where
+/// the expert-stream overlap actually gets restored.
+///
+/// # Safety
+/// Device addresses of live [`Buf`]s, valid until the next [`device_sync`]: `x`
+/// (`hidden` f32), `descs` (`e_start+e_count` [`ExpertDesc`]), the three codebooks
+/// (`VQ_K·VQ_DIM` fp16 each), `wexpert`, `h` (`E·inter` f32), `partial` (`E·hidden` f32).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_moe_expert_range(
+    x: *const f32,
+    hidden: usize,
+    inter: usize,
+    e_start: usize,
+    e_count: usize,
+    descs: *const ExpertDesc,
+    gate_cb: *const u16,
+    up_cb: *const u16,
+    down_cb: *const u16,
+    wexpert: *const f32,
+    h: *mut f32,
+    partial: *mut f32,
+    _stream: *mut std::ffi::c_void,
+) -> Result<()> {
+    moe_vq_guards(hidden, inter, e_count, "moe_expert_range")?;
+    ensure_word_aligned(descs as u64, "moe_expert_range descs")?;
+    for (p, n) in [(gate_cb, "gate_cb"), (up_cb, "up_cb"), (down_cb, "down_cb")] {
+        ensure_word_aligned(p as u64, &format!("moe_expert_range {n}"))?;
+    }
+    let g = gpu()?;
+
+    let gu = MoeGateUpPush {
+        x: x as u64,
+        descs: descs as u64,
+        gate_cb: gate_cb as u64,
+        up_cb: up_cb as u64,
+        h_out: h as u64,
+        hidden: hidden as i32,
+        inter: inter as i32,
+        e_start: e_start as i32,
+        e_count: e_count as i32,
+    };
+    g.dispatch(
+        &g.pipes.moe_gateup_vq,
+        &gu,
+        (e_count * inter).div_ceil(ROWS_PER_BLOCK as usize) as u32,
+    )?;
+
+    let dn = MoeDownPush {
+        descs: descs as u64,
+        down_cb: down_cb as u64,
+        wexpert: wexpert as u64,
+        h_in: h as u64,
+        partial: partial as u64,
+        hidden: hidden as i32,
+        inter: inter as i32,
+        e_start: e_start as i32,
+        e_count: e_count as i32,
+    };
+    g.dispatch(
+        &g.pipes.moe_down_vq,
+        &dn,
+        (e_count * hidden).div_ceil(ROWS_PER_BLOCK as usize) as u32,
+    )
+}
+
+/// `out[o] = Σ_e partial[e][o]`, e ascending. Matches `hip.rs::launch_moe_reduce`.
+///
+/// # Safety
+/// Device addresses of live [`Buf`]s: `partial` (`e·hidden` f32), `out` (`hidden` f32).
+pub unsafe fn launch_moe_reduce(
+    partial: *const f32,
+    e: usize,
+    hidden: usize,
+    out: *mut f32,
+    _stream: *mut std::ffi::c_void,
+) -> Result<()> {
+    ensure!(e > 0 && hidden > 0, "moe_reduce: argument guard rejected");
+    let g = gpu()?;
+    let push = MoeReducePush {
+        partial: partial as u64,
+        out: out as u64,
+        e_count: e as i32,
+        hidden: hidden as i32,
+    };
+    g.dispatch(&g.pipes.moe_reduce, &push, groups(hidden))
 }
