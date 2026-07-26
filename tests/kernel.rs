@@ -40,20 +40,36 @@ fn assert_close(want: &[f32], got: &[f32], label: &str) {
         .iter()
         .zip(got)
         .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
-    assert!(
-        err <= 1e-3 * mx + 1e-3,
-        "{label}: err={err:.3e} max={mx:.3e}"
+    let tol = 1e-3 * mx + 1e-3;
+    // Print the MARGIN, not just pass/fail. An oracle clearing its threshold by 100x
+    // and one clearing it by 2x look identical in a green test run, and only the
+    // second is evidence of anything.
+    println!(
+        "{label}: err={err:.3e} tol={tol:.3e} margin={:.1}x",
+        tol / err.max(f32::MIN_POSITIVE)
     );
+    assert!(err <= tol, "{label}: err={err:.3e} > tol={tol:.3e} max={mx:.3e}");
 }
 
 struct Lcg(u64);
 impl Lcg {
+    /// Uniform in [-1, 1).
+    ///
+    /// `>> 32`, not `>> 33`. The old shift kept only 31 bits, so dividing by
+    /// `u32::MAX` gave [0, 0.5) and `*2 - 1` gave [-1, 0) — **every sample negative**,
+    /// for the whole life of this file. In a matvec oracle that makes every
+    /// x[i]*w[i] product positive, so the partial sums GROW instead of cancelling:
+    /// `mx` inflates, the `1e-3 * mx` relative tolerance inflates with it, and the
+    /// oracles have been passing on roughly two orders of magnitude of headroom. It
+    /// also means no oracle here has ever exercised floating-point cancellation —
+    /// the only regime where summation order matters, and the entire reason the
+    /// kernels reduce with a fixed `__shfl_down` ladder instead of an atomic.
     fn f(&mut self) -> f32 {
         self.0 = self
             .0
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        ((self.0 >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        ((self.0 >> 32) as f32 / u32::MAX as f32) * 2.0 - 1.0
     }
 }
 
