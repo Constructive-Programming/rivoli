@@ -41,14 +41,12 @@ const M_GRID: [usize; 7] = [8, 10, 12, 16, 20, 24, 32];
 /// reaching further.
 const HORIZONS: [usize; 2] = [1, 2];
 
-/// Recall points the modelled pilot is swept over, bracketing the one real datum anyone
-/// has: colibri measured 71.6% L+1 recall on GLM-5.2 (48 greedy tokens). Ours is
-/// int3-vq quantized and L+2 is unmeasured anywhere, which is what LOOKA is for.
-const RECALL_GRID: [f64; 7] = [0.50, 0.60, 0.70, COLIBRI_L1_RECALL, 0.80, 0.90, 1.00];
+/// The one real recall datum anyone has: colibri measured 71.6% L+1 on GLM-5.2 (48 greedy
+/// tokens). Ours is int3-vq quantized and L+2 is unmeasured anywhere — that is what LOOKA
+/// is for. The curve marks whichever swept point lands nearest this.
 const COLIBRI_L1_RECALL: f64 = 0.716;
 
 /// One routing decision (one MoE layer of one token).
-#[derive(Default)]
 struct Decision {
     /// The keys the engine actually looked up, in access order. Always present.
     demand: Vec<u32>,
@@ -130,7 +128,11 @@ fn substitute(window: &[u32], k: usize, j: usize, m: usize, resident: impl Fn(u3
 #[derive(Clone, Copy)]
 struct Pilot {
     horizon: usize,
-    recall: f64,
+    /// How many of the decision's `top_k` experts it gets RIGHT — a count, not a
+    /// fraction. `top_k` is 8, so recall only exists in eighths; sweeping a fraction
+    /// would print 70%, 71.6% and 80% as three identical rows and need a footnote
+    /// apologising for it. A count makes every row an exact, distinct configuration.
+    keep: usize,
 }
 
 impl Pilot {
@@ -148,7 +150,7 @@ impl Pilot {
     /// all — a v1 trace could only have modelled a uniform draw.
     fn predict(&self, next: &Decision, out: &mut Vec<u32>) {
         let k = next.demand.len();
-        let keep = ((self.recall * k as f64).round() as usize).min(k);
+        let keep = self.keep.min(k);
         out.clear();
         out.extend(next.demand.iter().take(keep));
         out.extend(next.window.iter().skip(k).take(k - keep));
@@ -402,45 +404,43 @@ fn main() -> Result<()> {
     println!(
         "\nCACHE_PILOT recall curve — policy {grid_policy}, cap={cap}, baseline {base:.2}% hit,\n\
          {base_miss} baseline misses (= baseline admissions, the byte reference).\n\
-         r=100% is the ORACLE CEILING: perfect knowledge of decision L+h's true experts,\n\
-         admitted under the real byte policy with no eviction guard. Note it is close to\n\
-         vacuous — a decision needs only {} keys and {} admissions fit in any pool that holds\n\
-         one batch, so a perfect predictor removes every miss by construction, moving exactly\n\
-         the baseline's bytes earlier rather than adding any.\n\
-         Below r=100% the predictor still names {} experts, so every false negative is also a\n\
-         false POSITIVE drawn from that decision's own candidate window — the admissions\n\
-         column is where that cost shows up. THIS IS A MODEL, NOT A MEASUREMENT: errors are\n\
-         independent across decisions here and correlated in reality, so every row is an\n\
-         upper bound. Real recall comes from LOOKA, on the device.\n",
-        top_k, top_k, top_k,
+         Recall is a COUNT of a decision's {top_k} experts the predictor gets right, since\n\
+         recall only exists in 1/{top_k} steps. The {top_k}/{top_k} row is the ORACLE CEILING:\n\
+         perfect knowledge of L+h's true experts, admitted under the real byte policy with no\n\
+         eviction guard — and it is close to vacuous, because {top_k} admissions fit in any pool\n\
+         that holds one batch, so a perfect predictor removes every miss by construction and\n\
+         moves exactly the baseline's bytes earlier rather than adding any.\n\
+         Every row below it still names {top_k} experts, so each false negative is also a false\n\
+         POSITIVE, drawn from that decision's own candidate window — the admissions column is\n\
+         where that cost lands. THIS IS A MODEL, NOT A MEASUREMENT: errors are independent\n\
+         across decisions here and correlated in reality, so every row is an upper bound.\n\
+         Real recall comes from LOOKA, on the device.\n"
     );
     println!(
-        "{:<6}{:>8}{:>10}{:>10}{:>13}{:>12}",
+        "{:<6}{:>14}{:>10}{:>10}{:>13}{:>12}",
         "h", "recall", "hit%", "+pp", "admissions", "vs base"
     );
+    // Nearest swept point to colibri's measured L+1 recall, marked so the one real datum
+    // anyone has is findable in the curve rather than left to the reader's arithmetic.
+    let colibri_keep = (COLIBRI_L1_RECALL * top_k as f64).round() as usize;
     for h in HORIZONS {
-        for r in RECALL_GRID {
-            let c = replay(&grid_policy, cap, split, &trace, None, Some(Pilot { horizon: h, recall: r }))?;
+        // Half-right to all-right. Below half a predictor is not worth discussing, and
+        // `keep` is a COUNT because recall only exists in 1/top_k steps.
+        for keep in (top_k / 2)..=top_k {
+            let c = replay(&grid_policy, cap, split, &trace, None, Some(Pilot { horizon: h, keep }))?;
             let (pp, _) = delta(base, pct(c));
-            // Total bytes = every admission, demand or speculative, times the per-expert
-            // stride — which is constant, so the admission RATIO is the byte ratio.
+            // Every admission, demand or speculative, moves one expert's bytes; the stride
+            // is constant, so the admission RATIO is exactly the byte ratio.
             let admits = (accesses as u64 - c.loaded) + c.spec;
             println!(
-                "L+{h:<4}{:>7.1}%{:>9.2}%{pp:>+10.2}{admits:>13}{:>11.2}x{}",
-                100.0 * r,
+                "L+{h:<4}{:>7.1}% ({keep}/{top_k}){:>9.2}%{pp:>+10.2}{admits:>13}{:>11.2}x{}",
+                100.0 * keep as f64 / top_k as f64,
                 pct(c),
                 admits as f64 / base_miss.max(1) as f64,
-                if (r - COLIBRI_L1_RECALL).abs() < 1e-9 { "  <- colibri L+1" } else { "" },
+                if keep == colibri_keep { "  <- nearest colibri L+1 (71.6%)" } else { "" },
             );
         }
     }
-    // top_k of 8 quantizes recall to 12.5pp steps, so neighbouring rows can be identical.
-    // Say so rather than letting a reader infer a flat region that is really a rounding.
-    println!(
-        "\n(recall quantizes to 1/{top_k} = {:.1}pp steps — adjacent rows that round to the same\n\
-         kept-count are identical by construction, not by insensitivity.)",
-        100.0 / top_k as f64
-    );
     Ok(())
 }
 
@@ -546,7 +546,7 @@ mod tests {
                    1 2 | 1:0.9 2:0.8\n3 4 | 3:0.9 4:0.8\n1 2 | 1:0.9 2:0.8\n3 4 | 3:0.9 4:0.8\n";
         let t = parse(src);
         let base = replay("lru", 2, TwoQSplit::default(), &t, None, None).expect("base");
-        let pilot = Pilot { horizon: 1, recall: 1.0 };
+        let pilot = Pilot { horizon: 1, keep: 4 };
         let o = replay("lru", 2, TwoQSplit::default(), &t, None, Some(pilot)).expect("oracle");
         assert!(o.loaded >= base.loaded, "oracle {o:?} < baseline {base:?}");
         assert!(o.spec > 0, "the oracle issued no speculative admissions");
@@ -559,7 +559,7 @@ mod tests {
         let t = parse(V2);
         let mut out = Vec::new();
         for d in &t {
-            Pilot { horizon: 1, recall: 1.0 }.predict(d, &mut out);
+            Pilot { horizon: 1, keep: 4 }.predict(d, &mut out);
             assert_eq!(out, d.demand);
         }
     }
@@ -573,7 +573,7 @@ mod tests {
         let t = parse(V2);
         let mut out = Vec::new();
         // k=4, r=0.5 => keep 2 true, fill 2 from window[4..] = the ranks just outside.
-        Pilot { horizon: 1, recall: 0.5 }.predict(&t[0], &mut out);
+        Pilot { horizon: 1, keep: 2 }.predict(&t[0], &mut out);
         assert_eq!(out.len(), t[0].demand.len(), "a real pilot always names top_k");
         assert_eq!(out, vec![10, 11, 14, 15]);
         let hits = out.iter().filter(|k| t[0].demand.contains(k)).count();
