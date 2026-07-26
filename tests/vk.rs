@@ -7,13 +7,18 @@
 //!
 //! # Two rules for whoever writes the next tranche
 //!
-//! **1. Do not read `kernels/vk/*.comp` while writing an oracle.** Derive it from the
+//! **1. Do not read the Vulkan shader sources while writing an oracle.** Derive it from the
 //! HIP original and from `src/math.rs`, which are the specification. An oracle written
 //! by someone who has seen the shader is a consistency check wearing a correctness
 //! check's clothes: it agrees with the implementation because it was copied from it,
 //! and it will happily ratify a shared misreading of the HIP. The `fwd.hip` oracles
 //! here were written under that constraint deliberately. It costs a little rework when
 //! the two disagree, which is the entire point — that disagreement is the signal.
+//!
+//! `tests/oracle_independence.rs` enforces the detectable half: no test file may name
+//! the shader directory. That is why this paragraph does not spell the path out — a
+//! rule that trips its own tripwire has to be allowlisted, and an allowlisted rule
+//! stops being a rule.
 //!
 //! **2. A byte-exact oracle must prove its INPUTS are unambiguous.** Where a test
 //! compares quantised bytes, the test DATA is a source of cross-driver flake
