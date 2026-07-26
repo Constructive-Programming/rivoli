@@ -4,7 +4,8 @@ Status: **analysis + roadmap.** Leads with the **structural paths** (the higher-
 goals that move throughput by a multiplier or restructure a whole phase); the per-kernel
 findings are **follow-up polish** to that structural work and to the existing improvement
 proposals ([CACHE_ROUTE](CACHE_ROUTE.md), [CACHE_PILOT](CACHE_PILOT.md), the fp8-int4
-work).
+work). Residency / cache-conditional routing is **not** covered here — it is owned in full
+by those two proposals.
 
 ## Where the time goes (hybrid+lru, 512 tok, the best coherent config)
 
@@ -19,11 +20,12 @@ work).
 **We are compute-bound, not fetch-bound.** Fetch overlaps compute almost entirely (~9 ms
 exposed), so `wall ≈ route + moe-gpu + tail`. Two consequences that shape the plan:
 
-1. **Fetch-wall wins buy nothing** — residency work pays a *different* way: fewer misses →
-   fewer host-gated launch **bubbles** inside `moe-gpu`. A compute win, not a fetch win.
-2. **The prize is `moe-gpu` (60%) and `route`.** The structural paths below attack those
-   two by a multiplier or a whole-phase restructure; the per-kernel follow-ups shave the
-   remaining milliseconds.
+1. **Fetch-wall wins buy nothing.** Residency work pays a *different* way — fewer misses →
+   fewer host-gated launch bubbles inside `moe-gpu` — and that lever is already owned by
+   [CACHE_ROUTE](CACHE_ROUTE.md) / [CACHE_PILOT](CACHE_PILOT.md); it is out of scope here.
+2. **The prize for this plan is `moe-gpu` (60%) and `route`.** The structural paths below
+   attack those two by a multiplier or a whole-phase restructure; the per-kernel follow-ups
+   shave the remaining milliseconds.
 
 Hardware: gfx1151, 40 CUs, 256 GB/s LPDDR5 (unified, GTT ceiling 116 GiB).
 
@@ -65,20 +67,6 @@ program behind a shared quality gate (perplexity on fixed text — never free-ru
 
 **Impact: structural on the 210 ms (60% of wall). Effort: medium; requant + quality gate.**
 
-### Path C — Cache-conditional residency: kill the `moe-gpu` bubbles
-
-Every avoided miss avoids a host-gated per-expert launch, so it removes a compute bubble
-from `moe-gpu` (not fetch wall — fetch is hidden). Two existing proposals own this:
-
-- **[CACHE_ROUTE](CACHE_ROUTE.md)** (top-m cache-conditional routing) — training-free,
-  reported >50% miss reduction at +0.1–3% ppl; biases routing toward resident experts.
-  Highest residency ROI.
-- **[CACHE_PILOT](CACHE_PILOT.md)** (router-piloted cross-layer prefetch) — fetch L+1/L+2
-  experts during current compute; same bubble mechanism.
-- **Stretch — device-side expert loop.** The host-gating is structural; a persistent MoE
-  kernel that consumes experts as their bytes land (no host round-trip per expert) removes
-  the bubble class entirely. High effort; caps the bubble component of `moe-gpu`.
-
 ---
 
 ## Per-kernel follow-ups
@@ -117,20 +105,17 @@ Grounded in the measured kernel profile.
 | # | Item | Path | Est. impact | Effort | Status |
 |---|---|---|---|---|---|
 | 1 | `fp8_to_i4` + `--hot-pct` re-tune | B | med (more int4, faster compute) | low | fp8 downloading |
-| 2 | CACHE_ROUTE (top-m) | C | med–high (>50% miss cut) | med | [proposal](CACHE_ROUTE.md) |
-| 3 | VQ_K=2048 L1-resident codebook | B / follow-up #1 | med (lifts gather wall) + smaller experts | med (requant) | new |
-| 4 | Batched-GEMV kernels | A | med now, unlocks MTP | med–high | new |
-| 5 | MTP / speculative decode | A | high (≥1.5×) | high | needs #4 + fp8 MTP head |
-| 6 | `mla_latent_attend` occupancy | follow-up #3 | ~5–7 ms now, huge at long ctx | med | new |
-| 7 | o_proj / lm_head split-K | follow-up #2, #5 | ~10–15 ms | low | new |
-| 8 | `mla_absorb` restructure | follow-up #4 | ~2–3 ms | med | new |
-| 9 | CACHE_PILOT (cross-layer prefetch) | C | low–med (overlaps #2) | med | [proposal](CACHE_PILOT.md) |
-| — | device-side expert loop | C (stretch) | caps bubble class | high | stretch |
+| 2 | VQ_K=2048 L1-resident codebook | B / follow-up #1 | med (lifts gather wall) + smaller experts | med (requant) | new |
+| 3 | Batched-GEMV kernels | A | med now, unlocks MTP | med–high | new |
+| 4 | MTP / speculative decode | A | high (≥1.5×) | high | needs #3 + fp8 MTP head |
+| 5 | `mla_latent_attend` occupancy | follow-up #3 | ~5–7 ms now, huge at long ctx | med | new |
+| 6 | o_proj / lm_head split-K | follow-up #2, #5 | ~10–15 ms | low | new |
+| 7 | `mla_absorb` restructure | follow-up #4 | ~2–3 ms | med | new |
 
-**Suggested sequence:** land #1 (cheap, in flight) → **Path B + Path C** (#2, #3 — the
-biggest structural wins on the 210 ms) → **Path A** (#4 batched kernels → #5 MTP, the
-multiplier) → per-kernel follow-ups #6–8 as route/tail polish (#6 mandatory before any
-long-context work).
+**Suggested sequence:** land #1 (cheap, in flight) → **Path B** (#2 — the biggest
+structural win on the 210 ms) → **Path A** (#3 batched kernels → #4 MTP, the multiplier) →
+per-kernel follow-ups #5–7 as route/tail polish (#5 mandatory before any long-context
+work).
 
 **Measurement discipline (learned the hard way):** rank format/numerics changes by (a) the
 replay residency sim, (b) a fixed forced-token wall-clock bench, and (c) perplexity for
