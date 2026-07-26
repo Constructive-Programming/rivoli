@@ -259,6 +259,66 @@ fn memcpy_dtod_after_dispatch_is_ordered() {
     assert_validation_clean("memcpy_dtod_after_dispatch_is_ordered");
 }
 
+/// Drive a future to completion on this thread. Fifteen lines of std beats pulling in
+/// a runtime for one test — `asyncfetch.rs` brings tokio when it is actually ported.
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+    struct Unpark(std::thread::Thread);
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut f = std::pin::pin!(f);
+    loop {
+        match f.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => return v,
+            Poll::Pending => std::thread::park(),
+        }
+    }
+}
+
+/// The timeline-semaphore Signal resolves, and at what cost.
+///
+/// The HIP side gets this from `hipLaunchHostFunc` at ~19 us/signal, measured by
+/// `gpustream::tests::signal_resolves_and_latency`. Vulkan has no host-callback-on-
+/// queue, so this is one waiter thread in `vkWaitSemaphores` instead — and the plan
+/// explicitly says to MEASURE whether a thread wakeup beats 19 us rather than assume.
+/// The decode path arms roughly 9 per layer over 78 layers per token, so the number
+/// decides whether the async overlap is affordable at all.
+#[test]
+fn timeline_signal_resolves_and_latency() {
+    let g = gpu().expect("vulkan init");
+    // Warm the waiter thread and the first submit.
+    block_on(g.signal().expect("arm"));
+
+    let n = 200u32;
+    let t = std::time::Instant::now();
+    for _ in 0..n {
+        block_on(g.signal().expect("arm"));
+    }
+    let us = t.elapsed().as_nanos() as f64 / f64::from(n) / 1000.0;
+    println!("\nVK TIMELINE-SIGNAL round-trip: {us:.2} us/signal ({n} iters)\n");
+    // Sanity ceiling only, matching the HIP test: if a bare signal costs >1 ms the
+    // pipeline is a non-starter and the number matters more than the assertion.
+    assert!(us < 1000.0, "signal latency {us:.1}us implausibly high");
+    assert_validation_clean("timeline_signal_resolves_and_latency");
+}
+
+/// A resolved signal is immediately ready, and `resolve` is idempotent — the error
+/// path in the reaper depends on both, so awaiters never hang.
+#[test]
+fn signal_ready_and_resolve_are_immediate() {
+    block_on(rivoli::vk::Signal::ready());
+    let s = rivoli::vk::Signal::pending();
+    s.resolve();
+    s.resolve(); // idempotent
+    block_on(s);
+}
+
 /// The guards report errors rather than tripping a Vulkan VUID or allocating nothing.
 #[test]
 fn guards_reject_degenerate_arguments() {

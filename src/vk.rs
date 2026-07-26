@@ -11,8 +11,13 @@
 
 use anyhow::{Result, anyhow, bail, ensure};
 use ash::vk;
+use futures_util::task::AtomicWaker;
 use std::ffi::CStr;
-use std::sync::{Mutex, OnceLock};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::task::{Context, Poll};
 use tracing::{info, warn};
 
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
@@ -46,6 +51,7 @@ pub struct Gpu {
     pipes: Pipes,
     validation: bool,
     budget: bool,
+    timeline: Timeline,
 }
 
 /// Count of validation ERROR/WARNING messages seen. Tests assert it is zero, so a
@@ -186,7 +192,14 @@ pub fn gpu() -> Result<&'static Gpu> {
         return Ok(g);
     }
     let g = Gpu::new()?;
-    Ok(GPU.get_or_init(|| g))
+    let g = GPU.get_or_init(|| g);
+    // Spawned here, not in `Gpu::new`: the waiter needs a `&'static Gpu`, which only
+    // exists once the OnceLock owns it. Runs for the life of the process; `Gpu` is
+    // never dropped, so there is nothing for it to outlive.
+    std::thread::Builder::new()
+        .name("rivoli-vk-timeline".into())
+        .spawn(move || timeline_waiter(g))?;
+    Ok(g)
 }
 
 impl Gpu {
@@ -229,6 +242,7 @@ impl Gpu {
         let memprops = unsafe { instance.get_physical_device_memory_properties(phys) };
         let cmd = Cmd::new(&device, qfam)?;
         let pipes = Pipes::new(&device)?;
+        let timeline = Timeline::new(&device)?;
 
         Ok(Self {
             device,
@@ -241,6 +255,7 @@ impl Gpu {
             pipes,
             validation,
             budget,
+            timeline,
         })
     }
 
@@ -1139,5 +1154,191 @@ mod tests {
         println!("VULKAN free: {:.1} GiB", free as f64 / (1u64 << 30) as f64);
         // Second call must hand back the same context, not build another.
         assert!(std::ptr::eq(g, gpu().expect("cached")));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Async-signal bridge — the timeline-semaphore replacement for hipLaunchHostFunc.
+// ---------------------------------------------------------------------------
+
+/// A one-shot completion shared between whatever resolves it and the future awaiting
+/// it. Deliberately the SAME surface as `gpustream::Signal` — `pending`/`ready`/
+/// `resolve` plus `Future` — so `asyncfetch.rs` and the expert stream in `gpu.rs` do
+/// not change when the backend does.
+#[derive(Clone)]
+pub struct Signal(Arc<SignalState>);
+
+struct SignalState {
+    done: AtomicBool,
+    waker: AtomicWaker,
+}
+
+impl Signal {
+    /// An unresolved signal.
+    pub fn pending() -> Self {
+        Signal(Arc::new(SignalState {
+            done: AtomicBool::new(false),
+            waker: AtomicWaker::new(),
+        }))
+    }
+
+    /// An already-resolved signal — a cache hit whose data is already present.
+    pub fn ready() -> Self {
+        let s = Self::pending();
+        s.0.done.store(true, Ordering::Release);
+        s
+    }
+
+    /// Force-resolve from the resolver side (an error path, so awaiters never hang).
+    /// Idempotent.
+    pub fn resolve(&self) {
+        self.0.done.store(true, Ordering::Release);
+        self.0.waker.wake();
+    }
+}
+
+impl Future for Signal {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.0.done.load(Ordering::Acquire) {
+            return Poll::Ready(());
+        }
+        self.0.waker.register(cx.waker());
+        // Re-check: the waiter may have fired between the load and the register.
+        if self.0.done.load(Ordering::Acquire) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+/// The timeline semaphore plus the thread that watches it.
+///
+/// Vulkan has no host-callback-on-queue, which is what `hipLaunchHostFunc` gives the
+/// HIP side (~19 us/signal). The replacement is one thread blocking in
+/// `vkWaitSemaphores`, resolving every `Signal` whose value the counter has passed.
+/// One thread total, not one per signal.
+struct Timeline {
+    sem: vk::Semaphore,
+    /// Next value to signal. Monotonic; a timeline counter may only increase.
+    next: AtomicU64,
+    /// Registered `(value, signal)` pairs, and the condvar the waiter parks on when
+    /// there is nothing outstanding.
+    waiting: Mutex<Vec<(u64, Signal)>>,
+    wake: Condvar,
+}
+
+impl Gpu {
+    /// A [`Signal`] that resolves once everything SUBMITTED SO FAR has retired.
+    ///
+    /// ponytail: this covers submitted work, not work merely RECORDED into the open
+    /// command buffer — it appends its own empty timeline-signal submit, and the queue
+    /// is in-order, so it lands behind every prior submit. Recording is flushed by
+    /// `device_sync`, so `device_sync()` then `signal()` is well defined today.
+    ///
+    /// Arming directly on top of recorded-but-unsubmitted work (what
+    /// `Signal::arm_on(stream)` does on the HIP side) needs the single command buffer
+    /// here to become a small ring, because an async flush cannot reuse a buffer that
+    /// is still pending. That is integration-phase work: nothing consumes this yet,
+    /// `asyncfetch.rs` being rocm-only, and building the ring before its consumer
+    /// exists would be a design with no test to hold it honest.
+    pub fn signal(&self) -> Result<Signal> {
+        let t = &self.timeline;
+        let value = t.next.fetch_add(1, Ordering::Relaxed) + 1;
+        let sig = Signal::pending();
+        {
+            let mut w = t
+                .waiting
+                .lock()
+                .map_err(|_| anyhow!("vk timeline lock poisoned"))?;
+            w.push((value, sig.clone()));
+        }
+        t.wake.notify_one();
+
+        let sems = [t.sem];
+        let values = [value];
+        let mut ts = vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&values);
+        let submits = [vk::SubmitInfo::default()
+            .signal_semaphores(&sems)
+            .push_next(&mut ts)];
+        // SAFETY: an empty submit that only signals; the queue is externally
+        // synchronised by the caller holding no other queue operation in flight on
+        // another thread (see the Send/Sync note on `Gpu`).
+        let r = unsafe { self.device.queue_submit(self.queue, &submits, vk::Fence::null()) };
+        if let Err(e) = r {
+            // Nothing will ever signal this value, so resolve it here rather than
+            // leaving an awaiter parked forever.
+            sig.resolve();
+            if let Ok(mut w) = t.waiting.lock() {
+                w.retain(|(v, _)| *v != value);
+            }
+            bail!("vkQueueSubmit (timeline signal) failed: {e}");
+        }
+        Ok(sig)
+    }
+}
+
+impl Timeline {
+    fn new(device: &ash::Device) -> Result<Self> {
+        let mut ty = vk::SemaphoreTypeCreateInfo::default()
+            .semaphore_type(vk::SemaphoreType::TIMELINE)
+            .initial_value(0);
+        let ci = vk::SemaphoreCreateInfo::default().push_next(&mut ty);
+        // SAFETY: `device` is live; `ci` outlives the call.
+        let sem = unsafe { device.create_semaphore(&ci, None) }?;
+        Ok(Self {
+            sem,
+            next: AtomicU64::new(0),
+            waiting: Mutex::new(Vec::new()),
+            wake: Condvar::new(),
+        })
+    }
+}
+
+/// The waiter thread: block until the counter passes the lowest outstanding value,
+/// then resolve everything it has reached. Runs for the life of the process.
+fn timeline_waiter(g: &'static Gpu) {
+    let t = &g.timeline;
+    loop {
+        // Park while nothing is outstanding, so an idle process costs no CPU.
+        let target = {
+            let Ok(mut w) = t.waiting.lock() else { return };
+            while w.is_empty() {
+                let Ok(next) = t.wake.wait(w) else { return };
+                w = next;
+            }
+            w.iter().map(|(v, _)| *v).min().unwrap_or(u64::MAX)
+        };
+        let sems = [t.sem];
+        let values = [target];
+        let info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&sems)
+            .values(&values);
+        // A timeout rather than u64::MAX: a submit that never completes must not wedge
+        // this thread past the point where the watchdog would act on it.
+        // SAFETY: `t.sem` is live for the process.
+        let _ = unsafe { g.device.wait_semaphores(&info, 100_000_000) };
+        // SAFETY: as above.
+        let Ok(now) = (unsafe { g.device.get_semaphore_counter_value(t.sem) }) else {
+            continue;
+        };
+        let Ok(mut w) = t.waiting.lock() else { return };
+        // Resolve OUTSIDE the retain predicate's borrow of the signal, and resolve
+        // every value the counter has passed, not just `target` — several may have
+        // landed inside one wait.
+        let mut fired = Vec::new();
+        w.retain(|(v, s)| {
+            if *v <= now {
+                fired.push(s.clone());
+                false
+            } else {
+                true
+            }
+        });
+        drop(w);
+        for s in fired {
+            s.resolve();
+        }
     }
 }

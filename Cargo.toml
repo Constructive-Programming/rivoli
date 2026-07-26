@@ -46,9 +46,10 @@ default = []
 rocm = ["dep:tokio", "dep:futures-util", "dep:tokio-stream", "dep:tokio-metrics", "dep:io-uring"]
 # The second compute backend: build.rs compiles kernels/vk/*.comp via glslc. MUTUALLY
 # EXCLUSIVE with `rocm` — one backend per build, no runtime selection (docs/VULKAN.md).
-# ponytail: only the deps the ported phases actually use. The async stack arrives
-# with the timeline-semaphore Signal and stream.rs/asyncfetch.rs, not before.
-vulkan = ["dep:ash"]
+# ponytail: only the deps the ported phases actually use. futures-util arrives with the
+# timeline-semaphore Signal (AtomicWaker, same as gpustream.rs); tokio/io-uring wait for
+# stream.rs and asyncfetch.rs in the integration phase.
+vulkan = ["dep:ash", "dep:futures-util"]
 # OTLP export of the always-on decode summary (one span/run, opt-in at runtime via
 # OTEL_EXPORTER_OTLP_ENDPOINT). Off by default — the opentelemetry stack is heavy.
 otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
