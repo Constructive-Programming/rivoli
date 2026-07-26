@@ -71,6 +71,15 @@ impl FormatMeta {
                 && m.vq_group == VQ_GROUP,
             "artifact VQ params differ from the compiled-in kernel params"
         );
+        // The fp8 GEMV kernels index the block scale with a SHIFT (`blk_shift`), so a
+        // non-power-of-two tile is unrunnable. The kernel launchers reject it too (arg
+        // guard 1003); catching it here turns a mid-decode HIP error into a startup
+        // message that names the offending value.
+        ensure!(
+            m.fp8_block > 0 && m.fp8_block.is_power_of_two(),
+            "artifact fp8_block ({}) must be a power of two",
+            m.fp8_block
+        );
         Ok(m)
     }
 }

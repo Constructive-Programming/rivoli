@@ -212,6 +212,7 @@ extern "C" int rivoli_gemv_fp8_splitk(
     const float* x, const unsigned char* packed, const float* scale, int o_dim, int i_dim,
     int block, float* y) {
     if (o_dim <= 0 || i_dim <= 0 || block <= 0) return 1001;
+    if (block & (block - 1)) return 1003;  // blk_shift needs a power-of-two tile
     hipGetLastError();
     hipLaunchKernelGGL(gemv_fp8_splitk, dim3(o_dim), ROW_BLOCK, 0, 0, x, packed, scale, o_dim, i_dim, block, y);
     hipError_t e = hipGetLastError();
@@ -222,6 +223,7 @@ extern "C" int rivoli_gemv_fp8(
     const float* x, const unsigned char* packed, const float* scale, int o_dim, int i_dim,
     int block, float* y) {
     if (o_dim <= 0 || i_dim <= 0 || block <= 0) return 1001;
+    if (block & (block - 1)) return 1003;  // blk_shift needs a power-of-two tile
     if (i_dim >= GEMV_SPLITK_MIN_IDIM)
         return rivoli_gemv_fp8_splitk(x, packed, scale, o_dim, i_dim, block, y);
     hipGetLastError();
