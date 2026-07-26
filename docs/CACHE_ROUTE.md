@@ -199,8 +199,16 @@ worth adding if a writeup needs it, but `swap%` is what you tune (J, M) against.
 pilot is preliminary work for this policy and has no separate bar; there is one
 decision for the whole program.
 
-- Replay (fixed trace, per mode): miss reduction ≥20pp at some (J, M) on the grid, or
-  the feature is not worth the routing complexity — say so and stop.
+- Replay (fixed trace, per mode): **≥ +5pp absolute hit-rate improvement** at some (J, M)
+  on the grid, or the feature is not worth the routing complexity — say so and stop.
+  (This bar replaces an earlier "miss reduction ≥20pp", which was a spec bug: our baseline
+  miss rate is ~19–24%, so a 20 *percentage-point* reduction was at or past the arithmetic
+  maximum. Absolute hit pp is also directly comparable to the hit% column in
+  `benchmarks.md`.) Report **both** numbers for every grid cell — absolute pp on hit, and
+  the relative % of misses removed — so the result stays comparable to the paper's
+  ">50% cache-miss reduction" even though the relative figure is not the bar.
+  This grid is a **screen for whether to build**, not final acceptance; the perplexity,
+  hybrid tier-rule A/B and `moe-gpu` gates below still decide.
 - Engine: `--cache-policy lru|2q|arc` byte-identical to today.
 - Quality: perplexity delta within ~1% of the unsubstituted baseline at the chosen
   (J, M), measured on fixed text, in every mode it ships for.

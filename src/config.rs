@@ -72,8 +72,11 @@ pub struct Config {
     /// EFAULTs on direct io_uring DMA into VMM (see src/stream.rs). Set only to force the
     /// raw-DMA path.
     pub direct_vmm_dma: bool,
-    /// Dump the routed-expert access trace to this path (`--trace`): one line per MoE
-    /// layer, the keys it looked up. Feeds the offline `replay` cache-policy sim.
+    /// Dump the routed-expert access trace to this path (`--trace`), format v2: a
+    /// `# rivoli-trace v2 top_k=<k> window=<w>` header, then one line per MoE layer —
+    /// the keys it looked up, then `|`, then the top-`w` router candidates as
+    /// `key:choice`. Feeds the offline `replay` cache-policy sim; the header and the
+    /// `|` tail are both invisible to a v1 reader.
     pub trace: Option<String>,
     /// Override the fixed bench prompt (`--prompt`), for capturing routing traces of
     /// diverse inputs. None = the default prompt.

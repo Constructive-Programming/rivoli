@@ -177,9 +177,10 @@ pub struct Pin<'a> {
     fetch: AsyncFetch,
     pub hits: u64,
     pub misses: u64,
-    /// Optional access-trace sink (`--trace`): one line per resolved MoE layer — the
-    /// `(layer,expert)` keys looked up, in access order. Feeds the offline `replay`
-    /// simulator.
+    /// Optional access-trace sink (`--trace`), format v2: a `#` header line, then one
+    /// line per resolved MoE layer — the `(layer,expert)` keys looked up in access
+    /// order, then `|`, then the top-[`TRACE_WINDOW`] router candidates as
+    /// `key:choice` in rank order. Feeds the offline `replay` simulator.
     trace: Option<std::io::BufWriter<std::fs::File>>,
 }
 
@@ -369,6 +370,15 @@ fn resident_bytes(cfg: &ModelConfig, block: usize, shared_i4: bool, cb_resident:
     // 3 per-projection fp16 codebooks — resident whenever a VQ slab is present.
     total + if cb_resident { 3 * VQ_K * VQ_DIM * 2 } else { 0 }
 }
+
+/// Width of the trace-v2 candidate window: the top-W router candidates recorded per
+/// routing decision, on top of the `top_k` that actually ran. W bounds the largest M
+/// the offline (J, M) substitution grid in docs/CACHE_ROUTE.md can explore — an M
+/// wider than this cannot be evaluated from a captured trace without recapturing.
+/// 32 is 4× `top_k` (8) and an eighth of `n_experts` (256): far past any M where
+/// promoting a resident-but-lower-ranked expert is still defensible, and only ~380
+/// bytes a line.
+pub const TRACE_WINDOW: usize = 32;
 
 /// Pack `(layer, expert)` into the pool key. Both must fit in 16 bits — GLM is
 /// ≤92 layers × 256 routed experts, comfortably under 2^16.
@@ -756,9 +766,18 @@ impl<'a> Pin<'a> {
             misses: 0,
             trace: trace_path
                 .map(|p| -> Result<_> {
-                    Ok(std::io::BufWriter::new(
+                    use std::io::Write;
+                    let mut w = std::io::BufWriter::new(
                         std::fs::File::create(p).with_context(|| format!("open trace {p}"))?,
-                    ))
+                    );
+                    // Version header. It is deliberately unparseable as data: `replay`
+                    // reads each line for whitespace-separated u32s and drops the empty
+                    // ones, so this line contributes nothing and a v2 trace replays
+                    // through a v1 reader byte-identically.
+                    let top_k = cfg.top_k;
+                    writeln!(w, "# rivoli-trace v2 top_k={top_k} window={TRACE_WINDOW}")
+                        .context("write trace")?;
+                    Ok(w)
                 })
                 .transpose()?,
         })
@@ -782,6 +801,12 @@ impl<'a> Pin<'a> {
         self.shared_i4
     }
 
+    /// Is the `--trace` sink on? gpu.rs gates the candidate-window `topk_into` on this
+    /// so a non-tracing decode pays literally nothing for trace v2.
+    pub fn tracing(&self) -> bool {
+        self.trace.is_some()
+    }
+
     /// Accumulated reaper fetch wall (ns) — the off-main-thread load cost the expert
     /// stream's compute overlaps. The profile reads it against the MoE wall.
     pub fn fetch_ns(&self) -> u64 {
@@ -798,6 +823,8 @@ impl<'a> Pin<'a> {
         &mut self,
         layer: usize,
         sel: &[usize],
+        window: &[usize],
+        choice: &[f32],
     ) -> Result<([Option<ResolvedSlot>; 32], Vec<Signal>)> {
         let cfg = self.cfg;
         let sparse = (layer - cfg.dense_layers) * cfg.n_experts; // read-table row base
@@ -809,7 +836,11 @@ impl<'a> Pin<'a> {
         // New batch: clear the policy's per-batch pin set. Phase 1a's protect() and 1b's
         // admit() then pin every touched key so a later miss's eviction can't reclaim it.
         self.routed.begin_batch();
-        // Trace sink (--trace): the keys this layer looks up, in access order.
+        // Trace sink (--trace), v2: the demand keys this layer looks up in access
+        // order, then `|`, then the top-`TRACE_WINDOW` candidates as `key:choice` in
+        // rank order. The window's first `sel.len()` entries are necessarily `sel`
+        // again — same scores, same comparator — but the offline reader wants one
+        // self-contained ranked list per decision, so it is written out in full.
         if let Some(w) = &mut self.trace {
             use std::io::Write;
             for (j, &e) in sel.iter().enumerate() {
@@ -817,6 +848,16 @@ impl<'a> Pin<'a> {
                     write!(w, " ").context("write trace")?;
                 }
                 write!(w, "{}", expert_key(layer, e)).context("write trace")?;
+            }
+            // ponytail: the `choice` values have no consumer yet — the (J, M) grid needs
+            // only the RANK order, which the list already carries. Written anyway because
+            // a capture is GPU-gated, sole-tenant and ~30 minutes, so these few bytes are
+            // cheap now and unrecoverable later without another capture; and `route_kl`
+            // (docs/CACHE_ROUTE.md "Counters") is deferred, not cancelled, and needs the
+            // mass distribution.
+            write!(w, " |").context("write trace")?;
+            for &e in window {
+                write!(w, " {}:{:.6}", expert_key(layer, e), choice[e]).context("write trace")?;
             }
             writeln!(w).context("write trace")?;
         }
@@ -866,14 +907,20 @@ impl<'a> Pin<'a> {
     /// (device pointers into the pool) + per-expert format flag + load [`Signal`]. The
     /// descriptor pointers are final (post-relocation); the bytes land when `signals[i]`
     /// resolves. The expert stream awaits each signal before computing that expert.
+    ///
+    /// `window`/`choice` feed the trace sink only: the ranked top-[`TRACE_WINDOW`]
+    /// candidate expert ids and the full per-expert `choice` array they index into.
+    /// Pass an empty `window` when not tracing — nothing else reads them.
     pub fn submit_layer(
         &mut self,
         layer: usize,
         sel: &[usize],
+        window: &[usize],
+        choice: &[f32],
         out: &mut Vec<MlpVq>,
         fmt: &mut Vec<bool>,
     ) -> Result<Vec<Signal>> {
-        let (slots, signals) = self.submit_spine(layer, sel)?;
+        let (slots, signals) = self.submit_spine(layer, sel, window, choice)?;
         out.clear();
         fmt.clear();
         for (i, _e) in sel.iter().enumerate() {

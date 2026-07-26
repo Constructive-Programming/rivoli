@@ -13,7 +13,8 @@ use tracing::info;
 /// CLI: `rivoli <model-dir> [-bench <tokens>] [flags]`. `--cache-policy lru|2q|arc`
 /// (default 2q) picks the eviction policy; `--direct-vmm-dma` forces raw DMA over the
 /// default pinned-host bounce; `--trace <path>` dumps the routed-expert access trace
-/// for the offline `replay` sim; `--prompt <text>` overrides the bench prompt;
+/// (v2: demand keys plus the ranked candidate window) for the offline `replay` sim;
+/// `--prompt <text>` overrides the bench prompt;
 /// `--max-mem <GiB>` sets the device budget literally (no OS reserve — may OOM);
 /// without it the budget auto-sizes to `free − 16 GiB`.
 struct Args {

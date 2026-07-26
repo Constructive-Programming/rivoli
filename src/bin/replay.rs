@@ -68,8 +68,11 @@ fn main() -> Result<()> {
     }
     let split = TwoQSplit::new(kin, kout)?;
 
-    // Load the trace: one MoE layer per line, whitespace-separated demand keys. (A
-    // legacy `| predicted` tail from the retired prefetch era is ignored.)
+    // Load the trace: one MoE layer per line, whitespace-separated demand keys. Two
+    // parts of a v2 trace are skipped rather than parsed here, which is exactly what
+    // keeps it readable by this v1 loader: the `| key:choice ...` candidate window (cut
+    // by the split on `|`), and the `# rivoli-trace v2 ...` header (nothing in it parses
+    // as a u32, so the line comes out empty and the filter below drops it).
     let f = std::fs::File::open(&trace_path).with_context(|| format!("open trace {trace_path}"))?;
     let trace: Vec<Vec<u32>> = std::io::BufReader::new(f)
         .lines()

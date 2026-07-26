@@ -21,7 +21,7 @@ use crate::hip::{
 };
 use crate::math::{E4M3_BLOCK, sigmoid, topk_into};
 use crate::model::ModelConfig;
-use crate::pin::{Fp8Mlp, IndexerPin, LayerMlp, MlpVq, Pin};
+use crate::pin::{Fp8Mlp, IndexerPin, LayerMlp, MlpVq, Pin, TRACE_WINDOW};
 use crate::telemetry::ProfileSummary;
 use anyhow::{Result, bail, ensure};
 use futures_util::stream::{StreamExt, TryStreamExt};
@@ -215,6 +215,10 @@ pub struct GpuEngine<'a> {
     scores: Vec<f32>,
     choice: Vec<f32>,
     sel: Vec<usize>,
+    /// Trace-only: the ranked top-[`TRACE_WINDOW`] candidates. Stays empty unless
+    /// `--trace` is on, and `--trace` is fixed for the run, so this is either filled
+    /// every layer or never.
+    window: Vec<usize>,
     // Per-token host build scratch — reused every layer so the hot path allocates
     // nothing: resolved VQ descriptors + weights, the resolved batch, D2H staging.
     w: Vec<f32>,
@@ -353,6 +357,7 @@ impl<'a> GpuEngine<'a> {
             scores: vec![0.0; cfg.n_experts],
             choice: vec![0.0; cfg.n_experts],
             sel: Vec::with_capacity(cfg.top_k),
+            window: Vec::new(), // grown once by the first traced layer; empty otherwise
             w: Vec::with_capacity(slots),
             codebooks: pin.codebooks(),
             mlps_vq: Vec::with_capacity(cfg.top_k),
@@ -803,12 +808,26 @@ impl<'a> GpuEngine<'a> {
                     &mut self.sel,
                 );
                 self.prof.route_ns += t.elapsed().as_nanos();
+                // Trace v2 only: re-rank the same `choice` array to the wider candidate
+                // window the offline (J, M) grid needs. Deliberately outside the
+                // `route_ns` clock and behind the trace gate, so the decode path is
+                // byte-for-byte the work it was before and route_ns stays comparable
+                // across the change.
+                if self.pin.tracing() {
+                    topk_into(&self.choice, TRACE_WINDOW, &mut self.window);
+                }
                 // SUBMIT this layer's cold reads — each selected expert gets a load
                 // Signal (hit → ready; miss → resolves when its bytes land). The slot
                 // ADDRESSES are known now, so the descriptors below are valid pointers.
                 let miss0 = self.pin.misses;
-                let mut signals =
-                    self.pin.submit_layer(l, &self.sel, &mut self.mlps_vq, &mut self.fmt)?;
+                let mut signals = self.pin.submit_layer(
+                    l,
+                    &self.sel,
+                    &self.window,
+                    &self.choice,
+                    &mut self.mlps_vq,
+                    &mut self.fmt,
+                )?;
                 self.prof.fetch_n += self.pin.misses - miss0;
                 // Routed weights: sigmoid score, sum-normalized over the routed picks,
                 // then scaled. The VQ shared expert (weight 1.0) folds into the batch.
