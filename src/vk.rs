@@ -65,10 +65,30 @@ unsafe extern "system" fn debug_callback(
         .to_string_lossy()
         .into_owned();
     let err = sev.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR);
-    // PERFORMANCE messages are advice, not misuse — logged, never counted, or the
-    // first "your dispatch is small" hint would fail the whole suite and someone
-    // would delete the assertion rather than triage it.
-    if !ty.contains(vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE) {
+    // SAFETY: the loader guarantees `data` points at a valid struct for this call.
+    let id = unsafe { (*data).message_id_name_as_c_str() }
+        .unwrap_or(c"")
+        .to_string_lossy()
+        .into_owned();
+    // Two classes are logged but NOT counted, because counting them would make the
+    // assertion fire on something that is not a finding — and an assertion that cries
+    // wolf gets deleted rather than triaged.
+    //
+    //   PERFORMANCE — advice, not misuse ("your dispatch is small").
+    //   The layer talking ABOUT ITSELF — enabling GPU-AV makes it emit
+    //   VALIDATION-SETTINGS ("GPU-AV and core both on is slow") and
+    //   WARNING-Setting-Limit-Adjusted ("forcing vulkanMemoryModel to TRUE so I can
+    //   instrument your shaders"). Those describe the checker's configuration, not our
+    //   Vulkan usage, and without this the suite can NEVER pass under GPU-AV — which
+    //   is the one checker that covers the bare-device-address design.
+    //
+    // Matched by exact message-ID name, not a substring of the body: narrow enough
+    // that a real finding cannot hide behind it.
+    let self_report = matches!(
+        id.as_str(),
+        "VALIDATION-SETTINGS" | "WARNING-Setting-Limit-Adjusted"
+    );
+    if !ty.contains(vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE) && !self_report {
         VALIDATION_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     // stderr UNCONDITIONALLY, in addition to `tracing`.

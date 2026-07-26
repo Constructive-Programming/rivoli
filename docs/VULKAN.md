@@ -265,8 +265,46 @@ are microbench kernels the decode path never calls. Gate those oracles on the po
 set (`#[cfg]` or a skip list) rather than porting two kernels to satisfy a test.
 
 Do not accept "close enough" numerics. The oracle tolerances were tuned against real
-failures — bf16 codebooks failed the 1e-3 oracle and fp16 passed with ~5.6× margin;
-that margin is the safety net for a second backend.
+failures — bf16 codebooks failed the 1e-3 oracle and fp16 passed. That headroom is the
+safety net for a second backend, so it is worth knowing how much of it there actually
+is.
+
+### Measured oracle headroom (HIP, `--features rocm`)
+
+The previously recorded "~5.6× margin" for the fp16 codebook **was not a real margin.**
+It was measured under `tests/kernel.rs`'s `Lcg`, which shifted a `u64` right by 33 and
+so returned values in [-1, -2.3e-10] — every sample negative. With both operands
+negative every product in a matvec is positive, so the partial sums grow instead of
+cancelling, the max-magnitude term in `1e-3 * mx + 1e-3` inflates, and the threshold
+inflates with it. Fixed in `ceb759a`; these are the numbers with balanced inputs:
+
+| oracle | err | tol | margin |
+|---|---|---|---|
+| `moe_vq` | 4.841e-2 | 1.612e-1 | **3.3×** |
+| `gemv_vq` | 4.036e-3 | 2.818e-2 | **7.0×** |
+| `gemv_fp8_splitk` | 1.669e-5 | 9.781e-3 | 586× |
+| `moe_i4_real` | 9.835e-7 | 1.758e-3 | 1787× |
+| `moe_i4` | 9.918e-5 | 2.391e-1 | 2411× |
+| `gemv_fp8` | 9.537e-7 | 2.793e-3 | 2928× |
+| `mla_absorb` | 2.384e-7 | 1.854e-3 | 7776× |
+| `mla_value` | 4.768e-7 | 2.108e-3 | 4421× |
+| `mla_attend` | 8.382e-9 | 1.008e-3 | 120203× |
+| `vadd` | 0 | 3.000e-3 | exact |
+
+**3.3× is oracle headroom, not output quality.** It says how much room a reimplementation
+has before the *test* fails; it says nothing about whether the model's outputs are 3.3×
+away from wrong. Do not quote it as a quality figure.
+
+**The consequence for this port.** The two tightest oracles are the VQ paths, and the VQ
+MoE kernels — `moe_gateup_vq`, `moe_down_vq` — are exactly the ones not yet ported and
+the ones the plan already calls the hardest. A reduction-order difference there has 3.3×
+to fit inside, not the 5.6× the plan used to claim. So: **if a VQ oracle fails during the
+port, the first hypothesis is a genuine ordering or gather bug, not a tolerance that
+needs loosening.** Widening a bound on the kernel with the least headroom in the suite
+would discard the only signal that would have caught the bug.
+
+(This table belongs in `benchmarks.md` at merge time — it is kept here for now to avoid
+a conflict with concurrent edits to that file.)
 
 ## Staging
 
@@ -327,13 +365,25 @@ is real, not because the plan exists.
 
   Status as of the first validated run: **core and synchronisation validation both
   clean across all four tests.** GPU-AV clean too, but see the caveat below.
-- **GPU-AV's buffer-address checker has not been proven to fire** (open). Core
-  validation was proven by tripping `VUID-VkBufferCreateInfo-size-00912`, and
-  synchronisation validation by tripping `SYNC-HAZARD-WRITE-AFTER-WRITE` with two
-  unsynchronised `vkCmdFillBuffer`s. The equivalent for GPU-AV — a deliberate
-  out-of-bounds read through a buffer reference — has NOT been done, so "GPU-AV found
-  nothing" currently means "GPU-AV was enabled and reported nothing", which is weaker.
-  Since bare device addresses are the whole design, close this before trusting it.
+- ~~GPU-AV's buffer-address checker has not been proven to fire~~ **CLOSED.** All three
+  checkers have now been observed catching a deliberate fault, so their silence is
+  evidence rather than an absence of evidence:
+
+  | checker | fault used to prove it | reported |
+  |---|---|---|
+  | core | `vkCreateBuffer(size = 0)` | `VUID-VkBufferCreateInfo-size-00912` |
+  | synchronisation | two `vkCmdFillBuffer`s, no barrier | `SYNC-HAZARD-WRITE-AFTER-WRITE` |
+  | GPU-assisted | OOB store through a buffer reference | `VUID-RuntimeSpirv-PhysicalStorageBuffer64-11819` — "Out of bounds access: 4 bytes written at buffer device address 0x…" |
+
+  The GPU-AV proof matters most: it is the only checker that can see a bad *device
+  address*, because the address is an opaque `uint64` in a push constant with no object
+  for the CPU side to bounds-check against. Suite result under each: **clean**.
+
+  Note that `VALIDATION-SETTINGS` and `WARNING-Setting-Limit-Adjusted` are the layer
+  describing its OWN configuration (GPU-AV forcing `vulkanMemoryModel` on so it can
+  instrument, and warning that core+GPU-AV together are slow). `debug_callback` logs
+  them but excludes them from `VALIDATION_ERRORS` by exact message-ID match — otherwise
+  the suite could never pass under GPU-AV, which is the checker that matters most here.
 - **Push-constant budget** is 128 bytes guaranteed. Buffer device addresses collapse
   every buffer argument to 8 bytes, which may retire this risk outright: `gemv_f32`
   fits in 32 bytes with zero descriptor sets, and the worst case — `moe_gateup_vq`
