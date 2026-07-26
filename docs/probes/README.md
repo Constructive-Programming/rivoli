@@ -92,6 +92,25 @@ Last established on RADV STRIX_HALO (AMD Radeon 8060S),
 
 ## Traps worth knowing
 
+### A correct guard resting on a false rationale
+
+`DeviceTier::place` pads its cursor to a word boundary, and the comment said this is
+what stops one placement's 32-bit read reaching into the next placement's data. The
+padding is harmless and the code is safe. The *reason* was wrong: `off` is already
+rounded to 256, so `round_up_256(off + len) == round_up_256(off + span)` for every
+length and the returned addresses are byte-identical with and without it.
+
+Nobody is harmed by a guard that does nothing — until someone acts on the rationale.
+Lowering that 256-byte alignment is a plausible, local-looking tightening, and anyone
+doing it while believing `place` covers the gap would convert a benign read into a live
+overrun. **The code was safe and the argument was load-bearing, and it is the argument
+a maintainer reads.**
+
+So: when a guard's justification is checked and found false, fix the justification even
+if the code stays. State what the guard actually does, and why it is still worth
+keeping if it is. The failure mode is not the dead code — it is the true-sounding
+sentence next to it.
+
 ### A comment can camouflage the bug it describes
 
 `Gpu::signal` submitted to the queue without holding the mutex that Vulkan's

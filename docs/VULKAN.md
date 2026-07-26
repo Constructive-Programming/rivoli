@@ -263,6 +263,52 @@ embedded via `include_bytes!`. Keep `rerun-if-changed` on the shared header — 
 
 ### Numerics that must stay bit-exact
 
+### The toolchain rewrites float arithmetic. Assume nothing compiles literally.
+
+Read this before any other numerics claim here, because it invalidates the shape of
+argument the rest of them are made in.
+
+`append_kv.comp` wrote `a / 448.0`, matching `fwd.hip` character for character. The
+module `glslc --target-env=vulkan1.3 -O` produced contained **no division**:
+
+    %289 = OpFMul %float %645 %float_0_00223214296        // = fl(1/448)
+
+Without `-O` it is `OpFDiv %float %288 %float_448`. `hipcc` gets `-O3` and no
+`-ffast-math`, so the HIP side keeps a true IEEE divide, and `x * fl(1/448)` differs
+from `x / 448` by 1 ULP on **55.1% of inputs** (measured, 200k samples). Every
+KV-cache block scale diverged between the backends, and any `lc8` byte whose quotient
+sat near an e4m3 rounding midpoint could differ too.
+
+**No test could have caught it, and none was going to.** The `lscale` oracle uses a
+1e-6 relative tolerance (~8 ULP). The byte-exact `lc8` comparison is guarded by
+`assert_quantization_unambiguous(..., 8, ...)` — and *the margin that makes that
+comparison stable across drivers is the same margin that hides a 1-ULP scale shift*. A
+precondition built to protect a comparison turned out to be load-bearing in two
+directions at once. It took reading disassembly.
+
+**The consequence for the determinism story.** This port's reproducibility argument —
+the fixed `subgroupShuffleDown` ladder, `subgroupAdd` banned by `build.rs` — quietly
+assumed the toolchain does not rewrite float arithmetic. That assumption is now
+*measured false*. The `subgroupAdd` rule is necessary and **not sufficient**: it
+constrains what the author writes, not what the optimiser emits. Every claim in this
+document of the form "the same expression compiles to the same operation" has to be
+read in that light, and verified against disassembly rather than against source.
+
+Two mitigations, both mechanical:
+
+- **Pass constants the optimiser must not fold as runtime operands.** An operand it
+  cannot see is one it cannot fold. `append_kv` takes `E4M3_MAX` through its push
+  constant, sourced from `math.rs` so the value still has one definition.
+- **`build.rs` rejects any `OpFMul` by a float constant with a non-zero mantissa.**
+  Powers of two are exact and common in the e4m3/bf16 paths; anything else is either an
+  invented reciprocal or an author-written scale that deserves an argument. Verified to
+  fire by reinstating the literal.
+
+When porting the remaining kernels, **disassemble anything whose bit-exactness matters**
+rather than trusting that the source says what it means.
+
+### Bit-exactness with `math.rs`
+
 `bf16f`/`f2bf16`/`e4m3f` in `common.hpp` are bit-exact with `src/math.rs` **on the
 finite domain** — the CPU oracles in `tests/kernel.rs` test that. They are NOT
 bit-exact for NaN: `half::bf16::from_f32` forces the quiet bit (`| 0x0040`) where
