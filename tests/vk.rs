@@ -830,12 +830,22 @@ fn append_kv_quantizes_bit_exactly() {
     // kvl must be a multiple of 128 in [128, 1024], so it cannot be ragged — ropn is
     // the only free size here and 100 is deliberately not a multiple of 32, leaving the
     // rope write live on a partial subgroup.
-    // 512/100 was the only shape covered. 1024/300 is added because it is the one that
-    // can fail differently: kvl = 1024 is MAX_BLOCKS blocks, so every subgroup in the
-    // workgroup carries one and `gl_NumSubgroups == 8` is load-bearing rather than
-    // slack; and ropn = 300 exceeds THREADS, so the rope loop takes a second grid-stride
-    // iteration that was dead code in every previous run.
-    for (kvl, ropn, rows, pos) in [(512usize, 100usize, 5usize, 3usize), (1024, 300, 3, 2)] {
+    // Three shapes, and the two new ones each isolate ONE previously untested path so a
+    // failure is attributable:
+    //   512/100  the original: both paths in their already-covered state.
+    //   1024/100 kvl = MAX_BLOCKS*128, so every subgroup carries a block and
+    //            `gl_NumSubgroups == 8` is load-bearing rather than slack. Rope stays
+    //            under THREADS, so this shape can only implicate the block mapping.
+    //   512/300  ropn > THREADS, so the rope loop takes a second grid-stride iteration
+    //            that was dead code until now. Block count stays at the covered 4, so
+    //            this shape can only implicate the rope loop.
+    // Combining them (1024/300) would exercise both at once and, on a failure, tell you
+    // nothing about which.
+    for (kvl, ropn, rows, pos) in [
+        (512usize, 100usize, 5usize, 3usize),
+        (1024, 100, 3, 2),
+        (512, 300, 4, 1),
+    ] {
     let n_blocks = kvl / E4M3_BLOCK;
     let (latent, rope) = append_kv_input(kvl, ropn, 0xA55);
     let (want_lc8, want_scl, want_rc) = append_kv_oracle(&latent, &rope);

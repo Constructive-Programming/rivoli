@@ -128,6 +128,36 @@ conflict markers in files you never touched.
 There is more than one party working in this repository. To get a clean tree, use
 `git checkout <ref> -- <paths>` or a separate build directory.
 
+## Two kinds of false confidence, and the question that finds each
+
+Everything below is one of two failures. They feel identical from inside — a green
+suite — and you find them with different questions, so it is worth knowing which you
+are hunting.
+
+**An instrument reporting on the wrong thing.** It runs, it produces output, and the
+output is about something other than what you believe. A validation layer whose
+messages go to an empty sink. A `pgrep` matching its own shell. A probe that passes
+because the thing it tests kept the process alive. A test whose oracle was copied from
+the implementation.
+
+> Ask: **would this fire if the thing were wrong?**
+> Answer it by breaking the thing on purpose and watching.
+
+**A guard that is never exercised.** It is correct, it is present, and no test
+distinguishes it from its absence — the suite would be equally green with the guard
+deleted. `n_blocks == kvl/128` was unreachable because an earlier arm rejected every
+case that would have tested it. The odd-`ropn` refusal — the one place this backend is
+deliberately stricter than HIP — existed only as a comment. `place`'s word padding was
+invisible because every test length was already a multiple of four.
+
+> Ask: **would the suite notice if I deleted this?**
+> Answer it by deleting it and running the tests.
+
+The first question is about instruments, the second about guards, and neither finds the
+other's failures. A check can also be both at once: `assert_quantization_unambiguous`
+fires correctly *and* its 8-ULP margin is exactly wide enough to hide a 1-ULP toolchain
+divergence, so it protects a comparison and blinds it in the same stroke.
+
 ## Traps worth knowing
 
 ### A check that stops at the first failure reports a floor, not a count
