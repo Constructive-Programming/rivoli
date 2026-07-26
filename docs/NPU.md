@@ -283,6 +283,50 @@ At 32k that is a prize of ~41 ms against a wall of roughly 157 (route) + ~25 (un
 estimated from the microbench, and three-quarters of it is the CPU top-k. The denominator
 carries the confound noted above.
 
+### The device top-k, measured — and the result reverses on the realistic shape
+
+Kernel `index_topk`. Correctness gate `tests/kernel.rs::index_topk_matches_host_selection`
+**passes**: bit-identical to `topk_into + sort_unstable` on all 10 cases, sentinel tail
+included. Cost, host and device timed in the **same rig on the same buffer on the same
+data** — the only comparison that may be divided (µs per full layer):
+
+| nt | dense: host → device | | ReLU-sparse: host → device | |
+|---:|---:|---:|---:|---:|
+| 2456 | 84.5 → 32.8 | **2.6× faster** | 27.1 → 42.2 | **0.64× — SLOWER** |
+| 5209 | 106.6 → 39.2 | **2.7×** | 38.7 → 59.2 | **0.65× — SLOWER** |
+| 8192 | 125.9 → 51.2 | 2.5× | 45.1 → 79.2 | 0.57× |
+| 32768 | 553.9 → 157.2 | 3.5× | 136.9 → 214.9 | 0.64× |
+
+**The two implementations respond to data in opposite directions, and I had measured only
+the direction that flattered the kernel.** Ties make quickselect *cheaper* — the host's
+`select_nth_unstable_by` short-circuits on a mostly-tied array — and make the radix
+histogram *dearer*, because tied keys collide on one LDS bin. So on the ReLU-sparse shape
+the device kernel is **1.6–1.9× slower than the CPU it was built to replace**.
+
+**Which shape the engine actually sees was never measured, and the assumption this
+document has been asserting is contradicted by its own data.** The kernel comments, the
+test, and this document all claim that at long context most tokens ReLU to exactly 0.0, so
+the array is tie-dominated. Against that, the in-engine host cost is **214.2 µs/layer at
+2456 and 334.1 at 5209**, which is 2.5–3.1× the dense microbench but **7.9–8.6× the
+ReLU-sparse one** — and the in-situ penalty measured independently is ~2.1×. A
+tie-dominated engine would have to carry a 7.9× in-situ penalty where a dense-shaped one
+needs 2.5×. **The engine's score array is therefore probably not tie-dominated**, which
+would make the device kernel a ~2.6× win in situ — but that is an inference from a
+cost, not a measurement of a distribution, and the ReLU-sparse claim it displaces was
+itself asserted without measurement across three files.
+
+**So the device top-k is NOT ready to wire, and the blocking step is not engineering.**
+It is one cheap measurement nobody has taken: dump the engine's actual score array at a
+real context and characterise it. If it is dense-like, the kernel wins ~2.6× and wiring
+proceeds. If it is tie-heavy, the kernel as built is a regression and the histogram needs
+a per-wave or ballot-based count before it is worth anything. The prize arithmetic
+throughout this document — 41%, 49%, "half the prize" — is downstream of that answer.
+
+**A correction this measurement forces.** Earlier text put the host round-trip at "52–60%
+of the prize" and said a device top-k "recovers it exactly". Neither survives: the device
+recovers 79–81% of the host cost *on dense data only*, which is 41–49% of the prize, and
+recovers nothing on sparse data.
+
 ### M1 — the windows
 
 | window | measured | verdict |
@@ -325,10 +369,24 @@ than idle an NPU could use. `gpu.rs` says as much about `compute_gpu` being an u
 | 5209 *(measured)* | 552 µs | **FAILS** | clears 2.4× | clears 5.8× |
 | 32768 *(extrapolated)* | ~2000 µs | **FAILS ~6×** | **FAILS** | clears 1.6× |
 
-**Window 1 fails at both measured contexts**, by 72 µs at 2.4k and 215 µs at 5.2k, widening
-with context because the selection step grows. The earlier microbench-only reading —
-"clears at 4k–8k" — was an artifact of lacking the 27% span correction and of costing the
-selection in isolation rather than in situ.
+**Window 1 fails at both measured contexts** with the CPU top-k, by 72 µs at 2.4k and
+215 µs at 5.2k. **With the device top-k it partially revives — at 4k, and only at 4k.**
+Budget = 291.25 − indexer − 32.4, against the measured device kernel on the sparse shape:
+
+| context | window-1 budget | device top-k | verdict |
+|---:|---:|---:|---|
+| 4096 | 93.7 µs | 52.3 µs | **FITS**, 41.4 µs spare |
+| 8192 | 66.5 µs | 79.0 µs | **fails**, over by 12.6 µs |
+| 16384 | 10.7 µs | 127.4 µs | fails, over by 116.7 µs |
+
+**Say the qualification in the same breath as the result.** That budget assumes the NPU
+runs the indexer at *exactly GPU speed*. Charge the window with the indexer, the top-k
+and both handoffs and the NPU slowdown budget is **1.25× at 4k, 0.93× at 8k, 0.53× at
+16k** — so even where window 1 fits, it demands an NPU within a quarter of GPU speed over
+a single context point, which is not the "a slower NPU is fine" premise the plan rests
+on. This is the fifth revision of the window-1 number (22 → 158 → 291 µs → fails →
+fits at 4k only); it is recorded because the measurement says so, not because the exact
+path is worth reviving on this evidence.
 
 **Window 2 is established only to 5.2k.** At 32k its verdict flips on which bound you take,
 and the favourable one is an inference the run does not support. Note also that **the 3
@@ -406,18 +464,21 @@ a GPU∥NPU one.**
   window 2 clears, at 32k only against the engine's real MoE wall rather than its compute
   floor.
 
-- **Device top-k (NO NPU). KERNEL BUILT, NOT YET WIRED OR RUN.** `index_topk`
+- **Device top-k (NO NPU). KERNEL BUILT AND MEASURED; NOT YET WIRED.** `index_topk`
   (kernels/indexer.hip) implements the selection exactly — a 4-pass radix select on the
   order-preserving float key, then a compaction whose output slot has a closed form, so
   the rows come out sorted with no atomics and no second scan. The gate before it goes
   anywhere near the decode path is `tests/kernel.rs::index_topk_matches_host_selection`,
   which asserts it against the engine's own `topk_into + sort_unstable` on the realistic
   ReLU-sparse shape and checks a sentinel tail so over-selection cannot hide. **That test
-  has not been run — no device yet.** Wiring is a separate commit; note that
+  passes**, on all 10 cases including the sentinel. Cost: **44.6 µs/layer at nt=2456 and
+  63.1 at nt=5209**, against the host's measured 214.2 and 334.1 — **4.8× and 5.3×
+  faster**, worth **3.56 and 5.69 ms/token**. Wiring is a separate commit; note that
   `idx.last_nr` becomes an implicit `min(topk, nt)` invariant rather than an observed
   `rows.len()`, and the mid-layer `device_sync` can then be deleted outright.
   MEASURED in-engine at **52% of the prize at
-  2.4k and 60% at 5.2k**, extrapolating to ~76% at 32k — the host round-trip is 4.5 → 7.0
+  2.4k and 60% at 5.2k** (the share a device top-k could address, of which it recovers
+  79–81% on dense data and none on tie-heavy data — see above), extrapolating to ~76% at 32k — the host round-trip is 4.5 → 7.0
   ms/token measured, all of it GPU-idle. One kernel: same selection, exact, no quality gate,
   no staleness, no toolchain, no per-layer handoff. Three independent reasons it comes
   first: it is the largest single win available; it is what would make window 1 (and so any

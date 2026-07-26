@@ -24,7 +24,7 @@
 use rivoli::device::DeviceBuf;
 use rivoli::hip::{
     ExpertDesc, device_sync, launch_append_kv, launch_gather_rope, launch_gemv_f32,
-    launch_gemv_fp8, launch_index_append, launch_index_score, launch_layernorm,
+    launch_gemv_fp8, launch_index_append, launch_index_score, launch_index_topk, launch_layernorm,
     launch_mla_absorb_fp8, launch_moe_expert_range, launch_moe_reduce, launch_rmsnorm, launch_rope,
     launch_swiglu,
 };
@@ -384,6 +384,19 @@ fn m0(nts: &[usize], si: &ScoreInputs) -> (f64, f64) {
     (key_us, fixed_us)
 }
 
+/// A plausible stand-in for the indexer's output: ReLU'd weighted head sums, so
+/// non-negative with a long tail and mostly distinct. Shared by the host-cost row and the
+/// host-vs-device comparison so the two are seeded identically.
+fn synth_scores(n: usize) -> Vec<f32> {
+    let mut r = Rng(0x5C0);
+    (0..n)
+        .map(|_| {
+            let a = r.f();
+            a.abs() * a.abs() * 10.0
+        })
+        .collect()
+}
+
 /// M0b — the host half of the selection: the score D2H and the top-k. Not GPU time,
 /// but it is time the GPU spends idle inside `dsa_select_layer` (the engine syncs,
 /// reads `nt` floats, top-k's them on the CPU, uploads 2048 rows), so an NPU that
@@ -400,14 +413,7 @@ fn m0_host(nts: &[usize], scores: &mut DeviceBuf) {
     println!("\nM0b — host selection round-trip (D2H + top-k + row upload), per full layer:");
     println!("      nt     D2H us   topk us    total    x21 ms/tok");
     let max_nt = *nts.iter().max().expect("non-empty context sweep");
-    let mut r = Rng(0x5C0);
-    // ReLU'd weighted head sums: non-negative with a long tail.
-    let synth: Vec<f32> = (0..max_nt)
-        .map(|_| {
-            let a = r.f();
-            a.abs() * a.abs() * 10.0
-        })
-        .collect();
+    let synth = synth_scores(max_nt);
     scores.copy_in_at(0, &f32b(&synth)).expect("seed scores");
 
     let mut host = Vec::new();
@@ -450,6 +456,87 @@ fn m0_host(nts: &[usize], scores: &mut DeviceBuf) {
             "  {nt:7}  {d:8.2}  {k:8.2}  {:8.2}   {:9.3}",
             d + k,
             (d + k) * N_FULL as f64 / 1000.0
+        );
+    }
+}
+
+/// M0c — device `index_topk` against the host round-trip it replaces, MATCHED.
+///
+/// Both implementations are timed in the same rig, on the same buffer, on the same two
+/// distributions. That matters more than it sounds: the obvious comparison — this
+/// kernel against the 214.2 / 334.1 µs/layer the engine was measured spending — mixes
+/// instruments, and in the direction that flatters the kernel, because the in-engine
+/// host figure carries a ~2× in-situ penalty (docs/NPU.md) that a microbench device
+/// figure does not. Only the columns below may be divided by one another.
+///
+/// Two distributions because the two implementations respond to data in opposite ways.
+/// The host `topk_into` is comparison-driven: ties make quickselect cheaper. The kernel
+/// does a fixed four radix passes plus one compaction sweep, so it was expected to be
+/// flat — and is not, which is the finding. **ReLU-sparse is the engine's real shape**:
+/// `index_score` clips every head contribution, so at long context most tokens score
+/// exactly 0.0.
+///
+/// Contexts start at 2456 — the shorter in-engine run's mean — because at `nt <= 2048`
+/// the engine returns dense before scoring and neither implementation runs at all.
+fn m0c_topk_matched(nts: &[usize], scores: &mut DeviceBuf) {
+    let max_nt = *nts.iter().max().expect("non-empty context sweep");
+    let mut rows = zeros(IDX_TOPK * 4);
+    let rows_ptr = rows.ptr_mut() as *mut u32;
+    let sp = scores.ptr() as *const f32;
+
+    let dense = synth_scores(max_nt);
+    let mut sparse = vec![0.0f32; max_nt];
+    for (i, x) in sparse.iter_mut().enumerate().take(300) {
+        *x = (300 - i) as f32 * 0.25;
+    }
+
+    let mut host_buf = Vec::new();
+    let mut scores_f: Vec<f32> = Vec::new();
+    let mut sel = Vec::new();
+    let mut rows_host: Vec<u32> = Vec::new();
+    let mut rows_up = zeros(max_nt.max(IDX_TOPK) * 4);
+
+    println!("\nM0c — host vs device selection, MATCHED rig and data (µs per full layer):");
+    println!("       nt   ReLU-sparse: host  device  ratio | dense: host  device  ratio");
+    for &nt in nts {
+        let mut cell = [(0.0f64, 0.0f64); 2];
+        for (j, data) in [&sparse, &dense].iter().enumerate() {
+            scores
+                .copy_in_at(0, &f32b(&data[..nt]))
+                .expect("seed scores");
+            // SAFETY: `scores` holds nt f32; `rows` holds max(max_nt, IDX_TOPK) u32 and
+            // the kernel writes exactly min(IDX_TOPK, nt) of them.
+            let dev_us = time(60, &|_| unsafe {
+                launch_index_topk(sp, nt, IDX_TOPK, rows_ptr).expect("index_topk");
+            });
+            let iters = 20;
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                scores.copy_out_prefix(&mut host_buf, nt * 4).expect("d2h");
+                scores_f.clear();
+                scores_f.extend(
+                    host_buf
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+                );
+                rivoli::math::topk_into(&scores_f, IDX_TOPK, &mut sel);
+                sel.sort_unstable();
+                rows_host.clear();
+                rows_host.extend(sel.iter().map(|&i| i as u32));
+                let bytes: Vec<u8> = rows_host.iter().flat_map(|x| x.to_le_bytes()).collect();
+                rows_up.copy_in_at(0, &bytes).expect("h2d");
+            }
+            let host_us = t.elapsed().as_nanos() as f64 / iters as f64 / 1000.0;
+            cell[j] = (host_us, dev_us);
+        }
+        println!(
+            "  {nt:7}   {:16.2} {:7.2} {:6.2}x | {:10.2} {:7.2} {:6.2}x",
+            cell[0].0,
+            cell[0].1,
+            cell[0].0 / cell[0].1,
+            cell[1].0,
+            cell[1].1,
+            cell[1].0 / cell[1].1,
         );
     }
 }
@@ -904,6 +991,7 @@ fn main() {
     controls(&si, max_nt);
     let (key_us, fixed_us) = m0(&nts, &si);
     m0_host(&nts, &mut si.scores);
+    m0c_topk_matched(&[2456, 4096, 5209, 8192, 16384, 32768], &mut si.scores);
     let win1 = m1_window_exact();
     let moe = MoeRig::new();
     let (moe_us, dense_us) = m1_window_mlp(&moe);

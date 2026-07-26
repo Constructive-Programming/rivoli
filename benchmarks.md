@@ -884,3 +884,34 @@ content are perfectly confounded — and reaching any longer context requires mo
 the confound is structural, not an artifact of this pair. The +47 ms of wall came with hit%
 81.4 → 76.9 and ms/miss 76 → 134; n = 2 cannot apportion it. Compare `route` across runs, not
 `wall`.
+
+### Device top-k (`index_topk`) vs the host round-trip, 2026-07-27
+
+`examples/indexer_bench`, gfx1151 sole tenant. Controls in that run: `o_proj` 520.22 µs /
+193.5 GB/s (1.7% from the recorded 528.95), rotation 1.16× — both ok. Correctness gate
+`tests/kernel.rs::index_topk_matches_host_selection` passes on all 10 cases, including a
+sentinel-tail assertion that nothing is written past `min(k,nt)`.
+
+Both implementations timed in the same rig, on the same buffer, on the same data. µs per
+full layer:
+
+| nt | host, dense | device, dense | host, ReLU-sparse | device, ReLU-sparse |
+|---:|---:|---:|---:|---:|
+| 2456 | 84.47 | 32.81 | 27.07 | 42.22 |
+| 4096 | 124.22 | 30.73 | 36.48 | 50.89 |
+| 5209 | 106.60 | 39.19 | 38.68 | 59.23 |
+| 8192 | 125.89 | 51.22 | 45.10 | 79.20 |
+| 16384 | 345.74 | 86.36 | 64.39 | 123.99 |
+| 32768 | 553.93 | 157.20 | 136.89 | 214.92 |
+
+**Do not compare a device number here against the 214.2 / 334.1 µs/layer the engine was
+measured spending.** That mixes instruments in the direction that flatters the kernel: the
+in-engine host figure carries a ~2× in-situ penalty a microbench device figure does not.
+Only columns in this table may be divided by one another.
+
+**The two implementations respond to data in opposite directions.** Ties make quickselect
+cheaper and the radix histogram dearer, so the device is 2.5–4× faster on dense data and
+1.6–1.9× *slower* on tie-heavy data. Any single-number speedup for this kernel is
+meaningless without naming the distribution.
+
+Interpretation, and what it means for wiring: docs/NPU.md § "The device top-k, measured".
