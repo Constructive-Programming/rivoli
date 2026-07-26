@@ -513,18 +513,30 @@ mod vktier {
         /// startup, and means a caller cannot end up holding a device address for bytes
         /// that were never written.
         ///
+        /// The cursor advances by `bytes.len()` rounded up to [`crate::vk::WORD`], so a
+        /// shader's 32-bit read of a placement's final byte cannot reach into the NEXT
+        /// placement's data. `Buf::new` handles the same hazard at the end of the slab;
+        /// this handles it between placements, and both are needed.
+        ///
+        /// Enforced here rather than documented as a precondition because `place` is the
+        /// only way to obtain a tier pointer — `reserve` is private — so there is one
+        /// choke point and no rule for a caller to remember. Vulkan-only: HIP reads
+        /// bytes directly, and shifting the ROCm arena's offsets for a Vulkan-specific
+        /// hazard would be a behaviour change for no reason.
+        ///
         /// Errors if the tier is full — the pin is sized to fit, so OOM here is a
         /// budgeting bug, not a runtime condition.
         pub fn place(&mut self, bytes: &[u8]) -> Result<*mut u8> {
             let off = (self.used + 255) & !255;
+            let span = bytes.len().next_multiple_of(crate::vk::WORD);
             ensure!(
-                off + bytes.len() <= self.capacity,
-                "device tier OOM: need {} at offset {off}, capacity {}",
+                off + span <= self.capacity,
+                "device tier OOM: need {} (padded to {span}) at offset {off}, capacity {}",
                 bytes.len(),
                 self.capacity
             );
             self.slab.write_at(off, bytes)?;
-            self.used = off + bytes.len();
+            self.used = off + span;
             Ok((self.slab.ptr() as usize + off) as *mut u8)
         }
 

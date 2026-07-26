@@ -441,8 +441,9 @@ is real, not because the plan exists.
 
   | configuration | barrier removed | barrier present |
   |---|---|---|
-  | 32-step chain ×1 per run, 7.4 s | **2 of 8 runs FAIL** | 8 of 8 pass |
-  | 32-step chain ×16 per run, 1.8 s | **1 of 8 runs FAIL** | 8 of 8 pass |
+  | ×16 per run, 32 distinct matrices, 7.3 s | **8 of 8 runs FAIL** ← current | 8 of 8 pass |
+  | ×16 per run, 1 reused matrix, 1.8 s | 1 of 8 FAIL | 8 of 8 pass |
+  | ×1 per run, 32 distinct matrices, 7.4 s | 2 of 8 FAIL | 8 of 8 pass |
   | 4-step chain, 2048×2048 | 8 of 8 pass | 8 of 8 pass |
   | 2-step chain, 64×96 | 8 of 8 pass | 8 of 8 pass |
 
@@ -456,22 +457,28 @@ is real, not because the plan exists.
   enough for one escaped hazard to survive to the end. Below that you get a test that
   passes either way — which is worse than none, because of the name on it.
 
-  **Row two is the cautionary one, and it is the current state.** Running sixteen
-  chains per execution instead of one HALVED detection, 2/8 → 1/8, rather than raising
-  it toward the 1 − 0.75¹⁶ ≈ 99% the arithmetic suggests. Two reasons, and the second
-  is the instructive one: the repeats are not independent, and the same change that
-  added them also fixed a 512 MB duplicate-upload waste that cut runtime 7.4 s → 1.8 s.
-  Those 32 interleaved 16 MB uploads were part of what opened the timing window.
-  **Optimising the test removed the conditions that exposed the race.**
+  **Rows two and three are why the top row is worth its 7.3 seconds.** The middle row
+  is what happened when the test was "optimised": collapsing 32 distinct matrices into
+  one reused buffer cut runtime 7.4 s → 1.8 s and cut detection 2/8 → 1/8, and the
+  sixteen repeats added in the same change did not compensate — they are correlated
+  within a process, nowhere near the 1 − 0.75¹⁶ ≈ 99% the arithmetic suggests.
 
-  So the guard currently detects a removed barrier ~12% of the time. It is a smoke
-  alarm with a flat battery: valuable because it CAN fire, not because a green run
-  means anything. Do not read a passing CI run as evidence of ordering.
+  The mechanism is memory traffic, not scheduling. 32 distinct 16 MB matrices make each
+  step read cold DRAM; one reused matrix stays L2-resident, and the window closes. (It
+  is NOT upload interleaving — every upload happens at setup, before the first
+  dispatch.) Restoring the distinct matrices took detection to 8/8, because the repeats
+  now compound on top of a window that is actually open.
 
-  The lever for restoring it is not the repeat count — it is putting back whatever made
-  the chains slow and irregular, with unrelated large transfers interleaved between
-  dispatches the obvious candidate. **Re-measure the removal arm after any change to
-  this test**; the detection rate demonstrably does not follow from reasoning about it.
+  **The general lesson, which cost a real regression to learn: when optimising test
+  scaffolding, ask what the scaffolding is doing for the test's SENSITIVITY.** Applied
+  to production code, removing waste is free. Applied to a probe, the waste may be the
+  instrument — and deleting it leaves every green still green while the test quietly
+  stops being able to fail. The comment on the matrices in `tests/vk.rs` says this, so
+  the next ponytail pass does not make the same correct-sounding argument.
+
+  **Re-measure the removal arm after any change to this test.** The detection rate
+  demonstrably does not follow from reasoning about it: 2/8, then 1/8, then 8/8, from
+  changes that all looked neutral or positive beforehand.
 
   `memcpy_dtod_after_dispatch_is_ordered` has no equivalent construction at all, so
   COMPUTE→TRANSFER remains spec-derived only.
@@ -525,7 +532,37 @@ is real, not because the plan exists.
 
   The GPU-AV proof matters most: it is the only checker that can see a bad *device
   address*, because the address is an opaque `uint64` in a push constant with no object
-  for the CPU side to bounds-check against. Suite result under each: **clean**.
+  for the CPU side to bounds-check against.
+
+  **And it earned that immediately.** On the first run of the `fwd.hip` tranche under
+  GPU-AV, `embed_i8_row` reported
+  `Out of bounds access: 4 bytes read at buffer device address 0x…`, invocation 36 of a
+  5 × 37 = 185-byte embedding table reading the word at offset 184 — three bytes past
+  the end. Cause: shaders read packed `u8` as 32-bit words (`VK_KHR_8bit_storage` is
+  deliberately not required), so the word holding an unaligned buffer's last byte
+  overruns it.
+
+  **Every numeric oracle passed.** In the default configuration, and under
+  synchronisation validation, and on the byte-exact comparisons — because the
+  out-of-range bytes land in the discarded lanes of the word. Nothing but GPU-AV could
+  see it, and GPU-AV was only run because it had first been *proved to fire* against a
+  deliberate fault. That is the entire argument for the probe exercise, in one incident.
+
+  Scope, because the distinction matters when assessing this backend: the real engine's
+  embedding table is 151552 × 5120 = 776,048,640 bytes, which **is** divisible by 4, so
+  the bug was latent there and live only in the test's ragged shape. We found one before
+  it could exist rather than shipping one — but only because the oracle used a
+  deliberately ragged `hidden = 37`, and only because it ran under a checker known to
+  work.
+
+  Fixed at two choke points rather than by a documented precondition: `vk::Buf::new`
+  rounds every allocation up to `WORD` (reporting the unpadded `len`, so no downstream
+  bounds check starts permitting real overrun), and Vulkan's `DeviceTier::place` pads
+  its cursor so one placement's word-read cannot reach into the next placement's data.
+  Both are needed — the first covers a buffer's end, the second the gap between
+  placements. No launcher assert: `launch_embed_i8_row` never receives a length, and the
+  nearest checkable condition (`hidden % 4 == 0`) would have banned the ragged oracle
+  that found the bug.
 
   Note that `VALIDATION-SETTINGS` and `WARNING-Setting-Limit-Adjusted` are the layer
   describing its OWN configuration (GPU-AV forcing `vulkanMemoryModel` on so it can

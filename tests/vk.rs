@@ -320,37 +320,48 @@ fn chained_dispatch_respects_the_barrier() {
     // either explodes or collapses into noise, and a corrupted intermediate then hides
     // inside the arithmetic. This keeps every step O(1) so a stale row survives to the
     // output as a visible error.
-    let m = {
-        let mut m = vec![0.0f32; n * n];
-        for i in 0..n {
-            m[i * n + i] = 1.0;
-            m[i * n + (i + 1) % n] = 0.05 * r.f();
-        }
-        m
-    };
+    //
+    // A DISTINCT matrix per step, 32 x 16 MB = 512 MB. THIS IS NOT AN OVERSIGHT AND
+    // MUST NOT BE "OPTIMISED" INTO ONE REUSED BUFFER. It was, once: reusing a single
+    // matrix left it resident in cache, removed the DRAM traffic between dispatches,
+    // took the runtime from 7.4 s to 1.8 s — and HALVED the detection rate, 2/8 to 1/8,
+    // because the memory pressure was part of what opened the timing window. The waste
+    // is the instrument. Re-measure the removal arm before changing it (see the
+    // detection-rate note above); the number does not follow from reasoning.
+    //
+    // Cheap to build despite the size: only the diagonal and superdiagonal are nonzero,
+    // so it is 2n random values over a zeroed allocation, not n^2.
+    let mats: Vec<Vec<f32>> = (0..STEPS)
+        .map(|_| {
+            let mut m = vec![0.0f32; n * n];
+            for i in 0..n {
+                m[i * n + i] = 1.0;
+                m[i * n + (i + 1) % n] = 0.05 * r.f();
+            }
+            m
+        })
+        .collect();
     let x: Vec<f32> = (0..n).map(|_| r.f()).collect();
 
     let mut want = x.clone();
-    for _ in 0..STEPS {
+    for m in &mats {
         let mut next = vec![0.0f32; n];
-        matvec_f32(&mut next, &want, &m, n);
+        matvec_f32(&mut next, &want, m, n);
         want = next;
     }
 
-    // ONE upload, reused by every step of every repeat. Uploading a copy per step cost
-    // 512 MB of device memory and bought nothing.
-    let mb = dev(&f32b(&m));
+    let mbufs: Vec<Buf> = mats.iter().map(|m| dev(&f32b(m))).collect();
     let xb = dev(&f32b(&x));
     let mut ping = dev(&f32b(&vec![0.0f32; n]));
     let mut pong = dev(&f32b(&vec![0.0f32; n]));
 
     for rep in 0..REPEATS {
-        launch(&xb, &mb, &mut ping, n, n);
-        for i in 1..STEPS {
+        launch(&xb, &mbufs[0], &mut ping, n, n);
+        for (i, mb) in mbufs.iter().enumerate().skip(1) {
             if i % 2 == 1 {
-                launch(&ping, &mb, &mut pong, n, n);
+                launch(&ping, mb, &mut pong, n, n);
             } else {
-                launch(&pong, &mb, &mut ping, n, n);
+                launch(&pong, mb, &mut ping, n, n);
             }
         }
         device_sync().expect("sync"); // ONE sync per chain, after all STEPS dispatches
