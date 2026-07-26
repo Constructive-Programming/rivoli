@@ -539,6 +539,88 @@ the oracles for the 16 ported kernels pass**, plus a coherent 32-token decode on
 partial artifact (the `convert --layers 1` stub path used for the HIP end-to-end
 bring-up).
 
+### THE GATE BELOW CAN NEVER PASS. A replacement is proposed, and it is the USER'S CALL.
+
+The bar written in the next section — a byte-identical token-ID sequence against the HIP
+path — was set when `exp` was believed to be a tolerable unknown. It is now **unattainable
+by construction**, and that is measured rather than suspected:
+
+- `tests/xbackend.rs` compares the two backends directly on `swiglu`, the smallest kernel
+  whose result depends on `exp`. **1463 of 4096 outputs differ**, in the band where `exp`'s
+  low bits reach the result.
+- Reproducing hipcc's `expf` argument reduction instruction-for-instruction in GLSL left
+  that number **unchanged at 1463**, moving only 12 values. The residue lives in the
+  hardware `v_exp_f32` each toolchain calls, which GLSL source cannot reach.
+- All three constructive steps of the exactness strategy have been ATTEMPTED on `exp` and
+  each fails for a stated reason. It is not that nobody has tried.
+
+So the logits differ in their low bits on every layer, and over 78 layers and a
+154,880-way argmax a divergence is a matter of when, not whether. **A gate that cannot pass
+is not a strict gate; it is an absent one**, because the first time it fails everyone will
+reach for a reason to discount it.
+
+**Deciding what replaces it is a product decision, not an engineering one** — it defines
+what "the Vulkan backend is acceptable" means — so what follows is a proposal to take to
+the user, not a change already made.
+
+#### The proposal: four parts, because no one of them is sufficient
+
+**A. Token-ID agreement for K tokens, where K is MEASURED and REPORTED, not chosen.**
+Fixed prompt, greedy decode, same artifact, `--mode`, `--max-mem` and `--cache-policy` on
+both backends; report the index of the first differing token.
+*Catches:* every gross defect. A wrong index, a dropped row, a mis-ordered reduction, a
+bad expert — all of these diverge within a handful of tokens. This is by far the most
+sensitive instrument available and it stays that way.
+*Cannot catch:* nothing, once K is large. The number is a floor on agreement, not a
+pass/fail, and a low-bit `exp` difference will eventually end it for benign reasons. **The
+failure mode to guard against is treating a large K as a licence to stop looking.**
+*Suggested shape:* record K per release; a K that suddenly collapses from hundreds to
+single digits is the alarm, not the absolute value.
+
+**B. Perplexity equivalence within a pre-registered bound.** Teacher-forced on a fixed
+corpus, paired per-token NLL, reported as a mean difference with a 95% CI — the machinery
+`bin/ppl` already has, and the same verdict vocabulary already in `benchmarks.md`
+(PASS / FAIL / COST ESTABLISHED / INCONCLUSIVE).
+*Catches:* systematic accuracy loss that a short token-ID run would miss entirely, and it
+is the only part that speaks to output QUALITY rather than agreement.
+*Cannot catch:* a rare catastrophic path the corpus never exercises; and it is
+underpowered at small n — `benchmarks.md` already records three of four cells being unable
+to resolve a 1% question at 762 tokens. Budget the corpus accordingly or the verdict will
+be INCONCLUSIVE by construction.
+
+**C. Throughput and overlap against the ROCm baseline.** tok/s and fetch-hidden %, at
+matched `--max-mem` and `--cache-policy`.
+*Catches:* the failure A and B are both structurally blind to — a correct backend whose
+concurrency has collapsed. A fetch-serialised build computes identical numbers, so it
+passes A perfectly and B perfectly while being several times slower.
+*Cannot catch:* any correctness property whatsoever.
+*Why it must be in the gate rather than in a benchmark report:* the single-queue finding
+above means this is the most likely way integration goes wrong, and it is the only part of
+the gate that would notice.
+
+**D. Per-kernel bit-exactness where it is attainable, as a standing regression net.**
+Already built for `mla_value_fp8`, `mla_absorb_fp8`, and the `exp`-free half of the
+attention (`err = 0.000e0`).
+*Catches:* ordering, grouping and contraction changes — which A, B and C would all absorb
+silently, since each is a low-bit effect that only sometimes reaches an argmax.
+*Cannot catch:* anything downstream of `exp`, by definition. That is exactly the region
+the other three cover.
+
+#### What I would actually defend
+
+**Accept on A reported + B within bound + C within bound, with D green.** A is a number in
+the release notes rather than a threshold; B and C are the two pass/fail criteria; D is the
+regression net that runs on every commit.
+
+The honest summary of the change: **the old gate asked "are the backends identical?" and
+the answer is now known to be no. The replacement asks "is the Vulkan backend as good, and
+as fast, and does it diverge only where we have shown it must?"** That is weaker, and it is
+the strongest question that still has a true answer.
+
+Worth noting this is option (b) from the pre-registered contingency list in the `swiglu`
+section — written down before the measurement existed, precisely so the choice could not be
+made after seeing the result. It is being taken for the reason it was written.
+
 ### The real bar: an identical TOKEN ID sequence against the HIP path
 
 **NOT ATTAINABLE TODAY, and that is the point of writing it down.** The Vulkan backend
@@ -1005,11 +1087,79 @@ buffer. A second queue needs its own recording state anyway, so **the command-bu
 and the second queue are one design, not two** — which is the argument for doing them
 together rather than bolting the ring on later.
 
-**Design this on paper before writing integration code.** The open questions are: how
-`Cmd` splits (two independent `Mutex<Cmd>`, or one struct owning two), which queue the
-transfer path uses given family 1 also carries TRANSFER, where the timeline semaphore
-values are allocated so cross-queue ordering stays monotonic, and whether `device_sync`
-joins both queues or only the compute one.
+### The design, on paper
+
+Written before any integration code, and structured so the command-buffer ring falls out
+rather than being bolted on.
+
+**THREE streams, not two.** The earlier text said two and that undercounts. HIP runs:
+
+| stream | owner | work |
+|---|---|---|
+| the null/default stream | `gpu.rs`, implicitly | the whole forward pass except MoE experts |
+| `compute_stream` | `gpu.rs` | MoE expert partials, explicitly "separate from the null stream" |
+| the fetch stream | `asyncfetch.rs`, in the reaper | H2D copies of streamed expert weights |
+
+The overlap that hides 95% of fetch is between the last two; the first exists because the
+rest of the forward must not be reordered against either.
+
+**Three queues from family 1, which needs no new selection logic.** `create_device`
+already picks the compute-only family (`compute(f) && !GRAPHICS`) and asks for one queue
+(`prio = [1.0f32]`). It becomes `[1.0; 3]`, and family 1 has four. **Every queue is in the
+SAME family, which deletes a whole category of work:** no queue-family ownership transfers
+on any buffer, ever. That is the single biggest simplification available and it is why
+using the graphics family for anything would be a mistake.
+
+**One `Stream` per queue, replacing the single `Cmd`.**
+
+```
+struct Stream {
+    queue: vk::Queue,            // stays INSIDE the mutex, as Cmd's does today
+    pool: vk::CommandPool,
+    ring: [vk::CommandBuffer; RING],
+    done: [vk::Fence; RING],     // retires slot i
+    head: usize,
+    recording: bool,
+    timeline: vk::Semaphore,     // ONE PER STREAM, see below
+    next: AtomicU64,
+    poisoned: bool,
+}
+```
+
+`Gpu` holds three `Mutex<Stream>`. `vkQueueSubmit` requires external synchronisation
+per-queue, and a mutex per stream gives exactly that — the same borrow-checker enforcement
+the current design gets by keeping `queue` inside the guard, now three times over. It also
+means the fetch stream never blocks on the compute lock, which is the entire point.
+
+**A TIMELINE PER STREAM, not one shared.** A timeline semaphore must be signalled with
+strictly increasing values, so a shared one would force a global order across queues —
+reintroducing exactly the serialisation being removed, and making value allocation a
+cross-queue critical section. Per-stream timelines make each queue's values trivially
+monotonic under its own lock. Cross-queue ordering is then expressed the natural way: a
+submit on stream A waits on stream B's timeline at a value B has already been told to
+signal. The waiter thread handles several with one `vkWaitSemaphores` and `WAIT_ANY`.
+
+**The ring is what closes the `Gpu::signal` gap, and that is why they are one design.**
+Today `signal()` covers work already SUBMITTED, because there is a single command buffer:
+arming on merely-recorded work would need to submit it, and the buffer cannot be reused
+while pending. With a ring, `flush()` is *end the current buffer, submit it with a
+timeline signal, advance `head` to a slot whose fence has retired* — so arming on recorded
+work is just `flush()` then hand back the value. No separate mechanism. `RING` is sized by
+how many flushes can be in flight before the oldest must have retired; 4 is a starting
+guess and the fence wait makes an undersized ring a stall rather than a bug.
+
+**`device_sync` joins all three**, in a fixed order (main, MoE, fetch). It is once per
+token, so the cost is three fence waits rather than one, and the ordering is fixed so the
+join itself cannot become a source of nondeterminism.
+
+**Two things this design must not quietly change.** Cross-queue submits make the
+COMPUTE→COMPUTE and COMPUTE→TRANSFER barriers in `enqueue` insufficient on their own —
+a barrier orders within a queue; a semaphore orders across. Every existing hazard the
+barrier covers needs re-examining once a second queue can touch the same buffer, and
+synchronisation validation on this stack **cannot see any of it** (it covers only
+transfer↔transfer). That makes review the primary defence again, exactly as it was for the
+original barrier. And the fetch queue writing a slot the compute queue is reading is the
+`inflight` guard's job, not the queue layer's — the two must not both think they own it.
 
 ## Risks
 
