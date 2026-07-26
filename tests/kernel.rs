@@ -6,11 +6,12 @@ use rivoli::device::DeviceBuf;
 use rivoli::gpustream::HipStream;
 use rivoli::hip::{
     ExpertDesc, attend_scratch_floats, device_sync, launch_argmax, launch_attend,
-    launch_gemv_fp8, launch_gemv_vq, launch_mla_absorb_fp8, launch_mla_value_fp8,
-    launch_moe_expert_range, launch_moe_expert_range_i4, launch_moe_reduce, launch_vadd,
+    launch_gemv_fp8, launch_gemv_i8, launch_gemv_vq, launch_mla_absorb_fp8,
+    launch_mla_value_fp8, launch_moe_expert_range, launch_moe_expert_range_i4,
+    launch_moe_reduce, launch_vadd,
 };
 use rivoli::math::{bf16_to_f32, e4m3_to_f32, f32_to_bf16, f32_to_e4m3, silu, softmax};
-use rivoli::quant::{VQ_DIM, VQ_K, matvec_fp8, matvec_vq, quant_vq};
+use rivoli::quant::{VQ_DIM, VQ_K, matvec_fp8, matvec_i8, matvec_vq, quant_vq};
 
 fn f32b(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
@@ -108,6 +109,125 @@ fn gemv_fp8_matches_oracle() {
         device_sync().expect("sync");
         assert_close(&want, &f32v(&yb.copy_out().expect("out")), label);
     }
+}
+
+#[test]
+fn gemv_fp8_rejects_non_power_of_two_block() {
+    // The fp8 dot indexes the block scale with a SHIFT (`blk_shift`), which is only
+    // the same index as `i / block` for a power-of-two tile. The launcher must reject
+    // anything else rather than compute a silently wrong scale index.
+    //
+    // Asserts the guard CODE, not just is_err(): a test that accepted any error would
+    // still pass if someone replaced the power-of-two test with `block != 128`, or if
+    // the dim guard (1001) started swallowing these first. Both i_dim arms are covered
+    // because `rivoli_gemv_fp8` dispatches to the split-K launcher at i_dim >= 4096
+    // (GEMV_SPLITK_MIN_IDIM) and that launcher carries its own copy of the guard.
+    let o_dim = 64usize;
+    for i_dim in [512usize, 8192] {
+        let packed = dev(&vec![0u8; o_dim * i_dim]);
+        let scale = dev(&f32b(&vec![1.0f32; o_dim * i_dim]));
+        let x = dev(&f32b(&vec![0.0f32; i_dim]));
+        let mut y = dev(&vec![0u8; o_dim * 4]);
+        // 1 is a power of two (bsh = 0, `i >> 0` == `i / 1`), so it must be ACCEPTED.
+        for (block, want) in [(128usize, None), (96, Some(1003)), (127, Some(1003)), (1, None)] {
+            // SAFETY: all four buffers are device-resident and amply sized for these dims.
+            let r = unsafe {
+                launch_gemv_fp8(
+                    x.ptr() as *const f32,
+                    packed.ptr(),
+                    scale.ptr() as *const f32,
+                    o_dim,
+                    i_dim,
+                    block,
+                    y.ptr_mut() as *mut f32,
+                )
+            };
+            match want {
+                None => assert!(r.is_ok(), "i_dim={i_dim} block={block}: {r:?}"),
+                Some(code) => {
+                    let msg = format!("{:#}", r.expect_err("expected a guard rejection"));
+                    assert!(
+                        msg.contains(&code.to_string()),
+                        "i_dim={i_dim} block={block}: want guard {code}, got {msg:?}"
+                    );
+                }
+            }
+        }
+        device_sync().expect("sync");
+    }
+}
+
+#[test]
+fn mla_attend_rejects_unsupported_kvl() {
+    // `mla_latent_attend` keeps its online accumulator in MLA_ACC_REGS*SUBW = 512
+    // registers per lane and indexes it by k = (i - lane)/SUBW, so a kvl over that cap
+    // — or one that is not a multiple of 128 — must be REJECTED (guard 1004), never run
+    // with columns silently dropped or the wrong per-128 block scale applied.
+    let (h, kvl, rope) = (8usize, 512usize, 64usize);
+    let mut scratch = dev(&vec![0u8; attend_scratch_floats(h, kvl) * 4]);
+    let big = dev(&vec![0u8; h * 1024 * 4]);
+    let mut clat = dev(&vec![0u8; h * kvl * 4]);
+    for (bad_kvl, want) in [(kvl, None), (640usize, Some(1004)), (160, Some(1004))] {
+        // SAFETY: every buffer is sized for the largest kvl tried (1024 floats/head);
+        // the rejected cases never dereference them at all.
+        let r = unsafe {
+            launch_attend(
+                big.ptr() as *const f32,
+                big.ptr() as *const f32,
+                big.ptr(),
+                big.ptr() as *const f32,
+                big.ptr() as *const u16,
+                std::ptr::null(),
+                h,
+                16,
+                bad_kvl,
+                rope,
+                bad_kvl / 128,
+                1.0,
+                clat.ptr_mut() as *mut f32,
+                scratch.ptr_mut() as *mut f32,
+            )
+        };
+        match want {
+            None => assert!(r.is_ok(), "kvl={bad_kvl}: {r:?}"),
+            Some(code) => {
+                let msg = format!("{:#}", r.expect_err("expected a guard rejection"));
+                assert!(msg.contains(&code.to_string()), "kvl={bad_kvl}: got {msg:?}");
+            }
+        }
+    }
+    device_sync().expect("sync");
+}
+
+#[test]
+fn gemv_i8_matches_oracle() {
+    // lm_head's GEMV — the last op before argmax, and until now the only quantized
+    // kernel in the engine with NO oracle at all.
+    let (o_dim, i_dim) = (512usize, 6144usize);
+    let mut r = Lcg(0x18);
+    let packed: Vec<u8> = (0..o_dim * i_dim).map(|_| (r.f() * 127.0) as i8 as u8).collect();
+    let scale: Vec<f32> = (0..o_dim).map(|_| (r.f() * 0.01).abs() + 1e-4).collect();
+    let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
+
+    let mut want = vec![0.0f32; o_dim];
+    matvec_i8(&mut want, &x, &packed, &scale, o_dim, i_dim);
+
+    let (xb, pb, sb) = (dev(&f32b(&x)), dev(&packed), dev(&f32b(&scale)));
+    let mut yb = dev(&vec![0u8; o_dim * 4]);
+    // SAFETY: device buffers sized [i_dim], [o_dim*i_dim], [o_dim], [o_dim] f32.
+    unsafe {
+        launch_gemv_i8(
+            xb.ptr() as *const f32,
+            pb.ptr(),
+            sb.ptr() as *const f32,
+            o_dim,
+            i_dim,
+            yb.ptr_mut() as *mut f32,
+        )
+        .expect("launch");
+    }
+    device_sync().expect("sync");
+    assert_close(&want, &f32v(&yb.copy_out().expect("out")), "gemv_i8");
 }
 
 #[test]

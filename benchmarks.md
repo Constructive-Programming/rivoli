@@ -329,6 +329,204 @@ made the unsupported low-swap ratio tempting in the first place.
 
 ---
 
+## Per-kernel round: matched A/B, `examples/dot_bench`
+
+Same instrument binary in both arms; the only difference is the kernels. Three
+**interleaved** repeats (base/fix/base/fix/base/fix) so drift shows up as spread inside
+an arm rather than as the effect. GLM-5.2 dims from the manifest: H=64, qk_head_dim=256
+(nope 192 + rope 64), v_head_dim=256, kv_lora_rank=512, 78 layers.
+
+**Controls first — kernels this branch does not touch, measured in the same runs.**
+Without these the deltas below are unreadable:
+
+| control | base (3) | fix (3) | Δ |
+|---|---|---|---:|
+| `lm_head` | 8128.3 / 8114.2 / 8127.7 µs | 8121.2 / 8118.9 / 8132.3 | **+0.01%** |
+| `rmsnorm` | 7.7 / 7.7 / 7.9 µs | 7.7 / 7.7 / 7.7 | **~0%** |
+
+**Noise floor ≈ 0.1% on the big kernels** (~7% on kernels of a few tens of µs, e.g.
+`argmax`). Everything below is judged against that.
+
+| kernel | base µs | fix µs | Δ | GB/s |
+|---|---:|---:|---:|---|
+| `mla_absorb` | 72.00 | **36.50** | **−49.3% (1.97×)** | 87.4 → **172.3** |
+| `mla_value` | 33.73 | **27.03** | **−19.9% (1.25×)** | 248.6 → **310.3** |
+| `mla_attend` nr512 | 258.03 | **227.17** | **−12.0%** | — |
+| `mla_attend` nr2048 | 876.30 | **778.53** | **−11.2%** | — |
+| `o_proj` | 541.55 | **528.95** | **−2.3%** | 184.7 → **190.6** |
+
+Arms are non-overlapping for every row. o_proj is the weakest and was pooled over two
+separate experiments (6 samples/arm) because its effect is close to the between-run drift
+of its own baseline: all 6 base samples (534.2–548.1) sit above all 6 fix samples
+(524.7–531.7).
+
+### Per-token, which is what the plan is denominated in
+
+×78 attention layers. **These are microbench conditions, so treat them as an UPPER BOUND
+on what the engine will show** — in the engine these kernels run interleaved with MoE work
+that evicts the caches they are enjoying here. Pending an in-engine run.
+
+| | Δ/call | ×78 |
+|---|---:|---:|
+| `mla_absorb` | −35.50 µs | **−2.77 ms** |
+| `mla_attend` | −30.87 µs | **−2.41 ms** |
+| `o_proj` | −12.60 µs | **−0.98 ms** |
+| `mla_value` | −6.70 µs | **−0.52 ms** |
+| **total** | | **−6.68 ms/tok** |
+
+≈**1.9% of the 351 ms/token budget**; `route` 115 → ~108 ms. A real but modest win, and
+worth stating plainly next to the 1.97×: a large multiple on a 72 µs kernel is a small
+number of milliseconds.
+
+### The instruments agreed — and that is *why* the earlier refusal was right
+
+The first o_proj measurement was taken without a matched baseline, and 185 (in-engine,
+recorded in PERF.md) → 189 (microbench) was **not** reported as an improvement. The
+matched run later measured the base at **184.7 GB/s** against that 185, `mla_value` at
+**248.6** against its recorded 254, `mla_absorb` at **87.4** against 99, and `mla_attend`
+at 258 µs × 78 = **20.1 ms** against the recorded ~20 ms. The instruments agree closely,
+so the original comparison would have given roughly the right answer.
+
+**It was still the wrong thing to do, and this is the strongest evidence in this file for
+staging a matched arm even when the old number looks fine: agreement between two
+instruments is something you DEMONSTRATE, and none of these agreements were knowable
+before both arms had been run.** Had o_proj's true effect been the 2% it turned out to be
+and the instrument gap been 3% the other way, the uncontrolled comparison would have
+reported a regression as an improvement. The cost of staging the baseline was one extra
+build; the cost of not staging it is unbounded and invisible.
+
+### Closed questions
+
+- **`rmsnorm`'s `dim3(1)` launch is not a problem.** A single workgroup on a 40-CU part is
+  a striking thing to find on a hot path, and it is **7.7 µs — 0.05% of the `tail`
+  bucket.** At hidden=6144 there is simply not enough work for the geometry to matter. Do
+  not re-flag it from the launch shape alone; it has been measured.
+- **`mla_value` was not a healthy reference.** PERF.md judged `mla_absorb`'s 99 GB/s
+  against "`mla_value`'s 254" — but `mla_value` carried the same 64-bit divide, so the
+  yardstick was depressed too. Post-fix: 172.3 vs 310.3, absorb still ~1.8× off its
+  sibling, so its load-width restructure remains worth doing. **Check whether a reference
+  point is itself healthy before measuring against it.**
+
+### Open question: half of `tail` is in none of its kernels
+
+`tail` measures ~16 ms/tok. Measured: `lm_head` **8.12 ms**, `argmax` **0.088 ms**,
+`rmsnorm` **0.008 ms** — **~8.2 ms total, leaving ~7.8 ms unattributed.** Those are the
+only three kernels in the bucket, so **`tail` cannot be fixed by optimising them**: the
+best case on `lm_head` (117 → 256 GB/s) is 8.12 → 3.71 ms, ~4.4 ms.
+
+Candidate, **named but not measured**: these rows time 60 back-to-back launches behind a
+single sync, while the engine pays a `device_sync` and a logits readback *per token*, so
+per-token launch/sync/readback overhead would land in the bucket and not in any row here.
+That is a hypothesis with a plausible mechanism, which is exactly the status the four
+per-kernel mechanism errors below started from. Measure before acting on it.
+
+## Read the ISA before you book the device
+
+**The GPU is the scarce resource here; the compiler is not.** hipcc will answer a large
+class of kernel questions on the CPU, in seconds, with no queue — and it answers some of
+them *better* than a bench would, because it gives you the mechanism rather than a number.
+Both of these are CPU-only and need no device:
+
+```sh
+# 1. The gfx1151 ISA for a kernel translation unit.
+hipcc --offload-arch=gfx1151 -O3 --cuda-device-only -S kernels/linalg.hip -o /tmp/k.s
+awk '/^gemv_fp8_splitk:/,/^\.Lfunc_end/' /tmp/k.s > /tmp/kernel.s   # isolate one kernel
+awk '/Inner Loop Header/,/s_cbranch_execnz/' /tmp/kernel.s          # isolate its hot loop
+
+# 2. Registers, scratch, spills, occupancy.
+hipcc --offload-arch=gfx1151 -O3 -Rpass-analysis=kernel-resource-usage -c kernels/attn.hip -o /dev/null
+```
+
+What they are good for, from the per-kernel round that produced them:
+
+- **Instruction mix of the hot loop.** Count `v_` (VALU) against `global_load`/`ds_load`.
+  A loop with 44 VALU ops around 5 FMAs is not memory-bound no matter what its GB/s says.
+- **Whether a register array actually landed in registers.** `ScratchSize` and
+  `VGPRs Spill` are the whole answer, and a spill silently converts a "move it to
+  registers" optimization into a slowdown.
+- **Divergence.** Count `s_and_saveexec_b32`.
+
+### When you remove one cost, count the cost you may have added — in the same instrument
+
+The divergence check caught a change that would have been a regression, and the way it
+nearly got through is the point. Moving `mla_latent_attend`'s accumulator from LDS to
+registers was supposed to delete an LDS read-modify-write, and it did:
+
+| version | `s_and_saveexec_b32` | `ds_store` |
+|---|---:|---:|
+| baseline (`acc` in LDS) | 6 | 4 |
+| `acc` in registers, bound `i < kvl` | **37** | 2 |
+| `acc` in registers, bound `k < nacc` | **4** | 2 |
+
+The success criterion — "did the `ds_store` go away" — is **green on the middle row**,
+which is the version that added 31 exec-mask save/restores by predicating all 16 unrolled
+steps on a lane-divergent bound. It would plausibly have been slower than the code it
+replaced while displaying the exact signature of the win it was aiming for. A wall-clock
+bench would not have attributed it either: you would have seen "slower" and suspected
+register pressure, not the exec mask.
+
+**So: whatever cost you set out to remove, measure the neighbouring costs in the same
+pass.** Removing LDS traffic can add divergence; moving to registers can add spills;
+unrolling can add instruction-cache pressure. The instrument that shows the win is
+usually one grep away from the instrument that shows the offsetting loss.
+
+### Two ways an instruction count lies
+
+Both of these came up in one afternoon and both will recur:
+
+- **Unroll factors differ between the versions you are comparing.** Normalize before
+  quoting a ratio. `mla_absorb_fp8`'s loops were unrolled ×3 before the fix and ×2 after;
+  the raw block sizes (498 vs 52) suggest ~10×, per iteration it is ~6×. Count a
+  once-per-iteration op — `ds_load`, or the weight load — to recover the factor.
+- **Guarded paths inflate the static count when the guard is not taken at real dims.**
+  The same kernel's 498 instructions include a full 64-bit Newton-Raphson division behind
+  `v_cmpx_ne_u64`, which is **dead** at GLM dims (`row` ≤ 24576 and `block` = 128 both fit
+  in 32 bits). The static number is real and the dynamic cost is smaller. When a count
+  spans a branch, say which side runs.
+
+### The signed-division signature — grep for the right thing
+
+**Do not conclude "no divide in the loop" by grepping for `v_rcp_iflag_f32`.** LLVM
+strength-reduces a division by a loop-invariant runtime value into a magic multiply, so
+the reciprocal disappears while the cost does not. What survives for a **signed** divide
+is the quotient correction, and that is what to look for:
+
+```
+v_mul_hi_u32 / v_mul_lo_u32 / v_cndmask_b32 / v_max_i32 / v_xor_b32 / v_ashrrev_i32
+```
+
+`gemv_fp8_splitk` had eight of those per iteration around five FMAs, from
+`scalerow[i0 / block]` where both operands are `int`. Replacing it with a shift (the fp8
+tile is a power of two, and the launchers now enforce it) took the loop from 44 VALU to
+29 with the memory ops unchanged at 7.
+
+**A 64-bit divide is a different and much larger animal.** `size_t / int` promotes to a
+64-bit unsigned division, which LLVM *cannot* fold to a magic multiply — it emits an
+inline Newton-Raphson reciprocal (seed constant `0x5f7ffffc`) plus a 32-bit fast path
+guarded by `v_cmpx_ne_u64`. `mla_absorb_fp8` had one of these in its `d` loop, from
+`kvb_scale[(row / block) * sc_cols + ...]` with `size_t row`: **498 static instructions
+around 10 memory ops.** Read such counts carefully — the 64-bit path is *not taken* at
+GLM dims (both operands fit in 32 bits), so the static number overstates the dynamic
+cost, and the honest claim is "a runtime division per iteration was removed", with the
+magnitude left to measurement.
+
+### Re-opening the load-widening dead end — and why that was legitimate
+
+`kernels/common.hpp` records that widening the fp8 loads "was a wash". That note came
+from `d5e5932`, whose own commit message says the GEMVs were **decode**-bound at the
+time — and the LDS e4m3 LUT *in that same commit* removed the decode bound. **The
+conclusion outlived the conditions that produced it.** That is the standard for re-testing
+a logged dead end: not "let's try again", but a specific reason the original measurement
+no longer applies.
+
+The re-examination also narrowed the question. The ISA shows the x-side load is already
+`global_load_b128` — LLVM vectorized the four `x[i0+k]` reads by itself, so "widen the
+loads" has silently been half-done since before the note was written. Only the weight
+side is `b32`, and at 4 fp8/lane that is 128 B/wave = exactly one cache line, which is
+not obviously worth widening. The open question is therefore **x re-read amplification**
+(every block streams all of x for its slice of weights), which is a different lever from
+load width and was never what the dead end tested.
+
 ## Running these benches — detach anything multi-cell
 
 **A GPU run longer than the agent harness's background-task lifetime must be detached into

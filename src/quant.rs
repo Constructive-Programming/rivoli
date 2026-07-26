@@ -357,6 +357,22 @@ pub fn matvec_i4(y: &mut [f32], x: &[f32], packed: &[u8], scale: &[f32], o_dim: 
     }
 }
 
+/// Reference int8 GEMV `y[o] = scale[o] · Σ_i x[i]·(i8)packed[o·i_dim+i]` — the CPU
+/// oracle for the `gemv_i8` kernel (lm_head → logits). `packed` is raw bytes
+/// reinterpreted as signed, matching the kernel's `signed char`.
+pub fn matvec_i8(y: &mut [f32], x: &[f32], packed: &[u8], scale: &[f32], o_dim: usize, i_dim: usize) {
+    debug_assert_eq!(y.len(), o_dim);
+    debug_assert_eq!(x.len(), i_dim);
+    debug_assert_eq!(packed.len(), o_dim * i_dim);
+    for (o, (yo, row)) in y.iter_mut().zip(packed.chunks_exact(i_dim)).enumerate() {
+        let mut acc = 0.0f32;
+        for (&b, &xi) in row.iter().zip(x) {
+            acc += xi * (b as i8) as f32;
+        }
+        *yo = acc * scale[o];
+    }
+}
+
 /// Quantize `w[o_dim·i_dim]` (row-major) → per-row symmetric int4 (packed bytes +
 /// per-row f32 scale). `scale[o] = max|row|/7` so the extreme maps to nibble 15
 /// (value +7); nibbles clamp to `[0,15]`. Round-trips through [`matvec_i4`]. Used to
