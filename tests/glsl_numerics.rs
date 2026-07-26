@@ -14,11 +14,16 @@
 //! authoritative but reaches a few hundred values and needs the device. This reaches
 //! ~1.2 million and needs nothing, so the two are complementary rather than redundant.
 //!
-//! **If you edit `f2e4m3` or `f2bf16` in common.glsl, edit these to match.** There is a
-//! pointer to this file next to them.
+//! **If you edit `f2e4m3` or `f2bf16` in common.glsl, edit these to match.** That is
+//! not left to a comment: `transcriptions_still_match_the_glsl` hashes the two function
+//! bodies out of common.glsl and fails if they have changed, telling you to re-verify
+//! and update the constant. Naming a drift risk does not contain it — a stale
+//! transcription would keep passing while testing a function the shader no longer has,
+//! which is the same shape as a deleted helper or an empty log sink, one level removed.
 //!
 //! Not feature-gated: it depends only on `math.rs`, so it runs in the default build
 //! where the Vulkan backend is not even compiled.
+#![allow(clippy::expect_used)]
 
 /// Literal transcription of `common.glsl::f2e4m3`. Deliberately un-idiomatic — it must
 /// mirror the GLSL statement for statement, not read like good Rust.
@@ -154,5 +159,77 @@ fn glsl_f2bf16_diverges_from_math_rs_on_nan_by_design() {
         rivoli::math::f32_to_bf16(sig),
         0x7fc0,
         "math.rs via half: quiet bit forced"
+    );
+}
+
+
+// ---------------------------------------------------------------------------
+// Drift guard
+// ---------------------------------------------------------------------------
+
+/// FNV-1a. Hand-rolled because `DefaultHasher` is explicitly NOT stable across Rust
+/// releases — a checked-in constant computed from it would start failing on a toolchain
+/// bump, and the natural response to a mystery failure is to paste in the new number,
+/// which is exactly the reflex this guard exists to prevent.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// The body of a GLSL function, from its signature to its matching close brace.
+///
+/// Deliberately narrower than hashing the whole file: comments and unrelated helpers in
+/// common.glsl change often, and a guard that cries wolf on every edit gets its constant
+/// updated without thought. This fires when the ALGORITHM changes, which is when the
+/// transcriptions below actually need re-checking.
+fn glsl_fn_body(src: &str, signature: &str) -> String {
+    let start = src.find(signature).unwrap_or_else(|| {
+        panic!(
+            "kernels/vk/common.glsl no longer contains `{signature}`. If it was renamed \
+             or removed, update the transcription in tests/glsl_numerics.rs to match \
+             and fix this signature."
+        )
+    });
+    let bytes = src.as_bytes();
+    let mut i = start + signature.len(); // signature includes the opening brace
+    let mut depth = 1usize;
+    while depth > 0 {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    src[start..i].to_string()
+}
+
+/// Hash of `f2e4m3` + `f2bf16` as they stand in common.glsl. Update ONLY after checking
+/// that the transcriptions above still mirror the GLSL statement for statement.
+const GLSL_NUMERICS_HASH: u64 = 0xa5fb_54ab_dc74_a080;
+
+/// The transcriptions above are only evidence while they still correspond to the
+/// shader. This makes that correspondence a build-visible obligation rather than a
+/// comment: touch the GLSL, and the test tells you to re-verify.
+#[test]
+fn transcriptions_still_match_the_glsl() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/kernels/vk/common.glsl");
+    let src = std::fs::read_to_string(path).expect("read common.glsl");
+    let mut joined = glsl_fn_body(&src, "uint f2bf16(float x) {");
+    joined.push_str(&glsl_fn_body(&src, "uint f2e4m3(float x) {"));
+    let got = fnv1a(joined.as_bytes());
+    assert_eq!(
+        got, GLSL_NUMERICS_HASH,
+        "\n\nf2e4m3/f2bf16 in kernels/vk/common.glsl have CHANGED.\n\
+         The literal Rust transcriptions in this file may no longer mirror them, and \
+         until you check, this file's ~1.2M-value pass proves nothing about the \
+         shader.\n\
+         1. Re-read both GLSL functions against glsl_f2e4m3/glsl_f2bf16 here.\n\
+         2. Update them if they diverged.\n\
+         3. Set GLSL_NUMERICS_HASH = {got:#018x}\n"
     );
 }
