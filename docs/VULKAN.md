@@ -53,7 +53,7 @@ Mechanical mappings:
 | `hipEvent_t` elapsed | `VK_QUERY_TYPE_TIMESTAMP` query pool |
 | `hipLaunchHostFunc` | **no equivalent** — see "Signal bridge" |
 | `hipMalloc` / `rivoli_vmm_alloc` | `vkAllocateMemory` + offset-bound `VkBuffer` |
-| `hipHostMalloc` (bounce arena) | `VK_EXT_external_memory_host` import, or mapped `HOST_VISIBLE` |
+| `hipHostMalloc` (bounce arena) | device-local **copy pool** — see "Memory: copy, don't import" |
 | `hipMemcpyDtoD` (arena compaction) | `vkCmdCopyBuffer` |
 | `hipMemcpyHtoDAsync` | `vkCmdCopyBuffer` on a transfer queue |
 | kernel raw pointer args | buffer device addresses (`VK_KHR_buffer_device_address`) |
@@ -71,13 +71,37 @@ Fail fast at init with a clear message naming the missing one:
   `WAVE 32` (gfx1151 native wave32; see `kernels/common.hpp`).
 - `subgroupShuffleRelative` + `subgroupBasic` (core 1.1 subgroup ops).
 - `VK_KHR_shader_float16_int8` + `VK_KHR_16bit_storage` — the fp16 VQ codebook.
-- `VK_KHR_8bit_storage` — packed u8 weights (or read as `uint` and unpack, which the
-  hot loops already do).
 - `VK_KHR_timeline_semaphore` (core 1.2).
 - A `DEVICE_LOCAL | HOST_VISIBLE` heap covering GTT — on Strix Halo host RAM *is* GPU
   memory, and the pin path depends on writing resident weights directly.
 
-## Two things that are not mechanical
+Deliberately **not** required: `VK_KHR_8bit_storage`. Read packed u8 weights as `uint`
+words and unpack bytes/nibbles in the shader — colibri's `qmatmul.comp` does exactly
+this, and the hot loops already unpack manually, so the extension buys nothing.
+
+Use a **dedicated compute queue**, not the universal graphics queue (colibri `4d4cacc`).
+
+## Three things that are not mechanical
+
+### Memory: copy, don't import
+
+The obvious design — import the io_uring bounce arena as a `VkBuffer` via
+`VK_EXT_external_memory_host` so the shader reads weights in place — is **measured
+slower on our exact hardware** (RADV, gfx1151). Colibri built it, then replaced it with
+a fixed pre-allocated round-robin pool of device-local buffers:
+
+    SUBMIT ms/batch:  import(ring128) 2.13 | import-slab-shared 8.62 | copy 0.06
+
+Cause: amdgpu re-validates every *live* host-imported (userptr) BO on every
+`vkQueueSubmit`, so submit cost scales with live imports rather than referenced ones —
+and a ring evicts imports before they recur, so "zero-copy" re-pins (`get_user_pages`
+≈ a memcpy) on every use anyway. The copy pool also survives a mid-batch slab reload
+that segfaults the import path.
+
+So: `batch_add`-style memcpy into the next pool buffer, GPU reads a private device-local
+snapshot. Size the pool like colibri's default (~32 buffers) and tune from there.
+
+### Determinism
 
 ### Determinism
 
@@ -98,19 +122,31 @@ one waiter thread blocking in `vkWaitSemaphores` on a timeline semaphore, resolv
 change. Measure the latency — a thread wakeup may beat 19 µs or may not; if it
 regresses, batch several completions per semaphore value.
 
-## Kernel inventory (29 compute kernels)
+## Kernel inventory — port 16 of 29
 
-| File | Kernels | Port difficulty |
+v1 is **`--mode int3-vq`, `--attn dense`, decode only**. That is the smallest thing that
+runs the model, and it cuts 13 kernels from the port.
+
+| File | Port now | Port difficulty |
 |---|---|---|
-| `linalg.hip` | `gemv_fp8`, `gemv_fp8_splitk`, `gemv_vq`, `gemv_f32`, `gemv_i8`, `gemv_i4`, `swiglu`, `rmsnorm`, `rope_interleave`, `vq_encode` | `gemv_f32`/`swiglu`/`rmsnorm` trivial; the split-K LDS combine and the e4m3 LUT need care |
-| `moe.hip` | `moe_gateup_vq`, `moe_down_vq`, `moe_reduce`, `moe_gateup_i4`, `moe_down_i4` | hardest — per-expert device addresses, fp16 codebook gather |
+| `linalg.hip` | `gemv_fp8`, `gemv_fp8_splitk`, `gemv_f32`, `gemv_i8`, `swiglu`, `rmsnorm`, `rope_interleave` | `gemv_f32`/`swiglu`/`rmsnorm` trivial; the split-K LDS combine and the e4m3 LUT need care |
+| `moe.hip` | `moe_gateup_vq`, `moe_down_vq`, `moe_reduce` | hardest — per-expert device addresses, fp16 codebook gather |
 | `fwd.hip` | `embed_i8_row`, `append_kv`, `gather_rope`, `vadd`, `argmax_reduce` | easy |
 | `mla.hip` | `mla_absorb_fp8`, `mla_value_fp8` | easy-moderate |
 | `attn.hip` | `mla_latent_attend`, `mla_attend_combine` | moderate — dynamic shared memory sizing becomes a specialization constant |
-| `indexer.hip` | `layernorm`, `index_append`, `index_score`, `index_pool_push`, `index_head_route` | moderate; DSA path, defer to last |
 
-`vmm.hip` and `async.hip` are runtime shims, not kernels — they are replaced by the
-Vulkan memory/queue layer rather than ported.
+**Deferred, with the reason:**
+
+- `vq_encode` (`linalg.hip`) — converter only. `convert --gpu` stays a ROCm-build tool;
+  a Vulkan box converts on a HIP machine or on CPU.
+- `gemv_vq`, `gemv_i4` (`linalg.hip`) — standalone microbench/oracle kernels. Decode
+  goes through `moe_*_vq`; nothing in the forward pass calls these.
+- `moe_gateup_i4`, `moe_down_i4` (`moe.hip`) — only needed for `--mode int4|hybrid`.
+- `indexer.hip` ×5 — the DSA path. A Vulkan build supports `--attn dense` and rejects
+  `--attn dsa` at startup.
+
+`vmm.hip` and `async.hip` are runtime shims, not kernels — replaced by the Vulkan
+memory/queue layer rather than ported.
 
 **Shader language: GLSL compiled by `glslc`.** The kernels are already C-like; GLSL
 keeps the diff readable against the `.hip` originals, which matters because the two
@@ -155,8 +191,13 @@ costs one `cargo build` flag and nothing else.
 
 The port has an unusually good test story: `tests/kernel.rs` already validates every
 kernel against CPU oracles in `math.rs`/`quant.rs`. **The Vulkan backend is done when
-that suite passes unmodified**, plus a coherent 32-token decode on a partial artifact
-(the `convert --layers 1` stub path used for the HIP end-to-end bring-up).
+the oracles for the 16 ported kernels pass**, plus a coherent 32-token decode on a
+partial artifact (the `convert --layers 1` stub path used for the HIP end-to-end
+bring-up).
+
+Scoped, not "unmodified", on purpose: the suite also covers `gemv_vq`/`gemv_i4`, which
+are microbench kernels the decode path never calls. Gate those oracles on the ported
+set (`#[cfg]` or a skip list) rather than porting two kernels to satisfy a test.
 
 Do not accept "close enough" numerics. The oracle tolerances were tuned against real
 failures — bf16 codebooks failed the 1e-3 oracle and fp16 passed with ~5.6× margin;
@@ -170,29 +211,32 @@ Each phase ends with something runnable; no phase leaves the tree broken.
    dispatched from a GLSL shader, its oracle test green under `--features vulkan`.
    Proves the waist and the build plumbing. Small; do it before committing to the rest.
 2. **Memory + sync** — `DeviceBuf`/`DeviceTier`/`VmmBuf` equivalents, timeline-semaphore
-   `Signal`, timestamp queries, host-pointer import for the io_uring bounce arena.
-   Exit: `DeviceTier` reserve/copy tests pass; the reaper's H2D path round-trips.
+   `Signal`, and the device-local copy pool for the io_uring bounce path. No profiling
+   yet. Exit: `DeviceTier` reserve/copy tests pass; the reaper's H2D path round-trips.
 3. **Kernels, oracle-first** — port in test order: `fwd` → `linalg` (non-MoE) → `mla` →
-   `attn` → `moe`. Exit: full `tests/kernel.rs` green.
+   `attn` → `moe`. Exit: the 16 ported kernels' oracles green.
 4. **Integration** — `backend.rs` switch, `pin.rs`/`gpu.rs` imports, end-to-end decode
    on the 4-layer stub, then the full artifact. Exit: coherent output.
-5. **Bench** — compare against HIP on the same artifact. Expect the first port to be
-   slower; record where, do not tune during the port.
+5. **Bench + profiling** — timestamp query pools wired into `telemetry.rs`, then compare
+   against HIP on the same artifact. Expect the first port to be slower; record where,
+   do not tune during the port.
+
+**Sequence this last.** Of the three open proposals it has the least measured upside:
+PILOT and `top-m` attack a bottleneck we have quantified, while this buys portability
+we do not currently need on a node where ROCm works. Build it when the portability goal
+is real, not because the plan exists.
 
 ## Risks
 
 - **Subgroup size control** may be unavailable or ignored on some drivers; a wave64
   fallback means re-tuning `ROWS_PER_BLOCK` and re-validating determinism.
-- **Host-pointer import alignment** (`minImportedHostPointerAlignment`) must be ≤ the
-  O_DIRECT 4096 alignment the streamer already guarantees; check at init.
 - **Push-constant budget** is 128 bytes guaranteed. `launch_attend` and the MoE
   launchers exceed that — those need a small params `VkBuffer` per dispatch, which is
   an extra write on a hot path. Measure before assuming it is free.
 - **Profiling**: no `rocprof` equivalent in the workflow, but timestamp query pools are
   strictly better than the current HIP-event bracketing — the existing `telemetry.rs`
   spans map over cleanly.
-- **Scope**: 29 kernels is not a weekend. If the goal is only "runs without ROCm", the
-  first Vulkan release can ship without the DSA indexer path (5 kernels) — a Vulkan
-  build would support `--attn dense` only and reject `--attn dsa` at startup. That is a
-  smaller capability set for that build, not a mixed backend: the HIP build keeps DSA,
-  and neither build ever calls into the other.
+- **Scope**: 16 kernels is still not a weekend, and the deferred 13 are deferred, not
+  cancelled — `--mode int4|hybrid` and `--attn dsa` remain HIP-only until someone ports
+  them. That is a smaller capability set for that build, not a mixed backend: the HIP
+  build keeps everything, and neither build ever calls into the other.

@@ -97,6 +97,7 @@ src/bin/        convert, vq3_to_i4, pack_i4, add_indexer, replay
 kernels/*.hip   HIP kernels (moe, mla, attn, linalg, indexer, fwd, async, vmm)
 examples/       dot_bench — per-format dot microbench (int4 vs int3-vq vs fp8)
 tests/          kernel oracles + lib unit tests
-docs/           ARCHITECTURE.md, VULKAN.md (proposed second backend)
+docs/           ARCHITECTURE.md; proposals: VULKAN.md (second backend),
+                CACHE_ROUTE.md (top-m routing) + CACHE_PILOT.md (its prefetch)
 MODES.md        format-mode + cache-policy reference
 ```
