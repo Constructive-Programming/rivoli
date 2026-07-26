@@ -137,9 +137,20 @@ static GPU: OnceLock<Gpu> = OnceLock::new();
 /// engine's buffers (also static-lifetime, also never freed on the HIP side) still
 /// hold handles would be strictly worse than letting the OS reclaim it.
 pub fn gpu() -> Result<&'static Gpu> {
-    // ponytail: a lost init race just builds a second Gpu and drops it. The engine
-    // drives the GPU from one thread, so this cannot happen in practice; a Mutex to
-    // rule out a case that does not occur is not worth the deadlock surface.
+    // Double-checked: the fast path is a plain atomic load, and the slow path is
+    // taken once per process. `OnceLock::get_or_init` alone would be wrong here —
+    // `Gpu::new` is fallible, so init has to happen outside the closure, and two
+    // threads racing would each build a whole VkInstance + VkDevice + pipeline set
+    // with the loser's LEAKED (Gpu has no Drop, deliberately). The decode loop is
+    // single-threaded so this never fires in the engine, but cargo's test harness
+    // runs tests in parallel threads and every one of them calls `gpu()`.
+    //
+    // No deadlock surface: nothing reachable from `Gpu::new` calls `gpu()`.
+    if let Some(g) = GPU.get() {
+        return Ok(g);
+    }
+    static INIT: Mutex<()> = Mutex::new(());
+    let _lk = INIT.lock().map_err(|_| anyhow!("vk init lock poisoned"))?;
     if let Some(g) = GPU.get() {
         return Ok(g);
     }
