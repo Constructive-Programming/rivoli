@@ -267,7 +267,13 @@ these are not evidence about `top-m` in a well-quantized int4 mode.**
 | J=4/M=10 | 9.27330 | +2.095% | +0.02073 | 0.01206 | [−0.00290, +0.04436] | 54.1% | 79.95% | 9.55% |
 | J=2/M=12 | 10.23659 | +12.700% | +0.11956 | 0.01730 | [+0.08565, +0.15347] | 61.7% | — | 17.6% |
 
-**Three of four cells are UNDERPOWERED, and that is the headline.** One standard error
+**J=2/M=12 — the paper's own defaults — is DECIDED AND REJECTED. It does not get
+re-measured.** It fails outright on int4 at +12.700% with the interval entirely past the
+bar (6.91 SE above zero), and on int3-vq its lower bound is +0.68% around a +3.63% point
+estimate (2.42 SE above zero). Nothing about a larger corpus rescues a cell whose interval
+is already above the bar; more text would only tighten it around a failing value.
+
+**Three of the four cells are UNDERPOWERED, and that is the headline.** One standard error
 exceeds the 0.00995-nat bar (a 1% PPL change) in every cell, so at 762 tokens the
 experiment cannot resolve the acceptance question at any point estimate. An underpowered
 null is **not** evidence of no harm. Only `int4 J=2/M=12` is decided: its interval lies
@@ -280,25 +286,30 @@ zero, the low-swap point only 0.92 SE — so what is established is that the hig
 configuration costs something real, and that cost grows faster than swap does. The same
 shape appears in int4 (1.72 SE and 6.91 SE).
 
-**What does NOT survive: "the cost is ~2× worse in int4".** That compares two estimates
-each individually indistinguishable from zero, and a ratio inherits that uncertainty rather
-than escaping it. Doing the difference-of-differences properly
-(`SE = sqrt(SE₁² + SE₂²)`):
+**The cost per unit of swap is quantization-dependent — established, but by one of the two
+comparisons only.** Difference-of-differences between the arms at matched swap, independent
+runs so `SE = sqrt(SE₁² + SE₂²)`:
 
 | matched swap | int4 − int3-vq | SE of difference | |
 |---|---:|---:|---|
-| ~9.6% | +0.01070 | 0.01627 | 0.66 SE — **unresolved** |
-| ~17.6% | +0.08392 | 0.02273 | 3.69 SE — resolved, int4 costs more |
+| ~9.6% | +0.01070 | 0.01627 | 0.66 SE — **too noisy to contribute** |
+| ~17.6% | +0.08392 | 0.02273 | **3.69 SE — significant past p<0.001** |
 
-So quantization *does* change the cost at high swap, but **at the low-swap operating point
-we would actually ship, the difference is unresolved** — and that is the point that matters,
-since the candidate cell is J=4/M=9. Treat "re-measure per mode rather than inheriting a
-(J, M)" as prudence, not as something this data establishes. Resolving the low-swap
-difference needs both arms powered, which is roughly twice the n of either arm alone.
+The high-swap pair carries this on its own. The low-swap pair contributes nothing: both of
+its estimates are individually indistinguishable from zero, and the "roughly 2×" ratio that
+can be read off them inherits that uncertainty rather than escaping it — an earlier draft of
+this section claimed it and should not have.
 
-The mechanism that suggests itself — a less faithful quantization has less quality headroom
-to give away — is plausible, and that is exactly why it is dangerous: plausibility would be
-doing work the statistics are not.
+**The durable conclusion is a transfer warning: a (J, M) validated on one quantization does
+not carry over to another, and any future mode must be re-measured rather than inheriting a
+setting.** What remains unresolved is the *magnitude* of the gap at the low-swap operating
+point we would actually ship, which needs both arms powered — roughly twice the n of either
+arm alone.
+
+A mechanism suggests itself — a less faithful quantization has less quality headroom to give
+away before substitution starts to hurt — and it fits the direction and the widening with
+swap. It is not tested here, and it is worth noting that its plausibility is exactly what
+made the unsupported low-swap ratio tempting in the first place.
 
 ---
 
