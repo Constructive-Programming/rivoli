@@ -75,7 +75,7 @@ fn transcribed_e4m3f(b: u32) -> f32 {
     if exp == 15 && mant == 7.0 {
         return f32::from_bits(0x7fc0_0000);
     }
-    sign * (1.0 + mant * 0.125) * ((exp - 7) as f32).exp2()
+    sign * (1.0 + mant * 0.125) * f32::from_bits(((exp - 7 + 127) as u32) << 23)
 }
 
 /// Literal transcription of `common.glsl::f2bf16`.
@@ -241,7 +241,7 @@ const LOCKED: &[(&str, &str)] = &[
 /// Hash of every [`LOCKED`] function body as it stands in common.glsl, concatenated in
 /// order. Update ONLY after checking that the transcriptions above still mirror the GLSL
 /// statement for statement.
-const GLSL_NUMERICS_HASH: u64 = 0xf2db_abcb_0db9_04cb;
+const GLSL_NUMERICS_HASH: u64 = 0x92c6_d0fe_121f_98ca;
 
 /// The transcriptions above are only evidence while they still correspond to the
 /// shader. This makes that correspondence a build-visible obligation rather than a
@@ -325,10 +325,28 @@ fn every_transcription_is_locked() {
 /// exp==0 subnormal ladder, and the sign-symmetric edges, which is exactly why the
 /// placeholder named them.
 ///
-/// `exp2` appears in the normal branch and is the only transcendental in the numeric
-/// helpers. Its argument is an INTEGER in [-6, 8], and exp2 of an exact integer is an
-/// exact power of two in any conforming implementation — so the 3-ULP allowance Vulkan
-/// gives `exp2` cannot bite here. This test is what turns that argument into evidence.
+/// This test USED to carry an argument that `exp2` was safe in the normal branch: its
+/// argument is an integer in [-6, 8], and exp2 of an exact integer is an exact power of
+/// two "in any conforming implementation", so Vulkan's 3-ULP allowance could not bite.
+/// The argument was wrong in one way and the evidence for it was wrong in another.
+///
+/// Wrong argument: Vulkan's 3-ULP allowance for `exp2` has NO exemption for integer
+/// arguments. "Every implementation I can think of is exact there" is a prediction about
+/// implementations, not a property of the contract — and predictions of that shape have
+/// a poor record in this port.
+///
+/// Wrong evidence, and this is the part worth remembering: THIS TEST COULD NEVER HAVE
+/// DETECTED THE PROBLEM. It runs `transcribed_e4m3f`, which called RUST's `f32::exp2` —
+/// exact. The shader calls GLSL's `exp2` — the thing in question. A literal
+/// transcription mirrors STATEMENTS, and an accuracy contract is precisely what a
+/// transcription cannot transcribe. So the lock would have kept the two in perfect
+/// correspondence while the only property at issue differed between them.
+///
+/// The fix removes the question rather than answering it: both sides now build the power
+/// of two by bit manipulation, which is exact by construction and has no accuracy
+/// contract to argue about. Generalise it — for any `exp2`/`inversesqrt`-class builtin,
+/// a transcription test is NOT evidence of agreement, and the honest options are to
+/// eliminate the builtin or to compare against the real shader on the device.
 #[test]
 fn e4m3f_decodes_all_256_bytes_bit_exactly() {
     for b in 0u32..256 {

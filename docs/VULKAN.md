@@ -295,7 +295,46 @@ embedded via `include_bytes!`. Keep `rerun-if-changed` on the shared header — 
 
 ### Numerics that must stay bit-exact
 
-### The toolchain rewrites float arithmetic. Assume nothing compiles literally.
+### Same spelling, different semantics — the porting pre-flight
+
+**Run this list against the HIP source BEFORE writing a shader, not after the oracle
+fails.** Every entry below was discovered the expensive way, and each one was silent at
+every stage before a numeric comparison. They are one class: a construct that is spelled
+the same or nearly the same in HIP and GLSL, and means something different. That class is
+where this port's real defects live — not in the algorithms, which transliterate fine.
+
+| HIP | GLSL | Mechanism | Symptom |
+|---|---|---|---|
+| `float* lut` parameter | `float lut[256]` parameter | C decays arrays to pointers; GLSL copies value-result | Per-invocation private copy, writes lost, silent garbage. Rule 11 |
+| `i / block`, signed | `i / block` | LLVM strength-reduces, but the signed-quotient correction survives | Silent cost — 44→29 VALU/iter. Use `findMSB` |
+| `__shfl_down(v, o, 32)` | `subgroupShuffleDown` | Out-of-range returns the caller's own value in HIP; UNDEFINED in SPIR-V | Silent divergence on the last lanes. Rule 2 bans it |
+| `1.0f/sqrtf(z)` | `inversesqrt(z)` | Different accuracy contracts under identical intent | Silent ULP divergence from the CPU oracle. Rule 9 |
+| `exp2f(float(k))` | `exp2(float(k))` | Exact on an integer argument in libm; NOT REQUIRED to be in GLSL | Silent ULP error under a claimed bit-exactness contract |
+| `(unsigned char)p` | *(no such cast)* | C truncates; GLSL has no 8-bit type, so it must be `p & 0xFFu` | A wrong mask is a wrong weight, not a compile error |
+| `isfinite(x)` | *(does not exist)* | Must be composed from `isinf`/`isnan` | Compiles only if you notice; easy to get the polarity backwards |
+| `size_t` index | `uint` index | 32-bit overflow at 4 GB in the shader, not on the host | Silent wrap on large tensors. See the Index width note |
+
+The generative rule, which is worth more than the table: **a HIP construct whose GLSL
+analogue is "the obvious builtin" needs an explicit decision, never a transliteration.**
+That is exactly how `inversesqrt` got in, and how `exp2` sat under a comment calling
+bit-exactness a contract until this list was written.
+
+Two of these have mechanised guards (rules 2 and 9) and one is preventive (rule 11).
+The rest are checked by reading, which is why the list exists.
+
+### Rule 11 is the first PREVENTIVE rule
+
+Every other mechanised rule is detective: it fires on a defect that already exists in the
+tree. Rule 11 fires on a defect about to be introduced. `mla_absorb_fp8` and
+`mla_value_fp8` both call `e4m3_lut_build`, so a mechanical transliteration of tranche 2b
+reintroduces the copy-in/copy-out bug TWICE, in two kernels whose oracles do not exist
+yet — and it would again be silent at every stage before the numeric check. The rule was
+written an hour before the code it will stop.
+
+That is the strongest available argument for mechanising a rule the moment it is
+understood rather than after the next instance.
+
+## The toolchain rewrites float arithmetic. Assume nothing compiles literally.
 
 Read this before any other numerics claim here, because it invalidates the shape of
 argument the rest of them are made in.

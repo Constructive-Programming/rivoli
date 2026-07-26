@@ -131,7 +131,17 @@ float e4m3f(uint b) {
     float mant = float(b & 0x07u);
     if (exp == 0) return sign * (mant * 0.125) * 0.015625; // 2^-6
     if (exp == 15 && mant == 7.0) return uintBitsToFloat(0x7fc00000u);
-    return sign * (1.0 + mant * 0.125) * exp2(float(exp - 7));
+    // The power of two is BUILT FROM BITS, not computed. `exp2(float(exp - 7))` is the
+    // obvious transliteration of HIP's `exp2f` and of math.rs's `powi`, and it is the
+    // same trap that produced `inversesqrt`: GLSL does not require `exp2` to be exact,
+    // even on an exact integer argument, while Rust's `powi` and HIP's `exp2f` are. A
+    // conformant implementation may return 2^3 with several ULP of error, and the line
+    // above this function calls bit-exactness a CONTRACT.
+    //
+    // `exp` is 1..15 here (0 and the NaN encoding returned already), so `exp - 7 + 127`
+    // is 121..135 — always a normal exponent, so the shift is exact and total over the
+    // whole domain, with no accuracy contract to rely on.
+    return sign * (1.0 + mant * 0.125) * uintBitsToFloat(uint(exp - 7 + 127) << 23);
 }
 
 // Filling the e4m3 LUT is a MACRO, not a function, and that is a correctness
