@@ -51,7 +51,10 @@ fn desc_of_vq(m: &MlpVq) -> ExpertDesc {
 /// Per-token time buckets. ALWAYS ON: every bucket wraps a join/D2H the forward
 /// pass already pays (the end-of-layer sync, the gate-logits read, the stream
 /// drain), so accumulating them costs only a clock read per layer — no extra GPU
-/// sync, nothing that perturbs the run. The end-of-run [`Profile::report`] is the
+/// sync. Cost bound, since `wall_ns` is quoted as a measurement elsewhere: the
+/// indexer buckets add 42 `hipEventRecord` enqueues + 21 clock reads per token,
+/// O(0.2 ms) against a ~400 ms token, ~0.05%. Bounded by argument, not by an
+/// un-instrumented control run — see docs/NPU.md "What was NOT measured". The end-of-run [`Profile::report`] is the
 /// engine's standing performance summary; the expensive fine-grained audits and
 /// correctness probes live behind the `trace` feature instead.
 #[derive(Default)]
@@ -61,6 +64,16 @@ struct Profile {
     /// other policy, which is why the summary reports it as an Option rather than a 0%.
     swap_n: u64,
     route_ns: u128, // host routing (gate D2H + sigmoid/bias/top-k, + top-m substitution)
+    /// The DSA indexer's HIP-event SPAN — including whatever falls between its kernels,
+    /// so NOT comparable to a per-kernel microbench sum. Measured 27% above one, cause
+    /// unestablished. Note the endpoints are themselves barrier packets whose dispatch
+    /// cost lands inside the span.
+    idx_gpu_ns: u128,
+    /// The host half of the selection (score D2H + CPU top-k + row upload): GPU-idle time.
+    idx_host_ns: u128,
+    /// Full layers that scored, the denominator for both. Not `tokens * 21` — layers below
+    /// `index_topk` return dense before scoring and record nothing.
+    idx_layers: u64,
     moe_wall_ns: u128,    // the block_on wall of the overlapped MoE phase (CPU wall)
     compute_gpu_ns: u128, // HIP-event span of the compute stream (partials + reduce)
     wall_ns: u128,
@@ -101,6 +114,9 @@ impl Profile {
             hit_pct: 100.0 * hits as f64 / (hits + misses).max(1) as f64,
             wall_ms: per(self.wall_ns),
             route_ms: per(self.route_ns),
+            idx_gpu_ms: per(self.idx_gpu_ns),
+            idx_host_ms: per(self.idx_host_ns),
+            idx_layers_per_tok: self.idx_layers as f64 / tok,
             moe_wall_ms: per(self.moe_wall_ns),
             compute_gpu_ms: per(self.compute_gpu_ns),
             fetch_wall_ms: per(fetch_wall_ns as u128),
@@ -240,6 +256,10 @@ pub struct GpuEngine<'a> {
     /// the async overlap hides from wall-clock.
     moe_ev_start: HipEvent,
     moe_ev_end: HipEvent,
+    /// Brackets the DSA indexer's kernels inside `dsa_select_layer`. Recorded on the
+    /// null stream and read behind the sync that path already performs.
+    idx_ev_start: HipEvent,
+    idx_ev_end: HipEvent,
     moe_monitor: tokio_metrics::TaskMonitor,
     /// DIAGNOSTIC (`--checksum-x`, `trace` only): hash the residual stream each layer.
     #[cfg(feature = "trace")]
@@ -376,6 +396,8 @@ impl<'a> GpuEngine<'a> {
             compute_stream: HipStream::new()?,
             moe_ev_start: HipEvent::new()?,
             moe_ev_end: HipEvent::new()?,
+            idx_ev_start: HipEvent::new()?,
+            idx_ev_end: HipEvent::new()?,
             moe_monitor: tokio_metrics::TaskMonitor::new(),
             #[cfg(feature = "trace")]
             checksum_x: false,
@@ -472,6 +494,14 @@ impl<'a> GpuEngine<'a> {
             std::ptr::null_mut()
         };
 
+        // DSA only, and this is a correctness guard, not a scoping choice: MISA's
+        // head-route runs its own `device_sync` + D2H *inside* this bracket, which would
+        // fold host time into a GPU-timeline number. Under misa the buckets stay 0 and the
+        // summary line stays silent. Read behind the sync this path already pays.
+        let bracket = active_heads.is_none();
+        if bracket {
+            self.idx_ev_start.record(std::ptr::null_mut())?;
+        }
         // Key: wk·xn → LayerNorm(k_norm) → RoPE(first `rope` dims) → append. Runs EVERY
         // token so the cache is ready when we cross the threshold. MISA folds the same
         // roped key into the block pool on every token, for the same reason.
@@ -566,7 +596,20 @@ impl<'a> GpuEngine<'a> {
                 scp,
             )?;
         }
+        if bracket {
+            self.idx_ev_end.record(std::ptr::null_mut())?;
+        }
         device_sync()?;
+        // Both events are retired by the sync above — read the indexer's GPU span, then
+        // clock the host half (score D2H + CPU top-k + row upload) separately. The clock
+        // starts AFTER the sync so the wait for the GPU span is not counted twice; what
+        // it measures is time the GPU spends idle waiting on the host.
+        if bracket {
+            self.prof.idx_gpu_ns +=
+                (HipEvent::elapsed_ms(&self.idx_ev_start, &self.idx_ev_end)? as f64 * 1e6) as u128;
+            self.prof.idx_layers += 1;
+        }
+        let t_idx = std::time::Instant::now();
         idx.scores.copy_out_prefix(&mut idx.scores_host, nt * 4)?;
         idx.scores_f.clear();
         idx.scores_f.extend(
@@ -579,6 +622,9 @@ impl<'a> GpuEngine<'a> {
         idx.rows.clear();
         idx.rows.extend(idx.sel.iter().map(|&i| i as u32));
         self.rows_buf.copy_in_at(0, as_le_bytes(&idx.rows))?;
+        if bracket {
+            self.prof.idx_host_ns += t_idx.elapsed().as_nanos();
+        }
         idx.last_dense = false;
         idx.last_nr = idx.rows.len();
         Ok((self.rows_buf.ptr() as *const u32, idx.rows.len()))

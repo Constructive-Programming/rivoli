@@ -16,6 +16,14 @@ pub struct ProfileSummary {
     pub hit_pct: f64,
     pub wall_ms: f64,
     pub route_ms: f64,
+    /// The DSA indexer's GPU-timeline span; see [`Profile::idx_gpu_ns`](crate::gpu).
+    pub idx_gpu_ms: f64,
+    /// The host half of the selection (score D2H + CPU top-k + row upload) — GPU-idle time.
+    pub idx_host_ms: f64,
+    /// Full layers per token that took the scoring path. Not `21` until context exceeds
+    /// `index_topk`, and 0 whenever the indexer never scored — which is what gates the
+    /// report line below.
+    pub idx_layers_per_tok: f64,
     /// CPU wall of the overlapped MoE phase (the `block_on`).
     pub moe_wall_ms: f64,
     /// GPU-event span of the compute stream (partials + reduce).
@@ -65,6 +73,21 @@ impl ProfileSummary {
             self.load_wait_ms,
             self.launch_ms,
         );
+        // DSA indexer decomposition (docs/NPU.md M0). Silent when the indexer never
+        // scored — dense/streaming, or a context that stayed under `index_topk`, where a
+        // row of zeros would read as a measurement of something that did not happen.
+        if self.idx_layers_per_tok > 0.0 {
+            tracing::info!(
+                "  indexer/tok: gpu {:.1}ms + host {:.1}ms (D2H+topk+upload) over {:.3} scoring layers \
+                 => {:.1}us + {:.1}us per layer",
+                self.idx_gpu_ms,
+                self.idx_host_ms,
+                self.idx_layers_per_tok,
+                // Guarded non-zero by the `> 0.0` above, so these divisions are safe.
+                self.idx_gpu_ms * 1e3 / self.idx_layers_per_tok,
+                self.idx_host_ms * 1e3 / self.idx_layers_per_tok,
+            );
+        }
         if let Some(swap) = self.swap_pct {
             tracing::info!(
                 "  route: swap {swap:.2}% of chosen slots were outside the true top-K \

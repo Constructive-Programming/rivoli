@@ -393,11 +393,20 @@ Without these the deltas below are unreadable:
 
 | kernel | base µs | fix µs | Δ | GB/s |
 |---|---:|---:|---:|---|
-| `mla_absorb` | 72.00 | **36.50** | **−49.3% (1.97×)** | 87.4 → **172.3** |
+| `mla_absorb` | 72.00 | **36.50** | **−49.3% (1.97×)** | 87.4 → **172.3** | †
 | `mla_value` | 33.73 | **27.03** | **−19.9% (1.25×)** | 248.6 → **310.3** |
 | `mla_attend` nr512 | 258.03 | **227.17** | **−12.0%** | — |
 | `mla_attend` nr2048 | 876.30 | **778.53** | **−11.2%** | — |
 | `o_proj` | 541.55 | **528.95** | **−2.3%** | 184.7 → **190.6** |
+
+† **CORRECTION (2026-07-26, "DSA indexer round" below): 36.50 µs is a cache-resident
+figure, and so is its 172.3 GB/s.** The rig replays one 14.7 MB `kv_b` weight, which Strix
+Halo's 32 MB MALL serves; with 4 rotating copies the same kernel measures **45.64 µs**, and
+the engine holds 78 distinct `kv_b`. **The A/B above is unaffected** — both arms replayed
+the same single weight, so the −49.3% delta stands and is what this table was for. What is
+wrong is using 36.50 µs as an absolute per-layer cost, which the `×78` projection below and
+docs/PERF.md both do. The same defect is present in every absolute µs figure in this
+section; only the deltas are safe.
 
 Arms are non-overlapping for every row. o_proj is the weakest and was pooled over two
 separate experiments (6 samples/arm) because its effect is close to the between-run drift
@@ -826,3 +835,52 @@ over-subscribes all 40 CUs and neither can finish sooner concurrently no matter 
 DRAM bandwidth is spare. It measures compute-unit contention. The probe was deleted rather
 than left printing a confident 0.95×; the bandwidth question is answered arithmetically from
 the GB/s rows instead.
+
+
+### In-engine confirmation, `--attn dsa` (2026-07-26/27)
+
+`--attn dsa --mode hybrid --cache-policy lru --max-mem 115 -bench 48`, sole tenant, with two
+always-on buckets added to `dsa_select_layer`. Both ride joins the path already pays: the
+indexer's GPU span comes from a HIP-event pair read behind the existing `device_sync`, and
+the host clock starts *after* that sync so the GPU wait is not double-counted. Guarded to
+`--attn dsa` — under misa the head-route syncs inside the event bracket, which would fold
+host time into a GPU-timeline number.
+
+| | run A | run B |
+|---|---:|---:|
+| prompt tokens / mean nt during decode | 2432 / 2456 | 5185 / 5209 |
+| wall ms/token | **391** | **438** |
+| route (post-selection attention + host routing) | 156 | 158 |
+| moe wall (gpu) | 201 (192) | 242 (232) |
+| indexer GPU ms/tok — µs/layer | 4.1 — 194.9 | 4.6 — 218.1 |
+| indexer host ms/tok — µs/layer | 4.5 — 214.2 | 7.0 — 334.1 |
+| scoring layers/token | 21.0 | 21.0 |
+| tok/s · hit% · miss/tok · GB/tok | 2.56 · 81.4 · 111.4 · 1.71 | 2.28 · 76.9 · 138.9 · 2.13 |
+| residual (wall − route − moe − indexer) | 25.4 | 26.4 |
+
+Interpretation, and the extrapolations built on these rows, live in
+[docs/NPU.md](docs/NPU.md) "In-engine confirmation" — not repeated here. Three methodology
+points belong with the rows, though:
+
+- **`route` is flat, 156 → 158 ms, across a 2.1× context increase** — first direct evidence
+  that DSA caps the attend at `index_topk` rows. `route` is the right bucket to read across
+  runs for the reason this file already gives above: attention runs on resident weights and
+  is structurally insulated from fetch variance.
+- **The microbench under-predicts the indexer's GPU span by 27%** (1.271× and 1.264×, two
+  contexts, agreeing to 0.6%) — size solid, **mechanism unestablished**. The rig's own
+  launch-overhead measurement (5.16 µs for a four-kernel group with one sync) under-predicts
+  the ~41 µs surplus by 4–8×, so "launch bubbles" does not account for it. This is the
+  second unexplained microbench under-prediction of ~27% in this file; the earlier one
+  (route tranche, above) is a ratio of two *deltas* in which fixed per-launch overhead
+  cancels, so the two cannot share a cause and neither corroborates the other.
+- **The host round-trip is 2.0–2.2× its isolated microbench** at matched nt, so even a
+  deliberately realistic synthetic distribution understated it. A harder real distribution
+  and in-situ CPU-cache contention from the streamer moving 1.7–2.1 GB/token both fit; not
+  separated here.
+
+**A wall series across contexts is not obtainable from runs like these.** Run A's prompt is the first
+12,000 characters of run B's — wholly contained in it — so context length and prompt
+content are perfectly confounded — and reaching any longer context requires more text, so
+the confound is structural, not an artifact of this pair. The +47 ms of wall came with hit%
+81.4 → 76.9 and ms/miss 76 → 134; n = 2 cannot apportion it. Compare `route` across runs, not
+`wall`.
