@@ -66,6 +66,25 @@ void main() {
             b[k] = pc.base.v[row + 2u * j + 1u];
         }
     }
+    // `memoryBarrierBuffer()` FIRST, and it is not decoration. A bare `barrier()`
+    // compiles to `OpControlBarrier Workgroup Workgroup AcquireRelease|WorkgroupMemory`
+    // — semantics 0x108, which orders SHARED memory only. The data being protected here
+    // is `pc.base`, a buffer reference (PhysicalStorageBuffer), so the UniformMemory bit
+    // 0x40 is absent and the barrier was a pure EXECUTION barrier with respect to the
+    // very memory it exists to order.
+    //
+    // HIP's `__syncthreads()` orders both LDS and global, so the one-to-one
+    // transliteration silently dropped half of what it was porting: another entry in the
+    // same-spelling-different-semantics class, and the only one so far where the GLSL is
+    // WEAKER than the HIP rather than merely different.
+    //
+    // Two exposures, neither visible to spirv-val, GPU-AV, or this stack's sync
+    // validation (transfer-to-transfer only): the optimiser may sink a phase-1 `OpLoad`
+    // past a shared-only barrier since no dependence is declared, and on RDNA a
+    // shared-only barrier emits `s_waitcnt lgkmcnt(0)` without `vmcnt(0)`, so a VMEM load
+    // can still be in flight when another wave's store lands. It passes on today's RADV;
+    // a driver or compiler change flips it to a subtly wrong rotation, not a fault.
+    memoryBarrierBuffer();
     barrier();
 
     // Phase 2: rotate and write. v[j] and v[half+j] overlap the pairs read above, which

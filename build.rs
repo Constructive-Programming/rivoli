@@ -150,6 +150,7 @@ fn vulkan() {
             failures.extend(no_reciprocal_rewrite(&spv, &text));
             failures.extend(no_banned_builtins(&spv, &text));
             failures.extend(no_array_parameters(&spv, &text));
+            failures.extend(no_barrier_without_memory(&spv, &text));
         }
     }
     assert!(
@@ -346,6 +347,54 @@ fn no_array_parameters(spv: &str, text: &str) -> Vec<String> {
             )
         })
         .collect()
+}
+
+/// Fail the build if a shader has a barrier that orders NOTHING.
+///
+/// The twelfth rule. HIP's `__syncthreads()` orders LDS *and* global memory. GLSL's bare
+/// `barrier()` compiles to `OpControlBarrier Workgroup Workgroup
+/// AcquireRelease|WorkgroupMemory` — semantics 0x108, which orders SHARED memory only,
+/// with the UniformMemory bit 0x40 absent. So the one-to-one transliteration silently
+/// drops half of what it is porting, and this is the only member of the
+/// same-spelling-different-semantics class so far where the GLSL is WEAKER than the HIP
+/// rather than merely different.
+///
+/// `rope_interleave` shipped this way. Its barrier separates reads of `v[2j], v[2j+1]`
+/// from writes to `v[j], v[half+j]` over the SAME buffer-reference range, and carried no
+/// buffer semantics — a pure execution barrier with respect to the memory it existed to
+/// order. Nothing could see it: spirv-val is silent, GPU-AV checks addresses, and sync
+/// validation on this stack covers only transfer-to-transfer. It passed on today's RADV
+/// and a driver or compiler change turns it into a subtly wrong rotation, not a fault.
+///
+/// SIGNATURE, and it is narrow on purpose: a module that has a control barrier, has NO
+/// Workgroup-storage variables, and has NO memory barrier. With nothing in shared
+/// storage, a WorkgroupMemory-only barrier is definitionally ordering nothing, so the
+/// only thing it can have been written for is buffer traffic — and that is exactly the
+/// bug. It does NOT try to decide whether a barrier in a module that also uses shared
+/// memory needs buffer semantics; that is a dataflow question SPIR-V cannot answer
+/// cheaply, and a guess there would false-positive on correct code.
+///
+/// VERIFIED BOTH WAYS before adoption, per the lesson from rule 11: it is quiet on all
+/// four kernels with legitimate shared-memory barriers (append_kv, argmax_reduce,
+/// gemv_fp8, rmsnorm — each has Workgroup variables), and it fires on `rope_interleave`
+/// with the fix reverted.
+///
+/// Fix: `memoryBarrierBuffer(); barrier();`
+fn no_barrier_without_memory(spv: &str, text: &str) -> Vec<String> {
+    let has_barrier = text.contains("OpControlBarrier");
+    let has_shared = text.contains("OpVariable %_ptr_Workgroup");
+    let has_memory_barrier = text.contains("OpMemoryBarrier");
+    if !has_barrier || has_shared || has_memory_barrier {
+        return Vec::new();
+    }
+    vec![format!(
+        "{spv}: has a barrier that orders NOTHING\n  OpControlBarrier with \
+         WorkgroupMemory-only semantics, in a module with no Workgroup storage.\n  \
+         GLSL's bare `barrier()` orders SHARED memory only, unlike HIP's \
+         `__syncthreads()` which also orders global. If this barrier is protecting \
+         buffer traffic, write `memoryBarrierBuffer(); barrier();` — otherwise the \
+         barrier is dead and should be deleted."
+    )]
 }
 
 /// `spirv-dis` output, or `None` with a warning if the tool is absent — same optional

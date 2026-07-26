@@ -171,6 +171,35 @@ kernels and wrote three oracles: the suite went from 16 tests to 23, every one p
 and the two hardest kernels in the batch had never executed. "We added tests" is exactly
 the evidence someone would cite to argue the opposite.
 
+**A check constitutionally blind to the defect the code is exposed to.** Not an
+instrument pointed at the wrong thing, and not a guard that never runs — a check that
+runs, passes honestly, and *cannot* see a whole class of defect, where that class is
+exactly what the code is exposed to.
+
+`tests/glsl_numerics.rs` transcribes shader functions into Rust and compares against
+`math.rs` over ~1.2M values. It is strong evidence about statements. It said `e4m3f` was
+bit-exact while the shader used GLSL's `exp2` — 3 ULP allowed, no integer exemption — and
+the transcription used Rust's `f32::exp2`, which is exact. Both sides agreed perfectly
+and the only property at issue differed between them. **A transcription mirrors
+STATEMENTS, and an accuracy contract is precisely what a transcription cannot
+transcribe.** The lock would have stayed green forever.
+
+The blindness is co-located with the exposure, which is what makes it dangerous rather
+than merely incomplete: the technique is weakest on precision contracts, and precision
+contracts are the entire `inversesqrt`/`exp2` hazard class this port keeps hitting.
+
+> Ask: **what kind of defect is this check constitutionally unable to see, and is the
+> code exposed to that kind?**
+> Not "would it fire" and not "would the suite notice if I deleted it" — both of those
+> pass here. Answer it by naming the class, then checking whether the code contains one.
+
+Note the distinction from a broken tool: the lock **worked exactly as designed** — it
+fired on the edit, named the three-step check, and refused to pass until the hash was set
+deliberately, which is what forced all 256 values to be verified first. What was wrong was
+the SCOPE OF THE CLAIM being read into it. A tool doing its job while the claim built on
+it is too broad is a different failure from a tool that does not work, and the fix is to
+the claim.
+
 > Ask: **what is NOT in this suite?**
 > Answer it by enumerating what SHOULD be covered and diffing — not by reading the
 > count. `tests/kernel_coverage.rs` does this mechanically for kernels.

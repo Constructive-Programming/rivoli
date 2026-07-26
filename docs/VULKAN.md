@@ -509,6 +509,45 @@ Requirements when you do:
 - Record which backend produced each golden and on what hardware. A golden is a claim
   about a specific stack.
 
+### Every accuracy-contract builtin in the remaining kernels, decided in advance
+
+Enumerated by grepping all of `kernels/*.hip` for transcendentals BEFORE writing the
+shaders, so the token-ID gate has a written list of suspects before it runs rather than a
+mystery after it fails. Eliminate where possible; pre-register where not.
+
+| Site | Builtin | Tranche | Decision |
+|---|---|---|---|
+| `common.hpp:45` e4m3 decode | `exp2f` | shipped | **ELIMINATED** — power of two built from bits, exact by construction |
+| `linalg.hip:148` rmsnorm | `1.0f/sqrtf` | 2a | **CONSTRAINED** — must stay a divide, never `inversesqrt`. Rule 9 |
+| `indexer.hip:48` | `1.0f/sqrtf` | later | same as rmsnorm; rule 9 already covers it |
+| `linalg.hip:130` swiglu | `expf` | 2a | **PRE-REGISTERED** divergence — genuine transcendental |
+| `moe.hip:26` silu | `expf` | 2d | **PRE-REGISTERED** — same mechanism as swiglu |
+| `attn.hip:181-182` online softmax | `expf` | **2c** | **PRE-REGISTERED** — see below |
+| `attn.hip:244` split combine | `expf` + `isfinite` | **2c** | **PRE-REGISTERED**, and `isfinite` must be composed |
+
+**`exp` cannot be eliminated the way `exp2` was.** The e4m3 fix worked because the
+argument was an integer and the result an exact power of two. Softmax and SiLU evaluate
+`exp` at arbitrary runtime values, where no bit-exact construction exists — and there are
+THREE implementations in play, not two: Rust's `f32::exp` in the oracle, HIP's `expf`, and
+GLSL's `exp`. These kernels are tolerance-tested on both backends and always have been.
+Pre-registration is the honest resolution, not a concession.
+
+**2c carries three of these at once and is the hardest kernel in the port.** Meeting them
+as design decisions beats meeting them as a red oracle:
+
+- `expf(m - m_new)` and `expf(s - m_new)` in the online-softmax update, both with
+  arguments `<= 0` by construction, so results land in `(0, 1]`. Softmax is a ratio, so
+  errors partially cancel between numerator and denominator — partially, not exactly.
+- `isfinite(m_g)` at the split combine. **GLSL has no `isfinite`**; it must be composed
+  as `!isinf(x) && !isnan(x)`, and getting the polarity backwards zeroes every split
+  weight instead of guarding the empty-split case.
+- `__shfl(part, 0, SUBW)` — a broadcast whose `width` parameter partitions the wave.
+  **SPIR-V subgroup ops have no width parameter at all.** This one is currently safe
+  only because `SUBW == WAVE == 32`, so the partition is the whole wave — a coincidence
+  of a constant, not a property of the code. If `SUBW` ever differs from `WAVE`, a
+  transliteration breaks silently. Port it as an LDS broadcast, consistent with `wave_sum`
+  already being an LDS tree here.
+
 **PRE-REGISTERED: what happens if `swiglu` breaks this gate.** `swiglu` computes
 `x/(1+exp(-x))`, and `exp` is a library function whose last bits are unspecified in both
 GLSL and HIP — two correct implementations disagree. It is therefore the first suspect if
