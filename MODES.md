@@ -94,6 +94,57 @@ a pure-recency policy lets those flush the genuinely-hot ones.
 | `lru` | recency only | no | Simplest. One list, evict the least-recently-used. |
 | `2q` *(default)* | recency + a 2nd-access promotion | yes | A1in probation (one-shots age out) + Am frequent + A1out ghost. |
 | `arc` | self-tuning recency/frequency balance | yes | T1/T2 + B1/B2 ghosts + adaptive target `p`. |
+| `top-m` **(opt-in, single-format modes only)** | router rank + residency | n/a | **Changes which experts RUN, not just which are cached.** Not output-neutral. See below. |
+
+### `top-m` — cache-conditional routing (opt-in, not the default)
+
+`--cache-policy top-m`, cache-conditional MoE routing
+([arXiv:2412.00099](https://arxiv.org/abs/2412.00099)). **Every other policy answers "what
+do I evict". This one answers "given that a miss costs a 15 MB read, is the 5th-ranked
+expert that is already resident better than the 4th-ranked one that is not?"** The top-`J`
+ranked experts are always selected; the remaining `top_k − J` slots prefer experts that are
+already resident *and* ranked inside the top-`M` window; anything left falls back to plain
+rank order. Expert weights are untouched — the cache reorders *selection* only and never
+rewrites a gate value. Knobs `--route-j` (2) and `--route-m` (12).
+
+**This is the first policy whose choice is not output-neutral.** `lru`, `2q` and `arc`
+change only which bytes are read and when; the decoded tokens are identical. `top-m`
+changes which experts run, so it changes the output. That is why it is opt-in.
+
+**The measured trade** (int3-vq, 5,184 teacher-forced positions, `--max-mem 100`, at
+`--route-j 4 --route-m 9`):
+
+| | |
+|---|---|
+| hit rate | 72.25% → **77.69%** (+5.44pp) at 5.79% swap |
+| perplexity | 4.1306 → 4.1525, **+0.529%** |
+| 95% CI | **[−0.21%, +1.27%]** |
+| verdict | **UNCERTIFIED** against the ~1% bar |
+
+Read both halves of that honestly. The interval **contains zero**, so `top-m` is *not
+significantly worse* than the baseline — and it is also *not certified within budget*,
+because the upper bound of +1.27% overshoots the pre-registered ~1% bar. The point
+estimate is half the bar; the uncertainty is what fails, not the measurement. Under the
+paper's own reference band (+0.1–3.0%) it would pass comfortably.
+
+**Making it the default requires certification first.** That needs roughly **12,840
+teacher-forced tokens** (~2.5× the corpus used), about **3.4 h of sole-tenant device time**
+for a baseline plus one cell — and at the current point estimate it may *still* miss. Until
+someone buys that, `top-m` stays opt-in.
+
+**Relaxing the bar to the paper's ≤3% band was considered and DECLINED.** It would have
+passed immediately, and that is precisely the reason not to do it: the ~1% figure was fixed
+in the plan before any data existed, and moving a threshold after seeing a result that
+misses it is post-hoc reasoning. Recorded here so it is not re-proposed as an oversight.
+
+**Not available in `--mode hybrid`** — the rank-driven tier rule it would need is parked on
+an artifact precondition (see `docs/CACHE_ROUTE.md`). The engine rejects the combination
+rather than silently falling back. `top-m` is also incompatible with `--trace`, because
+substitution breaks the invariant the v2 trace format promises.
+
+**`lru`, `2q` and `arc` are byte-identical to before `top-m` existed.** The substitution
+sits behind an early return, and the residency predicate is provably never consulted when
+routing advice is absent. Choosing any of the three leaves the engine exactly as it was.
 
 ### What `hybrid` demands of a policy
 The HOT (int4) slab should hold the *frequent* experts. But **an expert's format only
