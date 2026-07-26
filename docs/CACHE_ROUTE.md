@@ -99,6 +99,29 @@ set that actually runs.
 **Single-format modes** (`int3-vq`, `int4`): uniform slot stride, residency is a
 boolean, and the behaviour is the paper exactly.
 
+> ## PARKED — the hybrid tier rule has an unmet ARTIFACT PRECONDITION
+>
+> **Precondition: an int4 that is more faithful than vq3. The current vq3-derived `.i4`
+> does not satisfy it. A group-scaled (gs64) `pack_i4` container plausibly would.**
+>
+> This is a precondition, not a TODO — it cannot be worked around in code, and no amount
+> of implementation makes the rule correct while it is unmet.
+>
+> The rule below promotes the **sacred top-J** — the experts that run *every single time
+> this layer is visited* — into int4, justified by "int4 is both more accurate and ~1.8×
+> faster". Half of that is measured false (int3-vq PPL 5.275 vs int4 9.083; see
+> `../benchmarks.md` "int4 provenance"). In this artifact `.i4` is re-derived from `.vq3`,
+> so it cannot be better than vq3 by construction.
+>
+> So the rule is not merely unjustified here — **it is precisely inverted**: it would take
+> the most important experts in the layer and put them in the least faithful format
+> available, buying compute and paying for it in quality on exactly the experts one would
+> least want to degrade. Everything below is correct *given* a faithful int4, and is
+> retained for that reason. Do not implement it against the current artifact.
+>
+> Unaffected: **single-format `top-m` (`int3-vq`, `int4`) ships independently of this.**
+> There is no promotion, no tiering and no format change anywhere in its path.
+
 **Hybrid mode: the router rank *is* the tier rule.** Today `HybridLru` promotes to the
 Hot (int4) tier on an access-frequency threshold (`hybrid.rs:150`). Under `top-m` that
 heuristic is redundant, because the router already tells us which experts matter — so

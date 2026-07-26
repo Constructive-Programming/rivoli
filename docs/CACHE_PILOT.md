@@ -1,11 +1,32 @@
 # rivoli — CACHE_PILOT: router-piloted cross-layer expert prefetch
 
-Status: **proposed, not started. Preliminary work for
-[CACHE_ROUTE.md](CACHE_ROUTE.md) (`--cache-policy top-m`) — not an independently
-justified feature.** `top-m` promotes top-M window members to int4 at an L+2 horizon,
-which requires exactly this machinery: a cross-layer prediction and a speculative
-loader. CACHE_PILOT has **no acceptance criteria of its own**; it is accepted or
-removed with `top-m`. See "Acceptance is not local" below.
+Status: **PARKED — blocked on an artifact precondition. Do not build.**
+
+There are now **two independent reasons** not to build this, and they are not the same
+reason wearing different hats.
+
+**1. It is blocked on a faithful int4 (new, and decisive on its own).** This document's
+entire purpose is to make an L+2 **int4 promotion** affordable — the prediction and the
+speculative loader exist to move an 18.9 MB int4 load off the critical path. But in the
+artifact we run, `.i4` is re-derived from `.vq3` (`bin/vq3_to_i4`), so int4 is strictly
+*less* faithful than the vq3 it came from: int3-vq PPL 5.275 against int4 9.083 on a fixed
+teacher-forced corpus (`../benchmarks.md`, "int4 provenance"). **Promotion to int4
+therefore degrades quality here, and this machinery exists to do more promotion, earlier.**
+Building it now would be an elaborate, expensive mechanism for making the model worse —
+the most costly possible way to be wrong. The precondition is an int4 more faithful than
+vq3; a group-scaled (gs64) `pack_i4` container plausibly supplies one, at which point this
+reason lifts and the design below stands as written.
+
+**2. It has no acceptance criteria of its own (pre-existing).** It is preliminary work for
+[CACHE_ROUTE.md](CACHE_ROUTE.md) (`--cache-policy top-m`) and is accepted or removed with
+it. See "Acceptance is not local" below.
+
+Note the offline screen cannot lift either reason: it saturates by construction and has no
+power over this work at all (see "Headroom" below). The one thing worth doing here before
+the precondition is met is **LOOKA** (Step 1) — its recall numbers are a durable fact about
+the model, cheap, and useful whatever happens to the loader.
+
+Unaffected: single-format `top-m` (`int3-vq`, `int4`) needs none of this machinery.
 
 Sister-project evidence: colibri's `PILOT`/`PILOT_REAL` (`c/colibri.c`), measured on
 *this node* (rh-anine).
