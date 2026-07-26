@@ -210,6 +210,82 @@ pub fn topk_into(scores: &[f32], k: usize, out: &mut Vec<usize>) {
     out.sort_by(cmp);
 }
 
+/// Host MoE routing: sigmoid the gate logits into `scores`, add the router `bias` into
+/// `choice`, and select the top-`top_k` into `sel`. A free fn over disjoint slices so
+/// the GPU engine can borrow `bias` out of `&Pin` while it mutably borrows its own
+/// routing scratch. Lives here, not in `gpu.rs`, because it is pure host math and the
+/// `None`-path regression test below has to run without the `rocm` feature.
+///
+/// `advice = Some((j, m))` switches on **cache-conditional substitution**
+/// (`--cache-policy top-m`, arXiv:2412.00099, docs/CACHE_ROUTE.md): the top-`j` ranked
+/// candidates are sacred, the remaining `top_k - j` slots prefer candidates that are
+/// already RESIDENT and ranked inside the top-`m` window, then fall back to plain rank
+/// order. `resident` is asked about expert INDICES (the caller maps them to pool keys)
+/// and must not mutate the policy — `HybridPolicy::contains` takes `&self` and does not
+/// refresh recency, where `get` would corrupt the eviction clock. `cand` is reusable
+/// scratch for the window. Returns the number of chosen slots that were NOT in the true
+/// top-`top_k`: the `swap%` numerator.
+///
+/// Weights are NOT touched: this reorders *selection* only, and the caller still builds
+/// its gate values from `scores[e]`.
+#[allow(clippy::too_many_arguments)] // disjoint scratch buffers, one call site
+pub fn route_into(
+    gate_logits: &[u8],
+    bias: &[f32],
+    top_k: usize,
+    advice: Option<(usize, usize)>,
+    resident: impl Fn(usize) -> bool,
+    scores: &mut [f32],
+    choice: &mut [f32],
+    sel: &mut Vec<usize>,
+    cand: &mut Vec<usize>,
+) -> u64 {
+    for (s, c) in gate_logits.chunks_exact(4).zip(scores.iter_mut()) {
+        *c = sigmoid(f32::from_le_bytes([s[0], s[1], s[2], s[3]]));
+    }
+    for ((c, &s), &b) in choice.iter_mut().zip(scores.iter()).zip(bias) {
+        *c = s + b;
+    }
+    topk_into(choice, top_k, sel);
+    // THE REGRESSION GUARANTEE. lru/2q/arc leave `advice` None, nothing below this line
+    // runs, and `sel`/`scores`/`choice` are bit-for-bit what they were before `top-m`
+    // existed — checked against a frozen copy of the old body in
+    // `advice_none_is_bit_identical_to_the_pre_top_m_routing`.
+    let Some((j, m)) = advice else { return 0 };
+    // Rank the window off the SAME `choice` with the SAME comparator, so its first
+    // `top_k` entries are exactly `sel`. That identity is what lets `cand[..top_k]` stand
+    // in for the true top-K when counting swaps, and it is the same invariant bin/replay
+    // hard-fails a captured trace over.
+    topk_into(choice, m.max(top_k), cand);
+    // Transcribed clamp-for-clamp from `substitute` in bin/replay.rs — the simulator that
+    // produced the offline (J, M) screen. If the engine and the simulator disagree the
+    // screen does not describe this engine, so this is a copy, not a reimplementation.
+    let (j, m) = (j.min(top_k), m.min(cand.len()));
+    // The true top-K, i.e. what `sel` held a moment ago — `cand`'s prefix IS that
+    // ranking, so the swap count below needs no second buffer.
+    let true_top = &cand[..top_k.min(cand.len())];
+    sel.clear();
+    sel.extend(cand.iter().take(j));
+    for &e in &cand[j.min(m)..m] {
+        if sel.len() == top_k {
+            break;
+        }
+        if resident(e) {
+            sel.push(e);
+        }
+    }
+    // Plain rank order for whatever residency could not fill.
+    for &e in &cand[j.min(cand.len())..] {
+        if sel.len() == top_k {
+            break;
+        }
+        if !sel.contains(&e) {
+            sel.push(e);
+        }
+    }
+    sel.iter().filter(|e| !true_top.contains(e)).count() as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,5 +422,204 @@ mod tests {
         }
         // NaN maps to the e4m3 NaN code and back to NaN.
         assert!(e4m3_to_f32(f32_to_e4m3(f32::NAN)).is_nan());
+    }
+
+    // --- top-m cache-conditional routing (docs/CACHE_ROUTE.md) -----------------------
+
+    /// Deterministic xorshift, local on purpose: `tests/kernel.rs`'s `Lcg` is another
+    /// file's helper and is under repair, and a randomized regression test must not
+    /// inherit someone else's generator bug.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        /// A logit in [-8, 8) — the router's actual range, wide enough that exact ties
+        /// are rare but not impossible (so the index-asc tiebreak still gets exercised).
+        fn logit(&mut self) -> f32 {
+            (self.next() >> 40) as f32 / 1_048_576.0 - 8.0
+        }
+    }
+
+    /// One decision's worth of inputs: `n` gate logits as LE bytes, plus a router bias.
+    fn gate_and_bias(r: &mut Rng, n: usize) -> (Vec<u8>, Vec<f32>) {
+        let mut g = Vec::with_capacity(n * 4);
+        for _ in 0..n {
+            g.extend_from_slice(&r.logit().to_le_bytes());
+        }
+        // The load-balancing bias is small next to the sigmoid it shifts.
+        (g, (0..n).map(|_| r.logit() * 0.05).collect())
+    }
+
+    /// A VERBATIM copy of `route_into` as it stood before `top-m` (HEAD 0894d14). The
+    /// test below asserts the shipped function still computes exactly this whenever
+    /// `advice` is None. Freezing the old body here — rather than asserting against
+    /// hand-written expectations — is what makes it a regression test instead of a
+    /// restatement of the new code.
+    fn route_into_pre(
+        gate_logits: &[u8],
+        bias: &[f32],
+        top_k: usize,
+        scores: &mut [f32],
+        choice: &mut [f32],
+        sel: &mut Vec<usize>,
+    ) {
+        for (s, c) in gate_logits.chunks_exact(4).zip(scores.iter_mut()) {
+            *c = sigmoid(f32::from_le_bytes([s[0], s[1], s[2], s[3]]));
+        }
+        for ((c, &s), &b) in choice.iter_mut().zip(scores.iter()).zip(bias) {
+            *c = s + b;
+        }
+        topk_into(choice, top_k, sel);
+    }
+
+    /// THE regression guarantee (docs/CACHE_ROUTE.md "Acceptance": `--cache-policy
+    /// lru|2q|arc` byte-identical to today). Property-style over many random score
+    /// vectors, and the residency predicate is `unreachable!`, so this also proves the
+    /// cache is never even CONSULTED on the None path — a predicate that touched the
+    /// policy would be a side effect no output comparison could catch.
+    #[test]
+    fn advice_none_is_bit_identical_to_the_pre_top_m_routing() {
+        const N: usize = 256;
+        let mut r = Rng(0x9E37_79B9_7F4A_7C15);
+        for top_k in [1usize, 2, 8, 16] {
+            for _ in 0..250 {
+                let (g, bias) = gate_and_bias(&mut r, N);
+                let (mut sa, mut ca, mut la) = (vec![0f32; N], vec![0f32; N], Vec::new());
+                let (mut sb, mut cb, mut lb) = (vec![0f32; N], vec![0f32; N], Vec::new());
+                let mut cand = Vec::new();
+                route_into_pre(&g, &bias, top_k, &mut sa, &mut ca, &mut la);
+                let swaps = route_into(
+                    &g,
+                    &bias,
+                    top_k,
+                    None,
+                    |_| unreachable!("residency must not be queried when advice is None"),
+                    &mut sb,
+                    &mut cb,
+                    &mut lb,
+                    &mut cand,
+                );
+                assert_eq!(swaps, 0, "the None path cannot swap anything");
+                assert_eq!(la, lb, "selection diverged at top_k={top_k}");
+                // Bit patterns, not float equality: -0.0 == 0.0, and the claim is BYTE
+                // identity, not numeric closeness.
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&sa), bits(&sb), "scores diverged at top_k={top_k}");
+                assert_eq!(bits(&ca), bits(&cb), "choice diverged at top_k={top_k}");
+                // `cand` is scratch the None path never writes; it must still be empty.
+                assert!(cand.is_empty(), "the None path touched the window scratch");
+            }
+        }
+    }
+
+    /// Drive one substituted decision and hand back `(selection, swaps)`.
+    fn sub(
+        g: &[u8],
+        bias: &[f32],
+        top_k: usize,
+        j: usize,
+        m: usize,
+        res: impl Fn(usize) -> bool,
+    ) -> (Vec<usize>, u64) {
+        let n = bias.len();
+        let (mut s, mut c) = (vec![0f32; n], vec![0f32; n]);
+        let (mut sel, mut cand) = (Vec::new(), Vec::new());
+        let swaps =
+            route_into(g, bias, top_k, Some((j, m)), res, &mut s, &mut c, &mut sel, &mut cand);
+        (sel, swaps)
+    }
+
+    /// M == top_k is a no-op whatever J is — the window IS the selection, so there is
+    /// nothing to promote. This is the invariant the offline (J, M) grid rests on: its
+    /// M=top_k column is the control that has to reproduce the baseline exactly.
+    #[test]
+    fn m_equal_to_top_k_is_a_no_op_for_every_j() {
+        const N: usize = 256;
+        const K: usize = 8;
+        let mut r = Rng(0x2545_F491_4F6C_DD1D);
+        for _ in 0..200 {
+            let (g, bias) = gate_and_bias(&mut r, N);
+            let (mut s, mut c) = (vec![0f32; N], vec![0f32; N]);
+            let (mut base, mut cand) = (Vec::new(), Vec::new());
+            route_into(&g, &bias, K, None, |_| false, &mut s, &mut c, &mut base, &mut cand);
+            for j in 0..=K + 2 {
+                // Residency is deliberately hostile: EVERY expert resident, so any
+                // eligible promotion would fire if the window were wider than top_k.
+                let (sel, swaps) = sub(&g, &bias, K, j, K, |_| true);
+                assert_eq!(sel, base, "J={j}: M=top_k must reproduce the ranking");
+                assert_eq!(swaps, 0, "J={j}: M=top_k cannot swap anything");
+            }
+        }
+    }
+
+    /// The sacred top-J always runs, and residents OUTSIDE the top-M window are never
+    /// promoted (the window bound is what stops a resident-but-irrelevant expert from
+    /// being routed to). A synthetic descending ranking makes both exact rather than
+    /// statistical.
+    #[test]
+    fn sacred_top_j_survives_and_residents_outside_the_window_do_not_promote() {
+        // Descending logits ⇒ expert e ranks e-th. Zero bias keeps the ranking readable.
+        const N: usize = 16;
+        let mut g = Vec::new();
+        for e in 0..N {
+            g.extend_from_slice(&(8.0 - e as f32).to_le_bytes());
+        }
+        let bias = vec![0f32; N];
+
+        // Nothing resident: plain rank order, and the top-J is there because it is
+        // sacred, not because it happened to be cached.
+        let (sel, swaps) = sub(&g, &bias, 4, 2, 8, |_| false);
+        assert_eq!(sel, vec![0, 1, 2, 3]);
+        assert_eq!(swaps, 0);
+
+        // Residents at ranks 6/7 are inside M=8: they take the two non-sacred slots, and
+        // the sacred prefix 0/1 survives untouched.
+        let (sel, swaps) = sub(&g, &bias, 4, 2, 8, |e| e >= 6);
+        assert_eq!(sel, vec![0, 1, 6, 7], "top-J kept, the rest swapped to residents");
+        assert_eq!(swaps, 2, "ranks 6 and 7 are outside the true top-4");
+
+        // The SAME residents at M=4 are outside the window and must not be promoted.
+        let (sel, swaps) = sub(&g, &bias, 4, 1, 4, |e| e >= 6);
+        assert_eq!(sel, vec![0, 1, 2, 3], "residents at rank 6/7 are outside M=4");
+        assert_eq!(swaps, 0);
+
+        // J=top_k pins the whole selection however the residency falls.
+        let (sel, _) = sub(&g, &bias, 4, 4, 16, |e| e >= 8);
+        assert_eq!(sel, vec![0, 1, 2, 3], "J=top_k leaves no substitutable slot");
+    }
+
+    /// Selection is always exactly `top_k` DISTINCT experts, over the whole (J, M) grid
+    /// and every residency pattern — including the degenerate M < J. A short or
+    /// duplicated selection would silently change the MoE batch size and the weight
+    /// normalization it feeds.
+    #[test]
+    fn substitution_always_yields_top_k_distinct_experts() {
+        const N: usize = 64;
+        let mut r = Rng(0xDEAD_BEEF_CAFE_F00D);
+        for _ in 0..60 {
+            let (g, bias) = gate_and_bias(&mut r, N);
+            for top_k in [1usize, 2, 8] {
+                for j in 0..=top_k + 1 {
+                    for m in [0usize, 1, top_k, top_k + 1, 12, 32, N, N * 4] {
+                        for res in 0..4u64 {
+                            let (sel, swaps) =
+                                sub(&g, &bias, top_k, j, m, |e| (e as u64) % 4 == res);
+                            assert_eq!(sel.len(), top_k, "J={j} M={m} res={res}");
+                            let uniq: std::collections::HashSet<_> = sel.iter().collect();
+                            assert_eq!(uniq.len(), top_k, "duplicate at J={j} M={m} res={res}");
+                            // A swap can only land in a non-sacred slot.
+                            assert!(
+                                swaps as usize <= top_k - j.min(top_k),
+                                "swapped a sacred slot at J={j} M={m} res={res}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

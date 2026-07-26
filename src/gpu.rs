@@ -19,7 +19,7 @@ use crate::hip::{
     launch_moe_expert_range_i4, launch_moe_reduce, launch_rmsnorm, launch_rope, launch_swiglu,
     launch_vadd,
 };
-use crate::math::{E4M3_BLOCK, sigmoid, topk_into};
+use crate::math::{E4M3_BLOCK, route_into, topk_into};
 use crate::model::ModelConfig;
 use crate::pin::{Fp8Mlp, IndexerPin, LayerMlp, MlpVq, Pin, TRACE_WINDOW};
 use crate::telemetry::ProfileSummary;
@@ -48,27 +48,6 @@ fn desc_of_vq(m: &MlpVq) -> ExpertDesc {
 }
 
 
-/// Host routing: sigmoid the gate logits into `scores`, add the router `bias` into
-/// `choice`, and select the top-`top_k` into `sel`. A free fn taking disjoint slices
-/// so the caller can borrow `bias` out of `&self.pin` while it mutably borrows its
-/// own routing scratch.
-fn route_into(
-    gate_logits: &[u8],
-    bias: &[f32],
-    top_k: usize,
-    scores: &mut [f32],
-    choice: &mut [f32],
-    sel: &mut Vec<usize>,
-) {
-    for (s, c) in gate_logits.chunks_exact(4).zip(scores.iter_mut()) {
-        *c = sigmoid(f32::from_le_bytes([s[0], s[1], s[2], s[3]]));
-    }
-    for ((c, &s), &b) in choice.iter_mut().zip(scores.iter()).zip(bias) {
-        *c = s + b;
-    }
-    topk_into(choice, top_k, sel);
-}
-
 /// Per-token time buckets. ALWAYS ON: every bucket wraps a join/D2H the forward
 /// pass already pays (the end-of-layer sync, the gate-logits read, the stream
 /// drain), so accumulating them costs only a clock read per layer — no extra GPU
@@ -77,8 +56,11 @@ fn route_into(
 /// correctness probes live behind the `trace` feature instead.
 #[derive(Default)]
 struct Profile {
-    fetch_n: u64,         // demand misses
-    route_ns: u128,       // host routing (gate D2H + sigmoid/bias/top-k)
+    fetch_n: u64, // demand misses
+    /// `top-m` only: chosen slots that were NOT in the true top-K. Stays 0 under every
+    /// other policy, which is why the summary reports it as an Option rather than a 0%.
+    swap_n: u64,
+    route_ns: u128, // host routing (gate D2H + sigmoid/bias/top-k, + top-m substitution)
     moe_wall_ns: u128,    // the block_on wall of the overlapped MoE phase (CPU wall)
     compute_gpu_ns: u128, // HIP-event span of the compute stream (partials + reduce)
     wall_ns: u128,
@@ -90,6 +72,7 @@ impl Profile {
     /// `fetch_wall_ns` is the reaper's off-thread load cost; `idle_ns`/`poll_ns` are
     /// the expert stream's tokio-metrics (load-wait / launch) — the accurate
     /// decomposition the async overlap hides from wall-clock.
+    #[allow(clippy::too_many_arguments)] // one call site; the buckets are unrelated scalars
     fn summary(
         &self,
         hits: u64,
@@ -98,6 +81,7 @@ impl Profile {
         fetch_wall_ns: u64,
         idle_ns: u64,
         poll_ns: u64,
+        advice: Option<(usize, usize)>,
     ) -> ProfileSummary {
         let tok = self.tokens.max(1) as f64;
         let per = |ns: u128| ns as f64 / 1e6 / tok; // ms/token
@@ -126,6 +110,11 @@ impl Profile {
             miss_per_tok: self.fetch_n as f64 / tok,
             ms_per_miss: fetch_wall_ns as f64 / 1e6 / self.fetch_n.max(1) as f64,
             gb_per_tok: self.fetch_n as f64 / tok * bytes_per_expert as f64 / 1e9,
+            // `hits + misses` IS the chosen-slot count (submit_layer looks each one up
+            // exactly once), so it is the same denominator hit% already uses. Reported
+            // only under `top-m` — a 0.0% next to lru would read as a measurement.
+            swap_pct: advice
+                .map(|_| 100.0 * self.swap_n as f64 / (hits + misses).max(1) as f64),
         }
     }
 }
@@ -219,6 +208,13 @@ pub struct GpuEngine<'a> {
     /// `--trace` is on, and `--trace` is fixed for the run, so this is either filled
     /// every layer or never.
     window: Vec<usize>,
+    /// `top-m` only: the ranked top-M candidate window [`route_into`] substitutes over.
+    /// Stays empty under every other policy (the advice-`None` early return never
+    /// writes it).
+    cand: Vec<usize>,
+    /// The policy's routing advice, read ONCE — the policy is fixed for the run, and
+    /// `None` must stay a plain early return on the per-layer routing path.
+    route_advice: Option<(usize, usize)>,
     // Per-token host build scratch — reused every layer so the hot path allocates
     // nothing: resolved VQ descriptors + weights, the resolved batch, D2H staging.
     w: Vec<f32>,
@@ -358,6 +354,8 @@ impl<'a> GpuEngine<'a> {
             choice: vec![0.0; cfg.n_experts],
             sel: Vec::with_capacity(cfg.top_k),
             window: Vec::new(), // grown once by the first traced layer; empty otherwise
+            cand: Vec::new(),   // ditto, for the first substituted layer
+            route_advice: pin.route_advice(),
             w: Vec::with_capacity(slots),
             codebooks: pin.codebooks(),
             mlps_vq: Vec::with_capacity(cfg.top_k),
@@ -799,13 +797,22 @@ impl<'a> GpuEngine<'a> {
                 // Read the gate logits, route with `bias` borrowed straight out of
                 // `&self.pin` while the routing scratch is borrowed mutably.
                 self.gate_logits.copy_out_into(&mut self.gl_host)?;
-                route_into(
+                // `--cache-policy top-m` (advice Some) makes this cache-CONDITIONAL:
+                // residency reorders the selection below the sacred top-J. Every other
+                // policy leaves the advice None and gets the pre-top-m routing back
+                // bit-for-bit. Residency is read through `Pin::resident` →
+                // `HybridPolicy::contains`, which does not touch the eviction clock;
+                // the substitution is inside the `route_ns` clock because it IS routing.
+                self.prof.swap_n += route_into(
                     &self.gl_host,
                     self.pin.moe_bias(l),
                     cfg.top_k,
+                    self.route_advice,
+                    |e| self.pin.resident(l, e),
                     &mut self.scores,
                     &mut self.choice,
                     &mut self.sel,
+                    &mut self.cand,
                 );
                 self.prof.route_ns += t.elapsed().as_nanos();
                 // Trace v2 only: re-rank the same `choice` array to the wider candidate
@@ -1101,6 +1108,7 @@ impl<'a> GpuEngine<'a> {
             self.pin.fetch_ns(),
             tm.total_idle_duration.as_nanos() as u64,
             tm.total_poll_duration.as_nanos() as u64,
+            self.route_advice,
         );
         summary.report();
         Ok((generated, summary))

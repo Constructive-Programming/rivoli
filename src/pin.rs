@@ -512,6 +512,7 @@ impl<'a> Pin<'a> {
         trace_path: Option<&str>,
         cache_policy: &str,
         two_q: cache::TwoQSplit,
+        route: crate::hybrid::RouteAdvice,
         want_indexer: bool,
         mode: Mode,
     ) -> Result<Self> {
@@ -717,8 +718,11 @@ impl<'a> Pin<'a> {
             Mode::Hybrid => (vq_tier()?, i4_tier()?),
         };
         let (cold_stride, hot_stride) = (cold.stride, hot.stride);
-        let policy = crate::hybrid::make(cache_policy, budget, cold_stride, hot_stride, two_q)
-            .with_context(|| format!("unknown --cache-policy {cache_policy} (lru|2q|arc)"))?;
+        let policy =
+            crate::hybrid::make(cache_policy, budget, cold_stride, hot_stride, two_q, route)
+                .with_context(|| {
+                    format!("unknown --cache-policy {cache_policy} (lru|2q|arc|top-m)")
+                })?;
         tracing::info!(
             "routed pool [{cache_policy} {mode}]: {:.1} GiB budget (~{} slots, cold {cold_stride}B / hot {hot_stride}B)",
             budget as f64 / (1u64 << 30) as f64,
@@ -805,6 +809,23 @@ impl<'a> Pin<'a> {
     /// so a non-tracing decode pays literally nothing for trace v2.
     pub fn tracing(&self) -> bool {
         self.trace.is_some()
+    }
+
+    /// The active policy's routing advice — `Some((j, m))` only under `--cache-policy
+    /// top-m`. gpu.rs reads this ONCE at engine construction: the policy is fixed for
+    /// the run, and `None` has to stay a compile-time-cheap early return on the hot
+    /// routing path.
+    pub fn route_advice(&self) -> Option<(usize, usize)> {
+        self.routed.policy.route_advice()
+    }
+
+    /// Is `(layer, expert)` resident? Deliberately routed through
+    /// [`HybridPolicy::contains`], which takes `&self` and does NOT refresh recency —
+    /// `get` would count the whole candidate window as an access and corrupt the
+    /// eviction clock, which is the failure mode that would make `top-m` look like it
+    /// works while destroying the cache underneath it.
+    pub fn resident(&self, layer: usize, expert: usize) -> bool {
+        self.routed.policy.contains(expert_key(layer, expert))
     }
 
     /// Flush the trace sink. Called per token, because the trace CANNOT rely on

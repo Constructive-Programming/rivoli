@@ -10,8 +10,10 @@ use anyhow::{Context, Result, bail};
 use rivoli::config::Config;
 use tracing::info;
 
-/// CLI: `rivoli <model-dir> [-bench <tokens>] [flags]`. `--cache-policy lru|2q|arc`
-/// (default 2q) picks the eviction policy; `--direct-vmm-dma` forces raw DMA over the
+/// CLI: `rivoli <model-dir> [-bench <tokens>] [flags]`. `--cache-policy lru|2q|arc|top-m`
+/// (default 2q) picks the cache policy — `top-m` additionally routes toward resident
+/// experts (`--route-j`/`--route-m`, docs/CACHE_ROUTE.md), which is the one policy that
+/// changes the model's output; `--direct-vmm-dma` forces raw DMA over the
 /// default pinned-host bounce; `--trace <path>` dumps the routed-expert access trace
 /// (v2: demand keys plus the ranked candidate window) for the offline `replay` sim;
 /// `--prompt <text>` overrides the bench prompt;
@@ -26,6 +28,8 @@ struct Args {
     cache_policy: String,
     two_q_kin: u32,
     two_q_kout: u32,
+    /// `--cache-policy top-m`'s (J, M); ignored by every other policy.
+    route: rivoli::hybrid::RouteAdvice,
     max_mem: Option<u64>,
     /// Routed-expert format (`--mode int3-vq|int4|hybrid`, default hybrid).
     mode: rivoli::config::Mode,
@@ -43,8 +47,8 @@ struct Args {
 fn parse_args() -> Result<Args> {
     const USAGE: &str = "usage: rivoli <model-dir> [-bench <tokens>] \
          [--mode int3-vq|int4|hybrid] [--direct-vmm-dma] \
-         [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc] [--2q-kin <pct>] \
-         [--2q-kout <pct>] [--max-mem <GiB>] \
+         [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc|top-m] [--2q-kin <pct>] \
+         [--2q-kout <pct>] [--route-j <n>] [--route-m <n>] [--max-mem <GiB>] \
          [--attn auto|dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>]";
     let mut model = None;
     let mut a = Args {
@@ -56,6 +60,7 @@ fn parse_args() -> Result<Args> {
         cache_policy: "2q".to_string(),
         two_q_kin: rivoli::cache::TwoQSplit::default().kin_pct(),
         two_q_kout: rivoli::cache::TwoQSplit::default().kout_pct(),
+        route: rivoli::hybrid::RouteAdvice::default(),
         max_mem: None,
         mode: rivoli::config::Mode::default(),
         attn: "auto".to_string(),
@@ -81,7 +86,23 @@ fn parse_args() -> Result<Args> {
             "--trace" => a.trace = Some(args.next().context("--trace requires a path")?),
             "--prompt" => a.prompt = Some(args.next().context("--prompt requires text")?),
             "--cache-policy" => {
-                a.cache_policy = args.next().context("--cache-policy requires lru|2q|arc")?;
+                a.cache_policy = args
+                    .next()
+                    .context("--cache-policy requires lru|2q|arc|top-m")?;
+            }
+            "--route-j" => {
+                a.route.j = args
+                    .next()
+                    .context("--route-j requires an integer")?
+                    .parse()
+                    .context("--route-j takes an integer")?;
+            }
+            "--route-m" => {
+                a.route.m = args
+                    .next()
+                    .context("--route-m requires an integer")?
+                    .parse()
+                    .context("--route-m takes an integer")?;
             }
             "--2q-kin" => {
                 a.two_q_kin = args
@@ -193,6 +214,7 @@ fn main() -> Result<()> {
         a.prompt,
         a.cache_policy,
         rivoli::cache::TwoQSplit::new(a.two_q_kin, a.two_q_kout)?,
+        a.route,
         a.max_mem,
         attn,
     )?;
@@ -201,6 +223,8 @@ fn main() -> Result<()> {
         cfg.checksum_x = checksum_x;
     }
     cfg.mode = a.mode;
+    // Mode-dependent, so it cannot live in `discover` — see Config::validate.
+    cfg.validate()?;
 
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -298,6 +322,7 @@ fn main() -> Result<()> {
             cfg.trace.as_deref(),
             &cfg.cache_policy,
             cfg.two_q,
+            cfg.route,
             want_indexer,
             cfg.mode,
         )?;

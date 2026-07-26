@@ -223,8 +223,11 @@ fn replay(
 ) -> Result<Counts> {
     // Unit strides: budget `cap` bytes == `cap` slots, cold==hot so the split is by
     // slot count exactly as the single-format engine sees it.
+    // RouteAdvice::default() is inert here: substitution is `sub` below, applied by this
+    // simulator, never by the policy — `replay --policy top-m` is therefore just `lru`.
     let mut p: Box<dyn HybridPolicy> =
-        hybrid::make(policy, cap, 1, 1, split).with_context(|| format!("unknown policy {policy}"))?;
+        hybrid::make(policy, cap, 1, 1, split, hybrid::RouteAdvice::default())
+            .with_context(|| format!("unknown policy {policy}"))?;
     let mut c = Counts::default();
     let mut miss: Vec<u32> = Vec::new();
     let mut chosen: Vec<u32> = Vec::new();
@@ -369,6 +372,34 @@ fn main() -> Result<()> {
     for pol in ["lru", "2q", "arc"] {
         println!("{pol:<10} {:>7.2}%", pct(replay(pol, cap, split, &trace, None, None)?));
     }
+    // Residency curve, ALWAYS printed. Two jobs, both learned the hard way.
+    //
+    // 1. It shows how steeply hit rate depends on capacity. Reading a single cap invites
+    //    the assumption that the curve is flat there — that slots are not the binding
+    //    constraint — and on this workload that assumption is badly wrong (+23% slots is
+    //    worth ~6pp). It also converts a policy's pp gain into "how many slots would buy
+    //    the same", which is the currency the engine actually thinks in.
+    // 2. It makes CROSS-MODE comparison honest. Every mode decodes its own trajectory, so
+    //    the traces are different workloads and each mode's own slot count is a different
+    //    capacity — comparing two modes at their native caps conflates the two effects
+    //    and silently attributes one to the other. Compare at a shared cap, from here.
+    println!("\nresidency curve (lru) — hit% vs capacity, for reading any single cap in context");
+    print!("{:<10}", "slots");
+    let curve: Vec<usize> = [cap / 2, cap * 3 / 4, cap, cap * 3 / 2, cap * 2]
+        .into_iter()
+        .filter(|&c| c > 0)
+        .collect();
+    for c in &curve {
+        print!("{c:>10}");
+    }
+    print!("\n{:<10}", "hit%");
+    for &c in &curve {
+        print!("{:>9.2}%", pct(replay("lru", c, split, &trace, None, None)?));
+    }
+    println!(
+        "\n(cross-mode readings MUST use the same slot count — each mode's native capacity\n\
+         differs AND its trace is a different workload, so native-cap comparisons conflate them.)"
+    );
     if split != default {
         println!("\n(2q ran with kin {kin}% / kout {kout}%)");
     }
