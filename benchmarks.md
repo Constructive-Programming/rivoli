@@ -8,143 +8,109 @@ AMD Strix Halo gfx1151. Matrix: `--mode {int3-vq,int4,hybrid}` × `--cache-polic
 (*"Explain, step by step, how a transformer neural network processes a sentence."*),
 `--attn dense`, `--max-mem 115`. Only `--mode` and `--cache-policy` vary.
 Binary: release + `--features rocm`. GPU sole-tenant (k3s stopped).
+`.i4` experts are the **vq3-derived** set (`vq3_to_i4`); see "int4 provenance" below.
 
-## Results
+## Results — all coherent, no crashes
 
-Degenerate output (greedy collapse into repetition) is treated as a **severe bug and
-a FAIL**, not a data point — a degenerate run routes to the same few experts, which
-*inflates* hit% and tok/s, so the broken run looks fastest. Runs are gated on output
-quality (distinct-token ratio of the completion) *before* their speed counts.
+Output quality is gated first (degenerate greedy output = a severe bug, disqualified
+from ranking) via the distinct-token ratio of the completion. Every cell passed.
 
-| mode | policy | tok/s | hit % | output | verdict |
-|---|---|---:|---:|---|---|
-| int3-vq | lru | 2.67 | 78.0 | coherent (distinct 0.74) | ✅ ok |
-| int3-vq | 2q  | 2.68 | 77.9 | coherent (distinct 0.74) | ✅ ok |
-| int3-vq | arc | — | — | — | ❌ **CRASH** |
-| int4 | lru | ~~3.50~~ | ~~91.9~~ | **degenerate (distinct 0.04)** | ❌ **BUG** |
-| int4 | 2q  | ~~3.28~~ | ~~91.2~~ | **degenerate (distinct 0.04)** | ❌ **BUG** |
-| int4 | arc | — | — | — | ❌ **CRASH** |
-| hybrid | lru | 2.89 | 83.0 | coherent (distinct 0.57) | ✅ ok |
-| hybrid | 2q  | 2.55 | 80.7 | coherent (distinct 0.60) | ✅ ok |
-| hybrid | arc | — | — | — | ❌ **CRASH** |
+| mode | policy | tok/s | hit % | distinct | output |
+|---|---|---:|---:|---:|---|
+| int3-vq | lru | 2.76 | 78.0 | 0.74 | ✅ coherent |
+| int3-vq | 2q  | 2.77 | 77.9 | 0.74 | ✅ coherent |
+| int3-vq | arc | 2.77 | 77.9 | 0.74 | ✅ coherent |
+| int4 | lru | 2.28 | 75.9 | 0.62 | ✅ coherent |
+| int4 | 2q  | 2.39 | 76.3 | 0.62 | ✅ coherent |
+| int4 | arc | 2.29 | 76.0 | 0.62 | ✅ coherent |
+| hybrid | lru | **2.85** | 80.6 | 0.66 | ✅ coherent |
+| hybrid | 2q  | 2.66 | 76.7 | 0.65 | ✅ coherent |
+| hybrid | arc | 2.51 | 75.7 | 0.58 | ✅ coherent |
 
-**5 of 9 runs fail** *as originally run.* int4's struck-through tok/s are *disqualified*
-— they are the degeneration artifact, not real throughput. **int4's degeneration was
-later root-caused to the colibri `.i4` source and FIXED** (see BUG 1); with vq3-derived
-`.i4`, `--mode int4` decodes coherently. `arc` still crashes (BUG 2, open).
+**9/9 pass.** (An earlier run of this matrix had 5/9 failures — int4 degenerated and
+arc crashed; both are now fixed, see "Bugs found and fixed" below.)
 
-### Valid runs only — ranked
+### Ranked (all coherent)
 
-Among the runs that produced coherent output, best first:
+1. **hybrid / lru — 2.85 tok/s** (80.6% hit) — the fastest coherent config.
+2. int3-vq / 2q · arc — 2.77
+3. int3-vq / lru — 2.76
+4. hybrid / 2q — 2.66
+5. hybrid / arc — 2.51
+6. int4 / 2q — 2.39
+7. int4 / arc — 2.29
+8. int4 / lru — 2.28
 
-| # | mode | policy | tok/s | hit % |
-|---|---|---|---:|---:|
-| 1 | hybrid | lru | **2.89** | 83.0 |
-| 2 | int3-vq | 2q | 2.68 | 77.9 |
-| 3 | int3-vq | lru | 2.67 | 78.0 |
-| 4 | hybrid | 2q | 2.55 | 80.7 |
+**hybrid+lru wins** — the byte-arena packs the highest effective residency (80.6% hit,
+fewest misses/tok), and its hot experts run int4's faster compute. **int3-vq is
+policy-insensitive** (2.76–2.77 across all three). **all-int4 is the slowest** despite
+faster per-expert compute: its 18.9 MB experts (vs vq3's 15.3 MB) fit fewer pool slots →
+more misses → more fetch + more MoE work. `hybrid+arc` (2.51) trails `hybrid+lru` — arc's
+adaptive split holds a smaller working set here.
 
-`hybrid + lru` is the only coherent config that clears int3-vq — it keeps the frequent
-experts in int4 (faster compute) while streaming the rest as accurate int3-vq, and the
-byte-arena fits ~6902 slots vs all-int4's 5596. Note `hybrid + 2q` is *slower* than
-int3-vq here; among coherent runs the policy interaction is small and inside run-to-run
-routing noise. Do not read fine tok/s differences as decisive (see caveat).
-
-### Per-token profile (valid runs, ms/tok)
+### Per-token profile (ms/tok)
 
 | mode/policy | wall | route | moe (gpu) | fetch (hidden) | miss/tok | GB/tok |
 |---|---:|---:|---:|---:|---:|---:|
-| int3-vq / lru | 375 | 115 | 242 (233) | 188 (95%) | 131.9 | 2.02 |
-| int3-vq / 2q  | 373 | 114 | 237 (228) | 186 (95%) | 132.7 | 2.04 |
-| hybrid / lru  | 346 | 114 | 215 (206) | 152 (94%) | 101.9 | 1.56 |
-| hybrid / 2q   | 392 | 115 | 254 (244) | 192 (95%) | 115.6 | 1.77 |
+| int3-vq / lru | 363 | 114 | 232 (223) | 177 (95%) | 131.9 | 2.02 |
+| int3-vq / 2q  | 361 | 115 | 226 (217) | 175 (95%) | 132.7 | 2.04 |
+| int3-vq / arc | 361 | 115 | 226 (217) | 174 (95%) | 132.4 | 2.03 |
+| int4 / lru | 439 | 109 | 310 (301) | 255 (96%) | 144.5 | 2.22 |
+| int4 / 2q  | 419 | 110 | 285 (277) | 243 (97%) | 142.4 | 2.18 |
+| int4 / arc | 437 | 110 | 305 (296) | 256 (97%) | 144.2 | 2.21 |
+| hybrid / lru | 351 | 115 | 220 (210) | 159 (94%) | 116.2 | 1.78 |
+| hybrid / 2q  | 375 | 115 | 242 (233) | 194 (95%) | 139.7 | 2.14 |
+| hybrid / arc | 398 | 116 | 262 (253) | 218 (96%) | 145.8 | 2.24 |
 
-Fetch is ~95% hidden behind compute in every valid run — the engine is compute-bound
-(route + moe-gpu), not fetch-bound, at this budget. hybrid/lru's edge is fewer
-misses/tok (101.9 vs ~132) → less exposed fetch and less MoE work.
-
----
-
-## Severe bugs found
-
-### BUG 1 — `int4` mode degenerates (all-experts int4)
-
-`--mode int4` collapses into verbatim repetition within the 512 tokens:
-
-> *"# The following is a simple example of how to use the neural network to process a
-> sentence and how to use it to train them # The following is a simple example of how
-> to use the neural network to process a sentence…"* (repeats to EOS)
-
-distinct-token ratio **0.04** (vs ~0.74 for the coherent int3-vq baseline on the
-identical prompt). Reproduces under both `lru` and `2q`, so it is **not** policy-related.
-
-**Root cause: the `.i4` experts were sourced from the wrong checkpoint.** The int4
-compute path is bit-correct (GPU kernel matches CPU `matvec_i4` on real bytes to cosine
-1.0000 — test `moe_i4_real_data_matches_cpu`; no blowup/NaN in a residual-norm trace).
-The defect is the *data*: `.i4` was built by `pack_i4` copying **colibri's** int4, which
-is a different/worse quantization of the experts than the **vq3** the rest of the model
-(attention, router, embed) comes from. Reconstructing actual weight rows and regressing
-proved it:
-
-| int4 source | fidelity vs vq3 (R) | per-row scale |
-|---|---|---|
-| colibri (`pack_i4`) | **0.96** | 5–9% inflated |
-| vq3 self-requant (`quant_i4` of the faithful weights) | **0.98** | matches `amax/7` |
-
-colibri's experts are ~4% off the vq3 experts the glm52-fp8 router was routing for;
-running that mismatch under greedy decode compounds into repetition collapse. (cosine
-alone hid it — cosine is scale-blind; the regression + self-requant exposed it.)
-
-**Fix — `bin/vq3_to_i4`: re-derive `.i4` from our faithful `.vq3` weights** (decode each
-expert to f32, re-quantize with `quant_i4`), replacing colibri as the `.i4` source.
-After regenerating the artifact's `.i4`, `--mode int4` decodes **coherently**:
-
-> *"…Use the sentence 'The cat sat on the mat' as an example. We need to explain, step
-> by step, how a transformer neural network processes a sentence…"*
-
-hit rate 73% (coherent-level, vs the degenerate 92%), no repetition. `pack_i4` is now
-deprecated as the `.i4` source. `--mode int4` is un-gated (it works). Hybrid benefits
-too — its int4 hot experts are now the self-consistent vq3-derived set.
-
-**Hybrid was never broken (a 24-token probe misled me).** Over a warm 128-token run,
-hybrid's int4 share of routed launches climbs as the pool fills (11%→17%+), i.e. it
-*does* promote hot experts into the int4 tier; the ~6900-slot pool just needs ~60 tokens
-to fill before anything cycles through the 2Q ghost to promote.
-
-### BUG 2 — `--cache-policy arc` crashes in every mode
-
-```
-Error: expert not resident after alloc (batch exceeds pool — raise --max-mem)
-```
-
-(`pin.rs:836`) — after a batch's misses are admitted+placed, some batch key is not
-resident. It is **not** a real capacity problem: the pool built fine (~5596–6900 slots)
-and a per-layer batch is only ~9 experts; `lru` and `2q` handle the identical budget
-without issue.
-
-`HybridArc` (`src/hybrid.rs`) is the only policy that fails, and its `Spec` unit test
-passes — but that test models single-tier byte accounting, **not** the two-ended arena
-(cold packs from the low end, hot from the high end, split floats, cross-tier grow
-compacts). So the bug is in the arc↔arena interaction the unit test doesn't cover:
-arc's `evict_until_fits` frees enough *total* bytes but its `protect`-is-a-no-op +
-`p`-driven tier choice can leave a batch slot unplaceable in the arena (wrong-end holes
-compaction can't resolve, or a just-admitted/hit slot evicted within the batch).
-`lru`/`2q` don't hit it because their eviction stays within the entered segment.
-
-**Fix direction:** make `HybridArc` respect the same per-batch protection `2q` uses
-(don't evict keys touched this batch) and evict from the tier whose arena end actually
-needs to shrink; add an arena-backed replay/unit test so the invariant is covered off-GPU.
+Fetch is ~95% hidden behind compute everywhere — the engine is compute-bound (route +
+moe-gpu), not fetch-bound, at this budget. hybrid/lru's edge is the fewest misses/tok
+(116 vs ~132–145) → lowest fetch and lowest MoE wall.
 
 ---
 
-## Measurement caveat (why the gates matter)
+## Bugs found and fixed
 
-Free-running greedy `tok/s` **cannot** rank modes on its own — this run is the proof:
-`int4` posted the highest tok/s (3.50) and highest hit% (91.9%) purely *because* it
-degenerated. Always gate on output quality first, then compare speed among survivors.
-For a trustworthy speed number use a fixed forced-token bench; for residency use
-`replay <trace> <n_slots> [--sweep]`; for pure per-format compute use
-`examples/dot_bench.rs`. See [MODES.md](MODES.md).
+### int4 degeneration — WRONG `.i4` SOURCE (fixed)
 
-*Generated 2026-07-25. Reproduce: `--mode <m> --cache-policy <p> -bench 512 --attn dense
+`--mode int4` used to collapse into repetition from token 0 (distinct-token ratio 0.04).
+The int4 compute path is bit-correct (GPU kernel matches CPU `matvec_i4` on real bytes to
+cosine 1.0000 — test `moe_i4_real_data_matches_cpu`; no blowup/NaN). The defect was the
+*data*: `.i4` was built by `pack_i4` copying **colibri's** int4, a different/worse
+quantization of the experts than the **vq3** the rest of the model uses — reconstructing
+weight rows and regressing showed colibri int4 at R≈0.96 vs vq3 (per-row scales 5–9%
+inflated) vs a vq3 self-requant at R≈0.98. The mismatched experts, run under the
+glm52-fp8 router, compound into greedy collapse. (cosine hid it — cosine is scale-blind.)
+Fix: `bin/vq3_to_i4` re-derives `.i4` from the faithful `.vq3` weights; `pack_i4` is
+deprecated as the `.i4` source. int4 now decodes coherently (rows above).
+
+### `arc` crash — batch-eviction (fixed)
+
+`--cache-policy arc` used to crash (`expert not resident after alloc`, `pin.rs`) — and so
+did int4/lru at 512 tokens. General bug in all three policies: `submit_layer` protects
+each hit then admits each miss, but a miss's eviction could reclaim a key touched earlier
+in the *same* batch (a prior hit or admitted miss), which the pin then can't resolve. arc
+triggered it readily (adaptive `p` drives one tier small enough for a 9-expert batch to
+drain past its MRU end); int4/lru hit it via eviction pressure (bigger experts → fewer
+slots). Fix: each policy keeps a per-batch `pinned` set (`begin_batch` clears it, protect
++ admit add to it); `OrderedSet::{peek,pop}_lru_skip` skip pinned keys during eviction.
+All three arc cells and int4/lru now run clean (above).
+
+### int4 provenance (in progress)
+
+These int4/hybrid numbers use `.i4` re-derived from **vq3** (itself a lossy 3-bit
+quantization). The higher-fidelity source is the original **GLM-5.2-FP8** checkpoint;
+`fp8_to_i4` (deriving `.i4` straight from fp8 via `quant_i4`) is pending a re-download of
+that checkpoint, after which int4/hybrid will be re-benched against this baseline.
+
+---
+
+## Measurement caveat
+
+Free-running greedy `tok/s` cannot rank modes on its own: a degenerate run routes to the
+same few experts → inflated hit% → artificially *fast* (the earlier int4 rows posted the
+highest tok/s *because* they degenerated). Always gate on output quality first, then
+compare speed among survivors. For residency use `replay <trace> <n_slots> [--sweep]`; for
+pure per-format compute use `examples/dot_bench.rs`. See [MODES.md](MODES.md).
+
+*Generated 2026-07-26. Reproduce: `--mode <m> --cache-policy <p> -bench 512 --attn dense
 --max-mem 115 --prompt "<above>"`.*
