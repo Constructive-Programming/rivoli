@@ -10,6 +10,9 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
+    if std::env::var("CARGO_FEATURE_VULKAN").is_ok() {
+        return vulkan(); // second backend: glslc instead of hipcc, no HIP at all.
+    }
     if std::env::var("CARGO_FEATURE_ROCM").is_err() {
         return; // CPU-only build: no HIP toolchain required.
     }
@@ -63,4 +66,38 @@ fn main() {
         }
     }
     println!("cargo:rustc-link-lib=dylib=amdhip64");
+}
+
+/// The `vulkan` arm: compile every `kernels/vk/*.comp` to SPIR-V in OUT_DIR, which
+/// `src/vk.rs` picks up with `include_bytes!`. Nothing is linked — the loader is
+/// opened at runtime by `ash`, so a Vulkan build needs no GPU library at link time.
+fn vulkan() {
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR set by cargo");
+    let glslc = std::env::var("GLSLC").unwrap_or_else(|_| "glslc".into());
+    println!("cargo:rerun-if-env-changed=GLSLC");
+    // The DIRECTORY entry catches an added/removed shader; the per-file entries below
+    // catch edits. Both are needed — and `common.glsl` is #included, not compiled, so
+    // without its own entry an edit to it silently ships stale SPIR-V (exactly the
+    // common.hpp staleness bug this repo already hit once).
+    println!("cargo:rerun-if-changed=kernels/vk");
+
+    let mut shaders: Vec<_> = std::fs::read_dir("kernels/vk")
+        .expect("read kernels/vk")
+        .map(|e| e.expect("dir entry").path())
+        .collect();
+    shaders.sort(); // deterministic build order
+    for path in &shaders {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    for src in shaders.iter().filter(|p| p.extension().is_some_and(|e| e == "comp")) {
+        let stem = src.file_stem().expect("shader stem").to_string_lossy();
+        let spv = format!("{out_dir}/{stem}.spv");
+        let status = Command::new(&glslc)
+            .args(["--target-env=vulkan1.3", "-O", "-Ikernels/vk"])
+            .arg(src)
+            .args(["-o", &spv])
+            .status()
+            .expect("run glslc");
+        assert!(status.success(), "glslc failed on {}", src.display());
+    }
 }
