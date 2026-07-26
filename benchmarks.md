@@ -235,9 +235,22 @@ baseline, one process per cell. This is the run that decided the feature.
 
 Baseline (lru): **PPL 4.130637**, hit 72.25%.
 
-| cell | PPL | dPPL% | mean dNLL | SE | 95% CI (nats) | worse% | hit% | swap% | verdict |
-|---|---:|---:|---:|---:|---|---:|---:|---:|---|
-| J=4/M=9 | 4.15252 | **+0.529%** | +0.00528 | 0.00375 | [−0.00207, +0.01263] | 52.3% | **77.69%** | 5.79% | **UNCERTIFIED** |
+| cell | PPL | dPPL% | mean dNLL | sd | SE | 95% CI (nats) | worse% | hit% | swap% | verdict |
+|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---|
+| J=4/M=9 | 4.15252 | **+0.529%** | +0.00528 | 0.2700 | 0.00375 | [−0.00207, +0.01263] | 52.3% | **77.69%** (+5.44pp) | 5.79% | **INCONCLUSIVE** — interval contains zero |
+| J=4/M=10 | 4.16786 | +0.901% | +0.00897 | 0.3011 | 0.00418 | [+0.00077, +0.01717] | 54.3% | 81.47% (+9.22pp) | 9.80% | **COST ESTABLISHED, MAGNITUDE UNRESOLVED** |
+
+**J=4/M=9 is what ships**, and its verdict is INCONCLUSIVE rather than "small cost
+confirmed": the interval contains zero, so no cost is established at all, and it is equally
+not certified within the bar. **J=4/M=10 is not ship-able** — its lower bound clears zero,
+so its cost *is* real, and buying more text would refine that number without changing the
+decision. Note J=4/M=10's point estimate (+0.901%) sits under the bar; it is excluded on
+the upper bound and on the established-cost finding, not on the headline.
+
+**The knob defaults are J=4/M=9, not the paper's J=2/M=12.** That matters because `top-m`
+ships opt-in: a user who enables the policy without passing knobs would otherwise have
+received the one configuration this program rejected (+3.63% on int3-vq, outright FAIL on
+int4). The paper's values remain reachable explicitly.
 
 **Shipped opt-in, not as the default.** The interval **contains zero**, so `top-m` is not
 significantly worse than baseline; its upper bound of +1.27% overshoots the pre-registered

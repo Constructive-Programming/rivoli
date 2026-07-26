@@ -105,7 +105,8 @@ expert that is already resident better than the 4th-ranked one that is not?"** T
 ranked experts are always selected; the remaining `top_k − J` slots prefer experts that are
 already resident *and* ranked inside the top-`M` window; anything left falls back to plain
 rank order. Expert weights are untouched — the cache reorders *selection* only and never
-rewrites a gate value. Knobs `--route-j` (2) and `--route-m` (12).
+rewrites a gate value. Knobs `--route-j` (**4**) and `--route-m` (**9**) — the measured
+cell, NOT the paper's J=2/M=12, which was rejected on this workload (see below).
 
 **This is the first policy whose choice is not output-neutral.** `lru`, `2q` and `arc`
 change only which bytes are read and when; the decoded tokens are identical. `top-m`
