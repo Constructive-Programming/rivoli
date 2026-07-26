@@ -55,7 +55,7 @@ pub static VALIDATION_ERRORS: std::sync::atomic::AtomicUsize =
 
 unsafe extern "system" fn debug_callback(
     sev: vk::DebugUtilsMessageSeverityFlagsEXT,
-    _ty: vk::DebugUtilsMessageTypeFlagsEXT,
+    ty: vk::DebugUtilsMessageTypeFlagsEXT,
     data: *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
     _user: *mut std::ffi::c_void,
 ) -> vk::Bool32 {
@@ -64,8 +64,14 @@ unsafe extern "system" fn debug_callback(
         .unwrap_or(c"<no message>")
         .to_string_lossy()
         .into_owned();
-    VALIDATION_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if sev.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+    let err = sev.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR);
+    // PERFORMANCE messages are advice, not misuse — logged, never counted, or the
+    // first "your dispatch is small" hint would fail the whole suite and someone
+    // would delete the assertion rather than triage it.
+    if !ty.contains(vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE) {
+        VALIDATION_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if err {
         tracing::error!("vk validation: {msg}");
     } else {
         warn!("vk validation: {msg}");
