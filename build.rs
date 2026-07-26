@@ -43,6 +43,10 @@ fn main() {
     }
 
     let lib = format!("{out_dir}/librivolikernels.a");
+    // `ar crs` only adds/replaces members — it never prunes ones dropped from the
+    // list, so a since-deleted kernel's stale .o lingers and duplicate-symbol-clashes.
+    // Start from a clean archive every build.
+    let _ = std::fs::remove_file(&lib);
     let mut ar = Command::new("ar");
     ar.arg("crs").arg(&lib);
     for o in &objs {

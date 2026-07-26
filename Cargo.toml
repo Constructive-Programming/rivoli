@@ -48,6 +48,12 @@ otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 # per-token profiling + the PROFILE summary are ALWAYS ON, no feature needed.)
 trace = []
 
+# The microbench is `#![cfg(feature = "rocm")]` end to end; without the feature it
+# compiles to an empty file and cargo rejects it for having no main. Skip it instead.
+[[example]]
+name = "dot_bench"
+required-features = ["rocm"]
+
 [lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
