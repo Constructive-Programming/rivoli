@@ -313,6 +313,28 @@ where this port's real defects live — not in the algorithms, which translitera
 | `(unsigned char)p` | *(no such cast)* | C truncates; GLSL has no 8-bit type, so it must be `p & 0xFFu` | A wrong mask is a wrong weight, not a compile error |
 | `isfinite(x)` | *(does not exist)* | Must be composed from `isinf`/`isnan` | Compiles only if you notice; easy to get the polarity backwards |
 | `size_t` index | `uint` index | 32-bit overflow at 4 GB in the shader, not on the host | Silent wrap on large tensors. See the Index width note |
+| `OpFMul` + `OpFAdd` | *one* fused multiply-add | The DRIVER contracts below SPIR-V. The module still shows two opcodes | The disassembly does not tell you the arithmetic. See below |
+
+**The FMA row is the one that breaks the instrument.** Every other entry is caught by
+reading the source or the disassembly; this one is invisible in both. `glslc` emits
+`OpFMul` then `OpFAdd`, the module says so, and the driver's backend fuses them anyway —
+so the single-rounding FMA result differs from the two-rounding result, and nothing you
+can inspect statically says which you got.
+
+Measured, and it is not marginal: a CPU oracle modelling `acc += s * (a+b+c+d)` as written
+differed from `mla_value_fp8` on **10 of 15 outputs**; modelling the fused chain
+(`t = x0*l0; t = fma(x1,l1,t); …; acc = fma(s,t,acc)`) made it **exactly zero**.
+
+Two consequences worth carrying:
+
+- **"Disassemble anything whose bit-exactness matters" is necessary and not sufficient.**
+  That advice appears twice in this document and it was written before this was known. The
+  disassembly is ground truth for *which operations exist*, not for *how they are rounded*.
+- **It is probably why the two backends agree.** hipcc defaults to contracting too
+  (`-ffp-contract=fast` is on at `-O3` without `-ffast-math`), so HIP and Vulkan plausibly
+  fuse the same expressions. That is a reason the port works, not a reason to relax: it
+  means bit-identity between backends rests on two independent compilers making the same
+  contraction choice, which is an assumption nobody has stated until now.
 
 The generative rule, which is worth more than the table: **a HIP construct whose GLSL
 analogue is "the obvious builtin" needs an explicit decision, never a transliteration.**
@@ -480,7 +502,72 @@ interleaved A/B produced 256 greedy argmaxes byte-identical between arms across 
 decode. So the property does hold for a correct change here, and a Vulkan run that fails
 it has a defect rather than an unrealistic target.
 
-### The incremental form: per-kernel golden bits (DESIGNED, NOT BUILT)
+### The incremental form: per-kernel golden bits — BUILT, and not as a hash
+
+**Delivered in tranche 2b, in a stronger form than the design below specified.** The plan
+was to record a HASH of a HIP-produced output buffer and assert the Vulkan oracle against
+it. What exists instead is a **spec-derived bit-exact CPU oracle**: `mla_value_fp8` and
+`mla_absorb_fp8` are compared element-by-element against a Rust reference at
+`err = 0.000e0`, exactly, not within a tolerance.
+
+**A hash tells you something changed; a derived oracle tells you what the answer should
+be.** That difference is the whole value, and it runs in two directions:
+
+- A hash cannot survive a legitimate change, so the first time an intended edit moves the
+  bits, someone regenerates it — and the failure message that says DO NOT REGENERATE is
+  competing with the path of least resistance at the exact moment it matters. A derived
+  oracle has nothing to regenerate: it is computed from `mla.hip` and `math.rs`, so a
+  legitimate change updates it by construction and an illegitimate one still fails.
+- A hash is evidence only about the machine that produced it. The oracle is a statement
+  about the specification, so it fails on the RIGHT machine too.
+
+Two things had to be true before it worked, and neither was obvious:
+
+1. **The oracle must model FMA contraction** (see the class table above). Modelling the
+   arithmetic as the shader source spells it left 10 of 15 outputs wrong in their low bits.
+2. **The comparison must be on BYTES.** See the next section — a tolerance is
+   categorically unable to do this job, at any shape.
+
+**Carry it forward from 2c on; do not retrofit the earlier kernels.** Converting kernels
+that already pass is rework, and the tranche order is the priority. If the token-ID gate
+later fails and implicates an early kernel, retrofit that one, with the failure as the
+reason.
+
+### A tolerance cannot detect a reordering, and no shape can fix that
+
+The general statement, because it cost a wrong fix to learn and it is not about Vulkan.
+
+`assert_close` compares at `1e-3·mx + 1e-3` — order `2e-3` on these shapes. Two different
+summation orders over the same terms differ by order `1e-7`. **The tolerance is four
+orders of magnitude larger than the perturbation it is being asked to detect**, so it
+cannot see reordering at all.
+
+The trap is that this looks like a shape problem. It was diagnosed as one: `mla_value`'s
+oracle modelled a 32-lane strided accumulation, and at `kvl = 64` only 16 lanes had work
+and each ran a single iteration, so the modelled order was provably unexercised. The
+prescribed fix was to raise `kvl` to 256 so every lane loops. **That was done, and a naive
+ascending sum still passed — at 27001× margin.**
+
+> **The gap is between the SIZE OF THE PERTURBATION and the SIZE OF THE TOLERANCE, not
+> between shapes.** Enlarging the shape changes which terms are summed, never the
+> magnitude of a rounding difference relative to a fixed relative tolerance. No shape
+> closes a four-order-of-magnitude gap.
+
+This is the fourth failure class from `docs/probes/README.md` — *a check constitutionally
+blind to the defect the code is exposed to* — wearing a new costume. The tolerance is not
+broken and the oracle is not wrong; the check simply cannot see this class, and the code is
+squarely exposed to it, because summation order is the entire reason `wave_sum` is a fixed
+ladder rather than `subgroupAdd`.
+
+The fix is a different KIND of assertion, not a better shape: compare bytes. With
+bit-identity asserted, replacing the modelled ladder with `partials.iter().sum()` fails **10
+of 15 elements**. The ladder is load-bearing for the first time.
+
+> **Before tightening a tolerance-based test, ask whether the defect class you care about
+> is even representable at that tolerance.** If the perturbation is orders of magnitude
+> below the bound, every shape you try will pass and you will conclude the code is fine.
+
+### The original design, for the record (superseded above)
 
 The token-ID gate needs a whole forward pass. There is a cheaper version that works
 *during* the port and localises a divergence to one kernel instead of to a token.
@@ -532,8 +619,64 @@ THREE implementations in play, not two: Rust's `f32::exp` in the oracle, HIP's `
 GLSL's `exp`. These kernels are tolerance-tested on both backends and always have been.
 Pre-registration is the honest resolution, not a concession.
 
-**2c carries three of these at once and is the hardest kernel in the port.** Meeting them
-as design decisions beats meeting them as a red oracle:
+### DECIDED, before writing 2c: `exp` is pre-registered, and the oracle SPLITS
+
+The decision, with its mechanism, taken as a design step rather than after a red oracle.
+
+**`exp` cannot be eliminated, and the reason is structural rather than effortful.** The
+`exp2` elimination worked because its argument was an exact integer and its result an exact
+power of two, so it could be built from bits. Softmax evaluates `exp` at arbitrary runtime
+values. There is no bit-exact construction, and there are THREE implementations in play —
+Rust's `f32::exp` in the oracle, HIP's `expf`, GLSL's `exp` (specified to 3 ULP). Pre-
+registration is the honest resolution.
+
+**The consequence the FMA finding forces, and it is the important one: 2c CANNOT have a
+bit-exact oracle the way 2b does.** Tranche 2b's oracles reach `err = 0.000e0` because
+every operation in those kernels is `+`, `*` or a table lookup, all reproducible exactly in
+Rust once contraction is modelled. Rust's `exp` and GLSL's `exp` are different functions,
+so any output downstream of an `exp` is unreachable by an exact CPU reference — no amount
+of care fixes that.
+
+And a tolerance is **categorically blind to reordering** (see above). So a naive 2c oracle
+would be blind to exactly the class `mla_latent_attend` is most exposed to: it carries a
+`SUBW`-strided reduction, a shuffle ladder, and a per-tile accumulation order.
+
+**Therefore the oracle splits along the `exp` boundary:**
+
+| part | arithmetic | oracle |
+|---|---|---|
+| score `s = scale·(qa·L_tt + qr·R_tt)` | `+`, `*`, shuffle ladder | **BIT-EXACT** — this is where the ordering risk lives, and it is `exp`-free |
+| tile widening `e4m3f(Lc8)·Lscale`, `bf16f(Rc)` | table + `*` | **BIT-EXACT** |
+| online-softmax update, split combine | `exp` | tolerance, **pre-registered** |
+
+The score reduction is the part with the ordering hazard and it sits entirely *before* the
+first `exp`, so it can be tested at full strength. Do that rather than accepting a single
+end-to-end tolerance that hides it.
+
+**A SECOND, INDEPENDENT BIT-IDENTITY HAZARD IN 2c, VISIBLE ONLY BECAUSE OF THE FMA
+FINDING.** The accumulator update is
+
+```c
+acc[k] = acc[k] * corr + p * Lt[tt * kvl + lane + k * SUBW];   // attn.hip:185
+```
+
+**Two multiplies, one add — so there are two valid contractions**, `fma(acc, corr, p*Lt)`
+and `fma(p, Lt, acc*corr)`, and they give different results. Nothing in either language
+specifies which a compiler picks. Every previously ported kernel had at most one multiply
+feeding an add, so the contraction was unambiguous and the two backends agreed by luck of
+having no choice to make. Here they can genuinely diverge, and it has nothing to do with
+`exp`.
+
+The same shape appears at `l = l * corr + p` (unambiguous — one multiply) and at
+`sum += partial[..] * w[s]` in the combine (unambiguous). It is `acc[k]` specifically.
+
+**So the pre-registered suspect list for the token-ID gate gains an entry that is not a
+transcendental**, and it is checkable ahead of the gate: disassemble both backends' inner
+loops and compare which multiply got fused. If they differ, the fix is to force the
+grouping explicitly on both sides rather than to hope.
+
+**2c also carries three same-spelling hazards at once.** Meeting them as design decisions
+beats meeting them as a red oracle:
 
 - `expf(m - m_new)` and `expf(s - m_new)` in the online-softmax update, both with
   arguments `<= 0` by construction, so results land in `(0, 1]`. Softmax is a ratio, so

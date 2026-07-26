@@ -220,6 +220,34 @@ contracts are the entire `inversesqrt`/`exp2` hazard class this port keeps hitti
 > Not "would it fire" and not "would the suite notice if I deleted it" — both of those
 > pass here. Answer it by naming the class, then checking whether the code contains one.
 
+#### The measurable form: compare the size of the defect to the size of the bound
+
+The version of this question you can answer with arithmetic instead of judgement, and the
+one that stops you fixing the wrong thing.
+
+A numeric test compares against a bound. If the defect class you care about perturbs the
+result by *orders of magnitude less than that bound*, the test cannot detect it — not on
+this input, not on a bigger one, not ever. **That is a property of the two magnitudes, not
+of the test data**, so the usual instinct (find a better shape) is guaranteed to fail while
+looking like progress.
+
+The case. A kernel oracle compared at `1e-3·mx + 1e-3` ≈ `2e-3`. The property at issue was
+SUMMATION ORDER, which perturbs an f32 reduction by ~`1e-7`. Four orders of magnitude
+apart. It was first diagnosed as a shape problem — the test's dimensions genuinely did
+leave half the lanes idle — and the shape was duly fixed. **A deliberately wrong summation
+order still passed, at 27001× margin.** The shape diagnosis was correct and irrelevant.
+
+The fix was a different KIND of assertion: compare bits. With bit-identity asserted, the
+same wrong order failed 10 of 15 elements.
+
+> Before enlarging a shape or tightening a tolerance, do the division: **how big is the
+> defect, how big is the bound?** If the answer is "orders of magnitude smaller", stop
+> looking for a better input and change what you are asserting.
+
+The trap has a tell worth recognising: you can construct a *correct* argument that the
+current input under-exercises the code — as was done here — and act on it, and be no better
+off. A true diagnosis is not the same as the operative one.
+
 Note the distinction from a broken tool: the lock **worked exactly as designed** — it
 fired on the edit, named the three-step check, and refused to pass until the hash was set
 deliberately, which is what forced all 256 values to be verified first. What was wrong was
