@@ -78,6 +78,16 @@ fn transcribed_e4m3f(b: u32) -> f32 {
     sign * (1.0 + mant * 0.125) * f32::from_bits(((exp - 7 + 127) as u32) << 23)
 }
 
+/// Literal transcription of `common.glsl::bf16f` — the DECODE direction, which arrived
+/// with `mla_latent_attend` and its bf16 roped keys.
+///
+/// Exact and TOTAL, unlike its encode partner: every bf16 pattern is a representable f32,
+/// so there is no rounding, no branch, and no non-finite special case to get wrong. The
+/// test below therefore sweeps all 65536 inputs rather than sampling.
+fn transcribed_bf16f(b: u32) -> f32 {
+    f32::from_bits((b & 0xffff) << 16)
+}
+
 /// Literal transcription of `common.glsl::f2bf16`.
 fn transcribed_f2bf16(x: f32) -> u16 {
     let b = x.to_bits();
@@ -236,12 +246,13 @@ const LOCKED: &[(&str, &str)] = &[
     ("f2bf16", "uint f2bf16(float x) {"),
     ("f2e4m3", "uint f2e4m3(float x) {"),
     ("e4m3f", "float e4m3f(uint b) {"),
+    ("bf16f", "float bf16f(uint b) {"),
 ];
 
 /// Hash of every [`LOCKED`] function body as it stands in common.glsl, concatenated in
 /// order. Update ONLY after checking that the transcriptions above still mirror the GLSL
 /// statement for statement.
-const GLSL_NUMERICS_HASH: u64 = 0x92c6_d0fe_121f_98ca;
+const GLSL_NUMERICS_HASH: u64 = 0x6c42_540d_da8d_19e8;
 
 /// The transcriptions above are only evidence while they still correspond to the
 /// shader. This makes that correspondence a build-visible obligation rather than a
@@ -374,4 +385,56 @@ fn e4m3f_decodes_all_256_bytes_bit_exactly() {
         "sign symmetry at zero"
     );
     println!("e4m3f: all 256 byte values bit-exact");
+}
+
+/// EVERY bf16 bit pattern, decoded, against `math.rs`.
+///
+/// All 65536 of them, which is the whole domain rather than a sample — the same argument
+/// as the e4m3 sweep, and just as cheap. `bf16f` is total and exact by construction (the
+/// 16 bits become the top half of an f32), so anything other than a perfect pass means the
+/// transcription or the shader has drifted from `math.rs::bf16_to_f32`.
+///
+/// A SECOND math.rs/HIP DIVERGENCE, FOUND BY WRITING THIS TEST, IN THE DIRECTION THAT WAS
+/// BELIEVED CLEAN. `common.glsl` records that `f2bf16` diverges from `math.rs` for NaN
+/// because `half::bf16::from_f32` forces the quiet bit — and says so about the ENCODE
+/// direction only. Decoding turns out to do it too: `half::bf16::to_f32` QUIETS a
+/// signalling NaN, so `bf16f(0x7f81)` is `0x7fc1_0000` through `math.rs` and
+/// `0x7f81_0000` through `common.hpp`, which is a plain 16-bit shift.
+///
+/// The rule (docs/VULKAN.md, "Numerics") is that the GLSL must mirror HIP, not `math.rs`,
+/// or the two BACKENDS disagree — which is the comparison that decides decode output. So
+/// the shader is right and an earlier draft of this test was wrong. The divergence is
+/// pinned below rather than tolerated silently, so that if `half` ever stops quieting, or
+/// `common.hpp` starts, the change is announced here.
+#[test]
+fn bf16f_matches_math_rs_except_for_signalling_nan() {
+    // The HIP contract, over the WHOLE domain: the 16 bits become the top half of an f32.
+    // Total, exact, no branch — so this arm admits no exceptions at all.
+    for b in 0u32..=0xffff {
+        assert_eq!(
+            transcribed_bf16f(b).to_bits(),
+            b << 16,
+            "bf16f({b:#06x}) must be a pure 16-bit shift, as common.hpp::bf16f is"
+        );
+    }
+
+    // Agreement with math.rs everywhere it is claimed: every pattern that is not a
+    // SIGNALLING NaN (exponent all ones, mantissa non-zero, quiet bit clear).
+    let signalling =
+        |b: u32| (b & 0x7f80) == 0x7f80 && (b & 0x007f) != 0 && (b & 0x0040) == 0;
+    let mut diverged = 0usize;
+    for b in 0u32..=0xffff {
+        let want = half::bf16::from_bits(b as u16).to_f32().to_bits();
+        let got = transcribed_bf16f(b).to_bits();
+        if signalling(b) {
+            assert_ne!(want, got, "bf16f({b:#06x}): expected the quiet-bit divergence");
+            diverged += 1;
+            continue;
+        }
+        assert_eq!(want, got, "bf16f({b:#06x}): math.rs {want:#010x} vs GLSL {got:#010x}");
+    }
+    // Anti-vacuity: if the classifier stopped matching anything, the loop above would be
+    // asserting agreement everywhere and this test would silently become a weaker claim.
+    assert_eq!(diverged, 126, "expected 126 signalling-NaN patterns (63 per sign)");
+    println!("bf16f: 65410 patterns bit-exact with math.rs, 126 signalling NaNs diverge by design");
 }

@@ -104,6 +104,13 @@ const BARRIER_EXEMPT: &[(&str, &str)] = &[
     // unlike rope_interleave there is no buffer traffic for the barrier to order.
     ("mla_value_fp8", "the e4m3 LUT"),
     ("mla_absorb_fp8", "the e4m3 LUT"),
+    // Every barrier in both attention kernels separates a shared WRITE from a shared
+    // READ — the staged L/R token tile, and the combine's per-split weights — so bare
+    // WorkgroupMemory semantics are what they need. Hand-checked, as the diagnostic
+    // demands. Buffer traffic needs no ordering across them: the only writes are the
+    // final per-thread stores to disjoint clat/partial slots, after the last barrier.
+    ("mla_latent_attend", "the staged L/R token tile"),
+    ("mla_attend_combine", "the per-split softmax weights and inv_l"),
 ];
 
 fn vulkan() {

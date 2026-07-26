@@ -164,7 +164,22 @@ float e4m3f(uint b) {
 // Caller barriers before use; needs a >=256-thread workgroup, which every caller has.
 #define E4M3_LUT_BUILD(lut, tid) { if ((tid) < 256u) (lut)[(tid)] = e4m3f(tid); }
 
-// bf16f (the other DECODE direction) is NOT here yet, on purpose. They are not conveniences —
+// bf16 -> f32. Mirrors common.hpp::bf16f exactly: the 16 bits become the TOP half of an
+// f32 and the low half is zero, which is the whole of the format's definition. Exact and
+// total over every bit pattern — no rounding and no branch.
+//
+// IT DIVERGES FROM math.rs FOR SIGNALLING NaN, and that was found by testing rather than
+// assumed. `half::bf16::to_f32` QUIETS a signalling NaN, so 0x7f81 decodes to 0x7fc1_0000
+// through math.rs and to 0x7f81_0000 here. The f2bf16 note above records the same
+// disagreement in the ENCODE direction and was believed to be the only one; it is not.
+// The rule stands either way — mirror HIP, not math.rs, since the backends are what must
+// agree — and tests/glsl_numerics.rs pins the 126 diverging patterns so a change in
+// either implementation is announced.
+//
+// Ported now because `mla_latent_attend` is its first caller (the roped keys stay bf16).
+float bf16f(uint b) { return uintBitsToFloat((b & 0xffffu) << 16); }
+
+// f2bf16's DECODE partner is above. The remaining note applies to anything still absent:
 // they are a BIT-EXACTNESS CONTRACT with src/math.rs, and unexercised code carrying a
 // correctness contract is worse than absent code, because it reads as coverage. Unused
 // GLSL is optimised out of every module, so porting them ahead of a caller ships
