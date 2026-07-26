@@ -606,11 +606,39 @@ silently, since each is a low-bit effect that only sometimes reaches an argmax.
 *Cannot catch:* anything downstream of `exp`, by definition. That is exactly the region
 the other three cover.
 
-#### What I would actually defend
+#### DECIDED BY THE USER: the gate is A + C + D. B is OUT.
 
-**Accept on A reported + B within bound + C within bound, with D green.** A is a number in
-the release notes rather than a threshold; B and C are the two pass/fail criteria; D is the
-regression net that runs on every commit.
+**Accept on token-ID agreement for K tokens (K measured and reported) + throughput/overlap
+within bound against the ROCm baseline + per-kernel bit-exactness green where attainable.**
+Perplexity equivalence is **not** a merge condition.
+
+C is the pass/fail criterion, D runs on every commit, and A is a reported number rather
+than a threshold.
+
+##### The blind spot this buys, stated as a limitation and not as a caveat
+
+**The accepted gate cannot see quality drift that preserves the argmax for K tokens and
+degrades afterwards.** B was the only part that spoke to output quality rather than to
+agreement or speed; without it, a backend that decodes identically for K tokens and then
+diverges into subtly worse text passes everything. A would report a healthy K, C would be
+green, D is bit-exactness on kernels that never reach `exp`.
+
+That is a real hole and it is being accepted knowingly, not overlooked. Two consequences
+follow, and they are obligations rather than suggestions:
+
+- **`bin/ppl` stays built, documented and runnable as a NON-GATING diagnostic.** It stops
+  being a merge condition; it does not stop being available. The first person who suspects
+  quality drift should find an instrument already in the tree — with the paired-NLL
+  machinery, the CI, and the four-verdict vocabulary already in `benchmarks.md` — rather
+  than an argument about whether to build one. Removing it because "it is not in the gate"
+  would convert an accepted, bounded blind spot into an unbounded one.
+- **K now carries the weight B used to.** It is the only part of the gate with any
+  sensitivity to numerical drift at all, so it must be REPORTED PROMINENTLY and its
+  baseline RECORDED THE FIRST TIME IT IS MEASURED. A K of several hundred means nothing to
+  a reader with no prior; a later collapse from hundreds to single digits is only visible
+  as a regression if the earlier value is written down. Record it here, next to the run
+  that produced it, and treat a large K as evidence about that run rather than as licence
+  to stop looking.
 
 The honest summary of the change: **the old gate asked "are the backends identical?" and
 the answer is now known to be no. The replacement asks "is the Vulkan backend as good, and
