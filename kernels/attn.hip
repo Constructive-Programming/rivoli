@@ -22,9 +22,10 @@
 // rope over the widened values (wave-reduced, so summation order differs by ~1e-5
 // rel), flash online form for stability.
 //
-// HB/TILE are occupancy/LDS knobs (LDS = (HB+TILE)*kvl + TILE*rope floats).
-// Correctness is independent of their value. HB is also the DRAM KV re-read
-// multiplier (⌈H/HB⌉×) — the dominant term at long context.
+// HB/TILE are occupancy/LDS knobs (LDS = TILE*(kvl + rope) floats — the per-head
+// accumulator is in REGISTERS, see MLA_ACC_REGS). Correctness is independent of their
+// value. HB is also the DRAM KV re-read multiplier (⌈H/HB⌉×) — the dominant term at
+// long context.
 
 #include "common.hpp"
 
@@ -33,6 +34,12 @@
 // Score-reduction subgroup width. MUST stay a divisor of the physical wavefront
 // (32 on gfx1151) so a head's HB-th 32-lane group never straddles two wavefronts.
 #define SUBW 32
+// Per-lane online-accumulator registers. Lane `l` of a head owns exactly the columns
+// i ≡ l (mod SUBW), so the accumulator is lane-private and needs ⌈kvl/SUBW⌉ registers
+// — 16 at the GLM kv_lora_rank of 512. This CAPS the kernel's kvl at
+// MLA_ACC_REGS*SUBW; `rivoli_mla_attend` enforces it (arg guard 1004) rather than
+// letting a larger model silently drop columns.
+#define MLA_ACC_REGS 16
 
 // --- Split-KV (flash-decoding) launch geometry ---------------------------
 // Head tiling alone yields grid = ⌈H/HB⌉ = 8 blocks at GLM dims (H=64, HB=8) —
@@ -42,7 +49,7 @@
 // (grid.y = n_splits). Each computes a PARTIAL online-softmax over its row range;
 // mla_attend_combine merges them with the standard stable rescale.
 #define MLA_MAX_SPLITS 16       // bounds grid.y AND the caller's once-per-session scratch
-#define MLA_TARGET_BLOCKS 80    // ~2× the 40 CUs (LDS ≈ 52 KB caps ~1 workgroup/CU)
+#define MLA_TARGET_BLOCKS 80    // ~2× the 40 CUs
 #define MLA_MIN_TILES_PER_SPLIT 4  // below this, split overhead + combine costs more than it buys
 
 // How the `nr` rows are cut. `tps` = TILE steps per split, so split s owns rows
@@ -79,15 +86,16 @@ extern "C" size_t rivoli_mla_attend_scratch_floats(int H, int kvl) {
     return (size_t)MLA_MAX_SPLITS * (size_t)H * ((size_t)kvl + 2);
 }
 
-// Dynamic LDS bytes: per-head accumulators plus one staged L/R token tile. MUST
-// match the smem carve-up in mla_latent_attend — one source of truth so a HB/TILE
-// tune can't desync the launcher's request from the kernel's layout.
+// Dynamic LDS bytes: one staged L/R token tile (the per-head accumulators live in
+// registers). MUST match the smem carve-up in mla_latent_attend — one source of truth
+// so a HB/TILE tune can't desync the launcher's request from the kernel's layout.
 static inline size_t mla_attend_lds(int kvl, int rope) {
-    return ((size_t)(HB + TILE) * kvl + (size_t)TILE * rope) * sizeof(float);
+    return ((size_t)TILE * kvl + (size_t)TILE * rope) * sizeof(float);
 }
 
 // grid = (⌈H/HB⌉, n_splits) blocks; block = HB*SUBW threads; dynamic LDS holds the
-// per-head accumulators plus the current L/R token tile. `blockIdx.y` is the split:
+// current L/R token tile (the per-head accumulators are in registers, see
+// MLA_ACC_REGS). `blockIdx.y` is the split:
 // this block attends only rows [y*tps*TILE, min(nr, (y+1)*tps*TILE)). When
 // `partial` is null (n_splits==1) the block owns every row and writes the
 // normalised result straight to `clat`. Otherwise it writes its UNNORMALISED
@@ -103,8 +111,7 @@ extern "C" __global__ void mla_latent_attend(
     float* __restrict__ clat,               // [H*kvl], written iff partial==null
     float* __restrict__ partial) {          // split scratch, or null = single split
     extern __shared__ float smem[];
-    float* acc = smem;              // [HB*kvl] online accumulator, persists all tiles
-    float* Lt = acc + HB * kvl;     // [TILE*kvl] staged latent tile
+    float* Lt = smem;               // [TILE*kvl] staged latent tile
     float* Rt = Lt + TILE * kvl;    // [TILE*rope] staged roped-key tile
 
     int tid = threadIdx.x;
@@ -113,12 +120,26 @@ extern "C" __global__ void mla_latent_attend(
     int head = blockIdx.x * HB + hb;
     bool active = head < H;
 
+    // INVARIANT: every unrolled acc loop below must bound on `k < nacc`, never on
+    // `i < kvl`. `i = lane + k*SUBW` makes `i < kvl` lane-divergent, and LLVM then
+    // predicates each unrolled step with its own exec-mask save/restore — which costs
+    // more than the LDS traffic this whole change removes. `nacc` is wave-uniform.
+    // kvl is a multiple of SUBW because the launcher rejects anything that is not a
+    // multiple of 128. Measured both ways in benchmarks.md, "Read the ISA before you
+    // book the device".
+    int nacc = kvl / SUBW;
+
+    // Online accumulator, ONE REGISTER PER LANE-OWNED COLUMN. This was an [HB*kvl] LDS
+    // array, but lane `lane` only ever touched columns i ≡ lane (mod SUBW) — it was
+    // lane-private all along. Registers drop the LDS by HB*kvl floats and delete an LDS
+    // read-modify-write from the innermost loop. Bit-identical: same columns, same
+    // values, same order. Zeroing all MLA_ACC_REGS is safe even when nacc is smaller or
+    // the lane is inactive — registers are private, so the extras are never read back.
+    float acc[MLA_ACC_REGS] = {0};
+
     // Online-softmax running max/sum, kept in registers replicated across the
     // head's lanes (every lane sees the same broadcast score → lockstep, no sync).
     float m = -INFINITY, l = 0.0f;
-    if (active) {
-        for (int i = lane; i < kvl; i += SUBW) acc[hb * kvl + i] = 0.0f;
-    }
 
     const float* qa = qabs + (size_t)(active ? head : 0) * kvl;
     const float* qr = qrope + (size_t)(active ? head : 0) * rope;
@@ -159,8 +180,9 @@ extern "C" __global__ void mla_latent_attend(
                 float m_new = fmaxf(m, s);
                 float corr = expf(m - m_new);
                 float p = expf(s - m_new);
-                for (int i = lane; i < kvl; i += SUBW)
-                    acc[hb * kvl + i] = acc[hb * kvl + i] * corr + p * Lt[tt * kvl + i];
+#pragma unroll
+                for (int k = 0; k < MLA_ACC_REGS; ++k)
+                    if (k < nacc) acc[k] = acc[k] * corr + p * Lt[tt * kvl + lane + k * SUBW];
                 l = l * corr + p;
                 m = m_new;
             }
@@ -177,15 +199,18 @@ extern "C" __global__ void mla_latent_attend(
             float* pa = partial + ((size_t)blockIdx.y * H + head) * kvl;
             float* pml = partial + (size_t)MLA_MAX_SPLITS * H * kvl +
                          ((size_t)blockIdx.y * H + head) * 2;
-            for (int i = lane; i < kvl; i += SUBW) pa[i] = acc[hb * kvl + i];
+#pragma unroll
+            for (int k = 0; k < MLA_ACC_REGS; ++k)
+                if (k < nacc) pa[lane + k * SUBW] = acc[k];
             if (lane == 0) {
                 pml[0] = m;
                 pml[1] = l;
             }
         } else {
             float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
-            for (int i = lane; i < kvl; i += SUBW)
-                clat[(size_t)head * kvl + i] = acc[hb * kvl + i] * inv;
+#pragma unroll
+            for (int k = 0; k < MLA_ACC_REGS; ++k)
+                if (k < nacc) clat[(size_t)head * kvl + lane + k * SUBW] = acc[k] * inv;
         }
     }
 }
@@ -242,7 +267,14 @@ extern "C" int rivoli_mla_attend(
     float* clat, float* partial) {
     if (H <= 0 || nr <= 0 || kvl <= 0 || rope <= 0 || n_blocks <= 0) return 1001;
     size_t lds = mla_attend_lds(kvl, rope);
-    if (lds > 65536) return 1002;  // exceeds gfx1151 LDS (shrink TILE/HB)
+    if (lds > 65536) return 1002;  // exceeds gfx1151 LDS (shrink TILE — HB no longer counts)
+    // The accumulator is register-resident and indexed by k = (i - lane)/SUBW, so kvl
+    // must fit MLA_ACC_REGS registers and tile SUBW exactly (`nacc` is the uniform bound
+    // the unrolled loops test against). Enforced at 128 rather than SUBW because the
+    // tile load's `Lscale[t*n_blocks + i/128]` needs kvl a multiple of 128 too: kvl=160
+    // would satisfy %SUBW, give n_blocks=1, and silently read the NEXT token's block
+    // scale for i in [128,160). 128 is a multiple of SUBW, so this subsumes both.
+    if (kvl > MLA_ACC_REGS * SUBW || kvl % 128) return 1004;
     int blocks = (H + HB - 1) / HB;
     MlaSplitPlan sp = mla_plan_splits(H, nr, partial != nullptr);
     float* part = sp.n_splits > 1 ? partial : nullptr;

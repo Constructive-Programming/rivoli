@@ -54,9 +54,19 @@ __device__ __forceinline__ void e4m3_lut_build(float* lut, int tid) {
     if (tid < 256) lut[tid] = e4m3f((unsigned char)tid);
 }
 
+// log2 of a power-of-two fp8 scale-tile size. Every launcher taking a `block`
+// REJECTS a non-power-of-two (arg guard 1003), so the hot loops index the block scale
+// with a shift instead of a divide. `block` is a runtime int, and LLVM does
+// strength-reduce `i / block` to a magic multiply — but the SIGNED quotient correction
+// survives it, and that is what cost: measured 44 → 29 VALU per iteration in
+// gemv_fp8_splitk, around 5 ops of real math, with the memory ops unchanged at 7.
+// Bit-identical: same index, same order. See benchmarks.md, "Read the ISA before you
+// book the device", for why grepping for `v_rcp_iflag_f32` finds nothing here.
+__device__ __forceinline__ int blk_shift(int block) { return 31 - __clz(block); }
+
 // Wave-cooperative fp8-e4m3 block-scaled dot for one output row `o`. `wrow` =
 // packed[o*i_dim..], `scalerow` = scale + (o/block)*sc_cols (the row's block-scale
-// row), so element i uses scalerow[i/block]. `lut` is the block's e4m3_lut_build
+// row), so element i uses scalerow[i>>bsh]. `lut` is the block's e4m3_lut_build
 // table. Matches quant.rs::matvec_fp8.
 // Strided fp8 dot accumulation (NO cross-thread reduction): Σ over the columns this
 // thread owns of `x·lut[w]·scale`, using a uint-per-lane load (4 fp8 → 128B/wave) atop
@@ -71,17 +81,18 @@ __device__ __forceinline__ float fp8_dot_strided(const float* __restrict__ x,
     float acc = 0.0f;
     const unsigned int* w4 = (const unsigned int*)wrow;
     int n4 = i_dim >> 2;
+    int bsh = blk_shift(block);
     for (int j = start; j < n4; j += stride) {
         unsigned int p = w4[j];
         int i0 = j << 2;
-        float s = scalerow[i0 / block];
+        float s = scalerow[i0 >> bsh];
         acc += s * (x[i0]     * lut[(unsigned char)p]
                   + x[i0 + 1] * lut[(unsigned char)(p >> 8)]
                   + x[i0 + 2] * lut[(unsigned char)(p >> 16)]
                   + x[i0 + 3] * lut[(unsigned char)(p >> 24)]);
     }
     for (int i = (n4 << 2) + start; i < i_dim; i += stride)
-        acc += x[i] * lut[wrow[i]] * scalerow[i / block];
+        acc += x[i] * lut[wrow[i]] * scalerow[i >> bsh];
     return acc;
 }
 
