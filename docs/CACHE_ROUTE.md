@@ -142,9 +142,21 @@ selections that actually happened. Evaluating substitution offline needs the *ca
 window*: per routing decision, the top-M expert ids (and their `choice` scores). Extend
 the trace writer, then extend `bin/replay` to replay a captured trace under substitution
 and report the hit-rate delta for a grid of (J, M). This answers "how much miss
-reduction is available on our workload" with **zero engine risk** and no GPU time. It
-is the one cheap place to stop the whole program — including the pilot work — before
-anything is written into the engine.
+reduction is available on our workload" with **zero engine risk** and (after one capture)
+no further GPU time. It is the cheap place to stop **`top-m`** before anything is written
+into the engine.
+
+**It does not screen CACHE_PILOT, and an earlier draft of this section wrongly said it
+did.** The offline oracle — perfect knowledge of the next decision's experts — saturates:
+a decision needs `top_k` keys, `top_k` admissions fit in any pool that holds one batch, so
+a perfect predictor removes every miss by construction and the number is a tautology. It
+is worse than uninformative, because at 100% recall the speculative admission set *is* the
+baseline miss set — the same bytes and the same evictions, merely earlier. The pilot's
+entire risk is **recall**, and recall is unobservable offline; LOOKA (build order step 3)
+is its real gate. What replay can offer is a *modelled* recall curve (`bin/replay` prints
+one), which prices the false positives a degraded predictor emits — but that is analysis,
+not a bar, and it is an upper bound because its errors are independent where real ones are
+correlated.
 
 **2. Engine implementation.** The `hybrid::make` arm + the tier rule + the
 `route_advice` hook + `route_into` substitution + `swap%`. Assert the `None` path is

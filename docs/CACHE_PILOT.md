@@ -74,9 +74,20 @@ reintroduce the silent-corruption class the `inflight` guard was written for.
 **Headroom is the known risk, not a gate.** Colibri measured a +3.1pp recall
 improvement producing *literally zero* tok/s change on a cache-starved host, and our VQ
 working set (16,457 experts against a ~5,000-slot pool) is closer to that regime than
-theirs. The shared offline replay step (build order below) quantifies the ceiling
-before the loader is written — but the answer informs `top-m`'s acceptance, it does not
-independently stop this work.
+theirs.
+
+**The offline replay step does NOT quantify this, and an earlier draft claimed it did.**
+The oracle ceiling saturates by construction: a decision needs `top_k` keys, `top_k`
+admissions fit in any pool that holds one batch, so a perfect predictor removes every miss
+and the number is a tautology — and at 100% recall the speculative admissions *are* the
+baseline misses, so it is the same bytes moved earlier, which is this document's thesis
+restated rather than tested. **This work's gate is recall, recall is unobservable offline,
+and LOOKA (Step 1) is the only thing that measures it.** `bin/replay` does print a
+*modelled* recall curve — at recall `r` the predictor still names `top_k` experts, so
+every false negative is also a false positive, drawn from the ranks just outside the true
+set in that decision's own window — and that curve prices the wasted bytes. It is an upper
+bound (its errors are independent; real ones are correlated), so treat it as the shape of
+the trade, and read the real `r` off LOOKA.
 
 ## Step 1 — LOOKA (instrumentation)
 
@@ -179,9 +190,10 @@ invalidated one hot_pct sweep and two earlier conclusions.
 One program, not two:
 
 1. Extend the `--trace` format (adds the top-M candidate window `top-m` needs).
-2. Offline replay: the oracle-prefetch ceiling and the (J, M) miss-reduction grid in
-   [CACHE_ROUTE.md](CACHE_ROUTE.md). Free, no GPU time — this is where the headroom
-   question gets its number.
+2. Offline replay: the (J, M) miss-reduction grid in
+   [CACHE_ROUTE.md](CACHE_ROUTE.md), plus the oracle ceiling and the modelled recall
+   curve. One GPU capture, then free. This screens **`top-m`**; it cannot screen the
+   pilot (see "Headroom" above) — step 3 does that.
 3. LOOKA recall counters, both horizons (Step 1 above).
 4. The speculative loader (Step 2 above).
 5. `top-m` routing + rank-driven tiering, then the pilot prediction driving promotion.
