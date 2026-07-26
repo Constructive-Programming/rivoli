@@ -1045,6 +1045,57 @@ PILOT and `top-m` attack a bottleneck we have quantified, while this buys portab
 we do not currently need on a node where ROCm works. Build it when the portability goal
 is real, not because the plan exists.
 
+## 2d pre-flight: `moe.hip`, the three int3-vq kernels
+
+Scoped against the source before writing, so the tranche starts from decisions rather
+than discoveries. NOT YET WRITTEN — this section is the plan.
+
+**The tightest oracle in the suite guards this tranche.** `moe_vq` has **3.3×** headroom
+against `gemv_fp8`'s 2928×. The standing rule applies without restatement: *a failing VQ
+oracle is a gather or ordering bug until proven otherwise, never a tolerance to loosen.*
+Widening the bound on the kernel with the least headroom would discard the only signal
+that would have caught the defect.
+
+**Five porting decisions, each already determined:**
+
+1. **The fp16 codebook needs no 16-bit storage extension.** `dot_vq_wave` reads two
+   `__half2`; GLSL's `unpackHalf2x16(uint)` returns exactly that pair from a `uint` word,
+   and half→float is exact. So the codebook is read as `uint` words like every other
+   packed tensor here, and `VK_KHR_16bit_storage` stays unrequired — one fewer device
+   precondition, which after the BALLOT finding is worth having.
+2. **`ExpertDescVq` is six device addresses per expert**, so `descs[e]` is a `uint64`
+   buffer read at stride 6. This is the tranche that actually exercises
+   `buffer_device_address` as the plan intended, and the push-constant budget prediction
+   (~88 bytes with the descs pointed-to rather than inlined) should be MEASURED here
+   rather than assumed — `push_struct!` will fail the build if it is wrong, which is the
+   right failure.
+3. **The 12-bit index unpack straddles word boundaries.** HIP reads
+   `idxrow[byte] | (idxrow[byte+1] << 8)` — two adjacent bytes, which with word-only
+   loads may span two words. The `WORD` padding already covers the tail read; the
+   straddle needs explicit handling, and it is the single most likely place for a silent
+   gather bug in this tranche.
+4. **`moe_reduce` is a partition feeding an order-sensitive reduction**, so by the rule
+   established in this document it is a numerics decision, not scheduling. Its `e_count`
+   batching must be transliterated, not re-derived, for the same reason `mla_plan_splits`
+   was.
+5. **`siluf` carries the pre-registered `exp` divergence**, confirmed present in the ISA
+   (`v_mul_f32 0xbfb8aa3b` — the negative log2(e), since it evaluates `exp(-x)`). Same
+   status as `swiglu`; nothing new to decide.
+
+**MEASURED, and it is the hazard this document predicted would recur.** `moe_gateup_vq`'s
+inner subvector dot is `x.x*c0 + x.y*c1 + x.z*c2 + x.w*c3` followed by
+`acc += scale * dot` — four multiplies feeding three adds, then another multiply-add. That
+is the two-multiplies-one-add shape from `attn.hip:185`, but with more freedom. hipcc's
+instruction mix for the kernel:
+
+    6 x v_mul_f32   4 x v_fma_f32   3 x v_fmac_f32   1 x v_dual_fmac_f32
+
+So contraction choices **are** being made here and the port must match them rather than
+hope. The first task of 2d is the isolate-and-disassemble treatment that
+`attn.hip:185` got — a minimal kernel calling `dot_vq_wave` alone, read term by term —
+because the mix above is not attributable to specific products while inlined into the
+whole kernel. Do that before writing the shader, not after the oracle disagrees.
+
 ## Phase 4 needs two queues, not one — and the acceptance gate cannot see it
 
 Written before integration starts, because the failure it describes is invisible to every
