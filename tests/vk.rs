@@ -2580,6 +2580,7 @@ fn run_attend(
     n_blocks: usize,
     scale: f32,
     with_scratch: bool,
+    rows: Option<&[u32]>,
 ) -> Vec<f32> {
     let rcb: Vec<u8> = rc.iter().flat_map(|v| v.to_le_bytes()).collect();
     let (qb, rb) = (dev(&f32b(qabs)), dev(&f32b(qrope)));
@@ -2591,7 +2592,11 @@ fn run_attend(
     let pp = scratch
         .as_mut()
         .map_or(std::ptr::null_mut(), |b| b.ptr_mut() as *mut f32);
-    // SAFETY: every buffer is live and of the documented size; `rows` is null (dense).
+    // The DSA row-selection buffer, or null for dense. Kept alive across the launch.
+    let rowsb = rows.map(|r| dev(&r.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()));
+    let rowsp = rowsb.as_ref().map_or(std::ptr::null(), |b| b.ptr() as *const u32);
+    // SAFETY: every buffer is live and of the documented size; `rows` is null for dense
+    // or an `nr`-entry u32 buffer outliving the sync.
     unsafe {
         launch_attend(
             qb.ptr() as *const f32,
@@ -2599,7 +2604,7 @@ fn run_attend(
             lb.ptr(),
             sb.ptr() as *const f32,
             kb.ptr() as *const u16,
-            std::ptr::null(),
+            rowsp,
             h,
             nr,
             kvl,
@@ -2648,7 +2653,7 @@ fn attend_tile_widening_is_bit_exact() {
     let want =
         attend_oracle(&qabs, &qrope, &lc8, &lscale, &rc, None, h, nr, kvl, rope, n_blocks, 0.125, false);
     let got =
-        run_attend(&qabs, &qrope, &lc8, &lscale, &rc, h, nr, kvl, rope, n_blocks, 0.125, false);
+        run_attend(&qabs, &qrope, &lc8, &lscale, &rc, h, nr, kvl, rope, n_blocks, 0.125, false, None);
     assert_close(&want, &got, "attend widening h3 kvl128 nr1");
     assert_bit_identical(&want, &got, "mla_latent_attend (nr=1, exp-free)");
     v.check("attend_tile_widening_is_bit_exact");
@@ -2676,9 +2681,79 @@ fn attend_matches_the_host_oracle() {
     let want =
         attend_oracle(&qabs, &qrope, &lc8, &lscale, &rc, None, h, nr, kvl, rope, n_blocks, 0.125, true);
     let got =
-        run_attend(&qabs, &qrope, &lc8, &lscale, &rc, h, nr, kvl, rope, n_blocks, 0.125, true);
+        run_attend(&qabs, &qrope, &lc8, &lscale, &rc, h, nr, kvl, rope, n_blocks, 0.125, true, None);
     assert_close(&want, &got, "attend h8 nr128 kvl512 splits2 nblocks4");
     v.check("attend_matches_the_host_oracle");
+}
+
+/// The DSA `rows` path — the indirection that was DEAD CODE in both the shader and the
+/// oracle until this test existed.
+///
+/// `rows[j]` is the cached token index of the j-th attended row, so the tile load reads
+/// `rows[t0 + tt]` instead of `t0 + tt`. Every other line of the kernel is row-POSITION
+/// arithmetic and cannot tell the difference, which is exactly why nothing else covers it.
+///
+/// THE SELECTION IS DELIBERATELY NOT THE IDENTITY, and not even a permutation of a
+/// contiguous prefix. It picks a strided, reversed subset out of a token pool four times
+/// larger than `nr`, so:
+///
+///   - an implementation that ignored `rows` entirely would read tokens 0..nr and differ;
+///   - one that read `rows` but forgot the `t0` tile offset would still be wrong after the
+///     first tile, which is why `nr` spans two tiles rather than one;
+///   - and because the pool is larger than `nr`, a wrong index lands on a REAL token's
+///     data rather than out of bounds, so this fails as wrong numbers rather than as a
+///     GPU-AV report. That is the failure mode worth building the test around.
+#[test]
+fn attend_honours_the_dsa_row_selection() {
+    let v = Validation::new();
+    let (h, nr, kvl, rope) = (3usize, 24usize, 128usize, 64usize);
+    let n_blocks = kvl / 128;
+    let tokens = 96usize; // four times nr, so selected indices are scattered and live
+    let (qabs, qrope, lc8, lscale, rc) = att_inputs(0xD5A, h, tokens, kvl, rope, n_blocks);
+
+    // Strided and descending: rows[j] = tokens - 1 - 4j. Shares no fixed point with the
+    // dense mapping j -> j, so any confusion between the two shows up everywhere.
+    let rows: Vec<u32> = (0..nr).map(|j| (tokens - 1 - 4 * j) as u32).collect();
+    assert!(
+        rows.iter().enumerate().all(|(j, r)| *r as usize != j),
+        "the selection must share no fixed point with the dense mapping"
+    );
+
+    let want = attend_oracle(
+        &qabs, &qrope, &lc8, &lscale, &rc, Some(&rows), h, nr, kvl, rope, n_blocks, 0.125,
+        false,
+    );
+    let got = run_attend(
+        &qabs, &qrope, &lc8, &lscale, &rc, h, nr, kvl, rope, n_blocks, 0.125, false,
+        Some(&rows),
+    );
+    assert_close(&want, &got, "attend dsa rows h3 nr24 kvl128");
+
+    // CONTROL: the same shape run DENSE must differ. Without this the test would pass for
+    // an implementation that ignored `rows` and happened to agree — the oracle would be
+    // reading the same tokens the shader did, both wrongly.
+    let dense = run_attend(
+        &qabs, &qrope, &lc8, &lscale, &rc, h, nr, kvl, rope, n_blocks, 0.125, false, None,
+    );
+    // THE CONTROL MEASURES WHAT THE ASSERTION MEASURES. An earlier version counted BIT
+    // inequality while the assertion it protects is `assert_close` at `1e-3*mx + 1e-3` —
+    // three orders of magnitude apart, so the control could pass while the test it guards
+    // was vacuous. Concretely: shrink the token pool to `tokens = nr` and the two paths
+    // consume the SAME tokens in a different order, differing only in accumulation, so
+    // every element differs in its low bits (the old control reports 384/384 and passes)
+    // while `max|want − dense|` is ~1e-7 — far inside the tolerance. A shader ignoring
+    // `rows` would then produce `got == dense` and `assert_close` would pass, with the
+    // indirection back to being dead code.
+    let mx = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let sep = want.iter().zip(&dense).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+    let tol = 1e-3 * mx + 1e-3;
+    assert!(
+        sep > tol,
+        "the dense and row-selected results must differ by more than assert_close's own \
+         tolerance (max separation {sep:.3e} vs tol {tol:.3e}) — otherwise a shader that \
+         ignored `rows` entirely would still pass this test"
+    );
+    v.check("attend_honours_the_dsa_row_selection");
 }
 
 /// `launch_attend`'s guards, including the one this backend adds.
@@ -2854,7 +2929,15 @@ fn oracle_dot_vq(idxrow: &[u8], scalerow: &[u8], cb: &[u16], x: &[f32], i_dim: u
         let mut t = lane;
         while t < nsub {
             let idx = vq_index(idxrow, t);
-            let c: Vec<f32> = (0..VQ_DIM).map(|k| f16_to_f32(cb[idx * VQ_DIM + k])).collect();
+            // A fixed array, not a Vec: this is the innermost loop of an oracle that runs
+            // 32 lanes x 128 subvectors x 512 rows x 3 experts, and a heap allocation per
+            // subvector made the test allocation-bound rather than arithmetic-bound.
+            let c = [
+                f16_to_f32(cb[idx * VQ_DIM]),
+                f16_to_f32(cb[idx * VQ_DIM + 1]),
+                f16_to_f32(cb[idx * VQ_DIM + 2]),
+                f16_to_f32(cb[idx * VQ_DIM + 3]),
+            ];
             let i0 = t * VQ_DIM;
             let mut dot = x[i0] * c[0];
             dot = x[i0 + 1].mul_add(c[1], dot);
@@ -3087,6 +3170,21 @@ fn moe_vq_matches_the_host_oracles() {
     shapes.close(&want_p, &got_p, "moe_down_vq h512 i64 e3");
     shapes.close(&want_o, &f32v(&got_o[..hidden * 4]), "moe_reduce h512 e3");
     shapes.assert_all_passed("moe vq");
+
+    // THE FUSION PIN, WHICH THE TOLERANCE ABOVE CANNOT SEE.
+    //
+    // `vq.glsl` spells `mul, fma, fma, fma` plus a fused scale because hipcc's ISA does —
+    // and a 1e-3 comparison is blind to contraction and association by three orders of
+    // magnitude, so a wrong grouping in the four-term dot would ship green above. The pass
+    // that can be pinned exactly is `moe_down_vq`: it is `exp`-FREE (one multiply after the
+    // dot), so feeding the GPU's OWN `h` into the oracle removes silu — the only
+    // unreproducible step — and what remains is the VQ dot and nothing else.
+    //
+    // `moe_reduce` is likewise a plain ascending sum, so it pins exactly too.
+    let pin_p = moe_down_oracle(&descs, &down_cb, &wexpert, &got_h, hidden, inter, 0, e_count);
+    assert_bit_identical(&pin_p, &got_p, "moe_down_vq (fed the GPU's own h)");
+    let pin_o = moe_reduce_oracle(&got_p, e_count, hidden);
+    assert_bit_identical(&pin_o, &f32v(&got_o[..hidden * 4]), "moe_reduce (fed the GPU's own partials)");
     v.check("moe_vq_matches_the_host_oracles");
 }
 

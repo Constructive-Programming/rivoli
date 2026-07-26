@@ -29,9 +29,23 @@ layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RoU
 // valid-looking codebook index rather than a fault. That is the likeliest silent gather
 // bug in this tranche, so each byte gets its own word load and the compiler is left to
 // merge them when it legally can.
+// MASK THE ABSOLUTE ADDRESS, NEVER THE OFFSET. `base` here is already offset to a ROW, so
+// its own low bits are whatever the row stride made them — masking `off` alone would leave
+// the load address congruent to `base` mod 4 and only accidentally aligned. Masking after
+// the add is aligned by construction for any base, and it is what gemv_i8 and
+// mla_latent_attend already do. (This distinction was got wrong once in this file, on the
+// scale read below, where the row stride genuinely can be 2 mod 4.)
 uint vq_byte(uint64_t base, uint64_t off) {
-    uint word = RoU32v(base + (off & ~3ul)).v[0];
-    return (word >> ((uint(off) & 3u) * 8u)) & 0xffu;
+    uint64_t a = base + off;
+    uint word = RoU32v(a & ~3ul).v[0];
+    return (word >> ((uint(a) & 3u) * 8u)) & 0xffu;
+}
+
+/// One bf16 half-word from a device address, same rule.
+uint vq_half(uint64_t base, uint64_t off) {
+    uint64_t a = base + off;
+    uint word = RoU32v(a & ~3ul).v[0];
+    return (word >> ((uint(a) & 3u) * 8u)) & 0xffffu;
 }
 
 // Wave-cooperative VQ-int3 dot for one output row, result on LANE 0 only.
@@ -81,10 +95,17 @@ float dot_vq_wave(RoF32 x, uint64_t idxrow, uint64_t scalerow, uint64_t cb,
         dot = fma(x.v[xi + 3u], c23.y, dot);
 
         // The group scale is bf16; one scale per VQ_SUBS_PER_GROUP subvectors.
+        //
+        // THE ROW BASE HERE CAN BE ODD, which is why this masks the absolute address.
+        // `scalerow` arrives already offset by the row, and the scale row stride is
+        // `vq_groups(i_dim) * 2` bytes — which is 2 (mod 4) whenever `i_dim / VQ_GROUP` is
+        // odd. At the tranche's own test shape (`inter = 64`, so `vq_groups = 1`, stride 2)
+        // every odd `down` row would have been a 32-bit load on a 2-aligned address, and
+        // the last row would have read two bytes past the buffer. Unlike the index row —
+        // whose stride `i_dim*3/8` is a multiple of 8 under the launcher's guard, so its
+        // base stays aligned — nothing makes this one even.
         uint64_t soff = uint64_t(t / VQ_SUBS_PER_GROUP) * 2ul;
-        uint sw = RoU32v(scalerow + (soff & ~3ul)).v[0];
-        uint sh = (sw >> ((uint(soff) & 3u) * 8u)) & 0xffffu;
-        acc = fma(bf16f(sh), dot, acc);
+        acc = fma(bf16f(vq_half(scalerow, soff)), dot, acc);
     }
     return wave_sum(acc);
 }
