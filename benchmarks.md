@@ -164,12 +164,14 @@ region (int3-vq: 4,744→66.42%, 5,852→72.60%, 8,000→81.13%, 12,000→90.37%
 slots into hits is worth a lot. Read against that curve:
 
 > `top-m` at J=2/M=12 buys what growing the pool from 5,852 to ~10,950 slots would — an
-> **~1.9× effective pool — at 17.8% swap, quality cost unmeasured.** J=4/M=10 is worth
-> ~1.4× at 9.6% swap.
+> **~1.9× effective pool — at 17.8% swap, and a MEASURED +3.63% perplexity** (see Quality
+> below), which is 3.6× the ~1% acceptance bar. J=4/M=10 is worth ~1.4× at 9.6% swap, at a
+> perplexity cost the data cannot yet resolve.
 
-Pool growth is free; substitution is not. Quoted without the swap number, "1.9× effective
-pool" reads as costless — 17.8% swap means nearly one chosen expert in five is not the one
-the router asked for.
+Pool growth is free; substitution is not. **J=2/M=12 — the paper's own defaults — is
+therefore not a shippable operating point here**, and the residency headline must never be
+quoted without that. 17.8% swap means nearly one chosen expert in five is not the one the
+router asked for, and it now has a price attached.
 
 **And we cannot simply buy those slots**, which is why the steep curve matters here
 specifically: the box has ~120 GiB and this capture already ran at `--max-mem 100`. There
@@ -225,6 +227,78 @@ question. **Do not read "L+2 is free" as the pilot's main risk being retired.** 
 retired; it is unmeasured, and reaching further is precisely where a real predictor is
 expected to lose recall. Treat every row as an upper bound: these errors are independent
 across decisions, and a real predictor's are correlated.
+
+### The engine and the simulator implement the same policy
+
+Checked before any quality number was trusted, because if it failed the entire offline
+screen above would be measuring a policy the engine does not run. Two independent
+implementations of the substitution rule — `bin/replay`'s `substitute` and the engine's
+`route_into` — on **different text** (the screen's 512-token trace vs the perplexity
+corpus):
+
+| (J, M) | simulator | engine |
+|---|---|---|
+| J=4/M=10 | +8.93pp hit, 9.6% swap | +8.98pp hit, 9.65% swap |
+| J=2/M=12 | +15.24pp hit, 17.8% swap | +15.18pp hit, 17.62% swap |
+
+Agreement to 0.06pp on hit and 0.2pp on swap. These are **deterministic counts over a run**,
+not statistical estimates of a small effect, so this carries no power caveat and is not
+subject to the ambiguity that limits the quality numbers below. This is the reason to
+believe the +15pp screen at all.
+
+### Quality — teacher-forced perplexity, and what it does NOT establish
+
+762 predicted tokens, fixed corpus, one process per cell, paired per-token NLL.
+`dPPL%` is the headline; the paired **mean dNLL ± SE** is the evidence.
+
+int3-vq — baseline PPL 5.275434, hit 73.67%:
+
+| cell | PPL | dPPL% | mean dNLL | SE | 95% CI (nats) | worse% | hit% | swap% |
+|---|---:|---:|---:|---:|---|---:|---:|---:|
+| J=4/M=10 | 5.32864 | +1.009% | +0.01003 | 0.01092 | [−0.01136, +0.03143] | 52.6% | 82.65% | 9.65% |
+| J=2/M=12 | 5.46686 | +3.629% | +0.03564 | 0.01474 | [+0.00676, +0.06453] | 57.0% | 88.85% | 17.62% |
+
+int4 — baseline PPL 9.083032, hit 69.67%. **Read with the provenance caveat above: this
+artifact's int4 is vq3-derived and 72% worse in absolute PPL before any policy acts, so
+these are not evidence about `top-m` in a well-quantized int4 mode.**
+
+| cell | PPL | dPPL% | mean dNLL | SE | 95% CI (nats) | worse% | hit% | swap% |
+|---|---:|---:|---:|---:|---|---:|---:|---:|
+| J=4/M=10 | 9.27330 | +2.095% | +0.02073 | 0.01206 | [−0.00290, +0.04436] | 54.1% | 79.95% | 9.55% |
+| J=2/M=12 | 10.23659 | +12.700% | +0.11956 | 0.01730 | [+0.08565, +0.15347] | 61.7% | — | 17.6% |
+
+**Three of four cells are UNDERPOWERED, and that is the headline.** One standard error
+exceeds the 0.00995-nat bar (a 1% PPL change) in every cell, so at 762 tokens the
+experiment cannot resolve the acceptance question at any point estimate. An underpowered
+null is **not** evidence of no harm. Only `int4 J=2/M=12` is decided: its interval lies
+entirely above the bar, a genuine FAIL at +12.7%.
+
+**What survives: cost rises with swap, within a fixed quantization.** Measured against a
+common baseline on the same text, so the two swap levels are directly comparable. In
+int3-vq, 9.65% swap → +1.01% and 17.62% swap → +3.63%; the high-swap point is 2.42 SE above
+zero, the low-swap point only 0.92 SE — so what is established is that the high-swap
+configuration costs something real, and that cost grows faster than swap does. The same
+shape appears in int4 (1.72 SE and 6.91 SE).
+
+**What does NOT survive: "the cost is ~2× worse in int4".** That compares two estimates
+each individually indistinguishable from zero, and a ratio inherits that uncertainty rather
+than escaping it. Doing the difference-of-differences properly
+(`SE = sqrt(SE₁² + SE₂²)`):
+
+| matched swap | int4 − int3-vq | SE of difference | |
+|---|---:|---:|---|
+| ~9.6% | +0.01070 | 0.01627 | 0.66 SE — **unresolved** |
+| ~17.6% | +0.08392 | 0.02273 | 3.69 SE — resolved, int4 costs more |
+
+So quantization *does* change the cost at high swap, but **at the low-swap operating point
+we would actually ship, the difference is unresolved** — and that is the point that matters,
+since the candidate cell is J=4/M=9. Treat "re-measure per mode rather than inheriting a
+(J, M)" as prudence, not as something this data establishes. Resolving the low-swap
+difference needs both arms powered, which is roughly twice the n of either arm alone.
+
+The mechanism that suggests itself — a less faithful quantization has less quality headroom
+to give away — is plausible, and that is exactly why it is dangerous: plausibility would be
+doing work the statistics are not.
 
 ---
 
