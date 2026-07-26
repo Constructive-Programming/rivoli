@@ -21,21 +21,19 @@ const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 /// HIP — where `WAVE 32` in `common.hpp` is an assumption — the pipelines pin it with
 /// `requiredSubgroupSize`, so a driver that cannot honour it fails at init, loudly.
 pub const WAVE: u32 = 32;
-/// Threads per workgroup = `ROWS_PER_BLOCK * WAVE`; must match `kernels/vk/common.glsl`.
+/// Rows (= subgroups) per workgroup; must match `kernels/vk/common.glsl`.
 pub const ROWS_PER_BLOCK: u32 = 8;
-pub const BLOCK: u32 = ROWS_PER_BLOCK * WAVE;
 
 /// Instance, device, the dedicated compute queue, and a command pool on it. Built
 /// once by [`gpu`]; never dropped (see the note there).
 pub struct Gpu {
     pub device: ash::Device,
-    pub queue: vk::Queue,
-    pub qfam: u32,
     pub memprops: vk::PhysicalDeviceMemoryProperties,
-    /// Kept alive for the device's sake, and for `mem_info`'s memory-budget query.
-    pub instance: ash::Instance,
-    pub phys: vk::PhysicalDevice,
-    entry: ash::Entry,
+    queue: vk::Queue,
+    instance: ash::Instance,
+    phys: vk::PhysicalDevice,
+    /// Owns the dlopen'd libvulkan; must outlive the instance, never called through.
+    _entry: ash::Entry,
     cmd: Mutex<Cmd>,
     pipes: Pipes,
     validation: bool,
@@ -100,13 +98,10 @@ impl Gpu {
             .application_name(c"rivoli")
             .api_version(vk::API_VERSION_1_3);
         let validation = Self::validation_layer(&entry);
-        let layers: Vec<*const i8> = validation
-            .then_some(VALIDATION_LAYER.as_ptr())
-            .into_iter()
-            .collect();
+        let all = [VALIDATION_LAYER.as_ptr()];
         let ci = vk::InstanceCreateInfo::default()
             .application_info(&app)
-            .enabled_layer_names(&layers);
+            .enabled_layer_names(&all[..validation as usize]);
         // SAFETY: `ci` and everything it borrows outlive the call.
         let instance = unsafe { entry.create_instance(&ci, None) }?;
 
@@ -122,11 +117,10 @@ impl Gpu {
         Ok(Self {
             device,
             queue,
-            qfam,
             memprops,
             instance,
             phys,
-            entry,
+            _entry: entry,
             cmd: Mutex::new(cmd),
             pipes,
             validation,
@@ -216,11 +210,12 @@ impl Gpu {
     fn compute_queue(instance: &ash::Instance, phys: vk::PhysicalDevice) -> Option<u32> {
         // SAFETY: `phys` came from `instance`.
         let fams = unsafe { instance.get_physical_device_queue_family_properties(phys) };
-        let has_compute = |f: &vk::QueueFamilyProperties| f.queue_flags.contains(vk::QueueFlags::COMPUTE);
-        let idx = |pred: &dyn Fn(&vk::QueueFamilyProperties) -> bool| {
-            fams.iter().position(pred).map(|i| i as u32)
-        };
-        idx(&|f| has_compute(f) && !f.queue_flags.contains(vk::QueueFlags::GRAPHICS)).or_else(|| idx(&has_compute))
+        let compute =
+            |f: &vk::QueueFamilyProperties| f.queue_flags.contains(vk::QueueFlags::COMPUTE);
+        fams.iter()
+            .position(|f| compute(f) && !f.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+            .or_else(|| fams.iter().position(compute))
+            .map(|i| i as u32)
     }
 
     /// Every required feature the device lacks, named as the spec names it so the
@@ -358,15 +353,6 @@ impl Gpu {
             |_| "<unnamed>".to_string(),
             |s| s.to_string_lossy().into_owned(),
         )
-    }
-}
-
-/// Silence the "field is never read" lint on the loader handle: `ash::Entry` owns the
-/// dlopen'd libvulkan and must outlive the instance, but nothing calls through it.
-impl Gpu {
-    #[allow(dead_code)]
-    fn entry(&self) -> &ash::Entry {
-        &self.entry
     }
 }
 
@@ -633,12 +619,6 @@ impl Buf {
     }
     pub fn ptr_mut(&mut self) -> *mut u8 {
         self.addr as *mut u8
-    }
-    pub fn len(&self) -> usize {
-        self.len
-    }
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
     }
 
     /// Host-write `bytes` at byte offset `off`. HOST_COHERENT, and `vkQueueSubmit`

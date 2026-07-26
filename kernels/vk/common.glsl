@@ -23,28 +23,10 @@ float wave_sum(float v) {
     return v;
 }
 
-// bf16 → f32: bf16 is the high 16 bits of f32 (matches math.rs::bf16_to_f32).
-float bf16f(uint b) {
-    return uintBitsToFloat(b << 16);
-}
-
-// f32 → bf16, round-to-nearest-even (matches math.rs::f32_to_bf16). Non-finite keeps
-// its top 16 bits verbatim (an RNE carry could turn a NaN into an Inf).
-uint f2bf16(float x) {
-    uint b = floatBitsToUint(x);
-    if ((b & 0x7f800000u) == 0x7f800000u) return b >> 16; // inf/nan
-    return (b + (((b >> 16) & 1u) + 0x7fffu)) >> 16;
-}
-
-// fp8-e4m3 → f32 (matches math.rs::e4m3_to_f32). 1 sign / 4 exp (bias 7) / 3 mant;
-// exp==0 subnormal = sign·(m/8)·2^-6; (exp==15, mant==7) = NaN.
-float e4m3f(uint b) {
-    float sign = (b & 0x80u) != 0u ? -1.0 : 1.0;
-    int exp = int((b >> 3) & 0x0fu);
-    float mant = float(b & 0x07u);
-    if (exp == 0) return sign * (mant * 0.125) * 0.015625; // 2^-6
-    if (exp == 15 && mant == 7.0) return uintBitsToFloat(0x7fc00000u);
-    return sign * (1.0 + mant * 0.125) * exp2(float(exp - 7));
-}
+// bf16f / f2bf16 / e4m3f are NOT here yet, on purpose. Unused GLSL functions are
+// optimised out of every module, so porting them ahead of a caller ships code that
+// looks verified and is not — and f2bf16's non-finite branch is a hand-rewrite of
+// isfinite() into a bit test. Port each alongside the first kernel that needs it, so
+// that kernel's oracle covers it.
 
 #endif // RIVOLI_COMMON_GLSL

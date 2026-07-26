@@ -55,6 +55,62 @@ fn matvec_f32(y: &mut [f32], x: &[f32], w: &[f32], i_dim: usize) {
     }
 }
 
+/// One `gemv_f32` dispatch, returning the raw output bytes.
+fn gemv(x: &Buf, w: &Buf, y: &mut Buf, o_dim: usize, i_dim: usize) -> Vec<u8> {
+    // SAFETY: live Buf device addresses of the documented sizes; nothing is dropped
+    // before the device_sync below.
+    unsafe {
+        launch_gemv_f32(
+            x.ptr() as *const f32,
+            w.ptr() as *const f32,
+            o_dim,
+            i_dim,
+            y.ptr_mut() as *mut f32,
+        )
+        .expect("launch");
+    }
+    device_sync().expect("sync");
+    let mut out = Vec::new();
+    y.read_into(&mut out, o_dim * 4).expect("out");
+    out
+}
+
+/// Greedy decode must be reproducible run to run, which is a STRICTER property than
+/// the oracle's 1e-3 accuracy: a reduction whose order varies with workgroup
+/// scheduling passes that tolerance happily. So compare BIT PATTERNS across repeats,
+/// with a differently-shaped dispatch interleaved to perturb the scheduler.
+///
+/// This is why `wave_sum` is a fixed `subgroupShuffleDown` ladder and not
+/// `subgroupAdd`. Every kernel with a reduction gets this test as it is ported —
+/// `gemv_fp8_splitk` and `mla_attend_combine` especially, since they reduce across
+/// workgroup partials in LDS rather than within one subgroup.
+#[test]
+fn gemv_f32_is_bit_reproducible() {
+    let mut r = Lcg(0xDE7);
+    let (o_dim, i_dim) = (255usize, 1024usize);
+    let w: Vec<f32> = (0..o_dim * i_dim).map(|_| r.f()).collect();
+    let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
+    let (xb, wb) = (dev(&f32b(&x)), dev(&f32b(&w)));
+    let mut yb = dev(&vec![0u8; o_dim * 4]);
+
+    // A decoy of a different shape, dispatched between repeats so the two runs do not
+    // see identical queue state.
+    let (dx, dw) = (dev(&f32b(&x[..96])), dev(&f32b(&w[..96 * 33])));
+    let mut dy = dev(&[0u8; 33 * 4]);
+
+    let first = gemv(&xb, &wb, &mut yb, o_dim, i_dim);
+    for i in 1..5 {
+        gemv(&dx, &dw, &mut dy, 33, 96);
+        let again = gemv(&xb, &wb, &mut yb, o_dim, i_dim);
+        assert_eq!(first, again, "gemv_f32 not bit-reproducible on repeat {i}");
+    }
+    // Guard against comparing two buffers of zeros and calling it determinism.
+    assert!(
+        f32v(&first).iter().any(|v| v.abs() > 1e-6),
+        "output is all zero — the test proves nothing"
+    );
+}
+
 #[test]
 fn gemv_f32_matches_oracle() {
     let mut r = Lcg(0x3F2);
@@ -70,21 +126,7 @@ fn gemv_f32_matches_oracle() {
 
         let (xb, wb) = (dev(&f32b(&x)), dev(&f32b(&w)));
         let mut yb = dev(&vec![0u8; o_dim * 4]);
-        // SAFETY: every pointer is a live Buf device address of the size the launcher
-        // documents, and nothing is dropped before the device_sync below.
-        unsafe {
-            launch_gemv_f32(
-                xb.ptr() as *const f32,
-                wb.ptr() as *const f32,
-                o_dim,
-                i_dim,
-                yb.ptr_mut() as *mut f32,
-            )
-            .expect("launch");
-        }
-        device_sync().expect("sync");
-        let mut out = Vec::new();
-        yb.read_into(&mut out, o_dim * 4).expect("out");
+        let out = gemv(&xb, &wb, &mut yb, o_dim, i_dim);
         assert_close(&want, &f32v(&out), &format!("gemv_f32 {o_dim}x{i_dim}"));
     }
 }
