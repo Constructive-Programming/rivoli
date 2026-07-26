@@ -439,9 +439,10 @@ is real, not because the plan exists.
   rather than by a checker.** Deleting it makes
   `chained_dispatch_respects_the_barrier` fail; restoring it makes the same test pass:
 
-  | | barrier removed | barrier present |
+  | configuration | barrier removed | barrier present |
   |---|---|---|
-  | 32-step chain, 2048×2048 | **2 of 8 runs FAIL** | 8 of 8 pass |
+  | 32-step chain ×1 per run, 7.4 s | **2 of 8 runs FAIL** | 8 of 8 pass |
+  | 32-step chain ×16 per run, 1.8 s | **1 of 8 runs FAIL** | 8 of 8 pass |
   | 4-step chain, 2048×2048 | 8 of 8 pass | 8 of 8 pass |
   | 2-step chain, 64×96 | 8 of 8 pass | 8 of 8 pass |
 
@@ -455,11 +456,25 @@ is real, not because the plan exists.
   enough for one escaped hazard to survive to the end. Below that you get a test that
   passes either way — which is worse than none, because of the name on it.
 
-  Two caveats, because this guard is probabilistic and should not be sold as more.
-  Detection is ~25% per run, so a single green run does NOT prove a refactor kept the
-  barrier; a regression surfaces within a few runs, not reliably in one. And it costs
-  7.4 s of the suite's 7.5 s total. `memcpy_dtod_after_dispatch_is_ordered` has no
-  equivalent construction yet, so COMPUTE→TRANSFER remains spec-derived only.
+  **Row two is the cautionary one, and it is the current state.** Running sixteen
+  chains per execution instead of one HALVED detection, 2/8 → 1/8, rather than raising
+  it toward the 1 − 0.75¹⁶ ≈ 99% the arithmetic suggests. Two reasons, and the second
+  is the instructive one: the repeats are not independent, and the same change that
+  added them also fixed a 512 MB duplicate-upload waste that cut runtime 7.4 s → 1.8 s.
+  Those 32 interleaved 16 MB uploads were part of what opened the timing window.
+  **Optimising the test removed the conditions that exposed the race.**
+
+  So the guard currently detects a removed barrier ~12% of the time. It is a smoke
+  alarm with a flat battery: valuable because it CAN fire, not because a green run
+  means anything. Do not read a passing CI run as evidence of ordering.
+
+  The lever for restoring it is not the repeat count — it is putting back whatever made
+  the chains slow and irregular, with unrelated large transfers interleaved between
+  dispatches the obvious candidate. **Re-measure the removal arm after any change to
+  this test**; the detection rate demonstrably does not follow from reasoning about it.
+
+  `memcpy_dtod_after_dispatch_is_ordered` has no equivalent construction at all, so
+  COMPUTE→TRANSFER remains spec-derived only.
 
   **Second, independent evidence that this cover is thin.** The Phase 2 correctness
   review found that `DeviceBuf`'s copies did not synchronise where `hipMemcpy` blocks —

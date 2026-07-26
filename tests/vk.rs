@@ -276,17 +276,29 @@ fn gemv_f32_matches_oracle() {
 /// output row depending on every input element, and a chain long enough that one
 /// escaped hazard survives to the end.
 ///
-/// DETECTION RATE. One chain catches a dropped barrier ~25% of the time (2/8), so a
-/// test performing a single chain would miss three regressions in four — barely better
-/// than the 64x96 version it replaced. It therefore runs `REPEATS` chains and asserts
-/// each. Treating executions as independent, detection is 1 - 0.75^REPEATS: ~90% at 8,
-/// ~99% at 16. REPEATS is 16.
+/// DETECTION RATE — MEASURED, AND WORSE THAN THE ARITHMETIC PREDICTS.
 ///
-/// Two honesties about that number. The independence assumption is UNVERIFIED —
-/// repeats inside one process share a scheduling regime and may well be correlated, in
-/// which case the true rate is lower than 99%. And the 2/8 base rate is itself a small
-/// sample. What is solid is the direction: 16 repeats is strictly and substantially
-/// better than one, and the control arm is clean either way.
+///   1 chain per execution, 7.4 s   ->  2 of 8 executions detect a removed barrier
+///   16 chains per execution, 1.8 s ->  1 of 8
+///   control (barrier present)      ->  0 of 8 in both configurations
+///
+/// Sixteen times the chains, HALF the detection. I predicted ~99% from
+/// 1 - 0.75^16 and that was wrong, because the repeats are not independent and,
+/// worse, because the change that added them also made each chain faster: fixing a
+/// 512 MB duplicate-upload waste dropped the runtime 7.4 s -> 1.8 s, and those 32
+/// interleaved 16 MB uploads were part of what opened the timing window. Optimising
+/// the test removed the conditions that exposed the race.
+///
+/// So: **~12% detection per execution, measured.** A green run is very weak evidence
+/// that a refactor kept the barrier. This test's value is now mostly that it CAN fail
+/// at all — it is a smoke alarm with a flat battery, not a guard. Do not treat a
+/// passing CI run as proof of ordering.
+///
+/// If you want a real guard back, the lever is not the repeat count: it is restoring
+/// whatever made the chains slow and irregular. Interleaving unrelated large transfers
+/// between the dispatches is the obvious candidate, since that is what was removed.
+/// Measure the removal arm again after any change here — the whole point is that this
+/// number does not follow from reasoning.
 ///
 /// COST. The host oracle (32 chained 2048x2048 matvecs, in a debug build) dominates
 /// and is computed once; the repeats add GPU work only. Worth it — this is the only
@@ -299,8 +311,9 @@ fn chained_dispatch_respects_the_barrier() {
     let mut r = Lcg(0xBA2);
     let n = 2048usize;
     const STEPS: usize = 32;
-    /// 1 - 0.75^16 ~= 99% detection, under an independence assumption the docstring
-    /// flags as unverified.
+    /// Measured at ~12% detection per execution, NOT the ~99% that
+    /// 1 - 0.75^REPEATS would suggest — see the docstring. Kept at 16 because it is
+    /// cheap (1.8 s) and more chains cannot hurt; the number is not load-bearing.
     const REPEATS: usize = 16;
 
     // Near-identity: unit diagonal plus small noise. A random matrix chained 32 deep
