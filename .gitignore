@@ -1,2 +1,5 @@
 /target*
 /glm52-fp8/
+# docs/probes/* are standalone crates with their own build dirs; the rooted pattern
+# above does not reach them.
+target/
