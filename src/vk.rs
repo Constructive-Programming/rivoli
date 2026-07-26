@@ -812,16 +812,63 @@ impl Gpu {
         Ok(())
     }
 
-    /// Stage `bytes` in a device buffer that lives until the next [`Gpu::sync`], and
-    /// return its device address. For data a launcher must hand a shader that does not
-    /// fit the 128-byte push-constant budget.
-    fn stage(&self, bytes: &[u8]) -> Result<u64> {
+    /// Stage `bytes` in a device buffer and return it WITH its device address, for data
+    /// a launcher must hand a shader that does not fit the 128-byte push-constant budget.
+    ///
+    /// RETURNS the `Buf` rather than pushing it straight onto `Cmd::scratch`, and that is
+    /// a lifetime requirement, not a style choice. Pushing here published the buffer for
+    /// reclamation while the dispatch that reads it was NOT YET RECORDED: `stage` took
+    /// the `cmd` lock and released it, then `dispatch` re-acquired it. A `Gpu::sync` in
+    /// that window takes the whole scratch list with `mem::take` and drops it after the
+    /// fence, so the dispatch would bake a FREED device address into its push constant.
+    ///
+    /// The trigger is not only an explicit `device_sync`: `Buf::drop` calls `Gpu::sync`
+    /// itself, so any `Buf` dropping on another thread does it, and `Gpu` is
+    /// `unsafe impl Send + Sync` with a design that is explicitly concurrent.
+    ///
+    /// Nothing could have caught it. A bare device address carries no object identity, so
+    /// neither GPU-AV nor the sync layer can see the use-after-free — the same reasoning
+    /// `Buf::drop`'s own comment gives for flushing before it frees.
+    ///
+    /// The caller now holds the buffer on its stack across the `dispatch` call and hands
+    /// it to [`Gpu::retain`] afterwards. It is alive for the whole window, and if the
+    /// caller bails between the two, `Buf::drop` flushes before freeing, which is exactly
+    /// what that drop impl exists for.
+    fn stage(&self, bytes: &[u8]) -> Result<(Buf, u64)> {
+        // Refuse BEFORE allocating, on a poisoned context. `sync`'s poison `ensure!`
+        // returns ABOVE its `mem::take(&mut cmd.scratch)`, so once poisoned the scratch
+        // list has no drain site left — and `Gpu` lives in a `OnceLock` that is never
+        // dropped, so `Cmd` never drops either. Without this check each post-poison
+        // launcher call still allocates a `Buf` (VkBuffer + VkDeviceMemory + a permanent
+        // map), still pushes it, and still returns Ok, failing only later at `enqueue`.
+        // The caller sees a sensible error every time and nothing signals that the retry
+        // loop is burning device handles until `maxMemoryAllocationCount` (commonly 4096)
+        // runs out and UNRELATED `Buf::new` calls start failing with OOM — the wrong bug
+        // entirely, and permanent for the process.
+        //
+        // The guard is here rather than in `sync` because the buffers already on the list
+        // may still be referenced by a submitted-but-unretired command buffer; draining
+        // them on the poisoned path would trade a leak for a use-after-free.
+        ensure!(
+            !self
+                .cmd
+                .lock()
+                .map_err(|_| anyhow!("vk command lock poisoned"))?
+                .poisoned,
+            "vk command buffer poisoned by an earlier device_sync failure"
+        );
         let mut buf = Buf::new(bytes.len())?;
         buf.write_at(0, bytes)?;
         let addr = buf.ptr() as u64;
+        Ok((buf, addr))
+    }
+
+    /// Hand a staged buffer over to be freed at the next [`Gpu::sync`]. Call only AFTER
+    /// the dispatch that reads it has been recorded — see [`Gpu::stage`].
+    fn retain(&self, buf: Buf) -> Result<()> {
         let mut cmd = self.cmd.lock().map_err(|_| anyhow!("vk command lock poisoned"))?;
         cmd.scratch.push(buf);
-        Ok(addr)
+        Ok(())
     }
 }
 
@@ -1945,7 +1992,10 @@ pub unsafe fn launch_rope(
         trig.push(ang.sin() as f32);
     }
     let bytes: Vec<u8> = trig.iter().flat_map(|f| f.to_le_bytes()).collect();
-    let trig_addr = gpu.stage(&bytes)?;
+    // Held on this stack across the dispatch below, then handed over for reclamation —
+    // see `Gpu::stage` for why it cannot go onto the scratch list before the dispatch is
+    // recorded.
+    let (trig_buf, trig_addr) = gpu.stage(&bytes)?;
 
     let push = RopePush {
         base: base as u64,
@@ -1954,7 +2004,8 @@ pub unsafe fn launch_rope(
         seg: seg as i32,
     };
     // One workgroup per row, as HIP does; the threads inside stride over `half`.
-    gpu.dispatch(&gpu.pipes.rope_interleave, &push, count as u32)
+    gpu.dispatch(&gpu.pipes.rope_interleave, &push, count as u32)?;
+    gpu.retain(trig_buf)
 }
 
 
