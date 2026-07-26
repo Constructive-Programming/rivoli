@@ -747,6 +747,26 @@ than an error:
 
 ---
 
+## A first-failure build hid a second one, and the fix caught it in the wild
+
+`build.rs` used to compile shaders in sorted order and abort on the first failure, so a
+change breaking several shaders reported one. It was fixed to compile everything and fail
+once with the whole list — and the confirmation arrived unprompted.
+
+The fix was verified with a synthetic break (set `ROWS_PER_BLOCK = 6`, watch two `#error`s
+report instead of one). Then, on the next rebase, a deliberate-break check that had
+previously printed **DID NOT FIRE** for `argmax_reduce`'s power-of-two coupling started
+firing correctly — because `append_kv`'s `#error` was no longer masking it. A real case,
+not a constructed one, and the accumulation change is what surfaced it.
+
+The general form is worth keeping: **a check that stops at the first failure reports a
+floor, not a count.** "The build passes now", after fixing the one error it named, is a
+weaker statement than it sounds — nothing established that error was the only one. The
+same applies to any first-failure-abort harness. Ask of a check: *if there were three
+problems, would this tell me three?*
+
+---
+
 ## Measurement caveat
 
 Free-running greedy `tok/s` cannot rank modes on its own: a degenerate run routes to the
