@@ -142,10 +142,32 @@ mod tier {
             Ok(())
         }
 
-        /// Reserve `len` bytes (256-aligned) and return a host-writable pointer to
-        /// fill in place (`pread`/memcpy). Errors if the tier is full — the pin is
-        /// sized to fit, so OOM here is a budgeting bug, not a runtime condition.
-        pub fn reserve(&mut self, len: usize) -> Result<*mut u8> {
+        /// Reserve `bytes.len()` device bytes (256-aligned), fill them, and return
+        /// the placed weight's DEVICE pointer.
+        ///
+        /// One call rather than reserve-then-memcpy, because the two are not
+        /// separable in general: filling means writing at a HOST address, and only
+        /// the tier knows the relationship between that and the device address it
+        /// hands back. Under HIP's unified addressing they are the same number and
+        /// this is a plain memcpy; that coincidence is not portable, and callers must
+        /// not depend on it. Making this the only way in also means a caller cannot
+        /// hold an unfilled device pointer, and costs `pin.rs` five `unsafe` blocks.
+        ///
+        /// Errors if the tier is full — the pin is sized to fit, so OOM here is a
+        /// budgeting bug, not a runtime condition.
+        pub fn place(&mut self, bytes: &[u8]) -> Result<*mut u8> {
+            let dst = self.reserve(bytes.len())?;
+            // SAFETY: `dst` owns the `bytes.len()` bytes just reserved, and the source
+            // is a live slice; the regions cannot overlap (one is the mmap'd artifact
+            // or a fresh Vec, the other the device slab).
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
+            Ok(dst)
+        }
+
+        /// Bump the cursor by `len` (256-aligned) and return the slab pointer.
+        /// Private: [`DeviceTier::place`] is the only way to obtain a tier pointer,
+        /// so one cannot escape unfilled.
+        fn reserve(&mut self, len: usize) -> Result<*mut u8> {
             let off = (self.used + 255) & !255;
             ensure!(
                 off + len <= self.capacity,
@@ -389,12 +411,8 @@ mod tier {
             let mut tier = DeviceTier::new(4 << 20).expect("alloc tier");
             let a: Vec<u8> = (0..1000u32).map(|i| (i & 0xff) as u8).collect();
             let b: Vec<u8> = (0..500u32).map(|i| ((i * 7) & 0xff) as u8).collect();
-            let pa = tier.reserve(a.len()).expect("reserve a");
-            // SAFETY: pa owns a.len() host-writable bytes just reserved.
-            unsafe { std::ptr::copy_nonoverlapping(a.as_ptr(), pa, a.len()) };
-            let pb = tier.reserve(b.len()).expect("reserve b");
-            // SAFETY: pb owns b.len() host-writable bytes just reserved.
-            unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), pb, b.len()) };
+            let pa = tier.place(&a).expect("place a");
+            let pb = tier.place(&b).expect("place b");
             assert_ne!(pa, pb);
             // SAFETY: read back the bytes just written (device-local, host-mapped).
             let (ra, rb) = unsafe {
@@ -412,7 +430,7 @@ mod tier {
         #[test]
         fn tier_rejects_overflow() {
             let mut tier = DeviceTier::new(1 << 20).expect("alloc tier");
-            assert!(tier.reserve((1 << 20) + 1).is_err());
+            assert!(tier.place(&vec![0u8; (1 << 20) + 1]).is_err());
         }
     }
 }

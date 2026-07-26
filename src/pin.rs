@@ -188,10 +188,8 @@ pub struct Pin<'a> {
 /// resident mmap into the device-local slab.
 fn place_f32(tier: &mut DeviceTier, st: &Safetensors, name: &str) -> Result<*const f32> {
     let (bytes, _) = st.typed(name, Dtype::F32)?;
-    let dst = tier.reserve(bytes.len())?;
-    // SAFETY: dst owns bytes.len() reserved bytes; f32 LE host == LE device.
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
-    Ok(dst as *const f32)
+    // f32 LE host == LE device.
+    Ok(tier.place(bytes)? as *const f32)
 }
 
 /// Place an fp8-e4m3 block-scaled weight (`<name>.weight` F8E4M3 + `.weight_scale_inv`
@@ -209,13 +207,8 @@ fn place_fp8(
     );
     let (o_dim, i_dim) = (shape[0], shape[1]);
     let (sc, _) = st.typed(&format!("{name}.weight_scale_inv"), Dtype::F32)?;
-    let packed = tier.reserve(w.len())?;
-    let scale = tier.reserve(sc.len())?;
-    // SAFETY: each dst owns its reserved byte count.
-    unsafe {
-        std::ptr::copy_nonoverlapping(w.as_ptr(), packed, w.len());
-        std::ptr::copy_nonoverlapping(sc.as_ptr(), scale, sc.len());
-    }
+    let packed = tier.place(w)?;
+    let scale = tier.place(sc)?;
     Ok(Fp8Weight {
         packed,
         scale: scale as *const f32,
@@ -232,13 +225,8 @@ fn place_i8(tier: &mut DeviceTier, st: &Safetensors, name: &str) -> Result<Int8W
     ensure!(shape.len() == 2, "{name}: expected 2-D, got {shape:?}");
     let (o_dim, i_dim) = (shape[0], shape[1]);
     let (sc, _) = st.typed(&format!("{name}.scale"), Dtype::F32)?;
-    let packed = tier.reserve(w.len())?;
-    let scale = tier.reserve(sc.len())?;
-    // SAFETY: each dst owns its reserved byte count.
-    unsafe {
-        std::ptr::copy_nonoverlapping(w.as_ptr(), packed, w.len());
-        std::ptr::copy_nonoverlapping(sc.as_ptr(), scale, sc.len());
-    }
+    let packed = tier.place(w)?;
+    let scale = tier.place(sc)?;
     Ok(Int8Weight {
         packed,
         scale: scale as *const f32,
@@ -268,9 +256,7 @@ fn place_shared(
     block: &[u8],
     off: &[usize; 6],
 ) -> Result<MlpVq> {
-    let dst = tier.reserve(block.len())?;
-    // SAFETY: dst owns block.len() reserved bytes.
-    unsafe { std::ptr::copy_nonoverlapping(block.as_ptr(), dst, block.len()) };
+    let dst = tier.place(block)?;
     Ok(MlpVq {
         gate: vqweight_at(dst, off[0], off[1]),
         up: vqweight_at(dst, off[2], off[3]),
@@ -603,12 +589,11 @@ impl<'a> Pin<'a> {
         let mut codebooks = [std::ptr::null(); 3];
         if vq_present {
             for (i, cb) in cbs.iter().enumerate() {
-                let half: Vec<u16> = cb.iter().map(|&v| crate::math::f32_to_f16(v)).collect();
-                let bytes = half.len() * 2;
-                let dst = tier.reserve(bytes)?;
-                // SAFETY: dst owns bytes just reserved; u16 LE host == LE device.
-                unsafe { std::ptr::copy_nonoverlapping(half.as_ptr() as *const u8, dst, bytes) };
-                codebooks[i] = dst as *const u16;
+                let half: Vec<u8> = cb
+                    .iter()
+                    .flat_map(|&v| crate::math::f32_to_f16(v).to_le_bytes())
+                    .collect();
+                codebooks[i] = tier.place(&half)? as *const u16;
             }
         }
 
