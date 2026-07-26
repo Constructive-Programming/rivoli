@@ -341,6 +341,52 @@ analogue is "the obvious builtin" needs an explicit decision, never a transliter
 That is exactly how `inversesqrt` got in, and how `exp2` sat under a comment calling
 bit-exactness a contract until this list was written.
 
+### THE EXACTNESS STRATEGY: eliminate the degree of freedom, do not hope it is exercised alike
+
+The single most consequential fact in this port, and it took until the FMA finding to state
+plainly:
+
+> **Cross-backend bit-identity rests on two independent compilers making the same choice
+> wherever their specifications leave one open.** Careful porting does not achieve
+> exactness — it only makes the two sides ELIGIBLE to agree. The agreement itself is
+> contingent on decisions neither backend's author controls.
+
+Every accuracy contract (`exp2` at 3 ULP, `inversesqrt` at 2 ULP), every latitude to
+contract a multiply-add, every unspecified summation order is such a choice. Two conformant
+compilers may resolve each differently and both be right.
+
+**So the strategy is not to match the choices. It is to remove them.** Three fixes already
+in this tree are instances of one move, and naming the move matters more than the list,
+because the list cannot tell you what to do about a case it does not contain:
+
+| degree of freedom | how it was removed |
+|---|---|
+| `exp2`'s accuracy contract | power of two **built from bits** — exact by construction, no contract left to differ on |
+| `pow`/`cos`/`sin` in rope | evaluated **host-side in f64**, uploaded as a table — no shader transcendental left to differ on |
+| which multiply fuses in `a*b + c*d` | a **named temporary** for one product — no contraction freedom left to differ on |
+
+The pattern: find the point where the two toolchains are permitted to disagree, and
+restructure so the permission never arises. That is stronger than testing for agreement,
+because a test can only observe today's compilers.
+
+**When you meet a new case, ask in this order:**
+
+1. **Can the value be constructed exactly?** (`exp2` — integer argument, exact power of two.)
+2. **Can the work move to a place with one implementation?** (rope — the host, in f64.)
+3. **Can the expression be written so only one lowering is legal?** (the accumulator — split
+   the products across statements.)
+4. Only if none apply: **pre-register the divergence**, name the mechanism, and put it on
+   the token-ID gate's suspect list. `exp` in softmax is the one genuine case so far, and it
+   is genuine because its argument is an arbitrary runtime value.
+
+**Why this hazard class appears in 2c and not earlier, which also predicts where it appears
+next.** Contraction only has a choice to make when TWO multiplies feed one add. Every
+kernel ported through 2b has at most one multiply per add — `acc += x*w`, `acc += s*(…)` —
+so both compilers fused the only candidate and the backends agreed *by having no freedom*,
+not by anyone's care. `attn.hip:185`'s `acc[k]*corr + p*Lt[..]` is the first expression in
+the port with two, and the first place the choice is real. Grep for that shape when
+approaching any remaining kernel.
+
 Two of these have mechanised guards (rules 2 and 9) and one is preventive (rule 11).
 The rest are checked by reading, which is why the list exists.
 
