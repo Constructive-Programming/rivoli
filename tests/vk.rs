@@ -7,7 +7,9 @@
 #![cfg(feature = "vulkan")]
 #![allow(clippy::expect_used)]
 
-use rivoli::vk::{Buf, ROWS_PER_BLOCK, VALIDATION_ERRORS, device_sync, gpu, launch_gemv_f32};
+use rivoli::vk::{
+    Buf, ROWS_PER_BLOCK, VALIDATION_ERRORS, device_sync, gpu, launch_gemv_f32, memcpy_dtod,
+};
 use std::sync::atomic::Ordering;
 
 fn f32b(v: &[f32]) -> Vec<u8> {
@@ -223,6 +225,38 @@ fn gemv_f32_is_bit_reproducible() {
         "output is all zero — the test proves nothing"
     );
     assert_validation_clean("gemv_f32_is_bit_reproducible");
+}
+
+/// `memcpy_dtod` (arena slot relocation) reading what a dispatch just wrote, in ONE
+/// command buffer. The copy's TRANSFER_READ must be ordered after the shader's
+/// SHADER_WRITE, which is a COMPUTE -> TRANSFER dependency — a class the barrier in
+/// `Gpu::enqueue` did not cover until this test forced it to.
+///
+/// Run this under `VK_LAYER_VALIDATE_SYNC=1`. The numeric assertion alone is weak
+/// here: an unsynchronised copy usually still returns the right bytes on this driver,
+/// which is exactly why the hazard is worth a checker rather than an oracle.
+#[test]
+fn memcpy_dtod_after_dispatch_is_ordered() {
+    let mut r = Lcg(0xC0B);
+    let (o_dim, i_dim) = (128usize, 256usize);
+    let w: Vec<f32> = (0..o_dim * i_dim).map(|_| r.f()).collect();
+    let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
+    let mut want = vec![0.0f32; o_dim];
+    matvec_f32(&mut want, &x, &w, i_dim);
+
+    let (xb, wb) = (dev(&f32b(&x)), dev(&f32b(&w)));
+    let mut yb = dev(&f32b(&vec![0.0f32; o_dim]));
+    let zb = dev(&f32b(&vec![f32::NAN; o_dim]));
+
+    // Dispatch writes y, then the copy reads y — no sync in between, so both land in
+    // the same command buffer and only the barrier separates them.
+    launch(&xb, &wb, &mut yb, o_dim, i_dim);
+    // SAFETY: both are live Buf device addresses, o_dim*4 bytes, distinct allocations.
+    unsafe { memcpy_dtod(zb.ptr() as *mut u8, yb.ptr(), o_dim * 4).expect("dtod") };
+
+    let got = f32v(&read(&zb, o_dim));
+    assert_close(&want, &got, "memcpy_dtod after dispatch");
+    assert_validation_clean("memcpy_dtod_after_dispatch_is_ordered");
 }
 
 /// The guards report errors rather than tripping a Vulkan VUID or allocating nothing.

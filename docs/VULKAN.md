@@ -331,12 +331,27 @@ is real, not because the plan exists.
 
 ## Risks
 
-- **The inter-dispatch barrier covers COMPUTE→COMPUTE only.** `Gpu::enqueue` emits
-  `SHADER_WRITE → SHADER_READ|SHADER_WRITE` between dispatches, which is what makes a
-  `launch_*` sequence behave like HIP's default stream. The moment `vkCmdCopyBuffer`
-  arrives — the copy pool, arena compaction, H2D staging — both the stage and access
-  masks need `TRANSFER` added, or the copies are unordered against the dispatches.
-  With no validation layer that failure reads as **garbage numbers, not a hang**.
+- **Synchronisation validation does not cover compute→transfer on this stack, so the
+  barrier's TRANSFER masks are SPEC-DERIVED, NOT VERIFIED.** `Gpu::enqueue` now scopes
+  both COMPUTE and TRANSFER on each side, which is required once `memcpy_dtod` records
+  a `vkCmdCopyBuffer` next to dispatches. But the checker cannot confirm it: with the
+  barrier removed **entirely**, an unsynchronised compute-write → transfer-read is
+  reported as nothing at all. That is not a buffer-device-address blind spot — a
+  descriptor-bound write is equally invisible (`docs/probes/vk_validation`,
+  `compute-copy` and `compute-copy-desc`), while transfer↔transfer fires normally.
+
+  This is the weakest evidence in the backend, and it is weak in the direction that
+  hurts: an unordered copy usually still returns the right bytes on this driver, so
+  neither the oracle nor the checker would catch it, and the failure would surface as
+  intermittent garbage under load.
+
+  **The same doubt applies to the compute→compute case until proven otherwise.**
+  `chained_dispatch_respects_the_barrier` passing under sync validation is only
+  evidence if the checker fires on that class, which has NOT been established — the
+  `compute-compute` probe mode exists to settle it and has not yet been run. Until it
+  has, treat the inter-dispatch barrier as spec-derived too. Assuming a checker that
+  fires on one hazard class covers another is exactly the error the probe matrix in
+  `docs/probes/README.md` exists to prevent.
 - **Subgroup size control** may be unavailable or ignored on some drivers; a wave64
   fallback means re-tuning `ROWS_PER_BLOCK` and re-validating determinism. Note the
   concrete shape of that failure: `gemv_f32.comp` maps rows by `gl_SubgroupID`, so a

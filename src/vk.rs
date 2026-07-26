@@ -610,15 +610,33 @@ impl Gpu {
             cmd.recording = true;
         }
         f(&self.device, cmd.buf);
+        // COMPUTE **and** TRANSFER on both sides. Dispatches are not the only thing
+        // recorded here — `memcpy_dtod` records a `vkCmdCopyBuffer`, so all four
+        // orderings occur: dispatch→dispatch, dispatch→copy (compaction reading a slot
+        // a kernel just wrote), copy→dispatch, copy→copy. Scoping only COMPUTE would
+        // leave the two involving a copy unordered.
+        //
+        // NOT verified by a checker, unlike everything else load-bearing here. See
+        // docs/VULKAN.md "Synchronisation validation does not cover compute→transfer":
+        // the layer reports transfer↔transfer hazards but stays silent on this class
+        // even with NO barrier at all, so a clean run says nothing either way. This is
+        // spec-derived, and it is the weakest evidence in the backend.
         let bar = [vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(
+                vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::TRANSFER_READ
+                    | vk::AccessFlags::TRANSFER_WRITE,
+            )];
+        let stages =
+            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER;
         // SAFETY: recording is open on `cmd.buf`.
         unsafe {
             self.device.cmd_pipeline_barrier(
                 cmd.buf,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
+                stages,
+                stages,
                 vk::DependencyFlags::empty(),
                 &bar,
                 &[],
@@ -788,6 +806,38 @@ pub struct Buf {
     len: usize,
 }
 
+/// Every live [`Buf`], so a device address can be mapped back to the `VkBuffer` that
+/// owns it.
+///
+/// This is the lookup table docs/VULKAN.md rejects for the launcher path — and the
+/// reasoning still holds there. It is acceptable HERE because `vkCmdCopyBuffer` takes
+/// handles and offsets and there is no copy-by-address command, and because the only
+/// caller is arena compaction: occasional, already synchronous, already moving whole
+/// expert blocks. A scan of a handful of entries next to a multi-megabyte copy is not
+/// a cost. Do not let it grow a second caller on the decode path.
+static ALLOCS: Mutex<Vec<Alloc>> = Mutex::new(Vec::new());
+
+struct Alloc {
+    base: u64,
+    len: u64,
+    buf: vk::Buffer,
+}
+
+/// The `VkBuffer` owning `[addr, addr+len)`, and the offset into it.
+fn resolve(addr: u64, len: usize) -> Result<(vk::Buffer, u64)> {
+    let allocs = ALLOCS.lock().map_err(|_| anyhow!("vk alloc registry poisoned"))?;
+    let end = addr
+        .checked_add(len as u64)
+        .ok_or_else(|| anyhow!("device address {addr:#x} + {len} overflows"))?;
+    allocs
+        .iter()
+        .find(|a| addr >= a.base && end <= a.base + a.len)
+        .map(|a| (a.buf, addr - a.base))
+        .ok_or_else(|| {
+            anyhow!("device address {addr:#x}..{end:#x} is not inside any live Buf")
+        })
+}
+
 impl Buf {
     pub fn new(len: usize) -> Result<Self> {
         ensure!(len > 0, "Buf::new(0): Vulkan rejects a zero-sized buffer");
@@ -863,6 +913,14 @@ impl Buf {
         let info = vk::BufferDeviceAddressInfo::default().buffer(buf);
         // SAFETY: `buf` was created with SHADER_DEVICE_ADDRESS and is bound.
         let addr = unsafe { g.device.get_buffer_device_address(&info) };
+        ALLOCS
+            .lock()
+            .map_err(|_| anyhow!("vk alloc registry poisoned"))?
+            .push(Alloc {
+                base: addr,
+                len: len as u64,
+                buf,
+            });
         Ok(Self {
             buf,
             mem,
@@ -884,6 +942,18 @@ impl Buf {
     }
     pub fn ptr_mut(&mut self) -> *mut u8 {
         self.addr as *mut u8
+    }
+
+    /// The HOST base of the permanent mapping — a real, dereferenceable pointer, and
+    /// the target an io_uring O_DIRECT read DMAs into.
+    ///
+    /// This is the OTHER half of the pair [`ptr`](Self::ptr) documents: under HIP these
+    /// are one number and `VmmBuf::ptr_mut` serves both purposes, which is why
+    /// `pin.rs`'s `ArenaPool` can use one base for descriptor arithmetic and for
+    /// `ReadSpec.dst`. Here they are unrelated, so the caller has to say which one it
+    /// means. See docs/VULKAN.md, "Host pointer != device address".
+    pub fn host_mut(&mut self) -> *mut u8 {
+        self.host
     }
 
     /// Host-write `bytes` at byte offset `off`. HOST_COHERENT, and `vkQueueSubmit`
@@ -930,6 +1000,11 @@ impl Drop for Buf {
         if let Err(e) = g.sync() {
             warn!("Buf::drop: flush failed, freeing anyway: {e:#}");
         }
+        // Deregister BEFORE the handles die, so `resolve` can never hand a freed
+        // VkBuffer to vkCmdCopyBuffer.
+        if let Ok(mut allocs) = ALLOCS.lock() {
+            allocs.retain(|a| a.base != self.addr);
+        }
         // SAFETY: all three handles came from this device and are released once. The
         // caller's contract (see `device_sync`) is that no kernel still references them.
         unsafe {
@@ -943,6 +1018,30 @@ impl Drop for Buf {
 // ---------------------------------------------------------------------------
 // Kernel launchers — the `hip.rs` surface, one fn per ported kernel.
 // ---------------------------------------------------------------------------
+
+/// Device-to-device copy of `bytes` from `src` to `dst` — the routed arena's slot
+/// relocation (compaction). `hip::memcpy_dtod`'s twin, and like it this BLOCKS, so the
+/// moved expert is in place before any later kernel reads the new slot.
+///
+/// # Safety
+/// `dst` and `src` must be DEVICE ADDRESSES inside live [`Buf`]s, `bytes` long, and
+/// NON-OVERLAPPING (the arena guarantees distinct slots).
+pub unsafe fn memcpy_dtod(dst: *mut u8, src: *const u8, bytes: usize) -> Result<()> {
+    ensure!(bytes > 0, "memcpy_dtod: argument guard rejected");
+    let g = gpu()?;
+    let (dbuf, doff) = resolve(dst as u64, bytes)?;
+    let (sbuf, soff) = resolve(src as u64, bytes)?;
+    let region = [vk::BufferCopy::default()
+        .src_offset(soff)
+        .dst_offset(doff)
+        .size(bytes as u64)];
+    g.enqueue(|d, cb| {
+        // SAFETY: recording is open; both handles came from `resolve`, so each range
+        // lies inside its buffer.
+        unsafe { d.cmd_copy_buffer(cb, sbuf, dbuf, &region) };
+    })?;
+    g.sync()
+}
 
 /// Declare a `push_constant` mirror struct, with both of its invariants checked AT
 /// COMPILE TIME rather than left as rules a porter has to remember at kernel 11 of 16:

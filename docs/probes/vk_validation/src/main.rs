@@ -350,6 +350,366 @@ fn probe_gpuav() -> &'static str {
     "VUID-RuntimeSpirv-PhysicalStorageBuffer64-11819"
 }
 
+/// SYNCHRONISATION validation, COMPUTE -> TRANSFER specifically.
+///
+/// `sync` proves the checker sees transfer-vs-transfer hazards. That does NOT imply it
+/// sees a compute write followed by a transfer read, which is the dependency
+/// `memcpy_dtod` (arena compaction reading a slot a kernel just wrote) actually needs.
+/// A different hazard class can have different coverage, and rivoli's suite came back
+/// clean on this pattern with a barrier that scopes only COMPUTE -> COMPUTE — either
+/// the barrier is enough or the checker is blind here, and those are very different
+/// facts. This mode settles it by removing the barrier ENTIRELY: if that is silent too,
+/// the checker cannot speak to this pattern and its silence proves nothing.
+fn probe_compute_copy() -> &'static str {
+    let c = setup(true);
+    unsafe {
+        let mk = |size: u64, usage: vk::BufferUsageFlags| {
+            let b = c
+                .device
+                .create_buffer(
+                    &vk::BufferCreateInfo::default().size(size).usage(usage),
+                    None,
+                )
+                .expect("buf");
+            let req = c.device.get_buffer_memory_requirements(b);
+            let mut mf = vk::MemoryAllocateFlagsInfo::default()
+                .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+            let m = c
+                .device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(req.size)
+                        .memory_type_index(memtype(
+                            &c,
+                            req.memory_type_bits,
+                            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                        ))
+                        .push_next(&mut mf),
+                    None,
+                )
+                .expect("mem");
+            c.device.bind_buffer_memory(b, m, 0).expect("bind");
+            b
+        };
+        let src = mk(
+            256,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                | vk::BufferUsageFlags::TRANSFER_SRC,
+        );
+        let dst = mk(256, vk::BufferUsageFlags::TRANSFER_DST);
+        let addr = c
+            .device
+            .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(src));
+
+        let spv = include_bytes!(concat!(env!("OUT_DIR"), "/oob.spv"));
+        let words = ash::util::read_spv(&mut std::io::Cursor::new(&spv[..])).expect("spv");
+        let module = c
+            .device
+            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
+            .expect("module");
+        let ranges = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(16)];
+        let layout = c
+            .device
+            .create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&ranges),
+                None,
+            )
+            .expect("layout");
+        let pipe = c
+            .device
+            .create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::ComputePipelineCreateInfo::default()
+                    .stage(
+                        vk::PipelineShaderStageCreateInfo::default()
+                            .stage(vk::ShaderStageFlags::COMPUTE)
+                            .module(module)
+                            .name(c"main"),
+                    )
+                    .layout(layout)],
+                None,
+            )
+            .map_err(|(_, e)| e)
+            .expect("pipeline")[0];
+
+        #[repr(C)]
+        struct Push {
+            addr: u64,
+            idx: u32,
+            _pad: u32,
+        }
+        // idx = 0: an ordinary IN-BOUNDS store. This mode is about ordering, not OOB.
+        let push = Push {
+            addr,
+            idx: 0,
+            _pad: 0,
+        };
+        let bytes = std::slice::from_raw_parts((&raw const push).cast::<u8>(), size_of::<Push>());
+        println!("fault: compute stores to a buffer, then vkCmdCopyBuffer READS it, NO barrier");
+        submit(&c, |cmd| {
+            c.device
+                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe);
+            c.device
+                .cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytes);
+            c.device.cmd_dispatch(cmd, 1, 1, 1);
+            let region = [vk::BufferCopy::default().size(256)];
+            c.device.cmd_copy_buffer(cmd, src, dst, &region);
+        });
+    }
+    "SYNC-HAZARD-READ-AFTER-WRITE"
+}
+
+/// SYNCHRONISATION validation, COMPUTE -> COMPUTE — the cell `Gpu::enqueue`'s barrier
+/// actually lives in, and the one `chained_dispatch_respects_the_barrier` claims a
+/// clean result for.
+///
+/// That claim is only worth something if the checker can see this hazard class. It
+/// fires on transfer↔transfer and is silent on compute→transfer, so its behaviour here
+/// cannot be inferred from either: **a checker's envelope has to be established per
+/// hazard class you intend to rely on, not once for the checker.**
+///
+/// Two dispatches of a read-modify-write on the same address, no barrier between them.
+fn probe_compute_compute() -> &'static str {
+    let c = setup(true);
+    unsafe {
+        let buf = c
+            .device
+            .create_buffer(
+                &vk::BufferCreateInfo::default().size(256).usage(
+                    vk::BufferUsageFlags::STORAGE_BUFFER
+                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                ),
+                None,
+            )
+            .expect("buf");
+        let req = c.device.get_buffer_memory_requirements(buf);
+        let mut mf =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let mem = c
+            .device
+            .allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(req.size)
+                    .memory_type_index(memtype(
+                        &c,
+                        req.memory_type_bits,
+                        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    ))
+                    .push_next(&mut mf),
+                None,
+            )
+            .expect("mem");
+        c.device.bind_buffer_memory(buf, mem, 0).expect("bind");
+        let addr = c
+            .device
+            .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buf));
+
+        let spv = include_bytes!(concat!(env!("OUT_DIR"), "/oob.spv"));
+        let words = ash::util::read_spv(&mut std::io::Cursor::new(&spv[..])).expect("spv");
+        let module = c
+            .device
+            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
+            .expect("module");
+        let ranges = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(16)];
+        let layout = c
+            .device
+            .create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&ranges),
+                None,
+            )
+            .expect("layout");
+        let pipe = c
+            .device
+            .create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::ComputePipelineCreateInfo::default()
+                    .stage(
+                        vk::PipelineShaderStageCreateInfo::default()
+                            .stage(vk::ShaderStageFlags::COMPUTE)
+                            .module(module)
+                            .name(c"main"),
+                    )
+                    .layout(layout)],
+                None,
+            )
+            .map_err(|(_, e)| e)
+            .expect("pipeline")[0];
+
+        #[repr(C)]
+        struct Push {
+            addr: u64,
+            idx: u32,
+            _pad: u32,
+        }
+        let push = Push {
+            addr,
+            idx: 0,
+            _pad: 0,
+        };
+        let bytes = std::slice::from_raw_parts((&raw const push).cast::<u8>(), size_of::<Push>());
+        println!("fault: two dispatches read-modify-writing the same address, NO barrier");
+        submit(&c, |cmd| {
+            c.device
+                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe);
+            c.device
+                .cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytes);
+            c.device.cmd_dispatch(cmd, 1, 1, 1);
+            // Nothing between them. The second dispatch reads what the first wrote.
+            c.device.cmd_dispatch(cmd, 1, 1, 1);
+        });
+    }
+    // Either RAW or WAW is a valid catch for a read-modify-write pair, so match the
+    // family rather than one label.
+    "SYNC-HAZARD"
+}
+
+/// The discriminator for [`probe_compute_copy`]: the SAME compute-write-then-copy
+/// hazard, but the shader reaches the buffer through an ordinary DESCRIPTOR BINDING.
+///
+/// If this reports and the buffer-reference version does not, then synchronisation
+/// validation's blind spot is buffer device addresses specifically — not
+/// compute-to-transfer ordering — and since bare device addresses are how rivoli
+/// passes every buffer to every kernel, sync validation can see almost nothing this
+/// backend does.
+fn probe_compute_copy_descriptor() -> &'static str {
+    let c = setup(false);
+    unsafe {
+        let mk = |size: u64, usage: vk::BufferUsageFlags| {
+            let b = c
+                .device
+                .create_buffer(
+                    &vk::BufferCreateInfo::default().size(size).usage(usage),
+                    None,
+                )
+                .expect("buf");
+            let req = c.device.get_buffer_memory_requirements(b);
+            let m = c
+                .device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(req.size)
+                        .memory_type_index(memtype(
+                            &c,
+                            req.memory_type_bits,
+                            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                        )),
+                    None,
+                )
+                .expect("mem");
+            c.device.bind_buffer_memory(b, m, 0).expect("bind");
+            b
+        };
+        let src = mk(
+            256,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
+        );
+        let dst = mk(256, vk::BufferUsageFlags::TRANSFER_DST);
+
+        let binding = [vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)];
+        let dsl = c
+            .device
+            .create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&binding),
+                None,
+            )
+            .expect("dsl");
+        let sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)];
+        let dpool = c
+            .device
+            .create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(1)
+                    .pool_sizes(&sizes),
+                None,
+            )
+            .expect("dpool");
+        let dsls = [dsl];
+        let set = c
+            .device
+            .allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(dpool)
+                    .set_layouts(&dsls),
+            )
+            .expect("set")[0];
+        let binfo = [vk::DescriptorBufferInfo::default()
+            .buffer(src)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        c.device.update_descriptor_sets(
+            &[vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&binfo)],
+            &[],
+        );
+
+        let spv = include_bytes!(concat!(env!("OUT_DIR"), "/descwrite.spv"));
+        let words = ash::util::read_spv(&mut std::io::Cursor::new(&spv[..])).expect("spv");
+        let module = c
+            .device
+            .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
+            .expect("module");
+        let layout = c
+            .device
+            .create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&dsls),
+                None,
+            )
+            .expect("layout");
+        let pipe = c
+            .device
+            .create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::ComputePipelineCreateInfo::default()
+                    .stage(
+                        vk::PipelineShaderStageCreateInfo::default()
+                            .stage(vk::ShaderStageFlags::COMPUTE)
+                            .module(module)
+                            .name(c"main"),
+                    )
+                    .layout(layout)],
+                None,
+            )
+            .map_err(|(_, e)| e)
+            .expect("pipeline")[0];
+
+        println!(
+            "fault: compute stores via a DESCRIPTOR, then vkCmdCopyBuffer READS it, NO barrier"
+        );
+        submit(&c, |cmd| {
+            c.device
+                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe);
+            c.device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                layout,
+                0,
+                &[set],
+                &[],
+            );
+            c.device.cmd_dispatch(cmd, 1, 1, 1);
+            let region = [vk::BufferCopy::default().size(256)];
+            c.device.cmd_copy_buffer(cmd, src, dst, &region);
+        });
+    }
+    "SYNC-HAZARD-READ-AFTER-WRITE"
+}
+
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_default();
     // Warn rather than fail: the point of the probe is to find out whether the checker
@@ -370,8 +730,24 @@ fn main() {
             env_hint("VK_LAYER_GPUAV_ENABLE");
             probe_gpuav()
         }
+        "compute-compute" => {
+            env_hint("VK_LAYER_VALIDATE_SYNC");
+            probe_compute_compute()
+        }
+        "compute-copy" => {
+            env_hint("VK_LAYER_VALIDATE_SYNC");
+            probe_compute_copy()
+        }
+        "compute-copy-desc" => {
+            env_hint("VK_LAYER_VALIDATE_SYNC");
+            probe_compute_copy_descriptor()
+        }
         _ => {
-            eprintln!("usage: vk_validation_probe core|sync|gpuav   (see ../README.md)");
+            eprintln!(
+                "usage: vk_validation_probe \
+                 core|sync|gpuav|compute-compute|compute-copy|compute-copy-desc\n\
+                 (see ../README.md — the sync modes map a COVERAGE MATRIX, not a pass/fail)"
+            );
             std::process::exit(2);
         }
     };
