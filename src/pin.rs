@@ -807,6 +807,20 @@ impl<'a> Pin<'a> {
         self.trace.is_some()
     }
 
+    /// Flush the trace sink. Called per token, because the trace CANNOT rely on
+    /// `BufWriter`'s `Drop`: the wedge watchdog kills a hung decode with
+    /// `std::process::exit`, which runs no destructors, and `Drop` discards flush errors
+    /// anyway — so a wedged or ENOSPC run would leave a silently short capture with a
+    /// clean exit code. A trace is ~30 minutes of sole-tenant GPU time; losing it quietly
+    /// is far worse than one `write` per token. Errors propagate here, unlike in `Drop`.
+    pub fn flush_trace(&mut self) -> Result<()> {
+        if let Some(w) = &mut self.trace {
+            use std::io::Write;
+            w.flush().context("flush trace")?;
+        }
+        Ok(())
+    }
+
     /// Accumulated reaper fetch wall (ns) — the off-main-thread load cost the expert
     /// stream's compute overlaps. The profile reads it against the MoE wall.
     pub fn fetch_ns(&self) -> u64 {
@@ -836,11 +850,20 @@ impl<'a> Pin<'a> {
         // New batch: clear the policy's per-batch pin set. Phase 1a's protect() and 1b's
         // admit() then pin every touched key so a later miss's eviction can't reclaim it.
         self.routed.begin_batch();
-        // Trace sink (--trace), v2: the demand keys this layer looks up in access
-        // order, then `|`, then the top-`TRACE_WINDOW` candidates as `key:choice` in
-        // rank order. The window's first `sel.len()` entries are necessarily `sel`
-        // again — same scores, same comparator — but the offline reader wants one
-        // self-contained ranked list per decision, so it is written out in full.
+        // Trace sink (--trace), v2: the demand keys this layer looks up, then `|`, then
+        // the top-`TRACE_WINDOW` candidates as `key:choice`.
+        //
+        // BOTH lists are in router RANK order, and that is LOAD-BEARING, not incidental.
+        // `sel` and `window` both come out of `topk_into` over the same `choice` buffer
+        // with the same comparator (value-desc, index-asc), and `topk_into` finishes with
+        // a full sort — so `window[..sel.len()] == sel` element for element, and
+        // `bin/replay` hard-fails a trace where that prefix does not hold. Reordering
+        // `sel` for any local reason (coalescing reads by expert id, say) would silently
+        // change the meaning of every captured trace. The debug_assert is the tripwire.
+        debug_assert!(
+            window.is_empty() || window.starts_with(sel),
+            "trace v2: the candidate window must be the ranking that produced `sel`"
+        );
         if let Some(w) = &mut self.trace {
             use std::io::Write;
             for (j, &e) in sel.iter().enumerate() {

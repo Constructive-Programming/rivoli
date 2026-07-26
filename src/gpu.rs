@@ -1069,6 +1069,9 @@ impl<'a> GpuEngine<'a> {
                 generated.push(next);
                 self.forward(next, pos).await?;
                 pos += 1;
+                // Bound trace loss to one token: the watchdog exits without destructors,
+                // so BufWriter's Drop is not a guarantee. No-op when not tracing.
+                self.pin.flush_trace()?;
                 #[cfg(feature = "trace")]
                 if (_i + 1) % WIN == 0 {
                     let dt = win_t.elapsed().as_secs_f64();
