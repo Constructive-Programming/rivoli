@@ -97,6 +97,13 @@ const BARRIER_EXEMPT: &[(&str, &str)] = &[
     ("argmax_reduce", "LDS halving tree over the vocabulary partials"),
     ("gemv_fp8", "the e4m3 LUT, plus split-K's per-wave partials"),
     ("rmsnorm", "LDS halving tree over the sum of squares"),
+    // Both MLA kernels carry ONE barrier, between E4M3_LUT_BUILD's writes to the shared
+    // e4m3 table and the first read of it. That is shared-memory ordering only, which a
+    // bare `barrier()` covers — checked by hand, as the diagnostic demands. Neither
+    // writes a buffer any other thread reads (each thread owns one output element), so
+    // unlike rope_interleave there is no buffer traffic for the barrier to order.
+    ("mla_value_fp8", "the e4m3 LUT"),
+    ("mla_absorb_fp8", "the e4m3 LUT"),
 ];
 
 fn vulkan() {

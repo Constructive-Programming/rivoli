@@ -18,7 +18,10 @@
 
 layout(local_size_x = THREADS) in;
 
-layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RoU32 { uint v[]; };
+// `lut` before the include: fp8.glsl's MAC reads it by name, because GLSL cannot take an
+// array parameter without copying it per invocation (rule 11).
+shared float lut[256];
+#include "fp8.glsl"
 
 layout(push_constant) uniform Push {
     RoF32 x;
@@ -31,39 +34,13 @@ layout(push_constant) uniform Push {
     int splitk;   // 0 = one wave per row; 1 = one BLOCK per row, split-K over i_dim
 } pc;
 
-shared float lut[256];
 shared float part[ROWS_PER_BLOCK];   // split-K: one partial per wave
 
-// Strided fp8 MAC with NO cross-thread reduction — Σ over the columns this thread owns.
-// Mirrors common.hpp::fp8_dot_strided statement for statement, including the order of
-// the four products inside the parentheses, which is what makes it bit-identical.
-//
-// `wrow_bytes` is a BYTE offset from `pc.packed`'s base, and the word loads below assume
-// it is 4-aligned — the launcher rejects an i_dim that is not a multiple of 4, so every
-// row base is.
-float fp8_dot_strided(uint64_t wrow_bytes, uint scale_off, uint start, uint stride) {
-    float acc = 0.0;
-    uint n4 = uint(pc.i_dim) >> 2;
-    int bsh = blk_shift(pc.block);
-    uint64_t w4 = uint64_t(pc.packed) + wrow_bytes;
-    for (uint j = start; j < n4; j += stride) {
-        uint p = RoU32(w4 + uint64_t(j) * 4ul).v[0];
-        uint i0 = j << 2;
-        float s = pc.scale.v[scale_off + (i0 >> bsh)];
-        acc += s * (pc.x.v[i0]      * lut[p & 0xffu]
-                  + pc.x.v[i0 + 1u] * lut[(p >> 8) & 0xffu]
-                  + pc.x.v[i0 + 2u] * lut[(p >> 16) & 0xffu]
-                  + pc.x.v[i0 + 3u] * lut[(p >> 24) & 0xffu]);
-    }
-    // Scalar tail, for an i_dim that is not a multiple of 4. Unreachable while the
-    // launcher enforces that, and kept because the HIP source has it and the two must
-    // stay diffable by eye.
-    for (uint i = (n4 << 2) + start; i < uint(pc.i_dim); i += stride) {
-        uint word = RoU32(w4 + (uint64_t(i) & ~3ul)).v[0];
-        uint byte = (word >> ((i & 3u) * 8u)) & 0xffu;
-        acc += pc.x.v[i] * lut[byte] * pc.scale.v[scale_off + (i >> bsh)];
-    }
-    return acc;
+// The row's weight address and its block-scale row, as fp8.glsl wants them: already
+// offset, matching how the HIP original passes pointers.
+uint64_t wrow_of(uint o) { return uint64_t(pc.packed) + uint64_t(o) * uint64_t(pc.i_dim); }
+RoF32 scalerow_of(uint o, int bsh, uint sc_cols) {
+    return RoF32(uint64_t(pc.scale) + uint64_t((o >> uint(bsh)) * sc_cols) * 4ul);
 }
 
 void main() {
@@ -79,9 +56,8 @@ void main() {
         // One WAVE per output row; adjacent lanes read adjacent columns.
         uint o = gl_WorkGroupID.x * ROWS_PER_BLOCK + gl_SubgroupID;
         if (o >= uint(pc.o_dim)) return;
-        float acc = fp8_dot_strided(
-            uint64_t(o) * uint64_t(pc.i_dim), (o >> uint(bsh)) * sc_cols, lane, WAVE);
-        acc = wave_sum(acc);
+        float acc = dot_fp8_wave(pc.x, wrow_of(o), scalerow_of(o, bsh, sc_cols),
+                                 pc.i_dim, pc.block, lane);
         if (lane == 0u) pc.y.v[o] = acc;
         return;
     }
@@ -91,8 +67,8 @@ void main() {
     // rows to fill the machine under wave-per-row; this gives K times the blocks.
     uint o = gl_WorkGroupID.x;
     if (o >= uint(pc.o_dim)) return;
-    float acc = fp8_dot_strided(
-        uint64_t(o) * uint64_t(pc.i_dim), (o >> uint(bsh)) * sc_cols, tid, THREADS);
+    float acc = fp8_dot_strided(pc.x, wrow_of(o), scalerow_of(o, bsh, sc_cols),
+                                pc.i_dim, pc.block, tid, THREADS);
     acc = wave_sum(acc);
     if (lane == 0u) part[gl_SubgroupID] = acc;
     barrier();

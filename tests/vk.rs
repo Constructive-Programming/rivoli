@@ -39,11 +39,11 @@
 
 use rivoli::device::{DeviceBuf, DeviceTier};
 use rivoli::quant::{matvec_fp8, matvec_i8};
-use rivoli::math::{E4M3_BLOCK, E4M3_MAX, f32_to_bf16, f32_to_e4m3, silu};
+use rivoli::math::{E4M3_BLOCK, E4M3_MAX, e4m3_to_f32, f32_to_bf16, f32_to_e4m3, silu};
 use rivoli::vk::{
     Buf, ROWS_PER_BLOCK, VALIDATION_ERRORS, device_sync, gpu, launch_append_kv, launch_argmax,
     launch_embed_i8_row, launch_gather_rope, launch_gemv_f32, launch_gemv_fp8, launch_gemv_i8,
-    launch_rmsnorm, launch_rope,
+    launch_mla_absorb_fp8, launch_mla_value_fp8, launch_rmsnorm, launch_rope,
     launch_swiglu, launch_vadd, memcpy_dtod,
 };
 use std::sync::atomic::Ordering;
@@ -1731,6 +1731,46 @@ fn linalg_guards_reject_degenerate_arguments() {
     assert!(rope(1, 8, 16).is_ok(), "rope count = 1 ignores stride");
     assert!(rope(2, 16, 16).is_ok(), "rope stride == seg must be accepted");
 
+    // The quantised GEMVs' guards, none of which had a test. Two of them are this
+    // backend's own additions rather than mirrors of a HIP arm — the word-alignment and
+    // multiple-of-4 checks exist because the shaders read packed weights as 32-bit WORDS
+    // (VK_KHR_8bit_storage is deliberately not required), which HIP does not do. An
+    // untested guard is indistinguishable from its absence, and these two are the ones
+    // standing between a sub-word-aligned slab pointer and a silently wrong decode.
+    //
+    // SAFETY: every case here is rejected before any pointer is dereferenced. `p` and `q`
+    // are live 4096-byte Bufs regardless.
+    unsafe {
+        let fp8 = |o: usize, i: usize, block: usize, packed: *const u8| {
+            launch_gemv_fp8(p as *const f32, packed, p as *const f32, o, i, block, q as *mut f32)
+        };
+        assert!(fp8(0, 64, 128, p).is_err(), "gemv_fp8 o_dim = 0");
+        assert!(fp8(8, 0, 128, p).is_err(), "gemv_fp8 i_dim = 0");
+        assert!(fp8(8, 64, 0, p).is_err(), "gemv_fp8 block = 0");
+        // blk_shift is a SHIFT, so a non-power-of-two tile would index the scale by a
+        // floor rather than a quotient — mirrors HIP's 1003.
+        assert!(fp8(8, 64, 96, p).is_err(), "gemv_fp8 block not a power of two");
+        assert!(fp8(8, 64, 128, p).is_ok(), "gemv_fp8 power-of-two block must be accepted");
+        // i_dim not a multiple of 4: row bases would stop being word-aligned after row 0.
+        assert!(fp8(8, 66, 128, p).is_err(), "gemv_fp8 i_dim not a multiple of 4");
+        // A packed base that is not word-aligned. The shader's offsets are relative to
+        // this address, so every word load would straddle. GPU-AV checks bounds, not
+        // alignment, so nothing else would catch it.
+        assert!(
+            fp8(8, 64, 128, p.add(1)).is_err(),
+            "gemv_fp8 packed not word-aligned"
+        );
+
+        assert!(
+            launch_gemv_i8(p as *const f32, p, p as *const f32, 0, 64, q as *mut f32).is_err(),
+            "gemv_i8 o_dim = 0"
+        );
+        assert!(
+            launch_gemv_i8(p as *const f32, p, p as *const f32, 8, 0, q as *mut f32).is_err(),
+            "gemv_i8 i_dim = 0"
+        );
+    }
+
     // Retire the accepted dispatches while their buffer is still alive. The guard test
     // is about the rejections, but the controls are real launches.
     device_sync().expect("sync");
@@ -1802,6 +1842,18 @@ fn gemv_i8_matches_the_host_oracle() {
 ///
 /// The block tile must be a power of two: `blk_shift` indexes the scale by a SHIFT since
 /// the HIP side replaced its signed divide, and the launcher mirrors that rejection.
+///
+/// RAGGED `o_dim` IS THE THIRD SHAPE, AND IT EXISTS TO MAKE ONE `if` FIRE. Both original
+/// shapes were multiples of `ROWS_PER_BLOCK`, so every workgroup was full and the
+/// wave-per-row row guard — `if (o >= o_dim) return;` — was indistinguishable from its
+/// absence: delete it and the suite stayed green. 253 = 31·8 + 5 leaves the last
+/// workgroup with three waves that must retire without writing, and those three would
+/// otherwise write rows 253..255 of a 253-row output, past the end.
+///
+/// The SPLIT-K arm's identical-looking guard is still unreachable, and that is a property
+/// of the dispatch rather than an oversight: its grid is exactly `o_dim` workgroups, so
+/// `o = gl_WorkGroupID.x` cannot exceed it. Stated rather than quietly left as apparent
+/// coverage — it is kept because a future change to that grid would need it.
 #[test]
 fn gemv_fp8_matches_the_host_oracle() {
     let v = Validation::new();
@@ -1809,9 +1861,12 @@ fn gemv_fp8_matches_the_host_oracle() {
     let block = 128usize;
     for (o_dim, i_dim, geometry) in [
         (256usize, 512usize, "wave-per-row"),
+        (253, 512, "wave-per-row ragged"),
         (128, 4096, "split-K"),
     ] {
-        let mut r = Lcg(0xF8 ^ i_dim as u64);
+        // Seed off BOTH dims: the two i_dim = 512 shapes would otherwise draw identical
+        // data, so a bug that happened to cancel on one would cancel on the other too.
+        let mut r = Lcg(0xF8 ^ (i_dim as u64) ^ ((o_dim as u64) << 20));
         let packed: Vec<u8> = (0..o_dim * i_dim).map(|_| f32_to_e4m3(r.f())).collect();
         let sc_cols = i_dim / block;
         let scale: Vec<f32> = (0..o_dim.div_ceil(block) * sc_cols)
@@ -1968,4 +2023,400 @@ fn rope_trig_table_matches_independent_reference() {
         );
     }
     v.check("rope_trig_table_matches_independent_reference");
+}
+
+// ---------------------------------------------------------------------------
+// mla.hip: the two fp8 MLA projections.
+//
+// Oracles derived from kernels/mla.hip, kernels/common.hpp and src/math.rs — the
+// SPECIFICATION — and from nothing else. The usual rule bites harder here: the same
+// person wrote these shaders, so an oracle they also wrote would be a consistency check
+// wearing a correctness check's clothes even if derived honestly. The two `mla_*_oracle`
+// functions were therefore written by someone working ONLY from the HIP sources, with the
+// shader files withheld.
+// ---------------------------------------------------------------------------
+
+/// Every output element must match the oracle BIT FOR BIT.
+///
+/// THIS IS THE ASSERTION THAT GIVES THE SUMMATION-ORDER MODELLING ANY FORCE, and it
+/// replaced a tolerance that could not do the job. `assert_close` compares at
+/// `1e-3·mx + 1e-3`; two different summation orders of the same terms differ by ~1e-7.
+/// Three orders of magnitude apart, so the tolerance cannot see order at all — MEASURED,
+/// not assumed: replacing `oracle_wave_sum` with `partials.iter().sum()` left the test
+/// passing at 27001x margin. Enlarging the shape does not help and no shape can, because
+/// the gap is between the SIZE of an ordering perturbation and the SIZE of the tolerance.
+///
+/// Bit-identity is attainable here only because the oracle models what the hardware
+/// actually does, INCLUDING FMA CONTRACTION — see `oracle_fp8_dot_strided`. That was
+/// established by experiment rather than assumed: without the fused form, 10 of 15
+/// elements differed; with it, err is exactly 0.
+fn assert_bit_identical(want: &[f32], got: &[f32], label: &str) {
+    let bad: Vec<String> = want
+        .iter()
+        .zip(got)
+        .enumerate()
+        .filter(|(_, (w, g))| w.to_bits() != g.to_bits())
+        .map(|(i, (w, g))| format!("[{i}] want {:#010x} got {:#010x}", w.to_bits(), g.to_bits()))
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "\n\n{label} is not BIT-IDENTICAL to its oracle ({} of {} elements):\n  {}\n\n\
+         The oracle reproduces this kernel's arithmetic exactly, so a mismatch means the \
+         shader's operation ORDER, GROUPING, or CONTRACTION has changed. INVESTIGATE; do \
+         not relax this to a tolerance — the tolerance is blind to precisely this class.\n",
+        bad.len(),
+        want.len(),
+        bad.join("\n  ")
+    );
+}
+
+/// gfx1151 native wave width — `WAVE` in kernels/common.hpp.
+const ORACLE_WAVE: usize = 32;
+
+/// `common.hpp::wave_sum` — the fixed `__shfl_down` halving ladder, modelled over the 32
+/// lane partials. Each rung reads the PRE-step values, because a shuffle is simultaneous.
+///
+/// A lane whose source `l + o` falls outside the group gets its own value back under HIP,
+/// so it doubles; that is modelled rather than summarised. It is dead weight for lane 0,
+/// which is the only lane the kernels store — and lane 0 is also the only lane whose
+/// chain reads in-range values throughout, which is why the GLSL side is correct at lane
+/// 0 despite SPIR-V leaving the out-of-range shuffle UNDEFINED (see common.glsl).
+fn oracle_wave_sum(partials: [f32; ORACLE_WAVE]) -> f32 {
+    let mut v = partials;
+    let mut o = ORACLE_WAVE / 2;
+    while o > 0 {
+        let src = v;
+        for l in 0..ORACLE_WAVE {
+            let up = l + o;
+            v[l] = src[l] + if up < ORACLE_WAVE { src[up] } else { src[l] };
+        }
+        o >>= 1;
+    }
+    v[0]
+}
+
+/// `common.hpp::fp8_dot_strided` — one lane's partial, NO cross-thread reduction.
+///
+/// Two loops with DELIBERATELY different groupings, both preserved: the dword loop takes
+/// four consecutive columns and applies the block scale to the PARENTHESISED GROUP once
+/// (using column `i0`'s scale for all four — valid only because `block >= 4` and `i0` is
+/// a multiple of 4), while the scalar tail applies the scale PER ELEMENT.
+///
+/// FUSED MULTIPLY-ADD, AND IT IS NOT DECORATION. The GLSL source reads
+/// `acc += s * (a + b + c + d)` with `a = x[i0]*lut[..]`, but the driver's backend
+/// contracts each multiply-then-add into an FMA — invisible in SPIR-V, which still shows
+/// OpFMul and OpFAdd, because contraction happens below it. Modelling the plain form
+/// leaves 10 of 15 outputs differing in their low bits; modelling the fused chain makes
+/// the oracle EXACT. Measured both ways.
+///
+/// The consequence worth knowing: a CPU oracle can be bit-exact with this GPU, but only
+/// by reproducing a decision the shader source does not express. If a future driver
+/// contracts differently, this is where it will show — as a bit mismatch, loudly, which
+/// is the point of asserting bit-identity rather than a tolerance.
+fn oracle_fp8_dot_strided(
+    x: &[f32],
+    wrow: &[u8],
+    scalerow: &[f32],
+    i_dim: usize,
+    block: usize,
+    start: usize,
+    stride: usize,
+) -> f32 {
+    let mut acc = 0.0f32;
+    let n4 = i_dim >> 2;
+    let mut j = start;
+    while j < n4 {
+        let i0 = j << 2;
+        let s = scalerow[i0 / block];
+        let mut t = x[i0] * e4m3_to_f32(wrow[i0]);
+        t = x[i0 + 1].mul_add(e4m3_to_f32(wrow[i0 + 1]), t);
+        t = x[i0 + 2].mul_add(e4m3_to_f32(wrow[i0 + 2]), t);
+        t = x[i0 + 3].mul_add(e4m3_to_f32(wrow[i0 + 3]), t);
+        acc = s.mul_add(t, acc);
+        j += stride;
+    }
+    let mut i = (n4 << 2) + start;
+    while i < i_dim {
+        acc += x[i] * e4m3_to_f32(wrow[i]) * scalerow[i / block];
+        i += stride;
+    }
+    acc
+}
+
+/// CPU oracle for `mla_absorb_fp8`.
+///
+/// One GPU thread owns one `(head, i)`, so the `d`-loop is a private accumulator summed
+/// strictly left to right — no shuffle, no LDS beyond the read-only LUT. `w = e4m3·scale`
+/// is formed FIRST and then multiplied by `q[d]`, matching the kernel's grouping.
+///
+/// Scale traversal: `i` is FIXED and the ROW varies with `d`, so this walks DOWN a column
+/// of the block-scale grid — the transpose of every other fp8 kernel here.
+#[allow(clippy::too_many_arguments)]
+fn mla_absorb_oracle(
+    q: &[f32],
+    kvb: &[u8],
+    kvb_scale: &[f32],
+    h: usize,
+    qh: usize,
+    nope: usize,
+    vh: usize,
+    kvl: usize,
+    block: usize,
+) -> Vec<f32> {
+    assert!(h > 0 && qh > 0 && nope > 0 && vh > 0 && kvl > 0 && block > 0, "guard 1001");
+    assert!(block.is_power_of_two(), "guard 1003: blk_shift needs a power-of-two tile");
+    // NOT launcher-guarded, but the kernel reads q[head·qh .. +nope).
+    assert!(qh >= nope, "q head stride {qh} shorter than nope {nope}");
+
+    let rows = h * (nope + vh);
+    let sc_cols = kvl.div_ceil(block);
+    assert_eq!(kvb.len(), rows * kvl, "kv_b is [H·(nope+vh), kvl], row stride kvl BYTES");
+    assert_eq!(kvb_scale.len(), rows.div_ceil(block) * sc_cols);
+
+    let mut qabs = vec![0.0f32; h * kvl];
+    for head in 0..h {
+        let rbase = head * (nope + vh);
+        let qrow = &q[head * qh..head * qh + nope];
+        for i in 0..kvl {
+            let mut acc = 0.0f32;
+            for (d, qd) in qrow.iter().enumerate() {
+                let row = rbase + d;
+                let w = e4m3_to_f32(kvb[row * kvl + i])
+                    * kvb_scale[(row / block) * sc_cols + i / block];
+                // `acc += q·w` contracts to a fused multiply-add on this driver; see
+                // oracle_fp8_dot_strided.
+                acc = qd.mul_add(w, acc);
+            }
+            qabs[head * kvl + i] = acc;
+        }
+    }
+    qabs
+}
+
+/// CPU oracle for `mla_value_fp8`.
+///
+/// One WAVE per output row, and this reproduces that STRUCTURE rather than summing
+/// sequentially: 32 independent lane partials, lane `l` owning dword groups `l, l+32, …`
+/// plus its slice of the scalar tail, then the fixed halving ladder.
+///
+/// Scale traversal: the ROW is fixed per output element and the COLUMN varies with `i` —
+/// the opposite of `mla_absorb_oracle`. The kernel hoists the row out; so does this.
+#[allow(clippy::too_many_arguments)]
+fn mla_value_oracle(
+    clat: &[f32],
+    kvb: &[u8],
+    kvb_scale: &[f32],
+    h: usize,
+    nope: usize,
+    vh: usize,
+    kvl: usize,
+    block: usize,
+) -> Vec<f32> {
+    assert!(h > 0 && nope > 0 && vh > 0 && kvl > 0 && block > 0, "guard 1001");
+    assert!(block.is_power_of_two(), "guard 1003: blk_shift needs a power-of-two tile");
+    // Not launcher-guarded on the HIP side, but required for the dword load to be
+    // well-defined: rows are `kvl` bytes apart, so an odd kvl misaligns every other row.
+    // The Vulkan launcher DOES reject it — one place this backend is stricter.
+    assert_eq!(kvl % 4, 0, "kv_b rows must stay 4-byte aligned for the dword load");
+    // Below 4, the dword group's single scale would straddle a scale-tile boundary.
+    assert!(block >= 4, "the 4-wide dword group must sit inside one scale tile");
+
+    let rows = h * (nope + vh);
+    let sc_cols = kvl.div_ceil(block);
+    assert_eq!(clat.len(), h * kvl);
+    assert_eq!(kvb.len(), rows * kvl);
+    assert_eq!(kvb_scale.len(), rows.div_ceil(block) * sc_cols);
+
+    let mut ctx = vec![0.0f32; h * vh];
+    for r in 0..h * vh {
+        let head = r / vh;
+        let j = r % vh;
+        let row = head * (nope + vh) + nope + j; // skip the head's nope absorb rows
+        let x = &clat[head * kvl..head * kvl + kvl];
+        let wrow = &kvb[row * kvl..row * kvl + kvl];
+        let scalerow = &kvb_scale[(row / block) * sc_cols..][..sc_cols];
+
+        let mut lanes = [0.0f32; ORACLE_WAVE];
+        for (lane, partial) in lanes.iter_mut().enumerate() {
+            *partial =
+                oracle_fp8_dot_strided(x, wrow, scalerow, kvl, block, lane, ORACLE_WAVE);
+        }
+        ctx[head * vh + j] = oracle_wave_sum(lanes);
+    }
+    ctx
+}
+
+/// Buffers shared by both MLA oracles: fp8 weights, their block scales, and the f32 input.
+///
+/// `rows` is the full kv_b row count, `h·(nope+vh)`; the block scale is a 2-D tile grid
+/// over (rows × kvl), so its length is `⌈rows/block⌉·⌈kvl/block⌉`.
+fn mla_inputs(
+    seed: u64,
+    xn: usize,
+    rows: usize,
+    kvl: usize,
+    block: usize,
+) -> (Vec<f32>, Vec<u8>, Vec<f32>) {
+    let mut r = Lcg(seed);
+    let x: Vec<f32> = (0..xn).map(|_| r.f()).collect();
+    let kvb: Vec<u8> = (0..rows * kvl).map(|_| f32_to_e4m3(r.f())).collect();
+    let scale: Vec<f32> = (0..rows.div_ceil(block) * kvl.div_ceil(block))
+        .map(|_| (r.f() * 0.1).abs() + 0.01)
+        .collect();
+    (x, kvb, scale)
+}
+
+/// `mla_value_fp8` against the CPU oracle.
+///
+/// `h·vh = 15` is DELIBERATELY not a multiple of `ROWS_PER_BLOCK`: the kernel maps one
+/// wave per output row, so a full-workgroup shape would leave `if (r >= h·vh) return;`
+/// unexercised and the trailing waves would write past `ctx`.
+///
+/// `kvl = 256` IS ALSO DELIBERATE, AND AN EARLIER 64 MADE THIS TEST PROVE LESS THAN IT
+/// LOOKED LIKE. The dot's dword loop runs `n4 = kvl/4` iterations shared across `WAVE`
+/// lanes. At kvl = 64, `n4 = 16 < 32`: lanes 16..31 did nothing at all, and every active
+/// lane ran EXACTLY ONE iteration — so the strided accumulation `oracle_fp8_dot_strided`
+/// exists to model was never exercised, and a naive ascending sum agreed to well within
+/// tolerance. The oracle was faithful and the test could not tell. At 256, `n4 = 64`, so
+/// all 32 lanes are busy and each loops twice; the per-lane order and the full 32-lane
+/// ladder both become load-bearing.
+#[test]
+fn mla_value_fp8_matches_the_host_oracle() {
+    let v = Validation::new();
+    let (h, nope, vh, kvl, block) = (3usize, 8usize, 5usize, 256usize, 16usize);
+    let rows = h * (nope + vh);
+    let (clat, kvb, scale) = mla_inputs(0x5A1, h * kvl, rows, kvl, block);
+
+    let want = mla_value_oracle(&clat, &kvb, &scale, h, nope, vh, kvl, block);
+
+    let (cb, kb, sb) = (dev(&f32b(&clat)), dev(&kvb), dev(&f32b(&scale)));
+    let mut out = poison(h * vh * 4 + GUARD);
+    // SAFETY: live Bufs of the documented sizes; `out` holds h·vh f32 plus a guard band.
+    unsafe {
+        launch_mla_value_fp8(
+            cb.ptr() as *const f32,
+            kb.ptr(),
+            sb.ptr() as *const f32,
+            h,
+            nope,
+            vh,
+            kvl,
+            block,
+            out.ptr_mut() as *mut f32,
+        )
+        .expect("launch");
+    }
+    device_sync().expect("sync");
+    let got = readb(&out, h * vh * 4 + GUARD);
+    assert_untouched(&got, h * vh * 4, "mla_value_fp8");
+    let got_f = f32v(&got[..h * vh * 4]);
+    assert_close(&want, &got_f, "mla_value_fp8 h3 vh5 kvl256");
+    assert_bit_identical(&want, &got_f, "mla_value_fp8");
+    v.check("mla_value_fp8_matches_the_host_oracle");
+}
+
+/// `mla_absorb_fp8` against the CPU oracle.
+///
+/// `kvl = 37` is RAGGED on purpose, and this kernel is the only one that can take it. It
+/// reads a single byte per thread by masking the containing word's address down, so an
+/// odd row stride is handled rather than banned — unlike `mla_value_fp8`, which walks
+/// rows with the word-loading shared MAC and rejects a `kvl` that is not a multiple of 4.
+/// A tidy `kvl` would leave that masking untested, and it is the whole of the difference
+/// between this kernel's memory access and every other fp8 kernel's.
+///
+/// `h·kvl = 111` also leaves most of the single 256-thread workgroup retiring early,
+/// which is the bounds guard.
+#[test]
+fn mla_absorb_fp8_matches_the_host_oracle() {
+    let v = Validation::new();
+    let (h, qh, nope, vh, kvl, block) = (3usize, 12usize, 8usize, 5usize, 37usize, 16usize);
+    let rows = h * (nope + vh);
+    let (q, kvb, scale) = mla_inputs(0xAB50, h * qh, rows, kvl, block);
+
+    let want = mla_absorb_oracle(&q, &kvb, &scale, h, qh, nope, vh, kvl, block);
+
+    let (qb, kb, sb) = (dev(&f32b(&q)), dev(&kvb), dev(&f32b(&scale)));
+    let mut out = poison(h * kvl * 4 + GUARD);
+    // SAFETY: live Bufs of the documented sizes; `out` holds h·kvl f32 plus a guard band.
+    unsafe {
+        launch_mla_absorb_fp8(
+            qb.ptr() as *const f32,
+            kb.ptr(),
+            sb.ptr() as *const f32,
+            h,
+            qh,
+            nope,
+            vh,
+            kvl,
+            block,
+            out.ptr_mut() as *mut f32,
+        )
+        .expect("launch");
+    }
+    device_sync().expect("sync");
+    let got = readb(&out, h * kvl * 4 + GUARD);
+    assert_untouched(&got, h * kvl * 4, "mla_absorb_fp8");
+    let got_f = f32v(&got[..h * kvl * 4]);
+    assert_close(&want, &got_f, "mla_absorb_fp8 h3 kvl37 nope8");
+    assert_bit_identical(&want, &got_f, "mla_absorb_fp8");
+    v.check("mla_absorb_fp8_matches_the_host_oracle");
+}
+
+/// Both MLA launchers' argument guards, mirroring `mla.hip`'s 1001/1003 arms plus this
+/// backend's word-addressing additions.
+#[test]
+fn mla_guards_reject_degenerate_arguments() {
+    let v = Validation::new();
+    let src = dev(&[0u8; 4096]);
+    let mut dst = dev(&[0u8; 4096]);
+    let (p, q) = (src.ptr(), dst.ptr_mut());
+
+    // SAFETY: every case is rejected before a pointer is dereferenced; the accepted
+    // controls dispatch over live 4096-byte Bufs and are retired by the sync below.
+    unsafe {
+        let val = |h: usize, nope: usize, vh: usize, kvl: usize, block: usize, kvb: *const u8| {
+            launch_mla_value_fp8(
+                p as *const f32, kvb, p as *const f32, h, nope, vh, kvl, block, q as *mut f32,
+            )
+        };
+        assert!(val(0, 4, 4, 16, 16, p).is_err(), "mla_value h = 0");
+        assert!(val(1, 0, 4, 16, 16, p).is_err(), "mla_value nope = 0");
+        assert!(val(1, 4, 0, 16, 16, p).is_err(), "mla_value vh = 0");
+        assert!(val(1, 4, 4, 0, 16, p).is_err(), "mla_value kvl = 0");
+        assert!(val(1, 4, 4, 16, 0, p).is_err(), "mla_value block = 0");
+        assert!(val(1, 4, 4, 16, 12, p).is_err(), "mla_value block not a power of two");
+        assert!(val(1, 4, 4, 18, 16, p).is_err(), "mla_value kvl not a multiple of 4");
+        assert!(val(1, 4, 4, 16, 16, p.add(1)).is_err(), "mla_value kvb not word-aligned");
+        assert!(val(1, 4, 4, 16, 16, p).is_ok(), "mla_value valid dims must be accepted");
+
+        // `nope` and `vh` are parameters here rather than hardcoded: fixing them at 4
+        // would leave two of this launcher's five dimension arms untested, and an
+        // untested guard is indistinguishable from its absence — which is the whole
+        // rationale for this test.
+        let abs = |h: usize,
+                   qh: usize,
+                   nope: usize,
+                   vh: usize,
+                   kvl: usize,
+                   block: usize,
+                   kvb: *const u8| {
+            launch_mla_absorb_fp8(
+                p as *const f32, kvb, p as *const f32, h, qh, nope, vh, kvl, block, q as *mut f32,
+            )
+        };
+        assert!(abs(0, 4, 4, 4, 16, 16, p).is_err(), "mla_absorb h = 0");
+        assert!(abs(1, 0, 4, 4, 16, 16, p).is_err(), "mla_absorb qh = 0");
+        assert!(abs(1, 4, 0, 4, 16, 16, p).is_err(), "mla_absorb nope = 0");
+        assert!(abs(1, 4, 4, 0, 16, 16, p).is_err(), "mla_absorb vh = 0");
+        assert!(abs(1, 4, 4, 4, 0, 16, p).is_err(), "mla_absorb kvl = 0");
+        assert!(abs(1, 4, 4, 4, 16, 0, p).is_err(), "mla_absorb block = 0");
+        assert!(abs(1, 4, 4, 4, 16, 12, p).is_err(), "mla_absorb block not a power of two");
+        assert!(abs(1, 4, 4, 4, 16, 16, p.add(1)).is_err(), "mla_absorb kvb not word-aligned");
+        // RAGGED kvl IS ACCEPTED HERE, and that asymmetry with mla_value is the point:
+        // this kernel masks the byte address rather than loading whole rows as words.
+        assert!(abs(1, 4, 4, 4, 17, 16, p).is_ok(), "mla_absorb ragged kvl must be accepted");
+    }
+
+    device_sync().expect("sync");
+    v.check("mla_guards_reject_degenerate_arguments");
 }

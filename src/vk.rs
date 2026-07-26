@@ -200,6 +200,8 @@ struct Pipes {
     rope_interleave: Pipe,
     gemv_i8: Pipe,
     gemv_fp8: Pipe,
+    mla_value_fp8: Pipe,
+    mla_absorb_fp8: Pipe,
 }
 
 // SAFETY: needed because ash models the DISPATCHABLE handles (`vk::Queue`,
@@ -912,6 +914,8 @@ impl Pipes {
             rope_interleave: RopePush,
             gemv_i8: GemvI8Push,
             gemv_fp8: GemvFp8Push,
+            mla_value_fp8: MlaValuePush,
+            mla_absorb_fp8: MlaAbsorbPush,
         ))
     }
 }
@@ -2128,4 +2132,145 @@ pub unsafe fn launch_gemv_fp8(
         o_dim.div_ceil(ROWS_PER_BLOCK as usize) as u32
     };
     g.dispatch(&g.pipes.gemv_fp8, &push, groups_x)
+}
+
+push_struct! {
+    /// Mirror of `mla_value_fp8.comp`'s push block. `_pad` keeps the struct
+    /// padding-free; the shader does not read it.
+    MlaValuePush {
+        clat: u64,
+        kvb: u64,
+        scale: u64,
+        ctx: u64,
+        h: i32,
+        nope: i32,
+        vh: i32,
+        kvl: i32,
+        block: i32,
+        _pad: i32,
+    }
+}
+
+push_struct! {
+    /// Mirror of `mla_absorb_fp8.comp`'s push block. Six ints after four addresses is
+    /// already even, so no pad is needed here.
+    MlaAbsorbPush {
+        q: u64,
+        kvb: u64,
+        scale: u64,
+        qabs: u64,
+        h: i32,
+        qh: i32,
+        nope: i32,
+        vh: i32,
+        kvl: i32,
+        block: i32,
+    }
+}
+
+/// Guards shared by both MLA fp8 launchers, mirroring `mla.hip`'s 1001/1003 arms so the
+/// two backends REJECT the same inputs as well as computing the same numbers.
+fn mla_fp8_guards(dims: &[usize], block: usize, packed: u64, what: &str) -> Result<()> {
+    ensure!(
+        dims.iter().all(|d| *d > 0) && block > 0,
+        "{what}: argument guard rejected"
+    );
+    // Guard 1003: `blk_shift` is a shift, so a non-power-of-two tile would index the
+    // block scale by a floor rather than a quotient.
+    ensure!(
+        block.is_power_of_two(),
+        "{what}: block {block} must be a power of two (blk_shift indexes by shift)"
+    );
+    ensure_word_aligned(packed, what)
+}
+
+/// MLA value: `ctx[head][j] = Σ_i clat[head][i]·kv_b[rbase+nope+j][i]` over kv_b's `vh`
+/// value rows, head-batched. kv_b fp8-e4m3 block-scaled.
+///
+/// # Safety
+/// Device addresses of live [`Buf`]s, valid until the next [`device_sync`]: `clat`
+/// (`h·kvl` f32), `kvb` (`h·(nope+vh)·kvl` bytes), `kvb_scale` (block-scale f32), `ctx`
+/// (`h·vh` f32).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_mla_value_fp8(
+    clat: *const f32,
+    kvb: *const u8,
+    kvb_scale: *const f32,
+    h: usize,
+    nope: usize,
+    vh: usize,
+    kvl: usize,
+    block: usize,
+    ctx: *mut f32,
+) -> Result<()> {
+    mla_fp8_guards(&[h, nope, vh, kvl], block, kvb as u64, "mla_value_fp8")?;
+    // The shared MAC reads weights as 32-bit words, so every row base must be 4-aligned;
+    // rows are `kvl` bytes apart.
+    ensure!(
+        kvl.is_multiple_of(4),
+        "mla_value_fp8: kvl {kvl} must be a multiple of 4 — rows are read as 32-bit words"
+    );
+    let g = gpu()?;
+    let push = MlaValuePush {
+        clat: clat as u64,
+        kvb: kvb as u64,
+        scale: kvb_scale as u64,
+        ctx: ctx as u64,
+        h: h as i32,
+        nope: nope as i32,
+        vh: vh as i32,
+        kvl: kvl as i32,
+        block: block as i32,
+        _pad: 0,
+    };
+    // One WAVE per output row, `h·vh` rows — same geometry as mla.hip's launcher.
+    let groups_x = (h * vh).div_ceil(ROWS_PER_BLOCK as usize) as u32;
+    g.dispatch(&g.pipes.mla_value_fp8, &push, groups_x)
+}
+
+/// MLA absorb: `qabs[head][i] = Σ_d q[head·qh+d]·kv_b[rbase+d][i]` over kv_b's `nope`
+/// absorb rows (rbase = head·(nope+vh)), head-batched. kv_b fp8-e4m3 block-scaled.
+///
+/// # Safety
+/// Device addresses of live [`Buf`]s, valid until the next [`device_sync`]: `q` (`h·qh`
+/// f32), `kvb` (`h·(nope+vh)·kvl` bytes), `kvb_scale` (block-scale f32), `qabs` (`h·kvl`
+/// f32).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_mla_absorb_fp8(
+    q: *const f32,
+    kvb: *const u8,
+    kvb_scale: *const f32,
+    h: usize,
+    qh: usize,
+    nope: usize,
+    vh: usize,
+    kvl: usize,
+    block: usize,
+    qabs: *mut f32,
+) -> Result<()> {
+    mla_fp8_guards(&[h, qh, nope, vh, kvl], block, kvb as u64, "mla_absorb_fp8")?;
+    // NO `kvl % 4` GUARD HERE, and the asymmetry with `mla_value_fp8` is deliberate.
+    // That kernel walks a row with the shared word-loading MAC, which needs 4-aligned row
+    // bases. This one reads a single byte per thread by masking the containing word's
+    // address down, so a ragged `kvl` is handled rather than banned — and banning it
+    // would rule out the ragged oracle shape that is the only thing exercising the mask.
+    let g = gpu()?;
+    let push = MlaAbsorbPush {
+        q: q as u64,
+        kvb: kvb as u64,
+        scale: kvb_scale as u64,
+        qabs: qabs as u64,
+        h: h as i32,
+        qh: qh as i32,
+        nope: nope as i32,
+        vh: vh as i32,
+        kvl: kvl as i32,
+        block: block as i32,
+    };
+    // One thread per (head, i). `BLOCK` is `ROWS_PER_BLOCK·WAVE` from the generated
+    // dims.rs, and the shader's `local_size_x` is the same expression — so the group size
+    // has ONE definition across the two languages. A second literal here would be the
+    // mismatch that leaves the tail of `qabs` holding its previous contents, silently.
+    let groups_x = (h * kvl).div_ceil(BLOCK as usize) as u32;
+    g.dispatch(&g.pipes.mla_absorb_fp8, &push, groups_x)
 }
