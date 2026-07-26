@@ -4,6 +4,31 @@
 //! Separate file because `tests/kernel.rs` is `#![cfg(feature = "rocm")]` end to end.
 //! The helpers below are deliberately the same ones it uses, so the kernel-porting
 //! phase can hoist both files onto a shared module instead of rewriting either.
+//!
+//! # Two rules for whoever writes the next tranche
+//!
+//! **1. Do not read `kernels/vk/*.comp` while writing an oracle.** Derive it from the
+//! HIP original and from `src/math.rs`, which are the specification. An oracle written
+//! by someone who has seen the shader is a consistency check wearing a correctness
+//! check's clothes: it agrees with the implementation because it was copied from it,
+//! and it will happily ratify a shared misreading of the HIP. The `fwd.hip` oracles
+//! here were written under that constraint deliberately. It costs a little rework when
+//! the two disagree, which is the entire point — that disagreement is the signal.
+//!
+//! **2. A byte-exact oracle must prove its INPUTS are unambiguous.** Where a test
+//! compares quantised bytes, the test DATA is a source of cross-driver flake
+//! independent of the code: a value landing on a rounding midpoint of the target
+//! format can legitimately quantise either way, so the comparison is decided by the
+//! driver's arithmetic accuracy rather than by the shader. Green here, red on someone
+//! else's machine, shader innocent — and whoever debugs it starts in the kernel,
+//! because that is where the failure appears.
+//!
+//! Use [`assert_quantization_unambiguous`] with the margin the RELEVANT SPEC
+//! guarantees, not the accuracy the hardware happens to deliver. Vulkan promises 2.5
+//! ULP on `FDiv` and correctly-rounded `FAdd`/`FMul`; a dot product accumulates. This
+//! matters most in the fp8 MoE tranche, which compares quantised bytes throughout and
+//! is where a seed-dependent flake would be most expensive to diagnose. Make the
+//! failure message name the SEED, not the shader.
 #![cfg(feature = "vulkan")]
 #![allow(clippy::expect_used)]
 
@@ -716,27 +741,52 @@ fn append_kv_input(kvl: usize, ropn: usize, seed: u64) -> (Vec<f32>, Vec<f32>) {
     (latent, rope)
 }
 
-/// e4m3 keeps 3 mantissa bits and Vulkan promises only 2.5 ULP on FDiv, so a quotient
-/// landing on an e4m3 rounding midpoint could legitimately quantize either way and the
-/// byte compare would be a coin flip on the driver. Assert the chosen inputs are
-/// nowhere near one, so a byte difference means the shader and not the seed.
+/// Every value in `values` must quantise to the same result `margin_ulp` either side
+/// of itself — i.e. none of them sits near a rounding midpoint of the target format.
 ///
-/// 8 ULP covers both divisions in the chain (amax/448, then latent/scale) with room.
-fn assert_quantization_is_unambiguous(latent: &[f32], scales: &[f32]) {
-    for (i, x) in latent.iter().enumerate() {
-        let q = x / scales[i / E4M3_BLOCK];
-        if q == 0.0 {
-            continue; // exact, no rounding to be ambiguous about
+/// THE STANDING PRECONDITION FOR ANY BYTE-EXACT ORACLE (see the module header). A test
+/// that compares quantised bytes is only meaningful if the inputs cannot legitimately
+/// quantise both ways: otherwise the driver's arithmetic accuracy decides the result,
+/// the test passes here and fails elsewhere, and the shader is innocent.
+///
+/// `margin_ulp` must come from what the SPEC guarantees for the operations that produce
+/// these values, not from what this GPU happens to do. Vulkan guarantees 2.5 ULP on
+/// `FDiv`; `FAdd`/`FMul` are correctly rounded but a reduction accumulates, so a dot
+/// product needs a margin that grows with its length.
+///
+/// The message names the SEED deliberately. When this fires the data is wrong, not the
+/// kernel, and the reader should not start by auditing a shader.
+fn assert_quantization_unambiguous<T: PartialEq>(
+    label: &str,
+    values: &[f32],
+    margin_ulp: u32,
+    quantize: impl Fn(f32) -> T,
+) {
+    for (i, &q) in values.iter().enumerate() {
+        if q == 0.0 || !q.is_finite() {
+            continue; // exact or saturating; no midpoint to sit on
         }
-        let up = f32::from_bits(q.to_bits().wrapping_add(8));
-        let dn = f32::from_bits(q.to_bits().wrapping_sub(8));
-        let e = f32_to_e4m3(q);
+        let up = f32::from_bits(q.to_bits().wrapping_add(margin_ulp));
+        let dn = f32::from_bits(q.to_bits().wrapping_sub(margin_ulp));
+        let want = quantize(q);
         assert!(
-            e == f32_to_e4m3(up) && e == f32_to_e4m3(dn),
-            "latent[{i}] = {x} quantizes ambiguously within 8 ULP of {q}: \
-             this seed cannot support a byte-exact compare, pick another"
+            want == quantize(up) && want == quantize(dn),
+            "{label}[{i}] = {q:e} quantises ambiguously within {margin_ulp} ULP: this \
+             SEED cannot support a byte-exact compare — pick another. The kernel is not \
+             implicated; see the byte-exact-oracle rule in this file's header."
         );
     }
+}
+
+/// `append_kv`'s use of the rule above: 8 ULP covers both divisions in the chain
+/// (amax/448, then latent/scale) at Vulkan's 2.5 ULP `FDiv` guarantee, with room.
+fn assert_quantization_is_unambiguous(latent: &[f32], scales: &[f32]) {
+    let quotients: Vec<f32> = latent
+        .iter()
+        .enumerate()
+        .map(|(i, x)| x / scales[i / E4M3_BLOCK])
+        .collect();
+    assert_quantization_unambiguous("latent/scale", &quotients, 8, f32_to_e4m3);
 }
 
 /// `append_kv`: latent -> fp8-e4m3 with a per-128 block scale, roped key -> bf16, both

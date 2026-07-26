@@ -316,6 +316,32 @@ Scoped, not "unmodified", on purpose: the suite also covers `gemv_vq`/`gemv_i4`,
 are microbench kernels the decode path never calls. Gate those oracles on the ported
 set (`#[cfg]` or a skip list) rather than porting two kernels to satisfy a test.
 
+### Two rules for writing the oracles
+
+Both are enforced in `tests/vk.rs`'s header, where the next author will be; repeated
+here because this is where the tranche gets *planned*.
+
+**Write the oracle without reading the shader.** Derive it from the HIP original and
+`src/math.rs`, which are the specification. An oracle written by someone who has seen
+the implementation is a consistency check wearing a correctness check's clothes — it
+agrees because it was copied, and it will ratify a shared misreading of the HIP. The
+`fwd.hip` oracles were written under that constraint deliberately, and the rework when
+the two disagree *is* the signal.
+
+**A byte-exact oracle must prove its inputs are unambiguous.** Where a test compares
+quantised bytes, the test DATA is a source of cross-driver flake independent of the
+code: a value on a rounding midpoint of the target format can legitimately quantise
+either way, so the driver's arithmetic accuracy decides the comparison rather than the
+shader. Green here, red elsewhere, shader innocent — and the person debugging starts in
+the kernel, because that is where the failure appears.
+
+`tests/vk.rs::assert_quantization_unambiguous` is the check. Give it the margin **the
+spec guarantees**, not what this GPU delivers: Vulkan promises 2.5 ULP on `FDiv`, and
+`FAdd`/`FMul` are correctly rounded but a reduction accumulates, so a dot product needs
+a margin that grows with its length. This bites hardest in the **fp8 MoE tranche**,
+which compares quantised bytes throughout and where a seed-dependent flake is most
+expensive to diagnose. Make the failure name the seed, not the shader.
+
 Do not accept "close enough" numerics. The oracle tolerances were tuned against real
 failures — bf16 codebooks failed the 1e-3 oracle and fp16 passed. That headroom is the
 safety net for a second backend, so it is worth knowing how much of it there actually
