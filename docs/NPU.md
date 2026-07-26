@@ -283,49 +283,59 @@ At 32k that is a prize of ~41 ms against a wall of roughly 157 (route) + ~25 (un
 estimated from the microbench, and three-quarters of it is the CPU top-k. The denominator
 carries the confound noted above.
 
-### The device top-k, measured — and the result reverses on the realistic shape
+### The device top-k, measured — after a fixture artifact was removed
 
 Kernel `index_topk`. Correctness gate `tests/kernel.rs::index_topk_matches_host_selection`
 **passes**: bit-identical to `topk_into + sort_unstable` on all 10 cases, sentinel tail
 included. Cost, host and device timed in the **same rig on the same buffer on the same
-data** — the only comparison that may be divided (µs per full layer):
+data** — the only comparison that may be divided (µs per full layer, host → device):
 
-| nt | dense: host → device | | ReLU-sparse: host → device | |
-|---:|---:|---:|---:|---:|
-| 2456 | 84.5 → 32.8 | **2.6× faster** | 27.1 → 42.2 | **0.64× — SLOWER** |
-| 5209 | 106.6 → 39.2 | **2.7×** | 38.7 → 59.2 | **0.65× — SLOWER** |
-| 8192 | 125.9 → 51.2 | 2.5× | 45.1 → 79.2 | 0.57× |
-| 32768 | 553.9 → 157.2 | 3.5× | 136.9 → 214.9 | 0.64× |
+| nt | dense (few ties) | scattered (heavy ties, random order) | sorted-sparse (**artifact**) |
+|---:|---:|---:|---:|
+| 2456 | 86.6 → 35.8 — **2.42×** | 54.4 → 45.6 — **1.19×** | 28.8 → 45.3 — 0.64× |
+| 5209 | 101.4 → 41.2 — **2.46×** | 74.9 → 59.7 — **1.25×** | 41.1 → 60.9 — 0.67× |
+| 8192 | 126.4 → 52.7 — 2.40× | 96.6 → 82.7 — 1.17× | 46.8 → 79.2 — 0.59× |
+| 16384 | 344.5 → 83.3 — 4.14× | 144.3 → 126.6 — 1.14× | 65.7 → 127.6 — 0.52× |
+| 32768 | 578.1 → 157.6 — 3.67× | 191.8 → 215.0 — **0.89×** | 144.6 → 215.0 — 0.67× |
 
-**The two implementations respond to data in opposite directions, and I had measured only
-the direction that flattered the kernel.** Ties make quickselect *cheaper* — the host's
-`select_nth_unstable_by` short-circuits on a mostly-tied array — and make the radix
-histogram *dearer*, because tied keys collide on one LDS bin. So on the ReLU-sparse shape
-the device kernel is **1.6–1.9× slower than the CPU it was built to replace**.
+**The third column is a trap, and an earlier revision of this document fell in it.** It
+reported "the device kernel is 1.6–1.9× slower than the CPU it was built to replace" from
+that column alone, and attributed the gap to ties making quickselect cheaper. The real
+cause was mostly the *fixture*: `topk_into` seeds its workspace with the identity
+permutation and orders by (score desc, index asc), and that fixture's values descend from
+index 0, so the identity **is** the sorted order — quickselect and the trailing sort both
+got an already-sorted slice, their best case, which the device kernel cannot exploit.
+`scattered` has the identical tie structure in random order and is the honest test. It
+moves the ratio from 0.64× to 1.19×, so **roughly 1.8× of the claimed regression was
+fixture, not ties.**
 
-**Which shape the engine actually sees was never measured, and the assumption this
-document has been asserting is contradicted by its own data.** The kernel comments, the
-test, and this document all claim that at long context most tokens ReLU to exactly 0.0, so
-the array is tie-dominated. Against that, the in-engine host cost is **214.2 µs/layer at
-2456 and 334.1 at 5209**, which is 2.5–3.1× the dense microbench but **7.9–8.6× the
-ReLU-sparse one** — and the in-situ penalty measured independently is ~2.1×. A
-tie-dominated engine would have to carry a 7.9× in-situ penalty where a dense-shaped one
-needs 2.5×. **The engine's score array is therefore probably not tie-dominated**, which
-would make the device kernel a ~2.6× win in situ — but that is an inference from a
-cost, not a measurement of a distribution, and the ReLU-sparse claim it displaces was
-itself asserted without measurement across three files.
+**Corrected finding.** The device kernel is faster than the host on every distribution
+measured except tie-heavy at 32k. The margin is strongly distribution-dependent —
+**2.4–4.1× on dense, 1.13–1.25× on tie-heavy, 0.89× at tie-heavy 32k** — because ties
+make quickselect cheaper *and* the radix histogram dearer (tied keys collide on one LDS
+bin). It is never the regression the previous revision reported. Any single-number
+speedup for this kernel is meaningless without naming the distribution.
 
-**So the device top-k is NOT ready to wire, and the blocking step is not engineering.**
-It is one cheap measurement nobody has taken: dump the engine's actual score array at a
-real context and characterise it. If it is dense-like, the kernel wins ~2.6× and wiring
-proceeds. If it is tie-heavy, the kernel as built is a regression and the histogram needs
-a per-wave or ballot-based count before it is worth anything. The prize arithmetic
-throughout this document — 41%, 49%, "half the prize" — is downstream of that answer.
+**Which shape the engine sees is still unmeasured, and that is now the whole question.**
+The in-engine host cost is 214.2 µs/layer at 2456 and 334.1 at 5209. For the engine to be
+producing each shape, the in-situ penalty would have to be **2.5–3.3× (dense), 3.9–4.5×
+(scattered), or 7.4–8.1× (sorted-sparse)**. Dense needs the smallest and is the only one
+close to the ~2.1× penalty measured elsewhere in this document — but note that penalty is
+itself the in-engine cost divided by a *dense* host microbench, so it is a reproducibility
+check on that row rather than independent evidence, and the argument partly assumes its
+conclusion. The honest position: dense-like is the best-supported guess, it is not
+established, and the kernel's value ranges from **~2.4× down to break-even** across the
+shapes still in play.
 
-**A correction this measurement forces.** Earlier text put the host round-trip at "52–60%
-of the prize" and said a device top-k "recovers it exactly". Neither survives: the device
-recovers 79–81% of the host cost *on dense data only*, which is 41–49% of the prize, and
-recovers nothing on sparse data.
+**What that does to the share-of-prize numbers.** Earlier text said the host round-trip is
+"52–60% of the prize" and a device top-k "recovers it exactly". Recomputed from the
+matched table: the kernel recovers **59% of the host cost on dense (≈31–36% of the prize)
+and 16–20% on tie-heavy (≈8–12%)**. The 52–60% figure is the size of the *target*, not of
+the win.
+
+**So the kernel is not ready to wire, and the blocking step is one cheap measurement:**
+dump the engine's real score array at a real context and characterise its tie structure.
+Everything above ranges over a factor of four on that one unknown.
 
 ### M1 — the windows
 
@@ -382,7 +392,7 @@ Budget = 291.25 − indexer − 32.4, against the measured device kernel on the 
 **Say the qualification in the same breath as the result.** That budget assumes the NPU
 runs the indexer at *exactly GPU speed*. Charge the window with the indexer, the top-k
 and both handoffs and the NPU slowdown budget is **1.25× at 4k, 0.93× at 8k, 0.53× at
-16k** — so even where window 1 fits, it demands an NPU within a quarter of GPU speed over
+16k** — so even where window 1 fits, it demands an NPU within 25% of GPU speed — a 1.25x slowdown budget — over
 a single context point, which is not the "a slower NPU is fine" premise the plan rests
 on. This is the fifth revision of the window-1 number (22 → 158 → 291 µs → fails →
 fits at 4k only); it is recorded because the measurement says so, not because the exact
@@ -464,27 +474,16 @@ a GPU∥NPU one.**
   window 2 clears, at 32k only against the engine's real MoE wall rather than its compute
   floor.
 
-- **Device top-k (NO NPU). KERNEL BUILT AND MEASURED; NOT YET WIRED.** `index_topk`
-  (kernels/indexer.hip) implements the selection exactly — a 4-pass radix select on the
-  order-preserving float key, then a compaction whose output slot has a closed form, so
-  the rows come out sorted with no atomics and no second scan. The gate before it goes
-  anywhere near the decode path is `tests/kernel.rs::index_topk_matches_host_selection`,
-  which asserts it against the engine's own `topk_into + sort_unstable` on the realistic
-  ReLU-sparse shape and checks a sentinel tail so over-selection cannot hide. **That test
-  passes**, on all 10 cases including the sentinel. Cost: **44.6 µs/layer at nt=2456 and
-  63.1 at nt=5209**, against the host's measured 214.2 and 334.1 — **4.8× and 5.3×
-  faster**, worth **3.56 and 5.69 ms/token**. Wiring is a separate commit; note that
-  `idx.last_nr` becomes an implicit `min(topk, nt)` invariant rather than an observed
-  `rows.len()`, and the mid-layer `device_sync` can then be deleted outright.
-  MEASURED in-engine at **52% of the prize at
-  2.4k and 60% at 5.2k** (the share a device top-k could address, of which it recovers
-  79–81% on dense data and none on tie-heavy data — see above), extrapolating to ~76% at 32k — the host round-trip is 4.5 → 7.0
-  ms/token measured, all of it GPU-idle. One kernel: same selection, exact, no quality gate,
-  no staleness, no toolchain, no per-layer handoff. Three independent reasons it comes
-  first: it is the largest single win available; it is what would make window 1 (and so any
-  exact path) even arguable; and it is what decouples window 2's long-context viability from
-  the engine staying fetch-bound. It also removes a per-layer `device_sync` from the decode
-  path and the distribution-dependence that makes the largest line item uncertain.
+- **Device top-k (NO NPU). KERNEL BUILT AND MEASURED; NOT WIRED, AND BLOCKED ON A
+  MEASUREMENT.** `index_topk` (kernels/indexer.hip) computes the selection exactly and its
+  correctness gate passes. Its *value* is unresolved: 2.4–4.1× faster than the host on
+  dense data, 1.13–1.25× on tie-heavy, 0.89× at tie-heavy 32k — and which of those the
+  engine produces has never been measured. See "The device top-k, measured" above. Do not
+  wire it until the engine's score distribution is characterised. When wiring does happen,
+  note that `idx.last_nr` becomes an implicit `min(topk, nt)` invariant rather than an
+  observed `rows.len()`, that the mid-layer `device_sync` can then be deleted outright,
+  and that the sync deletion must be costed SEPARATELY from the top-k in the A/B or
+  nobody will know which one paid.
 
 - **Toolchain spike — lead with the handoff.** Compile + run one dense bf16 kernel on the
   NPU via whatever flow exists (MLIR-AIE / Peano / IREE — presence unverified; `xrt-smi`

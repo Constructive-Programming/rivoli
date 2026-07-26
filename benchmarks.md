@@ -887,31 +887,44 @@ the confound is structural, not an artifact of this pair. The +47 ms of wall cam
 
 ### Device top-k (`index_topk`) vs the host round-trip, 2026-07-27
 
-`examples/indexer_bench`, gfx1151 sole tenant. Controls in that run: `o_proj` 520.22 µs /
-193.5 GB/s (1.7% from the recorded 528.95), rotation 1.16× — both ok. Correctness gate
+`examples/indexer_bench`, gfx1151 sole tenant. Controls that run: `o_proj` 520.22 µs /
+193.5 GB/s, rotation 1.16× — both ok. Correctness gate
 `tests/kernel.rs::index_topk_matches_host_selection` passes on all 10 cases, including a
 sentinel-tail assertion that nothing is written past `min(k,nt)`.
 
-Both implementations timed in the same rig, on the same buffer, on the same data. µs per
-full layer:
+Both implementations timed in the same rig, on the same buffer, on the same data, µs per
+full layer (host → device):
 
-| nt | host, dense | device, dense | host, ReLU-sparse | device, ReLU-sparse |
-|---:|---:|---:|---:|---:|
-| 2456 | 84.47 | 32.81 | 27.07 | 42.22 |
-| 4096 | 124.22 | 30.73 | 36.48 | 50.89 |
-| 5209 | 106.60 | 39.19 | 38.68 | 59.23 |
-| 8192 | 125.89 | 51.22 | 45.10 | 79.20 |
-| 16384 | 345.74 | 86.36 | 64.39 | 123.99 |
-| 32768 | 553.93 | 157.20 | 136.89 | 214.92 |
+| nt | dense (few ties) | scattered (heavy ties, random order) | sorted-sparse (**artifact**) |
+|---:|---:|---:|---:|
+| 2456 | 86.6 → 35.8 (2.42×) | 54.4 → 45.6 (1.19×) | 28.8 → 45.3 (0.64×) |
+| 4096 | 107.7 → 32.5 (3.32×) | 61.2 → 54.3 (1.13×) | 32.9 → 51.0 (0.65×) |
+| 5209 | 101.4 → 41.2 (2.46×) | 74.9 → 59.7 (1.25×) | 41.1 → 60.9 (0.67×) |
+| 8192 | 126.4 → 52.7 (2.40×) | 96.6 → 82.7 (1.17×) | 46.8 → 79.2 (0.59×) |
+| 16384 | 344.5 → 83.3 (4.14×) | 144.3 → 126.6 (1.14×) | 65.7 → 127.6 (0.52×) |
+| 32768 | 578.1 → 157.6 (3.67×) | 191.8 → 215.0 (0.89×) | 144.6 → 215.0 (0.67×) |
 
-**Do not compare a device number here against the 214.2 / 334.1 µs/layer the engine was
-measured spending.** That mixes instruments in the direction that flatters the kernel: the
-in-engine host figure carries a ~2× in-situ penalty a microbench device figure does not.
-Only columns in this table may be divided by one another.
+**A fixture can look like a finding — this one did.** An earlier revision of this section
+measured only the third column and reported the kernel as 1.6–1.9× *slower* than the CPU,
+attributing it to ties making quickselect cheaper. `topk_into` seeds its index workspace
+with the identity permutation and orders by (score desc, index asc); that fixture's
+non-zero values descend from index 0, so the identity **is** the sorted order and both
+`select_nth_unstable_by` and the trailing `sort_by` got an already-sorted slice — their
+best case, unavailable to the kernel. The `scattered` column holds the tie structure fixed
+and randomises order: the ratio moves 0.64× → 1.19×, so **~1.8× of that "regression" was
+the fixture.** When timing a comparison-based algorithm, randomise the input order or you
+are measuring your generator.
 
-**The two implementations respond to data in opposite directions.** Ties make quickselect
-cheaper and the radix histogram dearer, so the device is 2.5–4× faster on dense data and
-1.6–1.9× *slower* on tie-heavy data. Any single-number speedup for this kernel is
-meaningless without naming the distribution.
+**Corrected reading.** Ties cut both ways — cheaper for quickselect, dearer for the radix
+histogram (tied keys collide on one LDS bin) — so the kernel runs 2.4–4.1× faster on
+dense data, 1.13–1.25× on tie-heavy, and 0.89× at tie-heavy 32k. Never quote a single
+speedup without the distribution.
 
-Interpretation, and what it means for wiring: docs/NPU.md § "The device top-k, measured".
+**Caveats on precision.** The host column is 20 iterations reported as a bare mean with no
+dispersion, and it is non-monotonic (107.7 µs at nt=4096 against 101.4 at 5209) and
+disagrees with the earlier `m0_host` row by up to ~30% at some contexts while matching to
+~1% at others. Ratios here are good to about one significant figure, not two. The device
+kernel is also single-workgroup, so its absolute cost is one CU's serial sweep; the
+LDS-contention hypothesis names a lever but occupancy is the larger structural bound.
+
+Interpretation and what it means for wiring: docs/NPU.md § "The device top-k, measured".

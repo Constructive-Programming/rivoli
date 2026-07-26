@@ -179,11 +179,13 @@ __device__ __forceinline__ unsigned int topk_scan(
 // rows[0..min(k,nt)) = the DSA attend row set, ASCENDING: order by score descending
 // and index ascending, take the first k, emit that set in index order.
 //
-// The index tiebreak is load-bearing, not decorative. `index_score` ReLUs every head
-// contribution, so at long context a large fraction of tokens score exactly 0.0, the
-// k-th boundary lands INSIDE that tie group, and which tokens get attended is decided
-// entirely by the index rule. Resolving ties by arrival order would be non-deterministic
-// across runs over most of the selection.
+// The index tiebreak is load-bearing whenever the score array carries ties at the k-th
+// boundary: the selection is then decided by the index rule, and resolving ties by
+// arrival order would be non-deterministic across runs. How tie-heavy the engine's
+// scores actually are is UNMEASURED — `index_score` ReLUs every head contribution, which
+// is the reason to expect ties, but docs/NPU.md records evidence against the array being
+// tie-dominated. The rule is exact either way; only how much of the selection it decides
+// is open.
 extern "C" __global__ void index_topk(
     const float* __restrict__ s, int nt, int k, unsigned int* __restrict__ rows) {
     __shared__ unsigned int hist[TOPK_BINS];

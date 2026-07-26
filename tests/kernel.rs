@@ -858,12 +858,15 @@ fn moe_i4_real_data_matches_cpu() {
 /// caught by seven cases on selection alone, the canonicalisation only by
 /// `mixed +0.0/-0.0`, and **`<= need` by nothing except the tail check**.
 ///
-/// The `ReLU-sparse` and `scattered zeros` cases are the engine's real shape:
-/// `index_score` ReLUs every head contribution, so most tokens score exactly 0.0 and
-/// the k-th boundary falls INSIDE that tie group, leaving the index-ascending rule to
-/// decide the bulk of the selection. `scattered zeros` additionally makes the answer
-/// non-prefix, which is the combination nothing else here covers. nt = 5185 and
-/// k = 2048 are the longer in-engine context and GLM-5.2's `index_topk`.
+/// The `ReLU-sparse` and `scattered zeros` cases are tie-DOMINATED, which is the regime
+/// where the index-ascending rule decides the bulk of the selection rather than a
+/// handful of boundary entries. Whether the engine actually produces such an array is
+/// unmeasured (docs/NPU.md), so these are chosen as the hardest case for the tiebreak,
+/// not as a claim about production data. `scattered zeros` additionally makes the answer
+/// non-prefix, which is the combination nothing else here covers — and note the two
+/// differ in ORDER as well as scatter: `ReLU-sparse` is pre-sorted into the host
+/// comparator's own order, which is its best case and a trap when timing rather than
+/// checking. nt = 5185 and k = 2048 are the longer in-engine context and `index_topk`.
 #[test]
 fn index_topk_matches_host_selection() {
     const SENTINEL: u32 = 0xFFFF_FFFF;

@@ -469,12 +469,15 @@ fn m0_host(nts: &[usize], scores: &mut DeviceBuf) {
 /// host figure carries a ~2× in-situ penalty (docs/NPU.md) that a microbench device
 /// figure does not. Only the columns below may be divided by one another.
 ///
-/// Two distributions because the two implementations respond to data in opposite ways.
-/// The host `topk_into` is comparison-driven: ties make quickselect cheaper. The kernel
-/// does a fixed four radix passes plus one compaction sweep, so it was expected to be
-/// flat — and is not, which is the finding. **ReLU-sparse is the engine's real shape**:
-/// `index_score` clips every head contribution, so at long context most tokens score
-/// exactly 0.0.
+/// THREE fixtures, because two effects were confounded in an earlier revision.
+/// `dense` has few ties and random order. `scattered` has the same heavy tie structure
+/// as the engine is assumed to produce but random order. `sorted-sparse` has that tie
+/// structure pre-sorted into `topk_into`'s comparator order, which is its best case and
+/// nothing to do with ties — comparing it against `scattered` is what separates the two.
+///
+/// Which of these the engine actually produces has NEVER been measured; the claim that
+/// its scores are tie-dominated is an assumption, and docs/NPU.md records evidence
+/// against it.
 ///
 /// Contexts start at 2456 — the shorter in-engine run's mean — because at `nt <= 2048`
 /// the engine returns dense before scoring and neither implementation runs at all.
@@ -485,8 +488,21 @@ fn m0c_topk_matched(nts: &[usize], scores: &mut DeviceBuf) {
     let sp = scores.ptr() as *const f32;
 
     let dense = synth_scores(max_nt);
-    let mut sparse = vec![0.0f32; max_nt];
-    for (i, x) in sparse.iter_mut().enumerate().take(300) {
+    // Tie-heavy AND randomly ordered: 300 non-zeros scattered by a coprime stride, the
+    // rest exactly 0.0. This is the fixture that isolates the tie effect.
+    let mut scattered = vec![0.0f32; max_nt];
+    for j in 0..300 {
+        scattered[(j * 7919) % max_nt] = (300 - j) as f32 * 0.25;
+    }
+    // Tie-heavy AND pre-sorted: the same sparsity with the non-zeros descending from
+    // index 0. Kept because it is a TRAP, and the trap is the finding. `topk_into` seeds
+    // its workspace with the identity permutation and orders by (score desc, index asc),
+    // so for this fixture the identity IS the sorted order: quickselect and the trailing
+    // sort both get an already-sorted slice, which is their best case. The device kernel
+    // gets no such benefit. An earlier revision measured only this shape and concluded
+    // the kernel was 1.6x slower than the CPU — an artifact of the fixture, not of ties.
+    let mut sorted_sparse = vec![0.0f32; max_nt];
+    for (i, x) in sorted_sparse.iter_mut().enumerate().take(300) {
         *x = (300 - i) as f32 * 0.25;
     }
 
@@ -497,15 +513,20 @@ fn m0c_topk_matched(nts: &[usize], scores: &mut DeviceBuf) {
     let mut rows_up = zeros(max_nt.max(IDX_TOPK) * 4);
 
     println!("\nM0c — host vs device selection, MATCHED rig and data (µs per full layer):");
-    println!("       nt   ReLU-sparse: host  device  ratio | dense: host  device  ratio");
+    println!(
+        "       nt |  dense (few ties)   |  scattered (ties, random order) |  sorted-sparse (ties, PRE-SORTED)"
+    );
+    println!(
+        "          |  host   dev   ratio |  host    dev    ratio           |  host    dev    ratio"
+    );
     for &nt in nts {
-        let mut cell = [(0.0f64, 0.0f64); 2];
-        for (j, data) in [&sparse, &dense].iter().enumerate() {
+        let mut cell = [(0.0f64, 0.0f64); 3];
+        for (j, data) in [&dense, &scattered, &sorted_sparse].iter().enumerate() {
             scores
                 .copy_in_at(0, &f32b(&data[..nt]))
                 .expect("seed scores");
-            // SAFETY: `scores` holds nt f32; `rows` holds max(max_nt, IDX_TOPK) u32 and
-            // the kernel writes exactly min(IDX_TOPK, nt) of them.
+            // SAFETY: `scores` holds nt f32; `rows` holds IDX_TOPK u32, which is exactly
+            // what the kernel writes here since k == IDX_TOPK <= nt for every nt below.
             let dev_us = time(60, &|_| unsafe {
                 launch_index_topk(sp, nt, IDX_TOPK, rows_ptr).expect("index_topk");
             });
@@ -530,13 +551,16 @@ fn m0c_topk_matched(nts: &[usize], scores: &mut DeviceBuf) {
             cell[j] = (host_us, dev_us);
         }
         println!(
-            "  {nt:7}   {:16.2} {:7.2} {:6.2}x | {:10.2} {:7.2} {:6.2}x",
+            "  {nt:7} | {:6.1} {:5.1} {:5.2}x | {:6.1} {:6.1} {:5.2}x | {:6.1} {:6.1} {:5.2}x",
             cell[0].0,
             cell[0].1,
             cell[0].0 / cell[0].1,
             cell[1].0,
             cell[1].1,
             cell[1].0 / cell[1].1,
+            cell[2].0,
+            cell[2].1,
+            cell[2].0 / cell[2].1,
         );
     }
 }
