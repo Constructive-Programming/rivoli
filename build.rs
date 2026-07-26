@@ -142,10 +142,15 @@ fn vulkan() {
             continue;
         }
         failures.extend(spirv_val(&spv));
-        failures.extend(no_subgroup_arithmetic(&spv));
-        failures.extend(no_reciprocal_rewrite(&spv));
-        failures.extend(no_banned_builtins(&spv));
-        failures.extend(no_array_parameters(&spv));
+        // ONE disassembly, shared by every SPIR-V guard. Each used to shell out for
+        // itself: four spirv-dis runs per shader, 44 per build, all producing the same
+        // text.
+        if let Some(text) = disassemble(&spv) {
+            failures.extend(no_subgroup_arithmetic(&spv, &text));
+            failures.extend(no_reciprocal_rewrite(&spv, &text));
+            failures.extend(no_banned_builtins(&spv, &text));
+            failures.extend(no_array_parameters(&spv, &text));
+        }
     }
     assert!(
         failures.is_empty(),
@@ -169,8 +174,7 @@ fn vulkan() {
 ///
 /// Returns findings rather than panicking, so the caller can report every shader's
 /// problems at once.
-fn no_subgroup_arithmetic(spv: &str) -> Vec<String> {
-    let Some(text) = disassemble(spv) else { return Vec::new() };
+fn no_subgroup_arithmetic(spv: &str, text: &str) -> Vec<String> {
     ["GroupNonUniformArithmetic", "GroupNonUniformClustered"]
         .iter()
         .filter(|banned| text.contains(*banned))
@@ -203,14 +207,13 @@ fn no_subgroup_arithmetic(spv: &str) -> Vec<String> {
 /// multiplying by anything else is either an optimizer-invented reciprocal or an
 /// author-written scale that deserves an argument. Pass the divisor in at runtime — an
 /// operand the optimizer cannot see is an operand it cannot fold.
-fn no_reciprocal_rewrite(spv: &str) -> Vec<String> {
+fn no_reciprocal_rewrite(spv: &str, text: &str) -> Vec<String> {
     // Legitimate non-power-of-two constant multiplies, if one is ever justified: add
     // the exact printed value here with a comment saying why it is safe. Empty on
     // purpose — every current kernel either divides at runtime or scales by 2^n.
     const ALLOWED: &[&str] = &[];
 
     let mut found = Vec::new();
-    let Some(text) = disassemble(spv) else { return found };
     // name -> printed value, from `%float_x = OpConstant %float 0.125`
     let mut consts = std::collections::HashMap::new();
     for line in text.lines() {
@@ -263,7 +266,7 @@ fn no_reciprocal_rewrite(spv: &str) -> Vec<String> {
 /// A denylist of one entry that fires exactly is worth more than no guard. It grows as
 /// more are identified; each needs the divergence it prevents named, or the next person
 /// cannot judge whether an exemption is safe.
-fn no_banned_builtins(spv: &str) -> Vec<String> {
+fn no_banned_builtins(spv: &str, text: &str) -> Vec<String> {
     /// `(instruction, what to write instead, why)`.
     const BANNED: &[(&str, &str, &str)] = &[(
         "InverseSqrt",
@@ -272,7 +275,6 @@ fn no_banned_builtins(spv: &str) -> Vec<String> {
          correctly-rounded sqrt then a correctly-rounded divide, so the results differ",
     )];
 
-    let Some(text) = disassemble(spv) else { return Vec::new() };
     let mut found = Vec::new();
     for line in text.lines() {
         // Match the operand position exactly: `%n = OpExtInst %type %set <Instr> ...`.
@@ -316,7 +318,7 @@ fn no_banned_builtins(spv: &str) -> Vec<String> {
 ///
 /// WHY IT DOES NOT BLOCK A LOCAL ACCUMULATOR. `mla_latent_attend` needs
 /// `float acc[MLA_ACC_REGS]`, and indexing an array element compiles to `OpAccessChain`
-/// + `OpLoad %float` — never a whole-array load. Verified across every kernel here:
+/// then `OpLoad %float` — never a whole-array load. Verified across every kernel here:
 /// `rope_interleave` carries two local arrays and has zero whole-array loads; only the
 /// buggy `gemv_fp8` had any.
 ///
@@ -326,8 +328,7 @@ fn no_banned_builtins(spv: &str) -> Vec<String> {
 /// still miss the spill.
 ///
 /// Write a macro instead, so the caller's variable is written directly.
-fn no_array_parameters(spv: &str) -> Vec<String> {
-    let Some(text) = disassemble(spv) else { return Vec::new() };
+fn no_array_parameters(spv: &str, text: &str) -> Vec<String> {
     text.lines()
         .filter(|l| {
             l.split_once(" = OpLoad ")
