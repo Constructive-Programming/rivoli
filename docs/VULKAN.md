@@ -358,6 +358,36 @@ the oracles for the 16 ported kernels pass**, plus a coherent 32-token decode on
 partial artifact (the `convert --layers 1` stub path used for the HIP end-to-end
 bring-up).
 
+### The real bar: byte-identical output against the HIP path
+
+Per-kernel oracles are necessary and they are not the acceptance test. Each one checks a
+kernel against a CPU reference *in isolation*, with tolerances; none of them can see an
+error that only appears once 78 layers compose, and none of them constrains the sampled
+token at all.
+
+The end-to-end bar is: **the same prompt, same seed, same artifact, decoded through the
+Vulkan backend and through the HIP backend, produces byte-identical text.** Greedy
+decode makes that a legitimate demand rather than an aspiration — every token is an
+argmax over a 154,880-way vocabulary, so a single differing logit that crosses a
+boundary anywhere in the run changes the output and the comparison fails loudly. It
+subsumes every per-kernel oracle: nothing can be wrong in a way that survives it.
+
+Two reasons to write it down now, long before it can be run:
+
+- It is **achievable, and demonstrated** — not on this backend, but by the perf work on
+  the HIP side, whose interleaved A/B produced 256 greedy argmaxes byte-identical
+  between arms across a real decode. That is proof the property holds for a correct
+  change on this hardware, so a Vulkan run that fails it has a real defect rather than
+  an unrealistic bar.
+- It is the answer to *"the oracles are green, is the backend right?"*, and that question
+  will be asked at the point where the answer is expensive to get. It cannot be run
+  until phase 4 puts a whole forward pass on the Vulkan path.
+
+Until then, do not describe the port as verified end to end. The oracles are per-kernel
+evidence and nothing in this repo currently tests the composition — on either backend,
+which is why the perf run's byte-identity result arrived as a side effect rather than
+from a test.
+
 Scoped, not "unmodified", on purpose: the suite also covers `gemv_vq`/`gemv_i4`, which
 are microbench kernels the decode path never calls. Gate those oracles on the ported
 set (`#[cfg]` or a skip list) rather than porting two kernels to satisfy a test.
