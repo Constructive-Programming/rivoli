@@ -23,10 +23,24 @@ float wave_sum(float v) {
     return v;
 }
 
-// bf16f / f2bf16 / e4m3f are NOT here yet, on purpose. Unused GLSL functions are
-// optimised out of every module, so porting them ahead of a caller ships code that
-// looks verified and is not — and f2bf16's non-finite branch is a hand-rewrite of
-// isfinite() into a bit test. Port each alongside the first kernel that needs it, so
-// that kernel's oracle covers it.
+// bf16f / f2bf16 / e4m3f are NOT here yet, on purpose. They are not conveniences —
+// they are a BIT-EXACTNESS CONTRACT with src/math.rs, and unexercised code carrying a
+// correctness contract is worse than absent code, because it reads as coverage. Unused
+// GLSL is optimised out of every module, so porting them ahead of a caller ships
+// exactly that false signal.
+//
+// Port each alongside the first kernel that needs it — and note that a GEMV oracle
+// over plausible weight data does NOT cover them. It reaches neither the encodings
+// nor the branches that break. So, specifically:
+//
+//   e4m3f / e4m3_lut_build: add a standalone shader test that decodes ALL 256 byte
+//   values and compares elementwise against math::e4m3_to_f32. A 256-element dispatch
+//   settles the contract permanently; a MoE oracle will miss NaN (exp==15, mant==7),
+//   the exp==0 subnormal ladder, and the sign-symmetric edges.
+//
+//   f2bf16: test the RNE-with-non-finite-passthrough branch directly — a NaN whose
+//   payload an RNE carry would turn into Inf (the bug common.hpp's comment warns
+//   about), ±Inf, values that carry on rounding, and the subnormal boundary. The
+//   decode direction (bf16f) is cheap enough to test broadly.
 
 #endif // RIVOLI_COMMON_GLSL
