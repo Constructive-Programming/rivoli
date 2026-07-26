@@ -32,8 +32,8 @@ const KOUT_GRID: [u32; 6] = [25, 50, 100, 200, 400, 800];
 /// the bar moves as substitution is throttled). M is the candidate window, from `top_k`
 /// itself — where substitution is a no-op and the row must reproduce the baseline — out
 /// to the full recorded window.
-const J_GRID: [usize; 4] = [1, 2, 3, 4];
-const M_GRID: [usize; 7] = [8, 10, 12, 16, 20, 24, 32];
+const J_GRID: [usize; 7] = [1, 2, 3, 4, 5, 6, 7];
+const M_GRID: [usize; 8] = [8, 9, 10, 12, 16, 20, 24, 32];
 
 /// The prefetch horizons the oracle ceiling is reported at. L+2 is the horizon
 /// docs/CACHE_PILOT.md argues for (one layer of decode compute is shorter than one

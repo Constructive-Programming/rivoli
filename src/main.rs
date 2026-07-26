@@ -391,6 +391,8 @@ fn main() -> Result<()> {
             let (hits, misses) = (engine.hits(), engine.misses());
             let hit_pct = 100.0 * hits as f64 / (hits + misses).max(1) as f64;
             let swap = engine.swap_pct();
+            // The (J, M) actually in force, or None when the policy ignores them.
+            let top_m = (cfg.cache_policy == "top-m").then_some((cfg.route.j, cfg.route.m));
             info!(
                 "PPL: {:.6} (mean NLL {mean:.6} over {} predicted tokens, {dt:.1}s) | \
                  hit {hit_pct:.2}% | swap {}",
@@ -414,8 +416,12 @@ fn main() -> Result<()> {
                     "# rivoli-nll v1 mode={} policy={} j={} m={} tokens={} hit_pct={hit_pct:.4} swap_pct={}",
                     cfg.mode,
                     cfg.cache_policy,
-                    cfg.route.j,
-                    cfg.route.m,
+                    // `--route-j`/`--route-m` default to (2, 12) whatever the policy, so a
+                    // baseline run would otherwise record knobs it never consulted. This
+                    // file is the measurement of record; a reader must be able to tell the
+                    // baseline from a cell by its header alone.
+                    top_m.map_or("na".into(), |(j, _)| j.to_string()),
+                    top_m.map_or("na".into(), |(_, m)| m.to_string()),
                     nlls.len(),
                     swap.map_or("na".to_string(), |s| format!("{s:.4}")),
                 )?;
