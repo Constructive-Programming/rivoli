@@ -27,7 +27,7 @@
 
 /// Literal transcription of `common.glsl::f2e4m3`. Deliberately un-idiomatic — it must
 /// mirror the GLSL statement for statement, not read like good Rust.
-fn glsl_f2e4m3(x: f32) -> u8 {
+fn transcribed_f2e4m3(x: f32) -> u8 {
     if x.is_nan() {
         return 0x7f;
     }
@@ -64,7 +64,7 @@ fn glsl_f2e4m3(x: f32) -> u8 {
 }
 
 /// Literal transcription of `common.glsl::f2bf16`.
-fn glsl_f2bf16(x: f32) -> u16 {
+fn transcribed_f2bf16(x: f32) -> u16 {
     let b = x.to_bits();
     if (b & 0x7f80_0000) == 0x7f80_0000 {
         return (b >> 16) as u16; // inf/nan verbatim, as common.hpp does
@@ -84,7 +84,7 @@ fn glsl_f2e4m3_matches_math_rs() {
             let mant = (mstep * (0x0080_0000 / 4096)) | tie;
             let bits = (((exp + 127) as u32) << 23) | (mant & 0x007f_ffff);
             for v in [f32::from_bits(bits), -f32::from_bits(bits)] {
-                let (want, got) = (rivoli::math::f32_to_e4m3(v), glsl_f2e4m3(v));
+                let (want, got) = (rivoli::math::f32_to_e4m3(v), transcribed_f2e4m3(v));
                 assert_eq!(want, got, "f2e4m3({v:e}) bits={:#x}", v.to_bits());
                 checked += 1;
             }
@@ -108,7 +108,7 @@ fn glsl_f2e4m3_matches_math_rs() {
         f32::MIN_POSITIVE,
         f32::EPSILON,
     ] {
-        assert_eq!(rivoli::math::f32_to_e4m3(v), glsl_f2e4m3(v), "f2e4m3({v:e})");
+        assert_eq!(rivoli::math::f32_to_e4m3(v), transcribed_f2e4m3(v), "f2e4m3({v:e})");
         checked += 1;
     }
     // NaN is contractually 0x7f whatever the sign or payload.
@@ -118,7 +118,7 @@ fn glsl_f2e4m3_matches_math_rs() {
         f32::from_bits(0x7fc0_1234),
         f32::from_bits(0xffff_ffff),
     ] {
-        assert_eq!(glsl_f2e4m3(nan), 0x7f, "f2e4m3(NaN {:#x})", nan.to_bits());
+        assert_eq!(transcribed_f2e4m3(nan), 0x7f, "f2e4m3(NaN {:#x})", nan.to_bits());
         assert_eq!(rivoli::math::f32_to_e4m3(nan), 0x7f);
         checked += 1;
     }
@@ -134,7 +134,7 @@ fn glsl_f2bf16_matches_math_rs_on_finite() {
             let mant = (mstep * (0x0080_0000 / 8192)) | tie;
             let bits = (((exp + 127) as u32) << 23) | (mant & 0x007f_ffff);
             for v in [f32::from_bits(bits), -f32::from_bits(bits)] {
-                let (want, got) = (rivoli::math::f32_to_bf16(v), glsl_f2bf16(v));
+                let (want, got) = (rivoli::math::f32_to_bf16(v), transcribed_f2bf16(v));
                 assert_eq!(want, got, "f2bf16({v:e}) bits={:#x}", v.to_bits());
                 checked += 1;
             }
@@ -154,7 +154,7 @@ fn glsl_f2bf16_matches_math_rs_on_finite() {
 #[test]
 fn glsl_f2bf16_diverges_from_math_rs_on_nan_by_design() {
     let sig = f32::from_bits(0x7f80_0001);
-    assert_eq!(glsl_f2bf16(sig), 0x7f80, "GLSL/HIP: top 16 bits verbatim");
+    assert_eq!(transcribed_f2bf16(sig), 0x7f80, "GLSL/HIP: top 16 bits verbatim");
     assert_eq!(
         rivoli::math::f32_to_bf16(sig),
         0x7fc0,
@@ -208,8 +208,23 @@ fn glsl_fn_body(src: &str, signature: &str) -> String {
     src[start..i].to_string()
 }
 
-/// Hash of `f2e4m3` + `f2bf16` as they stand in common.glsl. Update ONLY after checking
-/// that the transcriptions above still mirror the GLSL statement for statement.
+/// Every GLSL function this file transcribes, as `(name, signature)`. The hash below
+/// covers all of them, in this order.
+///
+/// A LIST, not two hardcoded calls, because the previous version pinned `f2bf16` and
+/// `f2e4m3` BY NAME — which silently meant it did not cover anything else, and would not
+/// have covered the next transcription either, with nothing to say so. That is the same
+/// shape as a guard no test distinguishes from its absence: correct, present, and
+/// narrower than a reader assumes. `every_transcription_is_locked` below turns
+/// "remember to add it here" into a test failure.
+const LOCKED: &[(&str, &str)] = &[
+    ("f2bf16", "uint f2bf16(float x) {"),
+    ("f2e4m3", "uint f2e4m3(float x) {"),
+];
+
+/// Hash of every [`LOCKED`] function body as it stands in common.glsl, concatenated in
+/// order. Update ONLY after checking that the transcriptions above still mirror the GLSL
+/// statement for statement.
 const GLSL_NUMERICS_HASH: u64 = 0xa5fb_54ab_dc74_a080;
 
 /// The transcriptions above are only evidence while they still correspond to the
@@ -219,8 +234,10 @@ const GLSL_NUMERICS_HASH: u64 = 0xa5fb_54ab_dc74_a080;
 fn transcriptions_still_match_the_glsl() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/kernels/vk/common.glsl");
     let src = std::fs::read_to_string(path).expect("read common.glsl");
-    let mut joined = glsl_fn_body(&src, "uint f2bf16(float x) {");
-    joined.push_str(&glsl_fn_body(&src, "uint f2e4m3(float x) {"));
+    let mut joined = String::new();
+    for (_, signature) in LOCKED {
+        joined.push_str(&glsl_fn_body(&src, signature));
+    }
     let got = fnv1a(joined.as_bytes());
     assert_eq!(
         got, GLSL_NUMERICS_HASH,
@@ -232,4 +249,52 @@ fn transcriptions_still_match_the_glsl() {
          2. Update them if they diverged.\n\
          3. Set GLSL_NUMERICS_HASH = {got:#018x}\n"
     );
+}
+
+
+/// Every `glsl_*` transcription in this file must appear in [`LOCKED`].
+///
+/// THE EIGHTH MECHANISED RULE. Without it, the lock covers exactly what someone
+/// remembered to list: adding a transcription and forgetting the entry leaves a function
+/// diffed against `math.rs` but NOT pinned to the shader, so the GLSL can drift away from
+/// it silently — the transcription keeps passing while testing something the shader no
+/// longer contains. That is the failure this whole file exists to prevent, reintroduced
+/// one level up.
+///
+/// The convention it relies on is `fn transcribed_<name>` mirroring GLSL `<name>`. The
+/// prefix is deliberately distinct from anything a TEST would be called: the first
+/// version keyed on `glsl_` and matched the test functions too, reporting
+/// `glsl_f2e4m3_matches_math_rs` as an unlocked transcription. A convention has to be
+/// unambiguous before it can be mechanically checked.
+#[test]
+fn every_transcription_is_locked() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/glsl_numerics.rs");
+    let me = std::fs::read_to_string(path).expect("read this file");
+    let mut found = Vec::new();
+    for line in me.lines() {
+        let line = line.trim_start();
+        if let Some(name) = line
+            .strip_prefix("fn transcribed_")
+            .and_then(|rest| rest.split('(').next())
+        {
+            found.push(name.to_string());
+        }
+    }
+    assert!(
+        !found.is_empty(),
+        "no `fn transcribed_*` found — the naming convention this check keys on has \
+         changed, and it has been passing without examining anything"
+    );
+    for name in &found {
+        assert!(
+            LOCKED.iter().any(|(locked, _)| locked == name),
+            "\n\n`transcribed_{name}` is here but is NOT in LOCKED.\n\
+             It is therefore diffed against math.rs but not pinned to the shader, so \
+             kernels/vk/common.glsl can drift away from it and this file will keep \
+             passing while testing a function the shader no longer has.\n\
+             Add (\"{name}\", \"<its GLSL signature up to the opening brace>\") to \
+             LOCKED and update GLSL_NUMERICS_HASH.\n"
+        );
+    }
+    println!("transcriptions locked: {found:?}");
 }

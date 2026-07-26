@@ -37,7 +37,7 @@
 #![cfg(feature = "vulkan")]
 #![allow(clippy::expect_used)]
 
-use rivoli::device::DeviceTier;
+use rivoli::device::{DeviceBuf, DeviceTier};
 use rivoli::math::{E4M3_BLOCK, E4M3_MAX, f32_to_bf16, f32_to_e4m3};
 use rivoli::vk::{
     Buf, ROWS_PER_BLOCK, VALIDATION_ERRORS, device_sync, gpu, launch_append_kv, launch_argmax,
@@ -557,6 +557,113 @@ fn kernel_reads_weights_placed_through_the_tier() {
         "gemv over tier-placed weights",
     );
     v.check("kernel_reads_weights_placed_through_the_tier");
+}
+
+/// `DeviceBuf::copy_out_into` must see what a just-launched kernel wrote, WITHOUT the
+/// caller syncing.
+///
+/// Its HIP twin is a blocking `hipMemcpy(..., D2H)` and every caller was written against
+/// that contract. `gpu.rs:789` does `launch_gemv_f32(...)` then immediately
+/// `gate_logits.copy_out_into(...)`; if the Vulkan version were a bare read of the host
+/// mapping it would return the PREVIOUS token's gate logits, and routing would pick the
+/// wrong experts on every layer of every token — coherently, with no error.
+///
+/// Found by review, not by a test, and untested until now because `gpu.rs` is rocm-only.
+/// This closes it at unit scale, where a failure implicates one function, rather than at
+/// integration where every kernel is simultaneously a suspect.
+///
+/// DETERMINISTIC, not a race: without the internal `device_sync` the dispatch is still
+/// sitting unsubmitted in the open command buffer, so the read returns the sentinel
+/// every time. No scaling needed — unlike the barrier test, which needed 32 chained
+/// steps at 2048x2048 before a missing barrier became observable at all.
+#[test]
+fn copy_out_into_sees_the_dispatch_that_preceded_it() {
+    let v = Validation::new();
+    let mut r = Lcg(0x0D2);
+    let (o_dim, i_dim) = (128usize, 256usize);
+    let w: Vec<f32> = (0..o_dim * i_dim).map(|_| r.f()).collect();
+    let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
+    let mut want = vec![0.0f32; o_dim];
+    matvec_f32(&mut want, &x, &w, i_dim);
+
+    let (xb, wb) = (dev(&f32b(&x)), dev(&f32b(&w)));
+    // A sentinel the kernel cannot produce, so "stale" and "correct" are never confusable.
+    let sentinel = vec![-12345.0f32; o_dim];
+    let mut out = DeviceBuf::new(o_dim * 4).expect("alloc");
+    out.copy_in_at(0, &f32b(&sentinel)).expect("seed");
+
+    // SAFETY: live device addresses of the documented sizes; nothing is dropped before
+    // the copy_out_into below, which is what retires the dispatch.
+    unsafe {
+        launch_gemv_f32(
+            xb.ptr() as *const f32,
+            wb.ptr() as *const f32,
+            o_dim,
+            i_dim,
+            out.ptr_mut() as *mut f32,
+        )
+        .expect("launch");
+    }
+    // NO device_sync here. That is the whole test.
+    let mut host = Vec::new();
+    out.copy_out_into(&mut host).expect("copy_out_into");
+    let got = f32v(&host);
+    assert!(
+        got.iter().all(|&g| g != -12345.0),
+        "copy_out_into returned the SENTINEL — it read the host mapping without \
+         retiring the dispatch, so a caller gets the previous contents (gpu.rs:789 \
+         would route on the previous token's gate logits)"
+    );
+    assert_close(&want, &got, "copy_out_into after dispatch");
+    v.check("copy_out_into_sees_the_dispatch_that_preceded_it");
+}
+
+/// `DeviceBuf::copy_in_at` must not overwrite bytes a recorded-but-unsubmitted dispatch
+/// is going to read.
+///
+/// The mirror hazard of the test above, and the one that is easy to miss because it
+/// runs the other way: HIP's H2D `hipMemcpy` blocks, so it is ordered AFTER any kernel
+/// still reading the buffer. A bare host write into a mapped allocation is not — the
+/// write lands before the submit, and the dispatch reads the NEW bytes. `gpu.rs:843`
+/// (descs_vq / wexpert_buf) depends on the blocking behaviour.
+///
+/// Deterministic for the same reason: the dispatch has not been submitted, so without
+/// the internal sync it is guaranteed to see the overwrite rather than merely likely to.
+#[test]
+fn copy_in_at_does_not_clobber_a_pending_dispatch() {
+    let v = Validation::new();
+    let mut r = Lcg(0x1A7);
+    let (o_dim, i_dim) = (64usize, 128usize);
+    let w: Vec<f32> = (0..o_dim * i_dim).map(|_| r.f()).collect();
+    let x_old: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
+    // Distinct enough that a result computed from the wrong one cannot pass the oracle.
+    let x_new: Vec<f32> = x_old.iter().map(|v| v * 7.0 + 3.0).collect();
+    let mut want = vec![0.0f32; o_dim];
+    matvec_f32(&mut want, &x_old, &w, i_dim);
+
+    let wb = dev(&f32b(&w));
+    let mut xb = DeviceBuf::new(i_dim * 4).expect("alloc x");
+    xb.copy_in_at(0, &f32b(&x_old)).expect("seed old");
+    let mut yb = dev(&f32b(&vec![0.0f32; o_dim]));
+
+    // SAFETY: as above; `xb` outlives the sync inside copy_in_at.
+    unsafe {
+        launch_gemv_f32(
+            xb.ptr() as *const f32,
+            wb.ptr() as *const f32,
+            o_dim,
+            i_dim,
+            yb.ptr_mut() as *mut f32,
+        )
+        .expect("launch");
+    }
+    // Overwrite the INPUT the pending dispatch reads. copy_in_at must retire it first.
+    xb.copy_in_at(0, &f32b(&x_new)).expect("clobber");
+    device_sync().expect("sync");
+
+    let got = f32v(&read(&yb, o_dim));
+    assert_close(&want, &got, "gemv used x_old despite the overwrite");
+    v.check("copy_in_at_does_not_clobber_a_pending_dispatch");
 }
 
 /// The guards report errors rather than tripping a Vulkan VUID or allocating nothing.
