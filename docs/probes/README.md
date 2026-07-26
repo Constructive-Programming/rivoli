@@ -153,6 +153,18 @@ invisible because every test length was already a multiple of four.
 > Ask: **would the suite notice if I deleted this?**
 > Answer it by deleting it and running the tests.
 
+**Coverage that grew while a gap grew faster.** A number moved in the reassuring
+direction while the thing it stands for moved the other way. Tranche 2a ported six
+kernels and wrote three oracles: the suite went from 16 tests to 23, every one passed,
+and the two hardest kernels in the batch had never executed. "We added tests" is exactly
+the evidence someone would cite to argue the opposite.
+
+> Ask: **what is NOT in this suite?**
+> Answer it by enumerating what SHOULD be covered and diffing — not by reading the
+> count. `tests/kernel_coverage.rs` does this mechanically for kernels.
+
+**A green suite is not a claim about what is in it.**
+
 The first question is about instruments, the second about guards, and neither finds the
 other's failures. A check can also be both at once: `assert_quantization_unambiguous`
 fires correctly *and* its 8-ULP margin is exactly wide enough to hide a 1-ULP toolchain

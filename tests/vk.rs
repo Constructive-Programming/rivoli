@@ -38,10 +38,12 @@
 #![allow(clippy::expect_used)]
 
 use rivoli::device::{DeviceBuf, DeviceTier};
+use rivoli::quant::{matvec_fp8, matvec_i8};
 use rivoli::math::{E4M3_BLOCK, E4M3_MAX, f32_to_bf16, f32_to_e4m3, silu};
 use rivoli::vk::{
     Buf, ROWS_PER_BLOCK, VALIDATION_ERRORS, device_sync, gpu, launch_append_kv, launch_argmax,
-    launch_embed_i8_row, launch_gather_rope, launch_gemv_f32, launch_rmsnorm, launch_rope,
+    launch_embed_i8_row, launch_gather_rope, launch_gemv_f32, launch_gemv_fp8, launch_gemv_i8,
+    launch_rmsnorm, launch_rope,
     launch_swiglu, launch_vadd, memcpy_dtod,
 };
 use std::sync::atomic::Ordering;
@@ -1695,4 +1697,233 @@ fn linalg_guards_reject_degenerate_arguments() {
     // Rejecting a bad argument must not itself trip the layer — a guard that returns
     // Err while leaving a half-built Vulkan object behind would show up here.
     v.check("linalg_guards_reject_degenerate_arguments");
+}
+
+
+// ---------------------------------------------------------------------------
+// linalg.hip: the quantised GEMVs
+// ---------------------------------------------------------------------------
+
+/// `y[o] = scale[o] * Σ x[i]·(i8)packed[o·i_dim+i]` — lm_head to logits.
+///
+/// Like `embed_i8_row`, the shader reads packed int8 as u32 WORDS and sign-extends by
+/// hand, so the failure that matters is a byte read as unsigned: invisible below 0x80,
+/// a 256·scale error above it. Every row therefore carries the four extremes, and
+/// `i_dim` is not a multiple of 4 so the extraction runs at every byte phase.
+#[test]
+fn gemv_i8_matches_the_host_oracle() {
+    let v = Validation::new();
+    let mut r = Lcg(0x18);
+    // o_dim not a multiple of ROWS_PER_BLOCK (tail workgroup has idle subgroups);
+    // i_dim not a multiple of 4 or 32 (byte phases, and a ragged wave stride).
+    for (o_dim, i_dim) in [(37usize, 67usize), (256, 1024)] {
+        let mut packed: Vec<u8> = (0..o_dim * i_dim)
+            .map(|i| (i as u8).wrapping_mul(29).wrapping_add(7))
+            .collect();
+        for o in 0..o_dim {
+            packed[o * i_dim..o * i_dim + 4].copy_from_slice(&[0x80, 0xFF, 0x7F, 0x00]);
+        }
+        let scale: Vec<f32> = (0..o_dim).map(|o| 0.011 * (o as f32 + 1.0)).collect();
+        let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
+        let mut want = vec![0.0f32; o_dim];
+        matvec_i8(&mut want, &x, &packed, &scale, o_dim, i_dim);
+
+        let (xb, pb, sb) = (dev(&f32b(&x)), dev(&packed), dev(&f32b(&scale)));
+        let mut yb = poison(o_dim * 4 + GUARD);
+        // SAFETY: live Buf device addresses of the documented sizes; nothing dropped
+        // before the sync.
+        unsafe {
+            launch_gemv_i8(
+                xb.ptr() as *const f32,
+                pb.ptr(),
+                sb.ptr() as *const f32,
+                o_dim,
+                i_dim,
+                yb.ptr_mut() as *mut f32,
+            )
+            .expect("launch");
+        }
+        device_sync().expect("sync");
+        let got = readb(&yb, o_dim * 4 + GUARD);
+        let label = format!("gemv_i8 {o_dim}x{i_dim}");
+        assert_untouched(&got, o_dim * 4, &label);
+        assert_close(&want, &f32v(&got[..o_dim * 4]), &label);
+    }
+    v.check("gemv_i8_matches_the_host_oracle");
+}
+
+/// `gemv_fp8` against `quant.rs::matvec_fp8`, in BOTH dispatch geometries.
+///
+/// The launcher picks split-K at `i_dim >= 4096`, so the two shapes below straddle that
+/// threshold DELIBERATELY and each is reported separately. Testing only one side leaves
+/// an entire geometry — a different thread-to-row mapping and a whole LDS combine —
+/// unexecuted while the suite goes green, which is the same trap the 1024/300 append_kv
+/// shape had. Combined shapes are efficient right up to the moment one goes red.
+///
+/// The block tile must be a power of two: `blk_shift` indexes the scale by a SHIFT since
+/// the HIP side replaced its signed divide, and the launcher mirrors that rejection.
+#[test]
+fn gemv_fp8_matches_the_host_oracle() {
+    let v = Validation::new();
+    let block = 128usize;
+    for (o_dim, i_dim, geometry) in [
+        (256usize, 512usize, "wave-per-row"),
+        (128, 4096, "split-K"),
+    ] {
+        let mut r = Lcg(0xF8 ^ i_dim as u64);
+        let packed: Vec<u8> = (0..o_dim * i_dim).map(|_| f32_to_e4m3(r.f())).collect();
+        let sc_cols = i_dim / block;
+        let scale: Vec<f32> = (0..o_dim.div_ceil(block) * sc_cols)
+            .map(|_| (r.f() * 0.1).abs() + 0.01)
+            .collect();
+        let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
+        let mut want = vec![0.0f32; o_dim];
+        matvec_fp8(&mut want, &x, &packed, &scale, i_dim, block);
+
+        let (xb, pb, sb) = (dev(&f32b(&x)), dev(&packed), dev(&f32b(&scale)));
+        let mut yb = poison(o_dim * 4 + GUARD);
+        // SAFETY: as above; `scale` is ⌈o_dim/block⌉·⌈i_dim/block⌉ f32 as documented.
+        unsafe {
+            launch_gemv_fp8(
+                xb.ptr() as *const f32,
+                pb.ptr(),
+                sb.ptr() as *const f32,
+                o_dim,
+                i_dim,
+                block,
+                yb.ptr_mut() as *mut f32,
+            )
+            .expect("launch");
+        }
+        device_sync().expect("sync");
+        let got = readb(&yb, o_dim * 4 + GUARD);
+        let label = format!("gemv_fp8 {geometry} {o_dim}x{i_dim}");
+        assert_untouched(&got, o_dim * 4, &label);
+        assert_close(&want, &f32v(&got[..o_dim * 4]), &label);
+    }
+    v.check("gemv_fp8_matches_the_host_oracle");
+}
+
+/// The split-K path reduces across workgroup partials in a fixed-order LDS combine, so
+/// it gets the reproducibility test every reduction here gets — bytes, repeats, a decoy
+/// between them, and a not-all-zero guard.
+#[test]
+fn gemv_fp8_splitk_is_bit_reproducible() {
+    let v = Validation::new();
+    let (o_dim, i_dim, block) = (64usize, 4096usize, 128usize);
+    let mut r = Lcg(0x5B7);
+    let packed: Vec<u8> = (0..o_dim * i_dim).map(|_| f32_to_e4m3(r.f())).collect();
+    let scale: Vec<f32> = (0..o_dim.div_ceil(block) * (i_dim / block))
+        .map(|_| (r.f() * 0.1).abs() + 0.01)
+        .collect();
+    let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
+    let (xb, pb, sb) = (dev(&f32b(&x)), dev(&packed), dev(&f32b(&scale)));
+    let mut yb = dev(&f32b(&vec![0.0f32; o_dim]));
+    // A differently-shaped decoy, below the split-K threshold so it also perturbs which
+    // pipeline geometry ran last.
+    let (dx, dp, ds) = (
+        dev(&f32b(&x[..512])),
+        dev(&packed[..32 * 512]),
+        dev(&f32b(&scale[..4])),
+    );
+    let mut dy = dev(&f32b(&[0.0f32; 32]));
+
+    let run = |xb: &Buf, pb: &Buf, sb: &Buf, yb: &mut Buf, o: usize, i: usize| -> Vec<u8> {
+        // SAFETY: live device addresses of the documented sizes.
+        unsafe {
+            launch_gemv_fp8(
+                xb.ptr() as *const f32,
+                pb.ptr(),
+                sb.ptr() as *const f32,
+                o,
+                i,
+                block,
+                yb.ptr_mut() as *mut f32,
+            )
+            .expect("launch");
+        }
+        device_sync().expect("sync");
+        readb(yb, o * 4)
+    };
+
+    let first = run(&xb, &pb, &sb, &mut yb, o_dim, i_dim);
+    for k in 1..5 {
+        run(&dx, &dp, &ds, &mut dy, 32, 512);
+        let again = run(&xb, &pb, &sb, &mut yb, o_dim, i_dim);
+        assert_eq!(first, again, "gemv_fp8 split-K not bit-reproducible on repeat {k}");
+    }
+    assert!(
+        f32v(&first).iter().any(|v| v.abs() > 1e-6),
+        "output is all zero — the test proves nothing"
+    );
+    v.check("gemv_fp8_splitk_is_bit_reproducible");
+}
+
+/// Twelve `(pos, j)` points of the RoPE trig table, against values computed OUTSIDE this
+/// codebase's arithmetic.
+///
+/// WHY THIS EXISTS. `launch_rope` computes the table host-side in f64 — which is what
+/// makes it bit-identical to HIP — and `rope_interleave_rotates_each_row`'s oracle
+/// computes it the same way, with the same Rust libm. So that test is a CONSISTENCY
+/// check on the table: a misread exponent would reproduce identically on both sides and
+/// pass. The fix that bought bit-identity also removed the table from independent view,
+/// and both halves are consequences of the same change.
+///
+/// These literals break the coupling. They were computed in Python with `decimal` at 60
+/// digits: `inv = exp(-2j/seg · ln θ)` via Decimal's own ln/exp, exact range reduction
+/// mod 2π against a 60-digit constant, then sin/cos by Taylor series — no `powf`, no
+/// libm, nothing shared with the launcher.
+///
+/// SCOPE, stated so the coverage claim stays honest: THESE TWELVE POINTS are
+/// independently verified. The rest of the table remains consistency-checked.
+///
+/// Extraction trick: with a row of pairs all set to (1, 0), the rotation reduces to
+/// `v[j] = cos` and `v[half+j] = sin`, so the table is read straight out of the output.
+#[test]
+fn rope_trig_table_matches_independent_reference() {
+    let v = Validation::new();
+    // (pos, j, seg, cos bits, sin bits) — see the docstring for provenance.
+    const REF: &[(usize, usize, usize, u32, u32)] = &[
+        (0, 0, 64, 0x3f800000, 0x00000000),
+        (0, 7, 64, 0x3f800000, 0x00000000),
+        (1, 0, 64, 0x3f0a5140, 0x3f576aa4),
+        (1, 1, 64, 0x3f3b54b0, 0x3f2e7ace),
+        (4096, 0, 64, 0x3f4dd254, 0xbf183a75),
+        (4096, 3, 64, 0x3f5241cc, 0xbf120a82),
+        (4096, 31, 64, 0x3f5ac075, 0x3f04fadb),
+        (137, 5, 64, 0x3ef4f90e, 0x3f60cbae),
+        (100000, 0, 64, 0xbf7fd61c, 0x3d126d55),
+        (100000, 17, 64, 0xbf15a6fd, 0x3f4fb3c1),
+        (7, 2, 128, 0x3f02ee57, 0xbf5bfbf8),
+        (65535, 63, 128, 0x3e908076, 0x3f7597c0),
+    ];
+    let theta = 10000.0f64;
+    for &(pos, j, seg, want_cos, want_sin) in REF {
+        let half = seg / 2;
+        // All pairs (1, 0) so the rotation returns the table itself.
+        let mut row = vec![0.0f32; seg];
+        for k in 0..half {
+            row[2 * k] = 1.0;
+            row[2 * k + 1] = 0.0;
+        }
+        let mut b = dev(&f32b(&row));
+        // SAFETY: one row of `seg` f32, live until the sync.
+        unsafe { launch_rope(b.ptr_mut() as *mut f32, 1, seg, seg, pos, theta).expect("launch") };
+        device_sync().expect("sync");
+        let got = f32v(&read(&b, seg));
+        let (gc, gs) = (got[j].to_bits(), got[half + j].to_bits());
+        // Within 1 ULP, not bit-equal: the reference is a DIFFERENT algorithm at higher
+        // precision, so the two f64 intermediates can straddle an f32 rounding boundary.
+        // Exact agreement is expected and 1 ULP is the honest bound to assert.
+        let ulp = |a: u32, b: u32| (a as i64 - b as i64).abs();
+        assert!(
+            ulp(gc, want_cos) <= 1,
+            "rope cos(pos={pos}, j={j}, seg={seg}): got {gc:#010x}, independent reference              {want_cos:#010x} — the host-side trig table disagrees with a computation              that shares no arithmetic with it"
+        );
+        assert!(
+            ulp(gs, want_sin) <= 1,
+            "rope sin(pos={pos}, j={j}, seg={seg}): got {gs:#010x}, independent reference              {want_sin:#010x}"
+        );
+    }
+    v.check("rope_trig_table_matches_independent_reference");
 }
