@@ -114,6 +114,27 @@ this backend that has been violated twice is now a build failure instead — the
 `WAVE`/`ROWS_PER_BLOCK` single-sourcing, and this. Conventions in `src/vk.rs` have a
 measured failure rate of two.
 
+### A test built to fail needs its passing arm checked too
+
+The strongest form of the trap, because it survives all the other checks.
+
+`chained_dispatch_respects_the_barrier` was rebuilt to prove it could detect a deleted
+barrier. At 2048×2048 with the barrier removed it failed 8 of 8 — the exact result the
+experiment was looking for. It was wrong. Running the same test with the barrier
+*restored* showed it failed 8 of 8 there as well: the ping/pong output selection was
+inverted, so it read the wrong buffer and would have failed under any condition. A
+broken instrument and a confirmed hypothesis produced identical output, and the
+difference was only visible from the arm nobody thinks to run.
+
+**When you construct a test expecting failure, verify it passes under the condition
+where it should pass.** A negative result needs its positive control exactly as much as
+a positive result needs its negative one — and the direction that gets skipped is
+whichever one you already believe.
+
+This is the same family as the two below, and worse: there the instrument was silent
+when it should have spoken, which at least looks like nothing. Here it spoke, fluently,
+and said what was expected.
+
 ### The subject of a test can prop up its own scaffolding
 
 See the `ash::Entry` story below: a probe passed because the thing it was testing kept

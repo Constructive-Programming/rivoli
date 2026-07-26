@@ -186,32 +186,53 @@ fn gemv_f32_matches_oracle() {
 }
 
 /// The inter-dispatch barrier in `Gpu::enqueue`, exercised hard enough that its
-/// ABSENCE is detectable.
+/// ABSENCE is detectable — and repeated often enough that one execution is a real
+/// guard rather than a coin flip.
 ///
-/// Sizing is the whole point and is not arbitrary. A 64x96 version of this test passed
-/// 8/8 with the barrier deleted — too small to overlap, so it guarded nothing while
-/// carrying a name that claimed otherwise. To make a missing barrier observable the
-/// second dispatch has to actually start before the first has finished, which needs
-/// (a) enough workgroups to fill the machine several times over, (b) each output row
-/// depending on EVERY input element, so an early workgroup of step N+1 reads a row that
-/// a late workgroup of step N is still writing, and (c) a chain long enough that one
-/// escaped hazard anywhere shows up at the end.
+/// SIZING. Measured, not guessed. With the barrier deleted:
 ///
-/// 2048x2048 is 256 workgroups per dispatch at 8 rows each, four steps deep, one sync
-/// at the very end. Everything is in ONE command buffer, so the barrier is the only
-/// thing ordering the steps.
+///   32-step chain, 2048x2048  ->  2 of 8 executions FAIL
+///    4-step chain, 2048x2048  ->  0 of 8 (undetectable)
+///    2-step chain, 64x96      ->  0 of 8 (undetectable, the original size)
+///
+/// and 8 of 8 pass in every configuration with the barrier present. So a missing
+/// barrier is invisible below some threshold, and the shape that crosses it is: enough
+/// workgroups to fill the machine several times over (256 per dispatch here), every
+/// output row depending on every input element, and a chain long enough that one
+/// escaped hazard survives to the end.
+///
+/// DETECTION RATE. One chain catches a dropped barrier ~25% of the time (2/8), so a
+/// test performing a single chain would miss three regressions in four — barely better
+/// than the 64x96 version it replaced. It therefore runs `REPEATS` chains and asserts
+/// each. Treating executions as independent, detection is 1 - 0.75^REPEATS: ~90% at 8,
+/// ~99% at 16. REPEATS is 16.
+///
+/// Two honesties about that number. The independence assumption is UNVERIFIED —
+/// repeats inside one process share a scheduling regime and may well be correlated, in
+/// which case the true rate is lower than 99%. And the 2/8 base rate is itself a small
+/// sample. What is solid is the direction: 16 repeats is strictly and substantially
+/// better than one, and the control arm is clean either way.
+///
+/// COST. The host oracle (32 chained 2048x2048 matvecs, in a debug build) dominates
+/// and is computed once; the repeats add GPU work only. Worth it — this is the only
+/// empirical check on the most consequential unverifiable property in the backend,
+/// since synchronisation validation on this stack sees no compute hazard class at all
+/// (docs/probes/README.md).
 #[test]
 fn chained_dispatch_respects_the_barrier() {
     let v = Validation::new();
     let mut r = Lcg(0xBA2);
     let n = 2048usize;
     const STEPS: usize = 32;
+    /// 1 - 0.75^16 ~= 99% detection, under an independence assumption the docstring
+    /// flags as unverified.
+    const REPEATS: usize = 16;
 
-    // Near-identity matrices: unit diagonal plus small noise. A random matrix chained
-    // four deep either explodes or collapses to noise, and then a corrupted
-    // intermediate is indistinguishable from the arithmetic. This keeps every step
-    // O(1) in magnitude so a stale row survives to the output as a visible error.
-    let one = {
+    // Near-identity: unit diagonal plus small noise. A random matrix chained 32 deep
+    // either explodes or collapses into noise, and a corrupted intermediate then hides
+    // inside the arithmetic. This keeps every step O(1) so a stale row survives to the
+    // output as a visible error.
+    let m = {
         let mut m = vec![0.0f32; n * n];
         for i in 0..n {
             m[i * n + i] = 1.0;
@@ -219,36 +240,40 @@ fn chained_dispatch_respects_the_barrier() {
         }
         m
     };
-    let mats: Vec<Vec<f32>> = (0..STEPS).map(|_| one.clone()).collect();
     let x: Vec<f32> = (0..n).map(|_| r.f()).collect();
 
     let mut want = x.clone();
-    for m in &mats {
+    for _ in 0..STEPS {
         let mut next = vec![0.0f32; n];
-        matvec_f32(&mut next, &want, m, n);
+        matvec_f32(&mut next, &want, &m, n);
         want = next;
     }
 
-    let mbufs: Vec<Buf> = mats.iter().map(|m| dev(&f32b(m))).collect();
+    // ONE upload, reused by every step of every repeat. Uploading a copy per step cost
+    // 512 MB of device memory and bought nothing.
+    let mb = dev(&f32b(&m));
     let xb = dev(&f32b(&x));
     let mut ping = dev(&f32b(&vec![0.0f32; n]));
     let mut pong = dev(&f32b(&vec![0.0f32; n]));
 
-    // step 0 reads xb; every later step reads the previous step's output.
-    launch(&xb, &mbufs[0], &mut ping, n, n);
-    for (i, mb) in mbufs.iter().enumerate().skip(1) {
-        if i % 2 == 1 {
-            launch(&ping, mb, &mut pong, n, n);
-        } else {
-            launch(&pong, mb, &mut ping, n, n);
+    for rep in 0..REPEATS {
+        launch(&xb, &mb, &mut ping, n, n);
+        for i in 1..STEPS {
+            if i % 2 == 1 {
+                launch(&ping, &mb, &mut pong, n, n);
+            } else {
+                launch(&pong, &mb, &mut ping, n, n);
+            }
         }
+        device_sync().expect("sync"); // ONE sync per chain, after all STEPS dispatches
+        // Launch k writes ping for even k and pong for odd k, so after STEPS launches
+        // the result is in pong when STEPS is even. (Had this inverted first; the test
+        // then failed identically with AND without the barrier, which is what caught
+        // it — see docs/probes/README.md, "A test built to fail needs its passing arm
+        // checked too".)
+        let out = if STEPS.is_multiple_of(2) { &pong } else { &ping };
+        assert_close(&want, &f32v(&read(out, n)), &format!("{STEPS}-step chain #{rep}"));
     }
-    device_sync().expect("sync"); // ONE sync, after the whole chain
-    // Launch k writes ping for even k and pong for odd k, so after STEPS launches the
-    // result is in pong when STEPS is even. (Had this inverted first; the test then
-    // failed identically with and without the barrier, which is what caught it.)
-    let out = if STEPS.is_multiple_of(2) { &pong } else { &ping };
-    assert_close(&want, &f32v(&read(out, n)), "4-step chain");
     v.check("chained_dispatch");
 }
 
