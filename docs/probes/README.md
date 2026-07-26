@@ -142,6 +142,18 @@ the implementation.
 
 > Ask: **would this fire if the thing were wrong?**
 > Answer it by breaking the thing on purpose and watching.
+>
+> **Break however you like. Restore with `git checkout -- <file>`, never by reverse
+> substitution.** Undoing a deliberate break with `sed 's|new|old|'` once rewrote a
+> COMMENT in `append_kv.comp` that legitimately quoted the removed literal while
+> explaining why it was removed. The build stayed clean and the documentation had been
+> falsified. `git checkout` is exact by construction and cannot touch prose that happens
+> to quote the code.
+>
+> Note the vector: this repo already had one "comment asserting something false" — that
+> one was written by a person. This one was a RIGHT comment rewritten by a script. Same
+> failure, and no author to catch it in review, so the technique has to be safe by
+> construction rather than by careful reading at the end of each cycle.
 
 **A guard that is never exercised.** It is correct, it is present, and no test
 distinguishes it from its absence — the suite would be equally green with the guard
