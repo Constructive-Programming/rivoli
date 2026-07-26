@@ -48,8 +48,19 @@ pub trait HybridPolicy {
 
 /// `top-m`'s (J, M) knobs. Read only by [`make`]'s `"top-m"` arm; every other policy
 /// ignores it, which is why it rides along as an argument instead of forking the
-/// constructor. Defaults are the paper's values for this router class: J=2 (Qwen/
-/// DeepSeek-class, which GLM-5.2 belongs to) and M=12.
+/// constructor.
+///
+/// **Defaults are J=4, M=9 — MEASURED here, not the paper's J=2/M=12.** The paper's values
+/// were the defaults until they were measured on this workload and rejected: J=2/M=12
+/// costs +3.63% perplexity on int3-vq (lower bound +0.68%, so the cost is real) and fails
+/// outright on int4 at +12.7% with the whole interval past the bar. Shipping `top-m`
+/// opt-in with a rejected default would have meant that anyone enabling the policy without
+/// passing the knobs got the worst configuration we measured.
+///
+/// J=4/M=9 is the cell the shipping decision was made on: +5.44pp hit at 5.79% swap for
+/// +0.529% perplexity, 95% CI [-0.21%, +1.27%]. See `../benchmarks.md` and `../MODES.md`.
+/// The paper's values remain reachable with `--route-j 2 --route-m 12`; they are simply not
+/// what you get by accident.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RouteAdvice {
     pub j: usize,
@@ -57,7 +68,7 @@ pub struct RouteAdvice {
 }
 impl Default for RouteAdvice {
     fn default() -> Self {
-        Self { j: 2, m: 12 }
+        Self { j: 4, m: 9 }
     }
 }
 

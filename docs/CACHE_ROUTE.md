@@ -83,8 +83,12 @@ trait HybridPolicy {
 `route_into` gains the advice plus a residency predicate. When the advice is `None` the
 function is bit-identical to today's behaviour — that is the regression guarantee.
 
-Knobs, defaulting to the paper's values for this router class: `--route-j` (2) and
-`--route-m` (12). The paper's cumulative-mass variant (a per-token window from a
+Knobs `--route-j` and `--route-m`. **They default to J=4/M=9, the cell measured and
+shipped on — NOT the paper's J=2/M=12.** The paper's values were the defaults until they
+were measured here: +3.63% perplexity on int3-vq with the cost established as real, and an
+outright FAIL on int4 at +12.7%. Shipping opt-in with a rejected default would have handed
+the worst measured configuration to anyone who enabled the policy without passing knobs.
+The paper's values stay reachable explicitly; they are just not the accident. The paper's cumulative-mass variant (a per-token window from a
 probability threshold `p`) is **not** planned — it is a second mechanism for the knob
 fixed M already provides. Add it if M turns out to be workload-dependent.
 
