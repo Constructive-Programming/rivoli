@@ -286,6 +286,49 @@ pub fn route_into(
     sel.iter().filter(|e| !true_top.contains(e)).count() as u64
 }
 
+/// FNV-1a 64 of `bytes`, hex. Identity tag for the `--ppl` corpus, logged beside the
+/// numbers so a result can be checked against the text that produced it.
+///
+// ponytail: not a cryptographic hash and does not need to be — the corpus is committed,
+// so git already holds its real identity; this only has to catch "the file changed under
+// us". A sha256 would mean taking a dependency to print one line.
+pub fn fnv1a64_hex(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h = (h ^ b as u64).wrapping_mul(0x1000_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// `-log softmax(logits)[target]` from a little-endian f32 logit vector.
+///
+/// Shifted by the max before exponentiating, which is load-bearing rather than tidy:
+/// this model's raw logits routinely run past 80, `exp(80)` overflows f32 to `inf`, and
+/// an `inf` in the sum yields a NaN NLL. A NaN would then propagate into a mean that
+/// still *looks* like a plausible perplexity, so the failure would be silent and would
+/// land in a number we are using to decide a feature. Accumulated in f64 for the same
+/// reason — 154,880 f32 addends lose real precision to rounding.
+pub fn nll_of(logits_le: &[u8], target: usize) -> anyhow::Result<f32> {
+    let n = logits_le.len() / 4;
+    anyhow::ensure!(n > 0 && target < n, "target {target} outside {n} logits");
+    let z = |i: usize| {
+        let b = &logits_le[4 * i..4 * i + 4];
+        f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    };
+    let mut max = f32::NEG_INFINITY;
+    for i in 0..n {
+        let v = z(i);
+        if v > max {
+            max = v;
+        }
+    }
+    anyhow::ensure!(max.is_finite(), "non-finite logits");
+    let sum: f64 = (0..n).map(|i| ((z(i) - max) as f64).exp()).sum();
+    let nll = (sum.ln() - (z(target) - max) as f64) as f32;
+    anyhow::ensure!(nll.is_finite(), "non-finite NLL");
+    Ok(nll)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

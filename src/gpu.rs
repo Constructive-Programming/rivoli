@@ -19,7 +19,7 @@ use crate::hip::{
     launch_moe_expert_range_i4, launch_moe_reduce, launch_rmsnorm, launch_rope, launch_swiglu,
     launch_vadd,
 };
-use crate::math::{E4M3_BLOCK, route_into, topk_into};
+use crate::math::{E4M3_BLOCK, nll_of, route_into, topk_into};
 use crate::model::ModelConfig;
 use crate::pin::{Fp8Mlp, IndexerPin, LayerMlp, MlpVq, Pin, TRACE_WINDOW};
 use crate::telemetry::ProfileSummary;
@@ -387,6 +387,15 @@ impl<'a> GpuEngine<'a> {
     }
     pub fn misses(&self) -> u64 {
         self.pin.misses
+    }
+
+    /// `swap%` for a run that did not go through [`Profile::summary`] — `--ppl` scores a
+    /// text rather than generating, so it never builds one. Same numerator and the same
+    /// `hits + misses` denominator, and `None` under every policy but `top-m`.
+    pub fn swap_pct(&self) -> Option<f64> {
+        self.route_advice.map(|_| {
+            100.0 * self.prof.swap_n as f64 / (self.pin.hits + self.pin.misses).max(1) as f64
+        })
     }
 
     /// DIAGNOSTIC: hash the residual stream after every layer (`--checksum-x`).
@@ -986,6 +995,47 @@ impl<'a> GpuEngine<'a> {
             )?;
         }
         Ok(())
+    }
+
+    /// **Teacher-forced** negative log-likelihood of `ids`: one `-log softmax(logits)[t]`
+    /// per predicted position, returned in order. `ids[0]` is context only, so the result
+    /// has `ids.len() - 1` entries.
+    ///
+    /// Teacher-forced means at every position we feed the KNOWN next token, never our own
+    /// argmax. That is the whole point: a free-running run's quality number is confounded
+    /// by its own trajectory — a cache policy that degenerates into repetition routes to
+    /// fewer experts, hits more, and looks *better* on every metric the run generates
+    /// about itself. Forcing the text pins the trajectory so two policies are scored on
+    /// literally the same positions, which is also what makes the per-token NLLs PAIRABLE
+    /// across runs. See docs/CACHE_ROUTE.md "Quality".
+    ///
+    /// The full `vocab` logit vector comes back to the host each position. That is ~620 KB
+    /// against ~0.96 GB/token of expert streaming — noise. A device-side log-softmax would
+    /// be a kernel to write, test and debug in order to save 0.06% of the traffic.
+    // ponytail: host log-softmax, no kernel.
+    pub fn nll_forced(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
+        ensure!(ids.len() >= 2, "need at least 2 tokens to score a prediction");
+        let vocab = self.cfg.vocab;
+        // Same shape as `generate`: one current-thread runtime, `forward` awaited inline.
+        let rt = tokio::runtime::Builder::new_current_thread().build()?;
+        rt.block_on(async {
+            let mut out = Vec::with_capacity(ids.len() - 1);
+            let mut host: Vec<u8> = Vec::with_capacity(vocab * 4);
+            for (pos, &tok) in ids.iter().enumerate() {
+                // Beat per position: scoring a long text is many forwards with no token
+                // emitted, and the watchdog only knows about progress if we say so.
+                if let Some(hb) = &self.heartbeat {
+                    hb.beat();
+                }
+                self.forward(tok, pos).await?;
+                let Some(&next) = ids.get(pos + 1) else { break };
+                ensure!((next as usize) < vocab, "token {next} outside vocab {vocab}");
+                self.logits.copy_out_into(&mut host)?;
+                ensure!(host.len() == vocab * 4, "short logits D2H");
+                out.push(nll_of(&host, next as usize)?);
+            }
+            Ok(out)
+        })
     }
 
     /// Greedy argmax over the device logits — reduced ON DEVICE, so only 8 bytes come
