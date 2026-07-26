@@ -170,6 +170,32 @@ other's failures. A check can also be both at once: `assert_quantization_unambig
 fires correctly *and* its 8-ULP margin is exactly wide enough to hide a 1-ULP toolchain
 divergence, so it protects a comparison and blinds it in the same stroke.
 
+## Writing a guard: target what survives the compiler
+
+A guard that inspects compiled output must match a construct that **survives
+optimisation**, not the one you wrote in source. This is not a matter of picking a
+broader or narrower signature — get it wrong and the guard is *structurally incapable of
+firing*, while looking correct and passing review.
+
+The worked example. `void e4m3_lut_build(inout float lut[256], uint tid)` copied a shared
+array per invocation and produced garbage. The obvious guard is "reject an
+`OpFunctionParameter` of array type" — it names exactly the thing that is wrong. It
+cannot work: `glslc -O` inlines the helper, and the shipped module contains **zero**
+function parameters. Measured, not assumed.
+
+What survives is the copy itself — a whole-array `OpLoad` — because that is what
+inlining leaves behind. That signature fires.
+
+Check the existing rules against this and it is why they work, though nobody chose them
+for it: capabilities survive (they are module-level declarations), `InverseSqrt` survives
+(an opcode is not inlined away), a whole-array `OpLoad` survives. Anything that exists
+only in the *source* — a function boundary, a parameter, a variable name, a type alias —
+may not reach the artifact at all.
+
+> Before writing rule twelve: compile a deliberate instance, disassemble it, and confirm
+> the construct you plan to match is actually present. If it is not, you are matching
+> source structure through a lens that has already discarded it.
+
 ## Traps worth knowing
 
 ### A check that stops at the first failure reports a floor, not a count
