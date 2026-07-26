@@ -757,3 +757,72 @@ pure per-format compute use `examples/dot_bench.rs`. See [MODES.md](MODES.md).
 
 *Generated 2026-07-26. Reproduce: `--mode <m> --cache-policy <p> -bench 512 --attn dense
 --max-mem 115 --prompt "<above>"`.*
+
+---
+
+## DSA indexer round: `examples/indexer_bench`
+
+Instrument for the NPU-offload gates (docs/NPU.md M0/M1), gfx1151 sole tenant, 2026-07-26.
+Interpretation lives in [docs/NPU.md](docs/NPU.md); the rows and the methodology are here.
+`--attn dsa` dims from the manifest: index_n_heads 32, index_head_dim 128, index_topk 2048,
+and **21 FULL indexer layers** of 78 (`indexer_types` is 21 full / 57 shared, so a
+per-token figure is ×21, not ×78).
+
+### Controls
+
+All from the round's final run unless a superseded run is named.
+
+| control | result |
+|---|---|
+| `o_proj` fp8 [6144×16384] vs the 528.95 µs / 190.6 GB/s recorded in "Per-kernel round" | **519.4 µs / 193.8 GB/s** (1.8%) |
+| `index_score` nt=32768, 21 rotating key slabs vs one replayed slab | **237.2 vs 208.7 µs (1.14×)** — run at nt=32768 only; the ≤4k rows are launch-bound (GB/s *rises* with nt: 7.5 / 30.5 / 32.8 / 35.4), so the rotation is not what makes them what they are |
+| `index_score` output read back — finite, varying | ok |
+
+A fourth check, the score-D2H round-trip against seeded bytes, is an `assert!` in the rig:
+it aborts the run on failure and prints nothing on success, so it is not a reported control.
+It compares the first 8 elements only.
+
+### Rows (µs per call, per full layer)
+
+| kernel | µs | note |
+|---|---:|---|
+| indexer key path (`gemv_fp8` wk + `layernorm` + `rope` + `index_append`) | 15.32 | 20.48 with a sync per call |
+| `gemv_fp8` wq_b [4096×2048] | 78.27 | 107.2 GB/s |
+| `gemv_f32` weights_proj [32×6144] | 34.74 | 22.6 GB/s, 32 output rows — grid-starved |
+| `index_score` nt=128 / 2048 / 4096 / 8192 / 16384 / 32768 | 4.4 / 17.2 / 31.9 / 59.2 / 115.0 / 239.1 | 35 GB/s at long context |
+| host score D2H + CPU top-k + row upload, same contexts | 18.1 / 81.9 / 160.2 / 183.0 / 353.2 / 553.6 | distribution-dependent — see below |
+| `gemv_fp8` q_b [16384×2048] | 213.35 | 4 rotating copies |
+| `mla_absorb_fp8` | 45.64 | 4 rotating copies |
+| MoE batch, 9 vq3 experts + reduce | 1261.88 | 138.0 MB → 109.4 GB/s |
+| dense fp8 SwiGLU MLP | 1174.67 | |
+
+### Three methodology lessons, all of which cost a wrong answer first
+
+- **Replaying one weight measures the MALL, not the bus.** A single 33.5 MB `q_b` timed at
+  **372 GB/s — above the 256 GB/s bus**, which is only possible from the 32 MB MALL. With 4
+  rotating copies it is 213.35 µs (157 GB/s). The same defect moved `weights_proj` 19.4 →
+  34.7 µs and `mla_absorb_fp8` 36.04 → 45.64 µs. **The 36.50 µs `mla_absorb` figure recorded
+  in "Per-kernel round" above is therefore cache-resident** — sound for the A/B it was made
+  for, wrong as an absolute per-layer cost. Rotate before quoting an absolute.
+- **A window must contain all the independent work, not a subset.** Scoping the exact
+  overlap window to "kv_proj + KV-append" gave 22.6 µs and refuted a design; the full set of
+  selection-independent phase-1 launches is **291.25 µs** and clears it. Under-scoping is
+  not conservative — it produces a confident false negative.
+- **Comparison-driven host code is distribution-dependent.** The D2H + `topk_into` + row
+  upload over 32768 scores totals **162 µs** on a tie-heavy array (superseded run `m0m1-v2`)
+  and **554 µs** on a plausible heavy-tailed one (final run) — a 3.4× spread on what turned
+  out to be the single largest cost in the analysis. Synthesise the distribution
+  deliberately and say which one you used.
+
+### A GPU∥GPU probe cannot answer a GPU∥NPU bandwidth question
+
+`index_score` on the null stream against the MoE batch on a `hipStreamNonBlocking` stream
+measured, in superseded run `m0m1-v2`, three arms: the two workloads timed apart summed to
+**2505.6 µs**, the both-on-the-null-stream control ran in **2453.4 µs** (1.02× vs the sum —
+so the serial arm was genuinely serial), and the concurrent arm ran in **2625.0 µs** (0.95×,
+i.e. *slower* than serial). That result was determined before it ran:
+`index_score` at nt=32768 launches 32768 workgroups and the MoE batch ~9000, so each alone
+over-subscribes all 40 CUs and neither can finish sooner concurrently no matter how much
+DRAM bandwidth is spare. It measures compute-unit contention. The probe was deleted rather
+than left printing a confident 0.95×; the bandwidth question is answered arithmetically from
+the GB/s rows instead.
