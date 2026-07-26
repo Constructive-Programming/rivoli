@@ -179,9 +179,10 @@ pub fn set_idx(row: &mut [u8], k: usize, idx: u16) {
     row[base + 1] |= (v >> 8) as u8;
 }
 
-/// Read the 12-bit codebook index of the `k`-th subvector of a packed row.
+/// Read the 12-bit codebook index of the `k`-th subvector of a packed row. Public so
+/// the offline `vq3_to_i4` converter decodes indices identically to `matvec_vq`.
 #[inline]
-fn get_idx(row: &[u8], k: usize) -> usize {
+pub fn get_idx(row: &[u8], k: usize) -> usize {
     let (base, shift) = (k * VQ_INDEX_BITS / 8, (k * VQ_INDEX_BITS) % 8);
     (((row[base] as u16 | (row[base + 1] as u16) << 8) >> shift) & 0xFFF) as usize
 }

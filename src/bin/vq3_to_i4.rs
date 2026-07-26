@@ -10,17 +10,12 @@ use anyhow::{Context, Result, bail};
 use rivoli::format::load_codebooks;
 use rivoli::model::ModelConfig;
 use rivoli::quant::{
-    VQ_DIM, VQ_GROUP, VQ_INDEX_BITS, VqProj, i4_expert_stride, i4_row_bytes, i4_slot_offsets,
-    quant_i4, vq_expert, vq_expert_bytes, vq_expert_stride, vq_groups, vq_row_bytes, VQ_ALIGN,
+    VQ_ALIGN, VQ_DIM, VQ_GROUP, VqProj, get_idx, i4_expert_stride, i4_row_bytes, i4_slot_offsets,
+    quant_i4, vq_expert, vq_expert_bytes, vq_expert_stride, vq_groups, vq_row_bytes,
 };
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
-
-fn get_idx(row: &[u8], k: usize) -> usize {
-    let (base, shift) = (k * VQ_INDEX_BITS / 8, (k * VQ_INDEX_BITS) % 8);
-    (((row[base] as u16 | (row[base + 1] as u16) << 8) >> shift) & 0xFFF) as usize
-}
 
 /// Decode one VQ projection to a dense f32 row-major `W[o_dim, i_dim]`.
 fn decode_proj(p: &VqProj, cb: &[f32]) -> Vec<f32> {
