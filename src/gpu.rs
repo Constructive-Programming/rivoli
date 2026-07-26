@@ -309,6 +309,15 @@ impl<'a> GpuEngine<'a> {
             kvl.is_multiple_of(E4M3_BLOCK),
             "kv_lora_rank ({kvl}) must be a multiple of {E4M3_BLOCK} (fp8 KV block size)",
         );
+        // `mla_latent_attend` holds its online accumulator in MLA_ACC_REGS*SUBW = 512
+        // registers per lane and rejects a wider kvl (arg guard 1004). Check it HERE:
+        // the kernel guard would not fire until the first decoded token, by which point
+        // the KV cache and the whole resident pin are already allocated.
+        ensure!(
+            kvl <= 512,
+            "kv_lora_rank ({kvl}) exceeds 512, the attend kernel's register-resident \
+             accumulator cap (MLA_ACC_REGS*SUBW in kernels/attn.hip)",
+        );
         let n_kv_blocks = kvl / E4M3_BLOCK;
         let mut lc = Vec::with_capacity(cfg.n_layers);
         let mut lc_scale = Vec::with_capacity(cfg.n_layers);
