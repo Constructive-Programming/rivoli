@@ -63,6 +63,21 @@ fn transcribed_f2e4m3(x: f32) -> u8 {
     (sign | ((exp as u32) << 3) | m3) as u8
 }
 
+/// Literal transcription of `common.glsl::e4m3f` — the DECODE direction, which arrived
+/// with `gemv_fp8` and its LUT.
+fn transcribed_e4m3f(b: u32) -> f32 {
+    let sign: f32 = if (b & 0x80) != 0 { -1.0 } else { 1.0 };
+    let exp = ((b >> 3) & 0x0f) as i32;
+    let mant = (b & 0x07) as f32;
+    if exp == 0 {
+        return sign * (mant * 0.125) * 0.015625;
+    }
+    if exp == 15 && mant == 7.0 {
+        return f32::from_bits(0x7fc0_0000);
+    }
+    sign * (1.0 + mant * 0.125) * ((exp - 7) as f32).exp2()
+}
+
 /// Literal transcription of `common.glsl::f2bf16`.
 fn transcribed_f2bf16(x: f32) -> u16 {
     let b = x.to_bits();
@@ -220,12 +235,13 @@ fn glsl_fn_body(src: &str, signature: &str) -> String {
 const LOCKED: &[(&str, &str)] = &[
     ("f2bf16", "uint f2bf16(float x) {"),
     ("f2e4m3", "uint f2e4m3(float x) {"),
+    ("e4m3f", "float e4m3f(uint b) {"),
 ];
 
 /// Hash of every [`LOCKED`] function body as it stands in common.glsl, concatenated in
 /// order. Update ONLY after checking that the transcriptions above still mirror the GLSL
 /// statement for statement.
-const GLSL_NUMERICS_HASH: u64 = 0xa5fb_54ab_dc74_a080;
+const GLSL_NUMERICS_HASH: u64 = 0xf2db_abcb_0db9_04cb;
 
 /// The transcriptions above are only evidence while they still correspond to the
 /// shader. This makes that correspondence a build-visible obligation rather than a
@@ -297,4 +313,47 @@ fn every_transcription_is_locked() {
         );
     }
     println!("transcriptions locked: {found:?}");
+}
+
+
+/// EVERY e4m3 byte, decoded, against `math.rs`.
+///
+/// The standing debt from `kernels/vk/common.glsl`'s placeholder, now due: the LUT the
+/// fp8 GEMVs build is 256 entries of `e4m3f`, so this is not a sample — 256 values IS
+/// the whole domain, and a GEMV oracle over plausible weights would reach almost none of
+/// the interesting ones. Specifically it would miss NaN at (exp==15, mant==7), the
+/// exp==0 subnormal ladder, and the sign-symmetric edges, which is exactly why the
+/// placeholder named them.
+///
+/// `exp2` appears in the normal branch and is the only transcendental in the numeric
+/// helpers. Its argument is an INTEGER in [-6, 8], and exp2 of an exact integer is an
+/// exact power of two in any conforming implementation — so the 3-ULP allowance Vulkan
+/// gives `exp2` cannot bite here. This test is what turns that argument into evidence.
+#[test]
+fn e4m3f_decodes_all_256_bytes_bit_exactly() {
+    for b in 0u32..256 {
+        let want = rivoli::math::e4m3_to_f32(b as u8);
+        let got = transcribed_e4m3f(b);
+        if want.is_nan() {
+            assert!(got.is_nan(), "e4m3f({b:#04x}): math.rs NaN, transcription {got}");
+            continue;
+        }
+        assert_eq!(
+            want.to_bits(),
+            got.to_bits(),
+            "e4m3f({b:#04x}): math.rs {want} ({:#010x}) vs transcription {got} ({:#010x})",
+            want.to_bits(),
+            got.to_bits()
+        );
+    }
+    // The three classes the placeholder called out, asserted by name so a future edit
+    // cannot quietly stop covering them.
+    assert!(rivoli::math::e4m3_to_f32(0x7f).is_nan(), "0x7f is the NaN encoding");
+    assert_eq!(rivoli::math::e4m3_to_f32(0x01), 2f32.powi(-9), "smallest subnormal");
+    assert_eq!(
+        rivoli::math::e4m3_to_f32(0x80),
+        -rivoli::math::e4m3_to_f32(0x00),
+        "sign symmetry at zero"
+    );
+    println!("e4m3f: all 256 byte values bit-exact");
 }

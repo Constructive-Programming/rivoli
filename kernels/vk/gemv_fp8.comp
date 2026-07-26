@@ -1,0 +1,106 @@
+// y[o] = Σ_i x[i]·e4m3(packed[o·i_dim+i])·scale[(o>>bsh)·sc_cols + (i>>bsh)] — fp8
+// block-scaled GEMV (attention/dense projections). GLSL twin of linalg.hip::gemv_fp8,
+// carrying common.hpp::fp8_dot_strided.
+//
+// Both the wave-per-row form and the split-K form live in this one module, selected by
+// a push-constant flag, because they share the whole dot and differ only in how the
+// block's threads are assigned. Two shaders would mean two copies of the fp8 MAC, and
+// that MAC is a bit-exactness contract with quant.rs::matvec_fp8.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+#include "common.glsl"
+
+#define THREADS (ROWS_PER_BLOCK * WAVE)
+
+layout(local_size_x = THREADS) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RoU32 { uint v[]; };
+
+layout(push_constant) uniform Push {
+    RoF32 x;
+    RoU32 packed;
+    RoF32 scale;
+    RwF32 y;
+    int o_dim;
+    int i_dim;
+    int block;
+    int splitk;   // 0 = one wave per row; 1 = one BLOCK per row, split-K over i_dim
+} pc;
+
+shared float lut[256];
+shared float part[ROWS_PER_BLOCK];   // split-K: one partial per wave
+
+// Strided fp8 MAC with NO cross-thread reduction — Σ over the columns this thread owns.
+// Mirrors common.hpp::fp8_dot_strided statement for statement, including the order of
+// the four products inside the parentheses, which is what makes it bit-identical.
+//
+// `wrow_bytes` is a BYTE offset from `pc.packed`'s base, and the word loads below assume
+// it is 4-aligned — the launcher rejects an i_dim that is not a multiple of 4, so every
+// row base is.
+float fp8_dot_strided(uint64_t wrow_bytes, uint scale_off, uint start, uint stride) {
+    float acc = 0.0;
+    uint n4 = uint(pc.i_dim) >> 2;
+    int bsh = blk_shift(pc.block);
+    uint64_t w4 = uint64_t(pc.packed) + wrow_bytes;
+    for (uint j = start; j < n4; j += stride) {
+        uint p = RoU32(w4 + uint64_t(j) * 4ul).v[0];
+        uint i0 = j << 2;
+        float s = pc.scale.v[scale_off + (i0 >> bsh)];
+        acc += s * (pc.x.v[i0]      * lut[p & 0xffu]
+                  + pc.x.v[i0 + 1u] * lut[(p >> 8) & 0xffu]
+                  + pc.x.v[i0 + 2u] * lut[(p >> 16) & 0xffu]
+                  + pc.x.v[i0 + 3u] * lut[(p >> 24) & 0xffu]);
+    }
+    // Scalar tail, for an i_dim that is not a multiple of 4. Unreachable while the
+    // launcher enforces that, and kept because the HIP source has it and the two must
+    // stay diffable by eye.
+    for (uint i = (n4 << 2) + start; i < uint(pc.i_dim); i += stride) {
+        uint word = RoU32(w4 + (uint64_t(i) & ~3ul)).v[0];
+        uint byte = (word >> ((i & 3u) * 8u)) & 0xffu;
+        acc += pc.x.v[i] * lut[byte] * pc.scale.v[scale_off + (i >> bsh)];
+    }
+    return acc;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    e4m3_lut_build(lut, tid);
+    barrier();
+
+    uint lane = gl_SubgroupInvocationID;
+    int bsh = blk_shift(pc.block);
+    uint sc_cols = (uint(pc.i_dim) + uint(pc.block) - 1u) / uint(pc.block);
+
+    if (pc.splitk == 0) {
+        // One WAVE per output row; adjacent lanes read adjacent columns.
+        uint o = gl_WorkGroupID.x * ROWS_PER_BLOCK + gl_SubgroupID;
+        if (o >= uint(pc.o_dim)) return;
+        float acc = fp8_dot_strided(
+            uint64_t(o) * uint64_t(pc.i_dim), (o >> uint(bsh)) * sc_cols, lane, WAVE);
+        acc = wave_sum(acc);
+        if (lane == 0u) pc.y.v[o] = acc;
+        return;
+    }
+
+    // Split-K: ONE BLOCK per output row, its ROWS_PER_BLOCK waves each reducing a
+    // strided 1/K share of i_dim, combined in LDS in FIXED ORDER. o_proj has too few
+    // rows to fill the machine under wave-per-row; this gives K times the blocks.
+    uint o = gl_WorkGroupID.x;
+    if (o >= uint(pc.o_dim)) return;
+    float acc = fp8_dot_strided(
+        uint64_t(o) * uint64_t(pc.i_dim), (o >> uint(bsh)) * sc_cols, tid, THREADS);
+    acc = wave_sum(acc);
+    if (lane == 0u) part[gl_SubgroupID] = acc;
+    barrier();
+    if (tid == 0u) {
+        // Fixed loop order, not an atomic — the combine order is part of the
+        // reproducibility contract, exactly as in the HIP original.
+        float sum = 0.0;
+        for (uint w = 0u; w < ROWS_PER_BLOCK; ++w) sum += part[w];
+        pc.y.v[o] = sum;
+    }
+}

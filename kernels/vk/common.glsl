@@ -112,7 +112,37 @@ uint f2e4m3(float x) {
     return sign | (uint(exp) << 3) | m3;
 }
 
-// bf16f / e4m3f (the DECODE directions) are NOT here yet, on purpose. They are not conveniences —
+// log2 of a power-of-two fp8 scale-tile size. Mirrors common.hpp::blk_shift, which is
+// `31 - __clz(block)`; GLSL's findMSB is the same value for a positive power of two.
+// Every launcher taking a `block` REJECTS a non-power-of-two (arg guard 1003), so
+// agreement OUTSIDE that domain is irrelevant and is not claimed — `findMSB` returns the
+// highest set bit, which for a non-power-of-two is a floor rather than a log.
+//
+// Bit-identical to the divide it replaces: same index, same order.
+int blk_shift(int block) { return findMSB(block); }
+
+// fp8-e4m3 -> f32 (matches math.rs::e4m3_to_f32 and common.hpp::e4m3f). 1 sign / 4 exp
+// (bias 7) / 3 mantissa; exp==0 is subnormal = sign*(m/8)*2^-6; (exp==15, mant==7) is
+// NaN. Bit-exactness is a CONTRACT here, not a nicety: the fp8 GEMVs decode weights
+// through a LUT built from this, so an error is a wrong weight rather than a wrong bit.
+float e4m3f(uint b) {
+    float sign = (b & 0x80u) != 0u ? -1.0 : 1.0;
+    int exp = int((b >> 3) & 0x0fu);
+    float mant = float(b & 0x07u);
+    if (exp == 0) return sign * (mant * 0.125) * 0.015625; // 2^-6
+    if (exp == 15 && mant == 7.0) return uintBitsToFloat(0x7fc00000u);
+    return sign * (1.0 + mant * 0.125) * exp2(float(exp - 7));
+}
+
+// Fill a 256-float LDS table with e4m3f(byte), so the hot GEMV decodes fp8 by an LDS read
+// instead of the branchy path. Bit-exact with e4m3f by construction. Caller passes
+// gl_LocalInvocationID.x and barriers before use; needs a >=256-thread workgroup, which
+// both callers have.
+void e4m3_lut_build(inout float lut[256], uint tid) {
+    if (tid < 256u) lut[tid] = e4m3f(tid);
+}
+
+// bf16f (the other DECODE direction) is NOT here yet, on purpose. They are not conveniences —
 // they are a BIT-EXACTNESS CONTRACT with src/math.rs, and unexercised code carrying a
 // correctness contract is worse than absent code, because it reads as coverage. Unused
 // GLSL is optimised out of every module, so porting them ahead of a caller ships

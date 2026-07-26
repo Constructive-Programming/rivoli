@@ -158,6 +158,13 @@ struct Cmd {
     buf: vk::CommandBuffer,
     fence: vk::Fence,
     recording: bool,
+    /// Buffers a launcher had to allocate to carry data the push constant cannot hold —
+    /// today only `rope`'s host-computed trig table. They must outlive RECORDING (a
+    /// dispatch reads them) but not the sync, so they are dropped after the fence.
+    ///
+    /// Dropped OUTSIDE the mutex, in `sync`: `Buf::drop` calls `Gpu::sync`, which takes
+    /// this same non-reentrant lock. Freeing them while holding it deadlocks.
+    scratch: Vec<Buf>,
     /// Set by any failure in [`Gpu::sync`]. Each of its fallible calls leaves the
     /// buffer in a DIFFERENT illegal state — invalid after a failed `end`, executable
     /// after a failed submit, *pending* after a failed fence wait — and the pool has
@@ -188,6 +195,11 @@ struct Pipes {
     gather_rope: Pipe,
     vadd: Pipe,
     argmax_reduce: Pipe,
+    swiglu: Pipe,
+    rmsnorm: Pipe,
+    rope_interleave: Pipe,
+    gemv_i8: Pipe,
+    gemv_fp8: Pipe,
 }
 
 // SAFETY: needed because ash models the DISPATCHABLE handles (`vk::Queue`,
@@ -646,6 +658,7 @@ impl Cmd {
             fence,
             recording: false,
             poisoned: false,
+            scratch: Vec::new(),
         })
     }
 }
@@ -791,7 +804,24 @@ impl Gpu {
                 .reset_command_pool(cmd.pool, vk::CommandPoolResetFlags::empty())?;
         }
         cmd.poisoned = false; // every step succeeded; the buffer is initial again
+        // Take the scratch out under the lock, drop it after releasing — see the field's
+        // note. The work that read these buffers has retired at the fence above.
+        let spent = std::mem::take(&mut cmd.scratch);
+        drop(cmd);
+        drop(spent);
         Ok(())
+    }
+
+    /// Stage `bytes` in a device buffer that lives until the next [`Gpu::sync`], and
+    /// return its device address. For data a launcher must hand a shader that does not
+    /// fit the 128-byte push-constant budget.
+    fn stage(&self, bytes: &[u8]) -> Result<u64> {
+        let mut buf = Buf::new(bytes.len())?;
+        buf.write_at(0, bytes)?;
+        let addr = buf.ptr() as u64;
+        let mut cmd = self.cmd.lock().map_err(|_| anyhow!("vk command lock poisoned"))?;
+        cmd.scratch.push(buf);
+        Ok(addr)
     }
 }
 
@@ -830,6 +860,11 @@ impl Pipes {
             gather_rope: GatherRopePush,
             vadd: VaddPush,
             argmax_reduce: ArgmaxPush,
+            swiglu: SwigluPush,
+            rmsnorm: RmsnormPush,
+            rope_interleave: RopePush,
+            gemv_i8: GemvI8Push,
+            gemv_fp8: GemvFp8Push,
         ))
     }
 }
@@ -1786,4 +1821,260 @@ pub unsafe fn launch_argmax(
     // ONE workgroup: the reduction is workgroup-local and the grid-stride loop inside
     // covers any n. Matches the HIP launch.
     g.dispatch(&g.pipes.argmax_reduce, &push, 1)
+}
+
+// --- linalg.hip: the elementwise / normalisation trio ----------------------
+
+push_struct! {
+    /// Mirror of `swiglu.comp`'s push block.
+    SwigluPush {
+        g: u64,
+        u: u64,
+        h: u64,
+        n: i32,
+        _pad: i32,
+    }
+}
+
+/// SwiGLU combine `h = silu(g)·u`; safe in place, `h` may alias `g`.
+///
+/// # Safety
+/// Device addresses of live [`Buf`]s holding `n` f32 each, valid until the next
+/// [`device_sync`].
+pub unsafe fn launch_swiglu(g: *const f32, u: *const f32, n: usize, h: *mut f32) -> Result<()> {
+    ensure!(n > 0, "swiglu: argument guard rejected");
+    let gpu = gpu()?;
+    let push = SwigluPush {
+        g: g as u64,
+        u: u as u64,
+        h: h as u64,
+        n: n as i32,
+        _pad: 0,
+    };
+    gpu.dispatch(&gpu.pipes.swiglu, &push, groups(n))
+}
+
+push_struct! {
+    /// Mirror of `rmsnorm.comp`'s push block.
+    RmsnormPush {
+        x: u64,
+        w: u64,
+        y: u64,
+        n: i32,
+        eps: f32,
+    }
+}
+
+/// RMSNorm `y = x·rsqrt(mean(x²)+eps)·w`.
+///
+/// # Safety
+/// Device addresses of live [`Buf`]s holding `n` f32 each, valid until the next
+/// [`device_sync`].
+pub unsafe fn launch_rmsnorm(
+    x: *const f32,
+    w: *const f32,
+    n: usize,
+    eps: f32,
+    y: *mut f32,
+) -> Result<()> {
+    ensure!(n > 0, "rmsnorm: argument guard rejected");
+    let gpu = gpu()?;
+    let push = RmsnormPush {
+        x: x as u64,
+        w: w as u64,
+        y: y as u64,
+        n: n as i32,
+        eps,
+    };
+    // ONE workgroup: the reduction is workgroup-local and the grid-stride loops cover
+    // any n. Matches the HIP launch.
+    gpu.dispatch(&gpu.pipes.rmsnorm, &push, 1)
+}
+
+push_struct! {
+    /// Mirror of `rope_interleave.comp`'s push block.
+    RopePush {
+        base: u64,
+        trig: u64,
+        stride: i32,
+        seg: i32,
+    }
+}
+
+/// Interleaved RoPE over `count` rows of `stride`, rotating each row's first `seg`
+/// elements by the angle for position `pos`.
+///
+/// The trig table is computed HERE, on the host, in f64 — see the header of
+/// `rope_interleave.comp`. GLSL has no double transcendentals and f32 is not accurate
+/// enough, because the relative error in `theta^(-2j/seg)` is amplified by `pos`. Doing
+/// it host-side is what makes this bit-identical to HIP rather than merely close: both
+/// round the same f64 result to f32.
+///
+/// # Safety
+/// `base` must be a device address of a live [`Buf`] holding `count*stride` f32, valid
+/// until the next [`device_sync`].
+pub unsafe fn launch_rope(
+    base: *mut f32,
+    count: usize,
+    stride: usize,
+    seg: usize,
+    pos: usize,
+    theta: f64,
+) -> Result<()> {
+    // Same envelope as the HIP guard, including the >1024 half cap the shader's
+    // per-thread slot array is sized against.
+    ensure!(
+        count > 0 && seg > 0 && seg.is_multiple_of(2) && seg / 2 <= 1024,
+        "rope: argument guard rejected (count {count}, seg {seg})"
+    );
+    ensure!(
+        count == 1 || stride >= seg,
+        "rope: stride {stride} < seg {seg} would overlap rows"
+    );
+    let gpu = gpu()?;
+
+    // The same expression as fwd/linalg.hip, evaluated in f64 and rounded once — so the
+    // uploaded pair is the exact `(float)cos(ang)` / `(float)sin(ang)` the HIP kernel
+    // computes.
+    let half = seg / 2;
+    let mut trig = Vec::with_capacity(half * 2);
+    for j in 0..half {
+        let inv = theta.powf(-2.0 * j as f64 / seg as f64);
+        let ang = pos as f64 * inv;
+        trig.push(ang.cos() as f32);
+        trig.push(ang.sin() as f32);
+    }
+    let bytes: Vec<u8> = trig.iter().flat_map(|f| f.to_le_bytes()).collect();
+    let trig_addr = gpu.stage(&bytes)?;
+
+    let push = RopePush {
+        base: base as u64,
+        trig: trig_addr,
+        stride: stride as i32,
+        seg: seg as i32,
+    };
+    // One workgroup per row, as HIP does; the threads inside stride over `half`.
+    gpu.dispatch(&gpu.pipes.rope_interleave, &push, count as u32)
+}
+
+
+// --- linalg.hip: the quantised GEMVs --------------------------------------
+
+push_struct! {
+    /// Mirror of `gemv_i8.comp`'s push block.
+    GemvI8Push {
+        x: u64,
+        packed: u64,
+        scale: u64,
+        y: u64,
+        o_dim: i32,
+        i_dim: i32,
+    }
+}
+
+/// Per-row int8 GEMV `y = W·x` (lm_head to logits).
+///
+/// # Safety
+/// Device addresses of live [`Buf`]s, valid until the next [`device_sync`]: `x`
+/// (`i_dim` f32), `packed` (`o_dim·i_dim` bytes), `scale` (`o_dim` f32), `y`
+/// (`o_dim` f32).
+pub unsafe fn launch_gemv_i8(
+    x: *const f32,
+    packed: *const u8,
+    scale: *const f32,
+    o_dim: usize,
+    i_dim: usize,
+    y: *mut f32,
+) -> Result<()> {
+    ensure!(o_dim > 0 && i_dim > 0, "gemv_i8: argument guard rejected");
+    ensure_word_aligned(packed as u64, "gemv_i8 packed")?;
+    let g = gpu()?;
+    let push = GemvI8Push {
+        x: x as u64,
+        packed: packed as u64,
+        scale: scale as u64,
+        y: y as u64,
+        o_dim: o_dim as i32,
+        i_dim: i_dim as i32,
+    };
+    g.dispatch(
+        &g.pipes.gemv_i8,
+        &push,
+        o_dim.div_ceil(ROWS_PER_BLOCK as usize) as u32,
+    )
+}
+
+push_struct! {
+    /// Mirror of `gemv_fp8.comp`'s push block. One module serves both the wave-per-row
+    /// and split-K forms; `splitk` selects.
+    GemvFp8Push {
+        x: u64,
+        packed: u64,
+        scale: u64,
+        y: u64,
+        o_dim: i32,
+        i_dim: i32,
+        block: i32,
+        splitk: i32,
+    }
+}
+
+/// fp8-e4m3 block-scaled GEMV `y = W·x`.
+///
+/// Dispatches the SPLIT-K form for long reductions, matching `hip.rs`'s threshold: one
+/// block per output row instead of one wave, so a projection with few rows and a long
+/// i_dim still fills the machine.
+///
+/// # Safety
+/// Device addresses of live [`Buf`]s, valid until the next [`device_sync`]: `x`
+/// (`i_dim` f32), `packed` (`o_dim·i_dim` bytes), `scale`
+/// (`⌈o_dim/block⌉·⌈i_dim/block⌉` f32), `y` (`o_dim` f32).
+pub unsafe fn launch_gemv_fp8(
+    x: *const f32,
+    packed: *const u8,
+    scale: *const f32,
+    o_dim: usize,
+    i_dim: usize,
+    block: usize,
+    y: *mut f32,
+) -> Result<()> {
+    ensure!(
+        o_dim > 0 && i_dim > 0 && block > 0,
+        "gemv_fp8: argument guard rejected"
+    );
+    // Guard 1003's twin: `blk_shift` is a shift, so a non-power-of-two tile would index
+    // the block scale with a floor rather than a quotient. The HIP side added this when
+    // it replaced the signed divide; mirroring it keeps the two backends' REJECTIONS
+    // identical as well as their results.
+    ensure!(
+        block.is_power_of_two(),
+        "gemv_fp8: block {block} must be a power of two (blk_shift indexes by shift)"
+    );
+    // The word loads in the dot assume every row base is 4-aligned.
+    ensure!(
+        i_dim.is_multiple_of(4),
+        "gemv_fp8: i_dim {i_dim} must be a multiple of 4 — rows are read as 32-bit words"
+    );
+    ensure_word_aligned(packed as u64, "gemv_fp8 packed")?;
+    let g = gpu()?;
+
+    // Same threshold as hip.rs: below it, wave-per-row has enough rows to fill the
+    // machine; above it the reduction chain is long enough that split-K wins.
+    let splitk = i_dim >= 4096;
+    let push = GemvFp8Push {
+        x: x as u64,
+        packed: packed as u64,
+        scale: scale as u64,
+        y: y as u64,
+        o_dim: o_dim as i32,
+        i_dim: i_dim as i32,
+        block: block as i32,
+        splitk: i32::from(splitk),
+    };
+    let groups_x = if splitk {
+        o_dim as u32
+    } else {
+        o_dim.div_ceil(ROWS_PER_BLOCK as usize) as u32
+    };
+    g.dispatch(&g.pipes.gemv_fp8, &push, groups_x)
 }

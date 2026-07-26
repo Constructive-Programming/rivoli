@@ -1,0 +1,82 @@
+// Interleaved RoPE: v[j], v[half+j] = rotate(v[2j], v[2j+1]) by angle pos*theta^(-2j/seg).
+// GLSL twin of linalg.hip::rope_interleave.
+//
+// TWO DIVERGENCES FROM THE HIP SOURCE, both forced, both preserving the launcher's
+// signature so `backend.rs` still swaps cleanly.
+//
+// 1. THE TRIG IS COMPUTED ON THE HOST. HIP evaluates `pow(theta, -2.0*j/seg)` and
+//    `cos`/`sin` in DOUBLE precision. GLSL has no double transcendentals — Float64 gives
+//    arithmetic and `floor`, not `pow`/`sin`/`cos` — and f32 is not good enough here for
+//    a reason worth stating: the error in `inv` is amplified by `pos`. At j=0, inv=1 and
+//    ang=pos exactly; but a 1e-7 relative error in `inv` becomes ~ang*1e-7 absolute
+//    angle error, i.e. ~1e-3 rad at pos=1e4. That is a visibly wrong rotation, not a
+//    rounding difference. So `launch_rope` evaluates the same f64 formula on the CPU and
+//    uploads `half` (cos, sin) pairs — which also makes this BIT-IDENTICAL to HIP rather
+//    than merely close, since both round the same f64 result to f32.
+//
+// 2. FIXED 256 THREADS WITH A STRIDED LOOP. HIP launches exactly `seg/2` threads. GLSL
+//    workgroup size is compile-time, and `seg/2` reaches 1024 (the launcher's guard), so
+//    a fixed size would either need a pipeline per seg or a 1024-thread workgroup —
+//    raising this backend's device floor for one kernel, which the append_kv note
+//    already rejected for the same reason. Each thread instead owns j, j+256, ... with
+//    the read/write phases split by the barrier, exactly as HIP's single `__syncthreads`
+//    does: EVERY read of v[2j],v[2j+1] must complete before ANY write to v[j],v[half+j],
+//    because those ranges overlap.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+#include "common.glsl"
+
+#define ROPE_THREADS (ROWS_PER_BLOCK * WAVE)
+#define ROPE_MAX_HALF 1024                              // launcher guard: seg/2 <= 1024
+#define ROPE_SLOTS ((ROPE_MAX_HALF + ROPE_THREADS - 1) / ROPE_THREADS)
+
+// The staged pairs live in a per-thread array, which must be indexed by a compile-time
+// bound or it spills to scratch memory. ROPE_SLOTS is constant, and the loop below is
+// bounded on the slot index rather than on `j < half` for the same reason attn.hip bounds
+// on `k < nacc`: a lane-divergent bound makes the compiler predicate every unrolled step.
+#if ROPE_SLOTS * ROPE_THREADS < ROPE_MAX_HALF
+#error "rope_interleave: ROPE_SLOTS too small for ROPE_MAX_HALF"
+#endif
+
+layout(local_size_x = ROPE_THREADS) in;
+
+layout(push_constant) uniform Push {
+    RwF32 base;
+    RoF32 trig;   // 2*half floats: cos at [2j], sin at [2j+1]
+    int stride;
+    int seg;
+} pc;
+
+void main() {
+    uint s = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint half_n = uint(pc.seg) / 2u;
+    uint row = s * uint(pc.stride);
+
+    // Phase 1: read every pair this thread owns, BEFORE any write.
+    float a[ROPE_SLOTS];
+    float b[ROPE_SLOTS];
+    for (uint k = 0u; k < uint(ROPE_SLOTS); ++k) {
+        uint j = t + k * uint(ROPE_THREADS);
+        if (j < half_n) {
+            a[k] = pc.base.v[row + 2u * j];
+            b[k] = pc.base.v[row + 2u * j + 1u];
+        }
+    }
+    barrier();
+
+    // Phase 2: rotate and write. v[j] and v[half+j] overlap the pairs read above, which
+    // is why the barrier is not optional.
+    for (uint k = 0u; k < uint(ROPE_SLOTS); ++k) {
+        uint j = t + k * uint(ROPE_THREADS);
+        if (j < half_n) {
+            float cs = pc.trig.v[2u * j];
+            float sn = pc.trig.v[2u * j + 1u];
+            pc.base.v[row + j] = a[k] * cs - b[k] * sn;
+            pc.base.v[row + half_n + j] = b[k] * cs + a[k] * sn;
+        }
+    }
+}
