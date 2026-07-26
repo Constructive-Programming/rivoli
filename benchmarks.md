@@ -228,7 +228,29 @@ retired; it is unmeasured, and reaching further is precisely where a real predic
 expected to lose recall. Treat every row as an upper bound: these errors are independent
 across decisions, and a real predictor's are correlated.
 
-### The engine and the simulator implement the same policy
+### DECISION: `top-m` ships opt-in and UNCERTIFIED
+
+The powered run, `int3-vq`, **5,184 teacher-forced positions**, `--max-mem 100`, shared
+baseline, one process per cell. This is the run that decided the feature.
+
+Baseline (lru): **PPL 4.130637**, hit 72.25%.
+
+| cell | PPL | dPPL% | mean dNLL | SE | 95% CI (nats) | worse% | hit% | swap% | verdict |
+|---|---:|---:|---:|---:|---|---:|---:|---:|---|
+| J=4/M=9 | 4.15252 | **+0.529%** | +0.00528 | 0.00375 | [−0.00207, +0.01263] | 52.3% | **77.69%** | 5.79% | **UNCERTIFIED** |
+
+**Shipped opt-in, not as the default.** The interval **contains zero**, so `top-m` is not
+significantly worse than baseline; its upper bound of +1.27% overshoots the pre-registered
+~1% bar, so it is not certified within budget either. The point estimate is half the bar —
+what fails is the uncertainty, not the result. Promoting it to default needs ~12,840 tokens
+(~3.4 h sole-tenant for baseline plus one cell), and at this point estimate it might still
+miss.
+
+**Relaxing the bar to the paper's own +0.1–3.0% band was considered and declined**, because
+it would have passed immediately and the ~1% figure was fixed before any data existed.
+Moving a threshold after seeing the result it fails is post-hoc. See `MODES.md`.
+
+### The engine and the simulator implement the same policy — including one forward prediction
 
 Checked before any quality number was trusted, because if it failed the entire offline
 screen above would be measuring a policy the engine does not run. Two independent
@@ -236,15 +258,24 @@ implementations of the substitution rule — `bin/replay`'s `substitute` and the
 `route_into` — on **different text** (the screen's 512-token trace vs the perplexity
 corpus):
 
-| (J, M) | simulator | engine |
-|---|---|---|
-| J=4/M=10 | +8.93pp hit, 9.6% swap | +8.98pp hit, 9.65% swap |
-| J=2/M=12 | +15.24pp hit, 17.8% swap | +15.18pp hit, 17.62% swap |
+| (J, M) | simulator | engine | |
+|---|---|---|---|
+| J=4/M=10 | +8.93pp hit, 9.6% swap | +8.98pp hit, 9.65% swap | retrodiction |
+| J=2/M=12 | +15.24pp hit, 17.8% swap | +15.18pp hit, 17.62% swap | retrodiction |
+| **J=4/M=9** | **+5.35pp hit, 5.7% swap** | **+5.44pp hit, 5.79% swap** | **forward prediction** |
 
-Agreement to 0.06pp on hit and 0.2pp on swap. These are **deterministic counts over a run**,
-not statistical estimates of a small effect, so this carries no power caveat and is not
-subject to the ambiguity that limits the quality numbers below. This is the reason to
-believe the +15pp screen at all.
+Agreement to 0.09pp on hit and 0.2pp on swap. These are **deterministic counts over a run**,
+not statistical estimates of a small effect, so they carry no power caveat and are not
+subject to the ambiguity that limits the quality numbers.
+
+**The third row is a different and stronger class of evidence than the first two.** Those
+were retrodictions — cells the engine had already run, checked against the simulator
+afterwards. J=4/M=9 the simulator predicted *before the cell existed*: it was chosen off the
+offline grid precisely because it was the lowest-swap cell still clearing the residency
+screen, and the engine then returned it to within 0.09pp. An offline model that makes a
+successful **forward** prediction is what justifies using the screen to choose future (J, M)
+without re-measuring every candidate on device — which matters, because each device cell is
+~44 minutes and the offline grid is milliseconds.
 
 ### Quality — teacher-forced perplexity, and what it does NOT establish
 
