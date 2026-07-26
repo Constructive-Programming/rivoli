@@ -638,9 +638,25 @@ mod vktier {
 
     impl VmmBuf {
         pub fn new(len: usize) -> Result<Self> {
-            Ok(Self {
-                buf: Buf::new(len)?,
-            })
+            let mut buf = Buf::new(len)?;
+            // The cold-expert streamer DMAs O_DIRECT straight into this mapping — no
+            // bounce, no staging copy — which is legal only while the base is
+            // 4096-aligned. `vkMapMemory` guarantees `minMemoryMapAlignment`, which is
+            // page-sized on every driver we have seen and is NOT required to be. That
+            // "in practice" is exactly the kind of premise that fails on someone else's
+            // machine, as EINVAL from the first read inside the reaper rather than
+            // anything legible, so it is checked here instead of assumed.
+            //
+            // The other half of the requirement, the slot STRIDE, is VQ_ALIGN and is
+            // enforced by the arena; see `crate::format` and `slot_span` in pin.rs.
+            let base = buf.host_mut() as usize;
+            ensure!(
+                base.is_multiple_of(crate::vk::O_DIRECT_ALIGN),
+                "mapped base {base:#x} is not {}-byte aligned, so io_uring O_DIRECT \
+                 reads into the routed pool would fail with EINVAL",
+                crate::vk::O_DIRECT_ALIGN
+            );
+            Ok(Self { buf })
         }
 
         /// The DEVICE base. Descriptor pointers are computed from this; it is not

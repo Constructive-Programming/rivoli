@@ -155,6 +155,47 @@ that segfaults the import path.
 So: `batch_add`-style memcpy into the next pool buffer, GPU reads a private device-local
 snapshot. Size the pool like colibri's default (~32 buffers) and tune from there.
 
+### Deviation: the copy pool is NOT built, because we never import
+
+The measurement above is real, and the conclusion drawn from it does not apply to what
+this port actually does. The 2.13 ms submit cost comes from amdgpu re-validating live
+**userptr** BOs — host pages the driver does not own, handed to it by
+`VK_EXT_external_memory_host`. The pool is a workaround for that specific pathology.
+
+`VmmBuf` is an ordinary `VkDeviceMemory` allocation from the
+`DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT` heap — which on Strix Halo is the whole
+heap — permanently mapped, with `host_mut()` handing out that mapping. The driver
+allocated those pages itself, so there is nothing to re-validate and the premise is
+absent. io_uring reads `O_DIRECT` straight into the slot; the GPU reads device-local
+memory. That is the plan's *intent* — no import, no userptr re-validation, device-local
+reads — reached without the pool and without the memcpy the pool would add on hardware
+where host RAM already is device memory. Building it anyway would be cargo-culting a
+fix for a problem the design avoids.
+
+Colibri's other note, that the pool "survives a mid-batch slab reload that segfaults the
+import path", is also import-specific: a Vulkan-owned allocation is not reloaded under
+us. The residual concern — a DMA landing in a slot a kernel is still reading — is real
+but orthogonal, and already owned by the `inflight` guard and the rule that every miss
+slot in a batch is allocated before any read is issued. That is scheduling, not
+buffering; a pool would hide it rather than fix it.
+
+**The measurement that overturns this:** if per-submit cost is ever observed scaling
+with the number of LIVE buffers rather than the number referenced by the submission,
+the userptr pathology has reappeared by another route and the pool comes back. That is
+the same signature colibri measured, and it is what to watch for.
+
+**Two premises this makes load-bearing, both now runtime assertions rather than prose:**
+
+- **4096-byte alignment** of the mapped base, or `O_DIRECT` fails `EINVAL` at the first
+  read, inside the reaper, on someone else's machine. `vkMapMemory` guarantees only
+  `minMemoryMapAlignment`, which is page-sized everywhere we have looked and is not
+  required to be. Checked in `VmmBuf::new` (`vk::O_DIRECT_ALIGN`). The stride half of
+  the requirement is `VQ_ALIGN`, enforced by the arena.
+- **`HOST_COHERENT`** on the selected memory type, or host writes need an explicit
+  `vkFlushMappedMemoryRanges` that this backend does not perform — and the failure mode
+  is stale data read as valid: no fault, no validation message, wrong numbers.
+  `Buf::new` refuses to allocate without it and says why.
+
 ### Determinism
 
 ### Determinism
@@ -316,6 +357,19 @@ Each phase ends with something runnable; no phase leaves the tree broken.
 2. **Memory + sync** — `DeviceBuf`/`DeviceTier`/`VmmBuf` equivalents, timeline-semaphore
    `Signal`, and the device-local copy pool for the io_uring bounce path. No profiling
    yet. Exit: `DeviceTier` reserve/copy tests pass; the reaper's H2D path round-trips.
+
+   **DELIVERED, SMALLER THAN THIS.** `DeviceBuf`/`DeviceTier`/`VmmBuf`, `memcpy_dtod`,
+   and the timeline-semaphore `Signal` are done and tested. Two parts of the criterion
+   are NOT met and are deferred rather than reinterpreted:
+   - the **copy pool** is deliberately not built — see the deviation above;
+   - **"the reaper's H2D path round-trips"** cannot be met at all while the reaper is
+     `rocm`-only (`stream.rs`, `asyncfetch.rs`), so it moves to the io_uring port in
+     phase 4, where there is something to round-trip.
+
+   Also unfinished, and flagged because it looks done from the outside: `Gpu::signal`
+   covers work already SUBMITTED, not work merely recorded. Arming on top of recorded
+   work needs the single command buffer to become a small ring. Deferred to phase 4 for
+   the same reason as the pool — no consumer exists yet to hold the design honest.
 3. **Kernels, oracle-first** — port in test order: `fwd` → `linalg` (non-MoE) → `mla` →
    `attn` → `moe`. Exit: the 16 ported kernels' oracles green.
 4. **Integration** — `backend.rs` switch, `pin.rs`/`gpu.rs` imports, end-to-end decode
