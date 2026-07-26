@@ -233,9 +233,22 @@ is real, not because the plan exists.
 
 - **Subgroup size control** may be unavailable or ignored on some drivers; a wave64
   fallback means re-tuning `ROWS_PER_BLOCK` and re-validating determinism.
-- **Push-constant budget** is 128 bytes guaranteed. `launch_attend` and the MoE
-  launchers exceed that — those need a small params `VkBuffer` per dispatch, which is
-  an extra write on a hot path. Measure before assuming it is free.
+- **No validation layer on this box** (standing, unmitigated). `VK_LAYER_KHRONOS_validation`
+  is not installed on the gfx1151 node and installing it needs root
+  (`media-libs/vulkan-layers` on Gentoo). This is the worst gap in the port: passing
+  every buffer as a bare device address with no descriptor sets means a wrong address
+  or a missing barrier reads plausible **garbage** rather than faulting, and that is
+  exactly the class the layer exists to catch. What we have instead: `spirv-val` on
+  every module in `build.rs` (static wellformedness only — it sees nothing about
+  synchronisation, descriptors, or BDA), and the numeric oracles. Init logs at WARN
+  when the layer is absent so a green run is never mistaken for a validated one.
+  Re-run the whole suite under the layer the moment it is installed.
+- **Push-constant budget** is 128 bytes guaranteed. Buffer device addresses collapse
+  every buffer argument to 8 bytes, which may retire this risk outright: `gemv_f32`
+  fits in 32 bytes with zero descriptor sets, and the worst case — `moe_gateup_vq`
+  with `ExpertDesc`'s six pointers plus three codebooks plus dims — is ~88 bytes if
+  the descs stay a pointed-to array. Confirm at `launch_attend` and the MoE launchers
+  and record the measurement here; do not pre-emptively build the params-buffer path.
 - **Profiling**: no `rocprof` equivalent in the workflow, but timestamp query pools are
   strictly better than the current HIP-event bracketing — the existing `telemetry.rs`
   spans map over cleanly.

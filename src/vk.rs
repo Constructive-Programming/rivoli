@@ -9,9 +9,13 @@
 
 #![cfg(feature = "vulkan")]
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail, ensure};
 use ash::vk;
-use std::sync::OnceLock;
+use std::ffi::CStr;
+use std::sync::{Mutex, OnceLock};
+use tracing::{info, warn};
+
+const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 
 /// The one wave width the kernels are written for (gfx1151 is native wave32). Unlike
 /// HIP — where `WAVE 32` in `common.hpp` is an assumption — the pipelines pin it with
@@ -32,6 +36,33 @@ pub struct Gpu {
     pub instance: ash::Instance,
     pub phys: vk::PhysicalDevice,
     entry: ash::Entry,
+    cmd: Mutex<Cmd>,
+    pipes: Pipes,
+    validation: bool,
+}
+
+/// The one open command buffer every `launch_*` appends to, plus the fence
+/// [`device_sync`] joins on. Mirrors HIP's default stream: launches queue up, the
+/// sync submits and waits. One buffer, reset and refilled — no per-launch submit
+/// (colibri measured submit cost as the thing that matters on RADV).
+struct Cmd {
+    pool: vk::CommandPool,
+    buf: vk::CommandBuffer,
+    fence: vk::Fence,
+    recording: bool,
+}
+
+/// A compiled compute kernel. Every pipeline here has an EMPTY descriptor-set layout:
+/// buffers reach the shader as device addresses in push constants, which is HIP's raw
+/// pointer args translated literally (docs/VULKAN.md, "kernel raw pointer args").
+struct Pipe {
+    layout: vk::PipelineLayout,
+    pipe: vk::Pipeline,
+}
+
+/// Every kernel, compiled once at init. Grows one field per ported kernel.
+struct Pipes {
+    gemv_f32: Pipe,
 }
 
 // SAFETY: every field is either an ash object (already Send+Sync) or a Vulkan handle.
@@ -68,7 +99,14 @@ impl Gpu {
         let app = vk::ApplicationInfo::default()
             .application_name(c"rivoli")
             .api_version(vk::API_VERSION_1_3);
-        let ci = vk::InstanceCreateInfo::default().application_info(&app);
+        let validation = Self::validation_layer(&entry);
+        let layers: Vec<*const i8> = validation
+            .then_some(VALIDATION_LAYER.as_ptr())
+            .into_iter()
+            .collect();
+        let ci = vk::InstanceCreateInfo::default()
+            .application_info(&app)
+            .enabled_layer_names(&layers);
         // SAFETY: `ci` and everything it borrows outlive the call.
         let instance = unsafe { entry.create_instance(&ci, None) }?;
 
@@ -78,6 +116,8 @@ impl Gpu {
         let queue = unsafe { device.get_device_queue(qfam, 0) };
         // SAFETY: `phys` is a live physical device from this instance.
         let memprops = unsafe { instance.get_physical_device_memory_properties(phys) };
+        let cmd = Cmd::new(&device, qfam)?;
+        let pipes = Pipes::new(&device)?;
 
         Ok(Self {
             device,
@@ -87,7 +127,46 @@ impl Gpu {
             instance,
             phys,
             entry,
+            cmd: Mutex::new(cmd),
+            pipes,
+            validation,
         })
+    }
+
+    /// Is `VK_LAYER_KHRONOS_validation` installed? Says so either way, at WARN when
+    /// it is not — same rule as `device.rs`'s sole-tenant guard: a silently-inert
+    /// safety net is worse than none, because you believe you are protected.
+    ///
+    /// This backend passes every buffer as a raw device address with no descriptor
+    /// sets, and a bad address or a missing barrier reads plausible GARBAGE rather
+    /// than faulting. The validation layer is the only thing that catches that class;
+    /// `spirv-val` (run by build.rs) checks module wellformedness, not API use.
+    fn validation_layer(entry: &ash::Entry) -> bool {
+        // SAFETY: the loader is live.
+        let Ok(layers) = (unsafe { entry.enumerate_instance_layer_properties() }) else {
+            warn!("VULKAN VALIDATION OFF: could not enumerate instance layers");
+            return false;
+        };
+        let found = layers.iter().any(|l| {
+            l.layer_name_as_c_str()
+                .is_ok_and(|n| n == VALIDATION_LAYER)
+        });
+        if found {
+            info!("Vulkan validation layer ENABLED");
+        } else {
+            warn!(
+                "VULKAN VALIDATION OFF: {} not installed. Buffer-device-address and \
+                 synchronisation misuse will read garbage instead of failing.",
+                VALIDATION_LAYER.to_string_lossy()
+            );
+        }
+        found
+    }
+
+    /// Whether this context is running under the validation layer. Tests print it so
+    /// a green run is never mistaken for a validated one.
+    pub fn validation(&self) -> bool {
+        self.validation
     }
 
     /// First physical device whose queue families and features satisfy the whole
@@ -291,6 +370,364 @@ impl Gpu {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Command recording — HIP default-stream semantics over one command buffer.
+// ---------------------------------------------------------------------------
+
+impl Cmd {
+    fn new(device: &ash::Device, qfam: u32) -> Result<Self> {
+        let pci = vk::CommandPoolCreateInfo::default().queue_family_index(qfam);
+        // SAFETY: `device` is live; `pci` outlives the call.
+        let pool = unsafe { device.create_command_pool(&pci, None) }?;
+        let ai = vk::CommandBufferAllocateInfo::default()
+            .command_pool(pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        // SAFETY: as above; exactly one buffer is requested, so index 0 exists.
+        let buf = unsafe { device.allocate_command_buffers(&ai) }?[0];
+        // SAFETY: as above.
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }?;
+        Ok(Self {
+            pool,
+            buf,
+            fence,
+            recording: false,
+        })
+    }
+}
+
+impl Gpu {
+    /// Append work to the open command buffer, opening one if needed, then serialise
+    /// it against whatever comes next. The barrier is what makes a `launch_*` sequence
+    /// behave like HIP's default stream — each kernel sees the previous one's writes.
+    fn enqueue(&self, f: impl FnOnce(&ash::Device, vk::CommandBuffer)) -> Result<()> {
+        let mut cmd = self.cmd.lock().map_err(|_| anyhow!("vk command lock poisoned"))?;
+        if !cmd.recording {
+            let bi = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            // SAFETY: the buffer is not pending — the previous submit was fence-waited
+            // and the pool reset in `sync`.
+            unsafe { self.device.begin_command_buffer(cmd.buf, &bi) }?;
+            cmd.recording = true;
+        }
+        f(&self.device, cmd.buf);
+        let bar = [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
+        // SAFETY: recording is open on `cmd.buf`.
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                cmd.buf,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &bar,
+                &[],
+                &[],
+            );
+        }
+        Ok(())
+    }
+
+    /// Bind, push the constants, dispatch. `push` must be the `#[repr(C)]` mirror of
+    /// the shader's `push_constant` block — the ONE place the two sides can disagree,
+    /// so each launcher declares its struct next to the launch that uses it.
+    fn dispatch<T>(&self, p: &Pipe, push: &T, groups_x: u32) -> Result<()> {
+        // SAFETY: `T` is a `#[repr(C)]` POD; reading it as its own bytes is sound.
+        let bytes =
+            unsafe { std::slice::from_raw_parts((push as *const T).cast::<u8>(), size_of::<T>()) };
+        self.enqueue(|d, cb| {
+            // SAFETY: recording is open on `cb`; `p` was built against this device and
+            // its layout declares exactly `size_of::<T>()` push-constant bytes.
+            unsafe {
+                d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, p.pipe);
+                d.cmd_push_constants(cb, p.layout, vk::ShaderStageFlags::COMPUTE, 0, bytes);
+                d.cmd_dispatch(cb, groups_x, 1, 1);
+            }
+        })
+    }
+
+    /// Submit whatever is recorded and block until it retires — one join per token,
+    /// same contract as `hip::device_sync`. A no-op when nothing was launched.
+    pub fn sync(&self) -> Result<()> {
+        let mut cmd = self.cmd.lock().map_err(|_| anyhow!("vk command lock poisoned"))?;
+        if !cmd.recording {
+            return Ok(());
+        }
+        // Make the kernels' writes available to the HOST domain, so a readback after
+        // the fence is defined without a per-buffer invalidate. Host WRITES need no
+        // matching barrier — vkQueueSubmit implies one for anything written before it.
+        let bar = [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ)];
+        let bufs = [cmd.buf];
+        let si = [vk::SubmitInfo::default().command_buffers(&bufs)];
+        // SAFETY: recording is open; the fence is unsignalled (reset below on every
+        // path that signals it); nothing else touches this queue (see the Sync impl).
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                cmd.buf,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &bar,
+                &[],
+                &[],
+            );
+            self.device.end_command_buffer(cmd.buf)?;
+            cmd.recording = false;
+            self.device.queue_submit(self.queue, &si, cmd.fence)?;
+            self.device.wait_for_fences(&[cmd.fence], true, u64::MAX)?;
+            self.device.reset_fences(&[cmd.fence])?;
+            self.device
+                .reset_command_pool(cmd.pool, vk::CommandPoolResetFlags::empty())?;
+        }
+        Ok(())
+    }
+}
+
+/// Block until all launched kernels retire — one join per token. `hip::device_sync`'s
+/// twin, and the same contract: device pointers handed to a `launch_*` must stay valid
+/// until this returns.
+pub fn device_sync() -> Result<()> {
+    gpu()?.sync()
+}
+
+// ---------------------------------------------------------------------------
+// Pipelines
+// ---------------------------------------------------------------------------
+
+impl Pipes {
+    fn new(device: &ash::Device) -> Result<Self> {
+        Ok(Self {
+            gemv_f32: Pipe::new(
+                device,
+                include_bytes!(concat!(env!("OUT_DIR"), "/gemv_f32.spv")),
+                size_of::<GemvF32Push>() as u32,
+            )?,
+        })
+    }
+}
+
+impl Pipe {
+    fn new(device: &ash::Device, spv: &[u8], push_size: u32) -> Result<Self> {
+        let words = ash::util::read_spv(&mut std::io::Cursor::new(spv))?;
+        let smci = vk::ShaderModuleCreateInfo::default().code(&words);
+        // SAFETY: `device` is live; `words` outlives the call.
+        let module = unsafe { device.create_shader_module(&smci, None) }?;
+        let ranges = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(push_size)];
+        let plci = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&ranges);
+        // SAFETY: as above. No descriptor-set layouts: every buffer is a device address.
+        let layout = unsafe { device.create_pipeline_layout(&plci, None) }?;
+        // Pin the subgroup to WAVE and require FULL subgroups, so the shaders' fixed
+        // 32-lane shuffle ladder is a driver-enforced fact rather than an assumption.
+        let mut req = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+            .required_subgroup_size(WAVE);
+        let stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(module)
+            .name(c"main")
+            .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
+            .push_next(&mut req);
+        let ci = [vk::ComputePipelineCreateInfo::default()
+            .stage(stage)
+            .layout(layout)];
+        // SAFETY: as above.
+        let pipes = unsafe { device.create_compute_pipelines(vk::PipelineCache::null(), &ci, None) }
+            .map_err(|(_, e)| e)?;
+        // SAFETY: the module is only needed while the pipeline is being created.
+        unsafe { device.destroy_shader_module(module, None) };
+        let pipe = *pipes.first().ok_or_else(|| anyhow!("no compute pipeline created"))?;
+        Ok(Self { layout, pipe })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Buffers
+// ---------------------------------------------------------------------------
+
+/// One device allocation: a `VkBuffer` bound to its own `VkDeviceMemory`, permanently
+/// host-mapped, exposed to the kernels by its DEVICE ADDRESS.
+///
+/// This is the primitive `device.rs`'s `DeviceBuf`/`DeviceTier`/`VmmBuf` are built
+/// from. On Strix Halo host RAM *is* GPU memory, so the same allocation is both
+/// device-local (full bandwidth) and host-writable in place — the Vulkan spelling of
+/// what `kernels/vmm.hip` does with HIP VMM.
+pub struct Buf {
+    buf: vk::Buffer,
+    mem: vk::DeviceMemory,
+    addr: u64,
+    host: *mut u8,
+    len: usize,
+}
+
+impl Buf {
+    pub fn new(len: usize) -> Result<Self> {
+        ensure!(len > 0, "Buf::new(0): Vulkan rejects a zero-sized buffer");
+        let g = gpu()?;
+        let bci = vk::BufferCreateInfo::default()
+            .size(len as u64)
+            .usage(
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                    | vk::BufferUsageFlags::TRANSFER_SRC
+                    | vk::BufferUsageFlags::TRANSFER_DST,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY: the device is live; `bci` outlives the call.
+        let buf = unsafe { g.device.create_buffer(&bci, None) }?;
+        // SAFETY: `buf` was just created on this device.
+        let req = unsafe { g.device.get_buffer_memory_requirements(buf) };
+        let want = vk::MemoryPropertyFlags::DEVICE_LOCAL
+            | vk::MemoryPropertyFlags::HOST_VISIBLE
+            | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let types = &g.memprops.memory_types[..g.memprops.memory_type_count as usize];
+        let idx = types
+            .iter()
+            .enumerate()
+            .position(|(i, t)| {
+                req.memory_type_bits & (1 << i) != 0 && t.property_flags.contains(want)
+            })
+            .ok_or_else(|| {
+                anyhow!("no DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT memory type for a {len}B buffer")
+            })? as u32;
+        let mut flags =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let ai = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(idx)
+            .push_next(&mut flags);
+        // SAFETY: as above.
+        let mem = unsafe { g.device.allocate_memory(&ai, None) }?;
+        // SAFETY: `mem` was allocated for `buf`'s requirements and nothing is bound yet.
+        unsafe { g.device.bind_buffer_memory(buf, mem, 0) }?;
+        // SAFETY: HOST_VISIBLE memory, mapped whole, unmapped exactly once in Drop.
+        let host = unsafe {
+            g.device
+                .map_memory(mem, 0, req.size, vk::MemoryMapFlags::empty())
+        }? as *mut u8;
+        let info = vk::BufferDeviceAddressInfo::default().buffer(buf);
+        // SAFETY: `buf` was created with SHADER_DEVICE_ADDRESS and is bound.
+        let addr = unsafe { g.device.get_buffer_device_address(&info) };
+        Ok(Self {
+            buf,
+            mem,
+            addr,
+            host,
+            len,
+        })
+    }
+
+    /// The buffer's DEVICE address, shaped as a pointer so the `launch_*` signatures
+    /// match `hip.rs`'s exactly.
+    ///
+    /// **Not dereferenceable on the host.** Under HIP unified addressing the host and
+    /// device see one address; under Vulkan they do not. Host access goes through
+    /// [`Buf::write_at`] / [`Buf::read_into`], and the engine only ever passes these
+    /// values through to kernels — which is why the swap costs `gpu.rs` nothing.
+    pub fn ptr(&self) -> *const u8 {
+        self.addr as *const u8
+    }
+    pub fn ptr_mut(&mut self) -> *mut u8 {
+        self.addr as *mut u8
+    }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Host-write `bytes` at byte offset `off`. HOST_COHERENT, and `vkQueueSubmit`
+    /// implies the host-write barrier, so no flush and no `hipMemcpy` — the write is
+    /// visible to any kernel submitted after it returns.
+    pub fn write_at(&mut self, off: usize, bytes: &[u8]) -> Result<()> {
+        ensure!(
+            off + bytes.len() <= self.len,
+            "write_at {off}+{} > buf len {}",
+            bytes.len(),
+            self.len
+        );
+        // SAFETY: the mapping covers `self.len`; `off+len` is within it (checked).
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.host.add(off), bytes.len()) };
+        Ok(())
+    }
+
+    /// Read the first `len` bytes back into `out` (cleared, then refilled). Call after
+    /// a [`device_sync`] — that is where the kernels' writes are made host-visible.
+    pub fn read_into(&self, out: &mut Vec<u8>, len: usize) -> Result<()> {
+        ensure!(len <= self.len, "read_into {len} > buf len {}", self.len);
+        out.clear();
+        out.reserve(len);
+        // SAFETY: the mapping covers `self.len >= len`; `out` owns `len` reserved bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.host, out.as_mut_ptr(), len);
+            out.set_len(len);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Buf {
+    fn drop(&mut self) {
+        let Ok(g) = gpu() else { return };
+        // SAFETY: all three handles came from this device and are released once. The
+        // caller's contract (see `device_sync`) is that no kernel still references them.
+        unsafe {
+            g.device.unmap_memory(self.mem);
+            g.device.destroy_buffer(self.buf, None);
+            g.device.free_memory(self.mem, None);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel launchers — the `hip.rs` surface, one fn per ported kernel.
+// ---------------------------------------------------------------------------
+
+/// Mirror of `gemv_f32.comp`'s `push_constant` block. std430: three 8-byte buffer
+/// references then two ints — 32 bytes, well inside the 128-byte guaranteed budget.
+#[repr(C)]
+struct GemvF32Push {
+    x: u64,
+    w: u64,
+    y: u64,
+    o_dim: i32,
+    i_dim: i32,
+}
+
+/// f32 GEMV `y = W·x` (the MoE router gate).
+///
+/// # Safety
+/// `x`, `w` and `y` must be DEVICE ADDRESSES of live [`Buf`] regions holding `i_dim`,
+/// `o_dim·i_dim` and `o_dim` f32 respectively, and must stay live until the next
+/// [`device_sync`].
+pub unsafe fn launch_gemv_f32(
+    x: *const f32,
+    w: *const f32,
+    o_dim: usize,
+    i_dim: usize,
+    y: *mut f32,
+) -> Result<()> {
+    ensure!(o_dim > 0 && i_dim > 0, "gemv_f32: argument guard rejected");
+    let g = gpu()?;
+    let push = GemvF32Push {
+        x: x as u64,
+        w: w as u64,
+        y: y as u64,
+        o_dim: o_dim as i32,
+        i_dim: i_dim as i32,
+    };
+    g.dispatch(
+        &g.pipes.gemv_f32,
+        &push,
+        o_dim.div_ceil(ROWS_PER_BLOCK as usize) as u32,
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -300,7 +737,12 @@ mod tests {
     fn context_initialises() {
         let g = gpu().expect("vulkan init");
         let (free, total) = g.mem_info();
-        println!("\nVULKAN device: {} — {:.1} GiB device-local\n", g.name(), total as f64 / (1u64 << 30) as f64);
+        println!(
+            "\nVULKAN device: {} — {:.1} GiB device-local — validation layer: {}\n",
+            g.name(),
+            total as f64 / (1u64 << 30) as f64,
+            if g.validation() { "ON" } else { "OFF (unvalidated!)" }
+        );
         assert!(total > 0, "no DEVICE_LOCAL heap");
         assert_eq!(free, total);
         // Second call must hand back the same context, not build another.

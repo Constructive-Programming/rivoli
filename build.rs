@@ -99,5 +99,22 @@ fn vulkan() {
             .status()
             .expect("run glslc");
         assert!(status.success(), "glslc failed on {}", src.display());
+        spirv_val(&spv);
+    }
+}
+
+/// Validate a compiled module with `spirv-val`.
+///
+/// This is STATIC module validation — it catches malformed SPIR-V, bad decorations,
+/// and capability/extension mismatches. It does NOT see synchronisation, descriptor,
+/// or buffer-device-address misuse; only the VK_LAYER_KHRONOS_validation runtime layer
+/// does, and that layer is a separate install (see docs/VULKAN.md "Risks").
+///
+/// A missing `spirv-val` warns rather than fails: it ships in a different package from
+/// glslc, and a box that can build shaders should not be blocked on the checker.
+fn spirv_val(spv: &str) {
+    match Command::new("spirv-val").arg(spv).status() {
+        Ok(status) => assert!(status.success(), "spirv-val rejected {spv}"),
+        Err(e) => println!("cargo:warning=spirv-val not run on {spv} ({e}); SPIR-V unchecked"),
     }
 }
