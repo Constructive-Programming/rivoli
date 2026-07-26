@@ -129,6 +129,19 @@ fn main() -> Result<()> {
     // "the cost is small" apart from "we could not measure it".
     let bar = 1.01f64.ln();
     println!("\n1% PPL bar = {bar:.5} nats of mean dNLL. Verdict per cell:");
+    // The single crispest statement of underpowered: if one standard error is wider than
+    // the whole acceptance bar, the experiment cannot see the quantity it exists to bound,
+    // and no arrangement of the point estimates changes that.
+    for (label, _, lo, hi, _) in &verdicts {
+        let se = (hi - lo) / (2.0 * 1.96);
+        if se > bar {
+            println!(
+                "  !! {} — SE {se:.5} EXCEEDS the {bar:.5} bar: this cell cannot resolve the\n     \
+                 acceptance question at any point estimate. More TEXT is the only fix.",
+                label.split_whitespace().take(3).collect::<Vec<_>>().join(" ")
+            );
+        }
+    }
     for (label, m, lo, hi, sd) in &verdicts {
         let cell = label.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
         // Acceptance asks whether the cost is WITHIN 1%, so what must happen is that the
@@ -149,7 +162,19 @@ fn main() -> Result<()> {
         } else if *lo > bar {
             "FAIL — interval entirely worse than +1%".to_string()
         } else if *m >= bar {
-            "FAIL(point) — estimate at/past the bar; more text cannot rescue it".to_string()
+            // The point estimate sits at or past the bar, but the interval still straddles
+            // it. Calling that a FAIL would overstate what we know by exactly as much as
+            // calling it a PASS would: with SE this large the estimate is consistent with
+            // no effect AND with the bar simultaneously. Report the n that would make the
+            // question decidable either way rather than pretending it is already decided.
+            let se = (hi - lo) / (2.0 * 1.96);
+            let n_dec = ((1.96 * sd / (bar / 2.0)).powi(2)).ceil() as u64;
+            format!(
+                "INCONCLUSIVE — estimate {m:+.5} is at/past the bar but SE {se:.5} straddles it \
+                 ({:.2} SE from zero); ~{n_dec} tokens for a decisive interval, and it may \
+                 resolve either way",
+                m / se
+            )
         } else {
             // n to drive the upper bound under the bar AT THIS OBSERVED EFFECT SIZE. The
             // margin is (bar - mean), so a cell whose true cost is near zero needs far
