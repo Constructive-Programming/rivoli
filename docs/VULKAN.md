@@ -67,6 +67,9 @@ Fail fast at init with a clear message naming the missing one:
 - `VK_KHR_buffer_device_address` (core 1.2) — lets `ExpertDescVq`'s six raw pointers
   stay six `uint64` addresses in a params buffer instead of six descriptor bindings.
   Without it the per-expert launch path needs a descriptor rewrite per expert.
+- `shaderInt64` (core 1.0) — the other half of the above: the shader dereferences
+  those addresses as `uint64_t` buffer references (`GL_EXT_buffer_reference`), which
+  is a 64-bit integer operation.
 - `VK_EXT_subgroup_size_control` with `requiredSubgroupSize = 32` — the kernels assume
   `WAVE 32` (gfx1151 native wave32; see `kernels/common.hpp`).
 - `subgroupShuffleRelative` + `subgroupBasic` (core 1.1 subgroup ops).
