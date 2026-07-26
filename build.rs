@@ -100,6 +100,38 @@ fn vulkan() {
             .expect("run glslc");
         assert!(status.success(), "glslc failed on {}", src.display());
         spirv_val(&spv);
+        no_subgroup_arithmetic(&spv);
+    }
+}
+
+/// Fail the build if a module declares the `GroupNonUniformArithmetic` capability —
+/// i.e. someone reached for `subgroupAdd`/`subgroupMul`/`subgroupMin`... in a
+/// reduction.
+///
+/// Greedy decode must be bit-reproducible, and those ops have an
+/// IMPLEMENTATION-DEFINED summation order. Every reduction here is a fixed
+/// `subgroupShuffleDown` halving ladder instead (kernels/vk/common.glsl::wave_sum,
+/// matching common.hpp). That rule was a comment in docs/VULKAN.md; this makes it a
+/// build error, because a comment does not survive sixteen kernel ports.
+///
+/// Skipped with a warning if `spirv-dis` is absent, like `spirv-val` above.
+fn no_subgroup_arithmetic(spv: &str) {
+    let out = match Command::new("spirv-dis").arg("--no-color").arg(spv).output() {
+        Ok(o) if o.status.success() => o.stdout,
+        Ok(_) => panic!("spirv-dis failed on {spv}"),
+        Err(e) => {
+            println!("cargo:warning=spirv-dis not run on {spv} ({e}); subgroupAdd unchecked");
+            return;
+        }
+    };
+    let text = String::from_utf8_lossy(&out);
+    for banned in ["GroupNonUniformArithmetic", "GroupNonUniformClustered"] {
+        assert!(
+            !text.contains(banned),
+            "{spv} declares OpCapability {banned}: a subgroup reduce (subgroupAdd and \
+             friends) has an implementation-defined summation order and breaks greedy \
+             decode's reproducibility. Use the wave_sum shuffle ladder."
+        );
     }
 }
 
