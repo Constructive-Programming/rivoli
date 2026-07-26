@@ -68,7 +68,7 @@ float fp8_dot_strided(uint64_t wrow_bytes, uint scale_off, uint start, uint stri
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
-    e4m3_lut_build(lut, tid);
+    E4M3_LUT_BUILD(lut, tid);
     barrier();
 
     uint lane = gl_SubgroupInvocationID;

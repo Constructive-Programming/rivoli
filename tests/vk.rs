@@ -61,6 +61,46 @@ fn dev(b: &[u8]) -> Buf {
     d.write_at(0, b).expect("fill");
     d
 }
+/// Collects mismatches across shapes so a multi-shape oracle reports ALL of them.
+///
+/// `assert_close` panics on the first bad shape, which aborts the test and leaves every
+/// later shape UNEXECUTED — the same first-failure-abort that used to hide a second
+/// broken shader in build.rs, now inside a test. It cost real evidence: gemv_fp8's
+/// wave-per-row shape failed and the split-K correctness shape never ran, so "is split-K
+/// also wrong on values?" was unanswerable from a red suite.
+#[derive(Default)]
+struct Shapes {
+    bad: Vec<String>,
+}
+
+impl Shapes {
+    /// Like `assert_close` but records instead of panicking. Always prints the margin.
+    fn close(&mut self, want: &[f32], got: &[f32], label: &str) {
+        let mx = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let err = want
+            .iter()
+            .zip(got)
+            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        let tol = 1e-3 * mx + 1e-3;
+        println!(
+            "{label}: err={err:.3e} tol={tol:.3e} margin={:.1}x",
+            tol / err.max(f32::MIN_POSITIVE)
+        );
+        if err > tol {
+            self.bad.push(format!("{label}: err={err:.3e} > tol={tol:.3e}"));
+        }
+    }
+
+    fn assert_all_passed(&self, what: &str) {
+        assert!(
+            self.bad.is_empty(),
+            "\n\n{} of {what}'s shapes failed — ALL of them, not just the first:\n  {}\n",
+            self.bad.len(),
+            self.bad.join("\n  ")
+        );
+    }
+}
+
 /// Report the max error AND the threshold it was compared against. Printing the
 /// margin is the point: a green oracle that passed on 100x of headroom looks exactly
 /// like one that passed on 2x, and only one of them is evidence.
@@ -1765,6 +1805,7 @@ fn gemv_i8_matches_the_host_oracle() {
 #[test]
 fn gemv_fp8_matches_the_host_oracle() {
     let v = Validation::new();
+    let mut shapes = Shapes::default();
     let block = 128usize;
     for (o_dim, i_dim, geometry) in [
         (256usize, 512usize, "wave-per-row"),
@@ -1799,8 +1840,9 @@ fn gemv_fp8_matches_the_host_oracle() {
         let got = readb(&yb, o_dim * 4 + GUARD);
         let label = format!("gemv_fp8 {geometry} {o_dim}x{i_dim}");
         assert_untouched(&got, o_dim * 4, &label);
-        assert_close(&want, &f32v(&got[..o_dim * 4]), &label);
+        shapes.close(&want, &f32v(&got[..o_dim * 4]), &label);
     }
+    shapes.assert_all_passed("gemv_fp8");
     v.check("gemv_fp8_matches_the_host_oracle");
 }
 

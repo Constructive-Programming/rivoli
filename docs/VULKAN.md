@@ -441,6 +441,35 @@ interleaved A/B produced 256 greedy argmaxes byte-identical between arms across 
 decode. So the property does hold for a correct change here, and a Vulkan run that fails
 it has a defect rather than an unrealistic target.
 
+### The incremental form: per-kernel golden bits (DESIGNED, NOT BUILT)
+
+The token-ID gate needs a whole forward pass. There is a cheaper version that works
+*during* the port and localises a divergence to one kernel instead of to a token.
+
+Both backends' oracles already run the **same input** — same `Lcg` seed formula, same
+shapes — against the **same CPU reference**. So: hash the kernel's output buffer, commit
+the HIP-produced hash as a golden, and have the Vulkan oracle assert against it. That
+upgrades "the two backends report the same max error" from *consistent with* bit-identity
+to *established*, per kernel, at the kernel — and it is simultaneously the golden-bits
+regression test this repo has never had on either backend.
+
+Evidence it is worth doing: `gemv_fp8` at 256x512 reports `err=9.537e-7`,
+`margin=2928.2x` under **both** backends, identical to four significant figures. That is
+suggestive and it is not proof, and the gap between those two is exactly what this
+mechanism closes.
+
+Build it once 2b and 2c have landed, so it covers eight or nine kernels rather than two.
+Requirements when you do:
+
+- Use the same FNV-1a as `tests/glsl_numerics.rs`, for the same reason: `DefaultHasher`
+  is not stable across Rust releases, and a golden that breaks on a toolchain bump
+  teaches people to regenerate goldens.
+- **The failure message must say INVESTIGATE, DO NOT REGENERATE.** A golden refreshed on
+  mismatch guarantees nothing, and refreshing is the path of least resistance at the
+  moment it matters most.
+- Record which backend produced each golden and on what hardware. A golden is a claim
+  about a specific stack.
+
 **PRE-REGISTERED: what happens if `swiglu` breaks this gate.** `swiglu` computes
 `x/(1+exp(-x))`, and `exp` is a library function whose last bits are unspecified in both
 GLSL and HIP — two correct implementations disagree. It is therefore the first suspect if

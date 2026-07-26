@@ -134,13 +134,25 @@ float e4m3f(uint b) {
     return sign * (1.0 + mant * 0.125) * exp2(float(exp - 7));
 }
 
-// Fill a 256-float LDS table with e4m3f(byte), so the hot GEMV decodes fp8 by an LDS read
-// instead of the branchy path. Bit-exact with e4m3f by construction. Caller passes
-// gl_LocalInvocationID.x and barriers before use; needs a >=256-thread workgroup, which
-// both callers have.
-void e4m3_lut_build(inout float lut[256], uint tid) {
-    if (tid < 256u) lut[tid] = e4m3f(tid);
-}
+// Filling the e4m3 LUT is a MACRO, not a function, and that is a correctness
+// requirement rather than a style choice.
+//
+// GLSL passes parameters by VALUE-RESULT — copy-in/copy-out — including arrays, and
+// including `shared` ones. Written as `void e4m3_lut_build(inout float lut[256], uint
+// tid)` it compiled to a per-invocation 1 KB Function-storage copy of the whole shared
+// array: each of 256 threads copied all 256 entries in, wrote one, and copied all 256
+// back, so 255 of every thread's entries were the uninitialised values it had loaded.
+// Last writer won, the table was noise, and every fp8 weight decoded to noise
+// (err = 8.6e37). Nothing flagged it: clean compile, spirv-val clean, every capability
+// and arithmetic guard clean, and GPU-AV silent because the reads were in-bounds — the
+// CONTENTS were garbage, not the addresses.
+//
+// A macro writes the caller's shared variable directly, which is the whole point.
+// build.rs now rejects array-typed function parameters so this cannot come back as a
+// function.
+//
+// Caller barriers before use; needs a >=256-thread workgroup, which every caller has.
+#define E4M3_LUT_BUILD(lut, tid) { if ((tid) < 256u) (lut)[(tid)] = e4m3f(tid); }
 
 // bf16f (the other DECODE direction) is NOT here yet, on purpose. They are not conveniences —
 // they are a BIT-EXACTNESS CONTRACT with src/math.rs, and unexercised code carrying a

@@ -145,6 +145,7 @@ fn vulkan() {
         failures.extend(no_subgroup_arithmetic(&spv));
         failures.extend(no_reciprocal_rewrite(&spv));
         failures.extend(no_banned_builtins(&spv));
+        failures.extend(no_array_parameters(&spv));
     }
     assert!(
         failures.is_empty(),
@@ -290,6 +291,60 @@ fn no_banned_builtins(spv: &str) -> Vec<String> {
         }
     }
     found
+}
+
+/// Fail the build if a shader copies a WHOLE ARRAY in one load.
+///
+/// The eleventh mechanised rule. GLSL passes parameters by VALUE-RESULT — copy-in/
+/// copy-out — including arrays, and including `shared` ones. `void
+/// e4m3_lut_build(inout float lut[256], uint tid)` therefore compiled to a
+/// per-invocation 1 KB private copy of the whole shared array: 256 threads each copied
+/// all 256 entries in, wrote one, and copied all 256 back, so every thread clobbered the
+/// others with the uninitialised values it had loaded. The e4m3 table was noise and
+/// every fp8 weight decoded to noise (err = 8.6e37).
+///
+/// It got past ALL of: a clean compile, spirv-val, the capability scan, the reciprocal
+/// guard, the InverseSqrt guard, and GPU-assisted validation — the last because the
+/// reads were IN BOUNDS. The addresses were right and the contents were garbage. Only
+/// the numeric oracle caught it, and only because rule ten forced that oracle to exist.
+///
+/// WHY THIS SIGNATURE AND NOT `OpFunctionParameter` OF ARRAY TYPE. That is the obvious
+/// spelling and it does not work: `glslc -O` INLINES the helper, so the shipped module
+/// contains no function parameter at all. Measured — the buggy build has zero
+/// `OpFunctionParameter` and two `OpLoad` of array type. A guard has to match what
+/// survives optimisation, not what the source looks like.
+///
+/// WHY IT DOES NOT BLOCK A LOCAL ACCUMULATOR. `mla_latent_attend` needs
+/// `float acc[MLA_ACC_REGS]`, and indexing an array element compiles to `OpAccessChain`
+/// + `OpLoad %float` — never a whole-array load. Verified across every kernel here:
+/// `rope_interleave` carries two local arrays and has zero whole-array loads; only the
+/// buggy `gemv_fp8` had any.
+///
+/// Whether such an array lands in registers or spills to scratch is a DIFFERENT question
+/// with a different instrument — `ScratchSize` from the compiler's resource usage, not
+/// anything visible in SPIR-V. One rule attempting both would block legitimate code and
+/// still miss the spill.
+///
+/// Write a macro instead, so the caller's variable is written directly.
+fn no_array_parameters(spv: &str) -> Vec<String> {
+    let Some(text) = disassemble(spv) else { return Vec::new() };
+    text.lines()
+        .filter(|l| {
+            l.split_once(" = OpLoad ")
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with("%_arr_"))
+        })
+        .map(|l| {
+            format!(
+                "{spv}: copies a WHOLE ARRAY in one load\n  {}\n  GLSL copies array \
+                 arguments IN AND OUT per invocation, so passing a `shared` array to a \
+                 function gives every thread a private copy and the writes are lost. Use \
+                 a macro so the caller's variable is written directly (see \
+                 E4M3_LUT_BUILD in kernels/vk/common.glsl). Indexing a local array is \
+                 fine — that compiles to OpAccessChain + a scalar load, not this.",
+                l.trim()
+            )
+        })
+        .collect()
 }
 
 /// `spirv-dis` output, or `None` with a warning if the tool is absent — same optional
