@@ -202,6 +202,8 @@ struct Pipes {
     gemv_fp8: Pipe,
     mla_value_fp8: Pipe,
     mla_absorb_fp8: Pipe,
+    mla_latent_attend: Pipe,
+    mla_attend_combine: Pipe,
 }
 
 // SAFETY: needed because ash models the DISPATCHABLE handles (`vk::Queue`,
@@ -523,12 +525,32 @@ impl Gpu {
                 size.max_compute_workgroup_subgroups
             ),
         );
+        // `supported_operations` is a free bitmask and only BASIC is mandatory, so each
+        // op family a shader uses must be named. BALLOT arrived with 2c: `subgroupBroadcast`
+        // in mla_latent_attend compiles to OpGroupNonUniformBroadcast, which the spec puts
+        // behind the BALLOT bit rather than BASIC. Without this line a device advertising
+        // BASIC|SHUFFLE_RELATIVE but not BALLOT passes init cleanly and then fails at
+        // pipeline creation with an opaque ERROR_INITIALIZATION_FAILED naming nothing.
         for (flag, name) in [
             (vk::SubgroupFeatureFlags::BASIC, "subgroup BASIC"),
             (vk::SubgroupFeatureFlags::SHUFFLE_RELATIVE, "subgroup SHUFFLE_RELATIVE"),
+            (vk::SubgroupFeatureFlags::BALLOT, "subgroup BALLOT (subgroupBroadcast)"),
         ] {
             need(sub.supported_operations.contains(flag), name);
         }
+        // The attention tile is a STATIC shared array — GLSL has no dynamic LDS — and at
+        // 16*(512+64) f32 it is 36864 bytes. That is over Vulkan's REQUIRED minimum for
+        // maxComputeSharedMemorySize, which is 16384, so it is a real portability limit
+        // rather than a formality: every earlier shader here fits in ~1-2 KB. The shader
+        // comment used to claim this was checked at init; now it is.
+        need(
+            lim.max_compute_shared_memory_size >= MLA_ATTEND_LDS_BYTES,
+            &format!(
+                "maxComputeSharedMemorySize >= {MLA_ATTEND_LDS_BYTES} for the attention tile \
+                 (device allows {})",
+                lim.max_compute_shared_memory_size
+            ),
+        );
         // On Strix Halo host RAM *is* GPU memory (GTT); the pin path writes resident
         // weights straight into device-local memory, so this heap must exist.
         // SAFETY: `phys` is live.
@@ -728,7 +750,16 @@ impl Gpu {
     /// Bind, push the constants, dispatch. `push` must be the `#[repr(C)]` mirror of
     /// the shader's `push_constant` block — the ONE place the two sides can disagree,
     /// so each launcher declares its struct next to the launch that uses it.
+    /// One-dimensional grid — every kernel here but the attention sweep.
     fn dispatch<T>(&self, p: &Pipe, push: &T, groups_x: u32) -> Result<()> {
+        self.dispatch_2d(p, push, groups_x, 1)
+    }
+
+    /// Two-dimensional grid. `mla_latent_attend` needs it: `x` is the head-block and `y`
+    /// is the split, matching `attn.hip`'s `dim3(blocks, n_splits)`. The shader reads
+    /// `gl_WorkGroupID.y` to find its row range, so collapsing this into one dimension
+    /// would silently give every workgroup split 0.
+    fn dispatch_2d<T>(&self, p: &Pipe, push: &T, groups_x: u32, groups_y: u32) -> Result<()> {
         // The push struct and the pipeline layout are declared in different places and
         // nothing else compares them. `T` must also have NO PADDING — reading padding
         // bytes as `u8` is UB, and a `u64` after an `i32` silently introduces four.
@@ -749,7 +780,7 @@ impl Gpu {
             unsafe {
                 d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, p.pipe);
                 d.cmd_push_constants(cb, p.layout, vk::ShaderStageFlags::COMPUTE, 0, bytes);
-                d.cmd_dispatch(cb, groups_x, 1, 1);
+                d.cmd_dispatch(cb, groups_x, groups_y, 1);
             }
         })
     }
@@ -916,6 +947,8 @@ impl Pipes {
             gemv_fp8: GemvFp8Push,
             mla_value_fp8: MlaValuePush,
             mla_absorb_fp8: MlaAbsorbPush,
+            mla_latent_attend: MlaAttendPush,
+            mla_attend_combine: MlaCombinePush,
         ))
     }
 }
@@ -2273,4 +2306,231 @@ pub unsafe fn launch_mla_absorb_fp8(
     // mismatch that leaves the tail of `qabs` holding its previous contents, silently.
     let groups_x = (h * kvl).div_ceil(BLOCK as usize) as u32;
     g.dispatch(&g.pipes.mla_absorb_fp8, &push, groups_x)
+}
+
+// --- attn.hip: MLA flash attention -----------------------------------------
+//
+// These constants mirror `kernels/attn.hip`'s defines and `kernels/vk/*.comp`'s. They are
+// NOT single-sourced through build.rs the way WAVE/ROWS_PER_BLOCK are, and that is a debt
+// rather than a decision: doing it properly means teaching build.rs to feed the ROCm arm
+// too, which touches a backend this tranche does not otherwise change. The couplings that
+// would silently produce wrong numbers are pinned by the `const` assertions below and by
+// the shaders' own `#error`s (SUBW == WAVE, the LUT thread floor). NOT by anything at
+// dispatch: an earlier version of this comment claimed `attend_scratch_floats` was
+// "checked against the shader's view at dispatch", and it is not — `max_splits` is simply
+// pushed, with nothing comparing it to the shader's array bound. The assertion below is
+// what actually holds that one.
+//
+// ponytail: fold these into build.rs alongside the split-K threshold when that lands.
+const MLA_HB: usize = 8;
+const MLA_TILE: usize = 16;
+const MLA_SUBW: usize = 32;
+const MLA_ACC_REGS: usize = 16;
+const MLA_MAX_SPLITS: usize = 16;
+const MLA_TARGET_BLOCKS: usize = 80;
+const MLA_MIN_TILES_PER_SPLIT: usize = 4;
+/// The static LDS bound the shader declares, in f32 columns. `attn.hip` sizes its tile
+/// dynamically; GLSL cannot, so the shader carries a fixed array and the launcher must
+/// reject anything that would not fit it.
+const MLA_MAX_ROPE: usize = 64;
+
+/// Bytes of `shared` the attention shader statically declares: `TILE*(MAX_KVL + MAX_ROPE)`
+/// f32. Checked against the device limit in [`Gpu::missing_features`], because this is the
+/// first allocation here to exceed Vulkan's guaranteed 16384.
+const MLA_ATTEND_LDS_BYTES: u32 =
+    (MLA_TILE * (MLA_ACC_REGS * MLA_SUBW + MLA_MAX_ROPE) * 4) as u32;
+
+/// `MLA_MAX_SPLITS` is ALSO a compile-time array bound inside `mla_attend_combine.comp`
+/// (`shared float w[MLA_MAX_SPLITS]`), which cannot read a push constant for its size. So
+/// raising it here alone would let `mla_plan_splits` return more splits than that array
+/// holds, and the combine would write `w[s]` out of bounds — clobbering `inv_l` and
+/// corrupting every head, with GPU-AV blind to it because it does not check shared-memory
+/// bounds. Raise both or neither.
+const _: () = assert!(
+    MLA_MAX_SPLITS == 16,
+    "MLA_MAX_SPLITS must match `shared float w[16]` in kernels/vk/mla_attend_combine.comp"
+);
+
+// The two couplings above that would produce WRONG NUMBERS rather than a slowdown, made
+// compile errors. They do not remove the duplication — the shader still spells HB and SUBW
+// itself — but they pin the two quantities whose disagreement is silent.
+//
+// GRID vs WORKGROUP. `launch_attend` dispatches `h/HB` workgroups and the shader declares
+// `local_size_x = HB*SUBW`. If the launcher's HB drifted below the shader's, the upper
+// heads would never be dispatched and their `clat` rows would keep their previous
+// contents; if it drifted above, the extra workgroups would read past `qabs`.
+const _: () = assert!(
+    MLA_HB * MLA_SUBW == BLOCK as usize,
+    "MLA_HB*MLA_SUBW must equal the shaders' workgroup size (ROWS_PER_BLOCK*WAVE)"
+);
+// SUBW vs WAVE. The shader has its own `#error` for this, but the launcher's split-plan
+// arithmetic assumes it too, and a mismatch there is not a compile error on that side.
+const _: () = assert!(
+    MLA_SUBW == WAVE as usize,
+    "MLA_SUBW must equal WAVE — SPIR-V subgroup ops have no width parameter"
+);
+
+/// f32 count for the split-KV partial scratch — allocate once per session, never per
+/// token. Mirrors `attn.hip::rivoli_mla_attend_scratch_floats` exactly, including its
+/// worst-case `MLA_MAX_SPLITS` sizing, so a Vulkan build's `gpu.rs` allocates the same
+/// buffer a ROCm build does.
+pub fn attend_scratch_floats(h: usize, kvl: usize) -> usize {
+    if h == 0 || kvl == 0 {
+        return 0;
+    }
+    MLA_MAX_SPLITS * h * (kvl + 2)
+}
+
+/// How the `nr` rows are cut across splits. A PURE FUNCTION of `(h, nr, have_scratch)`,
+/// transliterated from `attn.hip::mla_plan_splits`.
+///
+/// This is not a performance knob that happens to live here — the cut determines which
+/// rows each split reduces, hence the SUMMATION ORDER, hence the bits. Two backends that
+/// planned differently would produce different numbers on identical input while both
+/// looking correct, and no per-kernel oracle would notice because each would agree with
+/// its own reference. Greedy decode needs the same cut on both sides.
+fn mla_plan_splits(h: usize, nr: usize, have_scratch: bool) -> (usize, usize) {
+    let ntiles = nr.div_ceil(MLA_TILE);
+    let hblocks = h.div_ceil(MLA_HB);
+    let by_work = ntiles / MLA_MIN_TILES_PER_SPLIT;
+    let by_grid = MLA_TARGET_BLOCKS.div_ceil(hblocks);
+    let mut n = by_work.min(by_grid);
+    if n > MLA_MAX_SPLITS {
+        n = MLA_MAX_SPLITS;
+    }
+    if n < 1 || !have_scratch {
+        n = 1; // degenerate = exactly the pre-split path
+    }
+    let tps = ntiles.div_ceil(n);
+    (ntiles.div_ceil(tps), tps)
+}
+
+push_struct! {
+    /// Mirror of `mla_latent_attend.comp`'s push block.
+    MlaAttendPush {
+        qabs: u64,
+        qrope: u64,
+        lc8: u64,
+        lscale: u64,
+        rc: u64,
+        rows: u64,
+        clat: u64,
+        partial: u64,
+        h: i32,
+        nr: i32,
+        kvl: i32,
+        rope: i32,
+        n_blocks: i32,
+        scale: f32,
+        tps: i32,
+        max_splits: i32,
+    }
+}
+
+push_struct! {
+    /// Mirror of `mla_attend_combine.comp`'s push block.
+    MlaCombinePush {
+        partial: u64,
+        clat: u64,
+        h: i32,
+        kvl: i32,
+        n_splits: i32,
+        max_splits: i32,
+    }
+}
+
+/// MLA flash attention over the compressed KV cache. Same signature as `hip.rs`'s, so
+/// `gpu.rs` never learns which backend it called.
+///
+/// # Safety
+/// Device addresses of live [`Buf`]s, valid until the next [`device_sync`]: `qabs`
+/// (`h·kvl` f32), `qrope` (`h·rope` f32), `lc8` (`tokens·kvl` bytes), `lscale`
+/// (`tokens·n_blocks` f32), `rc` (`tokens·rope` u16), `rows` (`nr` u32, or null for
+/// dense), `clat` (`h·kvl` f32), `partial` ([`attend_scratch_floats`] f32, or null).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_attend(
+    qabs: *const f32,
+    qrope: *const f32,
+    lc8: *const u8,
+    lscale: *const f32,
+    rc: *const u16,
+    rows: *const u32,
+    h: usize,
+    nr: usize,
+    kvl: usize,
+    rope: usize,
+    n_blocks: usize,
+    scale: f32,
+    clat: *mut f32,
+    partial: *mut f32,
+) -> Result<()> {
+    // attn.hip's guard 1001.
+    ensure!(
+        h > 0 && nr > 0 && kvl > 0 && rope > 0 && n_blocks > 0,
+        "mla_attend: argument guard rejected"
+    );
+    // attn.hip's guard 1004, for the same reason: the accumulator is register-resident and
+    // indexed by k = (i - lane)/SUBW, and the tile load's `lscale[t*n_blocks + i/128]`
+    // needs kvl a multiple of 128 — kvl = 160 would satisfy %SUBW, give n_blocks = 1, and
+    // silently read the NEXT token's block scale for i in [128, 160).
+    ensure!(
+        kvl <= MLA_ACC_REGS * MLA_SUBW && kvl.is_multiple_of(128),
+        "mla_attend: kvl {kvl} must be a multiple of 128 and at most {}",
+        MLA_ACC_REGS * MLA_SUBW
+    );
+    // STRICTER THAN HIP, and the one place this backend restricts what the model may be.
+    // attn.hip sizes its LDS tile dynamically at launch; GLSL has no dynamic shared
+    // memory, so the shader declares a fixed array and `rope` must fit it. GLM uses 64.
+    // Rejecting loudly beats overrunning a shared array, which GPU-AV does not check.
+    ensure!(
+        rope <= MLA_MAX_ROPE,
+        "mla_attend: rope {rope} exceeds the Vulkan backend's static LDS tile ({MLA_MAX_ROPE}); \
+         attn.hip sizes this dynamically and has no such limit"
+    );
+    // The shaders read lc8 and rc as 32-bit words, so their bases must be word-aligned.
+    ensure_word_aligned(lc8 as u64, "mla_attend lc8")?;
+    ensure_word_aligned(rc as u64, "mla_attend rc")?;
+
+    let g = gpu()?;
+    let (n_splits, tps) = mla_plan_splits(h, nr, !partial.is_null());
+    // attn.hip passes a NULL `partial` to the kernel when the plan degenerates to one
+    // split, which is what selects the write-straight-to-clat path.
+    let part = if n_splits > 1 { partial as u64 } else { 0 };
+
+    let push = MlaAttendPush {
+        qabs: qabs as u64,
+        qrope: qrope as u64,
+        lc8: lc8 as u64,
+        lscale: lscale as u64,
+        rc: rc as u64,
+        rows: rows as u64,
+        clat: clat as u64,
+        partial: part,
+        h: h as i32,
+        nr: nr as i32,
+        kvl: kvl as i32,
+        rope: rope as i32,
+        n_blocks: n_blocks as i32,
+        scale,
+        tps: tps as i32,
+        max_splits: MLA_MAX_SPLITS as i32,
+    };
+    g.dispatch_2d(
+        &g.pipes.mla_latent_attend,
+        &push,
+        h.div_ceil(MLA_HB) as u32,
+        n_splits as u32,
+    )?;
+    if n_splits <= 1 {
+        return Ok(()); // attend wrote clat directly
+    }
+    let cpush = MlaCombinePush {
+        partial: partial as u64,
+        clat: clat as u64,
+        h: h as i32,
+        kvl: kvl as i32,
+        n_splits: n_splits as i32,
+        max_splits: MLA_MAX_SPLITS as i32,
+    };
+    g.dispatch(&g.pipes.mla_attend_combine, &cpush, h as u32)
 }

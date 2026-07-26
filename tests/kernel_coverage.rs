@@ -17,6 +17,21 @@
 //!
 //! Not feature-gated — the rule is about what the repo contains, not about what someone
 //! compiled.
+//!
+//! KNOWN LIMIT: A SHADER WITH NO LAUNCHER IS INVISIBLE HERE. This check is keyed on
+//! `pub unsafe fn launch_*` in `src/vk.rs`, so a `.comp` that exists, compiles, and passes
+//! every SPIR-V guard while having no launcher at all is not counted as uncovered — it is
+//! not counted at all. `kernel_coverage` going green says nothing about it.
+//!
+//! Deliberately not fixed, because that state is the legitimate transient during a port:
+//! shaders land before their launchers, and a check that failed on it would fire on every
+//! honest checkpoint until the tranche closed. Keying on the shader directory instead
+//! would trade a silent gap for a noisy one.
+//!
+//! What covers it is not mechanical: whoever commits shaders ahead of their launchers must
+//! SAY SO, and not let a green suite imply otherwise. Recorded here so the next reader
+//! knows the boundary of the claim rather than inferring a wider one — which is exactly
+//! the inference the `bf16f` note in `common.glsl` had to be rewritten to stop.
 #![allow(clippy::expect_used)]
 
 /// Kernels with no oracle, and why. An entry here costs an argument in a reviewable

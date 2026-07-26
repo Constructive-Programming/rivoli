@@ -387,6 +387,38 @@ not by anyone's care. `attn.hip:185`'s `acc[k]*corr + p*Lt[..]` is the first exp
 the port with two, and the first place the choice is real. Grep for that shape when
 approaching any remaining kernel.
 
+### A WORK PARTITION IS A NUMERICS DECISION. `mla_plan_splits` IS NOT A PERF KNOB.
+
+The one divergence class that lives BETWEEN kernels rather than inside one, which puts it
+outside the reach of every instrument this port has built.
+
+`attn.hip::mla_plan_splits` cuts the `nr` attended rows into `n_splits` chunks. It reads
+like tuning — it is derived from CU count and a work threshold, and its own comment
+describes occupancy. But the cut determines **which rows each split reduces**, therefore
+the summation order, therefore the bits. The HIP source says so in passing ("same context
+length → same cut → same summation order → bit-identical results"); the Vulkan port has to
+reproduce the function EXACTLY, not merely plausibly.
+
+**Why no existing instrument would catch a divergence here.** Each backend's per-kernel
+oracle models that backend's own plan, so each agrees with its own reference and both go
+green. The numbers differ only when the two are compared to each other — which nothing does
+until the token-ID gate. So a "harmless" retuning of either copy — bumping
+`MLA_TARGET_BLOCKS` for a new GPU, changing `MLA_MIN_TILES_PER_SPLIT` — is a **silent
+numerics change** that presents as a decode divergence months later, in a different file
+from the one that was edited.
+
+Guarded by `tests/vk.rs`'s attention oracle asserting a specific split count for its shape,
+so a drift in either copy fails loudly and locally. That is a weak guard for a strong
+hazard; it is what is available without a cross-backend harness.
+
+**The general shape, worth carrying to the remaining kernels:** *anything that partitions
+work and feeds an order-sensitive reduction is a numerics decision wearing a scheduling
+costume.* Candidates already in this codebase: `gemv_fp8`'s split-K threshold (a bare 4096
+literal on the Vulkan side, uncoupled from the HIP constant — the same defect, unfixed),
+`moe_reduce`'s expert batching, and any future change to `TILE` or `HB`. Ask of each: if I
+retuned this for speed, would the OUTPUT change? If yes, it is single-sourced or it is a
+bug waiting for a profiler.
+
 Two of these have mechanised guards (rules 2 and 9) and one is preventive (rule 11).
 The rest are checked by reading, which is why the list exists.
 
@@ -891,6 +923,9 @@ Each phase ends with something runnable; no phase leaves the tree broken.
    `attn` → `moe`. Exit: the 16 ported kernels' oracles green.
 4. **Integration** — `backend.rs` switch, `pin.rs`/`gpu.rs` imports, end-to-end decode
    on the 4-layer stub, then the full artifact. Exit: coherent output.
+
+   **READ "Phase 4 needs two queues, not one" BELOW FIRST.** The exit criterion above is
+   insufficient on its own, and the seam is smaller than it looks.
 5. **Bench + profiling** — timestamp query pools wired into `telemetry.rs`, then compare
    against HIP on the same artifact. Expect the first port to be slower; record where,
    do not tune during the port.
@@ -899,6 +934,82 @@ Each phase ends with something runnable; no phase leaves the tree broken.
 PILOT and `top-m` attack a bottleneck we have quantified, while this buys portability
 we do not currently need on a node where ROCm works. Build it when the portability goal
 is real, not because the plan exists.
+
+## Phase 4 needs two queues, not one — and the acceptance gate cannot see it
+
+Written before integration starts, because the failure it describes is invisible to every
+check this port has: **the token-ID gate passes a backend that is three times slower.**
+
+### The streaming layer is not ported, and has not strayed only because it does not exist
+
+Verified rather than assumed: `gpu.rs`, `pin.rs`, `asyncfetch.rs`, `gpustream.rs` and
+`stream.rs` all carry `#![cfg(feature = "rocm")]`, so a Vulkan build compiles none of
+them. That is correct for phases 1–3 and is the whole reason the architecture has not
+drifted. It also means every claim below is about work not yet begun.
+
+### The seam is smaller than `backend.rs` claims, in two ways
+
+1. **`crate::backend` has no consumers at all.** `gpu.rs` imports `crate::hip::{...}`;
+   `pin.rs` imports `crate::hip::memcpy_dtod`. A grep for `crate::backend` returns only
+   that file's own doc comment. The waist is built and nothing goes through it.
+2. **The `launch_*` surface is not the boundary.** `gpu.rs` and `asyncfetch.rs` import
+   `crate::gpustream::{HipStream, HipEvent, Signal, stream_signal}` DIRECTLY, and
+   `HipStream` has no Vulkan analogue. Re-exporting `vk::*` from `backend.rs` cannot
+   supply a stream abstraction that does not exist.
+
+Both corrected in `backend.rs`'s own comment, which previously promised that swapping
+backends was "a cargo flag and nothing else."
+
+### The performance property lives in the CONCURRENCY, and vk.rs has none
+
+The engine's headline behaviour — fetch ~95% hidden behind compute (`benchmarks.md`) —
+comes from **two independent streams**:
+
+| piece | where |
+|---|---|
+| the reaper's dedicated fetch stream | `asyncfetch.rs`, `HipStream::new()` in `AsyncFetch::new` |
+| the MoE expert compute stream | `gpu.rs`, `compute_stream`, explicitly "separate from the null stream the rest of the forward uses" |
+| the driver that races them | `gpu.rs`, `try_for_each_concurrent` over the expert descriptors |
+
+`vk.rs` today is **one queue behind one `Mutex<Cmd>`**, documented as mirroring "HIP's
+default stream". Integrating onto that serialises fetch against compute.
+
+**And the acceptance gate would not notice.** Token IDs depend on arithmetic, not on
+overlap; a fully serialised backend computes exactly the same numbers. So the gate this
+document spent pages sharpening — identical token IDs, greedy decode, pinned conditions —
+passes a build whose central performance property has collapsed. **Phase 4 therefore needs
+a throughput criterion alongside it: measure fetch-hidden % and tok/s, and compare against
+the ROCm numbers in `benchmarks.md` at matched `--max-mem` and `--cache-policy`.** A
+correctness gate cannot certify a concurrency structure, and this is the clearest case in
+the project of a green check meaning less than it appears to.
+
+### The hardware permits the honest fix, and it merges with a deferred item
+
+Measured on this device (`vulkaninfo`, families with their queue counts):
+
+| family | queues | flags |
+|---|---:|---|
+| 0 | 1 | GRAPHICS \| COMPUTE \| TRANSFER \| SPARSE |
+| 1 | **4** | **COMPUTE \| TRANSFER \| SPARSE** (compute-only) |
+| 2–4 | 1 each | video decode / video encode / sparse binding |
+
+`Gpu::create_device` already selects the compute-only family — `compute(f) && !GRAPHICS`,
+which is family 1 — and requests exactly one queue from it (`prio = [1.0f32]`). **So the
+second queue needs no new family-selection logic: ask for two priorities instead of one.**
+HIP's two streams map onto two queues from the family already chosen, ordered by the
+timeline semaphore that is already built and measured (19.28 µs/signal).
+
+This also supplies the forcing function for the item deferred in phase 2: `Gpu::signal`
+covers work already SUBMITTED, not work merely recorded, because there is a single command
+buffer. A second queue needs its own recording state anyway, so **the command-buffer ring
+and the second queue are one design, not two** — which is the argument for doing them
+together rather than bolting the ring on later.
+
+**Design this on paper before writing integration code.** The open questions are: how
+`Cmd` splits (two independent `Mutex<Cmd>`, or one struct owning two), which queue the
+transfer path uses given family 1 also carries TRANSFER, where the timeline semaphore
+values are allocated so cross-queue ordering stays monotonic, and whether `device_sync`
+joins both queues or only the compute one.
 
 ## Risks
 

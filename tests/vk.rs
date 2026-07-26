@@ -43,7 +43,7 @@ use rivoli::math::{E4M3_BLOCK, E4M3_MAX, e4m3_to_f32, f32_to_bf16, f32_to_e4m3, 
 use rivoli::vk::{
     Buf, ROWS_PER_BLOCK, VALIDATION_ERRORS, device_sync, gpu, launch_append_kv, launch_argmax,
     launch_embed_i8_row, launch_gather_rope, launch_gemv_f32, launch_gemv_fp8, launch_gemv_i8,
-    launch_mla_absorb_fp8, launch_mla_value_fp8, launch_rmsnorm, launch_rope,
+    launch_attend, launch_mla_absorb_fp8, launch_mla_value_fp8, launch_rmsnorm, launch_rope,
     launch_swiglu, launch_vadd, memcpy_dtod,
 };
 use std::sync::atomic::Ordering;
@@ -2360,6 +2360,358 @@ fn mla_absorb_fp8_matches_the_host_oracle() {
     assert_close(&want, &got_f, "mla_absorb_fp8 h3 kvl37 nope8");
     assert_bit_identical(&want, &got_f, "mla_absorb_fp8");
     v.check("mla_absorb_fp8_matches_the_host_oracle");
+}
+
+// ---------------------------------------------------------------------------
+// attn.hip: MLA flash attention.
+//
+// THE ORACLE SPLITS AT THE `exp` BOUNDARY, and that is a decision recorded in
+// docs/VULKAN.md before this code was written. Everything upstream of the first `exp` is
+// ordinary arithmetic and gets BIT-EXACT treatment; everything downstream cannot, because
+// Rust's `exp` and GLSL's `exp` are different functions and no care closes that. Since a
+// tolerance is categorically blind to reordering (see `assert_bit_identical`), accepting
+// one across the whole kernel would have left the score reduction's ordering — the biggest
+// hazard in the kernel — untested. Splitting keeps it testable.
+// ---------------------------------------------------------------------------
+
+const ATT_HB: usize = 8;
+const ATT_TILE: usize = 16;
+const ATT_MAX_SPLITS: usize = 16;
+const ATT_MIN_TILES_PER_SPLIT: usize = 4;
+const ATT_TARGET_BLOCKS: usize = 80;
+
+/// `attn.hip::mla_plan_splits`, transliterated. The cut fixes which rows each split
+/// reduces, so it fixes the summation order and therefore the bits.
+fn att_plan(h: usize, nr: usize, have_scratch: bool) -> (usize, usize) {
+    let ntiles = nr.div_ceil(ATT_TILE);
+    let hblocks = h.div_ceil(ATT_HB);
+    let by_work = ntiles / ATT_MIN_TILES_PER_SPLIT;
+    let by_grid = ATT_TARGET_BLOCKS.div_ceil(hblocks);
+    let mut n = by_work.min(by_grid).min(ATT_MAX_SPLITS);
+    if n < 1 || !have_scratch {
+        n = 1;
+    }
+    let tps = ntiles.div_ceil(n);
+    (ntiles.div_ceil(tps), tps)
+}
+
+/// The staged tile, widened exactly as the shader widens it: latent fp8 × its per-128
+/// block scale, roped key bf16 → f32. `exp`-free, so this part is bit-exact.
+fn att_widen(
+    lc8: &[u8],
+    lscale: &[f32],
+    rc: &[u16],
+    t: usize,
+    kvl: usize,
+    rope: usize,
+    n_blocks: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let l: Vec<f32> = (0..kvl)
+        .map(|i| e4m3_to_f32(lc8[t * kvl + i]) * lscale[t * n_blocks + i / 128])
+        .collect();
+    let r: Vec<f32> = (0..rope).map(|d| f32::from_bits((rc[t * rope + d] as u32) << 16)).collect();
+    (l, r)
+}
+
+/// One split's online-softmax pass, returning its unnormalised accumulator and (m, l).
+///
+/// The per-lane score partials and the halving ladder are modelled explicitly, for the
+/// same reason `mla_value_oracle` models them: a left-to-right sum is a different number.
+/// The accumulator update reproduces the FORCED contraction — a plain multiply for
+/// `acc*corr`, a fused multiply-add for `p*Lt` — matching what the shader now spells with
+/// an explicit `fma`, and what hipcc's ISA shows.
+#[allow(clippy::too_many_arguments)]
+fn att_split(
+    qa: &[f32],
+    qr: &[f32],
+    lc8: &[u8],
+    lscale: &[f32],
+    rc: &[u16],
+    rows: Option<&[u32]>,
+    r_begin: usize,
+    r_end: usize,
+    kvl: usize,
+    rope: usize,
+    n_blocks: usize,
+    scale: f32,
+) -> (Vec<f32>, f32, f32) {
+    let mut acc = vec![0.0f32; kvl];
+    let mut m = f32::NEG_INFINITY;
+    let mut l = 0.0f32;
+
+    let mut t0 = r_begin;
+    while t0 < r_end {
+        let tcount = ATT_TILE.min(r_end - t0);
+        for tt in 0..tcount {
+            let t = rows.map_or(t0 + tt, |r| r[t0 + tt] as usize);
+            let (lt, rt) = att_widen(lc8, lscale, rc, t, kvl, rope, n_blocks);
+
+            // Per-lane strided partials: kvl first, then rope, into the SAME accumulator,
+            // in that order — as the two loops in attn.hip do.
+            // FUSED, for the same measured reason as `oracle_fp8_dot_strided`: the driver
+            // contracts `part += a*b` into an FMA below SPIR-V, and hipcc does too. This
+            // loop models the strided ORDER; modelling the order while dropping the
+            // GROUPING would leave the oracle disagreeing with the shader in the low bits
+            // of every score — invisible under `assert_close`, and a spurious failure for
+            // whoever later tries to widen the bit-exact assertion past nr = 1.
+            let mut lanes = [0.0f32; ORACLE_WAVE];
+            for (lane, part) in lanes.iter_mut().enumerate() {
+                let mut i = lane;
+                while i < kvl {
+                    *part = qa[i].mul_add(lt[i], *part);
+                    i += ORACLE_WAVE;
+                }
+                let mut d = lane;
+                while d < rope {
+                    *part = qr[d].mul_add(rt[d], *part);
+                    d += ORACLE_WAVE;
+                }
+            }
+            let s = oracle_wave_sum(lanes) * scale;
+
+            let m_new = m.max(s);
+            let corr = (m - m_new).exp();
+            let p = (s - m_new).exp();
+            for (i, a) in acc.iter_mut().enumerate() {
+                *a = p.mul_add(lt[i], *a * corr);
+            }
+            l = l.mul_add(corr, p);
+            m = m_new;
+        }
+        t0 += ATT_TILE;
+    }
+    (acc, m, l)
+}
+
+/// CPU oracle for the whole attention, splits and all.
+#[allow(clippy::too_many_arguments)]
+fn attend_oracle(
+    qabs: &[f32],
+    qrope: &[f32],
+    lc8: &[u8],
+    lscale: &[f32],
+    rc: &[u16],
+    rows: Option<&[u32]>,
+    h: usize,
+    nr: usize,
+    kvl: usize,
+    rope: usize,
+    n_blocks: usize,
+    scale: f32,
+    have_scratch: bool,
+) -> Vec<f32> {
+    let (n_splits, tps) = att_plan(h, nr, have_scratch);
+    let mut clat = vec![0.0f32; h * kvl];
+    for head in 0..h {
+        let qa = &qabs[head * kvl..][..kvl];
+        let qr = &qrope[head * rope..][..rope];
+        let mut parts = Vec::new();
+        for s in 0..n_splits {
+            let r_begin = s * tps * ATT_TILE;
+            let r_end = nr.min(r_begin + tps * ATT_TILE);
+            parts.push(att_split(
+                qa, qr, lc8, lscale, rc, rows, r_begin, r_end, kvl, rope, n_blocks, scale,
+            ));
+        }
+        if n_splits == 1 {
+            let (acc, _, l) = &parts[0];
+            let inv = if *l > 0.0 { 1.0 / *l } else { 0.0 };
+            for i in 0..kvl {
+                clat[head * kvl + i] = acc[i] * inv;
+            }
+            continue;
+        }
+        // The combine: ascending split order in both reductions, as the kernel does.
+        let m_g = parts.iter().fold(f32::NEG_INFINITY, |a, (_, m, _)| a.max(*m));
+        let finite = !m_g.is_infinite() && !m_g.is_nan();
+        let w: Vec<f32> = parts
+            .iter()
+            .map(|(_, m, _)| if finite { (*m - m_g).exp() } else { 0.0 })
+            .collect();
+        let mut l_g = 0.0f32;
+        for (s, (_, _, l)) in parts.iter().enumerate() {
+            l_g = l.mul_add(w[s], l_g);
+        }
+        let inv = if l_g > 0.0 { 1.0 / l_g } else { 0.0 };
+        for i in 0..kvl {
+            let mut sum = 0.0f32;
+            for (s, (acc, _, _)) in parts.iter().enumerate() {
+                sum = acc[i].mul_add(w[s], sum);
+            }
+            clat[head * kvl + i] = sum * inv;
+        }
+    }
+    clat
+}
+
+/// Inputs for the attention tests: `(qabs, qrope, lc8, lscale, rc)`.
+type AttInputs = (Vec<f32>, Vec<f32>, Vec<u8>, Vec<f32>, Vec<u16>);
+
+fn att_inputs(
+    seed: u64,
+    h: usize,
+    tokens: usize,
+    kvl: usize,
+    rope: usize,
+    n_blocks: usize,
+) -> AttInputs {
+    let mut r = Lcg(seed);
+    let qabs: Vec<f32> = (0..h * kvl).map(|_| r.f()).collect();
+    let qrope: Vec<f32> = (0..h * rope).map(|_| r.f()).collect();
+    let lc8: Vec<u8> = (0..tokens * kvl).map(|_| f32_to_e4m3(r.f())).collect();
+    let lscale: Vec<f32> = (0..tokens * n_blocks).map(|_| (r.f() * 0.1).abs() + 0.01).collect();
+    let rc: Vec<u16> = (0..tokens * rope).map(|_| f32_to_bf16(r.f())).collect();
+    (qabs, qrope, lc8, lscale, rc)
+}
+
+/// Dispatch the attention and read back `clat`.
+#[allow(clippy::too_many_arguments)]
+fn run_attend(
+    qabs: &[f32],
+    qrope: &[f32],
+    lc8: &[u8],
+    lscale: &[f32],
+    rc: &[u16],
+    h: usize,
+    nr: usize,
+    kvl: usize,
+    rope: usize,
+    n_blocks: usize,
+    scale: f32,
+    with_scratch: bool,
+) -> Vec<f32> {
+    let rcb: Vec<u8> = rc.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let (qb, rb) = (dev(&f32b(qabs)), dev(&f32b(qrope)));
+    let (lb, sb, kb) = (dev(lc8), dev(&f32b(lscale)), dev(&rcb));
+    let mut out = poison(h * kvl * 4 + GUARD);
+    let mut scratch = with_scratch.then(|| {
+        Buf::new(rivoli::vk::attend_scratch_floats(h, kvl) * 4).expect("scratch")
+    });
+    let pp = scratch
+        .as_mut()
+        .map_or(std::ptr::null_mut(), |b| b.ptr_mut() as *mut f32);
+    // SAFETY: every buffer is live and of the documented size; `rows` is null (dense).
+    unsafe {
+        launch_attend(
+            qb.ptr() as *const f32,
+            rb.ptr() as *const f32,
+            lb.ptr(),
+            sb.ptr() as *const f32,
+            kb.ptr() as *const u16,
+            std::ptr::null(),
+            h,
+            nr,
+            kvl,
+            rope,
+            n_blocks,
+            scale,
+            out.ptr_mut() as *mut f32,
+            pp,
+        )
+        .expect("launch");
+    }
+    device_sync().expect("sync");
+    let got = readb(&out, h * kvl * 4 + GUARD);
+    assert_untouched(&got, h * kvl * 4, "mla_attend");
+    f32v(&got[..h * kvl * 4])
+}
+
+/// The `exp`-FREE HALF, ASSERTED BIT-EXACTLY.
+///
+/// At `nr = 1` the softmax is degenerate: `m` starts at −inf so `m_new = s`. The output
+/// becomes the widened latent row, which isolates the tile widening — `e4m3(Lc8) × Lscale`,
+/// the whole fp8 decode path — and pins it bit for bit.
+///
+/// THE ARGUMENT, PRECISELY, because a sloppier version of it named the wrong dependency.
+/// `corr = exp(m − m_new)` is IRRELEVANT whatever it evaluates to: `acc` and `l` both start
+/// at zero, so `acc*corr` is zero for any finite `corr` and `l = fma(l, corr, p)` collapses
+/// to `p`. What the test actually rests on is `p = exp(0)` being exactly `1.0` — the shader
+/// computes `fma(p, Lt, 0) = p·Lt`, then `inv = 1/p`, then writes `(p·Lt)·(1/p)`, and those
+/// three roundings cancel only at `p == 1.0` exactly. At `1.0 + 1 ulp` they do not.
+///
+/// GLSL specifies `exp` to 3 ULP and says nothing about `exp(0)`, so this is an OBSERVED
+/// property of this driver, not a guarantee. It holds everywhere anyone has looked, and the
+/// failure would be loud rather than silent — but `assert_bit_identical`'s message tells the
+/// reader to investigate the shader's order, grouping or contraction, which would be the
+/// wrong file. Hence stating the real dependency here.
+///
+/// It does NOT cover the score reduction: with one row the score cannot influence the
+/// output at all. That gap is stated rather than papered over, and it is why the tolerance
+/// test below still matters.
+#[test]
+fn attend_tile_widening_is_bit_exact() {
+    let v = Validation::new();
+    let (h, nr, kvl, rope) = (3usize, 1usize, 128usize, 64usize);
+    let n_blocks = kvl / 128;
+    let (qabs, qrope, lc8, lscale, rc) = att_inputs(0xA77, h, nr, kvl, rope, n_blocks);
+    let want =
+        attend_oracle(&qabs, &qrope, &lc8, &lscale, &rc, None, h, nr, kvl, rope, n_blocks, 0.125, false);
+    let got =
+        run_attend(&qabs, &qrope, &lc8, &lscale, &rc, h, nr, kvl, rope, n_blocks, 0.125, false);
+    assert_close(&want, &got, "attend widening h3 kvl128 nr1");
+    assert_bit_identical(&want, &got, "mla_latent_attend (nr=1, exp-free)");
+    v.check("attend_tile_widening_is_bit_exact");
+}
+
+/// The full attention, at tolerance because the answer is downstream of `exp`.
+///
+/// `nr = 128` and `h = 8` drive the split planner to TWO splits, so `mla_attend_combine`
+/// runs — a single-split shape would leave that kernel unexecuted while the suite went
+/// green. The single-split path is covered by the bit-exact test above.
+///
+/// `kvl = 512` IS THE PRODUCTION SHAPE AND IT COVERS AN INDEX NOTHING ELSE DOES. It is the
+/// GLM `kv_lora_rank`, it fills all 16 `acc` registers, it fills the static LDS tile, and
+/// — the reason it is here — it makes `n_blocks = 4`, so the tile load's
+/// `Lscale[t*n_blocks + i/128]` actually VARIES with `i`. At kvl = 128 that term is
+/// identically zero and a wrong block-scale index inside a token row would be invisible.
+#[test]
+fn attend_matches_the_host_oracle() {
+    let v = Validation::new();
+    let (h, nr, kvl, rope) = (8usize, 128usize, 512usize, 64usize);
+    let n_blocks = kvl / 128;
+    let (qabs, qrope, lc8, lscale, rc) = att_inputs(0xA78, h, nr, kvl, rope, n_blocks);
+    // The plan must agree with the launcher's, or the two are reducing different rows.
+    assert_eq!(att_plan(h, nr, true).0, 2, "shape must exercise the split combine");
+    let want =
+        attend_oracle(&qabs, &qrope, &lc8, &lscale, &rc, None, h, nr, kvl, rope, n_blocks, 0.125, true);
+    let got =
+        run_attend(&qabs, &qrope, &lc8, &lscale, &rc, h, nr, kvl, rope, n_blocks, 0.125, true);
+    assert_close(&want, &got, "attend h8 nr128 kvl512 splits2 nblocks4");
+    v.check("attend_matches_the_host_oracle");
+}
+
+/// `launch_attend`'s guards, including the one this backend adds.
+#[test]
+fn attend_guards_reject_degenerate_arguments() {
+    let v = Validation::new();
+    let src = dev(&[0u8; 8192]);
+    let mut dst = dev(&[0u8; 8192]);
+    let (p, q) = (src.ptr(), dst.ptr_mut());
+
+    // SAFETY: every case is rejected before a pointer is dereferenced.
+    unsafe {
+        let att = |h: usize, nr: usize, kvl: usize, rope: usize, nb: usize, lc8: *const u8| {
+            launch_attend(
+                p as *const f32, p as *const f32, lc8, p as *const f32, p as *const u16,
+                std::ptr::null(), h, nr, kvl, rope, nb, 0.125, q as *mut f32, std::ptr::null_mut(),
+            )
+        };
+        assert!(att(0, 1, 128, 64, 1, p).is_err(), "attend h = 0");
+        assert!(att(1, 0, 128, 64, 1, p).is_err(), "attend nr = 0");
+        assert!(att(1, 1, 0, 64, 1, p).is_err(), "attend kvl = 0");
+        assert!(att(1, 1, 128, 0, 1, p).is_err(), "attend rope = 0");
+        assert!(att(1, 1, 128, 64, 0, p).is_err(), "attend n_blocks = 0");
+        // kvl must be a multiple of 128: 160 would satisfy %SUBW, give n_blocks = 1, and
+        // silently read the NEXT token's block scale for i in [128, 160).
+        assert!(att(1, 1, 160, 64, 1, p).is_err(), "attend kvl not a multiple of 128");
+        assert!(att(1, 1, 640, 64, 5, p).is_err(), "attend kvl over the register cap");
+        // STRICTER THAN HIP: the static LDS tile bounds rope, where attn.hip sizes it
+        // dynamically. Deliberately this backend's own limit, so it gets its own case.
+        assert!(att(1, 1, 128, 128, 1, p).is_err(), "attend rope over the static LDS tile");
+        assert!(att(1, 1, 128, 64, 1, p.add(1)).is_err(), "attend lc8 not word-aligned");
+    }
+    device_sync().expect("sync");
+    v.check("attend_guards_reject_degenerate_arguments");
 }
 
 /// Both MLA launchers' argument guards, mirroring `mla.hip`'s 1001/1003 arms plus this

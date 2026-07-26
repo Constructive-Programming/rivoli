@@ -43,8 +43,11 @@
 // at compile time by a limit that already exists. rope gets its own bound, which IS a
 // restriction the HIP lacks — see the launcher.
 //
-// 16*512 + 16*64 = 9216 floats = 36864 bytes, against the 65536 this device reports and
-// the 65536 the HIP launcher's own guard 1002 assumes. Checked at init, not assumed.
+// 16*512 + 16*64 = 9216 floats = 36864 bytes. This device reports 65536, but Vulkan only
+// GUARANTEES 16384, so this is the first shader here that a conformant device could legally
+// refuse — every earlier one fits in 1-2 KB. `Gpu::missing_features` checks
+// maxComputeSharedMemorySize against MLA_ATTEND_LDS_BYTES at init so the refusal is a named
+// message rather than an opaque pipeline-creation failure.
 #define MLA_MAX_KVL (MLA_ACC_REGS * SUBW)
 #define MLA_MAX_ROPE 64
 

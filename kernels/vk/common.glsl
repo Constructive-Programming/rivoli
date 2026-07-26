@@ -73,9 +73,16 @@ float wave_max(float v) {
 // the finite domain; append_kv's roped keys are compared as BYTES against it.
 //
 // Non-finite keeps its top 16 bits verbatim, matching common.hpp — an RNE carry could
-// turn a NaN into an Inf. Note this DIVERGES from math.rs for NaN, which goes through
-// half::bf16::from_f32 and forces the quiet bit. The divergence predates the port and
-// the rule is to mirror HIP, not math.rs (docs/VULKAN.md, "Numerics").
+// turn a NaN into an Inf.
+//
+// BOTH DIRECTIONS DIVERGE FROM math.rs ON NaN, and saying so explicitly matters: an
+// earlier version of this note described only the encode side, which implicitly cleared
+// the decode side, and that implication was false. The `half` crate forces the quiet bit
+// in BOTH `bf16::from_f32` (here) and `bf16::to_f32` (see bf16f below, where a signalling
+// NaN like 0x7f81 decodes to 0x7fc1_0000 through math.rs and 0x7f81_0000 through HIP).
+// The rule is the same for both and is what actually matters: mirror HIP, not math.rs,
+// because the two BACKENDS are what must agree (docs/VULKAN.md, "Numerics"). The
+// divergence from math.rs predates this port in both directions.
 uint f2bf16(float x) {
     uint b = floatBitsToUint(x);
     if ((b & 0x7f800000u) == 0x7f800000u) return b >> 16; // inf/nan: verbatim
