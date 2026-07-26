@@ -27,7 +27,19 @@
 
 #define THREADS (ROWS_PER_BLOCK * WAVE)
 #define KV_BLOCK 128
-#define MAX_BLOCKS 8   // kvl <= 1024, enforced by the launcher's argument guard
+#define MAX_BLOCKS ROWS_PER_BLOCK
+
+// One 128-element block per SUBGROUP, so the workgroup must have at least as many
+// subgroups as there are blocks: gl_NumSubgroups == THREADS/WAVE == ROWS_PER_BLOCK, and
+// the launcher caps kvl at MAX_BLOCKS*KV_BLOCK. Lower ROWS_PER_BLOCK (a real tuning
+// knob — a device with maxComputeWorkGroupInvocations of 128 would need 4) and the top
+// subgroups simply would not exist: sscale[4..7] never written (Vulkan does not
+// zero-initialise shared memory), the quantize loop divides by garbage, and
+// lscale[pos*8+4..] never written at all. No fault, no validation message, wrong KV
+// cache. The launcher's cap is derived from MAX_BLOCKS for the same reason.
+#if MAX_BLOCKS * KV_BLOCK != 1024
+#error "append_kv: ROWS_PER_BLOCK*128 != 1024 — update the launcher's kvl cap in src/vk.rs to match, then delete this check"
+#endif
 
 layout(local_size_x = THREADS) in;
 
@@ -43,6 +55,15 @@ layout(push_constant) uniform Push {
     int kvl;
     int ropn;
     int n_blocks;
+    // e4m3's maximum, 448. A PUSH CONSTANT rather than a literal, and that is a
+    // correctness fix, not a style choice: written as `a / 448.0`, glslc -O rewrote the
+    // divide into `a * 0.00223214296` (= fl(1/448)), which differs from a true IEEE
+    // divide by 1 ULP for 55% of inputs. hipcc gets -O3 with no -ffast-math and keeps a
+    // real fdiv, so the two backends' block scales diverged — against the whole premise
+    // that they stay numerically identical. A runtime operand cannot be folded into a
+    // reciprocal. Sourced from math.rs::E4M3_MAX so the constant has one definition.
+    float e4m3_max;
+    uint _pad;
 } pc;
 
 shared float sscale[MAX_BLOCKS];
@@ -65,7 +86,7 @@ void main() {
     if (lane == 0u && b < uint(pc.n_blocks)) {
         // amax == 0 -> scale 1.0, not 0: an all-zero block must quantize to zeros
         // rather than divide by zero.
-        float scl = a > 0.0 ? a / 448.0 : 1.0;
+        float scl = a > 0.0 ? a / pc.e4m3_max : 1.0;
         sscale[b] = scl;
         pc.lscale.v[uint(pc.pos) * uint(pc.n_blocks) + b] = scl;
     }

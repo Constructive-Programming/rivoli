@@ -21,6 +21,14 @@
 
 #define ARGMAX_THREADS (ROWS_PER_BLOCK * WAVE)
 
+// The LDS tree halves ARGMAX_THREADS down to 1, which only visits every slot if the
+// count is a POWER OF TWO. At 192 threads (ROWS_PER_BLOCK=6) the ladder runs
+// 96,48,24,12,6,3,1 and silently drops sval[2] — a wrong sampled token, with no numeric
+// smell, which is exactly the failure this shader's header warns about.
+#if (ARGMAX_THREADS & (ARGMAX_THREADS - 1)) != 0
+#error "argmax_reduce: ROWS_PER_BLOCK*WAVE must be a power of two — the LDS halving tree drops slots otherwise"
+#endif
+
 layout(local_size_x = ARGMAX_THREADS) in;
 
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer RwI32 { int v[]; };

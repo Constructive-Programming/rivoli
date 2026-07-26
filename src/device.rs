@@ -513,16 +513,26 @@ mod vktier {
         /// startup, and means a caller cannot end up holding a device address for bytes
         /// that were never written.
         ///
-        /// The cursor advances by `bytes.len()` rounded up to [`crate::vk::WORD`], so a
-        /// shader's 32-bit read of a placement's final byte cannot reach into the NEXT
-        /// placement's data. `Buf::new` handles the same hazard at the end of the slab;
-        /// this handles it between placements, and both are needed.
+        /// The cursor advances by `bytes.len()` rounded up to [`crate::vk::WORD`].
         ///
-        /// Enforced here rather than documented as a precondition because `place` is the
-        /// only way to obtain a tier pointer — `reserve` is private — so there is one
-        /// choke point and no rule for a caller to remember. Vulkan-only: HIP reads
-        /// bytes directly, and shifting the ROCm arena's offsets for a Vulkan-specific
-        /// hazard would be a behaviour change for no reason.
+        /// BELT, NOT BRACES — and the earlier version of this comment overstated it.
+        /// It claimed the padding is what stops one placement's 32-bit read reaching
+        /// into the next placement's data. It is not: `off` is already rounded to 256,
+        /// so `round_up_256(off + len) == round_up_256(off + span)` for every `len`
+        /// (the gap is at most 3), and the returned addresses are byte-identical with
+        /// and without this rounding. The end-of-slab case is likewise already covered
+        /// by `Buf::new` allocating `capacity.next_multiple_of(WORD)`.
+        ///
+        /// So today this changes nothing observable, and it is kept for one reason: it
+        /// makes the invariant hold on `span` rather than on the 256-byte alignment
+        /// happening to be larger than a word. Anyone lowering that alignment — a
+        /// plausible tightening, since 256 is generous for f32 weights — would
+        /// otherwise turn a benign read into a live overrun into the next placement's
+        /// bytes. Cheap insurance against a change that would look safe.
+        ///
+        /// Vulkan-only: HIP reads bytes directly and has no word-read hazard, so
+        /// shifting the ROCm arena's offsets for this would be a real behaviour change
+        /// for nothing.
         ///
         /// Errors if the tier is full — the pin is sized to fit, so OOM here is a
         /// budgeting bug, not a runtime condition.

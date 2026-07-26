@@ -555,14 +555,18 @@ is real, not because the plan exists.
   deliberately ragged `hidden = 37`, and only because it ran under a checker known to
   work.
 
-  Fixed at two choke points rather than by a documented precondition: `vk::Buf::new`
-  rounds every allocation up to `WORD` (reporting the unpadded `len`, so no downstream
-  bounds check starts permitting real overrun), and Vulkan's `DeviceTier::place` pads
-  its cursor so one placement's word-read cannot reach into the next placement's data.
-  Both are needed — the first covers a buffer's end, the second the gap between
-  placements. No launcher assert: `launch_embed_i8_row` never receives a length, and the
-  nearest checkable condition (`hidden % 4 == 0`) would have banned the ragged oracle
-  that found the bug.
+  Fixed by `vk::Buf::new` rounding every allocation up to `WORD`, reporting the unpadded
+  `len` so no downstream bounds check starts permitting real overrun. That is the fix;
+  `DeviceTier::place`'s matching cursor padding is belt-and-braces and an earlier
+  version of this section overstated it as load-bearing. It is not: `place` already
+  rounds offsets to 256, so the padding changes no address today. It is kept so the
+  invariant rests on the padding rather than on 256 happening to exceed a word — a
+  future tightening of that alignment would otherwise turn a benign read into a live
+  overrun between placements.
+
+  No launcher assert: `launch_embed_i8_row` never receives a length, and the nearest
+  checkable condition (`hidden % 4 == 0`) would have banned the ragged oracle that found
+  the bug.
 
   Note that `VALIDATION-SETTINGS` and `WARNING-Setting-Limit-Adjusted` are the layer
   describing its OWN configuration (GPU-AV forcing `vulkanMemoryModel` on so it can

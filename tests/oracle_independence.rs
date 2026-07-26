@@ -34,8 +34,27 @@ const ALLOWED: &[&str] = &["glsl_numerics.rs"];
 /// Assembled at runtime rather than written as one literal, so this file does not trip
 /// its own check and need a second allowlist entry that would blunt the "one exception"
 /// framing.
+///
+/// A literal `/`, NOT `MAIN_SEPARATOR`. Paths in Rust source are written with forward
+/// slashes on every platform, so keying off the host separator would make this silently
+/// match nothing on Windows — a tripwire that disarms itself rather than failing is the
+/// exact shape this file exists to prevent.
 fn shader_dir_needle() -> String {
-    format!("kernels{}vk", std::path::MAIN_SEPARATOR)
+    format!("kernels{}vk", '/')
+}
+
+/// Every `.rs` file under `dir`, recursively. Non-recursive scanning would make a
+/// `tests/oracles/` submodule invisible, which is a normal way for a test suite to grow.
+fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            rs_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
 }
 
 #[test]
@@ -48,16 +67,21 @@ fn oracles_do_not_reference_the_shaders() {
         .unwrap_or("")
         .to_string();
 
+    // tests/ ONLY, recursively. Scanning src/ was tried and reverted: `src/vk.rs` is
+    // the backend and legitimately names `kernels/vk/` in its module doc, so including
+    // src/ turns the tripwire into a false-positive generator — and a check that cries
+    // wolf gets deleted. KNOWN LIMIT, stated rather than papered over: an oracle placed
+    // in a `#[cfg(test)] mod tests` inside src/ is outside this check's reach. The rule
+    // still applies there; only the enforcement stops at the directory boundary.
+    let mut files = Vec::new();
+    rs_files(std::path::Path::new(dir), &mut files);
+
     let mut scanned = Vec::new();
-    for entry in std::fs::read_dir(dir).expect("read tests/") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().is_none_or(|e| e != "rs") {
-            continue;
-        }
+    for path in files {
         let name = path
             .file_name()
             .and_then(|s| s.to_str())
-            .expect("utf-8 filename")
+            .unwrap_or_default()
             .to_string();
         // The scanner excludes ITSELF structurally, not by allowlist — it is not an
         // oracle, and listing it would imply the rule has two exceptions when it has

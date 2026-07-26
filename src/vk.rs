@@ -1021,14 +1021,27 @@ impl Buf {
         let info = vk::BufferDeviceAddressInfo::default().buffer(buf);
         // SAFETY: `buf` was created with SHADER_DEVICE_ADDRESS and is bound.
         let addr = unsafe { g.device.get_buffer_device_address(&info) };
-        ALLOCS
-            .lock()
-            .map_err(|_| anyhow!("vk alloc registry poisoned"))?
-            .push(Alloc {
+        // Registering is the LAST fallible step, and it comes after `mem` is allocated
+        // and mapped — so its error path has to undo those, not just let `Buf::new`
+        // destroy the buffer. Every other `?` in this function has a matching undo and
+        // this one did not, which contradicted the comment two screens up saying they
+        // all do.
+        match ALLOCS.lock() {
+            Ok(mut allocs) => allocs.push(Alloc {
                 base: addr,
                 len: len as u64,
                 buf,
-            });
+            }),
+            Err(_) => {
+                // SAFETY: `mem` is bound and mapped, owned solely by this half-built
+                // Buf; the caller destroys `buf`.
+                unsafe {
+                    g.device.unmap_memory(mem);
+                    g.device.free_memory(mem, None);
+                }
+                bail!("vk alloc registry poisoned");
+            }
+        }
         Ok(Self {
             buf,
             mem,
@@ -1178,10 +1191,10 @@ pub unsafe fn memcpy_dtod(dst: *mut u8, src: *const u8, bytes: usize) -> Result<
 /// Order fields largest-first (8-byte device addresses, then 4-byte scalars) and the
 /// no-padding check is satisfied naturally.
 macro_rules! push_struct {
-    ($(#[$m:meta])* $name:ident { $($f:ident: $t:ty),+ $(,)? }) => {
+    ($(#[$m:meta])* $name:ident { $($(#[$fm:meta])* $f:ident: $t:ty),+ $(,)? }) => {
         $(#[$m])*
         #[repr(C)]
-        struct $name { $($f: $t),+ }
+        struct $name { $($(#[$fm])* $f: $t),+ }
         const _: () = assert!(
             size_of::<$name>() == 0 $(+ size_of::<$t>())+,
             concat!(stringify!($name), " has padding: reorder fields largest-first"),
@@ -1208,6 +1221,24 @@ push_struct! {
 /// Workgroups needed to cover `n` elements at one element per invocation.
 fn groups(n: usize) -> u32 {
     n.div_ceil(BLOCK as usize) as u32
+}
+
+/// A device address handed to a shader that reads or writes it as 32-bit WORDS must be
+/// word-aligned, because the shader's offset arithmetic is relative to this base.
+///
+/// [`WORD`] and `DeviceTier::place` fix the LENGTH half of the word-addressing hazard;
+/// this is the ALIGNMENT half. Every current caller satisfies it — `Buf` bases come
+/// from `vkGetBufferDeviceAddress` and `place` results are 256-aligned — but the byte-
+/// and u16-typed arguments (`packed`, `lc8`, `rc`) are exactly the shapes a caller
+/// could hand a sub-pointer: a per-layer KV slab offset, a compacted arena slot. GPU-AV
+/// checks out-of-bounds, not misalignment, so nothing else would catch it.
+fn ensure_word_aligned(p: u64, what: &str) -> Result<()> {
+    ensure!(
+        (p as usize).is_multiple_of(WORD),
+        "{what} address {p:#x} is not {WORD}-byte aligned — the shader reads it as \
+         32-bit words, and its offsets are relative to this base"
+    );
+    Ok(())
 }
 
 /// f32 GEMV `y = W·x` (the MoE router gate).
@@ -1548,6 +1579,7 @@ pub unsafe fn launch_embed_i8_row(
     x: *mut f32,
 ) -> Result<()> {
     ensure!(hidden > 0, "embed_i8_row: argument guard rejected");
+    ensure_word_aligned(packed as u64, "embed_i8_row packed")?;
     let g = gpu()?;
     let push = EmbedI8Push {
         packed: packed as u64,
@@ -1571,6 +1603,10 @@ push_struct! {
         kvl: i32,
         ropn: i32,
         n_blocks: i32,
+        /// Passed at runtime so `glslc -O` cannot fold `a / 448.0` into a multiply by
+        /// fl(1/448) — see the note in append_kv.comp.
+        e4m3_max: f32,
+        _pad: u32,
     }
 }
 
@@ -1599,14 +1635,20 @@ pub unsafe fn launch_append_kv(
     );
     // Same envelope as the HIP guard: the per-128 reduction needs kvl a multiple of 128
     // in [128, 1024]. Here 1024 is also MAX_BLOCKS*128, one 128-block per subgroup.
+    // DERIVED from the shader's geometry, not hardcoded: append_kv.comp maps one
+    // 128-element block per subgroup, so the ceiling is one block per subgroup in the
+    // workgroup. A `#if` in the shader fails the build if these two drift apart.
+    const KV_BLOCK: usize = 128;
+    let kvl_max = ROWS_PER_BLOCK as usize * KV_BLOCK;
     ensure!(
-        (128..=1024).contains(&kvl) && kvl.is_multiple_of(128) && ropn <= kvl,
-        "append_kv: kvl {kvl} must be a multiple of 128 in [128,1024] and ropn {ropn} <= kvl"
+        (KV_BLOCK..=kvl_max).contains(&kvl) && kvl.is_multiple_of(KV_BLOCK) && ropn <= kvl,
+        "append_kv: kvl {kvl} must be a multiple of {KV_BLOCK} in [{KV_BLOCK},{kvl_max}] \
+         and ropn {ropn} <= kvl"
     );
     ensure!(
-        n_blocks == kvl / 128,
-        "append_kv: n_blocks {n_blocks} != kvl/128 ({})",
-        kvl / 128
+        n_blocks == kvl / KV_BLOCK,
+        "append_kv: n_blocks {n_blocks} != kvl/{KV_BLOCK} ({})",
+        kvl / KV_BLOCK
     );
     // STRICTER THAN THE HIP GUARD, on purpose. `rc` is u16 and this shader writes it as
     // packed u32 words, so both the row base (pos*ropn) and the element count must be
@@ -1620,6 +1662,8 @@ pub unsafe fn launch_append_kv(
         "append_kv: ropn {ropn} must be even under the Vulkan backend (u16 keys are \
          written as packed u32 words); the HIP backend accepts odd ropn"
     );
+    ensure_word_aligned(lc8 as u64, "append_kv lc8")?;
+    ensure_word_aligned(rc as u64, "append_kv rc")?;
     let g = gpu()?;
     let push = AppendKvPush {
         latent: latent as u64,
@@ -1631,6 +1675,8 @@ pub unsafe fn launch_append_kv(
         kvl: kvl as i32,
         ropn: ropn as i32,
         n_blocks: n_blocks as i32,
+        e4m3_max: crate::math::E4M3_MAX,
+        _pad: 0,
     };
     // One workgroup, like the HIP launch: the per-block reduction is workgroup-local.
     g.dispatch(&g.pipes.append_kv, &push, 1)

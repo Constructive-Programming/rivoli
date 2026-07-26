@@ -123,6 +123,7 @@ fn vulkan() {
         assert!(status.success(), "glslc failed on {}", src.display());
         spirv_val(&spv);
         no_subgroup_arithmetic(&spv);
+        no_reciprocal_rewrite(&spv);
     }
 }
 
@@ -154,6 +155,80 @@ fn no_subgroup_arithmetic(spv: &str) {
              friends) has an implementation-defined summation order and breaks greedy \
              decode's reproducibility. Use the wave_sum shuffle ladder."
         );
+    }
+}
+
+/// Fail the build if `-O` turned a division into a multiply by a reciprocal.
+///
+/// `glslc -O` rewrites `a / K` for a literal K into `a * fl(1/K)`. For K = 448 that
+/// differs from a true IEEE divide by 1 ULP on 55% of inputs — measured, not feared —
+/// and hipcc (`-O3`, no `-ffast-math`) keeps a real `fdiv`, so the two backends'
+/// numbers silently diverged. That defeats the premise the whole port rests on, and
+/// nothing else catches it: the numeric oracles' tolerances are orders of magnitude
+/// looser than 1 ULP, and even the byte-exact comparisons are protected by an
+/// unambiguity margin that is precisely wide enough to hide it.
+///
+/// The determinism story here already assumes the toolchain does not rewrite float
+/// arithmetic — that is what the fixed shuffle ladder and the `subgroupAdd` ban are
+/// for. This is proof it does, so the assumption becomes a check.
+///
+/// THE RULE: no `OpFMul` by a float constant whose mantissa is non-zero. Multiplying by
+/// a power of two (0.125, 512.0, 2^-6) is exact and common in the e4m3/bf16 paths;
+/// multiplying by anything else is either an optimizer-invented reciprocal or an
+/// author-written scale that deserves an argument. Pass the divisor in at runtime — an
+/// operand the optimizer cannot see is an operand it cannot fold.
+fn no_reciprocal_rewrite(spv: &str) {
+    // Legitimate non-power-of-two constant multiplies, if one is ever justified: add
+    // the exact printed value here with a comment saying why it is safe. Empty on
+    // purpose — every current kernel either divides at runtime or scales by 2^n.
+    const ALLOWED: &[&str] = &[];
+
+    let Some(text) = disassemble(spv) else { return };
+    // name -> printed value, from `%float_x = OpConstant %float 0.125`
+    let mut consts = std::collections::HashMap::new();
+    for line in text.lines() {
+        if let Some((name, val)) = line.split_once(" = OpConstant %float ") {
+            consts.insert(name.trim(), val.trim());
+        }
+    }
+    for line in text.lines() {
+        if !line.contains(" = OpFMul ") {
+            continue;
+        }
+        for tok in line.split_whitespace() {
+            let Some(val) = consts.get(tok) else { continue };
+            if ALLOWED.contains(val) {
+                continue;
+            }
+            let Ok(v) = val.parse::<f32>() else { continue };
+            // Exact power of two (or zero): mantissa bits all clear.
+            if v == 0.0 || (v.to_bits() & 0x007f_ffff) == 0 {
+                continue;
+            }
+            panic!(
+                "{spv}: multiplies by the non-power-of-two constant {val}\n  {}\n\
+                 This is how `glslc -O` spells `a / {:.0}` — and a reciprocal multiply \
+                 is NOT bit-identical to the divide hipcc emits, so the two backends \
+                 diverge silently. Pass the divisor in as a push constant (see \
+                 append_kv.comp), or if this multiply is deliberate and safe, add \
+                 \"{val}\" to ALLOWED in build.rs with the reason.",
+                line.trim(),
+                1.0 / v
+            );
+        }
+    }
+}
+
+/// `spirv-dis` output, or `None` with a warning if the tool is absent — same optional
+/// treatment as `spirv-val`, since it ships in a different package from glslc.
+fn disassemble(spv: &str) -> Option<String> {
+    match Command::new("spirv-dis").arg("--no-color").arg(spv).output() {
+        Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
+        Ok(_) => panic!("spirv-dis failed on {spv}"),
+        Err(e) => {
+            println!("cargo:warning=spirv-dis not run on {spv} ({e}); SPIR-V unchecked");
+            None
+        }
     }
 }
 
