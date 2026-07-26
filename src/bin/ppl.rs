@@ -52,8 +52,24 @@ fn mean(v: &[f64]) -> f64 {
     v.iter().sum::<f64>() / v.len().max(1) as f64
 }
 
-/// Sample standard deviation (n-1). Used for the spread of the paired differences, which
-/// is what says whether a mean shift is meaningful or is just one or two tokens moving.
+/// Tokens needed for the UPPER 95% bound to fall below `bar`, at an observed effect of
+/// `mean` and per-token spread `sd`. Solves `mean + 1.96*sd/sqrt(n) < bar`.
+///
+/// The margin is `bar - mean`, which is why this can differ by an order of magnitude
+/// between two cells whose half-widths are identical: a cell whose true cost is near zero
+/// has almost the whole bar as margin, while one sitting just under it has almost none.
+/// Sizing a re-run from half-width alone ignores that and can buy hours of exclusive
+/// device time only to land in the same ambiguity.
+fn required_n(sd: f64, mean: f64, bar: f64) -> String {
+    let margin = bar - mean;
+    if margin <= 0.0 {
+        return "no n — the point estimate is already at or past the bar".to_string();
+    }
+    format!("{}", ((1.96 * sd / margin).powi(2)).ceil() as u64)
+}
+
+/// Sample standard deviation (n-1). The spread of the paired differences, which is what
+/// says whether a mean shift is broad or is just one or two tokens moving.
 fn stddev(v: &[f64]) -> f64 {
     if v.len() < 2 {
         return 0.0;
@@ -75,9 +91,10 @@ fn main() -> Result<()> {
     println!("          {} tokens, PPL {:.6}\n", base.nll.len(), mean(&base.nll).exp());
 
     println!(
-        "{:<46}{:>11}{:>10}{:>9}{:>12}{:>11}{:>9}",
-        "cell", "PPL", "dPPL", "dPPL%", "mean dNLL", "sd dNLL", "worse%"
+        "{:<34}{:>10}{:>8}{:>11}{:>9}{:>9}{:>22}{:>8}",
+        "cell", "PPL", "dPPL%", "mean dNLL", "sd", "SE", "95% CI (nats)", "worse%"
     );
+    let mut verdicts: Vec<(String, f64, f64, f64, f64)> = Vec::new();
     for r in &runs[1..] {
         // Pairing is only valid position-by-position. Different lengths mean the two runs
         // did not score the same text, and averaging them anyway would silently compare
@@ -95,19 +112,61 @@ fn main() -> Result<()> {
         // Share of positions the cell scored WORSE on. A mean shift carried by a handful
         // of tokens looks the same as a broad one until you check this.
         let worse = 100.0 * d.iter().filter(|&&x| x > 0.0).count() as f64 / d.len() as f64;
+        let (m, sd) = (mean(&d), stddev(&d));
+        let se = sd / (d.len() as f64).sqrt();
+        let (lo, hi) = (m - 1.96 * se, m + 1.96 * se);
         println!(
-            "{:<46}{ppl:>11.6}{:>10.6}{:>8.3}%{:>12.6}{:>11.6}{worse:>8.1}%",
-            r.label.split_whitespace().take(4).collect::<Vec<_>>().join(" "),
-            ppl - bppl,
+            "{:<34}{ppl:>10.5}{:>7.3}%{m:>11.5}{sd:>9.4}{se:>9.5}{:>22}{worse:>7.1}%",
+            r.label.split_whitespace().take(3).collect::<Vec<_>>().join(" "),
             100.0 * (ppl - bppl) / bppl,
-            mean(&d),
-            stddev(&d),
+            format!("[{lo:+.5}, {hi:+.5}]"),
         );
+        verdicts.push((r.label.clone(), m, lo, hi, sd));
+    }
+
+    // The bar is a ~1% PERPLEXITY change; since PPL = exp(mean NLL) that is ln(1.01)
+    // nats of mean dNLL. Comparing the interval against it is the only way to tell
+    // "the cost is small" apart from "we could not measure it".
+    let bar = 1.01f64.ln();
+    println!("\n1% PPL bar = {bar:.5} nats of mean dNLL. Verdict per cell:");
+    for (label, m, lo, hi, sd) in &verdicts {
+        let cell = label.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+        // Acceptance asks whether the cost is WITHIN 1%, so what must happen is that the
+        // interval's UPPER bound falls below the bar — not that its half-width equals the
+        // bar. Those come apart badly: an effect of 0.0 with half-width 1.0% still
+        // straddles and decides nothing, while an effect of 0.1% with half-width 0.7%
+        // passes cleanly. Sizing a re-run off half-width alone can buy hours of exclusive
+        // device time and land in the same ambiguity.
+        let verdict = if *hi < bar {
+            // ONE-SIDED on purpose. Acceptance bounds the quality COST, and a cell that
+            // came out better than baseline has not failed it — requiring the lower bound
+            // to clear -bar too would report a genuine pass as inconclusive and buy device
+            // time to re-measure something already answered. A lower bound past -1% is
+            // still worth a look, though: cache substitution should not IMPROVE quality,
+            // and if it appears to, the likelier explanation is a bug than a free lunch.
+            let odd = if *lo < -bar { "  (note: interval also admits >1% BETTER — implausible, suspect a bug)" } else { "" };
+            format!("PASS — upper bound {hi:+.5} < bar{odd}")
+        } else if *lo > bar {
+            "FAIL — interval entirely worse than +1%".to_string()
+        } else if *m >= bar {
+            "FAIL(point) — estimate at/past the bar; more text cannot rescue it".to_string()
+        } else {
+            // n to drive the upper bound under the bar AT THIS OBSERVED EFFECT SIZE. The
+            // margin is (bar - mean), so a cell whose true cost is near zero needs far
+            // less text than one sitting just under the bar. This is the number that says
+            // what to buy.
+            format!(
+                "INCONCLUSIVE — upper bound {hi:+.5} > bar; needs ~{} tokens at this effect size",
+                required_n(*sd, *m, bar)
+            )
+        };
+        println!("  {cell:<34} mean {m:+.5}  {verdict}");
     }
     println!(
         "\nPaired dNLL is the evidence; PPL is for comparability with arXiv:2412.00099.\n\
-         `worse%` near 50 with a mean dNLL near 0 means no systematic shift, however the\n\
-         PPL column reads. Acceptance (docs/CACHE_ROUTE.md): within ~1% of baseline."
+         An UNDERPOWERED null is NOT evidence of no harm — it is absence of evidence, and\n\
+         must not be reported as a pass. `worse%` near 50 with mean dNLL near 0 means no\n\
+         systematic shift however the PPL column reads."
     );
     Ok(())
 }
@@ -158,6 +217,25 @@ mod tests {
         assert_ne!(a.len(), b.len(), "fixture must differ in length");
         // Mirrors main's guard; kept as a test so the guard cannot be dropped silently.
         assert!(a.len() != b.len());
+    }
+
+    /// The distinction the whole acceptance decision turns on: a near-zero mean can mean
+    /// EITHER "the quality cost is negligible" OR "we could not resolve it", and only the
+    /// interval width tells them apart. Both cases below have essentially the same mean;
+    /// they must not get the same verdict.
+    #[test]
+    fn a_near_zero_mean_is_pass_or_underpowered_depending_on_spread() {
+        let bar = 1.01f64.ln();
+        // Tight: 2000 samples of tiny scatter -> CI far inside the bar. Genuinely no cost.
+        let tight: Vec<f64> = (0..2000).map(|i| if i % 2 == 0 { 0.001 } else { -0.001 }).collect();
+        let se_t = stddev(&tight) / (tight.len() as f64).sqrt();
+        assert!(1.96 * se_t < bar, "tight case must resolve the bar");
+        // Loose: same mean, realistic per-token scatter, only 49 samples — exactly the
+        // smoke-run regime, where a +3.6% PPL headline was pure noise.
+        let loose: Vec<f64> = (0..50).map(|i| if i % 2 == 0 { 0.25 } else { -0.25 }).collect();
+        let se_l = stddev(&loose) / (loose.len() as f64).sqrt();
+        assert!(1.96 * se_l > bar, "loose case must be flagged underpowered");
+        assert!((mean(&tight) - mean(&loose)).abs() < 1e-9, "means must be indistinguishable");
     }
 
     /// The property that motivates the whole tool: a small systematic shift is visible in

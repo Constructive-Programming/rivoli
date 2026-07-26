@@ -360,7 +360,13 @@ fn main() -> Result<()> {
             cfg.mode,
         )?;
         info!("pin built in {:.1}s", t.elapsed().as_secs_f64());
-        let max_ctx = prompt_ids.len() + ngen + 1;
+        // `--ppl` walks the CORPUS, not the bench prompt, and its `ngen` is 0 — sizing the
+        // KV cache from `prompt_ids` would allocate ~17 positions for an ~900-position
+        // scoring pass. Take whichever run this actually is.
+        let max_ctx = match &ppl_ids {
+            Some(ids) => ids.len() + 1,
+            None => prompt_ids.len() + ngen + 1,
+        };
         let mut engine = rivoli::gpu::GpuEngine::new(pin, &mc, max_ctx, cfg.attn.clone())?;
         #[cfg(feature = "trace")]
         engine.set_checksum_x(cfg.checksum_x);
