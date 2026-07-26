@@ -90,6 +90,44 @@ Last established on RADV STRIX_HALO (AMD Radeon 8060S),
 `core` **fires**, `sync` **fires**, `gpuav` **fires**,
 `compute-compute` **silent**, `compute-copy` **silent**, `compute-copy-desc` **silent**.
 
+## Operating in this repo: two hazards that bite silently
+
+Neither is about Vulkan. Both cost real work in this session and neither announces
+itself.
+
+### Is the GPU in use? Ask the driver, not `pgrep`
+
+```bash
+ls /sys/class/kfd/kfd/proc/                 # PIDs holding a GPU context
+cat /proc/<pid>/comm                        # who they are
+```
+
+`/sys/class/kfd/kfd/proc/` is the amdgpu driver's own list of processes with an open
+GPU context. It is name-independent and authoritative.
+
+**Every name-based check is structurally blind**, and the blindness is invisible —
+it reports "free" rather than erroring. Confirmed live: kfd showed PID 2195696
+holding a context while `pgrep -x rivoli` returned nothing, because the process was
+named `rivoli_base`. `cargo test` binaries (`kernel-e0184386`, `vk-…`) are worse:
+their names contain a content hash and match no fixed pattern at all, so a suite run
+holds the device completely invisibly.
+
+A second, separate failure of the same check: `pgrep -f "target/release/rivoli"`
+matches **its own shell's command line**, so it reports BUSY forever. A name-based
+check can therefore fail in both directions — blind to real users, and tripping on
+itself. If you must use one, run it from a script file so the pattern is not in the
+invoking command line, and know it still cannot see test binaries.
+
+### Never `git stash` here — the stash stack is shared across worktrees
+
+`git stash` is per-repository, not per-worktree, so a `stash push` in one worktree and
+a `stash pop` in another operate on the same stack. A no-op `push` (nothing to stash)
+followed by a `pop` will happily restore **someone else's** work into your tree, as
+conflict markers in files you never touched.
+
+There is more than one party working in this repository. To get a clean tree, use
+`git checkout <ref> -- <paths>` or a separate build directory.
+
 ## Traps worth knowing
 
 ### A correct guard resting on a false rationale
