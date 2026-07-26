@@ -82,6 +82,23 @@ fn main() {
 const VK_WAVE: u32 = 32;
 const VK_ROWS_PER_BLOCK: u32 = 8;
 
+/// The env the shaders are compiled FOR and validated AGAINST. The two tools spell the
+/// flag differently: `glslc --target-env=X`, but `spirv-val --target-env X` — the `=`
+/// form makes spirv-val print its usage and exit non-zero.
+const VK_TARGET_ENV: &str = "vulkan1.3";
+
+/// Modules where a barrier exists but [`no_barrier_without_memory`] declines to judge it,
+/// with the LDS the barrier is presumed to be ordering. See that function for why the set
+/// is pinned rather than merely reported. Module scope so `vulkan()` can also check that
+/// every entry still names a real shader — the deletion case the per-shader comparison
+/// cannot observe.
+const BARRIER_EXEMPT: &[(&str, &str)] = &[
+    ("append_kv", "block-max reduction over the latent row"),
+    ("argmax_reduce", "LDS halving tree over the vocabulary partials"),
+    ("gemv_fp8", "the e4m3 LUT, plus split-K's per-wave partials"),
+    ("rmsnorm", "LDS halving tree over the sum of squares"),
+];
+
 fn vulkan() {
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR set by cargo");
     let glslc = std::env::var("GLSLC").unwrap_or_else(|_| "glslc".into());
@@ -120,11 +137,41 @@ fn vulkan() {
     // that only surfaced because a deliberate-break check reported "did not fire" when
     // it should have.
     let mut failures: Vec<String> = Vec::new();
-    for src in shaders.iter().filter(|p| p.extension().is_some_and(|e| e == "comp")) {
+    let comps: Vec<_> = shaders
+        .iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "comp"))
+        .collect();
+    let stems: Vec<String> = comps
+        .iter()
+        .map(|p| p.file_stem().expect("shader stem").to_string_lossy().into_owned())
+        .collect();
+
+    // PRUNE stale SPIR-V before compiling. `include_bytes!` in src/vk.rs reads
+    // `{OUT_DIR}/{name}.spv` directly, and OUT_DIR is never cleaned between incremental
+    // builds — so deleting a `.comp` leaves its module on disk, still linked, still
+    // dispatched, with every guard below skipped for it because the loop is driven by
+    // the SOURCE directory. It would only fail on a clean build.
+    //
+    // Exactly the bug the HIP arm already fixed above ("`ar crs` never prunes ... start
+    // from a clean archive every build"); the vulkan arm had no equivalent.
+    if let Ok(entries) = std::fs::read_dir(&out_dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "spv")
+                && !p
+                    .file_stem()
+                    .is_some_and(|s| stems.iter().any(|k| k.as_str() == s))
+            {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+
+    for src in comps.iter() {
         let stem = src.file_stem().expect("shader stem").to_string_lossy();
         let spv = format!("{out_dir}/{stem}.spv");
         let out = Command::new(&glslc)
-            .args(["--target-env=vulkan1.3", "-O", "-Ikernels/vk"])
+            .args([&format!("--target-env={VK_TARGET_ENV}"), "-O", "-Ikernels/vk"])
             .arg(format!("-DWAVE={VK_WAVE}"))
             .arg(format!("-DROWS_PER_BLOCK={VK_ROWS_PER_BLOCK}"))
             .arg(src)
@@ -150,9 +197,25 @@ fn vulkan() {
             failures.extend(no_reciprocal_rewrite(&spv, &text));
             failures.extend(no_banned_builtins(&spv, &text));
             failures.extend(no_array_parameters(&spv, &text));
-            failures.extend(no_barrier_without_memory(&spv, &text));
+            failures.extend(no_barrier_without_memory(&spv, &stem, &text));
         }
     }
+    // The one transition the per-shader EXEMPT check structurally CANNOT see: a shader
+    // that no longer exists is never visited, so its entry is never re-examined by
+    // anything. Rename `rmsnorm.comp` and the orphaned ("rmsnorm", ...) sits there
+    // silently pre-authorising any FUTURE shader that takes the name back — which would
+    // then be waived from barrier checking with no diagnostic and no human ever having
+    // confirmed its barriers order what they must. That is the exact silent skip this
+    // mechanism exists to abolish, re-entering through deletion.
+    failures.extend(BARRIER_EXEMPT.iter().filter(|(m, _)| !stems.iter().any(|s| s == m)).map(
+        |(m, _)| {
+            format!(
+                "BARRIER_EXEMPT lists `{m}`, but kernels/vk/{m}.comp does not exist.\n  \
+                 A stale entry pre-authorises a future shader of that name to skip the \
+                 barrier rule silently. Remove it from BARRIER_EXEMPT in build.rs."
+            )
+        },
+    ));
     assert!(
         failures.is_empty(),
         "\n\n{} shader problem(s) — ALL of them, not just the first:\n\n{}\n",
@@ -380,21 +443,94 @@ fn no_array_parameters(spv: &str, text: &str) -> Vec<String> {
 /// with the fix reverted.
 ///
 /// Fix: `memoryBarrierBuffer(); barrier();`
-fn no_barrier_without_memory(spv: &str, text: &str) -> Vec<String> {
+///
+/// ## The skip set is PINNED, because a silent skip is how this rule dies
+///
+/// The `has_shared` skip above is deliberate and correct — but it is also INVISIBLE, and
+/// that is a defect independent of the rule being right. A module that gains a `shared`
+/// variable drops out of barrier checking with no diagnostic, and the change that does it
+/// reads as ordinary work: add an LDS tile, and every barrier in that kernel silently
+/// stops being judged.
+///
+/// The trigger is narrower than "a module gains a `shared` declaration", and the
+/// difference was MEASURED after a first version of this comment got it wrong. An unused
+/// Workgroup variable is dead-code-eliminated: a global `shared float lut[256]` that a
+/// module never reads leaves ZERO `OpVariable %_ptr_Workgroup` under `-O` (1 without it,
+/// and this build ships `-O`). So hoisting a shared LUT into `common.glsl` would NOT
+/// disarm the rule across every includer, as claimed here originally — only in the
+/// modules that actually read it. The real trigger is **a barrier plus a Workgroup
+/// variable the module genuinely uses**.
+///
+/// Left standing because a guard resting on a false rationale is this repo's own
+/// documented trap: the code was right, the argument was wrong, and the argument is what
+/// a maintainer reads when deciding whether the guard still earns its place.
+///
+/// Enforced in both directions so the list cannot rot into describing a past tree, plus a
+/// whole-set check in `vulkan()` for the deletion case neither direction can see. An
+/// entry costs an argument in a reviewable diff, matching `ALLOWED` in
+/// `tests/kernel_coverage.rs` and `LOCKED` in `tests/glsl_numerics.rs`.
+///
+/// **Read the list as a coverage statement, because it is a blunt one:** of eleven
+/// shaders, six have no barrier at all, FOUR are exempt here, and exactly ONE —
+/// `rope_interleave`, the kernel whose bug created this rule — is actually judged. The
+/// anti-vacuity principle this repo already applies ("prove the check looked at
+/// something") extended one step: also say what it did NOT look at.
+///
+/// A `cargo:warning` on every build was considered and rejected. Cargo hides plain build
+/// script output unless `-vv`, so it would land in a sink; and a warning that fires on
+/// every healthy build gets filtered out by the reader, which is this repo's stated
+/// reason for not counting PERFORMANCE validation messages. A build ERROR the moment the
+/// set CHANGES is the event worth interrupting someone for.
+fn no_barrier_without_memory(spv: &str, stem: &str, text: &str) -> Vec<String> {
     let has_barrier = text.contains("OpControlBarrier");
     let has_shared = text.contains("OpVariable %_ptr_Workgroup");
     let has_memory_barrier = text.contains("OpMemoryBarrier");
-    if !has_barrier || has_shared || has_memory_barrier {
-        return Vec::new();
+
+    // BOOKKEEPING AND THE REAL RULE BOTH REPORT, and the fall-through is the point.
+    // Returning on the EXEMPT mismatch substituted one message for the other in the case
+    // that matters most: convert `rmsnorm`'s halving tree to the `wave_sum` shuffle
+    // ladder — which the capability rule above actively encourages — and it loses its
+    // Workgroup variable while keeping a bare `barrier()` over buffer traffic. That is
+    // bit-for-bit the `rope_interleave` signature, but `listed && !skipped` fired first
+    // and the build said "remove a stale const entry", naming bookkeeping where the news
+    // was a live ordering bug. Same first-failure-floor this file rejects at build scope,
+    // reintroduced per shader.
+    let mut found = Vec::new();
+    let skipped = has_barrier && has_shared;
+    let listed = BARRIER_EXEMPT.iter().any(|(m, _)| *m == stem);
+    if skipped != listed {
+        found.push(if skipped {
+            format!(
+                "{spv}: has a barrier AND shared memory, so the barrier rule SKIPS it — \
+                 but `{stem}` is not in BARRIER_EXEMPT.\n  This kernel's barriers are no \
+                 longer checked for the missing buffer semantics that `rope_interleave` \
+                 shipped, and nothing would have said so. Add (\"{stem}\", \"<what the LDS \
+                 is>\") to BARRIER_EXEMPT in build.rs, having first confirmed by hand that \
+                 every barrier in it orders the memory it needs to."
+            )
+        } else {
+            format!(
+                "{spv}: `{stem}` is in BARRIER_EXEMPT, but the rule is NOT skipping it \
+                 (barrier={has_barrier}, shared={has_shared}).\n  The exemption no longer \
+                 describes this shader, and a stale entry reads as coverage that was \
+                 waived. Remove it from BARRIER_EXEMPT in build.rs — and read any finding \
+                 below this one first, it is the substantive one."
+            )
+        });
     }
-    vec![format!(
+
+    if !has_barrier || has_shared || has_memory_barrier {
+        return found;
+    }
+    found.push(format!(
         "{spv}: has a barrier that orders NOTHING\n  OpControlBarrier with \
          WorkgroupMemory-only semantics, in a module with no Workgroup storage.\n  \
          GLSL's bare `barrier()` orders SHARED memory only, unlike HIP's \
          `__syncthreads()` which also orders global. If this barrier is protecting \
          buffer traffic, write `memoryBarrierBuffer(); barrier();` — otherwise the \
          barrier is dead and should be deleted."
-    )]
+    ));
+    found
 }
 
 /// `spirv-dis` output, or `None` with a warning if the tool is absent — same optional
@@ -410,21 +546,44 @@ fn disassemble(spv: &str) -> Option<String> {
     }
 }
 
-/// Validate a compiled module with `spirv-val`.
+/// Validate a compiled module with `spirv-val`, **under Vulkan's rules**.
 ///
 /// This is STATIC module validation — it catches malformed SPIR-V, bad decorations,
 /// and capability/extension mismatches. It does NOT see synchronisation, descriptor,
 /// or buffer-device-address misuse; only the VK_LAYER_KHRONOS_validation runtime layer
 /// does, and that layer is a separate install (see docs/VULKAN.md "Risks").
 ///
+/// `--target-env` IS LOAD-BEARING, and its absence was a real hole rather than an
+/// untidiness. Without it `spirv-val` applies only the UNIVERSAL SPIR-V 1.6 rules, and
+/// the entire `VUID-StandaloneSpirv-*` family — every requirement Vulkan adds on top of
+/// the bare specification — goes unchecked. Measured, not inferred: strip the `Block`
+/// decoration off a push-constant struct and the old invocation exits **0** on the
+/// identical module, while `--target-env vulkan1.3` reports
+/// `[VUID-StandaloneSpirv-PushConstant-06675] PushConstant id '8' is missing Block
+/// decoration`.
+///
+/// Note the paragraph above it: this comment claimed "bad decorations" as covered, and a
+/// missing `Block` decoration is exactly the example it could not see.
+///
 /// A missing `spirv-val` warns rather than fails: it ships in a different package from
 /// glslc, and a box that can build shaders should not be blocked on the checker.
 fn spirv_val(spv: &str) -> Vec<String> {
-    match Command::new("spirv-val").arg(spv).output() {
+    match Command::new("spirv-val")
+        .args(["--target-env", VK_TARGET_ENV])
+        .arg(spv)
+        .output()
+    {
         Ok(o) if o.status.success() => Vec::new(),
+        // BOTH streams. Passing a flag introduced a failure class that did not exist when
+        // this took no arguments: spirv-val sends VALIDATION errors to stderr but its
+        // ARGUMENT-PARSING diagnostic — the whole usage block — to stdout, measured at
+        // 4046 bytes on stdout and 0 on stderr for the `--target-env=X` spelling. Reading
+        // stderr alone would fail all eleven shaders with an empty body, pointing at the
+        // modules while the invocation was at fault.
         Ok(o) => vec![format!(
-            "{spv}: spirv-val rejected the module\n{}",
-            String::from_utf8_lossy(&o.stderr).trim()
+            "{spv}: spirv-val rejected the module\n{}\n{}",
+            String::from_utf8_lossy(&o.stderr).trim(),
+            String::from_utf8_lossy(&o.stdout).trim()
         )],
         Err(e) => {
             println!("cargo:warning=spirv-val not run on {spv} ({e}); SPIR-V unchecked");
