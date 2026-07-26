@@ -1376,8 +1376,31 @@ original barrier. And the fetch queue writing a slot the compute queue is readin
   result. Run GPU-AV in its own pass: with core validation also on, the layer warns
   that the combination is slow, and that warning is likewise counted.
 
-  Status as of the first validated run: **core and synchronisation validation both
-  clean across all four tests.** GPU-AV clean too, but see the caveat below.
+  Status as of the commit carrying this note: the whole suite, **37 tests**, run once
+  under each of the three configurations in the table above (GPU-AV in its own pass):
+  **all clean.** That is coverage evidence, not repeatability evidence — no repeats were
+  taken. **It does not read back onto earlier commits:** `bffdc9d` is RED on
+  `attend_honours_the_dsa_row_selection`, which shipped a fixed-point precondition and
+  data violating it in the same commit, so the suite had never been green at 37 before.
+
+  **GPU-AV was confirmed live by DEMONSTRATION, not by its self-report:** the probes in
+  `docs/probes/vk_validation` were re-run on this stack the same day and reproduce the
+  matrix below exactly. (The self-report — 2 `VALIDATION-SETTINGS`-class messages with
+  the env var, 0 without — establishes only that the layer read the variable.)
+
+  **The `down` path at `inter = 64` is clean under GPU-AV *at that shape*.** That is the
+  adversarial shape for `bffdc9d`'s scale-read fix, which had never executed before this
+  run. Three limits, because this is otherwise exactly the paragraph that gets quoted as
+  a licence to stop checking:
+
+  - `bffdc9d` fixed **two** defects and GPU-AV can only ever have seen one. The 2-byte
+    over-read leaves the buffer, so it is in scope; the **misaligned 32-bit load is
+    in-bounds and has no instrument here**.
+  - The buggy code never ran under GPU-AV, so nobody watched the checker fire on this
+    defect. A clean post-fix pass is *consistent with* the fix and is not evidence the
+    checker would have caught it.
+  - The defect class is numerically silent, so GPU-AV's silence covers exactly the shapes
+    that were run. Re-run this shape after any change to the scale read.
 - ~~GPU-AV's buffer-address checker has not been proven to fire~~ **CLOSED.** All three
   checkers have now been observed catching a deliberate fault, so their silence is
   evidence rather than an absence of evidence:

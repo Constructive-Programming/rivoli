@@ -2711,9 +2711,27 @@ fn attend_honours_the_dsa_row_selection() {
     let tokens = 96usize; // four times nr, so selected indices are scattered and live
     let (qabs, qrope, lc8, lscale, rc) = att_inputs(0xD5A, h, tokens, kvl, rope, n_blocks);
 
-    // Strided and descending: rows[j] = tokens - 1 - 4j. Shares no fixed point with the
-    // dense mapping j -> j, so any confusion between the two shows up everywhere.
-    let rows: Vec<u32> = (0..nr).map(|j| (tokens - 1 - 4 * j) as u32).collect();
+    // Strided and descending: rows[j] = tokens - 2 - 4j — the 24 values {2, 6, …, 94},
+    // sparse within the live 96-token pool, which is what makes a wrong index land on a
+    // real token's data rather than out of bounds.
+    //
+    // THE BASE IS CONSTRAINED, AND THE OBVIOUS `- 1` VIOLATES THE ASSERT BELOW. Any
+    // descending selection starting above 0 and ending below `nr - 1` must CROSS the
+    // diagonal; the only question is whether it crosses ON an integer. For
+    // `rows[j] = tokens - base - s*j` it does iff `(s + 1)` divides `(tokens - base)` with
+    // the quotient below `nr`. At `s = 4` that means `tokens - base` must not be a multiple
+    // of 5: `base = 1` gives 95 = 5·19, so `rows[19] == 19`. `base = 2` gives 94, crossing
+    // at j = 18.8 — between samples. Re-check the divisibility after changing `tokens`,
+    // `nr` or the stride. Bases 2, 3 and 4 are all fixed-point-free and in range (base 5
+    // runs `rows` negative); 2 is the smallest of them and so spans widest, up to 94.
+    //
+    // It is a DESIGN invariant, not a detection guarantee, and the distinction is worth
+    // keeping: the output is indexed by (head, latent dim) and never by row position, so
+    // one shared entry costs almost nothing — the control below separates at 27x the
+    // tolerance here and still managed 26x with the `- 1` form. Keep the assert because it
+    // is cheap and machine-checks "the two mappings are unrelated", not because the test
+    // was meaningfully weak without it.
+    let rows: Vec<u32> = (0..nr).map(|j| (tokens - 2 - 4 * j) as u32).collect();
     assert!(
         rows.iter().enumerate().all(|(j, r)| *r as usize != j),
         "the selection must share no fixed point with the dense mapping"
