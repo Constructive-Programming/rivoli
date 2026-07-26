@@ -8,9 +8,6 @@
 
 layout(local_size_x = ROWS_PER_BLOCK * WAVE) in;
 
-layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RoF32 { float v[]; };
-layout(buffer_reference, std430, buffer_reference_align = 4) buffer RwF32 { float v[]; };
-
 layout(push_constant) uniform Push {
     RwF32 x;
     RoF32 y;

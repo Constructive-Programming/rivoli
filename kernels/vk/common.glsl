@@ -44,6 +44,16 @@ float wave_sum(float v) {
     return v;
 }
 
+// The two buffer-reference types every kernel needs. Declared once here rather than
+// six times across the shaders — buffers reach a shader as device addresses in push
+// constants (docs/VULKAN.md), so an f32 in and an f32 out is the shape of nearly every
+// launcher. Kernels needing other widths (packed u8/u16 read as words, i32 outputs)
+// declare those locally, where the unpacking that justifies them lives.
+#extension GL_EXT_buffer_reference : require
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RoF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer RwF32 { float v[]; };
+
 // Max across a subgroup, into LANE 0. Same shuffle ladder and the same lane-0-only
 // caveat as wave_sum above. Unlike a sum this is EXACT — max does no rounding, so the
 // order genuinely does not matter — but it still uses shuffles rather than

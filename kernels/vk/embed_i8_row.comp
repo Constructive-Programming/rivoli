@@ -13,8 +13,6 @@ layout(local_size_x = ROWS_PER_BLOCK * WAVE) in;
 // Packed int8 is read as UINT WORDS and unpacked by hand — VK_KHR_8bit_storage is
 // deliberately not required (docs/VULKAN.md), and the hot loops unpack manually anyway.
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RoU32 { uint v[]; };
-layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RoF32 { float v[]; };
-layout(buffer_reference, std430, buffer_reference_align = 4) buffer RwF32 { float v[]; };
 
 layout(push_constant) uniform Push {
     RoU32 packed;

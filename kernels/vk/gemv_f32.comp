@@ -15,8 +15,6 @@ layout(local_size_x = ROWS_PER_BLOCK * WAVE) in;
 // Buffers arrive as device ADDRESSES in the push constant, not as descriptor
 // bindings — the direct translation of HIP's raw kernel pointer args, and the reason
 // this backend needs no descriptor sets at all (see docs/VULKAN.md).
-layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RoF32 { float v[]; };
-layout(buffer_reference, std430, buffer_reference_align = 4) buffer RwF32 { float v[]; };
 
 layout(push_constant) uniform Push {
     RoF32 x;
