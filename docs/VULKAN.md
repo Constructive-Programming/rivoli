@@ -110,11 +110,19 @@ the buffer's device address have no fixed relationship, and
 `VK_EXT_external_memory_host` would not make them equal either (and is rejected above
 on measured performance grounds regardless).
 
-**Resolution: `reserve()` returns the DEVICE pointer, and host filling goes through
-`DeviceTier::write_at(dev_ptr, bytes)`.** The tier owns both bases, so the
-translation happens inside the type that knows them, once per placement at startup —
-never per operation, and never on the hot path. `VmmBuf` splits the same way: `ptr()`
-is the device base for descriptor arithmetic, `host_mut()` is the DMA target.
+**Resolution (implemented): `DeviceTier::place(&[u8]) -> *mut u8` reserves and fills
+in one call and returns the DEVICE pointer; `reserve` is private.** The tier owns both
+bases, so the translation happens inside the type that knows them, once per placement
+at startup — never per operation, never on the hot path. Fusing the two also means a
+caller cannot obtain a device pointer that has not been filled, which a separate
+`write_at` would have allowed. `VmmBuf` splits the same way when the pool is ported:
+`ptr()` is the device base for descriptor arithmetic, `host_mut()` is the DMA target.
+
+The pool half is NOT done. `ArenaPool::ptr` (`pin.rs`) must become two accessors —
+descriptors take the device base, `ReadSpec.dst` takes the host base — with both bases
+still resolved once at setup so each stays a single `add`. Deferred deliberately: under
+`rocm` the two bases are identical, so splitting it now would compile to the same thing
+and no test could tell the versions apart. It lands with the Vulkan streaming path.
 
 Two rejected alternatives, for the record:
 
@@ -203,10 +211,21 @@ embedded via `include_bytes!`. Keep `rerun-if-changed` on the shared header — 
 
 ### Numerics that must stay bit-exact
 
-`bf16f`/`f2bf16`/`e4m3f` in `common.hpp` are bit-exact with `src/math.rs` by
-requirement — the CPU oracles in `tests/kernel.rs` test exactly that. GLSL has no
-`__builtin_memcpy`; use `floatBitsToUint`/`uintBitsToFloat`. The e4m3 LUT
-(`e4m3_lut_build`) ports directly to a 256-float `shared` array.
+`bf16f`/`f2bf16`/`e4m3f` in `common.hpp` are bit-exact with `src/math.rs` **on the
+finite domain** — the CPU oracles in `tests/kernel.rs` test that. They are NOT
+bit-exact for NaN: `half::bf16::from_f32` forces the quiet bit (`| 0x0040`) where
+`common.hpp`'s `f2bf16` returns the top 16 bits verbatim. That divergence predates
+this port; a GLSL version must mirror **HIP**, not `math.rs`, or the two backends
+disagree. GLSL has no `__builtin_memcpy`; use `floatBitsToUint`/`uintBitsToFloat`. The
+e4m3 LUT (`e4m3_lut_build`) ports directly to a 256-float `shared` array — and prefer
+the LUT to a live `exp2` call, since GLSL specifies `exp2` only to 3 ULP.
+
+**Index width.** GLSL `uint` row arithmetic wraps at 2^32 elements = 4.29e9. `gemv_f32`
+(router gate, 256x5120 = 1.3e6) is nowhere near it, but `lm_head` via `gemv_i8` is
+151552x5120 = 7.76e8 — only 5.5x of margin, and it would wrap SILENTLY into another
+allocation. Use `uint64_t` row indices from `gemv_i8`/`gemv_fp8`/`moe_*` onward
+(`GL_EXT_shader_explicit_arithmetic_types_int64` is already enabled and `shaderInt64`
+already required) and record the ceiling per kernel as you port.
 
 ## Backend selection
 
@@ -274,8 +293,17 @@ is real, not because the plan exists.
 
 ## Risks
 
+- **The inter-dispatch barrier covers COMPUTE→COMPUTE only.** `Gpu::enqueue` emits
+  `SHADER_WRITE → SHADER_READ|SHADER_WRITE` between dispatches, which is what makes a
+  `launch_*` sequence behave like HIP's default stream. The moment `vkCmdCopyBuffer`
+  arrives — the copy pool, arena compaction, H2D staging — both the stage and access
+  masks need `TRANSFER` added, or the copies are unordered against the dispatches.
+  With no validation layer that failure reads as **garbage numbers, not a hang**.
 - **Subgroup size control** may be unavailable or ignored on some drivers; a wave64
-  fallback means re-tuning `ROWS_PER_BLOCK` and re-validating determinism.
+  fallback means re-tuning `ROWS_PER_BLOCK` and re-validating determinism. Note the
+  concrete shape of that failure: `gemv_f32.comp` maps rows by `gl_SubgroupID`, so a
+  wave64 subgroup halves `gl_NumSubgroups` and rows 4..7 of every workgroup are simply
+  never written — stale contents, no fault, no diagnostic. Only an oracle catches it.
 - **No validation layer on this box** (standing, unmitigated). `VK_LAYER_KHRONOS_validation`
   is not installed on the gfx1151 node and installing it needs root
   (`media-libs/vulkan-layers` on Gentoo). This is the worst gap in the port: passing

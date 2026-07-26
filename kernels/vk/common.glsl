@@ -8,16 +8,30 @@
 #ifndef RIVOLI_COMMON_GLSL
 #define RIVOLI_COMMON_GLSL
 
-// ponytail: WAVE=32 hardcoded for gfx1151 (RDNA3.5, native wave32), and the pipeline
-// pins it with requiredSubgroupSize=32 + REQUIRE_FULL_SUBGROUPS — so unlike the HIP
-// side this is enforced by the driver, not merely assumed.
-#define WAVE 32
-#define ROWS_PER_BLOCK 8  // block = 256 threads = 8 subgroups → 8 output rows/block
+// WAVE and ROWS_PER_BLOCK are injected by build.rs with -D, from the SAME constants
+// it uses to generate the Rust side's copy. They are deliberately NOT #defined here:
+// the launcher's grid arithmetic and the shader's row mapping must agree, and a
+// "must match" comment across two languages is not agreement. gfx1151 is native
+// wave32 and the pipeline pins it with requiredSubgroupSize + REQUIRE_FULL_SUBGROUPS,
+// so unlike the HIP side the wave width is driver-enforced rather than assumed.
+#if !defined(WAVE) || !defined(ROWS_PER_BLOCK)
+#error "WAVE/ROWS_PER_BLOCK must come from build.rs (-DWAVE=.. -DROWS_PER_BLOCK=..)"
+#endif
 
-// Sum a subgroup's partials into lane 0. subgroupShuffleDown, NOT subgroupAdd:
-// subgroupAdd's summation order is implementation-defined, and greedy decode must be
-// reproducible. This is the same fixed halving ladder as common.hpp::wave_sum, so the
-// two backends round identically.
+// Sum a subgroup's partials into LANE 0. subgroupShuffleDown, NOT subgroupAdd:
+// subgroupAdd's summation order is implementation-defined and greedy decode must be
+// reproducible. Same fixed halving ladder as common.hpp::wave_sum, so the two backends
+// round identically at lane 0. (build.rs also rejects any module that declares the
+// GroupNonUniformArithmetic capability, so this is enforced, not merely requested.)
+//
+// LANE 0 ONLY. This is where the GLSL and the HIP diverge: HIP's
+// __shfl_down(v, o, 32) returns the CALLER'S OWN value when lane+o >= 32, so every
+// lane ends holding a well-defined partial. SPIR-V's OpGroupNonUniformShuffleDown
+// leaves the result UNDEFINED in that case, so lanes >= o hold garbage here. The
+// induction still puts the true total in lane 0 — at offset o, lane j < o reads lane
+// j+o, whose value came from offset 2o over lanes j+o and j+3o < 4o <= 32, always in
+// range — but a kernel that reads wave_sum's result on any other lane is correct
+// under HIP and silently wrong under Vulkan. Every caller must guard with lane == 0.
 float wave_sum(float v) {
     for (uint o = WAVE / 2u; o > 0u; o >>= 1) v += subgroupShuffleDown(v, o);
     return v;

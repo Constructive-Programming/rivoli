@@ -7,7 +7,8 @@
 #![cfg(feature = "vulkan")]
 #![allow(clippy::expect_used)]
 
-use rivoli::vk::{Buf, device_sync, launch_gemv_f32};
+use rivoli::vk::{Buf, ROWS_PER_BLOCK, VALIDATION_ERRORS, device_sync, gpu, launch_gemv_f32};
+use std::sync::atomic::Ordering;
 
 fn f32b(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
@@ -22,26 +23,37 @@ fn dev(b: &[u8]) -> Buf {
     d.write_at(0, b).expect("fill");
     d
 }
+/// Report the max error AND the threshold it was compared against. Printing the
+/// margin is the point: a green oracle that passed on 100x of headroom looks exactly
+/// like one that passed on 2x, and only one of them is evidence.
 fn assert_close(want: &[f32], got: &[f32], label: &str) {
     let mx = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     let err = want
         .iter()
         .zip(got)
         .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
-    assert!(
-        err <= 1e-3 * mx + 1e-3,
-        "{label}: err={err:.3e} max={mx:.3e}"
-    );
+    let tol = 1e-3 * mx + 1e-3;
+    println!("{label}: err={err:.3e} tol={tol:.3e} margin={:.1}x", tol / err.max(f32::MIN_POSITIVE));
+    assert!(err <= tol, "{label}: err={err:.3e} > tol={tol:.3e}");
 }
 
 struct Lcg(u64);
 impl Lcg {
+    /// Uniform in [-1, 1).
+    ///
+    /// `>> 32`, not `>> 33`: the old shift left 31 bits, which over `u32::MAX` gives
+    /// [0, 0.5) and therefore `*2 - 1` in [-1, 0) — EVERY SAMPLE NEGATIVE. In a GEMV
+    /// oracle that makes every product positive, so the sums grow instead of
+    /// cancelling, `mx` inflates, and the relative tolerance turns into ~100x of
+    /// headroom. It also meant no oracle ever exercised cancellation — the one regime
+    /// where summation order matters, and the entire reason `wave_sum` is a fixed
+    /// ladder.
     fn f(&mut self) -> f32 {
         self.0 = self
             .0
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        ((self.0 >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        ((self.0 >> 32) as f32 / u32::MAX as f32) * 2.0 - 1.0
     }
 }
 
@@ -55,10 +67,17 @@ fn matvec_f32(y: &mut [f32], x: &[f32], w: &[f32], i_dim: usize) {
     }
 }
 
-/// One `gemv_f32` dispatch, returning the raw output bytes.
+/// One `gemv_f32` dispatch + sync, returning the raw output bytes.
 fn gemv(x: &Buf, w: &Buf, y: &mut Buf, o_dim: usize, i_dim: usize) -> Vec<u8> {
+    launch(x, w, y, o_dim, i_dim);
+    device_sync().expect("sync");
+    read(y, o_dim)
+}
+
+/// Enqueue only — no sync. Used to build a multi-dispatch command buffer.
+fn launch(x: &Buf, w: &Buf, y: &mut Buf, o_dim: usize, i_dim: usize) {
     // SAFETY: live Buf device addresses of the documented sizes; nothing is dropped
-    // before the device_sync below.
+    // before the caller's device_sync.
     unsafe {
         launch_gemv_f32(
             x.ptr() as *const f32,
@@ -69,10 +88,104 @@ fn gemv(x: &Buf, w: &Buf, y: &mut Buf, o_dim: usize, i_dim: usize) -> Vec<u8> {
         )
         .expect("launch");
     }
-    device_sync().expect("sync");
+}
+
+fn read(y: &Buf, n: usize) -> Vec<u8> {
     let mut out = Vec::new();
-    y.read_into(&mut out, o_dim * 4).expect("out");
+    y.read_into(&mut out, n * 4).expect("out");
     out
+}
+
+/// Fail the run if the validation layer said anything. Costs nothing when the layer
+/// is absent, and prints whether it was there at all — a green oracle from an
+/// unvalidated run must not read like a validated one.
+fn assert_validation_clean(label: &str) {
+    let g = gpu().expect("vulkan init");
+    let n = VALIDATION_ERRORS.load(Ordering::Relaxed);
+    println!(
+        "{label}: validation layer {}",
+        if g.validation() {
+            "ON"
+        } else {
+            "OFF — THIS RUN IS UNVALIDATED"
+        }
+    );
+    assert_eq!(n, 0, "{label}: {n} validation messages");
+}
+
+#[test]
+fn gemv_f32_matches_oracle() {
+    let mut r = Lcg(0x3F2);
+    // Shapes chosen for the edges, not for realism:
+    //   256x5120  the router-gate shape the kernel exists for;
+    //   255x512   o_dim not a multiple of ROWS_PER_BLOCK — the tail workgroup has
+    //             idle subgroups that must not write;
+    //   1x96      a single row, grid of one;
+    //   33x97     NEITHER dim is a multiple of WAVE=32, so the strided inner loop
+    //             leaves a partial final iteration and lanes diverge before wave_sum;
+    //   7x33      both tiny and both ragged.
+    for (o_dim, i_dim) in [
+        (256usize, 5120usize),
+        (255, 512),
+        (1, 96),
+        (33, 97),
+        (7, 33),
+    ] {
+        let w: Vec<f32> = (0..o_dim * i_dim).map(|_| r.f()).collect();
+        let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
+
+        let mut want = vec![0.0f32; o_dim];
+        matvec_f32(&mut want, &x, &w, i_dim);
+
+        let (xb, wb) = (dev(&f32b(&x)), dev(&f32b(&w)));
+        // Guard band: allocate a whole extra workgroup's worth of rows and poison
+        // them. `o_dim = 255` leaves subgroup 7 of the tail workgroup out of range and
+        // it must not write — but at exactly o_dim*4 bytes an overrun lands in the
+        // allocation's rounding slack and nothing notices.
+        let guard = ROWS_PER_BLOCK as usize;
+        let mut yb = dev(&f32b(&vec![f32::NAN; o_dim + guard]));
+        launch(&xb, &wb, &mut yb, o_dim, i_dim);
+        device_sync().expect("sync");
+        let out = f32v(&read(&yb, o_dim + guard));
+        assert!(
+            out[o_dim..].iter().all(|v| v.is_nan()),
+            "gemv_f32 {o_dim}x{i_dim}: wrote past row {o_dim}"
+        );
+        assert_close(&want, &out[..o_dim], &format!("gemv_f32 {o_dim}x{i_dim}"));
+    }
+    assert_validation_clean("gemv_f32_matches_oracle");
+}
+
+/// The inter-dispatch barrier in `Gpu::enqueue` is the most consequential unvalidated
+/// primitive in the backend, and until this test existed NOTHING covered it: every
+/// other test records one dispatch and then syncs, so deleting the barrier entirely
+/// would not have failed anything.
+///
+/// Two chained dispatches in ONE command buffer with ONE sync — the second consumes
+/// the first's output as its input — so the result is only correct if the barrier
+/// actually orders the write before the read.
+#[test]
+fn chained_dispatch_respects_the_barrier() {
+    let mut r = Lcg(0xBA2);
+    let (n, mid) = (64usize, 96usize);
+    let a: Vec<f32> = (0..mid * n).map(|_| r.f()).collect(); // [mid, n]
+    let b: Vec<f32> = (0..n * mid).map(|_| r.f()).collect(); // [n, mid]
+    let x: Vec<f32> = (0..n).map(|_| r.f()).collect();
+
+    let mut t = vec![0.0f32; mid];
+    matvec_f32(&mut t, &x, &a, n);
+    let mut want = vec![0.0f32; n];
+    matvec_f32(&mut want, &t, &b, mid);
+
+    let (xb, ab, bb) = (dev(&f32b(&x)), dev(&f32b(&a)), dev(&f32b(&b)));
+    let mut tb = dev(&f32b(&vec![0.0f32; mid]));
+    let mut yb = dev(&f32b(&vec![0.0f32; n]));
+
+    launch(&xb, &ab, &mut tb, mid, n); // t = A·x
+    launch(&tb, &bb, &mut yb, n, mid); // y = B·t   <- needs t complete
+    device_sync().expect("sync"); // ONE sync for both
+    assert_close(&want, &f32v(&read(&yb, n)), "chained A then B");
+    assert_validation_clean("chained_dispatch");
 }
 
 /// Greedy decode must be reproducible run to run, which is a STRICTER property than
@@ -109,24 +222,34 @@ fn gemv_f32_is_bit_reproducible() {
         f32v(&first).iter().any(|v| v.abs() > 1e-6),
         "output is all zero — the test proves nothing"
     );
+    assert_validation_clean("gemv_f32_is_bit_reproducible");
 }
 
+/// The guards report errors rather than tripping a Vulkan VUID or allocating nothing.
 #[test]
-fn gemv_f32_matches_oracle() {
-    let mut r = Lcg(0x3F2);
-    // n_experts × hidden — the router-gate shape the kernel exists for. o_dim is
-    // deliberately NOT a multiple of ROWS_PER_BLOCK, so the tail block's partly-idle
-    // subgroups are exercised.
-    for (o_dim, i_dim) in [(256usize, 5120usize), (255, 512), (1, 96)] {
-        let w: Vec<f32> = (0..o_dim * i_dim).map(|_| r.f()).collect();
-        let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
+fn guards_reject_degenerate_arguments() {
+    assert!(Buf::new(0).is_err(), "Buf::new(0) must be rejected");
 
-        let mut want = vec![0.0f32; o_dim];
-        matvec_f32(&mut want, &x, &w, i_dim);
+    let mut b = dev(&[0u8; 64]);
+    assert!(b.write_at(0, &[0u8; 65]).is_err(), "overlong write");
+    assert!(b.write_at(64, &[0u8; 1]).is_err(), "write at the end");
+    // The bounds check must not wrap: off + len overflows usize here, and an
+    // `off + len <= self.len` test would compute a small number and let it through.
+    assert!(b.write_at(usize::MAX, &[0u8; 8]).is_err(), "wrapping offset");
+    assert!(b.read_into(&mut Vec::new(), 65).is_err(), "overlong read");
 
-        let (xb, wb) = (dev(&f32b(&x)), dev(&f32b(&w)));
-        let mut yb = dev(&vec![0u8; o_dim * 4]);
-        let out = gemv(&xb, &wb, &mut yb, o_dim, i_dim);
-        assert_close(&want, &f32v(&out), &format!("gemv_f32 {o_dim}x{i_dim}"));
+    let mut y = dev(&[0u8; 16]);
+    // SAFETY: zero dims are rejected before any pointer is used.
+    unsafe {
+        assert!(
+            launch_gemv_f32(b.ptr() as *const f32, b.ptr() as *const f32, 0, 4, y.ptr_mut() as *mut f32)
+                .is_err(),
+            "o_dim = 0 must be rejected"
+        );
+        assert!(
+            launch_gemv_f32(b.ptr() as *const f32, b.ptr() as *const f32, 4, 0, y.ptr_mut() as *mut f32)
+                .is_err(),
+            "i_dim = 0 must be rejected"
+        );
     }
 }

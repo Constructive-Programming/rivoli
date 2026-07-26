@@ -28,6 +28,13 @@ layout(push_constant) uniform Push {
 
 void main() {
     uint lane = gl_SubgroupInvocationID;
+    // Valid only while gl_NumSubgroups == ROWS_PER_BLOCK, i.e. while local_size_x /
+    // requiredSubgroupSize == ROWS_PER_BLOCK. The pipeline pins requiredSubgroupSize
+    // to WAVE and the launcher's grid is o_dim/ROWS_PER_BLOCK, so they agree by
+    // construction today. Under the wave64 fallback docs/VULKAN.md lists as a risk,
+    // gl_NumSubgroups would drop to 4 and rows 4..7 of EVERY workgroup would simply
+    // never be written — y keeps its previous contents, no fault, no diagnostic. The
+    // oracle catches it; nothing else would.
     uint o = gl_WorkGroupID.x * ROWS_PER_BLOCK + gl_SubgroupID;
     // Uniform across the subgroup (o depends only on gl_SubgroupID), so the whole
     // subgroup exits together and wave_sum below always runs fully populated.
