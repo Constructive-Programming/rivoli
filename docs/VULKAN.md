@@ -670,10 +670,32 @@ having no choice to make. Here they can genuinely diverge, and it has nothing to
 The same shape appears at `l = l * corr + p` (unambiguous — one multiply) and at
 `sum += partial[..] * w[s]` in the combine (unambiguous). It is `acc[k]` specifically.
 
-**So the pre-registered suspect list for the token-ID gate gains an entry that is not a
-transcendental**, and it is checkable ahead of the gate: disassemble both backends' inner
-loops and compare which multiply got fused. If they differ, the fix is to force the
-grouping explicitly on both sides rather than to hope.
+**MEASURED, BEFORE WRITING THE SHADER — HIP's choice is now a known constraint rather than
+a suspect.** `hipcc --offload-arch=gfx1151 -O3 --cuda-device-only -S kernels/attn.hip`, in
+`mla_latent_attend`'s unrolled accumulator loop:
+
+```
+v_mul_f32_e32  v42, v28, v42    ; v42 = acc[k] * corr   — PLAIN multiply
+v_fmac_f32_e32 v42, v1,  v5     ; v42 = fma(p, Lt[k], v42)
+```
+
+repeated once per unrolled `k`. So HIP evaluates
+
+```
+acc[k] = fma(p, Lt[k], acc[k] * corr)
+```
+
+— it fuses the `p·Lt` multiply and leaves `acc·corr` unfused. **That is the form the GLSL
+must produce**, and it is now checkable rather than hopeful: write the shader, disassemble
+it, and confirm RADV fuses the same side. If it picks the other, force the grouping
+explicitly on both sides — the cheapest lever is a named temporary for `acc[k] * corr`,
+which removes the compiler's freedom to choose.
+
+Note how cheap this was. The GPU is the scarce resource and the compiler is not: this
+question was answered on the CPU in seconds, before a line of 2c existed, exactly as
+`benchmarks.md`'s "Read the ISA before you book the device" prescribes. It also would not
+have been ASKED without the FMA finding, which is the argument for recording mechanisms
+rather than symptoms.
 
 **2c also carries three same-spelling hazards at once.** Meeting them as design decisions
 beats meeting them as a red oracle:
