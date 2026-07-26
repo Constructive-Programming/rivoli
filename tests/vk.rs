@@ -185,36 +185,70 @@ fn gemv_f32_matches_oracle() {
     v.check("gemv_f32_matches_oracle");
 }
 
-/// The inter-dispatch barrier in `Gpu::enqueue` is the most consequential unvalidated
-/// primitive in the backend, and until this test existed NOTHING covered it: every
-/// other test records one dispatch and then syncs, so deleting the barrier entirely
-/// would not have failed anything.
+/// The inter-dispatch barrier in `Gpu::enqueue`, exercised hard enough that its
+/// ABSENCE is detectable.
 ///
-/// Two chained dispatches in ONE command buffer with ONE sync — the second consumes
-/// the first's output as its input — so the result is only correct if the barrier
-/// actually orders the write before the read.
+/// Sizing is the whole point and is not arbitrary. A 64x96 version of this test passed
+/// 8/8 with the barrier deleted — too small to overlap, so it guarded nothing while
+/// carrying a name that claimed otherwise. To make a missing barrier observable the
+/// second dispatch has to actually start before the first has finished, which needs
+/// (a) enough workgroups to fill the machine several times over, (b) each output row
+/// depending on EVERY input element, so an early workgroup of step N+1 reads a row that
+/// a late workgroup of step N is still writing, and (c) a chain long enough that one
+/// escaped hazard anywhere shows up at the end.
+///
+/// 2048x2048 is 256 workgroups per dispatch at 8 rows each, four steps deep, one sync
+/// at the very end. Everything is in ONE command buffer, so the barrier is the only
+/// thing ordering the steps.
 #[test]
 fn chained_dispatch_respects_the_barrier() {
     let v = Validation::new();
     let mut r = Lcg(0xBA2);
-    let (n, mid) = (64usize, 96usize);
-    let a: Vec<f32> = (0..mid * n).map(|_| r.f()).collect(); // [mid, n]
-    let b: Vec<f32> = (0..n * mid).map(|_| r.f()).collect(); // [n, mid]
+    let n = 2048usize;
+    const STEPS: usize = 32;
+
+    // Near-identity matrices: unit diagonal plus small noise. A random matrix chained
+    // four deep either explodes or collapses to noise, and then a corrupted
+    // intermediate is indistinguishable from the arithmetic. This keeps every step
+    // O(1) in magnitude so a stale row survives to the output as a visible error.
+    let one = {
+        let mut m = vec![0.0f32; n * n];
+        for i in 0..n {
+            m[i * n + i] = 1.0;
+            m[i * n + (i + 1) % n] = 0.05 * r.f();
+        }
+        m
+    };
+    let mats: Vec<Vec<f32>> = (0..STEPS).map(|_| one.clone()).collect();
     let x: Vec<f32> = (0..n).map(|_| r.f()).collect();
 
-    let mut t = vec![0.0f32; mid];
-    matvec_f32(&mut t, &x, &a, n);
-    let mut want = vec![0.0f32; n];
-    matvec_f32(&mut want, &t, &b, mid);
+    let mut want = x.clone();
+    for m in &mats {
+        let mut next = vec![0.0f32; n];
+        matvec_f32(&mut next, &want, m, n);
+        want = next;
+    }
 
-    let (xb, ab, bb) = (dev(&f32b(&x)), dev(&f32b(&a)), dev(&f32b(&b)));
-    let mut tb = dev(&f32b(&vec![0.0f32; mid]));
-    let mut yb = dev(&f32b(&vec![0.0f32; n]));
+    let mbufs: Vec<Buf> = mats.iter().map(|m| dev(&f32b(m))).collect();
+    let xb = dev(&f32b(&x));
+    let mut ping = dev(&f32b(&vec![0.0f32; n]));
+    let mut pong = dev(&f32b(&vec![0.0f32; n]));
 
-    launch(&xb, &ab, &mut tb, mid, n); // t = A·x
-    launch(&tb, &bb, &mut yb, n, mid); // y = B·t   <- needs t complete
-    device_sync().expect("sync"); // ONE sync for both
-    assert_close(&want, &f32v(&read(&yb, n)), "chained A then B");
+    // step 0 reads xb; every later step reads the previous step's output.
+    launch(&xb, &mbufs[0], &mut ping, n, n);
+    for (i, mb) in mbufs.iter().enumerate().skip(1) {
+        if i % 2 == 1 {
+            launch(&ping, mb, &mut pong, n, n);
+        } else {
+            launch(&pong, mb, &mut ping, n, n);
+        }
+    }
+    device_sync().expect("sync"); // ONE sync, after the whole chain
+    // Launch k writes ping for even k and pong for odd k, so after STEPS launches the
+    // result is in pong when STEPS is even. (Had this inverted first; the test then
+    // failed identically with and without the barrier, which is what caught it.)
+    let out = if STEPS.is_multiple_of(2) { &pong } else { &ping };
+    assert_close(&want, &f32v(&read(out, n)), "4-step chain");
     v.check("chained_dispatch");
 }
 

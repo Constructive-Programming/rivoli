@@ -214,8 +214,19 @@ implementation-defined. Use `subgroupShuffleDown` and keep the same halving ladd
 one waiter thread blocking in `vkWaitSemaphores` on a timeline semaphore, resolving the
 `Signal` for each value it observes. The `Signal` API (`pending`/`ready`/`arm_on`/
 `resolve`) stays as-is, so `asyncfetch.rs` and the expert stream in `gpu.rs` do not
-change. Measure the latency — a thread wakeup may beat 19 µs or may not; if it
-regresses, batch several completions per semaphore value.
+change.
+
+**MEASURED: 19.28 µs/signal** (200 iterations, `timeline_signal_resolves_and_latency`),
+against the HIP path's ~19 µs. A thread wakeup neither beats `hipLaunchHostFunc` nor
+regresses against it — the two are within noise, so the contingency of batching several
+completions per semaphore value is not needed, and the async overlap costs the same on
+either backend. Do not treat this as headroom: at ~9 signals per layer over 78 layers
+it is ~13 ms/token on both paths, which is a real cost that simply is not a REASON to
+prefer HIP.
+
+One caveat on the number: it was measured with the rest of the suite running on
+parallel threads against the same queue. That makes it an upper bound under contention
+rather than a quiet-machine best case, which is the more useful figure here anyway.
 
 ## Kernel inventory — port 16 of 29
 
@@ -385,27 +396,54 @@ is real, not because the plan exists.
 
 ## Risks
 
-- **Synchronisation validation does not cover compute→transfer on this stack, so the
-  barrier's TRANSFER masks are SPEC-DERIVED, NOT VERIFIED.** `Gpu::enqueue` now scopes
-  both COMPUTE and TRANSFER on each side, which is required once `memcpy_dtod` records
-  a `vkCmdCopyBuffer` next to dispatches. But the checker cannot confirm it: with the
-  barrier removed **entirely**, an unsynchronised compute-write → transfer-read is
-  reported as nothing at all. That is not a buffer-device-address blind spot — a
-  descriptor-bound write is equally invisible (`docs/probes/vk_validation`,
-  `compute-copy` and `compute-copy-desc`), while transfer↔transfer fires normally.
+- **Synchronisation validation covers only transfer↔transfer on this stack. Every
+  barrier in this backend is SPEC-DERIVED, NOT VERIFIED.** Measured, not assumed: with
+  the barrier removed **entirely**, neither an unsynchronised compute→compute
+  read-modify-write pair nor a compute-write → transfer-read produces a single
+  message, while transfer↔transfer fires normally
+  (`docs/probes/vk_validation`: `compute-compute`, `compute-copy`,
+  `compute-copy-desc`, `sync`). It is not a buffer-device-address blind spot — a
+  descriptor-bound write is equally invisible, so moving off bare device addresses
+  would not buy coverage back.
 
-  This is the weakest evidence in the backend, and it is weak in the direction that
-  hurts: an unordered copy usually still returns the right bytes on this driver, so
-  neither the oracle nor the checker would catch it, and the failure would surface as
-  intermittent garbage under load.
+  A compute backend is dispatches almost exclusively, so this is close to no coverage
+  of the thing it is for.
 
-  **The same doubt applies to the compute→compute case until proven otherwise.**
-  `chained_dispatch_respects_the_barrier` passing under sync validation is only
-  evidence if the checker fires on that class, which has NOT been established — the
-  `compute-compute` probe mode exists to settle it and has not yet been run. Until it
-  has, treat the inter-dispatch barrier as spec-derived too. Assuming a checker that
-  fires on one hazard class covers another is exactly the error the probe matrix in
-  `docs/probes/README.md` exists to prevent.
+  **The COMPUTE→COMPUTE barrier is nonetheless empirically validated, by demonstration
+  rather than by a checker.** Deleting it makes
+  `chained_dispatch_respects_the_barrier` fail; restoring it makes the same test pass:
+
+  | | barrier removed | barrier present |
+  |---|---|---|
+  | 32-step chain, 2048×2048 | **2 of 8 runs FAIL** | 8 of 8 pass |
+  | 4-step chain, 2048×2048 | 8 of 8 pass | 8 of 8 pass |
+  | 2-step chain, 64×96 | 8 of 8 pass | 8 of 8 pass |
+
+  Intermittent failure on removal with a clean control arm is a real race, so the
+  barrier does observable work on this hardware. That is weaker than checker-verified
+  and much stronger than spec-derived.
+
+  Read the smaller rows too: at the sizes the test originally used, a **missing barrier
+  is undetectable**. Anyone adding an ordering test needs enough workgroups to fill the
+  machine several times over, every output depending on every input, and a chain long
+  enough for one escaped hazard to survive to the end. Below that you get a test that
+  passes either way — which is worse than none, because of the name on it.
+
+  Two caveats, because this guard is probabilistic and should not be sold as more.
+  Detection is ~25% per run, so a single green run does NOT prove a refactor kept the
+  barrier; a regression surfaces within a few runs, not reliably in one. And it costs
+  7.4 s of the suite's 7.5 s total. `memcpy_dtod_after_dispatch_is_ordered` has no
+  equivalent construction yet, so COMPUTE→TRANSFER remains spec-derived only.
+
+  **Second, independent evidence that this cover is thin.** The Phase 2 correctness
+  review found that `DeviceBuf`'s copies did not synchronise where `hipMemcpy` blocks —
+  at integration, `gpu.rs:789` would have read the *previous* token's gate logits and
+  mis-routed every expert on every layer. That is squarely the class synchronisation
+  validation exists to catch, and it was found by human review of the diff, not by any
+  checker. Two independent routes to the same conclusion: **on this stack, review is
+  the primary defence for ordering bugs and the layer is a secondary one.** Budget
+  Phase 3 accordingly — a ported kernel's clean validation run is not evidence that its
+  synchronisation is right, and the oracles do not test ordering either.
 - **Subgroup size control** may be unavailable or ignored on some drivers; a wave64
   fallback means re-tuning `ROWS_PER_BLOCK` and re-validating determinism. Note the
   concrete shape of that failure: `gemv_f32.comp` maps rows by `gl_SubgroupID`, so a

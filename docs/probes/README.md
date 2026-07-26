@@ -49,14 +49,20 @@ deal here:
 | hazard class | access model | fires? |
 |---|---|---|
 | transfer ↔ transfer | n/a | **yes** (`sync`) |
-| compute → compute | buffer reference | **UNKNOWN — run `compute-compute`** |
+| compute → compute | buffer reference | **no** (`compute-compute`) |
 | compute → transfer | buffer reference | **no** (`compute-copy`) |
 | compute → transfer | descriptor | **no** (`compute-copy-desc`) |
 
-The last two are what make the third row load-bearing: the silence is NOT a
-buffer-device-address blind spot, since a descriptor-bound write is equally invisible.
-Whatever the cause, `Gpu::enqueue`'s TRANSFER masks cannot be verified by this checker
-on this stack, and are therefore spec-derived only.
+**Synchronisation validation on this stack covers only transfer↔transfer.** Every
+hazard class involving a compute dispatch is invisible, with or without a barrier, and
+whether the shader reaches memory through a descriptor or a buffer reference. Since a
+compute backend is dispatches almost exclusively, that is close to no coverage of the
+thing it is for: `Gpu::enqueue`'s barrier — both its COMPUTE→COMPUTE and its
+COMPUTE→TRANSFER scoping — is spec-derived, and a clean suite says nothing about it.
+
+The descriptor row is what stops the easy explanation. This is not a
+buffer-device-address blind spot; a descriptor-bound write is equally invisible, so
+switching away from bare device addresses would not buy coverage back.
 
 Anything the matrix marks "no" must be treated as UNVERIFIED in the code that depends
 on it, however clean the suite looks. A row is only evidence if the corresponding probe
@@ -81,8 +87,8 @@ session; "it fired last time" is not evidence about this time.
 
 Last established on RADV STRIX_HALO (AMD Radeon 8060S),
 `VK_LAYER_KHRONOS_validation` 1.4.341, Vulkan 1.4.335 loader:
-`core` **fires**, `sync` **fires**, `gpuav` **fires**, `compute-copy` **silent**,
-`compute-copy-desc` **silent**, `compute-compute` **not yet run**.
+`core` **fires**, `sync` **fires**, `gpuav` **fires**,
+`compute-compute` **silent**, `compute-copy` **silent**, `compute-copy-desc` **silent**.
 
 ## Traps worth knowing
 
