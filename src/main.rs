@@ -10,10 +10,13 @@ use anyhow::{Context, Result, bail};
 use rivoli::config::Config;
 use tracing::info;
 
-/// CLI: `rivoli <model-dir> [-bench <tokens>] [flags]`. `--cache-policy lru|2q|arc`
-/// (default 2q) picks the eviction policy; `--direct-vmm-dma` forces raw DMA over the
+/// CLI: `rivoli <model-dir> [-bench <tokens>] [flags]`. `--cache-policy lru|2q|arc|top-m`
+/// (default 2q) picks the cache policy — `top-m` additionally routes toward resident
+/// experts (`--route-j`/`--route-m`, docs/CACHE_ROUTE.md), which is the one policy that
+/// changes the model's output; `--direct-vmm-dma` forces raw DMA over the
 /// default pinned-host bounce; `--trace <path>` dumps the routed-expert access trace
-/// for the offline `replay` sim; `--prompt <text>` overrides the bench prompt;
+/// (v2: demand keys plus the ranked candidate window) for the offline `replay` sim;
+/// `--prompt <text>` overrides the bench prompt;
 /// `--max-mem <GiB>` sets the device budget literally (no OS reserve — may OOM);
 /// without it the budget auto-sizes to `free − 16 GiB`.
 struct Args {
@@ -25,6 +28,13 @@ struct Args {
     cache_policy: String,
     two_q_kin: u32,
     two_q_kout: u32,
+    /// `--cache-policy top-m`'s (J, M); ignored by every other policy.
+    route: rivoli::hybrid::RouteAdvice,
+    /// `--ppl <text-file>`: score that file TEACHER-FORCED and write one NLL per
+    /// predicted token to `--ppl-out`, instead of generating. The quality gate for
+    /// `top-m` (docs/CACHE_ROUTE.md "Quality"); never a free-running decode.
+    ppl: Option<String>,
+    ppl_out: Option<String>,
     max_mem: Option<u64>,
     /// Routed-expert format (`--mode int3-vq|int4|hybrid`, default hybrid).
     mode: rivoli::config::Mode,
@@ -42,8 +52,9 @@ struct Args {
 fn parse_args() -> Result<Args> {
     const USAGE: &str = "usage: rivoli <model-dir> [-bench <tokens>] \
          [--mode int3-vq|int4|hybrid] [--direct-vmm-dma] \
-         [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc] [--2q-kin <pct>] \
-         [--2q-kout <pct>] [--max-mem <GiB>] \
+         [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc|top-m] [--2q-kin <pct>] \
+         [--2q-kout <pct>] [--route-j <n>] [--route-m <n>] [--max-mem <GiB>] \
+         [--ppl <text-file>] [--ppl-out <path>] \
          [--attn auto|dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>]";
     let mut model = None;
     let mut a = Args {
@@ -55,6 +66,9 @@ fn parse_args() -> Result<Args> {
         cache_policy: "2q".to_string(),
         two_q_kin: rivoli::cache::TwoQSplit::default().kin_pct(),
         two_q_kout: rivoli::cache::TwoQSplit::default().kout_pct(),
+        route: rivoli::hybrid::RouteAdvice::default(),
+        ppl: None,
+        ppl_out: None,
         max_mem: None,
         mode: rivoli::config::Mode::default(),
         attn: "auto".to_string(),
@@ -80,7 +94,25 @@ fn parse_args() -> Result<Args> {
             "--trace" => a.trace = Some(args.next().context("--trace requires a path")?),
             "--prompt" => a.prompt = Some(args.next().context("--prompt requires text")?),
             "--cache-policy" => {
-                a.cache_policy = args.next().context("--cache-policy requires lru|2q|arc")?;
+                a.cache_policy = args
+                    .next()
+                    .context("--cache-policy requires lru|2q|arc|top-m")?;
+            }
+            "--ppl" => a.ppl = Some(args.next().context("--ppl requires a text file")?),
+            "--ppl-out" => a.ppl_out = Some(args.next().context("--ppl-out requires a path")?),
+            "--route-j" => {
+                a.route.j = args
+                    .next()
+                    .context("--route-j requires an integer")?
+                    .parse()
+                    .context("--route-j takes an integer")?;
+            }
+            "--route-m" => {
+                a.route.m = args
+                    .next()
+                    .context("--route-m requires an integer")?
+                    .parse()
+                    .context("--route-m takes an integer")?;
             }
             "--2q-kin" => {
                 a.two_q_kin = args
@@ -181,6 +213,8 @@ fn resolve_attn(a: &Args) -> Result<rivoli::attn::AttnMode> {
 fn main() -> Result<()> {
     let a = parse_args()?;
     let attn = resolve_attn(&a)?;
+    // Bound before `a` is partially moved into `discover` below.
+    let (a_ppl, a_ppl_out) = (a.ppl.clone(), a.ppl_out.clone());
     #[cfg(feature = "trace")]
     let checksum_x = a.checksum_x;
     #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
@@ -192,6 +226,7 @@ fn main() -> Result<()> {
         a.prompt,
         a.cache_policy,
         rivoli::cache::TwoQSplit::new(a.two_q_kin, a.two_q_kout)?,
+        a.route,
         a.max_mem,
         attn,
     )?;
@@ -200,6 +235,8 @@ fn main() -> Result<()> {
         cfg.checksum_x = checksum_x;
     }
     cfg.mode = a.mode;
+    // Mode-dependent, so it cannot live in `discover` — see Config::validate.
+    cfg.validate()?;
 
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -251,9 +288,30 @@ fn main() -> Result<()> {
         tok.eos
     );
 
-    let ngen = cfg
-        .bench
-        .context("server mode not yet implemented; use -bench <tokens>")?;
+    // `--ppl` scores a fixed text instead of generating, so `-bench` is meaningless there.
+    let ppl_ids = match &a_ppl {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("read --ppl text {path}"))?;
+            let ids = tok.encode(&text)?;
+            // The corpus is part of the measurement, so its identity goes in the log next
+            // to the numbers — a quality claim whose text drifted is worth nothing later.
+            info!(
+                "ppl corpus {path:?}: {} bytes, {} tokens, fnv1a64 {}",
+                text.len(),
+                ids.len(),
+                rivoli::math::fnv1a64_hex(text.as_bytes()),
+            );
+            Some(ids)
+        }
+        None => None,
+    };
+    let ngen = if ppl_ids.is_some() {
+        0
+    } else {
+        cfg.bench
+            .context("server mode not yet implemented; use -bench <tokens>")?
+    };
 
     #[cfg(feature = "rocm")]
     {
@@ -297,11 +355,18 @@ fn main() -> Result<()> {
             cfg.trace.as_deref(),
             &cfg.cache_policy,
             cfg.two_q,
+            cfg.route,
             want_indexer,
             cfg.mode,
         )?;
         info!("pin built in {:.1}s", t.elapsed().as_secs_f64());
-        let max_ctx = prompt_ids.len() + ngen + 1;
+        // `--ppl` walks the CORPUS, not the bench prompt, and its `ngen` is 0 — sizing the
+        // KV cache from `prompt_ids` would allocate ~17 positions for an ~900-position
+        // scoring pass. Take whichever run this actually is.
+        let max_ctx = match &ppl_ids {
+            Some(ids) => ids.len() + 1,
+            None => prompt_ids.len() + ngen + 1,
+        };
         let mut engine = rivoli::gpu::GpuEngine::new(pin, &mc, max_ctx, cfg.attn.clone())?;
         #[cfg(feature = "trace")]
         engine.set_checksum_x(cfg.checksum_x);
@@ -314,6 +379,61 @@ fn main() -> Result<()> {
         engine.set_heartbeat(rivoli::watchdog::spawn(std::time::Duration::from_secs(
             wd_secs,
         ))?);
+        // --- `--ppl`: teacher-forced quality gate, not a decode -----------------------
+        // Returns before `generate` because the two are mutually exclusive by design:
+        // a free-running generation's own trajectory is the confound this measurement
+        // exists to remove.
+        if let Some(ids) = ppl_ids {
+            let t0 = std::time::Instant::now();
+            let nlls = engine.nll_forced(&ids)?;
+            let dt = t0.elapsed().as_secs_f64();
+            let mean = nlls.iter().map(|&v| v as f64).sum::<f64>() / nlls.len().max(1) as f64;
+            let (hits, misses) = (engine.hits(), engine.misses());
+            let hit_pct = 100.0 * hits as f64 / (hits + misses).max(1) as f64;
+            let swap = engine.swap_pct();
+            // The (J, M) actually in force, or None when the policy ignores them.
+            let top_m = (cfg.cache_policy == "top-m").then_some((cfg.route.j, cfg.route.m));
+            info!(
+                "PPL: {:.6} (mean NLL {mean:.6} over {} predicted tokens, {dt:.1}s) | \
+                 hit {hit_pct:.2}% | swap {}",
+                mean.exp(),
+                nlls.len(),
+                match swap {
+                    Some(s) => format!("{s:.2}%"),
+                    None => "n/a".to_string(),
+                },
+            );
+            // Per-token NLLs are the actual deliverable: two runs over the same text are
+            // PAIRED at every position, and differencing them detects a systematic shift
+            // far smaller than the sampling noise in two independent perplexities.
+            if let Some(path) = &a_ppl_out {
+                use std::io::Write;
+                let mut w = std::io::BufWriter::new(
+                    std::fs::File::create(path).with_context(|| format!("create {path}"))?,
+                );
+                writeln!(
+                    w,
+                    "# rivoli-nll v1 mode={} policy={} j={} m={} tokens={} hit_pct={hit_pct:.4} swap_pct={}",
+                    cfg.mode,
+                    cfg.cache_policy,
+                    // `--route-j`/`--route-m` default to (2, 12) whatever the policy, so a
+                    // baseline run would otherwise record knobs it never consulted. This
+                    // file is the measurement of record; a reader must be able to tell the
+                    // baseline from a cell by its header alone.
+                    top_m.map_or("na".into(), |(j, _)| j.to_string()),
+                    top_m.map_or("na".into(), |(_, m)| m.to_string()),
+                    nlls.len(),
+                    swap.map_or("na".to_string(), |s| format!("{s:.4}")),
+                )?;
+                for v in &nlls {
+                    writeln!(w, "{v:.8}")?;
+                }
+                w.flush().context("flush --ppl-out")?;
+                info!("wrote {} per-token NLLs to {path}", nlls.len());
+            }
+            return Ok(());
+        }
+
         let t0 = std::time::Instant::now();
         let (ids, summary) = engine.generate(&prompt_ids, ngen, &tok.eos)?;
         let dt = t0.elapsed().as_secs_f64();
@@ -334,7 +454,7 @@ fn main() -> Result<()> {
 
     #[cfg(not(feature = "rocm"))]
     {
-        let _ = (prompt_ids, ngen, bench_prompt);
+        let _ = (prompt_ids, ngen, bench_prompt, ppl_ids, a_ppl_out);
         bail!("rivoli was built without the `rocm` feature; rebuild with --features rocm to decode")
     }
 }

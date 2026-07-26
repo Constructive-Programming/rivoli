@@ -177,9 +177,10 @@ pub struct Pin<'a> {
     fetch: AsyncFetch,
     pub hits: u64,
     pub misses: u64,
-    /// Optional access-trace sink (`--trace`): one line per resolved MoE layer — the
-    /// `(layer,expert)` keys looked up, in access order. Feeds the offline `replay`
-    /// simulator.
+    /// Optional access-trace sink (`--trace`), format v2: a `#` header line, then one
+    /// line per resolved MoE layer — the `(layer,expert)` keys looked up in access
+    /// order, then `|`, then the top-[`TRACE_WINDOW`] router candidates as
+    /// `key:choice` in rank order. Feeds the offline `replay` simulator.
     trace: Option<std::io::BufWriter<std::fs::File>>,
 }
 
@@ -370,6 +371,15 @@ fn resident_bytes(cfg: &ModelConfig, block: usize, shared_i4: bool, cb_resident:
     total + if cb_resident { 3 * VQ_K * VQ_DIM * 2 } else { 0 }
 }
 
+/// Width of the trace-v2 candidate window: the top-W router candidates recorded per
+/// routing decision, on top of the `top_k` that actually ran. W bounds the largest M
+/// the offline (J, M) substitution grid in docs/CACHE_ROUTE.md can explore — an M
+/// wider than this cannot be evaluated from a captured trace without recapturing.
+/// 32 is 4× `top_k` (8) and an eighth of `n_experts` (256): far past any M where
+/// promoting a resident-but-lower-ranked expert is still defensible, and only ~380
+/// bytes a line.
+pub const TRACE_WINDOW: usize = 32;
+
 /// Pack `(layer, expert)` into the pool key. Both must fit in 16 bits — GLM is
 /// ≤92 layers × 256 routed experts, comfortably under 2^16.
 fn expert_key(layer: usize, expert: usize) -> u32 {
@@ -502,6 +512,7 @@ impl<'a> Pin<'a> {
         trace_path: Option<&str>,
         cache_policy: &str,
         two_q: cache::TwoQSplit,
+        route: crate::hybrid::RouteAdvice,
         want_indexer: bool,
         mode: Mode,
     ) -> Result<Self> {
@@ -707,8 +718,11 @@ impl<'a> Pin<'a> {
             Mode::Hybrid => (vq_tier()?, i4_tier()?),
         };
         let (cold_stride, hot_stride) = (cold.stride, hot.stride);
-        let policy = crate::hybrid::make(cache_policy, budget, cold_stride, hot_stride, two_q)
-            .with_context(|| format!("unknown --cache-policy {cache_policy} (lru|2q|arc)"))?;
+        let policy =
+            crate::hybrid::make(cache_policy, budget, cold_stride, hot_stride, two_q, route)
+                .with_context(|| {
+                    format!("unknown --cache-policy {cache_policy} (lru|2q|arc|top-m)")
+                })?;
         tracing::info!(
             "routed pool [{cache_policy} {mode}]: {:.1} GiB budget (~{} slots, cold {cold_stride}B / hot {hot_stride}B)",
             budget as f64 / (1u64 << 30) as f64,
@@ -756,9 +770,18 @@ impl<'a> Pin<'a> {
             misses: 0,
             trace: trace_path
                 .map(|p| -> Result<_> {
-                    Ok(std::io::BufWriter::new(
+                    use std::io::Write;
+                    let mut w = std::io::BufWriter::new(
                         std::fs::File::create(p).with_context(|| format!("open trace {p}"))?,
-                    ))
+                    );
+                    // Version header. It is deliberately unparseable as data: `replay`
+                    // reads each line for whitespace-separated u32s and drops the empty
+                    // ones, so this line contributes nothing and a v2 trace replays
+                    // through a v1 reader byte-identically.
+                    let top_k = cfg.top_k;
+                    writeln!(w, "# rivoli-trace v2 top_k={top_k} window={TRACE_WINDOW}")
+                        .context("write trace")?;
+                    Ok(w)
                 })
                 .transpose()?,
         })
@@ -782,6 +805,43 @@ impl<'a> Pin<'a> {
         self.shared_i4
     }
 
+    /// Is the `--trace` sink on? gpu.rs gates the candidate-window `topk_into` on this
+    /// so a non-tracing decode pays literally nothing for trace v2.
+    pub fn tracing(&self) -> bool {
+        self.trace.is_some()
+    }
+
+    /// The active policy's routing advice — `Some((j, m))` only under `--cache-policy
+    /// top-m`. gpu.rs reads this ONCE at engine construction: the policy is fixed for
+    /// the run, and `None` has to stay a compile-time-cheap early return on the hot
+    /// routing path.
+    pub fn route_advice(&self) -> Option<(usize, usize)> {
+        self.routed.policy.route_advice()
+    }
+
+    /// Is `(layer, expert)` resident? Deliberately routed through
+    /// [`HybridPolicy::contains`], which takes `&self` and does NOT refresh recency —
+    /// `get` would count the whole candidate window as an access and corrupt the
+    /// eviction clock, which is the failure mode that would make `top-m` look like it
+    /// works while destroying the cache underneath it.
+    pub fn resident(&self, layer: usize, expert: usize) -> bool {
+        self.routed.policy.contains(expert_key(layer, expert))
+    }
+
+    /// Flush the trace sink. Called per token, because the trace CANNOT rely on
+    /// `BufWriter`'s `Drop`: the wedge watchdog kills a hung decode with
+    /// `std::process::exit`, which runs no destructors, and `Drop` discards flush errors
+    /// anyway — so a wedged or ENOSPC run would leave a silently short capture with a
+    /// clean exit code. A trace is ~30 minutes of sole-tenant GPU time; losing it quietly
+    /// is far worse than one `write` per token. Errors propagate here, unlike in `Drop`.
+    pub fn flush_trace(&mut self) -> Result<()> {
+        if let Some(w) = &mut self.trace {
+            use std::io::Write;
+            w.flush().context("flush trace")?;
+        }
+        Ok(())
+    }
+
     /// Accumulated reaper fetch wall (ns) — the off-main-thread load cost the expert
     /// stream's compute overlaps. The profile reads it against the MoE wall.
     pub fn fetch_ns(&self) -> u64 {
@@ -798,6 +858,8 @@ impl<'a> Pin<'a> {
         &mut self,
         layer: usize,
         sel: &[usize],
+        window: &[usize],
+        choice: &[f32],
     ) -> Result<([Option<ResolvedSlot>; 32], Vec<Signal>)> {
         let cfg = self.cfg;
         let sparse = (layer - cfg.dense_layers) * cfg.n_experts; // read-table row base
@@ -809,7 +871,20 @@ impl<'a> Pin<'a> {
         // New batch: clear the policy's per-batch pin set. Phase 1a's protect() and 1b's
         // admit() then pin every touched key so a later miss's eviction can't reclaim it.
         self.routed.begin_batch();
-        // Trace sink (--trace): the keys this layer looks up, in access order.
+        // Trace sink (--trace), v2: the demand keys this layer looks up, then `|`, then
+        // the top-`TRACE_WINDOW` candidates as `key:choice`.
+        //
+        // BOTH lists are in router RANK order, and that is LOAD-BEARING, not incidental.
+        // `sel` and `window` both come out of `topk_into` over the same `choice` buffer
+        // with the same comparator (value-desc, index-asc), and `topk_into` finishes with
+        // a full sort — so `window[..sel.len()] == sel` element for element, and
+        // `bin/replay` hard-fails a trace where that prefix does not hold. Reordering
+        // `sel` for any local reason (coalescing reads by expert id, say) would silently
+        // change the meaning of every captured trace. The debug_assert is the tripwire.
+        debug_assert!(
+            window.is_empty() || window.starts_with(sel),
+            "trace v2: the candidate window must be the ranking that produced `sel`"
+        );
         if let Some(w) = &mut self.trace {
             use std::io::Write;
             for (j, &e) in sel.iter().enumerate() {
@@ -817,6 +892,16 @@ impl<'a> Pin<'a> {
                     write!(w, " ").context("write trace")?;
                 }
                 write!(w, "{}", expert_key(layer, e)).context("write trace")?;
+            }
+            // ponytail: the `choice` values have no consumer yet — the (J, M) grid needs
+            // only the RANK order, which the list already carries. Written anyway because
+            // a capture is GPU-gated, sole-tenant and ~30 minutes, so these few bytes are
+            // cheap now and unrecoverable later without another capture; and `route_kl`
+            // (docs/CACHE_ROUTE.md "Counters") is deferred, not cancelled, and needs the
+            // mass distribution.
+            write!(w, " |").context("write trace")?;
+            for &e in window {
+                write!(w, " {}:{:.6}", expert_key(layer, e), choice[e]).context("write trace")?;
             }
             writeln!(w).context("write trace")?;
         }
@@ -866,14 +951,20 @@ impl<'a> Pin<'a> {
     /// (device pointers into the pool) + per-expert format flag + load [`Signal`]. The
     /// descriptor pointers are final (post-relocation); the bytes land when `signals[i]`
     /// resolves. The expert stream awaits each signal before computing that expert.
+    ///
+    /// `window`/`choice` feed the trace sink only: the ranked top-[`TRACE_WINDOW`]
+    /// candidate expert ids and the full per-expert `choice` array they index into.
+    /// Pass an empty `window` when not tracing — nothing else reads them.
     pub fn submit_layer(
         &mut self,
         layer: usize,
         sel: &[usize],
+        window: &[usize],
+        choice: &[f32],
         out: &mut Vec<MlpVq>,
         fmt: &mut Vec<bool>,
     ) -> Result<Vec<Signal>> {
-        let (slots, signals) = self.submit_spine(layer, sel)?;
+        let (slots, signals) = self.submit_spine(layer, sel, window, choice)?;
         out.clear();
         fmt.clear();
         for (i, _e) in sel.iter().enumerate() {

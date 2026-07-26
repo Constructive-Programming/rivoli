@@ -36,6 +36,29 @@ pub trait HybridPolicy {
     fn protect(&mut self, k: u32);
     /// Bytes currently resident — the pin/tests check this never exceeds the budget.
     fn resident_bytes(&self) -> usize;
+    /// `Some((j, m))` asks the ROUTER to prefer resident experts: the top-`j` ranked
+    /// candidates are sacred and the rest of the slots prefer residents inside the
+    /// top-`m` window (`--cache-policy top-m`, arXiv:2412.00099, docs/CACHE_ROUTE.md).
+    /// Defaulted to `None` so lru/2q/arc are untouched — and `None` is the engine's
+    /// regression guarantee, not merely a default (see [`crate::math::route_into`]).
+    fn route_advice(&self) -> Option<(usize, usize)> {
+        None
+    }
+}
+
+/// `top-m`'s (J, M) knobs. Read only by [`make`]'s `"top-m"` arm; every other policy
+/// ignores it, which is why it rides along as an argument instead of forking the
+/// constructor. Defaults are the paper's values for this router class: J=2 (Qwen/
+/// DeepSeek-class, which GLM-5.2 belongs to) and M=12.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RouteAdvice {
+    pub j: usize,
+    pub m: usize,
+}
+impl Default for RouteAdvice {
+    fn default() -> Self {
+        Self { j: 2, m: 12 }
+    }
 }
 
 /// Byte geometry shared by every policy: the budget and the two per-tier slot sizes.
@@ -54,17 +77,24 @@ impl Geom {
     }
 }
 
-/// Construct a byte-aware hybrid policy. `split` is 2Q's Kin/Kout (ignored by lru/arc).
+/// Construct a byte-aware hybrid policy. `split` is 2Q's Kin/Kout (ignored by lru/arc);
+/// `advice` is `top-m`'s (J, M) (ignored by everything else).
 pub fn make(
     policy: &str,
     budget: usize,
     cold_stride: usize,
     hot_stride: usize,
     split: crate::cache::TwoQSplit,
+    advice: RouteAdvice,
 ) -> Option<Box<dyn HybridPolicy>> {
     let g = Geom { budget, cold_stride: cold_stride.max(1), hot_stride: hot_stride.max(1) };
     match policy {
-        "lru" => Some(Box::new(HybridLru::new(g))),
+        "lru" => Some(Box::new(HybridLru::new(g, None))),
+        // NOT a fourth policy implementation: `top-m` IS LRU (the paper evaluates on
+        // LRU) with the routing advice switched on. This repo deleted three duplicate
+        // policy families in 08db745; a copy-pasted `HybridTopM` would be that mistake
+        // with a new name.
+        "top-m" => Some(Box::new(HybridLru::new(g, Some((advice.j, advice.m))))),
         "2q" => Some(Box::new(HybridTwoQ::new(g, split))),
         "arc" => Some(Box::new(HybridArc::new(g))),
         _ => None,
@@ -88,9 +118,13 @@ struct HybridLru {
     freq: HashMap<u32, u32>,
     accesses: u64,
     pinned: HashSet<u32>,
+    /// `Some((j, m))` under `--cache-policy top-m`; `None` under plain `lru`. The only
+    /// difference between the two policies — eviction, admission and byte accounting
+    /// are shared.
+    advice: Option<(usize, usize)>,
 }
 impl HybridLru {
-    fn new(g: Geom) -> Self {
+    fn new(g: Geom, advice: Option<(usize, usize)>) -> Self {
         Self {
             g,
             cold: OrderedSet::default(),
@@ -98,6 +132,7 @@ impl HybridLru {
             freq: HashMap::new(),
             accesses: 0,
             pinned: HashSet::new(),
+            advice,
         }
     }
     fn bump(&mut self, k: u32) {
@@ -175,6 +210,9 @@ impl HybridPolicy for HybridLru {
     }
     fn resident_bytes(&self) -> usize {
         self.cold.len() * self.g.cold_stride + self.hot.len() * self.g.hot_stride
+    }
+    fn route_advice(&self) -> Option<(usize, usize)> {
+        self.advice
     }
 }
 
@@ -440,10 +478,52 @@ mod tests {
 
     fn each_policy() -> Vec<(&'static str, Box<dyn HybridPolicy>)> {
         let (budget, cs, hs) = (100usize, 3usize, 4usize);
-        ["lru", "2q", "arc"]
+        ["lru", "2q", "arc", "top-m"]
             .iter()
-            .map(|&n| (n, make(n, budget, cs, hs, TwoQSplit::default()).expect("known policy")))
+            .map(|&n| {
+                let p = make(n, budget, cs, hs, TwoQSplit::default(), RouteAdvice::default());
+                (n, p.expect("known policy"))
+            })
             .collect()
+    }
+
+    /// The advice reaches `top-m` and NOBODY else. The defaulted trait method is the
+    /// whole mechanism by which lru/2q/arc stay byte-identical, so assert it directly
+    /// rather than inferring it from the engine's behaviour.
+    #[test]
+    fn only_top_m_carries_route_advice() {
+        let adv = RouteAdvice { j: 3, m: 20 };
+        for name in ["lru", "2q", "arc"] {
+            let p = make(name, 100, 3, 4, TwoQSplit::default(), adv).expect("known policy");
+            assert_eq!(p.route_advice(), None, "{name} must not see the advice");
+        }
+        let p = make("top-m", 100, 3, 4, TwoQSplit::default(), adv).expect("top-m");
+        assert_eq!(p.route_advice(), Some((3, 20)));
+    }
+
+    /// `top-m` IS `HybridLru` — substitution happens in the router, not in the cache —
+    /// so for one and the same access sequence the two must evict identically. This is
+    /// the test that would fail if someone "helpfully" forked a `HybridTopM`.
+    #[test]
+    fn top_m_is_lru_for_a_fixed_access_sequence() {
+        let (mut a, mut b) = (
+            make("lru", 60, 3, 4, TwoQSplit::default(), RouteAdvice::default()).expect("lru"),
+            make("top-m", 60, 3, 4, TwoQSplit::default(), RouteAdvice::default()).expect("top-m"),
+        );
+        for i in 0..3000u32 {
+            let k = if i % 3 == 0 { i % 11 } else { 100 + i % 400 };
+            for p in [&mut a, &mut b] {
+                p.begin_batch();
+                if !p.get(k) {
+                    p.admit(k);
+                }
+            }
+            assert_eq!(a.contains(k), b.contains(k));
+            assert_eq!(a.resident_bytes(), b.resident_bytes(), "diverged at access {i}");
+        }
+        for k in 0..500u32 {
+            assert_eq!(a.contains(k), b.contains(k), "residency diverged on key {k}");
+        }
     }
 
     #[test]
@@ -466,7 +546,7 @@ mod tests {
         for name in ["2q", "arc"] {
             // budget 5 holds exactly one hot slot (4) — small enough that the 2nd admit
             // evicts the 1st, big enough that a HOT slot fits.
-            let mut p = make(name, 5, 3, 4, TwoQSplit::default()).unwrap();
+            let mut p = make(name, 5, 3, 4, TwoQSplit::default(), RouteAdvice::default()).unwrap();
             p.begin_batch();
             assert!(!p.get(10));
             assert_eq!(p.admit(10).tier, Tier::Cold, "{name}: first-seen must be COLD");
@@ -484,7 +564,7 @@ mod tests {
     fn lru_admits_by_frequency() {
         // LRU has no ghost: placement is the decaying counter. First-seen COLD; a key
         // re-accessed after eviction crosses the threshold → HOT.
-        let mut p = make("lru", 5, 3, 4, TwoQSplit::default()).unwrap();
+        let mut p = make("lru", 5, 3, 4, TwoQSplit::default(), RouteAdvice::default()).unwrap();
         p.begin_batch();
         assert!(!p.get(10));
         assert_eq!(p.admit(10).tier, Tier::Cold);
@@ -501,7 +581,7 @@ mod tests {
         // A frequency-skewed workload (a hot core hit via the ghost) must drive ARC's
         // `p` DOWN from 0-start toward HOT... p rises on B1 hits (recency), falls on B2.
         // Here we just assert the hot core stays resident under churn (adaptivity works).
-        let mut p = make("arc", 60, 3, 4, TwoQSplit::default()).unwrap();
+        let mut p = make("arc", 60, 3, 4, TwoQSplit::default(), RouteAdvice::default()).unwrap();
         let core: Vec<u32> = (0..5).collect();
         for round in 0..50u32 {
             for &k in &core {
@@ -531,7 +611,7 @@ mod tests {
     fn batch_never_evicts_a_key_touched_this_batch() {
         for name in ["lru", "2q", "arc"] {
             let (budget, cs, hs) = (60usize, 3usize, 4usize);
-            let mut p = make(name, budget, cs, hs, TwoQSplit::default()).unwrap();
+            let mut p = make(name, budget, cs, hs, TwoQSplit::default(), RouteAdvice::default()).unwrap();
             let mut resident: HashMap<u32, ()> = HashMap::new();
             let mut rng = 0x1234_5678u64;
             let next = |r: &mut u64| {

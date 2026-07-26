@@ -72,17 +72,24 @@ pub struct Config {
     /// EFAULTs on direct io_uring DMA into VMM (see src/stream.rs). Set only to force the
     /// raw-DMA path.
     pub direct_vmm_dma: bool,
-    /// Dump the routed-expert access trace to this path (`--trace`): one line per MoE
-    /// layer, the keys it looked up. Feeds the offline `replay` cache-policy sim.
+    /// Dump the routed-expert access trace to this path (`--trace`), format v2: a
+    /// `# rivoli-trace v2 top_k=<k> window=<w>` header, then one line per MoE layer —
+    /// the keys it looked up, then `|`, then the top-`w` router candidates as
+    /// `key:choice`. Feeds the offline `replay` cache-policy sim; the header and the
+    /// `|` tail are both invisible to a v1 reader.
     pub trace: Option<String>,
     /// Override the fixed bench prompt (`--prompt`), for capturing routing traces of
     /// diverse inputs. None = the default prompt.
     pub prompt: Option<String>,
-    /// Routed-expert eviction policy (`--cache-policy` lru|2q|arc). Default "2q".
+    /// Routed-expert cache policy (`--cache-policy` lru|2q|arc|top-m). Default "2q".
+    /// `top-m` is the only one that also changes WHICH experts run — see
+    /// docs/CACHE_ROUTE.md and [`Config::validate`].
     pub cache_policy: String,
     /// 2Q's A1in/A1out split (`--2q-kin` / `--2q-kout`, percentages of pool capacity).
     /// Ignored by `lru`/`arc`. Unset = [`crate::cache::TwoQSplit::default`].
     pub two_q: crate::cache::TwoQSplit,
+    /// `top-m`'s (J, M) (`--route-j` / `--route-m`). Ignored by every other policy.
+    pub route: crate::hybrid::RouteAdvice,
     /// DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
     pub checksum_x: bool,
     /// Routed-expert format mode (`--mode int3-vq|int4|hybrid`, default `hybrid`). See
@@ -129,6 +136,7 @@ impl Config {
         prompt: Option<String>,
         cache_policy: String,
         two_q: crate::cache::TwoQSplit,
+        route: crate::hybrid::RouteAdvice,
         max_mem: Option<u64>,
         attn: crate::attn::AttnMode,
     ) -> Result<Self> {
@@ -149,11 +157,42 @@ impl Config {
             prompt,
             cache_policy,
             two_q,
+            route,
             checksum_x: false,
             mode: Mode::default(),
             max_mem,
             attn,
         })
+    }
+
+    /// Reject the flag combinations the engine cannot honour. Called by `main` AFTER
+    /// `mode` is set (which `discover` cannot see).
+    ///
+    /// `top-m` is the first policy that is neither mode-agnostic nor output-neutral, so
+    /// both of these are hard errors rather than quiet fallbacks: a fallback would
+    /// attribute some other mechanism's behaviour to `top-m` in a measurement that is
+    /// specifically trying to price `top-m`.
+    pub fn validate(&self) -> Result<()> {
+        if self.cache_policy != "top-m" {
+            return Ok(());
+        }
+        if self.mode == Mode::Hybrid {
+            bail!(
+                "--cache-policy top-m is implemented for the SINGLE-FORMAT modes only \
+                 (--mode int3-vq or --mode int4). The hybrid rank-driven tier rule \
+                 (docs/CACHE_ROUTE.md, \"Mode integration\") is not built yet; falling back \
+                 to the frequency threshold would credit its behaviour to top-m."
+            );
+        }
+        if self.trace.is_some() {
+            bail!(
+                "--cache-policy top-m cannot be combined with --trace: the v2 trace format \
+                 promises the candidate window's first top_k entries ARE the selection \
+                 (bin/replay hard-fails otherwise), and substitution is precisely what \
+                 breaks that prefix. Capture traces under lru|2q|arc."
+            );
+        }
+        Ok(())
     }
 }
 
@@ -162,7 +201,7 @@ impl fmt::Display for Config {
         const GIB: f64 = (1u64 << 30) as f64;
         write!(
             f,
-            "model={} bench={:?} mode={} attn={:?} direct_vmm_dma={} cache_policy={} 2q_kin={}% 2q_kout={}% trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={}",
+            "model={} bench={:?} mode={} attn={:?} direct_vmm_dma={} cache_policy={} 2q_kin={}% 2q_kout={}% route_j={} route_m={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={}",
             self.model,
             self.bench,
             self.mode,
@@ -171,6 +210,8 @@ impl fmt::Display for Config {
             self.cache_policy,
             self.two_q.kin_pct(),
             self.two_q.kout_pct(),
+            self.route.j,
+            self.route.m,
             self.trace,
             self.prompt,
             OS_RESERVE as f64 / GIB,
@@ -179,5 +220,64 @@ impl fmt::Display for Config {
                 None => "auto(all free)".to_string(),
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
+    use super::*;
+
+    fn cfg(policy: &str, mode: Mode, trace: Option<&str>) -> Config {
+        Config {
+            model: "/nonexistent".into(),
+            bench: Some(1),
+            direct_vmm_dma: false,
+            trace: trace.map(String::from),
+            prompt: None,
+            cache_policy: policy.into(),
+            two_q: crate::cache::TwoQSplit::default(),
+            route: crate::hybrid::RouteAdvice::default(),
+            checksum_x: false,
+            mode,
+            max_mem: None,
+            attn: crate::attn::AttnMode::Dense,
+        }
+    }
+
+    /// `top-m` in `--mode hybrid` must FAIL, not quietly fall back to the frequency
+    /// threshold: the hybrid rank-driven tier rule (docs/CACHE_ROUTE.md "Mode
+    /// integration") is a later step, and a silent fallback would let a hybrid run
+    /// report `top-m` numbers that `top-m` did not produce.
+    #[test]
+    fn top_m_in_hybrid_mode_fails_loudly() {
+        let e = cfg("top-m", Mode::Hybrid, None).validate().expect_err("must reject");
+        let msg = e.to_string();
+        assert!(msg.contains("SINGLE-FORMAT"), "unhelpful message: {msg}");
+        assert!(msg.contains("not built yet"), "must say what is missing: {msg}");
+        for m in [Mode::Int3Vq, Mode::Int4] {
+            cfg("top-m", m, None).validate().expect("single-format modes are supported");
+        }
+    }
+
+    /// Substitution breaks the v2 trace's "window prefix == selection" promise, so the
+    /// two cannot be captured together — bin/replay would either bail or, worse, screen
+    /// a future (J, M) grid against a trace already distorted by an earlier one.
+    #[test]
+    fn top_m_with_trace_fails_loudly() {
+        let e = cfg("top-m", Mode::Int4, Some("/tmp/t"))
+            .validate()
+            .expect_err("must reject");
+        assert!(e.to_string().contains("--trace"), "{e}");
+    }
+
+    /// ...and none of it touches the other policies: validate is a no-op for them.
+    #[test]
+    fn the_other_policies_are_unconstrained() {
+        for p in ["lru", "2q", "arc"] {
+            for m in [Mode::Int3Vq, Mode::Int4, Mode::Hybrid] {
+                cfg(p, m, Some("/tmp/t")).validate().expect("{p} must stay unconstrained");
+            }
+        }
     }
 }

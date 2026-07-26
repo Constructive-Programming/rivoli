@@ -33,6 +33,12 @@ pub struct ProfileSummary {
     pub miss_per_tok: f64,
     pub ms_per_miss: f64,
     pub gb_per_tok: f64,
+    /// `--cache-policy top-m` only: the share of chosen expert slots that were NOT in
+    /// the true top-K — the quality cost of cache-conditional routing, and per
+    /// docs/CACHE_ROUTE.md "Counters" the one number you tune (J, M) against. `None`
+    /// under lru/2q/arc, which never substitute; printing 0.0% there would read as a
+    /// measurement of something that did not happen.
+    pub swap_pct: Option<f64>,
 }
 
 impl ProfileSummary {
@@ -59,6 +65,13 @@ impl ProfileSummary {
             self.load_wait_ms,
             self.launch_ms,
         );
+        if let Some(swap) = self.swap_pct {
+            tracing::info!(
+                "  route: swap {swap:.2}% of chosen slots were outside the true top-K \
+                 (cache-conditional routing; hit% above is NOT comparable to a run \
+                 without it — see docs/CACHE_ROUTE.md \"Risks\")"
+            );
+        }
     }
 }
 
@@ -129,6 +142,9 @@ mod otlp {
         span.set_attribute(KeyValue::new("fetch_hidden_pct", summary.fetch_hidden_pct));
         span.set_attribute(KeyValue::new("miss_per_tok", summary.miss_per_tok));
         span.set_attribute(KeyValue::new("gb_per_tok", summary.gb_per_tok));
+        if let Some(swap) = summary.swap_pct {
+            span.set_attribute(KeyValue::new("swap_pct", swap));
+        }
         span.end();
 
         // Flush the simple processor's export before we return (the run ends here).

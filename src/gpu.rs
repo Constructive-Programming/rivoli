@@ -19,9 +19,9 @@ use crate::hip::{
     launch_moe_expert_range_i4, launch_moe_reduce, launch_rmsnorm, launch_rope, launch_swiglu,
     launch_vadd,
 };
-use crate::math::{E4M3_BLOCK, sigmoid, topk_into};
+use crate::math::{E4M3_BLOCK, nll_of, route_into, topk_into};
 use crate::model::ModelConfig;
-use crate::pin::{Fp8Mlp, IndexerPin, LayerMlp, MlpVq, Pin};
+use crate::pin::{Fp8Mlp, IndexerPin, LayerMlp, MlpVq, Pin, TRACE_WINDOW};
 use crate::telemetry::ProfileSummary;
 use anyhow::{Result, bail, ensure};
 use futures_util::stream::{StreamExt, TryStreamExt};
@@ -48,27 +48,6 @@ fn desc_of_vq(m: &MlpVq) -> ExpertDesc {
 }
 
 
-/// Host routing: sigmoid the gate logits into `scores`, add the router `bias` into
-/// `choice`, and select the top-`top_k` into `sel`. A free fn taking disjoint slices
-/// so the caller can borrow `bias` out of `&self.pin` while it mutably borrows its
-/// own routing scratch.
-fn route_into(
-    gate_logits: &[u8],
-    bias: &[f32],
-    top_k: usize,
-    scores: &mut [f32],
-    choice: &mut [f32],
-    sel: &mut Vec<usize>,
-) {
-    for (s, c) in gate_logits.chunks_exact(4).zip(scores.iter_mut()) {
-        *c = sigmoid(f32::from_le_bytes([s[0], s[1], s[2], s[3]]));
-    }
-    for ((c, &s), &b) in choice.iter_mut().zip(scores.iter()).zip(bias) {
-        *c = s + b;
-    }
-    topk_into(choice, top_k, sel);
-}
-
 /// Per-token time buckets. ALWAYS ON: every bucket wraps a join/D2H the forward
 /// pass already pays (the end-of-layer sync, the gate-logits read, the stream
 /// drain), so accumulating them costs only a clock read per layer — no extra GPU
@@ -77,8 +56,11 @@ fn route_into(
 /// correctness probes live behind the `trace` feature instead.
 #[derive(Default)]
 struct Profile {
-    fetch_n: u64,         // demand misses
-    route_ns: u128,       // host routing (gate D2H + sigmoid/bias/top-k)
+    fetch_n: u64, // demand misses
+    /// `top-m` only: chosen slots that were NOT in the true top-K. Stays 0 under every
+    /// other policy, which is why the summary reports it as an Option rather than a 0%.
+    swap_n: u64,
+    route_ns: u128, // host routing (gate D2H + sigmoid/bias/top-k, + top-m substitution)
     moe_wall_ns: u128,    // the block_on wall of the overlapped MoE phase (CPU wall)
     compute_gpu_ns: u128, // HIP-event span of the compute stream (partials + reduce)
     wall_ns: u128,
@@ -90,6 +72,7 @@ impl Profile {
     /// `fetch_wall_ns` is the reaper's off-thread load cost; `idle_ns`/`poll_ns` are
     /// the expert stream's tokio-metrics (load-wait / launch) — the accurate
     /// decomposition the async overlap hides from wall-clock.
+    #[allow(clippy::too_many_arguments)] // one call site; the buckets are unrelated scalars
     fn summary(
         &self,
         hits: u64,
@@ -98,6 +81,7 @@ impl Profile {
         fetch_wall_ns: u64,
         idle_ns: u64,
         poll_ns: u64,
+        advice: Option<(usize, usize)>,
     ) -> ProfileSummary {
         let tok = self.tokens.max(1) as f64;
         let per = |ns: u128| ns as f64 / 1e6 / tok; // ms/token
@@ -126,6 +110,11 @@ impl Profile {
             miss_per_tok: self.fetch_n as f64 / tok,
             ms_per_miss: fetch_wall_ns as f64 / 1e6 / self.fetch_n.max(1) as f64,
             gb_per_tok: self.fetch_n as f64 / tok * bytes_per_expert as f64 / 1e9,
+            // `hits + misses` IS the chosen-slot count (submit_layer looks each one up
+            // exactly once), so it is the same denominator hit% already uses. Reported
+            // only under `top-m` — a 0.0% next to lru would read as a measurement.
+            swap_pct: advice
+                .map(|_| 100.0 * self.swap_n as f64 / (hits + misses).max(1) as f64),
         }
     }
 }
@@ -215,6 +204,17 @@ pub struct GpuEngine<'a> {
     scores: Vec<f32>,
     choice: Vec<f32>,
     sel: Vec<usize>,
+    /// Trace-only: the ranked top-[`TRACE_WINDOW`] candidates. Stays empty unless
+    /// `--trace` is on, and `--trace` is fixed for the run, so this is either filled
+    /// every layer or never.
+    window: Vec<usize>,
+    /// `top-m` only: the ranked top-M candidate window [`route_into`] substitutes over.
+    /// Stays empty under every other policy (the advice-`None` early return never
+    /// writes it).
+    cand: Vec<usize>,
+    /// The policy's routing advice, read ONCE — the policy is fixed for the run, and
+    /// `None` must stay a plain early return on the per-layer routing path.
+    route_advice: Option<(usize, usize)>,
     // Per-token host build scratch — reused every layer so the hot path allocates
     // nothing: resolved VQ descriptors + weights, the resolved batch, D2H staging.
     w: Vec<f32>,
@@ -353,6 +353,9 @@ impl<'a> GpuEngine<'a> {
             scores: vec![0.0; cfg.n_experts],
             choice: vec![0.0; cfg.n_experts],
             sel: Vec::with_capacity(cfg.top_k),
+            window: Vec::new(), // grown once by the first traced layer; empty otherwise
+            cand: Vec::new(),   // ditto, for the first substituted layer
+            route_advice: pin.route_advice(),
             w: Vec::with_capacity(slots),
             codebooks: pin.codebooks(),
             mlps_vq: Vec::with_capacity(cfg.top_k),
@@ -384,6 +387,15 @@ impl<'a> GpuEngine<'a> {
     }
     pub fn misses(&self) -> u64 {
         self.pin.misses
+    }
+
+    /// `swap%` for a run that did not go through [`Profile::summary`] — `--ppl` scores a
+    /// text rather than generating, so it never builds one. Same numerator and the same
+    /// `hits + misses` denominator, and `None` under every policy but `top-m`.
+    pub fn swap_pct(&self) -> Option<f64> {
+        self.route_advice.map(|_| {
+            100.0 * self.prof.swap_n as f64 / (self.pin.hits + self.pin.misses).max(1) as f64
+        })
     }
 
     /// DIAGNOSTIC: hash the residual stream after every layer (`--checksum-x`).
@@ -794,21 +806,44 @@ impl<'a> GpuEngine<'a> {
                 // Read the gate logits, route with `bias` borrowed straight out of
                 // `&self.pin` while the routing scratch is borrowed mutably.
                 self.gate_logits.copy_out_into(&mut self.gl_host)?;
-                route_into(
+                // `--cache-policy top-m` (advice Some) makes this cache-CONDITIONAL:
+                // residency reorders the selection below the sacred top-J. Every other
+                // policy leaves the advice None and gets the pre-top-m routing back
+                // bit-for-bit. Residency is read through `Pin::resident` →
+                // `HybridPolicy::contains`, which does not touch the eviction clock;
+                // the substitution is inside the `route_ns` clock because it IS routing.
+                self.prof.swap_n += route_into(
                     &self.gl_host,
                     self.pin.moe_bias(l),
                     cfg.top_k,
+                    self.route_advice,
+                    |e| self.pin.resident(l, e),
                     &mut self.scores,
                     &mut self.choice,
                     &mut self.sel,
+                    &mut self.cand,
                 );
                 self.prof.route_ns += t.elapsed().as_nanos();
+                // Trace v2 only: re-rank the same `choice` array to the wider candidate
+                // window the offline (J, M) grid needs. Deliberately outside the
+                // `route_ns` clock and behind the trace gate, so the decode path is
+                // byte-for-byte the work it was before and route_ns stays comparable
+                // across the change.
+                if self.pin.tracing() {
+                    topk_into(&self.choice, TRACE_WINDOW, &mut self.window);
+                }
                 // SUBMIT this layer's cold reads — each selected expert gets a load
                 // Signal (hit → ready; miss → resolves when its bytes land). The slot
                 // ADDRESSES are known now, so the descriptors below are valid pointers.
                 let miss0 = self.pin.misses;
-                let mut signals =
-                    self.pin.submit_layer(l, &self.sel, &mut self.mlps_vq, &mut self.fmt)?;
+                let mut signals = self.pin.submit_layer(
+                    l,
+                    &self.sel,
+                    &self.window,
+                    &self.choice,
+                    &mut self.mlps_vq,
+                    &mut self.fmt,
+                )?;
                 self.prof.fetch_n += self.pin.misses - miss0;
                 // Routed weights: sigmoid score, sum-normalized over the routed picks,
                 // then scaled. The VQ shared expert (weight 1.0) folds into the batch.
@@ -962,6 +997,47 @@ impl<'a> GpuEngine<'a> {
         Ok(())
     }
 
+    /// **Teacher-forced** negative log-likelihood of `ids`: one `-log softmax(logits)[t]`
+    /// per predicted position, returned in order. `ids[0]` is context only, so the result
+    /// has `ids.len() - 1` entries.
+    ///
+    /// Teacher-forced means at every position we feed the KNOWN next token, never our own
+    /// argmax. That is the whole point: a free-running run's quality number is confounded
+    /// by its own trajectory — a cache policy that degenerates into repetition routes to
+    /// fewer experts, hits more, and looks *better* on every metric the run generates
+    /// about itself. Forcing the text pins the trajectory so two policies are scored on
+    /// literally the same positions, which is also what makes the per-token NLLs PAIRABLE
+    /// across runs. See docs/CACHE_ROUTE.md "Quality".
+    ///
+    /// The full `vocab` logit vector comes back to the host each position. That is ~620 KB
+    /// against ~0.96 GB/token of expert streaming — noise. A device-side log-softmax would
+    /// be a kernel to write, test and debug in order to save 0.06% of the traffic.
+    // ponytail: host log-softmax, no kernel.
+    pub fn nll_forced(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
+        ensure!(ids.len() >= 2, "need at least 2 tokens to score a prediction");
+        let vocab = self.cfg.vocab;
+        // Same shape as `generate`: one current-thread runtime, `forward` awaited inline.
+        let rt = tokio::runtime::Builder::new_current_thread().build()?;
+        rt.block_on(async {
+            let mut out = Vec::with_capacity(ids.len() - 1);
+            let mut host: Vec<u8> = Vec::with_capacity(vocab * 4);
+            for (pos, &tok) in ids.iter().enumerate() {
+                // Beat per position: scoring a long text is many forwards with no token
+                // emitted, and the watchdog only knows about progress if we say so.
+                if let Some(hb) = &self.heartbeat {
+                    hb.beat();
+                }
+                self.forward(tok, pos).await?;
+                let Some(&next) = ids.get(pos + 1) else { break };
+                ensure!((next as usize) < vocab, "token {next} outside vocab {vocab}");
+                self.logits.copy_out_into(&mut host)?;
+                ensure!(host.len() == vocab * 4, "short logits D2H");
+                out.push(nll_of(&host, next as usize)?);
+            }
+            Ok(out)
+        })
+    }
+
     /// Greedy argmax over the device logits — reduced ON DEVICE, so only 8 bytes come
     /// back per token. The kernel reproduces the host fold exactly (strict `>`: ties
     /// keep the lowest index, NaN never wins), returning `logits[best]` so the
@@ -1050,6 +1126,9 @@ impl<'a> GpuEngine<'a> {
                 generated.push(next);
                 self.forward(next, pos).await?;
                 pos += 1;
+                // Bound trace loss to one token: the watchdog exits without destructors,
+                // so BufWriter's Drop is not a guarantee. No-op when not tracing.
+                self.pin.flush_trace()?;
                 #[cfg(feature = "trace")]
                 if (_i + 1) % WIN == 0 {
                     let dt = win_t.elapsed().as_secs_f64();
@@ -1079,6 +1158,7 @@ impl<'a> GpuEngine<'a> {
             self.pin.fetch_ns(),
             tm.total_idle_duration.as_nanos() as u64,
             tm.total_poll_duration.as_nanos() as u64,
+            self.route_advice,
         );
         summary.report();
         Ok((generated, summary))

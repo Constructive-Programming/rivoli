@@ -1,11 +1,32 @@
 # rivoli — CACHE_PILOT: router-piloted cross-layer expert prefetch
 
-Status: **proposed, not started. Preliminary work for
-[CACHE_ROUTE.md](CACHE_ROUTE.md) (`--cache-policy top-m`) — not an independently
-justified feature.** `top-m` promotes top-M window members to int4 at an L+2 horizon,
-which requires exactly this machinery: a cross-layer prediction and a speculative
-loader. CACHE_PILOT has **no acceptance criteria of its own**; it is accepted or
-removed with `top-m`. See "Acceptance is not local" below.
+Status: **PARKED — blocked on an artifact precondition. Do not build.**
+
+There are now **two independent reasons** not to build this, and they are not the same
+reason wearing different hats.
+
+**1. It is blocked on a faithful int4 (new, and decisive on its own).** This document's
+entire purpose is to make an L+2 **int4 promotion** affordable — the prediction and the
+speculative loader exist to move an 18.9 MB int4 load off the critical path. But in the
+artifact we run, `.i4` is re-derived from `.vq3` (`bin/vq3_to_i4`), so int4 is strictly
+*less* faithful than the vq3 it came from: int3-vq PPL 5.275 against int4 9.083 on a fixed
+teacher-forced corpus (`../benchmarks.md`, "int4 provenance"). **Promotion to int4
+therefore degrades quality here, and this machinery exists to do more promotion, earlier.**
+Building it now would be an elaborate, expensive mechanism for making the model worse —
+the most costly possible way to be wrong. The precondition is an int4 more faithful than
+vq3; a group-scaled (gs64) `pack_i4` container plausibly supplies one, at which point this
+reason lifts and the design below stands as written.
+
+**2. It has no acceptance criteria of its own (pre-existing).** It is preliminary work for
+[CACHE_ROUTE.md](CACHE_ROUTE.md) (`--cache-policy top-m`) and is accepted or removed with
+it. See "Acceptance is not local" below.
+
+Note the offline screen cannot lift either reason: it saturates by construction and has no
+power over this work at all (see "Headroom" below). The one thing worth doing here before
+the precondition is met is **LOOKA** (Step 1) — its recall numbers are a durable fact about
+the model, cheap, and useful whatever happens to the loader.
+
+Unaffected: single-format `top-m` (`int3-vq`, `int4`) needs none of this machinery.
 
 Sister-project evidence: colibri's `PILOT`/`PILOT_REAL` (`c/colibri.c`), measured on
 *this node* (rh-anine).
@@ -74,9 +95,20 @@ reintroduce the silent-corruption class the `inflight` guard was written for.
 **Headroom is the known risk, not a gate.** Colibri measured a +3.1pp recall
 improvement producing *literally zero* tok/s change on a cache-starved host, and our VQ
 working set (16,457 experts against a ~5,000-slot pool) is closer to that regime than
-theirs. The shared offline replay step (build order below) quantifies the ceiling
-before the loader is written — but the answer informs `top-m`'s acceptance, it does not
-independently stop this work.
+theirs.
+
+**The offline replay step does NOT quantify this, and an earlier draft claimed it did.**
+The oracle ceiling saturates by construction: a decision needs `top_k` keys, `top_k`
+admissions fit in any pool that holds one batch, so a perfect predictor removes every miss
+and the number is a tautology — and at 100% recall the speculative admissions *are* the
+baseline misses, so it is the same bytes moved earlier, which is this document's thesis
+restated rather than tested. **This work's gate is recall, recall is unobservable offline,
+and LOOKA (Step 1) is the only thing that measures it.** `bin/replay` does print a
+*modelled* recall curve — at recall `r` the predictor still names `top_k` experts, so
+every false negative is also a false positive, drawn from the ranks just outside the true
+set in that decision's own window — and that curve prices the wasted bytes. It is an upper
+bound (its errors are independent; real ones are correlated), so treat it as the shape of
+the trade, and read the real `r` off LOOKA.
 
 ## Step 1 — LOOKA (instrumentation)
 
@@ -179,9 +211,10 @@ invalidated one hot_pct sweep and two earlier conclusions.
 One program, not two:
 
 1. Extend the `--trace` format (adds the top-M candidate window `top-m` needs).
-2. Offline replay: the oracle-prefetch ceiling and the (J, M) miss-reduction grid in
-   [CACHE_ROUTE.md](CACHE_ROUTE.md). Free, no GPU time — this is where the headroom
-   question gets its number.
+2. Offline replay: the (J, M) miss-reduction grid in
+   [CACHE_ROUTE.md](CACHE_ROUTE.md), plus the oracle ceiling and the modelled recall
+   curve. One GPU capture, then free. This screens **`top-m`**; it cannot screen the
+   pilot (see "Headroom" above) — step 3 does that.
 3. LOOKA recall counters, both horizons (Step 1 above).
 4. The speculative loader (Step 2 above).
 5. `top-m` routing + rank-driven tiering, then the pilot prediction driving promotion.
