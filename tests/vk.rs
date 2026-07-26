@@ -830,7 +830,12 @@ fn append_kv_quantizes_bit_exactly() {
     // kvl must be a multiple of 128 in [128, 1024], so it cannot be ragged — ropn is
     // the only free size here and 100 is deliberately not a multiple of 32, leaving the
     // rope write live on a partial subgroup.
-    let (kvl, ropn, rows, pos) = (512usize, 100usize, 5usize, 3usize);
+    // 512/100 was the only shape covered. 1024/300 is added because it is the one that
+    // can fail differently: kvl = 1024 is MAX_BLOCKS blocks, so every subgroup in the
+    // workgroup carries one and `gl_NumSubgroups == 8` is load-bearing rather than
+    // slack; and ropn = 300 exceeds THREADS, so the rope loop takes a second grid-stride
+    // iteration that was dead code in every previous run.
+    for (kvl, ropn, rows, pos) in [(512usize, 100usize, 5usize, 3usize), (1024, 300, 3, 2)] {
     let n_blocks = kvl / E4M3_BLOCK;
     let (latent, rope) = append_kv_input(kvl, ropn, 0xA55);
     let (want_lc8, want_scl, want_rc) = append_kv_oracle(&latent, &rope);
@@ -893,8 +898,9 @@ fn append_kv_quantizes_bit_exactly() {
         .iter()
         .zip(&got_scl)
         .fold(0.0f32, |m, (w, g)| m.max((w - g).abs() / w.abs()));
-    println!("append_kv lscale: max rel err={rel:.3e} tol=1.0e-6");
+    println!("append_kv {kvl}/{ropn} lscale: max rel err={rel:.3e} tol=1.0e-6");
     assert!(rel <= 1e-6, "append_kv lscale: rel err {rel:.3e} > 1e-6, want {want_scl:?} got {got_scl:?}");
+    }
     v.check("append_kv_quantizes_bit_exactly");
 }
 
@@ -1154,6 +1160,16 @@ fn fwd_guards_reject_degenerate_arguments() {
     assert!(akv(200, 8, 1).is_err(), "append_kv kvl not a multiple of 128");
     assert!(akv(1152, 8, 9).is_err(), "append_kv kvl > 1024");
     assert!(akv(256, 300, 2).is_err(), "append_kv ropn > kvl");
+    // The one guard deliberately STRICTER than HIP: the shader packs u16 keys into u32
+    // words, so an odd ropn would straddle a word and drop the tail. Untested until
+    // now, which meant the divergence from HIP was asserted only in a comment.
+    assert!(akv(256, 99, 2).is_err(), "append_kv odd ropn");
+    assert!(akv(256, 98, 2).is_ok(), "append_kv even ropn must still be accepted");
+    // POSITIVE but wrong. Every previous n_blocks case was rejected by an earlier arm
+    // (kvl > 1024 fires before the equality check), so `n_blocks == kvl/128` could have
+    // been deleted with the whole suite still green.
+    assert!(akv(256, 8, 1).is_err(), "append_kv n_blocks too small");
+    assert!(akv(256, 8, 3).is_err(), "append_kv n_blocks too large");
 
     // SAFETY: as above — a zero dimension is rejected before any pointer is used.
     unsafe {

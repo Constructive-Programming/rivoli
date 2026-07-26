@@ -536,6 +536,12 @@ mod vktier {
         ///
         /// Errors if the tier is full — the pin is sized to fit, so OOM here is a
         /// budgeting bug, not a runtime condition.
+        // NO `device_sync()` here, unlike `DeviceBuf::copy_in_at` which needs one. That
+        // asymmetry is deliberate and narrow: placement happens once at startup, before
+        // any dispatch is recorded, so there is no in-flight kernel for the host write to
+        // race. If placement ever becomes something the engine does mid-decode — a
+        // re-pin, a hot-swap — this needs the same sync `copy_in_at` got, for the same
+        // reason.
         pub fn place(&mut self, bytes: &[u8]) -> Result<*mut u8> {
             let off = (self.used + 255) & !255;
             let span = bytes.len().next_multiple_of(crate::vk::WORD);
@@ -730,6 +736,22 @@ mod vktier {
         fn tier_rejects_overflow() {
             let mut tier = DeviceTier::new(1 << 20).expect("alloc tier");
             assert!(tier.place(&vec![0u8; (1 << 20) + 1]).is_err());
+        }
+
+        /// `place` advances the cursor by a WORD-rounded span. Neither length in
+        /// `tier_roundtrips_placed_bytes` is ragged (1000 and 500 are both multiples of
+        /// 4), so `used` is identical with and without the padding and that test could
+        /// not tell the two apart. 1001 can.
+        #[test]
+        fn place_pads_the_cursor_to_a_word() {
+            let mut tier = DeviceTier::new(4 << 20).expect("alloc tier");
+            tier.place(&vec![7u8; 1001]).expect("place ragged");
+            assert_eq!(
+                tier.used,
+                1004,
+                "cursor must advance by the WORD-rounded span, so a shader's 32-bit \
+                 read of the final byte cannot reach the next placement"
+            );
         }
 
         #[test]

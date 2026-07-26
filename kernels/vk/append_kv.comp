@@ -68,6 +68,11 @@ layout(push_constant) uniform Push {
 
 shared float sscale[MAX_BLOCKS];
 
+// INDEX CEILING (docs/VULKAN.md, "Index width"): the row bases below are 32-bit.
+// `pos * kvl` at the maximum kvl of 1024 wraps at pos ~= 4.19e6, and `pos * ropn` later
+// still — both far above any reachable context length, so 32 bits is deliberate here
+// rather than an oversight. Recorded because the rule is to state the ceiling per
+// kernel, not to leave the next reader deriving it.
 void main() {
     uint t = gl_LocalInvocationID.x;
     uint b = gl_SubgroupID;          // one subgroup per 128-element block
