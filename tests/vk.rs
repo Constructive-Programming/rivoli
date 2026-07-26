@@ -43,7 +43,8 @@ use rivoli::math::{E4M3_BLOCK, E4M3_MAX, e4m3_to_f32, f32_to_bf16, f32_to_e4m3, 
 use rivoli::vk::{
     Buf, ROWS_PER_BLOCK, VALIDATION_ERRORS, device_sync, gpu, launch_append_kv, launch_argmax,
     launch_embed_i8_row, launch_gather_rope, launch_gemv_f32, launch_gemv_fp8, launch_gemv_i8,
-    launch_attend, launch_mla_absorb_fp8, launch_mla_value_fp8, launch_rmsnorm, launch_rope,
+    launch_attend, launch_mla_absorb_fp8, launch_mla_value_fp8, launch_moe_expert_range,
+    launch_moe_reduce, launch_rmsnorm, launch_rope,
     launch_swiglu, launch_vadd, memcpy_dtod,
 };
 use std::sync::atomic::Ordering;
@@ -2771,4 +2772,408 @@ fn mla_guards_reject_degenerate_arguments() {
 
     device_sync().expect("sync");
     v.check("mla_guards_reject_degenerate_arguments");
+}
+
+// ---------------------------------------------------------------------------
+// moe.hip: the fused VQ-int3 expert batch.
+//
+// Oracles derived from moe.hip, common.hpp, quant.rs and math.rs — the SPECIFICATION —
+// by someone working with the shader files WITHHELD, for the same reason as the MLA
+// tranche: the person who wrote these shaders cannot also write their reference.
+// ---------------------------------------------------------------------------
+
+use rivoli::quant::{VQ_DIM, VQ_GROUP, VQ_INDEX_BITS, vq_groups, vq_row_bytes};
+
+/// Subvectors sharing one bf16 group scale — `VQ_SUBS_PER_GROUP` in common.hpp.
+const VQ_SUBS: usize = VQ_GROUP / VQ_DIM;
+
+/// One expert's six byte spans, in `ExpertDescVq` field order. Scales are the raw
+/// little-endian bf16 bytes exactly as they sit on device, so the oracle decodes the
+/// same bytes the kernel does.
+#[derive(Clone, Default)]
+struct ExpertBytes {
+    gate_indices: Vec<u8>,
+    gate_scales: Vec<u8>,
+    up_indices: Vec<u8>,
+    up_scales: Vec<u8>,
+    down_indices: Vec<u8>,
+    down_scales: Vec<u8>,
+}
+
+/// fp16 bit pattern -> f32. Exact for every finite value: 10 mantissa bits into 23, and
+/// the 2^-24 subnormals are f32 normals. `math.rs` exports only the forward direction.
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits as u32) & 0x8000) << 16;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let mant = (bits & 0x03ff) as u32;
+    if exp == 0 {
+        let v = (mant as f32) * (1.0 / 16_777_216.0);
+        return if sign != 0 { -v } else { v };
+    }
+    if exp == 0x1f {
+        return f32::from_bits(sign | 0x7f80_0000 | (mant << 13));
+    }
+    f32::from_bits(sign | ((exp + 112) << 23) | (mant << 13))
+}
+
+/// The 12-bit index of subvector `t`, in `dot_vq_wave`'s own form.
+///
+/// TWO ADJACENT BYTES, and that is the whole hazard. `byte = (t*12)>>3` gives
+/// `0,1,3,4,6,7,9,...`, so the pair straddles a 4-byte word exactly when
+/// `t = 2 or 5 (mod 8)` — derived two ways, by enumeration and algebraically, agreeing.
+fn vq_index(idxrow: &[u8], t: usize) -> usize {
+    let bitpos = t * VQ_INDEX_BITS;
+    let byte = bitpos >> 3;
+    let shift = bitpos & 7;
+    let raw = (idxrow[byte] as u32) | ((idxrow[byte + 1] as u32) << 8);
+    ((raw >> shift) & 0xFFF) as usize
+}
+
+/// Write `idx` at subvector `t`, mirroring `quant.rs::set_idx`.
+fn vq_set(idxrow: &mut [u8], t: usize, idx: usize) {
+    let bitpos = t * VQ_INDEX_BITS;
+    let (byte, shift) = (bitpos >> 3, bitpos & 7);
+    let v = (idx as u32) << shift;
+    idxrow[byte] |= (v & 0xff) as u8;
+    idxrow[byte + 1] |= ((v >> 8) & 0xff) as u8;
+}
+
+/// `moe.hip::siluf` — a DIVIDE, not `math::silu`'s reciprocal-then-multiply. The two are
+/// not bit-identical; see docs/VULKAN.md.
+fn siluf(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+/// `common.hpp::dot_vq_wave`, wave-strided with the fixed ladder and hipcc's contraction:
+/// term 1 a plain multiply, terms 2-4 fused, and the group scale fused.
+fn oracle_dot_vq(idxrow: &[u8], scalerow: &[u8], cb: &[u16], x: &[f32], i_dim: usize) -> f32 {
+    let nsub = i_dim / VQ_DIM;
+    let mut lanes = [0.0f32; ORACLE_WAVE];
+    for (lane, out) in lanes.iter_mut().enumerate() {
+        let mut acc = 0.0f32;
+        let mut t = lane;
+        while t < nsub {
+            let idx = vq_index(idxrow, t);
+            let c: Vec<f32> = (0..VQ_DIM).map(|k| f16_to_f32(cb[idx * VQ_DIM + k])).collect();
+            let i0 = t * VQ_DIM;
+            let mut dot = x[i0] * c[0];
+            dot = x[i0 + 1].mul_add(c[1], dot);
+            dot = x[i0 + 2].mul_add(c[2], dot);
+            dot = x[i0 + 3].mul_add(c[3], dot);
+            let g = t / VQ_SUBS;
+            let s = rivoli::math::bf16_to_f32(u16::from_le_bytes([
+                scalerow[g * 2],
+                scalerow[g * 2 + 1],
+            ]));
+            acc = s.mul_add(dot, acc);
+            t += ORACLE_WAVE;
+        }
+        *out = acc;
+    }
+    oracle_wave_sum(lanes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn moe_gateup_oracle(
+    x: &[f32],
+    descs: &[ExpertBytes],
+    gate_cb: &[u16],
+    up_cb: &[u16],
+    hidden: usize,
+    inter: usize,
+    e_start: usize,
+    e_count: usize,
+) -> Vec<f32> {
+    let (rb, ng) = (vq_row_bytes(hidden), vq_groups(hidden));
+    let mut h = vec![0.0f32; (e_start + e_count) * inter];
+    for e in e_start..e_start + e_count {
+        let d = &descs[e];
+        for j in 0..inter {
+            let g = oracle_dot_vq(
+                &d.gate_indices[j * rb..(j + 1) * rb],
+                &d.gate_scales[j * ng * 2..(j + 1) * ng * 2],
+                gate_cb,
+                x,
+                hidden,
+            );
+            let u = oracle_dot_vq(
+                &d.up_indices[j * rb..(j + 1) * rb],
+                &d.up_scales[j * ng * 2..(j + 1) * ng * 2],
+                up_cb,
+                x,
+                hidden,
+            );
+            h[e * inter + j] = siluf(g) * u;
+        }
+    }
+    h
+}
+
+#[allow(clippy::too_many_arguments)]
+fn moe_down_oracle(
+    descs: &[ExpertBytes],
+    down_cb: &[u16],
+    wexpert: &[f32],
+    h: &[f32],
+    hidden: usize,
+    inter: usize,
+    e_start: usize,
+    e_count: usize,
+) -> Vec<f32> {
+    let (rb, ng) = (vq_row_bytes(inter), vq_groups(inter));
+    let mut partial = vec![0.0f32; (e_start + e_count) * hidden];
+    for e in e_start..e_start + e_count {
+        let d = &descs[e];
+        let he = &h[e * inter..(e + 1) * inter];
+        for o in 0..hidden {
+            let dv = oracle_dot_vq(
+                &d.down_indices[o * rb..(o + 1) * rb],
+                &d.down_scales[o * ng * 2..(o + 1) * ng * 2],
+                down_cb,
+                he,
+                inter,
+            );
+            partial[e * hidden + o] = wexpert[e] * dv;
+        }
+    }
+    partial
+}
+
+fn moe_reduce_oracle(partial: &[f32], e_count: usize, hidden: usize) -> Vec<f32> {
+    (0..hidden)
+        .map(|o| {
+            let mut acc = 0.0f32;
+            for e in 0..e_count {
+                acc += partial[e * hidden + o];
+            }
+            acc
+        })
+        .collect()
+}
+
+/// Build one expert's six spans. `plant` places a 12-bit index with EVERY BIT SET at the
+/// straddling subvectors, which is what makes the word-boundary bug detectable.
+fn expert_bytes(seed: u64, hidden: usize, inter: usize, plant: bool) -> ExpertBytes {
+    let mut r = Lcg(seed);
+    let mut mk = |rows: usize, i_dim: usize| -> (Vec<u8>, Vec<u8>) {
+        let (rb, ng) = (vq_row_bytes(i_dim), vq_groups(i_dim));
+        let nsub = i_dim / VQ_DIM;
+        let mut idx = vec![0u8; rows * rb];
+        for row in 0..rows {
+            let span = &mut idx[row * rb..(row + 1) * rb];
+            for t in 0..nsub {
+                // 0xFFF at every straddling subvector (t = 2 or 5 mod 8). A naive
+                // single-word load truncates the high nibble there, so an index whose
+                // high bits are zero would NOT reveal the bug.
+                let v = if plant && (t % 8 == 2 || t % 8 == 5) {
+                    0xFFF
+                } else {
+                    (r.0 >> 20) as usize & 0xFFF
+                };
+                r.f();
+                vq_set(span, t, v);
+            }
+        }
+        let scales: Vec<u8> = (0..rows * ng)
+            .flat_map(|_| f32_to_bf16((r.f() * 0.5).abs() + 0.05).to_le_bytes())
+            .collect();
+        (idx, scales)
+    };
+    let (gi, gs) = mk(inter, hidden);
+    let (ui, us) = mk(inter, hidden);
+    let (di, ds) = mk(hidden, inter);
+    ExpertBytes {
+        gate_indices: gi,
+        gate_scales: gs,
+        up_indices: ui,
+        up_scales: us,
+        down_indices: di,
+        down_scales: ds,
+    }
+}
+
+/// An fp16 codebook of `VQ_K` entries x VQ_DIM centroids, as raw bit patterns.
+fn vq_codebook(seed: u64) -> Vec<u16> {
+    let mut r = Lcg(seed);
+    (0..4096 * VQ_DIM).map(|_| rivoli::math::f32_to_f16(r.f())).collect()
+}
+
+/// The whole VQ MoE path — gate/up, down, reduce — against the CPU oracles.
+///
+/// SHAPE CHOSEN ADVERSARIALLY, not for convenience. `hidden = 512` gives 128 subvectors
+/// per gate/up row, so the straddling indices at `t = 2, 5 (mod 8)` occur 32 times per
+/// row. `inter = 64` gives only 16 subvectors per DOWN row — fewer than `WAVE` — so half
+/// the lanes contribute exactly zero and the halving ladder runs in its degenerate
+/// regime, which no other shape here exercises.
+#[test]
+fn moe_vq_matches_the_host_oracles() {
+    let v = Validation::new();
+    let (hidden, inter, e_count) = (512usize, 64usize, 3usize);
+    let mut r = Lcg(0x30E);
+    let x: Vec<f32> = (0..hidden).map(|_| r.f()).collect();
+    let wexpert: Vec<f32> = (0..e_count).map(|_| r.f().abs() + 0.1).collect();
+    let descs: Vec<ExpertBytes> =
+        (0..e_count).map(|e| expert_bytes(0xE0 + e as u64, hidden, inter, true)).collect();
+    let (gate_cb, up_cb, down_cb) = (vq_codebook(1), vq_codebook(2), vq_codebook(3));
+
+    let want_h = moe_gateup_oracle(&x, &descs, &gate_cb, &up_cb, hidden, inter, 0, e_count);
+    let want_p =
+        moe_down_oracle(&descs, &down_cb, &wexpert, &want_h, hidden, inter, 0, e_count);
+    let want_o = moe_reduce_oracle(&want_p, e_count, hidden);
+
+    // Device-side: the six spans per expert, then a descriptor array of their addresses.
+    let bufs: Vec<[Buf; 6]> = descs
+        .iter()
+        .map(|d| {
+            [
+                dev(&d.gate_indices),
+                dev(&d.gate_scales),
+                dev(&d.up_indices),
+                dev(&d.up_scales),
+                dev(&d.down_indices),
+                dev(&d.down_scales),
+            ]
+        })
+        .collect();
+    let desc_bytes: Vec<u8> = bufs
+        .iter()
+        .flat_map(|b| b.iter().flat_map(|s| (s.ptr() as u64).to_le_bytes()))
+        .collect();
+    let db = dev(&desc_bytes);
+    let u16b = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|h| h.to_le_bytes()).collect() };
+    let (gcb, ucb, dcb) = (dev(&u16b(&gate_cb)), dev(&u16b(&up_cb)), dev(&u16b(&down_cb)));
+    let (xb, wb) = (dev(&f32b(&x)), dev(&f32b(&wexpert)));
+    let mut hb = dev(&vec![0u8; e_count * inter * 4]);
+    let mut pb = dev(&vec![0u8; e_count * hidden * 4]);
+    let mut ob = poison(hidden * 4 + GUARD);
+
+    // SAFETY: every buffer is live and of the documented size; descs holds e_count
+    // six-address descriptors whose targets outlive the sync.
+    unsafe {
+        launch_moe_expert_range(
+            xb.ptr() as *const f32,
+            hidden,
+            inter,
+            0,
+            e_count,
+            db.ptr() as *const rivoli::vk::ExpertDesc,
+            gcb.ptr() as *const u16,
+            ucb.ptr() as *const u16,
+            dcb.ptr() as *const u16,
+            wb.ptr() as *const f32,
+            hb.ptr_mut() as *mut f32,
+            pb.ptr_mut() as *mut f32,
+            std::ptr::null_mut(),
+        )
+        .expect("expert range");
+        launch_moe_reduce(
+            pb.ptr() as *const f32,
+            e_count,
+            hidden,
+            ob.ptr_mut() as *mut f32,
+            std::ptr::null_mut(),
+        )
+        .expect("reduce");
+    }
+    device_sync().expect("sync");
+
+    let got_h = f32v(&readb(&hb, e_count * inter * 4));
+    let got_p = f32v(&readb(&pb, e_count * hidden * 4));
+    let got_o = readb(&ob, hidden * 4 + GUARD);
+    assert_untouched(&got_o, hidden * 4, "moe_reduce");
+
+    let mut shapes = Shapes::default();
+    shapes.close(&want_h, &got_h, "moe_gateup_vq h512 i64 e3");
+    shapes.close(&want_p, &got_p, "moe_down_vq h512 i64 e3");
+    shapes.close(&want_o, &f32v(&got_o[..hidden * 4]), "moe_reduce h512 e3");
+    shapes.assert_all_passed("moe vq");
+    v.check("moe_vq_matches_the_host_oracles");
+}
+
+/// The VQ launchers' argument guards, including the two stricter than HIP.
+#[test]
+fn moe_guards_reject_degenerate_arguments() {
+    let v = Validation::new();
+    let src = dev(&[0u8; 4096]);
+    let mut dst = dev(&[0u8; 4096]);
+    let (p, q) = (src.ptr(), dst.ptr_mut());
+    // SAFETY: every case is rejected before a pointer is dereferenced.
+    unsafe {
+        let mo = |hidden: usize, inter: usize, e_count: usize| {
+            launch_moe_expert_range(
+                p as *const f32, hidden, inter, 0, e_count,
+                p as *const rivoli::vk::ExpertDesc, p as *const u16, p as *const u16,
+                p as *const u16, p as *const f32, q as *mut f32, q as *mut f32,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(mo(0, 64, 1).is_err(), "moe hidden = 0");
+        assert!(mo(64, 0, 1).is_err(), "moe inter = 0");
+        assert!(mo(64, 64, 0).is_err(), "moe e_count = 0");
+        // STRICTER THAN HIP: moe.hip's vq_rb/vq_ng truncate silently on a dimension that
+        // is not a whole number of VQ groups, mis-sizing every row with no diagnostic.
+        assert!(mo(96, 64, 1).is_err(), "moe hidden not a multiple of VQ_GROUP");
+        assert!(mo(64, 96, 1).is_err(), "moe inter not a multiple of VQ_GROUP");
+        assert!(
+            launch_moe_reduce(p as *const f32, 0, 64, q as *mut f32, std::ptr::null_mut())
+                .is_err(),
+            "moe_reduce e = 0"
+        );
+        assert!(
+            launch_moe_reduce(p as *const f32, 1, 0, q as *mut f32, std::ptr::null_mut())
+                .is_err(),
+            "moe_reduce hidden = 0"
+        );
+    }
+    v.check("moe_guards_reject_degenerate_arguments");
+}
+
+/// THE PLANTED INDICES MUST ACTUALLY BE ABLE TO CATCH THE BUG.
+///
+/// The word-boundary defect needs the device to demonstrate end to end — a naive shader, a
+/// red oracle, a restore. But half of it is checkable on the CPU now, and it is the half
+/// that is easy to get wrong: whether the test DATA distinguishes the correct unpack from
+/// the naive one at all. A planted index whose high nibble happened to be zero would leave
+/// the GPU test green under a broken shader and nobody would know.
+///
+/// So model the naive single-word read — load the `uint` containing `byte`, shift within
+/// it, drop whatever lives in the next word — and assert it DISAGREES at every straddling
+/// subvector and AGREES everywhere else. The second half matters as much: if the model
+/// disagreed everywhere it would not be modelling this bug.
+#[test]
+fn planted_straddle_indices_would_catch_a_naive_unpack() {
+    let (hidden, inter) = (512usize, 64usize);
+    let d = expert_bytes(0xE0, hidden, inter, true);
+    let rb = vq_row_bytes(hidden);
+    let nsub = hidden / VQ_DIM;
+
+    let naive = |row: &[u8], t: usize| -> usize {
+        let bitpos = t * VQ_INDEX_BITS;
+        let byte = bitpos >> 3;
+        let w = byte & !3;
+        let word = u32::from_le_bytes([row[w], row[w + 1], row[w + 2], row[w + 3]]);
+        ((word >> (((byte - w) * 8) + (bitpos & 7))) & 0xFFF) as usize
+    };
+
+    let row = &d.gate_indices[..rb];
+    let (mut straddling, mut caught) = (0usize, 0usize);
+    for t in 0..nsub {
+        let correct = vq_index(row, t);
+        if ((t * VQ_INDEX_BITS) >> 3) % 4 == 3 {
+            straddling += 1;
+            assert_eq!(correct, 0xFFF, "t={t} should carry the planted all-ones index");
+            if naive(row, t) != correct {
+                caught += 1;
+            }
+        } else {
+            assert_eq!(naive(row, t), correct, "t={t} does not straddle; both must agree");
+        }
+    }
+    assert_eq!(straddling, 32, "expected 32 straddling subvectors at nsub=128");
+    assert_eq!(
+        caught, straddling,
+        "the planted data must distinguish the naive unpack at EVERY straddling subvector \
+         — below {straddling} and the GPU test could go green against a broken shader"
+    );
+    println!("{caught}/{straddling} straddling subvectors distinguish a naive unpack");
 }
