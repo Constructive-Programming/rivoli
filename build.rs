@@ -109,22 +109,48 @@ fn vulkan() {
     for path in &shaders {
         println!("cargo:rerun-if-changed={}", path.display());
     }
+    // EVERY shader is compiled and checked before anything fails, and the failures are
+    // reported together.
+    //
+    // Aborting at the first bad shader reports a FLOOR, not a count — and the situation
+    // where that bites is the common one: change a shared constant, break four shaders,
+    // get told about one. Fix it, rebuild, get told about the next. Each rebuild teaches
+    // one fact the compiler already knew in full. It also hides breakage during review:
+    // a `#error` in an early-sorted shader masked a second one in a later shader, and
+    // that only surfaced because a deliberate-break check reported "did not fire" when
+    // it should have.
+    let mut failures: Vec<String> = Vec::new();
     for src in shaders.iter().filter(|p| p.extension().is_some_and(|e| e == "comp")) {
         let stem = src.file_stem().expect("shader stem").to_string_lossy();
         let spv = format!("{out_dir}/{stem}.spv");
-        let status = Command::new(&glslc)
+        let out = Command::new(&glslc)
             .args(["--target-env=vulkan1.3", "-O", "-Ikernels/vk"])
             .arg(format!("-DWAVE={VK_WAVE}"))
             .arg(format!("-DROWS_PER_BLOCK={VK_ROWS_PER_BLOCK}"))
             .arg(src)
             .args(["-o", &spv])
-            .status()
+            .output()
             .expect("run glslc");
-        assert!(status.success(), "glslc failed on {}", src.display());
-        spirv_val(&spv);
-        no_subgroup_arithmetic(&spv);
-        no_reciprocal_rewrite(&spv);
+        if !out.status.success() {
+            failures.push(format!(
+                "{}: glslc failed\n{}",
+                src.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+            // The later checks read the .spv, which does not exist or is stale. Skipping
+            // them is not "stopping early": every OTHER shader is still checked.
+            continue;
+        }
+        failures.extend(spirv_val(&spv));
+        failures.extend(no_subgroup_arithmetic(&spv));
+        failures.extend(no_reciprocal_rewrite(&spv));
     }
+    assert!(
+        failures.is_empty(),
+        "\n\n{} shader problem(s) — ALL of them, not just the first:\n\n{}\n",
+        failures.len(),
+        failures.join("\n\n")
+    );
 }
 
 /// Fail the build if a module declares the `GroupNonUniformArithmetic` capability —
@@ -138,24 +164,22 @@ fn vulkan() {
 /// build error, because a comment does not survive sixteen kernel ports.
 ///
 /// Skipped with a warning if `spirv-dis` is absent, like `spirv-val` above.
-fn no_subgroup_arithmetic(spv: &str) {
-    let out = match Command::new("spirv-dis").arg("--no-color").arg(spv).output() {
-        Ok(o) if o.status.success() => o.stdout,
-        Ok(_) => panic!("spirv-dis failed on {spv}"),
-        Err(e) => {
-            println!("cargo:warning=spirv-dis not run on {spv} ({e}); subgroupAdd unchecked");
-            return;
-        }
-    };
-    let text = String::from_utf8_lossy(&out);
-    for banned in ["GroupNonUniformArithmetic", "GroupNonUniformClustered"] {
-        assert!(
-            !text.contains(banned),
-            "{spv} declares OpCapability {banned}: a subgroup reduce (subgroupAdd and \
-             friends) has an implementation-defined summation order and breaks greedy \
-             decode's reproducibility. Use the wave_sum shuffle ladder."
-        );
-    }
+///
+/// Returns findings rather than panicking, so the caller can report every shader's
+/// problems at once.
+fn no_subgroup_arithmetic(spv: &str) -> Vec<String> {
+    let Some(text) = disassemble(spv) else { return Vec::new() };
+    ["GroupNonUniformArithmetic", "GroupNonUniformClustered"]
+        .iter()
+        .filter(|banned| text.contains(*banned))
+        .map(|banned| {
+            format!(
+                "{spv}: declares OpCapability {banned} — a subgroup reduce (subgroupAdd \
+                 and friends) has an implementation-defined summation order and breaks \
+                 greedy decode's reproducibility. Use the wave_sum shuffle ladder."
+            )
+        })
+        .collect()
 }
 
 /// Fail the build if `-O` turned a division into a multiply by a reciprocal.
@@ -177,13 +201,14 @@ fn no_subgroup_arithmetic(spv: &str) {
 /// multiplying by anything else is either an optimizer-invented reciprocal or an
 /// author-written scale that deserves an argument. Pass the divisor in at runtime — an
 /// operand the optimizer cannot see is an operand it cannot fold.
-fn no_reciprocal_rewrite(spv: &str) {
+fn no_reciprocal_rewrite(spv: &str) -> Vec<String> {
     // Legitimate non-power-of-two constant multiplies, if one is ever justified: add
     // the exact printed value here with a comment saying why it is safe. Empty on
     // purpose — every current kernel either divides at runtime or scales by 2^n.
     const ALLOWED: &[&str] = &[];
 
-    let Some(text) = disassemble(spv) else { return };
+    let mut found = Vec::new();
+    let Some(text) = disassemble(spv) else { return found };
     // name -> printed value, from `%float_x = OpConstant %float 0.125`
     let mut consts = std::collections::HashMap::new();
     for line in text.lines() {
@@ -205,8 +230,8 @@ fn no_reciprocal_rewrite(spv: &str) {
             if v == 0.0 || (v.to_bits() & 0x007f_ffff) == 0 {
                 continue;
             }
-            panic!(
-                "{spv}: multiplies by the non-power-of-two constant {val}\n  {}\n\
+            found.push(format!(
+                "{spv}: multiplies by the non-power-of-two constant {val}\n  {}\n  \
                  This is how `glslc -O` spells `a / {:.0}` — and a reciprocal multiply \
                  is NOT bit-identical to the divide hipcc emits, so the two backends \
                  diverge silently. Pass the divisor in as a push constant (see \
@@ -214,9 +239,10 @@ fn no_reciprocal_rewrite(spv: &str) {
                  \"{val}\" to ALLOWED in build.rs with the reason.",
                 line.trim(),
                 1.0 / v
-            );
+            ));
         }
     }
+    found
 }
 
 /// `spirv-dis` output, or `None` with a warning if the tool is absent — same optional
@@ -241,9 +267,16 @@ fn disassemble(spv: &str) -> Option<String> {
 ///
 /// A missing `spirv-val` warns rather than fails: it ships in a different package from
 /// glslc, and a box that can build shaders should not be blocked on the checker.
-fn spirv_val(spv: &str) {
-    match Command::new("spirv-val").arg(spv).status() {
-        Ok(status) => assert!(status.success(), "spirv-val rejected {spv}"),
-        Err(e) => println!("cargo:warning=spirv-val not run on {spv} ({e}); SPIR-V unchecked"),
+fn spirv_val(spv: &str) -> Vec<String> {
+    match Command::new("spirv-val").arg(spv).output() {
+        Ok(o) if o.status.success() => Vec::new(),
+        Ok(o) => vec![format!(
+            "{spv}: spirv-val rejected the module\n{}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        )],
+        Err(e) => {
+            println!("cargo:warning=spirv-val not run on {spv} ({e}); SPIR-V unchecked");
+            Vec::new()
+        }
     }
 }

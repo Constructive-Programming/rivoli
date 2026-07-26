@@ -130,6 +130,28 @@ There is more than one party working in this repository. To get a clean tree, us
 
 ## Traps worth knowing
 
+### A check that stops at the first failure reports a floor, not a count
+
+`build.rs` compiled shaders in sorted order and aborted on the first bad one. Break a
+shared constant and four shaders fail; the build names one. Fix it, rebuild, get named
+the next. Each rebuild teaches one fact the compiler already knew in full — and
+"the build passes now" after fixing one error is a weaker statement than it sounds,
+because nothing ever established that one was the only one.
+
+It surfaced the good way: a deliberate-break arm reported DID NOT FIRE for a `#error`
+that does fire, because an earlier-sorted shader's `#error` aborted the build first.
+A *negative* result distrusted enough to chase, rather than a positive one accepted.
+Fixed by compiling everything, accumulating, and failing once with the whole list.
+
+The shape generalises past shaders — any first-failure-abort check reports a lower
+bound on the damage. A test harness that stops on first failure does it. So does
+`assert_validation_clean` in `tests/vk.rs`, per test: it asserts a count is zero, so the
+first message aborts that test and any later ones in it go unseen. That is acceptable
+there (one message is already a failure worth investigating) but it means the count in
+the message is a floor, and the phrasing should never imply otherwise.
+
+Ask of any check: **if there were three problems, would this tell me three?**
+
 ### A correct guard resting on a false rationale
 
 `DeviceTier::place` pads its cursor to a word boundary, and the comment said this is
