@@ -7,6 +7,7 @@
 #![cfg(feature = "vulkan")]
 #![allow(clippy::expect_used)]
 
+use rivoli::device::DeviceTier;
 use rivoli::vk::{
     Buf, ROWS_PER_BLOCK, VALIDATION_ERRORS, device_sync, gpu, launch_gemv_f32, memcpy_dtod,
 };
@@ -98,25 +99,51 @@ fn read(y: &Buf, n: usize) -> Vec<u8> {
     out
 }
 
-/// Fail the run if the validation layer said anything. Costs nothing when the layer
-/// is absent, and prints whether it was there at all — a green oracle from an
-/// unvalidated run must not read like a validated one.
-fn assert_validation_clean(label: &str) {
-    let g = gpu().expect("vulkan init");
-    let n = VALIDATION_ERRORS.load(Ordering::Relaxed);
-    println!(
-        "{label}: validation layer {}",
-        if g.validation() {
-            "ON"
-        } else {
-            "OFF — THIS RUN IS UNVALIDATED"
+/// Snapshots the validation counter on construction and asserts NOTHING NEW arrived
+/// by the time it is checked.
+///
+/// A delta, not an absolute. `VALIDATION_ERRORS` is process-global and cargo runs this
+/// binary's tests on parallel threads, so asserting `== 0` means a message caused by
+/// test A fails whichever test happens to read the counter next — the failure names
+/// the wrong test and the maintainer debugs the wrong code. That misattribution is
+/// worst for exactly the findings that matter here, since a threading diagnostic is
+/// caused by the interaction BETWEEN two tests.
+///
+/// The delta still cannot attribute a concurrent message to its true source; it only
+/// stops a test being blamed for one that predates it. Run with `--test-threads=1`
+/// when a message actually appears.
+struct Validation {
+    at_entry: usize,
+}
+
+impl Validation {
+    fn new() -> Self {
+        Self {
+            at_entry: VALIDATION_ERRORS.load(Ordering::Relaxed),
         }
-    );
-    assert_eq!(n, 0, "{label}: {n} validation messages");
+    }
+
+    /// Costs nothing when the layer is absent, and prints whether it was there at all
+    /// — a green oracle from an unvalidated run must not read like a validated one.
+    fn check(&self, label: &str) {
+        let g = gpu().expect("vulkan init");
+        let now = VALIDATION_ERRORS.load(Ordering::Relaxed);
+        let n = now.saturating_sub(self.at_entry);
+        println!(
+            "{label}: validation layer {}",
+            if g.validation() {
+                "ON"
+            } else {
+                "OFF — THIS RUN IS UNVALIDATED"
+            }
+        );
+        assert_eq!(n, 0, "{label}: {n} validation messages during this test");
+    }
 }
 
 #[test]
 fn gemv_f32_matches_oracle() {
+    let v = Validation::new();
     let mut r = Lcg(0x3F2);
     // Shapes chosen for the edges, not for realism:
     //   256x5120  the router-gate shape the kernel exists for;
@@ -155,7 +182,7 @@ fn gemv_f32_matches_oracle() {
         );
         assert_close(&want, &out[..o_dim], &format!("gemv_f32 {o_dim}x{i_dim}"));
     }
-    assert_validation_clean("gemv_f32_matches_oracle");
+    v.check("gemv_f32_matches_oracle");
 }
 
 /// The inter-dispatch barrier in `Gpu::enqueue` is the most consequential unvalidated
@@ -168,6 +195,7 @@ fn gemv_f32_matches_oracle() {
 /// actually orders the write before the read.
 #[test]
 fn chained_dispatch_respects_the_barrier() {
+    let v = Validation::new();
     let mut r = Lcg(0xBA2);
     let (n, mid) = (64usize, 96usize);
     let a: Vec<f32> = (0..mid * n).map(|_| r.f()).collect(); // [mid, n]
@@ -187,7 +215,7 @@ fn chained_dispatch_respects_the_barrier() {
     launch(&tb, &bb, &mut yb, n, mid); // y = B·t   <- needs t complete
     device_sync().expect("sync"); // ONE sync for both
     assert_close(&want, &f32v(&read(&yb, n)), "chained A then B");
-    assert_validation_clean("chained_dispatch");
+    v.check("chained_dispatch");
 }
 
 /// Greedy decode must be reproducible run to run, which is a STRICTER property than
@@ -201,6 +229,7 @@ fn chained_dispatch_respects_the_barrier() {
 /// workgroup partials in LDS rather than within one subgroup.
 #[test]
 fn gemv_f32_is_bit_reproducible() {
+    let v = Validation::new();
     let mut r = Lcg(0xDE7);
     let (o_dim, i_dim) = (255usize, 1024usize);
     let w: Vec<f32> = (0..o_dim * i_dim).map(|_| r.f()).collect();
@@ -224,7 +253,7 @@ fn gemv_f32_is_bit_reproducible() {
         f32v(&first).iter().any(|v| v.abs() > 1e-6),
         "output is all zero — the test proves nothing"
     );
-    assert_validation_clean("gemv_f32_is_bit_reproducible");
+    v.check("gemv_f32_is_bit_reproducible");
 }
 
 /// `memcpy_dtod` (arena slot relocation) reading what a dispatch just wrote, in ONE
@@ -237,6 +266,7 @@ fn gemv_f32_is_bit_reproducible() {
 /// which is exactly why the hazard is worth a checker rather than an oracle.
 #[test]
 fn memcpy_dtod_after_dispatch_is_ordered() {
+    let v = Validation::new();
     let mut r = Lcg(0xC0B);
     let (o_dim, i_dim) = (128usize, 256usize);
     let w: Vec<f32> = (0..o_dim * i_dim).map(|_| r.f()).collect();
@@ -256,7 +286,7 @@ fn memcpy_dtod_after_dispatch_is_ordered() {
 
     let got = f32v(&read(&zb, o_dim));
     assert_close(&want, &got, "memcpy_dtod after dispatch");
-    assert_validation_clean("memcpy_dtod_after_dispatch_is_ordered");
+    v.check("memcpy_dtod_after_dispatch_is_ordered");
 }
 
 /// Drive a future to completion on this thread. Fifteen lines of std beats pulling in
@@ -291,6 +321,7 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
 /// decides whether the async overlap is affordable at all.
 #[test]
 fn timeline_signal_resolves_and_latency() {
+    let v = Validation::new();
     let g = gpu().expect("vulkan init");
     // Warm the waiter thread and the first submit.
     block_on(g.signal().expect("arm"));
@@ -305,7 +336,7 @@ fn timeline_signal_resolves_and_latency() {
     // Sanity ceiling only, matching the HIP test: if a bare signal costs >1 ms the
     // pipeline is a non-starter and the number matters more than the assertion.
     assert!(us < 1000.0, "signal latency {us:.1}us implausibly high");
-    assert_validation_clean("timeline_signal_resolves_and_latency");
+    v.check("timeline_signal_resolves_and_latency");
 }
 
 /// A resolved signal is immediately ready, and `resolve` is idempotent — the error
@@ -319,9 +350,61 @@ fn signal_ready_and_resolve_are_immediate() {
     block_on(s);
 }
 
+/// A kernel reads weights placed through `DeviceTier`, at the address `place`
+/// returned.
+///
+/// This is the one line in the backend that converts between the two bases —
+/// `place` writes through the HOST mapping and hands back a DEVICE address
+/// (`slab.ptr() as usize + off`) — and docs/VULKAN.md calls that split the biggest
+/// structural difference in the port. The unit test in device.rs proves only the
+/// host-side arithmetic: it reads back through the host mapping, so a base swap, a
+/// sign error, or an offset that does not track between the two mappings would pass
+/// it and then produce garbage weights at integration.
+///
+/// Handing the returned address to a real dispatch is the only thing that closes
+/// that. It is also a miniature of what `pin.rs` does with every resident weight.
+#[test]
+fn kernel_reads_weights_placed_through_the_tier() {
+    let v = Validation::new();
+    let mut r = Lcg(0x71E);
+    let (o_dim, i_dim) = (64usize, 128usize);
+    let w: Vec<f32> = (0..o_dim * i_dim).map(|_| r.f()).collect();
+    let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
+    let mut want = vec![0.0f32; o_dim];
+    matvec_f32(&mut want, &x, &w, i_dim);
+
+    let mut tier = DeviceTier::new(4 << 20).expect("tier");
+    // Two placements, so the second sits at a non-zero bump offset — an offset that
+    // failed to track between the host and device bases would only show up there.
+    let wp = tier.place(&f32b(&w)).expect("place w");
+    let xp = tier.place(&f32b(&x)).expect("place x");
+    let mut yb = dev(&f32b(&vec![0.0f32; o_dim]));
+
+    // SAFETY: both are DEVICE addresses returned by `place`, sized as the launcher
+    // documents, inside a tier that outlives the sync below.
+    unsafe {
+        launch_gemv_f32(
+            xp as *const f32,
+            wp as *const f32,
+            o_dim,
+            i_dim,
+            yb.ptr_mut() as *mut f32,
+        )
+        .expect("launch");
+    }
+    device_sync().expect("sync");
+    assert_close(
+        &want,
+        &f32v(&read(&yb, o_dim)),
+        "gemv over tier-placed weights",
+    );
+    v.check("kernel_reads_weights_placed_through_the_tier");
+}
+
 /// The guards report errors rather than tripping a Vulkan VUID or allocating nothing.
 #[test]
 fn guards_reject_degenerate_arguments() {
+    let v = Validation::new();
     assert!(Buf::new(0).is_err(), "Buf::new(0) must be rejected");
 
     let mut b = dev(&[0u8; 64]);
@@ -346,4 +429,7 @@ fn guards_reject_degenerate_arguments() {
             "i_dim = 0 must be rejected"
         );
     }
+    // Rejecting a bad argument must not itself trip the layer — a guard that returns
+    // Err while leaving a half-built Vulkan object behind would show up here.
+    v.check("guards_reject_degenerate_arguments");
 }

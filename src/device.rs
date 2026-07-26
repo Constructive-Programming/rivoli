@@ -566,9 +566,16 @@ mod vktier {
         /// Overwrite `bytes` at byte offset `off` — grows a KV slab by one token or
         /// fills a cold-expert slot without reallocating.
         pub fn copy_in_at(&mut self, off: usize, bytes: &[u8]) -> Result<()> {
+            // SYNC FIRST. The HIP twin is `hipMemcpy(..., H2D)`, which BLOCKS and so
+            // orders itself after any kernel still reading this buffer. A bare host
+            // write into a mapped allocation does not: a dispatch already recorded into
+            // the open command buffer but not yet submitted would read the NEW bytes,
+            // turning a write-after-read hazard into wrong data. `gpu.rs:843` (descs_vq
+            // / wexpert_buf) depends on the blocking behaviour and has no device_sync
+            // of its own.
+            crate::vk::device_sync()?;
             // `write_at` already bounds-checks, and its message names the offset,
-            // length and capacity. A second check here would only change which
-            // function the text mentions.
+            // length and capacity.
             self.buf.write_at(off, bytes)
         }
 
@@ -585,12 +592,23 @@ mod vktier {
         /// For partially-written buffers — e.g. the indexer's score slab, sized to
         /// max_ctx but holding only `nt` scores this step.
         pub fn copy_out_prefix(&self, out: &mut Vec<u8>, len: usize) -> Result<()> {
+            crate::vk::device_sync()?;
             self.buf.read_into(out, len)
         }
 
         /// Copy the whole buffer back into `out` (a caller-owned buffer reused across
         /// tokens, so the per-token readback allocates nothing once it has grown).
+        /// SYNC FIRST, for the same reason as [`DeviceBuf::copy_in_at`] — the HIP twin
+        /// is a blocking `hipMemcpy(..., D2H)` and callers were written against that.
+        ///
+        /// Without it, `gpu.rs:789` (`launch_gemv_f32` then immediately
+        /// `gate_logits.copy_out_into`) would read the PREVIOUS token's gate logits,
+        /// because the dispatch is still sitting unsubmitted in the open command
+        /// buffer. Routing would then pick the wrong experts every layer of every
+        /// token, coherently, with no error. `gpu.rs:972` (`launch_argmax` then
+        /// `argmax_dev.copy_out_into`) is the same shape and yields the wrong token.
         pub fn copy_out_into(&self, out: &mut Vec<u8>) -> Result<()> {
+            crate::vk::device_sync()?;
             self.buf.read_into(out, self.len)
         }
 
@@ -712,11 +730,25 @@ mod vktier {
             assert!(d.copy_in_at(48, &bytes).is_err());
         }
 
-        // The spec's `VmmBuf::ptr()` vs `host_mut()` inequality test is deliberately
-        // absent, not forgotten: `host_mut` does not exist yet (see the note on
-        // `VmmBuf`). It is the property worth pinning — a maintainer "simplifying" two
-        // accessors back into one is exactly the regression that reads as garbage
-        // weights rather than a crash — so it belongs here the moment the accessor does.
+        /// The device base and the host base are DIFFERENT NUMBERS. This is the
+        /// central structural claim of the Vulkan port (docs/VULKAN.md, "Host pointer
+        /// != device address"), and the one a maintainer would erase by "simplifying"
+        /// two accessors back into one — a regression that reads as garbage weights
+        /// rather than a crash, because both values are plausible pointers.
+        #[test]
+        fn vmmbuf_device_and_host_bases_differ() {
+            let mut b = VmmBuf::new(1 << 20).expect("alloc");
+            let dev = b.ptr() as usize;
+            let host = b.host_mut() as usize;
+            assert_ne!(
+                dev, host,
+                "device base {dev:#x} == host base {host:#x}: either the accessors have \
+                 been collapsed, or this driver maps them identically — if the latter, \
+                 say so here rather than deleting the test, because the code must not \
+                 start depending on it"
+            );
+        }
+
         #[test]
         fn vmmbuf_allocates_distinct_device_bases() {
             let a = VmmBuf::new(4096).expect("alloc a");

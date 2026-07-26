@@ -18,7 +18,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::task::{Context, Poll};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 
@@ -57,6 +57,13 @@ pub struct Gpu {
     validation: bool,
     budget: bool,
     timeline: Timeline,
+    /// Did the waiter thread actually start? `gpu()` publishes the context BEFORE
+    /// spawning, so a spawn failure (EAGAIN under thread pressure) returns Err from
+    /// the first call while every later call short-circuits on the published value and
+    /// returns Ok. Without this flag the process would then run with no waiter: every
+    /// `signal()` would submit happily and no Signal would ever resolve, presenting as
+    /// a hang in the async path long after the transient failure that caused it.
+    waiter: AtomicBool,
 }
 
 /// Count of validation ERROR/WARNING messages seen. Tests assert it is zero, so a
@@ -215,6 +222,7 @@ pub fn gpu() -> Result<&'static Gpu> {
     std::thread::Builder::new()
         .name("rivoli-vk-timeline".into())
         .spawn(move || timeline_waiter(g))?;
+    g.waiter.store(true, Ordering::Release);
     Ok(g)
 }
 
@@ -271,6 +279,7 @@ impl Gpu {
             validation,
             budget,
             timeline,
+            waiter: AtomicBool::new(false),
         })
     }
 
@@ -628,6 +637,11 @@ impl Gpu {
     /// Append work to the open command buffer, opening one if needed, then serialise
     /// it against whatever comes next. The barrier is what makes a `launch_*` sequence
     /// behave like HIP's default stream — each kernel sees the previous one's writes.
+    /// `f` MUST NOT own, or transitively own, a [`Buf`]. It runs with the `cmd` mutex
+    /// held, and `Buf::drop` calls `Gpu::sync`, which takes that same non-reentrant
+    /// mutex — so a closure that drops a `Buf` deadlocks with no compile-time signal.
+    /// No current caller does (they capture `Copy` handles and borrowed slices), and
+    /// nothing enforces it, so the rule lives here where the next launcher is written.
     fn enqueue(&self, f: impl FnOnce(&ash::Device, vk::CommandBuffer)) -> Result<()> {
         let mut cmd = self.cmd.lock().map_err(|_| anyhow!("vk command lock poisoned"))?;
         ensure!(
@@ -727,8 +741,15 @@ impl Gpu {
         // Make the kernels' writes available to the HOST domain, so a readback after
         // the fence is defined without a per-buffer invalidate. Host WRITES need no
         // matching barrier — vkQueueSubmit implies one for anything written before it.
+        // TRANSFER as well as COMPUTE on the source side. `memcpy_dtod` records a
+        // vkCmdCopyBuffer, so bytes reaching the host may have been written by the
+        // copy rather than by a shader — as in `memcpy_dtod_after_dispatch_is_ordered`,
+        // which reads back exactly such bytes. `Gpu::enqueue` was widened for this and
+        // this barrier was not, which made the two internally inconsistent: either the
+        // host barrier is load-bearing and had a hole, or it is redundant and
+        // enqueue's premise is wrong. It is the former.
         let bar = [vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
             .dst_access_mask(vk::AccessFlags::HOST_READ)];
         let bufs = [cmd.buf];
         let si = [vk::SubmitInfo::default().command_buffers(&bufs)];
@@ -737,7 +758,7 @@ impl Gpu {
         unsafe {
             self.device.cmd_pipeline_barrier(
                 cmd.buf,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::HOST,
                 vk::DependencyFlags::empty(),
                 &bar,
@@ -1044,9 +1065,20 @@ impl Drop for Buf {
             warn!("Buf::drop: flush failed, freeing anyway: {e:#}");
         }
         // Deregister BEFORE the handles die, so `resolve` can never hand a freed
-        // VkBuffer to vkCmdCopyBuffer.
-        if let Ok(mut allocs) = ALLOCS.lock() {
-            allocs.retain(|a| a.base != self.addr);
+        // VkBuffer to vkCmdCopyBuffer. If the registry is unreachable we LEAK rather
+        // than free: a stale entry pointing at a destroyed buffer is a use-after-free
+        // with no object identity for any layer to catch, which is strictly worse than
+        // an allocation that outlives its owner.
+        match ALLOCS.lock() {
+            Ok(mut allocs) => allocs.retain(|a| a.base != self.addr),
+            Err(_) => {
+                error!(
+                    "vk alloc registry poisoned; LEAKING buffer at {:#x} rather than \
+                     leaving a stale entry that resolve() could hand to a copy",
+                    self.addr
+                );
+                return;
+            }
         }
         // SAFETY: all three handles came from this device and are released once. The
         // caller's contract (see `device_sync`) is that no kernel still references them.
@@ -1288,6 +1320,11 @@ impl Gpu {
         //
         // This is the lock the Send/Sync impl's invariant names, so taking it here is
         // what keeps that comment true rather than aspirational.
+        ensure!(
+            self.waiter.load(Ordering::Acquire),
+            "timeline waiter thread never started, so no Signal can ever resolve; \
+             refusing to hand out one that would hang its awaiter forever"
+        );
         let cmd = self.cmd.lock().map_err(|_| anyhow!("vk command lock poisoned"))?;
         ensure!(
             !cmd.poisoned,
@@ -1347,7 +1384,10 @@ impl Timeline {
 /// The waiter thread: block until the counter passes the lowest outstanding value,
 /// then resolve everything it has reached. Runs for the life of the process.
 fn timeline_waiter(g: &'static Gpu) {
+    /// Consecutive 100 ms timeouts on the same value before saying so — 5 s.
+    const STALL_WARN: u32 = 50;
     let t = &g.timeline;
+    let mut stalls = 0u32;
     loop {
         // Park while nothing is outstanding, so an idle process costs no CPU.
         let target = {
@@ -1363,14 +1403,56 @@ fn timeline_waiter(g: &'static Gpu) {
         let info = vk::SemaphoreWaitInfo::default()
             .semaphores(&sems)
             .values(&values);
-        // A timeout rather than u64::MAX: a submit that never completes must not wedge
-        // this thread past the point where the watchdog would act on it.
+        // A timeout rather than u64::MAX, so a stuck submit cannot wedge this thread.
         // SAFETY: `t.sem` is live for the process.
-        let _ = unsafe { g.device.wait_semaphores(&info, 100_000_000) };
+        let waited = unsafe { g.device.wait_semaphores(&info, 100_000_000) };
+        // TIMEOUT and a real error MUST be told apart. ash maps every non-SUCCESS code
+        // to Err, and on VK_ERROR_DEVICE_LOST the wait returns IMMEDIATELY — so
+        // discarding the result and looping turns the one failure the timeout exists to
+        // bound into a thread spinning a full core forever while every awaiter stays
+        // parked. Discarding it with `let _` also throws away the only thing that could
+        // distinguish the two.
+        match waited {
+            Ok(()) | Err(vk::Result::TIMEOUT) => {}
+            Err(e) => {
+                error!("vk timeline wait failed ({e}); resolving all awaiters and stopping");
+                if let Ok(mut w) = t.waiting.lock() {
+                    for (_, s) in w.drain(..) {
+                        s.resolve();
+                    }
+                }
+                return;
+            }
+        }
         // SAFETY: as above.
-        let Ok(now) = (unsafe { g.device.get_semaphore_counter_value(t.sem) }) else {
-            continue;
+        let now = match unsafe { g.device.get_semaphore_counter_value(t.sem) } {
+            Ok(v) => v,
+            Err(e) => {
+                error!("vk timeline counter read failed ({e}); resolving all awaiters");
+                if let Ok(mut w) = t.waiting.lock() {
+                    for (_, s) in w.drain(..) {
+                        s.resolve();
+                    }
+                }
+                return;
+            }
         };
+        // A value that is submitted but never signalled would otherwise sit at the head
+        // of the queue forever: `target` is the minimum, so every later signal would
+        // wait the full 100 ms before the sweep below reached it — a permanent, silent
+        // latency collapse from ~50 us to 100 ms. Say so instead of degrading quietly.
+        if waited == Err(vk::Result::TIMEOUT) {
+            stalls += 1;
+            if stalls == STALL_WARN {
+                warn!(
+                    "vk timeline value {target} has not been signalled after {} s; \
+                     every later Signal is now paying the full wait timeout",
+                    STALL_WARN / 10
+                );
+            }
+        } else {
+            stalls = 0;
+        }
         let Ok(mut w) = t.waiting.lock() else { return };
         // Resolve OUTSIDE the retain predicate's borrow of the signal, and resolve
         // every value the counter has passed, not just `target` — several may have
