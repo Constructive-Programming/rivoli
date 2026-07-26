@@ -84,7 +84,38 @@ Last established on RADV STRIX_HALO (AMD Radeon 8060S),
 `core` **fires**, `sync` **fires**, `gpuav` **fires**, `compute-copy` **silent**,
 `compute-copy-desc` **silent**, `compute-compute` **not yet run**.
 
-## A trap worth knowing
+## Traps worth knowing
+
+### A comment can camouflage the bug it describes
+
+`Gpu::signal` submitted to the queue without holding the mutex that Vulkan's
+external-synchronisation requirement needs — while carrying a SAFETY comment asserting
+the queue *was* externally synchronised, citing the `Send`/`Sync` note whose invariant
+is "the queue is only touched under the `cmd` mutex". The function bearing the citation
+was the code breaking the cited rule.
+
+That is worse than no comment. An uncommented `queue_submit` invites a reader to check;
+a commented one invites them to move on. The same shape appears wherever documentation
+asserts the property it violates — a doc comment promising a bound the function does not
+check, a `# Safety` clause listing a precondition the body then assumes rather than
+verifies.
+
+The fix was not a better comment. `vk::Queue` now lives *inside* the mutex-guarded
+`Cmd` struct rather than beside it on `Gpu`, so an unguarded submit is
+`error[E0609]: no field 'queue' on type '&Gpu'`. Verified by trying it. Every rule in
+this backend that has been violated twice is now a build failure instead — the
+`subgroupAdd` capability scan, `push_struct!`'s padding and budget assertions,
+`WAVE`/`ROWS_PER_BLOCK` single-sourcing, and this. Conventions in `src/vk.rs` have a
+measured failure rate of two.
+
+### The subject of a test can prop up its own scaffolding
+
+See the `ash::Entry` story below: a probe passed because the thing it was testing kept
+the process alive. Any check whose subject can supply an incidental side effect the
+check depends on can produce a pass that means nothing — and the more thoroughly the
+subject is engaged, the likelier it props something up.
+
+### Match on the ID as well as the body
 
 The probes match on `pMessageIdName` as well as the message body. An earlier version
 searched only the body for `SYNC-HAZARD` and printed "sync validation caught it: false"

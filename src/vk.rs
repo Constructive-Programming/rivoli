@@ -48,7 +48,6 @@ pub const BLOCK: u32 = ROWS_PER_BLOCK * WAVE;
 pub struct Gpu {
     pub device: ash::Device,
     pub memprops: vk::PhysicalDeviceMemoryProperties,
-    queue: vk::Queue,
     instance: ash::Instance,
     phys: vk::PhysicalDevice,
     /// Owns the dlopen'd libvulkan; must outlive the instance, never called through.
@@ -127,6 +126,15 @@ unsafe extern "system" fn debug_callback(
 /// sync submits and waits. One buffer, reset and refilled — no per-launch submit
 /// (colibri measured submit cost as the thing that matters on RADV).
 struct Cmd {
+    /// The queue lives HERE, not on `Gpu`, and that placement is load-bearing.
+    ///
+    /// `vkQueueSubmit` requires the VkQueue to be externally synchronised. When the
+    /// handle sat beside the mutex instead of inside it, "always submit under the
+    /// guard" was a convention — and `Gpu::signal` broke it within a day of the rule
+    /// being written down, while carrying a SAFETY comment citing the very invariant it
+    /// violated. Inside the guard, submitting without the lock is a borrow error rather
+    /// than something a reader has to notice.
+    queue: vk::Queue,
     pool: vk::CommandPool,
     buf: vk::CommandBuffer,
     fence: vk::Fence,
@@ -162,13 +170,15 @@ struct Pipes {
 // `vk::CommandBuffer`) as raw pointers, hence `!Send`/`!Sync`; the non-dispatchable
 // ones are `u64` and already fine.
 //
-// The invariant is CHECKABLE rather than merely asserted: the handles Vulkan requires
-// to be externally synchronised are the queue and the command pool/buffer, `queue` is
-// a PRIVATE field, `Cmd` is a private type behind `self.cmd`, and the only code that
-// touches either is `Gpu::enqueue`/`Gpu::sync` — both of which hold the `cmd` mutex
-// for their whole body. `device` is public but `VkDevice` is internally synchronised.
-// Keep `queue` private: a `pub` queue would let any caller submit concurrently from a
-// second thread and this comment would become a lie.
+// The invariant is ENFORCED, not asserted. Everything Vulkan requires to be externally
+// synchronised — the queue, the command pool, the command buffer — is a field of the
+// private `Cmd` struct behind `self.cmd`, so reaching any of them requires the mutex
+// guard and there is no discipline to remember. `device` is public, but `VkDevice` is
+// internally synchronised.
+//
+// This comment used to describe a convention instead, and `Gpu::signal` violated it
+// while citing it. If a future change moves a synchronised handle back out of `Cmd`,
+// this paragraph becomes false again — keep them inside.
 unsafe impl Send for Gpu {}
 unsafe impl Sync for Gpu {}
 
@@ -238,12 +248,12 @@ impl Gpu {
         }
 
         let (phys, qfam) = Self::pick(&instance)?;
+        // NOTE: the queue handle is deliberately NOT fetched here. It belongs to `Cmd`,
+        // behind the mutex, so that submitting without the guard cannot compile.
         // Live free-memory reporting; see `mem_info`. Optional because the fallback
         // (free == total) is merely useless, not wrong.
         let budget = Self::has_device_extension(&instance, phys, ash::ext::memory_budget::NAME);
         let device = Self::create_device(&instance, phys, qfam, budget)?;
-        // SAFETY: `qfam` came from the queue-create-info above; index 0 exists.
-        let queue = unsafe { device.get_device_queue(qfam, 0) };
         // SAFETY: `phys` is a live physical device from this instance.
         let memprops = unsafe { instance.get_physical_device_memory_properties(phys) };
         let cmd = Cmd::new(&device, qfam)?;
@@ -252,7 +262,6 @@ impl Gpu {
 
         Ok(Self {
             device,
-            queue,
             memprops,
             instance,
             phys,
@@ -602,7 +611,10 @@ impl Cmd {
         let buf = unsafe { device.allocate_command_buffers(&ai) }?[0];
         // SAFETY: as above.
         let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }?;
+        // SAFETY: `qfam` came from the queue-create-info; index 0 exists.
+        let queue = unsafe { device.get_device_queue(qfam, 0) };
         Ok(Self {
+            queue,
             pool,
             buf,
             fence,
@@ -734,7 +746,7 @@ impl Gpu {
             );
             self.device.end_command_buffer(cmd.buf)?;
             cmd.recording = false;
-            self.device.queue_submit(self.queue, &si, cmd.fence)?;
+            self.device.queue_submit(cmd.queue, &si, cmd.fence)?;
             self.device.wait_for_fences(&[cmd.fence], true, u64::MAX)?;
             self.device.reset_fences(&[cmd.fence])?;
             self.device
@@ -1301,7 +1313,7 @@ impl Gpu {
         // SAFETY: an empty submit that only signals. The queue's external-synchronisation
         // requirement is met by the `cmd` guard held above, which is the same lock
         // `sync` submits under.
-        let r = unsafe { self.device.queue_submit(self.queue, &submits, vk::Fence::null()) };
+        let r = unsafe { self.device.queue_submit(cmd.queue, &submits, vk::Fence::null()) };
         if let Err(e) = r {
             // Nothing will ever signal this value, so resolve it here rather than
             // leaving an awaiter parked forever.

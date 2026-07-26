@@ -566,15 +566,9 @@ mod vktier {
         /// Overwrite `bytes` at byte offset `off` — grows a KV slab by one token or
         /// fills a cold-expert slot without reallocating.
         pub fn copy_in_at(&mut self, off: usize, bytes: &[u8]) -> Result<()> {
-            // Bounds-checked here as well as in `write_at` so the message names the
-            // caller's operation; the engine greps these strings when a slab is
-            // mis-sized, and "write_at" would point at the wrong layer.
-            ensure!(
-                off.checked_add(bytes.len()).is_some_and(|e| e <= self.len),
-                "copy_in_at {off}+{} > buf len {}",
-                bytes.len(),
-                self.len
-            );
+            // `write_at` already bounds-checks, and its message names the offset,
+            // length and capacity. A second check here would only change which
+            // function the text mentions.
             self.buf.write_at(off, bytes)
         }
 
@@ -591,11 +585,6 @@ mod vktier {
         /// For partially-written buffers — e.g. the indexer's score slab, sized to
         /// max_ctx but holding only `nt` scores this step.
         pub fn copy_out_prefix(&self, out: &mut Vec<u8>, len: usize) -> Result<()> {
-            ensure!(
-                len <= self.len,
-                "copy_out_prefix {len} > buf len {}",
-                self.len
-            );
             self.buf.read_into(out, len)
         }
 
@@ -669,13 +658,6 @@ mod vktier {
         /// two that may be dereferenced on the CPU.
         pub fn host_mut(&mut self) -> *mut u8 {
             self.buf.host_mut()
-        }
-
-        /// Host-fill `bytes` at byte offset `off`, in place — no staging buffer and no
-        /// transfer command. The write is visible to any kernel submitted after it
-        /// returns (HOST_COHERENT, and `vkQueueSubmit` implies the host-write barrier).
-        pub fn write_at(&mut self, off: usize, bytes: &[u8]) -> Result<()> {
-            self.buf.write_at(off, bytes)
         }
     }
 
