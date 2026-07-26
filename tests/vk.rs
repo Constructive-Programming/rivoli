@@ -8,8 +8,10 @@
 #![allow(clippy::expect_used)]
 
 use rivoli::device::DeviceTier;
+use rivoli::math::{E4M3_BLOCK, E4M3_MAX, f32_to_bf16, f32_to_e4m3};
 use rivoli::vk::{
-    Buf, ROWS_PER_BLOCK, VALIDATION_ERRORS, device_sync, gpu, launch_gemv_f32, memcpy_dtod,
+    Buf, ROWS_PER_BLOCK, VALIDATION_ERRORS, device_sync, gpu, launch_append_kv, launch_argmax,
+    launch_embed_i8_row, launch_gather_rope, launch_gemv_f32, launch_vadd, memcpy_dtod,
 };
 use std::sync::atomic::Ordering;
 
@@ -94,9 +96,52 @@ fn launch(x: &Buf, w: &Buf, y: &mut Buf, o_dim: usize, i_dim: usize) {
 }
 
 fn read(y: &Buf, n: usize) -> Vec<u8> {
+    readb(y, n * 4)
+}
+
+/// `read` in BYTES. The fwd kernels write u8 and u16 as well as f32, and their
+/// contracts are bit patterns rather than numbers, so most of the checks below never
+/// leave byte space.
+fn readb(y: &Buf, bytes: usize) -> Vec<u8> {
     let mut out = Vec::new();
-    y.read_into(&mut out, n * 4).expect("out");
+    y.read_into(&mut out, bytes).expect("out");
     out
+}
+
+/// Bytes of guard band allocated past the end of every output buffer.
+const GUARD: usize = 256;
+
+/// An output buffer with every byte 0xFF. One poison pattern covers all four formats
+/// these kernels emit — f32 NaN, bf16 NaN, e4m3 NaN, and a u8 no scale path produces —
+/// so the guard band is the same check everywhere. `f32_to_e4m3` only ever returns
+/// 0xFF for a NaN input, and no test here feeds one, so a surviving 0xFF is always
+/// "nothing wrote here" rather than a legitimate result.
+fn poison(bytes: usize) -> Buf {
+    dev(&vec![0xFFu8; bytes])
+}
+
+/// Nothing was written at or past byte `end`. Cheap, and the standard — an overrun
+/// into an allocation's rounding slack is otherwise invisible.
+fn assert_untouched(got: &[u8], end: usize, label: &str) {
+    let n = got[end..].iter().filter(|&&b| b != 0xFF).count();
+    assert_eq!(n, 0, "{label}: wrote {n} bytes past byte {end}");
+}
+
+/// Byte-exact compare, reporting the FIRST difference and how many there are.
+/// `assert_eq!` on two multi-kilobyte `Vec<u8>`s dumps both in full and buries the one
+/// index that matters.
+fn assert_bytes(want: &[u8], got: &[u8], label: &str) {
+    assert_eq!(want.len(), got.len(), "{label}: length");
+    let diff = want.iter().zip(got).filter(|(a, b)| a != b).count();
+    match want.iter().zip(got).position(|(a, b)| a != b) {
+        None => println!("{label}: {} bytes exact", want.len()),
+        Some(i) => panic!(
+            "{label}: {diff} of {} bytes differ; first at {i}: want {:#04x} got {:#04x}",
+            want.len(),
+            want[i],
+            got[i]
+        ),
+    }
 }
 
 /// Snapshots the validation counter on construction and asserts NOTHING NEW arrived
@@ -491,4 +536,564 @@ fn guards_reject_degenerate_arguments() {
     // Rejecting a bad argument must not itself trip the layer — a guard that returns
     // Err while leaving a half-built Vulkan object behind would show up here.
     v.check("guards_reject_degenerate_arguments");
+}
+
+// ---------------------------------------------------------------------------
+// fwd.hip glue: embed_i8_row, gather_rope, vadd, append_kv, argmax_reduce.
+//
+// Oracles are written against kernels/fwd.hip and src/math.rs, NOT against the GLSL —
+// a test derived from the shader it checks agrees with the shader by construction.
+// ---------------------------------------------------------------------------
+
+/// `x[i] = (i8)packed[token·hidden + i] · scale[token]`.
+///
+/// The shader loads a `u32` word and sign-extends one byte out of it by hand, so the
+/// failure mode that matters is a byte read as UNSIGNED: invisible for every value
+/// below 0x80 and a 256·scale error at every value above it. Every row therefore
+/// starts with the four extremes {-128, -1, 127, 0}.
+///
+/// `hidden = 37` is neither a multiple of 4 nor of 32, so (a) the last workgroup has
+/// idle threads and (b) the row base `token·37` walks byte phases 0,1,2,3,0 over the
+/// five tokens — the same four extremes are extracted from a different position within
+/// the word on each iteration, which is the whole reason to loop over tokens at all.
+#[test]
+fn embed_i8_row_sign_extends_and_scales() {
+    let v = Validation::new();
+    let (vocab, hidden) = (5usize, 37usize);
+    let mut packed: Vec<u8> = (0..vocab * hidden)
+        .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+        .collect();
+    for t in 0..vocab {
+        packed[t * hidden..t * hidden + 4].copy_from_slice(&[0x80, 0xFF, 0x7F, 0x00]);
+    }
+    // Distinct per row, so a kernel indexing `scale[0]` instead of `scale[token]` is a
+    // failure rather than a coincidence.
+    let scale: Vec<f32> = (0..vocab).map(|t| 0.013 * (t as f32 + 1.0)).collect();
+    let (pb, sb) = (dev(&packed), dev(&f32b(&scale)));
+
+    for token in 0..vocab {
+        let want: Vec<f32> = (0..hidden)
+            .map(|i| f32::from(packed[token * hidden + i] as i8) * scale[token])
+            .collect();
+        let mut xb = poison(hidden * 4 + GUARD);
+        // SAFETY: live Buf device addresses of the documented sizes — `packed` is
+        // vocab·hidden bytes, `scale` vocab f32, `x` hidden f32 plus the guard band.
+        // Nothing is dropped before the sync.
+        unsafe {
+            launch_embed_i8_row(pb.ptr(), sb.ptr() as *const f32, token, hidden, xb.ptr_mut() as *mut f32)
+                .expect("launch");
+        }
+        device_sync().expect("sync");
+        let got = readb(&xb, hidden * 4 + GUARD);
+        let label = format!("embed_i8_row token {token}");
+        assert_untouched(&got, hidden * 4, &label);
+        // A sign-extension bug is a 256·scale error and clears this tolerance by three
+        // orders of magnitude — `assert_close`'s printed margin says which happened.
+        assert_close(&want, &f32v(&got[..hidden * 4]), &label);
+    }
+    v.check("embed_i8_row_sign_extends_and_scales");
+}
+
+/// `qrope[head·ropn + d] = q[head·qh + nope + d]` — gather each head's roped segment
+/// out of the strided `q` into a contiguous buffer.
+#[test]
+fn gather_rope_gathers_the_strided_segment() {
+    let v = Validation::new();
+    let mut r = Lcg(0x604);
+    // (h, qh, nope, ropn), all ragged. The caller guarantees nope + ropn <= qh; the
+    // last shape sits EXACTLY at qh, so the final head reads q's very last element and
+    // an off-by-one in the offset runs off the end of the allocation.
+    for (h, qh, nope, ropn) in [
+        (7usize, 100usize, 37usize, 51usize),
+        (1, 64, 0, 64), // nope = 0: the no-offset path, single head, grid of one
+        (33, 97, 65, 32),
+    ] {
+        let q: Vec<f32> = (0..h * qh).map(|_| r.f()).collect();
+        let want: Vec<f32> = (0..h * ropn)
+            .map(|i| q[(i / ropn) * qh + nope + i % ropn])
+            .collect();
+        let out_bytes = h * ropn * 4;
+
+        let qb = dev(&f32b(&q));
+        let mut ob = poison(out_bytes + GUARD);
+        // SAFETY: `q` is h·qh f32, `qrope` h·ropn f32 plus the guard band; both live
+        // until the sync below.
+        unsafe {
+            launch_gather_rope(qb.ptr() as *const f32, ob.ptr_mut() as *mut f32, h, qh, nope, ropn)
+                .expect("launch");
+        }
+        device_sync().expect("sync");
+        let got = readb(&ob, out_bytes + GUARD);
+        let label = format!("gather_rope h{h} qh{qh} nope{nope} ropn{ropn}");
+        assert_untouched(&got, out_bytes, &label);
+        // BYTES, not `assert_close`. This kernel performs no arithmetic, so any
+        // tolerance at all would be slack for a bug rather than for rounding.
+        assert_bytes(&f32b(&want), &got[..out_bytes], &label);
+    }
+    v.check("gather_rope_gathers_the_strided_segment");
+}
+
+/// `x[i] += y[i]`, in place.
+#[test]
+fn vadd_adds_into_x_in_place() {
+    let v = Validation::new();
+    let mut r = Lcg(0xADD);
+    // 1 (one live thread in one workgroup), 255/257 either side of the 256-thread
+    // workgroup, then ragged multi-workgroup sizes. None is a multiple of 256.
+    for n in [1usize, 255, 257, 1000, 4097] {
+        let x: Vec<f32> = (0..n).map(|_| r.f()).collect();
+        let y: Vec<f32> = (0..n).map(|_| r.f()).collect();
+        let want: Vec<f32> = x.iter().zip(&y).map(|(a, b)| a + b).collect();
+
+        let mut xb = poison(n * 4 + GUARD);
+        xb.write_at(0, &f32b(&x)).expect("fill x");
+        let yb = dev(&f32b(&y));
+        // SAFETY: `x` is n f32 plus the guard band, `y` is n f32; both live until the
+        // sync. `x` is read AND written by the kernel, which is the contract.
+        unsafe {
+            launch_vadd(xb.ptr_mut() as *mut f32, yb.ptr() as *const f32, n).expect("launch");
+        }
+        device_sync().expect("sync");
+        // Read back x's OWN buffer, so this also proves the sum landed in place rather
+        // than in some scratch the launcher forgot to point at x.
+        let got = readb(&xb, n * 4 + GUARD);
+        let label = format!("vadd n={n}");
+        assert_untouched(&got, n * 4, &label);
+        assert_close(&want, &f32v(&got[..n * 4]), &label);
+    }
+    v.check("vadd_adds_into_x_in_place");
+}
+
+/// The CPU side of `append_kv`, exactly as fwd.hip specifies it. Returns
+/// (lc8 bytes, block scales, rc bytes) for ONE row.
+///
+/// `f32_to_e4m3` and `f32_to_bf16` are bit-exact contracts — the kernel comment says
+/// "mirrors math.rs::f32_to_e4m3 bit-for-bit" — so the caller compares bytes. A float
+/// tolerance would accept a quantizer that rounds the other way at every tie, which is
+/// precisely the bug this file exists to catch.
+fn append_kv_oracle(latent: &[f32], rope: &[f32]) -> (Vec<u8>, Vec<f32>, Vec<u8>) {
+    let scales: Vec<f32> = latent
+        .chunks_exact(E4M3_BLOCK)
+        .map(|blk| {
+            let amax = blk.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            // amax == 0 -> scale 1.0, or the quantizer would divide by zero.
+            if amax > 0.0 { amax / E4M3_MAX } else { 1.0 }
+        })
+        .collect();
+    let lc8 = latent
+        .iter()
+        .enumerate()
+        .map(|(i, x)| f32_to_e4m3(x / scales[i / E4M3_BLOCK]))
+        .collect();
+    let rc = rope
+        .iter()
+        .flat_map(|x| f32_to_bf16(*x).to_le_bytes())
+        .collect();
+    (lc8, scales, rc)
+}
+
+/// One latent of `kvl` values whose 128-blocks sit in deliberately different scale
+/// regimes, plus `ropn` rope values.
+fn append_kv_input(kvl: usize, ropn: usize, seed: u64) -> (Vec<f32>, Vec<f32>) {
+    let mut r = Lcg(seed);
+    let latent: Vec<f32> = (0..kvl)
+        .map(|i| match i / E4M3_BLOCK {
+            1 => 0.0,            // amax == 0 -> the scale = 1.0 branch
+            2 => r.f() * 3000.0, // amax >> 448 -> a scale above one
+            _ => r.f(),          // amax ~ 1 -> a scale near 1/448
+        })
+        .collect();
+    let mut rope: Vec<f32> = (0..ropn).map(|_| r.f()).collect();
+    // bf16 is a pure bit operation, so these are unconditional: the RNE tie (rounds
+    // DOWN to the even neighbour 0x3f80), the value just past it (0x3f81), zero, and a
+    // magnitude f32 carries exactly but that leaves no mantissa room in bf16.
+    // ponytail: no -0.0 here. Its bf16 IS 0x8000, but Vulkan does not promise signed
+    // zero preservation without an execution mode, so a 0x0000 would be ambiguous
+    // between a shader bug and a missing SignedZeroInfNanPreserve — untestable from
+    // here, and a probe's job rather than an oracle's.
+    let specials = [1.0 + 2f32.powi(-8), 1.0 + 2f32.powi(-8) + 2f32.powi(-16), 0.0, 65504.0];
+    rope[..specials.len()].copy_from_slice(&specials);
+    (latent, rope)
+}
+
+/// e4m3 keeps 3 mantissa bits and Vulkan promises only 2.5 ULP on FDiv, so a quotient
+/// landing on an e4m3 rounding midpoint could legitimately quantize either way and the
+/// byte compare would be a coin flip on the driver. Assert the chosen inputs are
+/// nowhere near one, so a byte difference means the shader and not the seed.
+///
+/// 8 ULP covers both divisions in the chain (amax/448, then latent/scale) with room.
+fn assert_quantization_is_unambiguous(latent: &[f32], scales: &[f32]) {
+    for (i, x) in latent.iter().enumerate() {
+        let q = x / scales[i / E4M3_BLOCK];
+        if q == 0.0 {
+            continue; // exact, no rounding to be ambiguous about
+        }
+        let up = f32::from_bits(q.to_bits().wrapping_add(8));
+        let dn = f32::from_bits(q.to_bits().wrapping_sub(8));
+        let e = f32_to_e4m3(q);
+        assert!(
+            e == f32_to_e4m3(up) && e == f32_to_e4m3(dn),
+            "latent[{i}] = {x} quantizes ambiguously within 8 ULP of {q}: \
+             this seed cannot support a byte-exact compare, pick another"
+        );
+    }
+}
+
+/// `append_kv`: latent -> fp8-e4m3 with a per-128 block scale, roped key -> bf16, both
+/// at row `pos`.
+///
+/// The block amax is an LDS tree reduction over 128 lanes, which is where the
+/// reproducibility test below points; this one is about the quantizer agreeing with
+/// `math.rs` bit for bit and about the row offset.
+#[test]
+fn append_kv_quantizes_bit_exactly() {
+    let v = Validation::new();
+    // kvl must be a multiple of 128 in [128, 1024], so it cannot be ragged — ropn is
+    // the only free size here and 100 is deliberately not a multiple of 32, leaving the
+    // rope write live on a partial subgroup.
+    let (kvl, ropn, rows, pos) = (512usize, 100usize, 5usize, 3usize);
+    let n_blocks = kvl / E4M3_BLOCK;
+    let (latent, rope) = append_kv_input(kvl, ropn, 0xA55);
+    let (want_lc8, want_scl, want_rc) = append_kv_oracle(&latent, &rope);
+    assert_quantization_is_unambiguous(&latent, &want_scl);
+    // The two branches the test exists for, asserted on the oracle so a future edit to
+    // `append_kv_input` cannot silently drop either.
+    assert_eq!(want_scl[1], 1.0, "block 1 must exercise the amax == 0 branch");
+    assert!(want_scl[2] > 1.0, "block 2 must exercise a large amax");
+
+    let (lb, rb) = (dev(&f32b(&latent)), dev(&f32b(&rope)));
+    // Whole slabs, poisoned. Rows other than `pos` are as much of a guard band as the
+    // trailing GUARD bytes: a row-offset bug lands in one of them, and an `i < ropn`
+    // check missing from the rope write spills straight into row pos+1 of `rc`.
+    let (lc8_n, lscale_n, rc_n) = (rows * kvl, rows * n_blocks * 4, rows * ropn * 2);
+    let mut lc8 = poison(lc8_n + GUARD);
+    let mut lscale = poison(lscale_n + GUARD);
+    let mut rc = poison(rc_n + GUARD);
+    // SAFETY: `latent` is kvl f32 and `rope` ropn f32; the three slabs hold `rows` rows
+    // of their documented stride plus a guard band, and row `pos` is in bounds. All
+    // five outlive the sync.
+    unsafe {
+        launch_append_kv(
+            lb.ptr() as *const f32,
+            rb.ptr() as *const f32,
+            lc8.ptr_mut(),
+            lscale.ptr_mut() as *mut f32,
+            rc.ptr_mut() as *mut u16,
+            pos,
+            kvl,
+            ropn,
+            n_blocks,
+        )
+        .expect("launch");
+    }
+    device_sync().expect("sync");
+    let g_lc8 = readb(&lc8, lc8_n + GUARD);
+    let g_scl = readb(&lscale, lscale_n + GUARD);
+    let g_rc = readb(&rc, rc_n + GUARD);
+
+    for (got, stride, name) in [
+        (&g_lc8, kvl, "lc8"),
+        (&g_scl, n_blocks * 4, "lscale"),
+        (&g_rc, ropn * 2, "rc"),
+    ] {
+        assert!(
+            got[..pos * stride].iter().all(|&b| b == 0xFF),
+            "append_kv {name}: wrote BEFORE row {pos}"
+        );
+        assert_untouched(got, (pos + 1) * stride, &format!("append_kv {name} row {pos}"));
+    }
+    assert_bytes(&want_lc8, &g_lc8[pos * kvl..(pos + 1) * kvl], "append_kv lc8");
+    assert_bytes(&want_rc, &g_rc[pos * ropn * 2..(pos + 1) * ropn * 2], "append_kv rc");
+
+    // The scale is the one float here — a division, for which Vulkan promises 2.5 ULP.
+    // Compared per element RELATIVE rather than through `assert_close`: these four
+    // scales span 1/448 to ~6.7, and a shared `mx` would hand the smallest of them
+    // three orders of magnitude of slack. 1e-6 is ~8 ULP.
+    let got_scl = f32v(&g_scl[pos * n_blocks * 4..(pos + 1) * n_blocks * 4]);
+    let rel = want_scl
+        .iter()
+        .zip(&got_scl)
+        .fold(0.0f32, |m, (w, g)| m.max((w - g).abs() / w.abs()));
+    println!("append_kv lscale: max rel err={rel:.3e} tol=1.0e-6");
+    assert!(rel <= 1e-6, "append_kv lscale: rel err {rel:.3e} > 1e-6, want {want_scl:?} got {got_scl:?}");
+    v.check("append_kv_quantizes_bit_exactly");
+}
+
+/// `append_kv` reduces the block amax in LDS, so it gets the bit-reproducibility test
+/// every reduction in this backend gets — a scheduling-dependent reduce would still
+/// clear any tolerance, and here it would silently move the quantization scale.
+#[test]
+fn append_kv_is_bit_reproducible() {
+    let v = Validation::new();
+    let (kvl, ropn, pos) = (512usize, 100usize, 2usize);
+    let n_blocks = kvl / E4M3_BLOCK;
+    let (latent, rope) = append_kv_input(kvl, ropn, 0xB16);
+    let (lb, rb) = (dev(&f32b(&latent)), dev(&f32b(&rope)));
+
+    // A decoy of a DIFFERENT shape (one block, half the rope, row 0) dispatched between
+    // repeats, into its own buffers, so the two runs do not see identical queue state.
+    let (dlat, drope) = append_kv_input(E4M3_BLOCK, 64, 0xD00);
+    let (dlb, drb) = (dev(&f32b(&dlat)), dev(&f32b(&drope)));
+
+    // Zero-filled, not poisoned: the all-zero guard at the end has to be able to fail.
+    let rows = pos + 1;
+    let mut lc8 = dev(&vec![0u8; rows * kvl]);
+    let mut lscale = dev(&vec![0u8; rows * n_blocks * 4]);
+    let mut rc = dev(&vec![0u8; rows * ropn * 2]);
+    let (mut dlc8, mut dlscale, mut drc) =
+        (dev(&[0u8; E4M3_BLOCK]), dev(&[0u8; 4]), dev(&[0u8; 128]));
+
+    let run = |lat: &Buf,
+                   rop: &Buf,
+                   lc8: &mut Buf,
+                   lscale: &mut Buf,
+                   rc: &mut Buf,
+                   pos: usize,
+                   kvl: usize,
+                   ropn: usize,
+                   n_blocks: usize| {
+        // SAFETY: sizes as documented above; every Buf outlives the sync.
+        unsafe {
+            launch_append_kv(
+                lat.ptr() as *const f32,
+                rop.ptr() as *const f32,
+                lc8.ptr_mut(),
+                lscale.ptr_mut() as *mut f32,
+                rc.ptr_mut() as *mut u16,
+                pos,
+                kvl,
+                ropn,
+                n_blocks,
+            )
+            .expect("launch");
+        }
+        device_sync().expect("sync");
+        let mut out = readb(lc8, (pos + 1) * kvl);
+        out.extend(readb(lscale, (pos + 1) * n_blocks * 4));
+        out.extend(readb(rc, (pos + 1) * ropn * 2));
+        out
+    };
+
+    let first = run(&lb, &rb, &mut lc8, &mut lscale, &mut rc, pos, kvl, ropn, n_blocks);
+    for i in 1..5 {
+        run(&dlb, &drb, &mut dlc8, &mut dlscale, &mut drc, 0, E4M3_BLOCK, 64, 1);
+        let again = run(&lb, &rb, &mut lc8, &mut lscale, &mut rc, pos, kvl, ropn, n_blocks);
+        assert_bytes(&first, &again, &format!("append_kv repeat {i}"));
+    }
+    // Row `pos` of lc8 alone — rows 0..pos are legitimately still zero, so checking the
+    // whole buffer would be a weaker guard than it looks.
+    assert!(
+        first[pos * kvl..(pos + 1) * kvl].iter().any(|&b| b != 0),
+        "lc8 row {pos} is all zero — the test proves nothing"
+    );
+    v.check("append_kv_is_bit_reproducible");
+}
+
+/// One `argmax` dispatch + sync -> the two output words as RAW BYTES, idx then val.
+///
+/// Each word gets its own poisoned tail. They are written by thread 0 only, and a
+/// shader that spilled the whole workgroup's partials would still leave the right
+/// value in the first word.
+fn argmax_raw(logits: &[f32]) -> Vec<u8> {
+    let lb = dev(&f32b(logits));
+    let mut ib = poison(4 + GUARD);
+    let mut vb = poison(4 + GUARD);
+    // SAFETY: `logits` is logits.len() f32; each output is one word plus a guard band.
+    // All three live until the sync.
+    unsafe {
+        launch_argmax(
+            lb.ptr() as *const f32,
+            logits.len(),
+            ib.ptr_mut() as *mut i32,
+            vb.ptr_mut() as *mut f32,
+        )
+        .expect("launch argmax");
+    }
+    device_sync().expect("sync");
+    let (gi, gv) = (readb(&ib, 4 + GUARD), readb(&vb, 4 + GUARD));
+    assert_untouched(&gi, 4, "argmax out_idx");
+    assert_untouched(&gv, 4, "argmax out_val");
+    let mut out = gi[..4].to_vec();
+    out.extend_from_slice(&gv[..4]);
+    out
+}
+
+fn argmax(logits: &[f32]) -> (i32, f32) {
+    let b = argmax_raw(logits);
+    (
+        i32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+        f32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+    )
+}
+
+/// Both halves of the contract, always. An argmax that returns the right index with
+/// the wrong value still breaks the caller, whose `!bv.is_finite()` bail reads the
+/// value and not the index.
+fn chk_argmax(label: &str, logits: &[f32], want_idx: i32, want_val: f32) {
+    let (gi, gv) = argmax(logits);
+    assert_eq!(gi, want_idx, "{label}: index (value was {gv})");
+    assert_eq!(gv, want_val, "{label}: value (index was {gi})");
+    println!("argmax {label}: n={} -> ({gi}, {gv})", logits.len());
+}
+
+/// `argmax_reduce` against the host fold it reproduces, adversarially.
+///
+/// This is the last op before the sampled token, so a wrong answer is a wrong output
+/// with no numeric smell — no tolerance to blow, no NaN downstream, just a different
+/// word. The contract, from fwd.hip: the LOWEST index of the maximum value wins, NaN
+/// NEVER wins, and the returned value is `logits[best]`.
+#[test]
+fn argmax_matches_the_host_fold() {
+    let v = Validation::new();
+
+    chk_argmax("max at index 0", &[9.0, 1.0, 2.0, -3.0, 0.5], 0, 9.0);
+
+    // n = 7: fewer elements than the 256-thread workgroup, so most lanes contribute
+    // nothing but the identity and the LDS tree must not let one of them win.
+    chk_argmax("plateau -> lowest index", &[0.1, 0.5, 0.5, 0.3, 0.5, -1.0, 0.5], 1, 0.5);
+
+    let mut last = vec![-1.0f32; 1000];
+    last[999] = 5.0;
+    chk_argmax("max at the final position", &last, 999, 5.0);
+
+    // 261 = 5 + 256: with a 256-thread block the SAME lane sees both, so this tie is
+    // broken inside the grid-stride loop rather than in the LDS tree. The cross-lane
+    // case is the 100_003 one below.
+    let mut same_lane = vec![0.0f32; 300];
+    same_lane[5] = 2.0;
+    same_lane[261] = 2.0;
+    chk_argmax("plateau within one lane", &same_lane, 5, 2.0);
+
+    chk_argmax("all elements equal", &vec![1.5f32; 300], 0, 1.5);
+
+    // NaN loses to any finite value: every compare against it is false, so it never
+    // displaces the running best — including when it is the running best's only rival.
+    chk_argmax("NaN loses to finite", &[0.1, f32::NAN, 0.7, f32::NAN, 0.3, 0.7], 2, 0.7);
+    // Index 0 specifically: it is the identity's index, so a NaN there is the one
+    // position where "NaN loses" and "ties go to the lowest index" could conspire.
+    chk_argmax("NaN at index 0", &[f32::NAN, 0.2, 0.9, 0.4, -7.0], 2, 0.9);
+
+    // Every element is the identity: only the tie rule decides, and logits[0] is -inf
+    // so the returned value is exact rather than merely non-finite.
+    chk_argmax("all -inf", &vec![f32::NEG_INFINITY; 257], 0, f32::NEG_INFINITY);
+
+    // All negative — catches an oracle (or a shader) that initialises the running best
+    // to 0 instead of -inf, which is invisible whenever any element is positive.
+    chk_argmax("all negative", &[-5.0, -2.0, -9.0, -2.5, -1e30], 1, -2.0);
+    let big_neg: Vec<f32> = (0..1000).map(|i| -((i as f32 - 613.0).abs()) - 3.0).collect();
+    chk_argmax("all negative at scale", &big_neg, 613, -3.0);
+
+    // 100_003: ragged, ~391 grid-stride passes per lane, a NaN in lane 0's first slot,
+    // and a plateau whose two members land on DIFFERENT lanes (12_345 % 256 = 57,
+    // 98_765 % 256 = 205) so the tie is resolved by the LDS tree. `Lcg::f` is strictly
+    // inside [-1, 1), so 3.0 is the unique maximum.
+    let mut r = Lcg(0x9A2);
+    let mut big: Vec<f32> = (0..100_003).map(|_| r.f()).collect();
+    big[0] = f32::NAN;
+    big[12_345] = 3.0;
+    big[98_765] = 3.0;
+    chk_argmax("cross-lane plateau at 100_003", &big, 12_345, 3.0);
+
+    // ALL NaN. Nothing can win, so the reduction returns its identity. fwd.hip
+    // documents that identity as best = 0, bv = -inf, chosen so the host's
+    // `!bv.is_finite()` bail fires — the requirement is therefore not a particular
+    // value but a NON-FINITE one at a defined index, and the value is printed rather
+    // than asserted so a change in it is visible without being a failure.
+    let (gi, gv) = argmax(&vec![f32::NAN; 300]);
+    println!("argmax all-NaN: -> ({gi}, {gv}) bits {:#010x}", gv.to_bits());
+    assert_eq!(gi, 0, "all-NaN: index");
+    assert!(!gv.is_finite(), "all-NaN: value {gv} is finite — the caller's bail would not fire");
+
+    v.check("argmax_matches_the_host_fold");
+}
+
+/// `argmax_reduce` is a reduction, so it gets the bit-reproducibility test. Weaker
+/// than it sounds for the index (an i32 is exact either way) and exactly the point for
+/// the value: a reduce whose order varies with scheduling returns a different
+/// `logits[best]` bit pattern on a plateau, and greedy decode would drift run to run.
+#[test]
+fn argmax_is_bit_reproducible() {
+    let v = Validation::new();
+    let mut r = Lcg(0x1D3);
+    let mut logits: Vec<f32> = (0..100_003).map(|_| r.f() * 10.0).collect();
+    // Nonzero index AND nonzero value, so the all-zero guard below is not vacuous.
+    logits[77_777] = 42.5;
+    // A differently-shaped dispatch between repeats, to perturb queue state.
+    let decoy: Vec<f32> = (0..1291).map(|_| r.f()).collect();
+
+    let first = argmax_raw(&logits);
+    for i in 1..5 {
+        argmax_raw(&decoy);
+        assert_bytes(&first, &argmax_raw(&logits), &format!("argmax repeat {i}"));
+    }
+    assert!(
+        first.iter().any(|&b| b != 0),
+        "both output words are zero — the test proves nothing"
+    );
+    v.check("argmax_is_bit_reproducible");
+}
+
+/// The fwd launchers' argument guards report errors rather than dispatching a
+/// degenerate grid or tripping a VUID.
+///
+/// `token`, `pos` and `nope` are `usize` here, so the HIP guards' `< 0` arms are
+/// unreachable from Rust and are not tested — the only negative value that could reach
+/// the shader is one produced by the `as i32` narrowing inside the launcher, which is
+/// its business and not this file's.
+#[test]
+fn fwd_guards_reject_degenerate_arguments() {
+    let v = Validation::new();
+    let src = dev(&[0u8; 4096]);
+    let mut d1 = dev(&[0u8; 4096]);
+    let mut d2 = dev(&[0u8; 4096]);
+    let mut d3 = dev(&[0u8; 4096]);
+    let (p, a, b, c) = (src.ptr(), d1.ptr_mut(), d2.ptr_mut(), d3.ptr_mut());
+
+    let akv = |kvl: usize, ropn: usize, n_blocks: usize| {
+        // SAFETY: every one of these must be rejected by a shape guard before a pointer
+        // is used; the four buffers are live and 4096 bytes regardless.
+        unsafe {
+            launch_append_kv(
+                p as *const f32,
+                p as *const f32,
+                a,
+                b as *mut f32,
+                c as *mut u16,
+                0,
+                kvl,
+                ropn,
+                n_blocks,
+            )
+        }
+    };
+    assert!(akv(0, 8, 1).is_err(), "append_kv kvl = 0");
+    assert!(akv(128, 0, 1).is_err(), "append_kv ropn = 0");
+    assert!(akv(128, 8, 0).is_err(), "append_kv n_blocks = 0");
+    // The one-block per-128 reduction needs kvl a multiple of 128 in [128, 1024], and
+    // the rope half rides the same block so ropn cannot exceed it.
+    assert!(akv(64, 8, 1).is_err(), "append_kv kvl < 128");
+    assert!(akv(200, 8, 1).is_err(), "append_kv kvl not a multiple of 128");
+    assert!(akv(1152, 8, 9).is_err(), "append_kv kvl > 1024");
+    assert!(akv(256, 300, 2).is_err(), "append_kv ropn > kvl");
+
+    // SAFETY: as above — a zero dimension is rejected before any pointer is used.
+    unsafe {
+        assert!(
+            launch_embed_i8_row(p, p as *const f32, 0, 0, a as *mut f32).is_err(),
+            "embed_i8_row hidden = 0"
+        );
+        assert!(launch_vadd(a as *mut f32, p as *const f32, 0).is_err(), "vadd n = 0");
+        assert!(
+            launch_argmax(p as *const f32, 0, a as *mut i32, b as *mut f32).is_err(),
+            "argmax n = 0"
+        );
+        for (h, qh, ropn, why) in [(0usize, 8usize, 8usize, "h"), (8, 0, 8, "qh"), (8, 8, 0, "ropn")] {
+            assert!(
+                launch_gather_rope(p as *const f32, a as *mut f32, h, qh, 0, ropn).is_err(),
+                "gather_rope {why} = 0"
+            );
+        }
+    }
+    // Rejecting a bad argument must not itself trip the layer.
+    v.check("fwd_guards_reject_degenerate_arguments");
 }
