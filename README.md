@@ -93,10 +93,10 @@ Run `rivoli` with no model dir for the full usage line.
 src/            engine — format, quant, pin (residency + streaming), gpu (forward),
                 arena/hybrid (byte-arena pool + policies), stream (io_uring),
                 asyncfetch/gpustream (async load‖compute overlap), math, model, ...
-src/bin/        convert, pack_i4, add_indexer, replay
+src/bin/        convert, vq3_to_i4, pack_i4, add_indexer, replay
 kernels/*.hip   HIP kernels (moe, mla, attn, linalg, indexer, fwd, async, vmm)
 examples/       dot_bench — per-format dot microbench (int4 vs int3-vq vs fp8)
 tests/          kernel oracles + lib unit tests
-docs/           ARCHITECTURE.md
+docs/           ARCHITECTURE.md, VULKAN.md (proposed second backend)
 MODES.md        format-mode + cache-policy reference
 ```
