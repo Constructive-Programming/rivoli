@@ -609,3 +609,100 @@ fn moe_i4_matches_reference() {
     device_sync().expect("sync");
     assert_close(&want, &f32v(&obuf.copy_out().expect("out")), "moe_i4");
 }
+
+/// GPU int4 MoE on REAL colibri `.i4` bytes in the actual slot layout
+/// (`i4_slot_offsets`) vs `matvec_i4` on the same bytes. The gap neither
+/// `moe_i4_matches_reference` (synthetic `quant_i4`, separate buffers) nor the host
+/// probe (CPU only) covers. Skips if the artifact is absent.
+#[test]
+fn moe_i4_real_data_matches_cpu() {
+    use rivoli::quant::{
+        i4_expert_bytes, i4_row_bytes, i4_slot_offsets, matvec_i4, vq_expert_layout,
+    };
+    use std::os::unix::fs::FileExt;
+    let path = "/var/db/rivoli/glm52-vq3-full/L03.i4";
+    let Ok(f) = std::fs::File::open(path) else {
+        eprintln!("skip moe_i4_real_data: {path} absent");
+        return;
+    };
+    let (hidden, inter) = (6144usize, 2048usize);
+    let mut blk = vec![0u8; i4_expert_bytes(hidden, inter)];
+    f.read_exact_at(&mut blk, 0).expect("read expert 0"); // routed expert 0, layer 3 (block 0)
+    let off = i4_slot_offsets(hidden, inter);
+    let dims = vq_expert_layout(hidden, inter); // [(gate o,i),(up),(down)]
+
+    let mut r = Lcg(0x99);
+    let x: Vec<f32> = (0..hidden).map(|_| r.f()).collect();
+    let proj = |k: usize| -> (Vec<u8>, Vec<f32>) {
+        let (o, i) = dims[k];
+        let p = blk[off[k * 2]..off[k * 2] + o * i4_row_bytes(i)].to_vec();
+        let sc = blk[off[k * 2 + 1]..off[k * 2 + 1] + o * 4]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        (p, sc)
+    };
+    let (gp, gs) = proj(0);
+    let (up, us) = proj(1);
+    let (dp, ds) = proj(2);
+    let mut g = vec![0f32; inter];
+    matvec_i4(&mut g, &x, &gp, &gs, inter, hidden);
+    let mut u = vec![0f32; inter];
+    matvec_i4(&mut u, &x, &up, &us, inter, hidden);
+    let h: Vec<f32> = (0..inter).map(|j| silu(g[j]) * u[j]).collect();
+    let mut want = vec![0f32; hidden];
+    matvec_i4(&mut want, &h, &dp, &ds, hidden, inter);
+
+    let slot = dev(&blk);
+    let base = slot.ptr();
+    let desc = ExpertDesc {
+        gate_indices: unsafe { base.add(off[0]) },
+        gate_scales: unsafe { base.add(off[1]) } as *const u16,
+        up_indices: unsafe { base.add(off[2]) },
+        up_scales: unsafe { base.add(off[3]) } as *const u16,
+        down_indices: unsafe { base.add(off[4]) },
+        down_scales: unsafe { base.add(off[5]) } as *const u16,
+    };
+    let descb = dev(unsafe {
+        std::slice::from_raw_parts(
+            (&desc as *const ExpertDesc) as *const u8,
+            std::mem::size_of::<ExpertDesc>(),
+        )
+    });
+    let (xb, wb) = (dev(&f32b(&x)), dev(&f32b(&[1.0f32])));
+    let mut hbuf = dev(&vec![0u8; inter * 4]);
+    let mut pbuf = dev(&vec![0u8; hidden * 4]);
+    let mut obuf = dev(&vec![0u8; hidden * 4]);
+    let stream = HipStream::new().expect("stream");
+    unsafe {
+        launch_moe_expert_range_i4(
+            xb.ptr() as *const f32,
+            hidden,
+            inter,
+            0,
+            1,
+            descb.ptr() as *const ExpertDesc,
+            wb.ptr() as *const f32,
+            hbuf.ptr_mut() as *mut f32,
+            pbuf.ptr_mut() as *mut f32,
+            stream.raw(),
+        )
+        .expect("launch i4");
+        launch_moe_reduce(pbuf.ptr() as *const f32, 1, hidden, obuf.ptr_mut() as *mut f32, stream.raw())
+            .expect("reduce");
+    }
+    device_sync().expect("sync");
+    let got = f32v(&obuf.copy_out().expect("out"));
+    let dot: f64 = want.iter().zip(&got).map(|(a, b)| *a as f64 * *b as f64).sum();
+    let (na, nb): (f64, f64) = (
+        want.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt(),
+        got.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt(),
+    );
+    eprintln!(
+        "moe_i4_real: cosine(GPU,CPU)={:.4} want[0..3]={:?} got[0..3]={:?}",
+        dot / (na * nb + 1e-30),
+        &want[..3],
+        &got[..3]
+    );
+    assert_close(&want, &got, "moe_i4_real");
+}

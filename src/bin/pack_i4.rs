@@ -4,6 +4,13 @@
 //! files in the artifact. colibri's int4 layout (per-row, low-nibble-first,
 //! `(nibble-8)·qs`) is byte-identical to ours, so this is a pure copy — no re-quant.
 //!
+//! DEPRECATED as the `.i4` source — use `vq3_to_i4` instead. colibri's int4 is a
+//! DIFFERENT/worse quantization of the experts than our `.vq3` (per-row RTN R~0.96 vs
+//! vq3, scales 5-9% inflated); mixing colibri experts under our glm52-fp8 router made
+//! `--mode int4` decode DEGENERATE (repetition collapse). `vq3_to_i4` re-derives the
+//! `.i4` from our faithful `.vq3` weights (R~0.98, self-consistent) and decodes
+//! coherently. Kept only for the original colibri import / comparison.
+//!
 //! usage: pack_i4 <colibri-dir> <artifact-dir> [--layers N] [--experts M]
 //!   --layers N   convert only the first N MoE layers (smoke test)
 //!   --experts M  convert only experts 0..M plus the shared expert (smoke test)

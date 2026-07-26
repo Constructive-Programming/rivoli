@@ -44,8 +44,9 @@ is a codebook gather (latency-bound); int4 is ~1.8× faster compute but 24% bigg
 ```
 
 `convert` produces `manifest.json` + `codebooks.f32` + `resident.safetensors` +
-`L{ll}.vq3`. `pack_i4` adds the `L{ll}.i4` twins from a colibri-int4 source.
-`add_indexer` writes the side `indexer.safetensors`. All extra files are optional
+`L{ll}.vq3`. `vq3_to_i4` adds the `L{ll}.i4` twins by re-quantizing the faithful `.vq3`
+weights (self-consistent; the correct source). `add_indexer` writes the side
+`indexer.safetensors`. All extra files are optional
 and merged at load (`Safetensors::open_dir` unions every `*.safetensors`).
 
 `.vq3` per-file header (little-endian): magic `"VQ3\0"`, u32 version, u32 layer,
@@ -99,6 +100,9 @@ liburing system lib).
 ## Tools (src/bin/)
 
 - `convert` — fp8 checkpoint → the int3-vq artifact (learns codebooks, GPU-encodes).
-- `pack_i4` — colibri-int4 source → per-layer `L{l}.i4` twins (repack, not requant).
+- `vq3_to_i4` — re-derive `L{l}.i4` from the faithful `.vq3` weights (decode → `quant_i4`).
+  The correct `.i4` source; self-consistent with the vq3/glm52-fp8 experts.
+- `pack_i4` — DEPRECATED: colibri-int4 → `L{l}.i4` (a worse/mismatched quantization that
+  made `--mode int4` decode degenerate; kept for the original colibri import only).
 - `add_indexer` — write the DSA `indexer.safetensors` side file into an artifact.
 - `replay` — offline cache-policy sim over a `--trace` dump.
