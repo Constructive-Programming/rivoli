@@ -14,7 +14,7 @@ benchmark/diagnostic override, not required setup.
 
 | weights | format | resident? |
 |---|---|---|
-| routed experts | **int3-vq** (12-bit codebook idx + bf16 g64 scale) and/or **int4** (colibri, per-row scale) | streamed (pooled) |
+| routed experts | **int3-vq** (12-bit codebook idx + bf16 g64 scale) and/or **int4** (nibble + f32 g128 scale) | streamed (pooled) |
 | shared expert | int3-vq | resident |
 | attention projections (q/kv/o) | **fp8** e4m3 + 128-block scale | resident |
 | dense-layer MLPs (first 3 layers) | fp8 | resident |

@@ -3,7 +3,7 @@
 //! quantization of the experts (per-row RTN R~0.96 vs vq3, scales 5-9% inflated) than
 //! the vq3 the rest of the model uses; running it under the glm52-fp8 router degenerates
 //! all-int4 decode. This decodes each vq3 expert to f32 and re-quantizes with `quant_i4`
-//! (R~0.98, self-consistent). Writes `L{l}.i4` in the same layout as `pack_i4`.
+//! (R~0.98, self-consistent). Writes `L{l}.i4` in the layout `i4_slot_offsets` defines.
 //!
 //! usage: vq3_to_i4 <artifact-dir> [--layers N]   (back up existing L*.i4 first!)
 use anyhow::{Context, Result, bail};
@@ -94,6 +94,7 @@ fn main() -> Result<()> {
         chain: "fp8->vq3->int4".into(),
         src: std::fs::canonicalize(dir)?.display().to_string(),
         layers: [cfg.dense_layers, last],
+        group: Some(rivoli::quant::I4_GROUP),
     }
     .stamp(dir)?;
     eprintln!("done");

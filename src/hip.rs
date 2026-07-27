@@ -11,8 +11,10 @@ use std::ffi::c_void;
 /// ptr). ONE layout for both formats — byte-identical six-pointer `repr(C)` structs,
 /// the kernel picks the interpretation: for int3-VQ (`launch_moe_expert_range`) the
 /// pairs are packed 12-bit indices + bf16 group scales (`moe.hip ExpertDescVq`); for
-/// int4 (`launch_moe_expert_range_i4`) they are packed 4-bit weights + a per-row f32
-/// scale (`moe.hip ExpertDescI4`). The scale pointer is typed `*const u16` here
+/// int4 (`launch_moe_expert_range_i4`) they are packed 4-bit weights + f32 group
+/// scales, one per `I4_GROUP` weights (`moe.hip ExpertDescI4`). Both formats are
+/// group-scaled; only the scale WIDTH and the weight coding differ. The scale pointer
+/// is typed `*const u16` here
 /// (built from the VQ carrier) but its VALUE just addresses whatever the kernel reads.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -303,7 +305,7 @@ pub unsafe fn launch_moe_expert_range(
 }
 
 /// int4 counterpart of [`launch_moe_expert_range`]: gate/up + down for the absolute
-/// range `[e_start, e_start+e_count)` on `stream`, decoding int4 (per-row scale).
+/// range `[e_start, e_start+e_count)` on `stream`, decoding int4 (f32 group scales).
 /// `descs` are [`ExpertDesc`]; partials land in the same `partial` slab and are
 /// summed by [`launch_moe_reduce`], so int4 experts share the VQ reduce.
 ///
@@ -534,8 +536,9 @@ pub unsafe fn launch_gemv_vq(
     check(r, "gemv_vq")
 }
 
-/// Per-row int4 GEMV `y[o] = scale[o]·Σ x·(nibble-8)` — the MoE `dot_i4_wave`
-/// wave-per-row, for the dot-throughput microbench.
+/// Group-scaled int4 GEMV `y[o] = Σ_i x·(nibble-8)·scale[o, i/I4_GROUP]` — the MoE
+/// `dot_i4_wave` wave-per-row, for the dot-throughput microbench. `scale` is
+/// `o_dim · i4_groups(i_dim)` f32.
 ///
 /// # Safety
 /// Device pointers live until the next [`device_sync`].

@@ -31,8 +31,8 @@ many fit in the pool → hit rate), and **stream cost** (bytes per miss).
 - **Needs:** `L{l}.vq3` + `codebooks.f32` in the artifact.
 - **Best when:** the pool is residency/bandwidth-bound (small budget, big working set).
 
-### `int4` — colibri 4-bit, per-row scale
-- **Size:** ~18.9 MB/expert (~24% bigger) — **fewer slots fit** → lower hit rate →
+### `int4` — 4-bit, one f32 scale per 128 weights
+- **Size:** ~20.1 MB/expert (~32% bigger) — **fewer slots fit** → lower hit rate →
   **more misses** → more fetch + more host-gated compute bubbles.
 - **Compute:** sequential nibble decode, no gather. **~1.8× faster than int3-vq**
   (microbench: ~669–677 GElem/s, confound-free — see caveat below). No codebook.

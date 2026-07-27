@@ -117,18 +117,25 @@ extern "C" int rivoli_moe_reduce_s(const float* partial, int E, int hidden, floa
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-// ── int4 MoE (colibri "warm expert" format): same two-pass shape as the VQ path,
-//    decoding via dot_i4_wave with a per-row f32 scale applied OUTSIDE the dot. One
-//    descriptor per expert (six device pointers), absolute [e_start,e_count) range
-//    on a stream, so it plugs into the same expert-stream + moe_reduce as VQ.
+// ── int4 MoE (group-scaled "warm expert" format): same two-pass shape as the VQ
+//    path, decoding via dot_i4_wave with one f32 scale per I4_GROUP weights applied
+//    INSIDE the dot. One descriptor per expert (six device pointers), absolute
+//    [e_start,e_count) range on a stream, so it plugs into the same expert-stream +
+//    moe_reduce as VQ.
 struct ExpertDescI4 {
     const unsigned char* gate_packed;  // [inter · (hidden+1)/2]
-    const float*         gate_scale;   // [inter]
+    const float*         gate_scale;   // [inter · i4_ng(hidden)]
     const unsigned char* up_packed;
     const float*         up_scale;
     const unsigned char* down_packed;  // [hidden · (inter+1)/2]
-    const float*         down_scale;   // [hidden]
+    const float*         down_scale;   // [hidden · i4_ng(inter)]
 };
+
+// i4_groups inline (i_dim is the reduction dim of the projection) — matches
+// quant.rs::i4_groups, the sizing i4_slot_offsets lays the scale spans out with.
+__device__ __forceinline__ size_t i4_ng(int i_dim) {
+    return (size_t)((i_dim + I4_GROUP - 1) / I4_GROUP);
+}
 
 extern "C" __global__ void moe_gateup_i4(
     const float* __restrict__ x, int hidden, int inter, int e_start, int e_count,
@@ -139,10 +146,10 @@ extern "C" __global__ void moe_gateup_i4(
     int e = e_start + (int)(r / inter);
     int j = (int)(r % inter);
     const ExpertDescI4 d = descs[e];
-    size_t rb_h = (size_t)((hidden + 1) / 2);
-    float g = dot_i4_wave(x, d.gate_packed + (size_t)j * rb_h, hidden, lane);
-    float u = dot_i4_wave(x, d.up_packed + (size_t)j * rb_h, hidden, lane);
-    if (lane == 0) h_out[(size_t)e * inter + j] = siluf(g * d.gate_scale[j]) * (u * d.up_scale[j]);
+    size_t rb_h = (size_t)((hidden + 1) / 2), ng_h = i4_ng(hidden);
+    float g = dot_i4_wave(x, d.gate_packed + (size_t)j * rb_h, d.gate_scale + (size_t)j * ng_h, hidden, lane);
+    float u = dot_i4_wave(x, d.up_packed + (size_t)j * rb_h, d.up_scale + (size_t)j * ng_h, hidden, lane);
+    if (lane == 0) h_out[(size_t)e * inter + j] = siluf(g) * u;
 }
 
 extern "C" __global__ void moe_down_i4(
@@ -154,10 +161,10 @@ extern "C" __global__ void moe_down_i4(
     int e = e_start + (int)(r / hidden);
     int o = (int)(r % hidden);
     const ExpertDescI4 d = descs[e];
-    size_t rb_i = (size_t)((inter + 1) / 2);
+    size_t rb_i = (size_t)((inter + 1) / 2), ng_i = i4_ng(inter);
     const float* he = h_in + (size_t)e * inter;
-    float dv = dot_i4_wave(he, d.down_packed + (size_t)o * rb_i, inter, lane);
-    if (lane == 0) partial[(size_t)e * hidden + o] = wexpert[e] * dv * d.down_scale[o];
+    float dv = dot_i4_wave(he, d.down_packed + (size_t)o * rb_i, d.down_scale + (size_t)o * ng_i, inter, lane);
+    if (lane == 0) partial[(size_t)e * hidden + o] = wexpert[e] * dv;
 }
 
 extern "C" int rivoli_moe_expert_range_i4(

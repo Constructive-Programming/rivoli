@@ -8,7 +8,7 @@
 //! instead of two.
 //!
 //! IO-BOUND on the source read (~9.7 GiB of fp8 per layer, over NFS here); the actual
-//! arithmetic is a dequant and a per-row amax. A GPU port would buy nothing — unlike
+//! arithmetic is a dequant and a per-group amax. A GPU port would buy nothing — unlike
 //! the vq3 encoder, whose codebook argmin is genuinely compute-heavy.
 //!
 //! The `.i4` set is ~365 GB and does not fit twice on disk, so layers are replaced IN
@@ -21,7 +21,8 @@ use anyhow::{Context, Result, anyhow, ensure};
 use rivoli::format::{FormatMeta, I4Source, Safetensors};
 use rivoli::model::ModelConfig;
 use rivoli::quant::{
-    i4_expert_bytes, i4_expert_stride, i4_slot_offsets, quant_i4, vq_expert_layout, write_i4_proj,
+    I4_GROUP, i4_expert_bytes, i4_expert_stride, i4_slot_offsets, quant_i4, vq_expert_layout,
+    write_i4_proj,
 };
 use std::fs::File;
 use std::io::Write;
@@ -182,8 +183,11 @@ fn main() -> Result<()> {
             .display()
             .to_string(),
         layers: [from, to],
+        group: Some(I4_GROUP),
     }
     .stamp(&art)?;
-    eprintln!("fp8_to_i4: done — layers {from}..{to} rebuilt from fp8, manifest i4_source stamped");
+    eprintln!(
+        "fp8_to_i4: done — layers {from}..{to} rebuilt from fp8 at group {I4_GROUP}, manifest i4_source stamped"
+    );
     Ok(())
 }
