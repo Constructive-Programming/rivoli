@@ -133,6 +133,71 @@ vq3 and restore hybrid's premise. Recommended source:
 point, since the defect that deprecated it was per-row scaling and gs64 removes it.
 Until then, `--mode int4` and `--mode hybrid` quality numbers are bounded above by vq3.
 
+### `quant_i4`'s `amax/7` is loaded ~1.8× too wide — and that, not provenance, is int4's deficit
+
+The `.i4` set was rebuilt straight from fp8 (`bin/fp8_to_i4`, chain `fp8->int4`), removing
+the second quantization stage. The weights got measurably closer to ground truth **and
+decode quality got worse**, which is the shape of a bug that better weights unmask. It is
+not one. `bin/i4_audit` measures the whole path against the ORIGINAL fp8 checkpoint in
+f64 — never against `matvec_i4`, so no convention the producer and consumer share can
+cancel — and every hypothesis that would have made it a defect is refuted:
+
+| check | result |
+|---|---|
+| on-disk bytes == `quant_i4(dequant_fp8(ckpt))` | **bit-exact**, routed and shared, all 3 projections (now `tests/artifact.rs`) |
+| all 197,376,000 per-row scales in the set | 0 non-finite, 0 zero, 0 negative, 0 `amax==0` dead rows; range 2.35e-5 … 4.51e-1 |
+| new vs old `.i4` vs fp8 truth, whole row | rel-L2 **0.205 vs 0.250** — new is strictly better |
+| … restricted to the BULK (`\|w\| ≤ p99`), same positions | **0.215 vs 0.261** — new is better *there too* |
+| … restricted to the TAIL | **0.065 vs 0.093** — and there |
+| per-row `amax/median` (fp8 vs vq3-decoded rows) | 7.2 vs 6.8 — the fp8 step is **6.3% coarser**, as predicted |
+
+So the "fp8 keeps outliers, coarsens the step, wrecks the bulk" mechanism is **real in its
+premise and wrong in its conclusion**: the coarser step costs ~6%, and dropping a whole
+quantization stage buys far more. The errors add in quadrature and close exactly —
+`sqrt(0.250² − 0.159²) = 0.193` against `0.205 / 1.063 = 0.193`, agreement 0.2%, leaving
+no unexplained residual for a defect to hide in.
+
+**The one systematic difference is GAIN.** `quant_vq` refits its scale by least squares,
+so it is MMSE-like and shrinks: gain `= 1 − relL2²` (measured 0.9766 vs predicted 0.9754).
+`quant_i4` is plain round-to-nearest and is unbiased (gain 1.0000). The old `.i4`
+inherited vq3's shrink; compounded over gate‖up‖down and silu that is **~9% on the whole
+expert chain** (0.921 vs 1.007). Every configuration that ever decoded coherently ran a
+~9%-attenuated MoE branch; the new set is the first at full gain. That is a real change in
+the model, and it is the *only* one — but it is a property of the quantizers, not a bug.
+
+**The actual defect is the loading factor, and the fix is one constant.** `s = amax/7`
+puts the quantizer's overload point at ~4.6σ; the MSE optimum for a 15-level uniform
+quantizer on Gaussian-ish data is ~2.7σ. Sweeping `s = α·amax/7` against fp8 truth over
+27 cells (layers 3/40/77 × experts 0/128/shared × 3 projections):
+
+| α | 1.00 (shipped) | 0.80 | 0.70 | **0.60** | 0.50 | vq3 |
+|---|---:|---:|---:|---:|---:|---:|
+| rel-L2 (L3 e0 gate) | 0.2054 | 0.1648 | 0.1461 | **0.1314** | 0.1304 | 0.1589 |
+| gain | 1.0008 | 0.9989 | 0.9971 | **0.9907** | 0.9761 | 0.9766 |
+
+The optimum sits at **α = 0.55–0.65 in all 27 cells** (gate/up 0.55–0.60, down 0.65), and
+a per-row search buys only ~4% over a single global constant — so no percentile, no sort,
+no tunable. At α = 0.60 int4 beats vq3 by **17–28% in rel-L2 on 24 of 27 cells** (the three
+weak ones are the shared expert of the late layers, where it merely ties), and the
+output-space error `y = W·x` moves the same way, so this is not a weight-space artifact.
+`quant_i4` already clamps to `[0,15]`, so a smaller `s` saturates correctly with no other
+change.
+
+**This inverts the recommendation above.** int4 is not bounded above by vq3 because of
+double quantization — it was bounded above by an absmax scale set 1.8× too wide, and the
+`fp8->int4` set already removed the other half of the problem. Importing a gs64 container
+is no longer the only route. Not yet implemented: the measurement is the deliverable, and
+a quality run must confirm it before 365 GB is rewritten.
+
+**Two verification gaps this closed.** `moe_i4_real_data_matches_cpu` compares our kernel
+to our own `matvec_i4`, so a convention both share is invisible to it; and no test asserted
+what the bytes MEAN. `tests/artifact.rs::i4_bytes_are_what_the_checkpoint_quantizes_to` is
+now the exact gate (bit identity, CPU-only, provenance-checked), and
+`tests/kernel.rs::moe_i4_real_data_vs_fp8_ground_truth` is the coarse independent one.
+The latter is *deliberately* coarse — two aggregate statistics over 6144 outputs cannot see
+corruption confined to a few percent of rows, which is what the sibling test's max-abs is
+for. Its doc says so rather than claiming a resolution it does not have.
+
 ---
 
 ## `top-m` offline screen (CACHE_ROUTE, arXiv:2412.00099)

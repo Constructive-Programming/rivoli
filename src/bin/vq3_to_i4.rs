@@ -10,39 +10,19 @@ use anyhow::{Context, Result, bail};
 use rivoli::format::{I4Source, load_codebooks};
 use rivoli::model::ModelConfig;
 use rivoli::quant::{
-    VQ_ALIGN, VQ_DIM, VQ_GROUP, VqProj, get_idx, i4_expert_stride, i4_row_bytes, i4_slot_offsets,
-    quant_i4, vq_expert, vq_expert_bytes, vq_expert_stride, vq_groups, vq_row_bytes, write_i4_proj,
+    VQ_ALIGN, i4_expert_stride, i4_row_bytes, i4_slot_offsets, quant_i4, vq_decode_proj,
+    vq_expert, vq_expert_bytes, vq_expert_stride, write_i4_proj,
 };
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
-
-/// Decode one VQ projection to a dense f32 row-major `W[o_dim, i_dim]`.
-fn decode_proj(p: &VqProj, cb: &[f32]) -> Vec<f32> {
-    let (o_dim, i_dim) = (p.o_dim, p.i_dim);
-    let (rb, ng, nsub) = (vq_row_bytes(i_dim), vq_groups(i_dim), i_dim / VQ_DIM);
-    let mut w = vec![0f32; o_dim * i_dim];
-    for o in 0..o_dim {
-        let ir = &p.indices[o * rb..(o + 1) * rb];
-        for k in 0..nsub {
-            let g = (o * ng + (k * VQ_DIM) / VQ_GROUP) * 2;
-            let s = rivoli::math::bf16_to_f32(u16::from_le_bytes([p.scales[g], p.scales[g + 1]]));
-            let idx = get_idx(ir, k);
-            let c = &cb[idx * VQ_DIM..idx * VQ_DIM + VQ_DIM];
-            for d in 0..VQ_DIM {
-                w[o * i_dim + k * VQ_DIM + d] = s * c[d];
-            }
-        }
-    }
-    w
-}
 
 /// Build one expert's `.i4` block (vq expert bytes -> int4, per `i4_slot_offsets`).
 fn build_block(vqb: &[u8], cbs: &[Vec<f32>; 3], off: &[usize; 6], stride: usize, h: usize, m: usize) -> Vec<u8> {
     let projs = vq_expert(vqb, 0, h, m);
     let mut blk = vec![0u8; stride];
     for k in 0..3 {
-        let w = decode_proj(&projs[k], &cbs[k]);
+        let w = vq_decode_proj(&projs[k], &cbs[k]);
         let (packed, scale) = quant_i4(&w, projs[k].o_dim, projs[k].i_dim);
         debug_assert_eq!(packed.len(), projs[k].o_dim * i4_row_bytes(projs[k].i_dim));
         write_i4_proj(&mut blk, off, k, &packed, &scale);
