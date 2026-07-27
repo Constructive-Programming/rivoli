@@ -71,7 +71,7 @@ fn artifact_reads_back() {
 ///
 /// Every other check on this format is a statistic with a tolerance. This one is exact,
 /// and it is the only thing that can tell one `.i4` GENERATION from another: a
-/// `pack_i4` set, a `vq3_to_i4` set and an `fp8_to_i4` set are byte-indistinguishable
+/// a `vq3_to_i4` set and an `fp8_to_i4` set are byte-indistinguishable
 /// on disk by shape alone (`format.rs::I4Source`), which is precisely how a bad `.i4`
 /// set stayed invisible once already. It also catches a torn or partially-resumed
 /// conversion, a checkpoint revision swap, and a wrong `weight_scale_inv` tiling.
@@ -83,7 +83,8 @@ fn artifact_reads_back() {
 fn i4_bytes_are_what_the_checkpoint_quantizes_to() {
     use rivoli::format::I4Source;
     use rivoli::quant::{
-        i4_expert_stride, i4_row_bytes, i4_slot_offsets, quant_i4, read_f32, vq_expert_layout,
+        i4_expert_stride, i4_groups, i4_row_bytes, i4_slot_offsets, quant_i4, read_f32,
+        vq_expert_layout,
     };
     use std::os::unix::fs::FileExt;
     let Ok(dir) = std::env::var("RIVOLI_ARTIFACT") else {
@@ -135,7 +136,7 @@ fn i4_bytes_are_what_the_checkpoint_quantizes_to() {
             let po = off[k * 2];
             let got_packed = &blk[po..po + o_dim * i4_row_bytes(i_dim)];
             let so = off[k * 2 + 1];
-            let got_scale = read_f32(&blk[so..so + o_dim * 4]);
+            let got_scale = read_f32(&blk[so..so + o_dim * i4_groups(i_dim) * 4]);
             // Report WHERE, not just that: a whole-projection mismatch (wrong tensor)
             // and three bad rows (a torn write) need different next actions.
             let bad = want_packed
@@ -149,7 +150,7 @@ fn i4_bytes_are_what_the_checkpoint_quantizes_to() {
             );
             assert_eq!(
                 want_scale, got_scale,
-                "expert {e} {proj}: per-row scales differ from quant_i4(fp8)"
+                "expert {e} {proj}: group scales differ from quant_i4(fp8)"
             );
         }
     }

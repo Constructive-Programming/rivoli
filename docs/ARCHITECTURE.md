@@ -186,7 +186,8 @@ flowchart LR
   as a resident 9th descriptor (weight 1.0, always `ready()`).
 - **Two decode formats.** int3-vq: a 12-bit codebook index per subvector + bf16 group
   scale; the dot is an L1 codebook gather (latency-bound, the smallest/most-resident).
-  int4: colibri-style per-row nibbles (sequential decode, ~1.8× faster compute, bigger).
+  int4: nibbles + one f32 scale per `I4_GROUP` (128) input columns, applied inside the
+  dot (sequential decode, ~1.8× faster compute, bigger).
   The `--mode` picks which format the routed experts use; `hybrid` runs hot experts int4
   and cold experts vq3 in the one arena.
 
@@ -311,7 +312,7 @@ engine tractable to reason about.
 
 | weights | format | resident? | why |
 |---|---|---|---|
-| routed experts | **int3-vq** (12-bit idx + bf16 g64 scale) and/or **int4** (per-row) | streamed | the bandwidth driver; `--mode` picks the format |
+| routed experts | **int3-vq** (12-bit idx + bf16 g64 scale) and/or **int4** (nibble + f32 g128 scale) | streamed | the bandwidth driver; `--mode` picks the format |
 | shared expert | int3-vq / int4 | resident | folded into the MoE launch |
 | attention projections | **fp8** e4m3 + 128-block scale | resident | native source precision |
 | dense-layer MLPs (first 3) | **fp8** | resident | consistent with attention |

@@ -31,12 +31,13 @@ many fit in the pool → hit rate), and **stream cost** (bytes per miss).
 - **Needs:** `L{l}.vq3` + `codebooks.f32` in the artifact.
 - **Best when:** the pool is residency/bandwidth-bound (small budget, big working set).
 
-### `int4` — colibri 4-bit, per-row scale
-> **UNUSABLE on the current artifact (2026-07-27): PPL 73.43 vs int3-vq's 5.28.** The cause is
-> the format itself — ONE scale per 6144-weight row, where `.vq3` carries one per 64. Not a
-> bug, and not fixable by tuning. See `docs/INT4.md`. The size/compute tradeoffs below still
-> hold and are why the mode exists, but do not choose it for quality.
-- **Size:** ~18.9 MB/expert (~24% bigger) — **fewer slots fit** → lower hit rate →
+### `int4` — 4-bit, one f32 scale per 128 weights
+> **History (2026-07-27):** this mode used ONE scale per 6144-weight row and was
+> unusable — PPL 73.43 against int3-vq's 5.28. The defect was the format, not a bug:
+> a single outlier set the step for a whole row and rounded the bulk to zero (603 rows
+> past 50% zeros on one projection). Group-128 scales fixed it outright, **PPL 73.43 →
+> 5.120**, and int4 is now the best-quality mode in the engine. See `docs/INT4.md`.
+- **Size:** ~20.1 MB/expert (~32% bigger) — **fewer slots fit** → lower hit rate →
   **more misses** → more fetch + more host-gated compute bubbles.
 - **Compute:** sequential nibble decode, no gather. **~1.8× faster than int3-vq**
   (microbench: ~669–677 GElem/s, confound-free — see caveat below). No codebook.

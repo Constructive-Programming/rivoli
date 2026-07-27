@@ -3,3 +3,7 @@
 # docs/probes/* are standalone crates with their own build dirs; the rooted pattern
 # above does not reach them.
 target/
+
+# harness working state (worktrees, agent patches, session scratch)
+.claude/
+.snapshot_path

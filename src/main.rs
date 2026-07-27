@@ -288,14 +288,42 @@ fn main() -> Result<()> {
     // Which tool produced the `.i4` set, and from what — only for the modes that
     // actually read it. int4/hybrid quality numbers are interpretable only against
     // this line; unstamped means an artifact predating provenance, where a
-    // `vq3_to_i4` set and a deprecated `pack_i4` set are indistinguishable on disk.
+    // `vq3_to_i4` set and an `fp8_to_i4` set are indistinguishable on disk.
+    // The group size is not decoration: the engine indexes `scale[o·ngroups + i/G]`,
+    // so reading a set quantized at a different G walks a differently-shaped array.
+    // That does not fault — it silently yields garbage (a per-row set read as G=128
+    // produced rel_l2=NaN, gain=NaN in the ground-truth oracle), which is the failure
+    // mode a stamp exists to prevent. Refuse rather than decode nonsense.
     if cfg.mode.uses_int4() {
         match rivoli::format::I4Source::load(&cfg.model)? {
-            Some(s) => info!(
-                "i4 source: {} ({}) layers {}..{} from {}",
-                s.tool, s.chain, s.layers[0], s.layers[1], s.src
+            Some(s) => {
+                info!(
+                    "i4 source: {} ({}, group {}) layers {}..{} from {}",
+                    s.tool,
+                    s.chain,
+                    s.group.map_or("per-row".to_string(), |g| g.to_string()),
+                    s.layers[0],
+                    s.layers[1],
+                    s.src
+                );
+                let want = rivoli::quant::I4_GROUP;
+                match s.group {
+                    Some(g) if g == want => {}
+                    Some(g) => anyhow::bail!(
+                        "`.i4` set was quantized at group {g}, this binary reads group {want}. \
+                         Rebuild with `fp8_to_i4`, or run a binary built for group {g}."
+                    ),
+                    None => anyhow::bail!(
+                        "`.i4` set is per-row (pre-group provenance), this binary reads group \
+                         {want}. Rebuild with `fp8_to_i4`."
+                    ),
+                }
+            }
+            None => anyhow::bail!(
+                "`.i4` set is unstamped so its group size is unknown, and this binary reads \
+                 group {}. Rebuild with `fp8_to_i4`, or use `--mode int3-vq`.",
+                rivoli::quant::I4_GROUP
             ),
-            None => info!("i4 source: unstamped (artifact predates i4 provenance)"),
         }
     }
     info!(

@@ -107,10 +107,10 @@ extern "C" __global__ void gemv_i8(
     if (lane == 0) y[o] = acc * scale[o];
 }
 
-// y[o] = scale[o]·Σ_i x[i]·(nibble(o,i)-8) — per-row int4, wave-per-row (the exact
-// dot_i4_wave the MoE kernels use). Exists so the dot's decode throughput can be
-// measured in isolation against gemv_vq / gemv_fp8 at the MoE projection dims,
-// free of the routing/miss-count confound the decode bench has.
+// y[o] = Σ_i x[i]·(nibble(o,i)-8)·scale[o, i/I4_GROUP] — group-scaled int4,
+// wave-per-row (the exact dot_i4_wave the MoE kernels use). Exists so the dot's decode
+// throughput can be measured in isolation against gemv_vq / gemv_fp8 at the MoE
+// projection dims, free of the routing/miss-count confound the decode bench has.
 extern "C" __global__ void gemv_i4(
     const float* __restrict__ x, const unsigned char* __restrict__ packed,
     const float* __restrict__ scale, int o_dim, int i_dim, float* __restrict__ y) {
@@ -118,8 +118,9 @@ extern "C" __global__ void gemv_i4(
     size_t o = (size_t)blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x / WAVE);
     if (o >= (size_t)o_dim) return;
     size_t rb = (size_t)((i_dim + 1) / 2);
-    float dv = dot_i4_wave(x, packed + o * rb, i_dim, lane);
-    if (lane == 0) y[o] = dv * scale[o];
+    size_t ng = (size_t)((i_dim + I4_GROUP - 1) / I4_GROUP);
+    float dv = dot_i4_wave(x, packed + o * rb, scale + o * ng, i_dim, lane);
+    if (lane == 0) y[o] = dv;
 }
 
 // h[i] = silu(g[i])·u[i], silu(x)=x/(1+e^-x) — the SwiGLU combine for the dense

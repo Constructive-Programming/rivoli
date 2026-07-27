@@ -7,7 +7,7 @@
 //! resident.safetensors   # every resident weight (fp8 attn/dense, int8 embed, f32 norms, bf16 indexer)
 //! L{03..NN}.vq3          # per MoE layer: header + (n_experts + 1) expert blocks,
 //!                        #   block = gate‖up‖down; block n_experts = the shared expert
-//! L{03..NN}.i4           # optional int4 twin of the .vq3 (bin/pack_i4): headerless,
+//! L{03..NN}.i4           # optional int4 twin of the .vq3 (bin/fp8_to_i4): headerless,
 //!                        #   (n_experts + 1) blocks from offset 0. Streamed under --i4.
 //! ```
 
@@ -346,7 +346,7 @@ impl Safetensors {
 
 /// Provenance of the artifact's `.i4` expert set: which tool produced it, from what,
 /// and over which layers. Absent on artifacts built before this field existed — and
-/// that absence is itself the signal, since a `pack_i4` set and a `vq3_to_i4` set are
+/// that absence is itself the signal, since a `vq3_to_i4` set and an `fp8_to_i4` set are
 /// otherwise byte-indistinguishable on disk, which is exactly how a bad `.i4` set
 /// stayed invisible.
 ///
@@ -365,6 +365,14 @@ pub struct I4Source {
     /// rebuilds only part of the set records only that part, so a mixed artifact
     /// never claims to be uniform.
     pub layers: [usize; 2],
+    /// [`crate::quant::I4_GROUP`] the set was quantized at — weights per f32 scale
+    /// along the input dim. Without it a G=128 set and a G=64 set are the same
+    /// `tool`/`chain`/`src` triple, and the quality difference between them would be
+    /// unattributable. `None` is an artifact predating group scales (per-row); such a
+    /// set has a different `.i4` file size and is rejected by `ExpertSet::open`, so
+    /// this is a diagnosis, not a load-time guard.
+    #[serde(default)]
+    pub group: Option<usize>,
 }
 
 impl I4Source {
@@ -401,10 +409,12 @@ impl I4Source {
         // An unreadable prior stamp is not an error HERE — we are replacing it. Only
         // the reader is strict, so a corrupt field can never be misreported as fact.
         let merged = match Self::load(dir).ok().flatten() {
-            // Same derivation and the ranges touch → one contiguous claim.
+            // Same derivation and the ranges touch → one contiguous claim. `group` is
+            // part of "same derivation": merging a G=64 run into a G=128 run would
+            // claim one uniform set for two incompatible formats.
             Some(p)
-                if (p.tool.as_str(), p.chain.as_str(), p.src.as_str())
-                    == (&self.tool, &self.chain, &self.src)
+                if (p.tool.as_str(), p.chain.as_str(), p.src.as_str(), p.group)
+                    == (&self.tool, &self.chain, &self.src, self.group)
                     && p.layers[0] <= self.layers[1]
                     && self.layers[0] <= p.layers[1] =>
             {
@@ -774,6 +784,7 @@ mod tests {
             chain: "fp8->int4".into(),
             src: "/src".into(),
             layers: [3, 40],
+            group: Some(crate::quant::I4_GROUP),
         };
         a.stamp(&dir).unwrap();
         assert_eq!(I4Source::load(&dir).unwrap().as_ref(), Some(&a));
@@ -788,7 +799,18 @@ mod tests {
         // A different derivation replaces rather than merges — no stale claims.
         let b = I4Source { chain: "fp8->vq3->int4".into(), layers: [3, 78], ..a.clone() };
         b.stamp(&dir).unwrap();
-        assert_eq!(I4Source::load(&dir).unwrap(), Some(b));
+        assert_eq!(I4Source::load(&dir).unwrap(), Some(b.clone()));
+
+        // A different GROUP is a different derivation too: rebuilding the tail at
+        // G=64 must not merge into a G=128 claim over the head, or the manifest would
+        // describe one uniform set where two incompatible formats sit side by side.
+        let c = I4Source { group: Some(64), layers: [40, 78], ..b.clone() };
+        c.stamp(&dir).unwrap();
+        assert_eq!(I4Source::load(&dir).unwrap(), Some(c));
+
+        // An artifact stamped before group scales existed reads as group: None.
+        std::fs::write(&mf, br#"{"i4_source":{"tool":"t","chain":"c","src":"/s","layers":[0,1]}}"#).unwrap();
+        assert_eq!(I4Source::load(&dir).unwrap().unwrap().group, None);
 
         // Present-but-malformed is an error, never a silent "unstamped".
         std::fs::write(&mf, br#"{"i4_source":{"tool":"x"}}"#).unwrap();

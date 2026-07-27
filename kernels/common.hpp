@@ -121,22 +121,37 @@ __device__ __forceinline__ float dot_fp8_wave(const float* __restrict__ x,
     return wave_sum(fp8_dot_strided(x, wrow, scalerow, i_dim, block, lut, lane, WAVE));
 }
 
-// Wave-cooperative per-row int4 dot for one output row: Σ_i v[i]·(nibble(i) − 8),
-// result on lane 0 (the per-row scale is applied by the CALLER, outside). `row` =
-// packed[o*rb..], rb = (dim+1)/2. Matches quant.rs::matvec_i4. The fast path reads a
-// dword (8 nibbles = 8 consecutive columns) per lane when `row` is 4-byte aligned —
-// colibri's per-row stride (dim/2, dim a multiple of 8) keeps every row aligned.
+// int4 group-scale parameters — MUST match quant.rs (I4_GROUP). One f32 scale per
+// I4_GROUP weights along the input dim, so the scale lives INSIDE the dot.
+#define I4_GROUP 128
+#define I4_GROUP_SHIFT 7
+static_assert((1 << I4_GROUP_SHIFT) == I4_GROUP, "I4_GROUP_SHIFT must be log2(I4_GROUP)");
+static_assert(I4_GROUP % 8 == 0, "the dword fast path's 8 columns must not straddle a group");
+
+// Wave-cooperative group-scaled int4 dot for one output row, result on lane 0:
+//   Σ_i v[i]·(nibble(i) − 8)·scalerow[i / I4_GROUP]
+// `row` = packed[o*rb..], rb = (dim+1)/2; `scalerow` = scale + o*i4_groups(dim).
+// Matches quant.rs::matvec_i4. NOTE the scale is applied HERE, per group — under the
+// old per-row format the caller applied one scale outside the dot, which is exactly
+// what a group scale cannot express.
+//
+// The fast path reads a dword (8 nibbles = 8 consecutive columns) per lane when `row`
+// is 4-byte aligned (the dim/2 row stride, dim a multiple of 8, keeps every row
+// aligned). Those 8 columns start at a multiple of 8 and I4_GROUP is a multiple of 8,
+// so they always share ONE group scale — one extra multiply per 8 columns, and the
+// scalar tail below computes the same per-element product.
 __device__ __forceinline__ float nib(unsigned int w, int k) {
     return (float)((int)((w >> (4 * k)) & 0xFu) - 8); // nibble k → signed weight
 }
 __device__ __forceinline__ float dot_i4_wave(const float* __restrict__ v,
                                              const unsigned char* __restrict__ row,
+                                             const float* __restrict__ scalerow,
                                              int dim, int lane) {
     // Two accumulators + two float4 x-loads per lane per step: the 8 columns split
     // into independent FMA chains (ILP), and x streams as 2×16B vector loads instead
     // of 8 scalar loads. int4 is sequential-coalesced, so this saturates the L1/x
     // bandwidth and keeps the ALUs busy (nibble-decode) — unlike the VQ dot's random
-    // codebook gather. Fast path needs `row` 4-byte aligned (colibri's dim/2 stride).
+    // codebook gather.
     float a0 = 0.0f, a1 = 0.0f;
     int base = 0;
     if ((((size_t)row) & 3u) == 0) {
@@ -144,16 +159,17 @@ __device__ __forceinline__ float dot_i4_wave(const float* __restrict__ v,
         for (; base + WAVE * 8 <= dim; base += WAVE * 8) {
             int col = base + lane * 8;
             unsigned int w = rw[col >> 3]; // 8 nibbles = 8 consecutive columns
+            float s = scalerow[col >> I4_GROUP_SHIFT]; // one group for all 8
             float4 x0 = *(const float4*)(v + col);
             float4 x1 = *(const float4*)(v + col + 4);
-            a0 += x0.x * nib(w, 0) + x0.y * nib(w, 1) + x0.z * nib(w, 2) + x0.w * nib(w, 3);
-            a1 += x1.x * nib(w, 4) + x1.y * nib(w, 5) + x1.z * nib(w, 6) + x1.w * nib(w, 7);
+            a0 += s * (x0.x * nib(w, 0) + x0.y * nib(w, 1) + x0.z * nib(w, 2) + x0.w * nib(w, 3));
+            a1 += s * (x1.x * nib(w, 4) + x1.y * nib(w, 5) + x1.z * nib(w, 6) + x1.w * nib(w, 7));
         }
     }
     for (int i = base + lane; i < dim; i += WAVE) {
         unsigned char b = row[i >> 1];
         int n = (i & 1) ? (b >> 4) : (b & 0x0F);
-        a0 += v[i] * (float)(n - 8);
+        a0 += v[i] * (float)(n - 8) * scalerow[i >> I4_GROUP_SHIFT];
     }
     return wave_sum(a0 + a1);
 }

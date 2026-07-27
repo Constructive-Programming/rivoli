@@ -14,10 +14,13 @@
 //!   5. the outlier statistics (`amax/median`, `amax/p99.9`, spiky-row count) and the
 //!      error split into BULK (|w| ≤ p99) and TAIL — the measurement that decides
 //!      whether a quality drop is a defect or "fp8 rows are simply harder to quantize"
-//!   6. `--scale-study`: sweep `s = α·amax/7` and score every α against the fp8 truth
-//!      in BOTH weight and output space. `quant_i4` ships α = 1, which loads the
-//!      quantizer at ~4.6σ where the MSE optimum for 15 levels is ~2.7σ; this finds
-//!      the real optimum on real rows instead of assuming one.
+//!   6. `--scale-study`: score every candidate quantiser step against the fp8 truth in
+//!      BOTH weight and output space — a sweep of PER-ROW steps `s = α·amax/7`, the LS
+//!      refit, the per-row oracle, and the shipped GROUP-`I4_GROUP` quantiser. The last
+//!      row against the `α = 1.00` row is the head-to-head that justified moving off
+//!      per-row scales. This mode reads ONLY the fp8 checkpoint (the study is a
+//!      property of the weights and the quantiser), so it runs before a rebuild and
+//!      against an artifact of any generation.
 //!
 //! usage: i4_audit <artifact-dir> <fp8-dir> [--layer L] [--experts a,b,c]
 //!                 [--scan] [--scale-study]
@@ -26,8 +29,8 @@ use rivoli::format::{FormatMeta, I4Source, Safetensors, load_codebooks};
 use rivoli::math::silu;
 use rivoli::model::ModelConfig;
 use rivoli::quant::{
-    dequant_i4, i4_expert_stride, i4_row_bytes, i4_slot_offsets, matvec_i4, quant_i4, read_f32,
-    vq_decode_proj, vq_expert, vq_expert_layout, vq_expert_stride,
+    I4_GROUP, dequant_i4, i4_expert_stride, i4_groups, i4_row_bytes, i4_slot_offsets, matvec_i4,
+    quant_i4, read_f32, vq_decode_proj, vq_expert, vq_expert_layout, vq_expert_stride,
 };
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -101,14 +104,19 @@ struct Bulk {
     bulk_rel_l2: f64,     // rel-L2 of the reconstruction over |w| ≤ p99 ONLY
     tail_rel_l2: f64,     // rel-L2 over the |w| > p99 complement, for contrast
     levels_used: usize,   // distinct nibbles the bulk occupies, of 16
-    step_mean: f64,       // mean per-row scale (the quantiser step)
+    step_mean: f64,       // mean quantiser step (over every stored scale)
+    dead_rows: usize,     // rows where >50% of weights rounded to nibble 8 (zero)
     hist: [u64; 16],      // nibble histogram over the bulk
 }
 
 /// `w` is the reference (fp8 ground truth) the row statistics are taken from; `rec` is
-/// a reconstruction to score against it; `scale` is the per-row step `rec` was built
-/// with. Bulk/tail are split on the reference's own p99, so BOTH generations are scored
-/// on the same positions.
+/// a reconstruction to score against it; `scale` is the step array `rec` was built with
+/// (`o_dim · i4_groups(i_dim)` under group scales). Bulk/tail are split on the
+/// reference's own p99, so BOTH generations are scored on the same positions.
+///
+/// `dead_rows` is the headline number for the per-row → group change: under one scale
+/// per 6144-wide row a single outlier rounded the bulk to zero, and 603 of 6144 rows of
+/// L03 e0 down_proj ended past 50% zeros. A group scale should collapse that count.
 fn bulk_stats(
     w: &[f32],
     rec: &[f32],
@@ -120,6 +128,7 @@ fn bulk_stats(
     let rb = i4_row_bytes(i_dim);
     let (mut r_med, mut r_p999) = (0f64, 0f64);
     let (mut spiky, mut bn, mut bd, mut tn, mut td) = (0usize, 0f64, 0f64, 0f64, 0f64);
+    let mut dead = 0usize;
     let mut hist = [0u64; 16];
     let mut buf = vec![0f32; i_dim];
     for o in 0..o_dim {
@@ -139,18 +148,24 @@ fn bulk_stats(
             spiky += 1;
         }
         let prow = &packed[o * rb..(o + 1) * rb];
+        let mut zeros = 0usize;
         for i in 0..i_dim {
             let (a, b) = (row[i] as f64, rrow[i] as f64);
             let d = (b - a) * (b - a);
+            let byte = prow[i >> 1];
+            let nib = (if i & 1 == 0 { byte & 0x0F } else { byte >> 4 }) as usize;
+            zeros += usize::from(nib == 8);
             if row[i].abs() <= p99 {
                 bn += d;
                 bd += a * a;
-                let byte = prow[i >> 1];
-                hist[(if i & 1 == 0 { byte & 0x0F } else { byte >> 4 }) as usize] += 1;
+                hist[nib] += 1;
             } else {
                 tn += d;
                 td += a * a;
             }
+        }
+        if zeros * 2 > i_dim {
+            dead += 1;
         }
     }
     let n = o_dim as f64;
@@ -161,24 +176,31 @@ fn bulk_stats(
         bulk_rel_l2: (bn / bd.max(f64::MIN_POSITIVE)).sqrt(),
         tail_rel_l2: (tn / td.max(f64::MIN_POSITIVE)).sqrt(),
         levels_used: hist.iter().filter(|&&c| c > 0).count(),
-        step_mean: scale.iter().map(|&s| s as f64).sum::<f64>() / n,
+        step_mean: scale.iter().map(|&s| s as f64).sum::<f64>() / scale.len() as f64,
+        dead_rows: dead,
         hist,
     }
 }
 
 /// Quantize one row to int4 at step `s` and score the reconstruction against `row`.
-/// Returns `(sq_err, sq_ref, dot)` so a caller can pool them across rows into a
-/// projection-wide rel-L2 and gain.
-fn row_err(row: &[f32], s: f32) -> (f64, f64, f64) {
-    let (mut e, mut r, mut d) = (0f64, 0f64, 0f64);
+/// Returns `(sq_err, sq_ref, dot, zeros)` so a caller can pool them across rows into a
+/// projection-wide rel-L2, gain, and zero fraction.
+///
+/// `zeros` is the count that rounded to the middle level — weights the quantiser threw
+/// away entirely. It is the direct measure of the per-row pathology: one outlier sets
+/// `s = amax/7` for the whole row and the bulk lands on zero.
+fn row_err(row: &[f32], s: f32) -> (f64, f64, f64, u64) {
+    let (mut e, mut r, mut d, mut z) = (0f64, 0f64, 0f64, 0u64);
     for &w in row {
-        let n = ((w / s).round() as i32).clamp(-8, 7) as f64 * s as f64;
+        let q = ((w / s).round() as i32).clamp(-8, 7);
+        z += u64::from(q == 0);
+        let n = q as f64 * s as f64;
         let w = w as f64;
         e += (n - w) * (n - w);
         r += w * w;
         d += n * w;
     }
-    (e, r, d)
+    (e, r, d, z)
 }
 
 /// Does a better per-row STEP recover the ground the `.i4` set loses to `.vq3`?
@@ -204,12 +226,15 @@ fn scale_study(w: &[f32], x: &[f32], yref: &[f32], o_dim: usize, i_dim: usize) {
     ];
     const LS: usize = ALPHAS.len(); // LS refit
     const ORACLE: usize = ALPHAS.len() + 1; // per-row best α — the ceiling of a clip search
-    let mut acc = [(0f64, 0f64, 0f64); ALPHAS.len() + 2]; // (sq_err, sq_ref, dot) in WEIGHT space
-    let mut yacc = [(0f64, 0f64, 0f64); ALPHAS.len() + 2]; // the same in OUTPUT space
-    let add = |t: &mut (f64, f64, f64), v: (f64, f64, f64)| {
+    const GROUP: usize = ALPHAS.len() + 2; // the SHIPPED quantiser: amax/7 per I4_GROUP
+    const NVAR: usize = ALPHAS.len() + 3;
+    let mut acc = [(0f64, 0f64, 0f64, 0u64); NVAR]; // (sq_err, sq_ref, dot, zeros), WEIGHT space
+    let mut yacc = [(0f64, 0f64, 0f64); NVAR]; // (sq_err, sq_ref, dot) in OUTPUT space
+    let add = |t: &mut (f64, f64, f64, u64), v: (f64, f64, f64, u64)| {
         t.0 += v.0;
         t.1 += v.1;
         t.2 += v.2;
+        t.3 += v.3;
     };
     // Output-space error for one row at step `s`: y_o = Σ_i x_i·n_i·s against yref[o].
     let ydot = |row: &[f32], s: f32| -> f64 {
@@ -227,7 +252,8 @@ fn scale_study(w: &[f32], x: &[f32], yref: &[f32], o_dim: usize, i_dim: usize) {
         let s0 = amax / 7.0;
         let yr = yref[o] as f64;
         let mut ytally = |k: usize, y: f64| {
-            add(&mut yacc[k], ((y - yr) * (y - yr), yr * yr, y * yr));
+            let t = &mut yacc[k];
+            (t.0, t.1, t.2) = (t.0 + (y - yr) * (y - yr), t.1 + yr * yr, t.2 + y * yr);
         };
         let (mut best, mut best_i) = (f64::INFINITY, 0usize);
         for (i, &a) in ALPHAS.iter().enumerate() {
@@ -250,12 +276,30 @@ fn scale_study(w: &[f32], x: &[f32], yref: &[f32], o_dim: usize, i_dim: usize) {
         ytally(LS, ydot(row, sls));
         add(&mut acc[ORACLE], row_err(row, s0 * ALPHAS[best_i]));
         ytally(ORACLE, ydot(row, s0 * ALPHAS[best_i]));
+        // The SHIPPED quantiser: `amax/7` recomputed per I4_GROUP columns. Every α row
+        // above is a PER-ROW step, so this is the head-to-head the format change rests
+        // on — same rows, same x, same metrics.
+        let (mut gw, mut gy) = ((0f64, 0f64, 0f64, 0u64), 0f64);
+        for (g, seg) in row.chunks(I4_GROUP).enumerate() {
+            let gmax = seg.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let sg = if gmax > 0.0 { gmax / 7.0 } else { s0 };
+            add(&mut gw, row_err(seg, sg));
+            gy += seg
+                .iter()
+                .zip(&x[g * I4_GROUP..])
+                .map(|(&wi, &xi)| ((wi / sg).round() as i32).clamp(-8, 7) as f64 * sg as f64 * xi as f64)
+                .sum::<f64>();
+        }
+        add(&mut acc[GROUP], gw);
+        ytally(GROUP, gy);
     }
-    let show = |label: String, (e, r, d): (f64, f64, f64), (ye, yr, yd): (f64, f64, f64)| {
+    let total = (o_dim * i_dim) as f64;
+    let show = |label: String, (e, r, d, z): (f64, f64, f64, u64), (ye, yr, yd): (f64, f64, f64)| {
         println!(
-            "        {label:<22} W relL2 {:.4}  W gain {:.4}   |   y relL2 {:.4}  y gain {:.4}",
+            "        {label:<22} W relL2 {:.4}  W gain {:.4}  zeros {:>6.2}%   |   y relL2 {:.4}  y gain {:.4}",
             (e / r).sqrt(),
             d / r,
+            100.0 * z as f64 / total,
             (ye / yr).sqrt(),
             yd / yr
         );
@@ -265,6 +309,34 @@ fn scale_study(w: &[f32], x: &[f32], yref: &[f32], o_dim: usize, i_dim: usize) {
     }
     show("LS refit (as quant_vq)".into(), acc[LS], yacc[LS]);
     show("per-row best α (oracle)".into(), acc[ORACLE], yacc[ORACLE]);
+    show(format!("GROUP-{I4_GROUP} amax/7"), acc[GROUP], yacc[GROUP]);
+}
+
+/// `--scale-study` on its own: score every candidate step against the fp8 checkpoint
+/// WITHOUT reading the artifact. The study is a property of the weights and the
+/// quantiser, never of the shipped bytes — and keeping it independent is what lets it
+/// answer "is this format worth rebuilding 386 GB for?" BEFORE the rebuild, and lets it
+/// run at all while the `.i4` set on disk is a different generation's format.
+fn scale_study_only(fp8: &str, cfg: &ModelConfig, block: usize, layer: usize, experts: &[usize]) -> Result<()> {
+    let (h, m, ne) = (cfg.hidden, cfg.moe_inter, cfg.n_experts);
+    let src = Safetensors::open_dir(fp8).context("open fp8 checkpoint")?;
+    println!("layer {layer}  hidden {h}  moe_inter {m}  fp8_block {block}  (fp8 only — artifact not read)");
+    for &e in experts {
+        ensure!(e <= ne, "--experts: {ne} is the shared expert and the largest valid index");
+        let base = if e < ne {
+            format!("model.layers.{layer}.mlp.experts.{e}")
+        } else {
+            format!("model.layers.{layer}.mlp.shared_experts")
+        };
+        for (k, (&(o_dim, i_dim), pname)) in vq_expert_layout(h, m).iter().zip(PROJ).enumerate() {
+            let wref = src.dequant_fp8(&format!("{base}.{pname}"), o_dim, i_dim, block)?;
+            let x = make_x(i_dim, 0xB0BA_u64.wrapping_add((e * 7 + k) as u64));
+            let yref = matvec_f64(&wref, &x, o_dim, i_dim);
+            println!("      SCALE STUDY (fp8 rows, expert {e} {pname}, {o_dim}×{i_dim}):");
+            scale_study(&wref, &x, &yref, o_dim, i_dim);
+        }
+    }
+    Ok(())
 }
 
 /// The audit's activation vector — bit-identical to `tests/kernel.rs::Lcg::f`
@@ -396,10 +468,10 @@ fn xcheck(art: &str, cfg: &ModelConfig, layers: &[usize], experts: &[usize]) -> 
     Ok(())
 }
 
-/// Sweep every per-row f32 scale in the shipped `.i4` set looking for values the
-/// decode path cannot survive: non-finite (`0 · inf = NaN` in `matvec_i4`/`dot_i4_wave`,
-/// which apply the scale OUTSIDE the dot), zero, negative, or the `amax == 0` sentinel
-/// `1.0` (a dead row). Cheap: scales are 40 KB per expert, so this preads ~10 MB/layer.
+/// Sweep every f32 group scale in the shipped `.i4` set looking for values the decode
+/// path cannot survive: non-finite (`0 · inf = NaN` in `matvec_i4`/`dot_i4_wave`),
+/// zero, negative, or the `amax == 0` sentinel `1.0` (a dead group). Cheap: scales are
+/// ~2 MB per expert at `I4_GROUP` = 128, so this preads a few hundred MB/layer.
 fn scan_scales(art: &str, cfg: &ModelConfig) -> Result<()> {
     let (h, m, ne) = (cfg.hidden, cfg.moe_inter, cfg.n_experts);
     let off = i4_slot_offsets(h, m);
@@ -407,12 +479,12 @@ fn scan_scales(art: &str, cfg: &ModelConfig) -> Result<()> {
     let dims = vq_expert_layout(h, m);
     let (mut nonfinite, mut zero, mut neg, mut ones, mut total) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let (mut lo, mut hi) = (f32::INFINITY, 0f32);
-    let mut worst = (0usize, 0usize, 0usize, 0usize, 0f32); // layer, expert, proj, row, scale
+    let mut worst = (0usize, 0usize, 0usize, 0usize, 0f32); // layer, expert, proj, slot, scale
     for l in cfg.dense_layers..cfg.n_layers {
         let f = File::open(format!("{art}/L{l:02}.i4"))?;
         for e in 0..=ne {
-            for (k, &(o_dim, _)) in dims.iter().enumerate() {
-                let mut b = vec![0u8; o_dim * 4];
+            for (k, &(o_dim, i_dim)) in dims.iter().enumerate() {
+                let mut b = vec![0u8; o_dim * i4_groups(i_dim) * 4];
                 f.read_exact_at(&mut b, (e * stride + off[k * 2 + 1]) as u64)?;
                 for (o, s) in read_f32(&b).into_iter().enumerate() {
                     total += 1;
@@ -442,10 +514,10 @@ fn scan_scales(art: &str, cfg: &ModelConfig) -> Result<()> {
     }
     eprintln!();
     println!(
-        "scales: {total} total, nonfinite {nonfinite}, zero {zero}, negative {neg}, ==1.0 (amax==0 dead row) {ones}"
+        "scales: {total} total (group {I4_GROUP}), nonfinite {nonfinite}, zero {zero}, negative {neg}, ==1.0 (amax==0 dead group) {ones}"
     );
     println!(
-        "        min {lo:.6e}  max {hi:.6e}  (max at layer {} expert {} proj {} row {}, s={:.6e})",
+        "        min {lo:.6e}  max {hi:.6e}  (max at layer {} expert {} proj {} slot {}, s={:.6e})",
         worst.0, worst.1, worst.2, worst.3, worst.4
     );
     println!("        max|W| implied by the largest scale = 7·s = {:.4e}", hi * 7.0);
@@ -502,6 +574,13 @@ fn main() -> Result<()> {
         let ls: Vec<usize> = (cfg.dense_layers..cfg.n_layers).step_by(6).collect();
         let es: Vec<usize> = (0..cfg.n_experts).step_by(31).chain([cfg.n_experts]).collect();
         return verify_wide(&art, &fp8, &cfg, &ls, &es);
+    }
+    // Reads only the fp8 checkpoint, so it is valid against an artifact of any
+    // generation — including before a rebuild, which is the point: it is what decides
+    // whether a rebuild is worth buying.
+    if study {
+        let block = FormatMeta::load(&art)?.fp8_block;
+        return scale_study_only(&fp8, &cfg, block, layer, &experts);
     }
     let (h, m, ne) = (cfg.hidden, cfg.moe_inter, cfg.n_experts);
     // `e == ne` is the shared expert; anything ABOVE it would read routed block `e`'s
@@ -569,7 +648,8 @@ fn main() -> Result<()> {
             // ── what the artifact actually holds ─────────────────────────────
             let rb = i4_row_bytes(i_dim);
             let packed = &i4b[off[k * 2]..off[k * 2] + o_dim * rb];
-            let scale = read_f32(&i4b[off[k * 2 + 1]..off[k * 2 + 1] + o_dim * 4]);
+            let scale =
+                read_f32(&i4b[off[k * 2 + 1]..off[k * 2 + 1] + o_dim * i4_groups(i_dim) * 4]);
 
             // (1) byte identity: does the disk match a fresh quant_i4 of the fp8?
             let (p2, s2) = quant_i4(&wref, o_dim, i_dim);
@@ -659,9 +739,10 @@ fn main() -> Result<()> {
             for (label, b) in [("new i4", &bn), ("old i4", &bo)] {
                 println!(
                     "{:<6} BULK {:<8}| amax/med {:>5.1}  amax/p99.9 {:>5.2}  spiky rows {:>5}/{o_dim}  \
-                     step {:>9.3e}  bulk relL2 {:>7.4}  tail relL2 {:>7.4}  levels {:>2}/16",
-                    e, label, b.amax_over_med, b.amax_over_p999, b.spiky_rows, b.step_mean,
-                    b.bulk_rel_l2, b.tail_rel_l2, b.levels_used
+                     dead rows {:>5}/{o_dim}  step {:>9.3e}  bulk relL2 {:>7.4}  tail relL2 {:>7.4}  \
+                     levels {:>2}/16",
+                    e, label, b.amax_over_med, b.amax_over_p999, b.spiky_rows, b.dead_rows,
+                    b.step_mean, b.bulk_rel_l2, b.tail_rel_l2, b.levels_used
                 );
             }
             println!("{:<6} HIST new  | {:?}", e, bn.hist);
@@ -671,11 +752,6 @@ fn main() -> Result<()> {
                 e,
                 bn.step_mean / bo.step_mean
             );
-            if study {
-                println!("      SCALE STUDY (fp8 rows, expert {e} {pname}) — vq3 reaches relL2 {:.4}:", avq.rel_l2);
-                scale_study(&wref, &x, &yref, o_dim, i_dim);
-            }
-
             wrefs.push(wref);
             i4s.push((packed.to_vec(), scale));
             olds.push((op, os));

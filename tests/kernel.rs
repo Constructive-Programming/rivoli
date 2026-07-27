@@ -754,14 +754,19 @@ fn moe_vq_matches_reference() {
     assert_close(&want, &f32v(&obuf.copy_out().expect("out")), "moe_vq");
 }
 
-/// int4 MoE (moe_gateup_i4 → moe_down_i4 → moe_reduce), per-row scale, vs a
+/// int4 MoE (moe_gateup_i4 → moe_down_i4 → moe_reduce), GROUP scales, vs a
 /// matvec_i4+silu reference on the same quantized bytes. hidden ≥ 256 exercises
 /// dot_i4_wave's dword fast path; inter < 256 its scalar tail.
+///
+/// `hidden = 2·I4_GROUP` is deliberate: one dword-fast-path step covers WAVE·8 = 256
+/// columns, so lanes 0..15 and 16..31 sit in DIFFERENT groups within the same step —
+/// a kernel that hoisted one scale per step, or per row, disagrees here. `inter` is
+/// one whole group, so the scalar tail's group indexing is exercised too.
 #[test]
 fn moe_i4_matches_reference() {
-    use rivoli::quant::{matvec_i4, quant_i4};
+    use rivoli::quant::{I4_GROUP, matvec_i4, quant_i4};
     let mut r = Lcg(0x14);
-    let (hidden, inter, e) = (256usize, 128usize, 3usize);
+    let (hidden, inter, e) = (2 * I4_GROUP, I4_GROUP, 3usize);
     let x: Vec<f32> = (0..hidden).map(|_| r.f()).collect();
     let w: Vec<f32> = (0..e).map(|_| r.f()).collect();
     let dims = [(inter, hidden), (inter, hidden), (hidden, inter)]; // gate, up, down (o,i)
@@ -769,7 +774,12 @@ fn moe_i4_matches_reference() {
     for _ in 0..e {
         let mut per: [(Vec<u8>, Vec<f32>); 3] = std::array::from_fn(|_| (Vec::new(), Vec::new()));
         for (p, &(o_dim, i_dim)) in dims.iter().enumerate() {
-            let wv: Vec<f32> = (0..o_dim * i_dim).map(|_| r.f()).collect();
+            // Group `g` of every row is 4^g larger, so the stored scales genuinely
+            // DIFFER between groups. Uniform-magnitude weights would give near-equal
+            // group scales and a kernel reading the wrong group would still pass.
+            let wv: Vec<f32> = (0..o_dim * i_dim)
+                .map(|n| r.f() * 4f32.powi(((n % i_dim) / I4_GROUP) as i32))
+                .collect();
             per[p] = quant_i4(&wv, o_dim, i_dim);
         }
         enc.push(per);
@@ -902,7 +912,7 @@ fn gpu_i4_expert(blk: &[u8], off: &[usize; 6], x: &[f32], hidden: usize, inter: 
 #[test]
 fn moe_i4_real_data_matches_cpu() {
     use rivoli::quant::{
-        i4_expert_bytes, i4_row_bytes, i4_slot_offsets, matvec_i4, vq_expert_layout,
+        i4_expert_bytes, i4_groups, i4_row_bytes, i4_slot_offsets, matvec_i4, vq_expert_layout,
     };
     use std::os::unix::fs::FileExt;
     let path = "/var/db/rivoli/glm52-vq3-full/L03.i4";
@@ -921,7 +931,7 @@ fn moe_i4_real_data_matches_cpu() {
     let proj = |k: usize| -> (Vec<u8>, Vec<f32>) {
         let (o, i) = dims[k];
         let p = blk[off[k * 2]..off[k * 2] + o * i4_row_bytes(i)].to_vec();
-        let sc = blk[off[k * 2 + 1]..off[k * 2 + 1] + o * 4]
+        let sc = blk[off[k * 2 + 1]..off[k * 2 + 1] + o * i4_groups(i) * 4]
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
@@ -1012,6 +1022,20 @@ fn moe_i4_real_data_vs_fp8_ground_truth() {
         "the assertion bands characterise the fp8->int4 chain; this artifact is {}",
         prov.chain
     );
+    // A set quantized at a different group size is a differently-shaped scale array,
+    // not a slightly-different one: reading it walks the wrong strides and yields
+    // rel_l2=NaN rather than a large error. Skip loudly instead of asserting on NaN,
+    // which reports "systematic gain error" and sends the reader hunting a numerics
+    // bug that is really a stale artifact.
+    if prov.group != Some(rivoli::quant::I4_GROUP) {
+        eprintln!(
+            "skip moe_i4_real_data_vs_fp8: artifact is group {:?}, this build reads group {} \
+             — rebuild with fp8_to_i4",
+            prov.group,
+            rivoli::quant::I4_GROUP
+        );
+        return;
+    }
     assert!(
         prov.layers[0] <= LAYER && LAYER < prov.layers[1],
         "layer {LAYER} outside the stamped range {:?}",
