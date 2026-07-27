@@ -44,6 +44,9 @@ struct Args {
     sinks: usize,
     window: usize,
     misa_heads: usize,
+    /// `--moe-gain <g>`: scale the whole MoE branch by `g` before the residual add.
+    /// An EXPERIMENT knob, not a tuning parameter — see kernels/fwd.hip::vaxpy.
+    moe_gain: f32,
     /// DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
     #[cfg(feature = "trace")]
     checksum_x: bool,
@@ -55,7 +58,8 @@ fn parse_args() -> Result<Args> {
          [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc|top-m] [--2q-kin <pct>] \
          [--2q-kout <pct>] [--route-j <n>] [--route-m <n>] [--max-mem <GiB>] \
          [--ppl <text-file>] [--ppl-out <path>] \
-         [--attn auto|dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>]";
+         [--attn auto|dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>] \
+         [--moe-gain <g>]";
     let mut model = None;
     let mut a = Args {
         model: String::new(),
@@ -75,6 +79,7 @@ fn parse_args() -> Result<Args> {
         sinks: 4,
         window: 8192,
         misa_heads: 8, // the MISA paper's validated GLM setting
+        moe_gain: 1.0, // 1.0 = the engine's normal arithmetic, bit-identical (vadd, not vaxpy)
         #[cfg(feature = "trace")]
         checksum_x: false,
     };
@@ -154,6 +159,18 @@ fn parse_args() -> Result<Args> {
                     .parse()
                     .context("--window takes an integer")?;
             }
+            "--moe-gain" => {
+                a.moe_gain = args
+                    .next()
+                    .context("--moe-gain requires a float")?
+                    .parse()
+                    .context("--moe-gain takes a float")?;
+                // A sweep that silently ran at 0 or a negative gain would produce a
+                // confidently degenerate arm; the band is generous but finite.
+                if !(0.5..=1.5).contains(&a.moe_gain) {
+                    bail!("--moe-gain {} outside [0.5, 1.5]", a.moe_gain);
+                }
+            }
             "--misa-heads" => {
                 a.misa_heads = args
                     .next()
@@ -215,6 +232,7 @@ fn main() -> Result<()> {
     let attn = resolve_attn(&a)?;
     // Bound before `a` is partially moved into `discover` below.
     let (a_ppl, a_ppl_out) = (a.ppl.clone(), a.ppl_out.clone());
+    let a_moe_gain = a.moe_gain;
     #[cfg(feature = "trace")]
     let checksum_x = a.checksum_x;
     #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
@@ -383,6 +401,7 @@ fn main() -> Result<()> {
         let mut engine = rivoli::gpu::GpuEngine::new(pin, &mc, max_ctx, cfg.attn.clone())?;
         #[cfg(feature = "trace")]
         engine.set_checksum_x(cfg.checksum_x);
+        engine.set_moe_gain(a_moe_gain);
         // Wedge watchdog: a hung GPU join can't be caught inside the decode loop, so
         // a background thread aborts the process if no token lands for `wd_secs`.
         let wd_secs = std::env::var("RIVOLI_WATCHDOG_SECS")
@@ -426,13 +445,16 @@ fn main() -> Result<()> {
                 );
                 writeln!(
                     w,
-                    "# rivoli-nll v1 mode={} policy={} j={} m={} tokens={} hit_pct={hit_pct:.4} swap_pct={}",
+                    "# rivoli-nll v1 mode={} policy={} moe_gain={a_moe_gain} j={} m={} tokens={} hit_pct={hit_pct:.4} swap_pct={}",
                     cfg.mode,
                     cfg.cache_policy,
                     // `--route-j`/`--route-m` default to (2, 12) whatever the policy, so a
                     // baseline run would otherwise record knobs it never consulted. This
                     // file is the measurement of record; a reader must be able to tell the
-                    // baseline from a cell by its header alone.
+                    // baseline from a cell by its header alone — which is also why
+                    // `moe_gain` is here: a gain sweep differs in NOTHING else, so six
+                    // arms would otherwise write six identical headers and `bin/ppl`
+                    // would label them identically.
                     top_m.map_or("na".into(), |(j, _)| j.to_string()),
                     top_m.map_or("na".into(), |(_, m)| m.to_string()),
                     nlls.len(),

@@ -18,7 +18,7 @@ use crate::hip::{
     launch_index_append, launch_index_head_route, launch_index_pool_push, launch_index_score,
     launch_index_topk, launch_layernorm, launch_mla_absorb_fp8, launch_mla_value_fp8,
     launch_moe_expert_range, launch_moe_expert_range_i4, launch_moe_reduce, launch_rmsnorm,
-    launch_rope, launch_swiglu, launch_vadd,
+    launch_rope, launch_swiglu, launch_vadd, launch_vaxpy,
 };
 use crate::math::{E4M3_BLOCK, nll_of, route_into, topk_into};
 use crate::model::ModelConfig;
@@ -262,6 +262,11 @@ struct DeviceIndexer {
 }
 
 pub struct GpuEngine<'a> {
+    /// Scales the MoE branch before the residual add. `1.0` takes the plain `vadd`
+    /// path, so the default is BIT-IDENTICAL to an engine without this knob — which
+    /// matters because the `g = 1.0` arm is the in-session anchor the sweep is read
+    /// against, and an anchor that quietly ran different arithmetic anchors nothing.
+    moe_gain: f32,
     pin: Pin<'a>,
     cfg: &'a ModelConfig,
     /// Attention row-selection mode. Dense/Streaming pick rows by position; Dsa/Misa
@@ -456,6 +461,7 @@ impl<'a> GpuEngine<'a> {
             rc.push(DeviceBuf::new(max_ctx * rope * 2)?); // bf16 roped key
         }
         Ok(Self {
+            moe_gain: 1.0,
             cfg,
             mode,
             rows_buf: DeviceBuf::new(max_ctx * 4)?,
@@ -542,6 +548,14 @@ impl<'a> GpuEngine<'a> {
         self.route_advice.map(|_| {
             100.0 * self.prof.swap_n as f64 / (self.pin.hits + self.pin.misses).max(1) as f64
         })
+    }
+
+    /// Set the MoE-branch gain (see the field and kernels/fwd.hip::vaxpy).
+    pub fn set_moe_gain(&mut self, g: f32) {
+        if g != 1.0 {
+            tracing::warn!("MoE branch gain {g} — EXPERIMENT arithmetic, not a normal run");
+        }
+        self.moe_gain = g;
     }
 
     /// DIAGNOSTIC: hash the residual stream after every layer (`--checksum-x`).
@@ -1234,8 +1248,17 @@ impl<'a> GpuEngine<'a> {
                 self.prof.moe_wall_ns += tm.elapsed().as_nanos();
                 self.moe_ev_end.record(cs_raw)?;
             }
-            // SAFETY: residual add of the MLP contribution.
-            unsafe { launch_vadd(xp, self.moe_out.ptr() as *const f32, hidden)? };
+            // SAFETY: residual add of the MLP contribution. `--moe-gain` applies ONLY
+            // on MoE layers — the 3 dense layers share this add, and attenuating them
+            // too would confound "the MoE branch is too strong" with "the MLP branch
+            // is". At g == 1.0 this is the plain `vadd`, bit for bit.
+            let mp = self.moe_out.ptr() as *const f32;
+            unsafe {
+                match (dense_mlp.is_none(), self.moe_gain) {
+                    (true, g) if g != 1.0 => launch_vaxpy(xp, mp, g, hidden)?,
+                    _ => launch_vadd(xp, mp, hidden)?,
+                }
+            }
             // End-of-layer join: protects the reused descs/wexpert/moe_out buffers
             // before the next layer overwrites them, and surfaces faults. Folds into
             // the MoE wall (near-0 for MoE layers — the compute stream already synced;

@@ -170,6 +170,7 @@ unsafe extern "C" {
         ropn: i32,
     ) -> i32;
     fn rivoli_vadd(x: *mut f32, y: *const f32, n: i32) -> i32;
+    fn rivoli_vaxpy(x: *mut f32, y: *const f32, g: f32, n: i32) -> i32;
     fn rivoli_argmax(logits: *const f32, n: i32, out_idx: *mut i32, out_val: *mut f32) -> i32;
 
     fn rivoli_gemv_i8(
@@ -630,6 +631,16 @@ pub unsafe fn launch_vadd(x: *mut f32, y: *const f32, n: usize) -> Result<()> {
     // SAFETY: caller's pointer contract.
     let r = unsafe { rivoli_vadd(x, y, n as i32) };
     check(r, "vadd")
+}
+
+/// `x += g·y` — the residual add with a branch gain (see kernels/fwd.hip::vaxpy).
+///
+/// # Safety
+/// `x` and `y` must be device pointers to at least `n` f32.
+pub unsafe fn launch_vaxpy(x: *mut f32, y: *const f32, g: f32, n: usize) -> Result<()> {
+    // SAFETY: caller guarantees both buffers hold `n` device f32.
+    let r = unsafe { rivoli_vaxpy(x, y, g, n as i32) };
+    check(r, "vaxpy")
 }
 
 /// Greedy argmax over `logits[0..n]` → (`out_idx`, `out_val`); lowest index on a

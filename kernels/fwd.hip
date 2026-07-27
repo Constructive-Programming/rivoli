@@ -89,6 +89,18 @@ extern "C" __global__ void vadd(float* __restrict__ x, const float* __restrict__
     if (i < n) x[i] += y[i];
 }
 
+// x[i] += g·y[i] — residual add with a branch GAIN. Exists for one experiment: the
+// `fp8→vq3→int4` artifact attenuated the whole MoE branch by ~0.91 (quant_vq refits its
+// scale by least squares, so it shrinks; quant_i4 is plain RTN and does not), and every
+// configuration that ever decoded coherently ran with that attenuation. `--moe-gain`
+// reimposes it WITHOUT the extra quantization error, which no artifact rewrite can do:
+// rewriting the stored scales also shrinks silu's ARGUMENT, confounding two changes.
+// Applied only on MoE layers — the dense MLP shares this residual add.
+extern "C" __global__ void vaxpy(float* __restrict__ x, const float* __restrict__ y, float g, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] += g * y[i];
+}
+
 // Greedy argmax over `logits[0..n]`, reproducing the host fold in gpu.rs::argmax
 // EXACTLY: best=0, bv=-inf; for i: if logits[i] > bv { bv=logits[i]; best=i }. The
 // combine below is associative + commutative and yields the SAME result set as
@@ -172,6 +184,14 @@ extern "C" int rivoli_vadd(float* x, const float* y, int n) {
     if (n <= 0) return 1001;
     hipGetLastError();
     hipLaunchKernelGGL(vadd, dim3((n + 255) / 256), dim3(256), 0, 0, x, y, n);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+extern "C" int rivoli_vaxpy(float* x, const float* y, float g, int n) {
+    if (n <= 0) return 1001;
+    hipGetLastError();
+    hipLaunchKernelGGL(vaxpy, dim3((n + 255) / 256), dim3(256), 0, 0, x, y, g, n);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
