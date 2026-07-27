@@ -1,12 +1,27 @@
-# int4: why `--mode int4` is unusable, and what to build instead
+# int4: why `--mode int4` was unusable, and the fix
 
-**Status:** investigation closed. The cause is understood and it is a *format* choice, not a
-bug. The fix is group-wise scales, which is standard practice everywhere except here.
+**Status: RESOLVED, 2026-07-27.** The cause was a *format* choice, not a bug — one symmetric
+scale per **6144-weight row**. Replacing it with one scale per **128 weights** fixed it
+outright. The investigation below is preserved because what it *eliminated* is worth as much
+as what it found, and because two of its findings outlive int4 entirely (§1, §9).
 
-`--mode int4` scores **PPL 73.43** against int3-vq's **5.28** on the same corpus, harness and
-session. Hybrid sits at **11.55**. The ranking by perplexity is:
+| mode | before (per-row) | after (group-128) |
+|---|---:|---:|
+| `int4` | 73.43 | **5.120** |
+| `hybrid` | 11.55 | **5.189** |
+| `int3-vq` *(control — never reads `.i4`)* | 5.275434 | **5.275434** |
 
-> **int3-vq (5.28)  >  hybrid (11.55)  >  int4 (73.43)**
+The control reproduced to six decimals, so the `.i4` artifact was the only variable. **int4 is
+now the best-quality mode in the engine, and hybrid dominates int3-vq on both axes** — better
+PPL (5.189 vs 5.275) *and* faster (2.72 vs 2.62 tok/s), which is what hybrid was designed for
+and had never delivered. Cost: `.i4` grows ~6% (slot 18,915,328 → 20,054,016 B), so fewer
+experts are resident and int4's hit rate falls 74.6 → 68.1% — int4 is now the best quality and
+the *slowest*; hybrid is the best overall. See §6 for why group size and not a scale tweak,
+and §10 for the confirming measurement.
+
+The rest of this document describes the **pre-fix** state, in the present tense as written.
+
+> Ranking before the fix: **int3-vq (5.28) > hybrid (11.55) > int4 (73.43)**
 
 Everything below is from one 2026-07-27 device block, one binary, one artifact. Nothing is
 compared across sessions except where a control licenses it, and those controls are named.
@@ -295,3 +310,61 @@ mode should be removed rather than shipped.
 
 > **A pattern probe returning nothing is not proof of absence** — exactly as `kill -0`
 > returning success is not proof of health. Key progress on output *content*.
+
+---
+
+## 10. The fix, and the measurement that confirmed it
+
+**Change.** `quant_i4` now emits one f32 scale per `I4_GROUP = 128` weights along the input
+dim instead of one per output row, and the scale applies *inside* the dot — per group, in both
+`dot_i4_wave` paths (the dword fast path and the scalar tail). `I4_GROUP` is a named constant,
+so 64 (matching `.vq3`) can be swept without touching anything else.
+
+**The discriminator, run before spending the rebuild.** §6 left one question open that a
+365 GB conversion was riding on: did the old `.i4` behave better because `.vq3` carries
+group-of-64 scales, or because `quant_vq` refits its scales by least squares? Those predict
+opposite things about group-wise RTN. `i4_audit --scale-study` scores every candidate against
+f64 fp8 truth (expert 7 `down_proj`, 6144×2048):
+
+| scheme | W relL2 | zeros | gain |
+|---|---:|---:|---:|
+| per-row `amax/7` *(the shipped defect)* | 0.1521 | 20.73% | 1.0012 |
+| LS refit (as `quant_vq`) | 0.1482 | 20.26% | 0.9994 |
+| **GROUP-128 `amax/7`** | **0.1190** | **16.21%** | 1.0133 |
+| per-row best α (oracle) | 0.1097 | 13.62% | 0.9881 |
+
+**The refit buys 2.6%; group-128 buys 21.8%.** Group size was the mechanism. The old set
+inherited its advantage from `.vq3`'s granularity, not from the refit — so group-wise scales
+were the right build, and α tuning was correctly abandoned.
+
+Note the study does *not* cleanly favour group-128 over per-row at α≈0.60 (0.1190 vs 0.1152).
+Weight-space metrics could not decide this, which is consistent with §4: they never predicted
+decode quality here. PPL decided.
+
+**Confirmation** — one session, one binary, `--max-mem 100`, 762 teacher-forced tokens, plus
+512-token free-running:
+
+| mode | PPL | hit % | tok/s | distinct |
+|---|---:|---:|---:|---:|
+| `int4` | **5.120** | 64.40 | 2.01 | 0.279 |
+| `hybrid` | **5.189** | 73.50 | **2.72** | 0.138 |
+| `int3-vq` *(control)* | 5.275434 | 73.60 | 2.62 | 0.465 |
+
+int4's completion went from a four-sentence verbatim loop to correct Rayleigh-scattering
+physics. **And §1 lands one final time: hybrid has the worst distinct-ratio of the three
+(0.138) and the second-best perplexity.** Its repetition is greedy-decode attractor behaviour
+on a healthy model. A distinct-ratio gate would now reject the best config in the engine.
+
+**A provenance gap closed while validating.** `I4Source` gained a `group` field and
+`fp8_to_i4` wrote it, but nothing read it back. The engine indexes `scale[o*ngroups + i/G]`, so
+a set quantised at a different `G` is a differently-*shaped* array — reading it does not fault,
+it yields `rel_l2=NaN`, and the ground-truth oracle then reports "SYSTEMATIC gain error",
+sending the reader after a numerics bug that is really a stale artifact. The engine and the
+test now refuse, naming both group sizes and the remedy. Verified in both directions: refusing
+the per-row artifact, passing the rebuilt one. *A provenance field that records without
+enforcing is the failure it exists to prevent.*
+
+**Still open.** `I4_GROUP = 64` is untested and is what `.vq3` uses — worth one sweep, since it
+costs another ~6% in size and the engine is bandwidth-bound. Asymmetric quantisation (a
+zero-point) is untested; the current scheme is symmetric and uses 15 of 16 codes. Neither was
+needed to close this.
