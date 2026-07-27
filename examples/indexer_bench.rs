@@ -460,6 +460,41 @@ fn m0_host(nts: &[usize], scores: &mut DeviceBuf) {
     }
 }
 
+/// The engine's OWN score array, from a `RIVOLI_DUMP_SCORES` file if one is present
+/// (`(u32 layer, u32 nt, f32[nt])` records, native LE). Tiled or truncated to `n`, which
+/// preserves the value distribution exactly and is only approximate about ordering across
+/// a tile boundary. `None` when no file is given, and the column is then omitted rather
+/// than silently substituted — this is the one column that needs no fixture-matching
+/// argument, so it must never be confused with one that does.
+fn real_scores(n: usize) -> Option<Vec<f32>> {
+    let path = std::env::var("RIVOLI_DUMP_SCORES").ok()?;
+    let b = std::fs::read(path).ok()?;
+    let mut out: Vec<f32> = Vec::new();
+    let mut off = 0usize;
+    while off + 8 <= b.len() && out.len() < n {
+        let nt = u32::from_le_bytes([b[off + 4], b[off + 5], b[off + 6], b[off + 7]]) as usize;
+        off += 8;
+        if off + 4 * nt > b.len() {
+            break;
+        }
+        out.extend(
+            b[off..off + 4 * nt]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+        );
+        off += 4 * nt;
+    }
+    if out.is_empty() {
+        return None;
+    }
+    while out.len() < n {
+        let take = (n - out.len()).min(out.len());
+        out.extend_from_within(..take);
+    }
+    out.truncate(n);
+    Some(out)
+}
+
 /// M0c — device `index_topk` against the host round-trip it replaces, MATCHED.
 ///
 /// Both implementations are timed in the same rig, on the same buffer, on the same two
@@ -488,12 +523,19 @@ fn m0c_topk_matched(nts: &[usize], scores: &mut DeviceBuf) {
     let sp = scores.ptr() as *const f32;
 
     let dense = synth_scores(max_nt);
-    // Tie-heavy AND randomly ordered: 300 non-zeros scattered by a coprime stride, the
-    // rest exactly 0.0. This is the fixture that isolates the tie effect.
-    let mut scattered = vec![0.0f32; max_nt];
-    for j in 0..300 {
-        scattered[(j * 7919) % max_nt] = (300 - j) as f32 * 0.25;
-    }
+    // Tie-heavy AND randomly ordered, built PER nt: an earlier revision generated the
+    // non-zeros across max_nt and then sliced to nt, so at nt < max_nt almost all of them
+    // were sliced away (23 survivors at nt=2456, i.e. 99% zeros) and the fixture did not
+    // share `sorted_sparse`'s tie fraction the way its comment claimed. Generating inside
+    // the sweep keeps the tie structure identical and varies ONLY the order, which is the
+    // whole point of the pair.
+    let scattered_at = |n: usize| {
+        let mut v = vec![0.0f32; n];
+        for j in 0..300.min(n) {
+            v[(j * 7919) % n] = (300 - j) as f32 * 0.25;
+        }
+        v
+    };
     // Tie-heavy AND pre-sorted: the same sparsity with the non-zeros descending from
     // index 0. Kept because it is a TRAP, and the trap is the finding. `topk_into` seeds
     // its workspace with the identity permutation and orders by (score desc, index asc),
@@ -514,14 +556,22 @@ fn m0c_topk_matched(nts: &[usize], scores: &mut DeviceBuf) {
 
     println!("\nM0c — host vs device selection, MATCHED rig and data (µs per full layer):");
     println!(
-        "       nt |  dense (few ties)   |  scattered (ties, random order) |  sorted-sparse (ties, PRE-SORTED)"
+        "       nt |  dense (few ties)   |  scattered (ties, random)       |  sorted-sparse (PRE-SORTED)     |  REAL engine scores"
     );
     println!(
         "          |  host   dev   ratio |  host    dev    ratio           |  host    dev    ratio"
     );
     for &nt in nts {
-        let mut cell = [(0.0f64, 0.0f64); 3];
-        for (j, data) in [&dense, &scattered, &sorted_sparse].iter().enumerate() {
+        let mut cell = [(0.0f64, 0.0f64); 4];
+        let scattered = scattered_at(nt);
+        // The engine's own scores, if a `RIVOLI_DUMP_SCORES` file is present: the only
+        // column that needs no fixture-matching argument at all.
+        let real = real_scores(nt);
+        let mut sets: Vec<&Vec<f32>> = vec![&dense, &scattered, &sorted_sparse];
+        if let Some(r) = real.as_ref() {
+            sets.push(r);
+        }
+        for (j, data) in sets.iter().enumerate() {
             scores
                 .copy_in_at(0, &f32b(&data[..nt]))
                 .expect("seed scores");
@@ -550,8 +600,18 @@ fn m0c_topk_matched(nts: &[usize], scores: &mut DeviceBuf) {
             let host_us = t.elapsed().as_nanos() as f64 / iters as f64 / 1000.0;
             cell[j] = (host_us, dev_us);
         }
+        let real_col = if real.is_some() {
+            format!(
+                " | {:6.1} {:6.1} {:5.2}x",
+                cell[3].0,
+                cell[3].1,
+                cell[3].0 / cell[3].1
+            )
+        } else {
+            String::new()
+        };
         println!(
-            "  {nt:7} | {:6.1} {:5.1} {:5.2}x | {:6.1} {:6.1} {:5.2}x | {:6.1} {:6.1} {:5.2}x",
+            "  {nt:7} | {:6.1} {:5.1} {:5.2}x | {:6.1} {:6.1} {:5.2}x | {:6.1} {:6.1} {:5.2}x{real_col}",
             cell[0].0,
             cell[0].1,
             cell[0].0 / cell[0].1,

@@ -333,9 +333,122 @@ matched table: the kernel recovers **59% of the host cost on dense (≈31–36% 
 and 16–20% on tie-heavy (≈8–12%)**. The 52–60% figure is the size of the *target*, not of
 the win.
 
-**So the kernel is not ready to wire, and the blocking step is one cheap measurement:**
-dump the engine's real score array at a real context and characterise its tie structure.
-Everything above ranges over a factor of four on that one unknown.
+**That blocking measurement has since been taken — see the next section. The answer is
+`dense`, so the kernel's expected value is the ~2.4× column and wiring is unblocked.**
+
+### The engine's actual score distribution — measured, and it refutes the premise
+
+`RIVOLI_DUMP_SCORES` (a `trace`-gated dump of `index_score`'s raw output, added for this),
+2026-07-27: **64 (layer, token) records, all 21 full layers, 131,202 token-scores** at
+nt = 2049–2052. Characterised on its own terms first; the fixture comparison comes after.
+
+*Provenance:* `--features rocm,trace`, GLM-5.2 full artifact, `--attn dsa --mode hybrid
+--cache-policy lru --max-mem 115 -bench 4`, 2432-token prompt, sole tenant. **The records
+are all prefill-phase** — scoring begins at nt = 2049 and the budget exhausted immediately
+after — which is also the reason the dump cannot have perturbed the run's own profile
+numbers: `Profile::default()` resets the buckets after prefill, so nothing was written
+during the measured decode window. That is a structural argument, not an empirical one; do
+not read the trace run's agreement with the earlier non-trace runs (wall 388 vs 391 ms,
+route 157 vs 156) as evidence of non-perturbation, because the instrument was idle by then.
+One prompt is n = 1 on the axis most likely to vary.
+
+| property | measured |
+|---|---|
+| exactly `0.0` | **0 of 131,202 (0.0000%)** |
+| negative | **90.0%** |
+| distinct values / nt | **0.9985 – 1.000**, uniform across layers 0–74 |
+| per-layer heterogeneity | large — layer 1 is **100% non-negative** (median +126), layer 34 is 99.85% negative. The 90% is an aggregate, not a per-layer property |
+| largest tie group | 1–2 entries (0.05–0.1% of the array) |
+| tie group at the k-th boundary | **1 entry, in 0 of 64 records** |
+| ordering | 47.4–53.5% of adjacent pairs descending; ~1000 ascending runs in ~2050 elements |
+| spread | roughly −184 … +145; per-record median **−125.6 … +126.4** |
+
+**The ReLU-sparse premise is refuted on every axis it asserted.** It predicted "a large
+fraction of tokens score exactly 0.0"; the answer is *none*, not *few*. It assumed the
+scores were non-negative ReLU'd sums; 90% are negative. It claimed the k-th boundary lands
+inside a large tie group so the index tiebreak decides the bulk of the selection; the
+boundary tie group is a single entry in every record.
+
+**Why the premise was wrong, stated so it is not re-derived.** `index_score` computes
+`Σ_h w_h·wscale·ReLU(q_h·k_t·dscale)`. The ReLU clips each head's *dot*, not the sum, and
+`w_h` comes from `weights_proj` and is frequently negative — so a clipped head contributes
+`±0.0` while an unclipped one with a negative gate contributes a negative number. For the
+*sum over 32 heads* to be exactly `0.0`, every head must clip simultaneously. That never
+happened once in 131,202 samples. I had reasoned from "the ReLU produces many per-head
+zeros" to "the summed score is often zero", which does not follow.
+
+**Which fixture this implies: `dense`, on the host-side determinants.** On tie fraction
+and presortedness — what drives a comparison sort — the real array is 0.02% ties and ~50%
+presorted; `dense` is ~0% and ~50%; `scattered` and the `sorted-sparse` trap are tie-heavy,
+and the trap is additionally 100% presorted. It does not sit between the fixtures; it is at
+the `dense` end.
+
+**But the fixture argument is no longer the evidence, because the real arrays were measured
+directly.** `scores.bin` holds 64 real arrays, so the matched rig now carries a fourth
+column fed from the engine's own scores — no fixture-matching inference at all:
+
+| nt | dense | REAL engine scores | tiling contamination |
+|---:|---:|---:|---|
+| **2456** | 68.8 → 32.8 (2.10×) | **65.5 → 32.6 — 2.01×** | 16.5% duplicated |
+| 4096 | 126.0 → 30.8 (4.10×) | 70.3 → 32.4 (2.17×) | 50% — not trustworthy |
+| 5209 | 118.4 → 38.3 (3.09×) | 77.5 → 39.0 (1.99×) | 61% — not trustworthy |
+| 32768 | 407.5 → 155.4 (2.62×) | 136.7 → 159.3 (0.86×) | **94% — measures tiling** |
+
+**Read only the 2456 row.** The dumped arrays are nt ≈ 2050, so for larger `nt` the rig
+tiles them, and tiling duplicates every value — manufacturing exactly the ties the whole
+analysis is sensitive to. At 32768 the array is 16× tiled, every value repeated 16 times,
+which is why that row resembles the tie-heavy `scattered` column rather than the engine.
+That is a fixture artifact of the same family as the `sorted-sparse` trap, caught before
+publication this time rather than after.
+
+**So: 2.01× on real engine data at nt=2456, measured.** The `dense` fixture predicted 2.10×
+at the same point, which is why the fixture identification was right — but the number to
+quote is 2.0×, not the ~2.4× an earlier revision inferred. Note also the host column moved
+between runs (86.6 → 68.8 µs at 2456 for the same fixture), so **these ratios are good to
+one significant figure**, not two.
+
+**A claim from an earlier revision, now withdrawn.** It said the real array's pass-1 radix
+histogram was "slightly better for the kernel than dense" (14 of 256 bins, 43% maximum).
+That statistic was computed from record 0 and is inverted for the other 63: across all 64
+records the mean pass-1 maximum bin is ~85%, and 34 of 64 put ≥95% of the array in a single
+bin. The real array is *more* pass-1 contended than dense, not less. The direct measurement
+above supersedes the argument entirely, which is the better reason to stop making it.
+
+**And this settles an open question by elimination.** This document has carried "whether
+the host round-trip's 2× in-situ penalty is distribution or cache contention" as unresolved.
+The real distribution is structurally `dense`, so the in-engine/microbench gap is **not**
+distribution. But name the residual honestly: it is **2.5× at nt=2456 and 3.3× at 5209** —
+it *grows with context*, which is itself unexplained. "In-situ cost" is a label for what
+the microbench does not reproduce, **not a diagnosed mechanism** (HYPOTHESIS, per
+docs/PERF.md, which warns that a bucket gives a total and not a decomposition).
+That matters for the wiring estimate in the favourable direction: the device kernel does
+not run on the CPU, so it should not pay that penalty, and the in-engine win may exceed the
+2.4× the microbench shows.
+
+**Limitation, and what the data says about it.** The dump captured the *first* 64 scoring
+records, at nt ≈ 2050 — just past `index_topk`, where scoring begins during prefill — while
+the refuted premise was specifically about *long* context. The obvious worry is that a token
+32k positions back is less similar to the query than one 2k back, so clipping might grow
+with distance and the ties might appear at scale.
+
+The same data speaks to that, because distance is a within-record variable. Bucketing every
+record by position decile (decile 0 = oldest tokens, 9 = most recent):
+
+| decile | 0 | 3 | 6 | 9 |
+|---|---:|---:|---:|---:|
+| mean score | −59.8 | −58.4 | −53.6 | −33.4 |
+| distinct / n | 0.9999 | 0.9997 | 0.9998 | 0.9998 |
+| scores with \|x\| < 1e−6 | 0 | 0 | 0 | 0 |
+
+**The trend runs the wrong way for the worry.** Older tokens do not drift toward zero; they
+drift *more negative*, because unclipped heads with negative gates dominate further from the
+query. Distinctness is flat to four decimals across the whole span and there is not a single
+near-zero score in any decile. Extrapolating that trend predicts *fewer* ties at long
+context, not more.
+
+This is evidence, not proof — it is a 2050-token span standing in for a 32k one, and a
+monotone trend can still turn. Dumping later in a run is a one-line change to the record
+budget and costs one prefill, and is worth doing before anyone relies on the 32k rows.
 
 ### M1 — the windows
 
@@ -476,10 +589,10 @@ a GPU∥NPU one.**
 
 - **Device top-k (NO NPU). KERNEL BUILT AND MEASURED; NOT WIRED, AND BLOCKED ON A
   MEASUREMENT.** `index_topk` (kernels/indexer.hip) computes the selection exactly and its
-  correctness gate passes. Its *value* is unresolved: 2.4–4.1× faster than the host on
-  dense data, 1.13–1.25× on tie-heavy, 0.89× at tie-heavy 32k — and which of those the
-  engine produces has never been measured. See "The device top-k, measured" above. Do not
-  wire it until the engine's score distribution is characterised. When wiring does happen,
+  correctness gate passes. Its value is **~2.4× at the measured contexts**: the engine's
+  score distribution has now been dumped and is structurally `dense` (0 exact zeros in
+  131k samples, ~100% distinct, randomly ordered), so the dense column applies. **Wiring
+  is unblocked.** When wiring happens,
   note that `idx.last_nr` becomes an implicit `min(topk, nt)` invariant rather than an
   observed `rows.len()`, that the mid-layer `device_sync` can then be deleted outright,
   and that the sync deletion must be costed SEPARATELY from the top-k in the A/B or
@@ -539,3 +652,104 @@ indexer disappear from the GPU timeline" project. What the measurements change i
 the indexer is not on the GPU timeline at all — it is a CPU top-k the GPU is blocked behind
 — and that fixing *that*, with no NPU involved, is both the largest single win available and
 the precondition for the exact overlap the plan wanted.
+
+---
+
+## Successor brief — picking this up at the wiring seam
+
+Everything below the wiring step is unbuilt. This section is written for whoever does it.
+
+### Read in this order
+
+1. **This document's "MEASURED" sections**, for what is established and what is not.
+2. **`benchmarks.md`, "DSA indexer round"** and the two sections after it — the rows, the
+   methodology, and three recorded measurement traps.
+3. **`src/gpu.rs::dsa_select_layer`** — the function being changed, ~90 lines.
+4. **`kernels/indexer.hip`, the `index_topk` block** — the kernel that replaces its host half.
+5. **`docs/PERF.md`'s opening section** on how to write a performance claim here. It is the
+   house standard and this work violated it twice before complying.
+
+### State
+
+| item | status |
+|---|---|
+| `index_topk` kernel + launcher | committed, correctness gate **passes** |
+| `tests/kernel.rs::index_topk_matches_host_selection` | 10 cases, sentinel tail, **passes** |
+| Cost vs the host, matched rig | measured — **~2.4×** on the engine's real shape |
+| Engine score distribution | measured at nt≈2050: `dense`-like, 0 exact zeros in 131k |
+| Wiring into `dsa_select_layer` | **NOT DONE — this is the next step** |
+| `device_sync` deletion | not done; see below, cost it separately |
+| M1a / anything NPU | untouched, and M1a is still not implementable |
+
+### The wiring, and its two invariants
+
+Replace the D2H + `topk_into` + upload in `dsa_select_layer` with one `launch_index_topk`
+onto `rows_buf`. Two things change that are not obvious from the diff:
+
+1. **`idx.last_nr` becomes an implicit invariant.** Today it is `idx.rows.len()`, an
+   *observed* count. After wiring, nothing reads the rows back, so it must be
+   `min(topk, nt)` by construction. That is sound — the path only runs when `nt > topk`, so
+   it is exactly `topk` — but it is a state invariant with no test. Add one, or the first
+   change to the threshold logic breaks the attend's row count silently.
+2. **The mid-layer `device_sync` has TWO consumers, not one.** It makes the score D2H safe
+   *and* it retires the `idx_ev_start`/`idx_ev_end` pair that `HipEvent::elapsed_ms` reads
+   into `prof.idx_gpu_ns` — buckets that are not trace-gated and that feed the
+   `indexer/tok` telemetry line the A/B below depends on. Deleting it "outright" removes
+   the instrument the third arm needs. Either drop the per-layer GPU-span bucket or replace
+   the sync with an event query that does not stall the stream. (MISA takes a separate
+   `device_sync` for its head-route D2H; that one is untouched by this work.) With the selection device-resident, the attend consumes `rows_buf` on the same
+   stream and program order is the whole requirement. This is a *second, separate* win —
+   one sync per full layer per token, 21/token — and it must be **costed separately from
+   the top-k in the A/B**. If both land in one number nobody will ever know which paid.
+   Suggested: three arms, host+sync (baseline), device+sync, device+no-sync.
+
+### Which outcomes at wiring are findings, not nuisances
+
+- **Output tokens change.** That is a **bug**, not a tolerance. The kernel is bit-identical
+  to the host selection by test; if the engine's tokens move, the wiring is wrong, the
+  test's case list has a hole, or — the third possibility, excluded by neither — a NaN
+  reached the score array, where the kernel's contract and `topk_into`'s
+  (`partial_cmp(..).unwrap_or(Equal)`, not a total order) legitimately differ. No NaN or
+  inf appears in the 131,202 dumped scores, so this is not a live hazard, but it is the
+  explanation to check third rather than not at all. Do not rationalise it as numerical noise — the selection
+  is integer indices.
+- **`route` drops by much less than ~4 ms/token.** A **finding**. It would mean the host
+  round-trip was not on the critical path the way the buckets imply, and the `idx_host_ns`
+  bucket needs re-reading.
+- **`route` drops by much more.** Also a finding, and the likelier surprise: the `device_sync`
+  deletion may be worth more than the top-k. That is why they are costed separately.
+- **The kernel is slower in-engine than 44 µs/layer.** Expected to some degree — the
+  microbench times 60 launches behind one sync and the engine syncs per layer — but a large
+  gap would indicate the same launch-bubble effect that made the indexer's GPU span 27%
+  above its per-kernel sum, and would be worth attributing rather than absorbing.
+- **Degenerate output.** Always a severe bug here, never a benchmark confound.
+
+### The measurement lesson this work kept relearning
+
+Three separate defects in this branch were the same shape: **the case trusted most was the
+one never instrumented.**
+
+- A "ReLU-sparse" fixture was introduced *because* it was believed most realistic. It was
+  used to justify the tiebreak's importance, named in the test as the discriminating case,
+  and it was simultaneously (a) the case that masked over-selection, because when the answer
+  is an index prefix a truncated readback matches anyway, and (b) the case whose *timing*
+  was an artifact, because its scores descend from index 0 and `topk_into` seeds the
+  identity permutation, so a comparison sort was handed an already-sorted slice — its best
+  case, and one no device kernel can exploit. It produced a false 1.6–1.9× regression.
+- Then the distribution dump showed the fixture was not realistic at all: the engine
+  produces **zero** exact zeros, 90% negative scores, and ~100% distinct values.
+
+Three operational rules, in decreasing generality:
+
+1. **Instrument the case you trust most first.** Confidence concentrates exactly where you
+   have not looked, and that is where a blind spot costs the most.
+2. **When timing a comparison-based algorithm, randomise input order** — otherwise you are
+   measuring your generator. Hold the structure you care about fixed and vary only order,
+   as the `scattered` vs `sorted-sparse` pair does.
+3. **After a retraction, grep the whole document for the retracted number.** A corrected
+   section three pages from an uncorrected headline silently re-publishes the error; this
+   document did exactly that in one commit.
+
+And one that is not about measurement: **a passing control proves the rig measures
+something, never that it measures the thing you named it after.** Every validity control
+here passed while window 1 was wrong by 13×.

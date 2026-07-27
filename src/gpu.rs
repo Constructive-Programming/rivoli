@@ -264,6 +264,11 @@ pub struct GpuEngine<'a> {
     /// DIAGNOSTIC (`--checksum-x`, `trace` only): hash the residual stream each layer.
     #[cfg(feature = "trace")]
     checksum_x: bool,
+    /// `RIVOLI_DUMP_SCORES=<path>`: raw `index_score` output, for characterising the
+    /// distribution the host top-k actually faces (docs/NPU.md). `(file, calls seen,
+    /// records left)` — bounded so a long run cannot fill the disk.
+    #[cfg(feature = "trace")]
+    score_dump: Option<(std::fs::File, u64, usize)>,
     #[cfg(feature = "trace")]
     ck_buf: Vec<u8>,
 }
@@ -403,6 +408,10 @@ impl<'a> GpuEngine<'a> {
             checksum_x: false,
             #[cfg(feature = "trace")]
             ck_buf: Vec::new(),
+            #[cfg(feature = "trace")]
+            score_dump: std::env::var("RIVOLI_DUMP_SCORES")
+                .ok()
+                .and_then(|p| std::fs::File::create(&p).map(|f| (f, 0, 64)).ok()),
             heartbeat: None,
             pin,
         })
@@ -617,6 +626,10 @@ impl<'a> GpuEngine<'a> {
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
         );
+        // DIAGNOSTIC (`RIVOLI_DUMP_SCORES`): the raw score array, before any selection.
+        // Written here because this is the only point where the engine's real scores
+        // exist on the host; the analysis that consumes it must characterise them on
+        // their own terms, not by matching them to a synthetic fixture.
         topk_into(&idx.scores_f, topk, &mut idx.sel);
         idx.sel.sort_unstable(); // ascending token order for the gather
         idx.rows.clear();
@@ -625,6 +638,30 @@ impl<'a> GpuEngine<'a> {
         if bracket {
             self.prof.idx_host_ns += t_idx.elapsed().as_nanos();
         }
+        // AFTER the `idx_host_ns` clock closes, deliberately: an ~8 KB write inside it
+        // would inflate the one bucket the offload analysis attributes. Harmless while
+        // the budget exhausts during prefill (the buckets reset before decode), but the
+        // budget is meant to be raised — so the write must not be in the window at all.
+        #[cfg(feature = "trace")]
+        if let Some((w, seen, left)) = self.score_dump.as_mut() {
+            // STRIDE is coprime with the 21 full layers per token (211 = 10*21 + 1), so
+            // consecutive samples advance one layer AND ~10 tokens: 64 records cover all
+            // 21 layers and a ~630-token span of context. A prefix dump of the same size
+            // would cover 3 tokens at one context, which is the wrong shape for the
+            // question this exists to answer — whether the distribution moves with nt.
+            const STRIDE: u64 = 211;
+            if *left > 0 && *seen % STRIDE == 0 {
+                use std::io::Write;
+                let _ = w.write_all(&(l as u32).to_le_bytes());
+                let _ = w.write_all(&(nt as u32).to_le_bytes());
+                // Record layout, so the file is readable without this source:
+                // repeated `(u32 layer, u32 nt, f32[nt])`, native LE.
+                let _ = w.write_all(as_le_bytes(&idx.scores_f));
+                *left -= 1;
+            }
+            *seen += 1;
+        }
+
         idx.last_dense = false;
         idx.last_nr = idx.rows.len();
         Ok((self.rows_buf.ptr() as *const u32, idx.rows.len()))
