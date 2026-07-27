@@ -32,6 +32,10 @@ many fit in the pool → hit rate), and **stream cost** (bytes per miss).
 - **Best when:** the pool is residency/bandwidth-bound (small budget, big working set).
 
 ### `int4` — colibri 4-bit, per-row scale
+> **UNUSABLE on the current artifact (2026-07-27): PPL 73.43 vs int3-vq's 5.28.** The cause is
+> the format itself — ONE scale per 6144-weight row, where `.vq3` carries one per 64. Not a
+> bug, and not fixable by tuning. See `docs/INT4.md`. The size/compute tradeoffs below still
+> hold and are why the mode exists, but do not choose it for quality.
 - **Size:** ~18.9 MB/expert (~24% bigger) — **fewer slots fit** → lower hit rate →
   **more misses** → more fetch + more host-gated compute bubbles.
 - **Compute:** sequential nibble decode, no gather. **~1.8× faster than int3-vq**
@@ -42,6 +46,8 @@ many fit in the pool → hit rate), and **stream cost** (bytes per miss).
   usually **loses** — the residency hit outweighs the compute win.
 
 ### `hybrid` — int4 hot, int3-vq cold *(default)*
+> **Measured 2026-07-27: PPL 11.55** — between int3-vq (5.28) and int4 (73.43), and much
+> closer to int3-vq because its cold slab is group-64 `.vq3`. See `docs/INT4.md`.
 Two physical slabs. The cache policy routes each expert to one:
 - **HOT slab = int4** — the *frequently reused* experts. They get int4's fast compute
   **and** stay resident (no fetch, no bubbles) — the one place int4's speed actually

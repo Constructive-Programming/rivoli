@@ -328,6 +328,32 @@ pub fn matvec_vq(
     }
 }
 
+/// Decode one VQ projection to a DENSE row-major `W[o_dim, i_dim]` — the inverse of
+/// [`quant_vq`], and the SINGLE VQ reader: `bin/vq3_to_i4` re-quantizes what this
+/// returns, and any audit that reproduces that chain must decode identically or its
+/// "old set" baseline describes a converter that never existed. (The same rule
+/// [`write_i4_proj`] states for the `.i4` writer.)
+///
+/// Materializes `o_dim·i_dim` f32 — offline use only; the decode path is
+/// [`matvec_vq`], which never builds the dense matrix.
+pub fn vq_decode_proj(p: &VqProj, codebook: &[f32]) -> Vec<f32> {
+    let (o_dim, i_dim) = (p.o_dim, p.i_dim);
+    let (rb, ng, nsub) = (vq_row_bytes(i_dim), vq_groups(i_dim), i_dim / VQ_DIM);
+    let mut w = vec![0f32; o_dim * i_dim];
+    for o in 0..o_dim {
+        let ir = &p.indices[o * rb..(o + 1) * rb];
+        for k in 0..nsub {
+            let g = (o * ng + (k * VQ_DIM) / VQ_GROUP) * 2;
+            let s = bf16_to_f32(u16::from_le_bytes([p.scales[g], p.scales[g + 1]]));
+            let c = &codebook[get_idx(ir, k) * VQ_DIM..][..VQ_DIM];
+            for (d, &cw) in c.iter().enumerate() {
+                w[o * i_dim + k * VQ_DIM + d] = s * cw;
+            }
+        }
+    }
+    w
+}
+
 // ── int4 (colibri layout): the "warm expert" format ─────────────────────────
 // Per-row symmetric int4: `W[o,i] = (nibble(o,i) − 8) · scale[o]`. `packed` = o_dim
 // rows of `i4_row_bytes(i_dim)` bytes (LOW nibble = col 2j, HIGH = col 2j+1); one
@@ -400,6 +426,28 @@ pub fn quant_i4(w: &[f32], o_dim: usize, i_dim: usize) -> (Vec<u8>, Vec<f32>) {
     (packed, scale)
 }
 
+/// Reconstruct the dense `W[o_dim, i_dim]` a `(packed, scale)` int4 pair represents —
+/// the inverse of [`quant_i4`], and the SINGLE int4 reader for offline use.
+///
+/// Deliberately spells out the nibble convention rather than calling [`matvec_i4`]
+/// with basis vectors: an audit that reconstructs weights through the very routine it
+/// is auditing cannot detect a decode bug. The round trip `dequant_i4(quant_i4(w))` is
+/// unit-tested below, which is what keeps the two spellings honest.
+pub fn dequant_i4(packed: &[u8], scale: &[f32], o_dim: usize, i_dim: usize) -> Vec<f32> {
+    debug_assert_eq!(scale.len(), o_dim);
+    let rb = i4_row_bytes(i_dim);
+    let mut w = vec![0f32; o_dim * i_dim];
+    for o in 0..o_dim {
+        let row = &packed[o * rb..(o + 1) * rb];
+        for i in 0..i_dim {
+            let b = row[i >> 1];
+            let n = (if i & 1 == 0 { b & 0x0F } else { b >> 4 }) as i32 - 8;
+            w[o * i_dim + i] = n as f32 * scale[o];
+        }
+    }
+    w
+}
+
 /// On-disk bytes of one int4 projection `W[o_dim, i_dim]`: `o_dim` packed rows then
 /// `o_dim` f32 per-row scales, back-to-back (one projection = one contiguous span).
 pub fn i4_proj_bytes(o_dim: usize, i_dim: usize) -> usize {
@@ -453,9 +501,74 @@ pub fn i4_slot_offsets(hidden: usize, moe_inter: usize) -> [usize; 6] {
     [gp, gs, up, us, dp, ds]
 }
 
+/// Write projection `k`'s packed nibbles + per-row f32 scales into an expert block at
+/// the offsets [`i4_slot_offsets`] defines. The SINGLE writer of the `.i4` slot layout
+/// — both converters (`bin/fp8_to_i4`, `bin/vq3_to_i4`) go through it, so they cannot
+/// disagree on where a projection's bytes land (the same rule `vq_slot_offsets` states
+/// for `.vq3`).
+pub fn write_i4_proj(slot: &mut [u8], off: &[usize; 6], k: usize, packed: &[u8], scale: &[f32]) {
+    let po = off[k * 2];
+    slot[po..po + packed.len()].copy_from_slice(packed);
+    for (s, out) in scale
+        .iter()
+        .zip(slot[off[k * 2 + 1]..].chunks_exact_mut(4))
+    {
+        out.copy_from_slice(&s.to_le_bytes());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `dequant_i4` is a SECOND spelling of the nibble convention `matvec_i4` and
+    /// `quant_i4` carry (deliberately — an audit that reconstructs weights through the
+    /// routine it audits cannot see a decode bug). This is what keeps the spellings
+    /// honest: the round trip must land inside one quantiser step, and `matvec_i4` on
+    /// the packed bytes must equal a plain dot against the reconstruction.
+    ///
+    /// The step bound is the assertion that matters. `amax/7` with round-to-nearest
+    /// puts every weight within `s/2` of a grid point, so `max|w - ŵ| ≤ s/2` is forced
+    /// — an implementation that dropped the −8 zero point, swapped the nibble halves,
+    /// or applied the scale per column would blow past it, while an error of exactly
+    /// zero would mean no rounding happened at all and the test is measuring nothing.
+    #[test]
+    fn dequant_i4_inverts_quant_i4_within_one_step() {
+        let (o_dim, i_dim) = (5usize, 16usize); // odd o_dim, i_dim not a multiple of 8
+        let mut st = 0x1234_5678u64;
+        let mut rnd = || {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((st >> 32) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        // Row `r` scaled by 10^r so a per-row scale is genuinely exercised, plus one
+        // deliberate outlier per row (the value that SETS amax).
+        let mut w: Vec<f32> = (0..o_dim * i_dim).map(|i| rnd() * 10f32.powi((i / i_dim) as i32)).collect();
+        for o in 0..o_dim {
+            w[o * i_dim + o] = 9.0 * 10f32.powi(o as i32);
+        }
+        let (packed, scale) = quant_i4(&w, o_dim, i_dim);
+        let back = dequant_i4(&packed, &scale, o_dim, i_dim);
+        for o in 0..o_dim {
+            let s = scale[o];
+            let err = (0..i_dim)
+                .map(|i| (w[o * i_dim + i] - back[o * i_dim + i]).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                err <= s * 0.5 + 1e-6,
+                "row {o}: max round-trip error {err:.6e} exceeds half a step ({:.6e})",
+                s * 0.5
+            );
+            assert!(err > 0.0, "row {o}: zero error means no rounding happened");
+        }
+        // The GEMV oracle and the dense reconstruction must agree on the same bytes.
+        let x: Vec<f32> = (0..i_dim).map(|_| rnd()).collect();
+        let mut y = vec![0f32; o_dim];
+        matvec_i4(&mut y, &x, &packed, &scale, o_dim, i_dim);
+        for (o, &yo) in y.iter().enumerate() {
+            let want: f32 = (0..i_dim).map(|i| back[o * i_dim + i] * x[i]).sum();
+            assert!((yo - want).abs() <= 1e-4 * want.abs().max(1.0), "row {o}: {yo} != {want}");
+        }
+    }
 
     #[test]
     fn i4_slot_offsets_are_contiguous_and_aligned() {

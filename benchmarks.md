@@ -9,11 +9,19 @@ AMD Strix Halo gfx1151. Matrix: `--mode {int3-vq,int4,hybrid}` × `--cache-polic
 `--attn dense`, `--max-mem 115`. Only `--mode` and `--cache-policy` vary.
 Binary: release + `--features rocm`. GPU sole-tenant (k3s stopped).
 `.i4` experts are the **vq3-derived** set (`vq3_to_i4`); see "int4 provenance" below.
+**STALE as of 2026-07-27:** the `.i4` set has since been rebuilt from fp8 (`fp8_to_i4`), and
+`--mode int4` now measures **PPL 73.43 vs int3-vq's 5.28**. Every int4 and hybrid row below
+was produced with the *old* set and does not describe the current artifact — see `docs/INT4.md`.
 
 ## Results — all coherent, no crashes
 
 Output quality is gated first (degenerate greedy output = a severe bug, disqualified
 from ranking) via the distinct-token ratio of the completion. Every cell passed.
+**Do not rank on this metric.** Measured 2026-07-27: across a branch-gain sweep PPL tripled
+(73 → 216) while distinct-ratio doubled (0.126 → 0.324) — monotone in OPPOSITE directions.
+It detects repetition, one failure mode among many, and repetition is suppressible by changes
+that damage the model. Rank on teacher-forced PPL; use this only to flag a run unreadable.
+See `docs/INT4.md` §1.
 
 | mode | policy | tok/s | hit % | distinct | output |
 |---|---|---:|---:|---:|---|
@@ -163,6 +171,13 @@ slots). Fix: each policy keeps a per-batch `pinned` set (`begin_batch` clears it
 All three arc cells and int4/lru now run clean (above).
 
 ### int4 provenance — MEASURED, and it inverts hybrid's stated premise
+> **SUPERSEDED 2026-07-27 — see `docs/INT4.md`.** Two claims below are now measured false:
+> that `.i4` "cannot be better than the vq3 it was derived from, by construction", and that the
+> deficit is "the arithmetic of double quantization". The set was rebuilt from fp8 and is
+> **strictly more accurate** — and **8× worse end to end** (PPL 73.43 vs 5.28). The real cause
+> is per-row scaling (one scale per 6144 weights). The gs64/`pack_i4` recommendation at the end
+> of this section turns out to be **right for the wrong reason**, and `docs/INT4.md` re-endorses
+> it on the correct one.
 
 These int4/hybrid numbers use `.i4` re-derived from **vq3** (itself a lossy 3-bit
 quantization). `bin/vq3_to_i4` does this deliberately: colibri's own int4 was a mismatched
@@ -199,6 +214,114 @@ vq3 and restore hybrid's premise. Recommended source:
 `vq3_to_i4` job** — `pack_i4` imports a colibri container directly, which is the whole
 point, since the defect that deprecated it was per-row scaling and gs64 removes it.
 Until then, `--mode int4` and `--mode hybrid` quality numbers are bounded above by vq3.
+
+### `quant_i4`'s `amax/7` is loaded ~1.8× too wide — and that, not provenance, is int4's deficit
+> **SUPERSEDED 2026-07-27 — see `docs/INT4.md`.** The measurements below stand; the
+> *recommendation* does not. Tuning α is tuning a constant inside a per-row scheme that is far
+> coarser than any current practice (group-wise at 32–128 is standard). **Do not implement α.**
+> The end-to-end test this section called for was run: `--mode int4` measures PPL 73.43 against
+> int3-vq's 5.28, and a branch-gain sweep falsified the attenuation hypothesis outright.
+
+The `.i4` set was rebuilt straight from fp8 (`bin/fp8_to_i4`, chain `fp8->int4`), removing
+the second quantization stage. The weights got measurably closer to ground truth **and
+decode quality got worse**, which is the shape of a bug that better weights unmask. It is
+not one. `bin/i4_audit` measures the whole path against the ORIGINAL fp8 checkpoint in
+f64 — never against `matvec_i4`, so no convention the producer and consumer share can
+cancel — and every hypothesis that would have made it a defect is refuted:
+
+| check | result |
+|---|---|
+| on-disk bytes == `quant_i4(dequant_fp8(ckpt))` | **bit-exact**, routed and shared, all 3 projections (now `tests/artifact.rs`) |
+| all 197,376,000 per-row scales in the set | 0 non-finite, 0 zero, 0 negative, 0 `amax==0` dead rows; range 2.35e-5 … 4.51e-1 |
+| new vs old `.i4` vs fp8 truth, whole row | rel-L2 **0.205 vs 0.250** — new is strictly better |
+| … restricted to the BULK (`\|w\| ≤ p99`), same positions | **0.215 vs 0.261** — new is better *there too* |
+| … restricted to the TAIL | **0.065 vs 0.093** — and there |
+| per-row `amax/median` (fp8 vs vq3-decoded rows) | 7.2 vs 6.8 — the fp8 step is **6.3% coarser**, as predicted |
+
+So the "fp8 keeps outliers, coarsens the step, wrecks the bulk" mechanism is **real in its
+premise and wrong in its conclusion**: the coarser step costs ~6%, and dropping a whole
+quantization stage buys far more. The errors add in quadrature and close exactly —
+`sqrt(0.250² − 0.159²) = 0.193` against `0.205 / 1.063 = 0.193`, agreement 0.2%, leaving
+no unexplained residual for a defect to hide in.
+
+**The one systematic difference is GAIN.** `quant_vq` refits its scale by least squares,
+so it is MMSE-like and shrinks: gain `= 1 − relL2²` (measured 0.9766 vs predicted 0.9754).
+`quant_i4` is plain round-to-nearest and is unbiased (gain 1.0000). The old `.i4`
+inherited vq3's shrink; compounded over gate‖up‖down and silu that is **~9% on the whole
+expert chain** (0.921 vs 1.007). Every configuration that ever decoded coherently ran a
+~9%-attenuated MoE branch; the new set is the first at full gain. That is a real change in
+the model, and it is the *only* one — but it is a property of the quantizers, not a bug.
+
+**The actual defect is the loading factor, and the fix is one constant.** `s = amax/7`
+puts the quantizer's overload point at ~4.6σ; the MSE optimum for a 15-level uniform
+quantizer on Gaussian-ish data is ~2.7σ. Sweeping `s = α·amax/7` against fp8 truth over
+27 cells (layers 3/40/77 × experts 0/128/shared × 3 projections):
+
+| α | 1.00 (shipped) | 0.80 | 0.70 | **0.60** | 0.50 | vq3 |
+|---|---:|---:|---:|---:|---:|---:|
+| rel-L2 (L3 e0 gate) | 0.2054 | 0.1648 | 0.1461 | **0.1314** | 0.1304 | 0.1589 |
+| gain | 1.0008 | 0.9989 | 0.9971 | **0.9907** | 0.9761 | 0.9766 |
+
+The optimum sits at **α = 0.55–0.65 in all 27 cells** (gate/up 0.55–0.60, down 0.65), and
+a per-row search buys only ~4% over a single global constant — so no percentile, no sort,
+no tunable. At α = 0.60 int4 beats vq3 by **17–28% in rel-L2 on 24 of 27 cells** (the three
+weak ones are the shared expert of the late layers, where it merely ties), and the
+output-space error `y = W·x` moves the same way, so this is not a weight-space artifact.
+`quant_i4` already clamps to `[0,15]`, so a smaller `s` saturates correctly with no other
+change.
+
+**This inverts the recommendation above.** int4 is not bounded above by vq3 because of
+double quantization — it was bounded above by an absmax scale set 1.8× too wide, and the
+`fp8->int4` set already removed the other half of the problem. Importing a gs64 container
+is no longer the only route. Not yet implemented: the measurement is the deliverable, and
+a quality run must confirm it before 365 GB is rewritten.
+
+**Chain-level accuracy is x-draw noise; chain-level GAIN is not.** Scored through the
+full `down(silu(gate·x) ⊙ up·x)` chain on L3 experts 0/7/shared (`bin/i4_audit`, the GPU
+test's seed), new vs old `.i4` rel-L2 is 0.295/0.256/0.242 vs 0.290/0.305/0.296 — the sign
+flips with the expert, i.e. within draw noise. The gains over the same cells are
+**1.001/1.066/1.006 vs 0.894/0.949/0.902**, consistent in sign and size. So from the
+model's point of view the reliable thing that changed when the `.i4` set was rebuilt is
+the ~9% attenuation going away, not the accuracy. Weight-space rel-L2 (0.205 vs 0.250)
+stays the trustworthy accuracy number; the chain statistic is too noisy to rank on.
+
+### Pre-flight for the attenuation arm: specified correctly, but 0.9766 is not the knob value
+
+Before booking device time to test whether the model needs an attenuated MoE branch, the
+arm has to be shown to produce the attenuation it claims. `bin/i4_audit` scores the
+shipped nibbles with every stored per-row scale multiplied by `VQ_GAIN = 0.9766` —
+vq3's shrink without vq3's error — through the full expert chain, 9 cells (layers
+3/40/77 × experts 0/7/shared):
+
+| | branch factor vs the unattenuated new `.i4` | sd | range |
+|---|---:|---:|---|
+| arm (stored scale ×0.9766) | **0.9282** | 0.0010 | 0.9271–0.9297 |
+| the old `fp8→vq3→int4` set | **0.9124** | 0.0341 | 0.8391–0.9483 |
+
+**The arm is well specified and is *cleaner* than what it mimics.** Its effect is uniform
+to ±0.1% across layers and across routed vs shared experts, which is what an arm should
+be. The old set's attenuation is the same size but scatters ±3.4%, because its extra
+quantization error also passes through `silu` and contributes apparent attenuation that
+varies per expert. So the knob isolates attenuation; it does not reproduce the old set's
+per-expert texture, and if what the model needs is expert-DEPENDENT attenuation the knob
+cannot show it.
+
+**The correction that matters: the per-projection constant is not the branch constant.**
+0.9766 per projection compounds to **0.9282** at the branch output — `0.9766³ = 0.9314`,
+and `silu` compression takes off another 0.35%. Setting a branch-level `--moe-gain` to
+0.9766 would under-attenuate by 5% and land outside the old set's central value.
+A branch-gain sweep must be specified in branch units: **1.00 / 0.96 / 0.93 / 0.90 /
+0.86**, where 0.93 is the faithful equivalent of the artifact rewrite and 0.91 is the old
+set's centre.
+
+**Two verification gaps this closed.** `moe_i4_real_data_matches_cpu` compares our kernel
+to our own `matvec_i4`, so a convention both share is invisible to it; and no test asserted
+what the bytes MEAN. `tests/artifact.rs::i4_bytes_are_what_the_checkpoint_quantizes_to` is
+now the exact gate (bit identity, CPU-only, provenance-checked), and
+`tests/kernel.rs::moe_i4_real_data_vs_fp8_ground_truth` is the coarse independent one.
+The latter is *deliberately* coarse — two aggregate statistics over 6144 outputs cannot see
+corruption confined to a few percent of rows, which is what the sibling test's max-abs is
+for. Its doc says so rather than claiming a resolution it does not have.
 
 ---
 

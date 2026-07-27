@@ -845,6 +845,56 @@ fn moe_i4_matches_reference() {
     assert_close(&want, &f32v(&obuf.copy_out().expect("out")), "moe_i4");
 }
 
+/// Run ONE int4 expert block through the real GPU path — `moe_gateup_i4` →
+/// `moe_down_i4` → `moe_reduce`, weight 1.0 — and return `down(silu(gate·x) ⊙ up·x)`.
+/// `blk` is an expert's on-disk bytes; `off` its `i4_slot_offsets`. Shared by the two
+/// real-data tests so they exercise byte-for-byte the same launch, and a change to the
+/// descriptor layout cannot be fixed in one test and left stale in the other.
+fn gpu_i4_expert(blk: &[u8], off: &[usize; 6], x: &[f32], hidden: usize, inter: usize) -> Vec<f32> {
+    let slot = dev(blk);
+    let base = slot.ptr();
+    // SAFETY: every offset lies within `blk`, which `slot` holds device-resident.
+    let desc = ExpertDesc {
+        gate_indices: unsafe { base.add(off[0]) },
+        gate_scales: unsafe { base.add(off[1]) } as *const u16,
+        up_indices: unsafe { base.add(off[2]) },
+        up_scales: unsafe { base.add(off[3]) } as *const u16,
+        down_indices: unsafe { base.add(off[4]) },
+        down_scales: unsafe { base.add(off[5]) } as *const u16,
+    };
+    let descb = dev(unsafe {
+        std::slice::from_raw_parts(
+            (&desc as *const ExpertDesc) as *const u8,
+            std::mem::size_of::<ExpertDesc>(),
+        )
+    });
+    let (xb, wb) = (dev(&f32b(x)), dev(&f32b(&[1.0f32])));
+    let mut hbuf = dev(&vec![0u8; inter * 4]);
+    let mut pbuf = dev(&vec![0u8; hidden * 4]);
+    let mut obuf = dev(&vec![0u8; hidden * 4]);
+    let stream = HipStream::new().expect("stream");
+    // SAFETY: all buffers are device-resident and sized for these dims; the stream is live.
+    unsafe {
+        launch_moe_expert_range_i4(
+            xb.ptr() as *const f32,
+            hidden,
+            inter,
+            0,
+            1,
+            descb.ptr() as *const ExpertDesc,
+            wb.ptr() as *const f32,
+            hbuf.ptr_mut() as *mut f32,
+            pbuf.ptr_mut() as *mut f32,
+            stream.raw(),
+        )
+        .expect("launch i4");
+        launch_moe_reduce(pbuf.ptr() as *const f32, 1, hidden, obuf.ptr_mut() as *mut f32, stream.raw())
+            .expect("reduce");
+    }
+    device_sync().expect("sync");
+    f32v(&obuf.copy_out().expect("out"))
+}
+
 /// GPU int4 MoE on REAL colibri `.i4` bytes in the actual slot layout
 /// (`i4_slot_offsets`) vs `matvec_i4` on the same bytes. The gap neither
 /// `moe_i4_matches_reference` (synthetic `quant_i4`, separate buffers) nor the host
@@ -888,46 +938,7 @@ fn moe_i4_real_data_matches_cpu() {
     let mut want = vec![0f32; hidden];
     matvec_i4(&mut want, &h, &dp, &ds, hidden, inter);
 
-    let slot = dev(&blk);
-    let base = slot.ptr();
-    let desc = ExpertDesc {
-        gate_indices: unsafe { base.add(off[0]) },
-        gate_scales: unsafe { base.add(off[1]) } as *const u16,
-        up_indices: unsafe { base.add(off[2]) },
-        up_scales: unsafe { base.add(off[3]) } as *const u16,
-        down_indices: unsafe { base.add(off[4]) },
-        down_scales: unsafe { base.add(off[5]) } as *const u16,
-    };
-    let descb = dev(unsafe {
-        std::slice::from_raw_parts(
-            (&desc as *const ExpertDesc) as *const u8,
-            std::mem::size_of::<ExpertDesc>(),
-        )
-    });
-    let (xb, wb) = (dev(&f32b(&x)), dev(&f32b(&[1.0f32])));
-    let mut hbuf = dev(&vec![0u8; inter * 4]);
-    let mut pbuf = dev(&vec![0u8; hidden * 4]);
-    let mut obuf = dev(&vec![0u8; hidden * 4]);
-    let stream = HipStream::new().expect("stream");
-    unsafe {
-        launch_moe_expert_range_i4(
-            xb.ptr() as *const f32,
-            hidden,
-            inter,
-            0,
-            1,
-            descb.ptr() as *const ExpertDesc,
-            wb.ptr() as *const f32,
-            hbuf.ptr_mut() as *mut f32,
-            pbuf.ptr_mut() as *mut f32,
-            stream.raw(),
-        )
-        .expect("launch i4");
-        launch_moe_reduce(pbuf.ptr() as *const f32, 1, hidden, obuf.ptr_mut() as *mut f32, stream.raw())
-            .expect("reduce");
-    }
-    device_sync().expect("sync");
-    let got = f32v(&obuf.copy_out().expect("out"));
+    let got = gpu_i4_expert(&blk, &off, &x, hidden, inter);
     let dot: f64 = want.iter().zip(&got).map(|(a, b)| *a as f64 * *b as f64).sum();
     let (na, nb): (f64, f64) = (
         want.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt(),
@@ -940,6 +951,154 @@ fn moe_i4_real_data_matches_cpu() {
         &got[..3]
     );
     assert_close(&want, &got, "moe_i4_real");
+}
+
+/// The int4 path against INDEPENDENT ground truth: the original fp8 checkpoint the
+/// `.i4` set was derived from, dequantized and dotted in **f64** through the same
+/// `down(silu(gate·x) ⊙ up·x)` chain. `moe_i4_real_data_matches_cpu` compares the GPU
+/// kernel to our own `matvec_i4`; nothing in this reference touches `matvec_i4`,
+/// `quant_i4`, or a nibble.
+///
+/// **What it catches, stated honestly.** Errors present in the DERIVATION — wrong
+/// tensor, wrong dims, wrong `weight_scale_inv` tiling, an `.i4` set rebuilt from a
+/// different checkpoint or through the old `fp8→vq3→int4` chain. Those move `gain`
+/// toward 0 and `rel_l2` past 1. It does **not** catch a nibble order or zero point
+/// that `quant_i4` and the kernel SHARE: `quant_i4` wrote these bytes, so a shared
+/// convention cancels end to end. Nothing in this repo can pin that — both the writer
+/// and the reader are ours; the anchor is colibri's `.qs` format, off-tree.
+///
+/// **It is also a COARSE gate, deliberately.** Two aggregate statistics over 6144
+/// outputs cannot see corruption confined to a few percent of rows — a simulated 2%
+/// K-tail truncation sits inside any band wide enough to hold the real spread. The
+/// tight per-element gate is the sibling test's `assert_close` (max-abs at
+/// `1e-3·max`), which catches that trivially. `max_err/max|ref|` here is the cheap
+/// complement, not a substitute.
+///
+/// **The bands are tight because the measurement is deterministic.** `x` is a fixed
+/// seed, the artifact is fixed, and the kernels reduce with a fixed `__shfl_down`
+/// ladder — so this is not a sample from a distribution, it is one number. `bin/i4_audit`
+/// (same generator, same `CHAIN_SEED`) reproduces it on the CPU to four decimals:
+/// rel_l2 **0.2951**, gain **1.0009**, max_err/max|ref| **0.1603** for L3 expert 0.
+/// Bands sit ~12% around those, which is roughly 3× more sensitive than a band sized
+/// for x-draw spread would be — and rel-L2 through `silu` really does vary ~15% across
+/// draws, which is exactly why quoting a same-distribution-but-different-seed anchor
+/// (as an earlier revision did) is not good enough.
+///
+///     cargo run --release --bin i4_audit -- /var/db/rivoli/glm52-vq3-full <fp8-dir> \
+///         --layer 3 --experts 0,7,256
+#[test]
+fn moe_i4_real_data_vs_fp8_ground_truth() {
+    use rivoli::format::{FormatMeta, I4Source, Safetensors};
+    use rivoli::model::ModelConfig;
+    use rivoli::quant::{i4_expert_bytes, i4_slot_offsets, vq_expert_layout};
+    use std::os::unix::fs::FileExt;
+    const ART: &str = "/var/db/rivoli/glm52-vq3-full";
+    const LAYER: usize = 3; // first MoE layer; block 0 = routed expert 0
+    let path = format!("{ART}/L{LAYER:02}.i4");
+    let Ok(f) = std::fs::File::open(&path) else {
+        eprintln!("skip moe_i4_real_data_vs_fp8: {path} absent");
+        return;
+    };
+    // The checkpoint comes from the artifact's OWN stamp, and the bands below only
+    // describe the `fp8->int4` chain. `bin/vq3_to_i4` rewrites `L{l}.i4` IN PLACE in
+    // this very directory with the other chain; without this the test would keep
+    // running and quietly certify the derivation it exists to distinguish.
+    let Some(prov) = I4Source::load(ART).expect("read i4_source") else {
+        eprintln!("skip moe_i4_real_data_vs_fp8: artifact carries no i4_source stamp");
+        return;
+    };
+    assert_eq!(
+        prov.chain, "fp8->int4",
+        "the assertion bands characterise the fp8->int4 chain; this artifact is {}",
+        prov.chain
+    );
+    assert!(
+        prov.layers[0] <= LAYER && LAYER < prov.layers[1],
+        "layer {LAYER} outside the stamped range {:?}",
+        prov.layers
+    );
+    let Ok(src) = Safetensors::open_dir(&prov.src) else {
+        eprintln!("skip moe_i4_real_data_vs_fp8: checkpoint {} absent", prov.src);
+        return;
+    };
+    let block = FormatMeta::load(ART).expect("format meta").fp8_block;
+    // From the manifest, not hardcoded: the slot offsets below are functions of these
+    // dims, so a shape the constants disagreed with would read the wrong bytes and
+    // still produce a plausible-looking number.
+    let cfg = ModelConfig::load(ART).expect("artifact manifest");
+    let (hidden, inter) = (cfg.hidden, cfg.moe_inter);
+    let mut blk = vec![0u8; i4_expert_bytes(hidden, inter)];
+    f.read_exact_at(&mut blk, 0).expect("read expert 0");
+    let off = i4_slot_offsets(hidden, inter);
+    let dims = vq_expert_layout(hidden, inter);
+
+    // ── the reference: fp8 → f64, no quantized code in the path ─────────────────
+    let base = format!("model.layers.{LAYER}.mlp.experts.0");
+    let wref: Vec<Vec<f32>> = ["gate_proj", "up_proj", "down_proj"]
+        .iter()
+        .zip(&dims)
+        .map(|(p, &(o, i))| {
+            src.dequant_fp8(&format!("{base}.{p}"), o, i, block)
+                .expect("dequant fp8")
+        })
+        .collect();
+    let mv64 = |w: &[f32], x: &[f32], o_dim: usize, i_dim: usize| -> Vec<f32> {
+        (0..o_dim)
+            .map(|o| {
+                w[o * i_dim..(o + 1) * i_dim]
+                    .iter()
+                    .zip(x)
+                    .map(|(&a, &b)| a as f64 * b as f64)
+                    .sum::<f64>() as f32
+            })
+            .collect()
+    };
+    let mut r = Lcg(0x5A17);
+    let x: Vec<f32> = (0..hidden).map(|_| r.f()).collect();
+    let g = mv64(&wref[0], &x, inter, hidden);
+    let u = mv64(&wref[1], &x, inter, hidden);
+    let hv: Vec<f32> = (0..inter).map(|j| silu(g[j]) * u[j]).collect();
+    let want = mv64(&wref[2], &hv, hidden, inter);
+
+    // ── what the shipped int4 path produces, on the GPU, from the real bytes ────
+    let got = gpu_i4_expert(&blk, &off, &x, hidden, inter);
+
+    let (mut num, mut den, mut dot) = (0f64, 0f64, 0f64);
+    for (&a, &b) in got.iter().zip(&want) {
+        let (a, b) = (a as f64, b as f64);
+        num += (a - b) * (a - b);
+        den += b * b;
+        dot += a * b;
+    }
+    let (rel_l2, gain) = ((num / den).sqrt(), dot / den);
+    let (mx_ref, mx_err) = got.iter().zip(&want).fold((0f64, 0f64), |(r, e), (&a, &b)| {
+        (r.max(b.abs() as f64), e.max((a - b).abs() as f64))
+    });
+    let rel_max = mx_err / mx_ref;
+    // Margins, not just pass/fail — a run drifting from 0.24 toward 0.32 stays green
+    // and unremarked right up until it crosses (the reason `assert_close` prints them).
+    println!(
+        "moe_i4_vs_fp8: rel_l2={rel_l2:.4} (band 0.26..0.33) gain={gain:.4} (band 0.97..1.04) \
+         max_err/max|ref|={rel_max:.4} (bound 0.25)"
+    );
+    assert!(
+        (0.97..=1.04).contains(&gain),
+        "SYSTEMATIC gain error vs fp8 ground truth: gain={gain:.4}. Cosine scores 1.0000 \
+         for any uniform or per-row scale error, so nothing else here would see this."
+    );
+    assert!(
+        (0.26..=0.33).contains(&rel_l2),
+        "rel_l2={rel_l2:.4} != the deterministic 0.2951 this artifact and seed produce. \
+         Below 0.26 the reference has collapsed into the thing it checks (a 6144-wide row \
+         at an amax/7 step MUST lose ~0.20, ~0.30 through the silu chain); above 0.33 the \
+         derivation is wrong, not merely coarse. A change to `quant_i4`'s loading factor \
+         moves this ON PURPOSE — rebuild the anchor with bin/i4_audit, do not widen."
+    );
+    assert!(
+        rel_max <= 0.25,
+        "max_err/max|ref|={rel_max:.4} > 0.45 — a few corrupted output rows move this \
+         while leaving rel_l2 inside its band"
+    );
 }
 
 /// `index_topk` vs the host selection it replaces, on the shapes that actually occur.
