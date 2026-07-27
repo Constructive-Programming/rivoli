@@ -250,8 +250,11 @@ it is enforced structurally and covered by a batch-protocol stress test.
   when the DSA sparse indexer is active. `mla_absorb`/`mla_value` bracket the attend.
 - **DSA indexer (optional).** A small extra attention (`indexer.hip`) that scores past
   tokens and selects a sparse top-k the main attend restricts to, engaged past the 2048
-  `index_topk`. Present only if the artifact carries indexer weights (`--attn auto` detects
-  them). See `docs/NPU.md` for the plan to offload it concurrently.
+  `index_topk`. The selection is a **device top-k kernel** (a per-block binned scan,
+  `TOPK_BLOCK`/`TOPK_BINS`) — it replaced a host score-D2H + CPU top-k, cutting −9.4 ms/tok
+  with a bit-identical selection (so the whole DSA path now stays on device, no per-layer
+  round-trip). Present only if the artifact carries indexer weights (`--attn auto` detects
+  them). See `docs/NPU.md` for the measured offload analysis.
 
 Route is context-independent at short context (the projections dominate) and grows with
 context (the attend scan). It has been through an ISA-driven tuning pass (`docs/PERF.md`).
@@ -348,9 +351,15 @@ fails loud. `convert` produces the vq3 artifact; `vq3_to_i4` derives the `.i4` t
 - `arena` — two-ended byte arena; `hybrid` — byte-aware cache policies; `cache` —
   `OrderedSet`/`Tier`/`TwoQSplit` substrate.
 - `pin` — resident placement + the routed-expert `ArenaPool` (`submit_layer` protocol).
-- `gpu` — the async forward pass; `hip` — the FFI surface; `quant`/`math`/`model` — leaf.
+- `gpu` — the async forward pass; `hip` — the HIP/rocm FFI surface; `quant`/`math`/`model`
+  — leaf.
 - `attn`/`indexer` — attention modes + DSA. `telemetry` — the always-on PROFILE summary.
-- `kernels/*.hip` — moe, mla, attn, linalg, indexer, fwd, async, vmm.
+- `backend` — the planned build-time backend waist (`rocm` XOR `vulkan`, one impl chosen at
+  compile time, no vtable); **not yet wired** — a plan, not a seam. `vk` — the **Vulkan
+  compute backend** (`--features vulkan`): a feature-gated **WIP**, kernels landed through
+  tranche 2d but **not yet runnable**; see `docs/VULKAN.md`.
+- `kernels/*.hip` — moe, mla, attn, linalg, indexer, fwd, async, vmm (HIP/rocm).
+  `kernels/vk/*.comp` → SPIR-V via the `build.rs` vulkan arm (the WIP second backend).
 - `src/bin/` — `convert`, `vq3_to_i4`, `pack_i4` (deprecated), `add_indexer`, `replay`.
 
 See `docs/PERF.md` for the performance roadmap, `MODES.md` for the format/policy matrix, and
