@@ -7,6 +7,13 @@ proposals ([CACHE_ROUTE](CACHE_ROUTE.md), [CACHE_PILOT](CACHE_PILOT.md), the fp8
 work). Residency / cache-conditional routing is **not** covered here — it is owned in full
 by those two proposals.
 
+**A correctness defect found by this document's per-kernel work does NOT live in this
+document.** The `route` tranche turned up an fp8 block scale mis-applied at `block < 4`,
+affecting every fp8 block-scaled GEMV — it is written up in **benchmarks.md, "Bugs found
+and fixed"**, because someone auditing numerics reads that file and someone tuning kernels
+reads this one. Two known-broken twins are recorded there too. Perf items cross-reference
+the bug; they do not host it.
+
 ## How to read — and write — this document
 
 **A phase profile localises cost; it does not explain it.** Any mechanism attributed to a
@@ -141,6 +148,46 @@ Grounded in the measured kernel profile.
    helper — load widening, x re-read tiling — inherits the same multiplier, so it is worth
    more than its o_proj row suggests.
 
+   **x RE-READ AMPLIFICATION IS REFUTED. Measured, and refuted in the direction opposite
+   to the prediction.** `ROWS_PER_BLOCK`-style tiling was implemented (one pass over `x`
+   feeding R weight rows, bit-identical) and swept interleaved against the untiled arm,
+   5 samples each, min-of-N because the bus was contended:
+
+   | `SPLITK_ROWS` | x traffic | o_proj min µs | vs untiled |
+   |---|---|---:|---:|
+   | 1 (untiled, shipped) | 402 MB | **515.7** | — |
+   | 1 (via the tiled helper) | 402 MB | 615.0 | +19% |
+   | 2 | 201 MB | 508.3 | −1.4% |
+   | 4 | 100 MB | 531.5 | +3.1% |
+   | 8 | 50 MB | 573.6 | +11.2% |
+
+   If the x re-read were binding, R=8 would be the fastest arm. It is the **slowest**, and
+   the trend is monotone the wrong way for R ≥ 2. The best arm (R=2) buys 1.4%, inside a
+   noise band that spanned 515–1141 µs on the untiled arm alone. **The tiling was reverted
+   — it added a templated multi-row helper, pointer arrays and a tail-block clamp for an
+   effect indistinguishable from zero.**
+
+   **The arithmetic said so before the device did.** The 402 MB + 100 MB in 529 µs this
+   item rests on is 950 GB/s on a 256 GB/s part — 3.7× over, so it was never DRAM traffic
+   and one division would have retired the item without a device slot. See benchmarks.md,
+   "Divide by the peak before you book the slot".
+
+   **What o_proj actually is: at the roofline for the traffic it cannot avoid.** The
+   100.7 MB of weights it must read from DRAM is 393 µs at peak; it measures 515.7 µs
+   min = **76% of peak, with a competing memory-bound job on the same unified bus.** The
+   remaining headroom is ~24% and no restructuring of the x side can reach it.
+
+   **The `o / block` scale-row divide (a separate defect, found in the same ISA pass) is
+   fixed and measured.** `size_t o / int block` in both `gemv_fp8` and `gemv_fp8_splitk`
+   emitted a runtime division per thread — a 32-bit fast path plus a full 64-bit one
+   behind `v_cmp_ge_u64`, ~55 instructions, and the split-K prologue dropped 379 → 349
+   static instructions when it became a shift. Worth **−0.9% (min-of-6, 518.6 → 513.9 µs)
+   — inside the noise band**, NOT the 20% the identical fix bought in `mla_value_fp8`,
+   because `o` is uniform per block here so LLVM emits it in SALU and 256 threads amortize
+   one sequence. Shipped anyway: bit-identical, free, and the waste was real. This is the
+   third instance of the pattern and the second time it did not pay — *finding* an integer
+   division in a hot kernel is now a reliable prediction; **its magnitude is not.**
+
 3. **`mla_latent_attend` occupancy** *(route; scales with context — do before any
    long-context push).* ~20 ms @ nr512, grows ~linearly with context. LDS-capped to 1
    WG/CU (dynamic LDS `((HB+TILE)·kvl + TILE·rope)·4 = 53 KB`). Levers: move `acc[HB·kvl]`
@@ -194,6 +241,40 @@ Grounded in the measured kernel profile.
    coalescing and ILP, but it keeps each output's sum over `d` ascending, so it is
    bit-identical and needs no quality gate. Wave-per-row is not.
 
+   **DONE, and the i-quad prescription was right on both counts.** One thread per
+   (head, i-quad): **35.9 → 25.7 µs, 175 → 245 GB/s, 1.40×** on the 6.29 MB of kv_b it
+   reads (min-of-N over interleaved A/B; `mla_value` held at 26.1 µs in both arms as an
+   unchanged control). Over 78 layers that is **−0.80 ms/tok**, on top of the divide
+   fix's −2.77. Both figures are min-of-N from this branch's own A/B and are NOT the
+   36.5 µs / 172.3 GB/s recorded above, which came from a different session — compare
+   within a run, not across them.
+
+   **The mechanism was LOAD WIDTH, exactly as `lm_head`'s (#5) is.** One column per
+   thread meant `global_load_u8` — 32 lanes × 1 byte = **32 B/wave against a 128 B cache
+   line**. A quad's four columns are contiguous, so the same bytes arrive as one
+   `global_load_b32` = 128 B/wave, a full line. Normalized per four columns the ISA goes
+   from 4 weight loads / 4 scale loads / 66 VALU to **1 / 1 / 27** — 4× fewer memory
+   instructions and 2.4× less VALU for identical bytes moved. VGPRs 29, no spill, no
+   scratch, occupancy unchanged at 16 waves/SIMD, and `s_and_saveexec_b32` went 2 → 1
+   (removing a cost without adding a neighbouring one — the check benchmarks.md asks for).
+
+   **Bit-identical, and proved rather than argued:** absorb's output fingerprint is
+   `0925c147afeea3fb` in **all 14** interleaved runs across both arms. No quality gate
+   needed, as the item predicted. See benchmarks.md, "A fingerprint is the only instrument
+   that shows bit-identity".
+
+   **Two preconditions the quad path cannot meet, both routed to the original scalar body
+   rather than rejected in the launcher:** `kvl % 4 != 0` (rows unaligned for a dword
+   load) and `block < 4` (a quad would straddle two scale tiles). Both kept legal because
+   the Vulkan launcher accepts them and the backends must span one domain.
+
+   **This work also turned up a CORRECTNESS defect in `fp8_dot_strided`** — the block
+   scale was mis-applied at `block < 4` in every fp8 GEMV. It is a numerics bug, not a
+   perf one, so it is written up under **benchmarks.md, "Bugs found and fixed"** rather
+   than here, along with the two known-broken twins left in place (the Vulkan shader,
+   whose oracle mirrors the defect, and `rivoli_gemv_fp8`'s missing `i_dim % 4` guard).
+   No shipped model is affected: every fp8 checkpoint uses `weight_block_size` 128.
+
 5. **`lm_head` split-K** *(tail).* [154880, 6144] int8 GEMV — the one big tail cost. Split-K
    it (same shape argument as o_proj: many rows, long reduction).
    **MEASURED: 8.12 ms at 117 GB/s, so the ceiling on this item is ~4.4 ms** (8.12 → 3.71
@@ -222,8 +303,8 @@ Grounded in the measured kernel profile.
 | 3 | Batched-GEMV kernels | A | med now, unlocks MTP | med–high | new |
 | 4 | MTP / speculative decode | A | high (≥1.5×) | high | needs #3 + fp8 MTP head |
 | 5 | `mla_latent_attend` occupancy | follow-up #3 | ~5–7 ms now, huge at long ctx | med | new |
-| 6 | o_proj / lm_head split-K | follow-up #2, #5 | ~10–15 ms | low | new |
-| 7 | `mla_absorb` restructure | follow-up #4 | ~2–3 ms | med | new |
+| 6 | o_proj / lm_head split-K | follow-up #2, #5 | lm_head only (o_proj refuted) | low | partly closed |
+| 7 | `mla_absorb` restructure | follow-up #4 | **−0.80 ms/tok, measured** | med | **done** |
 
 **Suggested sequence:** land #1 (cheap, in flight) → **Path B** (#2 — the biggest
 structural win on the 210 ms) → **Path A** (#3 batched kernels → #4 MTP, the multiplier) →

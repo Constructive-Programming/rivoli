@@ -70,6 +70,73 @@ moe-gpu), not fetch-bound, at this budget. hybrid/lru's edge is the fewest misse
 
 ## Bugs found and fixed
 
+### fp8 block scale MIS-APPLIED at `block < 4` — every fp8 GEMV (fixed)
+
+**A numerics bug, not a perf one, and it sat in the helper every fp8 block-scaled GEMV
+goes through.** `common.hpp::fp8_dot_strided` reads four fp8 weights per lane as one dword
+and applies **one** block scale to all four:
+
+```c
+float s = scalerow[i0 >> bsh];              // ONE scale for columns i0..i0+3
+acc += s * (x[i0]*lut[..] + x[i0+1]*lut[..] + x[i0+2]*lut[..] + x[i0+3]*lut[..]);
+```
+
+That is only the right scale when the scale tile is at least a quad wide. At `block` 1 or
+2 the columns past the tile boundary belong to *later* tiles and silently took `i0`'s —
+three of four at block=1, the upper two at block=2. Affected `gemv_fp8`,
+`gemv_fp8_splitk` and `mla_value_fp8`, i.e. `o_proj`, `q_a`, `q_b`, `kv_a`, the dense MLP
+and the MLA value projection.
+
+**The guard test was actively asserting the broken domain.** `blk_shift` needs a
+power-of-two tile, so guard 1003 rejects non-powers-of-two — and 1 and 2 *are* powers of
+two, so they passed. `gemv_fp8_rejects_non_power_of_two_block` goes further and
+**explicitly requires block=1 to be ACCEPTED** ("1 is a power of two (bsh = 0,
+`i >> 0` == `i / 1`), so it must be ACCEPTED"). The launcher's contract said the input was
+legal while the kernel computed it wrong, which is the worst of the two failure modes: no
+error code, no fault, just wrong numbers.
+
+**Why nothing caught it.** Every oracle shape in the suite used `block = 128`. A tile that
+wide can never expose a quad straddling two tiles, so the entire fp8 oracle set was
+structurally incapable of seeing this — the same class of blind spot as the `fnv` note
+below, where an instrument is green because its inputs cannot reach the defect.
+
+**Found** by a `block = 2` shape added to `mla_fp8_matches_reference` while restructuring
+`mla_absorb_fp8` — the quad restructure needs exactly the same `block >= 4` precondition,
+which is what prompted asking whether the existing helper had it. It did not.
+`mla_value` at block=2 failed at **err 2.2e-1 against tol 1.5e-3**; `gemv_fp8` at block=2
+failed at **err 6.2e-1**. Both are hard failures, not tolerance grazes.
+
+**Fix**, one line, in the helper rather than the callers:
+
+```c
+int n4 = (block >= 4) ? (i_dim >> 2) : 0;   // narrow tile → per-column tail path
+```
+
+The per-column tail loop below it was always correct, so zeroing `n4` hands it the whole
+row. **Bit-identical at `block >= 4`** — the engine runs 128, and the generated ISA for
+the hot loop is byte-for-byte unchanged, so no shipped model's numerics moved. Post-fix
+margins: `mla_value` block=2 at 12318×, `gemv_fp8` block=2 and block=1 green.
+
+**TWO TWINS ARE KNOWN-BROKEN AND DELIBERATELY LEFT.** Both are recorded in
+`kernels/common.hpp` at the fix site and in docs/PERF.md #4:
+
+- **`kernels/vk/fp8.glsl::fp8_dot_strided` has the identical bug** — same loop, same
+  unconditional `n4 = i_dim >> 2`, same one-scale-per-quad. **And `tests/vk.rs`'s
+  `oracle_fp8_dot_strided` MIRRORS the kernel, including this behaviour** (`let s =
+  scalerow[i0 / block];` for the whole quad). So the Vulkan suite is **structurally blind
+  to it**: the oracle and the kernel agree *because they share the defect*, and adding a
+  block<4 shape there would pass while still being wrong. Fixing it means changing the
+  shader **and** its oracle together. Not done here — this branch had no Vulkan device
+  slot, and an unrunnable fix to a second backend is worse than a recorded divergence.
+- **`rivoli_gemv_fp8` still lacks the `i_dim % 4` guard** its `w4` cast needs (rows are
+  `i_dim` bytes apart, so a ragged `i_dim` misaligns three rows in four). `src/vk.rs`
+  enforces it; `rivoli_mla_value_fp8` now enforces the equivalent `kvl % 4` (guard 1002,
+  a parity gap this same work found and fixed). The requirement is **conditional** — at
+  `block < 4` the cast is never reached — which is why it is a guard question rather than
+  a second bug. Not added because a launcher guard that fires hard-fails a decode, and
+  this branch was barred from running the engine to confirm no live projection dim trips
+  it. Every GLM dim is a multiple of 4; the exposure is a future config, not this one.
+
 ### int4 degeneration — WRONG `.i4` SOURCE (fixed)
 
 `--mode int4` used to collapse into repetition from token 0 (distinct-token ratio 0.04).
@@ -711,6 +778,53 @@ side is `b32`, and at 4 fp8/lane that is 128 B/wave = exactly one cache line, wh
 not obviously worth widening. The open question is therefore **x re-read amplification**
 (every block streams all of x for its slice of weights), which is a different lever from
 load width and was never what the dead end tested.
+
+**That open question is now CLOSED — refuted.** `SPLITK_ROWS` tiling was implemented and
+swept 1/2/4/8; R=8 cuts x traffic 8× and is the **slowest** arm (+11%), R=2 the best at
+−1.4%, inside a noise band wider than the effect. The tiling was reverted. See
+docs/PERF.md follow-up #2 for the table. The load-width lever, meanwhile, paid where it
+was correctly aimed: `mla_absorb_fp8`'s single-byte weight load became a dword and the
+kernel went 35.9 → 25.7 µs. Two levers, one refuted and one confirmed, out of the same
+ISA pass.
+
+### Divide by the peak before you book the slot
+
+**402 MB of x plus 100 MB of weights in 529 µs is 950 GB/s, on a 256 GB/s part.** The
+traffic figure that motivated the x re-read item was 3.7× over the hardware limit, which
+means it was never DRAM traffic — `x` is 64 KB, it lives in cache, and the kernel was
+never paying the bus cost the hypothesis charged it. **One division would have retired the
+item without a device slot.** It cost four builds and twenty interleaved runs instead.
+
+This generalises past bandwidth. Any figure a hypothesis rests on — GB/s, instructions
+per byte, bytes per wave — has a hardware ceiling next to it, and checking is free.
+`mla_value_fp8` reads 8.4 MB in 26.1 µs = **322 GB/s, also over peak**: it is re-reading a
+14.7 MB `kv_b` that the bench leaves resident across its 60 iterations, so "310 GB/s" was
+never a DRAM number either and `mla_absorb`'s 1.8× gap to it was never a 1.8× bus gap.
+Both numbers are still valid *comparators* between arms of the same bench. Neither is a
+roofline. Say which one you are quoting.
+
+### A fingerprint is the only instrument that shows bit-identity
+
+`assert_close` cannot tell a bit-identical restructure from a reassociating one — both
+pass, and the margin print does not distinguish them either. `examples/dot_bench` now
+prints an FNV-1a hash of each kernel's raw output bytes, and the absorb restructure's
+claim rests on it: `0925c147afeea3fb`, unchanged across 14 interleaved runs of both arms.
+
+It only works if the inputs vary. `run_fp8` and `run_mla` used constant `x`, `q` and
+`clat` — correct for throughput, since traffic does not depend on values, but a constant
+input leaves the output insensitive to summation order, and the fingerprint would have
+been green for a change that reassociated. **The instrument and the input generator are
+one instrument**; a fingerprint over degenerate data is a fingerprint of nothing.
+
+### Measuring on a contended bus — report min, and keep a control arm
+
+These runs shared the machine with a memory-heavy conversion job, and `o_proj` (100 MB
+streamed) ranged **515 → 1141 µs on a single unchanged arm**. The MLA kernels (6-14 MB,
+cache-resident) held to ±3% through the same window. Three things kept the conclusions:
+interleaving the arms so drift hits both, quoting **min-of-N** rather than mean (the
+minimum is the least-contended sample; the mean measures the neighbour), and carrying an
+**unchanged control kernel** in the same binary — `mla_value` at 26.1 µs in both arms, and
+`lm_head` at 8026 vs 8038 µs, are what license reading a 1% difference at all.
 
 ## Running these benches — detach anything multi-cell
 

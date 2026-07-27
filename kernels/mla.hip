@@ -11,8 +11,17 @@
 
 // qabs[head][i] = Σ_d q[head·qh + d] · e4m3(kv_b[rbase+d][i]) · scale[block(rbase+d,i)],
 // rbase = head·(nope+vh), i∈[0,kvl), d∈[0,nope) — absorb q_nope through kv_b's nope
-// rows into latent space. Transposed: output indexed by column i, summed over nope
-// rows. One thread per (head,i) — adjacent threads read adjacent bytes.
+// rows into latent space. Transposed: output indexed by column i, summed over nope rows.
+//
+// One thread per (head, i-QUAD): four adjacent columns, four accumulators. A quad's
+// columns are contiguous in kv_b, so the weight read is one `global_load_b32` = 128 B per
+// wave, exactly one cache line; the old one-column-per-thread form issued
+// `global_load_u8` = 32 B/wave, a QUARTER of a line, and that load width was the cost.
+// Measured 1.40× — docs/PERF.md #4.
+//
+// BIT-IDENTICAL: each output still sums over `d` in ascending order with the same
+// expression, so no quality gate is needed. DO NOT "improve" this to the wave-per-row
+// shape `mla_value` uses — that reassociates, and then it does need one.
 extern "C" __global__ void mla_absorb_fp8(
     const float* __restrict__ q, const unsigned char* __restrict__ kvb,
     const float* __restrict__ kvb_scale, int H, int qh, int nope, int vh, int kvl, int block,
@@ -20,27 +29,70 @@ extern "C" __global__ void mla_absorb_fp8(
     __shared__ float lut[256];
     e4m3_lut_build(lut, threadIdx.x);
     __syncthreads();
+    int nquad = absorb_nquad(kvl);
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (size_t)H * kvl) return;
-    int head = (int)(idx / kvl);
-    int i = (int)(idx % kvl);
+    if (idx >= (size_t)H * nquad) return;
+    int head = (int)(idx / nquad);
+    int i0 = (int)(idx % nquad) << 2;
     int sc_cols = (kvl + block - 1) / block;
     // Shift, NOT divide: `row` is a size_t, so `row / block` was a 64-bit unsigned
     // division that LLVM cannot fold to a magic multiply — it emitted an inline
-    // Newton-Raphson reciprocal inside the d-loop, and that (not the load width) was
-    // this kernel's first-order cost. The launcher rejects a non-power-of-two tile.
-    // Bit-identical: `row` is unsigned and `i` non-negative, so the index is the same.
+    // Newton-Raphson reciprocal inside the d-loop, worth 72.0 → 36.5 µs on its own.
+    // The launcher rejects a non-power-of-two tile. Bit-identical: `row` is unsigned
+    // and the column index non-negative, so the index is the same.
     // Evidence in benchmarks.md, "Read the ISA before you book the device".
     int bsh = blk_shift(block);
     size_t rbase = (size_t)head * (nope + vh);
     const float* qh_ptr = q + (size_t)head * qh;
-    float acc = 0.0f;
-    for (int d = 0; d < nope; ++d) {
-        size_t row = rbase + d;
-        float w = lut[kvb[row * (size_t)kvl + i]] * kvb_scale[(row >> bsh) * sc_cols + (i >> bsh)];
-        acc += qh_ptr[d] * w;
+    const unsigned char* wcol = kvb + rbase * (size_t)kvl + i0;
+    float* out = qabs + (size_t)head * kvl + i0;
+    // ONE fallback branch, two independent triggers. `kvl & 3` leaves rows unaligned for
+    // the dword load (rows are `kvl` bytes apart); `block < 4` puts a quad's columns in
+    // different scale tiles. Rejecting them in the launcher instead is not an option: the
+    // Vulkan absorb launcher accepts both (src/vk.rs carries NO `kvl % 4` guard on absorb,
+    // only on value, deliberately) and the backends must span one argument domain.
+    //
+    // THE COST IS A SECOND COPY OF THE DEQUANT. This body and the quad body below are two
+    // expressions of the same math, and the GLM shape only ever runs the second — so a
+    // change to either (lut indexing, scale layout, an fp8 variant) must be made twice,
+    // and only the non-GLM oracle shapes in tests/kernel.rs would catch a divergence.
+    if ((kvl & 3) || block < 4) {
+        // Not unrolled: four copies of the d-loop tripled the kernel's static size
+        // (698 → 1078 instructions) for a branch the engine never takes. The measured
+        // build carried this pragma and the hot loop below is identical either way.
+#pragma unroll 1
+        for (int k = 0; k < 4 && i0 + k < kvl; ++k) {
+            float acc = 0.0f;
+            for (int d = 0; d < nope; ++d) {
+                size_t row = rbase + d;
+                acc += qh_ptr[d] * (lut[wcol[(size_t)d * kvl + k]]
+                                    * kvb_scale[(row >> bsh) * sc_cols + ((i0 + k) >> bsh)]);
+            }
+            out[k] = acc;
+        }
+        return;
     }
-    qabs[(size_t)head * kvl + i] = acc;
+    // One scale load per iteration covers all four columns: past the `if` above the quad
+    // sits inside one tile, and its column index does not depend on `d`.
+    int sc_col = i0 >> bsh;
+    // `w4 += stride4` rather than `w4[d * stride4]` — the latter cost a 64-bit
+    // multiply-add in the loop body.
+    const unsigned int* w4 = (const unsigned int*)wcol;
+    int stride4 = kvl >> 2;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (int d = 0; d < nope; ++d, w4 += stride4) {
+        unsigned int p = *w4;
+        float s = kvb_scale[((rbase + d) >> bsh) * sc_cols + sc_col];
+        float qd = qh_ptr[d];
+        a0 += qd * (lut[(unsigned char)p] * s);
+        a1 += qd * (lut[(unsigned char)(p >> 8)] * s);
+        a2 += qd * (lut[(unsigned char)(p >> 16)] * s);
+        a3 += qd * (lut[(unsigned char)(p >> 24)] * s);
+    }
+    out[0] = a0;
+    out[1] = a1;
+    out[2] = a2;
+    out[3] = a3;
 }
 
 // ctx[head][j] = Σ_i clat[head][i] · e4m3(kv_b[rbase+nope+j][i]) · scale[block(row,i)],
@@ -76,7 +128,7 @@ extern "C" int rivoli_mla_absorb_fp8(
     int H, int qh, int nope, int vh, int kvl, int block, float* qabs) {
     if (H <= 0 || qh <= 0 || nope <= 0 || vh <= 0 || kvl <= 0 || block <= 0) return 1001;
     if (block & (block - 1)) return 1003;  // blk_shift needs a power-of-two tile
-    size_t total = (size_t)H * kvl;
+    size_t total = (size_t)H * (size_t)absorb_nquad(kvl); // one thread per (head, i-quad)
     hipGetLastError();
     hipLaunchKernelGGL(mla_absorb_fp8, dim3((unsigned)((total + 255) / 256)), dim3(256), 0, 0,
                        q, kvb, kvb_scale, H, qh, nope, vh, kvl, block, qabs);
@@ -89,6 +141,14 @@ extern "C" int rivoli_mla_value_fp8(
     int H, int nope, int vh, int kvl, int block, float* ctx) {
     if (H <= 0 || nope <= 0 || vh <= 0 || kvl <= 0 || block <= 0) return 1001;
     if (block & (block - 1)) return 1003;  // blk_shift needs a power-of-two tile
+    // `dot_fp8_wave` reads weights as 32-bit words and rows are `kvl` bytes apart, so a
+    // ragged kvl leaves 3 rows in 4 misaligned for the dword load. The Vulkan twin has
+    // rejected this since it was written (src/vk.rs::launch_mla_value_fp8) and this
+    // launcher did not — a parity gap found when the absorb restructure added a kvl=37
+    // oracle shape, which is legal for absorb (it reads single bytes) and drove
+    // mla_value straight into the misaligned load. Absorb deliberately has NO such
+    // guard; the asymmetry is the same one src/vk.rs documents.
+    if (kvl & 3) return 1002;
     size_t total = (size_t)H * vh;
     hipGetLastError();
     hipLaunchKernelGGL(mla_value_fp8,

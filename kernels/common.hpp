@@ -64,6 +64,13 @@ __device__ __forceinline__ void e4m3_lut_build(float* lut, int tid) {
 // book the device", for why grepping for `v_rcp_iflag_f32` finds nothing here.
 __device__ __forceinline__ int blk_shift(int block) { return 31 - __clz(block); }
 
+// i-quads per head in `mla_absorb_fp8` — one thread each. Shared by the kernel (which
+// derives head/i0 from it) and its launcher (which sizes the grid from it), because a
+// grid smaller than the kernel's own bound leaves output columns UNWRITTEN with no error
+// code and no fault. `H * kvl` was self-evidently the same expression on both sides; a
+// rounding formula stated twice is not.
+__host__ __device__ __forceinline__ int absorb_nquad(int kvl) { return (kvl + 3) >> 2; }
+
 // Wave-cooperative fp8-e4m3 block-scaled dot for one output row `o`. `wrow` =
 // packed[o*i_dim..], `scalerow` = scale + (o/block)*sc_cols (the row's block-scale
 // row), so element i uses scalerow[i>>bsh]. `lut` is the block's e4m3_lut_build
@@ -80,7 +87,16 @@ __device__ __forceinline__ float fp8_dot_strided(const float* __restrict__ x,
                                                  int start, int stride) {
     float acc = 0.0f;
     const unsigned int* w4 = (const unsigned int*)wrow;
-    int n4 = i_dim >> 2;
+    // The dword path applies ONE block scale to a quad's four columns, so it is only the
+    // right scale when the tile is at least a quad wide — at block 1 or 2 the columns
+    // past the tile boundary were silently given i0's. Both are powers of two, so guard
+    // 1003 passes them. Zeroing `n4` hands the row to the per-column tail below, which
+    // was already correct; block ≥ 4 (the engine runs 128) is untouched and bit-identical.
+    // TWO KNOWN GAPS REMAIN, both recorded in docs/PERF.md #4: the Vulkan twin
+    // (vk/fp8.glsl) still has this bug and its oracle mirrors it, and `rivoli_gemv_fp8`
+    // still does not guard the `i_dim % 4` this `w4` cast needs — a requirement that is
+    // now CONDITIONAL, since at block < 4 the cast is never reached.
+    int n4 = (block >= 4) ? (i_dim >> 2) : 0;
     int bsh = blk_shift(block);
     for (int j = start; j < n4; j += stride) {
         unsigned int p = w4[j];
