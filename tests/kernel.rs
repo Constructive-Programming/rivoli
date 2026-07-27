@@ -922,6 +922,20 @@ fn moe_i4_real_data_vs_fp8_ground_truth() {
         "the assertion bands characterise the fp8->int4 chain; this artifact is {}",
         prov.chain
     );
+    // A set quantized at a different group size is a differently-shaped scale array,
+    // not a slightly-different one: reading it walks the wrong strides and yields
+    // rel_l2=NaN rather than a large error. Skip loudly instead of asserting on NaN,
+    // which reports "systematic gain error" and sends the reader hunting a numerics
+    // bug that is really a stale artifact.
+    if prov.group != Some(rivoli::quant::I4_GROUP) {
+        eprintln!(
+            "skip moe_i4_real_data_vs_fp8: artifact is group {:?}, this build reads group {} \
+             — rebuild with fp8_to_i4",
+            prov.group,
+            rivoli::quant::I4_GROUP
+        );
+        return;
+    }
     assert!(
         prov.layers[0] <= LAYER && LAYER < prov.layers[1],
         "layer {LAYER} outside the stamped range {:?}",
