@@ -7,6 +7,13 @@ proposals ([CACHE_ROUTE](CACHE_ROUTE.md), [CACHE_PILOT](CACHE_PILOT.md), the fp8
 work). Residency / cache-conditional routing is **not** covered here — it is owned in full
 by those two proposals.
 
+**A correctness defect found by this document's per-kernel work does NOT live in this
+document.** The `route` tranche turned up an fp8 block scale mis-applied at `block < 4`,
+affecting every fp8 block-scaled GEMV — it is written up in **benchmarks.md, "Bugs found
+and fixed"**, because someone auditing numerics reads that file and someone tuning kernels
+reads this one. Two known-broken twins are recorded there too. Perf items cross-reference
+the bug; they do not host it.
+
 ## How to read — and write — this document
 
 **A phase profile localises cost; it does not explain it.** Any mechanism attributed to a
@@ -261,16 +268,11 @@ Grounded in the measured kernel profile.
    load) and `block < 4` (a quad would straddle two scale tiles). Both kept legal because
    the Vulkan launcher accepts them and the backends must span one domain.
 
-   **This turned up a latent correctness defect in `fp8_dot_strided` itself.** Its dword
-   path has always applied ONE block scale to a quad's four columns, which is wrong for
-   `block` 1 or 2 — both powers of two, so guard 1003 passes them, and
-   `gemv_fp8_rejects_non_power_of_two_block` *explicitly requires* block=1 to be accepted.
-   Every fp8 GEMV and `mla_value_fp8` was silently mis-scaling three columns in four at
-   those tiles. Found by the block=2 shape added alongside the absorb work, fixed by
-   zeroing `n4` so the already-correct per-column tail takes the row, bit-identical at
-   block ≥ 4. **The Vulkan twin (`kernels/vk/fp8.glsl`) still has it, and tests/vk.rs's
-   oracle mirrors the bug so that backend cannot see it either** — recorded in
-   `kernels/common.hpp`, not fixed, because this branch had no Vulkan device slot.
+   **This work also turned up a CORRECTNESS defect in `fp8_dot_strided`** — the block
+   scale was mis-applied at `block < 4` in every fp8 GEMV. It is a numerics bug, not a
+   perf one, so it is written up under **benchmarks.md, "Bugs found and fixed"** rather
+   than here, along with the two known-broken twins left in place (the Vulkan shader,
+   whose oracle mirrors the defect, and `rivoli_gemv_fp8`'s missing `i_dim % 4` guard).
    No shipped model is affected: every fp8 checkpoint uses `weight_block_size` 128.
 
 5. **`lm_head` split-K** *(tail).* [154880, 6144] int8 GEMV — the one big tail cost. Split-K

@@ -70,6 +70,73 @@ moe-gpu), not fetch-bound, at this budget. hybrid/lru's edge is the fewest misse
 
 ## Bugs found and fixed
 
+### fp8 block scale MIS-APPLIED at `block < 4` — every fp8 GEMV (fixed)
+
+**A numerics bug, not a perf one, and it sat in the helper every fp8 block-scaled GEMV
+goes through.** `common.hpp::fp8_dot_strided` reads four fp8 weights per lane as one dword
+and applies **one** block scale to all four:
+
+```c
+float s = scalerow[i0 >> bsh];              // ONE scale for columns i0..i0+3
+acc += s * (x[i0]*lut[..] + x[i0+1]*lut[..] + x[i0+2]*lut[..] + x[i0+3]*lut[..]);
+```
+
+That is only the right scale when the scale tile is at least a quad wide. At `block` 1 or
+2 the columns past the tile boundary belong to *later* tiles and silently took `i0`'s —
+three of four at block=1, the upper two at block=2. Affected `gemv_fp8`,
+`gemv_fp8_splitk` and `mla_value_fp8`, i.e. `o_proj`, `q_a`, `q_b`, `kv_a`, the dense MLP
+and the MLA value projection.
+
+**The guard test was actively asserting the broken domain.** `blk_shift` needs a
+power-of-two tile, so guard 1003 rejects non-powers-of-two — and 1 and 2 *are* powers of
+two, so they passed. `gemv_fp8_rejects_non_power_of_two_block` goes further and
+**explicitly requires block=1 to be ACCEPTED** ("1 is a power of two (bsh = 0,
+`i >> 0` == `i / 1`), so it must be ACCEPTED"). The launcher's contract said the input was
+legal while the kernel computed it wrong, which is the worst of the two failure modes: no
+error code, no fault, just wrong numbers.
+
+**Why nothing caught it.** Every oracle shape in the suite used `block = 128`. A tile that
+wide can never expose a quad straddling two tiles, so the entire fp8 oracle set was
+structurally incapable of seeing this — the same class of blind spot as the `fnv` note
+below, where an instrument is green because its inputs cannot reach the defect.
+
+**Found** by a `block = 2` shape added to `mla_fp8_matches_reference` while restructuring
+`mla_absorb_fp8` — the quad restructure needs exactly the same `block >= 4` precondition,
+which is what prompted asking whether the existing helper had it. It did not.
+`mla_value` at block=2 failed at **err 2.2e-1 against tol 1.5e-3**; `gemv_fp8` at block=2
+failed at **err 6.2e-1**. Both are hard failures, not tolerance grazes.
+
+**Fix**, one line, in the helper rather than the callers:
+
+```c
+int n4 = (block >= 4) ? (i_dim >> 2) : 0;   // narrow tile → per-column tail path
+```
+
+The per-column tail loop below it was always correct, so zeroing `n4` hands it the whole
+row. **Bit-identical at `block >= 4`** — the engine runs 128, and the generated ISA for
+the hot loop is byte-for-byte unchanged, so no shipped model's numerics moved. Post-fix
+margins: `mla_value` block=2 at 12318×, `gemv_fp8` block=2 and block=1 green.
+
+**TWO TWINS ARE KNOWN-BROKEN AND DELIBERATELY LEFT.** Both are recorded in
+`kernels/common.hpp` at the fix site and in docs/PERF.md #4:
+
+- **`kernels/vk/fp8.glsl::fp8_dot_strided` has the identical bug** — same loop, same
+  unconditional `n4 = i_dim >> 2`, same one-scale-per-quad. **And `tests/vk.rs`'s
+  `oracle_fp8_dot_strided` MIRRORS the kernel, including this behaviour** (`let s =
+  scalerow[i0 / block];` for the whole quad). So the Vulkan suite is **structurally blind
+  to it**: the oracle and the kernel agree *because they share the defect*, and adding a
+  block<4 shape there would pass while still being wrong. Fixing it means changing the
+  shader **and** its oracle together. Not done here — this branch had no Vulkan device
+  slot, and an unrunnable fix to a second backend is worse than a recorded divergence.
+- **`rivoli_gemv_fp8` still lacks the `i_dim % 4` guard** its `w4` cast needs (rows are
+  `i_dim` bytes apart, so a ragged `i_dim` misaligns three rows in four). `src/vk.rs`
+  enforces it; `rivoli_mla_value_fp8` now enforces the equivalent `kvl % 4` (guard 1002,
+  a parity gap this same work found and fixed). The requirement is **conditional** — at
+  `block < 4` the cast is never reached — which is why it is a guard question rather than
+  a second bug. Not added because a launcher guard that fires hard-fails a decode, and
+  this branch was barred from running the engine to confirm no live projection dim trips
+  it. Every GLM dim is a multiple of 4; the exposure is a future config, not this one.
+
 ### int4 degeneration — WRONG `.i4` SOURCE (fixed)
 
 `--mode int4` used to collapse into repetition from token 0 (distinct-token ratio 0.04).
