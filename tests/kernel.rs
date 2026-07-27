@@ -1102,25 +1102,34 @@ fn moe_i4_real_data_vs_fp8_ground_truth() {
     // Margins, not just pass/fail — a run drifting from 0.24 toward 0.32 stays green
     // and unremarked right up until it crosses (the reason `assert_close` prints them).
     println!(
-        "moe_i4_vs_fp8: rel_l2={rel_l2:.4} (band 0.26..0.33) gain={gain:.4} (band 0.97..1.04) \
-         max_err/max|ref|={rel_max:.4} (bound 0.25)"
+        "moe_i4_vs_fp8: rel_l2={rel_l2:.4} (band 0.14..0.20) gain={gain:.4} (band 1.01..1.09) \
+         max_err/max|ref|={rel_max:.4} (bound 0.16)"
     );
+    // These bands describe GROUP-128 (`quant::I4_GROUP`). The per-row format they replaced
+    // anchored at rel_l2 0.2951 / gain 1.0009; group-128 measures 0.1698 / 1.0493 on the
+    // same artifact coordinates and seed — a 42% error reduction, and the reason `--mode
+    // int4` went from PPL 73.43 to 5.12. Changing `I4_GROUP` moves these ON PURPOSE:
+    // re-anchor with `bin/i4_audit`, do not widen. (A mismatched artifact never reaches
+    // here — the group gate above skips it, because reading one yields rel_l2=NaN and this
+    // assertion would then blame a "systematic gain error" for a stale file.)
     assert!(
-        (0.97..=1.04).contains(&gain),
+        (1.01..=1.09).contains(&gain),
         "SYSTEMATIC gain error vs fp8 ground truth: gain={gain:.4}. Cosine scores 1.0000 \
-         for any uniform or per-row scale error, so nothing else here would see this."
+         for any uniform or per-group scale error, so nothing else here would see this. \
+         Group-128 at an amax/7 step runs slightly hot (~1.05) because the step is set by \
+         each group's own extreme; a value near 1.00 means the loading factor changed."
     );
     assert!(
-        (0.26..=0.33).contains(&rel_l2),
-        "rel_l2={rel_l2:.4} != the deterministic 0.2951 this artifact and seed produce. \
-         Below 0.26 the reference has collapsed into the thing it checks (a 6144-wide row \
-         at an amax/7 step MUST lose ~0.20, ~0.30 through the silu chain); above 0.33 the \
-         derivation is wrong, not merely coarse. A change to `quant_i4`'s loading factor \
-         moves this ON PURPOSE — rebuild the anchor with bin/i4_audit, do not widen."
+        (0.14..=0.20).contains(&rel_l2),
+        "rel_l2={rel_l2:.4} != the deterministic 0.1698 this artifact and seed produce. \
+         Below 0.14 the reference has collapsed into the thing it checks (a 128-wide group \
+         at an amax/7 step still loses ~0.12, ~0.17 through the silu chain); above 0.20 the \
+         derivation is wrong, not merely coarse — and 0.26+ is the per-row format, i.e. an \
+         artifact that predates group scales."
     );
     assert!(
-        rel_max <= 0.25,
-        "max_err/max|ref|={rel_max:.4} > 0.45 — a few corrupted output rows move this \
+        rel_max <= 0.16,
+        "max_err/max|ref|={rel_max:.4} > 0.16 — a few corrupted output rows move this \
          while leaving rel_l2 inside its band"
     );
 }
