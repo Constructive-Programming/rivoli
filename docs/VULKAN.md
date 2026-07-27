@@ -1,7 +1,21 @@
 # rivoli — Vulkan backend (`vulkan` feature)
 
-Status: **proposed, not started.** This is the plan, not a description of code that
-exists. See [ARCHITECTURE.md](ARCHITECTURE.md) for the engine it plugs into.
+Status: **kernels landed through tranche 2d (2026-07-27, merged to main). NOT RUNNABLE —
+the backend cannot decode.** 16 kernels, 37/37 green under default, sync-validation and
+GPU-AV as separate passes; the deliberate straddle break verified red-then-green; GPU-AV
+confirmed live by re-running the probe coverage matrix rather than by a clean pass.
+
+**What does not exist:** Phase 4 — the entire streaming and orchestration layer plus the
+three-queue design. `pin.rs`, `gpu.rs`, `asyncfetch.rs`, `stream.rs` and `gpustream.rs` are
+all `rocm`-gated, and `crate::backend` has **zero** consumers, so the backend switch itself
+is unbuilt. MODES.md numbers come after Phase 4, not before. Read "Phase 4 needs two
+queues, not one" before writing any integration code.
+
+The acceptance gate is **A+C+D** (see below); byte-identical token IDs are unattainable by
+construction and that is measured, not suspected. Sections below describing work as
+"planned" predate the merge — the staging table and the 2d pre-flight are current.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the engine it plugs into.
 
 ## Goal
 
