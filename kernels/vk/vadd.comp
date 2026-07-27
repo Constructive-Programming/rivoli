@@ -1,0 +1,21 @@
+// x[i] += y[i] — residual add. GLSL twin of fwd.hip::vadd.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+#include "common.glsl"
+
+layout(local_size_x = ROWS_PER_BLOCK * WAVE) in;
+
+layout(push_constant) uniform Push {
+    RwF32 x;
+    RoF32 y;
+    int n;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.n)) return;
+    pc.x.v[i] += pc.y.v[i];
+}

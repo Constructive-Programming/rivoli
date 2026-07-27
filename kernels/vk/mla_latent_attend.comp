@@ -1,0 +1,201 @@
+// MLA flash attention over the compressed KV cache in latent space. GLSL twin of
+// attn.hip::mla_latent_attend. Per head:
+//
+//     clat_h = Σ_t softmax_t( (qabs_h·L_t + qrope_h·R_t) · scale ) · L_t
+//
+// A block owns HB heads (one subgroup each) and stages each token tile's L/R into LDS
+// once, widened to f32, reused across all HB heads. Read attn.hip first — this file is
+// deliberately line-comparable with it.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+#extension GL_KHR_shader_subgroup_ballot : require   // subgroupBroadcast, see the score loop
+
+#include "common.glsl"
+
+#define HB 8              // heads per block, one subgroup each
+#define TILE 16           // KV tokens staged into LDS per step
+#define SUBW 32           // score-reduction subgroup width
+#define MLA_ACC_REGS 16   // per-lane online-accumulator slots
+#define ATT_THREADS (HB * SUBW)
+
+// SUBW MUST EQUAL WAVE HERE, AND THE HIP DOES NOT REQUIRE THAT.
+//
+// attn.hip reduces with `__shfl_down(part, off, SUBW)` and broadcasts with
+// `__shfl(part, 0, SUBW)` — both take a WIDTH that partitions the wavefront, so SUBW may
+// legally be a proper divisor of the hardware wave. SPIR-V's subgroup ops have NO width
+// parameter at all: `subgroupShuffleDown` always spans the whole subgroup. The
+// transliteration is correct today only because SUBW == WAVE == 32 makes the partition
+// the entire wave — a coincidence of two constants, not a property of the code.
+//
+// So it is asserted rather than assumed. If SUBW ever diverges from WAVE, this build
+// fails instead of silently reducing across the wrong lane set.
+#if SUBW != WAVE
+#error "mla_latent_attend: SPIR-V subgroup ops have no width parameter, so SUBW must equal WAVE"
+#endif
+
+// STATIC LDS, WHERE THE HIP USES DYNAMIC. `extern __shared__` sized per launch has no
+// GLSL equivalent, and the plan's suggested specialization constant is not needed: the
+// launcher already rejects kvl > MLA_ACC_REGS*SUBW (guard 1004), so the tile is bounded
+// at compile time by a limit that already exists. rope gets its own bound, which IS a
+// restriction the HIP lacks — see the launcher.
+//
+// 16*512 + 16*64 = 9216 floats = 36864 bytes. This device reports 65536, but Vulkan only
+// GUARANTEES 16384, so this is the first shader here that a conformant device could legally
+// refuse — every earlier one fits in 1-2 KB. `Gpu::missing_features` checks
+// maxComputeSharedMemorySize against MLA_ATTEND_LDS_BYTES at init so the refusal is a named
+// message rather than an opaque pipeline-creation failure.
+#define MLA_MAX_KVL (MLA_ACC_REGS * SUBW)
+#define MLA_MAX_ROPE 64
+
+shared float Lt[TILE * MLA_MAX_KVL];   // staged latent tile, widened to f32
+shared float Rt[TILE * MLA_MAX_ROPE];  // staged roped-key tile
+
+layout(local_size_x = ATT_THREADS) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RoU32a { uint v[]; };
+
+layout(push_constant) uniform Push {
+    RoF32 qabs;
+    RoF32 qrope;
+    uint64_t lc8;     // [tokens*kvl] e4m3, read as words
+    RoF32 lscale;     // [tokens*n_blocks]
+    uint64_t rc;      // [tokens*rope] bf16, read as words
+    uint64_t rows;    // [nr] uint token indices, or 0 = dense
+    RwF32 clat;
+    uint64_t partial; // split scratch, or 0 = single split
+    int H;
+    int nr;
+    int kvl;
+    int rope;
+    int n_blocks;
+    float scale;
+    int tps;
+    int max_splits;   // MLA_MAX_SPLITS from the HIP, for the partial layout
+} pc;
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint lane = gl_SubgroupInvocationID;
+    uint hb = gl_SubgroupID;
+    uint head = gl_WorkGroupID.x * HB + hb;
+    bool head_ok = head < uint(pc.H);
+
+    // Bound the unrolled accumulator loops on `k < nacc`, which is WAVE-UNIFORM. Bounding
+    // on `i < kvl` makes the predicate lane-divergent and costs an exec-mask save/restore
+    // per unrolled step — measured on the HIP side, see benchmarks.md.
+    uint nacc = uint(pc.kvl) / SUBW;
+
+    float acc[MLA_ACC_REGS];
+    for (uint k = 0u; k < MLA_ACC_REGS; ++k) acc[k] = 0.0;
+
+    float m = -1.0 / 0.0; // -inf
+    float l = 0.0;
+
+    uint qoff = (head_ok ? head : 0u) * uint(pc.kvl);
+    uint roff = (head_ok ? head : 0u) * uint(pc.rope);
+
+    int r_begin = int(gl_WorkGroupID.y) * pc.tps * TILE;
+    int r_end = min(pc.nr, r_begin + pc.tps * TILE);
+
+    for (int t0 = r_begin; t0 < r_end; t0 += TILE) {
+        int tcount = min(TILE, r_end - t0);
+
+        // Cooperative tile load, all threads, widening into LDS.
+        for (uint idx = tid; idx < uint(tcount * pc.kvl); idx += ATT_THREADS) {
+            uint tt = idx / uint(pc.kvl);
+            uint i = idx - tt * uint(pc.kvl);
+            uint t = pc.rows != 0ul ? RoU32a(pc.rows).v[uint(t0) + tt] : uint(t0) + tt;
+            uint64_t off = uint64_t(t) * uint64_t(pc.kvl) + uint64_t(i);
+            uint word = RoU32a(pc.lc8 + (off & ~3ul)).v[0];
+            uint b = (word >> ((uint(off) & 3u) * 8u)) & 0xffu;
+            Lt[idx] = e4m3f(b) * pc.lscale.v[t * uint(pc.n_blocks) + i / 128u];
+        }
+        for (uint idx = tid; idx < uint(tcount * pc.rope); idx += ATT_THREADS) {
+            uint tt = idx / uint(pc.rope);
+            uint d = idx - tt * uint(pc.rope);
+            uint t = pc.rows != 0ul ? RoU32a(pc.rows).v[uint(t0) + tt] : uint(t0) + tt;
+            // bf16 is 2 bytes: pick the half of the containing word.
+            uint64_t eoff = uint64_t(t) * uint64_t(pc.rope) + uint64_t(d);
+            uint word = RoU32a(pc.rc + ((eoff * 2ul) & ~3ul)).v[0];
+            uint h16 = (word >> ((uint(eoff) & 1u) * 16u)) & 0xffffu;
+            Rt[idx] = bf16f(h16);
+        }
+        memoryBarrierShared();
+        barrier();
+
+        if (head_ok) {
+            for (int tt = 0; tt < tcount; ++tt) {
+                // score = scale · (qa·L_tt + qr·R_tt), reduced across the subgroup.
+                float part = 0.0;
+                for (uint i = lane; i < uint(pc.kvl); i += SUBW)
+                    part += pc.qabs.v[qoff + i] * Lt[uint(tt) * uint(pc.kvl) + i];
+                for (uint d = lane; d < uint(pc.rope); d += SUBW)
+                    part += pc.qrope.v[roff + d] * Rt[uint(tt) * uint(pc.rope) + d];
+                part = wave_sum(part);
+                // A SUBGROUP broadcast, NOT an LDS one — and the LDS version was a bug.
+                //
+                // wave_sum leaves the total on lane 0 only under SPIR-V, so the value has
+                // to reach the other lanes. Staging it through `shared` needs a barrier,
+                // and this code runs inside `if (head_ok)`: when H is not a multiple of HB
+                // the inactive subgroups never arrive, which is a barrier in divergent
+                // control flow — undefined in both languages, and reachable from any test
+                // shape with a ragged head count. attn.hip has no such problem because
+                // `__shfl` is a wave-level op needing no block barrier.
+                //
+                // subgroupBroadcast is the exact analogue of `__shfl(part, 0, SUBW)`, and
+                // it is legitimate where subgroupAdd is not: a broadcast moves one lane's
+                // value, so there is no summation order to be implementation-defined. It
+                // is correct only because SUBW == WAVE, which the #error above enforces.
+                float s = subgroupBroadcast(part, 0u) * pc.scale;
+
+                // Online-softmax update, identical on every lane.
+                float m_new = max(m, s);
+                float corr = exp(m - m_new);
+                float p = exp(s - m_new);
+                for (uint k = 0u; k < MLA_ACC_REGS; ++k) {
+                    if (k < nacc) {
+                        // THE CONTRACTION IS FORCED, NOT LEFT TO THE COMPILER. The HIP is
+                        // `acc[k] = acc[k]*corr + p*Lt[..]` — two multiplies feeding one
+                        // add, so two lowerings are legal and they differ. hipcc's ISA
+                        // shows a PLAIN multiply for acc*corr and a fused multiply-add for
+                        // p*Lt (v_mul_f32 then v_fmac_f32). Writing it that way explicitly
+                        // removes the freedom rather than hoping RADV agrees.
+                        float scaled = acc[k] * corr;
+                        acc[k] = fma(p, Lt[uint(tt) * uint(pc.kvl) + lane + k * SUBW], scaled);
+                    }
+                }
+                l = fma(l, corr, p);
+                m = m_new;
+            }
+        }
+        memoryBarrierShared();
+        barrier(); // tile fully consumed before the next overwrites LDS
+    }
+
+    if (!head_ok) return;
+
+    if (pc.partial != 0ul) {
+        // Unnormalised partial, plus (m, l) alongside — normalising here would lose what
+        // the combine needs. An empty split stores m = -inf, l = 0, acc = 0, which the
+        // combine's exp(-inf - m_global) = 0 weight annihilates.
+        uint slot = gl_WorkGroupID.y * uint(pc.H) + head;
+        RwF32 pa = RwF32(pc.partial + uint64_t(slot) * uint64_t(pc.kvl) * 4ul);
+        RwF32 pml = RwF32(pc.partial
+                          + uint64_t(pc.max_splits) * uint64_t(pc.H) * uint64_t(pc.kvl) * 4ul
+                          + uint64_t(slot) * 2ul * 4ul);
+        for (uint k = 0u; k < MLA_ACC_REGS; ++k)
+            if (k < nacc) pa.v[lane + k * SUBW] = acc[k];
+        if (lane == 0u) {
+            pml.v[0] = m;
+            pml.v[1] = l;
+        }
+    } else {
+        float inv = l > 0.0 ? 1.0 / l : 0.0;
+        for (uint k = 0u; k < MLA_ACC_REGS; ++k)
+            if (k < nacc) pc.clat.v[head * uint(pc.kvl) + lane + k * SUBW] = acc[k] * inv;
+    }
+}

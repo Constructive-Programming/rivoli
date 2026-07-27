@@ -2,6 +2,8 @@
 //! See docs/ARCHITECTURE.md for the module map and MODES.md for the run modes.
 pub mod arena;
 pub mod attn;
+/// The build-time backend switch (`rocm` XOR `vulkan`) — see docs/VULKAN.md.
+pub mod backend;
 pub mod cache;
 pub mod config;
 pub mod device;
@@ -27,3 +29,6 @@ pub mod hip;
 pub mod pin;
 #[cfg(feature = "rocm")]
 pub mod stream;
+
+#[cfg(feature = "vulkan")]
+pub mod vk;

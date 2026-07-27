@@ -1,0 +1,82 @@
+// y[o] = Σ_i x[i]·e4m3(packed[o·i_dim+i])·scale[(o>>bsh)·sc_cols + (i>>bsh)] — fp8
+// block-scaled GEMV (attention/dense projections). GLSL twin of linalg.hip::gemv_fp8,
+// carrying common.hpp::fp8_dot_strided.
+//
+// Both the wave-per-row form and the split-K form live in this one module, selected by
+// a push-constant flag, because they share the whole dot and differ only in how the
+// block's threads are assigned. Two shaders would mean two copies of the fp8 MAC, and
+// that MAC is a bit-exactness contract with quant.rs::matvec_fp8.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+#include "common.glsl"
+
+#define THREADS (ROWS_PER_BLOCK * WAVE)
+
+layout(local_size_x = THREADS) in;
+
+// `lut` before the include: fp8.glsl's MAC reads it by name, because GLSL cannot take an
+// array parameter without copying it per invocation (rule 11).
+shared float lut[256];
+#include "fp8.glsl"
+
+layout(push_constant) uniform Push {
+    RoF32 x;
+    RoU32 packed;
+    RoF32 scale;
+    RwF32 y;
+    int o_dim;
+    int i_dim;
+    int block;
+    int splitk;   // 0 = one wave per row; 1 = one BLOCK per row, split-K over i_dim
+} pc;
+
+shared float part[ROWS_PER_BLOCK];   // split-K: one partial per wave
+
+// The row's weight address and its block-scale row, as fp8.glsl wants them: already
+// offset, matching how the HIP original passes pointers.
+uint64_t wrow_of(uint o) { return uint64_t(pc.packed) + uint64_t(o) * uint64_t(pc.i_dim); }
+RoF32 scalerow_of(uint o, int bsh, uint sc_cols) {
+    return RoF32(uint64_t(pc.scale) + uint64_t((o >> uint(bsh)) * sc_cols) * 4ul);
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    E4M3_LUT_BUILD(lut, tid);
+    barrier();
+
+    uint lane = gl_SubgroupInvocationID;
+    int bsh = blk_shift(pc.block);
+    uint sc_cols = (uint(pc.i_dim) + uint(pc.block) - 1u) / uint(pc.block);
+
+    if (pc.splitk == 0) {
+        // One WAVE per output row; adjacent lanes read adjacent columns.
+        uint o = gl_WorkGroupID.x * ROWS_PER_BLOCK + gl_SubgroupID;
+        if (o >= uint(pc.o_dim)) return;
+        float acc = dot_fp8_wave(pc.x, wrow_of(o), scalerow_of(o, bsh, sc_cols),
+                                 pc.i_dim, pc.block, lane);
+        if (lane == 0u) pc.y.v[o] = acc;
+        return;
+    }
+
+    // Split-K: ONE BLOCK per output row, its ROWS_PER_BLOCK waves each reducing a
+    // strided 1/K share of i_dim, combined in LDS in FIXED ORDER. o_proj has too few
+    // rows to fill the machine under wave-per-row; this gives K times the blocks.
+    uint o = gl_WorkGroupID.x;
+    if (o >= uint(pc.o_dim)) return;
+    float acc = fp8_dot_strided(pc.x, wrow_of(o), scalerow_of(o, bsh, sc_cols),
+                                pc.i_dim, pc.block, tid, THREADS);
+    acc = wave_sum(acc);
+    if (lane == 0u) part[gl_SubgroupID] = acc;
+    barrier();
+    if (tid == 0u) {
+        // Fixed loop order, not an atomic — the combine order is part of the
+        // reproducibility contract, exactly as in the HIP original.
+        float sum = 0.0;
+        for (uint w = 0u; w < ROWS_PER_BLOCK; ++w) sum += part[w];
+        pc.y.v[o] = sum;
+    }
+}

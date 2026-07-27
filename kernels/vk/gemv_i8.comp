@@ -1,0 +1,51 @@
+// y[o] = scale[o] * Σ_i x[i]·(int8)packed[o·i_dim+i] — per-row int8 GEMV (lm_head to
+// logits). GLSL twin of linalg.hip::gemv_i8.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+#include "common.glsl"
+
+layout(local_size_x = ROWS_PER_BLOCK * WAVE) in;
+
+// Packed int8 read as UINT WORDS and unpacked by hand — VK_KHR_8bit_storage is
+// deliberately not required (docs/VULKAN.md).
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RoU32 { uint v[]; };
+
+layout(push_constant) uniform Push {
+    RoF32 x;
+    RoU32 packed;
+    RoF32 scale;
+    RwF32 y;
+    int o_dim;
+    int i_dim;
+} pc;
+
+void main() {
+    uint lane = gl_SubgroupInvocationID;
+    uint o = gl_WorkGroupID.x * ROWS_PER_BLOCK + gl_SubgroupID;
+    if (o >= uint(pc.o_dim)) return;
+
+    // 64-BIT, like embed_i8_row and for the same reason: lm_head is
+    // [151552, 5120] = 7.76e8 bytes, only 5.5x under the 2^32 element ceiling recorded
+    // in docs/VULKAN.md, and a wrap reads silently from another allocation rather than
+    // faulting. `o * i_dim` is the product that gets close.
+    uint64_t row = uint64_t(o) * uint64_t(pc.i_dim);
+
+    float acc = 0.0;
+    for (uint i = lane; i < uint(pc.i_dim); i += WAVE) {
+        uint64_t byte_off = row + uint64_t(i);
+        // Address the containing word directly; indexing `v[]` with a truncated 32-bit
+        // index would defeat the 64-bit arithmetic above.
+        uint word = RoU32(uint64_t(pc.packed) + (byte_off & ~3ul)).v[0];
+        uint shift = uint(byte_off & 3ul) * 8u;
+        // Sign-extend: shift the byte to the top, then an ARITHMETIC right shift back.
+        // Reading it unsigned is the obvious bug and shows only on values >= 0x80.
+        int b = int(word << (24u - shift)) >> 24;
+        acc += pc.x.v[i] * float(b);
+    }
+    acc = wave_sum(acc);
+    if (lane == 0u) pc.y.v[o] = acc * pc.scale.v[o];
+}

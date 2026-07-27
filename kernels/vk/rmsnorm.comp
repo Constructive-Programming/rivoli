@@ -1,0 +1,56 @@
+// y = x * rsqrt(mean(x^2) + eps) * w. GLSL twin of linalg.hip::rmsnorm — one workgroup,
+// grid-stride sum, fixed-order LDS tree.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+#include "common.glsl"
+
+#define RMS_THREADS (ROWS_PER_BLOCK * WAVE)
+
+// The LDS tree halves RMS_THREADS to 1, which only visits every slot if the count is a
+// power of two — same coupling as argmax_reduce, and silent when violated: a dropped
+// slot understates the sum of squares, so the norm comes out too large everywhere.
+#if (RMS_THREADS & (RMS_THREADS - 1)) != 0
+#error "rmsnorm: ROWS_PER_BLOCK*WAVE must be a power of two — the LDS halving tree drops slots otherwise"
+#endif
+
+layout(local_size_x = RMS_THREADS) in;
+
+layout(push_constant) uniform Push {
+    RoF32 x;
+    RoF32 w;
+    RwF32 y;
+    int n;
+    float eps;
+} pc;
+
+shared float red[RMS_THREADS];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    float local = 0.0;
+    for (uint i = t; i < uint(pc.n); i += RMS_THREADS) {
+        float xv = pc.x.v[i];
+        local += xv * xv;
+    }
+    red[t] = local;
+    barrier();
+    // Fixed-order tree, matching common.hpp. A sum, so the order IS the result — this is
+    // the same reason wave_sum is a shuffle ladder rather than subgroupAdd.
+    for (uint s = RMS_THREADS / 2u; s > 0u; s >>= 1) {
+        if (t < s) red[t] += red[t + s];
+        barrier();
+    }
+    // `1.0 / sqrt(z)`, NOT `inversesqrt(z)`. They are different functions with different
+    // accuracy contracts: Vulkan specifies inversesqrt to 2 ULP as a single operation,
+    // where HIP computes `1.0f / sqrtf(z)` from a correctly-rounded sqrt and a
+    // correctly-rounded divide. Substituting it looks like the idiomatic GLSL and would
+    // move the result — a divergence no oracle tolerance would flag and build.rs cannot
+    // see, since it is a function swap rather than an arithmetic rewrite.
+    float inv = 1.0 / sqrt(red[0] / float(pc.n) + pc.eps);
+    for (uint i = t; i < uint(pc.n); i += RMS_THREADS) {
+        pc.y.v[i] = pc.x.v[i] * inv * pc.w.v[i];
+    }
+}

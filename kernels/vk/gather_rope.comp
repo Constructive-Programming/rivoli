@@ -1,0 +1,33 @@
+// qrope[head*ropn + d] = q[head*qh + nope + d] — gather each head's roped query
+// segment out of the strided q[H*qh] into contiguous qrope[H*ropn] for the flash
+// kernel. GLSL twin of fwd.hip::gather_rope.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+#include "common.glsl"
+
+layout(local_size_x = ROWS_PER_BLOCK * WAVE) in;
+
+layout(push_constant) uniform Push {
+    RoF32 q;
+    RwF32 qrope;
+    int h;
+    int qh;
+    int nope;
+    int ropn;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= uint(pc.h) * uint(pc.ropn)) return;
+    uint head = idx / uint(pc.ropn);
+    uint d = idx % uint(pc.ropn);
+    // 32-bit indexing is deliberate here and the bound is small: q is [h, qh] with
+    // h = n_heads and qh the per-head query dim, so h*qh is O(1e4) — nine orders of
+    // magnitude under the 2^32 element ceiling recorded in docs/VULKAN.md. embed_i8_row
+    // is the kernel in this tranche that actually needs 64-bit; this one does not, and
+    // widening it would cost an address computation per invocation for nothing.
+    pc.qrope.v[idx] = pc.q.v[head * uint(pc.qh) + uint(pc.nope) + d];
+}

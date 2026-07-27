@@ -13,8 +13,13 @@
 //! the pin is filled once and freed as a unit, so a free-list would be dead
 //! weight.
 //!
-//! The whole module is empty without the `rocm` feature — there is no device to
-//! allocate on in a CPU-only dev build.
+//! The whole module is empty without a backend feature — there is no device to
+//! allocate on in a CPU-only dev build. `rocm` and `vulkan` each supply the same
+//! four names (`mem_info`, `DeviceTier`, `DeviceBuf`, `VmmBuf`) so everything above
+//! `crate::device::` reads identically either way; the Vulkan half lives in
+//! `vktier` and differs in exactly one respect, which is the reason it is not a
+//! mechanical transliteration: a host pointer and a device address are two unrelated
+//! numbers there (docs/VULKAN.md, "Host pointer != device address").
 
 #[cfg(feature = "rocm")]
 mod ffi {
@@ -431,6 +436,369 @@ mod tier {
         fn tier_rejects_overflow() {
             let mut tier = DeviceTier::new(1 << 20).expect("alloc tier");
             assert!(tier.place(&vec![0u8; (1 << 20) + 1]).is_err());
+        }
+    }
+}
+
+#[cfg(feature = "vulkan")]
+pub use vktier::{DeviceBuf, DeviceTier, VmmBuf, mem_info};
+
+/// The same four names over Vulkan. Every allocation is a [`crate::vk::Buf`] — one
+/// `VkBuffer` on its own `DEVICE_LOCAL | HOST_VISIBLE` allocation, permanently mapped
+/// — which is the Vulkan spelling of what `kernels/vmm.hip` gives the HIP side, so the
+/// shapes above (bump-allocated resident slab, rewritten per-token buffer) carry over
+/// unchanged.
+///
+/// What does NOT carry over is that a HIP device pointer is also a host pointer. Here
+/// the two bases are unrelated numbers, so every type below is explicit about which one
+/// it hands out: the tier writes through the mapping and returns device addresses, and
+/// `DeviceBuf`'s `copy_*` were already explicit transfers and need no change at all.
+#[cfg(feature = "vulkan")]
+mod vktier {
+    use crate::vk::Buf;
+    use anyhow::{Result, ensure};
+
+    /// Free device memory and total, in bytes. Live free figure via
+    /// VK_EXT_memory_budget — see [`crate::vk::Gpu::mem_info`] for what happens when
+    /// the extension is absent.
+    pub fn mem_info() -> Result<(usize, usize)> {
+        Ok(crate::vk::gpu()?.mem_info())
+    }
+
+    /// A resident device slab with a bump cursor. Weights placed into it stay resident
+    /// for the run; the kernels read them by the returned device address. Freed as a
+    /// unit on drop.
+    pub struct DeviceTier {
+        slab: Buf,
+        capacity: usize,
+        used: usize,
+    }
+
+    impl DeviceTier {
+        /// Leave this much device memory free beyond the tier (driver scratch, kernel
+        /// dispatch buffers, the cold-fetch slabs that arrive in M4).
+        const HEADROOM: usize = 4 << 30; // 4 GiB
+
+        /// Allocate the resident tier once. Fails if the request doesn't fit free
+        /// device memory with headroom.
+        ///
+        /// No sole-tenant guard here, unlike the HIP path. That guard reads amdgpu's
+        /// `mem_info_gtt_used` sysfs node, which reports whole-device tenancy and knows
+        /// nothing about which API allocated it — so running it again under Vulkan would
+        /// be the same check against the same counter, and on a non-amdgpu driver (the
+        /// portability this backend exists for) it fails open and warns, which is noise.
+        /// ponytail: one copy of a backend-independent guard, and it stays where the
+        /// wedge bug it defends against actually was.
+        pub fn new(capacity: usize) -> Result<Self> {
+            let (free, _total) = mem_info()?;
+            ensure!(
+                capacity + Self::HEADROOM <= free,
+                "device tier {capacity} + {} headroom > free {free}",
+                Self::HEADROOM
+            );
+            Ok(Self {
+                slab: Buf::new(capacity)?,
+                capacity,
+                used: 0,
+            })
+        }
+
+        /// Reserve `bytes.len()` device bytes (256-aligned), fill them, and return the
+        /// placed weight's DEVICE address.
+        ///
+        /// This is where the HIP path's convenient coincidence stops being one. Filling
+        /// means writing at a HOST address; the kernels need a DEVICE address; only the
+        /// tier knows both bases, so it is the only thing that can translate. Fusing
+        /// reserve and fill keeps that translation in one place, once per placement at
+        /// startup, and means a caller cannot end up holding a device address for bytes
+        /// that were never written.
+        ///
+        /// The cursor advances by `bytes.len()` rounded up to [`crate::vk::WORD`].
+        ///
+        /// BELT, NOT BRACES — and the earlier version of this comment overstated it.
+        /// It claimed the padding is what stops one placement's 32-bit read reaching
+        /// into the next placement's data. It is not: `off` is already rounded to 256,
+        /// so `round_up_256(off + len) == round_up_256(off + span)` for every `len`
+        /// (the gap is at most 3), and the returned addresses are byte-identical with
+        /// and without this rounding. The end-of-slab case is likewise already covered
+        /// by `Buf::new` allocating `capacity.next_multiple_of(WORD)`.
+        ///
+        /// So today this changes nothing observable, and it is kept for one reason: it
+        /// makes the invariant hold on `span` rather than on the 256-byte alignment
+        /// happening to be larger than a word. Anyone lowering that alignment — a
+        /// plausible tightening, since 256 is generous for f32 weights — would
+        /// otherwise turn a benign read into a live overrun into the next placement's
+        /// bytes. Cheap insurance against a change that would look safe.
+        ///
+        /// Vulkan-only: HIP reads bytes directly and has no word-read hazard, so
+        /// shifting the ROCm arena's offsets for this would be a real behaviour change
+        /// for nothing.
+        ///
+        /// Errors if the tier is full — the pin is sized to fit, so OOM here is a
+        /// budgeting bug, not a runtime condition.
+        // NO `device_sync()` here, unlike `DeviceBuf::copy_in_at` which needs one. That
+        // asymmetry is deliberate and narrow: placement happens once at startup, before
+        // any dispatch is recorded, so there is no in-flight kernel for the host write to
+        // race. If placement ever becomes something the engine does mid-decode — a
+        // re-pin, a hot-swap — this needs the same sync `copy_in_at` got, for the same
+        // reason.
+        pub fn place(&mut self, bytes: &[u8]) -> Result<*mut u8> {
+            let off = (self.used + 255) & !255;
+            let span = bytes.len().next_multiple_of(crate::vk::WORD);
+            ensure!(
+                off + span <= self.capacity,
+                "device tier OOM: need {} (padded to {span}) at offset {off}, capacity {}",
+                bytes.len(),
+                self.capacity
+            );
+            self.slab.write_at(off, bytes)?;
+            self.used = off + span;
+            Ok((self.slab.ptr() as usize + off) as *mut u8)
+        }
+
+        /// Read the slab's first `len` bytes back to the host.
+        ///
+        /// Test-only, and the tests need it: what [`DeviceTier::place`] returns is a
+        /// device address, so there is no other way to observe what a placement wrote.
+        #[cfg(test)]
+        fn read_prefix(&self, len: usize) -> Result<Vec<u8>> {
+            let mut out = Vec::new();
+            self.slab.read_into(&mut out, len)?;
+            Ok(out)
+        }
+    }
+
+    /// A standalone mutable device buffer — per-token activations, the descriptor
+    /// array, the MoE accumulator. Sized once and rewritten each token via
+    /// `copy_in_at`, exactly as under HIP: this type always spelled its transfers out,
+    /// so it is the one that ports with no design change.
+    ///
+    /// The `copy_out*` family reads the mapping directly rather than issuing a
+    /// `vkCmdCopyBuffer`, so unlike `hipMemcpy` it does NOT synchronise: call
+    /// [`crate::vk::device_sync`] first if a kernel wrote the bytes you are reading.
+    pub struct DeviceBuf {
+        buf: Buf,
+        len: usize,
+    }
+
+    impl DeviceBuf {
+        /// Allocate `len` uninitialized device bytes (e.g. a cold-expert slot filled
+        /// later via [`DeviceBuf::copy_in_at`]).
+        pub fn new(len: usize) -> Result<Self> {
+            Ok(Self {
+                buf: Buf::new(len)?,
+                len,
+            })
+        }
+
+        /// Overwrite `bytes` at byte offset `off` — grows a KV slab by one token or
+        /// fills a cold-expert slot without reallocating.
+        pub fn copy_in_at(&mut self, off: usize, bytes: &[u8]) -> Result<()> {
+            // SYNC FIRST. The HIP twin is `hipMemcpy(..., H2D)`, which BLOCKS and so
+            // orders itself after any kernel still reading this buffer. A bare host
+            // write into a mapped allocation does not: a dispatch already recorded into
+            // the open command buffer but not yet submitted would read the NEW bytes,
+            // turning a write-after-read hazard into wrong data. `gpu.rs:843` (descs_vq
+            // / wexpert_buf) depends on the blocking behaviour and has no device_sync
+            // of its own.
+            crate::vk::device_sync()?;
+            // `write_at` already bounds-checks, and its message names the offset,
+            // length and capacity.
+            self.buf.write_at(off, bytes)
+        }
+
+        /// Copy the whole buffer back to host as a fresh `Vec` (the ergonomic form the
+        /// kernel oracle tests use; the per-token decode path uses
+        /// [`DeviceBuf::copy_out_into`] to reuse a buffer instead).
+        pub fn copy_out(&self) -> Result<Vec<u8>> {
+            let mut out = Vec::new();
+            self.copy_out_into(&mut out)?;
+            Ok(out)
+        }
+
+        /// Copy the FIRST `len` bytes back into `out` (reused: cleared then resized).
+        /// For partially-written buffers — e.g. the indexer's score slab, sized to
+        /// max_ctx but holding only `nt` scores this step.
+        pub fn copy_out_prefix(&self, out: &mut Vec<u8>, len: usize) -> Result<()> {
+            crate::vk::device_sync()?;
+            self.buf.read_into(out, len)
+        }
+
+        /// Copy the whole buffer back into `out` (a caller-owned buffer reused across
+        /// tokens, so the per-token readback allocates nothing once it has grown).
+        /// SYNC FIRST, for the same reason as [`DeviceBuf::copy_in_at`] — the HIP twin
+        /// is a blocking `hipMemcpy(..., D2H)` and callers were written against that.
+        ///
+        /// Without it, `gpu.rs:789` (`launch_gemv_f32` then immediately
+        /// `gate_logits.copy_out_into`) would read the PREVIOUS token's gate logits,
+        /// because the dispatch is still sitting unsubmitted in the open command
+        /// buffer. Routing would then pick the wrong experts every layer of every
+        /// token, coherently, with no error. `gpu.rs:972` (`launch_argmax` then
+        /// `argmax_dev.copy_out_into`) is the same shape and yields the wrong token.
+        pub fn copy_out_into(&self, out: &mut Vec<u8>) -> Result<()> {
+            crate::vk::device_sync()?;
+            self.buf.read_into(out, self.len)
+        }
+
+        // No `copy_out_raw`. Its HIP twin takes a bare device pointer with no owning
+        // object, which works only because that number is also a host address. Here it
+        // is not, and an address carries no identity — recovering the mapping means
+        // asking `vk.rs`'s address registry which `Buf` contains the range and reading
+        // through that. Its one caller is the `trace`-feature expert-checksum probe, so
+        // that plumbing would exist purely to serve a diagnostic: build it if and when
+        // the probe is wanted under Vulkan, and hash through the owning `DeviceBuf`
+        // until then.
+
+        pub fn ptr(&self) -> *const u8 {
+            self.buf.ptr()
+        }
+        pub fn ptr_mut(&mut self) -> *mut u8 {
+            self.buf.ptr_mut()
+        }
+    }
+
+    /// The routed-expert pool's backing allocation: device-local at full bandwidth AND
+    /// host-writable in place, so a cold expert lands in it without an H2D copy.
+    ///
+    /// Where the HIP `VmmBuf` hands out ONE pointer that `pin.rs` uses simultaneously as
+    /// the io_uring O_DIRECT DMA target and as the base for every expert descriptor's
+    /// six device pointers (`ArenaPool::ptr`, `src/pin.rs`), those are two numbers here
+    /// and this type must hand them out separately — see docs/VULKAN.md, "Host pointer
+    /// != device address". [`VmmBuf::ptr`] is the device base, for descriptor
+    /// arithmetic, [`VmmBuf::host_mut`] is the DMA target, and callers must say which
+    /// one they mean.
+    pub struct VmmBuf {
+        buf: Buf,
+    }
+
+    impl VmmBuf {
+        pub fn new(len: usize) -> Result<Self> {
+            let mut buf = Buf::new(len)?;
+            // The cold-expert streamer DMAs O_DIRECT straight into this mapping — no
+            // bounce, no staging copy — which is legal only while the base is
+            // 4096-aligned. `vkMapMemory` guarantees `minMemoryMapAlignment`, which is
+            // page-sized on every driver we have seen and is NOT required to be. That
+            // "in practice" is exactly the kind of premise that fails on someone else's
+            // machine, as EINVAL from the first read inside the reaper rather than
+            // anything legible, so it is checked here instead of assumed.
+            //
+            // The other half of the requirement, the slot STRIDE, is VQ_ALIGN and is
+            // enforced by the arena; see `crate::format` and `slot_span` in pin.rs.
+            let base = buf.host_mut() as usize;
+            ensure!(
+                base.is_multiple_of(crate::vk::O_DIRECT_ALIGN),
+                "mapped base {base:#x} is not {}-byte aligned, so io_uring O_DIRECT \
+                 reads into the routed pool would fail with EINVAL",
+                crate::vk::O_DIRECT_ALIGN
+            );
+            Ok(Self { buf })
+        }
+
+        /// The DEVICE base. Descriptor pointers are computed from this; it is not
+        /// host-dereferenceable.
+        pub fn ptr(&self) -> *const u8 {
+            self.buf.ptr()
+        }
+
+        /// The HOST base — the io_uring O_DIRECT DMA target, and the only one of the
+        /// two that may be dereferenced on the CPU.
+        pub fn host_mut(&mut self) -> *mut u8 {
+            self.buf.host_mut()
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn tier_roundtrips_placed_bytes() {
+            let mut tier = DeviceTier::new(4 << 20).expect("alloc tier");
+            let a: Vec<u8> = (0..1000u32).map(|i| (i & 0xff) as u8).collect();
+            let b: Vec<u8> = (0..500u32).map(|i| ((i * 7) & 0xff) as u8).collect();
+            let pa = tier.place(&a).expect("place a");
+            let pb = tier.place(&b).expect("place b");
+            assert_ne!(pa, pb);
+            // 1000 bumps to 1024 (256-aligned) before b lands, and the returned device
+            // addresses track those offsets.
+            assert_eq!(tier.used, 1024 + 500);
+            assert_eq!(pb as usize - pa as usize, 1024);
+            // NOT read back through `pa`/`pb` the way the HIP test does: those are
+            // device addresses, and dereferencing one on the host is a segfault at best.
+            // The tier's own slab is the only host view of these bytes.
+            let got = tier.read_prefix(tier.used).expect("read back");
+            assert_eq!(&got[..a.len()], &a[..], "a corrupted");
+            assert_eq!(&got[1024..1024 + b.len()], &b[..], "b corrupted");
+        }
+
+        #[test]
+        fn tier_rejects_overflow() {
+            let mut tier = DeviceTier::new(1 << 20).expect("alloc tier");
+            assert!(tier.place(&vec![0u8; (1 << 20) + 1]).is_err());
+        }
+
+        /// `place` advances the cursor by a WORD-rounded span. Neither length in
+        /// `tier_roundtrips_placed_bytes` is ragged (1000 and 500 are both multiples of
+        /// 4), so `used` is identical with and without the padding and that test could
+        /// not tell the two apart. 1001 can.
+        #[test]
+        fn place_pads_the_cursor_to_a_word() {
+            let mut tier = DeviceTier::new(4 << 20).expect("alloc tier");
+            tier.place(&vec![7u8; 1001]).expect("place ragged");
+            assert_eq!(
+                tier.used,
+                1004,
+                "cursor must advance by the WORD-rounded span, so a shader's 32-bit \
+                 read of the final byte cannot reach the next placement"
+            );
+        }
+
+        #[test]
+        fn devicebuf_roundtrips() {
+            let mut d = DeviceBuf::new(64).expect("alloc");
+            d.copy_in_at(0, &[0u8; 64]).expect("zero");
+            let bytes: Vec<u8> = (1..=32u8).collect();
+            d.copy_in_at(8, &bytes).expect("copy in");
+            let out = d.copy_out().expect("copy out");
+            assert_eq!(out.len(), 64);
+            assert_eq!(&out[8..40], &bytes[..]);
+            assert!(out[..8].iter().all(|&v| v == 0), "wrote before the offset");
+            assert!(out[40..].iter().all(|&v| v == 0), "wrote past the bytes");
+            // The prefix form moves only `len` bytes, and `out` is reused, so its final
+            // length is the proof it did not fall back to the whole buffer.
+            let mut pre = vec![0xAAu8; 999];
+            d.copy_out_prefix(&mut pre, 16).expect("prefix");
+            assert_eq!(pre, &out[..16]);
+            assert!(d.copy_out_prefix(&mut pre, 65).is_err());
+            assert!(d.copy_in_at(48, &bytes).is_err());
+        }
+
+        /// The device base and the host base are DIFFERENT NUMBERS. This is the
+        /// central structural claim of the Vulkan port (docs/VULKAN.md, "Host pointer
+        /// != device address"), and the one a maintainer would erase by "simplifying"
+        /// two accessors back into one — a regression that reads as garbage weights
+        /// rather than a crash, because both values are plausible pointers.
+        #[test]
+        fn vmmbuf_device_and_host_bases_differ() {
+            let mut b = VmmBuf::new(1 << 20).expect("alloc");
+            let dev = b.ptr() as usize;
+            let host = b.host_mut() as usize;
+            assert_ne!(
+                dev, host,
+                "device base {dev:#x} == host base {host:#x}: either the accessors have \
+                 been collapsed, or this driver maps them identically — if the latter, \
+                 say so here rather than deleting the test, because the code must not \
+                 start depending on it"
+            );
+        }
+
+        #[test]
+        fn vmmbuf_allocates_distinct_device_bases() {
+            let a = VmmBuf::new(4096).expect("alloc a");
+            let b = VmmBuf::new(4096).expect("alloc b");
+            assert!(!a.ptr().is_null());
+            assert_ne!(a.ptr(), b.ptr());
         }
     }
 }

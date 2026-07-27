@@ -1,0 +1,9 @@
+// Same store as oob.comp's in-bounds case, but reached through an ORDINARY DESCRIPTOR
+// BINDING instead of a buffer reference. The pair is a discriminator: if a hazard is
+// reported for this shader and not for the buffer-reference one, the checker's blind
+// spot is buffer device addresses specifically — which is rivoli's entire access model
+// — rather than compute-to-transfer dependencies in general.
+#version 450
+layout(local_size_x = 1) in;
+layout(std430, binding = 0) buffer B { float v[]; };
+void main() { v[0] = v[0] + 1.0; }
