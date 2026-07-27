@@ -1,7 +1,9 @@
 # rivoli — NPU offload plan: the DSA indexer
 
-Status: **M0 and M1 MEASURED (2026-07-26). M0 clears ≥4k. M1 clears via the decoupled
-window only. A no-NPU change takes half the prize and gates the rest.** The NPU is live on
+Status: **M0 and M1 MEASURED (2026-07-26). The no-NPU device top-k is now WIRED and
+MEASURED (2026-07-27): −9.4 ms/token, 2.1% of wall, selection exact.** M0 clears ≥4k. M1
+clears via the decoupled window only, and everything past it still sits behind M1a, which
+remains not implementable as written. The NPU is live on
 this node — XRT 2.21, amdxdna 0.1, firmware 1.1.2, `/dev/accel/accel0`, Strix Halo NPU at
 `0000:c8:00.1` — and 100% idle during decode. This plan is **exclusive to one workload: the
 DSA sparse indexer.** The other NPU candidate (a spec-decode drafter) was analysed and set
@@ -11,13 +13,18 @@ and the NPU changes only the draft cost, not the verify-union penalty that sank 
 ## The finding, in five lines
 
 1. **The prize is real above `index_topk` = 2048 and larger than the microbench said.** Measured
-   in-engine: **8.6 ms/token at 2.4k context, 11.6 ms/token at 5.2k**, against a ≥0.68
-   ms/token handoff floor. Below `index_topk` = 2048 it is ~0.32 ms/token, *less than the
+   in-engine: **8.6 ms/token at 2.4k context, 11.6 ms/token at 5.2k** (session 1; **session 2
+   measured 13.1–15.3 ms/token at the same 2.4k context and identical flags** — the prize is
+   not a stable quantity, see "Wired"), against a ≥0.68 ms/token handoff floor. Below `index_topk` = 2048 it is ~0.32 ms/token, *less than the
    handoff*, so the offload would make the engine slower there.
 2. **Half to three-quarters of the prize is not GPU work.** The host score-D2H + CPU top-k
    + row upload is **52% of the prize at 2.4k and 60% at 5.2k, measured**, rising with
    context. A device top-k kernel recovers it exactly — no approximation, no quality gate,
-   no NPU, no toolchain.
+   no NPU, no toolchain. **This is now BUILT, WIRED and MEASURED: −9.4 ms/token, 2.1% of
+   wall, selection bit-identical to the host on 10,752 real layers** (see "Wired" below).
+   The 52/60% shares are session 1; **session 2 put the host share at 69–73%** at the same
+   context. The host half is not a stable quantity — 429–533 µs/layer in one session, 214
+   in another — so every share figure in this document is softer than it looks.
 3. **The exact-overlap design (window 1) fails on engine data, at every context measured.**
    The window is ~369 µs in-engine; the indexer plus its selection step needs 409 µs at
    2.4k and 552 µs at 5.2k. It is not close, and the gap widens with context.
@@ -30,7 +37,10 @@ and the NPU changes only the draft cost, not the verify-union penalty that sank 
 5. **The measured wall under `--attn dsa` is 391 ms/token at 2.4k and 438 ms/token at
    5.2k** — the estimate this document previously used (~430 ms) was close, but the
    estimate's *reasoning* was wrong (see below). The prize is **2.2% of wall at 2.4k and
-   2.7% at 5.2k**, measured, rising to ~9% at 32k by extrapolation.
+   2.7% at 5.2k**, measured, rising to ~9% at 32k by extrapolation. **Session 2 measured
+   447–452 ms wall and a 2.9–3.4% prize at the same 2.4k context and identical flags.** The
+   15% wall difference between sessions is UNEXPLAINED, and every share-of-wall percentage
+   in this document is divided by it.
 
 **A methodological warning that belongs at the top.** Window 1's verdict moved **four
 times** under review: 22 µs (window under-scoped) → 158 µs (weights cache-resident, `q_b`
@@ -311,7 +321,8 @@ fixture, not ties.**
 
 **Corrected finding.** The device kernel is faster than the host on every distribution
 measured except tie-heavy at 32k. The margin is strongly distribution-dependent —
-**2.4–4.1× on dense, 1.13–1.25× on tie-heavy, 0.89× at tie-heavy 32k** — because ties
+**2.4–4.1× on dense, 1.13–1.25× on tie-heavy, 0.89× at tie-heavy 32k** *(fixtures, not the
+engine — the engine's own arrays measure 2.01×; see the retraction below)* — because ties
 make quickselect cheaper *and* the radix histogram dearer (tied keys collide on one LDS
 bin). It is never the regression the previous revision reported. Any single-number
 speedup for this kernel is meaningless without naming the distribution.
@@ -325,7 +336,9 @@ itself the in-engine cost divided by a *dense* host microbench, so it is a repro
 check on that row rather than independent evidence, and the argument partly assumes its
 conclusion. The honest position: dense-like is the best-supported guess, it is not
 established, and the kernel's value ranges from **~2.4× down to break-even** across the
-shapes still in play.
+shapes still in play. *(Superseded twice over: the distribution was then measured — see the
+next section, which retracts ~2.4× in favour of **2.01×** on the engine's own arrays — and
+the kernel has since been wired and measured in-engine, below.)*
 
 **What that does to the share-of-prize numbers.** Earlier text said the host round-trip is
 "52–60% of the prize" and a device top-k "recovers it exactly". Recomputed from the
@@ -334,7 +347,8 @@ and 16–20% on tie-heavy (≈8–12%)**. The 52–60% figure is the size of the
 the win.
 
 **That blocking measurement has since been taken — see the next section. The answer is
-`dense`, so the kernel's expected value is the ~2.4× column and wiring is unblocked.**
+`dense`. But do not carry the ~2.4× forward: the next section measures the real arrays
+directly at **2.01×**, and that is the figure of record.**
 
 ### The engine's actual score distribution — measured, and it refutes the premise
 
@@ -423,7 +437,8 @@ the microbench does not reproduce, **not a diagnosed mechanism** (HYPOTHESIS, pe
 docs/PERF.md, which warns that a bucket gives a total and not a decomposition).
 That matters for the wiring estimate in the favourable direction: the device kernel does
 not run on the CPU, so it should not pay that penalty, and the in-engine win may exceed the
-2.4× the microbench shows.
+2.0× the microbench shows. **It did.** Wired and measured, the host round-trip costs
+429–533 µs/layer in-engine against the kernel's 34 µs/layer — see "Wired" below.
 
 **Limitation, and what the data says about it.** The dump captured the *first* 64 scoring
 records, at nt ≈ 2050 — just past `index_topk`, where scoring begins during prefill — while
@@ -449,6 +464,56 @@ context, not more.
 This is evidence, not proof — it is a 2050-token span standing in for a 32k one, and a
 monotone trend can still turn. Dumping later in a run is a one-line change to the record
 budget and costs one prefill, and is worth doing before anyone relies on the 32k rows.
+
+### Wired — the device top-k in the engine, and both wins are real
+
+`RIVOLI_TOPK` selects the arm; three timing arms plus a correctness arm from **one binary**,
+interleaved, 2432-token prompt, `-bench 128`, sole tenant, 2026-07-27. Rows, the bucket
+table and the full caveat list are in benchmarks.md, "Device top-k WIRED"; this is the
+interpretation.
+
+**Read the buckets, not the wall — and decide which buckets can respond before looking.**
+`moe` carries 7–10 ms of within-arm spread here against effects of 9.4 and 2.5 ms, so at
+n=2 `wall` resolves neither. Two revisions of this analysis were wrong for exactly that
+reason, in opposite directions, before the rule was applied.
+
+| change | measured in | r1 | r2 | mean |
+|---|---|---:|---:|---:|
+| the device top-k (`host` → `device`) | indexer bucket | −10.5 | −8.3 | **−9.4 ms/token, 2.1% of wall** |
+| the sync deletion (`device` → `device-nosync`) | route + unbucketed | −3.2 | −1.8 | **−2.5 ms/token, 0.6%** |
+
+**The top-k.** `idx_host` (11.2, 9.0 ms/token) goes to zero, `idx_gpu` rises 0.72 for the
+kernel, and **the unbucketed remainder is unchanged to ±0.4 ms** — nothing else moved. The
+kernel costs **34 µs/layer** in-engine against a host round-trip of **429–533 µs/layer**.
+Within this session the prize was 13.1–15.3 ms/token, of which the host half was 69–73%,
+and the top-k recovered **63–68%** of it: the host share less the kernel's own cost. The
+mechanism closes inside one session, with no cross-session differencing.
+
+**The sync deletion is worth ~2.5 ms, not nothing.** The plan predicted it "can then be
+deleted outright" and demanded it be costed apart — which was right, and the answer is that
+it is real but **4× smaller than the top-k**. `route` rises +12.6 / +10.1 as the wait
+relocates to the gate-logits D2H, the unbucketed remainder falls −15.8 / −11.9, and the
+difference is the win. **The default keeps the sync anyway**: 0.6% of wall at n=2 does not
+buy making `route` incomparable with every historical row in benchmarks.md. That is a
+judgement, not a measurement; re-run at n≥4 and flip if it holds.
+
+**Do not use `wall` for the sync arm.** Its wall delta changes sign between replicates
+(−9.2, +8.2) entirely because `moe` swings −6.0 / +10.0 — 14× the 0.7 ms this change can
+physically move (3 dense full layers × 229 µs, the only path where the wait lands in `moe`).
+An earlier revision read that sign flip as "the second win does not exist"; it was noise
+admitted into the comparator.
+
+**One instrument reproduced and one did not, and it matters more than the win.** `idx_gpu`
+returned 195.2 / 195.9 µs/layer, within 0.15–0.51% of a different session's 194.9. `idx_host`
+returned **533.2 / 428.9 µs/layer — 24% apart within one session**, against 214.2 in that
+earlier one. **The quantity this document denominates the entire prize in is the unstable
+one, and every share-of-prize figure above inherits that.** Candidate causes, the
+counter-evidence against them, and the unexplained 15% wall difference between sessions: see
+benchmarks.md. Nothing is diagnosed.
+
+**Correctness: 10,752 full layers matched the host selection exactly**, sentinel intact,
+output byte-identical across all seven runs (benchmarks.md for the count's derivation and
+for why the exit status is not the evidence).
 
 ### M1 — the windows
 
@@ -501,6 +566,16 @@ Budget = 291.25 − indexer − 32.4, against the measured device kernel on the 
 | 4096 | 93.7 µs | 52.3 µs | **FITS**, 41.4 µs spare |
 | 8192 | 66.5 µs | 79.0 µs | **fails**, over by 12.6 µs |
 | 16384 | 10.7 µs | 127.4 µs | fails, over by 116.7 µs |
+
+**That table is computed from the WRONG COLUMN, and is left standing only as a marker.**
+Its "device top-k" figures (52.3 / 79.0 / 127.4 µs) come from the tie-heavy `scattered` /
+`sorted-sparse` fixtures, which the distribution dump above refutes as models of the engine.
+The `dense` column is 32.5 / 52.7 / 83.3 µs at the same contexts, which would move the 8192
+row from "fails" to "fits" — so the verdicts here are not just imprecise, one of them
+flips. **Not recomputed into a new verdict**, because the budget it is differenced against
+is itself a microbench scaled across contexts, and this document has been wrong four times
+on exactly that kind of derived number. Window 1 needs a measurement, not another
+subtraction.
 
 **Say the qualification in the same breath as the result.** That budget assumes the NPU
 runs the indexer at *exactly GPU speed*. Charge the window with the indexer, the top-k
@@ -587,16 +662,18 @@ a GPU∥NPU one.**
   window 2 clears, at 32k only against the engine's real MoE wall rather than its compute
   floor.
 
-- **Device top-k (NO NPU). KERNEL BUILT AND MEASURED; NOT WIRED, AND BLOCKED ON A
-  MEASUREMENT.** `index_topk` (kernels/indexer.hip) computes the selection exactly and its
-  correctness gate passes. Its value is **~2.4× at the measured contexts**: the engine's
-  score distribution has now been dumped and is structurally `dense` (0 exact zeros in
-  131k samples, ~100% distinct, randomly ordered), so the dense column applies. **Wiring
-  is unblocked.** When wiring happens,
-  note that `idx.last_nr` becomes an implicit `min(topk, nt)` invariant rather than an
-  observed `rows.len()`, that the mid-layer `device_sync` can then be deleted outright,
-  and that the sync deletion must be costed SEPARATELY from the top-k in the A/B or
-  nobody will know which one paid.
+- ~~**Device top-k (NO NPU)**~~ **DONE — WIRED, DEFAULT ON, AND MEASURED IN-ENGINE.**
+  `index_topk` (kernels/indexer.hip) computes the selection exactly; `dsa_select_layer` now
+  launches it instead of the score D2H + CPU top-k + row H2D. **Worth −9.4 ms/token, 2.1%
+  of wall** (r1 −10.5, r2 −8.3, read off the indexer bucket with the unbucketed remainder
+  unchanged). Correctness: 10,752 full layers matched the host selection exactly on the
+  engine's real scores, over-selection sentinel intact, all seven runs byte-identical.
+  **The mid-layer `device_sync` deletion, costed separately as the plan demanded, is worth
+  −2.5 ms/token — real, consistently signed, and 4× smaller than the top-k.** The default
+  keeps the sync: 0.6% of wall at n=2 does not buy making `route` incomparable with every
+  historical row. Full rows and caveats: benchmarks.md, "Device top-k WIRED".
+  `idx.last_nr` is now `min(topk, nt)` by construction, checked by the `verify` arm's
+  sentinel rather than by an assertion on the arm that never needed one.
 
 - **Toolchain spike — lead with the handoff.** Compile + run one dense bf16 kernel on the
   NPU via whatever flow exists (MLIR-AIE / Peano / IREE — presence unverified; `xrt-smi`
@@ -657,7 +734,10 @@ the precondition for the exact overlap the plan wanted.
 
 ## Successor brief — picking this up at the wiring seam
 
-Everything below the wiring step is unbuilt. This section is written for whoever does it.
+**The wiring described below is DONE** (2026-07-27; see "Wired" above). Kept because its
+reading order, its two invariants and its measurement lessons all held up — and because
+"instrument the case you trust most first" caught a `verify` gate that passed while
+comparing nothing. Everything below the wiring step is still unbuilt.
 
 ### Read in this order
 
@@ -675,10 +755,11 @@ Everything below the wiring step is unbuilt. This section is written for whoever
 |---|---|
 | `index_topk` kernel + launcher | committed, correctness gate **passes** |
 | `tests/kernel.rs::index_topk_matches_host_selection` | 10 cases, sentinel tail, **passes** |
-| Cost vs the host, matched rig | measured — **~2.4×** on the engine's real shape |
+| Cost vs the host, matched rig | measured — **2.01×** on the engine's real arrays at nt=2456 (NOT ~2.4×; that is the `dense` *fixture* and was retracted above) |
 | Engine score distribution | measured at nt≈2050: `dense`-like, 0 exact zeros in 131k |
-| Wiring into `dsa_select_layer` | **NOT DONE — this is the next step** |
-| `device_sync` deletion | not done; see below, cost it separately |
+| Wiring into `dsa_select_layer` | **DONE**, default on — **−9.4 ms/token (2.1% of wall)** |
+| Selection matches the host in-engine | **10,752 full layers exact**, sentinel intact, output byte-identical across all arms |
+| `device_sync` deletion | costed separately: **−2.5 ms/token**, consistently signed, 4× smaller than the top-k. Sync KEPT — 0.6% of wall at n=2 vs `route`'s comparability |
 | M1a / anything NPU | untouched, and M1a is still not implementable |
 
 ### The wiring, and its two invariants

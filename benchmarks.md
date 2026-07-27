@@ -928,3 +928,115 @@ kernel is also single-workgroup, so its absolute cost is one CU's serial sweep; 
 LDS-contention hypothesis names a lever but occupancy is the larger structural bound.
 
 Interpretation and what it means for wiring: docs/NPU.md § "The device top-k, measured".
+
+### Device top-k WIRED: three-arm in-engine A/B, 2026-07-27
+
+`--attn dsa --mode hybrid --cache-policy lru --max-mem 115 -bench 128`, the same
+2432-token prompt as "In-engine confirmation" above, gfx1151 sole tenant. Arms selected by
+`RIVOLI_TOPK` from **one binary** — no build differs between them — run **interleaved**
+(host, device, device-nosync, twice). Greedy decode is deterministic, so every arm generates
+the same tokens and the same expert-miss sequence: the arms are PAIRED, and `116.79
+miss/tok` is identical across all seven runs.
+
+**Read the buckets, not the wall.** `wall = route + moe + idx_gpu + idx_host + unbucketed`
+is an identity here and closes to ±0.4 ms on every run below. `moe` carries **7–10 ms of
+within-arm spread** with no proposed mechanism, against effects of 9.4 and 2.5 ms — so at
+n=2 the wall cannot resolve either change, while the buckets that respond to them can. The
+unbucketed column is included for exactly this reason; omitting it is what made an earlier
+revision of this section wrong twice.
+
+| arm | rep | wall | route | moe | idx_gpu | idx_host | unbucketed |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `host` | r1 | 446.9 | 154.4 | 247 | 4.10 | 11.20 | 30.20 |
+| `host` | r2 | 451.8 | 155.9 | 254 | 4.11 | 9.01 | 28.78 |
+| `device` | r1 | 443.7 | 154.5 | 254 | 4.82 | — | 30.38 |
+| `device` | r2 | 433.5 | 155.3 | 245 | 4.82 | — | 28.38 |
+| `device-nosync` | r1 | 434.5 | 167.1 | 248 | 4.82 | — | 14.58 |
+| `device-nosync` | r2 | 441.7 | 165.4 | 255 | 4.82 | — | 16.48 |
+
+Per-layer: `idx_gpu` 195.2 / 195.9 µs (host), 229.3 / 229.6 (device), 229.7 / 229.3
+(nosync); `idx_host` **533.2 / 428.9 µs**, host arm only.
+
+**The two wins, costed separately. Both are real and they differ by 4×.**
+
+| change | measured in | r1 | r2 | mean | wall delta (for contrast) |
+|---|---|---:|---:|---:|---:|
+| `host` → `device` (the top-k) | indexer bucket | −10.48 | −8.30 | **−9.4** | −3.2 / −18.3 |
+| `device` → `device-nosync` (the sync) | route + unbucketed | −3.20 | −1.80 | **−2.5** | −9.2 / **+8.2** |
+
+**The top-k: −9.4 ms/token, 2.1% of wall.** The indexer bucket is the only one that
+responds — `idx_host` (11.20, 9.01) goes to zero and `idx_gpu` rises 0.72 for the kernel —
+and **the unbucketed remainder is unchanged to ±0.4 ms in both replicates**, i.e. nothing
+else moved. Per-replicate agreement is 2.18 ms. The wall deltas for the same change are
+−3.2 and −18.3, a 15 ms spread, entirely from `moe` going +7.0 then −9.0. This is a
+measurement, not a prediction: `idx_host` is host wall time the engine spends with the GPU
+idle, and on this arm it stops existing.
+
+**The sync: −2.5 ms/token, 0.6% of wall.** `route` rises +12.60 / +10.10 as the wait
+relocates to the gate-logits D2H, and the unbucketed remainder falls −15.80 / −11.90; the
+difference is the win. Same sign in both replicates. **Its wall delta changes sign
+(−9.2, +8.2) purely because `moe` swings −6.0 / +10.0** — a 16 ms swing against a mechanism
+bounded at 3 dense layers × 229 µs = **0.7 ms**, i.e. 14× more movement than the change can
+physically cause. `moe` is noise here and must be kept out of the comparator.
+
+**The default keeps the sync anyway**, and this is a judgement not a measurement: −2.5 ms is
+0.6% of wall at n=2, against making `route` incomparable with every historical row in this
+file. Re-run at n≥4; if the −2.5 holds, flip it.
+
+**Two corrections this section previously got wrong, recorded because both are instructive.**
+*(1)* An earlier revision headlined the top-k at −11.2 ms from the `host` → `device-nosync`
+wall delta, calling the −9.4 a "prediction" the wall "confirmed". That inverted the
+evidence: −9.4 is the direct measurement and −11.2 is a proxy carrying `moe`'s noise plus
+the sync's own −2.5. It also attributed a figure from an arm that is not the shipped default
+to the shipped default. *(2)* The same revision reported the sync deletion as worth
+"nothing, sign reverses" — which was `moe` noise admitted into the comparator for a 2.5 ms
+effect, and was inconsistent with this section's own withdrawal of the `moe` story below.
+The rule that would have caught both: **decide which buckets can respond to the change
+before looking at any of them.**
+
+**Note the three rows are not three measurements.** Row 3 (`host` → `device-nosync`) is
+exactly row 1 + row 2 per replicate; three arms give **two independent contrasts**. Quoting
+a "solid" third row is selecting the pair that happened to land closest.
+
+**A mechanism proposed and refuted, recorded so nobody re-derives it.** In r1 the `device`
+arm's `moe` rose 247 → 254, almost exactly cancelling the top-k win, and the obvious story
+was that the baseline's ~11 ms of CPU top-k had been doubling as head start for the fetch
+reaper. **In r2 the same comparison went the other way (254 → 245).** Fitted to one
+replicate; withdrawn. It is the first hypothesis anyone will form from the r1 column.
+
+**The instrument that reproduced, and the one that did not.** `idx_gpu` is 195.2 and 195.9
+µs/layer — 0.15% and 0.51% from the 194.9 recorded in a different session (mean 0.33%).
+`idx_host` is **533.2 and 428.9 µs/layer: 24% apart, same binary, same arm, same prompt,
+forty minutes apart**, against 214.2 in that earlier session. **The quantity this branch
+denominates its entire prize in is the unstable one.**
+
+**What is NOT explained about that instability.** These runs saw `28–30 ms/miss` where the
+earlier session saw `76.1`, and one reading is the streamer serving from page cache and
+pushing ~1.8 GB/token through the CPU concurrently with the CPU top-k. **Two facts in the
+same table cut against it:** this session is 15% SLOWER at the wall (447–452 vs 391) with
+`moe` 24% higher (247–255 vs 201) at identical flags and prompt, and `idx_host` moved 24%
+*within* this session at constant ms/miss. The two replicates are also one session, not two
+independent observations. **No mechanism is established.** The usable consequence: the SIZE
+of the top-k win is machine-state dependent; its existence is not.
+
+**Correctness, and why the exit status is not the evidence.** `RIVOLI_TOPK=verify` runs both
+selections per full layer and compares: **10,752 full layers matched the host selection
+exactly** — 21 full layers × 512 scoring tokens (384 prefill past `index_topk` = 2048, plus
+128 decode), i.e. every layer that could have run. A sentinel parked one slot past
+`min(topk, nt)` survived all 10,752, so the kernel did not over-select. The count is quoted
+rather than the exit status because an earlier revision of this gate **exited 0 having
+compared zero layers** whenever the context stayed under `index_topk`. The repaired gate was
+then confirmed to fail: `RIVOLI_TOPK=verify … -bench 4` on the default short prompt exits 1
+with `compared 0 layers: the context never exceeded index_topk=2048`. The comparison loop
+was rewritten during review, so the gate was re-run afterwards on the shipped binary:
+**8,736 layers matched** at `-bench 32` (21 × [384 prefill + 32 decode]). All seven runs
+generated **byte-identical output** (564 chars, sha256 `778387fa557c4e9d…`), coherent prose.
+
+**What is NOT established.** One prompt, one context (nt ≈ 2496 mean), n = 2 per arm, and
+`moe`'s 7–10 ms spread is uncharacterised — until it is, no wall-level effect below ~15 ms
+is measurable on this rig by wall alone, which affects any future A/B in this file. This
+session's wall is 15% above the earlier one at identical flags, and that is unexplained.
+`--attn misa` takes the device path, skips the timing bracket, and was never run. A paired
+`--ppl` across arms would beat identical greedy text as an equality check and was not run.
+Under-selection is caught only incidentally (stale rows differ); a poison-fill of
+`rows_buf[0..nr]` before the launch would make it explicit.
