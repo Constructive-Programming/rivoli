@@ -189,6 +189,15 @@ double quantization — it was bounded above by an absmax scale set 1.8× too wi
 is no longer the only route. Not yet implemented: the measurement is the deliverable, and
 a quality run must confirm it before 365 GB is rewritten.
 
+**Chain-level accuracy is x-draw noise; chain-level GAIN is not.** Scored through the
+full `down(silu(gate·x) ⊙ up·x)` chain on L3 experts 0/7/shared (`bin/i4_audit`, the GPU
+test's seed), new vs old `.i4` rel-L2 is 0.295/0.256/0.242 vs 0.290/0.305/0.296 — the sign
+flips with the expert, i.e. within draw noise. The gains over the same cells are
+**1.001/1.066/1.006 vs 0.894/0.949/0.902**, consistent in sign and size. So from the
+model's point of view the reliable thing that changed when the `.i4` set was rebuilt is
+the ~9% attenuation going away, not the accuracy. Weight-space rel-L2 (0.205 vs 0.250)
+stays the trustworthy accuracy number; the chain statistic is too noisy to rank on.
+
 **Two verification gaps this closed.** `moe_i4_real_data_matches_cpu` compares our kernel
 to our own `matvec_i4`, so a convention both share is invisible to it; and no test asserted
 what the bytes MEAN. `tests/artifact.rs::i4_bytes_are_what_the_checkpoint_quantizes_to` is

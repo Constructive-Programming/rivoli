@@ -874,11 +874,18 @@ fn moe_i4_real_data_matches_cpu() {
 /// `1e-3·max`), which catches that trivially. `max_err/max|ref|` here is the cheap
 /// complement, not a substitute.
 ///
-/// Bands are the measured spread with headroom, from `cargo run --release --bin
-/// i4_audit -- /var/db/rivoli/glm52-vq3-full <fp8-dir> --layer 3 --experts 0,7,256`
-/// (which drives the chain with THIS test's `x` distribution, so the anchor and the
-/// gate are the same statistic): rel_l2 0.238–0.256, gain 1.005–1.056,
-/// max_err/max|ref| 0.243–0.257 on routed experts.
+/// **The bands are tight because the measurement is deterministic.** `x` is a fixed
+/// seed, the artifact is fixed, and the kernels reduce with a fixed `__shfl_down`
+/// ladder — so this is not a sample from a distribution, it is one number. `bin/i4_audit`
+/// (same generator, same `CHAIN_SEED`) reproduces it on the CPU to four decimals:
+/// rel_l2 **0.2951**, gain **1.0009**, max_err/max|ref| **0.1603** for L3 expert 0.
+/// Bands sit ~12% around those, which is roughly 3× more sensitive than a band sized
+/// for x-draw spread would be — and rel-L2 through `silu` really does vary ~15% across
+/// draws, which is exactly why quoting a same-distribution-but-different-seed anchor
+/// (as an earlier revision did) is not good enough.
+///
+///     cargo run --release --bin i4_audit -- /var/db/rivoli/glm52-vq3-full <fp8-dir> \
+///         --layer 3 --experts 0,7,256
 #[test]
 fn moe_i4_real_data_vs_fp8_ground_truth() {
     use rivoli::format::{FormatMeta, I4Source, Safetensors};
@@ -971,23 +978,24 @@ fn moe_i4_real_data_vs_fp8_ground_truth() {
     // Margins, not just pass/fail — a run drifting from 0.24 toward 0.32 stays green
     // and unremarked right up until it crosses (the reason `assert_close` prints them).
     println!(
-        "moe_i4_vs_fp8: rel_l2={rel_l2:.4} (band 0.15..0.32) gain={gain:.4} (band 0.90..1.15) \
-         max_err/max|ref|={rel_max:.4} (bound 0.45)"
+        "moe_i4_vs_fp8: rel_l2={rel_l2:.4} (band 0.26..0.33) gain={gain:.4} (band 0.97..1.04) \
+         max_err/max|ref|={rel_max:.4} (bound 0.25)"
     );
     assert!(
-        (0.90..=1.15).contains(&gain),
+        (0.97..=1.04).contains(&gain),
         "SYSTEMATIC gain error vs fp8 ground truth: gain={gain:.4}. Cosine scores 1.0000 \
          for any uniform or per-row scale error, so nothing else here would see this."
     );
     assert!(
-        (0.15..=0.32).contains(&rel_l2),
-        "rel_l2={rel_l2:.4} outside the band a correctly derived 4-bit per-row RTN lands \
-         in. Below 0.15 the reference has collapsed into the thing it checks (a 6144-wide \
-         row at an amax/7 step MUST lose ~0.24); above 0.32 the derivation is wrong, not \
-         merely coarse."
+        (0.26..=0.33).contains(&rel_l2),
+        "rel_l2={rel_l2:.4} != the deterministic 0.2951 this artifact and seed produce. \
+         Below 0.26 the reference has collapsed into the thing it checks (a 6144-wide row \
+         at an amax/7 step MUST lose ~0.20, ~0.30 through the silu chain); above 0.33 the \
+         derivation is wrong, not merely coarse. A change to `quant_i4`'s loading factor \
+         moves this ON PURPOSE — rebuild the anchor with bin/i4_audit, do not widen."
     );
     assert!(
-        rel_max <= 0.45,
+        rel_max <= 0.25,
         "max_err/max|ref|={rel_max:.4} > 0.45 — a few corrupted output rows move this \
          while leaving rel_l2 inside its band"
     );

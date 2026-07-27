@@ -34,6 +34,11 @@ use std::os::unix::fs::FileExt;
 
 const PROJ: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
 
+/// `tests/kernel.rs::moe_i4_real_data_vs_fp8_ground_truth`'s `Lcg` seed. `make_x` is
+/// bit-identical to that test's `Lcg::f`, so the CHAIN rows below are the SAME number
+/// the test asserts on — which is the only way quoting them as its band is honest.
+const CHAIN_SEED: u64 = 0x5A17;
+
 /// Scale-sensitive agreement of `a` against reference `r`, all in f64.
 /// Returns (rel_l2, max_abs, cosine, gain) where `gain` is the least-squares slope
 /// `Σ a·r / Σ r·r` — 1.0 iff there is no systematic gain error. Cosine and gain
@@ -503,7 +508,11 @@ fn main() -> Result<()> {
         // ── the WHOLE expert: down(silu(gate·x) ⊙ up·x), the quantity the kernel
         //    actually produces, against the f64 fp8 chain. This is what the GPU test
         //    asserts on, so measure the bounds here rather than guessing them.
-        let x = make_x(h, 0xFACE_u64 + e as u64);
+        // The GPU test's seed, not a fresh one per expert: `tests/kernel.rs` quotes
+        // this tool's CHAIN row as its assertion band, and rel-L2 through silu varies
+        // by ~15% across x draws — enough that a merely same-DISTRIBUTION x quotes a
+        // band the test does not actually sit in. Same generator AND same seed.
+        let x = make_x(h, CHAIN_SEED);
         let chain_ref = {
             let g = matvec_f64(&wrefs[0], &x, m, h);
             let u = matvec_f64(&wrefs[1], &x, m, h);
