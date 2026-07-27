@@ -198,6 +198,35 @@ model's point of view the reliable thing that changed when the `.i4` set was reb
 the ~9% attenuation going away, not the accuracy. Weight-space rel-L2 (0.205 vs 0.250)
 stays the trustworthy accuracy number; the chain statistic is too noisy to rank on.
 
+### Pre-flight for the attenuation arm: specified correctly, but 0.9766 is not the knob value
+
+Before booking device time to test whether the model needs an attenuated MoE branch, the
+arm has to be shown to produce the attenuation it claims. `bin/i4_audit` scores the
+shipped nibbles with every stored per-row scale multiplied by `VQ_GAIN = 0.9766` —
+vq3's shrink without vq3's error — through the full expert chain, 9 cells (layers
+3/40/77 × experts 0/7/shared):
+
+| | branch factor vs the unattenuated new `.i4` | sd | range |
+|---|---:|---:|---|
+| arm (stored scale ×0.9766) | **0.9282** | 0.0010 | 0.9271–0.9297 |
+| the old `fp8→vq3→int4` set | **0.9124** | 0.0341 | 0.8391–0.9483 |
+
+**The arm is well specified and is *cleaner* than what it mimics.** Its effect is uniform
+to ±0.1% across layers and across routed vs shared experts, which is what an arm should
+be. The old set's attenuation is the same size but scatters ±3.4%, because its extra
+quantization error also passes through `silu` and contributes apparent attenuation that
+varies per expert. So the knob isolates attenuation; it does not reproduce the old set's
+per-expert texture, and if what the model needs is expert-DEPENDENT attenuation the knob
+cannot show it.
+
+**The correction that matters: the per-projection constant is not the branch constant.**
+0.9766 per projection compounds to **0.9282** at the branch output — `0.9766³ = 0.9314`,
+and `silu` compression takes off another 0.35%. Setting a branch-level `--moe-gain` to
+0.9766 would under-attenuate by 5% and land outside the old set's central value.
+A branch-gain sweep must be specified in branch units: **1.00 / 0.96 / 0.93 / 0.90 /
+0.86**, where 0.93 is the faithful equivalent of the artifact rewrite and 0.91 is the old
+set's centre.
+
 **Two verification gaps this closed.** `moe_i4_real_data_matches_cpu` compares our kernel
 to our own `matvec_i4`, so a convention both share is invisible to it; and no test asserted
 what the bytes MEAN. `tests/artifact.rs::i4_bytes_are_what_the_checkpoint_quantizes_to` is

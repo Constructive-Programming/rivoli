@@ -39,6 +39,13 @@ const PROJ: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
 /// the test asserts on — which is the only way quoting them as its band is honest.
 const CHAIN_SEED: u64 = 0x5A17;
 
+/// The per-projection gain `quant_vq` imposes and `quant_i4` does not: `quant_vq`
+/// refits its scale by least squares, which is MMSE-like and therefore shrinks by
+/// `1 − relL2²`. Measured 0.9766 across every projection of every expert sampled
+/// (predicted 0.9754 from its own rel-L2 — the agreement is why this is a property of
+/// the estimator and not a coincidence of one artifact).
+const VQ_GAIN: f32 = 0.9766;
+
 /// Scale-sensitive agreement of `a` against reference `r`, all in f64.
 /// Returns (rel_l2, max_abs, cosine, gain) where `gain` is the least-squares slope
 /// `Σ a·r / Σ r·r` — 1.0 iff there is no systematic gain error. Cosine and gain
@@ -532,6 +539,18 @@ fn main() -> Result<()> {
         let oldq: [(Vec<u8>, Vec<f32>); 3] = core::array::from_fn(|k| olds[k].clone());
         let cn = agree(&chain_i4(&newq), &chain_ref);
         let co = agree(&chain_i4(&oldq), &chain_ref);
+        // PRE-FLIGHT for the attenuation arm. The shipped nibbles with every stored
+        // per-row scale multiplied by VQ_GAIN — vq3's shrink WITHOUT vq3's error. If
+        // this does not land the chain gain inside the old set's band, the arm does not
+        // reproduce what it claims to and the device block would measure nothing.
+        //
+        // Multiplies the STORED scale only; the nibbles are the ones `amax/7` already
+        // chose. Rounding at `VQ_GAIN·amax/7` instead would be the α = 0.977 CLIP arm,
+        // a different experiment (finer step, gain still ~1).
+        let gainq: [(Vec<u8>, Vec<f32>); 3] = core::array::from_fn(|k| {
+            (i4s[k].0.clone(), i4s[k].1.iter().map(|s| s * VQ_GAIN).collect())
+        });
+        let cg = agree(&chain_i4(&gainq), &chain_ref);
         let cv = {
             let g = matvec_f64(&vqs[0], &x, m, h);
             let u = matvec_f64(&vqs[1], &x, m, h);
@@ -542,7 +561,7 @@ fn main() -> Result<()> {
         // see: corruption confined to a few percent of output rows moves rel-L2 by less
         // than its own tolerance, but moves this. The GPU test asserts on it.
         let ymax = chain_ref.iter().fold(0f64, |m, &v| m.max(v.abs() as f64));
-        for (label, a) in [("new i4", cn), ("old i4", co), ("vq3", cv)] {
+        for (label, a) in [("new i4", cn), ("old i4", co), ("vq3", cv), ("new×gain", cg)] {
             println!(
                 "{:<6} CHAIN {:<7}| relL2 {:>7.4}  gain {:>7.4}  cos {:>8.6}  maxerr/max|ref| {:>7.4}",
                 e, label, a.rel_l2, a.gain, a.cos, a.max_abs / ymax
