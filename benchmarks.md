@@ -9,11 +9,19 @@ AMD Strix Halo gfx1151. Matrix: `--mode {int3-vq,int4,hybrid}` × `--cache-polic
 `--attn dense`, `--max-mem 115`. Only `--mode` and `--cache-policy` vary.
 Binary: release + `--features rocm`. GPU sole-tenant (k3s stopped).
 `.i4` experts are the **vq3-derived** set (`vq3_to_i4`); see "int4 provenance" below.
+**STALE as of 2026-07-27:** the `.i4` set has since been rebuilt from fp8 (`fp8_to_i4`), and
+`--mode int4` now measures **PPL 73.43 vs int3-vq's 5.28**. Every int4 and hybrid row below
+was produced with the *old* set and does not describe the current artifact — see `docs/INT4.md`.
 
 ## Results — all coherent, no crashes
 
 Output quality is gated first (degenerate greedy output = a severe bug, disqualified
 from ranking) via the distinct-token ratio of the completion. Every cell passed.
+**Do not rank on this metric.** Measured 2026-07-27: across a branch-gain sweep PPL tripled
+(73 → 216) while distinct-ratio doubled (0.126 → 0.324) — monotone in OPPOSITE directions.
+It detects repetition, one failure mode among many, and repetition is suppressible by changes
+that damage the model. Rank on teacher-forced PPL; use this only to flag a run unreadable.
+See `docs/INT4.md` §1.
 
 | mode | policy | tok/s | hit % | distinct | output |
 |---|---|---:|---:|---:|---|
@@ -96,6 +104,13 @@ slots). Fix: each policy keeps a per-batch `pinned` set (`begin_batch` clears it
 All three arc cells and int4/lru now run clean (above).
 
 ### int4 provenance — MEASURED, and it inverts hybrid's stated premise
+> **SUPERSEDED 2026-07-27 — see `docs/INT4.md`.** Two claims below are now measured false:
+> that `.i4` "cannot be better than the vq3 it was derived from, by construction", and that the
+> deficit is "the arithmetic of double quantization". The set was rebuilt from fp8 and is
+> **strictly more accurate** — and **8× worse end to end** (PPL 73.43 vs 5.28). The real cause
+> is per-row scaling (one scale per 6144 weights). The gs64/`pack_i4` recommendation at the end
+> of this section turns out to be **right for the wrong reason**, and `docs/INT4.md` re-endorses
+> it on the correct one.
 
 These int4/hybrid numbers use `.i4` re-derived from **vq3** (itself a lossy 3-bit
 quantization). `bin/vq3_to_i4` does this deliberately: colibri's own int4 was a mismatched
@@ -134,6 +149,11 @@ point, since the defect that deprecated it was per-row scaling and gs64 removes 
 Until then, `--mode int4` and `--mode hybrid` quality numbers are bounded above by vq3.
 
 ### `quant_i4`'s `amax/7` is loaded ~1.8× too wide — and that, not provenance, is int4's deficit
+> **SUPERSEDED 2026-07-27 — see `docs/INT4.md`.** The measurements below stand; the
+> *recommendation* does not. Tuning α is tuning a constant inside a per-row scheme that is far
+> coarser than any current practice (group-wise at 32–128 is standard). **Do not implement α.**
+> The end-to-end test this section called for was run: `--mode int4` measures PPL 73.43 against
+> int3-vq's 5.28, and a branch-gain sweep falsified the attenuation hypothesis outright.
 
 The `.i4` set was rebuilt straight from fp8 (`bin/fp8_to_i4`, chain `fp8->int4`), removing
 the second quantization stage. The weights got measurably closer to ground truth **and

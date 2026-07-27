@@ -445,7 +445,7 @@ fn main() -> Result<()> {
                 );
                 writeln!(
                     w,
-                    "# rivoli-nll v1 mode={} policy={} moe_gain={a_moe_gain} j={} m={} tokens={} hit_pct={hit_pct:.4} swap_pct={}",
+                    "# rivoli-nll v1 mode={} policy={} j={} m={} moe_gain={a_moe_gain} tokens={} hit_pct={hit_pct:.4} swap_pct={}",
                     cfg.mode,
                     cfg.cache_policy,
                     // `--route-j`/`--route-m` default to (2, 12) whatever the policy, so a
@@ -454,7 +454,10 @@ fn main() -> Result<()> {
                     // baseline from a cell by its header alone — which is also why
                     // `moe_gain` is here: a gain sweep differs in NOTHING else, so six
                     // arms would otherwise write six identical headers and `bin/ppl`
-                    // would label them identically.
+                    // would label them identically. It goes AFTER j/m, not before:
+                    // `bin/ppl` labels cells with `split_whitespace().take(3)`, so a field
+                    // inserted third would push `j=`/`m=` out of every label and collide
+                    // the top-m cells this ordering exists to keep apart.
                     top_m.map_or("na".into(), |(j, _)| j.to_string()),
                     top_m.map_or("na".into(), |(_, m)| m.to_string()),
                     nlls.len(),

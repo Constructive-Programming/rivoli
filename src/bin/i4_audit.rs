@@ -284,6 +284,118 @@ fn make_x(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
+/// Byte identity over a WIDE sample: `dequant_fp8` + `quant_i4` + compare, and nothing
+/// else, so it runs ~10x faster than the full audit and can cover hundreds of
+/// projections instead of tens. An error confined to a subset — particular layers, a
+/// shape, a thread's chunk of the converter's work split — is entirely consistent with
+/// a narrow sample passing, which is the hole this closes.
+fn verify_wide(art: &str, fp8: &str, cfg: &ModelConfig, layers: &[usize], experts: &[usize]) -> Result<()> {
+    let (h, m, ne) = (cfg.hidden, cfg.moe_inter, cfg.n_experts);
+    let block = FormatMeta::load(art)?.fp8_block;
+    let (stride, off) = (i4_expert_stride(h, m), i4_slot_offsets(h, m));
+    let src = Safetensors::open_dir(fp8).context("open fp8 checkpoint")?;
+    let (mut ok, mut bad) = (0usize, 0usize);
+    for &l in layers {
+        let f = File::open(format!("{art}/L{l:02}.i4"))?;
+        for &e in experts {
+            let mut blk = vec![0u8; stride];
+            f.read_exact_at(&mut blk, (e * stride) as u64)?;
+            let base = if e < ne {
+                format!("model.layers.{l}.mlp.experts.{e}")
+            } else {
+                format!("model.layers.{l}.mlp.shared_experts")
+            };
+            for (k, (&(o_dim, i_dim), proj)) in
+                vq_expert_layout(h, m).iter().zip(PROJ).enumerate()
+            {
+                let w = src.dequant_fp8(&format!("{base}.{proj}"), o_dim, i_dim, block)?;
+                let (wp, ws) = quant_i4(&w, o_dim, i_dim);
+                let po = off[k * 2];
+                let gp = &blk[po..po + o_dim * i4_row_bytes(i_dim)];
+                let so = off[k * 2 + 1];
+                let gs = read_f32(&blk[so..so + o_dim * 4]);
+                if wp == gp && ws == gs {
+                    ok += 1;
+                } else {
+                    bad += 1;
+                    let rows = wp
+                        .chunks_exact(i4_row_bytes(i_dim))
+                        .zip(gp.chunks_exact(i4_row_bytes(i_dim)))
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    println!("MISMATCH L{l:02} e{e} {proj}: {rows}/{o_dim} rows, scales_eq={}", ws == gs);
+                }
+            }
+        }
+        eprint!("\rverified L{l:02}  ");
+    }
+    eprintln!();
+    println!("WIDE VERIFY: {ok} projections bit-exact, {bad} mismatched ({} layers x {} experts x 3)", layers.len(), experts.len());
+    ensure!(bad == 0, "{bad} projections differ from quant_i4(dequant_fp8(ckpt))");
+    Ok(())
+}
+
+/// Cross-check `.i4` against `.vq3` at the SAME artifact coordinates — the one
+/// comparison in this tool that can actually fail on a mapping error.
+///
+/// Every other check here re-dequantises fp8, which runs the same tensor-name and
+/// layer resolution `fp8_to_i4` used: an artifact layer built from the WRONG checkpoint
+/// layer would be bit-exactly reproduced by the audit and score perfectly. This path
+/// touches no fp8, no `dequant_fp8`, and no `model.layers.{l}` string. It reads
+/// `L{l}.i4` and `L{l}.vq3` at the same (layer, expert, projection) and asks whether
+/// they describe the same matrix. `.vq3` came from a separate tool with its own
+/// iteration, and the int3-vq model built on it decodes coherently — so if the two
+/// agree, the `.i4` at that coordinate holds that coordinate's weights.
+///
+/// Expected: both are quantizations of one matrix, so `rel-L2 ≈ sqrt(0.205² + 0.159²)
+/// ≈ 0.26` and `cos ≈ 0.97`. A mapping error gives two UNRELATED matrices: `cos ≈ 0`,
+/// `rel-L2 ≈ 1.41`. The gap between those outcomes is enormous, so this needs no
+/// delicate tolerance — and a cluster of low cells past some index is an off-by-one at
+/// a boundary rather than a uniform mis-mapping.
+fn xcheck(art: &str, cfg: &ModelConfig, layers: &[usize], experts: &[usize]) -> Result<()> {
+    let (h, m) = (cfg.hidden, cfg.moe_inter);
+    let (i4_stride, off) = (i4_expert_stride(h, m), i4_slot_offsets(h, m));
+    let vq_stride = vq_expert_stride(h, m);
+    let cbs = load_codebooks(art)?;
+    let mut worst = (1.0f64, 0usize, 0usize, "");
+    let mut low = 0usize;
+    println!("{:<6}{:<6}{:>12}{:>10}{:>10}", "layer", "expert", "proj", "cos", "relL2");
+    for &l in layers {
+        let i4f = File::open(format!("{art}/L{l:02}.i4"))?;
+        let vqf = File::open(format!("{art}/L{l:02}.vq3"))?;
+        for &e in experts {
+            let mut i4b = vec![0u8; i4_stride];
+            i4f.read_exact_at(&mut i4b, (e * i4_stride) as u64)?;
+            let mut vqb = vec![0u8; vq_stride];
+            vqf.read_exact_at(&mut vqb, (rivoli::quant::VQ_ALIGN + e * vq_stride) as u64)?;
+            let vqp = vq_expert(&vqb, 0, h, m);
+            for (k, (&(o_dim, i_dim), proj)) in vq_expert_layout(h, m).iter().zip(PROJ).enumerate() {
+                let packed = &i4b[off[k * 2]..off[k * 2] + o_dim * i4_row_bytes(i_dim)];
+                let scale = read_f32(&i4b[off[k * 2 + 1]..off[k * 2 + 1] + o_dim * 4]);
+                let wi4 = dequant_i4(packed, &scale, o_dim, i_dim);
+                let wvq = vq_decode_proj(&vqp[k], &cbs[k]);
+                let a = agree(&wi4, &wvq);
+                if a.cos < 0.90 {
+                    low += 1;
+                    println!("{l:<6}{e:<6}{proj:>12}{:>10.4}{:>10.4}   <<< LOW", a.cos, a.rel_l2);
+                } else if a.cos < worst.0 {
+                    worst = (a.cos, l, e, proj);
+                }
+            }
+        }
+        eprint!("\rxcheck L{l:02}  ");
+    }
+    eprintln!();
+    let n = layers.len() * experts.len() * 3;
+    println!(
+        "XCHECK: {n} projections ({} layers x {} experts x 3), {low} with cos < 0.90; \
+         worst good cell cos {:.4} at L{:02} e{} {}",
+        layers.len(), experts.len(), worst.0, worst.1, worst.2, worst.3
+    );
+    ensure!(low == 0, "{low} projections do not describe the same matrix as .vq3 — mapping error");
+    Ok(())
+}
+
 /// Sweep every per-row f32 scale in the shipped `.i4` set looking for values the
 /// decode path cannot survive: non-finite (`0 · inf = NaN` in `matvec_i4`/`dot_i4_wave`,
 /// which apply the scale OUTSIDE the dot), zero, negative, or the `amax == 0` sentinel
@@ -345,10 +457,12 @@ fn main() -> Result<()> {
     let art = args.next().context("usage: i4_audit <artifact-dir> <fp8-dir> [--layer L] [--experts a,b,c] [--scan]")?;
     let fp8 = args.next().context("missing <fp8-dir>")?;
     let (mut layer, mut experts) = (3usize, vec![0usize, 7, 128, 255]);
-    let (mut scan, mut study) = (false, false);
+    let (mut scan, mut study, mut verify, mut xchk) = (false, false, false, false);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--scan" => scan = true,
+            "--verify" => verify = true,
+            "--xcheck" => xchk = true,
             "--scale-study" => study = true,
             "--layer" => layer = args.next().context("--layer L")?.parse()?,
             "--experts" => {
@@ -366,6 +480,28 @@ fn main() -> Result<()> {
     let cfg = ModelConfig::load(&art)?;
     if scan {
         return scan_scales(&art, &cfg);
+    }
+    // Provenance BEFORE the mode dispatch: `verify_wide` is a byte-identity check against
+    // the operator-supplied fp8 dir, so it is the mode where auditing against a different
+    // revision of the same model is most damaging — every check goes false and the report
+    // blames the artifact for the argument. (`--xcheck` reads no fp8 and is unaffected, but
+    // a stale stamp is worth surfacing there too.)
+    match I4Source::load(&art)? {
+        Some(pv) if std::fs::canonicalize(&fp8).map(|c| c.display().to_string()).map(|c| c != pv.src).unwrap_or(true) => {
+            eprintln!("WARNING: artifact was built from {} — auditing against {fp8}", pv.src)
+        }
+        None => eprintln!("WARNING: artifact carries no i4_source stamp; provenance unverified"),
+        _ => {}
+    }
+    if xchk {
+        let ls: Vec<usize> = (cfg.dense_layers..cfg.n_layers).step_by(3).collect();
+        let es: Vec<usize> = (0..cfg.n_experts).step_by(17).chain([cfg.n_experts]).collect();
+        return xcheck(&art, &cfg, &ls, &es);
+    }
+    if verify {
+        let ls: Vec<usize> = (cfg.dense_layers..cfg.n_layers).step_by(6).collect();
+        let es: Vec<usize> = (0..cfg.n_experts).step_by(31).chain([cfg.n_experts]).collect();
+        return verify_wide(&art, &fp8, &cfg, &ls, &es);
     }
     let (h, m, ne) = (cfg.hidden, cfg.moe_inter, cfg.n_experts);
     // `e == ne` is the shared expert; anything ABOVE it would read routed block `e`'s
@@ -480,6 +616,40 @@ fn main() -> Result<()> {
                 "", "  ^vq3", avq.rel_l2, avq.max_abs, avq.cos, avq.gain,
                 ayvq.rel_l2, ayvq.cos, ayvq.gain
             );
+            // ── DEAD ROWS. A per-ROW amax/7 step means one outlier sets the scale for
+            //    all i_dim weights; every weight below s/2 then rounds to nibble 8 = 0.
+            //    `.vq3` cannot fail this way: its scales are per GROUP of 64, so an
+            //    outlier can only flatten its own group. This is the one structural
+            //    difference between the formats that a per-row error metric averages
+            //    away -- a row that is 100% zeros still contributes only its own share
+            //    of rel-L2, but it removes an output channel outright.
+            let dead = |pk: &[u8], label: &str| {
+                let rbb = i4_row_bytes(i_dim);
+                let mut fr: Vec<f64> = (0..o_dim)
+                    .map(|o| {
+                        let row = &pk[o * rbb..(o + 1) * rbb];
+                        let z = (0..i_dim)
+                            .filter(|&i| {
+                                let b = row[i >> 1];
+                                (if i & 1 == 0 { b & 0x0F } else { b >> 4 }) == 8
+                            })
+                            .count();
+                        z as f64 / i_dim as f64
+                    })
+                    .collect();
+                let mean = fr.iter().sum::<f64>() / o_dim as f64;
+                fr.sort_by(f64::total_cmp);
+                println!(
+                    "{:<6} DEAD {:<7}| mean {:.3}  p99 {:.3}  max {:.3}  >50% {:>4}  >80% {:>4}  ==100% {:>4}",
+                    e, label, mean, fr[o_dim * 99 / 100], fr[o_dim - 1],
+                    fr.iter().filter(|&&f| f > 0.5).count(),
+                    fr.iter().filter(|&&f| f > 0.8).count(),
+                    fr.iter().filter(|&&f| f >= 1.0).count()
+                );
+            };
+            dead(packed, &format!("new {pname}"));
+            dead(&op, &format!("old {pname}"));
+
             // ── bulk vs tail: does the fp8 chain's LARGER amax coarsen the step and
             //    cost precision on the many small weights, where decode quality lives?
             //    Both generations are scored on the SAME positions (the fp8 row's own
