@@ -21,8 +21,8 @@ extern "C" __global__ void gemv_fp8(
     size_t o = (size_t)blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x / WAVE);
     if (o >= (size_t)o_dim) return;
     int sc_cols = (i_dim + block - 1) / block;
-    float acc = dot_fp8_wave(x, packed + o * (size_t)i_dim, scale + (o / block) * sc_cols,
-                             i_dim, block, lane, lut);
+    float acc = dot_fp8_wave(x, packed + o * (size_t)i_dim,
+                             scale + (o >> blk_shift(block)) * sc_cols, i_dim, block, lane, lut);
     if (lane == 0) y[o] = acc;
 }
 
@@ -45,7 +45,11 @@ extern "C" __global__ void gemv_fp8_splitk(
     int lane = threadIdx.x & (WAVE - 1);
     int sc_cols = (i_dim + block - 1) / block;
     const unsigned char* wrow = packed + o * (size_t)i_dim;
-    const float* scalerow = scale + (o / block) * sc_cols;
+    // Shift, NOT divide: `o` is a size_t, so `o / block` was a runtime division once per
+    // thread (~55 instructions). Same index, the launcher rejecting a non-power-of-two
+    // tile. Measured −0.9%, INSIDE the noise band and not the 20% the identical fix
+    // bought in mla_value_fp8 — why, and why it shipped anyway, in docs/PERF.md #2.
+    const float* scalerow = scale + (o >> blk_shift(block)) * sc_cols;
     const int STRIDE = ROWS_PER_BLOCK * WAVE; // all 256 threads stride coalesced (split-K)
     // Same strided fp8 MAC as dot_fp8_wave, but split-K across every wave in the block.
     float acc = fp8_dot_strided(x, wrow, scalerow, i_dim, block, lut, threadIdx.x, STRIDE);
@@ -222,6 +226,8 @@ extern "C" int rivoli_gemv_fp8_splitk(
 extern "C" int rivoli_gemv_fp8(
     const float* x, const unsigned char* packed, const float* scale, int o_dim, int i_dim,
     int block, float* y) {
+    // NO `i_dim % 4` guard, unlike the Vulkan twin and unlike rivoli_mla_value_fp8's
+    // `kvl % 4` — a known gap, conditional on block >= 4. See common.hpp fp8_dot_strided.
     if (o_dim <= 0 || i_dim <= 0 || block <= 0) return 1001;
     if (block & (block - 1)) return 1003;  // blk_shift needs a power-of-two tile
     if (i_dim >= GEMV_SPLITK_MIN_IDIM)

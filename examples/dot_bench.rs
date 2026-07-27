@@ -48,8 +48,24 @@ fn u16b(v: &[u16]) -> Vec<u8> {
 fn f16b(v: &[f32]) -> Vec<u8> {
     u16b(&v.iter().map(|&x| f32_to_f16(x)).collect::<Vec<_>>())
 }
+/// `n` uniform [-1,1) f32 as device bytes, and the same with the positive offset the
+/// block scales need. Every fingerprinted buffer draws from one of these two.
+fn rnd(r: &mut Rng, n: usize) -> Vec<u8> {
+    f32b(&(0..n).map(|_| r.f()).collect::<Vec<_>>())
+}
+fn rnd_scale(r: &mut Rng, n: usize) -> Vec<u8> {
+    f32b(&(0..n).map(|_| (r.f() * 0.1).abs() + 0.01).collect::<Vec<_>>())
+}
 fn f32v(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+}
+
+/// FNV-1a over a kernel's raw output bytes — the only instrument here that separates
+/// "bit-identical" from "within tolerance". See benchmarks.md, "A fingerprint is the only
+/// instrument that shows bit-identity", including why the inputs below must VARY.
+fn fnv(b: &[u8]) -> u64 {
+    b.iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x100_0000_01b3))
 }
 
 fn time(iters: u32, f: &dyn Fn()) -> f64 {
@@ -141,23 +157,28 @@ fn report(name: &str, kind: &str, o_dim: usize, i_dim: usize, us: f64) {
 /// traffic against the 256 GB/s LPDDR5 peak, which is the number these kernels are
 /// actually bounded by.
 ///
-/// THROUGHPUT ONLY. `x` is a constant vector — fine here, because addresses and traffic
-/// are identical to a varying one — but it means these rows cannot surface any
-/// value-dependent effect. A clean number here is NOT evidence about numerics; that is
-/// what the oracles in tests/kernel.rs and the perplexity harness are for.
+/// THROUGHPUT PLUS A FINGERPRINT. `x` and the block scales VARY (they used to be
+/// constant); addresses and traffic are identical either way, so no timing row moves.
+/// The fingerprint is NOT an accuracy check — the oracles in tests/kernel.rs are.
 fn run_fp8(name: &str, o_dim: usize, i_dim: usize) {
     let block = 128usize;
+    let seed = 0xF8 ^ i_dim as u64;
+    let mut r = Rng(seed);
     // |v| <= 0.1 never encodes to the e4m3 NaN pattern, so no fixup is needed.
     let packed = pattern(o_dim * i_dim, |v| f32_to_e4m3(v * 0.1));
-    let scale: Vec<f32> = vec![1.0; (o_dim / block) * (i_dim / block)];
-    let x: Vec<f32> = vec![0.5; i_dim];
-    let (xb, pb, sb) = (dev(&f32b(&x)), dev(&packed), dev(&f32b(&scale)));
+    let scale = rnd_scale(&mut r, (o_dim / block) * (i_dim / block));
+    let (xb, pb, sb) = (dev(&rnd(&mut r, i_dim)), dev(&packed), dev(&scale));
     let mut yb = dev(&vec![0u8; o_dim * 4]);
     let (xp, yp) = (xb.ptr() as *const f32, yb.ptr_mut() as *mut f32);
     let us = time(60, &|| unsafe {
         launch_gemv_fp8(xp, pb.ptr(), sb.ptr() as *const f32, o_dim, i_dim, block, yp).expect("fp8");
     });
     report(name, "fp8", o_dim, i_dim, us);
+    // The hash is only comparable against a run with the SAME generator, so print what
+    // determines it: a recorded bare hash goes stale the first time a seed or a draw
+    // order moves, and reads as a numerics regression when it does.
+    println!("            fnv {:016x}  (seed {seed:#x}, {o_dim}x{i_dim} blk{block})",
+        fnv(&yb.copy_out().expect("out")));
 }
 
 fn run_i8(name: &str, o_dim: usize, i_dim: usize) {
@@ -181,12 +202,14 @@ fn run_i8(name: &str, o_dim: usize, i_dim: usize) {
 /// judged against, so both belong in the same run.
 fn run_mla(h: usize, qh: usize, nope: usize, vh: usize, kvl: usize) {
     let block = 128usize;
+    const SEED: u64 = 0x11A;
+    let mut r = Rng(SEED);
     let rows = h * (nope + vh);
     let kvb = dev(&pattern(rows * kvl, |v| f32_to_e4m3(v * 0.1)));
     let sc_cols = kvl.div_ceil(block);
-    let kvb_scale = dev(&f32b(&vec![1.0f32; rows.div_ceil(block) * sc_cols]));
-    let q = dev(&f32b(&vec![0.3f32; h * qh]));
-    let clat = dev(&f32b(&vec![0.3f32; h * kvl]));
+    let kvb_scale = dev(&rnd_scale(&mut r, rows.div_ceil(block) * sc_cols));
+    let q = dev(&rnd(&mut r, h * qh));
+    let clat = dev(&rnd(&mut r, h * kvl));
     let mut qabs = dev(&vec![0u8; h * kvl * 4]);
     let mut ctx = dev(&vec![0u8; h * vh * 4]);
     let (kp, sp) = (kvb.ptr(), kvb_scale.ptr() as *const f32);
@@ -198,12 +221,16 @@ fn run_mla(h: usize, qh: usize, nope: usize, vh: usize, kvl: usize) {
     });
     let gbs = (h * nope * kvl) as f64 / (us * 1e-6) / 1e9;
     println!("mla_absorb  [{h}x{nope}x{kvl}]   {us:8.1}us  {gbs:6.1} GB/s");
+    println!("            fnv {:016x}  (seed {SEED:#x}, {h}x{nope}x{kvl} blk{block})",
+        fnv(&qabs.copy_out().expect("out")));
 
     let us = time(60, &|| unsafe {
         launch_mla_value_fp8(cp, kp, sp, h, nope, vh, kvl, block, xp).expect("value");
     });
     let gbs = (h * vh * kvl) as f64 / (us * 1e-6) / 1e9;
     println!("mla_value   [{h}x{vh}x{kvl}]   {us:8.1}us  {gbs:6.1} GB/s");
+    println!("            fnv {:016x}  (seed {SEED:#x}, {h}x{vh}x{kvl} blk{block})",
+        fnv(&ctx.copy_out().expect("out")));
 }
 
 /// MLA flash attention at two context lengths. This kernel's cost grows with context,
@@ -266,26 +293,44 @@ fn run_tail_rest(vocab: usize, hidden: usize) {
     println!("rmsnorm     [{hidden}]           {us:8.1}us  (single workgroup, dim3(1))");
 }
 
+/// `-- mla gemv` runs only those sections; no argument runs all of them, so a per-kernel
+/// A/B can book only the rows it is about to compare.
 fn main() {
-    println!("MoE dot decode throughput (wave-per-row, isolated):");
-    run("gate/up", 2048, 6144); // hidden reduction
-    run("down", 6144, 2048); // inter reduction
+    const SECTIONS: [&str; 5] = ["moe", "gemv", "mla", "attend", "tail"];
+    let want: Vec<String> = std::env::args().skip(1).collect();
+    // A typo must NOT silently select nothing. Every number this branch rests on — the
+    // timings and the fnv fingerprints both — is read off this binary's stdout, so an
+    // empty run that exits 0 reads as "no regression" in exactly the A/B it exists for.
+    for w in &want {
+        assert!(SECTIONS.contains(&w.as_str()), "unknown section {w:?}, want one of {SECTIONS:?}");
+    }
+    let on = |s: &str| want.is_empty() || want.iter().any(|w| w == s);
 
+    if on("moe") {
+        println!("MoE dot decode throughput (wave-per-row, isolated):");
+        run("gate/up", 2048, 6144); // hidden reduction
+        run("down", 6144, 2048); // inter reduction
+    }
     // The two per-kernel targets in docs/PERF.md, at their real engine shapes.
-    println!("\nRoute/tail GEMV bandwidth (real shapes, 256 GB/s peak):");
-    run_fp8("o_proj", 6144, 16384); // ~half of `route`; split-K path
-    run_i8("lm_head", 154880, 6144); // ~half of `tail`, measured — not all of it
-
+    if on("gemv") {
+        println!("\nRoute/tail GEMV bandwidth (real shapes, 256 GB/s peak):");
+        run_fp8("o_proj", 6144, 16384); // ~half of `route`; split-K path
+        run_i8("lm_head", 154880, 6144); // ~half of `tail`, measured — not all of it
+    }
     // GLM-5.2 manifest: num_attention_heads 64, qk_head_dim 256 (= qk_nope 192 + rope
     // 64), v_head_dim 256, kv_lora_rank 512. Getting these wrong understates the work:
     // absorb reads H*nope*kvl and value reads H*vh*kvl, so a guessed 128/128 would have
     // measured 4.2 MB where the engine moves 6.3 and 8.4.
-    println!("\nMLA kv_b kernels (route):");
-    run_mla(64, 256, 192, 256, 512);
-
-    println!("\nMLA flash attention (route; scales with context):");
-    run_attend(64, 512, 64);
-
-    println!("\nRest of the tail bucket (attribution by subtraction):");
-    run_tail_rest(154880, 6144);
+    if on("mla") {
+        println!("\nMLA kv_b kernels (route):");
+        run_mla(64, 256, 192, 256, 512);
+    }
+    if on("attend") {
+        println!("\nMLA flash attention (route; scales with context):");
+        run_attend(64, 512, 64);
+    }
+    if on("tail") {
+        println!("\nRest of the tail bucket (attribution by subtraction):");
+        run_tail_rest(154880, 6144);
+    }
 }

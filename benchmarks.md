@@ -712,6 +712,53 @@ not obviously worth widening. The open question is therefore **x re-read amplifi
 (every block streams all of x for its slice of weights), which is a different lever from
 load width and was never what the dead end tested.
 
+**That open question is now CLOSED — refuted.** `SPLITK_ROWS` tiling was implemented and
+swept 1/2/4/8; R=8 cuts x traffic 8× and is the **slowest** arm (+11%), R=2 the best at
+−1.4%, inside a noise band wider than the effect. The tiling was reverted. See
+docs/PERF.md follow-up #2 for the table. The load-width lever, meanwhile, paid where it
+was correctly aimed: `mla_absorb_fp8`'s single-byte weight load became a dword and the
+kernel went 35.9 → 25.7 µs. Two levers, one refuted and one confirmed, out of the same
+ISA pass.
+
+### Divide by the peak before you book the slot
+
+**402 MB of x plus 100 MB of weights in 529 µs is 950 GB/s, on a 256 GB/s part.** The
+traffic figure that motivated the x re-read item was 3.7× over the hardware limit, which
+means it was never DRAM traffic — `x` is 64 KB, it lives in cache, and the kernel was
+never paying the bus cost the hypothesis charged it. **One division would have retired the
+item without a device slot.** It cost four builds and twenty interleaved runs instead.
+
+This generalises past bandwidth. Any figure a hypothesis rests on — GB/s, instructions
+per byte, bytes per wave — has a hardware ceiling next to it, and checking is free.
+`mla_value_fp8` reads 8.4 MB in 26.1 µs = **322 GB/s, also over peak**: it is re-reading a
+14.7 MB `kv_b` that the bench leaves resident across its 60 iterations, so "310 GB/s" was
+never a DRAM number either and `mla_absorb`'s 1.8× gap to it was never a 1.8× bus gap.
+Both numbers are still valid *comparators* between arms of the same bench. Neither is a
+roofline. Say which one you are quoting.
+
+### A fingerprint is the only instrument that shows bit-identity
+
+`assert_close` cannot tell a bit-identical restructure from a reassociating one — both
+pass, and the margin print does not distinguish them either. `examples/dot_bench` now
+prints an FNV-1a hash of each kernel's raw output bytes, and the absorb restructure's
+claim rests on it: `0925c147afeea3fb`, unchanged across 14 interleaved runs of both arms.
+
+It only works if the inputs vary. `run_fp8` and `run_mla` used constant `x`, `q` and
+`clat` — correct for throughput, since traffic does not depend on values, but a constant
+input leaves the output insensitive to summation order, and the fingerprint would have
+been green for a change that reassociated. **The instrument and the input generator are
+one instrument**; a fingerprint over degenerate data is a fingerprint of nothing.
+
+### Measuring on a contended bus — report min, and keep a control arm
+
+These runs shared the machine with a memory-heavy conversion job, and `o_proj` (100 MB
+streamed) ranged **515 → 1141 µs on a single unchanged arm**. The MLA kernels (6-14 MB,
+cache-resident) held to ±3% through the same window. Three things kept the conclusions:
+interleaving the arms so drift hits both, quoting **min-of-N** rather than mean (the
+minimum is the least-contended sample; the mean measures the neighbour), and carrying an
+**unchanged control kernel** in the same binary — `mla_value` at 26.1 µs in both arms, and
+`lm_head` at 8026 vs 8038 µs, are what license reading a 1% difference at all.
+
 ## Running these benches — detach anything multi-cell
 
 **A GPU run longer than the agent harness's background-task lifetime must be detached into

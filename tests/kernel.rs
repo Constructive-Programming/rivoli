@@ -78,12 +78,28 @@ fn gemv_fp8_matches_oracle() {
     // block-scaled fp8 GEMV vs matvec_fp8. Two shapes: a short reduction (plain
     // wave-per-row path) and a long one (i_dim ≥ 4096 → the split-K path
     // launch_gemv_fp8 dispatches to for the o_proj-class projections).
-    let block = 128usize;
-    for (o_dim, i_dim, label) in [(256usize, 512usize, "gemv_fp8"), (128, 16384, "gemv_fp8_splitk")] {
-        let mut r = Lcg(0xF8 ^ i_dim as u64);
+    // Shape 3 is DELIBERATELY ragged: 130 rows at block 128 give a PARTIAL final scale
+    // row, which shapes 1-2 (exact multiples) never produce. That is what forced the
+    // scale allocation below from `(o_dim / block)` to `o_dim.div_ceil(block)` — the old
+    // expression sizes one row for 130 and the oracle reads off the end of it.
+    // Shapes 4-5 pin the NARROW tiles the guard test below insists on ACCEPTING: the dot
+    // reads four columns per dword and one block scale per quad, so a tile narrower than
+    // a quad must fall back to the per-column path. Both values are covered because they
+    // index differently — block=1 gives bsh=0 and sc_cols == i_dim (a scale per column,
+    // no shift at all), block=2 puts two columns of each quad in the right tile and two
+    // in the next. Accepting them in the launcher while silently mis-scaling most of
+    // every quad, which is what shipped, is the worse of the two failures.
+    for (o_dim, i_dim, block, label) in [
+        (256usize, 512usize, 128usize, "gemv_fp8"),
+        (128, 16384, 128, "gemv_fp8_splitk"),
+        (130, 8192, 128, "gemv_fp8_splitk ragged o_dim"),
+        (64, 512, 2, "gemv_fp8 block=2"),
+        (64, 512, 1, "gemv_fp8 block=1"),
+    ] {
+        let mut r = Lcg(0xF8 ^ i_dim as u64 ^ (block as u64) << 20);
         let packed: Vec<u8> = (0..o_dim * i_dim).map(|_| f32_to_e4m3(r.f())).collect();
-        let sc_cols = i_dim / block;
-        let scale: Vec<f32> = (0..(o_dim / block) * sc_cols)
+        let sc_cols = i_dim.div_ceil(block); // div_ceil on BOTH axes, mirroring the kernel
+        let scale: Vec<f32> = (0..o_dim.div_ceil(block) * sc_cols)
             .map(|_| (r.f() * 0.1).abs() + 0.01)
             .collect();
         let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
@@ -154,6 +170,65 @@ fn gemv_fp8_rejects_non_power_of_two_block() {
         }
         device_sync().expect("sync");
     }
+}
+
+#[test]
+fn mla_value_rejects_ragged_kvl_but_absorb_accepts_it() {
+    // The two kv_b kernels have DIFFERENT legal kvl, and the asymmetry is load width.
+    // `mla_value_fp8` goes through the word-loading shared MAC, so a kvl that is not a
+    // multiple of 4 leaves 3 rows in 4 misaligned for its dword load — guard 1002, the
+    // same rejection src/vk.rs makes. `mla_absorb_fp8` reads the ragged case a column at
+    // a time and must keep accepting it, because the Vulkan absorb launcher does.
+    //
+    // Asserts BOTH directions. A test that only checked the rejection would still pass
+    // if someone "fixed the asymmetry" by adding the guard to absorb as well, which
+    // would silently drop a shape the other backend supports.
+    let (h, qh, nope, vh, block) = (2usize, 32usize, 8usize, 4usize, 128usize);
+    for (kvl, want) in [(64usize, None), (37, Some(1002)), (66, Some(1002))] {
+        let rows = h * (nope + vh);
+        let kvb = dev(&vec![0u8; rows * kvl]);
+        let scale = dev(&f32b(&vec![1.0f32; rows * kvl]));
+        let x = dev(&f32b(&vec![0.0f32; h * qh.max(kvl)]));
+        let mut out = dev(&vec![0u8; h * kvl * 4]);
+        // SAFETY: every buffer is device-resident and sized past what these dims read.
+        let val = unsafe {
+            launch_mla_value_fp8(
+                x.ptr() as *const f32,
+                kvb.ptr(),
+                scale.ptr() as *const f32,
+                h,
+                nope,
+                vh,
+                kvl,
+                block,
+                out.ptr_mut() as *mut f32,
+            )
+        };
+        match want {
+            None => assert!(val.is_ok(), "mla_value kvl={kvl}: {val:?}"),
+            Some(code) => {
+                let msg = format!("{:#}", val.expect_err("expected a guard rejection"));
+                assert!(msg.contains(&code.to_string()), "mla_value kvl={kvl}: got {msg:?}");
+            }
+        }
+        // SAFETY: as above; absorb reads the same buffers with a smaller footprint.
+        let abs = unsafe {
+            launch_mla_absorb_fp8(
+                x.ptr() as *const f32,
+                kvb.ptr(),
+                scale.ptr() as *const f32,
+                h,
+                qh,
+                nope,
+                vh,
+                kvl,
+                block,
+                out.ptr_mut() as *mut f32,
+            )
+        };
+        assert!(abs.is_ok(), "mla_absorb must accept kvl={kvl}: {abs:?}");
+    }
+    device_sync().expect("sync");
 }
 
 #[test]
@@ -434,15 +509,36 @@ fn mla_attend_edges() {
 }
 
 /// MLA absorb + value kernels vs an f32 reference on the dequantized kv_b. kv_b is
-/// fp8-e4m3 block-scaled: [H·(nope+vh) rows, kvl cols], block 128 on both axes.
+/// fp8-e4m3 block-scaled: [H·(nope+vh) rows, kvl cols].
+///
+/// `mla_absorb_fp8` has one fast path and ONE fallback branch with two independent
+/// triggers, and the GLM shape only ever reaches the fast path. The fast path gives a
+/// thread an i-QUAD: four contiguous columns read as one dword sharing one block scale.
+/// It needs `kvl % 4 == 0` (or the rows are unaligned for the dword load) and
+/// `block >= 4` (or a quad straddles scale tiles). Each trigger, and the boundary value
+/// `block == 4` itself, needs its own shape — an off-by-one in that predicate is
+/// invisible to a suite that only tries 2 and 128.
 #[test]
 fn mla_fp8_matches_reference() {
-    let mut r = Lcg(0x77);
-    let (h, qh, nope, vh, kvl, block) = (4usize, 128usize, 128usize, 64usize, 256usize, 128usize);
+    //          seed  h  qh nope vh  kvl block
+    check_mla_fp8(0x77, 4, 128, 128, 64, 256, 128); // GLM-like: the i-quad fast path
+    check_mla_fp8(0x78, 3, 64, 48, 32, 37, 128); // kvl % 4 != 0 → scalar fallback
+    check_mla_fp8(0x79, 2, 32, 16, 8, 64, 2); // block < 4 → scalar fallback
+    check_mla_fp8(0x7a, 2, 32, 16, 8, 64, 4); // block == 4: the fast/fallback BOUNDARY
+    check_mla_fp8(0x7b, 2, 32, 16, 8, 68, 64); // fast path over a PARTIAL last scale tile
+    check_mla_fp8(0x7c, 2, 16, 8, 4, 2, 128); // kvl < 4: the fallback's i0+k clamp
+}
+
+/// Checks absorb always, and value only where value is DEFINED — `mla_value_fp8` requires
+/// `kvl % 4 == 0` (guard 1002) and absorb does not; see
+/// `mla_value_rejects_ragged_kvl_but_absorb_accepts_it`.
+fn check_mla_fp8(seed: u64, h: usize, qh: usize, nope: usize, vh: usize, kvl: usize, block: usize) {
+    let value_defined = kvl.is_multiple_of(4);
+    let mut r = Lcg(seed);
     let rows = h * (nope + vh);
-    let sc_cols = kvl / block;
+    let sc_cols = kvl.div_ceil(block);
     let packed: Vec<u8> = (0..rows * kvl).map(|_| f32_to_e4m3(r.f())).collect();
-    let scale: Vec<f32> = (0..(rows / block).max(1) * sc_cols)
+    let scale: Vec<f32> = (0..rows.div_ceil(block) * sc_cols)
         .map(|_| (r.f() * 0.1).abs() + 0.01)
         .collect();
     // reference reads the exact dequant the kernels see: kvb[row][i] = e4m3·block-scale.
@@ -497,30 +593,34 @@ fn mla_fp8_matches_reference() {
             absb.ptr_mut() as *mut f32,
         )
         .expect("launch absorb");
-        launch_mla_value_fp8(
-            clb.ptr() as *const f32,
-            kb.ptr(),
-            sb.ptr() as *const f32,
-            h,
-            nope,
-            vh,
-            kvl,
-            block,
-            valb.ptr_mut() as *mut f32,
-        )
-        .expect("launch value");
+        if value_defined {
+            launch_mla_value_fp8(
+                clb.ptr() as *const f32,
+                kb.ptr(),
+                sb.ptr() as *const f32,
+                h,
+                nope,
+                vh,
+                kvl,
+                block,
+                valb.ptr_mut() as *mut f32,
+            )
+            .expect("launch value");
+        }
     }
     device_sync().expect("sync");
     assert_close(
         &want_abs,
         &f32v(&absb.copy_out().expect("out")),
-        "mla_absorb",
+        &format!("mla_absorb kvl{kvl} block{block}"),
     );
-    assert_close(
-        &want_val,
-        &f32v(&valb.copy_out().expect("out")),
-        "mla_value",
-    );
+    if value_defined {
+        assert_close(
+            &want_val,
+            &f32v(&valb.copy_out().expect("out")),
+            &format!("mla_value kvl{kvl} block{block}"),
+        );
+    }
 }
 
 /// Fused VQ MoE (moe_gateup_vq → moe_down_vq → moe_reduce), 3 per-projection
