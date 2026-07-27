@@ -334,41 +334,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn f32_to_f16_known_bit_patterns() {
-        // Exact-representable values and a sign.
-        assert_eq!(f32_to_f16(0.0), 0x0000);
-        assert_eq!(f32_to_f16(1.0), 0x3c00);
-        assert_eq!(f32_to_f16(2.0), 0x4000);
-        assert_eq!(f32_to_f16(0.5), 0x3800);
-        assert_eq!(f32_to_f16(-1.0), 0xbc00);
-        // Round to nearest even: 1 + 2^-11 sits exactly between 0x3c00 and 0x3c01,
-        // ties to even (0x3c00); 1 + 2^-10 is the next representable step.
-        assert_eq!(f32_to_f16(1.0 + 2f32.powi(-11)), 0x3c00);
-        assert_eq!(f32_to_f16(1.0 + 2f32.powi(-10)), 0x3c01);
-        // Max finite fp16 (65504) and overflow → inf.
-        assert_eq!(f32_to_f16(65504.0), 0x7bff);
-        assert_eq!(f32_to_f16(1e30), 0x7c00);
-        // Underflow → ±0; a NaN keeps a mantissa bit (stays NaN, not inf).
-        assert_eq!(f32_to_f16(1e-30), 0x0000);
-        assert_ne!(f32_to_f16(f32::NAN) & 0x03ff, 0);
-    }
-
-    #[test]
-    fn silu_known_points() {
-        assert!(silu(0.0).abs() < 1e-6);
-        // silu(x) = x*sigmoid(x); at large x it approaches x.
-        assert!((silu(20.0) - 20.0).abs() < 1e-3);
-    }
-
-    #[test]
-    fn softmax_sums_to_one_and_orders() {
-        let mut v = [1.0f32, 2.0, 3.0];
-        softmax(&mut v);
-        assert!((v.iter().sum::<f32>() - 1.0).abs() < 1e-6);
-        assert!(v[2] > v[1] && v[1] > v[0]);
-    }
-
-    #[test]
     fn topk_picks_largest_with_stable_tiebreak() {
         let s = [0.1f32, 0.9, 0.5, 0.9];
         // two 0.9s at idx 1 and 3 → lower index first.

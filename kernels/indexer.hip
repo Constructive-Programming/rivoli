@@ -140,6 +140,122 @@ extern "C" __global__ void index_head_route(
     if (tid == 0) e[j] = sum / (float)(m_blocks > 0 ? m_blocks : 1);
 }
 
+// --- device row selection (docs/NPU.md): replaces a host D2H + CPU top-k ---------
+// One workgroup: the kernel is ~5 sweeps of nt (nt <= max_ctx), so a grid-wide radix
+// would add a global sync and a second launch to tens of microseconds of work.
+#define TOPK_BLOCK 256
+#define TOPK_BINS 256
+
+// Order-preserving f32 -> u32 (ascending key iff ascending float), with -0.0
+// canonicalised to +0.0. The host comparator ties -0.0 with +0.0 (`partial_cmp` says
+// they are Equal) and separates them by index; a raw radix over bit patterns would
+// instead order -0.0 strictly below, so the canonicalisation is what makes the two
+// agree. NaN is out of contract on both sides — the host's comparator maps NaN to
+// Equal, which is not a total order — and here a sign-clear NaN sorts above +inf while
+// a sign-set NaN sorts below -inf.
+__device__ __forceinline__ unsigned int topk_key(float v) {
+    unsigned int b = (v == 0.0f) ? 0u : __float_as_uint(v);
+    return b ^ ((unsigned int)((int)b >> 31) | 0x80000000u);
+}
+
+// Block-wide EXCLUSIVE scan of `v`, block total left in *total. Every thread of the
+// block must call it: the barriers are unconditional.
+__device__ __forceinline__ unsigned int topk_scan(
+    unsigned int* tmp, unsigned int v, int tid, unsigned int* total) {
+    tmp[tid] = v;
+    __syncthreads();
+    for (int off = 1; off < TOPK_BLOCK; off <<= 1) {
+        unsigned int add = (tid >= off) ? tmp[tid - off] : 0u;
+        __syncthreads(); // read before write, or the shifted read races the update
+        tmp[tid] += add;
+        __syncthreads(); // write before the next iteration's read
+    }
+    unsigned int incl = tmp[tid];
+    *total = tmp[TOPK_BLOCK - 1];
+    __syncthreads(); // both reads retired before a caller reuses `tmp`
+    return incl - v;
+}
+
+// rows[0..min(k,nt)) = the DSA attend row set, ASCENDING: order by score descending
+// and index ascending, take the first k, emit that set in index order.
+//
+// The index tiebreak is load-bearing whenever the score array carries ties at the k-th
+// boundary: the selection is then decided by the index rule, and resolving ties by
+// arrival order would be non-deterministic across runs. How tie-heavy the engine's
+// scores actually are is UNMEASURED — `index_score` ReLUs every head contribution, which
+// is the reason to expect ties, but docs/NPU.md records evidence against the array being
+// tie-dominated. The rule is exact either way; only how much of the selection it decides
+// is open.
+extern "C" __global__ void index_topk(
+    const float* __restrict__ s, int nt, int k, unsigned int* __restrict__ rows) {
+    __shared__ unsigned int hist[TOPK_BINS];
+    __shared__ unsigned int scan[TOPK_BLOCK];
+    __shared__ unsigned int sh_pivot, sh_need;
+    int tid = threadIdx.x;
+
+    unsigned int pivot = 0u;             // key bits fixed so far
+    unsigned int mask = 0u;              // which bits of `pivot` are fixed
+    unsigned int need = (unsigned int)k; // top-k entries still to locate
+
+    // Four 8-bit radix passes, MSB first, converging `pivot` on the exact key of the
+    // k-th largest score and `need` on how many entries tied at it the selection takes.
+    // Each pass re-reads nt and filters on the bits fixed so far: one extra sweep of an
+    // array already in cache, against a compaction pass plus its scratch buffer.
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int b = tid; b < TOPK_BINS; b += TOPK_BLOCK) hist[b] = 0u;
+        __syncthreads();
+        for (int i = tid; i < nt; i += TOPK_BLOCK) {
+            unsigned int u = topk_key(s[i]);
+            if ((u & mask) == pivot) atomicAdd(&hist[(u >> shift) & 0xFFu], 1u);
+        }
+        __syncthreads();
+        if (tid == 0) {
+            // Walk bins high to low for the one carrying the k-th entry. The loop test
+            // only accumulates after checking `acc + hist[b] < need`, so `acc < need`
+            // holds on every exit and `need - acc >= 1` cannot underflow. Falling
+            // through to b == 0 is a real path, not dead code — bin 0 is never tested —
+            // and it is correct: there `acc = sum_{b>=1} hist[b]`, so
+            // `acc + hist[0]` is the whole surviving candidate count, which is >= need
+            // by the induction the chosen bin maintains.
+            unsigned int acc = 0u;
+            int b = TOPK_BINS - 1;
+            for (; b > 0; --b) {
+                if (acc + hist[b] >= need) break;
+                acc += hist[b];
+            }
+            sh_pivot = pivot | ((unsigned int)b << shift);
+            sh_need = need - acc;
+        }
+        __syncthreads();
+        pivot = sh_pivot;
+        need = sh_need;
+        mask |= 0xFFu << shift;
+        __syncthreads();
+    }
+
+    // Compaction, ascending. A selected element's output slot has a closed form —
+    //   slot(i) = (# keys > pivot before i) + min(# keys == pivot before i, need)
+    // — which is monotone in i, so one packed scan yields both prefixes and the rows
+    // land already sorted. No atomics, so the order is deterministic. The 16-bit
+    // packing is bounded by TOPK_BLOCK, not by nt: the scan only ever carries
+    // within-chunk counts (<= 256), while the running totals are separate registers.
+    unsigned int base_gt = 0u, base_eq = 0u;
+    for (int base = 0; base < nt; base += TOPK_BLOCK) {
+        int i = base + tid;
+        bool live = i < nt;
+        unsigned int u = live ? topk_key(s[i]) : 0u;
+        unsigned int gt = (live && u > pivot) ? 1u : 0u;
+        unsigned int eq = (live && u == pivot) ? 1u : 0u;
+        unsigned int total = 0u;
+        unsigned int pre = topk_scan(scan, gt | (eq << 16), tid, &total);
+        unsigned int g = base_gt + (pre & 0xFFFFu);
+        unsigned int e = base_eq + (pre >> 16);
+        if (gt || (eq && e < need)) rows[g + (e < need ? e : need)] = (unsigned int)i;
+        base_gt += total & 0xFFFFu;
+        base_eq += total >> 16;
+    }
+}
+
 extern "C" int rivoli_layernorm(
     const float* x, const float* w, const float* b, int n, float eps, float* y) {
     if (n <= 0) return 1001;
@@ -201,4 +317,19 @@ extern "C" int rivoli_index_head_route(
                        q, w, pool, m_blocks, nh, hd, e);
     hipError_t err = hipGetLastError();
     return err == hipSuccess ? 0 : -(int)err;
+}
+
+// Launch-only wrapper for `index_topk`. `k` is clamped to `nt`, matching
+// `topk_into`'s `k.min(scores.len())`, so a caller may pass index_topk > nt. Note one
+// divergence from `topk_into`: k == 0 is an argument error here, where the host returns
+// an empty selection. Unreachable today (`index_topk` is validated non-zero at config
+// load), but it is a difference, not an equivalence.
+extern "C" int rivoli_index_topk(
+    const float* scores, int nt, int k, unsigned int* rows) {
+    if (nt <= 0 || k <= 0) return 1001;
+    if (k > nt) k = nt;
+    hipGetLastError();
+    hipLaunchKernelGGL(index_topk, dim3(1), dim3(TOPK_BLOCK), 0, 0, scores, nt, k, rows);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
 }

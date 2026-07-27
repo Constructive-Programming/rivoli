@@ -54,6 +54,10 @@ trace = []
 name = "dot_bench"
 required-features = ["rocm"]
 
+[[example]]
+name = "indexer_bench"
+required-features = ["rocm"]
+
 [lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"

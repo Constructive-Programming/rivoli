@@ -5,10 +5,9 @@
 use rivoli::device::DeviceBuf;
 use rivoli::gpustream::HipStream;
 use rivoli::hip::{
-    ExpertDesc, attend_scratch_floats, device_sync, launch_argmax, launch_attend,
-    launch_gemv_fp8, launch_gemv_i8, launch_gemv_vq, launch_mla_absorb_fp8,
-    launch_mla_value_fp8, launch_moe_expert_range, launch_moe_expert_range_i4,
-    launch_moe_reduce, launch_vadd,
+    ExpertDesc, attend_scratch_floats, device_sync, launch_argmax, launch_attend, launch_gemv_fp8,
+    launch_gemv_i8, launch_gemv_vq, launch_index_topk, launch_mla_absorb_fp8, launch_mla_value_fp8,
+    launch_moe_expert_range, launch_moe_expert_range_i4, launch_moe_reduce, launch_vadd,
 };
 use rivoli::math::{bf16_to_f32, e4m3_to_f32, f32_to_bf16, f32_to_e4m3, silu, softmax};
 use rivoli::quant::{VQ_DIM, VQ_K, matvec_fp8, matvec_i8, matvec_vq, quant_vq};
@@ -841,4 +840,115 @@ fn moe_i4_real_data_matches_cpu() {
         &got[..3]
     );
     assert_close(&want, &got, "moe_i4_real");
+}
+
+/// `index_topk` vs the host selection it replaces, on the shapes that actually occur.
+///
+/// The oracle is the engine's own two lines — `topk_into(scores, k, &mut sel)` then
+/// `sel.sort_unstable()` — not a reimplementation, so this pins the kernel to what the
+/// attend has always consumed rather than to my reading of it.
+///
+/// **The row buffer is sentinel-filled and the tail is asserted untouched.** Without
+/// that, over-selection is invisible: the readback would be truncated to `want.len()`,
+/// and whenever the correct answer is an index *prefix* — which it is for the
+/// `ReLU-sparse` case, since its non-zero scores sit at indices 0..300 — a kernel that
+/// emitted every tied row would still match on the first k. Measured against a serial
+/// simulation of this kernel: of three mutations (drop the cross-chunk tie carry; use
+/// `<= need` for the tie budget; drop the -0.0 canonicalisation), the tie carry is
+/// caught by seven cases on selection alone, the canonicalisation only by
+/// `mixed +0.0/-0.0`, and **`<= need` by nothing except the tail check**.
+///
+/// The `ReLU-sparse` and `scattered zeros` cases are tie-DOMINATED, which is the regime
+/// where the index-ascending rule decides the bulk of the selection rather than a
+/// handful of boundary entries. Whether the engine actually produces such an array is
+/// unmeasured (docs/NPU.md), so these are chosen as the hardest case for the tiebreak,
+/// not as a claim about production data. `scattered zeros` additionally makes the answer
+/// non-prefix, which is the combination nothing else here covers — and note the two
+/// differ in ORDER as well as scatter: `ReLU-sparse` is pre-sorted into the host
+/// comparator's own order, which is its best case and a trap when timing rather than
+/// checking. nt = 5185 and k = 2048 are the longer in-engine context and `index_topk`.
+#[test]
+fn index_topk_matches_host_selection() {
+    const SENTINEL: u32 = 0xFFFF_FFFF;
+    fn host(scores: &[f32], k: usize) -> Vec<u32> {
+        let mut sel = Vec::new();
+        rivoli::math::topk_into(scores, k, &mut sel);
+        sel.sort_unstable();
+        sel.iter().map(|&i| i as u32).collect()
+    }
+    let mut rng = Lcg(0x7071_C0DE);
+    let nt = 5185usize;
+    // Realistic shape, answer is a prefix: real scores at the front, rest ReLU'd to 0.0.
+    let mut relu_sparse = vec![0.0f32; nt];
+    for (i, x) in relu_sparse.iter_mut().enumerate().take(300) {
+        *x = (300 - i) as f32 * 0.25;
+    }
+    // Realistic shape, answer is NOT a prefix: the same sparsity, scattered.
+    let mut scattered = vec![0.0f32; nt];
+    for j in 0..300 {
+        scattered[(j * 7919) % nt] = (300 - j) as f32 * 0.25;
+    }
+    let dense: Vec<f32> = (0..nt).map(|_| rng.f() * 8.0).collect();
+    let heavy_ties: Vec<f32> = (0..nt).map(|_| (rng.f() * 4.0).floor()).collect();
+    let cases: Vec<(&str, Vec<f32>, usize)> = vec![
+        (
+            "mixed +0.0/-0.0",
+            (0..4096)
+                .map(|i| if i % 3 == 0 { -0.0 } else { 0.0 })
+                .collect(),
+            2048,
+        ),
+        (
+            "negatives only",
+            (0..4096).map(|i| -((i % 11) as f32)).collect(),
+            2048,
+        ),
+        ("k == nt", (0..2048).map(|i| (i % 7) as f32).collect(), 2048),
+        ("k == nt - 1", (0..2049).map(|i| (i % 7) as f32).collect(), 2048),
+        ("k > nt (wrapper clamp)", (0..500).map(|i| (i % 7) as f32).collect(), 2048),
+        ("single block", (0..200).map(|i| (i % 5) as f32).collect(), 64),
+        ("ReLU-sparse (engine shape, prefix answer)", relu_sparse, 2048),
+        ("scattered zeros (engine shape, non-prefix answer)", scattered, 2048),
+        ("dense random", dense, 2048),
+        ("heavy ties", heavy_ties, 2048),
+    ];
+    for (name, scores, k) in cases {
+        let n = scores.len();
+        let want = host(&scores, k);
+        let written = k.min(n);
+        assert_eq!(
+            want.len(),
+            written,
+            "oracle wrote {} rows, expected {written} on {name}",
+            want.len()
+        );
+        let sb = dev(&f32b(&scores));
+        // Sentinel fill: anything the kernel writes past `written` shows up below.
+        let slots = n.max(k);
+        let mut rb = dev(&vec![0xFFu8; slots * 4]);
+        // SAFETY: scores holds n f32; rows holds >= min(k,n) u32.
+        unsafe {
+            launch_index_topk(sb.ptr() as *const f32, n, k, rb.ptr_mut() as *mut u32)
+                .expect("index_topk");
+        }
+        device_sync().expect("sync");
+        let raw = rb.copy_out().expect("rows out");
+        let got: Vec<u32> = raw
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(
+            &got[..written],
+            &want[..],
+            "index_topk selection differs on {name}"
+        );
+        assert!(
+            got[written..].iter().all(|&v| v == SENTINEL),
+            "index_topk wrote past min(k,nt)={written} on {name} — over-selection"
+        );
+        assert!(
+            got[..written].windows(2).all(|w| w[0] < w[1]),
+            "index_topk output not strictly ascending on {name}"
+        );
+    }
 }

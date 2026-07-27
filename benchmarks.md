@@ -393,11 +393,20 @@ Without these the deltas below are unreadable:
 
 | kernel | base µs | fix µs | Δ | GB/s |
 |---|---:|---:|---:|---|
-| `mla_absorb` | 72.00 | **36.50** | **−49.3% (1.97×)** | 87.4 → **172.3** |
+| `mla_absorb` | 72.00 | **36.50** | **−49.3% (1.97×)** | 87.4 → **172.3** | †
 | `mla_value` | 33.73 | **27.03** | **−19.9% (1.25×)** | 248.6 → **310.3** |
 | `mla_attend` nr512 | 258.03 | **227.17** | **−12.0%** | — |
 | `mla_attend` nr2048 | 876.30 | **778.53** | **−11.2%** | — |
 | `o_proj` | 541.55 | **528.95** | **−2.3%** | 184.7 → **190.6** |
+
+† **CORRECTION (2026-07-26, "DSA indexer round" below): 36.50 µs is a cache-resident
+figure, and so is its 172.3 GB/s.** The rig replays one 14.7 MB `kv_b` weight, which Strix
+Halo's 32 MB MALL serves; with 4 rotating copies the same kernel measures **45.64 µs**, and
+the engine holds 78 distinct `kv_b`. **The A/B above is unaffected** — both arms replayed
+the same single weight, so the −49.3% delta stands and is what this table was for. What is
+wrong is using 36.50 µs as an absolute per-layer cost, which the `×78` projection below and
+docs/PERF.md both do. The same defect is present in every absolute µs figure in this
+section; only the deltas are safe.
 
 Arms are non-overlapping for every row. o_proj is the weakest and was pooled over two
 separate experiments (6 samples/arm) because its effect is close to the between-run drift
@@ -757,3 +766,277 @@ pure per-format compute use `examples/dot_bench.rs`. See [MODES.md](MODES.md).
 
 *Generated 2026-07-26. Reproduce: `--mode <m> --cache-policy <p> -bench 512 --attn dense
 --max-mem 115 --prompt "<above>"`.*
+
+---
+
+## DSA indexer round: `examples/indexer_bench`
+
+Instrument for the NPU-offload gates (docs/NPU.md M0/M1), gfx1151 sole tenant, 2026-07-26.
+Interpretation lives in [docs/NPU.md](docs/NPU.md); the rows and the methodology are here.
+`--attn dsa` dims from the manifest: index_n_heads 32, index_head_dim 128, index_topk 2048,
+and **21 FULL indexer layers** of 78 (`indexer_types` is 21 full / 57 shared, so a
+per-token figure is ×21, not ×78).
+
+### Controls
+
+All from the round's final run unless a superseded run is named.
+
+| control | result |
+|---|---|
+| `o_proj` fp8 [6144×16384] vs the 528.95 µs / 190.6 GB/s recorded in "Per-kernel round" | **519.4 µs / 193.8 GB/s** (1.8%) |
+| `index_score` nt=32768, 21 rotating key slabs vs one replayed slab | **237.2 vs 208.7 µs (1.14×)** — run at nt=32768 only; the ≤4k rows are launch-bound (GB/s *rises* with nt: 7.5 / 30.5 / 32.8 / 35.4), so the rotation is not what makes them what they are |
+| `index_score` output read back — finite, varying | ok |
+
+A fourth check, the score-D2H round-trip against seeded bytes, is an `assert!` in the rig:
+it aborts the run on failure and prints nothing on success, so it is not a reported control.
+It compares the first 8 elements only.
+
+### Rows (µs per call, per full layer)
+
+| kernel | µs | note |
+|---|---:|---|
+| indexer key path (`gemv_fp8` wk + `layernorm` + `rope` + `index_append`) | 15.32 | 20.48 with a sync per call |
+| `gemv_fp8` wq_b [4096×2048] | 78.27 | 107.2 GB/s |
+| `gemv_f32` weights_proj [32×6144] | 34.74 | 22.6 GB/s, 32 output rows — grid-starved |
+| `index_score` nt=128 / 2048 / 4096 / 8192 / 16384 / 32768 | 4.4 / 17.2 / 31.9 / 59.2 / 115.0 / 239.1 | 35 GB/s at long context |
+| host score D2H + CPU top-k + row upload, same contexts | 18.1 / 81.9 / 160.2 / 183.0 / 353.2 / 553.6 | distribution-dependent — see below |
+| `gemv_fp8` q_b [16384×2048] | 213.35 | 4 rotating copies |
+| `mla_absorb_fp8` | 45.64 | 4 rotating copies |
+| MoE batch, 9 vq3 experts + reduce | 1261.88 | 138.0 MB → 109.4 GB/s |
+| dense fp8 SwiGLU MLP | 1174.67 | |
+
+### Three methodology lessons, all of which cost a wrong answer first
+
+- **Replaying one weight measures the MALL, not the bus.** A single 33.5 MB `q_b` timed at
+  **372 GB/s — above the 256 GB/s bus**, which is only possible from the 32 MB MALL. With 4
+  rotating copies it is 213.35 µs (157 GB/s). The same defect moved `weights_proj` 19.4 →
+  34.7 µs and `mla_absorb_fp8` 36.04 → 45.64 µs. **The 36.50 µs `mla_absorb` figure recorded
+  in "Per-kernel round" above is therefore cache-resident** — sound for the A/B it was made
+  for, wrong as an absolute per-layer cost. Rotate before quoting an absolute.
+- **A window must contain all the independent work, not a subset.** Scoping the exact
+  overlap window to "kv_proj + KV-append" gave 22.6 µs and refuted a design; the full set of
+  selection-independent phase-1 launches is **291.25 µs** and clears it. Under-scoping is
+  not conservative — it produces a confident false negative.
+- **Comparison-driven host code is distribution-dependent.** The D2H + `topk_into` + row
+  upload over 32768 scores totals **162 µs** on a tie-heavy array (superseded run `m0m1-v2`)
+  and **554 µs** on a plausible heavy-tailed one (final run) — a 3.4× spread on what turned
+  out to be the single largest cost in the analysis. Synthesise the distribution
+  deliberately and say which one you used.
+
+### A GPU∥GPU probe cannot answer a GPU∥NPU bandwidth question
+
+`index_score` on the null stream against the MoE batch on a `hipStreamNonBlocking` stream
+measured, in superseded run `m0m1-v2`, three arms: the two workloads timed apart summed to
+**2505.6 µs**, the both-on-the-null-stream control ran in **2453.4 µs** (1.02× vs the sum —
+so the serial arm was genuinely serial), and the concurrent arm ran in **2625.0 µs** (0.95×,
+i.e. *slower* than serial). That result was determined before it ran:
+`index_score` at nt=32768 launches 32768 workgroups and the MoE batch ~9000, so each alone
+over-subscribes all 40 CUs and neither can finish sooner concurrently no matter how much
+DRAM bandwidth is spare. It measures compute-unit contention. The probe was deleted rather
+than left printing a confident 0.95×; the bandwidth question is answered arithmetically from
+the GB/s rows instead.
+
+
+### In-engine confirmation, `--attn dsa` (2026-07-26/27)
+
+`--attn dsa --mode hybrid --cache-policy lru --max-mem 115 -bench 48`, sole tenant, with two
+always-on buckets added to `dsa_select_layer`. Both ride joins the path already pays: the
+indexer's GPU span comes from a HIP-event pair read behind the existing `device_sync`, and
+the host clock starts *after* that sync so the GPU wait is not double-counted. Guarded to
+`--attn dsa` — under misa the head-route syncs inside the event bracket, which would fold
+host time into a GPU-timeline number.
+
+| | run A | run B |
+|---|---:|---:|
+| prompt tokens / mean nt during decode | 2432 / 2456 | 5185 / 5209 |
+| wall ms/token | **391** | **438** |
+| route (post-selection attention + host routing) | 156 | 158 |
+| moe wall (gpu) | 201 (192) | 242 (232) |
+| indexer GPU ms/tok — µs/layer | 4.1 — 194.9 | 4.6 — 218.1 |
+| indexer host ms/tok — µs/layer | 4.5 — 214.2 | 7.0 — 334.1 |
+| scoring layers/token | 21.0 | 21.0 |
+| tok/s · hit% · miss/tok · GB/tok | 2.56 · 81.4 · 111.4 · 1.71 | 2.28 · 76.9 · 138.9 · 2.13 |
+| residual (wall − route − moe − indexer) | 25.4 | 26.4 |
+
+Interpretation, and the extrapolations built on these rows, live in
+[docs/NPU.md](docs/NPU.md) "In-engine confirmation" — not repeated here. Three methodology
+points belong with the rows, though:
+
+- **`route` is flat, 156 → 158 ms, across a 2.1× context increase** — first direct evidence
+  that DSA caps the attend at `index_topk` rows. `route` is the right bucket to read across
+  runs for the reason this file already gives above: attention runs on resident weights and
+  is structurally insulated from fetch variance.
+- **The microbench under-predicts the indexer's GPU span by 27%** (1.271× and 1.264×, two
+  contexts, agreeing to 0.6%) — size solid, **mechanism unestablished**. The rig's own
+  launch-overhead measurement (5.16 µs for a four-kernel group with one sync) under-predicts
+  the ~41 µs surplus by 4–8×, so "launch bubbles" does not account for it. This is the
+  second unexplained microbench under-prediction of ~27% in this file; the earlier one
+  (route tranche, above) is a ratio of two *deltas* in which fixed per-launch overhead
+  cancels, so the two cannot share a cause and neither corroborates the other.
+- **The host round-trip is 2.0–2.2× its isolated microbench** at matched nt, so even a
+  deliberately realistic synthetic distribution understated it. A harder real distribution
+  and in-situ CPU-cache contention from the streamer moving 1.7–2.1 GB/token both fit; not
+  separated here.
+
+**A wall series across contexts is not obtainable from runs like these.** Run A's prompt is the first
+12,000 characters of run B's — wholly contained in it — so context length and prompt
+content are perfectly confounded — and reaching any longer context requires more text, so
+the confound is structural, not an artifact of this pair. The +47 ms of wall came with hit%
+81.4 → 76.9 and ms/miss 76 → 134; n = 2 cannot apportion it. Compare `route` across runs, not
+`wall`.
+
+### Device top-k (`index_topk`) vs the host round-trip, 2026-07-27
+
+`examples/indexer_bench`, gfx1151 sole tenant. Controls that run: `o_proj` 520.22 µs /
+193.5 GB/s, rotation 1.16× — both ok. Correctness gate
+`tests/kernel.rs::index_topk_matches_host_selection` passes on all 10 cases, including a
+sentinel-tail assertion that nothing is written past `min(k,nt)`.
+
+Both implementations timed in the same rig, on the same buffer, on the same data, µs per
+full layer (host → device):
+
+| nt | dense (few ties) | scattered (heavy ties, random order) | sorted-sparse (**artifact**) |
+|---:|---:|---:|---:|
+| 2456 | 86.6 → 35.8 (2.42×) | 54.4 → 45.6 (1.19×) | 28.8 → 45.3 (0.64×) |
+| 4096 | 107.7 → 32.5 (3.32×) | 61.2 → 54.3 (1.13×) | 32.9 → 51.0 (0.65×) |
+| 5209 | 101.4 → 41.2 (2.46×) | 74.9 → 59.7 (1.25×) | 41.1 → 60.9 (0.67×) |
+| 8192 | 126.4 → 52.7 (2.40×) | 96.6 → 82.7 (1.17×) | 46.8 → 79.2 (0.59×) |
+| 16384 | 344.5 → 83.3 (4.14×) | 144.3 → 126.6 (1.14×) | 65.7 → 127.6 (0.52×) |
+| 32768 | 578.1 → 157.6 (3.67×) | 191.8 → 215.0 (0.89×) | 144.6 → 215.0 (0.67×) |
+
+**A fixture can look like a finding — this one did.** An earlier revision of this section
+measured only the third column and reported the kernel as 1.6–1.9× *slower* than the CPU,
+attributing it to ties making quickselect cheaper. `topk_into` seeds its index workspace
+with the identity permutation and orders by (score desc, index asc); that fixture's
+non-zero values descend from index 0, so the identity **is** the sorted order and both
+`select_nth_unstable_by` and the trailing `sort_by` got an already-sorted slice — their
+best case, unavailable to the kernel. The `scattered` column holds the tie structure fixed
+and randomises order: the ratio moves 0.64× → 1.19×, so **~1.8× of that "regression" was
+the fixture.** When timing a comparison-based algorithm, randomise the input order or you
+are measuring your generator.
+
+**Corrected reading.** Ties cut both ways — cheaper for quickselect, dearer for the radix
+histogram (tied keys collide on one LDS bin) — so the kernel runs 2.4–4.1× faster on
+dense data, 1.13–1.25× on tie-heavy, and 0.89× at tie-heavy 32k. Never quote a single
+speedup without the distribution.
+
+**Caveats on precision.** The host column is 20 iterations reported as a bare mean with no
+dispersion, and it is non-monotonic (107.7 µs at nt=4096 against 101.4 at 5209) and
+disagrees with the earlier `m0_host` row by up to ~30% at some contexts while matching to
+~1% at others. Ratios here are good to about one significant figure, not two. The device
+kernel is also single-workgroup, so its absolute cost is one CU's serial sweep; the
+LDS-contention hypothesis names a lever but occupancy is the larger structural bound.
+
+Interpretation and what it means for wiring: docs/NPU.md § "The device top-k, measured".
+
+### Device top-k WIRED: three-arm in-engine A/B, 2026-07-27
+
+`--attn dsa --mode hybrid --cache-policy lru --max-mem 115 -bench 128`, the same
+2432-token prompt as "In-engine confirmation" above, gfx1151 sole tenant. Arms selected by
+`RIVOLI_TOPK` from **one binary** — no build differs between them — run **interleaved**
+(host, device, device-nosync, twice). Greedy decode is deterministic, so every arm generates
+the same tokens and the same expert-miss sequence: the arms are PAIRED, and `116.79
+miss/tok` is identical across all seven runs.
+
+**Read the buckets, not the wall.** `wall = route + moe + idx_gpu + idx_host + unbucketed`
+is an identity here and closes to ±0.4 ms on every run below. `moe` carries **7–10 ms of
+within-arm spread** with no proposed mechanism, against effects of 9.4 and 2.5 ms — so at
+n=2 the wall cannot resolve either change, while the buckets that respond to them can. The
+unbucketed column is included for exactly this reason; omitting it is what made an earlier
+revision of this section wrong twice.
+
+| arm | rep | wall | route | moe | idx_gpu | idx_host | unbucketed |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `host` | r1 | 446.9 | 154.4 | 247 | 4.10 | 11.20 | 30.20 |
+| `host` | r2 | 451.8 | 155.9 | 254 | 4.11 | 9.01 | 28.78 |
+| `device` | r1 | 443.7 | 154.5 | 254 | 4.82 | — | 30.38 |
+| `device` | r2 | 433.5 | 155.3 | 245 | 4.82 | — | 28.38 |
+| `device-nosync` | r1 | 434.5 | 167.1 | 248 | 4.82 | — | 14.58 |
+| `device-nosync` | r2 | 441.7 | 165.4 | 255 | 4.82 | — | 16.48 |
+
+Per-layer: `idx_gpu` 195.2 / 195.9 µs (host), 229.3 / 229.6 (device), 229.7 / 229.3
+(nosync); `idx_host` **533.2 / 428.9 µs**, host arm only.
+
+**The two wins, costed separately. Both are real and they differ by 4×.**
+
+| change | measured in | r1 | r2 | mean | wall delta (for contrast) |
+|---|---|---:|---:|---:|---:|
+| `host` → `device` (the top-k) | indexer bucket | −10.48 | −8.30 | **−9.4** | −3.2 / −18.3 |
+| `device` → `device-nosync` (the sync) | route + unbucketed | −3.20 | −1.80 | **−2.5** | −9.2 / **+8.2** |
+
+**The top-k: −9.4 ms/token, 2.1% of wall.** The indexer bucket is the only one that
+responds — `idx_host` (11.20, 9.01) goes to zero and `idx_gpu` rises 0.72 for the kernel —
+and **the unbucketed remainder is unchanged to ±0.4 ms in both replicates**, i.e. nothing
+else moved. Per-replicate agreement is 2.18 ms. The wall deltas for the same change are
+−3.2 and −18.3, a 15 ms spread, entirely from `moe` going +7.0 then −9.0. This is a
+measurement, not a prediction: `idx_host` is host wall time the engine spends with the GPU
+idle, and on this arm it stops existing.
+
+**The sync: −2.5 ms/token, 0.6% of wall.** `route` rises +12.60 / +10.10 as the wait
+relocates to the gate-logits D2H, and the unbucketed remainder falls −15.80 / −11.90; the
+difference is the win. Same sign in both replicates. **Its wall delta changes sign
+(−9.2, +8.2) purely because `moe` swings −6.0 / +10.0** — a 16 ms swing against a mechanism
+bounded at 3 dense layers × 229 µs = **0.7 ms**, i.e. 14× more movement than the change can
+physically cause. `moe` is noise here and must be kept out of the comparator.
+
+**The default keeps the sync anyway**, and this is a judgement not a measurement: −2.5 ms is
+0.6% of wall at n=2, against making `route` incomparable with every historical row in this
+file. Re-run at n≥4; if the −2.5 holds, flip it.
+
+**Two corrections this section previously got wrong, recorded because both are instructive.**
+*(1)* An earlier revision headlined the top-k at −11.2 ms from the `host` → `device-nosync`
+wall delta, calling the −9.4 a "prediction" the wall "confirmed". That inverted the
+evidence: −9.4 is the direct measurement and −11.2 is a proxy carrying `moe`'s noise plus
+the sync's own −2.5. It also attributed a figure from an arm that is not the shipped default
+to the shipped default. *(2)* The same revision reported the sync deletion as worth
+"nothing, sign reverses" — which was `moe` noise admitted into the comparator for a 2.5 ms
+effect, and was inconsistent with this section's own withdrawal of the `moe` story below.
+The rule that would have caught both: **decide which buckets can respond to the change
+before looking at any of them.**
+
+**Note the three rows are not three measurements.** Row 3 (`host` → `device-nosync`) is
+exactly row 1 + row 2 per replicate; three arms give **two independent contrasts**. Quoting
+a "solid" third row is selecting the pair that happened to land closest.
+
+**A mechanism proposed and refuted, recorded so nobody re-derives it.** In r1 the `device`
+arm's `moe` rose 247 → 254, almost exactly cancelling the top-k win, and the obvious story
+was that the baseline's ~11 ms of CPU top-k had been doubling as head start for the fetch
+reaper. **In r2 the same comparison went the other way (254 → 245).** Fitted to one
+replicate; withdrawn. It is the first hypothesis anyone will form from the r1 column.
+
+**The instrument that reproduced, and the one that did not.** `idx_gpu` is 195.2 and 195.9
+µs/layer — 0.15% and 0.51% from the 194.9 recorded in a different session (mean 0.33%).
+`idx_host` is **533.2 and 428.9 µs/layer: 24% apart, same binary, same arm, same prompt,
+forty minutes apart**, against 214.2 in that earlier session. **The quantity this branch
+denominates its entire prize in is the unstable one.**
+
+**What is NOT explained about that instability.** These runs saw `28–30 ms/miss` where the
+earlier session saw `76.1`, and one reading is the streamer serving from page cache and
+pushing ~1.8 GB/token through the CPU concurrently with the CPU top-k. **Two facts in the
+same table cut against it:** this session is 15% SLOWER at the wall (447–452 vs 391) with
+`moe` 24% higher (247–255 vs 201) at identical flags and prompt, and `idx_host` moved 24%
+*within* this session at constant ms/miss. The two replicates are also one session, not two
+independent observations. **No mechanism is established.** The usable consequence: the SIZE
+of the top-k win is machine-state dependent; its existence is not.
+
+**Correctness, and why the exit status is not the evidence.** `RIVOLI_TOPK=verify` runs both
+selections per full layer and compares: **10,752 full layers matched the host selection
+exactly** — 21 full layers × 512 scoring tokens (384 prefill past `index_topk` = 2048, plus
+128 decode), i.e. every layer that could have run. A sentinel parked one slot past
+`min(topk, nt)` survived all 10,752, so the kernel did not over-select. The count is quoted
+rather than the exit status because an earlier revision of this gate **exited 0 having
+compared zero layers** whenever the context stayed under `index_topk`. The repaired gate was
+then confirmed to fail: `RIVOLI_TOPK=verify … -bench 4` on the default short prompt exits 1
+with `compared 0 layers: the context never exceeded index_topk=2048`. The comparison loop
+was rewritten during review, so the gate was re-run afterwards on the shipped binary:
+**8,736 layers matched** at `-bench 32` (21 × [384 prefill + 32 decode]). All seven runs
+generated **byte-identical output** (564 chars, sha256 `778387fa557c4e9d…`), coherent prose.
+
+**What is NOT established.** One prompt, one context (nt ≈ 2496 mean), n = 2 per arm, and
+`moe`'s 7–10 ms spread is uncharacterised — until it is, no wall-level effect below ~15 ms
+is measurable on this rig by wall alone, which affects any future A/B in this file. This
+session's wall is 15% above the earlier one at identical flags, and that is unexplained.
+`--attn misa` takes the device path, skips the timing bracket, and was never run. A paired
+`--ppl` across arms would beat identical greedy text as an equality check and was not run.
+Under-selection is caught only incidentally (stale rows differ); a poison-fill of
+`rows_buf[0..nr]` before the launch would make it explicit.

@@ -12,10 +12,24 @@
 /// fields. Built by the GPU engine from its always-on [`Profile`](crate::gpu) buckets.
 #[derive(Debug, Clone, Copy)]
 pub struct ProfileSummary {
+    /// The `RIVOLI_TOPK` arm this run used (docs/NPU.md). Printed in the PROFILE line so
+    /// a row pasted into benchmarks.md identifies its own arm — the engine names it once
+    /// at construction, thousands of log lines earlier.
+    pub topk_path: &'static str,
     pub tok_per_s: f64,
     pub hit_pct: f64,
     pub wall_ms: f64,
     pub route_ms: f64,
+    /// The DSA indexer's GPU-timeline span; see [`Profile::idx_gpu_ns`](crate::gpu).
+    pub idx_gpu_ms: f64,
+    /// The host half of the selection (score D2H + CPU top-k + row upload) — GPU-idle time.
+    /// `None` on the device arms, which never do it; a 0.0 there would read as a
+    /// measurement of work that no longer exists (same reason as `swap_pct`).
+    pub idx_host_ms: Option<f64>,
+    /// Full layers per token that took the scoring path. Not `21` until context exceeds
+    /// `index_topk`, and 0 whenever the indexer never scored — which is what gates the
+    /// report line below.
+    pub idx_layers_per_tok: f64,
     /// CPU wall of the overlapped MoE phase (the `block_on`).
     pub moe_wall_ms: f64,
     /// GPU-event span of the compute stream (partials + reduce).
@@ -48,7 +62,10 @@ impl ProfileSummary {
     pub fn report(&self) {
         let exposed = (self.moe_wall_ms - self.compute_gpu_ms).max(0.0);
         tracing::info!(
-            "PROFILE/tok: {:.0}ms wall | route {:.0}ms | moe {:.0}ms (gpu {:.0}ms) | fetch {:.0}ms ({:.0}% hidden, {:.0}ms exposed) | {:.2} miss, {:.2}ms/miss, {:.2} GB",
+            // wall/route at 0.1 ms: the DSA selection A/B (docs/NPU.md) turns on deltas of
+            // a few ms against a ~400 ms token, which 1 ms resolution rounds into noise.
+            "PROFILE/tok [topk={}]: {:.1}ms wall | route {:.1}ms | moe {:.0}ms (gpu {:.0}ms) | fetch {:.0}ms ({:.0}% hidden, {:.0}ms exposed) | {:.2} miss, {:.2}ms/miss, {:.2} GB",
+            self.topk_path,
             self.wall_ms,
             self.route_ms,
             self.moe_wall_ms,
@@ -65,6 +82,25 @@ impl ProfileSummary {
             self.load_wait_ms,
             self.launch_ms,
         );
+        // DSA indexer decomposition (docs/NPU.md M0). Silent when the indexer never
+        // scored — dense/streaming, or a context that stayed under `index_topk`, where a
+        // row of zeros would read as a measurement of something that did not happen.
+        if self.idx_layers_per_tok > 0.0 {
+            let host = match self.idx_host_ms {
+                Some(ms) => format!(
+                    "host {ms:.1}ms (D2H+topk+upload) => {:.1}us per layer",
+                    ms * 1e3 / self.idx_layers_per_tok,
+                ),
+                None => "host n/a (selection on device)".to_string(),
+            };
+            tracing::info!(
+                "  indexer/tok: gpu {:.1}ms => {:.1}us per layer + {host} over {:.3} scoring layers",
+                self.idx_gpu_ms,
+                // Guarded non-zero by the `> 0.0` above, so this division is safe.
+                self.idx_gpu_ms * 1e3 / self.idx_layers_per_tok,
+                self.idx_layers_per_tok,
+            );
+        }
         if let Some(swap) = self.swap_pct {
             tracing::info!(
                 "  route: swap {swap:.2}% of chosen slots were outside the true top-K \
