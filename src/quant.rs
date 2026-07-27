@@ -453,6 +453,22 @@ pub fn i4_slot_offsets(hidden: usize, moe_inter: usize) -> [usize; 6] {
     [gp, gs, up, us, dp, ds]
 }
 
+/// Write projection `k`'s packed nibbles + per-row f32 scales into an expert block at
+/// the offsets [`i4_slot_offsets`] defines. The SINGLE writer of the `.i4` slot layout
+/// — both converters (`bin/fp8_to_i4`, `bin/vq3_to_i4`) go through it, so they cannot
+/// disagree on where a projection's bytes land (the same rule `vq_slot_offsets` states
+/// for `.vq3`).
+pub fn write_i4_proj(slot: &mut [u8], off: &[usize; 6], k: usize, packed: &[u8], scale: &[f32]) {
+    let po = off[k * 2];
+    slot[po..po + packed.len()].copy_from_slice(packed);
+    for (s, out) in scale
+        .iter()
+        .zip(slot[off[k * 2 + 1]..].chunks_exact_mut(4))
+    {
+        out.copy_from_slice(&s.to_le_bytes());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

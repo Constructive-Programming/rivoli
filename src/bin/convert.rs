@@ -14,8 +14,8 @@ use anyhow::{Context, Result, ensure};
 use rivoli::format::{Dtype, FormatMeta, SafeWriter, Safetensors, Vq3Header};
 use rivoli::math::{bf16_to_f32, f32_to_bf16};
 use rivoli::quant::{
-    VQ_ALIGN, VQ_DIM, VQ_GROUP, VQ_K, dequant_fp8_block, quant_vq, read_f32, vq_expert_bytes,
-    vq_expert_layout, vq_proj_bytes, vq_row_bytes,
+    VQ_ALIGN, VQ_DIM, VQ_GROUP, VQ_K, quant_vq, read_f32, vq_expert_bytes, vq_expert_layout,
+    vq_proj_bytes, vq_row_bytes,
 };
 
 const FP8_BLOCK: usize = 128;
@@ -207,13 +207,7 @@ fn dims(cfg: &serde_json::Value) -> Result<Dims> {
 
 /// Dequantize an fp8 projection `<base>.<proj>.weight` (+ `weight_scale_inv`) to f32.
 fn deq(src: &Safetensors, base: &str, proj: &str, o_dim: usize, i_dim: usize) -> Result<Vec<f32>> {
-    let (w, shape) = src.typed(&format!("{base}.{proj}.weight"), Dtype::F8E4M3)?;
-    ensure!(
-        shape == [o_dim, i_dim],
-        "{base}.{proj}: shape {shape:?} != [{o_dim},{i_dim}]"
-    );
-    let scale = read_f32(src.bytes(&format!("{base}.{proj}.weight_scale_inv"))?);
-    Ok(dequant_fp8_block(w, &scale, o_dim, i_dim, FP8_BLOCK))
+    src.dequant_fp8(&format!("{base}.{proj}"), o_dim, i_dim, FP8_BLOCK)
 }
 
 /// Write one projection's (indices, scales) into `dst`: indices then LE bf16 scales.

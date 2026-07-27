@@ -7,11 +7,11 @@
 //!
 //! usage: vq3_to_i4 <artifact-dir> [--layers N]   (back up existing L*.i4 first!)
 use anyhow::{Context, Result, bail};
-use rivoli::format::load_codebooks;
+use rivoli::format::{I4Source, load_codebooks};
 use rivoli::model::ModelConfig;
 use rivoli::quant::{
     VQ_ALIGN, VQ_DIM, VQ_GROUP, VqProj, get_idx, i4_expert_stride, i4_row_bytes, i4_slot_offsets,
-    quant_i4, vq_expert, vq_expert_bytes, vq_expert_stride, vq_groups, vq_row_bytes,
+    quant_i4, vq_expert, vq_expert_bytes, vq_expert_stride, vq_groups, vq_row_bytes, write_i4_proj,
 };
 use std::fs::File;
 use std::io::Write;
@@ -44,13 +44,8 @@ fn build_block(vqb: &[u8], cbs: &[Vec<f32>; 3], off: &[usize; 6], stride: usize,
     for k in 0..3 {
         let w = decode_proj(&projs[k], &cbs[k]);
         let (packed, scale) = quant_i4(&w, projs[k].o_dim, projs[k].i_dim);
-        let po = off[k * 2];
-        blk[po..po + packed.len()].copy_from_slice(&packed);
-        let so = off[k * 2 + 1];
-        for (j, s) in scale.iter().enumerate() {
-            blk[so + j * 4..so + j * 4 + 4].copy_from_slice(&s.to_le_bytes());
-        }
         debug_assert_eq!(packed.len(), projs[k].o_dim * i4_row_bytes(projs[k].i_dim));
+        write_i4_proj(&mut blk, off, k, &packed, &scale);
     }
     blk
 }
@@ -111,6 +106,16 @@ fn main() -> Result<()> {
         }
         eprintln!("  L{l:02}.i4 rewritten from vq3 ({n} blocks)");
     }
+    // Restamp: this set is vq3-derived again. Leaving a previous `fp8_to_i4` stamp in
+    // place would have the engine confidently report the better chain for weights
+    // this tool just overwrote with the worse one.
+    I4Source {
+        tool: "vq3_to_i4".into(),
+        chain: "fp8->vq3->int4".into(),
+        src: std::fs::canonicalize(dir)?.display().to_string(),
+        layers: [cfg.dense_layers, last],
+    }
+    .stamp(dir)?;
     eprintln!("done");
     Ok(())
 }

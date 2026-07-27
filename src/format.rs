@@ -309,6 +309,127 @@ impl Safetensors {
     pub fn has(&self, name: &str) -> bool {
         self.index.contains_key(name)
     }
+
+    /// Dequantize a block-scaled fp8 projection (`<name>.weight` F8E4M3 +
+    /// `<name>.weight_scale_inv` F32) to row-major f32 `[o_dim, i_dim]`. The one
+    /// fp8-read used by both converters (`bin/convert` → `.vq3`, `bin/fp8_to_i4` →
+    /// `.i4`), so the two cannot drift on the decode convention.
+    ///
+    /// Both shapes are checked here rather than trusted: `weight_scale_inv` is
+    /// `[ceil(o/block), ceil(i/block)]` row-major, and a scale tensor of the wrong
+    /// extent would otherwise mis-tile silently — a wrong-but-plausible dequant,
+    /// which is far worse than a hard failure.
+    pub fn dequant_fp8(
+        &self,
+        name: &str,
+        o_dim: usize,
+        i_dim: usize,
+        block: usize,
+    ) -> Result<Vec<f32>> {
+        let (w, shape) = self.typed(&format!("{name}.weight"), Dtype::F8E4M3)?;
+        ensure!(
+            shape == [o_dim, i_dim],
+            "{name}.weight: shape {shape:?} != [{o_dim},{i_dim}]"
+        );
+        let (sb, ssh) = self.typed(&format!("{name}.weight_scale_inv"), Dtype::F32)?;
+        let want = [o_dim.div_ceil(block), i_dim.div_ceil(block)];
+        ensure!(
+            ssh == want,
+            "{name}.weight_scale_inv: shape {ssh:?} != {want:?} (block {block})"
+        );
+        let scale = crate::quant::read_f32(sb);
+        Ok(crate::quant::dequant_fp8_block(
+            w, &scale, o_dim, i_dim, block,
+        ))
+    }
+}
+
+/// Provenance of the artifact's `.i4` expert set: which tool produced it, from what,
+/// and over which layers. Absent on artifacts built before this field existed — and
+/// that absence is itself the signal, since a `pack_i4` set and a `vq3_to_i4` set are
+/// otherwise byte-indistinguishable on disk, which is exactly how a bad `.i4` set
+/// stayed invisible.
+///
+/// EVERY writer of `L{l}.i4` must call [`I4Source::stamp`]. A stale stamp is worse
+/// than no stamp: the engine reports it as fact, so a tool that rewrites the set
+/// without restamping turns an honest ambiguity into a confident lie.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct I4Source {
+    /// Binary that wrote the set, e.g. `"fp8_to_i4"`.
+    pub tool: String,
+    /// Derivation chain, e.g. `"fp8->int4"` vs the older `"fp8->vq3->int4"`.
+    pub chain: String,
+    /// Path of the source the weights were derived from.
+    pub src: String,
+    /// Half-open layer range this provenance covers, `[from, to)`. A run that
+    /// rebuilds only part of the set records only that part, so a mixed artifact
+    /// never claims to be uniform.
+    pub layers: [usize; 2],
+}
+
+impl I4Source {
+    /// Read `<dir>/manifest.json`'s `i4_source` section. `Ok(None)` means "no
+    /// manifest, or no such field" — an unstamped artifact, which is a reportable
+    /// fact rather than an error. A field that is PRESENT but unparseable is an
+    /// error: silently reporting it as "unstamped" would hide a real corruption.
+    pub fn load(dir: &str) -> Result<Option<Self>> {
+        let Ok(text) = std::fs::read(format!("{dir}/manifest.json")) else {
+            return Ok(None);
+        };
+        let v: serde_json::Value = serde_json::from_slice(&text)
+            .with_context(|| format!("parse {dir}/manifest.json"))?;
+        let Some(f) = v.get("i4_source") else {
+            return Ok(None);
+        };
+        Ok(Some(
+            serde_json::from_value(f.clone()).context("manifest i4_source is malformed")?,
+        ))
+    }
+
+    /// Record this provenance in `<dir>/manifest.json`, merging with an existing
+    /// stamp when the two describe the same derivation over adjoining layers — so a
+    /// run resumed with `--from` still ends up claiming the whole set it rebuilt,
+    /// rather than only its own final leg.
+    ///
+    /// Written tmp→fsync→rename: a torn `manifest.json` bricks an artifact whose
+    /// `.i4` set alone is ~365 GB.
+    pub fn stamp(&self, dir: &str) -> Result<()> {
+        let path = format!("{dir}/manifest.json");
+        let mut m: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("read {path}"))?)
+                .with_context(|| format!("parse {path}"))?;
+        // An unreadable prior stamp is not an error HERE — we are replacing it. Only
+        // the reader is strict, so a corrupt field can never be misreported as fact.
+        let merged = match Self::load(dir).ok().flatten() {
+            // Same derivation and the ranges touch → one contiguous claim.
+            Some(p)
+                if (p.tool.as_str(), p.chain.as_str(), p.src.as_str())
+                    == (&self.tool, &self.chain, &self.src)
+                    && p.layers[0] <= self.layers[1]
+                    && self.layers[0] <= p.layers[1] =>
+            {
+                Self {
+                    layers: [
+                        p.layers[0].min(self.layers[0]),
+                        p.layers[1].max(self.layers[1]),
+                    ],
+                    ..self.clone()
+                }
+            }
+            _ => self.clone(),
+        };
+        m["i4_source"] = serde_json::to_value(&merged)?;
+        let tmp = format!("{path}.tmp");
+        let mut f = std::fs::File::create(&tmp).with_context(|| format!("create {tmp}"))?;
+        {
+            use std::io::Write;
+            f.write_all(&serde_json::to_vec_pretty(&m)?)?;
+        }
+        f.sync_all().with_context(|| format!("fsync {tmp}"))?;
+        drop(f);
+        std::fs::rename(&tmp, &path).with_context(|| format!("rename {tmp} -> {path}"))?;
+        Ok(())
+    }
 }
 
 // ── .vq3 expert files (streamed routed experts + resident shared) ───────────────
@@ -597,6 +718,81 @@ mod tests {
         assert_eq!(sh, &[2, 4]);
         assert!(st.typed("a", Dtype::I8).is_err()); // dtype mismatch fails loud
         assert!(!st.has("missing"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `dequant_fp8` must apply the right block scale to the right tile, and must
+    /// REJECT a `weight_scale_inv` of the wrong extent — a silently mis-tiled scale
+    /// grid is the failure this guard exists to prevent, and it produces plausible
+    /// weights rather than an obvious error.
+    #[test]
+    fn dequant_fp8_tiles_scales_and_rejects_bad_shapes() {
+        let dir = std::env::temp_dir().join("rivoli_deqfp8_test");
+        let dir = dir.to_string_lossy().to_string();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = format!("{dir}/w.safetensors");
+        // A [2,4] fp8 matrix with block=2 → a [1,2] scale grid: the left 2 columns
+        // scale by 10, the right 2 by 100. A row/column-swapped tiling gives
+        // different answers here, so this pins the orientation.
+        let mut w = SafeWriter::new();
+        w.add(
+            "t.weight",
+            Dtype::F8E4M3,
+            vec![2, 4],
+            vec![0x38, 0x40, 0x38, 0xB8, 0xB8, 0x00, 0x40, 0x38], // 1,2,1,-1 / -1,0,2,1
+        );
+        w.add(
+            "t.weight_scale_inv",
+            Dtype::F32,
+            vec![1, 2],
+            [10.0f32, 100.0].iter().flat_map(|v| v.to_le_bytes()).collect(),
+        );
+        w.write(&path).unwrap();
+        let st = Safetensors::open_file(&path).unwrap();
+
+        let got = st.dequant_fp8("t", 2, 4, 2).unwrap();
+        assert_eq!(got, vec![10.0, 20.0, 100.0, -100.0, -10.0, 0.0, 200.0, 100.0]);
+
+        // Wrong declared dims, and a scale grid of the wrong extent, both fail loud.
+        assert!(st.dequant_fp8("t", 4, 2, 2).is_err());
+        assert!(st.dequant_fp8("t", 2, 4, 1).is_err()); // would want a [2,4] grid
+    }
+
+    /// Provenance round-trips, a missing field reads as unstamped, a malformed one is
+    /// an error (not silently "unstamped"), and a resumed run merges into one range.
+    #[test]
+    fn i4_source_round_trips_and_merges_adjoining_runs() {
+        let dir = std::env::temp_dir().join("rivoli_i4src_test");
+        let dir = dir.to_string_lossy().to_string();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mf = format!("{dir}/manifest.json");
+        std::fs::write(&mf, br#"{"hidden_size":6144}"#).unwrap();
+        assert!(I4Source::load(&dir).unwrap().is_none()); // no field yet
+
+        let a = I4Source {
+            tool: "fp8_to_i4".into(),
+            chain: "fp8->int4".into(),
+            src: "/src".into(),
+            layers: [3, 40],
+        };
+        a.stamp(&dir).unwrap();
+        assert_eq!(I4Source::load(&dir).unwrap().as_ref(), Some(&a));
+        // The stamp must not clobber the rest of the manifest.
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&mf).unwrap()).unwrap();
+        assert_eq!(v["hidden_size"], 6144);
+
+        // A resume picking up where the first run stopped claims the whole range.
+        I4Source { layers: [40, 78], ..a.clone() }.stamp(&dir).unwrap();
+        assert_eq!(I4Source::load(&dir).unwrap().unwrap().layers, [3, 78]);
+
+        // A different derivation replaces rather than merges — no stale claims.
+        let b = I4Source { chain: "fp8->vq3->int4".into(), layers: [3, 78], ..a.clone() };
+        b.stamp(&dir).unwrap();
+        assert_eq!(I4Source::load(&dir).unwrap(), Some(b));
+
+        // Present-but-malformed is an error, never a silent "unstamped".
+        std::fs::write(&mf, br#"{"i4_source":{"tool":"x"}}"#).unwrap();
+        assert!(I4Source::load(&dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

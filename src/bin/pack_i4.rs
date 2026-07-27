@@ -151,6 +151,15 @@ fn main() -> Result<()> {
         out.write_all(&blk)?;
         eprintln!("  L{l:02}.i4 written ({} blocks)", n_exp + 1);
     }
+    // Restamp: these are colibri's own int4 weights. Leaving an earlier tool's stamp
+    // would have the engine report a derivation this run just overwrote.
+    rivoli::format::I4Source {
+        tool: "pack_i4".into(),
+        chain: "colibri-int4".into(),
+        src: std::fs::canonicalize(colibri)?.display().to_string(),
+        layers: [cfg.dense_layers, last_layer],
+    }
+    .stamp(artifact)?;
     eprintln!("done");
     Ok(())
 }

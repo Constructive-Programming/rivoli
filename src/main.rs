@@ -267,6 +267,19 @@ fn main() -> Result<()> {
         mc.moe_inter,
         mc.vocab
     );
+    // Which tool produced the `.i4` set, and from what — only for the modes that
+    // actually read it. int4/hybrid quality numbers are interpretable only against
+    // this line; unstamped means an artifact predating provenance, where a
+    // `vq3_to_i4` set and a deprecated `pack_i4` set are indistinguishable on disk.
+    if cfg.mode.uses_int4() {
+        match rivoli::format::I4Source::load(&cfg.model)? {
+            Some(s) => info!(
+                "i4 source: {} ({}) layers {}..{} from {}",
+                s.tool, s.chain, s.layers[0], s.layers[1], s.src
+            ),
+            None => info!("i4 source: unstamped (artifact predates i4 provenance)"),
+        }
+    }
     info!(
         "mla: q_lora={} kv_lora={} qk={}+{} v_head={} rope_theta={}",
         mc.q_lora_rank,
