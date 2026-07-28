@@ -228,6 +228,117 @@ pub mod spans {
     }
 }
 
+
+/// A verbatim repetition loop found at the tail of a generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopReport {
+    /// Length of the repeating block, in tokens.
+    pub period: usize,
+    /// How many consecutive verbatim copies of it end the generation.
+    pub repeats: usize,
+    /// Index in the generated sequence where the repetition began.
+    pub start: usize,
+}
+
+/// Longest block of tokens that occurs at least twice anywhere in `ids`.
+///
+/// The companion to [`detect_loop`], and needed because a tail cycle is the *late* stage
+/// of degeneration. The early stage is a RESTART: the model answers, then answers again
+/// in slightly different words. Observed on a real 128-token run — two near-identical
+/// Rayleigh-scattering paragraphs — where `detect_loop` correctly found no verbatim
+/// cycle (the paragraphs differed by a word) and could not have found one anyway, since
+/// three repeats of a ~60-token block do not fit in 128 tokens. A run can be obviously
+/// broken and still have no cycle, so both signals are needed.
+///
+/// Binary search on length over a rolling-hash set: O(n log n). Healthy prose repeats
+/// short phrases; a restart repeats whole sentences.
+pub fn longest_repeated_block(ids: &[u32]) -> usize {
+    use std::collections::HashSet;
+    // Two independent moduli: a single 64-bit rolling hash would make a false positive
+    // (and thus a false "degenerate") possible on adversarial input, and this decides
+    // whether a benchmark cell gets thrown away.
+    const M1: u64 = 1_000_000_007;
+    const M2: u64 = 998_244_353;
+    const B1: u64 = 131;
+    const B2: u64 = 137;
+    let n = ids.len();
+    let has_repeat = |k: usize| -> bool {
+        if k == 0 || k > n {
+            return false;
+        }
+        let (mut p1, mut p2) = (1u64, 1u64);
+        for _ in 0..k {
+            p1 = p1 * B1 % M1;
+            p2 = p2 * B2 % M2;
+        }
+        let (mut h1, mut h2) = (0u64, 0u64);
+        for &t in &ids[..k] {
+            h1 = (h1 * B1 + u64::from(t) + 1) % M1;
+            h2 = (h2 * B2 + u64::from(t) + 1) % M2;
+        }
+        let mut seen = HashSet::with_capacity(n);
+        seen.insert((h1, h2));
+        for i in k..n {
+            h1 = (h1 * B1 + u64::from(ids[i]) + 1 + M1 * p1 - p1 * (u64::from(ids[i - k]) + 1) % M1) % M1;
+            h2 = (h2 * B2 + u64::from(ids[i]) + 1 + M2 * p2 - p2 * (u64::from(ids[i - k]) + 1) % M2) % M2;
+            if !seen.insert((h1, h2)) {
+                return true;
+            }
+        }
+        false
+    };
+    let (mut lo, mut hi) = (0usize, n / 2);
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        if has_repeat(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
+/// Detect a verbatim repetition loop at the **tail** of a generation.
+///
+/// **Deliberately not a distinct-token ratio.** [INT4.md](../docs/INT4.md) showed that
+/// gate inverts: hybrid has the worst distinct ratio in the engine (0.138) and the
+/// second-best perplexity, so a diversity threshold would reject the best config we
+/// have. Repetitiveness is not the signal — a *cycle* is. The tail being literally N
+/// verbatim copies of one block is something prose does not do and a wedged decode
+/// always does, so it is a hard classifier rather than a soft one.
+///
+/// Returns the SMALLEST period that qualifies, so an ABABAB loop reports period 2 rather
+/// than 4 or 6, and then walks backwards to count every copy and locate the onset.
+pub fn detect_loop(ids: &[u32], min_repeats: usize, max_period: usize) -> Option<LoopReport> {
+    if min_repeats < 2 {
+        return None;
+    }
+    let n = ids.len();
+    for period in 1..=max_period.min(n / min_repeats) {
+        let block = &ids[n - period..];
+        // Does the tail end in `min_repeats` copies of `block`?
+        if !(1..min_repeats).all(|k| ids[n - period * (k + 1)..n - period * k] == *block) {
+            continue;
+        }
+        // Qualifies. Walk back for the true count — the onset is the interesting part,
+        // because "looped for the last 12 tokens" and "looped for the last 400" are very
+        // different failures.
+        let mut repeats = min_repeats;
+        while n >= period * (repeats + 1)
+            && ids[n - period * (repeats + 1)..n - period * repeats] == *block
+        {
+            repeats += 1;
+        }
+        return Some(LoopReport {
+            period,
+            repeats,
+            start: n - period * repeats,
+        });
+    }
+    None
+}
+
 /// The run's arguments — what belongs on the root span. A span's attributes should say
 /// WHAT THIS RUN WAS so traces can be found and compared; the numbers it produced are
 /// metrics, and duplicating them here just makes two sources of truth that can drift.
@@ -251,6 +362,10 @@ pub struct RunInfo {
     pub sinks: usize,
     pub window: usize,
     pub misa_heads: usize,
+    /// Set when the generation ended in a verbatim repetition loop. `None` is the
+    /// measurement "it did not", which is why this is an Option and not a bool plus
+    /// three zeroes.
+    pub degenerate: Option<LoopReport>,
 }
 
 /// End-of-run per-token performance summary — the PROFILE line and the OTLP span
@@ -531,6 +646,18 @@ mod otlp {
         }
         // Tokens actually generated is run shape, not a measurement of speed.
         span.set_attribute(KeyValue::new("rivoli.tokens_generated", tokens as i64));
+        // Degeneration is a first-class outcome, not a footnote: a looped run's tok/s is
+        // an artifact (few experts, inflated hit rate) and must never be ranked as if it
+        // were a result. Present as an attribute so a query can exclude it.
+        span.set_attribute(KeyValue::new(
+            "rivoli.degenerate",
+            run.degenerate.is_some(),
+        ));
+        if let Some(d) = run.degenerate {
+            span.set_attribute(KeyValue::new("rivoli.loop_period", d.period as i64));
+            span.set_attribute(KeyValue::new("rivoli.loop_repeats", d.repeats as i64));
+            span.set_attribute(KeyValue::new("rivoli.loop_start", d.start as i64));
+        }
 
         // Rebuild the tree: decode -> token N -> layer L -> the leaf intervals. Emitting
         // the leaves as 1200 direct siblings of the root is technically a trace and
@@ -641,7 +768,7 @@ mod otlp {
 
         // Flush the simple processor's export before we return (the run ends here).
         provider.shutdown().context("flush OTLP spans")?;
-        export_metrics(summary, tokens)?;
+        export_metrics(summary, tokens, run)?;
         Ok(())
     }
 
@@ -664,7 +791,7 @@ mod otlp {
     ///
     /// Every class gauge carries `class` and (where it applies) `thread`, so one panel
     /// can `sum by (class)` instead of hard-coding a query per metric.
-    fn export_metrics(summary: &ProfileSummary, tokens: usize) -> Result<()> {
+    fn export_metrics(summary: &ProfileSummary, tokens: usize, run: &RunInfo) -> Result<()> {
         use opentelemetry::metrics::MeterProvider as _;
         use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 
@@ -737,9 +864,76 @@ mod otlp {
             .build()
             .record(summary.fetch_hidden_pct, &[]);
         m.u64_gauge("rivoli.tokens").build().record(tokens as u64, &[]);
+        // Chartable, so a dashboard can show "how many cells degenerated" over a matrix
+        // run rather than requiring someone to read 44 logs.
+        m.u64_gauge("rivoli.degenerate")
+            .build()
+            .record(u64::from(run.degenerate.is_some()), &[]);
+        if let Some(d) = run.degenerate {
+            m.u64_gauge("rivoli.loop_period").build().record(d.period as u64, &[]);
+            m.u64_gauge("rivoli.loop_repeats").build().record(d.repeats as u64, &[]);
+        }
 
         provider.shutdown().context("flush OTLP metrics")?;
         Ok(())
     }
 
+}
+
+#[cfg(test)]
+mod loop_tests {
+    use super::{detect_loop, LoopReport};
+
+    #[test]
+    fn detects_cycles_and_leaves_prose_alone() {
+        // Healthy: no verbatim cycle at the tail.
+        assert_eq!(detect_loop(&[1, 2, 3, 4, 5, 6, 7, 8, 9], 3, 32), None);
+        // Repetitive but NOT cyclic — the exact case a distinct-ratio gate would fail on
+        // and this must not: only 3 distinct tokens, yet no repeating period.
+        assert_eq!(detect_loop(&[1, 1, 2, 1, 1, 1, 2, 2, 1], 3, 32), None);
+
+        // Period 1: the same token over and over.
+        assert_eq!(
+            detect_loop(&[9, 8, 7, 7, 7, 7], 3, 32),
+            Some(LoopReport { period: 1, repeats: 4, start: 2 })
+        );
+        // Period 3, and the SMALLEST period wins (this also matches period 6).
+        assert_eq!(
+            detect_loop(&[5, 1, 2, 3, 1, 2, 3, 1, 2, 3], 3, 32),
+            Some(LoopReport { period: 3, repeats: 3, start: 1 })
+        );
+        // Below the repeat threshold: two copies is a couplet, not a wedge.
+        assert_eq!(detect_loop(&[4, 1, 2, 3, 1, 2, 3], 3, 32), None);
+        assert_eq!(
+            detect_loop(&[4, 1, 2, 3, 1, 2, 3], 2, 32).map(|r| r.period),
+            Some(3)
+        );
+        // max_period must bound the search.
+        assert_eq!(detect_loop(&[1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4], 3, 3), None);
+        // Degenerate inputs must not panic or divide by zero.
+        assert_eq!(detect_loop(&[], 3, 32), None);
+        assert_eq!(detect_loop(&[7], 3, 32), None);
+        assert_eq!(detect_loop(&[7, 7, 7], 1, 32), None); // min_repeats < 2 is meaningless
+    }
+}
+
+#[cfg(test)]
+mod lrb_tests {
+    use super::longest_repeated_block;
+
+    #[test]
+    fn finds_the_longest_repeat() {
+        assert_eq!(longest_repeated_block(&[]), 0);
+        assert_eq!(longest_repeated_block(&[1, 2, 3, 4, 5]), 0);
+        // One token repeated.
+        assert_eq!(longest_repeated_block(&[1, 2, 3, 2, 9]), 1);
+        // A 3-block that recurs non-adjacently — the RESTART shape, which detect_loop
+        // deliberately does not flag.
+        assert_eq!(longest_repeated_block(&[7, 1, 2, 3, 8, 9, 1, 2, 3]), 3);
+        // A full cycle: half the sequence repeats.
+        assert_eq!(longest_repeated_block(&[1, 2, 3, 4, 1, 2, 3, 4]), 4);
+        // Bounded by n/2 — a block cannot occur twice if it is longer than half.
+        let long: Vec<u32> = (0..100).collect();
+        assert_eq!(longest_repeated_block(&long), 0);
+    }
 }

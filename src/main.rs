@@ -522,6 +522,40 @@ fn main() -> Result<()> {
         // OTLP: one decode span carrying the always-on summary (opt-in via
         // OTEL_EXPORTER_OTLP_ENDPOINT; log-only otherwise). Exported synchronously on
         // drop — no async runtime.
+        // Degeneration check. A looped generation's tok/s is an ARTIFACT — it routes to
+        // a handful of experts, inflates the hit rate, and therefore benchmarks FAST —
+        // so it must be surfaced loudly, not left for someone to spot in the text. Three
+        // verbatim repeats of a block up to 64 tokens long; prose does not do that.
+        let degenerate = rivoli::telemetry::detect_loop(&ids, 3, 64);
+        // The restart signal. A tail cycle is LATE degeneration; a run that answers and
+        // then answers again is already broken and may have no cycle at all. Threshold:
+        // an eighth of the generation, floor 32 tokens. Healthy prose repeats phrases,
+        // not paragraphs.
+        let lrb = rivoli::telemetry::longest_repeated_block(&ids);
+        let lrb_bar = std::cmp::max(32, ids.len() / 8);
+        if degenerate.is_none() && lrb >= lrb_bar {
+            tracing::warn!(
+                "SUSPECT OUTPUT: the longest block repeated in {} generated tokens is {lrb} \
+                 tokens (bar {lrb_bar}) with no verbatim tail cycle — the shape of a \
+                 RESTART rather than a loop. tok/s here is still suspect: re-answering \
+                 re-routes to the same experts, which inflates the hit rate.",
+                ids.len(),
+            );
+        }
+        tracing::info!("generation: {} tokens, longest repeated block {lrb}", ids.len());
+        if let Some(d) = degenerate {
+            tracing::warn!(
+                "DEGENERATE OUTPUT: the last {} of {} generated tokens are {} verbatim \
+                 repeats of a {}-token block (loop starts at token {}). This run's tok/s \
+                 is NOT comparable — a looped decode reuses a few experts, so its hit \
+                 rate and speed are both inflated. Investigate before ranking it.",
+                d.period * d.repeats,
+                ids.len(),
+                d.repeats,
+                d.period,
+                d.start,
+            );
+        }
         // The run's identity for the root span. `route_jm` is Some only under top-m,
         // which is the only policy that substitutes — a (4, 9) next to lru would read as
         // a setting that did something.
@@ -541,6 +575,7 @@ fn main() -> Result<()> {
             sinks: a_sinks,
             window: a_window,
             misa_heads: a_misa_heads,
+            degenerate,
         };
         rivoli::telemetry::export_decode(&summary, ids.len(), &run);
         info!("{bench_prompt}{}", tok.decode_all(&ids)?);

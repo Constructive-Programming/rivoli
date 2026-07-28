@@ -1,270 +1,1071 @@
 {
-  "title": "rivoli — decode profile",
-  "uid": "rivoli-decode",
-  "tags": ["rivoli", "llm", "gpu"],
-  "timezone": "browser",
-  "schemaVersion": 39,
-  "editable": true,
-  "refresh": "",
-  "time": { "from": "now-6h", "to": "now" },
-  "templating": {
+  "annotations": {
     "list": [
       {
-        "name": "DS_PROM",
-        "label": "Metrics source",
-        "type": "datasource",
-        "query": "prometheus",
-        "current": {},
-        "hide": 0
-      },
-      {
-        "name": "DS_TEMPO",
-        "label": "Trace source",
-        "type": "datasource",
-        "query": "tempo",
-        "current": {},
-        "hide": 0
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
       }
     ]
   },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
   "panels": [
     {
-      "type": "text",
-      "title": "How to read this",
-      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
       "options": {
-        "mode": "markdown",
-        "content": "**The class series OVERLAP — never stack them.** `io-wait` runs on the reaper thread concurrently with the decode thread, so it routinely exceeds 100% of wall; that is the streaming design working, not an error. Only the **phase** row (`route`/`moe`/`tail`) partitions wall and may be stacked.\n\n**`gpu-wait` is not GPU utilisation.** It is the host blocked in a device join. Measured against `rocm-smi`, gpu-wait reads ~95% of wall while the device is ~84% busy — the ~11-point gap is launch/queue-drain overhead.\n\nNo residual is reported anywhere: unattributed time is absent rather than folded into a bucket. See `docs/PERF.md`."
-      }
+        "code": {
+          "language": "plaintext",
+          "showLineNumbers": false,
+          "showMiniMap": false
+        },
+        "content": "**The class series OVERLAP — never stack them.** `io-wait` runs on the reaper thread concurrently with the decode thread, so it routinely exceeds 100% of wall; that is the streaming design working, not an error. Only the **phase** row (`route`/`moe`/`tail`) partitions wall and may be stacked.\n\n**`gpu-wait` is not GPU utilisation.** It is the host blocked in a device join. Measured against `rocm-smi`, gpu-wait reads ~95% of wall while the device is ~84% busy — the ~11-point gap is launch/queue-drain overhead.\n\nNo residual is reported anywhere: unattributed time is absent rather than folded into a bucket. See `docs/PERF.md`.",
+        "mode": "markdown"
+      },
+      "pluginVersion": "12.3.1",
+      "title": "How to read this",
+      "type": "text"
     },
-
     {
-      "type": "stat",
-      "title": "tok/s",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 5 },
-      "fieldConfig": { "defaults": { "decimals": 2, "unit": "none" } },
-      "targets": [{ "expr": "rivoli_tok_per_s", "legendFormat": "tok/s", "refId": "A" }]
-    },
-    {
-      "type": "stat",
-      "title": "wall / tok",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 5 },
-      "fieldConfig": { "defaults": { "decimals": 1, "unit": "ms" } },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROM}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 5
+      },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.3.1",
       "targets": [
-        { "expr": "rivoli_ms_per_tok{class=\"wall\"}", "legendFormat": "wall", "refId": "A" }
-      ]
+        {
+          "expr": "rivoli_tok_per_s",
+          "legendFormat": "tok/s",
+          "refId": "A"
+        }
+      ],
+      "title": "tok/s",
+      "type": "stat"
     },
     {
-      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROM}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 1,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 5
+      },
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "expr": "rivoli_ms_per_tok{class=\"wall\"}",
+          "legendFormat": "wall",
+          "refId": "A"
+        }
+      ],
+      "title": "wall / tok",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROM}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 1,
+          "mappings": [],
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": 0
+              },
+              {
+                "color": "orange",
+                "value": 60
+              },
+              {
+                "color": "green",
+                "value": 75
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 5
+      },
+      "id": 4,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "expr": "rivoli_hit_pct",
+          "legendFormat": "hit",
+          "refId": "A"
+        }
+      ],
       "title": "expert hit %",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 5 },
-      "fieldConfig": {
-        "defaults": {
-          "decimals": 1,
-          "unit": "percent",
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "red", "value": null },
-              { "color": "orange", "value": 60 },
-              { "color": "green", "value": 75 }
-            ]
-          }
-        }
-      },
-      "targets": [{ "expr": "rivoli_hit_pct", "legendFormat": "hit", "refId": "A" }]
+      "type": "stat"
     },
     {
-      "type": "stat",
-      "title": "fetch hidden %",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROM}"
+      },
       "description": "Share of reaper fetch buried behind compute. Derived from moe_wall - compute_gpu, so treat as a gauge, not a hard number — prefer the io-wait series.",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 5 },
       "fieldConfig": {
         "defaults": {
           "decimals": 1,
-          "unit": "percent",
+          "mappings": [],
+          "max": 100,
+          "min": 0,
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "red", "value": null },
-              { "color": "orange", "value": 80 },
-              { "color": "green", "value": 92 }
+              {
+                "color": "red",
+                "value": 0
+              },
+              {
+                "color": "orange",
+                "value": 80
+              },
+              {
+                "color": "green",
+                "value": 92
+              }
             ]
-          }
-        }
+          },
+          "unit": "percent"
+        },
+        "overrides": []
       },
-      "targets": [{ "expr": "rivoli_fetch_hidden_pct", "legendFormat": "hidden", "refId": "A" }]
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 5
+      },
+      "id": 5,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "expr": "rivoli_fetch_hidden_pct",
+          "legendFormat": "hidden",
+          "refId": "A"
+        }
+      ],
+      "title": "fetch hidden %",
+      "type": "stat"
     },
     {
-      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROM}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "decgbytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 5
+      },
+      "id": 6,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "expr": "rivoli_gb_per_tok",
+          "legendFormat": "GB",
+          "refId": "A"
+        }
+      ],
       "title": "GB / tok",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 5 },
-      "fieldConfig": { "defaults": { "decimals": 2, "unit": "decgbytes" } },
-      "targets": [{ "expr": "rivoli_gb_per_tok", "legendFormat": "GB", "refId": "A" }]
+      "type": "stat"
     },
     {
-      "type": "stat",
-      "title": "host CPU share",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROM}"
+      },
       "description": "Measured host compute as a share of wall. Historically ~2%: this engine is GPU-bound.",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 5 },
-      "fieldConfig": { "defaults": { "decimals": 1, "unit": "percent" } },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 1,
+          "mappings": [],
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 5
+      },
+      "id": 7,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.3.1",
       "targets": [
         {
           "expr": "100 * rivoli_ms_per_tok{class=\"cpu\"} / rivoli_ms_per_tok{class=\"wall\"}",
           "legendFormat": "cpu %",
           "refId": "A"
         }
-      ]
+      ],
+      "title": "host CPU share",
+      "type": "stat"
     },
-
     {
-      "type": "timeseries",
-      "title": "CLASS — what the machine was doing (overlapping spans; DO NOT STACK)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROM}"
+      },
       "description": "gpu-wait = decode thread blocked in a device join. io-wait = reaper thread blocked in io_uring, measured at the ring; it overlaps everything else and can exceed wall. cpu = measured host-compute regions. No residual.",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 9 },
       "fieldConfig": {
         "defaults": {
-          "unit": "ms",
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
             "drawStyle": "line",
-            "lineWidth": 2,
             "fillOpacity": 0,
-            "stacking": { "mode": "none" },
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
             "pointSize": 6,
-            "showPoints": "auto"
-          }
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "ms"
         },
         "overrides": [
           {
-            "matcher": { "id": "byName", "options": "gpu-wait" },
-            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }]
+            "matcher": {
+              "id": "byName",
+              "options": "gpu-wait"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
           },
           {
-            "matcher": { "id": "byName", "options": "io-wait" },
-            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }]
+            "matcher": {
+              "id": "byName",
+              "options": "io-wait"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
           },
           {
-            "matcher": { "id": "byName", "options": "cpu" },
-            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "purple" } }]
+            "matcher": {
+              "id": "byName",
+              "options": "cpu"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "purple",
+                  "mode": "fixed"
+                }
+              }
+            ]
           }
         ]
       },
-      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "mean"] } },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.3.1",
       "targets": [
         {
           "expr": "rivoli_ms_per_tok{class=~\"gpu-wait|io-wait|cpu\"}",
           "legendFormat": "{{class}}",
           "refId": "A"
         }
-      ]
+      ],
+      "title": "CLASS — what the machine was doing (overlapping spans; DO NOT STACK)",
+      "type": "timeseries"
     },
     {
-      "type": "timeseries",
-      "title": "PHASE — where the time went (partitions wall; stacking is valid here)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROM}"
+      },
       "description": "route = MLA attention. moe = routed-expert compute, ~60-67% of wall and the only phase worth a multiplier. tail = final norm + lm_head + argmax.",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 9 },
       "fieldConfig": {
         "defaults": {
-          "unit": "ms",
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
             "drawStyle": "line",
-            "lineWidth": 1,
             "fillOpacity": 35,
-            "stacking": { "mode": "normal" },
-            "showPoints": "auto"
-          }
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "id": 9,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
         }
       },
-      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "mean"] } },
+      "pluginVersion": "12.3.1",
       "targets": [
         {
           "expr": "rivoli_ms_per_tok{class=~\"phase/.*\"}",
           "legendFormat": "{{class}}",
           "refId": "A"
         }
-      ]
+      ],
+      "title": "PHASE — where the time went (partitions wall; stacking is valid here)",
+      "type": "timeseries"
     },
-
     {
-      "type": "timeseries",
-      "title": "CPU breakdown — every term stamped, none derived",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROM}"
+      },
       "description": "launch = kernel-issue driver calls (~1.5k/tok). route = route_into top-k over 256 experts. submit = residency + policy bookkeeping. tokio-poll = expert-stream poll. Sums to the `cpu` series above.",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
       "fieldConfig": {
         "defaults": {
-          "unit": "ms",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 30,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
           "decimals": 2,
-          "custom": { "drawStyle": "line", "fillOpacity": 30, "stacking": { "mode": "normal" } }
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 18
+      },
+      "id": 10,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
         }
       },
-      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last"] } },
+      "pluginVersion": "12.3.1",
       "targets": [
         {
           "expr": "rivoli_ms_per_tok{class=~\"cpu/.*\"}",
           "legendFormat": "{{class}}",
           "refId": "A"
         }
-      ]
+      ],
+      "title": "CPU breakdown — every term stamped, none derived",
+      "type": "timeseries"
     },
     {
-      "type": "timeseries",
-      "title": "Splits — the questions the phase buckets could not answer",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROM}"
+      },
       "description": "route-gpu-wait vs route total shows route is attention GPU time, not host routing. tail-wait vs tail-gpu shows how much of the tail's blocking call is real GPU work. exposed-fetch is the only fetch that costs wall.",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
       "fieldConfig": {
         "defaults": {
-          "unit": "ms",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
           "decimals": 2,
-          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0 }
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 18
+      },
+      "id": 11,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
         }
       },
-      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last"] } },
+      "pluginVersion": "12.3.1",
       "targets": [
         {
           "expr": "rivoli_ms_per_tok{class=~\"split/.*\"}",
           "legendFormat": "{{class}}",
           "refId": "A"
         }
-      ]
+      ],
+      "title": "Splits — the questions the phase buckets could not answer",
+      "type": "timeseries"
     },
-
     {
-      "type": "timeseries",
-      "title": "Residency — misses and bytes per token",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROM}"
+      },
       "description": "A miss is one expert streamed from NVMe (~15.3 MB vq3 / 20.1 MB i4). Watch this alongside hit% when tuning the cache policy.",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 26 },
-      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
-      "targets": [
-        { "expr": "rivoli_miss_per_tok", "legendFormat": "misses/tok", "refId": "A" },
-        { "expr": "rivoli_gb_per_tok", "legendFormat": "GB/tok", "refId": "B" }
-      ]
-    },
-    {
-      "type": "traces",
-      "title": "Decode timeline — where the overlap is actually visible",
-      "description": "Open a rivoli.decode trace. io-wait/uring-reap bars (thread=reaper) sitting UNDER the gpu-wait bars is hidden fetch; sticking out past them is exposed fetch. Requires RIVOLI_SPANS to have been set on the run.",
-      "datasource": { "type": "tempo", "uid": "${DS_TEMPO}" },
-      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 26 },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 26
+      },
+      "id": 12,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.3.1",
       "targets": [
         {
-          "queryType": "traceql",
-          "query": "{ resource.service.name = \"rivoli\" && name = \"rivoli.decode\" }",
-          "limit": 20,
+          "expr": "rivoli_miss_per_tok",
+          "legendFormat": "misses/tok",
           "refId": "A"
+        },
+        {
+          "expr": "rivoli_gb_per_tok",
+          "legendFormat": "GB/tok",
+          "refId": "B"
         }
-      ]
+      ],
+      "title": "Residency — misses and bytes per token",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "tempo",
+        "uid": "${DS_TEMPO}"
+      },
+      "description": "Open a rivoli.decode trace. io-wait/uring-reap bars (thread=reaper) sitting UNDER the gpu-wait bars is hidden fetch; sticking out past them is exposed fetch. Requires RIVOLI_SPANS to have been set on the run.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "footer": {
+              "reducers": []
+            },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 26
+      },
+      "id": 13,
+      "options": {
+        "cellHeight": "sm",
+        "showHeader": true
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "tempo",
+            "uid": "${DS_TEMPO}"
+          },
+          "limit": 20,
+          "metricsQueryType": "range",
+          "query": "{ resource.service.name = \"rivoli\" && name = \"rivoli.decode\" }",
+          "queryType": "traceql",
+          "refId": "A",
+          "serviceMapUseNativeHistograms": false,
+          "tableType": "traces"
+        }
+      ],
+      "title": "Decode timeline — where the overlap is actually visible",
+      "type": "table"
     }
-  ]
+  ],
+  "preload": false,
+  "refresh": "",
+  "schemaVersion": 42,
+  "tags": [
+    "rivoli",
+    "llm",
+    "gpu"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "label": "Metrics source",
+        "name": "DS_PROM",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "type": "datasource"
+      },
+      {
+        "current": {},
+        "label": "Trace source",
+        "name": "DS_TEMPO",
+        "options": [],
+        "query": "tempo",
+        "refresh": 1,
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "rivoli — decode profile",
+  "uid": "rivoli-decode",
+  "version": 1
 }
