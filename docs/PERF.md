@@ -127,9 +127,23 @@ high by roughly this much, and by more at small `-bench`.
 `rocm-smi` reports **83.9%** GPU busy (n=65 steady-state, 77–91%) against 95% gpu-wait.
 Both are right and measure different things: ~11 points (~38 ms/tok) is the host blocked on
 a GPU that is *not* executing — launch gaps, driver and queue-drain overhead. **Reading
-`gpu-wait` as utilisation overstates it by an eighth**, and that 38 ms is now a bigger
-target than the lm_head win below. Caveats on the cross-check: the counter is coarse,
-rolling-averaged (~12 s to track a step), and the driver warned of a low-power state.
+`gpu-wait` as utilisation overstates it by an eighth.**
+
+**But put wide error bars on the 38 ms.** `gpu-wait` is stamped and trustworthy; the 83.9%
+it is differenced against is an *instantaneous SMU register read*, not a time-integrated
+counter, from a tool that in the same breath reports 512 MiB of VRAM (the real unified pool
+is 116 GiB of GTT), a 0% fan, and throws `map::at` on every invocation. It is also coarse
+and rolling-averaged — ~12 s to track a step.
+
+**~6 ms of the 38 is now measured rather than guessed:** the device-side kernel dispatch
+floor is 1.97 µs × ~1500 kernels ≈ **3.0 ms/tok**, and the host→GPU join tax is 11–20 µs ×
+~180 joins ≈ **2.7 ms/tok**. A clean negative came with it — `hipDeviceSynchronize`,
+`hipStreamSynchronize` and `hipEventSynchronize` all cost the same, and spinning on
+`hipEventQuery` is *strictly worse* — so there is no cheap win in swapping sync primitives.
+**The remaining ~30 ms has a suspect already named in `src/gpu.rs`: per-expert host-gated
+launch bubbles, which fall inside `compute_gpu_ns` and are why it is an upper bound.**
+Resolving this needs GPU-timeline spans on the host clock — see [GPU_TRACE.md](GPU_TRACE.md),
+which also shows that is ~4 hours of work and that the clock problem is already solved.
 
 **Audit — what is stamped.** Every blocking call in `src/gpu.rs` was enumerated. On this
 arm (`--attn dense`, `topk=device`) the decode path blocks in exactly three places: the
