@@ -842,6 +842,12 @@ impl<'a> Pin<'a> {
         self.fetch.fetch_ns()
     }
 
+    /// Accumulated ns the reaper spent blocked in `io_uring` completions — the measured
+    /// io-wait, taken at the ring rather than inferred from phase subtraction.
+    pub fn io_wait_ns(&self) -> u64 {
+        self.fetch.io_wait_ns()
+    }
+
     /// The streaming half of `submit_layer`: trace sink, then three phases over the
     /// arena pool. 1a: touch every HIT (protect it so a same-batch miss can't evict it).
     /// 1b: allocate every MISS — this is where the byte-aware policy evicts and the arena

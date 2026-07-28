@@ -168,6 +168,71 @@ struct Profile {
     compute_gpu_ns: u128, // HIP-event span of the compute stream (partials + reduce)
     wall_ns: u128,
     tokens: u64,
+
+    // ---- CLASS spans: what the machine was DOING, all directly measured ----
+    // The phase buckets above (route / moe / tail) are REGIONS, and each mixes host
+    // compute with blocking waits — which is why `tail` spent so long with most of
+    // itself attributable to no kernel. These cut the same work by activity instead.
+    //
+    // **They are measured spans, not a partition, and they may overlap and sum to MORE
+    // than wall.** That is deliberate: `io_wait` runs on the reaper thread concurrently
+    // with everything here, so forcing it into a share of wall is what made the earlier
+    // version derive it as `moe_wall − compute_gpu` — a host clock minus a GPU clock,
+    // which understated it. The cost of dropping the partition is that **no residual is
+    // reported**: unattributed time is simply not shown rather than being swept into a
+    // bucket that then looks like a measurement. An earlier `cpu` was exactly such a
+    // residual, and it was worthless — it absorbed every error in the other two.
+    /// Blocked in the gate-logits D2H (a subset of `route_ns`, which also holds the
+    /// host `route_into` work). Splitting it answers whether `route` is attention the
+    /// GPU is still running or routing the host is doing.
+    route_wait_ns: u128,
+    /// Blocked in a `device_sync()` — the mid-layer and end-of-layer joins.
+    sync_wait_ns: u128,
+    /// Blocked in the argmax D2H. This one call drains the final rmsnorm, lm_head AND
+    /// argmax, so before this field the whole tail phase was a single opaque wait.
+    tail_wait_ns: u128,
+
+    // ---- CPU: three stamped regions, replacing what used to be a residual ----
+    /// Host time issuing kernel launches — the per-layer attention/projection block and
+    /// the tail's rmsnorm/lm_head/argmax. No blocking call is inside either, so this is
+    /// host work by construction. Expected to dominate host cost: ~20 launches × 78
+    /// layers is ~1.5k driver calls per token.
+    cpu_launch_ns: u128,
+    /// Host time in `route_into` — sigmoid, bias, top-k over 256 experts per MoE layer,
+    /// plus any `top-m` substitution. Stamped directly rather than taken as
+    /// `route_ns − route_wait_ns` so it survives someone adding a third thing to the
+    /// route region.
+    cpu_route_ns: u128,
+    /// Host time in `Pin::submit_layer` — residency lookups, policy/eviction
+    /// bookkeeping, slot assignment and read-spec construction for the layer's picks.
+    cpu_submit_ns: u128,
+
+    // ---- GPU-timeline span. OVERLAPS the classes above; NOT part of the partition ----
+    /// HIP-event span across final rmsnorm → lm_head → argmax.
+    ///
+    /// **It is a bracket, not a sum, and the first version of this comment claimed
+    /// otherwise.** The three kernels launch back-to-back so the gaps are small, but they
+    /// are not zero: measured 5.50 ms against a microbench sum of 4.66 (lm_head 4.56 +
+    /// argmax 0.089 + rmsnorm 0.008), i.e. **~0.84 ms — 15% — is inter-kernel gap**, the
+    /// same caveat `idx_gpu_ns` carries. So this is an upper bound on the tail's GPU
+    /// execution, and `tail_wait − tail_gpu` is a LOWER bound on sync overhead, not the
+    /// whole of it.
+    tail_gpu_ns: u128,
+}
+
+/// Time a blocking call into one of [`Profile`]'s class buckets. Five lines instead of
+/// an RAII guard because the call sites are few and explicit beats clever here — but it
+/// should be the ONLY way the decode path blocks: an unwrapped join silently lands in
+/// the derived `cpu` bucket and looks like host compute.
+fn blocked<T>(acc: &mut u128, name: &'static str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let t = std::time::Instant::now();
+    let r = f();
+    let e = std::time::Instant::now();
+    *acc += e.duration_since(t).as_nanos();
+    // Also emit the interval, so the same wait that feeds the scalar counter can be
+    // drawn on a timeline next to the reaper's io-wait. No-op unless RIVOLI_SPANS is set.
+    crate::telemetry::spans::record(name, "decode", t, e);
+    r
 }
 
 impl Profile {
@@ -182,6 +247,7 @@ impl Profile {
         misses: u64,
         bytes_per_expert: usize,
         fetch_wall_ns: u64,
+        io_wait_ns: u64,
         idle_ns: u64,
         poll_ns: u64,
         advice: Option<(usize, usize)>,
@@ -195,6 +261,23 @@ impl Profile {
         // sums per-expert waits across the ~9 concurrent tasks — so it's reported raw,
         // not used here.)
         let exposed_ns = self.moe_wall_ns.saturating_sub(self.compute_gpu_ns) as f64;
+        // GPU-wait: the decode thread parked in a device join. Every term is a stamped
+        // `Instant` span except the MoE phase's, which is its own host wall net of the
+        // exposed fetch and the tokio poll (host work inside the same block).
+        //
+        // Not a share of wall and not trying to be. An earlier version forced these into
+        // a partition with `cpu` as the leftover; the leftover absorbed every error in
+        // the other terms and measured nothing. `cpu` below is now three stamped regions
+        // instead, and the cost of that honesty is that unattributed time is simply not
+        // reported.
+        let moe_gpu_wait_ns = (self.moe_wall_ns as f64 - exposed_ns - poll_ns as f64).max(0.0);
+        let gpu_wait_ns = (self.route_wait_ns + self.sync_wait_ns + self.tail_wait_ns) as f64
+            + moe_gpu_wait_ns;
+        // CPU: measured host-compute regions. `poll_ns` is the expert stream's tokio
+        // poll — host work inside the MoE block, which the three decode-thread stamps
+        // cannot see — so it belongs here rather than being double-counted as a wait.
+        let cpu_ns = (self.cpu_launch_ns + self.cpu_route_ns + self.cpu_submit_ns) as f64
+            + poll_ns as f64;
         let hidden = if fetch_wall_ns > 0 {
             (100.0 * (1.0 - exposed_ns / fetch_wall_ns as f64)).clamp(0.0, 100.0)
         } else {
@@ -218,6 +301,26 @@ impl Profile {
             miss_per_tok: self.fetch_n as f64 / tok,
             ms_per_miss: fetch_wall_ns as f64 / 1e6 / self.fetch_n.max(1) as f64,
             gb_per_tok: self.fetch_n as f64 / tok * bytes_per_expert as f64 / 1e9,
+            // CLASS partition of the same wall. `gpu_wait` collects the explicitly
+            // wrapped joins PLUS `compute_gpu`: during the MoE compute-stream span the
+            // host is parked in `stream_signal(...).await`, which is a GPU wait even
+            // though no `device_sync` appears there. `io_wait` is the exposed fetch —
+            // the part of the reaper's work that could NOT hide behind compute — and it
+            // is reused rather than re-stamped, because `moe_wall − compute_gpu` already
+            // measures exactly that.
+            gpu_wait_ms: gpu_wait_ns / 1e6 / tok,
+            // Measured at the io_uring ring on the reaper thread, NOT derived from
+            // `moe_wall − compute_gpu` as it was before. Off-thread, so it overlaps the
+            // decode wall and can exceed it.
+            io_wait_ms: io_wait_ns as f64 / 1e6 / tok,
+            exposed_fetch_ms: exposed_ns / 1e6 / tok,
+            cpu_ms: cpu_ns / 1e6 / tok,
+            cpu_launch_ms: per(self.cpu_launch_ns),
+            cpu_route_ms: per(self.cpu_route_ns),
+            cpu_submit_ms: per(self.cpu_submit_ns),
+            route_wait_ms: per(self.route_wait_ns),
+            tail_wait_ms: per(self.tail_wait_ns),
+            tail_gpu_ms: per(self.tail_gpu_ns),
             // `hits + misses` IS the chosen-slot count (submit_layer looks each one up
             // exactly once), so it is the same denominator hit% already uses. Reported
             // only under `top-m` — a 0.0% next to lru would read as a measurement.
@@ -362,6 +465,17 @@ pub struct GpuEngine<'a> {
     idx_ev_end: HipEvent,
     /// Both indexer events recorded this layer and not yet read.
     idx_ev_pending: bool,
+    /// Brackets final rmsnorm → lm_head → argmax on the null stream, read behind the
+    /// argmax D2H that the tail already pays. Unlike the indexer pair there is nothing
+    /// between these kernels, so the span is their execution time rather than a bracket
+    /// with gaps — which is what lets it separate GPU work from sync overhead inside
+    /// `tail_wait_ns`.
+    tail_ev_start: HipEvent,
+    tail_ev_end: HipEvent,
+    /// Tail events recorded this token and not yet read. False on the very first
+    /// `argmax` (the prompt's forward has run, but so has its `record`) — kept as a
+    /// guard anyway so an early-exit path cannot read an unrecorded event.
+    tail_ev_pending: bool,
     topk_path: TopkPath,
     /// Full layers `TopkPath::Verify` actually compared. A gate that can pass without
     /// running is not a gate: below `index_topk` the selection path never executes.
@@ -510,6 +624,9 @@ impl<'a> GpuEngine<'a> {
             compute_stream: HipStream::new()?,
             moe_ev_start: HipEvent::new()?,
             moe_ev_end: HipEvent::new()?,
+            tail_ev_start: HipEvent::new()?,
+            tail_ev_end: HipEvent::new()?,
+            tail_ev_pending: false,
             idx_ev_start: HipEvent::new()?,
             idx_ev_end: HipEvent::new()?,
             idx_ev_pending: false,
@@ -697,8 +814,13 @@ impl<'a> GpuEngine<'a> {
                 unsafe {
                     launch_index_head_route(iqp, iwp, ppool, m_blocks, nh, hd, ep)?;
                 }
-                device_sync()?;
-                idx.e.copy_out_prefix(&mut idx.e_host, nh * 4)?;
+                blocked(&mut self.prof.sync_wait_ns, "gpu-wait/misa-sync", device_sync)?;
+                // Same reason as the score D2H below — MISA-only (`--misa-heads`), so
+                // dormant on every arm measured so far, but unwrapped it would land in
+                // `cpu`.
+                blocked(&mut self.prof.sync_wait_ns, "gpu-wait/misa-d2h", || {
+                    idx.e.copy_out_prefix(&mut idx.e_host, nh * 4)
+                })?;
                 idx.e_f.clear();
                 idx.e_f.extend(
                     idx.e_host
@@ -779,13 +901,20 @@ impl<'a> GpuEngine<'a> {
         // UNCONDITIONAL end-of-layer join in `forward`. Not a new assumption either — the
         // `nt <= topk` return above already leaves this function without syncing.
         if want_scores || path != TopkPath::DeviceNoSync {
-            device_sync()?;
+            blocked(&mut self.prof.sync_wait_ns, "gpu-wait/idx-sync", device_sync)?;
         }
         // Clocked only where the host round-trip IS the selection. `Verify` does the same
         // work to compare against the device rows and must not be timed: it is not an arm.
         let t_idx = (bracket && path == TopkPath::Host).then(std::time::Instant::now);
         if want_scores {
-            idx.scores.copy_out_prefix(&mut idx.scores_host, nt * 4)?;
+            // Classed as a GPU wait even though `idx_host_ns` already brackets the whole
+            // host round-trip: that clock measures the SELECTION arm's cost, this one
+            // measures what the thread was doing. Unwrapped, it inflated the derived
+            // `cpu` bucket on the `--attn dsa` arms — invisible under `--attn dense`,
+            // where `dsa_select_layer` never runs at all.
+            blocked(&mut self.prof.sync_wait_ns, "gpu-wait/idx-scores-d2h", || {
+                idx.scores.copy_out_prefix(&mut idx.scores_host, nt * 4)
+            })?;
             idx.scores_f.clear();
             idx.scores_f.extend(
                 idx.scores_host
@@ -959,6 +1088,13 @@ impl<'a> GpuEngine<'a> {
             };
             let indexer_pin = lw.indexer; // ends the &pin.layers borrow (Copy)
 
+            // Open the launch-cost span. Everything from here to the gate D2H (MoE) or
+            // the end of the dense MLP is host-side kernel issue — EXCEPT the indexer's
+            // joins on the `--attn dsa` arms, so the close subtracts whatever
+            // `sync_wait_ns` accrued inside rather than assuming the region never blocks.
+            let t_launch = std::time::Instant::now();
+            let sync_at_open = self.prof.sync_wait_ns;
+
             let lc8p = self.lc[l].ptr_mut();
             let lscalep = self.lc_scale[l].ptr_mut() as *mut f32;
             let rcp = self.rc[l].ptr_mut() as *mut u16;
@@ -1090,6 +1226,13 @@ impl<'a> GpuEngine<'a> {
                         outp,
                     )?;
                 }
+                // Dense layer: attention + MLP were all launches, nothing blocked.
+                    let e_launch = std::time::Instant::now();
+                    self.prof.cpu_launch_ns += e_launch
+                        .duration_since(t_launch)
+                        .as_nanos()
+                        .saturating_sub(self.prof.sync_wait_ns - sync_at_open);
+                    crate::telemetry::spans::record("cpu/launch", "decode", t_launch, e_launch);
             } else {
                 // Router gate on device, then read logits to route on host.
                 // SAFETY: gate_w resident F32; glp device scratch.
@@ -1100,16 +1243,30 @@ impl<'a> GpuEngine<'a> {
                 // `TopkPath::DeviceNoSync` this join also absorbs the indexer's outstanding
                 // GPU span — see [`TopkPath::DeviceNoSync`] for why `route` rises there
                 // without the work growing.
+                // MoE layer: close the launch span before the first blocking call.
+                    let e_launch = std::time::Instant::now();
+                    self.prof.cpu_launch_ns += e_launch
+                        .duration_since(t_launch)
+                        .as_nanos()
+                        .saturating_sub(self.prof.sync_wait_ns - sync_at_open);
+                    crate::telemetry::spans::record("cpu/launch", "decode", t_launch, e_launch);
                 let t = std::time::Instant::now();
                 // Read the gate logits, route with `bias` borrowed straight out of
                 // `&self.pin` while the routing scratch is borrowed mutably.
-                self.gate_logits.copy_out_into(&mut self.gl_host)?;
+                // The D2H is separately classed as a GPU wait: `route_ns` is a region
+                // and this is the blocking half of it, so without the split a `route`
+                // number cannot distinguish attention the GPU is still finishing from
+                // routing the host is doing.
+                blocked(&mut self.prof.route_wait_ns, "gpu-wait/gate-d2h", || {
+                    self.gate_logits.copy_out_into(&mut self.gl_host)
+                })?;
                 // `--cache-policy top-m` (advice Some) makes this cache-CONDITIONAL:
                 // residency reorders the selection below the sacred top-J. Every other
                 // policy leaves the advice None and gets the pre-top-m routing back
                 // bit-for-bit. Residency is read through `Pin::resident` →
                 // `HybridPolicy::contains`, which does not touch the eviction clock;
                 // the substitution is inside the `route_ns` clock because it IS routing.
+                let t_route = std::time::Instant::now();
                 self.prof.swap_n += route_into(
                     &self.gl_host,
                     self.pin.moe_bias(l),
@@ -1121,6 +1278,10 @@ impl<'a> GpuEngine<'a> {
                     &mut self.sel,
                     &mut self.cand,
                 );
+                // The host half of the route region, stamped rather than derived.
+                let e_route = std::time::Instant::now();
+                self.prof.cpu_route_ns += e_route.duration_since(t_route).as_nanos();
+                crate::telemetry::spans::record("cpu/route-into", "decode", t_route, e_route);
                 self.prof.route_ns += t.elapsed().as_nanos();
                 // Trace v2 only: re-rank the same `choice` array to the wider candidate
                 // window the offline (J, M) grid needs. Deliberately outside the
@@ -1134,6 +1295,7 @@ impl<'a> GpuEngine<'a> {
                 // Signal (hit → ready; miss → resolves when its bytes land). The slot
                 // ADDRESSES are known now, so the descriptors below are valid pointers.
                 let miss0 = self.pin.misses;
+                let t_sub = std::time::Instant::now();
                 let mut signals = self.pin.submit_layer(
                     l,
                     &self.sel,
@@ -1142,6 +1304,11 @@ impl<'a> GpuEngine<'a> {
                     &mut self.mlps_vq,
                     &mut self.fmt,
                 )?;
+                // Pure host work: residency lookups + policy bookkeeping + read specs.
+                // It only ENQUEUES the reads; the reaper thread does the waiting.
+                let e_sub = std::time::Instant::now();
+                self.prof.cpu_submit_ns += e_sub.duration_since(t_sub).as_nanos();
+                crate::telemetry::spans::record("cpu/submit-layer", "decode", t_sub, e_sub);
                 self.prof.fetch_n += self.pin.misses - miss0;
                 // Routed weights: sigmoid score, sum-normalized over the routed picks,
                 // then scaled. The VQ shared expert (weight 1.0) folds into the batch.
@@ -1264,8 +1431,14 @@ impl<'a> GpuEngine<'a> {
             // the MoE wall (near-0 for MoE layers — the compute stream already synced;
             // the dense MLP compute for the 3 dense layers).
             let t = std::time::Instant::now();
+            // NOT stamped into `sync_wait_ns`: this join is already inside
+            // `moe_wall_ns`, and the class axis takes the MoE phase's contribution from
+            // that wall. Adding it to both would count it twice within one axis, which
+            // is exactly what made the first version of the CLASS line overshoot.
             device_sync()?;
-            self.prof.moe_wall_ns += t.elapsed().as_nanos();
+            let e_moe = std::time::Instant::now();
+            self.prof.moe_wall_ns += e_moe.duration_since(t).as_nanos();
+            crate::telemetry::spans::record("gpu-wait/end-of-layer-sync", "decode", t, e_moe);
             // Both MoE span events retired by the sync — read the compute-stream span
             // (MoE layers only; dense layers never recorded them).
             if dense_mlp.is_none() {
@@ -1295,6 +1468,14 @@ impl<'a> GpuEngine<'a> {
             }
         }
 
+        // Open the tail GPU span. The end-of-layer `device_sync` just above drained
+        // everything, so this timestamp sits on an idle stream and the span that
+        // follows is the tail kernels and nothing else.
+        self.tail_ev_start.record(std::ptr::null_mut())?;
+        self.tail_ev_pending = true;
+        // The tail's host launch cost, on the same `cpu_launch_ns` clock as the layers'.
+        // Nothing blocks between here and the end of `forward`.
+        let t_tail_launch = std::time::Instant::now();
         // Final norm → lm_head → logits (device); caller reads via argmax.
         // SAFETY: final_norm/lm_head resident; xn/logits device scratch.
         unsafe {
@@ -1309,6 +1490,9 @@ impl<'a> GpuEngine<'a> {
                 self.logits.ptr_mut() as *mut f32,
             )?;
         }
+        let e_tail_launch = std::time::Instant::now();
+        self.prof.cpu_launch_ns += e_tail_launch.duration_since(t_tail_launch).as_nanos();
+        crate::telemetry::spans::record("cpu/launch-tail", "decode", t_tail_launch, e_tail_launch);
         Ok(())
     }
 
@@ -1389,7 +1573,22 @@ impl<'a> GpuEngine<'a> {
                 self.argmax_dev.ptr_mut().add(4) as *mut f32,
             )?;
         }
-        self.argmax_dev.copy_out_into(&mut self.argmax_host)?;
+        // Close the tail GPU span here — AFTER the argmax launch, BEFORE the D2H — so
+        // it brackets exactly rmsnorm → lm_head → argmax. The start was recorded in
+        // `forward`; the D2H below retires both, so reading it costs no extra sync.
+        self.tail_ev_end.record(std::ptr::null_mut())?;
+        // The one blocking call the whole tail phase hides behind: it drains the final
+        // rmsnorm, lm_head AND argmax. Class it explicitly, or those milliseconds land
+        // in the derived `cpu` bucket and look like host work.
+        blocked(&mut self.prof.tail_wait_ns, "gpu-wait/argmax-d2h", || {
+            self.argmax_dev.copy_out_into(&mut self.argmax_host)
+        })?;
+        // Both events retired by the D2H above.
+        if self.tail_ev_pending {
+            self.tail_ev_pending = false;
+            let ms = HipEvent::elapsed_ms(&self.tail_ev_start, &self.tail_ev_end)?;
+            self.prof.tail_gpu_ns += (ms as f64 * 1e6) as u128;
+        }
         debug_assert_eq!(self.argmax_host.len(), 8, "argmax result must be 8 bytes");
         let idx = i32::from_le_bytes([
             self.argmax_host[0],
@@ -1429,7 +1628,7 @@ impl<'a> GpuEngine<'a> {
         const WIN: usize = 8;
         let rt = tokio::runtime::Builder::new_current_thread().build()?;
         let mut generated = Vec::with_capacity(ngen);
-        let (hit0, miss0, decode_wall) = rt.block_on(async {
+        let (hit0, miss0, fetch0, io0, decode_wall) = rt.block_on(async {
             let mut pos = 0usize;
             for &tok in prompt_ids {
                 // Beat the watchdog per prefill token too — a long/cold prompt can
@@ -1446,6 +1645,13 @@ impl<'a> GpuEngine<'a> {
             self.prof = Profile::default();
             let hit0 = self.pin.hits;
             let miss0 = self.pin.misses;
+            // Baseline the reaper's counters too. `hits`/`misses` were already rebased
+            // here but `fetch_ns` never was, so `fetch_wall_ms` has always folded the
+            // PREFILL's (cold, expensive) fetch into the decode average. Invisible at
+            // -bench 512 where 5 prompt tokens amortize away; at -bench 8 it reported
+            // io-wait at 136% of wall, which is how it was found.
+            let fetch0 = self.pin.fetch_ns();
+            let io0 = self.pin.io_wait_ns();
             let decode_wall = std::time::Instant::now();
             #[cfg(feature = "trace")]
             let mut win_t = std::time::Instant::now();
@@ -1479,7 +1685,7 @@ impl<'a> GpuEngine<'a> {
                     (win_hit, win_miss) = (self.pin.hits, self.pin.misses);
                 }
             }
-            Ok::<_, anyhow::Error>((hit0, miss0, decode_wall))
+            Ok::<_, anyhow::Error>((hit0, miss0, fetch0, io0, decode_wall))
         })?;
         self.prof.wall_ns = decode_wall.elapsed().as_nanos();
         self.prof.tokens = generated.len() as u64;
@@ -1492,7 +1698,8 @@ impl<'a> GpuEngine<'a> {
             self.pin.hits - hit0,
             self.pin.misses - miss0,
             bytes_per_expert,
-            self.pin.fetch_ns(),
+            self.pin.fetch_ns().saturating_sub(fetch0),
+            self.pin.io_wait_ns().saturating_sub(io0),
             tm.total_idle_duration.as_nanos() as u64,
             tm.total_poll_duration.as_nanos() as u64,
             self.route_advice,

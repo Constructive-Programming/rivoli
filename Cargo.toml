@@ -20,7 +20,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # synchronously at run end. Heavy deps, so opt-in at build time.
 opentelemetry = { version = "0.30", optional = true }
 opentelemetry_sdk = { version = "0.30", optional = true }
-opentelemetry-otlp = { version = "0.30", optional = true }
+opentelemetry-otlp = { version = "0.30", optional = true, features = ["metrics"] }
 # Async streaming MoE pipeline (rocm only): the futures-util StreamExt stack from
 # ollama-router drives the per-expert load‖compute overlap, with GPU/io_uring
 # completions bridged to futures via async signals. Current-thread runtime — the

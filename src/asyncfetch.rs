@@ -51,6 +51,14 @@ pub struct AsyncFetch {
     /// the true fetch cost the overlap hides. The profile reads it against the MoE
     /// wall to report how much fetch was buried behind compute.
     fetch_ns: Arc<AtomicU64>,
+    /// Accumulated time the reaper spent BLOCKED IN `io_uring` completions — the
+    /// `reap` loop only, excluding the queue/submit syscalls around it. Measured at
+    /// the ring rather than inferred: the profile's old `io-wait` was
+    /// `moe_wall - compute_gpu`, a host clock minus a GPU clock, which understated it.
+    ///
+    /// This runs on the reaper thread, so it OVERLAPS the decode thread's wall and is
+    /// not a share of it. That is the point — see `ProfileSummary`'s class line.
+    io_wait_ns: Arc<AtomicU64>,
     /// Set once by the reaper on any fetch error: the ring is left dirty by a
     /// mid-batch bail, so it's abandoned rather than reused (reusing it would index
     /// stale `user_data` → C-side OOB / signal-index panic). `submit` then fails
@@ -65,16 +73,19 @@ impl AsyncFetch {
         let fetch = HipStream::new()?;
         let (tx, rx) = channel::<ReapJob>();
         let fetch_ns = Arc::new(AtomicU64::new(0));
+        let io_wait_ns = Arc::new(AtomicU64::new(0));
         let poisoned = Arc::new(AtomicBool::new(false));
         let fn_reaper = fetch_ns.clone();
+        let io_reaper = io_wait_ns.clone();
         let poison_reaper = poisoned.clone();
         let reaper = std::thread::Builder::new()
             .name("rivoli-reaper".into())
-            .spawn(move || reaper_loop(streamer, fetch, rx, fn_reaper, poison_reaper))?;
+            .spawn(move || reaper_loop(streamer, fetch, rx, fn_reaper, io_reaper, poison_reaper))?;
         Ok(Self {
             tx: Some(tx),
             reaper: Some(reaper),
             fetch_ns,
+            io_wait_ns,
             poisoned,
         })
     }
@@ -82,6 +93,12 @@ impl AsyncFetch {
     /// Accumulated reaper fetch wall in ns (across all layers so far).
     pub fn fetch_ns(&self) -> u64 {
         self.fetch_ns.load(Ordering::Relaxed)
+    }
+
+    /// Accumulated ns the reaper spent blocked in `io_uring` completions — the measured
+    /// io-wait, taken at the ring. Off-thread, so it overlaps the decode wall.
+    pub fn io_wait_ns(&self) -> u64 {
+        self.io_wait_ns.load(Ordering::Relaxed)
     }
 
     /// Submit a layer's cold reads; returns one pending [`Signal`] per read, in the
@@ -126,6 +143,7 @@ fn reaper_loop(
     fetch: HipStream,
     rx: Receiver<ReapJob>,
     fetch_ns: Arc<AtomicU64>,
+    io_wait_ns: Arc<AtomicU64>,
     poisoned: Arc<AtomicBool>,
 ) {
     for job in rx {
@@ -141,7 +159,7 @@ fn reaper_loop(
             continue;
         }
         let t = std::time::Instant::now();
-        let r = run_job(&mut streamer, &fetch, &job);
+        let r = run_job(&mut streamer, &fetch, &job, &io_wait_ns);
         fetch_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if let Err(e) = r {
             // Fatal fetch error: poison (abandon the dirty ring for all later jobs),
@@ -155,7 +173,12 @@ fn reaper_loop(
     }
 }
 
-fn run_job(streamer: &mut Streamer, fetch: &HipStream, job: &ReapJob) -> Result<()> {
+fn run_job(
+    streamer: &mut Streamer,
+    fetch: &HipStream,
+    job: &ReapJob,
+    io_wait_ns: &AtomicU64,
+) -> Result<()> {
     for r in &job.reads {
         // SAFETY: `dst` is an ALIGN-aligned device slot the pipeline keeps live until
         // this read's signal resolves; the VQ blocks are VQ_ALIGN-aligned so the
@@ -167,6 +190,10 @@ fn run_job(streamer: &mut Streamer, fetch: &HipStream, job: &ReapJob) -> Result<
         );
     }
     streamer.submit()?;
+    // Everything above is CPU (building and submitting SQEs); everything in the loop
+    // below is the thread parked in the kernel waiting for NVMe. Only the latter is
+    // io-wait, which is why the clock starts here and not at the top of `run_job`.
+    let t_io = std::time::Instant::now();
     for _ in 0..job.reads.len() {
         // SAFETY: `fetch` is a live stream; `reap` kicks this read's copy on it and
         // returns the completed read's user_data.
@@ -174,6 +201,13 @@ fn run_job(streamer: &mut Streamer, fetch: &HipStream, job: &ReapJob) -> Result<
         // Resolve when the copy (enqueued by `reap`) lands on the fetch stream.
         job.signals[u].arm_on(fetch)?;
     }
+    let e_io = std::time::Instant::now();
+    io_wait_ns.fetch_add(e_io.duration_since(t_io).as_nanos() as u64, Ordering::Relaxed);
+    // Emitted on the REAPER thread against the same shared anchor as the decode
+    // thread's spans, so a trace viewer draws them on one timeline. This is the pair
+    // whose overlap the whole streaming design is a bet on: io-wait bars should sit
+    // underneath the decode thread's gpu-wait bars, not beside them.
+    crate::telemetry::spans::record("io-wait/uring-reap", "reaper", t_io, e_io);
     streamer.reset_batch();
     Ok(())
 }
