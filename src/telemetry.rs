@@ -27,16 +27,21 @@
 /// recording over a long run would be neither.
 pub mod spans {
     use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
     use std::sync::Mutex;
     use std::time::{Instant, SystemTime};
 
-    /// One closed interval on one thread.
+    /// One closed interval on one thread, with the position it happened at so the
+    /// export can rebuild a tree. A flat list of 1200 siblings is not a waterfall.
     pub struct Rec {
         pub name: &'static str,
         pub thread: &'static str,
         pub start: SystemTime,
         pub end: SystemTime,
+        /// Decode-loop token index.
+        pub tok: u32,
+        /// Layer index, or -1 for work outside the layer loop (the tail).
+        pub layer: i32,
     }
 
     struct Log {
@@ -52,6 +57,21 @@ pub mod spans {
     }
 
     static LOG: OnceLock<Option<Log>> = OnceLock::new();
+    /// Where the decode loop currently is. Read by `record` on whatever thread calls it,
+    /// so the reaper's io-wait inherits the token/layer it is servicing — approximate by
+    /// construction (it is a different thread) but right in every case that matters,
+    /// because the reaper only ever works on the batch the decode loop just submitted.
+    static CUR_TOK: AtomicU32 = AtomicU32::new(0);
+    static CUR_LAYER: AtomicI32 = AtomicI32::new(-1);
+
+    /// Called by the decode loop as it advances. Two relaxed stores; free when disabled.
+    pub fn mark(tok: u32, layer: i32) {
+        if LOG.get().map(Option::is_some) != Some(true) {
+            return;
+        }
+        CUR_TOK.store(tok, Ordering::Relaxed);
+        CUR_LAYER.store(layer, Ordering::Relaxed);
+    }
 
     fn log() -> Option<&'static Log> {
         LOG.get_or_init(|| {
@@ -95,6 +115,8 @@ pub mod spans {
             thread,
             start: s,
             end: e,
+            tok: CUR_TOK.load(Ordering::Relaxed),
+            layer: CUR_LAYER.load(Ordering::Relaxed),
         });
     }
 
@@ -310,6 +332,8 @@ mod otlp {
     use opentelemetry::trace::{Span, TraceContextExt, Tracer, TracerProvider as _};
     use opentelemetry_sdk::Resource;
     use opentelemetry_sdk::trace::SdkTracerProvider;
+    use std::collections::BTreeMap;
+    use std::time::SystemTime;
 
     /// Build a one-shot tracer (blocking HTTP exporter + a SimpleSpanProcessor, so the
     /// span exports synchronously on `end()`/`shutdown()` — no async runtime of ours),
@@ -334,7 +358,28 @@ mod otlp {
             .build();
 
         let tracer = provider.tracer("rivoli");
-        let mut span = tracer.start("rivoli.decode");
+        // Drain BEFORE building the root: the root needs explicit start/end covering the
+        // children, and `tracer.start()` would stamp it at export time — minutes after
+        // the intervals it parents. A parent whose window does not contain its children
+        // is what makes a waterfall render as one collapsed nest.
+        let (recs, truncated) = super::spans::drain();
+        let n = recs.len();
+        let bounds = recs
+            .iter()
+            .fold(None::<(SystemTime, SystemTime)>, |acc, r| match acc {
+                None => Some((r.start, r.end)),
+                Some((lo, hi)) => Some((lo.min(r.start), hi.max(r.end))),
+            });
+        let mut span = match bounds {
+            Some((lo, hi)) => tracer
+                .span_builder("rivoli.decode")
+                .with_start_time(lo)
+                .with_end_time(hi)
+                .start(&tracer),
+            // No intervals recorded (RIVOLI_SPANS unset): a plain now-stamped span, which
+            // is correct — there are no children for it to fail to contain.
+            None => tracer.start("rivoli.decode"),
+        };
         span.set_attribute(KeyValue::new("tokens", tokens as i64));
         span.set_attribute(KeyValue::new("tok_per_s", summary.tok_per_s));
         span.set_attribute(KeyValue::new("hit_pct", summary.hit_pct));
@@ -380,17 +425,67 @@ mod otlp {
         // Children are emitted under `span`'s context, and each carries `thread` so a
         // viewer can lane them. They are built with explicit timestamps rather than being
         // timed live, so recording stayed free during decode.
+        // Rebuild the tree: decode -> token N -> layer L -> the leaf intervals. Emitting
+        // the leaves as 1200 direct siblings of the root is technically a trace and
+        // practically unreadable; the token/layer levels are what make a waterfall
+        // navigable, and they are synthesised from the leaves' own bounds so they cannot
+        // disagree with them.
+        //
+        // Every span here is closed with `end_with_timestamp`. `end()` would stamp
+        // `now()` and silently discard the builder's `with_end_time`.
         let cx = opentelemetry::Context::current_with_span(span);
-        let (recs, truncated) = super::spans::drain();
-        let n = recs.len();
+        let mut by_tok: BTreeMap<u32, Vec<super::spans::Rec>> = BTreeMap::new();
         for r in recs {
-            let mut child = tracer
-                .span_builder(r.name)
-                .with_start_time(r.start)
-                .with_end_time(r.end)
-                .with_attributes([KeyValue::new("thread", r.thread)])
+            by_tok.entry(r.tok).or_default().push(r);
+        }
+        for (tok_i, tok_recs) in by_tok {
+            let Some((t_lo, t_hi)) = span_bounds(&tok_recs) else {
+                continue;
+            };
+            let mut tok_span = tracer
+                .span_builder(format!("token {tok_i}"))
+                .with_start_time(t_lo)
+                .with_end_time(t_hi)
+                .with_attributes([KeyValue::new("token", tok_i as i64)])
                 .start_with_context(&tracer, &cx);
-            child.end();
+            let tok_cx = opentelemetry::Context::current_with_span(tok_span);
+
+            let mut by_layer: BTreeMap<i32, Vec<super::spans::Rec>> = BTreeMap::new();
+            for r in tok_recs {
+                by_layer.entry(r.layer).or_default().push(r);
+            }
+            for (layer_i, layer_recs) in by_layer {
+                // layer -1 is work outside the layer loop (the tail): hang it straight off
+                // the token rather than inventing a "layer -1" level for it.
+                let parent_cx = if layer_i < 0 {
+                    tok_cx.clone()
+                } else {
+                    let Some((l_lo, l_hi)) = span_bounds(&layer_recs) else {
+                        continue;
+                    };
+                    let ls = tracer
+                        .span_builder(format!("layer {layer_i}"))
+                        .with_start_time(l_lo)
+                        .with_end_time(l_hi)
+                        .with_attributes([KeyValue::new("layer", layer_i as i64)])
+                        .start_with_context(&tracer, &tok_cx);
+                    let c = opentelemetry::Context::current_with_span(ls);
+                    let mut ls = c.span();
+                    ls.end_with_timestamp(l_hi);
+                    c
+                };
+                for r in layer_recs {
+                    let mut leaf = tracer
+                        .span_builder(r.name)
+                        .with_start_time(r.start)
+                        .with_end_time(r.end)
+                        .with_attributes([KeyValue::new("thread", r.thread)])
+                        .start_with_context(&tracer, &parent_cx);
+                    leaf.end_with_timestamp(r.end);
+                }
+            }
+            let mut ts = tok_cx.span();
+            ts.end_with_timestamp(t_hi);
         }
         let mut span = cx.span();
         span.set_attribute(KeyValue::new("spans_recorded", n as i64));
@@ -402,12 +497,24 @@ mod otlp {
                  covers only the start of the decode, not all of it"
             );
         }
-        span.end();
+        match bounds {
+            Some((_, hi)) => span.end_with_timestamp(hi),
+            None => span.end(),
+        }
 
         // Flush the simple processor's export before we return (the run ends here).
         provider.shutdown().context("flush OTLP spans")?;
         export_metrics(summary, tokens)?;
         Ok(())
+    }
+
+    /// Min start / max end over a set of records — the bounds a synthesised parent needs
+    /// so its window actually contains its children.
+    fn span_bounds(recs: &[super::spans::Rec]) -> Option<(SystemTime, SystemTime)> {
+        recs.iter().fold(None, |acc, r| match acc {
+            None => Some((r.start, r.end)),
+            Some((lo, hi)) => Some((lo.min(r.start), hi.max(r.end))),
+        })
     }
 
     /// Export the same summary as OTLP **metrics**, not just span attributes.

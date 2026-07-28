@@ -124,6 +124,19 @@ partition wall. Keeping the two rows visually distinct is the whole point of hav
   benchmarks.md is that the instrument must not be in the arm.
 - **The spans are the same intervals the scalars come from**, so the two views cannot
   disagree. If they do, that is a bug worth chasing.
+- **`Span::end()` is a trap.** It is `end_with_timestamp(now())` and it silently discards
+  the builder's `with_end_time`. The first version of this used it, so every child was
+  stamped as ending at *export* time — they all overlapped and Tempo rendered ~4000 spans
+  as one collapsed nest. Always `end_with_timestamp(rec.end)`. Same for the root, which
+  additionally needs explicit bounds spanning its children: a parent whose window does not
+  contain its children is the other half of that same broken waterfall.
+- **A flat span list is not a waterfall.** Emitting the leaves as direct siblings of the
+  root is technically a trace and practically unreadable. The export synthesises
+  `token N` → `layer L` levels from the leaves' own bounds (so they cannot disagree with
+  them); `spans::mark()` supplies the position with two relaxed atomic stores, and the
+  reaper reads them too, so its io-wait lands under the layer whose batch it is servicing.
+  Verified by decoding the exported protobuf: depth histogram `{0:1, 1:2, 2:106, 3:597}`,
+  600 distinct end times, 0 orphaned parent references.
 
 ## What to actually look at
 

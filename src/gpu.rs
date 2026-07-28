@@ -1087,6 +1087,10 @@ impl<'a> GpuEngine<'a> {
                 LayerMlp::Dense(_) => (std::ptr::null(), None),
             };
             let indexer_pin = lw.indexer; // ends the &pin.layers borrow (Copy)
+            // Position for the span tree: two relaxed stores, free when RIVOLI_SPANS is
+            // unset. The reaper reads these too, so its io-wait lands under the layer
+            // whose batch it is servicing.
+            crate::telemetry::spans::mark(pos as u32, l as i32);
 
             // Open the launch-cost span. Everything from here to the gate D2H (MoE) or
             // the end of the dense MLP is host-side kernel issue — EXCEPT the indexer's
@@ -1468,6 +1472,8 @@ impl<'a> GpuEngine<'a> {
             }
         }
 
+        // Out of the layer loop — the tail hangs off the token, not off a layer.
+        crate::telemetry::spans::mark(pos as u32, -1);
         // Open the tail GPU span. The end-of-layer `device_sync` just above drained
         // everything, so this timestamp sits on an idle stream and the span that
         // follows is the tail kernels and nothing else.
