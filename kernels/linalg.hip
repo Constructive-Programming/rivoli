@@ -94,6 +94,16 @@ extern "C" __global__ void gemv_f32(
 
 // y[o] = scale[o]·Σ_i x[i]·(int8)packed[o·i_dim+i] — per-row int8 GEMV (lm_head to
 // logits; matches quant.rs matvec_i8). One WAVE per output row, coalesced columns.
+//
+// FOUR columns per lane, not one. A scalar `row[i]` is a global_load_i8: 32 B/wave
+// against a 128 B cache line, so the kernel asked DRAM for a quarter line at a time and
+// measured 117 GB/s of a 256 GB/s part. Four contiguous int8 are one dword — a full line
+// per wave — paired with one float4 of x. Same mechanism, and the same fix, as
+// mla_absorb's i-quad (docs/PERF.md #4 and #5).
+//
+// NOT bit-identical to the scalar form: each lane now owns a contiguous quad instead of
+// a stride-WAVE comb, which reassociates the f32 sum. lm_head feeds argmax directly, so
+// this took the perplexity gate rather than a fingerprint.
 extern "C" __global__ void gemv_i8(
     const float* __restrict__ x, const signed char* __restrict__ packed,
     const float* __restrict__ scale, int o_dim, int i_dim, float* __restrict__ y) {
@@ -102,7 +112,20 @@ extern "C" __global__ void gemv_i8(
     if (o >= (size_t)o_dim) return;
     const signed char* row = packed + o * (size_t)i_dim;
     float acc = 0.0f;
-    for (int i = lane; i < i_dim; i += WAVE) acc += x[i] * (float)row[i];
+    int base = 0;
+    // The quad path needs `row` dword-aligned and `x` float4-aligned. `packed` is a
+    // device allocation, so the real condition is i_dim % 4 keeping every row aligned;
+    // both are uniform per block and anything failing them falls to the scalar tail.
+    if ((((size_t)row) & 3u) == 0 && (((size_t)x) & 15u) == 0) {
+        for (; base + WAVE * 4 <= i_dim; base += WAVE * 4) {
+            int col = base + lane * 4;
+            int w = *(const int*)(row + col); // 4 int8 = one dword = 128 B/wave
+            float4 xv = *(const float4*)(x + col);
+            acc += xv.x * (float)(signed char)(w) + xv.y * (float)(signed char)(w >> 8) +
+                   xv.z * (float)(signed char)(w >> 16) + xv.w * (float)(signed char)(w >> 24);
+        }
+    }
+    for (int i = base + lane; i < i_dim; i += WAVE) acc += x[i] * (float)row[i];
     acc = wave_sum(acc);
     if (lane == 0) y[o] = acc * scale[o];
 }

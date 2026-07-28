@@ -277,31 +277,39 @@ fn mla_attend_rejects_unsupported_kvl() {
 fn gemv_i8_matches_oracle() {
     // lm_head's GEMV — the last op before argmax, and until now the only quantized
     // kernel in the engine with NO oracle at all.
-    let (o_dim, i_dim) = (512usize, 6144usize);
-    let mut r = Lcg(0x18);
-    let packed: Vec<u8> = (0..o_dim * i_dim).map(|_| (r.f() * 127.0) as i8 as u8).collect();
-    let scale: Vec<f32> = (0..o_dim).map(|_| (r.f() * 0.01).abs() + 1e-4).collect();
-    let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
+    //
+    // Swept over dims because the kernel is now a dword-quad fast path plus a scalar
+    // tail, and lm_head alone (6144) only ever exercises the fast path. Each dim below
+    // reaches a different arm: 6148 leaves a 4-column tail, 100 is shorter than one
+    // WAVE*4 step so it is tail-only, and 6143 gives an odd row stride that
+    // de-aligns every row but the first and must fall out of the quad path entirely.
+    for (o_dim, i_dim) in [(512usize, 6144usize), (96, 6148), (96, 100), (96, 6143)] {
+        let mut r = Lcg(0x18);
+        let packed: Vec<u8> = (0..o_dim * i_dim).map(|_| (r.f() * 127.0) as i8 as u8).collect();
+        let scale: Vec<f32> = (0..o_dim).map(|_| (r.f() * 0.01).abs() + 1e-4).collect();
+        let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
 
-    let mut want = vec![0.0f32; o_dim];
-    matvec_i8(&mut want, &x, &packed, &scale, o_dim, i_dim);
+        let mut want = vec![0.0f32; o_dim];
+        matvec_i8(&mut want, &x, &packed, &scale, o_dim, i_dim);
 
-    let (xb, pb, sb) = (dev(&f32b(&x)), dev(&packed), dev(&f32b(&scale)));
-    let mut yb = dev(&vec![0u8; o_dim * 4]);
-    // SAFETY: device buffers sized [i_dim], [o_dim*i_dim], [o_dim], [o_dim] f32.
-    unsafe {
-        launch_gemv_i8(
-            xb.ptr() as *const f32,
-            pb.ptr(),
-            sb.ptr() as *const f32,
-            o_dim,
-            i_dim,
-            yb.ptr_mut() as *mut f32,
-        )
-        .expect("launch");
+        let (xb, pb, sb) = (dev(&f32b(&x)), dev(&packed), dev(&f32b(&scale)));
+        let mut yb = dev(&vec![0u8; o_dim * 4]);
+        // SAFETY: device buffers sized [i_dim], [o_dim*i_dim], [o_dim], [o_dim] f32.
+        unsafe {
+            launch_gemv_i8(
+                xb.ptr() as *const f32,
+                pb.ptr(),
+                sb.ptr() as *const f32,
+                o_dim,
+                i_dim,
+                yb.ptr_mut() as *mut f32,
+            )
+            .expect("launch");
+        }
+        device_sync().expect("sync");
+        let got = f32v(&yb.copy_out().expect("out"));
+        assert_close(&want, &got, &format!("gemv_i8 o={o_dim} i={i_dim}"));
     }
-    device_sync().expect("sync");
-    assert_close(&want, &f32v(&yb.copy_out().expect("out")), "gemv_i8");
 }
 
 #[test]
