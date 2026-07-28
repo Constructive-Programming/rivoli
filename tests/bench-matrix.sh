@@ -22,6 +22,16 @@ ROUND="${2:-1}"
 BIN="${RIVOLI_BIN:-$W/target/release/rivoli}"
 MODEL="${RIVOLI_MODEL:-/var/db/rivoli/glm52-vq3-full}"
 MEM="${RIVOLI_MEM:-115}"
+# The prompt is part of the experiment, not decoration. The default "The sky is blue
+# because" invites a ~60-token canned answer that greedy decode then repeats: measured,
+# hybrid/dense/lru at 512 tokens returned a longest-repeated-block of 256 of 512 — half
+# the output a verbatim duplicate. The same cell on the prompt below returns 18.
+#
+# And the degenerate run was FASTER: 2.88 tok/s at 79.4% hit versus 2.66 at 77.7%. That
+# is the confound in one line — looping re-routes to the same experts, the hit rate
+# rises, and the broken run wins the benchmark by 8%. A prompt that sustains a long,
+# varied answer is the cheapest defence available.
+PROMPT="${RIVOLI_PROMPT:-Explain in depth how modern computer systems manage memory, from DRAM and the cache hierarchy through virtual memory, TLBs, cache coherence, NUMA, allocators, and garbage collection. For each mechanism, describe why it exists, the trade-offs it makes, and a concrete failure mode an engineer would meet in production.}"
 mkdir -p "$OUT"
 
 case "$ROUND" in
@@ -58,6 +68,7 @@ fi
 
 echo "round $ROUND: ${#CELLS[@]} cells x $TOKENS tok, --max-mem $MEM, timeout ${TIMEOUT}s"
 echo "binary: $BIN"
+echo "prompt: ${PROMPT:0:80}..."
 printf 'status\tmode\tattn\tpolicy\ttok_s\thit_pct\twall_ms\tlrb\tnote\n' > "$OUT/round$ROUND.tsv"
 
 for cell in "${CELLS[@]}"; do
@@ -78,7 +89,7 @@ for cell in "${CELLS[@]}"; do
   start=$(date +%s)
   timeout -k 30 "$TIMEOUT" "$BIN" "$MODEL" \
       --mode "$mode" --cache-policy "$pol" --attn "$attn" --max-mem "$MEM" \
-      -bench "$TOKENS" "${extra[@]}" > "$log" 2>&1
+      --prompt "$PROMPT" -bench "$TOKENS" "${extra[@]}" > "$log" 2>&1
   rc=$?
   el=$(( $(date +%s) - start ))
 
