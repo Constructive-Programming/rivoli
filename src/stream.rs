@@ -243,10 +243,20 @@ impl Streamer {
         // submit. Either way the already-pushed SQEs are handed to the kernel and the
         // CQEs are collected by the matching `reap` calls. (The sole caller only submits
         // non-empty batches; an empty SQ would be a harmless no-op regardless.)
-        self.ring
-            .submit()
-            .map_err(|e| anyhow::anyhow!("io_uring submit failed: {e}"))?;
-        Ok(())
+        // EINTR is retried for the same reason `reap` retries it: a stray signal on the
+        // reaper thread must not poison a fetch whose SQEs are already pushed. `submit`
+        // does not wait, so this is far less likely than in `reap` — but the two calls
+        // were inconsistent, and `reap`'s own comment already grants that a signal can
+        // land here. `io_uring_enter` is not in the SA_RESTART-able class, so nothing
+        // retries it for us. (This also has to hold before any SIGPROF-based profiler
+        // could ever be attached — see docs/TRACES.md, "Pyroscope".)
+        loop {
+            match self.ring.submit() {
+                Ok(_) => return Ok(()),
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(e) => return Err(anyhow::anyhow!("io_uring submit failed: {e}")),
+            }
+        }
     }
 
     /// Per-read async reap: block for the NEXT read to complete, kick its bounce→slot
