@@ -14,12 +14,36 @@ not — which is the picture, not a percentage.
 
 | signal | what | needs |
 |---|---|---|
-| **traces** | `rivoli.decode` root + one child per recorded interval (`gpu-wait/*`, `io-wait/uring-reap`, `cpu/*`), each tagged `thread=decode\|reaper`, with true start/end times | `RIVOLI_SPANS` set |
+| **traces** | `rivoli.decode` → `token N` → `layer L` → leaf intervals (`gpu-wait/*`, `io-wait/uring-reap`, `cpu/*`), each leaf tagged `thread=decode\|reaper`, with true start/end times | `RIVOLI_SPANS` set |
 | **metrics** | `rivoli_ms_per_tok{class,thread}` plus `rivoli_tok_per_s`, `rivoli_hit_pct`, `rivoli_gb_per_tok`, `rivoli_miss_per_tok`, `rivoli_fetch_hidden_pct`, `rivoli_tokens` | always, when OTLP is on |
 
 Both go out over OTLP/HTTP at run end. Metrics exist because span attributes are
 *searchable* but not *chartable* — Grafana cannot draw `gpu_wait_ms` over time from a span
 tag, so a dashboard built on traces alone can only show one run at a time.
+
+### Span attributes — identity, not measurements
+
+Each level carries what identifies it, and **deliberately not** the numbers:
+
+| span | attributes |
+|---|---|
+| `rivoli.decode` | `rivoli.{model,mode,cache_policy,attn,topk_path,moe_gain,max_mem_gib,bench_tokens,prompt,route_j,route_m,2q_kin_pct,2q_kout_pct,sinks,window,misa_heads,tokens_generated}` |
+| `token N` | `rivoli.token_index`, `rivoli.token_id` |
+| `layer L` | `experts.{cold,warm}.{int4,int3_vq}`, `experts.cold`, `experts.total` |
+| leaf | `thread` |
+
+**The root carries the run's arguments, not its metrics.** An earlier version put
+`tok_per_s`, `wall_ms_per_tok` and friends on it; those went out as metrics too, which made
+two sources of truth that can drift, and they are not what you search a trace *by*. You
+search by "which mode / which policy / which budget", then read the numbers off a chart.
+`route_j`/`route_m` appear only under `top-m` and `max_mem_gib` only when set — a `(4, 9)`
+next to `lru`, or a `0 GiB` budget, would read as a setting that did something.
+
+**`layer L`'s expert composition is the point of the layer level.** Eight cold int4 experts
+and eight warm int3-vq experts are different animals, and residency × format is the pair
+that explains the layer's cost. It has to be sampled between the residency check and the
+format decision — residency *after* `submit_layer` reads as all-resident, because that is
+where misses get their slots.
 
 ## Where to send it
 
@@ -109,19 +133,36 @@ partition wall. Keeping the two rows visually distinct is the whole point of hav
 
 ## Things that will bite
 
-- **`RIVOLI_SPANS` is a record CAP, not a duration** (default 5000 if set to a
-  non-number). It is a cap on purpose: ~2 tokens at full per-layer fidelity is a far more
-  useful flamegraph than 128 tokens flattened into one bar. Hitting it logs a warning and
-  sets `spans_truncated` on the root — **a truncated timeline that does not say so reads
-  as a complete one.**
+- **`RIVOLI_SPANS` is a span budget, spent by SAMPLING whole tokens across the run**
+  (default 5000 if set to a non-number). It used to record the first N intervals and stop,
+  which meant the timeline only ever showed the **cold start** — the least representative
+  part of a decode, while the cache is still filling — and silently presented it as the
+  run. Now the stride is `ceil(ngen × per_tok / budget)`, prefill is discarded at the same
+  point the profile counters are rebased, and the log states the plan:
+  `budget 5000 / (~472 spans/tok x 128 tok) -> every 13th token sampled (10 of 128)`.
+  Hitting the cap now means the stride under-estimated spans/token, and says so.
+- **Whole tokens, not individual intervals.** Sampling intervals would leave half-built
+  layers whose synthesised parent spans lie about their own children.
+- **`per_tok` is derived, not measured.** Six leaf spans per MoE layer — `cpu/launch`,
+  `gate-d2h`, `route-into`, `submit-layer`, `end-of-layer-sync`, and the reaper's
+  `io-wait/uring-reap`. An earlier version discovered it at runtime by timing token 0; that
+  calibration fired *during prefill*, before the token count was known, and planned the
+  whole run off `ngen = 0`. It is a property of the model, so it is now computed from
+  `n_layers`. Round the estimate UP: a long stride samples fewer tokens, a short one
+  truncates the tail.
 - **One HTTP POST per span.** The exporter is a `SimpleSpanProcessor` (deliberately: no
   async runtime of ours), so 5000 spans is 5000 blocking round-trips at run end. Fine to
   localhost, slow to a remote Tempo. It happens *after* the decode and after the numbers
   are taken, so it never perturbs a measurement — but if it is painful, run a local
   `otel-collector` with a `batch` processor and forward from there.
-- **Recording is not free but it is cheap**: a `Vec` push behind a mutex per span, no
-  exporter on the hot path. Unset `RIVOLI_SPANS` for A/B timing runs anyway — the rule in
-  benchmarks.md is that the instrument must not be in the arm.
+- **Measured cost: +0.15% on wall, and that is the FULLY-instrumented figure** (every
+  token recorded, `RIVOLI_SPANS` sized past the whole run, no OTLP endpoint so only the
+  recording is timed): 338.5 → 339.0 ms/tok, min-of-2 interleaved. With the default
+  sampling stride it is **+0.00%** — min-of-3 interleaved, 338.2 vs 338.2, against a
+  0.4 ms within-arm spread. Recording is a `Vec` push behind a mutex; no exporter touches
+  the hot path.
+  Unset `RIVOLI_SPANS` for A/B timing runs regardless — benchmarks.md's rule is that the
+  instrument must not be in the arm, and "too small to measure" is not "zero".
 - **The spans are the same intervals the scalars come from**, so the two views cannot
   disagree. If they do, that is a bug worth chasing.
 - **`Span::end()` is a trap.** It is `end_with_timestamp(now())` and it silently discards

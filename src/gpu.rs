@@ -1090,7 +1090,7 @@ impl<'a> GpuEngine<'a> {
             // Position for the span tree: two relaxed stores, free when RIVOLI_SPANS is
             // unset. The reaper reads these too, so its io-wait lands under the layer
             // whose batch it is servicing.
-            crate::telemetry::spans::mark(pos as u32, l as i32);
+            crate::telemetry::spans::mark(pos as u32, token, l as i32);
 
             // Open the launch-cost span. Everything from here to the gate D2H (MoE) or
             // the end of the dense MLP is host-side kernel issue — EXCEPT the indexer's
@@ -1299,6 +1299,19 @@ impl<'a> GpuEngine<'a> {
                 // Signal (hit → ready; miss → resolves when its bytes land). The slot
                 // ADDRESSES are known now, so the descriptors below are valid pointers.
                 let miss0 = self.pin.misses;
+                // Residency must be sampled BEFORE submit_layer: it allocates slots for
+                // misses, so afterwards everything reads as resident. A bitmask, not a
+                // Vec — this runs 78x per token and top_k is 8.
+                let warm_mask: u64 = if crate::telemetry::spans::enabled() {
+                    self.sel
+                        .iter()
+                        .take(64)
+                        .enumerate()
+                        .filter(|&(_, &e)| self.pin.resident(l, e))
+                        .fold(0u64, |m, (i, _)| m | (1 << i))
+                } else {
+                    0
+                };
                 let t_sub = std::time::Instant::now();
                 let mut signals = self.pin.submit_layer(
                     l,
@@ -1313,6 +1326,26 @@ impl<'a> GpuEngine<'a> {
                 let e_sub = std::time::Instant::now();
                 self.prof.cpu_submit_ns += e_sub.duration_since(t_sub).as_nanos();
                 crate::telemetry::spans::record("cpu/submit-layer", "decode", t_sub, e_sub);
+                // Residency x format, the pair that explains a layer's cost. `fmt` is
+                // filled by submit_layer in `sel` order (the shared expert is pushed
+                // after, so `take(sel.len())` keeps this to the routed picks).
+                if crate::telemetry::spans::enabled() {
+                    let mut st = crate::telemetry::spans::LayerState {
+                        tok: pos as u32,
+                        layer: l as i32,
+                        ..Default::default()
+                    };
+                    for (i, &i4) in self.fmt.iter().take(self.sel.len()).enumerate() {
+                        let warm = i < 64 && (warm_mask & (1 << i)) != 0;
+                        match (warm, i4) {
+                            (true, true) => st.warm_i4 += 1,
+                            (false, true) => st.cold_i4 += 1,
+                            (true, false) => st.warm_vq3 += 1,
+                            (false, false) => st.cold_vq3 += 1,
+                        }
+                    }
+                    crate::telemetry::spans::record_layer(st);
+                }
                 self.prof.fetch_n += self.pin.misses - miss0;
                 // Routed weights: sigmoid score, sum-normalized over the routed picks,
                 // then scaled. The VQ shared expert (weight 1.0) folds into the batch.
@@ -1473,7 +1506,7 @@ impl<'a> GpuEngine<'a> {
         }
 
         // Out of the layer loop — the tail hangs off the token, not off a layer.
-        crate::telemetry::spans::mark(pos as u32, -1);
+        crate::telemetry::spans::mark(pos as u32, token, -1);
         // Open the tail GPU span. The end-of-layer `device_sync` just above drained
         // everything, so this timestamp sits on an idle stream and the span that
         // follows is the tail kernels and nothing else.
@@ -1658,6 +1691,14 @@ impl<'a> GpuEngine<'a> {
             // io-wait at 136% of wall, which is how it was found.
             let fetch0 = self.pin.fetch_ns();
             let io0 = self.pin.io_wait_ns();
+            // Tell the span recorder how long the run is, so it can spread its budget
+            // across the whole decode instead of spending it all on the cold start.
+            // Six leaf spans per MoE layer — cpu/launch, gate-d2h, route-into,
+            // submit-layer, end-of-layer-sync, and the reaper's io-wait/uring-reap. The
+            // first estimate said five (it forgot the reaper's, which is on the other
+            // thread) and overshot the budget by 10%. Rounding UP is the safe direction:
+            // a slightly long stride samples fewer tokens, a short one truncates the tail.
+            crate::telemetry::spans::plan(ngen, self.cfg.n_layers * 6 + 4);
             let decode_wall = std::time::Instant::now();
             #[cfg(feature = "trace")]
             let mut win_t = std::time::Instant::now();

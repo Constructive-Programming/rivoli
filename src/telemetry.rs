@@ -21,10 +21,17 @@
 /// during decode.** Intervals are replayed as spans with explicit timestamps only at
 /// run end, which is why this can be on while the numbers it produces stay honest.
 ///
-/// Off unless `RIVOLI_SPANS` is set (to a record cap; default 5000 when empty). It is
-/// deliberately a CAP and not a duration: ~2 tokens at full per-layer fidelity is a far
-/// more useful flamegraph than 128 tokens aggregated into one bar, and unbounded
-/// recording over a long run would be neither.
+/// Off unless `RIVOLI_SPANS` is set (a span budget; default 5000 when empty).
+///
+/// The budget is spent by **sampling whole tokens spread across the run**, not by
+/// recording the first N intervals and stopping. Taking the prefix meant the timeline
+/// only ever showed the cold start — the least representative part of a decode, when the
+/// cache is still filling — and silently claimed to be the run. The stride is
+/// self-calibrating: token 0 is always recorded, its span count reveals the per-token
+/// cost, and the stride for the rest falls out of `ngen x per_tok / budget`.
+///
+/// WHOLE tokens, deliberately: sampling individual intervals would leave half-built
+/// layers whose synthesised parent spans lie about their own children.
 pub mod spans {
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
@@ -40,6 +47,8 @@ pub mod spans {
         pub end: SystemTime,
         /// Decode-loop token index.
         pub tok: u32,
+        /// The token id being processed at that index, for the token span's attribute.
+        pub tok_id: u32,
         /// Layer index, or -1 for work outside the layer loop (the tail).
         pub layer: i32,
     }
@@ -61,16 +70,59 @@ pub mod spans {
     /// so the reaper's io-wait inherits the token/layer it is servicing — approximate by
     /// construction (it is a different thread) but right in every case that matters,
     /// because the reaper only ever works on the batch the decode loop just submitted.
+    /// Sampling plan: record every `STRIDE`-th token, whole.
+    static STRIDE: AtomicU32 = AtomicU32::new(1);
+    /// Whether the CURRENT token is being sampled. Computed once per token in `mark`, so
+    /// `record` costs one atomic load rather than a division.
+    static SAMPLED: AtomicBool = AtomicBool::new(true);
     static CUR_TOK: AtomicU32 = AtomicU32::new(0);
+    static CUR_TOK_ID: AtomicU32 = AtomicU32::new(0);
     static CUR_LAYER: AtomicI32 = AtomicI32::new(-1);
 
     /// Called by the decode loop as it advances. Two relaxed stores; free when disabled.
-    pub fn mark(tok: u32, layer: i32) {
-        if LOG.get().map(Option::is_some) != Some(true) {
+    pub fn mark(tok: u32, tok_id: u32, layer: i32) {
+        if log().is_none() {
             return;
         }
-        CUR_TOK.store(tok, Ordering::Relaxed);
+        if CUR_TOK.swap(tok, Ordering::Relaxed) != tok {
+            let stride = STRIDE.load(Ordering::Relaxed).max(1);
+            SAMPLED.store(tok % stride == 0, Ordering::Relaxed);
+        }
+        CUR_TOK_ID.store(tok_id, Ordering::Relaxed);
         CUR_LAYER.store(layer, Ordering::Relaxed);
+    }
+
+    /// Plan the sampling stride, and drop anything recorded so far.
+    ///
+    /// Called once, where the profile counters are rebased after prefill — which is the
+    /// same reason: **prefill is warm-up and must not be in the sample.** An earlier
+    /// version calibrated the stride by measuring token 0's span count at the first token
+    /// boundary, which fired *during prefill*, before the token count was known, and
+    /// planned the whole run off `ngen = 0`. `per_tok` is a property of the model
+    /// (~5 spans per layer plus the tail), not something to discover at runtime, so the
+    /// measurement step was both wrong and unnecessary.
+    pub fn plan(ngen: usize, per_tok: usize) {
+        let Some(l) = log() else { return };
+        let stride = (ngen.max(1) as u64 * per_tok.max(1) as u64)
+            .div_ceil(l.cap as u64)
+            .clamp(1, u32::MAX as u64) as u32;
+        STRIDE.store(stride, Ordering::Relaxed);
+        SAMPLED.store(true, Ordering::Relaxed); // token 0 is always in the sample
+        CUR_TOK.store(0, Ordering::Relaxed);
+        if let Ok(mut v) = l.recs.lock() {
+            v.clear();
+        }
+        if let Some(m) = LAYERS.get() {
+            if let Ok(mut v) = m.lock() {
+                v.clear();
+            }
+        }
+        tracing::info!(
+            "RIVOLI_SPANS: budget {} / (~{per_tok} spans/tok x {ngen} tok) -> every {stride}th \
+             token sampled ({} of {ngen}), prefill discarded",
+            l.cap,
+            ngen.div_ceil(stride as usize),
+        );
     }
 
     fn log() -> Option<&'static Log> {
@@ -91,7 +143,7 @@ pub mod spans {
     /// True when recording is on. Callers use it to skip taking timestamps they would
     /// otherwise throw away.
     pub fn enabled() -> bool {
-        log().is_some()
+        log().is_some() && SAMPLED.load(Ordering::Relaxed)
     }
 
     /// Record a closed interval. `start`/`end` are monotonic instants from any thread;
@@ -99,6 +151,9 @@ pub mod spans {
     /// timeline — which is the point, since io-wait lives on the reaper thread.
     pub fn record(name: &'static str, thread: &'static str, start: Instant, end: Instant) {
         let Some(l) = log() else { return };
+        if !SAMPLED.load(Ordering::Relaxed) {
+            return;
+        }
         // `saturating_duration_since` because an `Instant` taken before the anchor (a
         // span opened during construction) would otherwise panic on subtraction.
         let (s, e) = (
@@ -106,6 +161,8 @@ pub mod spans {
             l.t0_wall + end.saturating_duration_since(l.t0_mono),
         );
         let Ok(mut v) = l.recs.lock() else { return };
+        // Hard backstop. With sampling this should not trigger; if it does, the stride
+        // under-estimated the per-token cost and the tail of the run is missing.
         if v.len() >= l.cap {
             l.truncated.store(true, Ordering::Relaxed);
             return;
@@ -116,8 +173,46 @@ pub mod spans {
             start: s,
             end: e,
             tok: CUR_TOK.load(Ordering::Relaxed),
+            tok_id: CUR_TOK_ID.load(Ordering::Relaxed),
             layer: CUR_LAYER.load(Ordering::Relaxed),
         });
+    }
+
+    /// Per-(token, layer) expert composition, for the layer spans. Residency x format is
+    /// the thing that explains a layer's cost — a layer of eight cold int4 experts is a
+    /// different animal from eight warm vq3 ones — and it is knowable only here, between
+    /// the residency check and the format decision.
+    #[derive(Clone, Copy, Default)]
+    pub struct LayerState {
+        pub tok: u32,
+        pub layer: i32,
+        pub cold_i4: u16,
+        pub warm_i4: u16,
+        pub cold_vq3: u16,
+        pub warm_vq3: u16,
+    }
+
+    static LAYERS: OnceLock<Mutex<Vec<LayerState>>> = OnceLock::new();
+
+    /// Record a layer's expert composition. Same enable gate as `record`.
+    pub fn record_layer(st: LayerState) {
+        if log().is_none() || !SAMPLED.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(mut v) = LAYERS.get_or_init(|| Mutex::new(Vec::new())).lock() {
+            // Same cap as the interval log, for the same reason.
+            if v.len() < 200_000 {
+                v.push(st);
+            }
+        }
+    }
+
+    /// Drain the per-layer expert composition.
+    pub fn drain_layers() -> Vec<LayerState> {
+        LAYERS
+            .get()
+            .and_then(|m| m.lock().ok().map(|mut v| std::mem::take(&mut *v)))
+            .unwrap_or_default()
     }
 
     /// Drain the recorded intervals for export. Returns `(records, truncated)`.
@@ -131,6 +226,31 @@ pub mod spans {
             Err(_) => (Vec::new(), truncated),
         }
     }
+}
+
+/// The run's arguments — what belongs on the root span. A span's attributes should say
+/// WHAT THIS RUN WAS so traces can be found and compared; the numbers it produced are
+/// metrics, and duplicating them here just makes two sources of truth that can drift.
+#[derive(Debug, Clone)]
+pub struct RunInfo {
+    pub model: String,
+    pub mode: String,
+    pub cache_policy: String,
+    pub attn: String,
+    pub topk_path: &'static str,
+    /// `--max-mem <GiB>`, or None when the budget auto-sizes.
+    pub max_mem_gib: Option<u64>,
+    pub bench_tokens: Option<usize>,
+    pub prompt: Option<String>,
+    pub moe_gain: f32,
+    /// `--cache-policy top-m`'s (J, M); None under every other policy, where a 0 would
+    /// read as a measurement of something that did not happen.
+    pub route_jm: Option<(usize, usize)>,
+    pub two_q_kin: u32,
+    pub two_q_kout: u32,
+    pub sinks: usize,
+    pub window: usize,
+    pub misa_heads: usize,
 }
 
 /// End-of-run per-token performance summary — the PROFILE line and the OTLP span
@@ -313,20 +433,20 @@ impl ProfileSummary {
 /// feature is built AND `OTEL_EXPORTER_OTLP_ENDPOINT` is set. No-op otherwise (the
 /// PROFILE line already logged the same numbers). Never fails the run — an export
 /// error is warned and swallowed.
-pub fn export_decode(summary: &ProfileSummary, tokens: usize) {
+pub fn export_decode(summary: &ProfileSummary, tokens: usize, run: &RunInfo) {
     #[cfg(feature = "otlp")]
     if std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_some() {
-        if let Err(e) = otlp::export(summary, tokens) {
+        if let Err(e) = otlp::export(summary, tokens, run) {
             tracing::warn!("OTLP export failed ({e}); metrics logged only");
         }
     }
     #[cfg(not(feature = "otlp"))]
-    let _ = (summary, tokens);
+    let _ = (summary, tokens, run);
 }
 
 #[cfg(feature = "otlp")]
 mod otlp {
-    use super::ProfileSummary;
+    use super::{ProfileSummary, RunInfo};
     use anyhow::{Context, Result};
     use opentelemetry::KeyValue;
     use opentelemetry::trace::{Span, TraceContextExt, Tracer, TracerProvider as _};
@@ -340,7 +460,7 @@ mod otlp {
     /// emit the `rivoli.decode` span with the summary as attributes, and flush. The
     /// endpoint + protocol come from the standard `OTEL_*` env vars. Version is the
     /// build's `CARGO_PKG_VERSION`.
-    pub fn export(summary: &ProfileSummary, tokens: usize) -> Result<()> {
+    pub fn export(summary: &ProfileSummary, tokens: usize, run: &RunInfo) -> Result<()> {
         let exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
             .build()
@@ -380,51 +500,38 @@ mod otlp {
             // is correct — there are no children for it to fail to contain.
             None => tracer.start("rivoli.decode"),
         };
-        span.set_attribute(KeyValue::new("tokens", tokens as i64));
-        span.set_attribute(KeyValue::new("tok_per_s", summary.tok_per_s));
-        span.set_attribute(KeyValue::new("hit_pct", summary.hit_pct));
-        span.set_attribute(KeyValue::new("wall_ms_per_tok", summary.wall_ms));
-        span.set_attribute(KeyValue::new("route_ms_per_tok", summary.route_ms));
-        span.set_attribute(KeyValue::new("moe_wall_ms_per_tok", summary.moe_wall_ms));
-        span.set_attribute(KeyValue::new(
-            "compute_gpu_ms_per_tok",
-            summary.compute_gpu_ms,
-        ));
-        span.set_attribute(KeyValue::new(
-            "fetch_wall_ms_per_tok",
-            summary.fetch_wall_ms,
-        ));
-        span.set_attribute(KeyValue::new("load_wait_ms_per_tok", summary.load_wait_ms));
-        span.set_attribute(KeyValue::new("launch_ms_per_tok", summary.launch_ms));
-        span.set_attribute(KeyValue::new("fetch_hidden_pct", summary.fetch_hidden_pct));
-        // The class view — the axis a dashboard actually groups by.
-        span.set_attribute(KeyValue::new("gpu_wait_ms_per_tok", summary.gpu_wait_ms));
-        span.set_attribute(KeyValue::new("io_wait_ms_per_tok", summary.io_wait_ms));
-        span.set_attribute(KeyValue::new("cpu_ms_per_tok", summary.cpu_ms));
-        span.set_attribute(KeyValue::new("cpu_launch_ms_per_tok", summary.cpu_launch_ms));
-        span.set_attribute(KeyValue::new("cpu_route_ms_per_tok", summary.cpu_route_ms));
-        span.set_attribute(KeyValue::new("cpu_submit_ms_per_tok", summary.cpu_submit_ms));
-        span.set_attribute(KeyValue::new(
-            "exposed_fetch_ms_per_tok",
-            summary.exposed_fetch_ms,
-        ));
-        span.set_attribute(KeyValue::new("route_wait_ms_per_tok", summary.route_wait_ms));
-        span.set_attribute(KeyValue::new("tail_wait_ms_per_tok", summary.tail_wait_ms));
-        span.set_attribute(KeyValue::new("tail_gpu_ms_per_tok", summary.tail_gpu_ms));
-        span.set_attribute(KeyValue::new("miss_per_tok", summary.miss_per_tok));
-        span.set_attribute(KeyValue::new("gb_per_tok", summary.gb_per_tok));
-        if let Some(swap) = summary.swap_pct {
-            span.set_attribute(KeyValue::new("swap_pct", swap));
+        // WHAT THIS RUN WAS, not what it measured. The numbers went out as metrics —
+        // repeating them here would make two sources of truth that drift, and they are
+        // not what you search a trace by. These are.
+        span.set_attribute(KeyValue::new("rivoli.model", run.model.clone()));
+        span.set_attribute(KeyValue::new("rivoli.mode", run.mode.clone()));
+        span.set_attribute(KeyValue::new("rivoli.cache_policy", run.cache_policy.clone()));
+        span.set_attribute(KeyValue::new("rivoli.attn", run.attn.clone()));
+        span.set_attribute(KeyValue::new("rivoli.topk_path", run.topk_path));
+        span.set_attribute(KeyValue::new("rivoli.moe_gain", f64::from(run.moe_gain)));
+        span.set_attribute(KeyValue::new("rivoli.2q_kin_pct", i64::from(run.two_q_kin)));
+        span.set_attribute(KeyValue::new("rivoli.2q_kout_pct", i64::from(run.two_q_kout)));
+        span.set_attribute(KeyValue::new("rivoli.sinks", run.sinks as i64));
+        span.set_attribute(KeyValue::new("rivoli.window", run.window as i64));
+        span.set_attribute(KeyValue::new("rivoli.misa_heads", run.misa_heads as i64));
+        // Absent rather than zero where zero would read as a measurement: an auto-sized
+        // budget is not "0 GiB", and (J, M) under lru is not "(0, 0)".
+        if let Some(g) = run.max_mem_gib {
+            span.set_attribute(KeyValue::new("rivoli.max_mem_gib", g as i64));
         }
-        // Replay the recorded intervals as REAL child spans with their true start/end
-        // times. This is what makes overlap visible: the reaper's `io-wait/uring-reap`
-        // bars and the decode thread's `gpu-wait/*` bars share one timeline, so a viewer
-        // shows fetch sitting *underneath* compute instead of beside it. Without this
-        // the class numbers are attributes on a single span and no viewer can draw them.
-        //
-        // Children are emitted under `span`'s context, and each carries `thread` so a
-        // viewer can lane them. They are built with explicit timestamps rather than being
-        // timed live, so recording stayed free during decode.
+        if let Some(n) = run.bench_tokens {
+            span.set_attribute(KeyValue::new("rivoli.bench_tokens", n as i64));
+        }
+        if let Some(p) = &run.prompt {
+            span.set_attribute(KeyValue::new("rivoli.prompt", p.clone()));
+        }
+        if let Some((j, m)) = run.route_jm {
+            span.set_attribute(KeyValue::new("rivoli.route_j", j as i64));
+            span.set_attribute(KeyValue::new("rivoli.route_m", m as i64));
+        }
+        // Tokens actually generated is run shape, not a measurement of speed.
+        span.set_attribute(KeyValue::new("rivoli.tokens_generated", tokens as i64));
+
         // Rebuild the tree: decode -> token N -> layer L -> the leaf intervals. Emitting
         // the leaves as 1200 direct siblings of the root is technically a trace and
         // practically unreadable; the token/layer levels are what make a waterfall
@@ -434,6 +541,10 @@ mod otlp {
         // Every span here is closed with `end_with_timestamp`. `end()` would stamp
         // `now()` and silently discard the builder's `with_end_time`.
         let cx = opentelemetry::Context::current_with_span(span);
+        let layer_states: BTreeMap<(u32, i32), super::spans::LayerState> = super::spans::drain_layers()
+            .into_iter()
+            .map(|st| ((st.tok, st.layer), st))
+            .collect();
         let mut by_tok: BTreeMap<u32, Vec<super::spans::Rec>> = BTreeMap::new();
         for r in recs {
             by_tok.entry(r.tok).or_default().push(r);
@@ -442,11 +553,17 @@ mod otlp {
             let Some((t_lo, t_hi)) = span_bounds(&tok_recs) else {
                 continue;
             };
+            // The token id, not just the index — the index says "the 7th step", the id
+            // says which token the model was actually working on.
+            let tok_id = tok_recs.first().map(|r| r.tok_id).unwrap_or(0);
             let mut tok_span = tracer
                 .span_builder(format!("token {tok_i}"))
                 .with_start_time(t_lo)
                 .with_end_time(t_hi)
-                .with_attributes([KeyValue::new("token", tok_i as i64)])
+                .with_attributes([
+                    KeyValue::new("rivoli.token_index", tok_i as i64),
+                    KeyValue::new("rivoli.token_id", i64::from(tok_id)),
+                ])
                 .start_with_context(&tracer, &cx);
             let tok_cx = opentelemetry::Context::current_with_span(tok_span);
 
@@ -463,11 +580,30 @@ mod otlp {
                     let Some((l_lo, l_hi)) = span_bounds(&layer_recs) else {
                         continue;
                     };
+                    // Expert composition: residency x format. This is what explains a
+                    // layer's cost — eight cold int4 experts and eight warm vq3 ones are
+                    // different animals — and the counts are recorded at submit time
+                    // because that is the only point where both are known.
+                    let mut attrs = vec![KeyValue::new("rivoli.layer", layer_i as i64)];
+                    if let Some(st) = layer_states.get(&(tok_i, layer_i)) {
+                        attrs.push(KeyValue::new("experts.cold.int4", i64::from(st.cold_i4)));
+                        attrs.push(KeyValue::new("experts.warm.int4", i64::from(st.warm_i4)));
+                        attrs.push(KeyValue::new("experts.cold.int3_vq", i64::from(st.cold_vq3)));
+                        attrs.push(KeyValue::new("experts.warm.int3_vq", i64::from(st.warm_vq3)));
+                        attrs.push(KeyValue::new(
+                            "experts.cold",
+                            i64::from(st.cold_i4 + st.cold_vq3),
+                        ));
+                        attrs.push(KeyValue::new(
+                            "experts.total",
+                            i64::from(st.cold_i4 + st.warm_i4 + st.cold_vq3 + st.warm_vq3),
+                        ));
+                    }
                     let ls = tracer
                         .span_builder(format!("layer {layer_i}"))
                         .with_start_time(l_lo)
                         .with_end_time(l_hi)
-                        .with_attributes([KeyValue::new("layer", layer_i as i64)])
+                        .with_attributes(attrs)
                         .start_with_context(&tracer, &tok_cx);
                     let c = opentelemetry::Context::current_with_span(ls);
                     let mut ls = c.span();
@@ -493,8 +629,9 @@ mod otlp {
         if truncated {
             span.set_attribute(KeyValue::new("spans_truncated", true));
             tracing::warn!(
-                "RIVOLI_SPANS cap reached after {n} intervals — the exported timeline \
-                 covers only the start of the decode, not all of it"
+                "RIVOLI_SPANS cap reached after {n} intervals — the sampling stride \
+                 under-estimated spans/token, so the exported timeline is missing the \
+                 LATER sampled tokens. Raise RIVOLI_SPANS or the per_tok estimate."
             );
         }
         match bounds {

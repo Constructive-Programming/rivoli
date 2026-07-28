@@ -233,6 +233,15 @@ fn main() -> Result<()> {
     // Bound before `a` is partially moved into `discover` below.
     let (a_ppl, a_ppl_out) = (a.ppl.clone(), a.ppl_out.clone());
     let a_moe_gain = a.moe_gain;
+    // Bound here for the OTLP root span's run-identity attributes: `a` is partially
+    // moved into `discover` below, and `cfg` does not keep all of these verbatim.
+    let a_model = a.model.clone();
+    let a_cache_policy = a.cache_policy.clone();
+    let a_attn = format!("{attn:?}").to_lowercase();
+    let (a_max_mem, a_bench) = (a.max_mem, a.bench);
+    let a_route = a.route;
+    let (a_2q_kin, a_2q_kout) = (a.two_q_kin, a.two_q_kout);
+    let (a_sinks, a_window, a_misa_heads) = (a.sinks, a.window, a.misa_heads);
     #[cfg(feature = "trace")]
     let checksum_x = a.checksum_x;
     #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
@@ -513,7 +522,27 @@ fn main() -> Result<()> {
         // OTLP: one decode span carrying the always-on summary (opt-in via
         // OTEL_EXPORTER_OTLP_ENDPOINT; log-only otherwise). Exported synchronously on
         // drop — no async runtime.
-        rivoli::telemetry::export_decode(&summary, ids.len());
+        // The run's identity for the root span. `route_jm` is Some only under top-m,
+        // which is the only policy that substitutes — a (4, 9) next to lru would read as
+        // a setting that did something.
+        let run = rivoli::telemetry::RunInfo {
+            model: a_model.clone(),
+            mode: cfg.mode.to_string(),
+            cache_policy: a_cache_policy.clone(),
+            attn: a_attn.clone(),
+            topk_path: summary.topk_path,
+            max_mem_gib: a_max_mem,
+            bench_tokens: a_bench,
+            prompt: cfg.prompt.clone(),
+            moe_gain: a_moe_gain,
+            route_jm: (a_cache_policy == "top-m").then_some((a_route.j, a_route.m)),
+            two_q_kin: a_2q_kin,
+            two_q_kout: a_2q_kout,
+            sinks: a_sinks,
+            window: a_window,
+            misa_heads: a_misa_heads,
+        };
+        rivoli::telemetry::export_decode(&summary, ids.len(), &run);
         info!("{bench_prompt}{}", tok.decode_all(&ids)?);
         Ok(())
     }
