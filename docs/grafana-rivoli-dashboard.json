@@ -1,0 +1,270 @@
+{
+  "title": "rivoli — decode profile",
+  "uid": "rivoli-decode",
+  "tags": ["rivoli", "llm", "gpu"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "editable": true,
+  "refresh": "",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROM",
+        "label": "Metrics source",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0
+      },
+      {
+        "name": "DS_TEMPO",
+        "label": "Trace source",
+        "type": "datasource",
+        "query": "tempo",
+        "current": {},
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "text",
+      "title": "How to read this",
+      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "**The class series OVERLAP — never stack them.** `io-wait` runs on the reaper thread concurrently with the decode thread, so it routinely exceeds 100% of wall; that is the streaming design working, not an error. Only the **phase** row (`route`/`moe`/`tail`) partitions wall and may be stacked.\n\n**`gpu-wait` is not GPU utilisation.** It is the host blocked in a device join. Measured against `rocm-smi`, gpu-wait reads ~95% of wall while the device is ~84% busy — the ~11-point gap is launch/queue-drain overhead.\n\nNo residual is reported anywhere: unattributed time is absent rather than folded into a bucket. See `docs/PERF.md`."
+      }
+    },
+
+    {
+      "type": "stat",
+      "title": "tok/s",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 5 },
+      "fieldConfig": { "defaults": { "decimals": 2, "unit": "none" } },
+      "targets": [{ "expr": "rivoli_tok_per_s", "legendFormat": "tok/s", "refId": "A" }]
+    },
+    {
+      "type": "stat",
+      "title": "wall / tok",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 5 },
+      "fieldConfig": { "defaults": { "decimals": 1, "unit": "ms" } },
+      "targets": [
+        { "expr": "rivoli_ms_per_tok{class=\"wall\"}", "legendFormat": "wall", "refId": "A" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "expert hit %",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 5 },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 1,
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 60 },
+              { "color": "green", "value": 75 }
+            ]
+          }
+        }
+      },
+      "targets": [{ "expr": "rivoli_hit_pct", "legendFormat": "hit", "refId": "A" }]
+    },
+    {
+      "type": "stat",
+      "title": "fetch hidden %",
+      "description": "Share of reaper fetch buried behind compute. Derived from moe_wall - compute_gpu, so treat as a gauge, not a hard number — prefer the io-wait series.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 5 },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 1,
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 80 },
+              { "color": "green", "value": 92 }
+            ]
+          }
+        }
+      },
+      "targets": [{ "expr": "rivoli_fetch_hidden_pct", "legendFormat": "hidden", "refId": "A" }]
+    },
+    {
+      "type": "stat",
+      "title": "GB / tok",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 5 },
+      "fieldConfig": { "defaults": { "decimals": 2, "unit": "decgbytes" } },
+      "targets": [{ "expr": "rivoli_gb_per_tok", "legendFormat": "GB", "refId": "A" }]
+    },
+    {
+      "type": "stat",
+      "title": "host CPU share",
+      "description": "Measured host compute as a share of wall. Historically ~2%: this engine is GPU-bound.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 5 },
+      "fieldConfig": { "defaults": { "decimals": 1, "unit": "percent" } },
+      "targets": [
+        {
+          "expr": "100 * rivoli_ms_per_tok{class=\"cpu\"} / rivoli_ms_per_tok{class=\"wall\"}",
+          "legendFormat": "cpu %",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "type": "timeseries",
+      "title": "CLASS — what the machine was doing (overlapping spans; DO NOT STACK)",
+      "description": "gpu-wait = decode thread blocked in a device join. io-wait = reaper thread blocked in io_uring, measured at the ring; it overlaps everything else and can exceed wall. cpu = measured host-compute regions. No residual.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 9 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "stacking": { "mode": "none" },
+            "pointSize": 6,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "gpu-wait" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "io-wait" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "cpu" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "purple" } }]
+          }
+        ]
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "mean"] } },
+      "targets": [
+        {
+          "expr": "rivoli_ms_per_tok{class=~\"gpu-wait|io-wait|cpu\"}",
+          "legendFormat": "{{class}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "PHASE — where the time went (partitions wall; stacking is valid here)",
+      "description": "route = MLA attention. moe = routed-expert compute, ~60-67% of wall and the only phase worth a multiplier. tail = final norm + lm_head + argmax.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 9 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 35,
+            "stacking": { "mode": "normal" },
+            "showPoints": "auto"
+          }
+        }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "mean"] } },
+      "targets": [
+        {
+          "expr": "rivoli_ms_per_tok{class=~\"phase/.*\"}",
+          "legendFormat": "{{class}}",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "type": "timeseries",
+      "title": "CPU breakdown — every term stamped, none derived",
+      "description": "launch = kernel-issue driver calls (~1.5k/tok). route = route_into top-k over 256 experts. submit = residency + policy bookkeeping. tokio-poll = expert-stream poll. Sums to the `cpu` series above.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "decimals": 2,
+          "custom": { "drawStyle": "line", "fillOpacity": 30, "stacking": { "mode": "normal" } }
+        }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last"] } },
+      "targets": [
+        {
+          "expr": "rivoli_ms_per_tok{class=~\"cpu/.*\"}",
+          "legendFormat": "{{class}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Splits — the questions the phase buckets could not answer",
+      "description": "route-gpu-wait vs route total shows route is attention GPU time, not host routing. tail-wait vs tail-gpu shows how much of the tail's blocking call is real GPU work. exposed-fetch is the only fetch that costs wall.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "decimals": 2,
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0 }
+        }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last"] } },
+      "targets": [
+        {
+          "expr": "rivoli_ms_per_tok{class=~\"split/.*\"}",
+          "legendFormat": "{{class}}",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "type": "timeseries",
+      "title": "Residency — misses and bytes per token",
+      "description": "A miss is one expert streamed from NVMe (~15.3 MB vq3 / 20.1 MB i4). Watch this alongside hit% when tuning the cache policy.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 26 },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        { "expr": "rivoli_miss_per_tok", "legendFormat": "misses/tok", "refId": "A" },
+        { "expr": "rivoli_gb_per_tok", "legendFormat": "GB/tok", "refId": "B" }
+      ]
+    },
+    {
+      "type": "traces",
+      "title": "Decode timeline — where the overlap is actually visible",
+      "description": "Open a rivoli.decode trace. io-wait/uring-reap bars (thread=reaper) sitting UNDER the gpu-wait bars is hidden fetch; sticking out past them is exposed fetch. Requires RIVOLI_SPANS to have been set on the run.",
+      "datasource": { "type": "tempo", "uid": "${DS_TEMPO}" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 26 },
+      "targets": [
+        {
+          "queryType": "traceql",
+          "query": "{ resource.service.name = \"rivoli\" && name = \"rivoli.decode\" }",
+          "limit": 20,
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}
