@@ -47,6 +47,10 @@ struct Args {
     /// `--moe-gain <g>`: scale the whole MoE branch by `g` before the residual add.
     /// An EXPERIMENT knob, not a tuning parameter — see kernels/fwd.hip::vaxpy.
     moe_gain: f32,
+    /// Encode the prompt RAW, with no GLM turn framing. Reproduces every benchmark
+    /// number recorded before templating existed — and those runs could never stop, so
+    /// this is also how you re-measure the degeneration it caused.
+    raw_prompt: bool,
     /// DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
     #[cfg(feature = "trace")]
     checksum_x: bool,
@@ -57,7 +61,7 @@ fn parse_args() -> Result<Args> {
          [--mode int3-vq|int4|hybrid] [--direct-vmm-dma] \
          [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc|top-m] [--2q-kin <pct>] \
          [--2q-kout <pct>] [--route-j <n>] [--route-m <n>] [--max-mem <GiB>] \
-         [--ppl <text-file>] [--ppl-out <path>] \
+         [--ppl <text-file>] [--ppl-out <path>] [--raw-prompt] \
          [--attn auto|dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>] \
          [--moe-gain <g>]";
     let mut model = None;
@@ -80,6 +84,7 @@ fn parse_args() -> Result<Args> {
         window: 8192,
         misa_heads: 8, // the MISA paper's validated GLM setting
         moe_gain: 1.0, // 1.0 = the engine's normal arithmetic, bit-identical (vadd, not vaxpy)
+        raw_prompt: false,
         #[cfg(feature = "trace")]
         checksum_x: false,
     };
@@ -171,6 +176,7 @@ fn parse_args() -> Result<Args> {
                     bail!("--moe-gain {} outside [0.5, 1.5]", a.moe_gain);
                 }
             }
+            "--raw-prompt" => a.raw_prompt = true,
             "--misa-heads" => {
                 a.misa_heads = args
                     .next()
@@ -233,6 +239,7 @@ fn main() -> Result<()> {
     // Bound before `a` is partially moved into `discover` below.
     let (a_ppl, a_ppl_out) = (a.ppl.clone(), a.ppl_out.clone());
     let a_moe_gain = a.moe_gain;
+    let a_raw_prompt = a.raw_prompt;
     // Bound here for the OTLP root span's run-identity attributes: `a` is partially
     // moved into `discover` below, and `cfg` does not keep all of these verbatim.
     let a_model = a.model.clone();
@@ -348,10 +355,19 @@ fn main() -> Result<()> {
     // Tokenizer (tokenizer.json + generation_config.json, copied into the artifact).
     let bench_prompt = cfg.prompt.as_deref().unwrap_or("The sky is blue because");
     let tok = rivoli::tokenizer::Tokenizer::load(&cfg.model)?;
-    let prompt_ids = tok.encode(bench_prompt)?;
+    // Chat framing by default: raw text leaves the model outside any assistant turn, so
+    // its EOS ids (two of which are turn boundaries) are unreachable and decode runs to
+    // the token limit every time. `--ppl` deliberately does NOT go through here — it
+    // scores a fixed corpus, not a turn.
+    let prompt_ids = if a_raw_prompt {
+        tok.encode(bench_prompt)?
+    } else {
+        tok.encode_chat(bench_prompt)?
+    };
     info!(
-        "tokenizer: prompt {bench_prompt:?} -> {} tokens {:?}; eos={:?}",
+        "tokenizer: prompt {bench_prompt:?} -> {} tokens{} {:?}; eos={:?}",
         prompt_ids.len(),
+        if a_raw_prompt { " RAW (no chat framing — decode cannot stop on EOS)" } else { " chat-framed" },
         &prompt_ids[..prompt_ids.len().min(12)],
         tok.eos
     );

@@ -393,12 +393,26 @@ pub fn repetition_report(text: &str) -> RepetitionReport {
     }
 }
 
-/// Does this generation look structurally degenerate? A line repeated more than 20 times,
-/// or a distinct-word ratio under 0.30. Both thresholds sit far from the observed healthy
-/// band (top_line 1–3, distinct 0.42–0.53) and far from the observed broken band
-/// (top_line 25–329, distinct 0.12–0.29).
+/// Does this generation look structurally degenerate? **A repeated line only.**
+///
+/// The distinct-word ratio was in this test and has been REMOVED: type-token ratio falls
+/// with length in perfectly healthy text, so a flat threshold is length-confounded.
+/// Measured on real prose from `tests/ppl-corpus-5000.txt`: 0.593 at 300 words, 0.517 at
+/// 800, 0.455 at 1500, **0.376 at 3000** — already under a 0.42 "healthy band" that was
+/// derived from 512-token samples. It flagged a 2048-token run whose line repetition
+/// (x4) and longest repeated block (175 of 2048) were both healthy.
+///
+/// A window-based variant (MATTR-200) fixes the length confound and is still not usable
+/// alone: the 10k DSA run, 45% of whose output was a verbatim duplicate, scored **0.701 —
+/// higher than real prose** — because a long-range restart looks diverse inside every
+/// 200-word window. Local and long-range repetition need different instruments.
+///
+/// So the working set is two complementary EXACT signals, and neither is a diversity
+/// measure: `top_line` here for local template loops (healthy 1–4, broken 25–329), and
+/// [`longest_repeated_block`] for long-range restarts (healthy 6–18, broken 4544). Both
+/// observed failures are caught by one or the other.
 pub fn is_degenerate(r: &RepetitionReport) -> bool {
-    r.top_line > 20 || r.distinct < 0.30
+    r.top_line > 20
 }
 
 /// The run's arguments — what belongs on the root span. A span's attributes should say
@@ -1021,6 +1035,23 @@ mod rep_tests {
         let r = repetition_report(&loopy);
         assert!(r.top_line > 20, "top_line was {}", r.top_line);
         assert!(is_degenerate(&r));
+
+        // Length must not by itself trip the alarm. Long healthy text has a LOW
+        // distinct-word ratio (real prose is 0.376 at 3000 words) and must still pass,
+        // which is why `is_degenerate` gates on line repetition alone.
+        let mut long_ok = String::new();
+        for i in 0..400 {
+            long_ok.push_str(&format!(
+                "Page {i} is mapped lazily so untouched allocations cost nothing at all.\n"
+            ));
+        }
+        let r = repetition_report(&long_ok);
+        assert!(r.distinct < 0.30, "distinct was {} — pick a lower-entropy filler", r.distinct);
+        assert!(r.top_line <= 20, "top_line was {}", r.top_line);
+        assert!(
+            !is_degenerate(&r),
+            "a flat distinct-ratio threshold would false-positive here"
+        );
 
         // Healthy prose: no line repeats, high distinct ratio.
         let ok = "Virtual memory gives each process a private address space. \

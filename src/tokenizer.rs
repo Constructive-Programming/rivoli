@@ -47,8 +47,53 @@ impl Tokenizer {
         Ok(ids)
     }
 
-    /// Encode prompt text to token ids (no special tokens added — GLM chat
-    /// templating is a later concern; M1 just needs a coherent continuation).
+    /// GLM turn framing: `[gMASK] <sop> <|user|> \n {text} <|assistant|> \n`.
+    ///
+    /// **Without this the model can never stop.** Two of its three EOS ids are turn
+    /// boundaries (`<|user|>` 154827, `<|observation|>` 154829) and the third is
+    /// `<|endoftext|>` — all of which an instruct model emits at the end of an ASSISTANT
+    /// TURN. Fed raw text it is doing document continuation, is never in a turn, and has
+    /// no reason to emit any of them: across 56 benchmark runs not one terminated
+    /// naturally, every one ran to its token limit. Forced to keep writing past the end
+    /// of its answer it drifts into list scaffolding and then loops
+    /// (`**Memory Product.**` x329) — which is what invalidated every matrix cell above
+    /// 2048 tokens. See benchmarks.md's retraction.
+    ///
+    /// Built from token IDS rather than by encoding the literal template text, so it does
+    /// not depend on the tokenizer choosing to match `[gMASK]` as a special token inside a
+    /// string. No Jinja either: the checkpoint ships no `chat_template`, and GLM's turn
+    /// structure is four tokens of framing.
+    pub fn encode_chat(&self, text: &str) -> Result<Vec<u32>> {
+        // Missing any of these means an artifact whose tokenizer predates the chat
+        // tokens; fall back rather than fail, but say so — silent raw encoding is the
+        // bug this function exists to fix.
+        let ids: Option<Vec<u32>> = ["[gMASK]", "<sop>", "<|user|>", "<|assistant|>"]
+            .iter()
+            .map(|t| self.inner.token_to_id(t))
+            .collect();
+        let Some(sp) = ids else {
+            warn!(
+                "tokenizer lacks GLM chat tokens ([gMASK]/<sop>/<|user|>/<|assistant|>) — \
+                 encoding the prompt RAW. Decode will not stop on EOS."
+            );
+            return self.encode(text);
+        };
+        let nl = self.encode("\n")?;
+        let body = self.encode(text)?;
+        let mut out = Vec::with_capacity(body.len() + nl.len() * 2 + 4);
+        out.push(sp[0]); // [gMASK]
+        out.push(sp[1]); // <sop>
+        out.push(sp[2]); // <|user|>
+        out.extend_from_slice(&nl);
+        out.extend_from_slice(&body);
+        out.push(sp[3]); // <|assistant|>
+        out.extend_from_slice(&nl);
+        Ok(out)
+    }
+
+    /// Encode prompt text to token ids with NO special tokens — raw continuation.
+    /// Used by `--ppl` (which scores a fixed corpus, not a chat turn) and by
+    /// `--raw-prompt` for reproducing pre-templating benchmark numbers.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let enc = self
             .inner
