@@ -14,7 +14,8 @@ use crate::device::DeviceBuf;
 use crate::gpustream::{HipEvent, HipStream, Signal, stream_signal};
 use crate::hip::{
     ExpertDesc, device_sync, launch_append_kv, launch_argmax, launch_attend,
-    launch_embed_i8_row, launch_gather_rope, launch_gemv_f32, launch_gemv_fp8, launch_gemv_i8,
+    launch_embed_i8_row, launch_flag_nonfinite, launch_gather_rope, launch_gemv_f32,
+    launch_gemv_fp8, launch_gemv_i8,
     launch_index_append, launch_index_head_route, launch_index_pool_push, launch_index_score,
     launch_index_topk, launch_layernorm, launch_mla_absorb_fp8, launch_mla_value_fp8,
     launch_moe_expert_range, launch_moe_expert_range_i4, launch_moe_reduce, launch_rmsnorm,
@@ -606,7 +607,18 @@ impl<'a> GpuEngine<'a> {
             descs_buf: DeviceBuf::new(slots * std::mem::size_of::<ExpertDesc>())?,
             wexpert_buf: f(slots)?,
             logits: f(cfg.vocab)?,
-            argmax_dev: DeviceBuf::new(8)?, // [i32 index | f32 value]
+            // [i32 index | f32 value | u32 nonfinite-tag]. The tag rides this buffer
+            // deliberately: the tail's D2H is already paid, so localising the NaN costs
+            // no extra sync — and a sync is exactly what masks it (--checksum-x makes
+            // the fault disappear entirely).
+            argmax_dev: {
+                // hipMalloc does NOT zero. Tag 0 means "clean", so an unzeroed byte
+                // would fabricate a layer coordinate on the first failure — the probe
+                // would confidently point at the wrong place.
+                let mut b = DeviceBuf::new(12)?;
+                b.copy_in_at(0, &[0u8; 12])?;
+                b
+            },
             lc,
             lc_scale,
             rc,
@@ -623,7 +635,7 @@ impl<'a> GpuEngine<'a> {
             descs_vq: Vec::with_capacity(slots),
             fmt: Vec::with_capacity(slots),
             gl_host: Vec::with_capacity(cfg.n_experts * 4),
-            argmax_host: Vec::with_capacity(8),
+            argmax_host: Vec::with_capacity(12),
             prof: Profile::default(),
             compute_stream: HipStream::new()?,
             moe_ev_start: HipEvent::new()?,
@@ -1482,6 +1494,18 @@ impl<'a> GpuEngine<'a> {
             let e_moe = std::time::Instant::now();
             self.prof.moe_wall_ns += e_moe.duration_since(t).as_nanos();
             crate::telemetry::spans::record("gpu-wait/end-of-layer-sync", "decode", t, e_moe);
+            // Localise a non-finite residual to the earliest (pos, layer) that produced
+            // one. `atomicCAS(flag, 0, tag)` keeps the FIRST, and tag 0 is reserved for
+            // "clean" so the tag is offset by 1. One tiny kernel per layer, no sync.
+            // SAFETY: `x` is `hidden` device f32; the flag is 4 bytes inside argmax_dev.
+            unsafe {
+                launch_flag_nonfinite(
+                    xp,
+                    hidden,
+                    1 + (pos as u32) * 256 + l as u32,
+                    self.argmax_dev.ptr_mut().add(8) as *mut u32,
+                )?;
+            }
             // Both MoE span events retired by the sync — read the compute-stream span
             // (MoE layers only; dense layers never recorded them).
             if dense_mlp.is_none() {
@@ -1656,7 +1680,11 @@ impl<'a> GpuEngine<'a> {
             let ms = HipEvent::elapsed_ms(&self.tail_ev_start, &self.tail_ev_end)?;
             self.prof.tail_gpu_ns += (ms as f64 * 1e6) as u128;
         }
-        debug_assert_eq!(self.argmax_host.len(), 8, "argmax result must be 8 bytes");
+        debug_assert_eq!(
+            self.argmax_host.len(),
+            12,
+            "argmax result must be 12 bytes: [idx | val | nonfinite tag]"
+        );
         let idx = i32::from_le_bytes([
             self.argmax_host[0],
             self.argmax_host[1],
@@ -1670,7 +1698,26 @@ impl<'a> GpuEngine<'a> {
             self.argmax_host[7],
         ]);
         if !val.is_finite() {
-            bail!("logits are non-finite (NaN/Inf in the GPU forward pass)");
+            // The tag rode the same D2H, so this costs nothing and turns "somewhere in
+            // 78 layers x every position" into a coordinate.
+            let tag = u32::from_le_bytes([
+                self.argmax_host[8],
+                self.argmax_host[9],
+                self.argmax_host[10],
+                self.argmax_host[11],
+            ]);
+            let where_ = if tag == 0 {
+                "no layer residual was non-finite — the fault is AFTER the last layer \
+                 (final rmsnorm, lm_head or argmax itself), not in the MoE/attention stack"
+                    .to_string()
+            } else {
+                format!(
+                    "first non-finite residual at pos={} layer={}",
+                    (tag - 1) / 256,
+                    (tag - 1) % 256
+                )
+            };
+            bail!("logits are non-finite (NaN/Inf in the GPU forward pass): {where_}");
         }
         debug_assert!(idx >= 0, "argmax returned negative index {idx}");
         Ok(idx as u32)

@@ -172,6 +172,7 @@ unsafe extern "C" {
         ropn: i32,
     ) -> i32;
     fn rivoli_vadd(x: *mut f32, y: *const f32, n: i32) -> i32;
+    fn rivoli_flag_nonfinite(x: *const f32, n: i32, tag: u32, flag: *mut u32) -> i32;
     fn rivoli_vaxpy(x: *mut f32, y: *const f32, g: f32, n: i32) -> i32;
     fn rivoli_argmax(logits: *const f32, n: i32, out_idx: *mut i32, out_val: *mut f32) -> i32;
 
@@ -630,6 +631,25 @@ pub unsafe fn launch_gather_rope(
 ///
 /// # Safety
 /// Device pointers `x`, `y` (each `n` f32) live until the next [`device_sync`].
+/// Record `tag` in `*flag` if any of `x[0..n]` is non-finite (first writer wins).
+///
+/// The localiser for the intermittent non-finite-logits bug. Adds no sync — the caller
+/// reads `flag` on the argmax D2H the tail already pays — because the host-copy
+/// alternative (`--checksum-x`) perturbs timing enough to hide the fault entirely.
+///
+/// # Safety
+/// `x` must be `n` device f32; `flag` one device u32, zeroed before the run.
+pub unsafe fn launch_flag_nonfinite(
+    x: *const f32,
+    n: usize,
+    tag: u32,
+    flag: *mut u32,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r = unsafe { rivoli_flag_nonfinite(x, n as i32, tag, flag) };
+    check(r, "flag_nonfinite")
+}
+
 pub unsafe fn launch_vadd(x: *mut f32, y: *const f32, n: usize) -> Result<()> {
     // SAFETY: caller's pointer contract.
     let r = unsafe { rivoli_vadd(x, y, n as i32) };

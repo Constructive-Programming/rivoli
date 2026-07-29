@@ -206,3 +206,32 @@ extern "C" int rivoli_argmax(
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
+
+// If any of `x[0..n]` is non-finite, record `tag` in `*flag` — FIRST writer wins, so the
+// value names the EARLIEST layer that went bad rather than the last.
+//
+// Exists because the production guard fires only at `argmax`, i.e. after every layer of
+// every position, and so reports that a run is broken without saying where. The obvious
+// alternative — copying `x` to the host per layer (`--checksum-x`) — perturbs timing
+// enough to MASK the intermittent NaN entirely: a config that fails without it produced
+// zero non-finite values across 78 layers of every position with it. So this stays on the
+// device and adds NO sync: the flag rides the argmax D2H the tail already pays.
+extern "C" __global__ void flag_nonfinite(
+    const float* __restrict__ x, int n, unsigned tag, unsigned* __restrict__ flag) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = x[i];
+    // isfinite() on a NaN or +/-Inf; the compare form avoids depending on -ffast-math
+    // having left isfinite() meaningful.
+    if (!(v > -INFINITY && v < INFINITY)) {
+        atomicCAS(flag, 0u, tag);
+    }
+}
+
+extern "C" int rivoli_flag_nonfinite(const float* x, int n, unsigned tag, unsigned* flag) {
+    if (n <= 0) return 1001;
+    hipGetLastError();
+    hipLaunchKernelGGL(flag_nonfinite, dim3((n + 255) / 256), dim3(256), 0, 0, x, n, tag, flag);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
