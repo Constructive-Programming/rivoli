@@ -472,6 +472,10 @@ pub struct GpuEngine<'a> {
     /// `tail_wait_ns`.
     tail_ev_start: HipEvent,
     tail_ev_end: HipEvent,
+    /// One-shot latch so the first non-finite residual is reported once, not 78x per
+    /// position for the rest of the run (`trace` only).
+    #[cfg(feature = "trace")]
+    nan_seen: bool,
     /// Tail events recorded this token and not yet read. False on the very first
     /// `argmax` (the prompt's forward has run, but so has its `record`) — kept as a
     /// guard anyway so an early-exit path cannot read an unrecorded event.
@@ -624,6 +628,8 @@ impl<'a> GpuEngine<'a> {
             compute_stream: HipStream::new()?,
             moe_ev_start: HipEvent::new()?,
             moe_ev_end: HipEvent::new()?,
+            #[cfg(feature = "trace")]
+            nan_seen: false,
             tail_ev_start: HipEvent::new()?,
             tail_ev_end: HipEvent::new()?,
             tail_ev_pending: false,
@@ -1490,7 +1496,12 @@ impl<'a> GpuEngine<'a> {
                 self.prof.idx_gpu_ns += (ms as f64 * 1e6) as u128;
                 self.prof.idx_layers += 1;
             }
-            // DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
+            // DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer,
+            // and — the reason this also scans for non-finite values — localise the
+            // intermittent NaN. The production guard only fires at `argmax`, i.e. after
+            // all 78 layers of all ~70 prefill positions, so it says the run is broken
+            // without saying where. This names the first (pos, layer) that goes bad, and
+            // whether that layer had cold misses.
             #[cfg(feature = "trace")]
             if self.checksum_x {
                 let n = hidden * 4;
@@ -1501,7 +1512,24 @@ impl<'a> GpuEngine<'a> {
                     hh ^= b as u64;
                     hh = hh.wrapping_mul(0x1000_0000_01b3);
                 }
-                tracing::info!("XSUM pos={pos} l={l} x={hh:016x}");
+                let bad = self
+                    .ck_buf
+                    .chunks_exact(4)
+                    .filter(|c| {
+                        !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_finite()
+                    })
+                    .count();
+                if bad > 0 && !self.nan_seen {
+                    self.nan_seen = true;
+                    tracing::error!(
+                        "FIRST NON-FINITE RESIDUAL at pos={pos} layer={l}: {bad}/{hidden} \
+                         elements. misses this layer={}, dense={}. Everything downstream \
+                         is poisoned, so only this first report localises the fault.",
+                        self.prof.fetch_n,
+                        dense_mlp.is_some(),
+                    );
+                }
+                tracing::info!("XSUM pos={pos} l={l} x={hh:016x} nonfinite={bad}");
             }
         }
 
