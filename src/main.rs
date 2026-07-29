@@ -542,7 +542,29 @@ fn main() -> Result<()> {
                 ids.len(),
             );
         }
-        tracing::info!("generation: {} tokens, longest repeated block {lrb}", ids.len());
+        // Structural repetition, the signal the two exact-matching detectors above are
+        // blind to. Both passed a run that was 329 repetitions of "**Memory Product.**"
+        // with a varying label, so this is not a belt-and-braces addition — it is the
+        // detector that actually works on the common failure shape.
+        let text = tok.decode_all(&ids).unwrap_or_default();
+        let rep = rivoli::telemetry::repetition_report(&text);
+        tracing::info!(
+            "generation: {} tokens, longest repeated block {lrb}, top-line x{}, distinct {:.3}",
+            ids.len(),
+            rep.top_line,
+            rep.distinct,
+        );
+        if rivoli::telemetry::is_degenerate(&rep) {
+            tracing::warn!(
+                "STRUCTURALLY DEGENERATE: one line repeats {}x and the distinct-word ratio \
+                 is {:.3} (healthy band 0.42-0.53). This is a near-miss loop — a varying \
+                 slot in a repeated template — which the verbatim-cycle and \
+                 longest-repeated-block checks CANNOT see. tok/s is not usable: the hit \
+                 rate rises as the output collapses.",
+                rep.top_line,
+                rep.distinct,
+            );
+        }
         if let Some(d) = degenerate {
             tracing::warn!(
                 "DEGENERATE OUTPUT: the last {} of {} generated tokens are {} verbatim \

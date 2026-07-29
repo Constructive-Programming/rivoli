@@ -339,6 +339,68 @@ pub fn detect_loop(ids: &[u32], min_repeats: usize, max_period: usize) -> Option
     None
 }
 
+/// Structural repetition — the signal both exact-matching detectors are blind to.
+///
+/// **Added because [`detect_loop`] and [`longest_repeated_block`] BOTH passed a run
+/// whose output was 329 repetitions of `**Memory Product.**`.** The loop had a varying
+/// slot — `**Memory Phase:**`, `**Memory State:**`, `**Memory Status:**`, … — so there
+/// was no verbatim cycle and the longest exact block was only 142 tokens. A near-miss
+/// loop with one changing token is the most common real degeneration shape there is, and
+/// exact matching cannot see it.
+///
+/// Two cheap signals that can:
+/// - `top_line`: how many times the single most repeated line occurs. 1 on healthy
+///   output; 38 / 53 / 329 as one run degenerated over 2048 / 4096 / 10000 tokens.
+/// - `distinct`: distinct-word ratio. 0.43–0.53 healthy, 0.12–0.29 degenerate, and it
+///   fell monotonically (0.474 → 0.366 → 0.288 → 0.244) across that same run.
+///
+/// On `distinct`: [INT4.md](../docs/INT4.md) warns that a distinct-token gate INVERTS —
+/// hybrid has the worst ratio in the engine and the second-best perplexity. That warning
+/// is about ranking *healthy* configs against each other, where the ratio does not track
+/// quality. Reading it as "never use distinct ratio" was an over-generalisation, and it
+/// cost four rounds of a benchmark matrix: in the 0.24 regime the output is visibly
+/// broken, and this was the one instrument that would have said so. It is an ALARM, not
+/// a ranking metric.
+#[derive(Debug, Clone, Copy)]
+pub struct RepetitionReport {
+    pub top_line: usize,
+    pub distinct: f64,
+}
+
+/// Structural-repetition signals over generated TEXT (not tokens — the varying slot is a
+/// token-level difference, which is exactly why token-level exact matching misses it).
+pub fn repetition_report(text: &str) -> RepetitionReport {
+    use std::collections::HashMap;
+    let mut lines: HashMap<&str, usize> = HashMap::new();
+    for l in text.lines() {
+        let l = l.trim();
+        if l.len() > 3 {
+            *lines.entry(l).or_default() += 1;
+        }
+    }
+    let top_line = lines.values().copied().max().unwrap_or(0);
+    let mut words = 0usize;
+    let mut uniq = std::collections::HashSet::new();
+    for w in text.split(|c: char| !c.is_alphabetic()) {
+        if !w.is_empty() {
+            words += 1;
+            uniq.insert(w.to_ascii_lowercase());
+        }
+    }
+    RepetitionReport {
+        top_line,
+        distinct: if words == 0 { 1.0 } else { uniq.len() as f64 / words as f64 },
+    }
+}
+
+/// Does this generation look structurally degenerate? A line repeated more than 20 times,
+/// or a distinct-word ratio under 0.30. Both thresholds sit far from the observed healthy
+/// band (top_line 1–3, distinct 0.42–0.53) and far from the observed broken band
+/// (top_line 25–329, distinct 0.12–0.29).
+pub fn is_degenerate(r: &RepetitionReport) -> bool {
+    r.top_line > 20 || r.distinct < 0.30
+}
+
 /// The run's arguments — what belongs on the root span. A span's attributes should say
 /// WHAT THIS RUN WAS so traces can be found and compared; the numbers it produced are
 /// metrics, and duplicating them here just makes two sources of truth that can drift.
@@ -935,5 +997,41 @@ mod lrb_tests {
         // Bounded by n/2 — a block cannot occur twice if it is longer than half.
         let long: Vec<u32> = (0..100).collect();
         assert_eq!(longest_repeated_block(&long), 0);
+    }
+}
+
+#[cfg(test)]
+mod rep_tests {
+    use super::{is_degenerate, repetition_report};
+
+    #[test]
+    fn catches_the_varying_slot_loop_that_exact_matching_missed() {
+        // The real failure: structure repeats, one slot varies, so no verbatim cycle
+        // exists and the longest exact block is short. Both other detectors pass this.
+        let labels = [
+            "Phase", "State", "Status", "Mode", "Form", "Shape", "Size", "Scale", "Scope",
+            "Range", "Navigating", "Conducting", "Managing", "Administering", "Organizing",
+            "Coordinating", "Arranging", "Ordering", "Systematizing", "Structuring",
+            "Sequencing", "Aligning",
+        ];
+        let mut loopy = String::new();
+        for l in labels.iter().cycle().take(60) {
+            loopy.push_str(&format!("**Memory {l}:**\n**Memory Product.**\n\n"));
+        }
+        let r = repetition_report(&loopy);
+        assert!(r.top_line > 20, "top_line was {}", r.top_line);
+        assert!(is_degenerate(&r));
+
+        // Healthy prose: no line repeats, high distinct ratio.
+        let ok = "Virtual memory gives each process a private address space. \
+                  The kernel maps pages lazily, so untouched allocations cost nothing. \
+                  A TLB caches recent translations; invalidating it is expensive, which \
+                  is why context switches try to avoid full flushes on tagged hardware.";
+        let r = repetition_report(ok);
+        assert_eq!(r.top_line, 1);
+        assert!(r.distinct > 0.4, "distinct was {}", r.distinct);
+        assert!(!is_degenerate(&r));
+
+        assert!(!is_degenerate(&repetition_report("")));
     }
 }

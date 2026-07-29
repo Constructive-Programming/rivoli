@@ -1298,6 +1298,54 @@ session's wall is 15% above the earlier one at identical flags, and that is unex
 Under-selection is caught only incidentally (stale rows differ); a poison-fill of
 `rows_buf[0..nr]` before the launch would make it explicit.
 
+## RETRACTION: the 512->10k matrix's long-context results are invalid
+
+**Everything below at 2048 tokens and above measured degeneration, not throughput.** The
+headline — `int3-vq/streaming/2q` "the only cell that gets FASTER with context" — is an
+artifact. Reclassifying all 58 cells from their logs with a structural-repetition check:
+
+| round | tokens | valid | degenerate |
+|---|---:|---:|---:|
+| 1 | 512 | **42/42** | 0 |
+| 2 | 2048 | 7/8 | 1 |
+| 3 | 4096 | **0/4** | **4** |
+| 4 | 10000 | **0/2** | **2** |
+
+The winning cell was degenerating from 2048 onward and the detectors passed it every time:
+
+| tokens | tok/s | hit % | most-repeated line | distinct-word |
+|---:|---:|---:|---|---:|
+| 512 | 2.81 | 81.6 | (none) | 0.474 |
+| 2048 | 2.97 | 83.2 | `- Mechanism.` x38 | 0.366 |
+| 4096 | 3.06 | 85.4 | `- Mechanism.` x53 | 0.288 |
+| 10000 | 3.26 | 89.6 | `**Memory Product.**` **x329** | 0.244 |
+
+**The rising hit rate was the tell, and it was reported as a success.** Throughput and hit
+rate climb monotonically *because* the output collapses: a template loop re-routes to the
+same experts. Every "streaming scales with context" conclusion drawn from this is void.
+
+**Why both detectors missed it.** The loop had a VARYING SLOT — `**Memory Phase:**`,
+`**Memory State:**`, `**Memory Status:**`, … — so `detect_loop` found no verbatim cycle and
+`longest_repeated_block` capped at 142 tokens. Both are exact matchers. A near-miss loop
+with one changing token is the most common real degeneration shape and neither could see it.
+
+**The instrument that would have caught it was rejected on a misread.** Distinct-word ratio
+falls monotonically here (0.474 -> 0.244) and separates the healthy band (0.42-0.53) from
+the broken one (0.12-0.29) cleanly. It was excluded because docs/INT4.md records that a
+distinct-token gate INVERTS — hybrid has the worst ratio and the second-best perplexity.
+That warning is about ranking *healthy* configs, where the ratio does not track quality.
+Generalising it to "never use distinct ratio" cost three rounds of device time. It is an
+alarm, not a ranking metric, and `telemetry::repetition_report` now uses it as one.
+
+**What survives.** Round 1 (512 tokens, 42 cells) — the mode ranking, top-m's substitution
+cost, and int4's intermittent NaN. Everything context-dependent needs re-running, and not
+with free-running decode: at 4096 tokens EVERY configuration degenerated, so the fixed
+forced-token harness is no longer optional for long-context work.
+
+**What was right for the wrong reason.** "DSA degenerates at 10k" is true, but not
+distinctive — dense and streaming degenerate at 4096 too. DSA's is merely the only one an
+exact matcher could see.
+
 ## Benchmark matrix: mode x attn x cache-policy, 115 GiB, 512 -> 10k tokens
 
 Bracket 44 -> 8 -> 4 -> 2 at 512 / 2048 / 4096 / 10000 tokens, `--max-mem 115`, one

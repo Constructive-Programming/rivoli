@@ -69,7 +69,7 @@ fi
 echo "round $ROUND: ${#CELLS[@]} cells x $TOKENS tok, --max-mem $MEM, timeout ${TIMEOUT}s"
 echo "binary: $BIN"
 echo "prompt: ${PROMPT:0:80}..."
-printf 'status\tmode\tattn\tpolicy\ttok_s\thit_pct\twall_ms\tlrb\tnote\n' > "$OUT/round$ROUND.tsv"
+printf 'status\tmode\tattn\tpolicy\ttok_s\thit_pct\twall_ms\tlrb\tdistinct\tnote\n' > "$OUT/round$ROUND.tsv"
 
 for cell in "${CELLS[@]}"; do
   read -r mode attn pol <<< "$cell"
@@ -101,6 +101,10 @@ for cell in "${CELLS[@]}"; do
   # a real run). Either disqualifies the cell from ranking.
   loop=$(grep -oE 'DEGENERATE OUTPUT.*' "$log" | grep -oE '[0-9]+' | tr '\n' '/' | sed 's:/$::')
   suspect=$(grep -c 'SUSPECT OUTPUT' "$log")
+  # The detector that actually catches the common shape (varying-slot template loops).
+  structural=$(grep -c 'STRUCTURALLY DEGENERATE' "$log")
+  topline=$(grep -oE 'top-line x[0-9]+' "$log" | grep -oE '[0-9]+$')
+  distinct=$(grep -oE 'distinct [0-9.]+' "$log" | tail -1 | grep -oE '[0-9.]+')
   lrb=$(grep -oE 'longest repeated block [0-9]+' "$log" | grep -oE '[0-9]+$')
 
   if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
@@ -116,6 +120,8 @@ for cell in "${CELLS[@]}"; do
     note="rc=$rc ${note:-no error line}"
   elif [ -z "$tok_s" ]; then
     status=CRASH; note="exit 0 but no PROFILE line"
+  elif [ "$structural" != 0 ]; then
+    status=DEGENERATE; note="template loop (top-line x$topline, distinct $distinct) — do not rank"
   elif [ -n "$loop" ]; then
     status=DEGENERATE; note="tail cycle; tok/s inflated by expert reuse — do not rank"
   elif [ "$suspect" != 0 ]; then
@@ -123,8 +129,8 @@ for cell in "${CELLS[@]}"; do
   else
     status=ok; note="${el}s"
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$status" "$mode" "$attn" "$pol" "${tok_s:--}" "${hit:--}" "${wall:--}" "${lrb:--}" "$note" \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$status" "$mode" "$attn" "$pol" "${tok_s:--}" "${hit:--}" "${wall:--}" "${lrb:--}" "${distinct:--}" "$note" \
       >> "$OUT/round$ROUND.tsv"
   printf '  %-11s %-28s %sst %s tok/s\n' "$status" "$tag" "$el" "${tok_s:--}"
 done

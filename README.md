@@ -13,38 +13,40 @@ benchmark/diagnostic override, not required setup.
 ## Measured performance
 
 Full cross of mode x attention x cache-policy at `--max-mem 115`, bracketed
-44 -> 8 -> 4 -> 2 cells over 512 / 2048 / 4096 / 10000 tokens (~10 h, one process per
-cell). Numbers and caveats in **[benchmarks.md](benchmarks.md)**.
+44 -> 8 -> 4 -> 2 cells over 512 / 2048 / 4096 / 10000 tokens (~10 h). Details and the
+retraction below in **[benchmarks.md](benchmarks.md)**.
 
-| | best cell | 512 | 2048 | 4096 | 10000 |
-|---|---|---:|---:|---:|---:|
-| tok/s | `int3-vq` + `streaming` + `2q` | 2.81 | 2.97 | 3.06 | **3.26** |
+**Only the 512-token round is valid.** At 2048 tokens and beyond, free-running greedy
+decode degenerates into template loops **regardless of mode, attention or cache policy** —
+0/42 cells degenerate at 512, 1/8 at 2048, **4/4 at 4096 and 2/2 at 10000**. Long-context
+throughput on this engine is currently not measurable by free-running decode.
 
-It is the only configuration that gets **faster** with context, and the reason is the
-first thing to understand about this table: `streaming` attends a fixed 516 rows
-(`--sinks 4 --window 512`) no matter how long the context is — 100% of context at 512
-tokens, **5.2% at 10k**. It ranked 11th at 512, where it attends everything. The
-throughput is real; the quality cost of discarding 95% of the context is not measured by
-any number here.
+Valid results, 512 tokens, `--max-mem 115`:
 
-Three results worth knowing before trusting a `tok/s` from this engine:
+| mode | cells ok | tok/s | mean |
+|---|---:|---|---:|
+| `int3-vq` | 16/16 | 2.70-3.22 | **2.91** |
+| `hybrid` | 12/12 | 2.12-2.76 | 2.45 |
+| `int4` | 14/16 | 1.77-2.42 | 2.10 |
 
-- **DSA degenerates at long context.** `int3-vq/dsa/2q` is clean at 512/2048/4096 and
-  collapses at 10k: **45% of its output is a verbatim duplicate** (longest repeated block
-  4544 of 10000 tokens, confirmed as real text). Its 2.31 tok/s is not a result. Detected
-  only because runs are classified for repetition — no throughput metric can see it.
-- **`top-m` is not free.** Fastest policy at 512 (it took all four top slots) and by 4096
-  it is +1.6% over `2q` while substituting ~5.5% of experts away from the true top-K. Its
-  85-90% hit rates are not comparable to the other policies'.
-- **`int4` throws NaN/Inf intermittently** — 2 of 16 cells, non-reproducing, no predictive
-  combination. `int3-vq` and `hybrid` were 28/28 clean. Not root-caused.
+Two caveats on that table. `top-m` holds the top four slots (3.10-3.22) but substitutes
+~5.5% of experts away from the true top-K, so its 85-86% hit rates are not comparable.
+And `int4` lost two cells to intermittent `NaN/Inf` logits — non-reproducing, no
+predictive combination, `int3-vq` and `hybrid` 28/28 clean, not root-caused.
 
-**A degenerate run benchmarks FASTER**, which is why none of this is ranked on raw
-throughput: looping re-routes to the same few experts, so the hit rate rises. Measured
-directly — the same cell scored 2.88 tok/s while emitting 50% duplicate output and 2.66
-tok/s once the prompt was fixed. `-bench` runs therefore report a longest-repeated-block
-and warn when output degenerates. See [MODES.md](MODES.md) on why free-running `tok/s`
-cannot rank modes.
+**Why a degenerate run must never be ranked: it benchmarks FASTER.** A loop re-routes to
+the same few experts, so the cache hit rate climbs. Measured on one configuration as it
+collapsed over increasing context — hit rate **81.6 -> 83.2 -> 85.4 -> 89.6%** while the
+distinct-word ratio fell **0.474 -> 0.366 -> 0.288 -> 0.244**. It looked like the only
+configuration that got *faster* with context. It was the one degenerating hardest.
+
+`-bench` therefore classifies its own output and warns, on three independent signals: a
+verbatim tail cycle, the longest repeated block, and **structural repetition** (most-
+repeated line count + distinct-word ratio). The third exists because the first two both
+passed a run that was 329 repetitions of `**Memory Product.**` — the loop had a varying
+label, so no exact match was long enough to catch it. See [MODES.md](MODES.md) on why
+free-running `tok/s` cannot rank modes; a fixed forced-token harness is the fix and is not
+built yet.
 
 ## Weight formats
 
