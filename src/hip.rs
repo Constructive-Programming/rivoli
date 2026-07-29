@@ -30,6 +30,7 @@ pub struct ExpertDesc {
 unsafe extern "C" {
     fn rivoli_device_sync() -> i32;
     fn rivoli_memcpy_dtod(dst: *mut u8, src: *const u8, bytes: usize) -> i32;
+    fn rivoli_fill_u32(dst: *mut u8, pat: u32, bytes: usize) -> i32;
 
     #[allow(clippy::too_many_arguments)]
     fn rivoli_moe_expert_range_i4(
@@ -259,6 +260,17 @@ pub fn device_sync() -> Result<()> {
 /// arena guarantees distinct slots).
 pub unsafe fn memcpy_dtod(dst: *mut u8, src: *const u8, bytes: usize) -> Result<()> {
     check(unsafe { rivoli_memcpy_dtod(dst, src, bytes) }, "memcpy_dtod")
+}
+
+/// Fill `bytes` at `dst` with the 32-bit pattern `pat` (`bytes` must be a multiple of 4).
+///
+/// Poisons a freshly admitted slot so a read-before-write is DETERMINISTIC rather than
+/// dependent on what happened to be in memory. See kernels/vmm.hip::fill_u32.
+///
+/// # Safety
+/// `dst` must be a device pointer owning at least `bytes`.
+pub unsafe fn fill_u32(dst: *mut u8, pat: u32, bytes: usize) -> Result<()> {
+    check(unsafe { rivoli_fill_u32(dst, pat, bytes) }, "fill_u32")
 }
 
 /// Streaming MoE: gate/up + down for the absolute expert range `[e_start,

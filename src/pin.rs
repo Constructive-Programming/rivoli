@@ -517,6 +517,24 @@ impl ArenaPool {
         // once the read lands. A HIT observed while a key is in this state is the bug.
         #[cfg(feature = "trace")]
         self.loaded.remove(&key);
+        // POISON the slot before its bytes land, so a read-before-write is deterministic.
+        //
+        // Without this an unloaded slot holds whatever was there: uninitialised memory
+        // (-> NaN, seen in ~6% of long runs) or the evicted expert's weights (-> finite,
+        // plausible, SILENTLY wrong). 0x7FC0_7FC0 is a quiet NaN in f32 and in both bf16
+        // halves, so every format's scales read back non-finite and both cases collapse
+        // into the loud one — which the per-layer localiser then pins to a (pos, layer).
+        //
+        // Costs a ~20 MB device fill per miss (~3% of wall at 148 misses/token), which is
+        // why it is `trace`-only. It is a diagnostic, not a safety net.
+        #[cfg(feature = "trace")]
+        {
+            let stride = self.tier(hot).stride;
+            let dst = self.ptr(hot, idx);
+            // SAFETY: `dst` owns `stride` bytes in the pool VMM; the slot is not yet
+            // handed to any kernel (that happens in phase 1c, after this returns).
+            unsafe { crate::hip::fill_u32(dst, 0x7FC0_7FC0, stride)? };
+        }
         Ok(())
     }
 
@@ -986,11 +1004,32 @@ impl<'a> Pin<'a> {
             }
         }
         // Phase 1b: allocate the misses (evict + place + compact). Slots may relocate.
+        #[cfg(feature = "trace")]
+        let mut poisoned_any = false;
         for (i, &e) in sel.iter().enumerate() {
             if !is_hit[i] {
                 self.misses += 1;
                 self.routed.alloc(expert_key(layer, e))?;
+                #[cfg(feature = "trace")]
+                {
+                    poisoned_any = true;
+                }
             }
+        }
+        // The poison fills above run on the DEFAULT stream; the reaper's bounce->slot
+        // copies run on a `hipStreamNonBlocking` fetch stream, which does not synchronise
+        // with it. Unordered, a fill could land AFTER the read and destroy good data —
+        // the diagnostic would then cause the corruption it exists to detect. One join
+        // per layer-with-misses orders them.
+        //
+        // CAVEAT, and it is the same trap `--checksum-x` fell into: this sync may itself
+        // perturb the race being hunted. It sits at a different point (after allocation,
+        // before reads are submitted) than the per-layer D2H that masked the fault, so it
+        // is not the same barrier — but a clean run under poisoning is NOT proof the bug
+        // is absent. Only a poison HIT is positive evidence.
+        #[cfg(feature = "trace")]
+        if poisoned_any {
+            crate::hip::device_sync()?;
         }
         // Phase 1c: relocations have settled — resolve final slots and build the reads.
         let mut slots: [Option<ResolvedSlot>; 32] = [None; 32];
