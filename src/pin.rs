@@ -410,6 +410,26 @@ struct ArenaPool {
     policy: Box<dyn HybridPolicy>,
     slot_of: HashMap<u32, (bool, usize)>, // key -> (hot, idx)
     key_at: HashMap<(bool, usize), u32>,  // (hot, idx) -> key, for relocation remap
+    /// Keys whose bytes are known to have LANDED in their current slot.
+    ///
+    /// The engine has no other way to distinguish "the policy says resident" from "the
+    /// bytes are actually there", and that distinction is the leading hypothesis for the
+    /// intermittent non-finite-logits bug: a HIT returns `Signal::ready()` and the kernel
+    /// reads the slot immediately, so if a key is ever counted resident before its load
+    /// completed, the read is of uninitialised (-> NaN, the visible case) or stale (->
+    /// finite and WRONG, the silent case) memory.
+    ///
+    /// A key is removed on eviction and on relocation-into, and inserted only when its
+    /// read signal has resolved. `trace` only — it costs a hash op per expert per layer.
+    #[cfg(feature = "trace")]
+    loaded: std::collections::HashSet<u32>,
+    /// Misses submitted by the PREVIOUS layer, marked loaded at the top of the next
+    /// `submit_spine`. Correct because layer L's per-expert awaits and its unconditional
+    /// end-of-layer `device_sync` both complete before layer L+1 submits — so by then
+    /// every byte of L's batch has landed. Deferring this way avoids plumbing a
+    /// completion callback through `gpu.rs`'s async expert loop.
+    #[cfg(feature = "trace")]
+    pending_loaded: Vec<u32>,
     cold: TierFmt,
     hot: TierFmt,
 }
@@ -440,6 +460,21 @@ impl ArenaPool {
     fn begin_batch(&mut self) {
         self.policy.begin_batch();
     }
+    /// Record that `key`'s bytes have landed in its current slot. Called once per MISS,
+    /// after that read's signal resolves.
+    #[cfg(feature = "trace")]
+    fn mark_loaded(&mut self, key: u32) {
+        self.loaded.insert(key);
+    }
+
+    /// Has `key`'s data actually landed since it was last admitted? A HIT on a key for
+    /// which this is false is a read of uninitialised or stale bytes — the fault this
+    /// instrumentation exists to catch.
+    #[cfg(feature = "trace")]
+    fn is_loaded(&self, key: u32) -> bool {
+        self.loaded.contains(&key)
+    }
+
     /// A hit: the policy refreshes recency; the physical slot is unchanged and read from
     /// `slot_of` LATER (after any same-batch relocations settle).
     fn get(&mut self, key: u32) -> bool {
@@ -460,6 +495,10 @@ impl ArenaPool {
         for ev in adm.evicted {
             let s = self.slot_of.remove(&ev).context("evicted key had no slot")?;
             self.key_at.remove(&s);
+            // Evicted: its bytes are no longer this key's, and the slot is about to be
+            // handed to someone else.
+            #[cfg(feature = "trace")]
+            self.loaded.remove(&ev);
             self.arena.free(s.0, s.1);
         }
         let hot = adm.tier == cache::Tier::Hot;
@@ -474,6 +513,10 @@ impl ArenaPool {
         };
         self.slot_of.insert(key, (hot, idx));
         self.key_at.insert((hot, idx), key);
+        // Freshly admitted: a slot with no bytes in it yet. `mark_loaded` clears this
+        // once the read lands. A HIT observed while a key is in this state is the bug.
+        #[cfg(feature = "trace")]
+        self.loaded.remove(&key);
         Ok(())
     }
 
@@ -489,6 +532,8 @@ impl ArenaPool {
         unsafe { memcpy_dtod(dst, src, stride)? };
         self.slot_of.insert(moved, (r.hot, r.to));
         self.key_at.insert((r.hot, r.to), moved);
+        // The relocation copies the bytes with the key, so `moved` stays loaded. Nothing
+        // else changes state: the source slot is now free and holds no key.
         Ok(())
     }
 }
@@ -731,6 +776,10 @@ impl<'a> Pin<'a> {
             policy,
             slot_of: HashMap::new(),
             key_at: HashMap::new(),
+            #[cfg(feature = "trace")]
+            loaded: std::collections::HashSet::new(),
+            #[cfg(feature = "trace")]
+            pending_loaded: Vec::new(),
             cold,
             hot,
         };
@@ -870,6 +919,14 @@ impl<'a> Pin<'a> {
         );
         // New batch: clear the policy's per-batch pin set. Phase 1a's protect() and 1b's
         // admit() then pin every touched key so a later miss's eviction can't reclaim it.
+        // The previous layer's reads have all landed (its awaits + end-of-layer sync).
+        #[cfg(feature = "trace")]
+        {
+            let done = std::mem::take(&mut self.routed.pending_loaded);
+            for k in done {
+                self.routed.mark_loaded(k);
+            }
+        }
         self.routed.begin_batch();
         // Trace sink (--trace), v2: the demand keys this layer looks up, then `|`, then
         // the top-`TRACE_WINDOW` candidates as `key:choice`.
@@ -910,6 +967,20 @@ impl<'a> Pin<'a> {
         for (i, &e) in sel.iter().enumerate() {
             if self.routed.get(expert_key(layer, e)) {
                 self.hits += 1;
+                // THE CHECK. A hit hands the kernel a slot pointer and a resolved
+                // Signal, so nothing downstream waits. If the bytes never landed, the
+                // kernel reads uninitialised memory (NaN) or another expert's weights
+                // (finite, wrong, silent). Reported once per occurrence rather than
+                // fataling, so a run keeps going and the pattern is visible.
+                #[cfg(feature = "trace")]
+                if !self.routed.is_loaded(expert_key(layer, e)) {
+                    tracing::error!(
+                        "READ-BEFORE-WRITE: layer={layer} expert={e} counted as a cache \
+                         HIT but its bytes never landed since admission. The kernel is \
+                         about to read an unloaded slot — uninitialised memory (-> NaN) \
+                         or a previous expert's weights (-> silently wrong)."
+                    );
+                }
                 self.routed.protect(expert_key(layer, e));
                 is_hit[i] = true;
             }
@@ -939,6 +1010,11 @@ impl<'a> Pin<'a> {
         // Phase 2: hand the whole batch to the reaper — it queues+submits (all reads
         // start at once) and resolves each miss's Signal when its copy lands. Hits
         // default to `ready()`; overwrite each miss with its load Signal.
+        // Queue this batch's misses to be marked loaded at the next layer.
+        #[cfg(feature = "trace")]
+        for &i in &miss_sel {
+            self.routed.pending_loaded.push(expert_key(layer, sel[i]));
+        }
         let miss_signals = self.fetch.submit(reads)?;
         let mut signals: Vec<Signal> = (0..sel.len()).map(|_| Signal::ready()).collect();
         for (k, &i) in miss_sel.iter().enumerate() {
