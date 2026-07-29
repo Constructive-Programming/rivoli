@@ -1,7 +1,15 @@
 # rivoli — `top-m`: cache-conditional MoE routing (arXiv:2412.00099)
 
-Status: **proposed, not started.** Adds a fourth `--cache-policy` alongside
-`lru | 2q | arc`, and is the first cache mechanism that **changes which experts run**.
+Status: **SHIPPED for the single-format modes, opt-in, quality UNCERTIFIED.**
+`--cache-policy top-m` with `--route-j` / `--route-m` (defaults J=4, M=9) is live in
+`src/hybrid.rs` and `src/math.rs`; `config.rs::validate` rejects `top-m` + `--mode hybrid`
+and `top-m` + `--trace`. The `swap%` counter ships. What is NOT done is certification:
+the ~1% PPL bar needs ~12,840 teacher-forced tokens (~3.4 h sole-tenant) and may still
+miss. Do not promote it to default before then. The hybrid tier rule below remains
+unbuilt — see the PARKED block, whose precondition has since been MET.
+
+Adds a fourth `--cache-policy` alongside `lru | 2q | arc`, and is the first cache
+mechanism that **changes which experts run**.
 
 Source: Skliar, van Rozendaal, Lepert, Boinovski, van Baalen, Nagel, Whatmough,
 Ehteshami Bejnordi — *Mixture of Cache-Conditional Experts for Efficient Mobile Device
@@ -103,25 +111,29 @@ set that actually runs.
 **Single-format modes** (`int3-vq`, `int4`): uniform slot stride, residency is a
 boolean, and the behaviour is the paper exactly.
 
-> ## PARKED — the hybrid tier rule has an unmet ARTIFACT PRECONDITION
+> ## UNPARKED (2026-07-29) — the artifact precondition is now MET
 >
-> **Precondition: an int4 that is more faithful than vq3. The current vq3-derived `.i4`
-> does not satisfy it. A group-scaled (gs64) `pack_i4` container plausibly would.**
+> **This block parked the hybrid tier rule on "an int4 more faithful than vq3", which the
+> then-current vq3-derived `.i4` could not be by construction. That artifact is gone.**
 >
-> This is a precondition, not a TODO — it cannot be worked around in code, and no amount
-> of implementation makes the rule correct while it is unmet.
+> `bin/fp8_to_i4` now derives `.i4` from the original fp8 directly, and group-128 scales
+> replaced the per-row ones: **int4 PPL 5.120, hybrid 5.189, int3-vq 5.275**
+> (`docs/INT4.md` §10). int4 is now the *most* faithful of the three, not the least.
 >
-> The rule below promotes the **sacred top-J** — the experts that run *every single time
-> this layer is visited* — into int4, justified by "int4 is both more accurate and ~1.8×
-> faster". Half of that is measured false (int3-vq PPL 5.275 vs int4 9.083; see
-> `../benchmarks.md` "int4 provenance"). In this artifact `.i4` is re-derived from `.vq3`,
-> so it cannot be better than vq3 by construction.
+> So the argument below — that promoting the sacred top-J into int4 would be "precisely
+> inverted", putting the most important experts in the least faithful format — **no longer
+> holds against the current artifact.** It was correct when written, against a different
+> `.i4`.
 >
-> So the rule is not merely unjustified here — **it is precisely inverted**: it would take
-> the most important experts in the layer and put them in the least faithful format
-> available, buying compute and paying for it in quality on exactly the experts one would
-> least want to degrade. Everything below is correct *given* a faithful int4, and is
-> retained for that reason. Do not implement it against the current artifact.
+> The rule is therefore unblocked and unbuilt. Its acceptance test is unchanged and is
+> still owed: the hybrid A/B of the rank tier rule against the frequency threshold, on
+> hit% and the `moe-gpu` bucket. Note also that the precondition text named a
+> `pack_i4` container that was never written; the shipped path is `fp8_to_i4`.
+>
+> One caveat before building it: `config.rs::validate` currently rejects `top-m` +
+> `--mode hybrid` outright, precisely because this rule does not exist. Implementing the
+> rule means lifting that guard, and the guard is what stops a silent fallback to the
+> frequency threshold being credited to `top-m`.
 >
 > Unaffected: **single-format `top-m` (`int3-vq`, `int4`) ships independently of this.**
 > There is no promotion, no tiering and no format change anywhere in its path.
@@ -137,7 +149,8 @@ replace it rather than layer on top of it:
   **It is NOT more accurate in the artifact we run, and an earlier draft of this line
   claimed it was.** `bin/vq3_to_i4` re-derives `.i4` from our own `.vq3`, so the chain is
   fp8 → vq3 (lossy 3-bit) → int4 and the int4 set cannot be better than the vq3 it came
-  from, by construction. Measured on a 762-token teacher-forced corpus: int4 PPL 9.083 vs
+  from, by construction. Measured on a 762-token teacher-forced corpus at the time: int4
+  PPL 9.083 vs
   int3-vq 5.275. So promoting to int4 buys speed and *costs* quality here. See
   "int4 provenance" in `../benchmarks.md` for the fix path (a group-scaled colibri
   container), after which this bullet's original premise would hold again.

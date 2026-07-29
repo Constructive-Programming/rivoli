@@ -1,29 +1,29 @@
 # rivoli — CACHE_PILOT: router-piloted cross-layer expert prefetch
 
-Status: **PARKED — blocked on an artifact precondition. Do not build.**
+Status: **PARKED — but reason 1 has LIFTED (2026-07-29). Still do not build; reason 2
+stands.**
 
-There are now **two independent reasons** not to build this, and they are not the same
-reason wearing different hats.
+**1. ~~Blocked on a faithful int4~~ — LIFTED.** This reason said the machinery existed to
+make an L+2 **int4 promotion** affordable, while `.i4` was re-derived from `.vq3`
+(`bin/vq3_to_i4`) and therefore strictly *less* faithful than the vq3 it came from —
+int3-vq PPL 5.275 against int4 9.083. Promoting to int4 degraded quality, so building
+machinery to promote *more, earlier* would have been an elaborate way to make the model
+worse.
 
-**1. It is blocked on a faithful int4 (new, and decisive on its own).** This document's
-entire purpose is to make an L+2 **int4 promotion** affordable — the prediction and the
-speculative loader exist to move an 18.9 MB int4 load off the critical path. But in the
-artifact we run, `.i4` is re-derived from `.vq3` (`bin/vq3_to_i4`), so int4 is strictly
-*less* faithful than the vq3 it came from: int3-vq PPL 5.275 against int4 9.083 on a fixed
-teacher-forced corpus (`../benchmarks.md`, "int4 provenance"). **Promotion to int4
-therefore degrades quality here, and this machinery exists to do more promotion, earlier.**
-Building it now would be an elaborate, expensive mechanism for making the model worse —
-the most costly possible way to be wrong. The precondition is an int4 more faithful than
-vq3; a group-scaled (gs64) `pack_i4` container plausibly supplies one, at which point this
-reason lifts and the design below stands as written.
+That artifact is gone. `bin/fp8_to_i4` derives `.i4` from the original fp8 and group-128
+scales replaced the per-row ones: **int4 PPL 5.120, hybrid 5.189, int3-vq 5.275**
+(`INT4.md` §10). int4 is now the most faithful of the three, so promotion no longer costs
+quality and this objection no longer applies. (The precondition text named a `pack_i4`
+container that was never written; the shipped path is `fp8_to_i4`. The slot is also
+20.1 MB now, not 18.9.)
 
-**2. It has no acceptance criteria of its own (pre-existing).** It is preliminary work for
+**2. It has no acceptance criteria of its own (pre-existing) — STILL BLOCKING.** It is preliminary work for
 [CACHE_ROUTE.md](CACHE_ROUTE.md) (`--cache-policy top-m`) and is accepted or removed with
 it. See "Acceptance is not local" below.
 
-Note the offline screen cannot lift either reason: it saturates by construction and has no
-power over this work at all (see "Headroom" below). The one thing worth doing here before
-the precondition is met is **LOOKA** (Step 1) — its recall numbers are a durable fact about
+Note the offline screen cannot lift the remaining reason: it saturates by construction and
+has no power over this work at all (see "Headroom" below). The one thing worth doing here
+is still **LOOKA** (Step 1) — its recall numbers are a durable fact about
 the model, cheap, and useful whatever happens to the loader.
 
 Unaffected: single-format `top-m` (`int3-vq`, `int4`) needs none of this machinery.

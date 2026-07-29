@@ -47,8 +47,10 @@ many fit in the pool → hit rate), and **stream cost** (bytes per miss).
   usually **loses** — the residency hit outweighs the compute win.
 
 ### `hybrid` — int4 hot, int3-vq cold *(default)*
-> **Measured 2026-07-27: PPL 11.55** — between int3-vq (5.28) and int4 (73.43), and much
-> closer to int3-vq because its cold slab is group-64 `.vq3`. See `docs/INT4.md`.
+> **Measured 2026-07-28: PPL 5.189** — the best perplexity in the engine, ahead of
+> int3-vq (5.275) and int4 (5.120 — better still, but far slower in practice). The
+> earlier 11.55 was measured against the per-row-scaled `.i4` set that `docs/INT4.md` §10
+> replaced with group-128 scales; it does not describe the current artifact.
 Two physical slabs. The cache policy routes each expert to one:
 - **HOT slab = int4** — the *frequently reused* experts. They get int4's fast compute
   **and** stay resident (no fetch, no bubbles) — the one place int4's speed actually
@@ -70,10 +72,10 @@ decides its *format* — int4 or int3-vq — so the numerics themselves become a
 cache state. Two consequences, and the distinction between them matters:
 
 - **Reproducible at a fixed configuration.** Same prompt, same `--max-mem`, same
-  `--cache-policy`, same `--hot-pct`: the pool starts empty and residency evolves
+  `--cache-policy`, same budget: the pool starts empty and residency evolves
   identically, so the output is identical run to run. Hybrid is not nondeterministic.
-- **NOT comparable across budgets or policies.** Change `--max-mem`, the policy, or
-  `--hot-pct` and you change which experts sit in which format — which changes the
+- **NOT comparable across budgets or policies.** Change `--max-mem` or the policy and
+  you change which experts sit in which format — which changes the
   arithmetic. **Two hybrid runs at different budgets are not the same computation**, so a
   difference in output or quality between them cannot be attributed to the thing you were
   varying. The format mix moved underneath the comparison.
@@ -82,11 +84,19 @@ So an A/B across budgets is sound in the single-format modes and is confounded b
 construction in hybrid. If you need a cross-budget quality comparison, run it in
 `int3-vq`, where residency cannot touch the numerics.
 
-**`--hot-pct <n>`** (hybrid only; errors in other modes) sets the byte split — n% of
-the pool to the int4 HOT slab. **Default:** a *cold-slab floor* (probation must hold
-≳2 tokens' worth of experts so it can't starve) with the rest to HOT — i.e. "push hot
-as high as possible without starving cold." A flat percent is fragile: too high and
-the cold/probation slab collapses (measured cliff around n_cold < ~600 slots).
+**There is no split flag.** `--hot-pct` existed briefly, was replaced by a cold-slab
+floor, and was deleted outright along with the fixed-partition cache variants and the
+replay `--hybrid` split simulator (`c876a8d`) — the split self-sizes now. The hot/cold
+boundary is emergent: the two-ended byte arena packs COLD from the low end and HOT from
+the high end, and the boundary **floats** with the policy's tier decisions
+(`src/arena.rs`, `src/pin.rs`).
+
+The reason a flat percent was fragile still stands and is why nothing replaced it: too
+high and the cold/probation slab collapses (measured cliff around n_cold < ~600 slots).
+**A consequence worth knowing before you plan an experiment:** there is now no knob to
+sweep the split with, and `--max-mem` is *not* a substitute — changing the budget changes
+which experts sit in which format, i.e. changes the arithmetic being compared. Sweeping
+the split again means re-introducing a floor override first.
 
 ---
 
@@ -163,7 +173,8 @@ HOT correctly it needs a *frequency memory that survives eviction*:
 - **`2q` / `arc` fit naturally.** Both promote to the frequent tier only when a
   **ghost** key is re-accessed — which is a miss. Promotion *coincides with the fetch*,
   so the fetch goes straight into the int4 slab. Zero wasted work. In hybrid the tier
-  caps are **fixed** (`TwoQ::fixed` / `Arc::fixed`): each segment maps to a slab, and
+  caps are **dynamic and byte-aware** (there is no `::fixed` variant; the tier mapping
+  below is real, the fixed-partition constructors are not): each segment maps to a slab, and
   an insert only evicts from its own segment, so a reuse stays in one slab. This trades
   the policy's adaptivity for two right-sized slabs.
 - **`lru` has no ghost and no frequency signal**, so on its own it can't tell a hot
@@ -181,19 +192,21 @@ would need speculative refetch. Acceptable, but real.
 
 ## Interaction matrix
 
-Rows = format mode, columns = cache policy. `--hot-pct` applies only to the hybrid row.
+Rows = format mode, columns = cache policy. `top-m` is omitted from the grid below: it
+is a single-format policy only (`config.rs::validate` rejects `top-m` + `hybrid` outright)
+and is documented in its own section above.
 
 | | `lru` | `2q` *(default)* | `arc` |
 |---|---|---|---|
 | **`int3-vq`** | 1 vq3 slab, LRU evict | 1 vq3 slab, dynamic 2Q | 1 vq3 slab, dynamic ARC |
 | **`int4`** | 1 int4 slab, LRU evict | 1 int4 slab, dynamic 2Q | 1 int4 slab, dynamic ARC |
-| **`hybrid`** *(default)* | 2 slabs; **freq-counter** places (HOT/COLD), per-slab LRU evict | 2 slabs; **`TwoQ::fixed`** (A1in→COLD/vq3, Am→HOT/int4) | 2 slabs; **`Arc::fixed`** (T1→COLD/vq3, T2→HOT/int4) |
+| **`hybrid`** *(default)* | 2 slabs; **freq-counter** places (HOT/COLD), per-slab LRU evict | 2 slabs; **`HybridTwoQ`** (A1in→COLD/vq3, Am→HOT/int4) | 2 slabs; **`HybridArc`** (T1→COLD/vq3, T2→HOT/int4) |
 
-- **Single-format rows** (`int3-vq`, `int4`): the policy runs unmodified (`cache::make`,
-  dynamic), one slab. `--hot-pct` is rejected.
-- **Hybrid row:** the policy runs in its **fixed-partition** variant and reports a
+- **Single-format rows** (`int3-vq`, `int4`): the policy runs unmodified
+  (`hybrid::make`, dynamic), one slab.
+- **Hybrid row:** the same dynamic policy runs with two strides and reports a
   `Tier` (Cold/Hot) per insert; the pool maps that to a slab. `--2q-kout` still sizes
-  the ghost; `--2q-kin` is inert in hybrid (the split comes from `--hot-pct`).
+  the ghost. `--2q-kin`/`--2q-kout` are live in every mode (`src/cache.rs`).
 
 ---
 

@@ -1062,7 +1062,9 @@ is real, not because the plan exists.
 ## 2d pre-flight: `moe.hip`, the three int3-vq kernels
 
 Scoped against the source before writing, so the tranche starts from decisions rather
-than discoveries. NOT YET WRITTEN — this section is the plan.
+than discoveries. **Written and merged** (`047d0be`, `bffdc9d`); the `moe_*_vq` and
+`moe_reduce` shaders exist and the header's "landed through tranche 2d" is the current
+status. This section is retained as the plan it was executed from.
 
 **The tightest oracle in the suite guards this tranche.** `moe_vq` has **3.3×** headroom
 against `gemv_fp8`'s 2928×. The standing rule applies without restatement: *a failing VQ

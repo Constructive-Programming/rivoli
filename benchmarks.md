@@ -782,7 +782,16 @@ build; the cost of not staging it is unbounded and invisible.
   sibling, so its load-width restructure remains worth doing. **Check whether a reference
   point is itself healthy before measuring against it.**
 
-### Open question: half of `tail` is in none of its kernels
+### ~~Open question: half of `tail` is in none of its kernels~~ — ANSWERED
+
+> **Closed by the CLASS axis (docs/PERF.md).** The unattributed time is decode-loop HOST
+> CPU, not a hidden kernel — measured at ~6 ms/tok of a total 6.2 ms host compute, itemised
+> as kernel launch, tokio poll, `submit_layer` and `route_into`. The candidate named below
+> (per-token launch/sync/readback overhead) was right. It is also DEMOTED by the same
+> measurement: host compute is under 2% of wall, so this is not where the engine is slow.
+> The analysis below is kept for the reasoning, not as a live task.
+
+### Original: half of `tail` is in none of its kernels
 
 `tail` measures ~16 ms/tok. Measured: `lm_head` **8.12 ms**, `argmax` **0.088 ms**,
 `rmsnorm` **0.008 ms** — **~8.2 ms total, leaving ~7.8 ms unattributed.** Those are the
@@ -1375,7 +1384,10 @@ happens to be fast, not an optimisation.
 
 **3. DSA does not bound its cost the way its design implies.** It fell 14-21% from 512 to
 4096 — the steepest declines in the bracket — because the attend is capped but the INDEXER
-scores every cached token (4.7 ms/tok over ~17 scoring layers at 10k). Its cost curve
+scores every cached token (4.7 ms/tok over 16.836 scoring layers at 10k — a RUN AVERAGE,
+not a contradiction of NPU.md's 21.000: layers below `index_topk`=2048 return dense without
+scoring, so the first ~2048 positions score nothing and 21 x (10000-2048)/10000 = 16.7).
+Its cost curve
 resembles dense's. Any fix belongs in the indexer, not the attend kernel.
 
 **4. `top-m`'s premium collapses to noise as context grows.** Fastest cell at 512

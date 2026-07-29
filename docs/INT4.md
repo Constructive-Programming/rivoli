@@ -254,7 +254,12 @@ whichever checkpoint is adopted rather than trusting this paragraph.
 
 **Recommendation:** implement group-wise int4 (group 64 or 128, asymmetric) rather than tuning
 per-row. Prefer importing a published int4 checkpoint for this model family over re-deriving
-one — that is a `bin/pack_i4` job, not a `bin/fp8_to_i4` job.
+one — that would be an importer, not a re-derivation.
+
+> **Superseded by §10.** Group-128 *symmetric* was implemented and shipped, taking int4 from
+> PPL 73.43 to 5.120 without importing anything, so the import path was never needed and
+> `bin/pack_i4` was never written — do not go looking for it (docs that reference one are
+> stale). Asymmetric quantisation remains untested; see "Still open".
 
 **What that touches** — this is not a converter-only change:
 

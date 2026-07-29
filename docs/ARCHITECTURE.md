@@ -107,7 +107,7 @@ is to **keep the queue full**:
 - The module owns all the **O_DIRECT alignment math** (block-aligned offset, length, and
   buffer) so the rest of the engine deals in logical `(fd, begin, len)` read-specs.
 
-The payoff: on the full model, fetch is **~94% hidden** behind compute — the engine is
+The payoff: on the full model, fetch is **~95% hidden** behind compute — the engine is
 compute-bound, not disk-bound, at the working budget.
 
 ---
@@ -199,7 +199,7 @@ flowchart LR
 `(layer, expert)`; a hit reuses the resident slot, a miss evicts and streams.
 
 **Two-ended byte arena** (`arena.rs`): COLD (int3-vq, 15.3 MB) slots pack from the low end,
-HOT (int4, 18.9 MB) from the high end, tightly, with a floating gap in the middle:
+HOT (int4, 20.1 MB) from the high end, tightly, with a floating gap in the middle:
 
 ```
  low ────────────────────────────────────────────────────────── high
@@ -339,7 +339,8 @@ fp16 (L1-resident so the MoE gather is cheap).
 
 `.vq3`/`.i4` blocks are `gate‖up‖down` at O_DIRECT-aligned stride (VQ_ALIGN = 4096); index
 `n_experts` is the shared expert. Headers are validated on open; a dim/version mismatch
-fails loud. `convert` produces the vq3 artifact; `vq3_to_i4` derives the `.i4` twins;
+fails loud. `convert` produces the vq3 artifact; `fp8_to_i4` derives the `.i4` twins
+directly from the fp8 source (`vq3_to_i4` is the retired lossy chain — see docs/INT4.md);
 `add_indexer` writes the side indexer file (see `benchmarks.md` for int4 provenance).
 
 ## 11. Module map
@@ -361,7 +362,8 @@ fails loud. `convert` produces the vq3 artifact; `vq3_to_i4` derives the `.i4` t
   tranche 2d but **not yet runnable**; see `docs/VULKAN.md`.
 - `kernels/*.hip` — moe, mla, attn, linalg, indexer, fwd, async, vmm (HIP/rocm).
   `kernels/vk/*.comp` → SPIR-V via the `build.rs` vulkan arm (the WIP second backend).
-- `src/bin/` — `convert`, `vq3_to_i4`, `pack_i4` (deprecated), `add_indexer`, `replay`.
+- `src/bin/` — `convert`, `fp8_to_i4`, `vq3_to_i4`, `add_indexer`, `i4_audit`, `ppl`,
+  `replay`. (There is no `pack_i4`; docs that reference one are stale.)
 
 See `docs/PERF.md` for the performance roadmap, `MODES.md` for the format/policy matrix, and
 `benchmarks.md` for measured throughput and quality.
