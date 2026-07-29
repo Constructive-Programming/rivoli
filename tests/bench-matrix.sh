@@ -107,7 +107,12 @@ for cell in "${CELLS[@]}"; do
     status=TIMEOUT; note="killed after ${el}s — wedged?"
   elif [ "$rc" != 0 ]; then
     status=CRASH
-    note=$(grep -oiE '(Error|error\[|panicked at|OOM|out of memory|foreign|refuse).*' "$log" | head -1 | cut -c1-120)
+    # The LAST `Error:`/panic line, not the first match anywhere. An earlier version
+    # grepped case-insensitively for OOM and took head -1, which matched the benign
+    # startup line "(--max-mem, literal — no reserve; may OOM)" and labelled a
+    # NaN/Inf numerics failure as a memory problem — the exact wrong diagnosis.
+    note=$(grep -aoE '^(Error|thread .* panicked at).*' "$log" | tail -1 | cut -c1-140)
+    [ -z "$note" ] && note=$(grep -aoiE '(out of memory|hipErrorOutOfMemory|foreign GPU|device tier OOM).*' "$log" | tail -1 | cut -c1-140)
     note="rc=$rc ${note:-no error line}"
   elif [ -z "$tok_s" ]; then
     status=CRASH; note="exit 0 but no PROFILE line"

@@ -1297,3 +1297,80 @@ session's wall is 15% above the earlier one at identical flags, and that is unex
 `--ppl` across arms would beat identical greedy text as an equality check and was not run.
 Under-selection is caught only incidentally (stale rows differ); a poison-fill of
 `rows_buf[0..nr]` before the launch would make it explicit.
+
+## Benchmark matrix: mode x attn x cache-policy, 115 GiB, 512 -> 10k tokens
+
+Bracket 44 -> 8 -> 4 -> 2 at 512 / 2048 / 4096 / 10000 tokens, `--max-mem 115`, one
+process per cell, ~10 h total. Full data in `tests/bench-matrix.sh`'s output dir.
+
+**Result: `int3-vq` + `streaming` + `2q` — 3.26 tok/s at 10k, and the only cell that gets
+FASTER with context** (2.81 -> 2.97 -> 3.06 -> 3.26, +16% over 512 -> 10k).
+
+### The four findings that matter
+
+**1. DSA degenerates catastrophically at 10k context.** `int3-vq/dsa/2q` was clean at 512,
+2048 and 4096 (longest-repeated-block 6, 14, 16 tokens) and then collapsed at 10k:
+**lrb 4544 of 10000 — 45% of the output is a verbatim duplicate**, verified as real text
+(a 6000+ char block recurring), not a hash collision. Its 2.31 tok/s is therefore not a
+result. `streaming` at the same length is clean (lrb 142, 1.4%). This is a QUALITY failure
+in the sparse-attention path, invisible to any throughput metric, and it was caught only
+because the run classifies output. The indexer is the suspect: it scores every cached
+token and selects a subset, and something about that selection at ~10k positions loses the
+context the model needs.
+
+**2. `streaming` wins by doing less, and the benchmark cannot see the cost.**
+`--sinks 4 --window 512` attends **516 rows regardless of context** — 100% of context at
+512 tokens, 25% at 2048, 12.6% at 4096, **5.2% at 10k**. It ranked 11th at 512 (where it
+attends everything) and 1st from 2048 on. The throughput is real; whether the output is
+worth having at 5% context coverage is unmeasured here. Treat it as an approximation that
+happens to be fast, not an optimisation.
+
+**3. DSA does not bound its cost the way its design implies.** It fell 14-21% from 512 to
+4096 — the steepest declines in the bracket — because the attend is capped but the INDEXER
+scores every cached token (4.7 ms/tok over ~17 scoring layers at 10k). Its cost curve
+resembles dense's. Any fix belongs in the indexer, not the attend kernel.
+
+**4. `top-m`'s premium collapses to noise as context grows.** Fastest cell at 512
+(3.22 tok/s, all four top-4 slots) and by 4096 it is +1.6% over `dsa/2q` (2.54 vs 2.50)
+while substituting **5.48-5.62%** of experts away from the true top-K. It buys its 85-86%
+hit rates by routing to whatever is resident; that hit rate is not comparable to the other
+policies'. At 512 tokens the substitution looked free. It is not.
+
+### Mode ranking at 115 GiB, and a correction
+
+| mode | ok | tok/s @512 | mean |
+|---|---:|---|---:|
+| `int3-vq` | 16/16 | 2.70-3.22 | **2.91** |
+| `hybrid` | 12/12 | 2.12-2.76 | 2.45 |
+| `int4` | **14/16** | 1.77-2.42 | 2.10 |
+
+int3-vq beats hybrid by 19% here, where docs/INT4.md records hybrid ahead (2.72 vs 2.62 at
+`--max-mem 100`). Two things differ: the budget (115 GiB gives int3-vq's 15.34 MB experts
+~6900 slots vs int4's 5274, so a larger pool favours the smaller format) and **the
+prompt** — those numbers were free-running on "The sky is blue because", where hybrid
+degenerated to lrb 256/512 and int3-vq stayed at 20. Hybrid is the mode that confound
+flattered most. The speed half of that comparison needs re-measuring; hybrid still holds
+the better perplexity (5.189 vs 5.275), which this matrix does not measure.
+
+### `int4` throws NaN/Inf intermittently
+
+**2 of 16 int4 cells** died with `logits are non-finite`: `int4/dense/arc` and
+`int4/streaming/2q`. `int3-vq` and `hybrid` were 28/28 clean, and neither failing cell
+reproduced in round 2. No combination predicts it — `2q` passed under dense and failed
+under streaming, `arc` did the reverse — which is the signature of a timing-dependent
+fault rather than a logic one, plausibly widened by int4's 20.05 MB fetches taking ~30%
+longer than vq3's. **`hybrid` is unaffected despite using int4 for its hot experts**,
+which points at the all-int4 residency path rather than the int4 decode kernel. Not yet
+root-caused.
+
+### Method notes
+
+- **The prompt was manufacturing the degeneration.** On the default short prompt,
+  hybrid/dense/lru returned lrb 256/512 at 2.88 tok/s; on a prompt that sustains a long
+  answer, lrb 18 at 2.66. **The broken run benchmarked 8% FASTER** — looping re-routes to
+  the same experts, the hit rate rises. Round 1 was restarted for this reason and returned
+  0 degenerate cells out of 44.
+- **Do not select rounds on raw tok/s.** A pure top-8-by-tok/s at 512 would have cut at
+  2.91 and **eliminated `int3-vq/streaming/2q` at 2.81 — the eventual winner.** At short
+  context the capped-attention modes carry their overhead without their benefit. Rounds
+  were seeded to preserve the mode and attention comparisons instead.
