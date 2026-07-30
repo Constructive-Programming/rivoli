@@ -15,10 +15,12 @@
 //! here were written under that constraint deliberately. It costs a little rework when
 //! the two disagree, which is the entire point — that disagreement is the signal.
 //!
-//! `tests/oracle_independence.rs` enforces the detectable half: no test file may name
-//! the shader directory. That is why this paragraph does not spell the path out — a
-//! rule that trips its own tripwire has to be allowlisted, and an allowlisted rule
-//! stops being a rule.
+//! No tripwire enforces this. `tests/oracle_independence.rs` used to grep test sources
+//! for a mention of `kernels/vk`, which caught only the laziest spelling of the
+//! violation — a copied path — and cost 112 lines and an allowlist to say so. Deleted:
+//! the rule is a review obligation, and pretending otherwise bought a green check for
+//! the one case that leaves an artifact while the real failure (reading a shader, then
+//! writing the oracle from memory) was always invisible to it.
 //!
 //! **2. A byte-exact oracle must prove its INPUTS are unambiguous.** Where a test
 //! compares quantised bytes, the test DATA is a source of cross-driver flake
@@ -53,14 +55,11 @@ use rivoli::vk::{
 };
 use std::sync::atomic::Ordering;
 
-fn f32b(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
-}
-fn f32v(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
-}
+mod common;
+use common::{Lcg, assert_close, err_tol, f32b, f32v, u16b};
+
+/// Upload `b` to a fresh device buffer. Backend-typed, so it stays here rather than in
+/// `common`: this is `Buf` under Vulkan and `DeviceBuf` under HIP.
 fn dev(b: &[u8]) -> Buf {
     let mut d = Buf::new(b.len()).expect("alloc");
     d.write_at(0, b).expect("fill");
@@ -80,13 +79,9 @@ struct Shapes {
 
 impl Shapes {
     /// Like `assert_close` but records instead of panicking. Always prints the margin.
+    /// Shares `err_tol` with it: two copies of a tolerance formula is two tolerances.
     fn close(&mut self, want: &[f32], got: &[f32], label: &str) {
-        let mx = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        let err = want
-            .iter()
-            .zip(got)
-            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
-        let tol = 1e-3 * mx + 1e-3;
+        let (err, tol) = err_tol(want, got);
         println!(
             "{label}: err={err:.3e} tol={tol:.3e} margin={:.1}x",
             tol / err.max(f32::MIN_POSITIVE)
@@ -103,40 +98,6 @@ impl Shapes {
             self.bad.len(),
             self.bad.join("\n  ")
         );
-    }
-}
-
-/// Report the max error AND the threshold it was compared against. Printing the
-/// margin is the point: a green oracle that passed on 100x of headroom looks exactly
-/// like one that passed on 2x, and only one of them is evidence.
-fn assert_close(want: &[f32], got: &[f32], label: &str) {
-    let mx = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    let err = want
-        .iter()
-        .zip(got)
-        .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
-    let tol = 1e-3 * mx + 1e-3;
-    println!("{label}: err={err:.3e} tol={tol:.3e} margin={:.1}x", tol / err.max(f32::MIN_POSITIVE));
-    assert!(err <= tol, "{label}: err={err:.3e} > tol={tol:.3e}");
-}
-
-struct Lcg(u64);
-impl Lcg {
-    /// Uniform in [-1, 1).
-    ///
-    /// `>> 32`, not `>> 33`: the old shift left 31 bits, which over `u32::MAX` gives
-    /// [0, 0.5) and therefore `*2 - 1` in [-1, 0) — EVERY SAMPLE NEGATIVE. In a GEMV
-    /// oracle that makes every product positive, so the sums grow instead of
-    /// cancelling, `mx` inflates, and the relative tolerance turns into ~100x of
-    /// headroom. It also meant no oracle ever exercised cancellation — the one regime
-    /// where summation order matters, and the entire reason `wave_sum` is a fixed
-    /// ladder.
-    fn f(&mut self) -> f32 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((self.0 >> 32) as f32 / u32::MAX as f32) * 2.0 - 1.0
     }
 }
 
@@ -3142,19 +3103,11 @@ struct ExpertBytes {
 }
 
 /// fp16 bit pattern -> f32. Exact for every finite value: 10 mantissa bits into 23, and
-/// the 2^-24 subnormals are f32 normals. `math.rs` exports only the forward direction.
+/// the 2^-24 subnormals are f32 normals. `math.rs` exports only the forward direction, and
+/// this widening is `half`'s job rather than 12 lines of bit surgery — the same delegation
+/// `math::f32_to_f16` makes, so oracle and engine widen through one implementation.
 fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits as u32) & 0x8000) << 16;
-    let exp = ((bits >> 10) & 0x1f) as u32;
-    let mant = (bits & 0x03ff) as u32;
-    if exp == 0 {
-        let v = (mant as f32) * (1.0 / 16_777_216.0);
-        return if sign != 0 { -v } else { v };
-    }
-    if exp == 0x1f {
-        return f32::from_bits(sign | 0x7f80_0000 | (mant << 13));
-    }
-    f32::from_bits(sign | ((exp + 112) << 23) | (mant << 13))
+    half::f16::from_bits(bits).to_f32()
 }
 
 /// The 12-bit index of subvector `t`, in `dot_vq_wave`'s own form.
@@ -3389,7 +3342,6 @@ fn moe_vq_matches_the_host_oracles() {
         .flat_map(|b| b.iter().flat_map(|s| (s.ptr() as u64).to_le_bytes()))
         .collect();
     let db = dev(&desc_bytes);
-    let u16b = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|h| h.to_le_bytes()).collect() };
     let (gcb, ucb, dcb) = (dev(&u16b(&gate_cb)), dev(&u16b(&up_cb)), dev(&u16b(&down_cb)));
     let (xb, wb) = (dev(&f32b(&x)), dev(&f32b(&wexpert)));
     let mut hb = dev(&vec![0u8; e_count * inter * 4]);

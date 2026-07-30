@@ -86,7 +86,7 @@ pub mod spans {
         }
         if CUR_TOK.swap(tok, Ordering::Relaxed) != tok {
             let stride = STRIDE.load(Ordering::Relaxed).max(1);
-            SAMPLED.store(tok % stride == 0, Ordering::Relaxed);
+            SAMPLED.store(tok.is_multiple_of(stride), Ordering::Relaxed);
         }
         CUR_TOK_ID.store(tok_id, Ordering::Relaxed);
         CUR_LAYER.store(layer, Ordering::Relaxed);
@@ -112,10 +112,8 @@ pub mod spans {
         if let Ok(mut v) = l.recs.lock() {
             v.clear();
         }
-        if let Some(m) = LAYERS.get() {
-            if let Ok(mut v) = m.lock() {
-                v.clear();
-            }
+        if let Some(Ok(mut v)) = LAYERS.get().map(|m| m.lock()) {
+            v.clear();
         }
         tracing::info!(
             "RIVOLI_SPANS: budget {} / (~{per_tok} spans/tok x {ngen} tok) -> every {stride}th \
@@ -289,7 +287,7 @@ pub fn longest_repeated_block(ids: &[u32]) -> usize {
     };
     let (mut lo, mut hi) = (0usize, n / 2);
     while lo < hi {
-        let mid = (lo + hi + 1) / 2;
+        let mid = (lo + hi).div_ceil(2);
         if has_repeat(mid) {
             lo = mid;
         } else {
@@ -424,7 +422,6 @@ pub struct RunInfo {
     pub mode: String,
     pub cache_policy: String,
     pub attn: String,
-    pub topk_path: &'static str,
     /// `--max-mem <GiB>`, or None when the budget auto-sizes.
     pub max_mem_gib: Option<u64>,
     pub bench_tokens: Option<usize>,
@@ -448,20 +445,12 @@ pub struct RunInfo {
 /// fields. Built by the GPU engine from its always-on [`Profile`](crate::gpu) buckets.
 #[derive(Debug, Clone, Copy)]
 pub struct ProfileSummary {
-    /// The `RIVOLI_TOPK` arm this run used (docs/NPU.md). Printed in the PROFILE line so
-    /// a row pasted into benchmarks.md identifies its own arm — the engine names it once
-    /// at construction, thousands of log lines earlier.
-    pub topk_path: &'static str,
     pub tok_per_s: f64,
     pub hit_pct: f64,
     pub wall_ms: f64,
     pub route_ms: f64,
     /// The DSA indexer's GPU-timeline span; see [`Profile::idx_gpu_ns`](crate::gpu).
     pub idx_gpu_ms: f64,
-    /// The host half of the selection (score D2H + CPU top-k + row upload) — GPU-idle time.
-    /// `None` on the device arms, which never do it; a 0.0 there would read as a
-    /// measurement of work that no longer exists (same reason as `swap_pct`).
-    pub idx_host_ms: Option<f64>,
     /// Full layers per token that took the scoring path. Not `21` until context exceeds
     /// `index_topk`, and 0 whenever the indexer never scored — which is what gates the
     /// report line below.
@@ -539,8 +528,7 @@ impl ProfileSummary {
         tracing::info!(
             // wall/route at 0.1 ms: the DSA selection A/B (docs/NPU.md) turns on deltas of
             // a few ms against a ~400 ms token, which 1 ms resolution rounds into noise.
-            "PROFILE/tok [topk={}]: {:.1}ms wall | route {:.1}ms | moe {:.0}ms (gpu {:.0}ms) | fetch {:.0}ms ({:.0}% hidden, {:.0}ms exposed) | {:.2} miss, {:.2}ms/miss, {:.2} GB",
-            self.topk_path,
+            "PROFILE/tok: {:.1}ms wall | route {:.1}ms | moe {:.0}ms (gpu {:.0}ms) | fetch {:.0}ms ({:.0}% hidden, {:.0}ms exposed) | {:.2} miss, {:.2}ms/miss, {:.2} GB",
             self.wall_ms,
             self.route_ms,
             self.moe_wall_ms,
@@ -595,15 +583,9 @@ impl ProfileSummary {
         // scored — dense/streaming, or a context that stayed under `index_topk`, where a
         // row of zeros would read as a measurement of something that did not happen.
         if self.idx_layers_per_tok > 0.0 {
-            let host = match self.idx_host_ms {
-                Some(ms) => format!(
-                    "host {ms:.1}ms (D2H+topk+upload) => {:.1}us per layer",
-                    ms * 1e3 / self.idx_layers_per_tok,
-                ),
-                None => "host n/a (selection on device)".to_string(),
-            };
             tracing::info!(
-                "  indexer/tok: gpu {:.1}ms => {:.1}us per layer + {host} over {:.3} scoring layers",
+                "  indexer/tok: gpu {:.1}ms => {:.1}us per layer (selection on device) over \
+                 {:.3} scoring layers",
                 self.idx_gpu_ms,
                 // Guarded non-zero by the `> 0.0` above, so this division is safe.
                 self.idx_gpu_ms * 1e3 / self.idx_layers_per_tok,
@@ -698,7 +680,6 @@ mod otlp {
         span.set_attribute(KeyValue::new("rivoli.mode", run.mode.clone()));
         span.set_attribute(KeyValue::new("rivoli.cache_policy", run.cache_policy.clone()));
         span.set_attribute(KeyValue::new("rivoli.attn", run.attn.clone()));
-        span.set_attribute(KeyValue::new("rivoli.topk_path", run.topk_path));
         span.set_attribute(KeyValue::new("rivoli.moe_gain", f64::from(run.moe_gain)));
         span.set_attribute(KeyValue::new("rivoli.2q_kin_pct", i64::from(run.two_q_kin)));
         span.set_attribute(KeyValue::new("rivoli.2q_kout_pct", i64::from(run.two_q_kout)));

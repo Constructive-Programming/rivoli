@@ -21,6 +21,30 @@
 //! mechanical transliteration: a host pointer and a device address are two unrelated
 //! numbers there (docs/VULKAN.md, "Host pointer != device address").
 
+/// The bump cursor both backends' `DeviceTier::place` runs on — 256-byte aligned
+/// offsets, `len` rounded up to `pad`, OOM refused rather than wrapped.
+///
+/// Shared because it is the one part of the tier that is NOT backend-specific: what
+/// differs is how the bytes are written (a host memcpy under HIP, `Buf::write_at` under
+/// Vulkan) and what address comes back, not where the placement lands. The two copies
+/// this replaces had drifted in their OOM message and, more to the point, only one of
+/// them was covered by a test for a ragged length.
+///
+/// `pad` is 1 under HIP (byte reads, no word hazard) and [`crate::vk::WORD`] under
+/// Vulkan, whose shaders read the slab a `uint` at a time. Returns the offset; the caller
+/// advances nothing itself.
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
+fn bump(used: &mut usize, capacity: usize, len: usize, pad: usize) -> anyhow::Result<usize> {
+    let off = (*used + 255) & !255;
+    let span = len.next_multiple_of(pad);
+    anyhow::ensure!(
+        off + span <= capacity,
+        "device tier OOM: need {len} (padded to {span}) at offset {off}, capacity {capacity}"
+    );
+    *used = off + span;
+    Ok(off)
+}
+
 #[cfg(feature = "rocm")]
 mod ffi {
     use std::ffi::c_void;
@@ -161,27 +185,33 @@ mod tier {
         /// Errors if the tier is full — the pin is sized to fit, so OOM here is a
         /// budgeting bug, not a runtime condition.
         pub fn place(&mut self, bytes: &[u8]) -> Result<*mut u8> {
-            let dst = self.reserve(bytes.len())?;
-            // SAFETY: `dst` owns the `bytes.len()` bytes just reserved, and the source
-            // is a live slice; the regions cannot overlap (one is the mmap'd artifact
+            // `pad` 1: HIP kernels read the slab bytewise, so there is no word-read
+            // hazard to pad against (the Vulkan tier passes `WORD` for that reason).
+            let off = super::bump(&mut self.used, self.capacity, bytes.len(), 1)?;
+            // SAFETY: off+len ≤ capacity (checked by `bump`); within the slab. The source
+            // is a live slice and the regions cannot overlap (one is the mmap'd artifact
             // or a fresh Vec, the other the device slab).
+            let dst = unsafe { self.slab.ptr_mut().add(off) };
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
             Ok(dst)
         }
 
-        /// Bump the cursor by `len` (256-aligned) and return the slab pointer.
-        /// Private: [`DeviceTier::place`] is the only way to obtain a tier pointer,
-        /// so one cannot escape unfilled.
-        fn reserve(&mut self, len: usize) -> Result<*mut u8> {
-            let off = (self.used + 255) & !255;
-            ensure!(
-                off + len <= self.capacity,
-                "device tier OOM: need {len} at offset {off}, capacity {}",
-                self.capacity
-            );
-            self.used = off + len;
-            // SAFETY: off+len ≤ capacity (checked); within the slab.
-            Ok(unsafe { self.slab.ptr_mut().add(off) })
+        /// Read the slab's first `len` bytes back to the host. Test-only, and it exists
+        /// so ONE `tier_roundtrips_placed_bytes` covers both backends: the Vulkan tier
+        /// hands out device addresses that cannot be dereferenced on the host, so a test
+        /// reading through `place`'s return value could only ever have run here.
+        #[cfg(test)]
+        pub(super) fn read_prefix(&mut self, len: usize) -> Result<Vec<u8>> {
+            // SAFETY: the slab is host-mapped and at least `len` bytes (callers pass
+            // `used`), and no kernel runs during these tests.
+            Ok(unsafe { std::slice::from_raw_parts(self.slab.host_mut(), len) }.to_vec())
+        }
+
+        /// The bump cursor, for the shared tier tests at file scope. `#[cfg(test)]`, so
+        /// the field stays private in a real build.
+        #[cfg(test)]
+        pub(super) fn used(&self) -> usize {
+            self.used
         }
     }
 
@@ -277,50 +307,26 @@ mod tier {
         /// resized). For partially-written buffers — e.g. the indexer's score
         /// slab, sized to max_ctx but holding only `nt` scores this step — so
         /// the D2H moves nt·4 bytes, not the whole slab.
+        ///
+        /// The bounds check is here and the transfer is [`DeviceBuf::copy_out_raw`]'s:
+        /// three copies of the same `clear`/`reserve`/`hipMemcpy`/`set_len` sequence is
+        /// three places for the `set_len` to stop matching the copy.
         pub fn copy_out_prefix(&self, out: &mut Vec<u8>, len: usize) -> Result<()> {
             ensure!(
                 len <= self.len,
                 "copy_out_prefix {len} > buf len {}",
                 self.len
             );
-            // No zero-fill: the D2H overwrites the whole range (see copy_out_raw).
-            out.clear();
-            out.reserve(len);
-            // SAFETY: source has `len <= self.len` bytes; dest owns `len` reserved bytes.
-            let e = unsafe {
-                hipMemcpy(
-                    out.as_mut_ptr() as *mut c_void,
-                    self.ptr as *const c_void,
-                    len,
-                    HIP_MEMCPY_D2H,
-                )
-            };
-            ensure!(e == HIP_SUCCESS, "hipMemcpy D2H failed ({e})");
-            // SAFETY: the copy above initialized the first `len` bytes.
-            unsafe { out.set_len(len) };
-            Ok(())
+            // SAFETY: `self.ptr` owns `self.len >= len` device bytes, and the caller's
+            // sync obligation is the same one `copy_out_raw` documents.
+            unsafe { Self::copy_out_raw(self.ptr, len, out) }
         }
 
         /// Copy the whole buffer back into `out` (a caller-owned buffer reused
         /// across tokens: cleared then refilled to `len`, so the per-token decode
         /// D2H allocates nothing once `out` has grown to size).
         pub fn copy_out_into(&self, out: &mut Vec<u8>) -> Result<()> {
-            // No zero-fill: the D2H overwrites the whole buffer (see copy_out_raw).
-            out.clear();
-            out.reserve(self.len);
-            // SAFETY: both regions are `len` bytes; dest owns them reserved.
-            let e = unsafe {
-                hipMemcpy(
-                    out.as_mut_ptr() as *mut c_void,
-                    self.ptr as *const c_void,
-                    self.len,
-                    HIP_MEMCPY_D2H,
-                )
-            };
-            ensure!(e == HIP_SUCCESS, "hipMemcpy D2H failed ({e})");
-            // SAFETY: the copy above initialized the first `len` bytes.
-            unsafe { out.set_len(self.len) };
-            Ok(())
+            self.copy_out_prefix(out, self.len)
         }
 
         pub fn ptr(&self) -> *const u8 {
@@ -412,41 +418,6 @@ mod tier {
         }
     }
 
-    #[cfg(test)]
-    #[allow(clippy::unwrap_used, clippy::expect_used)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn tier_roundtrips_placed_bytes() {
-            // Small tier; reserve+fill two patterns via the host-writable ptr, read
-            // both back in place (VMM is host-readable), check the 256-align gap
-            // doesn't corrupt either.
-            let mut tier = DeviceTier::new(4 << 20).expect("alloc tier");
-            let a: Vec<u8> = (0..1000u32).map(|i| (i & 0xff) as u8).collect();
-            let b: Vec<u8> = (0..500u32).map(|i| ((i * 7) & 0xff) as u8).collect();
-            let pa = tier.place(&a).expect("place a");
-            let pb = tier.place(&b).expect("place b");
-            assert_ne!(pa, pb);
-            // SAFETY: read back the bytes just written (device-local, host-mapped).
-            let (ra, rb) = unsafe {
-                (
-                    std::slice::from_raw_parts(pa, a.len()),
-                    std::slice::from_raw_parts(pb, b.len()),
-                )
-            };
-            assert_eq!(ra, &a[..]);
-            assert_eq!(rb, &b[..]);
-            // 1000 bumps to 1024 (256-aligned) before b lands.
-            assert_eq!(tier.used, 1024 + 500);
-        }
-
-        #[test]
-        fn tier_rejects_overflow() {
-            let mut tier = DeviceTier::new(1 << 20).expect("alloc tier");
-            assert!(tier.place(&vec![0u8; (1 << 20) + 1]).is_err());
-        }
-    }
 }
 
 #[cfg(feature = "vulkan")]
@@ -552,16 +523,13 @@ mod vktier {
         // re-pin, a hot-swap — this needs the same sync `copy_in_at` got, for the same
         // reason.
         pub fn place(&mut self, bytes: &[u8]) -> Result<*mut u8> {
-            let off = (self.used + 255) & !255;
-            let span = bytes.len().next_multiple_of(crate::vk::WORD);
-            ensure!(
-                off + span <= self.capacity,
-                "device tier OOM: need {} (padded to {span}) at offset {off}, capacity {}",
+            let off = super::bump(
+                &mut self.used,
+                self.capacity,
                 bytes.len(),
-                self.capacity
-            );
+                crate::vk::WORD,
+            )?;
             self.slab.write_at(off, bytes)?;
-            self.used = off + span;
             Ok((self.slab.ptr() as usize + off) as *mut u8)
         }
 
@@ -569,11 +537,19 @@ mod vktier {
         ///
         /// Test-only, and the tests need it: what [`DeviceTier::place`] returns is a
         /// device address, so there is no other way to observe what a placement wrote.
+        /// The HIP tier carries the same accessor so one test covers both.
         #[cfg(test)]
-        fn read_prefix(&self, len: usize) -> Result<Vec<u8>> {
+        pub(super) fn read_prefix(&mut self, len: usize) -> Result<Vec<u8>> {
             let mut out = Vec::new();
             self.slab.read_into(&mut out, len)?;
             Ok(out)
+        }
+
+        /// The bump cursor, for the shared tier tests at file scope. `#[cfg(test)]`, so
+        /// the field stays private in a real build.
+        #[cfg(test)]
+        pub(super) fn used(&self) -> usize {
+            self.used
         }
     }
 
@@ -635,8 +611,9 @@ mod vktier {
 
         /// Copy the whole buffer back into `out` (a caller-owned buffer reused across
         /// tokens, so the per-token readback allocates nothing once it has grown).
-        /// SYNC FIRST, for the same reason as [`DeviceBuf::copy_in_at`] — the HIP twin
-        /// is a blocking `hipMemcpy(..., D2H)` and callers were written against that.
+        /// SYNCS FIRST via [`DeviceBuf::copy_out_prefix`], for the same reason as
+        /// [`DeviceBuf::copy_in_at`] — the HIP twin is a blocking `hipMemcpy(..., D2H)`
+        /// and callers were written against that.
         ///
         /// Without it, `gpu.rs:789` (`launch_gemv_f32` then immediately
         /// `gate_logits.copy_out_into`) would read the PREVIOUS token's gate logits,
@@ -645,8 +622,7 @@ mod vktier {
         /// token, coherently, with no error. `gpu.rs:972` (`launch_argmax` then
         /// `argmax_dev.copy_out_into`) is the same shape and yields the wrong token.
         pub fn copy_out_into(&self, out: &mut Vec<u8>) -> Result<()> {
-            crate::vk::device_sync()?;
-            self.buf.read_into(out, self.len)
+            self.copy_out_prefix(out, self.len)
         }
 
         /// DIAGNOSTIC: read `len` bytes back from an arbitrary device pointer.
@@ -743,32 +719,6 @@ mod vktier {
     mod tests {
         use super::*;
 
-        #[test]
-        fn tier_roundtrips_placed_bytes() {
-            let mut tier = DeviceTier::new(4 << 20).expect("alloc tier");
-            let a: Vec<u8> = (0..1000u32).map(|i| (i & 0xff) as u8).collect();
-            let b: Vec<u8> = (0..500u32).map(|i| ((i * 7) & 0xff) as u8).collect();
-            let pa = tier.place(&a).expect("place a");
-            let pb = tier.place(&b).expect("place b");
-            assert_ne!(pa, pb);
-            // 1000 bumps to 1024 (256-aligned) before b lands, and the returned device
-            // addresses track those offsets.
-            assert_eq!(tier.used, 1024 + 500);
-            assert_eq!(pb as usize - pa as usize, 1024);
-            // NOT read back through `pa`/`pb` the way the HIP test does: those are
-            // device addresses, and dereferencing one on the host is a segfault at best.
-            // The tier's own slab is the only host view of these bytes.
-            let got = tier.read_prefix(tier.used).expect("read back");
-            assert_eq!(&got[..a.len()], &a[..], "a corrupted");
-            assert_eq!(&got[1024..1024 + b.len()], &b[..], "b corrupted");
-        }
-
-        #[test]
-        fn tier_rejects_overflow() {
-            let mut tier = DeviceTier::new(1 << 20).expect("alloc tier");
-            assert!(tier.place(&vec![0u8; (1 << 20) + 1]).is_err());
-        }
-
         /// `place` advances the cursor by a WORD-rounded span. Neither length in
         /// `tier_roundtrips_placed_bytes` is ragged (1000 and 500 are both multiples of
         /// 4), so `used` is identical with and without the padding and that test could
@@ -783,26 +733,6 @@ mod vktier {
                 "cursor must advance by the WORD-rounded span, so a shader's 32-bit \
                  read of the final byte cannot reach the next placement"
             );
-        }
-
-        #[test]
-        fn devicebuf_roundtrips() {
-            let mut d = DeviceBuf::new(64).expect("alloc");
-            d.copy_in_at(0, &[0u8; 64]).expect("zero");
-            let bytes: Vec<u8> = (1..=32u8).collect();
-            d.copy_in_at(8, &bytes).expect("copy in");
-            let out = d.copy_out().expect("copy out");
-            assert_eq!(out.len(), 64);
-            assert_eq!(&out[8..40], &bytes[..]);
-            assert!(out[..8].iter().all(|&v| v == 0), "wrote before the offset");
-            assert!(out[40..].iter().all(|&v| v == 0), "wrote past the bytes");
-            // The prefix form moves only `len` bytes, and `out` is reused, so its final
-            // length is the proof it did not fall back to the whole buffer.
-            let mut pre = vec![0xAAu8; 999];
-            d.copy_out_prefix(&mut pre, 16).expect("prefix");
-            assert_eq!(pre, &out[..16]);
-            assert!(d.copy_out_prefix(&mut pre, 65).is_err());
-            assert!(d.copy_in_at(48, &bytes).is_err());
         }
 
         /// The device base and the host base are DIFFERENT NUMBERS. This is the
@@ -824,12 +754,82 @@ mod vktier {
             );
         }
 
-        #[test]
-        fn vmmbuf_allocates_distinct_device_bases() {
-            let a = VmmBuf::new(4096).expect("alloc a");
-            let b = VmmBuf::new(4096).expect("alloc b");
-            assert!(!a.ptr().is_null());
-            assert_ne!(a.ptr(), b.ptr());
-        }
+    }
+}
+
+/// The tier/buffer tests that are the SAME question on both backends, written once
+/// against the four re-exported names.
+///
+/// They used to be two near-identical `mod tests` blocks, one per backend, which is how
+/// the ROCm side ended up with no `DeviceBuf` coverage at all and the Vulkan side with
+/// the only ragged-length cursor check. What genuinely differs stays inside each backend
+/// module: the WORD padding (`place_pads_the_cursor_to_a_word`, Vulkan-only, since HIP
+/// pads by 1) and the device/host base distinction (`vmmbuf_device_and_host_bases_differ`,
+/// where HIP's two bases are deliberately the same number).
+///
+/// Needs a real device, so it runs only under a backend feature — a featureless
+/// `cargo test` skips the module rather than failing to link.
+#[cfg(all(test, any(feature = "rocm", feature = "vulkan")))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tier_tests {
+    use super::{DeviceBuf, DeviceTier, VmmBuf};
+
+    /// Two placements land at 256-aligned offsets, keep their bytes, and the returned
+    /// addresses track the cursor. Read back through `read_prefix` rather than through
+    /// the returned pointer: under Vulkan that pointer is a device address and
+    /// dereferencing it on the host is a segfault at best.
+    #[test]
+    fn tier_roundtrips_placed_bytes() {
+        let mut tier = DeviceTier::new(4 << 20).expect("alloc tier");
+        let a: Vec<u8> = (0..1000u32).map(|i| (i & 0xff) as u8).collect();
+        let b: Vec<u8> = (0..500u32).map(|i| ((i * 7) & 0xff) as u8).collect();
+        let pa = tier.place(&a).expect("place a");
+        let pb = tier.place(&b).expect("place b");
+        assert_ne!(pa, pb);
+        // 1000 bumps to 1024 (256-aligned) before b lands.
+        assert_eq!(tier.used(), 1024 + 500);
+        assert_eq!(pb as usize - pa as usize, 1024);
+        let used = tier.used();
+        let got = tier.read_prefix(used).expect("read back");
+        assert_eq!(&got[..a.len()], &a[..], "a corrupted");
+        assert_eq!(&got[1024..1024 + b.len()], &b[..], "b corrupted");
+    }
+
+    #[test]
+    fn tier_rejects_overflow() {
+        let mut tier = DeviceTier::new(1 << 20).expect("alloc tier");
+        assert!(tier.place(&vec![0u8; (1 << 20) + 1]).is_err());
+    }
+
+    #[test]
+    fn devicebuf_roundtrips() {
+        let mut d = DeviceBuf::new(64).expect("alloc");
+        d.copy_in_at(0, &[0u8; 64]).expect("zero");
+        let bytes: Vec<u8> = (1..=32u8).collect();
+        d.copy_in_at(8, &bytes).expect("copy in");
+        let out = d.copy_out().expect("copy out");
+        assert_eq!(out.len(), 64);
+        assert_eq!(&out[8..40], &bytes[..]);
+        assert!(out[..8].iter().all(|&v| v == 0), "wrote before the offset");
+        assert!(out[40..].iter().all(|&v| v == 0), "wrote past the bytes");
+        // The prefix form moves only `len` bytes, and `out` is reused, so its final
+        // length is the proof it did not fall back to the whole buffer. This also
+        // exercises the shared D2H path: `copy_out_into` -> `copy_out_prefix` ->
+        // `copy_out_raw` under HIP, so a broken `set_len` shows up here.
+        let mut pre = vec![0xAAu8; 999];
+        d.copy_out_prefix(&mut pre, 16).expect("prefix");
+        assert_eq!(pre, &out[..16]);
+        assert!(d.copy_out_prefix(&mut pre, 65).is_err());
+        assert!(d.copy_in_at(48, &bytes).is_err());
+    }
+
+    #[test]
+    fn vmmbuf_allocates_distinct_device_bases() {
+        // `ptr_mut` on both backends (HIP has no `ptr`), hence the `mut` bindings — the
+        // mutability is about what the kernels do to these bytes, not the CPU.
+        let mut a = VmmBuf::new(4096).expect("alloc a");
+        let mut b = VmmBuf::new(4096).expect("alloc b");
+        assert!(!a.ptr_mut().is_null());
+        assert_ne!(a.ptr_mut(), b.ptr_mut());
     }
 }

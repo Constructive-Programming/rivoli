@@ -946,6 +946,10 @@ impl<'a> Pin<'a> {
     /// may RELOCATE resident slots. 1c: only NOW, after all relocations have settled,
     /// resolve each key's final slot and build the misses' cold reads — so a read never
     /// targets a slot that later moves. Returns the per-`sel` resolved slots + signals.
+    // The return tuple is (resolved slots, load signals, per-expert int4 flag), spelled
+    // out rather than hidden behind a type alias: one caller, and the doc line above
+    // already names the three parts. An alias here would be one more name to chase.
+    #[allow(clippy::type_complexity)]
     fn submit_spine(
         &mut self,
         layer: usize,
@@ -1103,6 +1107,9 @@ impl<'a> Pin<'a> {
     /// `window`/`choice` feed the trace sink only: the ranked top-[`TRACE_WINDOW`]
     /// candidate expert ids and the full per-expert `choice` array they index into.
     /// Pass an empty `window` when not tracing — nothing else reads them.
+    // Eight arguments, all distinct runtime values on the per-layer hot path; bundling
+    // them into a struct built once per layer would allocate to satisfy a lint.
+    #[allow(clippy::too_many_arguments)]
     pub fn submit_layer(
         &mut self,
         layer: usize,

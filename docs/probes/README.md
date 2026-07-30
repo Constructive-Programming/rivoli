@@ -5,11 +5,22 @@ each is its own tiny cargo package so it cannot perturb `rivoli`'s dependency gr
 lint surface. You fire one when you need to establish a fact about the machine, then
 record the answer in the doc that depends on it.
 
-| probe | question it answers |
-|---|---|
-| `vk_validation/` | Do the Vulkan validation checkers actually fire on this driver + layer? |
+**No probe currently lives here.** `vk_validation/` was deleted after its answers were
+recorded — see below. Everything from "Operating in this repo" onward is method that
+outlives any one probe: it is about writing guards and reading their silence, and it is
+why this file survives the crate it documented.
+
+| probe | question it answered | status |
+|---|---|---|
+| `vk_validation/` | Do the Vulkan validation checkers actually fire on this driver + layer? | answered, deleted; source in git at `77b5500:docs/probes/vk_validation` |
 
 ## `vk_validation` — trust a silence, but verify it first
+
+**The probe is deleted; this section is its finding.** Restoring it from the tree at
+`77b5500` is the way to re-establish the matrix below — do that rather than re-deriving
+the fault injections, which are the expensive part (each mode had to be tuned until the
+layer actually complained, and a fault the layer ignores looks identical to a checker
+that is not watching).
 
 The Vulkan backend's whole safety argument rests on the validation layer reporting
 nothing. That argument is worthless if the checker is loaded but inert, which is not a
@@ -18,16 +29,9 @@ default**, so a clean run under the default configuration says nothing whatsoeve
 the `Gpu::enqueue` barrier or about buffer-device-address accesses — and those are, in
 order, the two things most likely to be wrong in this backend.
 
-So before trusting silence, make each checker speak. Each mode injects one deliberate
-fault and reports whether the expected diagnostic came back.
-
-```
-cd docs/probes/vk_validation
-
-cargo run -- core                                  # no env needed
-VK_LAYER_VALIDATE_SYNC=1 cargo run -- sync
-VK_LAYER_GPUAV_ENABLE=1  cargo run -- gpuav
-```
+So before trusting silence, make each checker speak. Each mode injected one deliberate
+fault and reported whether the expected diagnostic came back — `core` needs no env,
+`sync` needs `VK_LAYER_VALIDATE_SYNC=1`, `gpuav` needs `VK_LAYER_GPUAV_ENABLE=1`.
 
 | mode | fault injected | expected diagnostic |
 |---|---|---|
@@ -83,7 +87,11 @@ injects that exact access shape rather than a toy.
 Whenever the answer could have changed and you are about to rely on it: a Mesa/RADV
 update, a `vulkan-layers` update, a loader update, or a move to different hardware. This
 box went from *no validation layer installed at all* to 1.4.341 inside a single working
-session; "it fired last time" is not evidence about this time.
+session; "it fired last time" is not evidence about this time. **That is the standing
+cost of having deleted the probe: the trigger still exists, and meeting it now takes a
+`git show 77b5500:docs/probes/vk_validation/src/main.rs` first.** The alternative was
+keeping 800 lines and a second crate resident to answer a question that fires on a
+driver update, and the record below is what it produced.
 
 Last established on RADV STRIX_HALO (AMD Radeon 8060S),
 `VK_LAYER_KHRONOS_validation` 1.4.341, Vulkan 1.4.335 loader:

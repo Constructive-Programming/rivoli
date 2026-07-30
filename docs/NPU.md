@@ -125,7 +125,13 @@ it with GPU work that does **not** need the selection. Two windows:
 ## MEASURED — M0 and M1
 
 Instrument: `examples/indexer_bench.rs`, gfx1151, sole tenant, 2026-07-26. Same launch
-wrappers and GLM-5.2 dims as the engine, every constant sourced to a manifest key. **Rows,
+wrappers and GLM-5.2 dims as the engine, every constant sourced to a manifest key.
+**The rig is DELETED** (source at `77b5500:examples/indexer_bench.rs`): the in-engine
+confirmation below both superseded it and refuted its central figure by 27%, and the
+engine's own always-on `idx_gpu_ns` bucket now measures in situ what it approximated from
+outside. (`idx_host_ns` went with the host selection arm — see "Wired" below; on the shipped
+device path it was measuring zero.) Restore it only to re-derive a per-kernel decomposition; for
+totals, read a run's PROFILE line. **Rows,
 controls and methodology are recorded in `benchmarks.md`, "DSA indexer round"**; this
 section is the interpretation. Figures below are from that round's final run unless a
 superseded run is named explicitly.
@@ -467,8 +473,12 @@ budget and costs one prefill, and is worth doing before anyone relies on the 32k
 
 ### Wired — the device top-k in the engine, and both wins are real
 
-`RIVOLI_TOPK` selects the arm; three timing arms plus a correctness arm from **one binary**,
-interleaved, 2432-token prompt, `-bench 128`, sole tenant, 2026-07-27. Rows, the bucket
+`RIVOLI_TOPK` selected the arm; three timing arms plus a correctness arm from **one
+binary**, interleaved, 2432-token prompt, `-bench 128`, sole tenant, 2026-07-27. **The
+switch is gone** — the engine now always selects on device, the rejected `device-nosync`
+option is recorded below rather than shipped, and `verify`'s comparison lives in
+`tests/kernel.rs::index_topk_matches_host_selection`. Re-running the A/B means restoring
+the arms from git (`77b5500:src/gpu.rs`). Rows, the bucket
 table and the full caveat list are in benchmarks.md, "Device top-k WIRED"; this is the
 interpretation.
 

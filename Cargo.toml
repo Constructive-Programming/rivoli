@@ -39,6 +39,19 @@ io-uring = { version = "0.7", optional = true }
 # object model, which is the shape this codebase already has (see docs/VULKAN.md).
 # Pinned: ash releases slowly and the surface used here is core 1.2/1.3.
 ash = { version = "0.38", optional = true }
+# CLI parsing. `default-features = false` on purpose: the default set pulls anstream +
+# anstyle{,-parse,-query,-wincon} + colorchoice + utf8parse for COLOURED help, and every
+# invocation of this binary is either a benchmark script or a run whose output is piped to
+# a log. `suggestions` (strsim) is kept — with ~20 flags, "did you mean --2q-kin?" is worth
+# one crate. 13 transitive crates down to 5.
+clap = { version = "4", default-features = false, features = [
+    "std",
+    "derive",
+    "help",
+    "usage",
+    "error-context",
+    "suggestions",
+] }
 
 [features]
 default = []
@@ -72,14 +85,16 @@ trace = []
 name = "dot_bench"
 required-features = ["rocm"]
 
-[[example]]
-name = "indexer_bench"
-required-features = ["rocm"]
-
-# Backend-neutral: the same source builds under either backend, which is the point —
-# it is the only like-for-like kernel comparison available (dot_bench measures gemv_vq,
-# which Vulkan does not have). No required-features: the source is cfg-gated on
-# `any(rocm, vulkan)` so a featureless `cargo build --examples` skips it cleanly.
+# Backend-neutral: the same source builds under either backend, which is the point — it is
+# the only like-for-like kernel comparison available (dot_bench measures gemv_vq, which
+# Vulkan does not have). No `required-features`, because that field is an AND list and this
+# example wants "rocm OR vulkan"; pinning it to one backend would delete the comparison.
+#
+# A featureless `cargo check/test --all-targets` builds this target and SUCCEEDS: the
+# source gates its items individually and keeps a stub `main` that refuses at runtime.
+# It used to carry one file-scope `#![cfg(any(rocm, vulkan))]`, which blanked the file and
+# made cargo reject the example for having no `main` — so a featureless `cargo test` died
+# on `E0601` here, reading like a missing function rather than a missing feature.
 [[example]]
 name = "moe_bench"
 

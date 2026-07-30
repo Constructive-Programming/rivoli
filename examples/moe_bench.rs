@@ -13,19 +13,34 @@
 //!
 //! Run: `cargo run --release --features rocm   --example moe_bench`
 //!      `cargo run --release --features vulkan --example moe_bench`
-#![cfg(any(feature = "rocm", feature = "vulkan"))]
+//!
+//! Every item below is gated on a backend feature INDIVIDUALLY rather than by one
+//! `#![cfg(any(rocm, vulkan))]` at file scope. That inner attribute blanks the whole file,
+//! and cargo then rejects the example for having no `main` — so a featureless
+//! `cargo test` / `cargo check --all-targets` failed on THIS FILE with `E0601`, which
+//! reads like a missing function rather than a missing feature. The stub `main` at the
+//! bottom is what the gating buys: a build with no backend produces a binary that says so.
 #![allow(clippy::expect_used)]
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
 use rivoli::backend::{Event, ExpertDesc, Stream, device_sync, launch_moe_expert_range, launch_moe_reduce};
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
 use rivoli::device::DeviceBuf;
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
 use rivoli::quant::{VQ_DIM, VQ_K, vq_expert_bytes, vq_slot_offsets};
 
 /// The engine's shapes (GLM-5.2): hidden 6144, moe_inter 2048, top-8 routed + 1 shared.
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
 const HIDDEN: usize = 6144;
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
 const INTER: usize = 2048;
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
 const NDESC: usize = 9;
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
 const ITERS: usize = 40;
 
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
 struct Rng(u64);
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
 impl Rng {
     fn next(&mut self) -> u32 {
         self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -37,6 +52,7 @@ impl Rng {
 /// through a codebook, and a constant index would make every lane hit one entry — turning
 /// a scattered read into a broadcast and timing something the real kernel never does.
 /// (`dot_bench` has the same note for the same reason.)
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
 fn pattern(n: usize, seed: u64) -> Vec<u8> {
     let mut r = Rng(seed);
     let p: Vec<u8> = (0..4096).map(|_| r.next() as u8).collect();
@@ -45,16 +61,19 @@ fn pattern(n: usize, seed: u64) -> Vec<u8> {
     v
 }
 
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
 fn f32b(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
 fn dev(b: &[u8]) -> DeviceBuf {
     let mut d = DeviceBuf::new(b.len().max(4)).expect("alloc");
     d.copy_in_at(0, b).expect("fill");
     d
 }
 
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
 fn main() {
     let backend = if cfg!(feature = "vulkan") { "vulkan" } else { "rocm" };
     let slot = vq_expert_bytes(HIDDEN, INTER);
@@ -74,13 +93,13 @@ fn main() {
     );
     let mut r = Rng(7);
     let x = dev(&f32b(&(0..HIDDEN).map(|_| (r.next() >> 8) as f32 / 1e7).collect::<Vec<_>>()));
-    let w = dev(&f32b(&vec![1.0f32; NDESC]));
+    let w = dev(&f32b(&[1.0f32; NDESC]));
     let mut h = dev(&vec![0u8; NDESC * INTER * 4]);
     let mut partial = dev(&vec![0u8; NDESC * HIDDEN * 4]);
     let mut out = dev(&vec![0u8; HIDDEN * 4]);
 
     // Descriptors point into the slab at each expert's six projection offsets.
-    let base = weights.ptr() as *const u8;
+    let base = weights.ptr();
     let descs: Vec<ExpertDesc> = (0..NDESC)
         .map(|e| {
             // SAFETY: `e*slot + off[i]` is inside the slab by construction of
@@ -195,4 +214,17 @@ fn main() {
               is cache-warm relative to the engine, which streams 78 distinct experts. \
               Compare backends against each other, not against the in-engine moe bucket.",
              (slot * NDESC) as f64 / 1e6);
+}
+
+/// A build with no compute backend has no kernels to time.
+///
+/// Exists so this file yields a `main` in EVERY configuration — see the note at the top.
+/// Mirrors `src/main.rs`'s refusal: exit non-zero and name the fix.
+#[cfg(not(any(feature = "rocm", feature = "vulkan")))]
+fn main() {
+    eprintln!(
+        "moe_bench measures the MoE kernels and this build has no compute backend. \
+         Re-run with `--features rocm` or `--features vulkan` (exactly one)."
+    );
+    std::process::exit(1);
 }

@@ -89,7 +89,11 @@ cargo build --release --features rocm
 
 `build.rs` compiles `kernels/*.hip` via `hipcc` — needs ROCm and a gfx1151 target.
 Without `--features rocm` the crate builds host-only (formats, converter logic,
-cache/replay sims), which is what CI/clippy runs.
+cache/replay sims), which is what CI/clippy runs — `cargo test` and
+`cargo clippy --all-targets` are both clean with no features. The binaries and the
+`moe_bench` example still BUILD in that configuration; they refuse at runtime, naming the
+feature to rebuild with, because a rivoli that cannot decode should say so rather than
+fail to link.
 
 Optional features: `otlp` (export the decode as OTLP traces + metrics, opt-in at runtime
 via `OTEL_EXPORTER_OTLP_ENDPOINT`; set `RIVOLI_SPANS` to also emit a per-token/per-layer
@@ -131,7 +135,8 @@ Useful flags: `--max-mem <GiB>` (device budget, literal; default `free − 16 Gi
 auto|dense|dsa|streaming|misa`, `--trace <path>` (dump the routed-expert access
 trace for the offline `replay` sim). The hybrid hot/cold split has no flag — it
 self-sizes with the byte-arena pool.
-Run `rivoli` with no model dir for the full usage line.
+`rivoli --help` lists every flag with its default and its legal values (`-bench` is
+accepted alongside `--bench`, so every command line recorded in benchmarks.md still runs).
 
 ## Layout
 
@@ -139,10 +144,12 @@ Run `rivoli` with no model dir for the full usage line.
 src/            engine — format, quant, pin (residency + streaming), gpu (forward),
                 arena/hybrid (byte-arena pool + policies), stream (io_uring),
                 asyncfetch/gpustream (async load‖compute overlap), math, model, ...
-src/bin/        convert, fp8_to_i4, vq3_to_i4, add_indexer, i4_audit, ppl, replay
+src/bin/        convert, fp8_to_i4, add_indexer, i4_audit, ppl, replay
 kernels/*.hip   HIP kernels (moe, mla, attn, linalg, indexer, fwd, async, vmm)
-examples/       dot_bench — per-format dot microbench (int4 vs int3-vq vs fp8)
-tests/          kernel oracles + lib unit tests
+examples/       dot_bench — per-format dot microbench (int4 vs int3-vq vs fp8, rocm);
+                moe_bench — the MoE kernels alone, same source on both backends
+tests/          kernel oracles + lib unit tests; tests/common/ the shared
+                backend-neutral scaffolding (Lcg, assert_close, byte helpers)
 tests/bench-matrix.sh   the mode x attn x policy matrix runner (classifies every
                 cell ok/SUSPECT/DEGENERATE/CRASH/TIMEOUT; refuses to rank the rest)
 docs/           ARCHITECTURE.md, PERF.md (roadmap + the class-axis profile),

@@ -27,7 +27,7 @@ Each level carries what identifies it, and **deliberately not** the numbers:
 
 | span | attributes |
 |---|---|
-| `rivoli.decode` | `rivoli.{model,mode,cache_policy,attn,topk_path,moe_gain,max_mem_gib,bench_tokens,prompt,route_j,route_m,2q_kin_pct,2q_kout_pct,sinks,window,misa_heads,tokens_generated}` |
+| `rivoli.decode` | `rivoli.{model,mode,cache_policy,attn,moe_gain,max_mem_gib,bench_tokens,prompt,route_j,route_m,2q_kin_pct,2q_kout_pct,sinks,window,misa_heads,tokens_generated}` (`topk_path` is gone — the engine no longer has arms to name) |
 | `token N` | `rivoli.token_index`, `rivoli.token_id` |
 | `layer L` | `experts.{cold,warm}.{int4,int3_vq}`, `experts.cold`, `experts.total` |
 | leaf | `thread` |
@@ -47,10 +47,30 @@ where misses get their slots.
 
 ## Where to send it
 
-**Grafana does not ingest anything.** It queries stores. `alloy-gateway.hr-home.xyz` is the
-intended receiver — as of writing it **does not resolve** (no DNS record in the `hr-home.xyz`
-zone) and no OTLP port is open on `grafana.hr-home.xyz` (192.168.2.1), so the gateway still
-has to be stood up. Config below.
+**Grafana does not ingest anything.** It queries stores. The receiver is an **Alloy gateway
+at `192.168.2.62`**, and it is **up** — this section used to say the opposite, that the
+gateway "still has to be stood up", which stopped being true and sat here as a standing
+discouragement from using a pipeline that works.
+
+Verified from the decode box, 2026-07-30:
+
+| check | result |
+|---|---|
+| `POST http://192.168.2.62:4318/v1/traces` (empty `resourceSpans`) | **200** |
+| `:4317` (OTLP/gRPC) | open |
+| `http://192.168.2.62:12345/-/ready` (Alloy's own UI) | **"Alloy is ready."** |
+| `https://grafana.hr-home.xyz/api/health` | **200** |
+
+The table is what this box can probe; the end-to-end half — spans and metrics from a real
+decode landing in this gateway and rendering in the Grafana dashboard — is confirmed by the
+operator, who has the screenshots. Recorded with that attribution rather than as a
+reproducible check, because a reader who reruns the table has NOT reproduced the pipeline.
+**Do not point this at `grafana.hr-home.xyz`
+(192.168.2.1)** — that host serves the Grafana UI on 443 and refuses 4317/4318, because
+Grafana is the query layer, not the receiver. That confusion is the reason this paragraph
+names an IP and a port rather than "the Grafana box".
+
+Config below.
 
 ### Alloy gateway
 
@@ -111,13 +131,18 @@ cargo build --release --features rocm,otlp --bin rivoli
 
 RIVOLI_SPANS=5000 \
 OTEL_SERVICE_NAME=rivoli \
-OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy-gateway.hr-home.xyz:4318 \
+OTEL_EXPORTER_OTLP_ENDPOINT=http://192.168.2.62:4318 \
 ./target/release/rivoli /var/db/rivoli/glm52-vq3-full \
     --mode hybrid --cache-policy lru --attn dense --max-mem 100 -bench 128
 ```
 
 Verified end-to-end against a local collector: **1501 trace POSTs + 1 metrics POST** for a
-16-token run at `RIVOLI_SPANS=1500`.
+16-token run at `RIVOLI_SPANS=1500`, and against the live gateway at `192.168.2.62:4318`,
+whose spans and metrics render in Grafana.
+
+One POST per span, because the exporter is a `SimpleSpanProcessor` — which is why the Alloy
+config above batches. At `RIVOLI_SPANS=5000` that is 5000 requests at run END, not during
+decode, so it costs the measurement nothing.
 
 ## The dashboard
 

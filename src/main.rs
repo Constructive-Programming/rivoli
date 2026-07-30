@@ -7,212 +7,183 @@
 //! Zero-knob by design — the machine is auto-discovered (see config.rs); the flags
 //! below are benchmark/diagnostic overrides, not required configuration.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
+
+// The decode path's imports and helpers. A featureless build compiles this file down to
+// the refusal stub in `main` (see there for why the binary still builds at all), so
+// everything only the real `main` reaches is gated with it rather than left to warn.
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
+use anyhow::Context;
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
 use rivoli::config::Config;
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
 use tracing::info;
 
-/// CLI: `rivoli <model-dir> [-bench <tokens>] [flags]`. `--cache-policy lru|2q|arc|top-m`
-/// (default 2q) picks the cache policy — `top-m` additionally routes toward resident
-/// experts (`--route-j`/`--route-m`, docs/CACHE_ROUTE.md), which is the one policy that
-/// changes the model's output; `--direct-vmm-dma` forces raw DMA over the
-/// default pinned-host bounce; `--trace <path>` dumps the routed-expert access trace
-/// (v2: demand keys plus the ranked candidate window) for the offline `replay` sim;
-/// `--prompt <text>` overrides the bench prompt;
-/// `--max-mem <GiB>` sets the device budget literally (no OS reserve — may OOM);
-/// without it the budget auto-sizes to `free − 16 GiB`.
+// NOTE: doc comments on this struct and its fields are USER-FACING — clap renders them as
+// `--help`. Rationale for the code goes in `//` comments like this one, which clap ignores.
+//
+// `clap` derives the parse, the help text and the range checks from the struct. The
+// hand-rolled loop it replaced was ~150 lines of
+// `args.next().context(..)?.parse().context(..)?`, one block per flag, plus a `USAGE`
+// const maintained separately from the flags it described — and by the end no longer
+// matching them (it never mentioned `--misa-heads`, `--checksum-x` or `--2q-*`'s bounds).
+//
+// No `wrap_help` feature, so clap does not re-wrap: the terminal does. That also means
+// `max_term_width` would be inert, which is why it is not set.
+/// Zero-knob by design: every flag is a benchmark or diagnostic override, and a bare
+/// `rivoli <model-dir>` is a complete invocation.
+#[derive(clap::Parser, Debug)]
+#[command(name = "rivoli", about = "GLM-5.2 int3-vq MoE decode engine (HIP/ROCm or Vulkan)")]
 struct Args {
+    /// The converted artifact directory (manifest.json + codebooks + resident.safetensors
+    /// + L{ll}.vq3 + tokenizer). The artifact IS the model.
     model: String,
-    bench: Option<usize>,
-    direct_vmm_dma: bool,
-    trace: Option<String>,
-    prompt: Option<String>,
-    cache_policy: String,
-    two_q_kin: u32,
-    two_q_kout: u32,
-    /// `--cache-policy top-m`'s (J, M); ignored by every other policy.
-    route: rivoli::hybrid::RouteAdvice,
-    /// `--ppl <text-file>`: score that file TEACHER-FORCED and write one NLL per
-    /// predicted token to `--ppl-out`, instead of generating. The quality gate for
-    /// `top-m` (docs/CACHE_ROUTE.md "Quality"); never a free-running decode.
-    ppl: Option<String>,
-    ppl_out: Option<String>,
-    max_mem: Option<u64>,
-    /// Routed-expert format (`--mode int3-vq|int4|hybrid`; default hybrid on `rocm`,
-    /// int3-vq on `vulkan` — see `config::Mode`).
-    mode: rivoli::config::Mode,
-    /// Attention mode (`--attn auto|dense|streaming|dsa|misa`). `auto` picks `dsa` when the
-    /// artifact carries indexer weights and the backend has the indexer kernels, else
-    /// `dense` — see `resolve_attn`.
-    attn: String,
-    sinks: usize,
-    window: usize,
-    misa_heads: usize,
-    /// `--moe-gain <g>`: scale the whole MoE branch by `g` before the residual add.
-    /// An EXPERIMENT knob, not a tuning parameter — see kernels/fwd.hip::vaxpy.
-    moe_gain: f32,
-    /// `--dump-ids <path>`: write the generated token ids, one per line.
+
+    /// Decode this many tokens, print PROFILE, exit. Omit for the interactive/server path.
     ///
-    /// This exists for **gate A** of the Vulkan acceptance gate (docs/VULKAN.md): agreement
-    /// on token IDs for K tokens, with K measured and its baseline recorded. Comparing
-    /// decoded TEXT is not a substitute — different id sequences can decode to identical
-    /// text, so a text diff can only ever report a lower bound on divergence. And gate A
-    /// is a standing obligation across commits, not a one-off, so it needs an instrument
-    /// rather than an eyeball.
+    /// Spelled `-bench` in every recorded command line (benchmarks.md, MODES.md,
+    /// tests/bench-matrix.sh); `main` rewrites that single-dash form to `--bench` before
+    /// clap sees it, since clap has no single-dash-long concept. Both work.
+    #[arg(long)]
+    bench: Option<usize>,
+
+    /// Routed-expert format. Default: hybrid on rocm, int3-vq on vulkan (whose int4
+    /// kernels are not ported) — see MODES.md and `config::Mode`.
+    #[arg(long, default_value_t, value_parser = rivoli::config::Mode::parse)]
+    mode: rivoli::config::Mode,
+
+    /// Routed-expert cache policy. `top-m` also routes toward resident experts
+    /// (--route-j/--route-m, docs/CACHE_ROUTE.md) and is the only one that changes the
+    /// model's output.
+    #[arg(long, default_value = "2q", value_parser = ["lru", "2q", "arc", "top-m"])]
+    cache_policy: String,
+
+    /// 2Q's A1in probation bound, percent of pool capacity. Ignored by lru/arc.
+    #[arg(long = "2q-kin", value_name = "PCT", default_value_t = rivoli::cache::TwoQSplit::default().kin_pct())]
+    two_q_kin: u32,
+
+    /// 2Q's A1out ghost bound, percent of pool capacity. May exceed 100 (the ghost holds
+    /// keys only). Ignored by lru/arc.
+    #[arg(long = "2q-kout", value_name = "PCT", default_value_t = rivoli::cache::TwoQSplit::default().kout_pct())]
+    two_q_kout: u32,
+
+    /// `top-m`'s J: the top-J ranked candidates are sacred (never substituted).
+    #[arg(long = "route-j", value_name = "N", default_value_t = rivoli::hybrid::RouteAdvice::default().j)]
+    route_j: usize,
+
+    /// `top-m`'s M: the residency-preferring window. Ignored by every other policy.
+    #[arg(long = "route-m", value_name = "N", default_value_t = rivoli::hybrid::RouteAdvice::default().m)]
+    route_m: usize,
+
+    /// Device budget in GiB, taken LITERALLY — no OS reserve, so it may OOM at build.
+    /// Without it the budget auto-sizes to `free − 16 GiB`.
+    #[arg(long, value_name = "GIB", value_parser = clap::value_parser!(u64).range(1..))]
+    max_mem: Option<u64>,
+
+    /// Attention row selection. `auto` picks `dsa` when the artifact carries indexer
+    /// weights AND the backend has the indexer kernels, else `dense` — see `resolve_attn`.
+    #[arg(long, default_value = "auto", value_parser = ["auto", "dense", "streaming", "dsa", "misa"])]
+    attn: String,
+
+    /// `--attn streaming`: the number of leading sink tokens kept.
+    #[arg(long, value_name = "N", default_value_t = 4)]
+    sinks: usize,
+
+    /// `--attn streaming`: the trailing window kept.
+    #[arg(long, value_name = "N", default_value_t = 8192)]
+    window: usize,
+
+    /// `--attn misa`: how many indexer heads score tokens (the MISA paper's validated GLM
+    /// setting is 8).
+    #[arg(long, value_name = "N", default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
+    misa_heads: u16,
+
+    /// Opt OUT of the pinned-host bounce: DMA cold reads straight into VMM device memory.
+    /// The bounce is the default because it measures faster and survives kernels whose
+    /// amdgpu path EFAULTs on direct io_uring DMA into VMM (src/stream.rs).
+    #[arg(long)]
+    direct_vmm_dma: bool,
+
+    /// Dump the routed-expert access trace (v2: demand keys plus the ranked candidate
+    /// window) for the offline `replay` sim.
+    #[arg(long, value_name = "PATH")]
+    trace: Option<String>,
+
+    /// Override the fixed bench prompt, for capturing traces of diverse inputs.
+    #[arg(long, value_name = "TEXT")]
+    prompt: Option<String>,
+
+    /// Score this file TEACHER-FORCED and write one NLL per predicted token to --ppl-out
+    /// instead of generating. The quality gate for `top-m` (docs/CACHE_ROUTE.md
+    /// "Quality"); never a free-running decode.
+    #[arg(long, value_name = "TEXT_FILE", requires = "ppl_out")]
+    ppl: Option<String>,
+
+    /// Where `--ppl` writes its per-token NLLs.
+    #[arg(long, value_name = "PATH")]
+    ppl_out: Option<String>,
+
+    /// Scale the whole MoE branch by `g` before the residual add. An EXPERIMENT knob, not
+    /// a tuning parameter (kernels/fwd.hip::vaxpy). The band is generous but finite: a
+    /// sweep that silently ran at 0 or a negative gain would produce a confidently
+    /// degenerate arm. g = 1.0 is bit-identical to the plain vadd.
+    #[arg(long, value_name = "G", default_value_t = 1.0, value_parser = moe_gain_in_band)]
+    moe_gain: f32,
+
+    /// Write the generated token ids, one per line.
+    ///
+    /// For **gate A** of the Vulkan acceptance gate (docs/VULKAN.md): agreement on token
+    /// IDs for K tokens. Comparing decoded TEXT is not a substitute — different id
+    /// sequences can decode to identical text, so a text diff reports only a lower bound
+    /// on divergence. Gate A is a standing obligation across commits, so it needs an
+    /// instrument rather than an eyeball.
+    #[arg(long, value_name = "PATH")]
     dump_ids: Option<String>,
-    /// Encode the prompt RAW, with no GLM turn framing. Reproduces every benchmark
-    /// number recorded before templating existed — and those runs could never stop, so
-    /// this is also how you re-measure the degeneration it caused.
+
+    /// Encode the prompt RAW, with no GLM turn framing. Reproduces every benchmark number
+    /// recorded before templating existed — and those runs could never stop, so this is
+    /// also how you re-measure the degeneration it caused.
+    #[arg(long)]
     raw_prompt: bool,
-    /// DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
+
+    /// DIAGNOSTIC: hash the residual stream after every layer.
     #[cfg(feature = "trace")]
+    #[arg(long)]
     checksum_x: bool,
 }
 
-fn parse_args() -> Result<Args> {
-    const USAGE: &str = "usage: rivoli <model-dir> [-bench <tokens>] \
-         [--mode int3-vq|int4|hybrid] [--direct-vmm-dma] \
-         [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc|top-m] [--2q-kin <pct>] \
-         [--2q-kout <pct>] [--route-j <n>] [--route-m <n>] [--max-mem <GiB>] \
-         [--ppl <text-file>] [--ppl-out <path>] [--raw-prompt] [--dump-ids <path>] \
-         [--attn auto|dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>] \
-         [--moe-gain <g>]";
-    let mut model = None;
-    let mut a = Args {
-        model: String::new(),
-        bench: None,
-        direct_vmm_dma: false,
-        trace: None,
-        prompt: None,
-        cache_policy: "2q".to_string(),
-        two_q_kin: rivoli::cache::TwoQSplit::default().kin_pct(),
-        two_q_kout: rivoli::cache::TwoQSplit::default().kout_pct(),
-        route: rivoli::hybrid::RouteAdvice::default(),
-        ppl: None,
-        ppl_out: None,
-        max_mem: None,
-        mode: rivoli::config::Mode::default(),
-        attn: "auto".to_string(),
-        sinks: 4,
-        window: 8192,
-        misa_heads: 8, // the MISA paper's validated GLM setting
-        moe_gain: 1.0, // 1.0 = the engine's normal arithmetic, bit-identical (vadd, not vaxpy)
-        raw_prompt: false,
-        dump_ids: None,
-        #[cfg(feature = "trace")]
-        checksum_x: false,
-    };
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-bench" => {
-                let n = args.next().context("-bench requires a token count")?;
-                a.bench = Some(n.parse().context("-bench takes an integer")?);
-            }
-            "--direct-vmm-dma" => a.direct_vmm_dma = true,
-            "--mode" => {
-                a.mode = rivoli::config::Mode::parse(
-                    &args.next().context("--mode requires int3-vq|int4|hybrid")?,
-                )?;
-            }
-            "--trace" => a.trace = Some(args.next().context("--trace requires a path")?),
-            "--prompt" => a.prompt = Some(args.next().context("--prompt requires text")?),
-            "--cache-policy" => {
-                a.cache_policy = args
-                    .next()
-                    .context("--cache-policy requires lru|2q|arc|top-m")?;
-            }
-            "--ppl" => a.ppl = Some(args.next().context("--ppl requires a text file")?),
-            "--ppl-out" => a.ppl_out = Some(args.next().context("--ppl-out requires a path")?),
-            "--route-j" => {
-                a.route.j = args
-                    .next()
-                    .context("--route-j requires an integer")?
-                    .parse()
-                    .context("--route-j takes an integer")?;
-            }
-            "--route-m" => {
-                a.route.m = args
-                    .next()
-                    .context("--route-m requires an integer")?
-                    .parse()
-                    .context("--route-m takes an integer")?;
-            }
-            "--2q-kin" => {
-                a.two_q_kin = args
-                    .next()
-                    .context("--2q-kin requires a percentage")?
-                    .parse()
-                    .context("--2q-kin takes an integer percentage")?;
-            }
-            "--2q-kout" => {
-                a.two_q_kout = args
-                    .next()
-                    .context("--2q-kout requires a percentage")?
-                    .parse()
-                    .context("--2q-kout takes an integer percentage")?;
-            }
-            "--max-mem" => {
-                let gib: u64 = args
-                    .next()
-                    .context("--max-mem requires a GiB integer")?
-                    .parse()
-                    .context("--max-mem takes an integer number of GiB")?;
-                if gib == 0 {
-                    bail!("--max-mem must be a positive integer number of GiB");
-                }
-                a.max_mem = Some(gib << 30);
-            }
-            "--attn" => a.attn = args.next().context("--attn requires a mode")?,
-            "--sinks" => {
-                a.sinks = args
-                    .next()
-                    .context("--sinks requires an integer")?
-                    .parse()
-                    .context("--sinks takes an integer")?;
-            }
-            "--window" => {
-                a.window = args
-                    .next()
-                    .context("--window requires an integer")?
-                    .parse()
-                    .context("--window takes an integer")?;
-            }
-            "--moe-gain" => {
-                a.moe_gain = args
-                    .next()
-                    .context("--moe-gain requires a float")?
-                    .parse()
-                    .context("--moe-gain takes a float")?;
-                // A sweep that silently ran at 0 or a negative gain would produce a
-                // confidently degenerate arm; the band is generous but finite.
-                if !(0.5..=1.5).contains(&a.moe_gain) {
-                    bail!("--moe-gain {} outside [0.5, 1.5]", a.moe_gain);
-                }
-            }
-            "--raw-prompt" => a.raw_prompt = true,
-            "--dump-ids" => {
-                a.dump_ids = Some(args.next().context("--dump-ids requires a path")?);
-            }
-            "--misa-heads" => {
-                a.misa_heads = args
-                    .next()
-                    .context("--misa-heads requires an integer")?
-                    .parse()
-                    .context("--misa-heads takes an integer")?;
-                if a.misa_heads == 0 {
-                    bail!("--misa-heads must be >= 1");
-                }
-            }
-            #[cfg(feature = "trace")]
-            "--checksum-x" => a.checksum_x = true,
-            _ if model.is_none() => model = Some(arg),
-            _ => bail!("unexpected argument: {arg}\n{USAGE}"),
-        }
+/// `--moe-gain`'s band. A hand-written parser because clap's `range` value_parser is
+/// integers only, and an unchecked float here is the failure mode the band exists for.
+fn moe_gain_in_band(s: &str) -> Result<f32, String> {
+    let g: f32 = s.parse().map_err(|e| format!("{s:?} is not a float: {e}"))?;
+    if (0.5..=1.5).contains(&g) {
+        Ok(g)
+    } else {
+        Err(format!("{g} is outside [0.5, 1.5]"))
     }
-    a.model = model.context(USAGE)?;
-    Ok(a)
 }
 
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
+impl Args {
+    /// `top-m`'s (J, M) in the form `hybrid`/`config` want it.
+    fn route(&self) -> rivoli::hybrid::RouteAdvice {
+        rivoli::hybrid::RouteAdvice { j: self.route_j, m: self.route_m }
+    }
+}
+
+/// Parse argv, accepting the legacy single-dash `-bench` alongside `--bench`.
+///
+/// clap has no single-dash-long form, and `-bench N` is what every recorded command line
+/// in benchmarks.md, MODES.md and tests/bench-matrix.sh uses. Rewriting the token is three
+/// lines; re-recording a year of benchmark provenance is not. Only an exact `-bench`
+/// matches, so `-b`, `--bench` and a positional path are all untouched.
+fn parse_args() -> Args {
+    use clap::Parser;
+    let argv = std::env::args().map(|a| if a == "-bench" { "--bench".into() } else { a });
+    Args::parse_from(argv)
+}
+
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
 /// Does the artifact carry resident DSA indexer weights? (`auto` picks `dsa` iff so AND the
 /// backend has the indexer kernels — see [`resolve_attn`].)
 /// Checks layer 0's `wk` — `indexer_layout` guarantees layer 0 is a full layer, so
@@ -233,6 +204,7 @@ fn artifact_has_indexer(model_dir: &str) -> bool {
 /// `artifact_has_indexer` is still called (and still reported) either way: the reason for
 /// the choice is worth logging, since "auto picked dense" is otherwise indistinguishable
 /// from "this artifact has no indexer".
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
 fn resolve_attn(a: &Args) -> Result<rivoli::attn::AttnMode> {
     use rivoli::attn::AttnMode;
     let mode = if a.attn == "auto" {
@@ -259,14 +231,38 @@ fn resolve_attn(a: &Args) -> Result<rivoli::attn::AttnMode> {
         },
         "dsa" => AttnMode::Dsa,
         "misa" => AttnMode::Misa {
-            active_heads: a.misa_heads,
+            active_heads: a.misa_heads as usize,
         },
         other => bail!("unknown --attn mode {other:?} (auto|dense|streaming|dsa|misa)"),
     })
 }
 
+/// A build with NO compute backend refuses at the door.
+///
+/// The binary still compiles featureless on purpose — `cargo test` and the featureless
+/// clippy pass build every target, and `backend.rs` records why breaking those is not an
+/// option: they are what keeps the backend-independent half (config, math, quant, arena,
+/// cache, telemetry) honest. So this is a runtime refusal rather than a `compile_error!`,
+/// and it is the FIRST thing that happens: the old version discovered memory, loaded the
+/// manifest, built the tokenizer and encoded the prompt before admitting it could not
+/// decode.
+///
+/// `parse_args` still runs, so `--help` and flag validation work in a featureless build —
+/// which is the one useful thing it can do.
+#[cfg(not(any(feature = "rocm", feature = "vulkan")))]
 fn main() -> Result<()> {
-    let a = parse_args()?;
+    let _ = parse_args();
+    bail!(
+        "rivoli was built with NO compute backend and cannot decode. Rebuild with \
+         `--features rocm` (HIP/ROCm) or `--features vulkan` — exactly one; they are \
+         mutually exclusive (src/backend.rs, docs/VULKAN.md)."
+    )
+}
+
+/// A build with no compute backend cannot reach this: see the stub above.
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
+fn main() -> Result<()> {
+    let a = parse_args();
     let attn = resolve_attn(&a)?;
     // Bound before `a` is partially moved into `discover` below.
     let (a_ppl, a_ppl_out) = (a.ppl.clone(), a.ppl_out.clone());
@@ -279,9 +275,9 @@ fn main() -> Result<()> {
     let a_cache_policy = a.cache_policy.clone();
     let a_attn = format!("{attn:?}").to_lowercase();
     let (a_max_mem, a_bench) = (a.max_mem, a.bench);
-    let a_route = a.route;
+    let a_route = a.route();
     let (a_2q_kin, a_2q_kout) = (a.two_q_kin, a.two_q_kout);
-    let (a_sinks, a_window, a_misa_heads) = (a.sinks, a.window, a.misa_heads);
+    let (a_sinks, a_window, a_misa_heads) = (a.sinks, a.window, a.misa_heads as usize);
     #[cfg(feature = "trace")]
     let checksum_x = a.checksum_x;
     #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
@@ -293,7 +289,7 @@ fn main() -> Result<()> {
         a.prompt,
         a.cache_policy,
         rivoli::cache::TwoQSplit::new(a.two_q_kin, a.two_q_kout)?,
-        a.route,
+        a_route,
         a.max_mem,
         attn,
     )?;
@@ -654,7 +650,6 @@ fn main() -> Result<()> {
             mode: cfg.mode.to_string(),
             cache_policy: a_cache_policy.clone(),
             attn: a_attn.clone(),
-            topk_path: summary.topk_path,
             max_mem_gib: a_max_mem,
             bench_tokens: a_bench,
             prompt: cfg.prompt.clone(),
@@ -692,14 +687,5 @@ fn main() -> Result<()> {
         }
         info!("{bench_prompt}{}", tok.decode_all(&ids)?);
         Ok(())
-    }
-
-    #[cfg(not(any(feature = "rocm", feature = "vulkan")))]
-    {
-        let _ = (prompt_ids, ngen, bench_prompt, ppl_ids, a_ppl_out);
-        bail!(
-            "rivoli was built with no compute backend; rebuild with --features rocm (or \
-             --features vulkan) to decode"
-        )
     }
 }

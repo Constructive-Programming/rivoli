@@ -425,7 +425,7 @@ impl Streamer {
         loop {
             match self.ring.submit() {
                 Ok(_) => return Ok(()),
-                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(anyhow::anyhow!("io_uring submit failed: {e}")),
             }
         }
@@ -453,7 +453,7 @@ impl Streamer {
             // poison the whole fetch on e.g. a SIGWINCH delivered to the reaper thread.
             match self.ring.submit_and_wait(1) {
                 Ok(_) => {}
-                Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(anyhow::anyhow!("io_uring wait failed: {e}")),
             }
         };

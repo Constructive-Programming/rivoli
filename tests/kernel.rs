@@ -12,65 +12,15 @@ use rivoli::hip::{
 use rivoli::math::{bf16_to_f32, e4m3_to_f32, f32_to_bf16, f32_to_e4m3, silu, softmax};
 use rivoli::quant::{VQ_DIM, VQ_K, matvec_fp8, matvec_i8, matvec_vq, quant_vq};
 
-fn f32b(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
-}
-fn u16b(v: &[u16]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
-}
-/// f32 → fp16 bytes — the VQ codebook is uploaded fp16 (the kernel decodes __half),
-/// while the CPU reference keeps the f32 codebook, so these oracles measure exactly
-/// the fp16 codebook-rounding error against the tol.
-fn f16b(v: &[f32]) -> Vec<u8> {
-    u16b(&v.iter().map(|&x| rivoli::math::f32_to_f16(x)).collect::<Vec<_>>())
-}
-fn f32v(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
-}
+mod common;
+use common::{Lcg, assert_close, f16b, f32b, f32v, u16b};
+
+/// Upload `b` to a fresh device buffer. Backend-typed, so it stays here rather than in
+/// `common`: this is `DeviceBuf` under HIP and `Buf` under Vulkan.
 fn dev(b: &[u8]) -> DeviceBuf {
     let mut d = DeviceBuf::new(b.len()).expect("alloc");
     d.copy_in_at(0, b).expect("fill");
     d
-}
-fn assert_close(want: &[f32], got: &[f32], label: &str) {
-    let mx = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    let err = want
-        .iter()
-        .zip(got)
-        .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
-    let tol = 1e-3 * mx + 1e-3;
-    // Print the MARGIN, not just pass/fail. An oracle clearing its threshold by 100x
-    // and one clearing it by 2x look identical in a green test run, and only the
-    // second is evidence of anything.
-    println!(
-        "{label}: err={err:.3e} tol={tol:.3e} margin={:.1}x",
-        tol / err.max(f32::MIN_POSITIVE)
-    );
-    assert!(err <= tol, "{label}: err={err:.3e} > tol={tol:.3e} max={mx:.3e}");
-}
-
-struct Lcg(u64);
-impl Lcg {
-    /// Uniform in [-1, 1).
-    ///
-    /// `>> 32`, not `>> 33`. The old shift kept only 31 bits, so dividing by
-    /// `u32::MAX` gave [0, 0.5) and `*2 - 1` gave [-1, 0) — **every sample negative**,
-    /// for the whole life of this file. In a matvec oracle that makes every
-    /// x[i]*w[i] product positive, so the partial sums GROW instead of cancelling:
-    /// `mx` inflates, the `1e-3 * mx` relative tolerance inflates with it, and the
-    /// oracles have been passing on roughly two orders of magnitude of headroom. It
-    /// also means no oracle here has ever exercised floating-point cancellation —
-    /// the only regime where summation order matters, and the entire reason the
-    /// kernels reduce with a fixed `__shfl_down` ladder instead of an atomic.
-    fn f(&mut self) -> f32 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((self.0 >> 32) as f32 / u32::MAX as f32) * 2.0 - 1.0
-    }
 }
 
 #[test]
@@ -1018,9 +968,10 @@ fn moe_i4_real_data_vs_fp8_ground_truth() {
         return;
     };
     // The checkpoint comes from the artifact's OWN stamp, and the bands below only
-    // describe the `fp8->int4` chain. `bin/vq3_to_i4` rewrites `L{l}.i4` IN PLACE in
-    // this very directory with the other chain; without this the test would keep
-    // running and quietly certify the derivation it exists to distinguish.
+    // describe the `fp8->int4` chain. The retired `vq3_to_i4` rewrote `L{l}.i4` IN PLACE
+    // in this very directory with the other chain, and artifacts it produced are still
+    // on disk; without this the test would keep running and quietly certify the
+    // derivation it exists to distinguish.
     let Some(prov) = I4Source::load(ART).expect("read i4_source") else {
         eprintln!("skip moe_i4_real_data_vs_fp8: artifact carries no i4_source stamp");
         return;

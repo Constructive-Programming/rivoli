@@ -1708,8 +1708,9 @@ and must not be filtered out.
   the barrier removed **entirely**, neither an unsynchronised compute→compute
   read-modify-write pair nor a compute-write → transfer-read produces a single
   message, while transfer↔transfer fires normally
-  (`docs/probes/vk_validation`: `compute-compute`, `compute-copy`,
-  `compute-copy-desc`, `sync`). It is not a buffer-device-address blind spot — a
+  (the `vk_validation` probe's `compute-compute`, `compute-copy`, `compute-copy-desc`
+  and `sync` modes; probe deleted, matrix kept in `docs/probes/README.md`, source at
+  `77b5500:docs/probes/vk_validation`). It is not a buffer-device-address blind spot — a
   descriptor-bound write is equally invisible, so moving off bare device addresses
   would not buy coverage back.
 
@@ -1806,9 +1807,9 @@ and must not be filtered out.
   `attend_honours_the_dsa_row_selection`, which shipped a fixed-point precondition and
   data violating it in the same commit, so the suite had never been green at 37 before.
 
-  **GPU-AV was confirmed live by DEMONSTRATION, not by its self-report:** the probes in
-  `docs/probes/vk_validation` were re-run on this stack the same day and reproduce the
-  matrix below exactly. (The self-report — 2 `VALIDATION-SETTINGS`-class messages with
+  **GPU-AV was confirmed live by DEMONSTRATION, not by its self-report:** the
+  `vk_validation` probes were re-run on this stack the same day and reproduce the
+  matrix below exactly (probe since deleted — `77b5500:docs/probes/vk_validation`). (The self-report — 2 `VALIDATION-SETTINGS`-class messages with
   the env var, 0 without — establishes only that the layer read the variable.)
 
   **The `down` path at `inter = 64` is clean under GPU-AV *at that shape*.** That is the

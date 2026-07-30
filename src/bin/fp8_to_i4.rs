@@ -13,8 +13,10 @@
 //!
 //! The `.i4` set is ~365 GB and does not fit twice on disk, so layers are replaced IN
 //! PLACE: write `L{l}.i4.tmp`, fsync, `rename(2)` over `L{l}.i4`. Peak extra usage is
-//! one layer; free space is checked before each. Overwriting is recoverable — the
-//! `.vq3` set is still present and `bin/vq3_to_i4` regenerates the old `.i4` from it.
+//! one layer; free space is checked before each. Overwriting is NOT recoverable in
+//! place: `bin/vq3_to_i4`, which used to regenerate the old `.i4` from the `.vq3` set,
+//! is deleted (its output was worse by construction — see the paragraph above). Re-run
+//! THIS tool from the fp8 source to rebuild a layer.
 //!
 //! usage: fp8_to_i4 <fp8-dir> <artifact-dir> [--from L] [--to L]   (`--to` exclusive)
 use anyhow::{Context, Result, anyhow, ensure};

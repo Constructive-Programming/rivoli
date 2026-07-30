@@ -180,7 +180,8 @@ pub fn set_idx(row: &mut [u8], k: usize, idx: u16) {
 }
 
 /// Read the 12-bit codebook index of the `k`-th subvector of a packed row. Public so
-/// the offline `vq3_to_i4` converter decodes indices identically to `matvec_vq`.
+/// the offline readers (`bin/i4_audit`, [`vq_decode_proj`]) decode indices identically
+/// to `matvec_vq`.
 #[inline]
 pub fn get_idx(row: &[u8], k: usize) -> usize {
     let (base, shift) = (k * VQ_INDEX_BITS / 8, (k * VQ_INDEX_BITS) % 8);
@@ -329,10 +330,11 @@ pub fn matvec_vq(
 }
 
 /// Decode one VQ projection to a DENSE row-major `W[o_dim, i_dim]` — the inverse of
-/// [`quant_vq`], and the SINGLE VQ reader: `bin/vq3_to_i4` re-quantizes what this
-/// returns, and any audit that reproduces that chain must decode identically or its
-/// "old set" baseline describes a converter that never existed. (The same rule
-/// [`write_i4_proj`] states for the `.i4` writer.)
+/// [`quant_vq`], and the SINGLE VQ reader: `bin/i4_audit` compares what this returns
+/// against the fp8 ground truth, and any audit that reproduces the retired
+/// `vq3 → int4` chain must decode identically or its "old set" baseline describes a
+/// converter that never existed. (The same rule [`write_i4_proj`] states for the `.i4`
+/// writer.)
 ///
 /// Materializes `o_dim·i_dim` f32 — offline use only; the decode path is
 /// [`matvec_vq`], which never builds the dense matrix.
@@ -423,9 +425,11 @@ pub fn matvec_i8(y: &mut [f32], x: &[f32], packed: &[u8], scale: &[f32], o_dim: 
 }
 
 /// Quantize `w[o_dim·i_dim]` (row-major) → group-scaled symmetric int4 (packed bytes
-/// + `o_dim · i4_groups(i_dim)` f32 scales). Per group of [`I4_GROUP`] weights along
-/// the input dim, `s = max|group|/7` so the group's extreme maps to nibble 15 (value
-/// +7); nibbles clamp to `[0,15]`. Round-trips through [`matvec_i4`].
+/// plus `o_dim · i4_groups(i_dim)` f32 scales). Per group of [`I4_GROUP`] weights along
+/// the input dim, `s = max|group|/7` so the group's extreme maps to nibble 15 (value +7);
+/// nibbles clamp to `[0,15]`. Round-trips through [`matvec_i4`].
+//  (Rewrapped so no line STARTS with `+`: rustdoc reads a leading `+ ` as a list bullet,
+//  which is what `clippy::doc_lazy_continuation` was flagging.)
 ///
 /// The scale is per GROUP and not per ROW because an outlier only ever coarsens its
 /// own 128 weights instead of the whole 6144-wide row — see the module comment above
@@ -535,9 +539,9 @@ pub fn i4_slot_offsets(hidden: usize, moe_inter: usize) -> [usize; 6] {
 
 /// Write projection `k`'s packed nibbles + f32 group scales into an expert block at
 /// the offsets [`i4_slot_offsets`] defines. The SINGLE writer of the `.i4` slot layout
-/// — both converters (`bin/fp8_to_i4`, `bin/vq3_to_i4`) go through it, so they cannot
-/// disagree on where a projection's bytes land (the same rule `vq_slot_offsets` states
-/// for `.vq3`). `packed`/`scale` are exactly what [`quant_i4`] returned for this
+/// — `bin/fp8_to_i4` goes through it, as did the retired `vq3_to_i4`, so no two
+/// producers can disagree on where a projection's bytes land (the same rule
+/// `vq_slot_offsets` states for `.vq3`). `packed`/`scale` are exactly what [`quant_i4`] returned for this
 /// projection; a short `scale` would leave the tail of the span holding the PREVIOUS
 /// projection's bytes, so the lengths are checked rather than trusted.
 pub fn write_i4_proj(slot: &mut [u8], off: &[usize; 6], k: usize, packed: &[u8], scale: &[f32]) {

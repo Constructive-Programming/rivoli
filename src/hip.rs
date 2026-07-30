@@ -662,6 +662,10 @@ pub unsafe fn launch_flag_nonfinite(
     check(r, "flag_nonfinite")
 }
 
+/// `x += y` — the residual add. (`--moe-gain != 1` takes [`launch_vaxpy`] instead.)
+///
+/// # Safety
+/// `x` and `y` must be device pointers to at least `n` f32.
 pub unsafe fn launch_vadd(x: *mut f32, y: *const f32, n: usize) -> Result<()> {
     // SAFETY: caller's pointer contract.
     let r = unsafe { rivoli_vadd(x, y, n as i32) };

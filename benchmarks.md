@@ -1038,6 +1038,9 @@ pure per-format compute use `examples/dot_bench.rs`. See [MODES.md](MODES.md).
 ## DSA indexer round: `examples/indexer_bench`
 
 Instrument for the NPU-offload gates (docs/NPU.md M0/M1), gfx1151 sole tenant, 2026-07-26.
+The rig itself is deleted (`77b5500:examples/indexer_bench.rs`) — superseded by the
+engine's in-engine indexer buckets, which refuted its GPU-span figure by 27%. Every row
+below stands as recorded; re-running them means restoring the file.
 Interpretation lives in [docs/NPU.md](docs/NPU.md); the rows and the methodology are here.
 `--attn dsa` dims from the manifest: index_n_heads 32, index_head_dim 128, index_topk 2048,
 and **21 FULL indexer layers** of 78 (`indexer_types` is 21 full / 57 shared, so a
@@ -1200,7 +1203,11 @@ Interpretation and what it means for wiring: docs/NPU.md § "The device top-k, m
 `--attn dsa --mode hybrid --cache-policy lru --max-mem 115 -bench 128`, the same
 2432-token prompt as "In-engine confirmation" above, gfx1151 sole tenant. Arms selected by
 `RIVOLI_TOPK` from **one binary** — no build differs between them — run **interleaved**
-(host, device, device-nosync, twice). Greedy decode is deterministic, so every arm generates
+(host, device, device-nosync, twice). **The switch no longer exists**: `device` shipped,
+`host`/`device-nosync`/`verify` were deleted once these rows were recorded
+(`77b5500:src/gpu.rs` restores them). Every figure below stands as measured; the PROFILE
+line no longer prints a `[topk=…]` tag or an `idx_host` term, so rows recorded after
+2026-07-30 carry neither. Greedy decode is deterministic, so every arm generates
 the same tokens and the same expert-miss sequence: the arms are PAIRED, and `116.79
 miss/tok` is identical across all seven runs.
 

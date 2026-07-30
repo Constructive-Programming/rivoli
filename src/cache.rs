@@ -4,6 +4,7 @@
 //! what both need: [`OrderedSet`] (the recency structure), [`Tier`] (which residency
 //! tier a key landed in → which format slab), and [`TwoQSplit`] (2Q's Kin/Kout knobs).
 
+use anyhow::{Result, ensure};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Recency-ordered set of keys: O(log n) MRU-insert / arbitrary-remove / pop-LRU
@@ -109,40 +110,25 @@ impl Default for TwoQSplit {
     }
 }
 
-/// Why a `(kin_pct, kout_pct)` pair was rejected. Both carry the offending value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SplitError {
-    /// A1in outside `1..=99` % of capacity.
-    KinRange(u32),
-    /// A1out outside `1..=1000` % of capacity.
-    KoutRange(u32),
-}
-
-impl std::fmt::Display for SplitError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::KinRange(v) => write!(f, "--2q-kin {v}: must be 1..=99 (percent of capacity)"),
-            Self::KoutRange(v) => {
-                write!(f, "--2q-kout {v}: must be 1..=1000 (percent of capacity)")
-            }
-        }
-    }
-}
-impl std::error::Error for SplitError {}
-
 impl TwoQSplit {
     /// Validate a percentage pair. `kin_pct` is capped at 99 because at `kin >= cap`
     /// `reclaim` can never trim A1in, so with an empty Am it evicts nothing and
     /// residency grows past capacity — which would break the pin's slot invariant.
     /// `kout_pct` may exceed 100: A1out holds keys only (4 bytes), so a ghost larger
     /// than the resident set is cheap and remembers more second-access candidates.
-    pub fn new(kin_pct: u32, kout_pct: u32) -> Result<Self, SplitError> {
-        if !(1..=99).contains(&kin_pct) {
-            return Err(SplitError::KinRange(kin_pct));
-        }
-        if !(1..=1000).contains(&kout_pct) {
-            return Err(SplitError::KoutRange(kout_pct));
-        }
+    ///
+    /// `anyhow`, not a typed error: this is reached once, from CLI parsing, and nothing
+    /// ever matched on which bound was violated — the message IS the value. The typed
+    /// enum it replaced cost 20 lines and two trait impls to say the same thing.
+    pub fn new(kin_pct: u32, kout_pct: u32) -> Result<Self> {
+        ensure!(
+            (1..=99).contains(&kin_pct),
+            "--2q-kin {kin_pct}: must be 1..=99 (percent of capacity)"
+        );
+        ensure!(
+            (1..=1000).contains(&kout_pct),
+            "--2q-kout {kout_pct}: must be 1..=1000 (percent of capacity)"
+        );
         Ok(Self { kin_pct, kout_pct })
     }
 
@@ -156,14 +142,23 @@ impl TwoQSplit {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
+    /// The bounds, and that the message names the offending flag and value — the
+    /// message is the whole payload now that the error is untyped.
     #[test]
     fn split_rejects_out_of_range() {
-        assert_eq!(TwoQSplit::new(0, 50), Err(SplitError::KinRange(0)));
-        assert_eq!(TwoQSplit::new(100, 50), Err(SplitError::KinRange(100)));
-        assert_eq!(TwoQSplit::new(25, 0), Err(SplitError::KoutRange(0)));
-        assert_eq!(TwoQSplit::new(25, 1001), Err(SplitError::KoutRange(1001)));
+        for (kin, kout, want) in [
+            (0, 50, "--2q-kin 0"),
+            (100, 50, "--2q-kin 100"),
+            (25, 0, "--2q-kout 0"),
+            (25, 1001, "--2q-kout 1001"),
+        ] {
+            let e = TwoQSplit::new(kin, kout).expect_err("out of range must be rejected");
+            assert!(e.to_string().contains(want), "message {e:?} should name {want}");
+        }
+        assert!(TwoQSplit::new(8, 20).is_ok());
     }
 }

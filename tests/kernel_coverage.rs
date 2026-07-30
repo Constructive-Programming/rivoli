@@ -46,8 +46,9 @@ fn source(rel: &str) -> String {
 
 #[test]
 fn every_launcher_has_an_oracle() {
-    // Built at runtime, so this file's own text cannot trip the scan — the same reason
-    // `oracle_independence` assembles its needle rather than writing it as a literal.
+    // Built at runtime, so this file's own text cannot trip the scan: a literal
+    // `pub unsafe fn launch_` here would make this file look like a launcher declaration
+    // to its own reader.
     let decl = format!("pub unsafe fn {}", "launch_");
 
     let backend = source("src/vk.rs");

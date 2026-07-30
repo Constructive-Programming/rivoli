@@ -42,49 +42,16 @@ pub fn bf16_to_f32(b: u16) -> f32 {
 /// range, and the per-group bf16 scale carries the magnitude), decoded on the GPU
 /// via `__half`; fp16's 10-bit mantissa clears the kernel-oracle tol where bf16's 8
 /// does not. Mirror of the device `__float2half`.
+///
+/// Delegates to `half`, like the two bf16 functions above and for the same reason. This
+/// replaced a 45-line hand-rolled RNE with its own subnormal-shift and mantissa-carry
+/// paths; `fp16_is_ieee_rne` below pins the contract that made them equivalent — every
+/// representable fp16 round-trips, ties round to even, and both boundaries (65504 → inf,
+/// 2^-25 → ±0) land where IEEE says — rather than comparing one implementation to the
+/// other, which would only prove they agree.
+#[inline]
 pub fn f32_to_f16(x: f32) -> u16 {
-    let bits = x.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let biased = (bits >> 23) & 0xff;
-    let mant = bits & 0x007f_ffff;
-    if biased == 0xff {
-        // Inf/NaN: keep a mantissa bit set for NaN so it doesn't collapse to Inf.
-        return sign | 0x7c00 | if mant != 0 { 0x0200 } else { 0 };
-    }
-    let exp = biased as i32 - 127 + 15; // rebias 127 → 15
-    if exp >= 0x1f {
-        return sign | 0x7c00; // overflow → inf
-    }
-    if exp <= 0 {
-        if exp < -10 {
-            return sign; // underflow → ±0
-        }
-        // Subnormal: restore the implicit 1, shift into place with RNE.
-        let m = mant | 0x0080_0000;
-        let shift = (14 - exp) as u32; // 14..=24
-        let half = 1u32 << (shift - 1);
-        let rem = m & ((1u32 << shift) - 1);
-        let mut out = m >> shift;
-        if rem > half || (rem == half && (out & 1) == 1) {
-            out += 1;
-        }
-        return sign | out as u16;
-    }
-    // Normal: 10-bit mantissa, RNE on the dropped 13 bits.
-    let mut e = exp as u32;
-    let mut m = mant >> 13;
-    let rem = mant & 0x1fff;
-    if rem > 0x1000 || (rem == 0x1000 && (m & 1) == 1) {
-        m += 1;
-        if m == 0x400 {
-            m = 0; // mantissa carry bumps the exponent
-            e += 1;
-            if e >= 0x1f {
-                return sign | 0x7c00;
-            }
-        }
-    }
-    sign | ((e as u16) << 10) | m as u16
+    half::f16::from_f32(x).to_bits()
 }
 
 /// Largest finite magnitude representable in OCP `e4m3` (S.1111.110 = 448).
@@ -403,6 +370,48 @@ mod tests {
         assert_eq!(f32_to_bf16(f32::INFINITY), 0x7f80);
         assert_eq!(bf16_to_f32(0x7f80), f32::INFINITY);
         assert!(bf16_to_f32(f32_to_bf16(f32::NAN)).is_nan());
+    }
+
+    /// `f32_to_f16` is IEEE binary16 round-to-nearest-even. Written against the FORMAT,
+    /// not against the hand-rolled RNE it replaced: an implementation-vs-implementation
+    /// test proves agreement, which is not the property anyone needs. Every claim here is
+    /// one the HIP `__float2half` the codebook is decoded with must also satisfy.
+    #[test]
+    fn fp16_is_ieee_rne() {
+        // 1. EVERY representable fp16 survives a round trip through f32 — 65,536 values,
+        //    so this covers all 1,024 subnormals, both zeros and both infinities. A
+        //    narrowing bug in any exponent range shows up here as a changed pattern.
+        for bits in 0u32..=0xffff {
+            let b = bits as u16;
+            let v = half::f16::from_bits(b).to_f32();
+            if v.is_nan() {
+                continue; // NaN payload is not preserved by design; excluded above too
+            }
+            assert_eq!(f32_to_f16(v), b, "round trip failed for f16 bits {b:#06x}");
+        }
+        // 2. Ties round to EVEN, in both directions. 1.0 + 2^-11 sits exactly between
+        //    1.0 (0x3c00, mantissa LSB 0) and the next fp16 up (0x3c01), so it rounds
+        //    DOWN; the tie above 0x3c01 rounds UP to the even 0x3c02.
+        assert_eq!(f32_to_f16(1.0 + 2f32.powi(-11)), 0x3c00);
+        assert_eq!(f32_to_f16(1.0 + 2f32.powi(-11) + 2f32.powi(-20)), 0x3c01);
+        assert_eq!(f32_to_f16(1.0 + 2f32.powi(-10) + 2f32.powi(-11)), 0x3c02);
+        // 3. Overflow saturates to inf, and only past the last tie: 65504 is fp16::MAX,
+        //    the tie at 65520 rounds up to inf, and just under it rounds back to MAX.
+        assert_eq!(f32_to_f16(65504.0), 0x7bff);
+        assert_eq!(f32_to_f16(65519.0), 0x7bff);
+        assert_eq!(f32_to_f16(65520.0), 0x7c00);
+        assert_eq!(f32_to_f16(f32::INFINITY), 0x7c00);
+        // 4. Underflow through the subnormals: 2^-24 is the smallest positive subnormal,
+        //    2^-25 is its tie and rounds to the even neighbour ZERO, and just above the
+        //    tie rounds up to it. Sign is preserved on the way to zero.
+        assert_eq!(f32_to_f16(2f32.powi(-24)), 0x0001);
+        assert_eq!(f32_to_f16(2f32.powi(-25)), 0x0000);
+        assert_eq!(f32_to_f16(2f32.powi(-25) + 2f32.powi(-40)), 0x0001);
+        assert_eq!(f32_to_f16(-2f32.powi(-30)), 0x8000);
+        // 5. The subnormal/normal seam: 2^-14 is the smallest NORMAL, and the largest
+        //    subnormal is one step below it. Off-by-one in the shift lands here.
+        assert_eq!(f32_to_f16(2f32.powi(-14)), 0x0400);
+        assert_eq!(f32_to_f16(2f32.powi(-14) - 2f32.powi(-24)), 0x03ff);
     }
 
     #[test]

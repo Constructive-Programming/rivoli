@@ -54,93 +54,18 @@ fn desc_of_vq(m: &MlpVq) -> ExpertDesc {
     }
 }
 
-/// [`TopkPath::Verify`]'s over-selection marker: parked one slot past the row set before
-/// the kernel runs, and required to survive it. Never a valid row — `nt <= max_ctx`.
-const ROWS_SENTINEL: u32 = 0xFFFF_FFFF;
-
-/// How `dsa_select_layer` turns `index_score`'s output into the attend row set.
-///
-/// `RIVOLI_TOPK=host|device|device-nosync|verify`; **default `device`**, the measured
-/// arm (benchmarks.md, "Device top-k WIRED"). It exists so the device top-k and the
-/// mid-layer-sync deletion could be costed as SEPARATE arms of one binary — folding both
-/// into one number would have left nobody able to say which paid, and as it turned out
-/// only one of them did.
-///
-/// **Both wins are real; they differ by 4×.** `host` -> `device` is **−9.4 ms/token**
-/// (r1 −10.5, r2 −8.3), read off the indexer bucket — the only bucket that responds, with
-/// the unbucketed remainder unchanged to ±0.4 ms. `device` -> `device-nosync` is
-/// **−2.5 ms/token** (r1 −3.2, r2 −1.8), read off `route` rising minus the unbucketed
-/// remainder falling. Do NOT read either from `wall`: `moe` carries 7–10 ms of within-arm
-/// spread against a mechanism bounded at 0.7 ms, which swamps both effects and makes the
-/// sync arm's wall delta change sign between replicates.
-///
-/// The default keeps the sync anyway: −2.5 ms is 0.6% of wall at n=2, against making
-/// `route` incomparable with every historical row in benchmarks.md. Flip it if a run at
-/// n>=4 holds the −2.5. Keep `verify` as long as the kernel can change.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum TopkPath {
-    /// Score D2H → `topk_into` → row H2D, behind the mid-layer `device_sync`. The
-    /// pre-wiring baseline, kept so the A/B can be re-run against it.
-    Host,
-    /// `index_topk` on device, mid-layer `device_sync` KEPT. **The default.**
-    Device,
-    /// `index_topk` on device, mid-layer `device_sync` deleted — the second win.
-    ///
-    /// The deleted sync's GPU wait does not vanish, it MOVES. The host runs on to the next
-    /// blocking join, which is the gate-logits D2H — inside the `route_ns` clock — on MoE
-    /// layers, and the end-of-layer join — inside `moe_wall_ns` — on the 3 dense ones. Both
-    /// buckets RISE on this arm while `wall_ns` falls, so `wall` is the only honest
-    /// cross-arm comparator: a `route` regression here is the win, relocated.
-    DeviceNoSync,
-    /// Both, compared per full layer on the engine's real scores. Correctness gate, not
-    /// a timing arm: it pays a sync, a D2H and a CPU top-k the wired path does not.
-    Verify,
-}
-
-impl TopkPath {
-    fn from_env() -> Result<Self> {
-        // A typo must not silently select another arm: the arms are indistinguishable in
-        // the output. Only an ABSENT variable defaults.
-        let v = match std::env::var("RIVOLI_TOPK") {
-            Err(std::env::VarError::NotPresent) => return Ok(Self::Device),
-            Err(e) => bail!("RIVOLI_TOPK: {e}"),
-            Ok(v) => v,
-        };
-        match v.as_str() {
-            "host" => Ok(Self::Host),
-            "device" => Ok(Self::Device),
-            "device-nosync" => Ok(Self::DeviceNoSync),
-            "verify" => Ok(Self::Verify),
-            other => bail!("RIVOLI_TOPK={other:?}: want host|device|device-nosync|verify"),
-        }
-    }
-
-    /// The `RIVOLI_TOPK` spelling — `{:?}` would print `DeviceNoSync` for `device-nosync`,
-    /// and a PROFILE row must be greppable by the value that produced it.
-    fn name(self) -> &'static str {
-        match self {
-            Self::Host => "host",
-            Self::Device => "device",
-            Self::DeviceNoSync => "device-nosync",
-            Self::Verify => "verify",
-        }
-    }
-
-    fn selects_on_device(self) -> bool {
-        match self {
-            Self::Host => false,
-            Self::Device | Self::DeviceNoSync | Self::Verify => true,
-        }
-    }
-
-    /// `Verify` is true here AND in `selects_on_device`: it runs both and compares.
-    fn runs_host_topk(self) -> bool {
-        match self {
-            Self::Host | Self::Verify => true,
-            Self::Device | Self::DeviceNoSync => false,
-        }
-    }
-}
+// THE DSA ROW-SELECTION PATH is the DEVICE `index_topk` kernel, unconditionally.
+//
+// There used to be a `RIVOLI_TOPK=host|device|device-nosync|verify` switch here, four arms
+// of one binary so the device top-k and a mid-layer-sync deletion could be costed
+// separately. Both were costed (benchmarks.md, "Device top-k WIRED"): `host → device` is
+// **−9.4 ms/token**, `device → device-nosync` is **−2.5 ms/token** — and the second was
+// deliberately NOT taken, because 0.6% of wall is not worth making `route` incomparable
+// with every historical row in benchmarks.md. The arms are deleted now that the answers are
+// recorded: `host` was a baseline git already holds, `device-nosync` a rejected option, and
+// `verify` a correctness gate that `tests/kernel.rs::index_topk_matches_host_selection`
+// covers with the same over-selection sentinel trick, on data the test controls rather than
+// on whatever a run happens to produce.
 
 /// Per-token time buckets. ALWAYS ON: every bucket wraps a join/D2H the forward
 /// pass already pays (the end-of-layer sync, the gate-logits read, the stream
@@ -161,12 +86,9 @@ struct Profile {
     /// The DSA indexer's HIP-event SPAN — including whatever falls between its kernels,
     /// so NOT comparable to a per-kernel microbench sum. Measured 27% above one, cause
     /// unestablished. Note the endpoints are themselves barrier packets whose dispatch
-    /// cost lands inside the span. On a device path it additionally covers `index_topk`
-    /// — deliberately, so the price of the win is booked rather than hidden.
+    /// cost lands inside the span. It covers `index_topk` too — deliberately, so the
+    /// price of selecting on device is booked rather than hidden.
     idx_gpu_ns: u128,
-    /// The host half of the selection (score D2H + CPU top-k + row upload): GPU-idle time.
-    /// On a device path a 0 here is the measurement, not a missing bucket.
-    idx_host_ns: u128,
     /// Full layers that scored, the denominator for both. Not `tokens * 21` — layers below
     /// `index_topk` return dense before scoring and record nothing.
     idx_layers: u64,
@@ -257,7 +179,6 @@ impl Profile {
         idle_ns: u64,
         poll_ns: u64,
         advice: Option<(usize, usize)>,
-        path: TopkPath,
     ) -> ProfileSummary {
         let tok = self.tokens.max(1) as f64;
         let per = |ns: u128| ns as f64 / 1e6 / tok; // ms/token
@@ -290,13 +211,11 @@ impl Profile {
             0.0
         };
         ProfileSummary {
-            topk_path: path.name(),
             tok_per_s: self.tokens as f64 / (self.wall_ns as f64 / 1e9).max(1e-9),
             hit_pct: 100.0 * hits as f64 / (hits + misses).max(1) as f64,
             wall_ms: per(self.wall_ns),
             route_ms: per(self.route_ns),
             idx_gpu_ms: per(self.idx_gpu_ns),
-            idx_host_ms: (path == TopkPath::Host).then(|| per(self.idx_host_ns)),
             idx_layers_per_tok: self.idx_layers as f64 / tok,
             moe_wall_ms: per(self.moe_wall_ns),
             compute_gpu_ms: per(self.compute_gpu_ns),
@@ -338,9 +257,9 @@ impl Profile {
 
 /// Device-side DSA/MISA indexer state. Mirrors the trained lightning indexer but
 /// everything is device-resident: per full layer a bf16 key slab grown in place,
-/// plus per-token scratch and the host top-k buffers ([`TopkPath::Host`]'s score D2H +
-/// top-k per full layer; `Device`/`DeviceNoSync` leave them empty, `Verify` fills them
-/// to compare against the device rows). MISA additionally maintains a per-full-layer
+/// plus per-token scratch. The score-readback buffers below are filled only by the
+/// `trace`-feature score dump — the selection itself never leaves the device. MISA
+/// additionally maintains a per-full-layer
 /// block-pooled key pool and routes the top-`active_heads` indexer heads via a cheap
 /// device estimate before scoring.
 struct DeviceIndexer {
@@ -352,10 +271,12 @@ struct DeviceIndexer {
     q: DeviceBuf,      // index_n_heads * index_head_dim f32
     w: DeviceBuf,      // index_n_heads f32
     scores: DeviceBuf, // max_ctx f32
+    /// Score readback, `trace` only: the `RIVOLI_DUMP_SCORES` dump is the sole reader
+    /// now that the selection never leaves the device.
+    #[cfg(feature = "trace")]
     scores_host: Vec<u8>,
+    #[cfg(feature = "trace")]
     scores_f: Vec<f32>,
-    sel: Vec<usize>,
-    rows: Vec<u32>,
     /// The most recent full layer's selection this token (IndexShare reuse):
     /// `last_dense` = the whole causal prefix (null rows), else `last_nr` rows.
     last_nr: usize,
@@ -467,8 +388,8 @@ pub struct GpuEngine<'a> {
     moe_ev_end: Event,
     /// Brackets the DSA indexer's kernels inside `dsa_select_layer`. Recorded on the
     /// null stream and read behind the END-OF-LAYER sync, which every layer already
-    /// pays — so the span survives deleting the mid-layer one (`TopkPath::DeviceNoSync`),
-    /// which would otherwise retire the very instrument that arm is measured with.
+    /// pays rather than behind the mid-layer one — so the span survives if the mid-layer
+    /// join is ever deleted, which would otherwise retire the instrument that measures it.
     idx_ev_start: Event,
     idx_ev_end: Event,
     /// Both indexer events recorded this layer and not yet read.
@@ -488,10 +409,6 @@ pub struct GpuEngine<'a> {
     /// `argmax` (the prompt's forward has run, but so has its `record`) — kept as a
     /// guard anyway so an early-exit path cannot read an unrecorded event.
     tail_ev_pending: bool,
-    topk_path: TopkPath,
-    /// Full layers `TopkPath::Verify` actually compared. A gate that can pass without
-    /// running is not a gate: below `index_topk` the selection path never executes.
-    verified_layers: u64,
     moe_monitor: tokio_metrics::TaskMonitor,
     /// DIAGNOSTIC (`--checksum-x`, `trace` only): hash the residual stream each layer.
     #[cfg(feature = "trace")]
@@ -517,9 +434,8 @@ impl<'a> GpuEngine<'a> {
         );
         let f = |n: usize| DeviceBuf::new(n * 4); // f32 buffer of n elems
         // dsa and misa both need the resident indexer; misa additionally routes heads.
-        let topk_path = TopkPath::from_env()?;
         let idx = if matches!(mode, AttnMode::Dsa | AttnMode::Misa { .. }) {
-            tracing::info!("DSA row selection: RIVOLI_TOPK={}", topk_path.name());
+            tracing::info!("DSA row selection: device index_topk");
             let misa = matches!(mode, AttnMode::Misa { .. });
             let full = cfg.indexer_layout()?;
             let hd = cfg.index_head_dim;
@@ -543,10 +459,10 @@ impl<'a> GpuEngine<'a> {
                 q: DeviceBuf::new(cfg.index_n_heads * hd * 4)?,
                 w: DeviceBuf::new(cfg.index_n_heads * 4)?,
                 scores: DeviceBuf::new(max_ctx * 4)?,
+                #[cfg(feature = "trace")]
                 scores_host: Vec::new(),
+                #[cfg(feature = "trace")]
                 scores_f: Vec::new(),
-                sel: Vec::new(),
-                rows: Vec::new(),
                 last_nr: 0,
                 last_dense: true,
                 pool,
@@ -656,8 +572,6 @@ impl<'a> GpuEngine<'a> {
             idx_ev_start: Event::new()?,
             idx_ev_end: Event::new()?,
             idx_ev_pending: false,
-            topk_path,
-            verified_layers: 0,
             moe_monitor: tokio_metrics::TaskMonitor::new(),
             #[cfg(feature = "trace")]
             checksum_x: false,
@@ -809,7 +723,7 @@ impl<'a> GpuEngine<'a> {
         let nr = topk.min(nt);
 
         // Query heads (wq_b·qr, roped per head) + gates (weights_proj·xn), then score
-        // every cached token and pick the top-k — [`TopkPath`] decides where.
+        // every cached token and pick the top-k, both on device.
         let wscale = 1.0 / (nh as f32).sqrt();
         let dscale = 1.0 / (hd as f32).sqrt();
         // SAFETY: as above; iqp/iwp are live scratch sized nh·hd / nh.
@@ -879,65 +793,41 @@ impl<'a> GpuEngine<'a> {
                 scp,
             )?;
         }
-        let path = self.topk_path;
-        // `Verify` only, and it must precede the launch: a sentinel one slot past the
-        // contract, so the check below catches OVER-selection. Without it a readback
-        // truncated to `nr` matches a kernel that wrote extra rows — the exact masking
-        // docs/NPU.md records, and what `tests/kernel.rs` guards with the same trick.
-        // In bounds: nr = topk < nt.
-        if path == TopkPath::Verify {
-            self.rows_buf
-                .copy_in_at(nr * 4, &ROWS_SENTINEL.to_le_bytes())?;
-        }
-        // Launched INSIDE the event bracket deliberately: the kernel's cost then lands in
-        // `idx_gpu_ns` rather than nowhere, so the arms difference as (idx_host lost) minus
-        // (idx_gpu gained) instead of hiding the price of the win.
-        if path.selects_on_device() {
-            // SAFETY: scp holds nt f32 (just written by index_score, same stream); rows_buf
-            // is max_ctx u32 and the kernel writes exactly nr = min(topk, nt) <= nt <=
-            // max_ctx. Both buffers are engine-owned, so `DeviceNoSync` deleting the
-            // mid-layer join does not shorten the liveness `launch_index_topk` requires.
-            unsafe {
-                launch_index_topk(
-                    scp as *const f32,
-                    nt,
-                    topk,
-                    self.rows_buf.ptr_mut() as *mut u32,
-                )?;
-            }
+        // Launched INSIDE the event bracket deliberately: the kernel's cost lands in
+        // `idx_gpu_ns` rather than nowhere, so selecting on device is priced rather than
+        // credited with the host round-trip it removed.
+        //
+        // SAFETY: scp holds nt f32 (just written by index_score, same stream); rows_buf
+        // is max_ctx u32 and the kernel writes exactly nr = min(topk, nt) <= nt <=
+        // max_ctx. Both buffers are engine-owned.
+        unsafe {
+            launch_index_topk(
+                scp as *const f32,
+                nt,
+                topk,
+                self.rows_buf.ptr_mut() as *mut u32,
+            )?;
         }
         if bracket {
             self.idx_ev_end.record(std::ptr::null_mut())?;
             self.idx_ev_pending = true;
         }
-        // `RIVOLI_DUMP_SCORES` needs the scores host-side even on a device path. Gated on
-        // the REMAINING budget, not on the file: once the dump finishes it must stop
-        // forcing the sync below, or a trace build silently measures `Device` where the
-        // shell asked for `DeviceNoSync`.
+        // The mid-layer join. TWO consumers — it makes the score D2H below safe AND
+        // retires the event pair. Deleting it was measured as its own arm and is worth
+        // −2.5 ms/token, 0.6% of wall, at the cost of making `route` incomparable with
+        // every historical row in benchmarks.md; not taken, see the module note above.
+        blocked(&mut self.prof.sync_wait_ns, "gpu-wait/idx-sync", device_sync)?;
+        // `RIVOLI_DUMP_SCORES` is the only thing left that wants the scores host-side.
+        // Gated on the REMAINING budget, not on the file, so a finished dump stops paying
+        // for a D2H the selection itself no longer needs.
         #[cfg(feature = "trace")]
-        let want_scores = path.runs_host_topk()
-            || self.score_dump.as_ref().is_some_and(|(_, _, left)| *left > 0);
-        #[cfg(not(feature = "trace"))]
-        let want_scores = path.runs_host_topk();
-        // The mid-layer join, skipped only by `DeviceNoSync` and only when nothing
-        // host-side needs the scores. It has TWO consumers — it makes the score D2H safe
-        // AND retires the event pair — which is why deleting it is a separate arm rather
-        // than part of the wiring. Safe to drop: the attend reads `rows_buf` on the same
-        // stream, and the indexer scratch this also protects cannot be reused before the
-        // UNCONDITIONAL end-of-layer join in `forward`. Not a new assumption either — the
-        // `nt <= topk` return above already leaves this function without syncing.
-        if want_scores || path != TopkPath::DeviceNoSync {
-            blocked(&mut self.prof.sync_wait_ns, "gpu-wait/idx-sync", device_sync)?;
-        }
-        // Clocked only where the host round-trip IS the selection. `Verify` does the same
-        // work to compare against the device rows and must not be timed: it is not an arm.
-        let t_idx = (bracket && path == TopkPath::Host).then(std::time::Instant::now);
-        if want_scores {
-            // Classed as a GPU wait even though `idx_host_ns` already brackets the whole
-            // host round-trip: that clock measures the SELECTION arm's cost, this one
-            // measures what the thread was doing. Unwrapped, it inflated the derived
-            // `cpu` bucket on the `--attn dsa` arms — invisible under `--attn dense`,
-            // where `dsa_select_layer` never runs at all.
+        if self
+            .score_dump
+            .as_ref()
+            .is_some_and(|(_, _, left)| *left > 0)
+        {
+            // Classed as a GPU wait, not host compute: the thread is parked in a transfer.
+            // Unwrapped, it inflated the `cpu` bucket on the `--attn dsa` arms.
             blocked(&mut self.prof.sync_wait_ns, "gpu-wait/idx-scores-d2h", || {
                 idx.scores.copy_out_prefix(&mut idx.scores_host, nt * 4)
             })?;
@@ -948,56 +838,9 @@ impl<'a> GpuEngine<'a> {
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
             );
         }
-        if path.runs_host_topk() {
-            topk_into(&idx.scores_f, topk, &mut idx.sel);
-            idx.sel.sort_unstable(); // ascending token order for the gather
-            idx.rows.clear();
-            idx.rows.extend(idx.sel.iter().map(|&i| i as u32));
-            // Baseline only. `Verify` must NOT upload: the attend has to consume the
-            // DEVICE rows, or the gate below checks the kernel against itself.
-            if path == TopkPath::Host {
-                self.rows_buf.copy_in_at(0, as_le_bytes(&idx.rows))?;
-            }
-        }
-        if let Some(t) = t_idx {
-            self.prof.idx_host_ns += t.elapsed().as_nanos();
-        }
-        // CORRECTNESS GATE (`RIVOLI_TOPK=verify`): the rows the attend is about to consume,
-        // against the host selection, on the engine's real scores. Aborts the run on a
-        // mismatch — the selection is integer indices, so there is no tolerance.
-        if path == TopkPath::Verify {
-            // A fresh Vec per layer, unlike every other D2H here: `Verify` already pays a
-            // sync + D2H + CPU top-k, and a scratch field for a debug arm outlives it.
-            let mut raw = Vec::new();
-            self.rows_buf.copy_out_prefix(&mut raw, (nr + 1) * 4)?;
-            let mut got = raw
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
-            // Pin the comparison length first, so the sentinel check below is KNOWN to land
-            // on slot `nr`. A precondition of the gate, not a check on the device.
-            ensure!(
-                idx.rows.len() == nr,
-                "host top-k returned {} rows, want nr={nr} at layer {l} pos {pos} (nt={nt})",
-                idx.rows.len()
-            );
-            // `idx.rows` must be zip's LEFT operand: `Zip::next` pulls left first and stops
-            // there, leaving `got` holding slot `nr` for the sentinel. Swapped, the sentinel
-            // is consumed and the check below passes on a truncated iterator.
-            for (slot, (want, d)) in idx.rows.iter().zip(got.by_ref()).enumerate() {
-                ensure!(
-                    d == *want,
-                    "index_topk selection differs from the host at layer {l} pos {pos} \
-                     (nt={nt} topk={topk}): slot {slot} device {d} vs host {want}"
-                );
-            }
-            ensure!(
-                got.next() == Some(ROWS_SENTINEL),
-                "index_topk wrote past nr={nr} at layer {l} pos {pos} (nt={nt}) — over-selection"
-            );
-            self.verified_layers += 1;
-        }
-        // AFTER the `idx_host_ns` clock closes, deliberately: an ~8 KB write inside it
-        // would inflate the one bucket the offload analysis attributes. Harmless while
+        // The score dump writes AFTER the join above, deliberately: an ~8 KB write
+        // inside a timed window would inflate the one bucket the offload analysis
+        // attributes. Harmless while
         // the budget exhausts during prefill (the buckets reset before decode), but the
         // budget is meant to be raised — so the write must not be in the window at all.
         #[cfg(feature = "trace")]
@@ -1180,7 +1023,7 @@ impl<'a> GpuEngine<'a> {
 
             // Row selection: hoisted (dense/streaming) or per-layer DSA (needs `qrp`
             // the q-LoRA residual + `xnp` the layer input, both from phase 1). Whether DSA
-            // syncs mid-layer is [`TopkPath`]'s business, not this call site's.
+            // syncs mid-layer is `dsa_select_layer`'s business, not this call site's.
             let (rows_ptr, nr) = match hoisted_rows {
                 Some(rn) => rn,
                 None => self.dsa_select_layer(l, pos, xnp, qrp, indexer_pin)?,
@@ -1269,10 +1112,7 @@ impl<'a> GpuEngine<'a> {
                 unsafe { launch_gemv_f32(xnp, gate_w, cfg.n_experts, hidden, glp)? };
                 // The gate-logits D2H is a blocking join, so timing around it is free —
                 // no sync we don't already pay. (All the always-on profile buckets wrap
-                // existing join/D2H points; none add a sync.) Under
-                // `TopkPath::DeviceNoSync` this join also absorbs the indexer's outstanding
-                // GPU span — see [`TopkPath::DeviceNoSync`] for why `route` rises there
-                // without the work growing.
+                // existing join/D2H points; none add a sync.)
                 // MoE layer: close the launch span before the first blocking call.
                     let e_launch = std::time::Instant::now();
                     self.prof.cpu_launch_ns += e_launch
@@ -1660,25 +1500,6 @@ impl<'a> GpuEngine<'a> {
         Ok(())
     }
 
-    /// `RIVOLI_TOPK=verify` only: fail if the gate never ran. Below `index_topk` the
-    /// selection path returns dense before comparing anything, so a short run verifies
-    /// nothing and still exits 0 — a gate that can pass without running is not a gate.
-    fn check_verify_ran(&self) -> Result<()> {
-        if self.topk_path == TopkPath::Verify {
-            ensure!(
-                self.verified_layers > 0,
-                "RIVOLI_TOPK=verify compared 0 layers: the context never exceeded \
-                 index_topk={}, so nothing was checked",
-                self.cfg.index_topk
-            );
-            tracing::info!(
-                "RIVOLI_TOPK=verify: {} full layers matched the host selection exactly",
-                self.verified_layers
-            );
-        }
-        Ok(())
-    }
-
     /// **Teacher-forced** negative log-likelihood of `ids`: one `-log softmax(logits)[t]`
     /// per predicted position, returned in order. `ids[0]` is context only, so the result
     /// has `ids.len() - 1` entries.
@@ -1718,7 +1539,6 @@ impl<'a> GpuEngine<'a> {
             }
             Ok(out)
         })?;
-        self.check_verify_ran()?;
         Ok(out)
     }
 
@@ -1888,7 +1708,6 @@ impl<'a> GpuEngine<'a> {
         // The accurate async-side decomposition: reaper fetch wall + the expert
         // stream's tokio-metrics (idle = load-wait, poll = launch).
         let tm = self.moe_monitor.cumulative();
-        self.check_verify_ran()?;
         let summary = self.prof.summary(
             self.pin.hits - hit0,
             self.pin.misses - miss0,
@@ -1898,7 +1717,6 @@ impl<'a> GpuEngine<'a> {
             tm.total_idle_duration.as_nanos() as u64,
             tm.total_poll_duration.as_nanos() as u64,
             self.route_advice,
-            self.topk_path,
         );
         summary.report();
         Ok((generated, summary))
