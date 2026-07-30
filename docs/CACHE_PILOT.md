@@ -192,9 +192,54 @@ At 77.2% recall, covering today's 140.79 useful misses/token takes ~182 speculat
 fetches all of top-`k` is therefore plausibly net-NEGATIVE even at this recall.
 
 What Step 2 actually needs is **precision on a subset** — speculate only where confidence is
-high. The next measurement is recall broken down by **prediction rank**: if the top 2–3
-predictions carry ~95% precision, a confidence-gated prefetcher moves few enough wasted
-bytes to win. That number does not exist yet, and LOOKA is the right place to add it.
+high. Measured below.
+
+### Precision by prediction rank — MEASURED 2026-07-30
+
+Same run. `p@r` is the marginal precision of the pilot's r-th ranked guess (gate score
+descending); cumulative is the precision of speculating on the whole prefix.
+
+| rank r | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| **L+1** `p@r` | **99%** | 96% | 93% | 87% | 78% | 67% | 55% | 42% |
+| **L+2** `p@r` | **97%** | 92% | 85% | 76% | 66% | 55% | 45% | 36% |
+
+Cumulative L+1: top1 98.7 · top2 97.4 · top3 95.8 · top4 93.6 · top5 90.5 · top6 86.6 ·
+top7 82.1 · top8 77.2%. Cumulative L+2: top1 96.7 → top8 68.9%. (Cumulative top-8 equals
+aggregate recall exactly on both horizons — the rank and recall counters are independent,
+so that agreement is a self-check, not a tautology.)
+
+#### The break-even, and why it is 50%
+
+On a bandwidth-saturated device one expert is 15.34 MB ≈ **1.24 ms** — which is also the
+measured stall a miss imposes (ARCHITECTURE.md §3). So per speculation:
+
+- **right** → the fetch leaves the critical path, saving ~1.24 ms of stall; bytes unchanged,
+  since it was going to be fetched anyway.
+- **wrong** → ~1.24 ms of bandwidth spent displacing a real fetch on a device with no spare.
+
+Net = `1.24 × (2p − 1)` ms, **positive iff p > 50%**. Judge the *marginal* `p@r`, not the
+cumulative: adding rank r is priced at `p@r` alone.
+
+| horizon | speculate on | cumulative precision | first rank rejected |
+|---|---|--:|---|
+| **L+1** | ranks 0–6 (**top-7**) | 82.1% | r7 @ 42% |
+| **L+2** | ranks 0–5 (**top-6**) | 78.5% | r6 @ 45% |
+
+**Modelled payoff**, L+1 top-7: `Σ(2·p@r − 1)` over the gated ranks = 4.50, so
+`4.50 × 1.24 ms × f_nonres` per layer. At the measured miss fraction (`f_nonres` ≈ 0.235)
+that is ~1.3 ms/layer ⇒ **~98 ms/token**, which would land 386 → ~288 ms/tok, essentially
+on the ~283 ms overlap floor. Treat this as a model, not a result: it assumes wasted bytes
+displace useful ones one-for-one, that a correct prefetch hides the stall completely, and it
+does **not** price wrong admissions evicting warm residents — a second-order cost that
+pushes the real break-even above 50%. The eviction guard in Step 2 exists for exactly that,
+and its hysteresis margin should be tuned against this curve.
+
+`p@0` = 99% at L+1 is the standout: the single top prediction is right essentially always
+and clears any plausible break-even. **If Step 2 wants a minimum viable increment, it is
+"prefetch rank 0 of L+1 only"** — one expert per layer, ~99% precision, no confidence
+tuning, and it exercises every piece of loader plumbing (hidden slots, eviction guard,
+demand-priority) at the lowest possible waste.
 
 ## Step 2 — the speculative loader
 

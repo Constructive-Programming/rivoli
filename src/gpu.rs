@@ -1859,7 +1859,12 @@ impl<'a> GpuEngine<'a> {
         // ROUTER (would a prefetcher guess right?), not of where this run spent its time,
         // and it only exists in `trace` builds.
         #[cfg(feature = "trace")]
-        tracing::info!("{}", self.looka.report());
+        {
+            tracing::info!("{}", self.looka.report());
+            for line in self.looka.rank_report() {
+                tracing::info!("{}", line);
+            }
+        }
         Ok((generated, summary))
     }
 }

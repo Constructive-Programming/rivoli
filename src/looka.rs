@@ -24,6 +24,10 @@
 /// How far ahead to predict. Index into the per-layer stash is the position in this array.
 pub const HORIZONS: [usize; 2] = [1, 2];
 
+/// Ranks tracked for the precision curve. `top_k` is 8 today; the slack costs two words
+/// and means a wider `top_k` does not silently truncate the curve.
+const MAX_RANK: usize = 16;
+
 /// Recall accumulators plus the routing scratch the pilot needs to top-k its own logits.
 pub struct Looka {
     /// Summed per-decision recall (intersection size) and the matching denominator, per
@@ -34,6 +38,13 @@ pub struct Looka {
     /// Same, for "the experts this layer chose for the PREVIOUS token".
     prev_hit: u64,
     prev_tot: u64,
+    /// **Precision at rank**: `rank_hit[h][r]` counts how often the pilot's r-th ranked
+    /// guess (by gate score, descending — `topk_into` sorts value-desc) turned out to be
+    /// one the layer really picked. This, not aggregate recall, is what gates the
+    /// speculative loader: on a bandwidth-bound engine a wrong speculative fetch costs
+    /// real throughput, so the loader needs a PREFIX it can trust, not a good average.
+    rank_hit: [[u64; MAX_RANK]; HORIZONS.len()],
+    rank_tot: [[u64; MAX_RANK]; HORIZONS.len()],
     /// `pred[target][h]` — written at layer `target - HORIZONS[h]`, read when `target`
     /// routes. Same-token and strictly write-before-read, so no generation tag is needed.
     pred: Vec<[Vec<u32>; HORIZONS.len()]>,
@@ -56,6 +67,8 @@ impl Looka {
             tot: [0; HORIZONS.len()],
             prev_hit: 0,
             prev_tot: 0,
+            rank_hit: [[0; MAX_RANK]; HORIZONS.len()],
+            rank_tot: [[0; MAX_RANK]; HORIZONS.len()],
             pred: (0..n_layers).map(|_| Default::default()).collect(),
             prev: vec![Vec::new(); n_layers],
             p_scores: vec![0.0; n_experts],
@@ -91,6 +104,14 @@ impl Looka {
             let p = &self.pred[layer][h];
             self.hit[h] += sel.iter().filter(|&&e| p.contains(&(e as u32))).count() as u64;
             self.tot[h] += n;
+            // Precision at each rank. Scored per-guess (was THIS guess right?), the
+            // reverse direction of the recall test above (was this real pick named?).
+            for (r, &e) in p.iter().take(MAX_RANK).enumerate() {
+                self.rank_tot[h][r] += 1;
+                if sel.contains(&(e as usize)) {
+                    self.rank_hit[h][r] += 1;
+                }
+            }
             // Consume it: a stale guess must never be scored twice if a later token's
             // source layer goes dense and leaves this slot unwritten.
             self.pred[layer][h].clear();
@@ -133,6 +154,43 @@ impl Looka {
         ));
         s
     }
+
+    /// The precision curve, one line per horizon. `p@r` is "the r-th guess was right this
+    /// often"; `top-N` is the CUMULATIVE precision of speculating on the first N guesses,
+    /// which is the number a confidence-gated loader is actually priced by — at cumulative
+    /// precision `p`, covering `u` useful experts costs `u/p` fetches, and everything above
+    /// `u` is wasted bandwidth on an engine that has none to spare.
+    pub fn rank_report(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (h, &dh) in HORIZONS.iter().enumerate() {
+            let live = (0..MAX_RANK)
+                .filter(|&r| self.rank_tot[h][r] > 0)
+                .collect::<Vec<_>>();
+            if live.is_empty() {
+                continue;
+            }
+            let per: Vec<String> = live
+                .iter()
+                .map(|&r| format!("p@{}:{:.0}%", r, Self::pct(self.rank_hit[h][r], self.rank_tot[h][r])))
+                .collect();
+            let (mut ch, mut ct) = (0u64, 0u64);
+            let cum: Vec<String> = live
+                .iter()
+                .map(|&r| {
+                    ch += self.rank_hit[h][r];
+                    ct += self.rank_tot[h][r];
+                    format!("top{}:{:.1}%", r + 1, Self::pct(ch, ct))
+                })
+                .collect();
+            out.push(format!(
+                "  LOOKA precision L+{}: {} | cumulative {}",
+                dh,
+                per.join(" "),
+                cum.join(" ")
+            ));
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -156,6 +214,30 @@ mod tests {
         assert_eq!(lk.prev_tot, 8);
         // ...and the consumed prediction was not double-counted.
         assert_eq!(lk.tot[0], 8);
+    }
+
+    #[test]
+    fn precision_is_scored_per_guess_in_rank_order() {
+        let mut lk = Looka::new(8, 256);
+        // Ranks 0 and 2 are right; 1 and 3 are wrong.
+        lk.stash(3, 0, &[10, 77, 11, 88]);
+        lk.score(3, &[10, 11, 12, 13, 20, 21, 22, 23]);
+        assert_eq!((lk.rank_hit[0][0], lk.rank_tot[0][0]), (1, 1));
+        assert_eq!((lk.rank_hit[0][1], lk.rank_tot[0][1]), (0, 1));
+        assert_eq!((lk.rank_hit[0][2], lk.rank_tot[0][2]), (1, 1));
+        assert_eq!((lk.rank_hit[0][3], lk.rank_tot[0][3]), (0, 1));
+    }
+
+    #[test]
+    fn cumulative_precision_at_full_width_equals_recall() {
+        // When |pred| == |actual|, precision over the whole prefix and recall are the
+        // same ratio — a self-check that the two counters cannot silently disagree.
+        let mut lk = Looka::new(8, 256);
+        lk.stash(3, 0, &[10, 11, 12, 13, 90, 91, 92, 93]);
+        lk.score(3, &[10, 11, 12, 13, 20, 21, 22, 23]);
+        let rank_sum: u64 = lk.rank_hit[0].iter().sum();
+        let rank_tot: u64 = lk.rank_tot[0].iter().sum();
+        assert_eq!((rank_sum, rank_tot), (lk.hit[0], lk.tot[0]));
     }
 
     #[test]
