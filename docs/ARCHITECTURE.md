@@ -222,6 +222,23 @@ flowchart LR
   a wait enqueued before the producer records is a silent no-op — and enqueueing up front is
   the entire point. HIP uses `hipStreamWaitValue64`; Vulkan attaches the wait to a submit.
   Both are tested (INV-4), per backend, because they reach the property differently.
+
+  **Residents are launched FIRST, and that ordering is load-bearing.** The compute stream is
+  FIFO, so enqueueing in `sel` order puts every resident expert behind the first miss's wait
+  and nothing computes while a fetch is in flight — measured 3.05 → 2.44 tok/s when that was
+  briefly the case. Reordering launches is safe by construction (each expert writes its own
+  partial row; `moe_reduce` sums `0..ndesc` in fixed order), and it branches on
+  `ticket.is_resident()` — which is *not* the old mask, because it selects an ORDER among
+  launches that each enqueue their wait unconditionally. A wrong bit costs throughput and
+  cannot cost correctness.
+
+  **What it costs, measured.** ~10% against the host-gated engine it replaced (2.66–2.78 vs
+  3.05 tok/s; `moe` 254 vs 210 ms). Bucketing the MoE bracket by miss count localises it: the
+  marginal slope is unchanged (1073 → 1102 µs/miss), but a fixed **+382 µs** appears once per
+  layer-with-misses (a 1-miss layer costs +145 µs over 0-miss at baseline, +527 µs here).
+  That is wake latency on the wait — the GPU notices the value later than a host-func
+  callback did. Recovering it needs the misses off the critical stream (multiple compute
+  queues; Vulkan already has three), not a cheaper wait.
 - **Fixed-order reduce.** Partials are independent rows; `moe_reduce` sums them in a fixed
   order (deterministic output regardless of completion order). The shared expert folds in
   as a resident 9th descriptor (weight 1.0, always `ready()`).
