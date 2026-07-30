@@ -145,10 +145,11 @@ sequenceDiagram
   inline (no per-layer `block_on`). The runtime is local (not on `self`) so the future can
   borrow `&mut self` — the engine's state is single-owner throughout.
 - **The reaper is the only other thread** (`src/asyncfetch.rs`). It owns the demand ring
-  and a dedicated fetch `HipStream`; it queues+submits the batch, reaps completions
-  one-by-one, and arms each read's `Signal` on the fetch stream *after* kicking its
-  bounce→slot copy — so `load(e)` resolves when the **copy** lands, not merely the NVMe
-  read. A cache **hit** never enters here; its load is `Signal::ready()`.
+  and a dedicated fetch stream (`backend::Stream::fetch()` — a `hipStream_t` under `rocm`, a
+  third `VkQueue` with its own ring and timeline under `vulkan`); it queues+submits the batch,
+  reaps completions one-by-one, and arms each read's `Signal` on the fetch stream *after*
+  kicking its bounce→slot copy — so `load(e)` resolves when the **copy** lands, not merely
+  the NVMe read. A cache **hit** never enters here; its load is `Signal::ready()`.
 - The `StreamExt` pipeline stays single-threaded on the decode loop; the reaper blocks
   off-thread; the two meet **only** through `Signal` wakers. That is the entire concurrency
   surface — deliberately small.
@@ -356,12 +357,14 @@ directly from the fp8 source (`vq3_to_i4` is the retired lossy chain — see doc
 - `gpu` — the async forward pass; `hip` — the HIP/rocm FFI surface; `quant`/`math`/`model`
   — leaf.
 - `attn`/`indexer` — attention modes + DSA. `telemetry` — the always-on PROFILE summary.
-- `backend` — the planned build-time backend waist (`rocm` XOR `vulkan`, one impl chosen at
-  compile time, no vtable); **not yet wired** — a plan, not a seam. `vk` — the **Vulkan
-  compute backend** (`--features vulkan`): a feature-gated **WIP**, kernels landed through
-  tranche 2d but **not yet runnable**; see `docs/VULKAN.md`.
+- `backend` — the build-time backend waist (`rocm` XOR `vulkan`, one impl chosen at compile
+  time, no vtable). It IS the seam now: `gpu`, `pin`, `asyncfetch` and `stream` import it
+  rather than `hip`. `vk`/`vkstream` — the **Vulkan compute backend**
+  (`--features vulkan`): 16 of 29 kernels, and it DECODES `--mode int3-vq --attn dense` over
+  three queues with the fetch↔compute overlap intact (97% hidden, against ROCm's 96%). Still
+  ~1.9x slower end to end, all of it MoE kernel throughput; see `docs/VULKAN.md`.
 - `kernels/*.hip` — moe, mla, attn, linalg, indexer, fwd, async, vmm (HIP/rocm).
-  `kernels/vk/*.comp` → SPIR-V via the `build.rs` vulkan arm (the WIP second backend).
+  `kernels/vk/*.comp` → SPIR-V via the `build.rs` vulkan arm (the second backend).
 - `src/bin/` — `convert`, `fp8_to_i4`, `vq3_to_i4`, `add_indexer`, `i4_audit`, `ppl`,
   `replay`. (There is no `pack_i4`; docs that reference one are stale.)
 

@@ -5,12 +5,14 @@
 //!
 //! The ring is the `io-uring` crate (talks to the io_uring syscalls directly — no
 //! liburing system lib). This module owns the O_DIRECT alignment math (block-aligned
-//! offset/length/buffer), the fds, and the VMM destination pointers; the two HIP ops
-//! (pinned bounce arena, async H2D copy) are `rivoli_*` wrappers in `kernels/async.hip`.
+//! offset/length/buffer), the fds, and the VMM destination pointers; the two BACKEND ops
+//! (host staging arena, async H2D copy) are `rivoli_*` wrappers in `kernels/async.hip` under
+//! `rocm` and `vk::Buf::staging` + `vk::copy_h2d_async` under `vulkan` — see [`stage`], the
+//! whole of the difference.
 //!
 //! Two destination modes (chosen at `Streamer::new`, `queue`'s `dst` is the VMM slot
-//! either way): BOUNCE (the default) reads into a pinned host arena then
-//! `hipMemcpyAsync`s into VMM; DIRECT (`--direct-vmm-dma`) DMAs the read straight into
+//! either way): BOUNCE (the default) reads into a host staging arena then
+//! async-copies into VMM; DIRECT (`--direct-vmm-dma`) DMAs the read straight into
 //! VMM. Bounce is the default AND a WORKAROUND for an amdgpu kernel bug (6.18.38-
 //! gentoo, 2026-07-17) that EFAULTs on io_uring/O_DIRECT DMA into VMM device memory
 //! (can't `get_user_pages` those pages; regression vs ≤6.18.35-r1). The EFAULT is gone
