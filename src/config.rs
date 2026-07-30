@@ -173,7 +173,6 @@ impl Config {
     /// attribute some other mechanism's behaviour to `top-m` in a measurement that is
     /// specifically trying to price `top-m`.
     pub fn validate(&self) -> Result<()> {
-        self.validate_backend()?;
         if self.cache_policy != "top-m" {
             return Ok(());
         }
@@ -203,8 +202,17 @@ impl Config {
     /// after the artifact is mmapped, the tier is filled and forty layers have run. Same
     /// information, an order of magnitude more expensive to receive. See docs/VULKAN.md,
     /// "Kernel inventory — port 16 of 29".
+    ///
+    /// SEPARATE from [`Config::validate`], and called separately by `main`, deliberately.
+    /// `validate` polices flag COMBINATIONS — a property of the configuration, the same on
+    /// every machine — and its tests assert exactly that. Folding a build-time capability
+    /// gate into it would make those tests pass or fail depending on which feature the
+    /// suite was compiled with, and the first symptom was `top_m_in_hybrid_mode_fails_loudly`
+    /// failing under `--features vulkan` on the wrong error entirely. Two questions, two
+    /// functions. `main` asks both, next to each other, plus the `--moe-gain` gate that has
+    /// no `Config` field to hang off.
     #[cfg(feature = "vulkan")]
-    fn validate_backend(&self) -> Result<()> {
+    pub fn validate_backend(&self) -> Result<()> {
         use crate::attn::AttnMode;
         if self.mode != Mode::Int3Vq {
             bail!(
@@ -229,10 +237,10 @@ impl Config {
         Ok(())
     }
 
-    /// The `rocm` arm of [`Config::validate_backend`]: every kernel is present, so there is
+    /// The non-Vulkan arm of `validate_backend`: `rocm` has every kernel, so there is
     /// nothing to refuse.
     #[cfg(not(feature = "vulkan"))]
-    fn validate_backend(&self) -> Result<()> {
+    pub fn validate_backend(&self) -> Result<()> {
         Ok(())
     }
 }
@@ -319,6 +327,52 @@ mod tests {
             for m in [Mode::Int3Vq, Mode::Int4, Mode::Hybrid] {
                 cfg(p, m, Some("/tmp/t")).validate().expect("{p} must stay unconstrained");
             }
+        }
+    }
+
+    /// `validate` must NOT consult the backend. The two above and the one below are the
+    /// reason: these assertions hold on every build, and they only do because the
+    /// capability gate is a separate function. Wire `validate_backend` back into `validate`
+    /// and this test goes red under `--features vulkan` (`--mode int4` would be refused for
+    /// the wrong reason), which is the regression it exists to catch.
+    #[test]
+    fn validate_is_backend_independent() {
+        cfg("lru", Mode::Int4, None).validate().expect("int4 is a valid CONFIGURATION");
+        cfg("lru", Mode::Hybrid, None).validate().expect("hybrid is a valid CONFIGURATION");
+    }
+
+    /// The Vulkan capability gate: int3-vq + dense/streaming pass; int4, hybrid, dsa and
+    /// misa are refused AT STARTUP with a message naming both the missing kernels and the
+    /// way out. See docs/VULKAN.md, "Kernel inventory — port 16 of 29".
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn vulkan_refuses_the_unported_modes() {
+        use crate::attn::AttnMode;
+        let with_attn = |m: Mode, a: AttnMode| {
+            let mut c = cfg("lru", m, None);
+            c.attn = a;
+            c
+        };
+        for a in [AttnMode::Dense, AttnMode::Streaming { sinks: 4, window: 512 }] {
+            with_attn(Mode::Int3Vq, a)
+                .validate_backend()
+                .expect("int3-vq + a ported attention mode is the supported configuration");
+        }
+        for m in [Mode::Int4, Mode::Hybrid] {
+            let e = with_attn(m, AttnMode::Dense)
+                .validate_backend()
+                .expect_err("int4 expert kernels are not ported");
+            let msg = e.to_string();
+            assert!(msg.contains("int4 expert kernels"), "must name what is missing: {msg}");
+            assert!(msg.contains("--features rocm"), "must name the way out: {msg}");
+        }
+        for a in [AttnMode::Dsa, AttnMode::Misa { active_heads: 4 }] {
+            let e = with_attn(Mode::Int3Vq, a)
+                .validate_backend()
+                .expect_err("the DSA indexer kernels are not ported");
+            let msg = e.to_string();
+            assert!(msg.contains("index_append"), "must name what is missing: {msg}");
+            assert!(msg.contains("--features rocm"), "must name the way out: {msg}");
         }
     }
 }

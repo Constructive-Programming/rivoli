@@ -271,6 +271,12 @@ fn main() -> Result<()> {
     cfg.mode = a.mode;
     // Mode-dependent, so it cannot live in `discover` — see Config::validate.
     cfg.validate()?;
+    // Two DIFFERENT questions, asked together: is this configuration coherent (above), and
+    // does the backend this binary was built with have the kernels it needs (here)? The
+    // second is a no-op under `rocm` and refuses `--mode int4|hybrid` / `--attn dsa|misa`
+    // under `vulkan`. Kept separate so `validate`'s own tests stay backend-independent —
+    // see Config::validate_backend.
+    cfg.validate_backend()?;
     // `--moe-gain` is the one backend-gated knob that is NOT a `Config` field, so it is
     // checked here rather than in `validate_backend` with the others. g == 1 takes the
     // ported `vadd`; anything else takes `vaxpy`, which the Vulkan backend defers. Rejected

@@ -41,11 +41,15 @@ use rivoli::device::{DeviceBuf, DeviceTier};
 use rivoli::quant::{matvec_fp8, matvec_i8};
 use rivoli::math::{E4M3_BLOCK, E4M3_MAX, e4m3_to_f32, f32_to_bf16, f32_to_e4m3, silu};
 use rivoli::vk::{
-    Buf, ROWS_PER_BLOCK, VALIDATION_ERRORS, device_sync, gpu, launch_append_kv, launch_argmax,
-    launch_embed_i8_row, launch_gather_rope, launch_gemv_f32, launch_gemv_fp8, launch_gemv_i8,
-    launch_attend, launch_mla_absorb_fp8, launch_mla_value_fp8, launch_moe_expert_range,
+    Buf, ExpertDesc, ROWS_PER_BLOCK, VALIDATION_ERRORS, device_sync, fill_u32, gpu,
+    launch_append_kv, launch_argmax,
+    launch_embed_i8_row, launch_flag_nonfinite, launch_gather_rope, launch_gemv_f32,
+    launch_gemv_fp8, launch_gemv_i8,
+    launch_attend, launch_index_append, launch_index_head_route, launch_index_pool_push,
+    launch_index_score, launch_index_topk, launch_layernorm, launch_mla_absorb_fp8,
+    launch_mla_value_fp8, launch_moe_expert_range, launch_moe_expert_range_i4,
     launch_moe_reduce, launch_rmsnorm, launch_rope,
-    launch_swiglu, launch_vadd, memcpy_dtod,
+    launch_swiglu, launch_vadd, launch_vaxpy, memcpy_dtod,
 };
 use std::sync::atomic::Ordering;
 
@@ -3292,4 +3296,215 @@ fn planted_straddle_indices_would_catch_a_naive_unpack() {
          — below {straddling} and the GPU test could go green against a broken shader"
     );
     println!("{caught}/{straddling} straddling subvectors distinguish a naive unpack");
+}
+
+// ---------------------------------------------------------------------------
+// The phase-4 integration surface: fill_u32, flag_nonfinite, and the refusals.
+//
+// Oracles from kernels/fwd.hip::flag_nonfinite and kernels/vmm.hip::fill_u32.
+// ---------------------------------------------------------------------------
+
+/// Read one u32 back from a buffer, after a sync.
+fn read_u32(b: &Buf) -> u32 {
+    let raw = readb(b, 4);
+    u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])
+}
+
+/// `vkCmdFillBuffer` must behave as `vmm.hip::fill_u32`: every 32-bit word in
+/// `[dst, dst+bytes)` becomes `pat`, and NOTHING past it moves.
+///
+/// The pattern is the one `pin.rs` actually poisons with — a quiet NaN in f32 and in both
+/// bf16 halves — because a fill that swapped byte order would be invisible under a
+/// palindromic pattern and 0x7FC0_7FC0 is one. So the guard band carries a DIFFERENT,
+/// non-palindromic word, and a partial fill is what the overrun check catches.
+#[test]
+fn fill_u32_writes_the_pattern_and_nothing_past_it() {
+    let v = Validation::new();
+    const PAT: u32 = 0x7FC0_7FC0;
+    // 4 (one word), 1020/1028 either side of a 256-thread workgroup's 1024 bytes, and a
+    // ragged multi-workgroup size. None is a multiple of the workgroup byte span.
+    for bytes in [4usize, 1020, 1028, 5000] {
+        let mut b = poison(bytes + GUARD);
+        // SAFETY: `b` owns `bytes + GUARD` device bytes and `bytes` is a multiple of 4.
+        unsafe { fill_u32(b.ptr_mut(), PAT, bytes).expect("fill") };
+        device_sync().expect("sync");
+        let got = readb(&b, bytes + GUARD);
+        let label = format!("fill_u32 bytes={bytes}");
+        assert_untouched(&got, bytes, &label);
+        let want: Vec<u8> = PAT.to_le_bytes().repeat(bytes / 4);
+        assert_bytes(&want, &got[..bytes], &label);
+    }
+
+    // The guards. A `bytes` that is not a multiple of 4 cannot be expressed as whole
+    // words, and vkCmdFillBuffer would silently round it — so the launcher refuses,
+    // matching `rivoli_fill_u32`'s rc 1001.
+    let mut b = dev(&[0u8; 64]);
+    // SAFETY: every call is rejected on its arguments before the pointer is used.
+    unsafe {
+        assert!(fill_u32(b.ptr_mut(), PAT, 0).is_err(), "0 bytes must be rejected");
+        assert!(fill_u32(b.ptr_mut(), PAT, 6).is_err(), "6 bytes must be rejected");
+        assert!(
+            fill_u32(std::ptr::null_mut(), PAT, 4).is_err(),
+            "an address in no live Buf must be rejected"
+        );
+    }
+    v.check("fill_u32_writes_the_pattern_and_nothing_past_it");
+}
+
+/// `flag_nonfinite` records `tag` iff some element is non-finite, and FIRST WRITER WINS.
+///
+/// The oracle is `kernels/fwd.hip::flag_nonfinite`: `atomicCAS(flag, 0, tag)` on any `x[i]`
+/// failing `-inf < x[i] < inf`. Four properties, and the last is the one that makes the NaN
+/// localizer's answer meaningful rather than merely non-zero:
+///
+/// 1. An all-finite buffer leaves the flag at 0 — the "clean run" reading.
+/// 2. A NaN anywhere sets it. Positions are swept across the workgroup boundary because a
+///    shader that only checked lane 0, or only the first workgroup, would pass a
+///    first-element test and miss every real fault.
+/// 3. +inf and -inf set it too. A shader written with `isnan` instead of the two-sided
+///    compare passes on the NaN and silently ignores an overflow to infinity, which is the
+///    more common numerical failure of the two.
+/// 4. A SECOND call with a different tag over an already-flagged buffer does not overwrite
+///    the first — so the tag names the EARLIEST non-finite layer, which is the whole
+///    diagnostic. A plain store instead of the CAS would report the LAST layer, i.e. would
+///    point at a consequence rather than a cause.
+#[test]
+fn flag_nonfinite_records_the_first_tag_only() {
+    let v = Validation::new();
+    let mut r = Lcg(0xFACE);
+    // Sizes either side of one workgroup (256 threads), plus a ragged multi-workgroup one.
+    for n in [1usize, 255, 257, 1000] {
+        let finite: Vec<f32> = (0..n).map(|_| r.f()).collect();
+
+        // 1. Clean.
+        let xb = dev(&f32b(&finite));
+        let mut flag = dev(&0u32.to_le_bytes());
+        // SAFETY: `xb` is n live f32, `flag` one live u32, both until the sync.
+        unsafe { launch_flag_nonfinite(xb.ptr() as *const f32, n, 0x11, flag.ptr_mut() as *mut u32) }
+            .expect("launch clean");
+        device_sync().expect("sync");
+        assert_eq!(read_u32(&flag), 0, "n={n}: an all-finite buffer must not flag");
+
+        // 2/3. One bad element at a time, at positions that straddle the workgroup edge.
+        for (label, bad) in [("nan", f32::NAN), ("+inf", f32::INFINITY), ("-inf", f32::NEG_INFINITY)]
+        {
+            for &pos in &[0usize, n / 2, n - 1] {
+                let mut x = finite.clone();
+                x[pos] = bad;
+                let xb = dev(&f32b(&x));
+                let mut flag = dev(&0u32.to_le_bytes());
+                // SAFETY: as above.
+                unsafe {
+                    launch_flag_nonfinite(xb.ptr() as *const f32, n, 0x2A, flag.ptr_mut() as *mut u32)
+                }
+                .expect("launch bad");
+                device_sync().expect("sync");
+                assert_eq!(
+                    read_u32(&flag),
+                    0x2A,
+                    "n={n} {label} at {pos}: must be flagged with the tag"
+                );
+            }
+        }
+    }
+
+    // 4. First writer wins across two calls on one flag.
+    let n = 512usize;
+    let mut x: Vec<f32> = (0..n).map(|_| r.f()).collect();
+    x[100] = f32::NAN;
+    let xb = dev(&f32b(&x));
+    let mut flag = dev(&0u32.to_le_bytes());
+    // SAFETY: as above; the two launches are ordered by `enqueue`'s barrier.
+    unsafe {
+        launch_flag_nonfinite(xb.ptr() as *const f32, n, 0x07, flag.ptr_mut() as *mut u32)
+            .expect("first tag");
+        launch_flag_nonfinite(xb.ptr() as *const f32, n, 0x63, flag.ptr_mut() as *mut u32)
+            .expect("second tag");
+    }
+    device_sync().expect("sync");
+    assert_eq!(
+        read_u32(&flag),
+        0x07,
+        "the FIRST tag must survive — a plain store would report the last layer to see the \
+         NaN instead of the one that produced it"
+    );
+
+    // Guards. `n = 0` has nothing to scan; tag 0 is the "nothing flagged" sentinel and a
+    // CAS against it writes nothing, so a caller passing it would get silence it could not
+    // distinguish from a clean run.
+    // SAFETY: both are rejected on their arguments before any pointer is used.
+    unsafe {
+        assert!(
+            launch_flag_nonfinite(xb.ptr() as *const f32, 0, 1, flag.ptr_mut() as *mut u32).is_err(),
+            "n = 0 must be rejected"
+        );
+        assert!(
+            launch_flag_nonfinite(xb.ptr() as *const f32, n, 0, flag.ptr_mut() as *mut u32).is_err(),
+            "tag 0 must be rejected"
+        );
+    }
+    v.check("flag_nonfinite_records_the_first_tag_only");
+}
+
+/// The DEFERRED launchers must return `Err`, every one of them.
+///
+/// This is an oracle, not a formality. The alternative implementation — a no-op that
+/// returns `Ok` — compiles, dispatches nothing, and produces numbers: `layernorm` leaves
+/// the DSA indexer selecting rows on unnormalised keys, `moe_expert_range_i4` leaves the
+/// partial slab holding the previous token's experts. Both are silently wrong and neither
+/// would fail any other test in this file, because no other test calls them. So the
+/// property under test is "refuses", and it is checked directly.
+///
+/// `Config::validate` is what a USER hits first (docs/VULKAN.md: a Vulkan build rejects
+/// `--attn dsa|misa` and `--mode int4|hybrid` at startup). These are the backstop for a
+/// path that reaches a kernel without passing that gate.
+///
+/// Null pointers throughout, deliberately: a launcher that dereferenced one would fault
+/// here rather than pass, which is the second thing this test pins down.
+#[test]
+fn deferred_launchers_refuse_rather_than_no_op() {
+    let nf: *mut f32 = std::ptr::null_mut();
+    let cf: *const f32 = std::ptr::null();
+    // SAFETY: every launcher below is a deferred stub that returns Err before touching a
+    // pointer — which is precisely what this test asserts. A regression to a real
+    // implementation would fault on the nulls instead of passing quietly.
+    let refusals: Vec<(&str, bool)> = unsafe {
+        vec![
+            (
+                "moe_expert_range_i4",
+                launch_moe_expert_range_i4(
+                    cf,
+                    64,
+                    64,
+                    0,
+                    1,
+                    std::ptr::null::<ExpertDesc>(),
+                    cf,
+                    nf,
+                    nf,
+                    std::ptr::null_mut(),
+                )
+                .is_err(),
+            ),
+            ("layernorm", launch_layernorm(cf, cf, cf, 64, 1e-6, nf).is_err()),
+            ("index_append", launch_index_append(cf, std::ptr::null_mut(), 0, 64).is_err()),
+            (
+                "index_score",
+                launch_index_score(cf, cf, std::ptr::null(), std::ptr::null(), 8, 4, 4, 64, 1.0, 1.0, nf)
+                    .is_err(),
+            ),
+            ("index_topk", launch_index_topk(cf, 8, 4, std::ptr::null_mut()).is_err()),
+            ("index_pool_push", launch_index_pool_push(cf, nf, 0, 64).is_err()),
+            ("index_head_route", launch_index_head_route(cf, cf, cf, 2, 4, 64, nf).is_err()),
+            ("vaxpy", launch_vaxpy(nf, cf, 2.0, 64).is_err()),
+        ]
+    };
+    let quiet: Vec<&str> = refusals.iter().filter(|(_, e)| !e).map(|(n, _)| *n).collect();
+    assert!(
+        quiet.is_empty(),
+        "these deferred launchers returned Ok instead of refusing: {quiet:?}. A no-op that \
+         reports success is the failure mode this test exists to prevent — it produces \
+         plausible numbers with no diagnostic."
+    );
+    println!("{} deferred launchers all refuse", refusals.len());
 }

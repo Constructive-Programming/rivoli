@@ -1053,6 +1053,30 @@ fn resolve(addr: u64, len: usize) -> Result<(vk::Buffer, u64)> {
 }
 
 impl Buf {
+    /// # MEASURED: an allocation above ~4 GiB exceeds `maxMemoryAllocationSize` here.
+    ///
+    /// The first Vulkan run against the real artifact allocated the 16.16 GiB resident tier
+    /// and the 43.8 GiB routed pool as ONE `Buf` each, and the validation layer flagged both:
+    ///
+    /// ```text
+    /// vkAllocateMemory(): pAllocateInfo->allocationSize (47070568448) is larger than
+    /// maxMemoryAllocationSize (4294967292)
+    /// ```
+    ///
+    /// It WORKED — the driver honoured both and the token decoded — but that is the layer's
+    /// point: the limit is advertised, this exceeds it by 11x, and the spec permits
+    /// `VK_ERROR_OUT_OF_DEVICE_MEMORY` instead. Not fixed here because fixing it means
+    /// suballocating `DeviceTier`/`VmmBuf` across several allocations, which changes the
+    /// address arithmetic `pin.rs`'s arena is built on. Recorded so the next reader knows it
+    /// is KNOWN rather than unnoticed.
+    ///
+    /// Two consequences that bite before the fix lands:
+    ///
+    /// - **Any test that allocates more than 4 GiB will fail `Validation::check`**, which
+    ///   asserts zero validation messages. Every current test is far below it.
+    /// - **A Vulkan build logs two validation ERRORs during pin construction.** They are not
+    ///   spurious and must not be filtered out — see `debug_callback`'s note on what does
+    ///   and does not get counted.
     pub fn new(len: usize) -> Result<Self> {
         ensure!(len > 0, "Buf::new(0): Vulkan rejects a zero-sized buffer");
         let g = gpu()?;

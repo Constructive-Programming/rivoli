@@ -1,15 +1,20 @@
 # rivoli — Vulkan backend (`vulkan` feature)
 
-Status: **kernels landed through tranche 2d (2026-07-27, merged to main). NOT RUNNABLE —
-the backend cannot decode.** 16 kernels, 37/37 green under default, sync-validation and
-GPU-AV as separate passes; the deliberate straddle break verified red-then-green; GPU-AV
-confirmed live by re-running the probe coverage matrix rather than by a clean pass.
+Status: **RUNNABLE. Phase 4 increment 1 landed (2026-07-30): `--features vulkan` builds and
+decodes `--mode int3-vq --attn dense`.** 16 kernels + `flag_nonfinite` + `fill_u32`, 40/40
+green under the validation layer; the deliberate straddle break verified red-then-green;
+GPU-AV confirmed live by re-running the probe coverage matrix rather than by a clean pass.
 
-**What does not exist:** Phase 4 — the entire streaming and orchestration layer plus the
-three-queue design. `pin.rs`, `gpu.rs`, `asyncfetch.rs`, `stream.rs` and `gpustream.rs` are
-all `rocm`-gated, and `crate::backend` has **zero** consumers, so the backend switch itself
-is unbuilt. MODES.md numbers come after Phase 4, not before. Read "Phase 4 needs two
-queues, not one" before writing any integration code.
+**What does not exist:** the THREE-QUEUE design. Increment 1 integrated onto the single
+existing queue, which docs' own prediction says costs the fetch↔compute overlap entirely —
+**measured at 0% fetch hidden against ROCm's ~95%.** GPU timing spans read `0.0 ms` because
+timestamp query pools are phase 5. Both are documented at their types (`vkstream.rs`) rather
+than left to be inferred from a suspiciously round number. Read "Phase 4 needs two queues,
+not one" and then "Increment 1: measured" before writing increment 2.
+
+MODES.md numbers still come after the three-queue work: a matched multi-token throughput
+comparison has NOT been run, and the one-token figure from increment 1 is not a substitute
+for it.
 
 The acceptance gate is **A+C+D** (see below); byte-identical token IDs are unattainable by
 construction and that is measured, not suspected. Sections below describing work as
@@ -294,11 +299,27 @@ runs the model, and it cuts 13 kernels from the port.
 - `gemv_vq`, `gemv_i4` (`linalg.hip`) — standalone microbench/oracle kernels. Decode
   goes through `moe_*_vq`; nothing in the forward pass calls these.
 - `moe_gateup_i4`, `moe_down_i4` (`moe.hip`) — only needed for `--mode int4|hybrid`.
-- `indexer.hip` ×5 — the DSA path. A Vulkan build supports `--attn dense` and rejects
-  `--attn dsa` at startup.
+- `indexer.hip` ×5 plus `layernorm` (`linalg.hip`, the indexer's k_norm) — the DSA path.
+- `vaxpy` (`fwd.hip`) — reached only by `--moe-gain != 1`, an experiment knob. `vadd`, the
+  g = 1 case, IS ported and is what every normal decode uses.
+
+**How the deferral is enforced, as of increment 1.** Two layers, and the order matters:
+
+- `Config::validate_backend` refuses `--mode int4|hybrid` and `--attn dsa|misa` at
+  STARTUP, before the artifact is opened. `main` refuses `--moe-gain != 1` beside it. Each
+  message names the missing kernels and says `--features rocm`. This is what a user hits.
+- The launchers themselves return `Err` — **not a no-op returning `Ok`**. That distinction
+  is the whole reason they exist: a no-op `layernorm` leaves the DSA indexer selecting rows
+  from unnormalised keys, and a no-op `moe_expert_range_i4` leaves the partial slab holding
+  the previous token's experts. Both produce plausible numbers and no diagnostic.
+  `tests/vk.rs::deferred_launchers_refuse_rather_than_no_op` is the gate on that.
 
 `vmm.hip` and `async.hip` are runtime shims, not kernels — replaced by the Vulkan
-memory/queue layer rather than ported.
+memory/queue layer rather than ported. Two exceptions landed in increment 1 because the
+integration path calls them: `vmm.hip::fill_u32` became `vkCmdFillBuffer` (that command IS
+the kernel, so there is no GLSL twin to write), and `fwd.hip::flag_nonfinite` was ported as
+a real shader — stubbing the NaN localizer would make it report tag 0, "no layer was
+non-finite", on a run that went non-finite.
 
 **Shader language: GLSL compiled by `glslc`.** The kernels are already C-like; GLSL
 keeps the diff readable against the `.hip` originals, which matters because the two
@@ -1050,6 +1071,9 @@ Each phase ends with something runnable; no phase leaves the tree broken.
 
    **READ "Phase 4 needs two queues, not one" BELOW FIRST.** The exit criterion above is
    insufficient on its own, and the seam is smaller than it looks.
+
+   **INCREMENT 1 DELIVERED, and it decodes.** See "Increment 1: measured" below for what
+   landed, what the numbers were, and the two findings the run produced.
 5. **Bench + profiling** — timestamp query pools wired into `telemetry.rs`, then compare
    against HIP on the same artifact. Expect the first port to be slower; record where,
    do not tune during the port.
@@ -1157,6 +1181,13 @@ check this port has: **the token-ID gate passes a backend that is three times sl
 
 ### The streaming layer is not ported, and has not strayed only because it does not exist
 
+> **SUPERSEDED BY INCREMENT 1 — see "Increment 1: measured" below.** The two subsections
+> here diagnose the state of the tree BEFORE integration, and both have since been acted
+> on: the four modules named are now `any(rocm, vulkan)` and `crate::backend` has three
+> consumers. They are kept verbatim because the second one is the reason the increment was
+> scoped the way it was, and because the concurrency argument that follows them is still
+> the plan for increment 2.
+
 Verified rather than assumed: `gpu.rs`, `pin.rs`, `asyncfetch.rs`, `gpustream.rs` and
 `stream.rs` all carry `#![cfg(feature = "rocm")]`, so a Vulkan build compiles none of
 them. That is correct for phases 1–3 and is the whole reason the architecture has not
@@ -1174,6 +1205,12 @@ drifted. It also means every claim below is about work not yet begun.
 
 Both corrected in `backend.rs`'s own comment, which previously promised that swapping
 backends was "a cargo flag and nothing else."
+
+Increment 1's answer to (2): the stream types are re-exported from `backend.rs` under
+BACKEND-NEUTRAL names (`Stream`, `Event`), and `src/vkstream.rs` supplies the Vulkan side
+— a `Stream` that carries nothing because the launchers already ignore their `_stream`
+argument, and an `Event` whose `elapsed_ms` is always `0.0`. Neither pretends to be what
+HIP has; both are documented at the type as the absence they are.
 
 ### The performance property lives in the CONCURRENCY, and vk.rs has none
 
@@ -1284,6 +1321,59 @@ guess and the fence wait makes an undersized ring a stall rather than a bug.
 **`device_sync` joins all three**, in a fixed order (main, MoE, fetch). It is once per
 token, so the cost is three fence waits rather than one, and the ordering is fixed so the
 join itself cannot become a source of nondeterminism.
+
+### Increment 1: measured. It decodes, and it is serialised exactly as predicted.
+
+`--features vulkan --bin rivoli` builds and decodes. Measured on the full artifact
+(`/var/db/rivoli/glm52-vq3-full`, `--mode int3-vq --attn dense --max-mem 60`, one token,
+validation layer ON):
+
+| | |
+|---|---|
+| pin built | 93.2 s |
+| output | coherent (one token, exit 0) |
+| **fetch hidden** | **0%** — 289 ms fetched, 540 ms exposed |
+| GPU timing spans | `moe gpu 0ms`, `tail 0.0ms of 9.8ms` — absent, not small |
+| tok/s | 1.47 at 65.2% expert hit — **not comparable**, see below |
+
+**The 0% is the prediction in this section being confirmed, not a regression to chase.**
+ROCm hides ~95% of fetch behind compute; one queue hides none. The three-queue design
+above is what removes it.
+
+**Do not compare that 1.47 tok/s against PERF.md's ~2.85.** A one-token run is almost
+entirely cold — 4249 misses against 2951 hits — so the figure is dominated by prefill
+fetch on both backends. The honest comparison is a matched multi-token run at the same
+`--max-mem` and `--cache-policy`, which is exactly the throughput criterion this section
+argued Phase 4 needs. It has not been done.
+
+**What landed:** `backend.rs` became the real seam (launcher surface plus backend-neutral
+`Stream`/`Event`/`Signal`); `gpu.rs`/`pin.rs`/`asyncfetch.rs`/`stream.rs` moved from
+`#![cfg(rocm)]` to `any(rocm, vulkan)`; `src/vkstream.rs` is the single-queue shim;
+`flag_nonfinite` was ported as a real shader and `fill_u32` as `vkCmdFillBuffer`; the 13
+deferred kernels return `Err`, and `Config::validate_backend` refuses
+`--mode int4|hybrid`, `--attn dsa|misa` and `--moe-gain != 1` at startup. The
+host-vs-device pointer split landed in `ArenaPool` as this document said it must.
+
+**Two findings from the run, neither fixed:**
+
+1. **`vkAllocateMemory` above ~4 GiB exceeds `maxMemoryAllocationSize` on this driver
+   (4294967292 B), and the validation layer says so twice per run** — once for the
+   16.16 GiB tier, once for the 43.8 GiB pool. Both allocations SUCCEEDED and the token
+   decoded, which is precisely why this needs writing down: the limit is advertised, we
+   exceed it by 11x, and the spec permits `VK_ERROR_OUT_OF_DEVICE_MEMORY` instead. Fixing
+   it means suballocating `DeviceTier`/`VmmBuf` across several `VkDeviceMemory`
+   allocations, which changes the address arithmetic `pin.rs`'s arena is built on — a
+   design change, not a patch. Consequence in the meantime: any test allocating over 4 GiB
+   will fail `Validation::check`, which asserts zero validation messages. See
+   `vk::Buf::new`.
+2. **Bounce mode's staging copy is synchronous on Vulkan.** `stream.rs`'s HIP path is an
+   async `hipMemcpyAsync` on the fetch stream; the Vulkan path is a host `memcpy` into the
+   host-coherent mapping, because the pool IS host memory here. It is correct and it costs
+   a full un-overlapped copy per cold expert. `--direct-vmm-dma` skips it entirely by
+   DMA-ing the O_DIRECT read straight into the mapping, which is what `VmmBuf::new`'s
+   alignment guard exists for — worth measuring against the default on this backend, since
+   the reason bounce is the ROCm default (a read tax on host-mapped VMM) may not price the
+   same way when there is no H2D copy being saved.
 
 **Two things this design must not quietly change.** Cross-queue submits make the
 COMPUTE→COMPUTE and COMPUTE→TRANSFER barriers in `enqueue` insufficient on their own —
