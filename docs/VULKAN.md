@@ -5,16 +5,19 @@ decodes `--mode int3-vq --attn dense`.** 16 kernels + `flag_nonfinite` + `fill_u
 green under the validation layer; the deliberate straddle break verified red-then-green;
 GPU-AV confirmed live by re-running the probe coverage matrix rather than by a clean pass.
 
-**What does not exist:** the THREE-QUEUE design. Increment 1 integrated onto the single
-existing queue, which docs' own prediction says costs the fetch↔compute overlap entirely —
-**measured at 0% fetch hidden against ROCm's ~95%.** GPU timing spans read `0.0 ms` because
-timestamp query pools are phase 5. Both are documented at their types (`vkstream.rs`) rather
-than left to be inferred from a suspiciously round number. Read "Phase 4 needs two queues,
-not one" and then "Increment 1: measured" before writing increment 2.
+On matched 2-token runs the two backends produced **identical token IDs**, and Vulkan was
+**1.74x slower** — see "Increment 1: measured" for the full table and for why neither figure
+should be quoted further than it goes.
 
-MODES.md numbers still come after the three-queue work: a matched multi-token throughput
-comparison has NOT been run, and the one-token figure from increment 1 is not a substitute
-for it.
+**What does not exist:** the THREE-QUEUE design. Increment 1 integrated onto the single
+existing queue, which costs the fetch↔compute overlap entirely — **measured at 0% fetch
+hidden against ROCm's 97%.** GPU timing spans read `0.0 ms` because timestamp query pools
+are phase 5. Both are documented at their types (`vkstream.rs`) rather than left to be
+inferred from a suspiciously round number. Read "Phase 4 needs two queues, not one" and then
+"Increment 1: measured" before writing increment 2.
+
+MODES.md numbers still come after the three-queue work, and gate A's **K is still
+unmeasured**: agreement at K = 2 is a floor, not a result.
 
 The acceptance gate is **A+C+D** (see below); byte-identical token IDs are unattainable by
 construction and that is measured, not suspected. Sections below describing work as
@@ -1322,29 +1325,45 @@ guess and the fence wait makes an undersized ring a stall rather than a bug.
 token, so the cost is three fence waits rather than one, and the ordering is fixed so the
 join itself cannot become a source of nondeterminism.
 
-### Increment 1: measured. It decodes, and it is serialised exactly as predicted.
+### Increment 1: measured. It decodes, it agrees with HIP, and it is serialised.
 
-`--features vulkan --bin rivoli` builds and decodes. Measured on the full artifact
-(`/var/db/rivoli/glm52-vq3-full`, `--mode int3-vq --attn dense --max-mem 60`, one token,
-validation layer ON):
+`--features vulkan --bin rivoli` builds and decodes. **Matched runs**, same artifact
+(`/var/db/rivoli/glm52-vq3-full`), same flags (`--mode int3-vq --attn dense --max-mem 60
+--cache-policy 2q`, `-bench 2`), same prompt, greedy — the throughput criterion this
+section argued for, at a small K:
 
-| | |
-|---|---|
-| pin built | 93.2 s |
-| output | coherent (one token, exit 0) |
-| **fetch hidden** | **0%** — 289 ms fetched, 540 ms exposed |
-| GPU timing spans | `moe gpu 0ms`, `tail 0.0ms of 9.8ms` — absent, not small |
-| tok/s | 1.47 at 65.2% expert hit — **not comparable**, see below |
+| | ROCm | Vulkan |
+|---|---:|---:|
+| **generated token IDs** | `**Option` | **`**Option` — identical** |
+| wall / tok | 418.2 ms | 728.1 ms |
+| tok/s | 2.39 | 1.37 (**1.74x slower**) |
+| **fetch hidden** | **97%** (270 ms fetched, 8 ms exposed) | **0%** (317 ms fetched, 566 ms exposed) |
+| moe / tok | 311 ms (gpu 302 ms) | 566 ms (**gpu 0 ms**) |
+| expert hit | 60.2% (238.5 miss/tok) | 60.5% (237.0 miss/tok) |
+| pin build | — | 95.5 s |
 
-**The 0% is the prediction in this section being confirmed, not a regression to chase.**
-ROCm hides ~95% of fetch behind compute; one queue hides none. The three-queue design
-above is what removes it.
+Four readings, and the distinctions between them matter:
 
-**Do not compare that 1.47 tok/s against PERF.md's ~2.85.** A one-token run is almost
-entirely cold — 4249 misses against 2951 hits — so the figure is dominated by prefill
-fetch on both backends. The honest comparison is a matched multi-token run at the same
-`--max-mem` and `--cache-policy`, which is exactly the throughput criterion this section
-argued Phase 4 needs. It has not been done.
+1. **The token IDs AGREE at K = 2.** Two full forward passes — 78 layers, a 154,880-way
+   argmax, twice — landed on the same tokens. That is real evidence the port is
+   numerically right, and it is not evidence that gate A passes at a useful K: the `exp`
+   divergence this document measured makes eventual disagreement "a matter of when, not
+   whether". K = 2 is a floor, not a result. **Measuring and reporting K is still owed.**
+2. **0% fetch hidden against ROCm's 97%** is the single-queue prediction confirmed on
+   matched runs, at matched hit rates (60.2% vs 60.5%, 238 vs 237 misses). Not a
+   regression to chase — the three-queue design above is what removes it.
+3. **1.74x slower, not ~3x.** This section predicted ~3x; the measurement at these
+   settings is 1.74x, and the reason the prediction overshot is visible in the table: the
+   exposed fetch is 566 ms while ROCm's whole token is 418 ms, so serialisation costs
+   roughly one fetch pass rather than doubling everything. Recorded as measured-at-these-
+   settings; a different hit rate moves it, and 1.74x should not be quoted as the
+   backend's ratio.
+4. **`gpu 0 ms` is the absence of a measurement**, not a fast kernel. See `vkstream.rs`.
+
+The `--features vulkan,trace` build also decodes (2 tokens, exit 0), which exercises the
+slot poisoning and the NaN localizer on this backend — and reported no non-finite layer,
+a reading that only means something because `flag_nonfinite` was ported for real rather
+than stubbed.
 
 **What landed:** `backend.rs` became the real seam (launcher surface plus backend-neutral
 `Stream`/`Event`/`Signal`); `gpu.rs`/`pin.rs`/`asyncfetch.rs`/`stream.rs` moved from

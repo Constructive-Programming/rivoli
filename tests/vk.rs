@@ -3351,6 +3351,55 @@ fn fill_u32_writes_the_pattern_and_nothing_past_it() {
     v.check("fill_u32_writes_the_pattern_and_nothing_past_it");
 }
 
+/// `read_raw` resolves a bare device address back to its host mapping, INCLUDING at an
+/// offset into the buffer — which is the only case its caller ever uses.
+///
+/// The `trace` expert-checksum probe hashes weights straight out of the pool slab, and the
+/// engine addresses those as raw pointers inside descriptors: never a buffer base. So a
+/// lookup that returned the mapping base and ignored the offset would satisfy an
+/// offset-zero test and mis-hash every expert but the first. Hence the sub-range read, and
+/// hence the guards: one byte past the end, and an address in no live buffer at all.
+#[test]
+fn read_raw_resolves_a_device_address_at_an_offset() {
+    let v = Validation::new();
+    let bytes: Vec<u8> = (0..1024u32).map(|i| (i.wrapping_mul(31) & 0xff) as u8).collect();
+    let b = dev(&bytes);
+    let mut out = Vec::new();
+
+    // SAFETY: `b` is live and holds 1024 bytes; every range below is inside it, and no
+    // kernel is writing (nothing was launched).
+    unsafe {
+        rivoli::vk::read_raw(b.ptr(), bytes.len(), &mut out).expect("whole buffer");
+        assert_bytes(&bytes, &out, "read_raw whole");
+
+        let off = 517usize; // not word-aligned, so a word-granular lookup would show
+        let len = 300usize;
+        rivoli::vk::read_raw(b.ptr().add(off), len, &mut out).expect("sub-range");
+        assert_bytes(&bytes[off..off + len], &out, "read_raw at offset");
+    }
+
+    // SAFETY: each call is rejected on its arguments; nothing is dereferenced.
+    unsafe {
+        assert!(
+            rivoli::vk::read_raw(b.ptr(), 1025, &mut out).is_err(),
+            "one byte past the end must be rejected"
+        );
+        assert!(
+            rivoli::vk::read_raw(b.ptr().add(1024), 1, &mut out).is_err(),
+            "an address at the end must be rejected"
+        );
+        assert!(
+            rivoli::vk::read_raw(b.ptr(), 0, &mut out).is_err(),
+            "a zero-length read must be rejected"
+        );
+        assert!(
+            rivoli::vk::read_raw(std::ptr::null(), 4, &mut out).is_err(),
+            "an address in no live Buf must be rejected"
+        );
+    }
+    v.check("read_raw_resolves_a_device_address_at_an_offset");
+}
+
 /// `flag_nonfinite` records `tag` iff some element is non-finite, and FIRST WRITER WINS.
 ///
 /// The oracle is `kernels/fwd.hip::flag_nonfinite`: `atomicCAS(flag, 0, tag)` on any `x[i]`

@@ -1047,6 +1047,14 @@ impl<'a> Pin<'a> {
         // the diagnostic would then cause the corruption it exists to detect. One join
         // per layer-with-misses orders them.
         //
+        // Under Vulkan the hazard is the same one wearing different clothes, and the fix
+        // covers it for a DIFFERENT reason: the fill is a `vkCmdFillBuffer` recorded into
+        // the open command buffer, while the reaper's staging copy is a synchronous host
+        // memcpy on another thread (see stream.rs's `stage`). Nothing orders a recorded-
+        // but-unsubmitted fill against a host write, so the join is what submits and
+        // retires it before any read is queued. It happens to be load-bearing on both
+        // backends; do not delete it as HIP-specific.
+        //
         // CAVEAT, and it is the same trap `--checksum-x` fell into: this sync may itself
         // perturb the race being hunted. It sits at a different point (after allocation,
         // before reads are submitted) than the per-layer D2H that masked the fault, so it

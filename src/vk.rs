@@ -1035,10 +1035,22 @@ struct Alloc {
     base: u64,
     len: u64,
     buf: vk::Buffer,
+    /// The owning `Buf`'s HOST mapping base, so a device address can be turned back into a
+    /// readable host address. Only [`read_raw`] uses it — see the note there.
+    host: *mut u8,
 }
 
-/// The `VkBuffer` owning `[addr, addr+len)`, and the offset into it.
-fn resolve(addr: u64, len: usize) -> Result<(vk::Buffer, u64)> {
+// SAFETY: `host` is a permanent `vkMapMemory` result for an allocation that outlives every
+// registry entry (deregistration happens in `Buf::drop` BEFORE the unmap). The registry only
+// ever hands it out under its own mutex, and `read_raw` — its sole reader — copies out of it
+// after a `device_sync`. The pointer is not dereferenced by the registry itself.
+unsafe impl Send for Alloc {}
+
+/// Look up `[addr, addr+len)` in the registry and project one field out of the owning
+/// allocation. Shared by [`resolve`] and [`read_raw`] so the bounds and overflow checks
+/// exist once — they were duplicated, and the second copy is exactly where an off-by-one
+/// would live unnoticed.
+fn lookup<T>(addr: u64, len: usize, f: impl Fn(&Alloc, u64) -> T) -> Result<T> {
     let allocs = ALLOCS.lock().map_err(|_| anyhow!("vk alloc registry poisoned"))?;
     let end = addr
         .checked_add(len as u64)
@@ -1046,10 +1058,51 @@ fn resolve(addr: u64, len: usize) -> Result<(vk::Buffer, u64)> {
     allocs
         .iter()
         .find(|a| addr >= a.base && end <= a.base + a.len)
-        .map(|a| (a.buf, addr - a.base))
+        .map(|a| f(a, addr - a.base))
         .ok_or_else(|| {
             anyhow!("device address {addr:#x}..{end:#x} is not inside any live Buf")
         })
+}
+
+/// The `VkBuffer` owning `[addr, addr+len)`, and the offset into it.
+fn resolve(addr: u64, len: usize) -> Result<(vk::Buffer, u64)> {
+    lookup(addr, len, |a, off| (a.buf, off))
+}
+
+/// DIAGNOSTIC: read `len` bytes back from an arbitrary DEVICE ADDRESS into `out`.
+///
+/// The Vulkan twin of `hip.rs`'s `DeviceBuf::copy_out_raw`, and the second caller of the
+/// address registry `Buf`'s own comment warned not to grow. It earns the exception on the
+/// same terms `memcpy_dtod` does and one more:
+///
+/// - It is `trace`-only. Its sole caller is the expert-checksum / NaN-localizer probe, so it
+///   is never on the decode path and a linear scan of a handful of entries costs nothing.
+/// - There is no alternative. A bare device address carries no object identity, which is the
+///   whole reason `device.rs` deferred this — but the alternative to building it is that
+///   `--features vulkan,trace` does not COMPILE, and a feature combination that cannot be
+///   built is worse than a lookup nobody times.
+///
+/// Reads the host mapping directly, so unlike `hipMemcpy` it does NOT synchronise.
+///
+/// # Safety
+/// `src` must be a device address inside a live [`Buf`], readable for `len` bytes, and no
+/// kernel may be concurrently writing them — call after a [`device_sync`].
+pub unsafe fn read_raw(src: *const u8, len: usize, out: &mut Vec<u8>) -> Result<()> {
+    ensure!(len > 0, "read_raw: zero-length read");
+    let host = lookup(src as u64, len, |a, off| {
+        // SAFETY: `off + len <= a.len` was checked by `lookup`, and the mapping covers the
+        // whole allocation.
+        unsafe { a.host.add(off as usize) }
+    })?;
+    out.clear();
+    out.reserve(len);
+    // SAFETY: `host` is readable for `len` (bounds-checked above); `out` owns `len` reserved
+    // bytes; the two are distinct allocations.
+    unsafe {
+        std::ptr::copy_nonoverlapping(host, out.as_mut_ptr(), len);
+        out.set_len(len);
+    }
+    Ok(())
 }
 
 impl Buf {
@@ -1182,6 +1235,7 @@ impl Buf {
                 base: addr,
                 len: len as u64,
                 buf,
+                host,
             }),
             Err(_) => {
                 // SAFETY: `mem` is bound and mapped, owned solely by this half-built
