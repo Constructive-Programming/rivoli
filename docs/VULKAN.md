@@ -1177,6 +1177,48 @@ scalar floats through a `buffer_reference`, so it has no such constraint — onl
 alignment every f32 access already implies. A reader comparing the two launchers will find
 an alignment guard on one side and none on the other; that asymmetry is correct.
 
+## INCREMENT 1 SHIPPED THE FAILURE THIS SECTION WARNS ABOUT
+
+Recorded because the warning was read, quoted, and then overridden — which makes it a
+process failure, not an oversight.
+
+Increment 1 (merged) wired the backend waist and got the engine decoding under
+`--features vulkan` on a SINGLE queue, deferring the queues to a later increment. The
+section below is titled "Phase 4 needs two queues, not one". It was followed to the
+letter for the kernels and abandoned for the integration.
+
+**Measured, matched (int3-vq / dense / lru, `--max-mem 115`, 512 tok, same prompt):**
+
+| | ROCm | Vulkan increment 1 |
+|---|---:|---:|
+| tok/s | 2.52 | 1.44 |
+| moe/tok | 276 ms | **522 ms** |
+| route/tok | 104.6 ms | 128.2 ms |
+| expert hit | 75.6% | 76.5% |
+
+`moe` +89% against `route` +23% — the regression sits precisely in the phase whose design
+IS the overlap. ~246 ms/token of it.
+
+**Three violations, not one.** The queues were the visible one:
+
+1. one queue, so fetch cannot overlap compute;
+2. `stream.rs`'s `stage::copy_to_slot` under `vulkan` was a synchronous
+   `std::ptr::copy_nonoverlapping` — the host CPU copying 2.16 GB/token instead of a DMA
+   engine, blocking the reaper thread;
+3. `Event::elapsed_ms` returned 0.0, so `compute_gpu_ms` was 0 and `fetch_hidden_pct`
+   reported **0% as an arithmetic artifact of the stub**, not a measurement.
+
+(3) is why this should not have shipped. **An invariant that cannot be measured is not
+upheld, it is assumed** — and the reported "0% hidden" would have been quoted as a
+finding by anyone reading the run. Timestamp query pools were filed under Phase 5; they
+belong to Phase 4, because they are the instrument that certifies the thing Phase 4 exists
+to preserve.
+
+The lesson generalises past Vulkan: this document already says a green correctness check
+"means less than it appears to" here. The fix is that **the throughput criterion is part of
+the gate, not a follow-up** — see the acceptance criteria below, which increment 1 did not
+have to satisfy and should have.
+
 ## Phase 4 needs two queues, not one — and the acceptance gate cannot see it
 
 Written before integration starts, because the failure it describes is invisible to every
