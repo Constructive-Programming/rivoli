@@ -1,15 +1,15 @@
 # rivoli — `top-m`: cache-conditional MoE routing (arXiv:2412.00099)
 
-Status: **SHIPPED for the single-format modes, opt-in, quality UNCERTIFIED.**
-`--cache-policy top-m` with `--route-j` / `--route-m` (defaults J=4, M=9) is live in
-`src/hybrid.rs` and `src/math.rs`; `config.rs::validate` rejects `top-m` + `--mode hybrid`
-and `top-m` + `--trace`. The `swap%` counter ships. What is NOT done is certification:
-the ~1% PPL bar needs ~12,840 teacher-forced tokens (~3.4 h sole-tenant) and may still
-miss. Do not promote it to default before then. The hybrid tier rule below remains
-unbuilt — see the PARKED block, whose precondition has since been MET.
+Status: **REMOVED FROM THE ENGINE 2026-07-30.** `--cache-policy top-m`, `--route-j`,
+`--route-m`, `RouteAdvice`, the `route_into` substitution and `swap%` are all deleted. See
+the retirement record at the END of this file for why, and for the LOOKA hint layer that
+replaced it. **Everything between here and there describes a mechanism the engine no longer
+has** — kept because it records the design, the measurements that rejected it, and the
+reasoning that a future proposal would otherwise repeat.
 
-Adds a fourth `--cache-policy` alongside `lru | 2q | arc`, and is the first cache
-mechanism that **changes which experts run**.
+It was a fourth `--cache-policy` alongside `lru | 2q | arc`, and the only cache mechanism
+that ever **changed which experts run**. That property is now forbidden and tested against
+(**INV-1**, ARCHITECTURE.md §8b).
 
 Source: Skliar, van Rozendaal, Lepert, Boinovski, van Baalen, Nagel, Whatmough,
 Ehteshami Bejnordi — *Mixture of Cache-Conditional Experts for Efficient Mobile Device
