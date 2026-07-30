@@ -642,7 +642,7 @@ impl<'a> GpuEngine<'a> {
             gl_host: Vec::with_capacity(cfg.n_experts * 4),
             argmax_host: Vec::with_capacity(12),
             prof: Profile::default(),
-            compute_stream: Stream::new()?,
+            compute_stream: Stream::compute()?,
             moe_ev_start: Event::new()?,
             moe_ev_end: Event::new()?,
             #[cfg(feature = "trace")]

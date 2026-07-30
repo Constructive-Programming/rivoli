@@ -1,5 +1,6 @@
-//! rivoli — GLM-5.2 MoE decode engine (routed experts int3-vq/int4/hybrid, default
-//! hybrid; see MODES.md). The artifact IS the model: point
+//! rivoli — GLM-5.2 MoE decode engine (routed experts int3-vq/int4/hybrid; the default is
+//! hybrid on `rocm` and int3-vq on `vulkan`, whose int4 kernels are not ported — see
+//! MODES.md and `config::Mode`). The artifact IS the model: point
 //! `rivoli` at a converted artifact directory (manifest.json + codebooks.f32 +
 //! resident.safetensors + `L{ll}.vq3` + tokenizer) and it decodes on device.
 //!
@@ -36,10 +37,12 @@ struct Args {
     ppl: Option<String>,
     ppl_out: Option<String>,
     max_mem: Option<u64>,
-    /// Routed-expert format (`--mode int3-vq|int4|hybrid`, default hybrid).
+    /// Routed-expert format (`--mode int3-vq|int4|hybrid`; default hybrid on `rocm`,
+    /// int3-vq on `vulkan` — see `config::Mode`).
     mode: rivoli::config::Mode,
-    /// Attention mode (`--attn auto|dense|streaming|dsa|misa`). `auto` picks `dsa`
-    /// when the artifact carries indexer weights, else `dense`.
+    /// Attention mode (`--attn auto|dense|streaming|dsa|misa`). `auto` picks `dsa` when the
+    /// artifact carries indexer weights and the backend has the indexer kernels, else
+    /// `dense` — see `resolve_attn`.
     attn: String,
     sinks: usize,
     window: usize,
@@ -197,7 +200,8 @@ fn parse_args() -> Result<Args> {
     Ok(a)
 }
 
-/// Does the artifact carry resident DSA indexer weights? (`auto` picks `dsa` iff so.)
+/// Does the artifact carry resident DSA indexer weights? (`auto` picks `dsa` iff so AND the
+/// backend has the indexer kernels — see [`resolve_attn`].)
 /// Checks layer 0's `wk` — `indexer_layout` guarantees layer 0 is a full layer, so
 /// its indexer is present whenever any is. `open_dir` merges every *.safetensors in
 /// the artifact, so this sees `indexer.safetensors` (added post-hoc) too.
@@ -208,13 +212,28 @@ fn artifact_has_indexer(model_dir: &str) -> bool {
 }
 
 /// Resolve `--attn` (with `auto` → dsa/dense by artifact contents) into an `AttnMode`.
+///
+/// `auto` ALSO asks what the backend can run. The Vulkan build has none of the five DSA
+/// indexer kernels, so `auto` resolving to `dsa` on an artifact that carries indexer weights
+/// made a bare `rivoli <model>` fail on its own default — the second of the two ways it did.
+/// `cfg!` rather than `#[cfg]` so both arms keep compiling on both backends and
+/// `artifact_has_indexer` is still called (and still reported) either way: the reason for
+/// the choice is worth logging, since "auto picked dense" is otherwise indistinguishable
+/// from "this artifact has no indexer".
 fn resolve_attn(a: &Args) -> Result<rivoli::attn::AttnMode> {
     use rivoli::attn::AttnMode;
     let mode = if a.attn == "auto" {
-        if artifact_has_indexer(&a.model) {
-            "dsa"
-        } else {
-            "dense"
+        match (artifact_has_indexer(&a.model), cfg!(feature = "vulkan")) {
+            (true, false) => "dsa",
+            (true, true) => {
+                eprintln!(
+                    "--attn auto: the artifact carries DSA indexer weights, but this is a \
+                     Vulkan build and the lightning-indexer kernels are not ported \
+                     (docs/VULKAN.md) — resolving to `dense`. Use --features rocm for dsa."
+                );
+                "dense"
+            }
+            (false, _) => "dense",
         }
     } else {
         a.attn.as_str()

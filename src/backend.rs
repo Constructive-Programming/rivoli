@@ -22,14 +22,25 @@
 //!
 //! # What is NOT equal across the seam
 //!
-//! Compiling is not equivalence, and three differences are load-bearing for anyone reading
-//! a Vulkan run's output:
+//! Compiling is not equivalence. Two of the three differences this list used to carry are
+//! GONE as of Phase 4 increment 2 and are recorded here because their absence is the point:
+//! the Vulkan side runs THREE QUEUES with the fetch↔compute overlap measured at 97%
+//! (ROCm 96%), and `Event` returns real GPU milliseconds from a timestamp query pool rather
+//! than a `0.0` that arithmetic downstream turned into "0% hidden".
 //!
-//! 1. **One queue, so fetch does not overlap compute** — see `vkstream.rs`'s header.
-//! 2. **Every GPU timing span reads 0.0 ms** — see [`Event`].
-//! 3. **13 of 29 kernels refuse rather than run.** `Config::validate` rejects the
+//! What remains unequal, and is load-bearing for anyone reading a Vulkan run's output:
+//!
+//! 1. **13 of 29 kernels refuse rather than run.** `Config::validate_backend` rejects the
 //!    configurations that would reach them (`--attn dsa|misa`, `--mode int4|hybrid`) at
-//!    startup; the launchers themselves return `Err` as a backstop.
+//!    startup; the launchers themselves return `Err` as a backstop. The `--mode` and
+//!    `--attn auto` DEFAULTS therefore differ by backend — see `config::Mode`.
+//! 2. **The MoE kernels are ~2.1x slower than the HIP originals**, which is now the whole of
+//!    the throughput gap (measured per-phase; docs/VULKAN.md, "Increment 2: measured"). A
+//!    Vulkan run's tok/s is not a statement about the engine's design, and after
+//!    increment 2 it is not a statement about its scheduling either.
+//! 3. **A `Stream` here NAMES a queue rather than owning one.** `Stream::compute()` and
+//!    `Stream::fetch()` exist on both backends so the role is chosen by the consumer that
+//!    knows it; HIP ignores the distinction, Vulkan cannot.
 
 // One backend per build. Both at once is not a configuration that could work — the two
 // `pub use` globs below would collide on every shared name, and the resulting hundred

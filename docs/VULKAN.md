@@ -1,23 +1,25 @@
 # rivoli — Vulkan backend (`vulkan` feature)
 
-Status: **RUNNABLE. Phase 4 increment 1 landed (2026-07-30): `--features vulkan` builds and
-decodes `--mode int3-vq --attn dense`.** 16 kernels + `flag_nonfinite` + `fill_u32`, 40/40
-green under the validation layer; the deliberate straddle break verified red-then-green;
-GPU-AV confirmed live by re-running the probe coverage matrix rather than by a clean pass.
+Status: **RUNNABLE, AND IT IMPLEMENTS THE DESIGN. Phase 4 complete (2026-07-30):
+`--features vulkan` builds and decodes `--mode int3-vq --attn dense` over THREE QUEUES with
+the fetch↔compute overlap intact.** 16 kernels + `flag_nonfinite` + `fill_u32`, 46/46 green
+under the validation layer; the deliberate straddle break verified red-then-green; GPU-AV
+confirmed live by re-running the probe coverage matrix rather than by a clean pass.
 
-On matched 2-token runs the two backends produced **identical token IDs**, and Vulkan was
-**1.74x slower** — see "Increment 1: measured" for the full table and for why neither figure
-should be quoted further than it goes.
+**Fetch hidden: 97%**, measured with real timestamp query pools, against ROCm's 96% on the
+same matched run — and against 0% in increment 1, which was an arithmetic artifact of a
+stubbed `elapsed_ms` rather than a measurement.
 
-**What does not exist:** the THREE-QUEUE design. Increment 1 integrated onto the single
-existing queue, which costs the fetch↔compute overlap entirely — **measured at 0% fetch
-hidden against ROCm's 97%.** GPU timing spans read `0.0 ms` because timestamp query pools
-are phase 5. Both are documented at their types (`vkstream.rs`) rather than left to be
-inferred from a suspiciously round number. Read "Phase 4 needs two queues, not one" and then
-"Increment 1: measured" before writing increment 2.
+Vulkan is still **1.87x slower** end to end (1.46 vs 2.73 tok/s), and the per-phase GPU spans
+now say why: **279 ms of the 320 ms/token gap is the MoE kernels themselves**, 2.1x slower
+than the HIP originals. The overlap invariant is upheld; what remains is kernel throughput,
+which is a different problem with a different fix. See "Increment 2: measured" — including
+why 97% hidden is not a permanent property, since the fetch only just fits behind the current
+(slow) compute.
 
-MODES.md numbers still come after the three-queue work, and gate A's **K is still
-unmeasured**: agreement at K = 2 is a floor, not a result.
+On matched runs the two backends produced **identical token IDs** at K = 2. Gate A's **K is
+still unmeasured**: agreement at K = 2 is a floor, not a result. MODES.md numbers still come
+after a kernel-throughput pass, not after this one.
 
 The acceptance gate is **A+C+D** (see below); byte-identical token IDs are unattainable by
 construction and that is measured, not suspected. Sections below describing work as
@@ -1077,9 +1079,16 @@ Each phase ends with something runnable; no phase leaves the tree broken.
 
    **INCREMENT 1 DELIVERED, and it decodes.** See "Increment 1: measured" below for what
    landed, what the numbers were, and the two findings the run produced.
-5. **Bench + profiling** — timestamp query pools wired into `telemetry.rs`, then compare
-   against HIP on the same artifact. Expect the first port to be slower; record where,
-   do not tune during the port.
+
+   **INCREMENT 2 DELIVERED, and it implements the design.** Three queues, the ring, the async
+   staging copy, and the timestamp query pools this table filed under phase 5. See
+   "Increment 2: measured". **Phase 4 is complete.**
+5. **Bench + profiling** — ~~timestamp query pools~~ **DONE, and pulled into phase 4**: an
+   overlap invariant that cannot be measured is assumed rather than upheld, so the instrument
+   had to ship with the thing it certifies. `Stamp` in `vk.rs` feeds `backend::Event`, which
+   `telemetry.rs` already consumed. What remains of this item is the comparison work: the
+   port IS slower, the per-phase spans now say WHERE (MoE kernels, 2.1x), and the rule still
+   holds — record, do not tune during the port.
 
 **Sequence this last.** Of the three open proposals it has the least measured upside:
 PILOT and `top-m` attack a bottleneck we have quantified, while this buys portability
@@ -1179,6 +1188,13 @@ an alignment guard on one side and none on the other; that asymmetry is correct.
 
 ## INCREMENT 1 SHIPPED THE FAILURE THIS SECTION WARNS ABOUT
 
+> **RESOLVED by increment 2** — three queues, the command-buffer ring, an async staging
+> copy, and real timestamp query pools. Measured: **97% of fetch hidden**, up from 0%.
+> See "Increment 2: measured" below. This section is retained as the record of the process
+> failure, and its list of three violations is the checklist increment 2 was built against.
+> It also undercounted by one, which is the most useful thing about it now: see item 4
+> there.
+
 Recorded because the warning was read, quoted, and then overridden — which makes it a
 process failure, not an oversight.
 
@@ -1253,9 +1269,16 @@ backends was "a cargo flag and nothing else."
 
 Increment 1's answer to (2): the stream types are re-exported from `backend.rs` under
 BACKEND-NEUTRAL names (`Stream`, `Event`), and `src/vkstream.rs` supplies the Vulkan side
-— a `Stream` that carries nothing because the launchers already ignore their `_stream`
-argument, and an `Event` whose `elapsed_ms` is always `0.0`. Neither pretends to be what
-HIP has; both are documented at the type as the absence they are.
+— a `Stream` that carried nothing because the launchers ignored their `_stream` argument, and
+an `Event` whose `elapsed_ms` was always `0.0`. Neither pretended to be what HIP has; both
+were documented at the type as the absence they were.
+
+**Increment 2 made both of them real.** `Stream` is now the NAME of one of three queues
+(`Stream::compute()` / `Stream::fetch()`, so the role is chosen by the consumer that knows
+it), the MoE launchers parse and honour it, and `Event` is a `VK_QUERY_TYPE_TIMESTAMP` query
+pool. The one part of the shape that survived unchanged is the right one: `*mut c_void`
+remains the token, because the signature is shared with HIP — but it is now a TAG that
+`Q::parse` refuses if unrecognised, never a pointer anything dereferences.
 
 ### The performance property lives in the CONCURRENCY, and vk.rs has none
 
@@ -1270,6 +1293,11 @@ comes from **two independent streams**:
 
 `vk.rs` today is **one queue behind one `Mutex<Cmd>`**, documented as mirroring "HIP's
 default stream". Integrating onto that serialises fetch against compute.
+
+> **HISTORICAL from here to the end of this section.** `vk.rs` now has three
+> `Mutex<Stream>`, one queue each, and the overlap is measured at 97% — see "Increment 2:
+> measured". The analysis below is kept because it is the reasoning the fix was built from,
+> and because its final subsection is the record of the increment that ignored it.
 
 **And the acceptance gate would not notice.** Token IDs depend on arithmetic, not on
 overlap; a fully serialised backend computes exactly the same numbers. So the gate this
@@ -1306,6 +1334,27 @@ together rather than bolting the ring on later.
 
 Written before any integration code, and structured so the command-buffer ring falls out
 rather than being bolted on.
+
+> **BUILT, in `vk.rs`, and it held up.** Three deviations, each measured or reasoned rather
+> than preferred, plus one thing this text got wrong:
+>
+> - **`RING = 16`, not 4.** 4 stalls the DECODE thread — the one driving the expert stream —
+>   because the MoE stream flushes once per expert and a layer submits ~9 buffers. The doc is
+>   right that an undersized ring is a stall not a bug; it is wrong that the stall is
+>   harmless, because this particular thread stalling is the overlap.
+> - **`Stream::next` is a plain `u64`, not an `AtomicU64`.** It is only ever touched under
+>   the stream's own mutex, and an atomic would imply — falsely — that allocating a value
+>   outside the lock is safe. It is not; that is the monotonicity argument for per-stream
+>   timelines in the first place.
+> - **A device with fewer than three queues ALIASES** several `Q`s onto one `Stream`, rather
+>   than handing one `VkQueue` to two mutexes. The doc assumes family 1's four queues, which
+>   this device has; the aliasing is what keeps the portability claim honest, and it warns.
+> - **The signal is registered AFTER the submit, not before.** The waiter re-reads the
+>   counter every pass and waits on values that may already be reached, so there is no
+>   missed-wakeup window — which deletes the unregister-on-failure path the single-queue
+>   version needed.
+> - **What this text missed: RECORDING IS NOT SUBMITTING.** See item 4 of "Increment 2:
+>   measured". Three queues with lazy recording still serialise fetch against compute.
 
 **THREE streams, not two.** The earlier text said two and that undercounts. HIP runs:
 
@@ -1415,7 +1464,8 @@ deferred kernels return `Err`, and `Config::validate_backend` refuses
 `--mode int4|hybrid`, `--attn dsa|misa` and `--moe-gain != 1` at startup. The
 host-vs-device pointer split landed in `ArenaPool` as this document said it must.
 
-**Two findings from the run, neither fixed:**
+**Two findings from the run.** (1) is still open and now shows a THIRD message; (2) is fixed
+by increment 2 — the staging copy is a `vkCmdCopyBuffer` on the fetch queue.
 
 1. **`vkAllocateMemory` above ~4 GiB exceeds `maxMemoryAllocationSize` on this driver
    (4294967292 B), and the validation layer says so twice per run** — once for the
@@ -1444,6 +1494,136 @@ synchronisation validation on this stack **cannot see any of it** (it covers onl
 transfer↔transfer). That makes review the primary defence again, exactly as it was for the
 original barrier. And the fetch queue writing a slot the compute queue is reading is the
 `inflight` guard's job, not the queue layer's — the two must not both think they own it.
+
+### Increment 2: measured. The overlap is back, and the residue is kernel speed.
+
+Three queues, the ring, the async staging copy and the timestamp query pools, all landed
+together because they are one design. **The invariant is now MEASURED rather than asserted**
+— which was the whole reason the query pools moved forward out of phase 5.
+
+**Matched runs**, same artifact (`/var/db/rivoli/glm52-vq3-full`), same flags
+(`--mode int3-vq --attn dense --cache-policy lru --max-mem 115`), same prompt, greedy,
+**`-bench 64`** — sixty-four tokens, not the 512 of the increment-1 table, so the two columns
+here are comparable to each other and NOT to that table's absolute numbers (the hit rate is
+still climbing at 64):
+
+| | ROCm | Vulkan inc. 1 (512 tok) | **Vulkan inc. 2** |
+|---|---:|---:|---:|
+| tok/s | 2.73 | 1.44 | **1.46** |
+| wall / tok | 366.1 ms | — | 685.9 ms |
+| **fetch hidden** | **96%** (196 ms fetched, 8 ms exposed) | **0%** | **97%** (446 ms fetched, 15 ms exposed) |
+| moe / tok | 255 ms (**gpu 246 ms**) | 522 ms (gpu 0 = absent) | 540 ms (**gpu 525 ms**) |
+| route / tok | 97.8 ms | 128.2 ms | 113.3 ms |
+| expert hit | 74.0% (155.8 miss/tok) | 76.5% | 74.6% (152.4 miss/tok) |
+| ms / miss | 1.26 | — | 2.92 |
+| pin build | — | — | 99.7 s |
+
+The hit rates and miss counts match to under a point, which is what makes the rest of the
+table a comparison rather than two runs.
+
+**Four things the numbers say, and the distinctions matter as much as they did last time.**
+
+1. **`fetch_hidden_pct` is a measurement now.** It reads 96%, against 0% in increment 1 and
+   ~95-97% on ROCm. The 0% was an arithmetic artifact of `elapsed_ms` returning zero; this
+   is `vkCmdWriteTimestamp` into a `VkQueryPool`, scaled by `timestampPeriod` and masked to
+   `timestampValidBits`. Verified independently of the decode by
+   `timestamps_measure_gpu_time_and_refuse_when_absent`: 0.661 ms of GPU for eight
+   2048x2048 f32 GEMVs, i.e. 134 MB of weights at ~200 GB/s, inside a 0.948 ms wall.
+2. **The overlap invariant is upheld.** `moe/tok` is now almost entirely GPU time
+   (`gpu` ≈ `moe`), and the exposed fetch is a handful of ms against a fetch wall of
+   several hundred. That is the architecture working: the reaper streams while the MoE
+   queue computes.
+3. **THE REMAINING GAP AGAINST ROCm IS NOT OVERLAP, IT IS KERNEL THROUGHPUT — and the GPU
+   spans now prove it rather than suggest it.** The wall difference is 685.9 − 366.1 =
+   319.8 ms/tok. The MoE GPU span alone accounts for 525 − 246 = **279 ms** of it, and
+   `route` for another 15.5 ms; the exposed fetch contributes 7 ms. So ~87% of the gap is
+   the MoE kernels being 2.1x slower than the HIP originals they were transliterated from,
+   and essentially none of it is scheduling.
+
+   Increment 1's `moe` +89% therefore had two causes stacked and only one was the queues,
+   which is why "fix the queues and moe/tok halves" was never going to happen. This is the
+   honest reading and it should not be dressed up: the port now implements the design, and
+   the int3-vq shaders are slow. That is a kernel-optimisation question (occupancy, the
+   12-bit gather's word-straddle path, `requiredSubgroupSize` interaction), it is now
+   MEASURABLE per-phase, and it is not phase 4's scope.
+
+   **A consequence for whoever does that work: the fetch is only just hidden.** 446 ms of
+   fetch fits behind 540 ms of MoE with 15 ms exposed. Halve the MoE kernel time and the
+   fetch stops fitting — it becomes the limiter, at 2.92 ms/miss against ROCm's 1.26 ms for
+   the same bytes. The likely cause is the bounce arena: `Buf::staging` memory is
+   host-visible but NOT page-locked, so every O_DIRECT read pays `get_user_pages` on ~3750
+   pages that `hipHostMalloc`'s pre-pinned arena does not. It costs nothing today because it
+   is hidden, and it will cost everything the moment the kernels get faster. Do not treat
+   96% hidden as a permanent property of the backend.
+4. **A fourth violation, which the checklist above did not have.** Fixing the queues is not
+   enough on its own, because a Vulkan "launch" is a RECORD, not a submit. With one
+   always-open command buffer, every MoE dispatch sat unsubmitted until the end-of-phase
+   flush — so the GPU idled through the whole fetch and then computed. Fetch and compute
+   stay serialised, in the other order, and the token-ID gate still passes. The MoE and
+   fetch streams are therefore EAGER (one submit per launch, which is what HIP's launches
+   already are) and the main stream stays lazy. Anyone porting this design to another
+   backend should assume the same trap exists there: *ordering* the work correctly and
+   *starting* it promptly are two properties, and only one of them is what a queue is for.
+
+**The barrier review, and what carries each hazard.** Three mechanisms, none implying
+another:
+
+| hazard | execution order | availability | visibility |
+|---|---|---|---|
+| fetch copy → MoE dispatch reads the slot | host awaits the copy's `Signal` | that submit's fence + timeline signal | acquire barrier at the head of the MoE buffer |
+| MoE reduce → main-queue `vadd` reads `moe_out` | host awaits `stream_signal(compute)` | same | acquire barrier at the head of the main buffer |
+| main-queue writes `x` → MoE dispatch reads it | `copy_out_into`'s `device_sync` (the gate-logits D2H joins every queue before routing) | fence | acquire barrier |
+| two batches on ONE queue (eager flush split them) | the barrier's first scope spans SUBMISSION order, across submits | — | same barrier |
+| `fill_u32` poison → fetch copy writes the slot | `pin.rs`'s sync after the fill | fence | acquire barrier |
+| slot RECYCLED while a dispatch reads it | `pin.rs`'s per-batch PIN SET — **not the queue layer** | — | — |
+
+The last row is the one to keep straight: the queue layer owns the WRITE side of a slot and
+the residency layer owns its LIFETIME. Two mechanisms both believing they own lifetime is
+how a subtle double-free of bytes gets built.
+
+> **CORRECTION.** The design text above (and "Two things this design must not quietly
+> change") calls that mechanism "the `inflight` guard". **There is no `inflight` guard** —
+> `grep -rn inflight src/` finds nothing but the comment that cites it. The real mechanism is
+> the policy's per-batch pin set: `ArenaPool::begin_batch` clears it, phase 1a `protect`s
+> every hit, phase 1b's `admit` pins every miss, and the end-of-layer `device_sync` closes
+> the batch. So the property the doc asserted does hold, under a different name and by a
+> different route. Recorded rather than quietly renamed, because the invented name is what a
+> future porter reads first and it would send them looking for code that was never written.
+
+The fourth row is the one that is easy to get wrong and silent when wrong: separate
+submissions on one queue may otherwise execute concurrently, so the MoE reduce could read
+partials mid-write. The barrier at the head of every command buffer is what prevents it, and
+its being at the HEAD (not only between recorded ops) is load-bearing for exactly this.
+
+Synchronisation validation sees none of this — it covers transfer↔transfer only — so the
+tests carry what they can: `a_moe_dispatch_sees_what_the_fetch_queue_wrote` is the first row,
+`a_signal_covers_recorded_work_without_a_device_sync` is the ring's contract, and
+`the_command_buffer_ring_wraps_without_a_stale_slot` covers the wrap in both the
+slots-still-pending and the across-joins regimes.
+
+**`maxMemoryAllocationSize` is still exceeded, still deliberately, and now says so three
+times.** Recorded, not fixed:
+
+```text
+vkAllocateMemory(): pAllocateInfo->allocationSize (17353937024) is larger than
+maxMemoryAllocationSize (4294967292)
+vkAllocateMemory(): pAllocateInfo->allocationSize (106126368768) is larger than
+maxMemoryAllocationSize (4294967292)
+vkAllocateMemory(): pAllocateInfo->allocationSize is 106126368768 bytes from heap 1,
+but size of that heap is only 83393949696 bytes
+```
+
+The 16.16 GiB tier exceeds the advertised limit by 4x and the routed pool by 11x (98.8 GiB
+at `--max-mem 115`); the third message is a different VUID — the pool also exceeds the HEAP
+it is allocated from, because this APU reports a host-visible heap smaller than the memory
+the driver will actually grant. All three allocations SUCCEED and the model decodes, which
+is exactly why they are written down: the limits are advertised, the spec permits
+`VK_ERROR_OUT_OF_DEVICE_MEMORY` for each, and a driver update is entitled to start returning
+it. The fix is suballocating `DeviceTier`/`VmmBuf` across several `VkDeviceMemory`
+allocations, which changes the address arithmetic `pin.rs`'s arena is built on — a design
+change, not a patch. Consequence in the meantime: any test allocating over 4 GiB fails
+`Validation::check`, and a Vulkan decode logs these errors per run. They are NOT spurious
+and must not be filtered out.
 
 ## Risks
 

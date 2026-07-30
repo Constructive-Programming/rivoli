@@ -2,10 +2,14 @@
 //! Per-expert async loads: the io_uring→future adapter under the expert stream.
 //!
 //! Backend-independent: the fetch stream and the [`Signal`] both come from
-//! [`crate::backend`]. Under Vulkan the "dedicated fetch stream" is the SAME queue the
-//! forward pass uses, so the load↔compute overlap this module exists to create does not
-//! happen there yet — see `vkstream.rs`'s header and docs/VULKAN.md, "Phase 4 needs two
-//! queues, not one".
+//! [`crate::backend`], and it is a REAL dedicated stream on both — a `hipStream_t` under
+//! `rocm`, its own `VkQueue` with its own command-buffer ring and timeline under `vulkan`.
+//! Measured overlap: 96% of fetch hidden on ROCm, 97% on Vulkan. (Increment 1 of the Vulkan
+//! port ran every stream on one queue and hid 0%; docs/VULKAN.md, "Increment 2: measured".)
+//!
+//! `Stream::fetch()` rather than `Stream::new()` at the construction below, and that is not
+//! cosmetic: the Vulkan side maps the handle onto one of three queues and cannot infer which
+//! from context, so the ROLE is named where it is known.
 //!
 //! A reaper thread owns the demand ring and a dedicated fetch [`Stream`]. Per
 //! MoE layer the pipeline hands it a batch of cold reads; it queues+submits them
@@ -77,7 +81,7 @@ impl AsyncFetch {
     /// Take ownership of the demand `streamer` and spawn the reaper with its own
     /// fetch stream.
     pub fn new(streamer: Streamer) -> Result<Self> {
-        let fetch = Stream::new()?;
+        let fetch = Stream::fetch()?;
         let (tx, rx) = channel::<ReapJob>();
         let fetch_ns = Arc::new(AtomicU64::new(0));
         let io_wait_ns = Arc::new(AtomicU64::new(0));
