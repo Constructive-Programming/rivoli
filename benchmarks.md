@@ -1412,7 +1412,47 @@ degenerated to lrb 256/512 and int3-vq stayed at 20. Hybrid is the mode that con
 flattered most. The speed half of that comparison needs re-measuring; hybrid still holds
 the better perplexity (5.189 vs 5.275), which this matrix does not measure.
 
-### `int4` throws NaN/Inf intermittently
+### Non-finite logits: intermittent, NOT int4-specific, and not yet reproduced under instrumentation
+
+> **Superseding the section below, which called it int4-specific.** It is not. Five
+> occurrences across two modes: `int4/dense/arc`, `int4/streaming/2q`, and
+> **`int3-vq/streaming/2q` three times** — a config the matrix reported 16/16 clean. By
+> attention mode: streaming 3, dense 2. By policy: arc 2, 2q 3, **lru 0, top-m 0**.
+>
+> **It is a race.** Adding a per-layer host copy (`--checksum-x`) makes it vanish
+> entirely — 0 non-finite across 78 layers of every position on a config that fails
+> without it. A Heisenbug a sync closes is a timing fault.
+>
+> **Ruled out:** fetch/reaper failure (no poison, no reaper error in any failing log),
+> prefetch-admitting-before-load (no prefetch path exists), tier migration on hit (both
+> `HybridArc::get` and `HybridTwoQ::get` explicitly keep a hit in its tier).
+>
+> **The invariant holds in normal operation.** A `trace`-only check now verifies on every
+> cache HIT that the key's bytes actually landed since admission: ~3.7M checks, zero
+> violations. Poison-filling freshly admitted slots (`0x7FC0_7FC0`, quiet NaN in f32 and
+> both bf16 halves) loaded 15,656 slots correctly with coherent output. So this is not a
+> systematic read-before-write.
+>
+> **Not reproduced since instrumenting: 52 consecutive clean runs.** That is weaker
+> evidence than it looks, and the reason is a mistake worth recording: the first 28 runs
+> were `dense`-only when 3 of 5 failures were `streaming`; the 16 poison runs add ~78
+> `device_sync` calls per token and almost certainly mask the race, exactly as
+> `--checksum-x` does; and the 6 uninstrumented control runs at 2048 tokens on the one
+> twice-failing cell were **underpowered by design** — that cell fails ~1 in 7, so
+> P(0 in 6) = 0.40. **Fifteen runs of that cell (~3 h) is the minimum for a 90% chance of
+> one event.** Three separate underpowered experiments were run in this investigation
+> before anyone computed the power; compute it first.
+>
+> **Leading remaining suspect:** arena compaction (`src/arena.rs` slot relocation), which
+> `arc` and `2q` exercise far more than `lru` because their tier boundary floats. Matches
+> the 5/5 policy correlation. Not verified.
+>
+> **The part that is worse than the crash.** NaN needs a slot that was NEVER written. On a
+> warm pool the same race reads the evicted expert's bytes instead: finite, plausible,
+> silently wrong. A clean run is not evidence of absence, and some published numbers could
+> be quietly affected.
+
+### Original (int4-specific framing, superseded above): `int4` throws NaN/Inf intermittently
 
 **2 of 16 int4 cells** died with `logits are non-finite`: `int4/dense/arc` and
 `int4/streaming/2q`. `int3-vq` and `hybrid` were 28/28 clean, and neither failing cell
