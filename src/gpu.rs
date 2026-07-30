@@ -1527,21 +1527,44 @@ impl<'a> GpuEngine<'a> {
                 // dispatch is bit-identical to that many single ones). What no longer gates
                 // the batching is residency — only the format, and whether a wait had to be
                 // enqueued between them.
+                // ORDER MATTERS, and getting it wrong cost 20% before this comment existed.
+                // The compute stream is FIFO: enqueueing in `sel` order puts every resident
+                // expert BEHIND the first miss's wait, so nothing computes while that fetch
+                // is in flight — which is the overlap the whole engine is built on. Measured
+                // 3.05 -> 2.44 tok/s, `moe` 210 -> 289 ms.
+                //
+                // So residents go first, misses after. Reordering LAUNCHES is safe by
+                // construction: each expert writes its own partial row and `moe_reduce` sums
+                // `0..ndesc` in fixed order, so the result is bit-identical whatever order
+                // the partials are produced in.
+                //
+                // NOTE this branches on `ticket.is_resident()`, and that is NOT the `hit`
+                // mask coming back. The difference is what the branch controls. The mask
+                // decided whether to WAIT — a wrong bit meant a kernel ran on unwritten
+                // memory, silently. This decides only the ORDER of launches that each
+                // enqueue their wait unconditionally, so a wrong bit costs throughput and
+                // cannot cost correctness. Same data, and now it cannot gate the dependency.
                 let mut i = 0usize;
                 while i < ndesc {
-                    // Enqueue this expert's dependency. Free for a resident ticket.
-                    self.pin.wait_on(tickets[i], cs_raw)?;
+                    if !tickets[i].is_resident() {
+                        i += 1;
+                        continue;
+                    }
                     let f = fmt[i];
-                    // Extend the run while the format matches AND the next expert needs no
-                    // wait of its own — a wait between two experts must not be swallowed by
-                    // a batched dispatch that would launch the second one early.
-                    let mut j = i + 1;
-                    while j < ndesc && fmt[j] == f && tickets[j].is_resident() {
+                    let mut j = i;
+                    while j < ndesc && tickets[j].is_resident() && fmt[j] == f {
                         j += 1;
                     }
-                    // SAFETY: descs/codebooks resident; every expert in [i, j) is behind an
-                    // enqueued device-side wait for its own bytes; h/part device scratch;
-                    // cs_raw live.
+                    // Enqueued anyway rather than skipped: `wait_on` is the only way to
+                    // consume a ticket, and a resident one costs nothing (it short-circuits
+                    // on value 0). Keeping the call unconditional is what makes "every
+                    // launch is behind its dependency" true by reading the code, not by
+                    // trusting this loop's classification.
+                    for k in i..j {
+                        self.pin.wait_on(tickets[k], cs_raw)?;
+                    }
+                    // SAFETY: descs/codebooks resident; every expert in [i, j) has its
+                    // dependency enqueued above; h/part device scratch; cs_raw live.
                     unsafe {
                         if f {
                             launch_moe_expert_range_i4(
@@ -1556,6 +1579,29 @@ impl<'a> GpuEngine<'a> {
                         }
                     }
                     i = j;
+                }
+                // THEN the misses, each behind its own device-side wait. No host round trip:
+                // the whole layer is enqueued before any of it has to have landed, which is
+                // what INV-4 buys and what `hipStreamWaitEvent` could not.
+                for e in 0..ndesc {
+                    if tickets[e].is_resident() {
+                        continue;
+                    }
+                    self.pin.wait_on(tickets[e], cs_raw)?;
+                    // SAFETY: as above; this expert's bytes are gated by the wait just
+                    // enqueued on the same stream.
+                    unsafe {
+                        if fmt[e] {
+                            launch_moe_expert_range_i4(
+                                x_c, hidden, inter, e, 1, descs_ptr, w_ptr, h_c, part_c, cs_raw,
+                            )?;
+                        } else {
+                            launch_moe_expert_range(
+                                x_c, hidden, inter, e, 1, descs_ptr, cb0, cb1, cb2, w_ptr, h_c,
+                                part_c, cs_raw,
+                            )?;
+                        }
+                    }
                 }
                 // The load Signals are no longer awaited per expert — the GPU gates itself
                 // now. They remain the reaper's error/teardown channel (it resolves them on
