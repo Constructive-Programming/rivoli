@@ -445,6 +445,13 @@ pub struct RunInfo {
 /// fields. Built by the GPU engine from its always-on [`Profile`](crate::gpu) buckets.
 #[derive(Debug, Clone, Copy)]
 pub struct ProfileSummary {
+    /// Mean MoE bracket (µs) and layer count, indexed by that layer's MISS count.
+    ///
+    /// `compute_gpu` is a bracket, so the aggregate cannot say whether it is large because
+    /// the shaders are slow or because the compute stream idles waiting for bytes. This
+    /// can: read the SHAPE. A flat profile across miss counts means the gaps are not fetch
+    /// waits; a rising one means they are, and the slope is the per-miss cost.
+    pub moe_us_by_miss: [Option<(f64, u32)>; 16],
     pub tok_per_s: f64,
     pub hit_pct: f64,
     pub wall_ms: f64,
@@ -468,6 +475,27 @@ pub struct ProfileSummary {
     /// The stream's active launch cost (tokio poll).
     pub launch_ms: f64,
     /// Percent of `fetch_wall` buried behind compute: `1 − (moe_wall−compute_gpu)/fetch_wall`.
+    /// **SUBSTANTIALLY OVERSTATED — an upper bound, and not a tight one.** Reported at
+    /// 96% on a run where the true figure is at most 57%.
+    ///
+    /// It is `1 - (moe_wall - compute_gpu)/fetch_wall`, and `compute_gpu` is a BRACKET
+    /// (`moe_ev_start`..`moe_ev_end`) that CONTAINS the compute stream's idle time. So
+    /// every millisecond the stream spends stalled waiting for a missed expert is counted
+    /// as compute, and therefore as fetch successfully hidden.
+    ///
+    /// Measured by `moe_us_by_miss` on int3-vq/dense/lru @115 GiB: layers with 0 misses
+    /// run the MoE bracket in 1563 us, so 75 layers of pure kernel work is **117 ms/token**
+    /// — independently confirmed by `examples/moe_bench.rs`, whose isolated floor is
+    /// 113 ms. The measured bracket is 257 ms. The other **140 ms/token is stall**.
+    ///
+    /// The arithmetic does not close under the reported number and does under this one:
+    /// at 96% hidden the MoE phase would be ~125 ms (117 compute + 8 exposed) against a
+    /// measured `moe_wall` of 266 ms — a 141 ms hole. As 117 compute + 149 stall = 266 it
+    /// closes exactly. Since fetch can only hide behind compute, the ceiling is
+    /// `compute/fetch_wall` = 117/206 = **57%**.
+    ///
+    /// Prefer the `moe/layer by miss count` line, which measures the stall instead of
+    /// inferring its absence.
     pub fetch_hidden_pct: f64,
     pub miss_per_tok: f64,
     pub ms_per_miss: f64,
@@ -540,6 +568,29 @@ impl ProfileSummary {
             self.ms_per_miss,
             self.gb_per_tok,
         );
+        // The MoE bracket decomposed by miss count — printed only when there is more than
+        // one populated bucket, since a single bucket has no shape to read.
+        let pop: Vec<(usize, f64, u32)> = self
+            .moe_us_by_miss
+            .iter()
+            .enumerate()
+            .filter_map(|(m, v)| v.map(|(us, n)| (m, us, n)))
+            .collect();
+        if pop.len() > 1 {
+            let cells: Vec<String> = pop
+                .iter()
+                .map(|(m, us, n)| format!("{m}m:{us:.0}us(n={n})"))
+                .collect();
+            let lo = pop.first().map(|c| c.1).unwrap_or(0.0);
+            let hi = pop.last().map(|c| c.1).unwrap_or(0.0);
+            tracing::info!(
+                "  moe/layer by miss count: {} | span {:.0}->{:.0}us ({:+.0}%)",
+                cells.join(" "),
+                lo,
+                hi,
+                if lo > 0.0 { 100.0 * (hi - lo) / lo } else { 0.0 },
+            );
+        }
         tracing::info!(
             "  stream/tok: load-wait {:.0}ms (Σ over ~9 concurrent tasks) | launch {:.1}ms (poll)",
             self.load_wait_ms,

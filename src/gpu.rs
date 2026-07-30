@@ -94,6 +94,17 @@ struct Profile {
     idx_layers: u64,
     moe_wall_ns: u128,    // the block_on wall of the overlapped MoE phase (CPU wall)
     compute_gpu_ns: u128, // HIP-event span of the compute stream (partials + reduce)
+    /// Per-layer MoE bracket time, bucketed by how many of that layer's experts MISSED.
+    ///
+    /// `compute_gpu` is a bracket, not a sum: the compute stream idles inside it whenever
+    /// the next partial is still waiting on bytes. That makes the aggregate unable to say
+    /// WHY it is 2.2x the isolated-kernel floor. Bucketing by miss count answers it
+    /// directly — if the gaps are fetch waits, bracket time rises with misses and the
+    /// zero-miss bucket is pure kernel time. A regression over these buckets separates
+    /// "the shaders are slow" from "the stream is starved" with no extra sync: the events
+    /// are already read at the end-of-layer join, and this is two adds per layer.
+    moe_ns_by_miss: [u128; 16],
+    moe_n_by_miss: [u32; 16],
     wall_ns: u128,
     tokens: u64,
 
@@ -219,6 +230,16 @@ impl Profile {
             idx_layers_per_tok: self.idx_layers as f64 / tok,
             moe_wall_ms: per(self.moe_wall_ns),
             compute_gpu_ms: per(self.compute_gpu_ns),
+            // Mean MoE bracket per layer, by miss count. The shape is the finding: a flat
+            // profile means the gaps are not fetch waits, a rising one means they are.
+            moe_us_by_miss: std::array::from_fn(|i| {
+                let n = self.moe_n_by_miss[i];
+                if n == 0 {
+                    None
+                } else {
+                    Some((self.moe_ns_by_miss[i] as f64 / n as f64 / 1e3, n))
+                }
+            }),
             fetch_wall_ms: per(fetch_wall_ns as u128),
             load_wait_ms: per(idle_ns as u128),
             launch_ms: per(poll_ns as u128),
@@ -961,6 +982,9 @@ impl<'a> GpuEngine<'a> {
             // whose batch it is servicing.
             crate::telemetry::spans::mark(pos as u32, token, l as i32);
 
+            // This layer's miss count, hoisted so the end-of-layer bracket read can bucket
+            // by it. 0 on dense layers, which never enter the MoE branch.
+            let mut layer_misses = 0usize;
             // Open the launch-cost span. Everything from here to the gate D2H (MoE) or
             // the end of the dense MLP is host-side kernel issue — EXCEPT the indexer's
             // joins on the `--attn dsa` arms, so the close subtracts whatever
@@ -1213,6 +1237,7 @@ impl<'a> GpuEngine<'a> {
                     }
                     crate::telemetry::spans::record_layer(st);
                 }
+                layer_misses = (self.pin.misses - miss0) as usize;
                 self.prof.fetch_n += self.pin.misses - miss0;
                 // Routed weights: sigmoid score, sum-normalized over the routed picks,
                 // then scaled. The VQ shared expert (weight 1.0) folds into the batch.
@@ -1423,7 +1448,14 @@ impl<'a> GpuEngine<'a> {
             // (MoE layers only; dense layers never recorded them).
             if dense_mlp.is_none() {
                 let ms = Event::elapsed_ms(&self.moe_ev_start, &self.moe_ev_end)?;
-                self.prof.compute_gpu_ns += (ms as f64 * 1e6) as u128;
+                let ns = (ms as f64 * 1e6) as u128;
+                self.prof.compute_gpu_ns += ns;
+                // Bucket by this layer's miss count. Clamped rather than asserted: the
+                // shared expert is never a miss and top_k is 8, so 16 is generous, but a
+                // future top_k must not panic here.
+                let b = layer_misses.min(self.prof.moe_ns_by_miss.len() - 1);
+                self.prof.moe_ns_by_miss[b] += ns;
+                self.prof.moe_n_by_miss[b] += 1;
             }
             // Same sync, same reason, for the indexer span this layer recorded — read
             // here because this join is unconditional and the mid-layer one is not.

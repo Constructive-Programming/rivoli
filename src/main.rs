@@ -290,7 +290,12 @@ fn main() -> Result<()> {
         a.cache_policy,
         rivoli::cache::TwoQSplit::new(a.two_q_kin, a.two_q_kout)?,
         a_route,
-        a.max_mem,
+        // GiB -> BYTES. The flag is documented and value_named in GiB and every consumer
+        // (`Config::max_mem`, the pool cap, the log line's `/ GIB`) is in bytes. The clap
+        // migration dropped this multiply, so `--max-mem 115` asked for 115 BYTES and the
+        // pool came out at "0.0 GiB (~0 slots)" before failing in `rivoli_vmm_alloc(0)`.
+        // Loud rather than silent, but it invalidates any run that passed the flag.
+        a.max_mem.map(|g| g.saturating_mul(1 << 30)),
         attn,
     )?;
     #[cfg(feature = "trace")]
