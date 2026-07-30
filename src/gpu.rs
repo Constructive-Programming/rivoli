@@ -464,6 +464,18 @@ pub struct GpuEngine<'a> {
     /// the whole run — a value is never reused, so a stale wait cannot be satisfied early.
     moe_join: Timeline,
     join_n: u64,
+    /// `RIVOLI_PARTIAL_RANGE` sampling: the observed magnitude range of MoE partials, which
+    /// sizes a fixed-point accumulator.
+    #[cfg(feature = "trace")]
+    pr_on: bool,
+    #[cfg(feature = "trace")]
+    pr_min: f32,
+    #[cfg(feature = "trace")]
+    pr_max: f32,
+    #[cfg(feature = "trace")]
+    pr_n: u64,
+    #[cfg(feature = "trace")]
+    pr_host: Vec<u8>,
     /// Compute-stream span events (bracket the MoE partials+reduce) + the expert
     /// stream's task monitor (idle = load-wait, poll = launch) — the accurate timing
     /// the async overlap hides from wall-clock.
@@ -655,6 +667,16 @@ impl<'a> GpuEngine<'a> {
             miss_stream: Stream::miss()?,
             moe_join: Timeline::new()?,
             join_n: 0,
+            #[cfg(feature = "trace")]
+            pr_on: std::env::var("RIVOLI_PARTIAL_RANGE").is_ok(),
+            #[cfg(feature = "trace")]
+            pr_min: f32::INFINITY,
+            #[cfg(feature = "trace")]
+            pr_max: 0.0,
+            #[cfg(feature = "trace")]
+            pr_n: 0,
+            #[cfg(feature = "trace")]
+            pr_host: Vec::new(),
             moe_ev_start: Event::new()?,
             moe_ev_end: Event::new()?,
             #[cfg(feature = "trace")]
@@ -1653,6 +1675,24 @@ impl<'a> GpuEngine<'a> {
                 // SAFETY: partial holds ndesc·hidden f32; out is hidden f32; cs live.
                 unsafe { launch_moe_reduce(part_c, ndesc, hidden, out_c, cs_raw)? };
                 stream_signal(cs_raw)?.await;
+                // RIVOLI_PARTIAL_RANGE: sample the dynamic range of the values a fixed-point
+                // accumulator would have to represent exactly. The width needed is
+                // log2(max/min) + 24 mantissa bits + log2(E) carry bits, and guessing it is
+                // how a fixed-point design silently loses precision or overflows.
+                #[cfg(feature = "trace")]
+                if self.pr_on && l % 16 == 0 {
+                    let n = ndesc * hidden;
+                    self.pr_host.clear();
+                    self.moe_partial.copy_out_prefix(&mut self.pr_host, n * 4)?;
+                    for c in self.pr_host.chunks_exact(4) {
+                        let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]).abs();
+                        if v > 0.0 && v.is_finite() {
+                            self.pr_min = self.pr_min.min(v);
+                            self.pr_max = self.pr_max.max(v);
+                            self.pr_n += 1;
+                        }
+                    }
+                }
                 self.prof.moe_wall_ns += tm.elapsed().as_nanos();
                 self.moe_ev_end.record(cs_raw)?;
             }
@@ -1998,6 +2038,15 @@ impl<'a> GpuEngine<'a> {
         // LOOKA sits beside the profile rather than inside it: it is a property of the
         // ROUTER (would a prefetcher guess right?), not of where this run spent its time,
         // and it only exists in `trace` builds.
+        #[cfg(feature = "trace")]
+        if self.pr_on && self.pr_n > 0 {
+            let span = (self.pr_max / self.pr_min).log2();
+            tracing::info!(
+                "  partial range: |v| in [{:.3e}, {:.3e}] over {} samples | {:.1} exponent \
+                 bits; exact fixed-point needs ~{:.0} bits (+24 mantissa +4 carry)",
+                self.pr_min, self.pr_max, self.pr_n, span, span + 28.0,
+            );
+        }
         #[cfg(feature = "trace")]
         {
             tracing::info!("{}", self.looka.report());

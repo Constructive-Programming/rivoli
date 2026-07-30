@@ -459,3 +459,59 @@ docs/INT4.md; artifacts it produced are still identifiable by their `i4_source` 
 
 See `docs/PERF.md` for the performance roadmap, `MODES.md` for the format/policy matrix, and
 `benchmarks.md` for measured throughput and quality.
+
+---
+
+## 12. Exact fixed-point MoE accumulation — measured design inputs (2026-07-31)
+
+Plan of record for removing the reduce's cross-stream join *without* trading away
+determinism. Both inputs were probed, because both were load-bearing guesses.
+
+**Why fixed point.** The join exists because `moe_reduce` needs every partial before any
+output element is final, and f32 addition is not associative — so letting experts accumulate
+as they arrive would make the result depend on arrival order. **Integer** addition is
+associative and commutative, so a fixed-point accumulator makes arrival order irrelevant:
+no partials, no reduce kernel, no join, and experts land as they finish.
+
+Crucially this is a STRONGER guarantee than the alternative (a fixed index partition, each
+stream reducing its own half). That alternative's determinism holds only while the partition
+stays fixed — and its own documented drawback is load imbalance, whose obvious fix is to
+balance the partition by miss count, which is exactly what breaks it. That is the `hit` mask
+trap again: the natural optimisation is incentivised to violate the correctness property.
+Fixed point has no such property to break.
+
+### Probe 1 — can Vulkan express it? YES
+
+`VK_KHR_shader_atomic_int64`, `shaderBufferInt64Atomics = true` on gfx1151. So the limb
+atomics are available on both backends and the waist holds.
+
+### Probe 2 — how wide? 128 BITS, and that is 2x more than needed
+
+Sampled every 16th MoE layer over 24 tokens (`RIVOLI_PARTIAL_RANGE=1`, trace builds):
+
+```
+|v| in [5.224e-11, 1.525e1] over 21,454,848 samples | 38.1 exponent bits
+exact fixed-point needs ~66 bits (38 exponent + 24 mantissa + 4 carry for E=9)
+```
+
+**66 bits.** So two u64 limbs cover it with 62 binades of headroom. 256- or 512-bit
+accumulators — the widths first considered — would double or quadruple the atomic traffic to
+represent magnitudes that do not occur. Cost at 128 bits: 2 x 9 x 6144 ~= 110k atomics per
+layer, ~0.4 MB of traffic against the 221 KB of partials it replaces.
+
+Accuracy IMPROVES: today's sequential f32 sum rounds 8 times per output element; exact
+accumulation rounds once, at the final convert. Output will not be bit-comparable to the
+current engine, so this needs a perplexity gate rather than a token-ID diff — the one change
+in this area that does.
+
+### Implementation sketch
+
+- `moe_expert_range`(`_i4`) accumulate into 2 x u64 limbs via `atomicAdd`, scale `2^-40`
+  (LSB below the observed 5.2e-11 = 2^-34.2), instead of writing an f32 partial row.
+- Guard bits sized so no limb overflows across E=9 additions; a carry-normalise pass folds
+  limb 0 into limb 1.
+- Convert limbs -> f32 folded into the residual add, which already sits after the
+  end-of-layer barrier — so the join disappears rather than moving.
+- The `moe_ns_by_miss` bracket must be re-checked: it currently spans the compute stream, and
+  this moves work off it. A bracket that no longer covers what its name says is the error
+  this file has already shipped twice.
