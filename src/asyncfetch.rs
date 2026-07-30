@@ -23,7 +23,7 @@
 //! single-threaded on the decode loop, the reaper blocks off-thread, and the two
 //! meet only through `Signal` wakers.
 
-use crate::backend::{Signal, Stream};
+use crate::backend::{Signal, Stream, Timeline};
 use crate::stream::Streamer;
 use anyhow::{Result, anyhow};
 use std::os::fd::RawFd;
@@ -50,6 +50,41 @@ unsafe impl Send for ReadSpec {}
 struct ReapJob {
     reads: Vec<ReadSpec>,
     signals: Vec<Signal>,
+    /// `tickets[i].value` is what the reaper signals on `tickets[i]`'s timeline once read
+    /// `i`'s copy has been enqueued on the fetch stream. Assigned on the DECODE thread at
+    /// submit, which is the whole point: a consumer can enqueue its wait before the reaper
+    /// has even seen the completion.
+    tickets: Vec<Ticket>,
+}
+
+/// A promise that some data will be present, redeemable as a DEVICE-SIDE wait.
+///
+/// This replaces the `hit: Vec<bool>` that used to tell `gpu.rs` whether to await. That
+/// mask was a second, host-side encoding of "is this expert's data ready?", and when it
+/// disagreed with the Signal it silently won — `gpu.rs` launches every `hit` expert with no
+/// wait at all, so a mask that said "ready" made the kernel read unwritten memory. A ticket
+/// cannot disagree with anything: it IS the dependency, and the only way to launch is to
+/// enqueue its wait.
+///
+/// A resident expert carries [`Ticket::RESIDENT`] — value 0, which every timeline starts at,
+/// so its wait is satisfied on arrival. Resident, missing and in-flight therefore take ONE
+/// code path with no branch for anyone to get wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ticket {
+    /// Which staging slot's timeline carries this dependency.
+    pub slot: u16,
+    /// The value that timeline reaches once the data has landed.
+    pub value: u64,
+}
+
+impl Ticket {
+    /// Data that is already present. Timelines start at 0, so waiting on 0 is free.
+    pub const RESIDENT: Ticket = Ticket { slot: 0, value: 0 };
+
+    #[inline]
+    pub fn is_resident(&self) -> bool {
+        self.value == 0
+    }
 }
 
 /// Owns the demand ring + fetch stream on a reaper thread; services one [`ReapJob`]
@@ -75,6 +110,13 @@ pub struct AsyncFetch {
     /// stale `user_data` → C-side OOB / signal-index panic). `submit` then fails
     /// fast so the decode returns a clean `Err` instead of streaming garbage.
     poisoned: Arc<AtomicBool>,
+    /// One timeline per staging slot, shared with the reaper. Per-SLOT rather than one for
+    /// the whole stream because a ticket has to be known at submit time: read `i` of a batch
+    /// deterministically lands in slot `i`, so its (slot, value) is computable on the decode
+    /// thread before the read has been queued, let alone completed.
+    slot_tl: Arc<Vec<Timeline>>,
+    /// Next value to hand out per slot. Decode-thread only.
+    slot_next: Vec<u64>,
 }
 
 impl AsyncFetch {
@@ -82,6 +124,13 @@ impl AsyncFetch {
     /// fetch stream.
     pub fn new(streamer: Streamer) -> Result<Self> {
         let fetch = Stream::fetch()?;
+        let nslots = streamer.entries() as usize;
+        let mut tls = Vec::with_capacity(nslots);
+        for _ in 0..nslots {
+            tls.push(Timeline::new()?);
+        }
+        let slot_tl = Arc::new(tls);
+        let tl_reaper = slot_tl.clone();
         let (tx, rx) = channel::<ReapJob>();
         let fetch_ns = Arc::new(AtomicU64::new(0));
         let io_wait_ns = Arc::new(AtomicU64::new(0));
@@ -91,13 +140,17 @@ impl AsyncFetch {
         let poison_reaper = poisoned.clone();
         let reaper = std::thread::Builder::new()
             .name("rivoli-reaper".into())
-            .spawn(move || reaper_loop(streamer, fetch, rx, fn_reaper, io_reaper, poison_reaper))?;
+            .spawn(move || {
+                reaper_loop(streamer, fetch, rx, fn_reaper, io_reaper, poison_reaper, tl_reaper)
+            })?;
         Ok(Self {
             tx: Some(tx),
             reaper: Some(reaper),
             fetch_ns,
             io_wait_ns,
             poisoned,
+            slot_tl,
+            slot_next: vec![0; nslots],
         })
     }
 
@@ -116,24 +169,65 @@ impl AsyncFetch {
     /// same order (index = `user_data`). Reads run concurrently on the NVMe; each
     /// signal resolves when its bounce copy has landed on the fetch stream. Empty
     /// `reads` returns an empty vec (an all-hit layer).
-    pub fn submit(&self, reads: Vec<ReadSpec>) -> Result<Vec<Signal>> {
+    pub fn submit(&mut self, reads: Vec<ReadSpec>) -> Result<(Vec<Signal>, Vec<Ticket>)> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(anyhow!("AsyncFetch poisoned by an earlier reaper error"));
         }
         let signals: Vec<Signal> = reads.iter().map(|_| Signal::pending()).collect();
         if reads.is_empty() {
-            return Ok(signals);
+            return Ok((signals, Vec::new()));
         }
+        // Read `i` of this batch lands in staging slot `i` — `Streamer::queue` assigns
+        // `ud = queued++` in exactly this order — so the ticket is computable here, on the
+        // decode thread, before the reaper has touched anything. That is what lets a
+        // consumer enqueue its wait ahead of the producer (INV-4).
+        let tickets: Vec<Ticket> = reads
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                self.slot_next[i] += 1;
+                Ticket { slot: i as u16, value: self.slot_next[i] }
+            })
+            .collect();
         let job = ReapJob {
             reads,
             signals: signals.clone(),
+            tickets: tickets.clone(),
         };
         self.tx
             .as_ref()
             .ok_or_else(|| anyhow!("AsyncFetch closed"))?
             .send(job)
             .map_err(|_| anyhow!("reaper thread gone"))?;
-        Ok(signals)
+        Ok((signals, tickets))
+    }
+}
+
+impl AsyncFetch {
+    /// Enqueue a DEVICE-SIDE wait for `t` on `stream_raw`. The only way to consume a
+    /// ticket, so there is no path from "I have data" to "I launched" that skips the
+    /// dependency — which is precisely the gap the `hit` mask left open.
+    ///
+    /// A resident ticket is value 0 and every timeline starts there, so the wait would be
+    /// satisfied immediately; it is skipped rather than enqueued because ~7 of 9 experts per
+    /// layer are resident and a no-op packet each is pure queue traffic. That is a LOCAL
+    /// shortcut inside the one function that consumes tickets, not a contract a caller can
+    /// get wrong.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn wait(&self, t: Ticket, stream_raw: *mut std::ffi::c_void) -> Result<()> {
+        if t.is_resident() {
+            return Ok(());
+        }
+        self.slot_tl[t.slot as usize].wait(stream_raw, t.value)
+    }
+
+    /// Has this ticket's data landed? Used to recycle staging slots by TIMELINE VALUE
+    /// rather than by `reset_batch`'s blind integer reset — the latter recycled a slot with
+    /// no relationship to whether the copy out of it had retired, which was safe only
+    /// because every read happened to be awaited inside its own layer. That was an emergent
+    /// property of the consumer, written nowhere and enforced nowhere.
+    pub fn landed(&self, t: Ticket) -> bool {
+        t.is_resident() || self.slot_tl[t.slot as usize].completed() >= t.value
     }
 }
 
@@ -156,6 +250,7 @@ fn reaper_loop(
     fetch_ns: Arc<AtomicU64>,
     io_wait_ns: Arc<AtomicU64>,
     poisoned: Arc<AtomicBool>,
+    slot_tl: Arc<Vec<Timeline>>,
 ) {
     for job in rx {
         // Once poisoned, the ring is dirty (a prior job bailed mid-batch, leaving
@@ -170,7 +265,7 @@ fn reaper_loop(
             continue;
         }
         let t = std::time::Instant::now();
-        let r = run_job(&mut streamer, &fetch, &job, &io_wait_ns);
+        let r = run_job(&mut streamer, &fetch, &job, &io_wait_ns, &slot_tl);
         fetch_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if let Err(e) = r {
             // Fatal fetch error: poison (abandon the dirty ring for all later jobs),
@@ -189,6 +284,7 @@ fn run_job(
     fetch: &Stream,
     job: &ReapJob,
     io_wait_ns: &AtomicU64,
+    slot_tl: &[Timeline],
 ) -> Result<()> {
     for r in &job.reads {
         // SAFETY: `dst` is an ALIGN-aligned device slot the pipeline keeps live until
@@ -209,7 +305,13 @@ fn run_job(
         // SAFETY: `fetch` is a live stream; `reap` kicks this read's copy on it and
         // returns the completed read's user_data.
         let u = unsafe { streamer.reap(fetch.raw())? };
-        // Resolve when the copy (enqueued by `reap`) lands on the fetch stream.
+        // Publish the ticket: enqueued on the fetch stream AFTER `reap` queued this read's
+        // copy, so the timeline reaching this value means the copy has completed. This is
+        // what a consumer's `wait` is gated on.
+        let t = job.tickets[u];
+        slot_tl[t.slot as usize].signal(fetch.raw(), t.value)?;
+        // Resolve when the copy (enqueued by `reap`) lands on the fetch stream. Kept as the
+        // error/teardown channel; nothing awaits it per-expert any more.
         job.signals[u].arm_on(fetch)?;
     }
     let e_io = std::time::Instant::now();

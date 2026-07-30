@@ -28,6 +28,7 @@ use crate::backend::{
 use crate::device::DeviceBuf;
 use crate::math::{E4M3_BLOCK, nll_of, route_into, topk_into};
 use crate::model::ModelConfig;
+use crate::asyncfetch::Ticket;
 use crate::pin::{Fp8Mlp, IndexerPin, LayerMlp, MlpVq, Pin, TRACE_WINDOW};
 
 /// How many layers ahead the pilot predicts. `trace` builds evaluate both so LOOKA can
@@ -65,7 +66,6 @@ const _: () = assert!(
 );
 use crate::telemetry::ProfileSummary;
 use anyhow::{Result, bail, ensure};
-use futures_util::stream::{StreamExt, TryStreamExt};
 
 /// Little-endian byte view of a POD slice — zero-copy on this LE host (a `[T]`'s
 /// in-memory bytes ARE its LE serialization). Feeds the per-token H2D uploads (attn
@@ -212,9 +212,13 @@ fn blocked<T>(acc: &mut u128, name: &'static str, f: impl FnOnce() -> Result<T>)
 
 impl Profile {
     /// Fold the accumulated buckets into the per-token summary (also fed to OTLP).
-    /// `fetch_wall_ns` is the reaper's off-thread load cost; `idle_ns`/`poll_ns` are
-    /// the expert stream's tokio-metrics (load-wait / launch) — the accurate
-    /// decomposition the async overlap hides from wall-clock.
+    /// `fetch_wall_ns` is the reaper's off-thread load cost.
+    ///
+    /// The `idle_ns`/`poll_ns` tokio-metrics pair is GONE with the ticketed dataflow: it
+    /// measured the per-expert async awaits, and there are none — the GPU gates itself now.
+    /// Removed rather than left reporting zeros, because a metric whose subject no longer
+    /// exists reads as "this cost is zero" instead of "this is not measured here", and this
+    /// file has already shipped two metrics that quietly excluded their own subject.
     #[allow(clippy::too_many_arguments)] // one call site; the buckets are unrelated scalars
     fn summary(
         &self,
@@ -223,8 +227,6 @@ impl Profile {
         bytes_per_expert: usize,
         fetch_wall_ns: u64,
         io_wait_ns: u64,
-        idle_ns: u64,
-        poll_ns: u64,
     ) -> ProfileSummary {
         let tok = self.tokens.max(1) as f64;
         let per = |ns: u128| ns as f64 / 1e6 / tok; // ms/token
@@ -243,14 +245,14 @@ impl Profile {
         // the other terms and measured nothing. `cpu` below is now three stamped regions
         // instead, and the cost of that honesty is that unattributed time is simply not
         // reported.
-        let moe_gpu_wait_ns = (self.moe_wall_ns as f64 - exposed_ns - poll_ns as f64).max(0.0);
+        let moe_gpu_wait_ns = (self.moe_wall_ns as f64 - exposed_ns).max(0.0);
         let gpu_wait_ns = (self.route_wait_ns + self.sync_wait_ns + self.tail_wait_ns) as f64
             + moe_gpu_wait_ns;
-        // CPU: measured host-compute regions. `poll_ns` is the expert stream's tokio
-        // poll — host work inside the MoE block, which the three decode-thread stamps
-        // cannot see — so it belongs here rather than being double-counted as a wait.
-        let cpu_ns = (self.cpu_launch_ns + self.cpu_route_ns + self.cpu_submit_ns) as f64
-            + poll_ns as f64;
+        // CPU: measured host-compute regions. The expert stream's tokio poll used to be
+        // added here — host work inside the MoE block the three decode-thread stamps cannot
+        // see. With the launches enqueued straight onto the compute stream there is no such
+        // work left to attribute.
+        let cpu_ns = (self.cpu_launch_ns + self.cpu_route_ns + self.cpu_submit_ns) as f64;
         let hidden = if fetch_wall_ns > 0 {
             (100.0 * (1.0 - exposed_ns / fetch_wall_ns as f64)).clamp(0.0, 100.0)
         } else {
@@ -276,8 +278,6 @@ impl Profile {
                 }
             }),
             fetch_wall_ms: per(fetch_wall_ns as u128),
-            load_wait_ms: per(idle_ns as u128),
-            launch_ms: per(poll_ns as u128),
             fetch_hidden_pct: hidden,
             miss_per_tok: self.fetch_n as f64 / tok,
             // Over ALL reads the reaper serviced, demand and speculative alike —
@@ -441,7 +441,10 @@ pub struct GpuEngine<'a> {
     /// appends [`Pin::shared_i4`].
     fmt: Vec<bool>,
     /// Per-selected-expert: was it already resident? Drives the batched launch below.
-    hit: Vec<bool>,
+    /// Per-descriptor device-side dependency. Replaces the `hit: Vec<bool>` residency mask,
+    /// which encoded "do not await" as host data and could silently disagree with the real
+    /// dependency — see the launch loop for the failure that caused.
+    tickets: Vec<Ticket>,
     #[cfg(feature = "trace")]
     looka: crate::looka::Looka,
     gl_host: Vec<u8>,
@@ -480,7 +483,6 @@ pub struct GpuEngine<'a> {
     /// `argmax` (the prompt's forward has run, but so has its `record`) — kept as a
     /// guard anyway so an early-exit path cannot read an unrecorded event.
     tail_ev_pending: bool,
-    moe_monitor: tokio_metrics::TaskMonitor,
     /// DIAGNOSTIC (`--checksum-x`, `trace` only): hash the residual stream each layer.
     #[cfg(feature = "trace")]
     checksum_x: bool,
@@ -634,7 +636,7 @@ impl<'a> GpuEngine<'a> {
             mlps_vq: Vec::with_capacity(cfg.top_k),
             descs_vq: Vec::with_capacity(slots),
             fmt: Vec::with_capacity(slots),
-            hit: Vec::with_capacity(slots),
+            tickets: Vec::with_capacity(slots),
             #[cfg(feature = "trace")]
             looka: crate::looka::Looka::new(cfg.n_layers),
             gl_host: Vec::with_capacity(cfg.n_experts * 4),
@@ -651,7 +653,6 @@ impl<'a> GpuEngine<'a> {
             idx_ev_start: Event::new()?,
             idx_ev_end: Event::new()?,
             idx_ev_pending: false,
-            moe_monitor: tokio_metrics::TaskMonitor::new(),
             #[cfg(feature = "trace")]
             checksum_x: false,
             #[cfg(feature = "trace")]
@@ -1369,7 +1370,7 @@ impl<'a> GpuEngine<'a> {
                     &self.choice,
                     &mut self.mlps_vq,
                     &mut self.fmt,
-                    &mut self.hit,
+                    &mut self.tickets,
                     &self.hints,
                 )?;
                 // Pure host work: residency lookups + policy bookkeeping + read specs.
@@ -1425,12 +1426,12 @@ impl<'a> GpuEngine<'a> {
                     self.descs_vq.push(desc_of_vq(&s));
                     self.w.push(1.0);
                     self.fmt.push(self.pin.shared_i4());
-                    // The shared expert is in the RESIDENT tier, never streamed — its
-                    // Signal is `ready()` right here. `hit` must grow with `fmt`/`descs`
-                    // or it is shorter than `ndesc` and the batching loop below indexes
-                    // past the end (it did: "len is 8 but the index is 8", because `hit`
-                    // covers only the 8 routed picks).
-                    self.hit.push(true);
+                    // The shared expert is in the RESIDENT tier, never streamed, so its
+                    // dependency is already satisfied. It must still grow `tickets` with
+                    // `fmt`/`descs` or the launch loop indexes past the end (it did once:
+                    // "len is 8 but the index is 8", because the old mask covered only the
+                    // 8 routed picks).
+                    self.tickets.push(Ticket::RESIDENT);
                     signals.push(Signal::ready());
                 }
                 let ndesc = self.descs_vq.len();
@@ -1457,14 +1458,13 @@ impl<'a> GpuEngine<'a> {
                 // above). Cloned so the expert stream owns it (the small bool vec moves
                 // into the async closure). Hybrid mixes int4/vq3 within one batch.
                 let fmt = self.fmt.clone();
-                // Cloned alongside `fmt` for the same reason: the async block below moves
-                // what it captures, and `self` is borrowed mutably across the await.
-                let hit = self.hit.clone();
+                // Cloned alongside `fmt`: the launch loop indexes both while `self.pin` is
+                // borrowed for `wait_on`.
+                let tickets = self.tickets.clone();
                 let w_ptr = self.wexpert_buf.ptr() as *const f32;
                 let (cb0, cb1, cb2) = (self.codebooks[0], self.codebooks[1], self.codebooks[2]);
                 let cs_raw = self.compute_stream.raw();
                 let inter = cfg.moe_inter;
-                let monitor = self.moe_monitor.clone();
                 // Bracket the compute-stream span (partials+reduce) for the accurate
                 // GPU-side timing; read at the end-of-layer join. Caveat: each partial
                 // launches only after its per-expert `sig.await` resolves on the host,
@@ -1500,22 +1500,48 @@ impl<'a> GpuEngine<'a> {
                 // NOT permuted to make longer runs — `pin.rs`'s trace-v2 invariant requires
                 // `window[..sel.len()] == sel` and `bin/replay` hard-fails otherwise.
                 debug_assert_eq!(
-                    hit.len(), ndesc,
-                    "hit mask must cover every descriptor (routed picks + the shared expert)"
+                    tickets.len(), ndesc,
+                    "every descriptor needs a ticket (routed picks + the shared expert)"
                 );
+                // TICKETED DATAFLOW. Every expert is enqueued behind a DEVICE-SIDE wait on
+                // its own data, in one loop, with no branch on residency and no host round
+                // trip. Resident, missing and in-flight take the same path — a resident
+                // expert simply carries `Ticket::RESIDENT` (value 0, satisfied on arrival).
+                //
+                // This replaces a `hit: Vec<bool>` that told this loop whether to await, and
+                // deleting it is the point rather than a side effect. That mask was a second
+                // host-side encoding of "is this data ready?", and when it disagreed with the
+                // Signal it won SILENTLY: a `hit` expert launched with no wait at all, so a
+                // slot still being written could be marked ready and read as garbage. A
+                // ticket cannot disagree with anything — it IS the dependency, and
+                // `wait_on` is the only way to consume one, so "launched without waiting" is
+                // no longer expressible here.
+                //
+                // The wait must be enqueued BEFORE the producer has run (the reaper has not
+                // seen these completions yet), which is exactly what `hipStreamWaitEvent`
+                // cannot do and `hipStreamWaitValue64` can — tested as INV-4 on both
+                // backends. Do not "simplify" this to events.
+                //
+                // Runs of consecutive experts sharing a format still batch into one dispatch
+                // (`moe_expert_range` computes `e = e_start + row/inter`, so an `e_count > 1`
+                // dispatch is bit-identical to that many single ones). What no longer gates
+                // the batching is residency — only the format, and whether a wait had to be
+                // enqueued between them.
                 let mut i = 0usize;
-                while i < ndesc.min(hit.len()).min(fmt.len()) {
-                    if !hit[i] {
-                        i += 1;
-                        continue;
-                    }
+                while i < ndesc {
+                    // Enqueue this expert's dependency. Free for a resident ticket.
+                    self.pin.wait_on(tickets[i], cs_raw)?;
                     let f = fmt[i];
-                    let mut j = i;
-                    while j < ndesc && hit[j] && fmt[j] == f {
+                    // Extend the run while the format matches AND the next expert needs no
+                    // wait of its own — a wait between two experts must not be swallowed by
+                    // a batched dispatch that would launch the second one early.
+                    let mut j = i + 1;
+                    while j < ndesc && fmt[j] == f && tickets[j].is_resident() {
                         j += 1;
                     }
-                    // SAFETY: descs/codebooks resident; these slots are HITS, so their
-                    // bytes are already in place; h/part device scratch; cs_raw live.
+                    // SAFETY: descs/codebooks resident; every expert in [i, j) is behind an
+                    // enqueued device-side wait for its own bytes; h/part device scratch;
+                    // cs_raw live.
                     unsafe {
                         if f {
                             launch_moe_expert_range_i4(
@@ -1531,61 +1557,13 @@ impl<'a> GpuEngine<'a> {
                     }
                     i = j;
                 }
-                // THEN the misses, still one await + launch each. Removing the host from
-                // this path needs a device-side cross-stream wait, and that is now a
-                // CORRECTNESS item, not just a speed one — see the warning below.
-                //
-                // WHY THE `hit` MASK IS A HAZARD, not merely an optimisation. It encodes
-                // "do not await" as host-side data, so "is this expert's data ready?" lives
-                // in three places — this mask, `signals[e]`, and `routed.is_loaded` — across
-                // two modules with nothing enforcing agreement. The speculative prefetcher
-                // made them disagree: an in-flight speculative slot marked `hit` skipped the
-                // await entirely, the substituted Signal was never consumed, and the kernel
-                // read an unwritten slot. Fixed by giving that case a third state
-                // (`spec_hold` in pin.rs), which works but ADDS a state to a design whose
-                // problem is already having too many.
-                //
-                // The structural fix is to enqueue every launch behind a device-side wait on
-                // its own copy, so resident / missing / in-flight take ONE path and the mask
-                // stops existing. `submit_layer` no longer returning a `hit` mask is the
-                // acceptance test; if the mask survives the refactor, so does the bug class.
-                //
-                // MIND THE PRIMITIVE. `hipStreamWaitEvent` reproduces this bug in a new
-                // costume: it captures the event's state at ENQUEUE time, so a wait enqueued
-                // before the reaper records the copy is a silent no-op — and enqueueing up
-                // front is the entire point. HIP needs `hipStreamWaitValue64` /
-                // `hipStreamWriteValue64` (check `hipDeviceAttributeCanUseStreamWaitValue`
-                // on gfx1151 first). Vulkan already has the right primitive: per-stream
-                // timeline semaphores from Phase 4, where waiting on value N is well-defined
-                // before the signaller runs.
-                let miss: Vec<usize> = (0..ndesc).filter(|&e| !hit[e]).collect();
-                futures_util::stream::iter(miss.clone())
-                    .map(Ok::<usize, anyhow::Error>)
-                    .try_for_each_concurrent(miss.len().max(1), move |e| {
-                        let sig = signals[e].clone();
-                        let i4 = fmt[e];
-                        // Instrument: idle = time parked on the load Signal (the
-                        // fetch-wait the stream sees), poll = the launch cost.
-                        monitor.instrument(async move {
-                            sig.await;
-                            // SAFETY: descs/codebooks resident; slot loaded (sig
-                            // resolved); h/part device scratch; cs_raw live.
-                            unsafe {
-                                if i4 {
-                                    launch_moe_expert_range_i4(
-                                        x_c, hidden, inter, e, 1, descs_ptr, w_ptr, h_c, part_c,
-                                        cs_raw,
-                                    )
-                                } else {
-                                    launch_moe_expert_range(
-                                        x_c, hidden, inter, e, 1, descs_ptr, cb0, cb1, cb2, w_ptr,
-                                        h_c, part_c, cs_raw,
-                                    )
-                                }
-                            }
-                        })
-                    })
-                    .await?;
+                // The load Signals are no longer awaited per expert — the GPU gates itself
+                // now. They remain the reaper's error/teardown channel (it resolves them on
+                // poison so nothing hangs), and NOT awaiting them is what removes ~9 host
+                // round trips per layer: the measured cost of that gating was the MoE phase
+                // running at 38.8 GB/s in-engine against 91.8 GB/s for the same kernels in
+                // `examples/moe_bench.rs`.
+                drop(signals);
                 // SAFETY: partial holds ndesc·hidden f32; out is hidden f32; cs live.
                 unsafe { launch_moe_reduce(part_c, ndesc, hidden, out_c, cs_raw)? };
                 stream_signal(cs_raw)?.await;
@@ -1923,15 +1901,12 @@ impl<'a> GpuEngine<'a> {
         let bytes_per_expert = crate::quant::vq_expert_bytes(self.cfg.hidden, self.cfg.moe_inter);
         // The accurate async-side decomposition: reaper fetch wall + the expert
         // stream's tokio-metrics (idle = load-wait, poll = launch).
-        let tm = self.moe_monitor.cumulative();
         let summary = self.prof.summary(
             self.pin.hits - hit0,
             self.pin.misses - miss0,
             bytes_per_expert,
             self.pin.fetch_ns().saturating_sub(fetch0),
             self.pin.io_wait_ns().saturating_sub(io0),
-            tm.total_idle_duration.as_nanos() as u64,
-            tm.total_poll_duration.as_nanos() as u64,
         );
         summary.report();
         // LOOKA sits beside the profile rather than inside it: it is a property of the

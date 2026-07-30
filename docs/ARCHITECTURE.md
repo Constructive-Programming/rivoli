@@ -204,11 +204,24 @@ flowchart LR
   (gate/up/down × weights+scales). The VQ and int4 kernels *reinterpret* the same struct at
   their own slot offsets — a per-expert `fmt` bool (from the expert's tier) picks
   `launch_moe_expert_range` (VQ gather) vs `_i4` (nibble decode).
-- **Per-expert launch gated by its Signal.** Each expert's partial launches on the compute
-  stream only once its load `Signal` resolves — a resident/loaded expert launches
-  immediately; a miss's launch waits on its fetch. `try_for_each_concurrent(ndesc, …)`
-  drives them all: the misses fetch while the resident experts compute. The bubbles between
-  host-gated launches are the residual cost the cache-routing proposals attack.
+- **Per-expert launch gated by a device-side wait (INV-5).** Every descriptor carries a
+  `Ticket` — the timeline value its data lands at — and the launch loop enqueues
+  `wait_on(ticket)` before each dispatch. Resident experts carry `Ticket::RESIDENT`
+  (value 0, satisfied on arrival), so resident / missing / in-flight are ONE path with no
+  residency branch and **no host round trip**: the whole layer is enqueued at once and the
+  GPU gates itself.
+
+  This replaced a `hit: Vec<bool>` that told the loop whether to await. That mask was a
+  second host-side encoding of "is this data ready?", and when it disagreed with the Signal
+  it won silently — a `hit` expert launched with no wait at all, so a slot still being
+  written could be marked ready and read as garbage. That is not hypothetical: it is what
+  the speculative prefetcher did. A ticket cannot disagree with anything, because it IS the
+  dependency and `wait_on` is the only way to consume one.
+
+  **Mind the primitive.** `hipStreamWaitEvent` captures an event's state at ENQUEUE time, so
+  a wait enqueued before the producer records is a silent no-op — and enqueueing up front is
+  the entire point. HIP uses `hipStreamWaitValue64`; Vulkan attaches the wait to a submit.
+  Both are tested (INV-4), per backend, because they reach the property differently.
 - **Fixed-order reduce.** Partials are independent rows; `moe_reduce` sums them in a fixed
   order (deterministic output regardless of completion order). The shared expert folds in
   as a resident 9th descriptor (weight 1.0, always `ready()`).
@@ -358,10 +371,12 @@ different populations. Numbering converts "the doc drifted" into something a che
 | **INV-1** | Routing is a pure function of (gate logits, bias, top_k) — it never consults the cache, so any cache change is output-bit-identical by construction | `math.rs::inv_1_routing_never_consults_the_cache` |
 | **INV-2** | A LOOKA hint never promotes, admits, or leaves residue in policy state; it may only delay an eviction | `hybrid.rs::inv_2_hints_leave_no_residue_in_policy_state` |
 | **INV-3** | A hint can never fail an allocation — vetoes are advisory and are dropped rather than starve eviction | `hybrid.rs::inv_3_hints_can_never_starve_eviction` |
-| **INV-4** | A device-side wait may be enqueued BEFORE its producer exists and still waits (the property `hipStreamWaitEvent` lacks) | `gpustream.rs::inv_4_wait_enqueued_before_signal_still_waits` |
+| **INV-4** | A device-side wait may be enqueued BEFORE its producer exists and still waits (the property `hipStreamWaitEvent` lacks) — one half per backend, since they reach it by different mechanisms | `gpustream.rs::inv_4_wait_enqueued_before_signal_still_waits`, `tests/vk.rs::inv_4_…` |
+| **INV-5** | An expert cannot be launched without enqueueing its data dependency: every descriptor carries a `Ticket` and `wait_on` is the only way to consume one | `pin.rs::inv_5_every_descriptor_carries_a_ticket` |
 
-INV-4 is the foundation of the ticketed dataflow that replaces the `hit` mask: it is what
+INV-4 is the foundation of the ticketed dataflow that replaced the `hit` mask: it is what
 lets consumers be recorded up front, behind waits on values nothing has signalled yet.
+INV-5 is the guarantee that replaced it — see §5.
 
 ---
 

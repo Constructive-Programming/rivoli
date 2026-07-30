@@ -256,6 +256,9 @@ pub struct Streamer {
     /// ring's SQEs point into (Rust would otherwise run the `Drop` body — the arena
     /// free — before dropping this field). Access is transparent via `Deref`.
     ring: ManuallyDrop<IoUring>,
+    /// Ring/arena capacity in staging slots. A batch is bounded by this (see `queue`), and
+    /// the fetcher needs one timeline per slot.
+    entries: u32,
     queued: u32,
     /// Bounce mode (the default): reads land in a pinned host arena and are
     /// `hipMemcpy`d into VMM. False (`--direct-vmm-dma`) = DMA straight into the
@@ -329,6 +332,7 @@ impl Streamer {
 
         Ok(Self {
             ring: ManuallyDrop::new(ring),
+            entries,
             queued: 0,
             bounce,
             span,
@@ -503,8 +507,14 @@ impl Streamer {
         cq.next().map(|c| (c.result(), c.user_data()))
     }
 
-    /// Reset the per-batch bookkeeping after a full batch has been [`reap`]ed,
-    /// readying the ring for the next layer's batch.
+    /// Staging-slot count — the ring's capacity, and the number of per-slot timelines the
+    /// fetcher needs.
+    pub fn entries(&self) -> u32 {
+        self.entries
+    }
+
+    /// Reset the per-batch bookkeeping after a full batch has been [`reap`]ed, readying the
+    /// ring for the next layer's batch.
     pub fn reset_batch(&mut self) {
         self.queued = 0;
         self.dst.clear();

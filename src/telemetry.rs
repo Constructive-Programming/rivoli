@@ -466,12 +466,6 @@ pub struct ProfileSummary {
     pub compute_gpu_ms: f64,
     /// Off-thread reaper fetch cost (queue→submit→reap all misses).
     pub fetch_wall_ms: f64,
-    /// Aggregate expert-stream idle (tokio) — the SUM of per-expert load-waits across
-    /// the ~9 concurrent tasks, so it over-counts the wall; a load-pressure gauge, not
-    /// the exposed fetch (that's `moe_wall − compute_gpu`).
-    pub load_wait_ms: f64,
-    /// The stream's active launch cost (tokio poll).
-    pub launch_ms: f64,
     /// Percent of `fetch_wall` buried behind compute: `1 − (moe_wall−compute_gpu)/fetch_wall`.
     /// **SUBSTANTIALLY OVERSTATED — an upper bound, and not a tight one.** Reported at
     /// 96% on a run where the true figure is at most 57%.
@@ -587,11 +581,7 @@ impl ProfileSummary {
                 if lo > 0.0 { 100.0 * (hi - lo) / lo } else { 0.0 },
             );
         }
-        tracing::info!(
-            "  stream/tok: load-wait {:.0}ms (Σ over ~9 concurrent tasks) | launch {:.1}ms (poll)",
-            self.load_wait_ms,
-            self.launch_ms,
-        );
+
         // The CLASS view: the PROFILE line says WHERE the time is (phases); this says
         // WHAT it is. Every term is measured — none is a residual — so they OVERLAP and
         // need not sum to wall. `io-wait` is on the reaper thread and routinely exceeds
@@ -609,11 +599,10 @@ impl ProfileSummary {
             pct(self.cpu_ms),
         );
         tracing::info!(
-            "    cpu = launch {:.1}ms + route {:.2}ms + submit {:.2}ms + tokio-poll {:.1}ms",
+            "    cpu = launch {:.1}ms + route {:.2}ms + submit {:.2}ms",
             self.cpu_launch_ms,
             self.cpu_route_ms,
             self.cpu_submit_ms,
-            self.launch_ms,
         );
         // The two phase/class splits that motivated this view: `route` was a region
         // mixing a blocking D2H with host routing, and the whole `tail` phase was one

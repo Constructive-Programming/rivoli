@@ -17,7 +17,7 @@
 //! Needs a backend (`rocm` or `vulkan`): without a device there is nothing to pin.
 #![cfg(any(feature = "rocm", feature = "vulkan"))]
 
-use crate::asyncfetch::{AsyncFetch, ReadSpec};
+use crate::asyncfetch::{AsyncFetch, ReadSpec, Ticket};
 use crate::arena::{Arena, Reloc, Step};
 use crate::backend::{Signal, memcpy_dtod};
 use crate::cache;
@@ -588,6 +588,13 @@ impl ArenaPool {
 }
 
 impl<'a> Pin<'a> {
+    /// Enqueue the device-side wait for `t` on `stream_raw`. The ONLY way to consume a
+    /// ticket — so a launch cannot happen without its dependency.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn wait_on(&self, t: Ticket, stream_raw: *mut std::ffi::c_void) -> Result<()> {
+        self.fetch.wait(t, stream_raw)
+    }
+
     /// `(hints offered, of those already resident)`. A veto can only protect a resident
     /// key, so this is what separates "the mechanism had nothing to do" from "the wiring
     /// is broken" — two findings that need opposite fixes.
@@ -972,7 +979,7 @@ impl<'a> Pin<'a> {
         window: &[usize],
         choice: &[f32],
         hints: &[crate::hybrid::Hint],
-    ) -> Result<([Option<ResolvedSlot>; 32], Vec<Signal>, [bool; 32])> {
+    ) -> Result<([Option<ResolvedSlot>; 32], Vec<Signal>, Vec<Ticket>)> {
         let cfg = self.cfg;
         let sparse = (layer - cfg.dense_layers) * cfg.n_experts; // read-table row base
         debug_assert!(
@@ -1112,18 +1119,32 @@ impl<'a> Pin<'a> {
         for &i in &miss_sel {
             self.routed.pending_loaded.push(expert_key(layer, sel[i]));
         }
-        let miss_signals = self.fetch.submit(reads)?;
+        let (miss_signals, miss_tickets) = self.fetch.submit(reads)?;
         let mut signals: Vec<Signal> = (0..sel.len()).map(|_| Signal::ready()).collect();
+        // A resident expert's data is already there, so it carries the RESIDENT ticket
+        // (value 0, satisfied on arrival). Every expert therefore has a ticket and the
+        // caller has one code path — there is no residency bool for anyone to branch on.
+        let mut tickets: Vec<Ticket> = vec![Ticket::RESIDENT; sel.len()];
         for (k, &i) in miss_sel.iter().enumerate() {
             signals[i] = miss_signals[k].clone();
+            tickets[i] = miss_tickets[k];
         }
-        Ok((slots, signals, is_hit))
+        let _ = is_hit;
+        Ok((slots, signals, tickets))
     }
 
     /// Submit one layer's cold reads and resolve each selected expert to its [`MlpVq`]
-    /// (device pointers into the pool) + per-expert format flag + load [`Signal`]. The
-    /// descriptor pointers are final (post-relocation); the bytes land when `signals[i]`
-    /// resolves. The expert stream awaits each signal before computing that expert.
+    /// (device pointers into the pool), its format flag, and its [`Ticket`] — the
+    /// DEVICE-SIDE dependency its data is behind.
+    ///
+    /// **There is no residency mask, and its absence is the point.** This used to also
+    /// return `hit: Vec<bool>`, a second host-side encoding of "is this expert's data
+    /// ready?" that `gpu.rs` consumed to decide whether to await. When the two disagreed the
+    /// bool won silently — `gpu.rs` launches a `hit` expert with no wait at all — so a slot
+    /// still being written could be marked ready and the kernel would read it. A ticket
+    /// cannot disagree with anything: it IS the dependency, and the only way to launch is to
+    /// enqueue its wait (`AsyncFetch::wait`). Resident experts carry [`Ticket::RESIDENT`],
+    /// so resident / missing / in-flight are one code path.
     ///
     /// `window`/`choice` feed the trace sink only: the ranked top-[`TRACE_WINDOW`]
     /// candidate expert ids and the full per-expert `choice` array they index into.
@@ -1139,24 +1160,19 @@ impl<'a> Pin<'a> {
         choice: &[f32],
         out: &mut Vec<MlpVq>,
         fmt: &mut Vec<bool>,
-        hit: &mut Vec<bool>,
+        tickets: &mut Vec<Ticket>,
         hints: &[crate::hybrid::Hint],
     ) -> Result<Vec<Signal>> {
-        let (slots, signals, is_hit) = self.submit_spine(layer, sel, window, choice, hints)?;
+        let (slots, signals, tk) = self.submit_spine(layer, sel, window, choice, hints)?;
         out.clear();
         fmt.clear();
-        // Which experts were already resident. `gpu.rs` uses this to launch them WITHOUT
-        // a host round-trip: a hit's Signal is already resolved, so awaiting it before
-        // launching buys nothing and costs the GPU an idle gap. Returned rather than
-        // inferred from the Signal because `Signal` has no non-blocking readiness query,
-        // and because the policy's answer is deterministic where a poll would race.
-        hit.clear();
-        hit.extend_from_slice(&is_hit[..sel.len()]);
+        tickets.clear();
+        tickets.extend_from_slice(&tk);
         for (i, _e) in sel.iter().enumerate() {
             let s = slots[i].context("submit_layer: unresolved expert slot")?;
             let (b, o) = (s.ptr, s.off);
             // SAFETY: address arithmetic into the resolved slot; the bytes land when
-            // `signals[i]` resolves. The six pointers are identical for both formats
+            // `tickets[i]` is satisfied. The six pointers are identical for both formats
             // (gpu.rs reinterprets as ExpertDescI4 when `fmt[i]`).
             out.push(MlpVq {
                 gate: vqweight_at(b, o[0], o[1]),
@@ -1185,4 +1201,44 @@ fn build_moe_table(
         }
     }
     Ok(table)
+}
+
+#[cfg(test)]
+mod ticket_tests {
+    use crate::asyncfetch::Ticket;
+
+    /// **INV-5: an expert cannot be launched without enqueueing its data dependency.**
+    ///
+    /// The structural half of this is enforced by types and cannot be tested at runtime:
+    /// `submit_layer` returns `Vec<Ticket>` and no longer returns a residency mask, so
+    /// `gpu.rs` has nothing to branch on and no way to spell "launch without waiting". What
+    /// IS testable, and what actually broke before, is the encoding — a resident ticket must
+    /// be a real satisfied dependency rather than a sentinel the consumer has to recognise
+    /// and skip.
+    ///
+    /// Timelines start at 0, so `RESIDENT.value == 0` means "wait on 0", which every
+    /// timeline satisfies on arrival. If it were, say, `u64::MAX` as an "N/A" marker, the
+    /// consumer would need a branch to avoid deadlocking on it — and that branch is exactly
+    /// the `hit` mask growing back.
+    #[test]
+    fn inv_5_every_descriptor_carries_a_ticket() {
+        assert!(
+            Ticket::RESIDENT.is_resident(),
+            "the resident ticket must read as resident"
+        );
+        assert_eq!(
+            Ticket::RESIDENT.value,
+            0,
+            "RESIDENT must be value 0 — a timeline starts there, so waiting on it is \
+             satisfied immediately. A sentinel that had to be SKIPPED would put a residency \
+             branch back in the consumer, which is the bug class this removed."
+        );
+        // A real fetch ticket is never confusable with a resident one: values are assigned
+        // from 1 upward per slot.
+        let fetched = Ticket { slot: 3, value: 1 };
+        assert!(
+            !fetched.is_resident(),
+            "the first value a slot hands out must NOT read as already-satisfied"
+        );
+    }
 }
