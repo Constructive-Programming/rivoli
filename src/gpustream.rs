@@ -96,6 +96,22 @@ impl HipStream {
         Ok(HipStream(s))
     }
 
+    /// The MoE expert-partial stream. Identical to [`HipStream::new`] here — HIP streams
+    /// carry no role — and named so the ROLE is visible at the call site.
+    ///
+    /// This pair exists because the Vulkan side CANNOT be role-blind: it maps each stream
+    /// onto one of three queues, and a role-free `new()` would have to guess. Rather than
+    /// give the two backends different constructors, both spell the role and HIP ignores
+    /// it. Behaviour under `--features rocm` is unchanged to the byte.
+    pub fn compute() -> Result<Self> {
+        Self::new()
+    }
+
+    /// The reaper's H2D fetch stream. See [`HipStream::compute`].
+    pub fn fetch() -> Result<Self> {
+        Self::new()
+    }
+
     #[inline]
     pub fn raw(&self) -> *mut c_void {
         self.0

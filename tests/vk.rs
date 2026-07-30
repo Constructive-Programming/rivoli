@@ -556,6 +556,243 @@ fn signal_ready_and_resolve_are_immediate() {
     block_on(s);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4 increment 2: the three queues, the ring, timestamps, async staging.
+//
+// These are the oracles for the CONCURRENCY structure rather than for arithmetic, and
+// they exist because the port's headline gate cannot see any of it: token IDs depend on
+// arithmetic, not on overlap, so a fully serialised backend passes it (docs/VULKAN.md).
+// ---------------------------------------------------------------------------
+
+/// A [`Signal`] armed on a queue covers work that was merely RECORDED, not only work
+/// already submitted — the gap the command-buffer ring closes.
+///
+/// This is the property `asyncfetch.rs` depends on and could not have before: it enqueues
+/// a copy and arms a signal on the same stream with no `device_sync` between, so if arming
+/// covered only submitted work the signal would fire while the copy sat in an open buffer
+/// and the engine would read an unwritten slot. The read below happens with NO
+/// `device_sync` anywhere, deliberately — the signal is the only thing ordering it.
+#[test]
+fn a_signal_covers_recorded_work_without_a_device_sync() {
+    let v = Validation::new();
+    let mut x = dev(&f32b(&[1.0, 2.0, 3.0, 4.0]));
+    let mut y = dev(&f32b(&[10.0, 20.0, 30.0, 40.0]));
+    let fetch = rivoli::backend::Stream::fetch().expect("fetch stream");
+    // Records a copy on the fetch queue and nothing else. Under HIP this is
+    // `hipMemcpyAsync` on the fetch stream; here it is `vkCmdCopyBuffer`.
+    // SAFETY: both mappings are live, 16 bytes each, distinct allocations.
+    unsafe {
+        rivoli::vk::copy_h2d_async(y.host_mut(), x.host_mut(), 16).expect("async copy");
+    }
+    let sig = rivoli::vk::Signal::pending();
+    sig.arm_on(&fetch).expect("arm on fetch");
+    block_on(sig);
+    let got = f32v(&{
+        let mut out = Vec::new();
+        y.read_into(&mut out, 16).expect("read back");
+        out
+    });
+    assert_eq!(
+        got,
+        vec![1.0, 2.0, 3.0, 4.0],
+        "the copy had not landed when its Signal resolved"
+    );
+    v.check("a_signal_covers_recorded_work_without_a_device_sync");
+}
+
+/// The cross-queue hazard, end to end: the FETCH queue writes bytes and a dispatch on the
+/// MoE QUEUE reads them, ordered only by the host awaiting the copy's `Signal`.
+///
+/// This is the pair the barrier review is about, and the one synchronisation validation on
+/// this stack **cannot see** — it reports transfer↔transfer only, so a clean run says
+/// nothing either way (docs/VULKAN.md, "Risks"). Execution order comes from the await;
+/// visibility comes from the barrier at the head of the reading queue's command buffer. A
+/// missing acquire barrier would show up here as stale bytes in `out`, and nowhere else.
+///
+/// It is the decode path's exact shape: `moe_reduce` on the compute stream summing expert
+/// partials that arrived by H2D copy. `launch_vadd` would NOT do — it takes no stream, so it
+/// records on the MAIN queue, and a test that awaited the MoE stream for it would assert
+/// nothing while looking like it asserted the whole thing.
+#[test]
+fn a_moe_dispatch_sees_what_the_fetch_queue_wrote() {
+    let v = Validation::new();
+    const N: usize = 256;
+    const E: usize = 2;
+    let mut src = dev(&f32b(&vec![3.0f32; N * E]));
+    // `staged` is what the fetch copy writes and the MoE dispatch reads.
+    let mut staged = dev(&f32b(&vec![0.0f32; N * E]));
+    let mut out = poison(N * 4);
+    let fetch = rivoli::backend::Stream::fetch().expect("fetch stream");
+    let moe = rivoli::backend::Stream::compute().expect("compute stream");
+    // SAFETY: live mappings, N*E*4 bytes each, distinct allocations.
+    unsafe {
+        rivoli::vk::copy_h2d_async(staged.host_mut(), src.host_mut(), N * E * 4).expect("copy");
+    }
+    let sig = rivoli::vk::Signal::pending();
+    sig.arm_on(&fetch).expect("arm");
+    block_on(sig);
+    // Now a dispatch on the MoE queue reads those bytes: out[o] = Σ_e staged[e][o] = 6.
+    // SAFETY: device addresses of live Bufs holding N*E and N f32.
+    unsafe {
+        launch_moe_reduce(
+            staged.ptr() as *const f32,
+            E,
+            N,
+            out.ptr_mut() as *mut f32,
+            moe.raw(),
+        )
+        .expect("moe_reduce");
+    }
+    block_on(rivoli::backend::stream_signal(moe.raw()).expect("moe signal"));
+    let got = f32v(&read(&out, N));
+    assert!(
+        got.iter().all(|&g| g == 6.0),
+        "a MoE-queue dispatch read stale bytes the fetch queue had already written: {:?}",
+        &got[..8]
+    );
+    v.check("a_moe_dispatch_sees_what_the_fetch_queue_wrote");
+}
+
+/// GPU timestamps are a MEASUREMENT, not a stub — and a pair that was never recorded
+/// REFUSES rather than reading zero.
+///
+/// The second half is the regression test for increment 1's actual defect. `elapsed_ms`
+/// returning 0.0 made `compute_gpu_ms` zero, which made `ProfileSummary`'s
+/// `fetch_hidden_pct` print "0% hidden" as an arithmetic artifact of the stub — a number
+/// that reads as a finding. An error cannot be mistaken for a measurement; a zero can.
+#[test]
+fn timestamps_measure_gpu_time_and_refuse_when_absent() {
+    let v = Validation::new();
+    let start = rivoli::backend::Event::new().expect("event");
+    let end = rivoli::backend::Event::new().expect("event");
+    assert!(
+        rivoli::backend::Event::elapsed_ms(&start, &end).is_err(),
+        "an unrecorded stamp pair reported a duration; that is how a stub reads as data"
+    );
+
+    // A dispatch big enough to take measurable GPU time: 2048x2048 f32 GEMV.
+    let (o, i) = (2048usize, 2048usize);
+    let mut r = Lcg(0x5AA);
+    let x = dev(&f32b(&(0..i).map(|_| r.f()).collect::<Vec<_>>()));
+    let w = dev(&f32b(&(0..o * i).map(|_| r.f()).collect::<Vec<_>>()));
+    let mut y = dev(&vec![0u8; o * 4]);
+    let wall = std::time::Instant::now();
+    start.record(std::ptr::null_mut()).expect("record start");
+    for _ in 0..8 {
+        // SAFETY: live device addresses, shapes as allocated.
+        unsafe {
+            launch_gemv_f32(
+                x.ptr() as *const f32,
+                w.ptr() as *const f32,
+                o,
+                i,
+                y.ptr_mut() as *mut f32,
+            )
+            .expect("gemv");
+        }
+    }
+    end.record(std::ptr::null_mut()).expect("record end");
+    device_sync().expect("sync");
+    let wall_ms = wall.elapsed().as_secs_f64() * 1000.0;
+    let ms = rivoli::backend::Event::elapsed_ms(&start, &end).expect("elapsed");
+    println!("VK TIMESTAMP span: {ms:.3} ms GPU against {wall_ms:.3} ms wall");
+    assert!(ms > 0.0, "GPU span measured {ms} ms — the query pool is not being written");
+    // A sanity CEILING, not a comparison against `wall_ms`. The main queue is
+    // process-global and cargo runs these tests on parallel threads, so another test's
+    // dispatches can legitimately land between these two stamps and make the GPU span
+    // exceed this test's own wall. That would be a flake, not a finding — the wall is
+    // printed for the reader, and the assertion is set only far enough out to catch a bad
+    // scale factor (`timestampPeriod` misapplied turns 3 ms into 3 ns or 3 s).
+    assert!(
+        ms < 10_000.0,
+        "GPU span {ms} ms is implausible for 8 dispatches; check timestampPeriod scaling"
+    );
+    v.check("timestamps_measure_gpu_time_and_refuse_when_absent");
+}
+
+/// The ring wraps, in the two regimes that fail differently.
+///
+/// Deliberately more iterations than `RING`: at exactly `RING` the wrap never happens, which
+/// is the off-by-one this test exists to catch.
+///
+/// **Part 1, slots still PENDING.** The MoE stream is eager, so each launch is its own
+/// submit and none is joined — after `RING` of them the next `open` must wait a fence and
+/// reset a slot before reusing it. Reusing a pending command buffer is a CORE validation
+/// error (not a synchronisation one, so the layer really does catch this class), and a
+/// missing `reset_fences` turns the next wait into a hang. This is the regime the decode
+/// path runs in.
+///
+/// **Part 2, across joins.** `device_sync` per iteration retires everything, so this checks
+/// the other direction: nothing is lost when the ring wraps through joins. The data is
+/// cumulative, so a dropped batch shows up as a wrong total — which a single idempotent
+/// dispatch could not show.
+#[test]
+fn the_command_buffer_ring_wraps_without_a_stale_slot() {
+    let v = Validation::new();
+    const N: usize = 64;
+    const E: usize = 2;
+    const LAPS: usize = 40; // RING is 16; 40 is two and a half laps
+    let partial = dev(&f32b(&vec![2.0f32; N * E]));
+    let mut out = poison(N * 4);
+    let moe = rivoli::backend::Stream::compute().expect("compute stream");
+    for _ in 0..LAPS {
+        // SAFETY: device addresses of live Bufs holding N*E and N f32.
+        unsafe {
+            launch_moe_reduce(
+                partial.ptr() as *const f32,
+                E,
+                N,
+                out.ptr_mut() as *mut f32,
+                moe.raw(),
+            )
+            .expect("moe_reduce");
+        }
+    }
+    block_on(rivoli::backend::stream_signal(moe.raw()).expect("signal"));
+    let got = f32v(&read(&out, N));
+    assert!(
+        got.iter().all(|&g| g == 4.0),
+        "the eager MoE stream produced {:?} after {LAPS} unjoined submits",
+        &got[..8]
+    );
+
+    let one = dev(&f32b(&vec![1.0f32; N]));
+    let mut acc = dev(&f32b(&vec![0.0f32; N]));
+    for _ in 0..LAPS {
+        // `vadd` takes no stream, so this is the MAIN queue — the lazy one. The
+        // `device_sync` per iteration is what makes the total deterministic: without it,
+        // another test's join on this process-global stream decides how much of the batch
+        // has executed by the time the mapping is read.
+        // SAFETY: device addresses of live Bufs holding N f32 each.
+        unsafe {
+            launch_vadd(acc.ptr_mut() as *mut f32, one.ptr() as *const f32, N).expect("vadd");
+        }
+        device_sync().expect("sync");
+    }
+    let got = f32v(&read(&acc, N));
+    assert!(
+        got.iter().all(|&g| g == LAPS as f32),
+        "expected {LAPS} accumulated adds across the ring wrap, got {:?}",
+        &got[..8]
+    );
+    v.check("the_command_buffer_ring_wraps_without_a_stale_slot");
+}
+
+/// A launcher handed a stream token that is neither NULL nor one of the three queue tags
+/// REFUSES, rather than defaulting to a queue and computing plausible numbers on the wrong
+/// one. `Q::parse` is total; this is the arm that proves the error branch exists.
+#[test]
+fn an_unknown_stream_token_is_refused() {
+    let mut y = dev(&[0u8; 64]);
+    let p = y.ptr_mut() as *mut f32;
+    // SAFETY: the guard rejects before any pointer is read.
+    let r = unsafe { launch_moe_reduce(p as *const f32, 1, 16, p, 0x99 as *mut std::ffi::c_void) };
+    assert!(
+        r.is_err(),
+        "a bogus stream token silently picked a queue instead of failing"
+    );
+}
+
 /// A kernel reads weights placed through `DeviceTier`, at the address `place`
 /// returned.
 ///

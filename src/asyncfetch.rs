@@ -77,7 +77,7 @@ impl AsyncFetch {
     /// Take ownership of the demand `streamer` and spawn the reaper with its own
     /// fetch stream.
     pub fn new(streamer: Streamer) -> Result<Self> {
-        let fetch = Stream::new()?;
+        let fetch = Stream::fetch()?;
         let (tx, rx) = channel::<ReapJob>();
         let fetch_ns = Arc::new(AtomicU64::new(0));
         let io_wait_ns = Arc::new(AtomicU64::new(0));

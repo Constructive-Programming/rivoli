@@ -15,7 +15,7 @@ use futures_util::task::AtomicWaker;
 use std::ffi::CStr;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use tracing::{error, info, warn};
@@ -55,8 +55,8 @@ include!(concat!(env!("OUT_DIR"), "/dims.rs"));
 /// Threads per workgroup. The shaders' `local_size_x`.
 pub const BLOCK: u32 = ROWS_PER_BLOCK * WAVE;
 
-/// Instance, device, the dedicated compute queue, and a command pool on it. Built
-/// once by [`gpu`]; never dropped (see the note there).
+/// Instance, device, the THREE compute queues, and a command-buffer ring on each.
+/// Built once by [`gpu`]; never dropped (see the note there).
 pub struct Gpu {
     pub device: ash::Device,
     pub memprops: vk::PhysicalDeviceMemoryProperties,
@@ -64,11 +64,24 @@ pub struct Gpu {
     phys: vk::PhysicalDevice,
     /// Owns the dlopen'd libvulkan; must outlive the instance, never called through.
     _entry: ash::Entry,
-    cmd: Mutex<Cmd>,
+    /// One [`Stream`] per QUEUE, in [`Q`] order. Usually three; fewer only when the
+    /// chosen family exposes fewer, in which case [`Gpu::route`] aliases the tail.
+    streams: Vec<Mutex<Stream>>,
+    /// `Q` → index into [`Gpu::streams`]. Identity when the family gave us three
+    /// queues; on a device with fewer, several `Q`s share one stream (and so one
+    /// queue), which is the ONLY way to keep `vkQueueSubmit`'s external-synchronisation
+    /// requirement met — two mutexes in front of one queue would not.
+    route: [usize; Q::COUNT],
     pipes: Pipes,
     validation: bool,
     budget: bool,
     timeline: Timeline,
+    /// GPU-timestamp scaling: nanoseconds per tick, and how many low bits of the
+    /// counter the chosen queue family actually implements. Zero `bits` means this
+    /// family cannot write timestamps, and [`Stamp::elapsed_ms`] then refuses rather
+    /// than returning a plausible number — see [`Stamp`].
+    ts_period_ns: f32,
+    ts_bits: u32,
     /// Did the waiter thread actually start? `gpu()` publishes the context BEFORE
     /// spawning, so a spawn failure (EAGAIN under thread pressure) returns Err from
     /// the first call while every later call short-circuits on the published value and
@@ -140,11 +153,93 @@ unsafe extern "system" fn debug_callback(
     vk::FALSE
 }
 
-/// The one open command buffer every `launch_*` appends to, plus the fence
-/// [`device_sync`] joins on. Mirrors HIP's default stream: launches queue up, the
-/// sync submits and waits. One buffer, reset and refilled — no per-launch submit
-/// (colibri measured submit cost as the thing that matters on RADV).
-struct Cmd {
+/// WHICH QUEUE a launch belongs on — the Vulkan spelling of HIP's three streams
+/// (docs/VULKAN.md, "The design, on paper").
+///
+/// It travels through the `launch_*` surface as the same `*mut c_void` HIP carries a
+/// `hipStream_t` in, because that signature is shared by both backends and cannot be
+/// typed on one side alone. It is a TAG, NOT A POINTER: [`Q::parse`] never dereferences
+/// it, so a bogus value is a clean error rather than a wild read, and the tag needs no
+/// lifetime. NULL parses to [`Q::Main`], which is HIP's null-stream convention and what
+/// every oracle test already passes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Q {
+    /// The forward pass — everything `gpu.rs` launches without naming a stream. HIP's
+    /// null/default stream.
+    Main,
+    /// MoE expert partials and the reduce, launched from the async expert stream on the
+    /// decode thread. HIP's `compute_stream`.
+    Moe,
+    /// H2D copies of streamed expert weights, recorded on the REAPER thread. HIP's fetch
+    /// stream, and the queue whose overlap with `Moe` hides ~95% of fetch.
+    Fetch,
+}
+
+impl Q {
+    /// How many there are. Not derived — Rust has no `enum::COUNT` — so the three-arm
+    /// matches below are what keep it honest, and adding a variant fails to compile at
+    /// each of them.
+    const COUNT: usize = 3;
+
+    /// The opaque token a `launch_*` carries. Small, non-null, never dereferenced.
+    #[inline]
+    pub fn tag(self) -> *mut std::ffi::c_void {
+        (match self {
+            Q::Main => 1usize,
+            Q::Moe => 2,
+            Q::Fetch => 3,
+        }) as *mut std::ffi::c_void
+    }
+
+    /// Parse a launcher's stream argument. Total: every input either names a queue or
+    /// errors. NULL is `Main` — see the type's note.
+    pub fn parse(raw: *mut std::ffi::c_void) -> Result<Self> {
+        match raw as usize {
+            0 | 1 => Ok(Q::Main),
+            2 => Ok(Q::Moe),
+            3 => Ok(Q::Fetch),
+            other => bail!(
+                "stream token {other:#x} is not one of this backend's queue tags; a Vulkan \
+                 launcher was handed a HIP stream handle or an uninitialised pointer"
+            ),
+        }
+    }
+
+    #[inline]
+    fn index(self) -> usize {
+        match self {
+            Q::Main => 0,
+            Q::Moe => 1,
+            Q::Fetch => 2,
+        }
+    }
+}
+
+/// Command buffers per stream. Sized by how many flushes may be in flight before the
+/// oldest must have retired; the fence wait in [`Stream::open`] makes an undersized ring a
+/// STALL rather than a bug (docs/VULKAN.md, "The design, on paper").
+///
+/// **4 was the doc's starting guess and it is too small here, for a reason worth stating.**
+/// The MoE stream flushes once per expert (see `Stream::eager`), so a layer submits
+/// `top_k + 1` ≈ 9 buffers between end-of-layer joins. With RING = 4 the fifth `open` would
+/// block the DECODE THREAD on the first expert's fence — and that thread is the one driving
+/// the async expert stream, so it would stop launching experts whose fetches HAD landed in
+/// order to wait for one that was still computing. A stall on that thread is not a local
+/// cost, it is the overlap. 16 covers the widest batch with slack; the price is 16 command
+/// buffers and 16 fences per stream, which is nothing.
+const RING: usize = 16;
+
+/// One queue, its command-buffer ring, and its timeline. Three of these replace the
+/// single `Cmd` that mirrored HIP's default stream.
+///
+/// # The ring and the second queue are ONE design
+///
+/// With a single command buffer, `Gpu::signal` could only cover work already SUBMITTED:
+/// arming on merely-recorded work means submitting it, and a buffer cannot be reused
+/// while pending. With a ring, [`Stream::flush`] is *end the current buffer, submit it
+/// with a timeline signal, advance to a slot whose fence has retired* — so arming on
+/// recorded work is a flush and the value it returns. No second mechanism.
+struct Stream {
     /// The queue lives HERE, not on `Gpu`, and that placement is load-bearing.
     ///
     /// `vkQueueSubmit` requires the VkQueue to be externally synchronised. When the
@@ -152,27 +247,79 @@ struct Cmd {
     /// guard" was a convention — and `Gpu::signal` broke it within a day of the rule
     /// being written down, while carrying a SAFETY comment citing the very invariant it
     /// violated. Inside the guard, submitting without the lock is a borrow error rather
-    /// than something a reader has to notice.
+    /// than something a reader has to notice. Three streams means three such guards,
+    /// and — the whole point — the fetch stream never blocks on the compute lock.
     queue: vk::Queue,
+    /// Owns `ring`'s buffers. Never read after construction — `Stream::new`'s own error
+    /// path destroys it and `Gpu` is deliberately never dropped (see `gpu()`) — but kept
+    /// because the field is where a reader looks to find out what the ring belongs to, and
+    /// because any future teardown needs it.
+    #[allow(dead_code)]
     pool: vk::CommandPool,
-    buf: vk::CommandBuffer,
-    fence: vk::Fence,
-    recording: bool,
+    ring: [vk::CommandBuffer; RING],
+    /// `done[i]` retires slot `i`.
+    done: [vk::Fence; RING],
+    /// Was slot `i` submitted and not yet joined? A fence may only be waited on if some
+    /// submit will signal it, so this is what stops `advance`/`join` waiting forever on
+    /// a fence nothing will ever touch.
+    pending: [bool; RING],
     /// Buffers a launcher had to allocate to carry data the push constant cannot hold —
-    /// today only `rope`'s host-computed trig table. They must outlive RECORDING (a
-    /// dispatch reads them) but not the sync, so they are dropped after the fence.
+    /// today only `rope`'s host-computed trig table. They must outlive the EXECUTION of
+    /// the slot they were recorded into, so they hang off that slot rather than off the
+    /// stream, and are released when its fence retires.
+    scratch: [Vec<Buf>; RING],
+    /// Retired scratch, staged for dropping OUTSIDE the mutex. `Buf::drop` calls
+    /// `Gpu::sync`, which takes this same non-reentrant lock, so freeing under the guard
+    /// deadlocks. [`Gpu::with_stream`] drains this after releasing the lock, which is
+    /// the one place that discipline has to live.
+    spent: Vec<Buf>,
+    /// The slot currently open for recording (or the next one to open).
+    head: usize,
+    recording: bool,
+    /// Submit each recorded batch IMMEDIATELY, rather than leaving it open until something
+    /// joins or arms.
     ///
-    /// Dropped OUTSIDE the mutex, in `sync`: `Buf::drop` calls `Gpu::sync`, which takes
-    /// this same non-reentrant lock. Freeing them while holding it deadlocks.
-    scratch: Vec<Buf>,
-    /// Set by any failure in [`Gpu::sync`]. Each of its fallible calls leaves the
-    /// buffer in a DIFFERENT illegal state — invalid after a failed `end`, executable
-    /// after a failed submit, *pending* after a failed fence wait — and the pool has
-    /// no `RESET_COMMAND_BUFFER` bit, so `vkBeginCommandBuffer` is only legal from the
-    /// initial state. Since `device_sync` returns a `Result` the engine can observe
-    /// the error and carry on, which would put every later submit into undefined
-    /// behaviour, silently, with no validation layer to say so. So the failure is
-    /// STICKY: once poisoned, nothing is recorded or submitted again.
+    /// This is the difference between HIP's streams and this backend's, and getting it
+    /// wrong silently costs the whole overlap. Under HIP every launch IS a submit, so an
+    /// expert's partial starts on the GPU the moment its fetch signal resolves. Recording
+    /// lazily instead — which is what a single always-open command buffer does, and what
+    /// increment 1 did — means NOTHING runs until the batch is flushed at the end of the
+    /// MoE phase: the GPU idles through every fetch, then computes. Fetch and compute are
+    /// still serialised, just in the other order, and the token-ID gate still passes.
+    ///
+    /// So the two streams a host await sits on — MoE and fetch — are EAGER. The main stream
+    /// stays lazy, because nothing awaits it mid-token except `device_sync`, and batching a
+    /// whole forward pass into one submit is worth real time on RADV (colibri measured
+    /// submit cost as the thing that matters).
+    ///
+    /// Eager flushing is only safe because of the barrier at the head of every buffer: a
+    /// `vkCmdPipelineBarrier`'s first synchronisation scope covers all commands EARLIER IN
+    /// SUBMISSION ORDER — across submits, not just within one buffer — so splitting a
+    /// recorded sequence into several submits does not weaken the "each kernel sees the
+    /// previous one's writes" promise. Without that barrier, separate batches on one queue
+    /// may execute concurrently and the MoE reduce could read partials mid-write.
+    eager: bool,
+    /// A TIMELINE PER STREAM, not one shared. A timeline may only be signalled with
+    /// strictly increasing values, so one shared semaphore would force a global order
+    /// across the queues — reintroducing exactly the serialisation the split removes,
+    /// and making value allocation a cross-queue critical section. Per-stream, values
+    /// are trivially monotonic under this stream's own lock.
+    ///
+    /// The same handle is also held by [`Timeline::sems`] so the waiter thread can wait
+    /// on it WITHOUT taking this lock (semaphores are internally synchronised for wait
+    /// and query; only submits need the guard). Both copies are made once, in `Gpu::new`.
+    timeline: vk::Semaphore,
+    /// Last value submitted on `timeline`. A plain `u64`, not an atomic: it is only ever
+    /// read or written under this mutex, and an atomic here would suggest — falsely —
+    /// that allocating a value outside the lock is safe. It is not; see the field above.
+    next: u64,
+    /// Set by any failure in [`Stream::flush`] or [`Stream::join`]. Each fallible call
+    /// leaves the ring in a DIFFERENT illegal state — invalid after a failed `end`,
+    /// executable after a failed submit, *pending* after a failed fence wait — and since
+    /// `device_sync` returns a `Result` the engine can observe the error and carry on,
+    /// which would put every later submit into undefined behaviour, silently, with no
+    /// validation layer to say so. So the failure is STICKY: once poisoned, this stream
+    /// records and submits nothing again.
     poisoned: bool,
 }
 
@@ -215,10 +362,16 @@ struct Pipes {
 // ones are `u64` and already fine.
 //
 // The invariant is ENFORCED, not asserted. Everything Vulkan requires to be externally
-// synchronised — the queue, the command pool, the command buffer — is a field of the
-// private `Cmd` struct behind `self.cmd`, so reaching any of them requires the mutex
-// guard and there is no discipline to remember. `device` is public, but `VkDevice` is
-// internally synchronised.
+// synchronised — each queue, its command pool, its command buffers — is a field of the
+// private `Stream` struct behind one of `self.streams`, so reaching any of them requires
+// that stream's mutex guard and there is no discipline to remember. `device` is public,
+// but `VkDevice` is internally synchronised. Per-queue is exactly the granularity the
+// spec asks for: `vkQueueSubmit` is externally synchronised PER QUEUE, so three queues
+// behind three mutexes is three independent submitters, which is the point.
+//
+// The one thing this shape must never grow is two mutexes in front of one queue. On a
+// device whose compute family offers fewer than three queues, `Gpu::route` therefore
+// ALIASES several `Q`s onto one `Stream` rather than handing the same `vk::Queue` to two.
 //
 // This comment used to describe a convention instead, and `Gpu::signal` violated it
 // while citing it. If a future change moves a synchronised handle back out of `Cmd`,
@@ -293,17 +446,66 @@ impl Gpu {
         }
 
         let (phys, qfam) = Self::pick(&instance)?;
-        // NOTE: the queue handle is deliberately NOT fetched here. It belongs to `Cmd`,
-        // behind the mutex, so that submitting without the guard cannot compile.
+        // NOTE: the queue handles are deliberately NOT fetched here. Each belongs to a
+        // `Stream`, behind that stream's mutex, so that submitting without the guard
+        // cannot compile.
+        //
+        // How many queues the chosen family actually has decides how many of the three
+        // logical streams get one of their own. Measured on this device: family 1 is
+        // COMPUTE|TRANSFER|SPARSE with FOUR queues, so all three are independent and
+        // there are no queue-family ownership transfers on any buffer — the single
+        // biggest simplification available, and why using the graphics family would be
+        // a mistake (docs/VULKAN.md).
+        // SAFETY: `phys` came from this instance.
+        let fams = unsafe { instance.get_physical_device_queue_family_properties(phys) };
+        let fam = fams
+            .get(qfam as usize)
+            .ok_or_else(|| anyhow!("queue family {qfam} vanished between pick and create"))?;
+        let nq = (fam.queue_count as usize).clamp(1, Q::COUNT);
+        let ts_bits = fam.timestamp_valid_bits;
         // Live free-memory reporting; see `mem_info`. Optional because the fallback
         // (free == total) is merely useless, not wrong.
         let budget = Self::has_device_extension(&instance, phys, ash::ext::memory_budget::NAME);
-        let device = Self::create_device(&instance, phys, qfam, budget)?;
+        let device = Self::create_device(&instance, phys, qfam, nq, budget)?;
         // SAFETY: `phys` is a live physical device from this instance.
         let memprops = unsafe { instance.get_physical_device_memory_properties(phys) };
-        let cmd = Cmd::new(&device, qfam)?;
+        // SAFETY: as above.
+        let props = unsafe { instance.get_physical_device_properties(phys) };
+        let ts_period_ns = props.limits.timestamp_period;
+        if ts_bits == 0 {
+            warn!(
+                "queue family {qfam} implements 0 timestampValidBits: GPU timing spans are \
+                 UNAVAILABLE on this device and Event::elapsed_ms will refuse rather than \
+                 return zero (docs/VULKAN.md, the increment-1 note on why 0.0 was worse)"
+            );
+        }
+        let timeline = Timeline::new(&device, nq)?;
+        // One stream per available queue, in `Q` order; `route` maps the three logical
+        // streams onto them. `nq == 3` is the identity mapping and the only configuration
+        // that upholds the overlap invariant — anything less is reported, loudly, because
+        // a silently serialised backend is exactly what increment 1 shipped.
+        // Stream 0 is `Q::Main` and is the lazy one; see `Stream::eager`. When the family
+        // gave us fewer than three queues the aliased `Q`s land on stream 0 and inherit its
+        // laziness — correct, because `arm_on` flushes what it must, and the degradation is
+        // warned about below rather than hidden.
+        let streams = (0..nq)
+            .map(|i| {
+                Stream::new(&device, qfam, i as u32, timeline.sems[i], i > 0).map(Mutex::new)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let route = std::array::from_fn(|q| q.min(nq - 1));
+        if nq < Q::COUNT {
+            warn!(
+                "compute family {qfam} exposes only {} queue(s) of the 3 this backend wants: \
+                 {} share a queue, so fetch will NOT overlap compute and moe/tok will be \
+                 roughly the serialised sum (docs/VULKAN.md, \"Phase 4 needs two queues\")",
+                nq,
+                if nq == 1 { "all three streams" } else { "MoE and fetch" }
+            );
+        } else {
+            info!("vk: 3 compute queues from family {qfam}, one Stream each");
+        }
         let pipes = Pipes::new(&device)?;
-        let timeline = Timeline::new(&device)?;
 
         Ok(Self {
             device,
@@ -311,11 +513,14 @@ impl Gpu {
             instance,
             phys,
             _entry: entry,
-            cmd: Mutex::new(cmd),
+            streams,
+            route,
             pipes,
             validation,
             budget,
             timeline,
+            ts_period_ns,
+            ts_bits,
             waiter: AtomicBool::new(false),
         })
     }
@@ -579,16 +784,21 @@ impl Gpu {
             .is_ok_and(|xs| xs.iter().any(|x| x.extension_name_as_c_str() == Ok(name)))
     }
 
+    /// `nq` queues from `qfam` — three when the family has them, which is the whole of
+    /// the "second queue needs no new family-selection logic" claim: same family, same
+    /// selection, one more priority in the list. Same family also means NO queue-family
+    /// ownership transfers on any buffer, ever.
     fn create_device(
         instance: &ash::Instance,
         phys: vk::PhysicalDevice,
         qfam: u32,
+        nq: usize,
         budget: bool,
     ) -> Result<ash::Device> {
-        let prio = [1.0f32];
+        let prio = [1.0f32; Q::COUNT];
         let qci = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(qfam)
-            .queue_priorities(&prio)];
+            .queue_priorities(&prio[..nq])];
         let mut v11 = vk::PhysicalDeviceVulkan11Features::default().storage_buffer16_bit_access(true);
         let mut v12 = vk::PhysicalDeviceVulkan12Features::default()
             .buffer_device_address(true)
@@ -661,33 +871,260 @@ impl Gpu {
 }
 
 // ---------------------------------------------------------------------------
-// Command recording — HIP default-stream semantics over one command buffer.
+// Command recording — three queues, a command-buffer ring on each.
 // ---------------------------------------------------------------------------
 
-impl Cmd {
-    fn new(device: &ash::Device, qfam: u32) -> Result<Self> {
-        let pci = vk::CommandPoolCreateInfo::default().queue_family_index(qfam);
+/// The memory barrier both ends of a command buffer carry. Wide on purpose: a compute
+/// backend records dispatches AND copies, so all four orderings occur (dispatch→dispatch,
+/// dispatch→copy, copy→dispatch, copy→copy) and scoping to COMPUTE alone would leave the
+/// two involving a copy unordered.
+fn full_barrier() -> vk::MemoryBarrier<'static> {
+    vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(
+            vk::AccessFlags::SHADER_READ
+                | vk::AccessFlags::SHADER_WRITE
+                | vk::AccessFlags::TRANSFER_READ
+                | vk::AccessFlags::TRANSFER_WRITE,
+        )
+}
+
+/// The stages that barrier spans on both sides.
+const BOTH_STAGES: vk::PipelineStageFlags = vk::PipelineStageFlags::from_raw(
+    vk::PipelineStageFlags::COMPUTE_SHADER.as_raw() | vk::PipelineStageFlags::TRANSFER.as_raw(),
+);
+
+impl Stream {
+    fn new(
+        device: &ash::Device,
+        qfam: u32,
+        qidx: u32,
+        timeline: vk::Semaphore,
+        eager: bool,
+    ) -> Result<Self> {
+        // RESET_COMMAND_BUFFER, which the single-buffer design deliberately did without.
+        // A ring needs per-slot reuse, and with this bit `vkBeginCommandBuffer` may be
+        // called on a slot in the executable or invalid state (it resets implicitly);
+        // without it, only from the initial state, which a ring can never guarantee
+        // without resetting the whole pool and so every other slot with it.
+        let pci = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(qfam)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         // SAFETY: `device` is live; `pci` outlives the call.
         let pool = unsafe { device.create_command_pool(&pci, None) }?;
         let ai = vk::CommandBufferAllocateInfo::default()
             .command_pool(pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        // SAFETY: as above; exactly one buffer is requested, so index 0 exists.
-        let buf = unsafe { device.allocate_command_buffers(&ai) }?[0];
-        // SAFETY: as above.
-        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }?;
-        // SAFETY: `qfam` came from the queue-create-info; index 0 exists.
-        let queue = unsafe { device.get_device_queue(qfam, 0) };
+            .command_buffer_count(RING as u32);
+        // SAFETY: as above; exactly RING buffers are requested.
+        let bufs = unsafe { device.allocate_command_buffers(&ai) }?;
+        let ring: [vk::CommandBuffer; RING] = bufs
+            .try_into()
+            .map_err(|_| anyhow!("vkAllocateCommandBuffers returned the wrong count"))?;
+        // Fences are created UNSIGNALLED and `pending` starts all-false, so the two
+        // agree: nothing may be waited on until a submit signals it.
+        let mut done = [vk::Fence::null(); RING];
+        for (i, f) in done.iter_mut().enumerate() {
+            // SAFETY: `device` is live.
+            match unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) } {
+                Ok(h) => *f = h,
+                Err(e) => {
+                    // Undo the fences already created, then the pool. Init failure is
+                    // reported to the caller, and `Gpu` has no Drop to clean up after us.
+                    // SAFETY: every handle below was created by this function and is
+                    // released exactly once; `done[..i]` are the live ones.
+                    unsafe {
+                        for g in &done[..i] {
+                            device.destroy_fence(*g, None);
+                        }
+                        device.destroy_command_pool(pool, None);
+                    }
+                    return Err(e.into());
+                }
+            }
+        }
+        // SAFETY: `qfam`/`qidx` came from the device-queue-create-info above.
+        let queue = unsafe { device.get_device_queue(qfam, qidx) };
         Ok(Self {
             queue,
             pool,
-            buf,
-            fence,
+            ring,
+            done,
+            pending: [false; RING],
+            scratch: std::array::from_fn(|_| Vec::new()),
+            spent: Vec::new(),
+            head: 0,
             recording: false,
+            eager,
+            timeline,
+            next: 0,
             poisoned: false,
-            scratch: Vec::new(),
         })
+    }
+
+    /// The open command buffer, opening one if needed.
+    ///
+    /// Opening records the ACQUIRE half of this backend's cross-queue story, and that is
+    /// the one barrier a reader is most likely to think redundant. It is not: a pipeline
+    /// barrier's SOURCE scope covers only earlier commands on THIS queue, but its
+    /// visibility operation acts on every write already AVAILABLE in the device domain —
+    /// and a fence or timeline signal on another queue is what made the fetch queue's
+    /// copies available. So this is what turns "the copy has retired" (which the host
+    /// learned by awaiting a `Signal`) into "the dispatch about to be recorded can see
+    /// it". Execution order across the queues is the host's await, not this barrier;
+    /// visibility is this barrier, not the await. Both halves are needed and neither
+    /// implies the other. Synchronisation validation on this stack cannot see any of it
+    /// (it covers transfer↔transfer only), so this comment is the defence.
+    fn open(&mut self, d: &ash::Device) -> Result<vk::CommandBuffer> {
+        let cb = self.ring[self.head];
+        if self.recording {
+            return Ok(cb);
+        }
+        // The slot must not be pending — `vkBeginCommandBuffer` on a pending buffer is
+        // undefined. `advance` normally retires it; this covers the first use of a slot
+        // and any path that left one behind.
+        self.reclaim(d, self.head)?;
+        let bi = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        // SAFETY: the slot is not pending (reclaimed above); the pool carries
+        // RESET_COMMAND_BUFFER so beginning from the executable/invalid state is legal.
+        unsafe {
+            d.begin_command_buffer(cb, &bi)?;
+            let bar = [full_barrier()];
+            d.cmd_pipeline_barrier(
+                cb,
+                BOTH_STAGES,
+                BOTH_STAGES,
+                vk::DependencyFlags::empty(),
+                &bar,
+                &[],
+                &[],
+            );
+        }
+        self.recording = true;
+        Ok(cb)
+    }
+
+    /// End the open buffer, submit it with a timeline signal and a fence, and advance to
+    /// the next slot. Returns the timeline value this submit will signal.
+    ///
+    /// This is the whole of what the ring bought: a caller that needs a completion signal
+    /// for work it has merely RECORDED calls this and hands the value back. There is no
+    /// second mechanism, and `Gpu::signal`'s old submitted-vs-recorded gap is closed by
+    /// construction rather than documented around.
+    fn flush(&mut self, d: &ash::Device) -> Result<u64> {
+        debug_assert!(self.recording, "flush with nothing recorded");
+        let slot = self.head;
+        let cb = self.ring[slot];
+        // Poison FIRST, clear on the success path only: each `?` below leaves the slot in
+        // a different illegal state and getting that right per-error-code is more
+        // expensive and less safe than opting out of the analysis.
+        self.poisoned = true;
+        let value = self.next + 1;
+        let sems = [self.timeline];
+        let values = [value];
+        let bufs = [cb];
+        let mut ts = vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&values);
+        let si = [vk::SubmitInfo::default()
+            .command_buffers(&bufs)
+            .signal_semaphores(&sems)
+            .push_next(&mut ts)];
+        // SAFETY: recording is open on `cb`; `done[slot]` is unsignalled (reclaim resets
+        // it before the slot is reused); this queue is externally synchronised by the
+        // mutex we are inside (see the `queue` field).
+        unsafe {
+            // The RELEASE half, and it is recorded on EVERY flush rather than only in
+            // `sync` as it once was. Making a retired command buffer's writes host-visible
+            // unconditionally is what lets `join` be "wait the fences" instead of "wait
+            // the fences, unless an intervening flush submitted something the host may
+            // read, in which case also...". The earlier asymmetry — `enqueue` widened to
+            // TRANSFER, this barrier not — was a real hole, and one barrier per submit is
+            // not a cost worth reintroducing it for.
+            let bar = [vk::MemoryBarrier::default()
+                .src_access_mask(
+                    vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+                )
+                .dst_access_mask(vk::AccessFlags::HOST_READ)];
+            d.cmd_pipeline_barrier(
+                cb,
+                BOTH_STAGES,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &bar,
+                &[],
+                &[],
+            );
+            d.end_command_buffer(cb)?;
+            self.recording = false;
+            d.queue_submit(self.queue, &si, self.done[slot])?;
+        }
+        self.next = value;
+        self.pending[slot] = true;
+        self.head = (slot + 1) % RING;
+        self.poisoned = false;
+        // The new head is NOT reclaimed here, deliberately. Retiring it eagerly would make
+        // every flush block on the fence of the submit RING-1 ago, which puts a fence wait
+        // on the decode thread's critical path for no reason — `open` reclaims the slot it
+        // is about to use, which is the last moment the wait is actually required.
+        Ok(value)
+    }
+
+    /// Submit nothing but a timeline signal. Covers everything already submitted to this
+    /// queue (submission order is queue order), and needs no ring slot — which is why
+    /// arming on a stream with nothing recorded costs no command buffer.
+    fn signal_only(&mut self, d: &ash::Device) -> Result<u64> {
+        let value = self.next + 1;
+        let sems = [self.timeline];
+        let values = [value];
+        let mut ts = vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&values);
+        let si = [vk::SubmitInfo::default()
+            .signal_semaphores(&sems)
+            .push_next(&mut ts)];
+        // SAFETY: an empty submit that only signals; the queue is externally synchronised
+        // by the mutex we are inside.
+        unsafe { d.queue_submit(self.queue, &si, vk::Fence::null()) }?;
+        self.next = value;
+        Ok(value)
+    }
+
+    /// Wait for `slot`'s fence if it is pending, then reset it and release the buffers the
+    /// slot's dispatches were reading. A no-op on a slot that was never submitted.
+    ///
+    /// The scratch moves to `spent` rather than being dropped here: `Buf::drop` calls
+    /// `Gpu::sync`, which takes this stream's lock, and we are holding it.
+    fn reclaim(&mut self, d: &ash::Device, slot: usize) -> Result<()> {
+        if !self.pending[slot] {
+            return Ok(());
+        }
+        self.poisoned = true;
+        // SAFETY: `done[slot]` was signalled-or-will-be by the submit that set `pending`.
+        unsafe {
+            d.wait_for_fences(&[self.done[slot]], true, u64::MAX)?;
+            d.reset_fences(&[self.done[slot]])?;
+        }
+        self.pending[slot] = false;
+        let mut freed = std::mem::take(&mut self.scratch[slot]);
+        self.spent.append(&mut freed);
+        self.poisoned = false;
+        Ok(())
+    }
+
+    /// Flush anything recorded and block until this queue is idle — the per-stream half
+    /// of [`Gpu::sync`].
+    fn join(&mut self, d: &ash::Device) -> Result<()> {
+        ensure!(
+            !self.poisoned,
+            "vk stream poisoned by an earlier submit or fence failure"
+        );
+        if self.recording {
+            self.flush(d)?;
+        }
+        // In-order queue, so waiting for every pending fence is the same as waiting for
+        // the newest — but reclaiming each is what returns its slot and its scratch.
+        for slot in 0..RING {
+            self.reclaim(d, slot)?;
+        }
+        Ok(())
     }
 }
 
@@ -701,54 +1138,82 @@ impl Gpu {
     /// No current caller does (they capture `Copy` handles and borrowed slices), and
     /// nothing enforces it, so the rule lives here where the next launcher is written.
     fn enqueue(&self, f: impl FnOnce(&ash::Device, vk::CommandBuffer)) -> Result<()> {
-        let mut cmd = self.cmd.lock().map_err(|_| anyhow!("vk command lock poisoned"))?;
-        ensure!(
-            !cmd.poisoned,
-            "vk command buffer poisoned by an earlier device_sync failure"
-        );
-        if !cmd.recording {
-            let bi = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            // SAFETY: the buffer is not pending — the previous submit was fence-waited
-            // and the pool reset in `sync`.
-            unsafe { self.device.begin_command_buffer(cmd.buf, &bi) }?;
-            cmd.recording = true;
-        }
-        f(&self.device, cmd.buf);
-        // COMPUTE **and** TRANSFER on both sides. Dispatches are not the only thing
-        // recorded here — `memcpy_dtod` records a `vkCmdCopyBuffer`, so all four
-        // orderings occur: dispatch→dispatch, dispatch→copy (compaction reading a slot
-        // a kernel just wrote), copy→dispatch, copy→copy. Scoping only COMPUTE would
-        // leave the two involving a copy unordered.
-        //
-        // NOT verified by a checker, unlike everything else load-bearing here. See
-        // docs/VULKAN.md "Synchronisation validation does not cover compute→transfer":
-        // the layer reports transfer↔transfer hazards but stays silent on this class
-        // even with NO barrier at all, so a clean run says nothing either way. This is
-        // spec-derived, and it is the weakest evidence in the backend.
-        let bar = [vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(
-                vk::AccessFlags::SHADER_READ
-                    | vk::AccessFlags::SHADER_WRITE
-                    | vk::AccessFlags::TRANSFER_READ
-                    | vk::AccessFlags::TRANSFER_WRITE,
-            )];
-        let stages =
-            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER;
-        // SAFETY: recording is open on `cmd.buf`.
-        unsafe {
-            self.device.cmd_pipeline_barrier(
-                cmd.buf,
-                stages,
-                stages,
-                vk::DependencyFlags::empty(),
-                &bar,
-                &[],
-                &[],
+        self.enqueue_on(Q::Main, f)
+    }
+
+    /// The stream a [`Q`] resolves to. Never indexes out of range: `route` is built from
+    /// `streams.len()` in `Gpu::new`.
+    fn stream(&self, q: Q) -> &Mutex<Stream> {
+        &self.streams[self.route[q.index()]]
+    }
+
+    /// Run `f` with stream `q` locked, then release the buffers its ring retired — AFTER
+    /// the guard is dropped, because `Buf::drop` calls `Gpu::sync` and would deadlock on
+    /// the lock we were holding. Every path that touches a stream goes through here, so
+    /// that rule is stated and enforced in one place instead of remembered in six.
+    fn with_stream<R>(&self, q: Q, f: impl FnOnce(&ash::Device, &mut Stream) -> Result<R>) -> Result<R> {
+        let m = self.stream(q);
+        let mut s = m.lock().map_err(|_| anyhow!("vk stream lock poisoned"))?;
+        let r = f(&self.device, &mut s);
+        let spent = std::mem::take(&mut s.spent);
+        drop(s);
+        drop(spent);
+        r
+    }
+
+    /// Append work to `q`'s open command buffer, opening one if needed, then serialise it
+    /// against whatever comes next ON THAT QUEUE. The barrier is what makes a `launch_*`
+    /// sequence behave like HIP's default stream — each kernel sees the previous one's
+    /// writes. It orders WITHIN a queue only; ordering ACROSS queues is a semaphore's job,
+    /// and this backend gets it from the host awaiting a [`Signal`] plus the acquire
+    /// barrier in [`Stream::open`] — see that function.
+    ///
+    /// `f` MUST NOT own, or transitively own, a [`Buf`]. It runs with a stream mutex held,
+    /// and `Buf::drop` calls `Gpu::sync`, which takes every stream mutex — so a closure
+    /// that drops a `Buf` deadlocks with no compile-time signal. No current caller does
+    /// (they capture `Copy` handles and borrowed slices), and nothing enforces it, so the
+    /// rule lives here where the next launcher is written.
+    fn enqueue_on(&self, q: Q, f: impl FnOnce(&ash::Device, vk::CommandBuffer)) -> Result<()> {
+        self.with_stream(q, |d, s| {
+            ensure!(
+                !s.poisoned,
+                "vk stream poisoned by an earlier submit or fence failure"
             );
-        }
-        Ok(())
+            let cb = s.open(d)?;
+            f(d, cb);
+            // COMPUTE **and** TRANSFER on both sides. Dispatches are not the only thing
+            // recorded here — `memcpy_dtod` records a `vkCmdCopyBuffer` and the fetch
+            // queue records nothing else, so all four orderings occur: dispatch→dispatch,
+            // dispatch→copy (compaction reading a slot a kernel just wrote), copy→dispatch,
+            // copy→copy. Scoping only COMPUTE would leave the two involving a copy
+            // unordered.
+            //
+            // NOT verified by a checker, unlike everything else load-bearing here. See
+            // docs/VULKAN.md "Synchronisation validation does not cover compute→transfer":
+            // the layer reports transfer↔transfer hazards but stays silent on this class
+            // even with NO barrier at all, so a clean run says nothing either way. This is
+            // spec-derived, and it is the weakest evidence in the backend.
+            let bar = [full_barrier()];
+            // SAFETY: recording is open on `cb`.
+            unsafe {
+                d.cmd_pipeline_barrier(
+                    cb,
+                    BOTH_STAGES,
+                    BOTH_STAGES,
+                    vk::DependencyFlags::empty(),
+                    &bar,
+                    &[],
+                    &[],
+                );
+            }
+            // Submit now on the streams a host await sits on — see `Stream::eager` for why
+            // this is the difference between overlapping and merely computing the same
+            // numbers in a different order.
+            if s.eager {
+                s.flush(d)?;
+            }
+            Ok(())
+        })
     }
 
     /// Bind, push the constants, dispatch. `push` must be the `#[repr(C)]` mirror of
@@ -756,7 +1221,13 @@ impl Gpu {
     /// so each launcher declares its struct next to the launch that uses it.
     /// One-dimensional grid — every kernel here but the attention sweep.
     fn dispatch<T>(&self, p: &Pipe, push: &T, groups_x: u32) -> Result<()> {
-        self.dispatch_2d(p, push, groups_x, 1)
+        self.dispatch_2d_on(Q::Main, p, push, groups_x, 1)
+    }
+
+    /// As [`Gpu::dispatch`], on a named queue — the MoE expert kernels, which `gpu.rs`
+    /// launches on its compute stream.
+    fn dispatch_on<T>(&self, q: Q, p: &Pipe, push: &T, groups_x: u32) -> Result<()> {
+        self.dispatch_2d_on(q, p, push, groups_x, 1)
     }
 
     /// Two-dimensional grid. `mla_latent_attend` needs it: `x` is the head-block and `y`
@@ -764,6 +1235,17 @@ impl Gpu {
     /// `gl_WorkGroupID.y` to find its row range, so collapsing this into one dimension
     /// would silently give every workgroup split 0.
     fn dispatch_2d<T>(&self, p: &Pipe, push: &T, groups_x: u32, groups_y: u32) -> Result<()> {
+        self.dispatch_2d_on(Q::Main, p, push, groups_x, groups_y)
+    }
+
+    fn dispatch_2d_on<T>(
+        &self,
+        q: Q,
+        p: &Pipe,
+        push: &T,
+        groups_x: u32,
+        groups_y: u32,
+    ) -> Result<()> {
         // The push struct and the pipeline layout are declared in different places and
         // nothing else compares them. `T` must also have NO PADDING — reading padding
         // bytes as `u8` is UB, and a `u64` after an `i32` silently introduces four.
@@ -778,7 +1260,7 @@ impl Gpu {
         // initialised and reading it as its own bytes is sound.
         let bytes =
             unsafe { std::slice::from_raw_parts((push as *const T).cast::<u8>(), size_of::<T>()) };
-        self.enqueue(|d, cb| {
+        self.enqueue_on(q, |d, cb| {
             // SAFETY: recording is open on `cb`; `p` was built against this device and
             // its layout declares exactly `size_of::<T>()` push-constant bytes.
             unsafe {
@@ -789,75 +1271,54 @@ impl Gpu {
         })
     }
 
-    /// Submit whatever is recorded and block until it retires — one join per token,
-    /// same contract as `hip::device_sync`. A no-op when nothing was launched.
+    /// Submit whatever is recorded on ALL THREE streams and block until every queue is
+    /// idle — one join per token, same contract as `hip::device_sync` (which likewise
+    /// joins every stream, not just the default one). A no-op per stream that has nothing
+    /// recorded and nothing pending.
+    ///
+    /// FIXED ORDER — main, MoE, fetch — so the join itself cannot become a source of
+    /// nondeterminism. It costs three fence waits instead of one, once per token.
+    ///
+    /// Every stream is joined even after one fails, and the FIRST error is the one
+    /// returned: bailing early would leave the later streams' slots pending and their
+    /// scratch unreleased, so a single transient failure would strand buffers for the life
+    /// of the process.
     pub fn sync(&self) -> Result<()> {
-        let mut cmd = self.cmd.lock().map_err(|_| anyhow!("vk command lock poisoned"))?;
-        ensure!(
-            !cmd.poisoned,
-            "vk command buffer poisoned by an earlier device_sync failure"
-        );
-        if !cmd.recording {
-            return Ok(());
+        let mut spent: Vec<Buf> = Vec::new();
+        let mut first: Option<anyhow::Error> = None;
+        for m in &self.streams {
+            match m.lock() {
+                Ok(mut s) => {
+                    let r = s.join(&self.device);
+                    spent.append(&mut s.spent);
+                    drop(s);
+                    if let Err(e) = r {
+                        first.get_or_insert(e);
+                    }
+                }
+                Err(_) => {
+                    first.get_or_insert_with(|| anyhow!("vk stream lock poisoned"));
+                }
+            }
         }
-        // Poison FIRST, clear only on the success path: every early return below
-        // leaves the buffer in a state `vkBeginCommandBuffer` may not be called from,
-        // and there are four of them. Opting out of the analysis is cheaper and safer
-        // than getting it right per-error-code.
-        cmd.poisoned = true;
-        // Make the kernels' writes available to the HOST domain, so a readback after
-        // the fence is defined without a per-buffer invalidate. Host WRITES need no
-        // matching barrier — vkQueueSubmit implies one for anything written before it.
-        // TRANSFER as well as COMPUTE on the source side. `memcpy_dtod` records a
-        // vkCmdCopyBuffer, so bytes reaching the host may have been written by the
-        // copy rather than by a shader — as in `memcpy_dtod_after_dispatch_is_ordered`,
-        // which reads back exactly such bytes. `Gpu::enqueue` was widened for this and
-        // this barrier was not, which made the two internally inconsistent: either the
-        // host barrier is load-bearing and had a hole, or it is redundant and
-        // enqueue's premise is wrong. It is the former.
-        let bar = [vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::HOST_READ)];
-        let bufs = [cmd.buf];
-        let si = [vk::SubmitInfo::default().command_buffers(&bufs)];
-        // SAFETY: recording is open; the fence is unsignalled (reset below on every
-        // path that signals it); nothing else touches this queue (see the Sync impl).
-        unsafe {
-            self.device.cmd_pipeline_barrier(
-                cmd.buf,
-                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::HOST,
-                vk::DependencyFlags::empty(),
-                &bar,
-                &[],
-                &[],
-            );
-            self.device.end_command_buffer(cmd.buf)?;
-            cmd.recording = false;
-            self.device.queue_submit(cmd.queue, &si, cmd.fence)?;
-            self.device.wait_for_fences(&[cmd.fence], true, u64::MAX)?;
-            self.device.reset_fences(&[cmd.fence])?;
-            self.device
-                .reset_command_pool(cmd.pool, vk::CommandPoolResetFlags::empty())?;
-        }
-        cmd.poisoned = false; // every step succeeded; the buffer is initial again
-        // Take the scratch out under the lock, drop it after releasing — see the field's
-        // note. The work that read these buffers has retired at the fence above.
-        let spent = std::mem::take(&mut cmd.scratch);
-        drop(cmd);
+        // Dropped with no stream lock held — `Buf::drop` calls back into this function.
         drop(spent);
-        Ok(())
+        match first {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Stage `bytes` in a device buffer and return it WITH its device address, for data
     /// a launcher must hand a shader that does not fit the 128-byte push-constant budget.
     ///
-    /// RETURNS the `Buf` rather than pushing it straight onto `Cmd::scratch`, and that is
-    /// a lifetime requirement, not a style choice. Pushing here published the buffer for
-    /// reclamation while the dispatch that reads it was NOT YET RECORDED: `stage` took
-    /// the `cmd` lock and released it, then `dispatch` re-acquired it. A `Gpu::sync` in
-    /// that window takes the whole scratch list with `mem::take` and drops it after the
-    /// fence, so the dispatch would bake a FREED device address into its push constant.
+    /// RETURNS the `Buf` rather than pushing it straight onto the stream's scratch, and
+    /// that is a lifetime requirement, not a style choice. Pushing here published the
+    /// buffer for reclamation while the dispatch that reads it was NOT YET RECORDED:
+    /// `stage` took the stream lock and released it, then `dispatch` re-acquired it. A
+    /// `Gpu::sync` in that window takes the whole scratch list with `mem::take` and drops
+    /// it after the fence, so the dispatch would bake a FREED device address into its
+    /// push constant.
     ///
     /// The trigger is not only an explicit `device_sync`: `Buf::drop` calls `Gpu::sync`
     /// itself, so any `Buf` dropping on another thread does it, and `Gpu` is
@@ -871,41 +1332,48 @@ impl Gpu {
     /// it to [`Gpu::retain`] afterwards. It is alive for the whole window, and if the
     /// caller bails between the two, `Buf::drop` flushes before freeing, which is exactly
     /// what that drop impl exists for.
-    fn stage(&self, bytes: &[u8]) -> Result<(Buf, u64)> {
-        // Refuse BEFORE allocating, on a poisoned context. `sync`'s poison `ensure!`
-        // returns ABOVE its `mem::take(&mut cmd.scratch)`, so once poisoned the scratch
-        // list has no drain site left — and `Gpu` lives in a `OnceLock` that is never
-        // dropped, so `Cmd` never drops either. Without this check each post-poison
-        // launcher call still allocates a `Buf` (VkBuffer + VkDeviceMemory + a permanent
-        // map), still pushes it, and still returns Ok, failing only later at `enqueue`.
-        // The caller sees a sensible error every time and nothing signals that the retry
-        // loop is burning device handles until `maxMemoryAllocationCount` (commonly 4096)
-        // runs out and UNRELATED `Buf::new` calls start failing with OOM — the wrong bug
-        // entirely, and permanent for the process.
+    fn stage(&self, q: Q, bytes: &[u8]) -> Result<(Buf, u64)> {
+        // Refuse BEFORE allocating, on a poisoned stream. `join`'s poison `ensure!`
+        // returns ABOVE its reclaim loop, so once poisoned the scratch list has no drain
+        // site left — and `Gpu` lives in a `OnceLock` that is never dropped, so the
+        // `Stream` never drops either. Without this check each post-poison launcher call
+        // still allocates a `Buf` (VkBuffer + VkDeviceMemory + a permanent map), still
+        // pushes it, and still returns Ok, failing only later at `enqueue`. The caller
+        // sees a sensible error every time and nothing signals that the retry loop is
+        // burning device handles until `maxMemoryAllocationCount` (commonly 4096) runs out
+        // and UNRELATED `Buf::new` calls start failing with OOM — the wrong bug entirely,
+        // and permanent for the process.
         //
-        // The guard is here rather than in `sync` because the buffers already on the list
+        // The guard is here rather than in `join` because the buffers already on the list
         // may still be referenced by a submitted-but-unretired command buffer; draining
         // them on the poisoned path would trade a leak for a use-after-free.
-        ensure!(
-            !self
-                .cmd
-                .lock()
-                .map_err(|_| anyhow!("vk command lock poisoned"))?
-                .poisoned,
-            "vk command buffer poisoned by an earlier device_sync failure"
-        );
+        self.with_stream(q, |_, s| {
+            ensure!(
+                !s.poisoned,
+                "vk stream poisoned by an earlier submit or fence failure"
+            );
+            Ok(())
+        })?;
         let mut buf = Buf::new(bytes.len())?;
         buf.write_at(0, bytes)?;
         let addr = buf.ptr() as u64;
         Ok((buf, addr))
     }
 
-    /// Hand a staged buffer over to be freed at the next [`Gpu::sync`]. Call only AFTER
-    /// the dispatch that reads it has been recorded — see [`Gpu::stage`].
-    fn retain(&self, buf: Buf) -> Result<()> {
-        let mut cmd = self.cmd.lock().map_err(|_| anyhow!("vk command lock poisoned"))?;
-        cmd.scratch.push(buf);
-        Ok(())
+    /// Hand a staged buffer over to be freed when the ring slot it was recorded into
+    /// retires. Call only AFTER the dispatch that reads it has been recorded, on the same
+    /// queue — see [`Gpu::stage`].
+    ///
+    /// If a flush slipped in between the dispatch and this call, the buffer lands on the
+    /// NEXT slot's list and so is freed later than strictly necessary. That is the safe
+    /// direction and the only one available: `head` only ever moves forward, so a retained
+    /// buffer can never be attached to a slot that has already retired.
+    fn retain(&self, q: Q, buf: Buf) -> Result<()> {
+        self.with_stream(q, move |_, s| {
+            let slot = s.head;
+            s.scratch[slot].push(buf);
+            Ok(())
+        })
     }
 }
 
@@ -914,6 +1382,145 @@ impl Gpu {
 /// until this returns.
 pub fn device_sync() -> Result<()> {
     gpu()?.sync()
+}
+
+// ---------------------------------------------------------------------------
+// GPU timing — the instrument, not a nicety.
+// ---------------------------------------------------------------------------
+
+/// One point on a queue's GPU timeline — `hipEvent_t`'s twin, over
+/// `VK_QUERY_TYPE_TIMESTAMP`.
+///
+/// # Why this is Phase 4 work and not Phase 5
+///
+/// Increment 1 returned `0.0` from `elapsed_ms` on the reasoning that a plausible-looking
+/// number is worse than a zero. That was right about plausible numbers and wrong about
+/// zero: `compute_gpu_ms` was 0, so `fetch_hidden_pct` reported **0% as an arithmetic
+/// artifact of the stub**, and "0% hidden" reads as a finding rather than as an absent
+/// field. The whole point of Phase 4 is an overlap invariant, and an invariant you cannot
+/// measure is not upheld, it is assumed. So the query pools come with the queues.
+///
+/// The counter is masked to the queue family's `timestampValidBits` before subtracting —
+/// a family may implement fewer than 64, and the top bits then read as garbage. When the
+/// family implements NONE, [`Stamp::elapsed_ms`] refuses: still no plausible number, but
+/// now an error rather than a zero that arithmetic will happily divide.
+///
+/// `timestampComputeAndGraphics` is the device-wide shortcut ("every queue supports
+/// timestamps"); it is deliberately NOT consulted, because the per-family
+/// `timestampValidBits` is the authoritative answer for the family we actually chose and
+/// is correct whether the shortcut is true or false.
+pub struct Stamp {
+    pool: vk::QueryPool,
+    /// Has a timestamp write been RECORDED into this pool? A read of a query that was
+    /// never written returns `NOT_READY` at best and stale bytes at worst, so the pair is
+    /// refused up front instead. Atomic because `record` takes `&self` (mirroring
+    /// `HipEvent::record`, which `gpu.rs` calls through a shared borrow).
+    armed: AtomicBool,
+}
+
+impl Stamp {
+    pub fn new() -> Result<Self> {
+        let g = gpu()?;
+        let ci = vk::QueryPoolCreateInfo::default()
+            .query_type(vk::QueryType::TIMESTAMP)
+            .query_count(1);
+        // SAFETY: the device is live; `ci` outlives the call.
+        let pool = unsafe { g.device.create_query_pool(&ci, None) }?;
+        Ok(Self {
+            pool,
+            armed: AtomicBool::new(false),
+        })
+    }
+
+    /// Record "the GPU has reached this point on queue `q`" — reset then write, in one
+    /// command buffer.
+    ///
+    /// `BOTTOM_OF_PIPE`, on both ends of a span, is what makes the difference a duration:
+    /// it latches after every previously-submitted command on that queue has completed,
+    /// which is `hipEventRecord`'s contract. `TOP_OF_PIPE` would latch as soon as the
+    /// timestamp command itself was reached and quietly understate the span.
+    pub fn record(&self, q: Q) -> Result<()> {
+        let g = gpu()?;
+        let pool = self.pool;
+        g.enqueue_on(q, move |d, cb| {
+            // SAFETY: recording is open on `cb`; the pool holds exactly query 0, and a
+            // reset must precede the write (writing an already-written query without one
+            // is undefined).
+            unsafe {
+                d.cmd_reset_query_pool(cb, pool, 0, 1);
+                d.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, 0);
+            }
+        })?;
+        self.armed.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Milliseconds of GPU time between two stamps ON THE SAME QUEUE.
+    ///
+    /// Call after a [`device_sync`] — the results have to be available, and this
+    /// deliberately does NOT pass `WAIT`: a wait on a query whose command buffer is still
+    /// sitting unsubmitted would hang the decode thread outright, which is a far worse
+    /// failure than the error this returns instead.
+    ///
+    /// Two stamps on DIFFERENT queues are not comparable and this cannot detect it — the
+    /// counters are per-device on this driver but the spec does not promise it. Every
+    /// caller in `gpu.rs` brackets one queue.
+    pub fn elapsed_ms(start: &Stamp, end: &Stamp) -> Result<f32> {
+        let g = gpu()?;
+        ensure!(
+            g.ts_bits > 0,
+            "the chosen queue family implements 0 timestampValidBits, so GPU timing spans \
+             are unavailable on this device — the field is absent, not zero"
+        );
+        ensure!(
+            start.armed.load(Ordering::Acquire) && end.armed.load(Ordering::Acquire),
+            "elapsed_ms on a stamp pair that was never recorded"
+        );
+        let a = start.read()?;
+        let b = end.read()?;
+        // Mask to the bits the family actually implements, then treat b < a as one
+        // wraparound of that counter rather than as a negative duration.
+        let mask = if g.ts_bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << g.ts_bits) - 1
+        };
+        let (a, b) = (a & mask, b & mask);
+        let ticks = if b >= a {
+            b - a
+        } else {
+            (mask - a).wrapping_add(b).wrapping_add(1)
+        };
+        Ok((ticks as f64 * f64::from(g.ts_period_ns) / 1.0e6) as f32)
+    }
+
+    fn read(&self) -> Result<u64> {
+        let g = gpu()?;
+        let mut out = [0u64; 1];
+        // SAFETY: the pool is live and holds query 0; `out` is one u64, matching
+        // TYPE_64 and a stride of 8.
+        unsafe {
+            g.device
+                .get_query_pool_results(self.pool, 0, &mut out, vk::QueryResultFlags::TYPE_64)
+        }
+        .map_err(|e| {
+            anyhow!(
+                "timestamp query unavailable ({e}); elapsed_ms must follow a device_sync \
+                 that submitted the command buffer the stamp was recorded into"
+            )
+        })?;
+        Ok(out[0])
+    }
+}
+
+impl Drop for Stamp {
+    fn drop(&mut self) {
+        let Ok(g) = gpu() else { return };
+        // SAFETY: the pool came from this device and is destroyed once. Every command
+        // buffer that referenced it retired at the `device_sync` its reader required — and
+        // `gpu.rs` holds its stamps for the life of the engine, so this runs at teardown.
+        unsafe { g.device.destroy_query_pool(self.pool, None) };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,15 +1627,40 @@ pub struct Buf {
     len: usize,
 }
 
+// SAFETY: `Buf` is `!Send` only because of the `host` raw pointer, which is a permanent
+// `vkMapMemory` result owned solely by this `Buf`. Moving that ownership to another thread
+// is sound: `VkDevice` is internally synchronised, the map lives until `Drop` (which itself
+// only calls `Gpu::sync`, and `Gpu` is `Send + Sync`), and every host access goes through
+// `&self`/`&mut self` methods, so Rust's own aliasing rules still decide who may touch the
+// mapping. NOT `Sync`, and deliberately: nothing here needs a shared `&Buf` across threads,
+// and `read_into` reading a mapping a kernel may be writing is a contract question rather
+// than one the compiler can settle.
+//
+// Needed by `stream.rs`'s staging-arena registry, which owns the bounce arena's `Buf` in a
+// static while `Streamer` (on the reaper thread) holds its host pointer.
+unsafe impl Send for Buf {}
+
 /// Every live [`Buf`], so a device address can be mapped back to the `VkBuffer` that
 /// owns it.
 ///
 /// This is the lookup table docs/VULKAN.md rejects for the launcher path — and the
 /// reasoning still holds there. It is acceptable HERE because `vkCmdCopyBuffer` takes
-/// handles and offsets and there is no copy-by-address command, and because the only
-/// caller is arena compaction: occasional, already synchronous, already moving whole
-/// expert blocks. A scan of a handful of entries next to a multi-megabyte copy is not
-/// a cost. Do not let it grow a second caller on the decode path.
+/// handles and offsets and there is no copy-by-address command.
+///
+/// # It now has a decode-path caller, and that is a considered reversal
+///
+/// The rule used to be "do not let it grow a second caller on the decode path", written
+/// when the only caller was arena compaction (occasional, synchronous, already moving whole
+/// expert blocks). Phase 4's async staging copy ([`copy_h2d_async`]) breaks it: one lookup
+/// per cold expert, so a few hundred per token. The alternative was threading `VkBuffer`
+/// handles up through `stream.rs`'s `ReadSpec` and `pin.rs`'s pool — into code shared with
+/// the HIP backend, which has no such concept because a HIP device pointer resolves to its
+/// allocation inside the driver. Doing the same resolution here, in the same place, next to
+/// a 20 MB DMA, is the smaller price: a linear scan of a few dozen entries is tens of
+/// nanoseconds against a copy measured in hundreds of microseconds.
+///
+/// What has NOT changed is the rule for the LAUNCHERS: they still pass bare device
+/// addresses and must never consult this.
 static ALLOCS: Mutex<Vec<Alloc>> = Mutex::new(Vec::new());
 
 struct Alloc {
@@ -1067,6 +1699,30 @@ fn lookup<T>(addr: u64, len: usize, f: impl Fn(&Alloc, u64) -> T) -> Result<T> {
 /// The `VkBuffer` owning `[addr, addr+len)`, and the offset into it.
 fn resolve(addr: u64, len: usize) -> Result<(vk::Buffer, u64)> {
     lookup(addr, len, |a, off| (a.buf, off))
+}
+
+/// As [`resolve`], but keyed on the HOST mapping instead of the device address.
+///
+/// The fetch path needs this and cannot use `resolve`: `pin.rs` hands the streamer
+/// `ArenaPool::host_ptr` — the io_uring DMA target — because that is the pointer an
+/// O_DIRECT read and a CPU memcpy both need, and under HIP it is *also* the device address
+/// so one number served both. Here they are unrelated, so a copy expressed in host
+/// pointers has to be translated back. Same bounds and overflow checks, one predicate
+/// apart; deliberately NOT folded into `lookup` with a flag, because the two key spaces
+/// must never be confused and a boolean parameter is exactly how they would be.
+fn resolve_host(host: *const u8, len: usize) -> Result<(vk::Buffer, u64)> {
+    let allocs = ALLOCS.lock().map_err(|_| anyhow!("vk alloc registry poisoned"))?;
+    let base = host as usize;
+    let end = base
+        .checked_add(len)
+        .ok_or_else(|| anyhow!("host address {base:#x} + {len} overflows"))?;
+    allocs
+        .iter()
+        .find(|a| base >= a.host as usize && end <= a.host as usize + a.len as usize)
+        .map(|a| (a.buf, (base - a.host as usize) as u64))
+        .ok_or_else(|| {
+            anyhow!("host address {base:#x}..{end:#x} is not inside any live Buf's mapping")
+        })
 }
 
 /// DIAGNOSTIC: read `len` bytes back from an arbitrary DEVICE ADDRESS into `out`.
@@ -1131,6 +1787,29 @@ impl Buf {
     ///   spurious and must not be filtered out — see `debug_callback`'s note on what does
     ///   and does not get counted.
     pub fn new(len: usize) -> Result<Self> {
+        Self::alloc(len, false)
+    }
+
+    /// A HOST-MEMORY buffer for the io_uring bounce arena: `HOST_VISIBLE | HOST_COHERENT`
+    /// and, where the device offers the choice, **NOT `DEVICE_LOCAL`**.
+    ///
+    /// That exclusion is the whole reason this constructor exists, and it is a correctness
+    /// property rather than a preference. The bounce arena is the destination of an
+    /// O_DIRECT io_uring read, so the kernel has to `get_user_pages` it — which is exactly
+    /// what amdgpu refused for device-local VMM pages (`stream.rs`'s header: EFAULT on
+    /// 6.18.38-and-earlier, the bug bounce mode exists to work around). Allocating the
+    /// bounce arena out of device-local memory would reintroduce that failure on the very
+    /// path built to avoid it. It also keeps the ~40% system-vs-device read tax on the
+    /// GPU's side of the copy rather than the NVMe's.
+    ///
+    /// Falls back to any `HOST_VISIBLE | HOST_COHERENT` type if the device has nothing
+    /// non-device-local, and says so — on a unified-memory part that fallback may be the
+    /// only option, and refusing to run would be worse than a warning.
+    pub fn staging(len: usize) -> Result<Self> {
+        Self::alloc(len, true)
+    }
+
+    fn alloc(len: usize, host_only: bool) -> Result<Self> {
         ensure!(len > 0, "Buf::new(0): Vulkan rejects a zero-sized buffer");
         let g = gpu()?;
         // Allocate word-rounded (see [`WORD`]) but keep `self.len` at the REQUESTED
@@ -1159,7 +1838,7 @@ impl Buf {
         // residency and reports it — so every `?` below must undo what came before.
         // Leaking a VkBuffer per attempt would exhaust handles across a retry while
         // still reporting OOM, which reads as the wrong bug.
-        match Self::finish(g, buf, len) {
+        match Self::finish(g, buf, len, host_only) {
             Ok(b) => Ok(b),
             Err(e) => {
                 // SAFETY: `buf` is live, unbound, and referenced by nothing.
@@ -1169,18 +1848,49 @@ impl Buf {
         }
     }
 
-    fn finish(g: &'static Gpu, buf: vk::Buffer, len: usize) -> Result<Self> {
+    fn finish(
+        g: &'static Gpu,
+        buf: vk::Buffer,
+        len: usize,
+        host_only: bool,
+    ) -> Result<Self> {
         // SAFETY: `buf` was just created on this device.
         let req = unsafe { g.device.get_buffer_memory_requirements(buf) };
-        let want = vk::MemoryPropertyFlags::DEVICE_LOCAL
-            | vk::MemoryPropertyFlags::HOST_VISIBLE
-            | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let hostbits =
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let want = if host_only {
+            hostbits
+        } else {
+            hostbits | vk::MemoryPropertyFlags::DEVICE_LOCAL
+        };
         let types = &g.memprops.memory_types[..g.memprops.memory_type_count as usize];
+        let fits = |i: usize, t: &vk::MemoryType, avoid_local: bool| {
+            req.memory_type_bits & (1 << i) != 0
+                && t.property_flags.contains(want)
+                && !(avoid_local
+                    && t.property_flags
+                        .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL))
+        };
+        // Staging asks for non-device-local FIRST and settles for device-local only if the
+        // device has nothing else. `new` (host_only == false) is unaffected: it asks for
+        // DEVICE_LOCAL, so the first pass and the fallback are the same predicate and it
+        // picks the same type it always did.
         let idx = types
             .iter()
             .enumerate()
-            .position(|(i, t)| {
-                req.memory_type_bits & (1 << i) != 0 && t.property_flags.contains(want)
+            .position(|(i, t)| fits(i, t, host_only))
+            .or_else(|| {
+                if host_only {
+                    warn!(
+                        "no non-DEVICE_LOCAL HOST_VISIBLE|HOST_COHERENT memory type: the \
+                         io_uring bounce arena will live in device-local memory, which is \
+                         the configuration amdgpu once EFAULTed on (see stream.rs)"
+                    );
+                }
+                types
+                    .iter()
+                    .enumerate()
+                    .position(|(i, t)| fits(i, t, false))
             })
             .ok_or_else(|| {
                 // HOST_COHERENT is not a convenience here. Without it, host writes are
@@ -1190,9 +1900,9 @@ impl Buf {
                 // response short of implementing the flush, and a driver that forces
                 // that choice should say so at startup rather than at token 300.
                 anyhow!(
-                    "no DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT memory type for a {len} B \
-                     buffer. Without HOST_COHERENT every in-place host fill needs an \
-                     explicit vkFlushMappedMemoryRanges, which this backend does not do."
+                    "no {want:?} memory type for a {len} B buffer. Without HOST_COHERENT \
+                     every in-place host fill needs an explicit vkFlushMappedMemoryRanges, \
+                     which this backend does not do."
                 )
             })? as u32;
         let mut flags =
@@ -1378,6 +2088,54 @@ pub unsafe fn memcpy_dtod(dst: *mut u8, src: *const u8, bytes: usize) -> Result<
         unsafe { d.cmd_copy_buffer(cb, sbuf, dbuf, &region) };
     })?;
     g.sync()
+}
+
+/// ASYNC host-to-device copy on the FETCH queue — `rivoli_memcpy_h2d_async`'s twin, and
+/// the third of Phase 4's three violations fixed.
+///
+/// It RETURNS BEFORE THE BYTES LAND. What says they have landed is the [`Signal`] the
+/// caller arms next (`Signal::arm_on(&Stream)` → [`Gpu::arm_on`]), which flushes this
+/// recorded copy and fires when that submit retires. That is exactly the HIP contract:
+/// `hipMemcpyAsync` on the fetch stream, then a completion signal on the same stream.
+///
+/// # What this replaces, and why the old version was a violation and not a slow path
+///
+/// `stream.rs`'s Vulkan `stage::copy_to_slot` was `std::ptr::copy_nonoverlapping`: the
+/// REAPER THREAD's CPU copying ~2.16 GB per token, synchronously, with the decode thread
+/// free to do nothing about it. A DMA engine does that work here, off both threads, and the
+/// reaper returns to the ring immediately — which is the only way the fetch↔compute overlap
+/// can exist at all.
+///
+/// Both ends are HOST pointers, resolved back to their `VkBuffer` by [`resolve_host`]:
+/// `src` is a slot in the io_uring bounce arena ([`Buf::staging`]) and `dst` is a slot in
+/// the routed pool's mapping (`ArenaPool::host_ptr`). Passing host pointers is not a
+/// concession — it is what makes the signature identical on both backends, since under HIP
+/// the same number is also the device address.
+///
+/// The reader's ordering is NOT this function's business, and the split matters: the fetch
+/// queue must not overwrite a slot the MoE queue is still reading, and that is the
+/// `inflight` guard in `pin.rs` (a slot is not recycled while a read against it is
+/// outstanding). The queue layer owns only the write side. Two mechanisms both believing
+/// they own slot lifetime is how a subtle double-free of *bytes* would happen.
+///
+/// # Safety
+/// `dst` and `src` must be HOST addresses inside live [`Buf`] mappings, `n` bytes long, and
+/// non-overlapping. `dst`'s slot must stay valid until the caller's `Signal` fires — the
+/// copy reads `src` and writes `dst` on the GPU timeline, after this returns.
+pub unsafe fn copy_h2d_async(dst: *mut u8, src: *const u8, n: usize) -> Result<()> {
+    ensure!(n > 0, "copy_h2d_async: zero-length copy");
+    let g = gpu()?;
+    let (dbuf, doff) = resolve_host(dst, n)?;
+    let (sbuf, soff) = resolve_host(src, n)?;
+    let region = [vk::BufferCopy::default()
+        .src_offset(soff)
+        .dst_offset(doff)
+        .size(n as u64)];
+    g.enqueue_on(Q::Fetch, |d, cb| {
+        // SAFETY: recording is open; both handles came from `resolve_host`, so each range
+        // lies inside its buffer.
+        unsafe { d.cmd_copy_buffer(cb, sbuf, dbuf, &region) };
+    })
 }
 
 /// Fill `bytes` at `dst` with the 32-bit pattern `pat` (`bytes` a multiple of 4).
@@ -1593,20 +2351,35 @@ impl Future for Signal {
     }
 }
 
-/// The timeline semaphore plus the thread that watches it.
+/// The timeline semaphores plus the thread that watches them.
 ///
 /// Vulkan has no host-callback-on-queue, which is what `hipLaunchHostFunc` gives the
 /// HIP side (~19 us/signal). The replacement is one thread blocking in
-/// `vkWaitSemaphores`, resolving every `Signal` whose value the counter has passed.
-/// One thread total, not one per signal.
+/// `vkWaitSemaphores`, resolving every `Signal` whose value its stream's counter has
+/// passed. One thread total, not one per signal and not one per queue — it waits on all
+/// three at once with `WAIT_ANY`.
 struct Timeline {
-    sem: vk::Semaphore,
-    /// Next value to signal. Monotonic; a timeline counter may only increase.
-    next: AtomicU64,
-    /// Registered `(value, signal)` pairs, and the condvar the waiter parks on when
-    /// there is nothing outstanding.
-    waiting: Mutex<Vec<(u64, Signal)>>,
+    /// One per STREAM, indexed the same way `Gpu::streams` is (so `Q` reaches it through
+    /// `Gpu::route`, never directly). Each `Stream` holds a copy of its own handle for
+    /// submitting under its lock; these copies exist so the waiter can wait and query
+    /// WITHOUT taking any stream lock — semaphores are internally synchronised for both,
+    /// and a waiter that had to take the compute lock would be the serialisation this
+    /// whole design removes.
+    sems: Vec<vk::Semaphore>,
+    /// Registered `(stream, value, signal)` triples, and the condvar the waiter parks on
+    /// when there is nothing outstanding.
+    ///
+    /// Values are per-stream, so a bare `u64` would be ambiguous across queues — the
+    /// stream index is not decoration.
+    waiting: Mutex<Vec<Pend>>,
     wake: Condvar,
+}
+
+/// One armed signal: which stream's timeline, which value, and whom to wake.
+struct Pend {
+    stream: usize,
+    value: u64,
+    sig: Signal,
 }
 
 impl Gpu {
@@ -1624,117 +2397,157 @@ impl Gpu {
     /// paper", where the ring and the second queue are one design. `vkstream.rs`
     /// documents what the gap costs its callers today.
     pub fn signal(&self) -> Result<Signal> {
+        self.signal_on(Q::Main)
+    }
+
+    /// A [`Signal`] on a named queue, covering everything RECORDED OR SUBMITTED to it so
+    /// far. `vkstream::stream_signal`'s implementation.
+    pub fn signal_on(&self, q: Q) -> Result<Signal> {
         let sig = Signal::pending();
-        self.arm(&sig)?;
+        self.arm_on(q, &sig)?;
         Ok(sig)
     }
 
-    /// As [`Gpu::signal`] but resolving a CALLER-OWNED [`Signal`], which is what
-    /// `asyncfetch.rs` needs: it hands out one pending signal per queued read up front
-    /// and arms each later, as its completion is reaped. Splitting this out of `signal`
-    /// is the whole reason that module compiles against both backends —
-    /// `gpustream::Signal::arm_on` has the same shape.
+    /// As [`Gpu::signal`] but resolving a CALLER-OWNED [`Signal`] on `Q::Main`.
     pub fn arm(&self, sig: &Signal) -> Result<()> {
-        let t = &self.timeline;
-        // The `cmd` mutex is held across allocate-value AND submit, for two reasons
-        // that are both correctness, not tidiness:
-        //
-        //   MONOTONICITY. A timeline semaphore may only be signalled with a strictly
-        //   increasing value. Allocating outside the lock lets two callers take 1 and
-        //   2 and then submit in the order 2, 1 — which is a spec violation, not a
-        //   reordering the driver will forgive. Allocating and submitting atomically
-        //   makes submission order equal allocation order by construction.
-        //
-        //   QUEUE ACCESS. `vkQueueSubmit` requires the VkQueue to be externally
-        //   synchronised, and `sync` submits under this same lock. Submitting here
-        //   without it would let two threads call vkQueueSubmit on one queue.
-        //
-        // This is the lock the Send/Sync impl's invariant names, so taking it here is
-        // what keeps that comment true rather than aspirational.
+        self.arm_on(Q::Main, sig)
+    }
+
+    /// Arm a caller-owned [`Signal`] on `q` — what `asyncfetch.rs` needs: it hands out one
+    /// pending signal per queued read up front and arms each later, as its completion is
+    /// reaped. Splitting this out of `signal` is the whole reason that module compiles
+    /// against both backends — `gpustream::Signal::arm_on` has the same shape.
+    ///
+    /// # It covers RECORDED work, which is what closes increment 1's gap
+    ///
+    /// If the stream has something recorded, this FLUSHES it and the signal is the flush's
+    /// timeline value; otherwise it submits a signal-only batch, which covers everything
+    /// already submitted because a queue is in-order. Either way the caller gets a signal
+    /// that fires when the work it just enqueued has LANDED — the contract
+    /// `rivoli_memcpy_h2d_async` gives the HIP side, and the reason `stage::copy_to_slot`
+    /// can now return before the bytes arrive.
+    pub fn arm_on(&self, q: Q, sig: &Signal) -> Result<()> {
         ensure!(
             self.waiter.load(Ordering::Acquire),
             "timeline waiter thread never started, so no Signal can ever resolve; \
              refusing to hand out one that would hang its awaiter forever"
         );
-        let cmd = self.cmd.lock().map_err(|_| anyhow!("vk command lock poisoned"))?;
-        ensure!(
-            !cmd.poisoned,
-            "vk command buffer poisoned by an earlier device_sync failure"
-        );
-        let value = t.next.fetch_add(1, Ordering::Relaxed) + 1;
+        // Allocate-value AND submit happen inside the stream lock, in `flush`/
+        // `signal_only`, for two reasons that are both correctness, not tidiness:
+        //
+        //   MONOTONICITY. A timeline semaphore may only be signalled with a strictly
+        //   increasing value. Allocating outside the lock lets two callers take 1 and 2 and
+        //   then submit in the order 2, 1 — a spec violation, not a reordering the driver
+        //   will forgive. Allocating and submitting under one guard makes submission order
+        //   equal allocation order by construction. This is also the argument for a
+        //   timeline PER STREAM: one shared counter would make that guard global.
+        //
+        //   QUEUE ACCESS. `vkQueueSubmit` requires the VkQueue to be externally
+        //   synchronised, and this is the lock the Send/Sync impl's invariant names.
+        let stream = self.route[q.index()];
+        let value = self.with_stream(q, |d, s| {
+            ensure!(
+                !s.poisoned,
+                "vk stream poisoned by an earlier submit or fence failure"
+            );
+            if s.recording { s.flush(d) } else { s.signal_only(d) }
+        })?;
+        // REGISTERED AFTER THE SUBMIT, deliberately, and this is a simplification the
+        // earlier version could not have: if the counter has already passed `value` by the
+        // time we push, the waiter simply finds it satisfied on its next pass (it re-reads
+        // the counter every time and waits on values that may already be reached). So
+        // there is no missed-wakeup window to guard, and no unregister-on-failure path —
+        // a failed submit returns above, having registered nothing.
         {
-            let mut w = t
+            let mut w = self
+                .timeline
                 .waiting
                 .lock()
                 .map_err(|_| anyhow!("vk timeline lock poisoned"))?;
-            w.push((value, sig.clone()));
+            w.push(Pend {
+                stream,
+                value,
+                sig: sig.clone(),
+            });
         }
-        t.wake.notify_one();
-
-        let sems = [t.sem];
-        let values = [value];
-        let mut ts = vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&values);
-        let submits = [vk::SubmitInfo::default()
-            .signal_semaphores(&sems)
-            .push_next(&mut ts)];
-        // SAFETY: an empty submit that only signals. The queue's external-synchronisation
-        // requirement is met by the `cmd` guard held above, which is the same lock
-        // `sync` submits under.
-        let r = unsafe { self.device.queue_submit(cmd.queue, &submits, vk::Fence::null()) };
-        if let Err(e) = r {
-            // Nothing will ever signal this value, so resolve it here rather than
-            // leaving an awaiter parked forever.
-            sig.resolve();
-            if let Ok(mut w) = t.waiting.lock() {
-                w.retain(|(v, _)| *v != value);
-            }
-            bail!("vkQueueSubmit (timeline signal) failed: {e}");
-        }
+        self.timeline.wake.notify_one();
         Ok(())
     }
 }
 
 impl Timeline {
-    fn new(device: &ash::Device) -> Result<Self> {
-        let mut ty = vk::SemaphoreTypeCreateInfo::default()
-            .semaphore_type(vk::SemaphoreType::TIMELINE)
-            .initial_value(0);
-        let ci = vk::SemaphoreCreateInfo::default().push_next(&mut ty);
-        // SAFETY: `device` is live; `ci` outlives the call.
-        let sem = unsafe { device.create_semaphore(&ci, None) }?;
+    fn new(device: &ash::Device, n: usize) -> Result<Self> {
+        let mut sems = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut ty = vk::SemaphoreTypeCreateInfo::default()
+                .semaphore_type(vk::SemaphoreType::TIMELINE)
+                .initial_value(0);
+            let ci = vk::SemaphoreCreateInfo::default().push_next(&mut ty);
+            // SAFETY: `device` is live; `ci` outlives the call.
+            match unsafe { device.create_semaphore(&ci, None) } {
+                Ok(s) => sems.push(s),
+                Err(e) => {
+                    // SAFETY: every handle in `sems` came from this loop and is destroyed
+                    // once. `Gpu` has no Drop, so an init failure has to clean up here.
+                    unsafe {
+                        for s in &sems {
+                            device.destroy_semaphore(*s, None);
+                        }
+                    }
+                    return Err(e.into());
+                }
+            }
+        }
         Ok(Self {
-            sem,
-            next: AtomicU64::new(0),
+            sems,
             waiting: Mutex::new(Vec::new()),
             wake: Condvar::new(),
         })
     }
 }
 
-/// The waiter thread: block until the counter passes the lowest outstanding value,
-/// then resolve everything it has reached. Runs for the life of the process.
+/// The waiter thread: block until ANY stream's counter passes that stream's lowest
+/// outstanding value, then resolve everything every counter has reached. Runs for the life
+/// of the process.
+///
+/// `WAIT_ANY` over up to three (semaphore, value) pairs is what makes one thread enough:
+/// with `ALL` the fetch queue's completions would be held hostage by an unfinished compute
+/// value, which is the cross-queue coupling the per-stream timelines exist to avoid.
 fn timeline_waiter(g: &'static Gpu) {
-    /// Consecutive 100 ms timeouts on the same value before saying so — 5 s.
+    /// Consecutive 100 ms timeouts with no progress before saying so — 5 s.
     const STALL_WARN: u32 = 50;
     let t = &g.timeline;
     let mut stalls = 0u32;
     loop {
-        // Park while nothing is outstanding, so an idle process costs no CPU.
-        let target = {
+        // Park while nothing is outstanding, so an idle process costs no CPU. `targets` is
+        // the per-stream MINIMUM outstanding value, and only for streams that have one:
+        // vkWaitSemaphores needs at least one pair, and a stream with nothing armed has no
+        // value worth naming.
+        let targets: Vec<(usize, u64)> = {
             let Ok(mut w) = t.waiting.lock() else { return };
             while w.is_empty() {
                 let Ok(next) = t.wake.wait(w) else { return };
                 w = next;
             }
-            w.iter().map(|(v, _)| *v).min().unwrap_or(u64::MAX)
+            let mut min: Vec<Option<u64>> = vec![None; t.sems.len()];
+            for p in w.iter() {
+                let slot = &mut min[p.stream];
+                *slot = Some(slot.map_or(p.value, |v: u64| v.min(p.value)));
+            }
+            min.iter()
+                .enumerate()
+                .filter_map(|(i, v)| v.map(|v| (i, v)))
+                .collect()
         };
-        let sems = [t.sem];
-        let values = [target];
+        let sems: Vec<vk::Semaphore> = targets.iter().map(|&(i, _)| t.sems[i]).collect();
+        let values: Vec<u64> = targets.iter().map(|&(_, v)| v).collect();
         let info = vk::SemaphoreWaitInfo::default()
+            .flags(vk::SemaphoreWaitFlags::ANY)
             .semaphores(&sems)
             .values(&values);
         // A timeout rather than u64::MAX, so a stuck submit cannot wedge this thread.
-        // SAFETY: `t.sem` is live for the process.
+        // SAFETY: every semaphore in `t.sems` is live for the process, and `sems`/`values`
+        // are the same length (built from one iterator).
         let waited = unsafe { g.device.wait_semaphores(&info, 100_000_000) };
         // TIMEOUT and a real error MUST be told apart. ash maps every non-SUCCESS code
         // to Err, and on VK_ERROR_DEVICE_LOST the wait returns IMMEDIATELY — so
@@ -1746,37 +2559,36 @@ fn timeline_waiter(g: &'static Gpu) {
             Ok(()) | Err(vk::Result::TIMEOUT) => {}
             Err(e) => {
                 error!("vk timeline wait failed ({e}); resolving all awaiters and stopping");
-                if let Ok(mut w) = t.waiting.lock() {
-                    for (_, s) in w.drain(..) {
-                        s.resolve();
-                    }
-                }
+                resolve_all(t);
                 return;
             }
         }
-        // SAFETY: as above.
-        let now = match unsafe { g.device.get_semaphore_counter_value(t.sem) } {
-            Ok(v) => v,
-            Err(e) => {
-                error!("vk timeline counter read failed ({e}); resolving all awaiters");
-                if let Ok(mut w) = t.waiting.lock() {
-                    for (_, s) in w.drain(..) {
-                        s.resolve();
-                    }
+        // Read every stream's counter, not just the one that woke us: with WAIT_ANY the
+        // others may also have advanced, and sweeping them here is free.
+        let mut now: Vec<u64> = Vec::with_capacity(t.sems.len());
+        for s in &t.sems {
+            // SAFETY: as above.
+            match unsafe { g.device.get_semaphore_counter_value(*s) } {
+                Ok(v) => now.push(v),
+                Err(e) => {
+                    error!("vk timeline counter read failed ({e}); resolving all awaiters");
+                    resolve_all(t);
+                    return;
                 }
-                return;
             }
-        };
-        // A value that is submitted but never signalled would otherwise sit at the head
-        // of the queue forever: `target` is the minimum, so every later signal would
-        // wait the full 100 ms before the sweep below reached it — a permanent, silent
-        // latency collapse from ~50 us to 100 ms. Say so instead of degrading quietly.
+        }
+        // A value that is submitted but never signalled would otherwise sit at the head of
+        // its stream forever: `targets` holds the minima, so every later signal on that
+        // stream would wait the full 100 ms before the sweep below reached it — a
+        // permanent, silent latency collapse from ~50 us to 100 ms. Say so instead of
+        // degrading quietly.
         if waited == Err(vk::Result::TIMEOUT) {
             stalls += 1;
             if stalls == STALL_WARN {
                 warn!(
-                    "vk timeline value {target} has not been signalled after {} s; \
-                     every later Signal is now paying the full wait timeout",
+                    "vk timeline values {targets:?} (stream, value) have not been signalled \
+                     after {} s; every later Signal on those streams is now paying the full \
+                     wait timeout",
                     STALL_WARN / 10
                 );
             }
@@ -1784,13 +2596,13 @@ fn timeline_waiter(g: &'static Gpu) {
             stalls = 0;
         }
         let Ok(mut w) = t.waiting.lock() else { return };
-        // Resolve OUTSIDE the retain predicate's borrow of the signal, and resolve
-        // every value the counter has passed, not just `target` — several may have
+        // Resolve OUTSIDE the retain predicate's borrow of the signal, and resolve every
+        // value each counter has passed, not just the ones we waited on — several may have
         // landed inside one wait.
         let mut fired = Vec::new();
-        w.retain(|(v, s)| {
-            if *v <= now {
-                fired.push(s.clone());
+        w.retain(|p| {
+            if p.value <= now[p.stream] {
+                fired.push(p.sig.clone());
                 false
             } else {
                 true
@@ -1799,6 +2611,17 @@ fn timeline_waiter(g: &'static Gpu) {
         drop(w);
         for s in fired {
             s.resolve();
+        }
+    }
+}
+
+/// Resolve and forget every armed signal — the waiter's error exit. An awaiter that will
+/// never be woken is a hang; resolving early is wrong data, which the forward pass's
+/// finiteness guard can at least see.
+fn resolve_all(t: &Timeline) {
+    if let Ok(mut w) = t.waiting.lock() {
+        for p in w.drain(..) {
+            p.sig.resolve();
         }
     }
 }
@@ -2210,7 +3033,7 @@ pub unsafe fn launch_rope(
     // Held on this stack across the dispatch below, then handed over for reclamation —
     // see `Gpu::stage` for why it cannot go onto the scratch list before the dispatch is
     // recorded.
-    let (trig_buf, trig_addr) = gpu.stage(&bytes)?;
+    let (trig_buf, trig_addr) = gpu.stage(Q::Main, &bytes)?;
 
     let push = RopePush {
         base: base as u64,
@@ -2220,7 +3043,7 @@ pub unsafe fn launch_rope(
     };
     // One workgroup per row, as HIP does; the threads inside stride over `half`.
     gpu.dispatch(&gpu.pipes.rope_interleave, &push, count as u32)?;
-    gpu.retain(trig_buf)
+    gpu.retain(Q::Main, trig_buf)
 }
 
 
@@ -2805,11 +3628,11 @@ const VQ_GROUP: usize = 64;
 /// Pass 1 + pass 2 of the VQ expert batch for an ABSOLUTE expert range, matching
 /// `hip.rs::launch_moe_expert_range`.
 ///
-/// The `stream` parameter is accepted and IGNORED, and that is a deliberate placeholder
-/// rather than an oversight: this backend has one queue today, so there is nothing to
-/// place work on. Keeping the parameter means `gpu.rs` compiles unchanged against either
-/// backend; making it meaningful is the multi-queue work in docs/VULKAN.md, which is where
-/// the expert-stream overlap actually gets restored.
+/// `stream` NAMES A QUEUE and is honoured: `gpu.rs` passes its compute stream, which parses
+/// to [`Q::Moe`], so the expert partials record on the MoE queue and overlap the fetch
+/// queue's copies exactly as they do under HIP. NULL — which every oracle test passes —
+/// parses to [`Q::Main`]. It was an ignored placeholder in increment 1, and that is what
+/// made the port 1.44 tok/s against ROCm's 2.52.
 ///
 /// # Safety
 /// Device addresses of live [`Buf`]s, valid until the next [`device_sync`]: `x`
@@ -2829,8 +3652,9 @@ pub unsafe fn launch_moe_expert_range(
     wexpert: *const f32,
     h: *mut f32,
     partial: *mut f32,
-    _stream: *mut std::ffi::c_void,
+    stream: *mut std::ffi::c_void,
 ) -> Result<()> {
+    let q = Q::parse(stream)?;
     moe_vq_guards(hidden, inter, e_count, "moe_expert_range")?;
     ensure_word_aligned(descs as u64, "moe_expert_range descs")?;
     for (p, n) in [(gate_cb, "gate_cb"), (up_cb, "up_cb"), (down_cb, "down_cb")] {
@@ -2849,7 +3673,8 @@ pub unsafe fn launch_moe_expert_range(
         e_start: e_start as i32,
         e_count: e_count as i32,
     };
-    g.dispatch(
+    g.dispatch_on(
+        q,
         &g.pipes.moe_gateup_vq,
         &gu,
         (e_count * inter).div_ceil(ROWS_PER_BLOCK as usize) as u32,
@@ -2866,7 +3691,8 @@ pub unsafe fn launch_moe_expert_range(
         e_start: e_start as i32,
         e_count: e_count as i32,
     };
-    g.dispatch(
+    g.dispatch_on(
+        q,
         &g.pipes.moe_down_vq,
         &dn,
         (e_count * hidden).div_ceil(ROWS_PER_BLOCK as usize) as u32,
@@ -2882,8 +3708,9 @@ pub unsafe fn launch_moe_reduce(
     e: usize,
     hidden: usize,
     out: *mut f32,
-    _stream: *mut std::ffi::c_void,
+    stream: *mut std::ffi::c_void,
 ) -> Result<()> {
+    let q = Q::parse(stream)?;
     ensure!(e > 0 && hidden > 0, "moe_reduce: argument guard rejected");
     let g = gpu()?;
     let push = MoeReducePush {
@@ -2892,7 +3719,7 @@ pub unsafe fn launch_moe_reduce(
         e_count: e as i32,
         hidden: hidden as i32,
     };
-    g.dispatch(&g.pipes.moe_reduce, &push, groups(hidden))
+    g.dispatch_on(q, &g.pipes.moe_reduce, &push, groups(hidden))
 }
 
 // ---------------------------------------------------------------------------
