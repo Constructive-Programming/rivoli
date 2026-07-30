@@ -2114,9 +2114,16 @@ pub unsafe fn memcpy_dtod(dst: *mut u8, src: *const u8, bytes: usize) -> Result<
 ///
 /// The reader's ordering is NOT this function's business, and the split matters: the fetch
 /// queue must not overwrite a slot the MoE queue is still reading, and that is the
-/// `inflight` guard in `pin.rs` (a slot is not recycled while a read against it is
-/// outstanding). The queue layer owns only the write side. Two mechanisms both believing
-/// they own slot lifetime is how a subtle double-free of *bytes* would happen.
+/// RESIDENCY layer's job — `pin.rs`'s per-batch pin set (`begin_batch` clears it, `protect`
+/// pins every hit, `admit` pins every miss) makes a slot touched this batch un-evictable
+/// until the batch ends, and the end-of-layer `device_sync` closes the batch. The queue
+/// layer owns only the WRITE side of a slot. Two mechanisms both believing they own slot
+/// lifetime is how a subtle double-free of *bytes* gets built.
+///
+/// (docs/VULKAN.md called this "the `inflight` guard". No such guard exists under that name
+/// — the mechanism is the per-batch pin set above, and a reader grepping for `inflight`
+/// finds nothing. The doc is corrected; this note is here because the wrong name is what is
+/// written in the planning text a future porter will read first.)
 ///
 /// # Safety
 /// `dst` and `src` must be HOST addresses inside live [`Buf`] mappings, `n` bytes long, and
