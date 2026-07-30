@@ -981,8 +981,10 @@ impl Stream {
             return Ok(cb);
         }
         // The slot must not be pending — `vkBeginCommandBuffer` on a pending buffer is
-        // undefined. `advance` normally retires it; this covers the first use of a slot
-        // and any path that left one behind.
+        // undefined. THIS is where a slot is retired, and deliberately the only place: it is
+        // the last moment the fence wait is actually required, so a flush never pays for a
+        // slot nobody has asked for yet. A no-op unless the ring has wrapped onto a submit
+        // that has not finished.
         self.reclaim(d, self.head)?;
         let bi = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -1478,6 +1480,14 @@ impl Stamp {
         );
         let a = start.read()?;
         let b = end.read()?;
+        // DISARM on a successful read, so a second read without a fresh `record` errors
+        // instead of reporting the PREVIOUS span again. Same principle as refusing a pair
+        // that was never recorded: a stale duration is indistinguishable from a real one,
+        // and `gpu.rs` re-records both ends every layer, so nothing legitimate reads twice.
+        // Only after both reads succeed — disarming on an error path would replace the real
+        // cause with "never recorded" on the next call.
+        start.armed.store(false, Ordering::Release);
+        end.armed.store(false, Ordering::Release);
         // Mask to the bits the family actually implements, then treat b < a as one
         // wraparound of that counter rather than as a negative duration.
         let mask = if g.ts_bits >= 64 {
@@ -1516,9 +1526,16 @@ impl Stamp {
 impl Drop for Stamp {
     fn drop(&mut self) {
         let Ok(g) = gpu() else { return };
-        // SAFETY: the pool came from this device and is destroyed once. Every command
-        // buffer that referenced it retired at the `device_sync` its reader required — and
-        // `gpu.rs` holds its stamps for the life of the engine, so this runs at teardown.
+        // Join first, exactly as `Buf::drop` does and for the same reason: a command buffer
+        // recorded before this drop may still reference the pool, and destroying a query
+        // pool with a pending reference is undefined. In practice `gpu.rs` holds its stamps
+        // for the life of the engine and every reader had to `device_sync` first, so this is
+        // a no-op — but "in practice" is what the flush in `Buf::drop` exists to not rely on.
+        if let Err(e) = g.sync() {
+            warn!("Stamp::drop: flush failed, destroying the query pool anyway: {e:#}");
+        }
+        // SAFETY: the pool came from this device and is destroyed once; the join above
+        // retired anything that referenced it.
         unsafe { g.device.destroy_query_pool(self.pool, None) };
     }
 }

@@ -707,6 +707,13 @@ fn timestamps_measure_gpu_time_and_refuse_when_absent() {
         ms < 10_000.0,
         "GPU span {ms} ms is implausible for 8 dispatches; check timestampPeriod scaling"
     );
+    // A SECOND read, with no fresh `record`, must refuse rather than hand back the same span
+    // again. A stale duration is indistinguishable from a live one at the call site, which is
+    // the whole failure mode this test's first assertion exists for, one step further along.
+    assert!(
+        rivoli::backend::Event::elapsed_ms(&start, &end).is_err(),
+        "a stamp pair reported its span twice; the second read was stale data"
+    );
     v.check("timestamps_measure_gpu_time_and_refuse_when_absent");
 }
 

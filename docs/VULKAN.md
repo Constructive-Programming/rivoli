@@ -1079,9 +1079,16 @@ Each phase ends with something runnable; no phase leaves the tree broken.
 
    **INCREMENT 1 DELIVERED, and it decodes.** See "Increment 1: measured" below for what
    landed, what the numbers were, and the two findings the run produced.
-5. **Bench + profiling** — timestamp query pools wired into `telemetry.rs`, then compare
-   against HIP on the same artifact. Expect the first port to be slower; record where,
-   do not tune during the port.
+
+   **INCREMENT 2 DELIVERED, and it implements the design.** Three queues, the ring, the async
+   staging copy, and the timestamp query pools this table filed under phase 5. See
+   "Increment 2: measured". **Phase 4 is complete.**
+5. **Bench + profiling** — ~~timestamp query pools~~ **DONE, and pulled into phase 4**: an
+   overlap invariant that cannot be measured is assumed rather than upheld, so the instrument
+   had to ship with the thing it certifies. `Stamp` in `vk.rs` feeds `backend::Event`, which
+   `telemetry.rs` already consumed. What remains of this item is the comparison work: the
+   port IS slower, the per-phase spans now say WHERE (MoE kernels, 2.1x), and the rule still
+   holds — record, do not tune during the port.
 
 **Sequence this last.** Of the three open proposals it has the least measured upside:
 PILOT and `top-m` attack a bottleneck we have quantified, while this buys portability
@@ -1182,7 +1189,7 @@ an alignment guard on one side and none on the other; that asymmetry is correct.
 ## INCREMENT 1 SHIPPED THE FAILURE THIS SECTION WARNS ABOUT
 
 > **RESOLVED by increment 2** — three queues, the command-buffer ring, an async staging
-> copy, and real timestamp query pools. Measured: **96% of fetch hidden**, up from 0%.
+> copy, and real timestamp query pools. Measured: **97% of fetch hidden**, up from 0%.
 > See "Increment 2: measured" below. This section is retained as the record of the process
 > failure, and its list of three violations is the checklist increment 2 was built against.
 > It also undercounted by one, which is the most useful thing about it now: see item 4
