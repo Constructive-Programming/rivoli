@@ -41,8 +41,10 @@ pub struct Looka {
     /// **Precision at rank**: `rank_hit[h][r]` counts how often the pilot's r-th ranked
     /// guess (by gate score, descending — `topk_into` sorts value-desc) turned out to be
     /// one the layer really picked. This, not aggregate recall, is what gates the
-    /// speculative loader: on a bandwidth-bound engine a wrong speculative fetch costs
-    /// real throughput, so the loader needs a PREFIX it can trust, not a good average.
+    /// speculative loader: a wrong speculative fetch spends device time, so the loader
+    /// needs a PREFIX it can trust, not a good average. (How MUCH it costs was revised
+    /// down once `--pilot` measured +13% bytes for -12% wall — the device had headroom.
+    /// See docs/CACHE_PILOT.md; the ranking this curve gives is unaffected.)
     rank_hit: [[u64; MAX_RANK]; HORIZONS.len()],
     rank_tot: [[u64; MAX_RANK]; HORIZONS.len()],
     /// `pred[target][h]` — written at layer `target - HORIZONS[h]`, read when `target`
@@ -50,18 +52,10 @@ pub struct Looka {
     pred: Vec<[Vec<u32>; HORIZONS.len()]>,
     /// `prev[layer]` — what this layer selected on the previous token.
     prev: Vec<Vec<u32>>,
-    /// Routing scratch, kept off the hot path's `scores`/`choice`/`sel`/`cand` so a pilot
-    /// can never perturb the real selection.
-    pub p_scores: Vec<f32>,
-    pub p_choice: Vec<f32>,
-    pub p_sel: Vec<usize>,
-    pub p_cand: Vec<usize>,
-    /// Host landing zone for the pilot logits of BOTH horizons (one D2H, not two).
-    pub host: Vec<u8>,
 }
 
 impl Looka {
-    pub fn new(n_layers: usize, n_experts: usize) -> Self {
+    pub fn new(n_layers: usize) -> Self {
         Self {
             hit: [0; HORIZONS.len()],
             tot: [0; HORIZONS.len()],
@@ -71,11 +65,6 @@ impl Looka {
             rank_tot: [[0; MAX_RANK]; HORIZONS.len()],
             pred: (0..n_layers).map(|_| Default::default()).collect(),
             prev: vec![Vec::new(); n_layers],
-            p_scores: vec![0.0; n_experts],
-            p_choice: vec![0.0; n_experts],
-            p_sel: Vec::with_capacity(16),
-            p_cand: Vec::new(),
-            host: Vec::new(),
         }
     }
 
@@ -159,7 +148,8 @@ impl Looka {
     /// often"; `top-N` is the CUMULATIVE precision of speculating on the first N guesses,
     /// which is the number a confidence-gated loader is actually priced by — at cumulative
     /// precision `p`, covering `u` useful experts costs `u/p` fetches, and everything above
-    /// `u` is wasted bandwidth on an engine that has none to spare.
+    /// `u` is bandwidth spent on nothing — though measurably NOT one-for-one against useful
+    /// bytes, since the device turned out to have queue-depth headroom.
     pub fn rank_report(&self) -> Vec<String> {
         let mut out = Vec::new();
         for (h, &dh) in HORIZONS.iter().enumerate() {
@@ -199,7 +189,7 @@ mod tests {
 
     #[test]
     fn recall_is_intersection_over_actual() {
-        let mut lk = Looka::new(8, 256);
+        let mut lk = Looka::new(8);
         // Layer 3 is told, from layer 2 (h=0 → L+1), that it will pick 4 of these 8.
         lk.stash(3, 0, &[10, 11, 12, 13, 90, 91, 92, 93]);
         lk.score(3, &[10, 11, 12, 13, 20, 21, 22, 23]);
@@ -218,7 +208,7 @@ mod tests {
 
     #[test]
     fn precision_is_scored_per_guess_in_rank_order() {
-        let mut lk = Looka::new(8, 256);
+        let mut lk = Looka::new(8);
         // Ranks 0 and 2 are right; 1 and 3 are wrong.
         lk.stash(3, 0, &[10, 77, 11, 88]);
         lk.score(3, &[10, 11, 12, 13, 20, 21, 22, 23]);
@@ -232,7 +222,7 @@ mod tests {
     fn cumulative_precision_at_full_width_equals_recall() {
         // When |pred| == |actual|, precision over the whole prefix and recall are the
         // same ratio — a self-check that the two counters cannot silently disagree.
-        let mut lk = Looka::new(8, 256);
+        let mut lk = Looka::new(8);
         lk.stash(3, 0, &[10, 11, 12, 13, 90, 91, 92, 93]);
         lk.score(3, &[10, 11, 12, 13, 20, 21, 22, 23]);
         let rank_sum: u64 = lk.rank_hit[0].iter().sum();
@@ -242,7 +232,7 @@ mod tests {
 
     #[test]
     fn absent_prediction_is_excluded_not_zeroed() {
-        let mut lk = Looka::new(8, 256);
+        let mut lk = Looka::new(8);
         lk.score(5, &[1, 2, 3]); // nothing stashed: no denominator
         assert_eq!(lk.tot[0], 0);
         assert_eq!(lk.tot[1], 0);

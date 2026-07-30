@@ -2351,6 +2351,14 @@ impl Signal {
         s
     }
 
+    /// Non-blocking readiness probe. Mirrors the HIP `Signal` so `pin.rs`'s speculative
+    /// prefetcher stays backend-neutral. A `false` is always safe (the caller keeps the
+    /// slot pinned one more batch); this can never report ready before the resolver stored
+    /// it.
+    pub fn is_ready(&self) -> bool {
+        self.0.done.load(Ordering::Acquire)
+    }
+
     /// Force-resolve from the resolver side (an error path, so awaiters never hang).
     /// Idempotent.
     pub fn resolve(&self) {

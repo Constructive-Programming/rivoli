@@ -104,6 +104,13 @@ struct Args {
     #[arg(long)]
     direct_vmm_dma: bool,
 
+    /// Speculatively prefetch the NEXT layer's top-ranked expert (CACHE_PILOT Step 2).
+    /// Runs layer L+1's router against layer L's post-attention residual and issues the
+    /// rank-0 guess a layer early — measured at 99% precision (docs/CACHE_PILOT.md), which
+    /// is the only reason a speculative fetch pays on a bandwidth-bound engine.
+    #[arg(long)]
+    pilot: bool,
+
     /// Dump the routed-expert access trace (v2: demand keys plus the ranked candidate
     /// window) for the offline `replay` sim.
     #[arg(long, value_name = "PATH")]
@@ -285,6 +292,7 @@ fn main() -> Result<()> {
         a.model,
         a.bench,
         a.direct_vmm_dma,
+        a.pilot,
         a.trace,
         a.prompt,
         a.cache_policy,
@@ -505,6 +513,7 @@ fn main() -> Result<()> {
             None => prompt_ids.len() + ngen + 1,
         };
         let mut engine = rivoli::gpu::GpuEngine::new(pin, &mc, max_ctx, cfg.attn.clone())?;
+        engine.set_pilot(cfg.pilot);
         #[cfg(feature = "trace")]
         engine.set_checksum_x(cfg.checksum_x);
         engine.set_moe_gain(a_moe_gain);
@@ -588,6 +597,14 @@ fn main() -> Result<()> {
             summary.tok_per_s,
             summary.hit_pct,
         );
+        // Only meaningful under --pilot; silent otherwise so the default line is unchanged.
+        let (spec_issued, spec_used) = engine.spec();
+        if spec_issued > 0 {
+            info!(
+                "  pilot: {spec_issued} speculative fetches issued, {spec_used} used ({:.1}% live precision)",
+                100.0 * spec_used as f64 / spec_issued as f64,
+            );
+        }
         // OTLP: one decode span carrying the always-on summary (opt-in via
         // OTEL_EXPORTER_OTLP_ENDPOINT; log-only otherwise). Exported synchronously on
         // drop — no async runtime.

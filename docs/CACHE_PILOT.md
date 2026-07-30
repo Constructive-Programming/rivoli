@@ -209,6 +209,26 @@ top7 82.1 · top8 77.2%. Cumulative L+2: top1 96.7 → top8 68.9%. (Cumulative t
 aggregate recall exactly on both horizons — the rank and recall counters are independent,
 so that agreement is a self-check, not a tautology.)
 
+> **REVISED 2026-07-30, after `--pilot` shipped and was measured.** The derivation below
+> assumes the device is bandwidth-SATURATED, so a wasted speculative fetch displaces a
+> useful one one-for-one. **Measurement falsified that assumption.** Counting the
+> speculative reads (which the profile initially omitted), `--pilot` moved **2.02 → 2.29
+> GB/token, +13%, while wall fell 397.8 → 351.1 ms/token, −12%** — 5.08 → 6.52 GB/s
+> sustained. More bytes, less time: there was device headroom, and the binding constraint
+> is nearer **queue depth than bandwidth**.
+>
+> The engine is still fetch-bound (~181 ms transfer vs 117 ms compute) and the "95% hidden"
+> retraction is untouched — that rests on the miss-bucket linearity and the `moe_wall`
+> arithmetic, not on saturation. What falls is only the *tax* argument. The 50% figure is
+> therefore a CONSERVATIVE floor, not the true break-even: a wrong speculation that fills
+> otherwise-idle device time costs less than a full 1.24 ms, so ranks below 50% may still
+> pay. **The top-7 gate is worth measuring rather than ruled out.**
+>
+> Why the error: `2.25 GB / 386 ms = 5.83 GB/s` matched the documented "5.8–6.7 GB/s at
+> QD≥4" too neatly, and that coincidence was allowed to outweigh the marginal (12.4 GB/s)
+> and in-fetch-window (10.9 GB/s) figures measured in the same session, which both said the
+> device was faster than the aggregate implied.
+
 #### The break-even, and why it is 50%
 
 On a bandwidth-saturated device one expert is 15.34 MB ≈ **1.24 ms** — which is also the
@@ -241,7 +261,90 @@ and clears any plausible break-even. **If Step 2 wants a minimum viable incremen
 tuning, and it exercises every piece of loader plumbing (hidden slots, eviction guard,
 demand-priority) at the lowest possible waste.
 
-## Step 2 — the speculative loader
+## Step 2a — SHIPPED: the minimum viable loader (`--pilot`)
+
+Built 2026-07-30 off the `p@0` = 99% result above: **prefetch rank 0 of L+1, and nothing
+else.** One expert per layer, no confidence tuning to get wrong, and it still exercises
+every piece of plumbing the full loader needs. If this does not move tok/s, the fault is
+in the loader rather than the predictor — a much cheaper thing to learn here than after
+building the top-7 gate.
+
+**Where the speculation is allocated is the whole correctness story.** `Pin::submit_spine`
+takes a `spec_req` and allocates the predicted slot in **phase 1b, inside the same batch as
+that layer's demand misses**. That is not a convenience: phase 1b is where evictions and
+compaction relocate slots, and phase 1c resolves final addresses only after it. Allocating
+a speculative slot anywhere else — later, or out of band — lets a read target a slot that
+subsequently moves, which is exactly the silent-corruption class the `inflight` guard was
+written for.
+
+**The read-before-write trap, and the substitution that avoids it.** `alloc` publishes the
+key immediately, so the next layer's phase 1a finds it via `routed.get` and counts it a
+hit — and a hit is handed `Signal::ready()`, meaning nothing downstream waits. With bytes
+still in the air that is precisely the failure the READ-BEFORE-WRITE detector exists to
+report. `submit_spine` therefore tracks the one in-flight speculation and **substitutes the
+real Signal** for that expert's slot in phase 2, so the expert stream awaits it exactly as
+it would a demand miss. The detector is also routed around for that single key, since it is
+the one case where an unlanded hit is legitimate rather than a bug.
+
+Other invariants, each traceable to a constraint above:
+- **Pinned while in flight.** `protect` is called on the in-flight speculative key before
+  phase 1b, the only window guaranteed to precede any `alloc`, so this batch's evictions
+  cannot reclaim a slot that already has a read queued against it.
+- **One in flight, maximum.** If the previous speculation has neither landed nor been
+  consumed, this layer skips rather than tracking two. A layer (~3.5 ms) comfortably
+  exceeds a fetch (~1.4 ms), so the skip is rare.
+- **Already-resident predictions issue nothing** (~76% of them), which is what keeps the
+  feature cheap.
+- **Speculative read goes last in the batch** — the cheap approximation of "demand reads
+  never queue behind speculative ones". io_uring submits the whole SQ at once so this is
+  not a hard priority; a real priority split on the ring is the upgrade if it shows up.
+- **Eviction guard is implicit, not the one this document asks for.** Every key the layer
+  needs is protected by phase 1a and the in-flight spec is pinned, so a speculation can only
+  take a victim nobody in this batch wants — but there is no hotness *hysteresis*, so it can
+  still displace a warm resident a LATER layer wants. Watch expert-hit%: if it falls, that
+  guard is the fix. This is the known ceiling of the MVP.
+
+### MEASURED — int3-vq/dense/lru, `--max-mem 115`, 64 tokens
+
+| | baseline | `--pilot` |
+|---|--:|--:|
+| tok/s | 2.51 | **2.71 – 2.85** (2 runs) |
+| ms/tok | 397.8 | 351.1 / 369.6 |
+| expert hit | 78.0% | **79.8%** |
+| demand misses/tok | 131.91 | **121.42** |
+| bytes/tok (incl. speculative) | 2.02 GB | **2.29 GB** |
+| live precision | — | **98.7%** (1749/1772) |
+
+**~+8–14% throughput.** The range is two pilot runs against ONE baseline; the spread is
+run-to-run timing noise, not a difference in behaviour — hits, misses and speculation counts
+are bit-identical between the two pilot runs, so the cache path is fully deterministic and
+only wall time moves. A tighter number needs more baseline samples.
+
+Live precision 98.7% sits on LOOKA's predicted `p@0` of 99%, which is the check that the
+loader prefetches what the predictor named.
+
+**Verified**: output token IDs are bit-identical to the baseline (`--dump-ids`, diff clean),
+and zero READ-BEFORE-WRITE reports under `--features trace`.
+
+Two defects the first run caught, both fixed:
+1. **7 READ-BEFORE-WRITE reports**, all for one key. A speculation consumed *while still in
+   flight* reached neither path that sets the loaded flag — not a demand miss (nothing
+   pushed it to `pending_loaded`), and it had not landed before use (so the batch-start
+   `mark_loaded` never ran). The key stayed marked unloaded and every later token hitting it
+   re-reported. The bytes had landed; only the flag was missing. Fixed by pushing the
+   consumed key to `pending_loaded` exactly as a demand miss does.
+2. **The profile undercounted its own fetches.** `fetch_n` tracked demand misses only, so
+   `gb_per_tok`/`ms_per_miss` omitted every speculative read — understating the first run by
+   0.43 GB/token and making prefetch appear to REDUCE bytes moved. It increases them ~13%.
+   Now summed over demand + speculative; the hit-rate denominator is left on demand alone so
+   it cannot flatter itself.
+
+`--pilot` is a runtime flag on default builds; the pilot's rmsnorm+gemv runs one horizon
+(L+1) outside `trace` and both under it, so LOOKA keeps reporting the L+2 curve.
+`spec_issued`/`spec_used` are reported as live precision and should track `p@0`; a gap means
+the loader is prefetching something other than what the predictor named.
+
+## Step 2 — the speculative loader (full design, for the top-7 gate)
 
 One component, two callers: CACHE_PILOT asks it to load a predicted expert in the cheap
 format, `top-m` asks it to load a window member as int4. Design constraints, each

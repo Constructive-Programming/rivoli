@@ -86,6 +86,8 @@ pub struct Config {
     /// EFAULTs on direct io_uring DMA into VMM (see src/stream.rs). Set only to force the
     /// raw-DMA path.
     pub direct_vmm_dma: bool,
+    /// `--pilot`: speculative rank-0 prefetch of the next layer's top expert.
+    pub pilot: bool,
     /// Dump the routed-expert access trace to this path (`--trace`), format v2: a
     /// `# rivoli-trace v2 top_k=<k> window=<w>` header, then one line per MoE layer —
     /// the keys it looked up, then `|`, then the top-`w` router candidates as
@@ -148,6 +150,7 @@ impl Config {
         model: String,
         bench: Option<usize>,
         direct_vmm_dma: bool,
+        pilot: bool,
         trace: Option<String>,
         prompt: Option<String>,
         cache_policy: String,
@@ -169,6 +172,7 @@ impl Config {
             model,
             bench,
             direct_vmm_dma,
+            pilot,
             trace,
             prompt,
             cache_policy,
@@ -266,12 +270,13 @@ impl fmt::Display for Config {
         const GIB: f64 = (1u64 << 30) as f64;
         write!(
             f,
-            "model={} bench={:?} mode={} attn={:?} direct_vmm_dma={} cache_policy={} 2q_kin={}% 2q_kout={}% route_j={} route_m={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={}",
+            "model={} bench={:?} mode={} attn={:?} direct_vmm_dma={} pilot={} cache_policy={} 2q_kin={}% 2q_kout={}% route_j={} route_m={} trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={}",
             self.model,
             self.bench,
             self.mode,
             self.attn,
             self.direct_vmm_dma,
+            self.pilot,
             self.cache_policy,
             self.two_q.kin_pct(),
             self.two_q.kout_pct(),
@@ -298,6 +303,7 @@ mod tests {
             model: "/nonexistent".into(),
             bench: Some(1),
             direct_vmm_dma: false,
+            pilot: false,
             trace: trace.map(String::from),
             prompt: None,
             cache_policy: policy.into(),
