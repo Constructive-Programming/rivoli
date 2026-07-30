@@ -58,9 +58,23 @@ expert-disk time **22.9 s → 9.1 s (−60%)** (commit `248d78b`).
 
 ## Why the payoff differs for us
 
-Colibri is disk-bound; we are not, any more. Our fetch is **92% hidden** behind the
-async expert stream and the bottleneck is compute (route 134 ms + moe-gpu 226 ms of a
-388 ms wall). So do **not** expect the win to show up as fetch wall.
+> **RETRACTED 2026-07-30 — this section had it backwards, and it inverts the plan's
+> payoff.** It read: "Colibri is disk-bound; we are not, any more. Our fetch is **92%
+> hidden** … So do **not** expect the win to show up as fetch wall."
+>
+> We *are* disk-bound. The "92% hidden" figure derives from `compute_gpu_ns`, a HipEvent
+> **bracket** over the whole MoE phase that contains the fetch stalls it was used to rule
+> out — so stall time was being counted as compute, and therefore as fetch hidden. Bucketing
+> the bracket by per-layer miss count (38,400 layer-instances) separates them: a zero-miss
+> layer costs 1563 µs → **117 ms/token of real compute** (corroborated independently by
+> `moe_bench.rs` at 113 ms), while each miss adds **1239 µs**. Against 2.25 GB/token of
+> fetch at ~12 GB/s ⇒ **~181 ms of transfer vs 117 ms of compute**. See ARCHITECTURE.md §3.
+>
+> **So expect the win exactly where this said not to look: fetch wall.** Fewer misses is
+> now the *only* lever that raises the ceiling — perfect overlap alone floors at ~283 ms/tok
+> (~3.5 tok/s), and past that the term to cut is bytes moved. That makes this plan more
+> valuable than when it was written, not less, but for the opposite reason: raise hit rate
+> to move fewer bytes, not to unblock host-gated launches.
 
 Where it should show up instead:
 

@@ -89,8 +89,10 @@ computing the resident/already-loaded ones.
 
 `src/stream.rs` + `kernels/async.hip`. A routed-expert miss is a random NVMe read of one
 O_DIRECT-aligned block (a whole `gate‖up‖down` expert). A single read is latency-bound
-(~4 GB/s); the array delivers ~5.8–6.7 GB/s only at queue depth ≥ 4. So the fetcher's job
-is to **keep the queue full**:
+(~4 GB/s); the array delivers ~5.8–6.7 GB/s at queue depth ≥ 4, and **~11 GB/s at the
+deeper queues a real MoE layer produces** (measured 2026-07-30 in-engine: 2.25 GB/token
+over a 206 ms fetch window = 10.9 GB/s aggregate, 12.4 GB/s marginal per added miss). So
+the fetcher's job is to **keep the queue full**:
 
 - **Submit-all, join-once.** A MoE layer submits *all* its cold reads to the ring at once,
   so they hit the NVMe concurrently, and joins once — not read-by-read.
@@ -101,14 +103,39 @@ is to **keep the queue full**:
   SQPOLL is refused.
 - **Two destination modes.** BOUNCE (default): read into a pinned host arena, then
   `hipMemcpyAsync` into the VMM slot. DIRECT (`--direct-vmm-dma`): DMA straight into VMM.
-  Bounce is the default because reading weights back out of host-mapped VMM costs ~40% on
-  the MoE dot (the system-vs-device read tax) — more than the H2D copy it would save — and
-  it sidesteps an amdgpu kernel bug that EFAULTs on O_DIRECT DMA into VMM pages.
+  Bounce is the default because DMA into VMM device pages is *write*-slow — 5.66 GB/s vs
+  12.4 GB/s into the pinned arena — so DIRECT more than doubles the cost of a miss. It also
+  sidesteps an amdgpu kernel bug that EFAULTs on O_DIRECT DMA into VMM pages.
+  **Ablated 2026-07-30** (int3-vq/dense/lru @512): marginal cost per missed expert 1239 µs
+  (bounce) → 2709 µs (DIRECT); 386 → 837 ms/tok; 2.59 → 1.19 tok/s. The read side is
+  untouched — the flag only flips the streamer's `bounce` destination and never changes pool
+  allocation, so kernels read the same device-local VMM in both modes (zero-miss layer
+  1563 vs 1525 µs). An earlier version of this bullet credited a ~40% MoE-dot read tax from
+  host-mapped VMM; the flag does not produce that configuration.
 - The module owns all the **O_DIRECT alignment math** (block-aligned offset, length, and
   buffer) so the rest of the engine deals in logical `(fd, begin, len)` read-specs.
 
-The payoff: on the full model, fetch is **~95% hidden** behind compute — the engine is
-compute-bound, not disk-bound, at the working budget.
+The payoff: fetch overlaps compute rather than serializing behind it — reads for a layer's
+misses go to the device concurrently and each expert's kernel launches as its own bytes
+land, so a miss costs ~1239 µs against a ~2700 µs serialized read.
+
+**But the engine is DISK-bound, not compute-bound** — the reverse of what this section
+claimed until 2026-07-30. At 75.6% hit rate a token fetches 146.65 experts × 15.34 MB =
+**2.25 GB**, which even at the ~12 GB/s marginal rate is **~181 ms of transfer** against
+only **117 ms of compute** (a zero-miss layer is 1563 µs × 75 MoE layers; `moe_bench.rs`
+independently floors the kernels at 113 ms). You cannot hide 181 ms behind 117 ms.
+
+The retracted "~95% hidden" came from `1 − (moe_wall − compute_gpu)/fetch_wall`, where
+`compute_gpu` is a **bracket** (a HipEvent span over the whole MoE phase) that *contains*
+the stalls it is being used to rule out. Every millisecond blocked on a missing expert was
+counted as compute, hence as fetch successfully hidden. The true ceiling is
+`compute/fetch_wall` = 117/206 = **≤57%**. The arithmetic settles it: at 95% hidden the MoE
+phase should be ~125 ms against a measured `moe_wall` of 266 ms, a 141 ms hole; under the
+stall reading 117 + 149 = 266 closes exactly.
+
+Consequence for the roadmap: perfect overlap floors at `max(117, 181) + ~102 route ≈ 283
+ms/tok` (**~3.5 tok/s** vs 2.59 today). Past that, only moving *fewer bytes* helps — hit
+rate or a smaller expert format — not better timing.
 
 ---
 

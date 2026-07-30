@@ -1358,8 +1358,12 @@ remains the token, because the signature is shared with HIP — but it is now a 
 
 ### The performance property lives in the CONCURRENCY, and vk.rs has none
 
-The engine's headline behaviour — fetch ~95% hidden behind compute (`benchmarks.md`) —
-comes from **two independent streams**:
+The engine's headline behaviour — fetch overlapping compute on **two independent streams**
+— is what this section is about. (The "~95% hidden" number it originally cited was
+retracted 2026-07-30: it came from a bracket containing its own stalls, and the engine is
+in fact fetch-bound. See ARCHITECTURE.md §3. The *structural* argument below is unaffected
+— concurrency is still exactly what makes the overlap possible, and matters more now, not
+less, since fetch is the binding constraint.)
 
 | piece | where |
 |---|---|

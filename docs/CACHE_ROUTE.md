@@ -54,10 +54,13 @@ effects on the eviction clock.
 
 Two rivoli-specific bonuses beyond the paper's model: every avoided miss also avoids an
 **admission**, therefore an **eviction**, and in `--mode hybrid` sometimes a
-**compaction** (a synchronous device memcpy relocating a boundary slot). And since our
-fetch is already 92% hidden, the win lands as fewer host-gated compute bubbles in
-`moe-gpu` rather than as fetch wall — the same mechanism the all-int4 investigation
-identified.
+**compaction** (a synchronous device memcpy relocating a boundary slot).
+
+~~And since our fetch is already 92% hidden, the win lands as fewer host-gated compute
+bubbles in `moe-gpu` rather than as fetch wall.~~ **Retracted 2026-07-30:** "92% hidden"
+came from a bracket that contained the very stalls it was used to rule out. The engine is
+fetch-bound (~181 ms of transfer vs 117 ms of compute), so the win lands **as fetch wall**,
+which is the larger prize. See ARCHITECTURE.md §3 and CACHE_PILOT.md.
 
 ## Design
 

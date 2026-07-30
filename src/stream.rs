@@ -16,10 +16,16 @@
 //! VMM. Bounce is the default AND a WORKAROUND for an amdgpu kernel bug (6.18.38-
 //! gentoo, 2026-07-17) that EFAULTs on io_uring/O_DIRECT DMA into VMM device memory
 //! (can't `get_user_pages` those pages; regression vs ≤6.18.35-r1). The EFAULT is gone
-//! on 6.18.38 but bounce stays the default: reading weights from host-mapped VMM costs
-//! ~40% on `mlp` (the system-vs-device read tax, docs/hip-apu-memory.md) — far more than
-//! the H2D copy it saves. Repro: docs/probes/iouring_vmm.cpp (faults into VMM) vs the
-//! iou_host probe (pinned host succeeds).
+//! on 6.18.38 but bounce stays the default, and the reason is WRITE-side, not read-side:
+//! DMA-ing into VMM device pages runs at 5.66 GB/s vs 12.4 GB/s into the pinned arena, so
+//! DIRECT more than doubles the cost of a miss. Measured 2026-07-30, int3-vq/dense/lru
+//! @512: marginal cost per missed expert 1239 us (bounce) -> 2709 us (DIRECT), 2.59 ->
+//! 1.19 tok/s. The read side is UNCHANGED — `--direct-vmm-dma` only flips this module's
+//! `bounce` flag and never touches pool allocation, so kernels read the same device-local
+//! VMM either way: a zero-miss layer costs 1563 us (bounce) vs 1525 us (DIRECT), equal
+//! within noise. (An earlier note here blamed a ~40% `mlp` read tax from host-mapped VMM;
+//! that configuration is not what this flag produces.) Repro:
+//! docs/probes/iouring_vmm.cpp (faults into VMM) vs the iou_host probe (pinned host).
 //!
 //! SQPOLL is requested on the ring (own poller thread). Without it, submit is an
 //! `io_uring_enter` in which the CALLING thread walks the SQEs and drives the

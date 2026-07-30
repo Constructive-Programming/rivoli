@@ -70,9 +70,34 @@ adaptive split holds a smaller working set here.
 | hybrid / 2q  | 375 | 115 | 242 (233) | 194 (95%) | 139.7 | 2.14 |
 | hybrid / arc | 398 | 116 | 262 (253) | 218 (96%) | 145.8 | 2.24 |
 
-Fetch is ~95% hidden behind compute everywhere — the engine is compute-bound (route +
-moe-gpu), not fetch-bound, at this budget. hybrid/lru's edge is the fewest misses/tok
-(116 vs ~132–145) → lowest fetch and lowest MoE wall.
+> **RETRACTED 2026-07-30.** This read: "Fetch is ~95% hidden behind compute everywhere —
+> the engine is compute-bound (route + moe-gpu), not fetch-bound, at this budget." Both
+> halves are wrong. The hidden-% column is computed from `compute_gpu_ns`, a HipEvent
+> **bracket** spanning the whole MoE phase, so the fetch stalls *inside* it were counted as
+> compute and thus as fetch hidden. Real ceiling is `compute/fetch_wall` ≈ **57%**, and the
+> engine is **fetch-bound**: 2.25 GB/token at ~12 GB/s is ~181 ms of transfer against
+> 117 ms of compute. The per-miss cost is 1239 µs, measured by bucketing the bracket by
+> per-layer miss count. See ARCHITECTURE.md §3. **The hidden-% column in the table above is
+> unreliable; the ms/tok, misses/tok and tok/s columns are unaffected.**
+
+hybrid/lru's edge is the fewest misses/tok (116 vs ~132–145) → lowest fetch and lowest MoE
+wall. That ordering *is* still meaningful — and reads more directly now: under a fetch-bound
+engine, fewest bytes moved wins, which is exactly what the tok/s column shows.
+
+### DIRECT vs BOUNCE ablation (2026-07-30, int3-vq/dense/lru, `--max-mem 115`, 512 tok)
+
+Run to test whether the per-miss cost was serialized H2D staging (all bounce copies share
+one FIFO fetch stream). It is not — removing the copies made it **2.2× worse**:
+
+| | 0-miss layer | per-miss | ms/tok | tok/s |
+|---|--:|--:|--:|--:|
+| bounce (default) | 1563 µs | **1239 µs** | 386 | **2.59** |
+| `--direct-vmm-dma` | 1525 µs | **2709 µs** | 837 | **1.19** |
+
+DIRECT's 2709 µs/miss is 15.34 MB / 5.66 GB/s — one expert at the array's *serialized*
+rate. Bounce's 1239 µs is 12.4 GB/s, ~2.2× that, so the concurrent-submit path is working
+as designed. The zero-miss rows being equal (1563 vs 1525 µs) also shows the flag does not
+change where kernels read from — it only flips the streamer's DMA destination.
 
 ---
 
