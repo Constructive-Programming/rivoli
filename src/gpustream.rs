@@ -117,6 +117,17 @@ impl HipStream {
         Self::new()
     }
 
+    /// The MISS stream: experts whose bytes are still arriving, kept off the compute stream
+    /// so their device-side wait overlaps resident compute instead of following it.
+    ///
+    /// A stream is FIFO, so a wait sitting on the compute stream is only REACHED after the
+    /// residents finish, and the GPU's wake latency then lands on the critical path — a
+    /// measured +382 us per layer-with-misses. On its own stream the same wait starts at the
+    /// top of the layer and its latency is absorbed by the ~1557 us of resident work.
+    pub fn miss() -> Result<Self> {
+        Self::new()
+    }
+
     #[inline]
     pub fn raw(&self) -> *mut c_void {
         self.0

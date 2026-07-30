@@ -49,6 +49,21 @@ impl Stream {
         Ok(Stream(Q::Fetch))
     }
 
+    /// The MISS stream. **Maps to `Q::Moe` — the same queue as `compute()` — because this
+    /// backend has exactly three queues and none to spare.**
+    ///
+    /// That is a lost optimisation, not a correctness gap. The overlap win (a miss's wait
+    /// starting at the top of the layer rather than after the residents) simply does not
+    /// happen here; every guarantee still does, because each miss is launched behind its own
+    /// ticket wait either way. Nor can it deadlock: the join's `signal` is enqueued before
+    /// its `wait` in program order, so on one queue the signal is always reached first.
+    ///
+    /// Give this its own `Q` variant when a fourth queue is available — `Q::COUNT` and the
+    /// exhaustive matches on `Q` will name every site that needs updating.
+    pub fn miss() -> Result<Self> {
+        Ok(Stream(Q::Moe))
+    }
+
     #[inline]
     pub fn raw(&self) -> *mut c_void {
         self.0.tag()

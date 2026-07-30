@@ -16,7 +16,7 @@
 #![cfg(any(feature = "rocm", feature = "vulkan"))]
 
 use crate::attn::{AttnMode, streaming_rows};
-use crate::backend::{
+use crate::backend::{Timeline, 
     Event, ExpertDesc, Signal, Stream, device_sync, launch_append_kv, launch_argmax,
     launch_attend, launch_embed_i8_row, launch_flag_nonfinite, launch_gather_rope,
     launch_gemv_f32, launch_gemv_fp8, launch_gemv_i8,
@@ -455,6 +455,15 @@ pub struct GpuEngine<'a> {
     /// run here concurrently with the fetch stream's loads (the overlap). Separate
     /// from the null stream the rest of the forward uses.
     compute_stream: Stream,
+    /// Experts whose bytes are still arriving launch HERE, not on `compute_stream`. See
+    /// `Stream::miss` for why, and the launch loop for the join that puts the partials back
+    /// together.
+    miss_stream: Stream,
+    /// Cross-stream join for the MoE reduce: the miss stream signals it once its experts are
+    /// done, and the compute stream waits on that value before reducing. Monotonic across
+    /// the whole run — a value is never reused, so a stale wait cannot be satisfied early.
+    moe_join: Timeline,
+    join_n: u64,
     /// Compute-stream span events (bracket the MoE partials+reduce) + the expert
     /// stream's task monitor (idle = load-wait, poll = launch) — the accurate timing
     /// the async overlap hides from wall-clock.
@@ -643,6 +652,9 @@ impl<'a> GpuEngine<'a> {
             argmax_host: Vec::with_capacity(12),
             prof: Profile::default(),
             compute_stream: Stream::compute()?,
+            miss_stream: Stream::miss()?,
+            moe_join: Timeline::new()?,
+            join_n: 0,
             moe_ev_start: Event::new()?,
             moe_ev_end: Event::new()?,
             #[cfg(feature = "trace")]
@@ -1464,6 +1476,7 @@ impl<'a> GpuEngine<'a> {
                 let w_ptr = self.wexpert_buf.ptr() as *const f32;
                 let (cb0, cb1, cb2) = (self.codebooks[0], self.codebooks[1], self.codebooks[2]);
                 let cs_raw = self.compute_stream.raw();
+                let ms_raw = self.miss_stream.raw();
                 let inter = cfg.moe_inter;
                 // Bracket the compute-stream span (partials+reduce) for the accurate
                 // GPU-side timing; read at the end-of-layer join. Caveat: each partial
@@ -1580,28 +1593,55 @@ impl<'a> GpuEngine<'a> {
                     }
                     i = j;
                 }
-                // THEN the misses, each behind its own device-side wait. No host round trip:
-                // the whole layer is enqueued before any of it has to have landed, which is
-                // what INV-4 buys and what `hipStreamWaitEvent` could not.
+                // THEN the misses — on the MISS STREAM, not this one. A stream is FIFO, so
+                // a wait enqueued here is only REACHED after the residents above finish, and
+                // the GPU's wake latency then lands on the critical path: measured +382 us
+                // per layer-with-misses (a 1-miss layer cost +145 us over 0-miss when the
+                // host gated it, +527 us when this stream did). On its own stream the same
+                // wait starts at the top of the layer and that latency is absorbed by the
+                // ~1557 us of resident compute running beside it.
+                //
+                // Both streams write `partial`, at DISJOINT rows — the same independence
+                // that already lets a run of experts batch into one dispatch. Ordering AND
+                // visibility across the join were probed rather than assumed
+                // (docs/probes/waitvalue_visibility.hip): 0 mismatches over 8.4e8 checks.
+                let mut any_miss = false;
                 for e in 0..ndesc {
                     if tickets[e].is_resident() {
                         continue;
                     }
-                    self.pin.wait_on(tickets[e], cs_raw)?;
+                    any_miss = true;
+                    self.pin.wait_on(tickets[e], ms_raw)?;
                     // SAFETY: as above; this expert's bytes are gated by the wait just
                     // enqueued on the same stream.
                     unsafe {
                         if fmt[e] {
                             launch_moe_expert_range_i4(
-                                x_c, hidden, inter, e, 1, descs_ptr, w_ptr, h_c, part_c, cs_raw,
+                                x_c, hidden, inter, e, 1, descs_ptr, w_ptr, h_c, part_c, ms_raw,
                             )?;
                         } else {
                             launch_moe_expert_range(
                                 x_c, hidden, inter, e, 1, descs_ptr, cb0, cb1, cb2, w_ptr, h_c,
-                                part_c, cs_raw,
+                                part_c, ms_raw,
                             )?;
                         }
                     }
+                }
+                // THE JOIN. `moe_reduce` needs every partial, so the compute stream waits for
+                // the miss stream's experts before reducing. Skipped entirely when the layer
+                // had no misses — most layers pay nothing for this.
+                //
+                // The signal is enqueued BEFORE the wait in program order, which matters on a
+                // backend where both handles are the same queue (Vulkan, see `Stream::miss`):
+                // there the signal is simply reached first, rather than deadlocking behind a
+                // wait for a value only it can produce.
+                //
+                // `join_n` never repeats, so a wait can never be satisfied by an earlier
+                // layer's signal — the bug a per-layer flag would have.
+                if any_miss {
+                    self.join_n += 1;
+                    self.moe_join.signal(ms_raw, self.join_n)?;
+                    self.moe_join.wait(cs_raw, self.join_n)?;
                 }
                 // The load Signals are no longer awaited per expert — the GPU gates itself
                 // now. They remain the reaper's error/teardown channel (it resolves them on
