@@ -52,10 +52,10 @@ struct Args {
     #[arg(long, default_value_t, value_parser = rivoli::config::Mode::parse)]
     mode: rivoli::config::Mode,
 
-    /// Routed-expert cache policy. `top-m` also routes toward resident experts
-    /// (--route-j/--route-m, docs/CACHE_ROUTE.md) and is the only one that changes the
-    /// model's output.
-    #[arg(long, default_value = "2q", value_parser = ["lru", "2q", "arc", "top-m"])]
+    /// Routed-expert cache policy. All three are output-neutral: routing never consults
+    /// residency (see math.rs `inv_1_routing_never_consults_the_cache`), so a policy change
+    /// moves throughput and hit rate, never the tokens produced.
+    #[arg(long, default_value = "2q", value_parser = ["lru", "2q", "arc"])]
     cache_policy: String,
 
     /// 2Q's A1in probation bound, percent of pool capacity. Ignored by lru/arc.
@@ -67,13 +67,7 @@ struct Args {
     #[arg(long = "2q-kout", value_name = "PCT", default_value_t = rivoli::cache::TwoQSplit::default().kout_pct())]
     two_q_kout: u32,
 
-    /// `top-m`'s J: the top-J ranked candidates are sacred (never substituted).
-    #[arg(long = "route-j", value_name = "N", default_value_t = rivoli::hybrid::RouteAdvice::default().j)]
-    route_j: usize,
 
-    /// `top-m`'s M: the residency-preferring window. Ignored by every other policy.
-    #[arg(long = "route-m", value_name = "N", default_value_t = rivoli::hybrid::RouteAdvice::default().m)]
-    route_m: usize,
 
     /// Device budget in GiB, taken LITERALLY — no OS reserve, so it may OOM at build.
     /// Without it the budget auto-sizes to `free − 16 GiB`.
@@ -104,12 +98,13 @@ struct Args {
     #[arg(long)]
     direct_vmm_dma: bool,
 
-    /// Speculatively prefetch the NEXT layer's top-ranked expert (CACHE_PILOT Step 2).
-    /// Runs layer L+1's router against layer L's post-attention residual and issues the
-    /// rank-0 guess a layer early — measured at 99% precision (docs/CACHE_PILOT.md), which
-    /// is the only reason a speculative fetch pays on a bandwidth-bound engine.
-    #[arg(long)]
-    pilot: bool,
+    /// How many top-ranked LOOKA predictions per horizon (L+1 and L+2) to feed the cache
+    /// policy as eviction vetoes. ALWAYS ON; pass 0 to disable. Runs the target layer's
+    /// router against this layer's post-attention residual; measured precision by rank is
+    /// 99/96/93/87/78/67/55/42% (docs/CACHE_PILOT.md). A hint only vetoes eviction — it
+    /// never changes routing — so output is bit-identical at every value.
+    #[arg(long, value_name = "K", default_value_t = rivoli::gpu::DEFAULT_HINT_K)]
+    hint_k: usize,
 
     /// Dump the routed-expert access trace (v2: demand keys plus the ranked candidate
     /// window) for the offline `replay` sim.
@@ -121,8 +116,9 @@ struct Args {
     prompt: Option<String>,
 
     /// Score this file TEACHER-FORCED and write one NLL per predicted token to --ppl-out
-    /// instead of generating. The quality gate for `top-m` (docs/CACHE_ROUTE.md
-    /// "Quality"); never a free-running decode.
+    /// instead of generating. The quality instrument for any change that CAN move output
+    /// (a format or a kernel); never a free-running decode. Cache changes no longer need it
+    /// — routing is residency-blind, so they are output-neutral by construction.
     #[arg(long, value_name = "TEXT_FILE", requires = "ppl_out")]
     ppl: Option<String>,
 
@@ -167,14 +163,6 @@ fn moe_gain_in_band(s: &str) -> Result<f32, String> {
         Ok(g)
     } else {
         Err(format!("{g} is outside [0.5, 1.5]"))
-    }
-}
-
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
-impl Args {
-    /// `top-m`'s (J, M) in the form `hybrid`/`config` want it.
-    fn route(&self) -> rivoli::hybrid::RouteAdvice {
-        rivoli::hybrid::RouteAdvice { j: self.route_j, m: self.route_m }
     }
 }
 
@@ -282,7 +270,6 @@ fn main() -> Result<()> {
     let a_cache_policy = a.cache_policy.clone();
     let a_attn = format!("{attn:?}").to_lowercase();
     let (a_max_mem, a_bench) = (a.max_mem, a.bench);
-    let a_route = a.route();
     let (a_2q_kin, a_2q_kout) = (a.two_q_kin, a.two_q_kout);
     let (a_sinks, a_window, a_misa_heads) = (a.sinks, a.window, a.misa_heads as usize);
     #[cfg(feature = "trace")]
@@ -292,12 +279,11 @@ fn main() -> Result<()> {
         a.model,
         a.bench,
         a.direct_vmm_dma,
-        a.pilot,
+        a.hint_k,
         a.trace,
         a.prompt,
         a.cache_policy,
         rivoli::cache::TwoQSplit::new(a.two_q_kin, a.two_q_kout)?,
-        a_route,
         // GiB -> BYTES. The flag is documented and value_named in GiB and every consumer
         // (`Config::max_mem`, the pool cap, the log line's `/ GIB`) is in bytes. The clap
         // migration dropped this multiply, so `--max-mem 115` asked for 115 BYTES and the
@@ -500,7 +486,6 @@ fn main() -> Result<()> {
             cfg.trace.as_deref(),
             &cfg.cache_policy,
             cfg.two_q,
-            cfg.route,
             want_indexer,
             cfg.mode,
         )?;
@@ -513,7 +498,7 @@ fn main() -> Result<()> {
             None => prompt_ids.len() + ngen + 1,
         };
         let mut engine = rivoli::gpu::GpuEngine::new(pin, &mc, max_ctx, cfg.attn.clone())?;
-        engine.set_pilot(cfg.pilot);
+        engine.set_hint_k(cfg.hint_k);
         #[cfg(feature = "trace")]
         engine.set_checksum_x(cfg.checksum_x);
         engine.set_moe_gain(a_moe_gain);
@@ -537,18 +522,11 @@ fn main() -> Result<()> {
             let mean = nlls.iter().map(|&v| v as f64).sum::<f64>() / nlls.len().max(1) as f64;
             let (hits, misses) = (engine.hits(), engine.misses());
             let hit_pct = 100.0 * hits as f64 / (hits + misses).max(1) as f64;
-            let swap = engine.swap_pct();
-            // The (J, M) actually in force, or None when the policy ignores them.
-            let top_m = (cfg.cache_policy == "top-m").then_some((cfg.route.j, cfg.route.m));
             info!(
                 "PPL: {:.6} (mean NLL {mean:.6} over {} predicted tokens, {dt:.1}s) | \
-                 hit {hit_pct:.2}% | swap {}",
+                 hit {hit_pct:.2}%",
                 mean.exp(),
                 nlls.len(),
-                match swap {
-                    Some(s) => format!("{s:.2}%"),
-                    None => "n/a".to_string(),
-                },
             );
             // Per-token NLLs are the actual deliverable: two runs over the same text are
             // PAIRED at every position, and differencing them detects a systematic shift
@@ -560,23 +538,14 @@ fn main() -> Result<()> {
                 );
                 writeln!(
                     w,
-                    "# rivoli-nll v1 mode={} policy={} j={} m={} moe_gain={a_moe_gain} tokens={} hit_pct={hit_pct:.4} swap_pct={}",
+                    "# rivoli-nll v1 mode={} policy={} moe_gain={a_moe_gain} tokens={} hit_pct={hit_pct:.4}",
                     cfg.mode,
                     cfg.cache_policy,
-                    // `--route-j`/`--route-m` default to (2, 12) whatever the policy, so a
-                    // baseline run would otherwise record knobs it never consulted. This
-                    // file is the measurement of record; a reader must be able to tell the
-                    // baseline from a cell by its header alone — which is also why
-                    // `moe_gain` is here: a gain sweep differs in NOTHING else, so six
-                    // arms would otherwise write six identical headers and `bin/ppl`
-                    // would label them identically. It goes AFTER j/m, not before:
-                    // `bin/ppl` labels cells with `split_whitespace().take(3)`, so a field
-                    // inserted third would push `j=`/`m=` out of every label and collide
-                    // the top-m cells this ordering exists to keep apart.
-                    top_m.map_or("na".into(), |(j, _)| j.to_string()),
-                    top_m.map_or("na".into(), |(_, m)| m.to_string()),
+                    // `moe_gain` is in the header because a gain sweep differs in NOTHING
+                    // else: six arms would otherwise write six identical headers and
+                    // `bin/ppl` would label them identically. `bin/ppl` labels cells with
+                    // `split_whitespace().take(3)`, so the first three fields are the label.
                     nlls.len(),
-                    swap.map_or("na".to_string(), |s| format!("{s:.4}")),
                 )?;
                 for v in &nlls {
                     writeln!(w, "{v:.8}")?;
@@ -597,14 +566,6 @@ fn main() -> Result<()> {
             summary.tok_per_s,
             summary.hit_pct,
         );
-        // Only meaningful under --pilot; silent otherwise so the default line is unchanged.
-        let (spec_issued, spec_used) = engine.spec();
-        if spec_issued > 0 {
-            info!(
-                "  pilot: {spec_issued} speculative fetches issued, {spec_used} used ({:.1}% live precision)",
-                100.0 * spec_used as f64 / spec_issued as f64,
-            );
-        }
         // OTLP: one decode span carrying the always-on summary (opt-in via
         // OTEL_EXPORTER_OTLP_ENDPOINT; log-only otherwise). Exported synchronously on
         // drop — no async runtime.
@@ -664,9 +625,7 @@ fn main() -> Result<()> {
                 d.start,
             );
         }
-        // The run's identity for the root span. `route_jm` is Some only under top-m,
-        // which is the only policy that substitutes — a (4, 9) next to lru would read as
-        // a setting that did something.
+        // The run's identity for the root span.
         let run = rivoli::telemetry::RunInfo {
             model: a_model.clone(),
             mode: cfg.mode.to_string(),
@@ -676,7 +635,6 @@ fn main() -> Result<()> {
             bench_tokens: a_bench,
             prompt: cfg.prompt.clone(),
             moe_gain: a_moe_gain,
-            route_jm: (a_cache_policy == "top-m").then_some((a_route.j, a_route.m)),
             two_q_kin: a_2q_kin,
             two_q_kout: a_2q_kout,
             sinks: a_sinks,

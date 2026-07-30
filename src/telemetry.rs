@@ -428,8 +428,6 @@ pub struct RunInfo {
     pub prompt: Option<String>,
     pub moe_gain: f32,
     /// `--cache-policy top-m`'s (J, M); None under every other policy, where a 0 would
-    /// read as a measurement of something that did not happen.
-    pub route_jm: Option<(usize, usize)>,
     pub two_q_kin: u32,
     pub two_q_kout: u32,
     pub sinks: usize,
@@ -504,8 +502,6 @@ pub struct ProfileSummary {
     /// the true top-K — the quality cost of cache-conditional routing, and per
     /// docs/CACHE_ROUTE.md "Counters" the one number you tune (J, M) against. `None`
     /// under lru/2q/arc, which never substitute; printing 0.0% there would read as a
-    /// measurement of something that did not happen.
-    pub swap_pct: Option<f64>,
 
     // ---- CLASS spans: what the machine was DOING. All directly measured ----
     // These OVERLAP and may sum to MORE than `wall_ms`. `io_wait_ms` runs on the reaper
@@ -643,13 +639,7 @@ impl ProfileSummary {
                 self.idx_layers_per_tok,
             );
         }
-        if let Some(swap) = self.swap_pct {
-            tracing::info!(
-                "  route: swap {swap:.2}% of chosen slots were outside the true top-K \
-                 (cache-conditional routing; hit% above is NOT comparable to a run \
-                 without it — see docs/CACHE_ROUTE.md \"Risks\")"
-            );
-        }
+
     }
 }
 
@@ -748,10 +738,7 @@ mod otlp {
         if let Some(p) = &run.prompt {
             span.set_attribute(KeyValue::new("rivoli.prompt", p.clone()));
         }
-        if let Some((j, m)) = run.route_jm {
-            span.set_attribute(KeyValue::new("rivoli.route_j", j as i64));
-            span.set_attribute(KeyValue::new("rivoli.route_m", m as i64));
-        }
+
         // Tokens actually generated is run shape, not a measurement of speed.
         span.set_attribute(KeyValue::new("rivoli.tokens_generated", tokens as i64));
         // Degeneration is a first-class outcome, not a footnote: a looped run's tok/s is

@@ -33,11 +33,17 @@ use crate::pin::{Fp8Mlp, IndexerPin, LayerMlp, MlpVq, Pin, TRACE_WINDOW};
 /// How many layers ahead the pilot predicts. `trace` builds evaluate both so LOOKA can
 /// report the L+2 curve; `--pilot` alone only consumes L+1's rank 0, so it pays for one
 /// rmsnorm+gemv instead of two.
+/// Default hint width per horizon. Three because p@0..2 are 99/96/93% — the ranks that are
+/// right nearly every time — while p@3 onward fall away (87, 78, 67, 55, 42%). A hint only
+/// vetoes eviction, so a wrong one costs cache headroom rather than bandwidth; the cost of
+/// widening is bounded by `hybrid::HINT_CAP_PCT`, not by wasted fetches.
+pub const DEFAULT_HINT_K: usize = 3;
+
 const PILOT_H: [usize; 2] = [1, 2];
-#[cfg(feature = "trace")]
+/// Both horizons, always. The hint layer wants L+1 AND L+2 (a two-layer lead lets a veto
+/// outlive one layer of eviction pressure), and LOOKA reports the L+2 curve from the same
+/// pass, so there is no configuration in which only one is wanted.
 const PILOT_HORIZONS: usize = 2;
-#[cfg(not(feature = "trace"))]
-const PILOT_HORIZONS: usize = 1;
 // The stash in `looka` is indexed by position in ITS horizon array; if the two drift the
 // recall counters silently attribute L+2 hits to L+1.
 #[cfg(feature = "trace")]
@@ -100,9 +106,6 @@ struct Profile {
     /// bytes off the same device, so `gb_per_tok` and `ms_per_miss` are computed over the
     /// sum. Omitting them understated the pilot's first run by 0.43 GB/token.
     spec_n: u64,
-    /// `top-m` only: chosen slots that were NOT in the true top-K. Stays 0 under every
-    /// other policy, which is why the summary reports it as an Option rather than a 0%.
-    swap_n: u64,
     route_ns: u128, // host routing (gate D2H + sigmoid/bias/top-k, + top-m substitution)
     /// The DSA indexer's HIP-event SPAN — including whatever falls between its kernels,
     /// so NOT comparable to a per-kernel microbench sum. Measured 27% above one, cause
@@ -210,7 +213,6 @@ impl Profile {
         io_wait_ns: u64,
         idle_ns: u64,
         poll_ns: u64,
-        advice: Option<(usize, usize)>,
     ) -> ProfileSummary {
         let tok = self.tokens.max(1) as f64;
         let per = |ns: u128| ns as f64 / 1e6 / tok; // ms/token
@@ -291,11 +293,6 @@ impl Profile {
             route_wait_ms: per(self.route_wait_ns),
             tail_wait_ms: per(self.tail_wait_ns),
             tail_gpu_ms: per(self.tail_gpu_ns),
-            // `hits + misses` IS the chosen-slot count (submit_layer looks each one up
-            // exactly once), so it is the same denominator hit% already uses. Reported
-            // only under `top-m` — a 0.0% next to lru would read as a measurement.
-            swap_pct: advice
-                .map(|_| 100.0 * self.swap_n as f64 / (hits + misses).max(1) as f64),
         }
     }
 }
@@ -376,19 +373,19 @@ pub struct GpuEngine<'a> {
     /// `pilot_logits` holds both horizons back-to-back so one D2H serves both.
     pilot_xn: DeviceBuf,
     pilot_logits: DeviceBuf,
-    /// `--pilot`: speculatively prefetch the rank-0 prediction for the NEXT layer.
-    /// Measured at 99% precision (docs/CACHE_PILOT.md), which is what makes a one-expert
-    /// gate worth issuing on a bandwidth-bound engine.
-    pilot: bool,
+    /// `--hint-k`: how many top-ranked predictions per horizon to feed the cache policy as
+    /// eviction vetoes. Always on; 0 disables.
+    hint_k: usize,
     /// Routing scratch for the pilot, deliberately separate from the hot path's
     /// `scores`/`choice`/`sel`/`cand` so a prediction can never perturb a real selection.
     pilot_scores: Vec<f32>,
     pilot_choice: Vec<f32>,
     pilot_sel: Vec<usize>,
-    pilot_cand: Vec<usize>,
     pilot_host: Vec<u8>,
-    /// This layer's rank-0 guess for layer+1, handed to `submit_layer`.
-    spec_req: Option<usize>,
+    /// This layer's predictions for L+1 and L+2, handed to `submit_layer` and on to the
+    /// cache policy. Rebuilt every layer; never carried, because a stale hint names a layer
+    /// that has already been decided.
+    hints: Vec<crate::hybrid::Hint>,
     // Dense-MLP fp8 SwiGLU scratch (gate/up projections, dense_inter wide).
     mlp_g: DeviceBuf,
     mlp_u: DeviceBuf,
@@ -418,11 +415,7 @@ pub struct GpuEngine<'a> {
     window: Vec<usize>,
     /// `top-m` only: the ranked top-M candidate window [`route_into`] substitutes over.
     /// Stays empty under every other policy (the advice-`None` early return never
-    /// writes it).
-    cand: Vec<usize>,
     /// The policy's routing advice, read ONCE — the policy is fixed for the run, and
-    /// `None` must stay a plain early return on the per-layer routing path.
-    route_advice: Option<(usize, usize)>,
     // Per-token host build scratch — reused every layer so the hot path allocates
     // nothing: resolved VQ descriptors + weights, the resolved batch, D2H staging.
     w: Vec<f32>,
@@ -590,13 +583,12 @@ impl<'a> GpuEngine<'a> {
             gate_logits: f(cfg.n_experts)?,
             pilot_xn: f(cfg.hidden)?,
             pilot_logits: f(cfg.n_experts * PILOT_HORIZONS)?,
-            pilot: false,
+            hint_k: DEFAULT_HINT_K,
             pilot_scores: vec![0.0; cfg.n_experts],
             pilot_choice: vec![0.0; cfg.n_experts],
             pilot_sel: Vec::with_capacity(16),
-            pilot_cand: Vec::new(),
             pilot_host: Vec::new(),
-            spec_req: None,
+            hints: Vec::new(),
             mlp_g: f(cfg.dense_inter)?,
             mlp_u: f(cfg.dense_inter)?,
             moe_out: f(cfg.hidden)?,
@@ -625,8 +617,6 @@ impl<'a> GpuEngine<'a> {
             choice: vec![0.0; cfg.n_experts],
             sel: Vec::with_capacity(cfg.top_k),
             window: Vec::new(), // grown once by the first traced layer; empty otherwise
-            cand: Vec::new(),   // ditto, for the first substituted layer
-            route_advice: pin.route_advice(),
             w: Vec::with_capacity(slots),
             codebooks: pin.codebooks(),
             mlps_vq: Vec::with_capacity(cfg.top_k),
@@ -671,25 +661,10 @@ impl<'a> GpuEngine<'a> {
     pub fn hits(&self) -> u64 {
         self.pin.hits
     }
-    /// Speculative prefetches issued, and how many the next layer actually asked for.
-    /// The ratio is LIVE precision and should track LOOKA's measured `p@0` (99% at L+1);
-    /// a large gap means the loader is not prefetching what the predictor predicted.
-    pub fn spec(&self) -> (u64, u64) {
-        (self.pin.spec_issued, self.pin.spec_used)
-    }
-
     pub fn misses(&self) -> u64 {
         self.pin.misses
     }
 
-    /// `swap%` for a run that did not go through [`Profile::summary`] — `--ppl` scores a
-    /// text rather than generating, so it never builds one. Same numerator and the same
-    /// `hits + misses` denominator, and `None` under every policy but `top-m`.
-    pub fn swap_pct(&self) -> Option<f64> {
-        self.route_advice.map(|_| {
-            100.0 * self.prof.swap_n as f64 / (self.pin.hits + self.pin.misses).max(1) as f64
-        })
-    }
 
     /// Set the MoE-branch gain (see the field and kernels/fwd.hip::vaxpy).
     pub fn set_moe_gain(&mut self, g: f32) {
@@ -699,9 +674,9 @@ impl<'a> GpuEngine<'a> {
         self.moe_gain = g;
     }
 
-    /// `--pilot`: speculatively prefetch the next layer's rank-0 predicted expert.
-    pub fn set_pilot(&mut self, on: bool) {
-        self.pilot = on;
+    /// `--hint-k`: how many predictions per horizon feed the cache policy (0 disables).
+    pub fn set_hint_k(&mut self, k: usize) {
+        self.hint_k = k;
     }
 
     /// DIAGNOSTIC: hash the residual stream after every layer (`--checksum-x`).
@@ -1161,8 +1136,11 @@ impl<'a> GpuEngine<'a> {
             // layer L+h's true input needs L's MoE output that has not been computed yet.
             // That staleness IS the thing being measured; correcting for it would measure a
             // predictor nobody can build.
-            // Runs when the prefetcher needs it (`--pilot`) or when LOOKA is measuring.
-            if self.pilot || cfg!(feature = "trace") {
+            // Stale guesses must never outlive the layer that made them: a skipped pilot
+            // (dense target) would otherwise hand the next `submit_layer` the PREVIOUS
+            // layer's predictions, which are for the wrong layer entirely.
+            self.hints.clear();
+            if self.hint_k > 0 || cfg!(feature = "trace") {
                 let mut any = false;
                 for (hi, &dh) in PILOT_H[..PILOT_HORIZONS].iter().enumerate() {
                     let t = l + dh;
@@ -1216,18 +1194,27 @@ impl<'a> GpuEngine<'a> {
                             &self.pilot_host[lo..lo + cfg.n_experts * 4],
                             self.pin.moe_bias(t),
                             cfg.top_k,
-                            None,
-                            |_| true,
                             &mut self.pilot_scores,
                             &mut self.pilot_choice,
                             &mut self.pilot_sel,
-                            &mut self.pilot_cand,
                         );
                         // The prefetch request: rank 0 of the L+1 prediction, the 99%
                         // p@0 arm. Taken before the trace-only stash so `--pilot` works in
                         // a build with no LOOKA counters at all.
-                        if self.pilot && dh == 1 {
-                            self.spec_req = self.pilot_sel.first().copied();
+                        // Emit this horizon's top-`hint_k` as eviction vetoes. `dh` is both
+                        // the horizon and the TTL: a hint for L+2 must outlive one more
+                        // layer of eviction than one for L+1.
+                        if self.hint_k > 0 {
+                            let hk = self.hint_k;
+                            self.hints.extend(
+                                self.pilot_sel.iter().take(hk).enumerate().map(|(r, &pe)| {
+                                    crate::hybrid::Hint {
+                                        key: crate::pin::expert_key(t, pe),
+                                        horizon: dh as u8,
+                                        rank: r as u8,
+                                    }
+                                }),
+                            );
                         }
                         #[cfg(feature = "trace")]
                         self.looka.stash(t, hi, &self.pilot_sel);
@@ -1304,23 +1291,18 @@ impl<'a> GpuEngine<'a> {
                 blocked(&mut self.prof.route_wait_ns, "gpu-wait/gate-d2h", || {
                     self.gate_logits.copy_out_into(&mut self.gl_host)
                 })?;
-                // `--cache-policy top-m` (advice Some) makes this cache-CONDITIONAL:
-                // residency reorders the selection below the sacred top-J. Every other
-                // policy leaves the advice None and gets the pre-top-m routing back
-                // bit-for-bit. Residency is read through `Pin::resident` →
-                // `HybridPolicy::contains`, which does not touch the eviction clock;
-                // the substitution is inside the `route_ns` clock because it IS routing.
+                // Routing is a pure function of (logits, bias, top_k) — it does NOT
+                // consult residency. `top-m` used to make it cache-conditional; removing it
+                // is what lets the LOOKA hint layer be output-neutral by construction
+                // (math.rs `inv_1_routing_never_consults_the_cache`).
                 let t_route = std::time::Instant::now();
-                self.prof.swap_n += route_into(
+                route_into(
                     &self.gl_host,
                     self.pin.moe_bias(l),
                     cfg.top_k,
-                    self.route_advice,
-                    |e| self.pin.resident(l, e),
                     &mut self.scores,
                     &mut self.choice,
                     &mut self.sel,
-                    &mut self.cand,
                 );
                 // The host half of the route region, stamped rather than derived.
                 let e_route = std::time::Instant::now();
@@ -1371,7 +1353,7 @@ impl<'a> GpuEngine<'a> {
                     &mut self.mlps_vq,
                     &mut self.fmt,
                     &mut self.hit,
-                    self.spec_req.take(),
+                    &self.hints,
                 )?;
                 // Pure host work: residency lookups + policy bookkeeping + read specs.
                 // It only ENQUEUES the reads; the reaper thread does the waiting.
@@ -1400,7 +1382,6 @@ impl<'a> GpuEngine<'a> {
                 }
                 layer_misses = (self.pin.misses - miss0) as usize;
                 self.prof.fetch_n += self.pin.misses - miss0;
-                self.prof.spec_n = self.pin.spec_issued;
                 // Routed weights: sigmoid score, sum-normalized over the routed picks,
                 // then scaled. The VQ shared expert (weight 1.0) folds into the batch.
                 self.w.clear();
@@ -1534,8 +1515,32 @@ impl<'a> GpuEngine<'a> {
                     i = j;
                 }
                 // THEN the misses, still one await + launch each. Removing the host from
-                // this path needs a device-side cross-stream wait (hipStreamWaitEvent /
-                // a timeline wait) and is the next step, not this one.
+                // this path needs a device-side cross-stream wait, and that is now a
+                // CORRECTNESS item, not just a speed one — see the warning below.
+                //
+                // WHY THE `hit` MASK IS A HAZARD, not merely an optimisation. It encodes
+                // "do not await" as host-side data, so "is this expert's data ready?" lives
+                // in three places — this mask, `signals[e]`, and `routed.is_loaded` — across
+                // two modules with nothing enforcing agreement. The speculative prefetcher
+                // made them disagree: an in-flight speculative slot marked `hit` skipped the
+                // await entirely, the substituted Signal was never consumed, and the kernel
+                // read an unwritten slot. Fixed by giving that case a third state
+                // (`spec_hold` in pin.rs), which works but ADDS a state to a design whose
+                // problem is already having too many.
+                //
+                // The structural fix is to enqueue every launch behind a device-side wait on
+                // its own copy, so resident / missing / in-flight take ONE path and the mask
+                // stops existing. `submit_layer` no longer returning a `hit` mask is the
+                // acceptance test; if the mask survives the refactor, so does the bug class.
+                //
+                // MIND THE PRIMITIVE. `hipStreamWaitEvent` reproduces this bug in a new
+                // costume: it captures the event's state at ENQUEUE time, so a wait enqueued
+                // before the reaper records the copy is a silent no-op — and enqueueing up
+                // front is the entire point. HIP needs `hipStreamWaitValue64` /
+                // `hipStreamWriteValue64` (check `hipDeviceAttributeCanUseStreamWaitValue`
+                // on gfx1151 first). Vulkan already has the right primitive: per-stream
+                // timeline semaphores from Phase 4, where waiting on value N is well-defined
+                // before the signaller runs.
                 let miss: Vec<usize> = (0..ndesc).filter(|&e| !hit[e]).collect();
                 futures_util::stream::iter(miss.clone())
                     .map(Ok::<usize, anyhow::Error>)
@@ -1910,7 +1915,6 @@ impl<'a> GpuEngine<'a> {
             self.pin.io_wait_ns().saturating_sub(io0),
             tm.total_idle_duration.as_nanos() as u64,
             tm.total_poll_duration.as_nanos() as u64,
-            self.route_advice,
         );
         summary.report();
         // LOOKA sits beside the profile rather than inside it: it is a property of the

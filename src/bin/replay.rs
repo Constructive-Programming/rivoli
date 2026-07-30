@@ -226,7 +226,7 @@ fn replay(
     // RouteAdvice::default() is inert here: substitution is `sub` below, applied by this
     // simulator, never by the policy — `replay --policy top-m` is therefore just `lru`.
     let mut p: Box<dyn HybridPolicy> =
-        hybrid::make(policy, cap, 1, 1, split, hybrid::RouteAdvice::default())
+        hybrid::make(policy, cap, 1, 1, split)
             .with_context(|| format!("unknown policy {policy}"))?;
     let mut c = Counts::default();
     let mut miss: Vec<u32> = Vec::new();

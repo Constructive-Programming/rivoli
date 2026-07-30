@@ -21,6 +21,111 @@ pub struct Admission {
     pub evicted: Vec<u32>,
 }
 
+/// A LOOKA look-ahead prediction: layer `L`'s router run against layer `L+horizon`'s gate,
+/// saying "this key will probably be wanted `horizon` layers from now".
+///
+/// **A hint is NOT an access, and the distinction is the whole design.** Measured precision
+/// by rank is 99/96/93/87/78/67/55/42% at L+1 (docs/CACHE_PILOT.md), so a hint is evidence,
+/// not fact. Every policy therefore applies exactly ONE rule — *hints veto eviction, they
+/// never promote* — because promotion on a guess corrupts the very signal each policy exists
+/// to track: 2Q's whole point is that a single access does not promote (a prediction is
+/// weaker than an access), and ARC's `p` adapts on real hits (feeding it 78%-precision
+/// guesses degrades the adaptivity it exists for).
+///
+/// Because routing no longer consults residency (`top-m` is gone), hints can only change
+/// WHICH experts stay cached, never WHICH are selected — so enabling them is
+/// **output-bit-identical by construction**, and that is the acceptance test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hint {
+    pub key: u32,
+    /// Layers ahead this prediction is for; also its time-to-live in layers.
+    pub horizon: u8,
+    /// 0 = the router's top pick. Lower is more trustworthy, and it is the tiebreak when
+    /// hints exceed the cap.
+    pub rank: u8,
+}
+
+/// Ceiling on how much of a tier hint-vetoes may protect, in percent of its byte budget.
+/// Without it a wide horizon pins so much that eviction starves and `admit` fails outright —
+/// a self-inflicted OOM from an *advisory* signal. Over the cap the highest-`rank` (least
+/// trustworthy) hints are dropped first.
+pub const HINT_CAP_PCT: usize = 25;
+
+/// The hint bookkeeping, shared by every policy so the cap and the decay exist exactly ONCE.
+///
+/// Each policy embedding this gets identical semantics for free; a policy hand-rolling its
+/// own would be free to quietly skip the guards, which is how "capped and decaying" becomes
+/// "neither" over a few refactors.
+#[derive(Default)]
+pub struct HintSet {
+    /// key -> layers remaining before this veto expires.
+    live: std::collections::HashMap<u32, u8>,
+    /// Mirror of `live`'s keys, because eviction asks this question on every victim scan and
+    /// wants a `HashSet` without rebuilding one.
+    keys: std::collections::HashSet<u32>,
+    /// Max keys allowed to hold a veto at once (0 = uncapped, used only by tests).
+    cap: usize,
+}
+
+impl HintSet {
+    /// `cap` is derived from the tier's slot count, not from the hint count — the resource
+    /// being protected is eviction headroom.
+    pub fn with_cap(cap: usize) -> Self {
+        Self { cap, ..Default::default() }
+    }
+
+    /// Merge in a batch of predictions. Rank order decides who survives the cap: rank 0 is
+    /// the router's top pick (measured 99% precision), rank 7 is a coin flip.
+    pub fn insert(&mut self, hints: &[Hint]) {
+        let mut sorted: Vec<&Hint> = hints.iter().collect();
+        sorted.sort_by_key(|h| h.rank);
+        for h in sorted {
+            // Refresh an existing veto to the longer horizon rather than double-counting.
+            if let Some(ttl) = self.live.get_mut(&h.key) {
+                *ttl = (*ttl).max(h.horizon.max(1));
+                continue;
+            }
+            if self.cap != 0 && self.live.len() >= self.cap {
+                break; // over cap: the remaining (higher-rank, less trustworthy) hints drop
+            }
+            self.live.insert(h.key, h.horizon.max(1));
+            self.keys.insert(h.key);
+        }
+    }
+
+    /// One layer elapsed. A hint that never came true must decay, or the veto set only ever
+    /// grows and eviction is permanently starved by predictions about a layer long past.
+    pub fn tick(&mut self) {
+        self.live.retain(|_, ttl| {
+            *ttl -= 1;
+            *ttl > 0
+        });
+        // `keys` mirrors `live`'s key set. Letting the two drift means eviction keeps
+        // skipping a key nothing remembers, which never surfaces as an error — only as a
+        // quietly worse hit rate — so it is re-derived here rather than patched in parallel.
+        self.keys.retain(|k| self.live.contains_key(k));
+    }
+
+    /// Drop a veto once the key is genuinely resident-and-used; keeps the cap for live
+    /// predictions rather than for confirmed ones the policy already tracks.
+    pub fn confirm(&mut self, k: u32) {
+        self.live.remove(&k);
+        self.keys.remove(&k);
+    }
+
+    pub fn keys(&self) -> &std::collections::HashSet<u32> {
+        &self.keys
+    }
+
+    pub fn len(&self) -> usize {
+        self.live.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.live.is_empty()
+    }
+}
+
 pub trait HybridPolicy {
     fn contains(&self, k: u32) -> bool;
     /// A hit refreshes recency IN its tier and returns true; a miss returns false.
@@ -34,43 +139,27 @@ pub trait HybridPolicy {
     /// the pin can't resolve its slot ("expert not resident after alloc"). Touching to
     /// MRU is NOT enough: a big/skewed batch can drain a whole tier past the MRU end.
     fn protect(&mut self, k: u32);
+    /// Feed look-ahead predictions for upcoming layers. See [`Hint`]: these VETO EVICTION
+    /// and must never promote, admit, or touch a policy's internal adaptation state.
+    ///
+    /// Defaulted to a no-op so a policy opts in rather than silently ignoring hints while
+    /// appearing to support them. Implementations delegate to [`HintSet`], which owns the
+    /// cap and the decay — the two guards that otherwise silently do not happen.
+    fn hint(&mut self, _hints: &[Hint]) {}
+    /// Keys currently vetoed by live hints; eviction skips these. Empty unless [`hint`] is
+    /// implemented.
+    fn hinted(&self) -> &std::collections::HashSet<u32> {
+        static EMPTY: std::sync::OnceLock<std::collections::HashSet<u32>> =
+            std::sync::OnceLock::new();
+        EMPTY.get_or_init(Default::default)
+    }
+    /// Advance the hint clock one layer, expiring anything whose horizon has elapsed.
+    /// Called once per MoE layer by the pin.
+    fn tick_hints(&mut self) {}
     /// Bytes currently resident — the pin/tests check this never exceeds the budget.
     fn resident_bytes(&self) -> usize;
-    /// `Some((j, m))` asks the ROUTER to prefer resident experts: the top-`j` ranked
-    /// candidates are sacred and the rest of the slots prefer residents inside the
-    /// top-`m` window (`--cache-policy top-m`, arXiv:2412.00099, docs/CACHE_ROUTE.md).
-    /// Defaulted to `None` so lru/2q/arc are untouched — and `None` is the engine's
-    /// regression guarantee, not merely a default (see [`crate::math::route_into`]).
-    fn route_advice(&self) -> Option<(usize, usize)> {
-        None
-    }
 }
 
-/// `top-m`'s (J, M) knobs. Read only by [`make`]'s `"top-m"` arm; every other policy
-/// ignores it, which is why it rides along as an argument instead of forking the
-/// constructor.
-///
-/// **Defaults are J=4, M=9 — MEASURED here, not the paper's J=2/M=12.** The paper's values
-/// were the defaults until they were measured on this workload and rejected: J=2/M=12
-/// costs +3.63% perplexity on int3-vq (lower bound +0.68%, so the cost is real) and fails
-/// outright on int4 at +12.7% with the whole interval past the bar. Shipping `top-m`
-/// opt-in with a rejected default would have meant that anyone enabling the policy without
-/// passing the knobs got the worst configuration we measured.
-///
-/// J=4/M=9 is the cell the shipping decision was made on: +5.44pp hit at 5.79% swap for
-/// +0.529% perplexity, 95% CI [-0.21%, +1.27%]. See `../benchmarks.md` and `../MODES.md`.
-/// The paper's values remain reachable with `--route-j 2 --route-m 12`; they are simply not
-/// what you get by accident.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RouteAdvice {
-    pub j: usize,
-    pub m: usize,
-}
-impl Default for RouteAdvice {
-    fn default() -> Self {
-        Self { j: 4, m: 9 }
-    }
-}
 
 /// Byte geometry shared by every policy: the budget and the two per-tier slot sizes.
 #[derive(Clone, Copy)]
@@ -89,23 +178,23 @@ impl Geom {
 }
 
 /// Construct a byte-aware hybrid policy. `split` is 2Q's Kin/Kout (ignored by lru/arc);
-/// `advice` is `top-m`'s (J, M) (ignored by everything else).
 pub fn make(
     policy: &str,
     budget: usize,
     cold_stride: usize,
     hot_stride: usize,
     split: crate::cache::TwoQSplit,
-    advice: RouteAdvice,
 ) -> Option<Box<dyn HybridPolicy>> {
     let g = Geom { budget, cold_stride: cold_stride.max(1), hot_stride: hot_stride.max(1) };
     match policy {
-        "lru" => Some(Box::new(HybridLru::new(g, None))),
-        // NOT a fourth policy implementation: `top-m` IS LRU (the paper evaluates on
-        // LRU) with the routing advice switched on. This repo deleted three duplicate
+        "lru" => Some(Box::new(HybridLru::new(g))),
+        // Three policies, three implementations. (`top-m` was a fourth NAME over the same
+        // LRU with router substitution switched on; it was removed 2026-07-30 — the LOOKA
+        // hint layer steers eviction instead of selection and is output-neutral, which
+        // top-m was not: +3.63% ppl on int3-vq, +12.7% on int4. See docs/CACHE_ROUTE.md.)
+        // This repo deleted three duplicate
         // policy families in 08db745; a copy-pasted `HybridTopM` would be that mistake
         // with a new name.
-        "top-m" => Some(Box::new(HybridLru::new(g, Some((advice.j, advice.m))))),
         "2q" => Some(Box::new(HybridTwoQ::new(g, split))),
         "arc" => Some(Box::new(HybridArc::new(g))),
         _ => None,
@@ -129,13 +218,9 @@ struct HybridLru {
     freq: HashMap<u32, u32>,
     accesses: u64,
     pinned: HashSet<u32>,
-    /// `Some((j, m))` under `--cache-policy top-m`; `None` under plain `lru`. The only
-    /// difference between the two policies — eviction, admission and byte accounting
-    /// are shared.
-    advice: Option<(usize, usize)>,
 }
 impl HybridLru {
-    fn new(g: Geom, advice: Option<(usize, usize)>) -> Self {
+    fn new(g: Geom) -> Self {
         Self {
             g,
             cold: OrderedSet::default(),
@@ -143,7 +228,6 @@ impl HybridLru {
             freq: HashMap::new(),
             accesses: 0,
             pinned: HashSet::new(),
-            advice,
         }
     }
     fn bump(&mut self, k: u32) {
@@ -221,9 +305,6 @@ impl HybridPolicy for HybridLru {
     }
     fn resident_bytes(&self) -> usize {
         self.cold.len() * self.g.cold_stride + self.hot.len() * self.g.hot_stride
-    }
-    fn route_advice(&self) -> Option<(usize, usize)> {
-        self.advice
     }
 }
 
@@ -489,53 +570,16 @@ mod tests {
 
     fn each_policy() -> Vec<(&'static str, Box<dyn HybridPolicy>)> {
         let (budget, cs, hs) = (100usize, 3usize, 4usize);
-        ["lru", "2q", "arc", "top-m"]
+        ["lru", "2q", "arc"]
             .iter()
             .map(|&n| {
-                let p = make(n, budget, cs, hs, TwoQSplit::default(), RouteAdvice::default());
+                let p = make(n, budget, cs, hs, TwoQSplit::default());
                 (n, p.expect("known policy"))
             })
             .collect()
     }
 
-    /// The advice reaches `top-m` and NOBODY else. The defaulted trait method is the
-    /// whole mechanism by which lru/2q/arc stay byte-identical, so assert it directly
-    /// rather than inferring it from the engine's behaviour.
-    #[test]
-    fn only_top_m_carries_route_advice() {
-        let adv = RouteAdvice { j: 3, m: 20 };
-        for name in ["lru", "2q", "arc"] {
-            let p = make(name, 100, 3, 4, TwoQSplit::default(), adv).expect("known policy");
-            assert_eq!(p.route_advice(), None, "{name} must not see the advice");
-        }
-        let p = make("top-m", 100, 3, 4, TwoQSplit::default(), adv).expect("top-m");
-        assert_eq!(p.route_advice(), Some((3, 20)));
-    }
 
-    /// `top-m` IS `HybridLru` — substitution happens in the router, not in the cache —
-    /// so for one and the same access sequence the two must evict identically. This is
-    /// the test that would fail if someone "helpfully" forked a `HybridTopM`.
-    #[test]
-    fn top_m_is_lru_for_a_fixed_access_sequence() {
-        let (mut a, mut b) = (
-            make("lru", 60, 3, 4, TwoQSplit::default(), RouteAdvice::default()).expect("lru"),
-            make("top-m", 60, 3, 4, TwoQSplit::default(), RouteAdvice::default()).expect("top-m"),
-        );
-        for i in 0..3000u32 {
-            let k = if i % 3 == 0 { i % 11 } else { 100 + i % 400 };
-            for p in [&mut a, &mut b] {
-                p.begin_batch();
-                if !p.get(k) {
-                    p.admit(k);
-                }
-            }
-            assert_eq!(a.contains(k), b.contains(k));
-            assert_eq!(a.resident_bytes(), b.resident_bytes(), "diverged at access {i}");
-        }
-        for k in 0..500u32 {
-            assert_eq!(a.contains(k), b.contains(k), "residency diverged on key {k}");
-        }
-    }
 
     #[test]
     fn byte_budget_and_residency_hold_for_all() {
@@ -557,7 +601,7 @@ mod tests {
         for name in ["2q", "arc"] {
             // budget 5 holds exactly one hot slot (4) — small enough that the 2nd admit
             // evicts the 1st, big enough that a HOT slot fits.
-            let mut p = make(name, 5, 3, 4, TwoQSplit::default(), RouteAdvice::default()).unwrap();
+            let mut p = make(name, 5, 3, 4, TwoQSplit::default()).unwrap();
             p.begin_batch();
             assert!(!p.get(10));
             assert_eq!(p.admit(10).tier, Tier::Cold, "{name}: first-seen must be COLD");
@@ -575,7 +619,7 @@ mod tests {
     fn lru_admits_by_frequency() {
         // LRU has no ghost: placement is the decaying counter. First-seen COLD; a key
         // re-accessed after eviction crosses the threshold → HOT.
-        let mut p = make("lru", 5, 3, 4, TwoQSplit::default(), RouteAdvice::default()).unwrap();
+        let mut p = make("lru", 5, 3, 4, TwoQSplit::default()).unwrap();
         p.begin_batch();
         assert!(!p.get(10));
         assert_eq!(p.admit(10).tier, Tier::Cold);
@@ -592,7 +636,7 @@ mod tests {
         // A frequency-skewed workload (a hot core hit via the ghost) must drive ARC's
         // `p` DOWN from 0-start toward HOT... p rises on B1 hits (recency), falls on B2.
         // Here we just assert the hot core stays resident under churn (adaptivity works).
-        let mut p = make("arc", 60, 3, 4, TwoQSplit::default(), RouteAdvice::default()).unwrap();
+        let mut p = make("arc", 60, 3, 4, TwoQSplit::default()).unwrap();
         let core: Vec<u32> = (0..5).collect();
         for round in 0..50u32 {
             for &k in &core {
@@ -622,7 +666,7 @@ mod tests {
     fn batch_never_evicts_a_key_touched_this_batch() {
         for name in ["lru", "2q", "arc"] {
             let (budget, cs, hs) = (60usize, 3usize, 4usize);
-            let mut p = make(name, budget, cs, hs, TwoQSplit::default(), RouteAdvice::default()).unwrap();
+            let mut p = make(name, budget, cs, hs, TwoQSplit::default()).unwrap();
             let mut resident: HashMap<u32, ()> = HashMap::new();
             let mut rng = 0x1234_5678u64;
             let next = |r: &mut u64| {

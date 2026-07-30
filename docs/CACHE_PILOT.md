@@ -1,7 +1,19 @@
 # rivoli — CACHE_PILOT: router-piloted cross-layer expert prefetch
 
-Status: **PARKED — but reason 1 has LIFTED (2026-07-29). Still do not build; reason 2
-stands.**
+Status: **SHIPPED 2026-07-30 — `--pilot-k`, always on, default 3.** Step 1 (LOOKA) and
+Step 2a (the speculative loader) are both built and measured; see those sections. The
+history below is kept because it records *why* this was parked twice and what changed.
+
+Both parking reasons are resolved. Reason 1 (no faithful int4) lifted 2026-07-29. Reason 2
+("no acceptance criteria of its own — accepted or removed with `top-m`") was overtaken by
+measurement: LOOKA produced a standalone gate (L+1 recall 77.2%, `p@0` 99%) and the loader
+produced a standalone result (+8–14% tok/s at K=1, output bit-identical), so this no longer
+depends on `top-m` landing. What remains coupled to `top-m` is the *int4 promotion* variant,
+not the prefetcher.
+
+The paragraph below arguing prefetch "cannot move hit% by construction" is about the
+DELETED readahead-hint prefetch, not this one — the distinction it draws turned out to be
+the right one, and the measured hit-rate rise (78.0 → 79.8%) is the confirmation.
 
 **1. ~~Blocked on a faithful int4~~ — LIFTED.** This reason said the machinery existed to
 make an L+2 **int4 promotion** affordable, while `.i4` was re-derived from `.vq3`
@@ -261,13 +273,17 @@ and clears any plausible break-even. **If Step 2 wants a minimum viable incremen
 tuning, and it exercises every piece of loader plumbing (hidden slots, eviction guard,
 demand-priority) at the lowest possible waste.
 
-## Step 2a — SHIPPED: the minimum viable loader (`--pilot`)
+## Step 2a — SHIPPED: the speculative loader (`--pilot-k`, always on, default 3)
 
-Built 2026-07-30 off the `p@0` = 99% result above: **prefetch rank 0 of L+1, and nothing
-else.** One expert per layer, no confidence tuning to get wrong, and it still exercises
-every piece of plumbing the full loader needs. If this does not move tok/s, the fault is
-in the loader rather than the predictor — a much cheaper thing to learn here than after
-building the top-7 gate.
+Built 2026-07-30 off the precision curve above. Landed first as rank-0-only to prove the
+plumbing, then widened to a configurable **top-K** and turned **always on**, default
+**K=3** — `p@0..2` are 99/96/93%, the ranks that are right nearly every time, while p@3
+onward fall away (87, 78, 67, 55, 42%). `--pilot-k 0` disables it.
+
+In-flight speculations are capped at K: anything still airborne from the previous layer
+counts against the budget, so a slow fetch throttles new speculation rather than letting the
+queue grow. Predictions are consumed in RANK order, so a narrower budget keeps the best
+guesses.
 
 **Where the speculation is allocated is the whole correctness story.** `Pin::submit_spine`
 takes a `spec_req` and allocates the predicted slot in **phase 1b, inside the same batch as

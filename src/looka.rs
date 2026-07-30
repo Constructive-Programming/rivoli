@@ -9,9 +9,11 @@
 //! fit any pool that holds one batch), so this instrumentation is the only thing that
 //! produces the number.
 //!
-//! Two horizons, because `top-m` needs L+2 and the L+1↔L+2 difference is a number nobody
-//! has. Colibri's yardstick on the same architecture (unquantized, 48 greedy tokens):
-//! **71.6% at L+1** vs **41.3%** for the previous-token null hypothesis.
+//! Two horizons, because the hint layer wants both: an L+2 veto outlives one more layer of
+//! eviction pressure than an L+1 one, and the L+1↔L+2 difference was a number nobody had.
+//! Colibri's yardstick on the same architecture (unquantized, 48 greedy tokens):
+//! **71.6% at L+1** vs **41.3%** for the previous-token null hypothesis. Measured here:
+//! **77.2% / 68.9%** against a **30.8%** null.
 //!
 //! The null hypothesis is carried here on purpose. "Predict L+h from L" only earns the
 //! loader if it beats "reuse what this layer picked last token", which costs zero compute

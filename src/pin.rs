@@ -176,28 +176,6 @@ pub struct Pin<'a> {
     fetch: AsyncFetch,
     pub hits: u64,
     pub misses: u64,
-    /// CACHE_PILOT Step 2 (minimum viable): the ONE in-flight speculative admission —
-    /// the rank-0 prediction for the next layer, measured at 99% precision
-    /// (docs/CACHE_PILOT.md). `None` when nothing is in flight or the prediction was
-    /// already resident.
-    ///
-    /// Correctness rests on two things. (1) The slot is allocated inside the SAME
-    /// `submit_spine` batch as that layer's demand misses, so relocations have settled
-    /// before any read — including this one — is issued; allocating it out-of-band would
-    /// reintroduce exactly the class the `inflight` guard exists for. (2) `alloc`
-    /// publishes the key immediately, so the next layer would otherwise count it as a hit
-    /// and hand the kernel a resolved `Signal` while the bytes are still in the air — the
-    /// READ-BEFORE-WRITE bug. `spec_signal_for` below is what prevents that.
-    spec: Option<(u32, Signal)>,
-    /// `(target layer, key)` of the most recent speculation, kept for accounting after the
-    /// signal has been dropped — a speculation whose bytes land early becomes an ordinary
-    /// resident, and without this it would score as a plain hit and never be credited.
-    spec_for: Option<(usize, u32)>,
-    /// Speculations issued, and how many the next layer actually asked for. The ratio is
-    /// live precision, and it must track LOOKA's measured `p@0` — if it does not, the
-    /// predictor and the loader disagree about what was predicted.
-    pub spec_issued: u64,
-    pub spec_used: u64,
     /// Optional access-trace sink (`--trace`), format v2: a `#` header line, then one
     /// line per resolved MoE layer — the `(layer,expert)` keys looked up in access
     /// order, then `|`, then the top-[`TRACE_WINDOW`] router candidates as
@@ -389,7 +367,7 @@ pub const TRACE_WINDOW: usize = 32;
 
 /// Pack `(layer, expert)` into the pool key. Both must fit in 16 bits — GLM is
 /// ≤92 layers × 256 routed experts, comfortably under 2^16.
-fn expert_key(layer: usize, expert: usize) -> u32 {
+pub fn expert_key(layer: usize, expert: usize) -> u32 {
     debug_assert!(
         layer < (1 << 16) && expert < (1 << 16),
         "layer {layer}/expert {expert} exceed the 16-bit pool key packing"
@@ -520,6 +498,16 @@ impl ArenaPool {
     fn get(&mut self, key: u32) -> bool {
         self.policy.get(key)
     }
+    /// Feed the policy this layer's look-ahead predictions, then advance the hint clock.
+    /// Ticking HERE (once per batch, in the pin) rather than inside each policy is what
+    /// makes the decay uniform: a policy that forgot to tick would accumulate vetoes
+    /// forever and silently starve its own eviction.
+    fn hint(&mut self, hints: &[crate::hybrid::Hint]) {
+        self.policy.tick_hints();
+        if !hints.is_empty() {
+            self.policy.hint(hints);
+        }
+    }
     fn protect(&mut self, key: u32) {
         self.policy.protect(key);
     }
@@ -610,7 +598,6 @@ impl<'a> Pin<'a> {
         trace_path: Option<&str>,
         cache_policy: &str,
         two_q: cache::TwoQSplit,
-        route: crate::hybrid::RouteAdvice,
         want_indexer: bool,
         mode: Mode,
     ) -> Result<Self> {
@@ -816,7 +803,7 @@ impl<'a> Pin<'a> {
         };
         let (cold_stride, hot_stride) = (cold.stride, hot.stride);
         let policy =
-            crate::hybrid::make(cache_policy, budget, cold_stride, hot_stride, two_q, route)
+            crate::hybrid::make(cache_policy, budget, cold_stride, hot_stride, two_q)
                 .with_context(|| {
                     format!("unknown --cache-policy {cache_policy} (lru|2q|arc|top-m)")
                 })?;
@@ -876,10 +863,6 @@ impl<'a> Pin<'a> {
             fetch,
             hits: 0,
             misses: 0,
-            spec: None,
-            spec_for: None,
-            spec_issued: 0,
-            spec_used: 0,
             trace: trace_path
                 .map(|p| -> Result<_> {
                     use std::io::Write;
@@ -926,10 +909,6 @@ impl<'a> Pin<'a> {
     /// The active policy's routing advice — `Some((j, m))` only under `--cache-policy
     /// top-m`. gpu.rs reads this ONCE at engine construction: the policy is fixed for
     /// the run, and `None` has to stay a compile-time-cheap early return on the hot
-    /// routing path.
-    pub fn route_advice(&self) -> Option<(usize, usize)> {
-        self.routed.policy.route_advice()
-    }
 
     /// Is `(layer, expert)` resident? Deliberately routed through
     /// [`HybridPolicy::contains`], which takes `&self` and does NOT refresh recency —
@@ -982,7 +961,7 @@ impl<'a> Pin<'a> {
         sel: &[usize],
         window: &[usize],
         choice: &[f32],
-        spec_req: Option<usize>,
+        hints: &[crate::hybrid::Hint],
     ) -> Result<([Option<ResolvedSlot>; 32], Vec<Signal>, [bool; 32])> {
         let cfg = self.cfg;
         let sparse = (layer - cfg.dense_layers) * cfg.n_experts; // read-table row base
@@ -1002,24 +981,10 @@ impl<'a> Pin<'a> {
             }
         }
         self.routed.begin_batch();
-        // An in-flight speculative slot must survive this batch's evictions and
-        // compaction, or a read already queued against it lands in memory that has since
-        // been handed to someone else. `protect` before phase 1b is the only window where
-        // that pin is guaranteed to precede any `alloc`.
-        //
-        // Dropped once the bytes land: from then on it is an ordinary resident and the
-        // policy's own clock should govern it. The probe is non-blocking — a `false`
-        // merely keeps it pinned one more batch, which is the safe direction.
-        let mut spec_pending = None;
-        if let Some((k, sig)) = self.spec.take() {
-            if sig.is_ready() {
-                #[cfg(feature = "trace")]
-                self.routed.mark_loaded(k);
-            } else {
-                self.routed.protect(k);
-                spec_pending = Some((k, sig));
-            }
-        }
+        // Predictions for L+1/L+2 enter the policy as eviction VETOES, never as accesses —
+        // see `hybrid::Hint`. They cannot influence `sel` (routing no longer consults
+        // residency), so this is output-neutral by construction.
+        self.routed.hint(hints);
         // Trace sink (--trace), v2: the demand keys this layer looks up, then `|`, then
         // the top-`TRACE_WINDOW` candidates as `key:choice`.
         //
@@ -1054,49 +1019,25 @@ impl<'a> Pin<'a> {
             }
             writeln!(w).context("write trace")?;
         }
-        // Was this layer the target of the previous layer's speculation? Taken (not
-        // peeked) so a prediction is credited at most once.
-        let expect = match self.spec_for {
-            Some((t, k)) if t == layer => {
-                self.spec_for = None;
-                Some(k)
-            }
-            _ => None,
-        };
         // Phase 1a: touch every hit first, so a later miss's admit can't evict it.
         let mut is_hit = [false; 32];
-        // Index of the expert whose bytes are still in the air from a speculation. Its
-        // Signal replaces the default `ready()` in phase 2 — that substitution is the
-        // whole reason a speculative admission is not a read-before-write bug.
-        let mut spec_idx: Option<usize> = None;
         for (i, &e) in sel.iter().enumerate() {
             let key = expert_key(layer, e);
             if self.routed.get(key) {
                 self.hits += 1;
-                if expect == Some(key) {
-                    self.spec_used += 1;
-                }
-                // A still-in-flight speculation is the ONE case where a hit legitimately
-                // has unlanded bytes, so it is routed around the check below rather than
-                // tripping it. It gets the real Signal instead, and the expert stream
-                // waits on that exactly as it would for a demand miss.
-                if spec_pending.as_ref().is_some_and(|(k, _)| *k == key) {
-                    spec_idx = Some(i);
-                } else {
-                    // THE CHECK. A hit hands the kernel a slot pointer and a resolved
-                    // Signal, so nothing downstream waits. If the bytes never landed, the
-                    // kernel reads uninitialised memory (NaN) or another expert's weights
-                    // (finite, wrong, silent). Reported once per occurrence rather than
-                    // fataling, so a run keeps going and the pattern is visible.
-                    #[cfg(feature = "trace")]
-                    if !self.routed.is_loaded(key) {
-                        tracing::error!(
-                            "READ-BEFORE-WRITE: layer={layer} expert={e} counted as a cache \
-                             HIT but its bytes never landed since admission. The kernel is \
-                             about to read an unloaded slot — uninitialised memory (-> NaN) \
-                             or a previous expert's weights (-> silently wrong)."
-                        );
-                    }
+                // THE CHECK. A hit hands the kernel a slot pointer and a resolved
+                // Signal, so nothing downstream waits. If the bytes never landed, the
+                // kernel reads uninitialised memory (NaN) or another expert's weights
+                // (finite, wrong, silent). Reported once per occurrence rather than
+                // fataling, so a run keeps going and the pattern is visible.
+                #[cfg(feature = "trace")]
+                if !self.routed.is_loaded(key) {
+                    tracing::error!(
+                        "READ-BEFORE-WRITE: layer={layer} expert={e} counted as a cache \
+                         HIT but its bytes never landed since admission. The kernel is \
+                         about to read an unloaded slot — uninitialised memory (-> NaN) \
+                         or a previous expert's weights (-> silently wrong)."
+                    );
                 }
                 self.routed.protect(key);
                 is_hit[i] = true;
@@ -1113,34 +1054,6 @@ impl<'a> Pin<'a> {
                 {
                     poisoned_any = true;
                 }
-            }
-        }
-        // The speculative admission for layer+1, allocated HERE — inside the same batch as
-        // the demand misses — so phase 1c resolves every slot after all relocation has
-        // settled. Allocating it anywhere else is the corruption bug this ordering exists
-        // to prevent.
-        //
-        // At most one speculation is in flight. If the previous one has not landed AND is
-        // not being consumed by this layer, we skip rather than track two: a full layer
-        // (~3.5 ms) comfortably exceeds a fetch (~1.4 ms), so this is rare, and one slot
-        // of state is worth more than the tail it gives up.
-        //
-        // ponytail: the eviction guard is implicit — every key this layer needs is already
-        // protected by phase 1a and the in-flight spec is pinned above, so a speculation
-        // can only take a victim no one in this batch wants. It does NOT yet implement the
-        // hotness-hysteresis check CACHE_PILOT asks for, which is what stops a speculation
-        // displacing a WARM resident a later layer wants. Watch expert-hit%: if it falls,
-        // that guard is the fix.
-        let can_spec = spec_pending.is_none() || spec_idx.is_some();
-        let mut spec_new: Option<(usize, u32)> = None;
-        if let (Some(pe), true) = (spec_req, can_spec) {
-            let tl = layer + 1;
-            let k = expert_key(tl, pe);
-            // Already resident is the common case (~76% hit rate) — nothing to do, and no
-            // read issued. This is what keeps the feature cheap.
-            if tl < cfg.n_layers && tl >= cfg.dense_layers && !self.routed.get(k) {
-                self.routed.alloc(k)?;
-                spec_new = Some((pe, k));
             }
         }
         // The poison fills above run on the DEFAULT stream; the reaper's bounce->slot
@@ -1181,19 +1094,6 @@ impl<'a> Pin<'a> {
                 miss_sel.push(i);
             }
         }
-        // The speculative read goes LAST in the batch. io_uring submits the whole SQ at
-        // once, so this is not a hard priority — but the tail is the cheapest honest
-        // approximation of "demand reads never queue behind speculative ones", and it
-        // costs nothing. A real priority split on the ring is the upgrade if this shows up.
-        if let Some((pe, k)) = spec_new {
-            let (hot, idx) = self
-                .routed
-                .slot(k)
-                .context("speculative slot missing after alloc")?;
-            let tl_sparse = (layer + 1 - cfg.dense_layers) * cfg.n_experts;
-            let (fd, begin, len) = self.routed.tier(hot).table[tl_sparse + pe];
-            reads.push(ReadSpec { fd, begin, len, dst: self.routed.host_ptr(hot, idx) });
-        }
         // Phase 2: hand the whole batch to the reaper — it queues+submits (all reads
         // start at once) and resolves each miss's Signal when its copy lands. Hits
         // default to `ready()`; overwrite each miss with its load Signal.
@@ -1202,39 +1102,10 @@ impl<'a> Pin<'a> {
         for &i in &miss_sel {
             self.routed.pending_loaded.push(expert_key(layer, sel[i]));
         }
-        let n_demand = miss_sel.len();
         let miss_signals = self.fetch.submit(reads)?;
         let mut signals: Vec<Signal> = (0..sel.len()).map(|_| Signal::ready()).collect();
         for (k, &i) in miss_sel.iter().enumerate() {
             signals[i] = miss_signals[k].clone();
-        }
-        // THE SUBSTITUTION. This layer asked for an expert whose speculative read has not
-        // landed. It counted as a hit (no demand read was issued for it) but its bytes are
-        // still in the air, so it must carry the REAL signal — otherwise the expert stream
-        // computes on an unwritten slot, which is precisely the failure the read-before-
-        // write detector reports.
-        if let (Some(i), Some(p)) = (spec_idx, spec_pending.as_ref()) {
-            signals[i] = p.1.clone();
-            // Loaded-tracking, and it is NOT optional. A speculation consumed while still
-            // in flight reaches neither of the two paths that set this flag: it is not a
-            // demand miss (nothing pushed it to `pending_loaded`) and it did not land
-            // before use (so the batch-start `mark_loaded` never ran). Left out, the key
-            // stays marked unloaded forever and every LATER token that hits it re-reports
-            // READ-BEFORE-WRITE — 7 such reports, all for one key, is exactly what the
-            // first --pilot run produced.
-            #[cfg(feature = "trace")]
-            self.routed.pending_loaded.push(p.0);
-        }
-        // Carry an unlanded, UNUSED speculation forward so the next batch re-pins it. One
-        // that this layer consumed is now the expert stream's problem — it awaits the
-        // signal above — so it is dropped here.
-        if spec_idx.is_none() {
-            self.spec = spec_pending;
-        }
-        if let Some((_, k)) = spec_new {
-            self.spec = Some((k, miss_signals[n_demand].clone()));
-            self.spec_for = Some((layer + 1, k));
-            self.spec_issued += 1;
         }
         Ok((slots, signals, is_hit))
     }
@@ -1259,9 +1130,9 @@ impl<'a> Pin<'a> {
         out: &mut Vec<MlpVq>,
         fmt: &mut Vec<bool>,
         hit: &mut Vec<bool>,
-        spec_req: Option<usize>,
+        hints: &[crate::hybrid::Hint],
     ) -> Result<Vec<Signal>> {
-        let (slots, signals, is_hit) = self.submit_spine(layer, sel, window, choice, spec_req)?;
+        let (slots, signals, is_hit) = self.submit_spine(layer, sel, window, choice, hints)?;
         out.clear();
         fmt.clear();
         // Which experts were already resident. `gpu.rs` uses this to launch them WITHOUT
