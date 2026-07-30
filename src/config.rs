@@ -19,15 +19,29 @@ pub const OS_RESERVE: u64 = 16 << 30;
 /// Routed-expert format mode. The always-resident set (attention, dense MLPs, shared
 /// expert) is unaffected; this only picks how the 256 routed experts/layer decode.
 /// See MODES.md for the tradeoffs.
+///
+/// # The DEFAULT is backend-dependent, and that is the lesser of two wrongs
+///
+/// `hybrid` on `rocm`, `int3-vq` on `vulkan`. The Vulkan backend has no int4 expert kernels
+/// (docs/VULKAN.md ports 16 of 29), so `validate_backend` rejects `hybrid` — which meant a
+/// bare `rivoli <model>` on a Vulkan build failed on its own default, before it read a
+/// single byte of the artifact. A first command that errors out is a bad seam, and "pick a
+/// mode this build can actually run" is a better default than "pick the mode the other
+/// build prefers and then refuse".
+///
+/// It IS a divergence, and the alternative — one default, refused half the time — was
+/// worse. `--mode` is echoed in `Config`'s Display and in the OTLP run attributes, so no
+/// measurement can silently attribute one mode's numbers to the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
     /// Every routed expert is int3-VQ (`.vq3`): smallest, most slots, gather-bound.
+    #[cfg_attr(feature = "vulkan", default)]
     Int3Vq,
     /// Every routed expert is int4 (`.i4`): ~1.8× faster compute, bigger, fewer slots.
     Int4,
     /// Frequent experts int4 (HOT), the rest int3-VQ (COLD). Needs both file sets; the
     /// byte-aware policy floats the split.
-    #[default]
+    #[cfg_attr(not(feature = "vulkan"), default)]
     Hybrid,
 }
 
@@ -92,16 +106,18 @@ pub struct Config {
     pub route: crate::hybrid::RouteAdvice,
     /// DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
     pub checksum_x: bool,
-    /// Routed-expert format mode (`--mode int3-vq|int4|hybrid`, default `hybrid`). See
-    /// [`Mode`] and MODES.md. Set by `main`, like the checksum diagnostics.
+    /// Routed-expert format mode (`--mode int3-vq|int4|hybrid`; default `hybrid` on `rocm`,
+    /// `int3-vq` on `vulkan` — see [`Mode`] for why the default differs). MODES.md has the
+    /// tradeoffs. Set by `main`, like the checksum diagnostics.
     pub mode: Mode,
     /// Device budget override, bytes (`--max-mem <GiB>`). None (default) auto-sizes to
     /// `free − OS_RESERVE`. `Some(n)` uses exactly `n` — no OS reserve; the user asked
     /// for it, so it's allowed to OOM/fail at build.
     pub max_mem: Option<u64>,
     /// Attention row-selection mode (`--attn auto|dense|streaming|dsa|misa`, resolved
-    /// in `main`). `auto` picks `dsa` when the artifact carries indexer weights, else
-    /// `dense`. dsa/misa need the resident DSA indexer.
+    /// in `main`). `auto` picks `dsa` when the artifact carries indexer weights AND the
+    /// backend has the indexer kernels, else `dense` — on a Vulkan build it is always
+    /// `dense`, and says so. dsa/misa need the resident DSA indexer.
     pub attn: crate::attn::AttnMode,
 }
 
@@ -328,6 +344,24 @@ mod tests {
                 cfg(p, m, Some("/tmp/t")).validate().expect("{p} must stay unconstrained");
             }
         }
+    }
+
+    /// THE DEFAULT CONFIGURATION MUST RUN ON THE BUILD THAT HAS IT.
+    ///
+    /// A bare `rivoli <model>` on a Vulkan build used to fail twice before reading a byte of
+    /// the artifact: `--mode` defaulted to `hybrid`, which `validate_backend` refuses, and
+    /// `--attn auto` resolved to `dsa` on any artifact carrying indexer weights, which it
+    /// also refuses. This half of the fix is testable here; the `auto` half lives in
+    /// `main::resolve_attn` and needs a real artifact to exercise, so it is verified by
+    /// running the binary rather than by a unit test.
+    ///
+    /// Backend-independent by construction — on `rocm`, `validate_backend` is a no-op and
+    /// this asserts nothing; on `vulkan` it is the whole point.
+    #[test]
+    fn the_default_mode_passes_the_backend_gate() {
+        cfg("lru", Mode::default(), None)
+            .validate_backend()
+            .expect("the default --mode must be one this build's backend can run");
     }
 
     /// `validate` must NOT consult the backend. The two above and the one below are the
