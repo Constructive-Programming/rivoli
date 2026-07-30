@@ -7,6 +7,13 @@
 use anyhow::{Result, ensure};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+/// How many times a hint veto actually CHANGED the eviction victim, and how many times it
+/// was dropped because honouring it left no victim at all. Hit-rate deltas are an indirect
+/// signal — these two count the mechanism firing, which is what separates "the veto never
+/// binds" from "the veto binds and does not help".
+pub static VETO_BOUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static VETO_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Empty advisory set: the no-hints fallback, and callers that have none.
 pub(crate) static EMPTY_SKIP: std::sync::LazyLock<HashSet<u32>> =
     std::sync::LazyLock::new(HashSet::new);
@@ -82,10 +89,24 @@ impl OrderedSet {
         must: &HashSet<u32>,
         advisory: &HashSet<u32>,
     ) -> Option<u32> {
-        let t = self
-            .peek_one(must, advisory)
-            .or_else(|| self.peek_one(must, &EMPTY_SKIP))?
-            .0;
+        use std::sync::atomic::Ordering as O;
+        let plain = self.peek_one(must, &EMPTY_SKIP);
+        let t = match self.peek_one(must, advisory) {
+            Some(v) => {
+                // The veto BOUND iff honouring it picked a different victim than LRU would
+                // have. Counting the veto set's size, or the hit rate, would not show this.
+                if plain.map(|p| p.1) != Some(v.1) {
+                    VETO_BOUND.fetch_add(1, O::Relaxed);
+                }
+                v.0
+            }
+            None => {
+                if plain.is_some() {
+                    VETO_DROPPED.fetch_add(1, O::Relaxed);
+                }
+                plain?.0
+            }
+        };
         let k = self.order.remove(&t)?;
         self.at.remove(&k);
         Some(k)

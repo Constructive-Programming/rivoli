@@ -61,7 +61,9 @@ compile_error!(
 
 #[cfg(all(feature = "rocm", not(feature = "vulkan")))]
 mod imp {
-    pub use crate::gpustream::{HipEvent as Event, HipStream as Stream, Signal, stream_signal};
+    pub use crate::gpustream::{
+        HipEvent as Event, HipStream as Stream, Signal, Timeline, stream_signal,
+    };
     pub use crate::hip::*;
 }
 

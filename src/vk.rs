@@ -75,7 +75,7 @@ pub struct Gpu {
     pipes: Pipes,
     validation: bool,
     budget: bool,
-    timeline: Timeline,
+    timeline: StreamWaiter,
     /// GPU-timestamp scaling: nanoseconds per tick, and how many low bits of the
     /// counter the chosen queue family actually implements. Zero `bits` means this
     /// family cannot write timestamps, and [`Stamp::elapsed_ms`] then refuses rather
@@ -257,6 +257,13 @@ struct Stream {
     #[allow(dead_code)]
     pool: vk::CommandPool,
     ring: [vk::CommandBuffer; RING],
+    /// Consumer-facing timeline dependencies to attach to the NEXT submit — see
+    /// [`Timeline`]. Vulkan cannot record a wait INTO a command buffer the way
+    /// `hipStreamWaitValue64` enqueues one, so a wait is carried here and applied when the
+    /// recorded work is flushed. `Timeline::wait` flushes any open recording first, so the
+    /// gate lands on the work recorded AFTER the wait and the two backends agree.
+    tl_waits: Vec<(vk::Semaphore, u64)>,
+    tl_signals: Vec<(vk::Semaphore, u64)>,
     /// `done[i]` retires slot `i`.
     done: [vk::Fence; RING],
     /// Was slot `i` submitted and not yet joined? A fence may only be waited on if some
@@ -479,7 +486,7 @@ impl Gpu {
                  return zero (docs/VULKAN.md, the increment-1 note on why 0.0 was worse)"
             );
         }
-        let timeline = Timeline::new(&device, nq)?;
+        let timeline = StreamWaiter::new(&device, nq)?;
         // One stream per available queue, in `Q` order; `route` maps the three logical
         // streams onto them. `nq == 3` is the identity mapping and the only configuration
         // that upholds the overlap invariant — anything less is reported, loudly, because
@@ -949,6 +956,8 @@ impl Stream {
             queue,
             pool,
             ring,
+            tl_waits: Vec::new(),
+            tl_signals: Vec::new(),
             done,
             pending: [false; RING],
             scratch: std::array::from_fn(|_| Vec::new()),
@@ -1023,13 +1032,32 @@ impl Stream {
         // expensive and less safe than opting out of the analysis.
         self.poisoned = true;
         let value = self.next + 1;
-        let sems = [self.timeline];
-        let values = [value];
+        // This stream's own completion value, plus any consumer-facing timeline signals
+        // registered since the last flush.
+        let mut sems = vec![self.timeline];
+        let mut values = vec![value];
+        for (s, v) in self.tl_signals.drain(..) {
+            sems.push(s);
+            values.push(v);
+        }
+        // Waits registered by `Timeline::wait`. Vulkan timeline semaphores permit
+        // wait-before-signal at submit, which is exactly the property the ticketed dataflow
+        // needs and the one `hipStreamWaitEvent` lacks.
+        let (mut wsems, mut wvals, mut wstages) = (Vec::new(), Vec::new(), Vec::new());
+        for (s, v) in self.tl_waits.drain(..) {
+            wsems.push(s);
+            wvals.push(v);
+            wstages.push(BOTH_STAGES);
+        }
         let bufs = [cb];
-        let mut ts = vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&values);
+        let mut ts = vk::TimelineSemaphoreSubmitInfo::default()
+            .signal_semaphore_values(&values)
+            .wait_semaphore_values(&wvals);
         let si = [vk::SubmitInfo::default()
             .command_buffers(&bufs)
             .signal_semaphores(&sems)
+            .wait_semaphores(&wsems)
+            .wait_dst_stage_mask(&wstages)
             .push_next(&mut ts)];
         // SAFETY: recording is open on `cb`; `done[slot]` is unsignalled (reclaim resets
         // it before the slot is reused); this queue is externally synchronised by the
@@ -2390,7 +2418,12 @@ impl Future for Signal {
 /// `vkWaitSemaphores`, resolving every `Signal` whose value its stream's counter has
 /// passed. One thread total, not one per signal and not one per queue — it waits on all
 /// three at once with `WAIT_ANY`.
-struct Timeline {
+/// The per-stream COMPLETION WAITER — one thread parking on every stream's counter and
+/// resolving the `Signal`s that have been reached. Renamed from `Timeline` when the
+/// consumer-facing [`Timeline`] arrived: this is not a timeline, it is the thing that
+/// watches them, and two types called the same thing in one file is how the next reader
+/// wires a dependency into the waiter by mistake.
+struct StreamWaiter {
     /// One per STREAM, indexed the same way `Gpu::streams` is (so `Q` reaches it through
     /// `Gpu::route`, never directly). Each `Stream` holds a copy of its own handle for
     /// submitting under its lock; these copies exist so the waiter can wait and query
@@ -2507,7 +2540,7 @@ impl Gpu {
     }
 }
 
-impl Timeline {
+impl StreamWaiter {
     fn new(device: &ash::Device, n: usize) -> Result<Self> {
         let mut sems = Vec::with_capacity(n);
         for _ in 0..n {
@@ -2650,7 +2683,7 @@ fn timeline_waiter(g: &'static Gpu) {
 /// Resolve and forget every armed signal — the waiter's error exit. An awaiter that will
 /// never be woken is a hang; resolving early is wrong data, which the forward pass's
 /// finiteness guard can at least see.
-fn resolve_all(t: &Timeline) {
+fn resolve_all(t: &StreamWaiter) {
     if let Ok(mut w) = t.waiting.lock() {
         for p in w.drain(..) {
             p.sig.resolve();
@@ -3902,4 +3935,81 @@ pub unsafe fn launch_index_head_route(
 /// Dereferences nothing: it fails before touching a pointer.
 pub unsafe fn launch_vaxpy(_x: *mut f32, _y: *const f32, _g: f32, _n: usize) -> Result<()> {
     Err(deferred("vaxpy"))
+}
+
+/// A monotonic counter a queue can WAIT ON and SIGNAL, and the host can observe — the
+/// Vulkan half of the ticketed dataflow's primitive, matching `gpustream::Timeline`'s
+/// signature exactly so `pin`/`gpu` stay backend-neutral.
+///
+/// **The property that matters is the same on both backends, but it is reached differently.**
+/// HIP enqueues a wait op INTO the stream (`hipStreamWaitValue64`). Vulkan has no such
+/// command: a wait is attached to a *submit*. So `wait` flushes whatever is currently
+/// recorded and parks the dependency on the queue, where the next flush picks it up — which
+/// makes the gate apply to work recorded AFTER the wait, as on HIP.
+///
+/// Vulkan timeline semaphores permit **wait-before-signal** at submit: a submit waiting on
+/// value N simply does not execute until N is signalled, regardless of submission order.
+/// That is exactly the property INV-4 tests for on HIP, and exactly the one
+/// `hipStreamWaitEvent` lacks.
+pub struct Timeline(vk::Semaphore);
+
+// SAFETY: Vulkan semaphores are internally synchronised for wait, signal and query.
+unsafe impl Send for Timeline {}
+unsafe impl Sync for Timeline {}
+
+impl Timeline {
+    pub fn new() -> Result<Self> {
+        let g = gpu()?;
+        let mut ty = vk::SemaphoreTypeCreateInfo::default()
+            .semaphore_type(vk::SemaphoreType::TIMELINE)
+            .initial_value(0);
+        let ci = vk::SemaphoreCreateInfo::default().push_next(&mut ty);
+        // SAFETY: `g.device` is live for the process; `ci` outlives the call.
+        let sem = unsafe { g.device.create_semaphore(&ci, None) }?;
+        Ok(Timeline(sem))
+    }
+
+    /// Gate work recorded AFTER this call on the timeline reaching `value`. Safe to call
+    /// before anything signals it — that is the intended use.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn wait(&self, stream_raw: *mut std::ffi::c_void, value: u64) -> Result<()> {
+        let q = Q::parse(stream_raw)?;
+        let g = gpu()?;
+        g.with_stream(q, |d, s| {
+            // Flush first, or the gate would also cover work recorded BEFORE the wait —
+            // which HIP's in-stream wait does not do. Without this the two backends would
+            // disagree about scope in a way no test of either alone would catch.
+            if s.recording {
+                s.flush(d)?;
+            }
+            s.tl_waits.push((self.0, value));
+            Ok(())
+        })
+    }
+
+    /// Set the timeline to `value` once everything recorded on `stream_raw` so far has
+    /// completed — which is what makes the value mean "work up to here is done".
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn signal(&self, stream_raw: *mut std::ffi::c_void, value: u64) -> Result<()> {
+        let q = Q::parse(stream_raw)?;
+        let g = gpu()?;
+        g.with_stream(q, |d, s| {
+            s.tl_signals.push((self.0, value));
+            // A signal with nothing recorded still has to reach the queue, or the value is
+            // never delivered and a waiter hangs. Opening an empty buffer is the cheapest
+            // way to give the submit something legal to carry.
+            if !s.recording {
+                s.open(d)?;
+            }
+            s.flush(d)?;
+            Ok(())
+        })
+    }
+
+    /// Highest value the device has reached. A plain query — no wait, no submit.
+    pub fn completed(&self) -> u64 {
+        let Ok(g) = gpu() else { return 0 };
+        // SAFETY: `self.0` is a live timeline semaphore owned by this process.
+        unsafe { g.device.get_semaphore_counter_value(self.0) }.unwrap_or(0)
+    }
 }

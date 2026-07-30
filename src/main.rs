@@ -568,9 +568,12 @@ fn main() -> Result<()> {
         );
         let (hs, hr) = engine.hint_stats();
         if hs > 0 {
+            use std::sync::atomic::Ordering as O;
+            let bound = rivoli::cache::VETO_BOUND.load(O::Relaxed);
+            let dropped = rivoli::cache::VETO_DROPPED.load(O::Relaxed);
             info!(
-                "  hints: {hs} offered, {hr} named an already-resident key ({:.1}%) — a veto \
-                 can only protect a resident key",
+                "  hints: {hs} offered, {hr} resident ({:.1}%) | veto BOUND {bound} \
+                 (changed the victim), dropped {dropped} (would have starved eviction)",
                 100.0 * hr as f64 / hs as f64,
             );
         }

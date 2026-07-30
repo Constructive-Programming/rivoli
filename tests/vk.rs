@@ -3753,3 +3753,39 @@ fn deferred_launchers_refuse_rather_than_no_op() {
     );
     println!("{} deferred launchers all refuse", refusals.len());
 }
+
+/// **INV-4 (Vulkan half): a wait may be enqueued BEFORE its producer exists, and still
+/// waits.** The rocm half lives in `src/gpustream.rs`; both are required, because the two
+/// backends reach the property by different mechanisms and only a per-backend test can show
+/// each one actually has it.
+///
+/// HIP enqueues a wait op into the stream (`hipStreamWaitValue64`). Vulkan attaches the wait
+/// to a *submit* and relies on timeline semaphores permitting wait-before-signal. A Vulkan
+/// implementation that quietly resolved the wait at record time — or dropped it because
+/// nothing had signalled yet — would pass every kernel test in this file and fail only as
+/// silent corruption under load, which is exactly how the `hit`-mask bug behaved.
+#[cfg(feature = "vulkan")]
+#[test]
+fn inv_4_wait_enqueued_before_signal_still_waits() -> anyhow::Result<()> {
+    use rivoli::backend::{Stream, Timeline, stream_signal};
+
+    let t = Timeline::new()?;
+    assert_eq!(t.completed(), 0, "a fresh timeline starts at 0");
+
+    let compute = Stream::compute()?;
+    let fetch = Stream::fetch()?;
+
+    // Order is the whole test: the WAIT is registered first, against a value nothing has
+    // produced. If it were snapshot-at-record (HIP events' failure mode) this would sail
+    // through and the assertion below would read 0.
+    t.wait(compute.raw(), 1)?;
+    t.signal(fetch.raw(), 1)?;
+
+    let rt = tokio::runtime::Builder::new_current_thread().build()?;
+    rt.block_on(stream_signal(compute.raw())?);
+    assert!(
+        t.completed() >= 1,
+        "the waited-on value must have been reached, not skipped"
+    );
+    Ok(())
+}
