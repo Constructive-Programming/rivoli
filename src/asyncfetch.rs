@@ -1,7 +1,13 @@
-#![cfg(feature = "rocm")]
+#![cfg(any(feature = "rocm", feature = "vulkan"))]
 //! Per-expert async loads: the io_uring→future adapter under the expert stream.
 //!
-//! A reaper thread owns the demand ring and a dedicated fetch [`HipStream`]. Per
+//! Backend-independent: the fetch stream and the [`Signal`] both come from
+//! [`crate::backend`]. Under Vulkan the "dedicated fetch stream" is the SAME queue the
+//! forward pass uses, so the load↔compute overlap this module exists to create does not
+//! happen there yet — see `vkstream.rs`'s header and docs/VULKAN.md, "Phase 4 needs two
+//! queues, not one".
+//!
+//! A reaper thread owns the demand ring and a dedicated fetch [`Stream`]. Per
 //! MoE layer the pipeline hands it a batch of cold reads; it queues+submits them
 //! (so they run concurrently on the NVMe), then reaps completions one at a time.
 //! Because [`Streamer::reap`] already kicks each read's bounce→slot copy on the
@@ -13,7 +19,7 @@
 //! single-threaded on the decode loop, the reaper blocks off-thread, and the two
 //! meet only through `Signal` wakers.
 
-use crate::gpustream::{HipStream, Signal};
+use crate::backend::{Signal, Stream};
 use crate::stream::Streamer;
 use anyhow::{Result, anyhow};
 use std::os::fd::RawFd;
@@ -22,8 +28,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 
-/// One cold read: file range → VMM slot. `dst` is a device slot pointer valid
-/// across threads (device memory the ring DMAs into; never CPU-dereferenced here).
+/// One cold read: file range → pool slot. `dst` is the DMA TARGET for that slot, valid
+/// across threads and never CPU-dereferenced here — under HIP the pool's unified pointer,
+/// under Vulkan its host mapping (`ArenaPool::host_ptr`, not `ptr`).
 pub struct ReadSpec {
     pub fd: RawFd,
     pub begin: usize,
@@ -70,7 +77,7 @@ impl AsyncFetch {
     /// Take ownership of the demand `streamer` and spawn the reaper with its own
     /// fetch stream.
     pub fn new(streamer: Streamer) -> Result<Self> {
-        let fetch = HipStream::new()?;
+        let fetch = Stream::new()?;
         let (tx, rx) = channel::<ReapJob>();
         let fetch_ns = Arc::new(AtomicU64::new(0));
         let io_wait_ns = Arc::new(AtomicU64::new(0));
@@ -140,7 +147,7 @@ impl Drop for AsyncFetch {
 /// into `fetch_ns` — the fetch cost the main-thread compute overlaps.
 fn reaper_loop(
     mut streamer: Streamer,
-    fetch: HipStream,
+    fetch: Stream,
     rx: Receiver<ReapJob>,
     fetch_ns: Arc<AtomicU64>,
     io_wait_ns: Arc<AtomicU64>,
@@ -175,7 +182,7 @@ fn reaper_loop(
 
 fn run_job(
     streamer: &mut Streamer,
-    fetch: &HipStream,
+    fetch: &Stream,
     job: &ReapJob,
     io_wait_ns: &AtomicU64,
 ) -> Result<()> {

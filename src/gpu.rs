@@ -6,21 +6,26 @@
 //!
 //! Dense, streaming, DSA and MISA attention (the DSA/MISA row selection is
 //! [`GpuEngine::dsa_select_layer`]), fp8-e4m3 KV latent cache, VQ-int3 routed + shared
-//! experts. `rocm`-only.
-#![cfg(feature = "rocm")]
+//! experts.
+//!
+//! Every device call goes through [`crate::backend`], so this file is backend-independent:
+//! it compiles under `rocm` and under `vulkan`. What is NOT equal across that seam —
+//! single-queue serialisation, zero-valued GPU timing spans, and the DSA/int4 kernels that
+//! refuse on Vulkan — is enumerated in `backend.rs`'s header. Needs a backend either way;
+//! without a device there is nothing to decode on.
+#![cfg(any(feature = "rocm", feature = "vulkan"))]
 
 use crate::attn::{AttnMode, streaming_rows};
-use crate::device::DeviceBuf;
-use crate::gpustream::{HipEvent, HipStream, Signal, stream_signal};
-use crate::hip::{
-    ExpertDesc, device_sync, launch_append_kv, launch_argmax, launch_attend,
-    launch_embed_i8_row, launch_flag_nonfinite, launch_gather_rope, launch_gemv_f32,
-    launch_gemv_fp8, launch_gemv_i8,
+use crate::backend::{
+    Event, ExpertDesc, Signal, Stream, device_sync, launch_append_kv, launch_argmax,
+    launch_attend, launch_embed_i8_row, launch_flag_nonfinite, launch_gather_rope,
+    launch_gemv_f32, launch_gemv_fp8, launch_gemv_i8,
     launch_index_append, launch_index_head_route, launch_index_pool_push, launch_index_score,
     launch_index_topk, launch_layernorm, launch_mla_absorb_fp8, launch_mla_value_fp8,
     launch_moe_expert_range, launch_moe_expert_range_i4, launch_moe_reduce, launch_rmsnorm,
-    launch_rope, launch_swiglu, launch_vadd, launch_vaxpy,
+    launch_rope, launch_swiglu, launch_vadd, launch_vaxpy, stream_signal,
 };
+use crate::device::DeviceBuf;
 use crate::math::{E4M3_BLOCK, nll_of, route_into, topk_into};
 use crate::model::ModelConfig;
 use crate::pin::{Fp8Mlp, IndexerPin, LayerMlp, MlpVq, Pin, TRACE_WINDOW};
@@ -452,18 +457,18 @@ pub struct GpuEngine<'a> {
     /// The MoE expert stream's compute stream — resident/loaded experts' partials
     /// run here concurrently with the fetch stream's loads (the overlap). Separate
     /// from the null stream the rest of the forward uses.
-    compute_stream: HipStream,
+    compute_stream: Stream,
     /// Compute-stream span events (bracket the MoE partials+reduce) + the expert
     /// stream's task monitor (idle = load-wait, poll = launch) — the accurate timing
     /// the async overlap hides from wall-clock.
-    moe_ev_start: HipEvent,
-    moe_ev_end: HipEvent,
+    moe_ev_start: Event,
+    moe_ev_end: Event,
     /// Brackets the DSA indexer's kernels inside `dsa_select_layer`. Recorded on the
     /// null stream and read behind the END-OF-LAYER sync, which every layer already
     /// pays — so the span survives deleting the mid-layer one (`TopkPath::DeviceNoSync`),
     /// which would otherwise retire the very instrument that arm is measured with.
-    idx_ev_start: HipEvent,
-    idx_ev_end: HipEvent,
+    idx_ev_start: Event,
+    idx_ev_end: Event,
     /// Both indexer events recorded this layer and not yet read.
     idx_ev_pending: bool,
     /// Brackets final rmsnorm → lm_head → argmax on the null stream, read behind the
@@ -471,8 +476,8 @@ pub struct GpuEngine<'a> {
     /// between these kernels, so the span is their execution time rather than a bracket
     /// with gaps — which is what lets it separate GPU work from sync overhead inside
     /// `tail_wait_ns`.
-    tail_ev_start: HipEvent,
-    tail_ev_end: HipEvent,
+    tail_ev_start: Event,
+    tail_ev_end: Event,
     /// One-shot latch so the first non-finite residual is reported once, not 78x per
     /// position for the rest of the run (`trace` only).
     #[cfg(feature = "trace")]
@@ -596,7 +601,7 @@ impl<'a> GpuEngine<'a> {
             qabs: f(h * kvl)?,
             qrope: f(h * rope)?,
             clat: f(h * kvl)?,
-            attn_partial: f(crate::hip::attend_scratch_floats(h, kvl))?,
+            attn_partial: f(crate::backend::attend_scratch_floats(h, kvl))?,
             ctx: f(h * cfg.v_head_dim)?,
             gate_logits: f(cfg.n_experts)?,
             mlp_g: f(cfg.dense_inter)?,
@@ -637,16 +642,16 @@ impl<'a> GpuEngine<'a> {
             gl_host: Vec::with_capacity(cfg.n_experts * 4),
             argmax_host: Vec::with_capacity(12),
             prof: Profile::default(),
-            compute_stream: HipStream::new()?,
-            moe_ev_start: HipEvent::new()?,
-            moe_ev_end: HipEvent::new()?,
+            compute_stream: Stream::new()?,
+            moe_ev_start: Event::new()?,
+            moe_ev_end: Event::new()?,
             #[cfg(feature = "trace")]
             nan_seen: false,
-            tail_ev_start: HipEvent::new()?,
-            tail_ev_end: HipEvent::new()?,
+            tail_ev_start: Event::new()?,
+            tail_ev_end: Event::new()?,
             tail_ev_pending: false,
-            idx_ev_start: HipEvent::new()?,
-            idx_ev_end: HipEvent::new()?,
+            idx_ev_start: Event::new()?,
+            idx_ev_end: Event::new()?,
             idx_ev_pending: false,
             topk_path,
             verified_layers: 0,
@@ -1509,14 +1514,14 @@ impl<'a> GpuEngine<'a> {
             // Both MoE span events retired by the sync — read the compute-stream span
             // (MoE layers only; dense layers never recorded them).
             if dense_mlp.is_none() {
-                let ms = HipEvent::elapsed_ms(&self.moe_ev_start, &self.moe_ev_end)?;
+                let ms = Event::elapsed_ms(&self.moe_ev_start, &self.moe_ev_end)?;
                 self.prof.compute_gpu_ns += (ms as f64 * 1e6) as u128;
             }
             // Same sync, same reason, for the indexer span this layer recorded — read
             // here because this join is unconditional and the mid-layer one is not.
             if self.idx_ev_pending {
                 self.idx_ev_pending = false;
-                let ms = HipEvent::elapsed_ms(&self.idx_ev_start, &self.idx_ev_end)?;
+                let ms = Event::elapsed_ms(&self.idx_ev_start, &self.idx_ev_end)?;
                 self.prof.idx_gpu_ns += (ms as f64 * 1e6) as u128;
                 self.prof.idx_layers += 1;
             }
@@ -1677,7 +1682,7 @@ impl<'a> GpuEngine<'a> {
         // Both events retired by the D2H above.
         if self.tail_ev_pending {
             self.tail_ev_pending = false;
-            let ms = HipEvent::elapsed_ms(&self.tail_ev_start, &self.tail_ev_end)?;
+            let ms = Event::elapsed_ms(&self.tail_ev_start, &self.tail_ev_end)?;
             self.prof.tail_gpu_ns += (ms as f64 * 1e6) as u128;
         }
         debug_assert_eq!(

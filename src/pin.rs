@@ -14,19 +14,18 @@
 //! one VMM slab): a hit reuses the resident slot; a miss evicts the coldest and
 //! streams the expert in via io_uring O_DIRECT (`.vq3`/`.i4` block = one aligned read).
 //!
-//! `rocm`-only: without a device there is nothing to pin.
-#![cfg(feature = "rocm")]
+//! Needs a backend (`rocm` or `vulkan`): without a device there is nothing to pin.
+#![cfg(any(feature = "rocm", feature = "vulkan"))]
 
 use crate::asyncfetch::{AsyncFetch, ReadSpec};
 use crate::arena::{Arena, Reloc, Step};
+use crate::backend::{Signal, memcpy_dtod};
 use crate::cache;
 use crate::config::Mode;
 use crate::device::{DeviceTier, VmmBuf};
-use crate::hip::memcpy_dtod;
 use crate::hybrid::HybridPolicy;
 use std::collections::HashMap;
 use crate::format::{Dtype, ExpertSet, FormatMeta, Safetensors, load_codebooks};
-use crate::gpustream::Signal;
 use crate::model::ModelConfig;
 use crate::quant::{
     VQ_DIM, VQ_K, i4_expert_bytes, i4_slot_offsets, vq_expert_bytes, vq_slot_offsets,
@@ -403,9 +402,20 @@ struct TierFmt {
 /// rebalance the arena emits a relocation, which we execute as a synchronous device
 /// memcpy of the expert's bytes and remap its key. `slot_of`/`key_at` are inverse maps.
 struct ArenaPool {
-    #[allow(dead_code)] // RAII owner of the pool VMM; addressed via `base`
+    #[allow(dead_code)] // RAII owner of the pool VMM; addressed via `base`/`host_base`
     buf: VmmBuf,
+    /// The DEVICE base: what every expert descriptor's six projection pointers are built
+    /// from, and never dereferenced on the CPU.
     base: *mut u8,
+    /// The HOST base: the io_uring O_DIRECT DMA target (`ReadSpec.dst`), and the only one
+    /// of the two the CPU may touch.
+    ///
+    /// Under HIP these are the SAME NUMBER — unified addressing — so this field costs
+    /// nothing there and changes no behaviour. Under Vulkan they are unrelated, and
+    /// resolving both once here is what keeps [`ArenaPool::ptr`] and
+    /// [`ArenaPool::host_ptr`] a single `add` each on the fetch path. See
+    /// docs/VULKAN.md, "Host pointer != device address".
+    host_base: *mut u8,
     arena: Arena,
     policy: Box<dyn HybridPolicy>,
     slot_of: HashMap<u32, (bool, usize)>, // key -> (hot, idx)
@@ -438,18 +448,26 @@ impl ArenaPool {
     fn tier(&self, hot: bool) -> &TierFmt {
         if hot { &self.hot } else { &self.cold }
     }
-    /// The slot's pointer, valid TODAY as both a host DMA target (`ReadSpec.dst`, the
-    /// io_uring O_DIRECT destination) and a device address (the base every expert
-    /// descriptor's six projection pointers are built from). Those are one number
-    /// only because HIP unified addressing makes them one.
+    /// The slot's DEVICE address — the base every expert descriptor's six projection
+    /// pointers are built from, and what `memcpy_dtod`/`fill_u32` take.
     ///
-    /// A second backend must split this per consumer — descriptors take the device
-    /// base, `ReadSpec.dst` takes the host base — with both bases still resolved once
-    /// at setup, so this stays a single `add`. See docs/VULKAN.md, "Host pointer !=
-    /// device address".
+    /// NOT host-dereferenceable under Vulkan. It happens to be under HIP, where unified
+    /// addressing makes this and [`ArenaPool::host_ptr`] the same number; relying on that
+    /// is what the split exists to prevent.
     fn ptr(&self, hot: bool, idx: usize) -> *mut u8 {
         // SAFETY: arena.offset < budget, within the pool VMM.
         unsafe { self.base.add(self.arena.offset(hot, idx)) }
+    }
+
+    /// The slot's HOST address — the io_uring O_DIRECT destination (`ReadSpec.dst`).
+    ///
+    /// Same offset arithmetic as [`ArenaPool::ptr`], different base. The arena's slot
+    /// strides and the pool base are both `crate::stream::ALIGN`-aligned (checked in
+    /// `VmmBuf::new` and by the budget rounding in `Pin::build`), so every result satisfies
+    /// the O_DIRECT alignment the streamer asserts.
+    fn host_ptr(&self, hot: bool, idx: usize) -> *mut u8 {
+        // SAFETY: arena.offset < budget, within the pool VMM's host mapping.
+        unsafe { self.host_base.add(self.arena.offset(hot, idx)) }
     }
     fn resolved(&self, hot: bool, idx: usize) -> ResolvedSlot {
         let t = self.tier(hot);
@@ -533,7 +551,7 @@ impl ArenaPool {
             let dst = self.ptr(hot, idx);
             // SAFETY: `dst` owns `stride` bytes in the pool VMM; the slot is not yet
             // handed to any kernel (that happens in phase 1c, after this returns).
-            unsafe { crate::hip::fill_u32(dst, 0x7FC0_7FC0, stride)? };
+            unsafe { crate::backend::fill_u32(dst, 0x7FC0_7FC0, stride)? };
         }
         Ok(())
     }
@@ -787,9 +805,16 @@ impl<'a> Pin<'a> {
         );
         let mut buf = VmmBuf::new(budget)?;
         let base = buf.ptr_mut();
+        // Both bases resolved ONCE, here. Under HIP `host_mut` and `ptr_mut` return the
+        // same number and this is a no-op; under Vulkan they are the device address and the
+        // permanent host mapping, and the two consumers below must not be able to confuse
+        // them. Taking them in this order matters only in that `ptr_mut`/`host_mut` both
+        // need `&mut buf` and `buf` is moved into the struct after.
+        let host_base = buf.host_mut();
         let routed = ArenaPool {
             buf,
             base,
+            host_base,
             arena: Arena::new(budget, cold_stride, hot_stride),
             policy,
             slot_of: HashMap::new(),
@@ -1029,7 +1054,7 @@ impl<'a> Pin<'a> {
         // is absent. Only a poison HIT is positive evidence.
         #[cfg(feature = "trace")]
         if poisoned_any {
-            crate::hip::device_sync()?;
+            crate::backend::device_sync()?;
         }
         // Phase 1c: relocations have settled — resolve final slots and build the reads.
         let mut slots: [Option<ResolvedSlot>; 32] = [None; 32];
@@ -1042,7 +1067,7 @@ impl<'a> Pin<'a> {
             slots[i] = Some(self.routed.resolved(hot, idx));
             if !is_hit[i] {
                 let (fd, begin, len) = self.routed.tier(hot).table[sparse + e];
-                reads.push(ReadSpec { fd, begin, len, dst: self.routed.ptr(hot, idx) });
+                reads.push(ReadSpec { fd, begin, len, dst: self.routed.host_ptr(hot, idx) });
                 miss_sel.push(i);
             }
         }

@@ -271,6 +271,19 @@ fn main() -> Result<()> {
     cfg.mode = a.mode;
     // Mode-dependent, so it cannot live in `discover` — see Config::validate.
     cfg.validate()?;
+    // `--moe-gain` is the one backend-gated knob that is NOT a `Config` field, so it is
+    // checked here rather than in `validate_backend` with the others. g == 1 takes the
+    // ported `vadd`; anything else takes `vaxpy`, which the Vulkan backend defers. Rejected
+    // at startup for the same reason as the modes: the alternative is discovering it forty
+    // layers into the first token.
+    #[cfg(feature = "vulkan")]
+    if a_moe_gain != 1.0 {
+        bail!(
+            "--moe-gain {a_moe_gain} needs the `vaxpy` kernel, which the Vulkan backend does \
+             not have (docs/VULKAN.md defers it; `vadd`, the g = 1 case, is ported). Drop the \
+             flag, or rebuild with --features rocm."
+        );
+    }
 
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -397,7 +410,7 @@ fn main() -> Result<()> {
             .context("server mode not yet implemented; use -bench <tokens>")?
     };
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "vulkan"))]
     {
         use rivoli::config::OS_RESERVE;
         const GIB: f64 = (1u64 << 30) as f64;
@@ -620,9 +633,12 @@ fn main() -> Result<()> {
         Ok(())
     }
 
-    #[cfg(not(feature = "rocm"))]
+    #[cfg(not(any(feature = "rocm", feature = "vulkan")))]
     {
         let _ = (prompt_ids, ngen, bench_prompt, ppl_ids, a_ppl_out);
-        bail!("rivoli was built without the `rocm` feature; rebuild with --features rocm to decode")
+        bail!(
+            "rivoli was built with no compute backend; rebuild with --features rocm (or \
+             --features vulkan) to decode"
+        )
     }
 }

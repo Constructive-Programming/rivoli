@@ -27,8 +27,10 @@
 //! SQ tail at once, so the batch is genuinely concurrent. Falls back to a plain ring
 //! (the QD1 perf arm, still correct) if SQPOLL setup is refused.
 //!
-//! `rocm`-only (its sole consumer is the GPU decode pin).
-#![cfg(feature = "rocm")]
+//! Needs a backend (`rocm` or `vulkan`) — its sole consumer is the GPU decode pin. The
+//! ring itself is backend-independent; only the two BOUNCE-mode staging ops differ, and
+//! they are the whole of [`stage`] below.
+#![cfg(any(feature = "rocm", feature = "vulkan"))]
 
 use anyhow::{Result, ensure};
 use io_uring::{IoUring, opcode, types};
@@ -42,19 +44,133 @@ use std::os::fd::RawFd;
 /// must all be multiples of it.
 pub const ALIGN: usize = 4096;
 
-mod ffi {
+/// The two BOUNCE-mode operations, per backend: allocate/free the staging arena, and move
+/// one staged read into its pool slot. DIRECT mode uses neither — the read DMAs into the
+/// slot and there is nothing to stage.
+///
+/// Nothing else in this file is backend-specific.
+#[cfg(feature = "rocm")]
+mod stage {
     use std::ffi::c_void;
-    unsafe extern "C" {
-        /// Pinned host arena for the bounce path (kernels/async.hip). Null on failure.
-        pub fn rivoli_pinned_alloc(bytes: u64) -> *mut c_void;
-        pub fn rivoli_pinned_free(p: *mut c_void);
-        /// Async H2D copy on `stream` (bounce slot → VMM slot). 0 ok, else negative.
-        pub fn rivoli_memcpy_h2d_async(
-            dst: *mut c_void,
-            src: *const c_void,
-            n: u64,
-            stream: *mut c_void,
-        ) -> i32;
+
+    mod ffi {
+        use std::ffi::c_void;
+        unsafe extern "C" {
+            /// Pinned host arena for the bounce path (kernels/async.hip). Null on failure.
+            pub fn rivoli_pinned_alloc(bytes: u64) -> *mut c_void;
+            pub fn rivoli_pinned_free(p: *mut c_void);
+            /// Async H2D copy on `stream` (bounce slot → VMM slot). 0 ok, else negative.
+            pub fn rivoli_memcpy_h2d_async(
+                dst: *mut c_void,
+                src: *const c_void,
+                n: u64,
+                stream: *mut c_void,
+            ) -> i32;
+        }
+    }
+
+    /// A HIP-PINNED host arena, which is what makes the copy below a DMA rather than a
+    /// staged CPU memcpy. Null on failure.
+    pub fn alloc(bytes: usize) -> *mut u8 {
+        // SAFETY: no pointer args; null on failure.
+        unsafe { ffi::rivoli_pinned_alloc(bytes as u64) as *mut u8 }
+    }
+
+    /// `_bytes` is unused — HIP tracks the pinned registration's size itself. It is in the
+    /// signature so both backends' `free` are called identically; the Vulkan one needs the
+    /// size because `std::alloc::dealloc` demands the original `Layout`.
+    ///
+    /// # Safety
+    /// `p` came from [`alloc`] and is freed exactly once.
+    pub unsafe fn free(p: *mut u8, _bytes: usize) {
+        unsafe { ffi::rivoli_pinned_free(p as *mut c_void) };
+    }
+
+    /// ASYNC `hipMemcpyAsync` on the fetch stream: it returns before the bytes land, and
+    /// the read's `Signal` (armed on the same stream) is what says they have. This is the
+    /// op the load↔compute overlap is built on.
+    ///
+    /// # Safety
+    /// `dst` owns `n` device bytes and stays valid until `stream`'s completion signal
+    /// fires; `src` is a live arena slot holding `n` bytes; `stream` is a live handle.
+    pub unsafe fn copy_to_slot(
+        dst: *mut u8,
+        src: *const u8,
+        n: usize,
+        stream: *mut c_void,
+    ) -> Result<(), String> {
+        // SAFETY: the caller's contract, forwarded.
+        let rc = unsafe {
+            ffi::rivoli_memcpy_h2d_async(dst as *mut c_void, src as *const c_void, n as u64, stream)
+        };
+        if rc == 0 { Ok(()) } else { Err(format!("hip rc {rc}")) }
+    }
+}
+
+/// The Vulkan half of [`stage`].
+///
+/// **Both operations are plain host memory work, and the copy is SYNCHRONOUS.** On this
+/// APU the routed pool is a `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT` allocation that
+/// is permanently mapped (`vk::Buf`), so `ReadSpec.dst` is a real host pointer
+/// (`ArenaPool::host_ptr`) and "H2D" is a `memcpy` into GPU-visible memory. No pinning is
+/// needed because no DMA engine is involved, and `vkQueueSubmit` implies the host-write
+/// barrier, so no flush is either.
+///
+/// The consequence is a REAL one and it is not hidden: bounce mode costs a full
+/// synchronous copy of every cold expert (~20 MB) on the reaper thread, with no overlap.
+/// DIRECT mode (`--direct-vmm-dma`) skips it entirely by DMA-ing the O_DIRECT read straight
+/// into the mapping, which is what `device.rs`'s `VmmBuf::new` alignment guard exists for.
+/// Bounce remains the DEFAULT on both backends because it is a workaround for an amdgpu
+/// O_DIRECT-into-device-memory regression (see this module's header) that the Vulkan
+/// mapping is no more immune to than the HIP one — the memory is the same amdgpu pages.
+#[cfg(feature = "vulkan")]
+mod stage {
+    use std::alloc::{Layout, alloc as sys_alloc, dealloc};
+    use std::ffi::c_void;
+
+    /// The arena's layout, needed identically by `alloc` and `free` — `dealloc` requires
+    /// the SAME layout the allocation was made with, so the size has to be recoverable.
+    /// `Streamer` keeps it (`entries * span`) and passes it back.
+    fn layout(bytes: usize) -> Option<Layout> {
+        Layout::from_size_align(bytes, super::ALIGN).ok()
+    }
+
+    /// `ALIGN`-aligned host memory, so an O_DIRECT read may land in it. Null on failure —
+    /// including a zero or unrepresentable size, which `Layout` rejects for us.
+    pub fn alloc(bytes: usize) -> *mut u8 {
+        match layout(bytes) {
+            // SAFETY: `layout` is non-zero-sized (from_size_align rejects overflow, and a
+            // zero `bytes` yields a zero-sized layout which `alloc` forbids — guarded).
+            Some(l) if l.size() > 0 => unsafe { sys_alloc(l) },
+            _ => std::ptr::null_mut(),
+        }
+    }
+
+    /// # Safety
+    /// `p` came from [`alloc`] with `bytes`, and is freed exactly once.
+    pub unsafe fn free(p: *mut u8, bytes: usize) {
+        if let Some(l) = layout(bytes) {
+            // SAFETY: the caller's contract; `l` is the layout `alloc` used.
+            unsafe { dealloc(p, l) };
+        }
+    }
+
+    /// SYNCHRONOUS host copy into the pool slot's mapping. `stream` is ignored: there is
+    /// no queue op to order this against, because the bytes are in place when it returns.
+    ///
+    /// # Safety
+    /// `dst` owns `n` writable bytes in the pool's host mapping; `src` is a live arena slot
+    /// holding `n` bytes; the two do not overlap (distinct allocations).
+    pub unsafe fn copy_to_slot(
+        dst: *mut u8,
+        src: *const u8,
+        n: usize,
+        _stream: *mut c_void,
+    ) -> Result<(), String> {
+        // SAFETY: the caller's contract — `n` readable bytes at `src`, `n` writable at
+        // `dst`, non-overlapping allocations.
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, n) };
+        Ok(())
     }
 }
 
@@ -92,9 +208,13 @@ pub struct Streamer {
     /// superset any single read may deliver. A `queue` whose superset exceeds this
     /// can't fit its bounce slot. Unused (0) in direct mode.
     span: usize,
-    /// Pinned host arena, `entries * span` bytes (bounce mode only; null in direct):
-    /// read slot `user_data` is `arena + user_data * span`.
+    /// Staging arena, `entries * span` bytes (bounce mode only; null in direct): read slot
+    /// `user_data` is `arena + user_data * span`. HIP-pinned under `rocm`, plain
+    /// `ALIGN`-aligned host memory under `vulkan` — see [`stage`].
     arena: *mut u8,
+    /// `arena`'s byte size, kept because `stage::free` needs it (the Vulkan side's
+    /// `dealloc` requires the original `Layout`). Zero in direct mode.
+    arena_bytes: usize,
     /// Per-queued-read VMM destination + aligned read length (bounce mode only),
     /// indexed by the read's `user_data`. `reap` copies `nbytes` from the arena slot
     /// into `dst`. Built in queue order, cleared per batch (mirrors `min_res`).
@@ -137,15 +257,15 @@ impl Streamer {
             .build(entries)
             .or_else(|_| IoUring::new(entries))?;
 
+        let arena_bytes = if bounce { entries as usize * span } else { 0 };
         let arena = if bounce {
-            // SAFETY: no args; null on failure.
-            let p = unsafe { ffi::rivoli_pinned_alloc(entries as u64 * span as u64) };
+            let p = stage::alloc(arena_bytes);
             ensure!(
                 !p.is_null(),
-                "bounce arena alloc failed (entries={entries}, {:.0} MiB pinned)",
-                (entries as usize * span) as f64 / (1u64 << 20) as f64
+                "bounce arena alloc failed (entries={entries}, {:.0} MiB)",
+                arena_bytes as f64 / (1u64 << 20) as f64
             );
-            p as *mut u8
+            p
         } else {
             std::ptr::null_mut()
         };
@@ -156,6 +276,7 @@ impl Streamer {
             bounce,
             span,
             arena,
+            arena_bytes,
             dst: Vec::with_capacity(entries as usize),
             nbytes: Vec::with_capacity(entries as usize),
             min_res: Vec::with_capacity(entries as usize),
@@ -297,19 +418,21 @@ impl Streamer {
             self.min_res[ud]
         );
         if self.bounce {
-            // SAFETY: `dst[ud]` is a live VMM slot the pipeline keeps valid until this
+            // SAFETY: `dst[ud]` is a live pool slot the pipeline keeps valid until this
             // read's signal fires; the arena slot holds the just-read bytes; `stream` is
             // live. Copies the full aligned `nbytes` (a trailing-EOF short read leaves
             // stale bytes only past the useful window, never read).
-            let rc = unsafe {
-                ffi::rivoli_memcpy_h2d_async(
-                    self.dst[ud] as *mut c_void,
-                    self.arena.add(ud * self.span) as *const c_void,
-                    u64::from(self.nbytes[ud]),
+            let r = unsafe {
+                stage::copy_to_slot(
+                    self.dst[ud],
+                    self.arena.add(ud * self.span),
+                    self.nbytes[ud] as usize,
                     stream,
                 )
             };
-            ensure!(rc == 0, "bounce H2D copy failed on slot {ud} (hip rc {rc})");
+            if let Err(e) = r {
+                anyhow::bail!("bounce staging copy failed on slot {ud} ({e})");
+            }
         }
         Ok(ud)
     }
@@ -348,8 +471,8 @@ impl Drop for Streamer {
         // (single owner, no Clone).
         unsafe { ManuallyDrop::drop(&mut self.ring) };
         if !self.arena.is_null() {
-            // SAFETY: `arena` came from rivoli_pinned_alloc, freed exactly once.
-            unsafe { ffi::rivoli_pinned_free(self.arena as *mut c_void) };
+            // SAFETY: `arena` came from `stage::alloc(self.arena_bytes)`, freed once.
+            unsafe { stage::free(self.arena, self.arena_bytes) };
         }
     }
 }

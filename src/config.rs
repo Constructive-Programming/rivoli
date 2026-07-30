@@ -173,6 +173,7 @@ impl Config {
     /// attribute some other mechanism's behaviour to `top-m` in a measurement that is
     /// specifically trying to price `top-m`.
     pub fn validate(&self) -> Result<()> {
+        self.validate_backend()?;
         if self.cache_policy != "top-m" {
             return Ok(());
         }
@@ -192,6 +193,46 @@ impl Config {
                  breaks that prefix. Capture traces under lru|2q|arc."
             );
         }
+        Ok(())
+    }
+
+    /// Reject, AT STARTUP, the configurations whose kernels the selected backend does not
+    /// have. Nothing to reject on `rocm`, which is the reference backend.
+    ///
+    /// The Vulkan launchers for these paths return `Err` too, but that fires mid-decode —
+    /// after the artifact is mmapped, the tier is filled and forty layers have run. Same
+    /// information, an order of magnitude more expensive to receive. See docs/VULKAN.md,
+    /// "Kernel inventory — port 16 of 29".
+    #[cfg(feature = "vulkan")]
+    fn validate_backend(&self) -> Result<()> {
+        use crate::attn::AttnMode;
+        if self.mode != Mode::Int3Vq {
+            bail!(
+                "--mode {} needs the int4 expert kernels, which the Vulkan backend does not \
+                 have (docs/VULKAN.md defers them). Use --mode int3-vq, or rebuild with \
+                 --features rocm.",
+                self.mode
+            );
+        }
+        // `Dense` and `Streaming` share the ported attention path; DSA and MISA need the
+        // five indexer kernels plus `layernorm`, none of which is ported. `auto` is
+        // resolved to a concrete mode before this runs, so it cannot slip through.
+        if matches!(self.attn, AttnMode::Dsa | AttnMode::Misa { .. }) {
+            bail!(
+                "--attn {:?} needs the DSA lightning-indexer kernels (index_append/score/\
+                 topk/pool_push/head_route and layernorm), which the Vulkan backend does not \
+                 have (docs/VULKAN.md defers them). Use --attn dense or --attn streaming, or \
+                 rebuild with --features rocm.",
+                self.attn
+            );
+        }
+        Ok(())
+    }
+
+    /// The `rocm` arm of [`Config::validate_backend`]: every kernel is present, so there is
+    /// nothing to refuse.
+    #[cfg(not(feature = "vulkan"))]
+    fn validate_backend(&self) -> Result<()> {
         Ok(())
     }
 }

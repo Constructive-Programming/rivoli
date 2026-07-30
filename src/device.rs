@@ -394,6 +394,15 @@ mod tier {
         pub fn ptr_mut(&mut self) -> *mut u8 {
             self.ptr
         }
+
+        /// The HOST base, for symmetry with the Vulkan `VmmBuf` — under HIP unified
+        /// addressing it is the SAME NUMBER as [`VmmBuf::ptr_mut`], and the whole point of
+        /// spelling it separately is that `pin.rs` cannot then rely on that coincidence.
+        /// See docs/VULKAN.md, "Host pointer != device address"; the ordering rules for
+        /// filling through it are on `ptr_mut` above.
+        pub fn host_mut(&mut self) -> *mut u8 {
+            self.ptr
+        }
     }
 
     impl Drop for VmmBuf {
@@ -698,6 +707,13 @@ mod vktier {
         /// host-dereferenceable.
         pub fn ptr(&self) -> *const u8 {
             self.buf.ptr()
+        }
+
+        /// The DEVICE base as `*mut`, matching the HIP `VmmBuf`'s spelling so `pin.rs`
+        /// takes both bases the same way on both backends. Still not host-dereferenceable —
+        /// the mutability is about what the KERNELS do to these bytes, not the CPU.
+        pub fn ptr_mut(&mut self) -> *mut u8 {
+            self.buf.ptr_mut()
         }
 
         /// The HOST base — the io_uring O_DIRECT DMA target, and the only one of the
