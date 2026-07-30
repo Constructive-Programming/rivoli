@@ -76,6 +76,13 @@ required-features = ["rocm"]
 name = "indexer_bench"
 required-features = ["rocm"]
 
+# Backend-neutral: the same source builds under either backend, which is the point —
+# it is the only like-for-like kernel comparison available (dot_bench measures gemv_vq,
+# which Vulkan does not have). No required-features: the source is cfg-gated on
+# `any(rocm, vulkan)` so a featureless `cargo build --examples` skips it cleanly.
+[[example]]
+name = "moe_bench"
+
 [lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
