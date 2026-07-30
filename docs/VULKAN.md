@@ -1186,6 +1186,47 @@ scalar floats through a `buffer_reference`, so it has no such constraint — onl
 alignment every f32 access already implies. A reader comparing the two launchers will find
 an alignment guard on one side and none on the other; that asymmetry is correct.
 
+## GATE A: K = 0. RECORDED HERE, THE FIRST TIME IT WAS MEASURED
+
+The gate requires K "measured and REPORTED", with the baseline written down the first
+time, because "a later collapse from hundreds to single digits is only visible as a
+regression if the earlier value is written down". This is that record.
+
+**K = 0.** Matched runs — int3-vq / dense / lru, `--max-mem 115`, 512 greedy tokens, same
+artifact and prompt, ids dumped with `--dump-ids`:
+
+```
+# rivoli-ids v1 backend=rocm   mode=int3-vq policy=lru attn=dense tokens=512
+# rivoli-ids v1 backend=vulkan mode=int3-vq policy=lru attn=dense tokens=512
+first divergence at index 0:  rocm=2  vulkan=48148
+overall agreement 5/512 = 1.0%
+```
+
+The backends disagree on the **first token** and never resynchronise. An earlier "identical
+token IDs" observation was at `-bench 2` on a different prompt and is not a counterexample
+worth keeping: two tokens is inside the noise of a coin flip.
+
+**This is consistent with what this document already measured**, and is not a new defect:
+`swiglu` differs in **1463 of 4096** outputs between the backends, and that feeds every MoE
+down-projection, so by layer 78 the logits differ enough to move the argmax. The doc said
+byte-identical output "CAN NEVER PASS"; K=0 is that statement's quantitative form.
+
+**But it changes what the accepted gate is worth, and that has to be said plainly.** The
+reasoning for dropping B rested on K carrying B's weight — "it is the only part of the gate
+with any sensitivity to numerical drift at all". At K=0 it carries none. The blind spot the
+doc accepted as *bounded* is in fact **total**: nothing in A + C + D speaks to Vulkan's
+output quality.
+
+Both backends produce coherent, on-topic, non-degenerate text (lrb 6, distinct 0.538 vs
+0.555) — they simply produce *different* text. So this is not evidence the Vulkan backend is
+wrong. It is evidence that the gate cannot tell us whether it is.
+
+**Consequence, and it is the obligation this document already wrote down:** `bin/ppl` is now
+the ONLY instrument with any purchase on Vulkan output quality. Running it is no longer a
+nice-to-have that "stops being a merge condition" — it is the only remaining way to answer
+the question the gate was built to answer. Do that before trusting a Vulkan decode for
+anything but throughput work.
+
 ## INCREMENT 1 SHIPPED THE FAILURE THIS SECTION WARNS ABOUT
 
 > **RESOLVED by increment 2** — three queues, the command-buffer ring, an async staging

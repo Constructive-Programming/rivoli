@@ -952,7 +952,7 @@ impl<'a> Pin<'a> {
         sel: &[usize],
         window: &[usize],
         choice: &[f32],
-    ) -> Result<([Option<ResolvedSlot>; 32], Vec<Signal>)> {
+    ) -> Result<([Option<ResolvedSlot>; 32], Vec<Signal>, [bool; 32])> {
         let cfg = self.cfg;
         let sparse = (layer - cfg.dense_layers) * cfg.n_experts; // read-table row base
         debug_assert!(
@@ -1092,7 +1092,7 @@ impl<'a> Pin<'a> {
         for (k, &i) in miss_sel.iter().enumerate() {
             signals[i] = miss_signals[k].clone();
         }
-        Ok((slots, signals))
+        Ok((slots, signals, is_hit))
     }
 
     /// Submit one layer's cold reads and resolve each selected expert to its [`MlpVq`]
@@ -1111,10 +1111,18 @@ impl<'a> Pin<'a> {
         choice: &[f32],
         out: &mut Vec<MlpVq>,
         fmt: &mut Vec<bool>,
+        hit: &mut Vec<bool>,
     ) -> Result<Vec<Signal>> {
-        let (slots, signals) = self.submit_spine(layer, sel, window, choice)?;
+        let (slots, signals, is_hit) = self.submit_spine(layer, sel, window, choice)?;
         out.clear();
         fmt.clear();
+        // Which experts were already resident. `gpu.rs` uses this to launch them WITHOUT
+        // a host round-trip: a hit's Signal is already resolved, so awaiting it before
+        // launching buys nothing and costs the GPU an idle gap. Returned rather than
+        // inferred from the Signal because `Signal` has no non-blocking readiness query,
+        // and because the policy's answer is deterministic where a poll would race.
+        hit.clear();
+        hit.extend_from_slice(&is_hit[..sel.len()]);
         for (i, _e) in sel.iter().enumerate() {
             let s = slots[i].context("submit_layer: unresolved expert slot")?;
             let (b, o) = (s.ptr, s.off);

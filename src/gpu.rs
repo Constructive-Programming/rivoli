@@ -450,6 +450,8 @@ pub struct GpuEngine<'a> {
     /// Filled by [`Pin::submit_layer`] for routed experts; the folded shared expert
     /// appends [`Pin::shared_i4`].
     fmt: Vec<bool>,
+    /// Per-selected-expert: was it already resident? Drives the batched launch below.
+    hit: Vec<bool>,
     gl_host: Vec<u8>,
     argmax_host: Vec<u8>,
     /// Always-on cheap per-token profiling (see [`Profile`]).
@@ -639,6 +641,7 @@ impl<'a> GpuEngine<'a> {
             mlps_vq: Vec::with_capacity(cfg.top_k),
             descs_vq: Vec::with_capacity(slots),
             fmt: Vec::with_capacity(slots),
+            hit: Vec::with_capacity(slots),
             gl_host: Vec::with_capacity(cfg.n_experts * 4),
             argmax_host: Vec::with_capacity(12),
             prof: Profile::default(),
@@ -1343,6 +1346,7 @@ impl<'a> GpuEngine<'a> {
                     &self.choice,
                     &mut self.mlps_vq,
                     &mut self.fmt,
+                    &mut self.hit,
                 )?;
                 // Pure host work: residency lookups + policy bookkeeping + read specs.
                 // It only ENQUEUES the reads; the reaper thread does the waiting.
@@ -1396,6 +1400,12 @@ impl<'a> GpuEngine<'a> {
                     self.descs_vq.push(desc_of_vq(&s));
                     self.w.push(1.0);
                     self.fmt.push(self.pin.shared_i4());
+                    // The shared expert is in the RESIDENT tier, never streamed — its
+                    // Signal is `ready()` right here. `hit` must grow with `fmt`/`descs`
+                    // or it is shorter than `ndesc` and the batching loop below indexes
+                    // past the end (it did: "len is 8 but the index is 8", because `hit`
+                    // covers only the 8 routed picks).
+                    self.hit.push(true);
                     signals.push(Signal::ready());
                 }
                 let ndesc = self.descs_vq.len();
@@ -1422,6 +1432,9 @@ impl<'a> GpuEngine<'a> {
                 // above). Cloned so the expert stream owns it (the small bool vec moves
                 // into the async closure). Hybrid mixes int4/vq3 within one batch.
                 let fmt = self.fmt.clone();
+                // Cloned alongside `fmt` for the same reason: the async block below moves
+                // what it captures, and `self` is borrowed mutably across the await.
+                let hit = self.hit.clone();
                 let w_ptr = self.wexpert_buf.ptr() as *const f32;
                 let (cb0, cb1, cb2) = (self.codebooks[0], self.codebooks[1], self.codebooks[2]);
                 let cs_raw = self.compute_stream.raw();
@@ -1442,9 +1455,64 @@ impl<'a> GpuEngine<'a> {
                 // load is in flight at once — the misses fetch while the resident/loaded
                 // experts compute. try_for_each_concurrent drives all to completion and
                 // short-circuits on the first Err (no collected Vec).
-                futures_util::stream::iter(0..ndesc)
+                // FIRST, launch every already-resident expert with NO host round-trip,
+                // batching maximal runs into single dispatches.
+                //
+                // A hit's Signal is already resolved, so awaiting it before launching buys
+                // nothing and costs the GPU an idle gap — and at the measured ~76% hit rate
+                // that is ~7 of 9 experts per layer being gated for no reason. Measured
+                // cost of the gating: the MoE phase runs at 38.8 GB/s in-engine against
+                // 91.8 GB/s for the same kernels in `examples/moe_bench.rs`, i.e. 42% of
+                // what the shaders do when the host is not in the dependency chain.
+                //
+                // BIT-IDENTICAL by construction, not by hope: `moe_expert_range` computes
+                // `e = e_start + row/inter` with every row independent, so an `e_count > 1`
+                // dispatch is exactly the same arithmetic as `e_count` separate ones, and
+                // `moe_reduce` sums `for e in 0..e_count` in fixed order either way.
+                //
+                // Runs must be uniform in FORMAT as well as residency: hybrid mixes int4
+                // and int3-vq within a layer and they are different kernels. `sel` order is
+                // NOT permuted to make longer runs — `pin.rs`'s trace-v2 invariant requires
+                // `window[..sel.len()] == sel` and `bin/replay` hard-fails otherwise.
+                debug_assert_eq!(
+                    hit.len(), ndesc,
+                    "hit mask must cover every descriptor (routed picks + the shared expert)"
+                );
+                let mut i = 0usize;
+                while i < ndesc.min(hit.len()).min(fmt.len()) {
+                    if !hit[i] {
+                        i += 1;
+                        continue;
+                    }
+                    let f = fmt[i];
+                    let mut j = i;
+                    while j < ndesc && hit[j] && fmt[j] == f {
+                        j += 1;
+                    }
+                    // SAFETY: descs/codebooks resident; these slots are HITS, so their
+                    // bytes are already in place; h/part device scratch; cs_raw live.
+                    unsafe {
+                        if f {
+                            launch_moe_expert_range_i4(
+                                x_c, hidden, inter, i, j - i, descs_ptr, w_ptr, h_c, part_c,
+                                cs_raw,
+                            )?;
+                        } else {
+                            launch_moe_expert_range(
+                                x_c, hidden, inter, i, j - i, descs_ptr, cb0, cb1, cb2, w_ptr,
+                                h_c, part_c, cs_raw,
+                            )?;
+                        }
+                    }
+                    i = j;
+                }
+                // THEN the misses, still one await + launch each. Removing the host from
+                // this path needs a device-side cross-stream wait (hipStreamWaitEvent /
+                // a timeline wait) and is the next step, not this one.
+                let miss: Vec<usize> = (0..ndesc).filter(|&e| !hit[e]).collect();
+                futures_util::stream::iter(miss.clone())
                     .map(Ok::<usize, anyhow::Error>)
-                    .try_for_each_concurrent(ndesc, move |e| {
+                    .try_for_each_concurrent(miss.len().max(1), move |e| {
                         let sig = signals[e].clone();
                         let i4 = fmt[e];
                         // Instrument: idle = time parked on the load Signal (the

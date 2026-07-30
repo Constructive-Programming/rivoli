@@ -50,6 +50,15 @@ struct Args {
     /// `--moe-gain <g>`: scale the whole MoE branch by `g` before the residual add.
     /// An EXPERIMENT knob, not a tuning parameter — see kernels/fwd.hip::vaxpy.
     moe_gain: f32,
+    /// `--dump-ids <path>`: write the generated token ids, one per line.
+    ///
+    /// This exists for **gate A** of the Vulkan acceptance gate (docs/VULKAN.md): agreement
+    /// on token IDs for K tokens, with K measured and its baseline recorded. Comparing
+    /// decoded TEXT is not a substitute — different id sequences can decode to identical
+    /// text, so a text diff can only ever report a lower bound on divergence. And gate A
+    /// is a standing obligation across commits, not a one-off, so it needs an instrument
+    /// rather than an eyeball.
+    dump_ids: Option<String>,
     /// Encode the prompt RAW, with no GLM turn framing. Reproduces every benchmark
     /// number recorded before templating existed — and those runs could never stop, so
     /// this is also how you re-measure the degeneration it caused.
@@ -64,7 +73,7 @@ fn parse_args() -> Result<Args> {
          [--mode int3-vq|int4|hybrid] [--direct-vmm-dma] \
          [--trace <path>] [--prompt <text>] [--cache-policy lru|2q|arc|top-m] [--2q-kin <pct>] \
          [--2q-kout <pct>] [--route-j <n>] [--route-m <n>] [--max-mem <GiB>] \
-         [--ppl <text-file>] [--ppl-out <path>] [--raw-prompt] \
+         [--ppl <text-file>] [--ppl-out <path>] [--raw-prompt] [--dump-ids <path>] \
          [--attn auto|dense|streaming|dsa|misa] [--sinks <n>] [--window <n>] [--misa-heads <n>] \
          [--moe-gain <g>]";
     let mut model = None;
@@ -88,6 +97,7 @@ fn parse_args() -> Result<Args> {
         misa_heads: 8, // the MISA paper's validated GLM setting
         moe_gain: 1.0, // 1.0 = the engine's normal arithmetic, bit-identical (vadd, not vaxpy)
         raw_prompt: false,
+        dump_ids: None,
         #[cfg(feature = "trace")]
         checksum_x: false,
     };
@@ -180,6 +190,9 @@ fn parse_args() -> Result<Args> {
                 }
             }
             "--raw-prompt" => a.raw_prompt = true,
+            "--dump-ids" => {
+                a.dump_ids = Some(args.next().context("--dump-ids requires a path")?);
+            }
             "--misa-heads" => {
                 a.misa_heads = args
                     .next()
@@ -259,6 +272,7 @@ fn main() -> Result<()> {
     let (a_ppl, a_ppl_out) = (a.ppl.clone(), a.ppl_out.clone());
     let a_moe_gain = a.moe_gain;
     let a_raw_prompt = a.raw_prompt;
+    let a_dump_ids = a.dump_ids.clone();
     // Bound here for the OTLP root span's run-identity attributes: `a` is partially
     // moved into `discover` below, and `cfg` does not keep all of these verbatim.
     let a_model = a.model.clone();
@@ -654,6 +668,28 @@ fn main() -> Result<()> {
             degenerate,
         };
         rivoli::telemetry::export_decode(&summary, ids.len(), &run);
+        if let Some(path) = &a_dump_ids {
+            use std::io::Write;
+            let mut w = std::io::BufWriter::new(
+                std::fs::File::create(path).with_context(|| format!("create {path}"))?,
+            );
+            // Header names the arm, so two files cannot be silently compared across
+            // different backends/modes — the same discipline `--ppl-out` uses.
+            writeln!(
+                w,
+                "# rivoli-ids v1 backend={} mode={} policy={} attn={} tokens={}",
+                if cfg!(feature = "vulkan") { "vulkan" } else { "rocm" },
+                cfg.mode,
+                a_cache_policy,
+                a_attn,
+                ids.len(),
+            )?;
+            for id in &ids {
+                writeln!(w, "{id}")?;
+            }
+            w.flush().context("flush --dump-ids")?;
+            info!("wrote {} token ids to {path}", ids.len());
+        }
         info!("{bench_prompt}{}", tok.decode_all(&ids)?);
         Ok(())
     }
