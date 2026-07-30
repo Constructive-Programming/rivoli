@@ -370,3 +370,53 @@ where the prefetcher stays because it is already written. That is precisely how 
 last prefetch survived until `b372cd4`. What survives a negative result is the
 measurements: the (J, M) grid, the perplexity sweep, and the LOOKA recall numbers, all
 in `benchmarks.md`.
+
+---
+
+## RETIRED 2026-07-30 — `top-m` removed from the engine
+
+`--cache-policy top-m`, `--route-j`/`--route-m`, `RouteAdvice`, `route_into`'s substitution
+and the `swap%` counter are deleted (~180 refs / 16 files). What replaced it: the LOOKA
+hint layer (docs/CACHE_PILOT.md), which steers **eviction** instead of **selection**.
+
+**Why it went.** Measured cost was +3.63% perplexity on int3-vq and an outright fail on int4
+at +12.7%, against an acceptance bar of ~1%. But the deciding argument is structural, not
+the number: because top-m made routing cache-conditional, *every* cache change became a
+potential output change, and each one needed a perplexity run to price. With it gone,
+routing is a pure function of (logits, bias, top_k) — now tested as **INV-1** — so a hint, a
+policy swap or a budget change is output-bit-identical BY CONSTRUCTION. The acceptance test
+for the whole hint layer is "the token IDs never move", which is checkable in one diff.
+
+`bin/replay`'s (J, M) grid is kept as the historical screen that produced the numbers above.
+It now models a mechanism the engine does not have; it is not a knob anything can enable.
+
+### And the hint layer that replaced it is INERT at the default operating point
+
+Measured the same day (int3-vq/lru, `--max-mem 115`, `--hint-k 0/3/8`): output identical at
+every K (as INV-1 guarantees), and **expert hit 78.0% at all three** — unchanged to three
+significant figures — while tok/s drifted DOWN 2.75 / 2.68 / 2.48 (the pilot's cost, nothing
+bought).
+
+The wiring is fine, which was checked rather than assumed: of **46,305** hints offered,
+**36,529 (78.9%)** named an already-resident key — tracking the hit rate exactly, so the
+vetoes have plenty to protect. They simply never bind:
+
+- ~**7.2 evictions per layer** against a **6920-slot** pool, so a given key's chance of
+  being chosen as victim inside a 1–2 layer veto window is ~0.1%;
+- and LRU evicts the *coldest* key, while an expert predicted for the NEXT layer is warm by
+  construction — it is at the opposite end of the queue from where eviction happens.
+
+**The hint horizon is 1–2 layers; the eviction horizon is thousands.** A veto is the right
+mechanism only where those overlap.
+
+Three ways to make it bind, in order of how much they are worth testing:
+1. **Raise the pressure.** At a small `--max-mem` the eviction horizon collapses toward the
+   hint horizon. This is one cheap run and it decides whether the layer has ANY operating
+   point; do it before anything else.
+2. **Lengthen the horizon.** Predicting L+8 rather than L+2 would reach the eviction
+   horizon, but precision falls with distance (77.2% at L+1, 68.9% at L+2) and a prediction
+   names a *specific* layer, so this trades directly against accuracy.
+3. **Let hints drive ADMISSION, not just protection.** This is the only option that helps a
+   MISSING expert — a veto cannot protect what is not resident. It is also what the deleted
+   `--pilot-k` preloader did, and that measured flat while moving 2.4× the bytes. Do not
+   revisit it without a mechanism for the bytes.
