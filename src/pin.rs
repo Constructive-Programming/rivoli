@@ -508,6 +508,9 @@ impl ArenaPool {
             self.policy.hint(hints);
         }
     }
+    fn hint_stats(&self) -> (u64, u64) {
+        self.policy.hint_stats()
+    }
     fn protect(&mut self, key: u32) {
         self.policy.protect(key);
     }
@@ -585,6 +588,13 @@ impl ArenaPool {
 }
 
 impl<'a> Pin<'a> {
+    /// `(hints offered, of those already resident)`. A veto can only protect a resident
+    /// key, so this is what separates "the mechanism had nothing to do" from "the wiring
+    /// is broken" — two findings that need opposite fixes.
+    pub fn hint_stats(&self) -> (u64, u64) {
+        self.routed.hint_stats()
+    }
+
     /// Build the resident set from the artifact directory `dir`. `capacity` is the
     /// total device budget (auto-discovered); the always-resident set takes its
     /// computed footprint and the rest grows the routed pool. `bounce` selects the

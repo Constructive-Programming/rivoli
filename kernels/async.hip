@@ -81,3 +81,48 @@ extern "C" int rivoli_memcpy_h2d_async(void* dst, const void* src, unsigned long
                                   (hipStream_t)stream);
     return e == hipSuccess ? 0 : HIP_ERR_BASE - (int)e;
 }
+
+// ---------------------------------------------------------------------------
+// TIMELINE: a device-visible monotonic counter, waited on and signalled ON STREAM.
+//
+// This is the primitive the whole ticketed dataflow rests on, and the choice of API is
+// load-bearing. `hipStreamWaitEvent` CANNOT be used here: it captures the event's state at
+// the moment the wait is ENQUEUED, so a wait enqueued before the producer records its event
+// is a silent no-op. Enqueuing consumers before their producers have run is the entire point
+// of this design, so events would reproduce — invisibly — the very bug this replaces.
+//
+// `hipStreamWaitValue64` waits on a VALUE ("block until *ptr >= v"), which is well defined
+// before the signaller has run. Probed on gfx1151 (2026-07-30): hipDeviceAttributeCanUse-
+// StreamWaitValue = 1, and a wait enqueued BEFORE the write on another stream retires
+// correctly rather than passing vacuously or deadlocking.
+//
+// The counter must live in signal memory (hipMallocSignalMemory), not ordinary device
+// memory, or the wait has no coherent view of the writer.
+extern "C" void* rivoli_timeline_create() {
+  uint64_t* p = nullptr;
+  if (hipExtMallocWithFlags((void**)&p, sizeof(uint64_t), hipMallocSignalMemory) != hipSuccess)
+    return nullptr;
+  *p = 0;
+  return (void*)p;
+}
+
+extern "C" void rivoli_timeline_destroy(void* t) {
+  if (t) (void)hipFree(t);
+}
+
+// Enqueue "wait until *t >= value" on `stream`. Safe to enqueue before anything signals it.
+extern "C" int rivoli_timeline_wait(void* stream, void* t, unsigned long long value) {
+  return (int)hipStreamWaitValue64((hipStream_t)stream, t, (uint64_t)value,
+                                   hipStreamWaitValueGte, ~0ull);
+}
+
+// Enqueue "*t = value" on `stream`, ordered after everything already queued there — which
+// is what makes the value mean "all work up to here has completed".
+extern "C" int rivoli_timeline_signal(void* stream, void* t, unsigned long long value) {
+  return (int)hipStreamWriteValue64((hipStream_t)stream, t, (uint64_t)value, 0);
+}
+
+// Host-side observation, for recycling staging slots without a sync.
+extern "C" unsigned long long rivoli_timeline_completed(void* t) {
+  return __atomic_load_n((unsigned long long*)t, __ATOMIC_ACQUIRE);
+}

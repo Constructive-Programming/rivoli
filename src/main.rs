@@ -566,6 +566,14 @@ fn main() -> Result<()> {
             summary.tok_per_s,
             summary.hit_pct,
         );
+        let (hs, hr) = engine.hint_stats();
+        if hs > 0 {
+            info!(
+                "  hints: {hs} offered, {hr} named an already-resident key ({:.1}%) — a veto \
+                 can only protect a resident key",
+                100.0 * hr as f64 / hs as f64,
+            );
+        }
         // OTLP: one decode span carrying the always-on summary (opt-in via
         // OTEL_EXPORTER_OTLP_ENDPOINT; log-only otherwise). Exported synchronously on
         // drop — no async runtime.

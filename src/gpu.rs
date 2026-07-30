@@ -661,6 +661,11 @@ impl<'a> GpuEngine<'a> {
     pub fn hits(&self) -> u64 {
         self.pin.hits
     }
+    /// `(hints offered, of those already resident)`. A veto only protects a RESIDENT key.
+    pub fn hint_stats(&self) -> (u64, u64) {
+        self.pin.hint_stats()
+    }
+
     pub fn misses(&self) -> u64 {
         self.pin.misses
     }

@@ -5,7 +5,7 @@
 //! callback wakes a `Waker`), so `futures-util` can orchestrate GPU concurrency
 //! directly instead of blocking on `hipDeviceSynchronize`. No polling, no join.
 
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 use futures_util::task::AtomicWaker;
 use std::ffi::c_void;
 use std::future::Future;
@@ -26,6 +26,11 @@ unsafe extern "C" {
     fn rivoli_event_record(ev: *mut c_void, stream: *mut c_void) -> i32;
     fn rivoli_event_elapsed(start: *mut c_void, end: *mut c_void, ms: *mut f32) -> i32;
     fn rivoli_event_destroy(ev: *mut c_void);
+    fn rivoli_timeline_create() -> *mut c_void;
+    fn rivoli_timeline_destroy(t: *mut c_void);
+    fn rivoli_timeline_wait(stream: *mut c_void, t: *mut c_void, value: u64) -> i32;
+    fn rivoli_timeline_signal(stream: *mut c_void, t: *mut c_void, value: u64) -> i32;
+    fn rivoli_timeline_completed(t: *mut c_void) -> u64;
 }
 
 /// A timing event: bracket GPU work on a stream to recover the true duration the
@@ -262,5 +267,112 @@ mod tests {
         // Sanity ceiling: if a bare signal costs >1ms the pipeline is a non-starter.
         assert!(us < 1000.0, "signal latency {us:.1}us implausibly high");
         Ok(())
+    }
+}
+
+/// A monotonic counter a stream can WAIT ON and SIGNAL, and the host can observe.
+///
+/// This replaces host-side readiness booleans. The difference that matters: a consumer may
+/// be enqueued behind `wait(v)` **before** any producer has run, because the wait names a
+/// VALUE rather than capturing a producer's current state. That is precisely what
+/// `hipStreamWaitEvent` cannot do (it snapshots at enqueue time, so an early wait silently
+/// passes), and it is why the engine's readiness can stop being a `Vec<bool>` that two
+/// modules have to agree about.
+///
+/// Values are assigned by the producer side and only ever increase. `completed()` is a
+/// plain acquire load, so staging slots can be recycled without any sync at all: slot *i*
+/// is free once `completed() >= release[i]`.
+pub struct Timeline(*mut c_void);
+
+// SAFETY: the counter is device signal memory; the HIP calls that touch it are
+// stream-ordered and internally synchronised, and Rust-side access is an atomic load.
+unsafe impl Send for Timeline {}
+unsafe impl Sync for Timeline {}
+
+impl Timeline {
+    pub fn new() -> Result<Self> {
+        // SAFETY: no arguments; returns null on allocation failure, checked below.
+        let p = unsafe { rivoli_timeline_create() };
+        ensure!(
+            !p.is_null(),
+            "hipMallocSignalMemory failed — hipDeviceAttributeCanUseStreamWaitValue is 1 on \
+             gfx1151, so this is an allocation failure rather than an unsupported device"
+        );
+        Ok(Timeline(p))
+    }
+
+    /// Enqueue "block until this timeline reaches `value`" on `stream_raw`. Ordering is
+    /// safe in both directions: enqueueing this before the signaller is the intended use.
+    // Opaque HIP handle passed through, not dereferenced here.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn wait(&self, stream_raw: *mut c_void, value: u64) -> Result<()> {
+        // SAFETY: `self.0` is live signal memory; `stream_raw` is a live stream.
+        let rc = unsafe { rivoli_timeline_wait(stream_raw, self.0, value) };
+        ensure!(rc == 0, "hipStreamWaitValue64 failed ({rc})");
+        Ok(())
+    }
+
+    /// Enqueue "set this timeline to `value`" on `stream_raw`, ordered after everything
+    /// already queued there — which is what makes the value mean "work up to here is done".
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn signal(&self, stream_raw: *mut c_void, value: u64) -> Result<()> {
+        // SAFETY: as `wait`.
+        let rc = unsafe { rivoli_timeline_signal(stream_raw, self.0, value) };
+        ensure!(rc == 0, "hipStreamWriteValue64 failed ({rc})");
+        Ok(())
+    }
+
+    /// Highest value the device has reached. Acquire load — no sync, no stall.
+    pub fn completed(&self) -> u64 {
+        // SAFETY: `self.0` is live signal memory for the lifetime of `self`.
+        unsafe { rivoli_timeline_completed(self.0) }
+    }
+}
+
+impl Drop for Timeline {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` came from `rivoli_timeline_create` and is dropped once.
+        unsafe { rivoli_timeline_destroy(self.0) };
+    }
+}
+
+#[cfg(test)]
+mod timeline_tests {
+    use super::*;
+
+    /// **INV-4: a wait may be enqueued BEFORE its producer exists, and still waits.**
+    ///
+    /// This is the whole reason the dataflow can drop host-side readiness flags: consumers
+    /// are recorded up front, behind waits on values nothing has signalled yet. It is also
+    /// exactly what `hipStreamWaitEvent` cannot do — it snapshots the event at enqueue time,
+    /// so an early wait passes vacuously and the kernel reads unwritten memory. That failure
+    /// is silent, which is why this is a test and not a comment.
+    #[test]
+    fn inv_4_wait_enqueued_before_signal_still_waits() {
+        let t = Timeline::new().expect("timeline");
+        let (a, b) = (HipStream::new().expect("a"), HipStream::new().expect("b"));
+        assert_eq!(t.completed(), 0, "a fresh timeline starts at 0");
+        // Order matters: the WAIT goes first, against a value nothing has produced.
+        t.wait(a.raw(), 1).expect("wait enqueues before any signal");
+        t.signal(b.raw(), 1).expect("signal");
+        let rt = tokio::runtime::Builder::new_current_thread().build().expect("rt");
+        // If the wait had passed vacuously this would resolve regardless; the value check
+        // below is what distinguishes "waited" from "did not block".
+        rt.block_on(stream_signal(a.raw()).expect("completion"));
+        assert!(t.completed() >= 1, "the waited-on value must have been reached");
+    }
+
+    /// Values only move forward, and `completed()` observes them without a sync — the
+    /// property staging-slot recycling depends on (slot i is free iff completed >= release[i]).
+    #[test]
+    fn timeline_is_monotonic_and_host_observable() {
+        let t = Timeline::new().expect("timeline");
+        let s = HipStream::new().expect("stream");
+        for v in 1..=4u64 {
+            t.signal(s.raw(), v).expect("signal");
+        }
+        let rt = tokio::runtime::Builder::new_current_thread().build().expect("rt");
+        rt.block_on(stream_signal(s.raw()).expect("completion"));
+        assert_eq!(t.completed(), 4, "the last value written must be observable");
     }
 }

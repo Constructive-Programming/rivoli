@@ -7,6 +7,10 @@
 use anyhow::{Result, ensure};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+/// Empty advisory set: the no-hints fallback, and callers that have none.
+pub(crate) static EMPTY_SKIP: std::sync::LazyLock<HashSet<u32>> =
+    std::sync::LazyLock::new(HashSet::new);
+
 /// Recency-ordered set of keys: O(log n) MRU-insert / arbitrary-remove / pop-LRU
 /// via a monotonic tick clock + a `BTreeMap` whose front is the LRU end.
 #[derive(Default)]
@@ -46,18 +50,42 @@ impl OrderedSet {
         self.at.remove(&k);
         Some(k)
     }
-    /// The LRU key (and tick) not in `skip`, without removing — for cross-set recency
-    /// comparison (the hybrid LRU picks the globally oldest across both tiers). `skip` =
-    /// keys touched in the current batch, which eviction must never take (see
-    /// [`pop_lru_skip`]).
-    pub(crate) fn peek_lru_skip(&self, skip: &HashSet<u32>) -> Option<(i64, u32)> {
-        self.order.iter().find(|(_, k)| !skip.contains(k)).map(|(&t, &k)| (t, k))
+    /// The LRU key (and tick) without removing — for cross-set recency comparison (the
+    /// hybrid LRU picks the globally oldest across both tiers). Peek the LRU key skipping `must` (mandatory) and `advisory` (hints), falling back
+    /// to `must` alone when that leaves nothing. See [`pop_lru_skip`] for why the fallback
+    /// lives here and not at the call sites.
+    pub(crate) fn peek_lru_skip(
+        &self,
+        must: &HashSet<u32>,
+        advisory: &HashSet<u32>,
+    ) -> Option<(i64, u32)> {
+        self.peek_one(must, advisory).or_else(|| self.peek_one(must, &EMPTY_SKIP))
     }
-    /// Evict and return the LRU key NOT in `skip`. Per-batch pinning: a key touched
-    /// (hit or admitted) earlier in the same batch must stay resident so the pin can
-    /// resolve its slot — evicting it would surface as "expert not resident after alloc".
-    pub(crate) fn pop_lru_skip(&mut self, skip: &HashSet<u32>) -> Option<u32> {
-        let t = *self.order.iter().find(|(_, k)| !skip.contains(k))?.0;
+    fn peek_one(&self, must: &HashSet<u32>, advisory: &HashSet<u32>) -> Option<(i64, u32)> {
+        let skip = |k: &u32| must.contains(k) || advisory.contains(k);
+        self.order.iter().find(|(_, k)| !skip(k)).map(|(t, k)| (*t, *k))
+    }
+    /// Evict and return the LRU key, skipping two sets with DIFFERENT authority.
+    ///
+    /// `must` is the per-batch pin set: a key touched (hit or admitted) earlier in this
+    /// batch has to stay resident or the pin cannot resolve its slot ("expert not resident
+    /// after alloc"). That is a correctness constraint and is never relaxed.
+    ///
+    /// `advisory` is the LOOKA hint veto. It is a *prediction*, so it must never be able to
+    /// fail an allocation: if honouring it leaves no victim, it is dropped and the scan
+    /// retries against `must` alone. **The fallback lives here rather than at the eleven
+    /// call sites on purpose** — a policy that forgot it would turn an advisory signal into
+    /// a hard OOM, and `hybrid::HINT_CAP_PCT` would be load-bearing for correctness instead
+    /// of merely for hit rate.
+    pub(crate) fn pop_lru_skip(
+        &mut self,
+        must: &HashSet<u32>,
+        advisory: &HashSet<u32>,
+    ) -> Option<u32> {
+        let t = self
+            .peek_one(must, advisory)
+            .or_else(|| self.peek_one(must, &EMPTY_SKIP))?
+            .0;
         let k = self.order.remove(&t)?;
         self.at.remove(&k);
         Some(k)

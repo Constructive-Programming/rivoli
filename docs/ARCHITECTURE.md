@@ -329,10 +329,39 @@ concurrently. rivoli leans on Rust's type system so the unsafe interleavings are
   pointer never outlives the allocation it points into because the allocation's owner
   outlives it in the type graph.
 
-The result: the *only* way to get overlap wrong (a read into a slot that later moves, a
-compute launch before its bytes land, a hit evicted mid-batch) is ruled out at compile time
-or by a typed runtime invariant — which is what makes an aggressively concurrent streaming
-engine tractable to reason about.
+> **CORRECTED 2026-07-30.** This paragraph used to claim: *"the ONLY way to get overlap
+> wrong (a read into a slot that later moves, **a compute launch before its bytes land**, a
+> hit evicted mid-batch) is ruled out at compile time or by a typed runtime invariant."*
+>
+> The middle clause was false, and a speculative-prefetch bug proved it: readiness is
+> carried as `hit: Vec<bool>`, and `gpu.rs` launches every `hit` expert WITHOUT awaiting its
+> signal ("a hit's Signal is already resolved, so awaiting it buys nothing"). Marking a slot
+> whose bytes were still in flight as a hit therefore skipped the wait entirely, and the
+> kernel read unwritten memory. Nothing ruled it out, because "should I wait?" was a bool
+> crossing a module boundary.
+>
+> Two of the three hazards listed ARE structurally enforced (`pop_lru_skip(&pinned)`;
+> allocate-before-read). The third was enforced by nothing. A claim of this kind is worse
+> than no claim: it tells a reader a check is unnecessary.
+
+## 8b. Invariants (INV-n) — and the mechanism that keeps this section honest
+
+Every invariant below is numbered and has a test named `inv_<n>_*`. The rule is mechanical:
+**a documented invariant with no test, or a test naming an invariant no longer documented,
+is a defect.** That exists because prose drifted from behaviour repeatedly — §8's claim
+above stayed on the page for months after it stopped being true, and two metrics
+(`compute_gpu_ns`, `fetch_n`) reported ratios whose numerator and denominator came from
+different populations. Numbering converts "the doc drifted" into something a check can see.
+
+| ID | invariant | test |
+|---|---|---|
+| **INV-1** | Routing is a pure function of (gate logits, bias, top_k) — it never consults the cache, so any cache change is output-bit-identical by construction | `math.rs::inv_1_routing_never_consults_the_cache` |
+| **INV-2** | A LOOKA hint never promotes, admits, or leaves residue in policy state; it may only delay an eviction | `hybrid.rs::inv_2_hints_leave_no_residue_in_policy_state` |
+| **INV-3** | A hint can never fail an allocation — vetoes are advisory and are dropped rather than starve eviction | `hybrid.rs::inv_3_hints_can_never_starve_eviction` |
+| **INV-4** | A device-side wait may be enqueued BEFORE its producer exists and still waits (the property `hipStreamWaitEvent` lacks) | `gpustream.rs::inv_4_wait_enqueued_before_signal_still_waits` |
+
+INV-4 is the foundation of the ticketed dataflow that replaces the `hit` mask: it is what
+lets consumers be recorded up front, behind waits on values nothing has signalled yet.
 
 ---
 
