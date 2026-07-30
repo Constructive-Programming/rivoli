@@ -420,3 +420,39 @@ Three ways to make it bind, in order of how much they are worth testing:
    MISSING expert — a veto cannot protect what is not resident. It is also what the deleted
    `--pilot-k` preloader did, and that measured flat while moving 2.4× the bytes. Do not
    revisit it without a mechanism for the bytes.
+
+### The veto TESTED UNDER PRESSURE — and it still does not pay (2026-07-30)
+
+The inert result above was at `--max-mem 115`, where nothing is ever evicted soon enough for
+a 1–2 layer veto to matter. Re-run across a 4.6× range of pressure (int3-vq/lru, 48 tokens):
+
+| `--max-mem` | hit K=0 | hit K=3 | tok/s K=0 → K=3 | vetoes **BOUND** | dropped |
+|--:|--:|--:|--:|--:|--:|
+| 115 | 78.0% | 78.0% | 2.75 → 2.68 | — | — |
+| 40 | 34.4% | 34.4% | 1.48 → 1.36 | 23 | 0 |
+| 30 | 20.5% | **20.6%** | 1.30 → 1.20 | 220 | 0 |
+| 25 | 14.6% | 14.6% | 1.17 → 1.17 | 137 | 0 |
+
+Output bit-identical at every budget, as INV-1 guarantees.
+
+**The mechanism is alive and too weak.** Under pressure the vetoes DO bind — that was
+measured directly (`VETO_BOUND` counts a veto that changed the chosen victim, rather than
+inferring it from hit rate). None were ever dropped for cap, so `HINT_CAP_PCT` is not the
+limiter either. But 220 bound vetoes against ~25,700 evictions is **0.9% of eviction
+decisions**, worth +0.1pp of hit rate, against a 3–8% throughput cost for the pilot's
+per-layer rmsnorm + gemv + D2H.
+
+**Why, quantified.** At 30 GiB the pool holds ~965 slots and takes ~7 evictions/layer, so a
+resident key survives ~138 layers. A 1–2 layer veto can only bind on a key that is *already*
+within 1–2 layers of the LRU end — and an expert predicted for the NEXT layer is warm by
+construction, sitting at the opposite end of the queue. Closing that gap needs a horizon
+comparable to the eviction horizon (~138 layers), where LOOKA's precision (77.2% at L+1,
+68.9% at L+2) is long gone. **The horizons cannot be made to meet at any usable pool size**,
+because a pool small enough for a 2-layer eviction horizon could not hold one layer's
+working set.
+
+`--hint-k` therefore defaults to **0**. The flag, the counters and the policy plumbing stay,
+so the next horizon-or-pressure question costs one run rather than one rebuild. What remains
+durable from this line of work is LOOKA itself — the recall and precision curves are facts
+about the model — and the observation that only a mechanism which changes *bytes moved*
+(admission) can help a MISSING expert. A veto cannot protect what is not resident.

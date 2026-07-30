@@ -33,11 +33,23 @@ use crate::pin::{Fp8Mlp, IndexerPin, LayerMlp, MlpVq, Pin, TRACE_WINDOW};
 /// How many layers ahead the pilot predicts. `trace` builds evaluate both so LOOKA can
 /// report the L+2 curve; `--pilot` alone only consumes L+1's rank 0, so it pays for one
 /// rmsnorm+gemv instead of two.
-/// Default hint width per horizon. Three because p@0..2 are 99/96/93% — the ranks that are
-/// right nearly every time — while p@3 onward fall away (87, 78, 67, 55, 42%). A hint only
-/// vetoes eviction, so a wrong one costs cache headroom rather than bandwidth; the cost of
-/// widening is bounded by `hybrid::HINT_CAP_PCT`, not by wasted fetches.
-pub const DEFAULT_HINT_K: usize = 3;
+/// Default hint width per horizon. **Zero — the veto was measured and does not pay.**
+///
+/// Across a 4.6x range of cache pressure (`--max-mem` 115/40/30/25, hit 78.0/34.4/20.5/14.6%)
+/// enabling hints moved hit rate by at most +0.1pp while costing 3-8% throughput for the
+/// pilot's per-layer rmsnorm+gemv+D2H. The mechanism is not broken: vetoes BIND (23/220/137
+/// at 40/30/25 GiB) and none were ever dropped for cap. It is simply too weak — 220 bound
+/// vetoes against ~25,700 evictions is 0.9% of decisions.
+///
+/// The reason is structural. At 30 GiB the pool is ~965 slots taking ~7 evictions/layer, so
+/// a key survives ~138 layers; a 1-2 layer veto can only bind on a key already within 1-2
+/// layers of the LRU end, and a next-layer prediction is warm, so it sits at the far end.
+/// Making it bind would need a horizon near the eviction horizon (~138 layers), where
+/// LOOKA's precision (77.2% at L+1, 68.9% at L+2) has long since collapsed.
+///
+/// Kept as a flag, not deleted: the counters and the plumbing are what make the next
+/// horizon/pressure question one run instead of one rebuild. Set `--hint-k 3` to re-enable.
+pub const DEFAULT_HINT_K: usize = 0;
 
 const PILOT_H: [usize; 2] = [1, 2];
 /// Both horizons, always. The hint layer wants L+1 AND L+2 (a two-layer lead lets a veto
