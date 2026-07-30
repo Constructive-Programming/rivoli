@@ -1186,6 +1186,41 @@ scalar floats through a `buffer_reference`, so it has no such constraint — onl
 alignment every f32 access already implies. A reader comparing the two launchers will find
 an alignment guard on one side and none on the other; that asymmetry is correct.
 
+## THE QUALITY QUESTION K=0 LEFT OPEN: ANSWERED, AND VULKAN PASSES
+
+Gate A returning K=0 (below) means nothing in A + C + D speaks to Vulkan's output
+quality. `bin/ppl` was the instrument this document reserved for exactly that case. Run:
+
+| | ROCm | Vulkan |
+|---|---:|---:|
+| PPL (762 teacher-forced tokens) | 5.275434 | **5.231609** |
+| expert hit % | 78.08 | 78.05 |
+
+Paired per-position, ROCm as baseline: **mean dNLL −0.00834, sd 0.1689, SE 0.00612,
+95% CI [−0.02033, +0.00365], worse% 48.6.**
+
+**Read it as NO DETECTABLE DIFFERENCE, not as an improvement.** `worse%` of 48.6 says
+Vulkan is worse on about half the tokens and better on the other half — float noise with
+no systematic direction — and the interval spans zero. `ppl.rs` itself flags a
+better-than-baseline result as "implausible, suspect a bug"; the right conclusion is that
+the two backends are indistinguishable here, not that Vulkan improves the model.
+
+**And it is a POWERED pass, which is the distinction that matters.** The 1% bar is 0.00995
+nats and the CI upper bound is +0.00365, so the interval EXCLUDES harm greater than 1%.
+This is not the underpowered null `ppl.rs` warns against — it genuinely bounds the harm.
+
+Why this works when K=0 does not: `--ppl` is TEACHER-FORCED. Both backends score the same
+fixed token sequence, so it does not require them to agree on any argmax. That is precisely
+why it survives the divergence that makes gate A vacuous.
+
+**Scope, so this is not over-quoted.** 762 tokens, one corpus, `int3-vq / dense / lru` —
+the only configuration both backends can run. It measures logit quality, not generation
+dynamics, and it says nothing about the deferred int4/hybrid or DSA paths. The ROCm arm
+reproduced the published int3-vq baseline (5.275434) exactly, so the reference is sound.
+
+**Verdict: the Vulkan backend is as good, within 1%, on the configuration it supports.**
+That is the question the gate was built to answer and could not.
+
 ## GATE A: K = 0. RECORDED HERE, THE FIRST TIME IT WAS MEASURED
 
 The gate requires K "measured and REPORTED", with the baseline written down the first
