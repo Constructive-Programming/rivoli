@@ -394,6 +394,15 @@ mod tier {
         pub fn ptr_mut(&mut self) -> *mut u8 {
             self.ptr
         }
+
+        /// The HOST base, for symmetry with the Vulkan `VmmBuf` — under HIP unified
+        /// addressing it is the SAME NUMBER as [`VmmBuf::ptr_mut`], and the whole point of
+        /// spelling it separately is that `pin.rs` cannot then rely on that coincidence.
+        /// See docs/VULKAN.md, "Host pointer != device address"; the ordering rules for
+        /// filling through it are on `ptr_mut` above.
+        pub fn host_mut(&mut self) -> *mut u8 {
+            self.ptr
+        }
     }
 
     impl Drop for VmmBuf {
@@ -640,14 +649,29 @@ mod vktier {
             self.buf.read_into(out, self.len)
         }
 
-        // No `copy_out_raw`. Its HIP twin takes a bare device pointer with no owning
-        // object, which works only because that number is also a host address. Here it
-        // is not, and an address carries no identity — recovering the mapping means
-        // asking `vk.rs`'s address registry which `Buf` contains the range and reading
-        // through that. Its one caller is the `trace`-feature expert-checksum probe, so
-        // that plumbing would exist purely to serve a diagnostic: build it if and when
-        // the probe is wanted under Vulkan, and hash through the owning `DeviceBuf`
-        // until then.
+        /// DIAGNOSTIC: read `len` bytes back from an arbitrary device pointer.
+        ///
+        /// This was deliberately ABSENT, on the grounds that its HIP twin only works
+        /// because a device pointer is also a host pointer, and that recovering the mapping
+        /// from a bare address would exist purely to serve a diagnostic. It is here now for
+        /// one reason the earlier note did not weigh: without it `--features vulkan,trace`
+        /// does not COMPILE, and a feature combination that cannot be built is worse than a
+        /// registry lookup nobody times. `crate::vk::read_raw` carries the argument in full.
+        ///
+        /// `trace`-only, so it is never on the decode path.
+        ///
+        /// # Safety
+        /// `src` must be a device address inside a live buffer, readable for `len` bytes,
+        /// and no kernel may be concurrently writing them (call after a `device_sync`).
+        #[cfg(feature = "trace")]
+        pub unsafe fn copy_out_raw(src: *const u8, len: usize, out: &mut Vec<u8>) -> Result<()> {
+            // Reads the host mapping, which is not ordered against a recorded dispatch —
+            // hence the sync, matching what the blocking `hipMemcpy` gives the HIP twin for
+            // free. Every other `copy_out*` here does the same for the same reason.
+            crate::vk::device_sync()?;
+            // SAFETY: the caller's contract, forwarded.
+            unsafe { crate::vk::read_raw(src, len, out) }
+        }
 
         pub fn ptr(&self) -> *const u8 {
             self.buf.ptr()
@@ -698,6 +722,13 @@ mod vktier {
         /// host-dereferenceable.
         pub fn ptr(&self) -> *const u8 {
             self.buf.ptr()
+        }
+
+        /// The DEVICE base as `*mut`, matching the HIP `VmmBuf`'s spelling so `pin.rs`
+        /// takes both bases the same way on both backends. Still not host-dereferenceable —
+        /// the mutability is about what the KERNELS do to these bytes, not the CPU.
+        pub fn ptr_mut(&mut self) -> *mut u8 {
+            self.buf.ptr_mut()
         }
 
         /// The HOST base — the io_uring O_DIRECT DMA target, and the only one of the

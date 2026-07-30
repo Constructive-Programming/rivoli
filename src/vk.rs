@@ -194,6 +194,7 @@ struct Pipes {
     append_kv: Pipe,
     gather_rope: Pipe,
     vadd: Pipe,
+    flag_nonfinite: Pipe,
     argmax_reduce: Pipe,
     swiglu: Pipe,
     rmsnorm: Pipe,
@@ -942,6 +943,7 @@ impl Pipes {
             append_kv: AppendKvPush,
             gather_rope: GatherRopePush,
             vadd: VaddPush,
+            flag_nonfinite: FlagNonfinitePush,
             argmax_reduce: ArgmaxPush,
             swiglu: SwigluPush,
             rmsnorm: RmsnormPush,
@@ -1033,10 +1035,22 @@ struct Alloc {
     base: u64,
     len: u64,
     buf: vk::Buffer,
+    /// The owning `Buf`'s HOST mapping base, so a device address can be turned back into a
+    /// readable host address. Only [`read_raw`] uses it — see the note there.
+    host: *mut u8,
 }
 
-/// The `VkBuffer` owning `[addr, addr+len)`, and the offset into it.
-fn resolve(addr: u64, len: usize) -> Result<(vk::Buffer, u64)> {
+// SAFETY: `host` is a permanent `vkMapMemory` result for an allocation that outlives every
+// registry entry (deregistration happens in `Buf::drop` BEFORE the unmap). The registry only
+// ever hands it out under its own mutex, and `read_raw` — its sole reader — copies out of it
+// after a `device_sync`. The pointer is not dereferenced by the registry itself.
+unsafe impl Send for Alloc {}
+
+/// Look up `[addr, addr+len)` in the registry and project one field out of the owning
+/// allocation. Shared by [`resolve`] and [`read_raw`] so the bounds and overflow checks
+/// exist once — they were duplicated, and the second copy is exactly where an off-by-one
+/// would live unnoticed.
+fn lookup<T>(addr: u64, len: usize, f: impl Fn(&Alloc, u64) -> T) -> Result<T> {
     let allocs = ALLOCS.lock().map_err(|_| anyhow!("vk alloc registry poisoned"))?;
     let end = addr
         .checked_add(len as u64)
@@ -1044,13 +1058,78 @@ fn resolve(addr: u64, len: usize) -> Result<(vk::Buffer, u64)> {
     allocs
         .iter()
         .find(|a| addr >= a.base && end <= a.base + a.len)
-        .map(|a| (a.buf, addr - a.base))
+        .map(|a| f(a, addr - a.base))
         .ok_or_else(|| {
             anyhow!("device address {addr:#x}..{end:#x} is not inside any live Buf")
         })
 }
 
+/// The `VkBuffer` owning `[addr, addr+len)`, and the offset into it.
+fn resolve(addr: u64, len: usize) -> Result<(vk::Buffer, u64)> {
+    lookup(addr, len, |a, off| (a.buf, off))
+}
+
+/// DIAGNOSTIC: read `len` bytes back from an arbitrary DEVICE ADDRESS into `out`.
+///
+/// The Vulkan twin of `hip.rs`'s `DeviceBuf::copy_out_raw`, and the second caller of the
+/// address registry `Buf`'s own comment warned not to grow. It earns the exception on the
+/// same terms `memcpy_dtod` does and one more:
+///
+/// - It is `trace`-only. Its sole caller is the expert-checksum / NaN-localizer probe, so it
+///   is never on the decode path and a linear scan of a handful of entries costs nothing.
+/// - There is no alternative. A bare device address carries no object identity, which is the
+///   whole reason `device.rs` deferred this — but the alternative to building it is that
+///   `--features vulkan,trace` does not COMPILE, and a feature combination that cannot be
+///   built is worse than a lookup nobody times.
+///
+/// Reads the host mapping directly, so unlike `hipMemcpy` it does NOT synchronise.
+///
+/// # Safety
+/// `src` must be a device address inside a live [`Buf`], readable for `len` bytes, and no
+/// kernel may be concurrently writing them — call after a [`device_sync`].
+pub unsafe fn read_raw(src: *const u8, len: usize, out: &mut Vec<u8>) -> Result<()> {
+    ensure!(len > 0, "read_raw: zero-length read");
+    let host = lookup(src as u64, len, |a, off| {
+        // SAFETY: `off + len <= a.len` was checked by `lookup`, and the mapping covers the
+        // whole allocation.
+        unsafe { a.host.add(off as usize) }
+    })?;
+    out.clear();
+    out.reserve(len);
+    // SAFETY: `host` is readable for `len` (bounds-checked above); `out` owns `len` reserved
+    // bytes; the two are distinct allocations.
+    unsafe {
+        std::ptr::copy_nonoverlapping(host, out.as_mut_ptr(), len);
+        out.set_len(len);
+    }
+    Ok(())
+}
+
 impl Buf {
+    /// # MEASURED: an allocation above ~4 GiB exceeds `maxMemoryAllocationSize` here.
+    ///
+    /// The first Vulkan run against the real artifact allocated the 16.16 GiB resident tier
+    /// and the 43.8 GiB routed pool as ONE `Buf` each, and the validation layer flagged both:
+    ///
+    /// ```text
+    /// vkAllocateMemory(): pAllocateInfo->allocationSize (47070568448) is larger than
+    /// maxMemoryAllocationSize (4294967292)
+    /// ```
+    ///
+    /// It WORKED — the driver honoured both and the token decoded — but that is the layer's
+    /// point: the limit is advertised, this exceeds it by 11x, and the spec permits
+    /// `VK_ERROR_OUT_OF_DEVICE_MEMORY` instead. Not fixed here because fixing it means
+    /// suballocating `DeviceTier`/`VmmBuf` across several allocations, which changes the
+    /// address arithmetic `pin.rs`'s arena is built on. Recorded so the next reader knows it
+    /// is KNOWN rather than unnoticed.
+    ///
+    /// Two consequences that bite before the fix lands:
+    ///
+    /// - **Any test that allocates more than 4 GiB will fail `Validation::check`**, which
+    ///   asserts zero validation messages. Every current test is far below it.
+    /// - **A Vulkan build logs two validation ERRORs during pin construction.** They are not
+    ///   spurious and must not be filtered out — see `debug_callback`'s note on what does
+    ///   and does not get counted.
     pub fn new(len: usize) -> Result<Self> {
         ensure!(len > 0, "Buf::new(0): Vulkan rejects a zero-sized buffer");
         let g = gpu()?;
@@ -1156,6 +1235,7 @@ impl Buf {
                 base: addr,
                 len: len as u64,
                 buf,
+                host,
             }),
             Err(_) => {
                 // SAFETY: `mem` is bound and mapped, owned solely by this half-built
@@ -1298,6 +1378,41 @@ pub unsafe fn memcpy_dtod(dst: *mut u8, src: *const u8, bytes: usize) -> Result<
         unsafe { d.cmd_copy_buffer(cb, sbuf, dbuf, &region) };
     })?;
     g.sync()
+}
+
+/// Fill `bytes` at `dst` with the 32-bit pattern `pat` (`bytes` a multiple of 4).
+/// `hip::fill_u32`'s twin: it poisons a freshly admitted expert slot so a read-before-
+/// write is DETERMINISTIC rather than dependent on what was in memory (`pin.rs`, under
+/// `trace`).
+///
+/// `vkCmdFillBuffer` rather than a shader — that command IS this kernel, so
+/// `kernels/vmm.hip::fill_u32` has no GLSL twin and never needs one. Unlike
+/// [`memcpy_dtod`] this does NOT sync: the fill is recorded into the open command buffer
+/// and `enqueue`'s barrier orders it against whatever reads the slot next, which is what
+/// the HIP side gets from launching on the null stream.
+///
+/// # Safety
+/// `dst` must be a DEVICE ADDRESS inside a live [`Buf`] owning at least `bytes`.
+pub unsafe fn fill_u32(dst: *mut u8, pat: u32, bytes: usize) -> Result<()> {
+    ensure!(
+        bytes > 0 && bytes.is_multiple_of(4),
+        "fill_u32: {bytes} bytes is not a positive multiple of 4"
+    );
+    let g = gpu()?;
+    let (buf, off) = resolve(dst as u64, bytes)?;
+    // vkCmdFillBuffer requires a 4-byte-aligned offset AND size. `bytes` is checked
+    // above; the offset comes from `resolve`, so it inherits the caller's alignment and
+    // has to be checked here rather than assumed.
+    ensure!(
+        off.is_multiple_of(4),
+        "fill_u32 dst {dst:?} is at offset {off} in its buffer, which vkCmdFillBuffer \
+         requires to be 4-byte aligned"
+    );
+    g.enqueue(|d, cb| {
+        // SAFETY: recording is open; `buf`/`off` came from `resolve`, so the range lies
+        // inside the buffer, and both offset and size are 4-aligned (checked above).
+        unsafe { d.cmd_fill_buffer(cb, buf, off, bytes as u64, pat) };
+    })
 }
 
 /// Declare a `push_constant` mirror struct, with both of its invariants checked AT
@@ -1505,10 +1620,21 @@ impl Gpu {
     /// Arming directly on top of recorded-but-unsubmitted work (what
     /// `Signal::arm_on(stream)` does on the HIP side) needs the single command buffer
     /// here to become a small ring, because an async flush cannot reuse a buffer that
-    /// is still pending. That is integration-phase work: nothing consumes this yet,
-    /// `asyncfetch.rs` being rocm-only, and building the ring before its consumer
-    /// exists would be a design with no test to hold it honest.
+    /// is still pending. That is increment-2 work — see docs/VULKAN.md, "The design, on
+    /// paper", where the ring and the second queue are one design. `vkstream.rs`
+    /// documents what the gap costs its callers today.
     pub fn signal(&self) -> Result<Signal> {
+        let sig = Signal::pending();
+        self.arm(&sig)?;
+        Ok(sig)
+    }
+
+    /// As [`Gpu::signal`] but resolving a CALLER-OWNED [`Signal`], which is what
+    /// `asyncfetch.rs` needs: it hands out one pending signal per queued read up front
+    /// and arms each later, as its completion is reaped. Splitting this out of `signal`
+    /// is the whole reason that module compiles against both backends —
+    /// `gpustream::Signal::arm_on` has the same shape.
+    pub fn arm(&self, sig: &Signal) -> Result<()> {
         let t = &self.timeline;
         // The `cmd` mutex is held across allocate-value AND submit, for two reasons
         // that are both correctness, not tidiness:
@@ -1536,7 +1662,6 @@ impl Gpu {
             "vk command buffer poisoned by an earlier device_sync failure"
         );
         let value = t.next.fetch_add(1, Ordering::Relaxed) + 1;
-        let sig = Signal::pending();
         {
             let mut w = t
                 .waiting
@@ -1565,7 +1690,7 @@ impl Gpu {
             }
             bail!("vkQueueSubmit (timeline signal) failed: {e}");
         }
-        Ok(sig)
+        Ok(())
     }
 }
 
@@ -1874,6 +1999,53 @@ pub unsafe fn launch_vadd(x: *mut f32, y: *const f32, n: usize) -> Result<()> {
         _pad: 0,
     };
     g.dispatch(&g.pipes.vadd, &push, groups(n))
+}
+
+push_struct! {
+    /// Mirror of `flag_nonfinite.comp`'s push block.
+    FlagNonfinitePush {
+        x: u64,
+        flag: u64,
+        n: i32,
+        tag: u32,
+    }
+}
+
+/// Record `tag` in `flag` if any of `x[0..n]` is non-finite, first writer wins.
+/// `hip::launch_flag_nonfinite`'s twin, and REAL rather than stubbed: a no-op here would
+/// make the NaN localizer report tag 0 — "no layer was non-finite" — on a run that went
+/// non-finite, which is the one failure mode a diagnostic must not have.
+///
+/// Adds no sync of its own: the flag rides the argmax D2H the tail already pays.
+///
+/// # Safety
+/// Device addresses of live [`Buf`]s, valid until the next [`device_sync`]: `x` (`n`
+/// f32), `flag` (one u32, ZEROED before the run — the kernel only ever CAS-es 0 → tag).
+pub unsafe fn launch_flag_nonfinite(
+    x: *const f32,
+    n: usize,
+    tag: u32,
+    flag: *mut u32,
+) -> Result<()> {
+    ensure!(n > 0, "flag_nonfinite: argument guard rejected");
+    // Tag 0 is the sentinel for "nothing was flagged", so a caller passing it would fill
+    // in a value the reader cannot distinguish from silence — and `atomicCompSwap(_, 0,
+    // 0)` writes nothing anyway, so the call would ALSO be a silent no-op. The HIP side
+    // accepts it; refusing is one of the few places the Vulkan launcher is stricter, for
+    // the same reason as the VQ dimension guards (docs/VULKAN.md).
+    ensure!(
+        tag != 0,
+        "flag_nonfinite: tag 0 is the 'nothing flagged' sentinel and would be \
+         indistinguishable from a clean run"
+    );
+    let g = gpu()?;
+    let push = FlagNonfinitePush {
+        x: x as u64,
+        flag: flag as u64,
+        n: n as i32,
+        tag,
+    };
+    g.dispatch(&g.pipes.flag_nonfinite, &push, groups(n))
 }
 
 push_struct! {
@@ -2721,4 +2893,154 @@ pub unsafe fn launch_moe_reduce(
         hidden: hidden as i32,
     };
     g.dispatch(&g.pipes.moe_reduce, &push, groups(hidden))
+}
+
+// ---------------------------------------------------------------------------
+// Deferred kernels — the launchers that exist so `gpu.rs` COMPILES, and refuse.
+// ---------------------------------------------------------------------------
+//
+// docs/VULKAN.md ports 16 of 29 kernels; these are on the other side of that line. They
+// are here rather than absent because the backend waist is a glob re-export of one module
+// or the other (`src/backend.rs`), so a name `gpu.rs` mentions must EXIST on both sides.
+//
+// Every one returns `Err`. A silent no-op was the alternative and it is strictly worse:
+// `layernorm` no-oping leaves the indexer's k_norm unnormalised and the DSA row selection
+// becomes plausible garbage; `moe_expert_range_i4` no-oping leaves the partial slab at
+// whatever it held, so int4 decodes with the previous token's experts. Both produce
+// numbers and neither produces a diagnostic.
+//
+// The error is a BACKSTOP, not the user-facing check. `Config::validate` rejects
+// `--attn dsa|misa` and `--mode int4|hybrid` on a Vulkan build at STARTUP, before the pin
+// is built, because the same information after two minutes of weight loading and forty
+// layers of decode is the worse version of it. These fire only if some path reaches a
+// deferred kernel without passing that gate — which is exactly when a loud failure earns
+// its keep.
+
+/// One message shape, so every deferred kernel says the same thing the same way.
+fn deferred(name: &str) -> anyhow::Error {
+    anyhow!(
+        "{name} is not implemented on the Vulkan backend (docs/VULKAN.md ports 16 of 29 \
+         kernels and defers this one); rebuild with --features rocm"
+    )
+}
+
+/// int4 MoE experts — deferred. See the section header.
+///
+/// # Safety
+/// Dereferences nothing: it fails before touching a pointer.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_moe_expert_range_i4(
+    _x: *const f32,
+    _hidden: usize,
+    _inter: usize,
+    _e_start: usize,
+    _e_count: usize,
+    _descs: *const ExpertDesc,
+    _wexpert: *const f32,
+    _h: *mut f32,
+    _partial: *mut f32,
+    _stream: *mut std::ffi::c_void,
+) -> Result<()> {
+    Err(deferred("moe_expert_range_i4"))
+}
+
+/// The DSA indexer's k_norm LayerNorm — deferred. See the section header.
+///
+/// # Safety
+/// Dereferences nothing: it fails before touching a pointer.
+pub unsafe fn launch_layernorm(
+    _x: *const f32,
+    _w: *const f32,
+    _b: *const f32,
+    _n: usize,
+    _eps: f32,
+    _y: *mut f32,
+) -> Result<()> {
+    Err(deferred("layernorm"))
+}
+
+/// DSA/MISA indexer key append — deferred. See the section header.
+///
+/// # Safety
+/// Dereferences nothing: it fails before touching a pointer.
+pub unsafe fn launch_index_append(
+    _k: *const f32,
+    _kcache: *mut u16,
+    _pos: usize,
+    _hd: usize,
+) -> Result<()> {
+    Err(deferred("index_append"))
+}
+
+/// DSA/MISA indexer scoring — deferred. See the section header.
+///
+/// # Safety
+/// Dereferences nothing: it fails before touching a pointer.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_index_score(
+    _q: *const f32,
+    _w: *const f32,
+    _kcache: *const u16,
+    _heads: *const u32,
+    _nt: usize,
+    _nh: usize,
+    _nact: usize,
+    _hd: usize,
+    _wscale: f32,
+    _dscale: f32,
+    _scores: *mut f32,
+) -> Result<()> {
+    Err(deferred("index_score"))
+}
+
+/// DSA device-side top-k row selection — deferred. See the section header.
+///
+/// # Safety
+/// Dereferences nothing: it fails before touching a pointer.
+pub unsafe fn launch_index_topk(
+    _scores: *const f32,
+    _nt: usize,
+    _k: usize,
+    _rows: *mut u32,
+) -> Result<()> {
+    Err(deferred("index_topk"))
+}
+
+/// MISA block-pool running mean — deferred. See the section header.
+///
+/// # Safety
+/// Dereferences nothing: it fails before touching a pointer.
+pub unsafe fn launch_index_pool_push(
+    _k: *const f32,
+    _pool: *mut f32,
+    _t: usize,
+    _hd: usize,
+) -> Result<()> {
+    Err(deferred("index_pool_push"))
+}
+
+/// MISA head router — deferred. See the section header.
+///
+/// # Safety
+/// Dereferences nothing: it fails before touching a pointer.
+pub unsafe fn launch_index_head_route(
+    _q: *const f32,
+    _w: *const f32,
+    _pool: *const f32,
+    _m_blocks: usize,
+    _nh: usize,
+    _hd: usize,
+    _e: *mut f32,
+) -> Result<()> {
+    Err(deferred("index_head_route"))
+}
+
+/// `x += g·y`, the residual add with a branch gain — deferred. Reached only by
+/// `--moe-gain != 1.0`, which `main` rejects on a Vulkan build; `launch_vadd` (the g = 1
+/// case) is ported and is what every normal decode uses.
+///
+/// # Safety
+/// Dereferences nothing: it fails before touching a pointer.
+pub unsafe fn launch_vaxpy(_x: *mut f32, _y: *const f32, _g: f32, _n: usize) -> Result<()> {
+    Err(deferred("vaxpy"))
 }
