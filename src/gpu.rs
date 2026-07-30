@@ -346,6 +346,14 @@ pub struct GpuEngine<'a> {
     attn_partial: DeviceBuf,
     ctx: DeviceBuf,
     gate_logits: DeviceBuf,
+    /// LOOKA (CACHE_PILOT Step 1): scratch for running a FUTURE layer's router against
+    /// this layer's post-attention residual. Separate from `xn`/`gate_logits` so the pilot
+    /// cannot perturb the real forward pass — the whole point is a zero-effect measurement.
+    /// `pilot_logits` holds both horizons back-to-back so one D2H serves both.
+    #[cfg(feature = "trace")]
+    pilot_xn: DeviceBuf,
+    #[cfg(feature = "trace")]
+    pilot_logits: DeviceBuf,
     // Dense-MLP fp8 SwiGLU scratch (gate/up projections, dense_inter wide).
     mlp_g: DeviceBuf,
     mlp_u: DeviceBuf,
@@ -394,6 +402,8 @@ pub struct GpuEngine<'a> {
     fmt: Vec<bool>,
     /// Per-selected-expert: was it already resident? Drives the batched launch below.
     hit: Vec<bool>,
+    #[cfg(feature = "trace")]
+    looka: crate::looka::Looka,
     gl_host: Vec<u8>,
     argmax_host: Vec<u8>,
     /// Always-on cheap per-token profiling (see [`Profile`]).
@@ -543,6 +553,10 @@ impl<'a> GpuEngine<'a> {
             attn_partial: f(crate::backend::attend_scratch_floats(h, kvl))?,
             ctx: f(h * cfg.v_head_dim)?,
             gate_logits: f(cfg.n_experts)?,
+            #[cfg(feature = "trace")]
+            pilot_xn: f(cfg.hidden)?,
+            #[cfg(feature = "trace")]
+            pilot_logits: f(cfg.n_experts * crate::looka::HORIZONS.len())?,
             mlp_g: f(cfg.dense_inter)?,
             mlp_u: f(cfg.dense_inter)?,
             moe_out: f(cfg.hidden)?,
@@ -579,6 +593,8 @@ impl<'a> GpuEngine<'a> {
             descs_vq: Vec::with_capacity(slots),
             fmt: Vec::with_capacity(slots),
             hit: Vec::with_capacity(slots),
+            #[cfg(feature = "trace")]
+            looka: crate::looka::Looka::new(cfg.n_layers, cfg.n_experts),
             gl_host: Vec::with_capacity(cfg.n_experts * 4),
             argmax_host: Vec::with_capacity(12),
             prof: Profile::default(),
@@ -1085,6 +1101,84 @@ impl<'a> GpuEngine<'a> {
                 launch_rmsnorm(xp, post_ln, hidden, eps, xnp)?; // pre-MLP norm → xn
             }
 
+            // --- LOOKA pilot (CACHE_PILOT Step 1, `--features trace`) ---
+            // Run FUTURE layers' routers against THIS layer's post-attention residual and
+            // stash what they name. Placed here deliberately: `xp` still holds the
+            // post-attention residual, before the MoE result is added back into it — which
+            // is exactly the state a real prefetcher would have to predict from, since
+            // layer L+h's true input needs L's MoE output that has not been computed yet.
+            // That staleness IS the thing being measured; correcting for it would measure a
+            // predictor nobody can build.
+            #[cfg(feature = "trace")]
+            {
+                let mut any = false;
+                for (hi, &dh) in crate::looka::HORIZONS.iter().enumerate() {
+                    let t = l + dh;
+                    if t >= cfg.n_layers {
+                        continue;
+                    }
+                    // Copy the pointers out before touching `self.looka` — same borrow
+                    // dance as the layer header above.
+                    let tw = &self.pin.layers[t];
+                    let t_post_ln = tw.post_ln;
+                    let t_gate_w = match &tw.mlp {
+                        LayerMlp::Moe { gate_w, .. } => *gate_w,
+                        // A dense target has no router to run. Leaving the stash empty
+                        // keeps it out of the denominator rather than scoring a miss.
+                        LayerMlp::Dense(_) => continue,
+                    };
+                    let pxn = self.pilot_xn.ptr_mut() as *mut f32;
+                    let plp = (self.pilot_logits.ptr_mut() as *mut f32).wrapping_add(hi * cfg.n_experts);
+                    // SAFETY: `xp` is the live residual; `t_post_ln`/`t_gate_w` are resident
+                    // F32 dense weights (never streamed, so valid for any layer at any
+                    // time); `pxn`/`plp` are engine-owned scratch, and `plp` is in bounds
+                    // because `pilot_logits` is sized HORIZONS.len() * n_experts. Both
+                    // launches are stream-ordered, so the gemv sees the norm's output.
+                    unsafe {
+                        launch_rmsnorm(xp, t_post_ln, hidden, eps, pxn)?;
+                        launch_gemv_f32(pxn, t_gate_w, cfg.n_experts, hidden, plp)?;
+                    }
+                    any = true;
+                }
+                if any {
+                    // ONE D2H for both horizons. This is the only sync the pilot adds that
+                    // the forward pass does not already pay, so it is kept to a single
+                    // join rather than one per horizon.
+                    let (pl, host) = (&self.pilot_logits, &mut self.looka.host);
+                    blocked(&mut self.prof.sync_wait_ns, "gpu-wait/looka-d2h", || {
+                        pl.copy_out_into(host)
+                    })?;
+                    for (hi, &dh) in crate::looka::HORIZONS.iter().enumerate() {
+                        let t = l + dh;
+                        if t >= cfg.n_layers
+                            || !matches!(self.pin.layers[t].mlp, LayerMlp::Moe { .. })
+                        {
+                            continue;
+                        }
+                        let lo = hi * cfg.n_experts * 4;
+                        let lk = &mut self.looka;
+                        // Route the pilot the SAME way the real path will, minus the
+                        // cache-conditional advice: `top-m` reorders on residency, and a
+                        // prediction that consulted residency would be scoring the cache
+                        // rather than the predictor it is supposed to be scoring.
+                        crate::math::route_into(
+                            &lk.host[lo..lo + cfg.n_experts * 4],
+                            self.pin.moe_bias(t),
+                            cfg.top_k,
+                            None,
+                            |_| true,
+                            &mut lk.p_scores,
+                            &mut lk.p_choice,
+                            &mut lk.p_sel,
+                            &mut lk.p_cand,
+                        );
+                        let sel = std::mem::take(&mut lk.p_sel);
+                        lk.stash(t, hi, &sel);
+                        lk.p_sel = sel; // hand the allocation back for the next horizon
+                    }
+                }
+            }
+
             // --- MLP sublayer (out fully written; the outer vadd adds moe_out) ---
             if let Some(m) = dense_mlp {
                 let inter = m.gate.o_dim;
@@ -1177,6 +1271,16 @@ impl<'a> GpuEngine<'a> {
                 self.prof.cpu_route_ns += e_route.duration_since(t_route).as_nanos();
                 crate::telemetry::spans::record("cpu/route-into", "decode", t_route, e_route);
                 self.prof.route_ns += t.elapsed().as_nanos();
+                // LOOKA: score whatever layers `l-1` / `l-2` predicted for THIS layer
+                // against what it actually chose, then roll `sel` into the previous-token
+                // baseline. Deliberately outside both route clocks (they close above) —
+                // this is measurement, not routing, and `route_ns` has to stay comparable
+                // across this change.
+                #[cfg(feature = "trace")]
+                {
+                    let (lk, sel) = (&mut self.looka, &self.sel);
+                    lk.score(l, sel);
+                }
                 // Trace v2 only: re-rank the same `choice` array to the wider candidate
                 // window the offline (J, M) grid needs. Deliberately outside the
                 // `route_ns` clock and behind the trace gate, so the decode path is
@@ -1751,6 +1855,11 @@ impl<'a> GpuEngine<'a> {
             self.route_advice,
         );
         summary.report();
+        // LOOKA sits beside the profile rather than inside it: it is a property of the
+        // ROUTER (would a prefetcher guess right?), not of where this run spent its time,
+        // and it only exists in `trace` builds.
+        #[cfg(feature = "trace")]
+        tracing::info!("{}", self.looka.report());
         Ok((generated, summary))
     }
 }

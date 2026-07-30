@@ -30,6 +30,9 @@ pub mod backend;
 pub mod asyncfetch;
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
 pub mod gpu;
+// Backend-neutral (pure counters + routing scratch), so it builds wherever `trace` does.
+#[cfg(feature = "trace")]
+pub mod looka;
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
 pub mod pin;
 #[cfg(any(feature = "rocm", feature = "vulkan"))]

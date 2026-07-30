@@ -151,6 +151,51 @@ pilot logits into the *same* `copy_out_into` as the next gate read if possible, 
 not, account the added sync honestly in the profile rather than letting it land in
 `other`.
 
+### MEASURED 2026-07-30 — `src/looka.rs`, `--features rocm,trace`
+
+int3-vq / dense / lru, `--max-mem 115`, 128 tokens, chat-framed prompt:
+
+| | recall | vs null | n |
+|---|--:|--:|--:|
+| **L+1** | **77.2%** | +46.4pp | 120,600 |
+| **L+2** | **68.9%** | +38.2pp | 120,600 |
+| prev-token (null hypothesis) | 30.8% | — | 120,000 |
+
+**The gate passes.** We beat colibri's 71.6% at L+1 on a *quantized* model, and our null is
+weaker than theirs (30.8% vs 41.3%), so the margin over free is 2.5× rather than 1.7×.
+
+**L+2 = 68.9% answers the open horizon question** — only 8.3pp behind L+1, so `top-m`'s
+two-layer lead time is affordable and does not need a separate cheaper predictor.
+
+Implementation notes for anyone extending it:
+- The pilot runs on layer L's **post-attention residual**, i.e. before L's MoE output is
+  added back. That staleness is deliberate — it is the state a real prefetcher would have,
+  since L+h's true input depends on MoE results not yet computed. Correcting for it would
+  measure a predictor nobody can build.
+- It is launched **outside** the MoE event bracket (gpu.rs: pilot ~1104, bracket opens
+  ~1419), verified by the per-layer miss buckets being unchanged (0-miss 1576 µs here vs
+  1563 µs on the default build).
+- **`route` is not comparable in trace builds** — it reads 9.1 ms here vs 102.6 ms by
+  default, because the pilot's D2H drains the stream earlier and the attention wait that
+  `route_wait_ns` absorbed relocates into the pilot's sync bucket. (Which incidentally
+  shows `route` was ~90% attention wait, not host routing.)
+
+### What this does NOT settle — read before starting Step 2
+
+Recall passing is necessary, not sufficient, and the disk-bound finding
+(ARCHITECTURE.md §3) changed the economics after this plan was written. Prefetch's classic
+payoff is hiding latency; ours is **bandwidth**-limited, so mispredicted bytes are a direct
+throughput tax rather than merely wasted work.
+
+At 77.2% recall, covering today's 140.79 useful misses/token takes ~182 speculative loads:
+**2.16 → 2.80 GB/token, +29% on the exact resource that is the bottleneck.** A loader that
+fetches all of top-`k` is therefore plausibly net-NEGATIVE even at this recall.
+
+What Step 2 actually needs is **precision on a subset** — speculate only where confidence is
+high. The next measurement is recall broken down by **prediction rank**: if the top 2–3
+predictions carry ~95% precision, a confidence-gated prefetcher moves few enough wasted
+bytes to win. That number does not exist yet, and LOOKA is the right place to add it.
+
 ## Step 2 — the speculative loader
 
 One component, two callers: CACHE_PILOT asks it to load a predicted expert in the cheap
