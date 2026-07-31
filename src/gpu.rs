@@ -817,6 +817,13 @@ impl<'a> GpuEngine<'a> {
         self.pin.mtp.is_some()
     }
 
+    /// Is the routed-expert trace sink active (`--trace`)? `main` reads this to decide
+    /// whether speculative decode is available — a verify pass routes twice per layer and
+    /// submits the union, which the v2 trace format cannot express.
+    pub fn tracing(&self) -> bool {
+        self.pin.tracing()
+    }
+
     /// (drafts produced, drafts the main model then agreed with). Empty unless `--mtp`.
     pub fn mtp_accept(&self) -> (u64, u64) {
         (self.mtp_seen, self.mtp_hit)
@@ -2279,18 +2286,20 @@ impl<'a> GpuEngine<'a> {
         mtp: bool,
     ) -> Result<(Vec<u32>, ProfileSummary)> {
         ensure!(!prompt_ids.is_empty(), "empty prompt");
+        // Both preconditions are resolved by `main` (which downgrades to sequential
+        // decode and says why), so reaching either of these is a caller bug rather than a
+        // user one — but they stay, because both fail SILENTLY otherwise: a missing head
+        // would null-deref in the draft path, and tracing would emit per-layer selections
+        // that read as a routing the model never made.
         ensure!(
             !mtp || self.has_mtp(),
-            "--mtp: this artifact carries no MTP head (reconvert with a current bin/convert)"
+            "speculative decode: this artifact carries no MTP head (reconvert with a \
+             current bin/convert)"
         );
-        // A verify pass submits the UNION of both rows' picks, so the trace's per-layer
-        // `sel` would no longer be one routing decision — and `bin/replay`'s grammar (and
-        // pin.rs's `window[..sel.len()] == sel` invariant) assume it is. Refuse the pair
-        // rather than emit a trace that reads as a routing the model never made.
         ensure!(
             !mtp || !self.pin.tracing(),
-            "--mtp with --trace: a speculative pass routes twice per layer and submits the \
-             union, which the v2 trace format cannot express. Trace without --mtp."
+            "speculative decode with --trace: a verify pass routes twice per layer and \
+             submits the union, which the v2 trace format cannot express"
         );
         // The decode as ONE async flow: prefill (warm-up) then the token loop, driven
         // by a single current-thread runtime — `forward` awaits the expert stream

@@ -1571,3 +1571,23 @@ help: `R=2` costs 1.079× of `R=1`, so the per-row arithmetic is ~8% of an exper
 and the other 92% is the weight read, which the union forces regardless. GLM-5.2 ships
 `num_nextn_predict_layers = 1`, so a deeper head is not available either — depth-2 chained
 drafts were measured at 4.4%, which is why the pass is 2 rows and not 3.
+
+### 512-token confirmation, and a normal prompt
+
+`--prompt "What causes the seasons on Earth?"`, same config, 2026-07-31:
+
+| | tok/s | ms/tok | route | moe | miss/tok | GB/tok | hit |
+|---|---|---|---|---|---|---|---|
+| `--no-mtp` | **2.63** | — | — | — | — | — | 76.1% |
+| default (speculative) | **2.49** | 401.6 | 87.2 | 289 | 181.8 | 2.79 | 75.5% |
+
+**0.95×**, and completions BYTE-IDENTICAL over all 512 tokens (2195 bytes, `cmp` clean).
+Acceptance 161/350 = 46.0% = 1.460 tokens/pass, against the 1.53 break-even. Confidence
+separates cleanly and monotonically: 6% / 24% / 30% / 57% / 91% over n = 32/88/84/58/88.
+
+**Neither run terminates.** Both hit the 512 cap without emitting EOS, both collapse into
+the same loop (`longest repeated block 77, distinct 0.193`) — re-emitting earlier
+sentences with spliced fragments (`2.  2. **Orbit:**`, `**23. 5 degrees**`). It is
+byte-identical with and without speculation, so it is NOT the verify pass; it is the
+pre-existing degeneration, now visible on a normal prompt rather than only on
+`"The sky is blue because"`. Unresolved, and it is a bug, not a benchmark confound.

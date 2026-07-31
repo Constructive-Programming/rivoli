@@ -149,12 +149,18 @@ struct Args {
     #[arg(long)]
     raw_prompt: bool,
 
-    /// Run the MTP (multi-token prediction) head alongside the decode and report how often
-    /// its draft matched the token the model then produced. Costs ~1/n_layers per token and
-    /// currently changes NO output: without a batched verify pass an accepted draft saves
-    /// nothing, so this measures the ceiling before the kernel work that would realise it.
+    /// Turn OFF speculative decode. On by default whenever the artifact carries the MTP
+    /// head: the head drafts `pos+1`, a 2-row verify pass checks the real token and the
+    /// draft through one read of every weight, and an accepted draft costs no second pass.
+    ///
+    /// Output is BYTE-IDENTICAL either way — every batched kernel is bit-identical per row
+    /// and row 0 of a verify pass is the real token — so this flag can only move speed.
+    /// Which direction it moves it depends on the draft acceptance rate: the pass costs
+    /// ~1.53x a sequential one (the MoE launches the UNION of both rows' experts), so it
+    /// pays above ~53% acceptance and loses below. Measured 0.93x on the bench prompt;
+    /// see benchmarks.md, "Speculative decode".
     #[arg(long)]
-    mtp: bool,
+    no_mtp: bool,
 
     /// DIAGNOSTIC: hash the residual stream after every layer.
     #[cfg(feature = "trace")]
@@ -279,7 +285,7 @@ fn main() -> Result<()> {
     let (a_max_mem, a_bench) = (a.max_mem, a.bench);
     let (a_2q_kin, a_2q_kout) = (a.two_q_kin, a.two_q_kout);
     let (a_sinks, a_window, a_misa_heads) = (a.sinks, a.window, a.misa_heads as usize);
-    let a_mtp = a.mtp;
+    let a_no_mtp = a.no_mtp;
     #[cfg(feature = "trace")]
     let checksum_x = a.checksum_x;
     #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
@@ -565,7 +571,23 @@ fn main() -> Result<()> {
         }
 
         let t0 = std::time::Instant::now();
-        let (ids, summary) = engine.generate(&prompt_ids, ngen, &tok.eos, a_mtp)?;
+        // Speculative decode is the default, but only where it is BUILDABLE. Two
+        // conditions can take it away and neither is the user's mistake: an artifact
+        // without the MTP head (`bin/fp8_to_i4` emits no L78.i4, so int4/hybrid runs load
+        // without one), and `--trace` (a verify pass routes twice per layer and submits
+        // the union, which the v2 trace format cannot spell). Say which, once, and decode.
+        let mtp = !a_no_mtp && engine.has_mtp() && !engine.tracing();
+        if !a_no_mtp && !mtp {
+            info!(
+                "speculative decode OFF: {}",
+                match engine.has_mtp() {
+                    false => "this artifact carries no MTP head (bin/fp8_to_i4 emits no \
+                              L78.i4, so int4/hybrid artifacts have none)",
+                    true => "--trace routes once per layer and a verify pass routes twice",
+                }
+            );
+        }
+        let (ids, summary) = engine.generate(&prompt_ids, ngen, &tok.eos, mtp)?;
         let dt = t0.elapsed().as_secs_f64();
         let (hits, misses) = (engine.hits(), engine.misses());
         info!(
