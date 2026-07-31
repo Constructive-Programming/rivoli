@@ -1585,9 +1585,45 @@ drafts were measured at 4.4%, which is why the pass is 2 rows and not 3.
 Acceptance 161/350 = 46.0% = 1.460 tokens/pass, against the 1.53 break-even. Confidence
 separates cleanly and monotonically: 6% / 24% / 30% / 57% / 91% over n = 32/88/84/58/88.
 
-**Neither run terminates.** Both hit the 512 cap without emitting EOS, both collapse into
-the same loop (`longest repeated block 77, distinct 0.193`) — re-emitting earlier
-sentences with spliced fragments (`2.  2. **Orbit:**`, `**23. 5 degrees**`). It is
-byte-identical with and without speculation, so it is NOT the verify pass; it is the
-pre-existing degeneration, now visible on a normal prompt rather than only on
-`"The sky is blue because"`. Unresolved, and it is a bug, not a benchmark confound.
+**Neither run terminates.** Both hit the 512 cap without emitting EOS, both degrade the
+same way. Byte-identical with and without speculation, so it is NOT the verify pass.
+
+### It is not a repetition loop, and it is not the engine
+
+The `distinct 0.193 / longest repeated block 77` metrics say "repetition collapse" and
+that reading is WRONG — they fire on a clean loop and on this, and the difference is the
+whole clue. The text is SPLICED, not looped: `the Northern and Southern Hem` cuts
+mid-phrase into a sentence from two paragraphs earlier; `away from the Polaris` where the
+source clause said "the Sun"; `**23.5 degrees**` re-emitted as `**23. 5 degrees**`; and
+` it is AI-generated text. Please verify the information.` appears mid-sentence though the
+phrase is in no part of the context. Half-copies from context plus training-frequency
+attractors — not an attractor the sampler is stuck in.
+
+Root-caused 2026-07-31 as **model behaviour, not an engine fault**:
+
+- Teacher-forced PPL reproduces the recorded gate figure EXACTLY — 5.222720, mean NLL
+  1.653018 (docs/ARCHITECTURE.md "What gates this change"), six decimal places.
+- NLL is FLAT by position over 762 predicted tokens, in fact slightly improving
+  (Pearson r = -0.105; bucket means 1.893 / 1.469 / 2.083 / 2.013 / 2.006 / 1.263 / 1.168 /
+  1.329). A KV row-index, rope-position or attention-window bug climbs with position. This
+  does not, and it stays healthy well past the ~40 tokens where free-running corrupts.
+- The two 512-token runs are byte-identical at 97,542 vs 77,733 misses — different cache
+  pressure, same output, so no expert-stream race.
+- **`nll_forced` and `generate` call the same `self.forward(token, pos)`.** There is no
+  code path free-running takes that teacher-forcing does not. The engine cannot be
+  behaving differently; only the token sequence differs.
+
+The mechanism is in the same data: **52/762 = 6.8% of teacher-forced tokens sit above
+NLL 5** — near-random even given a known-good prefix. Greedy has no escape from those, and
+one bad argmax conditions everything after it.
+
+What this does NOT establish is how much of that 6.8% is int3-vq damage versus GLM-5.2
+under greedy: the repo has no unquantized arm (the ladder is int3-vq 5.28 > hybrid 11.55 >
+int4 73.43, all quantized), so the attribution is unmeasured. If it is quantization, the
+lever is a sampler (temperature/top-p) — the engine is greedy-only — not a kernel.
+
+**A caution on method.** A first attempt to localise the fork by teacher-forcing the model
+on its OWN output was discarded as confounded: it fed raw text through `--ppl` while the
+generation had been chat-framed, and re-tokenized instead of replaying the emitted ids, so
+positions did not align. Its "NLL 16.6" spikes were tokenizer boundaries. Replaying the
+ids needs a `--ppl` that takes ids, which does not exist.
