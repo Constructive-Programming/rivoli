@@ -64,7 +64,7 @@ flowchart TD
     A["ATTENTION (route)\nrmsnorm → MLA fp8 projections\n→ absorb → append KV (fp8 latent)\n→ flash attend (+DSA select)\n→ value → o_proj"]
     A --> M{dense layer?}
     M -- "layers 0-2" --> D["fp8 SwiGLU MLP"]
-    M -- "layers 3-77" --> MoE["MoE: route → top-8 experts\n(streamed) + shared expert\n→ weighted reduce"]
+    M -- "layers 3-77" --> MoE["MoE: route → top-8 experts\n(streamed) + shared expert\n→ fixed-point accumulate"]
     D --> R[+ residual]
     MoE --> R
   end
@@ -151,20 +151,23 @@ without the host blocking on `hipDeviceSynchronize`:
 ```mermaid
 sequenceDiagram
   participant Loop as decode loop (1 runtime, single thread)
-  participant Reaper as reaper thread (io_uring + fetch HipStream)
+  participant Reaper as reaper thread (io_uring + fetch stream)
   participant NVMe
-  participant Comp as compute HipStream (GPU)
+  participant Comp as compute stream (residents)
+  participant Miss as miss stream (in-flight experts)
 
-  Loop->>Reaper: submit_layer → batch of cold reads
+  Loop->>Reaper: submit_layer → batch of cold reads, one Ticket each
   Reaper->>NVMe: submit all (SQPOLL, concurrent)
-  par per expert e
+  Loop->>Comp: residents: wait_on(RESIDENT) + moe_expert_range → atomicAdd acc row 0
+  Loop->>Miss: misses: wait_on(ticket) + moe_expert_range → atomicAdd acc row 1
+  Note over Loop,Miss: BOTH enqueued up front — no host round trip, and no join between them
+  par per expert e still in flight
     NVMe-->>Reaper: read e lands
-    Reaper->>Comp: bounce→slot copy on fetch stream, arm Signal(e)
-    Note over Loop: sig[e].await resolves when the COPY lands
-    Loop->>Comp: launch_moe_expert_range(e) on compute stream
+    Reaper->>Miss: bounce→slot copy on fetch stream, signal timeline[e]
+    Note over Miss: the wait enqueued for e is satisfied; its kernel runs
   end
-  Loop->>Comp: moe_reduce, then stream_signal().await
-  Comp-->>Loop: layer done → residual add
+  Note over Loop,Miss: host awaits BOTH streams — the only sync, and it already existed
+  Loop->>Comp: moe_acc_drain — converts, resets, and IS the residual add
 ```
 
 - **One runtime, single-threaded, borrows `&mut self`.** `generate()` drives the whole
@@ -191,13 +194,15 @@ are computed and combined. The launch is where fetch and compute overlap:
 ```mermaid
 flowchart LR
   G[router gate f32] --> S[top-8 select]
-  S --> SL["submit_layer:\nresolve hits + admit misses\n→ MlpVq descriptors + fmt flags + load Signals"]
-  SL --> ST["expert stream (buffer_unordered / try_for_each_concurrent)"]
-  ST -->|"sig.await, then"| K1["moe_expert_range (VQ)  — fmt=cold"]
-  ST -->|"sig.await, then"| K2["moe_expert_range_i4 (int4) — fmt=hot"]
-  K1 --> RED[moe_reduce fixed-order]
-  K2 --> RED
-  RED --> V["+ residual (vadd)"]
+  S --> SL["submit_layer:\nresolve hits + admit misses\n→ MlpVq descriptors + fmt flags + Tickets"]
+  SL --> CS["compute stream: residents\n(batched by format run)"]
+  SL --> MS["miss stream: experts still in flight"]
+  CS -->|"wait_on(ticket)"| K1["moe_expert_range (VQ) / _i4 (int4)"]
+  MS -->|"wait_on(ticket)"| K2["moe_expert_range (VQ) / _i4 (int4)"]
+  K1 --> A0["atomicAdd → acc row 0"]
+  K2 --> A1["atomicAdd → acc row 1"]
+  A0 --> DR["moe_acc_drain\nconvert + reset + residual add"]
+  A1 --> DR
 ```
 
 - **One descriptor for both formats.** `ExpertDesc` is six device pointers
@@ -226,8 +231,8 @@ flowchart LR
   **Residents are launched FIRST, and that ordering is load-bearing.** The compute stream is
   FIFO, so enqueueing in `sel` order puts every resident expert behind the first miss's wait
   and nothing computes while a fetch is in flight — measured 3.05 → 2.44 tok/s when that was
-  briefly the case. Reordering launches is safe by construction (each expert writes its own
-  partial row; `moe_reduce` sums `0..ndesc` in fixed order), and it branches on
+  briefly the case. Reordering launches is safe by construction (every expert `atomicAdd`s
+  into a fixed-point row and integer addition associates), and it branches on
   `ticket.is_resident()` — which is *not* the old mask, because it selects an ORDER among
   launches that each enqueue their wait unconditionally. A wrong bit costs throughput and
   cannot cost correctness.
@@ -237,11 +242,31 @@ flowchart LR
   marginal slope is unchanged (1073 → 1102 µs/miss), but a fixed **+382 µs** appears once per
   layer-with-misses (a 1-miss layer costs +145 µs over 0-miss at baseline, +527 µs here).
   That is wake latency on the wait — the GPU notices the value later than a host-func
-  callback did. Recovering it needs the misses off the critical stream (multiple compute
-  queues; Vulkan already has three), not a cheaper wait.
-- **Fixed-order reduce.** Partials are independent rows; `moe_reduce` sums them in a fixed
-  order (deterministic output regardless of completion order). The shared expert folds in
-  as a resident 9th descriptor (weight 1.0, always `ready()`).
+  callback did. Recovering it needed the misses off the critical stream (multiple compute
+  queues; Vulkan already has three), not a cheaper wait — which is what the miss stream
+  below does.
+- **Fixed-point accumulation, and NO join (§12).** Every expert `atomicAdd`s
+  `round(w·down·h · 2^44)` as an i64 into a shared row instead of writing its own f32 partial
+  row. Integer addition associates, so completion order cannot reach the result and the
+  `moe_reduce` over the partials — plus the cross-stream join that had to precede it — both
+  leave the decode path. `moe_acc_drain` converts once, resets the row, and IS the residual
+  add, so the convert needs no barrier of its own: the end-of-layer `device_sync` already
+  stands between it and the next layer's first atomic. The shared expert folds in as a
+  resident 9th descriptor (weight 1.0, `Ticket::RESIDENT`).
+
+  **One accumulator row PER STREAM, not one shared** (`gpu.rs::MOE_ACC_ROWS`). That is a
+  contention fix, not a correctness one — a single shared row measured up to +825 µs on a
+  6-miss layer while making 0-miss layers *faster*, and a 1-miss layer issues the same
+  `9·hidden` atomics as a 0-miss one, so the variable was two queues bouncing the same cache
+  lines. Split: marginal cost per miss 1191 → **1074 µs**.
+
+  **The join itself was free, and §12 has the row that proves it.** Removing it moved a
+  0-miss layer 1607 → 1611 µs, because a host-side `stream_signal(cs).await` already sat
+  right after the reduce. Anyone reaching for "remove a join, gain throughput" here should
+  read that number first.
+
+  Output is no longer bit-comparable to the f32 reduce, so this is the one change in this
+  area that a token-ID diff CANNOT gate — see §12's perplexity result.
 - **Two decode formats.** int3-vq: a 12-bit codebook index per subvector + bf16 group
   scale; the dot is an L1 codebook gather (latency-bound, the smallest/most-resident).
   int4: nibbles + one f32 scale per `I4_GROUP` (128) input columns, applied inside the
