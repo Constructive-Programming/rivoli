@@ -681,8 +681,10 @@ impl<'a> Pin<'a> {
         let vq_present = mode != Mode::Int4; // int3-vq or hybrid needs a vq slab
         // The MTP head is checkpoint layer `n_layers` and is a full MoE layer, so it
         // rides the routed pool like any other and needs its expert slab in EVERY format
-        // this run opens. `bin/fp8_to_i4` does not emit one, so an int4/hybrid run decodes
-        // without a draft head rather than failing to load.
+        // this run opens. An artifact converted before 2026-07-31 has no `L78.i4` — that
+        // is a missing slab, not a missing feature, so an int4/hybrid run on one decodes
+        // without a draft head rather than failing to load. Re-run `bin/fp8_to_i4` to
+        // emit it; it covers layer `n_layers` since the range bound was widened.
         let mtp = st.has(&format!("model.layers.{}.eh_proj.weight", cfg.n_layers))
             && [(vq_present, "vq3"), (i4, "i4")].iter().all(|&(want, ext)| {
                 !want

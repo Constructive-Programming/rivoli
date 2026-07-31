@@ -10,7 +10,9 @@
 >   NOT describe the current artifact.
 > - **Throughput:** ~2.6–2.8 tok/s int3-vq, ~2.7 hybrid, ~2.1 int4 (larger slot → fewer
 >   resident experts). Fetch is 96–98% hidden; the engine is MoE-compute-bound.
-> - **Speculative decode:** 0.93–0.95×, a loss. See "Speculative decode (`--mtp`)" below.
+> - **Speculative decode:** **1.108× gated** (`--mtp-min-conf 0.8`, the default); 0.93–0.95×
+>   ungated. See "The MTP confidence gate" at the bottom — it supersedes the earlier
+>   "Speculative decode (`--mtp`)" section, which measured only the ungated form.
 > - **`distinct` / `longest repeated block` do not measure quality** — see the note under
 >   "Results" below before using either to judge a run.
 > - Every run: sole-tenant GPU, no `cargo build` between arms of a pair.
@@ -1738,3 +1740,97 @@ stride is a function of the group size. The file is **5,153,882,112 B = 257 × 2
 which only group 128 produces — group 64 would be 21,233,664 and per-row 18,915,328 per
 expert. `format.rs::I4Source` already said the stamp "is a diagnosis, not a load-time
 guard"; the `None` arm had made it one. A stamp that POSITIVELY disagrees still bails.
+
+---
+
+## The MTP confidence gate — 1.108×, 2026-07-31
+
+Supersedes "Speculative decode (`--mtp`)" above as the verdict on the feature: that section
+measured only the **ungated** form, which is still a loss. Shared-GPU caveat: these ran
+under `flock /tmp/rivoli-gpu.lock` with another tenant present, so pin-build times varied
+33 s → 164 s and absolute tok/s is noisier than the sole-tenant runs above. **Rank on
+tokens/pass and on the within-batch pairing, not on tok/s across sections** — tokens/pass
+is pure loop arithmetic and is contention-immune.
+
+512 tokens, `--mode int3-vq --attn dense --cache-policy 2q --max-mem 115`, memory-systems
+prompt (the coherent one; the seasons prompt trips the degeneration warning and is a
+different regime — see below).
+
+| arm | tok/s | tokens/pass | speculated | acceptance |
+|---|---:|---:|---:|---:|
+| `--no-mtp` (sequential) | 2.68 | 1.000 | — | — |
+| `--mtp-min-conf 0` (ungated) | 2.66 | 1.657 | 100% | 65.7% |
+| **`--mtp-min-conf 0.8` (default)** | **2.97** | 1.459 | **50%** | 66.4% |
+
+**1.108× over sequential**, and the three arms are **byte-identical** (1965 B of generated
+text, `cmp` clean across all three). Gating LOWERS tokens/pass while RAISING throughput —
+half the passes are cheap single-row ones — so tokens/pass stops being the figure of merit
+once the gate is on.
+
+### Why a fixed threshold is safe: the calibration does not move
+
+`RIVOLI_MTP_PROBE=1` buckets acceptance by the draft's own top-1 probability and, separately,
+by the MAIN MODEL's confidence in the token the draft was tested against.
+
+| | seasons (int3-vq) | memory (int3-vq) | seasons (int4) |
+|---|---:|---:|---:|
+| n | 350 | 309 | 342 |
+| acceptance | 46.0% | **65.7%** | 49.4% |
+| accept @ draft conf ≥0.8 | **91%** | **91%** | **91%** |
+| accept @ draft conf 0.6–0.8 | 57% | 57% | 66% |
+| accept @ target conf ≥0.8 | 49% | 76% | 54% |
+| share of drafts ≥0.8 | 25% | 52% | 23% |
+
+The ≥0.8 bin lands at 91% across two prompts and two quantizations. What moves is the
+**mass**, not the curve — so the threshold does not need per-prompt tuning, which was the
+main hazard the gate was expected to carry. Against a ~1.53× verify pass the break-even is
+~53%, so 0.8 clears it with margin and 0.6 (57%) would not.
+
+### Two things this refuted
+
+**`d`, the draft pass, is 16–19 ms ≈ 0.045 of a sequential pass** — it had been *inferred*
+at 0.01 from closing the cost model. Measured, it is 4× that, but still small enough that a
+gate placed BEFORE the draft would buy ~2% and would also go blind: the post-draft gate
+scores its skipped drafts for free against the plain pass's own `t1`, so bins it stops
+speculating on keep filling. Post-draft gating has no explore/exploit problem; pre-draft
+gating would.
+
+**"De-quantize the draft head" is refuted.** The hypothesis was that int3-vq damage to layer
+78 was costing acceptance (published MTP designs report 85–90%). Rebuilding the head at int4
+moved acceptance 46.0% → 49.4% (Δ = 3.4 pp, SE 3.8, CI [−4.0, +10.8]) and target-conditioned
+49% → 54% (Δ = 5 pp, CI [−3.4, +13.4]). **Both within noise.** Acceptance tracks the TEXT,
+not the head's precision: 65.7% on coherent generation versus 46–49% on the sample that
+trips the degeneration warning, where the model itself is near-random (6.8% of teacher-forced
+tokens sit above NLL 5) and greedy cannot escape a bad argmax. Caveat: `--mode int4` changes
+the main model as well as the head, so this is not a head-only comparison — it is the one
+that was available, and it shows no movement.
+
+int4 is not the throughput play regardless: 1.80 tok/s at 66.4% expert hit, against
+int3-vq's 2.68 at 72.2%.
+
+### Hybrid is not output-neutral under cache changes — 2026-07-31
+
+Found while checking the batched int4 kernel: hybrid sequential and hybrid speculative
+produce different text. The kernel is NOT the cause. Controls, all `--mode hybrid --attn
+dense --cache-policy 2q --bench 512`, seasons prompt:
+
+| run | flags | bytes | expert hit | vs previous |
+|---|---|---:|---:|---|
+| A | `--no-mtp --max-mem 115` | 2100 | 70.9% | — |
+| B | `--no-mtp --max-mem 115` (repeat) | 2100 | 70.9% | **byte-identical to A** |
+| C | `--no-mtp --max-mem 70` | 2167 | 53.4% | **differs from B at line 2** |
+
+So hybrid is deterministic run-to-run and **not** stable across cache configurations, with
+no speculation involved in any of the three. `int3-vq` and `int4` are byte-identical under
+speculation (1965 B and 2003 B, sequential vs gated vs ungated) — they are single-format.
+
+Mechanism: `Pin::submit_layer` fills `fmt` from the HOT/COLD slab placement and `gpu.rs`
+branches on it to choose `moe_expert_range_i4` vs the VQ launcher, so in hybrid **residency
+selects the arithmetic**. INV-1 ("routing never consults the cache") holds and its test
+passes; it was being read as the stronger claim that cache changes are output-neutral, which
+is true only for the single-format modes.
+
+Consequence for measurement: **do not A/B quality across `--max-mem` or `--cache-policy` in
+hybrid** — the arms are different numerics, not the same model under different pressure.
+Open defect; fixing it means binding format to expert identity rather than residency, which
+changes what `hybrid` is.

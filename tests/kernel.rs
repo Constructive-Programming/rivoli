@@ -1550,4 +1550,110 @@ fn batched_rows_are_bit_identical_to_single_rows() {
         assert_eq!(gv[..h * vh], val1[0][..], "mla_value row 0 must be bit-identical");
         assert_eq!(gv[h * vh..], val1[1][..], "mla_value row 1 must be bit-identical");
     }
+
+    // --- the int4 MoE pair (moe_gateup_i4 / moe_down_i4) ---
+    //
+    // Compares the FIXED-POINT accumulator as u64, not the drained f32: integer equality is
+    // the strictest form of "bit-identical" available and it is the quantity the atomics
+    // actually produce.
+    //
+    // The weight matrix is deliberately ragged — row 1 carries 0.0 on expert 1 — so this
+    // covers the union's correctness argument as well as the batching: a row that did not
+    // route to a union expert must come out exactly as if that expert were never launched.
+    // That is the property the whole speculative claim rests on, and `0 * dv` with a
+    // non-finite `dv` would otherwise clamp to a FINITE extreme rather than vanish.
+    {
+        use rivoli::hip::launch_moe_expert_range_i4;
+        use rivoli::quant::{I4_GROUP, quant_i4};
+        let (hidden, inter, ne) = (2 * I4_GROUP, I4_GROUP, 2usize);
+        let dims = [(inter, hidden), (inter, hidden), (hidden, inter)]; // gate, up, down
+        let mut bufs: Vec<DeviceBuf> = Vec::new();
+        let mut descs: Vec<ExpertDesc> = Vec::new();
+        for _ in 0..ne {
+            let mut p: Vec<*const u8> = Vec::new();
+            for &(o_dim, i_dim) in &dims {
+                // Group-varying magnitudes, as in `moe_i4_matches_reference`: equal group
+                // scales would let a kernel reading the wrong group still pass.
+                let wv: Vec<f32> = (0..o_dim * i_dim)
+                    .map(|n| r.f() * 4f32.powi(((n % i_dim) / I4_GROUP) as i32))
+                    .collect();
+                let (packed, scale) = quant_i4(&wv, o_dim, i_dim);
+                bufs.push(dev(&packed));
+                p.push(bufs.last().expect("packed").ptr());
+                bufs.push(dev(&f32b(&scale)));
+                p.push(bufs.last().expect("scale").ptr());
+            }
+            descs.push(ExpertDesc {
+                gate_indices: p[0],
+                gate_scales: p[1] as *const u16,
+                up_indices: p[2],
+                up_scales: p[3] as *const u16,
+                down_indices: p[4],
+                down_scales: p[5] as *const u16,
+            });
+        }
+        let descb = dev(unsafe {
+            std::slice::from_raw_parts(
+                descs.as_ptr() as *const u8,
+                std::mem::size_of_val(&descs[..]),
+            )
+        });
+        let xs: [Vec<f32>; 2] = std::array::from_fn(|_| (0..hidden).map(|_| r.f()).collect());
+        // Row 0 routes to both experts; row 1 only to expert 0. Indexed `[e * R + t]`.
+        let w1: [Vec<f32>; 2] = [vec![0.75, 0.5], vec![0.25, 0.0]];
+        let stream = HipStream::new().expect("stream");
+        let mut single = Vec::new();
+        for (x, w) in xs.iter().zip(&w1) {
+            let (xb, wb) = (dev(&f32b(x)), dev(&f32b(w)));
+            let mut hb = dev(&vec![0u8; ne * inter * 4]);
+            let mut ab = dev(&vec![0u8; hidden * 8]);
+            // SAFETY: x is [hidden], w is [ne], h is [ne*inter], acc is [hidden] u64; nrow 1.
+            unsafe {
+                launch_moe_expert_range_i4(
+                    xb.ptr() as *const f32,
+                    hidden,
+                    inter,
+                    0,
+                    ne,
+                    descb.ptr() as *const ExpertDesc,
+                    wb.ptr() as *const f32,
+                    hb.ptr_mut() as *mut f32,
+                    ab.ptr_mut() as *mut u64,
+                    1,
+                    stream.raw(),
+                )
+                .expect("moe_i4 r1");
+            }
+            device_sync().expect("sync");
+            single.push(ab.copy_out().expect("out"));
+        }
+        let mut xboth = xs[0].clone();
+        xboth.extend_from_slice(&xs[1]);
+        // Row-fastest: [e0r0, e0r1, e1r0, e1r1] — expert 1's row-1 weight is the 0.0.
+        let wboth = vec![w1[0][0], w1[1][0], w1[0][1], w1[1][1]];
+        let (xb, wb) = (dev(&f32b(&xboth)), dev(&f32b(&wboth)));
+        let mut hb = dev(&vec![0u8; ne * 2 * inter * 4]);
+        let mut ab = dev(&vec![0u8; 2 * hidden * 8]);
+        // SAFETY: x holds 2 rows of hidden, w is [ne*2], h is [ne*2*inter], acc 2 rows; nrow 2.
+        unsafe {
+            launch_moe_expert_range_i4(
+                xb.ptr() as *const f32,
+                hidden,
+                inter,
+                0,
+                ne,
+                descb.ptr() as *const ExpertDesc,
+                wb.ptr() as *const f32,
+                hb.ptr_mut() as *mut f32,
+                ab.ptr_mut() as *mut u64,
+                2,
+                stream.raw(),
+            )
+            .expect("moe_i4 r2");
+        }
+        device_sync().expect("sync");
+        let got = ab.copy_out().expect("out");
+        assert_eq!(got[..hidden * 8], single[0][..], "moe_i4 row 0 must be bit-identical");
+        assert_eq!(got[hidden * 8..], single[1][..], "moe_i4 row 1 must be bit-identical");
+    }
 }

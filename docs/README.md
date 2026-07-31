@@ -17,7 +17,7 @@ a STATE block that gives the current answer in ~15 lines.
 | Which mode has the best quality | `INT4.md` §0 table. int4 5.120 > hybrid 5.189 > int3-vq 5.275 | ranking on `benchmarks.md`'s top table — it predates the `.i4` rebuild |
 | Why int4 was once unusable | `INT4.md` §10 — per-row scales; group-128 fixed it, 73.43 → 5.120 | quoting 73.43 as current; it is the pre-fix number |
 | Where the time goes, and what to optimise next | `PERF.md` §"Ranked roadmap" (bottom) | reading the 39 KB above it |
-| Whether speculative decode is worth it | `ARCHITECTURE.md` §13 + `PERF.md` roadmap #4. **No: 0.93–0.95×**, and the arithmetic says why | re-deriving it a third time |
+| Whether speculative decode is worth it | `ARCHITECTURE.md` §13. **Yes, 1.108× — but only gated** (`--mtp-min-conf 0.8`); ungated it is 0.93–0.95× | quoting the ungated number as the verdict; it was the answer until 2026-07-31 |
 | What Vulkan can and cannot run | `VULKAN.md` §"Kernel inventory" | the other 110 KB — it is a port journal |
 | Whether the NPU offload is worth it | `NPU.md` §"The finding, in five lines" | the other 55 KB |
 | How the expert cache decides residency | `../MODES.md` §"Cache policies", then `CACHE_ROUTE.md` §"Design" | `CACHE_ROUTE.md` §"RETIRED" onwards — `top-m` is gone |

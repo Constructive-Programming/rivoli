@@ -165,6 +165,18 @@ struct Args {
     #[arg(long)]
     no_mtp: bool,
 
+    /// Speculate only when the draft head's own confidence clears this. Below it the pass
+    /// runs one row and the draft is scored for free against the plain result, so the
+    /// histogram keeps filling and the gate never goes blind to the bins it skips.
+    ///
+    /// Default 0.8 from the measured calibration, which is PROMPT-INVARIANT: two unrelated
+    /// 512-token prompts both put the ≥0.8 bin at 91% and the 0.6–0.8 bin at 57%, while the
+    /// MASS moved (25% vs 52% of drafts in the top bin). Against a ~1.53x verify pass the
+    /// break-even is ~53%, so 0.8 clears it with margin and 0.6 would not. 0 disables the
+    /// gate and speculates on every draft (the pre-gate behaviour).
+    #[arg(long, default_value_t = 0.8)]
+    mtp_min_conf: f32,
+
     /// DIAGNOSTIC: hash the residual stream after every layer.
     #[cfg(feature = "trace")]
     #[arg(long)]
@@ -590,21 +602,23 @@ fn main() -> Result<()> {
         let t0 = std::time::Instant::now();
         // Speculative decode is the default, but only where it is BUILDABLE. Two
         // conditions can take it away and neither is the user's mistake: an artifact
-        // without the MTP head (`bin/fp8_to_i4` emits no L78.i4, so int4/hybrid runs load
-        // without one), and `--trace` (a verify pass routes twice per layer and submits
-        // the union, which the v2 trace format cannot spell). Say which, once, and decode.
+        // without the MTP head (an artifact converted before 2026-07-31 has no L78.i4, so
+        // int4/hybrid runs on one load without a head), and `--trace` (a verify pass routes
+        // twice per layer and submits the union, which the v2 trace format cannot spell).
+        // Say which, once, and decode.
         let mtp = !a_no_mtp && engine.has_mtp() && !engine.tracing();
         if !a_no_mtp && !mtp {
             info!(
                 "speculative decode OFF: {}",
                 match engine.has_mtp() {
-                    false => "this artifact carries no MTP head (bin/fp8_to_i4 emits no \
-                              L78.i4, so int4/hybrid artifacts have none)",
+                    false => "this artifact carries no MTP head (re-run bin/fp8_to_i4 to \
+                              emit L78.i4 for int4/hybrid)",
                     true => "--trace routes once per layer and a verify pass routes twice",
                 }
             );
         }
-        let (ids, summary) = engine.generate(&prompt_ids, ngen, &tok.eos, mtp)?;
+        let (ids, summary) =
+            engine.generate(&prompt_ids, ngen, &tok.eos, mtp, a.mtp_min_conf)?;
         let dt = t0.elapsed().as_secs_f64();
         let (hits, misses) = (engine.hits(), engine.misses());
         info!(

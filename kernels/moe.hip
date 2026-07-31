@@ -262,7 +262,12 @@ __device__ __forceinline__ size_t i4_ng(int i_dim) {
     return (size_t)((i_dim + I4_GROUP - 1) / I4_GROUP);
 }
 
-extern "C" __global__ void moe_gateup_i4(
+// The int4 twins of the VQ pair above, and the same contract, axis for axis: `h` is
+// `[(e·R + t)·inter + j]`, `wexpert` is `[e·R + t]`, `acc` is `[t·hidden + o]`. That the
+// two formats agree on the layout is load-bearing rather than tidy — a HYBRID layer mixes
+// int4 and VQ experts within one batch and they accumulate into the same `h` and `acc`.
+template <int R>
+__device__ __forceinline__ void moe_gateup_i4_impl(
     const float* __restrict__ x, int hidden, int inter, int e_start, int e_count,
     const ExpertDescI4* __restrict__ descs, float* __restrict__ h_out) {
     int lane = threadIdx.x & (WAVE - 1);
@@ -272,12 +277,20 @@ extern "C" __global__ void moe_gateup_i4(
     int j = (int)(r % inter);
     const ExpertDescI4 d = descs[e];
     size_t rb_h = (size_t)((hidden + 1) / 2), ng_h = i4_ng(hidden);
-    float g = dot_i4_wave(x, d.gate_packed + (size_t)j * rb_h, d.gate_scale + (size_t)j * ng_h, hidden, lane);
-    float u = dot_i4_wave(x, d.up_packed + (size_t)j * rb_h, d.up_scale + (size_t)j * ng_h, hidden, lane);
-    if (lane == 0) h_out[(size_t)e * inter + j] = siluf(g) * u;
+    float g[R], u[R];
+    dot_i4_wave_r<R>(x, hidden, d.gate_packed + (size_t)j * rb_h,
+                     d.gate_scale + (size_t)j * ng_h, hidden, lane, g);
+    dot_i4_wave_r<R>(x, hidden, d.up_packed + (size_t)j * rb_h,
+                     d.up_scale + (size_t)j * ng_h, hidden, lane, u);
+    if (lane == 0) {
+#pragma unroll
+        for (int t = 0; t < R; ++t)
+            h_out[((size_t)e * R + t) * inter + j] = siluf(g[t]) * u[t];
+    }
 }
 
-extern "C" __global__ void moe_down_i4(
+template <int R>
+__device__ __forceinline__ void moe_down_i4_impl(
     int hidden, int inter, int e_start, int e_count, const ExpertDescI4* __restrict__ descs,
     const float* __restrict__ wexpert, const float* __restrict__ h_in,
     unsigned long long* __restrict__ acc) {
@@ -288,33 +301,80 @@ extern "C" __global__ void moe_down_i4(
     int o = (int)(r % hidden);
     const ExpertDescI4 d = descs[e];
     size_t rb_i = (size_t)((inter + 1) / 2), ng_i = i4_ng(inter);
-    const float* he = h_in + (size_t)e * inter;
-    float dv = dot_i4_wave(he, d.down_packed + (size_t)o * rb_i, d.down_scale + (size_t)o * ng_i, inter, lane);
-    if (lane == 0) atomicAdd(&acc[o], moe_fixed(wexpert[e] * dv));
+    const float* he = h_in + (size_t)e * R * inter;
+    float dv[R];
+    dot_i4_wave_r<R>(he, inter, d.down_packed + (size_t)o * rb_i,
+                     d.down_scale + (size_t)o * ng_i, inter, lane, dv);
+    if (lane == 0) {
+#pragma unroll
+        for (int t = 0; t < R; ++t) {
+            // Skip rows that did not route here — the same correctness argument as the VQ
+            // twin, not thrift: `0 * dv` with a non-finite `dv` is NaN, and moe_fixed's
+            // clamp turns NaN into a FINITE extreme. Adding zero to an integer accumulator
+            // is a no-op, so skipping is also bit-identical.
+            float w = wexpert[(size_t)e * R + t];
+            if (w != 0.0f) atomicAdd(&acc[(size_t)t * hidden + o], moe_fixed(w * dv[t]));
+        }
+    }
+}
+
+extern "C" __global__ void moe_gateup_i4(
+    const float* __restrict__ x, int hidden, int inter, int e_start, int e_count,
+    const ExpertDescI4* __restrict__ descs, float* __restrict__ h_out) {
+    moe_gateup_i4_impl<1>(x, hidden, inter, e_start, e_count, descs, h_out);
+}
+
+extern "C" __global__ void moe_gateup_i4_r2(
+    const float* __restrict__ x, int hidden, int inter, int e_start, int e_count,
+    const ExpertDescI4* __restrict__ descs, float* __restrict__ h_out) {
+    moe_gateup_i4_impl<2>(x, hidden, inter, e_start, e_count, descs, h_out);
+}
+
+extern "C" __global__ void moe_down_i4(
+    int hidden, int inter, int e_start, int e_count, const ExpertDescI4* __restrict__ descs,
+    const float* __restrict__ wexpert, const float* __restrict__ h_in,
+    unsigned long long* __restrict__ acc) {
+    moe_down_i4_impl<1>(hidden, inter, e_start, e_count, descs, wexpert, h_in, acc);
+}
+
+extern "C" __global__ void moe_down_i4_r2(
+    int hidden, int inter, int e_start, int e_count, const ExpertDescI4* __restrict__ descs,
+    const float* __restrict__ wexpert, const float* __restrict__ h_in,
+    unsigned long long* __restrict__ acc) {
+    moe_down_i4_impl<2>(hidden, inter, e_start, e_count, descs, wexpert, h_in, acc);
 }
 
 extern "C" int rivoli_moe_expert_range_i4(
     const float* x, int hidden, int inter, int e_start, int e_count, const void* descs,
     const float* wexpert, float* h, unsigned long long* acc, int nrow, void* stream) {
     if (hidden <= 0 || inter <= 0 || e_count <= 0 || e_start < 0) return 1001;
-    // The int4 experts are NOT row-batched. Refusing loudly matters more here than in the
-    // VQ twin: a hybrid layer mixes formats within one batch, so an int4 expert silently
-    // computing only row 0 would leave row 1 short a few experts and still decode — text
-    // that is subtly wrong rather than obviously broken. Unreachable today (`Pin::build`
-    // only carries the MTP head when every format has an L78 slab, and `bin/fp8_to_i4`
-    // emits none), which is exactly when a guard is cheap.
-    if (nrow != 1) return 1004;
+    // Only the widths instantiated above — same reasoning as the VQ launcher. This used to
+    // refuse every nrow > 1 (code 1004) because no batched int4 kernel existed, and that
+    // guard EARNED ITS KEEP on 2026-07-31: emitting L78.i4 made the path reachable for the
+    // first time and it failed loudly at token 1 instead of silently computing row 1 short
+    // a few experts in a hybrid layer.
+    if (nrow != 1 && nrow != 2) return 1003;
     const ExpertDescI4* d = (const ExpertDescI4*)descs;
     hipStream_t s = (hipStream_t)stream;
     hipGetLastError();
-    size_t rows_a = (size_t)e_count * inter;
-    hipLaunchKernelGGL(moe_gateup_i4, dim3((rows_a + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
-                       dim3(256), 0, s, x, hidden, inter, e_start, e_count, d, h);
+    dim3 grid_a(((size_t)e_count * inter + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+    if (nrow == 1) {
+        hipLaunchKernelGGL(moe_gateup_i4, grid_a, dim3(256), 0, s, x, hidden, inter, e_start,
+                           e_count, d, h);
+    } else {
+        hipLaunchKernelGGL(moe_gateup_i4_r2, grid_a, dim3(256), 0, s, x, hidden, inter, e_start,
+                           e_count, d, h);
+    }
     hipError_t e = hipGetLastError();
     if (e != hipSuccess) return -(int)e;
-    size_t rows_b = (size_t)e_count * hidden;
-    hipLaunchKernelGGL(moe_down_i4, dim3((rows_b + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
-                       dim3(256), 0, s, hidden, inter, e_start, e_count, d, wexpert, h, acc);
+    dim3 grid_b(((size_t)e_count * hidden + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+    if (nrow == 1) {
+        hipLaunchKernelGGL(moe_down_i4, grid_b, dim3(256), 0, s, hidden, inter, e_start,
+                           e_count, d, wexpert, h, acc);
+    } else {
+        hipLaunchKernelGGL(moe_down_i4_r2, grid_b, dim3(256), 0, s, hidden, inter, e_start,
+                           e_count, d, wexpert, h, acc);
+    }
     e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

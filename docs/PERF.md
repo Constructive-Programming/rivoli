@@ -3,9 +3,10 @@
 > **NAV — 39 KB. The live part is the "Ranked roadmap" table at the BOTTOM.**
 > Everything above it is the evidence for one row. Jump there first
 > (`grep -n "Ranked roadmap" docs/PERF.md`), then read only the section a row cites.
-> **Closed as negative — do not re-open without reading why:** batched-GEMV/MTP
-> speculative decode (#4, re-derived 2026-07-31 at 0.93–0.95×), o_proj split-K (#6b,
+> **Closed as negative — do not re-open without reading why:** o_proj split-K (#6b,
 > refuted and reverted), `--hot-pct` (#1b, flag deleted).
+> **#4 speculative decode was on that list and came OFF it on 2026-07-31**: ungated it
+> measures 0.93–0.95×, but `--mtp-min-conf 0.8` measures **1.108×**.
 
 Status: **analysis + roadmap.** Leads with the **structural paths** (the higher-level
 goals that move throughput by a multiplier or restructure a whole phase); the per-kernel
@@ -545,7 +546,7 @@ Grounded in the measured kernel profile.
 | 1b | ~~`--hot-pct` re-tune~~ | B | — | — | **struck — flag deleted, unrunnable** |
 | 2 | VQ_K=2048 L1-resident codebook | B / follow-up #1 | med (lifts gather wall) + smaller experts | med (requant) | new |
 | 3 | Batched-GEMV kernels | A | med now, unlocks MTP | med–high | **done, on `main`** — 6 kernels take `nrow`, bit-identical per row |
-| 4 | MTP / speculative decode | A | ≥1.5× on paper, **0.93–0.95× measured** | high | **RE-DERIVED 2026-07-31 and closed again — the cause is now known** |
+| 4 | MTP / speculative decode | A | **1.108× measured** with `--mtp-min-conf 0.8` (0.93–0.95× ungated) | high | **DONE and WON 2026-07-31** — gate on draft confidence; see the note below |
 
 > **Item 4 was re-derived as this table asked, and reached the same verdict by a route that
 > explains it.** Shipped end to end (`docs/ARCHITECTURE.md` §13): 2.50 vs 2.69 tok/s at 128
@@ -561,6 +562,18 @@ Grounded in the measured kernel profile.
 > because ~92% of an expert launch is the weight read. **Do not re-open without a draft head
 > that clears 53%.** GLM-5.2 ships one MTP layer and depth-2 chains accept at 4.4%, so that
 > head is not available in this checkpoint.
+>
+> **RE-OPENED AND WON, 2026-07-31 (same day). The "ONLY lever is acceptance" sentence above
+> is the error.** The other lever is not spending the verify pass on drafts that will not
+> pay for it. `--mtp-min-conf 0.8` gates on the draft head's own top-1 probability and
+> measures **2.97 tok/s against 2.68 sequential = 1.108×**, byte-identical output, on the
+> coherent (memory-systems) prompt. Two things made it work, neither of which this section
+> had: the accept-vs-confidence calibration is **prompt-invariant** (the ≥0.8 bin lands at
+> 91% across two prompts and two quantizations, while its share of drafts moves 25% → 52%),
+> and acceptance tracks the **text** rather than the head — 65.7% on coherent generation
+> versus 46.0% on the sample that trips the degeneration warning. Rebuilding the head at
+> int4 moved acceptance by 3.4 pp ± 7.4, i.e. not at all, so "de-quantize the head" is
+> refuted. Full table in `docs/ARCHITECTURE.md` §13.
 | 5 | `mla_latent_attend` occupancy | follow-up #3 | ~5–7 ms now, huge at long ctx | med | **partial** — `acc`→regs done (−12%); HB sweep not run |
 | 6a | lm_head load width | follow-up #5 | kernel **1.78×**; `tail` **−3.2 ms** in-engine; wall **~+1%, not noticeable** | low | **done** |
 | 6b | o_proj split-K / x-tiling | follow-up #2 | — | — | **refuted and reverted** |

@@ -88,15 +88,24 @@ fn main() -> Result<()> {
     // on the first expert rather than producing plausible-looking garbage.
     let block = FormatMeta::load(&art)?.fp8_block;
 
+    let src = Safetensors::open_dir(&fp8_dir).context("open fp8 checkpoint")?;
+
+    // The MTP head is checkpoint layer `n_layers` — a full MoE layer, so it converts
+    // through this exact loop with no special case. It was excluded only because the
+    // bound below read `<= cfg.n_layers`, and that one comparison is why `--mode int4`
+    // and the default `--mode hybrid` carried no head and silently decoded sequentially
+    // ("speculative decode OFF: this artifact carries no MTP head"). `convert` detects it
+    // the same way.
+    let mtp = src.has(&format!("model.layers.{}.eh_proj.weight", cfg.n_layers));
+    let last = cfg.n_layers + usize::from(mtp);
     let (from, to) = (
         arg_from.unwrap_or(cfg.dense_layers),
-        arg_to.unwrap_or(cfg.n_layers),
+        arg_to.unwrap_or(last),
     );
     ensure!(
-        cfg.dense_layers <= from && from < to && to <= cfg.n_layers,
-        "layer range {from}..{to} outside the MoE range {}..{}",
+        cfg.dense_layers <= from && from < to && to <= last,
+        "layer range {from}..{to} outside the MoE range {}..{last}",
         cfg.dense_layers,
-        cfg.n_layers
     );
 
     let (stride, ebytes) = (i4_expert_stride(h, m), i4_expert_bytes(h, m));
@@ -105,7 +114,6 @@ fn main() -> Result<()> {
     let layer_bytes = (n * stride) as u64;
     let threads = std::thread::available_parallelism().map_or(8, |t| t.get());
     let per = n.div_ceil(threads);
-    let src = Safetensors::open_dir(&fp8_dir).context("open fp8 checkpoint")?;
     eprintln!(
         "fp8_to_i4: layers {from}..{to}, {n} blocks/layer, {:.2} GiB/layer, {} workers",
         layer_bytes as f64 / (1u64 << 30) as f64,
@@ -188,6 +196,26 @@ fn main() -> Result<()> {
         group: Some(I4_GROUP),
     }
     .stamp(&art)?;
+    // The merge above only fires against a PRIOR stamp, and a stamp is one JSON field that
+    // can go missing (this artifact's did — docs/INT4.md §Reproduction). Converting a
+    // subrange into an unstamped set then writes a claim NARROWER than the `.i4` on disk,
+    // which reads as "only these layers are fp8-derived" and is worse than no claim at all.
+    // Cost 2026-07-31: a --from 78 run stamped [78,79] over a full set and
+    // `moe_i4_real_data_vs_fp8_ground_truth` — which had been skipping on the absent stamp
+    // — started failing on layer 3. Say so; do not guess the range on the user's behalf.
+    let on_disk: Vec<usize> = (cfg.dense_layers..=cfg.n_layers)
+        .filter(|l| std::fs::metadata(format!("{art}/L{l:02}.i4")).is_ok())
+        .collect();
+    if let (Some(&lo), Some(&hi)) = (on_disk.first(), on_disk.last())
+        && (lo < from || hi >= to)
+    {
+        eprintln!(
+            "fp8_to_i4: WARNING — stamped [{from},{to}) but L{lo:02}.i4..L{hi:02}.i4 are on \
+             disk. The stamp now UNDERSTATES the set. If those layers came from this same \
+             fp8 source at group {I4_GROUP}, widen `i4_source.layers` to [{lo},{}].",
+            hi + 1
+        );
+    }
     eprintln!(
         "fp8_to_i4: done — layers {from}..{to} rebuilt from fp8 at group {I4_GROUP}, manifest i4_source stamped"
     );

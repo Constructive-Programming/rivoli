@@ -412,7 +412,29 @@ different populations. Numbering converts "the doc drifted" into something a che
 
 | ID | invariant | test |
 |---|---|---|
-| **INV-1** | Routing is a pure function of (gate logits, bias, top_k) — it never consults the cache, so any cache change is output-bit-identical by construction | `math.rs::inv_1_routing_never_consults_the_cache` |
+| **INV-1** | Routing is a pure function of (gate logits, bias, top_k) — it never consults the cache | `math.rs::inv_1_routing_never_consults_the_cache` |
+
+> **INV-1 does NOT mean "cache changes are output-neutral", and in `--mode hybrid` they are
+> not. Measured 2026-07-31.** Two `--no-mtp` hybrid runs differing ONLY in `--max-mem`
+> (115 vs 70) produce **different text** — 2100 vs 2167 bytes, diverging at line 2, expert
+> hit 70.9% vs 53.4%. The same run repeated at fixed settings is byte-identical, so this is
+> placement, not a race.
+>
+> The mechanism is not routing. Routing is clean, exactly as INV-1 and its test say. But in
+> hybrid the cache also decides an expert's **numeric format**: `Pin::submit_layer` fills
+> `fmt` from the HOT/COLD slab placement (`HybridTwoQ`: A1in→COLD/vq3, Am→HOT/int4), and
+> `gpu.rs` branches on `fmt[i]` to pick `moe_expert_range_i4` or the VQ launcher. So
+> residency selects the arithmetic, and anything that perturbs the access sequence —
+> `--max-mem`, `--cache-policy`, or speculative decode's union fetches — moves which
+> experts run int4. `int3-vq` and `int4` are single-format and ARE output-neutral; both were
+> re-verified byte-identical under speculation the same day.
+>
+> **This is a real defect, not a documentation nit** — `CLAUDE.md` states the neutrality as
+> a correctness rule and says a violation "is a bug". It predates the speculative work and
+> is unrelated to it. Left open deliberately: making hybrid stable means binding format to
+> expert identity rather than to residency, which changes what `hybrid` *is* (its whole
+> premise is "hot experts get the better format"), so it is a design call rather than a
+> patch. No INV-n is claimed here because no invariant currently holds.
 | **INV-2** | A LOOKA hint never promotes, admits, or leaves residue in policy state; it may only delay an eviction | `hybrid.rs::inv_2_hints_leave_no_residue_in_policy_state` |
 | **INV-3** | A hint can never fail an allocation — vetoes are advisory and are dropped rather than starve eviction | `hybrid.rs::inv_3_hints_can_never_starve_eviction` |
 | **INV-4** | A device-side wait may be enqueued BEFORE its producer exists and still waits (the property `hipStreamWaitEvent` lacks) — one half per backend, since they reach it by different mechanisms | `gpustream.rs::inv_4_wait_enqueued_before_signal_still_waits`, `tests/vk.rs::inv_4_…` |
@@ -618,15 +640,27 @@ establishes is the thing it was run for: the upper bound +0.00217 nats sits well
 ## 13. Speculative decode — the MTP head and the two-row forward — SHIPPED 2026-07-31
 
 **On by default** wherever it is buildable; `--no-mtp` opts out. It changes throughput and
-**never** output.
+**never** output — verified byte-identical on `int3-vq` (1965 B) and `int4` (2003 B),
+sequential vs gated vs ungated.
 
-> **Caveat that undercuts "by default": the default `--mode hybrid` cannot run it.** The
-> head rides the routed pool, so it needs its expert slab in every format the run opens —
-> and `bin/fp8_to_i4` emits no `L78.i4`. Only `--mode int3-vq` carries a head today;
-> `int4` and `hybrid` log "speculative decode OFF: this artifact carries no MTP head" and
-> decode sequentially. So a bare `rivoli <artifact>` does not speculate. Closing that means
-> teaching `fp8_to_i4` to emit layer 78; nothing else is in the way, and at the currently
-> measured 0.93-0.95x there is no hurry.
+> **Except in `--mode hybrid`, and not for a reason that belongs to this section.** Hybrid
+> output is not stable under ANY cache perturbation, speculation included, because its cache
+> picks each expert's numeric format — see the note under INV-1 in §8b. `--max-mem` alone
+> reproduces it with `--no-mtp`.
+
+> **RESOLVED 2026-07-31 — every mode carries the head now.** This block used to read that
+> the default `--mode hybrid` could not speculate because `bin/fp8_to_i4` emitted no
+> `L78.i4`, and that "nothing else is in the way". **The second half was wrong.** Widening
+> the tool's range bound (it read `to <= cfg.n_layers`, so the loop ran 3..78 and stopped
+> one short) took five lines and produced the slab — and the very next run failed at token
+> 1 with `moe_expert_range_i4: argument guard rejected (1004)`, because there was no
+> **batched int4 MoE kernel**. The guard was doing exactly its job: a hybrid layer mixes
+> formats within one batch, so a silently single-row int4 expert would have left row 1
+> short a few experts and still decoded. `moe_gateup_i4`/`moe_down_i4` are now templated on
+> `R` like their VQ twins, with the same layout (`h[(e·R+t)·inter+j]`, `wexpert[e·R+t]`,
+> `acc[t·hidden+o]`) — which is what lets the two formats share `h` and `acc` inside one
+> hybrid layer. An artifact converted before 2026-07-31 still has no `L78.i4`; re-run
+> `bin/fp8_to_i4` to emit it.
 
 ### The head
 
@@ -702,15 +736,55 @@ Blended: a verify pass costs **1.53×** a sequential one, so it needs **1.53 tok
 coin flip landing slightly wrong, not a structural impossibility — and the only lever is
 acceptance, since skipping zero-weight rows inside the kernel would recover ~8%.
 
+### The confidence gate — SHIPPED 2026-07-31, and it is a WIN
+
+`--mtp-min-conf` (default **0.8**, `0` disables). Below the threshold the pass runs one row
+and takes one token; above it, the verify pass. **2.97 tok/s against 2.68 sequential =
+1.108×**, output byte-identical to both the sequential and the ungated run.
+
+The paragraph above says "the only lever is acceptance". That was wrong by omission: the
+other lever is **not spending the verify pass on drafts that will not pay for it**. Three
+measurements made the gate designable, all from `RIVOLI_MTP_PROBE=1`:
+
+| | seasons (degenerate) | memory (coherent) | int4/seasons |
+|---|---:|---:|---:|
+| acceptance | 46.0% (n=350) | **65.7%** (n=309) | 49.4% (n=342) |
+| accept @ draft conf ≥0.8 | 91% | **91%** | **91%** |
+| accept @ draft conf 0.6–0.8 | 57% | 57% | 66% |
+| accept @ target conf ≥0.8 | 49% | 76% | 54% |
+| share of drafts in the ≥0.8 bin | 25% | 52% | 23% |
+
+1. **The calibration is prompt-invariant.** The ≥0.8 bin lands at 91% across three runs
+   spanning two prompts and two quantizations. What moves between prompts is the *mass*,
+   not the curve — so a fixed threshold is safe and does not need per-prompt tuning. That
+   was the hazard the gate was expected to have, and it is not there.
+2. **`d`, the draft pass, costs 16–19 ms = ~0.045 of a sequential pass** (it was *inferred*
+   at 0.01 when this section was written — measured, it is 4× that). Still small enough
+   that a gate placed BEFORE the draft is not worth building, and such a gate would also go
+   blind: the post-draft gate scores its skipped drafts for free against the plain pass's
+   own `t1`, so the histogram keeps filling for bins it no longer speculates on.
+3. **Acceptance tracks the TEXT, not the head's precision.** The 46% sample is the
+   generation that trips the degeneration warning; the coherent prompt gives 65.7%, already
+   above break-even. Rebuilding the head at int4 moved acceptance 46.0% → 49.4% and
+   target-conditioned 49% → 54% — both **within noise** (Δ = 3.4 pp ± 7.4). So "de-quantize
+   the draft head" is REFUTED as a lever; the residual gap is model quality, and greedy
+   decode cannot escape a bad argmax whatever the head does.
+
+Note that gating LOWERS tokens/pass (1.657 → 1.459) while RAISING throughput: half the
+passes are now cheap single-row ones. Once the gate is on, tokens/pass stops being the
+figure of merit.
+
 **A pre-implementation estimate of 1.27–1.33× was wrong** because it applied the union
 factor to FETCH and only the row-batching factor to COMPUTE. Each union expert needs its own
 weight read. That single term was the whole error; `benchmarks.md` has the table.
 
 ### Refused rather than half-supported
 
-`--attn streaming|dsa|misa` with `nrow > 1` (each row selects a different KV window), the
-`.i4` MoE kernel at `nrow > 1` (a hybrid layer mixes formats, so a silently single-row int4
-expert would leave row 1 short a few experts and still decode), tracing (a verify pass
-routes twice per layer and submits the union, which the v2 trace format cannot spell), and
-every batched launcher on Vulkan. `main` resolves the head-absent and `--trace` cases by
-downgrading to sequential decode and saying which, rather than failing.
+`--attn streaming|dsa|misa` with `nrow > 1` (each row selects a different KV window),
+tracing (a verify pass routes twice per layer and submits the union, which the v2 trace
+format cannot spell), and every batched launcher on Vulkan. `main` resolves the head-absent
+and `--trace` cases by downgrading to sequential decode and saying which, rather than
+failing.
+
+**The `.i4` MoE kernel was on this list until 2026-07-31** and is now batched — see the
+block at the top of this section for why the guard that refused it earned its keep.

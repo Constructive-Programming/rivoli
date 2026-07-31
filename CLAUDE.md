@@ -24,7 +24,7 @@ tell you mostly about options that were rejected.
 | | |
 |---|---|
 | quality ladder | int4 **5.120** (best, slowest) > hybrid **5.189** (best overall, the default) > int3-vq **5.275** |
-| speculative decode (`--mtp`) | shipped, on by default where buildable, **0.93–0.95× — a loss.** Only `--mode int3-vq` carries the head |
+| speculative decode | on by default, **1.108×** via `--mtp-min-conf 0.8` (ungated it is 0.93–0.95×, a loss). All modes carry the head since 2026-07-31 |
 | LOOKA hints (`--hint-k`) | built, **default 0 = OFF**, measured inert (0.9% of evictions) |
 | `top-m` routing | **RETIRED**, removed from the engine |
 | Vulkan | decodes `--mode int3-vq --attn dense`; 16 of 29 kernels; 6 more are single-row; ~1.9× slower |
@@ -52,8 +52,12 @@ A featureless build compiles to a refusal stub — that is deliberate, not break
 - **Rank on paired dNLL from `bin/ppl`, not on the PPL column.** It reports its own power;
   an interval straddling zero is *inconclusive*, not a pass. `tests/ppl-corpus.txt` is 762
   tokens and often underpowered — `tests/ppl-corpus-5000.txt` exists.
-- **Cache policy and `--max-mem` are output-neutral** by construction (INV-1): routing never
-  consults residency. If output changes when only those change, that is a bug.
+- **Cache policy and `--max-mem` are output-neutral in `int3-vq` and `int4`** (INV-1:
+  routing never consults residency). If output changes when only those change, that is a
+  bug — **and in `--mode hybrid` it does, measured 2026-07-31.** Hybrid's cache picks each
+  expert's *format* (HOT→int4, COLD→vq3), so residency selects the arithmetic; `--max-mem`
+  115 vs 70 gives different text. Open defect, predates the MTP work — `docs/ARCHITECTURE.md`
+  §8b under INV-1. Do quality A/Bs on a single-format mode, or hold cache settings fixed.
 - **`docs/ARCHITECTURE.md` §8b is a registry with a test.** A documented INV-n with no
   `inv_n_*` test, or the reverse, fails `tests/invariants.rs`. Don't add one without the
   other.

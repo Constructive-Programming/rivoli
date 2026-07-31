@@ -31,9 +31,25 @@ compared across sessions except where a control licenses it, and those controls 
 that stamp was the authoritative way to tell the two `.i4` sets apart, since one overwrote
 the other in place. Engine: this branch (`feat/fp8-i4`) for A0–A5/M1/H, `41522f6` for P.
 
-> **CORRECTION, 2026-07-31: the stamp is gone, and it was never the strongest evidence.**
-> That artifact's `manifest.json` now carries no `i4_source` at all — a stamp is one JSON
-> field and JSON fields go missing. The **slab length** does not: `ExpertSet::open` requires
+> **RE-STAMPED later the same day (2026-07-31).** The artifact carries an `i4_source` again
+> — `layers [3, 79]`, same tool/chain/src, group 128 — because `bin/fp8_to_i4 --from 78
+> --to 79` was run to add the MTP head's slab, and stamping is what that tool does. Two
+> traps came out of it, both now guarded:
+>
+> - A subrange run merges with a PRIOR stamp, but there was none, so it wrote `[78, 79]`
+>   over a full set — a claim NARROWER than the `.i4` on disk, which reads as "only layer 78
+>   is fp8-derived" and is worse than no claim. The tool now warns when the range it stamps
+>   does not cover the `L*.i4` present. The `[3, 79]` value was restored by hand on the
+>   evidence below plus this section's own record of the original `[3, 78]` run.
+> - `moe_i4_real_data_vs_fp8_ground_truth` had been **passing by skipping** the whole time
+>   the stamp was absent (no stamp → early return). Restoring it made the test actually run.
+>   A provenance-gated test reports "ok" when the provenance is missing; that is the gate
+>   working as designed and is worth knowing when reading a green suite.
+>
+> **CORRECTION, 2026-07-31: the stamp had gone missing, and it was never the strongest
+> evidence.** For a period that artifact's `manifest.json` carried no `i4_source` at all —
+> a stamp is one JSON field and JSON fields go missing. The **slab length** does not:
+> `ExpertSet::open` requires
 > `len == (n_experts + 1) * i4_expert_stride`, and the stride is a function of the group
 > size, so the file's 5,153,882,112 B = 257 × 20,054,016 identifies group 128 and nothing
 > else (group 64 would be 21,233,664 per expert, per-row 18,915,328). Length is the

@@ -244,6 +244,54 @@ static_assert(I4_GROUP % 8 == 0, "the dword fast path's 8 columns must not strad
 __device__ __forceinline__ float nib(unsigned int w, int k) {
     return (float)((int)((w >> (4 * k)) & 0xFu) - 8); // nibble k → signed weight
 }
+// R token rows against ONE read of the weight row — the nibble decode and the group scale
+// amortise over the rows, which is the whole point of batching (the weight read is ~92% of
+// an expert launch). `v_stride` is the row-minor stride of `v`.
+//
+// R=1 is BIT-IDENTICAL to `dot_i4_wave` below, and that is a constraint on how this is
+// written, not a hope: the fast path's `s * (x·n + …)` grouping and the scalar tail's
+// left-to-right `v[i] * (n−8) * scale` are both reproduced exactly. Hoisting the nibbles
+// is safe (same values, same order); hoisting `(n−8) * scale` out of the tail would NOT be
+// — it re-associates the product. See tests/kernel.rs.
+template <int R>
+__device__ __forceinline__ void dot_i4_wave_r(const float* __restrict__ v, int v_stride,
+                                              const unsigned char* __restrict__ row,
+                                              const float* __restrict__ scalerow,
+                                              int dim, int lane, float* __restrict__ out) {
+    float a0[R], a1[R];
+#pragma unroll
+    for (int t = 0; t < R; ++t) { a0[t] = 0.0f; a1[t] = 0.0f; }
+    int base = 0;
+    if ((((size_t)row) & 3u) == 0) {
+        const unsigned int* rw = (const unsigned int*)row;
+        for (; base + WAVE * 8 <= dim; base += WAVE * 8) {
+            int col = base + lane * 8;
+            unsigned int w = rw[col >> 3];              // 8 nibbles = 8 consecutive columns
+            float s = scalerow[col >> I4_GROUP_SHIFT];  // one group for all 8
+            // Decoded ONCE for every row.
+            float n0 = nib(w, 0), n1 = nib(w, 1), n2 = nib(w, 2), n3 = nib(w, 3);
+            float n4 = nib(w, 4), n5 = nib(w, 5), n6 = nib(w, 6), n7 = nib(w, 7);
+#pragma unroll
+            for (int t = 0; t < R; ++t) {
+                const float* vt = v + (size_t)t * v_stride;
+                float4 x0 = *(const float4*)(vt + col);
+                float4 x1 = *(const float4*)(vt + col + 4);
+                a0[t] += s * (x0.x * n0 + x0.y * n1 + x0.z * n2 + x0.w * n3);
+                a1[t] += s * (x1.x * n4 + x1.y * n5 + x1.z * n6 + x1.w * n7);
+            }
+        }
+    }
+    for (int i = base + lane; i < dim; i += WAVE) {
+        unsigned char b = row[i >> 1];
+        int n = (i & 1) ? (b >> 4) : (b & 0x0F);
+#pragma unroll
+        for (int t = 0; t < R; ++t)
+            a0[t] += v[(size_t)t * v_stride + i] * (float)(n - 8) * scalerow[i >> I4_GROUP_SHIFT];
+    }
+#pragma unroll
+    for (int t = 0; t < R; ++t) out[t] = wave_sum(a0[t] + a1[t]);
+}
+
 __device__ __forceinline__ float dot_i4_wave(const float* __restrict__ v,
                                              const unsigned char* __restrict__ row,
                                              const float* __restrict__ scalerow,

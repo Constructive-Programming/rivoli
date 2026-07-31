@@ -118,6 +118,14 @@ fn mtp_bin(conf: f32) -> usize {
     ((conf * MTP_BINS as f32) as usize).min(MTP_BINS - 1)
 }
 
+/// `RIVOLI_MTP_PROBE=1` — bucket acceptance by the MAIN MODEL's confidence too. Off by
+/// default because it adds a 1.2 MB D2H per verify pass, which would contaminate the very
+/// `mtp_draft` timing it ships beside.
+fn mtp_probe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RIVOLI_MTP_PROBE").is_ok_and(|v| v != "0"))
+}
+
 /// `softmax(logits)[argmax]` from a raw f32 logit vector — the draft head's confidence
 /// in its own pick, and the only free signal a speculate-or-not gate could read.
 fn top1_prob(bytes: &[u8]) -> f32 {
@@ -441,6 +449,24 @@ pub struct GpuEngine<'a> {
     /// argmax). This is the signal a "should we speculate on this token?" gate would read,
     /// and bucketing it is how we find out whether it separates before building the gate.
     mtp_bins: [(u64, u64); MTP_BINS],
+    /// The same pair, bucketed by the MAIN MODEL'S confidence in the token the draft was
+    /// tested against (`softmax(row 0 logits)[argmax]`). This is the discriminator between
+    /// the two reasons a draft misses: a weak head (misses even where the target is
+    /// decidable) and a noisy target (everyone misses where the model itself is unsure).
+    /// Only the first is worth de-quantizing layer 78 for. `RIVOLI_MTP_PROBE=1` — it costs
+    /// a second 620 KB D2H per verify pass, which the timing runs must not pay.
+    mtp_tgt_bins: [(u64, u64); MTP_BINS],
+    /// Wall spent in `mtp_draft`, and passes counted. This is `d` in the speculative cost
+    /// model — the term inferred rather than measured when §13 was written, and the one
+    /// that decides whether a pre-draft gate (skipping the draft, not just the verify)
+    /// is worth building at all.
+    mtp_draft_ns: u128,
+    mtp_draft_n: u64,
+    /// Drafts the confidence gate actually spent a verify pass on. `mtp_seen` counts every
+    /// draft including the gated-out ones, so `mtp_seen` IS the pass count (each iteration
+    /// runs exactly one) and `generated / mtp_seen` is tokens per pass — the speedup over
+    /// sequential decode, measured rather than modelled.
+    mtp_verify: u64,
     /// Host staging for the draft's logits — the confidence needs the whole vector, and
     /// a host pass costs one 620 KB D2H behind a sync `argmax` already pays.
     /// ponytail: host softmax, no kernel — it is a measurement, not a decode-path cost.
@@ -695,6 +721,10 @@ impl<'a> GpuEngine<'a> {
             mtp_seen: 0,
             mtp_hit: 0,
             mtp_bins: [(0, 0); MTP_BINS],
+            mtp_tgt_bins: [(0, 0); MTP_BINS],
+            mtp_draft_ns: 0,
+            mtp_draft_n: 0,
+            mtp_verify: 0,
             mtp_host: Vec::new(),
             sub: f(MAXROW * cfg.hidden)?,
             qr: f(MAXROW * cfg.q_lora_rank)?,
@@ -1121,12 +1151,44 @@ impl<'a> GpuEngine<'a> {
     /// Returns the LAST row's `(draft, confidence)` — the only one anyone asks for.
     async fn mtp_draft(&mut self, tokens: &[u32], pos: usize) -> Result<(u32, f32)> {
         let last = tokens.len() - 1;
+        // `d` in the cost model. Spans the whole draft including its argmax D2H, because
+        // that sync is on the critical path exactly as much as the kernels are — a
+        // pre-draft gate would skip both or neither.
+        let t0 = std::time::Instant::now();
         self.forward_inner(tokens, pos, Draft::Head).await?;
         let d = self.argmax_rows(tokens.len())?[last];
         // `argmax_rows` already synced on its D2H, so this read needs no further join.
         self.logits.copy_out_into(&mut self.mtp_host)?;
         let vocab = self.cfg.vocab * 4;
-        Ok((d, top1_prob(&self.mtp_host[last * vocab..(last + 1) * vocab])))
+        let conf = top1_prob(&self.mtp_host[last * vocab..(last + 1) * vocab]);
+        self.mtp_draft_ns += t0.elapsed().as_nanos();
+        self.mtp_draft_n += 1;
+        Ok((d, conf))
+    }
+
+    /// Score a draft against the token the model actually produced.
+    ///
+    /// Called on BOTH paths, which is the point: a gated-out step runs a plain pass that
+    /// produces the very same `t1` a verify pass would have, so it still learns whether the
+    /// draft WOULD have been accepted. The gate therefore never goes blind to the bins it
+    /// stops speculating on, and no explore/exploit tempering is needed. A gate placed
+    /// BEFORE the draft could not do this — it would never compute `d` to compare.
+    ///
+    /// Reads row 0's logits when `RIVOLI_MTP_PROBE=1`: bucketing the same accept/reject by
+    /// the MAIN MODEL's confidence separates a weak head from a target too uncertain to
+    /// predict. Must run before `mtp_draft`, which reuses `mtp_host`.
+    fn score_draft(&mut self, ok: bool, conf: f32) -> Result<()> {
+        self.mtp_seen += 1;
+        self.mtp_hit += u64::from(ok);
+        let b = &mut self.mtp_bins[mtp_bin(conf)];
+        (b.0, b.1) = (b.0 + 1, b.1 + u64::from(ok));
+        if mtp_probe() {
+            self.logits.copy_out_into(&mut self.mtp_host)?;
+            let tgt = top1_prob(&self.mtp_host[..self.cfg.vocab * 4]);
+            let b = &mut self.mtp_tgt_bins[mtp_bin(tgt)];
+            (b.0, b.1) = (b.0 + 1, b.1 + u64::from(ok));
+        }
+        Ok(())
     }
 
     /// `mtp`: run the MTP head alone instead of the model's layers — see
@@ -2284,6 +2346,8 @@ impl<'a> GpuEngine<'a> {
         ngen: usize,
         eos: &[u32],
         mtp: bool,
+        // Speculate only above this draft confidence; see `--mtp-min-conf`. 0 = never gate.
+        min_conf: f32,
     ) -> Result<(Vec<u32>, ProfileSummary)> {
         ensure!(!prompt_ids.is_empty(), "empty prompt");
         // Both preconditions are resolved by `main` (which downgrades to sequential
@@ -2387,6 +2451,22 @@ impl<'a> GpuEngine<'a> {
                         cur = self.argmax()?;
                         pos += 1;
                     }
+                    // GATED OUT. The head is not confident enough for a verify pass to pay
+                    // for itself, so run one row and take one token. The draft is already
+                    // computed and is scored anyway — a plain pass yields the same `t1` the
+                    // verify pass would have, so this costs nothing and keeps the histogram
+                    // honest. Output is unaffected either way: both paths are exact, and
+                    // the gate moves only which of them pays for the second row.
+                    Some((d, conf)) if conf < min_conf => {
+                        self.forward(cur, pos).await?;
+                        let t1 = self.argmax()?;
+                        self.score_draft(d == t1, conf)?;
+                        // Same call the reject path makes: the head's KV must stay
+                        // hole-free, and `x` row 0 holds h_pos for it to consume.
+                        draft = Some(self.mtp_draft(&[t1], pos + 1).await?);
+                        cur = t1;
+                        pos += 1;
+                    }
                     // THE VERIFY PASS. Two rows: the real token at `pos` and the draft at
                     // `pos + 1`, through one read of every weight. Row 0's logits give the
                     // TRUE token at pos+1; row 1's give the true token at pos+2 — but only
@@ -2397,10 +2477,8 @@ impl<'a> GpuEngine<'a> {
                         let rows = self.argmax_rows(2)?;
                         let (t1, t2) = (rows[0], rows[1]);
                         let ok = d == t1;
-                        self.mtp_seen += 1;
-                        self.mtp_hit += u64::from(ok);
-                        let b = &mut self.mtp_bins[mtp_bin(conf)];
-                        (b.0, b.1) = (b.0 + 1, b.1 + u64::from(ok));
+                        self.mtp_verify += 1;
+                        self.score_draft(ok, conf)?;
                         // The head's element at pos+1 — needed whether or not the draft
                         // held: on a reject it IS the next draft, and on an accept it is
                         // the KV row that pos+2's draft will attend over. Batched with
@@ -2468,34 +2546,73 @@ impl<'a> GpuEngine<'a> {
         );
         summary.report();
         if self.mtp_seen > 0 {
-            // tokens/pass is now MEASURED, not projected: every verify pass emits one
-            // token plus the draft it accepted, so `generated / passes` is the speedup
-            // over the sequential loop with everything else held equal.
+            // tokens/pass is MEASURED, not projected. Every iteration scores exactly one
+            // draft — gated out or not — so `mtp_seen` IS the pass count and
+            // `generated / mtp_seen` is the speedup over a sequential loop with everything
+            // else held equal. It is no longer `1 + accept_rate`: a gated-out pass emits
+            // one token however good its draft looked.
             tracing::info!(
-                "MTP: {}/{} drafts accepted ({:.1}%) — {:.3} tokens per verify pass",
+                "MTP: {}/{} drafts accepted ({:.1}%) — {:.3} tokens/pass over {} passes",
                 self.mtp_hit,
                 self.mtp_seen,
                 100.0 * self.mtp_hit as f64 / self.mtp_seen as f64,
-                1.0 + self.mtp_hit as f64 / self.mtp_seen as f64,
+                generated.len() as f64 / self.mtp_seen as f64,
+                self.mtp_seen,
+            );
+            // What the gate actually did. `verify` counts the 2-row passes; the rest ran
+            // one row and cost a sequential pass, so this is the `g` in the cost model.
+            tracing::info!(
+                "  MTP gate: {}/{} drafts speculated ({:.0}%) at min_conf {min_conf}",
+                self.mtp_verify,
+                self.mtp_seen,
+                100.0 * self.mtp_verify as f64 / self.mtp_seen.max(1) as f64,
             );
             // Bucketed by the draft's own confidence: does it separate well enough to gate
             // on? A flat column of accept% means it does not, and no threshold helps.
-            // (Measured monotone 14→85% across the five bins, and still not worth gating:
-            // at c ≈ 1.08 the break-even accept rate is ~8%, which the worst bin clears.)
-            let row = self
-                .mtp_bins
-                .iter()
-                .enumerate()
-                .map(|(i, &(n, ok))| {
-                    let lo = i as f64 / MTP_BINS as f64;
-                    match n {
-                        0 => format!("p{lo:.1}+: -"),
-                        _ => format!("p{lo:.1}+: {:.0}%(n={n})", 100.0 * ok as f64 / n as f64),
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
-            tracing::info!("  MTP accept by draft confidence: {row}");
+            //
+            // CORRECTED 2026-07-31: this comment used to read "still not worth gating: at
+            // c ≈ 1.08 the break-even accept rate is ~8%, which the worst bin clears."
+            // That `c` came from the pre-implementation estimate that was wrong (it applied
+            // the union factor to fetch only — see §13). The measured verify pass costs
+            // c = 1.53, so break-even is ~53% and only the top bins clear it. Gating is
+            // worth building; the histogram below is what sizes it.
+            let hist = |bins: &[(u64, u64); MTP_BINS]| {
+                bins.iter()
+                    .enumerate()
+                    .map(|(i, &(n, ok))| {
+                        let lo = i as f64 / MTP_BINS as f64;
+                        match n {
+                            0 => format!("p{lo:.1}+: -"),
+                            _ => format!("p{lo:.1}+: {:.0}%(n={n})", 100.0 * ok as f64 / n as f64),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            tracing::info!("  MTP accept by draft confidence: {}", hist(&self.mtp_bins));
+            // `d` in the cost model, as ms and as a fraction of a whole pass. A pre-draft
+            // gate can only ever save this much, so if it is ~1% it is not worth building.
+            if self.mtp_draft_n > 0 {
+                let draft_ms = self.mtp_draft_ns as f64 / 1e6;
+                let pass_ms = self.prof.wall_ns as f64 / 1e6 / self.mtp_seen.max(1) as f64;
+                tracing::info!(
+                    "  MTP draft cost: {:.1} ms/draft over {} drafts = {:.1}% of decode wall \
+                     ({:.1} ms/pass) — this is `d`",
+                    draft_ms / self.mtp_draft_n as f64,
+                    self.mtp_draft_n,
+                    100.0 * draft_ms / (self.prof.wall_ns as f64 / 1e6),
+                    pass_ms,
+                );
+            }
+            // The discriminator. If the top bin here is ~90%+, the head is fine wherever
+            // the target is decidable and the ceiling is the model's own entropy — do not
+            // de-quantize layer 78. If it sits near the overall rate, the head is weak.
+            if self.mtp_tgt_bins.iter().any(|&(n, _)| n > 0) {
+                tracing::info!(
+                    "  MTP accept by TARGET confidence: {}",
+                    hist(&self.mtp_tgt_bins)
+                );
+            }
         }
         // LOOKA sits beside the profile rather than inside it: it is a property of the
         // ROUTER (would a prefetcher guess right?), not of where this run spent its time,

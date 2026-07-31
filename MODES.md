@@ -14,21 +14,25 @@ the bottom is the whole story; the sections explain the tradeoffs behind it.
 Everything here is about the **routed** experts (256/layer, streamed on demand). The
 always-resident set (attention, dense MLPs, shared expert, codebooks) is unaffected.
 
-> **The format mode also decides whether speculative decode runs, and in the DEFAULT mode
-> it does not.** The MTP head is checkpoint layer 78 and rides the routed pool like any
-> other layer, so it needs its expert slab in **every format the run opens**. `bin/convert`
-> emits `L78.vq3`; `bin/fp8_to_i4` emits no `L78.i4`. So:
+> **The format mode decides whether speculative decode runs. Since 2026-07-31 every mode
+> can.** The MTP head is checkpoint layer 78 and rides the routed pool like any other
+> layer, so it needs its expert slab in **every format the run opens**. `bin/convert` emits
+> `L78.vq3`; `bin/fp8_to_i4` now emits `L78.i4` (its range bound used to stop one layer
+> short). So:
 >
 > | `--mode` | opens | MTP head | speculative decode |
 > |---|---|---|---|
 > | `int3-vq` | `.vq3` | present | **on** (default; `--no-mtp` opts out) |
-> | `int4` | `.i4` | absent | off — logged with the reason |
-> | `hybrid` *(default)* | both | absent | off — logged with the reason |
+> | `int4` | `.i4` | present *(needs `L78.i4`)* | **on** |
+> | `hybrid` *(default)* | both | present *(needs both)* | **on** |
 >
-> So `rivoli <artifact>` with no flags decodes sequentially, and only `--mode int3-vq`
-> exercises the two-row verify pass. That is a gap in `fp8_to_i4`, not a design choice —
-> see `docs/ARCHITECTURE.md` §13. It is also currently a 0.93–0.95× feature, so nothing is
-> being lost in the meantime.
+> **An artifact converted before 2026-07-31 has no `L78.i4`** — `int4`/`hybrid` on one log
+> "speculative decode OFF: this artifact carries no MTP head" and decode sequentially,
+> which is a missing slab rather than a missing feature. Re-run `bin/fp8_to_i4` to emit it.
+>
+> This table said "absent / off" for `int4` and `hybrid` until 2026-07-31, and called the
+> feature a 0.93–0.95× loss "so nothing is being lost in the meantime". Gated on draft
+> confidence it measures **1.108×** — see `docs/ARCHITECTURE.md` §13.
 
 ---
 
