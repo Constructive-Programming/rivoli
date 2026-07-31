@@ -1,5 +1,12 @@
 # rivoli — NPU offload plan: the DSA indexer
 
+> **NAV — 57 KB. The answer is the next section, "The finding, in five lines".**
+> Read that and stop unless you are implementing the offload. **One line:** the prize is
+> real only above `index_topk` = 2048, half to three-quarters of it was never GPU work,
+> and the part that was — a device top-k kernel — **is built and shipped** (−9.4 ms/token,
+> selection bit-identical to the host over 10,752 real layers). The NPU itself remains
+> unbuilt and the exact-overlap design was falsified on engine data.
+
 Status: **M0 and M1 MEASURED (2026-07-26). The no-NPU device top-k is now WIRED and
 MEASURED (2026-07-27): −9.4 ms/token, 2.1% of wall, selection exact.** M0 clears ≥4k. M1
 clears via the decoupled window only, and everything past it still sits behind M1a, which

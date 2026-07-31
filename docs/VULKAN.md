@@ -1,5 +1,14 @@
 # rivoli — Vulkan backend (`vulkan` feature)
 
+> **NAV — 117 KB, a port journal across four phases. Do not read whole.**
+> Current capability is one section: **"Kernel inventory — port 16 of 29"**. That gives
+> what runs, what is deferred and why, and (2026-07-31) the six PORTED-but-single-row
+> kernels that make speculative decode ROCm-only. `grep -n "^## " docs/VULKAN.md` for the
+> rest; the phase sections are how it got here, including two conclusions it later
+> falsified (Vulkan CAN overlap; timeline waits DO work).
+> **One line:** decodes `--mode int3-vq --attn dense`, three queues, 97% fetch hidden,
+> ~1.9× slower than ROCm and all of it MoE kernel throughput.
+
 Status: **RUNNABLE, AND IT IMPLEMENTS THE DESIGN. Phase 4 complete (2026-07-30):
 `--features vulkan` builds and decodes `--mode int3-vq --attn dense` over THREE QUEUES with
 the fetch↔compute overlap intact.** 16 kernels + `flag_nonfinite` + `fill_u32`, 46/46 green

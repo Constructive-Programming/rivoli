@@ -1,8 +1,21 @@
 # rivoli — CACHE_PILOT: router-piloted cross-layer expert prefetch
 
-Status: **SHIPPED 2026-07-30 — `--pilot-k`, always on, default 3.** Step 1 (LOOKA) and
-Step 2a (the speculative loader) are both built and measured; see those sections. The
-history below is kept because it records *why* this was parked twice and what changed.
+Status: **BUILT, MEASURED, AND DEFAULT-OFF.** Step 1 (LOOKA) and Step 2a (the speculative
+loader) are both built; see those sections. The history below is kept because it records
+*why* this was parked twice and what changed.
+
+> **CORRECTED 2026-07-31.** This line used to read "SHIPPED — `--pilot-k`, always on,
+> default 3", and all three claims were wrong against the code:
+> - **The flag is `--hint-k`, not `--pilot-k`.** There is no `--pilot-k`.
+> - **Its default is 0, i.e. OFF** (`gpu::DEFAULT_HINT_K`), not 3.
+> - It is off *because it was measured inert*: the vetoes bind (23/220/137 at 40/30/25 GiB,
+>   none ever dropped for cap) but touch **0.9% of evictions**, moving hit rate by at most
+>   +0.1pp while costing 3-8% throughput for the pilot's per-layer rmsnorm+gemv+D2H. At
+>   ~965 slots a key survives ~138 layers, so a 1-2 layer veto can only bind on a key
+>   already at the LRU end — and a next-layer prediction is warm, so it sits at the far end.
+>
+> The mechanism is not broken and the plumbing is kept: `--hint-k 3` re-enables it, and
+> output is bit-identical at every value. What is retired is the claim that it is on.
 
 Both parking reasons are resolved. Reason 1 (no faithful int4) lifted 2026-07-29. Reason 2
 ("no acceptance criteria of its own — accepted or removed with `top-m`") was overtaken by

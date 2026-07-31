@@ -1,5 +1,12 @@
 # rivoli — performance plan
 
+> **NAV — 39 KB. The live part is the "Ranked roadmap" table at the BOTTOM.**
+> Everything above it is the evidence for one row. Jump there first
+> (`grep -n "Ranked roadmap" docs/PERF.md`), then read only the section a row cites.
+> **Closed as negative — do not re-open without reading why:** batched-GEMV/MTP
+> speculative decode (#4, re-derived 2026-07-31 at 0.93–0.95×), o_proj split-K (#6b,
+> refuted and reverted), `--hot-pct` (#1b, flag deleted).
+
 Status: **analysis + roadmap.** Leads with the **structural paths** (the higher-level
 goals that move throughput by a multiplier or restructure a whole phase); the per-kernel
 findings are **follow-up polish** to that structural work and to the existing improvement
@@ -537,8 +544,23 @@ Grounded in the measured kernel profile.
 | 1 | `fp8_to_i4` | B | int4 PPL 73.43 → **5.12**, hybrid → **5.19** | low | **done** |
 | 1b | ~~`--hot-pct` re-tune~~ | B | — | — | **struck — flag deleted, unrunnable** |
 | 2 | VQ_K=2048 L1-resident codebook | B / follow-up #1 | med (lifts gather wall) + smaller experts | med (requant) | new |
-| 3 | Batched-GEMV kernels | A | med now, unlocks MTP | med–high | built once on `deadend/mtp` |
-| 4 | MTP / speculative decode | A | ≥1.5× on paper, **<1.0× measured** | high | **closed as negative — re-derive before re-opening** |
+| 3 | Batched-GEMV kernels | A | med now, unlocks MTP | med–high | **done, on `main`** — 6 kernels take `nrow`, bit-identical per row |
+| 4 | MTP / speculative decode | A | ≥1.5× on paper, **0.93–0.95× measured** | high | **RE-DERIVED 2026-07-31 and closed again — the cause is now known** |
+
+> **Item 4 was re-derived as this table asked, and reached the same verdict by a route that
+> explains it.** Shipped end to end (`docs/ARCHITECTURE.md` §13): 2.50 vs 2.69 tok/s at 128
+> tokens, 2.49 vs 2.63 at 512, output byte-identical. The mechanism is arithmetic, not
+> tuning: the MoE is 67% of the pass and a batched pass launches the **UNION** of both rows'
+> routing — 14.5 experts against a single row's 9, so **1.61× the weight reads** — while the
+> second row per expert is genuinely free (178 vs 176 µs on 0-miss layers). Attention
+> behaved as designed (0.83× per token). Break-even is **1.53 tokens/pass ≈ 53% acceptance**
+> and measured acceptance is 42–54%.
+>
+> So it is a coin flip landing slightly wrong, not a structural impossibility, and the ONLY
+> lever is acceptance — skipping zero-weight rows inside the kernel would recover ~8%,
+> because ~92% of an expert launch is the weight read. **Do not re-open without a draft head
+> that clears 53%.** GLM-5.2 ships one MTP layer and depth-2 chains accept at 4.4%, so that
+> head is not available in this checkpoint.
 | 5 | `mla_latent_attend` occupancy | follow-up #3 | ~5–7 ms now, huge at long ctx | med | **partial** — `acc`→regs done (−12%); HB sweep not run |
 | 6a | lm_head load width | follow-up #5 | kernel **1.78×**; `tail` **−3.2 ms** in-engine; wall **~+1%, not noticeable** | low | **done** |
 | 6b | o_proj split-K / x-tiling | follow-up #2 | — | — | **refuted and reverted** |

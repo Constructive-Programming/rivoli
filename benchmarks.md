@@ -1,5 +1,20 @@
 # Benchmarks
 
+> ## STATE — read this, then grep for your config
+>
+> **Append-only measurement log, 105 KB. Do not read whole.** `grep -n "^## " benchmarks.md`
+> for the map. Newest results are at the BOTTOM.
+>
+> - **Quality ladder (current):** int4 **5.120** > hybrid **5.189** > int3-vq **5.275**.
+>   The mode table immediately below predates the `.i4` rebuild and its int4/hybrid rows do
+>   NOT describe the current artifact.
+> - **Throughput:** ~2.6–2.8 tok/s int3-vq, ~2.7 hybrid, ~2.1 int4 (larger slot → fewer
+>   resident experts). Fetch is 96–98% hidden; the engine is MoE-compute-bound.
+> - **Speculative decode:** 0.93–0.95×, a loss. See "Speculative decode (`--mtp`)" below.
+> - **`distinct` / `longest repeated block` do not measure quality** — see the note under
+>   "Results" below before using either to judge a run.
+> - Every run: sole-tenant GPU, no `cargo build` between arms of a pair.
+
 512-token greedy decode, GLM-5.2 full artifact (`/var/db/rivoli/glm52-vq3-full`),
 AMD Strix Halo gfx1151. Matrix: `--mode {int3-vq,int4,hybrid}` × `--cache-policy
 {lru,2q,arc}`, 9 runs.

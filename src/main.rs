@@ -99,7 +99,10 @@ struct Args {
     direct_vmm_dma: bool,
 
     /// How many top-ranked LOOKA predictions per horizon (L+1 and L+2) to feed the cache
-    /// policy as eviction vetoes. ALWAYS ON; pass 0 to disable. Runs the target layer's
+    /// policy as eviction vetoes. DEFAULT 0 = OFF: the vetoes bind but touch only ~0.9% of
+    /// evictions, so they moved hit rate by at most +0.1pp while costing 3-8% throughput
+    /// for the pilot's per-layer rmsnorm+gemv+D2H. Pass `--hint-k 3` to re-enable. Runs
+    /// the target layer's
     /// router against this layer's post-attention residual; measured precision by rank is
     /// 99/96/93/87/78/67/55/42% (docs/CACHE_PILOT.md). A hint only vetoes eviction — it
     /// never changes routing — so output is bit-identical at every value.
