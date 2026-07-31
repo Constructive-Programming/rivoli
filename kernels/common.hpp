@@ -231,12 +231,33 @@ __device__ __forceinline__ float dot_i4_wave(const float* __restrict__ v,
 // so the gather is an L1 hit instead of L2 (f32 was 64KB, L2-resident). fp16 keeps
 // x in f32 for the products; its 10-bit mantissa on the centroids clears the
 // oracle tol (bf16's 8 does not — see math::f32_to_f16).
-__device__ __forceinline__ float dot_vq_wave(const float* __restrict__ x,
-                                             const unsigned char* __restrict__ idxrow,
-                                             const unsigned short* __restrict__ scalerow,
-                                             const __half* __restrict__ cb, int i_dim, int lane) {
+// R INPUT ROWS against ONE weight row. `out[r]` (lane 0) is the dot of row `r` of `x`
+// — stride `x_stride` — with the decoded weight row.
+//
+// This is where a speculative verify pass gets cheap. The weight side is the expensive
+// half by a wide margin: an expert block is 15.34 MB and this kernel touches every byte
+// of it, while a row of `x` is 24 KB. Decoding the row once and dotting it against R
+// inputs turns R tokens into ONE read of the weights, so the pass that VERIFIES a draft
+// costs barely more than the pass that would have produced a single token — which is the
+// entire economic case for MTP on a fetch-bound engine.
+//
+// R is a template parameter so `acc[]` stays in registers and the inner loop unrolls; a
+// runtime count would index an array dynamically and spill it to scratch.
+//
+// R=1 is BIT-IDENTICAL to the single-row form this replaced — the same four products in
+// the same order, the same one `bf16f` scale multiply, the same `wave_sum`. That is load
+// bearing: it means every existing oracle test and the perplexity gate still bind the
+// batched kernel's R=1 path with no re-baselining.
+template <int R>
+__device__ __forceinline__ void dot_vq_wave_r(const float* __restrict__ x, int x_stride,
+                                              const unsigned char* __restrict__ idxrow,
+                                              const unsigned short* __restrict__ scalerow,
+                                              const __half* __restrict__ cb, int i_dim, int lane,
+                                              float* __restrict__ out) {
     int nsub = i_dim / VQ_DIM;
-    float acc = 0.0f;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] = 0.0f;
     for (int t = lane; t < nsub; t += WAVE) {
         int bitpos = t * VQ_INDEX_BITS;
         int byte = bitpos >> 3;
@@ -248,9 +269,25 @@ __device__ __forceinline__ float dot_vq_wave(const float* __restrict__ x,
         const __half* c = cb + (size_t)idx * VQ_DIM;
         float2 c01 = __half22float2(*(const __half2*)c);
         float2 c23 = __half22float2(*(const __half2*)(c + 2));
-        float4 xv = *(const float4*)(x + (size_t)t * VQ_DIM);
-        float dot = xv.x * c01.x + xv.y * c01.y + xv.z * c23.x + xv.w * c23.y;
-        acc += bf16f(scalerow[t / VQ_SUBS_PER_GROUP]) * dot;
+        float s = bf16f(scalerow[t / VQ_SUBS_PER_GROUP]);
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            float4 xv = *(const float4*)(x + (size_t)r * x_stride + (size_t)t * VQ_DIM);
+            float dot = xv.x * c01.x + xv.y * c01.y + xv.z * c23.x + xv.w * c23.y;
+            acc[r] += s * dot;
+        }
     }
-    return wave_sum(acc);
+    // Uniform across the wave: R is a compile-time constant, so every lane runs every
+    // `wave_sum`. A runtime bound here would be a partial-wave reduction.
+#pragma unroll
+    for (int r = 0; r < R; ++r) out[r] = wave_sum(acc[r]);
+}
+
+__device__ __forceinline__ float dot_vq_wave(const float* __restrict__ x,
+                                             const unsigned char* __restrict__ idxrow,
+                                             const unsigned short* __restrict__ scalerow,
+                                             const __half* __restrict__ cb, int i_dim, int lane) {
+    float out;
+    dot_vq_wave_r<1>(x, 0, idxrow, scalerow, cb, i_dim, lane, &out);
+    return out;
 }

@@ -1753,7 +1753,7 @@ impl<'a> GpuEngine<'a> {
                         } else {
                             launch_moe_expert_range(
                                 x_c, hidden, inter, i, j - i, descs_ptr, cb0, cb1, cb2, w_ptr,
-                                h_c, acc_c, cs_raw,
+                                h_c, acc_c, 1, cs_raw,
                             )?;
                         }
                     }
@@ -1788,7 +1788,7 @@ impl<'a> GpuEngine<'a> {
                         } else {
                             launch_moe_expert_range(
                                 x_c, hidden, inter, e, 1, descs_ptr, cb0, cb1, cb2, w_ptr, h_c,
-                                acc_miss, ms_raw,
+                                acc_miss, 1, ms_raw,
                             )?;
                         }
                     }

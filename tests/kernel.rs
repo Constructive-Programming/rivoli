@@ -697,6 +697,7 @@ fn moe_vq_matches_reference() {
                 wb.ptr() as *const f32,
                 hbuf.ptr_mut() as *mut f32,
                 pbuf.ptr_mut() as *mut u64,
+                1,
                 stream.raw(),
             )
             .expect("launch moe_expert_range");
@@ -720,6 +721,120 @@ fn moe_vq_matches_reference() {
     assert!(
         pbuf.copy_out().expect("acc").iter().all(|&b| b == 0),
         "moe_acc_drain left the accumulator dirty"
+    );
+
+    // --- nrow=2: the batched verify pass, against the single-row path it must reproduce.
+    //
+    // BIT-identical, not `assert_close`. The batched kernel is not an approximation of two
+    // passes, it is the same arithmetic with the weight decode hoisted — same products,
+    // same order, same `wave_sum`. Anything looser would accept a real reassociation bug,
+    // and reassociation here is exactly what the fixed-point accumulator exists to make
+    // impossible to hide.
+    //
+    // Row 1 gets a DIFFERENT x and DIFFERENT weights, one of them zero. Two rows with the
+    // same input would pass even if the kernel ignored the row index entirely; the zero
+    // weight covers the "this row did not route here" skip, which is the case the union
+    // batching produces on every real layer.
+    let x2: Vec<f32> = (0..hidden).map(|_| r.f()).collect();
+    let xr: Vec<f32> = x.iter().chain(&x2).copied().collect(); // x[t·hidden + i]
+    let w2: Vec<f32> = (0..e).map(|k| if k == 1 { 0.0 } else { r.f() }).collect();
+    // wexpert[e·2 + t] — token row fastest, matching the kernel's indexing.
+    let wr: Vec<f32> = (0..e).flat_map(|k| [w[k], w2[k]]).collect();
+
+    let xrb = dev(&f32b(&xr));
+    let wrb = dev(&f32b(&wr));
+    let mut hbuf2 = dev(&vec![0u8; e * 2 * inter * 4]);
+    let mut pbuf2 = dev(&vec![0u8; 2 * hidden * 8]);
+    let mut obuf2 = dev(&vec![0u8; 2 * hidden * 4]);
+    // SAFETY: every buffer is device-resident and sized for 2 rows in the layout above.
+    unsafe {
+        for k in 0..e {
+            launch_moe_expert_range(
+                xrb.ptr() as *const f32,
+                hidden,
+                inter,
+                k,
+                1,
+                descb.ptr() as *const ExpertDesc,
+                g0.ptr() as *const u16,
+                g1.ptr() as *const u16,
+                g2.ptr() as *const u16,
+                wrb.ptr() as *const f32,
+                hbuf2.ptr_mut() as *mut f32,
+                pbuf2.ptr_mut() as *mut u64,
+                2,
+                stream.raw(),
+            )
+            .expect("launch moe_expert_range nrow=2");
+        }
+        for t in 0..2 {
+            launch_moe_acc_drain(
+                obuf2.ptr_mut().add(t * hidden * 4) as *mut f32,
+                pbuf2.ptr_mut().add(t * hidden * 8) as *mut u64,
+                hidden,
+                1,
+                1.0,
+                stream.raw(),
+            )
+            .expect("launch moe_acc_drain nrow=2");
+        }
+    }
+    device_sync().expect("sync");
+    let got2 = f32v(&obuf2.copy_out().expect("out2"));
+
+    // Row 0 reran the FIRST arm's inputs exactly, so it must reproduce its bits.
+    let row0 = f32v(&obuf.copy_out().expect("out"));
+    assert_eq!(
+        got2[..hidden],
+        row0[..],
+        "nrow=2 row 0 disagrees with the single-row kernel"
+    );
+    // Row 1 against a fresh single-row run of the same inputs.
+    let x2b = dev(&f32b(&x2));
+    let w2b = dev(&f32b(&w2));
+    let mut hbuf1 = dev(&vec![0u8; e * inter * 4]);
+    let mut pbuf1 = dev(&vec![0u8; hidden * 8]);
+    let mut obuf1 = dev(&vec![0u8; hidden * 4]);
+    // SAFETY: as above, single row.
+    unsafe {
+        for k in 0..e {
+            launch_moe_expert_range(
+                x2b.ptr() as *const f32,
+                hidden,
+                inter,
+                k,
+                1,
+                descb.ptr() as *const ExpertDesc,
+                g0.ptr() as *const u16,
+                g1.ptr() as *const u16,
+                g2.ptr() as *const u16,
+                w2b.ptr() as *const f32,
+                hbuf1.ptr_mut() as *mut f32,
+                pbuf1.ptr_mut() as *mut u64,
+                1,
+                stream.raw(),
+            )
+            .expect("launch moe_expert_range row1");
+        }
+        launch_moe_acc_drain(
+            obuf1.ptr_mut() as *mut f32,
+            pbuf1.ptr_mut() as *mut u64,
+            hidden,
+            1,
+            1.0,
+            stream.raw(),
+        )
+        .expect("launch moe_acc_drain row1");
+    }
+    device_sync().expect("sync");
+    assert_eq!(
+        got2[hidden..],
+        f32v(&obuf1.copy_out().expect("out1"))[..],
+        "nrow=2 row 1 disagrees with the single-row kernel (expert 1 carried weight 0)"
+    );
+    assert!(
+        pbuf2.copy_out().expect("acc2").iter().all(|&b| b == 0),
+        "moe_acc_drain left a batched accumulator row dirty"
     );
 }
 

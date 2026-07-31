@@ -3371,6 +3371,7 @@ fn moe_vq_matches_the_host_oracles() {
             wb.ptr() as *const f32,
             hb.ptr_mut() as *mut f32,
             ab.ptr_mut() as *mut u64,
+            1,
             std::ptr::null_mut(),
         )
         .expect("expert range");
@@ -3433,7 +3434,7 @@ fn moe_guards_reject_degenerate_arguments() {
             launch_moe_expert_range(
                 p as *const f32, hidden, inter, 0, e_count,
                 p as *const rivoli::vk::ExpertDesc, p as *const u16, p as *const u16,
-                p as *const u16, p as *const f32, q as *mut f32, q as *mut u64,
+                p as *const u16, p as *const f32, q as *mut f32, q as *mut u64, 1,
                 std::ptr::null_mut(),
             )
         };

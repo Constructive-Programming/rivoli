@@ -34,11 +34,35 @@ __device__ __forceinline__ size_t vq_ng(int i_dim) {
     return (size_t)i_dim / VQ_GROUP;
 }
 
-// Pass 1: h[e·inter + j] = silu(gate_ej·x) · (up_ej·x). One WAVE per (expert,row).
-// Processes the ABSOLUTE expert range [e_start, e_start+e_count) of `descs`, writing
-// its own `h` rows — so the streaming pipeline can launch experts (or a subrange) on
-// independent streams and they all land in the same schedule-independent `h`.
-extern "C" __global__ void moe_gateup_vq(
+// --- BATCHING OVER TOKEN ROWS (`R`) ---------------------------------------------------
+//
+// Everything below computes `R` token rows through ONE read of the expert weights. The
+// row axis is a template parameter, never a grid dimension: putting it in the grid would
+// read the weights R times and give back exactly what batching exists to save.
+//
+// Batched routing is per (row, expert): row `t` may not have selected expert `e` at all.
+// That is expressed as `wexpert[e·R + t] == 0` rather than as a mask, so the caller builds
+// the UNION of the rows' picks and fills a small dense weight matrix — no mask plumbing,
+// no per-expert row lists. The rows that did not pick an expert still ride through its
+// gate/up/down arithmetic, and that is deliberately fine: the weights are read either way,
+// and reading them is the cost.
+//
+// EVERY row-major axis puts the token row FASTEST — `h[(e·R + t)·inter + j]`,
+// `wexpert[e·R + t]`, `acc[t·hidden + o]`. Two consequences, both load-bearing:
+//
+//   - No stride parameters. Each stride is `R`, `inter` or `hidden`, all already in hand,
+//     so batching adds exactly ONE argument to the launcher.
+//   - At R=1 every one of those expressions collapses to the single-row form it replaced
+//     (`h[e·inter+j]`, `wexpert[e]`, `acc[o]`). The shipping path's memory layout is not
+//     merely compatible, it is unchanged — so nothing about it needs re-measuring.
+//
+// Pass 1: h[(e·R + t)·inter + j] = silu(gate_ej·x_t) · (up_ej·x_t). One WAVE per
+// (expert,row), producing R values. Processes the ABSOLUTE expert range [e_start,
+// e_start+e_count) of `descs`, writing its own `h` rows — so the streaming pipeline can
+// launch experts (or a subrange) on independent streams and they all land in the same
+// schedule-independent `h`.
+template <int R>
+__device__ __forceinline__ void moe_gateup_vq_impl(
     const float* __restrict__ x, int hidden, int inter, int e_start, int e_count,
     const ExpertDescVq* __restrict__ descs, const __half* __restrict__ gate_cb,
     const __half* __restrict__ up_cb, float* __restrict__ h_out) {
@@ -49,16 +73,24 @@ extern "C" __global__ void moe_gateup_vq(
     int j = (int)(r % inter);
     const ExpertDescVq d = descs[e];
     size_t rb = vq_rb(hidden), ng = vq_ng(hidden);
-    float g = dot_vq_wave(x, d.gate_indices + (size_t)j * rb, d.gate_scales + (size_t)j * ng, gate_cb, hidden, lane);
-    float u = dot_vq_wave(x, d.up_indices + (size_t)j * rb, d.up_scales + (size_t)j * ng, up_cb, hidden, lane);
-    if (lane == 0) h_out[(size_t)e * inter + j] = siluf(g) * u;
+    float g[R], u[R];
+    dot_vq_wave_r<R>(x, hidden, d.gate_indices + (size_t)j * rb, d.gate_scales + (size_t)j * ng,
+                     gate_cb, hidden, lane, g);
+    dot_vq_wave_r<R>(x, hidden, d.up_indices + (size_t)j * rb, d.up_scales + (size_t)j * ng,
+                     up_cb, hidden, lane, u);
+    if (lane == 0) {
+#pragma unroll
+        for (int t = 0; t < R; ++t)
+            h_out[((size_t)e * R + t) * inter + j] = siluf(g[t]) * u[t];
+    }
 }
 
-// Pass 2: acc[o] += fixed(w[e] · (down_eo · h[e])). Every expert accumulates into ONE
-// row, atomically, in fixed point — so the result is schedule-independent not because
-// the writes are disjoint but because integer addition is associative. Same
+// Pass 2: acc[t][o] += fixed(w[e][t] · (down_eo · h[e][t])). Every expert accumulates into
+// ONE row per token row, atomically, in fixed point — so the result is schedule-independent
+// not because the writes are disjoint but because integer addition is associative. Same
 // absolute-range form. See common.hpp's MOE_ACC_SHIFT block for the width argument.
-extern "C" __global__ void moe_down_vq(
+template <int R>
+__device__ __forceinline__ void moe_down_vq_impl(
     int hidden, int inter, int e_start, int e_count, const ExpertDescVq* __restrict__ descs,
     const __half* __restrict__ down_cb, const float* __restrict__ wexpert,
     const float* __restrict__ h_in, unsigned long long* __restrict__ acc) {
@@ -69,9 +101,52 @@ extern "C" __global__ void moe_down_vq(
     int o = (int)(r % hidden);
     const ExpertDescVq d = descs[e];
     size_t rb = vq_rb(inter), ng = vq_ng(inter);
-    const float* he = h_in + (size_t)e * inter;
-    float dv = dot_vq_wave(he, d.down_indices + (size_t)o * rb, d.down_scales + (size_t)o * ng, down_cb, inter, lane);
-    if (lane == 0) atomicAdd(&acc[o], moe_fixed(wexpert[e] * dv));
+    // This expert's R h-rows are ADJACENT (row-fastest), so the gather dot_vq_wave_r does
+    // over them is stride `inter` and both rows share cache lines.
+    const float* he = h_in + (size_t)e * R * inter;
+    float dv[R];
+    dot_vq_wave_r<R>(he, inter, d.down_indices + (size_t)o * rb, d.down_scales + (size_t)o * ng,
+                     down_cb, inter, lane, dv);
+    if (lane == 0) {
+#pragma unroll
+        for (int t = 0; t < R; ++t) {
+            // Skip the rows that did not route here. Not an optimisation — `w == 0` times a
+            // non-finite `dv` is NaN, and moe_fixed's clamp turns NaN into a FINITE extreme
+            // (fmaxf returns the non-NaN operand), i.e. silent corruption of a row that
+            // never asked for this expert. Skipping is also bit-identical: adding zero to
+            // an integer accumulator is a no-op.
+            float w = wexpert[(size_t)e * R + t];
+            if (w != 0.0f) atomicAdd(&acc[(size_t)t * hidden + o], moe_fixed(w * dv[t]));
+        }
+    }
+}
+
+extern "C" __global__ void moe_gateup_vq(
+    const float* __restrict__ x, int hidden, int inter, int e_start, int e_count,
+    const ExpertDescVq* __restrict__ descs, const __half* __restrict__ gate_cb,
+    const __half* __restrict__ up_cb, float* __restrict__ h_out) {
+    moe_gateup_vq_impl<1>(x, hidden, inter, e_start, e_count, descs, gate_cb, up_cb, h_out);
+}
+
+extern "C" __global__ void moe_gateup_vq_r2(
+    const float* __restrict__ x, int hidden, int inter, int e_start, int e_count,
+    const ExpertDescVq* __restrict__ descs, const __half* __restrict__ gate_cb,
+    const __half* __restrict__ up_cb, float* __restrict__ h_out) {
+    moe_gateup_vq_impl<2>(x, hidden, inter, e_start, e_count, descs, gate_cb, up_cb, h_out);
+}
+
+extern "C" __global__ void moe_down_vq(
+    int hidden, int inter, int e_start, int e_count, const ExpertDescVq* __restrict__ descs,
+    const __half* __restrict__ down_cb, const float* __restrict__ wexpert,
+    const float* __restrict__ h_in, unsigned long long* __restrict__ acc) {
+    moe_down_vq_impl<1>(hidden, inter, e_start, e_count, descs, down_cb, wexpert, h_in, acc);
+}
+
+extern "C" __global__ void moe_down_vq_r2(
+    int hidden, int inter, int e_start, int e_count, const ExpertDescVq* __restrict__ descs,
+    const __half* __restrict__ down_cb, const float* __restrict__ wexpert,
+    const float* __restrict__ h_in, unsigned long long* __restrict__ acc) {
+    moe_down_vq_impl<2>(hidden, inter, e_start, e_count, descs, down_cb, wexpert, h_in, acc);
 }
 
 // acc → f32, folded into the residual add: x[o] += gain · (acc[o] · 2^-MOE_ACC_SHIFT),
@@ -111,22 +186,39 @@ extern "C" __global__ void moe_reduce(
 //     (e_count=1, per-expert Signal overlap); the [e_start,e_count) range form is the
 //     hook for a future batching of RESIDENT experts (whose Signals are already ready)
 //     into a single launch, to cut host-gated launch bubbles.
+// `nrow` token rows through ONE read of the expert weights. The grid is unchanged — the
+// row axis is inside each wave, not beside it — so this is the same launch shape doing
+// nrow times the arithmetic against the same bytes.
 extern "C" int rivoli_moe_expert_range(
     const float* x, int hidden, int inter, int e_start, int e_count, const void* descs,
     const __half* gate_cb, const __half* up_cb, const __half* down_cb, const float* wexpert,
-    float* h, unsigned long long* acc, void* stream) {
+    float* h, unsigned long long* acc, int nrow, void* stream) {
     if (hidden <= 0 || inter <= 0 || e_count <= 0 || e_start < 0) return 1001;
+    // Only the widths instantiated above. Depth-2 drafts measure 4.4% accepted, so a third
+    // row buys 1.6% for a whole extra row of verify — 2 IS the answer, and a wider `nrow`
+    // would be a template the data says not to write.
+    if (nrow != 1 && nrow != 2) return 1003;
     const ExpertDescVq* d = (const ExpertDescVq*)descs;
     hipStream_t s = (hipStream_t)stream;
     hipGetLastError();
-    size_t rows_a = (size_t)e_count * inter;
-    hipLaunchKernelGGL(moe_gateup_vq, dim3((rows_a + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
-                       dim3(256), 0, s, x, hidden, inter, e_start, e_count, d, gate_cb, up_cb, h);
+    dim3 grid_a(((size_t)e_count * inter + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+    if (nrow == 1) {
+        hipLaunchKernelGGL(moe_gateup_vq, grid_a, dim3(256), 0, s, x, hidden, inter, e_start,
+                           e_count, d, gate_cb, up_cb, h);
+    } else {
+        hipLaunchKernelGGL(moe_gateup_vq_r2, grid_a, dim3(256), 0, s, x, hidden, inter, e_start,
+                           e_count, d, gate_cb, up_cb, h);
+    }
     hipError_t e = hipGetLastError();
     if (e != hipSuccess) return -(int)e;
-    size_t rows_b = (size_t)e_count * hidden;
-    hipLaunchKernelGGL(moe_down_vq, dim3((rows_b + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
-                       dim3(256), 0, s, hidden, inter, e_start, e_count, d, down_cb, wexpert, h, acc);
+    dim3 grid_b(((size_t)e_count * hidden + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+    if (nrow == 1) {
+        hipLaunchKernelGGL(moe_down_vq, grid_b, dim3(256), 0, s, hidden, inter, e_start, e_count,
+                           d, down_cb, wexpert, h, acc);
+    } else {
+        hipLaunchKernelGGL(moe_down_vq_r2, grid_b, dim3(256), 0, s, hidden, inter, e_start,
+                           e_count, d, down_cb, wexpert, h, acc);
+    }
     e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

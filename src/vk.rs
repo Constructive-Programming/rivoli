@@ -3736,9 +3736,19 @@ pub unsafe fn launch_moe_expert_range(
     wexpert: *const f32,
     h: *mut f32,
     acc: *mut u64,
+    nrow: usize,
     stream: *mut std::ffi::c_void,
 ) -> Result<()> {
     let q = Q::parse(stream)?;
+    // Batched token rows are a HIP-only kernel so far (`moe_gateup_vq_r2`/`moe_down_vq_r2`
+    // in kernels/moe.hip). Refuse rather than silently compute row 0 and leave row 1 as
+    // whatever was in the buffer — a speculative verify that quietly dropped its second
+    // row would still produce plausible text, just never accept a draft.
+    ensure!(
+        nrow == 1,
+        "moe_expert_range: nrow={nrow} — batched token rows are not implemented on Vulkan \
+         (the .comp shaders are single-row); use --features rocm"
+    );
     moe_vq_guards(hidden, inter, e_count, "moe_expert_range")?;
     ensure_word_aligned(descs as u64, "moe_expert_range descs")?;
     for (p, n) in [(gate_cb, "gate_cb"), (up_cb, "up_cb"), (down_cb, "down_cb")] {

@@ -60,6 +60,7 @@ unsafe extern "C" {
         wexpert: *const f32,
         h: *mut f32,
         acc: *mut u64,
+        nrow: i32,
         stream: *mut c_void,
     ) -> i32;
 
@@ -286,13 +287,24 @@ pub unsafe fn fill_u32(dst: *mut u8, pat: u32, bytes: usize) -> Result<()> {
 /// e_start+e_count)` on `stream`, atomically accumulating into the shared fixed-point
 /// `acc` row. Drain it with [`launch_moe_acc_drain`] once every range has landed.
 ///
-/// `acc` is `hidden` u64 — ONE row, not `e·hidden`. Ranges on DIFFERENT streams may
-/// accumulate concurrently and the result is unchanged, because integer addition is
-/// associative; that is the whole reason this is not an f32 slab plus a reduce.
+/// `acc` is `hidden` u64 per token row — ONE row per row, not `e·hidden`. Ranges on
+/// DIFFERENT streams may accumulate concurrently and the result is unchanged, because
+/// integer addition is associative; that is the whole reason this is not an f32 slab plus
+/// a reduce.
+///
+/// `nrow` token rows (1 or 2) share ONE read of the expert weights — the batched verify
+/// pass a speculative decode needs. Every buffer puts the token row FASTEST:
+/// `x[t·hidden + i]`, `h[(e·nrow + t)·inter + j]`, `wexpert[e·nrow + t]`,
+/// `acc[t·hidden + o]`. `wexpert[e·nrow + t] == 0` means row `t` did not route to expert
+/// `e`, which is how the caller passes the UNION of two tokens' picks with no mask.
+///
+/// At `nrow == 1` every one of those indices collapses to the single-row form, so the
+/// shipping decode path's layout and arithmetic are unchanged.
 ///
 /// # Safety
 /// Every device pointer (`descs`/codebooks/`wexpert`/`x`/`h`/`acc`) must outlive
-/// `stream`'s completion — await its [`Signal`](crate::gpustream::Signal).
+/// `stream`'s completion — await its [`Signal`](crate::gpustream::Signal), and each must
+/// own `nrow` rows in the layout above.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn launch_moe_expert_range(
     x: *const f32,
@@ -307,6 +319,7 @@ pub unsafe fn launch_moe_expert_range(
     wexpert: *const f32,
     h: *mut f32,
     acc: *mut u64,
+    nrow: usize,
     stream: *mut c_void,
 ) -> Result<()> {
     // SAFETY: caller's pointer contract; stream is a live HipStream handle.
@@ -324,6 +337,7 @@ pub unsafe fn launch_moe_expert_range(
             wexpert,
             h,
             acc,
+            nrow as i32,
             stream,
         )
     };

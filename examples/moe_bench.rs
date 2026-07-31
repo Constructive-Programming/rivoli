@@ -37,6 +37,11 @@ const INTER: usize = 2048;
 const NDESC: usize = 9;
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
 const ITERS: usize = 40;
+/// Widest token-row batch measured. Buffers are sized for this and the `nrow=1` arm just
+/// uses the first row of each, so both arms read the SAME weight slab — which is the whole
+/// comparison: how much does a second token row cost when the weights are already being read?
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
+const MAXROW: usize = 2;
 
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
 struct Rng(u64);
@@ -92,12 +97,17 @@ fn main() {
         dev(&pattern(cb_bytes, 3)),
     );
     let mut r = Rng(7);
-    let x = dev(&f32b(&(0..HIDDEN).map(|_| (r.next() >> 8) as f32 / 1e7).collect::<Vec<_>>()));
-    let w = dev(&f32b(&[1.0f32; NDESC]));
-    let mut h = dev(&vec![0u8; NDESC * INTER * 4]);
-    // ONE accumulator row, not NDESC partial rows — every expert atomicAdds into it.
-    let mut acc = dev(&vec![0u8; HIDDEN * 8]);
-    let mut out = dev(&vec![0u8; HIDDEN * 4]);
+    let x = dev(&f32b(
+        &(0..MAXROW * HIDDEN).map(|_| (r.next() >> 8) as f32 / 1e7).collect::<Vec<_>>(),
+    ));
+    // `wexpert[e·nrow + t]` — token row fastest. All-ones means every row routed to every
+    // expert, i.e. the WORST case for batching: no row skips any expert's atomic.
+    let w = dev(&f32b(&[1.0f32; NDESC * MAXROW]));
+    let mut h = dev(&vec![0u8; NDESC * MAXROW * INTER * 4]);
+    // ONE accumulator row per token row, not NDESC partial rows — every expert atomicAdds
+    // into it.
+    let mut acc = dev(&vec![0u8; MAXROW * HIDDEN * 8]);
+    let mut out = dev(&vec![0u8; MAXROW * HIDDEN * 4]);
 
     // Descriptors point into the slab at each expert's six projection offsets.
     let base = weights.ptr();
@@ -140,59 +150,46 @@ fn main() {
     // ENGINE actually does: every expert is gated on its own ticket, so the launches
     // cannot be batched. The difference between the two isolates PER-LAUNCH cost, and a
     // Vulkan launch is a record + submit where a HIP launch is just an enqueue.
-    let mut run = |label: &str, iters: usize, per_expert: bool| {
-        // Warm up: first-touch page faults and pipeline creation must not be timed.
-        for _ in 0..3 {
-            // SAFETY: every pointer is a live device buffer sized above; `stream` is live.
-            unsafe {
-                let (start, count) = if per_expert { (0, 1) } else { (0, NDESC) };
-                let _ = (start, count);
-                for e in 0..(if per_expert { NDESC } else { 1 }) {
-                    launch_moe_expert_range(
-                        x.ptr() as *const f32, HIDDEN, INTER,
-                        if per_expert { e } else { 0 },
-                        if per_expert { 1 } else { NDESC },
-                        dbuf.ptr() as *const ExpertDesc,
-                        cb0.ptr() as *const u16, cb1.ptr() as *const u16, cb2.ptr() as *const u16,
-                        w.ptr() as *const f32, h.ptr_mut() as *mut f32,
-                        acc.ptr_mut() as *mut u64, stream.raw(),
-                    )
-                    .expect("moe");
-                }
+    let mut run = |label: &str, iters: usize, per_expert: bool, nrow: usize| -> f64 {
+        // One pass of the shape under test. Hoisted so the warm-up and the timed loop
+        // cannot drift apart — they were duplicated, and a bench whose two copies disagree
+        // measures the difference between them.
+        // SAFETY: every pointer is a live device buffer sized for MAXROW rows above;
+        // `stream` is live; `nrow` is 1 or 2, which the launcher validates.
+        let mut pass = || unsafe {
+            for e in 0..(if per_expert { NDESC } else { 1 }) {
+                launch_moe_expert_range(
+                    x.ptr() as *const f32, HIDDEN, INTER,
+                    if per_expert { e } else { 0 },
+                    if per_expert { 1 } else { NDESC },
+                    dbuf.ptr() as *const ExpertDesc,
+                    cb0.ptr() as *const u16, cb1.ptr() as *const u16, cb2.ptr() as *const u16,
+                    w.ptr() as *const f32, h.ptr_mut() as *mut f32,
+                    acc.ptr_mut() as *mut u64, nrow, stream.raw(),
+                )
+                .expect("moe");
+            }
+            // One drain per token row: the drain's `rows` axis is the STREAM split, not
+            // the token batch, so the rows are separate calls at separate bases.
+            for t in 0..nrow {
                 launch_moe_acc_drain(
-                    out.ptr_mut() as *mut f32, acc.ptr_mut() as *mut u64, HIDDEN, 1, 1.0,
-                    stream.raw(),
+                    out.ptr_mut().add(t * HIDDEN * 4) as *mut f32,
+                    acc.ptr_mut().add(t * HIDDEN * 8) as *mut u64,
+                    HIDDEN, 1, 1.0, stream.raw(),
                 )
                 .expect("drain");
             }
+        };
+        // Warm up: first-touch page faults and pipeline creation must not be timed.
+        for _ in 0..3 {
+            pass();
         }
         device_sync().expect("sync");
 
         let t = std::time::Instant::now();
         ev0.record(stream.raw()).expect("ev0");
         for _ in 0..iters {
-            // SAFETY: as above.
-            unsafe {
-                let (start, count) = if per_expert { (0, 1) } else { (0, NDESC) };
-                let _ = (start, count);
-                for e in 0..(if per_expert { NDESC } else { 1 }) {
-                    launch_moe_expert_range(
-                        x.ptr() as *const f32, HIDDEN, INTER,
-                        if per_expert { e } else { 0 },
-                        if per_expert { 1 } else { NDESC },
-                        dbuf.ptr() as *const ExpertDesc,
-                        cb0.ptr() as *const u16, cb1.ptr() as *const u16, cb2.ptr() as *const u16,
-                        w.ptr() as *const f32, h.ptr_mut() as *mut f32,
-                        acc.ptr_mut() as *mut u64, stream.raw(),
-                    )
-                    .expect("moe");
-                }
-                launch_moe_acc_drain(
-                    out.ptr_mut() as *mut f32, acc.ptr_mut() as *mut u64, HIDDEN, 1, 1.0,
-                    stream.raw(),
-                )
-                .expect("drain");
-            }
+            pass();
         }
         ev1.record(stream.raw()).expect("ev1");
         device_sync().expect("sync");
@@ -204,13 +201,27 @@ fn main() {
         // cost, which is exactly the thing this bench is trying NOT to attribute to the
         // shaders. Both are printed so the gap between them is visible.
         println!(
-            "{label:<10} wall {wall_us:8.1} us/call   gpu {gpu_us:8.1} us/call   \
+            "{label:<14} wall {wall_us:8.1} us/call   gpu {gpu_us:8.1} us/call   \
              {:6.1} GB/s (gpu)   {:6.1} GB/s (wall)",
             gb / (gpu_us * 1e-6) , gb / (wall_us * 1e-6),
         );
+        gpu_us
     };
-    run("batched", ITERS, false);
-    run("per-expert", ITERS, true);
+    let b1 = run("batched", ITERS, false, 1);
+    let p1 = run("per-expert", ITERS, true, 1);
+    let b2 = run("batched r2", ITERS, false, 2);
+    let p2 = run("per-expert r2", ITERS, true, 2);
+    // `c` in the speculative-decode throughput model: a verify pass covering 2 token rows
+    // costs `c` single-row passes. Speculating pays whenever (1 + p_accept)/c > 1, so this
+    // ratio is what decides whether MTP is worth wiring into the decode loop at all.
+    println!(
+        "\n2-row cost ratio c (gpu):  batched {:.3}x   per-expert {:.3}x\n\
+         at the measured 53.5% draft acceptance -> {:.3}x / {:.3}x tokens per unit work",
+        b2 / b1,
+        p2 / p1,
+        1.535 / (b2 / b1),
+        1.535 / (p2 / p1),
+    );
     println!("\nNOTE: the pool is re-read from the same {:.0} MB every iteration, so this \
               is cache-warm relative to the engine, which streams 78 distinct experts. \
               Compare backends against each other, not against the in-engine moe bucket.",
