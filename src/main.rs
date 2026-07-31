@@ -396,9 +396,23 @@ fn main() -> Result<()> {
                     ),
                 }
             }
-            None => anyhow::bail!(
-                "`.i4` set is unstamped so its group size is unknown, and this binary reads \
-                 group {}. Rebuild with `fp8_to_i4`, or use `--mode int3-vq`.",
+            // UNSTAMPED is not unknown, and refusing here made it look like it was.
+            // `ExpertSet::open` computes `(n_experts + 1) * i4_expert_stride` and hard-fails
+            // on a byte mismatch, and the stride is a function of the group size — so the
+            // slab length ALREADY proves the group, exactly, before a single expert is
+            // read. (The `.i4` set on the reference artifact is 5,153,882,112 B =
+            // 257 x 20,054,016, which only group 128 produces; group 64 would be
+            // 21,233,664 and per-row 18,915,328.) format.rs::I4Source says as much —
+            // "such a set has a different `.i4` file size and is rejected by
+            // `ExpertSet::open`, so this is a diagnosis, not a load-time guard" — and
+            // bailing here contradicted its own doc comment, locking out an artifact whose
+            // bytes are provably correct because a JSON field went missing.
+            //
+            // A stamp that POSITIVELY DISAGREES still bails above: that is a claim in
+            // conflict with the binary, not an absence of one.
+            None => info!(
+                "i4 source: unstamped (no manifest `i4_source`) — group size will be \
+                 verified by the `.i4` slab length against group {}",
                 rivoli::quant::I4_GROUP
             ),
         }

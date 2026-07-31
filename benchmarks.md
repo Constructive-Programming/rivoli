@@ -1627,3 +1627,66 @@ on its OWN output was discarded as confounded: it fed raw text through `--ppl` w
 generation had been chat-framed, and re-tokenized instead of replaying the emitted ids, so
 positions did not align. Its "NLL 16.6" spikes were tokenizer boundaries. Replaying the
 ids needs a `--ppl` that takes ids, which does not exist.
+
+## `--mode int4` vs int3-vq — the point estimate favours int4, the test cannot confirm it
+
+**2026-07-31**, one binary, one session, `tests/ppl-corpus.txt` (762 teacher-forced
+tokens), 2q / `--max-mem 115` / dense. `--ppl` never enters `generate`, so speculative
+decode is not a variable.
+
+| mode | PPL | mean NLL | hit % | 762 tok in | slot bytes | pool |
+|---|---:|---:|---:|---:|---:|---:|
+| int3-vq | 5.222720 | 1.653018 | 78.17 | 283.9 s | 15,335,424 | 6888 |
+| **int4** | **5.154898** | **1.639947** | 70.86 | 365.3 s | 20,054,016 | 5274 |
+
+Paired (`bin/ppl`): mean dNLL **−0.01307**, sd 0.5279, SE 0.01913, 95% CI
+**[−0.05056, +0.02441]**, worse% 57.3, dPPL −1.299%.
+
+**INCONCLUSIVE, and it must be reported that way.** The interval straddles zero and SE
+exceeds the 1%-PPL bar of 0.00995 nats, so this corpus cannot resolve the question at any
+point estimate — `bin/ppl` says so itself and asks for ~2021 tokens. int4 being ahead on
+PPL is consistent with docs/INT4.md §10's independent 5.120 vs 5.275434, but 762 tokens do
+not establish it here. `tests/ppl-corpus-5000.txt` exists and would settle it.
+
+Note `worse%` 57.3 with a NEGATIVE mean dNLL: int4 is individually worse on most tokens
+and wins by a wide margin on a minority. That is a distribution worth knowing about before
+reading −1.3% as a uniform improvement.
+
+**int4 is the slower mode**, and structurally so: its slot is 20.05 MB against int3-vq's
+15.34 MB, so the same budget holds 5274 experts instead of 6888 and the hit rate falls
+78.2 → 70.9%. 762 tokens took 365 s against 284 s.
+
+### Free-running, the difference is not 1.3% — it is night and day
+
+Same prompt that corrupted under int3-vq ("What causes the seasons on Earth?"), 512 tokens:
+
+| mode | distinct | longest repeated block | the completion |
+|---|---:|---:|---|
+| int3-vq | 0.264 | 77 | spliced wreckage: half-copies cutting mid-phrase, `**23. 5 degrees**`, boilerplate with no source in context |
+| **int4** | 0.279 | 77 | correct physics end to end, and it CATCHES ITS OWN SLIP — emits "tilted toward the Earth", then a `**Corrected Version:**` block restating the paragraph with "tilted toward the **Sun**", then continues into an accurate Q&A on insolation angle and daylight hours |
+
+**The metrics cannot see this.** distinct 0.264 vs 0.279 is nothing, and `longest repeated
+block` is 77 for BOTH — for int3-vq it is corruption, for int4 it is the deliberate
+`**Corrected Version:**` restatement, which is legitimate prose. Third independent
+demonstration of docs/INT4.md §1, after §10's hybrid case and the 2026-07-31 root-cause:
+the degeneration gate does not measure quality, and here it ranks a coherent completion
+level with a broken one.
+
+Neither reaches EOS in 512, but for opposite reasons — int3-vq cannot escape its loop,
+int4 is working through a self-generated Q&A series and would plausibly continue for a
+while. int4 is 2.06 tok/s against int3-vq's 2.63.
+
+**So the 1.3% PPL gap badly understates the practical gap.** Teacher-forcing pins the
+prefix and measures one step; free-running compounds every step into its own input, and
+that is where a small per-token edge turns into the difference between physics and
+splices. A PPL delta this size is not a safe proxy for decode quality in either direction.
+
+### The `.i4` set on the reference artifact is group-128, proven by its length
+
+`manifest.json` carries no `i4_source`, and `main` used to REFUSE to load on that basis.
+It no longer does, because the absence proves nothing while the slab length proves
+everything: `ExpertSet::open` requires `len == (n_experts + 1) * i4_expert_stride`, and the
+stride is a function of the group size. The file is **5,153,882,112 B = 257 × 20,054,016**,
+which only group 128 produces — group 64 would be 21,233,664 and per-row 18,915,328 per
+expert. `format.rs::I4Source` already said the stamp "is a diagnosis, not a load-time
+guard"; the `None` arm had made it one. A stamp that POSITIVELY disagrees still bails.
