@@ -11,7 +11,11 @@
 
 // y[o] = Σ_i x[i]·e4m3(packed[o·i_dim+i])·scale[(o/block)·sc_cols + i/block] — fp8
 // block-scaled (attention/dense projections; matches quant.rs matvec_fp8).
-extern "C" __global__ void gemv_fp8(
+// `R` token rows through one read of the weight row. `x` rows are `i_dim` apart and `y`
+// rows `o_dim` apart — both already arguments, so batching costs no extra parameter and at
+// R=1 every index is the single-row one.
+template <int R>
+__device__ __forceinline__ void gemv_fp8_impl(
     const float* __restrict__ x, const unsigned char* __restrict__ packed,
     const float* __restrict__ scale, int o_dim, int i_dim, int block, float* __restrict__ y) {
     __shared__ float lut[256];
@@ -21,9 +25,28 @@ extern "C" __global__ void gemv_fp8(
     size_t o = (size_t)blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x / WAVE);
     if (o >= (size_t)o_dim) return;
     int sc_cols = (i_dim + block - 1) / block;
-    float acc = dot_fp8_wave(x, packed + o * (size_t)i_dim,
-                             scale + (o >> blk_shift(block)) * sc_cols, i_dim, block, lane, lut);
-    if (lane == 0) y[o] = acc;
+    float acc[R];
+    fp8_dot_strided_r<R>(x, i_dim, packed + o * (size_t)i_dim,
+                         scale + (o >> blk_shift(block)) * sc_cols, i_dim, block, lut, lane, WAVE,
+                         acc);
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        // Uniform across the wave: R is a compile-time constant.
+        float s = wave_sum(acc[r]);
+        if (lane == 0) y[(size_t)r * o_dim + o] = s;
+    }
+}
+
+extern "C" __global__ void gemv_fp8(
+    const float* __restrict__ x, const unsigned char* __restrict__ packed,
+    const float* __restrict__ scale, int o_dim, int i_dim, int block, float* __restrict__ y) {
+    gemv_fp8_impl<1>(x, packed, scale, o_dim, i_dim, block, y);
+}
+
+extern "C" __global__ void gemv_fp8_r2(
+    const float* __restrict__ x, const unsigned char* __restrict__ packed,
+    const float* __restrict__ scale, int o_dim, int i_dim, int block, float* __restrict__ y) {
+    gemv_fp8_impl<2>(x, packed, scale, o_dim, i_dim, block, y);
 }
 
 // Split-K fp8 GEMV for LONG reductions: ONE block per output row, its ROWS_PER_BLOCK
@@ -32,11 +55,12 @@ extern "C" __global__ void gemv_fp8(
 // machine under wave-per-row (768 blocks, each wave grinding a 16384-long chain);
 // one-row-per-block gives K× the blocks so DRAM saturates — measured 128→~250 GB/s.
 // Same LUT + block-scaled e4m3 dot as gemv_fp8; the whole block strides coalesced.
-extern "C" __global__ void gemv_fp8_splitk(
+template <int R>
+__device__ __forceinline__ void gemv_fp8_splitk_impl(
     const float* __restrict__ x, const unsigned char* __restrict__ packed,
     const float* __restrict__ scale, int o_dim, int i_dim, int block, float* __restrict__ y) {
     __shared__ float lut[256];
-    __shared__ float part[ROWS_PER_BLOCK]; // K = ROWS_PER_BLOCK wave partials
+    __shared__ float part[R][ROWS_PER_BLOCK]; // K = ROWS_PER_BLOCK wave partials, per row
     e4m3_lut_build(lut, threadIdx.x);
     __syncthreads();
     size_t o = blockIdx.x; // one output row per block
@@ -52,15 +76,33 @@ extern "C" __global__ void gemv_fp8_splitk(
     const float* scalerow = scale + (o >> blk_shift(block)) * sc_cols;
     const int STRIDE = ROWS_PER_BLOCK * WAVE; // all 256 threads stride coalesced (split-K)
     // Same strided fp8 MAC as dot_fp8_wave, but split-K across every wave in the block.
-    float acc = fp8_dot_strided(x, wrow, scalerow, i_dim, block, lut, threadIdx.x, STRIDE);
-    acc = wave_sum(acc); // per-wave partial → its lane 0
-    if (lane == 0) part[wave] = acc;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float s = 0.0f;
-        for (int w = 0; w < ROWS_PER_BLOCK; ++w) s += part[w]; // fixed order
-        y[o] = s;
+    float acc[R];
+    fp8_dot_strided_r<R>(x, i_dim, wrow, scalerow, i_dim, block, lut, threadIdx.x, STRIDE, acc);
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        float s = wave_sum(acc[r]); // per-wave partial → its lane 0
+        if (lane == 0) part[r][wave] = s;
     }
+    __syncthreads();
+    // One thread per token row, each folding its own K partials in the SAME fixed order as
+    // the single-row kernel — so the split-K combine stays deterministic per row.
+    if (threadIdx.x < R) {
+        float s = 0.0f;
+        for (int w = 0; w < ROWS_PER_BLOCK; ++w) s += part[threadIdx.x][w];
+        y[(size_t)threadIdx.x * o_dim + o] = s;
+    }
+}
+
+extern "C" __global__ void gemv_fp8_splitk(
+    const float* __restrict__ x, const unsigned char* __restrict__ packed,
+    const float* __restrict__ scale, int o_dim, int i_dim, int block, float* __restrict__ y) {
+    gemv_fp8_splitk_impl<1>(x, packed, scale, o_dim, i_dim, block, y);
+}
+
+extern "C" __global__ void gemv_fp8_splitk_r2(
+    const float* __restrict__ x, const unsigned char* __restrict__ packed,
+    const float* __restrict__ scale, int o_dim, int i_dim, int block, float* __restrict__ y) {
+    gemv_fp8_splitk_impl<2>(x, packed, scale, o_dim, i_dim, block, y);
 }
 
 // y[o] = Σ_subvec scale[o,grp]·codebook[idx]·x — VQ-int3, per-group bf16 scale
@@ -238,26 +280,39 @@ extern "C" __global__ void vq_encode(
 
 extern "C" int rivoli_gemv_fp8_splitk(
     const float* x, const unsigned char* packed, const float* scale, int o_dim, int i_dim,
-    int block, float* y) {
+    int block, int nrow, float* y) {
     if (o_dim <= 0 || i_dim <= 0 || block <= 0) return 1001;
     if (block & (block - 1)) return 1003;  // blk_shift needs a power-of-two tile
+    if (nrow != 1 && nrow != 2) return 1004;
     hipGetLastError();
-    hipLaunchKernelGGL(gemv_fp8_splitk, dim3(o_dim), ROW_BLOCK, 0, 0, x, packed, scale, o_dim, i_dim, block, y);
+    if (nrow == 1) {
+        hipLaunchKernelGGL(gemv_fp8_splitk, dim3(o_dim), ROW_BLOCK, 0, 0, x, packed, scale, o_dim, i_dim, block, y);
+    } else {
+        hipLaunchKernelGGL(gemv_fp8_splitk_r2, dim3(o_dim), ROW_BLOCK, 0, 0, x, packed, scale, o_dim, i_dim, block, y);
+    }
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
 
+// `nrow` token rows (1 or 2) through ONE read of the fp8 weights: `x[r·i_dim + i]` →
+// `y[r·o_dim + o]`. The grid is unchanged — the row axis lives inside each wave, not
+// beside it — so this is the same launch doing nrow times the arithmetic on the same bytes.
 extern "C" int rivoli_gemv_fp8(
     const float* x, const unsigned char* packed, const float* scale, int o_dim, int i_dim,
-    int block, float* y) {
+    int block, int nrow, float* y) {
     // NO `i_dim % 4` guard, unlike the Vulkan twin and unlike rivoli_mla_value_fp8's
     // `kvl % 4` — a known gap, conditional on block >= 4. See common.hpp fp8_dot_strided.
     if (o_dim <= 0 || i_dim <= 0 || block <= 0) return 1001;
     if (block & (block - 1)) return 1003;  // blk_shift needs a power-of-two tile
+    if (nrow != 1 && nrow != 2) return 1004;
     if (i_dim >= GEMV_SPLITK_MIN_IDIM)
-        return rivoli_gemv_fp8_splitk(x, packed, scale, o_dim, i_dim, block, y);
+        return rivoli_gemv_fp8_splitk(x, packed, scale, o_dim, i_dim, block, nrow, y);
     hipGetLastError();
-    hipLaunchKernelGGL(gemv_fp8, ROW_GRID(o_dim), ROW_BLOCK, 0, 0, x, packed, scale, o_dim, i_dim, block, y);
+    if (nrow == 1) {
+        hipLaunchKernelGGL(gemv_fp8, ROW_GRID(o_dim), ROW_BLOCK, 0, 0, x, packed, scale, o_dim, i_dim, block, y);
+    } else {
+        hipLaunchKernelGGL(gemv_fp8_r2, ROW_GRID(o_dim), ROW_BLOCK, 0, 0, x, packed, scale, o_dim, i_dim, block, y);
+    }
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

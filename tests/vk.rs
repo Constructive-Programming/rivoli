@@ -1952,7 +1952,7 @@ fn linalg_guards_reject_degenerate_arguments() {
     // are live 4096-byte Bufs regardless.
     unsafe {
         let fp8 = |o: usize, i: usize, block: usize, packed: *const u8| {
-            launch_gemv_fp8(p as *const f32, packed, p as *const f32, o, i, block, q as *mut f32)
+            launch_gemv_fp8(p as *const f32, packed, p as *const f32, o, i, block, 1, q as *mut f32)
         };
         assert!(fp8(0, 64, 128, p).is_err(), "gemv_fp8 o_dim = 0");
         assert!(fp8(8, 0, 128, p).is_err(), "gemv_fp8 i_dim = 0");
@@ -2097,8 +2097,8 @@ fn gemv_fp8_matches_the_host_oracle() {
                 o_dim,
                 i_dim,
                 block,
-                yb.ptr_mut() as *mut f32,
-            )
+                1,
+                yb.ptr_mut() as *mut f32)
             .expect("launch");
         }
         device_sync().expect("sync");
@@ -2145,8 +2145,8 @@ fn gemv_fp8_splitk_is_bit_reproducible() {
                 o,
                 i,
                 block,
-                yb.ptr_mut() as *mut f32,
-            )
+                1,
+                yb.ptr_mut() as *mut f32)
             .expect("launch");
         }
         device_sync().expect("sync");

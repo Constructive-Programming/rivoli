@@ -147,6 +147,56 @@ __device__ __forceinline__ float fp8_dot_strided(const float* __restrict__ x,
     return acc;
 }
 
+// R INPUT ROWS against one weight row — the fp8 twin of `dot_vq_wave_r`, and the same
+// argument for existing. The attention projections read 165 MB of fp8 per layer (o_proj
+// alone is 100 MB) against a 24 KB row of `x`, so the weight side is the cost and R rows
+// through one read of it is what makes a speculative verify pass cheap.
+//
+// `x` rows are `x_stride` apart. NO cross-thread reduction here either — `dot_fp8_wave_r`
+// wave-sums, `gemv_fp8_splitk_r` reduces in LDS.
+//
+// R=1 is BIT-IDENTICAL to the scalar form: hoisting the four `lut[]` reads into locals
+// changes neither the values nor the order they are summed in.
+template <int R>
+__device__ __forceinline__ void fp8_dot_strided_r(const float* __restrict__ x, int x_stride,
+                                                  const unsigned char* __restrict__ wrow,
+                                                  const float* __restrict__ scalerow,
+                                                  int i_dim, int block,
+                                                  const float* __restrict__ lut,
+                                                  int start, int stride,
+                                                  float* __restrict__ acc) {
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+    const unsigned int* w4 = (const unsigned int*)wrow;
+    // See the single-row note above for why `block < 4` zeroes the dword path.
+    int n4 = (block >= 4) ? (i_dim >> 2) : 0;
+    int bsh = blk_shift(block);
+    for (int j = start; j < n4; j += stride) {
+        unsigned int p = w4[j];
+        int i0 = j << 2;
+        float s = scalerow[i0 >> bsh];
+        float l0 = lut[(unsigned char)p];
+        float l1 = lut[(unsigned char)(p >> 8)];
+        float l2 = lut[(unsigned char)(p >> 16)];
+        float l3 = lut[(unsigned char)(p >> 24)];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const float* xr = x + (size_t)r * x_stride;
+            acc[r] += s * (xr[i0] * l0 + xr[i0 + 1] * l1 + xr[i0 + 2] * l2 + xr[i0 + 3] * l3);
+        }
+    }
+    for (int i = (n4 << 2) + start; i < i_dim; i += stride) {
+        // `x * l * s`, NOT `x * (l*s)`. Folding the two weight-side factors first would be
+        // one fewer multiply per row and a DIFFERENT number — fp multiplication does not
+        // associate — which is exactly the kind of drift the bit-identity test exists to
+        // refuse. The loads are hoisted; the arithmetic is not touched.
+        float l = lut[wrow[i]];
+        float s = scalerow[i >> bsh];
+#pragma unroll
+        for (int r = 0; r < R; ++r) acc[r] += x[(size_t)r * x_stride + i] * l * s;
+    }
+}
+
 // One WAVE reduces one row: strided MAC over the wave's lanes, then a wave-sum.
 __device__ __forceinline__ float dot_fp8_wave(const float* __restrict__ x,
                                               const unsigned char* __restrict__ wrow,

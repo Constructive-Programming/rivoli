@@ -3197,11 +3197,20 @@ pub unsafe fn launch_gemv_fp8(
     o_dim: usize,
     i_dim: usize,
     block: usize,
+    nrow: usize,
     y: *mut f32,
 ) -> Result<()> {
     ensure!(
         o_dim > 0 && i_dim > 0 && block > 0,
         "gemv_fp8: argument guard rejected"
+    );
+    // Batched token rows are HIP-only so far (`gemv_fp8_r2`/`gemv_fp8_splitk_r2`). Refuse
+    // rather than compute row 0 and leave row 1 as whatever was in the buffer — see the
+    // same note on `launch_moe_expert_range`.
+    ensure!(
+        nrow == 1,
+        "gemv_fp8: nrow={nrow} — batched token rows are not implemented on Vulkan \
+         (the .comp shaders are single-row); use --features rocm"
     );
     // Guard 1003's twin: `blk_shift` is a shift, so a non-power-of-two tile would index
     // the block scale with a floor rather than a quotient. The HIP side added this when

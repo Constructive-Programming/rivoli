@@ -117,7 +117,7 @@ fn run(name: &str, o_dim: usize, i_dim: usize) {
     let fp8s: Vec<f32> = vec![1.0; (o_dim / block) * (i_dim / block)];
     let (fp8pb, fp8sb) = (dev(&fp8p), dev(&f32b(&fp8s)));
     let us_fp8 = time(iters, &|| unsafe {
-        launch_gemv_fp8(xp, fp8pb.ptr(), fp8sb.ptr() as *const f32, o_dim, i_dim, block, yp).expect("fp8");
+        launch_gemv_fp8(xp, fp8pb.ptr(), fp8sb.ptr() as *const f32, o_dim, i_dim, block, 1, yp).expect("fp8");
     });
 
     let ge = |us: f64| gelem / (us * 1e-6) / 1e9;
@@ -167,18 +167,38 @@ fn run_fp8(name: &str, o_dim: usize, i_dim: usize) {
     // |v| <= 0.1 never encodes to the e4m3 NaN pattern, so no fixup is needed.
     let packed = pattern(o_dim * i_dim, |v| f32_to_e4m3(v * 0.1));
     let scale = rnd_scale(&mut r, (o_dim / block) * (i_dim / block));
-    let (xb, pb, sb) = (dev(&rnd(&mut r, i_dim)), dev(&packed), dev(&scale));
-    let mut yb = dev(&vec![0u8; o_dim * 4]);
+    // Two token rows' worth of x and y; the nrow=1 arm uses the first row of each, so both
+    // arms read the SAME weight bytes and the ratio is purely "what does a second row cost".
+    let (xb, pb, sb) = (dev(&rnd(&mut r, 2 * i_dim)), dev(&packed), dev(&scale));
+    let mut yb = dev(&vec![0u8; 2 * o_dim * 4]);
     let (xp, yp) = (xb.ptr() as *const f32, yb.ptr_mut() as *mut f32);
     let us = time(60, &|| unsafe {
-        launch_gemv_fp8(xp, pb.ptr(), sb.ptr() as *const f32, o_dim, i_dim, block, yp).expect("fp8");
+        launch_gemv_fp8(xp, pb.ptr(), sb.ptr() as *const f32, o_dim, i_dim, block, 1, yp).expect("fp8");
     });
     report(name, "fp8", o_dim, i_dim, us);
+    // Row 0's bytes, before the 2-row arm rewrites them. `x` row 0 is the same first
+    // `i_dim` draws it always was, so this fingerprint stays comparable to values recorded
+    // before batching existed.
+    let row0 = yb.copy_out().expect("out")[..o_dim * 4].to_vec();
+    let us2 = time(60, &|| unsafe {
+        launch_gemv_fp8(xp, pb.ptr(), sb.ptr() as *const f32, o_dim, i_dim, block, 2, yp).expect("fp8 r2");
+    });
+    report(name, "fp8 r2", o_dim, i_dim, us2);
+    // BIT-identity at the real engine shape, which the unit test's toy dims cannot reach:
+    // o_proj is [6144,16384] and goes down the split-K path, where the 2-row kernel folds
+    // K partials per row out of a [R][K] LDS tile. A row-indexing slip there produces
+    // plausible numbers, not a crash.
+    let after = yb.copy_out().expect("out2");
+    assert!(
+        after[..o_dim * 4] == row0[..],
+        "{name}: nrow=2 row 0 differs from nrow=1 — the batched kernel is not the same arithmetic"
+    );
+    println!("            2-row cost ratio {:.3}x  (row 0 bit-identical)", us2 / us);
     // The hash is only comparable against a run with the SAME generator, so print what
     // determines it: a recorded bare hash goes stale the first time a seed or a draw
     // order moves, and reads as a numerics regression when it does.
     println!("            fnv {:016x}  (seed {seed:#x}, {o_dim}x{i_dim} blk{block})",
-        fnv(&yb.copy_out().expect("out")));
+        fnv(&row0));
 }
 
 fn run_i8(name: &str, o_dim: usize, i_dim: usize) {

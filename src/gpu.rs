@@ -892,8 +892,8 @@ impl<'a> GpuEngine<'a> {
                 ip.wk.o_dim,
                 ip.wk.i_dim,
                 ip.wk.block,
-                kp,
-            )?;
+                1,
+                kp)?;
             launch_layernorm(kp, ip.k_norm_w, ip.k_norm_b, hd, K_NORM_EPS, kp)?;
             launch_rope(kp, 1, rope, rope, pos, theta)?;
             launch_index_append(kp, kcp, pos, hd)?;
@@ -926,8 +926,8 @@ impl<'a> GpuEngine<'a> {
                 ip.wq_b.o_dim,
                 ip.wq_b.i_dim,
                 ip.wq_b.block,
-                iqp,
-            )?;
+                1,
+                iqp)?;
             launch_rope(iqp, nh, hd, rope, pos, theta)?; // per head: stride hd, seg rope
             // weights_proj is bf16→f32 [n_heads, hidden] — plain f32 GEMV.
             launch_gemv_f32(xnp, ip.weights_proj, nh, cfg.hidden, iwp)?;
@@ -1242,12 +1242,10 @@ impl<'a> GpuEngine<'a> {
             unsafe {
                 launch_rmsnorm(xp, input_ln, hidden, eps, xnp)?;
                 launch_gemv_fp8(
-                    xnp, q_a.packed, q_a.scale, q_a.o_dim, q_a.i_dim, q_a.block, qrp,
-                )?;
+                    xnp, q_a.packed, q_a.scale, q_a.o_dim, q_a.i_dim, q_a.block, 1, qrp)?;
                 launch_rmsnorm(qrp, q_a_ln, cfg.q_lora_rank, eps, qrp)?; // in-place
                 launch_gemv_fp8(
-                    qrp, q_b.packed, q_b.scale, q_b.o_dim, q_b.i_dim, q_b.block, qp,
-                )?;
+                    qrp, q_b.packed, q_b.scale, q_b.o_dim, q_b.i_dim, q_b.block, 1, qp)?;
                 launch_gemv_fp8(
                     xnp,
                     kv_a.packed,
@@ -1255,8 +1253,8 @@ impl<'a> GpuEngine<'a> {
                     kv_a.o_dim,
                     kv_a.i_dim,
                     kv_a.block,
-                    compp,
-                )?;
+                    1,
+                    compp)?;
                 launch_rmsnorm(compp, kv_a_ln, kvl, eps, compp)?; // normalize latent (first kvl)
                 launch_rope(compp.add(kvl), 1, rope, rope, pos, theta)?; // rope the key
                 launch_rope(qp.add(nope), h, qh, rope, pos, theta)?; // rope per-head query
@@ -1320,8 +1318,8 @@ impl<'a> GpuEngine<'a> {
                     o_proj.o_dim,
                     o_proj.i_dim,
                     o_proj.block,
-                    subp,
-                )?;
+                    1,
+                    subp)?;
                 launch_vadd(xp, subp, hidden)?; // residual
                 launch_rmsnorm(xp, post_ln, hidden, eps, xnp)?; // pre-MLP norm → xn
             }
@@ -1436,8 +1434,8 @@ impl<'a> GpuEngine<'a> {
                         m.gate.o_dim,
                         m.gate.i_dim,
                         m.gate.block,
-                        gp,
-                    )?;
+                        1,
+                        gp)?;
                     launch_gemv_fp8(
                         xnp,
                         m.up.packed,
@@ -1445,8 +1443,8 @@ impl<'a> GpuEngine<'a> {
                         m.up.o_dim,
                         m.up.i_dim,
                         m.up.block,
-                        up,
-                    )?;
+                        1,
+                        up)?;
                     launch_swiglu(gp, up, inter, gp)?; // in place: h = silu(gate)*up
                     launch_gemv_fp8(
                         gp,
@@ -1455,8 +1453,8 @@ impl<'a> GpuEngine<'a> {
                         m.down.o_dim,
                         m.down.i_dim,
                         m.down.block,
-                        outp,
-                    )?;
+                        1,
+                        outp)?;
                 }
                 // Dense layer: attention + MLP were all launches, nothing blocked.
                     let e_launch = std::time::Instant::now();

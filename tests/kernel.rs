@@ -67,8 +67,8 @@ fn gemv_fp8_matches_oracle() {
                 o_dim,
                 i_dim,
                 block,
-                yb.ptr_mut() as *mut f32,
-            )
+                1,
+                yb.ptr_mut() as *mut f32)
             .expect("launch");
         }
         device_sync().expect("sync");
@@ -104,8 +104,8 @@ fn gemv_fp8_rejects_non_power_of_two_block() {
                     o_dim,
                     i_dim,
                     block,
-                    y.ptr_mut() as *mut f32,
-                )
+                    1,
+                    y.ptr_mut() as *mut f32)
             };
             match want {
                 None => assert!(r.is_ok(), "i_dim={i_dim} block={block}: {r:?}"),

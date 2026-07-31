@@ -88,6 +88,7 @@ unsafe extern "C" {
         o_dim: i32,
         i_dim: i32,
         block: i32,
+        nrow: i32,
         y: *mut f32,
     ) -> i32;
 
@@ -433,9 +434,15 @@ pub unsafe fn launch_moe_reduce(
 
 /// fp8-e4m3 block-scaled GEMV `y = W·x` (attention/dense projections).
 ///
+/// `nrow` token rows (1 or 2) share ONE read of the weights: `x[r·i_dim + i]` →
+/// `y[r·o_dim + o]`. That read is the cost — the attention projections are 165 MB of fp8
+/// per layer against a 24 KB `x` — so a batched verify pass is where this earns its
+/// keep. At `nrow == 1` both indices are the single-row ones and nothing changes.
+///
 /// # Safety
-/// Async device pointers live until the next [`device_sync`]: `x` (`i_dim` f32),
-/// `packed` (`o_dim·i_dim` bytes), `scale` (block-scale f32), `y` (`o_dim` f32).
+/// Async device pointers live until the next [`device_sync`]: `x` (`nrow·i_dim` f32),
+/// `packed` (`o_dim·i_dim` bytes), `scale` (block-scale f32), `y` (`nrow·o_dim` f32).
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn launch_gemv_fp8(
     x: *const f32,
     packed: *const u8,
@@ -443,6 +450,7 @@ pub unsafe fn launch_gemv_fp8(
     o_dim: usize,
     i_dim: usize,
     block: usize,
+    nrow: usize,
     y: *mut f32,
 ) -> Result<()> {
     // SAFETY: caller's pointer contract.
@@ -454,6 +462,7 @@ pub unsafe fn launch_gemv_fp8(
             o_dim as i32,
             i_dim as i32,
             block as i32,
+            nrow as i32,
             y,
         )
     };
