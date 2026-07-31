@@ -16,7 +16,7 @@
 //! The whole module is empty without a backend feature — there is no device to
 //! allocate on in a CPU-only dev build. `rocm` and `vulkan` each supply the same
 //! four names (`mem_info`, `DeviceTier`, `DeviceBuf`, `VmmBuf`) so everything above
-//! `crate::device::` reads identically either way; the Vulkan half lives in
+//! `crate::memory::device::` reads identically either way; the Vulkan half lives in
 //! `vktier` and differs in exactly one respect, which is the reason it is not a
 //! mechanical transliteration: a host pointer and a device address are two unrelated
 //! numbers there (docs/VULKAN.md, "Host pointer != device address").
@@ -30,7 +30,7 @@
 /// this replaces had drifted in their OOM message and, more to the point, only one of
 /// them was covered by a test for a ragged length.
 ///
-/// `pad` is 1 under HIP (byte reads, no word hazard) and [`crate::vk::WORD`] under
+/// `pad` is 1 under HIP (byte reads, no word hazard) and [`crate::backend::vk::WORD`] under
 /// Vulkan, whose shaders read the slab a `uint` at a time. Returns the offset; the caller
 /// advances nothing itself.
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
@@ -390,7 +390,7 @@ mod tier {
         /// (a) the dispatch packet's system-scope ACQUIRE invalidating the GPU caches
         /// before the reading kernel, and (b) the read's `Signal` (armed on the fetch
         /// stream after [`Streamer::reap`] enqueued its copy) happening-before that
-        /// launch, plus the end-of-layer [`crate::hip::device_sync`] fencing slot
+        /// launch, plus the end-of-layer [`crate::backend::hip::device_sync`] fencing slot
         /// reuse. No CPU store fence is involved on this path.
         ///
         /// Verified CPU->GPU coherent on this APU (docs/probes/vmm_probe.cpp, incl.
@@ -423,7 +423,7 @@ mod tier {
 #[cfg(feature = "vulkan")]
 pub use vktier::{DeviceBuf, DeviceTier, VmmBuf, mem_info};
 
-/// The same four names over Vulkan. Every allocation is a [`crate::vk::Buf`] — one
+/// The same four names over Vulkan. Every allocation is a [`crate::backend::vk::Buf`] — one
 /// `VkBuffer` on its own `DEVICE_LOCAL | HOST_VISIBLE` allocation, permanently mapped
 /// — which is the Vulkan spelling of what `kernels/vmm.hip` gives the HIP side, so the
 /// shapes above (bump-allocated resident slab, rewritten per-token buffer) carry over
@@ -435,14 +435,14 @@ pub use vktier::{DeviceBuf, DeviceTier, VmmBuf, mem_info};
 /// `DeviceBuf`'s `copy_*` were already explicit transfers and need no change at all.
 #[cfg(feature = "vulkan")]
 mod vktier {
-    use crate::vk::Buf;
+    use crate::backend::vk::Buf;
     use anyhow::{Result, ensure};
 
     /// Free device memory and total, in bytes. Live free figure via
-    /// VK_EXT_memory_budget — see [`crate::vk::Gpu::mem_info`] for what happens when
+    /// VK_EXT_memory_budget — see [`crate::backend::vk::Gpu::mem_info`] for what happens when
     /// the extension is absent.
     pub fn mem_info() -> Result<(usize, usize)> {
-        Ok(crate::vk::gpu()?.mem_info())
+        Ok(crate::backend::vk::gpu()?.mem_info())
     }
 
     /// A resident device slab with a bump cursor. Weights placed into it stay resident
@@ -493,7 +493,7 @@ mod vktier {
         /// startup, and means a caller cannot end up holding a device address for bytes
         /// that were never written.
         ///
-        /// The cursor advances by `bytes.len()` rounded up to [`crate::vk::WORD`].
+        /// The cursor advances by `bytes.len()` rounded up to [`crate::backend::vk::WORD`].
         ///
         /// BELT, NOT BRACES — and the earlier version of this comment overstated it.
         /// It claimed the padding is what stops one placement's 32-bit read reaching
@@ -527,7 +527,7 @@ mod vktier {
                 &mut self.used,
                 self.capacity,
                 bytes.len(),
-                crate::vk::WORD,
+                crate::backend::vk::WORD,
             )?;
             self.slab.write_at(off, bytes)?;
             Ok((self.slab.ptr() as usize + off) as *mut u8)
@@ -560,7 +560,7 @@ mod vktier {
     ///
     /// The `copy_out*` family reads the mapping directly rather than issuing a
     /// `vkCmdCopyBuffer`, so unlike `hipMemcpy` it does NOT synchronise: call
-    /// [`crate::vk::device_sync`] first if a kernel wrote the bytes you are reading.
+    /// [`crate::backend::vk::device_sync`] first if a kernel wrote the bytes you are reading.
     pub struct DeviceBuf {
         buf: Buf,
         len: usize,
@@ -586,7 +586,7 @@ mod vktier {
             // turning a write-after-read hazard into wrong data. `gpu.rs:843` (descs_vq
             // / wexpert_buf) depends on the blocking behaviour and has no device_sync
             // of its own.
-            crate::vk::device_sync()?;
+            crate::backend::vk::device_sync()?;
             // `write_at` already bounds-checks, and its message names the offset,
             // length and capacity.
             self.buf.write_at(off, bytes)
@@ -605,7 +605,7 @@ mod vktier {
         /// For partially-written buffers — e.g. the indexer's score slab, sized to
         /// max_ctx but holding only `nt` scores this step.
         pub fn copy_out_prefix(&self, out: &mut Vec<u8>, len: usize) -> Result<()> {
-            crate::vk::device_sync()?;
+            crate::backend::vk::device_sync()?;
             self.buf.read_into(out, len)
         }
 
@@ -632,7 +632,7 @@ mod vktier {
         /// from a bare address would exist purely to serve a diagnostic. It is here now for
         /// one reason the earlier note did not weigh: without it `--features vulkan,trace`
         /// does not COMPILE, and a feature combination that cannot be built is worse than a
-        /// registry lookup nobody times. `crate::vk::read_raw` carries the argument in full.
+        /// registry lookup nobody times. `crate::backend::vk::read_raw` carries the argument in full.
         ///
         /// `trace`-only, so it is never on the decode path.
         ///
@@ -644,9 +644,9 @@ mod vktier {
             // Reads the host mapping, which is not ordered against a recorded dispatch —
             // hence the sync, matching what the blocking `hipMemcpy` gives the HIP twin for
             // free. Every other `copy_out*` here does the same for the same reason.
-            crate::vk::device_sync()?;
+            crate::backend::vk::device_sync()?;
             // SAFETY: the caller's contract, forwarded.
-            unsafe { crate::vk::read_raw(src, len, out) }
+            unsafe { crate::backend::vk::read_raw(src, len, out) }
         }
 
         pub fn ptr(&self) -> *const u8 {
@@ -662,7 +662,7 @@ mod vktier {
     ///
     /// Where the HIP `VmmBuf` hands out ONE pointer that `pin.rs` uses simultaneously as
     /// the io_uring O_DIRECT DMA target and as the base for every expert descriptor's
-    /// six device pointers (`ArenaPool::ptr`, `src/pin.rs`), those are two numbers here
+    /// six device pointers (`ArenaPool::ptr`, `src/memory/pin.rs`), those are two numbers here
     /// and this type must hand them out separately — see docs/VULKAN.md, "Host pointer
     /// != device address". [`VmmBuf::ptr`] is the device base, for descriptor
     /// arithmetic, [`VmmBuf::host_mut`] is the DMA target, and callers must say which
@@ -683,13 +683,13 @@ mod vktier {
             // anything legible, so it is checked here instead of assumed.
             //
             // The other half of the requirement, the slot STRIDE, is VQ_ALIGN and is
-            // enforced by the arena; see `crate::format` and `slot_span` in pin.rs.
+            // enforced by the arena; see `crate::artifact::format` and `slot_span` in pin.rs.
             let base = buf.host_mut() as usize;
             ensure!(
-                base.is_multiple_of(crate::vk::O_DIRECT_ALIGN),
+                base.is_multiple_of(crate::backend::vk::O_DIRECT_ALIGN),
                 "mapped base {base:#x} is not {}-byte aligned, so io_uring O_DIRECT \
                  reads into the routed pool would fail with EINVAL",
-                crate::vk::O_DIRECT_ALIGN
+                crate::backend::vk::O_DIRECT_ALIGN
             );
             Ok(Self { buf })
         }

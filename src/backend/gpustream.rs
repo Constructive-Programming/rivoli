@@ -213,13 +213,6 @@ impl Signal {
         Ok(())
     }
 
-    /// Non-blocking readiness probe. Used by the speculative prefetcher to ask "have the
-    /// bytes landed yet?" without awaiting — a `false` is always safe (the caller keeps
-    /// the slot pinned one more batch), so the race is benign in the only direction it
-    /// can go: this can never report ready before the resolver stored `true`.
-    pub fn is_ready(&self) -> bool {
-        self.0.done.load(Ordering::Acquire)
-    }
 
     /// Force-resolve from the resolver side without a stream (the reaper's error
     /// path, so awaiters never hang). Idempotent.

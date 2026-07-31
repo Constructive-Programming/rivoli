@@ -10,10 +10,10 @@
 //! reason the surface below is wider than a list of launchers:
 //!
 //! - **The stream/event types are part of the boundary, not incidental.** `gpu.rs` used to
-//!   import `crate::gpustream::{HipEvent, HipStream, Signal, stream_signal}` directly, and
+//!   import `crate::backend::gpustream::{HipEvent, HipStream, Signal, stream_signal}` directly, and
 //!   `HipStream` has no Vulkan analogue as such. They are re-exported here under
 //!   BACKEND-NEUTRAL names — [`Stream`], [`Event`] — so no module above this one spells a
-//!   backend into a type name. `src/vkstream.rs` is the Vulkan side.
+//!   backend into a type name. `src/backend/vkstream.rs` is the Vulkan side.
 //! - **The two backends do not agree on what a device pointer is.** Under HIP one number
 //!   is both a host and a device address; under Vulkan they are unrelated. That asymmetry
 //!   is NOT hidden here — it cannot be. `device.rs`'s `VmmBuf` hands out both bases and
@@ -69,18 +69,29 @@ compile_error!(
 // `compile_error!` for the neither case would fire on `cargo test` and break the very
 // builds that keep the shared code honest.
 
+// The two implementations live under this module (`src/backend/`) rather than beside it,
+// so the waist and the things it selects between are one subtree.
+#[cfg(feature = "rocm")]
+pub mod gpustream;
+#[cfg(feature = "rocm")]
+pub mod hip;
+#[cfg(feature = "vulkan")]
+pub mod vk;
+#[cfg(feature = "vulkan")]
+pub mod vkstream;
+
 #[cfg(all(feature = "rocm", not(feature = "vulkan")))]
 mod imp {
-    pub use crate::gpustream::{
+    pub use crate::backend::gpustream::{
         HipEvent as Event, HipStream as Stream, Signal, Timeline, stream_signal,
     };
-    pub use crate::hip::*;
+    pub use crate::backend::hip::*;
 }
 
 #[cfg(all(feature = "vulkan", not(feature = "rocm")))]
 mod imp {
-    pub use crate::vk::*;
-    pub use crate::vkstream::{Event, Stream, stream_signal};
+    pub use crate::backend::vk::*;
+    pub use crate::backend::vkstream::{Event, Stream, stream_signal};
 }
 
 pub use imp::*;

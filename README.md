@@ -139,9 +139,11 @@ cargo run --release --features rocm -- <model-dir> -bench 256 --mode hybrid --ma
 Useful flags: `--max-mem <GiB>` (device budget, literal; default `free − 16 GiB`),
 `--direct-vmm-dma` (raw DMA over the default pinned bounce), `--attn
 auto|dense|dsa|streaming|misa`, `--trace <path>` (dump the routed-expert access
-trace for the offline `replay` sim), `--no-mtp` (turn off speculative decode, which is
-on by default whenever the artifact carries the MTP head — today that means `--mode
-int3-vq` only; see `MODES.md`). The hybrid hot/cold split has no flag — it
+trace for the offline `replay` sim), `--no-mtp` (turn off speculative decode, which is on by
+default whenever the artifact carries the MTP head — **every mode carries one** since
+2026-07-31, though an artifact converted before then needs `bin/fp8_to_i4` re-run to emit
+`L78.i4`), `--mtp-min-conf` (the confidence gate that makes speculation pay — default 0.8,
+**1.108×**; `0` disables it and costs you ~15%). The hybrid hot/cold split has no flag — it
 self-sizes with the byte-arena pool.
 `rivoli --help` lists every flag with its default and its legal values (`-bench` is
 accepted alongside `--bench`, so every command line recorded in benchmarks.md still runs).

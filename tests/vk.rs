@@ -39,10 +39,10 @@
 #![cfg(feature = "vulkan")]
 #![allow(clippy::expect_used)]
 
-use rivoli::device::{DeviceBuf, DeviceTier};
-use rivoli::quant::{matvec_fp8, matvec_i8};
+use rivoli::memory::device::{DeviceBuf, DeviceTier};
+use rivoli::artifact::quant::{matvec_fp8, matvec_i8};
 use rivoli::math::{E4M3_BLOCK, E4M3_MAX, e4m3_to_f32, f32_to_bf16, f32_to_e4m3, silu};
-use rivoli::vk::{
+use rivoli::backend::vk::{
     Buf, ExpertDesc, ROWS_PER_BLOCK, VALIDATION_ERRORS, device_sync, fill_u32, gpu,
     launch_append_kv, launch_argmax,
     launch_embed_i8_row, launch_flag_nonfinite, launch_gather_rope, launch_gemv_f32,
@@ -510,8 +510,8 @@ fn timeline_signal_resolves_and_latency() {
 /// path in the reaper depends on both, so awaiters never hang.
 #[test]
 fn signal_ready_and_resolve_are_immediate() {
-    block_on(rivoli::vk::Signal::ready());
-    let s = rivoli::vk::Signal::pending();
+    block_on(rivoli::backend::vk::Signal::ready());
+    let s = rivoli::backend::vk::Signal::pending();
     s.resolve();
     s.resolve(); // idempotent
     block_on(s);
@@ -543,9 +543,9 @@ fn a_signal_covers_recorded_work_without_a_device_sync() {
     // `hipMemcpyAsync` on the fetch stream; here it is `vkCmdCopyBuffer`.
     // SAFETY: both mappings are live, 16 bytes each, distinct allocations.
     unsafe {
-        rivoli::vk::copy_h2d_async(y.host_mut(), x.host_mut(), 16).expect("async copy");
+        rivoli::backend::vk::copy_h2d_async(y.host_mut(), x.host_mut(), 16).expect("async copy");
     }
-    let sig = rivoli::vk::Signal::pending();
+    let sig = rivoli::backend::vk::Signal::pending();
     sig.arm_on(&fetch).expect("arm on fetch");
     block_on(sig);
     let got = f32v(&{
@@ -587,9 +587,9 @@ fn a_moe_dispatch_sees_what_the_fetch_queue_wrote() {
     let moe = rivoli::backend::Stream::compute().expect("compute stream");
     // SAFETY: live mappings, N*E*4 bytes each, distinct allocations.
     unsafe {
-        rivoli::vk::copy_h2d_async(staged.host_mut(), src.host_mut(), N * E * 4).expect("copy");
+        rivoli::backend::vk::copy_h2d_async(staged.host_mut(), src.host_mut(), N * E * 4).expect("copy");
     }
-    let sig = rivoli::vk::Signal::pending();
+    let sig = rivoli::backend::vk::Signal::pending();
     sig.arm_on(&fetch).expect("arm");
     block_on(sig);
     // Now a dispatch on the MoE queue reads those bytes: out[o] = Σ_e staged[e][o] = 6.
@@ -2796,7 +2796,7 @@ fn run_attend(
     let (lb, sb, kb) = (dev(lc8), dev(&f32b(lscale)), dev(&rcb));
     let mut out = poison(h * kvl * 4 + GUARD);
     let mut scratch = with_scratch.then(|| {
-        Buf::new(rivoli::vk::attend_scratch_floats(h, kvl) * 4).expect("scratch")
+        Buf::new(rivoli::backend::vk::attend_scratch_floats(h, kvl) * 4).expect("scratch")
     });
     let pp = scratch
         .as_mut()
@@ -3084,7 +3084,7 @@ fn mla_guards_reject_degenerate_arguments() {
 // tranche: the person who wrote these shaders cannot also write their reference.
 // ---------------------------------------------------------------------------
 
-use rivoli::quant::{VQ_DIM, VQ_GROUP, VQ_INDEX_BITS, vq_groups, vq_row_bytes};
+use rivoli::artifact::quant::{VQ_DIM, VQ_GROUP, VQ_INDEX_BITS, vq_groups, vq_row_bytes};
 
 /// Subvectors sharing one bf16 group scale — `VQ_SUBS_PER_GROUP` in common.hpp.
 const VQ_SUBS: usize = VQ_GROUP / VQ_DIM;
@@ -3364,7 +3364,7 @@ fn moe_vq_matches_the_host_oracles() {
             inter,
             0,
             e_count,
-            db.ptr() as *const rivoli::vk::ExpertDesc,
+            db.ptr() as *const rivoli::backend::vk::ExpertDesc,
             gcb.ptr() as *const u16,
             ucb.ptr() as *const u16,
             dcb.ptr() as *const u16,
@@ -3433,7 +3433,7 @@ fn moe_guards_reject_degenerate_arguments() {
         let mo = |hidden: usize, inter: usize, e_count: usize| {
             launch_moe_expert_range(
                 p as *const f32, hidden, inter, 0, e_count,
-                p as *const rivoli::vk::ExpertDesc, p as *const u16, p as *const u16,
+                p as *const rivoli::backend::vk::ExpertDesc, p as *const u16, p as *const u16,
                 p as *const u16, p as *const f32, q as *mut f32, q as *mut u64, 1,
                 std::ptr::null_mut(),
             )
@@ -3580,31 +3580,31 @@ fn read_raw_resolves_a_device_address_at_an_offset() {
     // SAFETY: `b` is live and holds 1024 bytes; every range below is inside it, and no
     // kernel is writing (nothing was launched).
     unsafe {
-        rivoli::vk::read_raw(b.ptr(), bytes.len(), &mut out).expect("whole buffer");
+        rivoli::backend::vk::read_raw(b.ptr(), bytes.len(), &mut out).expect("whole buffer");
         assert_bytes(&bytes, &out, "read_raw whole");
 
         let off = 517usize; // not word-aligned, so a word-granular lookup would show
         let len = 300usize;
-        rivoli::vk::read_raw(b.ptr().add(off), len, &mut out).expect("sub-range");
+        rivoli::backend::vk::read_raw(b.ptr().add(off), len, &mut out).expect("sub-range");
         assert_bytes(&bytes[off..off + len], &out, "read_raw at offset");
     }
 
     // SAFETY: each call is rejected on its arguments; nothing is dereferenced.
     unsafe {
         assert!(
-            rivoli::vk::read_raw(b.ptr(), 1025, &mut out).is_err(),
+            rivoli::backend::vk::read_raw(b.ptr(), 1025, &mut out).is_err(),
             "one byte past the end must be rejected"
         );
         assert!(
-            rivoli::vk::read_raw(b.ptr().add(1024), 1, &mut out).is_err(),
+            rivoli::backend::vk::read_raw(b.ptr().add(1024), 1, &mut out).is_err(),
             "an address at the end must be rejected"
         );
         assert!(
-            rivoli::vk::read_raw(b.ptr(), 0, &mut out).is_err(),
+            rivoli::backend::vk::read_raw(b.ptr(), 0, &mut out).is_err(),
             "a zero-length read must be rejected"
         );
         assert!(
-            rivoli::vk::read_raw(std::ptr::null(), 4, &mut out).is_err(),
+            rivoli::backend::vk::read_raw(std::ptr::null(), 4, &mut out).is_err(),
             "an address in no live Buf must be rejected"
         );
     }
@@ -3771,7 +3771,7 @@ fn deferred_launchers_refuse_rather_than_no_op() {
 }
 
 /// **INV-4 (Vulkan half): a wait may be enqueued BEFORE its producer exists, and still
-/// waits.** The rocm half lives in `src/gpustream.rs`; both are required, because the two
+/// waits.** The rocm half lives in `src/backend/gpustream.rs`; both are required, because the two
 /// backends reach the property by different mechanisms and only a per-backend test can show
 /// each one actually has it.
 ///

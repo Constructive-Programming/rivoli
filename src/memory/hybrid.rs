@@ -1,8 +1,8 @@
 //! Byte-aware routed-expert policies for the format hybrid. Unlike the single-format
-//! [`cache`](crate::cache) policies (which count uniform slots), these manage TWO tiers
+//! [`cache`](crate::memory::cache) policies (which count uniform slots), these manage TWO tiers
 //! of DIFFERENT byte sizes — COLD (int3-VQ) and HOT (int4) — against a byte budget, so
 //! the split between them FLOATS with the workload (and, for ARC, with the adaptive
-//! `p`). The pin backs them with the two-ended [`arena`](crate::arena); this module is
+//! `p`). The pin backs them with the two-ended [`arena`](crate::memory::arena); this module is
 //! pure bookkeeping (host-testable).
 //!
 //! Contract: `get` reports a hit and keeps the key in its tier (a resident expert never
@@ -11,7 +11,7 @@
 //! budget, returning every victim. The pin frees each victim's slot, then places the new
 //! one (compacting the arena as needed).
 
-use crate::cache::{OrderedSet, Tier};
+use crate::memory::cache::{OrderedSet, Tier};
 use std::collections::{HashMap, HashSet};
 
 /// The result of admitting a miss: which tier the key landed in, and every resident key
@@ -19,114 +19,6 @@ use std::collections::{HashMap, HashSet};
 pub struct Admission {
     pub tier: Tier,
     pub evicted: Vec<u32>,
-}
-
-/// A LOOKA look-ahead prediction: layer `L`'s router run against layer `L+horizon`'s gate,
-/// saying "this key will probably be wanted `horizon` layers from now".
-///
-/// **A hint is NOT an access, and the distinction is the whole design.** Measured precision
-/// by rank is 99/96/93/87/78/67/55/42% at L+1 (docs/CACHE_PILOT.md), so a hint is evidence,
-/// not fact. Every policy therefore applies exactly ONE rule — *hints veto eviction, they
-/// never promote* — because promotion on a guess corrupts the very signal each policy exists
-/// to track: 2Q's whole point is that a single access does not promote (a prediction is
-/// weaker than an access), and ARC's `p` adapts on real hits (feeding it 78%-precision
-/// guesses degrades the adaptivity it exists for).
-///
-/// Because routing no longer consults residency (`top-m` is gone), hints can only change
-/// WHICH experts stay cached, never WHICH are selected — so enabling them is
-/// **output-bit-identical by construction**, and that is the acceptance test.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Hint {
-    pub key: u32,
-    /// Layers ahead this prediction is for; also its time-to-live in layers.
-    pub horizon: u8,
-    /// 0 = the router's top pick. Lower is more trustworthy, and it is the tiebreak when
-    /// hints exceed the cap.
-    pub rank: u8,
-}
-
-/// Ceiling on how much of a tier hint-vetoes may protect, in percent of its byte budget.
-/// Without it a wide horizon pins so much that eviction starves and `admit` fails outright —
-/// a self-inflicted OOM from an *advisory* signal. Over the cap the highest-`rank` (least
-/// trustworthy) hints are dropped first.
-pub const HINT_CAP_PCT: usize = 25;
-
-/// The hint bookkeeping, shared by every policy so the cap and the decay exist exactly ONCE.
-///
-/// Each policy embedding this gets identical semantics for free; a policy hand-rolling its
-/// own would be free to quietly skip the guards, which is how "capped and decaying" becomes
-/// "neither" over a few refactors.
-#[derive(Default)]
-pub struct HintSet {
-    /// key -> layers remaining before this veto expires.
-    live: std::collections::HashMap<u32, u8>,
-    /// Mirror of `live`'s keys, because eviction asks this question on every victim scan and
-    /// wants a `HashSet` without rebuilding one.
-    keys: std::collections::HashSet<u32>,
-    /// Max keys allowed to hold a veto at once (0 = uncapped, used only by tests).
-    cap: usize,
-    /// Diagnostics: hints offered, and how many named an already-resident key.
-    pub seen: u64,
-    pub seen_resident: u64,
-}
-
-impl HintSet {
-    /// `cap` is derived from the tier's slot count, not from the hint count — the resource
-    /// being protected is eviction headroom.
-    pub fn with_cap(cap: usize) -> Self {
-        Self { cap, ..Default::default() }
-    }
-
-    /// Merge in a batch of predictions. Rank order decides who survives the cap: rank 0 is
-    /// the router's top pick (measured 99% precision), rank 7 is a coin flip.
-    pub fn insert(&mut self, hints: &[Hint]) {
-        let mut sorted: Vec<&Hint> = hints.iter().collect();
-        sorted.sort_by_key(|h| h.rank);
-        for h in sorted {
-            // Refresh an existing veto to the longer horizon rather than double-counting.
-            if let Some(ttl) = self.live.get_mut(&h.key) {
-                *ttl = (*ttl).max(h.horizon.max(1));
-                continue;
-            }
-            if self.cap != 0 && self.live.len() >= self.cap {
-                break; // over cap: the remaining (higher-rank, less trustworthy) hints drop
-            }
-            self.live.insert(h.key, h.horizon.max(1));
-            self.keys.insert(h.key);
-        }
-    }
-
-    /// One layer elapsed. A hint that never came true must decay, or the veto set only ever
-    /// grows and eviction is permanently starved by predictions about a layer long past.
-    pub fn tick(&mut self) {
-        self.live.retain(|_, ttl| {
-            *ttl -= 1;
-            *ttl > 0
-        });
-        // `keys` mirrors `live`'s key set. Letting the two drift means eviction keeps
-        // skipping a key nothing remembers, which never surfaces as an error — only as a
-        // quietly worse hit rate — so it is re-derived here rather than patched in parallel.
-        self.keys.retain(|k| self.live.contains_key(k));
-    }
-
-    /// Drop a veto once the key is genuinely resident-and-used; keeps the cap for live
-    /// predictions rather than for confirmed ones the policy already tracks.
-    pub fn confirm(&mut self, k: u32) {
-        self.live.remove(&k);
-        self.keys.remove(&k);
-    }
-
-    pub fn keys(&self) -> &std::collections::HashSet<u32> {
-        &self.keys
-    }
-
-    pub fn len(&self) -> usize {
-        self.live.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.live.is_empty()
-    }
 }
 
 pub trait HybridPolicy {
@@ -142,30 +34,6 @@ pub trait HybridPolicy {
     /// the pin can't resolve its slot ("expert not resident after alloc"). Touching to
     /// MRU is NOT enough: a big/skewed batch can drain a whole tier past the MRU end.
     fn protect(&mut self, k: u32);
-    /// Feed look-ahead predictions for upcoming layers. See [`Hint`]: these VETO EVICTION
-    /// and must never promote, admit, or touch a policy's internal adaptation state.
-    ///
-    /// Defaulted to a no-op so a policy opts in rather than silently ignoring hints while
-    /// appearing to support them. Implementations delegate to [`HintSet`], which owns the
-    /// cap and the decay — the two guards that otherwise silently do not happen.
-    fn hint(&mut self, _hints: &[Hint]) {}
-    /// Keys currently vetoed by live hints; eviction skips these. Empty unless [`hint`] is
-    /// implemented.
-    fn hinted(&self) -> &std::collections::HashSet<u32> {
-        static EMPTY: std::sync::OnceLock<std::collections::HashSet<u32>> =
-            std::sync::OnceLock::new();
-        EMPTY.get_or_init(Default::default)
-    }
-    /// Advance the hint clock one layer, expiring anything whose horizon has elapsed.
-    /// Called once per MoE layer by the pin.
-    fn tick_hints(&mut self) {}
-    /// `(hints seen, of those already RESIDENT when hinted)`. A veto can only ever protect
-    /// a resident key — hinting an absent one is a no-op, since eviction cannot take what
-    /// is not there. If these two numbers are far apart the mechanism has nothing to do,
-    /// which is a different finding from "the wiring is broken" and needs a different fix.
-    fn hint_stats(&self) -> (u64, u64) {
-        (0, 0)
-    }
     /// Bytes currently resident — the pin/tests check this never exceeds the budget.
     fn resident_bytes(&self) -> usize;
 }
@@ -188,29 +56,20 @@ impl Geom {
 }
 
 /// Construct a byte-aware hybrid policy. `split` is 2Q's Kin/Kout (ignored by lru/arc);
-impl Geom {
-    /// How many keys hints may veto at once: [`HINT_CAP_PCT`] of the pool's COLD-slot
-    /// capacity. Derived from the smaller stride so the cap is a bound on slots in the
-    /// worst case, and floored at 1 so a tiny test pool still admits one veto.
-    fn hint_cap(&self) -> usize {
-        ((self.budget / self.cold_stride) * HINT_CAP_PCT / 100).max(1)
-    }
-}
-
 pub fn make(
     policy: &str,
     budget: usize,
     cold_stride: usize,
     hot_stride: usize,
-    split: crate::cache::TwoQSplit,
+    split: crate::memory::cache::TwoQSplit,
 ) -> Option<Box<dyn HybridPolicy>> {
     let g = Geom { budget, cold_stride: cold_stride.max(1), hot_stride: hot_stride.max(1) };
     match policy {
         "lru" => Some(Box::new(HybridLru::new(g))),
         // Three policies, three implementations. (`top-m` was a fourth NAME over the same
-        // LRU with router substitution switched on; it was removed 2026-07-30 — the LOOKA
-        // hint layer steers eviction instead of selection and is output-neutral, which
-        // top-m was not: +3.63% ppl on int3-vq, +12.7% on int4. See docs/CACHE_ROUTE.md.)
+        // LRU with router substitution switched on; it was removed 2026-07-30 because
+        // steering EVICTION rather than SELECTION is output-neutral, which top-m was
+        // not: +3.63% ppl on int3-vq, +12.7% on int4. See docs/CACHE_ROUTE.md.)
         // This repo deleted three duplicate
         // policy families in 08db745; a copy-pasted `HybridTopM` would be that mistake
         // with a new name.
@@ -237,8 +96,6 @@ struct HybridLru {
     freq: HashMap<u32, u32>,
     accesses: u64,
     pinned: HashSet<u32>,
-    /// LOOKA eviction vetoes. Advisory: `cache::pop_lru_skip` drops them rather than fail.
-    hints: HintSet,
 }
 impl HybridLru {
     fn new(g: Geom) -> Self {
@@ -249,7 +106,6 @@ impl HybridLru {
             freq: HashMap::new(),
             accesses: 0,
             pinned: HashSet::new(),
-            hints: HintSet::with_cap(g.hint_cap()),
         }
     }
     fn bump(&mut self, k: u32) {
@@ -269,16 +125,16 @@ impl HybridLru {
     /// HOT tier), which is fine here; a true global LRU would need a shared clock.
     fn evict_lru(&mut self) -> Option<u32> {
         // Skip keys pinned this batch (peek AND pop), so a same-batch key is never evicted.
-        match (self.cold.peek_lru_skip(&self.pinned, self.hints.keys()), self.hot.peek_lru_skip(&self.pinned, self.hints.keys())) {
+        match (self.cold.peek_lru_skip(&self.pinned), self.hot.peek_lru_skip(&self.pinned)) {
             (Some((tc, _)), Some((th, _))) => {
                 if tc <= th {
-                    self.cold.pop_lru_skip(&self.pinned, self.hints.keys())
+                    self.cold.pop_lru_skip(&self.pinned)
                 } else {
-                    self.hot.pop_lru_skip(&self.pinned, self.hints.keys())
+                    self.hot.pop_lru_skip(&self.pinned)
                 }
             }
-            (Some(_), None) => self.cold.pop_lru_skip(&self.pinned, self.hints.keys()),
-            (None, Some(_)) => self.hot.pop_lru_skip(&self.pinned, self.hints.keys()),
+            (Some(_), None) => self.cold.pop_lru_skip(&self.pinned),
+            (None, Some(_)) => self.hot.pop_lru_skip(&self.pinned),
             (None, None) => None,
         }
     }
@@ -288,10 +144,6 @@ impl HybridPolicy for HybridLru {
         self.cold.contains(k) || self.hot.contains(k)
     }
     fn get(&mut self, k: u32) -> bool {
-        // A veto exists to protect a key UNTIL it is used. Once it is, the policy
-        // tracks it properly and holding the veto only consumes cap that a live
-        // prediction could use.
-        self.hints.confirm(k);
         self.bump(k);
         if self.cold.contains(k) {
             self.cold.touch(k);
@@ -304,7 +156,6 @@ impl HybridPolicy for HybridLru {
         }
     }
     fn admit(&mut self, k: u32) -> Admission {
-        self.hints.confirm(k);
         let tier = if self.freq.get(&k).copied().unwrap_or(0) >= LRU_HOT_THRESHOLD {
             Tier::Hot
         } else {
@@ -331,24 +182,6 @@ impl HybridPolicy for HybridLru {
         self.pinned.insert(k);
     }
 
-    fn hint(&mut self, hints: &[Hint]) {
-        for h in hints {
-            self.hints.seen += 1;
-            if self.contains(h.key) {
-                self.hints.seen_resident += 1;
-            }
-        }
-        self.hints.insert(hints);
-    }
-    fn hint_stats(&self) -> (u64, u64) {
-        (self.hints.seen, self.hints.seen_resident)
-    }
-    fn hinted(&self) -> &HashSet<u32> {
-        self.hints.keys()
-    }
-    fn tick_hints(&mut self) {
-        self.hints.tick();
-    }
     fn resident_bytes(&self) -> usize {
         self.cold.len() * self.g.cold_stride + self.hot.len() * self.g.hot_stride
     }
@@ -366,11 +199,9 @@ struct HybridTwoQ {
     am: OrderedSet,
     a1out: OrderedSet,
     pinned: HashSet<u32>,
-    /// LOOKA eviction vetoes. Advisory: `cache::pop_lru_skip` drops them rather than fail.
-    hints: HintSet,
 }
 impl HybridTwoQ {
-    fn new(g: Geom, split: crate::cache::TwoQSplit) -> Self {
+    fn new(g: Geom, split: crate::memory::cache::TwoQSplit) -> Self {
         let kin_bytes = (g.budget * split.kin_pct() as usize / 100).max(g.cold_stride);
         let slots = g.budget / g.cold_stride.min(g.hot_stride);
         let kout = (slots * split.kout_pct() as usize / 100).max(1);
@@ -382,14 +213,13 @@ impl HybridTwoQ {
             am: OrderedSet::default(),
             a1out: OrderedSet::default(),
             pinned: HashSet::new(),
-            hints: HintSet::with_cap(g.hint_cap()),
         }
     }
     fn a1in_bytes(&self) -> usize {
         self.a1in.len() * self.g.cold_stride
     }
     fn trim_a1in(&mut self) -> Option<u32> {
-        let v = self.a1in.pop_lru_skip(&self.pinned, self.hints.keys());
+        let v = self.a1in.pop_lru_skip(&self.pinned);
         if let Some(v) = v {
             self.a1out.touch(v); // ghost is key-only (not resident) — no pin skip needed
             while self.a1out.len() > self.kout {
@@ -404,9 +234,9 @@ impl HybridTwoQ {
     /// only pinned keys left, so a pinned-heavy batch can't stall the eviction.
     fn reclaim(&mut self) -> Option<u32> {
         if self.a1in_bytes() < self.kin_bytes {
-            self.am.pop_lru_skip(&self.pinned, self.hints.keys()).or_else(|| self.trim_a1in())
+            self.am.pop_lru_skip(&self.pinned).or_else(|| self.trim_a1in())
         } else {
-            self.trim_a1in().or_else(|| self.am.pop_lru_skip(&self.pinned, self.hints.keys()))
+            self.trim_a1in().or_else(|| self.am.pop_lru_skip(&self.pinned))
         }
     }
 }
@@ -415,10 +245,6 @@ impl HybridPolicy for HybridTwoQ {
         self.am.contains(k) || self.a1in.contains(k)
     }
     fn get(&mut self, k: u32) -> bool {
-        // A veto exists to protect a key UNTIL it is used. Once it is, the policy
-        // tracks it properly and holding the veto only consumes cap that a live
-        // prediction could use.
-        self.hints.confirm(k);
         if self.am.contains(k) {
             self.am.touch(k);
             return true;
@@ -426,7 +252,6 @@ impl HybridPolicy for HybridTwoQ {
         self.a1in.contains(k) // A1in hit stays put (FIFO); ghosts are not resident
     }
     fn admit(&mut self, k: u32) -> Admission {
-        self.hints.confirm(k);
         // A second distinct access (via the ghost) promotes to Am/HOT; else A1in/COLD.
         let tier = if self.a1out.remove(k) { Tier::Hot } else { Tier::Cold };
         let mut evicted = Vec::new();
@@ -455,24 +280,6 @@ impl HybridPolicy for HybridTwoQ {
         }
     }
 
-    fn hint(&mut self, hints: &[Hint]) {
-        for h in hints {
-            self.hints.seen += 1;
-            if self.contains(h.key) {
-                self.hints.seen_resident += 1;
-            }
-        }
-        self.hints.insert(hints);
-    }
-    fn hint_stats(&self) -> (u64, u64) {
-        (self.hints.seen, self.hints.seen_resident)
-    }
-    fn hinted(&self) -> &HashSet<u32> {
-        self.hints.keys()
-    }
-    fn tick_hints(&mut self) {
-        self.hints.tick();
-    }
     fn resident_bytes(&self) -> usize {
         self.a1in.len() * self.g.cold_stride + self.am.len() * self.g.hot_stride
     }
@@ -490,8 +297,6 @@ struct HybridArc {
     b1: OrderedSet,
     b2: OrderedSet,
     pinned: HashSet<u32>,
-    /// LOOKA eviction vetoes. Advisory: `cache::pop_lru_skip` drops them rather than fail.
-    hints: HintSet,
 }
 impl HybridArc {
     fn new(g: Geom) -> Self {
@@ -503,7 +308,6 @@ impl HybridArc {
             b1: OrderedSet::default(),
             b2: OrderedSet::default(),
             pinned: HashSet::new(),
-            hints: HintSet::with_cap(g.hint_cap()),
         }
     }
     fn t1_bytes(&self) -> usize {
@@ -517,14 +321,14 @@ impl HybridArc {
         let t1b = self.t1_bytes();
         let prefer_cold = t1b > self.p || (in_b2 && t1b == self.p);
         let (v, from_cold) = if prefer_cold {
-            match self.t1.pop_lru_skip(&self.pinned, self.hints.keys()) {
+            match self.t1.pop_lru_skip(&self.pinned) {
                 Some(v) => (Some(v), true),
-                None => (self.t2.pop_lru_skip(&self.pinned, self.hints.keys()), false),
+                None => (self.t2.pop_lru_skip(&self.pinned), false),
             }
         } else {
-            match self.t2.pop_lru_skip(&self.pinned, self.hints.keys()) {
+            match self.t2.pop_lru_skip(&self.pinned) {
                 Some(v) => (Some(v), false),
-                None => (self.t1.pop_lru_skip(&self.pinned, self.hints.keys()), true),
+                None => (self.t1.pop_lru_skip(&self.pinned), true),
             }
         };
         if let Some(v) = v {
@@ -552,10 +356,6 @@ impl HybridPolicy for HybridArc {
         self.t1.contains(k) || self.t2.contains(k)
     }
     fn get(&mut self, k: u32) -> bool {
-        // A veto exists to protect a key UNTIL it is used. Once it is, the policy
-        // tracks it properly and holding the veto only consumes cap that a live
-        // prediction could use.
-        self.hints.confirm(k);
         // A hit STAYS in its tier (no slab migration); refresh recency in-place.
         if self.t1.contains(k) {
             self.t1.touch(k);
@@ -568,7 +368,6 @@ impl HybridPolicy for HybridArc {
         }
     }
     fn admit(&mut self, k: u32) -> Admission {
-        self.hints.confirm(k);
         let mut evicted = Vec::new();
         // A ghost hit is a returning key → promote to T2/HOT and adapt `p`.
         let tier = if self.b1.remove(k) {
@@ -601,24 +400,6 @@ impl HybridPolicy for HybridArc {
         self.pinned.insert(k);
     }
 
-    fn hint(&mut self, hints: &[Hint]) {
-        for h in hints {
-            self.hints.seen += 1;
-            if self.contains(h.key) {
-                self.hints.seen_resident += 1;
-            }
-        }
-        self.hints.insert(hints);
-    }
-    fn hint_stats(&self) -> (u64, u64) {
-        (self.hints.seen, self.hints.seen_resident)
-    }
-    fn hinted(&self) -> &HashSet<u32> {
-        self.hints.keys()
-    }
-    fn tick_hints(&mut self) {
-        self.hints.tick();
-    }
     fn resident_bytes(&self) -> usize {
         self.t1.len() * self.g.cold_stride + self.t2.len() * self.g.hot_stride
     }
@@ -628,7 +409,7 @@ impl HybridPolicy for HybridArc {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
-    use crate::cache::TwoQSplit;
+    use crate::memory::cache::TwoQSplit;
 
     // The spec harness: drive a policy through a workload two-pass-per-key (get, then
     // admit on miss) while an independent tally tracks every resident key's tier. After
@@ -818,114 +599,3 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod hint_tests {
-    use super::*;
-    use crate::cache::TwoQSplit;
-
-    const POLICIES: [&str; 3] = ["lru", "2q", "arc"];
-
-    fn pol(name: &str, budget: usize) -> Box<dyn HybridPolicy> {
-        make(name, budget, 1, 1, TwoQSplit::default()).unwrap()
-    }
-
-    /// **INV-2: a hint never promotes, admits, or otherwise leaves residue in policy
-    /// state.** This is the property that separates the hint layer from the `top-m` it
-    /// replaced: a hint may only delay an eviction, never change what the policy believes.
-    ///
-    /// Observing "no promotion" directly would mean reaching into each policy's private
-    /// segments (2Q's A1in/Am, ARC's T1/T2/p), which the trait deliberately does not
-    /// expose. So it is observed behaviourally and end-to-end: run one policy that saw a
-    /// burst of hints (then let them expire) and one that never did, through an IDENTICAL
-    /// access sequence, and require the eviction order to match exactly. Any promotion,
-    /// admission, or `p` nudge would reorder something.
-    #[test]
-    fn inv_2_hints_leave_no_residue_in_policy_state() {
-        for name in POLICIES {
-            let (mut hinted, mut clean) = (pol(name, 8), pol(name, 8));
-            // Hint keys that are NOT resident, which is the case most likely to tempt an
-            // implementation into admitting them.
-            let hints: Vec<Hint> =
-                (100..108).map(|k| Hint { key: k, horizon: 2, rank: 0 }).collect();
-            hinted.hint(&hints);
-            for k in 100..108u32 {
-                assert!(!hinted.contains(k), "{name}: a hint must NOT admit key {k}");
-            }
-            // Expire them, so from here the two policies must be indistinguishable.
-            hinted.tick_hints();
-            hinted.tick_hints();
-            assert!(hinted.hinted().is_empty(), "{name}: hints must expire");
-
-            let (mut ev_h, mut ev_c) = (Vec::new(), Vec::new());
-            for k in 0..24u32 {
-                for (p, ev) in [(&mut hinted, &mut ev_h), (&mut clean, &mut ev_c)] {
-                    p.begin_batch();
-                    if !p.get(k % 10) {
-                        ev.extend(p.admit(k % 10).evicted);
-                    }
-                    if !p.get(k) {
-                        ev.extend(p.admit(k).evicted);
-                    }
-                }
-            }
-            assert_eq!(ev_h, ev_c, "{name}: expired hints changed the eviction order");
-            assert_eq!(hinted.resident_bytes(), clean.resident_bytes(), "{name}: bytes");
-        }
-    }
-
-    /// **INV-3: a hint can never fail an allocation.** Hints are predictions; the pin's
-    /// per-batch pins are correctness. If honouring every veto would leave no victim, the
-    /// veto is dropped — otherwise an advisory signal turns into "expert not resident after
-    /// alloc", and `HINT_CAP_PCT` silently becomes load-bearing for correctness.
-    #[test]
-    fn inv_3_hints_can_never_starve_eviction() {
-        for name in POLICIES {
-            let mut p = pol(name, 4);
-            p.begin_batch();
-            for k in 0..4u32 {
-                p.admit(k);
-            }
-            // Veto EVERY resident key, far past the cap, then force an admission.
-            let hints: Vec<Hint> =
-                (0..4u32).map(|k| Hint { key: k, horizon: 8, rank: 0 }).collect();
-            p.hint(&hints);
-            p.begin_batch();
-            let adm = p.admit(99);
-            assert!(
-                !adm.evicted.is_empty() || p.contains(99),
-                "{name}: a full pool + all-vetoed must still admit"
-            );
-            assert!(p.contains(99), "{name}: the new key must be resident");
-        }
-    }
-
-    /// The cap bounds the veto set, and rank decides who survives it — rank 0 is the
-    /// router's top pick at 99% measured precision, rank 7 is close to a coin flip.
-    #[test]
-    fn hint_cap_keeps_the_best_ranks() {
-        let mut hs = HintSet::with_cap(3);
-        let hints: Vec<Hint> = (0..8u32)
-            .map(|i| Hint { key: 100 + i, horizon: 2, rank: (7 - i) as u8 })
-            .collect();
-        hs.insert(&hints);
-        assert_eq!(hs.len(), 3, "cap must bound the veto set");
-        // rank 0..2 are keys 107, 106, 105.
-        for k in [107u32, 106, 105] {
-            assert!(hs.keys().contains(&k), "the best-ranked hint {k} must survive the cap");
-        }
-    }
-
-    /// Vetoes decay. Without this a hint about a layer long past pins forever and eviction
-    /// is permanently starved by stale predictions.
-    #[test]
-    fn hints_decay_after_their_horizon() {
-        let mut hs = HintSet::with_cap(0);
-        hs.insert(&[Hint { key: 1, horizon: 1, rank: 0 }, Hint { key: 2, horizon: 3, rank: 0 }]);
-        hs.tick();
-        assert!(!hs.keys().contains(&1), "a horizon-1 hint must not survive one layer");
-        assert!(hs.keys().contains(&2), "a horizon-3 hint must still be live");
-        hs.tick();
-        hs.tick();
-        assert!(hs.is_empty(), "every hint must eventually expire");
-    }
-}

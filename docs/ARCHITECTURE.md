@@ -435,8 +435,6 @@ different populations. Numbering converts "the doc drifted" into something a che
 > expert identity rather than to residency, which changes what `hybrid` *is* (its whole
 > premise is "hot experts get the better format"), so it is a design call rather than a
 > patch. No INV-n is claimed here because no invariant currently holds.
-| **INV-2** | A LOOKA hint never promotes, admits, or leaves residue in policy state; it may only delay an eviction | `hybrid.rs::inv_2_hints_leave_no_residue_in_policy_state` |
-| **INV-3** | A hint can never fail an allocation — vetoes are advisory and are dropped rather than starve eviction | `hybrid.rs::inv_3_hints_can_never_starve_eviction` |
 | **INV-4** | A device-side wait may be enqueued BEFORE its producer exists and still waits (the property `hipStreamWaitEvent` lacks) — one half per backend, since they reach it by different mechanisms | `gpustream.rs::inv_4_wait_enqueued_before_signal_still_waits`, `tests/vk.rs::inv_4_…` |
 | **INV-5** | An expert cannot be launched without enqueueing its data dependency: every descriptor carries a `Ticket` and `wait_on` is the only way to consume one | `pin.rs::inv_5_every_descriptor_carries_a_ticket` |
 
@@ -484,29 +482,46 @@ docs/INT4.md; artifacts it produced are still identifiable by their `i4_source` 
 
 ## 11. Module map
 
-- `format` — the artifact reader (manifest + `resident.safetensors` + `.vq3`/`.i4`
-  mmap/index); single source of the on-disk layout.
-- `device` — `DeviceTier`/`VmmBuf` (the resident bump slab).
-- `stream` — io_uring O_DIRECT streamer; `asyncfetch` — the reaper + per-expert `Signal`;
-  `gpustream` — the HIP-completion→future bridge.
-- `arena` — two-ended byte arena; `hybrid` — byte-aware cache policies; `cache` —
-  `OrderedSet`/`Tier`/`TwoQSplit` substrate.
-- `pin` — resident placement + the routed-expert `ArenaPool` (`submit_layer` protocol).
-- `gpu` — the async forward pass, single- or two-row (`MAXROW`, §13); `hip` — the HIP/rocm
-  FFI surface; `quant`/`math`/`model` — leaf.
-- `attn`/`indexer` — attention modes + DSA. `telemetry` — the always-on PROFILE summary.
-- `backend` — the build-time backend waist (`rocm` XOR `vulkan`, one impl chosen at compile
-  time, no vtable). It IS the seam now: `gpu`, `pin`, `asyncfetch` and `stream` import it
-  rather than `hip`. `vk`/`vkstream` — the **Vulkan compute backend**
-  (`--features vulkan`): 16 of 29 kernels, and it DECODES `--mode int3-vq --attn dense` over
-  three queues with the fetch↔compute overlap intact (97% hidden, against ROCm's 96%). Still
-  ~1.9x slower end to end, all of it MoE kernel throughput; see `docs/VULKAN.md`. Its
-  `.comp` shaders are SINGLE-ROW, so six ported launchers refuse `nrow > 1` and speculative
-  decode is ROCm-only (§13).
+**Grouped by subsystem since 2026-07-31** — `src/` was 25 flat files. Each group below is a
+module root (`src/<group>.rs`) over a directory, so the tree mirrors the sections above.
+
+- **`artifact/`** — the artifact IS the model. `format` (manifest + `resident.safetensors` +
+  `.vq3`/`.i4` mmap/index; single source of the on-disk layout), `quant` (the int3-vq / int4
+  / fp8 codecs, shared with `bin/`), `model` (hyperparameters), `tokenizer`, `config` (the
+  run configuration discovered from the machine). §7.
+- **`memory/`** — where weights live and what decides which stay. `device`
+  (`DeviceTier`/`VmmBuf`, the resident bump slab), `arena` (two-ended byte arena), `hybrid`
+  (byte-aware cache policies), `cache` (`OrderedSet`/`Tier`/`TwoQSplit` substrate), `pin`
+  (resident placement + the routed-expert `ArenaPool`, `submit_layer` protocol). §1, §6.
+- **`fetch/`** — getting cold bytes to the device without the GPU waiting. `stream`
+  (io_uring O_DIRECT streamer), `asyncfetch` (the reaper + the ticketed dataflow). §3, §4.
+- **`backend/`** — the build-time waist (`rocm` XOR `vulkan`, one impl chosen at compile
+  time, no vtable). `src/backend.rs` is the seam itself; `hip`/`gpustream` and
+  `vk`/`vkstream` are the two implementations under it. `gpu`, `memory::pin`,
+  `fetch::asyncfetch` and `fetch::stream` import the seam, never a backend directly. Vulkan
+  decodes `--mode int3-vq --attn dense` over three queues with the overlap intact (97%
+  hidden vs ROCm's 96%), ~1.9x slower end to end, all of it MoE kernel throughput; its
+  `.comp` shaders are SINGLE-ROW, so six launchers refuse `nrow > 1` and speculative decode
+  is ROCm-only (§13). See `docs/VULKAN.md`.
+- **Top level** — `gpu` (the async forward pass, single- or two-row: `MAXROW`, §13), `math`,
+  `attn`/`indexer` (attention modes + DSA), `telemetry` (the always-on PROFILE summary),
+  `watchdog`.
+- **`eval`** — teacher-forced scoring (`--ppl`), behind `--features teacher-forcing`. An
+  instrument, not an engine feature: nothing in a decode reaches it, so the module boundary
+  and the feature boundary are the same line and cannot drift apart.
 - `kernels/*.hip` — moe, mla, attn, linalg, indexer, fwd, async, vmm (HIP/rocm).
   `kernels/vk/*.comp` → SPIR-V via the `build.rs` vulkan arm (the second backend).
 - `src/bin/` — `convert`, `fp8_to_i4`, `add_indexer`, `i4_audit`, `ppl`, `replay`. (There
   is no `pack_i4` and no longer a `vq3_to_i4`; docs that reference either are stale.)
+  `ppl` needs no feature gate: it is pure host arithmetic over the `.nll` files `eval`
+  writes and never touches the engine.
+
+> **Two registry tests derive coverage from PATHS, and this move broke both.**
+> `tests/invariants.rs` listed five files and silently found none, reporting every INV-n as
+> untested; `tests/kernel_coverage.rs` read `src/vk.rs` and panicked. The first now WALKS
+> `src/` and the second panics loudly on a missing file rather than reading empty — a
+> path-derived check that degrades to "nothing to verify" is a passing test that checks
+> nothing.
 
 See `docs/PERF.md` for the performance roadmap, `MODES.md` for the format/policy matrix, and
 `benchmarks.md` for measured throughput and quality.
@@ -721,7 +736,10 @@ own 8 + shared whatever else the union dragged in. The skip is correctness, not 
 `0 * dv` with a non-finite `dv` is NaN, and `moe_fixed`'s clamp turns NaN into a FINITE
 extreme. Verified end to end: byte-identical completions at 128 and 512 tokens.
 
-### It is currently a LOSS, and the arithmetic says why
+### Ungated it is a LOSS, and the arithmetic says why
+
+*(This subsection is the ungated analysis, kept because it is what the gate below is
+reasoning against. The feature as it ships is **1.108×** — see "The confidence gate".)*
 
 Measured 0.93–0.95× (2.50 vs 2.69 tok/s at 128 tokens; 2.49 vs 2.63 at 512). The MoE is 67%
 of the pass and a batched pass launches the **union**: two rows route to ~13.5 routed + 1

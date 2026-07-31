@@ -25,7 +25,7 @@ tell you mostly about options that were rejected.
 |---|---|
 | quality ladder | int4 **5.120** (best, slowest) > hybrid **5.189** (best overall, the default) > int3-vq **5.275** |
 | speculative decode | on by default, **1.108×** via `--mtp-min-conf 0.8` (ungated it is 0.93–0.95×, a loss). All modes carry the head since 2026-07-31 |
-| LOOKA hints (`--hint-k`) | built, **default 0 = OFF**, measured inert (0.9% of evictions) |
+| LOOKA hints (`--hint-k`) | **DELETED 2026-07-31** — measured inert (0.9% of evictions, ≤+0.1pp hit). `docs/CACHE_PILOT.md` keeps the record |
 | `top-m` routing | **RETIRED**, removed from the engine |
 | Vulkan | decodes `--mode int3-vq --attn dense`; 16 of 29 kernels; 6 more are single-row; ~1.9× slower |
 | MoE accumulation | fixed-point (`MOE_ACC_SHIFT 44`), no cross-stream join |
@@ -34,9 +34,16 @@ tell you mostly about options that were rejected.
 
 ```bash
 cargo build --release --features rocm        # or --features vulkan; NEVER both
-cargo test  --release --features rocm        # 104 tests
+cargo test  --release --features rocm        # 100 tests
 cargo clippy --release --features rocm --all-targets
 ```
+
+`src/` is grouped by subsystem — `artifact/ memory/ fetch/ backend/` plus `gpu math attn
+indexer telemetry watchdog eval` at top level. See `docs/ARCHITECTURE.md` §11.
+
+`--features teacher-forcing` adds `--ppl` (teacher-forced scoring, `src/eval.rs`). Off by
+default: it is a quality instrument, not part of decoding. `bin/ppl`, which does the paired
+statistics over its `.nll` output, needs no feature — it never touches the engine.
 
 A featureless build compiles to a refusal stub — that is deliberate, not breakage.
 

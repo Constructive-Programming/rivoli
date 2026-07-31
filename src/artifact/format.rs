@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, RawFd};
 
-use crate::quant::{
+use crate::artifact::quant::{
     VQ_DIM, VQ_GROUP, VQ_INDEX_BITS, VQ_K, i4_expert_bytes, i4_expert_stride, vq_expert_bytes,
     vq_expert_stride,
 };
@@ -337,8 +337,8 @@ impl Safetensors {
             ssh == want,
             "{name}.weight_scale_inv: shape {ssh:?} != {want:?} (block {block})"
         );
-        let scale = crate::quant::read_f32(sb);
-        Ok(crate::quant::dequant_fp8_block(
+        let scale = crate::artifact::quant::read_f32(sb);
+        Ok(crate::artifact::quant::dequant_fp8_block(
             w, &scale, o_dim, i_dim, block,
         ))
     }
@@ -365,7 +365,7 @@ pub struct I4Source {
     /// rebuilds only part of the set records only that part, so a mixed artifact
     /// never claims to be uniform.
     pub layers: [usize; 2],
-    /// [`crate::quant::I4_GROUP`] the set was quantized at — weights per f32 scale
+    /// [`crate::artifact::quant::I4_GROUP`] the set was quantized at — weights per f32 scale
     /// along the input dim. Without it a G=128 set and a G=64 set are the same
     /// `tool`/`chain`/`src` triple, and the quality difference between them would be
     /// unattributable. `None` is an artifact predating group scales (per-row); such a
@@ -542,7 +542,7 @@ impl ExpertSet {
         Self::open(
             dir,
             "vq3",
-            crate::quant::VQ_ALIGN, // one aligned block reserved for the header
+            crate::artifact::quant::VQ_ALIGN, // one aligned block reserved for the header
             vq_expert_stride(hidden, moe_inter),
             vq_expert_bytes(hidden, moe_inter),
             dense_layers,
@@ -669,7 +669,7 @@ fn open_direct(path: &str) -> Result<std::fs::File> {
 /// Load the 3 per-projection codebooks from `<dir>/codebooks.f32` (gate, up, down),
 /// each `VQ_K·VQ_DIM` f32, concatenated in that order.
 pub fn load_codebooks(dir: &str) -> Result<[Vec<f32>; 3]> {
-    let raw = crate::quant::read_f32(&std::fs::read(format!("{dir}/codebooks.f32"))?);
+    let raw = crate::artifact::quant::read_f32(&std::fs::read(format!("{dir}/codebooks.f32"))?);
     ensure!(
         raw.len() == 3 * VQ_K * VQ_DIM,
         "codebooks.f32: {} f32, expected {}",
@@ -784,7 +784,7 @@ mod tests {
             chain: "fp8->int4".into(),
             src: "/src".into(),
             layers: [3, 40],
-            group: Some(crate::quant::I4_GROUP),
+            group: Some(crate::artifact::quant::I4_GROUP),
         };
         a.stamp(&dir).unwrap();
         assert_eq!(I4Source::load(&dir).unwrap().as_ref(), Some(&a));

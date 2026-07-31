@@ -4,9 +4,9 @@
 //! it skips, so CI without a checkpoint stays green.
 #![allow(clippy::unwrap_used)]
 
-use rivoli::format::{Dtype, FormatMeta, ExpertSet, Safetensors, load_codebooks};
-use rivoli::model::ModelConfig;
-use rivoli::quant::{VQ_ALIGN, VQ_DIM, VQ_K, vq_expert_bytes};
+use rivoli::artifact::format::{Dtype, FormatMeta, ExpertSet, Safetensors, load_codebooks};
+use rivoli::artifact::model::ModelConfig;
+use rivoli::artifact::quant::{VQ_ALIGN, VQ_DIM, VQ_K, vq_expert_bytes};
 
 #[test]
 fn artifact_reads_back() {
@@ -81,8 +81,8 @@ fn artifact_reads_back() {
 /// `i4_source` stamp, so the test cannot be pointed at the wrong ground truth.
 #[test]
 fn i4_bytes_are_what_the_checkpoint_quantizes_to() {
-    use rivoli::format::I4Source;
-    use rivoli::quant::{
+    use rivoli::artifact::format::I4Source;
+    use rivoli::artifact::quant::{
         i4_expert_stride, i4_groups, i4_row_bytes, i4_slot_offsets, quant_i4, read_f32,
         vq_expert_layout,
     };

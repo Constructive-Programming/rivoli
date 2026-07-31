@@ -37,10 +37,25 @@ fn every_documented_invariant_has_a_test_and_vice_versa() {
         .expect("ARCHITECTURE.md must carry the §8b invariant registry");
     let documented = ids(table, "INV-");
 
+    // WALK `src/`, do not list files. The list this replaced named five paths, and moving
+    // `hybrid`/`gpustream`/`pin` into subsystem folders on 2026-07-31 silently emptied it —
+    // the registry check then reported every INV-n as untested. A test whose coverage
+    // depends on a hand-maintained path list fails in the direction that looks like a real
+    // regression, which costs more than the walk.
     let mut tested = BTreeSet::new();
-    for f in ["src/math.rs", "src/hybrid.rs", "src/gpustream.rs", "src/pin.rs", "src/gpu.rs"] {
-        if let Ok(src) = std::fs::read_to_string(root.join(f)) {
-            tested.extend(ids(&src, "fn inv_"));
+    let mut stack = vec![root.join("src")];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            match p.is_dir() {
+                true => stack.push(p),
+                false if p.extension().is_some_and(|x| x == "rs") => {
+                    if let Ok(src) = std::fs::read_to_string(&p) {
+                        tested.extend(ids(&src, "fn inv_"));
+                    }
+                }
+                false => {}
+            }
         }
     }
 

@@ -24,7 +24,7 @@
 //! meet only through `Signal` wakers.
 
 use crate::backend::{Signal, Stream, Timeline};
-use crate::stream::Streamer;
+use crate::fetch::stream::Streamer;
 use anyhow::{Result, anyhow};
 use std::os::fd::RawFd;
 use std::sync::Arc;

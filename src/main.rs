@@ -15,7 +15,7 @@ use anyhow::{Result, bail};
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
 use anyhow::Context;
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
-use rivoli::config::Config;
+use rivoli::artifact::config::Config;
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
 use tracing::info;
 
@@ -49,8 +49,8 @@ struct Args {
 
     /// Routed-expert format. Default: hybrid on rocm, int3-vq on vulkan (whose int4
     /// kernels are not ported) — see MODES.md and `config::Mode`.
-    #[arg(long, default_value_t, value_parser = rivoli::config::Mode::parse)]
-    mode: rivoli::config::Mode,
+    #[arg(long, default_value_t, value_parser = rivoli::artifact::config::Mode::parse)]
+    mode: rivoli::artifact::config::Mode,
 
     /// Routed-expert cache policy. All three are output-neutral: routing never consults
     /// residency (see math.rs `inv_1_routing_never_consults_the_cache`), so a policy change
@@ -59,12 +59,12 @@ struct Args {
     cache_policy: String,
 
     /// 2Q's A1in probation bound, percent of pool capacity. Ignored by lru/arc.
-    #[arg(long = "2q-kin", value_name = "PCT", default_value_t = rivoli::cache::TwoQSplit::default().kin_pct())]
+    #[arg(long = "2q-kin", value_name = "PCT", default_value_t = rivoli::memory::cache::TwoQSplit::default().kin_pct())]
     two_q_kin: u32,
 
     /// 2Q's A1out ghost bound, percent of pool capacity. May exceed 100 (the ghost holds
     /// keys only). Ignored by lru/arc.
-    #[arg(long = "2q-kout", value_name = "PCT", default_value_t = rivoli::cache::TwoQSplit::default().kout_pct())]
+    #[arg(long = "2q-kout", value_name = "PCT", default_value_t = rivoli::memory::cache::TwoQSplit::default().kout_pct())]
     two_q_kout: u32,
 
 
@@ -94,20 +94,10 @@ struct Args {
 
     /// Opt OUT of the pinned-host bounce: DMA cold reads straight into VMM device memory.
     /// The bounce is the default because it measures faster and survives kernels whose
-    /// amdgpu path EFAULTs on direct io_uring DMA into VMM (src/stream.rs).
+    /// amdgpu path EFAULTs on direct io_uring DMA into VMM (src/fetch/stream.rs).
     #[arg(long)]
     direct_vmm_dma: bool,
 
-    /// How many top-ranked LOOKA predictions per horizon (L+1 and L+2) to feed the cache
-    /// policy as eviction vetoes. DEFAULT 0 = OFF: the vetoes bind but touch only ~0.9% of
-    /// evictions, so they moved hit rate by at most +0.1pp while costing 3-8% throughput
-    /// for the pilot's per-layer rmsnorm+gemv+D2H. Pass `--hint-k 3` to re-enable. Runs
-    /// the target layer's
-    /// router against this layer's post-attention residual; measured precision by rank is
-    /// 99/96/93/87/78/67/55/42% (docs/CACHE_PILOT.md). A hint only vetoes eviction — it
-    /// never changes routing — so output is bit-identical at every value.
-    #[arg(long, value_name = "K", default_value_t = rivoli::gpu::DEFAULT_HINT_K)]
-    hint_k: usize,
 
     /// Dump the routed-expert access trace (v2: demand keys plus the ranked candidate
     /// window) for the offline `replay` sim.
@@ -122,10 +112,12 @@ struct Args {
     /// instead of generating. The quality instrument for any change that CAN move output
     /// (a format or a kernel); never a free-running decode. Cache changes no longer need it
     /// — routing is residency-blind, so they are output-neutral by construction.
+    #[cfg(feature = "teacher-forcing")]
     #[arg(long, value_name = "TEXT_FILE", requires = "ppl_out")]
     ppl: Option<String>,
 
     /// Where `--ppl` writes its per-token NLLs.
+    #[cfg(feature = "teacher-forcing")]
     #[arg(long, value_name = "PATH")]
     ppl_out: Option<String>,
 
@@ -158,10 +150,14 @@ struct Args {
     ///
     /// Output is BYTE-IDENTICAL either way — every batched kernel is bit-identical per row
     /// and row 0 of a verify pass is the real token — so this flag can only move speed.
-    /// Which direction it moves it depends on the draft acceptance rate: the pass costs
-    /// ~1.53x a sequential one (the MoE launches the UNION of both rows' experts), so it
-    /// pays above ~53% acceptance and loses below. Measured 0.93x on the bench prompt;
-    /// see benchmarks.md, "Speculative decode".
+    /// (The exception is `--mode hybrid`, whose output is not stable under ANY cache
+    /// change, speculation included; see docs/ARCHITECTURE.md §8b under INV-1.)
+    ///
+    /// **Measured 1.108x** — 2.97 vs 2.68 tok/s, int3-vq, 512 tokens. That is WITH the
+    /// `--mtp-min-conf` gate, which is on by default. The verify pass costs ~1.53x a
+    /// sequential one (the MoE launches the UNION of both rows' experts), so it needs ~53%
+    /// acceptance to break even and ungated it lands at 0.93-0.95x. Gating is what turns it
+    /// positive. See benchmarks.md, "The MTP confidence gate".
     #[arg(long)]
     no_mtp: bool,
 
@@ -213,7 +209,7 @@ fn parse_args() -> Args {
 /// its indexer is present whenever any is. `open_dir` merges every *.safetensors in
 /// the artifact, so this sees `indexer.safetensors` (added post-hoc) too.
 fn artifact_has_indexer(model_dir: &str) -> bool {
-    rivoli::format::Safetensors::open_dir(model_dir)
+    rivoli::artifact::format::Safetensors::open_dir(model_dir)
         .map(|st| st.has("model.layers.0.self_attn.indexer.wk.weight"))
         .unwrap_or(false)
 }
@@ -288,6 +284,7 @@ fn main() -> Result<()> {
     let a = parse_args();
     let attn = resolve_attn(&a)?;
     // Bound before `a` is partially moved into `discover` below.
+    #[cfg(feature = "teacher-forcing")]
     let (a_ppl, a_ppl_out) = (a.ppl.clone(), a.ppl_out.clone());
     let a_moe_gain = a.moe_gain;
     let a_raw_prompt = a.raw_prompt;
@@ -308,11 +305,10 @@ fn main() -> Result<()> {
         a.model,
         a.bench,
         a.direct_vmm_dma,
-        a.hint_k,
         a.trace,
         a.prompt,
         a.cache_policy,
-        rivoli::cache::TwoQSplit::new(a.two_q_kin, a.two_q_kout)?,
+        rivoli::memory::cache::TwoQSplit::new(a.two_q_kin, a.two_q_kout)?,
         // GiB -> BYTES. The flag is documented and value_named in GiB and every consumer
         // (`Config::max_mem`, the pool cap, the log line's `/ GIB`) is in bytes. The clap
         // migration dropped this multiply, so `--max-mem 115` asked for 115 BYTES and the
@@ -365,7 +361,7 @@ fn main() -> Result<()> {
     }
 
     // Model dimensions from the artifact's manifest.json.
-    let mc = rivoli::model::ModelConfig::load(&cfg.model)?;
+    let mc = rivoli::artifact::model::ModelConfig::load(&cfg.model)?;
     info!(
         "model: {} layers ({} dense) hidden={} heads={} experts={} top{} moe_inter={} vocab={}",
         mc.n_layers,
@@ -387,7 +383,7 @@ fn main() -> Result<()> {
     // produced rel_l2=NaN, gain=NaN in the ground-truth oracle), which is the failure
     // mode a stamp exists to prevent. Refuse rather than decode nonsense.
     if cfg.mode.uses_int4() {
-        match rivoli::format::I4Source::load(&cfg.model)? {
+        match rivoli::artifact::format::I4Source::load(&cfg.model)? {
             Some(s) => {
                 info!(
                     "i4 source: {} ({}, group {}) layers {}..{} from {}",
@@ -398,7 +394,7 @@ fn main() -> Result<()> {
                     s.layers[1],
                     s.src
                 );
-                let want = rivoli::quant::I4_GROUP;
+                let want = rivoli::artifact::quant::I4_GROUP;
                 match s.group {
                     Some(g) if g == want => {}
                     Some(g) => anyhow::bail!(
@@ -428,7 +424,7 @@ fn main() -> Result<()> {
             None => info!(
                 "i4 source: unstamped (no manifest `i4_source`) — group size will be \
                  verified by the `.i4` slab length against group {}",
-                rivoli::quant::I4_GROUP
+                rivoli::artifact::quant::I4_GROUP
             ),
         }
     }
@@ -444,7 +440,7 @@ fn main() -> Result<()> {
 
     // Tokenizer (tokenizer.json + generation_config.json, copied into the artifact).
     let bench_prompt = cfg.prompt.as_deref().unwrap_or("The sky is blue because");
-    let tok = rivoli::tokenizer::Tokenizer::load(&cfg.model)?;
+    let tok = rivoli::artifact::tokenizer::Tokenizer::load(&cfg.model)?;
     // Chat framing by default: raw text leaves the model outside any assistant turn, so
     // its EOS ids (two of which are turn boundaries) are unreachable and decode runs to
     // the token limit every time. `--ppl` deliberately does NOT go through here — it
@@ -463,23 +459,15 @@ fn main() -> Result<()> {
     );
 
     // `--ppl` scores a fixed text instead of generating, so `-bench` is meaningless there.
+    // Defined in BOTH configurations rather than gating each of its three readers: without
+    // the feature there is no corpus to load, so it is a `None` the sizing below folds away.
+    #[cfg(feature = "teacher-forcing")]
     let ppl_ids = match &a_ppl {
-        Some(path) => {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("read --ppl text {path}"))?;
-            let ids = tok.encode(&text)?;
-            // The corpus is part of the measurement, so its identity goes in the log next
-            // to the numbers — a quality claim whose text drifted is worth nothing later.
-            info!(
-                "ppl corpus {path:?}: {} bytes, {} tokens, fnv1a64 {}",
-                text.len(),
-                ids.len(),
-                rivoli::math::fnv1a64_hex(text.as_bytes()),
-            );
-            Some(ids)
-        }
+        Some(path) => Some(rivoli::eval::load_corpus(path, &tok)?),
         None => None,
     };
+    #[cfg(not(feature = "teacher-forcing"))]
+    let ppl_ids: Option<Vec<u32>> = None;
     let ngen = if ppl_ids.is_some() {
         0
     } else {
@@ -489,9 +477,9 @@ fn main() -> Result<()> {
 
     #[cfg(any(feature = "rocm", feature = "vulkan"))]
     {
-        use rivoli::config::OS_RESERVE;
+        use rivoli::artifact::config::OS_RESERVE;
         const GIB: f64 = (1u64 << 30) as f64;
-        let (free, _total) = rivoli::device::mem_info()?;
+        let (free, _total) = rivoli::memory::device::mem_info()?;
         // `--max-mem` is honoured LITERALLY — no OS reserve; the user asked for that
         // size, so it's allowed to OOM/fail at pin build. The auto path just leaves
         // OS_RESERVE free (there is no hard footprint ceiling — the old NaN cliff was
@@ -521,7 +509,7 @@ fn main() -> Result<()> {
             rivoli::attn::AttnMode::Dsa | rivoli::attn::AttnMode::Misa { .. }
         );
         let t = std::time::Instant::now();
-        let pin = rivoli::pin::Pin::build(
+        let pin = rivoli::memory::pin::Pin::build(
             &cfg.model,
             &mc,
             cap,
@@ -541,7 +529,6 @@ fn main() -> Result<()> {
             None => prompt_ids.len() + ngen + 1,
         };
         let mut engine = rivoli::gpu::GpuEngine::new(pin, &mc, max_ctx, cfg.attn.clone())?;
-        engine.set_hint_k(cfg.hint_k);
         #[cfg(feature = "trace")]
         engine.set_checksum_x(cfg.checksum_x);
         engine.set_moe_gain(a_moe_gain);
@@ -555,47 +542,20 @@ fn main() -> Result<()> {
             wd_secs,
         ))?);
         // --- `--ppl`: teacher-forced quality gate, not a decode -----------------------
-        // Returns before `generate` because the two are mutually exclusive by design:
-        // a free-running generation's own trajectory is the confound this measurement
-        // exists to remove.
+        // Returns before `generate` because the two are mutually exclusive by design: a
+        // free-running generation's own trajectory is the confound this measurement exists
+        // to remove. The whole flow lives in `rivoli::eval` so the feature gate is a module
+        // boundary rather than four `#[cfg]`s that can drift out of step.
+        #[cfg(feature = "teacher-forcing")]
         if let Some(ids) = ppl_ids {
-            let t0 = std::time::Instant::now();
-            let nlls = engine.nll_forced(&ids)?;
-            let dt = t0.elapsed().as_secs_f64();
-            let mean = nlls.iter().map(|&v| v as f64).sum::<f64>() / nlls.len().max(1) as f64;
-            let (hits, misses) = (engine.hits(), engine.misses());
-            let hit_pct = 100.0 * hits as f64 / (hits + misses).max(1) as f64;
-            info!(
-                "PPL: {:.6} (mean NLL {mean:.6} over {} predicted tokens, {dt:.1}s) | \
-                 hit {hit_pct:.2}%",
-                mean.exp(),
-                nlls.len(),
+            // `bin/ppl` labels a cell with `split_whitespace().take(3)`, so these three
+            // fields ARE the label. `moe_gain` is among them because a gain sweep differs
+            // in nothing else — six arms would otherwise be indistinguishable downstream.
+            let label = format!(
+                "mode={} policy={} moe_gain={a_moe_gain}",
+                cfg.mode, cfg.cache_policy
             );
-            // Per-token NLLs are the actual deliverable: two runs over the same text are
-            // PAIRED at every position, and differencing them detects a systematic shift
-            // far smaller than the sampling noise in two independent perplexities.
-            if let Some(path) = &a_ppl_out {
-                use std::io::Write;
-                let mut w = std::io::BufWriter::new(
-                    std::fs::File::create(path).with_context(|| format!("create {path}"))?,
-                );
-                writeln!(
-                    w,
-                    "# rivoli-nll v1 mode={} policy={} moe_gain={a_moe_gain} tokens={} hit_pct={hit_pct:.4}",
-                    cfg.mode,
-                    cfg.cache_policy,
-                    // `moe_gain` is in the header because a gain sweep differs in NOTHING
-                    // else: six arms would otherwise write six identical headers and
-                    // `bin/ppl` would label them identically. `bin/ppl` labels cells with
-                    // `split_whitespace().take(3)`, so the first three fields are the label.
-                    nlls.len(),
-                )?;
-                for v in &nlls {
-                    writeln!(w, "{v:.8}")?;
-                }
-                w.flush().context("flush --ppl-out")?;
-                info!("wrote {} per-token NLLs to {path}", nlls.len());
-            }
+            rivoli::eval::run(&mut engine, &ids, a_ppl_out.as_ref(), &label)?;
             return Ok(());
         }
 
@@ -627,17 +587,6 @@ fn main() -> Result<()> {
             summary.tok_per_s,
             summary.hit_pct,
         );
-        let (hs, hr) = engine.hint_stats();
-        if hs > 0 {
-            use std::sync::atomic::Ordering as O;
-            let bound = rivoli::cache::VETO_BOUND.load(O::Relaxed);
-            let dropped = rivoli::cache::VETO_DROPPED.load(O::Relaxed);
-            info!(
-                "  hints: {hs} offered, {hr} resident ({:.1}%) | veto BOUND {bound} \
-                 (changed the victim), dropped {dropped} (would have starved eviction)",
-                100.0 * hr as f64 / hs as f64,
-            );
-        }
         // OTLP: one decode span carrying the always-on summary (opt-in via
         // OTEL_EXPORTER_OTLP_ENDPOINT; log-only otherwise). Exported synchronously on
         // drop — no async runtime.

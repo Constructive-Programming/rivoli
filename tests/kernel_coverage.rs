@@ -1,4 +1,4 @@
-//! Every `launch_*` in `src/vk.rs` must be exercised by a test.
+//! Every `launch_*` in `src/backend/vk.rs` must be exercised by a test.
 //!
 //! THE TENTH MECHANISED RULE, and it exists because of a specific miss: tranche 2a
 //! ported six kernels, delegated three oracles, and reported the tranche complete off
@@ -19,7 +19,7 @@
 //! compiled.
 //!
 //! KNOWN LIMIT: A SHADER WITH NO LAUNCHER IS INVISIBLE HERE. This check is keyed on
-//! `pub unsafe fn launch_*` in `src/vk.rs`, so a `.comp` that exists, compiles, and passes
+//! `pub unsafe fn launch_*` in `src/backend/vk.rs`, so a `.comp` that exists, compiles, and passes
 //! every SPIR-V guard while having no launcher at all is not counted as uncovered — it is
 //! not counted at all. `kernel_coverage` going green says nothing about it.
 //!
@@ -39,6 +39,12 @@
 const ALLOWED: &[(&str, &str)] = &[];
 
 /// Read a source file relative to the crate root.
+///
+/// PANICS on a missing file rather than returning empty. That is deliberate: this scanner
+/// and `tests/invariants.rs` both derive their coverage from paths, and a silent empty read
+/// turns "nothing to check" into a PASS. Moving `vk.rs` into `src/backend/` on 2026-07-31
+/// broke both; this one failed loudly because of this panic, the other reported every
+/// invariant as untested. Prefer loud.
 fn source(rel: &str) -> String {
     let path = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), rel);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
@@ -51,7 +57,7 @@ fn every_launcher_has_an_oracle() {
     // to its own reader.
     let decl = format!("pub unsafe fn {}", "launch_");
 
-    let backend = source("src/vk.rs");
+    let backend = source("src/backend/vk.rs");
     let launchers: Vec<String> = backend
         .lines()
         .filter_map(|l| l.trim_start().strip_prefix(&decl))
@@ -64,7 +70,7 @@ fn every_launcher_has_an_oracle() {
     // once when a naming convention changed underneath a scanner.
     assert!(
         launchers.len() >= 5,
-        "found only {} launchers in src/vk.rs — the declaration pattern has changed and \
+        "found only {} launchers in src/backend/vk.rs — the declaration pattern has changed and \
          this check has been passing without examining anything",
         launchers.len()
     );
@@ -78,7 +84,7 @@ fn every_launcher_has_an_oracle() {
 
     assert!(
         missing.is_empty(),
-        "\n\n{} kernel(s) have a launcher in src/vk.rs and NO oracle in tests/vk.rs:\n  \
+        "\n\n{} kernel(s) have a launcher in src/backend/vk.rs and NO oracle in tests/vk.rs:\n  \
          {}\n\n\
          They compile, they may even be dispatched by other code, and nothing has ever \
          checked what they compute. A passing suite says nothing about them.\n\

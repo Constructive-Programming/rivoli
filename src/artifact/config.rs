@@ -83,12 +83,9 @@ pub struct Config {
     /// memory (`--direct-vmm-dma`). Default false = bounce (read into pinned host,
     /// then `hipMemcpy` into VMM) — measures faster (sidesteps the coherent/snoop tax
     /// on DMA into host-mapped device pages) and survives kernels whose amdgpu path
-    /// EFAULTs on direct io_uring DMA into VMM (see src/stream.rs). Set only to force the
+    /// EFAULTs on direct io_uring DMA into VMM (see src/fetch/stream.rs). Set only to force the
     /// raw-DMA path.
     pub direct_vmm_dma: bool,
-    /// `--hint-k`: how many top-ranked predictions per horizon feed the cache policy as
-    /// eviction vetoes. Always on; 0 disables.
-    pub hint_k: usize,
     /// Dump the routed-expert access trace to this path (`--trace`), format v2: a
     /// `# rivoli-trace v2 top_k=<k> window=<w>` header, then one line per MoE layer —
     /// the keys it looked up, then `|`, then the top-`w` router candidates as
@@ -103,8 +100,8 @@ pub struct Config {
     /// docs/CACHE_ROUTE.md and [`Config::validate`].
     pub cache_policy: String,
     /// 2Q's A1in/A1out split (`--2q-kin` / `--2q-kout`, percentages of pool capacity).
-    /// Ignored by `lru`/`arc`. Unset = [`crate::cache::TwoQSplit::default`].
-    pub two_q: crate::cache::TwoQSplit,
+    /// Ignored by `lru`/`arc`. Unset = [`crate::memory::cache::TwoQSplit::default`].
+    pub two_q: crate::memory::cache::TwoQSplit,
         /// DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
     pub checksum_x: bool,
     /// Routed-expert format mode (`--mode int3-vq|int4|hybrid`; default `hybrid` on `rocm`,
@@ -149,11 +146,10 @@ impl Config {
         model: String,
         bench: Option<usize>,
         direct_vmm_dma: bool,
-        hint_k: usize,
         trace: Option<String>,
         prompt: Option<String>,
         cache_policy: String,
-        two_q: crate::cache::TwoQSplit,
+        two_q: crate::memory::cache::TwoQSplit,
         max_mem: Option<u64>,
         attn: crate::attn::AttnMode,
     ) -> Result<Self> {
@@ -170,7 +166,6 @@ impl Config {
             model,
             bench,
             direct_vmm_dma,
-            hint_k,
             trace,
             prompt,
             cache_policy,
@@ -249,13 +244,12 @@ impl fmt::Display for Config {
         const GIB: f64 = (1u64 << 30) as f64;
         write!(
             f,
-            "model={} bench={:?} mode={} attn={:?} direct_vmm_dma={} hint_k={} cache_policy={} 2q_kin={}% 2q_kout={}% trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={}",
+            "model={} bench={:?} mode={} attn={:?} direct_vmm_dma={} cache_policy={} 2q_kin={}% 2q_kout={}% trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={}",
             self.model,
             self.bench,
             self.mode,
             self.attn,
             self.direct_vmm_dma,
-            self.hint_k,
             self.cache_policy,
             self.two_q.kin_pct(),
             self.two_q.kout_pct(),
@@ -280,11 +274,10 @@ mod tests {
             model: "/nonexistent".into(),
             bench: Some(1),
             direct_vmm_dma: false,
-            hint_k: crate::gpu::DEFAULT_HINT_K,
             trace: trace.map(String::from),
             prompt: None,
             cache_policy: policy.into(),
-            two_q: crate::cache::TwoQSplit::default(),
+            two_q: crate::memory::cache::TwoQSplit::default(),
             checksum_x: false,
             mode,
             max_mem: None,

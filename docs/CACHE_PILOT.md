@@ -1,8 +1,26 @@
 # rivoli — CACHE_PILOT: router-piloted cross-layer expert prefetch
 
-Status: **BUILT, MEASURED, AND DEFAULT-OFF.** Step 1 (LOOKA) and Step 2a (the speculative
-loader) are both built; see those sections. The history below is kept because it records
-*why* this was parked twice and what changed.
+Status: **DELETED FROM THE ENGINE 2026-07-31. This document is now a record, not a guide to
+live code.** Step 1 (LOOKA) and the `--hint-k` eviction-veto layer were built, measured
+inert, and removed; nothing described below still exists in `src/`. The measurements stand
+and are the reason it went — read this before proposing cross-layer prefetch again.
+
+**Why it was removed rather than left default-off.** It was ~1,100 lines across
+`src/looka.rs`, `src/hybrid.rs` (the `Hint`/`HintSet` types, the cap, the decay, four trait
+methods per policy), `src/cache.rs` (a second, advisory skip set in the eviction scan, with
+a fallback that had to be right at eleven call sites), `src/gpu.rs` (per-layer rmsnorm +
+gemv + a blocking D2H), plus two registered invariants (INV-2, INV-3) with their tests. That
+is a lot of load-bearing machinery — the eviction scan carried two authorities with
+different failure modes — kept alive for a mechanism that moved hit rate by at most +0.1pp.
+Its own measurement says why it cannot be rescued by tuning: at ~965 slots a key survives
+~138 layers, so a 1-2 layer veto binds only on keys already at the LRU end, and reaching the
+eviction horizon would need a precision LOOKA does not have there (77.2% at L+1, 68.9% at
+L+2, falling).
+
+The offline simulator in `bin/replay` is NOT affected: its `Pilot` is a modelled predictor
+over a trace, self-contained, and still the right tool for asking the recall question.
+
+The history below is kept because it records *why* this was parked twice and what changed.
 
 > **CORRECTED 2026-07-31.** This line used to read "SHIPPED — `--pilot-k`, always on,
 > default 3", and all three claims were wrong against the code:

@@ -11,14 +11,14 @@
 //! Run: cargo run --release --features rocm --example dot_bench
 #![cfg(feature = "rocm")]
 #![allow(clippy::expect_used)]
-use rivoli::device::DeviceBuf;
-use rivoli::hip::{
+use rivoli::memory::device::DeviceBuf;
+use rivoli::backend::hip::{
     attend_scratch_floats, device_sync, launch_argmax, launch_attend, launch_gemv_fp8,
     launch_gemv_i4, launch_gemv_i8, launch_gemv_vq, launch_mla_absorb_fp8, launch_mla_value_fp8,
     launch_rmsnorm,
 };
 use rivoli::math::{f32_to_e4m3, f32_to_f16};
-use rivoli::quant::{matvec_i4, quant_i4, quant_vq, VQ_DIM, VQ_K};
+use rivoli::artifact::quant::{matvec_i4, quant_i4, quant_vq, VQ_DIM, VQ_K};
 
 struct Rng(u64);
 impl Rng {

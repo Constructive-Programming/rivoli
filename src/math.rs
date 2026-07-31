@@ -186,11 +186,10 @@ pub fn topk_into(scores: &[f32], k: usize, out: &mut Vec<usize>) {
 /// **Routing does not consult the cache, and that is now a load-bearing property.** The
 /// `top-m` cache-conditional substitution (arXiv:2412.00099) that used to live here was
 /// removed 2026-07-30: it cost +3.63% perplexity on int3-vq and failed outright on int4 at
-/// +12.7%, and the LOOKA hint layer supersedes it by steering EVICTION instead of
-/// SELECTION. Because selection is now a pure function of (logits, bias, top_k), any cache
-/// change — hints, policy, budget — is output-bit-identical by construction, which is the
-/// acceptance test for the whole hint mechanism. Re-introducing residency here would
-/// silently give that up. See docs/CACHE_ROUTE.md for the retirement record.
+/// +12.7%. Because selection is now a pure function of (logits, bias, top_k), any cache
+/// change — policy, budget, placement — is output-bit-identical by construction. That is
+/// the acceptance test every cache change is held to, and re-introducing residency here
+/// would silently give it up. See docs/CACHE_ROUTE.md for the retirement record.
 pub fn route_into(
     gate_logits: &[u8],
     bias: &[f32],
@@ -208,48 +207,6 @@ pub fn route_into(
     topk_into(choice, top_k, sel);
 }
 
-/// FNV-1a 64 of `bytes`, hex. Identity tag for the `--ppl` corpus, logged beside the
-/// numbers so a result can be checked against the text that produced it.
-///
-// ponytail: not a cryptographic hash and does not need to be — the corpus is committed,
-// so git already holds its real identity; this only has to catch "the file changed under
-// us". A sha256 would mean taking a dependency to print one line.
-pub fn fnv1a64_hex(bytes: &[u8]) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        h = (h ^ b as u64).wrapping_mul(0x1000_0000_01b3);
-    }
-    format!("{h:016x}")
-}
-
-/// `-log softmax(logits)[target]` from a little-endian f32 logit vector.
-///
-/// Shifted by the max before exponentiating, which is load-bearing rather than tidy:
-/// this model's raw logits routinely run past 80, `exp(80)` overflows f32 to `inf`, and
-/// an `inf` in the sum yields a NaN NLL. A NaN would then propagate into a mean that
-/// still *looks* like a plausible perplexity, so the failure would be silent and would
-/// land in a number we are using to decide a feature. Accumulated in f64 for the same
-/// reason — 154,880 f32 addends lose real precision to rounding.
-pub fn nll_of(logits_le: &[u8], target: usize) -> anyhow::Result<f32> {
-    let n = logits_le.len() / 4;
-    anyhow::ensure!(n > 0 && target < n, "target {target} outside {n} logits");
-    let z = |i: usize| {
-        let b = &logits_le[4 * i..4 * i + 4];
-        f32::from_le_bytes([b[0], b[1], b[2], b[3]])
-    };
-    let mut max = f32::NEG_INFINITY;
-    for i in 0..n {
-        let v = z(i);
-        if v > max {
-            max = v;
-        }
-    }
-    anyhow::ensure!(max.is_finite(), "non-finite logits");
-    let sum: f64 = (0..n).map(|i| ((z(i) - max) as f64).exp()).sum();
-    let nll = (sum.ln() - (z(target) - max) as f64) as f32;
-    anyhow::ensure!(nll.is_finite(), "non-finite NLL");
-    Ok(nll)
-}
 
 #[cfg(test)]
 mod tests {
@@ -451,9 +408,9 @@ mod tests {
     ///
     /// This test outlived the feature it was written for. It began as `top-m`'s regression
     /// guarantee ("`--cache-policy lru|2q|arc` is byte-identical to pre-top-m"); with
-    /// `top-m` deleted it now guards the property the LOOKA hint layer depends on. Because
-    /// selection cannot see residency, ANY cache change — a hint, a policy swap, a
-    /// different budget — is output-bit-identical BY CONSTRUCTION rather than by
+    /// `top-m` deleted it guards the property on its own account. Because selection
+    /// cannot see residency, ANY cache change — a policy swap, a different budget, a
+    /// different placement — is output-bit-identical BY CONSTRUCTION rather than by
     /// measurement. Re-introducing a residency predicate here would silently cost that,
     /// and no output diff would necessarily catch it (top-m's own damage was +3.63%
     /// perplexity, invisible to a token-ID comparison on a short run).

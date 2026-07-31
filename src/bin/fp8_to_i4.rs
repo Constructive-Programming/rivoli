@@ -20,9 +20,9 @@
 //!
 //! usage: fp8_to_i4 <fp8-dir> <artifact-dir> [--from L] [--to L]   (`--to` exclusive)
 use anyhow::{Context, Result, anyhow, ensure};
-use rivoli::format::{FormatMeta, I4Source, Safetensors};
-use rivoli::model::ModelConfig;
-use rivoli::quant::{
+use rivoli::artifact::format::{FormatMeta, I4Source, Safetensors};
+use rivoli::artifact::model::ModelConfig;
+use rivoli::artifact::quant::{
     I4_GROUP, i4_expert_bytes, i4_expert_stride, i4_slot_offsets, quant_i4, vq_expert_layout,
     write_i4_proj,
 };

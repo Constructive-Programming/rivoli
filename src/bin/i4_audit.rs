@@ -25,10 +25,10 @@
 //! usage: i4_audit <artifact-dir> <fp8-dir> [--layer L] [--experts a,b,c]
 //!                 [--scan] [--scale-study]
 use anyhow::{Context, Result, anyhow, ensure};
-use rivoli::format::{FormatMeta, I4Source, Safetensors, load_codebooks};
+use rivoli::artifact::format::{FormatMeta, I4Source, Safetensors, load_codebooks};
 use rivoli::math::silu;
-use rivoli::model::ModelConfig;
-use rivoli::quant::{
+use rivoli::artifact::model::ModelConfig;
+use rivoli::artifact::quant::{
     I4_GROUP, dequant_i4, i4_expert_stride, i4_groups, i4_row_bytes, i4_slot_offsets, matvec_i4,
     quant_i4, read_f32, vq_decode_proj, vq_expert, vq_expert_layout, vq_expert_stride,
 };
@@ -439,7 +439,7 @@ fn xcheck(art: &str, cfg: &ModelConfig, layers: &[usize], experts: &[usize]) -> 
             let mut i4b = vec![0u8; i4_stride];
             i4f.read_exact_at(&mut i4b, (e * i4_stride) as u64)?;
             let mut vqb = vec![0u8; vq_stride];
-            vqf.read_exact_at(&mut vqb, (rivoli::quant::VQ_ALIGN + e * vq_stride) as u64)?;
+            vqf.read_exact_at(&mut vqb, (rivoli::artifact::quant::VQ_ALIGN + e * vq_stride) as u64)?;
             let vqp = vq_expert(&vqb, 0, h, m);
             for (k, (&(o_dim, i_dim), proj)) in vq_expert_layout(h, m).iter().zip(PROJ).enumerate() {
                 let packed = &i4b[off[k * 2]..off[k * 2] + o_dim * i4_row_bytes(i_dim)];
@@ -629,7 +629,7 @@ fn main() -> Result<()> {
             .with_context(|| format!("read .i4 expert {e}"))?;
         // The `.vq3` block for the same expert (VQ_ALIGN header).
         let mut vqb = vec![0u8; vq_stride];
-        vqf.read_exact_at(&mut vqb, (rivoli::quant::VQ_ALIGN + e * vq_stride) as u64)
+        vqf.read_exact_at(&mut vqb, (rivoli::artifact::quant::VQ_ALIGN + e * vq_stride) as u64)
             .with_context(|| format!("read .vq3 expert {e}"))?;
         let vqp = vq_expert(&vqb, 0, h, m);
 

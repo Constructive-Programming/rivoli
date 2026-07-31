@@ -2,15 +2,15 @@
 #![cfg(feature = "rocm")]
 #![allow(clippy::expect_used)]
 
-use rivoli::device::DeviceBuf;
-use rivoli::gpustream::HipStream;
-use rivoli::hip::{
+use rivoli::memory::device::DeviceBuf;
+use rivoli::backend::gpustream::HipStream;
+use rivoli::backend::hip::{
     ExpertDesc, attend_scratch_floats, device_sync, launch_argmax, launch_attend, launch_gemv_fp8,
     launch_gemv_i8, launch_gemv_vq, launch_index_topk, launch_mla_absorb_fp8, launch_mla_value_fp8,
     launch_moe_acc_drain, launch_moe_expert_range, launch_moe_expert_range_i4, launch_vadd,
 };
 use rivoli::math::{bf16_to_f32, e4m3_to_f32, f32_to_bf16, f32_to_e4m3, silu, softmax};
-use rivoli::quant::{VQ_DIM, VQ_K, matvec_fp8, matvec_i8, matvec_vq, quant_vq};
+use rivoli::artifact::quant::{VQ_DIM, VQ_K, matvec_fp8, matvec_i8, matvec_vq, quant_vq};
 
 mod common;
 use common::{Lcg, assert_close, f16b, f32b, f32v, u16b};
@@ -127,7 +127,7 @@ fn mla_value_rejects_ragged_kvl_but_absorb_accepts_it() {
     // The two kv_b kernels have DIFFERENT legal kvl, and the asymmetry is load width.
     // `mla_value_fp8` goes through the word-loading shared MAC, so a kvl that is not a
     // multiple of 4 leaves 3 rows in 4 misaligned for its dword load — guard 1002, the
-    // same rejection src/vk.rs makes. `mla_absorb_fp8` reads the ragged case a column at
+    // same rejection src/backend/vk.rs makes. `mla_absorb_fp8` reads the ragged case a column at
     // a time and must keep accepting it, because the Vulkan absorb launcher does.
     //
     // Asserts BOTH directions. A test that only checked the rejection would still pass
@@ -585,7 +585,7 @@ fn check_mla_fp8(seed: u64, h: usize, qh: usize, nope: usize, vh: usize, kvl: us
 /// codebooks, vs a matvec_vq+silu reference on the same quantized bytes.
 #[test]
 fn moe_vq_matches_reference() {
-    use rivoli::quant::{vq_expert_layout, vq_groups, vq_row_bytes};
+    use rivoli::artifact::quant::{vq_expert_layout, vq_groups, vq_row_bytes};
     let mut r = Lcg(0x33);
     let (hidden, inter, e) = (128usize, 64usize, 3usize); // multi-group hidden, one-group inter
     // 3 codebooks
@@ -848,7 +848,7 @@ fn moe_vq_matches_reference() {
 /// one whole group, so the scalar tail's group indexing is exercised too.
 #[test]
 fn moe_i4_matches_reference() {
-    use rivoli::quant::{I4_GROUP, matvec_i4, quant_i4};
+    use rivoli::artifact::quant::{I4_GROUP, matvec_i4, quant_i4};
     let mut r = Lcg(0x14);
     let (hidden, inter, e) = (2 * I4_GROUP, I4_GROUP, 3usize);
     let x: Vec<f32> = (0..hidden).map(|_| r.f()).collect();
@@ -1002,7 +1002,7 @@ fn gpu_i4_expert(blk: &[u8], off: &[usize; 6], x: &[f32], hidden: usize, inter: 
 /// probe (CPU only) covers. Skips if the artifact is absent.
 #[test]
 fn moe_i4_real_data_matches_cpu() {
-    use rivoli::quant::{
+    use rivoli::artifact::quant::{
         i4_expert_bytes, i4_groups, i4_row_bytes, i4_slot_offsets, matvec_i4, vq_expert_layout,
     };
     use std::os::unix::fs::FileExt;
@@ -1089,9 +1089,9 @@ fn moe_i4_real_data_matches_cpu() {
 ///         --layer 3 --experts 0,7,256
 #[test]
 fn moe_i4_real_data_vs_fp8_ground_truth() {
-    use rivoli::format::{FormatMeta, I4Source, Safetensors};
-    use rivoli::model::ModelConfig;
-    use rivoli::quant::{i4_expert_bytes, i4_slot_offsets, vq_expert_layout};
+    use rivoli::artifact::format::{FormatMeta, I4Source, Safetensors};
+    use rivoli::artifact::model::ModelConfig;
+    use rivoli::artifact::quant::{i4_expert_bytes, i4_slot_offsets, vq_expert_layout};
     use std::os::unix::fs::FileExt;
     const ART: &str = "/var/db/rivoli/glm52-vq3-full";
     const LAYER: usize = 3; // first MoE layer; block 0 = routed expert 0
@@ -1119,12 +1119,12 @@ fn moe_i4_real_data_vs_fp8_ground_truth() {
     // rel_l2=NaN rather than a large error. Skip loudly instead of asserting on NaN,
     // which reports "systematic gain error" and sends the reader hunting a numerics
     // bug that is really a stale artifact.
-    if prov.group != Some(rivoli::quant::I4_GROUP) {
+    if prov.group != Some(rivoli::artifact::quant::I4_GROUP) {
         eprintln!(
             "skip moe_i4_real_data_vs_fp8: artifact is group {:?}, this build reads group {} \
              — rebuild with fp8_to_i4",
             prov.group,
-            rivoli::quant::I4_GROUP
+            rivoli::artifact::quant::I4_GROUP
         );
         return;
     }
@@ -1351,7 +1351,7 @@ fn index_topk_matches_host_selection() {
 /// row 1 (a missing `r * stride`) would pass a row-0-only test.
 #[test]
 fn batched_rows_are_bit_identical_to_single_rows() {
-    use rivoli::hip::launch_gemv_f32;
+    use rivoli::backend::hip::launch_gemv_f32;
     let mut r = Lcg(0xba7c);
 
     // --- gemv_f32 (the MoE router gate) ---
@@ -1563,8 +1563,8 @@ fn batched_rows_are_bit_identical_to_single_rows() {
     // That is the property the whole speculative claim rests on, and `0 * dv` with a
     // non-finite `dv` would otherwise clamp to a FINITE extreme rather than vanish.
     {
-        use rivoli::hip::launch_moe_expert_range_i4;
-        use rivoli::quant::{I4_GROUP, quant_i4};
+        use rivoli::backend::hip::launch_moe_expert_range_i4;
+        use rivoli::artifact::quant::{I4_GROUP, quant_i4};
         let (hidden, inter, ne) = (2 * I4_GROUP, I4_GROUP, 2usize);
         let dims = [(inter, hidden), (inter, hidden), (hidden, inter)]; // gate, up, down
         let mut bufs: Vec<DeviceBuf> = Vec::new();

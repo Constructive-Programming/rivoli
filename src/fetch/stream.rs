@@ -127,7 +127,7 @@ mod stage {
 /// the architecture, and a backend that serialises fetch against compute does not implement
 /// it (docs/VULKAN.md).
 ///
-/// What replaces it: the arena is a HOST-VISIBLE `vk::Buf` ([`crate::vk::Buf::staging`], so
+/// What replaces it: the arena is a HOST-VISIBLE `vk::Buf` ([`crate::backend::vk::Buf::staging`], so
 /// non-device-local where the device offers the choice — see below), and the move into the
 /// pool slot is a `vkCmdCopyBuffer` recorded on the FETCH QUEUE. It returns before the bytes
 /// land, and the read's `Signal` — armed by `asyncfetch.rs` on that same queue immediately
@@ -139,14 +139,14 @@ mod stage {
 /// `get_user_pages` it. That is precisely what amdgpu refused for device-local VMM pages
 /// (this module's header: EFAULT, ≤6.18.35-r1 regression), which is why BOUNCE mode exists
 /// at all. Allocating the bounce arena out of device-local memory would reintroduce the very
-/// failure it works around, so [`crate::vk::Buf::staging`] excludes `DEVICE_LOCAL` when the
+/// failure it works around, so [`crate::backend::vk::Buf::staging`] excludes `DEVICE_LOCAL` when the
 /// device has any alternative — and warns when it does not.
 ///
 /// DIRECT mode (`--direct-vmm-dma`) still skips the arena entirely by DMA-ing the read
 /// straight into the pool mapping, and is untouched by any of this.
 #[cfg(feature = "vulkan")]
 mod stage {
-    use crate::vk::Buf;
+    use crate::backend::vk::Buf;
     use std::collections::HashMap;
     use std::ffi::c_void;
     use std::sync::Mutex;
@@ -178,11 +178,11 @@ mod stage {
         // driver we have seen and is NOT required to be. An unaligned base makes every
         // O_DIRECT read fail EINVAL deep inside the reaper, so it is checked here rather
         // than assumed — the same guard `VmmBuf::new` carries for the pool.
-        if !(host as usize).is_multiple_of(crate::vk::O_DIRECT_ALIGN) {
+        if !(host as usize).is_multiple_of(crate::backend::vk::O_DIRECT_ALIGN) {
             tracing::error!(
                 "staging arena mapping {host:?} is not {}-byte aligned, so io_uring O_DIRECT \
                  reads into it would fail with EINVAL",
-                crate::vk::O_DIRECT_ALIGN
+                crate::backend::vk::O_DIRECT_ALIGN
             );
             return std::ptr::null_mut();
         }
@@ -212,7 +212,7 @@ mod stage {
     /// says they have.
     ///
     /// `stream` is accepted for signature parity and checked rather than used: the queue is
-    /// [`crate::vk::Q::Fetch`] by construction here, and a caller that passed some other
+    /// [`crate::backend::vk::Q::Fetch`] by construction here, and a caller that passed some other
     /// stream would be describing a copy this function is not making.
     ///
     /// # Safety
@@ -227,7 +227,7 @@ mod stage {
     ) -> Result<(), String> {
         // SAFETY: the caller's contract, forwarded — `n` readable bytes at `src`, `n`
         // writable at `dst`, non-overlapping, both inside live `Buf` mappings.
-        unsafe { crate::vk::copy_h2d_async(dst, src, n) }.map_err(|e| format!("{e:#}"))
+        unsafe { crate::backend::vk::copy_h2d_async(dst, src, n) }.map_err(|e| format!("{e:#}"))
     }
 }
 

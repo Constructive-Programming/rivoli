@@ -1,22 +1,11 @@
 //! Shared substrate for the routed-expert cache policies. The POLICIES themselves
-//! (LRU / 2Q / ARC) live in [`crate::hybrid`] — one byte-aware family used both LIVE
+//! (LRU / 2Q / ARC) live in [`crate::memory::hybrid`] — one byte-aware family used both LIVE
 //! by the pin and offline by `bin/replay` (with unit strides). This module holds only
 //! what both need: [`OrderedSet`] (the recency structure), [`Tier`] (which residency
 //! tier a key landed in → which format slab), and [`TwoQSplit`] (2Q's Kin/Kout knobs).
 
 use anyhow::{Result, ensure};
 use std::collections::{BTreeMap, HashMap, HashSet};
-
-/// How many times a hint veto actually CHANGED the eviction victim, and how many times it
-/// was dropped because honouring it left no victim at all. Hit-rate deltas are an indirect
-/// signal — these two count the mechanism firing, which is what separates "the veto never
-/// binds" from "the veto binds and does not help".
-pub static VETO_BOUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static VETO_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Empty advisory set: the no-hints fallback, and callers that have none.
-pub(crate) static EMPTY_SKIP: std::sync::LazyLock<HashSet<u32>> =
-    std::sync::LazyLock::new(HashSet::new);
 
 /// Recency-ordered set of keys: O(log n) MRU-insert / arbitrary-remove / pop-LRU
 /// via a monotonic tick clock + a `BTreeMap` whose front is the LRU end.
@@ -58,55 +47,22 @@ impl OrderedSet {
         Some(k)
     }
     /// The LRU key (and tick) without removing — for cross-set recency comparison (the
-    /// hybrid LRU picks the globally oldest across both tiers). Peek the LRU key skipping `must` (mandatory) and `advisory` (hints), falling back
-    /// to `must` alone when that leaves nothing. See [`pop_lru_skip`] for why the fallback
-    /// lives here and not at the call sites.
-    pub(crate) fn peek_lru_skip(
-        &self,
-        must: &HashSet<u32>,
-        advisory: &HashSet<u32>,
-    ) -> Option<(i64, u32)> {
-        self.peek_one(must, advisory).or_else(|| self.peek_one(must, &EMPTY_SKIP))
+    /// hybrid LRU picks the globally oldest across both tiers), skipping `must`.
+    pub(crate) fn peek_lru_skip(&self, must: &HashSet<u32>) -> Option<(i64, u32)> {
+        self.order.iter().find(|(_, k)| !must.contains(k)).map(|(t, k)| (*t, *k))
     }
-    fn peek_one(&self, must: &HashSet<u32>, advisory: &HashSet<u32>) -> Option<(i64, u32)> {
-        let skip = |k: &u32| must.contains(k) || advisory.contains(k);
-        self.order.iter().find(|(_, k)| !skip(k)).map(|(t, k)| (*t, *k))
-    }
-    /// Evict and return the LRU key, skipping two sets with DIFFERENT authority.
+    /// Evict and return the LRU key, skipping `must`.
     ///
     /// `must` is the per-batch pin set: a key touched (hit or admitted) earlier in this
     /// batch has to stay resident or the pin cannot resolve its slot ("expert not resident
     /// after alloc"). That is a correctness constraint and is never relaxed.
     ///
-    /// `advisory` is the LOOKA hint veto. It is a *prediction*, so it must never be able to
-    /// fail an allocation: if honouring it leaves no victim, it is dropped and the scan
-    /// retries against `must` alone. **The fallback lives here rather than at the eleven
-    /// call sites on purpose** — a policy that forgot it would turn an advisory signal into
-    /// a hard OOM, and `hybrid::HINT_CAP_PCT` would be load-bearing for correctness instead
-    /// of merely for hit rate.
-    pub(crate) fn pop_lru_skip(
-        &mut self,
-        must: &HashSet<u32>,
-        advisory: &HashSet<u32>,
-    ) -> Option<u32> {
-        use std::sync::atomic::Ordering as O;
-        let plain = self.peek_one(must, &EMPTY_SKIP);
-        let t = match self.peek_one(must, advisory) {
-            Some(v) => {
-                // The veto BOUND iff honouring it picked a different victim than LRU would
-                // have. Counting the veto set's size, or the hit rate, would not show this.
-                if plain.map(|p| p.1) != Some(v.1) {
-                    VETO_BOUND.fetch_add(1, O::Relaxed);
-                }
-                v.0
-            }
-            None => {
-                if plain.is_some() {
-                    VETO_DROPPED.fetch_add(1, O::Relaxed);
-                }
-                plain?.0
-            }
-        };
+    /// This took a second, ADVISORY skip set until 2026-07-31 — the LOOKA hint veto, which
+    /// could never be allowed to fail an allocation and so fell back to `must` alone. The
+    /// hint layer is gone (measured: the vetoes bound on ~0.9% of evictions and moved hit
+    /// rate by at most +0.1pp), and with it the two-authority scan and its fallback.
+    pub(crate) fn pop_lru_skip(&mut self, must: &HashSet<u32>) -> Option<u32> {
+        let t = self.peek_lru_skip(must)?.0;
         let k = self.order.remove(&t)?;
         self.at.remove(&k);
         Some(k)
@@ -126,7 +82,7 @@ pub enum Tier {
 /// 2Q's fixed split (the paper's Kin/Kout), expressed as PERCENTAGES of capacity so
 /// one setting transfers across pool sizes. `Kin` bounds the A1in probation
 /// (resident); `Kout` bounds the A1out ghost (key-only, not resident). The byte-aware
-/// [`crate::hybrid::HybridTwoQ`] scales these against its budget.
+/// [`crate::memory::hybrid::HybridTwoQ`] scales these against its budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TwoQSplit {
     kin_pct: u32,

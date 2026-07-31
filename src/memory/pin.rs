@@ -17,20 +17,20 @@
 //! Needs a backend (`rocm` or `vulkan`): without a device there is nothing to pin.
 #![cfg(any(feature = "rocm", feature = "vulkan"))]
 
-use crate::asyncfetch::{AsyncFetch, ReadSpec, Ticket};
-use crate::arena::{Arena, Reloc, Step};
+use crate::fetch::asyncfetch::{AsyncFetch, ReadSpec, Ticket};
+use crate::memory::arena::{Arena, Reloc, Step};
 use crate::backend::{Signal, memcpy_dtod};
-use crate::cache;
-use crate::config::Mode;
-use crate::device::{DeviceTier, VmmBuf};
-use crate::hybrid::HybridPolicy;
+use crate::memory::cache;
+use crate::artifact::config::Mode;
+use crate::memory::device::{DeviceTier, VmmBuf};
+use crate::memory::hybrid::HybridPolicy;
 use std::collections::HashMap;
-use crate::format::{Dtype, ExpertSet, FormatMeta, Safetensors, load_codebooks};
-use crate::model::ModelConfig;
-use crate::quant::{
+use crate::artifact::format::{Dtype, ExpertSet, FormatMeta, Safetensors, load_codebooks};
+use crate::artifact::model::ModelConfig;
+use crate::artifact::quant::{
     VQ_DIM, VQ_K, i4_expert_bytes, i4_slot_offsets, vq_expert_bytes, vq_slot_offsets,
 };
-use crate::stream::{Streamer, slot_span};
+use crate::fetch::stream::{Streamer, slot_span};
 use anyhow::{Context, Result, bail, ensure};
 use std::os::fd::RawFd;
 
@@ -492,7 +492,7 @@ impl ArenaPool {
     /// The slot's HOST address — the io_uring O_DIRECT destination (`ReadSpec.dst`).
     ///
     /// Same offset arithmetic as [`ArenaPool::ptr`], different base. The arena's slot
-    /// strides and the pool base are both `crate::stream::ALIGN`-aligned (checked in
+    /// strides and the pool base are both `crate::fetch::stream::ALIGN`-aligned (checked in
     /// `VmmBuf::new` and by the budget rounding in `Pin::build`), so every result satisfies
     /// the O_DIRECT alignment the streamer asserts.
     fn host_ptr(&self, hot: bool, idx: usize) -> *mut u8 {
@@ -527,19 +527,6 @@ impl ArenaPool {
     /// `slot_of` LATER (after any same-batch relocations settle).
     fn get(&mut self, key: u32) -> bool {
         self.policy.get(key)
-    }
-    /// Feed the policy this layer's look-ahead predictions, then advance the hint clock.
-    /// Ticking HERE (once per batch, in the pin) rather than inside each policy is what
-    /// makes the decay uniform: a policy that forgot to tick would accumulate vetoes
-    /// forever and silently starve its own eviction.
-    fn hint(&mut self, hints: &[crate::hybrid::Hint]) {
-        self.policy.tick_hints();
-        if !hints.is_empty() {
-            self.policy.hint(hints);
-        }
-    }
-    fn hint_stats(&self) -> (u64, u64) {
-        self.policy.hint_stats()
     }
     fn protect(&mut self, key: u32) {
         self.policy.protect(key);
@@ -625,12 +612,6 @@ impl<'a> Pin<'a> {
         self.fetch.wait(t, stream_raw)
     }
 
-    /// `(hints offered, of those already resident)`. A veto can only protect a resident
-    /// key, so this is what separates "the mechanism had nothing to do" from "the wiring
-    /// is broken" — two findings that need opposite fixes.
-    pub fn hint_stats(&self) -> (u64, u64) {
-        self.routed.hint_stats()
-    }
 
     /// Build the resident set from the artifact directory `dir`. `capacity` is the
     /// total device budget (auto-discovered); the always-resident set takes its
@@ -791,7 +772,7 @@ impl<'a> Pin<'a> {
                     &format!("{lb}.mlp.gate.e_score_correction_bias"),
                     Dtype::F32,
                 )?;
-                let bias = crate::quant::read_f32(bias);
+                let bias = crate::artifact::quant::read_f32(bias);
                 ensure!(
                     bias.len() == cfg.n_experts,
                     "layer {l} gate bias has {} entries, expected {}",
@@ -850,7 +831,7 @@ impl<'a> Pin<'a> {
         // anchor is aligned: HOT slots sit at `budget − (idx+1)*hot_stride`, so an
         // unaligned `budget` makes every hot-slot dst violate the O_DIRECT alignment
         // the streamer asserts (base + strides are already 4096-aligned). Costs <4 KiB.
-        let budget = capacity.saturating_sub(tier_cap) & !(crate::stream::ALIGN - 1);
+        let budget = capacity.saturating_sub(tier_cap) & !(crate::fetch::stream::ALIGN - 1);
         let vq_tier = || -> Result<TierFmt> {
             let s = vq_src.as_ref().context("vq source missing")?;
             Ok(TierFmt {
@@ -883,7 +864,7 @@ impl<'a> Pin<'a> {
         };
         let (cold_stride, hot_stride) = (cold.stride, hot.stride);
         let policy =
-            crate::hybrid::make(cache_policy, budget, cold_stride, hot_stride, two_q)
+            crate::memory::hybrid::make(cache_policy, budget, cold_stride, hot_stride, two_q)
                 .with_context(|| {
                     format!("unknown --cache-policy {cache_policy} (lru|2q|arc|top-m)")
                 })?;
@@ -1042,7 +1023,6 @@ impl<'a> Pin<'a> {
         sel: &[usize],
         window: &[usize],
         choice: &[f32],
-        hints: &[crate::hybrid::Hint],
     ) -> Result<([Option<ResolvedSlot>; 32], Vec<Signal>, Vec<Ticket>)> {
         let cfg = self.cfg;
         let sparse = (layer - cfg.dense_layers) * cfg.n_experts; // read-table row base
@@ -1062,10 +1042,6 @@ impl<'a> Pin<'a> {
             }
         }
         self.routed.begin_batch();
-        // Predictions for L+1/L+2 enter the policy as eviction VETOES, never as accesses —
-        // see `hybrid::Hint`. They cannot influence `sel` (routing no longer consults
-        // residency), so this is output-neutral by construction.
-        self.routed.hint(hints);
         // Trace sink (--trace), v2: the demand keys this layer looks up, then `|`, then
         // the top-`TRACE_WINDOW` candidates as `key:choice`.
         //
@@ -1225,9 +1201,8 @@ impl<'a> Pin<'a> {
         out: &mut Vec<MlpVq>,
         fmt: &mut Vec<bool>,
         tickets: &mut Vec<Ticket>,
-        hints: &[crate::hybrid::Hint],
     ) -> Result<Vec<Signal>> {
-        let (slots, signals, tk) = self.submit_spine(layer, sel, window, choice, hints)?;
+        let (slots, signals, tk) = self.submit_spine(layer, sel, window, choice)?;
         out.clear();
         fmt.clear();
         tickets.clear();
@@ -1270,7 +1245,7 @@ fn build_moe_table(
 
 #[cfg(test)]
 mod ticket_tests {
-    use crate::asyncfetch::Ticket;
+    use crate::fetch::asyncfetch::Ticket;
 
     /// **INV-5: an expert cannot be launched without enqueueing its data dependency.**
     ///

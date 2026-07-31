@@ -315,7 +315,7 @@ pub unsafe fn fill_u32(dst: *mut u8, pat: u32, bytes: usize) -> Result<()> {
 ///
 /// # Safety
 /// Every device pointer (`descs`/codebooks/`wexpert`/`x`/`h`/`acc`) must outlive
-/// `stream`'s completion — await its [`Signal`](crate::gpustream::Signal), and each must
+/// `stream`'s completion — await its [`Signal`](crate::backend::gpustream::Signal), and each must
 /// own `nrow` rows in the layout above.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn launch_moe_expert_range(
@@ -363,7 +363,7 @@ pub unsafe fn launch_moe_expert_range(
 ///
 /// # Safety
 /// Every device pointer (`descs`/packed weights/`wexpert`/`x`/`h`/`acc`) must
-/// outlive `stream`'s completion — await its [`Signal`](crate::gpustream::Signal).
+/// outlive `stream`'s completion — await its [`Signal`](crate::backend::gpustream::Signal).
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn launch_moe_expert_range_i4(
     x: *const f32,

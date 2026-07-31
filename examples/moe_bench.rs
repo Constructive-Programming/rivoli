@@ -24,9 +24,9 @@
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
 use rivoli::backend::{Event, ExpertDesc, Stream, device_sync, launch_moe_acc_drain, launch_moe_expert_range};
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
-use rivoli::device::DeviceBuf;
+use rivoli::memory::device::DeviceBuf;
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
-use rivoli::quant::{VQ_DIM, VQ_K, vq_expert_bytes, vq_slot_offsets};
+use rivoli::artifact::quant::{VQ_DIM, VQ_K, vq_expert_bytes, vq_slot_offsets};
 
 /// The engine's shapes (GLM-5.2): hidden 6144, moe_inter 2048, top-8 routed + 1 shared.
 #[cfg(any(feature = "rocm", feature = "vulkan"))]

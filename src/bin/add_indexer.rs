@@ -14,8 +14,8 @@
 //! usage: add_indexer <artifact-dir> <indexer-stash.safetensors>
 
 use anyhow::{Context, Result, ensure};
-use rivoli::format::{SafeWriter, Safetensors};
-use rivoli::model::ModelConfig;
+use rivoli::artifact::format::{SafeWriter, Safetensors};
+use rivoli::artifact::model::ModelConfig;
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);

@@ -25,32 +25,11 @@ use crate::backend::{
     launch_moe_acc_drain, launch_moe_expert_range, launch_moe_expert_range_i4, launch_rmsnorm,
     launch_rope, launch_swiglu, launch_vadd, stream_signal,
 };
-use crate::device::DeviceBuf;
-use crate::math::{E4M3_BLOCK, nll_of, route_into, topk_into};
-use crate::model::ModelConfig;
-use crate::asyncfetch::Ticket;
-use crate::pin::{Fp8Mlp, IndexerPin, LayerMlp, MlpVq, Pin, TRACE_WINDOW};
-
-/// How many layers ahead the pilot predicts. `trace` builds evaluate both so LOOKA can
-/// report the L+2 curve; `--pilot` alone only consumes L+1's rank 0, so it pays for one
-/// rmsnorm+gemv instead of two.
-/// Default hint width per horizon. **Zero — the veto was measured and does not pay.**
-///
-/// Across a 4.6x range of cache pressure (`--max-mem` 115/40/30/25, hit 78.0/34.4/20.5/14.6%)
-/// enabling hints moved hit rate by at most +0.1pp while costing 3-8% throughput for the
-/// pilot's per-layer rmsnorm+gemv+D2H. The mechanism is not broken: vetoes BIND (23/220/137
-/// at 40/30/25 GiB) and none were ever dropped for cap. It is simply too weak — 220 bound
-/// vetoes against ~25,700 evictions is 0.9% of decisions.
-///
-/// The reason is structural. At 30 GiB the pool is ~965 slots taking ~7 evictions/layer, so
-/// a key survives ~138 layers; a 1-2 layer veto can only bind on a key already within 1-2
-/// layers of the LRU end, and a next-layer prediction is warm, so it sits at the far end.
-/// Making it bind would need a horizon near the eviction horizon (~138 layers), where
-/// LOOKA's precision (77.2% at L+1, 68.9% at L+2) has long since collapsed.
-///
-/// Kept as a flag, not deleted: the counters and the plumbing are what make the next
-/// horizon/pressure question one run instead of one rebuild. Set `--hint-k 3` to re-enable.
-pub const DEFAULT_HINT_K: usize = 0;
+use crate::memory::device::DeviceBuf;
+use crate::math::{E4M3_BLOCK, route_into, topk_into};
+use crate::artifact::model::ModelConfig;
+use crate::fetch::asyncfetch::Ticket;
+use crate::memory::pin::{Fp8Mlp, IndexerPin, LayerMlp, MlpVq, Pin, TRACE_WINDOW};
 
 /// Fixed-point MoE accumulator rows: ONE PER STREAM (compute = 0, miss = 1), summed by
 /// `moe_acc_drain`. Not per expert — every expert on a stream shares its row, and integer
@@ -63,18 +42,6 @@ pub const DEFAULT_HINT_K: usize = 0;
 /// independent; the drain pays 2 reads instead of the old reduce's 9.
 const MOE_ACC_ROWS: usize = 2;
 
-const PILOT_H: [usize; 2] = [1, 2];
-/// Both horizons, always. The hint layer wants L+1 AND L+2 (a two-layer lead lets a veto
-/// outlive one layer of eviction pressure), and LOOKA reports the L+2 curve from the same
-/// pass, so there is no configuration in which only one is wanted.
-const PILOT_HORIZONS: usize = 2;
-// The stash in `looka` is indexed by position in ITS horizon array; if the two drift the
-// recall counters silently attribute L+2 hits to L+1.
-#[cfg(feature = "trace")]
-const _: () = assert!(
-    PILOT_H[0] == crate::looka::HORIZONS[0] && PILOT_H[1] == crate::looka::HORIZONS[1],
-    "gpu::PILOT_H and looka::HORIZONS must agree"
-);
 use crate::telemetry::ProfileSummary;
 use anyhow::{Context, Result, bail, ensure};
 
@@ -183,11 +150,6 @@ fn desc_of_vq(m: &MlpVq) -> ExpertDesc {
 #[derive(Default)]
 struct Profile {
     fetch_n: u64, // demand misses
-    /// Speculative reads issued (`--pilot`). Kept SEPARATE from `fetch_n` because they are
-    /// not misses — a hit-rate that counted them would flatter itself — but they are real
-    /// bytes off the same device, so `gb_per_tok` and `ms_per_miss` are computed over the
-    /// sum. Omitting them understated the pilot's first run by 0.43 GB/token.
-    spec_n: u64,
     route_ns: u128, // host routing (gate D2H + sigmoid/bias/top-k, + top-m substitution)
     /// The DSA indexer's HIP-event SPAN — including whatever falls between its kernels,
     /// so NOT comparable to a per-kernel microbench sum. Measured 27% above one, cause
@@ -352,8 +314,8 @@ impl Profile {
             miss_per_tok: self.fetch_n as f64 / tok,
             // Over ALL reads the reaper serviced, demand and speculative alike —
             // `fetch_wall_ns` covers both, so `fetch_n` alone is the wrong denominator.
-            ms_per_miss: fetch_wall_ns as f64 / 1e6 / (self.fetch_n + self.spec_n).max(1) as f64,
-            gb_per_tok: (self.fetch_n + self.spec_n) as f64 / tok * bytes_per_expert as f64
+            ms_per_miss: fetch_wall_ns as f64 / 1e6 / self.fetch_n.max(1) as f64,
+            gb_per_tok: self.fetch_n as f64 / tok * bytes_per_expert as f64
                 / 1e9,
             // CLASS partition of the same wall. `gpu_wait` collects the explicitly
             // wrapped joins PLUS `compute_gpu`: during the MoE compute-stream span the
@@ -483,25 +445,6 @@ pub struct GpuEngine<'a> {
     attn_partial: DeviceBuf,
     ctx: DeviceBuf,
     gate_logits: DeviceBuf,
-    /// LOOKA (CACHE_PILOT Step 1): scratch for running a FUTURE layer's router against
-    /// this layer's post-attention residual. Separate from `xn`/`gate_logits` so the pilot
-    /// cannot perturb the real forward pass — the whole point is a zero-effect measurement.
-    /// `pilot_logits` holds both horizons back-to-back so one D2H serves both.
-    pilot_xn: DeviceBuf,
-    pilot_logits: DeviceBuf,
-    /// `--hint-k`: how many top-ranked predictions per horizon to feed the cache policy as
-    /// eviction vetoes. Always on; 0 disables.
-    hint_k: usize,
-    /// Routing scratch for the pilot, deliberately separate from the hot path's
-    /// `scores`/`choice`/`sel`/`cand` so a prediction can never perturb a real selection.
-    pilot_scores: Vec<f32>,
-    pilot_choice: Vec<f32>,
-    pilot_sel: Vec<usize>,
-    pilot_host: Vec<u8>,
-    /// This layer's predictions for L+1 and L+2, handed to `submit_layer` and on to the
-    /// cache policy. Rebuilt every layer; never carried, because a stale hint names a layer
-    /// that has already been decided.
-    hints: Vec<crate::hybrid::Hint>,
     // Dense-MLP fp8 SwiGLU scratch (gate/up projections, dense_inter wide).
     mlp_g: DeviceBuf,
     mlp_u: DeviceBuf,
@@ -543,7 +486,7 @@ pub struct GpuEngine<'a> {
     /// than multiplying by it, which is why the union cannot perturb a row's own result.
     w: Vec<f32>,
     /// Each token row's own top-`top_k` picks, before the union. Row 0's also feeds
-    /// LOOKA/trace, which stay defined on the real token rather than the draft.
+    /// trace, which stays defined on the real token rather than the draft.
     sel_row: [Vec<usize>; MAXROW],
     /// Each row's normalized routed weights, parallel to `sel_row[r]`.
     wrow: [Vec<f32>; MAXROW],
@@ -564,8 +507,6 @@ pub struct GpuEngine<'a> {
     /// which encoded "do not await" as host data and could silently disagree with the real
     /// dependency — see the launch loop for the failure that caused.
     tickets: Vec<Ticket>,
-    #[cfg(feature = "trace")]
-    looka: crate::looka::Looka,
     gl_host: Vec<u8>,
     argmax_host: Vec<u8>,
     /// Always-on cheap per-token profiling (see [`Profile`]).
@@ -736,14 +677,6 @@ impl<'a> GpuEngine<'a> {
             attn_partial: f(MAXROW * crate::backend::attend_scratch_floats(h, kvl))?,
             ctx: f(MAXROW * h * cfg.v_head_dim)?,
             gate_logits: f(MAXROW * cfg.n_experts)?,
-            pilot_xn: f(cfg.hidden)?,
-            pilot_logits: f(cfg.n_experts * PILOT_HORIZONS)?,
-            hint_k: DEFAULT_HINT_K,
-            pilot_scores: vec![0.0; cfg.n_experts],
-            pilot_choice: vec![0.0; cfg.n_experts],
-            pilot_sel: Vec::with_capacity(16),
-            pilot_host: Vec::new(),
-            hints: Vec::new(),
             mlp_g: f(MAXROW * cfg.dense_inter)?,
             mlp_u: f(MAXROW * cfg.dense_inter)?,
             moe_out: f(MAXROW * cfg.hidden)?,
@@ -793,8 +726,6 @@ impl<'a> GpuEngine<'a> {
             descs_vq: Vec::with_capacity(slots),
             fmt: Vec::with_capacity(slots),
             tickets: Vec::with_capacity(slots),
-            #[cfg(feature = "trace")]
-            looka: crate::looka::Looka::new(cfg.n_layers),
             gl_host: Vec::with_capacity(MAXROW * cfg.n_experts * 4),
             argmax_host: Vec::with_capacity(ARGMAX_BYTES),
             prof: Profile::default(),
@@ -831,10 +762,6 @@ impl<'a> GpuEngine<'a> {
     pub fn hits(&self) -> u64 {
         self.pin.hits
     }
-    /// `(hints offered, of those already resident)`. A veto only protects a RESIDENT key.
-    pub fn hint_stats(&self) -> (u64, u64) {
-        self.pin.hint_stats()
-    }
 
     pub fn misses(&self) -> u64 {
         self.pin.misses
@@ -854,10 +781,6 @@ impl<'a> GpuEngine<'a> {
         self.pin.tracing()
     }
 
-    /// (drafts produced, drafts the main model then agreed with). Empty unless `--mtp`.
-    pub fn mtp_accept(&self) -> (u64, u64) {
-        (self.mtp_seen, self.mtp_hit)
-    }
 
     pub fn set_moe_gain(&mut self, g: f32) {
         if g != 1.0 {
@@ -866,10 +789,6 @@ impl<'a> GpuEngine<'a> {
         self.moe_gain = g;
     }
 
-    /// `--hint-k`: how many predictions per horizon feed the cache policy (0 disables).
-    pub fn set_hint_k(&mut self, k: usize) {
-        self.hint_k = k;
-    }
 
     /// DIAGNOSTIC: hash the residual stream after every layer (`--checksum-x`).
     #[cfg(feature = "trace")]
@@ -1514,104 +1433,6 @@ impl<'a> GpuEngine<'a> {
                 }
             }
 
-            // --- LOOKA pilot (CACHE_PILOT Step 1, `--features trace`) ---
-            // Run FUTURE layers' routers against THIS layer's post-attention residual and
-            // stash what they name. Placed here deliberately: `xp` still holds the
-            // post-attention residual, before the MoE result is added back into it — which
-            // is exactly the state a real prefetcher would have to predict from, since
-            // layer L+h's true input needs L's MoE output that has not been computed yet.
-            // That staleness IS the thing being measured; correcting for it would measure a
-            // predictor nobody can build.
-            // Stale guesses must never outlive the layer that made them: a skipped pilot
-            // (dense target) would otherwise hand the next `submit_layer` the PREVIOUS
-            // layer's predictions, which are for the wrong layer entirely.
-            self.hints.clear();
-            if self.hint_k > 0 || cfg!(feature = "trace") {
-                let mut any = false;
-                for (hi, &dh) in PILOT_H[..PILOT_HORIZONS].iter().enumerate() {
-                    let t = l + dh;
-                    if t >= cfg.n_layers {
-                        continue;
-                    }
-                    // Copy the pointers out before touching `self.looka` — same borrow
-                    // dance as the layer header above.
-                    let tw = &self.pin.layers[t];
-                    let t_post_ln = tw.post_ln;
-                    let t_gate_w = match &tw.mlp {
-                        LayerMlp::Moe { gate_w, .. } => *gate_w,
-                        // A dense target has no router to run. Leaving the stash empty
-                        // keeps it out of the denominator rather than scoring a miss.
-                        LayerMlp::Dense(_) => continue,
-                    };
-                    let pxn = self.pilot_xn.ptr_mut() as *mut f32;
-                    let plp = (self.pilot_logits.ptr_mut() as *mut f32).wrapping_add(hi * cfg.n_experts);
-                    // SAFETY: `xp` is the live residual; `t_post_ln`/`t_gate_w` are resident
-                    // F32 dense weights (never streamed, so valid for any layer at any
-                    // time); `pxn`/`plp` are engine-owned scratch, and `plp` is in bounds
-                    // because `pilot_logits` is sized HORIZONS.len() * n_experts. Both
-                    // launches are stream-ordered, so the gemv sees the norm's output.
-                    // ROW 0 ONLY, on both sides of the batch. LOOKA measures a PREDICTOR
-                    // against what the real token's router chose, and row 0 is the real
-                    // token; scoring a speculative row would mix "was the prediction
-                    // right" with "was the draft accepted".
-                    unsafe {
-                        launch_rmsnorm(xp, t_post_ln, hidden, eps, pxn)?;
-                        launch_gemv_f32(pxn, t_gate_w, cfg.n_experts, hidden, 1, plp)?;
-                    }
-                    any = true;
-                }
-                if any {
-                    // ONE D2H for both horizons. This is the only sync the pilot adds that
-                    // the forward pass does not already pay, so it is kept to a single
-                    // join rather than one per horizon.
-                    let (pl, host) = (&self.pilot_logits, &mut self.pilot_host);
-                    blocked(&mut self.prof.sync_wait_ns, "gpu-wait/pilot-d2h", || {
-                        pl.copy_out_into(host)
-                    })?;
-                    for (hi, &dh) in PILOT_H[..PILOT_HORIZONS].iter().enumerate() {
-                        let t = l + dh;
-                        if t >= cfg.n_layers
-                            || !matches!(self.pin.layers[t].mlp, LayerMlp::Moe { .. })
-                        {
-                            continue;
-                        }
-                        let lo = hi * cfg.n_experts * 4;
-                        // Route the pilot the SAME way the real path will, minus the
-                        // cache-conditional advice: `top-m` reorders on residency, and a
-                        // prediction that consulted residency would be scoring the cache
-                        // rather than the predictor it is supposed to be scoring.
-                        crate::math::route_into(
-                            &self.pilot_host[lo..lo + cfg.n_experts * 4],
-                            self.pin.moe_bias(t),
-                            cfg.top_k,
-                            &mut self.pilot_scores,
-                            &mut self.pilot_choice,
-                            &mut self.pilot_sel,
-                        );
-                        // The prefetch request: rank 0 of the L+1 prediction, the 99%
-                        // p@0 arm. Taken before the trace-only stash so `--pilot` works in
-                        // a build with no LOOKA counters at all.
-                        // Emit this horizon's top-`hint_k` as eviction vetoes. `dh` is both
-                        // the horizon and the TTL: a hint for L+2 must outlive one more
-                        // layer of eviction than one for L+1.
-                        if self.hint_k > 0 {
-                            let hk = self.hint_k;
-                            self.hints.extend(
-                                self.pilot_sel.iter().take(hk).enumerate().map(|(r, &pe)| {
-                                    crate::hybrid::Hint {
-                                        key: crate::pin::expert_key(t, pe),
-                                        horizon: dh as u8,
-                                        rank: r as u8,
-                                    }
-                                }),
-                            );
-                        }
-                        #[cfg(feature = "trace")]
-                        self.looka.stash(t, hi, &self.pilot_sel);
-                    }
-                }
-            }
-
             // --- MLP sublayer (out fully written; the outer vadd adds moe_out) ---
             if let Some(m) = dense_mlp {
                 let inter = m.gate.o_dim;
@@ -1684,7 +1505,7 @@ impl<'a> GpuEngine<'a> {
                 })?;
                 // Routing is a pure function of (logits, bias, top_k) — it does NOT
                 // consult residency. `top-m` used to make it cache-conditional; removing it
-                // is what lets the LOOKA hint layer be output-neutral by construction
+                // is what makes every cache change output-neutral by construction
                 // (math.rs `inv_1_routing_never_consults_the_cache`).
                 let t_route = std::time::Instant::now();
                 // One routing per token row, then the UNION. The rows are INDEPENDENT
@@ -1692,7 +1513,7 @@ impl<'a> GpuEngine<'a> {
                 // decision, not a modelling one, and each row's weights are normalized
                 // over its OWN top-k exactly as an unbatched pass would.
                 //
-                // Descending, so `scores`/`choice` are left holding ROW 0 for the LOOKA
+                // Descending, so `scores`/`choice` are left holding ROW 0 for the
                 // scorer and the trace window below: those measure the router against the
                 // real token, and row 0 is the real token.
                 let ne = cfg.n_experts * 4;
@@ -1740,16 +1561,6 @@ impl<'a> GpuEngine<'a> {
                 self.prof.cpu_route_ns += e_route.duration_since(t_route).as_nanos();
                 crate::telemetry::spans::record("cpu/route-into", "decode", t_route, e_route);
                 self.prof.route_ns += t.elapsed().as_nanos();
-                // LOOKA: score whatever layers `l-1` / `l-2` predicted for THIS layer
-                // against what it actually chose, then roll `sel` into the previous-token
-                // baseline. Deliberately outside both route clocks (they close above) —
-                // this is measurement, not routing, and `route_ns` has to stay comparable
-                // across this change.
-                #[cfg(feature = "trace")]
-                {
-                    let (lk, sel) = (&mut self.looka, &self.sel_row[0]);
-                    lk.score(l, sel);
-                }
                 // Trace v2 only: re-rank the same `choice` array to the wider candidate
                 // window the offline (J, M) grid needs. Deliberately outside the
                 // `route_ns` clock and behind the trace gate, so the decode path is
@@ -1787,7 +1598,6 @@ impl<'a> GpuEngine<'a> {
                     &mut self.mlps_vq,
                     &mut self.fmt,
                     &mut self.tickets,
-                    &self.hints,
                 )?;
                 // Pure host work: residency lookups + policy bookkeeping + read specs.
                 // It only ENQUEUES the reads; the reaper thread does the waiting.
@@ -2229,6 +2039,7 @@ impl<'a> GpuEngine<'a> {
     /// against ~0.96 GB/token of expert streaming — noise. A device-side log-softmax would
     /// be a kernel to write, test and debug in order to save 0.06% of the traffic.
     // ponytail: host log-softmax, no kernel.
+    #[cfg(feature = "teacher-forcing")]
     pub fn nll_forced(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
         ensure!(ids.len() >= 2, "need at least 2 tokens to score a prediction");
         let vocab = self.cfg.vocab;
@@ -2249,7 +2060,7 @@ impl<'a> GpuEngine<'a> {
                 self.logits.copy_out_into(&mut host)?;
                 // `logits` is MAXROW rows wide; a single-row forward writes only row 0.
                 ensure!(host.len() >= vocab * 4, "short logits D2H");
-                out.push(nll_of(&host[..vocab * 4], next as usize)?);
+                out.push(crate::eval::nll_of(&host[..vocab * 4], next as usize)?);
             }
             Ok(out)
         })?;
@@ -2534,7 +2345,7 @@ impl<'a> GpuEngine<'a> {
         })?;
         self.prof.wall_ns = decode_wall.elapsed().as_nanos();
         self.prof.tokens = generated.len() as u64;
-        let bytes_per_expert = crate::quant::vq_expert_bytes(self.cfg.hidden, self.cfg.moe_inter);
+        let bytes_per_expert = crate::artifact::quant::vq_expert_bytes(self.cfg.hidden, self.cfg.moe_inter);
         // The accurate async-side decomposition: reaper fetch wall + the expert
         // stream's tokio-metrics (idle = load-wait, poll = launch).
         let summary = self.prof.summary(
@@ -2612,16 +2423,6 @@ impl<'a> GpuEngine<'a> {
                     "  MTP accept by TARGET confidence: {}",
                     hist(&self.mtp_tgt_bins)
                 );
-            }
-        }
-        // LOOKA sits beside the profile rather than inside it: it is a property of the
-        // ROUTER (would a prefetcher guess right?), not of where this run spent its time,
-        // and it only exists in `trace` builds.
-        #[cfg(feature = "trace")]
-        {
-            tracing::info!("{}", self.looka.report());
-            for line in self.looka.rank_report() {
-                tracing::info!("{}", line);
             }
         }
         Ok((generated, summary))

@@ -22,7 +22,7 @@
 //! figures at matched `--max-mem` and `--cache-policy`, not just diff the token stream —
 //! which is now possible, because [`Event`] returns real GPU milliseconds.
 
-use crate::vk::{Q, Signal, Stamp, gpu};
+use crate::backend::vk::{Q, Signal, Stamp, gpu};
 use anyhow::Result;
 use std::ffi::c_void;
 

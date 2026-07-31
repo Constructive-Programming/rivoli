@@ -1,6 +1,6 @@
 //! Offline cache-policy A/B, 2Q Kin/Kout sweep, and the [CACHE_ROUTE](../../docs/CACHE_ROUTE.md)
 //! offline screen. Replays a routed-expert access trace (captured with `rivoli --trace`)
-//! through the SAME byte-aware policies the engine runs ([`rivoli::hybrid`]) at a chosen
+//! through the SAME byte-aware policies the engine runs ([`rivoli::memory::hybrid`]) at a chosen
 //! slot count — unit strides make the byte budget a plain slot count — and prints the
 //! residency (loaded %). Pure CPU, milliseconds: compare policies without a full GPU
 //! decode run.
@@ -17,8 +17,8 @@
 //! usage: replay <trace> <n_slots> [--kin <pct>] [--kout <pct>] [--sweep] [--policy <p>]
 
 use anyhow::{Context, Result, bail};
-use rivoli::cache::TwoQSplit;
-use rivoli::hybrid::{self, HybridPolicy};
+use rivoli::memory::cache::TwoQSplit;
+use rivoli::memory::hybrid::{self, HybridPolicy};
 use std::io::BufRead;
 
 /// The Kin/Kout grid a `--sweep` walks. Kin is a resident probation bound so it is

@@ -1,5 +1,5 @@
 //! convert — GLM-5.2 fp8 checkpoint → the rivoli int3-vq artifact (see
-//! docs/ARCHITECTURE.md + src/format.rs). Learns 3 per-projection codebooks,
+//! docs/ARCHITECTURE.md + src/artifact/format.rs). Learns 3 per-projection codebooks,
 //! VQ-encodes the routed + shared experts into per-layer `.vq3` files, and
 //! assembles the resident set (attention/dense fp8 copied native, norms + router
 //! gate bf16→f32, embed/lm_head bf16→int8) into `resident.safetensors`, plus a
@@ -11,9 +11,9 @@
 //! usage: convert <fp8-dir> <out-dir> [--layers N] [--sample-experts N] [--kmeans-iters N]
 
 use anyhow::{Context, Result, ensure};
-use rivoli::format::{Dtype, FormatMeta, SafeWriter, Safetensors, Vq3Header};
+use rivoli::artifact::format::{Dtype, FormatMeta, SafeWriter, Safetensors, Vq3Header};
 use rivoli::math::{bf16_to_f32, f32_to_bf16};
-use rivoli::quant::{
+use rivoli::artifact::quant::{
     VQ_ALIGN, VQ_DIM, VQ_GROUP, VQ_K, quant_vq, read_f32, vq_expert_bytes, vq_expert_layout,
     vq_proj_bytes, vq_row_bytes,
 };
@@ -31,9 +31,9 @@ const PROJ: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
 #[cfg(feature = "rocm")]
 mod gpu {
     use super::*;
-    use rivoli::device::DeviceBuf;
-    use rivoli::hip::{device_sync, launch_vq_encode};
-    use rivoli::quant::{set_idx, vq_groups};
+    use rivoli::memory::device::DeviceBuf;
+    use rivoli::backend::hip::{device_sync, launch_vq_encode};
+    use rivoli::artifact::quant::{set_idx, vq_groups};
 
     fn f32_as_bytes(v: &[f32]) -> &[u8] {
         // SAFETY: f32 is POD; the view is `4·len` read-only bytes (LE host == LE device).
@@ -56,7 +56,7 @@ mod gpu {
 
     impl Encoder {
         pub fn new(codebook: &[f32], max_sub: usize) -> Result<Self> {
-            let cbnorm = rivoli::quant::codebook_norms(codebook);
+            let cbnorm = rivoli::artifact::quant::codebook_norms(codebook);
             let mut cb = DeviceBuf::new(codebook.len() * 4)?;
             cb.copy_in_at(0, f32_as_bytes(codebook))?;
             let mut nb = DeviceBuf::new(cbnorm.len() * 4)?;
@@ -563,7 +563,7 @@ fn main() -> Result<()> {
     eprintln!("convert: mtp head {}", if mtp { "carried" } else { "absent" });
     let moe_layers: Vec<usize> = (d.dense_layers..last).chain(mtp.then_some(d.n_layers)).collect();
 
-    let stride = rivoli::quant::vq_expert_stride(d.hidden, d.moe_inter);
+    let stride = rivoli::artifact::quant::vq_expert_stride(d.hidden, d.moe_inter);
     let ebytes = vq_expert_bytes(d.hidden, d.moe_inter);
     for &l in &moe_layers {
         let path = format!("{}/L{l:02}.vq3", args.out_dir);
@@ -748,7 +748,7 @@ mod tests {
     fn expert_block_slices_via_loader() {
         // Encode a synthetic expert against tiny codebooks, then slice it with the
         // loader's vq_expert and check GEMV reproduces — the write↔read contract.
-        use rivoli::quant::{matvec_vq, vq_expert};
+        use rivoli::artifact::quant::{matvec_vq, vq_expert};
         let (hidden, moe_inter) = (VQ_GROUP, VQ_GROUP);
         let mut cbs: [Vec<f32>; 3] = std::array::from_fn(|p| {
             let mut cb = vec![1e30f32; VQ_K * VQ_DIM];

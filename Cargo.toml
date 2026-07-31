@@ -54,6 +54,9 @@ clap = { version = "4", default-features = false, features = [
 ] }
 
 [features]
+# Teacher-forced scoring (`--ppl`). Off by default: it is a quality INSTRUMENT, not
+# part of decoding, and `src/eval.rs` is the whole of it (see lib.rs).
+teacher-forcing = []
 default = []
 # build.rs compiles kernels/*.hip via hipcc; pulls in the async streaming stack.
 rocm = ["dep:tokio", "dep:futures-util", "dep:tokio-stream", "dep:tokio-metrics", "dep:io-uring"]

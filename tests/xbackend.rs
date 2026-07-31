@@ -105,8 +105,8 @@ fn swiglu_bytes() {
 
 #[cfg(all(feature = "rocm", not(feature = "vulkan")))]
 fn run_swiglu(g: &[f32], u: &[f32]) -> Vec<u8> {
-    use rivoli::device::DeviceBuf;
-    use rivoli::hip::{device_sync, launch_swiglu};
+    use rivoli::memory::device::DeviceBuf;
+    use rivoli::backend::hip::{device_sync, launch_swiglu};
     let n = g.len();
     let mut gb = DeviceBuf::new(n * 4).expect("g");
     gb.copy_in_at(0, bytemuck_f32(g)).expect("fill g");
@@ -129,7 +129,7 @@ fn run_swiglu(g: &[f32], u: &[f32]) -> Vec<u8> {
 
 #[cfg(all(feature = "vulkan", not(feature = "rocm")))]
 fn run_swiglu(g: &[f32], u: &[f32]) -> Vec<u8> {
-    use rivoli::vk::{Buf, device_sync, launch_swiglu};
+    use rivoli::backend::vk::{Buf, device_sync, launch_swiglu};
     let n = g.len();
     let mut gb = Buf::new(n * 4).expect("g");
     gb.write_at(0, bytemuck_f32(g)).expect("fill g");

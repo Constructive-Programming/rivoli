@@ -21,7 +21,7 @@ a STATE block that gives the current answer in ~15 lines.
 | What Vulkan can and cannot run | `VULKAN.md` §"Kernel inventory" | the other 110 KB — it is a port journal |
 | Whether the NPU offload is worth it | `NPU.md` §"The finding, in five lines" | the other 55 KB |
 | How the expert cache decides residency | `../MODES.md` §"Cache policies", then `CACHE_ROUTE.md` §"Design" | `CACHE_ROUTE.md` §"RETIRED" onwards — `top-m` is gone |
-| Whether cross-layer prefetch works | `CACHE_PILOT.md` header. Built, **default off**, measured inert | — |
+| Whether cross-layer prefetch works | `CACHE_PILOT.md` header. Built, measured inert, **deleted 2026-07-31** | assuming `--hint-k` still exists; it does not |
 | How to read a trace / profile | `TRACES.md` §"What to actually look at" | `GPU_TRACE.md` unless you are attaching a profiler |
 
 ## The docs, one line each
@@ -43,7 +43,7 @@ a STATE block that gives the current answer in ~15 lines.
 - **`NPU.md`** (57 KB) — DSA indexer offload to the NPU. Answer is in the first 40 lines;
   the device top-k it recommended is **built and shipped** (−9.4 ms/token).
 - **`CACHE_ROUTE.md`** (29 KB) — routing-aware caching. `top-m` **RETIRED 2026-07-30**.
-- **`CACHE_PILOT.md`** (28 KB) — LOOKA + speculative loader. Built, **default off**.
+- **`CACHE_PILOT.md`** (28 KB) — LOOKA + the `--hint-k` veto layer. **Removed from the engine 2026-07-31**; the doc is the record of why. `bin/replay`'s offline `Pilot` is unaffected.
 - **`PERF.md`** (39 KB) — the performance roadmap. The ranked table at the bottom is the
   live part; everything above is the evidence for a row in it.
 - **`TRACES.md`** (16 KB) / **`GPU_TRACE.md`** (9 KB) — OTLP spans, and why ROCm GPU
