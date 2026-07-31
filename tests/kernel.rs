@@ -150,7 +150,7 @@ fn mla_value_rejects_ragged_kvl_but_absorb_accepts_it() {
                 nope,
                 vh,
                 kvl,
-                block,
+                block, 1,
                 out.ptr_mut() as *mut f32,
             )
         };
@@ -172,7 +172,7 @@ fn mla_value_rejects_ragged_kvl_but_absorb_accepts_it() {
                 nope,
                 vh,
                 kvl,
-                block,
+                block, 1,
                 out.ptr_mut() as *mut f32,
             )
         };
@@ -251,7 +251,7 @@ fn gemv_i8_matches_oracle() {
                 pb.ptr(),
                 sb.ptr() as *const f32,
                 o_dim,
-                i_dim,
+                i_dim, 1,
                 yb.ptr_mut() as *mut f32,
             )
             .expect("launch");
@@ -547,7 +547,7 @@ fn check_mla_fp8(seed: u64, h: usize, qh: usize, nope: usize, vh: usize, kvl: us
             nope,
             vh,
             kvl,
-            block,
+            block, 1,
             absb.ptr_mut() as *mut f32,
         )
         .expect("launch absorb");
@@ -560,7 +560,7 @@ fn check_mla_fp8(seed: u64, h: usize, qh: usize, nope: usize, vh: usize, kvl: us
                 nope,
                 vh,
                 kvl,
-                block,
+                block, 1,
                 valb.ptr_mut() as *mut f32,
             )
             .expect("launch value");
@@ -924,6 +924,7 @@ fn moe_i4_matches_reference() {
                 wb.ptr() as *const f32,
                 hbuf.ptr_mut() as *mut f32,
                 pbuf.ptr_mut() as *mut u64,
+                1,
                 stream.raw(),
             )
             .expect("launch moe_expert_range_i4");
@@ -982,7 +983,8 @@ fn gpu_i4_expert(blk: &[u8], off: &[usize; 6], x: &[f32], hidden: usize, inter: 
             wb.ptr() as *const f32,
             hbuf.ptr_mut() as *mut f32,
             pbuf.ptr_mut() as *mut u64,
-            stream.raw(),
+            1,
+                stream.raw(),
         )
         .expect("launch i4");
         launch_moe_acc_drain(
@@ -1332,5 +1334,220 @@ fn index_topk_matches_host_selection() {
             got[..written].windows(2).all(|w| w[0] < w[1]),
             "index_topk output not strictly ascending on {name}"
         );
+    }
+}
+
+/// **The batched forward's correctness gate.** Every kernel that takes `nrow` must be
+/// BIT-IDENTICAL, per row, to running the same input as a single row — not close, equal.
+///
+/// That is what lets speculative decode claim to emit exactly the bytes greedy sequential
+/// decode would. Row 0 of a verify pass IS the real token: if these kernels are
+/// bit-identical at row 0, and the MoE union cannot perturb row 0 (unselected experts
+/// carry weight 0 and are skipped), then the speculative engine has no freedom to differ.
+/// A tolerance here would let that claim rot into "usually the same text".
+///
+/// Row 1 is checked the same way against its own single-row run, which is what catches
+/// the other failure mode: a kernel that batches correctly but leaks row 0's `x` into
+/// row 1 (a missing `r * stride`) would pass a row-0-only test.
+#[test]
+fn batched_rows_are_bit_identical_to_single_rows() {
+    use rivoli::hip::launch_gemv_f32;
+    let mut r = Lcg(0xba7c);
+
+    // --- gemv_f32 (the MoE router gate) ---
+    {
+        let (o_dim, i_dim) = (64usize, 128usize);
+        let w: Vec<f32> = (0..o_dim * i_dim).map(|_| r.f()).collect();
+        let xs: [Vec<f32>; 2] = std::array::from_fn(|_| (0..i_dim).map(|_| r.f()).collect());
+        let wb = dev(&f32b(&w));
+        let mut single = Vec::new();
+        for x in &xs {
+            let xb = dev(&f32b(x));
+            let mut yb = dev(&vec![0u8; o_dim * 4]);
+            // SAFETY: buffers sized [i_dim], [o_dim*i_dim], [o_dim] f32; nrow 1.
+            unsafe {
+                launch_gemv_f32(
+                    xb.ptr() as *const f32,
+                    wb.ptr() as *const f32,
+                    o_dim,
+                    i_dim,
+                    1,
+                    yb.ptr_mut() as *mut f32,
+                )
+                .expect("gemv_f32 r1");
+            }
+            device_sync().expect("sync");
+            single.push(f32v(&yb.copy_out().expect("out")));
+        }
+        let mut both: Vec<f32> = xs[0].clone();
+        both.extend_from_slice(&xs[1]);
+        let xb = dev(&f32b(&both));
+        let mut yb = dev(&vec![0u8; 2 * o_dim * 4]);
+        // SAFETY: `x` holds 2 rows of i_dim, `y` 2 rows of o_dim; nrow 2 is instantiated.
+        unsafe {
+            launch_gemv_f32(
+                xb.ptr() as *const f32,
+                wb.ptr() as *const f32,
+                o_dim,
+                i_dim,
+                2,
+                yb.ptr_mut() as *mut f32,
+            )
+            .expect("gemv_f32 r2");
+        }
+        device_sync().expect("sync");
+        let got = f32v(&yb.copy_out().expect("out"));
+        assert_eq!(got[..o_dim], single[0][..], "gemv_f32 row 0 must be bit-identical");
+        assert_eq!(got[o_dim..], single[1][..], "gemv_f32 row 1 must be bit-identical");
+    }
+
+    // --- gemv_i8 (lm_head). i_dim % 4 == 0 so both rows take the dword-quad path. ---
+    {
+        let (o_dim, i_dim) = (96usize, 260usize);
+        let packed: Vec<u8> = (0..o_dim * i_dim).map(|_| (r.f() * 127.0) as i8 as u8).collect();
+        let scale: Vec<f32> = (0..o_dim).map(|_| (r.f() * 0.01).abs() + 1e-4).collect();
+        let xs: [Vec<f32>; 2] = std::array::from_fn(|_| (0..i_dim).map(|_| r.f()).collect());
+        let (pb, sb) = (dev(&packed), dev(&f32b(&scale)));
+        let mut single = Vec::new();
+        for x in &xs {
+            let xb = dev(&f32b(x));
+            let mut yb = dev(&vec![0u8; o_dim * 4]);
+            // SAFETY: as gemv_i8_matches_oracle; nrow 1.
+            unsafe {
+                launch_gemv_i8(
+                    xb.ptr() as *const f32,
+                    pb.ptr(),
+                    sb.ptr() as *const f32,
+                    o_dim,
+                    i_dim,
+                    1,
+                    yb.ptr_mut() as *mut f32,
+                )
+                .expect("gemv_i8 r1");
+            }
+            device_sync().expect("sync");
+            single.push(f32v(&yb.copy_out().expect("out")));
+        }
+        let mut both: Vec<f32> = xs[0].clone();
+        both.extend_from_slice(&xs[1]);
+        let xb = dev(&f32b(&both));
+        let mut yb = dev(&vec![0u8; 2 * o_dim * 4]);
+        // SAFETY: `x` holds 2 rows of i_dim, `y` 2 rows of o_dim; nrow 2 is instantiated.
+        unsafe {
+            launch_gemv_i8(
+                xb.ptr() as *const f32,
+                pb.ptr(),
+                sb.ptr() as *const f32,
+                o_dim,
+                i_dim,
+                2,
+                yb.ptr_mut() as *mut f32,
+            )
+            .expect("gemv_i8 r2");
+        }
+        device_sync().expect("sync");
+        let got = f32v(&yb.copy_out().expect("out"));
+        assert_eq!(got[..o_dim], single[0][..], "gemv_i8 row 0 must be bit-identical");
+        assert_eq!(got[o_dim..], single[1][..], "gemv_i8 row 1 must be bit-identical");
+    }
+
+    // --- mla_absorb_fp8 / mla_value_fp8 (both through kv_b). kvl % 4 == 0 and
+    //     block >= 4, so this exercises the quad path both kernels actually run. ---
+    {
+        let (h, qh, nope, vh, kvl, block) = (3usize, 20usize, 12usize, 8usize, 16usize, 4usize);
+        let rows = h * (nope + vh);
+        let sc_cols = kvl.div_ceil(block);
+        let packed: Vec<u8> = (0..rows * kvl).map(|_| f32_to_e4m3(r.f())).collect();
+        let scale: Vec<f32> = (0..rows.div_ceil(block) * sc_cols)
+            .map(|_| (r.f() * 0.1).abs() + 0.01)
+            .collect();
+        let (kb, sb) = (dev(&packed), dev(&f32b(&scale)));
+        let qs: [Vec<f32>; 2] = std::array::from_fn(|_| (0..h * qh).map(|_| r.f()).collect());
+        let cs: [Vec<f32>; 2] = std::array::from_fn(|_| (0..h * kvl).map(|_| r.f()).collect());
+
+        let mut abs1 = Vec::new();
+        let mut val1 = Vec::new();
+        for i in 0..2 {
+            let (qb, clb) = (dev(&f32b(&qs[i])), dev(&f32b(&cs[i])));
+            let mut ab = dev(&vec![0u8; h * kvl * 4]);
+            let mut vb = dev(&vec![0u8; h * vh * 4]);
+            // SAFETY: shapes as in check_mla_fp8; nrow 1.
+            unsafe {
+                launch_mla_absorb_fp8(
+                    qb.ptr() as *const f32,
+                    kb.ptr(),
+                    sb.ptr() as *const f32,
+                    h,
+                    qh,
+                    nope,
+                    vh,
+                    kvl,
+                    block,
+                    1,
+                    ab.ptr_mut() as *mut f32,
+                )
+                .expect("absorb r1");
+                launch_mla_value_fp8(
+                    clb.ptr() as *const f32,
+                    kb.ptr(),
+                    sb.ptr() as *const f32,
+                    h,
+                    nope,
+                    vh,
+                    kvl,
+                    block,
+                    1,
+                    vb.ptr_mut() as *mut f32,
+                )
+                .expect("value r1");
+            }
+            device_sync().expect("sync");
+            abs1.push(f32v(&ab.copy_out().expect("out")));
+            val1.push(f32v(&vb.copy_out().expect("out")));
+        }
+        let mut qboth = qs[0].clone();
+        qboth.extend_from_slice(&qs[1]);
+        let mut cboth = cs[0].clone();
+        cboth.extend_from_slice(&cs[1]);
+        let (qb, clb) = (dev(&f32b(&qboth)), dev(&f32b(&cboth)));
+        let mut ab = dev(&vec![0u8; 2 * h * kvl * 4]);
+        let mut vb = dev(&vec![0u8; 2 * h * vh * 4]);
+        // SAFETY: q/clat/qabs/ctx all hold 2 rows of their single-row size; nrow 2.
+        unsafe {
+            launch_mla_absorb_fp8(
+                qb.ptr() as *const f32,
+                kb.ptr(),
+                sb.ptr() as *const f32,
+                h,
+                qh,
+                nope,
+                vh,
+                kvl,
+                block,
+                2,
+                ab.ptr_mut() as *mut f32,
+            )
+            .expect("absorb r2");
+            launch_mla_value_fp8(
+                clb.ptr() as *const f32,
+                kb.ptr(),
+                sb.ptr() as *const f32,
+                h,
+                nope,
+                vh,
+                kvl,
+                block,
+                2,
+                vb.ptr_mut() as *mut f32,
+            )
+            .expect("value r2");
+        }
+        device_sync().expect("sync");
+        let ga = f32v(&ab.copy_out().expect("out"));
+        let gv = f32v(&vb.copy_out().expect("out"));
+        assert_eq!(ga[..h * kvl], abs1[0][..], "mla_absorb row 0 must be bit-identical");
+        assert_eq!(ga[h * kvl..], abs1[1][..], "mla_absorb row 1 must be bit-identical");
+        assert_eq!(gv[..h * vh], val1[0][..], "mla_value row 0 must be bit-identical");
+        assert_eq!(gv[h * vh..], val1[1][..], "mla_value row 1 must be bit-identical");
     }
 }

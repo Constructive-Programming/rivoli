@@ -127,7 +127,7 @@ fn launch(x: &Buf, w: &Buf, y: &mut Buf, o_dim: usize, i_dim: usize) {
             x.ptr() as *const f32,
             w.ptr() as *const f32,
             o_dim,
-            i_dim,
+            i_dim, 1,
             y.ptr_mut() as *mut f32,
         )
         .expect("launch");
@@ -646,7 +646,7 @@ fn timestamps_measure_gpu_time_and_refuse_when_absent() {
                 x.ptr() as *const f32,
                 w.ptr() as *const f32,
                 o,
-                i,
+                i, 1,
                 y.ptr_mut() as *mut f32,
             )
             .expect("gemv");
@@ -798,7 +798,7 @@ fn kernel_reads_weights_placed_through_the_tier() {
             xp as *const f32,
             wp as *const f32,
             o_dim,
-            i_dim,
+            i_dim, 1,
             yb.ptr_mut() as *mut f32,
         )
         .expect("launch");
@@ -816,7 +816,7 @@ fn kernel_reads_weights_placed_through_the_tier() {
 /// caller syncing.
 ///
 /// Its HIP twin is a blocking `hipMemcpy(..., D2H)` and every caller was written against
-/// that contract. `gpu.rs:789` does `launch_gemv_f32(...)` then immediately
+/// that contract. `gpu.rs:789` does `launch_gemv_f32( 1,...)` then immediately
 /// `gate_logits.copy_out_into(...)`; if the Vulkan version were a bare read of the host
 /// mapping it would return the PREVIOUS token's gate logits, and routing would pick the
 /// wrong experts on every layer of every token — coherently, with no error.
@@ -852,7 +852,7 @@ fn copy_out_into_sees_the_dispatch_that_preceded_it() {
             xb.ptr() as *const f32,
             wb.ptr() as *const f32,
             o_dim,
-            i_dim,
+            i_dim, 1,
             out.ptr_mut() as *mut f32,
         )
         .expect("launch");
@@ -905,7 +905,7 @@ fn copy_in_at_does_not_clobber_a_pending_dispatch() {
             xb.ptr() as *const f32,
             wb.ptr() as *const f32,
             o_dim,
-            i_dim,
+            i_dim, 1,
             yb.ptr_mut() as *mut f32,
         )
         .expect("launch");
@@ -937,12 +937,12 @@ fn guards_reject_degenerate_arguments() {
     // SAFETY: zero dims are rejected before any pointer is used.
     unsafe {
         assert!(
-            launch_gemv_f32(b.ptr() as *const f32, b.ptr() as *const f32, 0, 4, y.ptr_mut() as *mut f32)
+            launch_gemv_f32(b.ptr() as *const f32, b.ptr() as *const f32, 0, 4, 1, y.ptr_mut() as *mut f32)
                 .is_err(),
             "o_dim = 0 must be rejected"
         );
         assert!(
-            launch_gemv_f32(b.ptr() as *const f32, b.ptr() as *const f32, 4, 0, y.ptr_mut() as *mut f32)
+            launch_gemv_f32(b.ptr() as *const f32, b.ptr() as *const f32, 4, 0, 1, y.ptr_mut() as *mut f32)
                 .is_err(),
             "i_dim = 0 must be rejected"
         );
@@ -1972,11 +1972,11 @@ fn linalg_guards_reject_degenerate_arguments() {
         );
 
         assert!(
-            launch_gemv_i8(p as *const f32, p, p as *const f32, 0, 64, q as *mut f32).is_err(),
+            launch_gemv_i8(p as *const f32, p, p as *const f32, 0, 64, 1, q as *mut f32).is_err(),
             "gemv_i8 o_dim = 0"
         );
         assert!(
-            launch_gemv_i8(p as *const f32, p, p as *const f32, 8, 0, q as *mut f32).is_err(),
+            launch_gemv_i8(p as *const f32, p, p as *const f32, 8, 0, 1, q as *mut f32).is_err(),
             "gemv_i8 i_dim = 0"
         );
     }
@@ -2028,7 +2028,7 @@ fn gemv_i8_matches_the_host_oracle() {
                 pb.ptr(),
                 sb.ptr() as *const f32,
                 o_dim,
-                i_dim,
+                i_dim, 1,
                 yb.ptr_mut() as *mut f32,
             )
             .expect("launch");
@@ -2511,7 +2511,7 @@ fn mla_value_fp8_matches_the_host_oracle() {
             nope,
             vh,
             kvl,
-            block,
+            block, 1,
             out.ptr_mut() as *mut f32,
         )
         .expect("launch");
@@ -2558,7 +2558,7 @@ fn mla_absorb_fp8_matches_the_host_oracle() {
             nope,
             vh,
             kvl,
-            block,
+            block, 1,
             out.ptr_mut() as *mut f32,
         )
         .expect("launch");
@@ -3031,7 +3031,7 @@ fn mla_guards_reject_degenerate_arguments() {
     unsafe {
         let val = |h: usize, nope: usize, vh: usize, kvl: usize, block: usize, kvb: *const u8| {
             launch_mla_value_fp8(
-                p as *const f32, kvb, p as *const f32, h, nope, vh, kvl, block, q as *mut f32,
+                p as *const f32, kvb, p as *const f32, h, nope, vh, kvl, block, 1, q as *mut f32,
             )
         };
         assert!(val(0, 4, 4, 16, 16, p).is_err(), "mla_value h = 0");
@@ -3056,7 +3056,7 @@ fn mla_guards_reject_degenerate_arguments() {
                    block: usize,
                    kvb: *const u8| {
             launch_mla_absorb_fp8(
-                p as *const f32, kvb, p as *const f32, h, qh, nope, vh, kvl, block, q as *mut f32,
+                p as *const f32, kvb, p as *const f32, h, qh, nope, vh, kvl, block, 1, q as *mut f32,
             )
         };
         assert!(abs(0, 4, 4, 4, 16, 16, p).is_err(), "mla_absorb h = 0");
@@ -3742,6 +3742,7 @@ fn deferred_launchers_refuse_rather_than_no_op() {
                     cf,
                     nf,
                     std::ptr::null_mut::<u64>(),
+                    1,
                     std::ptr::null_mut(),
                 )
                 .is_err(),

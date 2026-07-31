@@ -295,8 +295,15 @@ extern "C" __global__ void moe_down_i4(
 
 extern "C" int rivoli_moe_expert_range_i4(
     const float* x, int hidden, int inter, int e_start, int e_count, const void* descs,
-    const float* wexpert, float* h, unsigned long long* acc, void* stream) {
+    const float* wexpert, float* h, unsigned long long* acc, int nrow, void* stream) {
     if (hidden <= 0 || inter <= 0 || e_count <= 0 || e_start < 0) return 1001;
+    // The int4 experts are NOT row-batched. Refusing loudly matters more here than in the
+    // VQ twin: a hybrid layer mixes formats within one batch, so an int4 expert silently
+    // computing only row 0 would leave row 1 short a few experts and still decode — text
+    // that is subtly wrong rather than obviously broken. Unreachable today (`Pin::build`
+    // only carries the MTP head when every format has an L78 slab, and `bin/fp8_to_i4`
+    // emits none), which is exactly when a guard is cheap.
+    if (nrow != 1) return 1004;
     const ExpertDescI4* d = (const ExpertDescI4*)descs;
     hipStream_t s = (hipStream_t)stream;
     hipGetLastError();

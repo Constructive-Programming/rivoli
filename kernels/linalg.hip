@@ -120,18 +120,43 @@ extern "C" __global__ void gemv_vq(
     if (lane == 0) y[o] = acc;
 }
 
-// y[o] = Σ_i x[i]·w[o·i_dim+i] — plain f32 GEMV (the MoE router gate).
-extern "C" __global__ void gemv_f32(
+// y[r][o] = Σ_i x[r][i]·w[o·i_dim+i] — plain f32 GEMV (the MoE router gate), R token
+// rows through one read of `w`. The gate is 6.3 MB per MoE layer, ~470 MB a pass, so a
+// speculative verify wants it read once. `x` rows are `i_dim` apart, `y` rows `o_dim`.
+// Row 0 is bit-identical: same `i` order, same expression, just replicated.
+template <int R>
+__device__ __forceinline__ void gemv_f32_impl(
     const float* __restrict__ x, const float* __restrict__ w, int o_dim, int i_dim,
     float* __restrict__ y) {
     int lane = threadIdx.x & (WAVE - 1);
     size_t o = (size_t)blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x / WAVE);
     if (o >= (size_t)o_dim) return;
     const float* row = w + o * (size_t)i_dim;
-    float acc = 0.0f;
-    for (int i = lane; i < i_dim; i += WAVE) acc += x[i] * row[i];
-    acc = wave_sum(acc);
-    if (lane == 0) y[o] = acc;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+    for (int i = lane; i < i_dim; i += WAVE) {
+        float wi = row[i];
+#pragma unroll
+        for (int r = 0; r < R; ++r) acc[r] += x[(size_t)r * i_dim + i] * wi;
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        float s = wave_sum(acc[r]);
+        if (lane == 0) y[(size_t)r * o_dim + o] = s;
+    }
+}
+
+extern "C" __global__ void gemv_f32(
+    const float* __restrict__ x, const float* __restrict__ w, int o_dim, int i_dim,
+    float* __restrict__ y) {
+    gemv_f32_impl<1>(x, w, o_dim, i_dim, y);
+}
+
+extern "C" __global__ void gemv_f32_r2(
+    const float* __restrict__ x, const float* __restrict__ w, int o_dim, int i_dim,
+    float* __restrict__ y) {
+    gemv_f32_impl<2>(x, w, o_dim, i_dim, y);
 }
 
 // y[o] = scale[o]·Σ_i x[i]·(int8)packed[o·i_dim+i] — per-row int8 GEMV (lm_head to
@@ -146,30 +171,64 @@ extern "C" __global__ void gemv_f32(
 // NOT bit-identical to the scalar form: each lane now owns a contiguous quad instead of
 // a stride-WAVE comb, which reassociates the f32 sum. lm_head feeds argmax directly, so
 // this took the perplexity gate rather than a fingerprint.
-extern "C" __global__ void gemv_i8(
+//
+// R token rows through one read of the 952 MB lm_head. Row 0 is bit-identical: the quad
+// decode, the summation order and the final `acc * scale[o]` are unchanged, only
+// replicated. `x` rows are `i_dim` apart, `y` rows `o_dim` (= vocab).
+template <int R>
+__device__ __forceinline__ void gemv_i8_impl(
     const float* __restrict__ x, const signed char* __restrict__ packed,
     const float* __restrict__ scale, int o_dim, int i_dim, float* __restrict__ y) {
     int lane = threadIdx.x & (WAVE - 1);
     size_t o = (size_t)blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x / WAVE);
     if (o >= (size_t)o_dim) return;
     const signed char* row = packed + o * (size_t)i_dim;
-    float acc = 0.0f;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] = 0.0f;
     int base = 0;
     // The quad path needs `row` dword-aligned and `x` float4-aligned. `packed` is a
     // device allocation, so the real condition is i_dim % 4 keeping every row aligned;
     // both are uniform per block and anything failing them falls to the scalar tail.
-    if ((((size_t)row) & 3u) == 0 && (((size_t)x) & 15u) == 0) {
+    // With R > 1 there is one more: `x + r·i_dim` must stay float4-aligned, i.e. i_dim
+    // divisible by 4. Gated on `R == 1` (a compile-time constant) rather than added
+    // unconditionally, so the single-row path keeps taking the quad route on a ragged
+    // i_dim exactly as it did before — the oracle tests run such shapes.
+    if ((((size_t)row) & 3u) == 0 && (((size_t)x) & 15u) == 0 && (R == 1 || (i_dim & 3) == 0)) {
         for (; base + WAVE * 4 <= i_dim; base += WAVE * 4) {
             int col = base + lane * 4;
             int w = *(const int*)(row + col); // 4 int8 = one dword = 128 B/wave
-            float4 xv = *(const float4*)(x + col);
-            acc += xv.x * (float)(signed char)(w) + xv.y * (float)(signed char)(w >> 8) +
-                   xv.z * (float)(signed char)(w >> 16) + xv.w * (float)(signed char)(w >> 24);
+            float w0 = (float)(signed char)(w), w1 = (float)(signed char)(w >> 8);
+            float w2 = (float)(signed char)(w >> 16), w3 = (float)(signed char)(w >> 24);
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                float4 xv = *(const float4*)(x + (size_t)r * i_dim + col);
+                acc[r] += xv.x * w0 + xv.y * w1 + xv.z * w2 + xv.w * w3;
+            }
         }
     }
-    for (int i = base + lane; i < i_dim; i += WAVE) acc += x[i] * (float)row[i];
-    acc = wave_sum(acc);
-    if (lane == 0) y[o] = acc * scale[o];
+    for (int i = base + lane; i < i_dim; i += WAVE) {
+        float wi = (float)row[i];
+#pragma unroll
+        for (int r = 0; r < R; ++r) acc[r] += x[(size_t)r * i_dim + i] * wi;
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        float s = wave_sum(acc[r]);
+        if (lane == 0) y[(size_t)r * o_dim + o] = s * scale[o];
+    }
+}
+
+extern "C" __global__ void gemv_i8(
+    const float* __restrict__ x, const signed char* __restrict__ packed,
+    const float* __restrict__ scale, int o_dim, int i_dim, float* __restrict__ y) {
+    gemv_i8_impl<1>(x, packed, scale, o_dim, i_dim, y);
+}
+
+extern "C" __global__ void gemv_i8_r2(
+    const float* __restrict__ x, const signed char* __restrict__ packed,
+    const float* __restrict__ scale, int o_dim, int i_dim, float* __restrict__ y) {
+    gemv_i8_impl<2>(x, packed, scale, o_dim, i_dim, y);
 }
 
 // y[o] = Σ_i x[i]·(nibble(o,i)-8)·scale[o, i/I4_GROUP] — group-scaled int4,
@@ -338,18 +397,24 @@ extern "C" int rivoli_gemv_i4(
 }
 
 extern "C" int rivoli_gemv_i8(
-    const float* x, const signed char* packed, const float* scale, int o_dim, int i_dim, float* y) {
+    const float* x, const signed char* packed, const float* scale, int o_dim, int i_dim,
+    int nrow, float* y) {
     if (o_dim <= 0 || i_dim <= 0) return 1001;
+    if (nrow != 1 && nrow != 2) return 1004;  // R is a template parameter — see gemv_fp8
     hipGetLastError();
-    hipLaunchKernelGGL(gemv_i8, ROW_GRID(o_dim), ROW_BLOCK, 0, 0, x, packed, scale, o_dim, i_dim, y);
+    hipLaunchKernelGGL(nrow == 2 ? gemv_i8_r2 : gemv_i8, ROW_GRID(o_dim), ROW_BLOCK, 0, 0,
+                       x, packed, scale, o_dim, i_dim, y);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-extern "C" int rivoli_gemv_f32(const float* x, const float* w, int o_dim, int i_dim, float* y) {
+extern "C" int rivoli_gemv_f32(const float* x, const float* w, int o_dim, int i_dim, int nrow,
+                               float* y) {
     if (o_dim <= 0 || i_dim <= 0) return 1001;
+    if (nrow != 1 && nrow != 2) return 1004;  // R is a template parameter — see gemv_fp8
     hipGetLastError();
-    hipLaunchKernelGGL(gemv_f32, ROW_GRID(o_dim), ROW_BLOCK, 0, 0, x, w, o_dim, i_dim, y);
+    hipLaunchKernelGGL(nrow == 2 ? gemv_f32_r2 : gemv_f32, ROW_GRID(o_dim), ROW_BLOCK, 0, 0,
+                       x, w, o_dim, i_dim, y);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

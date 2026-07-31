@@ -209,7 +209,7 @@ fn run_i8(name: &str, o_dim: usize, i_dim: usize) {
     let mut yb = dev(&vec![0u8; o_dim * 4]);
     let (xp, yp) = (xb.ptr() as *const f32, yb.ptr_mut() as *mut f32);
     let us = time(60, &|| unsafe {
-        launch_gemv_i8(xp, pb.ptr(), sb.ptr() as *const f32, o_dim, i_dim, yp).expect("i8");
+        launch_gemv_i8(xp, pb.ptr(), sb.ptr() as *const f32, o_dim, i_dim, 1, yp).expect("i8");
     });
     report(name, "i8 ", o_dim, i_dim, us);
 }
@@ -237,7 +237,7 @@ fn run_mla(h: usize, qh: usize, nope: usize, vh: usize, kvl: usize) {
     let (cp, xp) = (clat.ptr() as *const f32, ctx.ptr_mut() as *mut f32);
 
     let us = time(60, &|| unsafe {
-        launch_mla_absorb_fp8(qp, kp, sp, h, qh, nope, vh, kvl, block, ap).expect("absorb");
+        launch_mla_absorb_fp8(qp, kp, sp, h, qh, nope, vh, kvl, block, 1, ap).expect("absorb");
     });
     let gbs = (h * nope * kvl) as f64 / (us * 1e-6) / 1e9;
     println!("mla_absorb  [{h}x{nope}x{kvl}]   {us:8.1}us  {gbs:6.1} GB/s");
@@ -245,7 +245,7 @@ fn run_mla(h: usize, qh: usize, nope: usize, vh: usize, kvl: usize) {
         fnv(&qabs.copy_out().expect("out")));
 
     let us = time(60, &|| unsafe {
-        launch_mla_value_fp8(cp, kp, sp, h, nope, vh, kvl, block, xp).expect("value");
+        launch_mla_value_fp8(cp, kp, sp, h, nope, vh, kvl, block, 1, xp).expect("value");
     });
     let gbs = (h * vh * kvl) as f64 / (us * 1e-6) / 1e9;
     println!("mla_value   [{h}x{vh}x{kvl}]   {us:8.1}us  {gbs:6.1} GB/s");

@@ -653,11 +653,15 @@ impl<'a> Pin<'a> {
         let i4 = mode.uses_int4();
         // ponytail: no free-memory pre-check — the budget is the user's literal
         // request (--max-mem), so let the device allocation itself OOM/fail.
-        // One-time bound for `submit_layer`'s fixed 32-slot scratch.
+        // One-time bound for `submit_layer`'s fixed 32-slot scratch. A batched forward
+        // submits the UNION of every token row's picks, so the worst case is
+        // `top_k · MAXROW + n_shared`, not one row's `experts_per_layer()`.
+        let max_batch = cfg.top_k * crate::gpu::MAXROW + cfg.n_shared;
         ensure!(
-            cfg.experts_per_layer() <= 32,
-            "top_k {} + n_shared {} exceeds the 32-slot batch scratch",
+            max_batch <= 32,
+            "top_k {} x {} rows + n_shared {} = {max_batch} exceeds the 32-slot batch scratch",
             cfg.top_k,
+            crate::gpu::MAXROW,
             cfg.n_shared
         );
 

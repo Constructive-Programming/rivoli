@@ -84,20 +84,34 @@ use anyhow::{Context, Result, bail, ensure};
 /// Confidence buckets for the MTP accept histogram: 5 even bins over [0,1].
 const MTP_BINS: usize = 5;
 
-/// Which pass `forward_inner` is running, and — for the head — where it reads `h`.
+/// Token rows one forward pass carries. 2 = the speculative verify pass: the real token
+/// at `pos` plus the MTP head's draft for `pos+1`, through ONE read of every weight.
+///
+/// Every device scratch buffer is allocated at this width and the batched kernels take
+/// the live `nrow` at launch, so an `nrow == 1` pass is bit-identical to the unbatched
+/// engine — which is what makes "speculative decode emits the same bytes as greedy
+/// sequential decode" a testable claim rather than an aspiration.
+///
+/// Fixed at 2 by measurement, not taste: chained depth-2 drafts land at 4.4% acceptance
+/// (GLM-5.2 ships `num_nextn_predict_layers = 1`), so a 3-row pass verifies 1.559
+/// tokens against 1.535 for two — more rows for no tokens.
+pub const MAXROW: usize = 2;
+
+/// The argmax result buffer: `MAXROW` × [i32 index | f32 value], then a u32 non-finite
+/// tag. ONE tag for the whole pass — it names the earliest `(pos, layer)` that went bad,
+/// and every row of a pass shares a base position, so per-row tags would say the same
+/// thing twice. The tag rides this D2H, which is why localising a NaN costs no sync.
+const ARGMAX_BYTES: usize = MAXROW * 8 + 4;
+
+/// Which pass `forward_inner` is running.
 #[derive(Clone, Copy, PartialEq)]
 enum Draft {
     /// Not a draft: the main model's own forward, over every layer.
     No,
-    /// Depth 1. `h` is the main model's last hidden state, which is the real thing the
-    /// head was trained to consume.
-    FromModel,
-    /// Depth 2+. `h` is the head's OWN output from the previous draft, standing in for a
-    /// hidden state the main model has not computed and by construction cannot: producing
-    /// it is what we are speculating about. This substitution is what lets ONE MTP module
-    /// predict more than one token ahead, and it is why depth-2 acceptance is strictly a
-    /// question for measurement rather than inference from depth-1's number.
-    Chained,
+    /// The MTP head alone (pinned layer `n_layers`). Row `r` consumes
+    /// `(x[r], emb(tokens[r]))` — `x` being the hidden state the last main-model forward
+    /// left resident, which is the real thing the head was trained to read.
+    Head,
 }
 
 fn mtp_bin(conf: f32) -> usize {
@@ -427,12 +441,6 @@ pub struct GpuEngine<'a> {
     /// argmax). This is the signal a "should we speculate on this token?" gate would read,
     /// and bucketing it is how we find out whether it separates before building the gate.
     mtp_bins: [(u64, u64); MTP_BINS],
-    /// Depth-2 (chained) drafts, counted ONLY where the depth-1 parent was accepted — a
-    /// chained draft conditioned on a wrong parent predicts a token that will never be
-    /// asked for, so scoring it would measure nothing. Bucketed by the PARENT's
-    /// confidence, which is the quantity a "how deep should we go?" rule would read.
-    mtp_chain: (u64, u64),
-    mtp_chain_bins: [(u64, u64); MTP_BINS],
     /// Host staging for the draft's logits — the confidence needs the whole vector, and
     /// a host pass costs one 620 KB D2H behind a sync `argmax` already pays.
     /// ponytail: host softmax, no kernel — it is a measurement, not a decode-path cost.
@@ -476,11 +484,12 @@ pub struct GpuEngine<'a> {
     /// end of layer. Replaced a [slots*hidden] f32 partial slab plus a reduce behind a
     /// cross-stream join. One row PER STREAM — see `MOE_ACC_ROWS`.
     moe_acc: DeviceBuf,
-    moe_h: DeviceBuf,       // [slots*moe_inter] SwiGLU hidden scratch (VQ MoE)
+    moe_h: DeviceBuf,       // [slots*MAXROW*moe_inter] SwiGLU hidden scratch (VQ MoE)
     descs_buf: DeviceBuf,
     wexpert_buf: DeviceBuf,
     logits: DeviceBuf,
-    /// Device argmax result: 8 bytes [i32 index | f32 max-value].
+    /// Device argmax result: `MAXROW` pairs of [i32 index | f32 max-value], then one
+    /// u32 non-finite tag shared by every row (see [`ARGMAX_BYTES`]).
     argmax_dev: DeviceBuf,
     // Per-layer fp8 KV latent cache, grown in place to max_ctx: `lc` is e4m3
     // (max_ctx*kvl u8), `lc_scale` the per-128 block scales (max_ctx*n_blocks f32),
@@ -493,7 +502,6 @@ pub struct GpuEngine<'a> {
     // Host routing/argmax scratch.
     scores: Vec<f32>,
     choice: Vec<f32>,
-    sel: Vec<usize>,
     /// Trace-only: the ranked top-[`TRACE_WINDOW`] candidates. Stays empty unless
     /// `--trace` is on, and `--trace` is fixed for the run, so this is either filled
     /// every layer or never.
@@ -503,7 +511,19 @@ pub struct GpuEngine<'a> {
     /// The policy's routing advice, read ONCE — the policy is fixed for the run, and
     // Per-token host build scratch — reused every layer so the hot path allocates
     // nothing: resolved VQ descriptors + weights, the resolved batch, D2H staging.
+    /// Per-expert routing weights for the current layer, laid out `[descriptor][row]` —
+    /// the layout `moe_down_vq` reads as `wexpert[e*R + t]`. A row that did not route to
+    /// a union expert carries 0.0 there, and `moe_down_vq` SKIPS a zero weight rather
+    /// than multiplying by it, which is why the union cannot perturb a row's own result.
     w: Vec<f32>,
+    /// Each token row's own top-`top_k` picks, before the union. Row 0's also feeds
+    /// LOOKA/trace, which stay defined on the real token rather than the draft.
+    sel_row: [Vec<usize>; MAXROW],
+    /// Each row's normalized routed weights, parallel to `sel_row[r]`.
+    wrow: [Vec<f32>; MAXROW],
+    /// The deduplicated union of every row's picks — what actually gets submitted and
+    /// launched. Row 0's picks come first, so an `nrow == 1` pass submits exactly `sel`.
+    union: Vec<usize>,
     /// The three per-projection VQ codebooks (gate/up/down), fp16, resident.
     codebooks: [*const u16; 3],
     mlps_vq: Vec<MlpVq>,
@@ -629,7 +649,11 @@ impl<'a> GpuEngine<'a> {
         let kvl = cfg.kv_lora_rank;
         let rope = cfg.qk_rope_head_dim;
         let h = cfg.n_heads;
-        let slots = cfg.experts_per_layer(); // routed + shared per MoE launch
+        // Descriptor slots per MoE launch. A batched pass submits the UNION of every
+        // row's picks, so the routed half scales with MAXROW; the shared experts are
+        // row-independent and appear once. Rows overlap ~31% in practice (measured), so
+        // the union is ~13.5 of the 16 this reserves.
+        let slots = cfg.top_k * MAXROW + cfg.n_shared;
         ensure!(
             kvl.is_multiple_of(E4M3_BLOCK),
             "kv_lora_rank ({kvl}) must be a multiple of {E4M3_BLOCK} (fp8 KV block size)",
@@ -664,26 +688,24 @@ impl<'a> GpuEngine<'a> {
             rows_host: Vec::new(),
             idx,
             max_ctx,
-            x: f(cfg.hidden)?,
-            xn: f(cfg.hidden)?,
-            mtp_cat: f(2 * cfg.hidden)?,
-            mtp_x: f(cfg.hidden)?,
+            x: f(MAXROW * cfg.hidden)?,
+            xn: f(MAXROW * cfg.hidden)?,
+            mtp_cat: f(MAXROW * 2 * cfg.hidden)?,
+            mtp_x: f(MAXROW * cfg.hidden)?,
             mtp_seen: 0,
             mtp_hit: 0,
             mtp_bins: [(0, 0); MTP_BINS],
-            mtp_chain: (0, 0),
-            mtp_chain_bins: [(0, 0); MTP_BINS],
             mtp_host: Vec::new(),
-            sub: f(cfg.hidden)?,
-            qr: f(cfg.q_lora_rank)?,
-            q: f(h * cfg.qk_head_dim())?,
-            comp: f(kvl + rope)?,
-            qabs: f(h * kvl)?,
-            qrope: f(h * rope)?,
-            clat: f(h * kvl)?,
-            attn_partial: f(crate::backend::attend_scratch_floats(h, kvl))?,
-            ctx: f(h * cfg.v_head_dim)?,
-            gate_logits: f(cfg.n_experts)?,
+            sub: f(MAXROW * cfg.hidden)?,
+            qr: f(MAXROW * cfg.q_lora_rank)?,
+            q: f(MAXROW * h * cfg.qk_head_dim())?,
+            comp: f(MAXROW * (kvl + rope))?,
+            qabs: f(MAXROW * h * kvl)?,
+            qrope: f(MAXROW * h * rope)?,
+            clat: f(MAXROW * h * kvl)?,
+            attn_partial: f(MAXROW * crate::backend::attend_scratch_floats(h, kvl))?,
+            ctx: f(MAXROW * h * cfg.v_head_dim)?,
+            gate_logits: f(MAXROW * cfg.n_experts)?,
             pilot_xn: f(cfg.hidden)?,
             pilot_logits: f(cfg.n_experts * PILOT_HORIZONS)?,
             hint_k: DEFAULT_HINT_K,
@@ -692,23 +714,27 @@ impl<'a> GpuEngine<'a> {
             pilot_sel: Vec::with_capacity(16),
             pilot_host: Vec::new(),
             hints: Vec::new(),
-            mlp_g: f(cfg.dense_inter)?,
-            mlp_u: f(cfg.dense_inter)?,
-            moe_out: f(cfg.hidden)?,
+            mlp_g: f(MAXROW * cfg.dense_inter)?,
+            mlp_u: f(MAXROW * cfg.dense_inter)?,
+            moe_out: f(MAXROW * cfg.hidden)?,
             // Zeroed HERE and nowhere else: `moe_acc_drain` resets it as it converts, so
             // steady state needs no memset. hipMalloc does not zero, and layer 0 would
             // otherwise sum against whatever was resident.
+            // Laid out `[stream][token row][hidden]`, so `moe_acc_drain` over
+            // `nrow·hidden` elements with `MOE_ACC_ROWS` stream rows drains every token
+            // row in one launch — the token and hidden axes are contiguous and the kernel
+            // never has to know they are two axes.
             moe_acc: {
-                let bytes = MOE_ACC_ROWS * cfg.hidden * 8;
+                let bytes = MOE_ACC_ROWS * MAXROW * cfg.hidden * 8;
                 let mut b = DeviceBuf::new(bytes)?;
                 // SAFETY: `b` owns `bytes`, just allocated.
                 unsafe { fill_u32(b.ptr_mut() as *mut u8, 0, bytes)? };
                 b
             },
-            moe_h: f(slots * cfg.moe_inter)?,
+            moe_h: f(slots * MAXROW * cfg.moe_inter)?,
             descs_buf: DeviceBuf::new(slots * std::mem::size_of::<ExpertDesc>())?,
-            wexpert_buf: f(slots)?,
-            logits: f(cfg.vocab)?,
+            wexpert_buf: f(slots * MAXROW)?,
+            logits: f(MAXROW * cfg.vocab)?,
             // [i32 index | f32 value | u32 nonfinite-tag]. The tag rides this buffer
             // deliberately: the tail's D2H is already paid, so localising the NaN costs
             // no extra sync — and a sync is exactly what masks it (--checksum-x makes
@@ -717,8 +743,8 @@ impl<'a> GpuEngine<'a> {
                 // hipMalloc does NOT zero. Tag 0 means "clean", so an unzeroed byte
                 // would fabricate a layer coordinate on the first failure — the probe
                 // would confidently point at the wrong place.
-                let mut b = DeviceBuf::new(12)?;
-                b.copy_in_at(0, &[0u8; 12])?;
+                let mut b = DeviceBuf::new(ARGMAX_BYTES)?;
+                b.copy_in_at(0, &[0u8; ARGMAX_BYTES])?;
                 b
             },
             lc,
@@ -727,18 +753,20 @@ impl<'a> GpuEngine<'a> {
             n_kv_blocks,
             scores: vec![0.0; cfg.n_experts],
             choice: vec![0.0; cfg.n_experts],
-            sel: Vec::with_capacity(cfg.top_k),
             window: Vec::new(), // grown once by the first traced layer; empty otherwise
-            w: Vec::with_capacity(slots),
+            w: Vec::with_capacity(slots * MAXROW),
+            sel_row: std::array::from_fn(|_| Vec::with_capacity(cfg.top_k)),
+            wrow: std::array::from_fn(|_| Vec::with_capacity(cfg.top_k)),
+            union: Vec::with_capacity(slots),
             codebooks: pin.codebooks(),
-            mlps_vq: Vec::with_capacity(cfg.top_k),
+            mlps_vq: Vec::with_capacity(slots),
             descs_vq: Vec::with_capacity(slots),
             fmt: Vec::with_capacity(slots),
             tickets: Vec::with_capacity(slots),
             #[cfg(feature = "trace")]
             looka: crate::looka::Looka::new(cfg.n_layers),
-            gl_host: Vec::with_capacity(cfg.n_experts * 4),
-            argmax_host: Vec::with_capacity(12),
+            gl_host: Vec::with_capacity(MAXROW * cfg.n_experts * 4),
+            argmax_host: Vec::with_capacity(ARGMAX_BYTES),
             prof: Profile::default(),
             compute_stream: Stream::compute()?,
             miss_stream: Stream::miss()?,
@@ -930,7 +958,7 @@ impl<'a> GpuEngine<'a> {
                 iqp)?;
             launch_rope(iqp, nh, hd, rope, pos, theta)?; // per head: stride hd, seg rope
             // weights_proj is bf16→f32 [n_heads, hidden] — plain f32 GEMV.
-            launch_gemv_f32(xnp, ip.weights_proj, nh, cfg.hidden, iwp)?;
+            launch_gemv_f32(xnp, ip.weights_proj, nh, cfg.hidden, 1, iwp)?;
         }
 
         // Active head set for the O(nt) scan: all `nh` heads (DSA), or the MISA-routed
@@ -1063,33 +1091,58 @@ impl<'a> GpuEngine<'a> {
     /// in `self.logits`.
     /// The main model: embed `token`, run every layer, leave logits on the device.
     async fn forward(&mut self, token: u32, pos: usize) -> Result<()> {
-        self.forward_inner(token, pos, Draft::No).await
+        self.forward_inner(&[token], pos, Draft::No).await
     }
 
-    /// The MTP head. Reads the hidden state the last [`GpuEngine::forward`] left in `x`
-    /// (`h_{pos-1}`), combines it with the embedding of `token` (the token AT `pos`, i.e.
-    /// the one just sampled), runs the single pinned head layer at `pos`, and returns its
-    /// greedy prediction for `pos + 1`.
+    /// The MTP head over `tokens.len()` rows. Row `r` is the head element at
+    /// `pos + r`: it consumes `(x[r], emb(tokens[r]))` — `x[r]` being the hidden state
+    /// row `r` of the last [`GpuEngine::forward`] — and predicts the token at
+    /// `pos + r + 1`.
     ///
     /// `x` is restored on the way out, so a draft is invisible to the main residual
     /// stream. What it DOES mutate is the head's own KV slab (correctly — that is the
     /// head's context) and the routed-expert pool (its 8 picks are admitted like any
     /// other layer's, which is also why a rejected draft is not wasted here: the bytes
     /// it fetched stay cached).
-    /// Returns `(draft, confidence)` — confidence being softmax(logits)[draft].
-    async fn mtp_draft(&mut self, token: u32, pos: usize, src: Draft) -> Result<(u32, f32)> {
-        self.forward_inner(token, pos, src).await?;
-        let d = self.argmax()?;
-        // `argmax` already synced on its D2H, so this read needs no further join.
+    ///
+    /// The head's KV must be filled at EVERY position, not just the ones we want a draft
+    /// for. Accepting a draft advances `pos` by two, and the element it skipped would
+    /// otherwise leave a row of uninitialised device memory inside the window the next
+    /// draft attends over. That is what the multi-row form is for: on an accepted pass
+    /// both the filler element and the real next draft ride one pass.
+    ///
+    /// Returns the LAST row's `(draft, confidence)` — the only one anyone asks for.
+    async fn mtp_draft(&mut self, tokens: &[u32], pos: usize) -> Result<(u32, f32)> {
+        let last = tokens.len() - 1;
+        self.forward_inner(tokens, pos, Draft::Head).await?;
+        let d = self.argmax_rows(tokens.len())?[last];
+        // `argmax_rows` already synced on its D2H, so this read needs no further join.
         self.logits.copy_out_into(&mut self.mtp_host)?;
-        Ok((d, top1_prob(&self.mtp_host)))
+        let vocab = self.cfg.vocab * 4;
+        Ok((d, top1_prob(&self.mtp_host[last * vocab..(last + 1) * vocab])))
     }
 
     /// `mtp`: run the MTP head alone instead of the model's layers — see
     /// [`GpuEngine::mtp_draft`] for what that means. Everything else is identical, which
     /// is the point: the head IS a layer, so it reuses the whole per-layer path
     /// (routing, the expert pool, tickets, the two streams, the profile).
-    async fn forward_inner(&mut self, token: u32, pos: usize, mtp: Draft) -> Result<()> {
+    ///
+    /// `tokens[r]` sits at position `pos + r`. Every device buffer is row-minor
+    /// (`buf[r*dim + i]`) so the batched kernels take a row count and the rest launch `R`
+    /// times at an offset; `tokens.len() == 1` reproduces the unbatched pass exactly,
+    /// pointer arithmetic and all.
+    ///
+    /// ROW `r > 0` IS SPECULATIVE. Its KV lands at position `pos + r` like any other, and
+    /// discarding it is just not advancing `pos` — the next pass overwrites that row.
+    /// There is no compaction and no fixup, because `append_kv` writes by position index
+    /// and `attend` reads `0..nr` with `nr` derived from position.
+    async fn forward_inner(&mut self, tokens: &[u32], pos: usize, mtp: Draft) -> Result<()> {
+        let nrow = tokens.len();
+        ensure!(
+            (1..=MAXROW).contains(&nrow),
+            "forward: {nrow} token rows, but the engine's scratch is allocated for {MAXROW}"
+        );
+        let token = tokens[0];
         let cfg = self.cfg;
         let eps = cfg.rms_norm_eps as f32;
         // Which pinned layers this pass runs. The head sits one past the model's last.
@@ -1097,37 +1150,44 @@ impl<'a> GpuEngine<'a> {
             Draft::No => 0..cfg.n_layers,
             _ => cfg.n_layers..cfg.n_layers + 1,
         };
-        // The head's entry: `x` ← eh_proj·[enorm(emb(token)) ‖ hnorm(x)]. Done BEFORE the
-        // scratch pointers are taken, because it ends by swapping the head's residual
-        // buffer into `x` — the last read of the main model's `h` is the hnorm above it.
+        // The head's entry: `x[r]` ← eh_proj·[enorm(emb(tokens[r])) ‖ hnorm(x[r])]. Done
+        // BEFORE the scratch pointers are taken, because it ends by swapping the head's
+        // residual buffer into `x` — the last read of the main model's `h` is the hnorm
+        // above it.
         let mtp_w = match mtp {
             Draft::No => None,
-            _ => {
+            Draft::Head => {
                 let m = self.pin.mtp.context("--mtp: artifact carries no MTP head")?;
                 let emb = self.pin.embed;
                 let catp = self.mtp_cat.ptr_mut() as *mut f32;
-                // Depth 1 reads the model's hidden state; a chained draft reads the head's
-                // own previous output, which the exit swap below left in `mtp_x`. That
-                // makes the chained case read and write the SAME buffer — safe, and only
-                // because both launches sit on the null stream in this order: the hnorm
-                // consumes it before the eh_proj gemv overwrites it.
-                let hp = match mtp {
-                    Draft::Chained => self.mtp_x.ptr() as *const f32,
-                    _ => self.x.ptr() as *const f32,
-                };
+                let hp = self.x.ptr() as *const f32;
                 let dst = self.mtp_x.ptr_mut() as *mut f32;
-                // SAFETY: cat is 2·hidden f32 scratch; `hp` is the hidden state the
-                // previous forward left resident; eh_proj is [hidden, 2·hidden] f32.
+                // SAFETY: cat is MAXROW·2·hidden f32 scratch; `hp` is the hidden state the
+                // previous forward left resident (row r for element pos+r); eh_proj is
+                // [hidden, 2·hidden] f32. All offsets are < nrow ≤ MAXROW.
                 unsafe {
-                    // Embedding half FIRST, hidden-state half second — the DeepSeek-V3
-                    // convention this checkpoint inherits. Not documented anywhere in the
-                    // artifact, so it was MEASURED: this order drafts at 53.5%, the
-                    // swapped one at 0.0% over 63 drafts. A 0% arm is what makes 53.5%
-                    // readable as "the head works", not "the metric is loose".
-                    launch_embed_i8_row(emb.packed, emb.scale, token as usize, cfg.hidden, catp)?;
-                    launch_rmsnorm(catp, m.enorm, cfg.hidden, eps, catp)?; // in-place
-                    launch_rmsnorm(hp, m.hnorm, cfg.hidden, eps, catp.add(cfg.hidden))?;
-                    launch_gemv_f32(catp, m.eh_proj, cfg.hidden, 2 * cfg.hidden, dst)?;
+                    // Per row rather than batched: `cat`'s row stride (2·hidden) differs
+                    // from the hnorm SOURCE's (hidden), which a single-stride rmsnorm
+                    // cannot express. Four launches on the one layer the head runs — the
+                    // eh_proj gemv below IS batched, and that is where the bytes are.
+                    for (r, &t) in tokens.iter().enumerate() {
+                        let cr = catp.add(r * 2 * cfg.hidden);
+                        // Embedding half FIRST, hidden-state half second — the DeepSeek-V3
+                        // convention this checkpoint inherits. Not documented anywhere in
+                        // the artifact, so it was MEASURED: this order drafts at 53.5%, the
+                        // swapped one at 0.0% over 63 drafts. A 0% arm is what makes 53.5%
+                        // readable as "the head works", not "the metric is loose".
+                        launch_embed_i8_row(emb.packed, emb.scale, t as usize, cfg.hidden, cr)?;
+                        launch_rmsnorm(cr, m.enorm, cfg.hidden, eps, cr)?; // in-place
+                        launch_rmsnorm(
+                            hp.add(r * cfg.hidden),
+                            m.hnorm,
+                            cfg.hidden,
+                            eps,
+                            cr.add(cfg.hidden),
+                        )?;
+                    }
+                    launch_gemv_f32(catp, m.eh_proj, cfg.hidden, 2 * cfg.hidden, nrow, dst)?;
                 }
                 std::mem::swap(&mut self.x, &mut self.mtp_x);
                 Some(m)
@@ -1161,44 +1221,69 @@ impl<'a> GpuEngine<'a> {
         let glp = self.gate_logits.ptr_mut() as *mut f32;
 
         // The KV slabs are sized to max_ctx; writing row pos beyond that is a device
-        // out-of-bounds write, so refuse here rather than corrupt device memory.
+        // out-of-bounds write, so refuse here rather than corrupt device memory. The
+        // LAST row is the one that writes furthest.
         ensure!(
-            pos < self.max_ctx,
-            "pos {pos} exceeds engine capacity max_ctx={}",
+            pos + nrow <= self.max_ctx,
+            "pos {pos} + {nrow} rows exceeds engine capacity max_ctx={}",
             self.max_ctx
         );
 
-        // Row selection: dense/streaming is layer-blind (computed once, reused by
-        // every layer's attend — dense passes a null rows pointer, the kernel fast
-        // path). Dsa/misa selects per full layer inside the loop (it needs the
-        // mid-attention q-LoRA residual), signalled by `None` here.
-        let hoisted_rows: Option<(*const u32, usize)> = match &self.mode {
-            AttnMode::Dense => Some((std::ptr::null(), pos + 1)),
+        // Row selection, one entry per token row: dense/streaming is layer-blind
+        // (computed once, reused by every layer's attend — dense passes a null rows
+        // pointer, the kernel fast path). Dsa/misa selects per full layer inside the loop
+        // (it needs the mid-attention q-LoRA residual), signalled by `None` here.
+        //
+        // Row `r` attends over `pos + r + 1` KV rows: it must SEE the rows the earlier
+        // rows of this same pass just appended, which they have because both launches sit
+        // on the null stream in append-then-attend order. That differing `nr` IS the
+        // causal mask — there is nothing else to add.
+        let hoisted_rows: Option<[(*const u32, usize); MAXROW]> = match &self.mode {
+            AttnMode::Dense => Some(std::array::from_fn(|r| (std::ptr::null(), pos + r + 1))),
+            // Streaming and DSA select a DIFFERENT row set per position, and the engine
+            // keeps one `rows_buf` — so a batched pass would need one upload per row and
+            // a per-row buffer. Not built: dense is the measured configuration and the
+            // work only pays once a batched pass is worth having under those modes too.
             AttnMode::Streaming { sinks, window } => {
+                ensure!(
+                    nrow == 1,
+                    "--attn streaming: batched token rows are not implemented (each row \
+                     selects a different KV window); use --attn dense with --mtp"
+                );
                 streaming_rows(pos + 1, *sinks, *window, &mut self.rows_host);
-                if self.rows_host.len() == pos + 1 {
-                    Some((std::ptr::null(), pos + 1)) // all selected → dense fast path
+                let rn = if self.rows_host.len() == pos + 1 {
+                    (std::ptr::null(), pos + 1) // all selected → dense fast path
                 } else {
                     self.rows_buf.copy_in_at(0, as_le_bytes(&self.rows_host))?;
-                    Some((self.rows_buf.ptr() as *const u32, self.rows_host.len()))
-                }
+                    (self.rows_buf.ptr() as *const u32, self.rows_host.len())
+                };
+                Some([rn; MAXROW])
             }
-            AttnMode::Dsa | AttnMode::Misa { .. } => None,
+            AttnMode::Dsa | AttnMode::Misa { .. } => {
+                ensure!(
+                    nrow == 1,
+                    "--attn dsa/misa: batched token rows are not implemented (the indexer \
+                     selects per position); use --attn dense with --mtp"
+                );
+                None
+            }
         };
 
-        // Embedding row → x.
+        // Embedding row → x, one per token row.
         // SAFETY: all pointers are device-resident scratch/weights valid for their
         // dims; each launch's inputs are produced by a prior launch on the same
         // (default) stream, so ordering holds; a device_sync precedes every host read.
         if mtp_w.is_none() {
-            unsafe {
-                launch_embed_i8_row(
-                    self.pin.embed.packed,
-                    self.pin.embed.scale,
-                    token as usize,
-                    hidden,
-                    xp,
-                )?;
+            for (r, &t) in tokens.iter().enumerate() {
+                unsafe {
+                    launch_embed_i8_row(
+                        self.pin.embed.packed,
+                        self.pin.embed.scale,
+                        t as usize,
+                        hidden,
+                        xp.add(r * hidden),
+                    )?;
+                }
             }
         }
 
@@ -1238,14 +1323,24 @@ impl<'a> GpuEngine<'a> {
             let rcp = self.rc[l].ptr_mut() as *mut u16;
 
             // --- Attention phase 1: projections, ropes, cache append, absorb. ---
-            // SAFETY: see the forward-level note; every pointer is live scratch.
+            // The four fp8 GEMVs and the absorb carry every row through ONE read of their
+            // weights (`nrow`); the norms/ropes/appends launch per row, because their
+            // scalar arguments (`pos`) or their strides differ per row and each is a
+            // microsecond kernel over ≤6144 floats — ~8 extra enqueues on a ~5 ms layer.
+            // SAFETY: see the forward-level note; every pointer is live scratch, and
+            // every `.add(r * …)` is within the MAXROW-wide allocation since r < nrow.
             unsafe {
-                launch_rmsnorm(xp, input_ln, hidden, eps, xnp)?;
+                for r in 0..nrow {
+                    launch_rmsnorm(xp.add(r * hidden), input_ln, hidden, eps, xnp.add(r * hidden))?;
+                }
                 launch_gemv_fp8(
-                    xnp, q_a.packed, q_a.scale, q_a.o_dim, q_a.i_dim, q_a.block, 1, qrp)?;
-                launch_rmsnorm(qrp, q_a_ln, cfg.q_lora_rank, eps, qrp)?; // in-place
+                    xnp, q_a.packed, q_a.scale, q_a.o_dim, q_a.i_dim, q_a.block, nrow, qrp)?;
+                for r in 0..nrow {
+                    let p = qrp.add(r * cfg.q_lora_rank);
+                    launch_rmsnorm(p, q_a_ln, cfg.q_lora_rank, eps, p)?; // in-place
+                }
                 launch_gemv_fp8(
-                    qrp, q_b.packed, q_b.scale, q_b.o_dim, q_b.i_dim, q_b.block, 1, qp)?;
+                    qrp, q_b.packed, q_b.scale, q_b.o_dim, q_b.i_dim, q_b.block, nrow, qp)?;
                 launch_gemv_fp8(
                     xnp,
                     kv_a.packed,
@@ -1253,22 +1348,17 @@ impl<'a> GpuEngine<'a> {
                     kv_a.o_dim,
                     kv_a.i_dim,
                     kv_a.block,
-                    1,
+                    nrow,
                     compp)?;
-                launch_rmsnorm(compp, kv_a_ln, kvl, eps, compp)?; // normalize latent (first kvl)
-                launch_rope(compp.add(kvl), 1, rope, rope, pos, theta)?; // rope the key
-                launch_rope(qp.add(nope), h, qh, rope, pos, theta)?; // rope per-head query
-                launch_append_kv(
-                    compp,
-                    compp.add(kvl),
-                    lc8p,
-                    lscalep,
-                    rcp,
-                    pos,
-                    kvl,
-                    rope,
-                    nb,
-                )?;
+                for r in 0..nrow {
+                    // `comp`'s row stride is kvl+rope but the norm covers only the first
+                    // kvl, so this cannot ride a single-stride batched rmsnorm.
+                    let c = compp.add(r * (kvl + rope));
+                    launch_rmsnorm(c, kv_a_ln, kvl, eps, c)?; // normalize latent (first kvl)
+                    launch_rope(c.add(kvl), 1, rope, rope, pos + r, theta)?; // rope the key
+                    launch_rope(qp.add(r * h * qh + nope), h, qh, rope, pos + r, theta)?;
+                    launch_append_kv(c, c.add(kvl), lc8p, lscalep, rcp, pos + r, kvl, rope, nb)?;
+                }
                 launch_mla_absorb_fp8(
                     qp,
                     kv_b.packed,
@@ -1279,27 +1369,52 @@ impl<'a> GpuEngine<'a> {
                     vh,
                     kvl,
                     kv_b.block,
+                    nrow,
                     qabsp,
                 )?;
-                launch_gather_rope(qp, qropep, h, qh, nope, rope)?;
+                for r in 0..nrow {
+                    launch_gather_rope(
+                        qp.add(r * h * qh),
+                        qropep.add(r * h * rope),
+                        h,
+                        qh,
+                        nope,
+                        rope,
+                    )?;
+                }
             }
 
             // Row selection: hoisted (dense/streaming) or per-layer DSA (needs `qrp`
             // the q-LoRA residual + `xnp` the layer input, both from phase 1). Whether DSA
             // syncs mid-layer is `dsa_select_layer`'s business, not this call site's.
-            let (rows_ptr, nr) = match hoisted_rows {
+            let rows: [(*const u32, usize); MAXROW] = match hoisted_rows {
                 Some(rn) => rn,
-                None => self.dsa_select_layer(l, pos, xnp, qrp, indexer_pin)?,
+                // `nrow == 1` here — the mode guard above refused anything wider.
+                None => [self.dsa_select_layer(l, pos, xnp, qrp, indexer_pin)?; MAXROW],
             };
 
             // --- Attention phase 2: dense flash attend, value + output projection,
             //     residual, pre-MLP norm. ---
             // SAFETY: see the forward-level note; every pointer is live scratch.
             unsafe {
-                launch_attend(
-                    qabsp, qropep, lc8p, lscalep, rcp, rows_ptr, h, nr, kvl, rope, nb, scale,
-                    clatp, apartp,
-                )?;
+                for (r, &(rows_ptr, nr)) in rows.iter().take(nrow).enumerate() {
+                    launch_attend(
+                        qabsp.add(r * h * kvl),
+                        qropep.add(r * h * rope),
+                        lc8p,
+                        lscalep,
+                        rcp,
+                        rows_ptr,
+                        h,
+                        nr,
+                        kvl,
+                        rope,
+                        nb,
+                        scale,
+                        clatp.add(r * h * kvl),
+                        apartp.add(r * crate::backend::attend_scratch_floats(h, kvl)),
+                    )?;
+                }
                 launch_mla_value_fp8(
                     clatp,
                     kv_b.packed,
@@ -1309,6 +1424,7 @@ impl<'a> GpuEngine<'a> {
                     vh,
                     kvl,
                     kv_b.block,
+                    nrow,
                     ctxp,
                 )?;
                 launch_gemv_fp8(
@@ -1318,10 +1434,15 @@ impl<'a> GpuEngine<'a> {
                     o_proj.o_dim,
                     o_proj.i_dim,
                     o_proj.block,
-                    1,
+                    nrow,
                     subp)?;
-                launch_vadd(xp, subp, hidden)?; // residual
-                launch_rmsnorm(xp, post_ln, hidden, eps, xnp)?; // pre-MLP norm → xn
+                // Both rows in one launch: `x` and `sub` are contiguous row-minor, so the
+                // residual add over nrow·hidden elements is the same elementwise op.
+                launch_vadd(xp, subp, nrow * hidden)?; // residual
+                for r in 0..nrow {
+                    // pre-MLP norm → xn
+                    launch_rmsnorm(xp.add(r * hidden), post_ln, hidden, eps, xnp.add(r * hidden))?;
+                }
             }
 
             // --- LOOKA pilot (CACHE_PILOT Step 1, `--features trace`) ---
@@ -1360,9 +1481,13 @@ impl<'a> GpuEngine<'a> {
                     // time); `pxn`/`plp` are engine-owned scratch, and `plp` is in bounds
                     // because `pilot_logits` is sized HORIZONS.len() * n_experts. Both
                     // launches are stream-ordered, so the gemv sees the norm's output.
+                    // ROW 0 ONLY, on both sides of the batch. LOOKA measures a PREDICTOR
+                    // against what the real token's router chose, and row 0 is the real
+                    // token; scoring a speculative row would mix "was the prediction
+                    // right" with "was the draft accepted".
                     unsafe {
                         launch_rmsnorm(xp, t_post_ln, hidden, eps, pxn)?;
-                        launch_gemv_f32(pxn, t_gate_w, cfg.n_experts, hidden, plp)?;
+                        launch_gemv_f32(pxn, t_gate_w, cfg.n_experts, hidden, 1, plp)?;
                     }
                     any = true;
                 }
@@ -1434,7 +1559,7 @@ impl<'a> GpuEngine<'a> {
                         m.gate.o_dim,
                         m.gate.i_dim,
                         m.gate.block,
-                        1,
+                        nrow,
                         gp)?;
                     launch_gemv_fp8(
                         xnp,
@@ -1443,9 +1568,10 @@ impl<'a> GpuEngine<'a> {
                         m.up.o_dim,
                         m.up.i_dim,
                         m.up.block,
-                        1,
+                        nrow,
                         up)?;
-                    launch_swiglu(gp, up, inter, gp)?; // in place: h = silu(gate)*up
+                    // One launch: elementwise over contiguous row-minor buffers.
+                    launch_swiglu(gp, up, nrow * inter, gp)?; // in place: h = silu(gate)*up
                     launch_gemv_fp8(
                         gp,
                         m.down.packed,
@@ -1453,7 +1579,7 @@ impl<'a> GpuEngine<'a> {
                         m.down.o_dim,
                         m.down.i_dim,
                         m.down.block,
-                        1,
+                        nrow,
                         outp)?;
                 }
                 // Dense layer: attention + MLP were all launches, nothing blocked.
@@ -1466,7 +1592,7 @@ impl<'a> GpuEngine<'a> {
             } else {
                 // Router gate on device, then read logits to route on host.
                 // SAFETY: gate_w resident F32; glp device scratch.
-                unsafe { launch_gemv_f32(xnp, gate_w, cfg.n_experts, hidden, glp)? };
+                unsafe { launch_gemv_f32(xnp, gate_w, cfg.n_experts, hidden, nrow, glp)? };
                 // The gate-logits D2H is a blocking join, so timing around it is free —
                 // no sync we don't already pay. (All the always-on profile buckets wrap
                 // existing join/D2H points; none add a sync.)
@@ -1492,14 +1618,54 @@ impl<'a> GpuEngine<'a> {
                 // is what lets the LOOKA hint layer be output-neutral by construction
                 // (math.rs `inv_1_routing_never_consults_the_cache`).
                 let t_route = std::time::Instant::now();
-                route_into(
-                    &self.gl_host,
-                    self.pin.moe_bias(l),
-                    cfg.top_k,
-                    &mut self.scores,
-                    &mut self.choice,
-                    &mut self.sel,
-                );
+                // One routing per token row, then the UNION. The rows are INDEPENDENT
+                // routers over independent hidden states — batching them is a launch
+                // decision, not a modelling one, and each row's weights are normalized
+                // over its OWN top-k exactly as an unbatched pass would.
+                //
+                // Descending, so `scores`/`choice` are left holding ROW 0 for the LOOKA
+                // scorer and the trace window below: those measure the router against the
+                // real token, and row 0 is the real token.
+                let ne = cfg.n_experts * 4;
+                for r in (0..nrow).rev() {
+                    route_into(
+                        &self.gl_host[r * ne..(r + 1) * ne],
+                        self.pin.moe_bias(l),
+                        cfg.top_k,
+                        &mut self.scores,
+                        &mut self.choice,
+                        &mut self.sel_row[r],
+                    );
+                    // Routed weights: sigmoid score, sum-normalized over THIS row's picks,
+                    // then scaled. Computed here rather than after the union because
+                    // `scores` belongs to row `r` only until the next iteration.
+                    let wr = &mut self.wrow[r];
+                    wr.clear();
+                    for &e in &self.sel_row[r] {
+                        wr.push(self.scores[e]);
+                    }
+                    let mut sm: f32 = wr.iter().sum();
+                    if cfg.norm_topk_prob {
+                        sm += 1e-20;
+                        for wi in wr.iter_mut() {
+                            *wi /= sm;
+                        }
+                    }
+                    for wi in wr.iter_mut() {
+                        *wi *= cfg.routed_scale as f32;
+                    }
+                }
+                // Row 0's picks first and in order, so an `nrow == 1` pass submits exactly
+                // what the unbatched engine submitted — same experts, same order, same
+                // descriptor indices.
+                self.union.clear();
+                for r in 0..nrow {
+                    for &e in &self.sel_row[r] {
+                        if !self.union.contains(&e) {
+                            self.union.push(e);
+                        }
+                    }
+                }
                 // The host half of the route region, stamped rather than derived.
                 let e_route = std::time::Instant::now();
                 self.prof.cpu_route_ns += e_route.duration_since(t_route).as_nanos();
@@ -1512,7 +1678,7 @@ impl<'a> GpuEngine<'a> {
                 // across this change.
                 #[cfg(feature = "trace")]
                 {
-                    let (lk, sel) = (&mut self.looka, &self.sel);
+                    let (lk, sel) = (&mut self.looka, &self.sel_row[0]);
                     lk.score(l, sel);
                 }
                 // Trace v2 only: re-rank the same `choice` array to the wider candidate
@@ -1531,7 +1697,7 @@ impl<'a> GpuEngine<'a> {
                 // misses, so afterwards everything reads as resident. A bitmask, not a
                 // Vec — this runs 78x per token and top_k is 8.
                 let warm_mask: u64 = if crate::telemetry::spans::enabled() {
-                    self.sel
+                    self.union
                         .iter()
                         .take(64)
                         .enumerate()
@@ -1541,9 +1707,12 @@ impl<'a> GpuEngine<'a> {
                     0
                 };
                 let t_sub = std::time::Instant::now();
+                // The UNION, not one row's picks: every expert any row routed to must be
+                // resident before the batch launches. Rows overlap ~31% (measured over
+                // 268 tokens x 75 layers), so 2 rows submit ~13.5 experts rather than 16.
                 let mut signals = self.pin.submit_layer(
                     l,
-                    &self.sel,
+                    &self.union,
                     &self.window,
                     &self.choice,
                     &mut self.mlps_vq,
@@ -1557,15 +1726,15 @@ impl<'a> GpuEngine<'a> {
                 self.prof.cpu_submit_ns += e_sub.duration_since(t_sub).as_nanos();
                 crate::telemetry::spans::record("cpu/submit-layer", "decode", t_sub, e_sub);
                 // Residency x format, the pair that explains a layer's cost. `fmt` is
-                // filled by submit_layer in `sel` order (the shared expert is pushed
-                // after, so `take(sel.len())` keeps this to the routed picks).
+                // filled by submit_layer in `union` order (the shared expert is pushed
+                // after, so `take(union.len())` keeps this to the routed picks).
                 if crate::telemetry::spans::enabled() {
                     let mut st = crate::telemetry::spans::LayerState {
                         tok: pos as u32,
                         layer: l as i32,
                         ..Default::default()
                     };
-                    for (i, &i4) in self.fmt.iter().take(self.sel.len()).enumerate() {
+                    for (i, &i4) in self.fmt.iter().take(self.union.len()).enumerate() {
                         let warm = i < 64 && (warm_mask & (1 << i)) != 0;
                         match (warm, i4) {
                             (true, true) => st.warm_i4 += 1,
@@ -1578,21 +1747,25 @@ impl<'a> GpuEngine<'a> {
                 }
                 layer_misses = (self.pin.misses - miss0) as usize;
                 self.prof.fetch_n += self.pin.misses - miss0;
-                // Routed weights: sigmoid score, sum-normalized over the routed picks,
-                // then scaled. The VQ shared expert (weight 1.0) folds into the batch.
+                // Scatter each row's weights into the `[descriptor][row]` matrix the
+                // kernel reads as `wexpert[e*R + t]`. A row that did not route to a union
+                // expert leaves 0.0 there, and `moe_down_vq` SKIPS a zero weight — so a
+                // row's result is EXACTLY its own 8 + shared, whatever else the union
+                // dragged in. That is what makes row 0 of a batched pass bit-identical to
+                // an unbatched one, and the skip is correctness rather than thrift:
+                // `0 * dv` with a non-finite `dv` is NaN, which the fixed-point clamp
+                // would turn into a finite extreme.
+                // Driven from the union rather than from each row's picks, so "this row
+                // did not route here" is the natural `None` and leaves the 0.0 the resize
+                // put there — no unwrap, and no way to silently drop a weight.
                 self.w.clear();
-                for &e in &self.sel {
-                    self.w.push(self.scores[e]);
-                }
-                let mut sm: f32 = self.w.iter().sum();
-                if cfg.norm_topk_prob {
-                    sm += 1e-20;
-                    for wi in self.w.iter_mut() {
-                        *wi /= sm;
+                self.w.resize(self.union.len() * nrow, 0.0);
+                for (u, &e) in self.union.iter().enumerate() {
+                    for r in 0..nrow {
+                        if let Some(i) = self.sel_row[r].iter().position(|&x| x == e) {
+                            self.w[u * nrow + r] = self.wrow[r][i];
+                        }
                     }
-                }
-                for wi in self.w.iter_mut() {
-                    *wi *= cfg.routed_scale as f32;
                 }
                 // VQ routed descriptors + the folded VQ shared expert (resident, so its
                 // load is `ready()`).
@@ -1602,7 +1775,9 @@ impl<'a> GpuEngine<'a> {
                 }
                 if let Some(s) = shared {
                     self.descs_vq.push(desc_of_vq(&s));
-                    self.w.push(1.0);
+                    // Weight 1.0 for EVERY row: the shared expert is unconditional, so it
+                    // contributes to each row of the batch.
+                    self.w.extend(std::iter::repeat_n(1.0, nrow));
                     self.fmt.push(self.pin.shared_i4());
                     // The shared expert is in the RESIDENT tier, never streamed, so its
                     // dependency is already satisfied. It must still grow `tickets` with
@@ -1625,8 +1800,10 @@ impl<'a> GpuEngine<'a> {
                 let x_c = xnp as *const f32;
                 let h_c = self.moe_h.ptr_mut() as *mut f32;
                 let acc_c = self.moe_acc.ptr_mut() as *mut u64;
-                // SAFETY: `moe_acc` is MOE_ACC_ROWS·hidden u64; this is row 1, in bounds.
-                let acc_miss = unsafe { acc_c.add(hidden) };
+                // SAFETY: `moe_acc` is MOE_ACC_ROWS·MAXROW·hidden u64, laid out
+                // [stream][token row][hidden]; this is the miss stream's block, in bounds
+                // for nrow ≤ MAXROW.
+                let acc_miss = unsafe { acc_c.add(nrow * hidden) };
                 // One descriptor buffer for both kernels — the int4 kernel reinterprets
                 // the same six-pointer bytes (at its slot offsets).
                 let descs_ptr = self.descs_buf.ptr() as *const ExpertDesc;
@@ -1746,12 +1923,12 @@ impl<'a> GpuEngine<'a> {
                         if f {
                             launch_moe_expert_range_i4(
                                 x_c, hidden, inter, i, j - i, descs_ptr, w_ptr, h_c, acc_c,
-                                cs_raw,
+                                nrow, cs_raw,
                             )?;
                         } else {
                             launch_moe_expert_range(
                                 x_c, hidden, inter, i, j - i, descs_ptr, cb0, cb1, cb2, w_ptr,
-                                h_c, acc_c, 1, cs_raw,
+                                h_c, acc_c, nrow, cs_raw,
                             )?;
                         }
                     }
@@ -1781,12 +1958,13 @@ impl<'a> GpuEngine<'a> {
                     unsafe {
                         if fmt[e] {
                             launch_moe_expert_range_i4(
-                                x_c, hidden, inter, e, 1, descs_ptr, w_ptr, h_c, acc_miss, ms_raw,
+                                x_c, hidden, inter, e, 1, descs_ptr, w_ptr, h_c, acc_miss, nrow,
+                                ms_raw,
                             )?;
                         } else {
                             launch_moe_expert_range(
                                 x_c, hidden, inter, e, 1, descs_ptr, cb0, cb1, cb2, w_ptr, h_c,
-                                acc_miss, 1, ms_raw,
+                                acc_miss, nrow, ms_raw,
                             )?;
                         }
                     }
@@ -1828,15 +2006,17 @@ impl<'a> GpuEngine<'a> {
             // stream that touched it has completed; `moe_out` is `hidden` f32.
             unsafe {
                 match dense_mlp.is_none() {
+                    // `nrow·hidden` in one launch: the accumulator's token and hidden
+                    // axes are contiguous, so the drain never has to know they are two.
                     true => launch_moe_acc_drain(
                         xp,
                         self.moe_acc.ptr_mut() as *mut u64,
-                        hidden,
+                        nrow * hidden,
                         MOE_ACC_ROWS,
                         self.moe_gain,
                         std::ptr::null_mut(),
                     )?,
-                    false => launch_vadd(xp, self.moe_out.ptr() as *const f32, hidden)?,
+                    false => launch_vadd(xp, self.moe_out.ptr() as *const f32, nrow * hidden)?,
                 }
             }
             // End-of-layer join: protects the reused descs/wexpert/moe_out buffers
@@ -1859,7 +2039,7 @@ impl<'a> GpuEngine<'a> {
             unsafe {
                 launch_flag_nonfinite(
                     xp,
-                    hidden,
+                    nrow * hidden,
                     1 + (pos as u32) * 256 + l as u32,
                     self.argmax_dev.ptr_mut().add(8) as *mut u32,
                 )?;
@@ -1938,14 +2118,19 @@ impl<'a> GpuEngine<'a> {
         // model (the checkpoint ships no `shared_head.head.weight`).
         let tail_norm = mtp_w.map_or(self.pin.final_norm, |m| m.shared_norm);
         unsafe {
-            launch_rmsnorm(xp, tail_norm, hidden, eps, xnp)?;
+            for r in 0..nrow {
+                launch_rmsnorm(xp.add(r * hidden), tail_norm, hidden, eps, xnp.add(r * hidden))?;
+            }
             let head = self.pin.lm_head;
+            // Batched: lm_head is 952 MB of int8, the single largest read in the pass, and
+            // a second row through the same read costs one more f32 multiply per column.
             launch_gemv_i8(
                 xnp,
                 head.packed,
                 head.scale,
                 head.o_dim,
                 head.i_dim,
+                nrow,
                 self.logits.ptr_mut() as *mut f32,
             )?;
         }
@@ -1993,28 +2178,43 @@ impl<'a> GpuEngine<'a> {
                 let Some(&next) = ids.get(pos + 1) else { break };
                 ensure!((next as usize) < vocab, "token {next} outside vocab {vocab}");
                 self.logits.copy_out_into(&mut host)?;
-                ensure!(host.len() == vocab * 4, "short logits D2H");
-                out.push(nll_of(&host, next as usize)?);
+                // `logits` is MAXROW rows wide; a single-row forward writes only row 0.
+                ensure!(host.len() >= vocab * 4, "short logits D2H");
+                out.push(nll_of(&host[..vocab * 4], next as usize)?);
             }
             Ok(out)
         })?;
         Ok(out)
     }
 
-    /// Greedy argmax over the device logits — reduced ON DEVICE, so only 8 bytes come
-    /// back per token. The kernel reproduces the host fold exactly (strict `>`: ties
-    /// keep the lowest index, NaN never wins), returning `logits[best]` so the
-    /// finiteness bail is the same `!value.is_finite()` check.
+    /// Greedy argmax over row 0 of the device logits — the only row a single-row forward
+    /// wrote.
     fn argmax(&mut self) -> Result<u32> {
-        // SAFETY: logits is `vocab` device f32 (written + joined); argmax_dev owns 8
-        // device bytes for [i32 index|f32 value].
-        unsafe {
-            launch_argmax(
-                self.logits.ptr() as *const f32,
-                self.cfg.vocab,
-                self.argmax_dev.ptr_mut() as *mut i32,
-                self.argmax_dev.ptr_mut().add(4) as *mut f32,
-            )?;
+        Ok(self.argmax_rows(1)?[0])
+    }
+
+    /// Greedy argmax over each of the pass's `n` logit rows — reduced ON DEVICE, so only
+    /// [`ARGMAX_BYTES`] come back per pass however many rows it carried. The kernel
+    /// reproduces the host fold exactly (strict `>`: ties keep the lowest index, NaN never
+    /// wins), returning `logits[best]` so the finiteness bail is the same
+    /// `!value.is_finite()` check.
+    ///
+    /// ONE D2H for every row: the rows are independent reductions but their results are
+    /// adjacent, and a per-row copy-out would add a blocking join per row to a path whose
+    /// whole point is to amortise joins.
+    fn argmax_rows(&mut self, n: usize) -> Result<[u32; MAXROW]> {
+        debug_assert!((1..=MAXROW).contains(&n));
+        for r in 0..n {
+            // SAFETY: logits is MAXROW·vocab device f32 (written + joined); argmax_dev
+            // owns ARGMAX_BYTES, and r < n ≤ MAXROW keeps both slots in bounds.
+            unsafe {
+                launch_argmax(
+                    (self.logits.ptr() as *const f32).add(r * self.cfg.vocab),
+                    self.cfg.vocab,
+                    self.argmax_dev.ptr_mut().add(r * 8) as *mut i32,
+                    self.argmax_dev.ptr_mut().add(r * 8 + 4) as *mut f32,
+                )?;
+            }
         }
         // Close the tail GPU span here — AFTER the argmax launch, BEFORE the D2H — so
         // it brackets exactly rmsnorm → lm_head → argmax. The start was recorded in
@@ -2034,45 +2234,38 @@ impl<'a> GpuEngine<'a> {
         }
         debug_assert_eq!(
             self.argmax_host.len(),
-            12,
-            "argmax result must be 12 bytes: [idx | val | nonfinite tag]"
+            ARGMAX_BYTES,
+            "argmax result must be MAXROW*[idx | val] + a nonfinite tag"
         );
-        let idx = i32::from_le_bytes([
-            self.argmax_host[0],
-            self.argmax_host[1],
-            self.argmax_host[2],
-            self.argmax_host[3],
-        ]);
-        let val = f32::from_le_bytes([
-            self.argmax_host[4],
-            self.argmax_host[5],
-            self.argmax_host[6],
-            self.argmax_host[7],
-        ]);
-        if !val.is_finite() {
-            // The tag rode the same D2H, so this costs nothing and turns "somewhere in
-            // 78 layers x every position" into a coordinate.
-            let tag = u32::from_le_bytes([
-                self.argmax_host[8],
-                self.argmax_host[9],
-                self.argmax_host[10],
-                self.argmax_host[11],
-            ]);
-            let where_ = if tag == 0 {
-                "no layer residual was non-finite — the fault is AFTER the last layer \
-                 (final rmsnorm, lm_head or argmax itself), not in the MoE/attention stack"
-                    .to_string()
-            } else {
-                format!(
-                    "first non-finite residual at pos={} layer={}",
-                    (tag - 1) / 256,
-                    (tag - 1) % 256
-                )
-            };
-            bail!("logits are non-finite (NaN/Inf in the GPU forward pass): {where_}");
+        let word = |o: usize| {
+            let b = &self.argmax_host[o..o + 4];
+            [b[0], b[1], b[2], b[3]]
+        };
+        let mut out = [0u32; MAXROW];
+        for (r, o) in out.iter_mut().enumerate().take(n) {
+            let idx = i32::from_le_bytes(word(r * 8));
+            let val = f32::from_le_bytes(word(r * 8 + 4));
+            if !val.is_finite() {
+                // The tag rode the same D2H, so this costs nothing and turns "somewhere in
+                // 78 layers x every position" into a coordinate.
+                let tag = u32::from_le_bytes(word(MAXROW * 8));
+                let where_ = if tag == 0 {
+                    "no layer residual was non-finite — the fault is AFTER the last layer \
+                     (final rmsnorm, lm_head or argmax itself), not in the MoE/attention stack"
+                        .to_string()
+                } else {
+                    format!(
+                        "first non-finite residual at pos={} layer={}",
+                        (tag - 1) / 256,
+                        (tag - 1) % 256
+                    )
+                };
+                bail!("logits are non-finite (NaN/Inf in the GPU forward pass), row {r}: {where_}");
+            }
+            debug_assert!(idx >= 0, "argmax returned negative index {idx}");
+            *o = idx as u32;
         }
-        debug_assert!(idx >= 0, "argmax returned negative index {idx}");
-        Ok(idx as u32)
+        Ok(out)
     }
 
     /// Greedy-decode up to `ngen` tokens continuing `prompt_ids`, stopping on any
@@ -2089,6 +2282,15 @@ impl<'a> GpuEngine<'a> {
         ensure!(
             !mtp || self.has_mtp(),
             "--mtp: this artifact carries no MTP head (reconvert with a current bin/convert)"
+        );
+        // A verify pass submits the UNION of both rows' picks, so the trace's per-layer
+        // `sel` would no longer be one routing decision — and `bin/replay`'s grammar (and
+        // pin.rs's `window[..sel.len()] == sel` invariant) assume it is. Refuse the pair
+        // rather than emit a trace that reads as a routing the model never made.
+        ensure!(
+            !mtp || !self.pin.tracing(),
+            "--mtp with --trace: a speculative pass routes twice per layer and submits the \
+             union, which the v2 trace format cannot express. Trace without --mtp."
         );
         // The decode as ONE async flow: prefill (warm-up) then the token loop, driven
         // by a single current-thread runtime — `forward` awaits the expert stream
@@ -2113,7 +2315,7 @@ impl<'a> GpuEngine<'a> {
                 // (h_i, emb(t_{i+1})) AT POSITION i+1, so the prompt supplies every
                 // element but the last, whose successor has not been sampled yet.
                 if mtp && let Some(&next) = prompt_ids.get(pos + 1) {
-                    self.mtp_draft(next, pos + 1, Draft::FromModel).await?;
+                    self.mtp_draft(&[next], pos + 1).await?;
                 }
                 pos += 1;
             }
@@ -2142,67 +2344,102 @@ impl<'a> GpuEngine<'a> {
             let mut win_t = std::time::Instant::now();
             #[cfg(feature = "trace")]
             let (mut win_hit, mut win_miss) = (self.pin.hits, self.pin.misses);
-            // The depth-1 draft made last iteration (predicts THIS token) with its own
-            // chained child, and a chained draft promoted one iteration ago whose parent
-            // was accepted — which also predicts this token, two steps after it was made.
-            let mut draft: Option<(u32, f32, u32)> = None;
-            let mut chained: Option<(u32, f32)> = None;
-            for _i in 0..ngen {
+            #[cfg(feature = "trace")]
+            let mut win_gen = 0usize;
+            // `cur` is the token AT `pos`, decided but not yet fed through the model;
+            // `x` row 0 holds h_{pos-1} and the head's KV is filled through row pos-1.
+            // `draft` is the head's prediction for pos+1, made from that same h.
+            let mut cur = self.argmax()?;
+            let mut draft = match mtp {
+                true => Some(self.mtp_draft(&[cur], pos).await?),
+                false => None,
+            };
+            // Emit and report whether the loop is done: eos ends it, and so does the
+            // token budget. A speculative iteration emits TWO tokens, so this cannot be
+            // the loop counter it used to be.
+            let emit = |g: &mut Vec<u32>, t: u32| {
+                if eos.contains(&t) {
+                    return true;
+                }
+                g.push(t);
+                g.len() >= ngen
+            };
+            let mut _i = 0usize;
+            loop {
                 if let Some(hb) = &self.heartbeat {
                     hb.beat();
                 }
-                let next = self.argmax()?;
-                // Score the PREVIOUS iteration's draft, which predicted exactly this
-                // token. Scoring before the eos break counts the last draft too.
-                if let Some((c, pconf)) = chained.take() {
-                    let ok = u64::from(c == next);
-                    self.mtp_chain = (self.mtp_chain.0 + 1, self.mtp_chain.1 + ok);
-                    let b = &mut self.mtp_chain_bins[mtp_bin(pconf)];
-                    (b.0, b.1) = (b.0 + 1, b.1 + ok);
-                }
-                if let Some((d, conf, c2)) = draft.take() {
-                    let ok = u64::from(d == next);
-                    self.mtp_seen += 1;
-                    self.mtp_hit += ok;
-                    let b = &mut self.mtp_bins[mtp_bin(conf)];
-                    (b.0, b.1) = (b.0 + 1, b.1 + ok);
-                    // Only a draft whose parent survived predicts a token anyone will
-                    // ask for; the rest are conditioned on a branch that did not happen.
-                    if ok == 1 {
-                        chained = Some((c2, conf));
-                    }
-                }
-                if eos.contains(&next) {
+                if emit(&mut generated, cur) {
                     break;
                 }
-                generated.push(next);
-                // Draft `pos + 1` from (h_{pos-1}, next) — `x` still holds h_{pos-1}, so
-                // this MUST run before the forward below overwrites it.
-                if mtp {
-                    let (d, conf) = self.mtp_draft(next, pos, Draft::FromModel).await?;
-                    // Chain UNCONDITIONALLY here even though the point is to gate on
-                    // confidence: the histogram needs the low-confidence rows too, and
-                    // measuring only where we already expect to win is how a threshold
-                    // gets picked from the data it was fitted to.
-                    let (c2, _) = self.mtp_draft(d, pos + 1, Draft::Chained).await?;
-                    draft = Some((d, conf, c2));
+                match draft {
+                    None => {
+                        self.forward(cur, pos).await?;
+                        cur = self.argmax()?;
+                        pos += 1;
+                    }
+                    // THE VERIFY PASS. Two rows: the real token at `pos` and the draft at
+                    // `pos + 1`, through one read of every weight. Row 0's logits give the
+                    // TRUE token at pos+1; row 1's give the true token at pos+2 — but only
+                    // if the draft it was computed from was right, which is exactly what
+                    // comparing row 0's answer to the draft tests.
+                    Some((d, conf)) => {
+                        self.forward_inner(&[cur, d], pos, Draft::No).await?;
+                        let rows = self.argmax_rows(2)?;
+                        let (t1, t2) = (rows[0], rows[1]);
+                        let ok = d == t1;
+                        self.mtp_seen += 1;
+                        self.mtp_hit += u64::from(ok);
+                        let b = &mut self.mtp_bins[mtp_bin(conf)];
+                        (b.0, b.1) = (b.0 + 1, b.1 + u64::from(ok));
+                        // The head's element at pos+1 — needed whether or not the draft
+                        // held: on a reject it IS the next draft, and on an accept it is
+                        // the KV row that pos+2's draft will attend over. Batched with
+                        // pos+2's element on an accept, since both inputs are now known
+                        // (rows 0 and 1 of `x` are h_pos and h_{pos+1}).
+                        draft = Some(match ok {
+                            false => self.mtp_draft(&[t1], pos + 1).await?,
+                            true => self.mtp_draft(&[t1, t2], pos + 1).await?,
+                        });
+                        if ok {
+                            // pos+1's KV was computed from the right token, so keep it and
+                            // take pos+2's token for free.
+                            if emit(&mut generated, t1) {
+                                break;
+                            }
+                            cur = t2;
+                            pos += 2;
+                        } else {
+                            // Rejecting is not advancing `pos`. Row 1's KV at pos+1 stays
+                            // where it is and the next pass overwrites it — `append_kv`
+                            // writes by position and `attend` reads 0..nr, so there is
+                            // nothing to compact. What is NOT rolled back is the expert
+                            // pool: the rejected row's fetched bytes stay cached, which is
+                            // the favourable direction.
+                            cur = t1;
+                            pos += 1;
+                        }
+                    }
                 }
-                self.forward(next, pos).await?;
-                pos += 1;
+                _i += 1;
                 // Bound trace loss to one token: the watchdog exits without destructors,
                 // so BufWriter's Drop is not a guarantee. No-op when not tracing.
                 self.pin.flush_trace()?;
                 #[cfg(feature = "trace")]
-                if (_i + 1) % WIN == 0 {
+                if _i % WIN == 0 {
                     let dt = win_t.elapsed().as_secs_f64();
                     let (dh, dm) = (self.pin.hits - win_hit, self.pin.misses - win_miss);
                     let hit_pct = 100.0 * dh as f64 / (dh + dm).max(1) as f64;
+                    // Tokens per PASS is now ≥ 1, so the window's rate has to divide the
+                    // tokens actually emitted by the wall, not WIN by it.
+                    let dg = generated.len() - win_gen;
                     tracing::info!(
-                        "  tok {}/{ngen}: {:.3} tok/s (window), hit {hit_pct:.1}%",
-                        _i + 1,
-                        WIN as f64 / dt.max(1e-9),
+                        "  tok {}/{ngen} ({_i} passes): {:.3} tok/s (window), hit {hit_pct:.1}%",
+                        generated.len(),
+                        dg as f64 / dt.max(1e-9),
                     );
                     win_t = std::time::Instant::now();
+                    win_gen = generated.len();
                     (win_hit, win_miss) = (self.pin.hits, self.pin.misses);
                 }
             }
@@ -2222,45 +2459,34 @@ impl<'a> GpuEngine<'a> {
         );
         summary.report();
         if self.mtp_seen > 0 {
+            // tokens/pass is now MEASURED, not projected: every verify pass emits one
+            // token plus the draft it accepted, so `generated / passes` is the speedup
+            // over the sequential loop with everything else held equal.
             tracing::info!(
-                "MTP: {}/{} drafts accepted ({:.1}%) — the greedy ceiling on tokens/pass \
-                 is 1 + that rate; realising it needs a BATCHED verify pass",
+                "MTP: {}/{} drafts accepted ({:.1}%) — {:.3} tokens per verify pass",
                 self.mtp_hit,
                 self.mtp_seen,
                 100.0 * self.mtp_hit as f64 / self.mtp_seen as f64,
+                1.0 + self.mtp_hit as f64 / self.mtp_seen as f64,
             );
             // Bucketed by the draft's own confidence: does it separate well enough to gate
             // on? A flat column of accept% means it does not, and no threshold helps.
-            let row = |bins: &[(u64, u64); MTP_BINS]| {
-                bins.iter()
-                    .enumerate()
-                    .map(|(i, &(n, ok))| {
-                        let lo = i as f64 / MTP_BINS as f64;
-                        match n {
-                            0 => format!("p{lo:.1}+: -"),
-                            _ => format!("p{lo:.1}+: {:.0}%(n={n})", 100.0 * ok as f64 / n as f64),
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            };
-            tracing::info!("  MTP d1 accept by draft confidence: {}", row(&self.mtp_bins));
-            let (cn, ck) = self.mtp_chain;
-            if cn > 0 {
-                let p1 = self.mtp_hit as f64 / self.mtp_seen as f64;
-                let p2 = ck as f64 / cn as f64;
-                tracing::info!(
-                    "  MTP d2 (chained, parent accepted): {ck}/{cn} ({:.1}%) — tokens/pass \
-                     1+p1 = {:.3} at 2 rows, 1+p1+p1·p2 = {:.3} at 3",
-                    100.0 * p2,
-                    1.0 + p1,
-                    1.0 + p1 + p1 * p2,
-                );
-                tracing::info!(
-                    "  MTP d2 accept by PARENT confidence: {}",
-                    row(&self.mtp_chain_bins)
-                );
-            }
+            // (Measured monotone 14→85% across the five bins, and still not worth gating:
+            // at c ≈ 1.08 the break-even accept rate is ~8%, which the worst bin clears.)
+            let row = self
+                .mtp_bins
+                .iter()
+                .enumerate()
+                .map(|(i, &(n, ok))| {
+                    let lo = i as f64 / MTP_BINS as f64;
+                    match n {
+                        0 => format!("p{lo:.1}+: -"),
+                        _ => format!("p{lo:.1}+: {:.0}%(n={n})", 100.0 * ok as f64 / n as f64),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::info!("  MTP accept by draft confidence: {row}");
         }
         // LOOKA sits beside the profile rather than inside it: it is a property of the
         // ROUTER (would a prefetcher guess right?), not of where this run spent its time,

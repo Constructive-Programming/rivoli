@@ -2304,14 +2304,21 @@ fn ensure_word_aligned(p: u64, what: &str) -> Result<()> {
 /// `x`, `w` and `y` must be DEVICE ADDRESSES of live [`Buf`] regions holding `i_dim`,
 /// `o_dim·i_dim` and `o_dim` f32 respectively, and must stay live until the next
 /// [`device_sync`].
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn launch_gemv_f32(
     x: *const f32,
     w: *const f32,
     o_dim: usize,
     i_dim: usize,
+    nrow: usize,
     y: *mut f32,
 ) -> Result<()> {
     ensure!(o_dim > 0 && i_dim > 0, "gemv_f32: argument guard rejected");
+    ensure!(
+        nrow == 1,
+        "gemv_f32: nrow={nrow} — batched token rows are not implemented on Vulkan \
+         (the .comp shaders are single-row); use --features rocm"
+    );
     let g = gpu()?;
     let push = GemvF32Push {
         x: x as u64,
@@ -3139,15 +3146,22 @@ push_struct! {
 /// Device addresses of live [`Buf`]s, valid until the next [`device_sync`]: `x`
 /// (`i_dim` f32), `packed` (`o_dim·i_dim` bytes), `scale` (`o_dim` f32), `y`
 /// (`o_dim` f32).
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn launch_gemv_i8(
     x: *const f32,
     packed: *const u8,
     scale: *const f32,
     o_dim: usize,
     i_dim: usize,
+    nrow: usize,
     y: *mut f32,
 ) -> Result<()> {
     ensure!(o_dim > 0 && i_dim > 0, "gemv_i8: argument guard rejected");
+    ensure!(
+        nrow == 1,
+        "gemv_i8: nrow={nrow} — batched token rows are not implemented on Vulkan \
+         (the .comp shaders are single-row); use --features rocm"
+    );
     ensure_word_aligned(packed as u64, "gemv_i8 packed")?;
     let g = gpu()?;
     let push = GemvI8Push {
@@ -3316,9 +3330,15 @@ pub unsafe fn launch_mla_value_fp8(
     vh: usize,
     kvl: usize,
     block: usize,
+    nrow: usize,
     ctx: *mut f32,
 ) -> Result<()> {
     mla_fp8_guards(&[h, nope, vh, kvl], block, kvb as u64, "mla_value_fp8")?;
+    ensure!(
+        nrow == 1,
+        "mla_value_fp8: nrow={nrow} — batched token rows are not implemented on Vulkan \
+         (the .comp shaders are single-row); use --features rocm"
+    );
     // The shared MAC reads weights as 32-bit words, so every row base must be 4-aligned;
     // rows are `kvl` bytes apart.
     ensure!(
@@ -3361,9 +3381,15 @@ pub unsafe fn launch_mla_absorb_fp8(
     vh: usize,
     kvl: usize,
     block: usize,
+    nrow: usize,
     qabs: *mut f32,
 ) -> Result<()> {
     mla_fp8_guards(&[h, qh, nope, vh, kvl], block, kvb as u64, "mla_absorb_fp8")?;
+    ensure!(
+        nrow == 1,
+        "mla_absorb_fp8: nrow={nrow} — batched token rows are not implemented on Vulkan \
+         (the .comp shaders are single-row); use --features rocm"
+    );
     // NO `kvl % 4` GUARD HERE, and the asymmetry with `mla_value_fp8` is deliberate.
     // That kernel walks a row with the shared word-loading MAC, which needs 4-aligned row
     // bases. This one reads a single byte per thread by masking the containing word's
@@ -3901,6 +3927,7 @@ pub unsafe fn launch_moe_expert_range_i4(
     _wexpert: *const f32,
     _h: *mut f32,
     _acc: *mut u64,
+    _nrow: usize,
     _stream: *mut std::ffi::c_void,
 ) -> Result<()> {
     Err(deferred("moe_expert_range_i4"))

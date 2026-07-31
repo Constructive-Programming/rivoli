@@ -1506,3 +1506,68 @@ root-caused.
   2.91 and **eliminated `int3-vq/streaming/2q` at 2.81 — the eventual winner.** At short
   context the capped-attention modes carry their overhead without their benefit. Rounds
   were seeded to preserve the mode and attention comparisons instead.
+
+## Speculative decode (`--mtp`): the batched verify pass LOSES 7%, and why
+
+**2026-07-31**, int3-vq / dense / 2q, `--max-mem 115`, 128 tokens, chat-framed prompt,
+sole tenant. Both runs back-to-back from the same binary with no rebuild between them
+(a `cargo build` evicts page cache and moved `ms/miss` 1.36 → 5.14 in a discarded pair).
+MTP ran FIRST, so any residual page-cache advantage went to the baseline.
+
+| | tok/s | ms/tok | route | moe | moe gpu | miss/tok | GB/tok | hit |
+|---|---|---|---|---|---|---|---|---|
+| sequential | **2.69** | 372.3 | 101.5 | 251 | 243 | 147.3 | 2.26 | 75.3% |
+| `--mtp` (2-row verify) | **2.50** | 399.4 | 84.4 | 292 | 285 | 197.2 | 3.02 | 74.1% |
+
+**0.93×.** Completions are BYTE-IDENTICAL (203 bytes, `cmp` clean) — which is the point of
+the exercise as much as the speed is: every batched kernel is bit-identical per row
+(`tests/kernel.rs::batched_rows_are_bit_identical_to_single_rows`), row 0 of a verify pass
+is the real token, and a union expert a row did not route to carries weight 0 and is
+skipped. So the speculative engine has no freedom to differ, and `diff` is the whole
+quality gate.
+
+Acceptance 38/90 = 42.2%, i.e. **1.422 tokens per verify pass**.
+
+### The two halves pull opposite ways
+
+- **Attention batches for free, as predicted.** `route` (the gate-D2H wait, which absorbs
+  the attention GPU time) went 101.5 → 84.4 ms/tok = **0.83×**. Per PASS that is 1.18× for
+  two token rows: `q_a`/`q_b`/`kv_a`/`o_proj`/`kv_b`/`lm_head` are dense weights read once
+  per layer whatever the row count, so the second row costs arithmetic and nothing else.
+- **The MoE does not.** 251 → 292 ms/tok = 1.16×, or **1.66× per pass**. A batched pass
+  routes twice and must launch the UNION: measured 13.49 routed + 1 shared = 14.5 experts
+  against a single row's 9, i.e. **1.61×**. Per expert the second row IS free (0-miss
+  layers: 2585 µs / 14.5 experts = 178 µs, against the baseline's 1582 / 9 = 176 µs), but
+  1.61× the experts is 1.61× the weight reads, and the weight read is the whole cost.
+
+### Break-even is 1.53 tokens/pass — the run landed at 1.422
+
+Blending the two at their measured shares of the wall (MoE 67%, attention 27%, tail 6%):
+
+```
+cost(verify pass) / cost(sequential pass) = 0.67·1.74 + 0.27·1.09 + 0.06·1.2 = 1.53
+```
+
+so the pass has to yield 1.53 tokens to break even — **~53% acceptance**. This run gave
+42.2%; the earlier sequential measurement of the same head over the same 128 tokens gave
+53.5% (68/127). The two samples' 95% intervals overlap, so this is not a structural loss
+so much as a coin flip that landed on the wrong side. It is nonetheless the measurement,
+and 0.93× is the number.
+
+### The prediction was wrong, and the error is worth naming
+
+The pre-implementation estimate was **1.27–1.33×**. It applied the union factor (1.687) to
+FETCH and the row-batching factor (1.079) to COMPUTE — but compute scales with the union
+too, because each of the union's experts needs its own weight read. Correcting that term
+alone gives 1.61/1.422 = 1.13× on the MoE, which is what happened (1.16× measured). The
+fetch half of that estimate was fine (2.26 → 3.02 GB/tok = 1.34×, still 97% hidden).
+
+Second time a fetch/compute projection on this engine has gone the wrong way. Re-measure.
+
+### What would flip it
+
+Only the acceptance rate. Skipping zero-weight rows inside the expert kernels would not
+help: `R=2` costs 1.079× of `R=1`, so the per-row arithmetic is ~8% of an expert launch
+and the other 92% is the weight read, which the union forces regardless. GLM-5.2 ships
+`num_nextn_predict_layers = 1`, so a deeper head is not available either — depth-2 chained
+drafts were measured at 4.4%, which is why the pass is 2 rows and not 3.

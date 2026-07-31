@@ -206,6 +206,22 @@ __device__ __forceinline__ float dot_fp8_wave(const float* __restrict__ x,
     return wave_sum(fp8_dot_strided(x, wrow, scalerow, i_dim, block, lut, lane, WAVE));
 }
 
+// R input rows, one wave, one weight row. R=1 is bit-identical to `dot_fp8_wave`:
+// `fp8_dot_strided_r<1>` reproduces the scalar accumulation exactly and `wave_sum` is
+// the same reduction.
+template <int R>
+__device__ __forceinline__ void dot_fp8_wave_r(const float* __restrict__ x, int x_stride,
+                                               const unsigned char* __restrict__ wrow,
+                                               const float* __restrict__ scalerow,
+                                               int i_dim, int block, int lane,
+                                               const float* __restrict__ lut,
+                                               float* __restrict__ out) {
+    float acc[R];
+    fp8_dot_strided_r<R>(x, x_stride, wrow, scalerow, i_dim, block, lut, lane, WAVE, acc);
+#pragma unroll
+    for (int r = 0; r < R; ++r) out[r] = wave_sum(acc[r]);
+}
+
 // int4 group-scale parameters — MUST match quant.rs (I4_GROUP). One f32 scale per
 // I4_GROUP weights along the input dim, so the scale lives INSIDE the dot.
 #define I4_GROUP 128

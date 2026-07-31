@@ -22,7 +22,13 @@
 // BIT-IDENTICAL: each output still sums over `d` in ascending order with the same
 // expression, so no quality gate is needed. DO NOT "improve" this to the wave-per-row
 // shape `mla_value` uses — that reassociates, and then it does need one.
-extern "C" __global__ void mla_absorb_fp8(
+//
+// R TOKEN ROWS through one read of kv_b (14.7 MB/layer, 16% of the attention bytes): the
+// `q` rows are `H·qh` apart, the `qabs` rows `H·kvl`, and the four column accumulators
+// become `R`×four in registers. Row 0 is bit-identical to R=1 — the `d` loop, the
+// expression and the summation order are untouched, only replicated.
+template <int R>
+__device__ __forceinline__ void mla_absorb_fp8_impl(
     const float* __restrict__ q, const unsigned char* __restrict__ kvb,
     const float* __restrict__ kvb_scale, int H, int qh, int nope, int vh, int kvl, int block,
     float* __restrict__ qabs) {
@@ -62,13 +68,18 @@ extern "C" __global__ void mla_absorb_fp8(
         // build carried this pragma and the hot loop below is identical either way.
 #pragma unroll 1
         for (int k = 0; k < 4 && i0 + k < kvl; ++k) {
-            float acc = 0.0f;
+            float acc[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) acc[r] = 0.0f;
             for (int d = 0; d < nope; ++d) {
                 size_t row = rbase + d;
-                acc += qh_ptr[d] * (lut[wcol[(size_t)d * kvl + k]]
-                                    * kvb_scale[(row >> bsh) * sc_cols + ((i0 + k) >> bsh)]);
+                float ws = lut[wcol[(size_t)d * kvl + k]]
+                           * kvb_scale[(row >> bsh) * sc_cols + ((i0 + k) >> bsh)];
+#pragma unroll
+                for (int r = 0; r < R; ++r) acc[r] += qh_ptr[(size_t)r * H * qh + d] * ws;
             }
-            out[k] = acc;
+#pragma unroll
+            for (int r = 0; r < R; ++r) out[(size_t)r * H * kvl + k] = acc[r];
         }
         return;
     }
@@ -79,27 +90,60 @@ extern "C" __global__ void mla_absorb_fp8(
     // multiply-add in the loop body.
     const unsigned int* w4 = (const unsigned int*)wcol;
     int stride4 = kvl >> 2;
-    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    float a[R][4];
+#pragma unroll
+    for (int r = 0; r < R; ++r) { a[r][0] = a[r][1] = a[r][2] = a[r][3] = 0.0f; }
     for (int d = 0; d < nope; ++d, w4 += stride4) {
         unsigned int p = *w4;
         float s = kvb_scale[((rbase + d) >> bsh) * sc_cols + sc_col];
-        float qd = qh_ptr[d];
-        a0 += qd * (lut[(unsigned char)p] * s);
-        a1 += qd * (lut[(unsigned char)(p >> 8)] * s);
-        a2 += qd * (lut[(unsigned char)(p >> 16)] * s);
-        a3 += qd * (lut[(unsigned char)(p >> 24)] * s);
+        // `lut[..] * s` hoisted out of the row loop, exactly as the R=1 form wrote it —
+        // the parenthesisation `qd * (lut * s)` is preserved, so row 0 is bit-identical.
+        float l0 = lut[(unsigned char)p] * s;
+        float l1 = lut[(unsigned char)(p >> 8)] * s;
+        float l2 = lut[(unsigned char)(p >> 16)] * s;
+        float l3 = lut[(unsigned char)(p >> 24)] * s;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            float qd = qh_ptr[(size_t)r * H * qh + d];
+            a[r][0] += qd * l0;
+            a[r][1] += qd * l1;
+            a[r][2] += qd * l2;
+            a[r][3] += qd * l3;
+        }
     }
-    out[0] = a0;
-    out[1] = a1;
-    out[2] = a2;
-    out[3] = a3;
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        float* o = out + (size_t)r * H * kvl;
+        o[0] = a[r][0];
+        o[1] = a[r][1];
+        o[2] = a[r][2];
+        o[3] = a[r][3];
+    }
+}
+
+extern "C" __global__ void mla_absorb_fp8(
+    const float* __restrict__ q, const unsigned char* __restrict__ kvb,
+    const float* __restrict__ kvb_scale, int H, int qh, int nope, int vh, int kvl, int block,
+    float* __restrict__ qabs) {
+    mla_absorb_fp8_impl<1>(q, kvb, kvb_scale, H, qh, nope, vh, kvl, block, qabs);
+}
+
+extern "C" __global__ void mla_absorb_fp8_r2(
+    const float* __restrict__ q, const unsigned char* __restrict__ kvb,
+    const float* __restrict__ kvb_scale, int H, int qh, int nope, int vh, int kvl, int block,
+    float* __restrict__ qabs) {
+    mla_absorb_fp8_impl<2>(q, kvb, kvb_scale, H, qh, nope, vh, kvl, block, qabs);
 }
 
 // ctx[head][j] = Σ_i clat[head][i] · e4m3(kv_b[rbase+nope+j][i]) · scale[block(row,i)],
 // j∈[0,vh), i∈[0,kvl) — project the attention-weighted latent through kv_b's value
 // rows. Per-head-row GEMV; one WAVE per output row (dot_fp8_wave folds the block
 // scale inside the dot, since it varies along i).
-extern "C" __global__ void mla_value_fp8(
+//
+// R token rows through one read of kv_b — `clat` rows are `H·kvl` apart, `ctx` rows
+// `H·vh`. Row 0 is bit-identical: `dot_fp8_wave_r<1>` IS `dot_fp8_wave`.
+template <int R>
+__device__ __forceinline__ void mla_value_fp8_impl(
     const float* __restrict__ clat, const unsigned char* __restrict__ kvb,
     const float* __restrict__ kvb_scale, int H, int nope, int vh, int kvl, int block,
     float* __restrict__ ctx) {
@@ -118,19 +162,42 @@ extern "C" __global__ void mla_value_fp8(
     // still worth 20% (33.7 → 27.0 us, 249 → 310 GB/s): with H*vh = 16384 threads and a
     // 34 us kernel, one 64-bit division per thread is not a rounding error. An earlier
     // version of this comment called it housekeeping; the bench disagreed.
-    float acc = dot_fp8_wave(clat + (size_t)head * kvl, kvb + row * (size_t)kvl,
-                             kvb_scale + (row >> blk_shift(block)) * sc_cols, kvl, block, lane, lut);
-    if (lane == 0) ctx[(size_t)head * vh + j] = acc;
+    float acc[R];
+    dot_fp8_wave_r<R>(clat + (size_t)head * kvl, H * kvl, kvb + row * (size_t)kvl,
+                      kvb_scale + (row >> blk_shift(block)) * sc_cols, kvl, block, lane, lut,
+                      acc);
+    if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) ctx[(size_t)r * H * vh + (size_t)head * vh + j] = acc[r];
+    }
+}
+
+extern "C" __global__ void mla_value_fp8(
+    const float* __restrict__ clat, const unsigned char* __restrict__ kvb,
+    const float* __restrict__ kvb_scale, int H, int nope, int vh, int kvl, int block,
+    float* __restrict__ ctx) {
+    mla_value_fp8_impl<1>(clat, kvb, kvb_scale, H, nope, vh, kvl, block, ctx);
+}
+
+extern "C" __global__ void mla_value_fp8_r2(
+    const float* __restrict__ clat, const unsigned char* __restrict__ kvb,
+    const float* __restrict__ kvb_scale, int H, int nope, int vh, int kvl, int block,
+    float* __restrict__ ctx) {
+    mla_value_fp8_impl<2>(clat, kvb, kvb_scale, H, nope, vh, kvl, block, ctx);
 }
 
 extern "C" int rivoli_mla_absorb_fp8(
     const float* q, const unsigned char* kvb, const float* kvb_scale,
-    int H, int qh, int nope, int vh, int kvl, int block, float* qabs) {
+    int H, int qh, int nope, int vh, int kvl, int block, int nrow, float* qabs) {
     if (H <= 0 || qh <= 0 || nope <= 0 || vh <= 0 || kvl <= 0 || block <= 0) return 1001;
     if (block & (block - 1)) return 1003;  // blk_shift needs a power-of-two tile
+    // The row count is a TEMPLATE parameter (accumulators live in registers), so only the
+    // instantiated widths exist. Same contract as gemv_fp8 / moe_expert_range.
+    if (nrow != 1 && nrow != 2) return 1004;
     size_t total = (size_t)H * (size_t)absorb_nquad(kvl); // one thread per (head, i-quad)
     hipGetLastError();
-    hipLaunchKernelGGL(mla_absorb_fp8, dim3((unsigned)((total + 255) / 256)), dim3(256), 0, 0,
+    hipLaunchKernelGGL(nrow == 2 ? mla_absorb_fp8_r2 : mla_absorb_fp8,
+                       dim3((unsigned)((total + 255) / 256)), dim3(256), 0, 0,
                        q, kvb, kvb_scale, H, qh, nope, vh, kvl, block, qabs);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
@@ -138,9 +205,10 @@ extern "C" int rivoli_mla_absorb_fp8(
 
 extern "C" int rivoli_mla_value_fp8(
     const float* clat, const unsigned char* kvb, const float* kvb_scale,
-    int H, int nope, int vh, int kvl, int block, float* ctx) {
+    int H, int nope, int vh, int kvl, int block, int nrow, float* ctx) {
     if (H <= 0 || nope <= 0 || vh <= 0 || kvl <= 0 || block <= 0) return 1001;
     if (block & (block - 1)) return 1003;  // blk_shift needs a power-of-two tile
+    if (nrow != 1 && nrow != 2) return 1004;  // see rivoli_mla_absorb_fp8
     // `dot_fp8_wave` reads weights as 32-bit words and rows are `kvl` bytes apart, so a
     // ragged kvl leaves 3 rows in 4 misaligned for the dword load. The Vulkan twin has
     // rejected this since it was written (src/vk.rs::launch_mla_value_fp8) and this
@@ -151,7 +219,7 @@ extern "C" int rivoli_mla_value_fp8(
     if (kvl & 3) return 1002;
     size_t total = (size_t)H * vh;
     hipGetLastError();
-    hipLaunchKernelGGL(mla_value_fp8,
+    hipLaunchKernelGGL(nrow == 2 ? mla_value_fp8_r2 : mla_value_fp8,
                        dim3((unsigned)((total + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK)),
                        dim3(ROWS_PER_BLOCK * WAVE), 0, 0,
                        clat, kvb, kvb_scale, H, nope, vh, kvl, block, ctx);

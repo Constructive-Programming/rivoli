@@ -43,6 +43,7 @@ unsafe extern "C" {
         wexpert: *const f32,
         h: *mut f32,
         acc: *mut u64,
+        nrow: i32,
         stream: *mut c_void,
     ) -> i32;
 
@@ -121,6 +122,7 @@ unsafe extern "C" {
         vh: i32,
         kvl: i32,
         block: i32,
+        nrow: i32,
         qabs: *mut f32,
     ) -> i32;
 
@@ -134,6 +136,7 @@ unsafe extern "C" {
         vh: i32,
         kvl: i32,
         block: i32,
+        nrow: i32,
         ctx: *mut f32,
     ) -> i32;
 
@@ -194,9 +197,17 @@ unsafe extern "C" {
         scale: *const f32,
         o_dim: i32,
         i_dim: i32,
+        nrow: i32,
         y: *mut f32,
     ) -> i32;
-    fn rivoli_gemv_f32(x: *const f32, w: *const f32, o_dim: i32, i_dim: i32, y: *mut f32) -> i32;
+    fn rivoli_gemv_f32(
+        x: *const f32,
+        w: *const f32,
+        o_dim: i32,
+        i_dim: i32,
+        nrow: i32,
+        y: *mut f32,
+    ) -> i32;
     fn rivoli_swiglu(g: *const f32, u: *const f32, n: i32, h: *mut f32) -> i32;
     fn rivoli_rmsnorm(x: *const f32, w: *const f32, n: i32, eps: f32, y: *mut f32) -> i32;
     fn rivoli_rope(base: *mut f32, count: i32, stride: i32, seg: i32, pos: i32, theta: f64) -> i32;
@@ -364,6 +375,7 @@ pub unsafe fn launch_moe_expert_range_i4(
     wexpert: *const f32,
     h: *mut f32,
     acc: *mut u64,
+    nrow: usize,
     stream: *mut c_void,
 ) -> Result<()> {
     // SAFETY: caller's pointer contract; stream is a live HipStream handle.
@@ -378,6 +390,7 @@ pub unsafe fn launch_moe_expert_range_i4(
             wexpert,
             h,
             acc,
+            nrow as i32,
             stream,
         )
     };
@@ -544,6 +557,7 @@ pub unsafe fn launch_mla_absorb_fp8(
     vh: usize,
     kvl: usize,
     block: usize,
+    nrow: usize,
     qabs: *mut f32,
 ) -> Result<()> {
     // SAFETY: caller's pointer contract.
@@ -558,6 +572,7 @@ pub unsafe fn launch_mla_absorb_fp8(
             vh as i32,
             kvl as i32,
             block as i32,
+            nrow as i32,
             qabs,
         )
     };
@@ -580,6 +595,7 @@ pub unsafe fn launch_mla_value_fp8(
     vh: usize,
     kvl: usize,
     block: usize,
+    nrow: usize,
     ctx: *mut f32,
 ) -> Result<()> {
     // SAFETY: caller's pointer contract.
@@ -593,6 +609,7 @@ pub unsafe fn launch_mla_value_fp8(
             vh as i32,
             kvl as i32,
             block as i32,
+            nrow as i32,
             ctx,
         )
     };
@@ -778,10 +795,12 @@ pub unsafe fn launch_gemv_i8(
     scale: *const f32,
     o_dim: usize,
     i_dim: usize,
+    nrow: usize,
     y: *mut f32,
 ) -> Result<()> {
     // SAFETY: caller's pointer contract.
-    let r = unsafe { rivoli_gemv_i8(x, packed, scale, o_dim as i32, i_dim as i32, y) };
+    let r =
+        unsafe { rivoli_gemv_i8(x, packed, scale, o_dim as i32, i_dim as i32, nrow as i32, y) };
     check(r, "gemv_i8")
 }
 
@@ -794,10 +813,11 @@ pub unsafe fn launch_gemv_f32(
     w: *const f32,
     o_dim: usize,
     i_dim: usize,
+    nrow: usize,
     y: *mut f32,
 ) -> Result<()> {
     // SAFETY: caller's pointer contract.
-    let r = unsafe { rivoli_gemv_f32(x, w, o_dim as i32, i_dim as i32, y) };
+    let r = unsafe { rivoli_gemv_f32(x, w, o_dim as i32, i_dim as i32, nrow as i32, y) };
     check(r, "gemv_f32")
 }
 
