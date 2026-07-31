@@ -76,7 +76,7 @@ const _: () = assert!(
     "gpu::PILOT_H and looka::HORIZONS must agree"
 );
 use crate::telemetry::ProfileSummary;
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 
 /// Little-endian byte view of a POD slice — zero-copy on this LE host (a `[T]`'s
 /// in-memory bytes ARE its LE serialization). Feeds the per-token H2D uploads (attn
@@ -378,6 +378,14 @@ pub struct GpuEngine<'a> {
     // Per-token device scratch (allocated once, reused).
     x: DeviceBuf,
     xn: DeviceBuf,
+    /// MTP scratch. `mtp_cat` is the `[enorm(emb) ‖ hnorm(h)]` concatenation `eh_proj`
+    /// consumes (2·hidden); `mtp_x` is the head's own residual stream, swapped with `x`
+    /// for the duration of the draft so the main model's hidden state survives it.
+    mtp_cat: DeviceBuf,
+    mtp_x: DeviceBuf,
+    /// Drafts produced / drafts that matched the main model's next argmax. `--mtp` only.
+    mtp_seen: u64,
+    mtp_hit: u64,
     sub: DeviceBuf,
     qr: DeviceBuf,
     q: DeviceBuf,
@@ -585,10 +593,14 @@ impl<'a> GpuEngine<'a> {
              accumulator cap (MLA_ACC_REGS*SUBW in kernels/attn.hip)",
         );
         let n_kv_blocks = kvl / E4M3_BLOCK;
-        let mut lc = Vec::with_capacity(cfg.n_layers);
-        let mut lc_scale = Vec::with_capacity(cfg.n_layers);
-        let mut rc = Vec::with_capacity(cfg.n_layers);
-        for _ in 0..cfg.n_layers {
+        // One KV slab per PIN layer, not per model layer: the MTP head is pinned one
+        // past the end and attends over its own cache (built at every position, prefill
+        // included), so it needs a slab like any other layer.
+        let n_pin_layers = pin.layers.len();
+        let mut lc = Vec::with_capacity(n_pin_layers);
+        let mut lc_scale = Vec::with_capacity(n_pin_layers);
+        let mut rc = Vec::with_capacity(n_pin_layers);
+        for _ in 0..n_pin_layers {
             lc.push(DeviceBuf::new(max_ctx * kvl)?); // e4m3 latent (1 byte)
             lc_scale.push(DeviceBuf::new(max_ctx * n_kv_blocks * 4)?); // f32 block scales
             rc.push(DeviceBuf::new(max_ctx * rope * 2)?); // bf16 roped key
@@ -603,6 +615,10 @@ impl<'a> GpuEngine<'a> {
             max_ctx,
             x: f(cfg.hidden)?,
             xn: f(cfg.hidden)?,
+            mtp_cat: f(2 * cfg.hidden)?,
+            mtp_x: f(cfg.hidden)?,
+            mtp_seen: 0,
+            mtp_hit: 0,
             sub: f(cfg.hidden)?,
             qr: f(cfg.q_lora_rank)?,
             q: f(h * cfg.qk_head_dim())?,
@@ -713,6 +729,16 @@ impl<'a> GpuEngine<'a> {
 
 
     /// Set the MoE-branch gain (see the field and kernels/fwd.hip::vaxpy).
+    /// Does the loaded artifact carry the MTP head?
+    pub fn has_mtp(&self) -> bool {
+        self.pin.mtp.is_some()
+    }
+
+    /// (drafts produced, drafts the main model then agreed with). Empty unless `--mtp`.
+    pub fn mtp_accept(&self) -> (u64, u64) {
+        (self.mtp_seen, self.mtp_hit)
+    }
+
     pub fn set_moe_gain(&mut self, g: f32) {
         if g != 1.0 {
             tracing::warn!("MoE branch gain {g} — EXPERIMENT arithmetic, not a normal run");
@@ -980,9 +1006,66 @@ impl<'a> GpuEngine<'a> {
 
     /// One forward pass for `token` at `pos`, leaving next-token logits device-side
     /// in `self.logits`.
+    /// The main model: embed `token`, run every layer, leave logits on the device.
     async fn forward(&mut self, token: u32, pos: usize) -> Result<()> {
+        self.forward_inner(token, pos, false).await
+    }
+
+    /// The MTP head. Reads the hidden state the last [`GpuEngine::forward`] left in `x`
+    /// (`h_{pos-1}`), combines it with the embedding of `token` (the token AT `pos`, i.e.
+    /// the one just sampled), runs the single pinned head layer at `pos`, and returns its
+    /// greedy prediction for `pos + 1`.
+    ///
+    /// `x` is restored on the way out, so a draft is invisible to the main residual
+    /// stream. What it DOES mutate is the head's own KV slab (correctly — that is the
+    /// head's context) and the routed-expert pool (its 8 picks are admitted like any
+    /// other layer's, which is also why a rejected draft is not wasted here: the bytes
+    /// it fetched stay cached).
+    async fn mtp_draft(&mut self, token: u32, pos: usize) -> Result<u32> {
+        self.forward_inner(token, pos, true).await?;
+        self.argmax()
+    }
+
+    /// `mtp`: run the MTP head alone instead of the model's layers — see
+    /// [`GpuEngine::mtp_draft`] for what that means. Everything else is identical, which
+    /// is the point: the head IS a layer, so it reuses the whole per-layer path
+    /// (routing, the expert pool, tickets, the two streams, the profile).
+    async fn forward_inner(&mut self, token: u32, pos: usize, mtp: bool) -> Result<()> {
         let cfg = self.cfg;
         let eps = cfg.rms_norm_eps as f32;
+        // Which pinned layers this pass runs. The head sits one past the model's last.
+        let layer_range = match mtp {
+            false => 0..cfg.n_layers,
+            true => cfg.n_layers..cfg.n_layers + 1,
+        };
+        // The head's entry: `x` ← eh_proj·[enorm(emb(token)) ‖ hnorm(x)]. Done BEFORE the
+        // scratch pointers are taken, because it ends by swapping the head's residual
+        // buffer into `x` — the last read of the main model's `h` is the hnorm above it.
+        let mtp_w = match mtp {
+            false => None,
+            true => {
+                let m = self.pin.mtp.context("--mtp: artifact carries no MTP head")?;
+                let emb = self.pin.embed;
+                let catp = self.mtp_cat.ptr_mut() as *mut f32;
+                let hp = self.x.ptr() as *const f32;
+                let dst = self.mtp_x.ptr_mut() as *mut f32;
+                // SAFETY: cat is 2·hidden f32 scratch; `hp` is the hidden state the
+                // previous forward left resident; eh_proj is [hidden, 2·hidden] f32.
+                unsafe {
+                    // Embedding half FIRST, hidden-state half second — the DeepSeek-V3
+                    // convention this checkpoint inherits. Not documented anywhere in the
+                    // artifact, so it was MEASURED: this order drafts at 53.5%, the
+                    // swapped one at 0.0% over 63 drafts. A 0% arm is what makes 53.5%
+                    // readable as "the head works", not "the metric is loose".
+                    launch_embed_i8_row(emb.packed, emb.scale, token as usize, cfg.hidden, catp)?;
+                    launch_rmsnorm(catp, m.enorm, cfg.hidden, eps, catp)?; // in-place
+                    launch_rmsnorm(hp, m.hnorm, cfg.hidden, eps, catp.add(cfg.hidden))?;
+                    launch_gemv_f32(catp, m.eh_proj, cfg.hidden, 2 * cfg.hidden, dst)?;
+                }
+                std::mem::swap(&mut self.x, &mut self.mtp_x);
+                Some(m)
+            }
+        };
         let (h, qh, nope, rope, kvl, vh, hidden) = (
             cfg.n_heads,
             cfg.qk_head_dim(),
@@ -1040,17 +1123,19 @@ impl<'a> GpuEngine<'a> {
         // SAFETY: all pointers are device-resident scratch/weights valid for their
         // dims; each launch's inputs are produced by a prior launch on the same
         // (default) stream, so ordering holds; a device_sync precedes every host read.
-        unsafe {
-            launch_embed_i8_row(
-                self.pin.embed.packed,
-                self.pin.embed.scale,
-                token as usize,
-                hidden,
-                xp,
-            )?;
+        if mtp_w.is_none() {
+            unsafe {
+                launch_embed_i8_row(
+                    self.pin.embed.packed,
+                    self.pin.embed.scale,
+                    token as usize,
+                    hidden,
+                    xp,
+                )?;
+            }
         }
 
-        for l in 0..cfg.n_layers {
+        for l in layer_range {
             // Copy the layer's weight pointers out (ends the &pin.layers borrow).
             let lw = &self.pin.layers[l];
             let (input_ln, post_ln) = (lw.input_ln, lw.post_ln);
@@ -1784,8 +1869,11 @@ impl<'a> GpuEngine<'a> {
         let t_tail_launch = std::time::Instant::now();
         // Final norm → lm_head → logits (device); caller reads via argmax.
         // SAFETY: final_norm/lm_head resident; xn/logits device scratch.
+        // `shared_head.norm` for the MTP head; `lm_head` itself is SHARED with the main
+        // model (the checkpoint ships no `shared_head.head.weight`).
+        let tail_norm = mtp_w.map_or(self.pin.final_norm, |m| m.shared_norm);
         unsafe {
-            launch_rmsnorm(xp, self.pin.final_norm, hidden, eps, xnp)?;
+            launch_rmsnorm(xp, tail_norm, hidden, eps, xnp)?;
             let head = self.pin.lm_head;
             launch_gemv_i8(
                 xnp,
@@ -1795,6 +1883,10 @@ impl<'a> GpuEngine<'a> {
                 head.i_dim,
                 self.logits.ptr_mut() as *mut f32,
             )?;
+        }
+        // Give the main model its residual stream back.
+        if mtp_w.is_some() {
+            std::mem::swap(&mut self.x, &mut self.mtp_x);
         }
         let e_tail_launch = std::time::Instant::now();
         self.prof.cpu_launch_ns += e_tail_launch.duration_since(t_tail_launch).as_nanos();
@@ -1926,8 +2018,13 @@ impl<'a> GpuEngine<'a> {
         prompt_ids: &[u32],
         ngen: usize,
         eos: &[u32],
+        mtp: bool,
     ) -> Result<(Vec<u32>, ProfileSummary)> {
         ensure!(!prompt_ids.is_empty(), "empty prompt");
+        ensure!(
+            !mtp || self.has_mtp(),
+            "--mtp: this artifact carries no MTP head (reconvert with a current bin/convert)"
+        );
         // The decode as ONE async flow: prefill (warm-up) then the token loop, driven
         // by a single current-thread runtime — `forward` awaits the expert stream
         // inline, so there's no per-layer block_on. The token loop is serial by data
@@ -1947,6 +2044,12 @@ impl<'a> GpuEngine<'a> {
                     hb.beat();
                 }
                 self.forward(tok, pos).await?;
+                // Build the head's KV alongside the model's: MTP element i is
+                // (h_i, emb(t_{i+1})) AT POSITION i+1, so the prompt supplies every
+                // element but the last, whose successor has not been sampled yet.
+                if mtp && let Some(&next) = prompt_ids.get(pos + 1) {
+                    self.mtp_draft(next, pos + 1).await?;
+                }
                 pos += 1;
             }
             // Profile the DECODE loop only (prefill is warm-up); reset the pin counters
@@ -1974,15 +2077,27 @@ impl<'a> GpuEngine<'a> {
             let mut win_t = std::time::Instant::now();
             #[cfg(feature = "trace")]
             let (mut win_hit, mut win_miss) = (self.pin.hits, self.pin.misses);
+            let mut draft: Option<u32> = None;
             for _i in 0..ngen {
                 if let Some(hb) = &self.heartbeat {
                     hb.beat();
                 }
                 let next = self.argmax()?;
+                // Score the PREVIOUS iteration's draft, which predicted exactly this
+                // token. Scoring before the eos break counts the last draft too.
+                if let Some(d) = draft.take() {
+                    self.mtp_seen += 1;
+                    self.mtp_hit += u64::from(d == next);
+                }
                 if eos.contains(&next) {
                     break;
                 }
                 generated.push(next);
+                // Draft `pos + 1` from (h_{pos-1}, next) — `x` still holds h_{pos-1}, so
+                // this MUST run before the forward below overwrites it.
+                if mtp {
+                    draft = Some(self.mtp_draft(next, pos).await?);
+                }
                 self.forward(next, pos).await?;
                 pos += 1;
                 // Bound trace loss to one token: the watchdog exits without destructors,
@@ -2017,6 +2132,15 @@ impl<'a> GpuEngine<'a> {
             self.pin.io_wait_ns().saturating_sub(io0),
         );
         summary.report();
+        if self.mtp_seen > 0 {
+            tracing::info!(
+                "MTP: {}/{} drafts accepted ({:.1}%) — the greedy ceiling on tokens/pass \
+                 is 1 + that rate; realising it needs a BATCHED verify pass",
+                self.mtp_hit,
+                self.mtp_seen,
+                100.0 * self.mtp_hit as f64 / self.mtp_seen as f64,
+            );
+        }
         // LOOKA sits beside the profile rather than inside it: it is a property of the
         // ROUTER (would a prefetcher guess right?), not of where this run spent its time,
         // and it only exists in `trace` builds.

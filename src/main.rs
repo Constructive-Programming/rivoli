@@ -149,6 +149,13 @@ struct Args {
     #[arg(long)]
     raw_prompt: bool,
 
+    /// Run the MTP (multi-token prediction) head alongside the decode and report how often
+    /// its draft matched the token the model then produced. Costs ~1/n_layers per token and
+    /// currently changes NO output: without a batched verify pass an accepted draft saves
+    /// nothing, so this measures the ceiling before the kernel work that would realise it.
+    #[arg(long)]
+    mtp: bool,
+
     /// DIAGNOSTIC: hash the residual stream after every layer.
     #[cfg(feature = "trace")]
     #[arg(long)]
@@ -272,6 +279,7 @@ fn main() -> Result<()> {
     let (a_max_mem, a_bench) = (a.max_mem, a.bench);
     let (a_2q_kin, a_2q_kout) = (a.two_q_kin, a.two_q_kout);
     let (a_sinks, a_window, a_misa_heads) = (a.sinks, a.window, a.misa_heads as usize);
+    let a_mtp = a.mtp;
     #[cfg(feature = "trace")]
     let checksum_x = a.checksum_x;
     #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
@@ -557,7 +565,7 @@ fn main() -> Result<()> {
         }
 
         let t0 = std::time::Instant::now();
-        let (ids, summary) = engine.generate(&prompt_ids, ngen, &tok.eos)?;
+        let (ids, summary) = engine.generate(&prompt_ids, ngen, &tok.eos, a_mtp)?;
         let dt = t0.elapsed().as_secs_f64();
         let (hits, misses) = (engine.hits(), engine.misses());
         info!(

@@ -556,9 +556,16 @@ fn main() -> Result<()> {
         None
     };
 
+    // The MTP head (`num_nextn_predict_layers`) is checkpoint layer `n_layers`: a full
+    // MoE layer plus enorm/hnorm/eh_proj/shared_head.norm. Carried only on a whole-model
+    // convert — a `--layers`-limited artifact has no hidden state for it to consume.
+    let mtp = args.layers.is_none() && src.has(&format!("model.layers.{}.eh_proj.weight", d.n_layers));
+    eprintln!("convert: mtp head {}", if mtp { "carried" } else { "absent" });
+    let moe_layers: Vec<usize> = (d.dense_layers..last).chain(mtp.then_some(d.n_layers)).collect();
+
     let stride = rivoli::quant::vq_expert_stride(d.hidden, d.moe_inter);
     let ebytes = vq_expert_bytes(d.hidden, d.moe_inter);
-    for l in d.dense_layers..last {
+    for &l in &moe_layers {
         let path = format!("{}/L{l:02}.vq3", args.out_dir);
         if std::fs::metadata(&path).is_ok() {
             continue;
@@ -621,7 +628,7 @@ fn main() -> Result<()> {
     add_int8(&src, &mut w, "model.embed_tokens.weight")?;
     add_int8(&src, &mut w, "lm_head.weight")?;
     w.add_widened(&src, "model.norm.weight")?;
-    for l in 0..last {
+    for l in (0..last).chain(mtp.then_some(d.n_layers)) {
         let lb = format!("model.layers.{l}");
         w.add_widened(&src, &format!("{lb}.input_layernorm.weight"))?;
         w.add_widened(&src, &format!("{lb}.post_attention_layernorm.weight"))?;
@@ -653,6 +660,15 @@ fn main() -> Result<()> {
                 bias.to_vec(),
             );
         }
+        // The MTP-only tensors. `eh_proj` is [hidden, 2·hidden] bf16 in the source with
+        // no block scales, so it cannot ride `copy_fp8`; widened it is 302 MB against a
+        // 15 GB resident set and reuses gemv_f32.
+        // ponytail: f32 eh_proj, int8 it if the resident budget ever bites.
+        if l == d.n_layers {
+            for t in ["enorm.weight", "hnorm.weight", "eh_proj.weight", "shared_head.norm.weight"] {
+                w.add_widened(&src, &format!("{lb}.{t}"))?;
+            }
+        }
     }
     let rpath = format!("{}/resident.safetensors", args.out_dir);
     w.write(&rpath)?;
@@ -665,6 +681,7 @@ fn main() -> Result<()> {
     if args.layers.is_some() {
         manifest["num_hidden_layers"] = serde_json::json!(last);
     }
+    manifest["num_nextn_predict_layers"] = serde_json::json!(u8::from(mtp));
     manifest["format"] = serde_json::to_value(FormatMeta::current(FP8_BLOCK))?;
     std::fs::write(
         format!("{}/manifest.json", args.out_dir),

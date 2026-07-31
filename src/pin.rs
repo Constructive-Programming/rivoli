@@ -138,6 +138,21 @@ pub struct LayerPin {
     pub indexer: Option<IndexerPin>,
 }
 
+/// The MTP (multi-token prediction) head's own weights, on top of the ordinary
+/// [`LayerPin`] it is stored as (`layers[cfg.n_layers]` — the checkpoint numbers it
+/// one past the last real layer, and it is a full MoE layer in every other respect).
+///
+/// The head consumes the main model's last hidden state `h` and the embedding of the
+/// token just sampled: `eh_proj·[enorm(emb) ‖ hnorm(h)]` is its residual-stream input.
+/// `shared_norm` replaces `model.norm` before the (shared) `lm_head`.
+#[derive(Clone, Copy)]
+pub struct MtpPin {
+    pub eh_proj: *const f32, // [hidden, 2·hidden] (bf16→f32; gemv_f32)
+    pub enorm: *const f32,   // [hidden]
+    pub hnorm: *const f32,   // [hidden]
+    pub shared_norm: *const f32, // [hidden]
+}
+
 /// The resident weight set + cold-expert streaming pool.
 pub struct Pin<'a> {
     cfg: &'a ModelConfig,
@@ -149,6 +164,9 @@ pub struct Pin<'a> {
     pub lm_head: Int8Weight,
     pub final_norm: *const f32,
     pub layers: Vec<LayerPin>,
+    /// The MTP head's extra weights, `Some` when the artifact carries it. Its ordinary
+    /// layer weights live at `layers[cfg.n_layers]`, so `layers.len()` is `n_layers + 1`.
+    pub mtp: Option<MtpPin>,
     /// Router correction bias per MoE layer, kept HOST-side (the sigmoid/bias/top-k
     /// routing runs on the CPU). `moe_bias[layer - dense_layers]`, len n_experts.
     moe_bias: Vec<Vec<f32>>,
@@ -317,7 +335,15 @@ fn indexer_bytes(cfg: &ModelConfig, block: usize) -> usize {
 /// and one VQ shared expert per MoE layer.
 /// `shared_i4`: the always-resident shared expert is int4 (else int3-VQ).
 /// `cb_resident`: the 3 fp16 VQ codebooks are resident (any VQ slab present).
-fn resident_bytes(cfg: &ModelConfig, block: usize, shared_i4: bool, cb_resident: bool) -> usize {
+/// `mtp`: the artifact carries the MTP head — one more MoE layer, plus its
+/// enorm/hnorm/shared_head.norm and the f32-widened `eh_proj`.
+fn resident_bytes(
+    cfg: &ModelConfig,
+    block: usize,
+    shared_i4: bool,
+    cb_resident: bool,
+    mtp: bool,
+) -> usize {
     let fp8 = |o: usize, i: usize| fp8_bytes(o, i, block);
     let i8 = i8_bytes;
     let f32n = f32_bytes;
@@ -327,7 +353,7 @@ fn resident_bytes(cfg: &ModelConfig, block: usize, shared_i4: bool, cb_resident:
         + i8(cfg.vocab, cfg.hidden)           // lm_head
         + f32n(cfg.hidden); // model.norm
 
-    for l in 0..cfg.n_layers {
+    for l in 0..cfg.n_layers + usize::from(mtp) {
         // Norms: input, post-attn, q_a, kv_a.
         total += 2 * f32n(cfg.hidden) + f32n(cfg.q_lora_rank) + f32n(cfg.kv_lora_rank);
         // MLA projections (fp8).
@@ -351,6 +377,10 @@ fn resident_bytes(cfg: &ModelConfig, block: usize, shared_i4: bool, cb_resident:
                 vq_expert_bytes(cfg.hidden, cfg.moe_inter)
             };
         }
+    }
+    // The MTP head's own tensors, on top of the extra layer counted above.
+    if mtp {
+        total += f32n(cfg.hidden * 2 * cfg.hidden) + 3 * f32n(cfg.hidden);
     }
     // 3 per-projection fp16 codebooks — resident whenever a VQ slab is present.
     total + if cb_resident { 3 * VQ_K * VQ_DIM * 2 } else { 0 }
@@ -645,12 +675,24 @@ impl<'a> Pin<'a> {
         // Both file sets sit in the artifact side by side. `shared_i4`: the
         // always-resident shared expert rides the primary/hot format (int4 in hybrid).
         let vq_present = mode != Mode::Int4; // int3-vq or hybrid needs a vq slab
+        // The MTP head is checkpoint layer `n_layers` and is a full MoE layer, so it
+        // rides the routed pool like any other and needs its expert slab in EVERY format
+        // this run opens. `bin/fp8_to_i4` does not emit one, so an int4/hybrid run decodes
+        // without a draft head rather than failing to load.
+        let mtp = st.has(&format!("model.layers.{}.eh_proj.weight", cfg.n_layers))
+            && [(vq_present, "vq3"), (i4, "i4")].iter().all(|&(want, ext)| {
+                !want
+                    || std::fs::metadata(format!("{dir}/L{:02}.{ext}", cfg.n_layers)).is_ok()
+            });
+        // Layers the PIN holds: the model's, plus the MTP head one past the end.
+        let n_pin = cfg.n_layers + usize::from(mtp);
+        tracing::info!("mtp head: {}", if mtp { "present" } else { "absent" });
         let vq_src = vq_present
             .then(|| {
                 ExpertSet::open_vq3(
                     dir,
                     cfg.dense_layers,
-                    cfg.n_layers,
+                    n_pin,
                     cfg.n_experts,
                     cfg.hidden,
                     cfg.moe_inter,
@@ -662,7 +704,7 @@ impl<'a> Pin<'a> {
                 ExpertSet::open_i4(
                     dir,
                     cfg.dense_layers,
-                    cfg.n_layers,
+                    n_pin,
                     cfg.n_experts,
                     cfg.hidden,
                     cfg.moe_inter,
@@ -678,18 +720,22 @@ impl<'a> Pin<'a> {
 
         // Full layers own a resident DSA indexer (dsa/misa modes). Empty when
         // dense/streaming — the mask drives both placement and the footprint.
+        // `index_share_for_mtp_iteration` means the head reuses the main model's
+        // selection, so it never owns an indexer — push a `false` for it either way.
         let full = if want_indexer {
-            cfg.indexer_layout()?
+            let mut f = cfg.indexer_layout()?;
+            f.resize(n_pin, false);
+            f
         } else {
-            vec![false; cfg.n_layers]
+            vec![false; n_pin]
         };
         let n_full = full.iter().filter(|&&f| f).count();
 
         // Size the tier to the always-resident footprint plus slack (absorbs the
         // per-reservation 256-byte alignment padding); anything left widens the pool.
         const SLACK: usize = 256 << 20; // 256 MiB
-        let resident =
-            resident_bytes(cfg, block, shared_i4, vq_present) + n_full * indexer_bytes(cfg, block);
+        let resident = resident_bytes(cfg, block, shared_i4, vq_present, mtp)
+            + n_full * indexer_bytes(cfg, block);
         let tier_cap = resident + SLACK;
         tracing::info!(
             "computed resident footprint {:.2} GiB (tier {:.2} GiB incl. slack)",
@@ -720,10 +766,10 @@ impl<'a> Pin<'a> {
 
         // Per-layer always-resident weights. `l` indexes both the weight-name
         // format!s and the `full` indexer mask; iterating `full` would lose it.
-        let mut layers = Vec::with_capacity(cfg.n_layers);
+        let mut layers = Vec::with_capacity(n_pin);
         let mut moe_bias = Vec::new();
         #[allow(clippy::needless_range_loop)]
-        for l in 0..cfg.n_layers {
+        for l in 0..n_pin {
             let lb = format!("model.layers.{l}");
             let a = format!("{lb}.self_attn");
             let mlp = if l < cfg.dense_layers {
@@ -777,6 +823,17 @@ impl<'a> Pin<'a> {
                 },
             });
         }
+        let mtp = mtp
+            .then(|| -> Result<MtpPin> {
+                let lb = format!("model.layers.{}", cfg.n_layers);
+                Ok(MtpPin {
+                    eh_proj: place_f32(&mut tier, &st, &format!("{lb}.eh_proj.weight"))?,
+                    enorm: place_f32(&mut tier, &st, &format!("{lb}.enorm.weight"))?,
+                    hnorm: place_f32(&mut tier, &st, &format!("{lb}.hnorm.weight"))?,
+                    shared_norm: place_f32(&mut tier, &st, &format!("{lb}.shared_head.norm.weight"))?,
+                })
+            })
+            .transpose()?;
 
         // Routed pool: a two-ended byte Arena over the budget left after the resident
         // set. Each expert is ONE aligned block read into a slot. COLD/HOT tiers are one
@@ -794,7 +851,7 @@ impl<'a> Pin<'a> {
                 off: vq_off,
                 int4: false,
                 stride: s.expert_slot(),
-                table: build_moe_table(cfg, |l, e| s.read_spec(l, e))?,
+                table: build_moe_table(cfg, n_pin, |l, e| s.read_spec(l, e))?,
             })
         };
         let i4_tier = || -> Result<TierFmt> {
@@ -803,7 +860,7 @@ impl<'a> Pin<'a> {
                 off: i4_off,
                 int4: true,
                 stride: s.expert_slot(),
-                table: build_moe_table(cfg, |l, e| s.read_spec(l, e))?,
+                table: build_moe_table(cfg, n_pin, |l, e| s.read_spec(l, e))?,
             })
         };
         // COLD/HOT tiers by mode. Single-format shares one format across both tiers.
@@ -871,6 +928,7 @@ impl<'a> Pin<'a> {
             lm_head,
             final_norm,
             layers,
+            mtp,
             moe_bias,
             codebooks,
             vq_src,
@@ -1191,11 +1249,12 @@ impl<'a> Pin<'a> {
 /// `read_spec`; range/dim checks ran at open).
 fn build_moe_table(
     cfg: &ModelConfig,
+    n_layers: usize,
     read: impl Fn(usize, usize) -> Result<(RawFd, usize, usize)>,
 ) -> Result<Vec<(RawFd, usize, usize)>> {
-    let n_moe = cfg.n_layers - cfg.dense_layers;
+    let n_moe = n_layers - cfg.dense_layers;
     let mut table = Vec::with_capacity(n_moe * cfg.n_experts);
-    for l in cfg.dense_layers..cfg.n_layers {
+    for l in cfg.dense_layers..n_layers {
         for e in 0..cfg.n_experts {
             table.push(read(l, e)?);
         }
