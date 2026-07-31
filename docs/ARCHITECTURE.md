@@ -135,9 +135,52 @@ counted as compute, hence as fetch successfully hidden. The true ceiling is
 phase should be ~125 ms against a measured `moe_wall` of 266 ms, a 141 ms hole; under the
 stall reading 117 + 149 = 266 closes exactly.
 
+**The code kept printing the retracted number until 2026-08-01.** This section had the
+diagnosis for two days while `PROFILE/tok` still said "97% hidden" every run, because the
+retraction was written here and not into `Profile::summary`. The tell was there for anyone
+who ran the arm: `--direct-vmm-dma` printed **99% hidden** while decoding at 1.11 tok/s
+against bounce's 2.26. `exposed` is now `moe_wall` minus a **measured** counterfactual —
+`moe_ns_by_miss[0]`, the mean bracket of the layers that missed nothing, times the layer
+count — which puts the same two arms at 22% and 10%. A metric whose ordering disagrees with
+throughput is not reporting a small error; it is reporting nothing.
+
 Consequence for the roadmap: perfect overlap floors at `max(117, 181) + ~102 route ≈ 283
 ms/tok` (**~3.5 tok/s** vs 2.59 today). Past that, only moving *fewer bytes* helps — hit
 rate or a smaller expert format — not better timing.
+
+### What the drive actually does, and why the fetch cannot go faster (2026-08-01)
+
+Measured with `docs/probes/fetch_batch.hip`, which reproduces the engine's exact shape —
+`hipHostMalloc` bounce buffers, submit-*m*-drain-all-*m* batches, random 15.3 MB reads
+across the 75 layer files, and a GPU kept busy streaming LPDDR5 beside it:
+
+| queue depth | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| GB/s, GPU busy | **7.7** | 12.1 | 13.0 | 10.9 |
+| GB/s, GPU idle | 8.8 | 12.6 | 13.3 | 13.7 |
+
+A decode achieves **~10 GB/s**. Weighting the table by the engine's own per-layer miss
+distribution (`moe_us_by_miss`: 18% of layers miss once, 23% twice, 20% three times) predicts
+15.8 s against a measured `io_wait` of 18.3 s over 64 tokens — inside the probe's own
+run-to-run spread. **The demand fetch is already getting what its queue depth can buy.**
+
+Three things this rules out, each of which looked plausible first:
+
+- *The bounce copy is the serial tail.* It is 0.18 ms per expert at 87 GB/s
+  (`fetch_stream_ops.hip`) against a ~1.3 ms read. Not the bottleneck.
+- *The pinned arena costs read bandwidth.* Pinned and pageable are within noise at every
+  queue depth.
+- *Splitting a read raises the queue depth for free.* It does — one expert split two ways
+  goes 1.94 → 1.44 ms — but only the 18% of layers that miss exactly once benefit, so it is
+  ~2% overall against a real change to the ring. Measured and dropped.
+
+What is left is the **duty cycle**. The ring only has work between a layer's routing and its
+MoE launch, so the drive is idle ~35% of every token (18.3 s of NVMe in a 28.3 s decode).
+Nothing inside the fetch path can fix that: a read cannot be issued before the router names
+the expert, and the router cannot run before that layer's attention. Filling it means
+predicting the routing one layer ahead — which is speculation, and is the one lever left.
+The ticket gate (§8b, INV-4/INV-6) is what makes such a read safe to issue; `docs/CACHE_PILOT.md`
+records what the last attempt at predicting cost and bought.
 
 ---
 
@@ -146,9 +189,21 @@ rate or a smaller expert format — not better timing.
 `src/gpustream.rs`. The mechanism that lets the fetcher and the compute stream interleave
 without the host blocking on `hipDeviceSynchronize`:
 
-> A GPU-stream op (or an io_uring completion's bounce-copy) becomes a **future** that
-> resolves when the hardware reaches that point. A `hipLaunchHostFunc` callback fires a
-> `Waker`; `futures-util` then orchestrates GPU + NVMe concurrency directly.
+> A GPU-stream op becomes a **future** that resolves when the hardware reaches that point.
+> A `hipLaunchHostFunc` callback fires a `Waker`; `futures-util` then orchestrates GPU
+> concurrency directly.
+
+**An io_uring completion's bounce-copy used to be one of those futures. It is not any more,
+and the bridge is smaller for it.** The ticketed dataflow (INV-5) moved each expert's
+dependency onto the device, so nothing awaited the per-read `Signal` — `gpu.rs` took the
+`Vec<Signal>` and dropped it — while `asyncfetch` went on arming one `hipLaunchHostFunc` per
+miss on the fetch stream, a host round trip recorded INTO the queue whose copies it delayed.
+Deleted 2026-08-01. What is left is one arm per stream per layer, which the decode loop
+genuinely awaits.
+
+The deletion also exposed that the reaper's failure path had been releasing the vestigial
+half: it resolved those signals and never touched the timelines, so a fetch error hung the
+device on a `hipStreamWaitValue64` nothing would ever satisfy. See INV-6 in §8b.
 
 ```mermaid
 sequenceDiagram
@@ -437,10 +492,20 @@ different populations. Numbering converts "the doc drifted" into something a che
 > patch. No INV-n is claimed here because no invariant currently holds.
 | **INV-4** | A device-side wait may be enqueued BEFORE its producer exists and still waits (the property `hipStreamWaitEvent` lacks) — one half per backend, since they reach it by different mechanisms | `gpustream.rs::inv_4_wait_enqueued_before_signal_still_waits`, `tests/vk.rs::inv_4_…` |
 | **INV-5** | An expert cannot be launched without enqueueing its data dependency: every descriptor carries a `Ticket` and `wait_on` is the only way to consume one | `pin.rs::inv_5_every_descriptor_carries_a_ticket` |
+| **INV-6** | A wait can always be released from the HOST, so a producer that dies owing a ticket cannot hang the device — one half per backend (HIP: monotone CAS into signal memory; Vulkan: `vkSignalSemaphore`) | `gpustream.rs::inv_6_a_host_release_retires_an_enqueued_wait`, `tests/vk.rs::inv_6_…` |
 
 INV-4 is the foundation of the ticketed dataflow that replaced the `hit` mask: it is what
 lets consumers be recorded up front, behind waits on values nothing has signalled yet.
 INV-5 is the guarantee that replaced it — see §5.
+
+INV-6 is INV-4's other half, and it was **missing until 2026-08-01**. `hipStreamWaitValue64`
+has no error state: it blocks until the value arrives, forever. So the reaper abandoning a
+poisoned ring without signalling that batch's tickets left every consumer already gated on
+them waiting on a value nothing would ever write — a fetch error **hung the device** instead
+of returning. What the teardown path did instead was resolve a `Vec<Signal>`, one per read,
+which by then nothing awaited: the ticketed dataflow had moved the dependency onto the
+device and left the failure path releasing the vestigial half. The signals are deleted and
+`Timeline::release` is what teardown calls.
 
 ---
 
@@ -499,8 +564,9 @@ module root (`src/<group>.rs`) over a directory, so the tree mirrors the section
   time, no vtable). `src/backend.rs` is the seam itself; `hip`/`gpustream` and
   `vk`/`vkstream` are the two implementations under it. `gpu`, `memory::pin`,
   `fetch::asyncfetch` and `fetch::stream` import the seam, never a backend directly. Vulkan
-  decodes `--mode int3-vq --attn dense` over three queues with the overlap intact (97%
-  hidden vs ROCm's 96%), ~1.9x slower end to end, all of it MoE kernel throughput; its
+  decodes `--mode int3-vq --attn dense` over three queues with the overlap intact
+  (established by increment 1 vs 2, not by the retracted 96/97% figures — §3), ~1.9x slower
+  end to end, all of it MoE kernel throughput; its
   `.comp` shaders are SINGLE-ROW, so six launchers refuse `nrow > 1` and speculative decode
   is ROCm-only (§13). See `docs/VULKAN.md`.
 - **Top level** — `gpu` (the async forward pass, single- or two-row: `MAXROW`, §13), `math`,

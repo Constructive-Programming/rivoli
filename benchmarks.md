@@ -1834,3 +1834,77 @@ Consequence for measurement: **do not A/B quality across `--max-mem` or `--cache
 hybrid** — the arms are different numerics, not the same model under different pressure.
 Open defect; fixing it means binding format to expert identity rather than residency, which
 changes what `hybrid` is.
+
+### The demand fetch is at the drive's ceiling; the drive is idle 35% of the token — 2026-08-01
+
+Chasing "can the disk fetches run fully concurrently with the rest of the system". Baseline
+`--mode int3-vq --attn dense --cache-policy 2q --max-mem 100 -bench 64`: 441.9 ms/tok wall,
+`moe` 328 ms, `fetch` 286 ms, `io_wait` 286 ms, 187.75 miss/tok × 15.34 MB = 2.88 GB/tok.
+
+**The MoE phase IS the disk.** Summing `moe_us_by_miss` over the run gives 20.5 s of MoE
+bracket against 18.3 s of `io_wait` — 89%. A zero-miss layer is 1585 µs, so all-resident
+compute is ~2 s of that 20.5 s.
+
+Drive characterised with `docs/probes/fetch_batch.hip`, which reproduces the engine's shape
+exactly (`hipHostMalloc` bounce buffers, submit-*m*-drain-all-*m*, random 15.3 MB O_DIRECT
+reads across the 75 layer files, GPU kept busy streaming LPDDR5):
+
+| | QD1 | QD2 | QD4 | QD8 |
+|---|---:|---:|---:|---:|
+| GPU busy | **7.7** | 12.1 | 13.0 | 10.9 |
+| GPU idle | 8.8 | 12.6 | 13.3 | 13.7 |
+
+Engine achieves ~10 GB/s. Weighting the table by the engine's own miss distribution predicts
+15.8 s against the measured 18.3 s — inside the probe's run-to-run spread, which is **±25% at
+QD1 alone** (7.7–12.5 GB/s across runs of the same probe). An early "26% unexplained" was
+that spread plus an idle-GPU comparison; it did not survive matching the load.
+
+Three hypotheses tested and killed, in order:
+
+| hypothesis | measurement | verdict |
+|---|---|---|
+| the bounce→VMM copy is the serial tail | 0.18 ms/expert at 87 GB/s (`fetch_stream_ops.hip`) vs a ~1.3 ms read | no |
+| the pinned arena costs read bandwidth | pinned vs pageable within noise at every QD | no |
+| splitting a read raises QD for free | one expert split 2 ways: 1.94 → 1.44 ms — but only 18% of layers miss exactly once | **~2% overall; dropped** |
+
+`--direct-vmm-dma` re-ablated on the same build: 900.8 ms/tok, 1.11 tok/s vs bounce's 2.26,
+`io_wait` 761 ms — confirms bounce as the default and, incidentally, exposed the broken
+hidden-fetch metric (it printed **99% hidden** on this arm).
+
+**What is left is the duty cycle: 18.3 s of NVMe inside a 28.3 s decode.** The ring only has
+work between a layer's routing and its MoE launch. Filling the idle 35% needs the routing
+known a layer ahead — prediction, not a fetch change. Floor if it were free:
+184.3 GB ÷ 12.5 GB/s ≈ 14.7 s, i.e. ~1.9×.
+
+### Deleting the per-read `Signal`: perf-neutral, and it fixed a hang — 2026-08-01
+
+`asyncfetch` armed one `Signal` (a `hipLaunchHostFunc`, a host round trip recorded INTO the
+fetch stream) per cold read. Nothing awaited it — `gpu.rs` took the `Vec<Signal>` and dropped
+it — since the ticketed dataflow moved the dependency onto the device. Probe cost: 7.2 µs of
+enqueue per read inside the `io_wait` clock, plus 4% of the fetch stream's drain.
+
+Paired A/B, both binaries built BEFORE either arm ran and alternated with no build between
+(the first attempt showed 2.26 → 2.54 and was an artifact of the build evicting page cache —
+exactly the trap CLAUDE.md warns about):
+
+| arm | tok/s | n | mean | sd |
+|---|---|---:|---:|---:|
+| old | 2.50, 2.76, 2.24, 2.68, 2.34 | 5 | 2.504 | 0.222 |
+| new | 2.44, 2.60, 2.59, 2.47, 2.50, 2.27 | 6 | 2.478 | 0.121 |
+
+**Perf-neutral**: Δ = −0.026 ± 0.111 tok/s (SE of the difference), nowhere near resolvable.
+Output byte-identical, hit/miss identical at 29353/16094, `moe_us_by_miss` histogram identical
+bucket for bucket.
+
+Note the run-to-run spread on this bench is **±0.2 tok/s, ~9%** — wider than most of what
+gets ranked in PERF.md. At n=5 the new arm looked three times more consistent (sd 0.070) and
+that was tempting to attribute to the deleted host callbacks; the sixth run (2.27) took the
+sd to 0.121 and F to 3.4, p ≈ 0.10. **There is no variance finding here**, only a reminder
+that this bench needs n ≥ 5 per arm before any single-digit percentage is worth saying.
+
+The value is elsewhere: the reaper's poison path resolved those signals and **never signalled
+the tickets**, so a fetch error left every consumer parked on a `hipStreamWaitValue64` nothing
+would ever satisfy — the device hung instead of the decode returning the error. Teardown now
+calls `Timeline::release` (host-side monotone store on ROCm, `vkSignalSemaphore` on Vulkan).
+Registered as **INV-6**, with a test per backend that proves the mechanism rather than the
+bookkeeping: a host release retires a wait enqueued against a value no stream will ever write.

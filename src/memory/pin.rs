@@ -19,7 +19,7 @@
 
 use crate::fetch::asyncfetch::{AsyncFetch, ReadSpec, Ticket};
 use crate::memory::arena::{Arena, Reloc, Step};
-use crate::backend::{Signal, memcpy_dtod};
+use crate::backend::memcpy_dtod;
 use crate::memory::cache;
 use crate::artifact::config::Mode;
 use crate::memory::device::{DeviceTier, VmmBuf};
@@ -189,7 +189,7 @@ pub struct Pin<'a> {
     /// COLD/HOT tiers are one format (single-format) or int3-VQ/int4 (hybrid).
     routed: ArenaPool,
     /// Per-expert async cold-fetch: owns the io_uring demand ring on a reaper thread
-    /// and resolves each miss's load [`Signal`] when its bytes land. The expert
+    /// and signals each miss's [`Ticket`] when its bytes land. The expert
     /// stream awaits these; there is no batch join.
     fetch: AsyncFetch,
     pub hits: u64,
@@ -454,7 +454,7 @@ struct ArenaPool {
     ///
     /// The engine has no other way to distinguish "the policy says resident" from "the
     /// bytes are actually there", and that distinction is the leading hypothesis for the
-    /// intermittent non-finite-logits bug: a HIT returns `Signal::ready()` and the kernel
+    /// intermittent non-finite-logits bug: a HIT carries `Ticket::RESIDENT` and the kernel
     /// reads the slot immediately, so if a key is ever counted resident before its load
     /// completed, the read is of uninitialised (-> NaN, the visible case) or stale (->
     /// finite and WRONG, the silent case) memory.
@@ -1022,9 +1022,9 @@ impl<'a> Pin<'a> {
     /// may RELOCATE resident slots. 1c: only NOW, after all relocations have settled,
     /// resolve each key's final slot and build the misses' cold reads — so a read never
     /// targets a slot that later moves. Returns the per-`sel` resolved slots + signals.
-    // The return tuple is (resolved slots, load signals, per-expert int4 flag), spelled
-    // out rather than hidden behind a type alias: one caller, and the doc line above
-    // already names the three parts. An alias here would be one more name to chase.
+    // The return tuple is (resolved slots, per-expert ticket), spelled out rather than
+    // hidden behind a type alias: one caller, and the doc line above already names both
+    // parts. An alias here would be one more name to chase.
     #[allow(clippy::type_complexity)]
     fn submit_spine(
         &mut self,
@@ -1032,7 +1032,7 @@ impl<'a> Pin<'a> {
         sel: &[usize],
         window: &[usize],
         choice: &[f32],
-    ) -> Result<([Option<ResolvedSlot>; 32], Vec<Signal>, Vec<Ticket>)> {
+    ) -> Result<([Option<ResolvedSlot>; 32], Vec<Ticket>)> {
         let cfg = self.cfg;
         let sparse = (layer - cfg.dense_layers) * cfg.n_experts; // read-table row base
         debug_assert!(
@@ -1092,7 +1092,7 @@ impl<'a> Pin<'a> {
             if self.routed.get(key) {
                 self.hits += 1;
                 // THE CHECK. A hit hands the kernel a slot pointer and a resolved
-                // Signal, so nothing downstream waits. If the bytes never landed, the
+                // RESIDENT ticket, so nothing downstream waits. If the bytes never landed, the
                 // kernel reads uninitialised memory (NaN) or another expert's weights
                 // (finite, wrong, silent). Reported once per occurrence rather than
                 // fataling, so a run keeps going and the pattern is visible.
@@ -1161,25 +1161,22 @@ impl<'a> Pin<'a> {
             }
         }
         // Phase 2: hand the whole batch to the reaper — it queues+submits (all reads
-        // start at once) and resolves each miss's Signal when its copy lands. Hits
-        // default to `ready()`; overwrite each miss with its load Signal.
+        // start at once) and signals each miss's ticket when its copy lands.
         // Queue this batch's misses to be marked loaded at the next layer.
         #[cfg(feature = "trace")]
         for &i in &miss_sel {
             self.routed.pending_loaded.push(expert_key(layer, sel[i]));
         }
-        let (miss_signals, miss_tickets) = self.fetch.submit(reads)?;
-        let mut signals: Vec<Signal> = (0..sel.len()).map(|_| Signal::ready()).collect();
+        let miss_tickets = self.fetch.submit(reads)?;
         // A resident expert's data is already there, so it carries the RESIDENT ticket
         // (value 0, satisfied on arrival). Every expert therefore has a ticket and the
         // caller has one code path — there is no residency bool for anyone to branch on.
         let mut tickets: Vec<Ticket> = vec![Ticket::RESIDENT; sel.len()];
         for (k, &i) in miss_sel.iter().enumerate() {
-            signals[i] = miss_signals[k].clone();
             tickets[i] = miss_tickets[k];
         }
         let _ = is_hit;
-        Ok((slots, signals, tickets))
+        Ok((slots, tickets))
     }
 
     /// Submit one layer's cold reads and resolve each selected expert to its [`MlpVq`]
@@ -1210,8 +1207,8 @@ impl<'a> Pin<'a> {
         out: &mut Vec<MlpVq>,
         fmt: &mut Vec<bool>,
         tickets: &mut Vec<Ticket>,
-    ) -> Result<Vec<Signal>> {
-        let (slots, signals, tk) = self.submit_spine(layer, sel, window, choice)?;
+    ) -> Result<()> {
+        let (slots, tk) = self.submit_spine(layer, sel, window, choice)?;
         out.clear();
         fmt.clear();
         tickets.clear();
@@ -1229,7 +1226,7 @@ impl<'a> Pin<'a> {
             });
             fmt.push(s.int4);
         }
-        Ok(signals)
+        Ok(())
     }
 }
 

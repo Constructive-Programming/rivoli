@@ -506,11 +506,16 @@ fn timeline_signal_resolves_and_latency() {
     v.check("timeline_signal_resolves_and_latency");
 }
 
-/// A resolved signal is immediately ready, and `resolve` is idempotent — the error
-/// path in the reaper depends on both, so awaiters never hang.
+/// `resolve` is idempotent and immediately ready — `resolve_all` calls it on every waiter of
+/// a retired stamp, and a second call must not hang or double-wake.
+///
+/// It used to also assert `Signal::ready()`, and the doc used to say "the error path in the
+/// reaper depends on both, so awaiters never hang". That was true and then quietly stopped
+/// being: the ticketed dataflow made the timeline the dependency, so the reaper's error path
+/// releases tickets (INV-6) and awaits no signal at all. `ready()` had no callers left and
+/// is deleted — `Ticket::RESIDENT` is what says "already present" now.
 #[test]
-fn signal_ready_and_resolve_are_immediate() {
-    block_on(rivoli::backend::vk::Signal::ready());
+fn signal_resolve_is_idempotent_and_immediate() {
     let s = rivoli::backend::vk::Signal::pending();
     s.resolve();
     s.resolve(); // idempotent
@@ -3803,5 +3808,34 @@ fn inv_4_wait_enqueued_before_signal_still_waits() -> anyhow::Result<()> {
         t.completed() >= 1,
         "the waited-on value must have been reached, not skipped"
     );
+    Ok(())
+}
+
+/// **INV-6: a wait can always be released, so a dead producer cannot hang the device.**
+/// `gpustream.rs::inv_6_…`'s Vulkan half — separate because the two backends reach it by
+/// different mechanisms: HIP does a monotone CAS into signal memory, Vulkan calls
+/// `vkSignalSemaphore`, which is the host-side signal operation proper.
+///
+/// The property is the same and it is the other half of INV-4. A wait enqueued before its
+/// producer is the design; a producer that dies owing that value must still be answerable,
+/// or the fetch error surfaces as a hang. It did — see the reaper's `release`.
+#[cfg(feature = "vulkan")]
+#[test]
+fn inv_6_a_host_release_retires_an_enqueued_wait() -> anyhow::Result<()> {
+    use rivoli::backend::{Stream, Timeline, stream_signal};
+
+    let t = Timeline::new()?;
+    let compute = Stream::compute()?;
+    // Against a value NOTHING will ever signal on any queue: the dead-producer case, not a
+    // race with a slow one.
+    t.wait(compute.raw(), 7)?;
+    t.release(7);
+
+    let rt = tokio::runtime::Builder::new_current_thread().build()?;
+    rt.block_on(stream_signal(compute.raw())?);
+    assert!(t.completed() >= 7, "the host release must be what retired the wait");
+    // Monotone: releasing backwards would un-free a slot another consumer is gated on.
+    t.release(3);
+    assert_eq!(t.completed(), 7, "release must never move a timeline backwards");
     Ok(())
 }

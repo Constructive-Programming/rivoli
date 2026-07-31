@@ -17,7 +17,7 @@
 
 use crate::attn::{AttnMode, streaming_rows};
 use crate::backend::{
-    Event, ExpertDesc, Signal, Stream, device_sync, fill_u32, launch_append_kv, launch_argmax,
+    Event, ExpertDesc, Stream, device_sync, fill_u32, launch_append_kv, launch_argmax,
     launch_attend, launch_embed_i8_row, launch_flag_nonfinite, launch_gather_rope,
     launch_gemv_f32, launch_gemv_fp8, launch_gemv_i8,
     launch_index_append, launch_index_head_route, launch_index_pool_push, launch_index_score,
@@ -262,15 +262,37 @@ impl Profile {
     ) -> ProfileSummary {
         let tok = self.tokens.max(1) as f64;
         let per = |ns: u128| ns as f64 / 1e6 / tok; // ms/token
-        // Exposed fetch = the MoE wall in excess of the pure compute-stream span
-        // (moe_wall − compute_gpu): the fetch that could NOT hide behind compute. The
-        // rest of the reaper's fetch_wall overlapped. (tokio idle over-counts — it
-        // sums per-expert waits across the ~9 concurrent tasks — so it's reported raw,
-        // not used here.)
-        let exposed_ns = self.moe_wall_ns.saturating_sub(self.compute_gpu_ns) as f64;
+        // Exposed fetch = the MoE wall in excess of what the SAME layers would have cost
+        // with every expert already resident. The counterfactual is measured, not modelled:
+        // `moe_ns_by_miss[0]` is the mean bracket of the layers that missed nothing, over
+        // `moe_n_by_miss[0]` of them, and a resident expert costs the same whichever layer
+        // it is in (same kernel, same bytes).
+        //
+        // THIS USED TO BE `moe_wall − compute_gpu` AND THAT MEASURED NOTHING. `compute_gpu`
+        // brackets the compute stream from `moe_ev_start` to `moe_ev_end`, and `_end` is
+        // recorded only after BOTH streams have been awaited — so the bracket spans the very
+        // fetch it was supposed to exclude, `exposed` came out near zero by construction, and
+        // the line printed "97% hidden" no matter what. The tell was `--direct-vmm-dma`:
+        // 99% hidden on the configuration that decodes at 1.11 tok/s against bounce's 2.26.
+        // The replacement puts those at 22% and 10% respectively — same ordering as the
+        // throughput, which is the least a hiding metric has to do.
+        let resident_ns = match self.moe_n_by_miss.first() {
+            Some(&n) if n > 0 => {
+                let instances: u64 = self.moe_n_by_miss.iter().map(|&n| u64::from(n)).sum();
+                self.moe_ns_by_miss[0] / u128::from(n) * u128::from(instances)
+            }
+            // No all-resident layer ran, so there is no measured price for one. Fall back to
+            // the whole bracket being exposed rather than inventing a counterfactual.
+            _ => 0,
+        };
+        let exposed_ns = self.moe_wall_ns.saturating_sub(resident_ns) as f64;
         // GPU-wait: the decode thread parked in a device join. Every term is a stamped
         // `Instant` span except the MoE phase's, which is its own host wall net of the
-        // exposed fetch and the tokio poll (host work inside the same block).
+        // exposed fetch — so with `exposed` now honest, this is the MoE time that was
+        // genuinely compute rather than the drive. It fell from 320 to ~104 ms/token when
+        // `exposed` stopped being derived from `compute_gpu`, and the drop is the
+        // correction, not a regression: that time did not stop being spent, it stopped
+        // being mis-classified as the GPU working when the GPU was waiting for NVMe.
         //
         // Not a share of wall and not trying to be. An earlier version forced these into
         // a partition with `cpu` as the leftover; the leftover absorbed every error in
@@ -1590,7 +1612,7 @@ impl<'a> GpuEngine<'a> {
                 // The UNION, not one row's picks: every expert any row routed to must be
                 // resident before the batch launches. Rows overlap ~31% (measured over
                 // 268 tokens x 75 layers), so 2 rows submit ~13.5 experts rather than 16.
-                let mut signals = self.pin.submit_layer(
+                self.pin.submit_layer(
                     l,
                     &self.union,
                     &self.window,
@@ -1664,7 +1686,6 @@ impl<'a> GpuEngine<'a> {
                     // "len is 8 but the index is 8", because the old mask covered only the
                     // 8 routed picks).
                     self.tickets.push(Ticket::RESIDENT);
-                    signals.push(Signal::ready());
                 }
                 let ndesc = self.descs_vq.len();
                 self.descs_buf
@@ -1854,13 +1875,14 @@ impl<'a> GpuEngine<'a> {
                 // a fixed-point accumulator nothing between the two streams needs ordering:
                 // the only consumer of all experts is the drain, and that already sits
                 // behind the end-of-layer barrier.
-                // The load Signals are no longer awaited per expert — the GPU gates itself
-                // now. They remain the reaper's error/teardown channel (it resolves them on
-                // poison so nothing hangs), and NOT awaiting them is what removes ~9 host
-                // round trips per layer: the measured cost of that gating was the MoE phase
-                // running at 38.8 GB/s in-engine against 91.8 GB/s for the same kernels in
-                // `examples/moe_bench.rs`.
-                drop(signals);
+                // The per-expert load Signals are GONE, not merely un-awaited. Dropping the
+                // await removed ~9 host round trips per layer (the measured cost of that
+                // gating was the MoE phase running at 38.8 GB/s in-engine against 91.8 GB/s
+                // for the same kernels in `examples/moe_bench.rs`) — but the signals kept
+                // being CREATED and armed, one `hipLaunchHostFunc` per miss on the fetch
+                // stream, for a future nobody polled. They also made the reaper's teardown
+                // path look correct while releasing nothing anyone waited on; see
+                // `asyncfetch::release`.
                 // BOTH streams, because neither one waits for the other any more. The
                 // drain below is the only thing that needs every expert, and it runs after
                 // this. `moe_ev_start`/`_end` still bracket honestly: `_end` records on an

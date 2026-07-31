@@ -31,6 +31,7 @@ unsafe extern "C" {
     fn rivoli_timeline_wait(stream: *mut c_void, t: *mut c_void, value: u64) -> i32;
     fn rivoli_timeline_signal(stream: *mut c_void, t: *mut c_void, value: u64) -> i32;
     fn rivoli_timeline_completed(t: *mut c_void) -> u64;
+    fn rivoli_timeline_release(t: *mut c_void, value: u64);
 }
 
 /// A timing event: bracket GPU work on a stream to recover the true duration the
@@ -164,11 +165,16 @@ extern "C" fn trampoline(user: *mut c_void) {
     state.waker.wake();
 }
 
-/// A one-shot completion shared between whatever resolves it (a GPU-stream
-/// host-func, an io_uring reaper) and the future that awaits it. `pending()` +
-/// `arm_on(stream)` fires it when a stream reaches a point; `ready()` is an
-/// already-resolved hit. `Clone` (Arc) so the resolver and the awaiter each hold
-/// one; `Send`/`Sync` so a reaper thread can arm what the main task awaits.
+/// A one-shot completion shared between whatever resolves it and the future that awaits it:
+/// `pending()` + `arm_on(stream)` fires when a stream reaches a point. `Clone` (Arc) so the
+/// resolver and the awaiter each hold one.
+///
+/// Its per-read use is GONE. `asyncfetch` armed one of these per cold read so `gpu.rs` could
+/// await each expert's bytes; the ticketed dataflow moved that dependency onto the device
+/// (INV-5) and the signals stayed on as a `hipLaunchHostFunc` per miss that nobody polled.
+/// What is left is `stream_signal` — one arm per stream per layer, which the decode loop
+/// genuinely awaits — so `ready()` (the resolved-on-arrival cache hit) has no callers either
+/// and is deleted; `Ticket::RESIDENT` says that now.
 #[derive(Clone)]
 pub struct Signal(Arc<SignalState>);
 
@@ -179,13 +185,6 @@ impl Signal {
             done: AtomicBool::new(false),
             waker: AtomicWaker::new(),
         }))
-    }
-
-    /// An already-resolved signal — a cache hit whose data is already present.
-    pub fn ready() -> Self {
-        let s = Self::pending();
-        s.0.done.store(true, Ordering::Release);
-        s
     }
 
     /// Fire this signal when `stream` reaches its current point (a host-func
@@ -331,6 +330,19 @@ impl Timeline {
         // SAFETY: `self.0` is live signal memory for the lifetime of `self`.
         unsafe { rivoli_timeline_completed(self.0) }
     }
+
+    /// TEARDOWN ONLY: force the counter to `value` from the host, releasing waits whose
+    /// producer will never run.
+    ///
+    /// `wait` has no error state — it blocks until the value arrives, forever — so a
+    /// producer that dies owing a ticket hangs every consumer already gated on it. That is
+    /// not hypothetical: the reaper's poison path abandoned a batch without signalling its
+    /// tickets, and the decode hung on the device rather than surfacing the fetch error.
+    /// Monotone, so releasing cannot move a slot backwards.
+    pub fn release(&self, value: u64) {
+        // SAFETY: `self.0` is live signal memory; the C side does a monotone CAS on it.
+        unsafe { rivoli_timeline_release(self.0, value) };
+    }
 }
 
 impl Drop for Timeline {
@@ -342,6 +354,11 @@ impl Drop for Timeline {
 
 #[cfg(test)]
 mod timeline_tests {
+    // A device handle either exists or the test cannot run at all, so `expect` IS the
+    // assertion here — matching `asyncfetch.rs`'s test module, which already says so.
+    // Without this the crate's `[lints.clippy] expect_used = "deny"` fails the whole
+    // `--all-targets` clippy run, which is the command CLAUDE.md tells an agent to use.
+    #![allow(clippy::expect_used)]
     use super::*;
 
     /// **INV-4: a wait may be enqueued BEFORE its producer exists, and still waits.**
@@ -364,6 +381,35 @@ mod timeline_tests {
         // below is what distinguishes "waited" from "did not block".
         rt.block_on(stream_signal(a.raw()).expect("completion"));
         assert!(t.completed() >= 1, "the waited-on value must have been reached");
+    }
+
+    /// **INV-6: a wait can always be released, so a dead producer cannot hang the device.**
+    ///
+    /// The other half of INV-4. Enqueuing a consumer before its producer is the whole design,
+    /// and `hipStreamWaitValue64` has no error state — it blocks until the value arrives,
+    /// forever — so the producer failing has to be expressible. It was not: the reaper's
+    /// poison path resolved a per-read `Signal` and left the timelines alone, which released
+    /// exactly nothing once the ticketed dataflow made the timeline the dependency. A fetch
+    /// error hung on the device instead of returning.
+    ///
+    /// What this actually proves is the mechanism, not the bookkeeping: a HOST store into
+    /// signal memory retires a device-side wait that was enqueued before it. Nothing in the
+    /// HIP docs promises that direction, and the teardown path is built on it.
+    #[test]
+    fn inv_6_a_host_release_retires_an_enqueued_wait() {
+        let t = Timeline::new().expect("timeline");
+        let s = HipStream::new().expect("stream");
+        // The wait goes in first, against a value NOTHING on any stream will ever signal —
+        // this is the dead-producer case, not a race with a slow one.
+        t.wait(s.raw(), 7).expect("wait enqueues against a value no stream will write");
+        t.release(7);
+        let rt = tokio::runtime::Builder::new_current_thread().build().expect("rt");
+        rt.block_on(stream_signal(s.raw()).expect("completion"));
+        assert!(t.completed() >= 7, "the host release must be what retired the wait");
+        // Monotone: releasing backwards would un-free a slot another consumer is gated on,
+        // turning a clean teardown into the deadlock it exists to prevent.
+        t.release(3);
+        assert_eq!(t.completed(), 7, "release must never move a timeline backwards");
     }
 
     /// Values only move forward, and `completed()` observes them without a sync — the

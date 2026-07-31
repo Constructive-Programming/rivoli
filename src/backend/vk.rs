@@ -2386,13 +2386,6 @@ impl Signal {
         }))
     }
 
-    /// An already-resolved signal — a cache hit whose data is already present.
-    pub fn ready() -> Self {
-        let s = Self::pending();
-        s.0.done.store(true, Ordering::Release);
-        s
-    }
-
 
     /// Force-resolve from the resolver side (an error path, so awaiters never hang).
     /// Idempotent.
@@ -4101,5 +4094,22 @@ impl Timeline {
         let Ok(g) = gpu() else { return 0 };
         // SAFETY: `self.0` is a live timeline semaphore owned by this process.
         unsafe { g.device.get_semaphore_counter_value(self.0) }.unwrap_or(0)
+    }
+
+    /// TEARDOWN ONLY: force the counter to `value` from the host, releasing waits whose
+    /// producer will never run. `gpustream::Timeline::release`'s twin, and it exists for the
+    /// same defect — a fetch error left tickets unsignalled and the device hung on them
+    /// instead of the decode returning the error.
+    ///
+    /// `vkSignalSemaphore` is the host-side signal operation and is a no-op below the
+    /// current value, so this is monotone for free where the HIP twin needs a CAS.
+    pub fn release(&self, value: u64) {
+        let Ok(g) = gpu() else { return };
+        if self.completed() >= value {
+            return;
+        }
+        let si = vk::SemaphoreSignalInfo::default().semaphore(self.0).value(value);
+        // SAFETY: `self.0` is a live timeline semaphore; `si` outlives the call.
+        let _ = unsafe { g.device.signal_semaphore(&si) };
     }
 }

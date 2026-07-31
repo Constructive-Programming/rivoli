@@ -6,6 +6,10 @@
 //! being true, and a reader would reasonably have skipped a check on the strength of it.
 //! A doc claim nobody can verify is worse than no claim; this makes the orphan — in either
 //! direction — a failing test rather than an archaeology exercise.
+// The registry file and its §8b table either parse or this test cannot run at all, so the
+// panic IS the assertion. Without this the crate's `[lints.clippy] expect_used = "deny"`
+// fails the whole `--all-targets` clippy run, which is the command CLAUDE.md prescribes.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 use std::collections::BTreeSet;
 
 fn ids(hay: &str, prefix: &str) -> BTreeSet<u32> {

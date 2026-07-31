@@ -19,6 +19,18 @@ confirmed live by re-running the probe coverage matrix rather than by a clean pa
 same matched run — and against 0% in increment 1, which was an arithmetic artifact of a
 stubbed `elapsed_ms` rather than a measurement.
 
+> **CORRECTION 2026-08-01 — the 96/97% figures are inflated; the finding they support is
+> not.** `fetch_hidden_pct` was `1 − (moe_wall − compute_gpu)/fetch_wall`, and `compute_gpu`
+> is a bracket that *contains* the stalls it was being used to rule out, so it read ~97% on
+> any configuration whatsoever — including `--direct-vmm-dma`, which printed 99% while
+> decoding at half speed. Recomputed against a measured all-resident counterfactual
+> (`docs/ARCHITECTURE.md` §3), ROCm is ~22%. The Vulkan number has not been re-measured.
+>
+> **What survives:** increment 1 ran every stream on one queue and genuinely hid nothing,
+> and increment 2's three queues genuinely overlap — that ordering was never in doubt and
+> is what the increment was for. What does not survive is reading 96% as "the fetch is
+> nearly free". It is not: ROCm is disk-bound, §3.
+
 Vulkan is still **1.87x slower** end to end (1.46 vs 2.73 tok/s), and the per-phase GPU spans
 now say why: **279 ms of the 320 ms/token gap is the MoE kernels themselves**, 2.1x slower
 than the HIP originals. The overlap invariant is upheld; what remains is kernel throughput,
@@ -1633,9 +1645,19 @@ table a comparison rather than two runs.
    `timestampValidBits`. Verified independently of the decode by
    `timestamps_measure_gpu_time_and_refuse_when_absent`: 0.661 ms of GPU for eight
    2048x2048 f32 GEMVs, i.e. 134 MB of weights at ~200 GB/s, inside a 0.948 ms wall.
+
+   > **2026-08-01: half right, and the wrong half was the headline.** The `elapsed_ms` fix
+   > IS real and the timestamps ARE measurements — that part stands. But
+   > `fetch_hidden_pct` consumed them through `moe_wall − compute_gpu`, and `compute_gpu`
+   > brackets the whole MoE phase including its stalls, so the ratio could not report
+   > anything but ~97% regardless of what the timestamps said. Fixing the clock did not fix
+   > the formula sitting on top of it. See `docs/ARCHITECTURE.md` §3.
+
 2. **The overlap invariant is upheld.** `moe/tok` is now almost entirely GPU time
-   (`gpu` ≈ `moe`), and the exposed fetch is a handful of ms against a fetch wall of
-   several hundred. That is the architecture working: the reaper streams while the MoE
+   (`gpu` ≈ `moe`) — which, note, is exactly what an unfixed `compute_gpu` bracket reports
+   whether or not it is true, so this bullet was never evidence for itself. The claim rests
+   instead on increment 1 vs 2 at fixed everything-else. That is the architecture working:
+   the reaper streams while the MoE
    queue computes.
 3. **THE REMAINING GAP AGAINST ROCm IS NOT OVERLAP, IT IS KERNEL THROUGHPUT — and the GPU
    spans now prove it rather than suggest it.** The wall difference is 685.9 − 366.1 =

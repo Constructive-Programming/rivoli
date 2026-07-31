@@ -1,18 +1,39 @@
 # docs/probes — standalone diagnostics
 
-Instruments, not tests. They are never run by CI and are not part of the crate build;
-each is its own tiny cargo package so it cannot perturb `rivoli`'s dependency graph or
-lint surface. You fire one when you need to establish a fact about the machine, then
-record the answer in the doc that depends on it.
+Instruments, not tests. They are never run by CI and are not part of the crate build —
+either a single-file `hipcc` program or its own tiny cargo package — so none of them can
+perturb `rivoli`'s dependency graph or lint surface. You fire one when you need to establish
+a fact about the machine, then record the answer in the doc that depends on it.
 
-**No probe currently lives here.** `vk_validation/` was deleted after its answers were
-recorded — see below. Everything from "Operating in this repo" onward is method that
-outlives any one probe: it is about writing guards and reading their silence, and it is
-why this file survives the crate it documented.
+Everything from "Operating in this repo" onward is method that outlives any one probe: it is
+about writing guards and reading their silence, and it is why this file survived the crate it
+originally documented.
 
 | probe | question it answered | status |
 |---|---|---|
+| `waitvalue_visibility.hip` | Is a `hipStreamWriteValue64` on one queue visible to a `hipStreamWaitValue64` enqueued on another? | 0 mismatches over 8.4e8 checks; INV-4 rests on it |
+| `fetch_batch.hip` | Is the demand fetch leaving drive bandwidth on the table? | **No** — ARCHITECTURE §3 |
+| `fetch_stream_ops.hip` | What does the reaper pay per completed read, above the NVMe? | the per-read `hipLaunchHostFunc` was dead; deleted 2026-08-01 |
 | `vk_validation/` | Do the Vulkan validation checkers actually fire on this driver + layer? | answered, deleted; source in git at `77b5500:docs/probes/vk_validation` |
+
+**Run every one of these under the GPU lock** (`flock /tmp/rivoli-gpu.lock -c '…'`) — they
+allocate device memory and take real bandwidth, so an unlocked probe corrupts whatever
+benchmark is running beside it, and vice versa. The two fetch probes are also the reason to
+say it twice: their whole point is to measure a drive under a *specific* concurrent load, so
+a stray neighbour does not just add noise, it answers a different question.
+
+## The two fetch probes, and why they are a pair
+
+`fetch_batch` asks what the DEVICE can do in the engine's exact shape; `fetch_stream_ops`
+asks what the ENGINE adds on top. Run apart they mislead in opposite directions — the first
+against an idle GPU flatters the drive by ~12%, the second says nothing about whether the
+drive was the limit. Together they bracket the answer, and the bracket is what showed the
+demand fetch has no bandwidth left to recover (ARCHITECTURE §3) while still turning up one
+piece of dead work on the reaper's critical path.
+
+Both are honest about a real hazard: **QD1 varies 7.7–12.5 GB/s across runs of the same
+probe.** Any conclusion that needs a single-digit percentage from them needs repeats, and the
+"~26% unexplained" this pair was written to chase turned out to be mostly that spread.
 
 ## `vk_validation` — trust a silence, but verify it first
 

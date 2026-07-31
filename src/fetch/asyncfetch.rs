@@ -1,11 +1,16 @@
 #![cfg(any(feature = "rocm", feature = "vulkan"))]
 //! Per-expert async loads: the io_uring→future adapter under the expert stream.
 //!
-//! Backend-independent: the fetch stream and the [`Signal`] both come from
+//! Backend-independent: the fetch stream and the [`Timeline`] both come from
 //! [`crate::backend`], and it is a REAL dedicated stream on both — a `hipStream_t` under
 //! `rocm`, its own `VkQueue` with its own command-buffer ring and timeline under `vulkan`.
-//! Measured overlap: 96% of fetch hidden on ROCm, 97% on Vulkan. (Increment 1 of the Vulkan
-//! port ran every stream on one queue and hid 0%; docs/VULKAN.md, "Increment 2: measured".)
+//! It is a real separate engine on both, and that is worth what the Vulkan port paid for it:
+//! increment 1 ran every stream on one queue and hid nothing at all (docs/VULKAN.md,
+//! "Increment 2: measured").
+//!
+//! The "96% of fetch hidden on ROCm, 97% on Vulkan" that used to be claimed here came from a
+//! metric that could not measure hiding — see `Profile::summary`, which now puts it at ~22%.
+//! Separate queues are still what makes ANY overlap possible; they were never worth 96%.
 //!
 //! `Stream::fetch()` rather than `Stream::new()` at the construction below, and that is not
 //! cosmetic: the Vulkan side maps the handle onto one of three queues and cannot infer which
@@ -15,15 +20,25 @@
 //! MoE layer the pipeline hands it a batch of cold reads; it queues+submits them
 //! (so they run concurrently on the NVMe), then reaps completions one at a time.
 //! Because [`Streamer::reap`] already kicks each read's bounce→slot copy on the
-//! fetch stream, the reaper just arms that read's [`Signal`] on the same stream —
-//! so `load(e)` resolves when the COPY lands, not merely the NVMe read. A cache hit
-//! never enters here; its load is [`Signal::ready`].
+//! fetch stream, the reaper just signals that read's [`Ticket`] on the same stream —
+//! so the ticket is satisfied when the COPY lands, not merely the NVMe read. A cache
+//! hit never enters here; it carries [`Ticket::RESIDENT`].
 //!
-//! This is the whole concurrency surface: the `StreamExt` pipeline above stays
-//! single-threaded on the decode loop, the reaper blocks off-thread, and the two
-//! meet only through `Signal` wakers.
+//! This is the whole concurrency surface, and it is now entirely device-side: the
+//! decode loop stays single-threaded, the reaper blocks off-thread, and the two meet
+//! only through the per-slot timelines. The one host round trip left — a `Signal` armed
+//! per read with `hipLaunchHostFunc` — was deleted once nothing polled it.
+//!
+//! ## What bounds it
+//!
+//! The demand fetch runs at ~10 GB/s and the drive delivers 7.7 GB/s at QD1 rising to
+//! ~13 GB/s at QD4 under the engine's own load (docs/probes/fetch_batch.hip), so a layer's
+//! batch is close to what its queue depth can buy. What is NOT close is the duty cycle: the
+//! ring only has work between a layer's routing and its MoE launch, so the drive idles
+//! ~35% of every token. Nothing here can fix that — a read cannot be issued before the
+//! router names it. See docs/ARCHITECTURE.md §4.
 
-use crate::backend::{Signal, Stream, Timeline};
+use crate::backend::{Stream, Timeline};
 use crate::fetch::stream::Streamer;
 use anyhow::{Result, anyhow, ensure};
 use std::os::fd::RawFd;
@@ -45,11 +60,16 @@ pub struct ReadSpec {
 // never dereferenced on the CPU; `fd` is a plain descriptor.
 unsafe impl Send for ReadSpec {}
 
-/// A layer's demand batch: the reads plus one [`Signal`] per read (index =
-/// io_uring `user_data`) that the reaper resolves as each copy lands.
+/// A layer's demand batch: the reads plus the ticket each one redeems.
+///
+/// There was a `Vec<Signal>` here too, one per read, armed on the fetch stream as each copy
+/// landed. Nothing awaited it — `gpu.rs` took the vec and dropped it — since the ticketed
+/// dataflow moved the dependency onto the device. It cost a `hipLaunchHostFunc` per read
+/// INSIDE the `io_wait` clock (7.2 us of enqueue each, 4% of the fetch stream's throughput;
+/// docs/probes/fetch_stream_ops.hip), and worse, it made the teardown path look correct
+/// while releasing nothing that anyone was waiting on.
 struct ReapJob {
     reads: Vec<ReadSpec>,
-    signals: Vec<Signal>,
     /// `tickets[i].value` is what the reaper signals on `tickets[i]`'s timeline once read
     /// `i`'s copy has been enqueued on the fetch stream. Assigned on the DECODE thread at
     /// submit, which is the whole point: a consumer can enqueue its wait before the reaper
@@ -89,7 +109,7 @@ impl Ticket {
 
 /// Owns the demand ring + fetch stream on a reaper thread; services one [`ReapJob`]
 /// per MoE layer. Reads submitted via [`submit`](Self::submit) resolve their
-/// per-read [`Signal`] when loaded.
+/// per-read [`Ticket`] when loaded.
 pub struct AsyncFetch {
     tx: Option<Sender<ReapJob>>,
     reaper: Option<JoinHandle<()>>,
@@ -206,17 +226,15 @@ impl AsyncFetch {
         self.io_wait_ns.load(Ordering::Relaxed)
     }
 
-    /// Submit a layer's cold reads; returns one pending [`Signal`] per read, in the
-    /// same order (index = `user_data`). Reads run concurrently on the NVMe; each
-    /// signal resolves when its bounce copy has landed on the fetch stream. Empty
-    /// `reads` returns an empty vec (an all-hit layer).
-    pub fn submit(&mut self, reads: Vec<ReadSpec>) -> Result<(Vec<Signal>, Vec<Ticket>)> {
+    /// Submit a layer's cold reads; returns one [`Ticket`] per read, in the same order.
+    /// Reads run concurrently on the NVMe; a ticket is satisfied once its read's bounce copy
+    /// has landed on the fetch stream. Empty `reads` returns an empty vec (an all-hit layer).
+    pub fn submit(&mut self, reads: Vec<ReadSpec>) -> Result<Vec<Ticket>> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(anyhow!("AsyncFetch poisoned by an earlier reaper error"));
         }
-        let signals: Vec<Signal> = reads.iter().map(|_| Signal::pending()).collect();
         if reads.is_empty() {
-            return Ok((signals, Vec::new()));
+            return Ok(Vec::new());
         }
         ensure!(
             reads.len() <= self.slot_next.len(),
@@ -234,17 +252,13 @@ impl AsyncFetch {
             self.slot_next[s] += 1;
             tickets.push(Ticket { slot: s as u16, value: self.slot_next[s] });
         }
-        let job = ReapJob {
-            reads,
-            signals: signals.clone(),
-            tickets: tickets.clone(),
-        };
+        let job = ReapJob { reads, tickets: tickets.clone() };
         self.tx
             .as_ref()
             .ok_or_else(|| anyhow!("AsyncFetch closed"))?
             .send(job)
             .map_err(|_| anyhow!("reaper thread gone"))?;
-        Ok((signals, tickets))
+        Ok(tickets)
     }
 }
 
@@ -314,13 +328,10 @@ fn reaper_loop(
     for job in rx {
         // Once poisoned, the ring is dirty (a prior job bailed mid-batch, leaving
         // undrained CQEs and stale queued/min_res). Touching it again would index a
-        // stale user_data → C-side OOB or a signals[u] panic that kills this thread
-        // and hangs every later awaiter. So don't: just resolve so nothing hangs (the
-        // slots hold stale bytes, which the forward's finiteness guard trips).
+        // stale user_data → C-side OOB or a panic that kills this thread and hangs
+        // every later consumer. So don't: abandon the ring and release the tickets.
         if poisoned.load(Ordering::Acquire) {
-            for s in &job.signals {
-                s.resolve();
-            }
+            release(&job, &slot_tl);
             continue;
         }
         let t = std::time::Instant::now();
@@ -328,13 +339,31 @@ fn reaper_loop(
         fetch_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if let Err(e) = r {
             // Fatal fetch error: poison (abandon the dirty ring for all later jobs),
-            // log, and resolve this job's signals so no awaiter hangs.
+            // log, and release this job's tickets so no consumer hangs. `run_job` may
+            // have signalled some of them already; `release` is monotone.
             tracing::error!("reaper: {e:#}");
             poisoned.store(true, Ordering::Release);
-            for s in &job.signals {
-                s.resolve();
-            }
+            release(&job, &slot_tl);
         }
+    }
+}
+
+/// Teardown: force every ticket in `job` to its value from the HOST, so consumers already
+/// gated on it stop waiting for a copy that will never be enqueued.
+///
+/// **This releases the ticket, not a `Signal`, and that is the whole point.** The poison
+/// path used to resolve one `Signal` per read and leave the timelines untouched. Once the
+/// ticketed dataflow moved the dependency onto the device, nothing awaited those signals and
+/// everything waited on the timelines — so a fetch error stopped surfacing as an error and
+/// started HANGING the device on a `hipStreamWaitValue64` whose value nothing would write.
+/// The teardown path kept releasing the thing that had become vestigial.
+///
+/// The slot's bytes are stale, which is correct to allow: `submit` fails fast from here on
+/// so the decode returns the real fetch error, and the forward's finiteness guard localises
+/// whatever the released kernels computed in the meantime.
+fn release(job: &ReapJob, slot_tl: &[Timeline]) {
+    for t in &job.tickets {
+        slot_tl[t.slot as usize].release(t.value);
     }
 }
 
@@ -374,12 +403,11 @@ fn run_job(
             .ok_or_else(|| anyhow!("completion for slot {slot}, which this batch never queued"))?;
         // Publish the ticket: enqueued on the fetch stream AFTER `reap` queued this read's
         // copy, so the timeline reaching this value means the copy has completed. This is
-        // what a consumer's `wait` is gated on.
+        // what a consumer's `wait` is gated on, and now the only thing published here — a
+        // `Signal::arm_on` used to follow, which is a `hipLaunchHostFunc` (a host round trip
+        // recorded INTO this stream) for a future nobody polled.
         let t = job.tickets[u];
         slot_tl[t.slot as usize].signal(fetch.raw(), t.value)?;
-        // Resolve when the copy (enqueued by `reap`) lands on the fetch stream. Kept as the
-        // error/teardown channel; nothing awaits it per-expert any more.
-        job.signals[u].arm_on(fetch)?;
     }
     let e_io = std::time::Instant::now();
     io_wait_ns.fetch_add(e_io.duration_since(t_io).as_nanos() as u64, Ordering::Relaxed);

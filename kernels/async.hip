@@ -126,3 +126,25 @@ extern "C" int rivoli_timeline_signal(void* stream, void* t, unsigned long long 
 extern "C" unsigned long long rivoli_timeline_completed(void* t) {
   return __atomic_load_n((unsigned long long*)t, __ATOMIC_ACQUIRE);
 }
+
+// Host-side RELEASE, for the teardown path only: force the counter to `value` so waits
+// already enqueued against it retire, even though the work that would have signalled them
+// will never run.
+//
+// This exists because a fetch error used to HANG the device. `hipStreamWaitValue64` has no
+// error state — it blocks until the value arrives, forever — so when the reaper abandoned a
+// poisoned ring without signalling that batch's tickets, every consumer already gated on
+// them waited on a value nothing would ever write. Resolving the per-read `Signal`s (which
+// is what the poison path did) released nothing: the ticket is the dependency, not the
+// signal.
+//
+// Monotone via CAS, never a bare store: values only ever increase per slot, and dropping one
+// backwards would un-release a slot some other consumer is already gated on — turning a
+// clean teardown into the deadlock it exists to prevent.
+extern "C" void rivoli_timeline_release(void* t, unsigned long long value) {
+  unsigned long long* p = (unsigned long long*)t;
+  unsigned long long cur = __atomic_load_n(p, __ATOMIC_ACQUIRE);
+  while (cur < value &&
+         !__atomic_compare_exchange_n(p, &cur, value, true, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE))
+    ;
+}

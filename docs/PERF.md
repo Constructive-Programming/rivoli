@@ -88,7 +88,10 @@ instead of implying it. See [TRACES.md](TRACES.md).
 
 **These spans OVERLAP and do not sum to wall — by design.** `io-wait` is the reaper thread
 blocked in `io_uring` while the decode thread computes; it is 54% of wall precisely because
-it is concurrent with it, and 95% of it is hidden. Forcing these into a partition is what
+it is concurrent with it. *(An earlier version of this line added "and 95% of it is hidden",
+which was the broken `fetch_hidden_pct`; it is ~22%, and the point being made here — that
+these spans overlap and must not be forced into a partition — never depended on it. See
+ARCHITECTURE.md §3.)* Forcing these into a partition is what
 broke the first version: it made `io-wait` a *derived* `moe_wall − compute_gpu` (a host
 clock minus a GPU clock) which reported **8.4 ms**, and `cpu` a residual. The measured
 io-wait is **183.7 ms — 20× larger**. The derived number was not measuring io-wait at all;
@@ -578,6 +581,23 @@ Grounded in the measured kernel profile.
 | 6a | lm_head load width | follow-up #5 | kernel **1.78×**; `tail` **−3.2 ms** in-engine; wall **~+1%, not noticeable** | low | **done** |
 | 6b | o_proj split-K / x-tiling | follow-up #2 | — | — | **refuted and reverted** |
 | 7 | `mla_absorb` restructure | follow-up #4 | **−0.80 ms/tok, measured** | med | **done** |
+| 8 | Faster demand fetch (deeper queues, split reads, unpinned arena) | B | — | — | **closed as negative 2026-08-01** — the drive is already giving what the queue depth buys; see below |
+
+> **Item 8 is a closed door, and it is worth knowing which door.** The demand fetch runs at
+> ~10 GB/s; `docs/probes/fetch_batch.hip` reproduces the engine's exact shape (pinned bounce
+> buffers, submit-*m*-drain-*m*, random 15.3 MB reads, GPU busy beside it) and the drive
+> gives **7.7 GB/s at QD1 and ~13 at QD4**. Weighted by the engine's own miss distribution
+> that predicts 15.8 s against a measured 18.3 s of `io_wait` over 64 tokens — inside the
+> probe's own run-to-run spread, which is itself ±25% at QD1. Splitting one expert read
+> K ways does raise its queue depth (1.94 → 1.44 ms), but only the 18% of layers that miss
+> exactly once benefit: **~2% overall**, for a real change to the ring. Measured, dropped.
+>
+> **What is NOT closed is the duty cycle.** The drive is idle ~35% of every token, because
+> the ring only has work between a layer's routing and its MoE launch. That is the whole
+> remaining fetch lever and it is not a fetch problem — it needs the routing known a layer
+> early, i.e. prediction (`CACHE_PILOT.md` for what the last attempt cost). Rank it against
+> #2, which moves *fewer bytes* and therefore shortens the busy 65% instead of filling the
+> idle 35%.
 
 **Suggested sequence, revised.** The original sequence led with #1 and treated #4 as the
 big multiplier; #1 has landed and #4 has a measured loss against it, so:
