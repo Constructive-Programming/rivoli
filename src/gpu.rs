@@ -16,14 +16,14 @@
 #![cfg(any(feature = "rocm", feature = "vulkan"))]
 
 use crate::attn::{AttnMode, streaming_rows};
-use crate::backend::{Timeline, 
-    Event, ExpertDesc, Signal, Stream, device_sync, launch_append_kv, launch_argmax,
+use crate::backend::{
+    Event, ExpertDesc, Signal, Stream, device_sync, fill_u32, launch_append_kv, launch_argmax,
     launch_attend, launch_embed_i8_row, launch_flag_nonfinite, launch_gather_rope,
     launch_gemv_f32, launch_gemv_fp8, launch_gemv_i8,
     launch_index_append, launch_index_head_route, launch_index_pool_push, launch_index_score,
     launch_index_topk, launch_layernorm, launch_mla_absorb_fp8, launch_mla_value_fp8,
-    launch_moe_expert_range, launch_moe_expert_range_i4, launch_moe_reduce, launch_rmsnorm,
-    launch_rope, launch_swiglu, launch_vadd, launch_vaxpy, stream_signal,
+    launch_moe_acc_drain, launch_moe_expert_range, launch_moe_expert_range_i4, launch_rmsnorm,
+    launch_rope, launch_swiglu, launch_vadd, stream_signal,
 };
 use crate::device::DeviceBuf;
 use crate::math::{E4M3_BLOCK, nll_of, route_into, topk_into};
@@ -51,6 +51,17 @@ use crate::pin::{Fp8Mlp, IndexerPin, LayerMlp, MlpVq, Pin, TRACE_WINDOW};
 /// Kept as a flag, not deleted: the counters and the plumbing are what make the next
 /// horizon/pressure question one run instead of one rebuild. Set `--hint-k 3` to re-enable.
 pub const DEFAULT_HINT_K: usize = 0;
+
+/// Fixed-point MoE accumulator rows: ONE PER STREAM (compute = 0, miss = 1), summed by
+/// `moe_acc_drain`. Not per expert — every expert on a stream shares its row, and integer
+/// addition associating is what makes that safe without ordering them.
+///
+/// Sharing a SINGLE row across both streams was measured and is worse: −90 µs on a 0-miss
+/// layer (the reduce is gone) but +106/+449/+825 µs at 1/3/6 misses. A 1-miss layer issues
+/// the same 9·hidden atomics as a 0-miss one, so the cost is cache lines bouncing between
+/// two queues, not the atomics. Splitting the rows keeps the reduce gone and the streams
+/// independent; the drain pays 2 reads instead of the old reduce's 9.
+const MOE_ACC_ROWS: usize = 2;
 
 const PILOT_H: [usize; 2] = [1, 2];
 /// Both horizons, always. The hint layer wants L+1 AND L+2 (a two-layer lead lets a veto
@@ -402,7 +413,10 @@ pub struct GpuEngine<'a> {
     mlp_g: DeviceBuf,
     mlp_u: DeviceBuf,
     moe_out: DeviceBuf,
-    moe_partial: DeviceBuf, // [slots*hidden] per-expert outputs (deterministic reduce)
+    /// [MOE_ACC_ROWS*hidden] u64 fixed-point MoE accumulator, drained into the residual at
+    /// end of layer. Replaced a [slots*hidden] f32 partial slab plus a reduce behind a
+    /// cross-stream join. One row PER STREAM — see `MOE_ACC_ROWS`.
+    moe_acc: DeviceBuf,
     moe_h: DeviceBuf,       // [slots*moe_inter] SwiGLU hidden scratch (VQ MoE)
     descs_buf: DeviceBuf,
     wexpert_buf: DeviceBuf,
@@ -456,26 +470,9 @@ pub struct GpuEngine<'a> {
     /// from the null stream the rest of the forward uses.
     compute_stream: Stream,
     /// Experts whose bytes are still arriving launch HERE, not on `compute_stream`. See
-    /// `Stream::miss` for why, and the launch loop for the join that puts the partials back
-    /// together.
+    /// `Stream::miss` for why. Both streams accumulate into the SAME `moe_acc` row and
+    /// need no join to do it — see `launch_moe_expert_range`.
     miss_stream: Stream,
-    /// Cross-stream join for the MoE reduce: the miss stream signals it once its experts are
-    /// done, and the compute stream waits on that value before reducing. Monotonic across
-    /// the whole run — a value is never reused, so a stale wait cannot be satisfied early.
-    moe_join: Timeline,
-    join_n: u64,
-    /// `RIVOLI_PARTIAL_RANGE` sampling: the observed magnitude range of MoE partials, which
-    /// sizes a fixed-point accumulator.
-    #[cfg(feature = "trace")]
-    pr_on: bool,
-    #[cfg(feature = "trace")]
-    pr_min: f32,
-    #[cfg(feature = "trace")]
-    pr_max: f32,
-    #[cfg(feature = "trace")]
-    pr_n: u64,
-    #[cfg(feature = "trace")]
-    pr_host: Vec<u8>,
     /// Compute-stream span events (bracket the MoE partials+reduce) + the expert
     /// stream's task monitor (idle = load-wait, poll = launch) — the accurate timing
     /// the async overlap hides from wall-clock.
@@ -627,7 +624,16 @@ impl<'a> GpuEngine<'a> {
             mlp_g: f(cfg.dense_inter)?,
             mlp_u: f(cfg.dense_inter)?,
             moe_out: f(cfg.hidden)?,
-            moe_partial: f(slots * cfg.hidden)?,
+            // Zeroed HERE and nowhere else: `moe_acc_drain` resets it as it converts, so
+            // steady state needs no memset. hipMalloc does not zero, and layer 0 would
+            // otherwise sum against whatever was resident.
+            moe_acc: {
+                let bytes = MOE_ACC_ROWS * cfg.hidden * 8;
+                let mut b = DeviceBuf::new(bytes)?;
+                // SAFETY: `b` owns `bytes`, just allocated.
+                unsafe { fill_u32(b.ptr_mut() as *mut u8, 0, bytes)? };
+                b
+            },
             moe_h: f(slots * cfg.moe_inter)?,
             descs_buf: DeviceBuf::new(slots * std::mem::size_of::<ExpertDesc>())?,
             wexpert_buf: f(slots)?,
@@ -665,18 +671,6 @@ impl<'a> GpuEngine<'a> {
             prof: Profile::default(),
             compute_stream: Stream::compute()?,
             miss_stream: Stream::miss()?,
-            moe_join: Timeline::new()?,
-            join_n: 0,
-            #[cfg(feature = "trace")]
-            pr_on: std::env::var("RIVOLI_PARTIAL_RANGE").is_ok(),
-            #[cfg(feature = "trace")]
-            pr_min: f32::INFINITY,
-            #[cfg(feature = "trace")]
-            pr_max: 0.0,
-            #[cfg(feature = "trace")]
-            pr_n: 0,
-            #[cfg(feature = "trace")]
-            pr_host: Vec::new(),
             moe_ev_start: Event::new()?,
             moe_ev_end: Event::new()?,
             #[cfg(feature = "trace")]
@@ -1472,19 +1466,17 @@ impl<'a> GpuEngine<'a> {
                 self.descs_buf
                     .copy_in_at(0, as_le_bytes(&self.descs_vq))?;
                 self.wexpert_buf.copy_in_at(0, as_le_bytes(&self.w))?;
-                // THE EXPERT STREAM (stream 1): each expert, once its load Signal
-                // resolves, launches its own partial on the compute stream. Concurrent
-                // loads (buffer_unordered) overlap the misses' fetch with the resident/
-                // loaded experts' compute; partials are independent rows so completion
-                // order is irrelevant. Then a fixed-order reduce on the same stream,
-                // awaited so moe_out is ready for the residual add. mlp bucket = the
-                // whole overlapped wall (fetch now hidden inside it).
+                // Two streams, no join: residents run on the compute stream while the
+                // misses' bytes are still landing on the miss stream, and BOTH atomically
+                // accumulate into the same fixed-point `moe_acc` row. Completion order is
+                // irrelevant because integer addition is associative — where the old f32
+                // partial slab needed disjoint rows plus a reduce plus a cross-stream wait
+                // to say the same thing. mlp bucket = the whole overlapped wall.
                 let x_c = xnp as *const f32;
-                let (h_c, part_c, out_c) = (
-                    self.moe_h.ptr_mut() as *mut f32,
-                    self.moe_partial.ptr_mut() as *mut f32,
-                    self.moe_out.ptr_mut() as *mut f32,
-                );
+                let h_c = self.moe_h.ptr_mut() as *mut f32;
+                let acc_c = self.moe_acc.ptr_mut() as *mut u64;
+                // SAFETY: `moe_acc` is MOE_ACC_ROWS·hidden u64; this is row 1, in bounds.
+                let acc_miss = unsafe { acc_c.add(hidden) };
                 // One descriptor buffer for both kernels — the int4 kernel reinterprets
                 // the same six-pointer bytes (at its slot offsets).
                 let descs_ptr = self.descs_buf.ptr() as *const ExpertDesc;
@@ -1603,13 +1595,13 @@ impl<'a> GpuEngine<'a> {
                     unsafe {
                         if f {
                             launch_moe_expert_range_i4(
-                                x_c, hidden, inter, i, j - i, descs_ptr, w_ptr, h_c, part_c,
+                                x_c, hidden, inter, i, j - i, descs_ptr, w_ptr, h_c, acc_c,
                                 cs_raw,
                             )?;
                         } else {
                             launch_moe_expert_range(
                                 x_c, hidden, inter, i, j - i, descs_ptr, cb0, cb1, cb2, w_ptr,
-                                h_c, part_c, cs_raw,
+                                h_c, acc_c, cs_raw,
                             )?;
                         }
                     }
@@ -1623,48 +1615,38 @@ impl<'a> GpuEngine<'a> {
                 // wait starts at the top of the layer and that latency is absorbed by the
                 // ~1557 us of resident compute running beside it.
                 //
-                // Both streams write `partial`, at DISJOINT rows — the same independence
-                // that already lets a run of experts batch into one dispatch. Ordering AND
-                // visibility across the join were probed rather than assumed
-                // (docs/probes/waitvalue_visibility.hip): 0 mismatches over 8.4e8 checks.
-                let mut any_miss = false;
+                // Misses accumulate into `moe_acc` ROW 1, residents into row 0, and the
+                // drain sums the two. No ordering between the streams is required at all —
+                // integers associate, so the split is a CONTENTION fix, not a correctness
+                // one (`MOE_ACC_ROWS` has the measurement). Cross-queue visibility was
+                // probed rather than assumed (docs/probes/waitvalue_visibility.hip): 0
+                // mismatches over 8.4e8 checks.
                 for e in 0..ndesc {
                     if tickets[e].is_resident() {
                         continue;
                     }
-                    any_miss = true;
                     self.pin.wait_on(tickets[e], ms_raw)?;
                     // SAFETY: as above; this expert's bytes are gated by the wait just
                     // enqueued on the same stream.
                     unsafe {
                         if fmt[e] {
                             launch_moe_expert_range_i4(
-                                x_c, hidden, inter, e, 1, descs_ptr, w_ptr, h_c, part_c, ms_raw,
+                                x_c, hidden, inter, e, 1, descs_ptr, w_ptr, h_c, acc_miss, ms_raw,
                             )?;
                         } else {
                             launch_moe_expert_range(
                                 x_c, hidden, inter, e, 1, descs_ptr, cb0, cb1, cb2, w_ptr, h_c,
-                                part_c, ms_raw,
+                                acc_miss, ms_raw,
                             )?;
                         }
                     }
                 }
-                // THE JOIN. `moe_reduce` needs every partial, so the compute stream waits for
-                // the miss stream's experts before reducing. Skipped entirely when the layer
-                // had no misses — most layers pay nothing for this.
-                //
-                // The signal is enqueued BEFORE the wait in program order, which matters on a
-                // backend where both handles are the same queue (Vulkan, see `Stream::miss`):
-                // there the signal is simply reached first, rather than deadlocking behind a
-                // wait for a value only it can produce.
-                //
-                // `join_n` never repeats, so a wait can never be satisfied by an earlier
-                // layer's signal — the bug a per-layer flag would have.
-                if any_miss {
-                    self.join_n += 1;
-                    self.moe_join.signal(ms_raw, self.join_n)?;
-                    self.moe_join.wait(cs_raw, self.join_n)?;
-                }
+                // THERE IS NO JOIN HERE ANY MORE, and its absence is the point. The
+                // compute stream used to wait on a timeline the miss stream signalled,
+                // because `moe_reduce` could not start until every partial row existed. With
+                // a fixed-point accumulator nothing between the two streams needs ordering:
+                // the only consumer of all experts is the drain, and that already sits
+                // behind the end-of-layer barrier.
                 // The load Signals are no longer awaited per expert — the GPU gates itself
                 // now. They remain the reaper's error/teardown channel (it resolves them on
                 // poison so nothing hangs), and NOT awaiting them is what removes ~9 host
@@ -1672,39 +1654,39 @@ impl<'a> GpuEngine<'a> {
                 // running at 38.8 GB/s in-engine against 91.8 GB/s for the same kernels in
                 // `examples/moe_bench.rs`.
                 drop(signals);
-                // SAFETY: partial holds ndesc·hidden f32; out is hidden f32; cs live.
-                unsafe { launch_moe_reduce(part_c, ndesc, hidden, out_c, cs_raw)? };
+                // BOTH streams, because neither one waits for the other any more. The
+                // drain below is the only thing that needs every expert, and it runs after
+                // this. `moe_ev_start`/`_end` still bracket honestly: `_end` records on an
+                // idle compute stream once both awaits have returned, so its timestamp is
+                // after the miss stream's experts too — the bracket did NOT narrow when the
+                // join left, which is the mis-measurement this file has shipped twice.
                 stream_signal(cs_raw)?.await;
-                // RIVOLI_PARTIAL_RANGE: sample the dynamic range of the values a fixed-point
-                // accumulator would have to represent exactly. The width needed is
-                // log2(max/min) + 24 mantissa bits + log2(E) carry bits, and guessing it is
-                // how a fixed-point design silently loses precision or overflows.
-                #[cfg(feature = "trace")]
-                if self.pr_on && l % 16 == 0 {
-                    let n = ndesc * hidden;
-                    self.pr_host.clear();
-                    self.moe_partial.copy_out_prefix(&mut self.pr_host, n * 4)?;
-                    for c in self.pr_host.chunks_exact(4) {
-                        let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]).abs();
-                        if v > 0.0 && v.is_finite() {
-                            self.pr_min = self.pr_min.min(v);
-                            self.pr_max = self.pr_max.max(v);
-                            self.pr_n += 1;
-                        }
-                    }
-                }
+                stream_signal(ms_raw)?.await;
                 self.prof.moe_wall_ns += tm.elapsed().as_nanos();
                 self.moe_ev_end.record(cs_raw)?;
             }
-            // SAFETY: residual add of the MLP contribution. `--moe-gain` applies ONLY
-            // on MoE layers — the 3 dense layers share this add, and attenuating them
-            // too would confound "the MoE branch is too strong" with "the MLP branch
-            // is". At g == 1.0 this is the plain `vadd`, bit for bit.
-            let mp = self.moe_out.ptr() as *const f32;
+            // Residual add of the MLP contribution. On a MoE layer the drain IS the add:
+            // it converts the fixed-point accumulator straight into `x` and resets it, so
+            // the conversion costs no extra pass. `--moe-gain` folds into the same multiply
+            // and applies ONLY here — the 3 dense layers must not be attenuated too, or
+            // "the MoE branch is too strong" and "the MLP branch is" stop being
+            // distinguishable.
+            //
+            // No barrier is needed before this despite both MoE streams having written
+            // `moe_acc`: they were awaited above.
+            // SAFETY: `x` is `hidden` device f32; `moe_acc` is `hidden` u64 and every
+            // stream that touched it has completed; `moe_out` is `hidden` f32.
             unsafe {
-                match (dense_mlp.is_none(), self.moe_gain) {
-                    (true, g) if g != 1.0 => launch_vaxpy(xp, mp, g, hidden)?,
-                    _ => launch_vadd(xp, mp, hidden)?,
+                match dense_mlp.is_none() {
+                    true => launch_moe_acc_drain(
+                        xp,
+                        self.moe_acc.ptr_mut() as *mut u64,
+                        hidden,
+                        MOE_ACC_ROWS,
+                        self.moe_gain,
+                        std::ptr::null_mut(),
+                    )?,
+                    false => launch_vadd(xp, self.moe_out.ptr() as *const f32, hidden)?,
                 }
             }
             // End-of-layer join: protects the reused descs/wexpert/moe_out buffers
@@ -2038,15 +2020,6 @@ impl<'a> GpuEngine<'a> {
         // LOOKA sits beside the profile rather than inside it: it is a property of the
         // ROUTER (would a prefetcher guess right?), not of where this run spent its time,
         // and it only exists in `trace` builds.
-        #[cfg(feature = "trace")]
-        if self.pr_on && self.pr_n > 0 {
-            let span = (self.pr_max / self.pr_min).log2();
-            tracing::info!(
-                "  partial range: |v| in [{:.3e}, {:.3e}] over {} samples | {:.1} exponent \
-                 bits; exact fixed-point needs ~{:.0} bits (+24 mantissa +4 carry)",
-                self.pr_min, self.pr_max, self.pr_n, span, span + 28.0,
-            );
-        }
         #[cfg(feature = "trace")]
         {
             tracing::info!("{}", self.looka.report());

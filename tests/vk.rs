@@ -50,7 +50,7 @@ use rivoli::vk::{
     launch_attend, launch_index_append, launch_index_head_route, launch_index_pool_push,
     launch_index_score, launch_index_topk, launch_layernorm, launch_mla_absorb_fp8,
     launch_mla_value_fp8, launch_moe_expert_range, launch_moe_expert_range_i4,
-    launch_moe_reduce, launch_rmsnorm, launch_rope,
+    launch_moe_acc_drain, launch_moe_reduce, launch_rmsnorm, launch_rope,
     launch_swiglu, launch_vadd, launch_vaxpy, memcpy_dtod,
 };
 use std::sync::atomic::Ordering;
@@ -3241,14 +3241,18 @@ fn moe_down_oracle(
     partial
 }
 
-fn moe_reduce_oracle(partial: &[f32], e_count: usize, hidden: usize) -> Vec<f32> {
+/// Host twin of `common.glsl::moe_fixed` — the SCALE and the rounding mode are the whole
+/// contract, so a drifted constant fails here rather than as a mystery 1e-4 in decode.
+fn moe_fixed(v: f32) -> i64 {
+    (v.clamp(-16384.0, 16384.0) * 17592186044416.0).round_ties_even() as i64
+}
+
+/// Host twin of `moe_acc_drain`: quantise each expert, sum EXACTLY, convert once.
+fn moe_acc_drain_oracle(partial: &[f32], e_count: usize, hidden: usize) -> Vec<f32> {
     (0..hidden)
         .map(|o| {
-            let mut acc = 0.0f32;
-            for e in 0..e_count {
-                acc += partial[e * hidden + o];
-            }
-            acc
+            let t: i64 = (0..e_count).map(|e| moe_fixed(partial[e * hidden + o])).sum();
+            (t as f64 / 17592186044416.0) as f32
         })
         .collect()
 }
@@ -3321,7 +3325,7 @@ fn moe_vq_matches_the_host_oracles() {
     let want_h = moe_gateup_oracle(&x, &descs, &gate_cb, &up_cb, hidden, inter, 0, e_count);
     let want_p =
         moe_down_oracle(&descs, &down_cb, &wexpert, &want_h, hidden, inter, 0, e_count);
-    let want_o = moe_reduce_oracle(&want_p, e_count, hidden);
+    let want_o = moe_acc_drain_oracle(&want_p, e_count, hidden);
 
     // Device-side: the six spans per expert, then a descriptor array of their addresses.
     let bufs: Vec<[Buf; 6]> = descs
@@ -3345,8 +3349,11 @@ fn moe_vq_matches_the_host_oracles() {
     let (gcb, ucb, dcb) = (dev(&u16b(&gate_cb)), dev(&u16b(&up_cb)), dev(&u16b(&down_cb)));
     let (xb, wb) = (dev(&f32b(&x)), dev(&f32b(&wexpert)));
     let mut hb = dev(&vec![0u8; e_count * inter * 4]);
-    let mut pb = dev(&vec![0u8; e_count * hidden * 4]);
-    let mut ob = poison(hidden * 4 + GUARD);
+    // ONE accumulator row (u64), zeroed, plus a zeroed `x` for the drain to add into —
+    // the drain is the residual add, so its output starts at 0 rather than poisoned. The
+    // GUARD past `hidden` stays poisoned and must survive.
+    let mut ab = dev(&vec![0u8; hidden * 8]);
+    let mut ob = dev(&[vec![0u8; hidden * 4], vec![0xFFu8; GUARD]].concat());
 
     // SAFETY: every buffer is live and of the documented size; descs holds e_count
     // six-address descriptors whose targets outlive the sync.
@@ -3363,30 +3370,36 @@ fn moe_vq_matches_the_host_oracles() {
             dcb.ptr() as *const u16,
             wb.ptr() as *const f32,
             hb.ptr_mut() as *mut f32,
-            pb.ptr_mut() as *mut f32,
+            ab.ptr_mut() as *mut u64,
             std::ptr::null_mut(),
         )
         .expect("expert range");
-        launch_moe_reduce(
-            pb.ptr() as *const f32,
-            e_count,
-            hidden,
+        launch_moe_acc_drain(
             ob.ptr_mut() as *mut f32,
+            ab.ptr_mut() as *mut u64,
+            hidden,
+            1,
+            1.0,
             std::ptr::null_mut(),
         )
-        .expect("reduce");
+        .expect("drain");
     }
     device_sync().expect("sync");
 
     let got_h = f32v(&readb(&hb, e_count * inter * 4));
-    let got_p = f32v(&readb(&pb, e_count * hidden * 4));
     let got_o = readb(&ob, hidden * 4 + GUARD);
-    assert_untouched(&got_o, hidden * 4, "moe_reduce");
+    assert_untouched(&got_o, hidden * 4, "moe_acc_drain");
+    // The accumulator was DRAINED, so it must read back all zeroes — the reset is what
+    // lets the next layer skip a memset, and a drain that forgot it would double-count
+    // silently from layer 1 onward.
+    assert!(
+        readb(&ab, hidden * 8).iter().all(|&b| b == 0),
+        "moe_acc_drain left the accumulator dirty"
+    );
 
     let mut shapes = Shapes::default();
     shapes.close(&want_h, &got_h, "moe_gateup_vq h512 i64 e3");
-    shapes.close(&want_p, &got_p, "moe_down_vq h512 i64 e3");
-    shapes.close(&want_o, &f32v(&got_o[..hidden * 4]), "moe_reduce h512 e3");
+    shapes.close(&want_o, &f32v(&got_o[..hidden * 4]), "moe_acc_drain h512 e3");
     shapes.assert_all_passed("moe vq");
 
     // THE FUSION PIN, WHICH THE TOLERANCE ABOVE CANNOT SEE.
@@ -3398,11 +3411,12 @@ fn moe_vq_matches_the_host_oracles() {
     // dot), so feeding the GPU's OWN `h` into the oracle removes silu — the only
     // unreproducible step — and what remains is the VQ dot and nothing else.
     //
-    // `moe_reduce` is likewise a plain ascending sum, so it pins exactly too.
+    // The fixed-point sum pins exactly too, and for a stronger reason than the f32 reduce
+    // did: integer addition has no rounding for a schedule to reorder, so this holds no
+    // matter which order the experts' atomics landed in.
     let pin_p = moe_down_oracle(&descs, &down_cb, &wexpert, &got_h, hidden, inter, 0, e_count);
-    assert_bit_identical(&pin_p, &got_p, "moe_down_vq (fed the GPU's own h)");
-    let pin_o = moe_reduce_oracle(&got_p, e_count, hidden);
-    assert_bit_identical(&pin_o, &f32v(&got_o[..hidden * 4]), "moe_reduce (fed the GPU's own partials)");
+    let pin_o = moe_acc_drain_oracle(&pin_p, e_count, hidden);
+    assert_bit_identical(&pin_o, &f32v(&got_o[..hidden * 4]), "moe_acc_drain (fed the GPU's own h)");
     v.check("moe_vq_matches_the_host_oracles");
 }
 
@@ -3419,7 +3433,7 @@ fn moe_guards_reject_degenerate_arguments() {
             launch_moe_expert_range(
                 p as *const f32, hidden, inter, 0, e_count,
                 p as *const rivoli::vk::ExpertDesc, p as *const u16, p as *const u16,
-                p as *const u16, p as *const f32, q as *mut f32, q as *mut f32,
+                p as *const u16, p as *const f32, q as *mut f32, q as *mut u64,
                 std::ptr::null_mut(),
             )
         };
@@ -3726,7 +3740,7 @@ fn deferred_launchers_refuse_rather_than_no_op() {
                     std::ptr::null::<ExpertDesc>(),
                     cf,
                     nf,
-                    nf,
+                    std::ptr::null_mut::<u64>(),
                     std::ptr::null_mut(),
                 )
                 .is_err(),

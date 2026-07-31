@@ -362,6 +362,7 @@ struct Pipes {
     moe_gateup_vq: Pipe,
     moe_down_vq: Pipe,
     moe_reduce: Pipe,
+    moe_acc_drain: Pipe,
 }
 
 // SAFETY: needed because ash models the DISPATCHABLE handles (`vk::Queue`,
@@ -691,6 +692,10 @@ impl Gpu {
         // ...which the shader dereferences as uint64_t buffer references.
         need(core.shader_int64 == vk::TRUE, "shaderInt64");
         need(v12.timeline_semaphore == vk::TRUE, "timelineSemaphore");
+        // The fixed-point MoE accumulator: every expert atomicAdds into a shared u64 row,
+        // which is what removes the reduce and the cross-stream join (common.glsl's
+        // MOE_ACC block). gfx1151 reports it; a device without it has no fallback path.
+        need(v12.shader_buffer_int64_atomics == vk::TRUE, "shaderBufferInt64Atomics");
         // The fp16 VQ codebook.
         need(v12.shader_float16 == vk::TRUE, "shaderFloat16");
         need(v11.storage_buffer16_bit_access == vk::TRUE, "storageBuffer16BitAccess");
@@ -810,6 +815,7 @@ impl Gpu {
         let mut v12 = vk::PhysicalDeviceVulkan12Features::default()
             .buffer_device_address(true)
             .timeline_semaphore(true)
+            .shader_buffer_int64_atomics(true)
             .shader_float16(true);
         let mut v13 = vk::PhysicalDeviceVulkan13Features::default()
             .subgroup_size_control(true)
@@ -1609,6 +1615,7 @@ impl Pipes {
             moe_gateup_vq: MoeGateUpPush,
             moe_down_vq: MoeDownPush,
             moe_reduce: MoeReducePush,
+            moe_acc_drain: MoeAccDrainPush,
         ))
     }
 }
@@ -3647,11 +3654,23 @@ push_struct! {
         down_cb: u64,
         wexpert: u64,
         h_in: u64,
-        partial: u64,
+        acc: u64,
         hidden: i32,
         inter: i32,
         e_start: i32,
         e_count: i32,
+    }
+}
+
+push_struct! {
+    /// Mirror of `moe_acc_drain.comp`'s push block.
+    MoeAccDrainPush {
+        x: u64,
+        acc: u64,
+        n: i32,
+        rows: i32,
+        gain: f32,
+        _pad: i32,
     }
 }
 
@@ -3716,7 +3735,7 @@ pub unsafe fn launch_moe_expert_range(
     down_cb: *const u16,
     wexpert: *const f32,
     h: *mut f32,
-    partial: *mut f32,
+    acc: *mut u64,
     stream: *mut std::ffi::c_void,
 ) -> Result<()> {
     let q = Q::parse(stream)?;
@@ -3750,7 +3769,7 @@ pub unsafe fn launch_moe_expert_range(
         down_cb: down_cb as u64,
         wexpert: wexpert as u64,
         h_in: h as u64,
-        partial: partial as u64,
+        acc: acc as u64,
         hidden: hidden as i32,
         inter: inter as i32,
         e_start: e_start as i32,
@@ -3764,7 +3783,39 @@ pub unsafe fn launch_moe_expert_range(
     )
 }
 
+/// `x[o] += gain·(Σ_r acc[r][o])·2⁻⁴⁴`, resetting `acc`. Matches
+/// `hip.rs::launch_moe_acc_drain`.
+///
+/// # Safety
+/// Device addresses of live [`Buf`]s: `x` (`n` f32), `acc` (`rows·n` u64). Every stream
+/// that accumulated into `acc` must already have completed.
+pub unsafe fn launch_moe_acc_drain(
+    x: *mut f32,
+    acc: *mut u64,
+    n: usize,
+    rows: usize,
+    gain: f32,
+    stream: *mut std::ffi::c_void,
+) -> Result<()> {
+    let q = Q::parse(stream)?;
+    ensure!(n > 0 && rows > 0, "moe_acc_drain: argument guard rejected");
+    ensure_word_aligned(acc as u64, "moe_acc_drain acc")?;
+    let g = gpu()?;
+    let push = MoeAccDrainPush {
+        x: x as u64,
+        acc: acc as u64,
+        n: n as i32,
+        rows: rows as i32,
+        gain,
+        _pad: 0,
+    };
+    g.dispatch_on(q, &g.pipes.moe_acc_drain, &push, groups(n))
+}
+
 /// `out[o] = Σ_e partial[e][o]`, e ascending. Matches `hip.rs::launch_moe_reduce`.
+///
+/// OFF THE DECODE PATH since [`launch_moe_acc_drain`] replaced it — retained as the f32
+/// reference the MoE oracle tests pin against.
 ///
 /// # Safety
 /// Device addresses of live [`Buf`]s: `partial` (`e·hidden` f32), `out` (`hidden` f32).
@@ -3830,7 +3881,7 @@ pub unsafe fn launch_moe_expert_range_i4(
     _descs: *const ExpertDesc,
     _wexpert: *const f32,
     _h: *mut f32,
-    _partial: *mut f32,
+    _acc: *mut u64,
     _stream: *mut std::ffi::c_void,
 ) -> Result<()> {
     Err(deferred("moe_expert_range_i4"))

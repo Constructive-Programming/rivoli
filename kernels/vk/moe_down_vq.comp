@@ -1,11 +1,14 @@
 // Pass 2 of the fused VQ-int3 MoE expert batch:
-//   partial[e·hidden + o] = w[e] · (down_eo · h[e])
+//   acc[o] += fixed(w[e] · (down_eo · h[e]))
 // One WAVE per (expert, row). GLSL twin of moe.hip::moe_down_vq.
 //
-// Each expert writes its OWN partial row — no atomics — which is what makes the result
-// schedule-independent no matter how the streaming pipeline carves experts into launches.
+// Every expert accumulates into ONE row, atomically, in fixed point. The result is
+// schedule-independent not because the writes are disjoint but because integer addition
+// is associative — a stronger property, and the one that let the reduce and the
+// cross-stream join leave the decode path. See common.glsl's MOE_ACC block.
 #version 450
 #extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_atomic_int64 : require
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
@@ -28,7 +31,7 @@ layout(push_constant) uniform Push {
     uint64_t down_cb;
     RoF32 wexpert;
     RoF32 h_in;
-    RwF32 partial;
+    RwU64 acc;
     int hidden;
     int inter;
     int e_start;
@@ -59,5 +62,5 @@ void main() {
 
     // LANE 0 ONLY. One multiply, no add — no contraction ambiguity to pin here, unlike
     // the dot itself.
-    if (lane == 0u) pc.partial.v[e * uint(pc.hidden) + o] = pc.wexpert.v[e] * dv;
+    if (lane == 0u) atomicAdd(pc.acc.v[o], moe_fixed(pc.wexpert.v[e] * dv));
 }

@@ -10,6 +10,41 @@
 #define WAVE 32
 #define ROWS_PER_BLOCK 8  // block = 256 threads = 8 waves → 8 output rows/block
 
+// ── Fixed-point MoE accumulator ─────────────────────────────────────────────────
+// Expert contributions are summed as INTEGERS at scale 2^-MOE_ACC_SHIFT, which makes
+// the sum ASSOCIATIVE: the result stops depending on which stream finished first. That
+// is what lets the per-expert partial rows, the `moe_reduce` over them, and the stream
+// join that had to precede it all leave the decode path — the join disappears rather
+// than moving, because the only thing that still needs every expert is the residual
+// add, which already sits behind the end-of-layer barrier.
+//
+// ONE i64, not the 128 bits ARCHITECTURE.md §12 sketched. That sketch sized the width
+// to represent the SMALLEST partial's full mantissa, which is the wrong question: the
+// error that matters is absolute against an order-1 output, not relative against a
+// 5e-11 term. Measured partials are |v| <= 15.25 over 21.5M samples, so at shift 44:
+//   overflow    Σ over E<=16 clamped terms <= 2^62, a full binade of slack, and the
+//               clamp is 1074x the observed worst case;
+//   truncation  EXACT for |v| >= 2^-21 (scaling by a power of two only moves the
+//               exponent, and llrintf of a value >= 2^24 is identity), and below that
+//               bounded by 2^-45 per term — 9 terms give <= 2.6e-13 against the ~8e-6
+//               of the f32 reduce it replaces.
+// A second limb would buy range there is already 1000x of and precision three orders
+// below what the f32 output can carry.
+// Only SHIFT is a choice; the other two DERIVE, so raising precision cannot silently
+// leave the overflow guard behind. MAX is the clamp that keeps E<=16 terms inside i64:
+// 16·MAX·2^SHIFT <= 2^62, i.e. MAX = 2^(58-SHIFT).
+#define MOE_ACC_SHIFT 44
+#define MOE_ACC_SCALE ((float)(1ull << MOE_ACC_SHIFT))
+#define MOE_ACC_MAX ((float)(1ull << (58 - MOE_ACC_SHIFT)))
+
+// f32 → fixed. ponytail: saturate, do not wrap. |v| > 2^14 means the model is already
+// broken, but integer overflow wraps to a FINITE wrong value that `flag_nonfinite`
+// cannot see, where saturation is monotone and shows up as a stuck output.
+__device__ __forceinline__ unsigned long long moe_fixed(float v) {
+    return (unsigned long long)llrintf(fminf(fmaxf(v, -MOE_ACC_MAX), MOE_ACC_MAX)
+                                       * MOE_ACC_SCALE);
+}
+
 // Sum a wave's partials into lane 0 (fixed __shfl_down order → deterministic).
 __device__ __forceinline__ float wave_sum(float v) {
     for (int o = WAVE / 2; o > 0; o >>= 1) v += __shfl_down(v, o, WAVE);

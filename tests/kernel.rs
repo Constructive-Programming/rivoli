@@ -7,7 +7,7 @@ use rivoli::gpustream::HipStream;
 use rivoli::hip::{
     ExpertDesc, attend_scratch_floats, device_sync, launch_argmax, launch_attend, launch_gemv_fp8,
     launch_gemv_i8, launch_gemv_vq, launch_index_topk, launch_mla_absorb_fp8, launch_mla_value_fp8,
-    launch_moe_expert_range, launch_moe_expert_range_i4, launch_moe_reduce, launch_vadd,
+    launch_moe_acc_drain, launch_moe_expert_range, launch_moe_expert_range_i4, launch_vadd,
 };
 use rivoli::math::{bf16_to_f32, e4m3_to_f32, f32_to_bf16, f32_to_e4m3, silu, softmax};
 use rivoli::quant::{VQ_DIM, VQ_K, matvec_fp8, matvec_i8, matvec_vq, quant_vq};
@@ -673,12 +673,14 @@ fn moe_vq_matches_reference() {
         dev(&f16b(&cbs[2])),
     );
     let mut hbuf = dev(&vec![0u8; e * inter * 4]);
-    let mut pbuf = dev(&vec![0u8; e * hidden * 4]);
+    // ONE u64 accumulator row, not e partial rows; obuf starts at 0 because the drain
+    // ADDS into it (it is the residual add).
+    let mut pbuf = dev(&vec![0u8; hidden * 8]);
     let mut obuf = dev(&vec![0u8; hidden * 4]);
     let _ = (vq_groups(hidden), vq_row_bytes(hidden)); // (layout used by quant/vq_expert)
-    // The production path: each expert computes its own partial via a single-expert
-    // range on a compute stream (exercising e_start indexing), then a fixed-order
-    // reduce — same as the async expert stream, minus the load overlap.
+    // The production path: each expert accumulates into the shared fixed-point row via a
+    // single-expert range on a compute stream (exercising e_start indexing), then one
+    // drain — same as the async expert stream, minus the load overlap.
     let stream = HipStream::new().expect("stream");
     unsafe {
         for k in 0..e {
@@ -694,22 +696,31 @@ fn moe_vq_matches_reference() {
                 g2.ptr() as *const u16,
                 wb.ptr() as *const f32,
                 hbuf.ptr_mut() as *mut f32,
-                pbuf.ptr_mut() as *mut f32,
+                pbuf.ptr_mut() as *mut u64,
                 stream.raw(),
             )
             .expect("launch moe_expert_range");
         }
-        launch_moe_reduce(
-            pbuf.ptr() as *const f32,
-            e,
-            hidden,
+        launch_moe_acc_drain(
             obuf.ptr_mut() as *mut f32,
+            pbuf.ptr_mut() as *mut u64,
+            hidden,
+            1,
+            1.0,
             stream.raw(),
         )
-        .expect("launch moe_reduce");
+        .expect("launch moe_acc_drain");
     }
     device_sync().expect("sync");
     assert_close(&want, &f32v(&obuf.copy_out().expect("out")), "moe_vq");
+    // The drain RESETS the accumulator, and that is load-bearing rather than tidy: it is
+    // why steady-state decode needs no memset before each layer's experts. A drain that
+    // forgot it would pass every single-layer check here and then double-count from layer
+    // 1 onward — silently, since the result stays finite and merely wrong.
+    assert!(
+        pbuf.copy_out().expect("acc").iter().all(|&b| b == 0),
+        "moe_acc_drain left the accumulator dirty"
+    );
 }
 
 /// int4 MoE (moe_gateup_i4 → moe_down_i4 → moe_reduce), GROUP scales, vs a
@@ -781,7 +792,9 @@ fn moe_i4_matches_reference() {
     });
     let (xb, wb) = (dev(&f32b(&x)), dev(&f32b(&w)));
     let mut hbuf = dev(&vec![0u8; e * inter * 4]);
-    let mut pbuf = dev(&vec![0u8; e * hidden * 4]);
+    // ONE u64 accumulator row, not e partial rows; obuf starts at 0 because the drain
+    // ADDS into it (it is the residual add).
+    let mut pbuf = dev(&vec![0u8; hidden * 8]);
     let mut obuf = dev(&vec![0u8; hidden * 4]);
     let stream = HipStream::new().expect("stream");
     unsafe {
@@ -795,19 +808,20 @@ fn moe_i4_matches_reference() {
                 descb.ptr() as *const ExpertDesc,
                 wb.ptr() as *const f32,
                 hbuf.ptr_mut() as *mut f32,
-                pbuf.ptr_mut() as *mut f32,
+                pbuf.ptr_mut() as *mut u64,
                 stream.raw(),
             )
             .expect("launch moe_expert_range_i4");
         }
-        launch_moe_reduce(
-            pbuf.ptr() as *const f32,
-            e,
-            hidden,
+        launch_moe_acc_drain(
             obuf.ptr_mut() as *mut f32,
+            pbuf.ptr_mut() as *mut u64,
+            hidden,
+            1,
+            1.0,
             stream.raw(),
         )
-        .expect("launch moe_reduce");
+        .expect("launch moe_acc_drain");
     }
     device_sync().expect("sync");
     assert_close(&want, &f32v(&obuf.copy_out().expect("out")), "moe_i4");
@@ -838,7 +852,7 @@ fn gpu_i4_expert(blk: &[u8], off: &[usize; 6], x: &[f32], hidden: usize, inter: 
     });
     let (xb, wb) = (dev(&f32b(x)), dev(&f32b(&[1.0f32])));
     let mut hbuf = dev(&vec![0u8; inter * 4]);
-    let mut pbuf = dev(&vec![0u8; hidden * 4]);
+    let mut pbuf = dev(&vec![0u8; hidden * 8]);
     let mut obuf = dev(&vec![0u8; hidden * 4]);
     let stream = HipStream::new().expect("stream");
     // SAFETY: all buffers are device-resident and sized for these dims; the stream is live.
@@ -852,12 +866,14 @@ fn gpu_i4_expert(blk: &[u8], off: &[usize; 6], x: &[f32], hidden: usize, inter: 
             descb.ptr() as *const ExpertDesc,
             wb.ptr() as *const f32,
             hbuf.ptr_mut() as *mut f32,
-            pbuf.ptr_mut() as *mut f32,
+            pbuf.ptr_mut() as *mut u64,
             stream.raw(),
         )
         .expect("launch i4");
-        launch_moe_reduce(pbuf.ptr() as *const f32, 1, hidden, obuf.ptr_mut() as *mut f32, stream.raw())
-            .expect("reduce");
+        launch_moe_acc_drain(
+            obuf.ptr_mut() as *mut f32, pbuf.ptr_mut() as *mut u64, hidden, 1, 1.0, stream.raw(),
+        )
+        .expect("drain");
     }
     device_sync().expect("sync");
     f32v(&obuf.copy_out().expect("out"))

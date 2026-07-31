@@ -53,6 +53,22 @@ float wave_sum(float v) {
 
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RoF32 { float v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer RwF32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer RwU64 { uint64_t v[]; };
+
+// ── Fixed-point MoE accumulator — twin of common.hpp's MOE_ACC block, which carries the
+//    width argument. The scale MUST match bit for bit: the two backends are compared
+//    against each other, and a shift that drifted would look like a kernel bug forever.
+#define MOE_ACC_SHIFT 44
+#define MOE_ACC_SCALE float(1ul << MOE_ACC_SHIFT)
+#define MOE_ACC_MAX float(1ul << (58 - MOE_ACC_SHIFT))
+
+// roundEven, not round(): GLSL's round() leaves halfway cases implementation-defined, and
+// llrintf (the HIP twin) is round-to-nearest-EVEN. Above 2^24 both are the identity, so
+// this only bites on the small terms — which is exactly where a silent backend divergence
+// would be hardest to notice.
+uint64_t moe_fixed(float v) {
+    return uint64_t(int64_t(roundEven(clamp(v, -MOE_ACC_MAX, MOE_ACC_MAX) * MOE_ACC_SCALE)));
+}
 
 // Max across a subgroup, into LANE 0. Same shuffle ladder and the same lane-0-only
 // caveat as wave_sum above. Unlike a sum this is EXACT — max does no rounding, so the

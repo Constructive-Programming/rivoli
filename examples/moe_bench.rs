@@ -2,12 +2,12 @@
 //!
 //! `examples/dot_bench.rs` cannot answer "how much slower are the Vulkan shaders?"
 //! because it measures `gemv_vq`/`gemv_i4`, which the Vulkan backend does not have. This
-//! measures `moe_expert_range` + `moe_reduce`, which both backends do have, at the
+//! measures `moe_expert_range` + `moe_acc_drain`, which both backends do have, at the
 //! engine's real dims — so the number is a like-for-like kernel comparison.
 //!
 //! Why it is needed: the in-engine `moe` bucket reads 675 ms on Vulkan against 276 ms on
 //! ROCm, but that bucket contains launch overhead, host-gated launch bubbles between
-//! per-expert `sig.await`s, and the reduce. Isolating the kernels separates
+//! per-expert `sig.await`s, and the drain. Isolating the kernels separates
 //! "the shaders are slow" from "the orchestration is slow", and only the first is a
 //! shader problem.
 //!
@@ -22,7 +22,7 @@
 //! bottom is what the gating buys: a build with no backend produces a binary that says so.
 #![allow(clippy::expect_used)]
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
-use rivoli::backend::{Event, ExpertDesc, Stream, device_sync, launch_moe_expert_range, launch_moe_reduce};
+use rivoli::backend::{Event, ExpertDesc, Stream, device_sync, launch_moe_acc_drain, launch_moe_expert_range};
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
 use rivoli::device::DeviceBuf;
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
@@ -95,7 +95,8 @@ fn main() {
     let x = dev(&f32b(&(0..HIDDEN).map(|_| (r.next() >> 8) as f32 / 1e7).collect::<Vec<_>>()));
     let w = dev(&f32b(&[1.0f32; NDESC]));
     let mut h = dev(&vec![0u8; NDESC * INTER * 4]);
-    let mut partial = dev(&vec![0u8; NDESC * HIDDEN * 4]);
+    // ONE accumulator row, not NDESC partial rows — every expert atomicAdds into it.
+    let mut acc = dev(&vec![0u8; HIDDEN * 8]);
     let mut out = dev(&vec![0u8; HIDDEN * 4]);
 
     // Descriptors point into the slab at each expert's six projection offsets.
@@ -136,7 +137,7 @@ fn main() {
     //
     // `batched` is one dispatch over all NDESC experts — the cleanest measure of shader
     // throughput. `per-expert` is NDESC dispatches of one expert each, which is what the
-    // ENGINE actually does: every partial is gated on its own `sig.await`, so the launches
+    // ENGINE actually does: every expert is gated on its own ticket, so the launches
     // cannot be batched. The difference between the two isolates PER-LAUNCH cost, and a
     // Vulkan launch is a record + submit where a HIP launch is just an enqueue.
     let mut run = |label: &str, iters: usize, per_expert: bool| {
@@ -154,15 +155,15 @@ fn main() {
                         dbuf.ptr() as *const ExpertDesc,
                         cb0.ptr() as *const u16, cb1.ptr() as *const u16, cb2.ptr() as *const u16,
                         w.ptr() as *const f32, h.ptr_mut() as *mut f32,
-                        partial.ptr_mut() as *mut f32, stream.raw(),
+                        acc.ptr_mut() as *mut u64, stream.raw(),
                     )
                     .expect("moe");
                 }
-                launch_moe_reduce(
-                    partial.ptr() as *const f32, NDESC, HIDDEN,
-                    out.ptr_mut() as *mut f32, stream.raw(),
+                launch_moe_acc_drain(
+                    out.ptr_mut() as *mut f32, acc.ptr_mut() as *mut u64, HIDDEN, 1, 1.0,
+                    stream.raw(),
                 )
-                .expect("reduce");
+                .expect("drain");
             }
         }
         device_sync().expect("sync");
@@ -182,15 +183,15 @@ fn main() {
                         dbuf.ptr() as *const ExpertDesc,
                         cb0.ptr() as *const u16, cb1.ptr() as *const u16, cb2.ptr() as *const u16,
                         w.ptr() as *const f32, h.ptr_mut() as *mut f32,
-                        partial.ptr_mut() as *mut f32, stream.raw(),
+                        acc.ptr_mut() as *mut u64, stream.raw(),
                     )
                     .expect("moe");
                 }
-                launch_moe_reduce(
-                    partial.ptr() as *const f32, NDESC, HIDDEN,
-                    out.ptr_mut() as *mut f32, stream.raw(),
+                launch_moe_acc_drain(
+                    out.ptr_mut() as *mut f32, acc.ptr_mut() as *mut u64, HIDDEN, 1, 1.0,
+                    stream.raw(),
                 )
-                .expect("reduce");
+                .expect("drain");
             }
         }
         ev1.record(stream.raw()).expect("ev1");

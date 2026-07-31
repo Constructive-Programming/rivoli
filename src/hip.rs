@@ -42,7 +42,7 @@ unsafe extern "C" {
         descs: *const ExpertDesc,
         wexpert: *const f32,
         h: *mut f32,
-        partial: *mut f32,
+        acc: *mut u64,
         stream: *mut c_void,
     ) -> i32;
 
@@ -59,7 +59,16 @@ unsafe extern "C" {
         down_cb: *const u16,
         wexpert: *const f32,
         h: *mut f32,
-        partial: *mut f32,
+        acc: *mut u64,
+        stream: *mut c_void,
+    ) -> i32;
+
+    fn rivoli_moe_acc_drain_s(
+        x: *mut f32,
+        acc: *mut u64,
+        n: i32,
+        rows: i32,
+        gain: f32,
         stream: *mut c_void,
     ) -> i32;
 
@@ -274,11 +283,15 @@ pub unsafe fn fill_u32(dst: *mut u8, pat: u32, bytes: usize) -> Result<()> {
 }
 
 /// Streaming MoE: gate/up + down for the absolute expert range `[e_start,
-/// e_start+e_count)` on `stream`, writing each expert's own `h`/`partial` rows.
-/// Reduce with [`launch_moe_reduce`] once every range's partials have landed.
+/// e_start+e_count)` on `stream`, atomically accumulating into the shared fixed-point
+/// `acc` row. Drain it with [`launch_moe_acc_drain`] once every range has landed.
+///
+/// `acc` is `hidden` u64 — ONE row, not `e·hidden`. Ranges on DIFFERENT streams may
+/// accumulate concurrently and the result is unchanged, because integer addition is
+/// associative; that is the whole reason this is not an f32 slab plus a reduce.
 ///
 /// # Safety
-/// Every device pointer (`descs`/codebooks/`wexpert`/`x`/`h`/`partial`) must outlive
+/// Every device pointer (`descs`/codebooks/`wexpert`/`x`/`h`/`acc`) must outlive
 /// `stream`'s completion — await its [`Signal`](crate::gpustream::Signal).
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn launch_moe_expert_range(
@@ -293,7 +306,7 @@ pub unsafe fn launch_moe_expert_range(
     down_cb: *const u16,
     wexpert: *const f32,
     h: *mut f32,
-    partial: *mut f32,
+    acc: *mut u64,
     stream: *mut c_void,
 ) -> Result<()> {
     // SAFETY: caller's pointer contract; stream is a live HipStream handle.
@@ -310,7 +323,7 @@ pub unsafe fn launch_moe_expert_range(
             down_cb,
             wexpert,
             h,
-            partial,
+            acc,
             stream,
         )
     };
@@ -319,11 +332,11 @@ pub unsafe fn launch_moe_expert_range(
 
 /// int4 counterpart of [`launch_moe_expert_range`]: gate/up + down for the absolute
 /// range `[e_start, e_start+e_count)` on `stream`, decoding int4 (f32 group scales).
-/// `descs` are [`ExpertDesc`]; partials land in the same `partial` slab and are
-/// summed by [`launch_moe_reduce`], so int4 experts share the VQ reduce.
+/// `descs` are [`ExpertDesc`]; contributions land in the same fixed-point `acc` row,
+/// so int4 and VQ experts of one layer mix freely within a batch.
 ///
 /// # Safety
-/// Every device pointer (`descs`/packed weights/`wexpert`/`x`/`h`/`partial`) must
+/// Every device pointer (`descs`/packed weights/`wexpert`/`x`/`h`/`acc`) must
 /// outlive `stream`'s completion — await its [`Signal`](crate::gpustream::Signal).
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn launch_moe_expert_range_i4(
@@ -335,7 +348,7 @@ pub unsafe fn launch_moe_expert_range_i4(
     descs: *const ExpertDesc,
     wexpert: *const f32,
     h: *mut f32,
-    partial: *mut f32,
+    acc: *mut u64,
     stream: *mut c_void,
 ) -> Result<()> {
     // SAFETY: caller's pointer contract; stream is a live HipStream handle.
@@ -349,14 +362,46 @@ pub unsafe fn launch_moe_expert_range_i4(
             descs,
             wexpert,
             h,
-            partial,
+            acc,
             stream,
         )
     };
     check(r, "moe_expert_range_i4")
 }
 
+/// Drain the fixed-point MoE accumulator into the residual:
+/// `x[o] += gain·(Σ_r acc[r][o])·2⁻⁴⁴`, resetting `acc` to zero for the next layer.
+///
+/// `rows` is ONE ROW PER STREAM, not per expert. Every expert on a given stream shares a
+/// row; separate streams get separate rows because sharing one measured +825 µs on a
+/// 6-miss layer — same atomic count as a 0-miss layer, so the cost was cache lines
+/// bouncing between queues, not the atomics themselves.
+///
+/// This IS the residual add on a MoE layer — it replaces [`launch_vadd`] there rather
+/// than running before it, so the convert costs no extra pass and needs no barrier of
+/// its own: the end-of-layer `device_sync` already stands between this and the next
+/// layer's first atomic.
+///
+/// # Safety
+/// `x` and `acc` hold `n` f32 / `n` u64; EVERY stream that accumulated into `acc` must
+/// already have completed.
+pub unsafe fn launch_moe_acc_drain(
+    x: *mut f32,
+    acc: *mut u64,
+    n: usize,
+    rows: usize,
+    gain: f32,
+    stream: *mut c_void,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
+    let r = unsafe { rivoli_moe_acc_drain_s(x, acc, n as i32, rows as i32, gain, stream) };
+    check(r, "moe_acc_drain")
+}
+
 /// Fixed-order reduce `out[o] = Σ_e partial[e][o]` over all `e` experts, on `stream`.
+///
+/// OFF THE DECODE PATH since [`launch_moe_acc_drain`] replaced it — retained as the f32
+/// reference the MoE oracle tests pin against.
 ///
 /// # Safety
 /// `partial` holds `e·hidden` f32 (all ranges landed); `out` holds `hidden` f32.

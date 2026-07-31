@@ -54,12 +54,14 @@ extern "C" __global__ void moe_gateup_vq(
     if (lane == 0) h_out[(size_t)e * inter + j] = siluf(g) * u;
 }
 
-// Pass 2: partial[e·hidden + o] = w[e] · (down_eo · h[e]). Each expert writes its
-// own partial row (no atomics → schedule-independent). Same absolute-range form.
+// Pass 2: acc[o] += fixed(w[e] · (down_eo · h[e])). Every expert accumulates into ONE
+// row, atomically, in fixed point — so the result is schedule-independent not because
+// the writes are disjoint but because integer addition is associative. Same
+// absolute-range form. See common.hpp's MOE_ACC_SHIFT block for the width argument.
 extern "C" __global__ void moe_down_vq(
     int hidden, int inter, int e_start, int e_count, const ExpertDescVq* __restrict__ descs,
     const __half* __restrict__ down_cb, const float* __restrict__ wexpert,
-    const float* __restrict__ h_in, float* __restrict__ partial) {
+    const float* __restrict__ h_in, unsigned long long* __restrict__ acc) {
     int lane = threadIdx.x & (WAVE - 1);
     size_t r = (size_t)blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / WAVE;
     if (r >= (size_t)e_count * hidden) return;
@@ -69,10 +71,31 @@ extern "C" __global__ void moe_down_vq(
     size_t rb = vq_rb(inter), ng = vq_ng(inter);
     const float* he = h_in + (size_t)e * inter;
     float dv = dot_vq_wave(he, d.down_indices + (size_t)o * rb, d.down_scales + (size_t)o * ng, down_cb, inter, lane);
-    if (lane == 0) partial[(size_t)e * hidden + o] = wexpert[e] * dv;
+    if (lane == 0) atomicAdd(&acc[o], moe_fixed(wexpert[e] * dv));
 }
 
-// out[o] = Σ_e partial[e][o], e ASCENDING — fixed order → deterministic decode.
+// acc → f32, folded into the residual add: x[o] += gain · (acc[o] · 2^-MOE_ACC_SHIFT),
+// and the accumulator is RESET here for the next layer. Resetting in the drain rather
+// than memsetting before the experts is what keeps the miss stream free of a start-of-
+// layer dependency: the end-of-layer device_sync already separates this store from the
+// next layer's first atomic.
+//
+// double, not float, for the convert: acc reaches 2^48 and f32 would round it away.
+extern "C" __global__ void moe_acc_drain(
+    float* __restrict__ x, unsigned long long* __restrict__ acc, int n, int rows, float gain) {
+    int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= n) return;
+    long long t = 0;
+    for (int r = 0; r < rows; ++r) {
+        t += (long long)acc[(size_t)r * n + o];
+        acc[(size_t)r * n + o] = 0ull;
+    }
+    x[o] += gain * (float)((double)t / (double)MOE_ACC_SCALE);
+}
+
+// out[o] = Σ_e partial[e][o], e ASCENDING. OFF THE DECODE PATH since the fixed-point
+// accumulator replaced the partial slab — kept as the f32 REFERENCE the oracle tests
+// pin against (and as the shape `tests/vk.rs` uses to probe cross-queue visibility).
 extern "C" __global__ void moe_reduce(
     const float* __restrict__ partial, int e_count, int hidden, float* __restrict__ out) {
     int o = blockIdx.x * blockDim.x + threadIdx.x;
@@ -91,7 +114,7 @@ extern "C" __global__ void moe_reduce(
 extern "C" int rivoli_moe_expert_range(
     const float* x, int hidden, int inter, int e_start, int e_count, const void* descs,
     const __half* gate_cb, const __half* up_cb, const __half* down_cb, const float* wexpert,
-    float* h, float* partial, void* stream) {
+    float* h, unsigned long long* acc, void* stream) {
     if (hidden <= 0 || inter <= 0 || e_count <= 0 || e_start < 0) return 1001;
     const ExpertDescVq* d = (const ExpertDescVq*)descs;
     hipStream_t s = (hipStream_t)stream;
@@ -103,8 +126,18 @@ extern "C" int rivoli_moe_expert_range(
     if (e != hipSuccess) return -(int)e;
     size_t rows_b = (size_t)e_count * hidden;
     hipLaunchKernelGGL(moe_down_vq, dim3((rows_b + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
-                       dim3(256), 0, s, hidden, inter, e_start, e_count, d, down_cb, wexpert, h, partial);
+                       dim3(256), 0, s, hidden, inter, e_start, e_count, d, down_cb, wexpert, h, acc);
     e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+extern "C" int rivoli_moe_acc_drain_s(float* x, unsigned long long* acc, int n, int rows,
+                                      float gain, void* stream) {
+    if (n <= 0 || rows <= 0) return 1001;
+    hipGetLastError();
+    hipLaunchKernelGGL(moe_acc_drain, dim3((n + 255) / 256), dim3(256), 0, (hipStream_t)stream,
+                       x, acc, n, rows, gain);
+    hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
 
@@ -154,7 +187,8 @@ extern "C" __global__ void moe_gateup_i4(
 
 extern "C" __global__ void moe_down_i4(
     int hidden, int inter, int e_start, int e_count, const ExpertDescI4* __restrict__ descs,
-    const float* __restrict__ wexpert, const float* __restrict__ h_in, float* __restrict__ partial) {
+    const float* __restrict__ wexpert, const float* __restrict__ h_in,
+    unsigned long long* __restrict__ acc) {
     int lane = threadIdx.x & (WAVE - 1);
     size_t r = (size_t)blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / WAVE;
     if (r >= (size_t)e_count * hidden) return;
@@ -164,12 +198,12 @@ extern "C" __global__ void moe_down_i4(
     size_t rb_i = (size_t)((inter + 1) / 2), ng_i = i4_ng(inter);
     const float* he = h_in + (size_t)e * inter;
     float dv = dot_i4_wave(he, d.down_packed + (size_t)o * rb_i, d.down_scale + (size_t)o * ng_i, inter, lane);
-    if (lane == 0) partial[(size_t)e * hidden + o] = wexpert[e] * dv;
+    if (lane == 0) atomicAdd(&acc[o], moe_fixed(wexpert[e] * dv));
 }
 
 extern "C" int rivoli_moe_expert_range_i4(
     const float* x, int hidden, int inter, int e_start, int e_count, const void* descs,
-    const float* wexpert, float* h, float* partial, void* stream) {
+    const float* wexpert, float* h, unsigned long long* acc, void* stream) {
     if (hidden <= 0 || inter <= 0 || e_count <= 0 || e_start < 0) return 1001;
     const ExpertDescI4* d = (const ExpertDescI4*)descs;
     hipStream_t s = (hipStream_t)stream;
@@ -181,7 +215,7 @@ extern "C" int rivoli_moe_expert_range_i4(
     if (e != hipSuccess) return -(int)e;
     size_t rows_b = (size_t)e_count * hidden;
     hipLaunchKernelGGL(moe_down_i4, dim3((rows_b + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK),
-                       dim3(256), 0, s, hidden, inter, e_start, e_count, d, wexpert, h, partial);
+                       dim3(256), 0, s, hidden, inter, e_start, e_count, d, wexpert, h, acc);
     e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

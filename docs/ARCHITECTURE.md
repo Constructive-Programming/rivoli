@@ -462,56 +462,124 @@ See `docs/PERF.md` for the performance roadmap, `MODES.md` for the format/policy
 
 ---
 
-## 12. Exact fixed-point MoE accumulation — measured design inputs (2026-07-31)
+## 12. Fixed-point MoE accumulation — SHIPPED 2026-07-31
 
-Plan of record for removing the reduce's cross-stream join *without* trading away
-determinism. Both inputs were probed, because both were load-bearing guesses.
+Replaces the per-expert f32 partial slab, the `moe_reduce` over it, and the cross-stream
+join that had to precede it. Every expert `atomicAdd`s its contribution into a shared u64
+row at scale 2^-44; `moe_acc_drain` converts once and resets, folded into the residual add.
 
-**Why fixed point.** The join exists because `moe_reduce` needs every partial before any
-output element is final, and f32 addition is not associative — so letting experts accumulate
-as they arrive would make the result depend on arrival order. **Integer** addition is
-associative and commutative, so a fixed-point accumulator makes arrival order irrelevant:
-no partials, no reduce kernel, no join, and experts land as they finish.
+**Why fixed point.** `moe_reduce` needed every partial before any output element was final,
+and f32 addition is not associative — so letting experts accumulate as they arrived would
+have made the result depend on arrival order. **Integer** addition is associative, so
+arrival order stops mattering: no partials, no reduce, no join.
 
-Crucially this is a STRONGER guarantee than the alternative (a fixed index partition, each
-stream reducing its own half). That alternative's determinism holds only while the partition
-stays fixed — and its own documented drawback is load imbalance, whose obvious fix is to
-balance the partition by miss count, which is exactly what breaks it. That is the `hit` mask
-trap again: the natural optimisation is incentivised to violate the correctness property.
-Fixed point has no such property to break.
+This is a STRONGER guarantee than the alternative (a fixed index partition, each stream
+reducing its own half). That alternative's determinism holds only while the partition stays
+fixed — and its documented drawback is load imbalance, whose obvious fix is to balance the
+partition by miss count, which is exactly what breaks it. That is the `hit` mask trap again:
+the natural optimisation is incentivised to violate the correctness property. Fixed point
+has no such property to break. Measured confirmation: the one-row and two-row layouts
+(below) produce BYTE-IDENTICAL output over 128 tokens — 86270/33130 hit/miss either way.
 
-### Probe 1 — can Vulkan express it? YES
+### Width: 64 bits. The 128-bit conclusion recorded here on 2026-07-30 was wrong.
 
-`VK_KHR_shader_atomic_int64`, `shaderBufferInt64Atomics = true` on gfx1151. So the limb
-atomics are available on both backends and the waist holds.
+The probe stands: `|v| in [5.224e-11, 1.525e1]` over 21,454,848 samples, 38.1 exponent bits.
+What was wrong was the question asked of it — "what width represents the SMALLEST partial's
+full mantissa?", which gives 66 bits and hence two limbs. But the error that matters is
+ABSOLUTE against an order-1 output, not relative against a 5e-11 term. At shift 44 in a
+single i64:
 
-### Probe 2 — how wide? 128 BITS, and that is 2x more than needed
+| | |
+|---|---|
+| overflow | Σ over E≤16 clamped terms ≤ 2^62, a full binade of slack; the clamp is 1074x the observed worst case |
+| quantisation | EXACT for \|v\| ≥ 2^-21; below that ≤ 2^-45 per term, so ≤ 2.6e-13 over 9 terms |
+| vs. today | the f32 tree it replaces carries ~8e-6 — this is ~7 orders better |
 
-Sampled every 16th MoE layer over 24 tokens (`RIVOLI_PARTIAL_RANGE=1`, trace builds):
+A second limb buys range there is already 1000x of and precision three orders below what the
+f32 output can carry. It would also double the atomic traffic. So: one u64, half the atomics
+of the sketch, and `MOE_ACC_SCALE`/`MOE_ACC_MAX` now DERIVE from `MOE_ACC_SHIFT` in both
+`common.hpp` and `common.glsl` — raising precision cannot silently leave the guard behind.
+
+Note this is *not* "one rounding instead of eight", as the sketch claimed: it is nine
+quantisations plus one convert. The claim that survives is the bound in the table.
+
+### Measured: the join was free, the reduce was free, the CONTENTION was not
+
+5 runs base, 5 one-row, 3 two-row (int3-vq/dense/lru, `--max-mem 115`, 128 tokens). `moe`
+µs/layer bucketed by miss count, which is the honest instrument here — see the confound
+below:
+
+| misses/layer | base | 1 row | 2 rows | 2 rows vs base |
+|---|---|---|---|---|
+| 0 | 1607 | 1611 | 1598 | −0.5% |
+| 1 | 2074 | 1983 | 1877 | **−9.5%** |
+| 2 | 3359 | 3238 | 2983 | **−11.2%** |
+| 3 | 4643 | 4514 | 4142 | **−10.8%** |
+| 6 | 8466 | 8447 | 7769 | −8.2% |
+
+marginal µs per miss: **1191 → 1187 → 1074**. tok/s means 2.538 / 2.550 / 2.687.
+
+**The join and the reduce cost nothing, and the 0-miss row proves it** — that row is the one
+where they are the ONLY things that changed, and it moved 1607 → 1611 µs. The join was never
+on the critical path: a host-side `stream_signal(cs).await` already sat right after the
+reduce, so the device join only spared the reduce a round trip it was not taking. Anyone
+reaching for "remove a join, gain throughput" on this engine should read that row first.
+
+The win is elsewhere and was found by accident. A single shared accumulator row made every
+layer WITH misses slower — up to +825 µs at 6 misses — while 0-miss layers got faster. A
+1-miss layer issues the same 9·hidden atomics as a 0-miss layer, so the variable was not
+atomic volume but the two queues bouncing the same cache lines. One row PER STREAM
+(`gpu.rs::MOE_ACC_ROWS`) recovers it and then some.
+
+**Confound, stated because tok/s hides it.** This change moves the output by design, so it
+moves the routing: base decodes at 152.69 miss/tok, the accumulator builds at 158.56 — ~4%
+more bytes fetched for the same wall. A tok/s comparison charges that to the change. The
+bucket table controls for it; the tok/s column does not.
+
+**Not comparable to the 3.05 tok/s recorded for the pre-ticket engine.** That run was 131.91
+miss/tok at 78.0% hit against today's 152.69 at 74.6%. Reading the difference as a
+regression would be charging a workload change to a code change.
+
+### Implementation
+
+- `moe_down_vq` / `moe_down_i4` (and the GLSL twin) `atomicAdd(&acc[o], moe_fixed(w·dv))`
+  instead of writing `partial[e·hidden+o]`. Residents accumulate into row 0 on the compute
+  stream, misses into row 1 on the miss stream.
+- `moe_acc_drain` sums the rows ascending, converts through `double` (the accumulator
+  reaches 2^48; f32 would round it away), adds into `x`, and ZEROES the accumulator. That
+  reset is why steady state needs no memset — the end-of-layer `device_sync` already stands
+  between it and the next layer's first atomic. Asserted on both backends.
+- The drain IS the residual add on a MoE layer, and `--moe-gain` folds into its multiply. So
+  the convert costs no extra pass and needs no barrier of its own: the join disappeared
+  rather than moving.
+- `moe_reduce` survives OFF the decode path, as the f32 reference the oracle tests pin
+  against and the shape `tests/vk.rs` probes cross-queue visibility with.
+- Vulkan: `shaderBufferInt64Atomics` is now a REQUIRED device feature (gfx1151 has it), and
+  `missing_features` names it. `GL_EXT_shader_atomic_int64` in `moe_down_vq.comp`.
+- `moe_ev_start`/`_end` still bracket honestly. `_end` records on an idle compute stream
+  after BOTH streams are awaited, so it covers the miss stream's experts too. This was the
+  flagged risk — a bracket that quietly narrows when work moves off the stream it spans is
+  an error this file has already shipped twice.
+
+### What gates this change
+
+Output is no longer bit-comparable, so the token-ID diff that gated every previous change in
+this area is INVALID here. The gate is teacher-forced perplexity plus the bit-identity of the
+drain against a host integer oracle in `tests/vk.rs::moe_vq_matches_the_host_oracles`.
+
+MEASURED (`tests/ppl-corpus.txt`, 762 predicted tokens, int3-vq/dense/lru, `--max-mem 115`):
 
 ```
-|v| in [5.224e-11, 1.525e1] over 21,454,848 samples | 38.1 exponent bits
-exact fixed-point needs ~66 bits (38 exponent + 24 mantissa + 4 carry for E=9)
+base   PPL 5.275434   mean NLL 1.663061   hit 78.08%
+acc    PPL 5.222720   mean NLL 1.653018   hit 78.09%
+paired mean dNLL -0.01004  95% CI [-0.02226, +0.00217]  worse% 50.1
 ```
 
-**66 bits.** So two u64 limbs cover it with 62 binades of headroom. 256- or 512-bit
-accumulators — the widths first considered — would double or quadruple the atomic traffic to
-represent magnitudes that do not occur. Cost at 128 bits: 2 x 9 x 6144 ~= 110k atomics per
-layer, ~0.4 MB of traffic against the 221 KB of partials it replaces.
-
-Accuracy IMPROVES: today's sequential f32 sum rounds 8 times per output element; exact
-accumulation rounds once, at the final convert. Output will not be bit-comparable to the
-current engine, so this needs a perplexity gate rather than a token-ID diff — the one change
-in this area that does.
-
-### Implementation sketch
-
-- `moe_expert_range`(`_i4`) accumulate into 2 x u64 limbs via `atomicAdd`, scale `2^-40`
-  (LSB below the observed 5.2e-11 = 2^-34.2), instead of writing an f32 partial row.
-- Guard bits sized so no limb overflows across E=9 additions; a carry-normalise pass folds
-  limb 0 into limb 1.
-- Convert limbs -> f32 folded into the residual add, which already sits after the
-  end-of-layer barrier — so the join disappears rather than moving.
-- The `moe_ns_by_miss` bracket must be re-checked: it currently spans the compute stream, and
-  this moves work off it. A bracket that no longer covers what its name says is the error
-  this file has already shipped twice.
+**PASS, and it is a PASS ON THE UPPER BOUND, not a 1% win.** The CI crosses zero and
+`worse%` sits at 50.1 — half the tokens moved each way — which is the tool's own signature
+for "no systematic shift however the PPL column reads". Reporting the −0.999% as an
+improvement would be reading noise: a 2.6e-13 accumulation error cannot move NLL by 1%, and
+the likelier source of the wobble is the handful of routing decisions that flipped (hit
+78.08% → 78.09%), which perturbs the output far more than the arithmetic does. What the gate
+establishes is the thing it was run for: the upper bound +0.00217 nats sits well inside the
+1% bar of 0.00995, so the change does not cost quality.
