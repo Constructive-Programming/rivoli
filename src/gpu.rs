@@ -81,6 +81,27 @@ use anyhow::{Context, Result, bail, ensure};
 /// Little-endian byte view of a POD slice — zero-copy on this LE host (a `[T]`'s
 /// in-memory bytes ARE its LE serialization). Feeds the per-token H2D uploads (attn
 /// rows/heads u32, expert descriptors, weights f32) with no staging buffer.
+/// Confidence buckets for the MTP accept histogram: 5 even bins over [0,1].
+const MTP_BINS: usize = 5;
+
+fn mtp_bin(conf: f32) -> usize {
+    ((conf * MTP_BINS as f32) as usize).min(MTP_BINS - 1)
+}
+
+/// `softmax(logits)[argmax]` from a raw f32 logit vector — the draft head's confidence
+/// in its own pick, and the only free signal a speculate-or-not gate could read.
+fn top1_prob(bytes: &[u8]) -> f32 {
+    let l = |c: &[u8]| f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+    let max = bytes.chunks_exact(4).map(l).fold(f32::NEG_INFINITY, f32::max);
+    // Shifted so the largest term is exp(0)=1; the sum is then ≥1 and 1/sum is the
+    // top-1 probability without ever forming the full softmax.
+    let sum: f64 = bytes
+        .chunks_exact(4)
+        .map(|c| f64::from(l(c) - max).exp())
+        .sum();
+    (1.0 / sum) as f32
+}
+
 fn as_le_bytes<T: Copy>(v: &[T]) -> &[u8] {
     // SAFETY: `T: Copy` POD (u32/f32/repr(C) ExpertDesc); LE host == LE bytes.
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
@@ -386,6 +407,14 @@ pub struct GpuEngine<'a> {
     /// Drafts produced / drafts that matched the main model's next argmax. `--mtp` only.
     mtp_seen: u64,
     mtp_hit: u64,
+    /// The same pair, bucketed by the DRAFT'S OWN confidence (softmax probability of its
+    /// argmax). This is the signal a "should we speculate on this token?" gate would read,
+    /// and bucketing it is how we find out whether it separates before building the gate.
+    mtp_bins: [(u64, u64); MTP_BINS],
+    /// Host staging for the draft's logits — the confidence needs the whole vector, and
+    /// a host pass costs one 620 KB D2H behind a sync `argmax` already pays.
+    /// ponytail: host softmax, no kernel — it is a measurement, not a decode-path cost.
+    mtp_host: Vec<u8>,
     sub: DeviceBuf,
     qr: DeviceBuf,
     q: DeviceBuf,
@@ -619,6 +648,8 @@ impl<'a> GpuEngine<'a> {
             mtp_x: f(cfg.hidden)?,
             mtp_seen: 0,
             mtp_hit: 0,
+            mtp_bins: [(0, 0); MTP_BINS],
+            mtp_host: Vec::new(),
             sub: f(cfg.hidden)?,
             qr: f(cfg.q_lora_rank)?,
             q: f(h * cfg.qk_head_dim())?,
@@ -1021,9 +1052,13 @@ impl<'a> GpuEngine<'a> {
     /// head's context) and the routed-expert pool (its 8 picks are admitted like any
     /// other layer's, which is also why a rejected draft is not wasted here: the bytes
     /// it fetched stay cached).
-    async fn mtp_draft(&mut self, token: u32, pos: usize) -> Result<u32> {
+    /// Returns `(draft, confidence)` — confidence being softmax(logits)[draft].
+    async fn mtp_draft(&mut self, token: u32, pos: usize) -> Result<(u32, f32)> {
         self.forward_inner(token, pos, true).await?;
-        self.argmax()
+        let d = self.argmax()?;
+        // `argmax` already synced on its D2H, so this read needs no further join.
+        self.logits.copy_out_into(&mut self.mtp_host)?;
+        Ok((d, top1_prob(&self.mtp_host)))
     }
 
     /// `mtp`: run the MTP head alone instead of the model's layers — see
@@ -2077,7 +2112,7 @@ impl<'a> GpuEngine<'a> {
             let mut win_t = std::time::Instant::now();
             #[cfg(feature = "trace")]
             let (mut win_hit, mut win_miss) = (self.pin.hits, self.pin.misses);
-            let mut draft: Option<u32> = None;
+            let mut draft: Option<(u32, f32)> = None;
             for _i in 0..ngen {
                 if let Some(hb) = &self.heartbeat {
                     hb.beat();
@@ -2085,9 +2120,12 @@ impl<'a> GpuEngine<'a> {
                 let next = self.argmax()?;
                 // Score the PREVIOUS iteration's draft, which predicted exactly this
                 // token. Scoring before the eos break counts the last draft too.
-                if let Some(d) = draft.take() {
+                if let Some((d, conf)) = draft.take() {
+                    let ok = u64::from(d == next);
                     self.mtp_seen += 1;
-                    self.mtp_hit += u64::from(d == next);
+                    self.mtp_hit += ok;
+                    let b = &mut self.mtp_bins[mtp_bin(conf)];
+                    (b.0, b.1) = (b.0 + 1, b.1 + ok);
                 }
                 if eos.contains(&next) {
                     break;
@@ -2098,6 +2136,7 @@ impl<'a> GpuEngine<'a> {
                 if mtp {
                     draft = Some(self.mtp_draft(next, pos).await?);
                 }
+
                 self.forward(next, pos).await?;
                 pos += 1;
                 // Bound trace loss to one token: the watchdog exits without destructors,
@@ -2140,6 +2179,21 @@ impl<'a> GpuEngine<'a> {
                 self.mtp_seen,
                 100.0 * self.mtp_hit as f64 / self.mtp_seen as f64,
             );
+            // Bucketed by the draft's own confidence: does it separate well enough to gate
+            // on? A flat column of accept% means it does not, and no threshold helps.
+            let cells: Vec<String> = self
+                .mtp_bins
+                .iter()
+                .enumerate()
+                .map(|(i, &(n, ok))| {
+                    let lo = i as f64 / MTP_BINS as f64;
+                    match n {
+                        0 => format!("p{lo:.1}+: -"),
+                        _ => format!("p{lo:.1}+: {:.0}%(n={n})", 100.0 * ok as f64 / n as f64),
+                    }
+                })
+                .collect();
+            tracing::info!("  MTP accept by draft confidence: {}", cells.join(" "));
         }
         // LOOKA sits beside the profile rather than inside it: it is a property of the
         // ROUTER (would a prefetcher guess right?), not of where this run spent its time,
