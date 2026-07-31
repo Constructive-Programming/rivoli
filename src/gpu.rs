@@ -2346,8 +2346,11 @@ impl<'a> GpuEngine<'a> {
         self.prof.wall_ns = decode_wall.elapsed().as_nanos();
         self.prof.tokens = generated.len() as u64;
         let bytes_per_expert = crate::artifact::quant::vq_expert_bytes(self.cfg.hidden, self.cfg.moe_inter);
-        // The accurate async-side decomposition: reaper fetch wall + the expert
-        // stream's tokio-metrics (idle = load-wait, poll = launch).
+        // The accurate async-side decomposition: reaper fetch wall + measured io-wait,
+        // taken at the ring. The tokio-metrics `idle_ns`/`poll_ns` pair this comment used
+        // to name went away with the ticketed dataflow (see `Prof`) — and the DEPENDENCY
+        // outlived the last use of it until 2026-07-31, along with `tokio-stream`, which
+        // had none at all.
         let summary = self.prof.summary(
             self.pin.hits - hit0,
             self.pin.misses - miss0,
@@ -2356,6 +2359,17 @@ impl<'a> GpuEngine<'a> {
             self.pin.io_wait_ns().saturating_sub(io0),
         );
         summary.report();
+        // Zero on every run measured so far, and that IS the claim: the ticket gate on
+        // staging-slot hand-out is satisfied on arrival for every read the engine issues,
+        // because each is awaited inside its issuing layer. Reported when it is not, since
+        // the alternative is the gate silently becoming the bottleneck it exists to prevent.
+        if self.pin.slot_stalls() > 0 {
+            tracing::warn!(
+                "staging-slot stalls: {} — a layer waited for a slot whose bounce copy had \
+                 not retired. The ring is undersized for the lookahead.",
+                self.pin.slot_stalls()
+            );
+        }
         if self.mtp_seen > 0 {
             // tokens/pass is MEASURED, not projected. Every iteration scores exactly one
             // draft — gated out or not — so `mtp_seen` IS the pass count and

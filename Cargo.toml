@@ -27,10 +27,8 @@ opentelemetry-otlp = { version = "0.30", optional = true, features = ["metrics"]
 # decode loop is serial; the GPU streams are the concurrency, not CPU threads.
 tokio = { version = "1", features = ["rt", "sync", "macros"], optional = true }
 futures-util = { version = "0.3", optional = true }
-tokio-stream = { version = "0.1", optional = true }
 # Per-task async metrics: TaskMonitor's idle_duration = the expert stream's load-wait,
 # poll_duration = its launch cost. Recovers the async-side timing the overlap blurs.
-tokio-metrics = { version = "0.4", optional = true }
 # io_uring O_DIRECT cold-expert streamer (rocm only). Talks to the io_uring syscalls
 # directly — no liburing system lib. The HIP bounce arena + async H2D copy stay in
 # kernels/async.hip (the codebase keeps HIP behind rivoli_* C wrappers).
@@ -59,7 +57,7 @@ clap = { version = "4", default-features = false, features = [
 teacher-forcing = []
 default = []
 # build.rs compiles kernels/*.hip via hipcc; pulls in the async streaming stack.
-rocm = ["dep:tokio", "dep:futures-util", "dep:tokio-stream", "dep:tokio-metrics", "dep:io-uring"]
+rocm = ["dep:tokio", "dep:futures-util", "dep:io-uring"]
 # The second compute backend: build.rs compiles kernels/vk/*.comp via glslc. MUTUALLY
 # EXCLUSIVE with `rocm` — one backend per build, no runtime selection (docs/VULKAN.md).
 # The async streaming stack is now the SAME set `rocm` pulls in: phase 4 integration put
@@ -70,8 +68,6 @@ vulkan = [
     "dep:ash",
     "dep:tokio",
     "dep:futures-util",
-    "dep:tokio-stream",
-    "dep:tokio-metrics",
     "dep:io-uring",
 ]
 # OTLP export of the always-on decode summary (one span/run, opt-in at runtime via

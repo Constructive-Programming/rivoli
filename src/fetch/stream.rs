@@ -275,15 +275,15 @@ pub struct Streamer {
     /// `arena`'s byte size, kept because `stage::free` needs it (the Vulkan side's
     /// `dealloc` requires the original `Layout`). Zero in direct mode.
     arena_bytes: usize,
-    /// Per-queued-read VMM destination + aligned read length (bounce mode only),
-    /// indexed by the read's `user_data`. `reap` copies `nbytes` from the arena slot
-    /// into `dst`. Built in queue order, cleared per batch (mirrors `min_res`).
+    /// Per-SLOT VMM destination + aligned read length (bounce mode only). `reap` copies
+    /// `nbytes` from the arena slot into `dst`. Indexed by staging slot — which is the
+    /// read's `user_data` — and NOT cleared per batch: a slot's lifetime is owned by its
+    /// [`Ticket`](crate::fetch::asyncfetch::Ticket) now, not by the batch that happened to use it.
     dst: Vec<*mut u8>,
     nbytes: Vec<u32>,
-    /// Per-queued-read minimum completion length (sub-block offset + useful len),
-    /// indexed by the read's `user_data`. `reap` compares the completion `res`
-    /// against it so a real mid-file short read is caught while EOF-padding
-    /// truncation is tolerated.
+    /// Per-SLOT minimum completion length (sub-block offset + useful len). `reap` compares
+    /// the completion `res` against it so a real mid-file short read is caught while
+    /// EOF-padding truncation is tolerated.
     min_res: Vec<u64>,
 }
 
@@ -338,27 +338,32 @@ impl Streamer {
             span,
             arena,
             arena_bytes,
-            dst: Vec::with_capacity(entries as usize),
-            nbytes: Vec::with_capacity(entries as usize),
-            min_res: Vec::with_capacity(entries as usize),
+            dst: vec![std::ptr::null_mut(); entries as usize],
+            nbytes: vec![0; entries as usize],
+            min_res: vec![0; entries as usize],
         })
     }
 
     /// Queue an O_DIRECT read of `len` bytes at file offset `begin` (from `fd`)
-    /// into `dst`. Reads the aligned superset `[align_down(begin), align_up(begin+
-    /// len))`, so `dst` must be `ALIGN`-aligned and own at least `slot_span(len)`
-    /// bytes. Returns the sub-block offset in `dst` where the useful `len` bytes
-    /// land (i.e. the caller reads `dst.add(returned) .. +len`).
+    /// into `dst`, staged through bounce arena slot `slot`. Reads the aligned superset
+    /// `[align_down(begin), align_up(begin+len))`, so `dst` must be `ALIGN`-aligned and
+    /// own at least `slot_span(len)` bytes. Returns the sub-block offset in `dst` where
+    /// the useful `len` bytes land (i.e. the caller reads `dst.add(returned) .. +len`).
+    ///
+    /// **`slot` is chosen by the caller, not by queue order.** It used to be `queued++`,
+    /// which made a slot's lifetime the batch's lifetime — see [`reset_batch`].
     ///
     /// # Safety
     /// `dst` must be `ALIGN`-aligned and valid for `slot_span(len)` writable bytes
-    /// until this read's [`reap`](Self::reap) completes.
+    /// until this read's [`reap`](Self::reap) completes. `slot` must not be in use by a
+    /// read whose bounce copy has not yet retired (the caller's ticket gate).
     pub unsafe fn queue(
         &mut self,
         fd: RawFd,
         begin: usize,
         len: usize,
         dst: *mut u8,
+        slot: u32,
     ) -> Result<usize> {
         debug_assert_eq!(
             dst as usize % ALIGN,
@@ -374,12 +379,16 @@ impl Streamer {
             self.span
         );
         let sub = begin - ab; // useful bytes start `sub` into the aligned read
-        let ud = self.queued;
+        let ud = slot;
+        ensure!(
+            ud < self.entries,
+            "staging slot {ud} out of range (entries {})",
+            self.entries
+        );
         // BOUNCE reads into this slot's arena window; DIRECT reads straight into dst.
         let into = if self.bounce {
-            // SAFETY: `entries` is a power of two (asserted in `new`) == the io_uring SQ
-            // capacity, and the caller bounds a batch by `entries` reads, so `ud < entries`
-            // — the arena (`entries*span`, each read's `nbytes <= span`) owns this slot.
+            // SAFETY: `ud < entries` (checked above), and the arena is `entries*span` with
+            // every read's `nbytes <= span`, so this slot's window is owned and in bounds.
             unsafe { self.arena.add(ud as usize * self.span) }
         } else {
             dst
@@ -398,15 +407,13 @@ impl Streamer {
             self.queued
         );
         if self.bounce {
-            debug_assert_eq!(self.dst.len(), ud as usize);
-            self.dst.push(dst);
-            self.nbytes.push(nbytes as u32);
+            self.dst[ud as usize] = dst;
+            self.nbytes[ud as usize] = nbytes as u32;
         }
         // The completion must deliver at least the useful window `[begin,begin+len)`
         // from the aligned start; a shorter read is mid-file truncation (checked in
         // `reap` against `min_res`). Trailing EOF padding beyond this is fine.
-        debug_assert_eq!(self.min_res.len(), self.queued as usize);
-        self.min_res.push(min_completion(begin, len));
+        self.min_res[ud as usize] = min_completion(begin, len);
         self.queued += 1;
         Ok(sub)
     }
@@ -513,13 +520,17 @@ impl Streamer {
         self.entries
     }
 
-    /// Reset the per-batch bookkeeping after a full batch has been [`reap`]ed, readying the
+    /// Reset the SQ occupancy counter after a full batch has been [`reap`]ed, readying the
     /// ring for the next layer's batch.
+    ///
+    /// It used to clear `dst`/`nbytes`/`min_res` too, which silently recycled every staging
+    /// slot — an integer reset with no relationship to whether the bounce copy OUT of those
+    /// slots had retired. That was safe only because every demand read happens to be awaited
+    /// inside its issuing layer: an emergent property of the consumer, written nowhere and
+    /// enforced nowhere, and the reason the first speculative preloader corrupted. Slot reuse
+    /// is now gated on the slot's timeline in `AsyncFetch::take_slot`.
     pub fn reset_batch(&mut self) {
         self.queued = 0;
-        self.dst.clear();
-        self.nbytes.clear();
-        self.min_res.clear();
     }
 }
 

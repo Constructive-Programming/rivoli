@@ -1007,6 +1007,15 @@ impl<'a> Pin<'a> {
         self.fetch.io_wait_ns()
     }
 
+    /// Times a layer had to WAIT for a staging slot whose bounce copy had not retired.
+    /// Should stay 0: a layer uses ~2 of 16 slots and a copy retires in ~1.2 ms against a
+    /// ~3.5 ms layer. Non-zero means the ring is undersized for the lookahead — surfaced
+    /// rather than merely counted, because a counter nobody reads is how the last two dead
+    /// fields in this engine got there.
+    pub fn slot_stalls(&self) -> u64 {
+        self.fetch.slot_stalls()
+    }
+
     /// The streaming half of `submit_layer`: trace sink, then three phases over the
     /// arena pool. 1a: touch every HIT (protect it so a same-batch miss can't evict it).
     /// 1b: allocate every MISS — this is where the byte-aware policy evicts and the arena
