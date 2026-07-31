@@ -84,6 +84,22 @@ use anyhow::{Context, Result, bail, ensure};
 /// Confidence buckets for the MTP accept histogram: 5 even bins over [0,1].
 const MTP_BINS: usize = 5;
 
+/// Which pass `forward_inner` is running, and — for the head — where it reads `h`.
+#[derive(Clone, Copy, PartialEq)]
+enum Draft {
+    /// Not a draft: the main model's own forward, over every layer.
+    No,
+    /// Depth 1. `h` is the main model's last hidden state, which is the real thing the
+    /// head was trained to consume.
+    FromModel,
+    /// Depth 2+. `h` is the head's OWN output from the previous draft, standing in for a
+    /// hidden state the main model has not computed and by construction cannot: producing
+    /// it is what we are speculating about. This substitution is what lets ONE MTP module
+    /// predict more than one token ahead, and it is why depth-2 acceptance is strictly a
+    /// question for measurement rather than inference from depth-1's number.
+    Chained,
+}
+
 fn mtp_bin(conf: f32) -> usize {
     ((conf * MTP_BINS as f32) as usize).min(MTP_BINS - 1)
 }
@@ -411,6 +427,12 @@ pub struct GpuEngine<'a> {
     /// argmax). This is the signal a "should we speculate on this token?" gate would read,
     /// and bucketing it is how we find out whether it separates before building the gate.
     mtp_bins: [(u64, u64); MTP_BINS],
+    /// Depth-2 (chained) drafts, counted ONLY where the depth-1 parent was accepted — a
+    /// chained draft conditioned on a wrong parent predicts a token that will never be
+    /// asked for, so scoring it would measure nothing. Bucketed by the PARENT's
+    /// confidence, which is the quantity a "how deep should we go?" rule would read.
+    mtp_chain: (u64, u64),
+    mtp_chain_bins: [(u64, u64); MTP_BINS],
     /// Host staging for the draft's logits — the confidence needs the whole vector, and
     /// a host pass costs one 620 KB D2H behind a sync `argmax` already pays.
     /// ponytail: host softmax, no kernel — it is a measurement, not a decode-path cost.
@@ -649,6 +671,8 @@ impl<'a> GpuEngine<'a> {
             mtp_seen: 0,
             mtp_hit: 0,
             mtp_bins: [(0, 0); MTP_BINS],
+            mtp_chain: (0, 0),
+            mtp_chain_bins: [(0, 0); MTP_BINS],
             mtp_host: Vec::new(),
             sub: f(cfg.hidden)?,
             qr: f(cfg.q_lora_rank)?,
@@ -1039,7 +1063,7 @@ impl<'a> GpuEngine<'a> {
     /// in `self.logits`.
     /// The main model: embed `token`, run every layer, leave logits on the device.
     async fn forward(&mut self, token: u32, pos: usize) -> Result<()> {
-        self.forward_inner(token, pos, false).await
+        self.forward_inner(token, pos, Draft::No).await
     }
 
     /// The MTP head. Reads the hidden state the last [`GpuEngine::forward`] left in `x`
@@ -1053,8 +1077,8 @@ impl<'a> GpuEngine<'a> {
     /// other layer's, which is also why a rejected draft is not wasted here: the bytes
     /// it fetched stay cached).
     /// Returns `(draft, confidence)` — confidence being softmax(logits)[draft].
-    async fn mtp_draft(&mut self, token: u32, pos: usize) -> Result<(u32, f32)> {
-        self.forward_inner(token, pos, true).await?;
+    async fn mtp_draft(&mut self, token: u32, pos: usize, src: Draft) -> Result<(u32, f32)> {
+        self.forward_inner(token, pos, src).await?;
         let d = self.argmax()?;
         // `argmax` already synced on its D2H, so this read needs no further join.
         self.logits.copy_out_into(&mut self.mtp_host)?;
@@ -1065,24 +1089,32 @@ impl<'a> GpuEngine<'a> {
     /// [`GpuEngine::mtp_draft`] for what that means. Everything else is identical, which
     /// is the point: the head IS a layer, so it reuses the whole per-layer path
     /// (routing, the expert pool, tickets, the two streams, the profile).
-    async fn forward_inner(&mut self, token: u32, pos: usize, mtp: bool) -> Result<()> {
+    async fn forward_inner(&mut self, token: u32, pos: usize, mtp: Draft) -> Result<()> {
         let cfg = self.cfg;
         let eps = cfg.rms_norm_eps as f32;
         // Which pinned layers this pass runs. The head sits one past the model's last.
         let layer_range = match mtp {
-            false => 0..cfg.n_layers,
-            true => cfg.n_layers..cfg.n_layers + 1,
+            Draft::No => 0..cfg.n_layers,
+            _ => cfg.n_layers..cfg.n_layers + 1,
         };
         // The head's entry: `x` ← eh_proj·[enorm(emb(token)) ‖ hnorm(x)]. Done BEFORE the
         // scratch pointers are taken, because it ends by swapping the head's residual
         // buffer into `x` — the last read of the main model's `h` is the hnorm above it.
         let mtp_w = match mtp {
-            false => None,
-            true => {
+            Draft::No => None,
+            _ => {
                 let m = self.pin.mtp.context("--mtp: artifact carries no MTP head")?;
                 let emb = self.pin.embed;
                 let catp = self.mtp_cat.ptr_mut() as *mut f32;
-                let hp = self.x.ptr() as *const f32;
+                // Depth 1 reads the model's hidden state; a chained draft reads the head's
+                // own previous output, which the exit swap below left in `mtp_x`. That
+                // makes the chained case read and write the SAME buffer — safe, and only
+                // because both launches sit on the null stream in this order: the hnorm
+                // consumes it before the eh_proj gemv overwrites it.
+                let hp = match mtp {
+                    Draft::Chained => self.mtp_x.ptr() as *const f32,
+                    _ => self.x.ptr() as *const f32,
+                };
                 let dst = self.mtp_x.ptr_mut() as *mut f32;
                 // SAFETY: cat is 2·hidden f32 scratch; `hp` is the hidden state the
                 // previous forward left resident; eh_proj is [hidden, 2·hidden] f32.
@@ -2083,7 +2115,7 @@ impl<'a> GpuEngine<'a> {
                 // (h_i, emb(t_{i+1})) AT POSITION i+1, so the prompt supplies every
                 // element but the last, whose successor has not been sampled yet.
                 if mtp && let Some(&next) = prompt_ids.get(pos + 1) {
-                    self.mtp_draft(next, pos + 1).await?;
+                    self.mtp_draft(next, pos + 1, Draft::FromModel).await?;
                 }
                 pos += 1;
             }
@@ -2112,7 +2144,11 @@ impl<'a> GpuEngine<'a> {
             let mut win_t = std::time::Instant::now();
             #[cfg(feature = "trace")]
             let (mut win_hit, mut win_miss) = (self.pin.hits, self.pin.misses);
-            let mut draft: Option<(u32, f32)> = None;
+            // The depth-1 draft made last iteration (predicts THIS token) with its own
+            // chained child, and a chained draft promoted one iteration ago whose parent
+            // was accepted — which also predicts this token, two steps after it was made.
+            let mut draft: Option<(u32, f32, u32)> = None;
+            let mut chained: Option<(u32, f32)> = None;
             for _i in 0..ngen {
                 if let Some(hb) = &self.heartbeat {
                     hb.beat();
@@ -2120,12 +2156,23 @@ impl<'a> GpuEngine<'a> {
                 let next = self.argmax()?;
                 // Score the PREVIOUS iteration's draft, which predicted exactly this
                 // token. Scoring before the eos break counts the last draft too.
-                if let Some((d, conf)) = draft.take() {
+                if let Some((c, pconf)) = chained.take() {
+                    let ok = u64::from(c == next);
+                    self.mtp_chain = (self.mtp_chain.0 + 1, self.mtp_chain.1 + ok);
+                    let b = &mut self.mtp_chain_bins[mtp_bin(pconf)];
+                    (b.0, b.1) = (b.0 + 1, b.1 + ok);
+                }
+                if let Some((d, conf, c2)) = draft.take() {
                     let ok = u64::from(d == next);
                     self.mtp_seen += 1;
                     self.mtp_hit += ok;
                     let b = &mut self.mtp_bins[mtp_bin(conf)];
                     (b.0, b.1) = (b.0 + 1, b.1 + ok);
+                    // Only a draft whose parent survived predicts a token anyone will
+                    // ask for; the rest are conditioned on a branch that did not happen.
+                    if ok == 1 {
+                        chained = Some((c2, conf));
+                    }
                 }
                 if eos.contains(&next) {
                     break;
@@ -2134,9 +2181,14 @@ impl<'a> GpuEngine<'a> {
                 // Draft `pos + 1` from (h_{pos-1}, next) — `x` still holds h_{pos-1}, so
                 // this MUST run before the forward below overwrites it.
                 if mtp {
-                    draft = Some(self.mtp_draft(next, pos).await?);
+                    let (d, conf) = self.mtp_draft(next, pos, Draft::FromModel).await?;
+                    // Chain UNCONDITIONALLY here even though the point is to gate on
+                    // confidence: the histogram needs the low-confidence rows too, and
+                    // measuring only where we already expect to win is how a threshold
+                    // gets picked from the data it was fitted to.
+                    let (c2, _) = self.mtp_draft(d, pos + 1, Draft::Chained).await?;
+                    draft = Some((d, conf, c2));
                 }
-
                 self.forward(next, pos).await?;
                 pos += 1;
                 // Bound trace loss to one token: the watchdog exits without destructors,
@@ -2181,19 +2233,36 @@ impl<'a> GpuEngine<'a> {
             );
             // Bucketed by the draft's own confidence: does it separate well enough to gate
             // on? A flat column of accept% means it does not, and no threshold helps.
-            let cells: Vec<String> = self
-                .mtp_bins
-                .iter()
-                .enumerate()
-                .map(|(i, &(n, ok))| {
-                    let lo = i as f64 / MTP_BINS as f64;
-                    match n {
-                        0 => format!("p{lo:.1}+: -"),
-                        _ => format!("p{lo:.1}+: {:.0}%(n={n})", 100.0 * ok as f64 / n as f64),
-                    }
-                })
-                .collect();
-            tracing::info!("  MTP accept by draft confidence: {}", cells.join(" "));
+            let row = |bins: &[(u64, u64); MTP_BINS]| {
+                bins.iter()
+                    .enumerate()
+                    .map(|(i, &(n, ok))| {
+                        let lo = i as f64 / MTP_BINS as f64;
+                        match n {
+                            0 => format!("p{lo:.1}+: -"),
+                            _ => format!("p{lo:.1}+: {:.0}%(n={n})", 100.0 * ok as f64 / n as f64),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            tracing::info!("  MTP d1 accept by draft confidence: {}", row(&self.mtp_bins));
+            let (cn, ck) = self.mtp_chain;
+            if cn > 0 {
+                let p1 = self.mtp_hit as f64 / self.mtp_seen as f64;
+                let p2 = ck as f64 / cn as f64;
+                tracing::info!(
+                    "  MTP d2 (chained, parent accepted): {ck}/{cn} ({:.1}%) — tokens/pass \
+                     1+p1 = {:.3} at 2 rows, 1+p1+p1·p2 = {:.3} at 3",
+                    100.0 * p2,
+                    1.0 + p1,
+                    1.0 + p1 + p1 * p2,
+                );
+                tracing::info!(
+                    "  MTP d2 accept by PARENT confidence: {}",
+                    row(&self.mtp_chain_bins)
+                );
+            }
         }
         // LOOKA sits beside the profile rather than inside it: it is a property of the
         // ROUTER (would a prefetcher guess right?), not of where this run spent its time,
