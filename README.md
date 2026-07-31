@@ -29,6 +29,12 @@ Valid results, 512 tokens, `--max-mem 115`:
 | `hybrid` | 12/12 | 2.12-2.76 | 2.45 |
 | `int4` | 14/16 | 1.77-2.42 | 2.10 |
 
+That table predates the group-128 `.i4` rebuild (`docs/INT4.md`, RESOLVED 2026-07-27):
+its `int4` and `hybrid` rows were measured against the per-row-scaled set, and `int4` is
+now the best-QUALITY mode in the engine (PPL 5.120 against int3-vq's 5.275) while staying
+the slowest — its slot is 31% larger, so the same budget holds fewer experts. Rank quality
+on `docs/INT4.md` §10 and `benchmarks.md`, not on tok/s here.
+
 Two caveats on that table. `top-m` holds the top four slots (3.10-3.22) but substitutes
 ~5.5% of experts away from the true top-K, so its 85-86% hit rates are not comparable.
 And `int4` lost two cells to intermittent `NaN/Inf` logits — non-reproducing, no
@@ -133,7 +139,9 @@ cargo run --release --features rocm -- <model-dir> -bench 256 --mode hybrid --ma
 Useful flags: `--max-mem <GiB>` (device budget, literal; default `free − 16 GiB`),
 `--direct-vmm-dma` (raw DMA over the default pinned bounce), `--attn
 auto|dense|dsa|streaming|misa`, `--trace <path>` (dump the routed-expert access
-trace for the offline `replay` sim). The hybrid hot/cold split has no flag — it
+trace for the offline `replay` sim), `--no-mtp` (turn off speculative decode, which is
+on by default whenever the artifact carries the MTP head — today that means `--mode
+int3-vq` only; see `MODES.md`). The hybrid hot/cold split has no flag — it
 self-sizes with the byte-arena pool.
 `rivoli --help` lists every flag with its default and its legal values (`-bench` is
 accepted alongside `--bench`, so every command line recorded in benchmarks.md still runs).

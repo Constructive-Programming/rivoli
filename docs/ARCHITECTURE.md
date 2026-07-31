@@ -81,7 +81,9 @@ token).
 
 The serial dependency is real and unavoidable, so rivoli does **not** parallelize across
 layers. The concurrency it exploits is *inside* the MoE phase: fetching cold experts while
-computing the resident/already-loaded ones.
+computing the resident/already-loaded ones — and, since 2026-07-31, **across two token rows
+within one pass** when speculative decode is on (§13). The diagram above describes one row;
+a verify pass runs the same graph with `R = 2` rows threaded through every kernel.
 
 ---
 
@@ -468,15 +470,17 @@ docs/INT4.md; artifacts it produced are still identifiable by their `i4_source` 
 - `arena` — two-ended byte arena; `hybrid` — byte-aware cache policies; `cache` —
   `OrderedSet`/`Tier`/`TwoQSplit` substrate.
 - `pin` — resident placement + the routed-expert `ArenaPool` (`submit_layer` protocol).
-- `gpu` — the async forward pass; `hip` — the HIP/rocm FFI surface; `quant`/`math`/`model`
-  — leaf.
+- `gpu` — the async forward pass, single- or two-row (`MAXROW`, §13); `hip` — the HIP/rocm
+  FFI surface; `quant`/`math`/`model` — leaf.
 - `attn`/`indexer` — attention modes + DSA. `telemetry` — the always-on PROFILE summary.
 - `backend` — the build-time backend waist (`rocm` XOR `vulkan`, one impl chosen at compile
   time, no vtable). It IS the seam now: `gpu`, `pin`, `asyncfetch` and `stream` import it
   rather than `hip`. `vk`/`vkstream` — the **Vulkan compute backend**
   (`--features vulkan`): 16 of 29 kernels, and it DECODES `--mode int3-vq --attn dense` over
   three queues with the fetch↔compute overlap intact (97% hidden, against ROCm's 96%). Still
-  ~1.9x slower end to end, all of it MoE kernel throughput; see `docs/VULKAN.md`.
+  ~1.9x slower end to end, all of it MoE kernel throughput; see `docs/VULKAN.md`. Its
+  `.comp` shaders are SINGLE-ROW, so six ported launchers refuse `nrow > 1` and speculative
+  decode is ROCm-only (§13).
 - `kernels/*.hip` — moe, mla, attn, linalg, indexer, fwd, async, vmm (HIP/rocm).
   `kernels/vk/*.comp` → SPIR-V via the `build.rs` vulkan arm (the second backend).
 - `src/bin/` — `convert`, `fp8_to_i4`, `add_indexer`, `i4_audit`, `ppl`, `replay`. (There
@@ -608,3 +612,105 @@ the likelier source of the wobble is the handful of routing decisions that flipp
 78.08% → 78.09%), which perturbs the output far more than the arithmetic does. What the gate
 establishes is the thing it was run for: the upper bound +0.00217 nats sits well inside the
 1% bar of 0.00995, so the change does not cost quality.
+
+---
+
+## 13. Speculative decode — the MTP head and the two-row forward — SHIPPED 2026-07-31
+
+**On by default** wherever it is buildable; `--no-mtp` opts out. It changes throughput and
+**never** output.
+
+> **Caveat that undercuts "by default": the default `--mode hybrid` cannot run it.** The
+> head rides the routed pool, so it needs its expert slab in every format the run opens —
+> and `bin/fp8_to_i4` emits no `L78.i4`. Only `--mode int3-vq` carries a head today;
+> `int4` and `hybrid` log "speculative decode OFF: this artifact carries no MTP head" and
+> decode sequentially. So a bare `rivoli <artifact>` does not speculate. Closing that means
+> teaching `fp8_to_i4` to emit layer 78; nothing else is in the way, and at the currently
+> measured 0.93-0.95x there is no hurry.
+
+### The head
+
+GLM-5.2 ships `num_nextn_predict_layers = 1`. Checkpoint layer `n_layers` (78) is a full
+MoE layer plus `enorm`/`hnorm`/`eh_proj`/`shared_head.norm`, and it carries no
+`shared_head.head.weight` — `lm_head` is SHARED with the main model. `bin/convert` carries
+it on a whole-model convert only (a `--layers`-limited artifact has no hidden state for it
+to consume), and `Pin` loads it as pin layer 78, so **the head IS a layer**: same routing,
+same expert pool, same tickets, same two streams, same profile buckets.
+
+Element *i* consumes `(h_i, emb(t_{i+1}))` at **position i+1** and predicts `t_{i+2}`.
+Entry is `x ← eh_proj·[enorm(emb) ‖ hnorm(h)]` — **embedding half FIRST**. That order is
+documented nowhere in the artifact and was MEASURED: it drafts at 53.5%, the swapped one at
+**0.0%** over 63 drafts. A 0% arm is what makes 53.5% readable as "the head works" rather
+than "the metric is loose".
+
+### The verify pass
+
+One forward carries `R` token rows (`gpu::MAXROW = 2`): the real token at `pos` and the
+draft at `pos+1`, through ONE read of every weight. Row 0's logits give the true token at
+`pos+1`; row 1's give the true token at `pos+2`, valid exactly when the draft was right.
+
+`R = 2` and not 3, by measurement: chained depth-2 drafts land at **4.4%** acceptance
+(GLM-5.2 has one MTP layer), so a 3-row pass verifies 1.559 tokens against 1.535 for two.
+
+Every device buffer is row-minor (`buf[r*dim + i]`). Kernels split three ways:
+
+| | kernels |
+|---|---|
+| **Row-batched** (`R` a C++ template parameter, `_r2` instantiation, `nrow` launcher arg, guard 1004 outside {1,2}) | `moe_gateup_vq`/`moe_down_vq`, `gemv_fp8` (+split-K), `mla_absorb_fp8`, `mla_value_fp8`, `gemv_f32`, `gemv_i8` |
+| **Launched R times at a row offset** (scalar `pos` or a stride the kernel cannot express) | `rmsnorm`, `rope_interleave`, `append_kv`, `gather_rope`, `attend`, `embed_i8_row`, `argmax_reduce` |
+| **One launch over `nrow*dim`** (axes contiguous) | `vadd`, `swiglu`, `flag_nonfinite`, `moe_acc_drain` |
+
+`moe_acc` is laid out `[stream][token row][hidden]`, so the drain over `nrow*hidden` with
+`MOE_ACC_ROWS` stream rows handles every token row in one launch — the kernel never learns
+that its `n` is two axes.
+
+### Rollback is nearly free
+
+`append_kv` writes KV **row `pos`** and `attend` reads rows `0..nr` with `nr` derived from
+position. So rejecting a draft is *not advancing `pos`* — the next pass overwrites the
+speculative row. No compaction, no free list, no fixup pass. The expert pool is deliberately
+NOT rolled back: a rejected draft leaves its fetched bytes warm.
+
+The head's own KV must be **hole-free**, which is why `mtp_draft` takes a slice. An accepted
+pass skips element `pos+1`, and leaving that row uninitialised would poison every later
+draft's attention — so on an accept the filler element and the real next draft ride one
+2-row head pass.
+
+### Why output cannot differ
+
+Every batched kernel is bit-identical per row
+(`tests/kernel.rs::batched_rows_are_bit_identical_to_single_rows`, `assert_eq!` and not a
+tolerance). Row 0 of a verify pass IS the real token. In the MoE the pass submits the UNION
+of both rows' picks, and a row that did not route to a union expert carries weight **0.0**,
+which `moe_down_vq` **skips** rather than multiplying by — so a row's result is exactly its
+own 8 + shared whatever else the union dragged in. The skip is correctness, not thrift:
+`0 * dv` with a non-finite `dv` is NaN, and `moe_fixed`'s clamp turns NaN into a FINITE
+extreme. Verified end to end: byte-identical completions at 128 and 512 tokens.
+
+### It is currently a LOSS, and the arithmetic says why
+
+Measured 0.93–0.95× (2.50 vs 2.69 tok/s at 128 tokens; 2.49 vs 2.63 at 512). The MoE is 67%
+of the pass and a batched pass launches the **union**: two rows route to ~13.5 routed + 1
+shared = 14.5 experts against a single row's 9, so **1.61× the weight reads**. Per expert
+the second row genuinely is free (0-miss layers: 178 µs/expert batched vs 176 µs), because
+~92% of an expert launch is the weight read. Attention is the opposite and behaves as
+designed — dense weights read once per layer whatever `R` is, measured 1.09× per pass,
+0.83× per token.
+
+Blended: a verify pass costs **1.53×** a sequential one, so it needs **1.53 tokens/pass ≈
+53% acceptance** to break even. Measured acceptance is 42–54% depending on sample. It is a
+coin flip landing slightly wrong, not a structural impossibility — and the only lever is
+acceptance, since skipping zero-weight rows inside the kernel would recover ~8%.
+
+**A pre-implementation estimate of 1.27–1.33× was wrong** because it applied the union
+factor to FETCH and only the row-batching factor to COMPUTE. Each union expert needs its own
+weight read. That single term was the whole error; `benchmarks.md` has the table.
+
+### Refused rather than half-supported
+
+`--attn streaming|dsa|misa` with `nrow > 1` (each row selects a different KV window), the
+`.i4` MoE kernel at `nrow > 1` (a hybrid layer mixes formats, so a silently single-row int4
+expert would leave row 1 short a few experts and still decode), tracing (a verify pass
+routes twice per layer and submits the union, which the v2 trace format cannot spell), and
+every batched launcher on Vulkan. `main` resolves the head-absent and `--trace` cases by
+downgrading to sequential decode and saying which, rather than failing.

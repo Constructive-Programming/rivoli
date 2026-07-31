@@ -9,19 +9,46 @@ AMD Strix Halo gfx1151. Matrix: `--mode {int3-vq,int4,hybrid}` × `--cache-polic
 `--attn dense`, `--max-mem 115`. Only `--mode` and `--cache-policy` vary.
 Binary: release + `--features rocm`. GPU sole-tenant (k3s stopped).
 `.i4` experts are the **vq3-derived** set (`vq3_to_i4`); see "int4 provenance" below.
-**STALE as of 2026-07-27:** the `.i4` set has since been rebuilt from fp8 (`fp8_to_i4`), and
-`--mode int4` now measures **PPL 73.43 vs int3-vq's 5.28**. Every int4 and hybrid row below
-was produced with the *old* set and does not describe the current artifact — see `docs/INT4.md`.
+
+> **STALE — and the staleness notice was itself stale, corrected 2026-07-31.** Every int4
+> and hybrid row below was produced with the *old* per-row-scaled `.i4` set and does not
+> describe the current artifact. The number this banner used to quote — "`--mode int4` now
+> measures PPL 73.43" — was the **pre-fix** figure and stopped being true the same day it
+> was written: `docs/INT4.md` is headed *"Status: RESOLVED, 2026-07-27"*, group-128 scales
+> took int4 from **73.43 → 5.120** and hybrid from 11.55 → 5.189, and int4 became the
+> best-quality mode in the engine. Re-measured 2026-07-31 on the current artifact:
+> **int4 5.154898 against int3-vq's 5.222720**. Read `docs/INT4.md` §0 and §10, and the
+> `--mode int4` section near the end of this file, before quoting any int4 number from
+> anywhere above.
 
 ## Results — all coherent, no crashes
 
-Output quality is gated first (degenerate greedy output = a severe bug, disqualified
-from ranking) via the distinct-token ratio of the completion. Every cell passed.
-**Do not rank on this metric.** Measured 2026-07-27: across a branch-gain sweep PPL tripled
-(73 → 216) while distinct-ratio doubled (0.126 → 0.324) — monotone in OPPOSITE directions.
-It detects repetition, one failure mode among many, and repetition is suppressible by changes
-that damage the model. Rank on teacher-forced PPL; use this only to flag a run unreadable.
-See `docs/INT4.md` §1.
+Output quality is gated first via the distinct-token ratio of the completion. Every cell
+passed. **Do not rank on this metric, and do not treat a low score as a bug report.**
+Measured 2026-07-27: across a branch-gain sweep PPL tripled (73 → 216) while distinct-ratio
+doubled (0.126 → 0.324) — monotone in OPPOSITE directions. It detects repetition, one
+failure mode among many, and repetition is suppressible by changes that damage the model.
+Rank on teacher-forced PPL; use this only to flag a run unreadable. See `docs/INT4.md` §1.
+
+> **This gate has now misled three separate investigations, so it is worth stating what it
+> cannot do.** `distinct` and `longest repeated block` fire IDENTICALLY on (a) a clean
+> greedy repetition loop, (b) *spliced corruption* — half-copies from context cutting
+> mid-phrase — and (c) legitimate prose that restates a paragraph on purpose. The three
+> demand completely different responses and the metric cannot tell them apart:
+>
+> - §10 of `docs/INT4.md`: hybrid scored the WORST distinct-ratio of the three modes
+>   (0.138) with the second-best PPL. A distinct-ratio gate would have rejected the best
+>   config in the engine.
+> - 2026-07-31: `distinct 0.193 / longest repeated block 77` on int3-vq was read as
+>   "repetition collapse" and sent an investigation after a KV/attention bug that does not
+>   exist. The text was spliced, not looped, and that distinction was the whole diagnosis.
+> - 2026-07-31: int4 and int3-vq scored `distinct 0.279` vs `0.264` and **`longest repeated
+>   block 77` for BOTH** on the same prompt — one produced correct physics with a
+>   deliberate `**Corrected Version:**` restatement, the other produced wreckage.
+>
+> **Read the text.** The metric flags a run for reading; it does not diagnose it, and an
+> earlier framing of degeneration as "a severe bug, disqualified from ranking" is retired
+> as of 2026-07-31 — that is a hypothesis to test, not a verdict to record.
 
 | mode | policy | tok/s | hit % | distinct | output |
 |---|---|---:|---:|---:|---|
@@ -1618,9 +1645,15 @@ NLL 5** — near-random even given a known-good prefix. Greedy has no escape fro
 one bad argmax conditions everything after it.
 
 What this does NOT establish is how much of that 6.8% is int3-vq damage versus GLM-5.2
-under greedy: the repo has no unquantized arm (the ladder is int3-vq 5.28 > hybrid 11.55 >
-int4 73.43, all quantized), so the attribution is unmeasured. If it is quantization, the
-lever is a sampler (temperature/top-p) — the engine is greedy-only — not a kernel.
+under greedy: the repo has no unquantized arm, so the attribution is unmeasured. (An earlier
+draft of this paragraph cited "the ladder is int3-vq 5.28 > hybrid 11.55 > int4 73.43" —
+those are the PRE-fix numbers and the ordering is inverted. Post-fix it is int4 5.120 >
+hybrid 5.189 > int3-vq 5.275. Every arm is still quantized, which is the part that
+mattered, but quoting the dead ladder is exactly the drift this file keeps catching.) If it
+is quantization, the lever is a sampler (temperature/top-p) — the engine is greedy-only —
+not a kernel. **Measured 2026-07-31, and it moves this a long way:** int4 on the same
+prompt produces correct physics for 512 tokens and self-corrects mid-completion. So the
+6.8% is at least substantially int3-vq's format, not the checkpoint's ceiling.
 
 **A caution on method.** A first attempt to localise the fork by teacher-forcing the model
 on its OWN output was discarded as confounded: it fed raw text through `--ppl` while the

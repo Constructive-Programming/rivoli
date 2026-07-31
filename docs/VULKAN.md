@@ -308,6 +308,21 @@ runs the model, and it cuts 13 kernels from the port.
 - `vaxpy` (`fwd.hip`) — reached only by `--moe-gain != 1`, an experiment knob. `vadd`, the
   g = 1 case, IS ported and is what every normal decode uses.
 
+**Ported but SINGLE-ROW, as of 2026-07-31 — a third category this inventory did not have.**
+`gemv_fp8` (+split-K), `gemv_f32`, `gemv_i8`, `mla_absorb_fp8`, `mla_value_fp8` and
+`moe_expert_range` gained an `nrow` argument on the HIP side for the speculative verify pass
+(ARCHITECTURE §13). The `.comp` shaders have no row axis, so all six accept `nrow == 1` and
+return `Err` above it. Consequence: **speculative decode is ROCm-only.**
+
+That is NOT enforced by `validate_backend`, and the asymmetry is deliberate but thin. The
+13 deferred kernels are gated at startup because `--mode`/`--attn` name them directly; the
+row count is a property of the artifact (does it carry an MTP head?) rather than of a flag,
+and it is only reachable at all because the Vulkan default `--mode int3-vq` is the mode the
+head rides. A Vulkan run against a head-carrying artifact therefore fails at the first layer
+of the first token rather than before the artifact is opened. If that combination becomes
+expected rather than incidental, move it into `validate_backend` — the message already names
+`--features rocm`.
+
 **How the deferral is enforced, as of increment 1.** Two layers, and the order matters:
 
 - `Config::validate_backend` refuses `--mode int4|hybrid` and `--attn dsa|misa` at

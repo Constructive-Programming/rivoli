@@ -28,8 +28,17 @@ compared across sessions except where a control licenses it, and those controls 
 
 **Reproduction.** Artifact `/var/db/rivoli/glm52-vq3-full` (`i4_source` stamp: tool
 `fp8_to_i4`, chain `fp8->int4`, src `/swarm/storage/ai/openclaw/glm52-fp8`, layers [3,78]) —
-that stamp is the authoritative way to tell the two `.i4` sets apart, since one overwrote the
-other in place. Engine: this branch (`feat/fp8-i4`) for A0–A5/M1/H, `41522f6` for P.
+that stamp was the authoritative way to tell the two `.i4` sets apart, since one overwrote
+the other in place. Engine: this branch (`feat/fp8-i4`) for A0–A5/M1/H, `41522f6` for P.
+
+> **CORRECTION, 2026-07-31: the stamp is gone, and it was never the strongest evidence.**
+> That artifact's `manifest.json` now carries no `i4_source` at all — a stamp is one JSON
+> field and JSON fields go missing. The **slab length** does not: `ExpertSet::open` requires
+> `len == (n_experts + 1) * i4_expert_stride`, and the stride is a function of the group
+> size, so the file's 5,153,882,112 B = 257 × 20,054,016 identifies group 128 and nothing
+> else (group 64 would be 21,233,664 per expert, per-row 18,915,328). Length is the
+> discriminator; the stamp is the label on it. `main` no longer refuses an unstamped set —
+> see the correction under §10 below.
 
 ```
 rivoli <artifact> --ppl tests/ppl-corpus.txt --ppl-out out.nll \
@@ -297,7 +306,9 @@ mode should be removed rather than shipped.
   `--xcheck` (`.i4` ↔ `.vq3`, the one that can fail), `--scale-study` (α sweep, weight and
   output space), plus dead-row and bulk/tail statistics.
 - `tests/artifact.rs::i4_bytes_are_what_the_checkpoint_quantizes_to` — exact, CPU-only,
-  provenance-gated on `i4_source`.
+  provenance-gated on `i4_source`. (Still gated: a TEST may reasonably demand the label,
+  since it is asserting what the bytes were derived *from*, which length cannot show. The
+  ENGINE only needs the group size, which length does show — see the §10 amendment.)
 - `tests/kernel.rs::moe_i4_real_data_vs_fp8_ground_truth` — independent f64 ground truth.
 - `--moe-gain <g>` — MoE-branch gain, `vadd`-identical at 1.0. **Decision: kept, diagnostic
   only.** Its hypothesis is falsified (§3) and it is *not* a fix — A5's g=1.10 gain is an
@@ -368,6 +379,19 @@ sending the reader after a numerics bug that is really a stale artifact. The eng
 test now refuse, naming both group sizes and the remedy. Verified in both directions: refusing
 the per-row artifact, passing the rebuilt one. *A provenance field that records without
 enforcing is the failure it exists to prevent.*
+
+> **AMENDED 2026-07-31.** That aphorism is right about a stamp that *disagrees* and wrong
+> about one that is *absent*, and the code had conflated them: the `None` arm refused to
+> load, which locked out the reference artifact — bytes provably correct — because a JSON
+> field went missing. It also contradicted `format.rs::I4Source`'s own doc comment, which
+> already said such a set "has a different `.i4` file size and is rejected by
+> `ExpertSet::open`, so this is a diagnosis, not a load-time guard."
+>
+> The behaviour now matches that comment. **Unstamped** logs a line and defers to the slab
+> length, which proves the group size exactly and before any expert is read. **A stamp that
+> positively disagrees still bails** — that is a claim in conflict with the binary, not the
+> absence of one. Sharpened: *a provenance field should enforce what it asserts, and assert
+> nothing when it is silent.*
 
 **Still open.** `I4_GROUP = 64` is untested and is what `.vq3` uses — worth one sweep, since it
 costs another ~6% in size and the engine is bandwidth-bound. Asymmetric quantisation (a

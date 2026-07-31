@@ -14,6 +14,22 @@ the bottom is the whole story; the sections explain the tradeoffs behind it.
 Everything here is about the **routed** experts (256/layer, streamed on demand). The
 always-resident set (attention, dense MLPs, shared expert, codebooks) is unaffected.
 
+> **The format mode also decides whether speculative decode runs, and in the DEFAULT mode
+> it does not.** The MTP head is checkpoint layer 78 and rides the routed pool like any
+> other layer, so it needs its expert slab in **every format the run opens**. `bin/convert`
+> emits `L78.vq3`; `bin/fp8_to_i4` emits no `L78.i4`. So:
+>
+> | `--mode` | opens | MTP head | speculative decode |
+> |---|---|---|---|
+> | `int3-vq` | `.vq3` | present | **on** (default; `--no-mtp` opts out) |
+> | `int4` | `.i4` | absent | off — logged with the reason |
+> | `hybrid` *(default)* | both | absent | off — logged with the reason |
+>
+> So `rivoli <artifact>` with no flags decodes sequentially, and only `--mode int3-vq`
+> exercises the two-row verify pass. That is a gap in `fp8_to_i4`, not a design choice —
+> see `docs/ARCHITECTURE.md` §13. It is also currently a 0.93–0.95× feature, so nothing is
+> being lost in the meantime.
+
 ---
 
 ## Format modes
@@ -47,8 +63,11 @@ many fit in the pool → hit rate), and **stream cost** (bytes per miss).
   usually **loses** — the residency hit outweighs the compute win.
 
 ### `hybrid` — int4 hot, int3-vq cold *(default)*
-> **Measured 2026-07-28: PPL 5.189** — the best perplexity in the engine, ahead of
-> int3-vq (5.275) and int4 (5.120 — better still, but far slower in practice). The
+> **Measured 2026-07-28: PPL 5.189** — the best mode in the engine OVERALL, being the only
+> one that beats int3-vq on both axes at once (5.189 vs 5.275 *and* 2.72 vs 2.62 tok/s).
+> Not the best perplexity: that is int4 at **5.120**, which this line used to claim for
+> hybrid while listing a better number two clauses later. int4 is best quality and slowest;
+> hybrid is best overall. (Corrected 2026-07-31.) The
 > earlier 11.55 was measured against the per-row-scaled `.i4` set that `docs/INT4.md` §10
 > replaced with group-128 scales; it does not describe the current artifact.
 Two physical slabs. The cache policy routes each expert to one:

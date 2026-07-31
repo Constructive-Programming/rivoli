@@ -150,7 +150,16 @@ replace it rather than layer on top of it:
   highest-value experts in the layer. int4 is ~1.8× faster to compute (isolated: gate/up
   int4 669 vs vq3 353 GElem/s).
   **It is NOT more accurate in the artifact we run, and an earlier draft of this line
-  claimed it was.** `bin/vq3_to_i4` re-derives `.i4` from our own `.vq3`, so the chain is
+  claimed it was.**
+  > **REVERSED 2026-07-27, and the original draft was right after all.** `bin/vq3_to_i4`
+  > is deleted; `.i4` comes from `bin/fp8_to_i4` (chain fp8 → int4, no vq3 leg) and carries
+  > group-128 scales. int4 is now the best-quality mode in the engine — **PPL 5.120 vs
+  > int3-vq's 5.275** (`docs/INT4.md` §10), re-measured 5.154898 vs 5.222720 on 2026-07-31.
+  > Promoting to int4 buys speed AND quality now; what it costs is residency, since the
+  > int4 slot is 31% larger. The historical reasoning is kept below because what it
+  > eliminated still matters.
+
+  `bin/vq3_to_i4` re-derived `.i4` from our own `.vq3`, so the chain was
   fp8 → vq3 (lossy 3-bit) → int4 and the int4 set cannot be better than the vq3 it came
   from, by construction. Measured on a 762-token teacher-forced corpus at the time: int4
   PPL 9.083 vs

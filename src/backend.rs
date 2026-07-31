@@ -34,6 +34,16 @@
 //!    configurations that would reach them (`--attn dsa|misa`, `--mode int4|hybrid`) at
 //!    startup; the launchers themselves return `Err` as a backstop. The `--mode` and
 //!    `--attn auto` DEFAULTS therefore differ by backend — see `config::Mode`.
+//! 1b. **Six PORTED kernels are single-row.** A different thing from a deferred kernel and
+//!    worth its own line: `gemv_fp8`, `gemv_f32`, `gemv_i8`, `mla_absorb_fp8`,
+//!    `mla_value_fp8` and `moe_expert_range` all run correctly here at `nrow == 1` and
+//!    refuse above it, because the `.comp` shaders carry no row axis. That makes
+//!    SPECULATIVE DECODE (the two-row verify pass, ARCHITECTURE §13) ROCm-only. Unlike the
+//!    13, this is not gated at startup — an artifact carrying the MTP head fails at the
+//!    first layer of the first token with a message naming `--features rocm`. Acceptable
+//!    only because the Vulkan default is `--mode int3-vq` while the head rides `.vq3`, so
+//!    the combination is reachable; if a Vulkan run is ever expected to carry one, this
+//!    belongs in `validate_backend` instead.
 //! 2. **The MoE kernels are ~2.1x slower than the HIP originals**, which is now the whole of
 //!    the throughput gap (measured per-phase; docs/VULKAN.md, "Increment 2: measured"). A
 //!    Vulkan run's tok/s is not a statement about the engine's design, and after

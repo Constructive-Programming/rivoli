@@ -18,7 +18,15 @@ the right one, and the measured hit-rate rise (78.0 → 79.8%) is the confirmati
 **1. ~~Blocked on a faithful int4~~ — LIFTED.** This reason said the machinery existed to
 make an L+2 **int4 promotion** affordable, while `.i4` was re-derived from `.vq3`
 (`bin/vq3_to_i4`) and therefore strictly *less* faithful than the vq3 it came from —
-int3-vq PPL 5.275 against int4 9.083. Promoting to int4 degraded quality, so building
+int3-vq PPL 5.275 against int4 9.083.
+
+> **`bin/vq3_to_i4` NO LONGER EXISTS** (deleted; `docs/ARCHITECTURE.md` §11 flags every
+> doc that still cites it). `.i4` is built by `bin/fp8_to_i4` straight from the fp8 source,
+> and since the group-128 fix (`docs/INT4.md`, RESOLVED 2026-07-27) int4 is the
+> best-QUALITY mode in the engine: **PPL 5.120 against int3-vq's 5.275**, re-measured
+> 5.154898 vs 5.222720 on 2026-07-31. The premise this bullet was lifted *around* — that
+> promoting to int4 degrades quality — is now false in the opposite direction. Anything
+> below reasoning from "int4 is less faithful" is reasoning from a dead artifact. Promoting to int4 degraded quality, so building
 machinery to promote *more, earlier* would have been an elaborate way to make the model
 worse.
 
