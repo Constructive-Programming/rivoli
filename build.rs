@@ -10,6 +10,7 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
+    no_duplicated_rust(); // backend-independent; runs in all three arms, including featureless.
     if std::env::var("CARGO_FEATURE_VULKAN").is_ok() {
         return vulkan(); // second backend: glslc instead of hipcc, no HIP at all.
     }
@@ -86,32 +87,6 @@ const VK_ROWS_PER_BLOCK: u32 = 8;
 /// flag differently: `glslc --target-env=X`, but `spirv-val --target-env X` — the `=`
 /// form makes spirv-val print its usage and exit non-zero.
 const VK_TARGET_ENV: &str = "vulkan1.3";
-
-/// Modules where a barrier exists but [`no_barrier_without_memory`] declines to judge it,
-/// with the LDS the barrier is presumed to be ordering. See that function for why the set
-/// is pinned rather than merely reported. Module scope so `vulkan()` can also check that
-/// every entry still names a real shader — the deletion case the per-shader comparison
-/// cannot observe.
-const BARRIER_EXEMPT: &[(&str, &str)] = &[
-    ("append_kv", "block-max reduction over the latent row"),
-    ("argmax_reduce", "LDS halving tree over the vocabulary partials"),
-    ("gemv_fp8", "the e4m3 LUT, plus split-K's per-wave partials"),
-    ("rmsnorm", "LDS halving tree over the sum of squares"),
-    // Both MLA kernels carry ONE barrier, between E4M3_LUT_BUILD's writes to the shared
-    // e4m3 table and the first read of it. That is shared-memory ordering only, which a
-    // bare `barrier()` covers — checked by hand, as the diagnostic demands. Neither
-    // writes a buffer any other thread reads (each thread owns one output element), so
-    // unlike rope_interleave there is no buffer traffic for the barrier to order.
-    ("mla_value_fp8", "the e4m3 LUT"),
-    ("mla_absorb_fp8", "the e4m3 LUT"),
-    // Every barrier in both attention kernels separates a shared WRITE from a shared
-    // READ — the staged L/R token tile, and the combine's per-split weights — so bare
-    // WorkgroupMemory semantics are what they need. Hand-checked, as the diagnostic
-    // demands. Buffer traffic needs no ordering across them: the only writes are the
-    // final per-thread stores to disjoint clat/partial slots, after the last barrier.
-    ("mla_latent_attend", "the staged L/R token tile"),
-    ("mla_attend_combine", "the per-split softmax weights and inv_l"),
-];
 
 fn vulkan() {
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR set by cargo");
@@ -211,25 +186,9 @@ fn vulkan() {
             failures.extend(no_reciprocal_rewrite(&spv, &text));
             failures.extend(no_banned_builtins(&spv, &text));
             failures.extend(no_array_parameters(&spv, &text));
-            failures.extend(no_barrier_without_memory(&spv, &stem, &text));
+            failures.extend(no_barrier_without_memory(&spv, &text));
         }
     }
-    // The one transition the per-shader EXEMPT check structurally CANNOT see: a shader
-    // that no longer exists is never visited, so its entry is never re-examined by
-    // anything. Rename `rmsnorm.comp` and the orphaned ("rmsnorm", ...) sits there
-    // silently pre-authorising any FUTURE shader that takes the name back — which would
-    // then be waived from barrier checking with no diagnostic and no human ever having
-    // confirmed its barriers order what they must. That is the exact silent skip this
-    // mechanism exists to abolish, re-entering through deletion.
-    failures.extend(BARRIER_EXEMPT.iter().filter(|(m, _)| !stems.iter().any(|s| s == m)).map(
-        |(m, _)| {
-            format!(
-                "BARRIER_EXEMPT lists `{m}`, but kernels/vk/{m}.comp does not exist.\n  \
-                 A stale entry pre-authorises a future shader of that name to skip the \
-                 barrier rule silently. Remove it from BARRIER_EXEMPT in build.rs."
-            )
-        },
-    ));
     assert!(
         failures.is_empty(),
         "\n\n{} shader problem(s) — ALL of them, not just the first:\n\n{}\n",
@@ -287,11 +246,6 @@ fn no_subgroup_arithmetic(spv: &str, text: &str) -> Vec<String> {
 /// author-written scale that deserves an argument. Pass the divisor in at runtime — an
 /// operand the optimizer cannot see is an operand it cannot fold.
 fn no_reciprocal_rewrite(spv: &str, text: &str) -> Vec<String> {
-    // Legitimate non-power-of-two constant multiplies, if one is ever justified: add
-    // the exact printed value here with a comment saying why it is safe. Empty on
-    // purpose — every current kernel either divides at runtime or scales by 2^n.
-    const ALLOWED: &[&str] = &[];
-
     let mut found = Vec::new();
     // name -> printed value, from `%float_x = OpConstant %float 0.125`
     let mut consts = std::collections::HashMap::new();
@@ -306,9 +260,6 @@ fn no_reciprocal_rewrite(spv: &str, text: &str) -> Vec<String> {
         }
         for tok in line.split_whitespace() {
             let Some(val) = consts.get(tok) else { continue };
-            if ALLOWED.contains(val) {
-                continue;
-            }
             let Ok(v) = val.parse::<f32>() else { continue };
             // Exact power of two (or zero): mantissa bits all clear.
             if v == 0.0 || (v.to_bits() & 0x007f_ffff) == 0 {
@@ -319,8 +270,10 @@ fn no_reciprocal_rewrite(spv: &str, text: &str) -> Vec<String> {
                  This is how `glslc -O` spells `a / {:.0}` — and a reciprocal multiply \
                  is NOT bit-identical to the divide hipcc emits, so the two backends \
                  diverge silently. Pass the divisor in as a push constant (see \
-                 append_kv.comp), or if this multiply is deliberate and safe, add \
-                 \"{val}\" to ALLOWED in build.rs with the reason.",
+                 append_kv.comp). There is no exemption list: an empty `ALLOWED` const \
+                 sat here until 2026-08-01 defending a hole nothing had ever needed. Add \
+                 one back — with the exact printed value and the reason it is safe — the \
+                 day a kernel genuinely needs it.",
                 line.trim(),
                 1.0 / v
             ));
@@ -342,36 +295,30 @@ fn no_reciprocal_rewrite(spv: &str, text: &str) -> Vec<String> {
 /// HIP computes a correctly-rounded `sqrtf` and then a correctly-rounded divide. Two
 /// different numbers, from a change that reads as cleanup.
 ///
-/// A denylist of one entry that fires exactly is worth more than no guard. It grows as
-/// more are identified; each needs the divergence it prevents named, or the next person
-/// cannot judge whether an exemption is safe.
+/// One test that fires exactly is worth more than no guard. It was a `BANNED` table of a
+/// single row until 2026-08-01 — a denylist shape for a denylist of one. Add a second
+/// `filter` when a second builtin is identified, and name the divergence it prevents, or
+/// the next person cannot judge whether an exemption is safe.
 fn no_banned_builtins(spv: &str, text: &str) -> Vec<String> {
-    /// `(instruction, what to write instead, why)`.
-    const BANNED: &[(&str, &str, &str)] = &[(
-        "InverseSqrt",
-        "1.0 / sqrt(z)",
-        "Vulkan specifies inversesqrt to 2 ULP as one operation; HIP does a \
-         correctly-rounded sqrt then a correctly-rounded divide, so the results differ",
-    )];
-
-    let mut found = Vec::new();
-    for line in text.lines() {
+    text.lines()
         // Match the operand position exactly: `%n = OpExtInst %type %set <Instr> ...`.
         // A substring search would also hit a name or a debug string.
-        let Some((_, rest)) = line.split_once(" = OpExtInst ") else { continue };
-        let Some(instr) = rest.split_whitespace().nth(2) else { continue };
-        for (banned, instead, why) in BANNED {
-            if instr == *banned {
-                found.push(format!(
-                    "{spv}: calls GLSL.std.450 `{banned}`\n  {}\n  Use `{instead}` \
-                     instead — {why}. If this call is deliberate and the divergence is \
-                     acceptable, remove it from BANNED in build.rs and say why.",
-                    line.trim()
-                ));
-            }
-        }
-    }
-    found
+        .filter(|l| {
+            l.split_once(" = OpExtInst ")
+                .and_then(|(_, rest)| rest.split_whitespace().nth(2))
+                == Some("InverseSqrt")
+        })
+        .map(|l| {
+            format!(
+                "{spv}: calls GLSL.std.450 `InverseSqrt`\n  {}\n  Use `1.0 / sqrt(z)` \
+                 instead — Vulkan specifies inversesqrt to 2 ULP as ONE operation, where \
+                 HIP computes a correctly-rounded sqrt and then a correctly-rounded \
+                 divide, so the results differ. If this call is deliberate and the \
+                 divergence is acceptable, delete the test in build.rs and say why.",
+                l.trim()
+            )
+        })
+        .collect()
 }
 
 /// Fail the build if a shader copies a WHOLE ARRAY in one load.
@@ -459,93 +406,42 @@ fn no_array_parameters(spv: &str, text: &str) -> Vec<String> {
 ///
 /// Fix: `memoryBarrierBuffer(); barrier();`
 ///
-/// ## The skip set is PINNED, because a silent skip is how this rule dies
+/// ## The skip is invisible, and the bookkeeping that policed it was not worth its weight
 ///
-/// The `has_shared` skip above is deliberate and correct — but it is also INVISIBLE, and
-/// that is a defect independent of the rule being right. A module that gains a `shared`
-/// variable drops out of barrier checking with no diagnostic, and the change that does it
-/// reads as ordinary work: add an LDS tile, and every barrier in that kernel silently
-/// stops being judged.
+/// The `has_shared` skip is deliberate and correct, but it is also SILENT: a module that
+/// gains a genuinely-used `shared` variable drops out of barrier checking with no
+/// diagnostic. The exact trigger was MEASURED, because a first version of this comment got
+/// it wrong — an UNUSED Workgroup variable is dead-code-eliminated, so a global `shared
+/// float lut[256]` that a module never reads leaves ZERO `OpVariable %_ptr_Workgroup`
+/// under `-O` (1 without it, and this build ships `-O`). The trigger is a barrier plus a
+/// Workgroup variable the module actually uses.
 ///
-/// The trigger is narrower than "a module gains a `shared` declaration", and the
-/// difference was MEASURED after a first version of this comment got it wrong. An unused
-/// Workgroup variable is dead-code-eliminated: a global `shared float lut[256]` that a
-/// module never reads leaves ZERO `OpVariable %_ptr_Workgroup` under `-O` (1 without it,
-/// and this build ships `-O`). So hoisting a shared LUT into `common.glsl` would NOT
-/// disarm the rule across every includer, as claimed here originally — only in the
-/// modules that actually read it. The real trigger is **a barrier plus a Workgroup
-/// variable the module genuinely uses**.
-///
-/// Left standing because a guard resting on a false rationale is this repo's own
-/// documented trap: the code was right, the argument was wrong, and the argument is what
-/// a maintainer reads when deciding whether the guard still earns its place.
-///
-/// Enforced in both directions so the list cannot rot into describing a past tree, plus a
-/// whole-set check in `vulkan()` for the deletion case neither direction can see. An
-/// entry costs an argument in a reviewable diff, matching `ALLOWED` in
-/// `tests/kernel_coverage.rs` and `LOCKED` in `tests/glsl_numerics.rs`.
-///
-/// **Read the list as a coverage statement, because it is a blunt one:** of eleven
-/// shaders, six have no barrier at all, FOUR are exempt here, and exactly ONE —
-/// `rope_interleave`, the kernel whose bug created this rule — is actually judged. The
-/// anti-vacuity principle this repo already applies ("prove the check looked at
-/// something") extended one step: also say what it did NOT look at.
-///
-/// A `cargo:warning` on every build was considered and rejected. Cargo hides plain build
-/// script output unless `-vv`, so it would land in a sink; and a warning that fires on
-/// every healthy build gets filtered out by the reader, which is this repo's stated
-/// reason for not counting PERFORMANCE validation messages. A build ERROR the moment the
-/// set CHANGES is the event worth interrupting someone for.
-fn no_barrier_without_memory(spv: &str, stem: &str, text: &str) -> Vec<String> {
+/// That silence used to be policed by a pinned `BARRIER_EXEMPT` const — 8 entries, a
+/// per-shader `skipped != listed` reporter, and a whole-set orphan scan in `vulkan()`.
+/// **Deleted 2026-08-01.** Of 20 shaders, 11 carry no barrier at all, 8 sat in the exempt
+/// list, and exactly ONE — `rope_interleave`, the kernel whose bug created this rule — was
+/// ever judged: ~60 lines of bidirectional bookkeeping to annotate a coverage ratio. Its
+/// one recorded incident was a FALSE lead, too. Converting `rmsnorm`'s halving tree to the
+/// `wave_sum` ladder (which the capability rule above actively encourages) makes it lose
+/// its Workgroup variable, and the mismatch reporter fired on that, saying "remove a stale
+/// const entry" where the news would have been a live ordering bug. The rule below is the
+/// guard; the list was commentary with a compiler error attached.
+fn no_barrier_without_memory(spv: &str, text: &str) -> Vec<String> {
     let has_barrier = text.contains("OpControlBarrier");
     let has_shared = text.contains("OpVariable %_ptr_Workgroup");
     let has_memory_barrier = text.contains("OpMemoryBarrier");
 
-    // BOOKKEEPING AND THE REAL RULE BOTH REPORT, and the fall-through is the point.
-    // Returning on the EXEMPT mismatch substituted one message for the other in the case
-    // that matters most: convert `rmsnorm`'s halving tree to the `wave_sum` shuffle
-    // ladder — which the capability rule above actively encourages — and it loses its
-    // Workgroup variable while keeping a bare `barrier()` over buffer traffic. That is
-    // bit-for-bit the `rope_interleave` signature, but `listed && !skipped` fired first
-    // and the build said "remove a stale const entry", naming bookkeeping where the news
-    // was a live ordering bug. Same first-failure-floor this file rejects at build scope,
-    // reintroduced per shader.
-    let mut found = Vec::new();
-    let skipped = has_barrier && has_shared;
-    let listed = BARRIER_EXEMPT.iter().any(|(m, _)| *m == stem);
-    if skipped != listed {
-        found.push(if skipped {
-            format!(
-                "{spv}: has a barrier AND shared memory, so the barrier rule SKIPS it — \
-                 but `{stem}` is not in BARRIER_EXEMPT.\n  This kernel's barriers are no \
-                 longer checked for the missing buffer semantics that `rope_interleave` \
-                 shipped, and nothing would have said so. Add (\"{stem}\", \"<what the LDS \
-                 is>\") to BARRIER_EXEMPT in build.rs, having first confirmed by hand that \
-                 every barrier in it orders the memory it needs to."
-            )
-        } else {
-            format!(
-                "{spv}: `{stem}` is in BARRIER_EXEMPT, but the rule is NOT skipping it \
-                 (barrier={has_barrier}, shared={has_shared}).\n  The exemption no longer \
-                 describes this shader, and a stale entry reads as coverage that was \
-                 waived. Remove it from BARRIER_EXEMPT in build.rs — and read any finding \
-                 below this one first, it is the substantive one."
-            )
-        });
-    }
-
     if !has_barrier || has_shared || has_memory_barrier {
-        return found;
+        return Vec::new();
     }
-    found.push(format!(
+    vec![format!(
         "{spv}: has a barrier that orders NOTHING\n  OpControlBarrier with \
          WorkgroupMemory-only semantics, in a module with no Workgroup storage.\n  \
          GLSL's bare `barrier()` orders SHARED memory only, unlike HIP's \
          `__syncthreads()` which also orders global. If this barrier is protecting \
          buffer traffic, write `memoryBarrierBuffer(); barrier();` — otherwise the \
          barrier is dead and should be deleted."
-    ));
-    found
+    )]
 }
 
 /// `spirv-dis` output, or `None` with a warning if the tool is absent — same optional
@@ -604,5 +500,99 @@ fn spirv_val(spv: &str) -> Vec<String> {
             println!("cargo:warning=spirv-val not run on {spv} ({e}); SPIR-V unchecked");
             Vec::new()
         }
+    }
+}
+
+/// Fail the build if jscpd finds ANY duplicated block in this repo's own Rust — `src/`,
+/// `tests/`, and this file — at `.jscpd.json`'s `minTokens: 15`.
+///
+/// ## Opt-in today, via `RIVOLI_JSCPD=1`
+///
+/// Measured 2026-08-01 at min-tokens 15 across all 46 Rust files: **181 clones, 1290
+/// duplicated lines, 4.51% of 28594**. An unconditional gate would therefore make the
+/// crate unbuildable, which is not a gate, it is a brick. Clearing that backlog is
+/// separate work; when it reaches zero, delete the `RIVOLI_JSCPD` read below and the gate
+/// is armed for everyone.
+///
+/// ## `.jscpd.json` raises maxLines/maxSize, and that is coverage, not tuning
+///
+/// jscpd's defaults (`max-lines 1000`, `max-size 100kb`) SILENTLY SKIP 9 of the 46 files,
+/// including the four largest: `src/backend/vk.rs` (4125 lines), `tests/vk.rs` (3841),
+/// `src/gpu.rs` (2591), `tests/kernel.rs` (1586). Those are precisely where copy-paste
+/// accumulates, and the skip is printed nowhere except under `--debug`. At the defaults
+/// this tree reports 31 clones / 1.92%; the gap to 4.51% is the size of the hole. Cost of
+/// closing it: detection 0.6s -> 11.9s, paid only by whoever arms the gate. `maxLines`
+/// must stay above the largest file in the tree or the hole silently reopens.
+///
+/// ## An env var, which CLAUDE.md forbids for engine instruments
+///
+/// The objection there is that an env var is invisible to `--help`, absent from the
+/// recorded command line in `docs/measurement/benchmarks.md`, and silently active in a
+/// build that looks stock. None of it applies here: a build script has no `--help` to be
+/// absent from, cargo already configures this one entirely through the environment
+/// (`CARGO_FEATURE_*`, `OUT_DIR`, `HIPCC`, `GLSLC`, `RIVOLI_OFFLOAD_ARCH`), and
+/// `rerun-if-env-changed` puts the toggle inside cargo's own fingerprint.
+///
+/// ## A missing jscpd SKIPS; only a DETECTED CLONE fails
+///
+/// Same treatment as `spirv-val` and `spirv-dis` above: this is a Node tool in a Rust
+/// crate, and a box without Node must still be able to build it. The two outcomes are told
+/// apart by exit code, never by parsing the report:
+///
+/// - `--exitCode 7` is jscpd's own "clones were found" signal and fires on
+///   `clones.length > 0`. `--threshold 0` is the obvious alternative and is WRONG for
+///   "strictly forbidden": it compares a percentage rounded to 2dp, so a small enough
+///   clone in a large enough tree reads as 0.00% and passes. It also throws instead of
+///   returning, so it exits 1 — indistinguishable from the tool being absent.
+/// - Missing package, unreadable config, anything else: exit 1, which warns and carries on.
+///
+/// `npx --no` is load-bearing: without it npx DOWNLOADS jscpd from the network mid-build.
+/// So is the bare `--` — npm otherwise claims `--exitCode` as its own flag and refuses to
+/// run ("Unknown cli config", exit 1), which this function would have read as "absent" and
+/// skipped silently forever.
+fn no_duplicated_rust() {
+    println!("cargo:rerun-if-env-changed=RIVOLI_JSCPD");
+    if std::env::var("RIVOLI_JSCPD").is_err() {
+        return;
+    }
+    // ONE list, serving as both the scan set and cargo's rerun set, so the two cannot
+    // drift apart. Emitted only when the gate is armed: `rerun-if-changed=src` re-runs
+    // this whole script on every Rust edit, and under `rocm` that is hipcc recompiling all
+    // eight kernels for a one-line change in src/.
+    const SCAN: &[&str] = &["src", "tests", "build.rs"];
+    for p in SCAN {
+        println!("cargo:rerun-if-changed={p}");
+    }
+    println!("cargo:rerun-if-changed=.jscpd.json");
+
+    // `-c` is explicit on purpose. jscpd's default is ".jscpd.json in <path>", and <path>
+    // here is `src` — a silent fall-back to the built-in minTokens 50 would leave the gate
+    // more than three times looser than the file that is supposed to govern it.
+    let out = match Command::new("npx")
+        .args(["--no", "--", "jscpd", "-c", ".jscpd.json", "--exitCode", "7"])
+        .args(SCAN)
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            println!("cargo:warning=jscpd not run ({e}); Rust duplication unchecked");
+            return;
+        }
+    };
+    match out.status.code() {
+        Some(0) => {}
+        // BOTH streams, for the reason `spirv_val` documents: the clone list is on stdout,
+        // but an invocation-level complaint can land on either.
+        Some(7) => panic!(
+            "\n\njscpd found duplicated Rust. Duplicates are FORBIDDEN here, not \
+             budgeted — .jscpd.json carries no `threshold`:\n\n{}\n{}\n",
+            String::from_utf8_lossy(&out.stdout).trim(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        _ => println!(
+            "cargo:warning=jscpd did not run ({}); Rust duplication unchecked. Run \
+             `npx --no -- jscpd -c .jscpd.json src tests build.rs` to see why.",
+            out.status
+        ),
     }
 }

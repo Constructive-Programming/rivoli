@@ -283,9 +283,13 @@ admissions fit in any pool that holds one batch, so a perfect predictor removes 
 and the number is a tautology — and at 100% recall the speculative admissions *are* the
 baseline misses, so it is the same bytes moved earlier, which is this document's thesis
 restated rather than tested. **This work's gate is recall, recall is unobservable offline,
-and LOOKA (Step 1) is the only thing that measures it.** `bin/replay` does print a
+and LOOKA (Step 1) is the only thing that measures it.** `bin/replay` printed a
 *modelled* recall curve — at recall `r` the predictor still names `top_k` experts, so
 every false negative is also a false positive, drawn from the ranks just outside the true
+<!-- 2026-08-01: the curve, HORIZONS, COLIBRI_L1_RECALL and Pilot were deleted from
+     bin/replay with the rest of the retired prefetcher. Tag archive/replay-oracle-prefetch
+     holds them. Kept below because a model that was an UPPER BOUND, and said so, is
+     exactly the reasoning this file exists to preserve. -->
 set in that decision's own window — and that curve prices the wasted bytes. It is an upper
 bound (its errors are independent; real ones are correlated), so treat it as the shape of
 the trade, and read the real `r` off LOOKA.

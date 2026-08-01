@@ -299,91 +299,53 @@ fn place_indexer(
     })
 }
 
-/// Device bytes an fp8-e4m3 block-scaled `[o,i]` weight occupies: `o·i` packed +
-/// `⌈o/block⌉·⌈i/block⌉·4` for the F32 block-scale. Single source for the sizing
-/// formulas below (`place_fp8` reserves the shard's own byte length, which this
-/// mirrors) — write the layout once so it can't drift between the two sizers.
-fn fp8_bytes(o: usize, i: usize, block: usize) -> usize {
-    o * i + o.div_ceil(block) * i.div_ceil(block) * 4
-}
-/// Device bytes an int8 per-row `[o,i]` weight occupies: `o·i` packed + `o·4` F32 scale.
-fn i8_bytes(o: usize, i: usize) -> usize {
-    o * i + o * 4
-}
-/// Device bytes an f32 vector of `n` elements occupies.
-fn f32_bytes(n: usize) -> usize {
-    n * 4
-}
-
-/// Device bytes ONE full layer's DSA indexer weights occupy, mirroring
-/// [`place_indexer`]: fp8 `wk`/`wq_b`, f32 `weights_proj` + f32 `k_norm`.
-fn indexer_bytes(cfg: &ModelConfig, block: usize) -> usize {
-    let fp8 = |o: usize, i: usize| fp8_bytes(o, i, block);
-    let hd = cfg.index_head_dim;
-    let nh = cfg.index_n_heads;
-    fp8(hd, cfg.hidden)                  // wk (fp8)
-        + fp8(nh * hd, cfg.q_lora_rank)  // wq_b (fp8)
-        + f32_bytes(nh * cfg.hidden)     // weights_proj (bf16→f32)
-        + 2 * f32_bytes(hd) // k_norm weight + bias (f32)
-}
-
-/// Device bytes the always-resident set occupies — everything read every token
-/// EXCEPT the routed experts. Summed from `cfg` so the resident tier is sized to
-/// what it holds and the rest of the device budget grows the routed pool. Mirrors
-/// the placement path: fp8 `[o,i]` = `o·i` packed + `⌈o/block⌉·⌈i/block⌉·4` scale;
-/// int8 `[o,i]` = `o·i` + `o·4`; an f32 norm of `n` = `n·4`; plus the 3 codebooks
-/// and one VQ shared expert per MoE layer.
-/// `shared_i4`: the always-resident shared expert is int4 (else int3-VQ).
-/// `cb_resident`: the 3 fp16 VQ codebooks are resident (any VQ slab present).
-/// `mtp`: the artifact carries the MTP head — one more MoE layer, plus its
-/// enorm/hnorm/shared_head.norm and the f32-widened `eh_proj`.
+/// Device bytes the always-resident set occupies — everything read every token EXCEPT the
+/// routed experts, so the tier is sized to what it holds and the rest of the device budget
+/// grows the routed pool.
+///
+/// **It is the artifact's own `*.safetensors` byte length, not a second derivation of the
+/// placement layout.** `bin/convert` writes `resident.safetensors` from exactly the tensor
+/// list [`Pin::build`] places, so the file IS the footprint. This replaced 73 lines
+/// (`fp8_bytes`/`i8_bytes`/`f32_bytes`/`indexer_bytes` + a per-layer `cfg` walk) that
+/// re-derived every shard size and were kept in step with the placement path by a comment
+/// saying so — two copies of one layout, and the copy nothing executed was free to drift.
+///
+/// The bias is deliberate: over-count only shrinks the routed pool, under-count is what
+/// `DeviceTier::place` bails on. It over-counts by each file's header, by the ~77 KB of
+/// router correction bias (read to the HOST, never placed), and by one layer's attention
+/// stack when the artifact carries MTP tensors this run cannot use (a format's slab absent).
+///
+/// Skipping the whole `indexer.safetensors` when `!want_indexer` IS the per-tensor
+/// `.indexer` filter — `bin/add_indexer` writes nothing else into it. `cb_resident` and
+/// `shared_i4` add the two resident things no safetensors holds: the 3 fp16 VQ codebooks,
+/// and one shared expert per MoE layer out of the `.vq3`/`.i4` slab.
 fn resident_bytes(
+    dir: &str,
     cfg: &ModelConfig,
-    block: usize,
+    n_pin: usize,
     shared_i4: bool,
     cb_resident: bool,
-    mtp: bool,
-) -> usize {
-    let fp8 = |o: usize, i: usize| fp8_bytes(o, i, block);
-    let i8 = i8_bytes;
-    let f32n = f32_bytes;
-
-    let qk = cfg.qk_head_dim();
-    let mut total = i8(cfg.vocab, cfg.hidden) // embed_tokens
-        + i8(cfg.vocab, cfg.hidden)           // lm_head
-        + f32n(cfg.hidden); // model.norm
-
-    for l in 0..cfg.n_layers + usize::from(mtp) {
-        // Norms: input, post-attn, q_a, kv_a.
-        total += 2 * f32n(cfg.hidden) + f32n(cfg.q_lora_rank) + f32n(cfg.kv_lora_rank);
-        // MLA projections (fp8).
-        total += fp8(cfg.q_lora_rank, cfg.hidden); // q_a
-        total += fp8(cfg.n_heads * qk, cfg.q_lora_rank); // q_b
-        total += fp8(cfg.kv_lora_rank + cfg.qk_rope_head_dim, cfg.hidden); // kv_a
-        total += fp8(
-            cfg.n_heads * (cfg.qk_nope_head_dim + cfg.v_head_dim),
-            cfg.kv_lora_rank,
-        ); // kv_b
-        total += fp8(cfg.hidden, cfg.n_heads * cfg.v_head_dim); // o_proj
-        if l < cfg.dense_layers {
-            total += 2 * fp8(cfg.dense_inter, cfg.hidden); // gate, up
-            total += fp8(cfg.hidden, cfg.dense_inter); // down
-        } else {
-            total += f32n(cfg.n_experts * cfg.hidden); // router gate (F32, device)
-            // Shared expert, in the routed format (int4 blocks are larger than VQ).
-            total += if shared_i4 {
-                i4_expert_bytes(cfg.hidden, cfg.moe_inter)
-            } else {
-                vq_expert_bytes(cfg.hidden, cfg.moe_inter)
-            };
+    want_indexer: bool,
+) -> Result<usize> {
+    let mut total = 0usize;
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read dir {dir}"))? {
+        let p = entry.with_context(|| format!("read dir {dir}"))?.path();
+        let is_st = p.extension().is_some_and(|x| x == "safetensors");
+        let unplaced_indexer =
+            !want_indexer && p.file_name().is_some_and(|n| n == "indexer.safetensors");
+        if !is_st || unplaced_indexer {
+            continue;
         }
+        total += p.metadata().with_context(|| format!("stat {p:?}"))?.len() as usize;
     }
-    // The MTP head's own tensors, on top of the extra layer counted above.
-    if mtp {
-        total += f32n(cfg.hidden * 2 * cfg.hidden) + 3 * f32n(cfg.hidden);
-    }
-    // 3 per-projection fp16 codebooks — resident whenever a VQ slab is present.
-    total + if cb_resident { 3 * VQ_K * VQ_DIM * 2 } else { 0 }
+    let shared = if shared_i4 {
+        i4_expert_bytes(cfg.hidden, cfg.moe_inter)
+    } else {
+        vq_expert_bytes(cfg.hidden, cfg.moe_inter)
+    };
+    Ok(total
+        + (n_pin - cfg.dense_layers) * shared
+        + if cb_resident { 3 * VQ_K * VQ_DIM * 2 } else { 0 })
 }
 
 /// Width of the trace-v2 candidate window: the top-W router candidates recorded per
@@ -403,16 +365,6 @@ pub fn expert_key(layer: usize, expert: usize) -> u32 {
         "layer {layer}/expert {expert} exceed the 16-bit pool key packing"
     );
     ((layer as u32) << 16) | expert as u32
-}
-
-/// Everything `submit_layer` needs to turn a resolved slot into an expert descriptor:
-/// its device base pointer, the six projection offsets, and its weight format (which
-/// kernel gpu.rs launches). Captured AFTER a batch's relocations settle.
-#[derive(Clone, Copy)]
-struct ResolvedSlot {
-    ptr: *mut u8,
-    off: [usize; 6],
-    int4: bool,
 }
 
 /// One arena tier's format: the projection offsets, the format flag, the slot stride,
@@ -464,7 +416,7 @@ struct ArenaPool {
     #[cfg(feature = "trace")]
     loaded: std::collections::HashSet<u32>,
     /// Misses submitted by the PREVIOUS layer, marked loaded at the top of the next
-    /// `submit_spine`. Correct because layer L's per-expert awaits and its unconditional
+    /// `submit_layer`. Correct because layer L's per-expert awaits and its unconditional
     /// end-of-layer `device_sync` both complete before layer L+1 submits — so by then
     /// every byte of L's batch has landed. Deferring this way avoids plumbing a
     /// completion callback through `gpu.rs`'s async expert loop.
@@ -499,15 +451,6 @@ impl ArenaPool {
         // SAFETY: arena.offset < budget, within the pool VMM's host mapping.
         unsafe { self.host_base.add(self.arena.offset(hot, idx)) }
     }
-    fn resolved(&self, hot: bool, idx: usize) -> ResolvedSlot {
-        let t = self.tier(hot);
-        ResolvedSlot { ptr: self.ptr(hot, idx), off: t.off, int4: t.int4 }
-    }
-    /// Start a batch: reset the policy's per-batch pin set so evictions this batch never
-    /// reclaim a key this batch touches (would surface as "expert not resident").
-    fn begin_batch(&mut self) {
-        self.policy.begin_batch();
-    }
     /// Record that `key`'s bytes have landed in its current slot. Called once per MISS,
     /// after that read's signal resolves.
     #[cfg(feature = "trace")]
@@ -523,14 +466,6 @@ impl ArenaPool {
         self.loaded.contains(&key)
     }
 
-    /// A hit: the policy refreshes recency; the physical slot is unchanged and read from
-    /// `slot_of` LATER (after any same-batch relocations settle).
-    fn get(&mut self, key: u32) -> bool {
-        self.policy.get(key)
-    }
-    fn protect(&mut self, key: u32) {
-        self.policy.protect(key);
-    }
     fn slot(&self, key: u32) -> Option<(bool, usize)> {
         self.slot_of.get(&key).copied()
     }
@@ -615,14 +550,12 @@ impl<'a> Pin<'a> {
 
     /// Build the resident set from the artifact directory `dir`. `capacity` is the
     /// total device budget (auto-discovered); the always-resident set takes its
-    /// computed footprint and the rest grows the routed pool. `bounce` selects the
-    /// streamer's destination path (see [`Streamer`]).
+    /// computed footprint and the rest grows the routed pool.
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         dir: &str,
         cfg: &'a ModelConfig,
         capacity: usize,
-        bounce: bool,
         trace_path: Option<&str>,
         cache_policy: &str,
         two_q: cache::TwoQSplit,
@@ -716,13 +649,11 @@ impl<'a> Pin<'a> {
         } else {
             vec![false; n_pin]
         };
-        let n_full = full.iter().filter(|&&f| f).count();
 
         // Size the tier to the always-resident footprint plus slack (absorbs the
         // per-reservation 256-byte alignment padding); anything left widens the pool.
         const SLACK: usize = 256 << 20; // 256 MiB
-        let resident = resident_bytes(cfg, block, shared_i4, vq_present, mtp)
-            + n_full * indexer_bytes(cfg, block);
+        let resident = resident_bytes(dir, cfg, n_pin, shared_i4, vq_present, want_indexer)?;
         let tier_cap = resident + SLACK;
         tracing::info!(
             "computed resident footprint {:.2} GiB (tier {:.2} GiB incl. slack)",
@@ -866,7 +797,7 @@ impl<'a> Pin<'a> {
         let policy =
             crate::memory::hybrid::make(cache_policy, budget, cold_stride, hot_stride, two_q)
                 .with_context(|| {
-                    format!("unknown --cache-policy {cache_policy} (lru|2q|arc|top-m)")
+                    format!("unknown --cache-policy {cache_policy} (lru|2q|arc)")
                 })?;
         tracing::info!(
             "routed pool [{cache_policy} {mode}]: {:.1} GiB budget (~{} slots, cold {cold_stride}B / hot {hot_stride}B)",
@@ -906,7 +837,7 @@ impl<'a> Pin<'a> {
         );
         // Bounce span = the largest expert block across the tiers (one read).
         let span = slot_span(cold_stride.max(hot_stride));
-        let fetch = AsyncFetch::new(Streamer::new(ring as u32, span, bounce)?)?;
+        let fetch = AsyncFetch::new(Streamer::new(ring as u32, span)?)?;
 
         Ok(Self {
             cfg,
@@ -968,14 +899,6 @@ impl<'a> Pin<'a> {
         self.trace.is_some()
     }
 
-    // An orphaned doc fragment sat here until 2026-08-01, describing an accessor for
-    // "the active policy's routing advice — `Some((j, m))` only under `--cache-policy
-    // top-m`". Both the accessor and `top-m` are gone (retired 2026-07-30); the fragment
-    // stayed, broke off mid-sentence, and rustdoc was attaching it to `resident` below —
-    // giving a live method a stale doc for a mechanism the engine no longer has. The
-    // record of what `top-m` was and why it lost is
-    // `docs/investigations/cache-conditional-routing.md`.
-
     /// Is `(layer, expert)` resident? Deliberately routed through
     /// [`HybridPolicy::contains`], which takes `&self` and does NOT refresh recency —
     /// `get` would count the whole candidate window as an access and corrupt the
@@ -1020,23 +943,47 @@ impl<'a> Pin<'a> {
         self.fetch.slot_stalls()
     }
 
-    /// The streaming half of `submit_layer`: trace sink, then three phases over the
-    /// arena pool. 1a: touch every HIT (protect it so a same-batch miss can't evict it).
-    /// 1b: allocate every MISS — this is where the byte-aware policy evicts and the arena
-    /// may RELOCATE resident slots. 1c: only NOW, after all relocations have settled,
-    /// resolve each key's final slot and build the misses' cold reads — so a read never
-    /// targets a slot that later moves. Returns the per-`sel` resolved slots + signals.
-    // The return tuple is (resolved slots, per-expert ticket), spelled out rather than
-    // hidden behind a type alias: one caller, and the doc line above already names both
-    // parts. An alias here would be one more name to chase.
-    #[allow(clippy::type_complexity)]
-    fn submit_spine(
+    /// Submit one layer's cold reads and resolve each selected expert to its [`MlpVq`]
+    /// (device pointers into the pool), its format flag, and its [`Ticket`] — the
+    /// DEVICE-SIDE dependency its data is behind.
+    ///
+    /// Trace sink, then three phases over the arena pool. 1a: touch every HIT (protect it
+    /// so a same-batch miss can't evict it). 1b: allocate every MISS — this is where the
+    /// byte-aware policy evicts and the arena may RELOCATE resident slots. 1c: only NOW,
+    /// after all relocations have settled, resolve each key's final slot into `out`/`fmt`
+    /// and build the misses' cold reads — so a read never targets a slot that later moves.
+    ///
+    /// **There is no residency mask, and its absence is the point.** This used to also
+    /// return `hit: Vec<bool>`, a second host-side encoding of "is this expert's data
+    /// ready?" that `gpu.rs` consumed to decide whether to await. When the two disagreed the
+    /// bool won silently — `gpu.rs` launches a `hit` expert with no wait at all — so a slot
+    /// still being written could be marked ready and the kernel would read it. A ticket
+    /// cannot disagree with anything: it IS the dependency, and the only way to launch is to
+    /// enqueue its wait (`AsyncFetch::wait`). Resident experts carry [`Ticket::RESIDENT`],
+    /// so resident / missing / in-flight are one code path.
+    ///
+    /// `window`/`choice` feed the trace sink only: the ranked top-[`TRACE_WINDOW`]
+    /// candidate expert ids and the full per-expert `choice` array they index into.
+    /// Pass an empty `window` when not tracing — nothing else reads them.
+    // ONE function, not the `submit_spine` + unwrap pair this was: the split's only artefact
+    // was a `[Option<ResolvedSlot>; 32]` filled unconditionally over `sel` and then unwrapped
+    // with a second `.context("unresolved expert slot")` that could never fire.
+    // Eight arguments, all distinct runtime values on the per-layer hot path; bundling
+    // them into a struct built once per layer would allocate to satisfy a lint.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_layer(
         &mut self,
         layer: usize,
         sel: &[usize],
         window: &[usize],
         choice: &[f32],
-    ) -> Result<([Option<ResolvedSlot>; 32], Vec<Ticket>)> {
+        out: &mut Vec<MlpVq>,
+        fmt: &mut Vec<bool>,
+        tickets: &mut Vec<Ticket>,
+    ) -> Result<()> {
+        out.clear();
+        fmt.clear();
+        tickets.clear();
         let cfg = self.cfg;
         let sparse = (layer - cfg.dense_layers) * cfg.n_experts; // read-table row base
         debug_assert!(
@@ -1054,7 +1001,7 @@ impl<'a> Pin<'a> {
                 self.routed.mark_loaded(k);
             }
         }
-        self.routed.begin_batch();
+        self.routed.policy.begin_batch();
         // Trace sink (--trace), v2: the demand keys this layer looks up, then `|`, then
         // the top-`TRACE_WINDOW` candidates as `key:choice`.
         //
@@ -1093,7 +1040,9 @@ impl<'a> Pin<'a> {
         let mut is_hit = [false; 32];
         for (i, &e) in sel.iter().enumerate() {
             let key = expert_key(layer, e);
-            if self.routed.get(key) {
+            // `get` refreshes recency; the physical slot is deliberately NOT read here —
+            // phase 1c takes it from `slot_of` after any same-batch relocation settles.
+            if self.routed.policy.get(key) {
                 self.hits += 1;
                 // THE CHECK. A hit hands the kernel a slot pointer and a resolved
                 // RESIDENT ticket, so nothing downstream waits. If the bytes never landed, the
@@ -1109,7 +1058,7 @@ impl<'a> Pin<'a> {
                          or a previous expert's weights (-> silently wrong)."
                     );
                 }
-                self.routed.protect(key);
+                self.routed.policy.protect(key);
                 is_hit[i] = true;
             }
         }
@@ -1150,16 +1099,24 @@ impl<'a> Pin<'a> {
             crate::backend::device_sync()?;
         }
         // Phase 1c: relocations have settled — resolve final slots and build the reads.
-        let mut slots: [Option<ResolvedSlot>; 32] = [None; 32];
         let mut reads: Vec<ReadSpec> = Vec::new();
         let mut miss_sel: Vec<usize> = Vec::new();
         for (i, &e) in sel.iter().enumerate() {
             let (hot, idx) = self.routed.slot(expert_key(layer, e)).context(
                 "expert not resident after alloc (batch exceeds pool — raise --max-mem)",
             )?;
-            slots[i] = Some(self.routed.resolved(hot, idx));
+            let (b, t) = (self.routed.ptr(hot, idx), self.routed.tier(hot));
+            // SAFETY: address arithmetic into the resolved slot; the bytes land when
+            // `tickets[i]` is satisfied. The six pointers are identical for both formats
+            // (gpu.rs reinterprets as ExpertDescI4 when `fmt[i]`).
+            out.push(MlpVq {
+                gate: vqweight_at(b, t.off[0], t.off[1]),
+                up: vqweight_at(b, t.off[2], t.off[3]),
+                down: vqweight_at(b, t.off[4], t.off[5]),
+            });
+            fmt.push(t.int4);
             if !is_hit[i] {
-                let (fd, begin, len) = self.routed.tier(hot).table[sparse + e];
+                let (fd, begin, len) = t.table[sparse + e];
                 reads.push(ReadSpec { fd, begin, len, dst: self.routed.host_ptr(hot, idx) });
                 miss_sel.push(i);
             }
@@ -1175,60 +1132,9 @@ impl<'a> Pin<'a> {
         // A resident expert's data is already there, so it carries the RESIDENT ticket
         // (value 0, satisfied on arrival). Every expert therefore has a ticket and the
         // caller has one code path — there is no residency bool for anyone to branch on.
-        let mut tickets: Vec<Ticket> = vec![Ticket::RESIDENT; sel.len()];
+        tickets.resize(sel.len(), Ticket::RESIDENT);
         for (k, &i) in miss_sel.iter().enumerate() {
             tickets[i] = miss_tickets[k];
-        }
-        let _ = is_hit;
-        Ok((slots, tickets))
-    }
-
-    /// Submit one layer's cold reads and resolve each selected expert to its [`MlpVq`]
-    /// (device pointers into the pool), its format flag, and its [`Ticket`] — the
-    /// DEVICE-SIDE dependency its data is behind.
-    ///
-    /// **There is no residency mask, and its absence is the point.** This used to also
-    /// return `hit: Vec<bool>`, a second host-side encoding of "is this expert's data
-    /// ready?" that `gpu.rs` consumed to decide whether to await. When the two disagreed the
-    /// bool won silently — `gpu.rs` launches a `hit` expert with no wait at all — so a slot
-    /// still being written could be marked ready and the kernel would read it. A ticket
-    /// cannot disagree with anything: it IS the dependency, and the only way to launch is to
-    /// enqueue its wait (`AsyncFetch::wait`). Resident experts carry [`Ticket::RESIDENT`],
-    /// so resident / missing / in-flight are one code path.
-    ///
-    /// `window`/`choice` feed the trace sink only: the ranked top-[`TRACE_WINDOW`]
-    /// candidate expert ids and the full per-expert `choice` array they index into.
-    /// Pass an empty `window` when not tracing — nothing else reads them.
-    // Eight arguments, all distinct runtime values on the per-layer hot path; bundling
-    // them into a struct built once per layer would allocate to satisfy a lint.
-    #[allow(clippy::too_many_arguments)]
-    pub fn submit_layer(
-        &mut self,
-        layer: usize,
-        sel: &[usize],
-        window: &[usize],
-        choice: &[f32],
-        out: &mut Vec<MlpVq>,
-        fmt: &mut Vec<bool>,
-        tickets: &mut Vec<Ticket>,
-    ) -> Result<()> {
-        let (slots, tk) = self.submit_spine(layer, sel, window, choice)?;
-        out.clear();
-        fmt.clear();
-        tickets.clear();
-        tickets.extend_from_slice(&tk);
-        for (i, _e) in sel.iter().enumerate() {
-            let s = slots[i].context("submit_layer: unresolved expert slot")?;
-            let (b, o) = (s.ptr, s.off);
-            // SAFETY: address arithmetic into the resolved slot; the bytes land when
-            // `tickets[i]` is satisfied. The six pointers are identical for both formats
-            // (gpu.rs reinterprets as ExpertDescI4 when `fmt[i]`).
-            out.push(MlpVq {
-                gate: vqweight_at(b, o[0], o[1]),
-                up: vqweight_at(b, o[2], o[3]),
-                down: vqweight_at(b, o[4], o[5]),
-            });
-            fmt.push(s.int4);
         }
         Ok(())
     }

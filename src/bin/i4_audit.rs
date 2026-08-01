@@ -8,9 +8,8 @@
 //!   1. on-disk `.i4` bytes  ==  quant_i4(dequant_fp8(fp8 ckpt))  — byte identity
 //!   2. reconstructed W_i4 vs W_fp8 (f64): rel-L2, max-abs, per-row best-fit GAIN
 //!   3. GEMV y = W·x: f64 reference from fp8 vs matvec_i4 — rel-L2 AND gain slope
-//!   4. the SAME metrics for the vq3-derived chain (decode `.vq3` -> quant_i4), so
-//!      the two `.i4` generations are compared head-to-head on one expert without
-//!      regenerating the 365 GB set
+//!   4. the same metrics for `.vq3` decoded at the same coordinates — `--mode int3-vq`'s
+//!      arithmetic, the other shipped routed-expert format, scored against one truth
 //!   5. the outlier statistics (`amax/median`, `amax/p99.9`, spiky-row count) and the
 //!      error split into BULK (|w| ≤ p99) and TAIL — the measurement that decides
 //!      whether a quality drop is a defect or "fp8 rows are simply harder to quantize"
@@ -22,32 +21,96 @@
 //!      property of the weights and the quantiser), so it runs before a rebuild and
 //!      against an artifact of any generation.
 //!
-//! usage: i4_audit <artifact-dir> <fp8-dir> [--layer L] [--experts a,b,c]
-//!                 [--scan] [--scale-study]
-use anyhow::{Context, Result, anyhow, ensure};
+//! `--help` is the flag reference. What this tool NO LONGER carries: the
+//! `fp8 → vq3 → int4` "old i4" rows and the `VQ_GAIN` attenuation pre-flight built on
+//! them, both removed 2026-08-01. They head-to-headed the shipped set against a
+//! generation nothing can produce any more (`bin/vq3_to_i4` is deleted —
+//! docs/reference/architecture.md §11), and the branch-gain hypothesis they fed is
+//! falsified outright (docs/investigations/int4-scales.md §3, "Falsified: branch gain":
+//! attenuation is monotonically harmful, no interior optimum). Every number they printed
+//! is tabulated in docs/measurement/benchmarks.md.
+use anyhow::{Context, Result, ensure};
+use clap::Parser;
 use rivoli::artifact::format::{FormatMeta, I4Source, Safetensors, load_codebooks};
 use rivoli::math::silu;
 use rivoli::artifact::model::ModelConfig;
 use rivoli::artifact::quant::{
-    I4_GROUP, dequant_i4, i4_expert_stride, i4_groups, i4_row_bytes, i4_slot_offsets, matvec_i4,
-    quant_i4, read_f32, vq_decode_proj, vq_expert, vq_expert_layout, vq_expert_stride,
+    I4_GROUP, PROJ, dequant_i4, i4_expert_stride, i4_groups, i4_row_bytes, i4_slot_offsets,
+    matvec_i4, quant_i4, read_f32, vq_decode_proj, vq_expert, vq_expert_layout, vq_expert_stride,
 };
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 
-const PROJ: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
+// NOTE: doc comments on the FIELDS below are USER-FACING — clap renders them as `--help`.
+// Rationale for the code goes in `//` comments like this one, which clap ignores. The
+// hand-rolled loop this replaced kept a `usage:` string in a `.context()` on the first
+// positional, and it had already drifted: it named neither `--verify` nor `--xcheck`, the
+// two wide modes docs/investigations/int4-scales.md §8 keeps this tool for.
+#[derive(Parser)]
+#[command(
+    name = "i4_audit",
+    about = "Scale-sensitive audit of the .i4 expert path against the original fp8 checkpoint"
+)]
+struct Args {
+    /// The artifact directory to audit: manifest.json, `L{ll}.i4`, `L{ll}.vq3`,
+    /// codebooks.f32. Its `i4_source` stamp is checked against <FP8_DIR> and a
+    /// disagreement is reported as a WARNING — auditing the wrong checkpoint turns every
+    /// byte-identity check false and reads as "the shipped .i4 is defective".
+    artifact_dir: String,
+
+    /// The fp8 checkpoint the artifact was built from — the INDEPENDENT ground truth, in
+    /// f64. Every mode but `--xcheck` reads it.
+    fp8_dir: String,
+
+    /// Sweep every f32 group scale in the WHOLE `.i4` set for values the decode path
+    /// cannot survive: non-finite (`0·inf = NaN` in the dot), zero, negative, or the
+    /// `amax == 0` sentinel 1.0. Reads scales only (~2 MB/expert), so it covers all
+    /// layers cheaply, and reports the observed range.
+    #[arg(long)]
+    scan: bool,
+
+    /// Wide byte-identity sweep — `dequant_fp8` + `quant_i4` + compare, and nothing else,
+    /// so it runs ~10× faster per projection than the default report and covers hundreds
+    /// (every 6th layer × every 31st expert × 3) instead of tens. Exits non-zero on any
+    /// mismatch. An error confined to particular layers or one converter thread's chunk
+    /// is exactly what a narrow sample misses.
+    #[arg(long)]
+    verify: bool,
+
+    /// Cross-check `.i4` against `.vq3` at the SAME artifact coordinates — the one check
+    /// here that can fail on a layer/expert MAPPING error, because it touches no fp8, no
+    /// `dequant_fp8` and no `model.layers.{l}` string. Two quantizations of one matrix
+    /// score cos ≈ 0.97; two unrelated ones score cos ≈ 0. Exits non-zero below 0.90.
+    #[arg(long)]
+    xcheck: bool,
+
+    /// Score every candidate quantiser step against the fp8 truth in BOTH weight and
+    /// output space: the per-row `s = α·amax/7` sweep, the LS refit `quant_vq` uses, the
+    /// per-row oracle, and the shipped GROUP-I4_GROUP quantiser. Reads ONLY the fp8
+    /// checkpoint, so it answers "is a rebuild worth buying?" BEFORE the rebuild and runs
+    /// against an artifact of any generation.
+    #[arg(long)]
+    scale_study: bool,
+
+    /// The layer to audit, for the default per-projection report and `--scale-study`.
+    /// `--scan`, `--verify` and `--xcheck` walk their own layer sets and ignore it.
+    #[arg(long, value_name = "L", default_value_t = 3)]
+    layer: usize,
+
+    /// Experts to audit, comma-separated, for the same two modes. `n_experts` is the
+    /// SHARED expert and the largest valid index — anything above it would score routed
+    /// block `e`'s bytes against the shared expert's weights, so it is rejected.
+    // `default_value` (one string) rather than `default_values_t` (four numbers) only so
+    // that `--help` shows the default in the same comma syntax the flag is typed in;
+    // clap runs the delimiter over the default too, so both spell the same four values.
+    #[arg(long, value_name = "A,B,C", value_delimiter = ',', default_value = "0,7,128,255")]
+    experts: Vec<usize>,
+}
 
 /// `tests/kernel.rs::moe_i4_real_data_vs_fp8_ground_truth`'s `Lcg` seed. `make_x` is
 /// bit-identical to that test's `Lcg::f`, so the CHAIN rows below are the SAME number
 /// the test asserts on — which is the only way quoting them as its band is honest.
 const CHAIN_SEED: u64 = 0x5A17;
-
-/// The per-projection gain `quant_vq` imposes and `quant_i4` does not: `quant_vq`
-/// refits its scale by least squares, which is MMSE-like and therefore shrinks by
-/// `1 − relL2²`. Measured 0.9766 across every projection of every expert sampled
-/// (predicted 0.9754 from its own rel-L2 — the agreement is why this is a property of
-/// the estimator and not a coincidence of one artifact).
-const VQ_GAIN: f32 = 0.9766;
 
 /// Scale-sensitive agreement of `a` against reference `r`, all in f64.
 /// Returns (rel_l2, max_abs, cosine, gain) where `gain` is the least-squares slope
@@ -112,7 +175,8 @@ struct Bulk {
 /// `w` is the reference (fp8 ground truth) the row statistics are taken from; `rec` is
 /// a reconstruction to score against it; `scale` is the step array `rec` was built with
 /// (`o_dim · i4_groups(i_dim)` under group scales). Bulk/tail are split on the
-/// reference's own p99, so BOTH generations are scored on the same positions.
+/// REFERENCE's own p99, not on the reconstruction's, so the split cannot flatter the
+/// thing being scored — and two reconstructions of one matrix land on the same positions.
 ///
 /// `dead_rows` is the headline number for the per-row → group change: under one scale
 /// per 6144-wide row a single outlier rounded the bulk to zero, and 603 of 6144 rows of
@@ -525,29 +589,19 @@ fn scan_scales(art: &str, cfg: &ModelConfig) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let mut args = std::env::args().skip(1);
-    let art = args.next().context("usage: i4_audit <artifact-dir> <fp8-dir> [--layer L] [--experts a,b,c] [--scan]")?;
-    let fp8 = args.next().context("missing <fp8-dir>")?;
-    let (mut layer, mut experts) = (3usize, vec![0usize, 7, 128, 255]);
-    let (mut scan, mut study, mut verify, mut xchk) = (false, false, false, false);
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--scan" => scan = true,
-            "--verify" => verify = true,
-            "--xcheck" => xchk = true,
-            "--scale-study" => study = true,
-            "--layer" => layer = args.next().context("--layer L")?.parse()?,
-            "--experts" => {
-                experts = args
-                    .next()
-                    .context("--experts a,b,c")?
-                    .split(',')
-                    .map(|s| s.parse::<usize>().map_err(|e| anyhow!("{e}")))
-                    .collect::<Result<_>>()?
-            }
-            _ => return Err(anyhow!("unknown arg {a}")),
-        }
-    }
+    // Destructured, not held: the mode flags below are read in a fixed precedence
+    // (`--scan`, then `--xcheck`, `--verify`, `--scale-study`, then the default report),
+    // and naming them here is what makes that ladder readable at the dispatch site.
+    let Args {
+        artifact_dir: art,
+        fp8_dir: fp8,
+        scan,
+        verify,
+        xcheck: xchk,
+        scale_study: study,
+        layer,
+        experts,
+    } = Args::parse();
 
     let cfg = ModelConfig::load(&art)?;
     if scan {
@@ -639,8 +693,8 @@ fn main() -> Result<()> {
             format!("model.layers.{layer}.mlp.shared_experts")
         };
 
-        // Kept per projection so the whole-expert chain below can be run three ways.
-        let (mut wrefs, mut i4s, mut olds, mut vqs) = (vec![], vec![], vec![], vec![]);
+        // Kept per projection so the whole-expert chain below can be run both ways.
+        let (mut wrefs, mut i4s, mut vqs) = (vec![], vec![], vec![]);
         for (k, (&(o_dim, i_dim), pname)) in dims.iter().zip(PROJ).enumerate() {
             // ── independent ground truth: the fp8 checkpoint ─────────────────
             let wref = src.dequant_fp8(&format!("{base}.{pname}"), o_dim, i_dim, block)?;
@@ -674,23 +728,14 @@ fn main() -> Result<()> {
                 if bytes_match && scales_match { "" } else { "  <<< DISK != quant_i4(fp8)" }
             );
 
-            // ── the OLD chain, same expert: fp8 -> vq3 -> int4 ───────────────
+            // ── the `.vq3` at the same coordinates: `--mode int3-vq`'s own arithmetic,
+            //    scored against the same fp8 truth. Both shipped formats derive from this
+            //    checkpoint by different quantizers, so this is the standing head-to-head
+            //    — and it is decoded, not re-quantized, so it is what that mode computes.
             let wvq = vq_decode_proj(&vqp[k], &cbs[k]);
-            let (op, os) = quant_i4(&wvq, o_dim, i_dim);
-            let wold = dequant_i4(&op, &os, o_dim, i_dim);
-            let aw_old = agree(&wold, &wref);
-            let mut yold = vec![0f32; o_dim];
-            matvec_i4(&mut yold, &x, &op, &os, o_dim, i_dim);
-            let ay_old = agree(&yold, &yref);
-            // and the vq3 path itself (the control mode's arithmetic)
             let avq = agree(&wvq, &wref);
             let yvq = matvec_f64(&wvq, &x, o_dim, i_dim);
             let ayvq = agree(&yvq, &yref);
-            println!(
-                "{:<6} {:<10} | {:>10.4e} {:>10.3e} {:>9.6} {:>9.6} | {:>10.4e} {:>9.6} {:>9.6} |",
-                "", "  ^old i4", aw_old.rel_l2, aw_old.max_abs, aw_old.cos, aw_old.gain,
-                ay_old.rel_l2, ay_old.cos, ay_old.gain
-            );
             println!(
                 "{:<6} {:<10} | {:>10.4e} {:>10.3e} {:>9.6} {:>9.6} | {:>10.4e} {:>9.6} {:>9.6} |",
                 "", "  ^vq3", avq.rel_l2, avq.max_abs, avq.cos, avq.gain,
@@ -698,63 +743,49 @@ fn main() -> Result<()> {
             );
             // ── DEAD ROWS. A per-ROW amax/7 step means one outlier sets the scale for
             //    all i_dim weights; every weight below s/2 then rounds to nibble 8 = 0.
-            //    `.vq3` cannot fail this way: its scales are per GROUP of 64, so an
-            //    outlier can only flatten its own group. This is the one structural
-            //    difference between the formats that a per-row error metric averages
-            //    away -- a row that is 100% zeros still contributes only its own share
-            //    of rel-L2, but it removes an output channel outright.
-            let dead = |pk: &[u8], label: &str| {
-                let rbb = i4_row_bytes(i_dim);
-                let mut fr: Vec<f64> = (0..o_dim)
-                    .map(|o| {
-                        let row = &pk[o * rbb..(o + 1) * rbb];
-                        let z = (0..i_dim)
-                            .filter(|&i| {
-                                let b = row[i >> 1];
-                                (if i & 1 == 0 { b & 0x0F } else { b >> 4 }) == 8
-                            })
-                            .count();
-                        z as f64 / i_dim as f64
-                    })
-                    .collect();
-                let mean = fr.iter().sum::<f64>() / o_dim as f64;
-                fr.sort_by(f64::total_cmp);
-                println!(
-                    "{:<6} DEAD {:<7}| mean {:.3}  p99 {:.3}  max {:.3}  >50% {:>4}  >80% {:>4}  ==100% {:>4}",
-                    e, label, mean, fr[o_dim * 99 / 100], fr[o_dim - 1],
-                    fr.iter().filter(|&&f| f > 0.5).count(),
-                    fr.iter().filter(|&&f| f > 0.8).count(),
-                    fr.iter().filter(|&&f| f >= 1.0).count()
-                );
-            };
-            dead(packed, &format!("new {pname}"));
-            dead(&op, &format!("old {pname}"));
-
-            // ── bulk vs tail: does the fp8 chain's LARGER amax coarsen the step and
-            //    cost precision on the many small weights, where decode quality lives?
-            //    Both generations are scored on the SAME positions (the fp8 row's own
-            //    p99), so the split cannot flatter either one.
-            let bn = bulk_stats(&wref, &wi4, packed, &scale, o_dim, i_dim);
-            let bo = bulk_stats(&wref, &wold, &op, &os, o_dim, i_dim);
-            for (label, b) in [("new i4", &bn), ("old i4", &bo)] {
-                println!(
-                    "{:<6} BULK {:<8}| amax/med {:>5.1}  amax/p99.9 {:>5.2}  spiky rows {:>5}/{o_dim}  \
-                     dead rows {:>5}/{o_dim}  step {:>9.3e}  bulk relL2 {:>7.4}  tail relL2 {:>7.4}  \
-                     levels {:>2}/16",
-                    e, label, b.amax_over_med, b.amax_over_p999, b.spiky_rows, b.dead_rows,
-                    b.step_mean, b.bulk_rel_l2, b.tail_rel_l2, b.levels_used
-                );
-            }
-            println!("{:<6} HIST new  | {:?}", e, bn.hist);
-            println!("{:<6} HIST old  | {:?}", e, bo.hist);
+            //    Group scales cannot fail that way — an outlier can only flatten its own
+            //    group — and this is the statistic that priced the move: 603 of 6144 rows
+            //    of L03 e0 down_proj were past 50% zeros under per-row scales
+            //    (docs/investigations/int4-scales.md §6, the acceptance gate). A per-row
+            //    error metric averages it away: a 100%-zero row contributes only its own
+            //    share of rel-L2 while removing an output channel outright.
+            let mut zero_frac: Vec<f64> = packed
+                .chunks_exact(rb)
+                .map(|row| {
+                    let z = (0..i_dim)
+                        .filter(|&i| {
+                            let b = row[i >> 1];
+                            (if i & 1 == 0 { b & 0x0F } else { b >> 4 }) == 8
+                        })
+                        .count();
+                    z as f64 / i_dim as f64
+                })
+                .collect();
+            let dead_mean = zero_frac.iter().sum::<f64>() / o_dim as f64;
+            zero_frac.sort_by(f64::total_cmp);
             println!(
-                "{:<6} STEP ratio| new/old = {:.4}  (>1 ⇒ the fp8 amax coarsened the step)",
-                e,
-                bn.step_mean / bo.step_mean
+                "{:<6} DEAD {:<8}| mean {:.3}  p99 {:.3}  max {:.3}  >50% {:>4}  >80% {:>4}  ==100% {:>4}",
+                e, pname, dead_mean, zero_frac[o_dim * 99 / 100], zero_frac[o_dim - 1],
+                zero_frac.iter().filter(|&&f| f > 0.5).count(),
+                zero_frac.iter().filter(|&&f| f > 0.8).count(),
+                zero_frac.iter().filter(|&&f| f >= 1.0).count()
             );
+
+            // ── bulk vs tail: whole-row rel-L2 is dominated by the large weights and can
+            //    improve while the many small ones — where decode quality lives — get
+            //    coarser. The split is taken on the fp8 row's own p99, so it prices the
+            //    bulk without the tail's leverage.
+            let b = bulk_stats(&wref, &wi4, packed, &scale, o_dim, i_dim);
+            println!(
+                "{:<6} BULK {:<8}| amax/med {:>5.1}  amax/p99.9 {:>5.2}  spiky rows {:>5}/{o_dim}  \
+                 dead rows {:>5}/{o_dim}  step {:>9.3e}  bulk relL2 {:>7.4}  tail relL2 {:>7.4}  \
+                 levels {:>2}/16",
+                e, pname, b.amax_over_med, b.amax_over_p999, b.spiky_rows, b.dead_rows,
+                b.step_mean, b.bulk_rel_l2, b.tail_rel_l2, b.levels_used
+            );
+            println!("{:<6} HIST {:<8}| {:?}", e, pname, b.hist);
             wrefs.push(wref);
             i4s.push((packed.to_vec(), scale));
-            olds.push((op, os));
             vqs.push(wvq);
         }
 
@@ -781,22 +812,12 @@ fn main() -> Result<()> {
             matvec_i4(&mut o, &hv, &q[2].0, &q[2].1, h, m);
             o
         };
+        // The one clone in this loop, and it is here because `chain_i4` wants the three
+        // projections as an owned array while `i4s` has to outlive it — `packed` borrows
+        // the layer buffer, so nothing here can hand out a `&[(&[u8], &[f32])]` that also
+        // survives the projection loop above.
         let newq: [(Vec<u8>, Vec<f32>); 3] = core::array::from_fn(|k| i4s[k].clone());
-        let oldq: [(Vec<u8>, Vec<f32>); 3] = core::array::from_fn(|k| olds[k].clone());
         let cn = agree(&chain_i4(&newq), &chain_ref);
-        let co = agree(&chain_i4(&oldq), &chain_ref);
-        // PRE-FLIGHT for the attenuation arm. The shipped nibbles with every stored
-        // per-row scale multiplied by VQ_GAIN — vq3's shrink WITHOUT vq3's error. If
-        // this does not land the chain gain inside the old set's band, the arm does not
-        // reproduce what it claims to and the device block would measure nothing.
-        //
-        // Multiplies the STORED scale only; the nibbles are the ones `amax/7` already
-        // chose. Rounding at `VQ_GAIN·amax/7` instead would be the α = 0.977 CLIP arm,
-        // a different experiment (finer step, gain still ~1).
-        let gainq: [(Vec<u8>, Vec<f32>); 3] = core::array::from_fn(|k| {
-            (i4s[k].0.clone(), i4s[k].1.iter().map(|s| s * VQ_GAIN).collect())
-        });
-        let cg = agree(&chain_i4(&gainq), &chain_ref);
         let cv = {
             let g = matvec_f64(&vqs[0], &x, m, h);
             let u = matvec_f64(&vqs[1], &x, m, h);
@@ -807,7 +828,7 @@ fn main() -> Result<()> {
         // see: corruption confined to a few percent of output rows moves rel-L2 by less
         // than its own tolerance, but moves this. The GPU test asserts on it.
         let ymax = chain_ref.iter().fold(0f64, |m, &v| m.max(v.abs() as f64));
-        for (label, a) in [("new i4", cn), ("old i4", co), ("vq3", cv), ("new×gain", cg)] {
+        for (label, a) in [("i4", cn), ("vq3", cv)] {
             println!(
                 "{:<6} CHAIN {:<7}| relL2 {:>7.4}  gain {:>7.4}  cos {:>8.6}  maxerr/max|ref| {:>7.4}",
                 e, label, a.rel_l2, a.gain, a.cos, a.max_abs / ymax

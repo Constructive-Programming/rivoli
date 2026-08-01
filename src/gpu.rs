@@ -45,9 +45,6 @@ const MOE_ACC_ROWS: usize = 2;
 use crate::telemetry::ProfileSummary;
 use anyhow::{Context, Result, bail, ensure};
 
-/// Little-endian byte view of a POD slice — zero-copy on this LE host (a `[T]`'s
-/// in-memory bytes ARE its LE serialization). Feeds the per-token H2D uploads (attn
-/// rows/heads u32, expert descriptors, weights f32) with no staging buffer.
 /// Confidence buckets for the MTP accept histogram: 5 even bins over [0,1].
 const MTP_BINS: usize = 5;
 
@@ -83,14 +80,6 @@ enum Draft {
 
 fn mtp_bin(conf: f32) -> usize {
     ((conf * MTP_BINS as f32) as usize).min(MTP_BINS - 1)
-}
-
-/// `RIVOLI_MTP_PROBE=1` — bucket acceptance by the MAIN MODEL's confidence too. Off by
-/// default because it adds a 1.2 MB D2H per verify pass, which would contaminate the very
-/// `mtp_draft` timing it ships beside.
-fn mtp_probe() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RIVOLI_MTP_PROBE").is_ok_and(|v| v != "0"))
 }
 
 /// `softmax(logits)[argmax]` from a raw f32 logit vector — the draft head's confidence
@@ -150,7 +139,7 @@ fn desc_of_vq(m: &MlpVq) -> ExpertDesc {
 #[derive(Default)]
 struct Profile {
     fetch_n: u64, // demand misses
-    route_ns: u128, // host routing (gate D2H + sigmoid/bias/top-k, + top-m substitution)
+    route_ns: u128, // host routing (gate D2H + sigmoid/bias/top-k)
     /// The DSA indexer's HIP-event SPAN — including whatever falls between its kernels,
     /// so NOT comparable to a per-kernel microbench sum. Measured 27% above one, cause
     /// unestablished. Note the endpoints are themselves barrier packets whose dispatch
@@ -205,10 +194,9 @@ struct Profile {
     /// host work by construction. Expected to dominate host cost: ~20 launches × 78
     /// layers is ~1.5k driver calls per token.
     cpu_launch_ns: u128,
-    /// Host time in `route_into` — sigmoid, bias, top-k over 256 experts per MoE layer,
-    /// plus any `top-m` substitution. Stamped directly rather than taken as
-    /// `route_ns − route_wait_ns` so it survives someone adding a third thing to the
-    /// route region.
+    /// Host time in `route_into` — sigmoid, bias, top-k over 256 experts per MoE layer.
+    /// Stamped directly rather than taken as `route_ns − route_wait_ns` so it survives
+    /// someone adding a third thing to the route region.
     cpu_route_ns: u128,
     /// Host time in `Pin::submit_layer` — residency lookups, policy/eviction
     /// bookkeeping, slot assignment and read-spec construction for the layer's picks.
@@ -272,8 +260,10 @@ impl Profile {
         // brackets the compute stream from `moe_ev_start` to `moe_ev_end`, and `_end` is
         // recorded only after BOTH streams have been awaited — so the bracket spans the very
         // fetch it was supposed to exclude, `exposed` came out near zero by construction, and
-        // the line printed "97% hidden" no matter what. The tell was `--direct-vmm-dma`:
-        // 99% hidden on the configuration that decodes at 1.11 tok/s against bounce's 2.26.
+        // the line printed "97% hidden" no matter what. The tell was `--direct-vmm-dma`
+        // (a flag deleted 2026-08-01, once the staged path won on every workload with
+        // misses): 99% hidden on the configuration that decodes at 1.11 tok/s against
+        // staged's 2.26.
         // The replacement puts those at 22% and 10% respectively — same ordering as the
         // throughput, which is the least a hiding metric has to do.
         let resident_ns = match self.moe_n_by_miss.first() {
@@ -307,11 +297,6 @@ impl Profile {
         // see. With the launches enqueued straight onto the compute stream there is no such
         // work left to attribute.
         let cpu_ns = (self.cpu_launch_ns + self.cpu_route_ns + self.cpu_submit_ns) as f64;
-        let hidden = if fetch_wall_ns > 0 {
-            (100.0 * (1.0 - exposed_ns / fetch_wall_ns as f64)).clamp(0.0, 100.0)
-        } else {
-            0.0
-        };
         ProfileSummary {
             tok_per_s: self.tokens as f64 / (self.wall_ns as f64 / 1e9).max(1e-9),
             hit_pct: 100.0 * hits as f64 / (hits + misses).max(1) as f64,
@@ -332,7 +317,6 @@ impl Profile {
                 }
             }),
             fetch_wall_ms: per(fetch_wall_ns as u128),
-            fetch_hidden_pct: hidden,
             miss_per_tok: self.fetch_n as f64 / tok,
             // Over ALL reads the reaper serviced, demand and speculative alike —
             // `fetch_wall_ns` covers both, so `fetch_n` alone is the wrong denominator.
@@ -351,7 +335,6 @@ impl Profile {
             // `moe_wall − compute_gpu` as it was before. Off-thread, so it overlaps the
             // decode wall and can exceed it.
             io_wait_ms: io_wait_ns as f64 / 1e6 / tok,
-            exposed_fetch_ms: exposed_ns / 1e6 / tok,
             cpu_ms: cpu_ns / 1e6 / tok,
             cpu_launch_ms: per(self.cpu_launch_ns),
             cpu_route_ms: per(self.cpu_route_ns),
@@ -364,12 +347,11 @@ impl Profile {
 }
 
 /// Device-side DSA/MISA indexer state. Mirrors the trained lightning indexer but
-/// everything is device-resident: per full layer a bf16 key slab grown in place,
-/// plus per-token scratch. The score-readback buffers below are filled only by the
-/// `trace`-feature score dump — the selection itself never leaves the device. MISA
-/// additionally maintains a per-full-layer
-/// block-pooled key pool and routes the top-`active_heads` indexer heads via a cheap
-/// device estimate before scoring.
+/// everything is device-resident: per full layer a bf16 key slab grown in place, plus
+/// per-token scratch. The scores never leave the device — `index_topk` selects from them
+/// in place, and there is no host readback buffer here at all. MISA additionally maintains
+/// a per-full-layer block-pooled key pool and routes the top-`active_heads` indexer heads
+/// via a cheap device estimate before scoring.
 struct DeviceIndexer {
     /// Per layer: `Some(slab_index)` for full layers, `None` for shared.
     slab_of: Vec<Option<usize>>,
@@ -379,12 +361,6 @@ struct DeviceIndexer {
     q: DeviceBuf,      // index_n_heads * index_head_dim f32
     w: DeviceBuf,      // index_n_heads f32
     scores: DeviceBuf, // max_ctx f32
-    /// Score readback, `trace` only: the `RIVOLI_DUMP_SCORES` dump is the sole reader
-    /// now that the selection never leaves the device.
-    #[cfg(feature = "trace")]
-    scores_host: Vec<u8>,
-    #[cfg(feature = "trace")]
-    scores_f: Vec<f32>,
     /// The most recent full layer's selection this token, PER TOKEN ROW (IndexShare
     /// reuse): `last_dense[r]` = the whole causal prefix (null rows), else `last_nr[r]`
     /// rows. Per row because a verify pass's rows sit one position apart, so the row that
@@ -438,13 +414,6 @@ pub struct GpuEngine<'a> {
     /// argmax). This is the signal a "should we speculate on this token?" gate would read,
     /// and bucketing it is how we find out whether it separates before building the gate.
     mtp_bins: [(u64, u64); MTP_BINS],
-    /// The same pair, bucketed by the MAIN MODEL'S confidence in the token the draft was
-    /// tested against (`softmax(row 0 logits)[argmax]`). This is the discriminator between
-    /// the two reasons a draft misses: a weak head (misses even where the target is
-    /// decidable) and a noisy target (everyone misses where the model itself is unsure).
-    /// Only the first is worth de-quantizing layer 78 for. `RIVOLI_MTP_PROBE=1` — it costs
-    /// a second 620 KB D2H per verify pass, which the timing runs must not pay.
-    mtp_tgt_bins: [(u64, u64); MTP_BINS],
     /// Wall spent in `mtp_draft`, and passes counted. This is `d` in the speculative cost
     /// model — the term inferred rather than measured when §13 was written, and the one
     /// that decides whether a pre-draft gate (skipping the draft, not just the verify)
@@ -502,9 +471,6 @@ pub struct GpuEngine<'a> {
     /// `--trace` is on, and `--trace` is fixed for the run, so this is either filled
     /// every layer or never.
     window: Vec<usize>,
-    /// `top-m` only: the ranked top-M candidate window [`route_into`] substitutes over.
-    /// Stays empty under every other policy (the advice-`None` early return never
-    /// The policy's routing advice, read ONCE — the policy is fixed for the run, and
     // Per-token host build scratch — reused every layer so the hot path allocates
     // nothing: resolved VQ descriptors + weights, the resolved batch, D2H staging.
     /// Per-expert routing weights for the current layer, laid out `[descriptor][row]` —
@@ -613,11 +579,6 @@ pub struct GpuEngine<'a> {
     /// DIAGNOSTIC (`--checksum-x`, `trace` only): hash the residual stream each layer.
     #[cfg(feature = "trace")]
     checksum_x: bool,
-    /// `RIVOLI_DUMP_SCORES=<path>`: raw `index_score` output, for characterising the
-    /// distribution the host top-k actually faces (docs/investigations/npu-offload.md). `(file, calls seen,
-    /// records left)` — bounded so a long run cannot fill the disk.
-    #[cfg(feature = "trace")]
-    score_dump: Option<(std::fs::File, u64, usize)>,
     #[cfg(feature = "trace")]
     ck_buf: Vec<u8>,
 }
@@ -659,10 +620,6 @@ impl<'a> GpuEngine<'a> {
                 q: DeviceBuf::new(cfg.index_n_heads * hd * 4)?,
                 w: DeviceBuf::new(cfg.index_n_heads * 4)?,
                 scores: DeviceBuf::new(max_ctx * 4)?,
-                #[cfg(feature = "trace")]
-                scores_host: Vec::new(),
-                #[cfg(feature = "trace")]
-                scores_f: Vec::new(),
                 last_nr: [0; MAXROW],
                 last_dense: [true; MAXROW],
                 pool,
@@ -725,7 +682,6 @@ impl<'a> GpuEngine<'a> {
             mtp_seen: 0,
             mtp_hit: 0,
             mtp_bins: [(0, 0); MTP_BINS],
-            mtp_tgt_bins: [(0, 0); MTP_BINS],
             mtp_draft_ns: 0,
             mtp_draft_n: 0,
             mtp_verify: 0,
@@ -834,10 +790,6 @@ impl<'a> GpuEngine<'a> {
             checksum_x: false,
             #[cfg(feature = "trace")]
             ck_buf: Vec::new(),
-            #[cfg(feature = "trace")]
-            score_dump: std::env::var("RIVOLI_DUMP_SCORES")
-                .ok()
-                .and_then(|p| std::fs::File::create(&p).map(|f| (f, 0, 64)).ok()),
             heartbeat: None,
             pin,
         })
@@ -856,8 +808,6 @@ impl<'a> GpuEngine<'a> {
         self.pin.misses
     }
 
-
-    /// Set the MoE-branch gain (see the field and kernels/fwd.hip::vaxpy).
     /// Does the loaded artifact carry the MTP head?
     pub fn has_mtp(&self) -> bool {
         self.pin.mtp.is_some()
@@ -869,7 +819,6 @@ impl<'a> GpuEngine<'a> {
     pub fn tracing(&self) -> bool {
         self.pin.tracing()
     }
-
 
     pub fn set_moe_gain(&mut self, g: f32) {
         if g != 1.0 {
@@ -1141,64 +1090,16 @@ impl<'a> GpuEngine<'a> {
             self.idx_ev_end.record(std::ptr::null_mut())?;
             self.idx_ev_pending = true;
         }
-        // The mid-layer join. TWO consumers — it makes the score D2H below safe AND
-        // retires the event pair. Deleting it was measured as its own arm and is worth
-        // −2.5 ms/token, 0.6% of wall, at the cost of making `route` incomparable with
-        // every historical row in docs/measurement/benchmarks.md; not taken, see the module
-        // note above.
+        // The mid-layer join. ONE consumer left — retiring the event pair. It used to have
+        // a second (making a score D2H below safe), and that D2H is gone with the score
+        // dump that was its only reader: the selection is `index_topk`'s start to finish,
+        // so nothing reads the scores host-side any more. Deleting the join itself was
+        // measured as its own arm and is worth −2.5 ms/token, 0.6% of wall, at the cost of
+        // making `route` incomparable with every historical row in
+        // docs/measurement/benchmarks.md; not taken, see the module note above.
         if scored_nt > 0 {
             blocked(&mut self.prof.sync_wait_ns, "gpu-wait/idx-sync", device_sync)?;
         }
-        // `RIVOLI_DUMP_SCORES` is the only thing left that wants the scores host-side.
-        // Gated on the REMAINING budget, not on the file, so a finished dump stops paying
-        // for a D2H the selection itself no longer needs. On a multi-row pass this is the
-        // LAST scored row's distribution — the scorer's output buffer is shared across
-        // rows, and the dump's question ("does the distribution move with nt?") is answered
-        // as well by one row of the pass as by both.
-        #[cfg(feature = "trace")]
-        if scored_nt > 0
-            && self
-                .score_dump
-                .as_ref()
-                .is_some_and(|(_, _, left)| *left > 0)
-        {
-            // Classed as a GPU wait, not host compute: the thread is parked in a transfer.
-            // Unwrapped, it inflated the `cpu` bucket on the `--attn dsa` arms.
-            blocked(&mut self.prof.sync_wait_ns, "gpu-wait/idx-scores-d2h", || {
-                idx.scores.copy_out_prefix(&mut idx.scores_host, scored_nt * 4)
-            })?;
-            idx.scores_f.clear();
-            idx.scores_f.extend(
-                idx.scores_host
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
-            );
-        }
-        // The score dump writes AFTER the join above, deliberately: an ~8 KB write
-        // inside a timed window would inflate the one bucket the offload analysis
-        // attributes. Harmless while
-        // the budget exhausts during prefill (the buckets reset before decode), but the
-        // budget is meant to be raised — so the write must not be in the window at all.
-        #[cfg(feature = "trace")]
-        if let Some((w, seen, left)) = self.score_dump.as_mut().filter(|_| scored_nt > 0) {
-            // STRIDE is coprime with the 21 full layers per token (211 = 10*21 + 1), so
-            // consecutive samples advance one layer AND ~10 tokens: 64 records cover all
-            // 21 layers and a ~630-token span of context. A prefix dump of the same size
-            // would cover 3 tokens at one context, which is the wrong shape for the
-            // question this exists to answer — whether the distribution moves with nt.
-            const STRIDE: u64 = 211;
-            if *left > 0 && *seen % STRIDE == 0 {
-                use std::io::Write;
-                let _ = w.write_all(&(l as u32).to_le_bytes());
-                let _ = w.write_all(&(scored_nt as u32).to_le_bytes());
-                // Record layout, so the file is readable without this source:
-                // repeated `(u32 layer, u32 nt, f32[nt])`, native LE.
-                let _ = w.write_all(as_le_bytes(&idx.scores_f));
-                *left -= 1;
-            }
-            *seen += 1;
-        }
-
         Ok(out)
     }
 
@@ -1251,21 +1152,11 @@ impl<'a> GpuEngine<'a> {
     /// draft WOULD have been accepted. The gate therefore never goes blind to the bins it
     /// stops speculating on, and no explore/exploit tempering is needed. A gate placed
     /// BEFORE the draft could not do this — it would never compute `d` to compare.
-    ///
-    /// Reads row 0's logits when `RIVOLI_MTP_PROBE=1`: bucketing the same accept/reject by
-    /// the MAIN MODEL's confidence separates a weak head from a target too uncertain to
-    /// predict. Must run before `mtp_draft`, which reuses `mtp_host`.
     fn score_draft(&mut self, ok: bool, conf: f32) -> Result<()> {
         self.mtp_seen += 1;
         self.mtp_hit += u64::from(ok);
         let b = &mut self.mtp_bins[mtp_bin(conf)];
         (b.0, b.1) = (b.0 + 1, b.1 + u64::from(ok));
-        if mtp_probe() {
-            self.logits.copy_out_into(&mut self.mtp_host)?;
-            let tgt = top1_prob(&self.mtp_host[..self.cfg.vocab * 4]);
-            let b = &mut self.mtp_tgt_bins[mtp_bin(tgt)];
-            (b.0, b.1) = (b.0 + 1, b.1 + u64::from(ok));
-        }
         Ok(())
     }
 
@@ -1932,9 +1823,12 @@ impl<'a> GpuEngine<'a> {
                 // GPU-side timing; read at the end-of-layer join. Caveat: each partial
                 // launches only after its per-expert `sig.await` resolves on the host,
                 // so the compute stream sits idle between host-gated launches and those
-                // bubbles fall inside this span — `compute_gpu` is thus an UPPER bound,
-                // making the derived `fetch_hidden_pct` (1 − (moe_wall−compute_gpu)/…)
-                // read slightly optimistic. Fine as a gauge; not a hard hidden-fetch %.
+                // bubbles fall inside this span — `compute_gpu` is thus an UPPER bound.
+                // The two fields that divided by it, `fetch_hidden_pct` and
+                // `exposed_fetch_ms`, were deleted 2026-08-01 for exactly that reason:
+                // charging the stall to compute reported 96% of fetch hidden against a
+                // ceiling of 57%. Read this as a bracket, and `io_wait_ms` — measured at
+                // the io_uring ring — for what the fetch actually cost.
                 self.moe_ev_start.record(cs_raw)?;
                 let tm = std::time::Instant::now();
                 // The expert stream runs inline in this (async) forward — awaited by
@@ -2274,9 +2168,8 @@ impl<'a> GpuEngine<'a> {
     pub fn nll_forced(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
         ensure!(ids.len() >= 2, "need at least 2 tokens to score a prediction");
         let vocab = self.cfg.vocab;
-        // Same shape as `generate`: one current-thread runtime, `forward` awaited inline.
-        let rt = tokio::runtime::Builder::new_current_thread().build()?;
-        let out = rt.block_on(async {
+        // Same shape as `generate`: `forward` awaited inline on this thread.
+        let out = crate::backend::block_on(async {
             let mut out = Vec::with_capacity(ids.len() - 1);
             let mut host: Vec<u8> = Vec::with_capacity(vocab * 4);
             for (pos, &tok) in ids.iter().enumerate() {
@@ -2419,9 +2312,8 @@ impl<'a> GpuEngine<'a> {
         // slots into. `rt` is local (not on `self`) so the future can borrow `&mut self`.
         #[cfg(feature = "trace")]
         const WIN: usize = 8;
-        let rt = tokio::runtime::Builder::new_current_thread().build()?;
         let mut generated = Vec::with_capacity(ngen);
-        let (hit0, miss0, fetch0, io0, decode_wall) = rt.block_on(async {
+        let (hit0, miss0, fetch0, io0, decode_wall) = crate::backend::block_on(async {
             let mut pos = 0usize;
             for &tok in prompt_ids {
                 // Beat the watchdog per prefill token too — a long/cold prompt can
@@ -2561,7 +2453,7 @@ impl<'a> GpuEngine<'a> {
                 // so BufWriter's Drop is not a guarantee. No-op when not tracing.
                 self.pin.flush_trace()?;
                 #[cfg(feature = "trace")]
-                if _i % WIN == 0 {
+                if _i.is_multiple_of(WIN) {
                     let dt = win_t.elapsed().as_secs_f64();
                     let (dh, dm) = (self.pin.hits - win_hit, self.pin.misses - win_miss);
                     let hit_pct = 100.0 * dh as f64 / (dh + dm).max(1) as f64;
@@ -2664,15 +2556,6 @@ impl<'a> GpuEngine<'a> {
                     self.mtp_draft_n,
                     100.0 * draft_ms / (self.prof.wall_ns as f64 / 1e6),
                     pass_ms,
-                );
-            }
-            // The discriminator. If the top bin here is ~90%+, the head is fine wherever
-            // the target is decidable and the ceiling is the model's own entropy — do not
-            // de-quantize layer 78. If it sits near the overall rate, the head is weak.
-            if self.mtp_tgt_bins.iter().any(|&(n, _)| n > 0) {
-                tracing::info!(
-                    "  MTP accept by TARGET confidence: {}",
-                    hist(&self.mtp_tgt_bins)
                 );
             }
         }

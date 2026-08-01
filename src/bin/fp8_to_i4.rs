@@ -17,19 +17,47 @@
 //! place: `bin/vq3_to_i4`, which used to regenerate the old `.i4` from the `.vq3` set,
 //! is deleted (its output was worse by construction — see the paragraph above). Re-run
 //! THIS tool from the fp8 source to rebuild a layer.
-//!
-//! usage: fp8_to_i4 <fp8-dir> <artifact-dir> [--from L] [--to L]   (`--to` exclusive)
 use anyhow::{Context, Result, anyhow, ensure};
+use clap::Parser;
 use rivoli::artifact::format::{FormatMeta, I4Source, Safetensors};
 use rivoli::artifact::model::ModelConfig;
 use rivoli::artifact::quant::{
-    I4_GROUP, i4_expert_bytes, i4_expert_stride, i4_slot_offsets, quant_i4, vq_expert_layout,
-    write_i4_proj,
+    I4_GROUP, PROJ, i4_expert_bytes, i4_expert_stride, i4_slot_offsets, quant_i4,
+    vq_expert_layout, write_i4_proj,
 };
 use std::fs::File;
 use std::io::Write;
 
-const PROJ: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
+// NOTE: doc comments on the FIELDS below are USER-FACING — clap renders them as `--help`.
+// Rationale for the code goes in `//` comments like this one, which clap ignores. The
+// `USAGE` const this replaced was the only place `--to`'s exclusivity was written down,
+// and it was a string the compiler could not check against the loop beneath it.
+#[derive(Parser)]
+#[command(
+    name = "fp8_to_i4",
+    about = "Derive an artifact's .i4 expert set directly from the original fp8 checkpoint"
+)]
+struct Args {
+    /// The fp8 GLM-5.2 checkpoint to quantize from. Its tile size must match the one the
+    /// artifact's manifest records, so a wrong-model or wrong-revision checkpoint dies on
+    /// the first expert instead of writing plausible garbage.
+    fp8_dir: String,
+
+    /// The artifact directory whose `L{ll}.i4` files are written. Layers are replaced IN
+    /// PLACE (tmp, fsync, rename), so peak extra space is one layer — and the overwrite is
+    /// NOT recoverable in place: re-run this tool against the fp8 source to rebuild one.
+    artifact_dir: String,
+
+    /// First layer to convert (inclusive). Defaults to the artifact's first MoE layer;
+    /// this is the flag an aborted run tells you to resume with.
+    #[arg(long, value_name = "L")]
+    from: Option<usize>,
+
+    /// One PAST the last layer to convert — `--to` is exclusive. Defaults to one past the
+    /// MTP head when the checkpoint carries one, else `num_hidden_layers`.
+    #[arg(long, value_name = "L")]
+    to: Option<usize>,
+}
 
 /// Quantize one expert (routed or shared) rooted at `base` straight from fp8 into
 /// `slot`, gate‖up‖down at the offsets `i4_slot_offsets` defines. `slot` is exactly
@@ -68,17 +96,7 @@ fn free_bytes(dir: &str) -> Result<u64> {
 }
 
 fn main() -> Result<()> {
-    const USAGE: &str = "usage: fp8_to_i4 <fp8-dir> <artifact-dir> [--from L] [--to L]   (--to exclusive)";
-    let (mut arg_from, mut arg_to, mut pos) = (None, None, Vec::new());
-    let mut it = std::env::args().skip(1);
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--from" => arg_from = Some(it.next().context("--from L")?.parse()?),
-            "--to" => arg_to = Some(it.next().context("--to L")?.parse()?),
-            _ => pos.push(a),
-        }
-    }
-    let [fp8_dir, art]: [String; 2] = pos.try_into().map_err(|_| anyhow!(USAGE))?;
+    let Args { fp8_dir, artifact_dir: art, from: arg_from, to: arg_to } = Args::parse();
 
     let cfg = ModelConfig::load(&art).context("load artifact manifest")?;
     let (h, m, ne) = (cfg.hidden, cfg.moe_inter, cfg.n_experts);

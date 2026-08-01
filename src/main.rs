@@ -26,7 +26,8 @@ use tracing::info;
 // hand-rolled loop it replaced was ~150 lines of
 // `args.next().context(..)?.parse().context(..)?`, one block per flag, plus a `USAGE`
 // const maintained separately from the flags it described — and by the end no longer
-// matching them (it never mentioned `--misa-heads`, `--checksum-x` or `--2q-*`'s bounds).
+// matching them (it never mentioned `--misa-heads`, `--checksum-x`, or the bounds of the
+// since-deleted `--2q-*` pair).
 //
 // No `wrap_help` feature, so clap does not re-wrap: the terminal does. That also means
 // `max_term_width` would be inert, which is why it is not set.
@@ -86,17 +87,6 @@ struct Args {
     #[arg(long, default_value = "2q", value_parser = ["lru", "2q", "arc"])]
     cache_policy: String,
 
-    /// 2Q's A1in probation bound, percent of pool capacity. Ignored by lru/arc.
-    #[arg(long = "2q-kin", value_name = "PCT", default_value_t = rivoli::memory::cache::TwoQSplit::default().kin_pct())]
-    two_q_kin: u32,
-
-    /// 2Q's A1out ghost bound, percent of pool capacity. May exceed 100 (the ghost holds
-    /// keys only). Ignored by lru/arc.
-    #[arg(long = "2q-kout", value_name = "PCT", default_value_t = rivoli::memory::cache::TwoQSplit::default().kout_pct())]
-    two_q_kout: u32,
-
-
-
     /// Device budget in GiB, taken LITERALLY — no OS reserve, so it may OOM at build.
     /// Without it the budget auto-sizes to `free − 16 GiB`.
     #[arg(long, value_name = "GIB", value_parser = clap::value_parser!(u64).range(1..))]
@@ -119,13 +109,6 @@ struct Args {
     /// setting is 8).
     #[arg(long, value_name = "N", default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
     misa_heads: u16,
-
-    /// Opt OUT of the pinned-host bounce: DMA cold reads straight into VMM device memory.
-    /// The bounce is the default because it measures faster and survives kernels whose
-    /// amdgpu path EFAULTs on direct io_uring DMA into VMM (src/fetch/stream.rs).
-    #[arg(long)]
-    direct_vmm_dma: bool,
-
 
     /// Dump the routed-expert access trace (v2: demand keys plus the ranked candidate
     /// window) for the offline `replay` sim.
@@ -194,12 +177,6 @@ struct Args {
     /// instrument rather than an eyeball.
     #[arg(long, value_name = "PATH")]
     dump_ids: Option<String>,
-
-    /// Encode the prompt RAW, with no GLM turn framing. Reproduces every benchmark number
-    /// recorded before templating existed — and those runs could never stop, so this is
-    /// also how you re-measure the degeneration it caused.
-    #[arg(long)]
-    raw_prompt: bool,
 
     /// Turn OFF speculative decode. On by default whenever the artifact carries the MTP
     /// head: the head drafts `pos+1`, a 2-row verify pass checks the real token and the
@@ -340,62 +317,47 @@ fn main() -> Result<()> {
 fn main() -> Result<()> {
     let a = parse_args();
     let attn = resolve_attn(&a)?;
-    // Bound before `a` is partially moved into `discover` below.
-    #[cfg(feature = "teacher-forcing")]
-    let (a_ppl, a_ppl_out) = (a.ppl.clone(), a.ppl_out.clone());
-    #[cfg(feature = "pred-probe")]
-    let a_pred_probe = a.pred_probe;
     // Arm the span recorder before anything can record: it anchors a monotonic clock to a
     // wall clock here, and every interval in the run is stamped as a delta from that pair.
     #[cfg(feature = "otlp")]
     if let Some(budget) = a.spans {
         rivoli::telemetry::spans::init(budget);
     }
-    let a_moe_gain = a.moe_gain;
-    let (a_port, a_ctx) = (a.port, a.ctx);
-    let a_raw_prompt = a.raw_prompt;
-    let a_dump_ids = a.dump_ids.clone();
-    // Bound here for the OTLP root span's run-identity attributes: `a` is partially
-    // moved into `discover` below, and `cfg` does not keep all of these verbatim.
-    let a_model = a.model.clone();
-    let a_cache_policy = a.cache_policy.clone();
-    let a_attn = format!("{attn:?}").to_lowercase();
-    let (a_max_mem, a_bench) = (a.max_mem, a.bench);
-    let (a_2q_kin, a_2q_kout) = (a.two_q_kin, a.two_q_kout);
-    let (a_sinks, a_window, a_misa_heads) = (a.sinks, a.window, a.misa_heads as usize);
-    let a_no_mtp = a.no_mtp;
-    let a_think = a.think;
+    // `--checksum-x` only exists in a `trace` build; elsewhere the field is dead-false.
     #[cfg(feature = "trace")]
     let checksum_x = a.checksum_x;
-    #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
-    let mut cfg = Config::discover(
-        a.model,
-        a.bench,
-        a.direct_vmm_dma,
-        a.trace,
-        a.prompt,
-        a.cache_policy,
-        rivoli::memory::cache::TwoQSplit::new(a.two_q_kin, a.two_q_kout)?,
+    #[cfg(not(feature = "trace"))]
+    let checksum_x = false;
+    // The one run-identity attribute the OTLP root span cannot read back off `cfg`, since
+    // `attn` is moved into it below and `AttnMode` has no Display.
+    let a_attn = format!("{attn:?}").to_lowercase();
+    rivoli::artifact::config::check_budget(a.max_mem)?;
+    // The flags ARE the config. This was `Config::discover`, a nine-argument passthrough
+    // (carrying an `#[allow(clippy::too_many_arguments)]`) whose only work was the budget
+    // check above — after which `main` overwrote two of the fields it had just defaulted.
+    // Moving the strings in rather than cloning them out is also what dissolved the block
+    // of `let a_* = a.field.clone()` bindings that worked around the partial move: every
+    // field read after this point is either `Copy` or lives on `cfg`.
+    let cfg = Config {
+        model: a.model,
+        bench: a.bench,
+        trace: a.trace,
+        prompt: a.prompt,
+        cache_policy: a.cache_policy,
+        two_q: rivoli::memory::cache::TwoQSplit::default(),
+        checksum_x,
+        mode: a.mode,
         // GiB -> BYTES. The flag is documented and value_named in GiB and every consumer
         // (`Config::max_mem`, the pool cap, the log line's `/ GIB`) is in bytes. The clap
         // migration dropped this multiply, so `--max-mem 115` asked for 115 BYTES and the
         // pool came out at "0.0 GiB (~0 slots)" before failing in `rivoli_vmm_alloc(0)`.
         // Loud rather than silent, but it invalidates any run that passed the flag.
-        a.max_mem.map(|g| g.saturating_mul(1 << 30)),
+        max_mem: a.max_mem.map(|g| g.saturating_mul(1 << 30)),
         attn,
-    )?;
-    #[cfg(feature = "trace")]
-    {
-        cfg.checksum_x = checksum_x;
-    }
-    cfg.mode = a.mode;
-    // Mode-dependent, so it cannot live in `discover` — see Config::validate.
-    cfg.validate()?;
-    // Two DIFFERENT questions, asked together: is this configuration coherent (above), and
-    // does the backend this binary was built with have the kernels it needs (here)? The
-    // second is a no-op under `rocm` and refuses `--mode int4|hybrid` / `--attn dsa|misa`
-    // under `vulkan`. Kept separate so `validate`'s own tests stay backend-independent —
-    // see Config::validate_backend.
+    };
+    // Does the backend this binary was built with have the kernels this configuration
+    // needs? A no-op under `rocm`; refuses `--mode int4|hybrid` / `--attn dsa|misa` under
+    // `vulkan`, at the door rather than forty layers into the first token.
     cfg.validate_backend()?;
     // `--moe-gain` is the one backend-gated knob that is NOT a `Config` field, so it is
     // checked here rather than in `validate_backend` with the others. g == 1 takes the
@@ -403,11 +365,12 @@ fn main() -> Result<()> {
     // at startup for the same reason as the modes: the alternative is discovering it forty
     // layers into the first token.
     #[cfg(feature = "vulkan")]
-    if a_moe_gain != 1.0 {
+    if a.moe_gain != 1.0 {
         bail!(
-            "--moe-gain {a_moe_gain} needs the `vaxpy` kernel, which the Vulkan backend does \
+            "--moe-gain {} needs the `vaxpy` kernel, which the Vulkan backend does \
              not have (docs/investigations/vulkan-port.md defers it; `vadd`, the g = 1 case, is ported). Drop the \
-             flag, or rebuild with --features rocm."
+             flag, or rebuild with --features rocm.",
+            a.moe_gain
         );
     }
 
@@ -508,19 +471,16 @@ fn main() -> Result<()> {
     // Tokenizer (tokenizer.json + generation_config.json, copied into the artifact).
     let bench_prompt = cfg.prompt.as_deref().unwrap_or("The sky is blue because");
     let tok = rivoli::artifact::tokenizer::Tokenizer::load(&cfg.model)?;
-    // Chat framing by default: raw text leaves the model outside any assistant turn, so
-    // its EOS ids (two of which are turn boundaries) are unreachable and decode runs to
-    // the token limit every time. `--ppl` deliberately does NOT go through here — it
-    // scores a fixed corpus, not a turn.
-    let prompt_ids = if a_raw_prompt {
-        tok.encode(bench_prompt)?
-    } else {
-        tok.encode_chat(bench_prompt)?
-    };
+    // Chat-framed, always: raw text leaves the model outside any assistant turn, so its
+    // EOS ids (two of which are turn boundaries) are unreachable and decode runs to the
+    // token limit every time. `--raw-prompt` opted out of the framing to reproduce numbers
+    // recorded before templating existed; it was deleted 2026-08-01, because the only runs
+    // it can produce are runs that cannot stop. `--ppl` deliberately does NOT go through
+    // here — it scores a fixed corpus, not a turn.
+    let prompt_ids = tok.encode_chat(bench_prompt)?;
     info!(
-        "tokenizer: prompt {bench_prompt:?} -> {} tokens{} {:?}; eos={:?}",
+        "tokenizer: prompt {bench_prompt:?} -> {} tokens chat-framed {:?}; eos={:?}",
         prompt_ids.len(),
-        if a_raw_prompt { " RAW (no chat framing — decode cannot stop on EOS)" } else { " chat-framed" },
         &prompt_ids[..prompt_ids.len().min(12)],
         tok.eos
     );
@@ -529,7 +489,7 @@ fn main() -> Result<()> {
     // Defined in BOTH configurations rather than gating each of its three readers: without
     // the feature there is no corpus to load, so it is a `None` the sizing below folds away.
     #[cfg(feature = "teacher-forcing")]
-    let ppl_ids = match &a_ppl {
+    let ppl_ids = match &a.ppl {
         Some(path) => Some(rivoli::eval::load_corpus(path, &tok)?),
         None => None,
     };
@@ -537,7 +497,7 @@ fn main() -> Result<()> {
     let ppl_ids: Option<Vec<u32>> = None;
     // Three shapes of run, and only `-bench` carries a token budget: `--ppl` scores a
     // corpus, and the server takes its budget per request (bounded by `--ctx`).
-    let ngen = match (ppl_ids.is_some(), a_port.is_some()) {
+    let ngen = match (ppl_ids.is_some(), a.port.is_some()) {
         (true, _) | (_, true) => 0,
         _ => cfg
             .bench
@@ -582,7 +542,6 @@ fn main() -> Result<()> {
             &cfg.model,
             &mc,
             cap,
-            !cfg.direct_vmm_dma,
             cfg.trace.as_deref(),
             &cfg.cache_policy,
             cfg.two_q,
@@ -594,17 +553,17 @@ fn main() -> Result<()> {
         // KV cache from `prompt_ids` would allocate ~17 positions for an ~900-position
         // scoring pass. The server sizes from `--ctx`, since it cannot know its prompts
         // yet and the slabs are allocated exactly once. Take whichever run this actually is.
-        let max_ctx = match (&ppl_ids, a_port) {
+        let max_ctx = match (&ppl_ids, a.port) {
             (Some(ids), _) => ids.len() + 1,
-            (None, Some(_)) => a_ctx,
+            (None, Some(_)) => a.ctx,
             (None, None) => prompt_ids.len() + ngen + 1,
         };
         let mut engine = rivoli::gpu::GpuEngine::new(pin, &mc, max_ctx, cfg.attn.clone())?;
         #[cfg(feature = "trace")]
         engine.set_checksum_x(cfg.checksum_x);
         #[cfg(feature = "pred-probe")]
-        engine.set_pred_probe(a_pred_probe);
-        engine.set_moe_gain(a_moe_gain);
+        engine.set_pred_probe(a.pred_probe);
+        engine.set_moe_gain(a.moe_gain);
         // Wedge watchdog: a hung GPU join can't be caught inside the decode loop, so
         // a background thread aborts the process if no token lands for `wd_secs`.
         let wd_secs = std::env::var("RIVOLI_WATCHDOG_SECS")
@@ -627,10 +586,10 @@ fn main() -> Result<()> {
             // fields ARE the label. `moe_gain` is among them because a gain sweep differs
             // in nothing else — six arms would otherwise be indistinguishable downstream.
             let label = format!(
-                "mode={} policy={} moe_gain={a_moe_gain}",
-                cfg.mode, cfg.cache_policy
+                "mode={} policy={} moe_gain={}",
+                cfg.mode, cfg.cache_policy, a.moe_gain
             );
-            rivoli::eval::run(&mut engine, &ids, a_ppl_out.as_ref(), &label)?;
+            rivoli::eval::run(&mut engine, &ids, a.ppl_out.as_ref(), &label)?;
             return Ok(());
         }
 
@@ -650,8 +609,8 @@ fn main() -> Result<()> {
         // Found 2026-08-01 while building server mode. Fixed by BATCHING the row selection
         // rather than refusing it: dsa/misa select per row and the head attends dense, and
         // streaming uploads one row set per row. All four modes speculate. See §13.
-        let mtp = !a_no_mtp && engine.has_mtp() && !engine.tracing();
-        if !a_no_mtp && !mtp {
+        let mtp = !a.no_mtp && engine.has_mtp() && !engine.tracing();
+        if !a.no_mtp && !mtp {
             info!(
                 "speculative decode OFF: {}",
                 match engine.has_mtp() {
@@ -664,14 +623,14 @@ fn main() -> Result<()> {
         // Server mode: the same engine, driven by HTTP instead of by one bench prompt.
         // Everything below (degeneration report, OTLP export, --dump-ids) is the bench
         // path's epilogue and does not apply — serve() carries its own per-request one.
-        if let Some(port) = a_port {
+        if let Some(port) = a.port {
             return rivoli::serve::serve(
                 &mut engine,
                 &tok,
                 &hb,
                 &rivoli::serve::Opts {
                     port,
-                    ctx: a_ctx,
+                    ctx: a.ctx,
                     // The artifact directory's own name, so `/v1/models` and the echoed
                     // `model` field say which checkpoint answered.
                     model_id: std::path::Path::new(&cfg.model)
@@ -679,7 +638,7 @@ fn main() -> Result<()> {
                         .map_or_else(|| "rivoli".into(), |n| n.to_string_lossy().into_owned()),
                     mtp,
                     mtp_min_conf: a.mtp_min_conf,
-                    think: a_think,
+                    think: a.think,
                 },
             );
         }
@@ -712,14 +671,14 @@ fn main() -> Result<()> {
         // then answers again is already broken and may have no cycle at all. Threshold:
         // an eighth of the generation, floor 32 tokens. Healthy prose repeats phrases,
         // not paragraphs.
-        let lrb = rivoli::telemetry::longest_repeated_block(&ids);
         let lrb_bar = std::cmp::max(32, ids.len() / 8);
-        if degenerate.is_none() && lrb >= lrb_bar {
+        let restart = rivoli::telemetry::has_repeated_block(&ids, lrb_bar);
+        if degenerate.is_none() && restart {
             tracing::warn!(
-                "SUSPECT OUTPUT: the longest block repeated in {} generated tokens is {lrb} \
-                 tokens (bar {lrb_bar}) with no verbatim tail cycle — the shape of a \
-                 RESTART rather than a loop. tok/s here is still suspect: re-answering \
-                 re-routes to the same experts, which inflates the hit rate.",
+                "SUSPECT OUTPUT: some block of {lrb_bar} tokens occurs twice in the {} \
+                 generated, with no verbatim tail cycle — the shape of a RESTART rather \
+                 than a loop. tok/s here is still suspect: re-answering re-routes to the \
+                 same experts, which inflates the hit rate.",
                 ids.len(),
             );
         }
@@ -730,7 +689,8 @@ fn main() -> Result<()> {
         let text = tok.decode_all(&ids).unwrap_or_default();
         let rep = rivoli::telemetry::repetition_report(&text);
         tracing::info!(
-            "generation: {} tokens, longest repeated block {lrb}, top-line x{}, distinct {:.3}",
+            "generation: {} tokens, {lrb_bar}-token block repeated: {restart}, top-line x{}, \
+             distinct {:.3}",
             ids.len(),
             rep.top_line,
             rep.distinct,
@@ -740,7 +700,7 @@ fn main() -> Result<()> {
                 "STRUCTURALLY DEGENERATE: one line repeats {}x and the distinct-word ratio \
                  is {:.3} (healthy band 0.42-0.53). This is a near-miss loop — a varying \
                  slot in a repeated template — which the verbatim-cycle and \
-                 longest-repeated-block checks CANNOT see. tok/s is not usable: the hit \
+                 repeated-block checks CANNOT see. tok/s is not usable: the hit \
                  rate rises as the output collapses.",
                 rep.top_line,
                 rep.distinct,
@@ -761,23 +721,21 @@ fn main() -> Result<()> {
         }
         // The run's identity for the root span.
         let run = rivoli::telemetry::RunInfo {
-            model: a_model.clone(),
+            model: cfg.model.clone(),
             mode: cfg.mode.to_string(),
-            cache_policy: a_cache_policy.clone(),
+            cache_policy: cfg.cache_policy.clone(),
             attn: a_attn.clone(),
-            max_mem_gib: a_max_mem,
-            bench_tokens: a_bench,
+            max_mem_gib: a.max_mem,
+            bench_tokens: a.bench,
             prompt: cfg.prompt.clone(),
-            moe_gain: a_moe_gain,
-            two_q_kin: a_2q_kin,
-            two_q_kout: a_2q_kout,
-            sinks: a_sinks,
-            window: a_window,
-            misa_heads: a_misa_heads,
+            moe_gain: a.moe_gain,
+            sinks: a.sinks,
+            window: a.window,
+            misa_heads: a.misa_heads as usize,
             degenerate,
         };
         rivoli::telemetry::export_decode(&summary, ids.len(), &run);
-        if let Some(path) = &a_dump_ids {
+        if let Some(path) = &a.dump_ids {
             use std::io::Write;
             let mut w = std::io::BufWriter::new(
                 std::fs::File::create(path).with_context(|| format!("create {path}"))?,
@@ -789,7 +747,7 @@ fn main() -> Result<()> {
                 "# rivoli-ids v1 backend={} mode={} policy={} attn={} tokens={}",
                 if cfg!(feature = "vulkan") { "vulkan" } else { "rocm" },
                 cfg.mode,
-                a_cache_policy,
+                cfg.cache_policy,
                 a_attn,
                 ids.len(),
             )?;

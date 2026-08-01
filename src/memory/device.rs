@@ -35,7 +35,7 @@
 /// advances nothing itself.
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
 fn bump(used: &mut usize, capacity: usize, len: usize, pad: usize) -> anyhow::Result<usize> {
-    let off = (*used + 255) & !255;
+    let off = used.next_multiple_of(256);
     let span = len.next_multiple_of(pad);
     anyhow::ensure!(
         off + span <= capacity,

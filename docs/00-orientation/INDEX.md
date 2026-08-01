@@ -47,10 +47,12 @@ measured, kept; the result is in the engine. `closed-mixed` — parts of both, b
 
 ## investigations/ — asked, answered, closed
 
-Read the verdict. Open the file only if you are about to re-open the question.
+Read the verdict. Open the file only if you are about to re-open the question. **One row is
+`live`** — an open proposal, not yet built; it moves to `closed-shipped` when it is executed.
 
 | doc | status | verdict |
 |---|---|---|
+| [`otlp-modernization.md`](../investigations/otlp-modernization.md) | live | PROPOSED, not built. Keep OTLP — measured, no leaner path exists at 0.30 and it costs 64 crates — add run-identity labels without which every metric series is uncomparable, plus MTP acceptance and moe-by-miss; drop fetch_hidden_pct and the top-m leftovers. |
 | [`int4-scales.md`](../investigations/int4-scales.md) | closed-shipped | Why int4 was unusable and how group-128 scales fixed it: PPL 73.43 → 5.120, making int4 the best-quality mode. RESOLVED. |
 | [`vulkan-port.md`](../investigations/vulkan-port.md) | closed-shipped | Porting the engine to Vulkan across four phases — the journal, not the rules. Shipped and decoding; the live inventory AND every standing shader obligation moved to reference/vulkan-kernels.md on 2026-08-01. |
 | [`cache-conditional-routing.md`](../investigations/cache-conditional-routing.md) | closed-negative | top-m routing: RETIRED 2026-07-30. Cost +3.63% PPL on int3-vq and +12.7% on int4 against a ~1% bar, and made every cache change an output change. |

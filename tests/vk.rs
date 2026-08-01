@@ -42,15 +42,16 @@
 use rivoli::memory::device::{DeviceBuf, DeviceTier};
 use rivoli::artifact::quant::{matvec_fp8, matvec_i8};
 use rivoli::math::{E4M3_BLOCK, E4M3_MAX, e4m3_to_f32, f32_to_bf16, f32_to_e4m3, silu};
+use rivoli::backend::block_on;
 use rivoli::backend::vk::{
-    Buf, ExpertDesc, ROWS_PER_BLOCK, VALIDATION_ERRORS, device_sync, fill_u32, gpu,
+    Buf, ExpertDesc, Q, ROWS_PER_BLOCK, VALIDATION_ERRORS, device_sync, fill_u32, gpu,
     launch_append_kv, launch_argmax,
     launch_embed_i8_row, launch_flag_nonfinite, launch_gather_rope, launch_gemv_f32,
     launch_gemv_fp8, launch_gemv_i8,
     launch_attend, launch_index_append, launch_index_head_route, launch_index_pool_push,
     launch_index_score, launch_index_topk, launch_layernorm, launch_mla_absorb_fp8,
     launch_mla_value_fp8, launch_moe_expert_range, launch_moe_expert_range_i4,
-    launch_moe_acc_drain, launch_moe_reduce, launch_rmsnorm, launch_rope,
+    launch_moe_acc_drain, launch_rmsnorm, launch_rope,
     launch_swiglu, launch_vadd, launch_vaxpy, memcpy_dtod,
 };
 use std::sync::atomic::Ordering;
@@ -181,6 +182,30 @@ fn assert_bytes(want: &[u8], got: &[u8], label: &str) {
             got[i]
         ),
     }
+}
+
+/// The repeat/decoy recipe every `*_is_bit_reproducible` test below runs: take `real`'s
+/// bytes, then four more times dispatch `decoy` — a differently-shaped launch, so two
+/// `real` runs never see identical queue state — and require `real` to reproduce its
+/// bytes exactly. `decoy`'s output is dropped; it exists only to perturb scheduling. See
+/// `gemv_f32_is_bit_reproducible` for why this is bit equality and not a tolerance.
+///
+/// Returns `first` rather than checking it: the "not all zero, so the test proves
+/// something" guard is NOT shared. `append_kv`'s untouched rows are legitimately zero so
+/// only the row it wrote can be checked, `argmax` returns an i32 beside an f32 and must
+/// not read both as floats, and the rest compare f32 magnitudes — which also rejects a
+/// buffer of denormal noise. A guard weak enough to cover all three catches none of them.
+fn assert_bit_reproducible(
+    label: &str,
+    mut real: impl FnMut() -> Vec<u8>,
+    mut decoy: impl FnMut() -> Vec<u8>,
+) -> Vec<u8> {
+    let first = real();
+    for i in 1..5 {
+        decoy();
+        assert_bytes(&first, &real(), &format!("{label} repeat {i}"));
+    }
+    first
 }
 
 /// Snapshots the validation counter on construction and asserts NOTHING NEW arrived
@@ -409,12 +434,11 @@ fn gemv_f32_is_bit_reproducible() {
     let (dx, dw) = (dev(&f32b(&x[..96])), dev(&f32b(&w[..96 * 33])));
     let mut dy = dev(&[0u8; 33 * 4]);
 
-    let first = gemv(&xb, &wb, &mut yb, o_dim, i_dim);
-    for i in 1..5 {
-        gemv(&dx, &dw, &mut dy, 33, 96);
-        let again = gemv(&xb, &wb, &mut yb, o_dim, i_dim);
-        assert_eq!(first, again, "gemv_f32 not bit-reproducible on repeat {i}");
-    }
+    let first = assert_bit_reproducible(
+        "gemv_f32",
+        || gemv(&xb, &wb, &mut yb, o_dim, i_dim),
+        || gemv(&dx, &dw, &mut dy, 33, 96),
+    );
     // Guard against comparing two buffers of zeros and calling it determinism.
     assert!(
         f32v(&first).iter().any(|v| v.abs() > 1e-6),
@@ -456,28 +480,6 @@ fn memcpy_dtod_after_dispatch_is_ordered() {
     v.check("memcpy_dtod_after_dispatch_is_ordered");
 }
 
-/// Drive a future to completion on this thread. Fifteen lines of std beats pulling in
-/// a runtime for one test — `asyncfetch.rs` brings tokio when it is actually ported.
-fn block_on<F: std::future::Future>(f: F) -> F::Output {
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake, Waker};
-    struct Unpark(std::thread::Thread);
-    impl Wake for Unpark {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
-    let mut cx = Context::from_waker(&waker);
-    let mut f = std::pin::pin!(f);
-    loop {
-        match f.as_mut().poll(&mut cx) {
-            Poll::Ready(v) => return v,
-            Poll::Pending => std::thread::park(),
-        }
-    }
-}
-
 /// The timeline-semaphore Signal resolves, and at what cost.
 ///
 /// The HIP side gets this from `hipLaunchHostFunc` at ~19 us/signal, measured by
@@ -491,12 +493,12 @@ fn timeline_signal_resolves_and_latency() {
     let v = Validation::new();
     let g = gpu().expect("vulkan init");
     // Warm the waiter thread and the first submit.
-    block_on(g.signal().expect("arm"));
+    block_on(g.signal_on(Q::Main).expect("arm"));
 
     let n = 200u32;
     let t = std::time::Instant::now();
     for _ in 0..n {
-        block_on(g.signal().expect("arm"));
+        block_on(g.signal_on(Q::Main).expect("arm"));
     }
     let us = t.elapsed().as_nanos() as f64 / f64::from(n) / 1000.0;
     println!("\nVK TIMELINE-SIGNAL round-trip: {us:.2} us/signal ({n} iters)\n");
@@ -516,7 +518,7 @@ fn timeline_signal_resolves_and_latency() {
 /// is deleted — `Ticket::RESIDENT` is what says "already present" now.
 #[test]
 fn signal_resolve_is_idempotent_and_immediate() {
-    let s = rivoli::backend::vk::Signal::pending();
+    let s = rivoli::backend::Signal::pending();
     s.resolve();
     s.resolve(); // idempotent
     block_on(s);
@@ -543,15 +545,14 @@ fn a_signal_covers_recorded_work_without_a_device_sync() {
     let v = Validation::new();
     let mut x = dev(&f32b(&[1.0, 2.0, 3.0, 4.0]));
     let mut y = dev(&f32b(&[10.0, 20.0, 30.0, 40.0]));
-    let fetch = rivoli::backend::Stream::fetch().expect("fetch stream");
     // Records a copy on the fetch queue and nothing else. Under HIP this is
     // `hipMemcpyAsync` on the fetch stream; here it is `vkCmdCopyBuffer`.
     // SAFETY: both mappings are live, 16 bytes each, distinct allocations.
     unsafe {
         rivoli::backend::vk::copy_h2d_async(y.host_mut(), x.host_mut(), 16).expect("async copy");
     }
-    let sig = rivoli::backend::vk::Signal::pending();
-    sig.arm_on(&fetch).expect("arm on fetch");
+    let sig = rivoli::backend::Signal::pending();
+    gpu().expect("vulkan init").arm_on(Q::Fetch, &sig).expect("arm on fetch");
     block_on(sig);
     let got = f32v(&{
         let mut out = Vec::new();
@@ -575,39 +576,49 @@ fn a_signal_covers_recorded_work_without_a_device_sync() {
 /// visibility comes from the barrier at the head of the reading queue's command buffer. A
 /// missing acquire barrier would show up here as stale bytes in `out`, and nowhere else.
 ///
-/// It is the decode path's exact shape: `moe_reduce` on the compute stream summing expert
-/// partials that arrived by H2D copy. `launch_vadd` would NOT do — it takes no stream, so it
-/// records on the MAIN queue, and a test that awaited the MoE stream for it would assert
-/// nothing while looking like it asserted the whole thing.
+/// It is the decode path's exact shape: `moe_acc_drain` on the compute stream folding an
+/// expert accumulator that arrived by H2D copy. `launch_vadd` would NOT do — it takes no
+/// stream, so it records on the MAIN queue, and a test that awaited the MoE stream for it
+/// would assert nothing while looking like it asserted the whole thing.
 #[test]
 fn a_moe_dispatch_sees_what_the_fetch_queue_wrote() {
     let v = Validation::new();
     const N: usize = 256;
-    const E: usize = 2;
-    let mut src = dev(&f32b(&vec![3.0f32; N * E]));
+    const ROWS: usize = 2;
+    // `moe_acc_drain` reads a FIXED-POINT accumulator: one unit is 2^-MOE_ACC_SHIFT, so
+    // 1<<44 per row over ROWS rows at gain 3 is exactly 6.0 — the same value this asserted
+    // when it drove `moe_reduce`, with no rounding for the schedule to reach.
+    let acc_bytes: Vec<u8> = (0..N * ROWS)
+        .flat_map(|_| (1u64 << 44).to_le_bytes())
+        .collect();
+    let mut src = dev(&acc_bytes);
     // `staged` is what the fetch copy writes and the MoE dispatch reads.
-    let mut staged = dev(&f32b(&vec![0.0f32; N * E]));
-    let mut out = poison(N * 4);
-    let fetch = rivoli::backend::Stream::fetch().expect("fetch stream");
+    let mut staged = dev(&vec![0u8; N * ROWS * 8]);
+    // Zero, not `poison`: the drain is `x[o] +=`, so a poisoned x could not be read as a
+    // sum. A copy that had NOT landed leaves the accumulator at zero and x at 0.0, which is
+    // exactly the stale-read this test exists to catch.
+    let mut out = dev(&f32b(&vec![0.0f32; N]));
     let moe = rivoli::backend::Stream::compute().expect("compute stream");
-    // SAFETY: live mappings, N*E*4 bytes each, distinct allocations.
+    // SAFETY: live mappings, N*ROWS*8 bytes each, distinct allocations.
     unsafe {
-        rivoli::backend::vk::copy_h2d_async(staged.host_mut(), src.host_mut(), N * E * 4).expect("copy");
+        rivoli::backend::vk::copy_h2d_async(staged.host_mut(), src.host_mut(), N * ROWS * 8)
+            .expect("copy");
     }
-    let sig = rivoli::backend::vk::Signal::pending();
-    sig.arm_on(&fetch).expect("arm");
+    let sig = rivoli::backend::Signal::pending();
+    gpu().expect("vulkan init").arm_on(Q::Fetch, &sig).expect("arm");
     block_on(sig);
-    // Now a dispatch on the MoE queue reads those bytes: out[o] = Σ_e staged[e][o] = 6.
-    // SAFETY: device addresses of live Bufs holding N*E and N f32.
+    // Now a dispatch on the MoE queue reads those bytes: out[o] = 3·Σ_r staged[r][o]/2^44 = 6.
+    // SAFETY: device addresses of live Bufs holding N*ROWS u64 and N f32.
     unsafe {
-        launch_moe_reduce(
-            staged.ptr() as *const f32,
-            E,
-            N,
+        launch_moe_acc_drain(
             out.ptr_mut() as *mut f32,
+            staged.ptr_mut() as *mut u64,
+            N,
+            ROWS,
+            3.0,
             moe.raw(),
         )
-        .expect("moe_reduce");
+        .expect("moe_acc_drain");
     }
     block_on(rivoli::backend::stream_signal(moe.raw()).expect("moe signal"));
     let got = f32v(&read(&out, N));
@@ -703,22 +714,31 @@ fn timestamps_measure_gpu_time_and_refuse_when_absent() {
 fn the_command_buffer_ring_wraps_without_a_stale_slot() {
     let v = Validation::new();
     const N: usize = 64;
-    const E: usize = 2;
+    const ROWS: usize = 2;
     const LAPS: usize = 40; // RING is 16; 40 is two and a half laps
-    let partial = dev(&f32b(&vec![2.0f32; N * E]));
-    let mut out = poison(N * 4);
+    // 1<<44 is one unit at MOE_ACC_SHIFT, so ROWS rows at gain 2 drain to exactly 4.0.
+    // The drain RESETS the accumulator, so laps 2..LAPS add zero and the total is the
+    // first lap's — part 1 was never the cumulative half (part 2 is), and the fence
+    // reset/pending-slot reuse this exercises fails as a validation error or a hang, both
+    // of which `LAPS > RING` unjoined submits are what provoke.
+    let acc_bytes: Vec<u8> = (0..N * ROWS)
+        .flat_map(|_| (1u64 << 44).to_le_bytes())
+        .collect();
+    let mut acc = dev(&acc_bytes);
+    let mut out = dev(&f32b(&vec![0.0f32; N]));
     let moe = rivoli::backend::Stream::compute().expect("compute stream");
     for _ in 0..LAPS {
-        // SAFETY: device addresses of live Bufs holding N*E and N f32.
+        // SAFETY: device addresses of live Bufs holding N*ROWS u64 and N f32.
         unsafe {
-            launch_moe_reduce(
-                partial.ptr() as *const f32,
-                E,
-                N,
+            launch_moe_acc_drain(
                 out.ptr_mut() as *mut f32,
+                acc.ptr_mut() as *mut u64,
+                N,
+                ROWS,
+                2.0,
                 moe.raw(),
             )
-            .expect("moe_reduce");
+            .expect("moe_acc_drain");
         }
     }
     block_on(rivoli::backend::stream_signal(moe.raw()).expect("signal"));
@@ -758,8 +778,10 @@ fn the_command_buffer_ring_wraps_without_a_stale_slot() {
 fn an_unknown_stream_token_is_refused() {
     let mut y = dev(&[0u8; 64]);
     let p = y.ptr_mut() as *mut f32;
-    // SAFETY: the guard rejects before any pointer is read.
-    let r = unsafe { launch_moe_reduce(p as *const f32, 1, 16, p, 0x99 as *mut std::ffi::c_void) };
+    // SAFETY: `Q::parse` runs before the argument guards and before any pointer is read.
+    let r = unsafe {
+        launch_moe_acc_drain(p, p as *mut u64, 8, 1, 1.0, 0x99 as *mut std::ffi::c_void)
+    };
     assert!(
         r.is_err(),
         "a bogus stream token silently picked a queue instead of failing"
@@ -1334,12 +1356,11 @@ fn append_kv_is_bit_reproducible() {
         out
     };
 
-    let first = run(&lb, &rb, &mut lc8, &mut lscale, &mut rc, pos, kvl, ropn, n_blocks);
-    for i in 1..5 {
-        run(&dlb, &drb, &mut dlc8, &mut dlscale, &mut drc, 0, E4M3_BLOCK, 64, 1);
-        let again = run(&lb, &rb, &mut lc8, &mut lscale, &mut rc, pos, kvl, ropn, n_blocks);
-        assert_bytes(&first, &again, &format!("append_kv repeat {i}"));
-    }
+    let first = assert_bit_reproducible(
+        "append_kv",
+        || run(&lb, &rb, &mut lc8, &mut lscale, &mut rc, pos, kvl, ropn, n_blocks),
+        || run(&dlb, &drb, &mut dlc8, &mut dlscale, &mut drc, 0, E4M3_BLOCK, 64, 1),
+    );
     // Row `pos` of lc8 alone — rows 0..pos are legitimately still zero, so checking the
     // whole buffer would be a weaker guard than it looks.
     assert!(
@@ -1481,11 +1502,7 @@ fn argmax_is_bit_reproducible() {
     // A differently-shaped dispatch between repeats, to perturb queue state.
     let decoy: Vec<f32> = (0..1291).map(|_| r.f()).collect();
 
-    let first = argmax_raw(&logits);
-    for i in 1..5 {
-        argmax_raw(&decoy);
-        assert_bytes(&first, &argmax_raw(&logits), &format!("argmax repeat {i}"));
-    }
+    let first = assert_bit_reproducible("argmax", || argmax_raw(&logits), || argmax_raw(&decoy));
     assert!(
         first.iter().any(|&b| b != 0),
         "both output words are zero — the test proves nothing"
@@ -1776,11 +1793,11 @@ fn rmsnorm_is_bit_reproducible() {
         readb(y, n * 4)
     };
 
-    let first = run(&xb, &wb, &mut yb, n);
-    for i in 1..5 {
-        run(&dx, &dw, &mut dy, 301);
-        assert_bytes(&first, &run(&xb, &wb, &mut yb, n), &format!("rmsnorm repeat {i}"));
-    }
+    let first = assert_bit_reproducible(
+        "rmsnorm",
+        || run(&xb, &wb, &mut yb, n),
+        || run(&dx, &dw, &mut dy, 301),
+    );
     // Guard against comparing two buffers of zeros and calling it determinism.
     assert!(
         f32v(&first).iter().any(|v| v.abs() > 1e-6),
@@ -2158,12 +2175,11 @@ fn gemv_fp8_splitk_is_bit_reproducible() {
         readb(yb, o * 4)
     };
 
-    let first = run(&xb, &pb, &sb, &mut yb, o_dim, i_dim);
-    for k in 1..5 {
-        run(&dx, &dp, &ds, &mut dy, 32, 512);
-        let again = run(&xb, &pb, &sb, &mut yb, o_dim, i_dim);
-        assert_eq!(first, again, "gemv_fp8 split-K not bit-reproducible on repeat {k}");
-    }
+    let first = assert_bit_reproducible(
+        "gemv_fp8 split-K",
+        || run(&xb, &pb, &sb, &mut yb, o_dim, i_dim),
+        || run(&dx, &dp, &ds, &mut dy, 32, 512),
+    );
     assert!(
         f32v(&first).iter().any(|v| v.abs() > 1e-6),
         "output is all zero — the test proves nothing"
@@ -3451,14 +3467,14 @@ fn moe_guards_reject_degenerate_arguments() {
         assert!(mo(96, 64, 1).is_err(), "moe hidden not a multiple of VQ_GROUP");
         assert!(mo(64, 96, 1).is_err(), "moe inter not a multiple of VQ_GROUP");
         assert!(
-            launch_moe_reduce(p as *const f32, 0, 64, q as *mut f32, std::ptr::null_mut())
+            launch_moe_acc_drain(q as *mut f32, q as *mut u64, 0, 1, 1.0, std::ptr::null_mut())
                 .is_err(),
-            "moe_reduce e = 0"
+            "moe_acc_drain n = 0"
         );
         assert!(
-            launch_moe_reduce(p as *const f32, 1, 0, q as *mut f32, std::ptr::null_mut())
+            launch_moe_acc_drain(q as *mut f32, q as *mut u64, 64, 0, 1.0, std::ptr::null_mut())
                 .is_err(),
-            "moe_reduce hidden = 0"
+            "moe_acc_drain rows = 0"
         );
     }
     v.check("moe_guards_reject_degenerate_arguments");
@@ -3802,8 +3818,7 @@ fn inv_4_wait_enqueued_before_signal_still_waits() -> anyhow::Result<()> {
     t.wait(compute.raw(), 1)?;
     t.signal(fetch.raw(), 1)?;
 
-    let rt = tokio::runtime::Builder::new_current_thread().build()?;
-    rt.block_on(stream_signal(compute.raw())?);
+    block_on(stream_signal(compute.raw())?);
     assert!(
         t.completed() >= 1,
         "the waited-on value must have been reached, not skipped"
@@ -3831,8 +3846,7 @@ fn inv_6_a_host_release_retires_an_enqueued_wait() -> anyhow::Result<()> {
     t.wait(compute.raw(), 7)?;
     t.release(7);
 
-    let rt = tokio::runtime::Builder::new_current_thread().build()?;
-    rt.block_on(stream_signal(compute.raw())?);
+    block_on(stream_signal(compute.raw())?);
     assert!(t.completed() >= 7, "the host release must be what retired the wait");
     // Monotone: releasing backwards would un-free a slot another consumer is gated on.
     t.release(3);

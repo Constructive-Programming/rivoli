@@ -259,7 +259,7 @@ pub struct LoopReport {
     pub start: usize,
 }
 
-/// Longest block of tokens that occurs at least twice anywhere in `ids`.
+/// Does some block of `k` tokens occur at least twice anywhere in `ids`?
 ///
 /// The companion to [`detect_loop`], and needed because a tail cycle is the *late* stage
 /// of degeneration. The early stage is a RESTART: the model answers, then answers again
@@ -269,9 +269,21 @@ pub struct LoopReport {
 /// three repeats of a ~60-token block do not fit in 128 tokens. A run can be obviously
 /// broken and still have no cycle, so both signals are needed.
 ///
-/// Binary search on length over a rolling-hash set: O(n log n). Healthy prose repeats
-/// short phrases; a restart repeats whole sentences.
-pub fn longest_repeated_block(ids: &[u32]) -> usize {
+/// A PREDICATE against a caller-supplied `k`, not a length. This was
+/// `longest_repeated_block`, which binary-searched the length over this same rolling-hash
+/// probe — O(n log n) rather than O(n) — and its one consumer then compared the answer to
+/// a single bar, `max(32, n/8)`. log2(n) probes to compute a number whose only use was one
+/// comparison; one probe at the bar answers the question. The exact length survives in the
+/// warning only as "a block this big repeats", which is what the warning ever acted on.
+///
+/// Dropping the search also dropped its `hi = n/2` cap, and that is a fix rather than a
+/// side effect: for a generation under 64 tokens the bar (floor 32) exceeded the cap, so
+/// the restart warning could never fire however broken the output was. A `k`-block CAN
+/// occur twice in fewer than `2k` tokens — that is exactly what a short periodic restart
+/// looks like — and now it is seen.
+///
+/// Healthy prose repeats short phrases; a restart repeats whole sentences.
+pub fn has_repeated_block(ids: &[u32], k: usize) -> bool {
     use std::collections::HashSet;
     // Two independent moduli: a single 64-bit rolling hash would make a false positive
     // (and thus a false "degenerate") possible on adversarial input, and this decides
@@ -281,41 +293,29 @@ pub fn longest_repeated_block(ids: &[u32]) -> usize {
     const B1: u64 = 131;
     const B2: u64 = 137;
     let n = ids.len();
-    let has_repeat = |k: usize| -> bool {
-        if k == 0 || k > n {
-            return false;
-        }
-        let (mut p1, mut p2) = (1u64, 1u64);
-        for _ in 0..k {
-            p1 = p1 * B1 % M1;
-            p2 = p2 * B2 % M2;
-        }
-        let (mut h1, mut h2) = (0u64, 0u64);
-        for &t in &ids[..k] {
-            h1 = (h1 * B1 + u64::from(t) + 1) % M1;
-            h2 = (h2 * B2 + u64::from(t) + 1) % M2;
-        }
-        let mut seen = HashSet::with_capacity(n);
-        seen.insert((h1, h2));
-        for i in k..n {
-            h1 = (h1 * B1 + u64::from(ids[i]) + 1 + M1 * p1 - p1 * (u64::from(ids[i - k]) + 1) % M1) % M1;
-            h2 = (h2 * B2 + u64::from(ids[i]) + 1 + M2 * p2 - p2 * (u64::from(ids[i - k]) + 1) % M2) % M2;
-            if !seen.insert((h1, h2)) {
-                return true;
-            }
-        }
-        false
-    };
-    let (mut lo, mut hi) = (0usize, n / 2);
-    while lo < hi {
-        let mid = (lo + hi).div_ceil(2);
-        if has_repeat(mid) {
-            lo = mid;
-        } else {
-            hi = mid - 1;
+    if k == 0 || k > n {
+        return false;
+    }
+    let (mut p1, mut p2) = (1u64, 1u64);
+    for _ in 0..k {
+        p1 = p1 * B1 % M1;
+        p2 = p2 * B2 % M2;
+    }
+    let (mut h1, mut h2) = (0u64, 0u64);
+    for &t in &ids[..k] {
+        h1 = (h1 * B1 + u64::from(t) + 1) % M1;
+        h2 = (h2 * B2 + u64::from(t) + 1) % M2;
+    }
+    let mut seen = HashSet::with_capacity(n);
+    seen.insert((h1, h2));
+    for i in k..n {
+        h1 = (h1 * B1 + u64::from(ids[i]) + 1 + M1 * p1 - p1 * (u64::from(ids[i - k]) + 1) % M1) % M1;
+        h2 = (h2 * B2 + u64::from(ids[i]) + 1 + M2 * p2 - p2 * (u64::from(ids[i - k]) + 1) % M2) % M2;
+        if !seen.insert((h1, h2)) {
+            return true;
         }
     }
-    lo
+    false
 }
 
 /// Detect a verbatim repetition loop at the **tail** of a generation.
@@ -360,7 +360,7 @@ pub fn detect_loop(ids: &[u32], min_repeats: usize, max_period: usize) -> Option
 
 /// Structural repetition — the signal both exact-matching detectors are blind to.
 ///
-/// **Added because [`detect_loop`] and [`longest_repeated_block`] BOTH passed a run
+/// **Added because [`detect_loop`] and [`has_repeated_block`] BOTH passed a run
 /// whose output was 329 repetitions of `**Memory Product.**`.** The loop had a varying
 /// slot — `**Memory Phase:**`, `**Memory State:**`, `**Memory Status:**`, … — so there
 /// was no verbatim cycle and the longest exact block was only 142 tokens. A near-miss
@@ -428,8 +428,9 @@ pub fn repetition_report(text: &str) -> RepetitionReport {
 ///
 /// So the working set is two complementary EXACT signals, and neither is a diversity
 /// measure: `top_line` here for local template loops (healthy 1–4, broken 25–329), and
-/// [`longest_repeated_block`] for long-range restarts (healthy 6–18, broken 4544). Both
-/// observed failures are caught by one or the other.
+/// [`has_repeated_block`] for long-range restarts (the longest repeat measured 6–18 tokens
+/// on healthy runs against 4544 on the broken one, so a bar in the tens separates them by
+/// two orders of magnitude). Both observed failures are caught by one or the other.
 pub fn is_degenerate(r: &RepetitionReport) -> bool {
     r.top_line > 20
 }
@@ -448,9 +449,6 @@ pub struct RunInfo {
     pub bench_tokens: Option<usize>,
     pub prompt: Option<String>,
     pub moe_gain: f32,
-    /// `--cache-policy top-m`'s (J, M); None under every other policy, where a 0 would
-    pub two_q_kin: u32,
-    pub two_q_kout: u32,
     pub sinks: usize,
     pub window: usize,
     pub misa_heads: usize,
@@ -487,36 +485,9 @@ pub struct ProfileSummary {
     pub compute_gpu_ms: f64,
     /// Off-thread reaper fetch cost (queue→submit→reap all misses).
     pub fetch_wall_ms: f64,
-    /// Percent of `fetch_wall` buried behind compute: `1 − (moe_wall−compute_gpu)/fetch_wall`.
-    /// **SUBSTANTIALLY OVERSTATED — an upper bound, and not a tight one.** Reported at
-    /// 96% on a run where the true figure is at most 57%.
-    ///
-    /// It is `1 - (moe_wall - compute_gpu)/fetch_wall`, and `compute_gpu` is a BRACKET
-    /// (`moe_ev_start`..`moe_ev_end`) that CONTAINS the compute stream's idle time. So
-    /// every millisecond the stream spends stalled waiting for a missed expert is counted
-    /// as compute, and therefore as fetch successfully hidden.
-    ///
-    /// Measured by `moe_us_by_miss` on int3-vq/dense/lru @115 GiB: layers with 0 misses
-    /// run the MoE bracket in 1563 us, so 75 layers of pure kernel work is **117 ms/token**
-    /// — independently confirmed by `examples/moe_bench.rs`, whose isolated floor is
-    /// 113 ms. The measured bracket is 257 ms. The other **140 ms/token is stall**.
-    ///
-    /// The arithmetic does not close under the reported number and does under this one:
-    /// at 96% hidden the MoE phase would be ~125 ms (117 compute + 8 exposed) against a
-    /// measured `moe_wall` of 266 ms — a 141 ms hole. As 117 compute + 149 stall = 266 it
-    /// closes exactly. Since fetch can only hide behind compute, the ceiling is
-    /// `compute/fetch_wall` = 117/206 = **57%**.
-    ///
-    /// Prefer the `moe/layer by miss count` line, which measures the stall instead of
-    /// inferring its absence.
-    pub fetch_hidden_pct: f64,
     pub miss_per_tok: f64,
     pub ms_per_miss: f64,
     pub gb_per_tok: f64,
-    /// `--cache-policy top-m` only: the share of chosen expert slots that were NOT in
-    /// the true top-K — the quality cost of cache-conditional routing, and per
-    /// docs/investigations/cache-conditional-routing.md "Counters" the one number you tune (J, M) against. `None`
-    /// under lru/2q/arc, which never substitute; printing 0.0% there would read as a
 
     // ---- CLASS spans: what the machine was DOING. All directly measured ----
     // These OVERLAP and may sum to MORE than `wall_ms`. `io_wait_ms` runs on the reaper
@@ -546,10 +517,6 @@ pub struct ProfileSummary {
     pub cpu_route_ms: f64,
     /// Host time in `Pin::submit_layer` — residency, policy bookkeeping, read specs.
     pub cpu_submit_ms: f64,
-    /// `moe_wall − compute_gpu`: fetch that could not hide behind compute. Kept for
-    /// continuity with `fetch_hidden_pct`, but it is a host clock minus a GPU clock —
-    /// prefer `io_wait_ms`, which is measured.
-    pub exposed_fetch_ms: f64,
     /// The blocking half of `route_ms` (the gate-logits D2H).
     pub route_wait_ms: f64,
     /// The argmax D2H — the single call the entire tail phase hides behind.
@@ -561,22 +528,30 @@ pub struct ProfileSummary {
 }
 
 impl ProfileSummary {
-    /// The always-on stdout PROFILE line. Under the async overlap, `moe_wall` is the
-    /// real per-token MoE cost; `fetch_wall` is the fetch work, of which
-    /// `fetch_hidden_pct` overlapped compute and only `load_wait` was exposed.
+    /// The always-on stdout PROFILE line. Under the async overlap, `moe_wall` is the real
+    /// per-token MoE cost and `fetch_wall` the reaper's work behind it.
+    ///
+    /// The `% hidden` and `ms exposed` terms were removed 2026-08-01 with the two fields
+    /// behind them. Both derived from `moe_wall − compute_gpu`, and `compute_gpu` is a
+    /// BRACKET that CONTAINS the compute stream's stall — so every millisecond spent
+    /// waiting on NVMe was counted as compute, and therefore as fetch successfully hidden.
+    /// It reported 96% where the arithmetic caps the true figure at 57%: layers with 0
+    /// misses run the MoE bracket in 1563 us, so 75 layers of pure kernel work is 117
+    /// ms/token (`examples/moe_bench.rs` independently floors at 113), against a measured
+    /// `moe_wall` of 266 — 117 compute + 149 stall, and fetch can only hide behind the 117.
+    /// Read `io_wait_ms` in the class line below, which is measured at the io_uring ring,
+    /// and the `moe/layer by miss count` line, which measures the stall rather than
+    /// inferring its absence.
     pub fn report(&self) {
-        let exposed = (self.moe_wall_ms - self.compute_gpu_ms).max(0.0);
         tracing::info!(
             // wall/route at 0.1 ms: the DSA selection A/B (docs/investigations/npu-offload.md) turns on deltas of
             // a few ms against a ~400 ms token, which 1 ms resolution rounds into noise.
-            "PROFILE/tok: {:.1}ms wall | route {:.1}ms | moe {:.0}ms (gpu {:.0}ms) | fetch {:.0}ms ({:.0}% hidden, {:.0}ms exposed) | {:.2} miss, {:.2}ms/miss, {:.2} GB",
+            "PROFILE/tok: {:.1}ms wall | route {:.1}ms | moe {:.0}ms (gpu {:.0}ms) | fetch {:.0}ms | {:.2} miss, {:.2}ms/miss, {:.2} GB",
             self.wall_ms,
             self.route_ms,
             self.moe_wall_ms,
             self.compute_gpu_ms,
             self.fetch_wall_ms,
-            self.fetch_hidden_pct,
-            exposed,
             self.miss_per_tok,
             self.ms_per_miss,
             self.gb_per_tok,
@@ -734,13 +709,11 @@ mod otlp {
         span.set_attribute(KeyValue::new("rivoli.cache_policy", run.cache_policy.clone()));
         span.set_attribute(KeyValue::new("rivoli.attn", run.attn.clone()));
         span.set_attribute(KeyValue::new("rivoli.moe_gain", f64::from(run.moe_gain)));
-        span.set_attribute(KeyValue::new("rivoli.2q_kin_pct", i64::from(run.two_q_kin)));
-        span.set_attribute(KeyValue::new("rivoli.2q_kout_pct", i64::from(run.two_q_kout)));
         span.set_attribute(KeyValue::new("rivoli.sinks", run.sinks as i64));
         span.set_attribute(KeyValue::new("rivoli.window", run.window as i64));
         span.set_attribute(KeyValue::new("rivoli.misa_heads", run.misa_heads as i64));
         // Absent rather than zero where zero would read as a measurement: an auto-sized
-        // budget is not "0 GiB", and (J, M) under lru is not "(0, 0)".
+        // budget is not "0 GiB", and a run with no `-bench` did not generate 0 tokens.
         if let Some(g) = run.max_mem_gib {
             span.set_attribute(KeyValue::new("rivoli.max_mem_gib", g as i64));
         }
@@ -957,7 +930,6 @@ mod otlp {
         g(summary.tail_wait_ms, "split/tail-wait", "decode");
         g(summary.tail_gpu_ms, "split/tail-gpu", "decode");
         g(summary.compute_gpu_ms, "split/moe-compute-gpu", "decode");
-        g(summary.exposed_fetch_ms, "split/exposed-fetch", "reaper");
 
         m.f64_gauge("rivoli.tok_per_s")
             .build()
@@ -971,9 +943,6 @@ mod otlp {
         m.f64_gauge("rivoli.miss_per_tok")
             .build()
             .record(summary.miss_per_tok, &[]);
-        m.f64_gauge("rivoli.fetch_hidden_pct")
-            .build()
-            .record(summary.fetch_hidden_pct, &[]);
         m.u64_gauge("rivoli.tokens").build().record(tokens as u64, &[]);
         // Chartable, so a dashboard can show "how many cells degenerated" over a matrix
         // run rather than requiring someone to read 44 logs.
@@ -1030,22 +999,34 @@ mod loop_tests {
 
 #[cfg(test)]
 mod lrb_tests {
-    use super::longest_repeated_block;
+    use super::has_repeated_block;
 
+    /// The predicate is exact at the bar in BOTH directions — the length it replaced was
+    /// only ever compared to one, so a test that pins the answer just below and just above
+    /// `k` covers everything the search used to.
     #[test]
-    fn finds_the_longest_repeat() {
-        assert_eq!(longest_repeated_block(&[]), 0);
-        assert_eq!(longest_repeated_block(&[1, 2, 3, 4, 5]), 0);
-        // One token repeated.
-        assert_eq!(longest_repeated_block(&[1, 2, 3, 2, 9]), 1);
+    fn answers_exactly_at_the_bar() {
+        assert!(!has_repeated_block(&[], 1));
+        assert!(!has_repeated_block(&[1, 2, 3, 4, 5], 1));
+        // One token repeated, and no pair.
+        assert!(has_repeated_block(&[1, 2, 3, 2, 9], 1));
+        assert!(!has_repeated_block(&[1, 2, 3, 2, 9], 2));
         // A 3-block that recurs non-adjacently — the RESTART shape, which detect_loop
         // deliberately does not flag.
-        assert_eq!(longest_repeated_block(&[7, 1, 2, 3, 8, 9, 1, 2, 3]), 3);
+        assert!(has_repeated_block(&[7, 1, 2, 3, 8, 9, 1, 2, 3], 3));
+        assert!(!has_repeated_block(&[7, 1, 2, 3, 8, 9, 1, 2, 3], 4));
         // A full cycle: half the sequence repeats.
-        assert_eq!(longest_repeated_block(&[1, 2, 3, 4, 1, 2, 3, 4]), 4);
-        // Bounded by n/2 — a block cannot occur twice if it is longer than half.
+        assert!(has_repeated_block(&[1, 2, 3, 4, 1, 2, 3, 4], 4));
+        // A block of more than half the sequence cannot occur twice — but one of exactly
+        // half can, and the deleted binary search's `hi = n/2` cap is why that is worth
+        // stating: the predicate is asked at bars the search could never return.
+        assert!(!has_repeated_block(&[1, 2, 3, 4, 1, 2, 3, 4], 5));
         let long: Vec<u32> = (0..100).collect();
-        assert_eq!(longest_repeated_block(&long), 0);
+        assert!(!has_repeated_block(&long, 1));
+        // Degenerate arguments must answer, not panic: a 0-token block is not a block,
+        // and no block longer than the input can occur in it at all.
+        assert!(!has_repeated_block(&[1, 2, 3], 0));
+        assert!(!has_repeated_block(&[1, 2, 3], 4));
     }
 }
 

@@ -25,7 +25,8 @@
 //! figures at matched `--max-mem` and `--cache-policy`, not just diff the token stream —
 //! which is now possible, because [`Event`] returns real GPU milliseconds.
 
-use crate::backend::vk::{Q, Signal, Stamp, gpu};
+use crate::backend::Signal;
+use crate::backend::vk::{Q, Stamp, gpu};
 use anyhow::Result;
 use std::ffi::c_void;
 
@@ -70,13 +71,6 @@ impl Stream {
     #[inline]
     pub fn raw(&self) -> *mut c_void {
         self.0.tag()
-    }
-
-    /// The queue this handle names — for `Signal::arm_on` below, so it does not have to go
-    /// out through the raw tag and re-parse what it already knows.
-    #[inline]
-    pub(crate) fn queue(&self) -> Q {
-        self.0
     }
 }
 
@@ -126,19 +120,4 @@ impl Event {
 #[allow(clippy::not_unsafe_ptr_arg_deref)] // parses the tag; never dereferences it
 pub fn stream_signal(stream_raw: *mut c_void) -> Result<Signal> {
     gpu()?.signal_on(Q::parse(stream_raw)?)
-}
-
-/// `Signal::arm_on`, the half of the HIP surface `vk.rs` cannot declare on its own.
-///
-/// `asyncfetch.rs` hands out one pending [`Signal`] per queued read before any of them
-/// completes, then arms each as its completion is reaped — so it needs to arm a signal it
-/// already owns, not receive a fresh one. Lives here rather than in `vk.rs` because the
-/// [`Stream`] it takes lives here; inherent impls may sit in any module of the defining
-/// crate.
-impl Signal {
-    /// Fire this signal once everything recorded or submitted to `stream` has retired.
-    /// Enqueue the work first, then arm — the arming is what flushes it.
-    pub fn arm_on(&self, stream: &Stream) -> Result<()> {
-        gpu()?.arm_on(stream.queue(), self)
-    }
 }

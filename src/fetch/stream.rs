@@ -10,23 +10,34 @@
 //! `rocm` and `vk::Buf::staging` + `vk::copy_h2d_async` under `vulkan` — see [`stage`], the
 //! whole of the difference.
 //!
-//! Two destination modes (chosen at `Streamer::new`, `queue`'s `dst` is the VMM slot
-//! either way): BOUNCE (the default) reads into a host staging arena then
-//! async-copies into VMM; DIRECT (`--direct-vmm-dma`) DMAs the read straight into
-//! VMM. Bounce is the default AND a WORKAROUND for an amdgpu kernel bug (6.18.38-
-//! gentoo, 2026-07-17) that EFAULTs on io_uring/O_DIRECT DMA into VMM device memory
-//! (can't `get_user_pages` those pages; regression vs ≤6.18.35-r1). The EFAULT is gone
-//! on 6.18.38 but bounce stays the default, and the reason is WRITE-side, not read-side:
-//! DMA-ing into VMM device pages runs at 5.66 GB/s vs 12.4 GB/s into the pinned arena, so
-//! DIRECT more than doubles the cost of a miss. Measured 2026-07-30, int3-vq/dense/lru
-//! @512: marginal cost per missed expert 1239 us (bounce) -> 2709 us (DIRECT), 2.59 ->
-//! 1.19 tok/s. The read side is UNCHANGED — `--direct-vmm-dma` only flips this module's
-//! `bounce` flag and never touches pool allocation, so kernels read the same device-local
-//! VMM either way: a zero-miss layer costs 1563 us (bounce) vs 1525 us (DIRECT), equal
-//! within noise. (An earlier note here blamed a ~40% `mlp` read tax from host-mapped VMM;
-//! that configuration is not what this flag produces.) Repro:
-//! `git show 3e1bd96:docs/probes/iouring_vmm.cpp` (faults into VMM) vs the iou_host
-//! probe (pinned host) — both predate the empty-slate rebuild and are not in the tree.
+//! There is ONE destination path and no flag to change it: every read lands in a HOST
+//! staging arena and is async-copied from there into the VMM slot (`queue`'s `dst` is the
+//! VMM slot; the arena is the hop in between). Two independent things forbid the obvious
+//! alternative of DMA-ing the read straight into VMM, and a future reader needs both —
+//! the first says WHERE the arena may live, the second says why the hop is not a cost.
+//!
+//! 1. **amdgpu could not `get_user_pages` device memory.** io_uring/O_DIRECT DMA into VMM
+//!    device pages EFAULTed when this was found (6.18.38-gentoo, 2026-07-17; a regression
+//!    vs ≤6.18.35-r1) and the staging hop began as the workaround. It no longer reproduces
+//!    on 6.18.38, so that part is history — but it is the history that constrains the
+//!    arena: it must be host memory the kernel can pin, NEVER device-local, or the read
+//!    into it reintroduces the original fault. [`stage`]'s Vulkan half excludes
+//!    `DEVICE_LOCAL` from the arena for exactly this reason; do not undo that.
+//! 2. **DMA into VMM device pages runs at half the bandwidth.** 5.66 GB/s vs 12.4 GB/s
+//!    into the pinned arena, so writing the read straight into VMM more than DOUBLES the
+//!    cost of a miss. Measured 2026-07-30, int3-vq/dense/lru @512: marginal cost per
+//!    missed expert 1239 us staged -> 2709 us direct, 2.59 -> 1.19 tok/s. The READ side is
+//!    unchanged either way — the pool is device-local VMM regardless of how it was
+//!    filled — so a zero-miss layer costs 1563 us vs 1525 us, equal within noise. Misses
+//!    are the entire design, which makes the direct path strictly worse on every workload
+//!    that matters. It was a `--direct-vmm-dma` flag until 2026-08-01; a flag with no
+//!    workload that wants it is not a choice, so it was deleted. (An earlier note here
+//!    blamed a ~40% `mlp` read tax from host-mapped VMM; that configuration is not what
+//!    the flag produced.)
+//!
+//! Repro of (1): `git show 3e1bd96:docs/probes/iouring_vmm.cpp` (faults into VMM) vs the
+//! iou_host probe (pinned host) — both predate the empty-slate rebuild, neither is in the
+//! tree.
 //!
 //! SQPOLL is requested on the ring (own poller thread). Without it, submit is an
 //! `io_uring_enter` in which the CALLING thread walks the SQEs and drives the
@@ -37,8 +48,8 @@
 //! (the QD1 perf arm, still correct) if SQPOLL setup is refused.
 //!
 //! Needs a backend (`rocm` or `vulkan`) — its sole consumer is the GPU decode pin. The
-//! ring itself is backend-independent; only the two BOUNCE-mode staging ops differ, and
-//! they are the whole of [`stage`] below.
+//! ring itself is backend-independent; only the two staging ops differ, and they are the
+//! whole of [`stage`] below.
 #![cfg(any(feature = "rocm", feature = "vulkan"))]
 
 use anyhow::{Result, ensure};
@@ -53,9 +64,8 @@ use std::os::fd::RawFd;
 /// must all be multiples of it.
 pub const ALIGN: usize = 4096;
 
-/// The two BOUNCE-mode operations, per backend: allocate/free the staging arena, and move
-/// one staged read into its pool slot. DIRECT mode uses neither — the read DMAs into the
-/// slot and there is nothing to stage.
+/// The two staging operations, per backend: allocate/free the staging arena, and move one
+/// staged read into its pool slot.
 ///
 /// Nothing else in this file is backend-specific.
 #[cfg(feature = "rocm")]
@@ -134,17 +144,15 @@ mod stage {
 /// land, and the read's `Signal` — armed by `asyncfetch.rs` on that same queue immediately
 /// after — is what says they have. That is `rivoli_memcpy_h2d_async`'s contract, kept.
 ///
-/// # The arena must NOT be device-local, and that is the same amdgpu bug bounce exists for
+/// # The arena must NOT be device-local, and that is the amdgpu bug the staging hop began as
 ///
 /// The arena is the destination of an O_DIRECT io_uring read, so the kernel must
 /// `get_user_pages` it. That is precisely what amdgpu refused for device-local VMM pages
-/// (this module's header: EFAULT, ≤6.18.35-r1 regression), which is why BOUNCE mode exists
-/// at all. Allocating the bounce arena out of device-local memory would reintroduce the very
-/// failure it works around, so [`crate::backend::vk::Buf::staging`] excludes `DEVICE_LOCAL` when the
-/// device has any alternative — and warns when it does not.
-///
-/// DIRECT mode (`--direct-vmm-dma`) still skips the arena entirely by DMA-ing the read
-/// straight into the pool mapping, and is untouched by any of this.
+/// (this module's header, reason 1: EFAULT, ≤6.18.35-r1 regression), which is why reads
+/// stage through host memory at all. Allocating the arena out of device-local memory would
+/// reintroduce the very failure the hop was built to avoid, so
+/// [`crate::backend::vk::Buf::staging`] excludes `DEVICE_LOCAL` when the device has any
+/// alternative — and warns when it does not.
 #[cfg(feature = "vulkan")]
 mod stage {
     use crate::backend::vk::Buf;
@@ -237,7 +245,7 @@ mod stage {
 /// reused slot can be sized once. `align_up(len) + ALIGN` covers the worst-case
 /// straddle (up to `ALIGN-1` leading pad + trailing round-up).
 pub fn slot_span(len: usize) -> usize {
-    len.div_ceil(ALIGN) * ALIGN + ALIGN
+    len.next_multiple_of(ALIGN) + ALIGN
 }
 
 /// Minimum bytes an O_DIRECT completion must deliver to cover the useful window
@@ -260,23 +268,17 @@ pub struct Streamer {
     /// Ring/arena capacity in staging slots. A batch is bounded by this (see `queue`), and
     /// the fetcher needs one timeline per slot.
     entries: u32,
-    queued: u32,
-    /// Bounce mode (the default): reads land in a pinned host arena and are
-    /// `hipMemcpy`d into VMM. False (`--direct-vmm-dma`) = DMA straight into the
-    /// VMM slot.
-    bounce: bool,
-    /// Per-read pinned-bounce stride (bounce mode only): the largest aligned
-    /// superset any single read may deliver. A `queue` whose superset exceeds this
-    /// can't fit its bounce slot. Unused (0) in direct mode.
+    /// Per-read pinned-bounce stride: the largest aligned superset any single read
+    /// may deliver. A `queue` whose superset exceeds this can't fit its bounce slot.
     span: usize,
-    /// Staging arena, `entries * span` bytes (bounce mode only; null in direct): read slot
-    /// `user_data` is `arena + user_data * span`. HIP-pinned under `rocm`, plain
-    /// `ALIGN`-aligned host memory under `vulkan` — see [`stage`].
+    /// Staging arena, `entries * span` bytes: read slot `user_data` is
+    /// `arena + user_data * span`. HIP-pinned under `rocm`, a host-visible `vk::Buf`
+    /// under `vulkan` — see [`stage`]. Never null: every read stages through it.
     arena: *mut u8,
     /// `arena`'s byte size, kept because `stage::free` needs it (the Vulkan side's
-    /// `dealloc` requires the original `Layout`). Zero in direct mode.
+    /// `dealloc` requires the original `Layout`).
     arena_bytes: usize,
-    /// Per-SLOT VMM destination + aligned read length (bounce mode only). `reap` copies
+    /// Per-SLOT VMM destination + aligned read length. `reap` copies
     /// `nbytes` from the arena slot into `dst`. Indexed by staging slot — which is the
     /// read's `user_data` — and NOT cleared per batch: a slot's lifetime is owned by its
     /// [`Ticket`](crate::fetch::asyncfetch::Ticket) now, not by the batch that happened to use it.
@@ -297,11 +299,9 @@ unsafe impl Send for Streamer {}
 impl Streamer {
     /// `entries` = max in-flight reads; `span` = the largest aligned superset a
     /// single read may deliver (`slot_span` of the biggest projection tensor).
-    /// `bounce` selects the destination path: true (the default) reads into an
-    /// `entries * span` pinned host arena then `hipMemcpy`s into VMM (kernel-bug
-    /// workaround); false (`--direct-vmm-dma`) DMAs straight into the VMM slot (no
-    /// arena allocated).
-    pub fn new(entries: u32, span: usize, bounce: bool) -> Result<Self> {
+    /// Always allocates the `entries * span` host staging arena — it is the only
+    /// destination path (see this module's header).
+    pub fn new(entries: u32, span: usize) -> Result<Self> {
         // The bounce arena has exactly `entries` slots and `queue` indexes it by the
         // SQE's user_data. io_uring rounds the SQ up to a power of two, so `entries` MUST
         // be a power of two for the arena to match the SQ capacity — otherwise a push
@@ -318,24 +318,17 @@ impl Streamer {
             .build(entries)
             .or_else(|_| IoUring::new(entries))?;
 
-        let arena_bytes = if bounce { entries as usize * span } else { 0 };
-        let arena = if bounce {
-            let p = stage::alloc(arena_bytes);
-            ensure!(
-                !p.is_null(),
-                "bounce arena alloc failed (entries={entries}, {:.0} MiB)",
-                arena_bytes as f64 / (1u64 << 20) as f64
-            );
-            p
-        } else {
-            std::ptr::null_mut()
-        };
+        let arena_bytes = entries as usize * span;
+        let arena = stage::alloc(arena_bytes);
+        ensure!(
+            !arena.is_null(),
+            "bounce arena alloc failed (entries={entries}, {:.0} MiB)",
+            arena_bytes as f64 / (1u64 << 20) as f64
+        );
 
         Ok(Self {
             ring: ManuallyDrop::new(ring),
             entries,
-            queued: 0,
-            bounce,
             span,
             arena,
             arena_bytes,
@@ -351,8 +344,9 @@ impl Streamer {
     /// own at least `slot_span(len)` bytes. Returns the sub-block offset in `dst` where
     /// the useful `len` bytes land (i.e. the caller reads `dst.add(returned) .. +len`).
     ///
-    /// **`slot` is chosen by the caller, not by queue order.** It used to be `queued++`,
-    /// which made a slot's lifetime the batch's lifetime — see [`reset_batch`].
+    /// **`slot` is chosen by the caller, not by queue order.** It used to be a `queued++`
+    /// counter reset per batch, which made a slot's lifetime the batch's lifetime; slot
+    /// reuse is now gated on the slot's own timeline in `AsyncFetch::take_slot`.
     ///
     /// # Safety
     /// `dst` must be `ALIGN`-aligned and valid for `slot_span(len)` writable bytes
@@ -372,10 +366,10 @@ impl Streamer {
             "O_DIRECT dst must be block-aligned"
         );
         let ab = begin & !(ALIGN - 1);
-        let ae = (begin + len).div_ceil(ALIGN) * ALIGN;
+        let ae = (begin + len).next_multiple_of(ALIGN);
         let nbytes = ae - ab;
         ensure!(
-            !self.bounce || nbytes <= self.span,
+            nbytes <= self.span,
             "read superset {nbytes} exceeds bounce span {} (raise Streamer span)",
             self.span
         );
@@ -386,14 +380,11 @@ impl Streamer {
             "staging slot {ud} out of range (entries {})",
             self.entries
         );
-        // BOUNCE reads into this slot's arena window; DIRECT reads straight into dst.
-        let into = if self.bounce {
-            // SAFETY: `ud < entries` (checked above), and the arena is `entries*span` with
-            // every read's `nbytes <= span`, so this slot's window is owned and in bounds.
-            unsafe { self.arena.add(ud as usize * self.span) }
-        } else {
-            dst
-        };
+        // The read lands in this slot's arena window; `reap` copies it on to `dst`.
+        // SAFETY: `ud < entries` (checked above), and the arena is `entries*span` with
+        // every read's `nbytes <= span` (checked above), so this slot's window is owned
+        // and in bounds.
+        let into = unsafe { self.arena.add(ud as usize * self.span) };
         let read = opcode::Read::new(types::Fd(fd), into, nbytes as u32)
             .offset(ab as u64)
             .build()
@@ -402,20 +393,20 @@ impl Streamer {
         // (caller's `dst` contract, or our arena slot); the SQE references it by raw
         // pointer, so it must outlive the completion — it does.
         let pushed = unsafe { self.ring.submission().push(&read) };
+        // io_uring owns the real SQ occupancy, so the capacity it ran out of is the only
+        // number worth reporting — a parallel `queued` counter existed solely for this
+        // message and could never have said anything the ring had not already decided.
         ensure!(
             pushed.is_ok(),
-            "io_uring SQ full at {} reads (raise ring entries)",
-            self.queued
+            "io_uring SQ full: the ring holds {} entries (raise it)",
+            self.entries
         );
-        if self.bounce {
-            self.dst[ud as usize] = dst;
-            self.nbytes[ud as usize] = nbytes as u32;
-        }
+        self.dst[ud as usize] = dst;
+        self.nbytes[ud as usize] = nbytes as u32;
         // The completion must deliver at least the useful window `[begin,begin+len)`
         // from the aligned start; a shorter read is mid-file truncation (checked in
         // `reap` against `min_res`). Trailing EOF padding beyond this is fine.
         self.min_res[ud as usize] = min_completion(begin, len);
-        self.queued += 1;
         Ok(sub)
     }
 
@@ -451,9 +442,9 @@ impl Streamer {
 
     /// Per-read async reap: block for the NEXT read to complete, kick its bounce→slot
     /// copy on `stream`, and return the completed read's `user_data` (the index into
-    /// the batch). The caller reaps exactly `queued` times, then
-    /// [`reset_batch`](Self::reset_batch). Reads run concurrently on the NVMe;
-    /// completions arrive in device order, each resolving its own expert.
+    /// the batch). The caller reaps exactly once per read it queued. Reads run
+    /// concurrently on the NVMe; completions arrive in device order, each resolving its
+    /// own expert.
     ///
     /// # Safety
     /// `stream` is a live HipStream handle; the copied read's `dst` slot must stay
@@ -486,22 +477,20 @@ impl Streamer {
             "short read on expert slot {ud}: {res} < {} useful bytes",
             self.min_res[ud]
         );
-        if self.bounce {
-            // SAFETY: `dst[ud]` is a live pool slot the pipeline keeps valid until this
-            // read's signal fires; the arena slot holds the just-read bytes; `stream` is
-            // live. Copies the full aligned `nbytes` (a trailing-EOF short read leaves
-            // stale bytes only past the useful window, never read).
-            let r = unsafe {
-                stage::copy_to_slot(
-                    self.dst[ud],
-                    self.arena.add(ud * self.span),
-                    self.nbytes[ud] as usize,
-                    stream,
-                )
-            };
-            if let Err(e) = r {
-                anyhow::bail!("bounce staging copy failed on slot {ud} ({e})");
-            }
+        // SAFETY: `dst[ud]` is a live pool slot the pipeline keeps valid until this
+        // read's signal fires; the arena slot holds the just-read bytes; `stream` is
+        // live. Copies the full aligned `nbytes` (a trailing-EOF short read leaves
+        // stale bytes only past the useful window, never read).
+        let r = unsafe {
+            stage::copy_to_slot(
+                self.dst[ud],
+                self.arena.add(ud * self.span),
+                self.nbytes[ud] as usize,
+                stream,
+            )
+        };
+        if let Err(e) = r {
+            anyhow::bail!("bounce staging copy failed on slot {ud} ({e})");
         }
         Ok(ud)
     }
@@ -520,19 +509,6 @@ impl Streamer {
     pub fn entries(&self) -> u32 {
         self.entries
     }
-
-    /// Reset the SQ occupancy counter after a full batch has been [`reap`]ed, readying the
-    /// ring for the next layer's batch.
-    ///
-    /// It used to clear `dst`/`nbytes`/`min_res` too, which silently recycled every staging
-    /// slot — an integer reset with no relationship to whether the bounce copy OUT of those
-    /// slots had retired. That was safe only because every demand read happens to be awaited
-    /// inside its issuing layer: an emergent property of the consumer, written nowhere and
-    /// enforced nowhere, and the reason the first speculative preloader corrupted. Slot reuse
-    /// is now gated on the slot's timeline in `AsyncFetch::take_slot`.
-    pub fn reset_batch(&mut self) {
-        self.queued = 0;
-    }
 }
 
 impl Drop for Streamer {
@@ -549,10 +525,10 @@ impl Drop for Streamer {
         // SAFETY: `ring` is never touched again; `ManuallyDrop::drop` runs exactly once
         // (single owner, no Clone).
         unsafe { ManuallyDrop::drop(&mut self.ring) };
-        if !self.arena.is_null() {
-            // SAFETY: `arena` came from `stage::alloc(self.arena_bytes)`, freed once.
-            unsafe { stage::free(self.arena, self.arena_bytes) };
-        }
+        // SAFETY: `arena` came from `stage::alloc(self.arena_bytes)` and `new` refuses to
+        // build a `Streamer` around a null one, so this is a live allocation; single
+        // owner, no Clone, so it is freed exactly once.
+        unsafe { stage::free(self.arena, self.arena_bytes) };
     }
 }
 
@@ -566,7 +542,7 @@ mod tests {
         for len in [1usize, 4095, 4096, 4097, 19_000_000] {
             for begin in [0usize, 1, 4095, 4096, 100_003] {
                 let ab = begin & !(ALIGN - 1);
-                let ae = (begin + len).div_ceil(ALIGN) * ALIGN;
+                let ae = (begin + len).next_multiple_of(ALIGN);
                 assert!(ae - ab <= slot_span(len), "len={len} begin={begin}");
                 assert_eq!(slot_span(len) % ALIGN, 0);
             }
@@ -593,7 +569,7 @@ mod tests {
         for len in [1usize, 4095, 4096, 4097, 1_000_000] {
             for begin in [0usize, 1, 4095, 4096, 100_003] {
                 let ab = begin & !(ALIGN - 1);
-                let superset = ((begin + len).div_ceil(ALIGN) * ALIGN - ab) as u64;
+                let superset = ((begin + len).next_multiple_of(ALIGN) - ab) as u64;
                 assert!(
                     min_completion(begin, len) <= superset,
                     "len={len} begin={begin}"

@@ -280,10 +280,18 @@ a perfect predictor removes every miss by construction and the number is a tauto
 is worse than uninformative, because at 100% recall the speculative admission set *is* the
 baseline miss set — the same bytes and the same evictions, merely earlier. The pilot's
 entire risk is **recall**, and recall is unobservable offline; LOOKA (build order step 3)
-is its real gate. What replay can offer is a *modelled* recall curve (`bin/replay` prints
+is its real gate. What replay can offer is a *modelled* recall curve (`bin/replay` printed
 one), which prices the false positives a degraded predictor emits — but that is analysis,
 not a bar, and it is an upper bound because its errors are independent where real ones are
 correlated.
+
+> **2026-08-01: `bin/replay` no longer does any of this.** The (J, M) substitution grid,
+> the modelled recall curve and the v2 candidate-window parser were deleted along with the
+> rest of the `top-m` machinery — 573 lines, leaving only the residency sim and the policy
+> table that `--sweep` drives. The grid's every cell is already tabulated in
+> `docs/measurement/benchmarks.md` §"`top-m` offline screen", which is the record. Recover
+> the tool from tag `archive/replay-oracle-prefetch` if the question is ever reopened; the
+> paragraphs above are kept because what they RULED OUT is the durable part.
 
 **2. Engine implementation.** The `hybrid::make` arm + the tier rule + the
 `route_advice` hook + `route_into` substitution + `swap%`. Assert the `None` path is

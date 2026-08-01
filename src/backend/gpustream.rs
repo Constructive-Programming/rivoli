@@ -2,17 +2,15 @@
 //! Async-signal bridge: HIP stream completions become futures. This is the
 //! keystone of the streaming MoE pipeline — a GPU-stream op turns into a future
 //! that resolves when the hardware reaches that point (a `hipLaunchHostFunc`
-//! callback wakes a `Waker`), so `futures-util` can orchestrate GPU concurrency
+//! callback wakes a `Waker`), so the decode loop can await GPU concurrency
 //! directly instead of blocking on `hipDeviceSynchronize`. No polling, no join.
+//!
+//! [`Signal`] itself lives in `src/backend.rs` — it was identical on both backends. What
+//! is HIP's alone, and is here, is the arming: the host-func trampoline.
 
+use crate::backend::Signal;
 use anyhow::{Result, bail, ensure};
-use futures_util::task::AtomicWaker;
 use std::ffi::c_void;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll};
 
 unsafe extern "C" {
     fn rivoli_stream_create() -> *mut c_void;
@@ -151,95 +149,48 @@ pub fn stream_signal(stream_raw: *mut c_void) -> Result<Signal> {
     Ok(s)
 }
 
-struct SignalState {
-    done: AtomicBool,
-    waker: AtomicWaker,
-}
-
 /// Runs on a HIP host thread when the stream reaches the enqueued point. Per the
 /// host-func contract: no HIP calls, no blocking — flag + wake only.
 extern "C" fn trampoline(user: *mut c_void) {
-    // SAFETY: `user` is the Arc ptr from `signal`'s into_raw; reclaim (drop at end).
-    let state = unsafe { Arc::from_raw(user as *const SignalState) };
-    state.done.store(true, Ordering::Release);
-    state.waker.wake();
+    // SAFETY: `user` is the reference `arm_on_raw` shared out; reclaimed exactly once, here.
+    let sig = unsafe { Signal::reclaim_raw(user) };
+    sig.resolve();
 }
 
-/// A one-shot completion shared between whatever resolves it and the future that awaits it:
-/// `pending()` + `arm_on(stream)` fires when a stream reaches a point. `Clone` (Arc) so the
-/// resolver and the awaiter each hold one.
+/// The HIP half of [`Signal`]: arming one on a stream.
 ///
 /// Its per-read use is GONE. `asyncfetch` armed one of these per cold read so `gpu.rs` could
 /// await each expert's bytes; the ticketed dataflow moved that dependency onto the device
 /// (INV-5) and the signals stayed on as a `hipLaunchHostFunc` per miss that nobody polled.
 /// What is left is `stream_signal` — one arm per stream per layer, which the decode loop
 /// genuinely awaits — so `ready()` (the resolved-on-arrival cache hit) has no callers either
-/// and is deleted; `Ticket::RESIDENT` says that now.
-#[derive(Clone)]
-pub struct Signal(Arc<SignalState>);
-
+/// and is deleted; `Ticket::RESIDENT` says that now. `arm_on(&HipStream)` went the same way
+/// on 2026-08-01: `stream_signal` and the tests reach `arm_on_raw` directly.
 impl Signal {
-    /// An unresolved signal.
-    pub fn pending() -> Self {
-        Signal(Arc::new(SignalState {
-            done: AtomicBool::new(false),
-            waker: AtomicWaker::new(),
-        }))
-    }
-
-    /// Fire this signal when `stream` reaches its current point (a host-func
-    /// callback wakes it), so the enqueued GPU work's completion resolves the
-    /// future. Enqueue the work first, then arm.
-    pub fn arm_on(&self, stream: &HipStream) -> Result<()> {
-        self.arm_on_raw(stream.raw())
-    }
-
-    /// As [`arm_on`](Self::arm_on) but for a raw stream handle — the expert stream
-    /// holds a `*mut c_void` (Copy) inside its async block, not a `&HipStream`.
+    /// Fire this signal when the stream reaches its current point (a host-func callback
+    /// wakes it), so the enqueued GPU work's completion resolves the future. Enqueue the
+    /// work first, then arm.
     // Opaque HIP handle passed to the runtime, not dereferenced here.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn arm_on_raw(&self, stream_raw: *mut c_void) -> Result<()> {
         // Hand one ref to the callback; the trampoline reclaims it exactly once.
-        let user = Arc::into_raw(self.0.clone()) as *mut c_void;
+        let user = self.share_raw();
         // SAFETY: `trampoline` has the C callback signature; `user` is a live Arc ptr.
         let rc = unsafe { rivoli_stream_host_signal(stream_raw, trampoline, user) };
         if rc != 0 {
             // Enqueue failed → callback never runs → reclaim the ref here.
-            // SAFETY: `user` came from into_raw and was not consumed.
-            unsafe { drop(Arc::from_raw(user as *const SignalState)) };
+            // SAFETY: `user` came from `share_raw` above and was not reclaimed.
+            unsafe { drop(Signal::reclaim_raw(user)) };
             bail!("hipLaunchHostFunc failed ({rc})");
         }
         Ok(())
-    }
-
-
-    /// Force-resolve from the resolver side without a stream (the reaper's error
-    /// path, so awaiters never hang). Idempotent.
-    pub fn resolve(&self) {
-        self.0.done.store(true, Ordering::Release);
-        self.0.waker.wake();
-    }
-}
-
-impl Future for Signal {
-    type Output = ();
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.0.done.load(Ordering::Acquire) {
-            return Poll::Ready(());
-        }
-        self.0.waker.register(cx.waker());
-        // Re-check: the callback may have fired between the load and register.
-        if self.0.done.load(Ordering::Acquire) {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::block_on;
 
     // Proves the bridge resolves on GPU completion AND measures per-signal
     // round-trip latency — the number that decides whether per-expert async
@@ -247,19 +198,18 @@ mod tests {
     // A Signal that resolves once every op enqueued on `stream` so far completes.
     fn signal(stream: &HipStream) -> Result<Signal> {
         let s = Signal::pending();
-        s.arm_on(stream)?;
+        s.arm_on_raw(stream.raw())?;
         Ok(s)
     }
 
     #[test]
     fn signal_resolves_and_latency() -> Result<()> {
         let stream = HipStream::new()?;
-        let rt = tokio::runtime::Builder::new_current_thread().build()?;
-        // Warm the runtime + the host-func machinery.
-        rt.block_on(signal(&stream)?);
+        // Warm the host-func machinery.
+        block_on(signal(&stream)?);
         let n = 2000u32;
         let t = std::time::Instant::now();
-        rt.block_on(async {
+        block_on(async {
             for _ in 0..n {
                 signal(&stream)?.await;
             }
@@ -360,6 +310,7 @@ mod timeline_tests {
     // `--all-targets` clippy run, which is the command CLAUDE.md tells an agent to use.
     #![allow(clippy::expect_used)]
     use super::*;
+    use crate::backend::block_on;
 
     /// **INV-4: a wait may be enqueued BEFORE its producer exists, and still waits.**
     ///
@@ -376,10 +327,9 @@ mod timeline_tests {
         // Order matters: the WAIT goes first, against a value nothing has produced.
         t.wait(a.raw(), 1).expect("wait enqueues before any signal");
         t.signal(b.raw(), 1).expect("signal");
-        let rt = tokio::runtime::Builder::new_current_thread().build().expect("rt");
         // If the wait had passed vacuously this would resolve regardless; the value check
         // below is what distinguishes "waited" from "did not block".
-        rt.block_on(stream_signal(a.raw()).expect("completion"));
+        block_on(stream_signal(a.raw()).expect("completion"));
         assert!(t.completed() >= 1, "the waited-on value must have been reached");
     }
 
@@ -403,8 +353,7 @@ mod timeline_tests {
         // this is the dead-producer case, not a race with a slow one.
         t.wait(s.raw(), 7).expect("wait enqueues against a value no stream will write");
         t.release(7);
-        let rt = tokio::runtime::Builder::new_current_thread().build().expect("rt");
-        rt.block_on(stream_signal(s.raw()).expect("completion"));
+        block_on(stream_signal(s.raw()).expect("completion"));
         assert!(t.completed() >= 7, "the host release must be what retired the wait");
         // Monotone: releasing backwards would un-free a slot another consumer is gated on,
         // turning a clean teardown into the deadlock it exists to prevent.
@@ -421,8 +370,7 @@ mod timeline_tests {
         for v in 1..=4u64 {
             t.signal(s.raw(), v).expect("signal");
         }
-        let rt = tokio::runtime::Builder::new_current_thread().build().expect("rt");
-        rt.block_on(stream_signal(s.raw()).expect("completion"));
+        block_on(stream_signal(s.raw()).expect("completion"));
         assert_eq!(t.completed(), 4, "the last value written must be observable");
     }
 }

@@ -34,10 +34,6 @@
 //! the inference the `bf16f` note in `common.glsl` had to be rewritten to stop.
 #![allow(clippy::expect_used)]
 
-/// Kernels with no oracle, and why. An entry here costs an argument in a reviewable
-/// diff, which is the point; it is not a place to park work.
-const ALLOWED: &[(&str, &str)] = &[];
-
 /// Read a source file relative to the crate root.
 ///
 /// PANICS on a missing file rather than returning empty. That is deliberate: this scanner
@@ -78,7 +74,6 @@ fn every_launcher_has_an_oracle() {
     let tests = source("tests/vk.rs");
     let missing: Vec<&String> = launchers
         .iter()
-        .filter(|name| !ALLOWED.iter().any(|(a, _)| *a == name.as_str()))
         .filter(|name| !tests.contains(&format!("launch_{name}(")))
         .collect();
 
@@ -88,7 +83,8 @@ fn every_launcher_has_an_oracle() {
          {}\n\n\
          They compile, they may even be dispatched by other code, and nothing has ever \
          checked what they compute. A passing suite says nothing about them.\n\
-         Write the oracle, or add the kernel to ALLOWED in {} with the reason.\n",
+         Write the oracle in tests/vk.rs. ({} has no exemption list — the empty one it \
+         used to carry only invited parking work here.)\n",
         missing.len(),
         missing
             .iter()

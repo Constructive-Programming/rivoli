@@ -18,6 +18,8 @@
 
 use std::path::{Path, PathBuf};
 
+mod common;
+
 const INDEX: &str = "docs/00-orientation/INDEX.md";
 const STATUSES: [&str; 5] = [
     "live",
@@ -33,19 +35,7 @@ fn docs_root() -> PathBuf {
 
 /// Every `.md` under `docs/`, repo-relative, sorted.
 fn markdown_files() -> Vec<String> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                walk(&p, out);
-            } else if p.extension().is_some_and(|x| x == "md") {
-                out.push(p);
-            }
-        }
-    }
-    let mut v = Vec::new();
-    walk(&docs_root(), &mut v);
+    let v: Vec<PathBuf> = common::walk(&docs_root(), "md");
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut out: Vec<String> = v
         .iter()

@@ -1,5 +1,5 @@
-//! The backend-neutral half of the kernel-oracle scaffolding, shared by `tests/vk.rs`
-//! and `tests/kernel.rs`.
+//! The backend-neutral half of the kernel-oracle scaffolding, shared by `tests/vk.rs`,
+//! `tests/kernel.rs`, `tests/docs.rs` and `tests/invariants.rs`.
 //!
 //! It was copy-pasted per file until 2026-07-30, and the copies had already started to
 //! drift: two spellings of the same `Lcg` bug note, two `assert_close` bodies with the
@@ -13,6 +13,31 @@
 //! utility, which is more machinery than the warning is worth.
 #![allow(dead_code)]
 #![allow(clippy::expect_used)]
+
+/// Every file under `root` with extension `ext`, recursively. Unsorted.
+///
+/// WALK, do not list files. The two registry checks that call this had each grown their
+/// own copy — `docs.rs` recursive, `invariants.rs` an explicit stack — and both exist for
+/// the same reason: the hand-maintained path list `invariants.rs` replaced named five
+/// files, and moving `hybrid`/`gpustream`/`pin` into subsystem folders on 2026-07-31
+/// silently emptied it, after which the registry reported every INV-n as untested. A
+/// coverage check keyed on a remembered list fails in the direction that looks like a real
+/// regression, which costs more than the walk.
+pub fn walk(root: &std::path::Path, ext: &str) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            match p.is_dir() {
+                true => stack.push(p),
+                false if p.extension().is_some_and(|x| x == ext) => out.push(p),
+                false => {}
+            }
+        }
+    }
+    out
+}
 
 /// f32 slice → little-endian bytes, the form every device upload takes.
 pub fn f32b(v: &[f32]) -> Vec<u8> {

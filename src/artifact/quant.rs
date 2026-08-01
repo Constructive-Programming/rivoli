@@ -128,6 +128,15 @@ pub fn vq_expert_layout(hidden: usize, moe_inter: usize) -> [(usize, usize); 3] 
     ]
 }
 
+/// The checkpoint tensor-name suffixes of those same three projections, in the SAME
+/// order — every offline tool that walks an expert zips this against
+/// [`vq_expert_layout`], so one index means one projection in both. It lives beside the
+/// layout rather than in each `src/bin` (where it had been declared, identically, four
+/// times) because a second copy of an ORDER-BEARING list is exactly the kind that goes
+/// wrong silently: a reordered copy still compiles and still runs, and scores gate's
+/// weights against up's.
+pub const PROJ: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
+
 /// Unpadded on-disk bytes of one expert (gate‖up‖down concatenated).
 pub fn vq_expert_bytes(hidden: usize, moe_inter: usize) -> usize {
     vq_expert_layout(hidden, moe_inter)

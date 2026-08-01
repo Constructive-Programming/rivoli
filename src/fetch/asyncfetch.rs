@@ -193,9 +193,14 @@ impl AsyncFetch {
 
     /// Take a staging slot whose previous read's bounce copy has retired.
     ///
-    /// This is the reuse gate that `reset_batch`'s integer reset used to skip. Bumping
-    /// `slot_next` at hand-out makes the returned slot fail its own test until its copy
-    /// lands, so a slot cannot be handed out twice — including twice within one batch.
+    /// This is the reuse gate the old per-batch `queued = 0` reset skipped: an integer
+    /// reset with no relationship to whether the bounce copy OUT of a slot had retired.
+    /// That was safe only because every demand read happens to be awaited inside its
+    /// issuing layer — an emergent property of the consumer, written nowhere and enforced
+    /// nowhere, and the reason the first speculative preloader corrupted.
+    ///
+    /// Bumping `slot_next` at hand-out makes the returned slot fail its own test until its
+    /// copy lands, so a slot cannot be handed out twice — including twice within one batch.
     fn take_slot(&mut self) -> Result<usize> {
         loop {
             // Destructured so the closure can borrow the timelines while `cursor` moves.
@@ -278,15 +283,6 @@ impl AsyncFetch {
             return Ok(());
         }
         self.slot_tl[t.slot as usize].wait(stream_raw, t.value)
-    }
-
-    /// Has this ticket's data landed? Used to recycle staging slots by TIMELINE VALUE
-    /// rather than by `reset_batch`'s blind integer reset — the latter recycled a slot with
-    /// no relationship to whether the copy out of it had retired, which was safe only
-    /// because every read happened to be awaited inside its own layer. That was an emergent
-    /// property of the consumer, written nowhere and enforced nowhere.
-    pub fn landed(&self, t: Ticket) -> bool {
-        t.is_resident() || self.slot_tl[t.slot as usize].completed() >= t.value
     }
 }
 
@@ -416,7 +412,6 @@ fn run_job(
     // whose overlap the whole streaming design is a bet on: io-wait bars should sit
     // underneath the decode thread's gpu-wait bars, not beside them.
     crate::telemetry::spans::record("io-wait/uring-reap", "reaper", t_io, e_io);
-    streamer.reset_batch();
     Ok(())
 }
 
@@ -427,7 +422,7 @@ mod tests {
 
     /// The hand-out rule, without a device: a slot is free iff its timeline has reached the
     /// last value issued for it, and bumping that value at hand-out is what stops the same
-    /// slot being handed out twice — the property `reset_batch`'s integer reset lacked.
+    /// slot being handed out twice — the property the old per-batch integer reset lacked.
     #[test]
     fn a_slot_is_not_reissued_until_its_copy_lands() {
         const N: usize = 4;

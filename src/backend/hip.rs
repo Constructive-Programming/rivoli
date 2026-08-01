@@ -74,14 +74,6 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
-    fn rivoli_moe_reduce_s(
-        partial: *const f32,
-        e: i32,
-        hidden: i32,
-        out: *mut f32,
-        stream: *mut c_void,
-    ) -> i32;
-
     fn rivoli_gemv_fp8(
         x: *const f32,
         packed: *const u8,
@@ -426,25 +418,6 @@ pub unsafe fn launch_moe_acc_drain(
     check(r, "moe_acc_drain")
 }
 
-/// Fixed-order reduce `out[o] = Σ_e partial[e][o]` over all `e` experts, on `stream`.
-///
-/// OFF THE DECODE PATH since [`launch_moe_acc_drain`] replaced it — retained as the f32
-/// reference the MoE oracle tests pin against.
-///
-/// # Safety
-/// `partial` holds `e·hidden` f32 (all ranges landed); `out` holds `hidden` f32.
-pub unsafe fn launch_moe_reduce(
-    partial: *const f32,
-    e: usize,
-    hidden: usize,
-    out: *mut f32,
-    stream: *mut c_void,
-) -> Result<()> {
-    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
-    let r = unsafe { rivoli_moe_reduce_s(partial, e as i32, hidden as i32, out, stream) };
-    check(r, "moe_reduce")
-}
-
 /// fp8-e4m3 block-scaled GEMV `y = W·x` (attention/dense projections).
 ///
 /// `nrow` token rows (1 or 2) share ONE read of the weights: `x[r·i_dim + i]` →
@@ -724,10 +697,6 @@ pub unsafe fn launch_gather_rope(
     check(r, "gather_rope")
 }
 
-/// Residual add `x[i] += y[i]`.
-///
-/// # Safety
-/// Device pointers `x`, `y` (each `n` f32) live until the next [`device_sync`].
 /// Record `tag` in `*flag` if any of `x[0..n]` is non-finite (first writer wins).
 ///
 /// The localiser for the intermittent non-finite-logits bug. Adds no sync — the caller

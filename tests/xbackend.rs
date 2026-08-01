@@ -29,31 +29,14 @@
 //!
 //! # FIRST RESULT: `swiglu` DIFFERS, and reproducing HIP's `expf` did not fix it
 //!
-//! Measured, 4096 inputs spanning −120..+120:
+//! The measurement and the argument built on it are in
+//! `docs/investigations/vulkan-port.md` §"1463 of 4096": reproducing hipcc's `expf`
+//! argument reduction instruction-for-instruction left that count UNCHANGED, moving only
+//! 12 values, so the residue is in `v_exp_f32` itself and `exp` stays PRE-REGISTERED.
 //!
-//! | build | elements differing from HIP |
-//! |---|---:|
-//! | Vulkan, GLSL `exp` | **1463 / 4096** |
-//! | Vulkan, HIP's `expf` argument reduction reproduced instruction-for-instruction | **1463 / 4096** |
-//!
-//! The two Vulkan builds differ from each other in only **12** of 4096, so the
-//! replication was genuinely active and genuinely different — this is a real negative,
-//! not a broken experiment. Divergence sits in x ∈ [−88.7, +9.11], precisely the band
-//! where `exp`'s low bits reach the output; outside it both backends agree exactly
-//! because `1 + exp(−x)` rounds to 1.0 or the result saturates.
-//!
-//! **Why the replication failed, and why it was still worth doing.** hipcc's `expf` and
-//! RADV's `exp` differ in TWO places: the argument reduction (hipcc uses a two-word
-//! log2(e) split plus integer/fraction range reduction; RADV uses one multiply) and the
-//! hardware `v_exp_f32` each then calls. Matching the first changed 12 values out of
-//! 4096 — the extra precision is below the noise floor of the second. So the remaining
-//! divergence is in `v_exp_f32` itself receiving different arguments, or in RADV's
-//! `exp2` lowering, and neither is reachable from GLSL source.
-//!
-//! **`exp` therefore stays PRE-REGISTERED.** The exactness strategy's steps 1-3
-//! (construct exactly, move the work, remove the lowering choice) have now all been
-//! ATTEMPTED on `exp` and all three fail for stated reasons — which is a stronger
-//! position than the previous "presumed unfixable", because it is measured.
+//! Deliberately a pointer and not a copy. This repo corrects a claim in one place, and a
+//! measurement restated in a doc comment is the copy that goes stale — the same failure
+//! `tests/docs.rs` exists to catch one level up.
 //!
 //! The harness is kept because the question it answers cannot be answered any other way,
 //! and phase 4's token-ID gate is this comparison scaled up.

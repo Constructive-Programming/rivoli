@@ -9,15 +9,12 @@
 
 #![cfg(feature = "vulkan")]
 
+use crate::backend::Signal;
 use anyhow::{Result, anyhow, bail, ensure};
 use ash::vk;
-use futures_util::task::AtomicWaker;
 use std::ffi::CStr;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::task::{Context, Poll};
+use std::sync::{Condvar, Mutex, OnceLock};
 use tracing::{error, info, warn};
 
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
@@ -180,19 +177,24 @@ pub enum Q {
 }
 
 impl Q {
-    /// How many there are. Not derived — Rust has no `enum::COUNT` — so the three-arm
-    /// matches below are what keep it honest, and adding a variant fails to compile at
-    /// each of them.
+    /// How many there are. Not derived — Rust has no `enum::COUNT` — so [`Q::index`] is
+    /// what keeps it honest: adding a variant fails to compile there, which is the
+    /// notification `vkstream::Stream::miss` is counting on when a fourth queue arrives.
+    /// That is also why `index` stays an explicit match rather than becoming
+    /// `self as usize` over a `#[repr(usize)]` discriminant: the cast compiles fine on a
+    /// new variant and then indexes `route` out of range at runtime instead.
     const COUNT: usize = 3;
 
-    /// The opaque token a `launch_*` carries. Small, non-null, never dereferenced.
+    /// The opaque token a `launch_*` carries. Small, NON-NULL — hence the `+ 1`, since
+    /// [`Q::parse`] must keep reading NULL as `Main` from a HIP-shaped call site rather
+    /// than as `Main`'s own tag — and never dereferenced.
+    ///
+    /// Derived from [`Q::index`] rather than spelling the ordering a second time: the two
+    /// were independent hand-written matches over the same three variants, which is one
+    /// place for them to disagree and no compiler check that they had not.
     #[inline]
     pub fn tag(self) -> *mut std::ffi::c_void {
-        (match self {
-            Q::Main => 1usize,
-            Q::Moe => 2,
-            Q::Fetch => 3,
-        }) as *mut std::ffi::c_void
+        (self.index() + 1) as *mut std::ffi::c_void
     }
 
     /// Parse a launcher's stream argument. Total: every input either names a queue or
@@ -209,6 +211,8 @@ impl Q {
         }
     }
 
+    /// This enum's ORDERING, written once. `route`, `sems` and [`Q::tag`] all derive from
+    /// it, so it is the one match a new variant has to break.
     #[inline]
     fn index(self) -> usize {
         match self {
@@ -238,7 +242,7 @@ const RING: usize = 16;
 ///
 /// # The ring and the second queue are ONE design
 ///
-/// With a single command buffer, `Gpu::signal` could only cover work already SUBMITTED:
+/// With a single command buffer, [`Gpu::signal_on`] could only cover work already SUBMITTED:
 /// arming on merely-recorded work means submitting it, and a buffer cannot be reused
 /// while pending. With a ring, [`Stream::flush`] is *end the current buffer, submit it
 /// with a timeline signal, advance to a slot whose fence has retired* — so arming on
@@ -248,18 +252,16 @@ struct Stream {
     ///
     /// `vkQueueSubmit` requires the VkQueue to be externally synchronised. When the
     /// handle sat beside the mutex instead of inside it, "always submit under the
-    /// guard" was a convention — and `Gpu::signal` broke it within a day of the rule
+    /// guard" was a convention — and [`Gpu::signal_on`] broke it within a day of the rule
     /// being written down, while carrying a SAFETY comment citing the very invariant it
     /// violated. Inside the guard, submitting without the lock is a borrow error rather
     /// than something a reader has to notice. Three streams means three such guards,
     /// and — the whole point — the fetch stream never blocks on the compute lock.
     queue: vk::Queue,
-    /// Owns `ring`'s buffers. Never read after construction — `Stream::new`'s own error
-    /// path destroys it and `Gpu` is deliberately never dropped (see `gpu()`) — but kept
-    /// because the field is where a reader looks to find out what the ring belongs to, and
-    /// because any future teardown needs it.
-    #[allow(dead_code)]
-    pool: vk::CommandPool,
+    /// The command pool `ring`'s buffers come from is NOT a field: it was never read after
+    /// construction, and it cannot become one usefully — `Gpu` is deliberately never
+    /// dropped (see `gpu()`), so nothing would ever destroy it. `Stream::new` holds it as a
+    /// local for the one path that does: its own error exit.
     ring: [vk::CommandBuffer; RING],
     /// Consumer-facing timeline dependencies to attach to the NEXT submit — see
     /// [`Timeline`]. Vulkan cannot record a wait INTO a command buffer the way
@@ -365,7 +367,6 @@ struct Pipes {
     mla_attend_combine: Pipe,
     moe_gateup_vq: Pipe,
     moe_down_vq: Pipe,
-    moe_reduce: Pipe,
     moe_acc_drain: Pipe,
 }
 
@@ -385,7 +386,7 @@ struct Pipes {
 // device whose compute family offers fewer than three queues, `Gpu::route` therefore
 // ALIASES several `Q`s onto one `Stream` rather than handing the same `vk::Queue` to two.
 //
-// This comment used to describe a convention instead, and `Gpu::signal` violated it
+// This comment used to describe a convention instead, and `Gpu::signal_on` violated it
 // while citing it. If a future change moves a synchronised handle back out of `Cmd`,
 // this paragraph becomes false again — keep them inside.
 unsafe impl Send for Gpu {}
@@ -875,16 +876,6 @@ impl Gpu {
             .sum();
         (free as usize, total as usize)
     }
-
-    /// Device name, for startup logging and for test output.
-    pub fn name(&self) -> String {
-        // SAFETY: `self.phys` is live.
-        let props = unsafe { self.instance.get_physical_device_properties(self.phys) };
-        props.device_name_as_c_str().map_or_else(
-            |_| "<unnamed>".to_string(),
-            |s| s.to_string_lossy().into_owned(),
-        )
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -964,7 +955,6 @@ impl Stream {
         let queue = unsafe { device.get_device_queue(qfam, qidx) };
         Ok(Self {
             queue,
-            pool,
             ring,
             tl_waits: Vec::new(),
             tl_signals: Vec::new(),
@@ -1031,7 +1021,7 @@ impl Stream {
     ///
     /// This is the whole of what the ring bought: a caller that needs a completion signal
     /// for work it has merely RECORDED calls this and hands the value back. There is no
-    /// second mechanism, and `Gpu::signal`'s old submitted-vs-recorded gap is closed by
+    /// second mechanism, and [`Gpu::signal_on`]'s old submitted-vs-recorded gap is closed by
     /// construction rather than documented around.
     fn flush(&mut self, d: &ash::Device) -> Result<u64> {
         debug_assert!(self.recording, "flush with nothing recorded");
@@ -1169,18 +1159,6 @@ impl Stream {
 }
 
 impl Gpu {
-    /// Append work to the open command buffer, opening one if needed, then serialise
-    /// it against whatever comes next. The barrier is what makes a `launch_*` sequence
-    /// behave like HIP's default stream — each kernel sees the previous one's writes.
-    /// `f` MUST NOT own, or transitively own, a [`Buf`]. It runs with the `cmd` mutex
-    /// held, and `Buf::drop` calls `Gpu::sync`, which takes that same non-reentrant
-    /// mutex — so a closure that drops a `Buf` deadlocks with no compile-time signal.
-    /// No current caller does (they capture `Copy` handles and borrowed slices), and
-    /// nothing enforces it, so the rule lives here where the next launcher is written.
-    fn enqueue(&self, f: impl FnOnce(&ash::Device, vk::CommandBuffer)) -> Result<()> {
-        self.enqueue_on(Q::Main, f)
-    }
-
     /// The stream a [`Q`] resolves to. Never indexes out of range: `route` is built from
     /// `streams.len()` in `Gpu::new`.
     fn stream(&self, q: Q) -> &Mutex<Stream> {
@@ -1274,10 +1252,6 @@ impl Gpu {
     /// is the split, matching `attn.hip`'s `dim3(blocks, n_splits)`. The shader reads
     /// `gl_WorkGroupID.y` to find its row range, so collapsing this into one dimension
     /// would silently give every workgroup split 0.
-    fn dispatch_2d<T>(&self, p: &Pipe, push: &T, groups_x: u32, groups_y: u32) -> Result<()> {
-        self.dispatch_2d_on(Q::Main, p, push, groups_x, groups_y)
-    }
-
     fn dispatch_2d_on<T>(
         &self,
         q: Q,
@@ -1618,7 +1592,6 @@ impl Pipes {
             mla_attend_combine: MlaCombinePush,
             moe_gateup_vq: MoeGateUpPush,
             moe_down_vq: MoeDownPush,
-            moe_reduce: MoeReducePush,
             moe_acc_drain: MoeAccDrainPush,
         ))
     }
@@ -2138,7 +2111,7 @@ pub unsafe fn memcpy_dtod(dst: *mut u8, src: *const u8, bytes: usize) -> Result<
         .src_offset(soff)
         .dst_offset(doff)
         .size(bytes as u64)];
-    g.enqueue(|d, cb| {
+    g.enqueue_on(Q::Main, |d, cb| {
         // SAFETY: recording is open; both handles came from `resolve`, so each range
         // lies inside its buffer.
         unsafe { d.cmd_copy_buffer(cb, sbuf, dbuf, &region) };
@@ -2150,7 +2123,7 @@ pub unsafe fn memcpy_dtod(dst: *mut u8, src: *const u8, bytes: usize) -> Result<
 /// the third of Phase 4's three violations fixed.
 ///
 /// It RETURNS BEFORE THE BYTES LAND. What says they have landed is the [`Signal`] the
-/// caller arms next (`Signal::arm_on(&Stream)` → [`Gpu::arm_on`]), which flushes this
+/// caller arms next ([`Gpu::arm_on`]`(Q::Fetch, &sig)`), which flushes this
 /// recorded copy and fires when that submit retires. That is exactly the HIP contract:
 /// `hipMemcpyAsync` on the fetch stream, then a completion signal on the same stream.
 ///
@@ -2229,7 +2202,7 @@ pub unsafe fn fill_u32(dst: *mut u8, pat: u32, bytes: usize) -> Result<()> {
         "fill_u32 dst {dst:?} is at offset {off} in its buffer, which vkCmdFillBuffer \
          requires to be 4-byte aligned"
     );
-    g.enqueue(|d, cb| {
+    g.enqueue_on(Q::Main, |d, cb| {
         // SAFETY: recording is open; `buf`/`off` came from `resolve`, so the range lies
         // inside the buffer, and both offset and size are 4-aligned (checked above).
         unsafe { d.cmd_fill_buffer(cb, buf, off, bytes as u64, pat) };
@@ -2348,8 +2321,7 @@ mod tests {
         let g = gpu().expect("vulkan init");
         let (free, total) = g.mem_info();
         println!(
-            "\nVULKAN device: {} — {:.1} GiB device-local — validation layer: {}\n",
-            g.name(),
+            "\nVULKAN device: {:.1} GiB device-local — validation layer: {}\n",
             total as f64 / (1u64 << 30) as f64,
             if g.validation() { "ON" } else { "OFF (unvalidated!)" }
         );
@@ -2367,53 +2339,10 @@ mod tests {
 
 // ---------------------------------------------------------------------------
 // Async-signal bridge — the timeline-semaphore replacement for hipLaunchHostFunc.
+//
+// [`Signal`] itself is in `src/backend.rs`; it was identical on both backends. What is
+// Vulkan's alone, and is here, is the arming: the waiter thread below.
 // ---------------------------------------------------------------------------
-
-/// A one-shot completion shared between whatever resolves it and the future awaiting
-/// it. Deliberately the SAME surface as `gpustream::Signal` — `pending`/`ready`/
-/// `resolve` plus `Future` — so `asyncfetch.rs` and the expert stream in `gpu.rs` do
-/// not change when the backend does.
-#[derive(Clone)]
-pub struct Signal(Arc<SignalState>);
-
-struct SignalState {
-    done: AtomicBool,
-    waker: AtomicWaker,
-}
-
-impl Signal {
-    /// An unresolved signal.
-    pub fn pending() -> Self {
-        Signal(Arc::new(SignalState {
-            done: AtomicBool::new(false),
-            waker: AtomicWaker::new(),
-        }))
-    }
-
-
-    /// Force-resolve from the resolver side (an error path, so awaiters never hang).
-    /// Idempotent.
-    pub fn resolve(&self) {
-        self.0.done.store(true, Ordering::Release);
-        self.0.waker.wake();
-    }
-}
-
-impl Future for Signal {
-    type Output = ();
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.0.done.load(Ordering::Acquire) {
-            return Poll::Ready(());
-        }
-        self.0.waker.register(cx.waker());
-        // Re-check: the waiter may have fired between the load and the register.
-        if self.0.done.load(Ordering::Acquire) {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    }
-}
 
 /// The timeline semaphores plus the thread that watches them.
 ///
@@ -2452,23 +2381,6 @@ struct Pend {
 }
 
 impl Gpu {
-    /// A [`Signal`] that resolves once everything SUBMITTED SO FAR has retired.
-    ///
-    /// ponytail: this covers submitted work, not work merely RECORDED into the open
-    /// command buffer — it appends its own empty timeline-signal submit, and the queue
-    /// is in-order, so it lands behind every prior submit. Recording is flushed by
-    /// `device_sync`, so `device_sync()` then `signal()` is well defined today.
-    ///
-    /// Arming directly on top of recorded-but-unsubmitted work (what
-    /// `Signal::arm_on(stream)` does on the HIP side) needs the single command buffer
-    /// here to become a small ring, because an async flush cannot reuse a buffer that
-    /// is still pending. That is increment-2 work — see docs/investigations/vulkan-port.md, "The design, on
-    /// paper", where the ring and the second queue are one design. `vkstream.rs`
-    /// documents what the gap costs its callers today.
-    pub fn signal(&self) -> Result<Signal> {
-        self.signal_on(Q::Main)
-    }
-
     /// A [`Signal`] on a named queue, covering everything RECORDED OR SUBMITTED to it so
     /// far. `vkstream::stream_signal`'s implementation.
     pub fn signal_on(&self, q: Q) -> Result<Signal> {
@@ -2477,15 +2389,10 @@ impl Gpu {
         Ok(sig)
     }
 
-    /// As [`Gpu::signal`] but resolving a CALLER-OWNED [`Signal`] on `Q::Main`.
-    pub fn arm(&self, sig: &Signal) -> Result<()> {
-        self.arm_on(Q::Main, sig)
-    }
-
     /// Arm a caller-owned [`Signal`] on `q` — what `asyncfetch.rs` needs: it hands out one
     /// pending signal per queued read up front and arms each later, as its completion is
-    /// reaped. Splitting this out of `signal` is the whole reason that module compiles
-    /// against both backends — `gpustream::Signal::arm_on` has the same shape.
+    /// reaped. Splitting this out of `signal_on` is the whole reason that module compiles
+    /// against both backends — `gpustream::Signal::arm_on_raw` has the same shape.
     ///
     /// # It covers RECORDED work, which is what closes increment 1's gap
     ///
@@ -3619,7 +3526,8 @@ pub unsafe fn launch_attend(
         tps: tps as i32,
         max_splits: MLA_MAX_SPLITS as i32,
     };
-    g.dispatch_2d(
+    g.dispatch_2d_on(
+        Q::Main,
         &g.pipes.mla_latent_attend,
         &push,
         h.div_ceil(MLA_HB) as u32,
@@ -3702,16 +3610,6 @@ push_struct! {
         rows: i32,
         gain: f32,
         _pad: i32,
-    }
-}
-
-push_struct! {
-    /// Mirror of `moe_reduce.comp`'s push block.
-    MoeReducePush {
-        partial: u64,
-        out: u64,
-        e_count: i32,
-        hidden: i32,
     }
 }
 
@@ -3851,32 +3749,6 @@ pub unsafe fn launch_moe_acc_drain(
         _pad: 0,
     };
     g.dispatch_on(q, &g.pipes.moe_acc_drain, &push, groups(n))
-}
-
-/// `out[o] = Σ_e partial[e][o]`, e ascending. Matches `hip.rs::launch_moe_reduce`.
-///
-/// OFF THE DECODE PATH since [`launch_moe_acc_drain`] replaced it — retained as the f32
-/// reference the MoE oracle tests pin against.
-///
-/// # Safety
-/// Device addresses of live [`Buf`]s: `partial` (`e·hidden` f32), `out` (`hidden` f32).
-pub unsafe fn launch_moe_reduce(
-    partial: *const f32,
-    e: usize,
-    hidden: usize,
-    out: *mut f32,
-    stream: *mut std::ffi::c_void,
-) -> Result<()> {
-    let q = Q::parse(stream)?;
-    ensure!(e > 0 && hidden > 0, "moe_reduce: argument guard rejected");
-    let g = gpu()?;
-    let push = MoeReducePush {
-        partial: partial as u64,
-        out: out as u64,
-        e_count: e as i32,
-        hidden: hidden as i32,
-    };
-    g.dispatch_on(q, &g.pipes.moe_reduce, &push, groups(hidden))
 }
 
 // ---------------------------------------------------------------------------

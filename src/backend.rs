@@ -13,7 +13,8 @@
 //!   import `crate::backend::gpustream::{HipEvent, HipStream, Signal, stream_signal}` directly, and
 //!   `HipStream` has no Vulkan analogue as such. They are re-exported here under
 //!   BACKEND-NEUTRAL names — [`Stream`], [`Event`] — so no module above this one spells a
-//!   backend into a type name. `src/backend/vkstream.rs` is the Vulkan side.
+//!   backend into a type name. `src/backend/vkstream.rs` is the Vulkan side. [`Signal`] is
+//!   not re-exported but DEFINED here — see its own note.
 //! - **The two backends do not agree on what a device pointer is.** Under HIP one number
 //!   is both a host and a device address; under Vulkan they are unrelated. That asymmetry
 //!   is NOT hidden here — it cannot be. `device.rs`'s `VmmBuf` hands out both bases and
@@ -83,7 +84,7 @@ pub mod vkstream;
 #[cfg(all(feature = "rocm", not(feature = "vulkan")))]
 mod imp {
     pub use crate::backend::gpustream::{
-        HipEvent as Event, HipStream as Stream, Signal, Timeline, stream_signal,
+        HipEvent as Event, HipStream as Stream, Timeline, stream_signal,
     };
     pub use crate::backend::hip::*;
 }
@@ -95,3 +96,125 @@ mod imp {
 }
 
 pub use imp::*;
+
+// ---------------------------------------------------------------------------
+// Shared by both backends — the parts of the waist that are not backend-specific.
+// ---------------------------------------------------------------------------
+
+use atomic_waker::AtomicWaker;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
+
+/// A one-shot completion shared between whatever resolves it and the future that awaits it.
+/// `Clone` (an `Arc`) so the resolver and the awaiter each hold one.
+///
+/// # ONE definition, not one per backend
+///
+/// This was two byte-identical copies, in `gpustream.rs` and `vk.rs`. `Signal` crosses the
+/// waist — `gpu.rs` and `asyncfetch.rs` await one without knowing which backend built it —
+/// so a drift between the copies would not have been a compile error on either build; it
+/// would have been a `Future` that polls differently depending on a feature flag. Nothing
+/// in it is backend-specific: it is a flag, a waker, and the double-check that closes the
+/// race between them.
+///
+/// What IS per-backend is only how a signal gets ARMED — `hipLaunchHostFunc` on one side, a
+/// timeline-semaphore waiter thread on the other — and that stays in each backend's module,
+/// as an inherent `impl` on this type (Rust allows those in any module of the defining
+/// crate).
+#[derive(Clone)]
+pub struct Signal(Arc<SignalState>);
+
+struct SignalState {
+    done: AtomicBool,
+    waker: AtomicWaker,
+}
+
+impl Signal {
+    /// An unresolved signal.
+    pub fn pending() -> Self {
+        Signal(Arc::new(SignalState {
+            done: AtomicBool::new(false),
+            waker: AtomicWaker::new(),
+        }))
+    }
+
+    /// Force-resolve from the resolver side, so awaiters never hang when the thing that was
+    /// going to resolve this dies instead. Idempotent.
+    pub fn resolve(&self) {
+        self.0.done.store(true, Ordering::Release);
+        self.0.waker.wake();
+    }
+
+    /// Hand ONE strong reference out as an opaque pointer for a C callback to own, balanced
+    /// by exactly one [`Signal::reclaim_raw`]. Not `into_raw`: this SHARES a reference, it
+    /// does not consume the signal — the caller keeps its own.
+    ///
+    /// The `Arc` arithmetic lives here rather than in `gpustream.rs` so the representation
+    /// stays private to this module and the refcount has one place to be got wrong in.
+    #[cfg(feature = "rocm")]
+    pub(crate) fn share_raw(&self) -> *mut std::ffi::c_void {
+        Arc::into_raw(self.0.clone()) as *mut std::ffi::c_void
+    }
+
+    /// Take back the reference [`Signal::share_raw`] handed out.
+    ///
+    /// # Safety
+    /// `p` must come from one [`Signal::share_raw`] that has not been reclaimed yet.
+    #[cfg(feature = "rocm")]
+    pub(crate) unsafe fn reclaim_raw(p: *mut std::ffi::c_void) -> Self {
+        // SAFETY: the caller's contract is exactly `Arc::from_raw`'s.
+        Signal(unsafe { Arc::from_raw(p as *const SignalState) })
+    }
+}
+
+impl Future for Signal {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.0.done.load(Ordering::Acquire) {
+            return Poll::Ready(());
+        }
+        self.0.waker.register(cx.waker());
+        // Re-check: the resolver may have fired between the load and the register.
+        if self.0.done.load(Ordering::Acquire) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+/// Drive one future to completion on the calling thread, parking between polls.
+///
+/// # Why this is not `tokio`
+///
+/// The whole use of tokio in this crate was `Builder::new_current_thread().build()?
+/// .block_on(..)` at eight sites — no `tokio::sync`, no `#[tokio::main]`, no `spawn`, no
+/// timers, and the declared `sync`/`macros` features were dead. That is twelve crates for a
+/// park/unpark loop `std::thread` already has, and `tests/vk.rs` had already written this
+/// one with the note "fifteen lines of std beats pulling in a runtime".
+///
+/// It is enough because the CONCURRENCY HERE IS GPU STREAMS, not CPU tasks (this module's
+/// header says so): the decode loop awaits one thing at a time and the overlap it is waiting
+/// on is happening on the device. A multi-threaded scheduler would have nothing to schedule.
+/// `park` may wake spuriously; the loop re-polls, which is the correct response either way.
+pub fn block_on<F: Future>(f: F) -> F::Output {
+    use std::task::{Wake, Waker};
+    struct Unpark(std::thread::Thread);
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut f = std::pin::pin!(f);
+    loop {
+        match f.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => return v,
+            Poll::Pending => std::thread::park(),
+        }
+    }
+}

@@ -619,34 +619,6 @@ mod live {
                 &mut on_tok,
             )?;
             hung_up = !live;
-            if !hung_up {
-                // Tool calls go out here, whole, rather than as fragments: the markup is only
-                // parseable once closed, and OpenAI's streamed tool-call shape (per-call
-                // `index`, arguments assembled across deltas) is a reassembly protocol a
-                // client is free to receive in one piece.
-                let whole = tok.decode_all(&out.0)?;
-                let (_, content) = split_think(&whole, think);
-                let (_, calls) = parse_tool_calls(content, &id);
-                if !calls.is_empty() {
-                    let indexed: Vec<Value> = calls
-                        .iter()
-                        .enumerate()
-                        .map(|(i, c)| {
-                            let mut c = c.clone();
-                            c["index"] = json!(i);
-                            c
-                        })
-                        .collect();
-                    sse(
-                        w,
-                        &chunk(&id, created, &model, json!({ "tool_calls": indexed }), None),
-                    )?;
-                }
-                let reason = stop_reason(&calls, out.0.len(), ngen);
-                sse(w, &chunk(&id, created, &model, json!({}), Some(reason)))?;
-                w.write_all(b"data: [DONE]\n\n")?;
-                w.flush()?;
-            }
             out
         } else {
             engine.generate(
@@ -681,7 +653,37 @@ mod live {
             );
         }
         if stream {
-            return Ok(()); // already sent, chunk by chunk
+            // The prose already went out chunk by chunk; this is the epilogue. It sits here,
+            // after the single `decode_all` above, because the streaming arm used to decode
+            // the whole generation a SECOND time to build it.
+            if !hung_up {
+                // Tool calls go out whole rather than as fragments: the markup is only
+                // parseable once closed, and OpenAI's streamed tool-call shape (per-call
+                // `index`, arguments assembled across deltas) is a reassembly protocol a
+                // client is free to receive in one piece.
+                let (_, content) = split_think(&text, think);
+                let (_, calls) = parse_tool_calls(content, &id);
+                if !calls.is_empty() {
+                    let indexed: Vec<Value> = calls
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| {
+                            let mut c = c.clone();
+                            c["index"] = json!(i);
+                            c
+                        })
+                        .collect();
+                    sse(
+                        w,
+                        &chunk(&id, created, &model, json!({ "tool_calls": indexed }), None),
+                    )?;
+                }
+                let reason = stop_reason(&calls, ids.len(), ngen);
+                sse(w, &chunk(&id, created, &model, json!({}), Some(reason)))?;
+                w.write_all(b"data: [DONE]\n\n")?;
+                w.flush()?;
+            }
+            return Ok(());
         }
         let (reasoning, content) = split_think(&text, think);
         let (prose, calls) = parse_tool_calls(content, &id);
@@ -711,20 +713,17 @@ mod live {
         )
     }
 
-    /// EOS is the only way a decode ends short of its budget, so hitting the budget is
-    /// exactly `length`.
-    fn finish_reason(generated: usize, ngen: usize) -> &'static str {
-        if generated >= ngen { "length" } else { "stop" }
-    }
-
     /// `tool_calls` outranks `stop` — an agent loop branches on this field, and a reply
     /// carrying calls but reporting `stop` reads as "the model is done talking to you",
     /// which is the opposite of what it means. `length` still wins over both: a call cut
     /// off by the budget may be incomplete, and saying `tool_calls` would assert it is not.
+    ///
+    /// EOS is the only way a decode ends short of its budget, so reaching it IS `length`.
     fn stop_reason(calls: &[Value], generated: usize, ngen: usize) -> &'static str {
-        match finish_reason(generated, ngen) {
-            "stop" if !calls.is_empty() => "tool_calls",
-            other => other,
+        match (generated >= ngen, calls.is_empty()) {
+            (true, _) => "length",
+            (false, false) => "tool_calls",
+            (false, true) => "stop",
         }
     }
 

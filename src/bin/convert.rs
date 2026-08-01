@@ -6,15 +6,14 @@
 //! self-describing `manifest.json`.
 //!
 //! CPU encode by default (correct, slow); `--layers N` limits the layer count for
-//! quick artifact/loader validation.
-//!
-//! usage: convert <fp8-dir> <out-dir> [--layers N] [--sample-experts N] [--kmeans-iters N]
+//! quick artifact/loader validation. `--help` is the flag reference.
 
 use anyhow::{Context, Result, ensure};
+use clap::Parser;
 use rivoli::artifact::format::{Dtype, FormatMeta, SafeWriter, Safetensors, Vq3Header};
 use rivoli::math::bf16_to_f32;
 use rivoli::artifact::quant::{
-    VQ_ALIGN, VQ_DIM, VQ_K, learn_codebook, quant_vq, read_f32, sample_subvectors,
+    PROJ, VQ_ALIGN, VQ_DIM, VQ_K, learn_codebook, quant_vq, read_f32, sample_subvectors,
     vq_expert_bytes, vq_expert_layout, vq_proj_bytes, vq_row_bytes,
 };
 // Used by the `--gpu` encoder and by the tests, both of which this binary can be built
@@ -27,7 +26,6 @@ use rivoli::artifact::quant::VQ_GROUP;
 use rivoli::math::f32_to_bf16;
 
 const FP8_BLOCK: usize = 128;
-const PROJ: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
 
 /// GPU-accelerated encode: the nearest-codebook argmin (the run-time ceiling, ~VQ_K×
 /// the other work) offloaded to `rivoli_vq_encode`. Host still does fp8 dequant,
@@ -309,59 +307,62 @@ fn add_int8(src: &Safetensors, w: &mut SafeWriter, name: &str) -> Result<()> {
     Ok(())
 }
 
+// clap derives the parse and the help text from this struct — the same switch src/main.rs
+// made, for the same reason: the hand-rolled `std::env::args()` loop this replaced kept a
+// usage string maintained separately from the flags it described, and a second source of
+// truth for a flag list only ever drifts apart from the first. This one already had:
+// its `usage:` line named neither `--gpu` nor `--validate`, the two flags that decide
+// whether a full convert takes an hour or a week.
+//
+// NOTE: doc comments on the FIELDS below are USER-FACING — clap renders them as `--help`.
+// Rationale for the code goes in `//` comments like this one, which clap ignores.
+#[derive(Parser)]
+#[command(
+    name = "convert",
+    about = "GLM-5.2 fp8 checkpoint → the rivoli int3-vq artifact (.vq3 experts, resident set, manifest)"
+)]
 struct Args {
+    /// The fp8 GLM-5.2 checkpoint directory: config.json, the `*.safetensors` shards,
+    /// and the tokenizer files that get copied into the artifact.
     fp8_dir: String,
+
+    /// Artifact directory to write — manifest.json, codebooks.f32, resident.safetensors,
+    /// one `L{ll}.vq3` per MoE layer, and the copied tokenizer. Created if absent, and an
+    /// existing codebooks.f32 or `L{ll}.vq3` is REUSED rather than re-encoded, so a
+    /// killed run resumes by re-running the same command line.
     out_dir: String,
+
+    /// Convert only the first N MoE layers (the dense prefix is always carried) — an
+    /// artifact/loader smoke test in minutes instead of hours. The manifest records the
+    /// reduced layer count, and the MTP head is dropped: it has no hidden state to consume
+    /// in a truncated model.
+    #[arg(long, value_name = "N")]
     layers: Option<usize>,
+
+    /// How many layers to draw codebook training subvectors from, one expert each, spread
+    /// evenly across the MoE range. Ignored when codebooks.f32 already exists.
+    #[arg(long, value_name = "N", default_value_t = 48)]
     sample_experts: usize,
+
+    /// k-means iterations per projection codebook. Ignored when codebooks.f32 exists.
+    #[arg(long, value_name = "N", default_value_t = 40)]
     kmeans_iters: usize,
-    /// Offload the nearest-codebook argmin to the GPU (`--gpu`, needs `--features
-    /// rocm`) — ~VQ_K× the encode work, ~an hour for the full model vs many on CPU.
+
+    /// Offload the nearest-codebook argmin to the GPU (needs `--features rocm`) — it is
+    /// ~VQ_K× the encode work, so this is ~an hour for the full model against many on
+    /// CPU. The bytes it writes are bit-identical to the CPU encoder's.
+    #[arg(long)]
     gpu: bool,
+
     /// Cross-check every GPU-encoded projection against the CPU `quant_vq` (bytes must
-    /// match exactly). Requires `--gpu`; roughly doubles encode time.
+    /// match exactly). Roughly doubles encode time. Only meaningful with `--gpu`, which
+    /// it therefore requires.
+    #[arg(long, requires = "gpu")]
     validate: bool,
 }
 
-fn parse_args() -> Result<Args> {
-    let mut a = Args {
-        fp8_dir: String::new(),
-        out_dir: String::new(),
-        layers: None,
-        sample_experts: 48,
-        kmeans_iters: 40,
-        gpu: false,
-        validate: false,
-    };
-    let mut pos = Vec::new();
-    let mut it = std::env::args().skip(1);
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--layers" => a.layers = Some(it.next().context("--layers N")?.parse()?),
-            "--sample-experts" => {
-                a.sample_experts = it.next().context("--sample-experts N")?.parse()?
-            }
-            "--kmeans-iters" => a.kmeans_iters = it.next().context("--kmeans-iters N")?.parse()?,
-            "--gpu" => a.gpu = true,
-            "--validate" => a.validate = true,
-            _ => pos.push(arg),
-        }
-    }
-    ensure!(
-        pos.len() == 2,
-        "usage: convert <fp8-dir> <out-dir> [--layers N] [--sample-experts N] [--kmeans-iters N] [--gpu] [--validate]"
-    );
-    ensure!(
-        !a.validate || a.gpu,
-        "--validate cross-checks the GPU encode against the CPU path; it needs --gpu"
-    );
-    a.fp8_dir = pos[0].clone();
-    a.out_dir = pos[1].clone();
-    Ok(a)
-}
-
 fn main() -> Result<()> {
-    let args = parse_args()?;
+    let args = Args::parse();
     let cfg: serde_json::Value =
         serde_json::from_slice(&std::fs::read(format!("{}/config.json", args.fp8_dir))?)?;
     let d = dims(&cfg)?;

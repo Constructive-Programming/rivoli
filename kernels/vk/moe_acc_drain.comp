@@ -5,8 +5,9 @@
 // is what let the cross-stream join go: the only step that needs every expert now sits
 // behind the end-of-layer barrier that already existed.
 //
-// THE PARTITION STILL CARRIES NO FREEDOM, for a different reason than moe_reduce.comp's.
-// There, each expert owned a row and this summed rows in a fixed order. Here every expert
+// THE PARTITION CARRIES NO FREEDOM. The f32 `moe_reduce` this replaced (deleted 2026-08-01,
+// off the decode path since the accumulator landed) needed each expert to own a row and
+// summed rows in a fixed order, because f32 addition does not associate. Here every expert
 // on a stream ADDS INTO one row, out of order, concurrently — and that is safe because the
 // adds are integers at a fixed scale, so they associate exactly. The schedule cannot reach
 // the result because there is no rounding for it to reorder. `rows` is one per stream (a

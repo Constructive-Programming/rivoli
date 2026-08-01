@@ -10,21 +10,35 @@
 //! Per full layer: `wk`/`wq_b` are copied verbatim (fp8 + weight_scale_inv);
 //! `weights_proj` and `k_norm.{weight,bias}` are widened bf16→f32 (the loader reads
 //! weights_proj via gemv_f32 and k_norm via the layernorm kernel).
-//!
-//! usage: add_indexer <artifact-dir> <indexer-stash.safetensors>
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
+use clap::Parser;
 use rivoli::artifact::format::{SafeWriter, Safetensors};
 use rivoli::artifact::model::ModelConfig;
 
+// NOTE: doc comments on the FIELDS below are USER-FACING — clap renders them as `--help`.
+// Rationale for the code goes in `//` comments like this one, which clap ignores. The
+// hand-rolled loop this replaced repeated one `usage:` string per positional and, being an
+// iterator, silently accepted (and dropped) any third argument.
+#[derive(Parser)]
+#[command(
+    name = "add_indexer",
+    about = "Splice DSA lightning-indexer weights from a stash into an existing artifact"
+)]
+struct Args {
+    /// The artifact directory to splice into. `indexer.safetensors` is written beside the
+    /// resident set, and `Pin::build` merges every `*.safetensors` in the directory, so
+    /// `--attn dsa`/`misa` auto-detect it on the next run. Existing experts are untouched.
+    artifact_dir: String,
+
+    /// The stashed safetensors holding every `*.indexer.*` tensor of the fp8 source. Must
+    /// cover every FULL indexer layer the manifest declares; a gap is a truncated stash
+    /// and fails hard rather than writing a half-usable indexer.
+    stash: String,
+}
+
 fn main() -> Result<()> {
-    let mut args = std::env::args().skip(1);
-    let art = args
-        .next()
-        .context("usage: add_indexer <artifact-dir> <indexer-stash.safetensors>")?;
-    let stash = args
-        .next()
-        .context("usage: add_indexer <artifact-dir> <indexer-stash.safetensors>")?;
+    let Args { artifact_dir: art, stash } = Args::parse();
 
     let cfg = ModelConfig::load(&art)?;
     let full = cfg.indexer_layout()?; // validates index dims + per-layer full/shared

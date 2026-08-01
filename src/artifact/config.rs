@@ -79,13 +79,6 @@ pub struct Config {
     /// Benchmark mode: decode this many tokens then print PROFILE and exit. None =
     /// server mode (later milestone).
     pub bench: Option<usize>,
-    /// Opt OUT of the pinned-host bounce and DMA cold reads straight into VMM device
-    /// memory (`--direct-vmm-dma`). Default false = bounce (read into pinned host,
-    /// then `hipMemcpy` into VMM) — measures faster (sidesteps the coherent/snoop tax
-    /// on DMA into host-mapped device pages) and survives kernels whose amdgpu path
-    /// EFAULTs on direct io_uring DMA into VMM (see src/fetch/stream.rs). Set only to force the
-    /// raw-DMA path.
-    pub direct_vmm_dma: bool,
     /// Dump the routed-expert access trace to this path (`--trace`), format v2: a
     /// `# rivoli-trace v2 top_k=<k> window=<w>` header, then one line per MoE layer —
     /// the keys it looked up, then `|`, then the top-`w` router candidates as
@@ -97,12 +90,17 @@ pub struct Config {
     pub prompt: Option<String>,
     /// Routed-expert cache policy (`--cache-policy` lru|2q|arc). Default "2q".
     /// All three are output-neutral: routing never consults residency — see
-    /// docs/investigations/cache-conditional-routing.md and [`Config::validate`].
+    /// docs/investigations/cache-conditional-routing.md.
     pub cache_policy: String,
-    /// 2Q's A1in/A1out split (`--2q-kin` / `--2q-kout`, percentages of pool capacity).
-    /// Ignored by `lru`/`arc`. Unset = [`crate::memory::cache::TwoQSplit::default`].
+    /// 2Q's A1in/A1out split, percentages of pool capacity. Ignored by `lru`/`arc`.
+    ///
+    /// Always [`crate::memory::cache::TwoQSplit::default`] in the engine: the `--2q-kin` /
+    /// `--2q-kout` flags that fed it were deleted 2026-08-01, having never appeared in a
+    /// recorded command line, a test or a script. The split is still swept — offline, by
+    /// `bin/replay`'s own `--kin`/`--kout` against a trace, which is where a policy grid
+    /// belongs and where it costs no GPU time.
     pub two_q: crate::memory::cache::TwoQSplit,
-        /// DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
+    /// DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
     pub checksum_x: bool,
     /// Routed-expert format mode (`--mode int3-vq|int4|hybrid`; default `hybrid` on `rocm`,
     /// `int3-vq` on `vulkan` — see [`Mode`] for why the default differs). docs/reference/modes.md has the
@@ -135,60 +133,32 @@ fn mem_available() -> Result<u64> {
     bail!("MemAvailable not found in /proc/meminfo")
 }
 
+/// Refuse a machine that cannot host the auto-sized expert pool, before anything is
+/// allocated. Only the AUTO path needs headroom: an explicit `--max-mem` is honoured
+/// literally — the user asked for that size, so it is allowed to OOM at pin build.
+///
+/// A free function taking the one argument it reads, because measuring the machine is all
+/// it does. It was also all `Config::discover` did: nine passthrough arguments (with an
+/// `#[allow(clippy::too_many_arguments)]` to say so), a struct literal, and then `main`
+/// immediately overwriting two of the fields it had just defaulted. `main` builds the
+/// literal itself now. Sole-tenant GPU enforcement stayed in `device::DeviceTier::new`,
+/// the single owner of the GTT guard, for the same reason: next to what it protects.
+pub fn check_budget(max_mem: Option<u64>) -> Result<()> {
+    if max_mem.is_some() {
+        return Ok(());
+    }
+    let avail = mem_available()?;
+    if avail <= OS_RESERVE {
+        bail!(
+            "only {:.1} GB available; need more than the {:.0} GB OS reserve",
+            avail as f64 / 1e9,
+            OS_RESERVE as f64 / 1e9
+        );
+    }
+    Ok(())
+}
+
 impl Config {
-    /// Discover the machine. The expert-pool budget is derived here from
-    /// `MemAvailable`; sole-tenant GPU enforcement lives in `device::DeviceTier::new`
-    /// (the single owner of the GTT guard), closer to the allocation it protects.
-    // Each arg is a distinct runtime knob threaded from the CLI; bundling them into a
-    // struct used at one call site is churn.
-    #[allow(clippy::too_many_arguments)]
-    pub fn discover(
-        model: String,
-        bench: Option<usize>,
-        direct_vmm_dma: bool,
-        trace: Option<String>,
-        prompt: Option<String>,
-        cache_policy: String,
-        two_q: crate::memory::cache::TwoQSplit,
-        max_mem: Option<u64>,
-        attn: crate::attn::AttnMode,
-    ) -> Result<Self> {
-        let avail = mem_available()?;
-        // Only the auto path needs headroom; an explicit --max-mem sizes itself.
-        if max_mem.is_none() && avail <= OS_RESERVE {
-            bail!(
-                "only {:.1} GB available; need more than the {:.0} GB OS reserve",
-                avail as f64 / 1e9,
-                OS_RESERVE as f64 / 1e9
-            );
-        }
-        Ok(Self {
-            model,
-            bench,
-            direct_vmm_dma,
-            trace,
-            prompt,
-            cache_policy,
-            two_q,
-            checksum_x: false,
-            mode: Mode::default(),
-            max_mem,
-            attn,
-        })
-    }
-
-    /// Reject the flag combinations the engine cannot honour. Called by `main` AFTER
-    /// `mode` is set (which `discover` cannot see).
-    ///
-    /// Currently vacuous: its only subject was `top-m`, whose two hard errors (no hybrid
-    /// tier rule; incompatible with the v2 trace prefix invariant) died with it on
-    /// 2026-07-30. Kept as the seam, because the NEXT non-output-neutral option should fail
-    /// loudly here rather than fall back quietly — a fallback attributes one mechanism's
-    /// behaviour to another in exactly the measurement trying to price it.
-    pub fn validate(&self) -> Result<()> {
-        Ok(())
-    }
-
     /// Reject, AT STARTUP, the configurations whose kernels the selected backend does not
     /// have. Nothing to reject on `rocm`, which is the reference backend.
     ///
@@ -197,14 +167,16 @@ impl Config {
     /// information, an order of magnitude more expensive to receive. See docs/investigations/vulkan-port.md,
     /// "Kernel inventory — port 16 of 29".
     ///
-    /// SEPARATE from [`Config::validate`], and called separately by `main`, deliberately.
-    /// `validate` polices flag COMBINATIONS — a property of the configuration, the same on
-    /// every machine — and its tests assert exactly that. Folding a build-time capability
-    /// gate into it would make those tests pass or fail depending on which feature the
-    /// suite was compiled with, and the first symptom was `top_m_in_hybrid_mode_fails_loudly`
-    /// failing under `--features vulkan` on the wrong error entirely. Two questions, two
-    /// functions. `main` asks both, next to each other, plus the `--moe-gain` gate that has
-    /// no `Config` field to hang off.
+    /// The ONLY startup gate that reads the build's features, and it is kept that way on
+    /// purpose. A sibling `validate` policed flag COMBINATIONS — a property of the
+    /// configuration, the same on every machine — until 2026-08-01, when it was deleted for
+    /// having had an `Ok(())` body since `top-m` was retired. It was ever separate because
+    /// folding a build-time capability gate into it made its tests pass or fail depending on
+    /// which feature the suite was compiled with; the symptom was
+    /// `top_m_in_hybrid_mode_fails_loudly` failing under `--features vulkan` on the wrong
+    /// error entirely. Any future combination gate belongs in its own function for the same
+    /// reason, not in here. `main` also asks the `--moe-gain` gate, which has no `Config`
+    /// field to hang off.
     #[cfg(feature = "vulkan")]
     pub fn validate_backend(&self) -> Result<()> {
         use crate::attn::AttnMode;
@@ -244,12 +216,11 @@ impl fmt::Display for Config {
         const GIB: f64 = (1u64 << 30) as f64;
         write!(
             f,
-            "model={} bench={:?} mode={} attn={:?} direct_vmm_dma={} cache_policy={} 2q_kin={}% 2q_kout={}% trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={}",
+            "model={} bench={:?} mode={} attn={:?} cache_policy={} 2q_kin={}% 2q_kout={}% trace={:?} prompt={:?} os_reserve={:.0}GiB max_mem={}",
             self.model,
             self.bench,
             self.mode,
             self.attn,
-            self.direct_vmm_dma,
             self.cache_policy,
             self.two_q.kin_pct(),
             self.two_q.kout_pct(),
@@ -269,39 +240,18 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
     use super::*;
 
-    fn cfg(policy: &str, mode: Mode, trace: Option<&str>) -> Config {
+    fn cfg(mode: Mode) -> Config {
         Config {
             model: "/nonexistent".into(),
             bench: Some(1),
-            direct_vmm_dma: false,
-            trace: trace.map(String::from),
+            trace: None,
             prompt: None,
-            cache_policy: policy.into(),
+            cache_policy: "lru".into(),
             two_q: crate::memory::cache::TwoQSplit::default(),
             checksum_x: false,
             mode,
             max_mem: None,
             attn: crate::attn::AttnMode::Dense,
-        }
-    }
-
-    /// `validate` is a no-op for every policy that ships: none of them is constrained by
-    /// mode or by `--trace`.
-    ///
-    /// Two truncated doc fragments sat above this one until 2026-08-01, describing tests
-    /// that no longer exist — one on `top-m` refusing `--mode hybrid`, one on `top-m`
-    /// substitution versus the v2 trace. They were left behind when `top-m` was retired and
-    /// its tests went with it, and both broke off mid-sentence, so what survived was
-    /// unreadable as well as untrue. The constraints they described are recorded properly
-    /// in `docs/investigations/cache-conditional-routing.md`; the third fragment, which
-    /// began "...and none of it touches the other policies", is the sentence above, now
-    /// finished.
-    #[test]
-    fn the_other_policies_are_unconstrained() {
-        for p in ["lru", "2q", "arc"] {
-            for m in [Mode::Int3Vq, Mode::Int4, Mode::Hybrid] {
-                cfg(p, m, Some("/tmp/t")).validate().expect("{p} must stay unconstrained");
-            }
         }
     }
 
@@ -318,20 +268,9 @@ mod tests {
     /// this asserts nothing; on `vulkan` it is the whole point.
     #[test]
     fn the_default_mode_passes_the_backend_gate() {
-        cfg("lru", Mode::default(), None)
+        cfg(Mode::default())
             .validate_backend()
             .expect("the default --mode must be one this build's backend can run");
-    }
-
-    /// `validate` must NOT consult the backend. The two above and the one below are the
-    /// reason: these assertions hold on every build, and they only do because the
-    /// capability gate is a separate function. Wire `validate_backend` back into `validate`
-    /// and this test goes red under `--features vulkan` (`--mode int4` would be refused for
-    /// the wrong reason), which is the regression it exists to catch.
-    #[test]
-    fn validate_is_backend_independent() {
-        cfg("lru", Mode::Int4, None).validate().expect("int4 is a valid CONFIGURATION");
-        cfg("lru", Mode::Hybrid, None).validate().expect("hybrid is a valid CONFIGURATION");
     }
 
     /// The Vulkan capability gate: int3-vq + dense/streaming pass; int4, hybrid, dsa and
@@ -342,7 +281,7 @@ mod tests {
     fn vulkan_refuses_the_unported_modes() {
         use crate::attn::AttnMode;
         let with_attn = |m: Mode, a: AttnMode| {
-            let mut c = cfg("lru", m, None);
+            let mut c = cfg(m);
             c.attn = a;
             c
         };

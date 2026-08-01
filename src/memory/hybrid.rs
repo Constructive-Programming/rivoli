@@ -539,7 +539,7 @@ mod tests {
         assert!(core_resident >= 3, "frequent core evaporated: {core_resident}/5 resident");
     }
 
-    // Mirrors the pin's submit_spine BATCH protocol (get()+protect() every hit, THEN
+    // Mirrors the pin's submit_layer BATCH protocol (get()+protect() every hit, THEN
     // admit() every miss). A miss's eviction must never drop a key touched earlier in
     // the SAME batch, else the pin can't resolve its slot ("expert not resident after
     // alloc"). The other tests drive keys one-at-a-time, so they never hit this.

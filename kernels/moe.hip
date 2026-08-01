@@ -168,18 +168,6 @@ extern "C" __global__ void moe_acc_drain(
     x[o] += gain * (float)((double)t / (double)MOE_ACC_SCALE);
 }
 
-// out[o] = Σ_e partial[e][o], e ASCENDING. OFF THE DECODE PATH since the fixed-point
-// accumulator replaced the partial slab — kept as the f32 REFERENCE the oracle tests
-// pin against (and as the shape `tests/vk.rs` uses to probe cross-queue visibility).
-extern "C" __global__ void moe_reduce(
-    const float* __restrict__ partial, int e_count, int hidden, float* __restrict__ out) {
-    int o = blockIdx.x * blockDim.x + threadIdx.x;
-    if (o >= hidden) return;
-    float acc = 0.0f;
-    for (int e = 0; e < e_count; ++e) acc += partial[(size_t)e * hidden + o];
-    out[o] = acc;
-}
-
 // --- Streaming-pipeline launchers: gate/up + down for an ABSOLUTE expert range on
 //     a caller-owned stream (so load DMA and this compute overlap on the GPU), and
 //     a stream-scoped reduce. The pipeline currently launches ONE expert per range
@@ -233,20 +221,11 @@ extern "C" int rivoli_moe_acc_drain_s(float* x, unsigned long long* acc, int n, 
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-extern "C" int rivoli_moe_reduce_s(const float* partial, int E, int hidden, float* out, void* stream) {
-    if (hidden <= 0 || E <= 0) return 1001;
-    hipGetLastError();
-    hipLaunchKernelGGL(moe_reduce, dim3((hidden + 255) / 256), dim3(256), 0, (hipStream_t)stream,
-                       partial, E, hidden, out);
-    hipError_t e = hipGetLastError();
-    return e == hipSuccess ? 0 : -(int)e;
-}
-
 // ── int4 MoE (group-scaled "warm expert" format): same two-pass shape as the VQ
 //    path, decoding via dot_i4_wave with one f32 scale per I4_GROUP weights applied
 //    INSIDE the dot. One descriptor per expert (six device pointers), absolute
 //    [e_start,e_count) range on a stream, so it plugs into the same expert-stream +
-//    moe_reduce as VQ.
+//    moe_acc_drain as VQ.
 struct ExpertDescI4 {
     const unsigned char* gate_packed;  // [inter · (hidden+1)/2]
     const float*         gate_scale;   // [inter · i4_ng(hidden)]

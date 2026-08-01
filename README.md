@@ -35,7 +35,8 @@ now the best-QUALITY mode in the engine (PPL 5.120 against int3-vq's 5.275) whil
 the slowest — its slot is 31% larger, so the same budget holds fewer experts. Rank quality
 on `docs/investigations/int4-scales.md` §10 and `docs/measurement/benchmarks.md`, not on tok/s here.
 
-Two caveats on that table. `top-m` holds the top four slots (3.10-3.22) but substitutes
+Two caveats on that table. **`top-m` has since been RETIRED and removed from the engine**,
+so its rows are history, not a policy you can select. It held the top four slots (3.10-3.22) but substituted
 ~5.5% of experts away from the true top-K, so its 85-86% hit rates are not comparable.
 And `int4` lost two cells to intermittent `NaN/Inf` logits — non-reproducing, no
 predictive combination, `int3-vq` and `hybrid` 28/28 clean, not root-caused.
@@ -74,7 +75,7 @@ fp8-e4m3 latent + f32 block scales + bf16 roped key, grown on device.
 ## Run modes
 
 `--mode int3-vq | int4 | hybrid` (default **hybrid**) picks the routed-expert
-format; `--cache-policy lru | 2q | arc | top-m` (default **2q**) picks the pool eviction
+format; `--cache-policy lru | 2q | arc` (default **2q**) picks the pool eviction
 policy. Hybrid keeps the frequently-reused ("hot") experts int4 for its ~1.8×
 faster compute and streams the rest as small cheap int3-vq slots, in one
 byte-arena pool whose hot/cold split floats with the workload. **[docs/reference/modes.md](docs/reference/modes.md)**
@@ -102,7 +103,7 @@ feature to rebuild with, because a rivoli that cannot decode should say so rathe
 fail to link.
 
 Optional features: `otlp` (export the decode as OTLP traces + metrics, opt-in at runtime
-via `OTEL_EXPORTER_OTLP_ENDPOINT`; set `RIVOLI_SPANS` to also emit a per-token/per-layer
+via `OTEL_EXPORTER_OTLP_ENDPOINT`; pass `--spans <BUDGET>` to also emit a per-token/per-layer
 span timeline — see [docs/measurement/traces.md](docs/measurement/traces.md)); `trace` (expensive correctness probes
 `--checksum-x`/`XSUM` + fine-grained per-op timing). The cheap per-token PROFILE
 summary is always on, no feature needed.
@@ -137,8 +138,7 @@ cargo run --release --features rocm -- <model-dir> -bench 256 --mode hybrid --ma
 ```
 
 Useful flags: `--max-mem <GiB>` (device budget, literal; default `free − 16 GiB`),
-`--direct-vmm-dma` (raw DMA over the default pinned bounce), `--attn
-auto|dense|dsa|streaming|misa`, `--trace <path>` (dump the routed-expert access
+`--attn auto|dense|dsa|streaming|misa`, `--trace <path>` (dump the routed-expert access
 trace for the offline `replay` sim), `--no-mtp` (turn off speculative decode, which is on by
 default whenever the artifact carries the MTP head — **every mode carries one** since
 2026-07-31, though an artifact converted before then needs `bin/fp8_to_i4` re-run to emit

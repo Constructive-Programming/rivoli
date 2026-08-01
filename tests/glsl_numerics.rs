@@ -294,37 +294,32 @@ fn transcriptions_still_match_the_glsl() {
 /// version keyed on `glsl_` and matched the test functions too, reporting
 /// `glsl_f2e4m3_matches_math_rs` as an unlocked transcription. A convention has to be
 /// unambiguous before it can be mechanically checked.
+///
+/// Counting is enough, and `include_str!` reads this file at COMPILE time — the previous
+/// version ran a 30-line runtime scan that parsed each name back out only to look it up in
+/// `LOCKED`. The count fails on exactly the case that matters, a transcription added
+/// without its entry, because the two totals diverge. Note that asserting `LOCKED.len()`
+/// against a literal would NOT: an unlisted transcription leaves the list's length alone.
 #[test]
 fn every_transcription_is_locked() {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/glsl_numerics.rs");
-    let me = std::fs::read_to_string(path).expect("read this file");
-    let mut found = Vec::new();
-    for line in me.lines() {
-        let line = line.trim_start();
-        if let Some(name) = line
-            .strip_prefix("fn transcribed_")
-            .and_then(|rest| rest.split('(').next())
-        {
-            found.push(name.to_string());
-        }
-    }
+    let n = include_str!("glsl_numerics.rs")
+        .matches("\nfn transcribed_")
+        .count();
     assert!(
-        !found.is_empty(),
-        "no `fn transcribed_*` found — the naming convention this check keys on has \
-         changed, and it has been passing without examining anything"
+        n > 0,
+        "no `fn transcribed_*` found — the naming convention this keys on has changed, \
+         and it has been passing without examining anything"
     );
-    for name in &found {
-        assert!(
-            LOCKED.iter().any(|(locked, _)| locked == name),
-            "\n\n`transcribed_{name}` is here but is NOT in LOCKED.\n\
-             It is therefore diffed against math.rs but not pinned to the shader, so \
-             kernels/vk/common.glsl can drift away from it and this file will keep \
-             passing while testing a function the shader no longer has.\n\
-             Add (\"{name}\", \"<its GLSL signature up to the opening brace>\") to \
-             LOCKED and update GLSL_NUMERICS_HASH.\n"
-        );
-    }
-    println!("transcriptions locked: {found:?}");
+    assert_eq!(
+        n,
+        LOCKED.len(),
+        "{n} `fn transcribed_*` here but {} LOCKED entries. A transcription with no entry \
+         is diffed against math.rs but NOT pinned to the shader, so \
+         kernels/vk/common.glsl can drift away from it while this file keeps passing. \
+         Add (\"<name>\", \"<its GLSL signature up to the opening brace>\") to LOCKED and \
+         update GLSL_NUMERICS_HASH.",
+        LOCKED.len()
+    );
 }
 
 
