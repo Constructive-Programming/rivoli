@@ -42,7 +42,24 @@ agrees. If you change a verdict, change both; the test will tell you which one y
 cargo build --release --features rocm        # or --features vulkan; NEVER both
 cargo test  --release --features rocm        # 100 tests
 cargo clippy --release --features rocm --all-targets
+# Before you claim a change compiles, ALSO run the union — see below.
+cargo clippy --release --features rocm,otlp,teacher-forcing,pred-probe,trace --all-targets
 ```
+
+**`--features rocm` alone does not compile `mod otlp`, `src/eval.rs`, or the pred-probe and
+trace paths.** That blind spot is not hypothetical: `otlp` sat broken for weeks on an
+`E0609` — a `ProfileSummary` field renamed out from under it — while every prescribed
+command passed, because nothing built it. There is no CI, so a feature-gated module is
+checked exactly as often as someone remembers to name its feature. Add the union run to any
+change that touches `telemetry.rs`, `eval.rs`, `gpu.rs` or a `ProfileSummary` field.
+
+**Duplication is a build error.** `build.rs` runs `jscpd --min-tokens 15` over `src/`,
+`tests/` and itself on every build and panics on any clone; `.jscpd.json` carries no
+`threshold`, so there is no budget. Seven regions are exempt via `jscpd:ignore-start`, each
+carrying its argument in place — the two backends' ABI walls, `math.rs`'s frozen
+`route_into_pre` oracle, and `glsl_numerics.rs`'s transliterations. Being a verbatim copy
+is the POINT in all three; everywhere else, factor it. jscpd is skipped with a warning if
+`npx` is absent, so the crate still builds without Node.
 
 `src/` is grouped by subsystem — `artifact/ memory/ fetch/ backend/` plus `gpu math attn
 indexer telemetry watchdog eval` at top level. See `docs/reference/architecture.md` §11.
