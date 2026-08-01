@@ -55,6 +55,12 @@ clap = { version = "4", default-features = false, features = [
 # Teacher-forced scoring (`--ppl`). Off by default: it is a quality INSTRUMENT, not
 # part of decoding, and `src/eval.rs` is the whole of it (see lib.rs).
 teacher-forcing = []
+# Pre-attention router recall (`--pred-probe`), the cross-layer prefetch feasibility
+# measurement — docs/CACHE_PILOT.md "Feasibility, settled". A diagnostic, not a decode
+# path: it adds an rmsnorm, a gemv and a BLOCKING D2H per MoE layer, which is roughly the
+# per-layer cost `--hint-k` was retired for. Gated rather than merely defaulted off so the
+# shipped binary cannot carry it, and so nobody reads a tok/s off a probe build.
+pred-probe = []
 default = []
 # build.rs compiles kernels/*.hip via hipcc; pulls in the async streaming stack.
 rocm = ["dep:tokio", "dep:futures-util", "dep:io-uring"]

@@ -575,6 +575,11 @@ module root (`src/<group>.rs`) over a directory, so the tree mirrors the section
 - **`eval`** — teacher-forced scoring (`--ppl`), behind `--features teacher-forcing`. An
   instrument, not an engine feature: nothing in a decode reaches it, so the module boundary
   and the feature boundary are the same line and cannot drift apart.
+- **`--pred-probe`**, behind `--features pred-probe`, is the same idea without its own
+  module — it has to run inside the layer loop, so it is `#[cfg]` at five sites in `gpu.rs`
+  rather than a boundary. Measures the pre-attention router's recall (§3's prefetch
+  question). The flag is what a `benchmarks.md` entry can record; the feature is what keeps
+  a blocking per-layer D2H out of a shipped binary.
 - `kernels/*.hip` — moe, mla, attn, linalg, indexer, fwd, async, vmm (HIP/rocm).
   `kernels/vk/*.comp` → SPIR-V via the `build.rs` vulkan arm (the second backend).
 - `src/bin/` — `convert`, `fp8_to_i4`, `add_indexer`, `i4_audit`, `ppl`, `replay`. (There

@@ -594,7 +594,8 @@ Grounded in the measured kernel profile.
 >
 > **The duty cycle looked open for a day; it is not.** The drive idles ~35% of every token,
 > and filling it needs the routing known before that layer's attention. The predictor works
-> — 82.7% recall on the misses (`RIVOLI_PRED_PROBE=1`) — but the window is **1.13 ms against
+> — 82.7% recall on the misses (`--features pred-probe`, `--pred-probe`) — but the window
+> is **1.13 ms against
 > a ~2 ms expert read**, so it fits 0.74 of one read where a layer needs 2.9, and the 23%
 > of a top-8 prefetch that goes unused costs +67 ms/token against a ≤85 ms/token ceiling.
 > Closed 2026-08-01; full arithmetic in `CACHE_PILOT.md` §"Feasibility, settled".

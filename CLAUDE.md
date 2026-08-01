@@ -45,6 +45,15 @@ indexer telemetry watchdog eval` at top level. See `docs/ARCHITECTURE.md` §11.
 default: it is a quality instrument, not part of decoding. `bin/ppl`, which does the paired
 statistics over its `.nll` output, needs no feature — it never touches the engine.
 
+`--features pred-probe` adds `--pred-probe` (pre-attention router recall, the cross-layer
+prefetch feasibility question; `docs/CACHE_PILOT.md` §"Feasibility, settled"). Same rule and
+the same reason: it puts a blocking D2H on the per-layer path, so it measures recall and a
+tok/s from a probe build means nothing.
+
+**Instruments go behind a feature AND a flag, never an env var.** Both of the above did
+briefly read one, and an env var is invisible to `--help`, absent from the recorded command
+line in `benchmarks.md`, and silently active in a build that looks stock.
+
 A featureless build compiles to a refusal stub — that is deliberate, not breakage.
 
 ## Measurement discipline — these have all drawn blood

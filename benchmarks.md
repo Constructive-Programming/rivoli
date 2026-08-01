@@ -1911,7 +1911,8 @@ bookkeeping: a host release retires a wait enqueued against a value no stream wi
 
 ### Cross-layer prefetch: the predictor works, the window does not — 2026-08-01
 
-`RIVOLI_PRED_PROBE=1`, `--mode int3-vq --attn dense --cache-policy 2q --max-mem 100
+`--features rocm,pred-probe`, then `--pred-probe --mode int3-vq --attn dense
+--cache-policy 2q --max-mem 100
 --no-mtp -bench 64`. `--no-mtp` deliberately: with speculation on, the union carries two
 routers' picks and a row-0 prediction would be scored against a denominator it never saw.
 

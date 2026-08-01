@@ -10,7 +10,7 @@ and are the reason it went — read this before proposing cross-layer prefetch a
 > the drive is saturated. Both of those were the stated reasons and both are false:
 >
 > - The pre-attention router predicts a layer's own misses at **82.7% recall**
->   (`RIVOLI_PRED_PROBE=1`, measured — better than LOOKA's 77.2% at L+1).
+>   (`--features pred-probe`, `--pred-probe`; measured — better than LOOKA's 77.2% at L+1).
 > - The drive is **idle 35% of every token** (`ARCHITECTURE.md` §3), so there is spare
 >   bandwidth. `b372cd4` prefetched into the *busy* window, which is why it saw nothing.
 >
@@ -148,7 +148,7 @@ earlier bytes.
 > is missing — strictly better information than that implementation had (it predicted from
 > L's residual *before* L's MoE contribution). See "Feasibility" below.
 
-## Feasibility, settled — MEASURED 2026-08-01 (`RIVOLI_PRED_PROBE=1`)
+## Feasibility, settled — MEASURED 2026-08-01 (`--pred-probe`)
 
 The predictor is **not** the problem. Run at the top of each MoE layer on `post_ln(x)` — the
 layer input, before attention adds into it — against `--mode int3-vq --attn dense --max-mem
@@ -204,7 +204,8 @@ It also says what would change the answer, which none of the plumbing work does:
 expert** (the window fits a larger fraction of one) or a **longer window** (more compute per
 layer to hide behind). Both are the same lever as PERF.md #2, and neither is prefetch.
 
-The probe stays in `gpu.rs` behind `RIVOLI_PRED_PROBE=1`, off by default. It is ~60 lines
+The probe stays in `gpu.rs` behind the `pred-probe` FEATURE plus its `--pred-probe` flag,
+so a shipped binary cannot carry it. It is ~60 lines
 and it is the evidence; re-run it before re-opening this.
 
 The evidence that this is the real mechanism is a natural experiment, not a claim.

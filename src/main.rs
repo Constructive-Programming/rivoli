@@ -121,6 +121,19 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     ppl_out: Option<String>,
 
+    /// Measure whether a layer's experts can be predicted BEFORE its attention runs — the
+    /// feasibility question under cross-layer prefetch. Reports recall against the top-k and
+    /// against the MISSES (the only reads a prefetch could save), plus what it would spend.
+    ///
+    /// Costs an rmsnorm, a gemv and a blocking D2H per MoE layer, so it measures RECALL and
+    /// nothing else — do not read a tok/s off a probe run. Pair it with `--no-mtp`: with
+    /// speculation on, the union carries two routers' picks and a row-0 prediction is scored
+    /// against a denominator it never saw. Answer: docs/CACHE_PILOT.md, "Feasibility,
+    /// settled".
+    #[cfg(feature = "pred-probe")]
+    #[arg(long)]
+    pred_probe: bool,
+
     /// Scale the whole MoE branch by `g` before the residual add. An EXPERIMENT knob, not
     /// a tuning parameter (kernels/fwd.hip::vaxpy). The band is generous but finite: a
     /// sweep that silently ran at 0 or a negative gain would produce a confidently
@@ -286,6 +299,8 @@ fn main() -> Result<()> {
     // Bound before `a` is partially moved into `discover` below.
     #[cfg(feature = "teacher-forcing")]
     let (a_ppl, a_ppl_out) = (a.ppl.clone(), a.ppl_out.clone());
+    #[cfg(feature = "pred-probe")]
+    let a_pred_probe = a.pred_probe;
     let a_moe_gain = a.moe_gain;
     let a_raw_prompt = a.raw_prompt;
     let a_dump_ids = a.dump_ids.clone();
@@ -531,6 +546,8 @@ fn main() -> Result<()> {
         let mut engine = rivoli::gpu::GpuEngine::new(pin, &mc, max_ctx, cfg.attn.clone())?;
         #[cfg(feature = "trace")]
         engine.set_checksum_x(cfg.checksum_x);
+        #[cfg(feature = "pred-probe")]
+        engine.set_pred_probe(a_pred_probe);
         engine.set_moe_gain(a_moe_gain);
         // Wedge watchdog: a hung GPU join can't be caught inside the decode loop, so
         // a background thread aborts the process if no token lands for `wd_secs`.
