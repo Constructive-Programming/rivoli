@@ -13,6 +13,16 @@ verdict: Append-only measurements. Never read whole — grep for the config. The
 > - **Quality ladder (current):** int4 **5.120** > hybrid **5.189** > int3-vq **5.275**.
 >   The mode table immediately below predates the `.i4` rebuild and its int4/hybrid rows do
 >   NOT describe the current artifact.
+> - **THE PROMPT FRAMING CHANGED ON 2026-08-01, so free-running text is not comparable
+>   across that date.** `encode_chat` emitted GLM-4's `<|role|>\n{content}` and ended the
+>   prompt at `<|assistant|>\n`; this checkpoint's `chat_template.jinja` has **no separator
+>   after the role token** and ends at `<|assistant|><think></think>`. Every `-bench` run
+>   above was therefore one token off-template per turn and carried no thinking prefill.
+>   Throughput rows are unaffected in kind (the work per token did not change) but their
+>   *text*, acceptance rates and hit rates all move, because the model is being asked a
+>   differently-tokenized question. Re-measure before comparing a new run to an old one.
+>   `--ppl` numbers are NOT affected: it scores a corpus through `encode`, never the chat
+>   framing. See `tests/artifact.rs::chat_framing_matches_the_checkpoint_template`.
 > - **Throughput:** ~2.6–2.8 tok/s int3-vq, ~2.7 hybrid, ~2.1 int4 (larger slot → fewer
 >   resident experts). Fetch is 96–98% hidden; the engine is MoE-compute-bound.
 > - **Speculative decode:** **1.108× gated** (`--mtp-min-conf 0.8`, the default); 0.93–0.95×

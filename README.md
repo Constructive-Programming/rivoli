@@ -184,17 +184,54 @@ models:
     healthCheckTimeout: 300
 ```
 
-Three things it deliberately does not do, so nobody debugs their absence:
+This is an inference backend, not a chat product — Open WebUI and the Hermes agent own the
+conversation surface, and everything here exists to be called by them.
+
+### Thinking
+
+The checkpoint is a **thinking model**. Its template ends the prompt at an open `<think>`,
+and the model fills that with reasoning before it answers; closing it immediately
+(`<think></think>`) is the off switch. There is a `/nothink` token in the vocabulary, but
+the template never emits it and neither does rivoli.
+
+**rivoli defaults thinking OFF** — the opposite of the template — because at ~2.7 tok/s a
+reasoning block is tens of seconds of silence before the first word, and most OpenAI clients
+have no way to turn it off once it is on. Turn it back on per server with `--think`, or per
+request:
+
+```jsonc
+{"messages": [...], "enable_thinking": true}          // explicit, wins over --think
+{"messages": [...], "reasoning_effort": "high"}       // implies thinking; "none" implies off
+```
+
+Reasoning comes back in **`reasoning_content`**, never mixed into `content` — the field
+Open WebUI already renders as a collapsible section. Streaming sends `reasoning_content`
+deltas and then `content` deltas. If the token budget runs out mid-reasoning you get
+reasoning and an empty `content`, which is the honest report: there was no answer yet.
+
+Only `high` maps to `Reasoning Effort: High`; every other value maps to `Max`. That is the
+template's own `capitalize` behaviour, not a shortcut.
+
+### Deliberately absent, so nobody debugs it
 
 - **No sampling.** `temperature` and `top_p` are accepted and **ignored** — the engine
   decodes greedy argmax, which is what every number in `benchmarks.md` is measured against.
   Output is deterministic no matter what the client asks for. One warning per process says so.
+- **No tool calling.** The checkpoint defines it (`<tool_call>`/`<arg_key>`/`<|observation|>`),
+  so this is an omission rather than an impossibility — but a request carrying `tools`, or a
+  `tool`-role message, gets a **400** instead of being answered in prose, because a client
+  that asked for a tool call and got an essay waits forever. Orchestration belongs in the
+  agent above.
 - **No `/v1/completions`.** A raw, unframed prompt leaves the model outside an assistant
   turn where its EOS ids are unreachable, so it runs to the token limit and then loops —
   the failure mode that invalidated every benchmark cell above 2048 tokens (see the
   retraction above). That endpoint would serve it by construction.
 - **No paging.** `--ctx` allocates the KV slabs once, at startup (~51 KB/token on top of
   the expert pool); a conversation that does not fit is a 400, never a silent truncation.
+
+An image part in a `content` array becomes the template's own "unable to process this image"
+reminder rather than being dropped — a silent drop makes the model describe pictures it
+never received.
 
 The per-request log carries the same degeneration check `-bench` does — a looped response
 is a broken one, and it is *faster*, so server mode is not allowed to be the path that

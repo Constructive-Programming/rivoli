@@ -156,3 +156,54 @@ fn i4_bytes_are_what_the_checkpoint_quantizes_to() {
     }
     eprintln!("i4 bytes OK: L{layer:02} experts 0 and {ne} (shared) are bit-exact vs {}", prov.src);
 }
+
+/// The chat framing must match the CHECKPOINT's `chat_template.jinja` byte for byte.
+/// `Tokenizer::encode_chat_turns` hand-ports that template — there is no Jinja engine here —
+/// and the converted artifact does **not** carry the template, so nothing but this test
+/// couples the two. It has drifted once already: the framing was GLM-4's `<|role|>\n{...}`
+/// with no thinking prefill until 2026-08-01, one token off per turn, which is why the
+/// expected strings below are written out in full rather than built from the code's own
+/// pieces. Source of truth: `chat_template.jinja` in `manifest.json`'s `i4_source.src`.
+#[test]
+fn chat_framing_matches_the_checkpoint_template() {
+    use rivoli::artifact::tokenizer::{ChatOpts, Tokenizer};
+    let Ok(dir) = std::env::var("RIVOLI_ARTIFACT") else {
+        eprintln!("skip: set RIVOLI_ARTIFACT to an artifact dir");
+        return;
+    };
+    let tok = Tokenizer::load(&dir).unwrap();
+    // Decoding with specials rendered is what makes this readable as the template's output.
+    let render = |turns: &[(&str, &str)], o: &ChatOpts| {
+        tok.decode_all(&tok.encode_chat_turns(turns, o).unwrap()).unwrap()
+    };
+
+    // enable_thinking=false: no Reasoning Effort turn, and the prompt closes <think> at once.
+    assert_eq!(
+        render(&[("user", "hi")], &ChatOpts::default()),
+        "[gMASK]<sop><|user|>hi<|assistant|><think></think>"
+    );
+    // The template's own default: <think> left OPEN, preceded by the effort system turn.
+    assert_eq!(
+        render(&[("user", "hi")], &ChatOpts { thinking: true, reasoning_effort: None }),
+        "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hi<|assistant|><think>"
+    );
+    // Only "high" is High. The template capitalizes its default for everything else, so
+    // "low" and "medium" render Max — that is the template's behaviour, not a shortcut.
+    assert_eq!(
+        render(&[("user", "hi")], &ChatOpts { thinking: true, reasoning_effort: Some("high") }),
+        "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>hi<|assistant|><think>"
+    );
+    assert_eq!(
+        render(&[("user", "hi")], &ChatOpts { thinking: true, reasoning_effort: Some("low") }),
+        "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hi<|assistant|><think>"
+    );
+    // Multi-turn: NO separator after any role token, and history's reasoning is cleared.
+    assert_eq!(
+        render(
+            &[("system", "S"), ("user", "a"), ("assistant", "b"), ("user", "c")],
+            &ChatOpts::default()
+        ),
+        "[gMASK]<sop><|system|>S<|user|>a<|assistant|><think></think>b<|user|>c\
+         <|assistant|><think></think>"
+    );
+}

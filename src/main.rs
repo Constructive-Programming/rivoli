@@ -64,6 +64,17 @@ struct Args {
     #[arg(long, value_name = "N", default_value_t = 8192, value_parser = clap::value_parser!(usize))]
     ctx: usize,
 
+    /// `--port`: reason before answering, unless the request says otherwise.
+    ///
+    /// The checkpoint is a thinking model — its template ends the prompt at an OPEN
+    /// `<think>` by default, and the model fills it before answering. rivoli defaults the
+    /// other way: at ~2.7 tok/s a reasoning block is tens of seconds of silence, and most
+    /// OpenAI clients have no way to turn it off once it is on. A request's
+    /// `enable_thinking` (or `reasoning_effort`) overrides this in either direction, and
+    /// the reasoning comes back in `reasoning_content`, never mixed into `content`.
+    #[arg(long)]
+    think: bool,
+
     /// Routed-expert format. Default: hybrid on rocm, int3-vq on vulkan (whose int4
     /// kernels are not ported) — see docs/reference/modes.md and `config::Mode`.
     #[arg(long, default_value_t, value_parser = rivoli::artifact::config::Mode::parse)]
@@ -331,6 +342,7 @@ fn main() -> Result<()> {
     let (a_2q_kin, a_2q_kout) = (a.two_q_kin, a.two_q_kout);
     let (a_sinks, a_window, a_misa_heads) = (a.sinks, a.window, a.misa_heads as usize);
     let a_no_mtp = a.no_mtp;
+    let a_think = a.think;
     #[cfg(feature = "trace")]
     let checksum_x = a.checksum_x;
     #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
@@ -645,6 +657,7 @@ fn main() -> Result<()> {
                         .map_or_else(|| "rivoli".into(), |n| n.to_string_lossy().into_owned()),
                     mtp,
                     mtp_min_conf: a.mtp_min_conf,
+                    think: a_think,
                 },
             );
         }

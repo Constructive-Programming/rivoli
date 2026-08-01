@@ -9,11 +9,22 @@
 //! one request per connection — which removes the keep-alive state machine entirely and is
 //! what a reverse proxy in front of us opens anyway.
 //!
+//! **This is an inference backend, not a chat product.** Open WebUI and the Hermes agent
+//! already own the conversation surface; everything here exists to be called BY them. That
+//! is why thinking is exposed as the protocol fields those clients already send and read
+//! (`enable_thinking`, `reasoning_content`) rather than as anything rendered, and why tool
+//! calling is refused outright below instead of half-built.
+//!
 //! Deliberately absent, so nobody goes looking:
 //! - **Sampling.** The engine is greedy argmax and every number in `benchmarks.md` is
 //!   measured that way. `temperature`/`top_p` are accepted and IGNORED, with one warning
 //!   per process — honouring them is not a server-side change, and dropping them silently
 //!   would leave a client believing its own determinism story.
+//! - **Tool calling.** The checkpoint's template does define it (`<tool_call>` /
+//!   `<arg_key>` / `<|observation|>`), so this is a real omission rather than an
+//!   impossibility — but a request carrying `tools` is refused with a 400 instead of being
+//!   answered in prose, because a client that asked for a tool call and got an essay waits
+//!   forever. Orchestration lives in the agent above us.
 //! - **`/v1/completions`.** A raw (unframed) prompt leaves the model outside an assistant
 //!   turn, where its EOS ids are unreachable and decode runs to the token limit every
 //!   time — see `Tokenizer::encode_chat`. That endpoint would serve the failure mode by
@@ -37,6 +48,11 @@ pub struct Opts {
     /// Speculative decode, already resolved against the artifact by `main`.
     pub mtp: bool,
     pub mtp_min_conf: f32,
+    /// `--think`: reason before answering unless the request says otherwise. Off by
+    /// default even though the checkpoint's template defaults it ON, because at ~2.7 tok/s
+    /// a reasoning block is tens of seconds of silence and most OpenAI clients cannot ask
+    /// for it to stop. A request's `enable_thinking` overrides this either way.
+    pub think: bool,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -97,19 +113,40 @@ fn read_req<R: BufRead>(r: &mut R) -> Result<Option<Req>> {
 }
 
 /// OpenAI `content` is either a string or an array of typed parts, and the chat UIs send
-/// both shapes within one conversation. Non-text parts (images) have nowhere to go in a
-/// text-only engine, so they are dropped rather than rendered as JSON into the prompt.
+/// both shapes within one conversation.
+///
+/// A non-text part becomes the template's own `<reminder>` sentence rather than being
+/// dropped. That is `visible_text()` in `chat_template.jinja` verbatim, and it is the
+/// difference between the model answering "the image shows..." about an image it never
+/// received and it saying it cannot see images — this engine is text-only, and a silent
+/// drop makes the model confabulate.
 fn content_text(c: Option<&Value>) -> String {
+    fn part(p: &Value) -> Option<String> {
+        if let Some(t) = p.as_str() {
+            return Some(t.to_string());
+        }
+        match p.get("type").and_then(Value::as_str)? {
+            "text" => p.get("text").and_then(Value::as_str).map(str::to_string),
+            ty => {
+                let media = ty.replace("_url", "").replace("input_", "");
+                Some(format!(
+                    "<reminder>You are unable to process this {media} because you don't have \
+                     multi-modal input ability. Try different methods.</reminder>"
+                ))
+            }
+        }
+    }
     match c {
         Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter_map(|p| p.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join(""),
+        Some(Value::Array(parts)) => parts.iter().filter_map(part).collect::<Vec<_>>().join(""),
         _ => String::new(),
     }
 }
+
+/// The roles the hand-ported template can frame. `tool` is absent on purpose: it only
+/// appears in a conversation that used `tools`, which `parse_ask` refuses, and framing it
+/// as a user turn would feed the model a tool result it has no protocol for.
+const ROLES: [&str; 4] = ["system", "developer", "user", "assistant"];
 
 fn messages_to_turns(body: &Value) -> Result<Vec<(String, String)>> {
     let msgs = body
@@ -117,13 +154,46 @@ fn messages_to_turns(body: &Value) -> Result<Vec<(String, String)>> {
         .and_then(Value::as_array)
         .context("`messages` must be an array")?;
     ensure!(!msgs.is_empty(), "`messages` is empty");
-    Ok(msgs
-        .iter()
-        .map(|m| {
+    msgs.iter()
+        .enumerate()
+        .map(|(i, m)| {
             let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
-            (role.to_string(), content_text(m.get("content")))
+            ensure!(
+                ROLES.contains(&role),
+                "messages[{i}].role is {role:?}; this server frames {ROLES:?} only\
+                 {}",
+                if role == "tool" {
+                    " — `tools` is not implemented, so a tool result cannot be answered"
+                } else {
+                    ""
+                }
+            );
+            // `developer` is OpenAI's newer name for a system message; the template has no
+            // such turn, so it frames as one.
+            let role = if role == "developer" { "system" } else { role };
+            Ok((role.to_string(), content_text(m.get("content"))))
         })
-        .collect())
+        .collect()
+}
+
+/// Split a generation into `(reasoning, content)`.
+///
+/// With thinking ON the prompt ends at an OPEN `<think>`, so the model emits its reasoning
+/// first and closes it — everything after `</think>` is the answer. With thinking off the
+/// prompt already closed it and no tags appear at all, which is why this needs to be told
+/// which mode it is in rather than guessing from the text.
+///
+/// A generation that hits the token budget mid-reasoning has no close, so it is all
+/// reasoning and no content. Reporting that honestly is the point: the alternative is
+/// presenting a half-finished train of thought as the answer.
+fn split_think(full: &str, thinking: bool) -> (&str, &str) {
+    if !thinking {
+        return ("", full);
+    }
+    match full.split_once("</think>") {
+        Some((reasoning, content)) => (reasoning, content.trim_start()),
+        None => (full, ""),
+    }
 }
 
 /// The new text a token added, given everything already sent — `None` when it added
@@ -152,7 +222,7 @@ pub use live::serve;
 
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
 mod live {
-    use super::{Opts, Req, delta, messages_to_turns, read_req};
+    use super::{Opts, Req, delta, messages_to_turns, read_req, split_think};
     use anyhow::{Context, Result};
     use serde_json::{Value, json};
     use std::io::{BufReader, Write};
@@ -261,6 +331,9 @@ mod live {
         ngen: usize,
         stream: bool,
         model: String,
+        /// Whether the prompt left `<think>` open, which is the only way to know how to
+        /// read the generation back — see `split_think`.
+        think: bool,
     }
 
     fn parse_ask(
@@ -269,12 +342,43 @@ mod live {
         opts: &Opts,
     ) -> Result<Ask> {
         let body: Value = serde_json::from_slice(body).context("body is not JSON")?;
+        // Refused, not ignored. The model CAN call tools — the template defines the whole
+        // `<tool_call><arg_key>` syntax — but nothing here renders the declarations or
+        // parses the calls back, so answering in prose would leave a client blocked on a
+        // tool call that is never coming. See the module doc.
+        if body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|t| !t.is_empty())
+        {
+            anyhow::bail!(
+                "`tools` is not implemented by this server. The checkpoint supports tool \
+                 calling, but rendering and parsing it is not built here — run the \
+                 orchestration in the agent above, or send the request without `tools`"
+            );
+        }
         let turns = messages_to_turns(&body)?;
+        // Thinking: the request wins, the server's `--think` is the default, and the
+        // checkpoint template's own default (on) is deliberately not inherited — see Opts.
+        // `reasoning_effort: "none"` is how OpenAI clients say "don't", so honour that too.
+        let effort = body.get("reasoning_effort").and_then(Value::as_str);
+        let think = match body.get("enable_thinking").and_then(Value::as_bool) {
+            Some(t) => t,
+            None => match effort {
+                Some("none") => false,
+                Some(_) => true,
+                None => opts.think,
+            },
+        };
         let prompt_ids = tok.encode_chat_turns(
             &turns
                 .iter()
                 .map(|(r, c)| (r.as_str(), c.as_str()))
                 .collect::<Vec<_>>(),
+            &crate::artifact::tokenizer::ChatOpts {
+                thinking: think,
+                reasoning_effort: effort,
+            },
         )?;
         // One slot beyond the prompt for the token the last forward produces; `forward`
         // refuses `pos >= max_ctx`, so this bound is the server's half of that contract.
@@ -307,6 +411,7 @@ mod live {
                 .unwrap_or(&opts.model_id)
                 .to_string(),
             prompt_ids,
+            think,
         })
     }
 
@@ -326,11 +431,12 @@ mod live {
             ngen,
             stream,
             model,
+            think,
         } = ask;
         let created = now_secs();
         let id = format!("chatcmpl-{created}");
         tracing::info!(
-            "chat: {} prompt tokens, up to {ngen} generated, stream={stream}",
+            "chat: {} prompt tokens, up to {ngen} generated, stream={stream}, thinking={think}",
             prompt_ids.len()
         );
 
@@ -343,21 +449,35 @@ mod live {
             // generation that arrives at ~3 tok/s, i.e. free — the alternative is an
             // incremental detokenizer, and `delta` documents why that is the fiddly one.
             // ponytail: prefix re-decode; revisit only if generations get long AND fast.
-            let (mut acc, mut sent, mut live) = (Vec::with_capacity(ngen), String::new(), true);
+            //
+            // Two channels, because `</think>` moves text from one to the other: the token
+            // that closes it can legitimately extend the reasoning AND start the content in
+            // the same step, so both are checked every time rather than switching once.
+            // `reasoning_content` is the field Open WebUI and the OpenAI-compatible
+            // ecosystem already read for a collapsible thinking section.
+            let mut acc = Vec::with_capacity(ngen);
+            let (mut sent_r, mut sent_c, mut live) = (String::new(), String::new(), true);
             let mut on_tok = |t: u32| {
                 acc.push(t);
                 let Ok(full) = tok.decode_all(&acc) else {
                     return true;
                 };
-                let Some(d) = delta(&sent, &full) else {
-                    return true;
-                };
-                let ev = chunk(&id, created, &model, json!({ "content": d }), None);
-                sent.push_str(d);
-                // A write failure IS the client hanging up. Stop the decode: the GPU is
-                // sole tenant, so finishing a generation nobody will read is time stolen
-                // from the next request.
-                live = sse(w, &ev).is_ok();
+                let (reasoning, content) = split_think(&full, think);
+                for (field, sent, target) in [
+                    ("reasoning_content", &mut sent_r, reasoning),
+                    ("content", &mut sent_c, content),
+                ] {
+                    let Some(d) = delta(sent, target) else { continue };
+                    let ev = chunk(&id, created, &model, json!({ field: d }), None);
+                    // A write failure IS the client hanging up. Stop the decode: the GPU is
+                    // sole tenant, so finishing a generation nobody will read is time stolen
+                    // from the next request.
+                    if sse(w, &ev).is_err() {
+                        live = false;
+                        break;
+                    }
+                    sent.push_str(d);
+                }
                 live
             };
             let out = engine.generate(
@@ -411,12 +531,19 @@ mod live {
         if stream {
             return Ok(()); // already sent, chunk by chunk
         }
+        let (reasoning, content) = split_think(&text, think);
+        let mut message = json!({"role": "assistant", "content": content});
+        // Only when there is some: a client that does not know the field should not have to
+        // filter an empty one out of every non-thinking response.
+        if !reasoning.is_empty() {
+            message["reasoning_content"] = json!(reasoning);
+        }
         send_json(
             w,
             200,
             &json!({"id": id, "object": "chat.completion", "created": created, "model": model,
                     "choices": [{"index": 0, "finish_reason": finish_reason(ids.len(), ngen),
-                                 "message": {"role": "assistant", "content": text}}],
+                                 "message": message}],
                     "usage": {"prompt_tokens": prompt_ids.len(), "completion_tokens": ids.len(),
                               "total_tokens": prompt_ids.len() + ids.len()}}),
         )
@@ -556,11 +683,18 @@ mod tests {
                                                       {"type":"text","text":" there"}]}]}"#,
         )
         .unwrap();
+        // The image becomes the template's own reminder rather than vanishing. Dropping it
+        // used to be the behaviour and it made the model describe images it never got.
         assert_eq!(
             messages_to_turns(&b).unwrap(),
             vec![
                 ("system".to_string(), "be terse".to_string()),
-                ("user".to_string(), "hi there".to_string()),
+                (
+                    "user".to_string(),
+                    "hi<reminder>You are unable to process this image because you don't have \
+                     multi-modal input ability. Try different methods.</reminder> there"
+                        .to_string()
+                ),
             ]
         );
     }
@@ -569,6 +703,37 @@ mod tests {
     fn no_messages_is_an_error_not_an_empty_prompt() {
         assert!(messages_to_turns(&json!({"messages": []})).is_err());
         assert!(messages_to_turns(&json!({"prompt": "hi"})).is_err());
+    }
+
+    #[test]
+    fn developer_is_a_system_turn_and_tool_is_refused() {
+        // OpenAI renamed `system` to `developer`; the template has only the one turn token.
+        assert_eq!(
+            messages_to_turns(&json!({"messages": [{"role": "developer", "content": "x"}]}))
+                .unwrap(),
+            vec![("system".to_string(), "x".to_string())]
+        );
+        // A tool RESULT cannot be framed when tool CALLS are refused — answering it as a
+        // user turn would feed the model a protocol it was not given.
+        let e = messages_to_turns(&json!({"messages": [{"role": "tool", "content": "42"}]}))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("tools"), "{e}");
+    }
+
+    #[test]
+    fn split_think_needs_to_be_told_which_mode_it_is_in() {
+        // Thinking off: the prompt already closed <think>, so nothing is reasoning. Guessing
+        // from the text would make a whole answer disappear into the reasoning channel.
+        assert_eq!(split_think("the sky is blue", false), ("", "the sky is blue"));
+        // Thinking on: the open <think> is in the PROMPT, so the generation starts inside it.
+        assert_eq!(
+            split_think("hmm, scattering</think>The sky is blue.", true),
+            ("hmm, scattering", "The sky is blue.")
+        );
+        // Budget ran out mid-reasoning — all reasoning, no answer, and say so rather than
+        // presenting a half-finished train of thought as the reply.
+        assert_eq!(split_think("hmm, scatter", true), ("hmm, scatter", ""));
     }
 
     #[test]

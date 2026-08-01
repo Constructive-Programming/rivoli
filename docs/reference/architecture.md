@@ -587,7 +587,19 @@ module root (`src/<group>.rs`) over a directory, so the tree mirrors the section
   the one CI runs, so the half worth testing is the half that has no backend. **Its one
   non-obvious coupling is the `watchdog`**: an idle server produces no tokens, so it beats
   the same heartbeat from a polling accept loop — a blocking `accept` would let the wedge
-  detector abort a perfectly healthy process 60 s after the last request.
+  detector abort a perfectly healthy process 60 s after the last request. Thinking is a
+  PROMPT property, not a server one, so it lives in `artifact::tokenizer` (below) and
+  `serve` only carries it in and splits it back out at `</think>`.
+- **`artifact::tokenizer::encode_chat_turns`** — a hand-port of the fp8 checkpoint's
+  `chat_template.jinja`, built from token IDs rather than by encoding template text. **There
+  is no Jinja engine and the converted artifact does not carry the template**, so nothing
+  couples the two except `tests/artifact.rs::chat_framing_matches_the_checkpoint_template`,
+  which renders the ids back to a string and compares against the template's output
+  literally. That test exists because the framing DID drift: it was GLM-4's
+  `<|role|>\n{content}` until 2026-08-01, one token off per turn, with no `<think>` prefill
+  at all — see the note in `benchmarks.md`'s STATE block for what that invalidates.
+  Thinking is expressed the way the template expresses it, as an open or closed `<think>` in
+  the generation prompt; the `/nothink` token in the vocab is never emitted by either.
 - **`eval`** — teacher-forced scoring (`--ppl`), behind `--features teacher-forcing`. An
   instrument, not an engine feature: nothing in a decode reaches it, so the module boundary
   and the feature boundary are the same line and cannot drift apart.
