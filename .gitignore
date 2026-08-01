@@ -4,6 +4,10 @@
 # above does not reach them.
 target/
 
-# harness working state (worktrees, agent patches, session scratch)
-.claude/
+# harness working state (worktrees, agent patches, session scratch) — but SKILLS are
+# project knowledge and ship with the repo, so they are re-included. This is `.claude/*`
+# rather than `.claude/` because git cannot re-include a path inside an excluded
+# DIRECTORY; the negation below is inert unless the parent is matched per-entry.
+.claude/*
+!.claude/skills/
 .snapshot_path
