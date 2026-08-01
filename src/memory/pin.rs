@@ -968,9 +968,13 @@ impl<'a> Pin<'a> {
         self.trace.is_some()
     }
 
-    /// The active policy's routing advice — `Some((j, m))` only under `--cache-policy
-    /// top-m`. gpu.rs reads this ONCE at engine construction: the policy is fixed for
-    /// the run, and `None` has to stay a compile-time-cheap early return on the hot
+    // An orphaned doc fragment sat here until 2026-08-01, describing an accessor for
+    // "the active policy's routing advice — `Some((j, m))` only under `--cache-policy
+    // top-m`". Both the accessor and `top-m` are gone (retired 2026-07-30); the fragment
+    // stayed, broke off mid-sentence, and rustdoc was attaching it to `resident` below —
+    // giving a live method a stale doc for a mechanism the engine no longer has. The
+    // record of what `top-m` was and why it lost is
+    // `docs/investigations/cache-conditional-routing.md`.
 
     /// Is `(layer, expert)` resident? Deliberately routed through
     /// [`HybridPolicy::contains`], which takes `&self` and does NOT refresh recency —

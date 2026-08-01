@@ -206,7 +206,7 @@ fn main() -> Result<()> {
     // data crossed layer boundaries. `shipped` vs `refit` is the fidelity check on the
     // fitter itself: if they disagree badly, nothing else on the line means anything.
     let mut refit: Vec<Vec<f32>> = Vec::with_capacity(3);
-    for p in 0..3 {
+    for (p, proj_name) in PROJ.iter().enumerate() {
         // EQUALIZED. Pooling n layers would otherwise hand the control n times the
         // training subvectors, and k-means gets better with data — so a naive pool would
         // beat per-layer for a reason that has nothing to do with crossing layers, and the
@@ -229,7 +229,7 @@ fn main() -> Result<()> {
         eprintln!(
             "vq_study: refit control for {}: {} pooled subvectors (equalized against \
              {} per layer)",
-            PROJ[p],
+            proj_name,
             pooled.len() / 4,
             per_cell / 4
         );

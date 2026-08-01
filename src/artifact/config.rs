@@ -285,14 +285,17 @@ mod tests {
         }
     }
 
-    /// `top-m` in `--mode hybrid` must FAIL, not quietly fall back to the frequency
-    /// threshold: the hybrid rank-driven tier rule (docs/investigations/cache-conditional-routing.md "Mode
-    /// integration") is a later step, and a silent fallback would let a hybrid run
-
-    /// Substitution breaks the v2 trace's "window prefix == selection" promise, so the
-    /// two cannot be captured together — bin/replay would either bail or, worse, screen
-
-    /// ...and none of it touches the other policies: validate is a no-op for them.
+    /// `validate` is a no-op for every policy that ships: none of them is constrained by
+    /// mode or by `--trace`.
+    ///
+    /// Two truncated doc fragments sat above this one until 2026-08-01, describing tests
+    /// that no longer exist — one on `top-m` refusing `--mode hybrid`, one on `top-m`
+    /// substitution versus the v2 trace. They were left behind when `top-m` was retired and
+    /// its tests went with it, and both broke off mid-sentence, so what survived was
+    /// unreadable as well as untrue. The constraints they described are recorded properly
+    /// in `docs/investigations/cache-conditional-routing.md`; the third fragment, which
+    /// began "...and none of it touches the other policies", is the sentence above, now
+    /// finished.
     #[test]
     fn the_other_policies_are_unconstrained() {
         for p in ["lru", "2q", "arc"] {

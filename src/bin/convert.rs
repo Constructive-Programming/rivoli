@@ -12,11 +12,19 @@
 
 use anyhow::{Context, Result, ensure};
 use rivoli::artifact::format::{Dtype, FormatMeta, SafeWriter, Safetensors, Vq3Header};
-use rivoli::math::{bf16_to_f32, f32_to_bf16};
+use rivoli::math::bf16_to_f32;
 use rivoli::artifact::quant::{
-    VQ_ALIGN, VQ_DIM, VQ_GROUP, VQ_K, learn_codebook, quant_vq, read_f32, sample_subvectors,
+    VQ_ALIGN, VQ_DIM, VQ_K, learn_codebook, quant_vq, read_f32, sample_subvectors,
     vq_expert_bytes, vq_expert_layout, vq_proj_bytes, vq_row_bytes,
 };
+// Used by the `--gpu` encoder and by the tests, both of which this binary can be built
+// without: a plain `use` is dead on a `--features vulkan` build of the bin target, which
+// is where clippy found it. Gated rather than allow-ed, so the next unused import here is
+// still a warning.
+#[cfg(any(feature = "rocm", test))]
+use rivoli::artifact::quant::VQ_GROUP;
+#[cfg(any(feature = "rocm", test))]
+use rivoli::math::f32_to_bf16;
 
 const FP8_BLOCK: usize = 128;
 const PROJ: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
