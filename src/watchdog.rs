@@ -81,3 +81,4 @@ mod tests {
         assert!(hb.last_ms.load(Ordering::Relaxed) >= before);
     }
 }
+

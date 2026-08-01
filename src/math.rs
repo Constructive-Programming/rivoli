@@ -207,7 +207,9 @@ pub fn route_into(
     topk_into(choice, top_k, sel);
 }
 
-
+/// Host math, backend-free by construction: top-k determinism, the flash-softmax
+/// recurrence the attention kernel implements, the three narrowing conversions, and the
+/// INV-1 routing-purity property at the bottom.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +385,16 @@ mod tests {
         (g, (0..n).map(|_| r.logit() * 0.05).collect())
     }
 
+    // jscpd:ignore-start
+    //
+    // BEING A VERBATIM COPY IS THE POINT, so the duplication gate is switched off for it.
+    // `route_into_pre` is a frozen photograph of `route_into` from before `top-m` existed,
+    // and the test below asserts the live function still computes exactly it. Deduplicating
+    // the two would delete the oracle and leave a test comparing a function to itself —
+    // which is the failure mode this repo has already been bitten by (a check that passes
+    // without examining anything). It is 18 lines to pin the routing arithmetic of a
+    // mechanism whose removal was the largest behavioural change on this branch.
+
     /// A VERBATIM copy of `route_into` as it stood before `top-m` was ever added
     /// (HEAD 0894d14) — and, now that `top-m` is removed, also what it must compute
     /// forever after.
@@ -402,6 +414,8 @@ mod tests {
         }
         topk_into(choice, top_k, sel);
     }
+
+    // jscpd:ignore-end
 
     /// **INV-1: routing is a pure function of (gate logits, bias, top_k) — it never
     /// consults the cache.**

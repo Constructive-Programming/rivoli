@@ -359,6 +359,16 @@ mod live {
     /// blocking for exactly one reason, in [`serve`]: the wedge watchdog.
     const IDLE_POLL: Duration = Duration::from_millis(100);
 
+    /// Everything a request handler needs from the process. The three always travel
+    /// together — `handle`, `chat` and `parse_ask` had spelled the same list out
+    /// separately — and bundling them keeps `&mut GpuEngine` where it belongs: threaded
+    /// through, never cloned, exactly one live borrow at a time.
+    struct Ctx<'a, 'e> {
+        engine: &'a mut crate::gpu::GpuEngine<'e>,
+        tok: &'a crate::artifact::tokenizer::Tokenizer,
+        opts: &'a Opts,
+    }
+
     /// A client that connects and then says nothing — or stops reading mid-stream — must
     /// not be able to wedge a single-threaded server. It would not just stall this
     /// request: no token would land, and the wedge watchdog would abort the process.
@@ -402,7 +412,8 @@ mod live {
                     sock.set_nodelay(true)?;
                     // A per-request failure is the CLIENT's problem, never the server's:
                     // log it and keep the (~1 minute to rebuild) engine alive.
-                    if let Err(e) = handle(&sock, engine, tok, opts) {
+                    let mut cx = Ctx { engine, tok, opts };
+                    if let Err(e) = handle(&sock, &mut cx) {
                         tracing::warn!("request failed: {e:#}");
                     }
                 }
@@ -415,12 +426,7 @@ mod live {
         }
     }
 
-    fn handle(
-        sock: &TcpStream,
-        engine: &mut crate::gpu::GpuEngine<'_>,
-        tok: &crate::artifact::tokenizer::Tokenizer,
-        opts: &Opts,
-    ) -> Result<()> {
+    fn handle(sock: &TcpStream, cx: &mut Ctx<'_, '_>) -> Result<()> {
         let mut r = BufReader::new(sock);
         let Some(req) = read_req(&mut r)? else {
             return Ok(()); // bare connect, no request
@@ -433,11 +439,11 @@ mod live {
                 &mut w,
                 200,
                 &json!({"object": "list", "data": [{
-                    "id": opts.model_id, "object": "model",
+                    "id": cx.opts.model_id, "object": "model",
                     "created": now_secs(), "owned_by": "rivoli",
                 }]}),
             ),
-            ("POST", "/v1/chat/completions") => chat(&mut w, &body, engine, tok, opts),
+            ("POST", "/v1/chat/completions") => chat(&mut w, &body, cx),
             _ => send_json(
                 &mut w,
                 404,
@@ -457,11 +463,8 @@ mod live {
         think: bool,
     }
 
-    fn parse_ask(
-        body: &[u8],
-        tok: &crate::artifact::tokenizer::Tokenizer,
-        opts: &Opts,
-    ) -> Result<Ask> {
+    fn parse_ask(body: &[u8], cx: &Ctx<'_, '_>) -> Result<Ask> {
+        let (tok, opts) = (cx.tok, cx.opts);
         let body: Value = serde_json::from_slice(body).context("body is not JSON")?;
         // `tool_choice` is accepted only in the forms this can honour. "none" is honoured by
         // dropping the declarations, which genuinely prevents calls; "required" is refused
@@ -542,14 +545,9 @@ mod live {
         })
     }
 
-    fn chat(
-        w: &mut impl Write,
-        body: &[u8],
-        engine: &mut crate::gpu::GpuEngine<'_>,
-        tok: &crate::artifact::tokenizer::Tokenizer,
-        opts: &Opts,
-    ) -> Result<()> {
-        let ask = match parse_ask(body, tok, opts) {
+    fn chat(w: &mut impl Write, body: &[u8], cx: &mut Ctx<'_, '_>) -> Result<()> {
+        let (tok, opts) = (cx.tok, cx.opts);
+        let ask = match parse_ask(body, cx) {
             Ok(a) => a,
             Err(e) => return send_json(w, 400, &err_body(&format!("{e:#}"))),
         };
@@ -569,6 +567,13 @@ mod live {
 
         let t0 = std::time::Instant::now();
         let mut hung_up = false;
+        // The decode arguments, in ONE place: the two arms below differ only in the
+        // per-token callback (stream an SSE delta, or do nothing until the end), and a
+        // second copy of the list is where `--mtp-min-conf` would go missing from one arm.
+        let mut decode = |on_tok: &mut dyn FnMut(u32) -> bool| {
+            cx.engine
+                .generate(&prompt_ids, ngen, &tok.eos, opts.mtp, opts.mtp_min_conf, on_tok)
+        };
         let (ids, summary) = if stream {
             sse_head(w)?;
             sse(w, &chunk(&id, created, &model, json!({"role": "assistant"}), None))?;
@@ -610,25 +615,11 @@ mod live {
                 }
                 live
             };
-            let out = engine.generate(
-                &prompt_ids,
-                ngen,
-                &tok.eos,
-                opts.mtp,
-                opts.mtp_min_conf,
-                &mut on_tok,
-            )?;
+            let out = decode(&mut on_tok)?;
             hung_up = !live;
             out
         } else {
-            engine.generate(
-                &prompt_ids,
-                ngen,
-                &tok.eos,
-                opts.mtp,
-                opts.mtp_min_conf,
-                &mut |_: u32| true,
-            )?
+            decode(&mut |_: u32| true)?
         };
 
         let text = tok.decode_all(&ids)?;
@@ -761,6 +752,9 @@ mod live {
             .map_or(0, |d| d.as_secs())
     }
 
+    /// One whole JSON response: status line, `Content-Length`, `Connection: close`, body.
+    /// Length-delimited rather than chunked, which is what makes the keep-alive state
+    /// machine unnecessary (see the module header).
     fn send_json(w: &mut impl Write, status: u16, body: &Value) -> Result<()> {
         let body = serde_json::to_vec(body)?;
         write!(
@@ -770,20 +764,29 @@ mod live {
             reason_phrase(status),
             body.len(),
         )?;
-        w.write_all(&body)?;
-        w.flush()?;
-        Ok(())
+        write_flush(w, &body)
     }
 
+    /// Write and flush in one step. Everything this server emits is flushed at the point it
+    /// is produced — one request per connection, so there is no later write to piggyback on,
+    /// and an unflushed SSE frame is a token that did not stream.
+    fn write_flush(w: &mut impl Write, bytes: &[u8]) -> Result<()> {
+        w.write_all(bytes)?;
+        Ok(w.flush()?)
+    }
+
+    /// The SSE preamble — 200 + `text/event-stream`, flushed before the first chunk so the
+    /// client can start rendering while the first token is still ~a second away.
     fn sse_head(w: &mut impl Write) -> Result<()> {
-        w.write_all(
+        write_flush(
+            w,
             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\
               Connection: close\r\n\r\n",
-        )?;
-        w.flush()?;
-        Ok(())
+        )
     }
 
+    /// One `data:` event. Returns the write error rather than logging it — the caller
+    /// reads a failure here as the client having hung up and stops the decode.
     fn sse(w: &mut impl Write, v: &Value) -> Result<()> {
         write!(w, "data: {}\n\n", serde_json::to_string(v)?)?;
         w.flush()?; // per event: an unflushed token is a token that did not stream

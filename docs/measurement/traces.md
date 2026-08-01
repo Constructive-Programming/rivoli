@@ -83,7 +83,7 @@ No truncation warning; 3.52 tok/s, within the spread of the same config without 
 | signal | what | needs |
 |---|---|---|
 | **traces** | `rivoli.decode` → `token N` → `layer L` → leaf intervals (`gpu-wait/*`, `io-wait/uring-reap`, `cpu/*`), each leaf tagged `thread=decode\|reaper`, with true start/end times | `--spans` given |
-| **metrics** | `rivoli_ms_per_tok{class,thread}` plus `rivoli_tok_per_s`, `rivoli_hit_pct`, `rivoli_gb_per_tok`, `rivoli_miss_per_tok`, `rivoli_tokens`, `rivoli_degenerate` (+ `rivoli_loop_period`/`_repeats` when it fires) | always, when OTLP is on |
+| **metrics** | `rivoli_ms_per_tok{class,thread}` plus `rivoli_tok_per_s`, `rivoli_hit_pct`, `rivoli_gb_per_tok`, `rivoli_miss_per_tok`, `rivoli_tokens`, `rivoli_degenerate` (+ `rivoli_loop_period`/`_repeats` when it fires) — **every one of them additionally labelled `{mode,cache_policy,attn,max_mem_gib}`**, see below | always, when OTLP is on |
 
 > **CORRECTED 2026-08-01.** This row also listed `rivoli_fetch_hidden_pct`. That gauge is
 > **deleted** — it and `exposed_fetch_ms` were removed on the authority of their own doc
@@ -100,6 +100,44 @@ No truncation warning; 3.52 tok/s, within the spread of the same config without 
 Both go out over OTLP/HTTP at run end. Metrics exist because span attributes are
 *searchable* but not *chartable* — Grafana cannot draw `gpu_wait_ms` over time from a span
 tag, so a dashboard built on traces alone can only show one run at a time.
+
+### Metric labels — which run this is
+
+**Added 2026-08-01** (`investigations/otlp-modernization.md` §2a, checklist item 1). Every
+exported datapoint carries the run's identity:
+
+| label | source | values |
+|---|---|---|
+| `mode` | `--mode` | `int4` · `int3-vq` · `hybrid` |
+| `cache_policy` | `--cache-policy` | `lru` · `2q` · `arc` |
+| `attn` | `--attn` | `dense` · `dsa` · `streaming {…}` · `misa {…}` — the parameterised two carry their own arguments |
+| `max_mem_gib` | `--max-mem` | the integer budget, **omitted entirely** when the budget auto-sizes |
+
+They come from `RunInfo`, the same struct the root span's attributes come from, so a trace
+and its metrics cannot disagree about what the run was.
+
+**Before this they were not there at all, and the omission was worse than a missing
+filter.** `rivoli_tok_per_s` from `--mode hybrid --max-mem 115` and from `--mode int3-vq
+--max-mem 70` were the *same Prometheus series* — two configurations averaged into one line,
+with nothing on the chart to say so. The paragraph below ("you search by which mode / which
+policy / which budget, then read the numbers off a chart") described the spans and was
+simply false of the chart.
+
+**They are datapoint attributes, not resource attributes, and that is not an implementation
+detail.** Alloy's `otelcol.exporter.prometheus` moves resource attributes into `target_info`
+and leaves them off the series unless `resource_to_telemetry_conversion` is enabled — a
+switch in a collector config file outside this repo. Run identity attached to the `Resource`
+would therefore look right in the code, export cleanly, and produce a dashboard whose `mode`
+picker is empty: the same "empty graph rather than an error" failure that
+`add_metric_suffixes` gets its own warning for in the Alloy config below. Only
+`service.name` and `service.version` ride on the Resource.
+
+**Cardinality is bounded by the command line, and must stay that way.** One datapoint per
+run, every value a flag argument from a closed set; their product is the benchmark matrix,
+which is the thing worth charting. `model` and `prompt` are deliberately *not* labels — they
+are unbounded, and both are already root-span attributes, where cardinality is free. Nothing
+per-token, per-layer or per-expert may be added beside these; that view is the trace, which
+costs a `Vec` push instead of a time series.
 
 ### Span attributes — identity, not measurements
 
@@ -119,6 +157,11 @@ search by "which mode / which policy / which budget", then read the numbers off 
 `max_mem_gib`, `bench_tokens` and `prompt` are emitted **only when set** — a `0 GiB` budget
 or `0` generated tokens would read as a setting that did something, rather than as absent.
 
+**Since 2026-08-01 the chart carries the same three** as metric labels (previous section),
+which is what makes that sentence true rather than aspirational: the trace search and the
+dashboard filter now name identical values, and `max_mem_gib` is omitted-when-unset on both
+sides for the same reason.
+
 > **CORRECTED 2026-08-01.** The row above also listed `route_j`, `route_m`, `2q_kin_pct` and
 > `2q_kout_pct`, and this paragraph said "`route_j`/`route_m` appear only under `top-m`".
 > **The engine emits none of the four.** `route_j`/`route_m` went with `top-m` when that
@@ -133,6 +176,12 @@ or `0` generated tokens would read as a setting that did something, rather than 
 > The attribute set is thin on **run identity** — no artifact hash, no git rev, no host —
 > and that is a known gap with a proposal attached, not an oversight:
 > [`investigations/otlp-modernization.md`](../investigations/otlp-modernization.md) §2a.
+>
+> **UPDATE 2026-08-01.** §2a's *metric* half is built — mode / cache_policy / attn /
+> max_mem_gib are now labels on every datapoint (see "Metric labels" above). What is still
+> missing is the artifact hash, the git rev and the host, and §2a proposes none of those:
+> they are a gap on the **span** side with no proposal behind them, so do not read the
+> shipped labels as having closed this.
 
 **`layer L`'s expert composition is the point of the layer level.** Eight cold int4 experts
 and eight warm int3-vq experts are different animals, and residency × format is the pair
@@ -196,7 +245,14 @@ otelcol.exporter.otlp "tempo" {
 
 // OTLP gauges -> Prometheus remote-write. `rivoli.ms_per_tok` arrives as
 // `rivoli_ms_per_tok`; the `class`/`thread` attributes become labels, which is what
-// every panel in the dashboard groups by.
+// every panel in the dashboard groups by, and so do the run-identity attributes
+// (`mode`, `cache_policy`, `attn`, `max_mem_gib`) that tell two runs apart.
+//
+// That works because they are DATAPOINT attributes. Resource attributes take a
+// different path: this exporter parks them in `target_info` and they never reach the
+// series unless `resource_to_telemetry_conversion` is turned on here. Nothing rivoli
+// filters a chart by is allowed to depend on that switch — which is why only
+// `service.name`/`service.version` are on the Resource.
 otelcol.exporter.prometheus "mimir" {
   // Keep the names as the dashboard expects them. With suffixes on, the exporter
   // appends unit/type to every series and `rivoli_ms_per_tok` silently becomes
@@ -288,9 +344,23 @@ partition wall. Keeping the two rows visually distinct is the whole point of hav
 - **The spans are the same intervals the scalars come from**, so the two views cannot
   disagree. If they do, that is a bug worth chasing.
 - **Nothing in CI compiles `--features otlp`.** It broke once already for exactly that
-  reason (see "How it rotted"). If you change `ProfileSummary`, build this arm before you
-  believe you are done — the compiler is the only thing that will tell you, and only if you
-  ask it.
+  reason (see "How it rotted"). If you change `ProfileSummary` or `RunInfo`, build this arm
+  before you believe you are done — the compiler is the only thing that will tell you, and
+  only if you ask it:
+
+  ```sh
+  cargo build --release --features rocm,otlp    # the arm no other command covers
+  ```
+
+  The label set itself is covered without the feature: `RunInfo::labels` lives in
+  always-compiled code and `telemetry::run_label_tests` runs under a plain
+  `cargo test --release --features rocm`.
+- **Series recorded before 2026-08-01 carry no run-identity labels**, so any query written
+  as `rivoli_tok_per_s{mode="hybrid"}` silently excludes every older datapoint rather than
+  erroring. That is the correct behaviour — those points genuinely could have been any mode
+  — but if a panel looks empty for a period you know you measured, this is why. Do not
+  paper over it with `or on() rivoli_tok_per_s`; that re-merges exactly what the labels were
+  added to separate.
 - **`Span::end()` is a trap.** It is `end_with_timestamp(now())` and it silently discards
   the builder's `with_end_time`. The first version of this used it, so every child was
   stamped as ending at *export* time — they all overlapped and Tempo rendered ~4000 spans

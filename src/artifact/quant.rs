@@ -137,6 +137,48 @@ pub fn vq_expert_layout(hidden: usize, moe_inter: usize) -> [(usize, usize); 3] 
 /// weights against up's.
 pub const PROJ: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
 
+/// One expert's three projections: the checkpoint tensor suffix paired with the
+/// `(o_dim, i_dim)` it has, in slot order. See [`expert_projs`].
+pub type ExpertProjs = [(&'static str, (usize, usize)); 3];
+
+/// [`PROJ`] already zipped against [`vq_expert_layout`] — the name/shape pairs an expert
+/// encoder walks, in slot order. Here for the same reason `PROJ` is: the ZIP is as
+/// order-bearing as the list, and `bin/convert` and `bin/fp8_to_i4` had spelled it out
+/// identically (down to recomputing the layout once per expert inside the worker loop).
+pub fn expert_projs(hidden: usize, moe_inter: usize) -> ExpertProjs {
+    let [g, u, d] = vq_expert_layout(hidden, moe_inter);
+    [(PROJ[0], g), (PROJ[1], u), (PROJ[2], d)]
+}
+
+/// Write a projection's group scales little-endian into the front of `dst`, `N` bytes
+/// each, stopping at whichever of the two runs out (`chunks_exact_mut` truncates a ragged
+/// tail rather than panicking).
+///
+/// `N` is the whole difference between the two producers: `.vq3` stores bf16 scales
+/// (2 bytes, `bin/convert`) and `.i4` stores f32 ones (4, [`write_i4_proj`]). Takes the
+/// encoded bytes rather than the numbers, so one function covers both without a numeric
+/// trait bound for two call sites.
+pub fn write_le_scales<const N: usize>(dst: &mut [u8], scales: impl Iterator<Item = [u8; N]>) {
+    for (s, out) in scales.zip(dst.chunks_exact_mut(N)) {
+        out.copy_from_slice(&s);
+    }
+}
+
+/// The checkpoint tensor prefix of expert `e` in `layer`. Routed experts are numbered;
+/// `e == n_experts` is the SHARED expert, which lives under an entirely different name.
+///
+/// Beside `PROJ` for the same reason: three tools (`convert`, `fp8_to_i4`, `i4_audit`)
+/// walk a layer's `n_experts + 1` blocks in this order, and a copy that got the boundary
+/// wrong would quantize the shared expert's weights into a routed slot — producing a file
+/// of exactly the right size that every length check passes.
+pub fn expert_base(layer: usize, e: usize, n_experts: usize) -> String {
+    if e < n_experts {
+        format!("model.layers.{layer}.mlp.experts.{e}")
+    } else {
+        format!("model.layers.{layer}.mlp.shared_experts")
+    }
+}
+
 /// Unpadded on-disk bytes of one expert (gate‖up‖down concatenated).
 pub fn vq_expert_bytes(hidden: usize, moe_inter: usize) -> usize {
     vq_expert_layout(hidden, moe_inter)
@@ -228,6 +270,26 @@ pub fn dequant_fp8_block(
 }
 
 
+/// The closed-form group refit: least-squares `s = Σ w·c / Σ c·c` over the codebook
+/// entries `idxs` already chose for `seg`, returned as bf16. `None` when the fit is
+/// degenerate (all-zero entries, or `s ≤ 0`) — the caller keeps its amax scale.
+///
+/// Shared with `bin/convert`'s `--gpu` encoder, which is documented (and asserted by
+/// `--validate`) to produce output BIT-IDENTICAL to [`quant_vq`]. Two copies of this
+/// accumulation is two places for one to pick up a different summation order and turn
+/// that guarantee into a mismatch report against the shipped bytes.
+pub fn vq_refit(seg: &[f32], idxs: &[u16], codebook: &[f32]) -> Option<u16> {
+    let (mut num, mut den) = (0.0f32, 0.0f32);
+    for (t, chunk) in seg.chunks_exact(VQ_DIM).enumerate() {
+        let c = &codebook[idxs[t] as usize * VQ_DIM..][..VQ_DIM];
+        for (d, &v) in chunk.iter().enumerate() {
+            num += v * c[d];
+            den += c[d] * c[d];
+        }
+    }
+    (den > 0.0 && num > 0.0).then(|| f32_to_bf16(num / den))
+}
+
 /// Quantize a row-major f32 weight matrix `W[o_dim, i_dim]` to VQ-int3 against a
 /// learned `codebook` (`VQ_K · VQ_DIM` f32). Returns `(indices, scales)`: `indices`
 /// is `o_dim · vq_row_bytes(i_dim)` packed 12-bit codebook indices; `scales` is
@@ -281,22 +343,13 @@ pub fn quant_vq(w: &[f32], o_dim: usize, i_dim: usize, codebook: &[f32]) -> (Vec
             let mut sb = f32_to_bf16(if amax > 0.0 { amax } else { 1.0 });
             let mut idxs = [0u16; SUBS];
             assign(seg, 1.0 / bf16_to_f32(sb), &mut idxs);
-            // Refit: minimize Σ (w − s·c)² over s for the chosen entries; keep the
-            // amax scale if the fit is degenerate (all-zero entries or s ≤ 0).
-            let (mut num, mut den) = (0.0f32, 0.0f32);
-            for (t, chunk) in seg.chunks_exact(VQ_DIM).enumerate() {
-                let c = &codebook[idxs[t] as usize * VQ_DIM..][..VQ_DIM];
-                for (d, &v) in chunk.iter().enumerate() {
-                    num += v * c[d];
-                    den += c[d] * c[d];
-                }
-            }
-            if den > 0.0 && num > 0.0 {
-                let refit = f32_to_bf16(num / den);
-                if refit != sb {
-                    sb = refit;
-                    assign(seg, 1.0 / bf16_to_f32(sb), &mut idxs);
-                }
+            // Refit against the chosen entries, then re-assign under the new scale.
+            // A degenerate fit keeps the amax scale and the first assignment.
+            if let Some(refit) = vq_refit(seg, &idxs, codebook)
+                && refit != sb
+            {
+                sb = refit;
+                assign(seg, 1.0 / bf16_to_f32(sb), &mut idxs);
             }
             scales[o * ngroups + grp] = sb;
             for (t, &ix) in idxs.iter().enumerate() {
@@ -691,17 +744,23 @@ pub fn write_i4_proj(slot: &mut [u8], off: &[usize; 6], k: usize, packed: &[u8],
     }
     let po = off[k * 2];
     slot[po..po + packed.len()].copy_from_slice(packed);
-    for (s, out) in scale
-        .iter()
-        .zip(slot[off[k * 2 + 1]..].chunks_exact_mut(4))
-    {
-        out.copy_from_slice(&s.to_le_bytes());
-    }
+    write_le_scales(&mut slot[off[k * 2 + 1]..], scale.iter().map(|s| s.to_le_bytes()));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deterministic uniform `[-1, 1)` stream. One spelling of the LCG the tests below
+    /// draw weights from, seeded per test so no two share a state and a failure
+    /// reproduces from its seed alone.
+    fn uniform(seed: u64) -> impl FnMut() -> f32 {
+        let mut st = seed;
+        move || {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((st >> 32) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        }
+    }
 
     /// `dequant_i4` is a SECOND spelling of the nibble convention `matvec_i4` and
     /// `quant_i4` carry (deliberately — an audit that reconstructs weights through the
@@ -722,11 +781,7 @@ mod tests {
         let (o_dim, i_dim) = (5usize, I4_GROUP * 3 + 16);
         let ng = i4_groups(i_dim);
         assert_eq!(ng, 4);
-        let mut st = 0x1234_5678u64;
-        let mut rnd = || {
-            st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
-            ((st >> 32) as f32 / u32::MAX as f32) * 2.0 - 1.0
-        };
+        let mut rnd = uniform(0x1234_5678);
         // Group `g` of every row scaled by 10^g: a single per-row scale could not stay
         // within half a step of the SMALL groups, so this separates the two formats.
         let mut w: Vec<f32> = (0..o_dim * i_dim)
@@ -778,11 +833,7 @@ mod tests {
     #[test]
     fn group_scales_beat_a_per_row_scale_on_the_bulk() {
         let (o_dim, i_dim) = (4usize, I4_GROUP * 8);
-        let mut st = 0xACE1_u64;
-        let mut rnd = || {
-            st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
-            ((st >> 32) as f32 / u32::MAX as f32) * 2.0 - 1.0
-        };
+        let mut rnd = uniform(0xACE1);
         // One outlier group per row, 1000× the rest — the pathology a per-row scale
         // cannot absorb (it rounds the other 7/8 of the row toward zero).
         let outlier = |o: usize| o % 8;

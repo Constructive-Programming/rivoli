@@ -918,6 +918,38 @@ const BOTH_STAGES: vk::PipelineStageFlags = vk::PipelineStageFlags::from_raw(
     vk::PipelineStageFlags::COMPUTE_SHADER.as_raw() | vk::PipelineStageFlags::TRANSFER.as_raw(),
 );
 
+/// Record ONE global memory barrier — no buffer barriers, no image barriers, no dependency
+/// flags. Every barrier this backend records has that shape and sources [`BOTH_STAGES`];
+/// only the DESTINATION stage varies, and it is the one argument worth reading at a call
+/// site, so it is the only one left there.
+///
+/// Written once because the three call sites must not drift: two of them order device work
+/// against device work and the third releases to the host, and it was the ASYMMETRY between
+/// two of these — one widened to TRANSFER, one not — that was a real hole (see
+/// [`Stream::flush`]).
+///
+/// # Safety
+/// `cb` must be in the recording state.
+unsafe fn record_barrier(
+    d: &ash::Device,
+    cb: vk::CommandBuffer,
+    dst: vk::PipelineStageFlags,
+    bar: vk::MemoryBarrier<'_>,
+) {
+    // SAFETY: the caller guarantees `cb` is recording; the slices live across the call.
+    unsafe {
+        d.cmd_pipeline_barrier(
+            cb,
+            BOTH_STAGES,
+            dst,
+            vk::DependencyFlags::empty(),
+            &[bar],
+            &[],
+            &[],
+        );
+    }
+}
+
 impl Stream {
     fn new(
         device: &ash::Device,
@@ -1014,19 +1046,11 @@ impl Stream {
         let bi = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         // SAFETY: the slot is not pending (reclaimed above); the pool carries
-        // RESET_COMMAND_BUFFER so beginning from the executable/invalid state is legal.
+        // RESET_COMMAND_BUFFER so beginning from the executable/invalid state is legal, and
+        // `cb` is recording once `begin_command_buffer` returns.
         unsafe {
             d.begin_command_buffer(cb, &bi)?;
-            let bar = [full_barrier()];
-            d.cmd_pipeline_barrier(
-                cb,
-                BOTH_STAGES,
-                BOTH_STAGES,
-                vk::DependencyFlags::empty(),
-                &bar,
-                &[],
-                &[],
-            );
+            record_barrier(d, cb, BOTH_STAGES, full_barrier());
         }
         self.recording = true;
         Ok(cb)
@@ -1086,19 +1110,15 @@ impl Stream {
             // read, in which case also...". The earlier asymmetry — `enqueue` widened to
             // TRANSFER, this barrier not — was a real hole, and one barrier per submit is
             // not a cost worth reintroducing it for.
-            let bar = [vk::MemoryBarrier::default()
-                .src_access_mask(
-                    vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
-                )
-                .dst_access_mask(vk::AccessFlags::HOST_READ)];
-            d.cmd_pipeline_barrier(
+            record_barrier(
+                d,
                 cb,
-                BOTH_STAGES,
                 vk::PipelineStageFlags::HOST,
-                vk::DependencyFlags::empty(),
-                &bar,
-                &[],
-                &[],
+                vk::MemoryBarrier::default()
+                    .src_access_mask(
+                        vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+                    )
+                    .dst_access_mask(vk::AccessFlags::HOST_READ),
             );
             d.end_command_buffer(cb)?;
             self.recording = false;
@@ -1155,13 +1175,24 @@ impl Stream {
         Ok(())
     }
 
-    /// Flush anything recorded and block until this queue is idle — the per-stream half
-    /// of [`Gpu::sync`].
-    fn join(&mut self, d: &ash::Device) -> Result<()> {
+    /// Refuse to touch a stream whose ring is in an unknown state.
+    ///
+    /// One function rather than four copies of the `ensure!` because the four callers must
+    /// agree on the STICKINESS as well as the message: `poisoned` is never cleared except by
+    /// the success path of the operation that set it (see the field), so every entry point
+    /// that could record, submit or allocate against a stream asks the same question here.
+    fn live(&self) -> Result<()> {
         ensure!(
             !self.poisoned,
             "vk stream poisoned by an earlier submit or fence failure"
         );
+        Ok(())
+    }
+
+    /// Flush anything recorded and block until this queue is idle — the per-stream half
+    /// of [`Gpu::sync`].
+    fn join(&mut self, d: &ash::Device) -> Result<()> {
+        self.live()?;
         if self.recording {
             self.flush(d)?;
         }
@@ -1209,10 +1240,7 @@ impl Gpu {
     /// rule lives here where the next launcher is written.
     fn enqueue_on(&self, q: Q, f: impl FnOnce(&ash::Device, vk::CommandBuffer)) -> Result<()> {
         self.with_stream(q, |d, s| {
-            ensure!(
-                !s.poisoned,
-                "vk stream poisoned by an earlier submit or fence failure"
-            );
+            s.live()?;
             let cb = s.open(d)?;
             f(d, cb);
             // COMPUTE **and** TRANSFER on both sides. Dispatches are not the only thing
@@ -1227,19 +1255,9 @@ impl Gpu {
             // the layer reports transfer↔transfer hazards but stays silent on this class
             // even with NO barrier at all, so a clean run says nothing either way. This is
             // spec-derived, and it is the weakest evidence in the backend.
-            let bar = [full_barrier()];
-            // SAFETY: recording is open on `cb`.
-            unsafe {
-                d.cmd_pipeline_barrier(
-                    cb,
-                    BOTH_STAGES,
-                    BOTH_STAGES,
-                    vk::DependencyFlags::empty(),
-                    &bar,
-                    &[],
-                    &[],
-                );
-            }
+            //
+            // SAFETY: recording is open on `cb` — `Stream::open` returned it above.
+            unsafe { record_barrier(d, cb, BOTH_STAGES, full_barrier()) };
             // Submit now on the streams a host await sits on — see `Stream::eager` for why
             // this is the difference between overlapping and merely computing the same
             // numbers in a different order.
@@ -1253,21 +1271,18 @@ impl Gpu {
     /// Bind, push the constants, dispatch. `push` must be the `#[repr(C)]` mirror of
     /// the shader's `push_constant` block — the ONE place the two sides can disagree,
     /// so each launcher declares its struct next to the launch that uses it.
-    /// One-dimensional grid — every kernel here but the attention sweep.
+    /// One-dimensional grid ON THE MAIN QUEUE — every kernel here but the MoE experts
+    /// (which `gpu.rs` launches on its compute stream, so they name their queue and call
+    /// [`Gpu::dispatch_2d_on`] directly) and the attention sweep.
     fn dispatch<T>(&self, p: &Pipe, push: &T, groups_x: u32) -> Result<()> {
         self.dispatch_2d_on(Q::Main, p, push, groups_x, 1)
     }
 
-    /// As [`Gpu::dispatch`], on a named queue — the MoE expert kernels, which `gpu.rs`
-    /// launches on its compute stream.
-    fn dispatch_on<T>(&self, q: Q, p: &Pipe, push: &T, groups_x: u32) -> Result<()> {
-        self.dispatch_2d_on(q, p, push, groups_x, 1)
-    }
-
-    /// Two-dimensional grid. `mla_latent_attend` needs it: `x` is the head-block and `y`
-    /// is the split, matching `attn.hip`'s `dim3(blocks, n_splits)`. The shader reads
-    /// `gl_WorkGroupID.y` to find its row range, so collapsing this into one dimension
-    /// would silently give every workgroup split 0.
+    /// Two-dimensional grid, on a named queue. `mla_latent_attend` needs the second
+    /// dimension: `x` is the head-block and `y` is the split, matching `attn.hip`'s
+    /// `dim3(blocks, n_splits)`. The shader reads `gl_WorkGroupID.y` to find its row range,
+    /// so collapsing this into one dimension would silently give every workgroup split 0.
+    /// The MoE launchers pass `groups_y = 1` and are here only for the queue.
     fn dispatch_2d_on<T>(
         &self,
         q: Q,
@@ -1377,13 +1392,7 @@ impl Gpu {
         // The guard is here rather than in `join` because the buffers already on the list
         // may still be referenced by a submitted-but-unretired command buffer; draining
         // them on the poisoned path would trade a leak for a use-after-free.
-        self.with_stream(q, |_, s| {
-            ensure!(
-                !s.poisoned,
-                "vk stream poisoned by an earlier submit or fence failure"
-            );
-            Ok(())
-        })?;
+        self.with_stream(q, |_, s| s.live())?;
         let mut buf = Buf::new(bytes.len())?;
         buf.write_at(0, bytes)?;
         let addr = buf.ptr() as u64;
@@ -1795,15 +1804,29 @@ pub unsafe fn read_raw(src: *const u8, len: usize, out: &mut Vec<u8>) -> Result<
         // whole allocation.
         unsafe { a.host.add(off as usize) }
     })?;
+    // SAFETY: `host` is readable for `len` — `lookup` bounds-checked it against the
+    // allocation — and it belongs to a device mapping, never to `out`.
+    unsafe { refill_from_mapping(out, host, len) };
+    Ok(())
+}
+
+/// Replace `out`'s contents with `len` bytes read from a host mapping.
+///
+/// The `set_len` after a `copy_nonoverlapping` into reserved-but-uninitialised capacity is
+/// the one place in this file where the length invariant is established by hand, so it is
+/// established ONCE — a second copy is a second chance to reserve and set different numbers.
+///
+/// # Safety
+/// `host` must be readable for `len` bytes and must not alias `out`'s buffer.
+unsafe fn refill_from_mapping(out: &mut Vec<u8>, host: *const u8, len: usize) {
     out.clear();
     out.reserve(len);
-    // SAFETY: `host` is readable for `len` (bounds-checked above); `out` owns `len` reserved
-    // bytes; the two are distinct allocations.
+    // SAFETY: the caller guarantees `host` is readable for `len` and distinct from `out`;
+    // `reserve` above gives `out` at least `len` bytes of capacity to initialise.
     unsafe {
         std::ptr::copy_nonoverlapping(host, out.as_mut_ptr(), len);
         out.set_len(len);
     }
-    Ok(())
 }
 
 impl Buf {
@@ -2059,13 +2082,9 @@ impl Buf {
     /// a [`device_sync`] — that is where the kernels' writes are made host-visible.
     pub fn read_into(&self, out: &mut Vec<u8>, len: usize) -> Result<()> {
         ensure!(len <= self.len, "read_into {len} > buf len {}", self.len);
-        out.clear();
-        out.reserve(len);
-        // SAFETY: the mapping covers `self.len >= len`; `out` owns `len` reserved bytes.
-        unsafe {
-            std::ptr::copy_nonoverlapping(self.host, out.as_mut_ptr(), len);
-            out.set_len(len);
-        }
+        // SAFETY: the mapping covers `self.len >= len` (checked); it is device memory, so
+        // it cannot be `out`'s buffer.
+        unsafe { refill_from_mapping(out, self.host, len) };
         Ok(())
     }
 }
@@ -2256,6 +2275,36 @@ macro_rules! push_struct {
     };
 }
 
+// jscpd:ignore-start
+//
+// THE LAUNCHER WALL — exempt from the duplication gate, and the only region of this file
+// that is. It runs from here to the `Timeline` section below.
+//
+// Everything in it is a DECLARATION in two mirrors that must not be allowed to drift
+// apart:
+//   * each `push_struct!` block mirrors one `.comp`'s `push_constant` block, field for
+//     field, because std430 layout is the contract with the shader; and
+//   * each `launch_*` signature mirrors the HIP launcher of the same name in
+//     `backend/hip.rs`, because `rocm` and `vulkan` are mutually exclusive and
+//     `backend.rs` cfg-selects one glob of the SAME names.
+//
+// `launch_gemv_fp8` below states the rule this rests on: the two backends' argument lists
+// "must stay readable side by side for the bit-exactness comparison to be checkable by
+// eye. Bundling them into a struct here and not there would put a translation step between
+// the two signatures, which is the one place this port cannot afford one." A macro
+// declaring each signature once would erase about fifteen of these at the cost of
+// goto-definition on every launcher, and would not touch the rest: roughly twenty-five are
+// DIFFERENT kernels that merely take the same shape (`gemv_fp8`/`i8`/`i4`/`vq` all take
+// `x, packed, scale, o_dim, i_dim, y`), where one copy of each already exists and there is
+// nothing to merge.
+//
+// WHAT THIS COSTS, stated plainly: two launcher BODIES with genuinely duplicated dispatch
+// logic would not be caught here. The gate remains live over the ~2,270 lines above —
+// the context, allocator, `Stream`, `Buf` and queue machinery, which is where this file's
+// logic actually lives and where the gate earned its keep on 2026-08-01 by finding
+// `record_barrier`, `Stream::live`, `refill_from_mapping` and a redundant `dispatch_on`.
+// The behavioural check for backend agreement is `tests/xbackend.rs`, which compares raw
+// output bytes between the two arms; that is the instrument, not a text matcher.
 push_struct! {
     /// Mirror of `gemv_f32.comp`'s `push_constant` block. std430: three 8-byte buffer
     /// references then two ints — 32 bytes.
@@ -2438,10 +2487,7 @@ impl Gpu {
         //   synchronised, and this is the lock the Send/Sync impl's invariant names.
         let stream = self.route[q.index()];
         let value = self.with_stream(q, |d, s| {
-            ensure!(
-                !s.poisoned,
-                "vk stream poisoned by an earlier submit or fence failure"
-            );
+            s.live()?;
             if s.recording { s.flush(d) } else { s.signal_only(d) }
         })?;
         // REGISTERED AFTER THE SUBMIT, deliberately, and this is a simplification the
@@ -3712,11 +3758,12 @@ pub unsafe fn launch_moe_expert_range(
         e_start: e_start as i32,
         e_count: e_count as i32,
     };
-    g.dispatch_on(
+    g.dispatch_2d_on(
         q,
         &g.pipes.moe_gateup_vq,
         &gu,
         (e_count * inter).div_ceil(ROWS_PER_BLOCK as usize) as u32,
+        1,
     )?;
 
     let dn = MoeDownPush {
@@ -3730,11 +3777,12 @@ pub unsafe fn launch_moe_expert_range(
         e_start: e_start as i32,
         e_count: e_count as i32,
     };
-    g.dispatch_on(
+    g.dispatch_2d_on(
         q,
         &g.pipes.moe_down_vq,
         &dn,
         (e_count * hidden).div_ceil(ROWS_PER_BLOCK as usize) as u32,
+        1,
     )
 }
 
@@ -3764,7 +3812,7 @@ pub unsafe fn launch_moe_acc_drain(
         gain,
         _pad: 0,
     };
-    g.dispatch_on(q, &g.pipes.moe_acc_drain, &push, groups(n))
+    g.dispatch_2d_on(q, &g.pipes.moe_acc_drain, &push, groups(n), 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -3917,6 +3965,8 @@ pub unsafe fn launch_index_head_route(
 pub unsafe fn launch_vaxpy(_x: *mut f32, _y: *const f32, _g: f32, _n: usize) -> Result<()> {
     Err(deferred("vaxpy"))
 }
+
+// jscpd:ignore-end
 
 /// A monotonic counter a queue can WAIT ON and SIGNAL, and the host can observe — the
 /// Vulkan half of the ticketed dataflow's primitive, matching `gpustream::Timeline`'s

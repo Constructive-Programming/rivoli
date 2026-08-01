@@ -35,8 +35,9 @@ use rivoli::artifact::format::{FormatMeta, I4Source, Safetensors, load_codebooks
 use rivoli::math::silu;
 use rivoli::artifact::model::ModelConfig;
 use rivoli::artifact::quant::{
-    I4_GROUP, PROJ, dequant_i4, i4_expert_stride, i4_groups, i4_row_bytes, i4_slot_offsets,
-    matvec_i4, quant_i4, read_f32, vq_decode_proj, vq_expert, vq_expert_layout, vq_expert_stride,
+    I4_GROUP, PROJ, dequant_i4, expert_base, i4_expert_stride, i4_groups, i4_row_bytes,
+    i4_slot_offsets, matvec_i4, quant_i4, read_f32, vq_decode_proj, vq_expert, vq_expert_layout,
+    vq_expert_stride,
 };
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -387,11 +388,7 @@ fn scale_study_only(fp8: &str, cfg: &ModelConfig, block: usize, layer: usize, ex
     println!("layer {layer}  hidden {h}  moe_inter {m}  fp8_block {block}  (fp8 only — artifact not read)");
     for &e in experts {
         ensure!(e <= ne, "--experts: {ne} is the shared expert and the largest valid index");
-        let base = if e < ne {
-            format!("model.layers.{layer}.mlp.experts.{e}")
-        } else {
-            format!("model.layers.{layer}.mlp.shared_experts")
-        };
+        let base = expert_base(layer, e, ne);
         for (k, (&(o_dim, i_dim), pname)) in vq_expert_layout(h, m).iter().zip(PROJ).enumerate() {
             let wref = src.dequant_fp8(&format!("{base}.{pname}"), o_dim, i_dim, block)?;
             let x = make_x(i_dim, 0xB0BA_u64.wrapping_add((e * 7 + k) as u64));
@@ -436,11 +433,7 @@ fn verify_wide(art: &str, fp8: &str, cfg: &ModelConfig, layers: &[usize], expert
         for &e in experts {
             let mut blk = vec![0u8; stride];
             f.read_exact_at(&mut blk, (e * stride) as u64)?;
-            let base = if e < ne {
-                format!("model.layers.{l}.mlp.experts.{e}")
-            } else {
-                format!("model.layers.{l}.mlp.shared_experts")
-            };
+            let base = expert_base(l, e, ne);
             for (k, (&(o_dim, i_dim), proj)) in
                 vq_expert_layout(h, m).iter().zip(PROJ).enumerate()
             {
@@ -588,6 +581,28 @@ fn scan_scales(art: &str, cfg: &ModelConfig) -> Result<()> {
     Ok(())
 }
 
+/// Warn if the artifact's `i4_source` stamp does not name the `fp8` directory being
+/// audited, or is absent.
+///
+/// The checkpoint is taken on faith otherwise: a DIFFERENT revision of the same model
+/// passes `dequant_fp8`'s shape checks, turns every byte-identity check false, and makes
+/// the report read "the shipped .i4 is defective" when the ARGUMENT is.
+fn warn_provenance(art: &str, fp8: &str) -> Result<()> {
+    match I4Source::load(art)? {
+        Some(p)
+            if std::fs::canonicalize(fp8)
+                .map(|c| c.display().to_string())
+                .map(|c| c != p.src)
+                .unwrap_or(true) =>
+        {
+            eprintln!("WARNING: artifact was built from {} — auditing against {fp8}", p.src)
+        }
+        None => eprintln!("WARNING: artifact carries no i4_source stamp; provenance unverified"),
+        _ => {}
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     // Destructured, not held: the mode flags below are read in a fixed precedence
     // (`--scan`, then `--xcheck`, `--verify`, `--scale-study`, then the default report),
@@ -612,13 +627,7 @@ fn main() -> Result<()> {
     // revision of the same model is most damaging — every check goes false and the report
     // blames the artifact for the argument. (`--xcheck` reads no fp8 and is unaffected, but
     // a stale stamp is worth surfacing there too.)
-    match I4Source::load(&art)? {
-        Some(pv) if std::fs::canonicalize(&fp8).map(|c| c.display().to_string()).map(|c| c != pv.src).unwrap_or(true) => {
-            eprintln!("WARNING: artifact was built from {} — auditing against {fp8}", pv.src)
-        }
-        None => eprintln!("WARNING: artifact carries no i4_source stamp; provenance unverified"),
-        _ => {}
-    }
+    warn_provenance(&art, &fp8)?;
     if xchk {
         let ls: Vec<usize> = (cfg.dense_layers..cfg.n_layers).step_by(3).collect();
         let es: Vec<usize> = (0..cfg.n_experts).step_by(17).chain([cfg.n_experts]).collect();
@@ -646,16 +655,10 @@ fn main() -> Result<()> {
         "--experts: {ne} is the shared expert and the largest valid index"
     );
     let block = FormatMeta::load(&art)?.fp8_block;
-    // The checkpoint is taken on faith otherwise: a DIFFERENT revision of the same
-    // model passes `dequant_fp8`'s shape checks, turns every byte-identity check false,
-    // and makes the report read "the shipped .i4 is defective" when the argument is.
-    match I4Source::load(&art)? {
-        Some(p) if std::fs::canonicalize(&fp8).map(|c| c.display().to_string()) .map(|c| c != p.src).unwrap_or(true) => {
-            eprintln!("WARNING: artifact was built from {} — auditing against {fp8}", p.src)
-        }
-        None => eprintln!("WARNING: artifact carries no i4_source stamp; provenance unverified"),
-        _ => {}
-    }
+    // REDUNDANT in this mode — the pre-dispatch call above has already run and printed
+    // the same line. Kept because removing it changes what the tool prints, which this
+    // pass is not allowed to do; drop it (and this comment) in a change that is.
+    warn_provenance(&art, &fp8)?;
     let off = i4_slot_offsets(h, m);
     let i4_stride = i4_expert_stride(h, m);
     let vq_stride = vq_expert_stride(h, m);
@@ -687,11 +690,7 @@ fn main() -> Result<()> {
             .with_context(|| format!("read .vq3 expert {e}"))?;
         let vqp = vq_expert(&vqb, 0, h, m);
 
-        let base = if e < ne {
-            format!("model.layers.{layer}.mlp.experts.{e}")
-        } else {
-            format!("model.layers.{layer}.mlp.shared_experts")
-        };
+        let base = expert_base(layer, e, ne);
 
         // Kept per projection so the whole-expert chain below can be run both ways.
         let (mut wrefs, mut i4s, mut vqs) = (vec![], vec![], vec![]);

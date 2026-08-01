@@ -7,13 +7,29 @@
 use rivoli::artifact::format::{Dtype, FormatMeta, ExpertSet, Safetensors, load_codebooks};
 use rivoli::artifact::model::ModelConfig;
 use rivoli::artifact::quant::{VQ_ALIGN, VQ_DIM, VQ_K, vq_expert_bytes};
+use rivoli::artifact::tokenizer::Tokenizer;
+
+/// The artifact dir, or `None` after printing the skip line. Every test in this file is
+/// gated on it, and the gate is a function so the four copies of the message — the thing a
+/// reader greps for when a CI run reports four passes and did nothing — cannot drift.
+fn artifact_dir() -> Option<String> {
+    match std::env::var("RIVOLI_ARTIFACT") {
+        Ok(d) => Some(d),
+        Err(_) => {
+            eprintln!("skip: set RIVOLI_ARTIFACT to an artifact dir");
+            None
+        }
+    }
+}
+
+/// [`artifact_dir`] plus the tokenizer the two chat-framing tests both need.
+fn artifact_tokenizer() -> Option<Tokenizer> {
+    Some(Tokenizer::load(&artifact_dir()?).unwrap())
+}
 
 #[test]
 fn artifact_reads_back() {
-    let Ok(dir) = std::env::var("RIVOLI_ARTIFACT") else {
-        eprintln!("skip: set RIVOLI_ARTIFACT to an artifact dir");
-        return;
-    };
+    let Some(dir) = artifact_dir() else { return };
     // manifest: format section + config fields
     let meta = FormatMeta::load(&dir).unwrap();
     assert_eq!((meta.vq_dim, meta.vq_k, meta.vq_group), (VQ_DIM, VQ_K, 64));
@@ -87,10 +103,7 @@ fn i4_bytes_are_what_the_checkpoint_quantizes_to() {
         vq_expert_layout,
     };
     use std::os::unix::fs::FileExt;
-    let Ok(dir) = std::env::var("RIVOLI_ARTIFACT") else {
-        eprintln!("skip: set RIVOLI_ARTIFACT to an artifact dir");
-        return;
-    };
+    let Some(dir) = artifact_dir() else { return };
     let Some(prov) = I4Source::load(&dir).unwrap() else {
         eprintln!("skip i4_bytes: {dir} has no i4_source stamp");
         return;
@@ -166,12 +179,8 @@ fn i4_bytes_are_what_the_checkpoint_quantizes_to() {
 /// pieces. Source of truth: `chat_template.jinja` in `manifest.json`'s `i4_source.src`.
 #[test]
 fn chat_framing_matches_the_checkpoint_template() {
-    use rivoli::artifact::tokenizer::{ChatOpts, Tokenizer};
-    let Ok(dir) = std::env::var("RIVOLI_ARTIFACT") else {
-        eprintln!("skip: set RIVOLI_ARTIFACT to an artifact dir");
-        return;
-    };
-    let tok = Tokenizer::load(&dir).unwrap();
+    use rivoli::artifact::tokenizer::ChatOpts;
+    let Some(tok) = artifact_tokenizer() else { return };
     // Decoding with specials rendered is what makes this readable as the template's output.
     let render = |turns: &[(&str, &str)], o: &ChatOpts| {
         tok.decode_all(&tok.encode_chat_turns(turns, o).unwrap()).unwrap()
@@ -216,13 +225,9 @@ fn chat_framing_matches_the_checkpoint_template() {
 /// compact form is a different token sequence.
 #[test]
 fn tool_framing_matches_the_checkpoint_template() {
-    use rivoli::artifact::tokenizer::{ChatOpts, Tokenizer};
+    use rivoli::artifact::tokenizer::ChatOpts;
     use serde_json::json;
-    let Ok(dir) = std::env::var("RIVOLI_ARTIFACT") else {
-        eprintln!("skip: set RIVOLI_ARTIFACT to an artifact dir");
-        return;
-    };
-    let tok = Tokenizer::load(&dir).unwrap();
+    let Some(tok) = artifact_tokenizer() else { return };
 
     // `strict` is dropped by the template's own macro, as is `defer_loading`.
     let tools = json!([{"type": "function", "function": {

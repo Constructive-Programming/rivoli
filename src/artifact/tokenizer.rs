@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
+use std::io::{self, Write};
 use tracing::warn;
 
 pub struct Tokenizer {
@@ -47,22 +48,23 @@ pub struct ChatOpts<'a> {
 /// needs no handling: serde_json never escapes non-ASCII, which is the same thing.
 struct PythonSpacing;
 
+/// Python's `item_separator` — `", "` before every element but the first.
+///
+/// ONE function, not one per hook: `json.dumps` uses the same separator between array
+/// elements and between an object's members, so two spellings could only ever differ by
+/// being wrong. The hooks below are thin because this is the whole rule.
+fn item_sep<W: ?Sized + Write>(w: &mut W, first: bool) -> io::Result<()> {
+    if first { Ok(()) } else { w.write_all(b", ") }
+}
+
 impl serde_json::ser::Formatter for PythonSpacing {
-    fn begin_array_value<W: ?Sized + std::io::Write>(
-        &mut self,
-        w: &mut W,
-        first: bool,
-    ) -> std::io::Result<()> {
-        if first { Ok(()) } else { w.write_all(b", ") }
+    fn begin_array_value<W: ?Sized + Write>(&mut self, w: &mut W, first: bool) -> io::Result<()> {
+        item_sep(w, first)
     }
-    fn begin_object_key<W: ?Sized + std::io::Write>(
-        &mut self,
-        w: &mut W,
-        first: bool,
-    ) -> std::io::Result<()> {
-        if first { Ok(()) } else { w.write_all(b", ") }
+    fn begin_object_key<W: ?Sized + Write>(&mut self, w: &mut W, first: bool) -> io::Result<()> {
+        item_sep(w, first)
     }
-    fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+    fn begin_object_value<W: ?Sized + Write>(&mut self, w: &mut W) -> io::Result<()> {
         w.write_all(b": ")
     }
 }

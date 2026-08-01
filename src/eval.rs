@@ -93,9 +93,8 @@ pub fn run(
     // sampling noise in two independent perplexities.
     if let Some(path) = out {
         use std::io::Write;
-        let mut w = std::io::BufWriter::new(
-            std::fs::File::create(path).with_context(|| format!("create {path}"))?,
-        );
+        let f = std::fs::File::create(path).with_context(|| format!("create {path}"))?;
+        let mut w = std::io::BufWriter::new(f);
         writeln!(
             w,
             "# rivoli-nll v1 {label} tokens={} hit_pct={hit_pct:.4}",

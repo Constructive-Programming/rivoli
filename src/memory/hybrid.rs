@@ -22,37 +22,98 @@ pub struct Admission {
 }
 
 pub trait HybridPolicy {
+    /// The shared geometry and per-batch pin set. Every policy owns one, and treats it
+    /// identically, which is why the two batch methods below are defaults over it rather
+    /// than the same four lines written out once per policy.
+    fn base(&mut self) -> &mut Base;
     fn contains(&self, k: u32) -> bool;
     /// A hit refreshes recency IN its tier and returns true; a miss returns false.
     fn get(&mut self, k: u32) -> bool;
     /// Admit a known-miss key: pick its tier, evict until it fits the byte budget.
     fn admit(&mut self, k: u32) -> Admission;
-    /// Start a new batch (the pin's `submit_layer`): clears the per-batch pin set so the
-    /// next batch's evictions may reclaim the previous batch's keys again.
-    fn begin_batch(&mut self);
-    /// Pin a just-hit key for the rest of this batch — eviction must not take it, else
-    /// the pin can't resolve its slot ("expert not resident after alloc"). Touching to
-    /// MRU is NOT enough: a big/skewed batch can drain a whole tier past the MRU end.
-    fn protect(&mut self, k: u32);
     /// Bytes currently resident — the pin/tests check this never exceeds the budget.
     fn resident_bytes(&self) -> usize;
+
+    /// Start a new batch (the pin's `submit_layer`): clears the per-batch pin set so the
+    /// next batch's evictions may reclaim the previous batch's keys again.
+    fn begin_batch(&mut self) {
+        self.base().pinned.clear();
+    }
+    /// Pin a just-hit key for the rest of this batch — eviction must not take it, else
+    /// the pin can't resolve its slot ("expert not resident after alloc"). Touching to
+    /// MRU is NOT enough: `get` already promotes the hit to its tier's MRU end, and a
+    /// big/skewed batch can still drain a whole tier past that end.
+    fn protect(&mut self, k: u32) {
+        self.base().pinned.insert(k);
+    }
 }
 
-
-/// Byte geometry shared by every policy: the budget and the two per-tier slot sizes.
-#[derive(Clone, Copy)]
-struct Geom {
+/// Byte geometry + the per-batch pin set: the state every policy carries identically.
+///
+/// `pub` only because [`HybridPolicy::base`] is — every field is private and every method
+/// is module-local, so nothing outside this file can do anything with one. It exists so
+/// `begin_batch`/`protect` are written once instead of once per policy.
+pub struct Base {
     budget: usize,
     cold_stride: usize,
     hot_stride: usize,
+    /// Keys touched (hit or admitted) in the CURRENT batch. Eviction skips these — see
+    /// [`HybridPolicy::protect`] and `OrderedSet::pop_lru_skip`.
+    pinned: HashSet<u32>,
 }
-impl Geom {
+impl Base {
     fn stride(&self, tier: Tier) -> usize {
         match tier {
             Tier::Cold => self.cold_stride,
             Tier::Hot => self.hot_stride,
         }
     }
+    /// A budget's worth of the SMALLER slot — the key count 2Q's and ARC's ghosts bound to.
+    fn slots(&self) -> usize {
+        self.budget / self.cold_stride.min(self.hot_stride)
+    }
+    /// Close an admission: the new key is pinned for the rest of the batch, because the
+    /// pin allocates every miss slot BEFORE resolving final addresses and a key evicted
+    /// by a LATER miss in the same batch could not then be resolved.
+    fn admitted(&mut self, k: u32, tier: Tier, evicted: Vec<u32>) -> Admission {
+        self.pinned.insert(k);
+        Admission { tier, evicted }
+    }
+}
+
+/// The eviction half of every `admit`: shed victims by the policy's own `reclaim` rule
+/// until `incoming` bytes fit `budget`, or until nothing unpinned is left to shed.
+///
+/// One copy of the LOOP, three victim rules. The `None => break` is the load-bearing part:
+/// a batch whose keys are all pinned has no legal victim, and a copy that dropped it would
+/// spin rather than admit over budget.
+fn evict_until_fits<P: HybridPolicy>(
+    p: &mut P,
+    incoming: usize,
+    budget: usize,
+    reclaim: impl Fn(&mut P) -> Option<u32>,
+) -> Vec<u32> {
+    let mut evicted = Vec::new();
+    while p.resident_bytes() + incoming > budget {
+        match reclaim(p) {
+            Some(v) => evicted.push(v),
+            None => break,
+        }
+    }
+    evicted
+}
+
+/// A hit refreshes recency IN whichever of the two resident tiers holds `k` — a resident
+/// expert never migrates format without a refetch. Shared by LRU and ARC, whose tier pairs
+/// differ only in name.
+fn touch_either(a: &mut OrderedSet, b: &mut OrderedSet, k: u32) -> bool {
+    for s in [a, b] {
+        if s.contains(k) {
+            s.touch(k);
+            return true;
+        }
+    }
+    false
 }
 
 /// Construct a byte-aware hybrid policy. `split` is 2Q's Kin/Kout (ignored by lru/arc);
@@ -63,7 +124,14 @@ pub fn make(
     hot_stride: usize,
     split: crate::memory::cache::TwoQSplit,
 ) -> Option<Box<dyn HybridPolicy>> {
-    let g = Geom { budget, cold_stride: cold_stride.max(1), hot_stride: hot_stride.max(1) };
+    // Strides clamped to ≥1 exactly as `Arena::new` clamps them: `slots` divides by the
+    // smaller of the two, and the policy's byte accounting has to agree with the arena's.
+    let g = Base {
+        budget,
+        cold_stride: cold_stride.max(1),
+        hot_stride: hot_stride.max(1),
+        pinned: HashSet::new(),
+    };
     match policy {
         "lru" => Some(Box::new(HybridLru::new(g))),
         // Three policies, three implementations. (`top-m` was a fourth NAME over the same
@@ -90,22 +158,20 @@ const LRU_HOT_THRESHOLD: u32 = 2;
 const LRU_DECAY: u64 = 4096;
 
 struct HybridLru {
-    g: Geom,
+    b: Base,
     cold: OrderedSet,
     hot: OrderedSet,
     freq: HashMap<u32, u32>,
     accesses: u64,
-    pinned: HashSet<u32>,
 }
 impl HybridLru {
-    fn new(g: Geom) -> Self {
+    fn new(b: Base) -> Self {
         Self {
-            g,
+            b,
             cold: OrderedSet::default(),
             hot: OrderedSet::default(),
             freq: HashMap::new(),
             accesses: 0,
-            pinned: HashSet::new(),
         }
     }
     fn bump(&mut self, k: u32) {
@@ -125,35 +191,29 @@ impl HybridLru {
     /// HOT tier), which is fine here; a true global LRU would need a shared clock.
     fn evict_lru(&mut self) -> Option<u32> {
         // Skip keys pinned this batch (peek AND pop), so a same-batch key is never evicted.
-        match (self.cold.peek_lru_skip(&self.pinned), self.hot.peek_lru_skip(&self.pinned)) {
+        let pin = &self.b.pinned;
+        match (self.cold.peek_lru_skip(pin), self.hot.peek_lru_skip(pin)) {
             (Some((tc, _)), Some((th, _))) => {
                 if tc <= th {
-                    self.cold.pop_lru_skip(&self.pinned)
+                    self.cold.pop_lru_skip(&self.b.pinned)
                 } else {
-                    self.hot.pop_lru_skip(&self.pinned)
+                    self.hot.pop_lru_skip(&self.b.pinned)
                 }
             }
-            (Some(_), None) => self.cold.pop_lru_skip(&self.pinned),
-            (None, Some(_)) => self.hot.pop_lru_skip(&self.pinned),
+            (Some(_), None) => self.cold.pop_lru_skip(&self.b.pinned),
+            (None, Some(_)) => self.hot.pop_lru_skip(&self.b.pinned),
             (None, None) => None,
         }
     }
 }
 impl HybridPolicy for HybridLru {
+    fn base(&mut self) -> &mut Base { &mut self.b }
     fn contains(&self, k: u32) -> bool {
         self.cold.contains(k) || self.hot.contains(k)
     }
     fn get(&mut self, k: u32) -> bool {
         self.bump(k);
-        if self.cold.contains(k) {
-            self.cold.touch(k);
-            true
-        } else if self.hot.contains(k) {
-            self.hot.touch(k);
-            true
-        } else {
-            false
-        }
+        touch_either(&mut self.cold, &mut self.hot, k)
     }
     fn admit(&mut self, k: u32) -> Admission {
         let tier = if self.freq.get(&k).copied().unwrap_or(0) >= LRU_HOT_THRESHOLD {
@@ -161,29 +221,17 @@ impl HybridPolicy for HybridLru {
         } else {
             Tier::Cold
         };
-        let mut evicted = Vec::new();
-        while self.resident_bytes() + self.g.stride(tier) > self.g.budget {
-            match self.evict_lru() {
-                Some(v) => evicted.push(v),
-                None => break,
-            }
-        }
+        let (incoming, budget) = (self.b.stride(tier), self.b.budget);
+        let evicted = evict_until_fits(self, incoming, budget, HybridLru::evict_lru);
         match tier {
             Tier::Cold => self.cold.touch(k),
             Tier::Hot => self.hot.touch(k),
         }
-        self.pinned.insert(k); // a just-admitted miss must survive the rest of the batch
-        Admission { tier, evicted }
-    }
-    fn begin_batch(&mut self) {
-        self.pinned.clear();
-    }
-    fn protect(&mut self, k: u32) {
-        self.pinned.insert(k);
+        self.b.admitted(k, tier, evicted)
     }
 
     fn resident_bytes(&self) -> usize {
-        self.cold.len() * self.g.cold_stride + self.hot.len() * self.g.hot_stride
+        self.cold.len() * self.b.cold_stride + self.hot.len() * self.b.hot_stride
     }
 }
 
@@ -192,34 +240,31 @@ impl HybridPolicy for HybridLru {
 // floats; A1out ghost promotes a returning key to HOT on its next miss.
 // ---------------------------------------------------------------------------
 struct HybridTwoQ {
-    g: Geom,
+    b: Base,
     kin_bytes: usize, // A1in (cold) byte bound
     kout: usize,      // A1out ghost length bound
     a1in: OrderedSet,
     am: OrderedSet,
     a1out: OrderedSet,
-    pinned: HashSet<u32>,
 }
 impl HybridTwoQ {
-    fn new(g: Geom, split: crate::memory::cache::TwoQSplit) -> Self {
-        let kin_bytes = (g.budget * split.kin_pct() as usize / 100).max(g.cold_stride);
-        let slots = g.budget / g.cold_stride.min(g.hot_stride);
-        let kout = (slots * split.kout_pct() as usize / 100).max(1);
+    fn new(b: Base, split: crate::memory::cache::TwoQSplit) -> Self {
+        let kin_bytes = (b.budget * split.kin_pct() as usize / 100).max(b.cold_stride);
+        let kout = (b.slots() * split.kout_pct() as usize / 100).max(1);
         Self {
-            g,
+            b,
             kin_bytes,
             kout,
             a1in: OrderedSet::default(),
             am: OrderedSet::default(),
             a1out: OrderedSet::default(),
-            pinned: HashSet::new(),
         }
     }
     fn a1in_bytes(&self) -> usize {
-        self.a1in.len() * self.g.cold_stride
+        self.a1in.len() * self.b.cold_stride
     }
     fn trim_a1in(&mut self) -> Option<u32> {
-        let v = self.a1in.pop_lru_skip(&self.pinned);
+        let v = self.a1in.pop_lru_skip(&self.b.pinned);
         if let Some(v) = v {
             self.a1out.touch(v); // ghost is key-only (not resident) — no pin skip needed
             while self.a1out.len() > self.kout {
@@ -234,13 +279,14 @@ impl HybridTwoQ {
     /// only pinned keys left, so a pinned-heavy batch can't stall the eviction.
     fn reclaim(&mut self) -> Option<u32> {
         if self.a1in_bytes() < self.kin_bytes {
-            self.am.pop_lru_skip(&self.pinned).or_else(|| self.trim_a1in())
+            self.am.pop_lru_skip(&self.b.pinned).or_else(|| self.trim_a1in())
         } else {
-            self.trim_a1in().or_else(|| self.am.pop_lru_skip(&self.pinned))
+            self.trim_a1in().or_else(|| self.am.pop_lru_skip(&self.b.pinned))
         }
     }
 }
 impl HybridPolicy for HybridTwoQ {
+    fn base(&mut self) -> &mut Base { &mut self.b }
     fn contains(&self, k: u32) -> bool {
         self.am.contains(k) || self.a1in.contains(k)
     }
@@ -254,25 +300,16 @@ impl HybridPolicy for HybridTwoQ {
     fn admit(&mut self, k: u32) -> Admission {
         // A second distinct access (via the ghost) promotes to Am/HOT; else A1in/COLD.
         let tier = if self.a1out.remove(k) { Tier::Hot } else { Tier::Cold };
-        let mut evicted = Vec::new();
-        while self.resident_bytes() + self.g.stride(tier) > self.g.budget {
-            match self.reclaim() {
-                Some(v) => evicted.push(v),
-                None => break,
-            }
-        }
+        let (incoming, budget) = (self.b.stride(tier), self.b.budget);
+        let evicted = evict_until_fits(self, incoming, budget, HybridTwoQ::reclaim);
         match tier {
             Tier::Hot => self.am.touch(k),
             Tier::Cold => self.a1in.touch(k),
         }
-        self.pinned.insert(k); // survives the rest of the batch
-        Admission { tier, evicted }
-    }
-    fn begin_batch(&mut self) {
-        self.pinned.clear();
+        self.b.admitted(k, tier, evicted)
     }
     fn protect(&mut self, k: u32) {
-        self.pinned.insert(k);
+        self.b.pinned.insert(k);
         // A1in is a FIFO and `get` leaves hits in place, so also move an actively-used
         // key to the young end (the 2Q recency intent, beyond the batch pin).
         if self.a1in.contains(k) {
@@ -281,7 +318,7 @@ impl HybridPolicy for HybridTwoQ {
     }
 
     fn resident_bytes(&self) -> usize {
-        self.a1in.len() * self.g.cold_stride + self.am.len() * self.g.hot_stride
+        self.a1in.len() * self.b.cold_stride + self.am.len() * self.b.hot_stride
     }
 }
 
@@ -290,28 +327,26 @@ impl HybridPolicy for HybridTwoQ {
 // key-only ghosts drive the target `p` (in BYTES), which chooses the eviction tier.
 // ---------------------------------------------------------------------------
 struct HybridArc {
-    g: Geom,
+    b: Base,
     p: usize, // target BYTES for T1 (cold); floats with the ghost hits
     t1: OrderedSet,
     t2: OrderedSet,
     b1: OrderedSet,
     b2: OrderedSet,
-    pinned: HashSet<u32>,
 }
 impl HybridArc {
-    fn new(g: Geom) -> Self {
+    fn new(b: Base) -> Self {
         Self {
-            g,
+            b,
             p: 0,
             t1: OrderedSet::default(),
             t2: OrderedSet::default(),
             b1: OrderedSet::default(),
             b2: OrderedSet::default(),
-            pinned: HashSet::new(),
         }
     }
     fn t1_bytes(&self) -> usize {
-        self.t1.len() * self.g.cold_stride
+        self.t1.len() * self.b.cold_stride
     }
     /// Evict one UNPINNED resident to a ghost, choosing the tier by `p`: shed COLD (T1)
     /// while it exceeds the target `p`, else shed HOT (T2). `in_b2` biases toward T1 at
@@ -321,87 +356,64 @@ impl HybridArc {
         let t1b = self.t1_bytes();
         let prefer_cold = t1b > self.p || (in_b2 && t1b == self.p);
         let (v, from_cold) = if prefer_cold {
-            match self.t1.pop_lru_skip(&self.pinned) {
+            match self.t1.pop_lru_skip(&self.b.pinned) {
                 Some(v) => (Some(v), true),
-                None => (self.t2.pop_lru_skip(&self.pinned), false),
+                None => (self.t2.pop_lru_skip(&self.b.pinned), false),
             }
         } else {
-            match self.t2.pop_lru_skip(&self.pinned) {
+            match self.t2.pop_lru_skip(&self.b.pinned) {
                 Some(v) => (Some(v), false),
-                None => (self.t1.pop_lru_skip(&self.pinned), true),
+                None => (self.t1.pop_lru_skip(&self.b.pinned), true),
             }
         };
         if let Some(v) = v {
             let ghost = if from_cold { &mut self.b1 } else { &mut self.b2 };
             ghost.touch(v);
             // Bound each ghost to a budget's worth of keys (cheap; remembers returns).
-            let bound = self.g.budget / self.g.cold_stride.min(self.g.hot_stride);
+            let bound = self.b.slots();
             while ghost.len() > bound {
                 ghost.pop_lru();
             }
         }
         v
     }
-    fn evict_until_fits(&mut self, incoming: usize, in_b2: bool, evicted: &mut Vec<u32>) {
-        while self.resident_bytes() + incoming > self.g.budget {
-            match self.replace(in_b2) {
-                Some(v) => evicted.push(v),
-                None => break,
-            }
-        }
-    }
 }
 impl HybridPolicy for HybridArc {
+    fn base(&mut self) -> &mut Base { &mut self.b }
     fn contains(&self, k: u32) -> bool {
         self.t1.contains(k) || self.t2.contains(k)
     }
     fn get(&mut self, k: u32) -> bool {
         // A hit STAYS in its tier (no slab migration); refresh recency in-place.
-        if self.t1.contains(k) {
-            self.t1.touch(k);
-            true
-        } else if self.t2.contains(k) {
-            self.t2.touch(k);
-            true
-        } else {
-            false
-        }
+        touch_either(&mut self.t1, &mut self.t2, k)
     }
     fn admit(&mut self, k: u32) -> Admission {
-        let mut evicted = Vec::new();
+        // Geometry read up front: `evict_until_fits` takes `&mut self`.
+        let (cold, hot, budget) = (self.b.cold_stride, self.b.hot_stride, self.b.budget);
         // A ghost hit is a returning key → promote to T2/HOT and adapt `p`.
-        let tier = if self.b1.remove(k) {
-            let delta = (self.b2.len() * self.g.hot_stride / self.b1.len().max(1)).max(self.g.cold_stride);
-            self.p = (self.p + delta).min(self.g.budget);
-            self.evict_until_fits(self.g.hot_stride, false, &mut evicted);
+        let (tier, evicted) = if self.b1.remove(k) {
+            let delta = (self.b2.len() * hot / self.b1.len().max(1)).max(cold);
+            self.p = (self.p + delta).min(budget);
+            let ev = evict_until_fits(self, hot, budget, |s| s.replace(false));
             self.t2.touch(k);
-            Tier::Hot
+            (Tier::Hot, ev)
         } else if self.b2.remove(k) {
-            let delta = (self.b1.len() * self.g.cold_stride / self.b2.len().max(1)).max(self.g.hot_stride);
+            let delta = (self.b1.len() * cold / self.b2.len().max(1)).max(hot);
             self.p = self.p.saturating_sub(delta);
-            self.evict_until_fits(self.g.hot_stride, true, &mut evicted);
+            let ev = evict_until_fits(self, hot, budget, |s| s.replace(true));
             self.t2.touch(k);
-            Tier::Hot
+            (Tier::Hot, ev)
         } else {
             // Fresh miss → T1/COLD probation.
-            self.evict_until_fits(self.g.cold_stride, false, &mut evicted);
+            let ev = evict_until_fits(self, cold, budget, |s| s.replace(false));
             self.t1.touch(k);
-            Tier::Cold
+            (Tier::Cold, ev)
         };
-        self.pinned.insert(k); // survives the rest of the batch
-        Admission { tier, evicted }
-    }
-    fn begin_batch(&mut self) {
-        self.pinned.clear();
-    }
-    fn protect(&mut self, k: u32) {
-        // `get` already promotes the hit to T1/T2 MRU, but a drained tier can evict past
-        // the MRU end, so pin it explicitly for the batch.
-        self.pinned.insert(k);
+        self.b.admitted(k, tier, evicted)
     }
 
     fn resident_bytes(&self) -> usize {
-        self.t1.len() * self.g.cold_stride + self.t2.len() * self.g.hot_stride
+        self.t1.len() * self.b.cold_stride + self.t2.len() * self.b.hot_stride
     }
 }
 
@@ -436,16 +448,24 @@ mod tests {
                 assert!(self.at.contains_key(&k), "hit on a key the tally thinks is gone: {k}");
                 return None;
             }
-            let a = p.admit(k);
-            for e in &a.evicted {
+            let Admission { tier, evicted } = p.admit(k);
+            for e in &evicted {
                 assert!(self.at.remove(e).is_some(), "evicted {e} was not resident");
                 assert!(!p.contains(*e), "evicted {e} still contained");
             }
-            self.at.insert(k, a.tier);
+            self.at.insert(k, tier);
             assert!(p.contains(k), "admitted {k} not resident");
             assert_eq!(self.bytes(), p.resident_bytes(), "byte accounting drift");
             assert!(self.bytes() <= self.budget, "over budget: {} > {}", self.bytes(), self.budget);
-            Some(a.tier)
+            Some(tier)
+        }
+    }
+
+    /// One 1-key batch: the pin's protocol in miniature (begin, then hit-or-admit).
+    fn touch(p: &mut dyn HybridPolicy, k: u32) {
+        p.begin_batch();
+        if !p.get(k) {
+            p.admit(k);
         }
     }
 
@@ -521,18 +541,11 @@ mod tests {
         let core: Vec<u32> = (0..5).collect();
         for round in 0..50u32 {
             for &k in &core {
-                p.begin_batch();
-                if !p.get(k) {
-                    p.admit(k);
-                }
+                touch(&mut *p, k);
             }
             // churn distinct tail keys to pressure the cache
             for t in 0..8u32 {
-                p.begin_batch();
-                let k = 1000 + round * 8 + t;
-                if !p.get(k) {
-                    p.admit(k);
-                }
+                touch(&mut *p, 1000 + round * 8 + t);
             }
         }
         let core_resident = core.iter().filter(|&&k| p.contains(k)).count();

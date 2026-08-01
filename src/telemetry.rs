@@ -458,6 +458,45 @@ pub struct RunInfo {
     pub degenerate: Option<LoopReport>,
 }
 
+impl RunInfo {
+    /// **Which run this is**, as metric labels: `(key, value)` in wire order.
+    ///
+    /// Every exported gauge carries these. Without them `--mode hybrid --max-mem 115` and
+    /// `--mode int3-vq --max-mem 70` are the *same* Prometheus series and average together
+    /// silently — the whole metrics half was uncomparable, and
+    /// `measurement/traces.md` told the reader to "search by which mode / which policy /
+    /// which budget, then read the numbers off a chart" against a chart with no such label
+    /// (`investigations/otlp-modernization.md` §2a).
+    ///
+    /// **Cardinality, and what bounds it — read this before adding a label here.** One
+    /// datapoint per RUN, and every value below is a command-line argument out of a small
+    /// closed set: `mode` 3 (`int4|int3-vq|hybrid`), `cache_policy` 3 (`lru|2q|arc`),
+    /// `attn` 4 shapes (`streaming`/`misa` carry their parameters in the `Debug` string, so
+    /// they are bounded by what a flag can be given, not by anything the run computes),
+    /// `max_mem_gib` ~10 budgets in practice. Their product is the benchmark matrix, which
+    /// is the point. **Nothing that varies per token, per layer or per prompt may join
+    /// them** — `model` and `prompt` are deliberately absent because they are unbounded,
+    /// and both are already root-span attributes, where cardinality is free.
+    ///
+    /// This lives outside `mod otlp` on purpose: it is the only place `RunInfo`'s fields
+    /// are named for the exporter, and named here the default `--features rocm` build
+    /// compiles it. A field rename that reaches only the feature-gated exporter is exactly
+    /// how `launch_ms` sat broken (`measurement/traces.md`, "How it rotted").
+    pub fn labels(&self) -> Vec<(&'static str, String)> {
+        [
+            ("mode", self.mode.clone()),
+            ("cache_policy", self.cache_policy.clone()),
+            ("attn", self.attn.clone()),
+        ]
+        .into_iter()
+        // Absent rather than zero, the same rule the root span keeps: an auto-sized budget
+        // is not "0 GiB", and a series labelled `max_mem_gib="0"` would read as a run that
+        // was given a budget of nothing.
+        .chain(self.max_mem_gib.map(|g| ("max_mem_gib", g.to_string())))
+        .collect()
+    }
+}
+
 /// End-of-run per-token performance summary — the PROFILE line and the OTLP span
 /// fields. Built by the GPU engine from its always-on [`Profile`](crate::gpu) buckets.
 #[derive(Debug, Clone, Copy)]
@@ -656,25 +695,34 @@ mod otlp {
     use std::collections::BTreeMap;
     use std::time::SystemTime;
 
+    /// The `Resource` BOTH signals carry, built in one place because they must agree.
+    ///
+    /// A trace and a metric that disagree on `service.name` land under two different
+    /// services in the backend and nothing correlates them — the span waterfall and the
+    /// gauges from the same run stop being the same run. `OTEL_SERVICE_NAME` overrides
+    /// the default so a side-by-side arm can be tagged; `service.version` is the build's
+    /// `CARGO_PKG_VERSION`, which is what tells one binary's numbers from another's.
+    fn resource() -> Resource {
+        let service_name =
+            std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "rivoli".to_string());
+        Resource::builder()
+            .with_service_name(service_name)
+            .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
+            .build()
+    }
+
     /// Build a one-shot tracer (blocking HTTP exporter + a SimpleSpanProcessor, so the
     /// span exports synchronously on `end()`/`shutdown()` — no async runtime of ours),
     /// emit the `rivoli.decode` span with the summary as attributes, and flush. The
-    /// endpoint + protocol come from the standard `OTEL_*` env vars. Version is the
-    /// build's `CARGO_PKG_VERSION`.
+    /// endpoint + protocol come from the standard `OTEL_*` env vars; the identity of the
+    /// run is [`resource`], shared with the metric export.
     pub fn export(summary: &ProfileSummary, tokens: usize, run: &RunInfo) -> Result<()> {
         let exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
             .build()
             .context("build OTLP span exporter")?;
-        let service_name =
-            std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "rivoli".to_string());
         let provider = SdkTracerProvider::builder()
-            .with_resource(
-                Resource::builder()
-                    .with_service_name(service_name)
-                    .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
-                    .build(),
-            )
+            .with_resource(resource())
             .with_simple_exporter(exporter)
             .build();
 
@@ -870,7 +918,9 @@ mod otlp {
     /// between runs anyway, so the reader is flushed once and shut down.
     ///
     /// Every class gauge carries `class` and (where it applies) `thread`, so one panel
-    /// can `sum by (class)` instead of hard-coding a query per metric.
+    /// can `sum by (class)` instead of hard-coding a query per metric — and **every**
+    /// datapoint, class gauge or scalar, additionally carries [`RunInfo::labels`], which
+    /// is what makes two runs distinguishable at all.
     fn export_metrics(summary: &ProfileSummary, tokens: usize, run: &RunInfo) -> Result<()> {
         use opentelemetry::metrics::MeterProvider as _;
         use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
@@ -879,29 +929,45 @@ mod otlp {
             .with_http()
             .build()
             .context("build OTLP metric exporter")?;
-        let service_name =
-            std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "rivoli".to_string());
         let provider = SdkMeterProvider::builder()
             .with_reader(PeriodicReader::builder(exporter).build())
-            .with_resource(
-                Resource::builder()
-                    .with_service_name(service_name)
-                    .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
-                    .build(),
-            )
+            .with_resource(resource())
             .build();
         let m = provider.meter("rivoli");
+
+        // WHICH RUN THIS IS — see `RunInfo::labels` for the set and for what bounds its
+        // cardinality. Appended to every `record()` below; a datapoint without them is a
+        // datapoint that averages into every other run's.
+        //
+        // **DATAPOINT attributes, not RESOURCE attributes**, and the distinction is the
+        // whole point rather than a detail: `record(v, attrs)` puts these in the
+        // gauge's `NumberDataPoint.attributes` (they become Prometheus labels on the
+        // series), while the `Resource` built above lands in `ResourceMetrics.resource`
+        // and Alloy's `otelcol.exporter.prometheus` parks that in `target_info` unless
+        // `resource_to_telemetry_conversion` is enabled — a collector setting in a config
+        // file outside this repo. Putting run identity there would draw an empty graph
+        // instead of an error, which `measurement/traces.md` ("Things that will bite")
+        // already records as the worst possible failure mode. So `service.name` and
+        // `service.version` stay on the Resource, and everything you filter a chart by
+        // goes through `record()`.
+        let run_labels: Vec<KeyValue> = run
+            .labels()
+            .into_iter()
+            .map(|(k, v)| KeyValue::new(k, v))
+            .collect();
 
         // ms/token, the unit every number in the PROFILE line is already in.
         let per_tok = m.f64_gauge("rivoli.ms_per_tok").build();
         let g = |v: f64, class: &'static str, thread: &'static str| {
-            per_tok.record(
-                v,
-                &[
+            let attrs: Vec<KeyValue> = run_labels
+                .iter()
+                .cloned()
+                .chain([
                     KeyValue::new("class", class),
                     KeyValue::new("thread", thread),
-                ],
-            );
+                ])
+                .collect();
+            per_tok.record(v, &attrs);
         };
         // The class axis — overlapping spans, so a stacked panel would LIE. The
         // dashboard draws these as separate lines for exactly that reason.
@@ -931,33 +997,121 @@ mod otlp {
         g(summary.tail_gpu_ms, "split/tail-gpu", "decode");
         g(summary.compute_gpu_ms, "split/moe-compute-gpu", "decode");
 
+        // The scalars carry run identity and nothing else — `tok_per_s` is THE ranking
+        // number, so it is the one series that must never merge two configurations.
         m.f64_gauge("rivoli.tok_per_s")
             .build()
-            .record(summary.tok_per_s, &[]);
+            .record(summary.tok_per_s, &run_labels);
         m.f64_gauge("rivoli.hit_pct")
             .build()
-            .record(summary.hit_pct, &[]);
+            .record(summary.hit_pct, &run_labels);
         m.f64_gauge("rivoli.gb_per_tok")
             .build()
-            .record(summary.gb_per_tok, &[]);
+            .record(summary.gb_per_tok, &run_labels);
         m.f64_gauge("rivoli.miss_per_tok")
             .build()
-            .record(summary.miss_per_tok, &[]);
-        m.u64_gauge("rivoli.tokens").build().record(tokens as u64, &[]);
+            .record(summary.miss_per_tok, &run_labels);
+        m.u64_gauge("rivoli.tokens").build().record(tokens as u64, &run_labels);
         // Chartable, so a dashboard can show "how many cells degenerated" over a matrix
-        // run rather than requiring someone to read 44 logs.
+        // run rather than requiring someone to read 44 logs — which needs the labels to
+        // say WHICH cells.
         m.u64_gauge("rivoli.degenerate")
             .build()
-            .record(u64::from(run.degenerate.is_some()), &[]);
+            .record(u64::from(run.degenerate.is_some()), &run_labels);
         if let Some(d) = run.degenerate {
-            m.u64_gauge("rivoli.loop_period").build().record(d.period as u64, &[]);
-            m.u64_gauge("rivoli.loop_repeats").build().record(d.repeats as u64, &[]);
+            m.u64_gauge("rivoli.loop_period").build().record(d.period as u64, &run_labels);
+            m.u64_gauge("rivoli.loop_repeats").build().record(d.repeats as u64, &run_labels);
         }
 
         provider.shutdown().context("flush OTLP metrics")?;
         Ok(())
     }
 
+}
+
+/// The metric label set — the run-identity half of the OTLP export, tested **without** the
+/// `otlp` feature on purpose.
+///
+/// `cargo test` is the whole gate here (there is no CI, and nothing anyone routinely runs
+/// compiles `--features otlp`), so an assertion that only holds inside `mod otlp` holds
+/// nowhere. These tests reach `RunInfo::labels` instead, which is the one place the fields
+/// are named for the exporter, and they run under the default build.
+#[cfg(test)]
+mod run_label_tests {
+    use super::{LoopReport, RunInfo};
+
+    /// Every field from a literal, deliberately. Adding a field to `RunInfo` breaks this
+    /// function, which forces whoever adds it to decide whether it is run *identity* (a
+    /// label) or a *measurement* (a gauge) — that mechanism is the point of the test, and
+    /// the assertions below are secondary to it.
+    fn run(max_mem_gib: Option<u64>) -> RunInfo {
+        RunInfo {
+            model: "/models/glm-5.2-int4".to_string(),
+            mode: "hybrid".to_string(),
+            cache_policy: "2q".to_string(),
+            attn: "dsa".to_string(),
+            max_mem_gib,
+            bench_tokens: Some(256),
+            prompt: Some("explain virtual memory".to_string()),
+            moe_gain: 1.0,
+            sinks: 4,
+            window: 2048,
+            misa_heads: 0,
+            degenerate: None,
+        }
+    }
+
+    #[test]
+    fn two_runs_that_differ_in_config_are_two_series() {
+        // These four key strings are what a dashboard template variable queries literally
+        // (`label_values(rivoli_tok_per_s, mode)` and friends). A rename here is an empty
+        // picker there, which reads as "no runs" rather than as an error — so a rename is
+        // a two-file edit, and this assertion is the reminder.
+        assert_eq!(
+            run(Some(115)).labels(),
+            vec![
+                ("mode", "hybrid".to_string()),
+                ("cache_policy", "2q".to_string()),
+                ("attn", "dsa".to_string()),
+                ("max_mem_gib", "115".to_string()),
+            ],
+        );
+
+        // The defect this whole change exists for: before it, these two landed in the same
+        // Prometheus series and averaged together in silence.
+        assert_ne!(run(Some(115)).labels(), run(Some(70)).labels());
+        let other = RunInfo { mode: "int3-vq".to_string(), ..run(Some(115)) };
+        assert_ne!(run(Some(115)).labels(), other.labels());
+    }
+
+    #[test]
+    fn an_auto_sized_budget_is_absent_rather_than_zero() {
+        let keys: Vec<&str> = run(None).labels().into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, ["mode", "cache_policy", "attn"]);
+    }
+
+    #[test]
+    fn the_label_set_stays_bounded() {
+        // Cardinality is the reason this is safe (see `RunInfo::labels`): every label is a
+        // flag value from a closed set, one datapoint per run. `prompt` and `model` are
+        // unbounded and belong on the root span, where cardinality is free; a per-token or
+        // per-layer value must never appear here at all. If this fails, the question to
+        // answer is not "raise the bound" but "how many series does that multiply into".
+        let labels = run(Some(115)).labels();
+        assert!(labels.len() <= 6, "label set grew to {labels:?}");
+        for (k, _) in &labels {
+            assert!(
+                !["prompt", "model", "token", "layer", "expert"].contains(k),
+                "{k} is unbounded or per-token; it does not belong on a metric label",
+            );
+        }
+        // A degenerate run must be labelled the same way as a healthy one — the loop's
+        // period/repeats are the gauge VALUES, not part of the series identity, or every
+        // failing run would get a series of its own.
+        let mut degen = run(Some(115));
+        degen.degenerate = Some(LoopReport { period: 3, repeats: 40, start: 12 });
+        assert_eq!(degen.labels(), run(Some(115)).labels());
+    }
 }
 
 #[cfg(test)]

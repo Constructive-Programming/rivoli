@@ -25,7 +25,9 @@ use crate::artifact::config::Mode;
 use crate::memory::device::{DeviceTier, VmmBuf};
 use crate::memory::hybrid::HybridPolicy;
 use std::collections::HashMap;
-use crate::artifact::format::{Dtype, ExpertSet, FormatMeta, Safetensors, load_codebooks};
+use crate::artifact::format::{
+    Dtype, ExpertSet, FormatMeta, Safetensors, SetDims, load_codebooks,
+};
 use crate::artifact::model::ModelConfig;
 use crate::artifact::quant::{
     VQ_DIM, VQ_K, i4_expert_bytes, i4_slot_offsets, vq_expert_bytes, vq_slot_offsets,
@@ -42,9 +44,11 @@ use std::os::fd::RawFd;
 pub struct Fp8Weight {
     pub packed: *const u8,
     pub scale: *const f32,
+    /// `weight_scale_inv` tile size — the one field [`Int8Weight`] (per-ROW scales) has no
+    /// analogue for, so it sits next to `scale` rather than trailing the dims.
+    pub block: usize,
     pub o_dim: usize,
     pub i_dim: usize,
-    pub block: usize,
 }
 
 /// A dense SwiGLU MLP's three fp8 projections, resolved.
@@ -229,9 +233,9 @@ fn place_fp8(
     Ok(Fp8Weight {
         packed,
         scale: scale as *const f32,
+        block,
         o_dim,
         i_dim,
-        block,
     })
 }
 
@@ -607,30 +611,17 @@ impl<'a> Pin<'a> {
         // Layers the PIN holds: the model's, plus the MTP head one past the end.
         let n_pin = cfg.n_layers + usize::from(mtp);
         tracing::info!("mtp head: {}", if mtp { "present" } else { "absent" });
-        let vq_src = vq_present
-            .then(|| {
-                ExpertSet::open_vq3(
-                    dir,
-                    cfg.dense_layers,
-                    n_pin,
-                    cfg.n_experts,
-                    cfg.hidden,
-                    cfg.moe_inter,
-                )
-            })
-            .transpose()?;
-        let i4_src = i4
-            .then(|| {
-                ExpertSet::open_i4(
-                    dir,
-                    cfg.dense_layers,
-                    n_pin,
-                    cfg.n_experts,
-                    cfg.hidden,
-                    cfg.moe_inter,
-                )
-            })
-            .transpose()?;
+        // Both formats open against the SAME dims, named once — the two cannot end up
+        // opened against different ones (which every length check would happily pass).
+        let dims = SetDims {
+            dense_layers: cfg.dense_layers,
+            n_layers: n_pin,
+            n_experts: cfg.n_experts,
+            hidden: cfg.hidden,
+            moe_inter: cfg.moe_inter,
+        };
+        let vq_src = vq_present.then(|| ExpertSet::open_routed(dir, false, dims)).transpose()?;
+        let i4_src = i4.then(|| ExpertSet::open_routed(dir, true, dims)).transpose()?;
         let shared_i4 = i4;
         // Slot byte layouts, one per format (which projection's indices/scales sit
         // where in an expert block). Shared expert + routed slabs reuse these.
@@ -763,20 +754,19 @@ impl<'a> Pin<'a> {
         // unaligned `budget` makes every hot-slot dst violate the O_DIRECT alignment
         // the streamer asserts (base + strides are already 4096-aligned). Costs <4 KiB.
         let budget = capacity.saturating_sub(tier_cap) & !(crate::fetch::stream::ALIGN - 1);
-        let vq_tier = || -> Result<TierFmt> {
-            let s = vq_src.as_ref().context("vq source missing")?;
+        // A tier descriptor per format. The two differ only in which source, which slot
+        // layout and which kernel flag — the read table is built the same way from either,
+        // so it is built in one place.
+        let tier_fmt = |int4: bool| -> Result<TierFmt> {
+            let (src, off, what) = if int4 {
+                (&i4_src, i4_off, "i4")
+            } else {
+                (&vq_src, vq_off, "vq")
+            };
+            let s = src.as_ref().with_context(|| format!("{what} source missing"))?;
             Ok(TierFmt {
-                off: vq_off,
-                int4: false,
-                stride: s.expert_slot(),
-                table: build_moe_table(cfg, n_pin, |l, e| s.read_spec(l, e))?,
-            })
-        };
-        let i4_tier = || -> Result<TierFmt> {
-            let s = i4_src.as_ref().context("i4 source missing")?;
-            Ok(TierFmt {
-                off: i4_off,
-                int4: true,
+                off,
+                int4,
                 stride: s.expert_slot(),
                 table: build_moe_table(cfg, n_pin, |l, e| s.read_spec(l, e))?,
             })
@@ -784,14 +774,14 @@ impl<'a> Pin<'a> {
         // COLD/HOT tiers by mode. Single-format shares one format across both tiers.
         let (cold, hot) = match mode {
             Mode::Int3Vq => {
-                let t = vq_tier()?;
+                let t = tier_fmt(false)?;
                 (t.clone(), t)
             }
             Mode::Int4 => {
-                let t = i4_tier()?;
+                let t = tier_fmt(true)?;
                 (t.clone(), t)
             }
-            Mode::Hybrid => (vq_tier()?, i4_tier()?),
+            Mode::Hybrid => (tier_fmt(false)?, tier_fmt(true)?),
         };
         let (cold_stride, hot_stride) = (cold.stride, hot.stride);
         let policy =

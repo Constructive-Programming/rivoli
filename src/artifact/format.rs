@@ -187,9 +187,8 @@ impl SafeWriter {
             );
         }
         let hjson = serde_json::to_vec(&serde_json::Value::Object(hdr))?;
-        let mut f = std::io::BufWriter::new(
-            std::fs::File::create(path).with_context(|| format!("create {path}"))?,
-        );
+        let file = std::fs::File::create(path).with_context(|| format!("create {path}"))?;
+        let mut f = std::io::BufWriter::new(file);
         f.write_all(&(hjson.len() as u64).to_le_bytes())?;
         f.write_all(&hjson)?;
         for (_, _, _, bytes) in &self.tensors {
@@ -513,6 +512,22 @@ impl Vq3Header {
 /// validation on open. Routed experts (0..n_experts) stream via [`read_spec`]; the
 /// shared expert (block n_experts) is read once for resident placement via
 /// [`shared_block`]. An `.i4` block is gate‖gate_scale‖up‖up_scale‖down‖down_scale.
+/// The dimensions an expert set is opened against. `n_layers` is EXCLUSIVE and is the
+/// CALLER's bound, not the artifact's — the pin opens one layer past `cfg.n_layers` when
+/// the MTP head has an expert file.
+///
+/// A struct rather than five positional `usize`s, because nothing about a transposed
+/// `(hidden, moe_inter)` fails a check: the set opens, every length matches, and it streams
+/// the wrong bytes. Five bare `usize`s in a row is the argument list that gets transposed.
+#[derive(Clone, Copy)]
+pub struct SetDims {
+    pub dense_layers: usize,
+    pub n_layers: usize,
+    pub n_experts: usize,
+    pub hidden: usize,
+    pub moe_inter: usize,
+}
+
 pub struct ExpertSet {
     files: Vec<std::fs::File>, // O_DIRECT, index = layer - dense_layers
     dense_layers: usize,
@@ -524,7 +539,48 @@ pub struct ExpertSet {
 }
 
 impl ExpertSet {
-    /// Open the int3-VQ `.vq3` set, validating each header against the config dims.
+    /// Open the routed expert set in one format. `.vq3` reserves one aligned block for a
+    /// header and validates it against these dims; `.i4` is headerless and starts at 0.
+    ///
+    /// ONE opener rather than two, because those three things (extension, block-start
+    /// offset, header validation) are the entire difference and the pin chooses between
+    /// them at RUNTIME — two entry points meant it wrote the identical six-argument
+    /// dimension list twice, and nothing about a transposed `(hidden, moe_inter)` fails a
+    /// length check: both sets open and stream the wrong bytes.
+    pub fn open_routed(dir: &str, i4: bool, d: SetDims) -> Result<Self> {
+        let (hidden, moe_inter) = (d.hidden, d.moe_inter);
+        let (ext, hbytes, stride, expert_bytes) = if i4 {
+            ("i4", 0, i4_expert_stride(hidden, moe_inter), i4_expert_bytes(hidden, moe_inter))
+        } else {
+            // One aligned block reserved for the header.
+            let hb = crate::artifact::quant::VQ_ALIGN;
+            ("vq3", hb, vq_expert_stride(hidden, moe_inter), vq_expert_bytes(hidden, moe_inter))
+        };
+        Self::open(dir, ext, hbytes, stride, expert_bytes, d, |path, l| {
+            if i4 {
+                return Ok(()); // headerless
+            }
+            // Validate the header via a separate buffered read (the O_DIRECT fd is
+            // for the streamer). Dims must match the config.
+            let hdr = std::fs::read(path)
+                .ok()
+                .filter(|b| b.len() >= VQ3_HEADER_BYTES)
+                .with_context(|| format!("read {path} header"))?;
+            let h = Vq3Header::from_bytes(&hdr)?;
+            ensure!(
+                h.layer as usize == l
+                    && h.n_experts as usize == d.n_experts
+                    && h.hidden as usize == hidden
+                    && h.moe_inter as usize == moe_inter,
+                "{path}: header dims disagree with config"
+            );
+            Ok(())
+        })
+    }
+
+    /// The int3-VQ set by loose dimensions — `tests/artifact.rs` opens the shipped `.vq3`
+    /// this way. The engine's format is a runtime choice, so it goes through
+    /// [`ExpertSet::open_routed`] with a [`SetDims`] it names its fields into.
     pub fn open_vq3(
         dir: &str,
         dense_layers: usize,
@@ -533,69 +589,20 @@ impl ExpertSet {
         hidden: usize,
         moe_inter: usize,
     ) -> Result<Self> {
-        Self::open(
-            dir,
-            "vq3",
-            crate::artifact::quant::VQ_ALIGN, // one aligned block reserved for the header
-            vq_expert_stride(hidden, moe_inter),
-            vq_expert_bytes(hidden, moe_inter),
-            dense_layers,
-            n_layers,
-            n_experts,
-            |path, l| {
-                // Validate the header via a separate buffered read (the O_DIRECT fd is
-                // for the streamer). Dims must match the config.
-                let hdr = std::fs::read(path)
-                    .ok()
-                    .filter(|b| b.len() >= VQ3_HEADER_BYTES)
-                    .with_context(|| format!("read {path} header"))?;
-                let h = Vq3Header::from_bytes(&hdr)?;
-                ensure!(
-                    h.layer as usize == l
-                        && h.n_experts as usize == n_experts
-                        && h.hidden as usize == hidden
-                        && h.moe_inter as usize == moe_inter,
-                    "{path}: header dims disagree with config"
-                );
-                Ok(())
-            },
-        )
+        let d = SetDims { dense_layers, n_layers, n_experts, hidden, moe_inter };
+        Self::open_routed(dir, false, d)
     }
 
-    /// Open the colibri int4 `.i4` set (headerless, blocks from offset 0).
-    pub fn open_i4(
-        dir: &str,
-        dense_layers: usize,
-        n_layers: usize,
-        n_experts: usize,
-        hidden: usize,
-        moe_inter: usize,
-    ) -> Result<Self> {
-        Self::open(
-            dir,
-            "i4",
-            0,
-            i4_expert_stride(hidden, moe_inter),
-            i4_expert_bytes(hidden, moe_inter),
-            dense_layers,
-            n_layers,
-            n_experts,
-            |_, _| Ok(()), // no header
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
     fn open(
         dir: &str,
         ext: &str,
         hbytes: usize,
         stride: usize,
         expert_bytes: usize,
-        dense_layers: usize,
-        n_layers: usize,
-        n_experts: usize,
+        d: SetDims,
         validate: impl Fn(&str, usize) -> Result<()>,
     ) -> Result<Self> {
+        let SetDims { dense_layers, n_layers, n_experts, .. } = d;
         let want = hbytes + (n_experts + 1) * stride; // header + routed + shared
         let mut files = Vec::with_capacity(n_layers - dense_layers);
         for l in dense_layers..n_layers {

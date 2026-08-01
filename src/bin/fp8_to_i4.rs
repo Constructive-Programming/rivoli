@@ -17,16 +17,21 @@
 //! place: `bin/vq3_to_i4`, which used to regenerate the old `.i4` from the `.vq3` set,
 //! is deleted (its output was worse by construction — see the paragraph above). Re-run
 //! THIS tool from the fp8 source to rebuild a layer.
+// jscpd:ignore-start — the import block. `i4_audit` opens with nearly the same one because
+// the two tools read the same artifact through the same modules, and Rust has no way to
+// share a `use` list. There is nothing here to factor: the duplication is the dependency
+// graph, stated twice because each binary must state its own.
 use anyhow::{Context, Result, anyhow, ensure};
 use clap::Parser;
 use rivoli::artifact::format::{FormatMeta, I4Source, Safetensors};
 use rivoli::artifact::model::ModelConfig;
 use rivoli::artifact::quant::{
-    I4_GROUP, PROJ, i4_expert_bytes, i4_expert_stride, i4_slot_offsets, quant_i4,
-    vq_expert_layout, write_i4_proj,
+    ExpertProjs, I4_GROUP, expert_base, expert_projs, i4_expert_bytes, i4_expert_stride,
+    i4_slot_offsets, quant_i4, write_i4_proj,
 };
 use std::fs::File;
 use std::io::Write;
+// jscpd:ignore-end
 
 // NOTE: doc comments on the FIELDS below are USER-FACING — clap renders them as `--help`.
 // Rationale for the code goes in `//` comments like this one, which clap ignores. The
@@ -65,17 +70,12 @@ struct Args {
 fn build_block(
     src: &Safetensors,
     base: &str,
-    hidden: usize,
-    moe_inter: usize,
+    projs: &ExpertProjs,
     block: usize,
     off: &[usize; 6],
     slot: &mut [u8],
 ) -> Result<()> {
-    for (k, (proj, &(o_dim, i_dim))) in PROJ
-        .iter()
-        .zip(&vq_expert_layout(hidden, moe_inter))
-        .enumerate()
-    {
+    for (k, &(proj, (o_dim, i_dim))) in projs.iter().enumerate() {
         let w = src.dequant_fp8(&format!("{base}.{proj}"), o_dim, i_dim, block)?;
         let (packed, scale) = quant_i4(&w, o_dim, i_dim);
         write_i4_proj(slot, off, k, &packed, &scale);
@@ -128,6 +128,9 @@ fn main() -> Result<()> {
 
     let (stride, ebytes) = (i4_expert_stride(h, m), i4_expert_bytes(h, m));
     let off = i4_slot_offsets(h, m);
+    // Hoisted out of the per-expert worker loop: the name/shape pairing is the same for
+    // every expert of every layer.
+    let projs = expert_projs(h, m);
     let n = ne + 1; // routed 0..ne, then the shared expert
     let layer_bytes = (n * stride) as u64;
     let threads = std::thread::available_parallelism().map_or(8, |t| t.get());
@@ -165,16 +168,12 @@ fn main() -> Result<()> {
                 .chunks_mut(per * stride)
                 .enumerate()
                 .map(|(ci, chunk)| {
-                    let (src, off) = (&src, &off);
+                    let (src, off, projs) = (&src, &off, &projs);
                     s.spawn(move || -> Result<()> {
                         for (j, slot) in chunk.chunks_exact_mut(stride).enumerate() {
                             let e = ci * per + j;
-                            let base = if e < ne {
-                                format!("model.layers.{l}.mlp.experts.{e}")
-                            } else {
-                                format!("model.layers.{l}.mlp.shared_experts")
-                            };
-                            build_block(src, &base, h, m, block, off, &mut slot[..ebytes])
+                            let base = expert_base(l, e, ne);
+                            build_block(src, &base, projs, block, off, &mut slot[..ebytes])
                                 .with_context(|| format!("expert {e}"))?;
                         }
                         Ok(())

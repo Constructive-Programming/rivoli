@@ -57,23 +57,34 @@ pub fn f16b(v: &[f32]) -> Vec<u8> {
 }
 
 /// Little-endian bytes → f32 vec, the inverse of [`f32b`] for readback.
+///
+/// Delegates to the engine's own decoder rather than repeating it: an oracle that read
+/// bytes back differently from the code under test could agree with itself while both were
+/// wrong about the file format.
 pub fn f32v(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+    rivoli::artifact::quant::read_f32(b)
 }
 
 /// Report the max error AND the threshold it was compared against. Printing the MARGIN
 /// is the point: a green oracle that passed on 100x of headroom looks exactly like one
 /// that passed on 2x, and only one of them is evidence of anything.
 pub fn assert_close(want: &[f32], got: &[f32], label: &str) {
-    let (err, tol) = err_tol(want, got);
+    let (err, tol) = report(want, got, label);
     let mx = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    assert!(err <= tol, "{label}: err={err:.3e} > tol={tol:.3e} max={mx:.3e}");
+}
+
+/// [`err_tol`] plus the margin line, returning the pair so the caller decides what a
+/// failure means: [`assert_close`] panics, `vk.rs`'s `Shapes::close` records and keeps
+/// going. The PRINT is what they share and the reason this is not two functions — the
+/// margin is the evidence, and a second copy of the format string is a second format.
+pub fn report(want: &[f32], got: &[f32], label: &str) -> (f32, f32) {
+    let (err, tol) = err_tol(want, got);
     println!(
         "{label}: err={err:.3e} tol={tol:.3e} margin={:.1}x",
         tol / err.max(f32::MIN_POSITIVE)
     );
-    assert!(err <= tol, "{label}: err={err:.3e} > tol={tol:.3e} max={mx:.3e}");
+    (err, tol)
 }
 
 /// `(max abs error, tolerance)` for a want/got pair — the shared arithmetic behind
@@ -86,6 +97,47 @@ pub fn err_tol(want: &[f32], got: &[f32]) -> (f32, f32) {
         .zip(got)
         .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
     (err, 1e-3 * mx + 1e-3)
+}
+
+/// `n` positive per-block scales, `|f·0.1| + 0.01`. Every fp8 oracle in both backend files
+/// draws them this way, and the 0.01 floor is load-bearing rather than tidy: a tile whose
+/// scale rounds to zero makes the comparison for that tile vacuous, and `assert_close`'s
+/// relative tolerance would not show it.
+pub fn block_scales(r: &mut Lcg, n: usize) -> Vec<f32> {
+    (0..n).map(|_| (r.f() * 0.1).abs() + 0.01).collect()
+}
+
+/// An fp8 GEMV case: e4m3 weights, `n_scales` block scales, the input, and the host result.
+///
+/// `n_scales` is the caller's, not computed here, because the two backends spell the scale
+/// grid differently (`i_dim / block` against `i_dim.div_ceil(block)`) and unifying that
+/// would change one of them for a shape neither currently tries. The DRAW ORDER — weights,
+/// scales, x — is the part that has to be shared: it is what makes a seed mean the same
+/// data on both sides.
+pub fn gemv_fp8_case(
+    r: &mut Lcg,
+    o_dim: usize,
+    i_dim: usize,
+    block: usize,
+    n_scales: usize,
+) -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    let packed: Vec<u8> = (0..o_dim * i_dim)
+        .map(|_| rivoli::math::f32_to_e4m3(r.f()))
+        .collect();
+    let scale = block_scales(r, n_scales);
+    let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
+    let mut want = vec![0.0f32; o_dim];
+    rivoli::artifact::quant::matvec_fp8(&mut want, &x, &packed, &scale, i_dim, block);
+    (packed, scale, x, want)
+}
+
+/// `matvec_i8` into a fresh `o_dim` vector. Returned rather than written through an
+/// out-param so the caller binds it in one line; the two int8 oracles generate their
+/// weights differently and share only this step.
+pub fn want_i8(x: &[f32], packed: &[u8], scale: &[f32], o_dim: usize, i_dim: usize) -> Vec<f32> {
+    let mut want = vec![0.0f32; o_dim];
+    rivoli::artifact::quant::matvec_i8(&mut want, x, packed, scale, o_dim, i_dim);
+    want
 }
 
 /// The oracles' deterministic input source.

@@ -13,9 +13,14 @@ use clap::Parser;
 use rivoli::artifact::format::{Dtype, FormatMeta, SafeWriter, Safetensors, Vq3Header};
 use rivoli::math::bf16_to_f32;
 use rivoli::artifact::quant::{
-    PROJ, VQ_ALIGN, VQ_DIM, VQ_K, learn_codebook, quant_vq, read_f32, sample_subvectors,
-    vq_expert_bytes, vq_expert_layout, vq_proj_bytes, vq_row_bytes,
+    ExpertProjs, PROJ, VQ_ALIGN, VQ_DIM, VQ_K, expert_base, expert_projs, learn_codebook, quant_vq,
+    read_f32, sample_subvectors, vq_expert_bytes, vq_proj_bytes, vq_row_bytes, write_le_scales,
 };
+// Only the tests still take the layout on its own; the encoders go through `expert_projs`,
+// which carries the projection NAMES alongside it. Gated rather than allow-ed, for the
+// same reason as `VQ_GROUP` below.
+#[cfg(test)]
+use rivoli::artifact::quant::vq_expert_layout;
 // Used by the `--gpu` encoder and by the tests, both of which this binary can be built
 // without: a plain `use` is dead on a `--features vulkan` build of the bin target, which
 // is where clippy found it. Gated rather than allow-ed, so the next unused import here is
@@ -146,25 +151,24 @@ mod gpu {
             for grp in 0..ngroups {
                 let seg = &wr[grp * VQ_GROUP..(grp + 1) * VQ_GROUP];
                 let sbase = o * nsub_row + grp * SUBS;
-                let (mut num, mut den) = (0.0f32, 0.0f32);
-                for t in 0..SUBS {
-                    let c = &codebook[idx1[sbase + t] as usize * VQ_DIM..][..VQ_DIM];
-                    for (d, &v) in seg[t * VQ_DIM..(t + 1) * VQ_DIM].iter().enumerate() {
-                        num += v * c[d];
-                        den += c[d] * c[d];
+                // The refit itself is `quant_vq`'s, called rather than restated: the two
+                // encoders are asserted bit-identical under `--validate`, and this
+                // accumulation is where a divergence would come from.
+                let refit = rivoli::artifact::quant::vq_refit(
+                    seg,
+                    &idx1[sbase..sbase + SUBS],
+                    codebook,
+                );
+                if let Some(refit) = refit
+                    && refit != scales[o * ngroups + grp]
+                {
+                    scales[o * ngroups + grp] = refit;
+                    let inv = 1.0 / bf16_to_f32(refit);
+                    let base = sbase * VQ_DIM;
+                    for (t, &v) in seg.iter().enumerate() {
+                        sub[base + t] = v * inv;
                     }
-                }
-                if den > 0.0 && num > 0.0 {
-                    let refit = f32_to_bf16(num / den);
-                    if refit != scales[o * ngroups + grp] {
-                        scales[o * ngroups + grp] = refit;
-                        let inv = 1.0 / bf16_to_f32(refit);
-                        let base = sbase * VQ_DIM;
-                        for (t, &v) in seg.iter().enumerate() {
-                            sub[base + t] = v * inv;
-                        }
-                        changed = true;
-                    }
+                    changed = true;
                 }
             }
         }
@@ -220,9 +224,7 @@ fn deq(src: &Safetensors, base: &str, proj: &str, o_dim: usize, i_dim: usize) ->
 fn write_proj(dst: &mut [u8], o_dim: usize, i_dim: usize, indices: &[u8], scales: &[u16]) {
     let ib = o_dim * vq_row_bytes(i_dim);
     dst[..ib].copy_from_slice(indices);
-    for (s, out) in scales.iter().zip(dst[ib..].chunks_exact_mut(2)) {
-        out.copy_from_slice(&s.to_le_bytes());
-    }
+    write_le_scales(&mut dst[ib..], scales.iter().map(|s| s.to_le_bytes()));
 }
 
 /// Per-projection GPU encoders (`--gpu`): one `Encoder` per codebook, each behind a
@@ -240,19 +242,14 @@ type Enc = ();
 fn encode_expert(
     src: &Safetensors,
     base: &str,
-    hidden: usize,
-    moe_inter: usize,
+    projs: &ExpertProjs,
     codebooks: &[Vec<f32>; 3],
     dst: &mut [u8],
     enc: Option<&Enc>,
     validate: bool,
 ) -> Result<()> {
     let mut off = 0;
-    for (p, (proj, &(o_dim, i_dim))) in PROJ
-        .iter()
-        .zip(&vq_expert_layout(hidden, moe_inter))
-        .enumerate()
-    {
+    for (p, &(proj, (o_dim, i_dim))) in projs.iter().enumerate() {
         let w = deq(src, base, proj, o_dim, i_dim)?;
         let (indices, scales) = match enc {
             #[cfg(feature = "rocm")]
@@ -392,11 +389,7 @@ fn main() -> Result<()> {
         const TARGET: usize = 1 << 20;
         let per_expert = d.moe_inter * d.hidden / VQ_DIM; // per projection
         let mut cbs: [Vec<f32>; 3] = [vec![], vec![], vec![]];
-        for (p, (proj, &(o_dim, i_dim))) in PROJ
-            .iter()
-            .zip(&vq_expert_layout(d.hidden, d.moe_inter))
-            .enumerate()
-        {
+        for (p, &(proj, (o_dim, i_dim))) in expert_projs(d.hidden, d.moe_inter).iter().enumerate() {
             let mut sample = Vec::new();
             let layers: Vec<usize> = (d.dense_layers..last)
                 .step_by(((last - d.dense_layers) / args.sample_experts).max(1))
@@ -460,6 +453,9 @@ fn main() -> Result<()> {
 
     let stride = rivoli::artifact::quant::vq_expert_stride(d.hidden, d.moe_inter);
     let ebytes = vq_expert_bytes(d.hidden, d.moe_inter);
+    // Hoisted out of the per-expert worker loop: the name/shape pairing is the same for
+    // every expert of every layer.
+    let projs = expert_projs(d.hidden, d.moe_inter);
     for &l in &moe_layers {
         let path = format!("{}/L{l:02}.vq3", args.out_dir);
         if std::fs::metadata(&path).is_ok() {
@@ -470,7 +466,7 @@ fn main() -> Result<()> {
         buf[..hdr.len()].copy_from_slice(&hdr);
         // Encode all n_experts+1 blocks (routed 0..n, shared = n) in parallel over
         // disjoint block slices — quant_vq is pure and Safetensors is Sync.
-        let (src, cb) = (&src, &codebooks);
+        let (src, cb, projs) = (&src, &codebooks, &projs);
         let enc = encoders.as_ref();
         let validate = args.validate;
         let threads = std::thread::available_parallelism().map_or(4, |t| t.get());
@@ -488,21 +484,8 @@ fn main() -> Result<()> {
                 handles.push(s.spawn(move || -> Result<()> {
                     for (j, slot) in mine.chunks_exact_mut(stride).enumerate() {
                         let e = base_e + j;
-                        let base = if e < d.n_experts {
-                            format!("model.layers.{l}.mlp.experts.{e}")
-                        } else {
-                            format!("model.layers.{l}.mlp.shared_experts")
-                        };
-                        encode_expert(
-                            src,
-                            &base,
-                            d.hidden,
-                            d.moe_inter,
-                            cb,
-                            &mut slot[..ebytes],
-                            enc,
-                            validate,
-                        )?;
+                        let base = expert_base(l, e, d.n_experts);
+                        encode_expert(src, &base, projs, cb, &mut slot[..ebytes], enc, validate)?;
                     }
                     Ok(())
                 }));

@@ -19,6 +19,20 @@ fn main() {
     }
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR set by cargo");
+    // True when `out` is missing or older than any of `deps` — the mtime comparison cargo
+    // does for its own targets, which build scripts do not get for free. Missing metadata
+    // means REBUILD: an unreadable timestamp is not evidence the output is current.
+    fn stale(out: &str, deps: &[&str]) -> bool {
+        let Ok(t) = std::fs::metadata(out).and_then(|m| m.modified()) else {
+            return true;
+        };
+        deps.iter().any(|d| {
+            std::fs::metadata(d)
+                .and_then(|m| m.modified())
+                .map(|s| s > t)
+                .unwrap_or(true)
+        })
+    }
     let kernels = [
         "linalg", "moe", "mla", "attn", "fwd", "vmm", "indexer", "async",
     ];
@@ -36,6 +50,18 @@ fn main() {
         let src = format!("kernels/{k}.hip");
         let obj = format!("{out_dir}/{k}.o");
         println!("cargo:rerun-if-changed={src}");
+        // SKIP an object that is newer than both its source and the shared header.
+        //
+        // This script re-runs whenever anything it watches changes, and since the
+        // duplication gate watches `src/` that now includes every Rust edit. Without this
+        // check each one recompiled all eight kernels through hipcc — seconds of rebuild
+        // for a change that cannot affect a single one of them. `common.hpp` is in the
+        // comparison because it is #included rather than compiled, so touching it must
+        // invalidate everything.
+        if !stale(&obj, &[&src, "kernels/common.hpp"]) {
+            objs.push(obj);
+            continue;
+        }
         let mut cmd = Command::new(&hipcc);
         cmd.args([&offload, "-O3", "-fPIC"]);
         let status = cmd
@@ -300,24 +326,40 @@ fn no_reciprocal_rewrite(spv: &str, text: &str) -> Vec<String> {
 /// `filter` when a second builtin is identified, and name the divergence it prevents, or
 /// the next person cannot judge whether an exemption is safe.
 fn no_banned_builtins(spv: &str, text: &str) -> Vec<String> {
-    text.lines()
-        // Match the operand position exactly: `%n = OpExtInst %type %set <Instr> ...`.
-        // A substring search would also hit a name or a debug string.
-        .filter(|l| {
+    // Match the operand position exactly: `%n = OpExtInst %type %set <Instr> ...`.
+    // A substring search would also hit a name or a debug string.
+    scan(
+        spv,
+        text,
+        |l| {
             l.split_once(" = OpExtInst ")
                 .and_then(|(_, rest)| rest.split_whitespace().nth(2))
                 == Some("InverseSqrt")
-        })
-        .map(|l| {
-            format!(
-                "{spv}: calls GLSL.std.450 `InverseSqrt`\n  {}\n  Use `1.0 / sqrt(z)` \
-                 instead — Vulkan specifies inversesqrt to 2 ULP as ONE operation, where \
-                 HIP computes a correctly-rounded sqrt and then a correctly-rounded \
-                 divide, so the results differ. If this call is deliberate and the \
-                 divergence is acceptable, delete the test in build.rs and say why.",
-                l.trim()
-            )
-        })
+        },
+        "calls GLSL.std.450 `InverseSqrt`",
+        "Use `1.0 / sqrt(z)` instead — Vulkan specifies inversesqrt to 2 ULP as ONE \
+         operation, where HIP computes a correctly-rounded sqrt and then a \
+         correctly-rounded divide, so the results differ. If this call is deliberate and \
+         the divergence is acceptable, delete the test in build.rs and say why.",
+    )
+}
+
+/// Report every disassembly line matching `hit` as a shader-rule failure.
+///
+/// The line-scanning rules differ only in their predicate and their prose; sharing the
+/// scan keeps the SHAPE of a diagnostic fixed, which is the part that must not drift — a
+/// reader who learns to read one of these can read all of them, and two copies of the
+/// format string is two formats.
+fn scan(
+    spv: &str,
+    text: &str,
+    hit: impl Fn(&str) -> bool,
+    head: &str,
+    advice: &str,
+) -> Vec<String> {
+    text.lines()
+        .filter(|l| hit(l))
+        .map(|l| format!("{spv}: {head}\n  {}\n  {advice}", l.trim()))
         .collect()
 }
 
@@ -355,23 +397,20 @@ fn no_banned_builtins(spv: &str, text: &str) -> Vec<String> {
 ///
 /// Write a macro instead, so the caller's variable is written directly.
 fn no_array_parameters(spv: &str, text: &str) -> Vec<String> {
-    text.lines()
-        .filter(|l| {
+    scan(
+        spv,
+        text,
+        |l| {
             l.split_once(" = OpLoad ")
                 .is_some_and(|(_, rest)| rest.trim_start().starts_with("%_arr_"))
-        })
-        .map(|l| {
-            format!(
-                "{spv}: copies a WHOLE ARRAY in one load\n  {}\n  GLSL copies array \
-                 arguments IN AND OUT per invocation, so passing a `shared` array to a \
-                 function gives every thread a private copy and the writes are lost. Use \
-                 a macro so the caller's variable is written directly (see \
-                 E4M3_LUT_BUILD in kernels/vk/common.glsl). Indexing a local array is \
-                 fine — that compiles to OpAccessChain + a scalar load, not this.",
-                l.trim()
-            )
-        })
-        .collect()
+        },
+        "copies a WHOLE ARRAY in one load",
+        "GLSL copies array arguments IN AND OUT per invocation, so passing a `shared` \
+         array to a function gives every thread a private copy and the writes are lost. \
+         Use a macro so the caller's variable is written directly (see E4M3_LUT_BUILD in \
+         kernels/vk/common.glsl). Indexing a local array is fine — that compiles to \
+         OpAccessChain + a scalar load, not this.",
+    )
 }
 
 /// Fail the build if a shader has a barrier that orders NOTHING.
@@ -551,14 +590,18 @@ fn spirv_val(spv: &str) -> Vec<String> {
 /// run ("Unknown cli config", exit 1), which this function would have read as "absent" and
 /// skipped silently forever.
 fn no_duplicated_rust() {
-    println!("cargo:rerun-if-env-changed=RIVOLI_JSCPD");
-    if std::env::var("RIVOLI_JSCPD").is_err() {
-        return;
-    }
+    // ALWAYS ON as of 2026-08-02. It was opt-in behind `RIVOLI_JSCPD` for exactly one day,
+    // while the backlog it was measuring — 181 clones, 4.49% — was cleared to zero. A gate
+    // nobody arms is a gate that reports nothing, which is the same failure as the empty
+    // exemption lists this build script used to carry.
+    //
+    // The `rerun-if-changed=src` below means every Rust edit re-runs this script. That used
+    // to imply recompiling all eight HIP kernels; `stale()` in `hip()` now skips objects
+    // newer than their source, so the cost of a re-run is the jscpd scan alone (~8 s over
+    // 46 files) and only when something actually changed.
+    //
     // ONE list, serving as both the scan set and cargo's rerun set, so the two cannot
-    // drift apart. Emitted only when the gate is armed: `rerun-if-changed=src` re-runs
-    // this whole script on every Rust edit, and under `rocm` that is hipcc recompiling all
-    // eight kernels for a one-line change in src/.
+    // drift apart.
     const SCAN: &[&str] = &["src", "tests", "build.rs"];
     for p in SCAN {
         println!("cargo:rerun-if-changed={p}");

@@ -45,6 +45,36 @@ fn bump(used: &mut usize, capacity: usize, len: usize, pad: usize) -> anyhow::Re
     Ok(off)
 }
 
+/// The sizing gate both backends' `DeviceTier::new` runs: the tier must fit free device
+/// memory with [`HEADROOM`] left over. Shared for the same reason as [`bump`] — it is
+/// arithmetic about the device budget, not about how bytes get written — and because the
+/// two copies it replaces had to keep one error message in step by hand.
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
+fn guard_capacity(capacity: usize, free: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        capacity + HEADROOM <= free,
+        "device tier {capacity} + {HEADROOM} headroom > free {free}"
+    );
+    Ok(())
+}
+
+/// Leave this much device memory free beyond the tier (driver scratch, kernel dispatch
+/// buffers, the cold-fetch slabs that arrive in M4).
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
+const HEADROOM: usize = 4 << 30; // 4 GiB
+
+/// `copy_out` for either backend's `DeviceBuf`: a fresh `Vec` filled by that type's own
+/// `copy_out_into`. Backend-independent by construction — the transfer is `copy_out_into`'s
+/// and the allocation is nobody's business but this function's.
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
+fn copy_out_owned(
+    fill: impl FnOnce(&mut Vec<u8>) -> anyhow::Result<()>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    fill(&mut out)?;
+    Ok(out)
+}
+
 #[cfg(feature = "rocm")]
 mod ffi {
     use std::ffi::c_void;
@@ -107,20 +137,13 @@ mod tier {
         /// tenant; a 21 GB foreign GTT allocation landing mid-run was the wedge
         /// aggravator behind most colibri device losses).
         const SOLE_TENANT_MAX_GTT: u64 = 1 << 30; // 1 GiB slack for the compositor
-        /// Leave this much device memory free beyond the tier (driver scratch,
-        /// kernel dispatch buffers, the cold-fetch slabs that arrive in M4).
-        const HEADROOM: usize = 4 << 30; // 4 GiB
 
         /// Allocate the resident tier once. Fails loudly if a foreign tenant is
         /// present or the request doesn't fit free device memory with headroom.
         pub fn new(capacity: usize) -> Result<Self> {
             Self::guard_sole_tenant()?;
             let (free, _total) = mem_info()?;
-            ensure!(
-                capacity + Self::HEADROOM <= free,
-                "device tier {capacity} + {} headroom > free {free}",
-                Self::HEADROOM
-            );
+            super::guard_capacity(capacity, free)?;
             // Device-local (MTYPE_RW, full bandwidth) AND host-fillable, so weights
             // load straight into the slab (no separate hipMalloc + H2D). `VmmBuf`
             // owns/frees the mapping.
@@ -207,12 +230,10 @@ mod tier {
             Ok(unsafe { std::slice::from_raw_parts(self.slab.host_mut(), len) }.to_vec())
         }
 
-        /// The bump cursor, for the shared tier tests at file scope. `#[cfg(test)]`, so
+        /// The bump cursor, for the shared `tier_tests` at file scope. `#[cfg(test)]`, so
         /// the field stays private in a real build.
         #[cfg(test)]
-        pub(super) fn used(&self) -> usize {
-            self.used
-        }
+        pub(super) fn used(&self) -> usize { self.used }
     }
 
     /// A standalone mutable device buffer — for per-token activations, the
@@ -298,9 +319,7 @@ mod tier {
         /// the kernel oracle tests use; the per-token decode path uses
         /// [`DeviceBuf::copy_out_into`] to reuse a buffer instead).
         pub fn copy_out(&self) -> Result<Vec<u8>> {
-            let mut out = Vec::new();
-            self.copy_out_into(&mut out)?;
-            Ok(out)
+            super::copy_out_owned(|out| self.copy_out_into(out))
         }
 
         /// Copy the FIRST `len` bytes back into `out` (reused: cleared then
@@ -416,9 +435,10 @@ mod tier {
         /// addressing it is the SAME NUMBER as [`VmmBuf::ptr_mut`], and the whole point of
         /// spelling it separately is that `pin.rs` cannot then rely on that coincidence.
         /// See docs/investigations/vulkan-port.md, "Host pointer != device address"; the ordering rules for
-        /// filling through it are on `ptr_mut` above.
+        /// filling through it are on `ptr_mut` above. Spelled as a call to it rather than
+        /// as a second read of `self.ptr`, so the coincidence is stated once.
         pub fn host_mut(&mut self) -> *mut u8 {
-            self.ptr
+            self.ptr_mut()
         }
     }
 
@@ -466,10 +486,6 @@ mod vktier {
     }
 
     impl DeviceTier {
-        /// Leave this much device memory free beyond the tier (driver scratch, kernel
-        /// dispatch buffers, the cold-fetch slabs that arrive in M4).
-        const HEADROOM: usize = 4 << 30; // 4 GiB
-
         /// Allocate the resident tier once. Fails if the request doesn't fit free
         /// device memory with headroom.
         ///
@@ -482,11 +498,7 @@ mod vktier {
         /// wedge bug it defends against actually was.
         pub fn new(capacity: usize) -> Result<Self> {
             let (free, _total) = mem_info()?;
-            ensure!(
-                capacity + Self::HEADROOM <= free,
-                "device tier {capacity} + {} headroom > free {free}",
-                Self::HEADROOM
-            );
+            super::guard_capacity(capacity, free)?;
             Ok(Self {
                 slab: Buf::new(capacity)?,
                 capacity,
@@ -556,12 +568,10 @@ mod vktier {
             Ok(out)
         }
 
-        /// The bump cursor, for the shared tier tests at file scope. `#[cfg(test)]`, so
-        /// the field stays private in a real build.
+        /// The bump cursor. `place_pads_the_cursor_to_a_word` in this module reads the
+        /// field straight; the shared `tier_tests` at file scope cannot, hence this.
         #[cfg(test)]
-        pub(super) fn used(&self) -> usize {
-            self.used
-        }
+        pub(super) fn used(&self) -> usize { self.used }
     }
 
     /// A standalone mutable device buffer — per-token activations, the descriptor
@@ -603,13 +613,11 @@ mod vktier {
             self.buf.write_at(off, bytes)
         }
 
-        /// Copy the whole buffer back to host as a fresh `Vec` (the ergonomic form the
-        /// kernel oracle tests use; the per-token decode path uses
-        /// [`DeviceBuf::copy_out_into`] to reuse a buffer instead).
+        /// Copy the whole buffer back to host as a fresh `Vec` — the ergonomic form the
+        /// kernel oracle tests use. SYNCS FIRST, like every `copy_out*` here, because it
+        /// goes through [`DeviceBuf::copy_out_into`].
         pub fn copy_out(&self) -> Result<Vec<u8>> {
-            let mut out = Vec::new();
-            self.copy_out_into(&mut out)?;
-            Ok(out)
+            super::copy_out_owned(|out| self.copy_out_into(out))
         }
 
         /// Copy the FIRST `len` bytes back into `out` (reused: cleared then resized).

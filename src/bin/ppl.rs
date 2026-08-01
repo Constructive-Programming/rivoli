@@ -195,6 +195,9 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// The statistics, against hand-built `.nll` files: pairing by header label, the paired
+/// difference itself, and the power arithmetic that decides INCONCLUSIVE. No engine and no
+/// GPU — this half is what makes a quality claim checkable without hardware.
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom

@@ -25,6 +25,19 @@
 //! where the Vulkan backend is not even compiled.
 #![allow(clippy::expect_used)]
 
+// jscpd:ignore-start
+//
+// MIRRORING IS THE POINT, so the duplication gate is off for the four transcriptions
+// below. Each is a statement-for-statement copy of a `common.glsl` function, and it
+// resembles `src/math.rs` because BOTH are transliterations of the same arithmetic in
+// `kernels/common.hpp` — that is precisely what the tests here assert. Factoring the
+// shared body out would leave this file testing `math.rs` against itself, which proves
+// nothing about the shader and is the "check that passes without examining anything"
+// failure this repo keeps re-learning.
+//
+// The gate stays live over the rest of the file — the sweeps, the hash lock and the
+// exhaustive decoders, which are ordinary code.
+
 /// Literal transcription of `common.glsl::f2e4m3`. Deliberately un-idiomatic — it must
 /// mirror the GLSL statement for statement, not read like good Rust.
 fn transcribed_f2e4m3(x: f32) -> u8 {
@@ -97,24 +110,46 @@ fn transcribed_f2bf16(x: f32) -> u16 {
     ((b + (((b >> 16) & 1) + 0x7fff)) >> 16) as u16
 }
 
+// jscpd:ignore-end
+
+/// Walk `exps` × `steps` mantissa positions of both signs, planting `tie` on every
+/// `tie_every`-th step so the sweep lands exactly on the points where round-to-nearest-even
+/// and round-half-away disagree, and hand each value to `chk`. Returns how many it visited.
+///
+/// The two sweeps below differ only in their range, their step count and which pair of
+/// functions they compare; one loop nest keeps them from drifting into sweeping different
+/// shapes of the input space while still reading as if they did.
+fn sweep(
+    exps: std::ops::RangeInclusive<i32>,
+    steps: u32,
+    tie_every: u32,
+    tie: u32,
+    chk: impl Fn(f32),
+) -> u64 {
+    let mut checked = 0u64;
+    for exp in exps {
+        for mstep in 0..steps {
+            let t = if mstep % tie_every == 0 { tie } else { 0 };
+            let mant = (mstep * (0x0080_0000 / steps)) | t;
+            let bits = (((exp + 127) as u32) << 23) | (mant & 0x007f_ffff);
+            for v in [f32::from_bits(bits), -f32::from_bits(bits)] {
+                chk(v);
+                checked += 1;
+            }
+        }
+    }
+    checked
+}
+
 /// Sweep every exponent e4m3 can represent, stepping the mantissa and landing exactly
 /// on the tie points where round-to-nearest-even and round-half-away disagree.
 /// Saturation above 448 and flush below 2^-10 make wider exponents uninteresting.
 #[test]
 fn glsl_f2e4m3_matches_math_rs() {
-    let mut checked = 0u64;
-    for exp in -14i32..=10 {
-        for mstep in 0..4096u32 {
-            let tie = if mstep % 3 == 0 { 0x0008_0000 } else { 0 };
-            let mant = (mstep * (0x0080_0000 / 4096)) | tie;
-            let bits = (((exp + 127) as u32) << 23) | (mant & 0x007f_ffff);
-            for v in [f32::from_bits(bits), -f32::from_bits(bits)] {
-                let (want, got) = (rivoli::math::f32_to_e4m3(v), transcribed_f2e4m3(v));
-                assert_eq!(want, got, "f2e4m3({v:e}) bits={:#x}", v.to_bits());
-                checked += 1;
-            }
-        }
-    }
+    let mut checked = sweep(-14..=10, 4096, 3, 0x0008_0000, |v| {
+        let (want, got) = (rivoli::math::f32_to_e4m3(v), transcribed_f2e4m3(v));
+        assert_eq!(want, got, "f2e4m3({v:e}) bits={:#x}", v.to_bits());
+    });
     for v in [
         0.0f32,
         -0.0,
@@ -152,19 +187,10 @@ fn glsl_f2e4m3_matches_math_rs() {
 
 #[test]
 fn glsl_f2bf16_matches_math_rs_on_finite() {
-    let mut checked = 0u64;
-    for exp in -30i32..=30 {
-        for mstep in 0..8192u32 {
-            let tie = if mstep % 5 == 0 { 0x0000_8000 } else { 0 };
-            let mant = (mstep * (0x0080_0000 / 8192)) | tie;
-            let bits = (((exp + 127) as u32) << 23) | (mant & 0x007f_ffff);
-            for v in [f32::from_bits(bits), -f32::from_bits(bits)] {
-                let (want, got) = (rivoli::math::f32_to_bf16(v), transcribed_f2bf16(v));
-                assert_eq!(want, got, "f2bf16({v:e}) bits={:#x}", v.to_bits());
-                checked += 1;
-            }
-        }
-    }
+    let checked = sweep(-30..=30, 8192, 5, 0x0000_8000, |v| {
+        let (want, got) = (rivoli::math::f32_to_bf16(v), transcribed_f2bf16(v));
+        assert_eq!(want, got, "f2bf16({v:e}) bits={:#x}", v.to_bits());
+    });
     println!("f2bf16 finite: {checked} values, 0 mismatches");
 }
 

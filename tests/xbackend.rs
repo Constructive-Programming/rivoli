@@ -87,52 +87,58 @@ fn swiglu_bytes() {
 }
 
 #[cfg(all(feature = "rocm", not(feature = "vulkan")))]
-fn run_swiglu(g: &[f32], u: &[f32]) -> Vec<u8> {
-    use rivoli::memory::device::DeviceBuf;
-    use rivoli::backend::hip::{device_sync, launch_swiglu};
-    let n = g.len();
-    let mut gb = DeviceBuf::new(n * 4).expect("g");
-    gb.copy_in_at(0, bytemuck_f32(g)).expect("fill g");
-    let mut ub = DeviceBuf::new(n * 4).expect("u");
-    ub.copy_in_at(0, bytemuck_f32(u)).expect("fill u");
-    let mut hb = DeviceBuf::new(n * 4).expect("h");
-    // SAFETY: three live device buffers of n f32, joined before they drop.
-    unsafe {
-        launch_swiglu(
-            gb.ptr() as *const f32,
-            ub.ptr() as *const f32,
-            n,
-            hb.ptr_mut() as *mut f32,
-        )
-        .expect("launch");
-    }
-    device_sync().expect("sync");
-    hb.copy_out().expect("copy out")
+use rivoli::backend::hip::{device_sync, launch_swiglu};
+#[cfg(all(feature = "rocm", not(feature = "vulkan")))]
+use rivoli::memory::device::DeviceBuf as Dev;
+#[cfg(all(feature = "vulkan", not(feature = "rocm")))]
+use rivoli::backend::vk::{Buf as Dev, device_sync, launch_swiglu};
+
+/// A device buffer holding `v`. Upload is the FIRST of the two spellings that differ
+/// between the backends — `copy_in_at` under HIP, `write_at` under Vulkan.
+#[cfg(all(feature = "rocm", not(feature = "vulkan")))]
+fn up(v: &[f32]) -> Dev {
+    let mut d = Dev::new(std::mem::size_of_val(v)).expect("alloc");
+    d.copy_in_at(0, bytemuck_f32(v)).expect("fill");
+    d
 }
 
 #[cfg(all(feature = "vulkan", not(feature = "rocm")))]
+fn up(v: &[f32]) -> Dev {
+    let mut d = Dev::new(std::mem::size_of_val(v)).expect("alloc");
+    d.write_at(0, bytemuck_f32(v)).expect("fill");
+    d
+}
+
+/// `bytes` back from the device. The SECOND spelling that differs: HIP hands back the
+/// whole allocation, Vulkan fills a caller's buffer to a length.
+#[cfg(all(feature = "rocm", not(feature = "vulkan")))]
+fn down(d: &Dev, _bytes: usize) -> Vec<u8> {
+    d.copy_out().expect("copy out")
+}
+
+#[cfg(all(feature = "vulkan", not(feature = "rocm")))]
+fn down(d: &Dev, bytes: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    d.read_into(&mut out, bytes).expect("read");
+    out
+}
+
+/// The dispatch itself is backend-neutral — `launch_swiglu` takes raw device addresses
+/// under both — so the arms above are the only cfg in this file. Two copies of this body
+/// is two chances for the arms to stop dispatching the same work, which would make the
+/// byte comparison this file exists for compare the wrong pair.
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
 fn run_swiglu(g: &[f32], u: &[f32]) -> Vec<u8> {
-    use rivoli::backend::vk::{Buf, device_sync, launch_swiglu};
     let n = g.len();
-    let mut gb = Buf::new(n * 4).expect("g");
-    gb.write_at(0, bytemuck_f32(g)).expect("fill g");
-    let mut ub = Buf::new(n * 4).expect("u");
-    ub.write_at(0, bytemuck_f32(u)).expect("fill u");
-    let mut hb = Buf::new(n * 4).expect("h");
-    // SAFETY: three live Buf device addresses of n f32, joined before they drop.
+    let (gb, ub) = (up(g), up(u));
+    let mut hb = Dev::new(n * 4).expect("h");
+    // SAFETY: three live device addresses of n f32 each, joined before they drop.
     unsafe {
-        launch_swiglu(
-            gb.ptr() as *const f32,
-            ub.ptr() as *const f32,
-            n,
-            hb.ptr_mut() as *mut f32,
-        )
-        .expect("launch");
+        launch_swiglu(gb.ptr() as *const f32, ub.ptr() as *const f32, n, hb.ptr_mut() as *mut f32)
+            .expect("launch");
     }
     device_sync().expect("sync");
-    let mut out = Vec::new();
-    hb.read_into(&mut out, n * 4).expect("read");
-    out
+    down(&hb, n * 4)
 }
 
 #[cfg(not(any(feature = "rocm", feature = "vulkan")))]

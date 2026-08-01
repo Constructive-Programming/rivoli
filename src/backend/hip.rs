@@ -27,6 +27,32 @@ pub struct ExpertDesc {
     pub down_scales: *const u16,
 }
 
+// jscpd:ignore-start
+//
+// EXEMPT FROM THE DUPLICATION GATE, and this is the only kind of thing that is.
+//
+// What follows is not code, it is an ABI: the argument lists of the C entry points in
+// `kernels/*.hip`. They necessarily match the Vulkan launchers in `backend/vk.rs`, because
+// `rocm` and `vulkan` are mutually exclusive and `backend.rs` cfg-selects one glob of the
+// SAME names — `gpu.rs` calls `launch_attend` and gets whichever was compiled. Identical
+// signatures are the contract, not copy-paste.
+//
+// It cannot be deduplicated without making the code worse. `vk.rs`'s own note above
+// `launch_gemv_fp8` states the reason: "the two must stay readable side by side for the
+// bit-exactness comparison to be checkable by eye. Bundling them into a struct here and
+// not there would put a translation step between the two signatures, which is the one
+// place this port cannot afford one." A macro that declares each signature once would
+// remove ~15 of these while breaking goto-definition on every launcher, and roughly 25 of
+// the rest are DIFFERENT kernels that merely take the same shape (`gemv_fp8`/`i8`/`i4`/`vq`
+// all take `x, packed, scale, o_dim, i_dim, y`) — there is one copy of each already and
+// nothing to merge.
+//
+// The real instrument for "do the two backends agree" is behavioural, not syntactic:
+// `tests/xbackend.rs` runs each arm under its own feature and compares raw output bytes.
+//
+// The gate stays live over everything else in this file — it found four genuine
+// duplicated-logic clones here on 2026-08-01 (`record_barrier`, `Stream::live`,
+// `refill_from_mapping`, `dispatch_on`), all outside this block.
 unsafe extern "C" {
     fn rivoli_device_sync() -> i32;
     fn rivoli_memcpy_dtod(dst: *mut u8, src: *const u8, bytes: usize) -> i32;
@@ -247,6 +273,7 @@ unsafe extern "C" {
         e: *mut f32,
     ) -> i32;
 }
+// jscpd:ignore-end
 
 /// Launcher return-code check: 0 = ok, POSITIVE = arg guard, NEGATIVE = -(hipError_t).
 fn check(r: i32, name: &str) -> Result<()> {
@@ -286,6 +313,17 @@ pub unsafe fn memcpy_dtod(dst: *mut u8, src: *const u8, bytes: usize) -> Result<
 pub unsafe fn fill_u32(dst: *mut u8, pat: u32, bytes: usize) -> Result<()> {
     check(unsafe { rivoli_fill_u32(dst, pat, bytes) }, "fill_u32")
 }
+
+// jscpd:ignore-start
+//
+// THE LAUNCHER WALL — same exemption, and for the same reason, as the `extern "C"` block
+// above and `vk.rs`'s wall: from here to the end of the file every item is a signature
+// that mirrors either a `kernels/*.hip` entry point or the Vulkan launcher of the same
+// name, and the mirroring is the contract. See the note above the extern block for the
+// full argument, and for why a signature-declaring macro would not pay.
+//
+// The gate stays live over everything above — `check`, `device_sync` and the memcpy/fill
+// helpers, which is where this file has logic rather than declarations.
 
 /// Streaming MoE: gate/up + down for the absolute expert range `[e_start,
 /// e_start+e_count)` on `stream`, atomically accumulating into the shared fixed-point
@@ -991,3 +1029,4 @@ pub unsafe fn launch_index_head_route(
         unsafe { rivoli_index_head_route(q, w, pool, m_blocks as i32, nh as i32, hd as i32, e) };
     check(r, "index_head_route")
 }
+// jscpd:ignore-end

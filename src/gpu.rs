@@ -231,6 +231,23 @@ fn blocked<T>(acc: &mut u128, name: &'static str, f: impl FnOnce() -> Result<T>)
 }
 
 impl Profile {
+    /// Close the per-layer launch span and bank it under `cpu/launch`.
+    ///
+    /// Both arms of the dense/MoE branch end their launch region at the same point — right
+    /// before the first thing that blocks — and did so with the same five lines written
+    /// twice. The subtraction is the load-bearing part: `sync_wait_ns` grows DURING the
+    /// region whenever a launch had to wait on the device, and leaving it in would bill
+    /// device wait to host launch, which is the same mis-attribution that made the old
+    /// "% hidden" line report 97% on every run.
+    fn close_launch(&mut self, t_launch: std::time::Instant, sync_at_open: u128) {
+        let e_launch = std::time::Instant::now();
+        self.cpu_launch_ns += e_launch
+            .duration_since(t_launch)
+            .as_nanos()
+            .saturating_sub(self.sync_wait_ns - sync_at_open);
+        crate::telemetry::spans::record("cpu/launch", "decode", t_launch, e_launch);
+    }
+
     /// Fold the accumulated buckets into the per-token summary (also fed to OTLP).
     /// `fetch_wall_ns` is the reaper's off-thread load cost.
     ///
@@ -1569,12 +1586,7 @@ impl<'a> GpuEngine<'a> {
                         outp)?;
                 }
                 // Dense layer: attention + MLP were all launches, nothing blocked.
-                    let e_launch = std::time::Instant::now();
-                    self.prof.cpu_launch_ns += e_launch
-                        .duration_since(t_launch)
-                        .as_nanos()
-                        .saturating_sub(self.prof.sync_wait_ns - sync_at_open);
-                    crate::telemetry::spans::record("cpu/launch", "decode", t_launch, e_launch);
+                self.prof.close_launch(t_launch, sync_at_open);
             } else {
                 // Router gate on device, then read logits to route on host.
                 // SAFETY: gate_w resident F32; glp device scratch.
@@ -1583,12 +1595,7 @@ impl<'a> GpuEngine<'a> {
                 // no sync we don't already pay. (All the always-on profile buckets wrap
                 // existing join/D2H points; none add a sync.)
                 // MoE layer: close the launch span before the first blocking call.
-                    let e_launch = std::time::Instant::now();
-                    self.prof.cpu_launch_ns += e_launch
-                        .duration_since(t_launch)
-                        .as_nanos()
-                        .saturating_sub(self.prof.sync_wait_ns - sync_at_open);
-                    crate::telemetry::spans::record("cpu/launch", "decode", t_launch, e_launch);
+                self.prof.close_launch(t_launch, sync_at_open);
                 let t = std::time::Instant::now();
                 // Read the gate logits, route with `bias` borrowed straight out of
                 // `&self.pin` while the routing scratch is borrowed mutably.

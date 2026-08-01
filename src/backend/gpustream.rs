@@ -127,10 +127,14 @@ impl HipStream {
         Self::new()
     }
 
+    // jscpd:ignore-start — mirrors `vkstream::Stream::raw`. Same name, same signature,
+    // different body (a HIP stream handle here, a `Q` tag there); `backend.rs` cfg-selects
+    // one of the two under the SAME path, so the signature is the contract.
     #[inline]
     pub fn raw(&self) -> *mut c_void {
         self.0
     }
+    // jscpd:ignore-end
 }
 
 impl Drop for HipStream {
@@ -237,10 +241,15 @@ mod tests {
 /// is free once `completed() >= release[i]`.
 pub struct Timeline(*mut c_void);
 
+// jscpd:ignore-start — the twin `unsafe impl Send/Sync for Timeline` in `vk.rs` is two
+// lines over a DIFFERENT type, discharged by a different argument (Vulkan semaphores are
+// internally synchronised for wait/signal/query). Two types cannot share one impl.
+//
 // SAFETY: the counter is device signal memory; the HIP calls that touch it are
 // stream-ordered and internally synchronised, and Rust-side access is an atomic load.
 unsafe impl Send for Timeline {}
 unsafe impl Sync for Timeline {}
+// jscpd:ignore-end
 
 impl Timeline {
     pub fn new() -> Result<Self> {

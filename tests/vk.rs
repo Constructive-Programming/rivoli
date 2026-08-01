@@ -40,7 +40,6 @@
 #![allow(clippy::expect_used)]
 
 use rivoli::memory::device::{DeviceBuf, DeviceTier};
-use rivoli::artifact::quant::{matvec_fp8, matvec_i8};
 use rivoli::math::{E4M3_BLOCK, E4M3_MAX, e4m3_to_f32, f32_to_bf16, f32_to_e4m3, silu};
 use rivoli::backend::block_on;
 use rivoli::backend::vk::{
@@ -57,7 +56,7 @@ use rivoli::backend::vk::{
 use std::sync::atomic::Ordering;
 
 mod common;
-use common::{Lcg, assert_close, err_tol, f32b, f32v, u16b};
+use common::{Lcg, assert_close, block_scales, f32b, f32v, gemv_fp8_case, report, u16b, want_i8};
 
 /// Upload `b` to a fresh device buffer. Backend-typed, so it stays here rather than in
 /// `common`: this is `Buf` under Vulkan and `DeviceBuf` under HIP.
@@ -82,11 +81,7 @@ impl Shapes {
     /// Like `assert_close` but records instead of panicking. Always prints the margin.
     /// Shares `err_tol` with it: two copies of a tolerance formula is two tolerances.
     fn close(&mut self, want: &[f32], got: &[f32], label: &str) {
-        let (err, tol) = err_tol(want, got);
-        println!(
-            "{label}: err={err:.3e} tol={tol:.3e} margin={:.1}x",
-            tol / err.max(f32::MIN_POSITIVE)
-        );
+        let (err, tol) = report(want, got, label);
         if err > tol {
             self.bad.push(format!("{label}: err={err:.3e} > tol={tol:.3e}"));
         }
@@ -124,14 +119,117 @@ fn launch(x: &Buf, w: &Buf, y: &mut Buf, o_dim: usize, i_dim: usize) {
     // SAFETY: live Buf device addresses of the documented sizes; nothing is dropped
     // before the caller's device_sync.
     unsafe {
-        launch_gemv_f32(
-            x.ptr() as *const f32,
-            w.ptr() as *const f32,
-            o_dim,
-            i_dim, 1,
-            y.ptr_mut() as *mut f32,
-        )
-        .expect("launch");
+        launch_at(x.ptr() as *const f32, w.ptr() as *const f32, y.ptr_mut() as *mut f32, o_dim, i_dim)
+    }
+}
+
+/// The same dispatch from BARE device addresses, which is the arm [`launch`] cannot serve:
+/// `DeviceTier::place` hands back an address rather than a `Buf`, and two tests deliberately
+/// hold a `DeviceBuf`. Those three sites plus `launch` are why the launcher's arguments are
+/// spelled here and nowhere else.
+///
+/// # Safety
+/// `x` must address `i_dim` live f32, `w` `o_dim`·`i_dim`, `y` `o_dim`, all still mapped
+/// when the caller next joins.
+unsafe fn launch_at(x: *const f32, w: *const f32, y: *mut f32, o_dim: usize, i_dim: usize) {
+    unsafe { launch_gemv_f32(x, w, o_dim, i_dim, 1, y) }.expect("launch");
+}
+
+/// Random `w` and `x` for an `o_dim × i_dim` GEMV, and the host result — the opening four
+/// lines of five tests below. `w` is drawn BEFORE `x`, which is what makes a seed mean the
+/// same data across them.
+fn gemv_case(r: &mut Lcg, o_dim: usize, i_dim: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let w: Vec<f32> = (0..o_dim * i_dim).map(|_| r.f()).collect();
+    let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
+    let mut want = vec![0.0f32; o_dim];
+    matvec_f32(&mut want, &x, &w, i_dim);
+    (w, x, want)
+}
+
+/// One `moe_acc_drain` on `stream`.
+fn drain(out: &mut Buf, acc: &mut Buf, n: usize, rows: usize, gain: f32, stream: *mut std::ffi::c_void) {
+    // SAFETY: live Buf device addresses holding `rows`·`n` u64 and `n` f32, both outliving
+    // the caller's join.
+    unsafe {
+        launch_moe_acc_drain(out.ptr_mut() as *mut f32, acc.ptr_mut() as *mut u64,
+                             n, rows, gain, stream)
+    }
+    .expect("moe_acc_drain");
+}
+
+/// One `gemv_fp8` dispatch + sync, returning `bytes` of `y`.
+#[allow(clippy::too_many_arguments)]
+fn gemv_fp8(x: &Buf, p: &Buf, s: &Buf, y: &mut Buf,
+            o_dim: usize, i_dim: usize, block: usize, bytes: usize) -> Vec<u8> {
+    // SAFETY: live Buf device addresses of the documented sizes — `scale` is
+    // ⌈o_dim/block⌉·⌈i_dim/block⌉ f32 — and nothing is dropped before the sync.
+    unsafe {
+        launch_gemv_fp8(x.ptr() as *const f32, p.ptr(), s.ptr() as *const f32,
+                        o_dim, i_dim, block, 1, y.ptr_mut() as *mut f32)
+    }
+    .expect("launch gemv_fp8");
+    device_sync().expect("sync");
+    readb(y, bytes)
+}
+
+/// One `rmsnorm` dispatch + sync, returning `bytes` of `out`.
+fn rmsnorm(x: &Buf, w: &Buf, out: &mut Buf, n: usize, eps: f32, bytes: usize) -> Vec<u8> {
+    // SAFETY: `x` and `w` are n f32 and `out` is at least `bytes`; all three outlive the sync.
+    unsafe {
+        launch_rmsnorm(x.ptr() as *const f32, w.ptr() as *const f32, n, eps,
+                       out.ptr_mut() as *mut f32)
+    }
+    .expect("launch rmsnorm");
+    device_sync().expect("sync");
+    readb(out, bytes)
+}
+
+/// One `append_kv` dispatch + sync.
+#[allow(clippy::too_many_arguments)]
+fn append_kv(lat: &Buf, rop: &Buf, lc8: &mut Buf, lscale: &mut Buf, rc: &mut Buf,
+             pos: usize, kvl: usize, ropn: usize, n_blocks: usize) {
+    // SAFETY: `lat` is kvl f32 and `rop` ropn f32; the three slabs hold whole rows of their
+    // documented stride and row `pos` is in bounds. All five are borrowed for the call.
+    unsafe {
+        launch_append_kv(lat.ptr() as *const f32, rop.ptr() as *const f32, lc8.ptr_mut(),
+                         lscale.ptr_mut() as *mut f32, rc.ptr_mut() as *mut u16,
+                         pos, kvl, ropn, n_blocks)
+    }
+    .expect("launch append_kv");
+    device_sync().expect("sync");
+}
+
+/// Comparing two buffers of ZEROS and calling it determinism would pass every
+/// reproducibility test in this file, so each one ends here.
+///
+/// Shared by the three whose output is f32 magnitudes. `append_kv`'s and `argmax`'s guards
+/// are deliberately NOT this function: append_kv's untouched rows are legitimately zero so
+/// only the row it wrote can be checked, and argmax returns an i32 beside an f32 and must
+/// not read both as floats. A guard weak enough to cover all five catches none of them.
+fn assert_not_all_zero(first: &[u8]) {
+    assert!(
+        f32v(first).iter().any(|v| v.abs() > 1e-6),
+        "output is all zero — the test proves nothing"
+    );
+}
+
+/// The scratch every guard test dispatches against: one read-only source and one
+/// destination. Owning both keeps them mapped across the `unsafe` block, which matters for
+/// the ACCEPTED controls — the rejected cases never reach a pointer at all.
+struct Scratch {
+    src: Buf,
+    dst: Buf,
+}
+
+impl Scratch {
+    /// The pair AND their device addresses, because every caller wants all three and the
+    /// owner exists only to keep the two mappings alive. `Buf::ptr` hands back a stored
+    /// device address rather than a pointer into the struct, so moving the `Scratch` out of
+    /// here does not invalidate what it returned.
+    fn new(bytes: usize) -> (Self, *const u8, *mut u8) {
+        let mut s = Self { src: dev(&vec![0u8; bytes]), dst: dev(&vec![0u8; bytes]) };
+        let (p, q) = (s.src.ptr(), s.dst.ptr_mut());
+        (s, p, q)
     }
 }
 
@@ -269,12 +367,7 @@ fn gemv_f32_matches_oracle() {
         (33, 97),
         (7, 33),
     ] {
-        let w: Vec<f32> = (0..o_dim * i_dim).map(|_| r.f()).collect();
-        let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
-
-        let mut want = vec![0.0f32; o_dim];
-        matvec_f32(&mut want, &x, &w, i_dim);
-
+        let (w, x, want) = gemv_case(&mut r, o_dim, i_dim);
         let (xb, wb) = (dev(&f32b(&x)), dev(&f32b(&w)));
         // Guard band: allocate a whole extra workgroup's worth of rows and poison
         // them. `o_dim = 255` leaves subgroup 7 of the tail workgroup out of range and
@@ -439,11 +532,7 @@ fn gemv_f32_is_bit_reproducible() {
         || gemv(&xb, &wb, &mut yb, o_dim, i_dim),
         || gemv(&dx, &dw, &mut dy, 33, 96),
     );
-    // Guard against comparing two buffers of zeros and calling it determinism.
-    assert!(
-        f32v(&first).iter().any(|v| v.abs() > 1e-6),
-        "output is all zero — the test proves nothing"
-    );
+    assert_not_all_zero(&first);
     v.check("gemv_f32_is_bit_reproducible");
 }
 
@@ -460,11 +549,7 @@ fn memcpy_dtod_after_dispatch_is_ordered() {
     let v = Validation::new();
     let mut r = Lcg(0xC0B);
     let (o_dim, i_dim) = (128usize, 256usize);
-    let w: Vec<f32> = (0..o_dim * i_dim).map(|_| r.f()).collect();
-    let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
-    let mut want = vec![0.0f32; o_dim];
-    matvec_f32(&mut want, &x, &w, i_dim);
-
+    let (w, x, want) = gemv_case(&mut r, o_dim, i_dim);
     let (xb, wb) = (dev(&f32b(&x)), dev(&f32b(&w)));
     let mut yb = dev(&f32b(&vec![0.0f32; o_dim]));
     let zb = dev(&f32b(&vec![f32::NAN; o_dim]));
@@ -608,18 +693,7 @@ fn a_moe_dispatch_sees_what_the_fetch_queue_wrote() {
     gpu().expect("vulkan init").arm_on(Q::Fetch, &sig).expect("arm");
     block_on(sig);
     // Now a dispatch on the MoE queue reads those bytes: out[o] = 3·Σ_r staged[r][o]/2^44 = 6.
-    // SAFETY: device addresses of live Bufs holding N*ROWS u64 and N f32.
-    unsafe {
-        launch_moe_acc_drain(
-            out.ptr_mut() as *mut f32,
-            staged.ptr_mut() as *mut u64,
-            N,
-            ROWS,
-            3.0,
-            moe.raw(),
-        )
-        .expect("moe_acc_drain");
-    }
+    drain(&mut out, &mut staged, N, ROWS, 3.0, moe.raw());
     block_on(rivoli::backend::stream_signal(moe.raw()).expect("moe signal"));
     let got = f32v(&read(&out, N));
     assert!(
@@ -656,17 +730,7 @@ fn timestamps_measure_gpu_time_and_refuse_when_absent() {
     let wall = std::time::Instant::now();
     start.record(std::ptr::null_mut()).expect("record start");
     for _ in 0..8 {
-        // SAFETY: live device addresses, shapes as allocated.
-        unsafe {
-            launch_gemv_f32(
-                x.ptr() as *const f32,
-                w.ptr() as *const f32,
-                o,
-                i, 1,
-                y.ptr_mut() as *mut f32,
-            )
-            .expect("gemv");
-        }
+        launch(&x, &w, &mut y, o, i);
     }
     end.record(std::ptr::null_mut()).expect("record end");
     device_sync().expect("sync");
@@ -728,18 +792,7 @@ fn the_command_buffer_ring_wraps_without_a_stale_slot() {
     let mut out = dev(&f32b(&vec![0.0f32; N]));
     let moe = rivoli::backend::Stream::compute().expect("compute stream");
     for _ in 0..LAPS {
-        // SAFETY: device addresses of live Bufs holding N*ROWS u64 and N f32.
-        unsafe {
-            launch_moe_acc_drain(
-                out.ptr_mut() as *mut f32,
-                acc.ptr_mut() as *mut u64,
-                N,
-                ROWS,
-                2.0,
-                moe.raw(),
-            )
-            .expect("moe_acc_drain");
-        }
+        drain(&mut out, &mut acc, N, ROWS, 2.0, moe.raw());
     }
     block_on(rivoli::backend::stream_signal(moe.raw()).expect("signal"));
     let got = f32v(&read(&out, N));
@@ -806,11 +859,7 @@ fn kernel_reads_weights_placed_through_the_tier() {
     let v = Validation::new();
     let mut r = Lcg(0x71E);
     let (o_dim, i_dim) = (64usize, 128usize);
-    let w: Vec<f32> = (0..o_dim * i_dim).map(|_| r.f()).collect();
-    let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
-    let mut want = vec![0.0f32; o_dim];
-    matvec_f32(&mut want, &x, &w, i_dim);
-
+    let (w, x, want) = gemv_case(&mut r, o_dim, i_dim);
     let mut tier = DeviceTier::new(4 << 20).expect("tier");
     // Two placements, so the second sits at a non-zero bump offset — an offset that
     // failed to track between the host and device bases would only show up there.
@@ -820,16 +869,7 @@ fn kernel_reads_weights_placed_through_the_tier() {
 
     // SAFETY: both are DEVICE addresses returned by `place`, sized as the launcher
     // documents, inside a tier that outlives the sync below.
-    unsafe {
-        launch_gemv_f32(
-            xp as *const f32,
-            wp as *const f32,
-            o_dim,
-            i_dim, 1,
-            yb.ptr_mut() as *mut f32,
-        )
-        .expect("launch");
-    }
+    unsafe { launch_at(xp as *const f32, wp as *const f32, yb.ptr_mut() as *mut f32, o_dim, i_dim) };
     device_sync().expect("sync");
     assert_close(
         &want,
@@ -861,11 +901,7 @@ fn copy_out_into_sees_the_dispatch_that_preceded_it() {
     let v = Validation::new();
     let mut r = Lcg(0x0D2);
     let (o_dim, i_dim) = (128usize, 256usize);
-    let w: Vec<f32> = (0..o_dim * i_dim).map(|_| r.f()).collect();
-    let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
-    let mut want = vec![0.0f32; o_dim];
-    matvec_f32(&mut want, &x, &w, i_dim);
-
+    let (w, x, want) = gemv_case(&mut r, o_dim, i_dim);
     let (xb, wb) = (dev(&f32b(&x)), dev(&f32b(&w)));
     // A sentinel the kernel cannot produce, so "stale" and "correct" are never confusable.
     let sentinel = vec![-12345.0f32; o_dim];
@@ -875,15 +911,9 @@ fn copy_out_into_sees_the_dispatch_that_preceded_it() {
     // SAFETY: live device addresses of the documented sizes; nothing is dropped before
     // the copy_out_into below, which is what retires the dispatch.
     unsafe {
-        launch_gemv_f32(
-            xb.ptr() as *const f32,
-            wb.ptr() as *const f32,
-            o_dim,
-            i_dim, 1,
-            out.ptr_mut() as *mut f32,
-        )
-        .expect("launch");
-    }
+        launch_at(xb.ptr() as *const f32, wb.ptr() as *const f32, out.ptr_mut() as *mut f32,
+                  o_dim, i_dim)
+    };
     // NO device_sync here. That is the whole test.
     let mut host = Vec::new();
     out.copy_out_into(&mut host).expect("copy_out_into");
@@ -928,15 +958,9 @@ fn copy_in_at_does_not_clobber_a_pending_dispatch() {
 
     // SAFETY: as above; `xb` outlives the sync inside copy_in_at.
     unsafe {
-        launch_gemv_f32(
-            xb.ptr() as *const f32,
-            wb.ptr() as *const f32,
-            o_dim,
-            i_dim, 1,
-            yb.ptr_mut() as *mut f32,
-        )
-        .expect("launch");
-    }
+        launch_at(xb.ptr() as *const f32, wb.ptr() as *const f32, yb.ptr_mut() as *mut f32,
+                  o_dim, i_dim)
+    };
     // Overwrite the INPUT the pending dispatch reads. copy_in_at must retire it first.
     xb.copy_in_at(0, &f32b(&x_new)).expect("clobber");
     device_sync().expect("sync");
@@ -1250,24 +1274,7 @@ fn append_kv_quantizes_bit_exactly() {
     let mut lc8 = poison(lc8_n + GUARD);
     let mut lscale = poison(lscale_n + GUARD);
     let mut rc = poison(rc_n + GUARD);
-    // SAFETY: `latent` is kvl f32 and `rope` ropn f32; the three slabs hold `rows` rows
-    // of their documented stride plus a guard band, and row `pos` is in bounds. All
-    // five outlive the sync.
-    unsafe {
-        launch_append_kv(
-            lb.ptr() as *const f32,
-            rb.ptr() as *const f32,
-            lc8.ptr_mut(),
-            lscale.ptr_mut() as *mut f32,
-            rc.ptr_mut() as *mut u16,
-            pos,
-            kvl,
-            ropn,
-            n_blocks,
-        )
-        .expect("launch");
-    }
-    device_sync().expect("sync");
+    append_kv(&lb, &rb, &mut lc8, &mut lscale, &mut rc, pos, kvl, ropn, n_blocks);
     let g_lc8 = readb(&lc8, lc8_n + GUARD);
     let g_scl = readb(&lscale, lscale_n + GUARD);
     let g_rc = readb(&rc, rc_n + GUARD);
@@ -1325,31 +1332,9 @@ fn append_kv_is_bit_reproducible() {
     let (mut dlc8, mut dlscale, mut drc) =
         (dev(&[0u8; E4M3_BLOCK]), dev(&[0u8; 4]), dev(&[0u8; 128]));
 
-    let run = |lat: &Buf,
-                   rop: &Buf,
-                   lc8: &mut Buf,
-                   lscale: &mut Buf,
-                   rc: &mut Buf,
-                   pos: usize,
-                   kvl: usize,
-                   ropn: usize,
-                   n_blocks: usize| {
-        // SAFETY: sizes as documented above; every Buf outlives the sync.
-        unsafe {
-            launch_append_kv(
-                lat.ptr() as *const f32,
-                rop.ptr() as *const f32,
-                lc8.ptr_mut(),
-                lscale.ptr_mut() as *mut f32,
-                rc.ptr_mut() as *mut u16,
-                pos,
-                kvl,
-                ropn,
-                n_blocks,
-            )
-            .expect("launch");
-        }
-        device_sync().expect("sync");
+    let run = |lat: &Buf, rop: &Buf, lc8: &mut Buf, lscale: &mut Buf, rc: &mut Buf,
+               pos: usize, kvl: usize, ropn: usize, n_blocks: usize| {
+        append_kv(lat, rop, lc8, lscale, rc, pos, kvl, ropn, n_blocks);
         let mut out = readb(lc8, (pos + 1) * kvl);
         out.extend(readb(lscale, (pos + 1) * n_blocks * 4));
         out.extend(readb(rc, (pos + 1) * ropn * 2));
@@ -1382,14 +1367,10 @@ fn argmax_raw(logits: &[f32]) -> Vec<u8> {
     // SAFETY: `logits` is logits.len() f32; each output is one word plus a guard band.
     // All three live until the sync.
     unsafe {
-        launch_argmax(
-            lb.ptr() as *const f32,
-            logits.len(),
-            ib.ptr_mut() as *mut i32,
-            vb.ptr_mut() as *mut f32,
-        )
-        .expect("launch argmax");
+        launch_argmax(lb.ptr() as *const f32, logits.len(),
+                      ib.ptr_mut() as *mut i32, vb.ptr_mut() as *mut f32)
     }
+    .expect("launch argmax");
     device_sync().expect("sync");
     let (gi, gv) = (readb(&ib, 4 + GUARD), readb(&vb, 4 + GUARD));
     assert_untouched(&gi, 4, "argmax out_idx");
@@ -1693,20 +1674,7 @@ fn rmsnorm_matches_the_host_oracle() {
         let want = rmsnorm_oracle(x, w, eps);
         let (xb, wb) = (dev(&f32b(x)), dev(&f32b(w)));
         let mut yb = poison(n * 4 + GUARD);
-        // SAFETY: `x` and `w` are n f32, `y` is n f32 plus the guard band; all three
-        // live until the sync.
-        unsafe {
-            launch_rmsnorm(
-                xb.ptr() as *const f32,
-                wb.ptr() as *const f32,
-                n,
-                eps,
-                yb.ptr_mut() as *mut f32,
-            )
-            .expect("launch");
-        }
-        device_sync().expect("sync");
-        let got = readb(&yb, n * 4 + GUARD);
+        let got = rmsnorm(&xb, &wb, &mut yb, n, eps, n * 4 + GUARD);
         assert_untouched(&got, n * 4, label);
         assert_close(&want, &f32v(&got[..n * 4]), label);
     };
@@ -1777,32 +1745,14 @@ fn rmsnorm_is_bit_reproducible() {
     let (dx, dw) = (dev(&f32b(&x[..301])), dev(&f32b(&w[..301])));
     let mut dy = dev(&vec![0u8; 301 * 4]);
 
-    let run = |x: &Buf, w: &Buf, y: &mut Buf, n: usize| {
-        // SAFETY: sizes as allocated above; every Buf outlives the sync.
-        unsafe {
-            launch_rmsnorm(
-                x.ptr() as *const f32,
-                w.ptr() as *const f32,
-                n,
-                eps,
-                y.ptr_mut() as *mut f32,
-            )
-            .expect("launch");
-        }
-        device_sync().expect("sync");
-        readb(y, n * 4)
-    };
+    let run = |x: &Buf, w: &Buf, y: &mut Buf, n: usize| rmsnorm(x, w, y, n, eps, n * 4);
 
     let first = assert_bit_reproducible(
         "rmsnorm",
         || run(&xb, &wb, &mut yb, n),
         || run(&dx, &dw, &mut dy, 301),
     );
-    // Guard against comparing two buffers of zeros and calling it determinism.
-    assert!(
-        f32v(&first).iter().any(|v| v.abs() > 1e-6),
-        "output is all zero — the test proves nothing"
-    );
+    assert_not_all_zero(&first);
     v.check("rmsnorm_is_bit_reproducible");
 }
 
@@ -1924,14 +1874,12 @@ fn rope_interleave_rotates_each_row() {
 #[test]
 fn linalg_guards_reject_degenerate_arguments() {
     let v = Validation::new();
-    let src = dev(&[0u8; 4096]);
-    let mut dst = dev(&[0u8; 4096]);
-    let (p, q) = (src.ptr(), dst.ptr_mut());
+    let (_s, p, q) = Scratch::new(4096);
 
     let rope = |count: usize, stride: usize, seg: usize| {
-        // SAFETY: `dst` is a live 4096-byte Buf and outlives the sync below; the cases
-        // that are ACCEPTED here write at most 32 f32 into it. The rejected ones never
-        // reach a pointer.
+        // SAFETY: `q` is the Scratch destination — a live 4096-byte Buf that `_s` owns to
+        // the end of this test, so it outlives the sync below. The cases ACCEPTED here
+        // write at most 32 f32 into it; the rejected ones never reach a pointer.
         unsafe { launch_rope(q as *mut f32, count, stride, seg, 3, 10000.0) }
     };
 
@@ -2037,24 +1985,16 @@ fn gemv_i8_matches_the_host_oracle() {
         }
         let scale: Vec<f32> = (0..o_dim).map(|o| 0.011 * (o as f32 + 1.0)).collect();
         let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
-        let mut want = vec![0.0f32; o_dim];
-        matvec_i8(&mut want, &x, &packed, &scale, o_dim, i_dim);
-
+        let want = want_i8(&x, &packed, &scale, o_dim, i_dim);
         let (xb, pb, sb) = (dev(&f32b(&x)), dev(&packed), dev(&f32b(&scale)));
         let mut yb = poison(o_dim * 4 + GUARD);
         // SAFETY: live Buf device addresses of the documented sizes; nothing dropped
         // before the sync.
         unsafe {
-            launch_gemv_i8(
-                xb.ptr() as *const f32,
-                pb.ptr(),
-                sb.ptr() as *const f32,
-                o_dim,
-                i_dim, 1,
-                yb.ptr_mut() as *mut f32,
-            )
-            .expect("launch");
+            launch_gemv_i8(xb.ptr() as *const f32, pb.ptr(), sb.ptr() as *const f32,
+                           o_dim, i_dim, 1, yb.ptr_mut() as *mut f32)
         }
+        .expect("launch");
         device_sync().expect("sync");
         let got = readb(&yb, o_dim * 4 + GUARD);
         let label = format!("gemv_i8 {o_dim}x{i_dim}");
@@ -2099,32 +2039,12 @@ fn gemv_fp8_matches_the_host_oracle() {
         // Seed off BOTH dims: the two i_dim = 512 shapes would otherwise draw identical
         // data, so a bug that happened to cancel on one would cancel on the other too.
         let mut r = Lcg(0xF8 ^ (i_dim as u64) ^ ((o_dim as u64) << 20));
-        let packed: Vec<u8> = (0..o_dim * i_dim).map(|_| f32_to_e4m3(r.f())).collect();
         let sc_cols = i_dim / block;
-        let scale: Vec<f32> = (0..o_dim.div_ceil(block) * sc_cols)
-            .map(|_| (r.f() * 0.1).abs() + 0.01)
-            .collect();
-        let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
-        let mut want = vec![0.0f32; o_dim];
-        matvec_fp8(&mut want, &x, &packed, &scale, i_dim, block);
-
+        let (packed, scale, x, want) =
+            gemv_fp8_case(&mut r, o_dim, i_dim, block, o_dim.div_ceil(block) * sc_cols);
         let (xb, pb, sb) = (dev(&f32b(&x)), dev(&packed), dev(&f32b(&scale)));
         let mut yb = poison(o_dim * 4 + GUARD);
-        // SAFETY: as above; `scale` is ⌈o_dim/block⌉·⌈i_dim/block⌉ f32 as documented.
-        unsafe {
-            launch_gemv_fp8(
-                xb.ptr() as *const f32,
-                pb.ptr(),
-                sb.ptr() as *const f32,
-                o_dim,
-                i_dim,
-                block,
-                1,
-                yb.ptr_mut() as *mut f32)
-            .expect("launch");
-        }
-        device_sync().expect("sync");
-        let got = readb(&yb, o_dim * 4 + GUARD);
+        let got = gemv_fp8(&xb, &pb, &sb, &mut yb, o_dim, i_dim, block, o_dim * 4 + GUARD);
         let label = format!("gemv_fp8 {geometry} {o_dim}x{i_dim}");
         assert_untouched(&got, o_dim * 4, &label);
         shapes.close(&want, &f32v(&got[..o_dim * 4]), &label);
@@ -2142,9 +2062,7 @@ fn gemv_fp8_splitk_is_bit_reproducible() {
     let (o_dim, i_dim, block) = (64usize, 4096usize, 128usize);
     let mut r = Lcg(0x5B7);
     let packed: Vec<u8> = (0..o_dim * i_dim).map(|_| f32_to_e4m3(r.f())).collect();
-    let scale: Vec<f32> = (0..o_dim.div_ceil(block) * (i_dim / block))
-        .map(|_| (r.f() * 0.1).abs() + 0.01)
-        .collect();
+    let scale = block_scales(&mut r, o_dim.div_ceil(block) * (i_dim / block));
     let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
     let (xb, pb, sb) = (dev(&f32b(&x)), dev(&packed), dev(&f32b(&scale)));
     let mut yb = dev(&f32b(&vec![0.0f32; o_dim]));
@@ -2158,21 +2076,7 @@ fn gemv_fp8_splitk_is_bit_reproducible() {
     let mut dy = dev(&f32b(&[0.0f32; 32]));
 
     let run = |xb: &Buf, pb: &Buf, sb: &Buf, yb: &mut Buf, o: usize, i: usize| -> Vec<u8> {
-        // SAFETY: live device addresses of the documented sizes.
-        unsafe {
-            launch_gemv_fp8(
-                xb.ptr() as *const f32,
-                pb.ptr(),
-                sb.ptr() as *const f32,
-                o,
-                i,
-                block,
-                1,
-                yb.ptr_mut() as *mut f32)
-            .expect("launch");
-        }
-        device_sync().expect("sync");
-        readb(yb, o * 4)
+        gemv_fp8(xb, pb, sb, yb, o, i, block, o * 4)
     };
 
     let first = assert_bit_reproducible(
@@ -2180,10 +2084,7 @@ fn gemv_fp8_splitk_is_bit_reproducible() {
         || run(&xb, &pb, &sb, &mut yb, o_dim, i_dim),
         || run(&dx, &dp, &ds, &mut dy, 32, 512),
     );
-    assert!(
-        f32v(&first).iter().any(|v| v.abs() > 1e-6),
-        "output is all zero — the test proves nothing"
-    );
+    assert_not_all_zero(&first);
     v.check("gemv_fp8_splitk_is_bit_reproducible");
 }
 
@@ -2345,13 +2246,8 @@ fn oracle_wave_sum(partials: [f32; ORACLE_WAVE]) -> f32 {
 /// contracts differently, this is where it will show — as a bit mismatch, loudly, which
 /// is the point of asserting bit-identity rather than a tolerance.
 fn oracle_fp8_dot_strided(
-    x: &[f32],
-    wrow: &[u8],
-    scalerow: &[f32],
-    i_dim: usize,
-    block: usize,
-    start: usize,
-    stride: usize,
+    x: &[f32], wrow: &[u8], scalerow: &[f32],
+    i_dim: usize, block: usize, start: usize, stride: usize,
 ) -> f32 {
     let mut acc = 0.0f32;
     let n4 = i_dim >> 2;
@@ -2384,15 +2280,8 @@ fn oracle_fp8_dot_strided(
 /// of the block-scale grid — the transpose of every other fp8 kernel here.
 #[allow(clippy::too_many_arguments)]
 fn mla_absorb_oracle(
-    q: &[f32],
-    kvb: &[u8],
-    kvb_scale: &[f32],
-    h: usize,
-    qh: usize,
-    nope: usize,
-    vh: usize,
-    kvl: usize,
-    block: usize,
+    q: &[f32], kvb: &[u8], kvb_scale: &[f32],
+    h: usize, qh: usize, nope: usize, vh: usize, kvl: usize, block: usize,
 ) -> Vec<f32> {
     assert!(h > 0 && qh > 0 && nope > 0 && vh > 0 && kvl > 0 && block > 0, "guard 1001");
     assert!(block.is_power_of_two(), "guard 1003: blk_shift needs a power-of-two tile");
@@ -2434,14 +2323,8 @@ fn mla_absorb_oracle(
 /// the opposite of `mla_absorb_oracle`. The kernel hoists the row out; so does this.
 #[allow(clippy::too_many_arguments)]
 fn mla_value_oracle(
-    clat: &[f32],
-    kvb: &[u8],
-    kvb_scale: &[f32],
-    h: usize,
-    nope: usize,
-    vh: usize,
-    kvl: usize,
-    block: usize,
+    clat: &[f32], kvb: &[u8], kvb_scale: &[f32],
+    h: usize, nope: usize, vh: usize, kvl: usize, block: usize,
 ) -> Vec<f32> {
     assert!(h > 0 && nope > 0 && vh > 0 && kvl > 0 && block > 0, "guard 1001");
     assert!(block.is_power_of_two(), "guard 1003: blk_shift needs a power-of-two tile");
@@ -2481,19 +2364,12 @@ fn mla_value_oracle(
 ///
 /// `rows` is the full kv_b row count, `h·(nope+vh)`; the block scale is a 2-D tile grid
 /// over (rows × kvl), so its length is `⌈rows/block⌉·⌈kvl/block⌉`.
-fn mla_inputs(
-    seed: u64,
-    xn: usize,
-    rows: usize,
-    kvl: usize,
-    block: usize,
-) -> (Vec<f32>, Vec<u8>, Vec<f32>) {
+fn mla_inputs(seed: u64, xn: usize, rows: usize, kvl: usize, block: usize)
+    -> (Vec<f32>, Vec<u8>, Vec<f32>) {
     let mut r = Lcg(seed);
     let x: Vec<f32> = (0..xn).map(|_| r.f()).collect();
     let kvb: Vec<u8> = (0..rows * kvl).map(|_| f32_to_e4m3(r.f())).collect();
-    let scale: Vec<f32> = (0..rows.div_ceil(block) * kvl.div_ceil(block))
-        .map(|_| (r.f() * 0.1).abs() + 0.01)
-        .collect();
+    let scale = block_scales(&mut r, rows.div_ceil(block) * kvl.div_ceil(block));
     (x, kvb, scale)
 }
 
@@ -2524,19 +2400,10 @@ fn mla_value_fp8_matches_the_host_oracle() {
     let mut out = poison(h * vh * 4 + GUARD);
     // SAFETY: live Bufs of the documented sizes; `out` holds h·vh f32 plus a guard band.
     unsafe {
-        launch_mla_value_fp8(
-            cb.ptr() as *const f32,
-            kb.ptr(),
-            sb.ptr() as *const f32,
-            h,
-            nope,
-            vh,
-            kvl,
-            block, 1,
-            out.ptr_mut() as *mut f32,
-        )
-        .expect("launch");
+        launch_mla_value_fp8(cb.ptr() as *const f32, kb.ptr(), sb.ptr() as *const f32,
+                             h, nope, vh, kvl, block, 1, out.ptr_mut() as *mut f32)
     }
+    .expect("launch");
     device_sync().expect("sync");
     let got = readb(&out, h * vh * 4 + GUARD);
     assert_untouched(&got, h * vh * 4, "mla_value_fp8");
@@ -2570,20 +2437,10 @@ fn mla_absorb_fp8_matches_the_host_oracle() {
     let mut out = poison(h * kvl * 4 + GUARD);
     // SAFETY: live Bufs of the documented sizes; `out` holds h·kvl f32 plus a guard band.
     unsafe {
-        launch_mla_absorb_fp8(
-            qb.ptr() as *const f32,
-            kb.ptr(),
-            sb.ptr() as *const f32,
-            h,
-            qh,
-            nope,
-            vh,
-            kvl,
-            block, 1,
-            out.ptr_mut() as *mut f32,
-        )
-        .expect("launch");
+        launch_mla_absorb_fp8(qb.ptr() as *const f32, kb.ptr(), sb.ptr() as *const f32,
+                              h, qh, nope, vh, kvl, block, 1, out.ptr_mut() as *mut f32)
     }
+    .expect("launch");
     device_sync().expect("sync");
     let got = readb(&out, h * kvl * 4 + GUARD);
     assert_untouched(&got, h * kvl * 4, "mla_absorb_fp8");
@@ -2629,13 +2486,8 @@ fn att_plan(h: usize, nr: usize, have_scratch: bool) -> (usize, usize) {
 /// The staged tile, widened exactly as the shader widens it: latent fp8 × its per-128
 /// block scale, roped key bf16 → f32. `exp`-free, so this part is bit-exact.
 fn att_widen(
-    lc8: &[u8],
-    lscale: &[f32],
-    rc: &[u16],
-    t: usize,
-    kvl: usize,
-    rope: usize,
-    n_blocks: usize,
+    lc8: &[u8], lscale: &[f32], rc: &[u16],
+    t: usize, kvl: usize, rope: usize, n_blocks: usize,
 ) -> (Vec<f32>, Vec<f32>) {
     let l: Vec<f32> = (0..kvl)
         .map(|i| e4m3_to_f32(lc8[t * kvl + i]) * lscale[t * n_blocks + i / 128])
@@ -2653,18 +2505,8 @@ fn att_widen(
 /// an explicit `fma`, and what hipcc's ISA shows.
 #[allow(clippy::too_many_arguments)]
 fn att_split(
-    qa: &[f32],
-    qr: &[f32],
-    lc8: &[u8],
-    lscale: &[f32],
-    rc: &[u16],
-    rows: Option<&[u32]>,
-    r_begin: usize,
-    r_end: usize,
-    kvl: usize,
-    rope: usize,
-    n_blocks: usize,
-    scale: f32,
+    qa: &[f32], qr: &[f32], lc8: &[u8], lscale: &[f32], rc: &[u16], rows: Option<&[u32]>,
+    r_begin: usize, r_end: usize, kvl: usize, rope: usize, n_blocks: usize, scale: f32,
 ) -> (Vec<f32>, f32, f32) {
     let mut acc = vec![0.0f32; kvl];
     let mut m = f32::NEG_INFINITY;
@@ -2717,18 +2559,8 @@ fn att_split(
 /// CPU oracle for the whole attention, splits and all.
 #[allow(clippy::too_many_arguments)]
 fn attend_oracle(
-    qabs: &[f32],
-    qrope: &[f32],
-    lc8: &[u8],
-    lscale: &[f32],
-    rc: &[u16],
-    rows: Option<&[u32]>,
-    h: usize,
-    nr: usize,
-    kvl: usize,
-    rope: usize,
-    n_blocks: usize,
-    scale: f32,
+    qabs: &[f32], qrope: &[f32], lc8: &[u8], lscale: &[f32], rc: &[u16], rows: Option<&[u32]>,
+    h: usize, nr: usize, kvl: usize, rope: usize, n_blocks: usize, scale: f32,
     have_scratch: bool,
 ) -> Vec<f32> {
     let (n_splits, tps) = att_plan(h, nr, have_scratch);
@@ -2778,19 +2610,13 @@ fn attend_oracle(
 /// Inputs for the attention tests: `(qabs, qrope, lc8, lscale, rc)`.
 type AttInputs = (Vec<f32>, Vec<f32>, Vec<u8>, Vec<f32>, Vec<u16>);
 
-fn att_inputs(
-    seed: u64,
-    h: usize,
-    tokens: usize,
-    kvl: usize,
-    rope: usize,
-    n_blocks: usize,
-) -> AttInputs {
+fn att_inputs(seed: u64, h: usize, tokens: usize, kvl: usize, rope: usize, n_blocks: usize)
+    -> AttInputs {
     let mut r = Lcg(seed);
     let qabs: Vec<f32> = (0..h * kvl).map(|_| r.f()).collect();
     let qrope: Vec<f32> = (0..h * rope).map(|_| r.f()).collect();
     let lc8: Vec<u8> = (0..tokens * kvl).map(|_| f32_to_e4m3(r.f())).collect();
-    let lscale: Vec<f32> = (0..tokens * n_blocks).map(|_| (r.f() * 0.1).abs() + 0.01).collect();
+    let lscale = block_scales(&mut r, tokens * n_blocks);
     let rc: Vec<u16> = (0..tokens * rope).map(|_| f32_to_bf16(r.f())).collect();
     (qabs, qrope, lc8, lscale, rc)
 }
@@ -2798,19 +2624,9 @@ fn att_inputs(
 /// Dispatch the attention and read back `clat`.
 #[allow(clippy::too_many_arguments)]
 fn run_attend(
-    qabs: &[f32],
-    qrope: &[f32],
-    lc8: &[u8],
-    lscale: &[f32],
-    rc: &[u16],
-    h: usize,
-    nr: usize,
-    kvl: usize,
-    rope: usize,
-    n_blocks: usize,
-    scale: f32,
-    with_scratch: bool,
-    rows: Option<&[u32]>,
+    qabs: &[f32], qrope: &[f32], lc8: &[u8], lscale: &[f32], rc: &[u16],
+    h: usize, nr: usize, kvl: usize, rope: usize, n_blocks: usize, scale: f32,
+    with_scratch: bool, rows: Option<&[u32]>,
 ) -> Vec<f32> {
     let rcb: Vec<u8> = rc.iter().flat_map(|v| v.to_le_bytes()).collect();
     let (qb, rb) = (dev(&f32b(qabs)), dev(&f32b(qrope)));
@@ -2829,23 +2645,12 @@ fn run_attend(
     // or an `nr`-entry u32 buffer outliving the sync.
     unsafe {
         launch_attend(
-            qb.ptr() as *const f32,
-            rb.ptr() as *const f32,
-            lb.ptr(),
-            sb.ptr() as *const f32,
-            kb.ptr() as *const u16,
-            rowsp,
-            h,
-            nr,
-            kvl,
-            rope,
-            n_blocks,
-            scale,
-            out.ptr_mut() as *mut f32,
-            pp,
+            qb.ptr() as *const f32, rb.ptr() as *const f32, lb.ptr(), sb.ptr() as *const f32,
+            kb.ptr() as *const u16, rowsp, h, nr, kvl, rope, n_blocks, scale,
+            out.ptr_mut() as *mut f32, pp,
         )
-        .expect("launch");
     }
+    .expect("launch attend");
     device_sync().expect("sync");
     let got = readb(&out, h * kvl * 4 + GUARD);
     assert_untouched(&got, h * kvl * 4, "mla_attend");
@@ -3008,9 +2813,7 @@ fn attend_honours_the_dsa_row_selection() {
 #[test]
 fn attend_guards_reject_degenerate_arguments() {
     let v = Validation::new();
-    let src = dev(&[0u8; 8192]);
-    let mut dst = dev(&[0u8; 8192]);
-    let (p, q) = (src.ptr(), dst.ptr_mut());
+    let (_s, p, q) = Scratch::new(8192);
 
     // SAFETY: every case is rejected before a pointer is dereferenced.
     unsafe {
@@ -3043,9 +2846,7 @@ fn attend_guards_reject_degenerate_arguments() {
 #[test]
 fn mla_guards_reject_degenerate_arguments() {
     let v = Validation::new();
-    let src = dev(&[0u8; 4096]);
-    let mut dst = dev(&[0u8; 4096]);
-    let (p, q) = (src.ptr(), dst.ptr_mut());
+    let (_s, p, q) = Scratch::new(4096);
 
     // SAFETY: every case is rejected before a pointer is dereferenced; the accepted
     // controls dispatch over live 4096-byte Bufs and are retired by the sync below.
@@ -3069,13 +2870,8 @@ fn mla_guards_reject_degenerate_arguments() {
         // would leave two of this launcher's five dimension arms untested, and an
         // untested guard is indistinguishable from its absence — which is the whole
         // rationale for this test.
-        let abs = |h: usize,
-                   qh: usize,
-                   nope: usize,
-                   vh: usize,
-                   kvl: usize,
-                   block: usize,
-                   kvb: *const u8| {
+        let abs = |h: usize, qh: usize, nope: usize, vh: usize,
+                   kvl: usize, block: usize, kvb: *const u8| {
             launch_mla_absorb_fp8(
                 p as *const f32, kvb, p as *const f32, h, qh, nope, vh, kvl, block, 1, q as *mut f32,
             )
@@ -3198,14 +2994,8 @@ fn oracle_dot_vq(idxrow: &[u8], scalerow: &[u8], cb: &[u16], x: &[f32], i_dim: u
 
 #[allow(clippy::too_many_arguments)]
 fn moe_gateup_oracle(
-    x: &[f32],
-    descs: &[ExpertBytes],
-    gate_cb: &[u16],
-    up_cb: &[u16],
-    hidden: usize,
-    inter: usize,
-    e_start: usize,
-    e_count: usize,
+    x: &[f32], descs: &[ExpertBytes], gate_cb: &[u16], up_cb: &[u16],
+    hidden: usize, inter: usize, e_start: usize, e_count: usize,
 ) -> Vec<f32> {
     let (rb, ng) = (vq_row_bytes(hidden), vq_groups(hidden));
     let mut h = vec![0.0f32; (e_start + e_count) * inter];
@@ -3234,14 +3024,8 @@ fn moe_gateup_oracle(
 
 #[allow(clippy::too_many_arguments)]
 fn moe_down_oracle(
-    descs: &[ExpertBytes],
-    down_cb: &[u16],
-    wexpert: &[f32],
-    h: &[f32],
-    hidden: usize,
-    inter: usize,
-    e_start: usize,
-    e_count: usize,
+    descs: &[ExpertBytes], down_cb: &[u16], wexpert: &[f32], h: &[f32],
+    hidden: usize, inter: usize, e_start: usize, e_count: usize,
 ) -> Vec<f32> {
     let (rb, ng) = (vq_row_bytes(inter), vq_groups(inter));
     let mut partial = vec![0.0f32; (e_start + e_count) * hidden];
@@ -3380,32 +3164,14 @@ fn moe_vq_matches_the_host_oracles() {
     // six-address descriptors whose targets outlive the sync.
     unsafe {
         launch_moe_expert_range(
-            xb.ptr() as *const f32,
-            hidden,
-            inter,
-            0,
-            e_count,
-            db.ptr() as *const rivoli::backend::vk::ExpertDesc,
-            gcb.ptr() as *const u16,
-            ucb.ptr() as *const u16,
-            dcb.ptr() as *const u16,
-            wb.ptr() as *const f32,
-            hb.ptr_mut() as *mut f32,
-            ab.ptr_mut() as *mut u64,
-            1,
-            std::ptr::null_mut(),
+            xb.ptr() as *const f32, hidden, inter, 0, e_count,
+            db.ptr() as *const rivoli::backend::vk::ExpertDesc, gcb.ptr() as *const u16,
+            ucb.ptr() as *const u16, dcb.ptr() as *const u16, wb.ptr() as *const f32,
+            hb.ptr_mut() as *mut f32, ab.ptr_mut() as *mut u64, 1, std::ptr::null_mut(),
         )
-        .expect("expert range");
-        launch_moe_acc_drain(
-            ob.ptr_mut() as *mut f32,
-            ab.ptr_mut() as *mut u64,
-            hidden,
-            1,
-            1.0,
-            std::ptr::null_mut(),
-        )
-        .expect("drain");
     }
+    .expect("expert range");
+    drain(&mut ob, &mut ab, hidden, 1, 1.0, std::ptr::null_mut());
     device_sync().expect("sync");
 
     let got_h = f32v(&readb(&hb, e_count * inter * 4));
@@ -3446,9 +3212,7 @@ fn moe_vq_matches_the_host_oracles() {
 #[test]
 fn moe_guards_reject_degenerate_arguments() {
     let v = Validation::new();
-    let src = dev(&[0u8; 4096]);
-    let mut dst = dev(&[0u8; 4096]);
-    let (p, q) = (src.ptr(), dst.ptr_mut());
+    let (_s, p, q) = Scratch::new(4096);
     // SAFETY: every case is rejected before a pointer is dereferenced.
     unsafe {
         let mo = |hidden: usize, inter: usize, e_count: usize| {

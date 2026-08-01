@@ -41,6 +41,29 @@ verdict: PROPOSED, mostly not built. Keep OTLP — measured, no leaner path exis
 > **Items 1–4 and 7–10 are untouched, and item 1 is still the one that matters**: nothing
 > identifies the run, so every metric series is still uncomparable.
 
+> **ITEM 1 SHIPPED 2026-08-01, later the same day.** Run identity is now on every exported
+> datapoint: `mode`, `cache_policy`, `attn`, and `max_mem_gib` (omitted when the budget
+> auto-sizes), built by `RunInfo::labels()` and appended in `export_metrics` to the
+> `ms_per_tok` class gauge and to all six scalars. `--mode hybrid --max-mem 115` and
+> `--mode int3-vq --max-mem 70` are no longer the same series. Documented in
+> [`measurement/traces.md`](../measurement/traces.md) under "Metric labels — which run this
+> is", which is where the live half belongs.
+>
+> **Two deliberate departures from §2a as written:**
+>
+> - **`mtp_min_conf` is NOT in the label set.** §2a lists it as "new field, see 2b", and
+>   adding it means adding a `RunInfo` field *and setting it in `src/main.rs`* — which makes
+>   it part of item 3, not item 1. It is the one row of §2a's table still outstanding, and
+>   the gate setting therefore remains invisible on both the chart and the root span.
+> - **The test that landed is the label half, not §5's `series()` test.** §5 step 1 (moving
+>   the class table onto `ProfileSummary::series()`) is checklist item 2 and is untouched;
+>   the same *structural* argument was applied to the labels instead — `RunInfo::labels()`
+>   is deliberately outside `mod otlp`, so the default `--features rocm` build compiles the
+>   only place `RunInfo`'s fields are named for the exporter, and
+>   `telemetry::run_label_tests` (three tests, no feature, no GPU, no collector) asserts the
+>   label keys, the omit-when-`None` rule, and that two budgets do not collide. Item 2 still
+>   needs doing for the class table, which is where the `launch_ms` E0609 actually came from.
+
 ## STATE — the answer in fifteen lines
 
 1. **The metrics half has a hole that makes it nearly useless, and it is not the crate
@@ -50,6 +73,8 @@ verdict: PROPOSED, mostly not built. Keep OTLP — measured, no leaner path exis
    Prometheus series**. `traces.md:106` tells the reader to "search by which mode / which
    policy / which budget, then read the numbers off a chart" — the chart has no such label
    to filter on. Fix this first; nothing else in this plan matters until it is done.
+   **DONE 2026-08-01** — four of §2a's five labels are on every datapoint; see the note
+   above for the fifth (`mtp_min_conf`, which belongs to item 3).
 2. **Speculative decode is on by default and is invisible to the exporter.** `mtp_hit` /
    `mtp_seen` / `mtp_verify` (`src/gpu.rs:434-458`) go to stdout only
    (`src/gpu.rs:2610-2678`). Break-even is 53% acceptance and acceptance tracks the *text*
@@ -127,6 +152,11 @@ table), so the live levers are **fewer bytes** (roadmap #2) and **fewer passes**
 telling you a run is not comparable.
 
 ### 2a. Run identity on every datapoint — **do this first, alone if nothing else**
+
+> **BUILT 2026-08-01**, everything below except the `mtp_min_conf` row. The mechanism is
+> exactly as proposed — one shared attribute set appended to every `record()` — with the
+> set itself built by `RunInfo::labels()` in always-compiled code rather than inside
+> `mod otlp`, so a `RunInfo` field rename is a compile error under plain `--features rocm`.
 
 Without it the metrics half cannot answer any question it is drawn for. Add a shared
 attribute set to every `record()` in `export_metrics`:
@@ -412,12 +442,16 @@ named in code that gets compiled.
 Each step is independently landable and independently useful. Steps 1–2 are the ones that
 make the feature genuinely useful; the rest is hygiene.
 
-- [ ] **1. Run identity on every metric datapoint** (`src/telemetry.rs:923-986`). Build one
+- [x] **1. Run identity on every metric datapoint** (`src/telemetry.rs:923-986`). Build one
       `Vec<KeyValue>` from `RunInfo` (`mode`, `cache_policy`, `attn`, `max_mem_gib` when
       `Some`, `mtp_min_conf`) and append it in the `g()` closure and every scalar `record()`.
       Add `mtp_min_conf: f32` to `RunInfo` (`src/telemetry.rs:441`, set at
       `src/main.rs:763-778`) and to the root span. **Without this step nothing else on this
       list is worth doing.**
+      **DONE 2026-08-01** for the four `RunInfo` already carries, via `RunInfo::labels()` +
+      `telemetry::run_label_tests`. `mtp_min_conf` is **not** done: the field does not exist
+      and populating it is a `src/main.rs` edit, so it moves to item 3, which is where the
+      rest of the MTP work is. Until then no chart can tell a gated run from an ungated one.
 - [ ] **2. Move the class table to `ProfileSummary::series()`** (§5 step 1) and rewrite
       `export_metrics` + `report()`'s class block to iterate it. Add the test (§5 step 2).
       Run `cargo test --release --features rocm` **and** `cargo build --release --features
@@ -426,6 +460,9 @@ make the feature genuinely useful; the rest is hygiene.
       `Profile::summary` — note the MTP counters live on `GpuEngine`, not `Profile`, so they
       pass as arguments the way `hits`/`misses`/`fetch_wall_ns` already do
       (`src/gpu.rs:255-262`). Guard on `mtp_seen > 0`.
+      **Also inherits §2a's last row**: add `mtp_min_conf` to `RunInfo` and to
+      `RunInfo::labels()` — one line each — so the gate setting becomes a label like the
+      rest. Item 1 could not, because setting the field is a `src/main.rs` edit.
 - [ ] **4. `moe_us_by_miss` gauges** (§2c). Data is already on the summary; this is a loop
       over 16 buckets, skipping `None`.
 - [x] **5. Drop the dead metrics** (§3): `fetch_hidden_pct`, `split/exposed-fetch`,
@@ -446,10 +483,20 @@ make the feature genuinely useful; the rest is hygiene.
       on `misses`. Bump nothing else; the CLASS/PHASE stacking distinction
       (`traces.md:224-227`) is correct and must survive the edit.
 - [ ] **11. `traces.md`**: ~~strike `route_j`/`route_m` (`:98`, `:108`)~~ **done 2026-08-01,
-      with `2q_kin_pct`/`2q_kout_pct` and `rivoli_fetch_hidden_pct` beside them**; document
+      with `2q_kin_pct`/`2q_kout_pct` and `rivoli_fetch_hidden_pct` beside them**; ~~document
       the new metric set and labels in the emit table (`:85-86`), and add the `rocm,otlp`
-      build line. Then move this file's live half into it and re-status this doc
+      build line~~ **done 2026-08-01 for the labels** — the emit row names them, a new
+      "Metric labels — which run this is" section states the datapoint-not-resource rule and
+      the cardinality bound, the Alloy config comment says why `target_info` is the trap, and
+      the `rocm,otlp` build line is in "Things that will bite". Still to document: whatever
+      items 3, 4, 7 and 8 add. Then move this file's live half into it and re-status this doc
       `closed-shipped`.
+
+      **For whoever does that re-status:** this file's `verdict:` front matter still reads
+      "add run-identity labels **without which every metric series is uncomparable**", which
+      item 1 has now answered. It was left alone deliberately — the verdict is duplicated in
+      [`00-orientation/INDEX.md`](../00-orientation/INDEX.md) and `tests/docs.rs` fails
+      unless both change in the same edit.
 - [ ] **12.** `cargo test --release --features rocm --test docs` and
       `cargo clippy --release --features rocm,otlp --all-targets`.
 
