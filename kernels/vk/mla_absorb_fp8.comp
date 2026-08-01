@@ -65,7 +65,7 @@ void main() {
     // q's per-head slice; the absorb reads its first `nope` entries.
     uint qoff = head * uint(pc.qh);
 
-    // INDEX CEILING, per docs/VULKAN.md. Largest index is the byte offset `row * kvl`:
+    // INDEX CEILING, per docs/reference/vulkan-kernels.md, "Index width". Largest index is the byte offset `row * kvl`:
     // row < H·(nope+vh) = 64·448 = 28672 and kvl = 512 at GLM dims, so it peaks near
     // 1.47e7 — ~292x clear of the 32-bit wrap. Computed in 64-bit regardless, since the
     // weight base is a device address.
@@ -73,7 +73,7 @@ void main() {
     for (uint d = 0u; d < uint(pc.nope); ++d) {
         uint row = rbase + d;
         // One BYTE per thread per step, read as the containing 32-bit word and shifted:
-        // VK_KHR_8bit_storage is deliberately not required (docs/VULKAN.md). Adjacent
+        // VK_KHR_8bit_storage is deliberately not required (docs/reference/vulkan-kernels.md, "Device requirements"). Adjacent
         // threads own adjacent `i`, so the four lanes sharing a word read it together.
         uint64_t off = uint64_t(row) * uint64_t(pc.kvl) + uint64_t(i);
         uint word = RoU32(pc.kvb + (off & ~3ul)).v[0];

@@ -4,7 +4,7 @@
 // is unspecified to the last bit in both languages: Vulkan guarantees `exp2` to 3 ULP and
 // derives `exp`, HIP's `expf` has its own accuracy contract. Two correct implementations
 // disagree in the low bits. The oracle's tolerance covers it; the token-ID acceptance
-// gate in docs/VULKAN.md may not, and this is one of the places to look first if it
+// gate in docs/investigations/vulkan-port.md may not, and this is one of the places to look first if it
 // fails. Recorded rather than papered over.
 //
 // The divide is by a RUNTIME value, so the reciprocal rewrite that bit append_kv cannot

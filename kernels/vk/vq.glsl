@@ -65,7 +65,7 @@ uint vq_half(uint64_t base, uint64_t off) {
 //
 // Four multiplies feeding three adds admit many legal contractions and they give different
 // results, so the port spells hipcc's choice explicitly rather than hoping ACO agrees —
-// the exactness strategy's step 3 (docs/VULKAN.md).
+// the exactness strategy's step 3 (docs/reference/vulkan-kernels.md).
 //
 // `v_fma_mix_f32` takes its fp16 operand without a separate convert. That is NOT a
 // divergence: every finite fp16 value is exactly representable in f32 (10 mantissa bits

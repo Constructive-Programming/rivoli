@@ -39,7 +39,7 @@
           "showLineNumbers": false,
           "showMiniMap": false
         },
-        "content": "**The class series OVERLAP — never stack them.** `io-wait` runs on the reaper thread concurrently with the decode thread, so it routinely exceeds 100% of wall; that is the streaming design working, not an error. Only the **phase** row (`route`/`moe`/`tail`) partitions wall and may be stacked.\n\n**`gpu-wait` is not GPU utilisation.** It is the host blocked in a device join. Measured against `rocm-smi`, gpu-wait reads ~95% of wall while the device is ~84% busy — the ~11-point gap is launch/queue-drain overhead.\n\nNo residual is reported anywhere: unattributed time is absent rather than folded into a bucket. See `docs/PERF.md`.",
+        "content": "**The class series OVERLAP — never stack them.** `io-wait` runs on the reaper thread concurrently with the decode thread, so it routinely exceeds 100% of wall; that is the streaming design working, not an error. Only the **phase** row (`route`/`moe`/`tail`) partitions wall and may be stacked.\n\n**`gpu-wait` is not GPU utilisation.** It is the host blocked in a device join. Measured against `rocm-smi`, gpu-wait reads ~95% of wall while the device is ~84% busy — the ~11-point gap is launch/queue-drain overhead.\n\nNo residual is reported anywhere: unattributed time is absent rather than folded into a bucket. See `docs/measurement/how-to-measure.md`.",
         "mode": "markdown"
       },
       "pluginVersion": "12.3.1",
@@ -673,7 +673,7 @@
         "type": "prometheus",
         "uid": "${DS_PROM}"
       },
-      "description": "launch = kernel-issue driver calls (~1.5k/tok). route = route_into top-k over 256 experts. submit = residency + policy bookkeeping. tokio-poll = expert-stream poll. Sums to the `cpu` series above.",
+      "description": "launch = kernel-issue driver calls (~1.5k/tok). route = route_into top-k over 256 experts. submit = residency + policy bookkeeping. These three ARE the `cpu` series above. The former tokio-poll series was dropped 2026-08-01: with expert launches enqueued straight onto the compute stream there is no expert-stream poll left to attribute.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -965,7 +965,7 @@
         "type": "tempo",
         "uid": "${DS_TEMPO}"
       },
-      "description": "Open a rivoli.decode trace. io-wait/uring-reap bars (thread=reaper) sitting UNDER the gpu-wait bars is hidden fetch; sticking out past them is exposed fetch. Requires RIVOLI_SPANS to have been set on the run.",
+      "description": "Open a rivoli.decode trace. io-wait/uring-reap bars (thread=reaper) sitting UNDER the gpu-wait bars is hidden fetch; sticking out past them is exposed fetch. Requires --spans on the run.",
       "fieldConfig": {
         "defaults": {
           "color": {

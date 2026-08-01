@@ -82,7 +82,7 @@ split/tok: route = 101.1ms gpu-wait + 0.3ms host-routing
 ```
 *(hybrid+lru, `-bench 128`, `--max-mem 100`, wall 338.2 ms/tok.)*
 
-These are **spans, not just counters** — set `RIVOLI_SPANS` and they export as real OTLP
+These are **spans, not just counters** — pass `--spans` and they export as real OTLP
 spans with true start/end times across both threads, so a trace viewer draws the overlap
 instead of implying it. See [TRACES.md](TRACES.md).
 

@@ -25,7 +25,8 @@
 //! VMM either way: a zero-miss layer costs 1563 us (bounce) vs 1525 us (DIRECT), equal
 //! within noise. (An earlier note here blamed a ~40% `mlp` read tax from host-mapped VMM;
 //! that configuration is not what this flag produces.) Repro:
-//! docs/measurement/probes/iouring_vmm.cpp (faults into VMM) vs the iou_host probe (pinned host).
+//! `git show 3e1bd96:docs/probes/iouring_vmm.cpp` (faults into VMM) vs the iou_host
+//! probe (pinned host) — both predate the empty-slate rebuild and are not in the tree.
 //!
 //! SQPOLL is requested on the ring (own poller thread). Without it, submit is an
 //! `io_uring_enter` in which the CALLING thread walks the SQEs and drives the

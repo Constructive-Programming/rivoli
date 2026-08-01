@@ -1,12 +1,21 @@
 // Device-local memory the CPU can fill in place — the escape from the coherent
-// read tax (see docs/hip-apu-memory.md). On this APU (gfx1151, unified LPDDR5X)
-// `hipHostMalloc` of any grain reads ~9% slower than `hipMalloc` because it maps
-// system-domain (MTYPE_NC/UC + PTE_SYSTEM + snoop, 4 KiB pages); no host-malloc
-// flag crosses into device-local. The HIP VMM API does: allocate DEVICE-LOCAL
-// physical memory (MTYPE_RW, full GPU bandwidth) then grant the CPU access too, so
-// weights `pread`/memcpy straight in and the GPU reads them in place — single
-// copy, no H2D, no tax. Verified: 220 GB/s (= hipMalloc) AND CPU->GPU coherent
-// (docs/measurement/probes/vmm_probe.cpp).
+// read tax (see docs/reference/architecture.md §1). On this APU (gfx1151, unified
+// LPDDR5X) `hipHostMalloc` of any grain reads ~9% slower than `hipMalloc` because
+// it maps system-domain (MTYPE_NC/UC + PTE_SYSTEM + snoop, 4 KiB pages); no
+// host-malloc flag crosses into device-local. The HIP VMM API does: allocate
+// DEVICE-LOCAL physical memory (MTYPE_RW, full GPU bandwidth) then grant the CPU
+// access too, so weights `pread`/memcpy straight in and the GPU reads them in
+// place — single copy, no H2D, no tax. Verified: 220 GB/s (= hipMalloc) AND
+// CPU->GPU coherent.
+//
+// SOURCES, corrected 2026-08-01. This cited `docs/hip-apu-memory.md`, deleted in
+// the empty-slate rebuild, and `docs/measurement/probes/vmm_probe.cpp`, which was
+// never at that path — the probe is `docs/probes/vmm_probe.cpp`, deleted in the
+// same commit and recoverable with `git show 3e1bd96:docs/probes/vmm_probe.cpp`.
+// So the ~9% read figure has no live measurement behind it; read it as the
+// rationale of record, not a standing number. What IS measured today is the write
+// side, in docs/reference/architecture.md §3: 5.66 GB/s DMA into VMM pages against
+// 12.4 GB/s into the pinned arena.
 //
 // Host-only HIP (no kernels); compiled into librivolikernels.a like the rest.
 // Return codes: 0 ok, POSITIVE arg guard, NEGATIVE -(hipError_t).

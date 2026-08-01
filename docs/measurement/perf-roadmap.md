@@ -78,7 +78,7 @@ big multiplier; #1 has landed and #4 has a measured loss against it, so:
 1. **#5's HB × `MLA_MIN_TILES_PER_SPLIT` sweep** — the cheapest unclaimed win, and still
    mandatory before any long-context work. Note it is a **4-site change** (`kernels/attn.hip`,
    `kernels/vk/mla_latent_attend.comp`, and the two mirrored launcher constants in
-   `src/vk.rs`), which the item's text does not say.
+   `src/backend/vk.rs`), which the item's text does not say.
 2. **Path B (#2)** — the biggest remaining structural lever, on the 210 ms that is 60% of
    wall. Now the *only* live item in Path B, since 1b is struck.
 3. ~~**`tail`'s missing ~62%**~~ — **ANSWERED and struck.** The CLASS axis shows it is

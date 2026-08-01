@@ -31,7 +31,7 @@ measured, kept; the result is in the engine. `closed-mixed` — parts of both, b
 |---|---|---|
 | [`architecture.md`](../reference/architecture.md) | live | The engine as it is. The one doc meant to be read whole; §8b is the INV registry, enforced by tests/invariants.rs. |
 | [`modes.md`](../reference/modes.md) | live | The --mode × --cache-policy matrix and which knob does what. Quality ladder: int4 5.120 > hybrid 5.189 > int3-vq 5.275. |
-| [`vulkan-kernels.md`](../reference/vulkan-kernels.md) | live | Which kernels the Vulkan backend has: 16 of 29 ported, 6 more single-row. It decodes --mode int3-vq --attn dense at ~1.9x slower. |
+| [`vulkan-kernels.md`](../reference/vulkan-kernels.md) | live | What the Vulkan backend has and what binds anyone editing a shader: 16 of 29 kernels, ~1.9x slower on --mode int3-vq --attn dense, the device requirements, the numerics and index-width rules, the mechanised-guard registry, and two OPEN fp8-dot gaps. |
 | [`serving.md`](../reference/serving.md) | live | The OpenAI HTTP server (--port). Thinking defaults OFF and is a prompt prefill, not a flag; tool calling works; sampling and /v1/completions do not, on purpose. |
 
 ## measurement/ — how to measure, and what was measured
@@ -40,7 +40,7 @@ measured, kept; the result is in the engine. `closed-mixed` — parts of both, b
 |---|---|---|
 | [`how-to-measure.md`](../measurement/how-to-measure.md) | live | How to measure, and the four-out-of-five lesson that says why the ISA beats a profile. |
 | [`perf-roadmap.md`](../measurement/perf-roadmap.md) | live | The ranked performance roadmap. Live rows: #2 VQ_K codebook, #5 the MLA HB sweep. |
-| [`traces.md`](../measurement/traces.md) | live | OTLP spans: what the engine emits and how to read a trace. |
+| [`traces.md`](../measurement/traces.md) | live | The --features otlp instrument: its three switches, what the engine emits, and how to read a trace. Verified end to end 2026-08-01, after it had stopped compiling. |
 | [`gpu-profiling.md`](../measurement/gpu-profiling.md) | live | Why ROCm GPU profiling does not work on this part, and what to do instead. Only if you are attaching a profiler. |
 | [`benchmarks.md`](../measurement/benchmarks.md) | data | Append-only measurements. Never read whole — grep for the config. The top table predates the .i4 rebuild and says so. |
 | [`probes/`](../measurement/probes/README.md) | data | Standalone HIP probes that reproduce engine behaviour outside the engine, and what each one settled. |
@@ -52,7 +52,7 @@ Read the verdict. Open the file only if you are about to re-open the question.
 | doc | status | verdict |
 |---|---|---|
 | [`int4-scales.md`](../investigations/int4-scales.md) | closed-shipped | Why int4 was unusable and how group-128 scales fixed it: PPL 73.43 → 5.120, making int4 the best-quality mode. RESOLVED. |
-| [`vulkan-port.md`](../investigations/vulkan-port.md) | closed-shipped | Porting the engine to Vulkan across four phases. Shipped and decoding; the live inventory is reference/vulkan-kernels.md. |
+| [`vulkan-port.md`](../investigations/vulkan-port.md) | closed-shipped | Porting the engine to Vulkan across four phases — the journal, not the rules. Shipped and decoding; the live inventory AND every standing shader obligation moved to reference/vulkan-kernels.md on 2026-08-01. |
 | [`cache-conditional-routing.md`](../investigations/cache-conditional-routing.md) | closed-negative | top-m routing: RETIRED 2026-07-30. Cost +3.63% PPL on int3-vq and +12.7% on int4 against a ~1% bar, and made every cache change an output change. |
 | [`cross-layer-prefetch.md`](../investigations/cross-layer-prefetch.md) | closed-negative | LOOKA hints and the pilot prefetcher: REMOVED 2026-07-31. The veto bound on 0.9% of evictions; the prefetcher predicted at 99% precision and still cost more than it saved. |
 | [`codebook-rotation.md`](../investigations/codebook-rotation.md) | closed-negative | Hadamard/QuIP rotation for int3-vq: CLOSED 2026-08-01. A per-layer codebook recovers 0.09% against a 2% bar, so there is nothing to homogenise. int3-vq is rate-limited. |

@@ -58,7 +58,7 @@ mod ffi {
     }
     // VMM device-local host-fillable allocator (kernels/vmm.hip, in
     // librivolikernels.a). Gives MTYPE_RW device-bandwidth memory the CPU can fill
-    // in place — see docs/hip-apu-memory.md.
+    // in place — see docs/reference/architecture.md §1.
     unsafe extern "C" {
         pub fn rivoli_vmm_alloc(
             size: usize,
@@ -349,8 +349,18 @@ mod tier {
     /// and grants the host an access mapping (APU unified addressing). So a cold
     /// expert is `pread`/memcpy'd straight in ([`VmmBuf::write_at`], a plain host
     /// memcpy, no `hipMemcpy`/sync) and the GPU reads it with NO coherent-pool read
-    /// tax — unlike a `hipHostMalloc` slot, which always maps system-domain and
-    /// reads ~9% slower. `ptr()` is GPU-usable. See docs/hip-apu-memory.md.
+    /// tax — unlike a `hipHostMalloc` slot, which always maps system-domain.
+    /// `ptr()` is GPU-usable.
+    ///
+    /// **The "reads ~9% slower" this claimed until 2026-08-01 has no LIVE source.**
+    /// It cited `docs/hip-apu-memory.md`, deleted in the empty-slate rebuild; the probe
+    /// behind it went in the same commit and is recoverable as
+    /// `git show 3e1bd96:docs/probes/vmm_probe.cpp`. Treat the figure as the rationale of
+    /// record rather than a standing number — a neighbouring read-tax claim (a ~40%
+    /// MoE-dot tax from host-mapped VMM) was retracted outright in
+    /// `docs/reference/architecture.md` §3. The allocator choice stands on the write
+    /// side, which IS measured there: DMA into VMM pages runs 5.66 GB/s against
+    /// 12.4 GB/s into the pinned arena.
     pub struct VmmBuf {
         ptr: *mut u8,
         handle: u64,
@@ -393,7 +403,8 @@ mod tier {
         /// launch, plus the end-of-layer [`crate::backend::hip::device_sync`] fencing slot
         /// reuse. No CPU store fence is involved on this path.
         ///
-        /// Verified CPU->GPU coherent on this APU (docs/measurement/probes/vmm_probe.cpp, incl.
+        /// Verified CPU->GPU coherent on this APU (`git show 3e1bd96:docs/probes/vmm_probe.cpp` — the probe
+        /// predates the empty-slate rebuild and is not in the tree; incl.
         /// `pread`). NOT a HIP contract for arbitrary hardware: a port off gfx1151,
         /// or a fill from a background HIP thread, must re-verify or insert an
         /// explicit fence.

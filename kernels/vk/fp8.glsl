@@ -37,7 +37,7 @@
 #endif
 
 // Packed fp8 weights are read as 32-bit WORDS — VK_KHR_8bit_storage is deliberately not
-// required (docs/VULKAN.md) — so every caller's row base must be 4-aligned.
+// required (docs/reference/vulkan-kernels.md, "Device requirements") — so every caller's row base must be 4-aligned.
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RoU32 { uint v[]; };
 
 // THE LUT IS AN IMPLICIT PARAMETER, and that is forced rather than chosen.

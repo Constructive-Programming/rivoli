@@ -6,10 +6,13 @@
 //!
 //! HIP runs three streams — the null stream for the forward pass, `compute_stream` for the
 //! MoE expert partials, and the reaper's fetch stream for H2D weight copies — and the
-//! overlap between the last two is what hides ~95% of fetch behind compute
-//! (docs/benchmarks.md). Increment 1 ran all three on ONE queue, which serialised fetch
-//! against compute and cost ~246 ms/token; `vk.rs` now has one [`Q`] per HIP stream, each
-//! with its own command-buffer ring and its own timeline semaphore.
+//! overlap between the last two is what hides fetch behind compute. Increment 1 ran all
+//! three on ONE queue, which serialised fetch against compute and cost ~246 ms/token;
+//! `vk.rs` now has one [`Q`] per HIP stream, each with its own command-buffer ring and its
+//! own timeline semaphore. **That A/B is what establishes the overlap**, not the "~95%
+//! hidden" this cited until 2026-08-01: that figure was RETRACTED (its estimator counted
+//! miss stalls as compute) and it cited `docs/benchmarks.md`, a path that moved to
+//! `docs/measurement/benchmarks.md`. See `docs/reference/architecture.md` §3.
 //!
 //! A [`Stream`] here is just the NAME of one of them. The queue itself lives inside
 //! `vk.rs`'s private `Mutex<Stream>` (a different type, same word — that one owns a

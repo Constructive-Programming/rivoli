@@ -1,6 +1,6 @@
 ---
 status: live
-verdict: Which kernels the Vulkan backend has: 16 of 29 ported, 6 more single-row. It decodes --mode int3-vq --attn dense at ~1.9x slower.
+verdict: What the Vulkan backend has and what binds anyone editing a shader: 16 of 29 kernels, ~1.9x slower on --mode int3-vq --attn dense, the device requirements, the numerics and index-width rules, the mechanised-guard registry, and two OPEN fp8-dot gaps.
 ---
 
 # rivoli — Vulkan kernel inventory
@@ -73,7 +73,53 @@ here has. `build.rs` gains a `vulkan` arm compiling `kernels/vk/*.comp` → SPIR
 embedded via `include_bytes!`. Keep `rerun-if-changed` on the shared header — the
 `common.hpp` staleness bug (see git history) is easy to repeat with `#include`d GLSL.
 
-### Numerics that must stay bit-exact
+## Device requirements
+
+Moved here from `investigations/vulkan-port.md` on 2026-08-01: this is what the backend
+demands of a device *today*, not a decision the port once made, and twelve shaders cite it.
+Init fails fast with a clear message naming the missing one.
+
+- `VK_KHR_buffer_device_address` (core 1.2) — lets `ExpertDescVq`'s six raw pointers stay
+  six `uint64` addresses in a params buffer instead of six descriptor bindings. Without it
+  the per-expert launch path needs a descriptor rewrite per expert.
+- `shaderInt64` (core 1.0) — the other half of the above: the shader dereferences those
+  addresses as `uint64_t` buffer references (`GL_EXT_buffer_reference`), a 64-bit integer
+  operation.
+- `VK_EXT_subgroup_size_control` with `requiredSubgroupSize = 32` — the kernels assume
+  `WAVE 32` (gfx1151 native wave32; see `kernels/common.hpp`).
+- `subgroupShuffleRelative` + `subgroupBasic` (core 1.1 subgroup ops).
+- `VK_KHR_shader_float16_int8` + `VK_KHR_16bit_storage` — the fp16 VQ codebook.
+- `VK_KHR_timeline_semaphore` (core 1.2).
+- A `DEVICE_LOCAL | HOST_VISIBLE` heap covering GTT — on Strix Halo host RAM *is* GPU
+  memory, and the pin path depends on writing resident weights directly.
+
+**Deliberately NOT required: `VK_KHR_8bit_storage`.** Read packed u8 weights as `uint`
+words and unpack bytes/nibbles in the shader. The hot loops already unpack manually, so the
+extension buys nothing — which is why four shaders say "deliberately not required" rather
+than leaving a reader to wonder whether it was an oversight.
+
+Use a **dedicated compute queue**, not the universal graphics queue.
+
+### Index width
+
+GLSL `uint` row arithmetic wraps at 2^32 elements = 4.29e9. `gemv_f32` (router gate,
+256x5120 = 1.3e6) is nowhere near it, but `lm_head` via `gemv_i8` is 151552x5120 = 7.76e8 —
+only 5.5x of margin, and it would wrap SILENTLY into another allocation. Use `uint64_t` row
+indices from `gemv_i8`/`gemv_fp8`/`moe_*` onward
+(`GL_EXT_shader_explicit_arithmetic_types_int64` is already enabled and `shaderInt64`
+already required) and **record the ceiling per kernel as you port** — `append_kv`,
+`embed_i8_row`, `gather_rope`, `mla_absorb_fp8` and `mla_value_fp8` each carry that
+computation in a comment, which is the whole mechanism: there is no check, only the habit.
+
+## Numerics that must stay bit-exact
+
+`bf16f`/`f2bf16`/`e4m3f` in `common.hpp` are bit-exact with `src/math.rs` **on the finite
+domain** — the CPU oracles in `tests/kernel.rs` test that. They are NOT bit-exact for NaN:
+`half::bf16::from_f32` forces the quiet bit (`| 0x0040`) where `common.hpp`'s `f2bf16`
+returns the top 16 bits verbatim. That divergence predates the port; **the GLSL must mirror
+HIP, not `math.rs`**, or the two backends disagree. GLSL has no `__builtin_memcpy`; use
+`floatBitsToUint`/`uintBitsToFloat`. The e4m3 LUT (`e4m3_lut_build`) is a 256-float `shared`
+array — prefer the LUT to a live `exp2`, which GLSL specifies only to 3 ULP.
 
 ### Same spelling, different semantics — the porting pre-flight
 
@@ -213,4 +259,61 @@ written an hour before the code it will stop.
 
 That is the strongest available argument for mechanising a rule the moment it is
 understood rather than after the next instance.
+
+---
+
+## The mechanised guards — the registry, written 2026-08-01
+
+**Ten places in this document and in `kernels/vk/` cite "rule 2", "rule 9", "rule 11" as
+though a numbered list existed. None did** — not in this file, not in the pre-split
+`docs/VULKAN.md`, not in any commit. The rules are real and they are enforced; only the
+list was missing, so a reader meeting "rule 11" in a shader had no way to learn what it
+forbids. The table is that list. It is derived from the enforcing code, which is the only
+authority: **`build.rs::vulkan()` runs the SPIR-V guards on every shader, every build.**
+
+| # | Guard | Mechanism | What it forbids, and the defect that bought it |
+|---|---|---|---|
+| — | `spirv_val` | `build.rs`, `spirv-val --target-env` | Invalid modules. The `--target-env` is load-bearing: without it only the UNIVERSAL SPIR-V rules apply, not Vulkan's. |
+| 2 | `no_subgroup_arithmetic` | `build.rs`, capability scan | `OpCapability GroupNonUniformArithmetic`/`Clustered` — i.e. `subgroupAdd` and friends. Their summation order is implementation-defined, which breaks greedy decode's reproducibility. Every reduction is the fixed `wave_sum` shuffle ladder instead. |
+| — | `no_reciprocal_rewrite` | `build.rs`, `OpFMul` constant scan | `glslc -O` rewriting `a / K` into `a * fl(1/K)`. At K = 448 that differs from a true divide by 1 ULP on **55% of inputs, measured**, while hipcc keeps a real `fdiv`. No oracle tolerance is tight enough to see it. |
+| 9 | `no_banned_builtins` | `build.rs`, `OpExtInst` denylist | `InverseSqrt`. Vulkan specifies it to 2 ULP as ONE operation; HIP does a correctly-rounded `sqrt` then a correctly-rounded divide. The risk is a reviewer "tidying" `1.0/sqrt(z)`. |
+| 11 | `no_array_parameters` | `build.rs`, whole-array `OpLoad` scan | GLSL's copy-in/copy-out of array parameters. `e4m3_lut_build(inout float lut[256], …)` gave every invocation a private 1 KB copy; the fp8 table became noise (err = 8.6e37). It passed a clean compile, `spirv-val`, every other guard, and GPU-AV — the reads were IN BOUNDS. |
+| 12 | `no_barrier_without_memory` | `build.rs`, barrier + storage scan | A bare `barrier()`, which orders SHARED memory only (0x108, no `UniformMemory` bit) where HIP's `__syncthreads()` orders global too. `rope_interleave` shipped this way and passed on today's RADV. The skip set (`BARRIER_EXEMPT`) is PINNED and a stale entry fails the build. |
+| 8 | transcription lock | `tests/glsl_numerics.rs` | `f2e4m3`/`f2bf16` in `common.glsl` drifting from the CPU transcriptions that test them. It hashes the two function bodies and fails on a change — a stale transcription would keep passing while testing a function the shader no longer has. |
+| 10 | launcher coverage | `tests/kernel_coverage.rs` | A `launch_*` in `src/backend/vk.rs` with no test. Tranche 2a ported six kernels and shipped `gemv_i8`/`gemv_fp8` never once executed, while the suite went 16 tests to 23 — coverage grew while the gap grew faster. |
+
+**Numbers 1, 3–7 are not recoverable.** The surviving labels are the code's own — `build.rs`
+says "ninth", "eleventh", "twelfth"; the tests say "EIGHTH" and "TENTH"; rule 2 is pinned by
+this document's own pre-flight table naming it for the subgroup ban. The rest were never
+written down anywhere that survived, so the gaps above are honest rather than reserved. **If
+you add a guard, put its number in its doc comment** — that is the only reason eight of
+these are still identifiable.
+
+Two of the guards are *detective* (they fire on a defect already in the tree) and rule 11 is
+*preventive*, per the section above. Rule 12 was verified BOTH ways before adoption — quiet
+on the four kernels with legitimate shared-memory barriers, loud on the one bug — which is
+the standard rule 11's silence set.
+
+---
+
+## Known gaps in the fp8 dot — OPEN, both of them
+
+Recorded here 2026-08-01. `kernels/common.hpp`'s `fp8_dot_strided` cited "docs/PERF.md #4"
+for these; `PERF.md` was split three ways and its item numbering no longer exists, so for a
+while the only record of two live defects was a comment pointing at a deleted file. Both
+were re-verified in the tree before writing this.
+
+**1. `kernels/vk/fp8.glsl` has the block-scale quad bug its HIP twin was fixed for.**
+The dword path applies ONE block scale to a quad's four columns, so it is only the right
+scale when the tile is at least a quad wide; at `block` 1 or 2 the columns past the tile
+boundary silently take `i0`'s scale. The HIP side guards it — `int n4 = (block >= 4) ?
+(i_dim >> 2) : 0`, handing those rows to the per-column tail — and the GLSL side still
+computes `uint n4 = uint(i_dim) >> 2` unconditionally. **The oracle mirrors the bug**, so
+the bit-exactness gate does not fire on it. The engine runs `block = 128`, so nothing
+reaches it today; a smaller block would.
+
+**2. `rivoli_gemv_fp8` does not guard the `i_dim % 4` its `w4` cast needs.**
+Unlike the Vulkan twin and unlike `rivoli_mla_value_fp8`'s `kvl % 4`. The requirement is
+now CONDITIONAL rather than absolute — at `block < 4` the cast is never reached — which is
+why this survived as a comment rather than a fix. `kernels/linalg.hip` marks the site.
 

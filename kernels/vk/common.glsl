@@ -46,7 +46,7 @@ float wave_sum(float v) {
 
 // The two buffer-reference types every kernel needs. Declared once here rather than
 // six times across the shaders — buffers reach a shader as device addresses in push
-// constants (docs/VULKAN.md), so an f32 in and an f32 out is the shape of nearly every
+// constants (docs/reference/vulkan-kernels.md, "Device requirements"), so an f32 in and an f32 out is the shape of nearly every
 // launcher. Kernels needing other widths (packed u8/u16 read as words, i32 outputs)
 // declare those locally, where the unpacking that justifies them lives.
 #extension GL_EXT_buffer_reference : require
@@ -97,7 +97,7 @@ float wave_max(float v) {
 // in BOTH `bf16::from_f32` (here) and `bf16::to_f32` (see bf16f below, where a signalling
 // NaN like 0x7f81 decodes to 0x7fc1_0000 through math.rs and 0x7f81_0000 through HIP).
 // The rule is the same for both and is what actually matters: mirror HIP, not math.rs,
-// because the two BACKENDS are what must agree (docs/VULKAN.md, "Numerics"). The
+// because the two BACKENDS are what must agree (docs/reference/vulkan-kernels.md, "Numerics that must stay bit-exact"). The
 // divergence from math.rs predates this port in both directions.
 uint f2bf16(float x) {
     uint b = floatBitsToUint(x);

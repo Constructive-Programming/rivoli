@@ -1,6 +1,6 @@
 ---
 status: closed-shipped
-verdict: Porting the engine to Vulkan across four phases. Shipped and decoding; the live inventory is reference/vulkan-kernels.md.
+verdict: Porting the engine to Vulkan across four phases — the journal, not the rules. Shipped and decoding; the live inventory AND every standing shader obligation moved to reference/vulkan-kernels.md on 2026-08-01.
 ---
 
 # rivoli — Vulkan backend (`vulkan` feature)
@@ -112,27 +112,13 @@ Mechanical mappings:
 
 ### Required device features
 
-Fail fast at init with a clear message naming the missing one:
-
-- `VK_KHR_buffer_device_address` (core 1.2) — lets `ExpertDescVq`'s six raw pointers
-  stay six `uint64` addresses in a params buffer instead of six descriptor bindings.
-  Without it the per-expert launch path needs a descriptor rewrite per expert.
-- `shaderInt64` (core 1.0) — the other half of the above: the shader dereferences
-  those addresses as `uint64_t` buffer references (`GL_EXT_buffer_reference`), which
-  is a 64-bit integer operation.
-- `VK_EXT_subgroup_size_control` with `requiredSubgroupSize = 32` — the kernels assume
-  `WAVE 32` (gfx1151 native wave32; see `kernels/common.hpp`).
-- `subgroupShuffleRelative` + `subgroupBasic` (core 1.1 subgroup ops).
-- `VK_KHR_shader_float16_int8` + `VK_KHR_16bit_storage` — the fp16 VQ codebook.
-- `VK_KHR_timeline_semaphore` (core 1.2).
-- A `DEVICE_LOCAL | HOST_VISIBLE` heap covering GTT — on Strix Halo host RAM *is* GPU
-  memory, and the pin path depends on writing resident weights directly.
-
-Deliberately **not** required: `VK_KHR_8bit_storage`. Read packed u8 weights as `uint`
-words and unpack bytes/nibbles in the shader — colibri's `qmatmul.comp` does exactly
-this, and the hot loops already unpack manually, so the extension buys nothing.
-
-Use a **dedicated compute queue**, not the universal graphics queue (colibri `4d4cacc`).
+> **MOVED 2026-08-01 to [`reference/vulkan-kernels.md`](../reference/vulkan-kernels.md),
+> "Device requirements".** This list is what the backend demands of a device *today* — live
+> reference, not a decision the port once made — and twelve shaders cite it. It was the
+> largest piece of live content still on the closed shelf. The requirement that generated
+> the most shader comments, `VK_KHR_8bit_storage` deliberately NOT required, went with it.
+> The port's original reasoning is preserved by this file's history; only the standing
+> requirement moved, because a duplicate is how two copies drift.
 
 ## Four things that are not mechanical
 
@@ -366,21 +352,12 @@ guard.
 
 ### Bit-exactness with `math.rs`
 
-`bf16f`/`f2bf16`/`e4m3f` in `common.hpp` are bit-exact with `src/math.rs` **on the
-finite domain** — the CPU oracles in `tests/kernel.rs` test that. They are NOT
-bit-exact for NaN: `half::bf16::from_f32` forces the quiet bit (`| 0x0040`) where
-`common.hpp`'s `f2bf16` returns the top 16 bits verbatim. That divergence predates
-this port; a GLSL version must mirror **HIP**, not `math.rs`, or the two backends
-disagree. GLSL has no `__builtin_memcpy`; use `floatBitsToUint`/`uintBitsToFloat`. The
-e4m3 LUT (`e4m3_lut_build`) ports directly to a 256-float `shared` array — and prefer
-the LUT to a live `exp2` call, since GLSL specifies `exp2` only to 3 ULP.
-
-**Index width.** GLSL `uint` row arithmetic wraps at 2^32 elements = 4.29e9. `gemv_f32`
-(router gate, 256x5120 = 1.3e6) is nowhere near it, but `lm_head` via `gemv_i8` is
-151552x5120 = 7.76e8 — only 5.5x of margin, and it would wrap SILENTLY into another
-allocation. Use `uint64_t` row indices from `gemv_i8`/`gemv_fp8`/`moe_*` onward
-(`GL_EXT_shader_explicit_arithmetic_types_int64` is already enabled and `shaderInt64`
-already required) and record the ceiling per kernel as you port.
+> **MOVED 2026-08-01 to [`reference/vulkan-kernels.md`](../reference/vulkan-kernels.md),
+> "Numerics that must stay bit-exact" and "Index width".** Both are standing obligations on
+> anyone editing a shader, not port history: the NaN divergence between `f2bf16` and
+> `half::bf16::from_f32` still binds, and the index ceiling is cited by five shaders that
+> each record their own peak. `common.glsl` cited this section as "Numerics" and had no
+> anchor to land on — that heading now exists there.
 
 ## Backend selection
 

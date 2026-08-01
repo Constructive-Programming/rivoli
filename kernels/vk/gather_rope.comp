@@ -26,7 +26,7 @@ void main() {
     uint d = idx % uint(pc.ropn);
     // 32-bit indexing is deliberate here and the bound is small: q is [h, qh] with
     // h = n_heads and qh the per-head query dim, so h*qh is O(1e4) — nine orders of
-    // magnitude under the 2^32 element ceiling recorded in docs/VULKAN.md. embed_i8_row
+    // magnitude under the 2^32 element ceiling recorded in docs/reference/vulkan-kernels.md, "Index width". embed_i8_row
     // is the kernel in this tranche that actually needs 64-bit; this one does not, and
     // widening it would cost an address computation per invocation for nothing.
     pc.qrope.v[idx] = pc.q.v[head * uint(pc.qh) + uint(pc.nope) + d];

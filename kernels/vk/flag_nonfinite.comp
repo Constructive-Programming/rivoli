@@ -4,7 +4,8 @@
 // The NaN localizer: every layer calls this on the residual stream with its own tag, the
 // flag rides the argmax D2H the tail already pays, and the tag that lands names the layer
 // that first went non-finite. No sync, no readback of its own — which is the whole reason
-// it exists rather than a host-side check (see fwd.hip, and docs/NAN.md if it has landed).
+// it exists rather than a host-side check (see fwd.hip; the `docs/NAN.md` this pointed at
+// until 2026-08-01 never landed and no doc replaced it — fwd.hip is the description).
 #version 450
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_buffer_reference : require

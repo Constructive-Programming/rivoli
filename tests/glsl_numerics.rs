@@ -173,7 +173,8 @@ fn glsl_f2bf16_matches_math_rs_on_finite() {
 /// `common.hpp::f2bf16` passes the top 16 bits through verbatim.
 ///
 /// Asserted rather than described, so that if anyone "fixes" the GLSL to match
-/// `math.rs` they get a failing test pointing at docs/investigations/vulkan-port.md instead of a silently
+/// `math.rs` they get a failing test pointing at docs/reference/vulkan-kernels.md,
+/// "Numerics that must stay bit-exact", instead of a silently
 /// divergent backend. The kernels never quantize a NaN key in practice; this pins the
 /// contract, it does not endorse it.
 #[test]
@@ -401,7 +402,8 @@ fn e4m3f_decodes_all_256_bytes_bit_exactly() {
 /// signalling NaN, so `bf16f(0x7f81)` is `0x7fc1_0000` through `math.rs` and
 /// `0x7f81_0000` through `common.hpp`, which is a plain 16-bit shift.
 ///
-/// The rule (docs/investigations/vulkan-port.md, "Numerics") is that the GLSL must mirror HIP, not `math.rs`,
+/// The rule (docs/reference/vulkan-kernels.md, "Numerics that must stay
+/// bit-exact") is that the GLSL must mirror HIP, not `math.rs`,
 /// or the two BACKENDS disagree — which is the comparison that decides decode output. So
 /// the shader is right and an earlier draft of this test was wrong. The divergence is
 /// pinned below rather than tolerated silently, so that if `half` ever stops quieting, or

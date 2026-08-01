@@ -245,8 +245,9 @@ fn vulkan() {
 /// Greedy decode must be bit-reproducible, and those ops have an
 /// IMPLEMENTATION-DEFINED summation order. Every reduction here is a fixed
 /// `subgroupShuffleDown` halving ladder instead (kernels/vk/common.glsl::wave_sum,
-/// matching common.hpp). That rule was a comment in docs/investigations/vulkan-port.md; this makes it a
-/// build error, because a comment does not survive sixteen kernel ports.
+/// matching common.hpp). That rule was a comment in the port journal; this makes it a
+/// build error, because a comment does not survive sixteen kernel ports. It is rule 2 in
+/// the registry at docs/reference/vulkan-kernels.md, "The mechanised guards".
 ///
 /// Skipped with a warning if `spirv-dis` is absent, like `spirv-val` above.
 ///

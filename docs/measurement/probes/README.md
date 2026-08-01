@@ -414,7 +414,7 @@ The fix was not a better comment. `vk::Queue` now lives *inside* the mutex-guard
 `error[E0609]: no field 'queue' on type '&Gpu'`. Verified by trying it. Every rule in
 this backend that has been violated twice is now a build failure instead — the
 `subgroupAdd` capability scan, `push_struct!`'s padding and budget assertions,
-`WAVE`/`ROWS_PER_BLOCK` single-sourcing, and this. Conventions in `src/vk.rs` have a
+`WAVE`/`ROWS_PER_BLOCK` single-sourcing, and this. Conventions in `src/backend/vk.rs` have a
 measured failure rate of two.
 
 ### A test built to fail needs its passing arm checked too

@@ -117,7 +117,7 @@ floor, and was deleted outright along with the fixed-partition cache variants an
 replay `--hybrid` split simulator (`c876a8d`) — the split self-sizes now. The hot/cold
 boundary is emergent: the two-ended byte arena packs COLD from the low end and HOT from
 the high end, and the boundary **floats** with the policy's tier decisions
-(`src/arena.rs`, `src/pin.rs`).
+(`src/memory/arena.rs`, `src/memory/pin.rs`).
 
 The reason a flat percent was fragile still stands and is why nothing replaced it: too
 high and the cold/probation slab collapses (measured cliff around n_cold < ~600 slots).
@@ -234,7 +234,7 @@ and is documented in its own section above.
   (`hybrid::make`, dynamic), one slab.
 - **Hybrid row:** the same dynamic policy runs with two strides and reports a
   `Tier` (Cold/Hot) per insert; the pool maps that to a slab. `--2q-kout` still sizes
-  the ghost. `--2q-kin`/`--2q-kout` are live in every mode (`src/cache.rs`).
+  the ghost. `--2q-kin`/`--2q-kout` are live in every mode (`src/memory/cache.rs`).
 
 ---
 

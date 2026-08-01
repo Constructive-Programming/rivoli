@@ -11,7 +11,7 @@
 layout(local_size_x = ROWS_PER_BLOCK * WAVE) in;
 
 // Packed int8 read as UINT WORDS and unpacked by hand — VK_KHR_8bit_storage is
-// deliberately not required (docs/VULKAN.md).
+// deliberately not required (docs/reference/vulkan-kernels.md, "Device requirements").
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RoU32 { uint v[]; };
 
 layout(push_constant) uniform Push {
@@ -30,7 +30,7 @@ void main() {
 
     // 64-BIT, like embed_i8_row and for the same reason: lm_head is
     // [151552, 5120] = 7.76e8 bytes, only 5.5x under the 2^32 element ceiling recorded
-    // in docs/VULKAN.md, and a wrap reads silently from another allocation rather than
+    // in docs/investigations/vulkan-port.md, and a wrap reads silently from another allocation rather than
     // faulting. `o * i_dim` is the product that gets close.
     uint64_t row = uint64_t(o) * uint64_t(pc.i_dim);
 

@@ -45,11 +45,11 @@ device budget into two regions, each a single VMM allocation made once at startu
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Resident tier** (`src/device.rs`, `src/pin.rs`): everything that fits and is touched
+- **Resident tier** (`src/memory/device.rs`, `src/memory/pin.rs`): everything that fits and is touched
   every token. Filled in place at startup (`pread`/memcpy into host-mapped VMM — no
   separate H2D), then handed to kernels as raw device pointers. Bump-allocated: filled
   once, freed as a unit, so there is no free list.
-- **Routed pool** (`src/arena.rs`, `src/hybrid.rs`, `src/pin.rs`): a fixed-size cache. The
+- **Routed pool** (`src/memory/arena.rs`, `src/memory/hybrid.rs`, `src/memory/pin.rs`): a fixed-size cache. The
   working set (≈19k distinct experts) dwarfs it (~6900 slots), so it evicts. This is where
   streaming and caching happen.
 
@@ -94,7 +94,7 @@ a verify pass runs the same graph with `R = 2` rows threaded through every kerne
 
 ## 3. Fetch parallelism — the io_uring streamer
 
-`src/stream.rs` + `kernels/async.hip`. A routed-expert miss is a random NVMe read of one
+`src/fetch/stream.rs` + `kernels/async.hip`. A routed-expert miss is a random NVMe read of one
 O_DIRECT-aligned block (a whole `gate‖up‖down` expert). A single read is latency-bound
 (~4 GB/s); the array delivers ~5.8–6.7 GB/s at queue depth ≥ 4, and **~11 GB/s at the
 deeper queues a real MoE layer produces** (measured 2026-07-30 in-engine: 2.25 GB/token
@@ -191,7 +191,7 @@ records what the last attempt at predicting cost and bought.
 
 ## 4. The async-signal bridge — the keystone
 
-`src/gpustream.rs`. The mechanism that lets the fetcher and the compute stream interleave
+`src/backend/gpustream.rs`. The mechanism that lets the fetcher and the compute stream interleave
 without the host blocking on `hipDeviceSynchronize`:
 
 > A GPU-stream op becomes a **future** that resolves when the hardware reaches that point.
@@ -236,7 +236,7 @@ sequenceDiagram
   decode from **one** `block_on`; `forward()` is `async` and awaits the expert stream
   inline (no per-layer `block_on`). The runtime is local (not on `self`) so the future can
   borrow `&mut self` — the engine's state is single-owner throughout.
-- **The reaper is the only other thread** (`src/asyncfetch.rs`). It owns the demand ring
+- **The reaper is the only other thread** (`src/fetch/asyncfetch.rs`). It owns the demand ring
   and a dedicated fetch stream (`backend::Stream::fetch()` — a `hipStream_t` under `rocm`, a
   third `VkQueue` with its own ring and timeline under `vulkan`); it queues+submits the batch,
   reaps completions one-by-one, and arms each read's `Signal` on the fetch stream *after*
@@ -340,7 +340,7 @@ flowchart LR
 
 ## 6. Caching & residency — the byte-arena pool
 
-`src/arena.rs`, `src/hybrid.rs`, `src/pin.rs`. The routed pool is a cache keyed by
+`src/memory/arena.rs`, `src/memory/hybrid.rs`, `src/memory/pin.rs`. The routed pool is a cache keyed by
 `(layer, expert)`; a hit reuses the resident slot, a miss evicts and streams.
 
 **Two-ended byte arena** (`arena.rs`): COLD (int3-vq, 15.3 MB) slots pack from the low end,
@@ -575,8 +575,18 @@ module root (`src/<group>.rs`) over a directory, so the tree mirrors the section
   `.comp` shaders are SINGLE-ROW, so six launchers refuse `nrow > 1` and speculative decode
   is ROCm-only (§13). See `docs/investigations/vulkan-port.md`.
 - **Top level** — `gpu` (the async forward pass, single- or two-row: `MAXROW`, §13), `math`,
-  `attn`/`indexer` (attention modes + DSA), `telemetry` (the always-on PROFILE summary),
-  `watchdog`.
+  `attn`/`indexer` (attention modes + DSA), `telemetry` (the always-on PROFILE summary,
+  plus the `otlp` feature below), `watchdog`.
+- **`--features otlp`** — exports the same intervals the PROFILE summary sums as real OTLP
+  spans and metrics, one emission at run end. Off by default: the opentelemetry stack is
+  heavy, and the rule that keeps instruments out of a stock binary applies here as it does
+  to `teacher-forcing` and `pred-probe`. **It is the one feature no CI arm compiles**, which
+  is how it came to reference a `ProfileSummary` field deleted months earlier and stop
+  building entirely — found and fixed 2026-08-01. Build it after any change to
+  `ProfileSummary`. Its span budget is `--spans [<BUDGET>]`, feature-gated so it is absent
+  from a build that cannot use it; that was the `RIVOLI_SPANS` env var until 2026-08-01,
+  which is the same rule violation `--pred-probe` was moved off. The wire details, the three
+  switches and the measured run are `docs/measurement/traces.md`.
 - **`serve`** — the OpenAI-compatible HTTP server (`--port`), which is how llama-swap and
   every OpenAI client reach the engine. Hand-rolled HTTP/1.1 over `std::net`: no HTTP crate,
   no async runtime, one request per connection, one request at a time. That is a consequence

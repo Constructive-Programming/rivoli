@@ -29,7 +29,8 @@ const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 pub const O_DIRECT_ALIGN: usize = 4096;
 
 /// Shaders read packed `u8`/`u16` weights as 32-bit WORDS — `VK_KHR_8bit_storage` is
-/// deliberately not required (docs/investigations/vulkan-port.md) — so the word holding the LAST byte of an
+/// deliberately not required (docs/reference/vulkan-kernels.md, "Device
+/// requirements") — so the word holding the LAST byte of an
 /// unaligned buffer extends up to 3 bytes past it. Every allocation is rounded up to
 /// this so that read stays in bounds.
 ///
@@ -171,7 +172,10 @@ pub enum Q {
     /// decode thread. HIP's `compute_stream`.
     Moe,
     /// H2D copies of streamed expert weights, recorded on the REAPER thread. HIP's fetch
-    /// stream, and the queue whose overlap with `Moe` hides ~95% of fetch.
+    /// stream, and the queue whose overlap with `Moe` hides fetch behind compute. (This
+    /// said "~95% of fetch" until 2026-08-01; that number was RETRACTED — its estimator
+    /// counted miss stalls as compute. The true ceiling is compute/fetch_wall ≤57%. See
+    /// `docs/reference/architecture.md` §3.)
     Fetch,
 }
 
@@ -3190,6 +3194,12 @@ push_struct! {
 /// Device addresses of live [`Buf`]s, valid until the next [`device_sync`]: `x`
 /// (`i_dim` f32), `packed` (`o_dim·i_dim` bytes), `scale`
 /// (`⌈o_dim/block⌉·⌈i_dim/block⌉` f32), `y` (`o_dim` f32).
+// Eight, against clippy's seven. The arguments ARE the HIP kernel's arguments — this is a
+// transliteration of `rivoli_gemv_fp8`, and the two must stay readable side by side for the
+// bit-exactness comparison to be checkable by eye. Bundling them into a struct here and not
+// there would put a translation step between the two signatures, which is the one place
+// this port cannot afford one.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn launch_gemv_fp8(
     x: *const f32,
     packed: *const u8,

@@ -127,7 +127,9 @@ __device__ __forceinline__ float fp8_dot_strided(const float* __restrict__ x,
     // past the tile boundary were silently given i0's. Both are powers of two, so guard
     // 1003 passes them. Zeroing `n4` hands the row to the per-column tail below, which
     // was already correct; block ≥ 4 (the engine runs 128) is untouched and bit-identical.
-    // TWO KNOWN GAPS REMAIN, both recorded in docs/PERF.md #4: the Vulkan twin
+    // TWO KNOWN GAPS REMAIN, both recorded in docs/reference/vulkan-kernels.md
+    // ("Known gaps in the fp8 dot"; this cited docs/PERF.md #4 until 2026-08-01,
+    // a file split three ways whose item numbering no longer exists): the Vulkan twin
     // (vk/fp8.glsl) still has this bug and its oracle mirrors it, and `rivoli_gemv_fp8`
     // still does not guard the `i_dim % 4` this `w4` cast needs — a requirement that is
     // now CONDITIONAL, since at block < 4 the cast is never reached.

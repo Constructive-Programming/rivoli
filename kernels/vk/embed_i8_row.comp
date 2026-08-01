@@ -11,7 +11,7 @@
 layout(local_size_x = ROWS_PER_BLOCK * WAVE) in;
 
 // Packed int8 is read as UINT WORDS and unpacked by hand — VK_KHR_8bit_storage is
-// deliberately not required (docs/VULKAN.md), and the hot loops unpack manually anyway.
+// deliberately not required (docs/reference/vulkan-kernels.md, "Device requirements"), and the hot loops unpack manually anyway.
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RoU32 { uint v[]; };
 
 layout(push_constant) uniform Push {
@@ -29,7 +29,7 @@ void main() {
     // 64-BIT, and this is the kernel that needs it. embed is [vocab, hidden] =
     // 151552 x 5120 = 7.76e8 bytes for GLM-5.2 — only 5.5x under the 2^32 ceiling, and
     // a wrap would read silently from another allocation rather than fault. Same shape
-    // as lm_head. See docs/VULKAN.md, "Index width".
+    // as lm_head. See docs/reference/vulkan-kernels.md, "Index width".
     uint64_t byte_off = uint64_t(pc.token) * uint64_t(pc.hidden) + uint64_t(i);
 
     // Address the containing 32-bit word directly rather than indexing `v[]` with a

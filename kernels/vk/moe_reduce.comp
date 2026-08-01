@@ -2,7 +2,7 @@
 //
 // THE PARTITION CARRIES NO FREEDOM, AND THAT IS BY DESIGN RATHER THAN BY LUCK.
 //
-// docs/VULKAN.md records that a work partition feeding an order-sensitive reduction is a
+// docs/reference/vulkan-kernels.md records that a work partition feeding an order-sensitive reduction is a
 // numerics decision wearing a scheduling costume — `mla_plan_splits` is the worked example,
 // where two backends cutting the rows differently produce different bits while both look
 // correct. This kernel is the same shape and needed the same scrutiny, so it is worth

@@ -1,25 +1,88 @@
 ---
 status: live
-verdict: OTLP spans: what the engine emits and how to read a trace.
+verdict: The --features otlp instrument: its three switches, what the engine emits, and how to read a trace. Verified end to end 2026-08-01, after it had stopped compiling.
 ---
 
 # Viewing a decode run as a trace (Grafana)
 
-The `class/tok` line in [PERF.md](PERF.md) reports **scalars**: `io-wait 183ms` tells you the
+The `class/tok` line in [how-to-measure.md](how-to-measure.md) reports **scalars**: `io-wait 183ms` tells you the
 reaper waited that long, not *when*, so nothing in it can show that the wait happened
 underneath the decode thread's GPU waits. That overlap is the bet the whole streaming
 design is placed on, and a sum cannot settle it.
 
-`RIVOLI_SPANS` turns the same measurements into **real OTLP spans with real start/end
+`--spans` turns the same measurements into **real OTLP spans with real start/end
 times**, on one timeline across both threads. In a trace viewer the `io-wait/uring-reap`
 bars sit *under* the `gpu-wait/*` bars when fetch is hidden, and *beside* them when it is
 not — which is the picture, not a percentage.
+
+## The feature, and the two switches that are not it
+
+**Verified end to end 2026-08-01 — and it had been broken.** See "How it rotted" below
+before trusting anything here.
+
+| switch | when | effect if absent |
+|---|---|---|
+| `--features otlp` | build | `export()` is a no-op stub; the opentelemetry stack is not linked. Everything below is inert. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | run | log-only. No collector needed, nothing is sent, the run is unaffected. |
+| `--spans [<BUDGET>]` | run | **metrics still export; traces do not.** The interval recorder never initialises, so there is nothing to build a timeline from. Bare `--spans` means 5000. |
+
+The feature is off by default because the opentelemetry stack is heavy, and it is a
+build-time gate for the same reason `teacher-forcing` and `pred-probe` are: an instrument
+that can be linked into a stock binary eventually is.
+
+**The span budget was `RIVOLI_SPANS` until 2026-08-01, and that broke the project's own
+rule** — an instrument goes behind a feature *and a flag, never an env var*, because an env
+var is invisible to `--help`, absent from the command line
+`docs/measurement/benchmarks.md` records, and silently active in a build that looks stock.
+It is `--spans` now, gated on the feature like `--ppl` and `--pred-probe` are on theirs, so
+it does not appear in a build that cannot use it. **The env var is inert, not deprecated:**
+a run with `RIVOLI_SPANS=5000` and no `--spans` exports metrics and a single empty root
+span, verified 2026-08-01.
+
+The one remaining env var, `OTEL_EXPORTER_OTLP_ENDPOINT`, keeps its exception by not being
+ours to name — it is the OpenTelemetry standard variable that every collector, SDK and
+deployment already speaks, and renaming it would cost more than the rule buys.
+
+### How it rotted, and what that says
+
+`--features otlp` **did not compile** on 2026-08-01. `src/telemetry.rs` recorded a
+`cpu/tokio-poll` metric series from `ProfileSummary::launch_ms`, a field deleted when the
+expert launches moved onto the compute stream — the removal swept the always-on code and
+never reached the feature-gated code, because **nothing in CI builds this feature.** The
+`rocm` and `vulkan` arms are what get built; `otlp` compiles only when someone asks for it,
+and nobody had since the field went.
+
+Two things followed from fixing it, both worth carrying:
+
+- **The `cpu/tokio-poll` series is gone**, not renamed. `cpu` is now exactly
+  `launch + route + submit`. The dashboard's CPU-breakdown panel described the old sum and
+  now says so.
+- **A false truncation warning was firing.** Prefill is one forward pass over 78 layers,
+  ~390 intervals, so any budget under that tripped the recorder's cap *before generation
+  started*. `plan()` discards the prefill records but did not clear the flag that describes
+  them — so a run whose sampled timeline was complete still ended with "the exported
+  timeline is missing the LATER sampled tokens" and a `spans_truncated` attribute on the
+  root. Reproduced at `--spans 200`, fixed, and the fix is what makes the measured run
+  below trustworthy.
+
+### The measured run, 2026-08-01
+
+`--mode int3-vq --cache-policy lru --attn dense --max-mem 100 -bench 8`, exporting to a
+local sink that counts POSTs:
+
+```
+--spans: budget 5000 / (~472 spans/tok x 8 tok) -> every 1th token sampled (8 of 8)
+/v1/traces:  2186 POSTs, 670197 bytes
+/v1/metrics:    1 POST,    1670 bytes
+```
+
+No truncation warning; 3.52 tok/s, within the spread of the same config without it.
 
 ## What rivoli emits
 
 | signal | what | needs |
 |---|---|---|
-| **traces** | `rivoli.decode` → `token N` → `layer L` → leaf intervals (`gpu-wait/*`, `io-wait/uring-reap`, `cpu/*`), each leaf tagged `thread=decode\|reaper`, with true start/end times | `RIVOLI_SPANS` set |
+| **traces** | `rivoli.decode` → `token N` → `layer L` → leaf intervals (`gpu-wait/*`, `io-wait/uring-reap`, `cpu/*`), each leaf tagged `thread=decode\|reaper`, with true start/end times | `--spans` given |
 | **metrics** | `rivoli_ms_per_tok{class,thread}` plus `rivoli_tok_per_s`, `rivoli_hit_pct`, `rivoli_gb_per_tok`, `rivoli_miss_per_tok`, `rivoli_fetch_hidden_pct`, `rivoli_tokens` | always, when OTLP is on |
 
 Both go out over OTLP/HTTP at run end. Metrics exist because span attributes are
@@ -134,24 +197,26 @@ needs *a* Prometheus-compatible source.
 ```sh
 cargo build --release --features rocm,otlp --bin rivoli
 
-RIVOLI_SPANS=5000 \
 OTEL_SERVICE_NAME=rivoli \
 OTEL_EXPORTER_OTLP_ENDPOINT=http://192.168.2.62:4318 \
 ./target/release/rivoli /var/db/rivoli/glm52-vq3-full \
-    --mode hybrid --cache-policy lru --attn dense --max-mem 100 -bench 128
+    --mode hybrid --cache-policy lru --attn dense --max-mem 100 -bench 128 --spans 5000
 ```
 
+`--spans` is what produces the timeline; without it the run still exports metrics, and the
+trace is one empty `rivoli.decode` span.
+
 Verified end-to-end against a local collector: **1501 trace POSTs + 1 metrics POST** for a
-16-token run at `RIVOLI_SPANS=1500`, and against the live gateway at `192.168.2.62:4318`,
+16-token run at a 1500-span budget, and against the live gateway at `192.168.2.62:4318`,
 whose spans and metrics render in Grafana.
 
 One POST per span, because the exporter is a `SimpleSpanProcessor` — which is why the Alloy
-config above batches. At `RIVOLI_SPANS=5000` that is 5000 requests at run END, not during
+config above batches. At `--spans 5000` that is 5000 requests at run END, not during
 decode, so it costs the measurement nothing.
 
 ## The dashboard
 
-Import [`grafana-rivoli-dashboard.json`](grafana-rivoli-dashboard.json) (Dashboards →
+Import [`grafana-dashboard.json`](grafana-dashboard.json) (Dashboards →
 New → Import). It prompts for the metrics and trace data sources. Thirteen panels:
 headline stats, the **CLASS** row, the **PHASE** row, a CPU breakdown, the splits,
 residency, and an embedded trace view.
@@ -163,8 +228,8 @@ partition wall. Keeping the two rows visually distinct is the whole point of hav
 
 ## Things that will bite
 
-- **`RIVOLI_SPANS` is a span budget, spent by SAMPLING whole tokens across the run**
-  (default 5000 if set to a non-number). It used to record the first N intervals and stop,
+- **`--spans` is a span budget, spent by SAMPLING whole tokens across the run**
+  (bare `--spans` means 5000). It used to record the first N intervals and stop,
   which meant the timeline only ever showed the **cold start** — the least representative
   part of a decode, while the cache is still filling — and silently presented it as the
   run. Now the stride is `ceil(ngen × per_tok / budget)`, prefill is discarded at the same
@@ -186,15 +251,19 @@ partition wall. Keeping the two rows visually distinct is the whole point of hav
   are taken, so it never perturbs a measurement — but if it is painful, run a local
   `otel-collector` with a `batch` processor and forward from there.
 - **Measured cost: +0.15% on wall, and that is the FULLY-instrumented figure** (every
-  token recorded, `RIVOLI_SPANS` sized past the whole run, no OTLP endpoint so only the
+  token recorded, `--spans` sized past the whole run, no OTLP endpoint so only the
   recording is timed): 338.5 → 339.0 ms/tok, min-of-2 interleaved. With the default
   sampling stride it is **+0.00%** — min-of-3 interleaved, 338.2 vs 338.2, against a
   0.4 ms within-arm spread. Recording is a `Vec` push behind a mutex; no exporter touches
   the hot path.
-  Unset `RIVOLI_SPANS` for A/B timing runs regardless — docs/measurement/benchmarks.md's rule is that the
+  Drop `--spans` for A/B timing runs regardless — docs/measurement/benchmarks.md's rule is that the
   instrument must not be in the arm, and "too small to measure" is not "zero".
 - **The spans are the same intervals the scalars come from**, so the two views cannot
   disagree. If they do, that is a bug worth chasing.
+- **Nothing in CI compiles `--features otlp`.** It broke once already for exactly that
+  reason (see "How it rotted"). If you change `ProfileSummary`, build this arm before you
+  believe you are done — the compiler is the only thing that will tell you, and only if you
+  ask it.
 - **`Span::end()` is a trap.** It is `end_with_timestamp(now())` and it silently discards
   the builder's `with_end_time`. The first version of this used it, so every child was
   stamped as ending at *export* time — they all overlapped and Tempo rendered ~4000 spans
@@ -279,7 +348,7 @@ labels without any tagging API. Budget 2–4 h behind the `trace` feature.
 **One prerequisite, now already met.** SIGPROF interrupts `io_uring_enter`, which is *not* in
 the `SA_RESTART`-able class. `Streamer::reap` always retried `EINTR`; `Streamer::submit` did
 not, and would have turned a stray signal into a poisoned fetch. That inconsistency is fixed
-(`src/stream.rs`) — it was a latent robustness gap regardless of profilers, since `reap`'s own
+(`src/fetch/stream.rs`) — it was a latent robustness gap regardless of profilers, since `reap`'s own
 comment already grants that a signal can reach the reaper thread.
 
 **Unverified, flagged:** whether `pprof-rs` unwinding from a signal handler through
