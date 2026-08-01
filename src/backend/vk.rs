@@ -701,6 +701,20 @@ impl Gpu {
         // which is what removes the reduce and the cross-stream join (common.glsl's
         // MOE_ACC block). gfx1151 reports it; a device without it has no fallback path.
         need(v12.shader_buffer_int64_atomics == vk::TRUE, "shaderBufferInt64Atomics");
+        // ...and `moe_acc_drain` converts that u64 back with `double(t) / double(SCALE)`,
+        // which is a SPIR-V Float64 capability. The HIP kernel does the identical
+        // `(double)t / (double)MOE_ACC_SCALE` (kernels/moe.hip:168), and the two backends
+        // are compared byte-for-byte — so narrowing the GLSL to f32 would not be a
+        // simplification, it would be a divergence. The accumulator reaches 2^48 and f32
+        // carries 24 mantissa bits, which is the reason both sides are double.
+        //
+        // This went UNDECLARED until 2026-08-01: the shader always used `double`, the
+        // device was created without the feature, and the validation layer said so on every
+        // run. It surfaced as `a_moe_dispatch_sees_what_the_fetch_queue_wrote` failing on a
+        // validation-message count — the alphabetically first test, i.e. whichever one
+        // happens to create a shader module first, which is exactly the misattribution
+        // `Validation`'s own doc warns about.
+        need(core.shader_float64 == vk::TRUE, "shaderFloat64");
         // The fp16 VQ codebook.
         need(v12.shader_float16 == vk::TRUE, "shaderFloat16");
         need(v11.storage_buffer16_bit_access == vk::TRUE, "storageBuffer16BitAccess");
@@ -825,7 +839,9 @@ impl Gpu {
         let mut v13 = vk::PhysicalDeviceVulkan13Features::default()
             .subgroup_size_control(true)
             .compute_full_subgroups(true);
-        let core = vk::PhysicalDeviceFeatures::default().shader_int64(true);
+        let core = vk::PhysicalDeviceFeatures::default()
+            .shader_int64(true)
+            .shader_float64(true);
         // Every REQUIRED extension is core in 1.3 — including subgroup_size_control
         // and buffer_device_address. memory_budget is the one optional extra.
         let exts = [ash::ext::memory_budget::NAME.as_ptr()];
