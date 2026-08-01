@@ -21,7 +21,7 @@ a STATE block that gives the current answer in ~15 lines.
 | What Vulkan can and cannot run | `VULKAN.md` §"Kernel inventory" | the other 110 KB — it is a port journal |
 | Whether the NPU offload is worth it | `NPU.md` §"The finding, in five lines" | the other 55 KB |
 | How the expert cache decides residency | `../MODES.md` §"Cache policies", then `CACHE_ROUTE.md` §"Design" | `CACHE_ROUTE.md` §"RETIRED" onwards — `top-m` is gone |
-| Whether cross-layer prefetch works | `CACHE_PILOT.md` header. Built, measured inert, **deleted 2026-07-31** | assuming `--hint-k` still exists; it does not |
+| Whether cross-layer prefetch works | `CACHE_PILOT.md` header. **No — settled 2026-08-01.** Not for want of accuracy (82.7% recall) or bandwidth (the drive idles 35%): the idle window is 1.13 ms and one expert read is ~2 ms | the two reasons previously recorded — "prediction is too hard" and "overlap creates no bandwidth" — both measured false |
 | Whether the disk fetch can be made faster | `ARCHITECTURE.md` §3, "What the drive actually does". **No** — it is already at what its queue depth buys; the drive is *idle* 35% of a token and only prediction fills that | trusting `fetch_hidden_pct` from before 2026-08-01; it read ~97% on every configuration, including ones running at half speed |
 | How to read a trace / profile | `TRACES.md` §"What to actually look at" | `GPU_TRACE.md` unless you are attaching a profiler |
 

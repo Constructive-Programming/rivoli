@@ -5,6 +5,23 @@ live code.** Step 1 (LOOKA) and the `--hint-k` eviction-veto layer were built, m
 inert, and removed; nothing described below still exists in `src/`. The measurements stand
 and are the reason it went — read this before proposing cross-layer prefetch again.
 
+> **THE ANSWER, 2026-08-01 — and it is not the one this document spent 400 lines expecting.**
+> Cross-layer prefetch is closed, but **not** because prediction is hard and **not** because
+> the drive is saturated. Both of those were the stated reasons and both are false:
+>
+> - The pre-attention router predicts a layer's own misses at **82.7% recall**
+>   (`RIVOLI_PRED_PROBE=1`, measured — better than LOOKA's 77.2% at L+1).
+> - The drive is **idle 35% of every token** (`ARCHITECTURE.md` §3), so there is spare
+>   bandwidth. `b372cd4` prefetched into the *busy* window, which is why it saw nothing.
+>
+> **The blocker is that the idle window is 1.13 ms and one expert read is ~2 ms.** It fits
+> 0.74 of a single read where a layer needs 2.9, and a layer's fetch ends when its LAST read
+> lands. Meanwhile the 23% of a top-8 prefetch that goes unused costs **+67 ms/token** of
+> extra drive time against a **≤85 ms/token** ceiling. Net ceiling ~3%, unreachable.
+>
+> Full numbers in "Feasibility, settled" below. What would change the answer is a **smaller
+> expert** or **more compute per layer** — i.e. PERF.md #2, not prefetch.
+
 **Why it was removed rather than left default-off.** It was ~1,100 lines across
 `src/looka.rs`, `src/hybrid.rs` (the `Hint`/`HintSet` types, the cap, the decay, four trait
 methods per policy), `src/cache.rs` (a second, advisory skip set in the eviction scan, with
@@ -97,6 +114,98 @@ the current layer is still computing, and performs the *actual load into the poo
 keyed for that layer. When decode arrives, the expert is already resident and the
 demand read **never happens**. The lever is residency — fewer total bytes — not
 earlier bytes.
+
+> **CORRECTED 2026-08-01 — "fewer total bytes" is wrong, and the `b372cd4` verdict is
+> narrower than it reads.**
+>
+> A prefetched expert's bytes still cross the PCIe/NVMe path exactly once. Prefetch does not
+> move fewer bytes; it moves the same bytes *earlier*. (It can raise hit rate for LATER
+> tokens by improving pool occupancy — `b372cd4` measured that at +1.4pp — but that is a
+> second-order effect, not the lever.) So the distinction this section draws between
+> CACHE_PILOT and the deleted prefetch does not exist: both are "earlier bytes".
+>
+> Which does **not** make prefetch worthless, because the premise underneath the deletion
+> was never checked. `b372cd4` concluded "on a bandwidth-bound NVMe path overlapping a read
+> creates no bandwidth". That holds only where the drive is BUSY, and its own code says
+> where it issued:
+>
+> > `// Submit L+1's predicted-expert reads NOW (non-blocking) while this layer's demand`
+> > `// reads are still in flight, so both batches sit in the device queue together.`
+>
+> It prefetched **during the MoE phase — the one window where the drive is saturated.**
+> Measured 2026-08-01: `route_wait` is 84.8 ms/token of host blocked on the gate D2H, i.e.
+> attention GPU time, ~1.13 ms per layer, and the io_uring ring is EMPTY throughout. The
+> drive idles **35% of every token** and prefetch was aimed at the other 65%.
+>
+> The unexploited window is worth at most **85 ms/token, ~1.28×**, capped by the attention
+> duration rather than the read duration (starting a 2.0 ms read 1.13 ms early gains
+> 1.13 ms, not 2.0). Against that: the pilot's own per-layer rmsnorm+gemv+D2H cost 3–8%
+> (above), mispredicted reads evict against a working set ~3× the pool, and the staging ring
+> is 16 slots for a ~3-slot layer.
+>
+> **`b372cd4`'s result stands for the window it tested.** It is not evidence about issuing
+> at the top of layer L+1, where `x_{L+1}` is already exact and only the attention residual
+> is missing — strictly better information than that implementation had (it predicted from
+> L's residual *before* L's MoE contribution). See "Feasibility" below.
+
+## Feasibility, settled — MEASURED 2026-08-01 (`RIVOLI_PRED_PROBE=1`)
+
+The predictor is **not** the problem. Run at the top of each MoE layer on `post_ln(x)` — the
+layer input, before attention adds into it — against `--mode int3-vq --attn dense --max-mem
+100 --no-mtp -bench 64`:
+
+| | |
+|---|---:|
+| recall on the top-k | **83.9%** (37236/44400) |
+| **recall on the MISSES** (the only ones a prefetch could save) | **82.7%** (12563/15191) |
+| reads it would issue | 16306 |
+| of those, wasted (no row routed there) | **23.0%** |
+
+That beats LOOKA's 77.2% at L+1, which is what one would expect: this predictor is missing
+only the attention residual, where LOOKA was missing that *and* the previous layer's MoE
+output. **Prediction accuracy is not what killed cross-layer prefetch.**
+
+### The economics, and they do not work
+
+Per pass (74 passes, 15.335 MB/read, measured 1.32 ms/miss):
+
+| | reads/pass | drive time |
+|---|---:|---:|
+| demand misses today | 205.3 | 271 ms |
+| prefetch would issue | 220.4 | 291 ms |
+| — useful (a demand miss, started early) | 169.8 | — |
+| — **wasted** | **50.7** | **+67 ms/token** |
+| demand misses it would still not predict | 35.5 | 47 ms |
+
+Against a gain ceiling of **85 ms/token** (the whole idle window) the 23% waste costs
+**67 ms/token**, and the predictor's own per-layer rmsnorm+gemv+D2H costs ~6 ms. Net ceiling
+**~+12 ms on a 397 ms token, ~3%** — while assuming the idle window is exploited perfectly.
+
+### Why it cannot be exploited perfectly, which is the real blocker
+
+**The idle window is 1.13 ms per layer. One 15.3 MB expert read takes ~2 ms at QD1.** The
+window fits 0.74 of a single read and a layer needs 2.9 of them. Worse, a layer's fetch ends
+when its *last* read lands, so starting a subset early moves the batch by much less than the
+window. The prefetch necessarily spills into the MoE phase — which is the saturated regime
+`b372cd4` measured, and where its wasted 23% is a straight tax on the bottleneck.
+
+### So: closed, and now for the right reason
+
+Three explanations have been offered for why cross-layer prefetch does not pay here. Two are
+wrong:
+
+- ~~"On a bandwidth-bound path overlap creates no bandwidth"~~ (`b372cd4`) — the drive idles
+  35% of every token. There IS spare bandwidth.
+- ~~"The predictor cannot see far enough"~~ — 82.7% recall on misses, measured above.
+- **The idle window is shorter than one expert read, and a top-8 prefetch's waste costs more
+  drive time than the window can return.** This one holds.
+
+It also says what would change the answer, which none of the plumbing work does: a **smaller
+expert** (the window fits a larger fraction of one) or a **longer window** (more compute per
+layer to hide behind). Both are the same lever as PERF.md #2, and neither is prefetch.
+
+The probe stays in `gpu.rs` behind `RIVOLI_PRED_PROBE=1`, off by default. It is ~60 lines
+and it is the evidence; re-run it before re-opening this.
 
 The evidence that this is the real mechanism is a natural experiment, not a claim.
 Colibri shipped the eviction guard with its comparison inverted (#474), which silently

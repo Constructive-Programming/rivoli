@@ -592,12 +592,16 @@ Grounded in the measured kernel profile.
 > K ways does raise its queue depth (1.94 → 1.44 ms), but only the 18% of layers that miss
 > exactly once benefit: **~2% overall**, for a real change to the ring. Measured, dropped.
 >
-> **What is NOT closed is the duty cycle.** The drive is idle ~35% of every token, because
-> the ring only has work between a layer's routing and its MoE launch. That is the whole
-> remaining fetch lever and it is not a fetch problem — it needs the routing known a layer
-> early, i.e. prediction (`CACHE_PILOT.md` for what the last attempt cost). Rank it against
-> #2, which moves *fewer bytes* and therefore shortens the busy 65% instead of filling the
-> idle 35%.
+> **The duty cycle looked open for a day; it is not.** The drive idles ~35% of every token,
+> and filling it needs the routing known before that layer's attention. The predictor works
+> — 82.7% recall on the misses (`RIVOLI_PRED_PROBE=1`) — but the window is **1.13 ms against
+> a ~2 ms expert read**, so it fits 0.74 of one read where a layer needs 2.9, and the 23%
+> of a top-8 prefetch that goes unused costs +67 ms/token against a ≤85 ms/token ceiling.
+> Closed 2026-08-01; full arithmetic in `CACHE_PILOT.md` §"Feasibility, settled".
+>
+> That leaves **#2 as the only live fetch lever**: it moves *fewer bytes*, shortening the
+> busy 65% rather than trying to fill the idle 35% — and a smaller expert is also the one
+> thing that would make the idle window worth filling.
 
 **Suggested sequence, revised.** The original sequence led with #1 and treated #4 as the
 big multiplier; #1 has landed and #4 has a measured loss against it, so:

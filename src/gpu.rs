@@ -93,6 +93,28 @@ fn mtp_probe() -> bool {
     *ON.get_or_init(|| std::env::var("RIVOLI_MTP_PROBE").is_ok_and(|v| v != "0"))
 }
 
+/// `RIVOLI_PRED_PROBE=1` — can layer L's experts be predicted BEFORE its attention runs?
+///
+/// This is the one unknown behind cross-layer prefetch, and it is worth stating precisely
+/// what it is not. The router reads `post_ln(x + attn_out)`; at the top of the layer only
+/// `x` is known, so the question is how much the attention residual moves the top-k. If it
+/// moves it a lot, there is nothing to prefetch with. Nothing else about prefetch matters
+/// until this number exists.
+///
+/// The window it would fill is measured: `route_wait` is 84.8 ms/token of host blocked on
+/// the gate D2H — attention GPU time, ~1.13 ms per layer — during which the io_uring ring
+/// is EMPTY. Cross-layer prefetch was built and deleted once (`b372cd4`) having issued its
+/// reads *during* the MoE phase, i.e. into a saturated drive, which is why it recorded
+/// "overlapping a read creates no bandwidth". That verdict is about the window it chose.
+///
+/// Off by default: it adds an rmsnorm, a gemv and a BLOCKING 1 KB D2H per MoE layer, which
+/// is roughly the per-layer cost the `--hint-k` pilot was retired for (3-8%). It measures
+/// recall, not throughput; do not read a tok/s off a probe run.
+fn pred_probe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RIVOLI_PRED_PROBE").is_ok_and(|v| v != "0"))
+}
+
 /// `softmax(logits)[argmax]` from a raw f32 logit vector — the draft head's confidence
 /// in its own pick, and the only free signal a speculate-or-not gate could read.
 fn top1_prob(bytes: &[u8]) -> f32 {
@@ -530,6 +552,27 @@ pub struct GpuEngine<'a> {
     /// dependency — see the launch loop for the failure that caused.
     tickets: Vec<Ticket>,
     gl_host: Vec<u8>,
+    /// `RIVOLI_PRED_PROBE` scratch: the pre-attention router prediction. Device buffers for
+    /// `post_ln(x)` and its gate logits, then the host triple `route_into` needs. Allocated
+    /// unconditionally (a hidden f32 + 256 f32 is ~25 KB) so the probe is one branch rather
+    /// than an `Option` threaded through the layer loop.
+    pred_xn: DeviceBuf,
+    pred_gl: DeviceBuf,
+    pgl_host: Vec<u8>,
+    pred_scores: Vec<f32>,
+    pred_choice: Vec<f32>,
+    pred_sel: Vec<usize>,
+    /// Predicted-vs-actual tallies, all over MoE layers only. `_sel` is recall against the
+    /// whole top-k; `_miss` is recall against the experts that were NOT resident — the only
+    /// ones a prefetch could have saved, and therefore the number that sets the payoff.
+    /// `pred_issued` counts reads a real prefetch would have started, `pred_wasted` those of
+    /// them that no row went on to route to.
+    pred_hit_sel: u64,
+    pred_tot_sel: u64,
+    pred_hit_miss: u64,
+    pred_tot_miss: u64,
+    pred_issued: u64,
+    pred_wasted: u64,
     argmax_host: Vec<u8>,
     /// Always-on cheap per-token profiling (see [`Profile`]).
     prof: Profile,
@@ -749,6 +792,18 @@ impl<'a> GpuEngine<'a> {
             fmt: Vec::with_capacity(slots),
             tickets: Vec::with_capacity(slots),
             gl_host: Vec::with_capacity(MAXROW * cfg.n_experts * 4),
+            pred_xn: f(cfg.hidden)?,
+            pred_gl: f(cfg.n_experts)?,
+            pgl_host: Vec::with_capacity(cfg.n_experts * 4),
+            pred_scores: vec![0.0; cfg.n_experts],
+            pred_choice: vec![0.0; cfg.n_experts],
+            pred_sel: Vec::with_capacity(cfg.top_k),
+            pred_hit_sel: 0,
+            pred_tot_sel: 0,
+            pred_hit_miss: 0,
+            pred_tot_miss: 0,
+            pred_issued: 0,
+            pred_wasted: 0,
             argmax_host: Vec::with_capacity(ARGMAX_BYTES),
             prof: Profile::default(),
             compute_stream: Stream::compute()?,
@@ -1332,6 +1387,40 @@ impl<'a> GpuEngine<'a> {
             let lscalep = self.lc_scale[l].ptr_mut() as *mut f32;
             let rcp = self.rc[l].ptr_mut() as *mut u16;
 
+            // PREDICTION PROBE, and its position in this function is the whole point: `xp`
+            // still holds the layer's INPUT residual, because attention has not added into
+            // it yet. That is exactly the information a prefetch issued at the top of this
+            // layer would have — and the ~1.13 ms of attention below it is the idle-drive
+            // window it would fetch into. Row 0 only; run with `--no-mtp` so the union is
+            // row 0's picks and the comparison has no second router in it.
+            if pred_probe() && dense_mlp.is_none() {
+                // SAFETY: `xp` is the live layer-input residual (nrow·hidden f32, row 0 at
+                // offset 0); `post_ln`/`gate_w` are resident weights of THIS layer;
+                // pred_xn/pred_gl are hidden / n_experts f32 device scratch.
+                unsafe {
+                    launch_rmsnorm(xp, post_ln, hidden, eps, self.pred_xn.ptr_mut() as *mut f32)?;
+                    launch_gemv_f32(
+                        self.pred_xn.ptr() as *const f32,
+                        gate_w,
+                        cfg.n_experts,
+                        hidden,
+                        1,
+                        self.pred_gl.ptr_mut() as *mut f32,
+                    )?;
+                }
+                // Blocking D2H, but a cheap one HERE: the previous layer ended in
+                // `device_sync`, so the null stream holds only the two launches above.
+                self.pred_gl.copy_out_into(&mut self.pgl_host)?;
+                route_into(
+                    &self.pgl_host,
+                    self.pin.moe_bias(l),
+                    cfg.top_k,
+                    &mut self.pred_scores,
+                    &mut self.pred_choice,
+                    &mut self.pred_sel,
+                );
+            }
+
             // --- Attention phase 1: projections, ropes, cache append, absorb. ---
             // The four fp8 GEMVs and the absorb carry every row through ONE read of their
             // weights (`nrow`); the norms/ropes/appends launch per row, because their
@@ -1608,6 +1697,31 @@ impl<'a> GpuEngine<'a> {
                 } else {
                     0
                 };
+                // Score the pre-attention prediction, and it has to be HERE for the same
+                // reason `warm_mask` does: `submit_layer` allocates the misses, so one line
+                // later every expert reads as resident and `_miss` would score 0/0.
+                if pred_probe() {
+                    for &e in &self.union {
+                        let predicted = self.pred_sel.contains(&e);
+                        let resident = self.pin.resident(l, e);
+                        self.pred_hit_sel += u64::from(predicted);
+                        self.pred_tot_sel += 1;
+                        if !resident {
+                            // The only experts a prefetch could have saved: a predicted
+                            // resident one is a read that would never have been issued.
+                            self.pred_hit_miss += u64::from(predicted);
+                            self.pred_tot_miss += 1;
+                        }
+                    }
+                    // What a real prefetch would have SPENT: a read per predicted expert
+                    // that is not already resident, whether or not it turns out to be used.
+                    for &e in &self.pred_sel {
+                        if !self.pin.resident(l, e) {
+                            self.pred_issued += 1;
+                            self.pred_wasted += u64::from(!self.union.contains(&e));
+                        }
+                    }
+                }
                 let t_sub = std::time::Instant::now();
                 // The UNION, not one row's picks: every expert any row routed to must be
                 // resident before the batch launches. Rows overlap ~31% (measured over
@@ -2460,6 +2574,26 @@ impl<'a> GpuEngine<'a> {
                     hist(&self.mtp_tgt_bins)
                 );
             }
+        }
+        // The prefetch feasibility number. `recall on MISSES` is the one that matters: it is
+        // the fraction of demand reads a prefetch issued at the top of the layer would have
+        // started ~1.13 ms early, so the throughput ceiling is roughly
+        // `recall x 85 ms/token` against a 393 ms token, minus the probe's own per-layer
+        // rmsnorm+gemv+D2H. Below ~30% there is nothing here.
+        if self.pred_tot_sel > 0 {
+            let pct = |a: u64, b: u64| 100.0 * a as f64 / b.max(1) as f64;
+            tracing::info!(
+                "PRED (pre-attention router): recall on top-k {:.1}% ({}/{}) | recall on \
+                 MISSES {:.1}% ({}/{}) | would issue {} reads, {:.1}% of them wasted",
+                pct(self.pred_hit_sel, self.pred_tot_sel),
+                self.pred_hit_sel,
+                self.pred_tot_sel,
+                pct(self.pred_hit_miss, self.pred_tot_miss),
+                self.pred_hit_miss,
+                self.pred_tot_miss,
+                self.pred_issued,
+                pct(self.pred_wasted, self.pred_issued),
+            );
         }
         Ok((generated, summary))
     }

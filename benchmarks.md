@@ -1908,3 +1908,57 @@ would ever satisfy — the device hung instead of the decode returning the error
 calls `Timeline::release` (host-side monotone store on ROCm, `vkSignalSemaphore` on Vulkan).
 Registered as **INV-6**, with a test per backend that proves the mechanism rather than the
 bookkeeping: a host release retires a wait enqueued against a value no stream will ever write.
+
+### Cross-layer prefetch: the predictor works, the window does not — 2026-08-01
+
+`RIVOLI_PRED_PROBE=1`, `--mode int3-vq --attn dense --cache-policy 2q --max-mem 100
+--no-mtp -bench 64`. `--no-mtp` deliberately: with speculation on, the union carries two
+routers' picks and a row-0 prediction would be scored against a denominator it never saw.
+
+At the top of each MoE layer — before attention adds into the residual — run the layer's own
+router on `post_ln(x)` and compare its top-8 against what the real router picks afterwards.
+That is exactly the information a prefetch issued into the attention window would have.
+
+| | |
+|---|---:|
+| recall on the top-k | **83.9%** (37236/44400) |
+| **recall on the MISSES** | **82.7%** (12563/15191) |
+| reads it would issue | 16306 |
+| of those, wasted | **23.0%** |
+
+Better than LOOKA's 77.2% at L+1 (2026-07-30), which is what the mechanism predicts: this
+predictor is missing only the attention residual where LOOKA was missing that *and* the
+previous layer's MoE output. **Prediction accuracy was never the blocker.**
+
+The economics, per pass (74 passes, 15.335 MB/read, measured 1.32 ms/miss):
+
+| | reads/pass | drive time |
+|---|---:|---:|
+| demand misses today | 205.3 | 271 ms |
+| prefetch would issue | 220.4 | 291 ms |
+| — useful (a demand miss, started early) | 169.8 | — |
+| — **wasted** | **50.7** | **+67 ms/token** |
+| demand misses still unpredicted | 35.5 | 47 ms |
+
+Gain ceiling is the idle window, **85 ms/token** (`route_wait`, the host blocked on the gate
+D2H = attention GPU time, with an empty io_uring ring throughout). The waste costs 67 ms and
+the predictor's own rmsnorm+gemv+D2H ~6 ms, so the net ceiling is **~+12 ms on a 397 ms
+token — 3%** — and that assumes the window is filled perfectly.
+
+**It cannot be. The window is 1.13 ms per layer and one 15.3 MB expert read is ~2 ms at
+QD1.** It fits 0.74 of a single read where a layer needs 2.9, and a layer's fetch ends when
+its LAST read lands, so starting a subset early moves the batch by much less than the window.
+The prefetch necessarily spills into the MoE phase — the saturated regime `b372cd4` measured.
+
+So three explanations have now been offered for why this does not pay, and two are false:
+
+| explanation | verdict |
+|---|---|
+| "on a bandwidth-bound path overlap creates no bandwidth" (`b372cd4`) | **false** — the drive idles 35% of every token |
+| "the predictor cannot see far enough" | **false** — 82.7% recall on misses |
+| the idle window is shorter than one expert read, and the waste costs more than it returns | **holds** |
+
+`b372cd4`'s A/B result stands; its stated reason does not, and it prefetched during the MoE
+phase rather than into the idle window, so it never tested the case its conclusion was read
+as closing. What would change the answer is a smaller expert or more compute per layer —
+PERF.md #2, not prefetch.
