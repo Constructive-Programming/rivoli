@@ -16,8 +16,10 @@ being the wrong one.
 >   remaining case for rotation lives. See "The two arguments".
 > - The gating experiment is therefore **not** a rotation experiment. It is one number:
 >   how much distortion does a per-layer codebook recover over the global one?
-> - **The fp8 ground truth is gone** (365 GB, deleted; 252 GB free on the volume). Every
->   study below is comparative against `.i4`, and says so.
+> - The fp8 ground truth **is available** at `/swarm/storage/ai/openclaw/glm52-fp8` (581 GB,
+>   141 shards) — verified `glm_moe_dsa`, 78 layers, hidden 6144, 256 experts, e4m3 with
+>   `[128,128]` block scales. It reads at **62 MB/s over NFS**, which is the real constraint:
+>   sample, never sweep.
 
 ## The two arguments for rotation, which are not the same argument
 
@@ -94,11 +96,24 @@ rate: global · per-layer · global-after-rotation.
 
 ## Constraints the next person will hit
 
-- **The fp8 checkpoint is deleted.** `i4_audit`'s ground-truth modes cannot run. Use `.i4` as
-  the reference: it is built by `fp8_to_i4` straight from fp8 with group-128 scales and
-  measures **5.120 PPL against vq3's 5.275**, so it is the most faithful surviving artifact.
-  This understates absolute error and is fine for a **comparative** study, where every arm
-  sees the same reference — say so in any number that leaves this file.
+- **The fp8 checkpoint is at `/swarm/storage/ai/openclaw/glm52-fp8`.**
+
+  > **CORRECTED 2026-08-01, same day this file was written.** The first version of this
+  > section said the fp8 set was deleted and that every study had to be comparative against
+  > `.i4`. That was wrong — it was inferred from `/var/db/rivoli` holding only the converted
+  > artifact, without looking further. Use fp8 as ground truth; `i4_audit`'s ground-truth
+  > modes run. The `.i4`-as-reference fallback below is no longer needed and is kept only
+  > because it remains a valid *comparative* reference if the NFS mount is unavailable.
+
+  **The constraint is bandwidth, not availability: 62 MB/s over NFS** (measured, 512 MB cold
+  read). The whole set is ~2.6 hours end to end, so nothing here sweeps it. Safetensors is
+  seekable and the index maps tensor → shard, so read only the experts you sample: one
+  expert is `3 × 6144 × 2048` fp8 ≈ **37.7 MB ≈ 0.6 s**. The gating experiment's 8 experts ×
+  6 layers is ~1.8 GB ≈ **30 seconds** of I/O. Budget by expert count, not by layer count.
+
+  Sample several experts per layer, not one — a single expert conflates a *per-layer*
+  codebook with a *per-expert* one, and only the first is affordable as header data
+  (per-expert would be 256 × 75 × 3 codebooks).
 - **`VQ_INDEX_BITS` is load-bearing in the packing.** 12 bits packs two indices per 3 bytes.
   11 or 13 bits needs an arbitrary-bit-boundary packer *on the MoE gather*, which is the hot
   path. Any `VQ_K` change is a kernel change, not a constant change.
