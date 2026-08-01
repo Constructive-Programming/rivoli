@@ -11,20 +11,25 @@
 //!
 //! **This is an inference backend, not a chat product.** Open WebUI and the Hermes agent
 //! already own the conversation surface; everything here exists to be called BY them. That
-//! is why thinking is exposed as the protocol fields those clients already send and read
-//! (`enable_thinking`, `reasoning_content`) rather than as anything rendered, and why tool
-//! calling is refused outright below instead of half-built.
+//! is why thinking and tool calling are expressed as the protocol fields those clients
+//! already send and read — `enable_thinking`/`reasoning_content`, `tools`/`tool_calls` —
+//! and nothing here renders, orchestrates or loops.
+//!
+//! Tool calling is the checkpoint's own, hand-ported from its `chat_template.jinja`
+//! alongside the rest of the framing: declarations go out as the template's `# Tools`
+//! system turn, calls come back as `<tool_call>name<arg_key>k</arg_key>…` and are parsed
+//! into OpenAI `tool_calls`, and results return as `<|observation|><tool_response>`. The
+//! renderer and the parser are deliberate mirrors — see `parse_tool_calls`.
 //!
 //! Deliberately absent, so nobody goes looking:
 //! - **Sampling.** The engine is greedy argmax and every number in `benchmarks.md` is
 //!   measured that way. `temperature`/`top_p` are accepted and IGNORED, with one warning
 //!   per process — honouring them is not a server-side change, and dropping them silently
 //!   would leave a client believing its own determinism story.
-//! - **Tool calling.** The checkpoint's template does define it (`<tool_call>` /
-//!   `<arg_key>` / `<|observation|>`), so this is a real omission rather than an
-//!   impossibility — but a request carrying `tools` is refused with a 400 instead of being
-//!   answered in prose, because a client that asked for a tool call and got an essay waits
-//!   forever. Orchestration lives in the agent above us.
+//! - **Forcing a call.** `tool_choice` accepts `"auto"` and `"none"` (which drops the
+//!   declarations, genuinely preventing calls) and REFUSES `"required"` or a named
+//!   function: nothing here can constrain decoding, and answering prose to a client that
+//!   demanded a call would look like compliance.
 //! - **`/v1/completions`.** A raw (unframed) prompt leaves the model outside an assistant
 //!   turn, where its EOS ids are unreachable and decode runs to the token limit every
 //!   time — see `Tokenizer::encode_chat`. That endpoint would serve the failure mode by
@@ -36,7 +41,7 @@
 //! `GpuEngine::new`, so a request that will not fit is a 400 rather than a reallocation.
 
 use anyhow::{Context, Result, ensure};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::io::BufRead;
 
 pub struct Opts {
@@ -143,37 +148,151 @@ fn content_text(c: Option<&Value>) -> String {
     }
 }
 
-/// The roles the hand-ported template can frame. `tool` is absent on purpose: it only
-/// appears in a conversation that used `tools`, which `parse_ask` refuses, and framing it
-/// as a user turn would feed the model a tool result it has no protocol for.
-const ROLES: [&str; 4] = ["system", "developer", "user", "assistant"];
+/// The roles the hand-ported template can frame.
+const ROLES: [&str; 5] = ["system", "developer", "user", "assistant", "tool"];
 
+/// Flatten an OpenAI `messages` array into the template's turns.
+///
+/// Two shapes do not survive one-message-per-turn and are folded here rather than in the
+/// tokenizer, because both are facts about the OpenAI wire format and not about the
+/// template:
+/// - an assistant message carries `tool_calls` alongside (or instead of) its content, which
+///   the template renders as markup INSIDE the assistant turn;
+/// - consecutive `tool` results share ONE `<|observation|>` turn, so a run of them becomes a
+///   single turn whose content is their concatenated `<tool_response>` blocks.
 fn messages_to_turns(body: &Value) -> Result<Vec<(String, String)>> {
     let msgs = body
         .get("messages")
         .and_then(Value::as_array)
         .context("`messages` must be an array")?;
     ensure!(!msgs.is_empty(), "`messages` is empty");
-    msgs.iter()
-        .enumerate()
-        .map(|(i, m)| {
-            let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
-            ensure!(
-                ROLES.contains(&role),
-                "messages[{i}].role is {role:?}; this server frames {ROLES:?} only\
-                 {}",
-                if role == "tool" {
-                    " — `tools` is not implemented, so a tool result cannot be answered"
-                } else {
-                    ""
+    let mut turns: Vec<(String, String)> = Vec::with_capacity(msgs.len());
+    for (i, m) in msgs.iter().enumerate() {
+        let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
+        ensure!(
+            ROLES.contains(&role),
+            "messages[{i}].role is {role:?}; this server frames {ROLES:?} only"
+        );
+        let mut content = content_text(m.get("content"));
+        match role {
+            // A run of tool results is one observation turn. `last_mut` rather than a
+            // look-ahead: the previous turn IS the run so far.
+            "tool" => {
+                let block = crate::artifact::tokenizer::tool_response_markup(&content);
+                match turns.last_mut() {
+                    Some((r, c)) if r == "observation" => c.push_str(&block),
+                    _ => turns.push(("observation".to_string(), block)),
                 }
-            );
-            // `developer` is OpenAI's newer name for a system message; the template has no
-            // such turn, so it frames as one.
-            let role = if role == "developer" { "system" } else { role };
-            Ok((role.to_string(), content_text(m.get("content"))))
-        })
-        .collect()
+                continue;
+            }
+            "assistant" => {
+                for (j, tc) in m
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                {
+                    let f = tc.get("function").unwrap_or(tc);
+                    let name = f.get("name").and_then(Value::as_str).with_context(|| {
+                        format!("messages[{i}].tool_calls[{j}] has no function name")
+                    })?;
+                    // OpenAI sends `arguments` as a JSON *string*; a client that sends an
+                    // object instead is accepted rather than argued with.
+                    let args = match f.get("arguments") {
+                        Some(Value::String(s)) => {
+                            serde_json::from_str(s).unwrap_or_else(|_| json!({}))
+                        }
+                        Some(v) => v.clone(),
+                        None => json!({}),
+                    };
+                    content.push_str(&crate::artifact::tokenizer::tool_call_markup(name, &args));
+                }
+            }
+            _ => {}
+        }
+        // `developer` is OpenAI's newer name for a system message; the template has no such
+        // turn, so it frames as one.
+        let role = if role == "developer" { "system" } else { role };
+        turns.push((role.to_string(), content));
+    }
+    Ok(turns)
+}
+
+const TOOL_OPEN: &str = "<tool_call>";
+const TOOL_CLOSE: &str = "</tool_call>";
+const ARG_KEY: (&str, &str) = ("<arg_key>", "</arg_key>");
+const ARG_VALUE: (&str, &str) = ("<arg_value>", "</arg_value>");
+
+/// `(inner, rest)` for the first `open`…`close` pair, or `None`.
+fn take<'a>(s: &'a str, (open, close): (&str, &str)) -> Option<(&'a str, &'a str)> {
+    let i = s.find(open)? + open.len();
+    let j = s[i..].find(close)?;
+    Some((&s[i..i + j], &s[i + j + close.len()..]))
+}
+
+/// Pull the model's `<tool_call>` blocks out of a reply, returning the prose that was left
+/// and the calls in OpenAI shape.
+///
+/// The inverse of `tokenizer::tool_call_markup`, and deliberately its mirror: an argument is
+/// parsed as JSON and falls back to the raw string, because that is exactly how the renderer
+/// decides between the two. `id` is derived from the completion id rather than random, so a
+/// greedy engine stays reproducible request to request.
+///
+/// A block left unterminated by the token budget is still reported, with whatever arguments
+/// completed — a truncated call the client can see beats a silent drop.
+fn parse_tool_calls(text: &str, id: &str) -> (String, Vec<Value>) {
+    let (mut prose, mut calls, mut rest) = (String::new(), Vec::new(), text);
+    while let Some(i) = rest.find(TOOL_OPEN) {
+        prose.push_str(&rest[..i]);
+        let after = &rest[i + TOOL_OPEN.len()..];
+        let (inner, tail) = match after.find(TOOL_CLOSE) {
+            Some(j) => (&after[..j], &after[j + TOOL_CLOSE.len()..]),
+            None => (after, ""),
+        };
+        let name_end = inner.find(ARG_KEY.0).unwrap_or(inner.len());
+        let mut args = serde_json::Map::new();
+        let mut cursor = &inner[name_end..];
+        while let Some((key, r)) = take(cursor, ARG_KEY) {
+            let Some((raw, r2)) = take(r, ARG_VALUE) else { break };
+            let v = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
+            args.insert(key.to_string(), v);
+            cursor = r2;
+        }
+        calls.push(json!({
+            "id": format!("call_{id}_{}", calls.len()),
+            "type": "function",
+            "function": {
+                "name": inner[..name_end].trim(),
+                // OpenAI's `arguments` is a JSON string, not an object.
+                "arguments": Value::Object(args).to_string(),
+            }
+        }));
+        rest = tail;
+    }
+    prose.push_str(rest);
+    (prose.trim().to_string(), calls)
+}
+
+/// The part of `text` that is safe to stream as `content` right now.
+///
+/// Everything before the first `<tool_call>` and not a byte more — a tool call is a protocol
+/// message, not prose, and it goes out as a structured delta at the end instead. A trailing
+/// PARTIAL marker is held back too: mid-generation the text can end `…<tool_ca`, and emitting
+/// that would leak a fragment which the next token turns into a marker, after which `content`
+/// would have to shrink. A delta stream cannot express shrinking.
+fn streamable(text: &str) -> &str {
+    if let Some(i) = text.find(TOOL_OPEN) {
+        return &text[..i];
+    }
+    // Longest suffix that is a proper prefix of the marker. ASCII, so a match can never
+    // land mid-codepoint.
+    for k in (1..TOOL_OPEN.len().min(text.len() + 1)).rev() {
+        if text.ends_with(&TOOL_OPEN[..k]) {
+            return &text[..text.len() - k];
+        }
+    }
+    text
 }
 
 /// Split a generation into `(reasoning, content)`.
@@ -222,8 +341,10 @@ pub use live::serve;
 
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
 mod live {
-    use super::{Opts, Req, delta, messages_to_turns, read_req, split_think};
-    use anyhow::{Context, Result};
+    use super::{
+        Opts, Req, delta, messages_to_turns, parse_tool_calls, read_req, split_think, streamable,
+    };
+    use anyhow::{Context, Result, ensure};
     use serde_json::{Value, json};
     use std::io::{BufReader, Write};
     use std::net::TcpStream;
@@ -342,21 +463,26 @@ mod live {
         opts: &Opts,
     ) -> Result<Ask> {
         let body: Value = serde_json::from_slice(body).context("body is not JSON")?;
-        // Refused, not ignored. The model CAN call tools — the template defines the whole
-        // `<tool_call><arg_key>` syntax — but nothing here renders the declarations or
-        // parses the calls back, so answering in prose would leave a client blocked on a
-        // tool call that is never coming. See the module doc.
-        if body
-            .get("tools")
-            .and_then(Value::as_array)
-            .is_some_and(|t| !t.is_empty())
-        {
-            anyhow::bail!(
-                "`tools` is not implemented by this server. The checkpoint supports tool \
-                 calling, but rendering and parsing it is not built here — run the \
-                 orchestration in the agent above, or send the request without `tools`"
-            );
+        // `tool_choice` is accepted only in the forms this can honour. "none" is honoured by
+        // dropping the declarations, which genuinely prevents calls; "required" is refused
+        // rather than faked, because nothing here can force the model's hand and a client
+        // that asked for a guaranteed call must not get prose that looks like compliance.
+        let choice = body.get("tool_choice");
+        match choice.and_then(Value::as_str) {
+            None | Some("auto") | Some("none") => {}
+            Some(other) => anyhow::bail!(
+                "`tool_choice` {other:?} is not supported — this server can do \"auto\" or \
+                 \"none\"; it cannot force a call"
+            ),
         }
+        ensure!(
+            !choice.is_some_and(Value::is_object),
+            "`tool_choice` naming a specific function is not supported — this server cannot \
+             force a call; use \"auto\""
+        );
+        let tools = body
+            .get("tools")
+            .filter(|_| choice.and_then(Value::as_str) != Some("none"));
         let turns = messages_to_turns(&body)?;
         // Thinking: the request wins, the server's `--think` is the default, and the
         // checkpoint template's own default (on) is deliberately not inherited — see Opts.
@@ -378,6 +504,7 @@ mod live {
             &crate::artifact::tokenizer::ChatOpts {
                 thinking: think,
                 reasoning_effort: effort,
+                tools,
             },
         )?;
         // One slot beyond the prompt for the token the last forward produces; `forward`
@@ -465,7 +592,10 @@ mod live {
                 let (reasoning, content) = split_think(&full, think);
                 for (field, sent, target) in [
                     ("reasoning_content", &mut sent_r, reasoning),
-                    ("content", &mut sent_c, content),
+                    // Prose only. Tool calls leave as one structured delta once the whole
+                    // reply is parseable — streaming their markup would hand the client
+                    // `<tool_call>` to render as text.
+                    ("content", &mut sent_c, streamable(content)),
                 ] {
                     let Some(d) = delta(sent, target) else { continue };
                     let ev = chunk(&id, created, &model, json!({ field: d }), None);
@@ -490,7 +620,29 @@ mod live {
             )?;
             hung_up = !live;
             if !hung_up {
-                let reason = finish_reason(out.0.len(), ngen);
+                // Tool calls go out here, whole, rather than as fragments: the markup is only
+                // parseable once closed, and OpenAI's streamed tool-call shape (per-call
+                // `index`, arguments assembled across deltas) is a reassembly protocol a
+                // client is free to receive in one piece.
+                let whole = tok.decode_all(&out.0)?;
+                let (_, content) = split_think(&whole, think);
+                let (_, calls) = parse_tool_calls(content, &id);
+                if !calls.is_empty() {
+                    let indexed: Vec<Value> = calls
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| {
+                            let mut c = c.clone();
+                            c["index"] = json!(i);
+                            c
+                        })
+                        .collect();
+                    sse(
+                        w,
+                        &chunk(&id, created, &model, json!({ "tool_calls": indexed }), None),
+                    )?;
+                }
+                let reason = stop_reason(&calls, out.0.len(), ngen);
                 sse(w, &chunk(&id, created, &model, json!({}), Some(reason)))?;
                 w.write_all(b"data: [DONE]\n\n")?;
                 w.flush()?;
@@ -532,17 +684,27 @@ mod live {
             return Ok(()); // already sent, chunk by chunk
         }
         let (reasoning, content) = split_think(&text, think);
-        let mut message = json!({"role": "assistant", "content": content});
+        let (prose, calls) = parse_tool_calls(content, &id);
+        let mut message = json!({"role": "assistant", "content": prose});
         // Only when there is some: a client that does not know the field should not have to
         // filter an empty one out of every non-thinking response.
         if !reasoning.is_empty() {
             message["reasoning_content"] = json!(reasoning);
         }
+        if !calls.is_empty() {
+            // OpenAI pairs `tool_calls` with a null content, not an empty string — a client
+            // that renders content unconditionally would otherwise print a blank message.
+            if prose.is_empty() {
+                message["content"] = Value::Null;
+            }
+            message["tool_calls"] = json!(calls);
+        }
         send_json(
             w,
             200,
             &json!({"id": id, "object": "chat.completion", "created": created, "model": model,
-                    "choices": [{"index": 0, "finish_reason": finish_reason(ids.len(), ngen),
+                    "choices": [{"index": 0,
+                                 "finish_reason": stop_reason(&calls, ids.len(), ngen),
                                  "message": message}],
                     "usage": {"prompt_tokens": prompt_ids.len(), "completion_tokens": ids.len(),
                               "total_tokens": prompt_ids.len() + ids.len()}}),
@@ -553,6 +715,17 @@ mod live {
     /// exactly `length`.
     fn finish_reason(generated: usize, ngen: usize) -> &'static str {
         if generated >= ngen { "length" } else { "stop" }
+    }
+
+    /// `tool_calls` outranks `stop` — an agent loop branches on this field, and a reply
+    /// carrying calls but reporting `stop` reads as "the model is done talking to you",
+    /// which is the opposite of what it means. `length` still wins over both: a call cut
+    /// off by the budget may be incomplete, and saying `tool_calls` would assert it is not.
+    fn stop_reason(calls: &[Value], generated: usize, ngen: usize) -> &'static str {
+        match finish_reason(generated, ngen) {
+            "stop" if !calls.is_empty() => "tool_calls",
+            other => other,
+        }
     }
 
     fn chunk(
@@ -706,19 +879,99 @@ mod tests {
     }
 
     #[test]
-    fn developer_is_a_system_turn_and_tool_is_refused() {
+    fn developer_is_a_system_turn_and_an_unknown_role_is_refused() {
         // OpenAI renamed `system` to `developer`; the template has only the one turn token.
         assert_eq!(
             messages_to_turns(&json!({"messages": [{"role": "developer", "content": "x"}]}))
                 .unwrap(),
             vec![("system".to_string(), "x".to_string())]
         );
-        // A tool RESULT cannot be framed when tool CALLS are refused — answering it as a
-        // user turn would feed the model a protocol it was not given.
-        let e = messages_to_turns(&json!({"messages": [{"role": "tool", "content": "42"}]}))
+        let e = messages_to_turns(&json!({"messages": [{"role": "wizard", "content": "x"}]}))
             .unwrap_err()
             .to_string();
-        assert!(e.contains("tools"), "{e}");
+        assert!(e.contains("wizard"), "{e}");
+    }
+
+    #[test]
+    fn a_tool_round_trip_folds_into_the_template_turns() {
+        let b = json!({"messages": [
+            {"role": "user", "content": "weather in Paris and Rome?"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "a", "type": "function",
+                 "function": {"name": "wx", "arguments": "{\"city\":\"Paris\"}"}},
+                {"id": "b", "type": "function",
+                 "function": {"name": "wx", "arguments": "{\"city\":\"Rome\"}"}}]},
+            {"role": "tool", "tool_call_id": "a", "content": "18C"},
+            {"role": "tool", "tool_call_id": "b", "content": "24C"},
+        ]});
+        assert_eq!(
+            messages_to_turns(&b).unwrap(),
+            vec![
+                ("user".to_string(), "weather in Paris and Rome?".to_string()),
+                // Calls render INSIDE the assistant turn, in order, after its (empty) prose.
+                (
+                    "assistant".to_string(),
+                    "<tool_call>wx<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>\
+                     <tool_call>wx<arg_key>city</arg_key><arg_value>Rome</arg_value></tool_call>"
+                        .to_string()
+                ),
+                // BOTH results share ONE observation turn — the template opens it once per
+                // consecutive run, not once per result.
+                (
+                    "observation".to_string(),
+                    "<tool_response>18C</tool_response><tool_response>24C</tool_response>"
+                        .to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_mirrors_the_renderer() {
+        // A string argument is rendered RAW and everything else as JSON, so the parse has to
+        // try JSON first and fall back — that is what makes the two round-trip.
+        let (prose, calls) = parse_tool_calls(
+            "Let me look.<tool_call>wx<arg_key>city</arg_key><arg_value>Paris</arg_value>\
+             <arg_key>days</arg_key><arg_value>3</arg_value></tool_call>",
+            "X",
+        );
+        assert_eq!(prose, "Let me look.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "wx");
+        assert_eq!(calls[0]["id"], "call_X_0");
+        // `arguments` is a JSON STRING in the OpenAI shape, not an object.
+        let args: Value = serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(args, json!({"city": "Paris", "days": 3}));
+
+        // Two calls, no prose.
+        let (prose, calls) = parse_tool_calls(
+            "<tool_call>a</tool_call><tool_call>b<arg_key>k</arg_key><arg_value>v</arg_value>\
+             </tool_call>",
+            "X",
+        );
+        assert!(prose.is_empty());
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1]["id"], "call_X_1");
+        assert_eq!(calls[0]["function"]["arguments"], "{}");
+
+        // Budget ran out mid-call: report the truncated call rather than dropping it.
+        let (_, calls) = parse_tool_calls("<tool_call>wx<arg_key>city</arg_key>", "X");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "wx");
+    }
+
+    #[test]
+    fn streamable_holds_back_anything_that_could_become_a_tool_call() {
+        assert_eq!(streamable("plain prose"), "plain prose");
+        assert_eq!(streamable("before<tool_call>wx"), "before");
+        // A partial marker must not leak: the next token completes it, and `content` cannot
+        // shrink once sent.
+        assert_eq!(streamable("ok <tool_c"), "ok ");
+        assert_eq!(streamable("ok <"), "ok ");
+        // A lone `<` in prose is held one step and emitted as soon as it cannot be a marker.
+        assert_eq!(streamable("a <b"), "a <b");
+        assert_eq!(streamable(""), "");
     }
 
     #[test]

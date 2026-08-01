@@ -3,6 +3,7 @@
 //! not reinvent; this is a 19 MB trained vocab.
 
 use anyhow::{Context, Result, anyhow};
+use serde_json::Value;
 use tracing::warn;
 
 pub struct Tokenizer {
@@ -30,6 +31,108 @@ pub struct ChatOpts<'a> {
     /// `Some("high")` renders "Reasoning Effort: High"; everything else renders "Max",
     /// which is the template's own `capitalize` of its default. Ignored unless `thinking`.
     pub reasoning_effort: Option<&'a str>,
+    /// OpenAI `tools` — the raw array, each entry either `{"type","function":{...}}` or a
+    /// bare function object. Renders the template's `# Tools` system turn, which is the
+    /// ONLY thing that teaches the model this checkpoint's `<tool_call>` syntax; invent a
+    /// preamble instead and it reaches for other frameworks' conventions.
+    pub tools: Option<&'a Value>,
+}
+
+/// `serde_json`, but with Python's default separators — `", "` between items and `": "`
+/// after a key.
+///
+/// Not cosmetic. The template renders tool schemas through Jinja's `tojson`, which is
+/// `json.dumps`, which spaces them that way — so that is the byte sequence the model was
+/// trained on, and `serde_json`'s compact form tokenizes differently. `ensure_ascii=False`
+/// needs no handling: serde_json never escapes non-ASCII, which is the same thing.
+struct PythonSpacing;
+
+impl serde_json::ser::Formatter for PythonSpacing {
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first { Ok(()) } else { w.write_all(b", ") }
+    }
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first { Ok(()) } else { w.write_all(b", ") }
+    }
+    fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(b": ")
+    }
+}
+
+fn python_json(v: &Value) -> String {
+    let mut buf = Vec::new();
+    let mut ser = serde_json::Serializer::with_formatter(&mut buf, PythonSpacing);
+    match serde::Serialize::serialize(v, &mut ser) {
+        Ok(()) => String::from_utf8(buf).unwrap_or_default(),
+        Err(_) => v.to_string(),
+    }
+}
+
+/// One call the model made, as the template writes it back into the conversation:
+/// `<tool_call>{name}<arg_key>{k}</arg_key><arg_value>{v}</arg_value>...</tool_call>`.
+///
+/// A STRING argument is emitted raw and everything else as JSON — the template's
+/// `v | tojson if v is not string else v`, which is also what makes the parse in
+/// `serve::parse_tool_calls` round-trip.
+pub fn tool_call_markup(name: &str, arguments: &Value) -> String {
+    let mut s = format!("<tool_call>{name}");
+    if let Some(args) = arguments.as_object() {
+        for (k, v) in args {
+            let rendered = match v {
+                Value::String(t) => t.clone(),
+                other => python_json(other),
+            };
+            s.push_str(&format!("<arg_key>{k}</arg_key><arg_value>{rendered}</arg_value>"));
+        }
+    }
+    s.push_str("</tool_call>");
+    s
+}
+
+/// A tool RESULT, as the template frames it inside an `<|observation|>` turn. Consecutive
+/// results share one observation turn — the caller concatenates these, see
+/// `serve::messages_to_turns`.
+pub fn tool_response_markup(content: &str) -> String {
+    format!("<tool_response>{content}</tool_response>")
+}
+
+/// The `# Tools` system turn, byte-for-byte from `chat_template.jinja`.
+///
+/// The Jinja is rendered with `trim_blocks`/`lstrip_blocks` (what transformers sets), so the
+/// block tags around the loop contribute nothing and each schema lands on its own line.
+/// `defer_loading` and `strict` are dropped per the template's own macro.
+fn tools_system_turn(tools: &Value) -> String {
+    let mut s = String::from(
+        "\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n\
+         You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n",
+    );
+    for tool in tools.as_array().into_iter().flatten() {
+        let f = tool.get("function").unwrap_or(tool);
+        let cleaned: serde_json::Map<_, _> = f
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(k, _)| k.as_str() != "defer_loading" && k.as_str() != "strict")
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        s.push_str(&python_json(&Value::Object(cleaned)));
+        s.push('\n');
+    }
+    s.push_str(
+        "</tools>\n\nFor each function call, output the function name and arguments within \
+         the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key>\
+         <arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key>\
+         <arg_value>{arg-value-2}</arg_value>...</tool_call>",
+    );
+    s
 }
 
 impl Tokenizer {
@@ -145,10 +248,19 @@ impl Tokenizer {
         // model saw it there in training. `capitalize` of the template's own default makes
         // anything that is not "high" into "Max" — including "low" and "medium", which is
         // the template's behaviour and not a shortcut taken here.
-        if opts.thinking && let Some(system) = self.inner.token_to_id("<|system|>") {
+        let system = self.inner.token_to_id("<|system|>");
+        if opts.thinking && let Some(system) = system {
             let effort = if opts.reasoning_effort == Some("high") { "High" } else { "Max" };
             out.push(system);
             out.extend_from_slice(&self.encode(&format!("Reasoning Effort: {effort}"))?);
+        }
+        // The tool declarations, after the effort turn and before the conversation — the
+        // order the template emits them in, and therefore the order the model saw.
+        if let Some(tools) = opts.tools.filter(|t| t.as_array().is_some_and(|a| !a.is_empty()))
+            && let Some(system) = system
+        {
+            out.push(system);
+            out.extend_from_slice(&self.encode(&tools_system_turn(tools))?);
         }
 
         for (role, text) in turns {

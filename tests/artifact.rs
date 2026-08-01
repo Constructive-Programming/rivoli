@@ -184,17 +184,17 @@ fn chat_framing_matches_the_checkpoint_template() {
     );
     // The template's own default: <think> left OPEN, preceded by the effort system turn.
     assert_eq!(
-        render(&[("user", "hi")], &ChatOpts { thinking: true, reasoning_effort: None }),
+        render(&[("user", "hi")], &ChatOpts { thinking: true, ..Default::default() }),
         "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hi<|assistant|><think>"
     );
     // Only "high" is High. The template capitalizes its default for everything else, so
     // "low" and "medium" render Max — that is the template's behaviour, not a shortcut.
     assert_eq!(
-        render(&[("user", "hi")], &ChatOpts { thinking: true, reasoning_effort: Some("high") }),
+        render(&[("user", "hi")], &ChatOpts { thinking: true, reasoning_effort: Some("high"), ..Default::default() }),
         "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>hi<|assistant|><think>"
     );
     assert_eq!(
-        render(&[("user", "hi")], &ChatOpts { thinking: true, reasoning_effort: Some("low") }),
+        render(&[("user", "hi")], &ChatOpts { thinking: true, reasoning_effort: Some("low"), ..Default::default() }),
         "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hi<|assistant|><think>"
     );
     // Multi-turn: NO separator after any role token, and history's reasoning is cleared.
@@ -206,4 +206,61 @@ fn chat_framing_matches_the_checkpoint_template() {
         "[gMASK]<sop><|system|>S<|user|>a<|assistant|><think></think>b<|user|>c\
          <|assistant|><think></think>"
     );
+}
+
+/// The TOOL half of the same template, pinned the same way and for the same reason. The
+/// `# Tools` system turn is what teaches the model this checkpoint's `<tool_call>` syntax —
+/// invent a preamble instead and it reaches for other frameworks' conventions — so its
+/// wording, its blank lines and the `", "` / `": "` spacing of the JSON all matter. That
+/// spacing is Python's `json.dumps`, which is what Jinja's `tojson` emits; serde_json's
+/// compact form is a different token sequence.
+#[test]
+fn tool_framing_matches_the_checkpoint_template() {
+    use rivoli::artifact::tokenizer::{ChatOpts, Tokenizer};
+    use serde_json::json;
+    let Ok(dir) = std::env::var("RIVOLI_ARTIFACT") else {
+        eprintln!("skip: set RIVOLI_ARTIFACT to an artifact dir");
+        return;
+    };
+    let tok = Tokenizer::load(&dir).unwrap();
+
+    // `strict` is dropped by the template's own macro, as is `defer_loading`.
+    let tools = json!([{"type": "function", "function": {
+        "name": "wx",
+        "description": "Weather",
+        "strict": true,
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+    }}]);
+    let turns = [
+        ("user", "weather in Paris?"),
+        (
+            "assistant",
+            "<tool_call>wx<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+        ),
+        ("observation", "<tool_response>18C</tool_response>"),
+    ];
+    let got = tok
+        .decode_all(
+            &tok.encode_chat_turns(&turns, &ChatOpts { tools: Some(&tools), ..Default::default() })
+                .unwrap(),
+        )
+        .unwrap();
+
+    let want = concat!(
+        "[gMASK]<sop>",
+        "<|system|>\n# Tools\n\n",
+        "You may call one or more functions to assist with the user query.\n\n",
+        "You are provided with function signatures within <tools></tools> XML tags:\n",
+        "<tools>\n",
+        r#"{"name": "wx", "description": "Weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}"#,
+        "\n</tools>\n\n",
+        "For each function call, output the function name and arguments within the following XML format:\n",
+        "<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>",
+        "<arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>",
+        "<|user|>weather in Paris?",
+        "<|assistant|><think></think><tool_call>wx<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+        "<|observation|><tool_response>18C</tool_response>",
+        "<|assistant|><think></think>",
+    );
+    assert_eq!(got, want);
 }
