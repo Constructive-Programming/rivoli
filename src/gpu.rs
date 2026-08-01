@@ -237,7 +237,7 @@ fn blocked<T>(acc: &mut u128, name: &'static str, f: impl FnOnce() -> Result<T>)
     let e = std::time::Instant::now();
     *acc += e.duration_since(t).as_nanos();
     // Also emit the interval, so the same wait that feeds the scalar counter can be
-    // drawn on a timeline next to the reaper's io-wait. No-op unless RIVOLI_SPANS is set.
+    // drawn on a timeline next to the reaper's io-wait. No-op unless --spans is given.
     crate::telemetry::spans::record(name, "decode", t, e);
     r
 }
@@ -754,7 +754,7 @@ impl<'a> GpuEngine<'a> {
                 let bytes = MOE_ACC_ROWS * MAXROW * cfg.hidden * 8;
                 let mut b = DeviceBuf::new(bytes)?;
                 // SAFETY: `b` owns `bytes`, just allocated.
-                unsafe { fill_u32(b.ptr_mut() as *mut u8, 0, bytes)? };
+                unsafe { fill_u32(b.ptr_mut(), 0, bytes)? };
                 b
             },
             moe_h: f(slots * MAXROW * cfg.moe_inter)?,
@@ -1454,7 +1454,7 @@ impl<'a> GpuEngine<'a> {
                 LayerMlp::Dense(_) => (std::ptr::null(), None),
             };
             let indexer_pin = lw.indexer; // ends the &pin.layers borrow (Copy)
-            // Position for the span tree: two relaxed stores, free when RIVOLI_SPANS is
+            // Position for the span tree: two relaxed stores, free when --spans is
             // unset. The reaper reads these too, so its io-wait lands under the layer
             // whose batch it is servicing.
             crate::telemetry::spans::mark(pos as u32, token, l as i32);
@@ -2023,8 +2023,8 @@ impl<'a> GpuEngine<'a> {
                     // on value 0). Keeping the call unconditional is what makes "every
                     // launch is behind its dependency" true by reading the code, not by
                     // trusting this loop's classification.
-                    for k in i..j {
-                        self.pin.wait_on(tickets[k], cs_raw)?;
+                    for &t in &tickets[i..j] {
+                        self.pin.wait_on(t, cs_raw)?;
                     }
                     // SAFETY: descs/codebooks resident; every expert in [i, j) has its
                     // dependency enqueued above; h/part device scratch; cs_raw live.

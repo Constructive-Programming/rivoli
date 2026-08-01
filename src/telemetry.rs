@@ -21,7 +21,7 @@
 /// during decode.** Intervals are replayed as spans with explicit timestamps only at
 /// run end, which is why this can be on while the numbers it produces stay honest.
 ///
-/// Off unless `RIVOLI_SPANS` is set (a span budget; default 5000 when empty).
+/// Off unless `--spans <BUDGET>` is given (see [`init`]); `--spans` alone means 5000.
 ///
 /// The budget is spent by **sampling whole tokens spread across the run**, not by
 /// recording the first N intervals and stopping. Taking the prefix meant the timeline
@@ -112,30 +112,51 @@ pub mod spans {
         if let Ok(mut v) = l.recs.lock() {
             v.clear();
         }
+        // Clear the truncation flag with the records it describes. Prefill is one forward
+        // pass over 78 layers — ~390 intervals — so any budget below that trips the cap
+        // before generation starts, and the flag outlived the data: a run whose sampled
+        // timeline is COMPLETE still ended with "the exported timeline is missing the LATER
+        // sampled tokens" and a `spans_truncated` attribute on the root. Measured
+        // 2026-08-01 at `--spans 200`. A truncation warning that fires on untruncated
+        // output is worse than none — it teaches the reader to ignore the real one.
+        l.truncated.store(false, Ordering::Relaxed);
         if let Some(Ok(mut v)) = LAYERS.get().map(|m| m.lock()) {
             v.clear();
         }
         tracing::info!(
-            "RIVOLI_SPANS: budget {} / (~{per_tok} spans/tok x {ngen} tok) -> every {stride}th \
+            "--spans: budget {} / (~{per_tok} spans/tok x {ngen} tok) -> every {stride}th \
              token sampled ({} of {ngen}), prefill discarded",
             l.cap,
             ngen.div_ceil(stride as usize),
         );
     }
 
+    /// Arm the recorder with a span budget, and anchor its clocks. `main` calls this once
+    /// for `--spans`; without that call every entry point in this module is a no-op, so a
+    /// run that does not ask for a timeline pays nothing for the possibility of one.
+    ///
+    /// **Called from `main`, not read from the environment.** This was `RIVOLI_SPANS` until
+    /// 2026-08-01, which broke the project's own rule — an instrument goes behind a feature
+    /// AND a flag, never an env var, because an env var is invisible to `--help`, absent
+    /// from the command line a benchmark records, and silently active in a build that looks
+    /// stock. The two `OTEL_*` variables that remain are the OpenTelemetry standard's, not
+    /// ours to rename; this one was ours.
+    ///
+    /// Idempotent by construction: a second call cannot re-anchor the clocks a first one
+    /// established, because the intervals already recorded against them would shift.
+    pub fn init(cap: usize) {
+        let cap = cap.max(1);
+        let _ = LOG.set(Some(Log {
+            t0_mono: Instant::now(),
+            t0_wall: SystemTime::now(),
+            cap,
+            recs: Mutex::new(Vec::with_capacity(cap.min(1 << 16))),
+            truncated: AtomicBool::new(false),
+        }));
+    }
+
     fn log() -> Option<&'static Log> {
-        LOG.get_or_init(|| {
-            let v = std::env::var("RIVOLI_SPANS").ok()?;
-            let cap = v.trim().parse::<usize>().unwrap_or(5000).max(1);
-            Some(Log {
-                t0_mono: Instant::now(),
-                t0_wall: SystemTime::now(),
-                cap,
-                recs: Mutex::new(Vec::with_capacity(cap.min(1 << 16))),
-                truncated: AtomicBool::new(false),
-            })
-        })
-        .as_ref()
+        LOG.get()?.as_ref()
     }
 
     /// True when recording is on. Callers use it to skip taking timestamps they would
@@ -514,8 +535,10 @@ pub struct ProfileSummary {
     /// `run_job`'s reap loop, excluding the queue/submit syscalls around it.
     /// Off-thread, so it overlaps the decode wall and can exceed it.
     pub io_wait_ms: f64,
-    /// Host compute: the sum of `cpu_launch_ms + cpu_route_ms + cpu_submit_ms` plus the
-    /// expert stream's tokio poll time. Every term stamped; none derived.
+    /// Host compute: the sum of `cpu_launch_ms + cpu_route_ms + cpu_submit_ms`. Every term
+    /// stamped; none derived. (It also carried the expert stream's tokio poll time until
+    /// 2026-08-01; enqueueing the launches straight onto the compute stream left no such
+    /// work to attribute — see `gpu.rs`'s `cpu_ns`.)
     pub cpu_ms: f64,
     /// Host time issuing kernel launches (per-layer attention/MLP block + the tail).
     pub cpu_launch_ms: f64,
@@ -638,10 +661,10 @@ impl ProfileSummary {
 /// error is warned and swallowed.
 pub fn export_decode(summary: &ProfileSummary, tokens: usize, run: &RunInfo) {
     #[cfg(feature = "otlp")]
-    if std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_some() {
-        if let Err(e) = otlp::export(summary, tokens, run) {
-            tracing::warn!("OTLP export failed ({e}); metrics logged only");
-        }
+    if std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_some()
+        && let Err(e) = otlp::export(summary, tokens, run)
+    {
+        tracing::warn!("OTLP export failed ({e}); metrics logged only");
     }
     #[cfg(not(feature = "otlp"))]
     let _ = (summary, tokens, run);
@@ -699,7 +722,7 @@ mod otlp {
                 .with_start_time(lo)
                 .with_end_time(hi)
                 .start(&tracer),
-            // No intervals recorded (RIVOLI_SPANS unset): a plain now-stamped span, which
+            // No intervals recorded (--spans not given): a plain now-stamped span, which
             // is correct — there are no children for it to fail to contain.
             None => tracer.start("rivoli.decode"),
         };
@@ -767,7 +790,7 @@ mod otlp {
             // The token id, not just the index — the index says "the 7th step", the id
             // says which token the model was actually working on.
             let tok_id = tok_recs.first().map(|r| r.tok_id).unwrap_or(0);
-            let mut tok_span = tracer
+            let tok_span = tracer
                 .span_builder(format!("token {tok_i}"))
                 .with_start_time(t_lo)
                 .with_end_time(t_hi)
@@ -817,7 +840,7 @@ mod otlp {
                         .with_attributes(attrs)
                         .start_with_context(&tracer, &tok_cx);
                     let c = opentelemetry::Context::current_with_span(ls);
-                    let mut ls = c.span();
+                    let ls = c.span();
                     ls.end_with_timestamp(l_hi);
                     c
                 };
@@ -831,18 +854,18 @@ mod otlp {
                     leaf.end_with_timestamp(r.end);
                 }
             }
-            let mut ts = tok_cx.span();
+            let ts = tok_cx.span();
             ts.end_with_timestamp(t_hi);
         }
-        let mut span = cx.span();
+        let span = cx.span();
         span.set_attribute(KeyValue::new("spans_recorded", n as i64));
         // A truncated timeline that does not say so reads as a complete one.
         if truncated {
             span.set_attribute(KeyValue::new("spans_truncated", true));
             tracing::warn!(
-                "RIVOLI_SPANS cap reached after {n} intervals — the sampling stride \
+                "--spans cap reached after {n} intervals — the sampling stride \
                  under-estimated spans/token, so the exported timeline is missing the \
-                 LATER sampled tokens. Raise RIVOLI_SPANS or the per_tok estimate."
+                 LATER sampled tokens. Raise --spans or the per_tok estimate."
             );
         }
         match bounds {
@@ -898,7 +921,7 @@ mod otlp {
 
         // ms/token, the unit every number in the PROFILE line is already in.
         let per_tok = m.f64_gauge("rivoli.ms_per_tok").build();
-        let mut g = |v: f64, class: &'static str, thread: &'static str| {
+        let g = |v: f64, class: &'static str, thread: &'static str| {
             per_tok.record(
                 v,
                 &[
@@ -915,7 +938,11 @@ mod otlp {
         g(summary.cpu_launch_ms, "cpu/launch", "decode");
         g(summary.cpu_route_ms, "cpu/route", "decode");
         g(summary.cpu_submit_ms, "cpu/submit", "decode");
-        g(summary.launch_ms, "cpu/tokio-poll", "decode");
+        // `cpu/tokio-poll` was dropped 2026-08-01 with the field behind it. The expert
+        // stream's poll time stopped being a term when the launches were enqueued straight
+        // onto the compute stream (`gpu.rs`, `cpu_ns`) — but the removal never reached this
+        // line, because nothing in CI compiles `--features otlp`, so the feature had not
+        // built since. If a series disappears from the dashboard, this is where it went.
         // The phase axis — these DO partition wall, and may be stacked.
         g(summary.route_ms, "phase/route", "decode");
         g(summary.moe_wall_ms, "phase/moe", "decode");

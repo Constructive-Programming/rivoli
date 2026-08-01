@@ -162,6 +162,22 @@ struct Args {
     #[arg(long)]
     pred_probe: bool,
 
+    /// Record the decode as real OTLP spans, up to BUDGET of them (bare `--spans` = 5000).
+    /// Without it only the end-of-run metrics export; there is no timeline to build.
+    ///
+    /// The budget is spent by sampling WHOLE tokens spread across the run, so what you get
+    /// is representative rather than the cold start. Cost is a `Vec` push behind a mutex —
+    /// +0.15% on wall fully instrumented, +0.00% at the default stride — but leave it off
+    /// in a benchmark arm regardless: "too small to measure" is not "zero".
+    ///
+    /// Was the `RIVOLI_SPANS` env var until 2026-08-01. An env var is invisible to `--help`,
+    /// absent from the command line `docs/measurement/benchmarks.md` records, and silently
+    /// active in a build that looks stock — this is the same rule `--ppl` and `--pred-probe`
+    /// follow. See `docs/measurement/traces.md`.
+    #[cfg(feature = "otlp")]
+    #[arg(long, value_name = "BUDGET", num_args = 0..=1, default_missing_value = "5000")]
+    spans: Option<usize>,
+
     /// Scale the whole MoE branch by `g` before the residual add. An EXPERIMENT knob, not
     /// a tuning parameter (kernels/fwd.hip::vaxpy). The band is generous but finite: a
     /// sweep that silently ran at 0 or a negative gain would produce a confidently
@@ -329,6 +345,12 @@ fn main() -> Result<()> {
     let (a_ppl, a_ppl_out) = (a.ppl.clone(), a.ppl_out.clone());
     #[cfg(feature = "pred-probe")]
     let a_pred_probe = a.pred_probe;
+    // Arm the span recorder before anything can record: it anchors a monotonic clock to a
+    // wall clock here, and every interval in the run is stamped as a delta from that pair.
+    #[cfg(feature = "otlp")]
+    if let Some(budget) = a.spans {
+        rivoli::telemetry::spans::init(budget);
+    }
     let a_moe_gain = a.moe_gain;
     let (a_port, a_ctx) = (a.port, a.ctx);
     let a_raw_prompt = a.raw_prompt;
