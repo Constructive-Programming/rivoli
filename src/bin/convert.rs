@@ -14,8 +14,8 @@ use anyhow::{Context, Result, ensure};
 use rivoli::artifact::format::{Dtype, FormatMeta, SafeWriter, Safetensors, Vq3Header};
 use rivoli::math::{bf16_to_f32, f32_to_bf16};
 use rivoli::artifact::quant::{
-    VQ_ALIGN, VQ_DIM, VQ_GROUP, VQ_K, quant_vq, read_f32, vq_expert_bytes, vq_expert_layout,
-    vq_proj_bytes, vq_row_bytes,
+    VQ_ALIGN, VQ_DIM, VQ_GROUP, VQ_K, learn_codebook, quant_vq, read_f32, sample_subvectors,
+    vq_expert_bytes, vq_expert_layout, vq_proj_bytes, vq_row_bytes,
 };
 
 const FP8_BLOCK: usize = 128;
@@ -269,120 +269,6 @@ fn encode_expert(
     }
     let _ = validate; // consumed above only under `rocm`; silence the unused warning
     Ok(())
-}
-
-/// Append every `stride`-th group-normalized subvector of `w` to the codebook sample.
-fn sample_subvectors(w: &[f32], o_dim: usize, i_dim: usize, stride: usize, out: &mut Vec<f32>) {
-    let mut n = 0usize;
-    for row in w.chunks_exact(i_dim) {
-        for grp in row.chunks_exact(VQ_GROUP) {
-            let amax = grp.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-            let inv = 1.0 / bf16_to_f32(f32_to_bf16(if amax > 0.0 { amax } else { 1.0 }));
-            for sub in grp.chunks_exact(VQ_DIM) {
-                if n.is_multiple_of(stride) {
-                    out.extend(sub.iter().map(|&v| v * inv));
-                }
-                n += 1;
-            }
-        }
-    }
-    let _ = o_dim;
-}
-
-/// k-means (k-means++ seed, threaded Lloyd, convergence-stopped) → VQ_K·VQ_DIM.
-fn learn_codebook(sample: &[f32], max_iters: usize) -> Vec<f32> {
-    let n = sample.len() / VQ_DIM;
-    assert!(n >= VQ_K, "sample {n} < VQ_K {VQ_K}");
-    let threads = std::thread::available_parallelism().map_or(4, |t| t.get());
-    let mut c = vec![0.0f32; VQ_K * VQ_DIM];
-    let mut rng = 0x2545_F491_4F6C_DD1Du64;
-    let mut next = move || {
-        rng ^= rng << 13;
-        rng ^= rng >> 7;
-        rng ^= rng << 17;
-        (rng >> 11) as f64 / (1u64 << 53) as f64
-    };
-    let mut mind = vec![1.0f32; n];
-    for j in 0..VQ_K {
-        let total: f64 = mind.iter().map(|&d| d as f64).sum();
-        let mut t = next() * total;
-        let mut pick = n - 1;
-        for (i, &d) in mind.iter().enumerate() {
-            t -= d as f64;
-            if t <= 0.0 {
-                pick = i;
-                break;
-            }
-        }
-        let seed = &sample[pick * VQ_DIM..(pick + 1) * VQ_DIM];
-        c[j * VQ_DIM..(j + 1) * VQ_DIM].copy_from_slice(seed);
-        for (i, md) in mind.iter_mut().enumerate() {
-            let v = &sample[i * VQ_DIM..(i + 1) * VQ_DIM];
-            let d: f32 = v.iter().zip(seed).map(|(&x, &y)| (x - y) * (x - y)).sum();
-            *md = if j == 0 { d } else { md.min(d) };
-        }
-    }
-    let mut prev = f64::INFINITY;
-    for _ in 0..max_iters {
-        let chunk = n.div_ceil(threads);
-        let parts: Vec<(Vec<f32>, Vec<u32>, f64)> = std::thread::scope(|s| {
-            let mut hs = Vec::new();
-            for t in 0..threads {
-                let (lo, hi) = (t * chunk, ((t + 1) * chunk).min(n));
-                if lo >= hi {
-                    break;
-                }
-                let c = &c;
-                hs.push(s.spawn(move || {
-                    let mut sum = vec![0.0f32; VQ_K * VQ_DIM];
-                    let mut cnt = vec![0u32; VQ_K];
-                    let mut dist = 0.0f64;
-                    for i in lo..hi {
-                        let v = &sample[i * VQ_DIM..(i + 1) * VQ_DIM];
-                        let mut best = (f32::INFINITY, 0usize);
-                        for j in 0..VQ_K {
-                            let cc = &c[j * VQ_DIM..(j + 1) * VQ_DIM];
-                            let d: f32 = v.iter().zip(cc).map(|(&x, &y)| (x - y) * (x - y)).sum();
-                            if d < best.0 {
-                                best = (d, j);
-                            }
-                        }
-                        dist += best.0 as f64;
-                        cnt[best.1] += 1;
-                        for d in 0..VQ_DIM {
-                            sum[best.1 * VQ_DIM + d] += v[d];
-                        }
-                    }
-                    (sum, cnt, dist)
-                }));
-            }
-            hs.into_iter().filter_map(|h| h.join().ok()).collect()
-        });
-        let mut sum = vec![0.0f32; VQ_K * VQ_DIM];
-        let mut cnt = vec![0u32; VQ_K];
-        let mut dist = 0.0f64;
-        for (ps, pc, pd) in parts {
-            for (a, b) in sum.iter_mut().zip(ps) {
-                *a += b;
-            }
-            for (a, b) in cnt.iter_mut().zip(pc) {
-                *a += b;
-            }
-            dist += pd;
-        }
-        for j in 0..VQ_K {
-            if cnt[j] > 0 {
-                for d in 0..VQ_DIM {
-                    c[j * VQ_DIM + d] = sum[j * VQ_DIM + d] / cnt[j] as f32;
-                }
-            }
-        }
-        if ((prev - dist) / dist.max(f64::MIN_POSITIVE)).abs() < 1e-4 {
-            break;
-        }
-        prev = dist;
-    }
-    c
 }
 
 /// Requantize a bf16 `[o_dim, i_dim]` matrix to per-row int8 → (packed i8, f32 scale).
