@@ -3,7 +3,7 @@
 //!
 //! WHY THIS FILE HAS TO EXIST. Every other test here compares ONE backend against a CPU
 //! reference. That is the right instrument for almost everything, and it is structurally
-//! incapable of settling the one question docs/VULKAN.md's token-ID gate actually asks:
+//! incapable of settling the one question docs/investigations/vulkan-port.md's token-ID gate actually asks:
 //! *do the two backends agree with each other?* Where a kernel's result depends on a
 //! HARDWARE function — `v_exp_f32` on gfx1151 — the CPU has no way to evaluate it, so a
 //! Rust oracle is a third implementation and its disagreement with either GPU proves

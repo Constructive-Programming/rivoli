@@ -7,17 +7,23 @@ while the resident ones compute — that overlap is the whole design.
 
 ## Read this before opening anything in `docs/`
 
-**`docs/` is ~490 KB of markdown. Do not read it.** Most of it is investigation logs kept
-for what they *eliminated*, not reference material. Reading `benchmarks.md` (105 KB),
-`docs/VULKAN.md` (117 KB) or `docs/NPU.md` (57 KB) end to end will consume your context and
-tell you mostly about options that were rejected.
+**`docs/` is ~500 KB and most of it is closed investigation.** It is kept for what it
+*eliminated*, not as reference. Reading it end to end will cost your context and teach you
+mostly about rejected options.
 
-1. **`docs/README.md` first** — the index. ~4 KB, and it answers most questions outright or
-   names the one section to open.
-2. **`docs/ARCHITECTURE.md`** is the only doc meant to be read whole (44 KB). It is the
-   engine as it is today, not as it was proposed.
-3. **Everything else: grep it.** `grep -n "^## " docs/X.md` for the map, then read the one
-   section. Each big doc opens with a STATE block giving the current answer in ~15 lines.
+1. **`docs/00-orientation/TOUR.md`** — two pages. If you are new, read this and stop.
+2. **`docs/00-orientation/INDEX.md`** — every doc with a `status:` and a one-line
+   **verdict**. Use the verdict column to decide what *not* to open; if it answers your
+   question, you are done.
+3. **`docs/reference/architecture.md`** is the only doc meant to be read whole.
+4. **Everything else: grep it.** `grep -n "^## " <file>` for the map, then read one section.
+
+Layout: `reference/` = true today · `measurement/` = how to measure and what was measured ·
+`investigations/` = asked, answered, closed. **A doc that stops being true moves directory**
+— that move is the signal.
+
+`tests/docs.rs` enforces that every doc declares `status:`/`verdict:` and that the index
+agrees. If you change a verdict, change both; the test will tell you which one you forgot.
 
 ## Current state, so you don't go looking
 
@@ -25,7 +31,7 @@ tell you mostly about options that were rejected.
 |---|---|
 | quality ladder | int4 **5.120** (best, slowest) > hybrid **5.189** (best overall, the default) > int3-vq **5.275** |
 | speculative decode | on by default, **1.108×** via `--mtp-min-conf 0.8` (ungated it is 0.93–0.95×, a loss). All modes carry the head since 2026-07-31 |
-| LOOKA hints (`--hint-k`) | **DELETED 2026-07-31** — measured inert (0.9% of evictions, ≤+0.1pp hit). `docs/CACHE_PILOT.md` keeps the record |
+| LOOKA hints (`--hint-k`) | **DELETED 2026-07-31** — measured inert (0.9% of evictions, ≤+0.1pp hit). `docs/investigations/cross-layer-prefetch.md` keeps the record |
 | `top-m` routing | **RETIRED**, removed from the engine |
 | Vulkan | decodes `--mode int3-vq --attn dense`; 16 of 29 kernels; 6 more are single-row; ~1.9× slower |
 | MoE accumulation | fixed-point (`MOE_ACC_SHIFT 44`), no cross-stream join |
@@ -39,20 +45,20 @@ cargo clippy --release --features rocm --all-targets
 ```
 
 `src/` is grouped by subsystem — `artifact/ memory/ fetch/ backend/` plus `gpu math attn
-indexer telemetry watchdog eval` at top level. See `docs/ARCHITECTURE.md` §11.
+indexer telemetry watchdog eval` at top level. See `docs/reference/architecture.md` §11.
 
 `--features teacher-forcing` adds `--ppl` (teacher-forced scoring, `src/eval.rs`). Off by
 default: it is a quality instrument, not part of decoding. `bin/ppl`, which does the paired
 statistics over its `.nll` output, needs no feature — it never touches the engine.
 
 `--features pred-probe` adds `--pred-probe` (pre-attention router recall, the cross-layer
-prefetch feasibility question; `docs/CACHE_PILOT.md` §"Feasibility, settled"). Same rule and
+prefetch feasibility question; `docs/investigations/cross-layer-prefetch.md` §"Feasibility, settled"). Same rule and
 the same reason: it puts a blocking D2H on the per-layer path, so it measures recall and a
 tok/s from a probe build means nothing.
 
 **Instruments go behind a feature AND a flag, never an env var.** Both of the above did
 briefly read one, and an env var is invisible to `--help`, absent from the recorded command
-line in `benchmarks.md`, and silently active in a build that looks stock.
+line in `docs/measurement/benchmarks.md`, and silently active in a build that looks stock.
 
 A featureless build compiles to a refusal stub — that is deliberate, not breakage.
 
@@ -72,9 +78,9 @@ A featureless build compiles to a refusal stub — that is deliberate, not break
   routing never consults residency). If output changes when only those change, that is a
   bug — **and in `--mode hybrid` it does, measured 2026-07-31.** Hybrid's cache picks each
   expert's *format* (HOT→int4, COLD→vq3), so residency selects the arithmetic; `--max-mem`
-  115 vs 70 gives different text. Open defect, predates the MTP work — `docs/ARCHITECTURE.md`
+  115 vs 70 gives different text. Open defect, predates the MTP work — `docs/reference/architecture.md`
   §8b under INV-1. Do quality A/Bs on a single-format mode, or hold cache settings fixed.
-- **`docs/ARCHITECTURE.md` §8b is a registry with a test.** A documented INV-n with no
+- **`docs/reference/architecture.md` §8b is a registry with a test.** A documented INV-n with no
   `inv_n_*` test, or the reverse, fails `tests/invariants.rs`. Don't add one without the
   other.
 

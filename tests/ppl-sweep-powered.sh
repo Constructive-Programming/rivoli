@@ -19,7 +19,7 @@
 #
 # RUN THIS DETACHED. Each cell is ~44 min and an agent harness reaps background tasks at
 # ~60 min, killing the engine with them — one cell fits, two never do. See
-# "Running these benches — detach anything multi-cell" in benchmarks.md for the numbers and
+# "Running these benches — detach anything multi-cell" in docs/measurement/benchmarks.md for the numbers and
 # the PGID check that distinguishes "I ran setsid" from "it is actually detached".
 #
 #   setsid nohup ./tests/ppl-sweep-powered.sh <out-dir> > resume.out 2>&1 < /dev/null &

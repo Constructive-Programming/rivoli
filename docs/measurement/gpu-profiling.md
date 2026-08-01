@@ -1,3 +1,8 @@
+---
+status: live
+verdict: Why ROCm GPU profiling does not work on this part, and what to do instead. Only if you are attaching a profiler.
+---
+
 # GPU profiling into OTLP — what is possible on this box
 
 Researched July 2026 for gfx1151 / Strix Halo. The goal that motivated it: localise the

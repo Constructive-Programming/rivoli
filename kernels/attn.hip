@@ -125,7 +125,7 @@ extern "C" __global__ void mla_latent_attend(
     // predicates each unrolled step with its own exec-mask save/restore — which costs
     // more than the LDS traffic this whole change removes. `nacc` is wave-uniform.
     // kvl is a multiple of SUBW because the launcher rejects anything that is not a
-    // multiple of 128. Measured both ways in benchmarks.md, "Read the ISA before you
+    // multiple of 128. Measured both ways in docs/measurement/benchmarks.md, "Read the ISA before you
     // book the device".
     int nacc = kvl / SUBW;
 

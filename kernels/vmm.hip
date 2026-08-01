@@ -6,7 +6,7 @@
 // physical memory (MTYPE_RW, full GPU bandwidth) then grant the CPU access too, so
 // weights `pread`/memcpy straight in and the GPU reads them in place — single
 // copy, no H2D, no tax. Verified: 220 GB/s (= hipMalloc) AND CPU->GPU coherent
-// (docs/probes/vmm_probe.cpp).
+// (docs/measurement/probes/vmm_probe.cpp).
 //
 // Host-only HIP (no kernels); compiled into librivolikernels.a like the rest.
 // Return codes: 0 ok, POSITIVE arg guard, NEGATIVE -(hipError_t).

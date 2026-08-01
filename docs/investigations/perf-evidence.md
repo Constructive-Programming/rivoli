@@ -1,183 +1,25 @@
-# rivoli — performance plan
+---
+status: closed-mixed
+verdict: Phase profile and per-kernel tranches behind the roadmap. The "Where the time goes" block is STALE and inverted — see its banner.
+---
 
-> **NAV — 39 KB. The live part is the "Ranked roadmap" table at the BOTTOM.**
-> Everything above it is the evidence for one row. Jump there first
-> (`grep -n "Ranked roadmap" docs/PERF.md`), then read only the section a row cites.
-> **Closed as negative — do not re-open without reading why:** o_proj split-K (#6b,
-> refuted and reverted), `--hot-pct` (#1b, flag deleted).
-> **#4 speculative decode was on that list and came OFF it on 2026-07-31**: ungated it
-> measures 0.93–0.95×, but `--mtp-min-conf 0.8` measures **1.108×**.
+# rivoli — performance evidence
 
-Status: **analysis + roadmap.** Leads with the **structural paths** (the higher-level
-goals that move throughput by a multiplier or restructure a whole phase); the per-kernel
-findings are **follow-up polish** to that structural work and to the existing improvement
-proposals ([CACHE_ROUTE](CACHE_ROUTE.md), [CACHE_PILOT](CACHE_PILOT.md), the fp8-int4
-work). Residency / cache-conditional routing is **not** covered here — it is owned in full
-by those two proposals.
-
-**A correctness defect found by this document's per-kernel work does NOT live in this
-document.** The `route` tranche turned up an fp8 block scale mis-applied at `block < 4`,
-affecting every fp8 block-scaled GEMV — it is written up in **benchmarks.md, "Bugs found
-and fixed"**, because someone auditing numerics reads that file and someone tuning kernels
-reads this one. Two known-broken twins are recorded there too. Perf items cross-reference
-the bug; they do not host it.
-
-## How to read — and write — this document
-
-**A phase profile localises cost; it does not explain it.** Any mechanism attributed to a
-hot kernel without reading its ISA is a **HYPOTHESIS**. Mark it as one when writing, and
-confirm with `hipcc -S` before implementing — that costs a compile, not a device slot.
-
-This is not a general caution; it is the measured result of the first per-kernel tranche.
-**Four of the five per-kernel items below had the wrong mechanism.** The profile was right
-about *where* the time went in all five cases and wrong about *why* in four:
-
-| # | Mechanism in the plan | Mechanism in the ISA |
-|---|---|---|
-| 2 o_proj | too few blocks to fill the machine | signed 32-bit divide in the inner loop |
-| 3 attend | LDS caps occupancy at 1 WG/CU | still 1 WG/CU after the fix; the real prize was an LDS read-modify-write, and a lever the item never listed (HB) |
-| 4 absorb | transpose direction, single-byte loads, low ILP | 64-bit divide LLVM cannot strength-reduce |
-| 5 lm_head | split-K, "same shape argument as o_proj" | not grid-starved at all (19,360 blocks); it is load width |
-
-Every one of those corrections came from a compiler that was available the whole time,
-free, while the GPU was the bottleneck. See benchmarks.md, "Read the ISA before you book
-the device", for the invocations and the two ways an instruction count lies.
-
-**All four corrected mechanisms have now been implemented and measured, and the ISA was
-right every time** — absorb's load width 1.40×, lm_head's load width 1.78×, attend's LDS
-read-modify-write −12%, and o_proj's divide, which was real but not binding. So the
-column that matters is not "the plan was wrong four times out of five"; it is that **the
-ISA reading was right four times out of four.** One caveat carries forward, from o_proj:
-the ISA tells you the mechanism reliably, and **the magnitude not at all** — a 34% VALU
-cut bought 2.3% there, while the same class of fix bought 78% here. Use it to choose what
-to implement, then still measure what it was worth.
-
-**The same error has a magnitude form, and this document made it too.** Item #5's estimate
-was revised from "a few ms" up to "~10 ms" by reasoning that `tail` ≈ 16 ms is "almost
-entirely" lm_head, implying <100 GB/s. Measured: lm_head is **8.12 ms**, roughly *half*
-the bucket, and the original "a few ms" was closer than the revision. **A bucket gives you
-a total, not a decomposition** — inferring a component's cost from its phase budget is the
-same mistake as inferring its mechanism from its phase budget, and both were made here on
-the same afternoon. Decompose by measurement before you estimate from a bucket.
-
-**The structural paths below have NOT been through this filter.** Path A and Path B were
-written in the same style, from the same profile, and their mechanism claims are
-localisation plus a reasoned guess rather than localisation plus a diagnosis. They may
-well be right — but treat them as un-ISA'd until someone checks, and expect the per-kernel
-hit rate to apply.
-
-## What the time IS — the CLASS axis (always on, `class/tok`)
-
-The phase buckets below (`route` / `moe-gpu` / `tail`) say **where** time goes. They are
-*regions*, and each mixes host compute with blocking waits — which is why `tail` spent this
-document's whole life with most of itself attributable to no kernel. The `class/tok` line
-cuts the same work by **activity**, and every term is a stamped span:
-
-```
-class/tok [spans overlap; no residual]:
-    gpu-wait 321.4ms (95% of wall) | io-wait 165.1ms (49%) | cpu 6.2ms (2%)
-    cpu = launch 2.6ms + route 0.31ms + submit 0.87ms + tokio-poll 2.4ms
-split/tok: route = 101.1ms gpu-wait + 0.3ms host-routing
-           tail wait 5.5ms, of which 5.5ms is GPU
-```
-*(hybrid+lru, `-bench 128`, `--max-mem 100`, wall 338.2 ms/tok.)*
-
-These are **spans, not just counters** — set `RIVOLI_SPANS` and they export as real OTLP
-spans with true start/end times across both threads, so a trace viewer draws the overlap
-instead of implying it. See [TRACES.md](TRACES.md).
-
-**These spans OVERLAP and do not sum to wall — by design.** `io-wait` is the reaper thread
-blocked in `io_uring` while the decode thread computes; it is 54% of wall precisely because
-it is concurrent with it. *(An earlier version of this line added "and 95% of it is hidden",
-which was the broken `fetch_hidden_pct`; it is ~22%, and the point being made here — that
-these spans overlap and must not be forced into a partition — never depended on it. See
-ARCHITECTURE.md §3.)* Forcing these into a partition is what
-broke the first version: it made `io-wait` a *derived* `moe_wall − compute_gpu` (a host
-clock minus a GPU clock) which reported **8.4 ms**, and `cpu` a residual. The measured
-io-wait is **183.7 ms — 20× larger**. The derived number was not measuring io-wait at all;
-it was measuring the *unhidden remainder*, which is a different and much smaller thing.
-
-**The price, accepted deliberately: no residual is reported.** Measured `cpu` is 6.5 ms
-where the old residual said 8.8 — so ~2.3 ms/tok is genuinely unattributed. It is now
-invisible rather than dressed up as host compute. A residual bucket absorbs every error in
-every other term, which makes it the one number in a profile that cannot be wrong and
-cannot be useful.
-
-**Three things this settles.**
-
-1. **We are GPU-bound, and host compute is negligible — 6.2 ms, under 2%.** Now measured
-   in four named pieces rather than inferred: kernel launch 2.6 ms (~1.5k driver calls),
-   tokio poll 2.4 ms, `submit_layer` 0.87 ms, `route_into` 0.31 ms. Any plan premised on
-   host overhead is chasing 2%, and we know which 2%.
-2. **`route` is not routing.** Of its 101 ms, **101.1 ms is a blocking D2H wait and 0.31 ms
-   is the actual host routing** — top-k over 256 experts across 75 layers costs nothing.
-   `route` is an attention-GPU phase wearing a host-phase name.
-3. **`tail`'s missing half was never a kernel.** The argmax D2H is 5.5 ms and effectively
-   all of it is GPU. The rest of the old `tail` bucket is decode-loop host work now
-   itemised above. **benchmarks.md's "half of `tail` is in none of its kernels" is
-   answered, and the answer demotes it.**
-
-**Measuring io-wait properly exposed a pre-existing bug in `fetch_wall_ms`.** `hits` and
-`misses` are rebased when the profile resets after prefill; `fetch_ns` never was, so every
-`fetch` number this project has published folded the prefill's cold, expensive fetch into
-the decode average. It was invisible at `-bench 512` (5 prompt tokens amortize away) and
-obvious the moment the new io-wait was read at `-bench 8`, where it reported **136% of
-wall**. Both counters are now baselined: at `-bench 128` **`fetch` drops 184 → 165 ms/tok,
-an 11% correction** to a long-standing figure. Older `fetch` numbers in benchmarks.md are
-high by roughly this much, and by more at small `-bench`.
-
-### How far to trust each bucket
-
-| bucket | confidence | why |
-|---|---|---|
-| `gpu-wait` | **high** as *host state* | Stamped at every blocking call; audit found none unwrapped on this arm. |
-| `io-wait` | **high** | Stamped around `run_job`'s reap loop at the ring, excluding queue/submit. Independently ≈ `fetch_wall` (165.1 vs 165.0), which is the expected agreement. |
-| `cpu` | **high, but a lower bound** | Four stamped regions. Anything host-side outside them is unattributed and *not shown* — hence the ~2.3 ms gap to the old residual. |
-
-**`gpu-wait` is not utilisation, and the gap is measured.** Sampled through a decode,
-`rocm-smi` reports **83.9%** GPU busy (n=65 steady-state, 77–91%) against 95% gpu-wait.
-Both are right and measure different things: ~11 points (~38 ms/tok) is the host blocked on
-a GPU that is *not* executing — launch gaps, driver and queue-drain overhead. **Reading
-`gpu-wait` as utilisation overstates it by an eighth.**
-
-**But put wide error bars on the 38 ms.** `gpu-wait` is stamped and trustworthy; the 83.9%
-it is differenced against is an *instantaneous SMU register read*, not a time-integrated
-counter, from a tool that in the same breath reports 512 MiB of VRAM (the real unified pool
-is 116 GiB of GTT), a 0% fan, and throws `map::at` on every invocation. It is also coarse
-and rolling-averaged — ~12 s to track a step.
-
-**~6 ms of the 38 is now measured rather than guessed:** the device-side kernel dispatch
-floor is 1.97 µs × ~1500 kernels ≈ **3.0 ms/tok**, and the host→GPU join tax is 11–20 µs ×
-~180 joins ≈ **2.7 ms/tok**. A clean negative came with it — `hipDeviceSynchronize`,
-`hipStreamSynchronize` and `hipEventSynchronize` all cost the same, and spinning on
-`hipEventQuery` is *strictly worse* — so there is no cheap win in swapping sync primitives.
-**The remaining ~30 ms has a suspect already named in `src/gpu.rs`: per-expert host-gated
-launch bubbles, which fall inside `compute_gpu_ns` and are why it is an upper bound.**
-Resolving this needs GPU-timeline spans on the host clock — see [GPU_TRACE.md](GPU_TRACE.md),
-which also shows that is ~4 hours of work and that the clock problem is already solved.
-
-**Audit — what is stamped.** Every blocking call in `src/gpu.rs` was enumerated. On this
-arm (`--attn dense`, `topk=device`) the decode path blocks in exactly three places: the
-gate-logits D2H, the argmax D2H, and the end-of-layer `device_sync`. `pin`/`hybrid`/
-`stream`/`arena` contain **no** blocking calls; expert fetch is async throughout, and the
-one place it really waits — the reap loop — is where `io-wait` is now taken. Two indexer
-D2Hs were unwrapped and would have corrupted the `--attn dsa` arms (invisible under
-`--attn dense`, where `dsa_select_layer` never runs); both are fixed. Left unwrapped
-deliberately: the `TopkPath::Verify` debug arm, the `--ppl` logits D2H, and `--checksum-x`.
-
-**One overclaim corrected.** The tail HIP-event span was documented as the tail kernels'
-execution time; it is a *bracket*. It measures 5.50 ms against a 4.66 ms microbench sum, so
-**~0.84 ms (15%) is inter-kernel gap** — the caveat `idx_gpu_ns` already carried. It is an
-upper bound, and the reported "0% overhead" is 0.1 ms display rounding, not a measured zero.
-
-Expensive per-kernel detail stays behind the `trace` feature; this axis is free — it rides
-joins the forward pass already pays and adds no sync.
+> **Evidence, not conclusions.** Each section here backs one row of
+> [`measurement/perf-roadmap.md`](../measurement/perf-roadmap.md). Read the row first.
+>
+> **⚠ The "Where the time goes" section below is STALE and inverted.** It says
+> *compute-bound, 94% hidden, fetch-wall wins buy nothing*. All three are wrong:
+> `reference/architecture.md` §3 has 181 ms of transfer against 117 ms of compute, the true
+> overlap ceiling is ≤57%, and `fetch_hidden_pct` was later found broken outright (~22%, not
+> 94%). It is kept because the per-kernel work below was done under it and the reasoning is
+> only legible with it in view.
 
 ## Where the time goes (hybrid+lru, 512 tok, the best coherent config)
 
 **Status of `route`: the per-kernel tranche on `feat/perf` measures `route` 112 → 104 ms
 in-engine** (interleaved A/B, flat control, identical miss counts, byte-identical output).
-The 115 ms below is the pre-tranche figure. See benchmarks.md, "In-engine confirmation".
+The 115 ms below is the pre-tranche figure. See docs/measurement/benchmarks.md, "In-engine confirmation".
 
 **Status of `tail`: lm_head's quad-load fix (follow-up #5) takes it 8.12 → 4.56 ms, and the
 bucket measures 14.5 → 11.3 ms in-engine.** The ~16 ms below is the pre-fix figure. Two
@@ -276,9 +118,9 @@ program behind a shared quality gate (perplexity on fixed text — never free-ru
    **So this row cannot be run as written, and the substitute is not `--max-mem`** — a
    cross-budget hybrid A/B is confounded by construction, because changing the budget
    changes which experts sit in which format, i.e. changes the arithmetic being compared
-   ([MODES.md](../MODES.md)). Re-specifying it means re-introducing a floor override to
+   ([docs/reference/modes.md](../MODES.md)). Re-specifying it means re-introducing a floor override to
    sweep against. Until then the honest status is *unrunnable*, not *pending*.
-   (`MODES.md` and `README.md` still document `--hot-pct` and the deleted `::fixed`
+   (`docs/reference/modes.md` and `README.md` still document `--hot-pct` and the deleted `::fixed`
    variants as live — three stale sites, worth a pass.)
 3. **Smaller, L1-resident codebook** (per-kernel follow-up #1) — the lever that lifts the
    gather wall itself.
@@ -312,7 +154,7 @@ Grounded in the measured kernel profile.
    hypothesis is now **x re-read amplification** — all 6144 blocks stream the whole 64 KB
    of x for 16 KB of weights, 402 MB of x traffic against 100 MB of weights — which is a
    cache-hierarchy question the ISA cannot answer and `ROWS_PER_BLOCK` tiling is the fix
-   for. See benchmarks.md, "Read the ISA before you book the device".
+   for. See docs/measurement/benchmarks.md, "Read the ISA before you book the device".
    **THIS ITEM IS MIS-SCOPED AS AN o_proj FIX — it is route-wide.** `fp8_dot_strided` is
    the shared helper behind *every* fp8 block-scaled GEMV: `o_proj`, `q_a`, `q_b`, `kv_a`
    and the dense MLP. Measured in-engine by a three-arm decomposition, the shift was worth
@@ -341,7 +183,7 @@ Grounded in the measured kernel profile.
 
    **The arithmetic said so before the device did.** The 402 MB + 100 MB in 529 µs this
    item rests on is 950 GB/s on a 256 GB/s part — 3.7× over, so it was never DRAM traffic
-   and one division would have retired the item without a device slot. See benchmarks.md,
+   and one division would have retired the item without a device slot. See docs/measurement/benchmarks.md,
    "Divide by the peak before you book the slot".
 
    **What o_proj actually is: at the roofline for the traffic it cannot avoid.** The
@@ -428,11 +270,11 @@ Grounded in the measured kernel profile.
    from 4 weight loads / 4 scale loads / 66 VALU to **1 / 1 / 27** — 4× fewer memory
    instructions and 2.4× less VALU for identical bytes moved. VGPRs 29, no spill, no
    scratch, occupancy unchanged at 16 waves/SIMD, and `s_and_saveexec_b32` went 2 → 1
-   (removing a cost without adding a neighbouring one — the check benchmarks.md asks for).
+   (removing a cost without adding a neighbouring one — the check docs/measurement/benchmarks.md asks for).
 
    **Bit-identical, and proved rather than argued:** absorb's output fingerprint is
    `0925c147afeea3fb` in **all 14** interleaved runs across both arms. No quality gate
-   needed, as the item predicted. See benchmarks.md, "A fingerprint is the only instrument
+   needed, as the item predicted. See docs/measurement/benchmarks.md, "A fingerprint is the only instrument
    that shows bit-identity".
 
    **Two preconditions the quad path cannot meet, both routed to the original scalar body
@@ -442,7 +284,7 @@ Grounded in the measured kernel profile.
 
    **This work also turned up a CORRECTNESS defect in `fp8_dot_strided`** — the block
    scale was mis-applied at `block < 4` in every fp8 GEMV. It is a numerics bug, not a
-   perf one, so it is written up under **benchmarks.md, "Bugs found and fixed"** rather
+   perf one, so it is written up under **docs/measurement/benchmarks.md, "Bugs found and fixed"** rather
    than here, along with the two known-broken twins left in place (the Vulkan shader,
    whose oracle mirrors the defect, and `rivoli_gemv_fp8`'s missing `i_dim % 4` guard).
    No shipped model is affected: every fp8 checkpoint uses `weight_block_size` 128.
@@ -453,7 +295,7 @@ Grounded in the measured kernel profile.
    at peak). An earlier revision of this line said "~10 ms, not a few" by assuming `tail`
    was almost entirely lm_head; it is about half. The original "a few ms" was right.
    **`tail` cannot be fixed here**: lm_head 8.12 + argmax 0.088 + rmsnorm 0.008 ≈ 8.2 ms
-   of a ~16 ms bucket, and those are its only kernels — see benchmarks.md, "Open question:
+   of a ~16 ms bucket, and those are its only kernels — see docs/measurement/benchmarks.md, "Open question:
    half of `tail` is in none of its kernels".
    **And split-K is probably not the fix.** o_dim=154880 already launches 19,360 blocks,
    so the machine is full — the grid argument that motivated o_proj's split-K does not
@@ -477,7 +319,7 @@ Grounded in the measured kernel profile.
    one `global_load_b128` for `x`, replacing 4× `global_load_i8` + 4 scalar `x` loads) and
    **36 VALU → 17**, for identical bytes moved. The sign-extends compiled to three
    `v_bfe_i32` plus one `v_ashrrev_i32`. VGPRs 18, zero scratch, zero spill, occupancy 16
-   waves/SIMD (the maximum) — and, the neighbouring-cost check benchmarks.md asks for,
+   waves/SIMD (the maximum) — and, the neighbouring-cost check docs/measurement/benchmarks.md asks for,
    **`s_and_saveexec_b32` inside the hot loop stayed at 0**; the kernel's two are the
    prologue guard and the tail-loop entry, both outside it.
 
@@ -513,7 +355,7 @@ Grounded in the measured kernel profile.
    **IN-ENGINE: the bucket moved exactly as predicted, and the wall did not noticeably.**
    `-bench 256`, hybrid + lru + `--max-mem 100`, interleaved base/fix ×3. Miss counts were
    **identical in all six runs** (40202 miss, 148.55/tok, 2.28 GB) so the greedy sequence
-   never diverged — the free-running-decode confound MODES.md warns about did not fire, and
+   never diverged — the free-running-decode confound docs/reference/modes.md warns about did not fire, and
    was checked rather than assumed. `route` held at 102.3–102.9 ms in **both** arms, a clean
    control confirming the change is isolated to `tail`.
 
@@ -541,86 +383,3 @@ Grounded in the measured kernel profile.
 
 ---
 
-## Ranked roadmap
-
-| # | Item | Path | Est. impact | Effort | Status |
-|---|---|---|---|---|---|
-| 1 | `fp8_to_i4` | B | int4 PPL 73.43 → **5.12**, hybrid → **5.19** | low | **done** |
-| 1b | ~~`--hot-pct` re-tune~~ | B | — | — | **struck — flag deleted, unrunnable** |
-| 2 | VQ_K=2048 L1-resident codebook | B / follow-up #1 | med (lifts gather wall) + smaller experts | med (requant) | new |
-| 3 | Batched-GEMV kernels | A | med now, unlocks MTP | med–high | **done, on `main`** — 6 kernels take `nrow`, bit-identical per row |
-| 4 | MTP / speculative decode | A | **1.108× measured** with `--mtp-min-conf 0.8` (0.93–0.95× ungated) | high | **DONE and WON 2026-07-31** — gate on draft confidence; see the note below |
-
-> **Item 4 was re-derived as this table asked, and reached the same verdict by a route that
-> explains it.** Shipped end to end (`docs/ARCHITECTURE.md` §13): 2.50 vs 2.69 tok/s at 128
-> tokens, 2.49 vs 2.63 at 512, output byte-identical. The mechanism is arithmetic, not
-> tuning: the MoE is 67% of the pass and a batched pass launches the **UNION** of both rows'
-> routing — 14.5 experts against a single row's 9, so **1.61× the weight reads** — while the
-> second row per expert is genuinely free (178 vs 176 µs on 0-miss layers). Attention
-> behaved as designed (0.83× per token). Break-even is **1.53 tokens/pass ≈ 53% acceptance**
-> and measured acceptance is 42–54%.
->
-> So it is a coin flip landing slightly wrong, not a structural impossibility, and the ONLY
-> lever is acceptance — skipping zero-weight rows inside the kernel would recover ~8%,
-> because ~92% of an expert launch is the weight read. **Do not re-open without a draft head
-> that clears 53%.** GLM-5.2 ships one MTP layer and depth-2 chains accept at 4.4%, so that
-> head is not available in this checkpoint.
->
-> **RE-OPENED AND WON, 2026-07-31 (same day). The "ONLY lever is acceptance" sentence above
-> is the error.** The other lever is not spending the verify pass on drafts that will not
-> pay for it. `--mtp-min-conf 0.8` gates on the draft head's own top-1 probability and
-> measures **2.97 tok/s against 2.68 sequential = 1.108×**, byte-identical output, on the
-> coherent (memory-systems) prompt. Two things made it work, neither of which this section
-> had: the accept-vs-confidence calibration is **prompt-invariant** (the ≥0.8 bin lands at
-> 91% across two prompts and two quantizations, while its share of drafts moves 25% → 52%),
-> and acceptance tracks the **text** rather than the head — 65.7% on coherent generation
-> versus 46.0% on the sample that trips the degeneration warning. Rebuilding the head at
-> int4 moved acceptance by 3.4 pp ± 7.4, i.e. not at all, so "de-quantize the head" is
-> refuted. Full table in `docs/ARCHITECTURE.md` §13.
-| 5 | `mla_latent_attend` occupancy | follow-up #3 | ~5–7 ms now, huge at long ctx | med | **partial** — `acc`→regs done (−12%); HB sweep not run |
-| 6a | lm_head load width | follow-up #5 | kernel **1.78×**; `tail` **−3.2 ms** in-engine; wall **~+1%, not noticeable** | low | **done** |
-| 6b | o_proj split-K / x-tiling | follow-up #2 | — | — | **refuted and reverted** |
-| 7 | `mla_absorb` restructure | follow-up #4 | **−0.80 ms/tok, measured** | med | **done** |
-| 8 | Faster demand fetch (deeper queues, split reads, unpinned arena) | B | — | — | **closed as negative 2026-08-01** — the drive is already giving what the queue depth buys; see below |
-
-> **Item 8 is a closed door, and it is worth knowing which door.** The demand fetch runs at
-> ~10 GB/s; `docs/probes/fetch_batch.hip` reproduces the engine's exact shape (pinned bounce
-> buffers, submit-*m*-drain-*m*, random 15.3 MB reads, GPU busy beside it) and the drive
-> gives **7.7 GB/s at QD1 and ~13 at QD4**. Weighted by the engine's own miss distribution
-> that predicts 15.8 s against a measured 18.3 s of `io_wait` over 64 tokens — inside the
-> probe's own run-to-run spread, which is itself ±25% at QD1. Splitting one expert read
-> K ways does raise its queue depth (1.94 → 1.44 ms), but only the 18% of layers that miss
-> exactly once benefit: **~2% overall**, for a real change to the ring. Measured, dropped.
->
-> **The duty cycle looked open for a day; it is not.** The drive idles ~35% of every token,
-> and filling it needs the routing known before that layer's attention. The predictor works
-> — 82.7% recall on the misses (`--features pred-probe`, `--pred-probe`) — but the window
-> is **1.13 ms against
-> a ~2 ms expert read**, so it fits 0.74 of one read where a layer needs 2.9, and the 23%
-> of a top-8 prefetch that goes unused costs +67 ms/token against a ≤85 ms/token ceiling.
-> Closed 2026-08-01; full arithmetic in `CACHE_PILOT.md` §"Feasibility, settled".
->
-> That leaves **#2 as the only live fetch lever**: it moves *fewer bytes*, shortening the
-> busy 65% rather than trying to fill the idle 35% — and a smaller expert is also the one
-> thing that would make the idle window worth filling.
-
-**Suggested sequence, revised.** The original sequence led with #1 and treated #4 as the
-big multiplier; #1 has landed and #4 has a measured loss against it, so:
-
-1. **#5's HB × `MLA_MIN_TILES_PER_SPLIT` sweep** — the cheapest unclaimed win, and still
-   mandatory before any long-context work. Note it is a **4-site change** (`kernels/attn.hip`,
-   `kernels/vk/mla_latent_attend.comp`, and the two mirrored launcher constants in
-   `src/vk.rs`), which the item's text does not say.
-2. **Path B (#2)** — the biggest remaining structural lever, on the 210 ms that is 60% of
-   wall. Now the *only* live item in Path B, since 1b is struck.
-3. ~~**`tail`'s missing ~62%**~~ — **ANSWERED and struck.** The CLASS axis shows it is
-   decode-loop host CPU (~6 ms of the 8.9 ms `cpu` bucket), not a hidden kernel. Promoting
-   it was the right call on the evidence available; measuring it cost one run and demoted
-   it, because total host compute is under 3% of the token.
-4. **Path A (#3 → #4)** only after the draft cost is re-derived against today's `moe-gpu`.
-   Do not re-estimate it from accept rate: 84% accept has already been measured, and lost.
-
-**Measurement discipline (learned the hard way):** rank format/numerics changes by (a) the
-replay residency sim, (b) a fixed forced-token wall-clock bench, and (c) perplexity for
-quality — **never** free-running greedy tok/s (confounded by output degeneration; a broken
-run looks fastest). See [MODES.md](MODES.md) and [benchmarks.md](../benchmarks.md).

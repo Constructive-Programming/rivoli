@@ -1,3 +1,8 @@
+---
+status: live
+verdict: The --mode × --cache-policy matrix and which knob does what. Quality ladder: int4 5.120 > hybrid 5.189 > int3-vq 5.275.
+---
+
 # Run modes
 
 Rivoli's routed-expert pool has **two orthogonal knobs**:
@@ -32,7 +37,7 @@ always-resident set (attention, dense MLPs, shared expert, codebooks) is unaffec
 >
 > This table said "absent / off" for `int4` and `hybrid` until 2026-07-31, and called the
 > feature a 0.93–0.95× loss "so nothing is being lost in the meantime". Gated on draft
-> confidence it measures **1.108×** — see `docs/ARCHITECTURE.md` §13.
+> confidence it measures **1.108×** — see `docs/reference/architecture.md` §13.
 
 ---
 
@@ -56,7 +61,7 @@ many fit in the pool → hit rate), and **stream cost** (bytes per miss).
 > unusable — PPL 73.43 against int3-vq's 5.28. The defect was the format, not a bug:
 > a single outlier set the step for a whole row and rounded the bulk to zero (603 rows
 > past 50% zeros on one projection). Group-128 scales fixed it outright, **PPL 73.43 →
-> 5.120**, and int4 is now the best-quality mode in the engine. See `docs/INT4.md`.
+> 5.120**, and int4 is now the best-quality mode in the engine. See `docs/investigations/int4-scales.md`.
 - **Size:** ~20.1 MB/expert (~32% bigger) — **fewer slots fit** → lower hit rate →
   **more misses** → more fetch + more host-gated compute bubbles.
 - **Compute:** sequential nibble decode, no gather. **~1.8× faster than int3-vq**
@@ -72,7 +77,7 @@ many fit in the pool → hit rate), and **stream cost** (bytes per miss).
 > Not the best perplexity: that is int4 at **5.120**, which this line used to claim for
 > hybrid while listing a better number two clauses later. int4 is best quality and slowest;
 > hybrid is best overall. (Corrected 2026-07-31.) The
-> earlier 11.55 was measured against the per-row-scaled `.i4` set that `docs/INT4.md` §10
+> earlier 11.55 was measured against the per-row-scaled `.i4` set that `docs/investigations/int4-scales.md` §10
 > replaced with group-128 scales; it does not describe the current artifact.
 Two physical slabs. The cache policy routes each expert to one:
 - **HOT slab = int4** — the *frequently reused* experts. They get int4's fast compute
@@ -179,7 +184,7 @@ in the plan before any data existed, and moving a threshold after seeing a resul
 misses it is post-hoc reasoning. Recorded here so it is not re-proposed as an oversight.
 
 **Not available in `--mode hybrid`** — the rank-driven tier rule it would need is parked on
-an artifact precondition (see `docs/CACHE_ROUTE.md`). The engine rejects the combination
+an artifact precondition (see `docs/investigations/cache-conditional-routing.md`). The engine rejects the combination
 rather than silently falling back. `top-m` is also incompatible with `--trace`, because
 substitution breaks the invariant the v2 trace format promises.
 

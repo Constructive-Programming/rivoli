@@ -1,4 +1,4 @@
-//! Paired perplexity comparison for the `top-m` quality gate (docs/CACHE_ROUTE.md).
+//! Paired perplexity comparison for the `top-m` quality gate (docs/investigations/cache-conditional-routing.md).
 //!
 //! Consumes the per-token NLL files written by `rivoli --ppl <text> --ppl-out <path>`,
 //! the FIRST being the baseline, and reports each cell against it.

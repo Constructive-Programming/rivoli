@@ -1,7 +1,7 @@
 //! vq_study — how much int3-vq distortion is the RATE, and how much is one codebook
 //! being shared by 75 layers?
 //!
-//! The gating measurement for docs/ROTATION.md. Rotation's remaining argument, and the
+//! The gating measurement for docs/investigations/codebook-rotation.md. Rotation's remaining argument, and the
 //! per-layer-codebook alternative, both claim the same budget:
 //!
 //! ```text
@@ -281,7 +281,7 @@ fn main() -> Result<()> {
              the verdict below."
         );
     }
-    // The bar is stated in docs/ROTATION.md and repeated here so a run is self-describing.
+    // The bar is stated in docs/investigations/codebook-rotation.md and repeated here so a run is self-describing.
     println!(
         "{}",
         if median < 2.0 {

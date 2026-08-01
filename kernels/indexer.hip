@@ -140,7 +140,7 @@ extern "C" __global__ void index_head_route(
     if (tid == 0) e[j] = sum / (float)(m_blocks > 0 ? m_blocks : 1);
 }
 
-// --- device row selection (docs/NPU.md): replaces a host D2H + CPU top-k ---------
+// --- device row selection (docs/investigations/npu-offload.md): replaces a host D2H + CPU top-k ---------
 // One workgroup: the kernel is ~5 sweeps of nt (nt <= max_ctx), so a grid-wide radix
 // would add a global sync and a second launch to tens of microseconds of work.
 #define TOPK_BLOCK 256
@@ -183,7 +183,7 @@ __device__ __forceinline__ unsigned int topk_scan(
 // boundary: the selection is then decided by the index rule, and resolving ties by
 // arrival order would be non-deterministic across runs. How tie-heavy the engine's
 // scores actually are is UNMEASURED — `index_score` ReLUs every head contribution, which
-// is the reason to expect ties, but docs/NPU.md records evidence against the array being
+// is the reason to expect ties, but docs/investigations/npu-offload.md records evidence against the array being
 // tie-dominated. The rule is exact either way; only how much of the selection it decides
 // is open.
 extern "C" __global__ void index_topk(

@@ -1,4 +1,4 @@
-//! Offline cache-policy A/B, 2Q Kin/Kout sweep, and the [CACHE_ROUTE](../../docs/CACHE_ROUTE.md)
+//! Offline cache-policy A/B, 2Q Kin/Kout sweep, and the [CACHE_ROUTE](../../docs/investigations/cache-conditional-routing.md)
 //! offline screen. Replays a routed-expert access trace (captured with `rivoli --trace`)
 //! through the SAME byte-aware policies the engine runs ([`rivoli::memory::hybrid`]) at a chosen
 //! slot count — unit strides make the byte budget a plain slot count — and prints the
@@ -10,7 +10,7 @@
 //!
 //! - the **(J, M) grid** — replays under `top-m` cache-conditional substitution
 //!   (arXiv:2412.00099) and reports how much of the miss rate it removes;
-//! - the **oracle-prefetch ceiling** — what [CACHE_PILOT](../../docs/CACHE_PILOT.md) could
+//! - the **oracle-prefetch ceiling** — what [CACHE_PILOT](../../docs/investigations/cross-layer-prefetch.md) could
 //!   reach at 100% recall, i.e. with perfect knowledge of decision `L+h`'s true experts,
 //!   admitted under the real byte policy.
 //!
@@ -36,7 +36,7 @@ const J_GRID: [usize; 7] = [1, 2, 3, 4, 5, 6, 7];
 const M_GRID: [usize; 8] = [8, 9, 10, 12, 16, 20, 24, 32];
 
 /// The prefetch horizons the oracle ceiling is reported at. L+2 is the horizon
-/// docs/CACHE_PILOT.md argues for (one layer of decode compute is shorter than one
+/// docs/investigations/cross-layer-prefetch.md argues for (one layer of decode compute is shorter than one
 /// expert load); L+1 is the cheaper prediction, and the gap between them is the cost of
 /// reaching further.
 const HORIZONS: [usize; 2] = [1, 2];
@@ -152,7 +152,7 @@ fn substitute(window: &[u32], k: usize, j: usize, m: usize, resident: impl Fn(u3
 /// fixed offline: errors here are independent across decisions, where a real predictor's
 /// errors are correlated (the tokens it finds hard, it finds hard for many layers in a
 /// row). Treat every number it produces as an upper bound. The real recall figure comes
-/// from LOOKA (docs/CACHE_PILOT.md Step 1), on the device.
+/// from LOOKA (docs/investigations/cross-layer-prefetch.md Step 1), on the device.
 #[derive(Clone, Copy)]
 struct Pilot {
     horizon: usize,
@@ -191,7 +191,7 @@ impl Pilot {
 struct Counts {
     loaded: u64,
     spec: u64,
-    /// Chosen slots that were NOT in the true top-K. docs/CACHE_ROUTE.md "Counters":
+    /// Chosen slots that were NOT in the true top-K. docs/investigations/cache-conditional-routing.md "Counters":
     /// "`swap%` is what you tune (J, M) against" — so the tool that tunes (J, M) has to
     /// compute it, or the grid ranks cells on hit rate alone and always crowns the
     /// maximum-substitution corner.
@@ -278,7 +278,7 @@ fn replay(
 
 /// `(absolute pp on the hit rate, relative % of misses removed)` for `hit` against
 /// `base`, both as percentages. Both numbers are reported for every grid cell: the pp
-/// figure is the acceptance bar and is directly comparable to `benchmarks.md`'s hit%
+/// figure is the acceptance bar and is directly comparable to `docs/measurement/benchmarks.md`'s hit%
 /// column; the relative figure is what makes the result comparable to the paper's
 /// ">50% cache-miss reduction".
 fn delta(base: f64, hit: f64) -> (f64, f64) {
@@ -296,9 +296,9 @@ fn main() -> Result<()> {
         .parse()
         .context("n_slots must be an integer")?;
     let mut sweep = false;
-    // The (J, M) grid and the oracle run under ONE policy: docs/CACHE_ROUTE.md builds
+    // The (J, M) grid and the oracle run under ONE policy: docs/investigations/cache-conditional-routing.md builds
     // `top-m` on `HybridLru` (the paper evaluates on LRU) and hybrid+lru is the fastest
-    // coherent config in benchmarks.md. Overridable, but one grid is the readable one.
+    // coherent config in docs/measurement/benchmarks.md. Overridable, but one grid is the readable one.
     let mut grid_policy = "lru".to_string();
     let default = TwoQSplit::default();
     let (mut kin, mut kout) = (default.kin_pct(), default.kout_pct());
@@ -464,7 +464,7 @@ fn main() -> Result<()> {
         "\ntop-m (J, M) grid — policy {grid_policy}, cap={cap}, baseline {base:.2}% hit.\n\
          Cells are `hit% (+pp / swap%)`. J = sacred prefix, M = candidate window; the M={top_k}\n\
          column is the control and must reproduce the baseline exactly. swap% is the share of\n\
-         chosen slots outside the true top-K — the quality cost, and per docs/CACHE_ROUTE.md\n\
+         chosen slots outside the true top-K — the quality cost, and per docs/investigations/cache-conditional-routing.md\n\
          the thing you actually tune (J, M) against. Screen: >= +5.00 pp absolute somewhere.\n"
     );
     print!("{:<5}", "J\\M");

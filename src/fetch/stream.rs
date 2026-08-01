@@ -25,7 +25,7 @@
 //! VMM either way: a zero-miss layer costs 1563 us (bounce) vs 1525 us (DIRECT), equal
 //! within noise. (An earlier note here blamed a ~40% `mlp` read tax from host-mapped VMM;
 //! that configuration is not what this flag produces.) Repro:
-//! docs/probes/iouring_vmm.cpp (faults into VMM) vs the iou_host probe (pinned host).
+//! docs/measurement/probes/iouring_vmm.cpp (faults into VMM) vs the iou_host probe (pinned host).
 //!
 //! SQPOLL is requested on the ring (own poller thread). Without it, submit is an
 //! `io_uring_enter` in which the CALLING thread walks the SQEs and drives the
@@ -125,7 +125,7 @@ mod stage {
 /// supposed to be draining. It produced correct tokens, which is exactly why it survived a
 /// merge — the engine's streaming design is not a tuning layer over the arithmetic, it IS
 /// the architecture, and a backend that serialises fetch against compute does not implement
-/// it (docs/VULKAN.md).
+/// it (docs/investigations/vulkan-port.md).
 ///
 /// What replaces it: the arena is a HOST-VISIBLE `vk::Buf` ([`crate::backend::vk::Buf::staging`], so
 /// non-device-local where the device offers the choice — see below), and the move into the
@@ -438,7 +438,7 @@ impl Streamer {
         // were inconsistent, and `reap`'s own comment already grants that a signal can
         // land here. `io_uring_enter` is not in the SA_RESTART-able class, so nothing
         // retries it for us. (This also has to hold before any SIGPROF-based profiler
-        // could ever be attached — see docs/TRACES.md, "Pyroscope".)
+        // could ever be attached — see docs/measurement/traces.md, "Pyroscope".)
         loop {
             match self.ring.submit() {
                 Ok(_) => return Ok(()),

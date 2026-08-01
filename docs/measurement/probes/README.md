@@ -1,3 +1,8 @@
+---
+status: data
+verdict: Standalone HIP probes that reproduce engine behaviour outside the engine, and what each one settled.
+---
+
 # docs/probes — standalone diagnostics
 
 Instruments, not tests. They are never run by CI and are not part of the crate build —
@@ -14,7 +19,7 @@ originally documented.
 | `waitvalue_visibility.hip` | Is a `hipStreamWriteValue64` on one queue visible to a `hipStreamWaitValue64` enqueued on another? | 0 mismatches over 8.4e8 checks; INV-4 rests on it |
 | `fetch_batch.hip` | Is the demand fetch leaving drive bandwidth on the table? | **No** — ARCHITECTURE §3 |
 | `fetch_stream_ops.hip` | What does the reaper pay per completed read, above the NVMe? | the per-read `hipLaunchHostFunc` was dead; deleted 2026-08-01 |
-| `vk_validation/` | Do the Vulkan validation checkers actually fire on this driver + layer? | answered, deleted; source in git at `77b5500:docs/probes/vk_validation` |
+| `vk_validation/` | Do the Vulkan validation checkers actually fire on this driver + layer? | answered, deleted; source in git at `77b5500:docs/measurement/probes/vk_validation` |
 
 **Run every one of these under the GPU lock** (`flock /tmp/rivoli-gpu.lock -c '…'`) — they
 allocate device memory and take real bandwidth, so an unlocked probe corrupts whatever
@@ -110,7 +115,7 @@ update, a `vulkan-layers` update, a loader update, or a move to different hardwa
 box went from *no validation layer installed at all* to 1.4.341 inside a single working
 session; "it fired last time" is not evidence about this time. **That is the standing
 cost of having deleted the probe: the trigger still exists, and meeting it now takes a
-`git show 77b5500:docs/probes/vk_validation/src/main.rs` first.** The alternative was
+`git show 77b5500:docs/measurement/probes/vk_validation/src/main.rs` first.** The alternative was
 keeping 800 lines and a second crate resident to answer a question that fires on a
 driver update, and the record below is what it produced.
 

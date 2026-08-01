@@ -1,3 +1,8 @@
+---
+status: closed-negative
+verdict: DSA indexer offload to the NPU: not worth it. The answer is in the first 40 lines; the device top-k it recommended shipped instead (−9.4 ms/token).
+---
+
 # rivoli — NPU offload plan: the DSA indexer
 
 > **NAV — 57 KB. The answer is the next section, "The finding, in five lines".**
@@ -139,7 +144,7 @@ engine's own always-on `idx_gpu_ns` bucket now measures in situ what it approxim
 outside. (`idx_host_ns` went with the host selection arm — see "Wired" below; on the shipped
 device path it was measuring zero.) Restore it only to re-derive a per-kernel decomposition; for
 totals, read a run's PROFILE line. **Rows,
-controls and methodology are recorded in `benchmarks.md`, "DSA indexer round"**; this
+controls and methodology are recorded in `docs/measurement/benchmarks.md`, "DSA indexer round"**; this
 section is the interpretation. Figures below are from that round's final run unless a
 superseded run is named explicitly.
 
@@ -149,7 +154,7 @@ superseded run is named explicitly.
 host↔device stream-signal round-trip. A hidden indexer needs two per full layer (release the
 GPU, resume it), so the floor is **≥32.4 µs/layer = ≥0.68 ms/token over 21 layers**.
 
-**HYPOTHESIS, flagged per docs/PERF.md.** This is a host↔GPU HIP host-func round-trip
+**HYPOTHESIS, flagged per docs/measurement/perf-roadmap.md.** This is a host↔GPU HIP host-func round-trip
 standing in for a host↔NPU one, which goes through XRT submit/fence — a different mechanism,
 cheaper or dearer unknown, and first on the spike's list. The test prints the figure and
 asserts only `us < 1000`, so **nothing in the tree records it**; it is quoted here with its
@@ -194,7 +199,7 @@ Three things in that table were not in the plan:
   adding an `mla_attend` nr=2048 term to a `--attn dense` benchmark, and the in-engine
   decomposition shows that reasoning was wrong: under dsa the attention phase is *flat* in
   context, and the term that actually grows is the indexer itself. A right answer from a
-  wrong mechanism is the failure mode `docs/PERF.md` opens with.
+  wrong mechanism is the failure mode `docs/measurement/perf-roadmap.md` opens with.
 
 ### In-engine confirmation — two runs, and the microbench does not survive intact
 
@@ -247,7 +252,7 @@ text than reaching 2.4k — which turns out to matter.
   group with one sync — predicts under 10 µs, not the observed ~41 µs, so it under-predicts
   by 4–8×. A second candidate the instrument cannot exclude: the span's endpoints are
   barrier packets whose own dispatch cost falls inside it. Recorded as measured-but-
-  unexplained, which is the status `benchmarks.md` gave the previous 27% surplus and the
+  unexplained, which is the status `docs/measurement/benchmarks.md` gave the previous 27% surplus and the
   status this one has earned. **Do not read the earlier 27% as corroboration** — that
   figure is a ratio of two *deltas* between arms of one binary, in which any fixed
   per-launch overhead cancels exactly, so it cannot share a bubble-count cause. Two
@@ -279,7 +284,7 @@ text than reaching 2.4k — which turns out to matter.
   prompts at matched length so content varies *within* a context point rather than between
   them, or a synthetic-KV harness that skips prefill entirely. Absent one of those, a wall
   or MoE difference between two context points is uninterpretable, and only `route` — which
-  benchmarks.md notes is structurally insulated from fetch variance — can be compared
+  docs/measurement/benchmarks.md notes is structurally insulated from fetch variance — can be compared
   directly. And it cuts both ways: the extrapolated 32k
   wall below is built from `route` and `moe` taken from these same two runs, so **that
   denominator inherits the same confound** and the "~9% of wall" figure is softer than its
@@ -447,7 +452,7 @@ The real distribution is structurally `dense`, so the in-engine/microbench gap i
 distribution. But name the residual honestly: it is **2.5× at nt=2456 and 3.3× at 5209** —
 it *grows with context*, which is itself unexplained. "In-situ cost" is a label for what
 the microbench does not reproduce, **not a diagnosed mechanism** (HYPOTHESIS, per
-docs/PERF.md, which warns that a bucket gives a total and not a decomposition).
+docs/measurement/perf-roadmap.md, which warns that a bucket gives a total and not a decomposition).
 That matters for the wiring estimate in the favourable direction: the device kernel does
 not run on the CPU, so it should not pay that penalty, and the in-engine win may exceed the
 2.0× the microbench shows. **It did.** Wired and measured, the host round-trip costs
@@ -486,7 +491,7 @@ switch is gone** — the engine now always selects on device, the rejected `devi
 option is recorded below rather than shipped, and `verify`'s comparison lives in
 `tests/kernel.rs::index_topk_matches_host_selection`. Re-running the A/B means restoring
 the arms from git (`77b5500:src/gpu.rs`). Rows, the bucket
-table and the full caveat list are in benchmarks.md, "Device top-k WIRED"; this is the
+table and the full caveat list are in docs/measurement/benchmarks.md, "Device top-k WIRED"; this is the
 interpretation.
 
 **Read the buckets, not the wall — and decide which buckets can respond before looking.**
@@ -511,7 +516,7 @@ deleted outright" and demanded it be costed apart — which was right, and the a
 it is real but **4× smaller than the top-k**. `route` rises +12.6 / +10.1 as the wait
 relocates to the gate-logits D2H, the unbucketed remainder falls −15.8 / −11.9, and the
 difference is the win. **The default keeps the sync anyway**: 0.6% of wall at n=2 does not
-buy making `route` incomparable with every historical row in benchmarks.md. That is a
+buy making `route` incomparable with every historical row in docs/measurement/benchmarks.md. That is a
 judgement, not a measurement; re-run at n≥4 and flip if it holds.
 
 **Do not use `wall` for the sync arm.** Its wall delta changes sign between replicates
@@ -526,10 +531,10 @@ returned **533.2 / 428.9 µs/layer — 24% apart within one session**, against 2
 earlier one. **The quantity this document denominates the entire prize in is the unstable
 one, and every share-of-prize figure above inherits that.** Candidate causes, the
 counter-evidence against them, and the unexplained 15% wall difference between sessions: see
-benchmarks.md. Nothing is diagnosed.
+docs/measurement/benchmarks.md. Nothing is diagnosed.
 
 **Correctness: 10,752 full layers matched the host selection exactly**, sentinel intact,
-output byte-identical across all seven runs (benchmarks.md for the count's derivation and
+output byte-identical across all seven runs (docs/measurement/benchmarks.md for the count's derivation and
 for why the exit status is not the evidence).
 
 ### M1 — the windows
@@ -643,7 +648,7 @@ codebook gather is friendlier to L1 than the engine's — shortening the window 
 for hideability) and understating the bus share it commits.
 
 A direct GPU∥GPU concurrency probe was built, run and deleted; it could not answer the
-question, for reasons recorded in benchmarks.md. **A GPU∥GPU experiment cannot stand in for
+question, for reasons recorded in docs/measurement/benchmarks.md. **A GPU∥GPU experiment cannot stand in for
 a GPU∥NPU one.**
 
 ### What was NOT measured
@@ -651,7 +656,7 @@ a GPU∥NPU one.**
 - **Any context beyond 5.2k, in-engine.** The 8k/16k/32k rows are extrapolated from two
   measured points through a functional form the algorithm justifies, not measured. A 32k run
   costs **~3.6 h of sole-tenant prefill** (measured prefill rate: 0.34–0.39 s/token,
-  token-by-token — there is no batched prefill; that is `docs/PERF.md` Path A, unbuilt) and,
+  token-by-token — there is no batched prefill; that is `docs/measurement/perf-roadmap.md` Path A, unbuilt) and,
   more decisively, **it would not produce a clean wall number anyway**: reaching 32k needs a
   different prompt, and prompt changes move expert hit% and therefore the MoE phase by more
   than context moves the indexer. The two runs here differ by 47 ms of wall of which 41 ms is
@@ -688,7 +693,7 @@ a GPU∥NPU one.**
   **The mid-layer `device_sync` deletion, costed separately as the plan demanded, is worth
   −2.5 ms/token — real, consistently signed, and 4× smaller than the top-k.** The default
   keeps the sync: 0.6% of wall at n=2 does not buy making `route` incomparable with every
-  historical row. Full rows and caveats: benchmarks.md, "Device top-k WIRED".
+  historical row. Full rows and caveats: docs/measurement/benchmarks.md, "Device top-k WIRED".
   `idx.last_nr` is now `min(topk, nt)` by construction, checked by the `verify` arm's
   sentinel rather than by an assertion on the arm that never needed one.
 
@@ -724,7 +729,7 @@ where `o_proj` reaches 193.8 GB/s** on the same rig and run — a measured 1.8×
 ms/token context-independent cost. **HYPOTHESIS, not a measurement:** that the gap is
 recoverable. `wq_b` [4096×2048] stays on the wave-per-row `gemv_fp8` path while `o_proj` at
 i_dim=16384 dispatches to `gemv_fp8_splitk` — different kernels, different grid regimes, so
-the gap may be structural. Per docs/PERF.md, read the ISA before booking the device.
+the gap may be structural. Per docs/measurement/perf-roadmap.md, read the ISA before booking the device.
 
 ## Risks
 
@@ -759,11 +764,11 @@ comparing nothing. Everything below the wiring step is still unbuilt.
 ### Read in this order
 
 1. **This document's "MEASURED" sections**, for what is established and what is not.
-2. **`benchmarks.md`, "DSA indexer round"** and the two sections after it — the rows, the
+2. **`docs/measurement/benchmarks.md`, "DSA indexer round"** and the two sections after it — the rows, the
    methodology, and three recorded measurement traps.
 3. **`src/gpu.rs::dsa_select_layer`** — the function being changed, ~90 lines.
 4. **`kernels/indexer.hip`, the `index_topk` block** — the kernel that replaces its host half.
-5. **`docs/PERF.md`'s opening section** on how to write a performance claim here. It is the
+5. **`docs/measurement/perf-roadmap.md`'s opening section** on how to write a performance claim here. It is the
    house standard and this work violated it twice before complying.
 
 ### State

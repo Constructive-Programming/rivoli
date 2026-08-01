@@ -18,12 +18,12 @@ pub const OS_RESERVE: u64 = 16 << 30;
 
 /// Routed-expert format mode. The always-resident set (attention, dense MLPs, shared
 /// expert) is unaffected; this only picks how the 256 routed experts/layer decode.
-/// See MODES.md for the tradeoffs.
+/// See docs/reference/modes.md for the tradeoffs.
 ///
 /// # The DEFAULT is backend-dependent, and that is the lesser of two wrongs
 ///
 /// `hybrid` on `rocm`, `int3-vq` on `vulkan`. The Vulkan backend has no int4 expert kernels
-/// (docs/VULKAN.md ports 16 of 29), so `validate_backend` rejects `hybrid` — which meant a
+/// (docs/investigations/vulkan-port.md ports 16 of 29), so `validate_backend` rejects `hybrid` — which meant a
 /// bare `rivoli <model>` on a Vulkan build failed on its own default, before it read a
 /// single byte of the artifact. A first command that errors out is a bad seam, and "pick a
 /// mode this build can actually run" is a better default than "pick the mode the other
@@ -97,7 +97,7 @@ pub struct Config {
     pub prompt: Option<String>,
     /// Routed-expert cache policy (`--cache-policy` lru|2q|arc). Default "2q".
     /// All three are output-neutral: routing never consults residency — see
-    /// docs/CACHE_ROUTE.md and [`Config::validate`].
+    /// docs/investigations/cache-conditional-routing.md and [`Config::validate`].
     pub cache_policy: String,
     /// 2Q's A1in/A1out split (`--2q-kin` / `--2q-kout`, percentages of pool capacity).
     /// Ignored by `lru`/`arc`. Unset = [`crate::memory::cache::TwoQSplit::default`].
@@ -105,7 +105,7 @@ pub struct Config {
         /// DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
     pub checksum_x: bool,
     /// Routed-expert format mode (`--mode int3-vq|int4|hybrid`; default `hybrid` on `rocm`,
-    /// `int3-vq` on `vulkan` — see [`Mode`] for why the default differs). MODES.md has the
+    /// `int3-vq` on `vulkan` — see [`Mode`] for why the default differs). docs/reference/modes.md has the
     /// tradeoffs. Set by `main`, like the checksum diagnostics.
     pub mode: Mode,
     /// Device budget override, bytes (`--max-mem <GiB>`). None (default) auto-sizes to
@@ -194,7 +194,7 @@ impl Config {
     ///
     /// The Vulkan launchers for these paths return `Err` too, but that fires mid-decode —
     /// after the artifact is mmapped, the tier is filled and forty layers have run. Same
-    /// information, an order of magnitude more expensive to receive. See docs/VULKAN.md,
+    /// information, an order of magnitude more expensive to receive. See docs/investigations/vulkan-port.md,
     /// "Kernel inventory — port 16 of 29".
     ///
     /// SEPARATE from [`Config::validate`], and called separately by `main`, deliberately.
@@ -211,7 +211,7 @@ impl Config {
         if self.mode != Mode::Int3Vq {
             bail!(
                 "--mode {} needs the int4 expert kernels, which the Vulkan backend does not \
-                 have (docs/VULKAN.md defers them). Use --mode int3-vq, or rebuild with \
+                 have (docs/investigations/vulkan-port.md defers them). Use --mode int3-vq, or rebuild with \
                  --features rocm.",
                 self.mode
             );
@@ -223,7 +223,7 @@ impl Config {
             bail!(
                 "--attn {:?} needs the DSA lightning-indexer kernels (index_append/score/\
                  topk/pool_push/head_route and layernorm), which the Vulkan backend does not \
-                 have (docs/VULKAN.md defers them). Use --attn dense or --attn streaming, or \
+                 have (docs/investigations/vulkan-port.md defers them). Use --attn dense or --attn streaming, or \
                  rebuild with --features rocm.",
                 self.attn
             );
@@ -286,7 +286,7 @@ mod tests {
     }
 
     /// `top-m` in `--mode hybrid` must FAIL, not quietly fall back to the frequency
-    /// threshold: the hybrid rank-driven tier rule (docs/CACHE_ROUTE.md "Mode
+    /// threshold: the hybrid rank-driven tier rule (docs/investigations/cache-conditional-routing.md "Mode
     /// integration") is a later step, and a silent fallback would let a hybrid run
 
     /// Substitution breaks the v2 trace's "window prefix == selection" promise, so the
@@ -333,7 +333,7 @@ mod tests {
 
     /// The Vulkan capability gate: int3-vq + dense/streaming pass; int4, hybrid, dsa and
     /// misa are refused AT STARTUP with a message naming both the missing kernels and the
-    /// way out. See docs/VULKAN.md, "Kernel inventory — port 16 of 29".
+    /// way out. See docs/investigations/vulkan-port.md, "Kernel inventory — port 16 of 29".
     #[cfg(feature = "vulkan")]
     #[test]
     fn vulkan_refuses_the_unported_modes() {

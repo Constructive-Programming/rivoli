@@ -129,10 +129,10 @@ fn desc_of_vq(m: &MlpVq) -> ExpertDesc {
 //
 // There used to be a `RIVOLI_TOPK=host|device|device-nosync|verify` switch here, four arms
 // of one binary so the device top-k and a mid-layer-sync deletion could be costed
-// separately. Both were costed (benchmarks.md, "Device top-k WIRED"): `host → device` is
+// separately. Both were costed (docs/measurement/benchmarks.md, "Device top-k WIRED"): `host → device` is
 // **−9.4 ms/token**, `device → device-nosync` is **−2.5 ms/token** — and the second was
 // deliberately NOT taken, because 0.6% of wall is not worth making `route` incomparable
-// with every historical row in benchmarks.md. The arms are deleted now that the answers are
+// with every historical row in docs/measurement/benchmarks.md. The arms are deleted now that the answers are
 // recorded: `host` was a baseline git already holds, `device-nosync` a rejected option, and
 // `verify` a correctness gate that `tests/kernel.rs::index_topk_matches_host_selection`
 // covers with the same over-selection sentinel trick, on data the test controls rather than
@@ -144,7 +144,7 @@ fn desc_of_vq(m: &MlpVq) -> ExpertDesc {
 /// sync. Cost bound, since `wall_ns` is quoted as a measurement elsewhere: the
 /// indexer buckets add 42 `hipEventRecord` enqueues + 21 clock reads per token,
 /// O(0.2 ms) against a ~400 ms token, ~0.05%. Bounded by argument, not by an
-/// un-instrumented control run — see docs/NPU.md "What was NOT measured". The end-of-run [`Profile::report`] is the
+/// un-instrumented control run — see docs/investigations/npu-offload.md "What was NOT measured". The end-of-run [`Profile::report`] is the
 /// engine's standing performance summary; the expensive fine-grained audits and
 /// correctness probes live behind the `trace` feature instead.
 #[derive(Default)]
@@ -609,7 +609,7 @@ pub struct GpuEngine<'a> {
     #[cfg(feature = "trace")]
     checksum_x: bool,
     /// `RIVOLI_DUMP_SCORES=<path>`: raw `index_score` output, for characterising the
-    /// distribution the host top-k actually faces (docs/NPU.md). `(file, calls seen,
+    /// distribution the host top-k actually faces (docs/investigations/npu-offload.md). `(file, calls seen,
     /// records left)` — bounded so a long run cannot fill the disk.
     #[cfg(feature = "trace")]
     score_dump: Option<(std::fs::File, u64, usize)>,
@@ -893,7 +893,7 @@ impl<'a> GpuEngine<'a> {
     ///
     /// **This measures recall, not throughput.** It adds an rmsnorm, a gemv and a blocking
     /// D2H per MoE layer — roughly the per-layer cost `--hint-k` was retired for — so a
-    /// tok/s off a probe run means nothing. Answer in docs/CACHE_PILOT.md, "Feasibility,
+    /// tok/s off a probe run means nothing. Answer in docs/investigations/cross-layer-prefetch.md, "Feasibility,
     /// settled": 82.7% recall on the misses, and it still does not pay.
     #[cfg(feature = "pred-probe")]
     pub fn set_pred_probe(&mut self, on: bool) {
@@ -1094,7 +1094,7 @@ impl<'a> GpuEngine<'a> {
         // The mid-layer join. TWO consumers — it makes the score D2H below safe AND
         // retires the event pair. Deleting it was measured as its own arm and is worth
         // −2.5 ms/token, 0.6% of wall, at the cost of making `route` incomparable with
-        // every historical row in benchmarks.md; not taken, see the module note above.
+        // every historical row in docs/measurement/benchmarks.md; not taken, see the module note above.
         blocked(&mut self.prof.sync_wait_ns, "gpu-wait/idx-sync", device_sync)?;
         // `RIVOLI_DUMP_SCORES` is the only thing left that wants the scores host-side.
         // Gated on the REMAINING budget, not on the file, so a finished dump stops paying
@@ -1989,7 +1989,7 @@ impl<'a> GpuEngine<'a> {
                 // drain sums the two. No ordering between the streams is required at all —
                 // integers associate, so the split is a CONTENTION fix, not a correctness
                 // one (`MOE_ACC_ROWS` has the measurement). Cross-queue visibility was
-                // probed rather than assumed (docs/probes/waitvalue_visibility.hip): 0
+                // probed rather than assumed (docs/measurement/probes/waitvalue_visibility.hip): 0
                 // mismatches over 8.4e8 checks.
                 for e in 0..ndesc {
                     if tickets[e].is_resident() {
@@ -2198,7 +2198,7 @@ impl<'a> GpuEngine<'a> {
     /// fewer experts, hits more, and looks *better* on every metric the run generates
     /// about itself. Forcing the text pins the trajectory so two policies are scored on
     /// literally the same positions, which is also what makes the per-token NLLs PAIRABLE
-    /// across runs. See docs/CACHE_ROUTE.md "Quality".
+    /// across runs. See docs/investigations/cache-conditional-routing.md "Quality".
     ///
     /// The full `vocab` logit vector comes back to the host each position. That is ~620 KB
     /// against ~0.96 GB/token of expert streaming — noise. A device-side log-softmax would

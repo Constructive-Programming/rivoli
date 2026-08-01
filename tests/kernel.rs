@@ -1245,7 +1245,7 @@ fn moe_i4_real_data_vs_fp8_ground_truth() {
 /// The `ReLU-sparse` and `scattered zeros` cases are tie-DOMINATED, which is the regime
 /// where the index-ascending rule decides the bulk of the selection rather than a
 /// handful of boundary entries. Whether the engine actually produces such an array is
-/// unmeasured (docs/NPU.md), so these are chosen as the hardest case for the tiebreak,
+/// unmeasured (docs/investigations/npu-offload.md), so these are chosen as the hardest case for the tiebreak,
 /// not as a claim about production data. `scattered zeros` additionally makes the answer
 /// non-prefix, which is the combination nothing else here covers — and note the two
 /// differ in ORDER as well as scatter: `ReLU-sparse` is pre-sorted into the host

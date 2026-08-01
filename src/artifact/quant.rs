@@ -40,7 +40,7 @@ pub fn matvec_fp8(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Vector-quantized int3 experts (M1 scalar oracle — see docs/int3.md).
+// Vector-quantized int3 experts (M1 scalar oracle).
 //
 // We requantize the fp8 checkpoint's experts into a uniform container the streaming
 // kernel reads. Each row's weights are split into `VQ_DIM`-wide subvectors, and each
@@ -53,8 +53,12 @@ pub fn matvec_fp8(
 // `i_dim/VQ_GROUP` bf16 group scales. `w[subvec] ≈ scale_group · codebook[index]`.
 // This module DEFINES the bytes the converter (M2) writes and the HIP kernel (M3)
 // reads. The codebook is learned once by the converter, stored in the file header,
-// and embedded in the kernel. Hadamard rotation (QuIP incoherence) is DEFERRED —
-// it measured no gain on these already-well-conditioned weights (docs/int3.md).
+// and embedded in the kernel. Hadamard rotation (QuIP incoherence) is CLOSED, not merely
+// deferred: this comment used to cite `docs/int3.md` for "no gain on these
+// already-well-conditioned weights", and that file was never committed. The claim was
+// re-derived from evidence that does exist and it holds — see
+// docs/investigations/codebook-rotation.md, which also measures the OTHER argument (one
+// codebook shared by 75 layers) and finds 0.09% to recover against a 2% bar.
 
 /// Weights per learned codebook entry (subvector dimension).
 pub const VQ_DIM: usize = 4;
@@ -359,7 +363,7 @@ pub fn vq_decode_proj(p: &VqProj, codebook: &[f32]) -> Vec<f32> {
 // ── codebook learning (shared by `convert` and `vq_study`) ──────────────────
 //
 // Lives here rather than in the converter because a second consumer appeared: the
-// per-layer-codebook study (docs/ROTATION.md) has to fit codebooks the SAME way the
+// per-layer-codebook study (docs/investigations/codebook-rotation.md) has to fit codebooks the SAME way the
 // shipped one was fitted, or the comparison measures the fitting procedure instead of
 // the thing it is trying to price.
 

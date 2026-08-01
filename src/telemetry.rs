@@ -299,7 +299,7 @@ pub fn longest_repeated_block(ids: &[u32]) -> usize {
 
 /// Detect a verbatim repetition loop at the **tail** of a generation.
 ///
-/// **Deliberately not a distinct-token ratio.** [INT4.md](../docs/INT4.md) showed that
+/// **Deliberately not a distinct-token ratio.** [INT4.md](../docs/investigations/int4-scales.md) showed that
 /// gate inverts: hybrid has the worst distinct ratio in the engine (0.138) and the
 /// second-best perplexity, so a diversity threshold would reject the best config we
 /// have. Repetitiveness is not the signal — a *cycle* is. The tail being literally N
@@ -352,7 +352,7 @@ pub fn detect_loop(ids: &[u32], min_repeats: usize, max_period: usize) -> Option
 /// - `distinct`: distinct-word ratio. 0.43–0.53 healthy, 0.12–0.29 degenerate, and it
 ///   fell monotonically (0.474 → 0.366 → 0.288 → 0.244) across that same run.
 ///
-/// On `distinct`: [INT4.md](../docs/INT4.md) warns that a distinct-token gate INVERTS —
+/// On `distinct`: [INT4.md](../docs/investigations/int4-scales.md) warns that a distinct-token gate INVERTS —
 /// hybrid has the worst ratio in the engine and the second-best perplexity. That warning
 /// is about ranking *healthy* configs against each other, where the ratio does not track
 /// quality. Reading it as "never use distinct ratio" was an over-generalisation, and it
@@ -494,7 +494,7 @@ pub struct ProfileSummary {
     pub gb_per_tok: f64,
     /// `--cache-policy top-m` only: the share of chosen expert slots that were NOT in
     /// the true top-K — the quality cost of cache-conditional routing, and per
-    /// docs/CACHE_ROUTE.md "Counters" the one number you tune (J, M) against. `None`
+    /// docs/investigations/cache-conditional-routing.md "Counters" the one number you tune (J, M) against. `None`
     /// under lru/2q/arc, which never substitute; printing 0.0% there would read as a
 
     // ---- CLASS spans: what the machine was DOING. All directly measured ----
@@ -544,7 +544,7 @@ impl ProfileSummary {
     pub fn report(&self) {
         let exposed = (self.moe_wall_ms - self.compute_gpu_ms).max(0.0);
         tracing::info!(
-            // wall/route at 0.1 ms: the DSA selection A/B (docs/NPU.md) turns on deltas of
+            // wall/route at 0.1 ms: the DSA selection A/B (docs/investigations/npu-offload.md) turns on deltas of
             // a few ms against a ~400 ms token, which 1 ms resolution rounds into noise.
             "PROFILE/tok: {:.1}ms wall | route {:.1}ms | moe {:.0}ms (gpu {:.0}ms) | fetch {:.0}ms ({:.0}% hidden, {:.0}ms exposed) | {:.2} miss, {:.2}ms/miss, {:.2} GB",
             self.wall_ms,
@@ -615,7 +615,7 @@ impl ProfileSummary {
             self.tail_gpu_ms,
             100.0 * (self.tail_wait_ms - self.tail_gpu_ms).max(0.0) / self.tail_wait_ms.max(1e-9),
         );
-        // DSA indexer decomposition (docs/NPU.md M0). Silent when the indexer never
+        // DSA indexer decomposition (docs/investigations/npu-offload.md M0). Silent when the indexer never
         // scored — dense/streaming, or a context that stayed under `index_topk`, where a
         // row of zeros would read as a measurement of something that did not happen.
         if self.idx_layers_per_tok > 0.0 {

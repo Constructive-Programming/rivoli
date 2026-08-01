@@ -189,7 +189,7 @@ pub fn topk_into(scores: &[f32], k: usize, out: &mut Vec<usize>) {
 /// +12.7%. Because selection is now a pure function of (logits, bias, top_k), any cache
 /// change — policy, budget, placement — is output-bit-identical by construction. That is
 /// the acceptance test every cache change is held to, and re-introducing residency here
-/// would silently give it up. See docs/CACHE_ROUTE.md for the retirement record.
+/// would silently give it up. See docs/investigations/cache-conditional-routing.md for the retirement record.
 pub fn route_into(
     gate_logits: &[u8],
     bias: &[f32],

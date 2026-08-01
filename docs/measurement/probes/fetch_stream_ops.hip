@@ -18,7 +18,7 @@
 // from the STREAM cost (what the copies behind it pay), because they are different budgets
 // and only the first shows up as lost fetch bandwidth.
 //
-// build: hipcc -O2 --offload-arch=gfx1151 -o /tmp/fetch_stream_ops docs/probes/fetch_stream_ops.hip
+// build: hipcc -O2 --offload-arch=gfx1151 -o /tmp/fetch_stream_ops docs/measurement/probes/fetch_stream_ops.hip
 // run:   flock /tmp/rivoli-gpu.lock -c /tmp/fetch_stream_ops
 #include <hip/hip_runtime.h>
 #include <cstdio>

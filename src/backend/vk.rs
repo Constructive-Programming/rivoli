@@ -1,6 +1,6 @@
 //! The Vulkan compute backend — the `rocm`-free twin of `hip.rs`. Instance/device
 //! bring-up, memory, queue/timeline sync, and the `launch_*` surface over the SPIR-V
-//! kernels in `kernels/vk/`. See docs/VULKAN.md.
+//! kernels in `kernels/vk/`. See docs/investigations/vulkan-port.md.
 //!
 //! Everything hangs off one process-global [`Gpu`]. HIP hides its context inside the
 //! runtime, which is why `hip.rs`'s launchers and `device.rs`'s buffers take nothing
@@ -29,7 +29,7 @@ const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 pub const O_DIRECT_ALIGN: usize = 4096;
 
 /// Shaders read packed `u8`/`u16` weights as 32-bit WORDS — `VK_KHR_8bit_storage` is
-/// deliberately not required (docs/VULKAN.md) — so the word holding the LAST byte of an
+/// deliberately not required (docs/investigations/vulkan-port.md) — so the word holding the LAST byte of an
 /// unaligned buffer extends up to 3 bytes past it. Every allocation is rounded up to
 /// this so that read stays in bounds.
 ///
@@ -154,7 +154,7 @@ unsafe extern "system" fn debug_callback(
 }
 
 /// WHICH QUEUE a launch belongs on — the Vulkan spelling of HIP's three streams
-/// (docs/VULKAN.md, "The design, on paper").
+/// (docs/investigations/vulkan-port.md, "The design, on paper").
 ///
 /// It travels through the `launch_*` surface as the same `*mut c_void` HIP carries a
 /// `hipStream_t` in, because that signature is shared by both backends and cannot be
@@ -217,7 +217,7 @@ impl Q {
 
 /// Command buffers per stream. Sized by how many flushes may be in flight before the
 /// oldest must have retired; the fence wait in [`Stream::open`] makes an undersized ring a
-/// STALL rather than a bug (docs/VULKAN.md, "The design, on paper").
+/// STALL rather than a bug (docs/investigations/vulkan-port.md, "The design, on paper").
 ///
 /// **4 was the doc's starting guess and it is too small here, for a reason worth stating.**
 /// The MoE stream flushes once per expert (see `Stream::eager`), so a layer submits
@@ -332,7 +332,7 @@ struct Stream {
 
 /// A compiled compute kernel. Every pipeline here has an EMPTY descriptor-set layout:
 /// buffers reach the shader as device addresses in push constants, which is HIP's raw
-/// pointer args translated literally (docs/VULKAN.md, "kernel raw pointer args").
+/// pointer args translated literally (docs/investigations/vulkan-port.md, "kernel raw pointer args").
 struct Pipe {
     layout: vk::PipelineLayout,
     pipe: vk::Pipeline,
@@ -463,7 +463,7 @@ impl Gpu {
         // COMPUTE|TRANSFER|SPARSE with FOUR queues, so all three are independent and
         // there are no queue-family ownership transfers on any buffer — the single
         // biggest simplification available, and why using the graphics family would be
-        // a mistake (docs/VULKAN.md).
+        // a mistake (docs/investigations/vulkan-port.md).
         // SAFETY: `phys` came from this instance.
         let fams = unsafe { instance.get_physical_device_queue_family_properties(phys) };
         let fam = fams
@@ -484,7 +484,7 @@ impl Gpu {
             warn!(
                 "queue family {qfam} implements 0 timestampValidBits: GPU timing spans are \
                  UNAVAILABLE on this device and Event::elapsed_ms will refuse rather than \
-                 return zero (docs/VULKAN.md, the increment-1 note on why 0.0 was worse)"
+                 return zero (docs/investigations/vulkan-port.md, the increment-1 note on why 0.0 was worse)"
             );
         }
         let timeline = StreamWaiter::new(&device, nq)?;
@@ -506,7 +506,7 @@ impl Gpu {
             warn!(
                 "compute family {qfam} exposes only {} queue(s) of the 3 this backend wants: \
                  {} share a queue, so fetch will NOT overlap compute and moe/tok will be \
-                 roughly the serialised sum (docs/VULKAN.md, \"Phase 4 needs two queues\")",
+                 roughly the serialised sum (docs/investigations/vulkan-port.md, \"Phase 4 needs two queues\")",
                 nq,
                 if nq == 1 { "all three streams" } else { "MoE and fetch" }
             );
@@ -1225,7 +1225,7 @@ impl Gpu {
             // unordered.
             //
             // NOT verified by a checker, unlike everything else load-bearing here. See
-            // docs/VULKAN.md "Synchronisation validation does not cover compute→transfer":
+            // docs/investigations/vulkan-port.md "Synchronisation validation does not cover compute→transfer":
             // the layer reports transfer↔transfer hazards but stays silent on this class
             // even with NO barrier at all, so a clean run says nothing either way. This is
             // spec-derived, and it is the weakest evidence in the backend.
@@ -1695,7 +1695,7 @@ unsafe impl Send for Buf {}
 /// Every live [`Buf`], so a device address can be mapped back to the `VkBuffer` that
 /// owns it.
 ///
-/// This is the lookup table docs/VULKAN.md rejects for the launcher path — and the
+/// This is the lookup table docs/investigations/vulkan-port.md rejects for the launcher path — and the
 /// reasoning still holds there. It is acceptable HERE because `vkCmdCopyBuffer` takes
 /// handles and offsets and there is no copy-by-address command.
 ///
@@ -2039,7 +2039,7 @@ impl Buf {
     /// are one number and `VmmBuf::ptr_mut` serves both purposes, which is why
     /// `pin.rs`'s `ArenaPool` can use one base for descriptor arithmetic and for
     /// `ReadSpec.dst`. Here they are unrelated, so the caller has to say which one it
-    /// means. See docs/VULKAN.md, "Host pointer != device address".
+    /// means. See docs/investigations/vulkan-port.md, "Host pointer != device address".
     pub fn host_mut(&mut self) -> *mut u8 {
         self.host
     }
@@ -2172,7 +2172,7 @@ pub unsafe fn memcpy_dtod(dst: *mut u8, src: *const u8, bytes: usize) -> Result<
 /// layer owns only the WRITE side of a slot. Two mechanisms both believing they own slot
 /// lifetime is how a subtle double-free of *bytes* gets built.
 ///
-/// (docs/VULKAN.md called this "the `inflight` guard". No such guard exists under that name
+/// (docs/investigations/vulkan-port.md called this "the `inflight` guard". No such guard exists under that name
 /// — the mechanism is the per-batch pin set above, and a reader grepping for `inflight`
 /// finds nothing. The doc is corrected; this note is here because the wrong name is what is
 /// written in the planning text a future porter will read first.)
@@ -2241,7 +2241,7 @@ pub unsafe fn fill_u32(dst: *mut u8, pat: u32, bytes: usize) -> Result<()> {
 ///   silently land in the wrong slots. A `u64` after an `i32` introduces four bytes of
 ///   it, which is one field reorder away at every future launcher.
 /// - **Fits the guaranteed budget.** 128 bytes is all Vulkan promises. Exceeding it is
-///   the "push-constant budget" risk in docs/VULKAN.md; this makes it a build error
+///   the "push-constant budget" risk in docs/investigations/vulkan-port.md; this makes it a build error
 ///   instead of a device-dependent surprise, so the params-buffer fallback gets built
 ///   the day it is actually needed and not before.
 ///
@@ -2458,7 +2458,7 @@ impl Gpu {
     /// Arming directly on top of recorded-but-unsubmitted work (what
     /// `Signal::arm_on(stream)` does on the HIP side) needs the single command buffer
     /// here to become a small ring, because an async flush cannot reuse a buffer that
-    /// is still pending. That is increment-2 work — see docs/VULKAN.md, "The design, on
+    /// is still pending. That is increment-2 work — see docs/investigations/vulkan-port.md, "The design, on
     /// paper", where the ring and the second queue are one design. `vkstream.rs`
     /// documents what the gap costs its callers today.
     pub fn signal(&self) -> Result<Signal> {
@@ -2920,7 +2920,7 @@ pub unsafe fn launch_flag_nonfinite(
     // in a value the reader cannot distinguish from silence — and `atomicCompSwap(_, 0,
     // 0)` writes nothing anyway, so the call would ALSO be a silent no-op. The HIP side
     // accepts it; refusing is one of the few places the Vulkan launcher is stricter, for
-    // the same reason as the VQ dimension guards (docs/VULKAN.md).
+    // the same reason as the VQ dimension guards (docs/investigations/vulkan-port.md).
     ensure!(
         tag != 0,
         "flag_nonfinite: tag 0 is the 'nothing flagged' sentinel and would be \
@@ -3873,7 +3873,7 @@ pub unsafe fn launch_moe_reduce(
 // Deferred kernels — the launchers that exist so `gpu.rs` COMPILES, and refuse.
 // ---------------------------------------------------------------------------
 //
-// docs/VULKAN.md ports 16 of 29 kernels; these are on the other side of that line. They
+// docs/investigations/vulkan-port.md ports 16 of 29 kernels; these are on the other side of that line. They
 // are here rather than absent because the backend waist is a glob re-export of one module
 // or the other (`src/backend.rs`), so a name `gpu.rs` mentions must EXIST on both sides.
 //
@@ -3893,7 +3893,7 @@ pub unsafe fn launch_moe_reduce(
 /// One message shape, so every deferred kernel says the same thing the same way.
 fn deferred(name: &str) -> anyhow::Error {
     anyhow!(
-        "{name} is not implemented on the Vulkan backend (docs/VULKAN.md ports 16 of 29 \
+        "{name} is not implemented on the Vulkan backend (docs/investigations/vulkan-port.md ports 16 of 29 \
          kernels and defers this one); rebuild with --features rocm"
     )
 }

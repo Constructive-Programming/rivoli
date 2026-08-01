@@ -69,7 +69,7 @@ pub fn make(
         // Three policies, three implementations. (`top-m` was a fourth NAME over the same
         // LRU with router substitution switched on; it was removed 2026-07-30 because
         // steering EVICTION rather than SELECTION is output-neutral, which top-m was
-        // not: +3.63% ppl on int3-vq, +12.7% on int4. See docs/CACHE_ROUTE.md.)
+        // not: +3.63% ppl on int3-vq, +12.7% on int4. See docs/investigations/cache-conditional-routing.md.)
         // This repo deleted three duplicate
         // policy families in 08db745; a copy-pasted `HybridTopM` would be that mistake
         // with a new name.
@@ -81,7 +81,7 @@ pub fn make(
 
 // ---------------------------------------------------------------------------
 // LRU — recency eviction, frequency-counter admission (LRU has no native hot/cold
-// signal). See MODES.md.
+// signal). See docs/reference/modes.md.
 // ---------------------------------------------------------------------------
 const LRU_HOT_THRESHOLD: u32 = 2;
 /// Halve `freq` every this many accesses so the count tracks RECENT frequency (a cooled

@@ -1,3 +1,8 @@
+---
+status: closed-negative
+verdict: LOOKA hints and the pilot prefetcher: REMOVED 2026-07-31. The veto bound on 0.9% of evictions; the prefetcher predicted at 99% precision and still cost more than it saved.
+---
+
 # rivoli — CACHE_PILOT: router-piloted cross-layer expert prefetch
 
 Status: **DELETED FROM THE ENGINE 2026-07-31. This document is now a record, not a guide to
@@ -68,9 +73,9 @@ make an L+2 **int4 promotion** affordable, while `.i4` was re-derived from `.vq3
 (`bin/vq3_to_i4`) and therefore strictly *less* faithful than the vq3 it came from —
 int3-vq PPL 5.275 against int4 9.083.
 
-> **`bin/vq3_to_i4` NO LONGER EXISTS** (deleted; `docs/ARCHITECTURE.md` §11 flags every
+> **`bin/vq3_to_i4` NO LONGER EXISTS** (deleted; `docs/reference/architecture.md` §11 flags every
 > doc that still cites it). `.i4` is built by `bin/fp8_to_i4` straight from the fp8 source,
-> and since the group-128 fix (`docs/INT4.md`, RESOLVED 2026-07-27) int4 is the
+> and since the group-128 fix (`docs/investigations/int4-scales.md`, RESOLVED 2026-07-27) int4 is the
 > best-QUALITY mode in the engine: **PPL 5.120 against int3-vq's 5.275**, re-measured
 > 5.154898 vs 5.222720 on 2026-07-31. The premise this bullet was lifted *around* — that
 > promoting to int4 degrades quality — is now false in the opposite direction. Anything
@@ -602,4 +607,4 @@ deleting at `b372cd4`.
 
 The one thing worth recording either way is the LOOKA measurement. Recall numbers for
 GLM-5.2-int3-vq at L+1 and L+2 are a durable fact about the model that belongs in
-`benchmarks.md` whatever happens to the code.
+`docs/measurement/benchmarks.md` whatever happens to the code.

@@ -4,7 +4,7 @@
 //! backing store); [`arena`] is the two-ended byte arena carved out of the second; [`cache`]
 //! and [`hybrid`] are the eviction substrate and the three policies over it; [`pin`] ties
 //! them to the model, holding the resident weight set and resolving a layer's experts to
-//! device pointers. See docs/ARCHITECTURE.md §1 and §6.
+//! device pointers. See docs/reference/architecture.md §1 and §6.
 
 pub mod arena;
 pub mod cache;

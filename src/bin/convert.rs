@@ -1,5 +1,5 @@
 //! convert — GLM-5.2 fp8 checkpoint → the rivoli int3-vq artifact (see
-//! docs/ARCHITECTURE.md + src/artifact/format.rs). Learns 3 per-projection codebooks,
+//! docs/reference/architecture.md + src/artifact/format.rs). Learns 3 per-projection codebooks,
 //! VQ-encodes the routed + shared experts into per-layer `.vq3` files, and
 //! assembles the resident set (attention/dense fp8 copied native, norms + router
 //! gate bf16→f32, embed/lm_head bf16→int8) into `resident.safetensors`, plus a

@@ -72,7 +72,7 @@ __device__ __forceinline__ void gemv_fp8_splitk_impl(
     // Shift, NOT divide: `o` is a size_t, so `o / block` was a runtime division once per
     // thread (~55 instructions). Same index, the launcher rejecting a non-power-of-two
     // tile. Measured −0.9%, INSIDE the noise band and not the 20% the identical fix
-    // bought in mla_value_fp8 — why, and why it shipped anyway, in docs/PERF.md #2.
+    // bought in mla_value_fp8 — why, and why it shipped anyway, in docs/measurement/perf-roadmap.md #2.
     const float* scalerow = scale + (o >> blk_shift(block)) * sc_cols;
     const int STRIDE = ROWS_PER_BLOCK * WAVE; // all 256 threads stride coalesced (split-K)
     // Same strided fp8 MAC as dot_fp8_wave, but split-K across every wave in the block.
@@ -166,7 +166,7 @@ extern "C" __global__ void gemv_f32_r2(
 // against a 128 B cache line, so the kernel asked DRAM for a quarter line at a time and
 // measured 117 GB/s of a 256 GB/s part. Four contiguous int8 are one dword — a full line
 // per wave — paired with one float4 of x. Same mechanism, and the same fix, as
-// mla_absorb's i-quad (docs/PERF.md #4 and #5).
+// mla_absorb's i-quad (docs/measurement/perf-roadmap.md #4 and #5).
 //
 // NOT bit-identical to the scalar form: each lane now owns a contiguous quad instead of
 // a stride-WAVE comb, which reassociates the f32 sum. lm_head feeds argmax directly, so

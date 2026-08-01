@@ -1,6 +1,6 @@
 //! rivoli — GLM-5.2 MoE decode engine (routed experts int3-vq/int4/hybrid; the default is
 //! hybrid on `rocm` and int3-vq on `vulkan`, whose int4 kernels are not ported — see
-//! MODES.md and `config::Mode`). The artifact IS the model: point
+//! docs/reference/modes.md and `config::Mode`). The artifact IS the model: point
 //! `rivoli` at a converted artifact directory (manifest.json + codebooks.f32 +
 //! resident.safetensors + `L{ll}.vq3` + tokenizer) and it decodes on device.
 //!
@@ -41,14 +41,14 @@ struct Args {
 
     /// Decode this many tokens, print PROFILE, exit. Omit for the interactive/server path.
     ///
-    /// Spelled `-bench` in every recorded command line (benchmarks.md, MODES.md,
+    /// Spelled `-bench` in every recorded command line (docs/measurement/benchmarks.md, docs/reference/modes.md,
     /// tests/bench-matrix.sh); `main` rewrites that single-dash form to `--bench` before
     /// clap sees it, since clap has no single-dash-long concept. Both work.
     #[arg(long)]
     bench: Option<usize>,
 
     /// Routed-expert format. Default: hybrid on rocm, int3-vq on vulkan (whose int4
-    /// kernels are not ported) — see MODES.md and `config::Mode`.
+    /// kernels are not ported) — see docs/reference/modes.md and `config::Mode`.
     #[arg(long, default_value_t, value_parser = rivoli::artifact::config::Mode::parse)]
     mode: rivoli::artifact::config::Mode,
 
@@ -128,7 +128,7 @@ struct Args {
     /// Costs an rmsnorm, a gemv and a blocking D2H per MoE layer, so it measures RECALL and
     /// nothing else — do not read a tok/s off a probe run. Pair it with `--no-mtp`: with
     /// speculation on, the union carries two routers' picks and a row-0 prediction is scored
-    /// against a denominator it never saw. Answer: docs/CACHE_PILOT.md, "Feasibility,
+    /// against a denominator it never saw. Answer: docs/investigations/cross-layer-prefetch.md, "Feasibility,
     /// settled".
     #[cfg(feature = "pred-probe")]
     #[arg(long)]
@@ -143,7 +143,7 @@ struct Args {
 
     /// Write the generated token ids, one per line.
     ///
-    /// For **gate A** of the Vulkan acceptance gate (docs/VULKAN.md): agreement on token
+    /// For **gate A** of the Vulkan acceptance gate (docs/investigations/vulkan-port.md): agreement on token
     /// IDs for K tokens. Comparing decoded TEXT is not a substitute — different id
     /// sequences can decode to identical text, so a text diff reports only a lower bound
     /// on divergence. Gate A is a standing obligation across commits, so it needs an
@@ -164,13 +164,13 @@ struct Args {
     /// Output is BYTE-IDENTICAL either way — every batched kernel is bit-identical per row
     /// and row 0 of a verify pass is the real token — so this flag can only move speed.
     /// (The exception is `--mode hybrid`, whose output is not stable under ANY cache
-    /// change, speculation included; see docs/ARCHITECTURE.md §8b under INV-1.)
+    /// change, speculation included; see docs/reference/architecture.md §8b under INV-1.)
     ///
     /// **Measured 1.108x** — 2.97 vs 2.68 tok/s, int3-vq, 512 tokens. That is WITH the
     /// `--mtp-min-conf` gate, which is on by default. The verify pass costs ~1.53x a
     /// sequential one (the MoE launches the UNION of both rows' experts), so it needs ~53%
     /// acceptance to break even and ungated it lands at 0.93-0.95x. Gating is what turns it
-    /// positive. See benchmarks.md, "The MTP confidence gate".
+    /// positive. See docs/measurement/benchmarks.md, "The MTP confidence gate".
     #[arg(long)]
     no_mtp: bool,
 
@@ -206,7 +206,7 @@ fn moe_gain_in_band(s: &str) -> Result<f32, String> {
 /// Parse argv, accepting the legacy single-dash `-bench` alongside `--bench`.
 ///
 /// clap has no single-dash-long form, and `-bench N` is what every recorded command line
-/// in benchmarks.md, MODES.md and tests/bench-matrix.sh uses. Rewriting the token is three
+/// in docs/measurement/benchmarks.md, docs/reference/modes.md and tests/bench-matrix.sh uses. Rewriting the token is three
 /// lines; re-recording a year of benchmark provenance is not. Only an exact `-bench`
 /// matches, so `-b`, `--bench` and a positional path are all untouched.
 fn parse_args() -> Args {
@@ -246,7 +246,7 @@ fn resolve_attn(a: &Args) -> Result<rivoli::attn::AttnMode> {
                 eprintln!(
                     "--attn auto: the artifact carries DSA indexer weights, but this is a \
                      Vulkan build and the lightning-indexer kernels are not ported \
-                     (docs/VULKAN.md) — resolving to `dense`. Use --features rocm for dsa."
+                     (docs/investigations/vulkan-port.md) — resolving to `dense`. Use --features rocm for dsa."
                 );
                 "dense"
             }
@@ -287,7 +287,7 @@ fn main() -> Result<()> {
     bail!(
         "rivoli was built with NO compute backend and cannot decode. Rebuild with \
          `--features rocm` (HIP/ROCm) or `--features vulkan` — exactly one; they are \
-         mutually exclusive (src/backend.rs, docs/VULKAN.md)."
+         mutually exclusive (src/backend.rs, docs/investigations/vulkan-port.md)."
     )
 }
 
@@ -354,7 +354,7 @@ fn main() -> Result<()> {
     if a_moe_gain != 1.0 {
         bail!(
             "--moe-gain {a_moe_gain} needs the `vaxpy` kernel, which the Vulkan backend does \
-             not have (docs/VULKAN.md defers it; `vadd`, the g = 1 case, is ported). Drop the \
+             not have (docs/investigations/vulkan-port.md defers it; `vadd`, the g = 1 case, is ported). Drop the \
              flag, or rebuild with --features rocm."
         );
     }

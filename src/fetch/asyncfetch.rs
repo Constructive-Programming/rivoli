@@ -5,7 +5,7 @@
 //! [`crate::backend`], and it is a REAL dedicated stream on both — a `hipStream_t` under
 //! `rocm`, its own `VkQueue` with its own command-buffer ring and timeline under `vulkan`.
 //! It is a real separate engine on both, and that is worth what the Vulkan port paid for it:
-//! increment 1 ran every stream on one queue and hid nothing at all (docs/VULKAN.md,
+//! increment 1 ran every stream on one queue and hid nothing at all (docs/investigations/vulkan-port.md,
 //! "Increment 2: measured").
 //!
 //! The "96% of fetch hidden on ROCm, 97% on Vulkan" that used to be claimed here came from a
@@ -32,11 +32,11 @@
 //! ## What bounds it
 //!
 //! The demand fetch runs at ~10 GB/s and the drive delivers 7.7 GB/s at QD1 rising to
-//! ~13 GB/s at QD4 under the engine's own load (docs/probes/fetch_batch.hip), so a layer's
+//! ~13 GB/s at QD4 under the engine's own load (docs/measurement/probes/fetch_batch.hip), so a layer's
 //! batch is close to what its queue depth can buy. What is NOT close is the duty cycle: the
 //! ring only has work between a layer's routing and its MoE launch, so the drive idles
 //! ~35% of every token. Nothing here can fix that — a read cannot be issued before the
-//! router names it. See docs/ARCHITECTURE.md §4.
+//! router names it. See docs/reference/architecture.md §4.
 
 use crate::backend::{Stream, Timeline};
 use crate::fetch::stream::Streamer;
@@ -66,7 +66,7 @@ unsafe impl Send for ReadSpec {}
 /// landed. Nothing awaited it — `gpu.rs` took the vec and dropped it — since the ticketed
 /// dataflow moved the dependency onto the device. It cost a `hipLaunchHostFunc` per read
 /// INSIDE the `io_wait` clock (7.2 us of enqueue each, 4% of the fetch stream's throughput;
-/// docs/probes/fetch_stream_ops.hip), and worse, it made the teardown path look correct
+/// docs/measurement/probes/fetch_stream_ops.hip), and worse, it made the teardown path look correct
 /// while releasing nothing that anyone was waiting on.
 struct ReapJob {
     reads: Vec<ReadSpec>,

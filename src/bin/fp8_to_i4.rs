@@ -2,7 +2,7 @@
 //! checkpoint, replacing the `fp8 → vq3 → int4` chain `bin/vq3_to_i4` produces.
 //!
 //! `vq3_to_i4` re-quantizes the already-lossy 3-bit `.vq3`, so by construction the
-//! int4 set cannot be better than the vq3 it came from (benchmarks.md, "int4
+//! int4 set cannot be better than the vq3 it came from (docs/measurement/benchmarks.md, "int4
 //! provenance"). This reads the fp8 e4m3 block-scaled experts, dequantizes to f32,
 //! and runs the SAME `quant_i4` into the SAME on-disk layout — one quantization step
 //! instead of two.
@@ -197,7 +197,7 @@ fn main() -> Result<()> {
     }
     .stamp(&art)?;
     // The merge above only fires against a PRIOR stamp, and a stamp is one JSON field that
-    // can go missing (this artifact's did — docs/INT4.md §Reproduction). Converting a
+    // can go missing (this artifact's did — docs/investigations/int4-scales.md §Reproduction). Converting a
     // subrange into an unstamped set then writes a claim NARROWER than the `.i4` on disk,
     // which reads as "only these layers are fp8-derived" and is worse than no claim at all.
     // Cost 2026-07-31: a --from 78 run stamped [78,79] over a full set and

@@ -18,7 +18,7 @@
 //!   is both a host and a device address; under Vulkan they are unrelated. That asymmetry
 //!   is NOT hidden here — it cannot be. `device.rs`'s `VmmBuf` hands out both bases and
 //!   `pin.rs` picks per consumer (descriptors take the device base, the io_uring DMA
-//!   target takes the host base). See docs/VULKAN.md, "Host pointer != device address".
+//!   target takes the host base). See docs/investigations/vulkan-port.md, "Host pointer != device address".
 //!
 //! # What is NOT equal across the seam
 //!
@@ -45,7 +45,7 @@
 //!    the combination is reachable; if a Vulkan run is ever expected to carry one, this
 //!    belongs in `validate_backend` instead.
 //! 2. **The MoE kernels are ~2.1x slower than the HIP originals**, which is now the whole of
-//!    the throughput gap (measured per-phase; docs/VULKAN.md, "Increment 2: measured"). A
+//!    the throughput gap (measured per-phase; docs/investigations/vulkan-port.md, "Increment 2: measured"). A
 //!    Vulkan run's tok/s is not a statement about the engine's design, and after
 //!    increment 2 it is not a statement about its scheduling either.
 //! 3. **A `Stream` here NAMES a queue rather than owning one.** `Stream::compute()` and
@@ -58,7 +58,7 @@
 #[cfg(all(feature = "rocm", feature = "vulkan"))]
 compile_error!(
     "features `rocm` and `vulkan` are mutually exclusive: one compute backend per build, \
-     selected at build time (docs/VULKAN.md, \"Backend selection\"). Pick one."
+     selected at build time (docs/investigations/vulkan-port.md, \"Backend selection\"). Pick one."
 );
 
 // NEITHER feature is a legal build — `cargo test` runs the backend-independent half of the

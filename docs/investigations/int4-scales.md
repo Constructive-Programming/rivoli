@@ -1,3 +1,8 @@
+---
+status: closed-shipped
+verdict: Why int4 was unusable and how group-128 scales fixed it: PPL 73.43 → 5.120, making int4 the best-quality mode. RESOLVED.
+---
+
 # int4: why `--mode int4` was unusable, and the fix
 
 **Status: RESOLVED, 2026-07-27.** The cause was a *format* choice, not a bug — one symmetric
@@ -65,7 +70,7 @@ rivoli <artifact> --ppl tests/ppl-corpus.txt --ppl-out out.nll \
 
 ## 1. Read this first: the degeneration gate is not a quality metric
 
-`benchmarks.md` gates cells on the **distinct-token ratio** of a completion — "degenerate
+`docs/measurement/benchmarks.md` gates cells on the **distinct-token ratio** of a completion — "degenerate
 greedy output = a severe bug, disqualified from ranking". That gate is not measuring model
 quality, and this block shows it inverting.
 
@@ -232,7 +237,7 @@ zeroed). The old `.i4` was not better designed; it was pre-conditioned upstream.
 **But which upstream property did it?** Two candidates, and they are not distinguished here:
 (a) `.vq3`'s scale per **64** weights, or (b) `quant_vq`'s **least-squares scale refit**, which
 is MMSE-like and shrinks by `1 − relL2²` — measured 0.9766, and the mechanism this repo has
-actually evidenced (`bin/i4_audit`'s `VQ_GAIN`, benchmarks.md). MMSE shrinkage biting harder in
+actually evidenced (`bin/i4_audit`'s `VQ_GAIN`, docs/measurement/benchmarks.md). MMSE shrinkage biting harder in
 the tail than at the median would drop `amax/median` 7.2 → 6.8 with **no appeal to group size
 at all**. This is load-bearing: if the benefit came from (b), then group-wise int4 *without* an
 MMSE/LS scale fit will not reproduce it, and 365 GB gets rewritten on the wrong half of the
@@ -294,7 +299,7 @@ one — that would be an importer, not a re-derivation.
 | `src/quant.rs` | `i4_row_bytes`, `quant_i4`, `dequant_i4`, `matvec_i4`, `i4_proj_bytes`, `i4_expert_bytes`, `i4_expert_stride`, `i4_slot_offsets` all encode per-row layout. |
 | `tests/artifact.rs` | asserts on-disk bytes equal `quant_i4`'s output; rewritten with it. |
 | `src/bin/i4_audit.rs` | every mode slices via `off[k*2+1]`. |
-| `MODES.md` | group scales grow bytes/expert, moving the **18.9 MB/expert** figure — which sets pool slots and hit rate, i.e. the whole int4-vs-int3-vq residency tradeoff. |
+| `docs/reference/modes.md` | group scales grow bytes/expert, moving the **18.9 MB/expert** figure — which sets pool slots and hit rate, i.e. the whole int4-vs-int3-vq residency tradeoff. |
 
 **Acceptance gate.** `--mode int4` must reach PPL within ~10% of int3-vq's 5.28 on
 `tests/ppl-corpus.txt` at `--max-mem 100`, and `bin/i4_audit`'s `>50%-zero` row count for
@@ -308,7 +313,7 @@ mode should be removed rather than shipped.
 - **α** — measured in weight space, never tested end-to-end. Superseded; do not spend on it.
 - **Group-wise int4** — the actual recommendation, untested here.
 - **H's distinct-ratio** — not run. `followup.sh` ran hybrid PPL-only. Not backfilled because
-  MODES.md makes hybrid's free-running numbers the least interpretable of the set (its
+  docs/reference/modes.md makes hybrid's free-running numbers the least interpretable of the set (its
   numerics are a function of cache state).
 - **P and M1 distinct** — not run; both are bit-identical to A0, so a generation pass would
   reproduce A0's text exactly.

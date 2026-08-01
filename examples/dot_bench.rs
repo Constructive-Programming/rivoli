@@ -5,9 +5,9 @@
 //! structure); fp8 at i_dim≥4096 dispatches to split-K (its live behaviour). Finding:
 //! int4 decodes ~1.8× faster than vq3/fp8 — the all-int4 decode-bench slowdown was
 //! residency (bigger experts → fewer slots → bubbles), not compute.
-//! A second section adds the two `docs/PERF.md` per-kernel targets (o_proj, lm_head) at
+//! A second section adds the two `docs/measurement/perf-roadmap.md` per-kernel targets (o_proj, lm_head) at
 //! their real engine shapes in GB/s. The MoE rows above are untouched, so numbers already
-//! recorded in benchmarks.md stay comparable.
+//! recorded in docs/measurement/benchmarks.md stay comparable.
 //! Run: cargo run --release --features rocm --example dot_bench
 #![cfg(feature = "rocm")]
 #![allow(clippy::expect_used)]
@@ -30,7 +30,7 @@ impl Rng {
         // `run` rows: all-negative weights and inputs make every product positive, so
         // the i4 oracle check below never exercises cancellation, and the VQ codebook
         // indices come from half the distribution. The MoE rows recorded in
-        // benchmarks.md predate this fix and are NOT comparable to rows measured after.
+        // docs/measurement/benchmarks.md predate this fix and are NOT comparable to rows measured after.
         ((self.0 >> 32) as f32 / u32::MAX as f32) * 2.0 - 1.0
     }
 }
@@ -61,7 +61,7 @@ fn f32v(b: &[u8]) -> Vec<f32> {
 }
 
 /// FNV-1a over a kernel's raw output bytes — the only instrument here that separates
-/// "bit-identical" from "within tolerance". See benchmarks.md, "A fingerprint is the only
+/// "bit-identical" from "within tolerance". See docs/measurement/benchmarks.md, "A fingerprint is the only
 /// instrument that shows bit-identity", including why the inputs below must VARY.
 fn fnv(b: &[u8]) -> u64 {
     b.iter()
@@ -331,7 +331,7 @@ fn main() {
         run("gate/up", 2048, 6144); // hidden reduction
         run("down", 6144, 2048); // inter reduction
     }
-    // The two per-kernel targets in docs/PERF.md, at their real engine shapes.
+    // The two per-kernel targets in docs/measurement/perf-roadmap.md, at their real engine shapes.
     if on("gemv") {
         println!("\nRoute/tail GEMV bandwidth (real shapes, 256 GB/s peak):");
         run_fp8("o_proj", 6144, 16384); // ~half of `route`; split-K path

@@ -1,3 +1,8 @@
+---
+status: closed-negative
+verdict: top-m routing: RETIRED 2026-07-30. Cost +3.63% PPL on int3-vq and +12.7% on int4 against a ~1% bar, and made every cache change an output change.
+---
+
 # rivoli — `top-m`: cache-conditional MoE routing (arXiv:2412.00099)
 
 Status: **REMOVED FROM THE ENGINE 2026-07-30.** `--cache-policy top-m`, `--route-j`,
@@ -121,7 +126,7 @@ boolean, and the behaviour is the paper exactly.
 >
 > `bin/fp8_to_i4` now derives `.i4` from the original fp8 directly, and group-128 scales
 > replaced the per-row ones: **int4 PPL 5.120, hybrid 5.189, int3-vq 5.275**
-> (`docs/INT4.md` §10). int4 is now the *most* faithful of the three, not the least.
+> (`docs/investigations/int4-scales.md` §10). int4 is now the *most* faithful of the three, not the least.
 >
 > So the argument below — that promoting the sacred top-J into int4 would be "precisely
 > inverted", putting the most important experts in the least faithful format — **no longer
@@ -154,7 +159,7 @@ replace it rather than layer on top of it:
   > **REVERSED 2026-07-27, and the original draft was right after all.** `bin/vq3_to_i4`
   > is deleted; `.i4` comes from `bin/fp8_to_i4` (chain fp8 → int4, no vq3 leg) and carries
   > group-128 scales. int4 is now the best-quality mode in the engine — **PPL 5.120 vs
-  > int3-vq's 5.275** (`docs/INT4.md` §10), re-measured 5.154898 vs 5.222720 on 2026-07-31.
+  > int3-vq's 5.275** (`docs/investigations/int4-scales.md` §10), re-measured 5.154898 vs 5.222720 on 2026-07-31.
   > Promoting to int4 buys speed AND quality now; what it costs is residency, since the
   > int4 slot is 31% larger. The historical reasoning is kept below because what it
   > eliminated still matters.
@@ -336,7 +341,7 @@ worth adding if a writeup needs it, but `swap%` is what you tune (J, M) against.
   where a frequency counter only ratchets up.
 - **Quality regression is silent.** A cache-aware run that degenerates into repetition
   routes to the same few experts, so it shows *higher* hit rate and *faster* tok/s. This
-  is precisely the confound documented in MODES.md that already invalidated a hot_pct
+  is precisely the confound documented in docs/reference/modes.md that already invalidated a hot_pct
   sweep. **Never rank (J, M) by free-running decode tok/s.** Perplexity on fixed text
   for quality; the replay sim or a fixed forced-token bench for residency.
 - **Interaction with the router bias.** We rank by `sigmoid + bias`, where the bias is
@@ -359,7 +364,7 @@ decision for the whole program.
   (This bar replaces an earlier "miss reduction ≥20pp", which was a spec bug: our baseline
   miss rate is ~19–24%, so a 20 *percentage-point* reduction was at or past the arithmetic
   maximum. Absolute hit pp is also directly comparable to the hit% column in
-  `benchmarks.md`.) Report **both** numbers for every grid cell — absolute pp on hit, and
+  `docs/measurement/benchmarks.md`.) Report **both** numbers for every grid cell — absolute pp on hit, and
   the relative % of misses removed — so the result stays comparable to the paper's
   ">50% cache-miss reduction" even though the relative figure is not the bar.
   This grid is a **screen for whether to build**, not final acceptance; the perplexity,
@@ -370,7 +375,7 @@ decision for the whole program.
 - Hybrid: the rank-driven tier rule beats the frequency threshold it replaces on hit%
   and `moe-gpu` at a matched budget, and the resident int4/int3-vq mix is stable rather
   than drifting to one format.
-- MODES.md gains the policy and the honest quality trade; this is the first policy whose
+- docs/reference/modes.md gains the policy and the honest quality trade; this is the first policy whose
   choice is not output-neutral, and that has to be documented where users pick it.
 
 **If these are not met, CACHE_PILOT comes out too** — the prediction, the speculative
@@ -378,7 +383,7 @@ loader, the eviction guard, and any ring added for it. There is no fallback posi
 where the prefetcher stays because it is already written. That is precisely how the
 last prefetch survived until `b372cd4`. What survives a negative result is the
 measurements: the (J, M) grid, the perplexity sweep, and the LOOKA recall numbers, all
-in `benchmarks.md`.
+in `docs/measurement/benchmarks.md`.
 
 ---
 
@@ -386,7 +391,7 @@ in `benchmarks.md`.
 
 `--cache-policy top-m`, `--route-j`/`--route-m`, `RouteAdvice`, `route_into`'s substitution
 and the `swap%` counter are deleted (~180 refs / 16 files). What replaced it: the LOOKA
-hint layer (docs/CACHE_PILOT.md), which steers **eviction** instead of **selection**.
+hint layer (docs/investigations/cross-layer-prefetch.md), which steers **eviction** instead of **selection**.
 
 **Why it went.** Measured cost was +3.63% perplexity on int3-vq and an outright fail on int4
 at +12.7%, against an acceptance bar of ~1%. But the deciding argument is structural, not

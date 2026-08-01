@@ -19,7 +19,7 @@
 //! `crate::memory::device::` reads identically either way; the Vulkan half lives in
 //! `vktier` and differs in exactly one respect, which is the reason it is not a
 //! mechanical transliteration: a host pointer and a device address are two unrelated
-//! numbers there (docs/VULKAN.md, "Host pointer != device address").
+//! numbers there (docs/investigations/vulkan-port.md, "Host pointer != device address").
 
 /// The bump cursor both backends' `DeviceTier::place` runs on — 256-byte aligned
 /// offsets, `len` rounded up to `pad`, OOM refused rather than wrapped.
@@ -393,7 +393,7 @@ mod tier {
         /// launch, plus the end-of-layer [`crate::backend::hip::device_sync`] fencing slot
         /// reuse. No CPU store fence is involved on this path.
         ///
-        /// Verified CPU->GPU coherent on this APU (docs/probes/vmm_probe.cpp, incl.
+        /// Verified CPU->GPU coherent on this APU (docs/measurement/probes/vmm_probe.cpp, incl.
         /// `pread`). NOT a HIP contract for arbitrary hardware: a port off gfx1151,
         /// or a fill from a background HIP thread, must re-verify or insert an
         /// explicit fence.
@@ -404,7 +404,7 @@ mod tier {
         /// The HOST base, for symmetry with the Vulkan `VmmBuf` — under HIP unified
         /// addressing it is the SAME NUMBER as [`VmmBuf::ptr_mut`], and the whole point of
         /// spelling it separately is that `pin.rs` cannot then rely on that coincidence.
-        /// See docs/VULKAN.md, "Host pointer != device address"; the ordering rules for
+        /// See docs/investigations/vulkan-port.md, "Host pointer != device address"; the ordering rules for
         /// filling through it are on `ptr_mut` above.
         pub fn host_mut(&mut self) -> *mut u8 {
             self.ptr
@@ -663,7 +663,7 @@ mod vktier {
     /// Where the HIP `VmmBuf` hands out ONE pointer that `pin.rs` uses simultaneously as
     /// the io_uring O_DIRECT DMA target and as the base for every expert descriptor's
     /// six device pointers (`ArenaPool::ptr`, `src/memory/pin.rs`), those are two numbers here
-    /// and this type must hand them out separately — see docs/VULKAN.md, "Host pointer
+    /// and this type must hand them out separately — see docs/investigations/vulkan-port.md, "Host pointer
     /// != device address". [`VmmBuf::ptr`] is the device base, for descriptor
     /// arithmetic, [`VmmBuf::host_mut`] is the DMA target, and callers must say which
     /// one they mean.
@@ -736,7 +736,7 @@ mod vktier {
         }
 
         /// The device base and the host base are DIFFERENT NUMBERS. This is the
-        /// central structural claim of the Vulkan port (docs/VULKAN.md, "Host pointer
+        /// central structural claim of the Vulkan port (docs/investigations/vulkan-port.md, "Host pointer
         /// != device address"), and the one a maintainer would erase by "simplifying"
         /// two accessors back into one — a regression that reads as garbage weights
         /// rather than a crash, because both values are plausible pointers.

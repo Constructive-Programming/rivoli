@@ -313,7 +313,7 @@ fn gemv_f32_matches_oracle() {
 /// and is computed once; the repeats add GPU work only. Worth it — this is the only
 /// empirical check on the most consequential unverifiable property in the backend,
 /// since synchronisation validation on this stack sees no compute hazard class at all
-/// (docs/probes/README.md).
+/// (docs/measurement/probes/README.md).
 #[test]
 fn chained_dispatch_respects_the_barrier() {
     let v = Validation::new();
@@ -377,7 +377,7 @@ fn chained_dispatch_respects_the_barrier() {
         // Launch k writes ping for even k and pong for odd k, so after STEPS launches
         // the result is in pong when STEPS is even. (Had this inverted first; the test
         // then failed identically with AND without the barrier, which is what caught
-        // it — see docs/probes/README.md, "A test built to fail needs its passing arm
+        // it — see docs/measurement/probes/README.md, "A test built to fail needs its passing arm
         // checked too".)
         let out = if STEPS.is_multiple_of(2) { &pong } else { &ping };
         assert_close(&want, &f32v(&read(out, n)), &format!("{STEPS}-step chain #{rep}"));
@@ -527,7 +527,7 @@ fn signal_resolve_is_idempotent_and_immediate() {
 //
 // These are the oracles for the CONCURRENCY structure rather than for arithmetic, and
 // they exist because the port's headline gate cannot see any of it: token IDs depend on
-// arithmetic, not on overlap, so a fully serialised backend passes it (docs/VULKAN.md).
+// arithmetic, not on overlap, so a fully serialised backend passes it (docs/investigations/vulkan-port.md).
 // ---------------------------------------------------------------------------
 
 /// A [`Signal`] armed on a queue covers work that was merely RECORDED, not only work
@@ -571,7 +571,7 @@ fn a_signal_covers_recorded_work_without_a_device_sync() {
 ///
 /// This is the pair the barrier review is about, and the one synchronisation validation on
 /// this stack **cannot see** — it reports transfer↔transfer only, so a clean run says
-/// nothing either way (docs/VULKAN.md, "Risks"). Execution order comes from the await;
+/// nothing either way (docs/investigations/vulkan-port.md, "Risks"). Execution order comes from the await;
 /// visibility comes from the barrier at the head of the reading queue's command buffer. A
 /// missing acquire barrier would show up here as stale bytes in `out`, and nowhere else.
 ///
@@ -771,7 +771,7 @@ fn an_unknown_stream_token_is_refused() {
 ///
 /// This is the one line in the backend that converts between the two bases —
 /// `place` writes through the HOST mapping and hands back a DEVICE address
-/// (`slab.ptr() as usize + off`) — and docs/VULKAN.md calls that split the biggest
+/// (`slab.ptr() as usize + off`) — and docs/investigations/vulkan-port.md calls that split the biggest
 /// structural difference in the port. The unit test in device.rs proves only the
 /// host-side arithmetic: it reads back through the host mapping, so a base swap, a
 /// sign error, or an offset that does not track between the two mappings would pass
@@ -2581,7 +2581,7 @@ fn mla_absorb_fp8_matches_the_host_oracle() {
 // attn.hip: MLA flash attention.
 //
 // THE ORACLE SPLITS AT THE `exp` BOUNDARY, and that is a decision recorded in
-// docs/VULKAN.md before this code was written. Everything upstream of the first `exp` is
+// docs/investigations/vulkan-port.md before this code was written. Everything upstream of the first `exp` is
 // ordinary arithmetic and gets BIT-EXACT treatment; everything downstream cannot, because
 // Rust's `exp` and GLSL's `exp` are different functions and no care closes that. Since a
 // tolerance is categorically blind to reordering (see `assert_bit_identical`), accepting
@@ -3138,7 +3138,7 @@ fn vq_set(idxrow: &mut [u8], t: usize, idx: usize) {
 }
 
 /// `moe.hip::siluf` — a DIVIDE, not `math::silu`'s reciprocal-then-multiply. The two are
-/// not bit-identical; see docs/VULKAN.md.
+/// not bit-identical; see docs/investigations/vulkan-port.md.
 fn siluf(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
@@ -3720,7 +3720,7 @@ fn flag_nonfinite_records_the_first_tag_only() {
 /// would fail any other test in this file, because no other test calls them. So the
 /// property under test is "refuses", and it is checked directly.
 ///
-/// `Config::validate` is what a USER hits first (docs/VULKAN.md: a Vulkan build rejects
+/// `Config::validate` is what a USER hits first (docs/investigations/vulkan-port.md: a Vulkan build rejects
 /// `--attn dsa|misa` and `--mode int4|hybrid` at startup). These are the backstop for a
 /// path that reaches a kernel without passing that gate.
 ///

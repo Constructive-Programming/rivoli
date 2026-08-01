@@ -1,3 +1,8 @@
+---
+status: closed-negative
+verdict: Hadamard/QuIP rotation for int3-vq: CLOSED 2026-08-01. A per-layer codebook recovers 0.09% against a 2% bar, so there is nothing to homogenise. int3-vq is rate-limited.
+---
+
 # rivoli — ROTATION: incoherence processing for the int3-vq codebook
 
 Status: **CLOSED NEGATIVE 2026-08-01.** Both arguments for rotation are measured and both
@@ -42,7 +47,7 @@ These need different measurements, and only the first has been done.
 
 ## What the outlier data already says — argument 1 is weak here
 
-Measured, on the real weights (`benchmarks.md`, `docs/INT4.md` §, per-row, fp8):
+Measured, on the real weights (`docs/measurement/benchmarks.md`, `docs/investigations/int4-scales.md` §, per-row, fp8):
 
 | statistic | measured | a perfect Gaussian row of 6144 would give |
 |---|--:|--:|

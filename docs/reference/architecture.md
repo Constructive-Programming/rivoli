@@ -1,3 +1,8 @@
+---
+status: live
+verdict: The engine as it is. The one doc meant to be read whole; §8b is the INV registry, enforced by tests/invariants.rs.
+---
+
 # rivoli — architecture
 
 A single-node decode engine for the GLM-5.2 MoE model (78 layers, 256 routed experts,
@@ -150,7 +155,7 @@ rate or a smaller expert format — not better timing.
 
 ### What the drive actually does, and why the fetch cannot go faster (2026-08-01)
 
-Measured with `docs/probes/fetch_batch.hip`, which reproduces the engine's exact shape —
+Measured with `docs/measurement/probes/fetch_batch.hip`, which reproduces the engine's exact shape —
 `hipHostMalloc` bounce buffers, submit-*m*-drain-all-*m* batches, random 15.3 MB reads
 across the 75 layer files, and a GPU kept busy streaming LPDDR5 beside it:
 
@@ -179,7 +184,7 @@ MoE launch, so the drive is idle ~35% of every token (18.3 s of NVMe in a 28.3 s
 Nothing inside the fetch path can fix that: a read cannot be issued before the router names
 the expert, and the router cannot run before that layer's attention. Filling it means
 predicting the routing one layer ahead — which is speculation, and is the one lever left.
-The ticket gate (§8b, INV-4/INV-6) is what makes such a read safe to issue; `docs/CACHE_PILOT.md`
+The ticket gate (§8b, INV-4/INV-6) is what makes such a read safe to issue; `docs/investigations/cross-layer-prefetch.md`
 records what the last attempt at predicting cost and bought.
 
 ---
@@ -395,10 +400,10 @@ it is enforced structurally and covered by a batch-protocol stress test.
   `TOPK_BLOCK`/`TOPK_BINS`) — it replaced a host score-D2H + CPU top-k, cutting −9.4 ms/tok
   with a bit-identical selection (so the whole DSA path now stays on device, no per-layer
   round-trip). Present only if the artifact carries indexer weights (`--attn auto` detects
-  them). See `docs/NPU.md` for the measured offload analysis.
+  them). See `docs/investigations/npu-offload.md` for the measured offload analysis.
 
 Route is context-independent at short context (the projections dominate) and grows with
-context (the attend scan). It has been through an ISA-driven tuning pass (`docs/PERF.md`).
+context (the attend scan). It has been through an ISA-driven tuning pass (`docs/measurement/perf-roadmap.md`).
 
 ---
 
@@ -542,8 +547,8 @@ fp16 (L1-resident so the MoE gather is cheap).
 `n_experts` is the shared expert. Headers are validated on open; a dim/version mismatch
 fails loud. `convert` produces the vq3 artifact; `fp8_to_i4` derives the `.i4` twins
 directly from the fp8 source (`vq3_to_i4`, the retired lossy chain, is DELETED — see
-docs/INT4.md; artifacts it produced are still identifiable by their `i4_source` stamp);
-`add_indexer` writes the side indexer file (see `benchmarks.md` for int4 provenance).
+docs/investigations/int4-scales.md; artifacts it produced are still identifiable by their `i4_source` stamp);
+`add_indexer` writes the side indexer file (see `docs/measurement/benchmarks.md` for int4 provenance).
 
 ## 11. Module map
 
@@ -568,7 +573,7 @@ module root (`src/<group>.rs`) over a directory, so the tree mirrors the section
   (established by increment 1 vs 2, not by the retracted 96/97% figures — §3), ~1.9x slower
   end to end, all of it MoE kernel throughput; its
   `.comp` shaders are SINGLE-ROW, so six launchers refuse `nrow > 1` and speculative decode
-  is ROCm-only (§13). See `docs/VULKAN.md`.
+  is ROCm-only (§13). See `docs/investigations/vulkan-port.md`.
 - **Top level** — `gpu` (the async forward pass, single- or two-row: `MAXROW`, §13), `math`,
   `attn`/`indexer` (attention modes + DSA), `telemetry` (the always-on PROFILE summary),
   `watchdog`.
@@ -578,7 +583,7 @@ module root (`src/<group>.rs`) over a directory, so the tree mirrors the section
 - **`--pred-probe`**, behind `--features pred-probe`, is the same idea without its own
   module — it has to run inside the layer loop, so it is `#[cfg]` at five sites in `gpu.rs`
   rather than a boundary. Measures the pre-attention router's recall (§3's prefetch
-  question). The flag is what a `benchmarks.md` entry can record; the feature is what keeps
+  question). The flag is what a `docs/measurement/benchmarks.md` entry can record; the feature is what keeps
   a blocking per-layer D2H out of a shipped binary.
 - `kernels/*.hip` — moe, mla, attn, linalg, indexer, fwd, async, vmm (HIP/rocm).
   `kernels/vk/*.comp` → SPIR-V via the `build.rs` vulkan arm (the second backend).
@@ -594,8 +599,8 @@ module root (`src/<group>.rs`) over a directory, so the tree mirrors the section
 > path-derived check that degrades to "nothing to verify" is a passing test that checks
 > nothing.
 
-See `docs/PERF.md` for the performance roadmap, `MODES.md` for the format/policy matrix, and
-`benchmarks.md` for measured throughput and quality.
+See `docs/measurement/perf-roadmap.md` for the performance roadmap, `docs/reference/modes.md` for the format/policy matrix, and
+`docs/measurement/benchmarks.md` for measured throughput and quality.
 
 ---
 
@@ -865,7 +870,7 @@ figure of merit.
 
 **A pre-implementation estimate of 1.27–1.33× was wrong** because it applied the union
 factor to FETCH and only the row-batching factor to COMPUTE. Each union expert needs its own
-weight read. That single term was the whole error; `benchmarks.md` has the table.
+weight read. That single term was the whole error; `docs/measurement/benchmarks.md` has the table.
 
 ### Refused rather than half-supported
 

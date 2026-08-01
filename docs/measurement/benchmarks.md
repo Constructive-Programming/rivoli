@@ -1,8 +1,13 @@
+---
+status: data
+verdict: Append-only measurements. Never read whole — grep for the config. The top table predates the .i4 rebuild and says so.
+---
+
 # Benchmarks
 
 > ## STATE — read this, then grep for your config
 >
-> **Append-only measurement log, 105 KB. Do not read whole.** `grep -n "^## " benchmarks.md`
+> **Append-only measurement log, 105 KB. Do not read whole.** `grep -n "^## " docs/measurement/benchmarks.md`
 > for the map. Newest results are at the BOTTOM.
 >
 > - **Quality ladder (current):** int4 **5.120** > hybrid **5.189** > int3-vq **5.275**.
@@ -31,10 +36,10 @@ Binary: release + `--features rocm`. GPU sole-tenant (k3s stopped).
 > and hybrid row below was produced with the *old* per-row-scaled `.i4` set and does not
 > describe the current artifact. The number this banner used to quote — "`--mode int4` now
 > measures PPL 73.43" — was the **pre-fix** figure and stopped being true the same day it
-> was written: `docs/INT4.md` is headed *"Status: RESOLVED, 2026-07-27"*, group-128 scales
+> was written: `docs/investigations/int4-scales.md` is headed *"Status: RESOLVED, 2026-07-27"*, group-128 scales
 > took int4 from **73.43 → 5.120** and hybrid from 11.55 → 5.189, and int4 became the
 > best-quality mode in the engine. Re-measured 2026-07-31 on the current artifact:
-> **int4 5.154898 against int3-vq's 5.222720**. Read `docs/INT4.md` §0 and §10, and the
+> **int4 5.154898 against int3-vq's 5.222720**. Read `docs/investigations/int4-scales.md` §0 and §10, and the
 > `--mode int4` section near the end of this file, before quoting any int4 number from
 > anywhere above.
 
@@ -45,7 +50,7 @@ passed. **Do not rank on this metric, and do not treat a low score as a bug repo
 Measured 2026-07-27: across a branch-gain sweep PPL tripled (73 → 216) while distinct-ratio
 doubled (0.126 → 0.324) — monotone in OPPOSITE directions. It detects repetition, one
 failure mode among many, and repetition is suppressible by changes that damage the model.
-Rank on teacher-forced PPL; use this only to flag a run unreadable. See `docs/INT4.md` §1.
+Rank on teacher-forced PPL; use this only to flag a run unreadable. See `docs/investigations/int4-scales.md` §1.
 
 > **This gate has now misled three separate investigations, so it is worth stating what it
 > cannot do.** `distinct` and `longest repeated block` fire IDENTICALLY on (a) a clean
@@ -53,7 +58,7 @@ Rank on teacher-forced PPL; use this only to flag a run unreadable. See `docs/IN
 > mid-phrase — and (c) legitimate prose that restates a paragraph on purpose. The three
 > demand completely different responses and the metric cannot tell them apart:
 >
-> - §10 of `docs/INT4.md`: hybrid scored the WORST distinct-ratio of the three modes
+> - §10 of `docs/investigations/int4-scales.md`: hybrid scored the WORST distinct-ratio of the three modes
 >   (0.138) with the second-best PPL. A distinct-ratio gate would have rejected the best
 >   config in the engine.
 > - 2026-07-31: `distinct 0.193 / longest repeated block 77` on int3-vq was read as
@@ -195,7 +200,7 @@ the hot loop is byte-for-byte unchanged, so no shipped model's numerics moved. P
 margins: `mla_value` block=2 at 12318×, `gemv_fp8` block=2 and block=1 green.
 
 **TWO TWINS ARE KNOWN-BROKEN AND DELIBERATELY LEFT.** Both are recorded in
-`kernels/common.hpp` at the fix site and in docs/PERF.md #4:
+`kernels/common.hpp` at the fix site and in docs/measurement/perf-roadmap.md #4:
 
 - **`kernels/vk/fp8.glsl::fp8_dot_strided` has the identical bug** — same loop, same
   unconditional `n4 = i_dim >> 2`, same one-scale-per-quad. **And `tests/vk.rs`'s
@@ -240,12 +245,12 @@ slots). Fix: each policy keeps a per-batch `pinned` set (`begin_batch` clears it
 All three arc cells and int4/lru now run clean (above).
 
 ### int4 provenance — MEASURED, and it inverts hybrid's stated premise
-> **SUPERSEDED 2026-07-27 — see `docs/INT4.md`.** Two claims below are now measured false:
+> **SUPERSEDED 2026-07-27 — see `docs/investigations/int4-scales.md`.** Two claims below are now measured false:
 > that `.i4` "cannot be better than the vq3 it was derived from, by construction", and that the
 > deficit is "the arithmetic of double quantization". The set was rebuilt from fp8 and is
 > **strictly more accurate** — and **8× worse end to end** (PPL 73.43 vs 5.28). The real cause
 > is per-row scaling (one scale per 6144 weights). The gs64/`pack_i4` recommendation at the end
-> of this section turns out to be **right for the wrong reason**, and `docs/INT4.md` re-endorses
+> of this section turns out to be **right for the wrong reason**, and `docs/investigations/int4-scales.md` re-endorses
 > it on the correct one.
 
 These int4/hybrid numbers use `.i4` re-derived from **vq3** (itself a lossy 3-bit
@@ -268,7 +273,7 @@ arithmetic of double quantization, not a surprise — but it inverts the design 
 record for hybrid mode. Hybrid is described as putting the hot set in int4 to buy accuracy
 along with int4's ~1.8× compute. **In this artifact int4 has no accuracy to offer**: it is
 strictly a re-quantization of the vq3 set, so hybrid currently trades quality *away* for
-compute rather than buying quality with it. `docs/CACHE_ROUTE.md` carried the same inverted
+compute rather than buying quality with it. `docs/investigations/cache-conditional-routing.md` carried the same inverted
 claim ("int4 is both more accurate and ~1.8× faster") and has been corrected.
 
 Every int4 or hybrid quality number in this file must be read as *this artifact's* int4,
@@ -285,7 +290,7 @@ point, since the defect that deprecated it was per-row scaling and gs64 removes 
 Until then, `--mode int4` and `--mode hybrid` quality numbers are bounded above by vq3.
 
 ### `quant_i4`'s `amax/7` is loaded ~1.8× too wide — and that, not provenance, is int4's deficit
-> **SUPERSEDED 2026-07-27 — see `docs/INT4.md`.** The measurements below stand; the
+> **SUPERSEDED 2026-07-27 — see `docs/investigations/int4-scales.md`.** The measurements below stand; the
 > *recommendation* does not. Tuning α is tuning a constant inside a per-row scheme that is far
 > coarser than any current practice (group-wise at 32–128 is standard). **Do not implement α.**
 > The end-to-end test this section called for was run: `--mode int4` measures PPL 73.43 against
@@ -520,7 +525,7 @@ miss.
 
 **Relaxing the bar to the paper's own +0.1–3.0% band was considered and declined**, because
 it would have passed immediately and the ~1% figure was fixed before any data existed.
-Moving a threshold after seeing the result it fails is post-hoc. See `MODES.md`.
+Moving a threshold after seeing the result it fails is post-hoc. See `docs/reference/modes.md`.
 
 ### The engine and the simulator implement the same policy — including one forward prediction
 
@@ -664,7 +669,7 @@ Halo's 32 MB MALL serves; with 4 rotating copies the same kernel measures **45.6
 the engine holds 78 distinct `kv_b`. **The A/B above is unaffected** — both arms replayed
 the same single weight, so the −49.3% delta stands and is what this table was for. What is
 wrong is using 36.50 µs as an absolute per-layer cost, which the `×78` projection below and
-docs/PERF.md both do. The same defect is present in every absolute µs figure in this
+docs/measurement/perf-roadmap.md both do. The same defect is present in every absolute µs figure in this
 section; only the deltas are safe.
 
 Arms are non-overlapping for every row. o_proj is the weakest and was pooled over two
@@ -853,7 +858,7 @@ build; the cost of not staging it is unbounded and invisible.
 
 ### ~~Open question: half of `tail` is in none of its kernels~~ — ANSWERED
 
-> **Closed by the CLASS axis (docs/PERF.md).** The unattributed time is decode-loop HOST
+> **Closed by the CLASS axis (docs/measurement/perf-roadmap.md).** The unattributed time is decode-loop HOST
 > CPU, not a hidden kernel — measured at ~6 ms/tok of a total 6.2 ms host compute, itemised
 > as kernel launch, tokio poll, `submit_layer` and `route_into`. The candidate named below
 > (per-token launch/sync/readback overhead) was right. It is also DEMOTED by the same
@@ -983,7 +988,7 @@ load width and was never what the dead end tested.
 **That open question is now CLOSED — refuted.** `SPLITK_ROWS` tiling was implemented and
 swept 1/2/4/8; R=8 cuts x traffic 8× and is the **slowest** arm (+11%), R=2 the best at
 −1.4%, inside a noise band wider than the effect. The tiling was reverted. See
-docs/PERF.md follow-up #2 for the table. The load-width lever, meanwhile, paid where it
+docs/measurement/perf-roadmap.md follow-up #2 for the table. The load-width lever, meanwhile, paid where it
 was correctly aimed: `mla_absorb_fp8`'s single-byte weight load became a dword and the
 kernel went 35.9 → 25.7 µs. Two levers, one refuted and one confirmed, out of the same
 ISA pass.
@@ -1097,7 +1102,7 @@ Free-running greedy `tok/s` cannot rank modes on its own: a degenerate run route
 same few experts → inflated hit% → artificially *fast* (the earlier int4 rows posted the
 highest tok/s *because* they degenerated). Always gate on output quality first, then
 compare speed among survivors. For residency use `replay <trace> <n_slots> [--sweep]`; for
-pure per-format compute use `examples/dot_bench.rs`. See [MODES.md](MODES.md).
+pure per-format compute use `examples/dot_bench.rs`. See [docs/reference/modes.md](docs/reference/modes.md).
 
 *Generated 2026-07-26. Reproduce: `--mode <m> --cache-policy <p> -bench 512 --attn dense
 --max-mem 115 --prompt "<above>"`.*
@@ -1106,11 +1111,11 @@ pure per-format compute use `examples/dot_bench.rs`. See [MODES.md](MODES.md).
 
 ## DSA indexer round: `examples/indexer_bench`
 
-Instrument for the NPU-offload gates (docs/NPU.md M0/M1), gfx1151 sole tenant, 2026-07-26.
+Instrument for the NPU-offload gates (docs/investigations/npu-offload.md M0/M1), gfx1151 sole tenant, 2026-07-26.
 The rig itself is deleted (`77b5500:examples/indexer_bench.rs`) — superseded by the
 engine's in-engine indexer buckets, which refuted its GPU-span figure by 27%. Every row
 below stands as recorded; re-running them means restoring the file.
-Interpretation lives in [docs/NPU.md](docs/NPU.md); the rows and the methodology are here.
+Interpretation lives in [docs/investigations/npu-offload.md](docs/investigations/npu-offload.md); the rows and the methodology are here.
 `--attn dsa` dims from the manifest: index_n_heads 32, index_head_dim 128, index_topk 2048,
 and **21 FULL indexer layers** of 78 (`indexer_types` is 21 full / 57 shared, so a
 per-token figure is ×21, not ×78).
@@ -1197,7 +1202,7 @@ host time into a GPU-timeline number.
 | residual (wall − route − moe − indexer) | 25.4 | 26.4 |
 
 Interpretation, and the extrapolations built on these rows, live in
-[docs/NPU.md](docs/NPU.md) "In-engine confirmation" — not repeated here. Three methodology
+[docs/investigations/npu-offload.md](docs/investigations/npu-offload.md) "In-engine confirmation" — not repeated here. Three methodology
 points belong with the rows, though:
 
 - **`route` is flat, 156 → 158 ms, across a 2.1× context increase** — first direct evidence
@@ -1265,7 +1270,7 @@ disagrees with the earlier `m0_host` row by up to ~30% at some contexts while ma
 kernel is also single-workgroup, so its absolute cost is one CU's serial sweep; the
 LDS-contention hypothesis names a lever but occupancy is the larger structural bound.
 
-Interpretation and what it means for wiring: docs/NPU.md § "The device top-k, measured".
+Interpretation and what it means for wiring: docs/investigations/npu-offload.md § "The device top-k, measured".
 
 ### Device top-k WIRED: three-arm in-engine A/B, 2026-07-27
 
@@ -1416,7 +1421,7 @@ with one changing token is the most common real degeneration shape and neither c
 
 **The instrument that would have caught it was rejected on a misread.** Distinct-word ratio
 falls monotonically here (0.474 -> 0.244) and separates the healthy band (0.42-0.53) from
-the broken one (0.12-0.29) cleanly. It was excluded because docs/INT4.md records that a
+the broken one (0.12-0.29) cleanly. It was excluded because docs/investigations/int4-scales.md records that a
 distinct-token gate INVERTS — hybrid has the worst ratio and the second-best perplexity.
 That warning is about ranking *healthy* configs, where the ratio does not track quality.
 Generalising it to "never use distinct ratio" cost three rounds of device time. It is an
@@ -1480,7 +1485,7 @@ policies'. At 512 tokens the substitution looked free. It is not.
 | `hybrid` | 12/12 | 2.12-2.76 | 2.45 |
 | `int4` | **14/16** | 1.77-2.42 | 2.10 |
 
-int3-vq beats hybrid by 19% here, where docs/INT4.md records hybrid ahead (2.72 vs 2.62 at
+int3-vq beats hybrid by 19% here, where docs/investigations/int4-scales.md records hybrid ahead (2.72 vs 2.62 at
 `--max-mem 100`). Two things differ: the budget (115 GiB gives int3-vq's 15.34 MB experts
 ~6900 slots vs int4's 5274, so a larger pool favours the smaller format) and **the
 prompt** — those numbers were free-running on "The sky is blue because", where hybrid
@@ -1646,7 +1651,7 @@ attractors — not an attractor the sampler is stuck in.
 Root-caused 2026-07-31 as **model behaviour, not an engine fault**:
 
 - Teacher-forced PPL reproduces the recorded gate figure EXACTLY — 5.222720, mean NLL
-  1.653018 (docs/ARCHITECTURE.md "What gates this change"), six decimal places.
+  1.653018 (docs/reference/architecture.md "What gates this change"), six decimal places.
 - NLL is FLAT by position over 762 predicted tokens, in fact slightly improving
   (Pearson r = -0.105; bucket means 1.893 / 1.469 / 2.083 / 2.013 / 2.006 / 1.263 / 1.168 /
   1.329). A KV row-index, rope-position or attention-window bug climbs with position. This
@@ -1695,7 +1700,7 @@ Paired (`bin/ppl`): mean dNLL **−0.01307**, sd 0.5279, SE 0.01913, 95% CI
 **INCONCLUSIVE, and it must be reported that way.** The interval straddles zero and SE
 exceeds the 1%-PPL bar of 0.00995 nats, so this corpus cannot resolve the question at any
 point estimate — `bin/ppl` says so itself and asks for ~2021 tokens. int4 being ahead on
-PPL is consistent with docs/INT4.md §10's independent 5.120 vs 5.275434, but 762 tokens do
+PPL is consistent with docs/investigations/int4-scales.md §10's independent 5.120 vs 5.275434, but 762 tokens do
 not establish it here. `tests/ppl-corpus-5000.txt` exists and would settle it.
 
 Note `worse%` 57.3 with a NEGATIVE mean dNLL: int4 is individually worse on most tokens
@@ -1718,7 +1723,7 @@ Same prompt that corrupted under int3-vq ("What causes the seasons on Earth?"), 
 **The metrics cannot see this.** distinct 0.264 vs 0.279 is nothing, and `longest repeated
 block` is 77 for BOTH — for int3-vq it is corruption, for int4 it is the deliberate
 `**Corrected Version:**` restatement, which is legitimate prose. Third independent
-demonstration of docs/INT4.md §1, after §10's hybrid case and the 2026-07-31 root-cause:
+demonstration of docs/investigations/int4-scales.md §1, after §10's hybrid case and the 2026-07-31 root-cause:
 the degeneration gate does not measure quality, and here it ranks a coherent completion
 level with a broken one.
 
@@ -1845,7 +1850,7 @@ Chasing "can the disk fetches run fully concurrently with the rest of the system
 bracket against 18.3 s of `io_wait` — 89%. A zero-miss layer is 1585 µs, so all-resident
 compute is ~2 s of that 20.5 s.
 
-Drive characterised with `docs/probes/fetch_batch.hip`, which reproduces the engine's shape
+Drive characterised with `docs/measurement/probes/fetch_batch.hip`, which reproduces the engine's shape
 exactly (`hipHostMalloc` bounce buffers, submit-*m*-drain-all-*m*, random 15.3 MB O_DIRECT
 reads across the 75 layer files, GPU kept busy streaming LPDDR5):
 

@@ -14,7 +14,7 @@ benchmark/diagnostic override, not required setup.
 
 Full cross of mode x attention x cache-policy at `--max-mem 115`, bracketed
 44 -> 8 -> 4 -> 2 cells over 512 / 2048 / 4096 / 10000 tokens (~10 h). Details and the
-retraction below in **[benchmarks.md](benchmarks.md)**.
+retraction below in **[docs/measurement/benchmarks.md](docs/measurement/benchmarks.md)**.
 
 **Only the 512-token round is valid.** At 2048 tokens and beyond, free-running greedy
 decode degenerates into template loops **regardless of mode, attention or cache policy** —
@@ -29,11 +29,11 @@ Valid results, 512 tokens, `--max-mem 115`:
 | `hybrid` | 12/12 | 2.12-2.76 | 2.45 |
 | `int4` | 14/16 | 1.77-2.42 | 2.10 |
 
-That table predates the group-128 `.i4` rebuild (`docs/INT4.md`, RESOLVED 2026-07-27):
+That table predates the group-128 `.i4` rebuild (`docs/investigations/int4-scales.md`, RESOLVED 2026-07-27):
 its `int4` and `hybrid` rows were measured against the per-row-scaled set, and `int4` is
 now the best-QUALITY mode in the engine (PPL 5.120 against int3-vq's 5.275) while staying
 the slowest — its slot is 31% larger, so the same budget holds fewer experts. Rank quality
-on `docs/INT4.md` §10 and `benchmarks.md`, not on tok/s here.
+on `docs/investigations/int4-scales.md` §10 and `docs/measurement/benchmarks.md`, not on tok/s here.
 
 Two caveats on that table. `top-m` holds the top four slots (3.10-3.22) but substitutes
 ~5.5% of experts away from the true top-K, so its 85-86% hit rates are not comparable.
@@ -50,7 +50,7 @@ configuration that got *faster* with context. It was the one degenerating hardes
 verbatim tail cycle, the longest repeated block, and **structural repetition** (most-
 repeated line count + distinct-word ratio). The third exists because the first two both
 passed a run that was 329 repetitions of `**Memory Product.**` — the loop had a varying
-label, so no exact match was long enough to catch it. See [MODES.md](MODES.md) on why
+label, so no exact match was long enough to catch it. See [docs/reference/modes.md](docs/reference/modes.md) on why
 free-running `tok/s` cannot rank modes; a fixed forced-token harness is the fix and is not
 built yet.
 
@@ -77,7 +77,7 @@ fp8-e4m3 latent + f32 block scales + bf16 roped key, grown on device.
 format; `--cache-policy lru | 2q | arc | top-m` (default **2q**) picks the pool eviction
 policy. Hybrid keeps the frequently-reused ("hot") experts int4 for its ~1.8×
 faster compute and streams the rest as small cheap int3-vq slots, in one
-byte-arena pool whose hot/cold split floats with the workload. **[MODES.md](MODES.md)**
+byte-arena pool whose hot/cold split floats with the workload. **[docs/reference/modes.md](docs/reference/modes.md)**
 is the full story — the format tradeoffs, the cache policies, the interaction
 matrix, and (important) why free-running decode `tok/s` cannot rank modes.
 
@@ -85,7 +85,7 @@ matrix, and (important) why free-running decode `tok/s` cannot rank modes.
 perplexity (5.189 vs int3-vq's 5.275), while the matrix above measures `int3-vq` ~19%
 faster at a 115 GiB budget. Which one is right depends on whether you are spending your
 memory budget on quality or on slots, and the answer moves with `--max-mem`: at 100 GiB
-the ranking reported in [docs/INT4.md](docs/INT4.md) is the other way round.
+the ranking reported in [docs/investigations/int4-scales.md](docs/investigations/int4-scales.md) is the other way round.
 
 ## Build
 
@@ -103,7 +103,7 @@ fail to link.
 
 Optional features: `otlp` (export the decode as OTLP traces + metrics, opt-in at runtime
 via `OTEL_EXPORTER_OTLP_ENDPOINT`; set `RIVOLI_SPANS` to also emit a per-token/per-layer
-span timeline — see [docs/TRACES.md](docs/TRACES.md)); `trace` (expensive correctness probes
+span timeline — see [docs/measurement/traces.md](docs/measurement/traces.md)); `trace` (expensive correctness probes
 `--checksum-x`/`XSUM` + fine-grained per-op timing). The cheap per-token PROFILE
 summary is always on, no feature needed.
 
@@ -123,7 +123,7 @@ cargo run --release --bin add_indexer -- <out-dir> <indexer-stash.safetensors>
 
 The artifact directory holds `manifest.json`, `codebooks.f32`,
 `resident.safetensors`, one `L{ll}.vq3` per MoE layer (+ optional `L{ll}.i4`,
-`indexer.safetensors`), and the tokenizer. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+`indexer.safetensors`), and the tokenizer. See [docs/reference/architecture.md](docs/reference/architecture.md)
 for the on-disk layout and the module map.
 
 ## Run
@@ -146,7 +146,20 @@ default whenever the artifact carries the MTP head — **every mode carries one*
 **1.108×**; `0` disables it and costs you ~15%). The hybrid hot/cold split has no flag — it
 self-sizes with the byte-arena pool.
 `rivoli --help` lists every flag with its default and its legal values (`-bench` is
-accepted alongside `--bench`, so every command line recorded in benchmarks.md still runs).
+accepted alongside `--bench`, so every command line recorded in docs/measurement/benchmarks.md still runs).
+
+## Documentation
+
+Start at **[docs/00-orientation/TOUR.md](docs/00-orientation/TOUR.md)** — two pages, and it
+is enough to be useful. Then
+**[docs/00-orientation/INDEX.md](docs/00-orientation/INDEX.md)**, which lists every doc with
+a status and a one-line **verdict** so you can decide what *not* to read.
+
+| | |
+|---|---|
+| `docs/reference/` | true about the engine today — `architecture.md` is the one meant to be read whole |
+| `docs/measurement/` | how to measure, the roadmap, traces, and the append-only benchmark log |
+| `docs/investigations/` | questions asked, answered and closed. Read the verdict; open the file only to re-open the question |
 
 ## Layout
 
@@ -166,5 +179,5 @@ docs/           ARCHITECTURE.md, PERF.md (roadmap + the class-axis profile),
                 INT4.md, TRACES.md + grafana dashboard, GPU_TRACE.md; proposals:
                 VULKAN.md (second backend), NPU.md (DSA/MISA),
                 CACHE_ROUTE.md (top-m routing) + CACHE_PILOT.md (its prefetch)
-MODES.md        format-mode + cache-policy reference
+docs/reference/modes.md        format-mode + cache-policy reference
 ```

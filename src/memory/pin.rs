@@ -388,7 +388,7 @@ fn resident_bytes(
 
 /// Width of the trace-v2 candidate window: the top-W router candidates recorded per
 /// routing decision, on top of the `top_k` that actually ran. W bounds the largest M
-/// the offline (J, M) substitution grid in docs/CACHE_ROUTE.md can explore — an M
+/// the offline (J, M) substitution grid in docs/investigations/cache-conditional-routing.md can explore — an M
 /// wider than this cannot be evaluated from a captured trace without recapturing.
 /// 32 is 4× `top_k` (8) and an eighth of `n_experts` (256): far past any M where
 /// promoting a resident-but-lower-ranked expert is still defensible, and only ~380
@@ -444,7 +444,7 @@ struct ArenaPool {
     /// nothing there and changes no behaviour. Under Vulkan they are unrelated, and
     /// resolving both once here is what keeps [`ArenaPool::ptr`] and
     /// [`ArenaPool::host_ptr`] a single `add` each on the fetch path. See
-    /// docs/VULKAN.md, "Host pointer != device address".
+    /// docs/investigations/vulkan-port.md, "Host pointer != device address".
     host_base: *mut u8,
     arena: Arena,
     policy: Box<dyn HybridPolicy>,
@@ -630,7 +630,7 @@ impl<'a> Pin<'a> {
         mode: Mode,
     ) -> Result<Self> {
         // `i4` = the int4 placement path is needed (int4 mode, or the hybrid HOT tier +
-        // shared expert). int3-VQ uses neither. See MODES.md.
+        // shared expert). int3-VQ uses neither. See docs/reference/modes.md.
         let i4 = mode.uses_int4();
         // ponytail: no free-memory pre-check — the budget is the user's literal
         // request (--max-mem), so let the device allocation itself OOM/fail.
@@ -1077,7 +1077,7 @@ impl<'a> Pin<'a> {
             // only the RANK order, which the list already carries. Written anyway because
             // a capture is GPU-gated, sole-tenant and ~30 minutes, so these few bytes are
             // cheap now and unrecoverable later without another capture; and `route_kl`
-            // (docs/CACHE_ROUTE.md "Counters") is deferred, not cancelled, and needs the
+            // (docs/investigations/cache-conditional-routing.md "Counters") is deferred, not cancelled, and needs the
             // mass distribution.
             write!(w, " |").context("write trace")?;
             for &e in window {

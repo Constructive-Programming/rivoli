@@ -245,7 +245,7 @@ fn vulkan() {
 /// Greedy decode must be bit-reproducible, and those ops have an
 /// IMPLEMENTATION-DEFINED summation order. Every reduction here is a fixed
 /// `subgroupShuffleDown` halving ladder instead (kernels/vk/common.glsl::wave_sum,
-/// matching common.hpp). That rule was a comment in docs/VULKAN.md; this makes it a
+/// matching common.hpp). That rule was a comment in docs/investigations/vulkan-port.md; this makes it a
 /// build error, because a comment does not survive sixteen kernel ports.
 ///
 /// Skipped with a warning if `spirv-dis` is absent, like `spirv-val` above.
@@ -565,7 +565,7 @@ fn disassemble(spv: &str) -> Option<String> {
 /// This is STATIC module validation — it catches malformed SPIR-V, bad decorations,
 /// and capability/extension mismatches. It does NOT see synchronisation, descriptor,
 /// or buffer-device-address misuse; only the VK_LAYER_KHRONOS_validation runtime layer
-/// does, and that layer is a separate install (see docs/VULKAN.md "Risks").
+/// does, and that layer is a separate install (see docs/investigations/vulkan-port.md "Risks").
 ///
 /// `--target-env` IS LOAD-BEARING, and its absence was a real hole rather than an
 /// untidiness. Without it `spirv-val` applies only the UNIVERSAL SPIR-V 1.6 rules, and

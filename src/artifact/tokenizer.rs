@@ -57,7 +57,7 @@ impl Tokenizer {
     /// naturally, every one ran to its token limit. Forced to keep writing past the end
     /// of its answer it drifts into list scaffolding and then loops
     /// (`**Memory Product.**` x329) — which is what invalidated every matrix cell above
-    /// 2048 tokens. See benchmarks.md's retraction.
+    /// 2048 tokens. See docs/measurement/benchmarks.md's retraction.
     ///
     /// Built from token IDS rather than by encoding the literal template text, so it does
     /// not depend on the tokenizer choosing to match `[gMASK]` as a special token inside a

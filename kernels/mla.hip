@@ -17,7 +17,7 @@
 // columns are contiguous in kv_b, so the weight read is one `global_load_b32` = 128 B per
 // wave, exactly one cache line; the old one-column-per-thread form issued
 // `global_load_u8` = 32 B/wave, a QUARTER of a line, and that load width was the cost.
-// Measured 1.40× — docs/PERF.md #4.
+// Measured 1.40× — docs/measurement/perf-roadmap.md #4.
 //
 // BIT-IDENTICAL: each output still sums over `d` in ascending order with the same
 // expression, so no quality gate is needed. DO NOT "improve" this to the wave-per-row
@@ -46,7 +46,7 @@ __device__ __forceinline__ void mla_absorb_fp8_impl(
     // Newton-Raphson reciprocal inside the d-loop, worth 72.0 → 36.5 µs on its own.
     // The launcher rejects a non-power-of-two tile. Bit-identical: `row` is unsigned
     // and the column index non-negative, so the index is the same.
-    // Evidence in benchmarks.md, "Read the ISA before you book the device".
+    // Evidence in docs/measurement/benchmarks.md, "Read the ISA before you book the device".
     int bsh = blk_shift(block);
     size_t rbase = (size_t)head * (nope + vh);
     const float* qh_ptr = q + (size_t)head * qh;

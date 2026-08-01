@@ -1,3 +1,8 @@
+---
+status: live
+verdict: OTLP spans: what the engine emits and how to read a trace.
+---
+
 # Viewing a decode run as a trace (Grafana)
 
 The `class/tok` line in [PERF.md](PERF.md) reports **scalars**: `io-wait 183ms` tells you the
@@ -186,7 +191,7 @@ partition wall. Keeping the two rows visually distinct is the whole point of hav
   sampling stride it is **+0.00%** — min-of-3 interleaved, 338.2 vs 338.2, against a
   0.4 ms within-arm spread. Recording is a `Vec` push behind a mutex; no exporter touches
   the hot path.
-  Unset `RIVOLI_SPANS` for A/B timing runs regardless — benchmarks.md's rule is that the
+  Unset `RIVOLI_SPANS` for A/B timing runs regardless — docs/measurement/benchmarks.md's rule is that the
   instrument must not be in the arm, and "too small to measure" is not "zero".
 - **The spans are the same intervals the scalars come from**, so the two views cannot
   disagree. If they do, that is a bug worth chasing.
