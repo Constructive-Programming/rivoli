@@ -446,6 +446,12 @@ pub struct RunInfo {
     pub attn: String,
     /// `--max-mem <GiB>`, or None when the budget auto-sizes.
     pub max_mem_gib: Option<u64>,
+    /// The `--mtp-min-conf` gate when speculative decode is ON, else None.
+    ///
+    /// Part of run identity because it changes THROUGHPUT, not just quality: ungated the
+    /// verify pass is 0.93-0.95x (a loss), and at 0.8 it is 1.108x. Two runs that differ
+    /// only here are not comparable, and until 2026-08-02 they shared a series.
+    pub mtp_min_conf: Option<f32>,
     pub bench_tokens: Option<usize>,
     pub prompt: Option<String>,
     pub moe_gain: f32,
@@ -493,6 +499,14 @@ impl RunInfo {
         // is not "0 GiB", and a series labelled `max_mem_gib="0"` would read as a run that
         // was given a budget of nothing.
         .chain(self.max_mem_gib.map(|g| ("max_mem_gib", g.to_string())))
+        // ALWAYS present, unlike the budget: "speculative decode was off" is a state the
+        // run was in, not a measurement that is missing, and it is the difference between
+        // a 1.108x arm and a 0.93x one. Two decimals because the gate is swept in tenths.
+        .chain(std::iter::once((
+            "mtp",
+            self.mtp_min_conf
+                .map_or_else(|| "off".to_string(), |c| format!("{c:.2}")),
+        )))
         .collect()
     }
 }
@@ -1051,6 +1065,7 @@ mod run_label_tests {
             cache_policy: "2q".to_string(),
             attn: "dsa".to_string(),
             max_mem_gib,
+            mtp_min_conf: Some(0.8),
             bench_tokens: Some(256),
             prompt: Some("explain virtual memory".to_string()),
             moe_gain: 1.0,
@@ -1074,8 +1089,17 @@ mod run_label_tests {
                 ("cache_policy", "2q".to_string()),
                 ("attn", "dsa".to_string()),
                 ("max_mem_gib", "115".to_string()),
+                ("mtp", "0.80".to_string()),
             ],
         );
+
+        // Speculative decode is on by DEFAULT and its gate decides whether the verify pass
+        // is a 1.108x win or a 0.93x loss, so an ungated run and a gated one must not share
+        // a series. Unlike the budget, "off" is emitted rather than omitted: it is a state
+        // the run was in, and a missing key would make the two indistinguishable again.
+        let ungated = RunInfo { mtp_min_conf: None, ..run(Some(115)) };
+        assert_ne!(ungated.labels(), run(Some(115)).labels());
+        assert!(ungated.labels().contains(&("mtp", "off".to_string())));
 
         // The defect this whole change exists for: before it, these two landed in the same
         // Prometheus series and averaged together in silence.
@@ -1087,7 +1111,7 @@ mod run_label_tests {
     #[test]
     fn an_auto_sized_budget_is_absent_rather_than_zero() {
         let keys: Vec<&str> = run(None).labels().into_iter().map(|(k, _)| k).collect();
-        assert_eq!(keys, ["mode", "cache_policy", "attn"]);
+        assert_eq!(keys, ["mode", "cache_policy", "attn", "mtp"]);
     }
 
     #[test]

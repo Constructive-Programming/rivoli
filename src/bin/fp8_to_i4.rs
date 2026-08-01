@@ -17,21 +17,18 @@
 //! place: `bin/vq3_to_i4`, which used to regenerate the old `.i4` from the `.vq3` set,
 //! is deleted (its output was worse by construction — see the paragraph above). Re-run
 //! THIS tool from the fp8 source to rebuild a layer.
-// jscpd:ignore-start — the import block. `i4_audit` opens with nearly the same one because
-// the two tools read the same artifact through the same modules, and Rust has no way to
-// share a `use` list. There is nothing here to factor: the duplication is the dependency
-// graph, stated twice because each binary must state its own.
 use anyhow::{Context, Result, anyhow, ensure};
 use clap::Parser;
-use rivoli::artifact::format::{FormatMeta, I4Source, Safetensors};
-use rivoli::artifact::model::ModelConfig;
-use rivoli::artifact::quant::{
-    ExpertProjs, I4_GROUP, expert_base, expert_projs, i4_expert_bytes, i4_expert_stride,
-    i4_slot_offsets, quant_i4, write_i4_proj,
+use rivoli::artifact::{
+    format::{FormatMeta, I4Source, Safetensors},
+    model::ModelConfig,
+    quant::{
+        ExpertProjs, I4_GROUP, expert_base, expert_projs, i4_expert_bytes, i4_expert_stride,
+        i4_slot_offsets, quant_i4, write_i4_proj,
+    },
 };
 use std::fs::File;
 use std::io::Write;
-// jscpd:ignore-end
 
 // NOTE: doc comments on the FIELDS below are USER-FACING — clap renders them as `--help`.
 // Rationale for the code goes in `//` comments like this one, which clap ignores. The

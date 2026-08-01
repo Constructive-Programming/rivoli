@@ -726,6 +726,7 @@ fn main() -> Result<()> {
             cache_policy: cfg.cache_policy.clone(),
             attn: a_attn.clone(),
             max_mem_gib: a.max_mem,
+            mtp_min_conf: mtp.then_some(a.mtp_min_conf),
             bench_tokens: a.bench,
             prompt: cfg.prompt.clone(),
             moe_gain: a.moe_gain,

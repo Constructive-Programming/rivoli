@@ -1,6 +1,6 @@
 ---
 status: live
-verdict: PROPOSED, mostly not built. Keep OTLP — measured, no leaner path exists at 0.30 and it costs 64 crates — add run-identity labels without which every metric series is uncomparable, plus MTP acceptance and moe-by-miss; the §3 drops (fetch_hidden_pct, exposed-fetch, the top-m leftovers) SHIPPED 2026-08-01.
+verdict: PARTLY BUILT. Keep OTLP — measured, no leaner path exists at 0.30 and it costs 64 crates. Run-identity labels {mode,cache_policy,attn,max_mem_gib,mtp} SHIPPED 2026-08-02, as did the §3 drops; MTP acceptance and moe-by-miss are still proposed.
 ---
 
 # What `--features otlp` should export

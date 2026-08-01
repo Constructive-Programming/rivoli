@@ -83,7 +83,7 @@ No truncation warning; 3.52 tok/s, within the spread of the same config without 
 | signal | what | needs |
 |---|---|---|
 | **traces** | `rivoli.decode` → `token N` → `layer L` → leaf intervals (`gpu-wait/*`, `io-wait/uring-reap`, `cpu/*`), each leaf tagged `thread=decode\|reaper`, with true start/end times | `--spans` given |
-| **metrics** | `rivoli_ms_per_tok{class,thread}` plus `rivoli_tok_per_s`, `rivoli_hit_pct`, `rivoli_gb_per_tok`, `rivoli_miss_per_tok`, `rivoli_tokens`, `rivoli_degenerate` (+ `rivoli_loop_period`/`_repeats` when it fires) — **every one of them additionally labelled `{mode,cache_policy,attn,max_mem_gib}`**, see below | always, when OTLP is on |
+| **metrics** | `rivoli_ms_per_tok{class,thread}` plus `rivoli_tok_per_s`, `rivoli_hit_pct`, `rivoli_gb_per_tok`, `rivoli_miss_per_tok`, `rivoli_tokens`, `rivoli_degenerate` (+ `rivoli_loop_period`/`_repeats` when it fires) — **every one of them additionally labelled `{mode,cache_policy,attn,max_mem_gib,mtp}`**, see below | always, when OTLP is on |
 
 > **CORRECTED 2026-08-01.** This row also listed `rivoli_fetch_hidden_pct`. That gauge is
 > **deleted** — it and `exposed_fetch_ms` were removed on the authority of their own doc
@@ -112,6 +112,7 @@ exported datapoint carries the run's identity:
 | `cache_policy` | `--cache-policy` | `lru` · `2q` · `arc` |
 | `attn` | `--attn` | `dense` · `dsa` · `streaming {…}` · `misa {…}` — the parameterised two carry their own arguments |
 | `max_mem_gib` | `--max-mem` | the integer budget, **omitted entirely** when the budget auto-sizes |
+| `mtp` | `--mtp-min-conf` | the gate to 2dp, or `off`. ALWAYS present, unlike the budget: speculative decode is on by default, ungated it is a 0.93-0.95x LOSS and at 0.8 a 1.108x win, so two runs differing only here are not comparable. "Off" is a state the run was in, not a missing measurement. |
 
 They come from `RunInfo`, the same struct the root span's attributes come from, so a trace
 and its metrics cannot disagree about what the run was.
