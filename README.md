@@ -219,9 +219,6 @@ tests/          kernel oracles + lib unit tests; tests/common/ the shared
                 backend-neutral scaffolding (Lcg, assert_close, byte helpers)
 tests/bench-matrix.sh   the mode x attn x policy matrix runner (classifies every
                 cell ok/SUSPECT/DEGENERATE/CRASH/TIMEOUT; refuses to rank the rest)
-docs/           ARCHITECTURE.md, PERF.md (roadmap + the class-axis profile),
-                INT4.md, TRACES.md + grafana dashboard, GPU_TRACE.md; proposals:
-                VULKAN.md (second backend), NPU.md (DSA/MISA),
-                CACHE_ROUTE.md (top-m routing) + CACHE_PILOT.md (its prefetch)
-docs/reference/modes.md        format-mode + cache-policy reference
+docs/           see "Documentation" above — 00-orientation/, reference/,
+                measurement/, investigations/
 ```

@@ -410,7 +410,7 @@ fn main() -> Result<()> {
                     o_dim,
                     i_dim,
                 )?;
-                sample_subvectors(&w, o_dim, i_dim, stride, &mut sample);
+                sample_subvectors(&w, i_dim, stride, &mut sample);
             }
             eprintln!(
                 "convert: learning {} codebook from {} subvectors…",

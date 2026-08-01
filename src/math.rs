@@ -10,7 +10,7 @@ pub fn silu(x: f32) -> f32 {
 
 /// Logistic sigmoid — the MoE router's scoring function (scoring_func=sigmoid).
 #[inline]
-pub fn sigmoid(x: f32) -> f32 {
+fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 

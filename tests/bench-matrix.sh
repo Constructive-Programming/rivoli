@@ -82,7 +82,6 @@ for cell in "${CELLS[@]}"; do
     continue
   fi
   extra=()
-  [ "$pol" = top-m ] && extra+=(--route-j 4 --route-m 9)
   [ "$attn" = streaming ] && extra+=(--sinks 4 --window 512)
   [ "$attn" = misa ] && extra+=(--misa-heads 32)
 

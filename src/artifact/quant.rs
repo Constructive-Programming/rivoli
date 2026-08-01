@@ -360,15 +360,17 @@ pub fn vq_decode_proj(p: &VqProj, codebook: &[f32]) -> Vec<f32> {
     w
 }
 
-// ── codebook learning (shared by `convert` and `vq_study`) ──────────────────
+// ── codebook learning ───────────────────────────────────────────────────────
 //
-// Lives here rather than in the converter because a second consumer appeared: the
-// per-layer-codebook study (docs/investigations/codebook-rotation.md) has to fit codebooks the SAME way the
-// shipped one was fitted, or the comparison measures the fitting procedure instead of
-// the thing it is trying to price.
+// Lives here rather than in the converter because it once had a second consumer, the
+// per-layer-codebook study, which had to fit codebooks the SAME way the shipped one was
+// fitted or the comparison would measure the fitting procedure instead of the thing it
+// was pricing. That study closed negative (docs/investigations/codebook-rotation.md,
+// 2026-08-01: 0.09% recovered against a 2% bar) and its binary is gone — recover it from
+// tag `archive/vq-study`. `convert` is the only caller now.
 
 /// Append every `stride`-th group-normalized subvector of `w` to the codebook sample.
-pub fn sample_subvectors(w: &[f32], o_dim: usize, i_dim: usize, stride: usize, out: &mut Vec<f32>) {
+pub fn sample_subvectors(w: &[f32], i_dim: usize, stride: usize, out: &mut Vec<f32>) {
     let mut n = 0usize;
     for row in w.chunks_exact(i_dim) {
         for grp in row.chunks_exact(VQ_GROUP) {
@@ -382,10 +384,8 @@ pub fn sample_subvectors(w: &[f32], o_dim: usize, i_dim: usize, stride: usize, o
             }
         }
     }
-    let _ = o_dim;
 }
 
-/// k-means (k-means++ seed, threaded Lloyd, convergence-stopped) → VQ_K·VQ_DIM.
 /// k-means (k-means++ seed, threaded Lloyd, convergence-stopped) → VQ_K·VQ_DIM.
 pub fn learn_codebook(sample: &[f32], max_iters: usize) -> Vec<f32> {
     let n = sample.len() / VQ_DIM;

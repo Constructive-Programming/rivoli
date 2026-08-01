@@ -285,12 +285,6 @@ impl Safetensors {
             .with_context(|| format!("tensor {name} not found"))
     }
 
-    /// Raw bytes of a tensor.
-    pub fn bytes(&self, name: &str) -> Result<&[u8]> {
-        let l = self.loc(name)?;
-        Ok(&self.mmaps[l.shard][l.begin..l.begin + l.len])
-    }
-
     /// Bytes + dtype-check + shape of a tensor (fails loud on a dtype mismatch).
     pub fn typed(&self, name: &str, want: Dtype) -> Result<(&[u8], &[usize])> {
         let l = self.loc(name)?;
@@ -721,7 +715,6 @@ mod tests {
         w.write(&path).unwrap();
 
         let st = Safetensors::open_file(&path).unwrap();
-        assert_eq!(st.bytes("a").unwrap(), &a[..]);
         assert_eq!(st.shape("a").unwrap(), &[2, 6]);
         let (bb, sh) = st.typed("b", Dtype::I8).unwrap();
         assert_eq!(bb, &b[..]);

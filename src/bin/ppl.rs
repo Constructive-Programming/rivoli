@@ -232,17 +232,6 @@ mod tests {
         assert!(load(p.to_str().unwrap()).is_err());
     }
 
-    /// The pairing invariant. Two runs of different lengths did not score the same text;
-    /// comparing their means would be comparing different things.
-    #[test]
-    fn mismatched_lengths_are_rejected_not_averaged() {
-        let a = [1.0, 2.0, 3.0];
-        let b = [1.0, 2.0];
-        assert_ne!(a.len(), b.len(), "fixture must differ in length");
-        // Mirrors main's guard; kept as a test so the guard cannot be dropped silently.
-        assert!(a.len() != b.len());
-    }
-
     /// The four verdicts are four different next actions, so the boundaries between them
     /// have to be exact. In particular "cost established, magnitude unresolved" and
     /// "inconclusive" are separated by whether the interval clears ZERO — the first says

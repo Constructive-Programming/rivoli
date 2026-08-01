@@ -42,13 +42,7 @@ pub fn nll_of(logits_le: &[u8], target: usize) -> anyhow::Result<f32> {
         let b = &logits_le[4 * i..4 * i + 4];
         f32::from_le_bytes([b[0], b[1], b[2], b[3]])
     };
-    let mut max = f32::NEG_INFINITY;
-    for i in 0..n {
-        let v = z(i);
-        if v > max {
-            max = v;
-        }
-    }
+    let max = (0..n).map(z).fold(f32::NEG_INFINITY, f32::max);
     anyhow::ensure!(max.is_finite(), "non-finite logits");
     let sum: f64 = (0..n).map(|i| ((z(i) - max) as f64).exp()).sum();
     let nll = (sum.ln() - (z(target) - max) as f64) as f32;

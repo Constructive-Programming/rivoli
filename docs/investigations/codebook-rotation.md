@@ -6,8 +6,15 @@ verdict: Hadamard/QuIP rotation for int3-vq: CLOSED 2026-08-01. A per-layer code
 # rivoli — ROTATION: incoherence processing for the int3-vq codebook
 
 Status: **CLOSED NEGATIVE 2026-08-01.** Both arguments for rotation are measured and both
-fail. `src/bin/vq_study.rs` is the instrument; the numbers are in "Result" below. Nothing
+fail. `src/bin/vq_study.rs` was the instrument; the numbers are in "Result" below. Nothing
 was built beyond the measurement, which is the point.
+
+> **The instrument was deleted 2026-08-01**, after this investigation closed — a 297-line
+> binary carried by no test, script or doc other than this one. The result table below is
+> the record; re-running it would not change a verdict that is already settled. Recover it
+> with `git checkout archive/vq-study -- src/bin/vq_study.rs` (annotated tag; `git show
+> archive/vq-study` explains what it held). `sample_subvectors` / `learn_codebook` stay in
+> `src/artifact/quant.rs`, so a re-run needs the harness back, not the fitting code.
 
 > **STATE, in fifteen lines.**
 > - The question: would a randomized Hadamard rotation (QuIP incoherence processing) improve
