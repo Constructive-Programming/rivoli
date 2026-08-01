@@ -577,6 +577,17 @@ module root (`src/<group>.rs`) over a directory, so the tree mirrors the section
 - **Top level** — `gpu` (the async forward pass, single- or two-row: `MAXROW`, §13), `math`,
   `attn`/`indexer` (attention modes + DSA), `telemetry` (the always-on PROFILE summary),
   `watchdog`.
+- **`serve`** — the OpenAI-compatible HTTP server (`--port`), which is how llama-swap and
+  every OpenAI client reach the engine. Hand-rolled HTTP/1.1 over `std::net`: no HTTP crate,
+  no async runtime, one request per connection, one request at a time. That is a consequence
+  of the engine, not a shortcut — the GPU is sole-tenant and the decode is ~3 tok/s, so a
+  connection pool would queue exactly what the device already serialises. Its cfg is
+  `any(rocm, vulkan, test)` rather than the usual backend pair: HTTP framing, the multi-turn
+  chat template and the streaming detokenizer are host code, and the featureless build is
+  the one CI runs, so the half worth testing is the half that has no backend. **Its one
+  non-obvious coupling is the `watchdog`**: an idle server produces no tokens, so it beats
+  the same heartbeat from a polling accept loop — a blocking `accept` would let the wedge
+  detector abort a perfectly healthy process 60 s after the last request.
 - **`eval`** — teacher-forced scoring (`--ppl`), behind `--features teacher-forcing`. An
   instrument, not an engine feature: nothing in a decode reaches it, so the module boundary
   and the feature boundary are the same line and cannot drift apart.
@@ -874,11 +885,76 @@ weight read. That single term was the whole error; `docs/measurement/benchmarks.
 
 ### Refused rather than half-supported
 
-`--attn streaming|dsa|misa` with `nrow > 1` (each row selects a different KV window),
-tracing (a verify pass routes twice per layer and submits the union, which the v2 trace
-format cannot spell), and every batched launcher on Vulkan. `main` resolves the head-absent
-and `--trace` cases by downgrading to sequential decode and saying which, rather than
+`--attn streaming` with `nrow > 1` (its row set is built on the HOST, so a batched pass needs
+one upload per row), tracing (a verify pass routes twice per layer and submits the union,
+which the v2 trace format cannot spell), and every batched launcher on Vulkan. `main`
+resolves all of these by downgrading to sequential decode and saying which, rather than
 failing.
+
+> **CORRECTION, 2026-08-01: `--attn dsa|misa` used to be on that list, and being on it was a
+> PANIC on the default flags.** The sentence above used to name streaming/dsa/misa together
+> and claim `main` downgrades; `main` only ever checked `has_mtp()` and `tracing()`, never
+> the attention mode. `--attn auto` picks `dsa` on any artifact carrying indexer weights —
+> the reference artifact does — so a bare `rivoli <artifact> -bench 8` ran speculation under
+> DSA and died at `index out of bounds: the len is 78 but the index is 78`. Found while
+> building server mode, which is what made the default path matter: a server has no
+> benchmark command line to add flags to.
+>
+> **The `nrow > 1` guard did not catch it, and could not.** What reaches DSA first is the
+> one-row DRAFT pass, which is well-formed by that guard's rule; it then asks
+> `dsa_select_layer` for layer 78, the MTP head, and indexes `idx.slab_of` — sized to the
+> model's 78 layers, because the head carries no indexer of its own. The two-row verify
+> pass the guard was written for never got a turn. A guard on the shape of a pass cannot
+> see a guard needed on the identity of a layer.
+>
+> **Resolved by BATCHING the selection, not by refusing it.** The first fix was a downgrade
+> — `main` skipping speculation under any non-dense mode — and it cost the default
+> configuration its speculation for the sake of a combination that turned out to be four
+> small changes, not a redesign:
+>
+> - `rows_buf` holds `MAXROW` slices of `max_ctx` rather than one, row `r` at element
+>   `r*max_ctx`; `DeviceIndexer::last_nr/last_dense` become per-row. Per-row because the two
+>   rows sit one position apart, so the row that has just crossed `index_topk` selects while
+>   the row below it is still dense.
+> - `dsa_select_layer` loops the pass's rows, each at its own position. Ordering IS the
+>   causal mask: every launch is on the null stream, so row `r`'s scorer reads the keys rows
+>   `0..r` appended a few launches earlier, and scores exactly its own `pos+r+1` tokens. The
+>   per-row scratch (`k`/`q`/`w`/`scores`) is reused across rows for the same reason.
+> - ONE event bracket and ONE mid-layer join per **layer**, not per row. Bracketing per row
+>   would report a verify pass as two layers of indexer time (`idx_layers` is the divisor);
+>   joining per row would charge the batched pass a sync the sequential path never paid,
+>   which is the cost speculation exists to avoid. At `nrow == 1` both are bit-identical to
+>   the old behaviour.
+> - **The MTP head attends dense.** It carries no indexer weights, so there is nothing to
+>   select with, and dense is the exact computation DSA approximates — on one layer of 79.
+>   Note that the checkpoint sets `index_share_for_mtp_iteration: true`, i.e. the reference
+>   shares the model's selection into the head; that is untried here, and the only thing it
+>   could buy is acceptance rate, because a bad draft is rejected rather than emitted.
+>
+> **Verified output-neutral**, which is the property that matters — `--dump-ids` byte-identical
+> between `--no-mtp` and the default across four paired arms: dsa at `--max-mem` 30 and 115,
+> dense, and dsa with `index_topk` forced to 64. **That last arm is the one that counts.** At
+> the trained `index_topk` of 2048 a 256-token run never crosses the threshold, so
+> `dsa_select_layer` returns its dense fast path and none of the batched selection code above
+> runs; the first three arms prove only that nothing else broke. The 64 arm was run against a
+> directory of symlinks to the artifact with one edited `manifest.json`.
+>
+> Speed, 256 tokens, int3-vq, 2q, `--max-mem 115`, same prompt, paired within the session:
+>
+> | arm | sequential | speculating | |
+> |---|---:|---:|---:|
+> | `--attn dense` | 2.53 | 2.71 | **1.071×** |
+> | `--attn dsa` | 2.60 | 2.71 | **1.042×** |
+> | `--attn dsa`, `index_topk` 64, 192 tok | 2.63 | 2.77 | **1.053×** |
+>
+> dsa gains less than dense because a verify pass runs the indexer **twice per full layer** —
+> the one cost batching cannot remove. Acceptance does not mind that the model went sparse
+> while the head stayed dense: 48.1% at topk 2048 vs 48.8% at 64. `--attn misa` rides the
+> same path (50.9% acceptance on a 64-token smoke).
+>
+> `--attn streaming` still refuses, and `main` still downgrades it. `rows_buf` now has the
+> per-row slices it would need and the change is small — but nothing measures streaming, and
+> shipping an unmeasured row set is how a mode goes wrong quietly.
 
 **The `.i4` MoE kernel was on this list until 2026-07-31** and is now batched — see the
 block at the top of this section for why the guard that refused it earned its keep.

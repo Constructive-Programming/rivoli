@@ -385,10 +385,12 @@ struct DeviceIndexer {
     scores_host: Vec<u8>,
     #[cfg(feature = "trace")]
     scores_f: Vec<f32>,
-    /// The most recent full layer's selection this token (IndexShare reuse):
-    /// `last_dense` = the whole causal prefix (null rows), else `last_nr` rows.
-    last_nr: usize,
-    last_dense: bool,
+    /// The most recent full layer's selection this token, PER TOKEN ROW (IndexShare
+    /// reuse): `last_dense[r]` = the whole causal prefix (null rows), else `last_nr[r]`
+    /// rows. Per row because a verify pass's rows sit one position apart, so the row that
+    /// has just crossed `index_topk` selects while the row below it is still dense.
+    last_nr: [usize; MAXROW],
+    last_dense: [bool; MAXROW],
     // --- MISA head routing (empty/unused in dsa mode) ---
     pool: Vec<DeviceBuf>, // per full layer, ⌈max_ctx/MISA_BLOCK⌉ rows of index_head_dim f32
     e: DeviceBuf,         // index_n_heads f32 — router estimates
@@ -410,8 +412,11 @@ pub struct GpuEngine<'a> {
     /// Attention row-selection mode. Dense/Streaming pick rows by position; Dsa/Misa
     /// run the resident indexer per full layer.
     mode: AttnMode,
-    /// Device copy of the selected rows — uploaded per token, shared by every layer's
-    /// attend. Null-rows (dense) skips it.
+    /// Device copy of the selected rows: `MAXROW` slices of `max_ctx` u32, row `r` at
+    /// element offset `r * max_ctx`. Uploaded per token, shared by every layer's attend;
+    /// null-rows (dense) skips it. One slice PER ROW because the two rows of a verify pass
+    /// sit at different positions and select different KV sets — with one slice the second
+    /// row's selection overwrote the first's before either was attended over.
     rows_buf: DeviceBuf,
     rows_host: Vec<u32>,
     /// Device-side DSA indexer (dsa/misa modes); `None` for dense/streaming.
@@ -658,8 +663,8 @@ impl<'a> GpuEngine<'a> {
                 scores_host: Vec::new(),
                 #[cfg(feature = "trace")]
                 scores_f: Vec::new(),
-                last_nr: 0,
-                last_dense: true,
+                last_nr: [0; MAXROW],
+                last_dense: [true; MAXROW],
                 pool,
                 e: DeviceBuf::new(cfg.index_n_heads * 4)?,
                 e_host: Vec::new(),
@@ -709,7 +714,7 @@ impl<'a> GpuEngine<'a> {
             moe_gain: 1.0,
             cfg,
             mode,
-            rows_buf: DeviceBuf::new(max_ctx * 4)?,
+            rows_buf: DeviceBuf::new(MAXROW * max_ctx * 4)?,
             rows_host: Vec::new(),
             idx,
             max_ctx,
@@ -900,22 +905,30 @@ impl<'a> GpuEngine<'a> {
         self.pred_probe = on;
     }
 
-    /// DSA/MISA row selection for one full/shared layer at `pos`, returning the attend
-    /// row set `(rows_ptr, nr)` — a null pointer means dense over `0..nr`. `xnp` is the
-    /// layer input (post input_layernorm), `qrp` the q-LoRA residual (both device
-    /// pointers, valid until the next sync). Full layers append this token's indexer
-    /// key, then score + top-k once the cache exceeds index_topk (below that it is
+    /// DSA/MISA row selection for one full/shared layer, for EVERY token row of the pass —
+    /// row `r` is the token at `pos + r`. Returns each row's attend set `(rows_ptr, nr)`; a
+    /// null pointer means dense over `0..nr`. `xnp` is the layer input (post
+    /// input_layernorm) and `qrp` the q-LoRA residual, both row 0 of row-minor device
+    /// scratch, valid until the next sync. Full layers append each row's indexer key, then
+    /// score + top-k for that row once its own cache exceeds index_topk (below that it is
     /// exactly dense); shared layers reuse the nearest preceding full layer's selection
-    /// (IndexShare). MISA additionally routes the top-`active_heads` indexer heads via a
-    /// block-pool estimate and scores only those.
+    /// (IndexShare), per row. MISA additionally routes the top-`active_heads` indexer heads
+    /// via a block-pool estimate and scores only those.
+    ///
+    /// Rows run in ascending order on the null stream, so row `r`'s scorer reads the keys
+    /// rows `0..r` appended a few launches earlier. That ordering IS the causal mask: row
+    /// `r` scores exactly its own `pos + r + 1` cached tokens and no more. The per-row
+    /// scratch (`k`/`q`/`w`/`scores`) is reused across rows for the same reason — each row
+    /// finishes with it before the next row's launches are issued.
     fn dsa_select_layer(
         &mut self,
         l: usize,
         pos: usize,
+        nrow: usize,
         xnp: *const f32,
         qrp: *const f32,
         ipin: Option<IndexerPin>,
-    ) -> Result<(*const u32, usize)> {
+    ) -> Result<[(*const u32, usize); MAXROW]> {
         use crate::indexer::K_NORM_EPS;
         let cfg = self.cfg;
         let hd = cfg.index_head_dim;
@@ -923,7 +936,8 @@ impl<'a> GpuEngine<'a> {
         let rope = cfg.qk_rope_head_dim;
         let theta = cfg.rope_theta();
         let topk = cfg.index_topk;
-        let nt = pos + 1;
+        // Row r's selection lives at elements `r*max_ctx ..` of `rows_buf`.
+        let max_ctx = self.max_ctx;
         // MISA routes a head subset; DSA scores all heads. Read the mode before
         // borrowing `self.idx` (Copy — no move of self.mode).
         let active_heads = match self.mode {
@@ -936,15 +950,31 @@ impl<'a> GpuEngine<'a> {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("dsa_select_layer without a device indexer"))?;
 
-        let slab = match idx.slab_of[l] {
+        // `slab_of` is sized to the MODEL's layers. The MTP head sits one past them and
+        // carries no indexer weights of its own, so the caller routes it dense and it must
+        // never arrive here; an out-of-range `l` means the layer range and the slab table
+        // disagree, which is an engine bug and not a user one. Indexing this directly was
+        // a panic ("len is 78 but the index is 78") on the DEFAULT flags until 2026-08-01
+        // — `--attn auto` picks dsa on any artifact with indexer weights, and speculative
+        // decode then asked for the head's slab. See docs/ARCHITECTURE.md §13.
+        let slab = match *idx.slab_of.get(l).with_context(|| {
+            format!(
+                "dsa/misa row selection asked for layer {l}, but the indexer has slabs for \
+                 the model's {n} layers only — layer {n} is the MTP head, which attends \
+                 dense and must not reach here",
+                n = cfg.n_layers,
+            )
+        })? {
             Some(s) => s,
-            // Shared layer: reuse the last full layer's selection verbatim.
+            // Shared layer: reuse each row's own last full-layer selection verbatim.
             None => {
-                return Ok(if idx.last_dense {
-                    (std::ptr::null(), idx.last_nr)
-                } else {
-                    (self.rows_buf.ptr() as *const u32, idx.last_nr)
-                });
+                let base = self.rows_buf.ptr() as *const u32;
+                let (dense, nr) = (idx.last_dense, idx.last_nr);
+                return Ok(std::array::from_fn(|r| match dense[r] {
+                    true => (std::ptr::null(), nr[r]),
+                    // SAFETY: rows_buf holds MAXROW slices of max_ctx u32 and r < MAXROW.
+                    false => (unsafe { base.add(r * max_ctx) }, nr[r]),
+                }));
             }
         };
         let ip = ipin.ok_or_else(|| anyhow::anyhow!("full layer {l} missing resident indexer"))?;
@@ -958,157 +988,184 @@ impl<'a> GpuEngine<'a> {
         } else {
             std::ptr::null_mut()
         };
+        let rows_base = self.rows_buf.ptr_mut() as *mut u32;
 
         // DSA only, and this is a correctness guard, not a scoping choice: MISA's
         // head-route runs its own `device_sync` + D2H *inside* this bracket, which would
         // fold host time into a GPU-timeline number. Under misa the buckets stay 0 and the
         // summary line stays silent. Read behind the end-of-layer join (`idx_ev_pending`).
+        //
+        // ONE bracket and ONE join for the whole layer, however many rows it carries.
+        // Bracketing per row would report a two-row verify pass as two layers of indexer
+        // time (`idx_layers` is the divisor), and joining per row would charge the batched
+        // pass a sync the one-row path never paid — which is the cost speculation exists to
+        // avoid. At `nrow == 1` both are bit-identical to what this did before.
         let bracket = active_heads.is_none();
         if bracket {
             self.idx_ev_start.record(std::ptr::null_mut())?;
         }
-        // Key: wk·xn → LayerNorm(k_norm) → RoPE(first `rope` dims) → append. Runs EVERY
-        // token so the cache is ready when we cross the threshold. MISA folds the same
-        // roped key into the block pool on every token, for the same reason.
-        // SAFETY: indexer weights resident; scratch/kc/pool are live device bufs;
-        // ordering is null-stream program order; a sync precedes any D2H.
-        unsafe {
-            launch_gemv_fp8(
-                xnp,
-                ip.wk.packed,
-                ip.wk.scale,
-                ip.wk.o_dim,
-                ip.wk.i_dim,
-                ip.wk.block,
-                1,
-                kp)?;
-            launch_layernorm(kp, ip.k_norm_w, ip.k_norm_b, hd, K_NORM_EPS, kp)?;
-            launch_rope(kp, 1, rope, rope, pos, theta)?;
-            launch_index_append(kp, kcp, pos, hd)?;
-            if active_heads.is_some() {
-                launch_index_pool_push(kp as *const f32, poolp, pos, hd)?;
-            }
-        }
-        if nt <= topk {
-            idx.last_dense = true;
-            idx.last_nr = nt;
-            return Ok((std::ptr::null(), nt));
-        }
-        // The attend's row count. Was an OBSERVED `idx.rows.len()`; with the selection
-        // device-resident nothing reads it back, so it now holds by construction —
-        // `min(topk, nt)`, matching `rivoli_index_topk`'s own clamp of `k` to `nt`. The
-        // guard above already returned, so it is exactly `topk`; written as the min so it
-        // survives a change to that guard.
-        let nr = topk.min(nt);
+        let mut out = [(std::ptr::null(), 0usize); MAXROW];
+        // `nt` of the last row that actually ran the scorer; 0 = every row was still dense,
+        // in which case there is nothing to join on and no span worth reading.
+        let mut scored_nt = 0usize;
+        for (r, slot) in out.iter_mut().take(nrow).enumerate() {
+            let pos = pos + r;
+            let nt = pos + 1;
+            // SAFETY: xn and qr are row-minor scratch of MAXROW rows, r < nrow <= MAXROW.
+            let (xnp, qrp) = unsafe { (xnp.add(r * cfg.hidden), qrp.add(r * cfg.q_lora_rank)) };
 
-        // Query heads (wq_b·qr, roped per head) + gates (weights_proj·xn), then score
-        // every cached token and pick the top-k, both on device.
-        let wscale = 1.0 / (nh as f32).sqrt();
-        let dscale = 1.0 / (hd as f32).sqrt();
-        // SAFETY: as above; iqp/iwp are live scratch sized nh·hd / nh.
-        unsafe {
-            launch_gemv_fp8(
-                qrp,
-                ip.wq_b.packed,
-                ip.wq_b.scale,
-                ip.wq_b.o_dim,
-                ip.wq_b.i_dim,
-                ip.wq_b.block,
-                1,
-                iqp)?;
-            launch_rope(iqp, nh, hd, rope, pos, theta)?; // per head: stride hd, seg rope
-            // weights_proj is bf16→f32 [n_heads, hidden] — plain f32 GEMV.
-            launch_gemv_f32(xnp, ip.weights_proj, nh, cfg.hidden, 1, iwp)?;
-        }
-
-        // Active head set for the O(nt) scan: all `nh` heads (DSA), or the MISA-routed
-        // top-h (a device estimate + tiny nh-float D2H). `h >= nh` degenerates to "all
-        // heads", so guard on h < nh.
-        let (heads_ptr, nact): (*const u32, usize) = match active_heads {
-            Some(hh) if hh < nh => {
-                let m_blocks = nt.div_ceil(crate::indexer::MISA_BLOCK);
-                let ppool = idx.pool[slab].ptr() as *const f32;
-                let ep = idx.e.ptr_mut() as *mut f32;
-                // SAFETY: iqp/iwp/ppool/ep are live device scratch; a sync precedes the D2H.
-                unsafe {
-                    launch_index_head_route(iqp, iwp, ppool, m_blocks, nh, hd, ep)?;
+            // Key: wk·xn → LayerNorm(k_norm) → RoPE(first `rope` dims) → append. Runs EVERY
+            // token so the cache is ready when we cross the threshold. MISA folds the same
+            // roped key into the block pool on every token, for the same reason.
+            // SAFETY: indexer weights resident; scratch/kc/pool are live device bufs;
+            // ordering is null-stream program order; a sync precedes any D2H.
+            unsafe {
+                launch_gemv_fp8(
+                    xnp,
+                    ip.wk.packed,
+                    ip.wk.scale,
+                    ip.wk.o_dim,
+                    ip.wk.i_dim,
+                    ip.wk.block,
+                    1,
+                    kp)?;
+                launch_layernorm(kp, ip.k_norm_w, ip.k_norm_b, hd, K_NORM_EPS, kp)?;
+                launch_rope(kp, 1, rope, rope, pos, theta)?;
+                launch_index_append(kp, kcp, pos, hd)?;
+                if active_heads.is_some() {
+                    launch_index_pool_push(kp as *const f32, poolp, pos, hd)?;
                 }
-                blocked(&mut self.prof.sync_wait_ns, "gpu-wait/misa-sync", device_sync)?;
-                // Same reason as the score D2H below — MISA-only (`--misa-heads`), so
-                // dormant on every arm measured so far, but unwrapped it would land in
-                // `cpu`.
-                blocked(&mut self.prof.sync_wait_ns, "gpu-wait/misa-d2h", || {
-                    idx.e.copy_out_prefix(&mut idx.e_host, nh * 4)
-                })?;
-                idx.e_f.clear();
-                idx.e_f.extend(
-                    idx.e_host
-                        .chunks_exact(4)
-                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
-                );
-                topk_into(&idx.e_f, hh, &mut idx.head_sel);
-                idx.heads_u32.clear();
-                idx.heads_u32.extend(idx.head_sel.iter().map(|&i| i as u32));
-                idx.heads_buf.copy_in_at(0, as_le_bytes(&idx.heads_u32))?;
-                (idx.heads_buf.ptr() as *const u32, idx.heads_u32.len())
             }
-            _ => (std::ptr::null(), nh),
-        };
+            if nt <= topk {
+                idx.last_dense[r] = true;
+                idx.last_nr[r] = nt;
+                *slot = (std::ptr::null(), nt);
+                continue;
+            }
+            // The attend's row count. Was an OBSERVED `idx.rows.len()`; with the selection
+            // device-resident nothing reads it back, so it now holds by construction —
+            // `min(topk, nt)`, matching `rivoli_index_topk`'s own clamp of `k` to `nt`. The
+            // guard above already skipped, so it is exactly `topk`; written as the min so
+            // it survives a change to that guard.
+            let nr = topk.min(nt);
 
-        // SAFETY: iqp/iwp/kcp/scp are live scratch; heads_ptr is null (DSA) or the
-        // just-uploaded `nact`-entry head buffer (MISA).
-        unsafe {
-            launch_index_score(
-                iqp,
-                iwp,
-                kcp as *const u16,
-                heads_ptr,
-                nt,
-                nh,
-                nact,
-                hd,
-                wscale,
-                dscale,
-                scp,
-            )?;
+            // Query heads (wq_b·qr, roped per head) + gates (weights_proj·xn), then score
+            // every cached token and pick the top-k, both on device.
+            let wscale = 1.0 / (nh as f32).sqrt();
+            let dscale = 1.0 / (hd as f32).sqrt();
+            // SAFETY: as above; iqp/iwp are live scratch sized nh·hd / nh.
+            unsafe {
+                launch_gemv_fp8(
+                    qrp,
+                    ip.wq_b.packed,
+                    ip.wq_b.scale,
+                    ip.wq_b.o_dim,
+                    ip.wq_b.i_dim,
+                    ip.wq_b.block,
+                    1,
+                    iqp)?;
+                launch_rope(iqp, nh, hd, rope, pos, theta)?; // per head: stride hd, seg rope
+                // weights_proj is bf16→f32 [n_heads, hidden] — plain f32 GEMV.
+                launch_gemv_f32(xnp, ip.weights_proj, nh, cfg.hidden, 1, iwp)?;
+            }
+
+            // Active head set for the O(nt) scan: all `nh` heads (DSA), or the MISA-routed
+            // top-h (a device estimate + tiny nh-float D2H). `h >= nh` degenerates to "all
+            // heads", so guard on h < nh.
+            let (heads_ptr, nact): (*const u32, usize) = match active_heads {
+                Some(hh) if hh < nh => {
+                    let m_blocks = nt.div_ceil(crate::indexer::MISA_BLOCK);
+                    let ppool = poolp as *const f32;
+                    let ep = idx.e.ptr_mut() as *mut f32;
+                    // SAFETY: iqp/iwp/ppool/ep are live device scratch; a sync precedes the D2H.
+                    unsafe {
+                        launch_index_head_route(iqp, iwp, ppool, m_blocks, nh, hd, ep)?;
+                    }
+                    blocked(&mut self.prof.sync_wait_ns, "gpu-wait/misa-sync", device_sync)?;
+                    // Same reason as the score D2H below — MISA-only (`--misa-heads`), so
+                    // dormant on every arm measured so far, but unwrapped it would land in
+                    // `cpu`.
+                    blocked(&mut self.prof.sync_wait_ns, "gpu-wait/misa-d2h", || {
+                        idx.e.copy_out_prefix(&mut idx.e_host, nh * 4)
+                    })?;
+                    idx.e_f.clear();
+                    idx.e_f.extend(
+                        idx.e_host
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+                    );
+                    topk_into(&idx.e_f, hh, &mut idx.head_sel);
+                    idx.heads_u32.clear();
+                    idx.heads_u32.extend(idx.head_sel.iter().map(|&i| i as u32));
+                    idx.heads_buf.copy_in_at(0, as_le_bytes(&idx.heads_u32))?;
+                    (idx.heads_buf.ptr() as *const u32, idx.heads_u32.len())
+                }
+                _ => (std::ptr::null(), nh),
+            };
+
+            // SAFETY: iqp/iwp/kcp/scp are live scratch; heads_ptr is null (DSA) or the
+            // just-uploaded `nact`-entry head buffer (MISA).
+            unsafe {
+                launch_index_score(
+                    iqp,
+                    iwp,
+                    kcp as *const u16,
+                    heads_ptr,
+                    nt,
+                    nh,
+                    nact,
+                    hd,
+                    wscale,
+                    dscale,
+                    scp,
+                )?;
+            }
+            // Launched INSIDE the event bracket deliberately: the kernel's cost lands in
+            // `idx_gpu_ns` rather than nowhere, so selecting on device is priced rather than
+            // credited with the host round-trip it removed.
+            //
+            // SAFETY: scp holds nt f32 (just written by index_score, same stream); this
+            // row's rows_buf slice is max_ctx u32 at element r*max_ctx and the kernel
+            // writes exactly nr = min(topk, nt) <= nt <= max_ctx. Both buffers are
+            // engine-owned.
+            let rowp = unsafe { rows_base.add(r * max_ctx) };
+            unsafe {
+                launch_index_topk(scp as *const f32, nt, topk, rowp)?;
+            }
+            idx.last_dense[r] = false;
+            idx.last_nr[r] = nr;
+            *slot = (rowp as *const u32, nr);
+            scored_nt = nt;
         }
-        // Launched INSIDE the event bracket deliberately: the kernel's cost lands in
-        // `idx_gpu_ns` rather than nowhere, so selecting on device is priced rather than
-        // credited with the host round-trip it removed.
-        //
-        // SAFETY: scp holds nt f32 (just written by index_score, same stream); rows_buf
-        // is max_ctx u32 and the kernel writes exactly nr = min(topk, nt) <= nt <=
-        // max_ctx. Both buffers are engine-owned.
-        unsafe {
-            launch_index_topk(
-                scp as *const f32,
-                nt,
-                topk,
-                self.rows_buf.ptr_mut() as *mut u32,
-            )?;
-        }
-        if bracket {
+        if bracket && scored_nt > 0 {
             self.idx_ev_end.record(std::ptr::null_mut())?;
             self.idx_ev_pending = true;
         }
         // The mid-layer join. TWO consumers — it makes the score D2H below safe AND
         // retires the event pair. Deleting it was measured as its own arm and is worth
         // −2.5 ms/token, 0.6% of wall, at the cost of making `route` incomparable with
-        // every historical row in docs/measurement/benchmarks.md; not taken, see the module note above.
-        blocked(&mut self.prof.sync_wait_ns, "gpu-wait/idx-sync", device_sync)?;
+        // every historical row in docs/measurement/benchmarks.md; not taken, see the module
+        // note above.
+        if scored_nt > 0 {
+            blocked(&mut self.prof.sync_wait_ns, "gpu-wait/idx-sync", device_sync)?;
+        }
         // `RIVOLI_DUMP_SCORES` is the only thing left that wants the scores host-side.
         // Gated on the REMAINING budget, not on the file, so a finished dump stops paying
-        // for a D2H the selection itself no longer needs.
+        // for a D2H the selection itself no longer needs. On a multi-row pass this is the
+        // LAST scored row's distribution — the scorer's output buffer is shared across
+        // rows, and the dump's question ("does the distribution move with nt?") is answered
+        // as well by one row of the pass as by both.
         #[cfg(feature = "trace")]
-        if self
-            .score_dump
-            .as_ref()
-            .is_some_and(|(_, _, left)| *left > 0)
+        if scored_nt > 0
+            && self
+                .score_dump
+                .as_ref()
+                .is_some_and(|(_, _, left)| *left > 0)
         {
             // Classed as a GPU wait, not host compute: the thread is parked in a transfer.
             // Unwrapped, it inflated the `cpu` bucket on the `--attn dsa` arms.
             blocked(&mut self.prof.sync_wait_ns, "gpu-wait/idx-scores-d2h", || {
-                idx.scores.copy_out_prefix(&mut idx.scores_host, nt * 4)
+                idx.scores.copy_out_prefix(&mut idx.scores_host, scored_nt * 4)
             })?;
             idx.scores_f.clear();
             idx.scores_f.extend(
@@ -1123,7 +1180,7 @@ impl<'a> GpuEngine<'a> {
         // the budget exhausts during prefill (the buckets reset before decode), but the
         // budget is meant to be raised — so the write must not be in the window at all.
         #[cfg(feature = "trace")]
-        if let Some((w, seen, left)) = self.score_dump.as_mut() {
+        if let Some((w, seen, left)) = self.score_dump.as_mut().filter(|_| scored_nt > 0) {
             // STRIDE is coprime with the 21 full layers per token (211 = 10*21 + 1), so
             // consecutive samples advance one layer AND ~10 tokens: 64 records cover all
             // 21 layers and a ~630-token span of context. A prefix dump of the same size
@@ -1133,7 +1190,7 @@ impl<'a> GpuEngine<'a> {
             if *left > 0 && *seen % STRIDE == 0 {
                 use std::io::Write;
                 let _ = w.write_all(&(l as u32).to_le_bytes());
-                let _ = w.write_all(&(nt as u32).to_le_bytes());
+                let _ = w.write_all(&(scored_nt as u32).to_le_bytes());
                 // Record layout, so the file is readable without this source:
                 // repeated `(u32 layer, u32 nt, f32[nt])`, native LE.
                 let _ = w.write_all(as_le_bytes(&idx.scores_f));
@@ -1142,9 +1199,7 @@ impl<'a> GpuEngine<'a> {
             *seen += 1;
         }
 
-        idx.last_dense = false;
-        idx.last_nr = nr;
-        Ok((self.rows_buf.ptr() as *const u32, nr))
+        Ok(out)
     }
 
     /// One forward pass for `token` at `pos`, leaving next-token logits device-side
@@ -1332,15 +1387,17 @@ impl<'a> GpuEngine<'a> {
         // causal mask — there is nothing else to add.
         let hoisted_rows: Option<[(*const u32, usize); MAXROW]> = match &self.mode {
             AttnMode::Dense => Some(std::array::from_fn(|r| (std::ptr::null(), pos + r + 1))),
-            // Streaming and DSA select a DIFFERENT row set per position, and the engine
-            // keeps one `rows_buf` — so a batched pass would need one upload per row and
-            // a per-row buffer. Not built: dense is the measured configuration and the
-            // work only pays once a batched pass is worth having under those modes too.
+            // Streaming selects a DIFFERENT row set per position and builds it on the HOST,
+            // so a batched pass needs one upload per row. `rows_buf` has the per-row slices
+            // for it since dsa was batched (2026-08-01) and the change is small — but it is
+            // unbuilt because nothing measures streaming, and shipping an unmeasured row
+            // set is how a mode ends up wrong quietly. `main` downgrades `--mtp` here.
             AttnMode::Streaming { sinks, window } => {
                 ensure!(
                     nrow == 1,
                     "--attn streaming: batched token rows are not implemented (each row \
-                     selects a different KV window); use --attn dense with --mtp"
+                     selects a different KV window, and this one is built on the host); \
+                     --attn dense and --attn dsa both speculate"
                 );
                 streaming_rows(pos + 1, *sinks, *window, &mut self.rows_host);
                 let rn = if self.rows_host.len() == pos + 1 {
@@ -1351,14 +1408,10 @@ impl<'a> GpuEngine<'a> {
                 };
                 Some([rn; MAXROW])
             }
-            AttnMode::Dsa | AttnMode::Misa { .. } => {
-                ensure!(
-                    nrow == 1,
-                    "--attn dsa/misa: batched token rows are not implemented (the indexer \
-                     selects per position); use --attn dense with --mtp"
-                );
-                None
-            }
+            // Dsa/misa needs the mid-attention q-LoRA residual, so it selects inside the
+            // layer loop — and there it selects PER ROW, each row over its own position's
+            // cache. `None` signals that to the call site below.
+            AttnMode::Dsa | AttnMode::Misa { .. } => None,
         };
 
         // Embedding row → x, one per token row.
@@ -1516,8 +1569,15 @@ impl<'a> GpuEngine<'a> {
             // syncs mid-layer is `dsa_select_layer`'s business, not this call site's.
             let rows: [(*const u32, usize); MAXROW] = match hoisted_rows {
                 Some(rn) => rn,
-                // `nrow == 1` here — the mode guard above refused anything wider.
-                None => [self.dsa_select_layer(l, pos, xnp, qrp, indexer_pin)?; MAXROW],
+                // The MTP head carries no indexer of its own — the checkpoint ships none —
+                // so it attends DENSE over its own KV slab. That is the exact computation
+                // DSA approximates, on one layer of 79, and it is the other half of what
+                // makes speculation work under a sparse mode: asking the indexer for the
+                // head's layer is what panicked here before 2026-08-01.
+                None if l >= cfg.n_layers => {
+                    std::array::from_fn(|r| (std::ptr::null(), pos + r + 1))
+                }
+                None => self.dsa_select_layer(l, pos, nrow, xnp, qrp, indexer_pin)?,
             };
 
             // --- Attention phase 2: dense flash attend, value + output projection,
@@ -2324,6 +2384,11 @@ impl<'a> GpuEngine<'a> {
         mtp: bool,
         // Speculate only above this draft confidence; see `--mtp-min-conf`. 0 = never gate.
         min_conf: f32,
+        // Called with each generated token the moment it lands, BEFORE the next forward.
+        // Return false to stop the decode early. Server mode streams from it and returns
+        // false when the client hangs up — otherwise a closed connection would keep the
+        // sole-tenant GPU busy for the rest of the token budget. `-bench` passes `|_| true`.
+        on_tok: &mut dyn FnMut(u32) -> bool,
     ) -> Result<(Vec<u32>, ProfileSummary)> {
         ensure!(!prompt_ids.is_empty(), "empty prompt");
         // Both preconditions are resolved by `main` (which downgrades to sequential
@@ -2404,14 +2469,15 @@ impl<'a> GpuEngine<'a> {
                 false => None,
             };
             // Emit and report whether the loop is done: eos ends it, and so does the
-            // token budget. A speculative iteration emits TWO tokens, so this cannot be
-            // the loop counter it used to be.
-            let emit = |g: &mut Vec<u32>, t: u32| {
+            // token budget, and so does the consumer (`on_tok` returning false). A
+            // speculative iteration emits TWO tokens, so this cannot be the loop counter
+            // it used to be.
+            let mut emit = |g: &mut Vec<u32>, t: u32| {
                 if eos.contains(&t) {
                     return true;
                 }
                 g.push(t);
-                g.len() >= ngen
+                !on_tok(t) || g.len() >= ngen
             };
             let mut _i = 0usize;
             loop {

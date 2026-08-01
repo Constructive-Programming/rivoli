@@ -39,13 +39,30 @@ struct Args {
     /// + L{ll}.vq3 + tokenizer). The artifact IS the model.
     model: String,
 
-    /// Decode this many tokens, print PROFILE, exit. Omit for the interactive/server path.
+    /// Decode this many tokens, print PROFILE, exit. Omit for the server path (`--port`).
     ///
     /// Spelled `-bench` in every recorded command line (docs/measurement/benchmarks.md, docs/reference/modes.md,
     /// tests/bench-matrix.sh); `main` rewrites that single-dash form to `--bench` before
     /// clap sees it, since clap has no single-dash-long concept. Both work.
     #[arg(long)]
     bench: Option<usize>,
+
+    /// Serve an OpenAI-compatible HTTP API on 127.0.0.1:PORT until killed — this is how
+    /// llama-swap (and any OpenAI client) calls the engine. `POST /v1/chat/completions`
+    /// with or without `stream`, plus `GET /health` and `GET /v1/models`.
+    ///
+    /// The port opens only once the model is loaded, so it doubles as the readiness
+    /// signal. Sampling is NOT implemented — `temperature`/`top_p` are accepted and
+    /// ignored, because the engine decodes greedy argmax. See src/serve.rs.
+    #[arg(long, value_name = "PORT", conflicts_with = "bench")]
+    port: Option<u16>,
+
+    /// `--port`: the context window, in tokens. The KV cache is allocated ONCE at startup
+    /// (there is no paging here), so this is a hard per-request ceiling — a conversation
+    /// that does not fit is refused with a 400, not silently truncated. Costs ~51 KB of
+    /// device memory per token, on top of `--max-mem`'s expert pool.
+    #[arg(long, value_name = "N", default_value_t = 8192, value_parser = clap::value_parser!(usize))]
+    ctx: usize,
 
     /// Routed-expert format. Default: hybrid on rocm, int3-vq on vulkan (whose int4
     /// kernels are not ported) — see docs/reference/modes.md and `config::Mode`.
@@ -302,6 +319,7 @@ fn main() -> Result<()> {
     #[cfg(feature = "pred-probe")]
     let a_pred_probe = a.pred_probe;
     let a_moe_gain = a.moe_gain;
+    let (a_port, a_ctx) = (a.port, a.ctx);
     let a_raw_prompt = a.raw_prompt;
     let a_dump_ids = a.dump_ids.clone();
     // Bound here for the OTLP root span's run-identity attributes: `a` is partially
@@ -483,11 +501,13 @@ fn main() -> Result<()> {
     };
     #[cfg(not(feature = "teacher-forcing"))]
     let ppl_ids: Option<Vec<u32>> = None;
-    let ngen = if ppl_ids.is_some() {
-        0
-    } else {
-        cfg.bench
-            .context("server mode not yet implemented; use -bench <tokens>")?
+    // Three shapes of run, and only `-bench` carries a token budget: `--ppl` scores a
+    // corpus, and the server takes its budget per request (bounded by `--ctx`).
+    let ngen = match (ppl_ids.is_some(), a_port.is_some()) {
+        (true, _) | (_, true) => 0,
+        _ => cfg
+            .bench
+            .context("nothing to do: pass -bench <tokens> to decode, or --port <PORT> to serve")?,
     };
 
     #[cfg(any(feature = "rocm", feature = "vulkan"))]
@@ -538,10 +558,12 @@ fn main() -> Result<()> {
         info!("pin built in {:.1}s", t.elapsed().as_secs_f64());
         // `--ppl` walks the CORPUS, not the bench prompt, and its `ngen` is 0 — sizing the
         // KV cache from `prompt_ids` would allocate ~17 positions for an ~900-position
-        // scoring pass. Take whichever run this actually is.
-        let max_ctx = match &ppl_ids {
-            Some(ids) => ids.len() + 1,
-            None => prompt_ids.len() + ngen + 1,
+        // scoring pass. The server sizes from `--ctx`, since it cannot know its prompts
+        // yet and the slabs are allocated exactly once. Take whichever run this actually is.
+        let max_ctx = match (&ppl_ids, a_port) {
+            (Some(ids), _) => ids.len() + 1,
+            (None, Some(_)) => a_ctx,
+            (None, None) => prompt_ids.len() + ngen + 1,
         };
         let mut engine = rivoli::gpu::GpuEngine::new(pin, &mc, max_ctx, cfg.attn.clone())?;
         #[cfg(feature = "trace")]
@@ -555,9 +577,11 @@ fn main() -> Result<()> {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(60);
-        engine.set_heartbeat(rivoli::watchdog::spawn(std::time::Duration::from_secs(
-            wd_secs,
-        ))?);
+        // Cloned rather than moved: server mode has to beat it from the accept loop too,
+        // because an idle server produces no tokens and the watchdog cannot tell "waiting
+        // for a request" from "wedged". See serve::serve.
+        let hb = rivoli::watchdog::spawn(std::time::Duration::from_secs(wd_secs))?;
+        engine.set_heartbeat(hb.clone());
         // --- `--ppl`: teacher-forced quality gate, not a decode -----------------------
         // Returns before `generate` because the two are mutually exclusive by design: a
         // free-running generation's own trajectory is the confound this measurement exists
@@ -577,25 +601,75 @@ fn main() -> Result<()> {
         }
 
         let t0 = std::time::Instant::now();
-        // Speculative decode is the default, but only where it is BUILDABLE. Two
-        // conditions can take it away and neither is the user's mistake: an artifact
-        // without the MTP head (an artifact converted before 2026-07-31 has no L78.i4, so
-        // int4/hybrid runs on one load without a head), and `--trace` (a verify pass routes
-        // twice per layer and submits the union, which the v2 trace format cannot spell).
-        // Say which, once, and decode.
-        let mtp = !a_no_mtp && engine.has_mtp() && !engine.tracing();
+        // Speculative decode is the default, but only where it is BUILDABLE. THREE
+        // conditions can take it away and none is the user's mistake: an artifact without
+        // the MTP head (an artifact converted before 2026-07-31 has no L78.i4, so
+        // int4/hybrid runs on one load without a head), `--trace` (a verify pass routes
+        // twice per layer and submits the union, which the v2 trace format cannot spell),
+        // and `--attn streaming`, whose row set is built host-side and would need one
+        // upload per row. Say which, once, and decode.
+        //
+        // `--attn dsa/misa` USED to be on that list, and being on it is what made a bare
+        // `rivoli <artifact> -bench 8` panic on the DEFAULT flags: `--attn auto` picks dsa
+        // on any artifact carrying indexer weights, `main` never checked the attention mode
+        // at all, and the one-row DRAFT pass then slipped past the engine's `nrow > 1`
+        // guard and indexed the indexer's per-layer slab table at the MTP head's layer
+        // ("len is 78 but the index is 78"). Found 2026-08-01 while building server mode
+        // and fixed the same day by BATCHING the selection rather than by refusing it —
+        // dsa/misa now select per row, and the head attends dense. See §13.
+        let batched_rows = !matches!(cfg.attn, rivoli::attn::AttnMode::Streaming { .. });
+        let mtp = !a_no_mtp && engine.has_mtp() && !engine.tracing() && batched_rows;
         if !a_no_mtp && !mtp {
             info!(
                 "speculative decode OFF: {}",
-                match engine.has_mtp() {
-                    false => "this artifact carries no MTP head (re-run bin/fp8_to_i4 to \
-                              emit L78.i4 for int4/hybrid)",
-                    true => "--trace routes once per layer and a verify pass routes twice",
+                match (engine.has_mtp(), engine.tracing()) {
+                    (false, _) => "this artifact carries no MTP head (re-run bin/fp8_to_i4 \
+                                   to emit L78.i4 for int4/hybrid)"
+                        .to_string(),
+                    (_, true) =>
+                        "--trace routes once per layer and a verify pass routes twice"
+                            .to_string(),
+                    // `streaming` by elimination — it is the only mode left that clears
+                    // `has_mtp && !tracing` and still fails `batched_rows`. Named rather
+                    // than interpolated from `a_attn`, which is the mode's Debug and would
+                    // print "streaming { sinks: 4, window: 8192 }" mid-sentence.
+                    _ => "--attn streaming builds its row set on the host, so a two-row \
+                          verify pass would need one upload per row and is not built \
+                          (docs/ARCHITECTURE.md §13); --attn dense and --attn dsa speculate"
+                        .to_string(),
                 }
             );
         }
-        let (ids, summary) =
-            engine.generate(&prompt_ids, ngen, &tok.eos, mtp, a.mtp_min_conf)?;
+        // Server mode: the same engine, driven by HTTP instead of by one bench prompt.
+        // Everything below (degeneration report, OTLP export, --dump-ids) is the bench
+        // path's epilogue and does not apply — serve() carries its own per-request one.
+        if let Some(port) = a_port {
+            return rivoli::serve::serve(
+                &mut engine,
+                &tok,
+                &hb,
+                &rivoli::serve::Opts {
+                    port,
+                    ctx: a_ctx,
+                    // The artifact directory's own name, so `/v1/models` and the echoed
+                    // `model` field say which checkpoint answered.
+                    model_id: std::path::Path::new(&cfg.model)
+                        .file_name()
+                        .map_or_else(|| "rivoli".into(), |n| n.to_string_lossy().into_owned()),
+                    mtp,
+                    mtp_min_conf: a.mtp_min_conf,
+                },
+            );
+        }
+
+        let (ids, summary) = engine.generate(
+            &prompt_ids,
+            ngen,
+            &tok.eos,
+            mtp,
+            a.mtp_min_conf,
+            &mut |_: u32| true,
+        )?;
         let dt = t0.elapsed().as_secs_f64();
         let (hits, misses) = (engine.hits(), engine.misses());
         info!(

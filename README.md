@@ -161,6 +161,45 @@ a status and a one-line **verdict** so you can decide what *not* to read.
 | `docs/measurement/` | how to measure, the roadmap, traces, and the append-only benchmark log |
 | `docs/investigations/` | questions asked, answered and closed. Read the verdict; open the file only to re-open the question |
 
+## Serve — OpenAI API, and llama-swap
+
+```
+cargo run --release --features rocm -- <model-dir> --port 8080 --ctx 8192
+```
+
+`POST /v1/chat/completions` (with or without `stream`), `GET /v1/models`, `GET /health`.
+Loopback only, one request at a time — the GPU is sole-tenant and decodes at ~3 tok/s, so
+concurrency here could only queue what the device already serialises.
+
+Under llama-swap, which spawns the process on demand and proxies to it:
+
+```yaml
+models:
+  glm-5.2-rivoli:
+    cmd: /path/to/rivoli /var/db/rivoli/glm52-vq3-full --port ${PORT} --ctx 8192 --max-mem 115
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    # Pin build is ~1 min and the port does not open until the model is loaded, so the
+    # health check gets connection-refused (not a 503) until it is genuinely ready.
+    healthCheckTimeout: 300
+```
+
+Three things it deliberately does not do, so nobody debugs their absence:
+
+- **No sampling.** `temperature` and `top_p` are accepted and **ignored** — the engine
+  decodes greedy argmax, which is what every number in `benchmarks.md` is measured against.
+  Output is deterministic no matter what the client asks for. One warning per process says so.
+- **No `/v1/completions`.** A raw, unframed prompt leaves the model outside an assistant
+  turn where its EOS ids are unreachable, so it runs to the token limit and then loops —
+  the failure mode that invalidated every benchmark cell above 2048 tokens (see the
+  retraction above). That endpoint would serve it by construction.
+- **No paging.** `--ctx` allocates the KV slabs once, at startup (~51 KB/token on top of
+  the expert pool); a conversation that does not fit is a 400, never a silent truncation.
+
+The per-request log carries the same degeneration check `-bench` does — a looped response
+is a broken one, and it is *faster*, so server mode is not allowed to be the path that
+hides it.
+
 ## Layout
 
 ```

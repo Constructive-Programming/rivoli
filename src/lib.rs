@@ -20,6 +20,16 @@ pub mod math;
 pub mod telemetry;
 pub mod watchdog;
 
+/// The OpenAI-compatible HTTP server (`--port`), for llama-swap and friends.
+///
+/// Backend-gated like `gpu`, since without one there is no engine to serve — but with
+/// `test` added, because the half of it that matters for correctness (HTTP framing,
+/// message flattening, the streaming detokenizer) is pure host code, and the featureless
+/// build is the one CI runs. `serve()` itself, which drives a live engine, carries the
+/// backend cfg a second time inside.
+#[cfg(any(feature = "rocm", feature = "vulkan", test))]
+pub mod serve;
+
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
 pub mod gpu;
 

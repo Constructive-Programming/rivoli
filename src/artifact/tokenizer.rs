@@ -64,6 +64,17 @@ impl Tokenizer {
     /// string. No Jinja either: the checkpoint ships no `chat_template`, and GLM's turn
     /// structure is four tokens of framing.
     pub fn encode_chat(&self, text: &str) -> Result<Vec<u32>> {
+        self.encode_chat_turns(&[("user", text)])
+    }
+
+    /// The same framing over a MULTI-TURN conversation, which is what an OpenAI
+    /// `messages` array is: `[gMASK] <sop>` then `<|role|> \n {content}` per turn, then a
+    /// trailing `<|assistant|> \n` for the model to continue into.
+    ///
+    /// Roles map to GLM's own turn tokens (`system`/`user`/`assistant`/`observation`); an
+    /// unknown role is framed as `user`, since the alternative — dropping the turn — loses
+    /// content silently.
+    pub fn encode_chat_turns(&self, turns: &[(&str, &str)]) -> Result<Vec<u32>> {
         // Missing any of these means an artifact whose tokenizer predates the chat
         // tokens; fall back rather than fail, but say so — silent raw encoding is the
         // bug this function exists to fix.
@@ -76,16 +87,28 @@ impl Tokenizer {
                 "tokenizer lacks GLM chat tokens ([gMASK]/<sop>/<|user|>/<|assistant|>) — \
                  encoding the prompt RAW. Decode will not stop on EOS."
             );
-            return self.encode(text);
+            return self.encode(&turns.iter().map(|(_, t)| *t).collect::<Vec<_>>().join("\n"));
         };
         let nl = self.encode("\n")?;
-        let body = self.encode(text)?;
-        let mut out = Vec::with_capacity(body.len() + nl.len() * 2 + 4);
-        out.push(sp[0]); // [gMASK]
-        out.push(sp[1]); // <sop>
-        out.push(sp[2]); // <|user|>
-        out.extend_from_slice(&nl);
-        out.extend_from_slice(&body);
+        let mut out = vec![sp[0], sp[1]]; // [gMASK] <sop>
+        for (role, text) in turns {
+            let header = match *role {
+                "user" => sp[2],
+                "assistant" => sp[3],
+                // Only looked up when actually used: an artifact can carry the four
+                // tokens above without these two, and a `system` message is optional.
+                other => match self.inner.token_to_id(&format!("<|{other}|>")) {
+                    Some(id) => id,
+                    None => {
+                        warn!("tokenizer has no <|{other}|> turn token — framing it as user");
+                        sp[2]
+                    }
+                },
+            };
+            out.push(header);
+            out.extend_from_slice(&nl);
+            out.extend_from_slice(&self.encode(text)?);
+        }
         out.push(sp[3]); // <|assistant|>
         out.extend_from_slice(&nl);
         Ok(out)
