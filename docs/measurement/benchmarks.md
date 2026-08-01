@@ -158,6 +158,17 @@ rate. Bounce's 1239 µs is 12.4 GB/s, ~2.2× that, so the concurrent-submit path
 as designed. The zero-miss rows being equal (1563 vs 1525 µs) also shows the flag does not
 change where kernels read from — it only flips the streamer's DMA destination.
 
+> **2026-08-01: `--direct-vmm-dma` was DELETED and the staging hop is now unconditional.**
+> This measurement is why, and it is not superseded — it is the reason the flag went. Misses
+> are the entire design, and the DIRECT row more than doubles the cost of one. The amdgpu
+> EFAULT on O_DIRECT DMA into VMM pages that the flag *also* worked around no longer
+> reproduces on kernel 6.18.38, so nothing was left holding it up. **The table stands as the
+> record**; `src/fetch/stream.rs`'s header carries both these numbers and the
+> `get_user_pages` history, because that history is what forbids ever making the arena
+> device-local. Re-adding a direct destination on **Vulkan** is a separate, still-open
+> question — the pool is host memory there, so no H2D copy is being saved
+> (`investigations/vulkan-port.md`, increment 1 finding 2).
+
 ---
 
 ## Bugs found and fixed
@@ -870,7 +881,9 @@ build; the cost of not staging it is unbounded and invisible.
 
 > **Closed by the CLASS axis (docs/measurement/perf-roadmap.md).** The unattributed time is decode-loop HOST
 > CPU, not a hidden kernel — measured at ~6 ms/tok of a total 6.2 ms host compute, itemised
-> as kernel launch, tokio poll, `submit_layer` and `route_into`. The candidate named below
+> as kernel launch, tokio poll *(term deleted 2026-08-01 with tokio itself; 2.4 ms of a
+> 338 ms token, so the conclusion is unchanged)*, `submit_layer` and `route_into`. The
+> candidate named below
 > (per-token launch/sync/readback overhead) was right. It is also DEMOTED by the same
 > measurement: host compute is under 2% of wall, so this is not where the engine is slow.
 > The analysis below is kept for the reasoning, not as a live task.
@@ -1787,6 +1800,16 @@ once the gate is on.
 `RIVOLI_MTP_PROBE=1` buckets acceptance by the draft's own top-1 probability and, separately,
 by the MAIN MODEL's confidence in the token the draft was tested against.
 
+> **The probe was deleted 2026-08-01 and this table cannot be re-run as written.** It was an
+> env var, which `CLAUDE.md` forbids — invisible to `--help`, absent from the recorded
+> command line right here, silently active in a build that looks stock. It had answered its
+> question: "de-quantize the draft head" is REFUTED (46.0% → 49.4% acceptance, 49% → 54%
+> target-conditioned, Δ = 3.4 pp ± 7.4 — noise). Recover it from tag
+> `archive/mtp-target-probe`. **The `draft conf` rows are still measurable from a stock
+> build**: `mtp_bins` is the DRAFT-side histogram and was deliberately kept, because it sizes
+> the live `--mtp-min-conf 0.8` gate that is on by default and worth 1.108×. Only the
+> `target conf` rows needed the probe.
+
 | | seasons (int3-vq) | memory (int3-vq) | seasons (int4) |
 |---|---:|---:|---:|
 | n | 350 | 309 | 342 |
@@ -1884,7 +1907,10 @@ Three hypotheses tested and killed, in order:
 
 `--direct-vmm-dma` re-ablated on the same build: 900.8 ms/tok, 1.11 tok/s vs bounce's 2.26,
 `io_wait` 761 ms — confirms bounce as the default and, incidentally, exposed the broken
-hidden-fetch metric (it printed **99% hidden** on this arm).
+hidden-fetch metric (it printed **99% hidden** on this arm). *(2026-08-01: both are gone —
+the flag, because this arm is the whole case against it; and `fetch_hidden_pct`, because a
+metric whose ordering disagrees with throughput is not reporting a small error. See the
+DIRECT vs BOUNCE ablation above.)*
 
 **What is left is the duty cycle: 18.3 s of NVMe inside a 28.3 s decode.** The ring only has
 work between a layer's routing and its MoE launch. Filling the idle 35% needs the routing

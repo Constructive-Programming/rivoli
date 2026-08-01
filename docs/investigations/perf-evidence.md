@@ -14,6 +14,14 @@ verdict: Phase profile and per-kernel tranches behind the roadmap. The "Where th
 > overlap ceiling is ≤57%, and `fetch_hidden_pct` was later found broken outright (~22%, not
 > 94%). It is kept because the per-kernel work below was done under it and the reasoning is
 > only legible with it in view.
+>
+> **`fetch_hidden_pct` was DELETED from the engine 2026-08-01**, together with
+> `exposed_fetch_ms`, the PROFILE line's `% hidden` term and the OTLP gauge — fixing the
+> arithmetic did not make a derived hiding percentage worth printing beside a directly
+> measured `io_wait_ms`. **Every "% hidden" figure in this file is therefore a number no
+> current build can reproduce.** They stay as recorded: this file's whole job is to show
+> what the roadmap was reasoned from, and a retracted premise that has been erased teaches
+> nobody why the conclusion moved.
 
 ## Where the time goes (hybrid+lru, 512 tok, the best coherent config)
 

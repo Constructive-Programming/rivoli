@@ -187,6 +187,15 @@ overwritten in place. `bin/i4_audit` re-derives them as `quant_i4(vq_decode_proj
 is what `bin/vq3_to_i4` did. A sound proxy, but by this document's own §3 teaching it resolves
 through some of the same code, so it is a reconstruction and is labelled as one.
 
+> **2026-08-01: `i4_audit` no longer re-derives them.** The "old i4" rows and the `VQ_GAIN`
+> attenuation pre-flight built on them were removed — they head-to-headed the shipped set
+> against a generation nothing can produce any more (`bin/vq3_to_i4` is deleted), and the
+> branch-gain hypothesis they fed is falsified outright by §3, "Falsified: branch gain"
+> (attenuation is monotonically harmful; no interior optimum). **The rows below and every
+> number they printed stand as recorded**, here and in `measurement/benchmarks.md` — a
+> reconstruction that has already served its comparison does not need a standing tool. The
+> live arms are unchanged: `--scan`, `--verify`, `--xcheck`, `--scale-study`.
+
 | | rel-L2 (whole row) | bulk (\|w\| ≤ p99) | tail | gain |
 |---|---:|---:|---:|---:|
 | new `.i4` | **0.205** | **0.215** | **0.065** | **1.0008** |
@@ -237,7 +246,8 @@ zeroed). The old `.i4` was not better designed; it was pre-conditioned upstream.
 **But which upstream property did it?** Two candidates, and they are not distinguished here:
 (a) `.vq3`'s scale per **64** weights, or (b) `quant_vq`'s **least-squares scale refit**, which
 is MMSE-like and shrinks by `1 − relL2²` — measured 0.9766, and the mechanism this repo has
-actually evidenced (`bin/i4_audit`'s `VQ_GAIN`, docs/measurement/benchmarks.md). MMSE shrinkage biting harder in
+actually evidenced (`bin/i4_audit`'s `VQ_GAIN` — removed 2026-08-01, see §2's note; the
+0.9766 is recorded in docs/measurement/benchmarks.md). MMSE shrinkage biting harder in
 the tail than at the median would drop `amax/median` 7.2 → 6.8 with **no appeal to group size
 at all**. This is load-bearing: if the benefit came from (b), then group-wise int4 *without* an
 MMSE/LS scale fit will not reproduce it, and 365 GB gets rewritten on the wrong half of the

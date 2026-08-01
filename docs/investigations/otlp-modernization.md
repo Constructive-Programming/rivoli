@@ -1,15 +1,45 @@
 ---
 status: live
-verdict: PROPOSED, not built. Keep OTLP — measured, no leaner path exists at 0.30 and it costs 64 crates — add run-identity labels without which every metric series is uncomparable, plus MTP acceptance and moe-by-miss; drop fetch_hidden_pct and the top-m leftovers.
+verdict: PROPOSED, mostly not built. Keep OTLP — measured, no leaner path exists at 0.30 and it costs 64 crates — add run-identity labels without which every metric series is uncomparable, plus MTP acceptance and moe-by-miss; the §3 drops (fetch_hidden_pct, exposed-fetch, the top-m leftovers) SHIPPED 2026-08-01.
 ---
 
 # What `--features otlp` should export
 
-> **This is a PLAN, not a description.** Nothing below is built. It is `live` and it sits in
-> `investigations/` because it is an *open* question with a recommendation attached; when it
-> is executed it becomes `closed-shipped` and the live half of it belongs in
+> **This is a PLAN, not a description.** Almost nothing below is built. It is `live` and it
+> sits in `investigations/` because it is an *open* question with a recommendation attached;
+> when it is executed it becomes `closed-shipped` and the live half of it belongs in
 > [`measurement/traces.md`](../measurement/traces.md), which is where the instrument is
 > documented. Read `traces.md` for what the feature *does*; read this for what it *should*.
+
+> **PARTIALLY EXECUTED 2026-08-01, by a different change than this plan.** The
+> over-engineering audit (`3e2ed79`) landed **§3, "What to drop"**, almost entirely — it was
+> the half that only removed things, so it needed none of the labelling work the rest of the
+> plan is blocked on. Specifically:
+>
+> | §3 row | outcome |
+> |---|---|
+> | `rivoli.fetch_hidden_pct` gauge | **dropped** — the `ProfileSummary` field went too, so the PROFILE line's `% hidden` term is gone |
+> | `split/exposed-fetch` series | **dropped** with `exposed_fetch_ms` |
+> | dashboard panel 5, `fetch hidden %` | **repointed, not deleted** — see below |
+> | both stale `top-m` doc comments | **gone**, along with the `two_q_kin`/`two_q_kout` fields they were misattached to |
+> | `route_j`/`route_m` in `traces.md` | **struck**, with `2q_kin_pct`/`2q_kout_pct` beside them |
+> | `loop_period`/`loop_repeats` gauges | **still there.** The one §3 row not executed |
+>
+> **Panel 5 was repointed at `rivoli_ms_per_tok{class="io-wait"}` rather than deleted.** §3
+> asked for deletion because "a panel querying a removed metric draws a plausible zero" —
+> that argument is about the *query*, not the *tile*, and the panel's own description already
+> said "prefer the io-wait series". So the tile now shows the number it was always deferring
+> to, `min` and `unit` corrected from percent to ms and the thresholds dropped (there is no
+> good/bad band for io-wait; it overlaps wall by design). Deleting it would have left a hole
+> at `x:12` in a five-tile row and cost a re-layout to say less.
+>
+> Also settled by the same change: the **DEFECT** noted below at `src/telemetry.rs:568`
+> (`report` recomputing the retracted `moe_wall − compute_gpu` beside the corrected field) is
+> **fixed by construction** — both terms were removed from the PROFILE line. The measured
+> counterfactual survives as a local in `Profile::summary` feeding `gpu_wait_ms`.
+>
+> **Items 1–4 and 7–10 are untouched, and item 1 is still the one that matters**: nothing
+> identifies the run, so every metric series is still uncomparable.
 
 ## STATE — the answer in fifteen lines
 
@@ -70,12 +100,21 @@ One `rivoli.ms_per_tok{class,thread}` gauge carrying 15 class values, plus seven
 gauges (`tok_per_s`, `hit_pct`, `gb_per_tok`, `miss_per_tok`, `fetch_hidden_pct`, `tokens`,
 `degenerate`) and two conditional ones (`loop_period`, `loop_repeats`).
 
+> **As of 2026-08-01 this reads 14 class values and six scalar gauges** — `fetch_hidden_pct`
+> and the `split/exposed-fetch` class were dropped by §3 (see the note at the top of this
+> file). The inventory is left as it was surveyed, because §2 and §3 below both argue
+> against it and a plan whose "before" picture has been quietly edited cannot be audited.
+
 ### The dashboard (`docs/measurement/grafana-dashboard.json`, uid `rivoli-decode`)
 
 13 panels. Every one queries `rivoli_ms_per_tok{class=...}` or a scalar gauge; there is **no
 template variable over run identity** — `templating.list` holds only the two datasource
 pickers. Panel 5 is `fetch hidden %`; panel 11 (`Splits`) draws `class=~"split/.*"`, which
 includes `split/exposed-fetch`.
+
+> **2026-08-01:** panel 5 is now `io-wait / tok` and panel 11's regex matches four live
+> splits, not five. **The run-identity gap is untouched and is still the finding of this
+> file** — 13 panels, no way to tell two runs apart.
 
 ---
 
@@ -389,11 +428,15 @@ make the feature genuinely useful; the rest is hygiene.
       (`src/gpu.rs:255-262`). Guard on `mtp_seen > 0`.
 - [ ] **4. `moe_us_by_miss` gauges** (§2c). Data is already on the summary; this is a loop
       over 16 buckets, skipping `None`.
-- [ ] **5. Drop the dead metrics** (§3): `fetch_hidden_pct`, `split/exposed-fetch`,
-      `loop_period`/`loop_repeats` gauges. Delete dashboard panel 5 in the same commit —
+- [x] **5. Drop the dead metrics** (§3): `fetch_hidden_pct`, `split/exposed-fetch`,
+      ~~`loop_period`/`loop_repeats` gauges~~. Delete dashboard panel 5 in the same commit —
       a panel querying a removed metric draws a plausible zero.
-- [ ] **6. Fix the two `top-m` doc comments** (`src/telemetry.rs:451-453`, `:516-520`). The
+      **DONE 2026-08-01 except the loop gauges, which remain.** Panel 5 was **repointed** at
+      `rivoli_ms_per_tok{class="io-wait"}` rather than deleted — see the note at the top.
+- [x] **6. Fix the two `top-m` doc comments** (`src/telemetry.rs:451-453`, `:516-520`). The
       second is the load-bearing one: it currently documents `gpu_wait_ms`.
+      **DONE 2026-08-01** — both comments and the `two_q_kin`/`two_q_kout` fields under them
+      are gone with the `--2q-kin`/`--2q-kout` flags.
 - [ ] **7. Degeneration flag** (§2e): `top_line` + `longest_repeated_block` onto `RunInfo`,
       OR'd into the attribute and the gauge.
 - [ ] **8. Indexer gauges** (§2d), guarded by `idx_layers_per_tok > 0.0`.
@@ -402,9 +445,11 @@ make the feature genuinely useful; the rest is hygiene.
       an MTP row (accept %, speculated %, tokens/pass), and a `moe_us_by_layer` panel keyed
       on `misses`. Bump nothing else; the CLASS/PHASE stacking distinction
       (`traces.md:224-227`) is correct and must survive the edit.
-- [ ] **11. `traces.md`**: strike `route_j`/`route_m` (`:98`, `:108`), document the new
-      metric set and labels in the emit table (`:85-86`), and add the `rocm,otlp` build line.
-      Then move this file's live half into it and re-status this doc `closed-shipped`.
+- [ ] **11. `traces.md`**: ~~strike `route_j`/`route_m` (`:98`, `:108`)~~ **done 2026-08-01,
+      with `2q_kin_pct`/`2q_kout_pct` and `rivoli_fetch_hidden_pct` beside them**; document
+      the new metric set and labels in the emit table (`:85-86`), and add the `rocm,otlp`
+      build line. Then move this file's live half into it and re-status this doc
+      `closed-shipped`.
 - [ ] **12.** `cargo test --release --features rocm --test docs` and
       `cargo clippy --release --features rocm,otlp --all-targets`.
 

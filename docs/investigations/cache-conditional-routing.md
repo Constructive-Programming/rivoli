@@ -143,6 +143,11 @@ boolean, and the behaviour is the paper exactly.
 > rule means lifting that guard, and the guard is what stops a silent fallback to the
 > frequency threshold being credited to `top-m`.
 >
+> *(`Config::validate` itself was deleted 2026-08-01 — once `top-m` went it had an `Ok(())`
+> body behind 11 lines of doc explaining it was a seam, plus two tests asserting only
+> `Ok(())`. `Config::validate_backend`, which refuses `--mode int4|hybrid` and
+> `--attn dsa|misa` under Vulkan, is a different function and is live.)*
+>
 > Unaffected: **single-format `top-m` (`int3-vq`, `int4`) ships independently of this.**
 > There is no promotion, no tiering and no format change anywhere in its path.
 
@@ -323,6 +328,10 @@ per-token means would both differ once batches vary; pick this one and stay with
 Not an implementation detail — a real interaction between two features this document
 treats as independent. The v2 trace format promises `window[..top_k] == sel`;
 `submit_spine` debug-asserts it and `bin/replay` hard-fails a trace that violates it.
+*(`submit_spine` is `Pin::submit_layer` since 2026-08-01 — the pair folded into one
+function. `bin/replay`'s v2 candidate-window parser went the same day with the rest of the
+`top-m` machinery, so nothing reads a window any more; the prefix invariant itself is
+unchanged and still what makes a captured trace trustworthy.)*
 Substitution is *precisely* what breaks that prefix, because `sel` is then no longer the
 rank-order head of the window. A `--trace --cache-policy top-m` run would therefore either
 trip the assert or write a corrupt capture that the next (J, M) screen would read as

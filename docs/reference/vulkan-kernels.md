@@ -17,10 +17,19 @@ runs the model, and it cuts 13 kernels from the port.
 | File | Port now | Port difficulty |
 |---|---|---|
 | `linalg.hip` | `gemv_fp8`, `gemv_fp8_splitk`, `gemv_f32`, `gemv_i8`, `swiglu`, `rmsnorm`, `rope_interleave` | `gemv_f32`/`swiglu`/`rmsnorm` trivial; the split-K LDS combine and the e4m3 LUT need care |
-| `moe.hip` | `moe_gateup_vq`, `moe_down_vq`, `moe_reduce` | hardest — per-expert device addresses, fp16 codebook gather |
+| `moe.hip` | `moe_gateup_vq`, `moe_down_vq`, `moe_acc_drain` | hardest — per-expert device addresses, fp16 codebook gather |
 | `fwd.hip` | `embed_i8_row`, `append_kv`, `gather_rope`, `vadd`, `argmax_reduce` | easy |
 | `mla.hip` | `mla_absorb_fp8`, `mla_value_fp8` | easy-moderate |
 | `attn.hip` | `mla_latent_attend`, `mla_attend_combine` | moderate — dynamic shared memory sizing becomes a specialization constant |
+
+> **CORRECTED 2026-08-01.** The `moe.hip` row read `moe_reduce`, which no longer exists on
+> either backend — the HIP kernel, its C wrapper, both launchers, the Vulkan push struct and
+> `kernels/vk/moe_reduce.comp` were all deleted that day. Fixed-point accumulation
+> (`architecture.md` §12) replaced it on 2026-07-31 and it had been off the decode path ever
+> since; the last two claims on it — "the f32 reference the oracle tests pin against" and
+> "the shape `tests/vk.rs` probes cross-queue visibility with" — both moved to
+> `moe_acc_drain`, which is the shader that is actually ported and dispatched. **One-for-one
+> substitution, so the 16-of-29 count is unchanged.**
 
 **Deferred, with the reason:**
 
@@ -244,6 +253,15 @@ literal on the Vulkan side, uncoupled from the HIP constant — the same defect,
 `moe_reduce`'s expert batching, and any future change to `TILE` or `HB`. Ask of each: if I
 retuned this for speed, would the OUTPUT change? If yes, it is single-sourced or it is a
 bug waiting for a profiler.
+
+> **2026-08-01: `moe_reduce` was the example, and it is now the counter-example.** It is
+> deleted — replaced by `moe_acc_drain` over an i64 fixed-point accumulator, where every
+> expert `atomicAdd`s at scale 2^-44 in any order. **Integer addition associates, so the
+> partition carries no freedom and retuning it cannot move the output.** That is the only
+> way an item leaves this list: not by being checked more carefully, but by the
+> schedule-sensitivity being designed out. Kept here as the worked example, because the
+> question — "if I retuned this for speed, would the OUTPUT change?" — is what the rest of
+> the list still needs asked of it.
 
 Two of these have mechanised guards (rules 2 and 9) and one is preventive (rule 11).
 The rest are checked by reading, which is why the list exists.

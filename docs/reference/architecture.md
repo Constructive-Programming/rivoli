@@ -108,17 +108,26 @@ the fetcher's job is to **keep the queue full**:
   blk-mq inline, serially, at QD1 (2.53 GB/s). The poller takes the whole SQ tail at once →
   genuinely concurrent (6.69 GB/s). Falls back to a plain ring (still correct, QD1) if
   SQPOLL is refused.
-- **Two destination modes.** BOUNCE (default): read into a pinned host arena, then
-  `hipMemcpyAsync` into the VMM slot. DIRECT (`--direct-vmm-dma`): DMA straight into VMM.
-  Bounce is the default because DMA into VMM device pages is *write*-slow — 5.66 GB/s vs
-  12.4 GB/s into the pinned arena — so DIRECT more than doubles the cost of a miss. It also
-  sidesteps an amdgpu kernel bug that EFAULTs on O_DIRECT DMA into VMM pages.
+- **One destination: the staged hop.** Read into a pinned host arena, then `hipMemcpyAsync`
+  into the VMM slot. There is no longer a choice — but there was, and the measurement that
+  removed it is the reason never to re-add it.
+
+  > **CORRECTED 2026-08-01.** This bullet described "two destination modes" and a
+  > `--direct-vmm-dma` flag that DMA'd straight into VMM. **The flag is deleted and the
+  > staging hop is unconditional.** The amdgpu bug it originally worked around — an EFAULT
+  > on O_DIRECT DMA into VMM pages — no longer reproduces on kernel 6.18.38, but the
+  > *surviving* reason is write-side and permanent: DMA into VMM device pages runs
+  > **5.66 GB/s** against **12.4 GB/s** into the pinned arena, so the direct path more than
+  > doubled the cost of a miss. **Misses are the entire design**, so no workload wanted it.
+  > `src/fetch/stream.rs`'s header keeps both this measurement and the `get_user_pages`
+  > history, because that history is what forbids ever making the arena device-local.
+
   **Ablated 2026-07-30** (int3-vq/dense/lru @512): marginal cost per missed expert 1239 µs
-  (bounce) → 2709 µs (DIRECT); 386 → 837 ms/tok; 2.59 → 1.19 tok/s. The read side is
-  untouched — the flag only flips the streamer's `bounce` destination and never changes pool
-  allocation, so kernels read the same device-local VMM in both modes (zero-miss layer
+  (staged) → 2709 µs (direct); 386 → 837 ms/tok; 2.59 → 1.19 tok/s. The read side was
+  untouched — the flag only flipped the streamer's `bounce` destination and never changed
+  pool allocation, so kernels read the same device-local VMM in both modes (zero-miss layer
   1563 vs 1525 µs). An earlier version of this bullet credited a ~40% MoE-dot read tax from
-  host-mapped VMM; the flag does not produce that configuration.
+  host-mapped VMM; the flag did not produce that configuration.
 - The module owns all the **O_DIRECT alignment math** (block-aligned offset, length, and
   buffer) so the rest of the engine deals in logical `(fd, begin, len)` read-specs.
 
@@ -144,10 +153,27 @@ stall reading 117 + 149 = 266 closes exactly.
 diagnosis for two days while `PROFILE/tok` still said "97% hidden" every run, because the
 retraction was written here and not into `Profile::summary`. The tell was there for anyone
 who ran the arm: `--direct-vmm-dma` printed **99% hidden** while decoding at 1.11 tok/s
-against bounce's 2.26. `exposed` is now `moe_wall` minus a **measured** counterfactual —
-`moe_ns_by_miss[0]`, the mean bracket of the layers that missed nothing, times the layer
-count — which puts the same two arms at 22% and 10%. A metric whose ordering disagrees with
-throughput is not reporting a small error; it is reporting nothing.
+against staged's 2.26. `exposed` was then re-derived as `moe_wall` minus a **measured**
+counterfactual — `moe_ns_by_miss[0]`, the mean bracket of the layers that missed nothing,
+times the layer count — which put the same two arms at 22% and 10%. A metric whose ordering
+disagrees with throughput is not reporting a small error; it is reporting nothing.
+
+> **CORRECTED 2026-08-01, same day, second step.** The clause "`PROFILE/tok` still said
+> '97% hidden' every run" is now **history, not behaviour** — that line no longer prints,
+> because `fetch_hidden_pct` and `exposed_fetch_ms` were deleted outright rather than kept
+> in their corrected form. Their own doc comment is what condemned them: "SUBSTANTIALLY
+> OVERSTATED — an upper bound, and not a tight one… prefer `io_wait_ms`, which is measured".
+> Fixing the arithmetic did not make a *derived* hiding percentage worth reporting beside a
+> directly measured `io_wait_ms`, so the field, the PROFILE term, the OTLP gauge
+> (`rivoli_fetch_hidden_pct`), the `split/exposed-fetch` series and the Grafana tile all
+> went together.
+>
+> **The counterfactual itself survives and is load-bearing.** `moe_ns_by_miss[0]` × layer
+> count is still subtracted from `moe_wall` in `Profile::summary` — it is now a local that
+> feeds `gpu_wait_ms`, which is why gpu-wait fell from 320 to ~104 ms/token when this
+> correction landed. What went is the *reported percentage*, not the measurement behind it.
+> Everything above stays because it is the reasoning that priced the metric, and the next
+> person tempted to add a "% hidden" gauge needs to read it before they do.
 
 Consequence for the roadmap: perfect overlap floors at `max(117, 181) + ~102 route ≈ 283
 ms/tok` (**~3.5 tok/s** vs 2.59 today). Past that, only moving *fewer bytes* helps — hit
@@ -195,8 +221,17 @@ records what the last attempt at predicting cost and bought.
 without the host blocking on `hipDeviceSynchronize`:
 
 > A GPU-stream op becomes a **future** that resolves when the hardware reaches that point.
-> A `hipLaunchHostFunc` callback fires a `Waker`; `futures-util` then orchestrates GPU
-> concurrency directly.
+> A `hipLaunchHostFunc` callback fires a `Waker`; `std`'s own future machinery then
+> orchestrates GPU concurrency directly.
+
+> **CORRECTED 2026-08-01.** This said `futures-util`. That crate was pulled in for exactly
+> one type — `AtomicWaker` — and is replaced by the `atomic-waker` crate, which is that type
+> with no transitive dependencies. `tokio` went the same day: its entire use was
+> `Builder::new_current_thread().build()?.block_on(..)` at eight sites — no sync primitives,
+> no macros, no `spawn`, no timers — replaced by a 15-line `std` park/unpark `block_on` in
+> `backend.rs`, which `tests/vk.rs` had already written with the note that it "beats pulling
+> in a runtime". **The concurrency here is GPU streams, not CPU tasks**, which is why an
+> executor was never load-bearing. ROCm's crate graph went 103 → 97.
 
 **An io_uring completion's bounce-copy used to be one of those futures. It is not any more,
 and the bridge is smaller for it.** The ticketed dataflow (INV-5) moved each expert's
@@ -232,10 +267,12 @@ sequenceDiagram
   Loop->>Comp: moe_acc_drain — converts, resets, and IS the residual add
 ```
 
-- **One runtime, single-threaded, borrows `&mut self`.** `generate()` drives the whole
+- **One `block_on`, single-threaded, borrows `&mut self`.** `generate()` drives the whole
   decode from **one** `block_on`; `forward()` is `async` and awaits the expert stream
-  inline (no per-layer `block_on`). The runtime is local (not on `self`) so the future can
-  borrow `&mut self` — the engine's state is single-owner throughout.
+  inline (no per-layer `block_on`). It is a free function, not a runtime on `self`, so the
+  future can borrow `&mut self` — the engine's state is single-owner throughout. *(It was a
+  local tokio current-thread runtime until 2026-08-01; it is now `backend.rs`'s 15-line
+  park/unpark loop. Same shape, same guarantee, one fewer dependency tree.)*
 - **The reaper is the only other thread** (`src/fetch/asyncfetch.rs`). It owns the demand ring
   and a dedicated fetch stream (`backend::Stream::fetch()` — a `hipStream_t` under `rocm`, a
   third `VkQueue` with its own ring and timeline under `vulkan`); it queues+submits the batch,
@@ -729,8 +766,23 @@ regression would be charging a workload change to a code change.
 - The drain IS the residual add on a MoE layer, and `--moe-gain` folds into its multiply. So
   the convert costs no extra pass and needs no barrier of its own: the join disappeared
   rather than moving.
-- `moe_reduce` survives OFF the decode path, as the f32 reference the oracle tests pin
-  against and the shape `tests/vk.rs` probes cross-queue visibility with.
+- ~~`moe_reduce` survives OFF the decode path, as the f32 reference the oracle tests pin
+  against and the shape `tests/vk.rs` probes cross-queue visibility with.~~
+
+  > **CORRECTED 2026-08-01. `moe_reduce` is deleted end to end** — the HIP kernel, the
+  > `rivoli_moe_reduce_s` C wrapper, both launchers, the Vulkan push struct and
+  > `kernels/vk/moe_reduce.comp`. It had been off the decode path since this accumulator
+  > landed, and `moe.hip`'s own comment said so. Neither surviving use held: the oracle tests
+  > pin against the **integer** drain (`tests/vk.rs::moe_vq_matches_the_host_oracles`, and
+  > the gate below), and the cross-queue visibility probe
+  > (`a_moe_dispatch_sees_what_the_fetch_queue_wrote`) was rewritten to dispatch
+  > `moe_acc_drain` over a fixed-point accumulator — `1<<44` per row over 2 rows at gain 3 is
+  > exactly 6.0, the same value it asserted when it drove `moe_reduce`, with no rounding for
+  > the schedule to reach. Keeping an f32 reference for a path whose correctness argument is
+  > *"integer addition associates"* was reference by habit, not by need.
+  >
+  > **The reasoning above stays, because it is why the reduce had to go**, and
+  > `moe_acc_drain.comp`'s header carries the same argument beside the code.
 - Vulkan: `shaderBufferInt64Atomics` is now a REQUIRED device feature (gfx1151 has it), and
   `missing_features` names it. `GL_EXT_shader_atomic_int64` in `moe_down_vq.comp`.
 - `moe_ev_start`/`_end` still bracket honestly. `_end` records on an idle compute stream
@@ -873,7 +925,17 @@ and takes one token; above it, the verify pass. **2.97 tok/s against 2.68 sequen
 
 The paragraph above says "the only lever is acceptance". That was wrong by omission: the
 other lever is **not spending the verify pass on drafts that will not pay for it**. Three
-measurements made the gate designable, all from `RIVOLI_MTP_PROBE=1`:
+measurements made the gate designable, all from the target-side probe `RIVOLI_MTP_PROBE=1`:
+
+> **The probe was deleted 2026-08-01.** It was an env var, which `CLAUDE.md` forbids for
+> exactly the reasons that apply here — invisible to `--help`, absent from the command line
+> `benchmarks.md` records, silently active in a build that looks stock. It had answered its
+> question ("de-quantize the draft head" → REFUTED at 49% → 54%, Δ = 3.4 pp ± 7.4), and a
+> refuted lever does not need a standing instrument. Recover it from tag
+> `archive/mtp-target-probe`; `src/gpu.rs` now reads **zero** env vars. **The DRAFT-side
+> `mtp_bins` is deliberately untouched** — it sizes the live `--mtp-min-conf 0.8` gate that
+> is on by default and worth 1.108×, so the ≥0.8 row of the table below is still measurable
+> from a stock build. The table stays as recorded; it is what makes the gate defensible.
 
 | | seasons (degenerate) | memory (coherent) | int4/seasons |
 |---|---:|---:|---:|

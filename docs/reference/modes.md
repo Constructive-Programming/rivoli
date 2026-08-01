@@ -139,23 +139,33 @@ a pure-recency policy lets those flush the genuinely-hot ones.
 | `lru` | recency only | no | Simplest. One list, evict the least-recently-used. |
 | `2q` *(default)* | recency + a 2nd-access promotion | yes | A1in probation (one-shots age out) + Am frequent + A1out ghost. |
 | `arc` | self-tuning recency/frequency balance | yes | T1/T2 + B1/B2 ghosts + adaptive target `p`. |
-| `top-m` **(opt-in, single-format modes only)** | router rank + residency | n/a | **Changes which experts RUN, not just which are cached.** Not output-neutral. See below. |
 
-### `top-m` — cache-conditional routing (opt-in, not the default)
+**Those three are the whole list.** `--cache-policy` parses `lru | 2q | arc` and nothing
+else; every one of them is output-neutral by construction (**INV-1**, `architecture.md`
+§8b).
 
-`--cache-policy top-m`, cache-conditional MoE routing
+### `top-m` was a fourth policy. RETIRED 2026-07-30, removed from the engine.
+
+> **This section described a selectable policy until 2026-08-01.** It does not any more —
+> `--cache-policy top-m`, `--route-j`, `--route-m`, `RouteAdvice`, the `route_into`
+> substitution and the `swap%` counter are all deleted from the engine, and `bin/replay`'s
+> (J, M) substitution grid went with them on 2026-08-01. The prose below is kept in the
+> past tense because *what it ruled out is the durable part*; nothing here is a knob.
+
+`top-m` was cache-conditional MoE routing
 ([arXiv:2412.00099](https://arxiv.org/abs/2412.00099)). **Every other policy answers "what
-do I evict". This one answers "given that a miss costs a 15 MB read, is the 5th-ranked
+do I evict". This one answered "given that a miss costs a 15 MB read, is the 5th-ranked
 expert that is already resident better than the 4th-ranked one that is not?"** The top-`J`
-ranked experts are always selected; the remaining `top_k − J` slots prefer experts that are
-already resident *and* ranked inside the top-`M` window; anything left falls back to plain
-rank order. Expert weights are untouched — the cache reorders *selection* only and never
-rewrites a gate value. Knobs `--route-j` (**4**) and `--route-m` (**9**) — the measured
-cell, NOT the paper's J=2/M=12, which was rejected on this workload (see below).
+ranked experts were always selected; the remaining `top_k − J` slots preferred experts that
+were already resident *and* ranked inside the top-`M` window; anything left fell back to
+plain rank order. Expert weights were untouched — the cache reordered *selection* only and
+never rewrote a gate value. Knobs were `--route-j` (**4**) and `--route-m` (**9**) — the
+measured cell, NOT the paper's J=2/M=12, which was rejected on this workload.
 
-**This is the first policy whose choice is not output-neutral.** `lru`, `2q` and `arc`
-change only which bytes are read and when; the decoded tokens are identical. `top-m`
-changes which experts run, so it changes the output. That is why it is opt-in.
+**It was the only policy whose choice was not output-neutral**, and that is why it is gone.
+`lru`, `2q` and `arc` change only which bytes are read and when; the decoded tokens are
+identical. `top-m` changed which experts ran, so *every* cache change became a potential
+output change and each one needed a perplexity run to price.
 
 **The measured trade** (int3-vq, 5,184 teacher-forced positions, `--max-mem 100`, at
 `--route-j 4 --route-m 9`):
@@ -167,30 +177,29 @@ changes which experts run, so it changes the output. That is why it is opt-in.
 | 95% CI | **[−0.21%, +1.27%]** |
 | verdict | **UNCERTIFIED** against the ~1% bar |
 
-Read both halves of that honestly. The interval **contains zero**, so `top-m` is *not
-significantly worse* than the baseline — and it is also *not certified within budget*,
-because the upper bound of +1.27% overshoots the pre-registered ~1% bar. The point
-estimate is half the bar; the uncertainty is what fails, not the measurement. Under the
-paper's own reference band (+0.1–3.0%) it would pass comfortably.
+Read both halves of that honestly. The interval **contained zero**, so `top-m` was *not
+significantly worse* than the baseline — and also *not certified within budget*, because
+the upper bound of +1.27% overshot the pre-registered ~1% bar. The point estimate was half
+the bar; the uncertainty is what failed, not the measurement. Under the paper's own
+reference band (+0.1–3.0%) it would have passed comfortably. **Relaxing the bar to that
+band was considered and DECLINED** — the ~1% figure was fixed in the plan before any data
+existed, and moving a threshold after seeing a result that misses it is post-hoc reasoning.
+Recorded so it is not re-proposed as an oversight. Certifying it as the default would have
+needed ~**12,840 teacher-forced tokens** (~2.5× the corpus used), about **3.4 h** of
+sole-tenant device time for a baseline plus one cell, and at that point estimate it might
+*still* have missed.
 
-**Making it the default requires certification first.** That needs roughly **12,840
-teacher-forced tokens** (~2.5× the corpus used), about **3.4 h of sole-tenant device time**
-for a baseline plus one cell — and at the current point estimate it may *still* miss. Until
-someone buys that, `top-m` stays opt-in.
+Later measurement settled it against the bar outright — **+3.63% PPL on int3-vq and +12.7%
+on int4** — but the deciding argument was the structural one above, not the number. Full
+record in
+[`docs/investigations/cache-conditional-routing.md`](../investigations/cache-conditional-routing.md);
+the (J, M) grid and the certification arithmetic are tabulated in
+[`docs/measurement/benchmarks.md`](../measurement/benchmarks.md) §"`top-m` offline screen"
+and §"DECISION". Recover the offline screen from tag `archive/replay-oracle-prefetch`.
 
-**Relaxing the bar to the paper's ≤3% band was considered and DECLINED.** It would have
-passed immediately, and that is precisely the reason not to do it: the ~1% figure was fixed
-in the plan before any data existed, and moving a threshold after seeing a result that
-misses it is post-hoc reasoning. Recorded here so it is not re-proposed as an oversight.
-
-**Not available in `--mode hybrid`** — the rank-driven tier rule it would need is parked on
-an artifact precondition (see `docs/investigations/cache-conditional-routing.md`). The engine rejects the combination
-rather than silently falling back. `top-m` is also incompatible with `--trace`, because
-substitution breaks the invariant the v2 trace format promises.
-
-**`lru`, `2q` and `arc` are byte-identical to before `top-m` existed.** The substitution
-sits behind an early return, and the residency predicate is provably never consulted when
-routing advice is absent. Choosing any of the three leaves the engine exactly as it was.
+**`lru`, `2q` and `arc` are byte-identical to before `top-m` existed, and to after.** The
+substitution sat behind an early return, and with it deleted routing is a pure function of
+(logits, bias, `top_k`) — which is now the tested invariant, not a claim.
 
 ### What `hybrid` demands of a policy
 The HOT (int4) slab should hold the *frequent* experts. But **an expert's format only
@@ -220,9 +229,12 @@ would need speculative refetch. Acceptable, but real.
 
 ## Interaction matrix
 
-Rows = format mode, columns = cache policy. `top-m` is omitted from the grid below: it
-is a single-format policy only (`config.rs::validate` rejects `top-m` + `hybrid` outright)
-and is documented in its own section above.
+Rows = format mode, columns = cache policy. The grid is complete — these three policies are
+all there are. (It once carried a fourth column for `top-m`, which was single-format only;
+`config.rs::validate` rejected `top-m` + `hybrid` outright. Both the policy and that
+validator are gone — `Config::validate` was an `Ok(())` stub after the retirement and was
+deleted 2026-08-01; `validate_backend`, which refuses `--mode int4|hybrid` under Vulkan,
+is a different function and is still live.)
 
 | | `lru` | `2q` *(default)* | `arc` |
 |---|---|---|---|
@@ -233,8 +245,18 @@ and is documented in its own section above.
 - **Single-format rows** (`int3-vq`, `int4`): the policy runs unmodified
   (`hybrid::make`, dynamic), one slab.
 - **Hybrid row:** the same dynamic policy runs with two strides and reports a
-  `Tier` (Cold/Hot) per insert; the pool maps that to a slab. `--2q-kout` still sizes
-  the ghost. `--2q-kin`/`--2q-kout` are live in every mode (`src/memory/cache.rs`).
+  `Tier` (Cold/Hot) per insert; the pool maps that to a slab. The 2Q split still sizes the
+  A1in probation queue and the A1out ghost, at `TwoQSplit::default()` — **kin 8% / kout
+  20%**, in `src/memory/cache.rs`, in every mode.
+
+  > **CORRECTED 2026-08-01.** This said "`--2q-kin`/`--2q-kout` are live in every mode".
+  > The *split* is; the two engine flags are not. They were deleted that day, having never
+  > appeared in `docs/`, `tests/`, the README or any script, and `TwoQSplit::default()` was
+  > the only value ever passed. The measured optimum is a broad plateau (kin 6–10% × kout
+  > 15–25%, all within 0.1pp), which is why nothing was ever lost by not exposing it —
+  > `src/memory/cache.rs` carries that measurement beside the constant. To sweep the split
+  > offline, `bin/replay` keeps its own `--kin`/`--kout` and prints the full kin×kout grid;
+  > that is now the only way to move it.
 
 ---
 

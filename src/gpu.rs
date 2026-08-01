@@ -1851,6 +1851,9 @@ impl<'a> GpuEngine<'a> {
                 // `e = e_start + row/inter` with every row independent, so an `e_count > 1`
                 // dispatch is exactly the same arithmetic as `e_count` separate ones, and
                 // `moe_reduce` sums `for e in 0..e_count` in fixed order either way.
+                // (`moe_reduce` was DELETED 2026-08-01 — the fixed-point `moe_acc_drain`
+                // replaced it. It is named here, and twice below, because the argument for
+                // why batching is exact is what it was; the kernel is in git, not the tree.)
                 //
                 // Runs must be uniform in FORMAT as well as residency: hybrid mixes int4
                 // and int3-vq within a layer and they are different kernels. `sel` order is

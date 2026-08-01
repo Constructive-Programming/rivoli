@@ -10,6 +10,17 @@ live code.** Step 1 (LOOKA) and the `--hint-k` eviction-veto layer were built, m
 inert, and removed; nothing described below still exists in `src/`. The measurements stand
 and are the reason it went — read this before proposing cross-layer prefetch again.
 
+> **Naming note, 2026-08-01: `submit_spine` is now `Pin::submit_layer`.** This file names
+> the old symbol four times (`:270`, `:446`, `:458`, `:537`) while describing the batch
+> protocol a speculative admission would have to fit inside. The *function* was never a
+> prefetch mechanism and did not go with the rest — it was a `submit_spine` + unwrap pair
+> that folded into one function on 2026-08-01, the split having been an artefact of nothing.
+> **The correctness rule those paragraphs describe is still live and still binding**: allocate
+> every miss slot in a batch (phase 1b) before resolving final addresses or issuing reads
+> (phase 1c), because phase 1b is where eviction and compaction relocate slots. Grep
+> `submit_layer` in `src/memory/pin.rs`. Kept unrenamed below so the design prose still reads
+> as the record it is.
+
 > **THE ANSWER, 2026-08-01 — and it is not the one this document spent 400 lines expecting.**
 > Cross-layer prefetch is closed, but **not** because prediction is hard and **not** because
 > the drive is saturated. Both of those were the stated reasons and both are false:
@@ -41,6 +52,17 @@ L+2, falling).
 
 The offline simulator in `bin/replay` is NOT affected: its `Pilot` is a modelled predictor
 over a trace, self-contained, and still the right tool for asking the recall question.
+
+> **SUPERSEDED 2026-08-01 — `Pilot` was deleted from `bin/replay` too.** The sentence above
+> was the argument for keeping it, and it did not survive its own file: this document's
+> "Feasibility, settled" section answers the recall question with a **measurement**
+> (`--features pred-probe`, 82.7% pre-attention router recall) and the modelled curve
+> "described itself as A MODEL, NOT A MEASUREMENT … every row is an upper bound". A modelled
+> upper bound is not the right tool for a question that now has a measured answer, and every
+> cell it produced is tabulated in `measurement/benchmarks.md`. `HORIZONS`,
+> `COLIBRI_L1_RECALL` and the recall curve went with it; `bin/replay` is 813 → 240 lines and
+> keeps the residency sim and the policy table that `--sweep` drives. Tag
+> `archive/replay-oracle-prefetch`.
 
 The history below is kept because it records *why* this was parked twice and what changed.
 

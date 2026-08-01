@@ -11,8 +11,17 @@ verdict: Porting the engine to Vulkan across four phases — the journal, not th
 > kernels that make speculative decode ROCm-only. `grep -n "^## " docs/investigations/vulkan-port.md` for the
 > rest; the phase sections are how it got here, including two conclusions it later
 > falsified (Vulkan CAN overlap; timeline waits DO work).
-> **One line:** decodes `--mode int3-vq --attn dense`, three queues, 97% fetch hidden,
-> ~1.9× slower than ROCm and all of it MoE kernel throughput.
+> **One line:** decodes `--mode int3-vq --attn dense`, three queues, ~1.9× slower than ROCm
+> and all of it MoE kernel throughput.
+>
+> **CORRECTED 2026-08-01.** This line also said "97% fetch hidden". **Do not quote that
+> number** — `fetch_hidden_pct` was a broken quotient (see the correction ~40 lines below),
+> and on 2026-08-01 the metric was deleted from the engine outright rather than kept in
+> corrected form, along with `exposed_fetch_ms`, `rivoli_fetch_hidden_pct` and the
+> `split/exposed-fetch` series. The Vulkan overlap finding does **not** depend on it: it
+> rests on increment 1 vs increment 2 at fixed everything-else. Every `fetch_hidden_pct`
+> figure below is kept as recorded, because what it *ruled out* — that a green correctness
+> check certifies an overlap invariant — is this journal's most reused lesson.
 
 Status: **RUNNABLE, AND IT IMPLEMENTS THE DESIGN. Phase 4 complete (2026-07-30):
 `--features vulkan` builds and decodes `--mode int3-vq --attn dense` over THREE QUEUES with
@@ -908,12 +917,29 @@ PILOT and `top-m` attack a bottleneck we have quantified, while this buys portab
 we do not currently need on a node where ROCm works. Build it when the portability goal
 is real, not because the plan exists.
 
+> **2026-08-01: the sequencing argument inverted, and the losers are both gone.** `top-m`
+> was RETIRED 2026-07-30 (+3.63% PPL on int3-vq, +12.7% on int4 against a ~1% bar) and
+> PILOT was DELETED 2026-07-31 (the eviction veto bound on 0.9% of evictions). **This item —
+> the one ranked last of three — is the one that shipped.** Kept because the ranking was
+> reasonable on the evidence available and still lost: "least measured upside" priced the
+> two competitors' *modelled* upside against this one's *certain* cost, and modelled upside
+> is the term that failed. See `cache-conditional-routing.md` and `cross-layer-prefetch.md`.
+
 ## 2d pre-flight: `moe.hip`, the three int3-vq kernels
 
 Scoped against the source before writing, so the tranche starts from decisions rather
 than discoveries. **Written and merged** (`047d0be`, `bffdc9d`); the `moe_*_vq` and
 `moe_reduce` shaders exist and the header's "landed through tranche 2d" is the current
 status. This section is retained as the plan it was executed from.
+
+> **2026-08-01: `moe_reduce.comp` no longer exists**, nor does the HIP kernel, its C
+> wrapper, either launcher or the Vulkan push struct. Fixed-point accumulation
+> (`reference/architecture.md` §12) replaced it on 2026-07-31 — `moe_acc_drain` is the
+> shader that ships. Decision 4 below, "`moe_reduce` is a partition feeding an
+> order-sensitive reduction, so it is a numerics decision, not scheduling", was **correct
+> and is exactly why it went**: the replacement makes every expert `atomicAdd` at a fixed
+> integer scale, so the partition carries no freedom and the schedule cannot reach the
+> result. The plan is retained unedited; `moe_*_vq` did land as written.
 
 **The tightest oracle in the suite guards this tranche.** `moe_vq` has **3.3×** headroom
 against `gemv_fp8`'s 2928×. The standing rule applies without restatement: *a failing VQ
@@ -1378,6 +1404,19 @@ by increment 2 — the staging copy is a `vkCmdCopyBuffer` on the fetch queue.
    alignment guard exists for — worth measuring against the default on this backend, since
    the reason bounce is the ROCm default (a read tax on host-mapped VMM) may not price the
    same way when there is no H2D copy being saved.
+
+   > **2026-08-01: that measurement was never taken, and the flag is now gone.**
+   > `--direct-vmm-dma` was deleted and the staging hop is unconditional on both backends —
+   > the amdgpu EFAULT it originally worked around no longer reproduces on 6.18.38, and on
+   > ROCm the surviving objection is write-side and decisive (5.66 GB/s DMA into VMM device
+   > pages vs 12.4 into the pinned arena; 1239 → 2709 µs per missed expert; 2.59 → 1.19
+   > tok/s). **The Vulkan question this paragraph raises is genuinely still open** — the
+   > pool is host memory here, so no H2D copy is being saved and the ROCm pricing may not
+   > carry. It is now a question about re-adding a destination mode, not about flipping a
+   > flag, and `src/fetch/stream.rs`'s header holds the measurement and the
+   > `get_user_pages` history anyone re-opening it needs. Increment 2 fixed (2) by making
+   > the staging copy a `vkCmdCopyBuffer` on the fetch queue, which is why nobody came back
+   > to this.
 
 **Two things this design must not quietly change.** Cross-queue submits make the
 COMPUTE→COMPUTE and COMPUTE→TRANSFER barriers in `enqueue` insufficient on their own —

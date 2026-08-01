@@ -83,7 +83,19 @@ No truncation warning; 3.52 tok/s, within the spread of the same config without 
 | signal | what | needs |
 |---|---|---|
 | **traces** | `rivoli.decode` → `token N` → `layer L` → leaf intervals (`gpu-wait/*`, `io-wait/uring-reap`, `cpu/*`), each leaf tagged `thread=decode\|reaper`, with true start/end times | `--spans` given |
-| **metrics** | `rivoli_ms_per_tok{class,thread}` plus `rivoli_tok_per_s`, `rivoli_hit_pct`, `rivoli_gb_per_tok`, `rivoli_miss_per_tok`, `rivoli_fetch_hidden_pct`, `rivoli_tokens` | always, when OTLP is on |
+| **metrics** | `rivoli_ms_per_tok{class,thread}` plus `rivoli_tok_per_s`, `rivoli_hit_pct`, `rivoli_gb_per_tok`, `rivoli_miss_per_tok`, `rivoli_tokens`, `rivoli_degenerate` (+ `rivoli_loop_period`/`_repeats` when it fires) | always, when OTLP is on |
+
+> **CORRECTED 2026-08-01.** This row also listed `rivoli_fetch_hidden_pct`. That gauge is
+> **deleted** — it and `exposed_fetch_ms` were removed on the authority of their own doc
+> comment, which said the number was "SUBSTANTIALLY OVERSTATED — an upper bound, and not a
+> tight one… prefer `io_wait_ms`, which is measured". It was derived from
+> `moe_wall − compute_gpu`, and `compute_gpu` under-counted, so the quotient reported ~96%
+> against a true overlap ceiling of ≤57% and printed 99% for a configuration that decoded at
+> half speed. **The honest series for "did fetch cost wall" is `rivoli_ms_per_tok{class="io-wait"}`.**
+> The Grafana stat tile that queried the gauge was repointed there the same day. Nothing was
+> lost: the measurement that condemned the metric is in
+> [`investigations/perf-evidence.md`](../investigations/perf-evidence.md) and
+> [`how-to-measure.md`](how-to-measure.md).
 
 Both go out over OTLP/HTTP at run end. Metrics exist because span attributes are
 *searchable* but not *chartable* — Grafana cannot draw `gpu_wait_ms` over time from a span
@@ -95,7 +107,7 @@ Each level carries what identifies it, and **deliberately not** the numbers:
 
 | span | attributes |
 |---|---|
-| `rivoli.decode` | `rivoli.{model,mode,cache_policy,attn,moe_gain,max_mem_gib,bench_tokens,prompt,route_j,route_m,2q_kin_pct,2q_kout_pct,sinks,window,misa_heads,tokens_generated}` (`topk_path` is gone — the engine no longer has arms to name) |
+| `rivoli.decode` | `rivoli.{model,mode,cache_policy,attn,moe_gain,max_mem_gib,bench_tokens,prompt,sinks,window,misa_heads,tokens_generated,degenerate}` (+ `loop_{period,repeats,start}` when degenerate) |
 | `token N` | `rivoli.token_index`, `rivoli.token_id` |
 | `layer L` | `experts.{cold,warm}.{int4,int3_vq}`, `experts.cold`, `experts.total` |
 | leaf | `thread` |
@@ -104,8 +116,23 @@ Each level carries what identifies it, and **deliberately not** the numbers:
 `tok_per_s`, `wall_ms_per_tok` and friends on it; those went out as metrics too, which made
 two sources of truth that can drift, and they are not what you search a trace *by*. You
 search by "which mode / which policy / which budget", then read the numbers off a chart.
-`route_j`/`route_m` appear only under `top-m` and `max_mem_gib` only when set — a `(4, 9)`
-next to `lru`, or a `0 GiB` budget, would read as a setting that did something.
+`max_mem_gib`, `bench_tokens` and `prompt` are emitted **only when set** — a `0 GiB` budget
+or `0` generated tokens would read as a setting that did something, rather than as absent.
+
+> **CORRECTED 2026-08-01.** The row above also listed `route_j`, `route_m`, `2q_kin_pct` and
+> `2q_kout_pct`, and this paragraph said "`route_j`/`route_m` appear only under `top-m`".
+> **The engine emits none of the four.** `route_j`/`route_m` went with `top-m` when that
+> policy was retired 2026-07-30 (`investigations/cache-conditional-routing.md`);
+> `2q_kin_pct`/`2q_kout_pct` went 2026-08-01 with the `--2q-kin`/`--2q-kout` flags, which
+> were deleted because `TwoQSplit::default()` was the only value anything ever passed — a
+> constant is not run identity, so labelling every span with it bought nothing. `topk_path`
+> had already been corrected out of this table for the same class of reason. The
+> conditional-emission rule the paragraph was illustrating is real and still holds; only its
+> examples were dead.
+>
+> The attribute set is thin on **run identity** — no artifact hash, no git rev, no host —
+> and that is a known gap with a proposal attached, not an oversight:
+> [`investigations/otlp-modernization.md`](../investigations/otlp-modernization.md) §2a.
 
 **`layer L`'s expert composition is the point of the layer level.** Eight cold int4 experts
 and eight warm int3-vq experts are different animals, and residency × format is the pair
@@ -306,7 +333,10 @@ It is worse than sparse: `ITIMER_PROF` is **process-directed**, so the kernel de
 SIGPROF to an arbitrary eligible thread and the sample is attributed wherever it lands, not
 to the thread that burned the CPU (the documented source of Go's profile skew,
 golang/go#14434). With decode / reaper / tokio threads, the `thread` attribution — the one
-dimension we actually care about — is exactly what cannot be trusted.
+dimension we actually care about — is exactly what cannot be trusted. *(2026-08-01: tokio
+is gone from the dependency graph — its entire use was `block_on` at eight sites — so the
+thread set is decode / reaper plus the io_uring SQPOLL kernel thread. **Two eligible threads
+instead of three does not fix process-directed delivery**, so the argument is unchanged.)*
 
 **Span profiles are not available to us, twice over.** Grafana supports them for Go, Java,
 Ruby, .NET and Python; **Rust is absent**, and `grafana/pyroscope-rs#172` has sat open since

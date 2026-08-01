@@ -13,7 +13,8 @@
 // ── Fixed-point MoE accumulator ─────────────────────────────────────────────────
 // Expert contributions are summed as INTEGERS at scale 2^-MOE_ACC_SHIFT, which makes
 // the sum ASSOCIATIVE: the result stops depending on which stream finished first. That
-// is what lets the per-expert partial rows, the `moe_reduce` over them, and the stream
+// is what lets the per-expert partial rows, the `moe_reduce` over them (that kernel was
+// deleted 2026-08-01, once nothing on the decode path called it), and the stream
 // join that had to precede it all leave the decode path — the join disappears rather
 // than moving, because the only thing that still needs every expert is the residual
 // add, which already sits behind the end-of-layer barrier.

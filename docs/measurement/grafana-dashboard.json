@@ -240,31 +240,22 @@
         "type": "prometheus",
         "uid": "${DS_PROM}"
       },
-      "description": "Share of reaper fetch buried behind compute. Derived from moe_wall - compute_gpu, so treat as a gauge, not a hard number — prefer the io-wait series.",
+      "description": "Reaper thread blocked in io_uring, per token. THIS TILE WAS 'fetch hidden %' UNTIL 2026-08-01, querying rivoli_fetch_hidden_pct — a gauge derived from moe_wall - compute_gpu that was deleted from the engine that day for being an upper bound and not a tight one (it read ~96% against a true overlap ceiling of <=57%, and 99% for a config decoding at half speed). Its own description already said 'prefer the io-wait series', so the tile was repointed there rather than removed: io-wait is measured, not derived. It OVERLAPS the decode thread by design and routinely exceeds wall — compare it against gpu-wait on the CLASS panel, do not read it as a share. See docs/measurement/how-to-measure.md.",
       "fieldConfig": {
         "defaults": {
           "decimals": 1,
           "mappings": [],
-          "max": 100,
           "min": 0,
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "red",
+                "color": "text",
                 "value": 0
-              },
-              {
-                "color": "orange",
-                "value": 80
-              },
-              {
-                "color": "green",
-                "value": 92
               }
             ]
           },
-          "unit": "percent"
+          "unit": "ms"
         },
         "overrides": []
       },
@@ -295,12 +286,12 @@
       "pluginVersion": "12.3.1",
       "targets": [
         {
-          "expr": "rivoli_fetch_hidden_pct",
-          "legendFormat": "hidden",
+          "expr": "rivoli_ms_per_tok{class=\"io-wait\"}",
+          "legendFormat": "io-wait",
           "refId": "A"
         }
       ],
-      "title": "fetch hidden %",
+      "title": "io-wait / tok",
       "type": "stat"
     },
     {
@@ -770,7 +761,7 @@
         "type": "prometheus",
         "uid": "${DS_PROM}"
       },
-      "description": "route-gpu-wait vs route total shows route is attention GPU time, not host routing. tail-wait vs tail-gpu shows how much of the tail's blocking call is real GPU work. exposed-fetch is the only fetch that costs wall.",
+      "description": "route-gpu-wait vs route total shows route is attention GPU time, not host routing. tail-wait vs tail-gpu shows how much of the tail's blocking call is real GPU work. moe-compute-gpu is the MoE bracket net of the measured all-resident counterfactual. CORRECTED 2026-08-01: this also named a 'split/exposed-fetch' series, which the engine stopped producing when exposed_fetch_ms was deleted alongside fetch_hidden_pct. The regex target keeps rendering the four live splits; only the sentence was stale. For 'did fetch cost wall', read the io-wait tile and the CLASS panel.",
       "fieldConfig": {
         "defaults": {
           "color": {

@@ -374,6 +374,16 @@ directly at **2.01×**, and that is the figure of record.**
 2026-07-27: **64 (layer, token) records, all 21 full layers, 131,202 token-scores** at
 nt = 2049–2052. Characterised on its own terms first; the fixture comparison comes after.
 
+> **The dump was deleted 2026-08-01.** `RIVOLI_DUMP_SCORES` was an env var, which
+> `CLAUDE.md` forbids — an env var is invisible to `--help`, absent from the command line
+> `benchmarks.md` records, and silently active in a build that looks stock. It served this
+> investigation, which is **closed-negative with its one recommendation already shipped**
+> (the device top-k, −9.4 ms/token), so the instrument had no remaining question. `src/gpu.rs`
+> now reads zero env vars. **The distribution it captured is tabulated below and is the
+> record**; if the premise is ever re-opened, re-add the dump behind a *feature and a flag*
+> the way `--ppl`, `--pred-probe` and `--spans` are — that is the shape the rule asks for,
+> and this is one of the two env-var instruments that motivated writing it down.
+
 *Provenance:* `--features rocm,trace`, GLM-5.2 full artifact, `--attn dsa --mode hybrid
 --cache-policy lru --max-mem 115 -bench 4`, 2432-token prompt, sole tenant. **The records
 are all prefill-phase** — scoring begins at nt = 2049 and the budget exhausted immediately

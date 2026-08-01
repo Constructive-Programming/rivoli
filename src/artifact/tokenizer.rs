@@ -303,8 +303,9 @@ impl Tokenizer {
     }
 
     /// Encode prompt text to token ids with NO special tokens — raw continuation.
-    /// Used by `--ppl` (which scores a fixed corpus, not a chat turn) and by
-    /// `--raw-prompt` for reproducing pre-templating benchmark numbers.
+    /// Used by `--ppl`, which scores a fixed corpus rather than a chat turn. It also
+    /// served `--raw-prompt`, a flag deleted 2026-08-01 for reproducing pre-templating
+    /// benchmark numbers that no recorded command line ever asked for.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let enc = self
             .inner

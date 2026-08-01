@@ -84,18 +84,40 @@ split/tok: route = 101.1ms gpu-wait + 0.3ms host-routing
 
 These are **spans, not just counters** — pass `--spans` and they export as real OTLP
 spans with true start/end times across both threads, so a trace viewer draws the overlap
-instead of implying it. See [TRACES.md](TRACES.md).
+instead of implying it. See [traces.md](traces.md).
+
+> **CORRECTED 2026-08-01: the `tokio-poll` term above no longer exists.** `cpu` is now
+> exactly `launch + route + submit`. The term went when the expert launches were enqueued
+> straight onto the compute stream, and tokio itself was removed from the dependency graph
+> the same day — its entire use had been `Builder::new_current_thread().build()?.block_on(..)`
+> at eight sites, replaced by a 15-line std park/unpark `block_on`. **The measurement is
+> kept as recorded**: 2.4 ms of 338.2 ms/tok wall is 0.7%, so its removal does not move the
+> conclusion below, and a run whose numbers are quoted elsewhere should not be silently
+> re-tabulated. Expect four terms in a fresh `class/tok` line, not five.
 
 **These spans OVERLAP and do not sum to wall — by design.** `io-wait` is the reaper thread
 blocked in `io_uring` while the decode thread computes; it is 54% of wall precisely because
 it is concurrent with it. *(An earlier version of this line added "and 95% of it is hidden",
-which was the broken `fetch_hidden_pct`; it is ~22%, and the point being made here — that
-these spans overlap and must not be forced into a partition — never depended on it. See
-ARCHITECTURE.md §3.)* Forcing these into a partition is what
-broke the first version: it made `io-wait` a *derived* `moe_wall − compute_gpu` (a host
+which was the broken `fetch_hidden_pct`; the honest figure was ~22%, and the point being
+made here — that these spans overlap and must not be forced into a partition — never
+depended on it. See [architecture.md](../reference/architecture.md) §3.)* Forcing these
+into a partition is what broke the first version: it made `io-wait` a *derived*
+`moe_wall − compute_gpu` (a host
 clock minus a GPU clock) which reported **8.4 ms**, and `cpu` a residual. The measured
 io-wait is **183.7 ms — 20× larger**. The derived number was not measuring io-wait at all;
 it was measuring the *unhidden remainder*, which is a different and much smaller thing.
+
+> **`fetch_hidden_pct` and `exposed_fetch_ms` were deleted from the engine 2026-08-01** —
+> the fields, the PROFILE line's `% hidden` / `ms exposed` terms, the OTLP gauge and the
+> `split/exposed-fetch` series. (The Grafana stat tile that queried the gauge was
+> **repointed** at `rivoli_ms_per_tok{class="io-wait"}`, not deleted.) They are gone on the
+> authority of their own 27-line doc comment, which said the number was "SUBSTANTIALLY
+> OVERSTATED — an upper bound, and not a tight one… prefer `io_wait_ms`, which is measured".
+> The paragraph above is why: **`io-wait` is the measurement and the derived quotient was
+> not**, and a metric that reports 96% where the true ceiling is ≤57% (and 99% for a
+> configuration decoding at half speed) does not become useful by being labelled a gauge.
+> The diagnosis is preserved in [`investigations/perf-evidence.md`](../investigations/perf-evidence.md)
+> and `reference/architecture.md` §3; only the emitting code is gone.
 
 **The price, accepted deliberately: no residual is reported.** Measured `cpu` is 6.5 ms
 where the old residual said 8.8 — so ~2.3 ms/tok is genuinely unattributed. It is now
@@ -107,7 +129,8 @@ cannot be useful.
 
 1. **We are GPU-bound, and host compute is negligible — 6.2 ms, under 2%.** Now measured
    in four named pieces rather than inferred: kernel launch 2.6 ms (~1.5k driver calls),
-   tokio poll 2.4 ms, `submit_layer` 0.87 ms, `route_into` 0.31 ms. Any plan premised on
+   tokio poll 2.4 ms *(term deleted 2026-08-01 — see the note above)*, `submit_layer`
+   0.87 ms, `route_into` 0.31 ms. Any plan premised on
    host overhead is chasing 2%, and we know which 2%.
 2. **`route` is not routing.** Of its 101 ms, **101.1 ms is a blocking D2H wait and 0.31 ms
    is the actual host routing** — top-k over 256 experts across 75 layers costs nothing.
