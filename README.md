@@ -168,7 +168,7 @@ cargo run --release --features rocm -- <model-dir> --port 8080 --ctx 8192
 ```
 
 `POST /v1/chat/completions` (with or without `stream`), `GET /v1/models`, `GET /health`.
-Loopback only, one request at a time — the GPU is sole-tenant and decodes at ~3 tok/s, so
+Loopback only, one request at a time — the GPU is sole-tenant and decodes at ~2.7 tok/s, so
 concurrency here could only queue what the device already serialises.
 
 Under llama-swap, which spawns the process on demand and proxies to it:
@@ -179,7 +179,7 @@ models:
     cmd: /path/to/rivoli /var/db/rivoli/glm52-vq3-full --port ${PORT} --ctx 8192 --max-mem 115
     proxy: http://127.0.0.1:${PORT}
     checkEndpoint: /health
-    # Pin build is ~1 min and the port does not open until the model is loaded, so the
+    # Pin build is ~1-2 min and the port does not open until the model is loaded, so the
     # health check gets connection-refused (not a 503) until it is genuinely ready.
     healthCheckTimeout: 300
 ```
@@ -187,55 +187,23 @@ models:
 This is an inference backend, not a chat product — Open WebUI and the Hermes agent own the
 conversation surface, and everything here exists to be called by them.
 
-### Thinking
+- **Thinking defaults OFF**, which is the opposite of the checkpoint's own template. It is a
+  thinking model and the switch is a prompt prefill, not a flag; at ~2.7 tok/s a reasoning
+  block is tens of seconds of silence before the first word. `--think`, or per request
+  `enable_thinking` / `reasoning_effort`. Reasoning returns in `reasoning_content`, never
+  mixed into `content`.
+- **Tool calling works**, using the checkpoint's own `<tool_call>` syntax, parsed back into
+  OpenAI `tool_calls` with `finish_reason: tool_calls`. `tool_choice` does `"auto"` and
+  `"none"`; it refuses `"required"`, because nothing here can force the model's hand.
+- **No sampling** — greedy argmax, which is what every number in
+  `docs/measurement/benchmarks.md` is measured against. `temperature`/`top_p` are accepted
+  and ignored, with one warning per process.
+- **No `/v1/completions`, no paging.** A raw prompt cannot stop on EOS; `--ctx` is allocated
+  once, so a conversation that does not fit is a 400 rather than a silent truncation.
 
-The checkpoint is a **thinking model**. Its template ends the prompt at an open `<think>`,
-and the model fills that with reasoning before it answers; closing it immediately
-(`<think></think>`) is the off switch. There is a `/nothink` token in the vocabulary, but
-the template never emits it and neither does rivoli.
+**Full detail — the thinking protocol, the tool wire format, the chat-template port and the
+test that pins it — is in [`docs/reference/serving.md`](docs/reference/serving.md).**
 
-**rivoli defaults thinking OFF** — the opposite of the template — because at ~2.7 tok/s a
-reasoning block is tens of seconds of silence before the first word, and most OpenAI clients
-have no way to turn it off once it is on. Turn it back on per server with `--think`, or per
-request:
-
-```jsonc
-{"messages": [...], "enable_thinking": true}          // explicit, wins over --think
-{"messages": [...], "reasoning_effort": "high"}       // implies thinking; "none" implies off
-```
-
-Reasoning comes back in **`reasoning_content`**, never mixed into `content` — the field
-Open WebUI already renders as a collapsible section. Streaming sends `reasoning_content`
-deltas and then `content` deltas. If the token budget runs out mid-reasoning you get
-reasoning and an empty `content`, which is the honest report: there was no answer yet.
-
-Only `high` maps to `Reasoning Effort: High`; every other value maps to `Max`. That is the
-template's own `capitalize` behaviour, not a shortcut.
-
-### Deliberately absent, so nobody debugs it
-
-- **No sampling.** `temperature` and `top_p` are accepted and **ignored** — the engine
-  decodes greedy argmax, which is what every number in `benchmarks.md` is measured against.
-  Output is deterministic no matter what the client asks for. One warning per process says so.
-- **No tool calling.** The checkpoint defines it (`<tool_call>`/`<arg_key>`/`<|observation|>`),
-  so this is an omission rather than an impossibility — but a request carrying `tools`, or a
-  `tool`-role message, gets a **400** instead of being answered in prose, because a client
-  that asked for a tool call and got an essay waits forever. Orchestration belongs in the
-  agent above.
-- **No `/v1/completions`.** A raw, unframed prompt leaves the model outside an assistant
-  turn where its EOS ids are unreachable, so it runs to the token limit and then loops —
-  the failure mode that invalidated every benchmark cell above 2048 tokens (see the
-  retraction above). That endpoint would serve it by construction.
-- **No paging.** `--ctx` allocates the KV slabs once, at startup (~51 KB/token on top of
-  the expert pool); a conversation that does not fit is a 400, never a silent truncation.
-
-An image part in a `content` array becomes the template's own "unable to process this image"
-reminder rather than being dropped — a silent drop makes the model describe pictures it
-never received.
-
-The per-request log carries the same degeneration check `-bench` does — a looped response
-is a broken one, and it is *faster*, so server mode is not allowed to be the path that
-hides it.
 
 ## Layout
 

@@ -32,6 +32,7 @@ measured, kept; the result is in the engine. `closed-mixed` — parts of both, b
 | [`architecture.md`](../reference/architecture.md) | live | The engine as it is. The one doc meant to be read whole; §8b is the INV registry, enforced by tests/invariants.rs. |
 | [`modes.md`](../reference/modes.md) | live | The --mode × --cache-policy matrix and which knob does what. Quality ladder: int4 5.120 > hybrid 5.189 > int3-vq 5.275. |
 | [`vulkan-kernels.md`](../reference/vulkan-kernels.md) | live | Which kernels the Vulkan backend has: 16 of 29 ported, 6 more single-row. It decodes --mode int3-vq --attn dense at ~1.9x slower. |
+| [`serving.md`](../reference/serving.md) | live | The OpenAI HTTP server (--port). Thinking defaults OFF and is a prompt prefill, not a flag; tool calling works; sampling and /v1/completions do not, on purpose. |
 
 ## measurement/ — how to measure, and what was measured
 

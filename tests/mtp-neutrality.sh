@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Speculative decode must move SPEED and never OUTPUT (docs/ARCHITECTURE.md §13). This is
+# Speculative decode must move SPEED and never OUTPUT (docs/reference/architecture.md §13). This is
 # the paired check for that, one pair per `--attn` mode: decode once with `--no-mtp` and
 # once with the default, and compare token IDS. Not text — different id sequences can
 # decode to identical text, so a text diff reports only a lower bound on divergence.

@@ -22,7 +22,7 @@
 //! renderer and the parser are deliberate mirrors — see `parse_tool_calls`.
 //!
 //! Deliberately absent, so nobody goes looking:
-//! - **Sampling.** The engine is greedy argmax and every number in `benchmarks.md` is
+//! - **Sampling.** The engine is greedy argmax and every number in `docs/measurement/benchmarks.md` is
 //!   measured that way. `temperature`/`top_p` are accepted and IGNORED, with one warning
 //!   per process — honouring them is not a server-side change, and dropping them silently
 //!   would leave a client believing its own determinism story.
@@ -668,7 +668,7 @@ mod live {
             summary.hit_pct,
             if hung_up { " (client hung up)" } else { "" },
         );
-        // The repo's standing rule (README, MODES.md): a looped generation is not a slow
+        // The repo's standing rule (README, docs/reference/modes.md): a looped generation is not a slow
         // generation, it is a broken one, and it benchmarks FASTER because it re-routes to
         // the same few experts. Server mode must not be the one path that hides it.
         let rep = crate::telemetry::repetition_report(&text);
@@ -746,7 +746,7 @@ mod live {
         ONCE.call_once(|| {
             tracing::warn!(
                 "`temperature`/`top_p` are IGNORED — this engine decodes greedy argmax, which \
-                 is what every number in benchmarks.md is measured against. Output is \
+                 is what every number in docs/measurement/benchmarks.md is measured against. Output is \
                  deterministic no matter what the client asks for."
             );
         });

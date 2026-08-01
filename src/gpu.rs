@@ -956,7 +956,7 @@ impl<'a> GpuEngine<'a> {
         // disagree, which is an engine bug and not a user one. Indexing this directly was
         // a panic ("len is 78 but the index is 78") on the DEFAULT flags until 2026-08-01
         // — `--attn auto` picks dsa on any artifact with indexer weights, and speculative
-        // decode then asked for the head's slab. See docs/ARCHITECTURE.md §13.
+        // decode then asked for the head's slab. See docs/reference/architecture.md §13.
         let slab = match *idx.slab_of.get(l).with_context(|| {
             format!(
                 "dsa/misa row selection asked for layer {l}, but the indexer has slabs for \
