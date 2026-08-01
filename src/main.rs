@@ -601,42 +601,29 @@ fn main() -> Result<()> {
         }
 
         let t0 = std::time::Instant::now();
-        // Speculative decode is the default, but only where it is BUILDABLE. THREE
-        // conditions can take it away and none is the user's mistake: an artifact without
-        // the MTP head (an artifact converted before 2026-07-31 has no L78.i4, so
-        // int4/hybrid runs on one load without a head), `--trace` (a verify pass routes
-        // twice per layer and submits the union, which the v2 trace format cannot spell),
-        // and `--attn streaming`, whose row set is built host-side and would need one
-        // upload per row. Say which, once, and decode.
+        // Speculative decode is the default, but only where it is BUILDABLE. TWO conditions
+        // can take it away and neither is the user's mistake: an artifact without the MTP
+        // head (an artifact converted before 2026-07-31 has no L78.i4, so int4/hybrid runs
+        // on one load without a head), and `--trace` (a verify pass routes twice per layer
+        // and submits the union, which the v2 trace format cannot spell). Say which, once.
         //
-        // `--attn dsa/misa` USED to be on that list, and being on it is what made a bare
-        // `rivoli <artifact> -bench 8` panic on the DEFAULT flags: `--attn auto` picks dsa
-        // on any artifact carrying indexer weights, `main` never checked the attention mode
-        // at all, and the one-row DRAFT pass then slipped past the engine's `nrow > 1`
-        // guard and indexed the indexer's per-layer slab table at the MTP head's layer
-        // ("len is 78 but the index is 78"). Found 2026-08-01 while building server mode
-        // and fixed the same day by BATCHING the selection rather than by refusing it —
-        // dsa/misa now select per row, and the head attends dense. See §13.
-        let batched_rows = !matches!(cfg.attn, rivoli::attn::AttnMode::Streaming { .. });
-        let mtp = !a_no_mtp && engine.has_mtp() && !engine.tracing() && batched_rows;
+        // **The attention mode is no longer one of them, and it is the one that drew blood.**
+        // Every sparse mode was on this list, `main` never actually checked for any of them,
+        // and `--attn auto` picks dsa on any artifact carrying indexer weights — so a bare
+        // `rivoli <artifact> -bench 8` ran speculation under DSA, slipped past the engine's
+        // `nrow > 1` guard on the one-row DRAFT pass, and PANICKED indexing the indexer's
+        // per-layer slab table at the MTP head's layer ("len is 78 but the index is 78").
+        // Found 2026-08-01 while building server mode. Fixed by BATCHING the row selection
+        // rather than refusing it: dsa/misa select per row and the head attends dense, and
+        // streaming uploads one row set per row. All four modes speculate. See §13.
+        let mtp = !a_no_mtp && engine.has_mtp() && !engine.tracing();
         if !a_no_mtp && !mtp {
             info!(
                 "speculative decode OFF: {}",
-                match (engine.has_mtp(), engine.tracing()) {
-                    (false, _) => "this artifact carries no MTP head (re-run bin/fp8_to_i4 \
-                                   to emit L78.i4 for int4/hybrid)"
-                        .to_string(),
-                    (_, true) =>
-                        "--trace routes once per layer and a verify pass routes twice"
-                            .to_string(),
-                    // `streaming` by elimination — it is the only mode left that clears
-                    // `has_mtp && !tracing` and still fails `batched_rows`. Named rather
-                    // than interpolated from `a_attn`, which is the mode's Debug and would
-                    // print "streaming { sinks: 4, window: 8192 }" mid-sentence.
-                    _ => "--attn streaming builds its row set on the host, so a two-row \
-                          verify pass would need one upload per row and is not built \
-                          (docs/ARCHITECTURE.md §13); --attn dense and --attn dsa speculate"
-                        .to_string(),
+                match engine.has_mtp() {
+                    false => "this artifact carries no MTP head (re-run bin/fp8_to_i4 to \
+                              emit L78.i4 for int4/hybrid)",
+                    true => "--trace routes once per layer and a verify pass routes twice",
                 }
             );
         }

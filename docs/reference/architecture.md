@@ -885,11 +885,12 @@ weight read. That single term was the whole error; `docs/measurement/benchmarks.
 
 ### Refused rather than half-supported
 
-`--attn streaming` with `nrow > 1` (its row set is built on the HOST, so a batched pass needs
-one upload per row), tracing (a verify pass routes twice per layer and submits the union,
-which the v2 trace format cannot spell), and every batched launcher on Vulkan. `main`
-resolves all of these by downgrading to sequential decode and saying which, rather than
-failing.
+Tracing (a verify pass routes twice per layer and submits the union, which the v2 trace
+format cannot spell), and every batched launcher on Vulkan. `main` resolves the tracing case
+by downgrading to sequential decode and saying so, rather than failing.
+
+**No attention mode is on this list any more.** All four batch their row selection — see the
+correction below, and the one under it for streaming.
 
 > **CORRECTION, 2026-08-01: `--attn dsa|misa` used to be on that list, and being on it was a
 > PANIC on the default flags.** The sentence above used to name streaming/dsa/misa together
@@ -952,9 +953,38 @@ failing.
 > while the head stayed dense: 48.1% at topk 2048 vs 48.8% at 64. `--attn misa` rides the
 > same path (50.9% acceptance on a 64-token smoke).
 >
-> `--attn streaming` still refuses, and `main` still downgrades it. `rows_buf` now has the
-> per-row slices it would need and the change is small — but nothing measures streaming, and
-> shipping an unmeasured row set is how a mode goes wrong quietly.
+> `--attn streaming` still refused as of this correction; see the next one.
+
+> **CORRECTION, 2026-08-01, later the same day: `--attn streaming` batches too, so `main` no
+> longer downgrades ANY attention mode.** The block above closed with "nothing measures
+> streaming, and shipping an unmeasured row set is how a mode goes wrong quietly" — fair as
+> caution, wrong as a reason to leave it refused. The answer to an unmeasured mode is to
+> measure it. It came to ~15 lines: `hoisted_rows` loops the pass's rows and uploads each
+> row's `streaming_rows` set into the same per-row `rows_buf` slice dsa already uses.
+> `rows_host` is rebuilt per row rather than kept per row — at `MAXROW = 2` a second host
+> buffer would save one `streaming_rows` call at the price of ~8 KB of memcpy.
+>
+> Output-neutral on the same `--dump-ids` gate, two arms: 40 tokens at `--window 16` and 320
+> tokens at `--window 128`, both byte-identical between `--no-mtp` and the default.
+>
+> **The window must be narrower than the run or the check proves nothing.** `streaming_rows`
+> returns the whole causal prefix while `nt <= sinks + window`, and the default window is
+> **8192** — so any run shorter than that is `--attn dense` wearing a different flag. Same
+> trap `index_topk` sets for dsa, and the reason `tests/mtp-neutrality.sh` carries a per-mode
+> flag set instead of running each mode as shipped.
+>
+> **Speed: no measurable effect, and the ratios are not quotable.** 2.80 → 2.73 (w16) and
+> 2.74 → 2.70 (w128) — 0.975× and 0.985×, both inside this machine's run-to-run spread of
+> **2.8%**. That spread is measured, not assumed: the dense and dsa sequential arms at 256
+> tokens are computationally identical (both take dense fast paths at `index_topk` 2048) and
+> came out 2.53 and 2.60. Streaming speculation is therefore neither a win nor a loss on this
+> evidence.
+>
+> It should not be expected to reach dense's 1.071×, and the union rule (§13 above,
+> `benchmarks.md`) says why: streaming makes **attention** cheaper without touching the MoE,
+> so the routed-expert union is a larger share of a verify pass and the acceptance needed to
+> break even rises. Narrower window → worse, which is the direction the two arms sit in. The
+> lever for making it pay would be `--mtp-min-conf`, not the row selection.
 
 **The `.i4` MoE kernel was on this list until 2026-07-31** and is now batched — see the
 block at the top of this section for why the guard that refused it earned its keep.

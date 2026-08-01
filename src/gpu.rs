@@ -1387,26 +1387,32 @@ impl<'a> GpuEngine<'a> {
         // causal mask — there is nothing else to add.
         let hoisted_rows: Option<[(*const u32, usize); MAXROW]> = match &self.mode {
             AttnMode::Dense => Some(std::array::from_fn(|r| (std::ptr::null(), pos + r + 1))),
-            // Streaming selects a DIFFERENT row set per position and builds it on the HOST,
-            // so a batched pass needs one upload per row. `rows_buf` has the per-row slices
-            // for it since dsa was batched (2026-08-01) and the change is small — but it is
-            // unbuilt because nothing measures streaming, and shipping an unmeasured row
-            // set is how a mode ends up wrong quietly. `main` downgrades `--mtp` here.
+            // Streaming selects a different row set per position and builds it on the HOST,
+            // so unlike dense it costs one upload per row — into the same per-row `rows_buf`
+            // slices dsa uses, at the same element offsets. `rows_host` is rebuilt per row
+            // rather than kept per row: it is a scratch Vec, the upload is synchronous, and
+            // at MAXROW=2 a second one would save one `streaming_rows` call over ~8 KB of
+            // memcpy.
             AttnMode::Streaming { sinks, window } => {
-                ensure!(
-                    nrow == 1,
-                    "--attn streaming: batched token rows are not implemented (each row \
-                     selects a different KV window, and this one is built on the host); \
-                     --attn dense and --attn dsa both speculate"
-                );
-                streaming_rows(pos + 1, *sinks, *window, &mut self.rows_host);
-                let rn = if self.rows_host.len() == pos + 1 {
-                    (std::ptr::null(), pos + 1) // all selected → dense fast path
-                } else {
-                    self.rows_buf.copy_in_at(0, as_le_bytes(&self.rows_host))?;
-                    (self.rows_buf.ptr() as *const u32, self.rows_host.len())
-                };
-                Some([rn; MAXROW])
+                // Copy out of the `&self.mode` borrow before touching rows_host/rows_buf.
+                let (sinks, window) = (*sinks, *window);
+                let max_ctx = self.max_ctx;
+                let mut rn = [(std::ptr::null(), 0usize); MAXROW];
+                for (r, slot) in rn.iter_mut().take(nrow).enumerate() {
+                    let nt = pos + r + 1;
+                    streaming_rows(nt, sinks, window, &mut self.rows_host);
+                    *slot = if self.rows_host.len() == nt {
+                        (std::ptr::null(), nt) // all selected → dense fast path
+                    } else {
+                        self.rows_buf
+                            .copy_in_at(r * max_ctx * 4, as_le_bytes(&self.rows_host))?;
+                        // SAFETY: rows_buf is MAXROW slices of max_ctx u32; r < MAXROW, and
+                        // `streaming_rows` never yields more than `nt <= max_ctx` entries.
+                        let p = unsafe { (self.rows_buf.ptr() as *const u32).add(r * max_ctx) };
+                        (p, self.rows_host.len())
+                    };
+                }
+                Some(rn)
             }
             // Dsa/misa needs the mid-attention q-LoRA residual, so it selects inside the
             // layer loop — and there it selects PER ROW, each row over its own position's

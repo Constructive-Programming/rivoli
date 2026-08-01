@@ -5,15 +5,21 @@
 # decode to identical text, so a text diff reports only a lower bound on divergence.
 #
 # THE TRAP THIS EXISTS TO SIDESTEP, and the reason it is a script rather than a line in
-# bench-matrix.sh: `dsa_select_layer` returns a DENSE FAST PATH while the context is
-# <= index_topk, which is 2048 on the reference artifact. A 256-token run under `--attn
-# dsa` therefore never executes the batched per-row selection at all, and the pair passes
-# without covering a line of it. That is exactly what happened on 2026-08-01 before this
-# script existed. So for dsa/misa it also runs the pair against a SHADOW artifact: a
-# directory of symlinks to every file, plus one manifest.json with index_topk lowered.
+# bench-matrix.sh: **every sparse mode has a dense fast path, and a short run stays inside
+# it.** `dsa_select_layer` returns dense while the context is <= index_topk (2048 on the
+# reference artifact), and `streaming_rows` returns the whole prefix while it is <= sinks +
+# window (8192 by default). So a 256-token pair under `--attn dsa` or `--attn streaming`
+# executes none of the batched per-row selection it claims to test, and passes vacuously.
+# That is exactly what happened on 2026-08-01 before this script existed.
 #
-# Usage: tests/mtp-neutrality.sh <artifact> [attn ...]     # default: dense dsa
-#   RIVOLI_NGEN=48  RIVOLI_LOW_TOPK=16  RIVOLI_MAX_MEM=115  override the defaults.
+# Two answers, one per mode, both of which force the selection to actually run:
+#   - dsa/misa: also run the pair against a SHADOW artifact — a directory of symlinks to
+#     every file, plus one manifest.json with index_topk lowered. Costs a directory, not a
+#     copy of 60 GB, and beats prefilling 2048 tokens at ~0.38 s/token.
+#   - streaming: `--window` is a CLI flag, so a small one is all it takes (see mode_flags).
+#
+# Usage: tests/mtp-neutrality.sh <artifact> [attn ...]     # default: dense dsa streaming
+#   RIVOLI_NGEN=48  RIVOLI_LOW_TOPK=16  RIVOLI_WINDOW=16  RIVOLI_MAX_MEM=115  override.
 #
 # The artifact must carry the MTP head (`L78.i4`), or every arm silently decodes
 # sequentially and the comparison is two identical sequential runs — checked below.
@@ -22,7 +28,7 @@ set -euo pipefail
 ART=${1:?usage: mtp-neutrality.sh <artifact> [attn ...]}
 shift || true
 MODES=("${@:-}")
-[ -z "${MODES[0]}" ] && MODES=(dense dsa)
+[ -z "${MODES[0]}" ] && MODES=(dense dsa streaming)
 
 BIN=./target/release/rivoli
 NGEN=${RIVOLI_NGEN:-48}
@@ -46,11 +52,25 @@ arm() { # arm <artifact> <attn> <ids-out> [extra flags...]
     2>&1 | grep -aE "tok/s|MTP:|speculative decode OFF" || true
 }
 
+# Flags that make a mode's row selection actually SPARSE inside a short run — without
+# them the mode takes its own dense fast path and the pair proves nothing. `streaming`'s
+# default window is 8192, i.e. wider than any run this script does.
+mode_flags() {
+  case $1 in
+    streaming) echo "--sinks 4 --window ${RIVOLI_WINDOW:-16}" ;;
+    misa) echo "--misa-heads 8" ;;
+    *) echo "" ;;
+  esac
+}
+
 pair() { # pair <artifact> <attn> <label>
   local art=$1 attn=$2 label=$3
-  echo "=== $attn $label ==="
-  arm "$art" "$attn" "$WORK/seq.ids" --no-mtp
-  arm "$art" "$attn" "$WORK/spec.ids"
+  local extra; extra=$(mode_flags "$attn")
+  echo "=== $attn $label ${extra:+[$extra]} ==="
+  # shellcheck disable=SC2086  # extra is a deliberately word-split flag list
+  arm "$art" "$attn" "$WORK/seq.ids" --no-mtp $extra
+  # shellcheck disable=SC2086
+  arm "$art" "$attn" "$WORK/spec.ids" $extra
   if cmp -s "$WORK/seq.ids" "$WORK/spec.ids"; then
     echo "PASS  $attn $label — speculation is output-neutral ($NGEN token ids identical)"
   else
@@ -77,7 +97,7 @@ json.dump(m,open(sys.argv[2],'w'))" "$ART/manifest.json" "$d/manifest.json" "$LO
 
 FAILED=0
 for attn in "${MODES[@]}"; do
-  pair "$ART" "$attn" "(trained index_topk)"
+  pair "$ART" "$attn" "(as shipped)"
   # Only dsa/misa consult index_topk; for dense the shadow arm would be the same run.
   case "$attn" in
     dsa | misa) pair "$(shadow)" "$attn" "(index_topk=$LOW_TOPK — selector actually runs)" ;;
