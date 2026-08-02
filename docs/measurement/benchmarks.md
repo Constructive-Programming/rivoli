@@ -1783,7 +1783,7 @@ guard"; the `None` arm had made it one. A stamp that POSITIVELY disagrees still 
 
 Supersedes "Speculative decode (`--mtp`)" above as the verdict on the feature: that section
 measured only the **ungated** form, which is still a loss. Shared-GPU caveat: these ran
-under `flock /tmp/rivoli-gpu.lock` with another tenant present, so pin-build times varied
+under `flock /var/run/sys-gpu.lock` with another tenant present, so pin-build times varied
 33 s → 164 s and absolute tok/s is noisier than the sole-tenant runs above. **Rank on
 tokens/pass and on the within-batch pairing, not on tok/s across sections** — tokens/pass
 is pure loop arithmetic and is contention-immune.
@@ -2253,3 +2253,320 @@ The instrument: `replay <trace> <slots>` prints the `opt` row and a `headroom` l
 run. `src/bin/replay.rs::replay_opt` — deliberately NOT registered in `hybrid::make`, since
 it needs the whole future and `--cache-policy opt` would offer the engine something it
 cannot run.
+
+---
+
+## Batch coalescing, alternative policies, and the 2Q kin/kout re-sweep (2026-08-02)
+
+**Question.** Does batching the MoE — a pass over B tokens reading each layer's UNION of
+picks once instead of once per row — reduce the bytes fetched per token? This prices
+batched prefill (`perf-roadmap.md` Path A), whose stated case assumed it does.
+
+**Answer: no, at this pool size. It reduces expert LAUNCHES, not READS.** Batching and
+caching spend the same pool of redundancy, and at 6874 slots the cache has already spent it.
+
+**Instrument.** `bin/replay --batch B` (new 2026-08-02): coalesces B consecutive tokens'
+decisions per layer into the union a batched pass would issue, and reports `reads/token` —
+the only figure comparable across B, since the union removes accesses, so `loaded %` rises
+even where bytes moved per token do not fall.
+
+**Traces**, both preserved, both replayed at **6874 slots** (int3-vq, `--max-mem 115`):
+
+- `/var/db/rivoli/glm52-vq3-full-int3vq-288pass.trace` — 288 tokens, 14,982 unique.
+- `/var/db/rivoli/glm52-vq3-full-int3vq-769prefill.trace` — NEW. 769-token prefill of
+  deliberately diverse prose (7 unrelated topics) + 64 decode, 18,474 unique. Captured:
+  `rivoli <artifact> --mode int3-vq --cache-policy 2q --max-mem 115 --prompt "$(cat
+  tests/ppl-corpus.txt)" --bench 64 --trace <path>` — 456.6 ms/tok, 2.19 tok/s, hit 70.3%.
+  `--trace` disables MTP (a verify pass routes twice per layer; v2 cannot spell it).
+  The prefill-only prefix used below is its first `1 + 769*75` lines.
+
+### reads/token vs batch — the result
+
+prefill trace (769 tokens):
+
+| batch | launch/tok | lru | 2q | arc | opt |
+|---|---|---|---|---|---|
+| 1 | 600.0 | 157.90 | 154.75 | 157.78 | 72.98 |
+| 2 | 524.2 | 158.17 | 154.79 | 157.36 | 72.92 |
+| 4 | 454.3 | 157.70 | 154.80 | 156.75 | 72.86 |
+| 8 | 387.3 | 153.98 | 159.77 | 156.42 | 72.75 |
+| 16 | 318.0 | 167.84 | 162.18 | 167.96 | 72.68 |
+| 32 | 243.0 | **240.74** | 157.55 | **219.79** | 72.36 |
+| 64 | 170.4 | 169.91 | 169.91 | 165.02 | 72.02 |
+
+288-pass decode trace:
+
+| batch | launch/tok | lru | 2q | arc | opt |
+|---|---|---|---|---|---|
+| 1 | 600.0 | 117.66 | 119.62 | 119.46 | 67.48 |
+| 2 | 487.9 | 118.23 | 120.02 | 119.48 | 67.45 |
+| 4 | 402.6 | 118.41 | 119.91 | 120.07 | 67.43 |
+| 8 | 335.8 | 117.88 | 121.64 | 118.74 | 67.35 |
+| 16 | 271.1 | 113.95 | 119.75 | 117.49 | 67.34 |
+| 32 | 206.9 | 113.32 | 122.44 | 117.23 | 66.72 |
+
+Launches fall 2.9-3.5x. **Reads do not fall on either trace.** The Belady column is the
+load-bearing one: OPT sees ALL reuse at unlimited range and is **flat to 1.3%** across a
+64x change in B. If batching created reuse, OPT would show it. It does not — batching only
+dedups inside a B-token window, which a cache already covers over a far longer one.
+
+### The working-set rule — why the collapse happens, and why only sometimes
+
+A batch's working set is `launch/tok x B` (within a batch every access is a distinct
+`(layer,expert)`; coalesce dedups per layer and layers hold disjoint key ranges). The two
+traces STRADDLE capacity at batch 32 and behave accordingly:
+
+| batch | prefill WS | decode WS | vs 6874 |
+|---|---|---|---|
+| 8 | 3,098 | 2,686 | 39-45% |
+| 16 | 5,088 | 4,338 | 63-74% |
+| 32 | **7,776** | 6,621 | prefill OVER, decode 96% |
+
+Over capacity, nothing a batch loads survives into the next: at prefill batch 64 all three
+policies converge on ~165-170 reads against 170.4 launches — a hit rate near zero. **Design
+rule: keep `launch/tok x B` under the slot count**, which caps B at ~16-24 here and scales
+with the pool. Under the line, policy choice is nearly free; over it, it decides everything.
+
+### Capacity is what makes batching irrelevant, and the sweep proves it
+
+2q reads/token, 288-pass decode trace:
+
+| cap | B=1 | B=4 | B=16 |
+|---|---|---|---|
+| 500 | 599.35 | 426.34 | 295.93 |
+| 2000 | 323.59 | 303.96 | 295.93 |
+| 6888 | 148.38 | 148.10 | 152.25 |
+| 16000 | 59.13 | 59.13 | 59.13 |
+
+At 500 slots batching is worth 2x — there is no cache to take the reuse. By 6888 it is worth
+nothing. At 16000 (> the 15,847 unique of that capture) every policy sits on compulsory
+misses exactly, 15847/268 = 59.13, which is the boundary check on the tool.
+
+### Alternative policies: the OPT gap is NOT reachable by heuristics
+
+Prefill trace, 6874 slots, batch 1. A popularity ORACLE (top-6874 by whole-trace frequency,
+pinned) and per-layer partitioning both LOSE to plain global LRU:
+
+| policy | hit | reads/token |
+|---|---|---|
+| global LRU | 73.68% | 157.90 |
+| static LFU (global, oracle frequency) | 71.93% | 168.44 |
+| per-layer LRU (91 slots/layer) | 72.69% | 163.83 |
+| per-layer static LFU (91/layer) | 71.48% | 171.12 |
+| **OPT (Belady)** | **87.84%** | **72.98** |
+
+So OPT's 2.1x advantage is neither stable popularity nor layer structure — it is genuine
+temporal lookahead. **A cyclic-access argument for partitioning was the hypothesis here and
+it is refuted.** Do not write another eviction heuristic; change the access ORDER instead.
+
+### 2Q kin/kout re-sweep — the shipped default is stale but harmless
+
+`TwoQSplit::default()` is kin 8% / kout 20%, tuned at ~3.6k slots where kout 20% scored
+77.56% against 100%'s 71.43% — a 6.1 pp spread that made kout "the axis that matters".
+Re-swept at 6874 slots, that spread is **0.17 pp** (decode) and **0.46 pp** (prefill), and
+the whole grid is flat:
+
+| trace | grid range (kin 3-66% x kout 25-800%) | default | best cell | gain |
+|---|---|---|---|---|
+| 288-pass decode | 79.93 - 80.44% (**0.51 pp**) | 80.06% | 40%/25% | +0.37 pp |
+| 769 prefill | 73.51 - 74.43% (**0.92 pp**) | 74.21% | 20%/25% | +0.23 pp |
+| prefill, **batch 32** | 1.81 - 43.42% (**41.6 pp**) | 35.16% | **3%/50%** | **+8.26 pp** |
+
+The mechanism in the original comment survives — spurious ghost promotions scale with
+pressure, and unique/slots fell from 3.6 to 2.2-2.7 — the effect simply shrank out from
+under it. **Do not retune**: the two traces pick DIFFERENT best cells (40%/25% vs 20%/25%),
+which is what a best cell drawn from noise looks like, and a knife-edge default is worse
+than a flat one. Under batching the same grid spans 41.6 pp and small kin wins decisively,
+because A1in hard-caps how much of a scan reaches the protected set.
+
+**The ARC parenthetical in `cache.rs` is refuted.** ARC does not underperform at batch 1
+(119.46 vs LRU 117.66 / 2Q 119.62 on decode). It collapses only over the working-set line,
+and there full-capacity ghosts cannot be the cause: the entire kout axis is worth 0.7 pp at
+batch 32 against ARC's ~10 pp gap. Remaining candidate is ARC's adaptive `p`, UNTESTED.
+
+### Consequence: layer-major prefill, and what it is worth
+
+Reads under batching are bounded below by the union within a chunk. Take the chunk to the
+WHOLE PROMPT — process every token through layer L before layer L+1 — and reads equal the
+unique-expert count, which is the compulsory floor:
+
+```
+per-layer distinct: min 232, mean 246.3, max 256 of 256
+reads = 18,474 -> 24.02 reads/token   (vs 154.75, the best chunked result)
+bytes = 283 GB for the ENTIRE prompt = 22.9 s at 12.4 GB/s
+working set = one layer = 256 experts = 3.93 GB (the pool holds 6874 slots)
+activations = 769 * 6144 * 4 = 18.9 MB
+```
+
+A 769-token prompt already touches 246 of 256 experts at the average layer, so prefill
+reads the model ONCE and its cost stops scaling with prompt length. Against today's
+365 ms/token that is ~10-12x, and the pool becomes ~irrelevant during prefill (256 slots
+needed, not 6874). **This is arithmetic over the trace's unique count, not a simulation of
+a layer-major engine** — there is no cache behaviour to get wrong at a 256-expert working
+set, but it assumes the reordering is legal, which rests on layer L for all tokens needing
+only layer L-1 for all tokens. Worth a reviewer before anything is built on it.
+
+**Caveats.** Two traces, two prompts; router skew is prompt-dependent and the prefill prompt
+was chosen for topic diversity, which makes it a pessimistic (wide) case. `replay_opt` keeps
+the per-batch pin set and ignores every other engine constraint, so real policies are
+further from it than the pp column suggests. Nothing here was measured on hardware: these
+are trace replays, and the only hardware number in this section is the capture's own
+456.6 ms/tok.
+
+### Path 5: is a layer-major whole-file read faster than scattered per-expert reads? NO (2026-08-02)
+
+`probes/seq_vs_random.c`, btrfs **Data RAID0 across two NVMe** (`nvme1n1p3` + `nvme0n1p2`,
+1.68 TiB, no compression, `ssd`), under `flock /var/run/sys-gpu.lock`. Same 15.34 MB request
+size, same 246 requests, same layer file, arm order alternated per rep — only offset ORDER
+differs. Mean of 4 reps, GB/s:
+
+| QD | rand | seq | delta |
+|---|---|---|---|
+| 1 | 12.39 | 12.91 | +4.2% |
+| 2 | 13.96 | 13.88 | -0.6% |
+| 4 | 14.11 | 14.05 | -0.4% |
+| 8 | 14.29 | 14.25 | -0.3% |
+| 16 | 14.76 | 14.54 | -1.5% |
+
+**Sequential ordering buys nothing at QD>=2.** At 15.34 MB the seek is already amortised to
+nothing, so expert-granular "random" is sequential as far as the array is concerned. This
+agrees with `fetch_batch`'s 13.0-13.7 GB/s at QD4-8 and with §3's "the demand fetch is
+already getting what its queue depth can buy".
+
+**A larger REQUEST also buys nothing, and the first run said otherwise.** Pass 1 reported
+14.2 -> 19 GB/s at 256 MB. It did not replicate: with chunk order rotated per rep and a
+drift control at both ends, 512 MB/QD8 spanned **5.05-14.26 GB/s** and 256 MB/QD8 spanned
+**8.20-15.45**, while the 15 MB controls held 12.2-14.5 — so it is not throttling, it is
+sample size. 512 MB over a 3.9 GB file is 7 requests; that number is one slow read. Pass 1
+also advanced chunk size, layer file and time-under-load together and could separate none of
+them. Both defects were in the instrument. `probes/README.md` had already written the rule
+this broke: *any conclusion needing a single-digit percentage from these probes needs repeats.*
+
+**Consequence for layer-major prefill (path 1).** Plan it at the SAME ~13 GB/s the demand
+fetch already gets; there is no ordering or granularity bonus to bank. It still wins, on
+bytes moved rather than on rate: 283 GB at 12.5-14 GB/s is **20-23 s** for the 769-token
+prompt against a measured **312.8 s** today (342.0 s total GPU minus 64 x 456.6 ms of
+decode) — call it **13-15x**, and it improves with prompt length because the 283 GB is fixed.
+Compute is ~1.2 s of GEMM against that, so layer-major prefill is ~95% NVMe-bound and the
+floor is hard.
+
+---
+
+## The MLA HB sweep: HB 8→16 is 2.08× on the kernel and −3.2 ms/token — SHIPPED 2026-08-02
+
+Roadmap #5, run as the two-parameter (HB × `MLA_MIN_TILES_PER_SPLIT`) sweep the item asked
+for. **Only one parameter is live.** Interleaved, min-of-5, `examples/dot_bench attend`,
+four binaries built up front so no `cargo build` ever ran between arms.
+
+| arm | nr512 µs | nr2048 µs | fnv nr512 | fnv nr2048 |
+|---|---:|---:|---|---|
+| HB=8, MIN=4 *(was shipped)* | 226.5 | 769.8 | `6eb5576d…` | `91d2fa2a…` |
+| HB=8, MIN=2 | 226.4 | 767.3 | `6eb5576d…` | `91d2fa2a…` |
+| **HB=16, MIN=4 (shipped)** | **108.8** | **421.2** | `6eb5576d…` | `4c2cf2d9…` |
+| HB=16, MIN=2 | 117.9 | 423.1 | `faf6f182…` | `4c2cf2d9…` |
+
+**`MLA_MIN_TILES_PER_SPLIT` is INERT at both HB values** (226.5 vs 226.4) — `tps` rounds
+back to the same value, exactly as the item's own text predicted for HB=8. The item expected
+it to "start to bite" once HB rose; it does not. It stays at 4.
+
+**In-engine: `route` 101.6/101.9 → 98.4/98.8 ms, −3.2 ms/token** (`--bench 512`, dense,
+`--no-mtp`, two rounds each). Wall cannot resolve it — moe/fetch swing 246–274 ms between
+rounds — which is why `route` is the column quoted. The kernel's 2.08× does NOT appear as
+~9 ms because a 512-token decode averages nr≈170, where the kernel is small; the win scales
+with context and the bench's nr=512 is above the operating point, not at it.
+
+### The item's "no numerics change" claim is wrong above nr≈640, and the fingerprints say so
+
+`by_work` = ⌈nr/TILE⌉/MIN binds at short context and gives both HB values the same cut;
+`by_grid` = ⌈MLA_TARGET_BLOCKS/⌈H/HB⌉⌉ binds above it, and doubling HB doubles `by_grid`.
+Crossover is **nr ≈ 640**. Below it HB is bit-identical — confirmed twice over, by identical
+`fnv` at nr512 and by a 512-token decode whose output was byte-identical across four runs
+(both HB values, two rounds). Above it the split plan moves (10 → 16 splits at nr2048) and
+so does the f32 summation order. So this took the full gate, and the roadmap's advice to
+prefer HB *because* it dodges the gate does not survive.
+
+**The gate, on `ppl-corpus-5000`, `--attn dense`, both arms reproduced byte-identically twice:**
+
+| | mean dNLL | 95% CI | SE | verdict |
+|---|---:|---|---:|---|
+| HB=16 vs HB=8 | **+0.00217** | [−0.00243, +0.00676] | 0.00234 | **PASS** — bound < 0.00995 |
+
+`--attn dense` deliberately, not the default `dsa`: the DSA selector picks rows from scores
+that any numerics change perturbs, so a dsa A/B turns a reassociation into a *different
+2048-row set* and cannot attribute what it measures. (`docs/measurement/benchmarks.md` already
+records the mirror of this — a dsa A/B *under* `index_topk` tests the dense fast path and
+passes vacuously.)
+
+**Coverage the sweep exposed, now closed.** `tests/kernel.rs::mla_attend_glm_dims` ran
+nt=300, so every attend test sat in the bit-identical regime and the whole suite passed at
+HB=16 while saying nothing. `mla_attend_long_context_split_regimes` (nt=704 past `by_grid`,
+nt=4608 past the `MLA_MAX_SPLITS` clamp) now covers both, and passes at HB=8 and HB=16 —
+which is what proves the kernel correct in both plans rather than merely fast.
+
+**Vulkan is NOT changed and the backends now differ above nr≈640.** `MLA_HB * MLA_SUBW ==
+BLOCK` is a deliberate compile-time guard and `BLOCK` is shared across kernels, so HB=16
+there needs a dedicated workgroup constant, a `--features vulkan` build and `tests/vk.rs`.
+`tests/xbackend.rs` covers only `swiglu`, so nothing catches the divergence. Vulkan is
+int3-vq/dense-only and agrees below the crossover; this is a known debt, not an oversight.
+
+Full suite at HB=16: **110 passed, 0 failed, 1 ignored.**
+
+---
+
+## Long runs are NON-DETERMINISTIC: ~40% of 5k-token scores are silently wrong — 2026-08-02
+
+**This confirms the "worse than the crash" case recorded above** under "Leading remaining
+suspect: arena compaction", which had stood as *not verified*. That entry predicted it
+exactly: "NaN needs a slot that was NEVER written. On a warm pool the same race reads the
+evicted expert's bytes instead: finite, plausible, silently wrong." That is what this is —
+no NaN, no `logits are non-finite`, just a different answer.
+
+**Two invocations of the SAME binary, SAME flags, SAME corpus** (`rivoli_tf_hb8`,
+`--mode int3-vq --no-mtp --attn dense --max-mem 90`, `ppl-corpus-5000`, default `2q`):
+
+| | PPL |
+|---|---:|
+| run 1 | **4.616271** |
+| run 2 | **4.122046** |
+
+Bit-identical for tokens 0–4041, then a **discrete event at token 4042** — max |dNLL| 17.02
+nats immediately, 1143/5184 tokens affected. Not drift; a step.
+
+**Six 5k samples this session split into exactly two clusters**, and the clean one is
+reproducible across configurations that INV-1 says must agree:
+
+| config | PPL | |
+|---|---:|---|
+| dense HB=8, `2q` | 4.616271 | **corrupt** |
+| dense HB=8, `2q` (repeat) | 4.122046 | clean |
+| dense HB=8, **`lru`** | 4.122046 | clean — **byte-identical** to the row above |
+| dense HB=16, `2q` | 4.130991 | clean |
+| dense HB=16, `2q` (repeat) | 4.130991 | clean — byte-identical |
+| dsa HB=16, `2q` | 4.597614 | corrupt |
+
+The `lru` row is the load-bearing one: a **different cache policy** at a **different hit
+rate** (68.00% vs 69.93%) produced a byte-identical score file. That is INV-1 holding
+exactly as documented, and it is what establishes 4.122046 as the *true* answer rather than
+merely another sample — so the 4.59/4.61 runs are wrong, not just different.
+
+**What this invalidates.** Any single-run quality number taken on this corpus carries a ~40%
+chance of being a corrupted sample, and the corruption is ~0.5 PPL — 50× the 1% bar that
+`bin/ppl` gates on. Four readings taken during the HB sweep were wrong because of it
+(a "+0.108 nats FAIL", a selector-divergence story built on top of that, and a "PASS" at
+−0.111 implying HB=16 was 10% *better*); all four dissolved once each arm was repeated. The
+tell was there and was ignored: `bin/ppl` printed *"interval also admits >1% BETTER —
+implausible, suspect a bug"*.
+
+**The measurement rule this forces.** A 5k-token quality number needs its arm REPEATED before
+it means anything; a single run is not a measurement here. Repeating is also what makes the
+gate powerful — with both arms clean, per-token sd falls 1.115 → 0.169 (6.7×) and SE goes
+0.0155 → 0.00234, i.e. from "cannot resolve the question at any point estimate" to a verdict.
+**The corruption was the noise.**
+
+**Not root-caused.** The suspect remains `src/arena.rs` slot relocation. Unbooked next step,
+with its power computed: the corruption needs ~4000 tokens (a 512-token decode was
+byte-identical across four runs), so `-bench` could not reach it until the scripted follow-up
+turns landed the same day — `-bench` stops at EOS at ~318 tokens on the default prompt. Note
+`docs/reference/architecture.md` §6 currently asserts the opposite of this section
+("a relocation never races an in-flight fetch… the correctness spine of the cache"); that
+claim is contradicted by the table above and should not be trusted until this is resolved.

@@ -1,6 +1,6 @@
 ---
 status: live
-verdict: The ranked performance roadmap. Live rows: #2 VQ_K codebook, #5 the MLA HB sweep, #10 general-R MoE kernels. #11 (cache policy) closed negative at 115 GiB — Belady's own ceiling is 8.6 ms/tok — but still live at 61.
+verdict: The ranked performance roadmap. Live rows: #2 VQ_K codebook, #10 general-R MoE kernels. #5 DONE 2026-08-02 (HB 8→16, 2.08x kernel, −3.2 ms/tok, gated). #11 (cache policy) closed negative at 115 GiB — Belady's own ceiling is 8.6 ms/tok — but still live at 61.
 ---
 
 # rivoli — the ranked performance roadmap
@@ -45,7 +45,7 @@ verdict: The ranked performance roadmap. Live rows: #2 VQ_K codebook, #5 the MLA
 > versus 46.0% on the sample that trips the degeneration warning. Rebuilding the head at
 > int4 moved acceptance by 3.4 pp ± 7.4, i.e. not at all, so "de-quantize the head" is
 > refuted. Full table in `docs/reference/architecture.md` §13.
-| 5 | `mla_latent_attend` occupancy | follow-up #3 | ~5–7 ms now, huge at long ctx | med | **partial** — `acc`→regs done (−12%); HB sweep not run |
+| 5 | `mla_latent_attend` occupancy | follow-up #3 | `acc`→regs −12%; **HB 8→16 = 2.08× kernel, −3.2 ms/tok** | med | **DONE 2026-08-02** — HB=16 shipped on ROCm, gated at +0.00217 nats; `MLA_MIN_TILES_PER_SPLIT` measured INERT and stays at 4; Vulkan still HB=8 (see below) |
 | 6a | lm_head load width | follow-up #5 | kernel **1.78×**; `tail` **−3.2 ms** in-engine; wall **~+1%, not noticeable** | low | **done** |
 | 6b | o_proj split-K / x-tiling | follow-up #2 | — | — | **refuted and reverted** |
 | 7 | `mla_absorb` restructure | follow-up #4 | **−0.80 ms/tok, measured** | med | **done** |
@@ -94,6 +94,31 @@ verdict: The ranked performance roadmap. Live rows: #2 VQ_K codebook, #5 the MLA
 > which also means the cheapest 105 ms on a starved machine is `--max-mem`, not a policy.
 > Full table, the transfer model and three optimism caveats in
 > [`benchmarks.md`](benchmarks.md), "The Belady bound on residency".
+
+> **Item 5 is done, and it corrects three things this table said about it.** HB 8→16 halves
+> the DRAM KV re-read multiplier: **226.5 → 108.8 µs at nr512 (2.08×)**, 769.8 → 421.2 at
+> nr2048, **−3.2 ms/token of `route`** in engine. Free in registers, LDS unchanged.
+>
+> 1. **It is NOT a numerics-free change**, which is why this item recommended the HB route.
+>    `by_grid` binds above **nr≈640** and doubling HB doubles it, moving the split plan and
+>    the summation order. It took the full gate and passed: **+0.00217 nats, CI
+>    [−0.00243, +0.00676]** against a 0.00995 bar.
+> 2. **`MLA_MIN_TILES_PER_SPLIT` is INERT at both HB values.** This item predicted it would
+>    "start to bite" once HB rose. It does not — `tps` rounds back. It stays at 4, so the
+>    "two-parameter sweep" has one live parameter.
+> 3. **"~5–7 ms now" overstates a short-context decode.** A 512-token run averages nr≈170,
+>    where the kernel is small; the realized figure is −3.2 ms and it grows with context.
+>
+> **Vulkan is still HB=8**, so the backends differ in split blocking above nr≈640.
+> `MLA_HB * MLA_SUBW == BLOCK` is a compile-time guard on a `BLOCK` shared across kernels,
+> so it needs a dedicated workgroup constant plus a `--features vulkan` build and
+> `tests/vk.rs`. Known debt. Full write-up in [`benchmarks.md`](benchmarks.md), "The MLA HB
+> sweep".
+>
+> **A warning that outranks the item.** The gate above is trustworthy only because every arm
+> was REPEATED: ~40% of 5k-token runs are silently corrupted (`benchmarks.md`, "Long runs are
+> NON-DETERMINISTIC"), which is ~0.5 PPL — 50× the bar. Four readings during this sweep were
+> wrong before the arms were repeated. Do not take a single 5k-token quality number here.
 
 **Suggested sequence, revised.** The original sequence led with #1 and treated #4 as the
 big multiplier; #1 has landed and #4 has a measured loss against it, so:
