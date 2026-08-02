@@ -1,6 +1,6 @@
 ---
 status: live
-verdict: The ranked performance roadmap. Live rows: #2 VQ_K codebook, #5 the MLA HB sweep, #10 general-R MoE kernels.
+verdict: The ranked performance roadmap. Live rows: #2 VQ_K codebook, #5 the MLA HB sweep, #10 general-R MoE kernels. #11 (cache policy) closed negative at 115 GiB — Belady's own ceiling is 8.6 ms/tok — but still live at 61.
 ---
 
 # rivoli — the ranked performance roadmap
@@ -52,6 +52,7 @@ verdict: The ranked performance roadmap. Live rows: #2 VQ_K codebook, #5 the MLA
 | 8 | Faster demand fetch (deeper queues, split reads, unpinned arena) | B | — | — | **closed as negative 2026-08-01** — the drive is already giving what the queue depth buys; see below |
 | 9 | Layer-major prefill | A | **prefill 2.15×**; expert reads 159.56 → 28.20/token (the compulsory floor); output byte-identical | med | **done, opt-in 2026-08-02** — `--layer-major-prefill`; decode pays a one-off ~2.7 s warm-up, 1.8% of the saving. `docs/reference/architecture.md` §14 |
 | 10 | General-`R` MoE kernels (tiled GEMM) | follow-up #9 | the rest of #9: a 2-row pass still re-reads its experts from LPDDR5, and that is now the prefill bound | **high** | new — see below |
+| 11 | Better cache policy (residency / hit rate) | B | ceiling **8.6 ms/tok (2.4%)** at 115 GiB — and that is Belady's, not a reachable one | — | **closed as negative 2026-08-02 AT 115 GiB — still live at 61**; see below |
 
 > **Item 8 is a closed door, and it is worth knowing which door.** The demand fetch runs at
 > ~10 GB/s; `docs/measurement/probes/fetch_batch.hip` reproduces the engine's exact shape (pinned bounce
@@ -73,6 +74,26 @@ verdict: The ranked performance roadmap. Live rows: #2 VQ_K codebook, #5 the MLA
 > That leaves **#2 as the only live fetch lever**: it moves *fewer bytes*, shortening the
 > busy 65% rather than trying to fill the idle 35% — and a smaller expert is also the one
 > thing that would make the idle window worth filling.
+
+> **Item 11 closes the OTHER byte lever, and it was never priced until 2026-08-02.** Hit rate
+> is the second of the two things that move bytes, and every policy on record — LRU vs 2Q vs
+> ARC, `TwoQSplit::default`'s Kin/Kout sweep — was ranked only against the others, so nobody
+> could say whether 2Q's win was 2 pp or 20 pp short of what the trace allows. `bin/replay`
+> now prints Belady's clairvoyant bound (`opt`) and a `headroom` line beside it.
+>
+> **At 115 GiB the answer is that the lever is spent.** Best online is 83.63%, OPT 90.00% —
+> 6.37 pp, which looks like room and is not. Transfer at best-online is already **125.6 ms
+> against §3's 117 ms compute floor**, and a clairvoyant policy takes it to 76.7 ms, *below*
+> the floor, where bytes stop buying anything. Since wall follows `max(transfer, compute)`,
+> the entire remaining value of cache-policy work is **125.6 → 117 = 8.6 ms/token, 2.4%** —
+> for a policy that cannot exist. Break-even is 84.75% and LRU sits 1.1 pp under it. **Do not
+> open another policy at this budget.**
+>
+> **At 61 GiB the same table says the opposite**: transfer 230.6 ms against the same floor,
+> 13.74 pp of headroom, OPT worth ~105 ms/token. So residency has no budget-free verdict —
+> which also means the cheapest 105 ms on a starved machine is `--max-mem`, not a policy.
+> Full table, the transfer model and three optimism caveats in
+> [`benchmarks.md`](benchmarks.md), "The Belady bound on residency".
 
 **Suggested sequence, revised.** The original sequence led with #1 and treated #4 as the
 big multiplier; #1 has landed and #4 has a measured loss against it, so:

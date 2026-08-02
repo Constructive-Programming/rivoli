@@ -2171,3 +2171,85 @@ tokens of recent routing at every layer. One closing pass supplies one, so layer
 hold a single token's 9 experts each and decode still misses them. Reproducing the
 token-major end state needs a ~10-token close, not a 1-token one — and at a fixed 2.7 s the
 thing it would buy is not worth the reads.
+---
+
+## The Belady bound on residency: the cache-policy lever is spent at 115 GiB, live at 61 — 2026-08-02
+
+**Why this was never run before.** The online policies were only ever ranked against *each
+other* — `docs/reference/modes.md`'s 2Q-beats-LRU rows, `cache.rs`'s `TwoQSplit::default`
+Kin/Kout sweep, the ARC comparison. So a 2Q that beat LRU by 5 pp could equally have been
+2 pp or 20 pp short of what the trace allows, and no one could say which. `bin/replay` now
+prints an `opt` row: Belady's clairvoyant evictor, which no online policy can beat.
+
+**Trace.** `--bench 512 --mode int3-vq --no-mtp`, prompt "The sky is blue because", stopped
+at EOS after 277 tokens. 288 forward passes × 75 MoE layers = **21600 decisions, 172800
+accesses, 14982 unique experts** (of 19200 possible). Captured on the **Vulkan** build at an
+auto-sized 61.5 GiB budget, 0.84 tok/s, engine hit 63.8%. Backend does not enter: a trace is
+an access sequence, and in `int3-vq` routing is cache-neutral (INV-1), so ONE capture serves
+every capacity below. Expert stride from the artifact: `L03.vq3` 3941208064 B / 257 =
+**15335439 B**, so 61 GiB = 4271 slots and 115 GiB = 8051.
+
+| cap (slots) | lru | 2q | arc | **opt** | headroom | transfer @ best-online | transfer @ opt |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2000 | 40.14% | 51.59% | 54.31% | **73.11%** | 18.80 pp | 350.4 ms | 206.2 ms |
+| 4271 *(61 GiB)* | 68.48% | 69.93% | 69.16% | **83.67%** | 13.74 pp | 230.6 ms | 125.3 ms |
+| 6000 | 77.17% | 77.16% | 77.11% | **87.57%** | 10.40 pp | 175.1 ms | 95.3 ms |
+| 8051 *(115 GiB)* | 83.63% | 83.43% | 83.55% | **90.00%** | 6.37 pp | 125.6 ms | 76.7 ms |
+| 10000 | 87.71% | 87.61% | 87.62% | **91.13%** | 3.42 pp | 94.3 ms | 68.0 ms |
+| 12000 | 90.18% | 90.18% | 90.18% | **91.33%** | 1.15 pp | 75.3 ms | 66.5 ms |
+
+`headroom` is OPT minus the best of the three, which is not always the same policy: **arc
+wins at 2000, 2q at 4271, lru everywhere from 6000 up**, and the three converge to within
+0.1 pp above 6000. That crossover is itself a result — the policy choice only matters in the
+starved regime, and `TwoQSplit::default`'s Kin/Kout tuning was done at a capacity where it
+does.
+
+Transfer is `767 × (1 − hit)` ms, calibrated on `docs/reference/architecture.md` §3's own
+figures — 600 routed accesses/token, 15.34 MB each, 2.25 GB at 75.6% hit = 181 ms, i.e.
+~12.4 GB/s marginal. **The compute floor is 117 ms** (§3), and wall is governed by
+`max(transfer, compute)`, which is what turns a pp into a millisecond or into nothing.
+
+**At 115 GiB the lever is spent, and the headroom column is what hides it.** 6.37 pp looks
+like room. It is not: best-online transfer is already **125.6 ms against a 117 ms compute
+floor**, so the fetch is very nearly hideable as it stands. A *clairvoyant* policy takes
+transfer to 76.7 ms — under the floor, where further bytes buy nothing — so
+`max(transfer, compute)` moves 125.6 → 117 and the entire remaining value of cache-policy
+work is **8.6 ms/token, 2.4% of wall**. That is the ceiling for a policy that cannot exist;
+a real one captures some fraction of Belady's gap, so the realistic figure rounds to zero.
+**Do not open another policy. The break-even hit rate is 84.75% (117/767) and LRU is already
+at 83.63% — 1.1 pp away.**
+
+**At 61 GiB it is NOT spent, and the same table says so.** Transfer 230.6 ms against the
+same 117 ms floor: deeply disk-bound, 13.74 pp of headroom, and OPT would take transfer to
+125.3 ms — a **105 ms/token** saving that is still above the floor and therefore real. So
+"is residency worth working on" has no budget-free answer, which is why every row here
+carries its slot count.
+
+**The actionable form of that, and it is not a policy.** Going 61 → 115 GiB moves
+best-online transfer 230.6 → 125.6 ms, ~105 ms/token — more than the whole per-kernel
+follow-up list combined, and it is a flag. The capture auto-sized to 61.5 GiB because
+`MemAvailable` read 77.5 GiB at that instant (`config.rs::mem_available` − 16 GiB
+`OS_RESERVE`); it read 116 GiB minutes later. **The auto-sizer is correct and this is not a
+defect** — it is a reason to pass `--max-mem` explicitly for anything measured, exactly as
+every recorded run above already does.
+
+**Three caveats, all in the direction of optimism.**
+
+1. **288 forward passes is short.** 14982 of 19200 experts are already touched, so the
+   working set is not saturated; a longer run touches more and every hit% above drifts down.
+   Headroom at the large caps is probably understated — 12000 slots is 80% of the *touched*
+   set, which is why its OPT flattens at 91.3%.
+2. **One prompt.** Router skew is prompt-dependent and this is a single coherent generation.
+3. **The bound is generous to itself.** `replay_opt` keeps the per-batch pin set (a key hit
+   this batch cannot be evicted before the batch closes), which is the one engine constraint
+   it honours; it ignores every other one. Real policies are further from it than the pp
+   column suggests.
+
+**The trace is preserved** at `/var/db/rivoli/glm52-vq3-full-int3vq-288pass.trace` (13 MB).
+A capture is GPU-gated and sole-tenant, so re-deriving any row above costs a device slot;
+re-reading it costs 0.8 s.
+
+The instrument: `replay <trace> <slots>` prints the `opt` row and a `headroom` line on every
+run. `src/bin/replay.rs::replay_opt` — deliberately NOT registered in `hybrid::make`, since
+it needs the whole future and `--cache-policy opt` would offer the engine something it
+cannot run.

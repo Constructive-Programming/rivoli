@@ -4,6 +4,13 @@
 //! a plain slot count — and prints the residency (loaded %). Pure CPU, milliseconds:
 //! compare policies without a full GPU decode run.
 //!
+//! It also prints [`replay_opt`], the Belady bound, which is what makes any of those rows
+//! readable: until 2026-08-02 the online policies were only ever ranked against each other,
+//! so a 2Q that beat LRU by 5 pp could equally have been 2 pp or 20 pp short of what the
+//! trace allows. On a disk-bound engine (`docs/reference/architecture.md` §3: 181 ms of
+//! transfer against 117 ms of compute) hit rate is one of only two levers that move bytes,
+//! so knowing whether that lever is spent is worth more than another policy.
+//!
 //! A **v2** trace's `| key:score ...` tail — the ranked candidate window per routing
 //! decision — is read past and dropped. It fed two models this tool no longer carries: the
 //! `top-m` (J, M) substitution grid and the oracle-prefetch ceiling, both removed
@@ -18,6 +25,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use rivoli::memory::cache::TwoQSplit;
 use rivoli::memory::hybrid::{self, HybridPolicy};
+use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 
 /// The Kin/Kout grid a `--sweep` walks. Kin is a resident probation bound so it is
@@ -120,6 +128,78 @@ fn replay(policy: &str, cap: usize, split: TwoQSplit, trace: &[Decision]) -> Res
     Ok(loaded)
 }
 
+/// Belady's OPT: the `loaded` count a CLAIRVOYANT evictor reaches on this trace at `cap`
+/// slots. No online policy can beat it, so it is the ceiling the rows above are short of.
+///
+/// **Deliberately not a [`HybridPolicy`], and deliberately not in `hybrid::make`.** It needs
+/// the whole future, which the trait does not offer (and `replay` calls `get` for every hit
+/// before `admit` for any miss, so a policy-side access counter would not even see trace
+/// order). Registering it would also put `--cache-policy opt` in the engine's `--help` for
+/// something the engine cannot run — the mistake `top-m` made in the other direction.
+///
+/// It carries the pin set anyway (`pinned`), which is NOT part of textbook OPT: a key hit
+/// this batch has had its slot handed to a kernel and cannot be evicted before the batch
+/// closes ("expert not resident after alloc"). Relaxing it would raise the bound by making
+/// it unreachable by construction, which is the opposite of what a bound is for.
+fn replay_opt(cap: usize, trace: &[Decision]) -> u64 {
+    // Next-use index per access, walking the flattened sequence BACKWARDS: `last.insert`
+    // hands back the previous value, which — going this direction — is exactly the next
+    // occurrence of that key. `usize::MAX` = never referenced again, i.e. evict me first.
+    let mut next: Vec<Vec<usize>> = trace.iter().map(|d| vec![usize::MAX; d.len()]).collect();
+    let mut last: HashMap<u32, usize> = HashMap::new();
+    let mut i: usize = trace.iter().map(Vec::len).sum();
+    for (di, d) in trace.iter().enumerate().rev() {
+        for (ki, &k) in d.iter().enumerate().rev() {
+            i -= 1;
+            next[di][ki] = last.insert(k, i).unwrap_or(usize::MAX);
+        }
+    }
+
+    let mut resident: HashMap<u32, usize> = HashMap::new(); // key -> its next-use index
+    let mut pinned: HashSet<u32> = HashSet::new();
+    let mut loaded = 0u64;
+    for (di, d) in trace.iter().enumerate() {
+        // Pass 1 — score the batch and RE-KEY its hits to the use AFTER this one. Ranking a
+        // key by the reference being served now would make every hit look maximally urgent
+        // and evict the wrong victim. Pinning misses too is a no-op (they are not resident)
+        // and saves a second membership test below.
+        pinned.clear();
+        for (ki, &k) in d.iter().enumerate() {
+            if let Some(nu) = resident.get_mut(&k) {
+                *nu = next[di][ki];
+                loaded += 1;
+            }
+            pinned.insert(k);
+        }
+        // Pass 2 — admit the misses, evicting the farthest next use. Ties break on the key
+        // so the bound is reproducible: `HashMap` iteration order is not stable across runs
+        // and a number quoted in a doc has to be the same number tomorrow.
+        for (ki, &k) in d.iter().enumerate() {
+            if resident.contains_key(&k) {
+                continue;
+            }
+            // Linear scan, ~3.6k slots × ~300k misses ≈ a second — a heap would need a
+            // second structure kept in sync with `resident` for a tool that runs once.
+            // ponytail: if a sweep ever wants OPT per cell, that heap is the upgrade path.
+            while resident.len() >= cap {
+                let victim = resident
+                    .iter()
+                    .filter(|(v, _)| !pinned.contains(*v))
+                    .max_by_key(|&(v, &nu)| (nu, *v))
+                    .map(|(v, _)| *v);
+                // Same `None => break` as `hybrid::evict_until_fits`: a batch with no legal
+                // victim admits over budget rather than spinning.
+                match victim {
+                    Some(v) => resident.remove(&v),
+                    None => break,
+                };
+            }
+            resident.insert(k, next[di][ki]);
+        }
+    }
+    loaded
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let cap = args.n_slots;
@@ -183,9 +263,22 @@ fn main() -> Result<()> {
     }
 
     println!("\n{:<10} {:>8}", "policy", "loaded");
+    let mut best_online = f64::MIN;
     for pol in ["lru", "2q", "arc"] {
-        println!("{pol:<10} {:>7.2}%", pct(replay(pol, cap, split, &trace)?));
+        let hit = pct(replay(pol, cap, split, &trace)?);
+        best_online = best_online.max(hit);
+        println!("{pol:<10} {hit:>7.2}%");
     }
+    // The bound, and what is left under it. This line is the whole point of the table: a
+    // headroom near zero RETIRES residency as a lever and leaves format (`perf-roadmap.md`
+    // #2) as the only remaining way to move bytes; a large one prices the policy work in
+    // the currency that matters — at ~8 experts/layer a pp is ~0.6 fewer misses per token.
+    let opt = pct(replay_opt(cap, &trace));
+    println!("{:<10} {opt:>7.2}%   <- Belady bound (clairvoyant, unreachable online)", "opt");
+    println!(
+        "headroom:  {:.2} pp  — every online policy above is at least this far from optimal",
+        opt - best_online
+    );
     // Residency curve, ALWAYS printed. Two jobs, both learned the hard way.
     //
     // 1. It shows how steeply hit rate depends on capacity. Reading a single cap invites
@@ -242,5 +335,27 @@ mod tests {
              9 10\n",
         );
         assert_eq!(t, vec![vec![7, 8], vec![9, 10]]);
+    }
+
+    /// The textbook case OPT exists to catch, hand-computed. `1 2 3 1 2 3 1 2 3` at cap 2:
+    /// OPT scores **3** — on the first 3 it drops 2 (next use at index 4) rather than 1
+    /// (index 3), so 1 hits, and the pattern repeats. The exact 3 fails if the eviction rule
+    /// inverts, if the next-use table is off by an access, or if pass 1 forgets to re-key a
+    /// hit past the reference it is serving.
+    ///
+    /// The second assert is the property the whole tool rests on — **no online policy can
+    /// exceed the bound** — checked against all three rather than one. Note this is a strict
+    /// inequality, not `lru == 0`: `hybrid::evict_lru` runs two tiers on INDEPENDENT clocks
+    /// and is documented as not a true global LRU, and that drift is worth 2 hits here. If
+    /// this ever reads 0, the tier segmentation changed — that is a finding, not a typo.
+    #[test]
+    fn opt_bounds_every_online_policy() {
+        let t = parse("1\n2\n3\n1\n2\n3\n1\n2\n3\n");
+        let opt = replay_opt(2, &t);
+        assert_eq!(opt, 3, "Belady keeps the sooner-used key");
+        for pol in ["lru", "2q", "arc"] {
+            let online = replay(pol, 2, TwoQSplit::default(), &t).unwrap();
+            assert!(online < opt, "{pol} scored {online} against a bound of {opt}");
+        }
     }
 }

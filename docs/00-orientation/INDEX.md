@@ -39,7 +39,7 @@ measured, kept; the result is in the engine. `closed-mixed` — parts of both, b
 | doc | status | verdict |
 |---|---|---|
 | [`how-to-measure.md`](../measurement/how-to-measure.md) | live | How to measure, and the four-out-of-five lesson that says why the ISA beats a profile. |
-| [`perf-roadmap.md`](../measurement/perf-roadmap.md) | live | The ranked performance roadmap. Live rows: #2 VQ_K codebook, #5 the MLA HB sweep, #10 general-R MoE kernels. |
+| [`perf-roadmap.md`](../measurement/perf-roadmap.md) | live | The ranked performance roadmap. Live rows: #2 VQ_K codebook, #5 the MLA HB sweep, #10 general-R MoE kernels. #11 (cache policy) closed negative at 115 GiB — Belady's own ceiling is 8.6 ms/tok — but still live at 61. |
 | [`traces.md`](../measurement/traces.md) | live | The --features otlp instrument: its three switches, what the engine emits, and how to read a trace. Verified end to end 2026-08-01, after it had stopped compiling. |
 | [`gpu-profiling.md`](../measurement/gpu-profiling.md) | live | Why ROCm GPU profiling does not work on this part, and what to do instead. Only if you are attaching a profiler. |
 | [`benchmarks.md`](../measurement/benchmarks.md) | data | Append-only measurements. Never read whole — grep for the config. The top table predates the .i4 rebuild and says so. |
