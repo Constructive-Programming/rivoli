@@ -108,6 +108,44 @@ span timeline — see [docs/measurement/traces.md](docs/measurement/traces.md));
 `--checksum-x`/`XSUM` + fine-grained per-op timing). The cheap per-token PROFILE
 summary is always on, no feature needed.
 
+## CI, and what a green tick does not mean
+
+`.github/workflows/ci.yml` runs on every push and PR, on GitHub-hosted runners, in the two
+configurations that need no GPU: **featureless** (formats, converter logic, cache/replay
+sims, every registry test) and **`--features vulkan`**, which compiles `kernels/vk/*.comp`
+through `glslc` and runs build.rs's twelve mechanised SPIR-V rules — compiling a shader
+needs a compiler, not a device. The vulkan job also runs the union
+`vulkan,otlp,teacher-forcing,pred-probe,trace`, because plain `--features vulkan` compiles
+neither `mod otlp` nor `src/eval.rs`, and that blind spot is how `otlp` once sat broken on
+an `E0609` while every prescribed command passed.
+
+**A green tick says nothing about the 106 rocm tests, the 48 vulkan tests, or any tok/s
+number.** Those need the device.
+
+CI also installs `jscpd` explicitly. build.rs invokes `npx --no -- jscpd`, and `--no` means
+"never auto-install" — correct for a build, but it means that on a machine without jscpd the
+duplication gate does not run at all: build.rs warns and carries on. The workflow installs a
+pinned jscpd and then asserts the scan examined a plausible number of files, so "the scanner
+looked at nothing" fails instead of passing.
+
+## Releases
+
+Tagging `vX.Y.Z` runs `.github/workflows/release.yml`, which builds `--features rocm`
+for gfx1151, runs the full test suite **on the device**, and publishes a tarball of the
+engine plus the offline tools (`convert`, `fp8_to_i4`, `add_indexer`, `i4_audit`, `ppl`,
+`replay`) with a `BUILD-INFO.txt` naming the commit, toolchain and target arch.
+
+It needs a **self-hosted runner** labelled `rocm` and `gfx1151`: the ROCm toolchain does not
+fit a GitHub-hosted runner, and a binary for one GPU architecture is only worth shipping if
+it has been run on that architecture. With no such runner the job queues rather than
+failing — a tag should not release without hardware verification. The GPU is sole-tenant, so
+the test step takes the same `/tmp/rivoli-gpu.lock` every other consumer takes, and builds
+outside it.
+
+The tag must match `version` in `Cargo.toml`; the workflow refuses the release otherwise,
+before building anything. `archive/*` tags never trigger it — those are recovery points for
+deleted code.
+
 ## Convert a checkpoint → artifact
 
 ```

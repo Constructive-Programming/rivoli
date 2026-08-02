@@ -34,7 +34,16 @@ use tracing::info;
 /// Zero-knob by design: every flag is a benchmark or diagnostic override, and a bare
 /// `rivoli <model-dir>` is a complete invocation.
 #[derive(clap::Parser, Debug)]
-#[command(name = "rivoli", about = "GLM-5.2 int3-vq MoE decode engine (HIP/ROCm or Vulkan)")]
+// `version` reports CARGO_PKG_VERSION. It is here because tagged builds are now shipped as
+// tarballs (.github/workflows/release.yml), and a binary that cannot say which one it is
+// turns every "which build is this?" into a checksum hunt. The release workflow refuses to
+// run unless the tag and Cargo.toml agree, so this number is the tag. The commit and
+// toolchain that produced it are in BUILD-INFO.txt beside the binary.
+#[command(
+    name = "rivoli",
+    version,
+    about = "GLM-5.2 int3-vq MoE decode engine (HIP/ROCm or Vulkan)"
+)]
 struct Args {
     /// The converted artifact directory (manifest.json + codebooks + resident.safetensors
     /// + L{ll}.vq3 + tokenizer). The artifact IS the model.

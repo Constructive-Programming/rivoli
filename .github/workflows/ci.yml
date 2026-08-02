@@ -1,0 +1,123 @@
+name: ci
+
+# What CI can and cannot do for this crate, because it is not obvious.
+#
+# The real engine needs `hipcc` and a gfx1151 device, and GitHub-hosted runners have
+# neither. So everything here runs in the two configurations that need NO GPU:
+#
+#   * featureless — the crate builds host-only and the binaries compile to a refusal stub.
+#     README already describes this as "what CI/clippy runs". It covers the artifact
+#     formats, the converter logic, the cache/replay sims and every registry test.
+#   * `--features vulkan` — build.rs compiles kernels/vk/*.comp with glslc and runs the
+#     twelve mechanised SPIR-V rules over the result. Compiling a shader needs a compiler,
+#     not a device, so this validates the largest single piece of build.rs on a plain
+#     runner. Linking is fine too: `ash` loads the Vulkan loader at RUNTIME.
+#
+# What is NOT covered here, so nobody reads a green tick as more than it is: the 106 rocm
+# tests, the 48 vulkan tests, and any tok/s number. Those need the device and run on the
+# self-hosted runner in release.yml, or by hand.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A second push to the same branch makes the first one's result irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on a warning. `unwrap_used`/`expect_used` are already deny-level in Cargo.toml;
+  # this extends the bar to everything else, which is the standard this tree already meets.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  host:
+    name: featureless (build + test + duplication gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # build.rs invokes `npx --no -- jscpd`. `--no` means "never auto-install", which is
+      # deliberate — a build must not silently pull a package off the network. The
+      # consequence is that on a machine without jscpd the gate DOES NOT RUN: build.rs
+      # prints `cargo:warning=jscpd not run` and carries on, so a duplicated-code PR would
+      # sail through a green CI. Installing it here is what makes the gate real in CI, and
+      # the version is pinned so a jscpd release cannot change the verdict under us.
+      - name: Install jscpd (without this the duplication gate silently no-ops)
+        run: npm install -g jscpd@4.0.5
+
+      - name: Prove the duplication gate is actually armed
+        # Belt and braces for the trap above: if jscpd were missing or misconfigured this
+        # reports 0 clones for the wrong reason. Running it directly, and requiring the
+        # file count to be plausible, makes "the scanner examined nothing" a failure
+        # instead of a pass — the same anti-vacuity check tests/kernel_coverage.rs uses.
+        run: |
+          set -euo pipefail
+          jscpd -c .jscpd.json --reporters json --output /tmp/jscpd src tests build.rs
+          python3 - <<'PY'
+          import json, sys
+          r = json.load(open('/tmp/jscpd/jscpd-report.json'))
+          fmts = r['statistics']['formats']
+          files = sum(len(f['sources']) for f in fmts.values())
+          clones = len(r['duplicates'])
+          print(f'jscpd: {files} files scanned, {clones} clones')
+          if files < 40:
+              sys.exit(f'only {files} files scanned — jscpd is skipping the tree '
+                       '(maxLines/maxSize defaults silently drop the largest files)')
+          if clones:
+              sys.exit(f'{clones} clones')
+          PY
+
+      - name: clippy
+        run: cargo clippy --release --locked --all-targets
+
+      - name: test
+        run: cargo test --release --locked
+
+  vulkan:
+    name: vulkan shaders + every feature-gated module
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy
+
+      # glslc compiles the shaders; spirv-val and spirv-dis are what build.rs's rule engine
+      # reads. No GPU, no Vulkan driver, no loader needed at build time.
+      - name: Install the shader toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends glslc spirv-tools
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install jscpd (build.rs runs the gate in this arm too)
+        run: npm install -g jscpd@4.0.5
+
+      # This is the arm that compiles kernels/vk/*.comp and runs the SPIR-V rules — the
+      # barrier-memory-semantics check, the banned-builtin check, the whole-array-load
+      # check, spirv-val. It is the single highest-value thing CI can do without hardware.
+      - name: clippy (vulkan)
+        run: cargo clippy --release --locked --features vulkan --all-targets
+
+      # `--features vulkan` alone does NOT compile `mod otlp`, `src/eval.rs`, or the
+      # pred-probe and trace paths. That blind spot is how `otlp` sat broken on an E0609
+      # for weeks while every prescribed command passed — see CLAUDE.md, "Build and test".
+      # This is the union run, on the backend that needs no device.
+      - name: clippy (every feature-gated module)
+        run: cargo clippy --release --locked --features vulkan,otlp,teacher-forcing,pred-probe,trace --all-targets
+
+      - name: test (host-only tests still run under the vulkan feature)
+        run: cargo test --release --locked --features vulkan --test docs --test invariants --test kernel_coverage --test glsl_numerics

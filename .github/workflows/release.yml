@@ -1,0 +1,138 @@
+name: release
+
+# Binary packages for tagged commits.
+#
+# WHY THIS NEEDS A SELF-HOSTED RUNNER, and is not a GitHub-hosted job with an apt step.
+#
+# The shipped engine is `--features rocm` compiled `--offload-arch=gfx1151`. That needs the
+# ROCm toolchain (hipcc + device libs), which is tens of gigabytes and does not fit in a
+# GitHub-hosted runner's free disk. More importantly, a binary for one GPU architecture is
+# only worth shipping if it has been RUN on that architecture, and the 106-test rocm suite
+# needs the device. So the release is built and tested on the target machine itself.
+#
+# REGISTERING THE RUNNER (one-time, on the Strix Halo box):
+#   Settings -> Actions -> Runners -> New self-hosted runner, then add the labels
+#   `rocm` and `gfx1151` alongside the defaults. This workflow requires both, so a runner
+#   that lacks ROCm can never pick the job up by accident.
+#
+# If no such runner is registered the job QUEUES rather than fails. That is deliberate: a
+# tag should not be silently released without hardware verification. Nothing else in CI
+# depends on this workflow — ci.yml runs entirely on GitHub-hosted runners.
+
+on:
+  push:
+    tags:
+      # `v1.2.3` only. NOT a bare `*`: this repo's tag namespace already contains
+      # `archive/vq-study`, `archive/replay-oracle-prefetch` and `archive/mtp-target-probe`,
+      # which are recovery points for deleted code and must never cut a release.
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+permissions:
+  contents: write # create the Release and upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: build, test on the device, package
+    runs-on: [self-hosted, linux, rocm, gfx1151]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # A tag that disagrees with Cargo.toml ships a binary whose `--version` lies about
+      # which release it is, and the mismatch is invisible until someone is debugging a
+      # deployment. Fail here, before anything is built.
+      - name: Refuse a tag that disagrees with Cargo.toml
+        run: |
+          set -euo pipefail
+          crate=$(cargo metadata --no-deps --format-version 1 \
+                  | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$crate" != "$tag" ]; then
+            echo "tag $GITHUB_REF_NAME says $tag, Cargo.toml says $crate" >&2
+            echo "Bump the version in Cargo.toml (and Cargo.lock) to match the tag." >&2
+            exit 1
+          fi
+          echo "tag and Cargo.toml agree on $crate"
+
+      - name: Record what produced this build
+        id: meta
+        run: |
+          set -euo pipefail
+          echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          echo "arch=${RIVOLI_OFFLOAD_ARCH:-gfx1151}" >> "$GITHUB_OUTPUT"
+          {
+            echo "rivoli ${GITHUB_REF_NAME}"
+            echo "commit:  ${GITHUB_SHA}"
+            echo "built:   $(date -uIseconds)"
+            echo "arch:    ${RIVOLI_OFFLOAD_ARCH:-gfx1151}"
+            echo "rustc:   $(rustc --version)"
+            echo "hipcc:   $(hipcc --version 2>/dev/null | head -1 || echo unknown)"
+          } > BUILD-INFO.txt
+          cat BUILD-INFO.txt
+
+      # OUTSIDE the GPU lock, deliberately. Compiling needs no device, and holding the lock
+      # through a multi-minute build would stall anything else on this sole-tenant machine.
+      - name: Build (no GPU needed)
+        run: cargo build --release --locked --features rocm --bins
+
+      # INSIDE the lock. The GPU here is SOLE-TENANT and shared with interactive work:
+      # `DeviceTier::new` fails to allocate while anything else holds the budget, so a test
+      # run that ignored the lock would both fail spuriously and corrupt whatever it
+      # collided with. This is the same `/tmp/rivoli-gpu.lock` every other consumer takes.
+      #
+      # `--test-threads=1` is not tidiness: tests/vk.rs:186 documents that VALIDATION_ERRORS
+      # is process-global, so under parallel threads a message caused by one test fails
+      # whichever test reads the counter next and names the wrong one.
+      - name: Test on the device (sole-tenant, under the shared lock)
+        run: |
+          flock /tmp/rivoli-gpu.lock \
+            cargo test --release --locked --features rocm -- --test-threads=1
+
+      - name: Package
+        id: pack
+        run: |
+          set -euo pipefail
+          NAME="rivoli-${{ steps.meta.outputs.tag }}-linux-x86_64-${{ steps.meta.outputs.arch }}"
+          mkdir -p "dist/$NAME"
+          # The engine plus the offline tools, which are useless separately: you cannot run
+          # rivoli without an artifact, and `convert`/`fp8_to_i4`/`add_indexer` are what
+          # build one. README's conversion recipe names all three.
+          for b in rivoli convert fp8_to_i4 add_indexer i4_audit ppl replay; do
+            install -m755 "target/release/$b" "dist/$NAME/$b"
+          done
+          install -m644 README.md BUILD-INFO.txt "dist/$NAME/"
+          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+          ( cd dist && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256" )
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          ls -lh dist/
+
+      # Sanity: the packaged binary must at least start and report its own identity. A
+      # tarball whose contents cannot exec is the classic release-day discovery.
+      - name: Smoke-test the packaged binary
+        run: |
+          set -euo pipefail
+          tar -C /tmp -xzf "dist/${{ steps.pack.outputs.name }}.tar.gz"
+          "/tmp/${{ steps.pack.outputs.name }}/rivoli" --version
+          "/tmp/${{ steps.pack.outputs.name }}/rivoli" --help > /dev/null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.name }}
+          path: dist/*.tar.gz*
+          retention-days: 30
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ steps.meta.outputs.tag }}" \
+            --title "rivoli ${{ steps.meta.outputs.tag }}" \
+            --generate-notes \
+            --notes "Built and tested on ${{ steps.meta.outputs.arch }} (AMD Strix Halo). Requires a ROCm runtime — the binary links \`libamdhip64.so\` dynamically. See BUILD-INFO.txt in the tarball for the exact toolchain." \
+            "dist/${{ steps.pack.outputs.name }}.tar.gz" \
+            "dist/${{ steps.pack.outputs.name }}.tar.gz.sha256"
