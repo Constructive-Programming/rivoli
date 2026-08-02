@@ -300,7 +300,10 @@ pub fn device_sync() -> Result<()> {
 /// `dst` and `src` must be valid, `bytes`-sized, NON-OVERLAPPING device regions (the
 /// arena guarantees distinct slots).
 pub unsafe fn memcpy_dtod(dst: *mut u8, src: *const u8, bytes: usize) -> Result<()> {
-    check(unsafe { rivoli_memcpy_dtod(dst, src, bytes) }, "memcpy_dtod")
+    check(
+        unsafe { rivoli_memcpy_dtod(dst, src, bytes) },
+        "memcpy_dtod",
+    )
 }
 
 /// Fill `bytes` at `dst` with the 32-bit pattern `pat` (`bytes` must be a multiple of 4).
@@ -806,8 +809,7 @@ pub unsafe fn launch_gemv_i8(
     y: *mut f32,
 ) -> Result<()> {
     // SAFETY: caller's pointer contract.
-    let r =
-        unsafe { rivoli_gemv_i8(x, packed, scale, o_dim as i32, i_dim as i32, nrow as i32, y) };
+    let r = unsafe { rivoli_gemv_i8(x, packed, scale, o_dim as i32, i_dim as i32, nrow as i32, y) };
     check(r, "gemv_i8")
 }
 

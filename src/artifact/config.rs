@@ -285,7 +285,13 @@ mod tests {
             c.attn = a;
             c
         };
-        for a in [AttnMode::Dense, AttnMode::Streaming { sinks: 4, window: 512 }] {
+        for a in [
+            AttnMode::Dense,
+            AttnMode::Streaming {
+                sinks: 4,
+                window: 512,
+            },
+        ] {
             with_attn(Mode::Int3Vq, a)
                 .validate_backend()
                 .expect("int3-vq + a ported attention mode is the supported configuration");
@@ -294,17 +300,30 @@ mod tests {
             let e = with_attn(m, AttnMode::Dense)
                 .validate_backend()
                 .expect_err("int4 expert kernels are not ported");
-            let msg = e.to_string();
-            assert!(msg.contains("int4 expert kernels"), "must name what is missing: {msg}");
-            assert!(msg.contains("--features rocm"), "must name the way out: {msg}");
+            assert_refusal_names(&e, "int4 expert kernels");
         }
         for a in [AttnMode::Dsa, AttnMode::Misa { active_heads: 4 }] {
             let e = with_attn(Mode::Int3Vq, a)
                 .validate_backend()
                 .expect_err("the DSA indexer kernels are not ported");
-            let msg = e.to_string();
-            assert!(msg.contains("index_append"), "must name what is missing: {msg}");
-            assert!(msg.contains("--features rocm"), "must name the way out: {msg}");
+            assert_refusal_names(&e, "index_append");
         }
+    }
+
+    /// A backend refusal has to say BOTH what is missing and how to get it, and the two
+    /// are asserted together because a message carrying only one is the failure that
+    /// matters: "int4 expert kernels are not ported" sends a reader hunting through docs,
+    /// and "--features rocm" on its own does not say what for.
+    ///
+    /// Gated to match its only caller. Without the cfg this is dead code under `rocm`,
+    /// where there is nothing to refuse.
+    #[cfg(feature = "vulkan")]
+    fn assert_refusal_names(e: &anyhow::Error, missing: &str) {
+        let msg = e.to_string();
+        assert!(msg.contains(missing), "must name what is missing: {msg}");
+        assert!(
+            msg.contains("--features rocm"),
+            "must name the way out: {msg}"
+        );
     }
 }

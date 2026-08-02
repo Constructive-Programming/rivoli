@@ -49,7 +49,10 @@ impl OrderedSet {
     /// The LRU key (and tick) without removing — for cross-set recency comparison (the
     /// hybrid LRU picks the globally oldest across both tiers), skipping `must`.
     pub(crate) fn peek_lru_skip(&self, must: &HashSet<u32>) -> Option<(i64, u32)> {
-        self.order.iter().find(|(_, k)| !must.contains(k)).map(|(t, k)| (*t, *k))
+        self.order
+            .iter()
+            .find(|(_, k)| !must.contains(k))
+            .map(|(t, k)| (*t, *k))
     }
     /// Evict and return the LRU key, skipping `must`.
     ///
@@ -143,7 +146,6 @@ impl TwoQSplit {
     pub fn kout_pct(self) -> u32 {
         self.kout_pct
     }
-
 }
 
 #[cfg(test)]
@@ -162,7 +164,10 @@ mod tests {
             (25, 1001, "--2q-kout 1001"),
         ] {
             let e = TwoQSplit::new(kin, kout).expect_err("out of range must be rejected");
-            assert!(e.to_string().contains(want), "message {e:?} should name {want}");
+            assert!(
+                e.to_string().contains(want),
+                "message {e:?} should name {want}"
+            );
         }
         assert!(TwoQSplit::new(8, 20).is_ok());
     }

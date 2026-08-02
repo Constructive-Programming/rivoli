@@ -75,6 +75,24 @@ fn copy_out_owned(
     Ok(out)
 }
 
+/// Emit the `#[cfg(test)]` bump-cursor accessor both backends' `DeviceTier` carry.
+///
+/// Shared for the same reason as [`bump`] and [`guard_capacity`]: the cursor is the part
+/// of the tier that is NOT backend-specific, and the shared `tier_tests` at file scope
+/// asserts on it for both. It has to be an accessor rather than a `pub(super)` field so
+/// the field stays private in a real build, and it has to be a macro rather than a trait
+/// because either backend's `impl` block is the only place that can name the field —
+/// which is what left two literal copies once `cargo fmt` normalised them.
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
+macro_rules! tier_used_accessor {
+    () => {
+        #[cfg(test)]
+        pub(super) fn used(&self) -> usize {
+            self.used
+        }
+    };
+}
+
 #[cfg(feature = "rocm")]
 mod ffi {
     use std::ffi::c_void;
@@ -230,10 +248,7 @@ mod tier {
             Ok(unsafe { std::slice::from_raw_parts(self.slab.host_mut(), len) }.to_vec())
         }
 
-        /// The bump cursor, for the shared `tier_tests` at file scope. `#[cfg(test)]`, so
-        /// the field stays private in a real build.
-        #[cfg(test)]
-        pub(super) fn used(&self) -> usize { self.used }
+        tier_used_accessor!();
     }
 
     /// A standalone mutable device buffer — for per-token activations, the
@@ -448,7 +463,6 @@ mod tier {
             unsafe { rivoli_vmm_free(self.ptr as *mut c_void, self.handle, self.mapped) };
         }
     }
-
 }
 
 #[cfg(feature = "vulkan")]
@@ -568,10 +582,9 @@ mod vktier {
             Ok(out)
         }
 
-        /// The bump cursor. `place_pads_the_cursor_to_a_word` in this module reads the
-        /// field straight; the shared `tier_tests` at file scope cannot, hence this.
-        #[cfg(test)]
-        pub(super) fn used(&self) -> usize { self.used }
+        // `place_pads_the_cursor_to_a_word` in this module reads the field straight; the
+        // shared `tier_tests` at file scope cannot, hence the accessor.
+        tier_used_accessor!();
     }
 
     /// A standalone mutable device buffer — per-token activations, the descriptor
@@ -747,8 +760,7 @@ mod vktier {
             let mut tier = DeviceTier::new(4 << 20).expect("alloc tier");
             tier.place(&vec![7u8; 1001]).expect("place ragged");
             assert_eq!(
-                tier.used,
-                1004,
+                tier.used, 1004,
                 "cursor must advance by the WORD-rounded span, so a shader's 32-bit \
                  read of the final byte cannot reach the next placement"
             );
@@ -772,7 +784,6 @@ mod vktier {
                  start depending on it"
             );
         }
-
     }
 }
 

@@ -35,7 +35,8 @@ fn ids(hay: &str, prefix: &str) -> BTreeSet<u32> {
 #[test]
 fn every_documented_invariant_has_a_test_and_vice_versa() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let doc = std::fs::read_to_string(root.join("docs/reference/architecture.md")).expect("ARCHITECTURE.md");
+    let doc = std::fs::read_to_string(root.join("docs/reference/architecture.md"))
+        .expect("ARCHITECTURE.md");
     // Only the registry table declares invariants; prose elsewhere may reference them.
     let table = doc
         .split("## 8b.")

@@ -42,7 +42,10 @@ type Decision = Vec<u32>;
 // struct itself carries no doc comment on purpose: `about` overrides it, so it would be a
 // second description of this binary that nothing ever prints.
 #[derive(Parser)]
-#[command(name = "replay", about = "Offline cache-policy A/B and 2Q Kin/Kout sweep over a routing trace")]
+#[command(
+    name = "replay",
+    about = "Offline cache-policy A/B and 2Q Kin/Kout sweep over a routing trace"
+)]
 struct Args {
     /// The routed-expert access trace to replay, captured with `rivoli --trace`. v1 and v2
     /// traces both read here; a v2 candidate-window tail is ignored.
@@ -78,7 +81,10 @@ fn parse_trace(r: impl BufRead) -> Result<Vec<Decision>> {
     for line in r.lines() {
         let line = line.context("read trace")?;
         let head = line.split_once('|').map_or(line.as_str(), |(h, _)| h);
-        let demand: Decision = head.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+        let demand: Decision = head
+            .split_whitespace()
+            .filter_map(|t| t.parse().ok())
+            .collect();
         if !demand.is_empty() {
             out.push(demand);
         }
@@ -120,8 +126,8 @@ fn main() -> Result<()> {
     let default = TwoQSplit::default();
     let split = TwoQSplit::new(args.kin, args.kout)?;
 
-    let f = std::fs::File::open(&args.trace)
-        .with_context(|| format!("open trace {}", args.trace))?;
+    let f =
+        std::fs::File::open(&args.trace).with_context(|| format!("open trace {}", args.trace))?;
     let trace = parse_trace(std::io::BufReader::new(f))?;
 
     let accesses: usize = trace.iter().map(Vec::len).sum();

@@ -158,7 +158,12 @@ fn vulkan() {
         .collect();
     let stems: Vec<String> = comps
         .iter()
-        .map(|p| p.file_stem().expect("shader stem").to_string_lossy().into_owned())
+        .map(|p| {
+            p.file_stem()
+                .expect("shader stem")
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
 
     // PRUNE stale SPIR-V before compiling. `include_bytes!` in src/vk.rs reads
@@ -186,7 +191,11 @@ fn vulkan() {
         let stem = src.file_stem().expect("shader stem").to_string_lossy();
         let spv = format!("{out_dir}/{stem}.spv");
         let out = Command::new(&glslc)
-            .args([&format!("--target-env={VK_TARGET_ENV}"), "-O", "-Ikernels/vk"])
+            .args([
+                &format!("--target-env={VK_TARGET_ENV}"),
+                "-O",
+                "-Ikernels/vk",
+            ])
             .arg(format!("-DWAVE={VK_WAVE}"))
             .arg(format!("-DROWS_PER_BLOCK={VK_ROWS_PER_BLOCK}"))
             .arg(src)
@@ -486,7 +495,11 @@ fn no_barrier_without_memory(spv: &str, text: &str) -> Vec<String> {
 /// `spirv-dis` output, or `None` with a warning if the tool is absent — same optional
 /// treatment as `spirv-val`, since it ships in a different package from glslc.
 fn disassemble(spv: &str) -> Option<String> {
-    match Command::new("spirv-dis").arg("--no-color").arg(spv).output() {
+    match Command::new("spirv-dis")
+        .arg("--no-color")
+        .arg(spv)
+        .output()
+    {
         Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
         Ok(_) => panic!("spirv-dis failed on {spv}"),
         Err(e) => {
@@ -612,7 +625,15 @@ fn no_duplicated_rust() {
     // here is `src` — a silent fall-back to the built-in minTokens 50 would leave the gate
     // more than three times looser than the file that is supposed to govern it.
     let out = match Command::new("npx")
-        .args(["--no", "--", "jscpd", "-c", ".jscpd.json", "--exitCode", "7"])
+        .args([
+            "--no",
+            "--",
+            "jscpd",
+            "-c",
+            ".jscpd.json",
+            "--exitCode",
+            "7",
+        ])
         .args(SCAN)
         .output()
     {

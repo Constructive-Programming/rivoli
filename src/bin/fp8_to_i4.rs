@@ -88,12 +88,21 @@ fn free_bytes(dir: &str) -> Result<u64> {
     // the `rc == 0` check below.
     let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::statvfs(c.as_ptr(), &mut s) };
-    ensure!(rc == 0, "statvfs({dir}): {}", std::io::Error::last_os_error());
+    ensure!(
+        rc == 0,
+        "statvfs({dir}): {}",
+        std::io::Error::last_os_error()
+    );
     Ok(s.f_bavail as u64 * s.f_frsize as u64)
 }
 
 fn main() -> Result<()> {
-    let Args { fp8_dir, artifact_dir: art, from: arg_from, to: arg_to } = Args::parse();
+    let Args {
+        fp8_dir,
+        artifact_dir: art,
+        from: arg_from,
+        to: arg_to,
+    } = Args::parse();
 
     let cfg = ModelConfig::load(&art).context("load artifact manifest")?;
     let (h, m, ne) = (cfg.hidden, cfg.moe_inter, cfg.n_experts);
@@ -113,10 +122,7 @@ fn main() -> Result<()> {
     // the same way.
     let mtp = src.has(&format!("model.layers.{}.eh_proj.weight", cfg.n_layers));
     let last = cfg.n_layers + usize::from(mtp);
-    let (from, to) = (
-        arg_from.unwrap_or(cfg.dense_layers),
-        arg_to.unwrap_or(last),
-    );
+    let (from, to) = (arg_from.unwrap_or(cfg.dense_layers), arg_to.unwrap_or(last));
     ensure!(
         cfg.dense_layers <= from && from < to && to <= last,
         "layer range {from}..{to} outside the MoE range {}..{last}",

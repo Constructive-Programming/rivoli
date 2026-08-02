@@ -11,14 +11,14 @@
 //! Run: cargo run --release --features rocm --example dot_bench
 #![cfg(feature = "rocm")]
 #![allow(clippy::expect_used)]
-use rivoli::memory::device::DeviceBuf;
+use rivoli::artifact::quant::{VQ_DIM, VQ_K, matvec_i4, quant_i4, quant_vq};
 use rivoli::backend::hip::{
     attend_scratch_floats, device_sync, launch_argmax, launch_attend, launch_gemv_fp8,
     launch_gemv_i4, launch_gemv_i8, launch_gemv_vq, launch_mla_absorb_fp8, launch_mla_value_fp8,
     launch_rmsnorm,
 };
 use rivoli::math::{f32_to_e4m3, f32_to_f16};
-use rivoli::artifact::quant::{matvec_i4, quant_i4, quant_vq, VQ_DIM, VQ_K};
+use rivoli::memory::device::DeviceBuf;
 
 struct Rng(u64);
 impl Rng {
@@ -54,18 +54,25 @@ fn rnd(r: &mut Rng, n: usize) -> Vec<u8> {
     f32b(&(0..n).map(|_| r.f()).collect::<Vec<_>>())
 }
 fn rnd_scale(r: &mut Rng, n: usize) -> Vec<u8> {
-    f32b(&(0..n).map(|_| (r.f() * 0.1).abs() + 0.01).collect::<Vec<_>>())
+    f32b(
+        &(0..n)
+            .map(|_| (r.f() * 0.1).abs() + 0.01)
+            .collect::<Vec<_>>(),
+    )
 }
 fn f32v(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 /// FNV-1a over a kernel's raw output bytes — the only instrument here that separates
 /// "bit-identical" from "within tolerance". See docs/measurement/benchmarks.md, "A fingerprint is the only
 /// instrument that shows bit-identity", including why the inputs below must VARY.
 fn fnv(b: &[u8]) -> u64 {
-    b.iter()
-        .fold(0xcbf2_9ce4_8422_2325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x100_0000_01b3))
+    b.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &x| {
+        (h ^ x as u64).wrapping_mul(0x100_0000_01b3)
+    })
 }
 
 fn time(iters: u32, f: &dyn Fn()) -> f64 {
@@ -101,15 +108,31 @@ fn run(name: &str, o_dim: usize, i_dim: usize) {
     matvec_i4(&mut want, &x, &i4p, &i4s, o_dim, i_dim);
     let got = f32v(&yb.copy_out().expect("o"));
     let mx = want.iter().fold(0f32, |m, v| m.max(v.abs()));
-    let err = want.iter().zip(&got).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
-    let i4_ok = if err <= 1e-3 * mx + 1e-3 { "ok" } else { "MISMATCH" };
+    let err = want
+        .iter()
+        .zip(&got)
+        .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+    let i4_ok = if err <= 1e-3 * mx + 1e-3 {
+        "ok"
+    } else {
+        "MISMATCH"
+    };
 
     // int3-VQ
     let cb: Vec<f32> = (0..VQ_K * VQ_DIM).map(|_| r.f()).collect();
     let (vqi, vqs) = quant_vq(&w, o_dim, i_dim, &cb);
     let (vqib, vqsb, cbb) = (dev(&vqi), dev(&u16b(&vqs)), dev(&f16b(&cb)));
     let us_vq = time(iters, &|| unsafe {
-        launch_gemv_vq(xp, vqib.ptr(), vqsb.ptr() as *const u16, cbb.ptr() as *const u16, o_dim, i_dim, yp).expect("vq");
+        launch_gemv_vq(
+            xp,
+            vqib.ptr(),
+            vqsb.ptr() as *const u16,
+            cbb.ptr() as *const u16,
+            o_dim,
+            i_dim,
+            yp,
+        )
+        .expect("vq");
     });
 
     // fp8 (scale=1 blocks — decode cost is representative; accuracy irrelevant here)
@@ -117,15 +140,33 @@ fn run(name: &str, o_dim: usize, i_dim: usize) {
     let fp8s: Vec<f32> = vec![1.0; (o_dim / block) * (i_dim / block)];
     let (fp8pb, fp8sb) = (dev(&fp8p), dev(&f32b(&fp8s)));
     let us_fp8 = time(iters, &|| unsafe {
-        launch_gemv_fp8(xp, fp8pb.ptr(), fp8sb.ptr() as *const f32, o_dim, i_dim, block, 1, yp).expect("fp8");
+        launch_gemv_fp8(
+            xp,
+            fp8pb.ptr(),
+            fp8sb.ptr() as *const f32,
+            o_dim,
+            i_dim,
+            block,
+            1,
+            yp,
+        )
+        .expect("fp8");
     });
 
     let ge = |us: f64| gelem / (us * 1e-6) / 1e9;
     println!("{name} [{o_dim}x{i_dim}]  (gemv_i4 vs oracle: {i4_ok}, err {err:.2e}/{mx:.2})");
     println!("  int4 {us_i4:7.1}us  {:6.1} GElem/s  (1.00x)", ge(us_i4));
-    println!("  vq3  {us_vq:7.1}us  {:6.1} GElem/s  ({:.2}x int4)", ge(us_vq), us_i4 / us_vq);
-    println!("  fp8  {us_fp8:7.1}us  {:6.1} GElem/s  ({:.2}x int4){}", ge(us_fp8), us_i4 / us_fp8,
-        if i_dim >= 4096 { "  [split-K]" } else { "" });
+    println!(
+        "  vq3  {us_vq:7.1}us  {:6.1} GElem/s  ({:.2}x int4)",
+        ge(us_vq),
+        us_i4 / us_vq
+    );
+    println!(
+        "  fp8  {us_fp8:7.1}us  {:6.1} GElem/s  ({:.2}x int4){}",
+        ge(us_fp8),
+        us_i4 / us_fp8,
+        if i_dim >= 4096 { "  [split-K]" } else { "" }
+    );
 }
 
 /// `n` bytes from a repeated 4 KiB pattern. These two shapes are BANDWIDTH measurements
@@ -148,7 +189,10 @@ fn pattern(n: usize, mut byte: impl FnMut(f32) -> u8) -> Vec<u8> {
 
 fn report(name: &str, kind: &str, o_dim: usize, i_dim: usize, us: f64) {
     let gbs = (o_dim * i_dim) as f64 / (us * 1e-6) / 1e9;
-    println!("{name} {kind} [{o_dim}x{i_dim}]  {us:8.1}us  {gbs:6.1} GB/s  ({:.0}% of 256)", gbs / 2.56);
+    println!(
+        "{name} {kind} [{o_dim}x{i_dim}]  {us:8.1}us  {gbs:6.1} GB/s  ({:.0}% of 256)",
+        gbs / 2.56
+    );
 }
 
 /// The two BIG real shapes, throughput only. Separate from `run` because `run`
@@ -173,7 +217,17 @@ fn run_fp8(name: &str, o_dim: usize, i_dim: usize) {
     let mut yb = dev(&vec![0u8; 2 * o_dim * 4]);
     let (xp, yp) = (xb.ptr() as *const f32, yb.ptr_mut() as *mut f32);
     let us = time(60, &|| unsafe {
-        launch_gemv_fp8(xp, pb.ptr(), sb.ptr() as *const f32, o_dim, i_dim, block, 1, yp).expect("fp8");
+        launch_gemv_fp8(
+            xp,
+            pb.ptr(),
+            sb.ptr() as *const f32,
+            o_dim,
+            i_dim,
+            block,
+            1,
+            yp,
+        )
+        .expect("fp8");
     });
     report(name, "fp8", o_dim, i_dim, us);
     // Row 0's bytes, before the 2-row arm rewrites them. `x` row 0 is the same first
@@ -181,7 +235,17 @@ fn run_fp8(name: &str, o_dim: usize, i_dim: usize) {
     // before batching existed.
     let row0 = yb.copy_out().expect("out")[..o_dim * 4].to_vec();
     let us2 = time(60, &|| unsafe {
-        launch_gemv_fp8(xp, pb.ptr(), sb.ptr() as *const f32, o_dim, i_dim, block, 2, yp).expect("fp8 r2");
+        launch_gemv_fp8(
+            xp,
+            pb.ptr(),
+            sb.ptr() as *const f32,
+            o_dim,
+            i_dim,
+            block,
+            2,
+            yp,
+        )
+        .expect("fp8 r2");
     });
     report(name, "fp8 r2", o_dim, i_dim, us2);
     // BIT-identity at the real engine shape, which the unit test's toy dims cannot reach:
@@ -193,12 +257,17 @@ fn run_fp8(name: &str, o_dim: usize, i_dim: usize) {
         after[..o_dim * 4] == row0[..],
         "{name}: nrow=2 row 0 differs from nrow=1 — the batched kernel is not the same arithmetic"
     );
-    println!("            2-row cost ratio {:.3}x  (row 0 bit-identical)", us2 / us);
+    println!(
+        "            2-row cost ratio {:.3}x  (row 0 bit-identical)",
+        us2 / us
+    );
     // The hash is only comparable against a run with the SAME generator, so print what
     // determines it: a recorded bare hash goes stale the first time a seed or a draw
     // order moves, and reads as a numerics regression when it does.
-    println!("            fnv {:016x}  (seed {seed:#x}, {o_dim}x{i_dim} blk{block})",
-        fnv(&row0));
+    println!(
+        "            fnv {:016x}  (seed {seed:#x}, {o_dim}x{i_dim} blk{block})",
+        fnv(&row0)
+    );
 }
 
 fn run_i8(name: &str, o_dim: usize, i_dim: usize) {
@@ -241,16 +310,20 @@ fn run_mla(h: usize, qh: usize, nope: usize, vh: usize, kvl: usize) {
     });
     let gbs = (h * nope * kvl) as f64 / (us * 1e-6) / 1e9;
     println!("mla_absorb  [{h}x{nope}x{kvl}]   {us:8.1}us  {gbs:6.1} GB/s");
-    println!("            fnv {:016x}  (seed {SEED:#x}, {h}x{nope}x{kvl} blk{block})",
-        fnv(&qabs.copy_out().expect("out")));
+    println!(
+        "            fnv {:016x}  (seed {SEED:#x}, {h}x{nope}x{kvl} blk{block})",
+        fnv(&qabs.copy_out().expect("out"))
+    );
 
     let us = time(60, &|| unsafe {
         launch_mla_value_fp8(cp, kp, sp, h, nope, vh, kvl, block, 1, xp).expect("value");
     });
     let gbs = (h * vh * kvl) as f64 / (us * 1e-6) / 1e9;
     println!("mla_value   [{h}x{vh}x{kvl}]   {us:8.1}us  {gbs:6.1} GB/s");
-    println!("            fnv {:016x}  (seed {SEED:#x}, {h}x{vh}x{kvl} blk{block})",
-        fnv(&ctx.copy_out().expect("out")));
+    println!(
+        "            fnv {:016x}  (seed {SEED:#x}, {h}x{vh}x{kvl} blk{block})",
+        fnv(&ctx.copy_out().expect("out"))
+    );
 }
 
 /// MLA flash attention at two context lengths. This kernel's cost grows with context,
@@ -273,8 +346,23 @@ fn run_attend(h: usize, kvl: usize, rope: usize) {
         let rp = rc.ptr() as *const u16;
         let (cp, pp) = (clat.ptr_mut() as *mut f32, part.ptr_mut() as *mut f32);
         let us = time(30, &|| unsafe {
-            launch_attend(qa, qr, lp, ls, rp, std::ptr::null(), h, nr, kvl, rope, n_blocks, 0.08, cp, pp)
-                .expect("attend");
+            launch_attend(
+                qa,
+                qr,
+                lp,
+                ls,
+                rp,
+                std::ptr::null(),
+                h,
+                nr,
+                kvl,
+                rope,
+                n_blocks,
+                0.08,
+                cp,
+                pp,
+            )
+            .expect("attend");
         });
         println!("mla_attend  [h{h} nr{nr} kvl{kvl}]  {us:8.1}us");
     }
@@ -286,7 +374,11 @@ fn run_attend(h: usize, kvl: usize, rope: usize) {
 /// ops in the bucket. Neither kernel is modified by this branch — the rows exist to
 /// decompose the budget, not to show a before/after.
 fn run_tail_rest(vocab: usize, hidden: usize) {
-    let logits = dev(&f32b(&(0..vocab).map(|i| (i % 977) as f32 * 1e-3).collect::<Vec<_>>()));
+    let logits = dev(&f32b(
+        &(0..vocab)
+            .map(|i| (i % 977) as f32 * 1e-3)
+            .collect::<Vec<_>>(),
+    ));
     let mut idx = dev(&[0u8; 4]);
     let mut val = dev(&[0u8; 4]);
     let (lp, ip, vp) = (
@@ -322,7 +414,10 @@ fn main() {
     // timings and the fnv fingerprints both — is read off this binary's stdout, so an
     // empty run that exits 0 reads as "no regression" in exactly the A/B it exists for.
     for w in &want {
-        assert!(SECTIONS.contains(&w.as_str()), "unknown section {w:?}, want one of {SECTIONS:?}");
+        assert!(
+            SECTIONS.contains(&w.as_str()),
+            "unknown section {w:?}, want one of {SECTIONS:?}"
+        );
     }
     let on = |s: &str| want.is_empty() || want.iter().any(|w| w == s);
 

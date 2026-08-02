@@ -92,7 +92,9 @@ pub fn tool_call_markup(name: &str, arguments: &Value) -> String {
                 Value::String(t) => t.clone(),
                 other => python_json(other),
             };
-            s.push_str(&format!("<arg_key>{k}</arg_key><arg_value>{rendered}</arg_value>"));
+            s.push_str(&format!(
+                "<arg_key>{k}</arg_key><arg_value>{rendered}</arg_value>"
+            ));
         }
     }
     s.push_str("</tool_call>");
@@ -251,14 +253,22 @@ impl Tokenizer {
         // anything that is not "high" into "Max" — including "low" and "medium", which is
         // the template's behaviour and not a shortcut taken here.
         let system = self.inner.token_to_id("<|system|>");
-        if opts.thinking && let Some(system) = system {
-            let effort = if opts.reasoning_effort == Some("high") { "High" } else { "Max" };
+        if opts.thinking
+            && let Some(system) = system
+        {
+            let effort = if opts.reasoning_effort == Some("high") {
+                "High"
+            } else {
+                "Max"
+            };
             out.push(system);
             out.extend_from_slice(&self.encode(&format!("Reasoning Effort: {effort}"))?);
         }
         // The tool declarations, after the effort turn and before the conversation — the
         // order the template emits them in, and therefore the order the model saw.
-        if let Some(tools) = opts.tools.filter(|t| t.as_array().is_some_and(|a| !a.is_empty()))
+        if let Some(tools) = opts
+            .tools
+            .filter(|t| t.as_array().is_some_and(|a| !a.is_empty()))
             && let Some(system) = system
         {
             out.push(system);

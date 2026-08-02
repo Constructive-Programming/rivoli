@@ -32,13 +32,13 @@
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use rivoli::artifact::format::{FormatMeta, I4Source, Safetensors, load_codebooks};
-use rivoli::math::silu;
 use rivoli::artifact::model::ModelConfig;
 use rivoli::artifact::quant::{
     I4_GROUP, PROJ, dequant_i4, expert_base, i4_expert_stride, i4_groups, i4_row_bytes,
     i4_slot_offsets, matvec_i4, quant_i4, read_f32, vq_decode_proj, vq_expert, vq_expert_layout,
     vq_expert_stride,
 };
+use rivoli::math::silu;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 
@@ -104,7 +104,12 @@ struct Args {
     // `default_value` (one string) rather than `default_values_t` (four numbers) only so
     // that `--help` shows the default in the same comma syntax the flag is typed in;
     // clap runs the delimiter over the default too, so both spell the same four values.
-    #[arg(long, value_name = "A,B,C", value_delimiter = ',', default_value = "0,7,128,255")]
+    #[arg(
+        long,
+        value_name = "A,B,C",
+        value_delimiter = ',',
+        default_value = "0,7,128,255"
+    )]
     experts: Vec<usize>,
 }
 
@@ -162,15 +167,15 @@ fn matvec_f64(w: &[f32], x: &[f32], o_dim: usize, i_dim: usize) -> Vec<f32> {
 /// large weights — it can improve while the many small weights, which is where decode
 /// quality lives, get coarser. This separates the two.
 struct Bulk {
-    amax_over_med: f64,   // per-row amax / median|w|, mean over rows
-    amax_over_p999: f64,  // per-row amax / p99.9|w|, mean over rows — the sharp outlier test
-    spiky_rows: usize,    // rows where ≤4 weights reach half of amax (amax set by a handful)
-    bulk_rel_l2: f64,     // rel-L2 of the reconstruction over |w| ≤ p99 ONLY
-    tail_rel_l2: f64,     // rel-L2 over the |w| > p99 complement, for contrast
-    levels_used: usize,   // distinct nibbles the bulk occupies, of 16
-    step_mean: f64,       // mean quantiser step (over every stored scale)
-    dead_rows: usize,     // rows where >50% of weights rounded to nibble 8 (zero)
-    hist: [u64; 16],      // nibble histogram over the bulk
+    amax_over_med: f64,  // per-row amax / median|w|, mean over rows
+    amax_over_p999: f64, // per-row amax / p99.9|w|, mean over rows — the sharp outlier test
+    spiky_rows: usize,   // rows where ≤4 weights reach half of amax (amax set by a handful)
+    bulk_rel_l2: f64,    // rel-L2 of the reconstruction over |w| ≤ p99 ONLY
+    tail_rel_l2: f64,    // rel-L2 over the |w| > p99 complement, for contrast
+    levels_used: usize,  // distinct nibbles the bulk occupies, of 16
+    step_mean: f64,      // mean quantiser step (over every stored scale)
+    dead_rows: usize,    // rows where >50% of weights rounded to nibble 8 (zero)
+    hist: [u64; 16],     // nibble histogram over the bulk
 }
 
 /// `w` is the reference (fp8 ground truth) the row statistics are taken from; `rec` is
@@ -197,7 +202,10 @@ fn bulk_stats(
     let mut hist = [0u64; 16];
     let mut buf = vec![0f32; i_dim];
     for o in 0..o_dim {
-        let (row, rrow) = (&w[o * i_dim..(o + 1) * i_dim], &rec[o * i_dim..(o + 1) * i_dim]);
+        let (row, rrow) = (
+            &w[o * i_dim..(o + 1) * i_dim],
+            &rec[o * i_dim..(o + 1) * i_dim],
+        );
         for (b, &v) in buf.iter_mut().zip(row) {
             *b = v.abs();
         }
@@ -352,14 +360,18 @@ fn scale_study(w: &[f32], x: &[f32], yref: &[f32], o_dim: usize, i_dim: usize) {
             gy += seg
                 .iter()
                 .zip(&x[g * I4_GROUP..])
-                .map(|(&wi, &xi)| ((wi / sg).round() as i32).clamp(-8, 7) as f64 * sg as f64 * xi as f64)
+                .map(|(&wi, &xi)| {
+                    ((wi / sg).round() as i32).clamp(-8, 7) as f64 * sg as f64 * xi as f64
+                })
                 .sum::<f64>();
         }
         add(&mut acc[GROUP], gw);
         ytally(GROUP, gy);
     }
     let total = (o_dim * i_dim) as f64;
-    let show = |label: String, (e, r, d, z): (f64, f64, f64, u64), (ye, yr, yd): (f64, f64, f64)| {
+    let show = |label: String,
+                (e, r, d, z): (f64, f64, f64, u64),
+                (ye, yr, yd): (f64, f64, f64)| {
         println!(
             "        {label:<22} W relL2 {:.4}  W gain {:.4}  zeros {:>6.2}%   |   y relL2 {:.4}  y gain {:.4}",
             (e / r).sqrt(),
@@ -382,12 +394,23 @@ fn scale_study(w: &[f32], x: &[f32], yref: &[f32], o_dim: usize, i_dim: usize) {
 /// quantiser, never of the shipped bytes — and keeping it independent is what lets it
 /// answer "is this format worth rebuilding 386 GB for?" BEFORE the rebuild, and lets it
 /// run at all while the `.i4` set on disk is a different generation's format.
-fn scale_study_only(fp8: &str, cfg: &ModelConfig, block: usize, layer: usize, experts: &[usize]) -> Result<()> {
+fn scale_study_only(
+    fp8: &str,
+    cfg: &ModelConfig,
+    block: usize,
+    layer: usize,
+    experts: &[usize],
+) -> Result<()> {
     let (h, m, ne) = (cfg.hidden, cfg.moe_inter, cfg.n_experts);
     let src = Safetensors::open_dir(fp8).context("open fp8 checkpoint")?;
-    println!("layer {layer}  hidden {h}  moe_inter {m}  fp8_block {block}  (fp8 only — artifact not read)");
+    println!(
+        "layer {layer}  hidden {h}  moe_inter {m}  fp8_block {block}  (fp8 only — artifact not read)"
+    );
     for &e in experts {
-        ensure!(e <= ne, "--experts: {ne} is the shared expert and the largest valid index");
+        ensure!(
+            e <= ne,
+            "--experts: {ne} is the shared expert and the largest valid index"
+        );
         let base = expert_base(layer, e, ne);
         for (k, (&(o_dim, i_dim), pname)) in vq_expert_layout(h, m).iter().zip(PROJ).enumerate() {
             let wref = src.dequant_fp8(&format!("{base}.{pname}"), o_dim, i_dim, block)?;
@@ -411,7 +434,9 @@ fn make_x(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 32) as f32 / u32::MAX as f32) * 2.0 - 1.0
         })
         .collect()
@@ -422,7 +447,13 @@ fn make_x(n: usize, seed: u64) -> Vec<f32> {
 /// projections instead of tens. An error confined to a subset — particular layers, a
 /// shape, a thread's chunk of the converter's work split — is entirely consistent with
 /// a narrow sample passing, which is the hole this closes.
-fn verify_wide(art: &str, fp8: &str, cfg: &ModelConfig, layers: &[usize], experts: &[usize]) -> Result<()> {
+fn verify_wide(
+    art: &str,
+    fp8: &str,
+    cfg: &ModelConfig,
+    layers: &[usize],
+    experts: &[usize],
+) -> Result<()> {
     let (h, m, ne) = (cfg.hidden, cfg.moe_inter, cfg.n_experts);
     let block = FormatMeta::load(art)?.fp8_block;
     let (stride, off) = (i4_expert_stride(h, m), i4_slot_offsets(h, m));
@@ -434,8 +465,7 @@ fn verify_wide(art: &str, fp8: &str, cfg: &ModelConfig, layers: &[usize], expert
             let mut blk = vec![0u8; stride];
             f.read_exact_at(&mut blk, (e * stride) as u64)?;
             let base = expert_base(l, e, ne);
-            for (k, (&(o_dim, i_dim), proj)) in
-                vq_expert_layout(h, m).iter().zip(PROJ).enumerate()
+            for (k, (&(o_dim, i_dim), proj)) in vq_expert_layout(h, m).iter().zip(PROJ).enumerate()
             {
                 let w = src.dequant_fp8(&format!("{base}.{proj}"), o_dim, i_dim, block)?;
                 let (wp, ws) = quant_i4(&w, o_dim, i_dim);
@@ -452,15 +482,25 @@ fn verify_wide(art: &str, fp8: &str, cfg: &ModelConfig, layers: &[usize], expert
                         .zip(gp.chunks_exact(i4_row_bytes(i_dim)))
                         .filter(|(a, b)| a != b)
                         .count();
-                    println!("MISMATCH L{l:02} e{e} {proj}: {rows}/{o_dim} rows, scales_eq={}", ws == gs);
+                    println!(
+                        "MISMATCH L{l:02} e{e} {proj}: {rows}/{o_dim} rows, scales_eq={}",
+                        ws == gs
+                    );
                 }
             }
         }
         eprint!("\rverified L{l:02}  ");
     }
     eprintln!();
-    println!("WIDE VERIFY: {ok} projections bit-exact, {bad} mismatched ({} layers x {} experts x 3)", layers.len(), experts.len());
-    ensure!(bad == 0, "{bad} projections differ from quant_i4(dequant_fp8(ckpt))");
+    println!(
+        "WIDE VERIFY: {ok} projections bit-exact, {bad} mismatched ({} layers x {} experts x 3)",
+        layers.len(),
+        experts.len()
+    );
+    ensure!(
+        bad == 0,
+        "{bad} projections differ from quant_i4(dequant_fp8(ckpt))"
+    );
     Ok(())
 }
 
@@ -488,17 +528,20 @@ fn xcheck(art: &str, cfg: &ModelConfig, layers: &[usize], experts: &[usize]) -> 
     let cbs = load_codebooks(art)?;
     let mut worst = (1.0f64, 0usize, 0usize, "");
     let mut low = 0usize;
-    println!("{:<6}{:<6}{:>12}{:>10}{:>10}", "layer", "expert", "proj", "cos", "relL2");
+    println!(
+        "{:<6}{:<6}{:>12}{:>10}{:>10}",
+        "layer", "expert", "proj", "cos", "relL2"
+    );
     for &l in layers {
         let i4f = File::open(format!("{art}/L{l:02}.i4"))?;
         let vqf = File::open(format!("{art}/L{l:02}.vq3"))?;
         for &e in experts {
             let mut i4b = vec![0u8; i4_stride];
             i4f.read_exact_at(&mut i4b, (e * i4_stride) as u64)?;
-            let mut vqb = vec![0u8; vq_stride];
-            vqf.read_exact_at(&mut vqb, (rivoli::artifact::quant::VQ_ALIGN + e * vq_stride) as u64)?;
+            let vqb = read_vq_block(&vqf, e, vq_stride)?;
             let vqp = vq_expert(&vqb, 0, h, m);
-            for (k, (&(o_dim, i_dim), proj)) in vq_expert_layout(h, m).iter().zip(PROJ).enumerate() {
+            for (k, (&(o_dim, i_dim), proj)) in vq_expert_layout(h, m).iter().zip(PROJ).enumerate()
+            {
                 let packed = &i4b[off[k * 2]..off[k * 2] + o_dim * i4_row_bytes(i_dim)];
                 let scale = read_f32(&i4b[off[k * 2 + 1]..off[k * 2 + 1] + o_dim * 4]);
                 let wi4 = dequant_i4(packed, &scale, o_dim, i_dim);
@@ -506,7 +549,10 @@ fn xcheck(art: &str, cfg: &ModelConfig, layers: &[usize], experts: &[usize]) -> 
                 let a = agree(&wi4, &wvq);
                 if a.cos < 0.90 {
                     low += 1;
-                    println!("{l:<6}{e:<6}{proj:>12}{:>10.4}{:>10.4}   <<< LOW", a.cos, a.rel_l2);
+                    println!(
+                        "{l:<6}{e:<6}{proj:>12}{:>10.4}{:>10.4}   <<< LOW",
+                        a.cos, a.rel_l2
+                    );
                 } else if a.cos < worst.0 {
                     worst = (a.cos, l, e, proj);
                 }
@@ -519,9 +565,17 @@ fn xcheck(art: &str, cfg: &ModelConfig, layers: &[usize], experts: &[usize]) -> 
     println!(
         "XCHECK: {n} projections ({} layers x {} experts x 3), {low} with cos < 0.90; \
          worst good cell cos {:.4} at L{:02} e{} {}",
-        layers.len(), experts.len(), worst.0, worst.1, worst.2, worst.3
+        layers.len(),
+        experts.len(),
+        worst.0,
+        worst.1,
+        worst.2,
+        worst.3
     );
-    ensure!(low == 0, "{low} projections do not describe the same matrix as .vq3 — mapping error");
+    ensure!(
+        low == 0,
+        "{low} projections do not describe the same matrix as .vq3 — mapping error"
+    );
     Ok(())
 }
 
@@ -577,7 +631,10 @@ fn scan_scales(art: &str, cfg: &ModelConfig) -> Result<()> {
         "        min {lo:.6e}  max {hi:.6e}  (max at layer {} expert {} proj {} slot {}, s={:.6e})",
         worst.0, worst.1, worst.2, worst.3, worst.4
     );
-    println!("        max|W| implied by the largest scale = 7·s = {:.4e}", hi * 7.0);
+    println!(
+        "        max|W| implied by the largest scale = 7·s = {:.4e}",
+        hi * 7.0
+    );
     Ok(())
 }
 
@@ -595,12 +652,30 @@ fn warn_provenance(art: &str, fp8: &str) -> Result<()> {
                 .map(|c| c != p.src)
                 .unwrap_or(true) =>
         {
-            eprintln!("WARNING: artifact was built from {} — auditing against {fp8}", p.src)
+            eprintln!(
+                "WARNING: artifact was built from {} — auditing against {fp8}",
+                p.src
+            )
         }
         None => eprintln!("WARNING: artifact carries no i4_source stamp; provenance unverified"),
         _ => {}
     }
     Ok(())
+}
+
+/// One expert's `.vq3` block, at its `VQ_ALIGN`-headered offset.
+///
+/// Both readers here need the same two facts — the header offset and the stride — and a
+/// second copy of that arithmetic is a second chance to read one expert's bytes as
+/// another's, which decodes to plausible garbage rather than failing.
+fn read_vq_block(vqf: &File, e: usize, vq_stride: usize) -> Result<Vec<u8>> {
+    let mut vqb = vec![0u8; vq_stride];
+    vqf.read_exact_at(
+        &mut vqb,
+        (rivoli::artifact::quant::VQ_ALIGN + e * vq_stride) as u64,
+    )
+    .with_context(|| format!("read .vq3 expert {e}"))?;
+    Ok(vqb)
 }
 
 fn main() -> Result<()> {
@@ -630,12 +705,18 @@ fn main() -> Result<()> {
     warn_provenance(&art, &fp8)?;
     if xchk {
         let ls: Vec<usize> = (cfg.dense_layers..cfg.n_layers).step_by(3).collect();
-        let es: Vec<usize> = (0..cfg.n_experts).step_by(17).chain([cfg.n_experts]).collect();
+        let es: Vec<usize> = (0..cfg.n_experts)
+            .step_by(17)
+            .chain([cfg.n_experts])
+            .collect();
         return xcheck(&art, &cfg, &ls, &es);
     }
     if verify {
         let ls: Vec<usize> = (cfg.dense_layers..cfg.n_layers).step_by(6).collect();
-        let es: Vec<usize> = (0..cfg.n_experts).step_by(31).chain([cfg.n_experts]).collect();
+        let es: Vec<usize> = (0..cfg.n_experts)
+            .step_by(31)
+            .chain([cfg.n_experts])
+            .collect();
         return verify_wide(&art, &fp8, &cfg, &ls, &es);
     }
     // Reads only the fp8 checkpoint, so it is valid against an artifact of any
@@ -684,10 +765,7 @@ fn main() -> Result<()> {
         let mut i4b = vec![0u8; i4_stride];
         i4f.read_exact_at(&mut i4b, (e * i4_stride) as u64)
             .with_context(|| format!("read .i4 expert {e}"))?;
-        // The `.vq3` block for the same expert (VQ_ALIGN header).
-        let mut vqb = vec![0u8; vq_stride];
-        vqf.read_exact_at(&mut vqb, (rivoli::artifact::quant::VQ_ALIGN + e * vq_stride) as u64)
-            .with_context(|| format!("read .vq3 expert {e}"))?;
+        let vqb = read_vq_block(&vqf, e, vq_stride)?;
         let vqp = vq_expert(&vqb, 0, h, m);
 
         let base = expert_base(layer, e, ne);
@@ -723,8 +801,20 @@ fn main() -> Result<()> {
 
             println!(
                 "{:<6} {:<10} | {:>10.4e} {:>10.3e} {:>9.6} {:>9.6} | {:>10.4e} {:>9.6} {:>9.6} |{}",
-                e, pname, aw.rel_l2, aw.max_abs, aw.cos, aw.gain, ay.rel_l2, ay.cos, ay.gain,
-                if bytes_match && scales_match { "" } else { "  <<< DISK != quant_i4(fp8)" }
+                e,
+                pname,
+                aw.rel_l2,
+                aw.max_abs,
+                aw.cos,
+                aw.gain,
+                ay.rel_l2,
+                ay.cos,
+                ay.gain,
+                if bytes_match && scales_match {
+                    ""
+                } else {
+                    "  <<< DISK != quant_i4(fp8)"
+                }
             );
 
             // ── the `.vq3` at the same coordinates: `--mode int3-vq`'s own arithmetic,
@@ -737,8 +827,15 @@ fn main() -> Result<()> {
             let ayvq = agree(&yvq, &yref);
             println!(
                 "{:<6} {:<10} | {:>10.4e} {:>10.3e} {:>9.6} {:>9.6} | {:>10.4e} {:>9.6} {:>9.6} |",
-                "", "  ^vq3", avq.rel_l2, avq.max_abs, avq.cos, avq.gain,
-                ayvq.rel_l2, ayvq.cos, ayvq.gain
+                "",
+                "  ^vq3",
+                avq.rel_l2,
+                avq.max_abs,
+                avq.cos,
+                avq.gain,
+                ayvq.rel_l2,
+                ayvq.cos,
+                ayvq.gain
             );
             // ── DEAD ROWS. A per-ROW amax/7 step means one outlier sets the scale for
             //    all i_dim weights; every weight below s/2 then rounds to nibble 8 = 0.
@@ -764,7 +861,11 @@ fn main() -> Result<()> {
             zero_frac.sort_by(f64::total_cmp);
             println!(
                 "{:<6} DEAD {:<8}| mean {:.3}  p99 {:.3}  max {:.3}  >50% {:>4}  >80% {:>4}  ==100% {:>4}",
-                e, pname, dead_mean, zero_frac[o_dim * 99 / 100], zero_frac[o_dim - 1],
+                e,
+                pname,
+                dead_mean,
+                zero_frac[o_dim * 99 / 100],
+                zero_frac[o_dim - 1],
                 zero_frac.iter().filter(|&&f| f > 0.5).count(),
                 zero_frac.iter().filter(|&&f| f > 0.8).count(),
                 zero_frac.iter().filter(|&&f| f >= 1.0).count()
@@ -779,8 +880,16 @@ fn main() -> Result<()> {
                 "{:<6} BULK {:<8}| amax/med {:>5.1}  amax/p99.9 {:>5.2}  spiky rows {:>5}/{o_dim}  \
                  dead rows {:>5}/{o_dim}  step {:>9.3e}  bulk relL2 {:>7.4}  tail relL2 {:>7.4}  \
                  levels {:>2}/16",
-                e, pname, b.amax_over_med, b.amax_over_p999, b.spiky_rows, b.dead_rows,
-                b.step_mean, b.bulk_rel_l2, b.tail_rel_l2, b.levels_used
+                e,
+                pname,
+                b.amax_over_med,
+                b.amax_over_p999,
+                b.spiky_rows,
+                b.dead_rows,
+                b.step_mean,
+                b.bulk_rel_l2,
+                b.tail_rel_l2,
+                b.levels_used
             );
             println!("{:<6} HIST {:<8}| {:?}", e, pname, b.hist);
             wrefs.push(wref);
@@ -830,7 +939,12 @@ fn main() -> Result<()> {
         for (label, a) in [("i4", cn), ("vq3", cv)] {
             println!(
                 "{:<6} CHAIN {:<7}| relL2 {:>7.4}  gain {:>7.4}  cos {:>8.6}  maxerr/max|ref| {:>7.4}",
-                e, label, a.rel_l2, a.gain, a.cos, a.max_abs / ymax
+                e,
+                label,
+                a.rel_l2,
+                a.gain,
+                a.cos,
+                a.max_abs / ymax
             );
         }
     }
@@ -839,6 +953,9 @@ fn main() -> Result<()> {
         mismatches,
         experts.len() * 3
     );
-    ensure!(mismatches == 0, "the shipped .i4 is NOT what this checkpoint quantizes to");
+    ensure!(
+        mismatches == 0,
+        "the shipped .i4 is NOT what this checkpoint quantizes to"
+    );
     Ok(())
 }

@@ -432,8 +432,8 @@ pub fn gpu() -> Result<&'static Gpu> {
 impl Gpu {
     fn new() -> Result<Self> {
         // SAFETY: loads libvulkan; the returned Entry owns it for the process.
-        let entry = unsafe { ash::Entry::load() }
-            .map_err(|e| anyhow::anyhow!("no Vulkan loader: {e}"))?;
+        let entry =
+            unsafe { ash::Entry::load() }.map_err(|e| anyhow::anyhow!("no Vulkan loader: {e}"))?;
 
         let app = vk::ApplicationInfo::default()
             .application_name(c"rivoli")
@@ -502,9 +502,7 @@ impl Gpu {
         // laziness — correct, because `arm_on` flushes what it must, and the degradation is
         // warned about below rather than hidden.
         let streams = (0..nq)
-            .map(|i| {
-                Stream::new(&device, qfam, i as u32, timeline.sems[i], i > 0).map(Mutex::new)
-            })
+            .map(|i| Stream::new(&device, qfam, i as u32, timeline.sems[i], i > 0).map(Mutex::new))
             .collect::<Result<Vec<_>>>()?;
         let route = std::array::from_fn(|q| q.min(nq - 1));
         if nq < Q::COUNT {
@@ -513,7 +511,11 @@ impl Gpu {
                  {} share a queue, so fetch will NOT overlap compute and moe/tok will be \
                  roughly the serialised sum (docs/investigations/vulkan-port.md, \"Phase 4 needs two queues\")",
                 nq,
-                if nq == 1 { "all three streams" } else { "MoE and fetch" }
+                if nq == 1 {
+                    "all three streams"
+                } else {
+                    "MoE and fetch"
+                }
             );
         } else {
             info!("vk: 3 compute queues from family {qfam}, one Stream each");
@@ -552,10 +554,9 @@ impl Gpu {
             warn!("VULKAN VALIDATION OFF: could not enumerate instance layers");
             return false;
         };
-        let found = layers.iter().any(|l| {
-            l.layer_name_as_c_str()
-                .is_ok_and(|n| n == VALIDATION_LAYER)
-        });
+        let found = layers
+            .iter()
+            .any(|l| l.layer_name_as_c_str().is_ok_and(|n| n == VALIDATION_LAYER));
         if found {
             info!("Vulkan validation layer ENABLED");
         } else {
@@ -700,7 +701,10 @@ impl Gpu {
         // The fixed-point MoE accumulator: every expert atomicAdds into a shared u64 row,
         // which is what removes the reduce and the cross-stream join (common.glsl's
         // MOE_ACC block). gfx1151 reports it; a device without it has no fallback path.
-        need(v12.shader_buffer_int64_atomics == vk::TRUE, "shaderBufferInt64Atomics");
+        need(
+            v12.shader_buffer_int64_atomics == vk::TRUE,
+            "shaderBufferInt64Atomics",
+        );
         // ...and `moe_acc_drain` converts that u64 back with `double(t) / double(SCALE)`,
         // which is a SPIR-V Float64 capability. The HIP kernel does the identical
         // `(double)t / (double)MOE_ACC_SCALE` (kernels/moe.hip:168), and the two backends
@@ -717,10 +721,16 @@ impl Gpu {
         need(core.shader_float64 == vk::TRUE, "shaderFloat64");
         // The fp16 VQ codebook.
         need(v12.shader_float16 == vk::TRUE, "shaderFloat16");
-        need(v11.storage_buffer16_bit_access == vk::TRUE, "storageBuffer16BitAccess");
+        need(
+            v11.storage_buffer16_bit_access == vk::TRUE,
+            "storageBuffer16BitAccess",
+        );
         // WAVE 32 is not negotiable — the reductions are a fixed 32-lane ladder.
         need(v13.subgroup_size_control == vk::TRUE, "subgroupSizeControl");
-        need(v13.compute_full_subgroups == vk::TRUE, "computeFullSubgroups");
+        need(
+            v13.compute_full_subgroups == vk::TRUE,
+            "computeFullSubgroups",
+        );
         need(
             size.min_subgroup_size <= WAVE && WAVE <= size.max_subgroup_size,
             &format!(
@@ -729,7 +739,8 @@ impl Gpu {
             ),
         );
         need(
-            size.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE),
+            size.required_subgroup_size_stages
+                .contains(vk::ShaderStageFlags::COMPUTE),
             "requiredSubgroupSizeStages including COMPUTE",
         );
         need(
@@ -773,8 +784,14 @@ impl Gpu {
         // pipeline creation with an opaque ERROR_INITIALIZATION_FAILED naming nothing.
         for (flag, name) in [
             (vk::SubgroupFeatureFlags::BASIC, "subgroup BASIC"),
-            (vk::SubgroupFeatureFlags::SHUFFLE_RELATIVE, "subgroup SHUFFLE_RELATIVE"),
-            (vk::SubgroupFeatureFlags::BALLOT, "subgroup BALLOT (subgroupBroadcast)"),
+            (
+                vk::SubgroupFeatureFlags::SHUFFLE_RELATIVE,
+                "subgroup SHUFFLE_RELATIVE",
+            ),
+            (
+                vk::SubgroupFeatureFlags::BALLOT,
+                "subgroup BALLOT (subgroupBroadcast)",
+            ),
         ] {
             need(sub.supported_operations.contains(flag), name);
         }
@@ -830,7 +847,8 @@ impl Gpu {
         let qci = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(qfam)
             .queue_priorities(&prio[..nq])];
-        let mut v11 = vk::PhysicalDeviceVulkan11Features::default().storage_buffer16_bit_access(true);
+        let mut v11 =
+            vk::PhysicalDeviceVulkan11Features::default().storage_buffer16_bit_access(true);
         let mut v12 = vk::PhysicalDeviceVulkan12Features::default()
             .buffer_device_address(true)
             .timeline_semaphore(true)
@@ -1216,7 +1234,11 @@ impl Gpu {
     /// the guard is dropped, because `Buf::drop` calls `Gpu::sync` and would deadlock on
     /// the lock we were holding. Every path that touches a stream goes through here, so
     /// that rule is stated and enforced in one place instead of remembered in six.
-    fn with_stream<R>(&self, q: Q, f: impl FnOnce(&ash::Device, &mut Stream) -> Result<R>) -> Result<R> {
+    fn with_stream<R>(
+        &self,
+        q: Q,
+        f: impl FnOnce(&ash::Device, &mut Stream) -> Result<R>,
+    ) -> Result<R> {
         let m = self.stream(q);
         let mut s = m.lock().map_err(|_| anyhow!("vk stream lock poisoned"))?;
         let r = f(&self.device, &mut s);
@@ -1649,11 +1671,14 @@ impl Pipe {
             .stage(stage)
             .layout(layout)];
         // SAFETY: as above.
-        let pipes = unsafe { device.create_compute_pipelines(vk::PipelineCache::null(), &ci, None) }
-            .map_err(|(_, e)| e)?;
+        let pipes =
+            unsafe { device.create_compute_pipelines(vk::PipelineCache::null(), &ci, None) }
+                .map_err(|(_, e)| e)?;
         // SAFETY: the module is only needed while the pipeline is being created.
         unsafe { device.destroy_shader_module(module, None) };
-        let pipe = *pipes.first().ok_or_else(|| anyhow!("no compute pipeline created"))?;
+        let pipe = *pipes
+            .first()
+            .ok_or_else(|| anyhow!("no compute pipeline created"))?;
         Ok(Self {
             layout,
             pipe,
@@ -1737,7 +1762,9 @@ unsafe impl Send for Alloc {}
 /// exist once — they were duplicated, and the second copy is exactly where an off-by-one
 /// would live unnoticed.
 fn lookup<T>(addr: u64, len: usize, f: impl Fn(&Alloc, u64) -> T) -> Result<T> {
-    let allocs = ALLOCS.lock().map_err(|_| anyhow!("vk alloc registry poisoned"))?;
+    let allocs = ALLOCS
+        .lock()
+        .map_err(|_| anyhow!("vk alloc registry poisoned"))?;
     let end = addr
         .checked_add(len as u64)
         .ok_or_else(|| anyhow!("device address {addr:#x} + {len} overflows"))?;
@@ -1745,9 +1772,7 @@ fn lookup<T>(addr: u64, len: usize, f: impl Fn(&Alloc, u64) -> T) -> Result<T> {
         .iter()
         .find(|a| addr >= a.base && end <= a.base + a.len)
         .map(|a| f(a, addr - a.base))
-        .ok_or_else(|| {
-            anyhow!("device address {addr:#x}..{end:#x} is not inside any live Buf")
-        })
+        .ok_or_else(|| anyhow!("device address {addr:#x}..{end:#x} is not inside any live Buf"))
 }
 
 /// The `VkBuffer` owning `[addr, addr+len)`, and the offset into it.
@@ -1765,7 +1790,9 @@ fn resolve(addr: u64, len: usize) -> Result<(vk::Buffer, u64)> {
 /// apart; deliberately NOT folded into `lookup` with a flag, because the two key spaces
 /// must never be confused and a boolean parameter is exactly how they would be.
 fn resolve_host(host: *const u8, len: usize) -> Result<(vk::Buffer, u64)> {
-    let allocs = ALLOCS.lock().map_err(|_| anyhow!("vk alloc registry poisoned"))?;
+    let allocs = ALLOCS
+        .lock()
+        .map_err(|_| anyhow!("vk alloc registry poisoned"))?;
     let base = host as usize;
     let end = base
         .checked_add(len)
@@ -1916,12 +1943,7 @@ impl Buf {
         }
     }
 
-    fn finish(
-        g: &'static Gpu,
-        buf: vk::Buffer,
-        len: usize,
-        host_only: bool,
-    ) -> Result<Self> {
+    fn finish(g: &'static Gpu, buf: vk::Buffer, len: usize, host_only: bool) -> Result<Self> {
         // SAFETY: `buf` was just created on this device.
         let req = unsafe { g.device.get_buffer_memory_requirements(buf) };
         let hostbits =
@@ -2388,7 +2410,11 @@ mod tests {
         println!(
             "\nVULKAN device: {:.1} GiB device-local — validation layer: {}\n",
             total as f64 / (1u64 << 30) as f64,
-            if g.validation() { "ON" } else { "OFF (unvalidated!)" }
+            if g.validation() {
+                "ON"
+            } else {
+                "OFF (unvalidated!)"
+            }
         );
         assert!(total > 0, "no DEVICE_LOCAL heap");
         // NOT `assert_eq!(free, total)`. That is what the stub used to return, and
@@ -2488,7 +2514,11 @@ impl Gpu {
         let stream = self.route[q.index()];
         let value = self.with_stream(q, |d, s| {
             s.live()?;
-            if s.recording { s.flush(d) } else { s.signal_only(d) }
+            if s.recording {
+                s.flush(d)
+            } else {
+                s.signal_only(d)
+            }
         })?;
         // REGISTERED AFTER THE SUBMIT, deliberately, and this is a simplification the
         // earlier version could not have: if the counter has already passed `value` by the
@@ -3084,7 +3114,6 @@ pub unsafe fn launch_rope(
     gpu.retain(Q::Main, trig_buf)
 }
 
-
 // --- linalg.hip: the quantised GEMVs --------------------------------------
 
 push_struct! {
@@ -3410,8 +3439,7 @@ const MLA_MAX_ROPE: usize = 64;
 /// Bytes of `shared` the attention shader statically declares: `TILE*(MAX_KVL + MAX_ROPE)`
 /// f32. Checked against the device limit in [`Gpu::missing_features`], because this is the
 /// first allocation here to exceed Vulkan's guaranteed 16384.
-const MLA_ATTEND_LDS_BYTES: u32 =
-    (MLA_TILE * (MLA_ACC_REGS * MLA_SUBW + MLA_MAX_ROPE) * 4) as u32;
+const MLA_ATTEND_LDS_BYTES: u32 = (MLA_TILE * (MLA_ACC_REGS * MLA_SUBW + MLA_MAX_ROPE) * 4) as u32;
 
 /// `MLA_MAX_SPLITS` is ALSO a compile-time array bound inside `mla_attend_combine.comp`
 /// (`shared float w[MLA_MAX_SPLITS]`), which cannot read a push constant for its size. So
@@ -4056,7 +4084,9 @@ impl Timeline {
         if self.completed() >= value {
             return;
         }
-        let si = vk::SemaphoreSignalInfo::default().semaphore(self.0).value(value);
+        let si = vk::SemaphoreSignalInfo::default()
+            .semaphore(self.0)
+            .value(value);
         // SAFETY: `self.0` is a live timeline semaphore; `si` outlives the call.
         let _ = unsafe { g.device.signal_semaphore(&si) };
     }

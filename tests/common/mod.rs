@@ -53,7 +53,11 @@ pub fn u16b(v: &[u16]) -> Vec<u8> {
 /// while the CPU reference keeps the f32 codebook, so these oracles measure exactly the
 /// fp16 codebook-rounding error against the tol.
 pub fn f16b(v: &[f32]) -> Vec<u8> {
-    u16b(&v.iter().map(|&x| rivoli::math::f32_to_f16(x)).collect::<Vec<_>>())
+    u16b(
+        &v.iter()
+            .map(|&x| rivoli::math::f32_to_f16(x))
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// Little-endian bytes → f32 vec, the inverse of [`f32b`] for readback.
@@ -71,7 +75,10 @@ pub fn f32v(b: &[u8]) -> Vec<f32> {
 pub fn assert_close(want: &[f32], got: &[f32], label: &str) {
     let (err, tol) = report(want, got, label);
     let mx = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    assert!(err <= tol, "{label}: err={err:.3e} > tol={tol:.3e} max={mx:.3e}");
+    assert!(
+        err <= tol,
+        "{label}: err={err:.3e} > tol={tol:.3e} max={mx:.3e}"
+    );
 }
 
 /// [`err_tol`] plus the margin line, returning the pair so the caller decides what a
@@ -131,6 +138,21 @@ pub fn gemv_fp8_case(
     (packed, scale, x, want)
 }
 
+/// Random int8 weights and their per-row scales, drawn the way every int8 oracle here
+/// draws them.
+///
+/// The `1e-4` floor is load-bearing for the same reason [`block_scales`]'s `0.01` is: a row
+/// whose scale rounds to zero makes that row's comparison vacuous, and a relative tolerance
+/// would not show it. The DRAW ORDER — weights, then scales — is what makes a seed mean the
+/// same data at both call sites.
+pub fn i8_weights(r: &mut Lcg, o_dim: usize, i_dim: usize) -> (Vec<u8>, Vec<f32>) {
+    let packed: Vec<u8> = (0..o_dim * i_dim)
+        .map(|_| (r.f() * 127.0) as i8 as u8)
+        .collect();
+    let scale: Vec<f32> = (0..o_dim).map(|_| (r.f() * 0.01).abs() + 1e-4).collect();
+    (packed, scale)
+}
+
 /// `matvec_i8` into a fresh `o_dim` vector. Returned rather than written through an
 /// out-param so the caller binds it in one line; the two int8 oracles generate their
 /// weights differently and share only this step.
@@ -138,6 +160,129 @@ pub fn want_i8(x: &[f32], packed: &[u8], scale: &[f32], o_dim: usize, i_dim: usi
     let mut want = vec![0.0f32; o_dim];
     rivoli::artifact::quant::matvec_i8(&mut want, x, packed, scale, o_dim, i_dim);
     want
+}
+
+/// The kv_b geometry both MLA launchers take.
+///
+/// Six bare `usize` in a row, every one of them plausible in any other's position, spelled
+/// in an oracle, a launch wrapper and a guard closure PER BACKEND — five copies of the same
+/// order, and a transposed pair would have moved the oracle and the kernel together. Pure
+/// dimensions, so it belongs here rather than beside either backend's buffer type.
+#[derive(Clone, Copy)]
+pub struct Mla {
+    pub h: usize,
+    /// The q head stride. `mla_value_fp8` never reads q, so [`Mla::value_dims`] leaves this
+    /// zero — cheaper than a second five-field shape whose only difference from this one is
+    /// a field nothing reads.
+    pub qh: usize,
+    pub nope: usize,
+    pub vh: usize,
+    pub kvl: usize,
+    pub block: usize,
+}
+
+impl Mla {
+    pub fn new(h: usize, qh: usize, nope: usize, vh: usize, kvl: usize, block: usize) -> Self {
+        Self {
+            h,
+            qh,
+            nope,
+            vh,
+            kvl,
+            block,
+        }
+    }
+
+    /// `mla_value_fp8`'s shape: it takes no `qh`.
+    pub fn value_dims(h: usize, nope: usize, vh: usize, kvl: usize, block: usize) -> Self {
+        Self::new(h, 0, nope, vh, kvl, block)
+    }
+
+    /// kv_b's full row count, `h·(nope + vh)`.
+    pub fn rows(self) -> usize {
+        self.h * (self.nope + self.vh)
+    }
+
+    /// The two launcher guards both CPU oracles restate. An oracle that accepted a shape
+    /// the launcher rejects would be checking the kernel against a case it can never run.
+    ///
+    /// `qh` is deliberately absent: `value_dims` leaves it zero and `mla_value_fp8` never
+    /// reads it, so the absorb oracle asserts it separately.
+    pub fn assert_guarded(self) {
+        let (h, nope, vh) = (self.h, self.nope, self.vh);
+        let (kvl, block) = (self.kvl, self.block);
+        assert!(
+            h > 0 && nope > 0 && vh > 0 && kvl > 0 && block > 0,
+            "guard 1001"
+        );
+        assert!(
+            block.is_power_of_two(),
+            "guard 1003: blk_shift needs a power-of-two tile"
+        );
+    }
+}
+
+/// The MLA attention's shape.
+///
+/// Five `usize` and an f32 that travel together through the split planner, the tile
+/// widener, the CPU reference and the dispatch — and the reference and the dispatch take
+/// the SAME six, so every test spelled them twice. A transposed pair would have moved both
+/// sides identically and the comparison would still have agreed.
+#[derive(Clone, Copy)]
+pub struct Att {
+    pub h: usize,
+    pub nr: usize,
+    pub kvl: usize,
+    pub rope: usize,
+    pub n_blocks: usize,
+    pub scale: f32,
+}
+
+impl Att {
+    /// `n_blocks` is not a free parameter — the fp8 latent cache carries one block scale per
+    /// 128 latent dims, so it FOLLOWS from `kvl`, and every test derived it the same way.
+    /// Deriving it once removes the only way a reference and a launcher could have been
+    /// handed different block-scale strides for the same cache.
+    pub fn new(h: usize, nr: usize, kvl: usize, rope: usize, scale: f32) -> Self {
+        Self {
+            h,
+            nr,
+            kvl,
+            rope,
+            n_blocks: kvl / 128,
+            scale,
+        }
+    }
+}
+
+/// One MoE dispatch's geometry: the two matrix dims and the half-open expert range
+/// `[e_start, e_start + e_count)`.
+///
+/// The same four, in the same order, in `moe_expert_range`'s wrapper and in both of the
+/// VQ oracles that check it — three copies per backend of a list whose middle two entries
+/// are interchangeable to the type checker.
+#[derive(Clone, Copy)]
+pub struct MoeRange {
+    pub hidden: usize,
+    pub inter: usize,
+    pub e_start: usize,
+    pub e_count: usize,
+}
+
+impl MoeRange {
+    pub fn new(hidden: usize, inter: usize, e_start: usize, e_count: usize) -> Self {
+        Self {
+            hidden,
+            inter,
+            e_start,
+            e_count,
+        }
+    }
+
+    /// One past the last expert this range writes — the oracles size their staging by it.
+    pub fn e_end(self) -> usize {
+        self.e_start + self.e_count
+    }
 }
 
 /// The oracles' deterministic input source.

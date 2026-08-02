@@ -37,7 +37,11 @@ fn load(path: &str) -> Result<Run> {
         if line.trim().is_empty() {
             continue;
         }
-        nll.push(line.trim().parse::<f64>().with_context(|| format!("{path}: bad NLL {line:?}"))?);
+        nll.push(
+            line.trim()
+                .parse::<f64>()
+                .with_context(|| format!("{path}: bad NLL {line:?}"))?,
+        );
     }
     if nll.is_empty() {
         bail!("{path}: no NLL samples");
@@ -45,7 +49,24 @@ fn load(path: &str) -> Result<Run> {
     if label.is_empty() {
         bail!("{path}: missing `# rivoli-nll v1` header — not an engine-written NLL file");
     }
-    Ok(Run { path: path.to_string(), label, nll })
+    Ok(Run {
+        path: path.to_string(),
+        label,
+        nll,
+    })
+}
+
+/// The first three whitespace fields of a run's header — how a cell is named in every
+/// table and verdict line here.
+///
+/// Three because the header's leading fields are `mode`, `attn` and `cache-policy`, which
+/// is exactly what distinguishes one cell of a sweep from another; the rest is the budget
+/// and the corpus, identical across a paired comparison and pure noise in a 34-column
+/// label. One function so the table and the verdicts below cannot disagree about which
+/// run they are talking about.
+fn cell(label: &str) -> String {
+    let fields: Vec<&str> = label.split_whitespace().take(3).collect();
+    fields.join(" ")
 }
 
 fn mean(v: &[f64]) -> f64 {
@@ -88,7 +109,11 @@ fn main() -> Result<()> {
     let base = &runs[0];
 
     println!("baseline: {}\n          {}", base.path, base.label);
-    println!("          {} tokens, PPL {:.6}\n", base.nll.len(), mean(&base.nll).exp());
+    println!(
+        "          {} tokens, PPL {:.6}\n",
+        base.nll.len(),
+        mean(&base.nll).exp()
+    );
 
     println!(
         "{:<34}{:>10}{:>8}{:>11}{:>9}{:>9}{:>22}{:>8}",
@@ -117,7 +142,7 @@ fn main() -> Result<()> {
         let (lo, hi) = (m - 1.96 * se, m + 1.96 * se);
         println!(
             "{:<34}{ppl:>10.5}{:>7.3}%{m:>11.5}{sd:>9.4}{se:>9.5}{:>22}{worse:>7.1}%",
-            r.label.split_whitespace().take(3).collect::<Vec<_>>().join(" "),
+            cell(&r.label),
             100.0 * (ppl - bppl) / bppl,
             format!("[{lo:+.5}, {hi:+.5}]"),
         );
@@ -138,12 +163,12 @@ fn main() -> Result<()> {
             println!(
                 "  !! {} — SE {se:.5} EXCEEDS the {bar:.5} bar: this cell cannot resolve the\n     \
                  acceptance question at any point estimate. More TEXT is the only fix.",
-                label.split_whitespace().take(3).collect::<Vec<_>>().join(" ")
+                cell(label)
             );
         }
     }
     for (label, m, lo, hi, sd) in &verdicts {
-        let cell = label.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+        let cell = cell(label);
         // Acceptance asks whether the cost is WITHIN 1%, so what must happen is that the
         // interval's UPPER bound falls below the bar — not that its half-width equals the
         // bar. Those come apart badly: an effect of 0.0 with half-width 1.0% still
@@ -157,7 +182,11 @@ fn main() -> Result<()> {
             // time to re-measure something already answered. A lower bound past -1% is
             // still worth a look, though: cache substitution should not IMPROVE quality,
             // and if it appears to, the likelier explanation is a bug than a free lunch.
-            let odd = if *lo < -bar { "  (note: interval also admits >1% BETTER — implausible, suspect a bug)" } else { "" };
+            let odd = if *lo < -bar {
+                "  (note: interval also admits >1% BETTER — implausible, suspect a bug)"
+            } else {
+                ""
+            };
             format!("PASS — upper bound {hi:+.5} < bar{odd}")
         } else if *lo > bar {
             "FAIL — interval entirely worse than +1%".to_string()
@@ -219,7 +248,12 @@ mod tests {
     #[test]
     fn round_trips_the_engine_header_and_samples() {
         let d = tmp();
-        let p = write(&d, "a.nll", "mode=int3-vq policy=lru j=2 m=12 tokens=3", &[1.0, 2.0, 3.0]);
+        let p = write(
+            &d,
+            "a.nll",
+            "mode=int3-vq policy=lru j=2 m=12 tokens=3",
+            &[1.0, 2.0, 3.0],
+        );
         let r = load(&p).unwrap();
         assert_eq!(r.nll, vec![1.0, 2.0, 3.0]);
         assert!(r.label.starts_with("mode=int3-vq"));
@@ -253,7 +287,11 @@ mod tests {
                 "INCONCLUSIVE"
             }
         };
-        assert_eq!(classify(-0.002, 0.005), "PASS", "upper bound inside the bar");
+        assert_eq!(
+            classify(-0.002, 0.005),
+            "PASS",
+            "upper bound inside the bar"
+        );
         assert_eq!(classify(0.012, 0.030), "FAIL", "wholly past the bar");
         assert_eq!(classify(0.002, 0.018), "COST", "clears zero, not the bar");
         assert_eq!(classify(-0.011, 0.031), "INCONCLUSIVE", "straddles zero");
@@ -271,15 +309,22 @@ mod tests {
     fn a_near_zero_mean_is_pass_or_underpowered_depending_on_spread() {
         let bar = 1.01f64.ln();
         // Tight: 2000 samples of tiny scatter -> CI far inside the bar. Genuinely no cost.
-        let tight: Vec<f64> = (0..2000).map(|i| if i % 2 == 0 { 0.001 } else { -0.001 }).collect();
+        let tight: Vec<f64> = (0..2000)
+            .map(|i| if i % 2 == 0 { 0.001 } else { -0.001 })
+            .collect();
         let se_t = stddev(&tight) / (tight.len() as f64).sqrt();
         assert!(1.96 * se_t < bar, "tight case must resolve the bar");
         // Loose: same mean, realistic per-token scatter, only 49 samples — exactly the
         // smoke-run regime, where a +3.6% PPL headline was pure noise.
-        let loose: Vec<f64> = (0..50).map(|i| if i % 2 == 0 { 0.25 } else { -0.25 }).collect();
+        let loose: Vec<f64> = (0..50)
+            .map(|i| if i % 2 == 0 { 0.25 } else { -0.25 })
+            .collect();
         let se_l = stddev(&loose) / (loose.len() as f64).sqrt();
         assert!(1.96 * se_l > bar, "loose case must be flagged underpowered");
-        assert!((mean(&tight) - mean(&loose)).abs() < 1e-9, "means must be indistinguishable");
+        assert!(
+            (mean(&tight) - mean(&loose)).abs() < 1e-9,
+            "means must be indistinguishable"
+        );
     }
 
     /// The property that motivates the whole tool: a small systematic shift is visible in
@@ -287,11 +332,19 @@ mod tests {
     #[test]
     fn pairing_recovers_a_shift_buried_in_token_variance() {
         // Token difficulty swings by ~4 nats; the systematic shift is 0.01.
-        let base: Vec<f64> = (0..500).map(|i| 1.0 + 4.0 * ((i % 7) as f64 / 7.0)).collect();
+        let base: Vec<f64> = (0..500)
+            .map(|i| 1.0 + 4.0 * ((i % 7) as f64 / 7.0))
+            .collect();
         let cell: Vec<f64> = base.iter().map(|b| b + 0.01).collect();
         let d: Vec<f64> = cell.iter().zip(&base).map(|(a, b)| a - b).collect();
-        assert!((mean(&d) - 0.01).abs() < 1e-12, "paired mean recovers the shift exactly");
-        assert!(stddev(&d) < 1e-12, "and the token-to-token variance cancels");
+        assert!(
+            (mean(&d) - 0.01).abs() < 1e-12,
+            "paired mean recovers the shift exactly"
+        );
+        assert!(
+            stddev(&d) < 1e-12,
+            "and the token-to-token variance cancels"
+        );
         // Unpaired, the same shift is ~0.3% of a spread of >1 nat — invisible by eye.
         assert!(stddev(&base) > 1.0);
     }

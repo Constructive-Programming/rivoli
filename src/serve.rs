@@ -254,7 +254,9 @@ fn parse_tool_calls(text: &str, id: &str) -> (String, Vec<Value>) {
         let mut args = serde_json::Map::new();
         let mut cursor = &inner[name_end..];
         while let Some((key, r)) = take(cursor, ARG_KEY) {
-            let Some((raw, r2)) = take(r, ARG_VALUE) else { break };
+            let Some((raw, r2)) = take(r, ARG_VALUE) else {
+                break;
+            };
             let v = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
             args.insert(key.to_string(), v);
             cursor = r2;
@@ -444,11 +446,7 @@ mod live {
                 }]}),
             ),
             ("POST", "/v1/chat/completions") => chat(&mut w, &body, cx),
-            _ => send_json(
-                &mut w,
-                404,
-                &err_body(&format!("no route {method} {path}")),
-            ),
+            _ => send_json(&mut w, 404, &err_body(&format!("no route {method} {path}"))),
         }
     }
 
@@ -571,12 +569,21 @@ mod live {
         // per-token callback (stream an SSE delta, or do nothing until the end), and a
         // second copy of the list is where `--mtp-min-conf` would go missing from one arm.
         let mut decode = |on_tok: &mut dyn FnMut(u32) -> bool| {
-            cx.engine
-                .generate(&prompt_ids, ngen, &tok.eos, opts.mtp, opts.mtp_min_conf, on_tok)
+            cx.engine.generate(
+                &prompt_ids,
+                ngen,
+                &tok.eos,
+                opts.mtp,
+                opts.mtp_min_conf,
+                on_tok,
+            )
         };
         let (ids, summary) = if stream {
             sse_head(w)?;
-            sse(w, &chunk(&id, created, &model, json!({"role": "assistant"}), None))?;
+            sse(
+                w,
+                &chunk(&id, created, &model, json!({"role": "assistant"}), None),
+            )?;
             // Decode the whole prefix each token and send what it added. O(n^2) over a
             // generation that arrives at ~3 tok/s, i.e. free — the alternative is an
             // incremental detokenizer, and `delta` documents why that is the fiddly one.
@@ -602,7 +609,9 @@ mod live {
                     // `<tool_call>` to render as text.
                     ("content", &mut sent_c, streamable(content)),
                 ] {
-                    let Some(d) = delta(sent, target) else { continue };
+                    let Some(d) = delta(sent, target) else {
+                        continue;
+                    };
                     let ev = chunk(&id, created, &model, json!({ field: d }), None);
                     // A write failure IS the client hanging up. Stop the decode: the GPU is
                     // sole tenant, so finishing a generation nobody will read is time stolen
@@ -718,13 +727,7 @@ mod live {
         }
     }
 
-    fn chunk(
-        id: &str,
-        created: u64,
-        model: &str,
-        delta: Value,
-        finish: Option<&str>,
-    ) -> Value {
+    fn chunk(id: &str, created: u64, model: &str, delta: Value, finish: Option<&str>) -> Value {
         json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
     }
@@ -942,8 +945,8 @@ mod tests {
         assert_eq!(calls[0]["function"]["name"], "wx");
         assert_eq!(calls[0]["id"], "call_X_0");
         // `arguments` is a JSON STRING in the OpenAI shape, not an object.
-        let args: Value = serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap())
-            .unwrap();
+        let args: Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args, json!({"city": "Paris", "days": 3}));
 
         // Two calls, no prose.
@@ -980,7 +983,10 @@ mod tests {
     fn split_think_needs_to_be_told_which_mode_it_is_in() {
         // Thinking off: the prompt already closed <think>, so nothing is reasoning. Guessing
         // from the text would make a whole answer disappear into the reasoning channel.
-        assert_eq!(split_think("the sky is blue", false), ("", "the sky is blue"));
+        assert_eq!(
+            split_think("the sky is blue", false),
+            ("", "the sky is blue")
+        );
         // Thinking on: the open <think> is in the PROMPT, so the generation starts inside it.
         assert_eq!(
             split_think("hmm, scattering</think>The sky is blue.", true),

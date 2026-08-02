@@ -170,7 +170,15 @@ impl AsyncFetch {
         let reaper = std::thread::Builder::new()
             .name("rivoli-reaper".into())
             .spawn(move || {
-                reaper_loop(streamer, fetch, rx, fn_reaper, io_reaper, poison_reaper, tl_reaper)
+                reaper_loop(
+                    streamer,
+                    fetch,
+                    rx,
+                    fn_reaper,
+                    io_reaper,
+                    poison_reaper,
+                    tl_reaper,
+                )
             })?;
         Ok(Self {
             tx: Some(tx),
@@ -204,7 +212,12 @@ impl AsyncFetch {
     fn take_slot(&mut self) -> Result<usize> {
         loop {
             // Destructured so the closure can borrow the timelines while `cursor` moves.
-            let Self { cursor, slot_tl, slot_next, .. } = self;
+            let Self {
+                cursor,
+                slot_tl,
+                slot_next,
+                ..
+            } = self;
             if let Some(s) = scan_free(slot_next.len(), cursor, |s| {
                 slot_tl[s].completed() >= slot_next[s]
             }) {
@@ -213,7 +226,9 @@ impl AsyncFetch {
             // Nothing free. The reaper is the only thing that can advance a timeline, so if
             // it has died there is no wake-up coming — check before parking again.
             if self.poisoned.load(Ordering::Acquire) {
-                return Err(anyhow!("AsyncFetch poisoned while waiting for a staging slot"));
+                return Err(anyhow!(
+                    "AsyncFetch poisoned while waiting for a staging slot"
+                ));
             }
             self.slot_stalls += 1;
             std::thread::yield_now();
@@ -255,9 +270,15 @@ impl AsyncFetch {
         for _ in &reads {
             let s = self.take_slot()?;
             self.slot_next[s] += 1;
-            tickets.push(Ticket { slot: s as u16, value: self.slot_next[s] });
+            tickets.push(Ticket {
+                slot: s as u16,
+                value: self.slot_next[s],
+            });
         }
-        let job = ReapJob { reads, tickets: tickets.clone() };
+        let job = ReapJob {
+            reads,
+            tickets: tickets.clone(),
+        };
         self.tx
             .as_ref()
             .ok_or_else(|| anyhow!("AsyncFetch closed"))?
@@ -406,7 +427,10 @@ fn run_job(
         slot_tl[t.slot as usize].signal(fetch.raw(), t.value)?;
     }
     let e_io = std::time::Instant::now();
-    io_wait_ns.fetch_add(e_io.duration_since(t_io).as_nanos() as u64, Ordering::Relaxed);
+    io_wait_ns.fetch_add(
+        e_io.duration_since(t_io).as_nanos() as u64,
+        Ordering::Relaxed,
+    );
     // Emitted on the REAPER thread against the same shared anchor as the decode
     // thread's spans, so a trace viewer draws them on one timeline. This is the pair
     // whose overlap the whole streaming design is a bet on: io-wait bars should sit

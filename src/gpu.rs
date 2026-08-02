@@ -15,20 +15,25 @@
 //! without a device there is nothing to decode on.
 #![cfg(any(feature = "rocm", feature = "vulkan"))]
 
+use crate::artifact::model::ModelConfig;
 use crate::attn::{AttnMode, streaming_rows};
+// jscpd:ignore-start — the engine's launcher import list. `tests/vk.rs` imports very
+// nearly the same set for the same reason: both call every launcher. A `use` list is
+// not factorable in Rust short of a glob import, which would cost the compile-time
+// check that every name here actually exists in the selected backend.
 use crate::backend::{
     Event, ExpertDesc, Stream, device_sync, fill_u32, launch_append_kv, launch_argmax,
-    launch_attend, launch_embed_i8_row, launch_flag_nonfinite, launch_gather_rope,
-    launch_gemv_f32, launch_gemv_fp8, launch_gemv_i8,
-    launch_index_append, launch_index_head_route, launch_index_pool_push, launch_index_score,
-    launch_index_topk, launch_layernorm, launch_mla_absorb_fp8, launch_mla_value_fp8,
-    launch_moe_acc_drain, launch_moe_expert_range, launch_moe_expert_range_i4, launch_rmsnorm,
-    launch_rope, launch_swiglu, launch_vadd, stream_signal,
+    launch_attend, launch_embed_i8_row, launch_flag_nonfinite, launch_gather_rope, launch_gemv_f32,
+    launch_gemv_fp8, launch_gemv_i8, launch_index_append, launch_index_head_route,
+    launch_index_pool_push, launch_index_score, launch_index_topk, launch_layernorm,
+    launch_mla_absorb_fp8, launch_mla_value_fp8, launch_moe_acc_drain, launch_moe_expert_range,
+    launch_moe_expert_range_i4, launch_rmsnorm, launch_rope, launch_swiglu, launch_vadd,
+    stream_signal,
 };
-use crate::memory::device::DeviceBuf;
-use crate::math::{E4M3_BLOCK, route_into, topk_into};
-use crate::artifact::model::ModelConfig;
+// jscpd:ignore-end
 use crate::fetch::asyncfetch::Ticket;
+use crate::math::{E4M3_BLOCK, route_into, topk_into};
+use crate::memory::device::DeviceBuf;
 use crate::memory::pin::{Fp8Mlp, IndexerPin, LayerMlp, MlpVq, Pin, TRACE_WINDOW};
 
 /// Fixed-point MoE accumulator rows: ONE PER STREAM (compute = 0, miss = 1), summed by
@@ -86,7 +91,10 @@ fn mtp_bin(conf: f32) -> usize {
 /// in its own pick, and the only free signal a speculate-or-not gate could read.
 fn top1_prob(bytes: &[u8]) -> f32 {
     let l = |c: &[u8]| f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-    let max = bytes.chunks_exact(4).map(l).fold(f32::NEG_INFINITY, f32::max);
+    let max = bytes
+        .chunks_exact(4)
+        .map(l)
+        .fold(f32::NEG_INFINITY, f32::max);
     // Shifted so the largest term is exp(0)=1; the sum is then ≥1 and 1/sum is the
     // top-1 probability without ever forming the full softmax.
     let sum: f64 = bytes
@@ -114,6 +122,85 @@ fn desc_of_vq(m: &MlpVq) -> ExpertDesc {
     }
 }
 
+/// Row-wise rmsnorm of the residual stream: `xn[r] = rmsnorm(x[r], w)` for `r < nrow`.
+///
+/// Three sites in `forward` want exactly this and differ only in `w` — the attention
+/// input norm, the pre-MLP norm, and the tail norm — so before this they were three
+/// copies of the same loop. Nothing about WHAT is measured changes: none of the three
+/// sits inside a profile bucket's stamps.
+///
+/// One launch per row rather than one batched launch, deliberately: rmsnorm is a
+/// microsecond kernel over ≤6144 floats, so the ~2 extra enqueues on a ~5 ms layer are
+/// not worth a second stride argument in the kernel. See the phase-1 note in `forward`.
+///
+/// # Safety
+/// `x` and `xn` must each be valid for `nrow * hidden` device f32 (the MAXROW-wide
+/// scratch allocations are, since `nrow ≤ MAXROW`), `w` a resident norm weight of
+/// `hidden` f32, and all three must live until the next `device_sync`.
+unsafe fn rmsnorm_rows(
+    x: *const f32,
+    w: *const f32,
+    xn: *mut f32,
+    nrow: usize,
+    hidden: usize,
+    eps: f32,
+) -> Result<()> {
+    for r in 0..nrow {
+        // SAFETY: forwarded from this function's own contract; r < nrow, so both
+        // `.add(r * hidden)` land inside the caller's allocations.
+        unsafe { launch_rmsnorm(x.add(r * hidden), w, hidden, eps, xn.add(r * hidden))? };
+    }
+    Ok(())
+}
+
+/// Enqueue the `experts` slice of the descriptor table on `stream`, in whichever format
+/// `i4` says the batch carries.
+///
+/// The two entry points differ ONLY in the three vq codebook pointers — every other
+/// argument means the same thing in the same position — and both call sites (the
+/// resident run-batcher and the per-miss loop) had to spell the whole shared argument
+/// list twice, once per arm of the same `if fmt`. The codebooks are read only on the
+/// vq3 side; the int4 kernel reinterprets the same descriptor bytes at its own slot
+/// offsets, which is why one descriptor buffer serves both.
+///
+/// The kernels take `(start, count)`; this takes the `Range` those two are always a
+/// spelling of, so a caller cannot hand over a start and a count that disagree.
+///
+/// # Safety
+/// The contract of the two launches this forwards to, unchanged: `descs`, `codebooks`
+/// and `wexpert` resident, `x`/`h`/`acc` live device scratch, `stream` live, and every
+/// expert in `experts` already gated by a wait enqueued on `stream`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_expert_range(
+    i4: bool,
+    x: *const f32,
+    hidden: usize,
+    inter: usize,
+    experts: std::ops::Range<usize>,
+    descs: *const ExpertDesc,
+    codebooks: [*const u16; 3],
+    wexpert: *const f32,
+    h: *mut f32,
+    acc: *mut u64,
+    nrow: usize,
+    stream: *mut std::ffi::c_void,
+) -> Result<()> {
+    let [cb0, cb1, cb2] = codebooks;
+    let (e_start, e_count) = (experts.start, experts.len());
+    // SAFETY: forwarded verbatim from this function's own contract.
+    unsafe {
+        match i4 {
+            true => launch_moe_expert_range_i4(
+                x, hidden, inter, e_start, e_count, descs, wexpert, h, acc, nrow, stream,
+            ),
+            false => launch_moe_expert_range(
+                x, hidden, inter, e_start, e_count, descs, cb0, cb1, cb2, wexpert, h, acc, nrow,
+                stream,
+            ),
+        }
+    }
+}
+
 // THE DSA ROW-SELECTION PATH is the DEVICE `index_topk` kernel, unconditionally.
 //
 // There used to be a `RIVOLI_TOPK=host|device|device-nosync|verify` switch here, four arms
@@ -138,7 +225,7 @@ fn desc_of_vq(m: &MlpVq) -> ExpertDesc {
 /// correctness probes live behind the `trace` feature instead.
 #[derive(Default)]
 struct Profile {
-    fetch_n: u64, // demand misses
+    fetch_n: u64,   // demand misses
     route_ns: u128, // host routing (gate D2H + sigmoid/bias/top-k)
     /// The DSA indexer's HIP-event SPAN — including whatever falls between its kernels,
     /// so NOT comparable to a per-kernel microbench sum. Measured 27% above one, cause
@@ -149,7 +236,7 @@ struct Profile {
     /// Full layers that scored, the denominator for both. Not `tokens * 21` — layers below
     /// `index_topk` return dense before scoring and record nothing.
     idx_layers: u64,
-    moe_wall_ns: u128,    // the block_on wall of the overlapped MoE phase (CPU wall)
+    moe_wall_ns: u128, // the block_on wall of the overlapped MoE phase (CPU wall)
     compute_gpu_ns: u128, // HIP-event span of the compute stream (partials + reduce)
     /// Per-layer MoE bracket time, bucketed by how many of that layer's experts MISSED.
     ///
@@ -307,8 +394,8 @@ impl Profile {
         // instead, and the cost of that honesty is that unattributed time is simply not
         // reported.
         let moe_gpu_wait_ns = (self.moe_wall_ns as f64 - exposed_ns).max(0.0);
-        let gpu_wait_ns = (self.route_wait_ns + self.sync_wait_ns + self.tail_wait_ns) as f64
-            + moe_gpu_wait_ns;
+        let gpu_wait_ns =
+            (self.route_wait_ns + self.sync_wait_ns + self.tail_wait_ns) as f64 + moe_gpu_wait_ns;
         // CPU: measured host-compute regions. The expert stream's tokio poll used to be
         // added here — host work inside the MoE block the three decode-thread stamps cannot
         // see. With the launches enqueued straight onto the compute stream there is no such
@@ -338,8 +425,7 @@ impl Profile {
             // Over ALL reads the reaper serviced, demand and speculative alike —
             // `fetch_wall_ns` covers both, so `fetch_n` alone is the wrong denominator.
             ms_per_miss: fetch_wall_ns as f64 / 1e6 / self.fetch_n.max(1) as f64,
-            gb_per_tok: self.fetch_n as f64 / tok * bytes_per_expert as f64
-                / 1e9,
+            gb_per_tok: self.fetch_n as f64 / tok * bytes_per_expert as f64 / 1e9,
             // CLASS partition of the same wall. `gpu_wait` collects the explicitly
             // wrapped joins PLUS `compute_gpu`: during the MoE compute-stream span the
             // host is parked in `stream_signal(...).await`, which is a GPU wait even
@@ -466,7 +552,7 @@ pub struct GpuEngine<'a> {
     /// end of layer. Replaced a [slots*hidden] f32 partial slab plus a reduce behind a
     /// cross-stream join. One row PER STREAM — see `MOE_ACC_ROWS`.
     moe_acc: DeviceBuf,
-    moe_h: DeviceBuf,       // [slots*MAXROW*moe_inter] SwiGLU hidden scratch (VQ MoE)
+    moe_h: DeviceBuf, // [slots*MAXROW*moe_inter] SwiGLU hidden scratch (VQ MoE)
     descs_buf: DeviceBuf,
     wexpert_buf: DeviceBuf,
     logits: DeviceBuf,
@@ -844,7 +930,6 @@ impl<'a> GpuEngine<'a> {
         self.moe_gain = g;
     }
 
-
     /// DIAGNOSTIC: hash the residual stream after every layer (`--checksum-x`).
     #[cfg(feature = "trace")]
     pub fn set_checksum_x(&mut self, on: bool) {
@@ -994,7 +1079,8 @@ impl<'a> GpuEngine<'a> {
                     ip.wk.i_dim,
                     ip.wk.block,
                     1,
-                    kp)?;
+                    kp,
+                )?;
                 launch_layernorm(kp, ip.k_norm_w, ip.k_norm_b, hd, K_NORM_EPS, kp)?;
                 launch_rope(kp, 1, rope, rope, pos, theta)?;
                 launch_index_append(kp, kcp, pos, hd)?;
@@ -1029,7 +1115,8 @@ impl<'a> GpuEngine<'a> {
                     ip.wq_b.i_dim,
                     ip.wq_b.block,
                     1,
-                    iqp)?;
+                    iqp,
+                )?;
                 launch_rope(iqp, nh, hd, rope, pos, theta)?; // per head: stride hd, seg rope
                 // weights_proj is bf16→f32 [n_heads, hidden] — plain f32 GEMV.
                 launch_gemv_f32(xnp, ip.weights_proj, nh, cfg.hidden, 1, iwp)?;
@@ -1047,7 +1134,11 @@ impl<'a> GpuEngine<'a> {
                     unsafe {
                         launch_index_head_route(iqp, iwp, ppool, m_blocks, nh, hd, ep)?;
                     }
-                    blocked(&mut self.prof.sync_wait_ns, "gpu-wait/misa-sync", device_sync)?;
+                    blocked(
+                        &mut self.prof.sync_wait_ns,
+                        "gpu-wait/misa-sync",
+                        device_sync,
+                    )?;
                     // Same reason as the score D2H below — MISA-only (`--misa-heads`), so
                     // dormant on every arm measured so far, but unwrapped it would land in
                     // `cpu`.
@@ -1115,7 +1206,11 @@ impl<'a> GpuEngine<'a> {
         // making `route` incomparable with every historical row in
         // docs/measurement/benchmarks.md; not taken, see the module note above.
         if scored_nt > 0 {
-            blocked(&mut self.prof.sync_wait_ns, "gpu-wait/idx-sync", device_sync)?;
+            blocked(
+                &mut self.prof.sync_wait_ns,
+                "gpu-wait/idx-sync",
+                device_sync,
+            )?;
         }
         Ok(out)
     }
@@ -1212,7 +1307,10 @@ impl<'a> GpuEngine<'a> {
         let mtp_w = match mtp {
             Draft::No => None,
             Draft::Head => {
-                let m = self.pin.mtp.context("--mtp: artifact carries no MTP head")?;
+                let m = self
+                    .pin
+                    .mtp
+                    .context("--mtp: artifact carries no MTP head")?;
                 let emb = self.pin.embed;
                 let catp = self.mtp_cat.ptr_mut() as *mut f32;
                 let hp = self.x.ptr() as *const f32;
@@ -1424,17 +1522,17 @@ impl<'a> GpuEngine<'a> {
             // SAFETY: see the forward-level note; every pointer is live scratch, and
             // every `.add(r * …)` is within the MAXROW-wide allocation since r < nrow.
             unsafe {
-                for r in 0..nrow {
-                    launch_rmsnorm(xp.add(r * hidden), input_ln, hidden, eps, xnp.add(r * hidden))?;
-                }
+                rmsnorm_rows(xp, input_ln, xnp, nrow, hidden, eps)?;
                 launch_gemv_fp8(
-                    xnp, q_a.packed, q_a.scale, q_a.o_dim, q_a.i_dim, q_a.block, nrow, qrp)?;
+                    xnp, q_a.packed, q_a.scale, q_a.o_dim, q_a.i_dim, q_a.block, nrow, qrp,
+                )?;
                 for r in 0..nrow {
                     let p = qrp.add(r * cfg.q_lora_rank);
                     launch_rmsnorm(p, q_a_ln, cfg.q_lora_rank, eps, p)?; // in-place
                 }
                 launch_gemv_fp8(
-                    qrp, q_b.packed, q_b.scale, q_b.o_dim, q_b.i_dim, q_b.block, nrow, qp)?;
+                    qrp, q_b.packed, q_b.scale, q_b.o_dim, q_b.i_dim, q_b.block, nrow, qp,
+                )?;
                 launch_gemv_fp8(
                     xnp,
                     kv_a.packed,
@@ -1443,7 +1541,8 @@ impl<'a> GpuEngine<'a> {
                     kv_a.i_dim,
                     kv_a.block,
                     nrow,
-                    compp)?;
+                    compp,
+                )?;
                 for r in 0..nrow {
                     // `comp`'s row stride is kvl+rope but the norm covers only the first
                     // kvl, so this cannot ride a single-stride batched rmsnorm.
@@ -1536,14 +1635,12 @@ impl<'a> GpuEngine<'a> {
                     o_proj.i_dim,
                     o_proj.block,
                     nrow,
-                    subp)?;
+                    subp,
+                )?;
                 // Both rows in one launch: `x` and `sub` are contiguous row-minor, so the
                 // residual add over nrow·hidden elements is the same elementwise op.
                 launch_vadd(xp, subp, nrow * hidden)?; // residual
-                for r in 0..nrow {
-                    // pre-MLP norm → xn
-                    launch_rmsnorm(xp.add(r * hidden), post_ln, hidden, eps, xnp.add(r * hidden))?;
-                }
+                rmsnorm_rows(xp, post_ln, xnp, nrow, hidden, eps)?; // pre-MLP norm → xn
             }
 
             // --- MLP sublayer (out fully written; the outer vadd adds moe_out) ---
@@ -1563,7 +1660,8 @@ impl<'a> GpuEngine<'a> {
                         m.gate.i_dim,
                         m.gate.block,
                         nrow,
-                        gp)?;
+                        gp,
+                    )?;
                     launch_gemv_fp8(
                         xnp,
                         m.up.packed,
@@ -1572,7 +1670,8 @@ impl<'a> GpuEngine<'a> {
                         m.up.i_dim,
                         m.up.block,
                         nrow,
-                        up)?;
+                        up,
+                    )?;
                     // One launch: elementwise over contiguous row-minor buffers.
                     launch_swiglu(gp, up, nrow * inter, gp)?; // in place: h = silu(gate)*up
                     launch_gemv_fp8(
@@ -1583,7 +1682,8 @@ impl<'a> GpuEngine<'a> {
                         m.down.i_dim,
                         m.down.block,
                         nrow,
-                        outp)?;
+                        outp,
+                    )?;
                 }
                 // Dense layer: attention + MLP were all launches, nothing blocked.
                 self.prof.close_launch(t_launch, sync_at_open);
@@ -1795,8 +1895,7 @@ impl<'a> GpuEngine<'a> {
                     self.tickets.push(Ticket::RESIDENT);
                 }
                 let ndesc = self.descs_vq.len();
-                self.descs_buf
-                    .copy_in_at(0, as_le_bytes(&self.descs_vq))?;
+                self.descs_buf.copy_in_at(0, as_le_bytes(&self.descs_vq))?;
                 self.wexpert_buf.copy_in_at(0, as_le_bytes(&self.w))?;
                 // Two streams, no join: residents run on the compute stream while the
                 // misses' bytes are still landing on the miss stream, and BOTH atomically
@@ -1822,7 +1921,9 @@ impl<'a> GpuEngine<'a> {
                 // borrowed for `wait_on`.
                 let tickets = self.tickets.clone();
                 let w_ptr = self.wexpert_buf.ptr() as *const f32;
-                let (cb0, cb1, cb2) = (self.codebooks[0], self.codebooks[1], self.codebooks[2]);
+                // Read out of `self` here, alongside `fmt`/`tickets`: the launch loops below
+                // hold `self.pin` borrowed for `wait_on`.
+                let cbs = self.codebooks;
                 let cs_raw = self.compute_stream.raw();
                 let ms_raw = self.miss_stream.raw();
                 let inter = cfg.moe_inter;
@@ -1867,7 +1968,8 @@ impl<'a> GpuEngine<'a> {
                 // NOT permuted to make longer runs — `pin.rs`'s trace-v2 invariant requires
                 // `window[..sel.len()] == sel` and `bin/replay` hard-fails otherwise.
                 debug_assert_eq!(
-                    tickets.len(), ndesc,
+                    tickets.len(),
+                    ndesc,
                     "every descriptor needs a ticket (routed picks + the shared expert)"
                 );
                 // TICKETED DATAFLOW. Every expert is enqueued behind a DEVICE-SIDE wait on
@@ -1933,17 +2035,20 @@ impl<'a> GpuEngine<'a> {
                     // SAFETY: descs/codebooks resident; every expert in [i, j) has its
                     // dependency enqueued above; h/part device scratch; cs_raw live.
                     unsafe {
-                        if f {
-                            launch_moe_expert_range_i4(
-                                x_c, hidden, inter, i, j - i, descs_ptr, w_ptr, h_c, acc_c,
-                                nrow, cs_raw,
-                            )?;
-                        } else {
-                            launch_moe_expert_range(
-                                x_c, hidden, inter, i, j - i, descs_ptr, cb0, cb1, cb2, w_ptr,
-                                h_c, acc_c, nrow, cs_raw,
-                            )?;
-                        }
+                        launch_expert_range(
+                            f,
+                            x_c,
+                            hidden,
+                            inter,
+                            i..j,
+                            descs_ptr,
+                            cbs,
+                            w_ptr,
+                            h_c,
+                            acc_c,
+                            nrow,
+                            cs_raw,
+                        )?;
                     }
                     i = j;
                 }
@@ -1969,17 +2074,20 @@ impl<'a> GpuEngine<'a> {
                     // SAFETY: as above; this expert's bytes are gated by the wait just
                     // enqueued on the same stream.
                     unsafe {
-                        if fmt[e] {
-                            launch_moe_expert_range_i4(
-                                x_c, hidden, inter, e, 1, descs_ptr, w_ptr, h_c, acc_miss, nrow,
-                                ms_raw,
-                            )?;
-                        } else {
-                            launch_moe_expert_range(
-                                x_c, hidden, inter, e, 1, descs_ptr, cb0, cb1, cb2, w_ptr, h_c,
-                                acc_miss, nrow, ms_raw,
-                            )?;
-                        }
+                        launch_expert_range(
+                            fmt[e],
+                            x_c,
+                            hidden,
+                            inter,
+                            e..e + 1,
+                            descs_ptr,
+                            cbs,
+                            w_ptr,
+                            h_c,
+                            acc_miss,
+                            nrow,
+                            ms_raw,
+                        )?;
                     }
                 }
                 // THERE IS NO JOIN HERE ANY MORE, and its absence is the point. The
@@ -2098,9 +2206,7 @@ impl<'a> GpuEngine<'a> {
                 let bad = self
                     .ck_buf
                     .chunks_exact(4)
-                    .filter(|c| {
-                        !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_finite()
-                    })
+                    .filter(|c| !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_finite())
                     .count();
                 if bad > 0 && !self.nan_seen {
                     self.nan_seen = true;
@@ -2132,9 +2238,7 @@ impl<'a> GpuEngine<'a> {
         // model (the checkpoint ships no `shared_head.head.weight`).
         let tail_norm = mtp_w.map_or(self.pin.final_norm, |m| m.shared_norm);
         unsafe {
-            for r in 0..nrow {
-                launch_rmsnorm(xp.add(r * hidden), tail_norm, hidden, eps, xnp.add(r * hidden))?;
-            }
+            rmsnorm_rows(xp, tail_norm, xnp, nrow, hidden, eps)?;
             let head = self.pin.lm_head;
             // Batched: lm_head is 952 MB of int8, the single largest read in the pass, and
             // a second row through the same read costs one more f32 multiply per column.
@@ -2176,7 +2280,10 @@ impl<'a> GpuEngine<'a> {
     // ponytail: host log-softmax, no kernel.
     #[cfg(feature = "teacher-forcing")]
     pub fn nll_forced(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
-        ensure!(ids.len() >= 2, "need at least 2 tokens to score a prediction");
+        ensure!(
+            ids.len() >= 2,
+            "need at least 2 tokens to score a prediction"
+        );
         let vocab = self.cfg.vocab;
         // Same shape as `generate`: `forward` awaited inline on this thread.
         let out = crate::backend::block_on(async {
@@ -2190,7 +2297,10 @@ impl<'a> GpuEngine<'a> {
                 }
                 self.forward(tok, pos).await?;
                 let Some(&next) = ids.get(pos + 1) else { break };
-                ensure!((next as usize) < vocab, "token {next} outside vocab {vocab}");
+                ensure!(
+                    (next as usize) < vocab,
+                    "token {next} outside vocab {vocab}"
+                );
                 self.logits.copy_out_into(&mut host)?;
                 // `logits` is MAXROW rows wide; a single-row forward writes only row 0.
                 ensure!(host.len() >= vocab * 4, "short logits D2H");
@@ -2484,7 +2594,8 @@ impl<'a> GpuEngine<'a> {
         })?;
         self.prof.wall_ns = decode_wall.elapsed().as_nanos();
         self.prof.tokens = generated.len() as u64;
-        let bytes_per_expert = crate::artifact::quant::vq_expert_bytes(self.cfg.hidden, self.cfg.moe_inter);
+        let bytes_per_expert =
+            crate::artifact::quant::vq_expert_bytes(self.cfg.hidden, self.cfg.moe_inter);
         // The accurate async-side decomposition: reaper fetch wall + measured io-wait,
         // taken at the ring. The tokio-metrics `idle_ns`/`poll_ns` pair this comment used
         // to name went away with the ticketed dataflow (see `Prof`) — and the DEPENDENCY

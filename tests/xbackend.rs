@@ -88,10 +88,10 @@ fn swiglu_bytes() {
 
 #[cfg(all(feature = "rocm", not(feature = "vulkan")))]
 use rivoli::backend::hip::{device_sync, launch_swiglu};
-#[cfg(all(feature = "rocm", not(feature = "vulkan")))]
-use rivoli::memory::device::DeviceBuf as Dev;
 #[cfg(all(feature = "vulkan", not(feature = "rocm")))]
 use rivoli::backend::vk::{Buf as Dev, device_sync, launch_swiglu};
+#[cfg(all(feature = "rocm", not(feature = "vulkan")))]
+use rivoli::memory::device::DeviceBuf as Dev;
 
 /// A device buffer holding `v`. Upload is the FIRST of the two spellings that differ
 /// between the backends — `copy_in_at` under HIP, `write_at` under Vulkan.
@@ -134,8 +134,13 @@ fn run_swiglu(g: &[f32], u: &[f32]) -> Vec<u8> {
     let mut hb = Dev::new(n * 4).expect("h");
     // SAFETY: three live device addresses of n f32 each, joined before they drop.
     unsafe {
-        launch_swiglu(gb.ptr() as *const f32, ub.ptr() as *const f32, n, hb.ptr_mut() as *mut f32)
-            .expect("launch");
+        launch_swiglu(
+            gb.ptr() as *const f32,
+            ub.ptr() as *const f32,
+            n,
+            hb.ptr_mut() as *mut f32,
+        )
+        .expect("launch");
     }
     device_sync().expect("sync");
     down(&hb, n * 4)

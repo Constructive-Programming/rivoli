@@ -44,7 +44,11 @@ fn transcribed_f2e4m3(x: f32) -> u8 {
     if x.is_nan() {
         return 0x7f;
     }
-    let sign: u32 = if (x.to_bits() & 0x8000_0000) != 0 { 0x80 } else { 0 };
+    let sign: u32 = if (x.to_bits() & 0x8000_0000) != 0 {
+        0x80
+    } else {
+        0
+    };
     let a = x.abs();
     if a >= 448.0 {
         return (sign | 0x7e) as u8;
@@ -56,7 +60,11 @@ fn transcribed_f2e4m3(x: f32) -> u8 {
     let e = ((bits >> 23) & 0xff) as i32 - 127;
     if e < -6 {
         let m = (a * 512.0 + 0.5).floor() as u32;
-        return if m >= 8 { (sign | 0x08) as u8 } else { (sign | m) as u8 };
+        return if m >= 8 {
+            (sign | 0x08) as u8
+        } else {
+            (sign | m) as u8
+        };
     }
     let mant = bits & 0x007f_ffff;
     let mut m3 = mant >> 20;
@@ -168,7 +176,11 @@ fn glsl_f2e4m3_matches_math_rs() {
         f32::MIN_POSITIVE,
         f32::EPSILON,
     ] {
-        assert_eq!(rivoli::math::f32_to_e4m3(v), transcribed_f2e4m3(v), "f2e4m3({v:e})");
+        assert_eq!(
+            rivoli::math::f32_to_e4m3(v),
+            transcribed_f2e4m3(v),
+            "f2e4m3({v:e})"
+        );
         checked += 1;
     }
     // NaN is contractually 0x7f whatever the sign or payload.
@@ -178,7 +190,12 @@ fn glsl_f2e4m3_matches_math_rs() {
         f32::from_bits(0x7fc0_1234),
         f32::from_bits(0xffff_ffff),
     ] {
-        assert_eq!(transcribed_f2e4m3(nan), 0x7f, "f2e4m3(NaN {:#x})", nan.to_bits());
+        assert_eq!(
+            transcribed_f2e4m3(nan),
+            0x7f,
+            "f2e4m3(NaN {:#x})",
+            nan.to_bits()
+        );
         assert_eq!(rivoli::math::f32_to_e4m3(nan), 0x7f);
         checked += 1;
     }
@@ -206,14 +223,17 @@ fn glsl_f2bf16_matches_math_rs_on_finite() {
 #[test]
 fn glsl_f2bf16_diverges_from_math_rs_on_nan_by_design() {
     let sig = f32::from_bits(0x7f80_0001);
-    assert_eq!(transcribed_f2bf16(sig), 0x7f80, "GLSL/HIP: top 16 bits verbatim");
+    assert_eq!(
+        transcribed_f2bf16(sig),
+        0x7f80,
+        "GLSL/HIP: top 16 bits verbatim"
+    );
     assert_eq!(
         rivoli::math::f32_to_bf16(sig),
         0x7fc0,
         "math.rs via half: quiet bit forced"
     );
 }
-
 
 // ---------------------------------------------------------------------------
 // Drift guard
@@ -305,7 +325,6 @@ fn transcriptions_still_match_the_glsl() {
     );
 }
 
-
 /// Every `glsl_*` transcription in this file must appear in [`LOCKED`].
 ///
 /// THE EIGHTH MECHANISED RULE. Without it, the lock covers exactly what someone
@@ -348,7 +367,6 @@ fn every_transcription_is_locked() {
     );
 }
 
-
 /// EVERY e4m3 byte, decoded, against `math.rs`.
 ///
 /// The standing debt from `kernels/vk/common.glsl`'s placeholder, now due: the LUT the
@@ -386,7 +404,10 @@ fn e4m3f_decodes_all_256_bytes_bit_exactly() {
         let want = rivoli::math::e4m3_to_f32(b as u8);
         let got = transcribed_e4m3f(b);
         if want.is_nan() {
-            assert!(got.is_nan(), "e4m3f({b:#04x}): math.rs NaN, transcription {got}");
+            assert!(
+                got.is_nan(),
+                "e4m3f({b:#04x}): math.rs NaN, transcription {got}"
+            );
             continue;
         }
         assert_eq!(
@@ -399,8 +420,15 @@ fn e4m3f_decodes_all_256_bytes_bit_exactly() {
     }
     // The three classes the placeholder called out, asserted by name so a future edit
     // cannot quietly stop covering them.
-    assert!(rivoli::math::e4m3_to_f32(0x7f).is_nan(), "0x7f is the NaN encoding");
-    assert_eq!(rivoli::math::e4m3_to_f32(0x01), 2f32.powi(-9), "smallest subnormal");
+    assert!(
+        rivoli::math::e4m3_to_f32(0x7f).is_nan(),
+        "0x7f is the NaN encoding"
+    );
+    assert_eq!(
+        rivoli::math::e4m3_to_f32(0x01),
+        2f32.powi(-9),
+        "smallest subnormal"
+    );
     assert_eq!(
         rivoli::math::e4m3_to_f32(0x80),
         -rivoli::math::e4m3_to_f32(0x00),
@@ -443,21 +471,29 @@ fn bf16f_matches_math_rs_except_for_signalling_nan() {
 
     // Agreement with math.rs everywhere it is claimed: every pattern that is not a
     // SIGNALLING NaN (exponent all ones, mantissa non-zero, quiet bit clear).
-    let signalling =
-        |b: u32| (b & 0x7f80) == 0x7f80 && (b & 0x007f) != 0 && (b & 0x0040) == 0;
+    let signalling = |b: u32| (b & 0x7f80) == 0x7f80 && (b & 0x007f) != 0 && (b & 0x0040) == 0;
     let mut diverged = 0usize;
     for b in 0u32..=0xffff {
         let want = half::bf16::from_bits(b as u16).to_f32().to_bits();
         let got = transcribed_bf16f(b).to_bits();
         if signalling(b) {
-            assert_ne!(want, got, "bf16f({b:#06x}): expected the quiet-bit divergence");
+            assert_ne!(
+                want, got,
+                "bf16f({b:#06x}): expected the quiet-bit divergence"
+            );
             diverged += 1;
             continue;
         }
-        assert_eq!(want, got, "bf16f({b:#06x}): math.rs {want:#010x} vs GLSL {got:#010x}");
+        assert_eq!(
+            want, got,
+            "bf16f({b:#06x}): math.rs {want:#010x} vs GLSL {got:#010x}"
+        );
     }
     // Anti-vacuity: if the classifier stopped matching anything, the loop above would be
     // asserting agreement everywhere and this test would silently become a weaker claim.
-    assert_eq!(diverged, 126, "expected 126 signalling-NaN patterns (63 per sign)");
+    assert_eq!(
+        diverged, 126,
+        "expected 126 signalling-NaN patterns (63 per sign)"
+    );
     println!("bf16f: 65410 patterns bit-exact with math.rs, 126 signalling NaNs diverge by design");
 }

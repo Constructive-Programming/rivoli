@@ -81,6 +81,51 @@ impl Base {
     }
 }
 
+/// Emit [`HybridPolicy::base`] for a policy that carries its [`Base`] as field `b`.
+///
+/// Three tokens of glue that cannot be a trait default — a default body cannot name a
+/// field — so all three policies wrote it out, and `cargo fmt` made the three copies
+/// literal (jscpd caught them fused to the head of `contains`, which follows in each
+/// impl). This macro is the single place the "field `b`" convention is stated; the
+/// alternative, storing `Base` outside the policy, would reshape the trait and every
+/// call site in `pin.rs` for no behaviour change.
+macro_rules! impl_base {
+    () => {
+        fn base(&mut self) -> &mut Base {
+            &mut self.b
+        }
+    };
+}
+
+/// `Hot` iff the policy's promotion test passed, `Cold` otherwise.
+///
+/// Every `admit` opens with this branch — LRU on its frequency counter, 2Q on an A1out
+/// ghost hit — and the two were the same five lines once rustfmt expanded the `if/else`
+/// (it exceeds `single_line_if_else_max_width`). Naming the branch says what it decides.
+fn tier_if_hot(promote: bool) -> Tier {
+    if promote { Tier::Hot } else { Tier::Cold }
+}
+
+/// Close an admission: put `k` into `tier`'s resident set and record the victims.
+///
+/// The tier→set dispatch plus [`Base::admitted`] is the tail of both the LRU and the 2Q
+/// `admit`; only the two sets differ, in the same way [`touch_either`]'s two do. ARC does
+/// not use it — its tier is decided inside the ghost branches, which touch their set there.
+fn place_in_tier(
+    b: &mut Base,
+    cold: &mut OrderedSet,
+    hot: &mut OrderedSet,
+    k: u32,
+    tier: Tier,
+    evicted: Vec<u32>,
+) -> Admission {
+    match tier {
+        Tier::Cold => cold.touch(k),
+        Tier::Hot => hot.touch(k),
+    }
+    b.admitted(k, tier, evicted)
+}
+
 /// The eviction half of every `admit`: shed victims by the policy's own `reclaim` rule
 /// until `incoming` bytes fit `budget`, or until nothing unpinned is left to shed.
 ///
@@ -207,7 +252,7 @@ impl HybridLru {
     }
 }
 impl HybridPolicy for HybridLru {
-    fn base(&mut self) -> &mut Base { &mut self.b }
+    impl_base!();
     fn contains(&self, k: u32) -> bool {
         self.cold.contains(k) || self.hot.contains(k)
     }
@@ -216,18 +261,10 @@ impl HybridPolicy for HybridLru {
         touch_either(&mut self.cold, &mut self.hot, k)
     }
     fn admit(&mut self, k: u32) -> Admission {
-        let tier = if self.freq.get(&k).copied().unwrap_or(0) >= LRU_HOT_THRESHOLD {
-            Tier::Hot
-        } else {
-            Tier::Cold
-        };
+        let tier = tier_if_hot(self.freq.get(&k).copied().unwrap_or(0) >= LRU_HOT_THRESHOLD);
         let (incoming, budget) = (self.b.stride(tier), self.b.budget);
         let evicted = evict_until_fits(self, incoming, budget, HybridLru::evict_lru);
-        match tier {
-            Tier::Cold => self.cold.touch(k),
-            Tier::Hot => self.hot.touch(k),
-        }
-        self.b.admitted(k, tier, evicted)
+        place_in_tier(&mut self.b, &mut self.cold, &mut self.hot, k, tier, evicted)
     }
 
     fn resident_bytes(&self) -> usize {
@@ -279,14 +316,17 @@ impl HybridTwoQ {
     /// only pinned keys left, so a pinned-heavy batch can't stall the eviction.
     fn reclaim(&mut self) -> Option<u32> {
         if self.a1in_bytes() < self.kin_bytes {
-            self.am.pop_lru_skip(&self.b.pinned).or_else(|| self.trim_a1in())
+            self.am
+                .pop_lru_skip(&self.b.pinned)
+                .or_else(|| self.trim_a1in())
         } else {
-            self.trim_a1in().or_else(|| self.am.pop_lru_skip(&self.b.pinned))
+            self.trim_a1in()
+                .or_else(|| self.am.pop_lru_skip(&self.b.pinned))
         }
     }
 }
 impl HybridPolicy for HybridTwoQ {
-    fn base(&mut self) -> &mut Base { &mut self.b }
+    impl_base!();
     fn contains(&self, k: u32) -> bool {
         self.am.contains(k) || self.a1in.contains(k)
     }
@@ -299,14 +339,10 @@ impl HybridPolicy for HybridTwoQ {
     }
     fn admit(&mut self, k: u32) -> Admission {
         // A second distinct access (via the ghost) promotes to Am/HOT; else A1in/COLD.
-        let tier = if self.a1out.remove(k) { Tier::Hot } else { Tier::Cold };
+        let tier = tier_if_hot(self.a1out.remove(k));
         let (incoming, budget) = (self.b.stride(tier), self.b.budget);
         let evicted = evict_until_fits(self, incoming, budget, HybridTwoQ::reclaim);
-        match tier {
-            Tier::Hot => self.am.touch(k),
-            Tier::Cold => self.a1in.touch(k),
-        }
-        self.b.admitted(k, tier, evicted)
+        place_in_tier(&mut self.b, &mut self.a1in, &mut self.am, k, tier, evicted)
     }
     fn protect(&mut self, k: u32) {
         self.b.pinned.insert(k);
@@ -367,7 +403,11 @@ impl HybridArc {
             }
         };
         if let Some(v) = v {
-            let ghost = if from_cold { &mut self.b1 } else { &mut self.b2 };
+            let ghost = if from_cold {
+                &mut self.b1
+            } else {
+                &mut self.b2
+            };
             ghost.touch(v);
             // Bound each ghost to a budget's worth of keys (cheap; remembers returns).
             let bound = self.b.slots();
@@ -379,7 +419,7 @@ impl HybridArc {
     }
 }
 impl HybridPolicy for HybridArc {
-    fn base(&mut self) -> &mut Base { &mut self.b }
+    impl_base!();
     fn contains(&self, k: u32) -> bool {
         self.t1.contains(k) || self.t2.contains(k)
     }
@@ -437,15 +477,26 @@ mod tests {
     }
     impl Spec {
         fn new(budget: usize, cs: usize, hs: usize) -> Self {
-            Spec { budget, cs, hs, at: HashMap::new() }
+            Spec {
+                budget,
+                cs,
+                hs,
+                at: HashMap::new(),
+            }
         }
         fn bytes(&self) -> usize {
-            self.at.values().map(|t| if *t == Tier::Hot { self.hs } else { self.cs }).sum()
+            self.at
+                .values()
+                .map(|t| if *t == Tier::Hot { self.hs } else { self.cs })
+                .sum()
         }
         fn access(&mut self, p: &mut dyn HybridPolicy, k: u32) -> Option<Tier> {
             p.begin_batch(); // each access is its own 1-key batch in this harness
             if p.get(k) {
-                assert!(self.at.contains_key(&k), "hit on a key the tally thinks is gone: {k}");
+                assert!(
+                    self.at.contains_key(&k),
+                    "hit on a key the tally thinks is gone: {k}"
+                );
                 return None;
             }
             let Admission { tier, evicted } = p.admit(k);
@@ -456,7 +507,12 @@ mod tests {
             self.at.insert(k, tier);
             assert!(p.contains(k), "admitted {k} not resident");
             assert_eq!(self.bytes(), p.resident_bytes(), "byte accounting drift");
-            assert!(self.bytes() <= self.budget, "over budget: {} > {}", self.bytes(), self.budget);
+            assert!(
+                self.bytes() <= self.budget,
+                "over budget: {} > {}",
+                self.bytes(),
+                self.budget
+            );
             Some(tier)
         }
     }
@@ -479,8 +535,6 @@ mod tests {
             })
             .collect()
     }
-
-
 
     #[test]
     fn byte_budget_and_residency_hold_for_all() {
@@ -505,14 +559,22 @@ mod tests {
             let mut p = make(name, 5, 3, 4, TwoQSplit::default()).unwrap();
             p.begin_batch();
             assert!(!p.get(10));
-            assert_eq!(p.admit(10).tier, Tier::Cold, "{name}: first-seen must be COLD");
+            assert_eq!(
+                p.admit(10).tier,
+                Tier::Cold,
+                "{name}: first-seen must be COLD"
+            );
             p.begin_batch();
             assert!(!p.get(20)); // evicts 10 (cold slot reused)
             let _ = p.admit(20);
             assert!(!p.contains(10), "{name}: 10 should have been evicted");
             p.begin_batch();
             assert!(!p.get(10)); // 10 returns via the ghost
-            assert_eq!(p.admit(10).tier, Tier::Hot, "{name}: a returning key must be HOT");
+            assert_eq!(
+                p.admit(10).tier,
+                Tier::Hot,
+                "{name}: a returning key must be HOT"
+            );
         }
     }
 
@@ -549,7 +611,10 @@ mod tests {
             }
         }
         let core_resident = core.iter().filter(|&&k| p.contains(k)).count();
-        assert!(core_resident >= 3, "frequent core evaporated: {core_resident}/5 resident");
+        assert!(
+            core_resident >= 3,
+            "frequent core evaporated: {core_resident}/5 resident"
+        );
     }
 
     // Mirrors the pin's submit_layer BATCH protocol (get()+protect() every hit, THEN
@@ -605,10 +670,12 @@ mod tests {
                     resident.insert(k, ());
                 }
                 for &k in &batch {
-                    assert!(p.contains(k), "{name}: batch key {k} not resident after its batch");
+                    assert!(
+                        p.contains(k),
+                        "{name}: batch key {k} not resident after its batch"
+                    );
                 }
             }
         }
     }
 }
-

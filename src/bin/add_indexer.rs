@@ -38,7 +38,10 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    let Args { artifact_dir: art, stash } = Args::parse();
+    let Args {
+        artifact_dir: art,
+        stash,
+    } = Args::parse();
 
     let cfg = ModelConfig::load(&art)?;
     let full = cfg.indexer_layout()?; // validates index dims + per-layer full/shared

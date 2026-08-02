@@ -43,7 +43,18 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install the Rust toolchain
-        run: rustup toolchain install stable --profile minimal --component clippy
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+
+      # Formatting is checked BEFORE anything expensive: it needs no cache, no build and no
+      # network, and it is the failure most likely to be a one-command fix.
+      #
+      # This tree was not rustfmt-clean until 2026-08-02, and making it so was not cosmetic.
+      # Normalising the layout turned 66 previously-invisible duplicate blocks into exact
+      # matches that the duplication gate could finally see — the same code had been there
+      # all along, masked by inconsistent line-breaking. So `fmt` and the jscpd gate are not
+      # independent: a reformat can surface clones, which is why both run here.
+      - name: fmt
+        run: cargo fmt --check
 
       - uses: Swatinem/rust-cache@v2
 

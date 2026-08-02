@@ -377,8 +377,8 @@ impl I4Source {
         let Ok(text) = std::fs::read(format!("{dir}/manifest.json")) else {
             return Ok(None);
         };
-        let v: serde_json::Value = serde_json::from_slice(&text)
-            .with_context(|| format!("parse {dir}/manifest.json"))?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&text).with_context(|| format!("parse {dir}/manifest.json"))?;
         let Some(f) = v.get("i4_source") else {
             return Ok(None);
         };
@@ -550,11 +550,21 @@ impl ExpertSet {
     pub fn open_routed(dir: &str, i4: bool, d: SetDims) -> Result<Self> {
         let (hidden, moe_inter) = (d.hidden, d.moe_inter);
         let (ext, hbytes, stride, expert_bytes) = if i4 {
-            ("i4", 0, i4_expert_stride(hidden, moe_inter), i4_expert_bytes(hidden, moe_inter))
+            (
+                "i4",
+                0,
+                i4_expert_stride(hidden, moe_inter),
+                i4_expert_bytes(hidden, moe_inter),
+            )
         } else {
             // One aligned block reserved for the header.
             let hb = crate::artifact::quant::VQ_ALIGN;
-            ("vq3", hb, vq_expert_stride(hidden, moe_inter), vq_expert_bytes(hidden, moe_inter))
+            (
+                "vq3",
+                hb,
+                vq_expert_stride(hidden, moe_inter),
+                vq_expert_bytes(hidden, moe_inter),
+            )
         };
         Self::open(dir, ext, hbytes, stride, expert_bytes, d, |path, l| {
             if i4 {
@@ -589,7 +599,13 @@ impl ExpertSet {
         hidden: usize,
         moe_inter: usize,
     ) -> Result<Self> {
-        let d = SetDims { dense_layers, n_layers, n_experts, hidden, moe_inter };
+        let d = SetDims {
+            dense_layers,
+            n_layers,
+            n_experts,
+            hidden,
+            moe_inter,
+        };
         Self::open_routed(dir, false, d)
     }
 
@@ -602,7 +618,12 @@ impl ExpertSet {
         d: SetDims,
         validate: impl Fn(&str, usize) -> Result<()>,
     ) -> Result<Self> {
-        let SetDims { dense_layers, n_layers, n_experts, .. } = d;
+        let SetDims {
+            dense_layers,
+            n_layers,
+            n_experts,
+            ..
+        } = d;
         let want = hbytes + (n_experts + 1) * stride; // header + routed + shared
         let mut files = Vec::with_capacity(n_layers - dense_layers);
         for l in dense_layers..n_layers {
@@ -630,7 +651,11 @@ impl ExpertSet {
             (self.dense_layers..self.n_layers).contains(&layer),
             "layer {layer} out of MoE range"
         );
-        ensure!(expert < self.n_experts, "expert {expert} >= {}", self.n_experts);
+        ensure!(
+            expert < self.n_experts,
+            "expert {expert} >= {}",
+            self.n_experts
+        );
         let fd = self.files[layer - self.dense_layers].as_raw_fd();
         Ok((fd, self.hbytes + expert * self.stride, self.expert_bytes))
     }
@@ -755,13 +780,19 @@ mod tests {
             "t.weight_scale_inv",
             Dtype::F32,
             vec![1, 2],
-            [10.0f32, 100.0].iter().flat_map(|v| v.to_le_bytes()).collect(),
+            [10.0f32, 100.0]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
         );
         w.write(&path).unwrap();
         let st = Safetensors::open_file(&path).unwrap();
 
         let got = st.dequant_fp8("t", 2, 4, 2).unwrap();
-        assert_eq!(got, vec![10.0, 20.0, 100.0, -100.0, -10.0, 0.0, 200.0, 100.0]);
+        assert_eq!(
+            got,
+            vec![10.0, 20.0, 100.0, -100.0, -10.0, 0.0, 200.0, 100.0]
+        );
 
         // Wrong declared dims, and a scale grid of the wrong extent, both fail loud.
         assert!(st.dequant_fp8("t", 4, 2, 2).is_err());
@@ -793,23 +824,40 @@ mod tests {
         assert_eq!(v["hidden_size"], 6144);
 
         // A resume picking up where the first run stopped claims the whole range.
-        I4Source { layers: [40, 78], ..a.clone() }.stamp(&dir).unwrap();
+        I4Source {
+            layers: [40, 78],
+            ..a.clone()
+        }
+        .stamp(&dir)
+        .unwrap();
         assert_eq!(I4Source::load(&dir).unwrap().unwrap().layers, [3, 78]);
 
         // A different derivation replaces rather than merges — no stale claims.
-        let b = I4Source { chain: "fp8->vq3->int4".into(), layers: [3, 78], ..a.clone() };
+        let b = I4Source {
+            chain: "fp8->vq3->int4".into(),
+            layers: [3, 78],
+            ..a.clone()
+        };
         b.stamp(&dir).unwrap();
         assert_eq!(I4Source::load(&dir).unwrap(), Some(b.clone()));
 
         // A different GROUP is a different derivation too: rebuilding the tail at
         // G=64 must not merge into a G=128 claim over the head, or the manifest would
         // describe one uniform set where two incompatible formats sit side by side.
-        let c = I4Source { group: Some(64), layers: [40, 78], ..b.clone() };
+        let c = I4Source {
+            group: Some(64),
+            layers: [40, 78],
+            ..b.clone()
+        };
         c.stamp(&dir).unwrap();
         assert_eq!(I4Source::load(&dir).unwrap(), Some(c));
 
         // An artifact stamped before group scales existed reads as group: None.
-        std::fs::write(&mf, br#"{"i4_source":{"tool":"t","chain":"c","src":"/s","layers":[0,1]}}"#).unwrap();
+        std::fs::write(
+            &mf,
+            br#"{"i4_source":{"tool":"t","chain":"c","src":"/s","layers":[0,1]}}"#,
+        )
+        .unwrap();
         assert_eq!(I4Source::load(&dir).unwrap().unwrap().group, None);
 
         // Present-but-malformed is an error, never a silent "unstamped".

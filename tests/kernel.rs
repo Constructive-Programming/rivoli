@@ -2,7 +2,8 @@
 #![cfg(feature = "rocm")]
 #![allow(clippy::expect_used)]
 
-use rivoli::memory::device::DeviceBuf;
+use anyhow::Result;
+use rivoli::artifact::quant::{VQ_DIM, VQ_K, matvec_vq, quant_vq};
 use rivoli::backend::gpustream::HipStream;
 use rivoli::backend::hip::{
     ExpertDesc, attend_scratch_floats, device_sync, launch_argmax, launch_attend, launch_gemv_fp8,
@@ -10,10 +11,13 @@ use rivoli::backend::hip::{
     launch_moe_acc_drain, launch_moe_expert_range, launch_moe_expert_range_i4, launch_vadd,
 };
 use rivoli::math::{bf16_to_f32, e4m3_to_f32, f32_to_bf16, f32_to_e4m3, silu, softmax};
-use rivoli::artifact::quant::{VQ_DIM, VQ_K, matvec_vq, quant_vq};
+use rivoli::memory::device::DeviceBuf;
 
 mod common;
-use common::{Lcg, assert_close, block_scales, f16b, f32b, f32v, gemv_fp8_case, u16b, want_i8};
+use common::{
+    Att, Lcg, Mla, MoeRange, assert_close, block_scales, f16b, f32b, f32v, gemv_fp8_case,
+    i8_weights, u16b, want_i8,
+};
 
 /// Upload `b` to a fresh device buffer. Backend-typed, so it stays here rather than in
 /// `common`: this is `DeviceBuf` under HIP and `Buf` under Vulkan.
@@ -30,12 +34,15 @@ fn dev(b: &[u8]) -> DeviceBuf {
 /// tests: one that accepted any error would still pass if someone replaced a power-of-two
 /// check with `block != 128`, or if an unrelated dimension guard started swallowing the
 /// case first.
-fn assert_guard<T: std::fmt::Debug>(r: anyhow::Result<T>, want: Option<u32>, what: &str) {
+fn assert_guard<T: std::fmt::Debug>(r: Result<T>, want: Option<u32>, what: &str) {
     match want {
         None => assert!(r.is_ok(), "{what}: {r:?}"),
         Some(code) => {
             let msg = format!("{:#}", r.expect_err("expected a guard rejection"));
-            assert!(msg.contains(&code.to_string()), "{what}: want guard {code}, got {msg:?}");
+            assert!(
+                msg.contains(&code.to_string()),
+                "{what}: want guard {code}, got {msg:?}"
+            );
         }
     }
 }
@@ -48,66 +55,140 @@ fn assert_guard<T: std::fmt::Debug>(r: anyhow::Result<T>, want: Option<u32>, wha
 // half of the type pair the two oracle files exist to keep apart.
 // ---------------------------------------------------------------------------
 
+/// The four buffers a quantized GEMV takes: activations, packed weights, block scales, and
+/// the destination.
+///
+/// `gemv_fp8` and `gemv_i8` take the same four in the same order and differ only in whether
+/// a `block` follows — written out twice, that is two four-line preambles that must stay in
+/// step with each other and with the launcher.
+struct GemvIo<'a> {
+    x: &'a DeviceBuf,
+    p: &'a DeviceBuf,
+    s: &'a DeviceBuf,
+    y: &'a mut DeviceBuf,
+}
+
+impl<'a> GemvIo<'a> {
+    fn new(x: &'a DeviceBuf, p: &'a DeviceBuf, s: &'a DeviceBuf, y: &'a mut DeviceBuf) -> Self {
+        Self { x, p, s, y }
+    }
+
+    /// The four device addresses, in launcher order. Consuming, because the destination is
+    /// a unique borrow and the address outlives the reborrow that produced it.
+    fn ptrs(self) -> (*const f32, *const u8, *const f32, *mut f32) {
+        let (x, s) = (self.x.ptr() as *const f32, self.s.ptr() as *const f32);
+        (x, self.p.ptr(), s, self.y.ptr_mut() as *mut f32)
+    }
+}
+
 /// `gemv_fp8`. Returns the `Result` rather than expecting it: the guard test hands it dims
 /// it requires to be REJECTED, and that arm must reach its assertion rather than panic.
-#[allow(clippy::too_many_arguments)]
-fn gemv_fp8(x: &DeviceBuf, p: &DeviceBuf, s: &DeviceBuf, y: &mut DeviceBuf,
-            o_dim: usize, i_dim: usize, block: usize, nrow: usize) -> anyhow::Result<()> {
+fn gemv_fp8(io: GemvIo<'_>, o_dim: usize, i_dim: usize, block: usize, nrow: usize) -> Result<()> {
+    let (x, p, s, y) = io.ptrs();
     // SAFETY: the buffers are borrowed for the call, so they outlive it; every caller sizes
     // them for the dims it passes, and a rejected dim never reaches a dereference.
-    unsafe {
-        launch_gemv_fp8(x.ptr() as *const f32, p.ptr(), s.ptr() as *const f32,
-                        o_dim, i_dim, block, nrow, y.ptr_mut() as *mut f32)
-    }
+    unsafe { launch_gemv_fp8(x, p, s, o_dim, i_dim, block, nrow, y) }
 }
 
 /// `gemv_i8` — lm_head's projection.
-fn gemv_i8(x: &DeviceBuf, p: &DeviceBuf, s: &DeviceBuf, y: &mut DeviceBuf,
-           o_dim: usize, i_dim: usize, nrow: usize) {
+fn gemv_i8(io: GemvIo<'_>, o_dim: usize, i_dim: usize, nrow: usize) {
+    let (x, p, s, y) = io.ptrs();
     // SAFETY: as `gemv_fp8`; `x` holds `nrow` rows of i_dim and `y` `nrow` rows of o_dim.
-    unsafe {
-        launch_gemv_i8(x.ptr() as *const f32, p.ptr(), s.ptr() as *const f32,
-                       o_dim, i_dim, nrow, y.ptr_mut() as *mut f32)
+    unsafe { launch_gemv_i8(x, p, s, o_dim, i_dim, nrow, y) }.expect("gemv_i8");
+}
+
+/// The fp8 kv_b block, its block-scale grid, and the destination — everything one MLA
+/// dispatch touches except the f32 input, which is the ONE argument the two kernels differ
+/// in (`q` for absorb, `clat` for value).
+///
+/// Bundled for the same reason as [`Mla`] beside it: these launchers take eleven arguments
+/// each, and two copies of that list is two chances for the pair to stop reading the same
+/// kv_b — which no oracle in this file would notice, since each checks its own kernel.
+struct MlaIo<'a> {
+    kvb: &'a DeviceBuf,
+    scale: &'a DeviceBuf,
+    out: &'a mut DeviceBuf,
+}
+
+impl<'a> MlaIo<'a> {
+    fn new(kvb: &'a DeviceBuf, scale: &'a DeviceBuf, out: &'a mut DeviceBuf) -> Self {
+        Self { kvb, scale, out }
     }
-    .expect("gemv_i8");
+
+    /// The three device addresses, in launcher order.
+    fn ptrs(&mut self) -> (*const u8, *const f32, *mut f32) {
+        let sc = self.scale.ptr() as *const f32;
+        (self.kvb.ptr(), sc, self.out.ptr_mut() as *mut f32)
+    }
 }
 
 /// `mla_absorb_fp8`. `Result`-returning for the same reason as [`gemv_fp8`].
-#[allow(clippy::too_many_arguments)]
-fn mla_absorb(q: &DeviceBuf, kvb: &DeviceBuf, scale: &DeviceBuf, out: &mut DeviceBuf,
-              h: usize, qh: usize, nope: usize, vh: usize, kvl: usize, block: usize,
-              nrow: usize) -> anyhow::Result<()> {
+fn mla_absorb(q: &DeviceBuf, io: &mut MlaIo<'_>, m: Mla, nrow: usize) -> Result<()> {
+    let (kvb, sc, out) = io.ptrs();
+    let q = q.ptr() as *const f32;
     // SAFETY: as `gemv_fp8`; kv_b is [h·(nope+vh), kvl] bytes and `out` `nrow` rows of h·kvl.
     unsafe {
-        launch_mla_absorb_fp8(q.ptr() as *const f32, kvb.ptr(), scale.ptr() as *const f32,
-                              h, qh, nope, vh, kvl, block, nrow, out.ptr_mut() as *mut f32)
+        launch_mla_absorb_fp8(
+            q, kvb, sc, m.h, m.qh, m.nope, m.vh, m.kvl, m.block, nrow, out,
+        )
     }
 }
 
 /// `mla_value_fp8` — the same kv_b, without `qh`, into `ctx`.
-#[allow(clippy::too_many_arguments)]
-fn mla_value(clat: &DeviceBuf, kvb: &DeviceBuf, scale: &DeviceBuf, out: &mut DeviceBuf,
-             h: usize, nope: usize, vh: usize, kvl: usize, block: usize,
-             nrow: usize) -> anyhow::Result<()> {
+fn mla_value(clat: &DeviceBuf, io: &mut MlaIo<'_>, m: Mla, nrow: usize) -> Result<()> {
+    let (kvb, sc, out) = io.ptrs();
+    let clat = clat.ptr() as *const f32;
     // SAFETY: as `mla_absorb`; `out` holds `nrow` rows of h·vh.
-    unsafe {
-        launch_mla_value_fp8(clat.ptr() as *const f32, kvb.ptr(), scale.ptr() as *const f32,
-                             h, nope, vh, kvl, block, nrow, out.ptr_mut() as *mut f32)
+    unsafe { launch_mla_value_fp8(clat, kvb, sc, m.h, m.nope, m.vh, m.kvl, m.block, nrow, out) }
+}
+
+/// The four per-dispatch buffers of one MoE expert range: the token rows, the gate weights,
+/// the per-expert `h` staging, and the fixed-point accumulator.
+///
+/// Descriptors, codebooks and geometry are fixed for a whole test; these four are what a
+/// batched arm swaps. Bundled so the two batching tests can each drive their range through
+/// a closure taking ONE operand rather than the same five-parameter list written twice.
+struct MoeIo<'a> {
+    x: &'a DeviceBuf,
+    w: &'a DeviceBuf,
+    h: &'a mut DeviceBuf,
+    acc: &'a mut DeviceBuf,
+}
+
+impl<'a> MoeIo<'a> {
+    fn new(x: &'a DeviceBuf, w: &'a DeviceBuf, h: &'a mut DeviceBuf, a: &'a mut DeviceBuf) -> Self {
+        Self { x, w, h, acc: a }
+    }
+
+    /// The four device addresses, in launcher order. Consuming, because two of them are
+    /// unique borrows and the address outlives the reborrow that produced it.
+    fn ptrs(self) -> (*const f32, *const f32, *mut f32, *mut u64) {
+        let (x, w) = (self.x.ptr() as *const f32, self.w.ptr() as *const f32);
+        let acc = self.acc.ptr_mut() as *mut u64;
+        (x, w, self.h.ptr_mut() as *mut f32, acc)
     }
 }
 
-/// `moe_expert_range_i4` over experts `[e_start, e_start+e_count)`.
-#[allow(clippy::too_many_arguments)]
-fn expert_range_i4(x: &DeviceBuf, descs: &DeviceBuf, w: &DeviceBuf, h: &mut DeviceBuf,
-                   acc: &mut DeviceBuf, hidden: usize, inter: usize, e_start: usize,
-                   e_count: usize, nrow: usize, stream: &HipStream) {
+/// `moe_expert_range_i4` over experts `[g.e_start, g.e_end())`.
+fn expert_range_i4(io: MoeIo<'_>, descs: &DeviceBuf, g: MoeRange, nrow: usize, st: &HipStream) {
+    let (x, w, h, acc) = io.ptrs();
+    let d = descs.ptr() as *const ExpertDesc;
+    let (hidden, inter) = (g.hidden, g.inter);
     // SAFETY: `x` is `nrow` rows of [hidden], `w` is [e_count·nrow], `h` [e_count·nrow·inter]
     // and `acc` `nrow` rows of [hidden] u64; the stream is live for the call.
     unsafe {
         launch_moe_expert_range_i4(
-            x.ptr() as *const f32, hidden, inter, e_start, e_count,
-            descs.ptr() as *const ExpertDesc, w.ptr() as *const f32,
-            h.ptr_mut() as *mut f32, acc.ptr_mut() as *mut u64, nrow, stream.raw(),
+            x,
+            hidden,
+            inter,
+            g.e_start,
+            g.e_count,
+            d,
+            w,
+            h,
+            acc,
+            nrow,
+            st.raw(),
         )
     }
     .expect("moe_expert_range_i4");
@@ -124,7 +205,10 @@ fn drain(out: &mut DeviceBuf, acc: &mut DeviceBuf, row: usize, hidden: usize, st
         launch_moe_acc_drain(
             out.ptr_mut().add(row * hidden * 4) as *mut f32,
             acc.ptr_mut().add(row * hidden * 8) as *mut u64,
-            hidden, 1, 1.0, stream.raw(),
+            hidden,
+            1,
+            1.0,
+            stream.raw(),
         )
     }
     .expect("moe_acc_drain");
@@ -152,7 +236,12 @@ fn desc_buf(descs: &[ExpertDesc]) -> DeviceBuf {
 ///
 /// ONE u64 accumulator row per token, not `e` partial rows; the output starts at zero
 /// because the drain ADDS into it — it is the residual add.
-fn moe_bufs(e: usize, nrow: usize, hidden: usize, inter: usize) -> (DeviceBuf, DeviceBuf, DeviceBuf) {
+fn moe_bufs(
+    e: usize,
+    nrow: usize,
+    hidden: usize,
+    inter: usize,
+) -> (DeviceBuf, DeviceBuf, DeviceBuf) {
     (
         dev(&vec![0u8; e * nrow * inter * 4]),
         dev(&vec![0u8; nrow * hidden * 8]),
@@ -215,8 +304,12 @@ fn encode_experts<S>(
 fn argmax(logits: &DeviceBuf, n: usize, idx: &mut DeviceBuf, val: &mut DeviceBuf) {
     // SAFETY: `logits` is n live f32 and each output buffer is one live word.
     unsafe {
-        launch_argmax(logits.ptr() as *const f32, n,
-                      idx.ptr_mut() as *mut i32, val.ptr_mut() as *mut f32)
+        launch_argmax(
+            logits.ptr() as *const f32,
+            n,
+            idx.ptr_mut() as *mut i32,
+            val.ptr_mut() as *mut f32,
+        )
     }
     .expect("launch argmax");
 }
@@ -283,7 +376,7 @@ fn gemv_fp8_matches_oracle() {
 
         let (xb, pb, sb) = (dev(&f32b(&x)), dev(&packed), dev(&f32b(&scale)));
         let mut yb = dev(&vec![0u8; o_dim * 4]);
-        gemv_fp8(&xb, &pb, &sb, &mut yb, o_dim, i_dim, block, 1).expect("launch");
+        gemv_fp8(GemvIo::new(&xb, &pb, &sb, &mut yb), o_dim, i_dim, block, 1).expect("launch");
         device_sync().expect("sync");
         assert_close(&want, &f32v(&yb.copy_out().expect("out")), label);
     }
@@ -307,8 +400,14 @@ fn gemv_fp8_rejects_non_power_of_two_block() {
         let x = dev(&f32b(&vec![0.0f32; i_dim]));
         let mut y = dev(&vec![0u8; o_dim * 4]);
         // 1 is a power of two (bsh = 0, `i >> 0` == `i / 1`), so it must be ACCEPTED.
-        for (block, want) in [(128usize, None), (96, Some(1003)), (127, Some(1003)), (1, None)] {
-            let r = gemv_fp8(&x, &packed, &scale, &mut y, o_dim, i_dim, block, 1);
+        for (block, want) in [
+            (128usize, None),
+            (96, Some(1003)),
+            (127, Some(1003)),
+            (1, None),
+        ] {
+            let io = GemvIo::new(&x, &packed, &scale, &mut y);
+            let r = gemv_fp8(io, o_dim, i_dim, block, 1);
             assert_guard(r, want, &format!("i_dim={i_dim} block={block}"));
         }
         device_sync().expect("sync");
@@ -333,9 +432,10 @@ fn mla_value_rejects_ragged_kvl_but_absorb_accepts_it() {
         let scale = dev(&f32b(&vec![1.0f32; rows * kvl]));
         let x = dev(&f32b(&vec![0.0f32; h * qh.max(kvl)]));
         let mut out = dev(&vec![0u8; h * kvl * 4]);
-        let val = mla_value(&x, &kvb, &scale, &mut out, h, nope, vh, kvl, block, 1);
+        let m = Mla::new(h, qh, nope, vh, kvl, block);
+        let val = mla_value(&x, &mut MlaIo::new(&kvb, &scale, &mut out), m, 1);
         assert_guard(val, want, &format!("mla_value kvl={kvl}"));
-        let abs = mla_absorb(&x, &kvb, &scale, &mut out, h, qh, nope, vh, kvl, block, 1);
+        let abs = mla_absorb(&x, &mut MlaIo::new(&kvb, &scale, &mut out), m, 1);
         assert!(abs.is_ok(), "mla_absorb must accept kvl={kvl}: {abs:?}");
     }
     device_sync().expect("sync the accepted kv_b dispatches");
@@ -389,13 +489,12 @@ fn gemv_i8_matches_oracle() {
     // de-aligns every row but the first and must fall out of the quad path entirely.
     for (o_dim, i_dim) in [(512usize, 6144usize), (96, 6148), (96, 100), (96, 6143)] {
         let mut r = Lcg(0x18);
-        let packed: Vec<u8> = (0..o_dim * i_dim).map(|_| (r.f() * 127.0) as i8 as u8).collect();
-        let scale: Vec<f32> = (0..o_dim).map(|_| (r.f() * 0.01).abs() + 1e-4).collect();
+        let (packed, scale) = i8_weights(&mut r, o_dim, i_dim);
         let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
         let (xb, pb, sb) = (dev(&f32b(&x)), dev(&packed), dev(&f32b(&scale)));
         let mut yb = dev(&vec![0u8; o_dim * 4]);
         let want = want_i8(&x, &packed, &scale, o_dim, i_dim);
-        gemv_i8(&xb, &pb, &sb, &mut yb, o_dim, i_dim, 1);
+        gemv_i8(GemvIo::new(&xb, &pb, &sb, &mut yb), o_dim, i_dim, 1);
         device_sync().expect("sync");
         let got = f32v(&yb.copy_out().expect("out"));
         assert_close(&want, &got, &format!("gemv_i8 o={o_dim} i={i_dim}"));
@@ -424,8 +523,15 @@ fn gemv_vq_matches_oracle() {
     // SAFETY: all five buffers are device-resident, sized for these dims, and live until
     // the sync below.
     unsafe {
-        launch_gemv_vq(xb.ptr() as *const f32, ib.ptr(), sb.ptr() as *const u16,
-                       cb.ptr() as *const u16, o_dim, i_dim, yb.ptr_mut() as *mut f32)
+        launch_gemv_vq(
+            xb.ptr() as *const f32,
+            ib.ptr(),
+            sb.ptr() as *const u16,
+            cb.ptr() as *const u16,
+            o_dim,
+            i_dim,
+            yb.ptr_mut() as *mut f32,
+        )
     }
     .expect("launch");
     device_sync().expect("sync");
@@ -486,12 +592,17 @@ fn fwd_argmax_and_vadd() {
 /// Dense two-pass scalar softmax over the whole cache — the oracle the flash
 /// (online) kernel must match. Latent is fp8-e4m3 × per-128 block scale (the exact
 /// dequant the kernel does); the roped key is bf16.
-#[allow(clippy::too_many_arguments)]
 fn attend_reference(
-    qabs: &[f32], qrope: &[f32], lc8: &[u8], lscale: &[f32], rc: &[u16],
-    h: usize, nt: usize, kvl: usize, rope: usize, n_blocks: usize, scale: f32,
+    qabs: &[f32],
+    qrope: &[f32],
+    lc8: &[u8],
+    lscale: &[f32],
+    rc: &[u16],
+    d: Att,
 ) -> Vec<f32> {
-    let lat = |t: usize, i: usize| e4m3_to_f32(lc8[t * kvl + i]) * lscale[t * n_blocks + i / 128];
+    let (h, nt, kvl, rope, scale) = (d.h, d.nr, d.kvl, d.rope, d.scale);
+    let nb = d.n_blocks;
+    let lat = |t: usize, i: usize| e4m3_to_f32(lc8[t * kvl + i]) * lscale[t * nb + i / 128];
     let mut clat = vec![0.0f32; h * kvl];
     let mut scores = vec![0.0f32; nt];
     for head in 0..h {
@@ -523,7 +634,8 @@ fn attend_reference(
 
 fn check_attend(seed: u64, h: usize, nt: usize, kvl: usize, rope: usize) {
     assert_eq!(kvl % 128, 0, "fp8 latent cache needs kvl a multiple of 128");
-    let n_blocks = kvl / 128;
+    let d = Att::new(h, nt, kvl, rope, 1.0 / ((kvl + rope) as f32).sqrt());
+    let (n_blocks, scale) = (d.n_blocks, d.scale);
     let mut r = Lcg(seed);
     let qabs: Vec<f32> = (0..h * kvl).map(|_| r.f()).collect();
     let qrope: Vec<f32> = (0..h * rope).map(|_| r.f()).collect();
@@ -535,10 +647,7 @@ fn check_attend(seed: u64, h: usize, nt: usize, kvl: usize, rope: usize) {
         .map(|_| (r.f() * 0.1).abs() + 0.01)
         .collect();
     let rc: Vec<u16> = (0..nt * rope).map(|_| f32_to_bf16(r.f())).collect();
-    let scale = 1.0 / ((kvl + rope) as f32).sqrt();
-    let want = attend_reference(
-        &qabs, &qrope, &lc8, &lscale, &rc, h, nt, kvl, rope, n_blocks, scale,
-    );
+    let want = attend_reference(&qabs, &qrope, &lc8, &lscale, &rc, d);
 
     let (qab, qrb) = (dev(&f32b(&qabs)), dev(&f32b(&qrope)));
     let (lcb, lsb, rcb) = (dev(&lc8), dev(&f32b(&lscale)), dev(&u16b(&rc)));
@@ -609,9 +718,10 @@ fn mla_fp8_matches_reference() {
 /// `kvl % 4 == 0` (guard 1002) and absorb does not; see
 /// `mla_value_rejects_ragged_kvl_but_absorb_accepts_it`.
 fn check_mla_fp8(seed: u64, h: usize, qh: usize, nope: usize, vh: usize, kvl: usize, block: usize) {
+    let m = Mla::new(h, qh, nope, vh, kvl, block);
     let value_defined = kvl.is_multiple_of(4);
     let mut r = Lcg(seed);
-    let rows = h * (nope + vh);
+    let rows = m.rows();
     let sc_cols = kvl.div_ceil(block);
     let (packed, scale) = kvb_fp8(&mut r, rows, kvl, block);
     // reference reads the exact dequant the kernels see: kvb[row][i] = e4m3·block-scale.
@@ -653,9 +763,9 @@ fn check_mla_fp8(seed: u64, h: usize, qh: usize, nope: usize, vh: usize, kvl: us
     let mut absb = dev(&vec![0u8; h * kvl * 4]);
     let mut valb = dev(&vec![0u8; h * vh * 4]);
     // Both enqueued before either sync, as the engine's attention step runs them.
-    mla_absorb(&qb, &kb, &sb, &mut absb, h, qh, nope, vh, kvl, block, 1).expect("launch absorb");
+    mla_absorb(&qb, &mut MlaIo::new(&kb, &sb, &mut absb), m, 1).expect("launch absorb");
     if value_defined {
-        mla_value(&clb, &kb, &sb, &mut valb, h, nope, vh, kvl, block, 1).expect("launch value");
+        mla_value(&clb, &mut MlaIo::new(&kb, &sb, &mut valb), m, 1).expect("launch value");
     }
     device_sync().expect("sync");
     assert_close(
@@ -692,7 +802,15 @@ fn moe_vq_matches_reference() {
     });
 
     let want = moe_reference(&x, &w, hidden, inter, |out, inp, ex, p, o_dim, i_dim| {
-        matvec_vq(out, inp, &enc[ex][p].0, &enc[ex][p].1, &cbs[p], o_dim, i_dim)
+        matvec_vq(
+            out,
+            inp,
+            &enc[ex][p].0,
+            &enc[ex][p].1,
+            &cbs[p],
+            o_dim,
+            i_dim,
+        )
     });
 
     // device: hold bufs alive; descriptors point into them
@@ -723,24 +841,25 @@ fn moe_vq_matches_reference() {
     // Three arms below run the same two kernels and differ only in the token rows, the
     // gate weights, the destination buffers and `nrow`. Geometry, descriptors and
     // codebooks are identical in all three, so they are captured rather than re-spelled.
-    let range =
-        |xb: &DeviceBuf, wb: &DeviceBuf, hb: &mut DeviceBuf, ab: &mut DeviceBuf, nrow: usize| {
-            for k in 0..e {
-                // SAFETY: every buffer is device-resident and sized for `nrow` rows of the
-                // layout above; the stream is live.
-                unsafe {
-                    launch_moe_expert_range(
-                        xb.ptr() as *const f32, hidden, inter, k, 1,
-                        descb.ptr() as *const ExpertDesc, g0.ptr() as *const u16,
-                        g1.ptr() as *const u16, g2.ptr() as *const u16, wb.ptr() as *const f32,
-                        hb.ptr_mut() as *mut f32, ab.ptr_mut() as *mut u64, nrow, stream.raw(),
-                    )
-                }
-                .expect("launch moe_expert_range");
+    // Descriptors, codebooks and stream as device addresses once, so the dispatch below
+    // reads as the argument LIST it is rather than fourteen lines of `.ptr() as`.
+    let dp = descb.ptr() as *const ExpertDesc;
+    let cb = |b: &DeviceBuf| b.ptr() as *const u16;
+    let (c0, c1, c2) = (cb(&g0), cb(&g1), cb(&g2));
+    let st = stream.raw();
+    let range = |io: MoeIo<'_>, nrow: usize| {
+        let (x, w, h, acc) = io.ptrs();
+        for k in 0..e {
+            // SAFETY: every buffer is device-resident and sized for `nrow` rows of the
+            // layout above; the stream is live.
+            unsafe {
+                launch_moe_expert_range(x, hidden, inter, k, 1, dp, c0, c1, c2, w, h, acc, nrow, st)
             }
-        };
+            .expect("launch moe_expert_range");
+        }
+    };
 
-    range(&xb, &wb, &mut hbuf, &mut pbuf, 1);
+    range(MoeIo::new(&xb, &wb, &mut hbuf, &mut pbuf), 1);
     drain(&mut obuf, &mut pbuf, 0, hidden, &stream);
     device_sync().expect("sync");
     assert_close(&want, &f32v(&obuf.copy_out().expect("out")), "moe_vq");
@@ -774,7 +893,7 @@ fn moe_vq_matches_reference() {
     let xrb = dev(&f32b(&xr));
     let wrb = dev(&f32b(&wr));
     let (mut hbuf2, mut pbuf2, mut obuf2) = moe_bufs(e, 2, hidden, inter);
-    range(&xrb, &wrb, &mut hbuf2, &mut pbuf2, 2);
+    range(MoeIo::new(&xrb, &wrb, &mut hbuf2, &mut pbuf2), 2);
     for t in 0..2 {
         drain(&mut obuf2, &mut pbuf2, t, hidden, &stream);
     }
@@ -792,7 +911,7 @@ fn moe_vq_matches_reference() {
     let x2b = dev(&f32b(&x2));
     let w2b = dev(&f32b(&w2));
     let (mut hbuf1, mut pbuf1, mut obuf1) = moe_bufs(e, 1, hidden, inter);
-    range(&x2b, &w2b, &mut hbuf1, &mut pbuf1, 1);
+    range(MoeIo::new(&x2b, &w2b, &mut hbuf1, &mut pbuf1), 1);
     drain(&mut obuf1, &mut pbuf1, 0, hidden, &stream);
     device_sync().expect("sync");
     assert_eq!(
@@ -854,7 +973,8 @@ fn moe_i4_matches_reference() {
     let (mut hbuf, mut pbuf, mut obuf) = moe_bufs(e, 1, hidden, inter);
     let stream = HipStream::new().expect("stream");
     for k in 0..e {
-        expert_range_i4(&xb, &descb, &wb, &mut hbuf, &mut pbuf, hidden, inter, k, 1, 1, &stream);
+        let io = MoeIo::new(&xb, &wb, &mut hbuf, &mut pbuf);
+        expert_range_i4(io, &descb, MoeRange::new(hidden, inter, k, 1), 1, &stream);
     }
     drain(&mut obuf, &mut pbuf, 0, hidden, &stream);
     device_sync().expect("sync");
@@ -882,7 +1002,8 @@ fn gpu_i4_expert(blk: &[u8], off: &[usize; 6], x: &[f32], hidden: usize, inter: 
     let (xb, wb) = (dev(&f32b(x)), dev(&f32b(&[1.0f32])));
     let (mut hbuf, mut pbuf, mut obuf) = moe_bufs(1, 1, hidden, inter);
     let stream = HipStream::new().expect("stream");
-    expert_range_i4(&xb, &descb, &wb, &mut hbuf, &mut pbuf, hidden, inter, 0, 1, 1, &stream);
+    let io = MoeIo::new(&xb, &wb, &mut hbuf, &mut pbuf);
+    expert_range_i4(io, &descb, MoeRange::new(hidden, inter, 0, 1), 1, &stream);
     drain(&mut obuf, &mut pbuf, 0, hidden, &stream);
     device_sync().expect("sync");
     f32v(&obuf.copy_out().expect("out"))
@@ -932,7 +1053,11 @@ fn moe_i4_real_data_matches_cpu() {
     matvec_i4(&mut want, &h, &dp, &ds, hidden, inter);
 
     let got = gpu_i4_expert(&blk, &off, &x, hidden, inter);
-    let dot: f64 = want.iter().zip(&got).map(|(a, b)| *a as f64 * *b as f64).sum();
+    let dot: f64 = want
+        .iter()
+        .zip(&got)
+        .map(|(a, b)| *a as f64 * *b as f64)
+        .sum();
     let (na, nb): (f64, f64) = (
         want.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt(),
         got.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt(),
@@ -1026,7 +1151,10 @@ fn moe_i4_real_data_vs_fp8_ground_truth() {
         prov.layers
     );
     let Ok(src) = Safetensors::open_dir(&prov.src) else {
-        eprintln!("skip moe_i4_real_data_vs_fp8: checkpoint {} absent", prov.src);
+        eprintln!(
+            "skip moe_i4_real_data_vs_fp8: checkpoint {} absent",
+            prov.src
+        );
         return;
     };
     let block = FormatMeta::load(ART).expect("format meta").fp8_block;
@@ -1079,9 +1207,12 @@ fn moe_i4_real_data_vs_fp8_ground_truth() {
         dot += a * b;
     }
     let (rel_l2, gain) = ((num / den).sqrt(), dot / den);
-    let (mx_ref, mx_err) = got.iter().zip(&want).fold((0f64, 0f64), |(r, e), (&a, &b)| {
-        (r.max(b.abs() as f64), e.max((a - b).abs() as f64))
-    });
+    let (mx_ref, mx_err) = got
+        .iter()
+        .zip(&want)
+        .fold((0f64, 0f64), |(r, e), (&a, &b)| {
+            (r.max(b.abs() as f64), e.max((a - b).abs() as f64))
+        });
     let rel_max = mx_err / mx_ref;
     // Margins, not just pass/fail — a run drifting from 0.24 toward 0.32 stays green
     // and unremarked right up until it crosses (the reason `assert_close` prints them).
@@ -1180,11 +1311,31 @@ fn index_topk_matches_host_selection() {
             2048,
         ),
         ("k == nt", (0..2048).map(|i| (i % 7) as f32).collect(), 2048),
-        ("k == nt - 1", (0..2049).map(|i| (i % 7) as f32).collect(), 2048),
-        ("k > nt (wrapper clamp)", (0..500).map(|i| (i % 7) as f32).collect(), 2048),
-        ("single block", (0..200).map(|i| (i % 5) as f32).collect(), 64),
-        ("ReLU-sparse (engine shape, prefix answer)", relu_sparse, 2048),
-        ("scattered zeros (engine shape, non-prefix answer)", scattered, 2048),
+        (
+            "k == nt - 1",
+            (0..2049).map(|i| (i % 7) as f32).collect(),
+            2048,
+        ),
+        (
+            "k > nt (wrapper clamp)",
+            (0..500).map(|i| (i % 7) as f32).collect(),
+            2048,
+        ),
+        (
+            "single block",
+            (0..200).map(|i| (i % 5) as f32).collect(),
+            64,
+        ),
+        (
+            "ReLU-sparse (engine shape, prefix answer)",
+            relu_sparse,
+            2048,
+        ),
+        (
+            "scattered zeros (engine shape, non-prefix answer)",
+            scattered,
+            2048,
+        ),
         ("dense random", dense, 2048),
         ("heavy ties", heavy_ties, 2048),
     ];
@@ -1256,33 +1407,56 @@ fn batched_rows_are_bit_identical_to_single_rows() {
             // SAFETY: `x` holds `nrow` rows of i_dim and `y` `nrow` rows of o_dim; both
             // nrow 1 and nrow 2 are instantiated.
             unsafe {
-                launch_gemv_f32(xb.ptr() as *const f32, wb.ptr() as *const f32,
-                                o_dim, i_dim, nrow, yb.ptr_mut() as *mut f32)
+                launch_gemv_f32(
+                    xb.ptr() as *const f32,
+                    wb.ptr() as *const f32,
+                    o_dim,
+                    i_dim,
+                    nrow,
+                    yb.ptr_mut() as *mut f32,
+                )
             }
             .expect("gemv_f32");
         });
-        assert_eq!(got[..o_dim], single[0][..], "gemv_f32 row 0 must be bit-identical");
-        assert_eq!(got[o_dim..], single[1][..], "gemv_f32 row 1 must be bit-identical");
+        assert_eq!(
+            got[..o_dim],
+            single[0][..],
+            "gemv_f32 row 0 must be bit-identical"
+        );
+        assert_eq!(
+            got[o_dim..],
+            single[1][..],
+            "gemv_f32 row 1 must be bit-identical"
+        );
     }
 
     // --- gemv_i8 (lm_head). i_dim % 4 == 0 so both rows take the dword-quad path. ---
     {
         let (o_dim, i_dim) = (96usize, 260usize);
-        let packed: Vec<u8> = (0..o_dim * i_dim).map(|_| (r.f() * 127.0) as i8 as u8).collect();
-        let scale: Vec<f32> = (0..o_dim).map(|_| (r.f() * 0.01).abs() + 1e-4).collect();
+        let (packed, scale) = i8_weights(&mut r, o_dim, i_dim);
         let xs: [Vec<f32>; 2] = std::array::from_fn(|_| (0..i_dim).map(|_| r.f()).collect());
         let (pb, sb) = (dev(&packed), dev(&f32b(&scale)));
-        let (got, single) =
-            single_vs_batched(&xs, o_dim, |xb, yb, nrow| gemv_i8(xb, &pb, &sb, yb, o_dim, i_dim, nrow));
-        assert_eq!(got[..o_dim], single[0][..], "gemv_i8 row 0 must be bit-identical");
-        assert_eq!(got[o_dim..], single[1][..], "gemv_i8 row 1 must be bit-identical");
+        let (got, single) = single_vs_batched(&xs, o_dim, |xb, yb, nrow| {
+            gemv_i8(GemvIo::new(xb, &pb, &sb, yb), o_dim, i_dim, nrow)
+        });
+        assert_eq!(
+            got[..o_dim],
+            single[0][..],
+            "gemv_i8 row 0 must be bit-identical"
+        );
+        assert_eq!(
+            got[o_dim..],
+            single[1][..],
+            "gemv_i8 row 1 must be bit-identical"
+        );
     }
 
     // --- mla_absorb_fp8 / mla_value_fp8 (both through kv_b). kvl % 4 == 0 and
     //     block >= 4, so this exercises the quad path both kernels actually run. ---
     {
         let (h, qh, nope, vh, kvl, block) = (3usize, 20usize, 12usize, 8usize, 16usize, 4usize);
-        let (packed, scale) = kvb_fp8(&mut r, h * (nope + vh), kvl, block);
+        let m = Mla::new(h, qh, nope, vh, kvl, block);
+        let (packed, scale) = kvb_fp8(&mut r, m.rows(), kvl, block);
         let (kb, sb) = (dev(&packed), dev(&f32b(&scale)));
         let qs: [Vec<f32>; 2] = std::array::from_fn(|_| (0..h * qh).map(|_| r.f()).collect());
         let cs: [Vec<f32>; 2] = std::array::from_fn(|_| (0..h * kvl).map(|_| r.f()).collect());
@@ -1291,10 +1465,10 @@ fn batched_rows_are_bit_identical_to_single_rows() {
         // flight together before either result is read, which is how the engine's own
         // attention step runs them and how the nrow=1 arm below has always run them.
         let absorb = |qb: &DeviceBuf, ab: &mut DeviceBuf, nrow: usize| {
-            mla_absorb(qb, &kb, &sb, ab, h, qh, nope, vh, kvl, block, nrow).expect("absorb");
+            mla_absorb(qb, &mut MlaIo::new(&kb, &sb, ab), m, nrow).expect("absorb");
         };
         let value = |clb: &DeviceBuf, vb: &mut DeviceBuf, nrow: usize| {
-            mla_value(clb, &kb, &sb, vb, h, nope, vh, kvl, block, nrow).expect("value");
+            mla_value(clb, &mut MlaIo::new(&kb, &sb, vb), m, nrow).expect("value");
         };
 
         let mut abs1 = Vec::new();
@@ -1321,10 +1495,26 @@ fn batched_rows_are_bit_identical_to_single_rows() {
         device_sync().expect("sync");
         let ga = f32v(&ab.copy_out().expect("out"));
         let gv = f32v(&vb.copy_out().expect("out"));
-        assert_eq!(ga[..h * kvl], abs1[0][..], "mla_absorb row 0 must be bit-identical");
-        assert_eq!(ga[h * kvl..], abs1[1][..], "mla_absorb row 1 must be bit-identical");
-        assert_eq!(gv[..h * vh], val1[0][..], "mla_value row 0 must be bit-identical");
-        assert_eq!(gv[h * vh..], val1[1][..], "mla_value row 1 must be bit-identical");
+        assert_eq!(
+            ga[..h * kvl],
+            abs1[0][..],
+            "mla_absorb row 0 must be bit-identical"
+        );
+        assert_eq!(
+            ga[h * kvl..],
+            abs1[1][..],
+            "mla_absorb row 1 must be bit-identical"
+        );
+        assert_eq!(
+            gv[..h * vh],
+            val1[0][..],
+            "mla_value row 0 must be bit-identical"
+        );
+        assert_eq!(
+            gv[h * vh..],
+            val1[1][..],
+            "mla_value row 1 must be bit-identical"
+        );
     }
 
     // --- the int4 MoE pair (moe_gateup_i4 / moe_down_i4) ---
@@ -1372,11 +1562,12 @@ fn batched_rows_are_bit_identical_to_single_rows() {
         // Row 0 routes to both experts; row 1 only to expert 0. Indexed `[e * R + t]`.
         let w1: [Vec<f32>; 2] = [vec![0.75, 0.5], vec![0.25, 0.0]];
         let stream = HipStream::new().expect("stream");
-        let run = |xb: &DeviceBuf, wb: &DeviceBuf, hb: &mut DeviceBuf,
-                   ab: &mut DeviceBuf, nrow: usize| -> Vec<u8> {
-            expert_range_i4(xb, &descb, wb, hb, ab, hidden, inter, 0, ne, nrow, &stream);
+        let g = MoeRange::new(hidden, inter, 0, ne);
+        // Launch and join only — the caller reads its OWN accumulator back, because that
+        // is the buffer the comparison is about and `MoeIo` has already given up its borrow.
+        let run = |io: MoeIo<'_>, nrow: usize| {
+            expert_range_i4(io, &descb, g, nrow, &stream);
             device_sync().expect("sync");
-            ab.copy_out().expect("out")
         };
 
         let single: Vec<Vec<u8>> = xs
@@ -1386,7 +1577,8 @@ fn batched_rows_are_bit_identical_to_single_rows() {
                 let (xb, wb) = (dev(&f32b(x)), dev(&f32b(w)));
                 let mut hb = dev(&vec![0u8; ne * inter * 4]);
                 let mut ab = dev(&vec![0u8; hidden * 8]);
-                run(&xb, &wb, &mut hb, &mut ab, 1)
+                run(MoeIo::new(&xb, &wb, &mut hb, &mut ab), 1);
+                ab.copy_out().expect("out")
             })
             .collect();
         let mut xboth = xs[0].clone();
@@ -1396,8 +1588,17 @@ fn batched_rows_are_bit_identical_to_single_rows() {
         let (xb, wb) = (dev(&f32b(&xboth)), dev(&f32b(&wboth)));
         let mut hb = dev(&vec![0u8; ne * 2 * inter * 4]);
         let mut ab = dev(&vec![0u8; 2 * hidden * 8]);
-        let got = run(&xb, &wb, &mut hb, &mut ab, 2);
-        assert_eq!(got[..hidden * 8], single[0][..], "moe_i4 row 0 must be bit-identical");
-        assert_eq!(got[hidden * 8..], single[1][..], "moe_i4 row 1 must be bit-identical");
+        run(MoeIo::new(&xb, &wb, &mut hb, &mut ab), 2);
+        let got = ab.copy_out().expect("out");
+        assert_eq!(
+            got[..hidden * 8],
+            single[0][..],
+            "moe_i4 row 0 must be bit-identical"
+        );
+        assert_eq!(
+            got[hidden * 8..],
+            single[1][..],
+            "moe_i4 row 1 must be bit-identical"
+        );
     }
 }

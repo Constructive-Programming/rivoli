@@ -33,9 +33,9 @@
 /// WHOLE tokens, deliberately: sampling individual intervals would leave half-built
 /// layers whose synthesised parent spans lie about their own children.
 pub mod spans {
+    use std::sync::Mutex;
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
-    use std::sync::Mutex;
     use std::time::{Instant, SystemTime};
 
     /// One closed interval on one thread, with the position it happened at so the
@@ -247,7 +247,6 @@ pub mod spans {
     }
 }
 
-
 /// A verbatim repetition loop found at the tail of a generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoopReport {
@@ -309,8 +308,10 @@ pub fn has_repeated_block(ids: &[u32], k: usize) -> bool {
     let mut seen = HashSet::with_capacity(n);
     seen.insert((h1, h2));
     for i in k..n {
-        h1 = (h1 * B1 + u64::from(ids[i]) + 1 + M1 * p1 - p1 * (u64::from(ids[i - k]) + 1) % M1) % M1;
-        h2 = (h2 * B2 + u64::from(ids[i]) + 1 + M2 * p2 - p2 * (u64::from(ids[i - k]) + 1) % M2) % M2;
+        h1 = (h1 * B1 + u64::from(ids[i]) + 1 + M1 * p1 - p1 * (u64::from(ids[i - k]) + 1) % M1)
+            % M1;
+        h2 = (h2 * B2 + u64::from(ids[i]) + 1 + M2 * p2 - p2 * (u64::from(ids[i - k]) + 1) % M2)
+            % M2;
         if !seen.insert((h1, h2)) {
             return true;
         }
@@ -408,7 +409,11 @@ pub fn repetition_report(text: &str) -> RepetitionReport {
     }
     RepetitionReport {
         top_line,
-        distinct: if words == 0 { 1.0 } else { uniq.len() as f64 / words as f64 },
+        distinct: if words == 0 {
+            1.0
+        } else {
+            uniq.len() as f64 / words as f64
+        },
     }
 }
 
@@ -629,7 +634,11 @@ impl ProfileSummary {
                 cells.join(" "),
                 lo,
                 hi,
-                if lo > 0.0 { 100.0 * (hi - lo) / lo } else { 0.0 },
+                if lo > 0.0 {
+                    100.0 * (hi - lo) / lo
+                } else {
+                    0.0
+                },
             );
         }
 
@@ -679,7 +688,6 @@ impl ProfileSummary {
                 self.idx_layers_per_tok,
             );
         }
-
     }
 }
 
@@ -768,7 +776,10 @@ mod otlp {
         // not what you search a trace by. These are.
         span.set_attribute(KeyValue::new("rivoli.model", run.model.clone()));
         span.set_attribute(KeyValue::new("rivoli.mode", run.mode.clone()));
-        span.set_attribute(KeyValue::new("rivoli.cache_policy", run.cache_policy.clone()));
+        span.set_attribute(KeyValue::new(
+            "rivoli.cache_policy",
+            run.cache_policy.clone(),
+        ));
         span.set_attribute(KeyValue::new("rivoli.attn", run.attn.clone()));
         span.set_attribute(KeyValue::new("rivoli.moe_gain", f64::from(run.moe_gain)));
         span.set_attribute(KeyValue::new("rivoli.sinks", run.sinks as i64));
@@ -791,10 +802,7 @@ mod otlp {
         // Degeneration is a first-class outcome, not a footnote: a looped run's tok/s is
         // an artifact (few experts, inflated hit rate) and must never be ranked as if it
         // were a result. Present as an attribute so a query can exclude it.
-        span.set_attribute(KeyValue::new(
-            "rivoli.degenerate",
-            run.degenerate.is_some(),
-        ));
+        span.set_attribute(KeyValue::new("rivoli.degenerate", run.degenerate.is_some()));
         if let Some(d) = run.degenerate {
             span.set_attribute(KeyValue::new("rivoli.loop_period", d.period as i64));
             span.set_attribute(KeyValue::new("rivoli.loop_repeats", d.repeats as i64));
@@ -810,10 +818,11 @@ mod otlp {
         // Every span here is closed with `end_with_timestamp`. `end()` would stamp
         // `now()` and silently discard the builder's `with_end_time`.
         let cx = opentelemetry::Context::current_with_span(span);
-        let layer_states: BTreeMap<(u32, i32), super::spans::LayerState> = super::spans::drain_layers()
-            .into_iter()
-            .map(|st| ((st.tok, st.layer), st))
-            .collect();
+        let layer_states: BTreeMap<(u32, i32), super::spans::LayerState> =
+            super::spans::drain_layers()
+                .into_iter()
+                .map(|st| ((st.tok, st.layer), st))
+                .collect();
         let mut by_tok: BTreeMap<u32, Vec<super::spans::Rec>> = BTreeMap::new();
         for r in recs {
             by_tok.entry(r.tok).or_default().push(r);
@@ -857,8 +866,14 @@ mod otlp {
                     if let Some(st) = layer_states.get(&(tok_i, layer_i)) {
                         attrs.push(KeyValue::new("experts.cold.int4", i64::from(st.cold_i4)));
                         attrs.push(KeyValue::new("experts.warm.int4", i64::from(st.warm_i4)));
-                        attrs.push(KeyValue::new("experts.cold.int3_vq", i64::from(st.cold_vq3)));
-                        attrs.push(KeyValue::new("experts.warm.int3_vq", i64::from(st.warm_vq3)));
+                        attrs.push(KeyValue::new(
+                            "experts.cold.int3_vq",
+                            i64::from(st.cold_vq3),
+                        ));
+                        attrs.push(KeyValue::new(
+                            "experts.warm.int3_vq",
+                            i64::from(st.warm_vq3),
+                        ));
                         attrs.push(KeyValue::new(
                             "experts.cold",
                             i64::from(st.cold_i4 + st.cold_vq3),
@@ -1025,7 +1040,9 @@ mod otlp {
         m.f64_gauge("rivoli.miss_per_tok")
             .build()
             .record(summary.miss_per_tok, &run_labels);
-        m.u64_gauge("rivoli.tokens").build().record(tokens as u64, &run_labels);
+        m.u64_gauge("rivoli.tokens")
+            .build()
+            .record(tokens as u64, &run_labels);
         // Chartable, so a dashboard can show "how many cells degenerated" over a matrix
         // run rather than requiring someone to read 44 logs — which needs the labels to
         // say WHICH cells.
@@ -1033,14 +1050,17 @@ mod otlp {
             .build()
             .record(u64::from(run.degenerate.is_some()), &run_labels);
         if let Some(d) = run.degenerate {
-            m.u64_gauge("rivoli.loop_period").build().record(d.period as u64, &run_labels);
-            m.u64_gauge("rivoli.loop_repeats").build().record(d.repeats as u64, &run_labels);
+            m.u64_gauge("rivoli.loop_period")
+                .build()
+                .record(d.period as u64, &run_labels);
+            m.u64_gauge("rivoli.loop_repeats")
+                .build()
+                .record(d.repeats as u64, &run_labels);
         }
 
         provider.shutdown().context("flush OTLP metrics")?;
         Ok(())
     }
-
 }
 
 /// The metric label set — the run-identity half of the OTLP export, tested **without** the
@@ -1097,14 +1117,20 @@ mod run_label_tests {
         // is a 1.108x win or a 0.93x loss, so an ungated run and a gated one must not share
         // a series. Unlike the budget, "off" is emitted rather than omitted: it is a state
         // the run was in, and a missing key would make the two indistinguishable again.
-        let ungated = RunInfo { mtp_min_conf: None, ..run(Some(115)) };
+        let ungated = RunInfo {
+            mtp_min_conf: None,
+            ..run(Some(115))
+        };
         assert_ne!(ungated.labels(), run(Some(115)).labels());
         assert!(ungated.labels().contains(&("mtp", "off".to_string())));
 
         // The defect this whole change exists for: before it, these two landed in the same
         // Prometheus series and averaged together in silence.
         assert_ne!(run(Some(115)).labels(), run(Some(70)).labels());
-        let other = RunInfo { mode: "int3-vq".to_string(), ..run(Some(115)) };
+        let other = RunInfo {
+            mode: "int3-vq".to_string(),
+            ..run(Some(115))
+        };
         assert_ne!(run(Some(115)).labels(), other.labels());
     }
 
@@ -1133,14 +1159,18 @@ mod run_label_tests {
         // period/repeats are the gauge VALUES, not part of the series identity, or every
         // failing run would get a series of its own.
         let mut degen = run(Some(115));
-        degen.degenerate = Some(LoopReport { period: 3, repeats: 40, start: 12 });
+        degen.degenerate = Some(LoopReport {
+            period: 3,
+            repeats: 40,
+            start: 12,
+        });
         assert_eq!(degen.labels(), run(Some(115)).labels());
     }
 }
 
 #[cfg(test)]
 mod loop_tests {
-    use super::{detect_loop, LoopReport};
+    use super::{LoopReport, detect_loop};
 
     #[test]
     fn detects_cycles_and_leaves_prose_alone() {
@@ -1153,12 +1183,20 @@ mod loop_tests {
         // Period 1: the same token over and over.
         assert_eq!(
             detect_loop(&[9, 8, 7, 7, 7, 7], 3, 32),
-            Some(LoopReport { period: 1, repeats: 4, start: 2 })
+            Some(LoopReport {
+                period: 1,
+                repeats: 4,
+                start: 2
+            })
         );
         // Period 3, and the SMALLEST period wins (this also matches period 6).
         assert_eq!(
             detect_loop(&[5, 1, 2, 3, 1, 2, 3, 1, 2, 3], 3, 32),
-            Some(LoopReport { period: 3, repeats: 3, start: 1 })
+            Some(LoopReport {
+                period: 3,
+                repeats: 3,
+                start: 1
+            })
         );
         // Below the repeat threshold: two copies is a couplet, not a wedge.
         assert_eq!(detect_loop(&[4, 1, 2, 3, 1, 2, 3], 3, 32), None);
@@ -1167,7 +1205,10 @@ mod loop_tests {
             Some(3)
         );
         // max_period must bound the search.
-        assert_eq!(detect_loop(&[1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4], 3, 3), None);
+        assert_eq!(
+            detect_loop(&[1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4], 3, 3),
+            None
+        );
         // Degenerate inputs must not panic or divide by zero.
         assert_eq!(detect_loop(&[], 3, 32), None);
         assert_eq!(detect_loop(&[7], 3, 32), None);
@@ -1217,10 +1258,28 @@ mod rep_tests {
         // The real failure: structure repeats, one slot varies, so no verbatim cycle
         // exists and the longest exact block is short. Both other detectors pass this.
         let labels = [
-            "Phase", "State", "Status", "Mode", "Form", "Shape", "Size", "Scale", "Scope",
-            "Range", "Navigating", "Conducting", "Managing", "Administering", "Organizing",
-            "Coordinating", "Arranging", "Ordering", "Systematizing", "Structuring",
-            "Sequencing", "Aligning",
+            "Phase",
+            "State",
+            "Status",
+            "Mode",
+            "Form",
+            "Shape",
+            "Size",
+            "Scale",
+            "Scope",
+            "Range",
+            "Navigating",
+            "Conducting",
+            "Managing",
+            "Administering",
+            "Organizing",
+            "Coordinating",
+            "Arranging",
+            "Ordering",
+            "Systematizing",
+            "Structuring",
+            "Sequencing",
+            "Aligning",
         ];
         let mut loopy = String::new();
         for l in labels.iter().cycle().take(60) {
@@ -1240,7 +1299,11 @@ mod rep_tests {
             ));
         }
         let r = repetition_report(&long_ok);
-        assert!(r.distinct < 0.30, "distinct was {} — pick a lower-entropy filler", r.distinct);
+        assert!(
+            r.distinct < 0.30,
+            "distinct was {} — pick a lower-entropy filler",
+            r.distinct
+        );
         assert!(r.top_line <= 20, "top_line was {}", r.top_line);
         assert!(
             !is_degenerate(&r),

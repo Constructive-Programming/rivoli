@@ -225,7 +225,9 @@ struct Args {
 /// `--moe-gain`'s band. A hand-written parser because clap's `range` value_parser is
 /// integers only, and an unchecked float here is the failure mode the band exists for.
 fn moe_gain_in_band(s: &str) -> Result<f32, String> {
-    let g: f32 = s.parse().map_err(|e| format!("{s:?} is not a float: {e}"))?;
+    let g: f32 = s
+        .parse()
+        .map_err(|e| format!("{s:?} is not a float: {e}"))?;
     if (0.5..=1.5).contains(&g) {
         Ok(g)
     } else {
@@ -623,7 +625,8 @@ fn main() -> Result<()> {
             info!(
                 "speculative decode OFF: {}",
                 match engine.has_mtp() {
-                    false => "this artifact carries no MTP head (re-run bin/fp8_to_i4 to \
+                    false =>
+                        "this artifact carries no MTP head (re-run bin/fp8_to_i4 to \
                               emit L78.i4 for int4/hybrid)",
                     true => "--trace routes once per layer and a verify pass routes twice",
                 }
@@ -755,7 +758,11 @@ fn main() -> Result<()> {
             writeln!(
                 w,
                 "# rivoli-ids v1 backend={} mode={} policy={} attn={} tokens={}",
-                if cfg!(feature = "vulkan") { "vulkan" } else { "rocm" },
+                if cfg!(feature = "vulkan") {
+                    "vulkan"
+                } else {
+                    "rocm"
+                },
                 cfg.mode,
                 cfg.cache_policy,
                 a_attn,

@@ -4,7 +4,7 @@
 //! it skips, so CI without a checkpoint stays green.
 #![allow(clippy::unwrap_used)]
 
-use rivoli::artifact::format::{Dtype, FormatMeta, ExpertSet, Safetensors, load_codebooks};
+use rivoli::artifact::format::{Dtype, ExpertSet, FormatMeta, Safetensors, load_codebooks};
 use rivoli::artifact::model::ModelConfig;
 use rivoli::artifact::quant::{VQ_ALIGN, VQ_DIM, VQ_K, vq_expert_bytes};
 use rivoli::artifact::tokenizer::Tokenizer;
@@ -22,9 +22,15 @@ fn artifact_dir() -> Option<String> {
     }
 }
 
-/// [`artifact_dir`] plus the tokenizer the two chat-framing tests both need.
-fn artifact_tokenizer() -> Option<Tokenizer> {
-    Some(Tokenizer::load(&artifact_dir()?).unwrap())
+/// Run `body` with the artifact's tokenizer, or skip.
+///
+/// A combinator rather than an `Option`-returning getter because the two chat-framing
+/// tests are gated identically, and `let Some(tok) = … else { return }` written twice is
+/// two places for the skip path to stop matching the message [`artifact_dir`] prints.
+fn with_tokenizer(body: impl FnOnce(&Tokenizer)) {
+    if let Some(dir) = artifact_dir() {
+        body(&Tokenizer::load(&dir).unwrap());
+    }
 }
 
 #[test]
@@ -109,7 +115,10 @@ fn i4_bytes_are_what_the_checkpoint_quantizes_to() {
         return;
     };
     if prov.chain != "fp8->int4" {
-        eprintln!("skip i4_bytes: chain is {} — only fp8->int4 is byte-checkable here", prov.chain);
+        eprintln!(
+            "skip i4_bytes: chain is {} — only fp8->int4 is byte-checkable here",
+            prov.chain
+        );
         return;
     }
     let Ok(src) = Safetensors::open_dir(&prov.src) else {
@@ -167,7 +176,10 @@ fn i4_bytes_are_what_the_checkpoint_quantizes_to() {
             );
         }
     }
-    eprintln!("i4 bytes OK: L{layer:02} experts 0 and {ne} (shared) are bit-exact vs {}", prov.src);
+    eprintln!(
+        "i4 bytes OK: L{layer:02} experts 0 and {ne} (shared) are bit-exact vs {}",
+        prov.src
+    );
 }
 
 /// The chat framing must match the CHECKPOINT's `chat_template.jinja` byte for byte.
@@ -180,41 +192,62 @@ fn i4_bytes_are_what_the_checkpoint_quantizes_to() {
 #[test]
 fn chat_framing_matches_the_checkpoint_template() {
     use rivoli::artifact::tokenizer::ChatOpts;
-    let Some(tok) = artifact_tokenizer() else { return };
-    // Decoding with specials rendered is what makes this readable as the template's output.
-    let render = |turns: &[(&str, &str)], o: &ChatOpts| {
-        tok.decode_all(&tok.encode_chat_turns(turns, o).unwrap()).unwrap()
-    };
+    with_tokenizer(|tok| {
+        // Decoding with specials rendered is what makes this readable as the template's output.
+        let render = |turns: &[(&str, &str)], o: &ChatOpts| {
+            tok.decode_all(&tok.encode_chat_turns(turns, o).unwrap())
+                .unwrap()
+        };
+        // The three thinking cases differ ONLY in `reasoning_effort`, so that is the only
+        // thing spelled per case: three copies of the surrounding `ChatOpts` would let one
+        // of them silently stop setting `thinking`, and the expected strings would still
+        // look like they were asserting the effort word.
+        let thinking = |effort: Option<&str>| {
+            render(
+                &[("user", "hi")],
+                &ChatOpts {
+                    thinking: true,
+                    reasoning_effort: effort,
+                    ..Default::default()
+                },
+            )
+        };
 
-    // enable_thinking=false: no Reasoning Effort turn, and the prompt closes <think> at once.
-    assert_eq!(
-        render(&[("user", "hi")], &ChatOpts::default()),
-        "[gMASK]<sop><|user|>hi<|assistant|><think></think>"
-    );
-    // The template's own default: <think> left OPEN, preceded by the effort system turn.
-    assert_eq!(
-        render(&[("user", "hi")], &ChatOpts { thinking: true, ..Default::default() }),
-        "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hi<|assistant|><think>"
-    );
-    // Only "high" is High. The template capitalizes its default for everything else, so
-    // "low" and "medium" render Max — that is the template's behaviour, not a shortcut.
-    assert_eq!(
-        render(&[("user", "hi")], &ChatOpts { thinking: true, reasoning_effort: Some("high"), ..Default::default() }),
-        "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>hi<|assistant|><think>"
-    );
-    assert_eq!(
-        render(&[("user", "hi")], &ChatOpts { thinking: true, reasoning_effort: Some("low"), ..Default::default() }),
-        "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hi<|assistant|><think>"
-    );
-    // Multi-turn: NO separator after any role token, and history's reasoning is cleared.
-    assert_eq!(
-        render(
-            &[("system", "S"), ("user", "a"), ("assistant", "b"), ("user", "c")],
-            &ChatOpts::default()
-        ),
-        "[gMASK]<sop><|system|>S<|user|>a<|assistant|><think></think>b<|user|>c\
-         <|assistant|><think></think>"
-    );
+        // enable_thinking=false: no Reasoning Effort turn, and the prompt closes <think> at once.
+        assert_eq!(
+            render(&[("user", "hi")], &ChatOpts::default()),
+            "[gMASK]<sop><|user|>hi<|assistant|><think></think>"
+        );
+        // The template's own default: <think> left OPEN, preceded by the effort system turn.
+        assert_eq!(
+            thinking(None),
+            "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hi<|assistant|><think>"
+        );
+        // Only "high" is High. The template capitalizes its default for everything else, so
+        // "low" and "medium" render Max — that is the template's behaviour, not a shortcut.
+        assert_eq!(
+            thinking(Some("high")),
+            "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>hi<|assistant|><think>"
+        );
+        assert_eq!(
+            thinking(Some("low")),
+            "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hi<|assistant|><think>"
+        );
+        // Multi-turn: NO separator after any role token, and history's reasoning is cleared.
+        assert_eq!(
+            render(
+                &[
+                    ("system", "S"),
+                    ("user", "a"),
+                    ("assistant", "b"),
+                    ("user", "c")
+                ],
+                &ChatOpts::default()
+            ),
+            "[gMASK]<sop><|system|>S<|user|>a<|assistant|><think></think>b<|user|>c\
+             <|assistant|><think></think>"
+        );
+    });
 }
 
 /// The TOOL half of the same template, pinned the same way and for the same reason. The
@@ -227,8 +260,6 @@ fn chat_framing_matches_the_checkpoint_template() {
 fn tool_framing_matches_the_checkpoint_template() {
     use rivoli::artifact::tokenizer::ChatOpts;
     use serde_json::json;
-    let Some(tok) = artifact_tokenizer() else { return };
-
     // `strict` is dropped by the template's own macro, as is `defer_loading`.
     let tools = json!([{"type": "function", "function": {
         "name": "wx",
@@ -244,13 +275,6 @@ fn tool_framing_matches_the_checkpoint_template() {
         ),
         ("observation", "<tool_response>18C</tool_response>"),
     ];
-    let got = tok
-        .decode_all(
-            &tok.encode_chat_turns(&turns, &ChatOpts { tools: Some(&tools), ..Default::default() })
-                .unwrap(),
-        )
-        .unwrap();
-
     let want = concat!(
         "[gMASK]<sop>",
         "<|system|>\n# Tools\n\n",
@@ -267,5 +291,19 @@ fn tool_framing_matches_the_checkpoint_template() {
         "<|observation|><tool_response>18C</tool_response>",
         "<|assistant|><think></think>",
     );
-    assert_eq!(got, want);
+    with_tokenizer(|tok| {
+        let got = tok
+            .decode_all(
+                &tok.encode_chat_turns(
+                    &turns,
+                    &ChatOpts {
+                        tools: Some(&tools),
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(got, want);
+    });
 }

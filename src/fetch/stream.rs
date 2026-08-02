@@ -122,7 +122,11 @@ mod stage {
         let rc = unsafe {
             ffi::rivoli_memcpy_h2d_async(dst as *mut c_void, src as *const c_void, n as u64, stream)
         };
-        if rc == 0 { Ok(()) } else { Err(format!("hip rc {rc}")) }
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(format!("hip rc {rc}"))
+        }
     }
 }
 
@@ -198,7 +202,8 @@ mod stage {
         let Ok(mut reg) = ARENAS.lock() else {
             return std::ptr::null_mut();
         };
-        reg.get_or_insert_with(HashMap::new).insert(host as usize, buf);
+        reg.get_or_insert_with(HashMap::new)
+            .insert(host as usize, buf);
         host
     }
 

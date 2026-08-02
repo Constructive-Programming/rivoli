@@ -339,7 +339,10 @@ mod timeline_tests {
         // If the wait had passed vacuously this would resolve regardless; the value check
         // below is what distinguishes "waited" from "did not block".
         block_on(stream_signal(a.raw()).expect("completion"));
-        assert!(t.completed() >= 1, "the waited-on value must have been reached");
+        assert!(
+            t.completed() >= 1,
+            "the waited-on value must have been reached"
+        );
     }
 
     /// **INV-6: a wait can always be released, so a dead producer cannot hang the device.**
@@ -360,14 +363,31 @@ mod timeline_tests {
         let s = HipStream::new().expect("stream");
         // The wait goes in first, against a value NOTHING on any stream will ever signal —
         // this is the dead-producer case, not a race with a slow one.
-        t.wait(s.raw(), 7).expect("wait enqueues against a value no stream will write");
+        // jscpd:ignore-start — INV-4's two halves. `tests/vk.rs` asserts the SAME property
+        // against the Vulkan timeline, and the assertions are identical because the
+        // invariant is: a wait enqueued before anything signals must still retire, and a
+        // release must never move a timeline backwards. `rocm` and `vulkan` are mutually
+        // exclusive features, so there is no module where one copy could compile for both —
+        // a shared helper is not available at any price. Same category as the ABI walls in
+        // hip.rs/vk.rs, and the reason INV-4 is registered once in architecture.md §8b
+        // while being tested twice.
+        t.wait(s.raw(), 7)
+            .expect("wait enqueues against a value no stream will write");
         t.release(7);
         block_on(stream_signal(s.raw()).expect("completion"));
-        assert!(t.completed() >= 7, "the host release must be what retired the wait");
+        assert!(
+            t.completed() >= 7,
+            "the host release must be what retired the wait"
+        );
         // Monotone: releasing backwards would un-free a slot another consumer is gated on,
         // turning a clean teardown into the deadlock it exists to prevent.
         t.release(3);
-        assert_eq!(t.completed(), 7, "release must never move a timeline backwards");
+        assert_eq!(
+            t.completed(),
+            7,
+            "release must never move a timeline backwards"
+        );
+        // jscpd:ignore-end
     }
 
     /// Values only move forward, and `completed()` observes them without a sync — the
@@ -380,6 +400,10 @@ mod timeline_tests {
             t.signal(s.raw(), v).expect("signal");
         }
         block_on(stream_signal(s.raw()).expect("completion"));
-        assert_eq!(t.completed(), 4, "the last value written must be observable");
+        assert_eq!(
+            t.completed(),
+            4,
+            "the last value written must be observable"
+        );
     }
 }

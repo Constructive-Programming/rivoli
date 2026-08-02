@@ -16,6 +16,33 @@ pub fn read_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// The entry contract every `matvec_*` oracle below shares: one `y` per output row, one
+/// `x` per input column. Each oracle then asserts its OWN packed array against the
+/// geometry it just derived, which is why those checks stay at the call sites.
+///
+/// Debug-only, because these are oracles and `bin/i4_audit` sweeps them per expert per
+/// layer — a release-mode length check would be pure cost on a path that only ever runs
+/// against arrays this module also built. `#[track_caller]` so a failure names the oracle
+/// that was mis-called rather than this line.
+#[track_caller]
+fn debug_check_gemv(y: &[f32], x: &[f32], o_dim: usize, i_dim: usize) {
+    debug_assert_eq!(y.len(), o_dim);
+    debug_assert_eq!(x.len(), i_dim);
+}
+
+/// The row loop the two BYTE-per-weight oracles share: `packed` is `y.len()` rows of
+/// `i_dim` bytes, row-major, and `row_dot` turns row `o` into its output element.
+///
+/// Only the decode differs — an e4m3 byte against a block scale, a signed byte against a
+/// row scale — and both spelled out the same `zip(chunks_exact(i_dim))` accumulate. The
+/// int4 and VQ oracles do NOT use it: their rows are packed sub-byte, so `i_dim` is not
+/// their row stride.
+fn matvec_bytes(y: &mut [f32], packed: &[u8], i_dim: usize, row_dot: impl Fn(usize, &[u8]) -> f32) {
+    for (o, (yo, row)) in y.iter_mut().zip(packed.chunks_exact(i_dim)).enumerate() {
+        *yo = row_dot(o, row);
+    }
+}
+
 /// GEMV against an **fp8-e4m3** block-scaled matrix `W[o_dim, i_dim]` — the CPU
 /// oracle the HIP `gemv_fp8` kernel (attention/dense projections) is validated
 /// against. `scale` is the F32 `weight_scale_inv`, one value per `block × block`
@@ -30,13 +57,13 @@ pub fn matvec_fp8(
 ) {
     debug_assert_eq!(x.len(), i_dim);
     let sc_cols = i_dim.div_ceil(block);
-    for (o, (yo, row)) in y.iter_mut().zip(packed.chunks_exact(i_dim)).enumerate() {
+    matvec_bytes(y, packed, i_dim, |o, row| {
         let mut acc = 0.0f32;
         for (i, (&b, &xi)) in row.iter().zip(x).enumerate() {
             acc += e4m3_to_f32(b) * scale[(o / block) * sc_cols + i / block] * xi;
         }
-        *yo = acc;
-    }
+        acc
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -202,6 +229,23 @@ pub struct VqProj<'a> {
     pub i_dim: usize,
 }
 
+impl VqProj<'_> {
+    /// The borrowed group scales as the little-endian bf16 WORDS [`matvec_vq`] takes.
+    ///
+    /// Allocates, so it is for offline and test use only — the decode path never calls it
+    /// (`matvec_vq` is handed words the loader already has, and [`vq_decode_proj`] reads
+    /// the two bytes in place). It exists because the byte→word convention is THIS
+    /// module's: every caller that re-spelled `u16::from_le_bytes` over `chunks_exact(2)`
+    /// was a copy of a layout rule that belongs here, and one of them lives in a binary
+    /// that never sees a change to this format.
+    pub fn scales_u16(&self) -> Vec<u16> {
+        self.scales
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect()
+    }
+}
+
 /// Slice expert `e`'s three [`VqProj`] out of a per-layer `.vq3` buffer (`n_experts`
 /// blocks at [`vq_expert_stride`]). The layout the converter writes: each expert is
 /// `gate ‖ up ‖ down`, each projection indices-then-scales.
@@ -268,7 +312,6 @@ pub fn dequant_fp8_block(
     }
     out
 }
-
 
 /// The closed-form group refit: least-squares `s = Σ w·c / Σ c·c` over the codebook
 /// entries `idxs` already chose for `seg`, returned as bf16. `None` when the fit is
@@ -373,11 +416,10 @@ pub fn matvec_vq(
     o_dim: usize,
     i_dim: usize,
 ) {
-    debug_assert_eq!(y.len(), o_dim);
-    debug_assert_eq!(x.len(), i_dim);
     let ngroups = i_dim / VQ_GROUP;
     let nsub = i_dim / VQ_DIM;
     let rb = vq_row_bytes(i_dim);
+    debug_check_gemv(y, x, o_dim, i_dim);
     for (o, yo) in y.iter_mut().enumerate() {
         let ir = &indices[o * rb..(o + 1) * rb];
         let mut acc = 0.0f32;
@@ -575,13 +617,30 @@ pub fn i4_row_bytes(i_dim: usize) -> usize {
     i_dim.div_ceil(2)
 }
 
+// jscpd:ignore-start — the four `matvec_*` oracles' PARAMETER LISTS. `matvec_i4` and
+// `matvec_i8` take character-identical arguments (`y, x, packed, scale, o_dim, i_dim`),
+// which rustfmt expands past 100 columns into eight lines — enough to clone against each
+// other and against a caller's. No BODY duplication remains: the shared row loop is
+// `matvec_bytes` and the shared entry contract is `debug_check_gemv`.
+//
+// The honest fix is a `Weights<'_>` sum type (`Fp8{packed,scale,block} | I4{..} | I8{..} |
+// Vq{..}`), which would also make "int4 scales with an int8 packed array" unrepresentable
+// — worth doing, but it rewrites call sites in i4_audit, convert, tests/kernel.rs and
+// tests/common. Renaming a parameter to break the hash was the alternative and is exactly
+// the masking this gate exists to undo.
 /// Reference int4 GEMV `y[o] = Σ_i x[i]·(nibble(o,i) − 8)·scale[o, i/I4_GROUP]` — the
 /// CPU oracle the `moe_gateup_i4`/`moe_down_i4` kernels validate against. `scale` is
 /// `o_dim · i4_groups(i_dim)` f32, row-major.
-pub fn matvec_i4(y: &mut [f32], x: &[f32], packed: &[u8], scale: &[f32], o_dim: usize, i_dim: usize) {
-    debug_assert_eq!(y.len(), o_dim);
-    debug_assert_eq!(x.len(), i_dim);
+pub fn matvec_i4(
+    y: &mut [f32],
+    x: &[f32],
+    packed: &[u8],
+    scale: &[f32],
+    o_dim: usize,
+    i_dim: usize,
+) {
     let (rb, ng) = (i4_row_bytes(i_dim), i4_groups(i_dim));
+    debug_check_gemv(y, x, o_dim, i_dim);
     debug_assert_eq!(scale.len(), o_dim * ng);
     for (o, yo) in y.iter_mut().enumerate() {
         let row = &packed[o * rb..(o + 1) * rb];
@@ -599,18 +658,26 @@ pub fn matvec_i4(y: &mut [f32], x: &[f32], packed: &[u8], scale: &[f32], o_dim: 
 /// Reference int8 GEMV `y[o] = scale[o] · Σ_i x[i]·(i8)packed[o·i_dim+i]` — the CPU
 /// oracle for the `gemv_i8` kernel (lm_head → logits). `packed` is raw bytes
 /// reinterpreted as signed, matching the kernel's `signed char`.
-pub fn matvec_i8(y: &mut [f32], x: &[f32], packed: &[u8], scale: &[f32], o_dim: usize, i_dim: usize) {
-    debug_assert_eq!(y.len(), o_dim);
-    debug_assert_eq!(x.len(), i_dim);
+pub fn matvec_i8(
+    y: &mut [f32],
+    x: &[f32],
+    packed: &[u8],
+    scale: &[f32],
+    o_dim: usize,
+    i_dim: usize,
+) {
+    debug_check_gemv(y, x, o_dim, i_dim);
     debug_assert_eq!(packed.len(), o_dim * i_dim);
-    for (o, (yo, row)) in y.iter_mut().zip(packed.chunks_exact(i_dim)).enumerate() {
+    matvec_bytes(y, packed, i_dim, |o, row| {
         let mut acc = 0.0f32;
         for (&b, &xi) in row.iter().zip(x) {
             acc += xi * (b as i8) as f32;
         }
-        *yo = acc * scale[o];
-    }
+        // Row scale applied to the finished dot, exactly as before: `scale[o] · Σ …`.
+        acc * scale[o]
+    });
 }
+// jscpd:ignore-end
 
 /// Quantize `w[o_dim·i_dim]` (row-major) → group-scaled symmetric int4 (packed bytes
 /// plus `o_dim · i4_groups(i_dim)` f32 scales). Per group of [`I4_GROUP`] weights along
@@ -733,7 +800,10 @@ pub fn i4_slot_offsets(hidden: usize, moe_inter: usize) -> [usize; 6] {
 /// projection; a short `scale` would leave the tail of the span holding the PREVIOUS
 /// projection's bytes, so the lengths are checked rather than trusted.
 pub fn write_i4_proj(slot: &mut [u8], off: &[usize; 6], k: usize, packed: &[u8], scale: &[f32]) {
-    debug_assert!(off[k * 2] + packed.len() <= off[k * 2 + 1], "packed overruns its span");
+    debug_assert!(
+        off[k * 2] + packed.len() <= off[k * 2 + 1],
+        "packed overruns its span"
+    );
     // The scale span must END where the next projection begins (and the last one
     // inside the slot): a `scale` sized for a different `I4_GROUP` would otherwise
     // run into — or leave stale bytes in — the neighbouring projection.
@@ -744,7 +814,10 @@ pub fn write_i4_proj(slot: &mut [u8], off: &[usize; 6], k: usize, packed: &[u8],
     }
     let po = off[k * 2];
     slot[po..po + packed.len()].copy_from_slice(packed);
-    write_le_scales(&mut slot[off[k * 2 + 1]..], scale.iter().map(|s| s.to_le_bytes()));
+    write_le_scales(
+        &mut slot[off[k * 2 + 1]..],
+        scale.iter().map(|s| s.to_le_bytes()),
+    );
 }
 
 #[cfg(test)]
@@ -807,7 +880,10 @@ mod tests {
                     "row {o} group {g}: max round-trip error {err:.6e} exceeds half a step ({:.6e})",
                     s * 0.5
                 );
-                assert!(err > 0.0, "row {o} group {g}: zero error means no rounding happened");
+                assert!(
+                    err > 0.0,
+                    "row {o} group {g}: zero error means no rounding happened"
+                );
             }
         }
         // The GEMV oracle and the dense reconstruction must agree on the same bytes.
@@ -816,7 +892,10 @@ mod tests {
         matvec_i4(&mut y, &x, &packed, &scale, o_dim, i_dim);
         for (o, &yo) in y.iter().enumerate() {
             let want: f32 = (0..i_dim).map(|i| back[o * i_dim + i] * x[i]).sum();
-            assert!((yo - want).abs() <= 1e-4 * want.abs().max(1.0), "row {o}: {yo} != {want}");
+            assert!(
+                (yo - want).abs() <= 1e-4 * want.abs().max(1.0),
+                "row {o}: {yo} != {want}"
+            );
         }
     }
 
@@ -865,7 +944,8 @@ mod tests {
             .chunks_exact(i_dim)
             .flat_map(|row| {
                 let s = row.iter().fold(0f32, |m, v| m.max(v.abs())) / 7.0;
-                row.iter().map(move |&v| ((v / s).round() as i32).clamp(-8, 7) as f32 * s)
+                row.iter()
+                    .map(move |&v| ((v / s).round() as i32).clamp(-8, 7) as f32 * s)
             })
             .collect();
         let (r_rel, r_zero) = bulk(&per_row);
@@ -875,8 +955,14 @@ mod tests {
         );
         // The mechanism, not just the score: the per-row scale rounds nearly the whole
         // bulk to zero, the group scale rounds almost none of it.
-        assert!(r_zero > 0.9, "per-row bulk should be almost all zeros, got {r_zero:.3}");
-        assert!(g_zero < 0.1, "group bulk should barely round to zero, got {g_zero:.3}");
+        assert!(
+            r_zero > 0.9,
+            "per-row bulk should be almost all zeros, got {r_zero:.3}"
+        );
+        assert!(
+            g_zero < 0.1,
+            "group bulk should barely round to zero, got {g_zero:.3}"
+        );
     }
 
     #[test]
@@ -918,8 +1004,14 @@ mod tests {
         matvec_i4(&mut got, &x, &packed, &scale, o, i);
         // int4 group quant: err bounded by ~scale·Σ|x| worst case; check it tracks.
         let mx = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        let err = want.iter().zip(&got).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
-        assert!(err < 0.15 * mx + 0.1, "i4 roundtrip err={err:.3} max={mx:.3}");
+        let err = want
+            .iter()
+            .zip(&got)
+            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(
+            err < 0.15 * mx + 0.1,
+            "i4 roundtrip err={err:.3} max={mx:.3}"
+        );
     }
 
     #[test]
@@ -979,9 +1071,16 @@ mod tests {
             let mut y_ref = vec![0.0f32; *o_dim];
             // GEMV the SLICED projection (decoding its borrowed bf16 scale bytes) and
             // the ORIGINAL arrays — the converter→loader byte contract for an expert.
-            let ps: Vec<u16> =
-                proj.scales.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-            matvec_vq(&mut y_load, &x, proj.indices, &ps, &cb, proj.o_dim, proj.i_dim);
+            let ps = proj.scales_u16();
+            matvec_vq(
+                &mut y_load,
+                &x,
+                proj.indices,
+                &ps,
+                &cb,
+                proj.o_dim,
+                proj.i_dim,
+            );
             matvec_vq(&mut y_ref, &x, indices, scales, &cb, *o_dim, *i_dim);
             assert_eq!(y_load, y_ref);
         }

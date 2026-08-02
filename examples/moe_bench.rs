@@ -22,11 +22,13 @@
 //! bottom is what the gating buys: a build with no backend produces a binary that says so.
 #![allow(clippy::expect_used)]
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
-use rivoli::backend::{Event, ExpertDesc, Stream, device_sync, launch_moe_acc_drain, launch_moe_expert_range};
+use rivoli::artifact::quant::{VQ_DIM, VQ_K, vq_expert_bytes, vq_slot_offsets};
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
+use rivoli::backend::{
+    Event, ExpertDesc, Stream, device_sync, launch_moe_acc_drain, launch_moe_expert_range,
+};
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
 use rivoli::memory::device::DeviceBuf;
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
-use rivoli::artifact::quant::{VQ_DIM, VQ_K, vq_expert_bytes, vq_slot_offsets};
 
 /// The engine's shapes (GLM-5.2): hidden 6144, moe_inter 2048, top-8 routed + 1 shared.
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
@@ -80,12 +82,19 @@ fn dev(b: &[u8]) -> DeviceBuf {
 
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
 fn main() {
-    let backend = if cfg!(feature = "vulkan") { "vulkan" } else { "rocm" };
+    let backend = if cfg!(feature = "vulkan") {
+        "vulkan"
+    } else {
+        "rocm"
+    };
     let slot = vq_expert_bytes(HIDDEN, INTER);
     let off = vq_slot_offsets(HIDDEN, INTER);
     println!("backend={backend}  hidden={HIDDEN} inter={INTER} ndesc={NDESC}");
-    println!("expert slot = {:.2} MB, {NDESC} experts = {:.2} MB read per call",
-             slot as f64 / 1e6, (slot * NDESC) as f64 / 1e6);
+    println!(
+        "expert slot = {:.2} MB, {NDESC} experts = {:.2} MB read per call",
+        slot as f64 / 1e6,
+        (slot * NDESC) as f64 / 1e6
+    );
 
     // One contiguous slab holding NDESC experts, exactly as the pool does.
     let weights = dev(&pattern(slot * NDESC, 0xA11CE));
@@ -98,7 +107,9 @@ fn main() {
     );
     let mut r = Rng(7);
     let x = dev(&f32b(
-        &(0..MAXROW * HIDDEN).map(|_| (r.next() >> 8) as f32 / 1e7).collect::<Vec<_>>(),
+        &(0..MAXROW * HIDDEN)
+            .map(|_| (r.next() >> 8) as f32 / 1e7)
+            .collect::<Vec<_>>(),
     ));
     // `wexpert[e·nrow + t]` — token row fastest. All-ones means every row routed to every
     // expert, i.e. the WORST case for batching: no row skips any expert's atomic.
@@ -130,9 +141,12 @@ fn main() {
         .iter()
         .flat_map(|d| {
             [
-                d.gate_indices as usize, d.gate_scales as usize,
-                d.up_indices as usize, d.up_scales as usize,
-                d.down_indices as usize, d.down_scales as usize,
+                d.gate_indices as usize,
+                d.gate_scales as usize,
+                d.up_indices as usize,
+                d.up_scales as usize,
+                d.down_indices as usize,
+                d.down_scales as usize,
             ]
             .iter()
             .flat_map(|p| p.to_le_bytes())
@@ -159,13 +173,20 @@ fn main() {
         let mut pass = || unsafe {
             for e in 0..(if per_expert { NDESC } else { 1 }) {
                 launch_moe_expert_range(
-                    x.ptr() as *const f32, HIDDEN, INTER,
+                    x.ptr() as *const f32,
+                    HIDDEN,
+                    INTER,
                     if per_expert { e } else { 0 },
                     if per_expert { 1 } else { NDESC },
                     dbuf.ptr() as *const ExpertDesc,
-                    cb0.ptr() as *const u16, cb1.ptr() as *const u16, cb2.ptr() as *const u16,
-                    w.ptr() as *const f32, h.ptr_mut() as *mut f32,
-                    acc.ptr_mut() as *mut u64, nrow, stream.raw(),
+                    cb0.ptr() as *const u16,
+                    cb1.ptr() as *const u16,
+                    cb2.ptr() as *const u16,
+                    w.ptr() as *const f32,
+                    h.ptr_mut() as *mut f32,
+                    acc.ptr_mut() as *mut u64,
+                    nrow,
+                    stream.raw(),
                 )
                 .expect("moe");
             }
@@ -175,7 +196,10 @@ fn main() {
                 launch_moe_acc_drain(
                     out.ptr_mut().add(t * HIDDEN * 4) as *mut f32,
                     acc.ptr_mut().add(t * HIDDEN * 8) as *mut u64,
-                    HIDDEN, 1, 1.0, stream.raw(),
+                    HIDDEN,
+                    1,
+                    1.0,
+                    stream.raw(),
                 )
                 .expect("drain");
             }
@@ -194,8 +218,8 @@ fn main() {
         ev1.record(stream.raw()).expect("ev1");
         device_sync().expect("sync");
         let wall_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
-        let gpu_us = f64::from(Event::elapsed_ms(&ev0, &ev1).expect("elapsed")) * 1000.0
-            / iters as f64;
+        let gpu_us =
+            f64::from(Event::elapsed_ms(&ev0, &ev1).expect("elapsed")) * 1000.0 / iters as f64;
         let gb = (slot * NDESC) as f64 / 1e9;
         // GPU time is the honest denominator where it is available; wall includes launch
         // cost, which is exactly the thing this bench is trying NOT to attribute to the
@@ -203,7 +227,8 @@ fn main() {
         println!(
             "{label:<14} wall {wall_us:8.1} us/call   gpu {gpu_us:8.1} us/call   \
              {:6.1} GB/s (gpu)   {:6.1} GB/s (wall)",
-            gb / (gpu_us * 1e-6) , gb / (wall_us * 1e-6),
+            gb / (gpu_us * 1e-6),
+            gb / (wall_us * 1e-6),
         );
         gpu_us
     };
@@ -222,10 +247,12 @@ fn main() {
         1.535 / (b2 / b1),
         1.535 / (p2 / p1),
     );
-    println!("\nNOTE: the pool is re-read from the same {:.0} MB every iteration, so this \
+    println!(
+        "\nNOTE: the pool is re-read from the same {:.0} MB every iteration, so this \
               is cache-warm relative to the engine, which streams 78 distinct experts. \
               Compare backends against each other, not against the in-engine moe bucket.",
-             (slot * NDESC) as f64 / 1e6);
+        (slot * NDESC) as f64 / 1e6
+    );
 }
 
 /// A build with no compute backend has no kernels to time.

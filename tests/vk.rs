@@ -39,24 +39,25 @@
 #![cfg(feature = "vulkan")]
 #![allow(clippy::expect_used)]
 
-use rivoli::memory::device::{DeviceBuf, DeviceTier};
-use rivoli::math::{E4M3_BLOCK, E4M3_MAX, e4m3_to_f32, f32_to_bf16, f32_to_e4m3, silu};
 use rivoli::backend::block_on;
 use rivoli::backend::vk::{
     Buf, ExpertDesc, Q, ROWS_PER_BLOCK, VALIDATION_ERRORS, device_sync, fill_u32, gpu,
-    launch_append_kv, launch_argmax,
-    launch_embed_i8_row, launch_flag_nonfinite, launch_gather_rope, launch_gemv_f32,
-    launch_gemv_fp8, launch_gemv_i8,
-    launch_attend, launch_index_append, launch_index_head_route, launch_index_pool_push,
-    launch_index_score, launch_index_topk, launch_layernorm, launch_mla_absorb_fp8,
-    launch_mla_value_fp8, launch_moe_expert_range, launch_moe_expert_range_i4,
-    launch_moe_acc_drain, launch_rmsnorm, launch_rope,
+    launch_append_kv, launch_argmax, launch_attend, launch_embed_i8_row, launch_flag_nonfinite,
+    launch_gather_rope, launch_gemv_f32, launch_gemv_fp8, launch_gemv_i8, launch_index_append,
+    launch_index_head_route, launch_index_pool_push, launch_index_score, launch_index_topk,
+    launch_layernorm, launch_mla_absorb_fp8, launch_mla_value_fp8, launch_moe_acc_drain,
+    launch_moe_expert_range, launch_moe_expert_range_i4, launch_rmsnorm, launch_rope,
     launch_swiglu, launch_vadd, launch_vaxpy, memcpy_dtod,
 };
+use rivoli::math::{E4M3_BLOCK, E4M3_MAX, e4m3_to_f32, f32_to_bf16, f32_to_e4m3, silu};
+use rivoli::memory::device::{DeviceBuf, DeviceTier};
 use std::sync::atomic::Ordering;
 
 mod common;
-use common::{Lcg, assert_close, block_scales, f32b, f32v, gemv_fp8_case, report, u16b, want_i8};
+use common::{
+    Att, Lcg, Mla, MoeRange, assert_close, block_scales, f32b, f32v, gemv_fp8_case, report, u16b,
+    want_i8,
+};
 
 /// Upload `b` to a fresh device buffer. Backend-typed, so it stays here rather than in
 /// `common`: this is `Buf` under Vulkan and `DeviceBuf` under HIP.
@@ -83,7 +84,8 @@ impl Shapes {
     fn close(&mut self, want: &[f32], got: &[f32], label: &str) {
         let (err, tol) = report(want, got, label);
         if err > tol {
-            self.bad.push(format!("{label}: err={err:.3e} > tol={tol:.3e}"));
+            self.bad
+                .push(format!("{label}: err={err:.3e} > tol={tol:.3e}"));
         }
     }
 
@@ -114,13 +116,25 @@ fn gemv(x: &Buf, w: &Buf, y: &mut Buf, o_dim: usize, i_dim: usize) -> Vec<u8> {
     read(y, o_dim)
 }
 
+/// A `Signal` armed on the FETCH queue, already recorded.
+///
+/// The two cross-queue tests below both hand-roll this handshake, and it is the thing they
+/// are actually testing rather than incidental setup — so it is spelled once, with one
+/// panic message, rather than twice with two.
+fn armed_on_fetch() -> rivoli::backend::Signal {
+    let sig = rivoli::backend::Signal::pending();
+    gpu()
+        .expect("vulkan init")
+        .arm_on(Q::Fetch, &sig)
+        .expect("arm on fetch");
+    sig
+}
+
 /// Enqueue only — no sync. Used to build a multi-dispatch command buffer.
 fn launch(x: &Buf, w: &Buf, y: &mut Buf, o_dim: usize, i_dim: usize) {
     // SAFETY: live Buf device addresses of the documented sizes; nothing is dropped
     // before the caller's device_sync.
-    unsafe {
-        launch_at(x.ptr() as *const f32, w.ptr() as *const f32, y.ptr_mut() as *mut f32, o_dim, i_dim)
-    }
+    unsafe { launch_at(x.ptr(), w.ptr(), y.ptr_mut(), o_dim, i_dim) }
 }
 
 /// The same dispatch from BARE device addresses, which is the arm [`launch`] cannot serve:
@@ -128,10 +142,14 @@ fn launch(x: &Buf, w: &Buf, y: &mut Buf, o_dim: usize, i_dim: usize) {
 /// hold a `DeviceBuf`. Those three sites plus `launch` are why the launcher's arguments are
 /// spelled here and nowhere else.
 ///
+/// Untyped `u8` addresses, so a caller passes `ptr()`/`ptr_mut()` straight through and the
+/// three f32 casts live here with the `unsafe` they justify rather than at each site.
+///
 /// # Safety
 /// `x` must address `i_dim` live f32, `w` `o_dim`·`i_dim`, `y` `o_dim`, all still mapped
 /// when the caller next joins.
-unsafe fn launch_at(x: *const f32, w: *const f32, y: *mut f32, o_dim: usize, i_dim: usize) {
+unsafe fn launch_at(x: *const u8, w: *const u8, y: *mut u8, o_dim: usize, i_dim: usize) {
+    let (x, w, y) = (x as *const f32, w as *const f32, y as *mut f32);
     unsafe { launch_gemv_f32(x, w, o_dim, i_dim, 1, y) }.expect("launch");
 }
 
@@ -147,53 +165,113 @@ fn gemv_case(r: &mut Lcg, o_dim: usize, i_dim: usize) -> (Vec<f32>, Vec<f32>, Ve
 }
 
 /// One `moe_acc_drain` on `stream`.
-fn drain(out: &mut Buf, acc: &mut Buf, n: usize, rows: usize, gain: f32, stream: *mut std::ffi::c_void) {
+fn drain(
+    out: &mut Buf,
+    acc: &mut Buf,
+    n: usize,
+    rows: usize,
+    gain: f32,
+    stream: *mut std::ffi::c_void,
+) {
     // SAFETY: live Buf device addresses holding `rows`·`n` u64 and `n` f32, both outliving
     // the caller's join.
     unsafe {
-        launch_moe_acc_drain(out.ptr_mut() as *mut f32, acc.ptr_mut() as *mut u64,
-                             n, rows, gain, stream)
+        launch_moe_acc_drain(
+            out.ptr_mut() as *mut f32,
+            acc.ptr_mut() as *mut u64,
+            n,
+            rows,
+            gain,
+            stream,
+        )
     }
     .expect("moe_acc_drain");
 }
 
 /// One `gemv_fp8` dispatch + sync, returning `bytes` of `y`.
 #[allow(clippy::too_many_arguments)]
-fn gemv_fp8(x: &Buf, p: &Buf, s: &Buf, y: &mut Buf,
-            o_dim: usize, i_dim: usize, block: usize, bytes: usize) -> Vec<u8> {
+fn gemv_fp8(
+    x: &Buf,
+    p: &Buf,
+    s: &Buf,
+    y: &mut Buf,
+    o_dim: usize,
+    i_dim: usize,
+    block: usize,
+    bytes: usize,
+) -> Vec<u8> {
     // SAFETY: live Buf device addresses of the documented sizes — `scale` is
     // ⌈o_dim/block⌉·⌈i_dim/block⌉ f32 — and nothing is dropped before the sync.
     unsafe {
-        launch_gemv_fp8(x.ptr() as *const f32, p.ptr(), s.ptr() as *const f32,
-                        o_dim, i_dim, block, 1, y.ptr_mut() as *mut f32)
+        launch_gemv_fp8(
+            x.ptr() as *const f32,
+            p.ptr(),
+            s.ptr() as *const f32,
+            o_dim,
+            i_dim,
+            block,
+            1,
+            y.ptr_mut() as *mut f32,
+        )
     }
     .expect("launch gemv_fp8");
-    device_sync().expect("sync");
-    readb(y, bytes)
+    sync_readb(y, bytes)
 }
 
 /// One `rmsnorm` dispatch + sync, returning `bytes` of `out`.
 fn rmsnorm(x: &Buf, w: &Buf, out: &mut Buf, n: usize, eps: f32, bytes: usize) -> Vec<u8> {
     // SAFETY: `x` and `w` are n f32 and `out` is at least `bytes`; all three outlive the sync.
     unsafe {
-        launch_rmsnorm(x.ptr() as *const f32, w.ptr() as *const f32, n, eps,
-                       out.ptr_mut() as *mut f32)
+        launch_rmsnorm(
+            x.ptr() as *const f32,
+            w.ptr() as *const f32,
+            n,
+            eps,
+            out.ptr_mut() as *mut f32,
+        )
     }
     .expect("launch rmsnorm");
-    device_sync().expect("sync");
-    readb(out, bytes)
+    sync_readb(out, bytes)
 }
 
+/// The three destination slabs one `append_kv` writes a row into.
+///
+/// Bundled, with the shape beside it as [`KvShape`], because this dispatch took NINE
+/// positional arguments and the reproducibility test forwards all nine through a closure
+/// to a second, differently-shaped case. Four bare `usize`s in a row is a transposition
+/// the type checker cannot see, and it would move the real case and the decoy together.
+struct KvDst<'a> {
+    lc8: &'a mut Buf,
+    lscale: &'a mut Buf,
+    rc: &'a mut Buf,
+}
+
+impl<'a> KvDst<'a> {
+    fn new(lc8: &'a mut Buf, lscale: &'a mut Buf, rc: &'a mut Buf) -> Self {
+        Self { lc8, lscale, rc }
+    }
+}
+
+/// `(pos, kvl, ropn, n_blocks)` — the row written and the strides it is written with.
+type KvShape = (usize, usize, usize, usize);
+
 /// One `append_kv` dispatch + sync.
-#[allow(clippy::too_many_arguments)]
-fn append_kv(lat: &Buf, rop: &Buf, lc8: &mut Buf, lscale: &mut Buf, rc: &mut Buf,
-             pos: usize, kvl: usize, ropn: usize, n_blocks: usize) {
+fn append_kv(lat: &Buf, rop: &Buf, dst: &mut KvDst<'_>, shape: KvShape) {
+    let (pos, kvl, ropn, n_blocks) = shape;
     // SAFETY: `lat` is kvl f32 and `rop` ropn f32; the three slabs hold whole rows of their
     // documented stride and row `pos` is in bounds. All five are borrowed for the call.
     unsafe {
-        launch_append_kv(lat.ptr() as *const f32, rop.ptr() as *const f32, lc8.ptr_mut(),
-                         lscale.ptr_mut() as *mut f32, rc.ptr_mut() as *mut u16,
-                         pos, kvl, ropn, n_blocks)
+        launch_append_kv(
+            lat.ptr() as *const f32,
+            rop.ptr() as *const f32,
+            dst.lc8.ptr_mut(),
+            dst.lscale.ptr_mut() as *mut f32,
+            dst.rc.ptr_mut() as *mut u16,
+            pos,
+            kvl,
+            ropn,
+            n_blocks,
+        )
     }
     .expect("launch append_kv");
     device_sync().expect("sync");
@@ -227,7 +305,10 @@ impl Scratch {
     /// device address rather than a pointer into the struct, so moving the `Scratch` out of
     /// here does not invalidate what it returned.
     fn new(bytes: usize) -> (Self, *const u8, *mut u8) {
-        let mut s = Self { src: dev(&vec![0u8; bytes]), dst: dev(&vec![0u8; bytes]) };
+        let mut s = Self {
+            src: dev(&vec![0u8; bytes]),
+            dst: dev(&vec![0u8; bytes]),
+        };
         let (p, q) = (s.src.ptr(), s.dst.ptr_mut());
         (s, p, q)
     }
@@ -235,6 +316,13 @@ impl Scratch {
 
 fn read(y: &Buf, n: usize) -> Vec<u8> {
     readb(y, n * 4)
+}
+
+/// Join, then read `bytes` of `y` — the launch/join/read-back tail every single-dispatch
+/// oracle here ends with. One place to forget the `device_sync`, rather than one per kernel.
+fn sync_readb(y: &Buf, bytes: usize) -> Vec<u8> {
+    device_sync().expect("sync");
+    readb(y, bytes)
 }
 
 /// `read` in BYTES. The fwd kernels write u8 and u16 as well as f32, and their
@@ -497,8 +585,16 @@ fn chained_dispatch_respects_the_barrier() {
         // then failed identically with AND without the barrier, which is what caught
         // it — see docs/measurement/probes/README.md, "A test built to fail needs its passing arm
         // checked too".)
-        let out = if STEPS.is_multiple_of(2) { &pong } else { &ping };
-        assert_close(&want, &f32v(&read(out, n)), &format!("{STEPS}-step chain #{rep}"));
+        let out = if STEPS.is_multiple_of(2) {
+            &pong
+        } else {
+            &ping
+        };
+        assert_close(
+            &want,
+            &f32v(&read(out, n)),
+            &format!("{STEPS}-step chain #{rep}"),
+        );
     }
     v.check("chained_dispatch");
 }
@@ -636,9 +732,7 @@ fn a_signal_covers_recorded_work_without_a_device_sync() {
     unsafe {
         rivoli::backend::vk::copy_h2d_async(y.host_mut(), x.host_mut(), 16).expect("async copy");
     }
-    let sig = rivoli::backend::Signal::pending();
-    gpu().expect("vulkan init").arm_on(Q::Fetch, &sig).expect("arm on fetch");
-    block_on(sig);
+    block_on(armed_on_fetch());
     let got = f32v(&{
         let mut out = Vec::new();
         y.read_into(&mut out, 16).expect("read back");
@@ -689,9 +783,7 @@ fn a_moe_dispatch_sees_what_the_fetch_queue_wrote() {
         rivoli::backend::vk::copy_h2d_async(staged.host_mut(), src.host_mut(), N * ROWS * 8)
             .expect("copy");
     }
-    let sig = rivoli::backend::Signal::pending();
-    gpu().expect("vulkan init").arm_on(Q::Fetch, &sig).expect("arm");
-    block_on(sig);
+    block_on(armed_on_fetch());
     // Now a dispatch on the MoE queue reads those bytes: out[o] = 3·Σ_r staged[r][o]/2^44 = 6.
     drain(&mut out, &mut staged, N, ROWS, 3.0, moe.raw());
     block_on(rivoli::backend::stream_signal(moe.raw()).expect("moe signal"));
@@ -737,7 +829,10 @@ fn timestamps_measure_gpu_time_and_refuse_when_absent() {
     let wall_ms = wall.elapsed().as_secs_f64() * 1000.0;
     let ms = rivoli::backend::Event::elapsed_ms(&start, &end).expect("elapsed");
     println!("VK TIMESTAMP span: {ms:.3} ms GPU against {wall_ms:.3} ms wall");
-    assert!(ms > 0.0, "GPU span measured {ms} ms — the query pool is not being written");
+    assert!(
+        ms > 0.0,
+        "GPU span measured {ms} ms — the query pool is not being written"
+    );
     // A sanity CEILING, not a comparison against `wall_ms`. The main queue is
     // process-global and cargo runs these tests on parallel threads, so another test's
     // dispatches can legitimately land between these two stamps and make the GPU span
@@ -832,9 +927,8 @@ fn an_unknown_stream_token_is_refused() {
     let mut y = dev(&[0u8; 64]);
     let p = y.ptr_mut() as *mut f32;
     // SAFETY: `Q::parse` runs before the argument guards and before any pointer is read.
-    let r = unsafe {
-        launch_moe_acc_drain(p, p as *mut u64, 8, 1, 1.0, 0x99 as *mut std::ffi::c_void)
-    };
+    let r =
+        unsafe { launch_moe_acc_drain(p, p as *mut u64, 8, 1, 1.0, 0x99 as *mut std::ffi::c_void) };
     assert!(
         r.is_err(),
         "a bogus stream token silently picked a queue instead of failing"
@@ -869,7 +963,7 @@ fn kernel_reads_weights_placed_through_the_tier() {
 
     // SAFETY: both are DEVICE addresses returned by `place`, sized as the launcher
     // documents, inside a tier that outlives the sync below.
-    unsafe { launch_at(xp as *const f32, wp as *const f32, yb.ptr_mut() as *mut f32, o_dim, i_dim) };
+    unsafe { launch_at(xp, wp, yb.ptr_mut(), o_dim, i_dim) };
     device_sync().expect("sync");
     assert_close(
         &want,
@@ -910,10 +1004,7 @@ fn copy_out_into_sees_the_dispatch_that_preceded_it() {
 
     // SAFETY: live device addresses of the documented sizes; nothing is dropped before
     // the copy_out_into below, which is what retires the dispatch.
-    unsafe {
-        launch_at(xb.ptr() as *const f32, wb.ptr() as *const f32, out.ptr_mut() as *mut f32,
-                  o_dim, i_dim)
-    };
+    unsafe { launch_at(xb.ptr(), wb.ptr(), out.ptr_mut(), o_dim, i_dim) };
     // NO device_sync here. That is the whole test.
     let mut host = Vec::new();
     out.copy_out_into(&mut host).expect("copy_out_into");
@@ -957,10 +1048,7 @@ fn copy_in_at_does_not_clobber_a_pending_dispatch() {
     let mut yb = dev(&f32b(&vec![0.0f32; o_dim]));
 
     // SAFETY: as above; `xb` outlives the sync inside copy_in_at.
-    unsafe {
-        launch_at(xb.ptr() as *const f32, wb.ptr() as *const f32, yb.ptr_mut() as *mut f32,
-                  o_dim, i_dim)
-    };
+    unsafe { launch_at(xb.ptr(), wb.ptr(), yb.ptr_mut(), o_dim, i_dim) };
     // Overwrite the INPUT the pending dispatch reads. copy_in_at must retire it first.
     xb.copy_in_at(0, &f32b(&x_new)).expect("clobber");
     device_sync().expect("sync");
@@ -981,23 +1069,24 @@ fn guards_reject_degenerate_arguments() {
     assert!(b.write_at(64, &[0u8; 1]).is_err(), "write at the end");
     // The bounds check must not wrap: off + len overflows usize here, and an
     // `off + len <= self.len` test would compute a small number and let it through.
-    assert!(b.write_at(usize::MAX, &[0u8; 8]).is_err(), "wrapping offset");
+    assert!(
+        b.write_at(usize::MAX, &[0u8; 8]).is_err(),
+        "wrapping offset"
+    );
     assert!(b.read_into(&mut Vec::new(), 65).is_err(), "overlong read");
 
     let mut y = dev(&[0u8; 16]);
-    // SAFETY: zero dims are rejected before any pointer is used.
-    unsafe {
-        assert!(
-            launch_gemv_f32(b.ptr() as *const f32, b.ptr() as *const f32, 0, 4, 1, y.ptr_mut() as *mut f32)
-                .is_err(),
-            "o_dim = 0 must be rejected"
-        );
-        assert!(
-            launch_gemv_f32(b.ptr() as *const f32, b.ptr() as *const f32, 4, 0, 1, y.ptr_mut() as *mut f32)
-                .is_err(),
-            "i_dim = 0 must be rejected"
-        );
-    }
+    // The same dispatch with one dim zeroed, so the two cases differ by exactly the
+    // argument under test and nothing else can be what rejected them.
+    let mut degenerate = |o_dim, i_dim| {
+        // SAFETY: zero dims are rejected before any pointer is used.
+        unsafe {
+            let p = b.ptr() as *const f32;
+            launch_gemv_f32(p, p, o_dim, i_dim, 1, y.ptr_mut() as *mut f32)
+        }
+    };
+    assert!(degenerate(0, 4).is_err(), "o_dim = 0 must be rejected");
+    assert!(degenerate(4, 0).is_err(), "i_dim = 0 must be rejected");
     // Rejecting a bad argument must not itself trip the layer — a guard that returns
     // Err while leaving a half-built Vulkan object behind would show up here.
     v.check("guards_reject_degenerate_arguments");
@@ -1045,11 +1134,16 @@ fn embed_i8_row_sign_extends_and_scales() {
         // vocab·hidden bytes, `scale` vocab f32, `x` hidden f32 plus the guard band.
         // Nothing is dropped before the sync.
         unsafe {
-            launch_embed_i8_row(pb.ptr(), sb.ptr() as *const f32, token, hidden, xb.ptr_mut() as *mut f32)
-                .expect("launch");
+            launch_embed_i8_row(
+                pb.ptr(),
+                sb.ptr() as *const f32,
+                token,
+                hidden,
+                xb.ptr_mut() as *mut f32,
+            )
+            .expect("launch");
         }
-        device_sync().expect("sync");
-        let got = readb(&xb, hidden * 4 + GUARD);
+        let got = sync_readb(&xb, hidden * 4 + GUARD);
         let label = format!("embed_i8_row token {token}");
         assert_untouched(&got, hidden * 4, &label);
         // A sign-extension bug is a 256·scale error and clears this tolerance by three
@@ -1084,11 +1178,17 @@ fn gather_rope_gathers_the_strided_segment() {
         // SAFETY: `q` is h·qh f32, `qrope` h·ropn f32 plus the guard band; both live
         // until the sync below.
         unsafe {
-            launch_gather_rope(qb.ptr() as *const f32, ob.ptr_mut() as *mut f32, h, qh, nope, ropn)
-                .expect("launch");
+            launch_gather_rope(
+                qb.ptr() as *const f32,
+                ob.ptr_mut() as *mut f32,
+                h,
+                qh,
+                nope,
+                ropn,
+            )
+            .expect("launch");
         }
-        device_sync().expect("sync");
-        let got = readb(&ob, out_bytes + GUARD);
+        let got = sync_readb(&ob, out_bytes + GUARD);
         let label = format!("gather_rope h{h} qh{qh} nope{nope} ropn{ropn}");
         assert_untouched(&got, out_bytes, &label);
         // BYTES, not `assert_close`. This kernel performs no arithmetic, so any
@@ -1176,7 +1276,12 @@ fn append_kv_input(kvl: usize, ropn: usize, seed: u64) -> (Vec<f32>, Vec<f32>) {
     // zero preservation without an execution mode, so a 0x0000 would be ambiguous
     // between a shader bug and a missing SignedZeroInfNanPreserve — untestable from
     // here, and a probe's job rather than an oracle's.
-    let specials = [1.0 + 2f32.powi(-8), 1.0 + 2f32.powi(-8) + 2f32.powi(-16), 0.0, 65504.0];
+    let specials = [
+        1.0 + 2f32.powi(-8),
+        1.0 + 2f32.powi(-8) + 2f32.powi(-16),
+        0.0,
+        65504.0,
+    ];
     rope[..specials.len()].copy_from_slice(&specials);
     (latent, rope)
 }
@@ -1257,53 +1362,72 @@ fn append_kv_quantizes_bit_exactly() {
         (1024, 100, 3, 2),
         (512, 300, 4, 1),
     ] {
-    let n_blocks = kvl / E4M3_BLOCK;
-    let (latent, rope) = append_kv_input(kvl, ropn, 0xA55);
-    let (want_lc8, want_scl, want_rc) = append_kv_oracle(&latent, &rope);
-    assert_quantization_is_unambiguous(&latent, &want_scl);
-    // The two branches the test exists for, asserted on the oracle so a future edit to
-    // `append_kv_input` cannot silently drop either.
-    assert_eq!(want_scl[1], 1.0, "block 1 must exercise the amax == 0 branch");
-    assert!(want_scl[2] > 1.0, "block 2 must exercise a large amax");
-
-    let (lb, rb) = (dev(&f32b(&latent)), dev(&f32b(&rope)));
-    // Whole slabs, poisoned. Rows other than `pos` are as much of a guard band as the
-    // trailing GUARD bytes: a row-offset bug lands in one of them, and an `i < ropn`
-    // check missing from the rope write spills straight into row pos+1 of `rc`.
-    let (lc8_n, lscale_n, rc_n) = (rows * kvl, rows * n_blocks * 4, rows * ropn * 2);
-    let mut lc8 = poison(lc8_n + GUARD);
-    let mut lscale = poison(lscale_n + GUARD);
-    let mut rc = poison(rc_n + GUARD);
-    append_kv(&lb, &rb, &mut lc8, &mut lscale, &mut rc, pos, kvl, ropn, n_blocks);
-    let g_lc8 = readb(&lc8, lc8_n + GUARD);
-    let g_scl = readb(&lscale, lscale_n + GUARD);
-    let g_rc = readb(&rc, rc_n + GUARD);
-
-    for (got, stride, name) in [
-        (&g_lc8, kvl, "lc8"),
-        (&g_scl, n_blocks * 4, "lscale"),
-        (&g_rc, ropn * 2, "rc"),
-    ] {
-        assert!(
-            got[..pos * stride].iter().all(|&b| b == 0xFF),
-            "append_kv {name}: wrote BEFORE row {pos}"
+        let n_blocks = kvl / E4M3_BLOCK;
+        let (latent, rope) = append_kv_input(kvl, ropn, 0xA55);
+        let (want_lc8, want_scl, want_rc) = append_kv_oracle(&latent, &rope);
+        assert_quantization_is_unambiguous(&latent, &want_scl);
+        // The two branches the test exists for, asserted on the oracle so a future edit to
+        // `append_kv_input` cannot silently drop either.
+        assert_eq!(
+            want_scl[1], 1.0,
+            "block 1 must exercise the amax == 0 branch"
         );
-        assert_untouched(got, (pos + 1) * stride, &format!("append_kv {name} row {pos}"));
-    }
-    assert_bytes(&want_lc8, &g_lc8[pos * kvl..(pos + 1) * kvl], "append_kv lc8");
-    assert_bytes(&want_rc, &g_rc[pos * ropn * 2..(pos + 1) * ropn * 2], "append_kv rc");
+        assert!(want_scl[2] > 1.0, "block 2 must exercise a large amax");
 
-    // The scale is the one float here — a division, for which Vulkan promises 2.5 ULP.
-    // Compared per element RELATIVE rather than through `assert_close`: these four
-    // scales span 1/448 to ~6.7, and a shared `mx` would hand the smallest of them
-    // three orders of magnitude of slack. 1e-6 is ~8 ULP.
-    let got_scl = f32v(&g_scl[pos * n_blocks * 4..(pos + 1) * n_blocks * 4]);
-    let rel = want_scl
-        .iter()
-        .zip(&got_scl)
-        .fold(0.0f32, |m, (w, g)| m.max((w - g).abs() / w.abs()));
-    println!("append_kv {kvl}/{ropn} lscale: max rel err={rel:.3e} tol=1.0e-6");
-    assert!(rel <= 1e-6, "append_kv lscale: rel err {rel:.3e} > 1e-6, want {want_scl:?} got {got_scl:?}");
+        let (lb, rb) = (dev(&f32b(&latent)), dev(&f32b(&rope)));
+        // Whole slabs, poisoned. Rows other than `pos` are as much of a guard band as the
+        // trailing GUARD bytes: a row-offset bug lands in one of them, and an `i < ropn`
+        // check missing from the rope write spills straight into row pos+1 of `rc`.
+        let (lc8_n, lscale_n, rc_n) = (rows * kvl, rows * n_blocks * 4, rows * ropn * 2);
+        let mut lc8 = poison(lc8_n + GUARD);
+        let mut lscale = poison(lscale_n + GUARD);
+        let mut rc = poison(rc_n + GUARD);
+        let mut dst = KvDst::new(&mut lc8, &mut lscale, &mut rc);
+        append_kv(&lb, &rb, &mut dst, (pos, kvl, ropn, n_blocks));
+        let g_lc8 = readb(&lc8, lc8_n + GUARD);
+        let g_scl = readb(&lscale, lscale_n + GUARD);
+        let g_rc = readb(&rc, rc_n + GUARD);
+
+        for (got, stride, name) in [
+            (&g_lc8, kvl, "lc8"),
+            (&g_scl, n_blocks * 4, "lscale"),
+            (&g_rc, ropn * 2, "rc"),
+        ] {
+            assert!(
+                got[..pos * stride].iter().all(|&b| b == 0xFF),
+                "append_kv {name}: wrote BEFORE row {pos}"
+            );
+            assert_untouched(
+                got,
+                (pos + 1) * stride,
+                &format!("append_kv {name} row {pos}"),
+            );
+        }
+        assert_bytes(
+            &want_lc8,
+            &g_lc8[pos * kvl..(pos + 1) * kvl],
+            "append_kv lc8",
+        );
+        assert_bytes(
+            &want_rc,
+            &g_rc[pos * ropn * 2..(pos + 1) * ropn * 2],
+            "append_kv rc",
+        );
+
+        // The scale is the one float here — a division, for which Vulkan promises 2.5 ULP.
+        // Compared per element RELATIVE rather than through `assert_close`: these four
+        // scales span 1/448 to ~6.7, and a shared `mx` would hand the smallest of them
+        // three orders of magnitude of slack. 1e-6 is ~8 ULP.
+        let got_scl = f32v(&g_scl[pos * n_blocks * 4..(pos + 1) * n_blocks * 4]);
+        let rel = want_scl
+            .iter()
+            .zip(&got_scl)
+            .fold(0.0f32, |m, (w, g)| m.max((w - g).abs() / w.abs()));
+        println!("append_kv {kvl}/{ropn} lscale: max rel err={rel:.3e} tol=1.0e-6");
+        assert!(
+            rel <= 1e-6,
+            "append_kv lscale: rel err {rel:.3e} > 1e-6, want {want_scl:?} got {got_scl:?}"
+        );
     }
     v.check("append_kv_quantizes_bit_exactly");
 }
@@ -1332,19 +1456,21 @@ fn append_kv_is_bit_reproducible() {
     let (mut dlc8, mut dlscale, mut drc) =
         (dev(&[0u8; E4M3_BLOCK]), dev(&[0u8; 4]), dev(&[0u8; 128]));
 
-    let run = |lat: &Buf, rop: &Buf, lc8: &mut Buf, lscale: &mut Buf, rc: &mut Buf,
-               pos: usize, kvl: usize, ropn: usize, n_blocks: usize| {
-        append_kv(lat, rop, lc8, lscale, rc, pos, kvl, ropn, n_blocks);
-        let mut out = readb(lc8, (pos + 1) * kvl);
-        out.extend(readb(lscale, (pos + 1) * n_blocks * 4));
-        out.extend(readb(rc, (pos + 1) * ropn * 2));
+    let run = |lat: &Buf, rop: &Buf, dst: &mut KvDst<'_>, shape: KvShape| {
+        append_kv(lat, rop, dst, shape);
+        let (pos, kvl, ropn, n_blocks) = shape;
+        let mut out = readb(dst.lc8, (pos + 1) * kvl);
+        out.extend(readb(dst.lscale, (pos + 1) * n_blocks * 4));
+        out.extend(readb(dst.rc, (pos + 1) * ropn * 2));
         out
     };
 
+    let mut real = KvDst::new(&mut lc8, &mut lscale, &mut rc);
+    let mut decoy = KvDst::new(&mut dlc8, &mut dlscale, &mut drc);
     let first = assert_bit_reproducible(
         "append_kv",
-        || run(&lb, &rb, &mut lc8, &mut lscale, &mut rc, pos, kvl, ropn, n_blocks),
-        || run(&dlb, &drb, &mut dlc8, &mut dlscale, &mut drc, 0, E4M3_BLOCK, 64, 1),
+        || run(&lb, &rb, &mut real, (pos, kvl, ropn, n_blocks)),
+        || run(&dlb, &drb, &mut decoy, (0, E4M3_BLOCK, 64, 1)),
     );
     // Row `pos` of lc8 alone — rows 0..pos are legitimately still zero, so checking the
     // whole buffer would be a weaker guard than it looks.
@@ -1367,8 +1493,12 @@ fn argmax_raw(logits: &[f32]) -> Vec<u8> {
     // SAFETY: `logits` is logits.len() f32; each output is one word plus a guard band.
     // All three live until the sync.
     unsafe {
-        launch_argmax(lb.ptr() as *const f32, logits.len(),
-                      ib.ptr_mut() as *mut i32, vb.ptr_mut() as *mut f32)
+        launch_argmax(
+            lb.ptr() as *const f32,
+            logits.len(),
+            ib.ptr_mut() as *mut i32,
+            vb.ptr_mut() as *mut f32,
+        )
     }
     .expect("launch argmax");
     device_sync().expect("sync");
@@ -1412,7 +1542,12 @@ fn argmax_matches_the_host_fold() {
 
     // n = 7: fewer elements than the 256-thread workgroup, so most lanes contribute
     // nothing but the identity and the LDS tree must not let one of them win.
-    chk_argmax("plateau -> lowest index", &[0.1, 0.5, 0.5, 0.3, 0.5, -1.0, 0.5], 1, 0.5);
+    chk_argmax(
+        "plateau -> lowest index",
+        &[0.1, 0.5, 0.5, 0.3, 0.5, -1.0, 0.5],
+        1,
+        0.5,
+    );
 
     let mut last = vec![-1.0f32; 1000];
     last[999] = 5.0;
@@ -1430,19 +1565,31 @@ fn argmax_matches_the_host_fold() {
 
     // NaN loses to any finite value: every compare against it is false, so it never
     // displaces the running best — including when it is the running best's only rival.
-    chk_argmax("NaN loses to finite", &[0.1, f32::NAN, 0.7, f32::NAN, 0.3, 0.7], 2, 0.7);
+    chk_argmax(
+        "NaN loses to finite",
+        &[0.1, f32::NAN, 0.7, f32::NAN, 0.3, 0.7],
+        2,
+        0.7,
+    );
     // Index 0 specifically: it is the identity's index, so a NaN there is the one
     // position where "NaN loses" and "ties go to the lowest index" could conspire.
     chk_argmax("NaN at index 0", &[f32::NAN, 0.2, 0.9, 0.4, -7.0], 2, 0.9);
 
     // Every element is the identity: only the tie rule decides, and logits[0] is -inf
     // so the returned value is exact rather than merely non-finite.
-    chk_argmax("all -inf", &vec![f32::NEG_INFINITY; 257], 0, f32::NEG_INFINITY);
+    chk_argmax(
+        "all -inf",
+        &vec![f32::NEG_INFINITY; 257],
+        0,
+        f32::NEG_INFINITY,
+    );
 
     // All negative — catches an oracle (or a shader) that initialises the running best
     // to 0 instead of -inf, which is invisible whenever any element is positive.
     chk_argmax("all negative", &[-5.0, -2.0, -9.0, -2.5, -1e30], 1, -2.0);
-    let big_neg: Vec<f32> = (0..1000).map(|i| -((i as f32 - 613.0).abs()) - 3.0).collect();
+    let big_neg: Vec<f32> = (0..1000)
+        .map(|i| -((i as f32 - 613.0).abs()) - 3.0)
+        .collect();
     chk_argmax("all negative at scale", &big_neg, 613, -3.0);
 
     // 100_003: ragged, ~391 grid-stride passes per lane, a NaN in lane 0's first slot,
@@ -1462,9 +1609,15 @@ fn argmax_matches_the_host_fold() {
     // value but a NON-FINITE one at a defined index, and the value is printed rather
     // than asserted so a change in it is visible without being a failure.
     let (gi, gv) = argmax(&vec![f32::NAN; 300]);
-    println!("argmax all-NaN: -> ({gi}, {gv}) bits {:#010x}", gv.to_bits());
+    println!(
+        "argmax all-NaN: -> ({gi}, {gv}) bits {:#010x}",
+        gv.to_bits()
+    );
     assert_eq!(gi, 0, "all-NaN: index");
-    assert!(!gv.is_finite(), "all-NaN: value {gv} is finite — the caller's bail would not fire");
+    assert!(
+        !gv.is_finite(),
+        "all-NaN: value {gv} is finite — the caller's bail would not fire"
+    );
 
     v.check("argmax_matches_the_host_fold");
 }
@@ -1530,14 +1683,20 @@ fn fwd_guards_reject_degenerate_arguments() {
     // The one-block per-128 reduction needs kvl a multiple of 128 in [128, 1024], and
     // the rope half rides the same block so ropn cannot exceed it.
     assert!(akv(64, 8, 1).is_err(), "append_kv kvl < 128");
-    assert!(akv(200, 8, 1).is_err(), "append_kv kvl not a multiple of 128");
+    assert!(
+        akv(200, 8, 1).is_err(),
+        "append_kv kvl not a multiple of 128"
+    );
     assert!(akv(1152, 8, 9).is_err(), "append_kv kvl > 1024");
     assert!(akv(256, 300, 2).is_err(), "append_kv ropn > kvl");
     // The one guard deliberately STRICTER than HIP: the shader packs u16 keys into u32
     // words, so an odd ropn would straddle a word and drop the tail. Untested until
     // now, which meant the divergence from HIP was asserted only in a comment.
     assert!(akv(256, 99, 2).is_err(), "append_kv odd ropn");
-    assert!(akv(256, 98, 2).is_ok(), "append_kv even ropn must still be accepted");
+    assert!(
+        akv(256, 98, 2).is_ok(),
+        "append_kv even ropn must still be accepted"
+    );
     // POSITIVE but wrong. Every previous n_blocks case was rejected by an earlier arm
     // (kvl > 1024 fires before the equality check), so `n_blocks == kvl/128` could have
     // been deleted with the whole suite still green.
@@ -1550,12 +1709,19 @@ fn fwd_guards_reject_degenerate_arguments() {
             launch_embed_i8_row(p, p as *const f32, 0, 0, a as *mut f32).is_err(),
             "embed_i8_row hidden = 0"
         );
-        assert!(launch_vadd(a as *mut f32, p as *const f32, 0).is_err(), "vadd n = 0");
+        assert!(
+            launch_vadd(a as *mut f32, p as *const f32, 0).is_err(),
+            "vadd n = 0"
+        );
         assert!(
             launch_argmax(p as *const f32, 0, a as *mut i32, b as *mut f32).is_err(),
             "argmax n = 0"
         );
-        for (h, qh, ropn, why) in [(0usize, 8usize, 8usize, "h"), (8, 0, 8, "qh"), (8, 8, 0, "ropn")] {
+        for (h, qh, ropn, why) in [
+            (0usize, 8usize, 8usize, "h"),
+            (8, 0, 8, "qh"),
+            (8, 8, 0, "ropn"),
+        ] {
             assert!(
                 launch_gather_rope(p as *const f32, a as *mut f32, h, qh, 0, ropn).is_err(),
                 "gather_rope {why} = 0"
@@ -1631,7 +1797,10 @@ fn swiglu_matches_silu_times_u() {
             } else {
                 readb(&hb, n * 4 + GUARD)
             };
-            let label = format!("swiglu n={n} {}", if alias { "aliased" } else { "distinct" });
+            let label = format!(
+                "swiglu n={n} {}",
+                if alias { "aliased" } else { "distinct" }
+            );
             assert_untouched(&out, n * 4, &label);
             assert_close(&want, &f32v(&out[..n * 4]), &label);
             // With distinct buffers `g` is an input and must come back untouched. BYTES
@@ -1640,7 +1809,11 @@ fn swiglu_matches_silu_times_u() {
             // that writes through the wrong pointer fail — in the aliased arm that bug
             // is invisible, because the wrong pointer is the right one.
             if !alias {
-                assert_bytes(&f32b(&g), &readb(&gb, n * 4), &format!("{label}: g unmodified"));
+                assert_bytes(
+                    &f32b(&g),
+                    &readb(&gb, n * 4),
+                    &format!("{label}: g unmodified"),
+                );
             }
         }
     }
@@ -1823,11 +1996,9 @@ fn rope_interleave_rotates_each_row() {
         // SAFETY: `base` is a live Buf device address holding count*stride f32 plus the
         // guard band; it outlives the sync.
         unsafe {
-            launch_rope(bb.ptr_mut() as *mut f32, count, stride, seg, pos, theta)
-                .expect("launch");
+            launch_rope(bb.ptr_mut() as *mut f32, count, stride, seg, pos, theta).expect("launch");
         }
-        device_sync().expect("sync");
-        let got = readb(&bb, bytes + GUARD);
+        let got = sync_readb(&bb, bytes + GUARD);
         let label = format!("rope c{count} st{stride} seg{seg} pos{pos}");
         assert_untouched(&got, bytes, &label);
 
@@ -1900,7 +2071,10 @@ fn linalg_guards_reject_degenerate_arguments() {
     // Odd seg: `half = seg/2` would truncate and the last element would never be read
     // or written, so the guard is the only thing standing between that and silence.
     assert!(rope(1, 16, 15).is_err(), "rope odd seg");
-    assert!(rope(1, 16, 16).is_ok(), "rope even seg must still be accepted");
+    assert!(
+        rope(1, 16, 16).is_ok(),
+        "rope even seg must still be accepted"
+    );
     // seg/2 > 1024 — one past the cap. The ACCEPTED boundary, seg = 2048, is exercised
     // for real in `rope_interleave_rotates_each_row` rather than here, where the 4096
     // byte buffer could not hold its output.
@@ -1909,7 +2083,10 @@ fn linalg_guards_reject_degenerate_arguments() {
     // bytes another block is mid-rotation on.
     assert!(rope(2, 8, 16).is_err(), "rope count > 1 with stride < seg");
     assert!(rope(1, 8, 16).is_ok(), "rope count = 1 ignores stride");
-    assert!(rope(2, 16, 16).is_ok(), "rope stride == seg must be accepted");
+    assert!(
+        rope(2, 16, 16).is_ok(),
+        "rope stride == seg must be accepted"
+    );
 
     // The quantised GEMVs' guards, none of which had a test. Two of them are this
     // backend's own additions rather than mirrors of a HIP arm — the word-alignment and
@@ -1922,17 +2099,35 @@ fn linalg_guards_reject_degenerate_arguments() {
     // are live 4096-byte Bufs regardless.
     unsafe {
         let fp8 = |o: usize, i: usize, block: usize, packed: *const u8| {
-            launch_gemv_fp8(p as *const f32, packed, p as *const f32, o, i, block, 1, q as *mut f32)
+            launch_gemv_fp8(
+                p as *const f32,
+                packed,
+                p as *const f32,
+                o,
+                i,
+                block,
+                1,
+                q as *mut f32,
+            )
         };
         assert!(fp8(0, 64, 128, p).is_err(), "gemv_fp8 o_dim = 0");
         assert!(fp8(8, 0, 128, p).is_err(), "gemv_fp8 i_dim = 0");
         assert!(fp8(8, 64, 0, p).is_err(), "gemv_fp8 block = 0");
         // blk_shift is a SHIFT, so a non-power-of-two tile would index the scale by a
         // floor rather than a quotient — mirrors HIP's 1003.
-        assert!(fp8(8, 64, 96, p).is_err(), "gemv_fp8 block not a power of two");
-        assert!(fp8(8, 64, 128, p).is_ok(), "gemv_fp8 power-of-two block must be accepted");
+        assert!(
+            fp8(8, 64, 96, p).is_err(),
+            "gemv_fp8 block not a power of two"
+        );
+        assert!(
+            fp8(8, 64, 128, p).is_ok(),
+            "gemv_fp8 power-of-two block must be accepted"
+        );
         // i_dim not a multiple of 4: row bases would stop being word-aligned after row 0.
-        assert!(fp8(8, 66, 128, p).is_err(), "gemv_fp8 i_dim not a multiple of 4");
+        assert!(
+            fp8(8, 66, 128, p).is_err(),
+            "gemv_fp8 i_dim not a multiple of 4"
+        );
         // A packed base that is not word-aligned. The shader's offsets are relative to
         // this address, so every word load would straddle. GPU-AV checks bounds, not
         // alignment, so nothing else would catch it.
@@ -1958,7 +2153,6 @@ fn linalg_guards_reject_degenerate_arguments() {
     // Err while leaving a half-built Vulkan object behind would show up here.
     v.check("linalg_guards_reject_degenerate_arguments");
 }
-
 
 // ---------------------------------------------------------------------------
 // linalg.hip: the quantised GEMVs
@@ -1989,14 +2183,12 @@ fn gemv_i8_matches_the_host_oracle() {
         let (xb, pb, sb) = (dev(&f32b(&x)), dev(&packed), dev(&f32b(&scale)));
         let mut yb = poison(o_dim * 4 + GUARD);
         // SAFETY: live Buf device addresses of the documented sizes; nothing dropped
-        // before the sync.
-        unsafe {
-            launch_gemv_i8(xb.ptr() as *const f32, pb.ptr(), sb.ptr() as *const f32,
-                           o_dim, i_dim, 1, yb.ptr_mut() as *mut f32)
-        }
-        .expect("launch");
-        device_sync().expect("sync");
-        let got = readb(&yb, o_dim * 4 + GUARD);
+        // before the sync. The addresses are taken first so the dispatch reads as one
+        // line — `yp` is a raw address, so `yb` is free to be borrowed again below.
+        let (xp, pp, sp) = (xb.ptr() as *const f32, pb.ptr(), sb.ptr() as *const f32);
+        let yp = yb.ptr_mut() as *mut f32;
+        unsafe { launch_gemv_i8(xp, pp, sp, o_dim, i_dim, 1, yp) }.expect("launch");
+        let got = sync_readb(&yb, o_dim * 4 + GUARD);
         let label = format!("gemv_i8 {o_dim}x{i_dim}");
         assert_untouched(&got, o_dim * 4, &label);
         assert_close(&want, &f32v(&got[..o_dim * 4]), &label);
@@ -2044,7 +2236,16 @@ fn gemv_fp8_matches_the_host_oracle() {
             gemv_fp8_case(&mut r, o_dim, i_dim, block, o_dim.div_ceil(block) * sc_cols);
         let (xb, pb, sb) = (dev(&f32b(&x)), dev(&packed), dev(&f32b(&scale)));
         let mut yb = poison(o_dim * 4 + GUARD);
-        let got = gemv_fp8(&xb, &pb, &sb, &mut yb, o_dim, i_dim, block, o_dim * 4 + GUARD);
+        let got = gemv_fp8(
+            &xb,
+            &pb,
+            &sb,
+            &mut yb,
+            o_dim,
+            i_dim,
+            block,
+            o_dim * 4 + GUARD,
+        );
         let label = format!("gemv_fp8 {geometry} {o_dim}x{i_dim}");
         assert_untouched(&got, o_dim * 4, &label);
         shapes.close(&want, &f32v(&got[..o_dim * 4]), &label);
@@ -2246,8 +2447,13 @@ fn oracle_wave_sum(partials: [f32; ORACLE_WAVE]) -> f32 {
 /// contracts differently, this is where it will show — as a bit mismatch, loudly, which
 /// is the point of asserting bit-identity rather than a tolerance.
 fn oracle_fp8_dot_strided(
-    x: &[f32], wrow: &[u8], scalerow: &[f32],
-    i_dim: usize, block: usize, start: usize, stride: usize,
+    x: &[f32],
+    wrow: &[u8],
+    scalerow: &[f32],
+    i_dim: usize,
+    block: usize,
+    start: usize,
+    stride: usize,
 ) -> f32 {
     let mut acc = 0.0f32;
     let n4 = i_dim >> 2;
@@ -2278,19 +2484,21 @@ fn oracle_fp8_dot_strided(
 ///
 /// Scale traversal: `i` is FIXED and the ROW varies with `d`, so this walks DOWN a column
 /// of the block-scale grid — the transpose of every other fp8 kernel here.
-#[allow(clippy::too_many_arguments)]
-fn mla_absorb_oracle(
-    q: &[f32], kvb: &[u8], kvb_scale: &[f32],
-    h: usize, qh: usize, nope: usize, vh: usize, kvl: usize, block: usize,
-) -> Vec<f32> {
-    assert!(h > 0 && qh > 0 && nope > 0 && vh > 0 && kvl > 0 && block > 0, "guard 1001");
-    assert!(block.is_power_of_two(), "guard 1003: blk_shift needs a power-of-two tile");
+fn mla_absorb_oracle(q: &[f32], kvb: &[u8], kvb_scale: &[f32], m: Mla) -> Vec<f32> {
+    let (h, qh, nope) = (m.h, m.qh, m.nope);
+    let (vh, kvl, block) = (m.vh, m.kvl, m.block);
+    m.assert_guarded();
+    assert!(qh > 0, "guard 1001");
     // NOT launcher-guarded, but the kernel reads q[head·qh .. +nope).
     assert!(qh >= nope, "q head stride {qh} shorter than nope {nope}");
 
-    let rows = h * (nope + vh);
+    let rows = m.rows();
     let sc_cols = kvl.div_ceil(block);
-    assert_eq!(kvb.len(), rows * kvl, "kv_b is [H·(nope+vh), kvl], row stride kvl BYTES");
+    assert_eq!(
+        kvb.len(),
+        rows * kvl,
+        "kv_b is [H·(nope+vh), kvl], row stride kvl BYTES"
+    );
     assert_eq!(kvb_scale.len(), rows.div_ceil(block) * sc_cols);
 
     let mut qabs = vec![0.0f32; h * kvl];
@@ -2321,19 +2529,23 @@ fn mla_absorb_oracle(
 ///
 /// Scale traversal: the ROW is fixed per output element and the COLUMN varies with `i` —
 /// the opposite of `mla_absorb_oracle`. The kernel hoists the row out; so does this.
-#[allow(clippy::too_many_arguments)]
-fn mla_value_oracle(
-    clat: &[f32], kvb: &[u8], kvb_scale: &[f32],
-    h: usize, nope: usize, vh: usize, kvl: usize, block: usize,
-) -> Vec<f32> {
-    assert!(h > 0 && nope > 0 && vh > 0 && kvl > 0 && block > 0, "guard 1001");
-    assert!(block.is_power_of_two(), "guard 1003: blk_shift needs a power-of-two tile");
+fn mla_value_oracle(clat: &[f32], kvb: &[u8], kvb_scale: &[f32], m: Mla) -> Vec<f32> {
+    let (h, nope, vh) = (m.h, m.nope, m.vh);
+    let (kvl, block) = (m.kvl, m.block);
+    m.assert_guarded();
     // Not launcher-guarded on the HIP side, but required for the dword load to be
     // well-defined: rows are `kvl` bytes apart, so an odd kvl misaligns every other row.
     // The Vulkan launcher DOES reject it — one place this backend is stricter.
-    assert_eq!(kvl % 4, 0, "kv_b rows must stay 4-byte aligned for the dword load");
+    assert_eq!(
+        kvl % 4,
+        0,
+        "kv_b rows must stay 4-byte aligned for the dword load"
+    );
     // Below 4, the dword group's single scale would straddle a scale-tile boundary.
-    assert!(block >= 4, "the 4-wide dword group must sit inside one scale tile");
+    assert!(
+        block >= 4,
+        "the 4-wide dword group must sit inside one scale tile"
+    );
 
     let rows = h * (nope + vh);
     let sc_cols = kvl.div_ceil(block);
@@ -2352,20 +2564,65 @@ fn mla_value_oracle(
 
         let mut lanes = [0.0f32; ORACLE_WAVE];
         for (lane, partial) in lanes.iter_mut().enumerate() {
-            *partial =
-                oracle_fp8_dot_strided(x, wrow, scalerow, kvl, block, lane, ORACLE_WAVE);
+            *partial = oracle_fp8_dot_strided(x, wrow, scalerow, kvl, block, lane, ORACLE_WAVE);
         }
         ctx[head * vh + j] = oracle_wave_sum(lanes);
     }
     ctx
 }
 
+/// The fp8 kv_b block and its block-scale grid, as device addresses.
+///
+/// The only two of these launchers' eleven arguments that always travel together, and
+/// pairing them is what keeps each wrapper's signature on ONE line — which is in turn what
+/// keeps the two from being two copies of the same five-line parameter list.
+#[derive(Clone, Copy)]
+struct KvPtr {
+    b: *const u8,
+    scale: *const f32,
+}
+
+impl KvPtr {
+    fn new(b: *const u8, scale: *const f32) -> Self {
+        Self { b, scale }
+    }
+}
+
+/// One `mla_absorb_fp8` dispatch, from BARE device addresses and `nrow = 1`.
+///
+/// Raw addresses because the two callers hold different things — the oracle test owns
+/// `Buf`s, the guard test dispatches from a [`Scratch`]'s pair of pointers — and this
+/// launcher's eleven arguments are worth spelling exactly once either way.
+///
+/// # Safety
+/// `q` addresses `h`·`qh` live f32, `kv.b` `Mla::rows()`·`kvl` bytes, `kv.scale` their
+/// block-scale grid, and `out` `h`·`kvl` f32; all four outlive the caller's next join.
+unsafe fn mla_absorb_at(m: Mla, q: *const f32, kv: KvPtr, out: *mut f32) -> anyhow::Result<()> {
+    let (b, sc) = (kv.b, kv.scale);
+    unsafe { launch_mla_absorb_fp8(q, b, sc, m.h, m.qh, m.nope, m.vh, m.kvl, m.block, 1, out) }
+}
+
+/// One `mla_value_fp8` dispatch, the same way. `qh` is absent: this kernel reads `clat`,
+/// which is already one contiguous `kvl` row per head.
+///
+/// # Safety
+/// As [`mla_absorb_at`], with `clat` addressing `h`·`kvl` f32 and `out` `h`·`vh`.
+unsafe fn mla_value_at(m: Mla, clat: *const f32, kv: KvPtr, out: *mut f32) -> anyhow::Result<()> {
+    let (b, sc) = (kv.b, kv.scale);
+    unsafe { launch_mla_value_fp8(clat, b, sc, m.h, m.nope, m.vh, m.kvl, m.block, 1, out) }
+}
+
 /// Buffers shared by both MLA oracles: fp8 weights, their block scales, and the f32 input.
 ///
 /// `rows` is the full kv_b row count, `h·(nope+vh)`; the block scale is a 2-D tile grid
 /// over (rows × kvl), so its length is `⌈rows/block⌉·⌈kvl/block⌉`.
-fn mla_inputs(seed: u64, xn: usize, rows: usize, kvl: usize, block: usize)
-    -> (Vec<f32>, Vec<u8>, Vec<f32>) {
+fn mla_inputs(
+    seed: u64,
+    xn: usize,
+    rows: usize,
+    kvl: usize,
+    block: usize,
+) -> (Vec<f32>, Vec<u8>, Vec<f32>) {
     let mut r = Lcg(seed);
     let x: Vec<f32> = (0..xn).map(|_| r.f()).collect();
     let kvb: Vec<u8> = (0..rows * kvl).map(|_| f32_to_e4m3(r.f())).collect();
@@ -2391,21 +2648,20 @@ fn mla_inputs(seed: u64, xn: usize, rows: usize, kvl: usize, block: usize)
 fn mla_value_fp8_matches_the_host_oracle() {
     let v = Validation::new();
     let (h, nope, vh, kvl, block) = (3usize, 8usize, 5usize, 256usize, 16usize);
-    let rows = h * (nope + vh);
-    let (clat, kvb, scale) = mla_inputs(0x5A1, h * kvl, rows, kvl, block);
+    let m = Mla::value_dims(h, nope, vh, kvl, block);
+    let (clat, kvb, scale) = mla_inputs(0x5A1, h * kvl, m.rows(), kvl, block);
 
-    let want = mla_value_oracle(&clat, &kvb, &scale, h, nope, vh, kvl, block);
+    let want = mla_value_oracle(&clat, &kvb, &scale, m);
 
     let (cb, kb, sb) = (dev(&f32b(&clat)), dev(&kvb), dev(&f32b(&scale)));
     let mut out = poison(h * vh * 4 + GUARD);
     // SAFETY: live Bufs of the documented sizes; `out` holds h·vh f32 plus a guard band.
     unsafe {
-        launch_mla_value_fp8(cb.ptr() as *const f32, kb.ptr(), sb.ptr() as *const f32,
-                             h, nope, vh, kvl, block, 1, out.ptr_mut() as *mut f32)
+        let kv = KvPtr::new(kb.ptr(), sb.ptr() as *const f32);
+        mla_value_at(m, cb.ptr() as *const f32, kv, out.ptr_mut() as *mut f32)
     }
     .expect("launch");
-    device_sync().expect("sync");
-    let got = readb(&out, h * vh * 4 + GUARD);
+    let got = sync_readb(&out, h * vh * 4 + GUARD);
     assert_untouched(&got, h * vh * 4, "mla_value_fp8");
     let got_f = f32v(&got[..h * vh * 4]);
     assert_close(&want, &got_f, "mla_value_fp8 h3 vh5 kvl256");
@@ -2428,21 +2684,20 @@ fn mla_value_fp8_matches_the_host_oracle() {
 fn mla_absorb_fp8_matches_the_host_oracle() {
     let v = Validation::new();
     let (h, qh, nope, vh, kvl, block) = (3usize, 12usize, 8usize, 5usize, 37usize, 16usize);
-    let rows = h * (nope + vh);
-    let (q, kvb, scale) = mla_inputs(0xAB50, h * qh, rows, kvl, block);
+    let m = Mla::new(h, qh, nope, vh, kvl, block);
+    let (q, kvb, scale) = mla_inputs(0xAB50, h * qh, m.rows(), kvl, block);
 
-    let want = mla_absorb_oracle(&q, &kvb, &scale, h, qh, nope, vh, kvl, block);
+    let want = mla_absorb_oracle(&q, &kvb, &scale, m);
 
     let (qb, kb, sb) = (dev(&f32b(&q)), dev(&kvb), dev(&f32b(&scale)));
     let mut out = poison(h * kvl * 4 + GUARD);
     // SAFETY: live Bufs of the documented sizes; `out` holds h·kvl f32 plus a guard band.
     unsafe {
-        launch_mla_absorb_fp8(qb.ptr() as *const f32, kb.ptr(), sb.ptr() as *const f32,
-                              h, qh, nope, vh, kvl, block, 1, out.ptr_mut() as *mut f32)
+        let kv = KvPtr::new(kb.ptr(), sb.ptr() as *const f32);
+        mla_absorb_at(m, qb.ptr() as *const f32, kv, out.ptr_mut() as *mut f32)
     }
     .expect("launch");
-    device_sync().expect("sync");
-    let got = readb(&out, h * kvl * 4 + GUARD);
+    let got = sync_readb(&out, h * kvl * 4 + GUARD);
     assert_untouched(&got, h * kvl * 4, "mla_absorb_fp8");
     let got_f = f32v(&got[..h * kvl * 4]);
     assert_close(&want, &got_f, "mla_absorb_fp8 h3 kvl37 nope8");
@@ -2468,6 +2723,19 @@ const ATT_MAX_SPLITS: usize = 16;
 const ATT_MIN_TILES_PER_SPLIT: usize = 4;
 const ATT_TARGET_BLOCKS: usize = 80;
 
+/// The attention's five input arrays: the per-head queries, then the token cache.
+///
+/// Owned rather than borrowed because every caller builds them from one [`att_inputs`]
+/// draw and then hands the same set to both the oracle and the kernel — which is the
+/// property that makes the comparison mean anything.
+struct AttIn {
+    qabs: Vec<f32>,
+    qrope: Vec<f32>,
+    lc8: Vec<u8>,
+    lscale: Vec<f32>,
+    rc: Vec<u16>,
+}
+
 /// `attn.hip::mla_plan_splits`, transliterated. The cut fixes which rows each split
 /// reduces, so it fixes the summation order and therefore the bits.
 fn att_plan(h: usize, nr: usize, have_scratch: bool) -> (usize, usize) {
@@ -2485,14 +2753,14 @@ fn att_plan(h: usize, nr: usize, have_scratch: bool) -> (usize, usize) {
 
 /// The staged tile, widened exactly as the shader widens it: latent fp8 × its per-128
 /// block scale, roped key bf16 → f32. `exp`-free, so this part is bit-exact.
-fn att_widen(
-    lc8: &[u8], lscale: &[f32], rc: &[u16],
-    t: usize, kvl: usize, rope: usize, n_blocks: usize,
-) -> (Vec<f32>, Vec<f32>) {
+fn att_widen(src: &AttIn, t: usize, d: Att) -> (Vec<f32>, Vec<f32>) {
+    let (kvl, rope, n_blocks) = (d.kvl, d.rope, d.n_blocks);
     let l: Vec<f32> = (0..kvl)
-        .map(|i| e4m3_to_f32(lc8[t * kvl + i]) * lscale[t * n_blocks + i / 128])
+        .map(|i| e4m3_to_f32(src.lc8[t * kvl + i]) * src.lscale[t * n_blocks + i / 128])
         .collect();
-    let r: Vec<f32> = (0..rope).map(|d| f32::from_bits((rc[t * rope + d] as u32) << 16)).collect();
+    let r: Vec<f32> = (0..rope)
+        .map(|d| f32::from_bits((src.rc[t * rope + d] as u32) << 16))
+        .collect();
     (l, r)
 }
 
@@ -2503,11 +2771,15 @@ fn att_widen(
 /// The accumulator update reproduces the FORCED contraction — a plain multiply for
 /// `acc*corr`, a fused multiply-add for `p*Lt` — matching what the shader now spells with
 /// an explicit `fma`, and what hipcc's ISA shows.
-#[allow(clippy::too_many_arguments)]
 fn att_split(
-    qa: &[f32], qr: &[f32], lc8: &[u8], lscale: &[f32], rc: &[u16], rows: Option<&[u32]>,
-    r_begin: usize, r_end: usize, kvl: usize, rope: usize, n_blocks: usize, scale: f32,
+    qa: &[f32],
+    qr: &[f32],
+    src: &AttIn,
+    rows: Option<&[u32]>,
+    (r_begin, r_end): (usize, usize),
+    d: Att,
 ) -> (Vec<f32>, f32, f32) {
+    let (kvl, rope, scale) = (d.kvl, d.rope, d.scale);
     let mut acc = vec![0.0f32; kvl];
     let mut m = f32::NEG_INFINITY;
     let mut l = 0.0f32;
@@ -2517,7 +2789,7 @@ fn att_split(
         let tcount = ATT_TILE.min(r_end - t0);
         for tt in 0..tcount {
             let t = rows.map_or(t0 + tt, |r| r[t0 + tt] as usize);
-            let (lt, rt) = att_widen(lc8, lscale, rc, t, kvl, rope, n_blocks);
+            let (lt, rt) = att_widen(src, t, d);
 
             // Per-lane strided partials: kvl first, then rope, into the SAME accumulator,
             // in that order — as the two loops in attn.hip do.
@@ -2557,24 +2829,18 @@ fn att_split(
 }
 
 /// CPU oracle for the whole attention, splits and all.
-#[allow(clippy::too_many_arguments)]
-fn attend_oracle(
-    qabs: &[f32], qrope: &[f32], lc8: &[u8], lscale: &[f32], rc: &[u16], rows: Option<&[u32]>,
-    h: usize, nr: usize, kvl: usize, rope: usize, n_blocks: usize, scale: f32,
-    have_scratch: bool,
-) -> Vec<f32> {
+fn attend_oracle(src: &AttIn, rows: Option<&[u32]>, d: Att, have_scratch: bool) -> Vec<f32> {
+    let (h, nr, kvl, rope) = (d.h, d.nr, d.kvl, d.rope);
     let (n_splits, tps) = att_plan(h, nr, have_scratch);
     let mut clat = vec![0.0f32; h * kvl];
     for head in 0..h {
-        let qa = &qabs[head * kvl..][..kvl];
-        let qr = &qrope[head * rope..][..rope];
+        let qa = &src.qabs[head * kvl..][..kvl];
+        let qr = &src.qrope[head * rope..][..rope];
         let mut parts = Vec::new();
         for s in 0..n_splits {
             let r_begin = s * tps * ATT_TILE;
             let r_end = nr.min(r_begin + tps * ATT_TILE);
-            parts.push(att_split(
-                qa, qr, lc8, lscale, rc, rows, r_begin, r_end, kvl, rope, n_blocks, scale,
-            ));
+            parts.push(att_split(qa, qr, src, rows, (r_begin, r_end), d));
         }
         if n_splits == 1 {
             let (acc, _, l) = &parts[0];
@@ -2585,7 +2851,9 @@ fn attend_oracle(
             continue;
         }
         // The combine: ascending split order in both reductions, as the kernel does.
-        let m_g = parts.iter().fold(f32::NEG_INFINITY, |a, (_, m, _)| a.max(*m));
+        let m_g = parts
+            .iter()
+            .fold(f32::NEG_INFINITY, |a, (_, m, _)| a.max(*m));
         let finite = !m_g.is_infinite() && !m_g.is_nan();
         let w: Vec<f32> = parts
             .iter()
@@ -2607,30 +2875,31 @@ fn attend_oracle(
     clat
 }
 
-/// Inputs for the attention tests: `(qabs, qrope, lc8, lscale, rc)`.
-type AttInputs = (Vec<f32>, Vec<f32>, Vec<u8>, Vec<f32>, Vec<u16>);
-
-fn att_inputs(seed: u64, h: usize, tokens: usize, kvl: usize, rope: usize, n_blocks: usize)
-    -> AttInputs {
+/// Inputs for the attention tests. `tokens` is the CACHE depth, which the DSA test makes
+/// larger than `d.nr` so a selected row lands on a live token rather than out of bounds.
+fn att_inputs(seed: u64, tokens: usize, d: Att) -> AttIn {
+    let (h, kvl, rope) = (d.h, d.kvl, d.rope);
     let mut r = Lcg(seed);
     let qabs: Vec<f32> = (0..h * kvl).map(|_| r.f()).collect();
     let qrope: Vec<f32> = (0..h * rope).map(|_| r.f()).collect();
     let lc8: Vec<u8> = (0..tokens * kvl).map(|_| f32_to_e4m3(r.f())).collect();
-    let lscale = block_scales(&mut r, tokens * n_blocks);
+    let lscale = block_scales(&mut r, tokens * d.n_blocks);
     let rc: Vec<u16> = (0..tokens * rope).map(|_| f32_to_bf16(r.f())).collect();
-    (qabs, qrope, lc8, lscale, rc)
+    AttIn {
+        qabs,
+        qrope,
+        lc8,
+        lscale,
+        rc,
+    }
 }
 
 /// Dispatch the attention and read back `clat`.
-#[allow(clippy::too_many_arguments)]
-fn run_attend(
-    qabs: &[f32], qrope: &[f32], lc8: &[u8], lscale: &[f32], rc: &[u16],
-    h: usize, nr: usize, kvl: usize, rope: usize, n_blocks: usize, scale: f32,
-    with_scratch: bool, rows: Option<&[u32]>,
-) -> Vec<f32> {
-    let rcb: Vec<u8> = rc.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let (qb, rb) = (dev(&f32b(qabs)), dev(&f32b(qrope)));
-    let (lb, sb, kb) = (dev(lc8), dev(&f32b(lscale)), dev(&rcb));
+fn run_attend(src: &AttIn, rows: Option<&[u32]>, d: Att, with_scratch: bool) -> Vec<f32> {
+    let (h, nr, kvl, rope) = (d.h, d.nr, d.kvl, d.rope);
+    let rcb: Vec<u8> = src.rc.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let (qb, rb) = (dev(&f32b(&src.qabs)), dev(&f32b(&src.qrope)));
+    let (lb, sb, kb) = (dev(&src.lc8), dev(&f32b(&src.lscale)), dev(&rcb));
     let mut out = poison(h * kvl * 4 + GUARD);
     let mut scratch = with_scratch.then(|| {
         Buf::new(rivoli::backend::vk::attend_scratch_floats(h, kvl) * 4).expect("scratch")
@@ -2640,19 +2909,31 @@ fn run_attend(
         .map_or(std::ptr::null_mut(), |b| b.ptr_mut() as *mut f32);
     // The DSA row-selection buffer, or null for dense. Kept alive across the launch.
     let rowsb = rows.map(|r| dev(&r.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()));
-    let rowsp = rowsb.as_ref().map_or(std::ptr::null(), |b| b.ptr() as *const u32);
+    let rowsp = rowsb
+        .as_ref()
+        .map_or(std::ptr::null(), |b| b.ptr() as *const u32);
     // SAFETY: every buffer is live and of the documented size; `rows` is null for dense
     // or an `nr`-entry u32 buffer outliving the sync.
     unsafe {
         launch_attend(
-            qb.ptr() as *const f32, rb.ptr() as *const f32, lb.ptr(), sb.ptr() as *const f32,
-            kb.ptr() as *const u16, rowsp, h, nr, kvl, rope, n_blocks, scale,
-            out.ptr_mut() as *mut f32, pp,
+            qb.ptr() as *const f32,
+            rb.ptr() as *const f32,
+            lb.ptr(),
+            sb.ptr() as *const f32,
+            kb.ptr() as *const u16,
+            rowsp,
+            h,
+            nr,
+            kvl,
+            rope,
+            d.n_blocks,
+            d.scale,
+            out.ptr_mut() as *mut f32,
+            pp,
         )
     }
     .expect("launch attend");
-    device_sync().expect("sync");
-    let got = readb(&out, h * kvl * 4 + GUARD);
+    let got = sync_readb(&out, h * kvl * 4 + GUARD);
     assert_untouched(&got, h * kvl * 4, "mla_attend");
     f32v(&got[..h * kvl * 4])
 }
@@ -2682,13 +2963,10 @@ fn run_attend(
 #[test]
 fn attend_tile_widening_is_bit_exact() {
     let v = Validation::new();
-    let (h, nr, kvl, rope) = (3usize, 1usize, 128usize, 64usize);
-    let n_blocks = kvl / 128;
-    let (qabs, qrope, lc8, lscale, rc) = att_inputs(0xA77, h, nr, kvl, rope, n_blocks);
-    let want =
-        attend_oracle(&qabs, &qrope, &lc8, &lscale, &rc, None, h, nr, kvl, rope, n_blocks, 0.125, false);
-    let got =
-        run_attend(&qabs, &qrope, &lc8, &lscale, &rc, h, nr, kvl, rope, n_blocks, 0.125, false, None);
+    let d = Att::new(3, 1, 128, 64, 0.125);
+    let src = att_inputs(0xA77, d.nr, d);
+    let want = attend_oracle(&src, None, d, false);
+    let got = run_attend(&src, None, d, false);
     assert_close(&want, &got, "attend widening h3 kvl128 nr1");
     assert_bit_identical(&want, &got, "mla_latent_attend (nr=1, exp-free)");
     v.check("attend_tile_widening_is_bit_exact");
@@ -2708,15 +2986,16 @@ fn attend_tile_widening_is_bit_exact() {
 #[test]
 fn attend_matches_the_host_oracle() {
     let v = Validation::new();
-    let (h, nr, kvl, rope) = (8usize, 128usize, 512usize, 64usize);
-    let n_blocks = kvl / 128;
-    let (qabs, qrope, lc8, lscale, rc) = att_inputs(0xA78, h, nr, kvl, rope, n_blocks);
+    let d = Att::new(8, 128, 512, 64, 0.125);
+    let src = att_inputs(0xA78, d.nr, d);
     // The plan must agree with the launcher's, or the two are reducing different rows.
-    assert_eq!(att_plan(h, nr, true).0, 2, "shape must exercise the split combine");
-    let want =
-        attend_oracle(&qabs, &qrope, &lc8, &lscale, &rc, None, h, nr, kvl, rope, n_blocks, 0.125, true);
-    let got =
-        run_attend(&qabs, &qrope, &lc8, &lscale, &rc, h, nr, kvl, rope, n_blocks, 0.125, true, None);
+    assert_eq!(
+        att_plan(d.h, d.nr, true).0,
+        2,
+        "shape must exercise the split combine"
+    );
+    let want = attend_oracle(&src, None, d, true);
+    let got = run_attend(&src, None, d, true);
     assert_close(&want, &got, "attend h8 nr128 kvl512 splits2 nblocks4");
     v.check("attend_matches_the_host_oracle");
 }
@@ -2741,10 +3020,9 @@ fn attend_matches_the_host_oracle() {
 #[test]
 fn attend_honours_the_dsa_row_selection() {
     let v = Validation::new();
-    let (h, nr, kvl, rope) = (3usize, 24usize, 128usize, 64usize);
-    let n_blocks = kvl / 128;
+    let d = Att::new(3, 24, 128, 64, 0.125);
     let tokens = 96usize; // four times nr, so selected indices are scattered and live
-    let (qabs, qrope, lc8, lscale, rc) = att_inputs(0xD5A, h, tokens, kvl, rope, n_blocks);
+    let src = att_inputs(0xD5A, tokens, d);
 
     // Strided and descending: rows[j] = tokens - 2 - 4j — the 24 values {2, 6, …, 94},
     // sparse within the live 96-token pool, which is what makes a wrong index land on a
@@ -2766,28 +3044,20 @@ fn attend_honours_the_dsa_row_selection() {
     // tolerance here and still managed 26x with the `- 1` form. Keep the assert because it
     // is cheap and machine-checks "the two mappings are unrelated", not because the test
     // was meaningfully weak without it.
-    let rows: Vec<u32> = (0..nr).map(|j| (tokens - 2 - 4 * j) as u32).collect();
+    let rows: Vec<u32> = (0..d.nr).map(|j| (tokens - 2 - 4 * j) as u32).collect();
     assert!(
         rows.iter().enumerate().all(|(j, r)| *r as usize != j),
         "the selection must share no fixed point with the dense mapping"
     );
 
-    let want = attend_oracle(
-        &qabs, &qrope, &lc8, &lscale, &rc, Some(&rows), h, nr, kvl, rope, n_blocks, 0.125,
-        false,
-    );
-    let got = run_attend(
-        &qabs, &qrope, &lc8, &lscale, &rc, h, nr, kvl, rope, n_blocks, 0.125, false,
-        Some(&rows),
-    );
+    let want = attend_oracle(&src, Some(&rows), d, false);
+    let got = run_attend(&src, Some(&rows), d, false);
     assert_close(&want, &got, "attend dsa rows h3 nr24 kvl128");
 
     // CONTROL: the same shape run DENSE must differ. Without this the test would pass for
     // an implementation that ignored `rows` and happened to agree — the oracle would be
     // reading the same tokens the shader did, both wrongly.
-    let dense = run_attend(
-        &qabs, &qrope, &lc8, &lscale, &rc, h, nr, kvl, rope, n_blocks, 0.125, false, None,
-    );
+    let dense = run_attend(&src, None, d, false);
     // THE CONTROL MEASURES WHAT THE ASSERTION MEASURES. An earlier version counted BIT
     // inequality while the assertion it protects is `assert_close` at `1e-3*mx + 1e-3` —
     // three orders of magnitude apart, so the control could pass while the test it guards
@@ -2798,7 +3068,10 @@ fn attend_honours_the_dsa_row_selection() {
     // `rows` would then produce `got == dense` and `assert_close` would pass, with the
     // indirection back to being dead code.
     let mx = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    let sep = want.iter().zip(&dense).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+    let sep = want
+        .iter()
+        .zip(&dense)
+        .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
     let tol = 1e-3 * mx + 1e-3;
     assert!(
         sep > tol,
@@ -2819,8 +3092,20 @@ fn attend_guards_reject_degenerate_arguments() {
     unsafe {
         let att = |h: usize, nr: usize, kvl: usize, rope: usize, nb: usize, lc8: *const u8| {
             launch_attend(
-                p as *const f32, p as *const f32, lc8, p as *const f32, p as *const u16,
-                std::ptr::null(), h, nr, kvl, rope, nb, 0.125, q as *mut f32, std::ptr::null_mut(),
+                p as *const f32,
+                p as *const f32,
+                lc8,
+                p as *const f32,
+                p as *const u16,
+                std::ptr::null(),
+                h,
+                nr,
+                kvl,
+                rope,
+                nb,
+                0.125,
+                q as *mut f32,
+                std::ptr::null_mut(),
             )
         };
         assert!(att(0, 1, 128, 64, 1, p).is_err(), "attend h = 0");
@@ -2830,12 +3115,24 @@ fn attend_guards_reject_degenerate_arguments() {
         assert!(att(1, 1, 128, 64, 0, p).is_err(), "attend n_blocks = 0");
         // kvl must be a multiple of 128: 160 would satisfy %SUBW, give n_blocks = 1, and
         // silently read the NEXT token's block scale for i in [128, 160).
-        assert!(att(1, 1, 160, 64, 1, p).is_err(), "attend kvl not a multiple of 128");
-        assert!(att(1, 1, 640, 64, 5, p).is_err(), "attend kvl over the register cap");
+        assert!(
+            att(1, 1, 160, 64, 1, p).is_err(),
+            "attend kvl not a multiple of 128"
+        );
+        assert!(
+            att(1, 1, 640, 64, 5, p).is_err(),
+            "attend kvl over the register cap"
+        );
         // STRICTER THAN HIP: the static LDS tile bounds rope, where attn.hip sizes it
         // dynamically. Deliberately this backend's own limit, so it gets its own case.
-        assert!(att(1, 1, 128, 128, 1, p).is_err(), "attend rope over the static LDS tile");
-        assert!(att(1, 1, 128, 64, 1, p.add(1)).is_err(), "attend lc8 not word-aligned");
+        assert!(
+            att(1, 1, 128, 128, 1, p).is_err(),
+            "attend rope over the static LDS tile"
+        );
+        assert!(
+            att(1, 1, 128, 64, 1, p.add(1)).is_err(),
+            "attend lc8 not word-aligned"
+        );
     }
     device_sync().expect("sync");
     v.check("attend_guards_reject_degenerate_arguments");
@@ -2851,30 +3148,41 @@ fn mla_guards_reject_degenerate_arguments() {
     // SAFETY: every case is rejected before a pointer is dereferenced; the accepted
     // controls dispatch over live 4096-byte Bufs and are retired by the sync below.
     unsafe {
-        let val = |h: usize, nope: usize, vh: usize, kvl: usize, block: usize, kvb: *const u8| {
-            launch_mla_value_fp8(
-                p as *const f32, kvb, p as *const f32, h, nope, vh, kvl, block, 1, q as *mut f32,
-            )
+        let val = |h, nope, vh, kvl, block, kvb: *const u8| {
+            let m = Mla::value_dims(h, nope, vh, kvl, block);
+            let kv = KvPtr::new(kvb, p as *const f32);
+            mla_value_at(m, p as *const f32, kv, q as *mut f32)
         };
         assert!(val(0, 4, 4, 16, 16, p).is_err(), "mla_value h = 0");
         assert!(val(1, 0, 4, 16, 16, p).is_err(), "mla_value nope = 0");
         assert!(val(1, 4, 0, 16, 16, p).is_err(), "mla_value vh = 0");
         assert!(val(1, 4, 4, 0, 16, p).is_err(), "mla_value kvl = 0");
         assert!(val(1, 4, 4, 16, 0, p).is_err(), "mla_value block = 0");
-        assert!(val(1, 4, 4, 16, 12, p).is_err(), "mla_value block not a power of two");
-        assert!(val(1, 4, 4, 18, 16, p).is_err(), "mla_value kvl not a multiple of 4");
-        assert!(val(1, 4, 4, 16, 16, p.add(1)).is_err(), "mla_value kvb not word-aligned");
-        assert!(val(1, 4, 4, 16, 16, p).is_ok(), "mla_value valid dims must be accepted");
+        assert!(
+            val(1, 4, 4, 16, 12, p).is_err(),
+            "mla_value block not a power of two"
+        );
+        assert!(
+            val(1, 4, 4, 18, 16, p).is_err(),
+            "mla_value kvl not a multiple of 4"
+        );
+        assert!(
+            val(1, 4, 4, 16, 16, p.add(1)).is_err(),
+            "mla_value kvb not word-aligned"
+        );
+        assert!(
+            val(1, 4, 4, 16, 16, p).is_ok(),
+            "mla_value valid dims must be accepted"
+        );
 
         // `nope` and `vh` are parameters here rather than hardcoded: fixing them at 4
         // would leave two of this launcher's five dimension arms untested, and an
         // untested guard is indistinguishable from its absence — which is the whole
         // rationale for this test.
-        let abs = |h: usize, qh: usize, nope: usize, vh: usize,
-                   kvl: usize, block: usize, kvb: *const u8| {
-            launch_mla_absorb_fp8(
-                p as *const f32, kvb, p as *const f32, h, qh, nope, vh, kvl, block, 1, q as *mut f32,
-            )
+        let abs = |h, qh, nope, vh, kvl, block, kvb: *const u8| {
+            let m = Mla::new(h, qh, nope, vh, kvl, block);
+            let kv = KvPtr::new(kvb, p as *const f32);
+            mla_absorb_at(m, p as *const f32, kv, q as *mut f32)
         };
         assert!(abs(0, 4, 4, 4, 16, 16, p).is_err(), "mla_absorb h = 0");
         assert!(abs(1, 0, 4, 4, 16, 16, p).is_err(), "mla_absorb qh = 0");
@@ -2882,11 +3190,20 @@ fn mla_guards_reject_degenerate_arguments() {
         assert!(abs(1, 4, 4, 0, 16, 16, p).is_err(), "mla_absorb vh = 0");
         assert!(abs(1, 4, 4, 4, 0, 16, p).is_err(), "mla_absorb kvl = 0");
         assert!(abs(1, 4, 4, 4, 16, 0, p).is_err(), "mla_absorb block = 0");
-        assert!(abs(1, 4, 4, 4, 16, 12, p).is_err(), "mla_absorb block not a power of two");
-        assert!(abs(1, 4, 4, 4, 16, 16, p.add(1)).is_err(), "mla_absorb kvb not word-aligned");
+        assert!(
+            abs(1, 4, 4, 4, 16, 12, p).is_err(),
+            "mla_absorb block not a power of two"
+        );
+        assert!(
+            abs(1, 4, 4, 4, 16, 16, p.add(1)).is_err(),
+            "mla_absorb kvb not word-aligned"
+        );
         // RAGGED kvl IS ACCEPTED HERE, and that asymmetry with mla_value is the point:
         // this kernel masks the byte address rather than loading whole rows as words.
-        assert!(abs(1, 4, 4, 4, 17, 16, p).is_ok(), "mla_absorb ragged kvl must be accepted");
+        assert!(
+            abs(1, 4, 4, 4, 17, 16, p).is_ok(),
+            "mla_absorb ragged kvl must be accepted"
+        );
     }
 
     device_sync().expect("sync");
@@ -2992,14 +3309,17 @@ fn oracle_dot_vq(idxrow: &[u8], scalerow: &[u8], cb: &[u16], x: &[f32], i_dim: u
     oracle_wave_sum(lanes)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn moe_gateup_oracle(
-    x: &[f32], descs: &[ExpertBytes], gate_cb: &[u16], up_cb: &[u16],
-    hidden: usize, inter: usize, e_start: usize, e_count: usize,
+    x: &[f32],
+    descs: &[ExpertBytes],
+    gate_cb: &[u16],
+    up_cb: &[u16],
+    g: MoeRange,
 ) -> Vec<f32> {
+    let (hidden, inter) = (g.hidden, g.inter);
     let (rb, ng) = (vq_row_bytes(hidden), vq_groups(hidden));
-    let mut h = vec![0.0f32; (e_start + e_count) * inter];
-    for e in e_start..e_start + e_count {
+    let mut h = vec![0.0f32; g.e_end() * inter];
+    for e in g.e_start..g.e_end() {
         let d = &descs[e];
         for j in 0..inter {
             let g = oracle_dot_vq(
@@ -3022,14 +3342,17 @@ fn moe_gateup_oracle(
     h
 }
 
-#[allow(clippy::too_many_arguments)]
 fn moe_down_oracle(
-    descs: &[ExpertBytes], down_cb: &[u16], wexpert: &[f32], h: &[f32],
-    hidden: usize, inter: usize, e_start: usize, e_count: usize,
+    descs: &[ExpertBytes],
+    down_cb: &[u16],
+    wexpert: &[f32],
+    h: &[f32],
+    g: MoeRange,
 ) -> Vec<f32> {
+    let (hidden, inter) = (g.hidden, g.inter);
     let (rb, ng) = (vq_row_bytes(inter), vq_groups(inter));
-    let mut partial = vec![0.0f32; (e_start + e_count) * hidden];
-    for e in e_start..e_start + e_count {
+    let mut partial = vec![0.0f32; g.e_end() * hidden];
+    for e in g.e_start..g.e_end() {
         let d = &descs[e];
         let he = &h[e * inter..(e + 1) * inter];
         for o in 0..hidden {
@@ -3056,7 +3379,9 @@ fn moe_fixed(v: f32) -> i64 {
 fn moe_acc_drain_oracle(partial: &[f32], e_count: usize, hidden: usize) -> Vec<f32> {
     (0..hidden)
         .map(|o| {
-            let t: i64 = (0..e_count).map(|e| moe_fixed(partial[e * hidden + o])).sum();
+            let t: i64 = (0..e_count)
+                .map(|e| moe_fixed(partial[e * hidden + o]))
+                .sum();
             (t as f64 / 17592186044416.0) as f32
         })
         .collect()
@@ -3106,7 +3431,9 @@ fn expert_bytes(seed: u64, hidden: usize, inter: usize, plant: bool) -> ExpertBy
 /// An fp16 codebook of `VQ_K` entries x VQ_DIM centroids, as raw bit patterns.
 fn vq_codebook(seed: u64) -> Vec<u16> {
     let mut r = Lcg(seed);
-    (0..4096 * VQ_DIM).map(|_| rivoli::math::f32_to_f16(r.f())).collect()
+    (0..4096 * VQ_DIM)
+        .map(|_| rivoli::math::f32_to_f16(r.f()))
+        .collect()
 }
 
 /// The whole VQ MoE path — gate/up, down, reduce — against the CPU oracles.
@@ -3123,13 +3450,14 @@ fn moe_vq_matches_the_host_oracles() {
     let mut r = Lcg(0x30E);
     let x: Vec<f32> = (0..hidden).map(|_| r.f()).collect();
     let wexpert: Vec<f32> = (0..e_count).map(|_| r.f().abs() + 0.1).collect();
-    let descs: Vec<ExpertBytes> =
-        (0..e_count).map(|e| expert_bytes(0xE0 + e as u64, hidden, inter, true)).collect();
+    let descs: Vec<ExpertBytes> = (0..e_count)
+        .map(|e| expert_bytes(0xE0 + e as u64, hidden, inter, true))
+        .collect();
     let (gate_cb, up_cb, down_cb) = (vq_codebook(1), vq_codebook(2), vq_codebook(3));
 
-    let want_h = moe_gateup_oracle(&x, &descs, &gate_cb, &up_cb, hidden, inter, 0, e_count);
-    let want_p =
-        moe_down_oracle(&descs, &down_cb, &wexpert, &want_h, hidden, inter, 0, e_count);
+    let g = MoeRange::new(hidden, inter, 0, e_count);
+    let want_h = moe_gateup_oracle(&x, &descs, &gate_cb, &up_cb, g);
+    let want_p = moe_down_oracle(&descs, &down_cb, &wexpert, &want_h, g);
     let want_o = moe_acc_drain_oracle(&want_p, e_count, hidden);
 
     // Device-side: the six spans per expert, then a descriptor array of their addresses.
@@ -3151,7 +3479,11 @@ fn moe_vq_matches_the_host_oracles() {
         .flat_map(|b| b.iter().flat_map(|s| (s.ptr() as u64).to_le_bytes()))
         .collect();
     let db = dev(&desc_bytes);
-    let (gcb, ucb, dcb) = (dev(&u16b(&gate_cb)), dev(&u16b(&up_cb)), dev(&u16b(&down_cb)));
+    let (gcb, ucb, dcb) = (
+        dev(&u16b(&gate_cb)),
+        dev(&u16b(&up_cb)),
+        dev(&u16b(&down_cb)),
+    );
     let (xb, wb) = (dev(&f32b(&x)), dev(&f32b(&wexpert)));
     let mut hb = dev(&vec![0u8; e_count * inter * 4]);
     // ONE accumulator row (u64), zeroed, plus a zeroed `x` for the drain to add into —
@@ -3164,10 +3496,20 @@ fn moe_vq_matches_the_host_oracles() {
     // six-address descriptors whose targets outlive the sync.
     unsafe {
         launch_moe_expert_range(
-            xb.ptr() as *const f32, hidden, inter, 0, e_count,
-            db.ptr() as *const rivoli::backend::vk::ExpertDesc, gcb.ptr() as *const u16,
-            ucb.ptr() as *const u16, dcb.ptr() as *const u16, wb.ptr() as *const f32,
-            hb.ptr_mut() as *mut f32, ab.ptr_mut() as *mut u64, 1, std::ptr::null_mut(),
+            xb.ptr() as *const f32,
+            hidden,
+            inter,
+            0,
+            e_count,
+            db.ptr() as *const rivoli::backend::vk::ExpertDesc,
+            gcb.ptr() as *const u16,
+            ucb.ptr() as *const u16,
+            dcb.ptr() as *const u16,
+            wb.ptr() as *const f32,
+            hb.ptr_mut() as *mut f32,
+            ab.ptr_mut() as *mut u64,
+            1,
+            std::ptr::null_mut(),
         )
     }
     .expect("expert range");
@@ -3187,7 +3529,11 @@ fn moe_vq_matches_the_host_oracles() {
 
     let mut shapes = Shapes::default();
     shapes.close(&want_h, &got_h, "moe_gateup_vq h512 i64 e3");
-    shapes.close(&want_o, &f32v(&got_o[..hidden * 4]), "moe_acc_drain h512 e3");
+    shapes.close(
+        &want_o,
+        &f32v(&got_o[..hidden * 4]),
+        "moe_acc_drain h512 e3",
+    );
     shapes.assert_all_passed("moe vq");
 
     // THE FUSION PIN, WHICH THE TOLERANCE ABOVE CANNOT SEE.
@@ -3202,9 +3548,13 @@ fn moe_vq_matches_the_host_oracles() {
     // The fixed-point sum pins exactly too, and for a stronger reason than the f32 reduce
     // did: integer addition has no rounding for a schedule to reorder, so this holds no
     // matter which order the experts' atomics landed in.
-    let pin_p = moe_down_oracle(&descs, &down_cb, &wexpert, &got_h, hidden, inter, 0, e_count);
+    let pin_p = moe_down_oracle(&descs, &down_cb, &wexpert, &got_h, g);
     let pin_o = moe_acc_drain_oracle(&pin_p, e_count, hidden);
-    assert_bit_identical(&pin_o, &f32v(&got_o[..hidden * 4]), "moe_acc_drain (fed the GPU's own h)");
+    assert_bit_identical(
+        &pin_o,
+        &f32v(&got_o[..hidden * 4]),
+        "moe_acc_drain (fed the GPU's own h)",
+    );
     v.check("moe_vq_matches_the_host_oracles");
 }
 
@@ -3217,9 +3567,19 @@ fn moe_guards_reject_degenerate_arguments() {
     unsafe {
         let mo = |hidden: usize, inter: usize, e_count: usize| {
             launch_moe_expert_range(
-                p as *const f32, hidden, inter, 0, e_count,
-                p as *const rivoli::backend::vk::ExpertDesc, p as *const u16, p as *const u16,
-                p as *const u16, p as *const f32, q as *mut f32, q as *mut u64, 1,
+                p as *const f32,
+                hidden,
+                inter,
+                0,
+                e_count,
+                p as *const rivoli::backend::vk::ExpertDesc,
+                p as *const u16,
+                p as *const u16,
+                p as *const u16,
+                p as *const f32,
+                q as *mut f32,
+                q as *mut u64,
+                1,
                 std::ptr::null_mut(),
             )
         };
@@ -3228,18 +3588,28 @@ fn moe_guards_reject_degenerate_arguments() {
         assert!(mo(64, 64, 0).is_err(), "moe e_count = 0");
         // STRICTER THAN HIP: moe.hip's vq_rb/vq_ng truncate silently on a dimension that
         // is not a whole number of VQ groups, mis-sizing every row with no diagnostic.
-        assert!(mo(96, 64, 1).is_err(), "moe hidden not a multiple of VQ_GROUP");
-        assert!(mo(64, 96, 1).is_err(), "moe inter not a multiple of VQ_GROUP");
         assert!(
-            launch_moe_acc_drain(q as *mut f32, q as *mut u64, 0, 1, 1.0, std::ptr::null_mut())
-                .is_err(),
-            "moe_acc_drain n = 0"
+            mo(96, 64, 1).is_err(),
+            "moe hidden not a multiple of VQ_GROUP"
         );
         assert!(
-            launch_moe_acc_drain(q as *mut f32, q as *mut u64, 64, 0, 1.0, std::ptr::null_mut())
-                .is_err(),
-            "moe_acc_drain rows = 0"
+            mo(64, 96, 1).is_err(),
+            "moe inter not a multiple of VQ_GROUP"
         );
+        // One dispatch with one dim zeroed, so the two cases differ by exactly the
+        // argument under test and nothing else can be what rejected them.
+        let acc_drain = |n: usize, rows: usize| {
+            launch_moe_acc_drain(
+                q as *mut f32,
+                q as *mut u64,
+                n,
+                rows,
+                1.0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(acc_drain(0, 1).is_err(), "moe_acc_drain n = 0");
+        assert!(acc_drain(64, 0).is_err(), "moe_acc_drain rows = 0");
     }
     v.check("moe_guards_reject_degenerate_arguments");
 }
@@ -3277,15 +3647,25 @@ fn planted_straddle_indices_would_catch_a_naive_unpack() {
         let correct = vq_index(row, t);
         if ((t * VQ_INDEX_BITS) >> 3) % 4 == 3 {
             straddling += 1;
-            assert_eq!(correct, 0xFFF, "t={t} should carry the planted all-ones index");
+            assert_eq!(
+                correct, 0xFFF,
+                "t={t} should carry the planted all-ones index"
+            );
             if naive(row, t) != correct {
                 caught += 1;
             }
         } else {
-            assert_eq!(naive(row, t), correct, "t={t} does not straddle; both must agree");
+            assert_eq!(
+                naive(row, t),
+                correct,
+                "t={t} does not straddle; both must agree"
+            );
         }
     }
-    assert_eq!(straddling, 32, "expected 32 straddling subvectors at nsub=128");
+    assert_eq!(
+        straddling, 32,
+        "expected 32 straddling subvectors at nsub=128"
+    );
     assert_eq!(
         caught, straddling,
         "the planted data must distinguish the naive unpack at EVERY straddling subvector \
@@ -3323,8 +3703,7 @@ fn fill_u32_writes_the_pattern_and_nothing_past_it() {
         let mut b = poison(bytes + GUARD);
         // SAFETY: `b` owns `bytes + GUARD` device bytes and `bytes` is a multiple of 4.
         unsafe { fill_u32(b.ptr_mut(), PAT, bytes).expect("fill") };
-        device_sync().expect("sync");
-        let got = readb(&b, bytes + GUARD);
+        let got = sync_readb(&b, bytes + GUARD);
         let label = format!("fill_u32 bytes={bytes}");
         assert_untouched(&got, bytes, &label);
         let want: Vec<u8> = PAT.to_le_bytes().repeat(bytes / 4);
@@ -3337,8 +3716,14 @@ fn fill_u32_writes_the_pattern_and_nothing_past_it() {
     let mut b = dev(&[0u8; 64]);
     // SAFETY: every call is rejected on its arguments before the pointer is used.
     unsafe {
-        assert!(fill_u32(b.ptr_mut(), PAT, 0).is_err(), "0 bytes must be rejected");
-        assert!(fill_u32(b.ptr_mut(), PAT, 6).is_err(), "6 bytes must be rejected");
+        assert!(
+            fill_u32(b.ptr_mut(), PAT, 0).is_err(),
+            "0 bytes must be rejected"
+        );
+        assert!(
+            fill_u32(b.ptr_mut(), PAT, 6).is_err(),
+            "6 bytes must be rejected"
+        );
         assert!(
             fill_u32(std::ptr::null_mut(), PAT, 4).is_err(),
             "an address in no live Buf must be rejected"
@@ -3358,7 +3743,9 @@ fn fill_u32_writes_the_pattern_and_nothing_past_it() {
 #[test]
 fn read_raw_resolves_a_device_address_at_an_offset() {
     let v = Validation::new();
-    let bytes: Vec<u8> = (0..1024u32).map(|i| (i.wrapping_mul(31) & 0xff) as u8).collect();
+    let bytes: Vec<u8> = (0..1024u32)
+        .map(|i| (i.wrapping_mul(31) & 0xff) as u8)
+        .collect();
     let b = dev(&bytes);
     let mut out = Vec::new();
 
@@ -3425,14 +3812,23 @@ fn flag_nonfinite_records_the_first_tag_only() {
         let xb = dev(&f32b(&finite));
         let mut flag = dev(&0u32.to_le_bytes());
         // SAFETY: `xb` is n live f32, `flag` one live u32, both until the sync.
-        unsafe { launch_flag_nonfinite(xb.ptr() as *const f32, n, 0x11, flag.ptr_mut() as *mut u32) }
-            .expect("launch clean");
+        unsafe {
+            launch_flag_nonfinite(xb.ptr() as *const f32, n, 0x11, flag.ptr_mut() as *mut u32)
+        }
+        .expect("launch clean");
         device_sync().expect("sync");
-        assert_eq!(read_u32(&flag), 0, "n={n}: an all-finite buffer must not flag");
+        assert_eq!(
+            read_u32(&flag),
+            0,
+            "n={n}: an all-finite buffer must not flag"
+        );
 
         // 2/3. One bad element at a time, at positions that straddle the workgroup edge.
-        for (label, bad) in [("nan", f32::NAN), ("+inf", f32::INFINITY), ("-inf", f32::NEG_INFINITY)]
-        {
+        for (label, bad) in [
+            ("nan", f32::NAN),
+            ("+inf", f32::INFINITY),
+            ("-inf", f32::NEG_INFINITY),
+        ] {
             for &pos in &[0usize, n / 2, n - 1] {
                 let mut x = finite.clone();
                 x[pos] = bad;
@@ -3440,7 +3836,12 @@ fn flag_nonfinite_records_the_first_tag_only() {
                 let mut flag = dev(&0u32.to_le_bytes());
                 // SAFETY: as above.
                 unsafe {
-                    launch_flag_nonfinite(xb.ptr() as *const f32, n, 0x2A, flag.ptr_mut() as *mut u32)
+                    launch_flag_nonfinite(
+                        xb.ptr() as *const f32,
+                        n,
+                        0x2A,
+                        flag.ptr_mut() as *mut u32,
+                    )
                 }
                 .expect("launch bad");
                 device_sync().expect("sync");
@@ -3480,11 +3881,13 @@ fn flag_nonfinite_records_the_first_tag_only() {
     // SAFETY: both are rejected on their arguments before any pointer is used.
     unsafe {
         assert!(
-            launch_flag_nonfinite(xb.ptr() as *const f32, 0, 1, flag.ptr_mut() as *mut u32).is_err(),
+            launch_flag_nonfinite(xb.ptr() as *const f32, 0, 1, flag.ptr_mut() as *mut u32)
+                .is_err(),
             "n = 0 must be rejected"
         );
         assert!(
-            launch_flag_nonfinite(xb.ptr() as *const f32, n, 0, flag.ptr_mut() as *mut u32).is_err(),
+            launch_flag_nonfinite(xb.ptr() as *const f32, n, 0, flag.ptr_mut() as *mut u32)
+                .is_err(),
             "tag 0 must be rejected"
         );
     }
@@ -3532,20 +3935,51 @@ fn deferred_launchers_refuse_rather_than_no_op() {
                 )
                 .is_err(),
             ),
-            ("layernorm", launch_layernorm(cf, cf, cf, 64, 1e-6, nf).is_err()),
-            ("index_append", launch_index_append(cf, std::ptr::null_mut(), 0, 64).is_err()),
+            (
+                "layernorm",
+                launch_layernorm(cf, cf, cf, 64, 1e-6, nf).is_err(),
+            ),
+            (
+                "index_append",
+                launch_index_append(cf, std::ptr::null_mut(), 0, 64).is_err(),
+            ),
             (
                 "index_score",
-                launch_index_score(cf, cf, std::ptr::null(), std::ptr::null(), 8, 4, 4, 64, 1.0, 1.0, nf)
-                    .is_err(),
+                launch_index_score(
+                    cf,
+                    cf,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    8,
+                    4,
+                    4,
+                    64,
+                    1.0,
+                    1.0,
+                    nf,
+                )
+                .is_err(),
             ),
-            ("index_topk", launch_index_topk(cf, 8, 4, std::ptr::null_mut()).is_err()),
-            ("index_pool_push", launch_index_pool_push(cf, nf, 0, 64).is_err()),
-            ("index_head_route", launch_index_head_route(cf, cf, cf, 2, 4, 64, nf).is_err()),
+            (
+                "index_topk",
+                launch_index_topk(cf, 8, 4, std::ptr::null_mut()).is_err(),
+            ),
+            (
+                "index_pool_push",
+                launch_index_pool_push(cf, nf, 0, 64).is_err(),
+            ),
+            (
+                "index_head_route",
+                launch_index_head_route(cf, cf, cf, 2, 4, 64, nf).is_err(),
+            ),
             ("vaxpy", launch_vaxpy(nf, cf, 2.0, 64).is_err()),
         ]
     };
-    let quiet: Vec<&str> = refusals.iter().filter(|(_, e)| !e).map(|(n, _)| *n).collect();
+    let quiet: Vec<&str> = refusals
+        .iter()
+        .filter(|(_, e)| !e)
+        .map(|(n, _)| *n)
+        .collect();
     assert!(
         quiet.is_empty(),
         "these deferred launchers returned Ok instead of refusing: {quiet:?}. A no-op that \
@@ -3611,9 +4045,16 @@ fn inv_6_a_host_release_retires_an_enqueued_wait() -> anyhow::Result<()> {
     t.release(7);
 
     block_on(stream_signal(compute.raw())?);
-    assert!(t.completed() >= 7, "the host release must be what retired the wait");
+    assert!(
+        t.completed() >= 7,
+        "the host release must be what retired the wait"
+    );
     // Monotone: releasing backwards would un-free a slot another consumer is gated on.
     t.release(3);
-    assert_eq!(t.completed(), 7, "release must never move a timeline backwards");
+    assert_eq!(
+        t.completed(),
+        7,
+        "release must never move a timeline backwards"
+    );
     Ok(())
 }

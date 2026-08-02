@@ -72,7 +72,11 @@ impl Arena {
     }
 
     fn stride(&self, hot: bool) -> usize {
-        if hot { self.hot_stride } else { self.cold_stride }
+        if hot {
+            self.hot_stride
+        } else {
+            self.cold_stride
+        }
     }
     fn frontier(&self, hot: bool) -> usize {
         if hot { self.hot_hi } else { self.cold_hi }
@@ -85,7 +89,11 @@ impl Arena {
         }
     }
     fn free_list(&mut self, hot: bool) -> &mut Vec<usize> {
-        if hot { &mut self.hot_free } else { &mut self.cold_free }
+        if hot {
+            &mut self.hot_free
+        } else {
+            &mut self.cold_free
+        }
     }
 
     /// Free bytes between the two frontiers (the only space either tier can grow into).
@@ -144,8 +152,12 @@ impl Arena {
         if let Some(h) = self.free_list(other).pop() {
             self.set_frontier(other, top); // top vacated → gap grows by the other stride
             self.retreat(other); // cascade past any hole now exposed at the frontier, so
-                                 // the NEXT compaction never relocates a keyless hole
-            return Step::Relocated(Reloc { hot: other, from: top, to: h });
+            // the NEXT compaction never relocates a keyless hole
+            return Step::Relocated(Reloc {
+                hot: other,
+                from: top,
+                to: h,
+            });
         }
         // 4) Other tier is packed solid (no holes) — caller must evict one of its slots.
         Step::NeedFree
@@ -168,22 +180,37 @@ mod tests {
     }
     impl Sim {
         fn new(budget: usize, cs: usize, hs: usize) -> Self {
-            Sim { a: Arena::new(budget, cs, hs), at: HashMap::new(), next_free_victim: Vec::new() }
+            Sim {
+                a: Arena::new(budget, cs, hs),
+                at: HashMap::new(),
+                next_free_victim: Vec::new(),
+            }
         }
         fn byte_range(&self, hot: bool, idx: usize) -> (usize, usize) {
             let o = self.a.offset(hot, idx);
             (o, o + self.a.stride(hot))
         }
         fn assert_no_overlap(&self) {
-            let mut spans: Vec<(usize, usize, u32)> =
-                self.at.iter().map(|(&k, &(h, i))| {
+            let mut spans: Vec<(usize, usize, u32)> = self
+                .at
+                .iter()
+                .map(|(&k, &(h, i))| {
                     let (lo, hi) = self.byte_range(h, i);
                     (lo, hi, k)
-                }).collect();
+                })
+                .collect();
             spans.sort();
             for w in spans.windows(2) {
-                assert!(w[0].1 <= w[1].0, "overlap: key {} [{},{}) vs key {} [{},{})",
-                    w[0].2, w[0].0, w[0].1, w[1].2, w[1].0, w[1].1);
+                assert!(
+                    w[0].1 <= w[1].0,
+                    "overlap: key {} [{},{}) vs key {} [{},{})",
+                    w[0].2,
+                    w[0].0,
+                    w[0].1,
+                    w[1].2,
+                    w[1].0,
+                    w[1].1
+                );
                 assert!(w[1].1 <= self.a.budget, "slot past budget");
             }
         }
@@ -198,17 +225,22 @@ mod tests {
                     }
                     Step::Relocated(r) => {
                         // find the key at (r.hot, r.from), move it to (r.hot, r.to)
-                        let moved = *self.at.iter()
+                        let moved = *self
+                            .at
+                            .iter()
                             .find(|&(_, &(h, i))| h == r.hot && i == r.from)
-                            .expect("relocated slot must hold a key").0;
+                            .expect("relocated slot must hold a key")
+                            .0;
                         self.at.insert(moved, (r.hot, r.to));
                     }
                     Step::NeedFree => {
                         // evict the oldest victim in the OTHER tier if any, else oldest overall
                         let other = !hot;
-                        let pick = self.next_free_victim.iter().position(|k| {
-                            self.at.get(k).map(|&(h, _)| h == other).unwrap_or(false)
-                        }).or_else(|| (!self.next_free_victim.is_empty()).then_some(0))
+                        let pick = self
+                            .next_free_victim
+                            .iter()
+                            .position(|k| self.at.get(k).map(|&(h, _)| h == other).unwrap_or(false))
+                            .or_else(|| (!self.next_free_victim.is_empty()).then_some(0))
                             .expect("nothing to evict but arena full");
                         let v = self.next_free_victim.remove(pick);
                         let (h, i) = self.at.remove(&v).expect("victim resident");
@@ -276,12 +308,16 @@ mod tests {
         let mut key_at: HashMap<(bool, usize), u32> = HashMap::new();
         for k in 0..5u32 {
             match a.alloc_step(false) {
-                Step::Placed(i) => { key_at.insert((false, i), k); }
+                Step::Placed(i) => {
+                    key_at.insert((false, i), k);
+                }
                 s => panic!("cold grow: unexpected {s:?}"),
             }
         }
         match a.alloc_step(true) {
-            Step::Placed(i) => { key_at.insert((true, i), 100); }
+            Step::Placed(i) => {
+                key_at.insert((true, i), 100);
+            }
             s => panic!("hot grow: unexpected {s:?}"),
         }
         // Free non-adjacent cold holes (keys at slots 3 then 1) — neither is the frontier.
@@ -295,9 +331,9 @@ mod tests {
             match a.alloc_step(true) {
                 Step::Placed(_) => break,
                 Step::Relocated(r) => {
-                    let k = key_at
-                        .remove(&(r.hot, r.from))
-                        .unwrap_or_else(|| panic!("relocated a keyless hole at {:?}", (r.hot, r.from)));
+                    let k = key_at.remove(&(r.hot, r.from)).unwrap_or_else(|| {
+                        panic!("relocated a keyless hole at {:?}", (r.hot, r.from))
+                    });
                     key_at.insert((r.hot, r.to), k);
                 }
                 Step::NeedFree => panic!("unexpected NeedFree with free bytes available"),

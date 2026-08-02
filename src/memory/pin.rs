@@ -17,25 +17,22 @@
 //! Needs a backend (`rocm` or `vulkan`): without a device there is nothing to pin.
 #![cfg(any(feature = "rocm", feature = "vulkan"))]
 
-use crate::fetch::asyncfetch::{AsyncFetch, ReadSpec, Ticket};
-use crate::memory::arena::{Arena, Reloc, Step};
-use crate::backend::memcpy_dtod;
-use crate::memory::cache;
 use crate::artifact::config::Mode;
-use crate::memory::device::{DeviceTier, VmmBuf};
-use crate::memory::hybrid::HybridPolicy;
-use std::collections::HashMap;
-use crate::artifact::format::{
-    Dtype, ExpertSet, FormatMeta, Safetensors, SetDims, load_codebooks,
-};
+use crate::artifact::format::{Dtype, ExpertSet, FormatMeta, Safetensors, SetDims, load_codebooks};
 use crate::artifact::model::ModelConfig;
 use crate::artifact::quant::{
     VQ_DIM, VQ_K, i4_expert_bytes, i4_slot_offsets, vq_expert_bytes, vq_slot_offsets,
 };
+use crate::backend::memcpy_dtod;
+use crate::fetch::asyncfetch::{AsyncFetch, ReadSpec, Ticket};
 use crate::fetch::stream::{Streamer, slot_span};
+use crate::memory::arena::{Arena, Reloc, Step};
+use crate::memory::cache;
+use crate::memory::device::{DeviceTier, VmmBuf};
+use crate::memory::hybrid::HybridPolicy;
 use anyhow::{Context, Result, bail, ensure};
+use std::collections::HashMap;
 use std::os::fd::RawFd;
-
 
 /// A resolved fp8-e4m3 block-scaled weight matrix in the tier: device pointers +
 /// dims + the `weight_scale_inv` block size. Consumed by `launch_gemv_fp8` (attn +
@@ -151,9 +148,9 @@ pub struct LayerPin {
 /// `shared_norm` replaces `model.norm` before the (shared) `lm_head`.
 #[derive(Clone, Copy)]
 pub struct MtpPin {
-    pub eh_proj: *const f32, // [hidden, 2·hidden] (bf16→f32; gemv_f32)
-    pub enorm: *const f32,   // [hidden]
-    pub hnorm: *const f32,   // [hidden]
+    pub eh_proj: *const f32,     // [hidden, 2·hidden] (bf16→f32; gemv_f32)
+    pub enorm: *const f32,       // [hidden]
+    pub hnorm: *const f32,       // [hidden]
     pub shared_norm: *const f32, // [hidden]
 }
 
@@ -272,11 +269,7 @@ fn place_dense_mlp(
 /// Place a shared-expert `block` (gate‖up‖down) resident and resolve its six
 /// pointers. `off` = the format's slot offsets (VQ or int4), so the same code
 /// places either. The shared expert is the routed format (`--i4` ⇒ int4).
-fn place_shared(
-    tier: &mut DeviceTier,
-    block: &[u8],
-    off: &[usize; 6],
-) -> Result<MlpVq> {
+fn place_shared(tier: &mut DeviceTier, block: &[u8], off: &[usize; 6]) -> Result<MlpVq> {
     let dst = tier.place(block)?;
     Ok(MlpVq {
         gate: vqweight_at(dst, off[0], off[1]),
@@ -349,7 +342,11 @@ fn resident_bytes(
     };
     Ok(total
         + (n_pin - cfg.dense_layers) * shared
-        + if cb_resident { 3 * VQ_K * VQ_DIM * 2 } else { 0 })
+        + if cb_resident {
+            3 * VQ_K * VQ_DIM * 2
+        } else {
+            0
+        })
 }
 
 /// Width of the trace-v2 candidate window: the top-W router candidates recorded per
@@ -480,7 +477,10 @@ impl ArenaPool {
     fn alloc(&mut self, key: u32) -> Result<()> {
         let adm = self.policy.admit(key);
         for ev in adm.evicted {
-            let s = self.slot_of.remove(&ev).context("evicted key had no slot")?;
+            let s = self
+                .slot_of
+                .remove(&ev)
+                .context("evicted key had no slot")?;
             self.key_at.remove(&s);
             // Evicted: its bytes are no longer this key's, and the slot is about to be
             // handed to someone else.
@@ -529,7 +529,10 @@ impl ArenaPool {
     /// non-overlapping slots) and remap the key that lived there. Synchronous, so it
     /// lands before the layer's compute or any later cold read touches the new slot.
     fn relocate(&mut self, r: Reloc) -> Result<()> {
-        let moved = self.key_at.remove(&(r.hot, r.from)).context("relocated slot had no key")?;
+        let moved = self
+            .key_at
+            .remove(&(r.hot, r.from))
+            .context("relocated slot had no key")?;
         let stride = self.tier(r.hot).stride;
         let src = self.ptr(r.hot, r.from) as *const u8;
         let dst = self.ptr(r.hot, r.to);
@@ -550,7 +553,6 @@ impl<'a> Pin<'a> {
     pub fn wait_on(&self, t: Ticket, stream_raw: *mut std::ffi::c_void) -> Result<()> {
         self.fetch.wait(t, stream_raw)
     }
-
 
     /// Build the resident set from the artifact directory `dir`. `capacity` is the
     /// total device budget (auto-discovered); the always-resident set takes its
@@ -604,10 +606,11 @@ impl<'a> Pin<'a> {
         // without a draft head rather than failing to load. Re-run `bin/fp8_to_i4` to
         // emit it; it covers layer `n_layers` since the range bound was widened.
         let mtp = st.has(&format!("model.layers.{}.eh_proj.weight", cfg.n_layers))
-            && [(vq_present, "vq3"), (i4, "i4")].iter().all(|&(want, ext)| {
-                !want
-                    || std::fs::metadata(format!("{dir}/L{:02}.{ext}", cfg.n_layers)).is_ok()
-            });
+            && [(vq_present, "vq3"), (i4, "i4")]
+                .iter()
+                .all(|&(want, ext)| {
+                    !want || std::fs::metadata(format!("{dir}/L{:02}.{ext}", cfg.n_layers)).is_ok()
+                });
         // Layers the PIN holds: the model's, plus the MTP head one past the end.
         let n_pin = cfg.n_layers + usize::from(mtp);
         tracing::info!("mtp head: {}", if mtp { "present" } else { "absent" });
@@ -620,8 +623,12 @@ impl<'a> Pin<'a> {
             hidden: cfg.hidden,
             moe_inter: cfg.moe_inter,
         };
-        let vq_src = vq_present.then(|| ExpertSet::open_routed(dir, false, dims)).transpose()?;
-        let i4_src = i4.then(|| ExpertSet::open_routed(dir, true, dims)).transpose()?;
+        let vq_src = vq_present
+            .then(|| ExpertSet::open_routed(dir, false, dims))
+            .transpose()?;
+        let i4_src = i4
+            .then(|| ExpertSet::open_routed(dir, true, dims))
+            .transpose()?;
         let shared_i4 = i4;
         // Slot byte layouts, one per format (which projection's indices/scales sit
         // where in an expert block). Shared expert + routed slabs reuse these.
@@ -703,9 +710,15 @@ impl<'a> Pin<'a> {
                 );
                 moe_bias.push(bias);
                 let shared_block = if shared_i4 {
-                    i4_src.as_ref().context("i4 shared: source missing")?.shared_block(l)?
+                    i4_src
+                        .as_ref()
+                        .context("i4 shared: source missing")?
+                        .shared_block(l)?
                 } else {
-                    vq_src.as_ref().context("vq shared: source missing")?.shared_block(l)?
+                    vq_src
+                        .as_ref()
+                        .context("vq shared: source missing")?
+                        .shared_block(l)?
                 };
                 let shared = place_shared(&mut tier, &shared_block, &shared_off)?;
                 LayerMlp::Moe { gate_w, shared }
@@ -739,7 +752,11 @@ impl<'a> Pin<'a> {
                     eh_proj: place_f32(&mut tier, &st, &format!("{lb}.eh_proj.weight"))?,
                     enorm: place_f32(&mut tier, &st, &format!("{lb}.enorm.weight"))?,
                     hnorm: place_f32(&mut tier, &st, &format!("{lb}.hnorm.weight"))?,
-                    shared_norm: place_f32(&mut tier, &st, &format!("{lb}.shared_head.norm.weight"))?,
+                    shared_norm: place_f32(
+                        &mut tier,
+                        &st,
+                        &format!("{lb}.shared_head.norm.weight"),
+                    )?,
                 })
             })
             .transpose()?;
@@ -763,7 +780,9 @@ impl<'a> Pin<'a> {
             } else {
                 (&vq_src, vq_off, "vq")
             };
-            let s = src.as_ref().with_context(|| format!("{what} source missing"))?;
+            let s = src
+                .as_ref()
+                .with_context(|| format!("{what} source missing"))?;
             Ok(TierFmt {
                 off,
                 int4,
@@ -786,9 +805,7 @@ impl<'a> Pin<'a> {
         let (cold_stride, hot_stride) = (cold.stride, hot.stride);
         let policy =
             crate::memory::hybrid::make(cache_policy, budget, cold_stride, hot_stride, two_q)
-                .with_context(|| {
-                    format!("unknown --cache-policy {cache_policy} (lru|2q|arc)")
-                })?;
+                .with_context(|| format!("unknown --cache-policy {cache_policy} (lru|2q|arc)"))?;
         tracing::info!(
             "routed pool [{cache_policy} {mode}]: {:.1} GiB budget (~{} slots, cold {cold_stride}B / hot {hot_stride}B)",
             budget as f64 / (1u64 << 30) as f64,
@@ -1107,7 +1124,12 @@ impl<'a> Pin<'a> {
             fmt.push(t.int4);
             if !is_hit[i] {
                 let (fd, begin, len) = t.table[sparse + e];
-                reads.push(ReadSpec { fd, begin, len, dst: self.routed.host_ptr(hot, idx) });
+                reads.push(ReadSpec {
+                    fd,
+                    begin,
+                    len,
+                    dst: self.routed.host_ptr(hot, idx),
+                });
                 miss_sel.push(i);
             }
         }

@@ -11,11 +11,11 @@
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use rivoli::artifact::format::{Dtype, FormatMeta, SafeWriter, Safetensors, Vq3Header};
-use rivoli::math::bf16_to_f32;
 use rivoli::artifact::quant::{
     ExpertProjs, PROJ, VQ_ALIGN, VQ_DIM, VQ_K, expert_base, expert_projs, learn_codebook, quant_vq,
     read_f32, sample_subvectors, vq_expert_bytes, vq_proj_bytes, vq_row_bytes, write_le_scales,
 };
+use rivoli::math::bf16_to_f32;
 // Only the tests still take the layout on its own; the encoders go through `expert_projs`,
 // which carries the projection NAMES alongside it. Gated rather than allow-ed, for the
 // same reason as `VQ_GROUP` below.
@@ -42,9 +42,9 @@ const FP8_BLOCK: usize = 128;
 #[cfg(feature = "rocm")]
 mod gpu {
     use super::*;
-    use rivoli::memory::device::DeviceBuf;
-    use rivoli::backend::hip::{device_sync, launch_vq_encode};
     use rivoli::artifact::quant::{set_idx, vq_groups};
+    use rivoli::backend::hip::{device_sync, launch_vq_encode};
+    use rivoli::memory::device::DeviceBuf;
 
     fn f32_as_bytes(v: &[f32]) -> &[u8] {
         // SAFETY: f32 is POD; the view is `4·len` read-only bytes (LE host == LE device).
@@ -154,11 +154,8 @@ mod gpu {
                 // The refit itself is `quant_vq`'s, called rather than restated: the two
                 // encoders are asserted bit-identical under `--validate`, and this
                 // accumulation is where a divergence would come from.
-                let refit = rivoli::artifact::quant::vq_refit(
-                    seg,
-                    &idx1[sbase..sbase + SUBS],
-                    codebook,
-                );
+                let refit =
+                    rivoli::artifact::quant::vq_refit(seg, &idx1[sbase..sbase + SUBS], codebook);
                 if let Some(refit) = refit
                     && refit != scales[o * ngroups + grp]
                 {
@@ -447,9 +444,15 @@ fn main() -> Result<()> {
     // The MTP head (`num_nextn_predict_layers`) is checkpoint layer `n_layers`: a full
     // MoE layer plus enorm/hnorm/eh_proj/shared_head.norm. Carried only on a whole-model
     // convert — a `--layers`-limited artifact has no hidden state for it to consume.
-    let mtp = args.layers.is_none() && src.has(&format!("model.layers.{}.eh_proj.weight", d.n_layers));
-    eprintln!("convert: mtp head {}", if mtp { "carried" } else { "absent" });
-    let moe_layers: Vec<usize> = (d.dense_layers..last).chain(mtp.then_some(d.n_layers)).collect();
+    let mtp =
+        args.layers.is_none() && src.has(&format!("model.layers.{}.eh_proj.weight", d.n_layers));
+    eprintln!(
+        "convert: mtp head {}",
+        if mtp { "carried" } else { "absent" }
+    );
+    let moe_layers: Vec<usize> = (d.dense_layers..last)
+        .chain(mtp.then_some(d.n_layers))
+        .collect();
 
     let stride = rivoli::artifact::quant::vq_expert_stride(d.hidden, d.moe_inter);
     let ebytes = vq_expert_bytes(d.hidden, d.moe_inter);
@@ -543,7 +546,12 @@ fn main() -> Result<()> {
         // 15 GB resident set and reuses gemv_f32.
         // ponytail: f32 eh_proj, int8 it if the resident budget ever bites.
         if l == d.n_layers {
-            for t in ["enorm.weight", "hnorm.weight", "eh_proj.weight", "shared_head.norm.weight"] {
+            for t in [
+                "enorm.weight",
+                "hnorm.weight",
+                "eh_proj.weight",
+                "shared_head.norm.weight",
+            ] {
                 w.add_widened(&src, &format!("{lb}.{t}"))?;
             }
         }
@@ -661,9 +669,20 @@ mod tests {
             let x: Vec<f32> = (0..*i_dim).map(|v| (v + 1) as f32).collect();
             let mut yl = vec![0.0f32; *o_dim];
             let mut yr = vec![0.0f32; *o_dim];
-            let ps: Vec<u16> =
-                proj.scales.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-            matvec_vq(&mut yl, &x, proj.indices, &ps, &cbs[k], proj.o_dim, proj.i_dim);
+            let ps: Vec<u16> = proj
+                .scales
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            matvec_vq(
+                &mut yl,
+                &x,
+                proj.indices,
+                &ps,
+                &cbs[k],
+                proj.o_dim,
+                proj.i_dim,
+            );
             matvec_vq(&mut yr, &x, indices, scales, &cbs[k], *o_dim, *i_dim);
             assert_eq!(yl, yr);
         }
