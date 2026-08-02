@@ -684,6 +684,25 @@ fn mla_attend_glm_dims() {
     check_attend(0x0a5e_1102, 64, 300, 512, 64);
 }
 
+/// Long context, where the split PLANNER changes regime — the case every other attend
+/// test misses. `mla_attend_glm_dims` runs nt=300 (ntiles=19), so `by_work` binds and
+/// `n_splits` is 4; nothing above exercises the two regimes the engine actually reaches:
+/// `by_grid` binding (nt ≳ 640) and the `MLA_MAX_SPLITS` clamp (nt ≳ 1024).
+///
+/// Added 2026-08-02 after an `HB` 8→16 sweep measured **2.08× on the kernel** and then
+/// failed the perplexity gate at **+0.108 nats** — damage that is exactly zero below
+/// nt≈640, symmetric noise to ~4600, and catastrophic past it (max |dNLL| 16 nats). The
+/// whole suite passed at HB=16 because its longest case stops at 300. A knob whose only
+/// effect is on the split plan needs a case where the split plan is non-trivial.
+///
+/// nt=4608 is the smallest size reproducing the blow-up; the f32 reference is O(nt·kvl·h)
+/// and runs in about a second, which is why this is a plain case and not `#[ignore]`d.
+#[test]
+fn mla_attend_long_context_split_regimes() {
+    check_attend(0x5f11_7bad, 64, 704, 512, 64); // just past by_grid binding
+    check_attend(0xc1a3_9ed0, 64, 4608, 512, 64); // past the MLA_MAX_SPLITS clamp
+}
+
 #[test]
 fn mla_attend_edges() {
     // Single cached token stresses the online init (m=-inf on the first token);
