@@ -413,15 +413,25 @@ struct ArenaPool {
     /// finite and WRONG, the silent case) memory.
     ///
     /// A key is removed on eviction and on relocation-into, and inserted only when its
-    /// read signal has resolved. `trace` only — it costs a hash op per expert per layer.
-    #[cfg(feature = "trace")]
+    /// read signal has resolved.
+    ///
+    /// **Was `trace`-only until 2026-08-03; it is now always compiled, and that change is
+    /// the point.** The fault it detects is silent by construction — a hit whose bytes never
+    /// landed reads the previous expert's weights, which are finite and plausible — and the
+    /// only build that could see it was the one whose poison fill adds a `device_sync` that
+    /// masks it. So the detector existed and could not fire. Long runs were measured
+    /// non-deterministic (~40% of 5k-token scores wrong, benchmarks.md 2026-08-02) with this
+    /// check compiled out.
+    ///
+    /// It costs a hash op per expert per layer: ~600 per token against a ~400 ms token, i.e.
+    /// ~0.003%, and adds NO device work and NO ordering — which is what lets it hunt a race
+    /// rather than hide one. The poison fill and its `device_sync` stay behind `trace`.
     loaded: std::collections::HashSet<u32>,
     /// Misses submitted by the PREVIOUS layer, marked loaded at the top of the next
     /// `submit_layer`. Correct because layer L's per-expert awaits and its unconditional
     /// end-of-layer `device_sync` both complete before layer L+1 submits — so by then
     /// every byte of L's batch has landed. Deferring this way avoids plumbing a
     /// completion callback through `gpu.rs`'s async expert loop.
-    #[cfg(feature = "trace")]
     pending_loaded: Vec<u32>,
     cold: TierFmt,
     hot: TierFmt,
@@ -454,15 +464,14 @@ impl ArenaPool {
     }
     /// Record that `key`'s bytes have landed in its current slot. Called once per MISS,
     /// after that read's signal resolves.
-    #[cfg(feature = "trace")]
     fn mark_loaded(&mut self, key: u32) {
         self.loaded.insert(key);
     }
 
     /// Has `key`'s data actually landed since it was last admitted? A HIT on a key for
     /// which this is false is a read of uninitialised or stale bytes — the fault this
-    /// instrumentation exists to catch.
-    #[cfg(feature = "trace")]
+    /// check exists to catch, and the leading explanation for the measured
+    /// non-determinism of long runs.
     fn is_loaded(&self, key: u32) -> bool {
         self.loaded.contains(&key)
     }
@@ -484,7 +493,6 @@ impl ArenaPool {
             self.key_at.remove(&s);
             // Evicted: its bytes are no longer this key's, and the slot is about to be
             // handed to someone else.
-            #[cfg(feature = "trace")]
             self.loaded.remove(&ev);
             self.arena.free(s.0, s.1);
         }
@@ -502,7 +510,6 @@ impl ArenaPool {
         self.key_at.insert((hot, idx), key);
         // Freshly admitted: a slot with no bytes in it yet. `mark_loaded` clears this
         // once the read lands. A HIT observed while a key is in this state is the bug.
-        #[cfg(feature = "trace")]
         self.loaded.remove(&key);
         // POISON the slot before its bytes land, so a read-before-write is deterministic.
         //
@@ -827,9 +834,7 @@ impl<'a> Pin<'a> {
             policy,
             slot_of: HashMap::new(),
             key_at: HashMap::new(),
-            #[cfg(feature = "trace")]
             loaded: std::collections::HashSet::new(),
-            #[cfg(feature = "trace")]
             pending_loaded: Vec::new(),
             cold,
             hot,
@@ -1001,7 +1006,6 @@ impl<'a> Pin<'a> {
         // New batch: clear the policy's per-batch pin set. Phase 1a's protect() and 1b's
         // admit() then pin every touched key so a later miss's eviction can't reclaim it.
         // The previous layer's reads have all landed (its awaits + end-of-layer sync).
-        #[cfg(feature = "trace")]
         {
             let done = std::mem::take(&mut self.routed.pending_loaded);
             for k in done {
@@ -1056,7 +1060,6 @@ impl<'a> Pin<'a> {
                 // kernel reads uninitialised memory (NaN) or another expert's weights
                 // (finite, wrong, silent). Reported once per occurrence rather than
                 // fataling, so a run keeps going and the pattern is visible.
-                #[cfg(feature = "trace")]
                 if !self.routed.is_loaded(key) {
                     tracing::error!(
                         "READ-BEFORE-WRITE: layer={layer} expert={e} counted as a cache \
@@ -1136,7 +1139,6 @@ impl<'a> Pin<'a> {
         // Phase 2: hand the whole batch to the reaper — it queues+submits (all reads
         // start at once) and signals each miss's ticket when its copy lands.
         // Queue this batch's misses to be marked loaded at the next layer.
-        #[cfg(feature = "trace")]
         for &i in &miss_sel {
             self.routed.pending_loaded.push(expert_key(layer, sel[i]));
         }
