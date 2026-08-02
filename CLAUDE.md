@@ -35,12 +35,13 @@ agrees. If you change a verdict, change both; the test will tell you which one y
 | `top-m` routing | **RETIRED**, removed from the engine |
 | Vulkan | decodes `--mode int3-vq --attn dense`; 16 of 29 kernels; 6 more are single-row; ~1.9× slower |
 | MoE accumulation | fixed-point (`MOE_ACC_SHIFT 44`), no cross-stream join |
+| layer-major prefill | `--layer-major-prefill`, **opt-in** 2026-08-02: prefill **2.15×**, reads **159.56 → 28.20/token** (the floor), output byte-identical, every `--attn` mode. Decode pays a ONE-OFF ~2.7 s warm-up (1.8% of the prefill saving; the "1.55× slower decode" reading is a 13-pass artifact). Closing the sweep token-major was tried and **reverted** — useless. `architecture.md` §14 |
 
 ## Build and test
 
 ```bash
 cargo build --release --features rocm        # or --features vulkan; NEVER both
-cargo test  --release --features rocm        # 100 tests
+cargo test  --release --features rocm        # 108 tests
 cargo clippy --release --features rocm --all-targets
 # Before you claim a change compiles, ALSO run the union — see below.
 cargo clippy --release --features rocm,otlp,teacher-forcing,pred-probe,trace --all-targets

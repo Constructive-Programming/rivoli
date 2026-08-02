@@ -1074,3 +1074,79 @@ correction below, and the one under it for streaming.
 
 **The `.i4` MoE kernel was on this list until 2026-07-31** and is now batched — see the
 block at the top of this section for why the guard that refused it earned its keep.
+
+## 14. Layer-major prefill — OPT-IN 2026-08-02
+
+**Off by default**; `--layer-major-prefill` opts in. It changes the ORDER the prompt walks
+the model and nothing else, so it moves the expert read count and **never** output —
+verified byte-identical on `--attn dense` (16 ids, `--dump-ids`) and gated by
+`tests/layer-major-neutrality.sh`. Measured 2.15x on prefill wall, 5.66x fewer expert reads;
+docs/measurement/benchmarks.md, "Layer-major prefill".
+
+Token-major prefill runs `forward(tok, pos)` per prompt token, so a token walks all 78
+layers before the next one starts. Layer-major inverts the loops: every token through layer
+L, then every token through L+1. `forward_inner` was already row-batched for §13's verify
+pass, so the reordering is a `Span { layers, x_off, tail }` on it rather than a second
+engine — `layers` narrows a pass to one layer, `x_off` gives it a window into a
+prompt-wide `x`, `tail` says how many trailing rows get logits.
+
+### Why the order is worth anything
+
+Routing is unchanged, so both orders demand exactly the same `(layer, expert)` pairs. What
+differs is the DISTANCE between two demands for the same pair. Token-major puts 77 other
+layers between them and the pool evicts in the gap; layer-major puts one pass. One layer's
+experts are 256 x 15.34 MB = 3.93 GB against a 6874-slot pool, so nothing is ever evicted
+before it is wanted again, and the read count falls to the compulsory one — 28.20/token
+measured against 159.56.
+
+### Legality, and the one thing that could have broken it
+
+Layer L for all tokens needs only layer L-1 for all tokens, which holds by construction for
+everything except attention. Attention is fine too: row `r` attends over `pos + r + 1` KV
+rows, and every row below it in this layer appended its KV in an earlier (or the same) pass.
+The differing `nr` IS the causal mask, exactly as in §13's verify pass.
+
+**What did break was the dsa/misa indexer, and it broke silently.** IndexShare has a shared
+layer reuse "this token's selection from the last full layer", and that state
+(`last_nr`/`last_dense`, plus the row's slice of `rows_buf`) was keyed by ROW SLOT. Keyed
+that way it is correct only while a token's whole model runs inside one pass: layer-major
+puts a different token in slot `r` between one layer and the next, so a shared layer would
+attend over a row set selected for a token elsewhere in the prompt. No crash, no counter
+that moves, plausible text. The reuse state is now keyed by ABSOLUTE POSITION when passes
+can split, and the indexer owns a dedicated `sel` buffer (`index_topk` u32 per slot) instead
+of borrowing streaming's `rows_buf` — the two have different lifetimes, which is what the
+shared buffer was hiding. Costs `index_topk * 4` = 8 KB per context token, only when the
+flag is on. Streaming needed nothing: its selection is a pure function of `(pos, sinks,
+window)`, rebuilt every pass.
+
+### What it costs, and what it does not buy
+
+`x` holds the whole prompt's residual stream (24 KB/token) because layer L reads what L-1
+wrote for every row. That is the only buffer that widens — passes are still `MAXROW` = 2
+rows, so this buys the NVMe reduction and **not** the LPDDR5 one. Each 2-row pass still
+streams its experts out of RAM; layer-major only halves how often. The remaining multiple
+needs general-`R` MoE kernels (`moe_gateup_vq` and its int4 twin are templated at `R <= 2`
+and return 1004 above it), and a genuinely wide `R` wants LDS tiling on both operands, not
+one more `acc[R]` slot — at R=769 the activations alone exceed L2. See benchmarks.md.
+
+**Decode starts cold afterwards — a ONE-OFF ~2.7 s, not a rate**, because the pool ends up
+holding layer 77 for every token rather than ten tokens' worth of every layer. Read at 13
+passes it looks like a 1.55x per-pass regression (610.5 vs 390.8 ms); at 22 passes the gap
+per pass HALVES to 117.7 ms while the product holds at ~2.7 s, and layer-major's own ms/pass
+does not move (610.5 -> 608.0) while token-major's rises with context. Warm-up, not cost.
+Against 152 s of prefill saved on the same run it is 1.8%. See benchmarks.md.
+
+> **A mitigation was implemented, measured and REVERTED — do not re-propose it.** Sweep
+> `0..n-2` layer-major, then run the last prompt token through all 78 layers as one ordinary
+> pass so the pool ends in the token-major shape. Correct (output identical) and useless:
+> decode 618.5 ms/pass against 610.5 without it, for +383 expert reads.
+>
+> It cannot work, and the reason is a fact about the pool worth keeping: a token-major
+> prefill leaves roughly the last **ten** tokens' experts resident — 6874 slots / (78 layers
+> x 9 experts) = 9.8 — not the last one's. One closing pass restores a tenth of the coverage
+> decode actually finds there. A ~10-token close would reproduce it, and at a fixed 2.7 s
+> that is not worth the reads.
+
+`--trace` is refused with it: a v2 trace has no token delimiter and a reader recovers one
+from the layer id descending, which a layer-major prefill never does. The read counts would
+be right and the segmentation silently wrong.

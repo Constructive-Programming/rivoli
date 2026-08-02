@@ -50,6 +50,8 @@ verdict: The ranked performance roadmap. Live rows: #2 VQ_K codebook, #5 the MLA
 | 6b | o_proj split-K / x-tiling | follow-up #2 | — | — | **refuted and reverted** |
 | 7 | `mla_absorb` restructure | follow-up #4 | **−0.80 ms/tok, measured** | med | **done** |
 | 8 | Faster demand fetch (deeper queues, split reads, unpinned arena) | B | — | — | **closed as negative 2026-08-01** — the drive is already giving what the queue depth buys; see below |
+| 9 | Layer-major prefill | A | **prefill 2.15×**; expert reads 159.56 → 28.20/token (the compulsory floor); output byte-identical | med | **done, opt-in 2026-08-02** — `--layer-major-prefill`; decode pays a one-off ~2.7 s warm-up, 1.8% of the saving. `docs/reference/architecture.md` §14 |
+| 10 | General-`R` MoE kernels (tiled GEMM) | follow-up #9 | the rest of #9: a 2-row pass still re-reads its experts from LPDDR5, and that is now the prefill bound | **high** | new — see below |
 
 > **Item 8 is a closed door, and it is worth knowing which door.** The demand fetch runs at
 > ~10 GB/s; `docs/measurement/probes/fetch_batch.hip` reproduces the engine's exact shape (pinned bounce
@@ -92,3 +94,23 @@ big multiplier; #1 has landed and #4 has a measured loss against it, so:
 replay residency sim, (b) a fixed forced-token wall-clock bench, and (c) perplexity for
 quality — **never** free-running greedy tok/s (confounded by output degeneration; a broken
 run looks fastest). See [docs/reference/modes.md](docs/reference/modes.md) and [docs/measurement/benchmarks.md](../benchmarks.md).
+
+> **#10, and why it is `high` effort rather than "template the kernel wider".** #9 removed
+> the NVMe term from prefill and left the LPDDR5 one, which is now the bound: a pass is
+> `MAXROW` = 2 rows, so each 2-row pass still streams its experts out of RAM and layer-major
+> only halves how often. `moe_gateup_vq`/`moe_down_vq` and the int4 twins are templated on
+> `R` and return guard 1004 above 2, so the obvious move is to raise the template.
+>
+> **That does not work, and the reason is the activation side, not the weight side.** The
+> kernels hold `float acc[R]` in registers and read `x` from cache. At R=2 the activations
+> are 48 KB and every wave re-reads them out of L2 for free. At R=769 they are 18.9 MB —
+> larger than L2 — so `x` would stream from DRAM once per output-row block, and at 2048
+> output rows per expert that costs far more than the 15.34 MB of weights it saved. A wide
+> `R` therefore needs LDS tiling on BOTH operands, i.e. an actual tiled GEMM per expert per
+> projection, plus its Vulkan twin. That is the work; the payoff is the gap between #9's
+> 2.15× and the ~13× the read count alone would suggest.
+>
+> Intermediate `R` is the cheap probe and it is not free either: `moe_h` is
+> `[slot][row][inter]` and grows as `union × R × moe_inter × 4`, i.e. 2.1 MB per row of `R`
+> at a 257-expert union — 67 MB at R=32, 269 MB at R=128. Dispatching one expert at a time
+> collapses that to `R × moe_inter × 4` and is the way in.

@@ -216,6 +216,25 @@ struct Args {
     #[arg(long, default_value_t = 0.8)]
     mtp_min_conf: f32,
 
+    /// Prefill the prompt LAYER-MAJOR: every token through layer L before any reaches
+    /// L+1, instead of every layer per token.
+    ///
+    /// Same arithmetic, different order. Token-major prefill evicts layer L's experts long
+    /// before the next token wants them — 154.75 expert reads per token over a 769-token
+    /// prompt. Layer-major reads each distinct (layer, expert) pair once: 24.02 per token,
+    /// the compulsory floor.
+    ///
+    /// Costs 24 KB of device memory per context token, because the whole prompt's residual
+    /// stream has to stay live across the model; under --attn dsa/misa another 8 KB/token,
+    /// since the indexer's reuse state has to be keyed by position rather than by row.
+    /// Works with every attention mode.
+    ///
+    /// Off by default until the wall-clock A/B is recorded in
+    /// docs/measurement/benchmarks.md. Passes are still 2 rows wide, so this buys the NVMe
+    /// reduction and not the LPDDR5 one — see `GpuEngine::prefill_layer_major`.
+    #[arg(long)]
+    layer_major_prefill: bool,
+
     /// DIAGNOSTIC: hash the residual stream after every layer.
     #[cfg(feature = "trace")]
     #[arg(long)]
@@ -569,7 +588,13 @@ fn main() -> Result<()> {
             (None, Some(_)) => a.ctx,
             (None, None) => prompt_ids.len() + ngen + 1,
         };
-        let mut engine = rivoli::gpu::GpuEngine::new(pin, &mc, max_ctx, cfg.attn.clone())?;
+        let mut engine = rivoli::gpu::GpuEngine::new(
+            pin,
+            &mc,
+            max_ctx,
+            cfg.attn.clone(),
+            a.layer_major_prefill,
+        )?;
         #[cfg(feature = "trace")]
         engine.set_checksum_x(cfg.checksum_x);
         #[cfg(feature = "pred-probe")]

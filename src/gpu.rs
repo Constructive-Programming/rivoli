@@ -83,8 +83,62 @@ enum Draft {
     Head,
 }
 
+/// Which slice of the model, and of the residual stream, one `forward_inner` pass covers.
+///
+/// A decode pass is [`Span::whole`]: every layer, rows `0..nrow` of `x`, logits for all of
+/// them. Layer-major prefill is the other shape — ONE layer, a two-row window into an `x`
+/// that holds the entire prompt, and no logits at all except on the very last pass.
+#[derive(Clone)]
+struct Span {
+    /// Model layers to run. Ignored under [`Draft::Head`]: the head IS its own layer.
+    layers: std::ops::Range<usize>,
+    /// First row of `x` this pass owns. `x` is the ONLY scratch that can be wider than
+    /// [`MAXROW`] — every other buffer is `MAXROW` rows starting at row 0 — so this
+    /// offset applies to it and to nothing else.
+    x_off: usize,
+    /// Run the tail (final norm → lm_head) on the LAST `tail` rows, writing their logits
+    /// to rows `0..tail`. 0 skips it entirely, which is what makes layer-major prefill
+    /// affordable: logits are 620 KB per row at this vocab and only the prompt's final
+    /// row is ever read.
+    tail: usize,
+}
+
+impl Span {
+    /// The decode shape: the whole model at row 0, logits for every row of the pass.
+    fn whole(n_layers: usize, tail: usize) -> Self {
+        Self {
+            layers: 0..n_layers,
+            x_off: 0,
+            tail,
+        }
+    }
+}
+
 fn mtp_bin(conf: f32) -> usize {
     ((conf * MTP_BINS as f32) as usize).min(MTP_BINS - 1)
+}
+
+/// The passes a layer-major prefill runs, in order: `(layer, first row, rows, tail)`.
+///
+/// Split out of [`GpuEngine::prefill_layer_major`] so the ordering contract is testable
+/// without a GPU, because every part of it is load-bearing and none of it is obvious:
+/// layers must ascend (layer L reads what L−1 wrote), rows must ascend within a layer
+/// (row `r` attends over the KV rows below it, which the passes before it appended),
+/// every `(layer, row)` must appear exactly once (twice would re-embed or double the
+/// residual), and the tail must fire on the LAST row of the LAST layer and nowhere else
+/// (that row's logits are the only ones the decode loop reads).
+fn layer_major_schedule(
+    n: usize,
+    n_layers: usize,
+    width: usize,
+) -> impl Iterator<Item = (usize, usize, usize, usize)> {
+    (0..n_layers).flat_map(move |l| {
+        (0..n).step_by(width).map(move |lo| {
+            let rows = (lo + width).min(n) - lo;
+            let last = l + 1 == n_layers && lo + rows == n;
+            (l, lo, rows, usize::from(last))
+        })
+    })
 }
 
 /// `softmax(logits)[argmax]` from a raw f32 logit vector — the draft head's confidence
@@ -464,12 +518,25 @@ struct DeviceIndexer {
     q: DeviceBuf,      // index_n_heads * index_head_dim f32
     w: DeviceBuf,      // index_n_heads f32
     scores: DeviceBuf, // max_ctx f32
-    /// The most recent full layer's selection this token, PER TOKEN ROW (IndexShare
-    /// reuse): `last_dense[r]` = the whole causal prefix (null rows), else `last_nr[r]`
-    /// rows. Per row because a verify pass's rows sit one position apart, so the row that
-    /// has just crossed `index_topk` selects while the row below it is still dense.
-    last_nr: [usize; MAXROW],
-    last_dense: [bool; MAXROW],
+    /// The most recent full layer's selection, per IndexShare slot: `last_dense[s]` = the
+    /// whole causal prefix (null rows), else `last_nr[s]` rows out of [`DeviceIndexer::sel`].
+    /// Per slot rather than per layer because a verify pass's rows sit one position apart,
+    /// so the row that has just crossed `index_topk` selects while the row below it is
+    /// still dense.
+    ///
+    /// A slot is a ROW of the current pass when a token's layers all run inside one pass,
+    /// and its ABSOLUTE POSITION when they can be split across passes (layer-major
+    /// prefill). `dsa_select_layer`'s `slot_of` is the one place that decides; see
+    /// `share_rows` in [`GpuEngine::new`] for why both forms exist and what each costs.
+    last_nr: Vec<usize>,
+    last_dense: Vec<bool>,
+    /// The selections themselves: `share_rows` slots of `index_topk` u32, written in place
+    /// by `index_topk` and read by `attend` — and, on a shared layer, read again by
+    /// whichever later layer reuses the slot. Separate from `GpuEngine::rows_buf` (which
+    /// is now streaming's alone) because the two have different lifetimes and different
+    /// widths: a streaming selection is rebuilt every pass and can be `max_ctx` long,
+    /// while this one has to SURVIVE passes and is never longer than `index_topk`.
+    sel: DeviceBuf,
     // --- MISA head routing (empty/unused in dsa mode) ---
     pool: Vec<DeviceBuf>, // per full layer, ⌈max_ctx/MISA_BLOCK⌉ rows of index_head_dim f32
     e: DeviceBuf,         // index_n_heads f32 — router estimates
@@ -491,19 +558,31 @@ pub struct GpuEngine<'a> {
     /// Attention row-selection mode. Dense/Streaming pick rows by position; Dsa/Misa
     /// run the resident indexer per full layer.
     mode: AttnMode,
-    /// Device copy of the selected rows: `MAXROW` slices of `max_ctx` u32, row `r` at
-    /// element offset `r * max_ctx`. Uploaded per token, shared by every layer's attend;
-    /// null-rows (dense) skips it. One slice PER ROW because the two rows of a verify pass
-    /// sit at different positions and select different KV sets — with one slice the second
-    /// row's selection overwrote the first's before either was attended over.
+    /// STREAMING's selected rows: `MAXROW` slices of `max_ctx` u32, row `r` at element
+    /// offset `r * max_ctx`. Uploaded per pass, shared by every layer's attend; null-rows
+    /// (dense) skips it. One slice PER ROW because the two rows of a verify pass sit at
+    /// different positions and select different KV sets — with one slice the second row's
+    /// selection overwrote the first's before either was attended over.
+    ///
+    /// Dsa/misa used to share this buffer and now own [`DeviceIndexer::sel`] instead: a
+    /// streaming selection is rebuilt from scratch every pass, while an indexer selection
+    /// has to survive until a later shared layer reuses it.
     rows_buf: DeviceBuf,
     rows_host: Vec<u32>,
     /// Device-side DSA indexer (dsa/misa modes); `None` for dense/streaming.
     idx: Option<DeviceIndexer>,
     /// KV-slab capacity in tokens; forward() refuses pos beyond it.
     max_ctx: usize,
+    /// Prefill the prompt LAYER-MAJOR (`--layer-major-prefill`). See
+    /// [`GpuEngine::prefill_layer_major`] — same arithmetic, 6.4x fewer expert reads.
+    layer_major_prefill: bool,
     // Per-token device scratch (allocated once, reused).
+    /// Residual stream. The ONE buffer that can be wider than [`MAXROW`]: layer-major
+    /// prefill needs every prompt token's hidden state live across the whole model, since
+    /// layer L reads what L−1 wrote for every row. `MAXROW` rows otherwise.
     x: DeviceBuf,
+    /// Rows `x` was allocated for — the bound `forward_inner` checks `x_off + nrow` against.
+    x_rows: usize,
     xn: DeviceBuf,
     /// MTP scratch. `mtp_cat` is the `[enorm(emb) ‖ hnorm(h)]` concatenation `eh_proj`
     /// consumes (2·hidden); `mtp_x` is the head's own residual stream, swapped with `x`
@@ -687,7 +766,13 @@ pub struct GpuEngine<'a> {
 }
 
 impl<'a> GpuEngine<'a> {
-    pub fn new(pin: Pin<'a>, cfg: &'a ModelConfig, max_ctx: usize, mode: AttnMode) -> Result<Self> {
+    pub fn new(
+        pin: Pin<'a>,
+        cfg: &'a ModelConfig,
+        max_ctx: usize,
+        mode: AttnMode,
+        layer_major_prefill: bool,
+    ) -> Result<Self> {
         // The MoE block folds the shared expert into the routed batch at a single
         // kernel `inter = moe_inter`. Only valid when the shared expert has the routed
         // width, i.e. n_shared == 1 (GLM-5.2).
@@ -696,6 +781,23 @@ impl<'a> GpuEngine<'a> {
             "GPU decode assumes n_shared==1 (shared folded into the routed batch); n_shared={}",
             cfg.n_shared
         );
+        // How many IndexShare reuse slots the dsa/misa indexer keeps, and what a slot MEANS.
+        //
+        // A shared layer reuses "this token's selection from the last full layer". Running
+        // token-major, a token's whole model is one `forward_inner`, so the reuse never
+        // outlives the call and a slot per ROW is exactly a slot per token. Running
+        // layer-major, that same token's 78 layers are 78 separate passes with every other
+        // token's passes interleaved, so a row slot holds a different token from one layer
+        // to the next — the reuse has to be keyed by ABSOLUTE POSITION instead.
+        //
+        // Position-keyed is the general form and is correct either way; it just costs
+        // `index_topk * 4` = 8 KB per context token (67 MB at max_ctx 8192, 2048 topk).
+        // The narrow form is kept for the runs whose passes cannot split, so nothing pays
+        // for a generality it cannot use.
+        let share_rows = match layer_major_prefill {
+            true => max_ctx.max(MAXROW),
+            false => MAXROW,
+        };
         let f = |n: usize| DeviceBuf::new(n * 4); // f32 buffer of n elems
         // dsa and misa both need the resident indexer; misa additionally routes heads.
         let idx = if matches!(mode, AttnMode::Dsa | AttnMode::Misa { .. }) {
@@ -723,8 +825,9 @@ impl<'a> GpuEngine<'a> {
                 q: DeviceBuf::new(cfg.index_n_heads * hd * 4)?,
                 w: DeviceBuf::new(cfg.index_n_heads * 4)?,
                 scores: DeviceBuf::new(max_ctx * 4)?,
-                last_nr: [0; MAXROW],
-                last_dense: [true; MAXROW],
+                last_nr: vec![0; share_rows],
+                last_dense: vec![true; share_rows],
+                sel: DeviceBuf::new(share_rows * cfg.index_topk * 4)?,
                 pool,
                 e: DeviceBuf::new(cfg.index_n_heads * 4)?,
                 e_host: Vec::new(),
@@ -770,6 +873,23 @@ impl<'a> GpuEngine<'a> {
             lc_scale.push(DeviceBuf::new(max_ctx * n_kv_blocks * 4)?); // f32 block scales
             rc.push(DeviceBuf::new(max_ctx * rope * 2)?); // bf16 roped key
         }
+        // Layer-major prefill keeps the WHOLE prompt's residual stream live across the
+        // model, so `x` has to hold it: 24 KB a token, i.e. 18.9 MB for a 769-token prompt
+        // and 201 MB at max_ctx 8192. `max_ctx` is the honest bound — the server sizes its
+        // context once and every prompt it accepts fits inside it. Nothing else widens:
+        // passes are still MAXROW rows, so this costs exactly zero when the flag is off.
+        let x_rows = match layer_major_prefill {
+            true => max_ctx.max(MAXROW),
+            false => MAXROW,
+        };
+        tracing::info!(
+            "residual stream: {x_rows} rows ({:.1} MB){}",
+            (x_rows * cfg.hidden * 4) as f64 / 1e6,
+            match layer_major_prefill {
+                true => " — layer-major prefill",
+                false => "",
+            }
+        );
         Ok(Self {
             moe_gain: 1.0,
             cfg,
@@ -778,7 +898,9 @@ impl<'a> GpuEngine<'a> {
             rows_host: Vec::new(),
             idx,
             max_ctx,
-            x: f(MAXROW * cfg.hidden)?,
+            layer_major_prefill,
+            x: f(x_rows * cfg.hidden)?,
+            x_rows,
             xn: f(MAXROW * cfg.hidden)?,
             mtp_cat: f(MAXROW * 2 * cfg.hidden)?,
             mtp_x: f(MAXROW * cfg.hidden)?,
@@ -987,15 +1109,21 @@ impl<'a> GpuEngine<'a> {
         let rope = cfg.qk_rope_head_dim;
         let theta = cfg.rope_theta();
         let topk = cfg.index_topk;
-        // Row r's selection lives at elements `r*max_ctx ..` of `rows_buf`.
-        let max_ctx = self.max_ctx;
+        // Which IndexShare slot each row of this pass owns — the absolute position when a
+        // token's layers can be split across passes, the row index when they cannot. Bound
+        // as a closure over a plain `bool` BEFORE `self.idx` is borrowed, because the
+        // decision belongs to the engine and the state it indexes belongs to the indexer.
+        let by_pos = self.layer_major_prefill;
+        let slot_of = move |r: usize| match by_pos {
+            true => pos + r,
+            false => r,
+        };
         // MISA routes a head subset; DSA scores all heads. Read the mode before
         // borrowing `self.idx` (Copy — no move of self.mode).
         let active_heads = match self.mode {
             AttnMode::Misa { active_heads } => Some(active_heads),
             _ => None,
         };
-        // Disjoint field borrows: idx (mut) and rows_buf (mut) are distinct fields.
         let idx = self
             .idx
             .as_mut()
@@ -1017,15 +1145,25 @@ impl<'a> GpuEngine<'a> {
             )
         })? {
             Some(s) => s,
-            // Shared layer: reuse each row's own last full-layer selection verbatim.
+            // Shared layer: reuse each row's own last full-layer selection verbatim — the
+            // slot's, which is this token's however the passes were sliced.
             None => {
-                let base = self.rows_buf.ptr() as *const u32;
-                let (dense, nr) = (idx.last_dense, idx.last_nr);
-                return Ok(std::array::from_fn(|r| match dense[r] {
-                    true => (std::ptr::null(), nr[r]),
-                    // SAFETY: rows_buf holds MAXROW slices of max_ctx u32 and r < MAXROW.
-                    false => (unsafe { base.add(r * max_ctx) }, nr[r]),
-                }));
+                let base = idx.sel.ptr() as *const u32;
+                // `take(nrow)`, not `from_fn` over all MAXROW: a slot is an absolute
+                // position under layer-major, so row 1 of a one-row pass at the last
+                // context position would index one past `share_rows`.
+                let mut out = [(std::ptr::null(), 0usize); MAXROW];
+                for (r, o) in out.iter_mut().enumerate().take(nrow) {
+                    let s = slot_of(r);
+                    *o = match idx.last_dense[s] {
+                        true => (std::ptr::null(), idx.last_nr[s]),
+                        // SAFETY: `sel` holds `share_rows` slots of `topk` u32, and the
+                        // caller's `pos + nrow <= max_ctx` bounds every slot this pass
+                        // touches (`share_rows` is `max_ctx` whenever slots are positions).
+                        false => (unsafe { base.add(s * topk) }, idx.last_nr[s]),
+                    };
+                }
+                return Ok(out);
             }
         };
         let ip = ipin.ok_or_else(|| anyhow::anyhow!("full layer {l} missing resident indexer"))?;
@@ -1039,7 +1177,7 @@ impl<'a> GpuEngine<'a> {
         } else {
             std::ptr::null_mut()
         };
-        let rows_base = self.rows_buf.ptr_mut() as *mut u32;
+        let sel_base = idx.sel.ptr_mut() as *mut u32;
 
         // DSA only, and this is a correctness guard, not a scoping choice: MISA's
         // head-route runs its own `device_sync` + D2H *inside* this bracket, which would
@@ -1060,6 +1198,7 @@ impl<'a> GpuEngine<'a> {
         // in which case there is nothing to join on and no span worth reading.
         let mut scored_nt = 0usize;
         for (r, slot) in out.iter_mut().take(nrow).enumerate() {
+            let s = slot_of(r);
             let pos = pos + r;
             let nt = pos + 1;
             // SAFETY: xn and qr are row-minor scratch of MAXROW rows, r < nrow <= MAXROW.
@@ -1089,8 +1228,8 @@ impl<'a> GpuEngine<'a> {
                 }
             }
             if nt <= topk {
-                idx.last_dense[r] = true;
-                idx.last_nr[r] = nt;
+                idx.last_dense[s] = true;
+                idx.last_nr[s] = nt;
                 *slot = (std::ptr::null(), nt);
                 continue;
             }
@@ -1182,15 +1321,15 @@ impl<'a> GpuEngine<'a> {
             // credited with the host round-trip it removed.
             //
             // SAFETY: scp holds nt f32 (just written by index_score, same stream); this
-            // row's rows_buf slice is max_ctx u32 at element r*max_ctx and the kernel
-            // writes exactly nr = min(topk, nt) <= nt <= max_ctx. Both buffers are
-            // engine-owned.
-            let rowp = unsafe { rows_base.add(r * max_ctx) };
+            // slot's `sel` slice is `topk` u32 at element s*topk and the kernel writes
+            // exactly nr = min(topk, nt) = topk of them (the dense guard above already
+            // took every nt <= topk). Both buffers are engine-owned.
+            let rowp = unsafe { sel_base.add(s * topk) };
             unsafe {
                 launch_index_topk(scp as *const f32, nt, topk, rowp)?;
             }
-            idx.last_dense[r] = false;
-            idx.last_nr[r] = nr;
+            idx.last_dense[s] = false;
+            idx.last_nr[s] = nr;
             *slot = (rowp as *const u32, nr);
             scored_nt = nt;
         }
@@ -1219,7 +1358,103 @@ impl<'a> GpuEngine<'a> {
     /// in `self.logits`.
     /// The main model: embed `token`, run every layer, leave logits on the device.
     async fn forward(&mut self, token: u32, pos: usize) -> Result<()> {
-        self.forward_inner(&[token], pos, Draft::No).await
+        let span = Span::whole(self.cfg.n_layers, 1);
+        self.forward_inner(&[token], pos, Draft::No, span).await
+    }
+
+    /// Prefill LAYER-MAJOR: every prompt token through layer L before any token reaches
+    /// layer L+1. Same arithmetic in a different order, and the order is the whole point.
+    ///
+    /// Token-major prefill walks all 78 layers per token, so layer L's experts are long
+    /// evicted by the time the next token asks for them — **154.75 expert reads per
+    /// token** over a 769-token prompt (2Q, 6874 slots, measured offline in `bin/replay`).
+    /// Layer-major asks for layer L's experts once and reuses them across the whole
+    /// prompt: **18,474 reads, 24.02 per token**, which IS the compulsory count — one read
+    /// per distinct `(layer, expert)` pair, the floor no policy can beat. Nothing thrashes
+    /// on the way, because one layer's experts are 256 × 15.34 MB = 3.93 GB against a
+    /// 6874-slot pool. See docs/measurement/benchmarks.md, "Batch coalescing…".
+    ///
+    /// Legality rests on one property: layer L for all tokens needs only layer L−1 for all
+    /// tokens. Attention is what could break it, and does not — row `r` attends over
+    /// `pos + r + 1` KV rows, and every row below it in this layer appended its KV in an
+    /// earlier (or the same) pass. The differing `nr` IS the causal mask, exactly as in the
+    /// verify pass. So this should be BIT-IDENTICAL to sequential prefill, which is a
+    /// claim the `--layer-major-prefill` A/B can falsify rather than a hope.
+    ///
+    /// ponytail: passes stay [`MAXROW`] (2) rows wide, so this buys the NVMe reduction and
+    /// NOT the LPDDR5 one — each 2-row pass still re-reads its experts' weights out of
+    /// RAM, and that traffic is what bounds prefill once the fetch stops dominating.
+    /// Widening a pass needs general-`R` MoE kernels: `moe_gateup_vq` and friends are
+    /// templated at `R ≤ 2` and return 1004 above it, and a genuinely wide `R` wants LDS
+    /// tiling on both operands rather than one more `acc[R]` register slot. That is the
+    /// upgrade path and it is where the rest of the win lives.
+    async fn prefill_layer_major(&mut self, ids: &[u32], mtp: bool) -> Result<()> {
+        let n_layers = self.cfg.n_layers;
+        for (l, lo, rows, tail) in layer_major_schedule(ids.len(), n_layers, MAXROW) {
+            // Beat per PASS. `generate`'s prefill beat is per token and this path does not
+            // take it; a cold layer can run for seconds, which is long enough for the
+            // watchdog to kill a process that is making perfectly normal progress.
+            if let Some(hb) = &self.heartbeat {
+                hb.beat();
+            }
+            let span = Span {
+                layers: l..l + 1,
+                x_off: lo,
+                tail,
+            };
+            self.forward_inner(&ids[lo..lo + rows], lo, Draft::No, span)
+                .await?;
+        }
+        // The head's KV over the prompt, layer-major for the same reason the model was:
+        // the MTP head is a full MoE layer and streams its 8 picks like any other, so
+        // walking it token-by-token would add ~8 reads/token back onto a prefill that
+        // just spent the whole change getting down to 24.
+        //
+        // Element `i` is `(h_i, emb(t_{i+1}))` AT POSITION `i+1`, so the prompt supplies
+        // every element but the last — hence `ids[1..]` read against `x` rows `0..`.
+        if mtp && ids.len() >= 2 {
+            for (c, chunk) in ids[1..].chunks(MAXROW).enumerate() {
+                if let Some(hb) = &self.heartbeat {
+                    hb.beat();
+                }
+                let lo = c * MAXROW;
+                self.mtp_fill(chunk, lo + 1, lo).await?;
+            }
+        }
+        // Normalise the residual stream back to the shape every other caller assumes:
+        // row 0 holds the LIVE hidden state. A layer-major prefill left it in row n-1,
+        // and the decode loop's first `mtp_draft` reads row 0 to build its draft.
+        //
+        // ponytail: 24 KB round-tripped through the host, once per prefill, rather than a
+        // device-to-device copy primitive added to both backends for this one call. The
+        // end-of-layer `device_sync` inside the last pass already retired every writer.
+        let row = self.cfg.hidden * 4;
+        let mut last = Vec::with_capacity(row);
+        // SAFETY: `x` holds `x_rows * hidden` f32 and every pass above bounded
+        // `ids.len()` by `x_rows`; the sync closing the last pass retired its writer.
+        unsafe {
+            let src = self.x.ptr().add((ids.len() - 1) * row);
+            DeviceBuf::copy_out_raw(src, row, &mut last)?;
+        }
+        self.x.copy_in_at(0, &last)?;
+        Ok(())
+    }
+
+    /// Fill the MTP head's KV over `tokens` without asking it for a draft.
+    ///
+    /// [`GpuEngine::mtp_draft`] is this same pass plus the tail; skipping the tail is what
+    /// makes it affordable across a whole prompt, since the head's logits cost 620 KB a
+    /// row and the prefill reads none of them. `x_off` is where in the prompt-wide
+    /// residual stream this chunk's hidden states live.
+    async fn mtp_fill(&mut self, tokens: &[u32], pos: usize, x_off: usize) -> Result<()> {
+        // `layers` is ignored under `Draft::Head` — the head IS its layer, pinned one past
+        // the model's last.
+        let span = Span {
+            layers: 0..0,
+            x_off,
+            tail: 0,
+        };
+        self.forward_inner(tokens, pos, Draft::Head, span).await
     }
 
     /// The MTP head over `tokens.len()` rows. Row `r` is the head element at
@@ -1246,7 +1481,10 @@ impl<'a> GpuEngine<'a> {
         // that sync is on the critical path exactly as much as the kernels are — a
         // pre-draft gate would skip both or neither.
         let t0 = std::time::Instant::now();
-        self.forward_inner(tokens, pos, Draft::Head).await?;
+        // `Span::whole`'s layer range is ignored under `Draft::Head`; `tail` is not — the
+        // draft's logits ARE the point here, one row per element.
+        let span = Span::whole(self.cfg.n_layers, tokens.len());
+        self.forward_inner(tokens, pos, Draft::Head, span).await?;
         let d = self.argmax_rows(tokens.len())?[last];
         // `argmax_rows` already synced on its D2H, so this read needs no further join.
         self.logits.copy_out_into(&mut self.mtp_host)?;
@@ -1286,18 +1524,47 @@ impl<'a> GpuEngine<'a> {
     /// discarding it is just not advancing `pos` — the next pass overwrites that row.
     /// There is no compaction and no fixup, because `append_kv` writes by position index
     /// and `attend` reads `0..nr` with `nr` derived from position.
-    async fn forward_inner(&mut self, tokens: &[u32], pos: usize, mtp: Draft) -> Result<()> {
+    async fn forward_inner(
+        &mut self,
+        tokens: &[u32],
+        pos: usize,
+        mtp: Draft,
+        span: Span,
+    ) -> Result<()> {
         let nrow = tokens.len();
         ensure!(
             (1..=MAXROW).contains(&nrow),
             "forward: {nrow} token rows, but the engine's scratch is allocated for {MAXROW}"
+        );
+        // The KV slabs are sized to max_ctx; writing row pos beyond that is a device
+        // out-of-bounds write, so refuse here rather than corrupt device memory. The
+        // LAST row is the one that writes furthest.
+        ensure!(
+            pos + nrow <= self.max_ctx,
+            "pos {pos} + {nrow} rows exceeds engine capacity max_ctx={}",
+            self.max_ctx
+        );
+        // The `x` bound, checked BEFORE the pointer below is formed: `.add()` past the
+        // end of an allocation is UB even when nothing dereferences it.
+        ensure!(
+            span.x_off + nrow <= self.x_rows,
+            "forward: residual rows {}..{} but `x` holds {} (raise --max-ctx, or the \
+             prompt outgrew the layer-major buffer)",
+            span.x_off,
+            span.x_off + nrow,
+            self.x_rows
+        );
+        ensure!(
+            span.tail <= nrow,
+            "forward: tail over {} rows of a {nrow}-row pass",
+            span.tail
         );
         let token = tokens[0];
         let cfg = self.cfg;
         let eps = cfg.rms_norm_eps as f32;
         // Which pinned layers this pass runs. The head sits one past the model's last.
         let layer_range = match mtp {
-            Draft::No => 0..cfg.n_layers,
+            Draft::No => span.layers.clone(),
             _ => cfg.n_layers..cfg.n_layers + 1,
         };
         // The head's entry: `x[r]` ← eh_proj·[enorm(emb(tokens[r])) ‖ hnorm(x[r])]. Done
@@ -1313,7 +1580,13 @@ impl<'a> GpuEngine<'a> {
                     .context("--mtp: artifact carries no MTP head")?;
                 let emb = self.pin.embed;
                 let catp = self.mtp_cat.ptr_mut() as *mut f32;
-                let hp = self.x.ptr() as *const f32;
+                // The head reads the MAIN model's hidden state, so this carries the
+                // pass's `x` offset — under layer-major prefill the row it wants is
+                // wherever that token sits in the prompt-wide residual stream. The
+                // head's OWN residual (`mtp_x`) is MAXROW rows and always starts at 0,
+                // which is why the swap below leaves the layer loop at offset 0.
+                // SAFETY: bounded by the `x_off + nrow <= x_rows` ensure above.
+                let hp = unsafe { (self.x.ptr() as *const f32).add(span.x_off * cfg.hidden) };
                 let dst = self.mtp_x.ptr_mut() as *mut f32;
                 // SAFETY: cat is MAXROW·2·hidden f32 scratch; `hp` is the hidden state the
                 // previous forward left resident (row r for element pos+r); eh_proj is
@@ -1360,7 +1633,17 @@ impl<'a> GpuEngine<'a> {
         let nb = self.n_kv_blocks;
 
         // Raw scratch pointers (Copy — don't hold borrows across the launches).
-        let xp = self.x.ptr_mut() as *mut f32;
+        // `x` is the one buffer a pass can be offset into: layer-major prefill keeps the
+        // whole prompt's residual stream live and hands each pass a two-row window. A
+        // head pass is always at row 0 — it swapped its own MAXROW-wide buffer into `x`
+        // just above, and `hp` already read the model's state at the real offset.
+        let x_row0 = match mtp {
+            Draft::No => span.x_off,
+            _ => 0,
+        };
+        // SAFETY: `x` holds `x_rows * hidden` f32 and the ensure above bounds
+        // `x_off + nrow` by `x_rows`; a head pass uses offset 0 into a MAXROW buffer.
+        let xp = unsafe { (self.x.ptr_mut() as *mut f32).add(x_row0 * cfg.hidden) };
         let xnp = self.xn.ptr_mut() as *mut f32;
         let subp = self.sub.ptr_mut() as *mut f32;
         let qrp = self.qr.ptr_mut() as *mut f32;
@@ -1372,15 +1655,6 @@ impl<'a> GpuEngine<'a> {
         let apartp = self.attn_partial.ptr_mut() as *mut f32;
         let ctxp = self.ctx.ptr_mut() as *mut f32;
         let glp = self.gate_logits.ptr_mut() as *mut f32;
-
-        // The KV slabs are sized to max_ctx; writing row pos beyond that is a device
-        // out-of-bounds write, so refuse here rather than corrupt device memory. The
-        // LAST row is the one that writes furthest.
-        ensure!(
-            pos + nrow <= self.max_ctx,
-            "pos {pos} + {nrow} rows exceeds engine capacity max_ctx={}",
-            self.max_ctx
-        );
 
         // Row selection, one entry per token row: dense/streaming is layer-blind
         // (computed once, reused by every layer's attend — dense passes a null rows
@@ -1394,11 +1668,15 @@ impl<'a> GpuEngine<'a> {
         let hoisted_rows: Option<[(*const u32, usize); MAXROW]> = match &self.mode {
             AttnMode::Dense => Some(std::array::from_fn(|r| (std::ptr::null(), pos + r + 1))),
             // Streaming selects a different row set per position and builds it on the HOST,
-            // so unlike dense it costs one upload per row — into the same per-row `rows_buf`
-            // slices dsa uses, at the same element offsets. `rows_host` is rebuilt per row
-            // rather than kept per row: it is a scratch Vec, the upload is synchronous, and
-            // at MAXROW=2 a second one would save one `streaming_rows` call over ~8 KB of
-            // memcpy.
+            // so unlike dense it costs one upload per row — into its own per-row `rows_buf`
+            // slices. `rows_host` is rebuilt per row rather than kept per row: it is a
+            // scratch Vec, the upload is synchronous, and at MAXROW=2 a second one would
+            // save one `streaming_rows` call over ~8 KB of memcpy.
+            //
+            // Layer-major safe without doing anything: a streaming selection is a pure
+            // function of `(pos + r, sinks, window)`, rebuilt from scratch on every pass
+            // and read before the next one overwrites it. Nothing here outlives the call,
+            // which is exactly what the dsa indexer's IndexShare reuse could not say.
             AttnMode::Streaming { sinks, window } => {
                 // Copy out of the `&self.mode` borrow before touching rows_host/rows_buf.
                 let (sinks, window) = (*sinks, *window);
@@ -1426,11 +1704,14 @@ impl<'a> GpuEngine<'a> {
             AttnMode::Dsa | AttnMode::Misa { .. } => None,
         };
 
-        // Embedding row → x, one per token row.
+        // Embedding row → x, one per token row — and ONLY when this pass starts at layer
+        // 0. Under layer-major prefill a row visits `forward_inner` once per layer, and
+        // re-embedding would overwrite the residual stream 77 more times with the token
+        // it started from. The decode path always starts at 0, so nothing changes there.
         // SAFETY: all pointers are device-resident scratch/weights valid for their
         // dims; each launch's inputs are produced by a prior launch on the same
         // (default) stream, so ordering holds; a device_sync precedes every host read.
-        if mtp_w.is_none() {
+        if mtp_w.is_none() && span.layers.start == 0 {
             for (r, &t) in tokens.iter().enumerate() {
                 unsafe {
                     launch_embed_i8_row(
@@ -2196,8 +2477,13 @@ impl<'a> GpuEngine<'a> {
             #[cfg(feature = "trace")]
             if self.checksum_x {
                 let n = hidden * 4;
-                // SAFETY: `x` is `hidden` f32; the sync above retired every writer.
-                unsafe { DeviceBuf::copy_out_raw(self.x.ptr(), n, &mut self.ck_buf)? };
+                // `xp`, not `x.ptr()`: this hashes THIS PASS's row 0, which under
+                // layer-major prefill is somewhere in the middle of `x` rather than at its
+                // start. Hashing row 0 of the buffer would report the same first prompt
+                // token 78 times and localise nothing.
+                // SAFETY: `xp` is this pass's residual row 0, `hidden` f32 inside `x`; the
+                // sync above retired every writer.
+                unsafe { DeviceBuf::copy_out_raw(xp as *const u8, n, &mut self.ck_buf)? };
                 let mut hh: u64 = 0xcbf2_9ce4_8422_2325;
                 for &b in self.ck_buf.iter() {
                     hh ^= b as u64;
@@ -2223,42 +2509,63 @@ impl<'a> GpuEngine<'a> {
         }
 
         // Out of the layer loop — the tail hangs off the token, not off a layer.
-        crate::telemetry::spans::mark(pos as u32, token, -1);
-        // Open the tail GPU span. The end-of-layer `device_sync` just above drained
-        // everything, so this timestamp sits on an idle stream and the span that
-        // follows is the tail kernels and nothing else.
-        self.tail_ev_start.record(std::ptr::null_mut())?;
-        self.tail_ev_pending = true;
-        // The tail's host launch cost, on the same `cpu_launch_ns` clock as the layers'.
-        // Nothing blocks between here and the end of `forward`.
-        let t_tail_launch = std::time::Instant::now();
-        // Final norm → lm_head → logits (device); caller reads via argmax.
-        // SAFETY: final_norm/lm_head resident; xn/logits device scratch.
-        // `shared_head.norm` for the MTP head; `lm_head` itself is SHARED with the main
-        // model (the checkpoint ships no `shared_head.head.weight`).
-        let tail_norm = mtp_w.map_or(self.pin.final_norm, |m| m.shared_norm);
-        unsafe {
-            rmsnorm_rows(xp, tail_norm, xnp, nrow, hidden, eps)?;
-            let head = self.pin.lm_head;
-            // Batched: lm_head is 952 MB of int8, the single largest read in the pass, and
-            // a second row through the same read costs one more f32 multiply per column.
-            launch_gemv_i8(
-                xnp,
-                head.packed,
-                head.scale,
-                head.o_dim,
-                head.i_dim,
-                nrow,
-                self.logits.ptr_mut() as *mut f32,
-            )?;
+        //
+        // SKIPPED ENTIRELY when `span.tail == 0`, which is every pass of a layer-major
+        // prefill but the last. That is not a micro-optimisation: `logits` is 620 KB per
+        // row at this vocab and lm_head is 952 MB of int8, so running the tail per pass
+        // would re-read the largest weight in the model 78 times per token row for logits
+        // nobody looks at. Only the prompt's FINAL row feeds the decode loop's argmax.
+        if span.tail > 0 {
+            crate::telemetry::spans::mark(pos as u32, token, -1);
+            // Open the tail GPU span. The end-of-layer `device_sync` just above drained
+            // everything, so this timestamp sits on an idle stream and the span that
+            // follows is the tail kernels and nothing else.
+            self.tail_ev_start.record(std::ptr::null_mut())?;
+            self.tail_ev_pending = true;
+            // The tail's host launch cost, on the same `cpu_launch_ns` clock as the
+            // layers'. Nothing blocks between here and the end of `forward`.
+            let t_tail_launch = std::time::Instant::now();
+            // Final norm → lm_head → logits (device); caller reads via argmax.
+            // The LAST `tail` rows, landing in logits rows `0..tail`: a full pass takes
+            // `tail == nrow` and so writes row for row exactly as it always did, while a
+            // prefill's closing pass takes 1 and puts the prompt's final row in row 0 —
+            // which is where `argmax` already looks.
+            // SAFETY: final_norm/lm_head resident; xn/logits device scratch; `tail <=
+            // nrow` (checked at entry) keeps the offset inside the rows this pass owns.
+            // `shared_head.norm` for the MTP head; `lm_head` itself is SHARED with the
+            // main model (the checkpoint ships no `shared_head.head.weight`).
+            let tail_norm = mtp_w.map_or(self.pin.final_norm, |m| m.shared_norm);
+            unsafe {
+                let last = xp.add((nrow - span.tail) * hidden);
+                rmsnorm_rows(last, tail_norm, xnp, span.tail, hidden, eps)?;
+                let head = self.pin.lm_head;
+                // Batched: lm_head is 952 MB of int8, the single largest read in the
+                // pass, and a second row through the same read costs one more f32
+                // multiply per column.
+                launch_gemv_i8(
+                    xnp,
+                    head.packed,
+                    head.scale,
+                    head.o_dim,
+                    head.i_dim,
+                    span.tail,
+                    self.logits.ptr_mut() as *mut f32,
+                )?;
+            }
+            let e_tail_launch = std::time::Instant::now();
+            self.prof.cpu_launch_ns += e_tail_launch.duration_since(t_tail_launch).as_nanos();
+            crate::telemetry::spans::record(
+                "cpu/launch-tail",
+                "decode",
+                t_tail_launch,
+                e_tail_launch,
+            );
         }
-        // Give the main model its residual stream back.
+        // Give the main model its residual stream back. OUTSIDE the tail guard: the swap
+        // is bookkeeping the head owes whether or not anyone asked it for logits.
         if mtp_w.is_some() {
             std::mem::swap(&mut self.x, &mut self.mtp_x);
         }
-        let e_tail_launch = std::time::Instant::now();
-        self.prof.cpu_launch_ns += e_tail_launch.duration_since(t_tail_launch).as_nanos();
-        crate::telemetry::spans::record("cpu/launch-tail", "decode", t_tail_launch, e_tail_launch);
         Ok(())
     }
 
@@ -2425,6 +2732,21 @@ impl<'a> GpuEngine<'a> {
             "speculative decode with --trace: a verify pass routes twice per layer and \
              submits the union, which the v2 trace format cannot express"
         );
+        // Same class of refusal, same reason. A v2 trace is "one line per MoE layer" with
+        // no token delimiter, so a reader recovers token boundaries from the layer id
+        // going back down. Layer-major prefill emits every token's layer 0, then every
+        // token's layer 1 — the layer id ascends ONCE across the whole prompt, and the
+        // offline sim reads that as a single 78-layer token. The read counts would still
+        // be right and the segmentation silently wrong, which is the worst shape for a
+        // capture that costs a sole-tenant GPU half an hour and cannot be redone from the
+        // file. Trace the sequential prefill; the layer-major read count is arithmetic
+        // over the same trace's distinct (layer, expert) pairs.
+        ensure!(
+            !self.layer_major_prefill || !self.pin.tracing(),
+            "--layer-major-prefill with --trace: the v2 trace has no token delimiter and \
+             recovers one from the layer id descending, which a layer-major prefill never \
+             does. Capture with the sequential prefill instead"
+        );
         // The decode as ONE async flow: prefill (warm-up) then the token loop, driven
         // by a single current-thread runtime — `forward` awaits the expert stream
         // inline, so there's no per-layer block_on. The token loop is serial by data
@@ -2435,21 +2757,51 @@ impl<'a> GpuEngine<'a> {
         let mut generated = Vec::with_capacity(ngen);
         let (hit0, miss0, fetch0, io0, decode_wall) = crate::backend::block_on(async {
             let mut pos = 0usize;
-            for &tok in prompt_ids {
-                // Beat the watchdog per prefill token too — a long/cold prompt can
-                // exceed the deadline mid-prefill while making normal progress, and only
-                // the decode loop beat before, so it would kill a healthy process.
-                if let Some(hb) = &self.heartbeat {
-                    hb.beat();
+            let prefill_wall = std::time::Instant::now();
+            if self.layer_major_prefill {
+                self.prefill_layer_major(prompt_ids, mtp).await?;
+                pos = prompt_ids.len();
+            } else {
+                for &tok in prompt_ids {
+                    // Beat the watchdog per prefill token too — a long/cold prompt can
+                    // exceed the deadline mid-prefill while making normal progress, and
+                    // only the decode loop beat before, so it would kill a healthy
+                    // process.
+                    if let Some(hb) = &self.heartbeat {
+                        hb.beat();
+                    }
+                    self.forward(tok, pos).await?;
+                    // Build the head's KV alongside the model's: MTP element i is
+                    // (h_i, emb(t_{i+1})) AT POSITION i+1, so the prompt supplies every
+                    // element but the last, whose successor has not been sampled yet.
+                    if mtp && let Some(&next) = prompt_ids.get(pos + 1) {
+                        self.mtp_draft(&[next], pos + 1).await?;
+                    }
+                    pos += 1;
                 }
-                self.forward(tok, pos).await?;
-                // Build the head's KV alongside the model's: MTP element i is
-                // (h_i, emb(t_{i+1})) AT POSITION i+1, so the prompt supplies every
-                // element but the last, whose successor has not been sampled yet.
-                if mtp && let Some(&next) = prompt_ids.get(pos + 1) {
-                    self.mtp_draft(&[next], pos + 1).await?;
-                }
-                pos += 1;
+            }
+            // The prefill's OWN cost, stamped before the rebase below discards it. This
+            // is the number `--layer-major-prefill` exists to move and it is otherwise
+            // invisible: `hit0`/`miss0` exist precisely to EXCLUDE the prefill from the
+            // decode profile, so the phase doing 6.4x the reads has never reported a
+            // single one of them. `reads/token` is the comparable figure across prompt
+            // lengths — 154.75 token-major, 24.02 layer-major, the latter being the
+            // compulsory floor (one read per distinct (layer, expert) pair).
+            {
+                let (h, m) = (self.pin.hits, self.pin.misses);
+                let n = prompt_ids.len() as f64;
+                tracing::info!(
+                    "PREFILL: {} tokens in {:.1} s ({}) | {m} expert reads, {:.2}/token \
+                     | {h} hits, {:.1}%",
+                    prompt_ids.len(),
+                    prefill_wall.elapsed().as_secs_f64(),
+                    match self.layer_major_prefill {
+                        true => "layer-major",
+                        false => "token-major",
+                    },
+                    m as f64 / n,
+                    100.0 * h as f64 / (h + m).max(1) as f64,
+                );
             }
             // Profile the DECODE loop only (prefill is warm-up); reset the pin counters
             // too so hit%/misses describe steady-state decode, not the cold prefill.
@@ -2463,6 +2815,14 @@ impl<'a> GpuEngine<'a> {
             // io-wait at 136% of wall, which is how it was found.
             let fetch0 = self.pin.fetch_ns();
             let io0 = self.pin.io_wait_ns();
+            // And the draft clock, for the same reason and with the same history. `d` in
+            // the speculative cost model is reported as a share of DECODE wall, but it
+            // accumulated across the prefill's per-token drafts too — so a 658-token prompt
+            // charged 657 prefill drafts against a 16-token decode and reported
+            // "255.8% of decode wall". Measured 2026-08-02; it predates layer-major prefill
+            // and was merely invisible while both arms mis-counted equally.
+            self.mtp_draft_ns = 0;
+            self.mtp_draft_n = 0;
             // Tell the span recorder how long the run is, so it can spread its budget
             // across the whole decode instead of spending it all on the cold start.
             // Six leaf spans per MoE layer — cpu/launch, gate-d2h, route-into,
@@ -2533,7 +2893,8 @@ impl<'a> GpuEngine<'a> {
                     // if the draft it was computed from was right, which is exactly what
                     // comparing row 0's answer to the draft tests.
                     Some((d, conf)) => {
-                        self.forward_inner(&[cur, d], pos, Draft::No).await?;
+                        let span = Span::whole(self.cfg.n_layers, 2);
+                        self.forward_inner(&[cur, d], pos, Draft::No, span).await?;
                         let rows = self.argmax_rows(2)?;
                         let (t1, t2) = (rows[0], rows[1]);
                         let ok = d == t1;
@@ -2702,5 +3063,68 @@ impl<'a> GpuEngine<'a> {
             );
         }
         Ok((generated, summary))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// Layer-major prefill's whole correctness argument is its ORDER, and the schedule is
+    /// where the order lives. Four properties, each with a failure that is silent rather
+    /// than loud: layers must ascend (L reads what L-1 wrote), rows must ascend within a
+    /// layer (row r attends over the KV the rows below it appended), every (layer, row)
+    /// must appear exactly once (a repeat re-embeds at layer 0 and double-adds the
+    /// residual elsewhere), and the tail must fire on the last row of the last layer and
+    /// nowhere else (its logits are the only ones the decode loop reads).
+    #[test]
+    fn the_layer_major_schedule_covers_every_row_of_every_layer_once_in_order() {
+        // A ragged prompt (7 = 3 full pairs + a single) so the last chunk is short — that
+        // is the case where an off-by-one in `rows` puts the tail on the wrong row.
+        for (n, n_layers, width) in [(7usize, 4usize, 2usize), (1, 1, 2), (8, 3, 2), (5, 2, 3)] {
+            let sched: Vec<_> = layer_major_schedule(n, n_layers, width).collect();
+            let mut seen = vec![0u32; n * n_layers];
+            let mut tails = Vec::new();
+            let (mut prev_l, mut prev_lo) = (0usize, None::<usize>);
+            for &(l, lo, rows, tail) in &sched {
+                assert!(
+                    rows >= 1 && rows <= width,
+                    "{rows} rows in a {width}-wide pass"
+                );
+                assert!(l >= prev_l, "layer {l} after {prev_l}: layers must ascend");
+                // Only meaningful WITHIN a layer: a new layer restarts at row 0, which is
+                // the one place `lo` is allowed to go backwards.
+                if l == prev_l
+                    && let Some(p) = prev_lo
+                {
+                    assert!(lo > p, "row {lo} after {p} within layer {l}");
+                }
+                (prev_l, prev_lo) = (l, Some(lo));
+                for r in lo..lo + rows {
+                    seen[l * n + r] += 1;
+                }
+                if tail > 0 {
+                    tails.push((l, lo + rows - 1, tail));
+                }
+            }
+            assert!(
+                seen.iter().all(|&c| c == 1),
+                "n={n} layers={n_layers}: every (layer, row) exactly once, got {seen:?}"
+            );
+            assert_eq!(
+                tails,
+                vec![(n_layers - 1, n - 1, 1)],
+                "n={n} layers={n_layers}: the tail belongs to the last row of the last layer"
+            );
+        }
+    }
+
+    /// The schedule a prompt shorter than one pass produces — the boundary the engine hits
+    /// on a one-token prompt, where `rows < width` on the ONLY pass.
+    #[test]
+    fn a_prompt_shorter_than_a_pass_is_one_pass_per_layer() {
+        let sched: Vec<_> = layer_major_schedule(1, 3, MAXROW).collect();
+        assert_eq!(sched, vec![(0, 0, 1, 0), (1, 0, 1, 0), (2, 0, 1, 1)]);
     }
 }

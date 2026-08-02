@@ -2004,3 +2004,162 @@ So three explanations have now been offered for why this does not pay, and two a
 phase rather than into the idle window, so it never tested the case its conclusion was read
 as closing. What would change the answer is a smaller expert or more compute per layer —
 PERF.md #2, not prefetch.
+
+## Layer-major prefill (`--layer-major-prefill`) — prefill 2.15x, output byte-identical (2026-08-02)
+
+Prefill the prompt LAYER-MAJOR: every token through layer L before any token reaches L+1,
+instead of walking all 78 layers per token. Same arithmetic, different order.
+
+```
+./target/release/rivoli /var/db/rivoli/glm52-vq3-full -bench 16 --mode int3-vq \
+  --attn dense --cache-policy 2q --max-mem 115 --prompt "$(head -c 3200 tests/ppl-corpus-5000.txt)" \
+  --dump-ids <out>            # and the same again with --layer-major-prefill
+```
+658-token chat-framed prompt, MTP on (the default), both arms inside ONE lock hold so the
+page cache is not disturbed between them.
+
+| | token-major | layer-major | |
+|---|---:|---:|---|
+| prefill wall | 282.7 s | **131.7 s** | **2.15x** |
+| expert reads (prefill) | 104 991 | **18 558** | **5.66x fewer** |
+| reads/token | 159.56 | **28.20** | |
+| prefill hit rate | 73.8 % | **94.7 %** | |
+| total wall, 16 tokens | 287.8 s | **139.6 s** | 2.06x |
+| total misses | 107 102 | **22 059** | 4.9x fewer |
+| decode | 393.3 ms/pass | 610.5 ms/pass | **1.55x WORSE — see below** |
+| token ids | 16 ids | 16 ids | **byte-identical** |
+
+### The read count is the mechanism, and it lands on the floor
+
+18 558 reads is the **compulsory** count — one read per distinct `(layer, expert)` pair, what
+no policy can beat. The offline prediction from the preserved 769-token trace was 18 474 for
+the model's 75 MoE layers; this run is a 658-token prompt and *includes* the MTP head's own
+MoE layer, so ~18.5k is the same number. Token-major does not fail to cache — it fails to
+cache LONG ENOUGH: layer L's experts are evicted somewhere in the next 77 layers, so the next
+token re-reads them. One layer's experts are 256 x 15.34 MB = 3.93 GB against a 6874-slot
+pool, so layer-major never has to evict anything it is about to want.
+
+### It is byte-identical, and that is checked rather than argued
+
+`tests/layer-major-neutrality.sh` is the standing gate, and it asserts BOTH halves: token ids
+identical AND reads/token actually reduced. Neither alone is a gate — the first passes on a
+build where the flag does nothing, the second on a build that produces garbage cheaply.
+
+### What it does NOT buy: the LPDDR5 re-read. This is where the rest of the win is.
+
+The reads-only arithmetic said 13-15x and that estimate was WRONG, because it priced NVMe
+bytes and FLOPs and not expert weights re-read from RAM. A pass is still `MAXROW` = 2 rows
+wide, so each 2-row pass streams its experts out of LPDDR5 exactly as before; layer-major
+only halves how often (2 rows share one read instead of 1). Per layer per token that is
+~115 MB against ~138 MB — 17%, not 6x. Once the fetch stops dominating, THAT traffic is the
+bound, and 2.15x is what the two effects come to together.
+
+Widening a pass needs general-`R` MoE kernels. `moe_gateup_vq`/`moe_down_vq` and the int4
+twins are templated at `R <= 2` and return 1004 above it, and a genuinely wide `R` cannot be
+one more `acc[R]` register slot: at R=769 the activations are 18.9 MB, larger than L2, so the
+x-side would stream from DRAM once per output-row block and cost more than the weights it
+saved. It wants LDS tiling on both operands — a real GEMM kernel, plus its Vulkan twin.
+
+### The surprise: decode starts COLD after a layer-major prefill
+
+**Decode got 1.55x slower per pass (393.3 -> 610.5 ms), and it is cache shape, not a bug.**
+Token-major prefill ends with the last token having walked all 78 layers, so the pool's
+most-recent entries span every layer — exactly what the first decode token wants. Layer-major
+ends holding layer 77's experts for every token, so decode restarts cold at layers 0..76.
+
+At `-bench 16` that cold start IS the whole decode, so this is the worst case for the metric;
+total misses still fell 4.9x and total wall still halved. But the trade is real and its sign
+depends on the workload: long prompt + short answer wins big, short prompt + long answer may
+not. **Not measured at a realistic generation length, which is the missing number and the
+reason the flag is off by default.**
+
+### Incidental: `d` was reported against the wrong denominator
+
+The token-major arm printed `MTP draft cost: 19.5 ms/draft over 671 drafts = 255.8% of decode
+wall`. `mtp_draft_ns`/`mtp_draft_n` accumulate across the PREFILL's per-token drafts but are
+reported as a share of DECODE wall, so a 658-token prompt charged 657 prefill drafts against
+a 16-token decode. Predates this work — the same rebase bug `fetch_ns` had — and was
+invisible only because both arms mis-counted equally until layer-major started using the
+tail-less `mtp_fill`. Rebased with `hit0`/`miss0`/`fetch0`/`io0`.
+
+### Coverage: every attention mode, and the offline sim it cross-validates
+
+`tests/layer-major-neutrality.sh`, `--no-mtp`, `-bench 8`, 2q, `--max-mem 115`. Wall times
+here are INDICATIVE ONLY — this script takes the lock per arm (so it does not reserve a
+shared GPU for an hour), which means another tenant's run can land between the two arms. The
+id comparison and the read counts are immune to that; only the seconds are not. The 2.15x
+headline above came from a pair inside one lock hold.
+
+| arm | prompt | reads/token | prefill wall | token ids |
+|---|---:|---:|---:|---|
+| `--attn dense`, as shipped | 658 | 154.64 -> **27.83** (5.56x) | 251.2 -> 129.2 s | identical |
+| `--attn dsa`, as shipped | 658 | 154.97 -> **27.83** (5.57x) | 256.1 -> 130.9 s | identical |
+| `--attn dsa`, `index_topk=64` | 197 | 170.64 -> **78.31** (2.18x) | 78.2 -> 45.8 s | identical |
+| `--attn streaming`, `--window 64` | 197 | 168.69 -> **77.87** (2.17x) | 80.1 -> 45.0 s | identical |
+| `--attn dense`, MTP on | 658 | 159.56 -> **28.20** (5.66x) | 282.7 -> 131.7 s | identical |
+
+**`bin/replay` is validated by this, from a completely different code path.** The offline sim
+predicted **154.75** reads/token for a 769-token prefill at 2Q/6874 slots; the engine reports
+**154.64** for a 658-token one. 0.07% apart. Every cache-policy conclusion in this file rests
+on that simulator and nothing had previously checked it against the engine's own counter.
+
+**The `index_topk=64` row is the one that matters for correctness, and it is why the shadow
+artifact exists.** At the shipped 2048 a 658-token prompt never leaves `dsa_select_layer`'s
+dense fast path, so the two `as shipped` rows never write the indexer's `sel` buffer at all —
+they exercise the position-keyed `last_nr`/`last_dense` (where the old row-slot scheme would
+already have handed a shared layer the wrong `nr`) but not the cross-pass selection reuse.
+Lowering `index_topk` to 64 makes ~133 of 197 positions select, store into `sel`, and have a
+later shared layer read it back. That row passing is the evidence the IndexShare re-keying is
+right; the other two are not.
+
+**The win grows with prompt length, measured rather than argued.** Layer-major reads the
+compulsory count, which is ~78 x distinct-per-layer and therefore roughly FIXED in absolute
+terms — 15 427 reads at 197 tokens, 18 310 at 658. Per token that is 78.31 and 27.83. Token-
+major is ~155/token at both lengths, because it re-reads per token by construction. So the
+ratio is 2.18x at 197 tokens and 5.56x at 658, and keeps climbing.
+
+**Streaming needed `--window 64` for the same reason dsa needed the shadow.** `streaming_rows`
+returns the whole causal prefix while `nt <= sinks + window`, and the default window is 8192
+— so a 197-token run at the shipped default is `--attn dense` wearing a different flag. With
+a 64-wide window the per-row selection actually runs, and layer-major needs nothing from it:
+the set is a pure function of `(pos + r, sinks, window)`, rebuilt every pass, nothing
+outliving the call. That is the property dsa's IndexShare did NOT have.
+
+> One `--attn dsa` as-shipped arm at 197 tokens failed with an empty log — a signal from this
+> session's own cleanup catching the arm before it wrote anything, not an engine fault. The
+> same configuration passes at 658 tokens in the table above.
+
+### The decode "regression" is a ONE-OFF ~2.7 s warm-up, and the fix for it FAILED (2026-08-02)
+
+The table above reports layer-major decode at **610.5 ms/pass against token-major's 390.8**,
+which reads like a 1.55x steady-state regression. It is not one. `-bench 16` is 13 passes and
+a cold start front-loads, so that measurement cannot tell a one-off penalty from a rate
+difference — a distinction the first write-up of this section did not draw, and should have.
+
+Same pair at `-bench 128` (the model hits EOS at 25 tokens, so 22 passes):
+
+| passes | token-major | layer-major | gap/pass | gap x passes |
+|---:|---:|---:|---:|---:|
+| 13 | 390.8 ms | 610.5 ms | 219.7 ms | **2.86 s** |
+| 22 | 490.3 ms | 608.0 ms | 117.7 ms | **2.59 s** |
+
+**The per-pass gap HALVED while the total held.** A steady-state penalty would have kept the
+gap at ~220 ms/pass and totalled 4.8 s over 22 passes; instead the product is flat at ~2.7 s.
+Layer-major's own ms/pass barely moved (610.5 -> 608.0) while token-major's ROSE (390.8 ->
+490.3) as the context grew — the two are converging, which is what a warm-up looks like and
+what a rate difference does not. Against the 152 s the prefill saves on the same run
+(282.9 -> 130.6 s), 2.7 s is **1.8%**. Output identical at both lengths (16 and 25 ids).
+
+**The mitigation this file previously proposed was implemented, measured and REVERTED.**
+Sweep layer-major over tokens `0..n-2`, then run the last prompt token through all 78 layers
+as one ordinary pass, so the pool ends in the shape token-major leaves it. Measured: decode
+**618.5 ms/pass against 610.5 without it** — no change — at a cost of **+383 expert reads**
+(28.20 -> 28.79/token). Correct but useless, so it is not in the tree.
+
+Why it could not work, which is worth more than the change was: a token-major prefill does
+not leave the pool holding THE LAST TOKEN's experts across all layers, it leaves roughly the
+last **ten** tokens' — 6874 slots / (78 layers x 9 experts) = 9.8. Decode therefore finds ten
+tokens of recent routing at every layer. One closing pass supplies one, so layers 0..50 still
+hold a single token's 9 experts each and decode still misses them. Reproducing the
+token-major end state needs a ~10-token close, not a 1-token one — and at a fixed 2.7 s the
+thing it would buy is not worth the reads.
