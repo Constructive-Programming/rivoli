@@ -1,6 +1,6 @@
 ---
 status: live
-verdict: The ranked performance roadmap. Live rows: #2 VQ_K codebook, #5 the MLA HB sweep.
+verdict: The ranked performance roadmap. Live rows: #2 VQ_K codebook, #5 the MLA HB sweep, #10 general-R MoE kernels.
 ---
 
 # rivoli — the ranked performance roadmap

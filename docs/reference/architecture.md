@@ -90,6 +90,13 @@ computing the resident/already-loaded ones — and, since 2026-07-31, **across t
 within one pass** when speculative decode is on (§13). The diagram above describes one row;
 a verify pass runs the same graph with `R = 2` rows threaded through every kernel.
 
+**This is the DECODE shape, and the prompt need not take it.** The serial dependency binds
+decode because token T+1's input is T's argmax — there is no set of tokens to reorder. A
+prompt is the opposite case: every token is known up front, so the loops can be inverted to
+run one layer over all of them before the next. That is `--layer-major-prefill` (§14), off by
+default, and it is worth 2.15x on prefill because it stops re-reading each layer's experts
+once per token.
+
 ---
 
 ## 3. Fetch parallelism — the io_uring streamer

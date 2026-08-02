@@ -7,7 +7,7 @@ verdict: Append-only measurements. Never read whole — grep for the config. The
 
 > ## STATE — read this, then grep for your config
 >
-> **Append-only measurement log, 105 KB. Do not read whole.** `grep -n "^## " docs/measurement/benchmarks.md`
+> **Append-only measurement log, 132 KB. Do not read whole.** `grep -n "^## " docs/measurement/benchmarks.md`
 > for the map. Newest results are at the BOTTOM.
 >
 > - **Quality ladder (current):** int4 **5.120** > hybrid **5.189** > int3-vq **5.275**.
@@ -23,8 +23,16 @@ verdict: Append-only measurements. Never read whole — grep for the config. The
 >   differently-tokenized question. Re-measure before comparing a new run to an old one.
 >   `--ppl` numbers are NOT affected: it scores a corpus through `encode`, never the chat
 >   framing. See `tests/artifact.rs::chat_framing_matches_the_checkpoint_template`.
-> - **Throughput:** ~2.6–2.8 tok/s int3-vq, ~2.7 hybrid, ~2.1 int4 (larger slot → fewer
->   resident experts). Fetch is 96–98% hidden; the engine is MoE-compute-bound.
+> - **Throughput (DECODE):** ~2.6–2.8 tok/s int3-vq, ~2.7 hybrid, ~2.1 int4 (larger slot →
+>   fewer resident experts). Fetch is 96–98% hidden; decode is MoE-compute-bound.
+> - **PREFILL is a different regime, and it was never in this block.** Token-major prefill
+>   re-reads experts **154.75 per token** — 77 layers separate two demands for the same one
+>   and the pool evicts in the gap. `--layer-major-prefill` (opt-in, 2026-08-02) reorders it
+>   to **28.20 reads/token**, the compulsory floor, for **2.15×** on prefill wall, output
+>   byte-identical, every `--attn` mode. Decode is unchanged by it (it cannot be reordered —
+>   token T+1's input is T's argmax) beyond a one-off ~2.7 s warm-up. See "Layer-major
+>   prefill" at the bottom. Reads and wall are measured; that what now bounds prefill is
+>   LPDDR5 expert re-reads is INFERRED from the 5.66x-reads-for-2.15x-wall gap, not measured.
 > - **Speculative decode:** **1.108× gated** (`--mtp-min-conf 0.8`, the default); 0.93–0.95×
 >   ungated. See "The MTP confidence gate" at the bottom — it supersedes the earlier
 >   "Speculative decode (`--mtp`)" section, which measured only the ungated form.
