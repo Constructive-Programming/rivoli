@@ -46,7 +46,7 @@ WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 # arm rather than around the whole script, so a long matrix does not hold it for an hour.
 arm() { # arm <artifact> <attn> <ids-out> [extra flags...]
   local art=$1 attn=$2 out=$3; shift 3
-  flock -w 1800 /tmp/rivoli-gpu.lock -c \
+  flock -w 1800 /var/run/sys-gpu.lock -c \
     "timeout 1800 $BIN '$art' -bench $NGEN --mode int3-vq --attn $attn \
      --cache-policy 2q --max-mem $MAX_MEM --prompt '$PROMPT' --dump-ids '$out' $*" \
     2>&1 | grep -aE "tok/s|MTP:|speculative decode OFF" || true

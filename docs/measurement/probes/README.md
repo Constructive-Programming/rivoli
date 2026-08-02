@@ -21,7 +21,7 @@ originally documented.
 | `fetch_stream_ops.hip` | What does the reaper pay per completed read, above the NVMe? | the per-read `hipLaunchHostFunc` was dead; deleted 2026-08-01 |
 | `vk_validation/` | Do the Vulkan validation checkers actually fire on this driver + layer? | answered, deleted; source in git at `77b5500:docs/measurement/probes/vk_validation` |
 
-**Run every one of these under the GPU lock** (`flock /tmp/rivoli-gpu.lock -c '…'`) — they
+**Run every one of these under the GPU lock** (`flock /var/run/sys-gpu.lock -c '…'`) — they
 allocate device memory and take real bandwidth, so an unlocked probe corrupts whatever
 benchmark is running beside it, and vice versa. The two fetch probes are also the reason to
 say it twice: their whole point is to measure a drive under a *specific* concurrent load, so

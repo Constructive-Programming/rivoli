@@ -82,14 +82,20 @@ jobs:
       # INSIDE the lock. The GPU here is SOLE-TENANT and shared with interactive work:
       # `DeviceTier::new` fails to allocate while anything else holds the budget, so a test
       # run that ignored the lock would both fail spuriously and corrupt whatever it
-      # collided with. This is the same `/tmp/rivoli-gpu.lock` every other consumer takes.
+      # collided with. This is the same `/var/run/sys-gpu.lock` every other consumer takes.
+      #
+      # `/var/run` is `/run`, which is TMPFS: the lock file does not survive a reboot of the
+      # self-hosted runner, and `/run` is root-owned so `flock` cannot recreate it. It fails
+      # LOUDLY when missing (`cannot open lock file`, exit 66) rather than testing unlocked,
+      # so a rebooted runner fails this step instead of racing interactive work — restore
+      # with `sudo install -m 666 -o "$USER" /dev/null /run/sys-gpu.lock`.
       #
       # `--test-threads=1` is not tidiness: tests/vk.rs:186 documents that VALIDATION_ERRORS
       # is process-global, so under parallel threads a message caused by one test fails
       # whichever test reads the counter next and names the wrong one.
       - name: Test on the device (sole-tenant, under the shared lock)
         run: |
-          flock /tmp/rivoli-gpu.lock \
+          flock /var/run/sys-gpu.lock \
             cargo test --release --locked --features rocm -- --test-threads=1
 
       - name: Package

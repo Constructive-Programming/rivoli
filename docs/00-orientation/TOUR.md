@@ -47,8 +47,18 @@ Read [`reference/architecture.md`](../reference/architecture.md) for the real ve
 ## Five things that will bite you
 
 1. **The GPU is sole-tenant, and several agents share this machine.** Wrap every GPU command
-   in `flock /tmp/rivoli-gpu.lock -c '…'`. Build *outside* the lock. Two concurrent
+   in `flock /var/run/sys-gpu.lock -c '…'`. Build *outside* the lock. Two concurrent
    benchmarks do not just contend — they make `DeviceTier::new` fail to allocate.
+
+   **`/var/run` is `/run`, which is tmpfs — the lock file does not survive a reboot**, and
+   `/run` is root-owned so `flock` cannot recreate it as an ordinary user. The failure is
+   loud rather than silent (`flock: cannot open lock file …: Permission denied`, exit 66)
+   so nothing ever runs *believing* it holds a lock it does not — but every GPU command
+   stays broken until someone restores the file:
+
+   ```bash
+   sudo install -m 666 -o "$USER" /dev/null /run/sys-gpu.lock
+   ```
 
 2. **Never `cargo build` between the two arms of an A/B.** It evicts page cache and moved
    `ms/miss` from 1.36 to 5.14 in one measured pair.
@@ -72,7 +82,7 @@ Read [`reference/architecture.md`](../reference/architecture.md) for the real ve
 
 ```bash
 cargo build --release --features rocm        # or --features vulkan; NEVER both
-flock /tmp/rivoli-gpu.lock -c 'cargo test --release --features rocm'
+flock /var/run/sys-gpu.lock -c 'cargo test --release --features rocm'
 cargo clippy --release --features rocm --all-targets
 ```
 
