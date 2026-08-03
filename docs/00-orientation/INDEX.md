@@ -47,8 +47,8 @@ measured, kept; the result is in the engine. `closed-mixed` — parts of both, b
 
 ## investigations/ — asked, answered, closed
 
-Read the verdict. Open the file only if you are about to re-open the question. **One row is
-`live`** — an open proposal, not yet built; it moves to `closed-shipped` when it is executed.
+Read the verdict. Open the file only if you are about to re-open the question. **Two rows are
+`live`** — open proposals, partly built; each moves to `closed-shipped` when it is executed.
 
 | doc | status | verdict |
 |---|---|---|
@@ -60,6 +60,7 @@ Read the verdict. Open the file only if you are about to re-open the question. *
 | [`codebook-rotation.md`](../investigations/codebook-rotation.md) | closed-negative | Hadamard/QuIP rotation for int3-vq: CLOSED 2026-08-01. A per-layer codebook recovers 0.09% against a 2% bar, so there is nothing to homogenise. int3-vq is rate-limited. |
 | [`npu-offload.md`](../investigations/npu-offload.md) | closed-negative | DSA indexer offload to the NPU: not worth it. The answer is in the first 40 lines; the device top-k it recommended shipped instead (−9.4 ms/token). |
 | [`perf-evidence.md`](../investigations/perf-evidence.md) | closed-mixed | Phase profile and per-kernel tranches behind the roadmap. The "Where the time goes" block is STALE and inverted — see its banner. |
+| [`other-models.md`](../investigations/other-models.md) | live | Kimi K3 is a BITRATE problem, not a capacity one — 2.72T expert params is 1.03 TiB at int3-vq's 3.25 bits/weight against ~940 GiB reclaimable, and ≤2.5 bits fits; the real wall is a linear-attention kernel family for 69 of its 93 layers. DeepSeek-V4-Flash-0731 fits at ~120 GiB and its sqrt(softplus) router SHIPPED 2026-08-03, but it is not MLA, not residual-additive, and llama.cpp measured it compute-bound — so it barely exercises expert streaming. |
 
 ## If you are writing here
 
