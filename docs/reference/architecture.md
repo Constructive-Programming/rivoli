@@ -509,7 +509,14 @@ different populations. Numbering converts "the doc drifted" into something a che
 
 | ID | invariant | test |
 |---|---|---|
-| **INV-1** | Routing is a pure function of (gate logits, bias, top_k) — it never consults the cache | `math.rs::inv_1_routing_never_consults_the_cache` |
+| **INV-1** | Routing is a pure function of (gate logits, bias, top_k, scoring) — it never consults the cache | `math.rs::inv_1_routing_never_consults_the_cache` |
+
+> **`scoring` joined the tuple 2026-08-03** and does not weaken INV-1. It is the model's
+> `scoring_func` — `sigmoid` for GLM-5.2 and the DeepSeek-V3 lineage, `sqrt(softplus(·))`
+> for DeepSeek-V4 — read from the manifest at load and constant for the life of a run, so
+> it is one more input the cache cannot reach. The frozen `route_into_pre` oracle still
+> pins the sigmoid path bit-for-bit; the test passes `Scoring::Sigmoid` explicitly, which
+> is why it still compares two different functions rather than a function to itself.
 
 > **INV-1 does NOT mean "cache changes are output-neutral", and in `--mode hybrid` they are
 > not. Measured 2026-07-31.** Two `--no-mtp` hybrid runs differing ONLY in `--max-mem`

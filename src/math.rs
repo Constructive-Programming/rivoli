@@ -14,6 +14,43 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+/// `sqrt(softplus(x))` — DeepSeek-V4's router affinity, replacing V3's sigmoid.
+/// Verified against the reference `inference/model.py`, which computes it as
+/// `F.softplus(scores).sqrt()`; guessing this formula would have routed to
+/// plausible-but-wrong experts with no crash to notice.
+///
+/// `softplus` in the stable form `max(x,0) + ln1p(exp(-|x|))`: the naive
+/// `ln(1+exp(x))` overflows to `inf` around x=88 in f32 and gate logits are not
+/// bounded. Unlike sigmoid this is UNBOUNDED above, so the top-k `choice` values
+/// are no longer confined to (0,1) — nothing downstream assumes they are, but the
+/// bias is trained against this scale, not sigmoid's.
+#[inline]
+fn sqrt_softplus(x: f32) -> f32 {
+    (x.max(0.0) + (-x.abs()).exp().ln_1p()).sqrt()
+}
+
+/// Which affinity the router applies to the gate logits. Part of the pure input
+/// tuple INV-1 names, alongside (logits, bias, top_k) — it comes from the model's
+/// `scoring_func`, never from residency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Scoring {
+    /// GLM-5.2, DeepSeek-V3, Kimi K2.
+    #[default]
+    Sigmoid,
+    /// DeepSeek-V4.
+    SqrtSoftplus,
+}
+
+impl Scoring {
+    #[inline]
+    fn apply(self, x: f32) -> f32 {
+        match self {
+            Scoring::Sigmoid => sigmoid(x),
+            Scoring::SqrtSoftplus => sqrt_softplus(x),
+        }
+    }
+}
+
 /// Truncate f32 → bf16 (round to nearest even). The KV cache stores latents in
 /// bf16 — a free 2× on KV bandwidth with no accuracy story (decided 2026-07-18).
 ///
@@ -194,12 +231,13 @@ pub fn route_into(
     gate_logits: &[u8],
     bias: &[f32],
     top_k: usize,
+    scoring: Scoring,
     scores: &mut [f32],
     choice: &mut [f32],
     sel: &mut Vec<usize>,
 ) {
     for (s, c) in gate_logits.chunks_exact(4).zip(scores.iter_mut()) {
-        *c = sigmoid(f32::from_le_bytes([s[0], s[1], s[2], s[3]]));
+        *c = scoring.apply(f32::from_le_bytes([s[0], s[1], s[2], s[3]]));
     }
     for ((c, &s), &b) in choice.iter_mut().zip(scores.iter()).zip(bias) {
         *c = s + b;
@@ -213,6 +251,70 @@ pub fn route_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `sqrt(softplus(x))` against values computed from the reference's
+    /// `F.softplus(x).sqrt()`, plus the two properties that make it safe to swap in
+    /// for sigmoid: it never returns NaN on the f32 range gate logits can reach, and
+    /// it is monotonic (so top-k on it is top-k on the raw logits).
+    #[test]
+    fn sqrt_softplus_matches_the_reference_and_is_monotonic() {
+        for (x, want) in [
+            (0.0f32, 0.832_554_6f32),   // sqrt(ln 2) = sqrt(0.693147)
+            (1.0, 1.145_976_7),         // sqrt(ln(1+e)) = sqrt(1.313262)
+            (-1.0, 0.559_698_1),        // sqrt(ln(1+1/e)) = sqrt(0.313262)
+            (10.0, 3.162_284_6),        // sqrt(10.0000454)
+            (-10.0, 0.006_737_9),       // sqrt(4.539889e-5)
+        ] {
+            let got = sqrt_softplus(x);
+            assert!(
+                (got - want).abs() < 1e-5,
+                "sqrt_softplus({x}) = {got}, want {want}"
+            );
+        }
+        // The naive ln(1+exp(x)) overflows to inf here; the stable form must not.
+        for x in [100.0f32, 1e4, f32::MAX] {
+            assert!(sqrt_softplus(x).is_finite(), "overflowed at {x}");
+        }
+        for x in [-1e4f32, -1e30, f32::MIN] {
+            let v = sqrt_softplus(x);
+            assert!(v.is_finite() && v >= 0.0, "underflowed to {v} at {x}");
+        }
+        let mut prev = f32::NEG_INFINITY;
+        for i in -2000..2000 {
+            let v = sqrt_softplus(i as f32 * 0.05);
+            assert!(v >= prev, "not monotonic at {i}");
+            prev = v;
+        }
+    }
+
+    /// The scoring function is part of routing's pure input tuple, so changing it
+    /// must change the selection and nothing else about the mechanism. Sigmoid is
+    /// bounded in (0,1) and sqrt-softplus is not — a bias trained against one scale
+    /// applied to the other is exactly the silent-wrong-experts failure.
+    #[test]
+    fn scoring_choice_changes_selection_not_shape() {
+        let mut r = Rng(0xC0FF_EE01);
+        let (g, bias) = gate_and_bias(&mut r, 256);
+        let mut differed = 0;
+        for &k in &[1usize, 6, 8] {
+            let (mut s1, mut c1, mut sel1) = (vec![0.0; 256], vec![0.0; 256], Vec::new());
+            let (mut s2, mut c2, mut sel2) = (vec![0.0; 256], vec![0.0; 256], Vec::new());
+            route_into(&g, &bias, k, Scoring::Sigmoid, &mut s1, &mut c1, &mut sel1);
+            route_into(&g, &bias, k, Scoring::SqrtSoftplus, &mut s2, &mut c2, &mut sel2);
+            assert_eq!(sel1.len(), k);
+            assert_eq!(sel2.len(), k);
+            assert!(s1.iter().all(|v| (0.0..=1.0).contains(v)), "sigmoid escaped (0,1)");
+            assert!(s2.iter().all(|v| v.is_finite() && *v >= 0.0), "sqrt-softplus not finite");
+            if sel1 != sel2 {
+                differed += 1;
+            }
+        }
+        assert!(
+            differed > 0,
+            "sigmoid and sqrt-softplus selected identically at every k — \
+             the scoring parameter is not reaching the selection"
+        );
+    }
 
     #[test]
     fn topk_picks_largest_with_stable_tiebreak() {
@@ -442,7 +544,7 @@ mod tests {
                     let k = k.min(n);
                     let (mut s1, mut c1, mut sel1) = (vec![0.0; n], vec![0.0; n], Vec::new());
                     let (mut s2, mut c2, mut sel2) = (vec![0.0; n], vec![0.0; n], Vec::new());
-                    route_into(&g, &bias, k, &mut s1, &mut c1, &mut sel1);
+                    route_into(&g, &bias, k, Scoring::Sigmoid, &mut s1, &mut c1, &mut sel1);
                     route_into_pre(&g, &bias, k, &mut s2, &mut c2, &mut sel2);
                     assert_eq!(sel1, sel2, "selection drifted from the frozen routing");
                     assert_eq!(s1, s2, "scores drifted");

@@ -1508,6 +1508,7 @@ impl<'a> GpuEngine<'a> {
                     &self.pgl_host,
                     self.pin.moe_bias(l),
                     cfg.top_k,
+                    cfg.scoring(),
                     &mut self.pred_scores,
                     &mut self.pred_choice,
                     &mut self.pred_sel,
@@ -1725,11 +1726,14 @@ impl<'a> GpuEngine<'a> {
                         &self.gl_host[r * ne..(r + 1) * ne],
                         self.pin.moe_bias(l),
                         cfg.top_k,
+                        cfg.scoring(),
                         &mut self.scores,
                         &mut self.choice,
                         &mut self.sel_row[r],
                     );
-                    // Routed weights: sigmoid score, sum-normalized over THIS row's picks,
+                    // Routed weights: the affinity score BEFORE the bias (the bias steers
+                    // selection only — `weights = original_scores.gather(...)` in the
+                    // reference), sum-normalized over THIS row's picks,
                     // then scaled. Computed here rather than after the union because
                     // `scores` belongs to row `r` only until the next iteration.
                     let wr = &mut self.wrow[r];
