@@ -2503,11 +2503,35 @@ HB=16 while saying nothing. `mla_attend_long_context_split_regimes` (nt=704 past
 nt=4608 past the `MLA_MAX_SPLITS` clamp) now covers both, and passes at HB=8 and HB=16 —
 which is what proves the kernel correct in both plans rather than merely fast.
 
-**Vulkan is NOT changed and the backends now differ above nr≈640.** `MLA_HB * MLA_SUBW ==
-BLOCK` is a deliberate compile-time guard and `BLOCK` is shared across kernels, so HB=16
-there needs a dedicated workgroup constant, a `--features vulkan` build and `tests/vk.rs`.
-`tests/xbackend.rs` covers only `swiglu`, so nothing catches the divergence. Vulkan is
-int3-vq/dense-only and agrees below the crossover; this is a known debt, not an oversight.
+**Vulkan was NOT changed in the first pass, and the backends differed above nr≈640.**
+`MLA_HB * MLA_SUBW == BLOCK` was a compile-time guard on a `BLOCK` shared across kernels,
+so HB=16 there needed a dedicated workgroup constant, a `--features vulkan` build and
+`tests/vk.rs`.
+
+> **CORRECTED 2026-08-02, same day: Vulkan is now HB=16 too and the divergence is closed.**
+> Suite green at **141 passed, 0 failed, 1 ignored**. The port turned up two latent defects
+> that HB only exposed:
+>
+> - **The `MLA_HB * MLA_SUBW == BLOCK` assert never checked what it claimed.** `BLOCK` is
+>   `ROWS_PER_BLOCK * WAVE` — an unrelated kernel's geometry that happened to also be 8×32,
+>   so the assert read as "launcher HB is pinned to the attention shader" while actually
+>   pinning it to a coincidence. Rewriting it as `== 512` would have been a tautology, both
+>   sides deriving from `MLA_HB`. Fixed structurally instead: **build.rs owns `VK_MLA_HB`**,
+>   emits it into `dims.rs` AND passes it as `-DHB`, and the shader `#error`s if HB is
+>   undefined — the same single-source mechanism `WAVE`/`ROWS_PER_BLOCK` already use, and
+>   the `ponytail: fold these into build.rs` note the file had left itself.
+> - **`missing_features` would have admitted a device that cannot run attend.** It checked
+>   `maxComputeWorkGroupInvocations >= BLOCK` (256) while attend declares `MLA_HB*MLA_SUBW`
+>   = 512, so a 256-limit device would load every other pipeline and fail on attend alone
+>   with an opaque `ERROR_INITIALIZATION_FAILED` — exactly the failure that function exists
+>   to pre-empt. Same for `maxComputeWorkgroupSubgroups`, checked against `ROWS_PER_BLOCK`
+>   (8) where attend needs 16. Both now check the larger.
+>
+> **What the Vulkan suite does and does not establish.** It validates the kernels against
+> their oracles, so correctness is covered. It does NOT re-run the quality gate — the paired
+> dNLL was measured on ROCm, and the claim that it carries over rests on both backends now
+> deriving their split plan from the same `MLA_HB`. `tests/xbackend.rs` covers only
+> `swiglu`, so that is true by construction, not by test.
 
 Full suite at HB=16: **110 passed, 0 failed, 1 ignored.**
 
@@ -2570,3 +2594,52 @@ turns landed the same day — `-bench` stops at EOS at ~318 tokens on the defaul
 `docs/reference/architecture.md` §6 currently asserts the opposite of this section
 ("a relocation never races an in-flight fetch… the correctness spine of the cache"); that
 claim is contradicted by the table above and should not be trusted until this is resolved.
+
+---
+
+## Long-run corruption: four mechanisms eliminated, and the clue we were reading backwards — 2026-08-03
+
+Follows "Long runs are NON-DETERMINISTIC" above. **The bug is not found.** This records what
+it is NOT, and one reframing that changes where to look next.
+
+### Eliminated
+
+| # | mechanism | why it is not this |
+|---|---|---|
+| 1 | **Arena relocation racing an in-flight read** — the standing suspect | There IS a real ordering hole: `relocate()` uses `hipMemcpy` (null stream, `linalg.hip:467`) while the reaper's staging copies run on a `hipStreamNonBlocking` stream that does not synchronise with it. It is unreachable. Reads are built in phase 1c AFTER relocations, and `gpu.rs:2153`'s **unconditional** end-of-layer `device_sync` drains every stream before the next `submit_layer`. |
+| 2 | **Nondeterministic argmax tie-break** | Fits the signature (rare, discrete, one token then permanent divergence) and is refuted by construction: single block, 256 threads, fixed LDS tree reduce with `__syncthreads()`, no atomics; `amax_combine` breaks ties to the smaller index. |
+| 3 | **Bookkeeping read-before-write** (policy says resident, no read completed) | Instrumented and measured: 5000 tokens, **2,098,270 hits checked, zero fires**. |
+| 4 | **Staging slot recycled under an in-flight copy** | `asyncfetch.rs:427` enqueues the timeline signal on the fetch stream AFTER `reap` queues the copy, so reaching that value means the copy completed; `take_slot` refuses a slot until `completed() >= slot_next[s]`. |
+
+**#1 matters most, because `benchmarks.md` has carried arena compaction as the "leading
+remaining suspect… not verified" since the NaN investigation.** It now has an argument
+against it rather than an absence of evidence. The `--max-mem 30` non-determinism recorded
+earlier was plausibly this bug *before* the end-of-layer sync existed — i.e. already fixed.
+
+**On #3, state the limit honestly.** The check catches a hit on a key the bookkeeping never
+marked loaded. It cannot catch the PHYSICAL case, because `pending_loaded` infers loadedness
+from the end-of-layer `device_sync` rather than verifying bytes landed — so it cannot detect
+a violation of that same assumption. A physical check needs a per-slot stamp verified at use.
+
+### The clue that was being read backwards
+
+Every clean result is a SHORT run; every corrupted result is a LONG one:
+
+| run | tokens | context | outcome |
+|---|---:|---|---|
+| `--bench 512`, 4 runs (2 HB values × 2) | 512 | short | **byte-identical** |
+| `--bench 600` ×2 at `--max-mem 30` — **3.7× the miss rate** (457 vs 124 misses/token) | 600 | short | **byte-identical**, and identical hit counts (135745/274055) |
+| `--ppl` 5k, 6 runs | 5184 | long | ~40% corrupt |
+
+This was being investigated as *fetch pressure*. The `--max-mem 30` arm argues the other way:
+**more misses, shorter context, no fault.** So the search should shift toward context-scaled
+state (attention geometry, the split-KV plan, KV cache) and away from the expert pool.
+
+**What is NOT yet distinguishable, and the cost of settling it.** "Context-dependent" and
+"uniform per token" both predict these observations, because 600 tokens is 8× shorter than
+5000 and the rate is ~1 event per 13,000 tokens — two clean short runs is the expected
+outcome under EITHER hypothesis. Short-run replication cannot settle it cheaply: 3 expected
+events needs ~39,000 tokens of short runs (~65 runs). The affordable discriminator is the
+DIVERGENCE POSITION from more long pairs — one is localised so far (token 4042 of 5184). If
+events cluster high, context-dependence; if uniform over the run, per-token. Each pair is
+~90 min of sole-tenant GPU, so price it before booking it.
