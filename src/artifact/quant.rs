@@ -617,6 +617,62 @@ pub fn i4_row_bytes(i_dim: usize) -> usize {
     i_dim.div_ceil(2)
 }
 
+// --- FP4 (`.f4`) — DeepSeek-V4-Flash's native routed-expert format --------------------
+//
+// Chosen 2026-08-03 to keep source fidelity: V4-Flash ships its 296.35B routed-expert
+// params ALREADY at 4 bits (OCP MX e2m1 nibbles with e8m0 block scales), so producing a
+// `.f4` artifact is a REPACK into rivoli's O_DIRECT-aligned block layout, not a
+// quantization. There is no fit, no codebook, and no error introduced — which is the whole
+// point: re-quantizing a 4-bit source into 3.25-bit int3-vq is the lossy-on-lossy chain
+// docs/investigations/int4-scales.md records at PPL 73.43. See other-models.md §5.
+//
+// Unlike int4 (uniform levels, f32 group scale), e2m1 is a fixed NON-uniform 16-value
+// codebook and the scale is a bare power of two, so dequant is a 16-entry lookup times a
+// shift. That makes it cheaper on the GPU than either neighbour, not more expensive.
+
+/// Weights per e8m0 scale along the input dim. 32 is the OCP MX block size, which is what
+/// V4-Flash's `.scale` tensors carry (1×32 sub-blocks nested inside its 128×128 fp8
+/// blocks). Distinct from `I4_GROUP`(128) and `VQ_GROUP`(64) on purpose — this one is
+/// dictated by the source, not chosen by us.
+pub const F4_GROUP: usize = 32;
+
+/// The 16 e2m1 values, indexed by nibble. Bit 3 is sign, bits 2-1 exponent, bit 0
+/// mantissa; there are no infinities and no NaN — every code is a finite value, which is
+/// why a bare lookup is a complete decoder.
+pub const F4_LUT: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+];
+
+/// Decode one e8m0 scale byte: a bare exponent, value `2^(b - 127)`. `0xFF` is the
+/// format's NaN and must not appear in weights — a scale that is NaN poisons a whole
+/// 32-weight block, so it is worth failing on rather than propagating.
+pub fn e8m0(b: u8) -> anyhow::Result<f32> {
+    if b == 0xFF {
+        anyhow::bail!("e8m0 scale byte 0xFF is NaN");
+    }
+    // exp2 rather than `bits << 23`: the bit form is exact only for b >= 1, and b = 0 is
+    // 2^-127, an f32 SUBNORMAL that the shift encodes as +0.
+    Ok(f32::exp2(b as f32 - 127.0))
+}
+
+/// Number of e8m0 group scales in one FP4 row (`ceil(i_dim / F4_GROUP)`).
+pub fn f4_groups(i_dim: usize) -> usize {
+    i_dim.div_ceil(F4_GROUP)
+}
+
+/// Row stride in bytes for an FP4 matrix (2 nibbles/byte) — same packing as int4, so the
+/// `.i4` container's nibble addressing carries over unchanged.
+pub fn f4_row_bytes(i_dim: usize) -> usize {
+    i_dim.div_ceil(2)
+}
+
+/// On-disk bytes of one FP4-packed projection `W[o_dim, i_dim]`: packed nibbles, then one
+/// e8m0 byte per group. Mirrors `vq_proj_bytes`/`i4_proj_bytes` so the block layout and
+/// `VQ_ALIGN` stride math are shared across all three formats.
+pub fn f4_proj_bytes(o_dim: usize, i_dim: usize) -> usize {
+    o_dim * f4_row_bytes(i_dim) + o_dim * f4_groups(i_dim)
+}
+
 // jscpd:ignore-start — the four `matvec_*` oracles' PARAMETER LISTS. `matvec_i4` and
 // `matvec_i8` take character-identical arguments (`y, x, packed, scale, o_dim, i_dim`),
 // which rustfmt expands past 100 columns into eight lines — enough to clone against each
@@ -1178,5 +1234,62 @@ mod tests {
         matvec_fp8(&mut y, &x, &packed, &scale, 2, 1);
         // row0: 10·3 + 200·5 = 1030 ; row1: -1000·3 + 0·5 = -3000
         assert_eq!(y, [1030.0, -3000.0]);
+    }
+
+    /// The e2m1 table decoded from its bit fields rather than restated, so this is a
+    /// check and not a copy of the constant. Bit 3 sign, bits 2-1 exponent, bit 0
+    /// mantissa; exponent 0 is the subnormal case (value = mantissa/2), every other
+    /// exponent e is `2^(e-1) * (1 + mantissa/2)`. There is no Inf and no NaN, which is
+    /// what makes a bare 16-entry lookup a COMPLETE decoder.
+    #[test]
+    fn f4_lut_matches_the_e2m1_bit_fields() {
+        for code in 0u8..16 {
+            let (sign, exp, man) = (code >> 3, (code >> 1) & 3, code & 1);
+            let mag = if exp == 0 {
+                man as f32 * 0.5
+            } else {
+                f32::exp2(exp as f32 - 1.0) * (1.0 + man as f32 * 0.5)
+            };
+            let want = if sign == 1 { -mag } else { mag };
+            assert_eq!(
+                F4_LUT[code as usize], want,
+                "e2m1 code {code:#06b} decodes to {want}, table says {}",
+                F4_LUT[code as usize]
+            );
+        }
+        // The largest magnitude is 6.0, so a block's dynamic range is entirely in its
+        // e8m0 scale — a fact the repack relies on to carry values through untouched.
+        assert_eq!(F4_LUT.iter().cloned().fold(0.0f32, f32::max), 6.0);
+    }
+
+    /// e8m0 is a bare exponent, `2^(b-127)`, and both ends matter: b=0 lands on an f32
+    /// subnormal (the `bits << 23` form silently returns +0 there) and 0xFF is the
+    /// format's NaN, which would poison a whole 32-weight block.
+    #[test]
+    fn e8m0_covers_both_ends_and_rejects_nan() {
+        assert_eq!(e8m0(127).unwrap(), 1.0);
+        assert_eq!(e8m0(128).unwrap(), 2.0);
+        assert_eq!(e8m0(126).unwrap(), 0.5);
+        assert_eq!(e8m0(254).unwrap(), f32::exp2(127.0));
+        let lo = e8m0(0).unwrap();
+        assert!(lo > 0.0 && lo.is_finite(), "b=0 must be 2^-127, got {lo}");
+        assert_eq!(lo, f32::exp2(-127.0));
+        assert!(e8m0(0xFF).is_err(), "0xFF is NaN and must be refused");
+    }
+
+    /// `.f4` shares `.i4`'s nibble packing but carries a one-byte scale per 32 weights
+    /// instead of an f32 per 128, so its rows are wider. GLM's widths stand in for the
+    /// arithmetic; V4-Flash's own are hidden 4096 / moe_inter 2048.
+    #[test]
+    fn f4_layout_sizes() {
+        assert_eq!(f4_row_bytes(2048), 1024);
+        assert_eq!(f4_groups(2048), 64);
+        assert_eq!(f4_groups(2049), 65, "a ragged tail gets its own scale");
+        // 4.25 bits/weight: 4 for the nibble, 8/32 for the scale.
+        let (o, i) = (4096usize, 2048usize);
+        assert_eq!(f4_proj_bytes(o, i), o * 1024 + o * 64);
+        assert_eq!(f4_proj_bytes(o, i) as f64 * 8.0 / (o * i) as f64, 4.25);
+        // Strictly larger than int3-vq's 3.25, and that is the trade we chose.
+        assert!(f4_proj_bytes(o, i) > vq_proj_bytes(o, i));
     }
 }
