@@ -45,7 +45,7 @@ verdict: The ranked performance roadmap. Live rows: #2 VQ_K codebook, #10 genera
 > versus 46.0% on the sample that trips the degeneration warning. Rebuilding the head at
 > int4 moved acceptance by 3.4 pp ± 7.4, i.e. not at all, so "de-quantize the head" is
 > refuted. Full table in `docs/reference/architecture.md` §13.
-| 5 | `mla_latent_attend` occupancy | follow-up #3 | `acc`→regs −12%; **HB 8→16 = 2.08× kernel, −3.2 ms/tok** | med | **DONE 2026-08-02** — HB=16 shipped on ROCm, gated at +0.00217 nats; `MLA_MIN_TILES_PER_SPLIT` measured INERT and stays at 4; Vulkan still HB=8 (see below) |
+| 5 | `mla_latent_attend` occupancy | follow-up #3 | `acc`→regs −12%; **HB 8→16 = 2.08× kernel, −3.2 ms/tok** | med | **DONE 2026-08-02** — HB=16 shipped on both backends, gated at +0.00217 nats; `MLA_MIN_TILES_PER_SPLIT` measured INERT and stays at 4; Vulkan HB=16 too |
 | 6a | lm_head load width | follow-up #5 | kernel **1.78×**; `tail` **−3.2 ms** in-engine; wall **~+1%, not noticeable** | low | **done** |
 | 6b | o_proj split-K / x-tiling | follow-up #2 | — | — | **refuted and reverted** |
 | 7 | `mla_absorb` restructure | follow-up #4 | **−0.80 ms/tok, measured** | med | **done** |
@@ -109,11 +109,12 @@ verdict: The ranked performance roadmap. Live rows: #2 VQ_K codebook, #10 genera
 > 3. **"~5–7 ms now" overstates a short-context decode.** A 512-token run averages nr≈170,
 >    where the kernel is small; the realized figure is −3.2 ms and it grows with context.
 >
-> **Vulkan is still HB=8**, so the backends differ in split blocking above nr≈640.
-> `MLA_HB * MLA_SUBW == BLOCK` is a compile-time guard on a `BLOCK` shared across kernels,
-> so it needs a dedicated workgroup constant plus a `--features vulkan` build and
-> `tests/vk.rs`. Known debt. Full write-up in [`benchmarks.md`](benchmarks.md), "The MLA HB
-> sweep".
+> **Vulkan is HB=16 too** (done the same day; the row's first version said it was still 8).
+> `MLA_HB` is now single-sourced from build.rs into both `dims.rs` and the shader's `-DHB`,
+> which also retired an assert that had only ever held by coincidence and a device-limit
+> check that would have admitted hardware unable to run the 512-thread attend workgroup.
+> Vulkan suite: 141 passed, 0 failed. Full write-up in [`benchmarks.md`](benchmarks.md),
+> "The MLA HB sweep".
 >
 > **A warning that outranks the item.** The gate above is trustworthy only because every arm
 > was REPEATED: ~40% of 5k-token runs are silently corrupted (`benchmarks.md`, "Long runs are

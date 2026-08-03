@@ -16,7 +16,13 @@
 
 #include "common.glsl"
 
-#define HB 8              // heads per block, one subgroup each
+// HB (heads per block, one subgroup each) is injected by build.rs as `-DHB`, from the same
+// `VK_MLA_HB` that generates the launcher's `MLA_HB`. It was `#define HB 8` here with a
+// second copy in src/backend/vk.rs; the two are now one source, so they cannot disagree.
+// 8 -> 16 on 2026-08-02 to match attn.hip — see that file for the measurement.
+#ifndef HB
+#error "mla_latent_attend: HB must come from build.rs (-DHB); do not define it here"
+#endif
 #define TILE 16           // KV tokens staged into LDS per step
 #define SUBW 32           // score-reduction subgroup width
 #define MLA_ACC_REGS 16   // per-lane online-accumulator slots
