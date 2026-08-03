@@ -5,7 +5,7 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-/// `rope_parameters` is a nested object; we only need theta.
+/// GLM-5.2 nests theta under `rope_parameters`; we only need theta.
 #[derive(Debug, Clone, Deserialize)]
 struct RopeParameters {
     rope_theta: f64,
@@ -61,12 +61,23 @@ pub struct ModelConfig {
     pub routed_scale: f64,
     #[serde(default)]
     pub norm_topk_prob: bool,
+    /// Router affinity. Absent on snapshots that predate the field; GLM-5.2 and the
+    /// DeepSeek-V3 lineage are `sigmoid`, DeepSeek-V4 is `sqrtsoftplus`. Resolved by
+    /// `scoring()` and rejected at load if unrecognised — a wrong affinity picks
+    /// plausible-but-wrong experts and never crashes.
+    #[serde(default)]
+    scoring_func: Option<String>,
 
     #[serde(rename = "vocab_size")]
     pub vocab: usize,
     pub rms_norm_eps: f64,
-    #[serde(rename = "rope_parameters")]
-    rope: RopeParameters,
+    /// GLM-5.2 nests theta; the DeepSeek/Llama lineage puts `rope_theta` at top
+    /// level. Accept either — this is the first thing that fails on a non-GLM
+    /// config, before any dimension is even looked at.
+    #[serde(rename = "rope_parameters", default)]
+    rope: Option<RopeParameters>,
+    #[serde(rename = "rope_theta", default)]
+    rope_theta_flat: Option<f64>,
 }
 
 impl ModelConfig {
@@ -79,7 +90,14 @@ impl ModelConfig {
             Err(_) => format!("{dir}/config.json"),
         };
         let text = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
-        let cfg: Self = serde_json::from_str(&text).with_context(|| format!("parse {path}"))?;
+        Self::from_json(&text).with_context(|| format!("parse {path}"))
+    }
+
+    /// Parse and validate one config document. Split out of `load` so the tests can
+    /// drive the real boundary from a literal rather than re-implementing it — which
+    /// is how a test starts passing against itself.
+    fn from_json(text: &str) -> Result<Self> {
+        let cfg: Self = serde_json::from_str(text)?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -108,24 +126,62 @@ impl ModelConfig {
                 self.n_heads
             );
         }
-        // The fused MoE kernel (moe_fused.hip) stages one SwiGLU intermediate row
-        // per workgroup in dynamic LDS = inter*4 bytes, capped by gfx1151's 64KB
-        // LDS budget → inter ≤ 16384. Fail at load with the cause, not at first
-        // MoE launch. GLM-5.2: dense_inter=12288, moe_inter*n_shared=2048 — fit.
-        const MAX_FUSED_INTER: usize = 16384;
-        let shared_inter = self.moe_inter * self.n_shared;
-        if self.dense_inter > MAX_FUSED_INTER || shared_inter > MAX_FUSED_INTER {
+        // `softmax` is deliberately NOT accepted: the reference skips the top-k
+        // renormalization for it (`if score_func != "softmax"`), so mapping it onto
+        // this path would silently apply `norm_topk_prob` where the model expects
+        // none. No model we target uses it.
+        match self.scoring_func.as_deref() {
+            None | Some("sigmoid") | Some("sqrtsoftplus") => {}
+            Some(other) => anyhow::bail!(
+                "unsupported scoring_func {other:?} — implemented: sigmoid, sqrtsoftplus"
+            ),
+        }
+        if self.rope_theta() == 0.0 {
             anyhow::bail!(
-                "intermediate width exceeds fused-kernel LDS ceiling {MAX_FUSED_INTER} \
-                 (dense_inter={}, moe_inter*n_shared={shared_inter})",
-                self.dense_inter
+                "no rope_theta: expected either a nested `rope_parameters.rope_theta` \
+                 (GLM-5.2) or a top-level `rope_theta` (DeepSeek/Llama lineage)"
             );
         }
+        // `vq_row_bytes`/`vq_groups` divide by VQ_DIM and VQ_GROUP with only a
+        // `debug_assert` to catch a ragged dim, so in a RELEASE build a bad width
+        // silently truncates every expert row instead of failing. Both widths are
+        // an `i_dim` for some projection (gate/up take hidden, down takes moe_inter),
+        // and VQ_GROUP=64 is a multiple of the 8 the 12-bit packing needs, so this
+        // one check covers both. GLM-5.2: 6144, 2048 — both clean.
+        for (what, dim) in [("hidden", self.hidden), ("moe_inter", self.moe_inter)] {
+            if !dim.is_multiple_of(crate::artifact::quant::VQ_GROUP) {
+                anyhow::bail!(
+                    "{what} {dim} is not a multiple of VQ_GROUP {} — int3-vq rows would \
+                     silently truncate in a release build",
+                    crate::artifact::quant::VQ_GROUP
+                );
+            }
+        }
+        // No ceiling on the intermediate widths: the LDS-staging MoE kernel that
+        // imposed one (inter ≤ 16384, gfx1151's 64KB budget) is gone. `swiglu`
+        // (linalg.hip) is elementwise with zero dynamic LDS, and moe.hip stages
+        // nothing on purpose — LDS capped occupancy and measured slower. The old
+        // guard would have refused the DeepSeek-V3 family on intermediate_size
+        // 18432 for a constraint that no longer exists.
         Ok(())
     }
 
+    /// The router affinity this model was trained with. Infallible because
+    /// `validate` has already rejected anything it cannot map.
+    pub fn scoring(&self) -> crate::math::Scoring {
+        match self.scoring_func.as_deref() {
+            Some("sqrtsoftplus") => crate::math::Scoring::SqrtSoftplus,
+            _ => crate::math::Scoring::Sigmoid,
+        }
+    }
+
     pub fn rope_theta(&self) -> f64 {
-        self.rope.rope_theta
+        // `validate` has already established one of the two is present.
+        self.rope
+            .as_ref()
+            .map(|r| r.rope_theta)
+            .or(self.rope_theta_flat)
+            .unwrap_or(0.0)
     }
 
     /// Validate the indexer config for the dsa/misa attention modes and return
@@ -171,5 +227,129 @@ impl ModelConfig {
     /// stream, and the concurrency the stream needs to run them all at once.
     pub fn experts_per_layer(&self) -> usize {
         self.top_k + self.n_shared
+    }
+}
+
+/// The load boundary is the only place a foreign snapshot is inspected before its
+/// dimensions reach a kernel, so every refusal here is one that would otherwise be an
+/// out-of-bounds panic, a silently truncated expert row, or wrong experts with no crash.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GLM-5.2's real values, as a JSON object that `overrides` can patch. Built as
+    /// text rather than a struct literal because the serde renames ARE the contract
+    /// under test — `n_routed_experts`, the nested rope, `first_k_dense_replace`.
+    fn cfg_json(overrides: &[(&str, &str)]) -> String {
+        let mut fields: Vec<(String, String)> = [
+            ("num_hidden_layers", "78"),
+            ("hidden_size", "6144"),
+            ("num_attention_heads", "64"),
+            ("q_lora_rank", "2048"),
+            ("kv_lora_rank", "512"),
+            ("qk_rope_head_dim", "64"),
+            ("qk_nope_head_dim", "192"),
+            ("v_head_dim", "256"),
+            ("n_routed_experts", "256"),
+            ("num_experts_per_tok", "8"),
+            ("moe_intermediate_size", "2048"),
+            ("intermediate_size", "12288"),
+            ("n_shared_experts", "1"),
+            ("first_k_dense_replace", "3"),
+            ("routed_scaling_factor", "2.5"),
+            ("vocab_size", "154880"),
+            ("rms_norm_eps", "1e-5"),
+            ("rope_parameters", r#"{"rope_theta": 8000000}"#),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        for (k, v) in overrides {
+            fields.retain(|(fk, _)| fk != k);
+            if !v.is_empty() {
+                fields.push((k.to_string(), v.to_string()));
+            }
+        }
+        let body: Vec<String> = fields
+            .iter()
+            .map(|(k, v)| format!("\"{k}\":{v}"))
+            .collect();
+        format!("{{{}}}", body.join(","))
+    }
+
+    fn parse(overrides: &[(&str, &str)]) -> Result<ModelConfig> {
+        ModelConfig::from_json(&cfg_json(overrides))
+    }
+
+    #[test]
+    fn glm_baseline_parses() {
+        let c = parse(&[]).expect("GLM-5.2's own config must load");
+        assert_eq!(c.rope_theta(), 8_000_000.0);
+        assert_eq!(c.scoring(), crate::math::Scoring::Sigmoid);
+        assert_eq!(c.experts_per_layer(), 9);
+        assert_eq!(c.qk_head_dim(), 256);
+    }
+
+    /// GLM nests theta; the DeepSeek/Llama lineage puts it at top level. Both must
+    /// load, and a snapshot carrying neither must say so instead of decoding at
+    /// theta=0 — which would be a silently wrong RoPE, not a crash.
+    #[test]
+    fn rope_theta_from_either_nesting() {
+        let flat = parse(&[("rope_parameters", ""), ("rope_theta", "10000")])
+            .expect("top-level rope_theta must load");
+        assert_eq!(flat.rope_theta(), 10_000.0);
+
+        let err = parse(&[("rope_parameters", "")]).unwrap_err().to_string();
+        assert!(err.contains("rope_theta"), "unhelpful message: {err}");
+    }
+
+    /// A wrong router affinity picks plausible-but-wrong experts and never crashes,
+    /// so an unrecognised one must be refused at load. `softmax` is refused on
+    /// purpose: the reference skips top-k renormalization for it.
+    #[test]
+    fn scoring_func_is_resolved_or_refused() {
+        assert_eq!(
+            parse(&[("scoring_func", r#""sqrtsoftplus""#)]).unwrap().scoring(),
+            crate::math::Scoring::SqrtSoftplus
+        );
+        assert_eq!(
+            parse(&[("scoring_func", r#""sigmoid""#)]).unwrap().scoring(),
+            crate::math::Scoring::Sigmoid
+        );
+        for bad in [r#""softmax""#, r#""gumbel""#] {
+            let err = parse(&[("scoring_func", bad)]).unwrap_err().to_string();
+            assert!(err.contains("scoring_func"), "unhelpful message: {err}");
+        }
+    }
+
+    /// `vq_row_bytes`/`vq_groups` only `debug_assert` this, so a release build would
+    /// truncate every expert row with no diagnostic at all.
+    /// Note the head count on the `hidden` case: at GLM's 64 heads the existing
+    /// `hidden % n_heads` check already implies `% VQ_GROUP`, since both are 64. It is
+    /// `moe_inter` — checked against nothing else — that this actually protects.
+    #[test]
+    fn ragged_vq_widths_are_refused() {
+        for bad in [
+            vec![("num_attention_heads", "8"), ("hidden_size", "6120")],
+            vec![("moe_intermediate_size", "2000")],
+        ] {
+            let err = parse(&bad).unwrap_err().to_string();
+            assert!(err.contains("VQ_GROUP"), "unhelpful message: {err}");
+        }
+        // 18432 is the DeepSeek-V3 family's intermediate_size, which the deleted
+        // `MAX_FUSED_INTER` ceiling used to refuse for a kernel that no longer exists.
+        parse(&[("intermediate_size", "18432")]).expect("no intermediate ceiling any more");
+    }
+
+    #[test]
+    fn structurally_impossible_dims_are_refused() {
+        for bad in [
+            vec![("first_k_dense_replace", "99")],
+            vec![("num_experts_per_tok", "300")],
+            vec![("n_shared_experts", "0")],
+            vec![("num_attention_heads", "63")],
+        ] {
+            assert!(parse(&bad).is_err(), "{bad:?} should not have loaded");
+        }
     }
 }
