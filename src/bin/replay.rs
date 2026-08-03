@@ -25,7 +25,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use rivoli::memory::cache::TwoQSplit;
 use rivoli::memory::hybrid::{self, HybridPolicy};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::BufRead;
 
 /// The Kin/Kout grid a `--sweep` walks. Kin is a resident probation bound so it is
@@ -67,6 +67,13 @@ struct Args {
     #[arg(long)]
     sweep: bool,
 
+    /// Model a BATCHED pass over this many consecutive tokens: each layer reads the union
+    /// of its rows' picks once instead of once per row. 1 (the default) replays the trace
+    /// as captured. The figure of merit under batching is `reads/token`, not `loaded %` —
+    /// the union shrinks the access count itself, so hit rate flatters a larger batch.
+    #[arg(long, value_name = "B", default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
+    batch: u16,
+
     /// 2Q only: the A1in probation bound, as a percentage of capacity.
     #[arg(long, value_name = "PCT", default_value_t = TwoQSplit::default().kin_pct())]
     kin: u32,
@@ -98,6 +105,52 @@ fn parse_trace(r: impl BufRead) -> Result<Vec<Decision>> {
         }
     }
     Ok(out)
+}
+
+/// Split a flat trace into per-token runs. `expert_key` packs the layer into the high 16
+/// bits, and a token walks its MoE layers in increasing order, so a layer id that fails to
+/// increase starts a new token. Derived rather than assumed: the MoE layer count is an
+/// artifact property and a trace carries no header for it.
+fn tokens(trace: &[Decision]) -> Vec<&[Decision]> {
+    let mut cuts = vec![0usize];
+    for (i, d) in trace.iter().enumerate().skip(1) {
+        if d[0] >> 16 <= trace[i - 1][0] >> 16 {
+            cuts.push(i);
+        }
+    }
+    cuts.push(trace.len());
+    cuts.windows(2).map(|w| &trace[w[0]..w[1]]).collect()
+}
+
+/// The access sequence a BATCHED pass over `b` consecutive tokens would issue: per layer,
+/// the union of that layer's picks across the batch's rows, read once. This is the whole
+/// question batched prefill turns on — a batch pays the union, not the sum, so the saving
+/// is however much consecutive tokens agree about which experts they want.
+///
+/// Layers come back in id order, which is the order a batched pass visits them. Within a
+/// layer the union keeps FIRST-SEEN order, preserving the router rank the policies are
+/// recency-sensitive to (see [`Decision`]).
+fn coalesce(trace: &[Decision], b: usize) -> Vec<Decision> {
+    if b <= 1 {
+        return trace.to_vec();
+    }
+    let mut out = Vec::new();
+    for chunk in tokens(trace).chunks(b) {
+        let mut by_layer: BTreeMap<u32, Decision> = BTreeMap::new();
+        for d in chunk.iter().copied().flatten() {
+            let u = by_layer.entry(d[0] >> 16).or_default();
+            // ponytail: linear dedup over a union bounded by b*top_k (512 at b=64), which
+            // is microseconds against a trace this tool already scans in milliseconds. A
+            // HashSet beside it is the upgrade path if a batch ever wants to be large.
+            for &k in d {
+                if !u.contains(&k) {
+                    u.push(k);
+                }
+            }
+        }
+        out.extend(by_layer.into_values());
+    }
+    out
 }
 
 /// Replay `trace` through `policy` at `cap` unit slots; return the `loaded` (resident-hit)
@@ -209,6 +262,12 @@ fn main() -> Result<()> {
     let f =
         std::fs::File::open(&args.trace).with_context(|| format!("open trace {}", args.trace))?;
     let trace = parse_trace(std::io::BufReader::new(f))?;
+    // Token count comes from the CAPTURED trace, before coalescing collapses the runs it
+    // is derived from. It is the denominator of `reads/token`, which is the only figure
+    // comparable across batch sizes — bytes moved per token of output is what the fetch
+    // bound is denominated in (docs/reference/architecture.md §3).
+    let ntok = tokens(&trace).len();
+    let trace = coalesce(&trace, usize::from(args.batch));
 
     let accesses: usize = trace.iter().map(Vec::len).sum();
     let uniq = trace
@@ -218,12 +277,19 @@ fn main() -> Result<()> {
         .collect::<std::collections::HashSet<u32>>()
         .len();
     println!(
-        "trace {}: {} layers, {accesses} accesses, {uniq} unique experts, cap={cap}",
+        "trace {}: {} decisions over {ntok} tokens (batch={}), {accesses} accesses, \
+         {uniq} unique experts, cap={cap}",
         args.trace,
-        trace.len()
+        trace.len(),
+        args.batch,
     );
     // Every replay is scored the same way: demand accesses served from residency.
     let pct = |loaded: u64| 100.0 * loaded as f64 / accesses.max(1) as f64;
+    // Misses are reads, and a read is ~15.34 MB off NVMe. Per TOKEN, because that is the
+    // denominator the fetch bound uses and the only one a batch cannot flatter: batching
+    // removes accesses, so `loaded %` rises even where bytes moved per token does not fall.
+    let per_tok =
+        |loaded: u64| (accesses as u64).saturating_sub(loaded) as f64 / ntok.max(1) as f64;
 
     if args.sweep {
         println!(
@@ -262,19 +328,24 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    println!("\n{:<10} {:>8}", "policy", "loaded");
+    println!("\n{:<10} {:>8} {:>12}", "policy", "loaded", "reads/token");
     let mut best_online = f64::MIN;
     for pol in ["lru", "2q", "arc"] {
-        let hit = pct(replay(pol, cap, split, &trace)?);
-        best_online = best_online.max(hit);
-        println!("{pol:<10} {hit:>7.2}%");
+        let loaded = replay(pol, cap, split, &trace)?;
+        best_online = best_online.max(pct(loaded));
+        println!("{pol:<10} {:>7.2}% {:>12.2}", pct(loaded), per_tok(loaded));
     }
     // The bound, and what is left under it. This line is the whole point of the table: a
     // headroom near zero RETIRES residency as a lever and leaves format (`perf-roadmap.md`
     // #2) as the only remaining way to move bytes; a large one prices the policy work in
     // the currency that matters — at ~8 experts/layer a pp is ~0.6 fewer misses per token.
-    let opt = pct(replay_opt(cap, &trace));
-    println!("{:<10} {opt:>7.2}%   <- Belady bound (clairvoyant, unreachable online)", "opt");
+    let opt_loaded = replay_opt(cap, &trace);
+    let opt = pct(opt_loaded);
+    println!(
+        "{:<10} {opt:>7.2}% {:>12.2}   <- Belady bound (clairvoyant, unreachable online)",
+        "opt",
+        per_tok(opt_loaded)
+    );
     println!(
         "headroom:  {:.2} pp  — every online policy above is at least this far from optimal",
         opt - best_online
@@ -337,6 +408,43 @@ mod tests {
         assert_eq!(t, vec![vec![7, 8], vec![9, 10]]);
     }
 
+    /// A batch pays the UNION of its rows, not the sum — the property the whole batched-
+    /// prefill question turns on, so it is asserted rather than assumed. Two tokens over
+    /// two layers, agreeing on one expert per layer: 4 accesses per layer collapse to 3.
+    ///
+    /// It also pins the two things a wrong union would silently break: the layer split is
+    /// derived from `expert_key`'s high 16 bits (so `tokens` must find 2, not 1 or 4), and
+    /// layers come back in id order with first-seen rank inside them, because the policies
+    /// downstream are recency-sensitive and read this as an access sequence.
+    #[test]
+    fn a_batch_reads_the_union_of_its_rows_not_the_sum() {
+        let k = |layer: u32, expert: u32| (layer << 16) | expert;
+        let t = parse(&format!(
+            "{} {}\n{} {}\n{} {}\n{} {}\n",
+            k(3, 1),
+            k(3, 2),
+            k(4, 5),
+            k(4, 6),
+            k(3, 2),
+            k(3, 3),
+            k(4, 5),
+            k(4, 7),
+        ));
+        assert_eq!(tokens(&t).len(), 2, "two tokens of two MoE layers each");
+        assert_eq!(
+            coalesce(&t, 1),
+            t,
+            "batch=1 is the captured trace, untouched"
+        );
+        assert_eq!(
+            coalesce(&t, 2),
+            vec![
+                vec![k(3, 1), k(3, 2), k(3, 3)],
+                vec![k(4, 5), k(4, 6), k(4, 7)],
+            ],
+        );
+    }
+
     /// The textbook case OPT exists to catch, hand-computed. `1 2 3 1 2 3 1 2 3` at cap 2:
     /// OPT scores **3** — on the first 3 it drops 2 (next use at index 4) rather than 1
     /// (index 3), so 1 hits, and the pattern repeats. The exact 3 fails if the eviction rule
@@ -355,7 +463,10 @@ mod tests {
         assert_eq!(opt, 3, "Belady keeps the sooner-used key");
         for pol in ["lru", "2q", "arc"] {
             let online = replay(pol, 2, TwoQSplit::default(), &t).unwrap();
-            assert!(online < opt, "{pol} scored {online} against a bound of {opt}");
+            assert!(
+                online < opt,
+                "{pol} scored {online} against a bound of {opt}"
+            );
         }
     }
 }
