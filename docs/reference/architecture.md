@@ -93,7 +93,7 @@ a verify pass runs the same graph with `R = 2` rows threaded through every kerne
 **This is the DECODE shape, and the prompt need not take it.** The serial dependency binds
 decode because token T+1's input is T's argmax — there is no set of tokens to reorder. A
 prompt is the opposite case: every token is known up front, so the loops can be inverted to
-run one layer over all of them before the next. That is `--layer-major-prefill` (§14), off by
+run one layer over all of them before the next. That is layer-major prefill (§14), on by
 default, and it is worth 2.15x on prefill because it stops re-reading each layer's experts
 once per token.
 
@@ -1084,7 +1084,20 @@ block at the top of this section for why the guard that refused it earned its ke
 
 ## 14. Layer-major prefill — OPT-IN 2026-08-02
 
-**Off by default**; `--layer-major-prefill` opts in. It changes the ORDER the prompt walks
+**DEFAULT since 2026-08-03**; the `--layer-major-prefill` flag is deleted and the mode is
+DERIVED, not chosen: on, except while `--trace` is capturing. That exception is not a
+preference — a v2 trace has no token delimiter and recovers one from the layer id
+DESCENDING, which a layer-major prefill never does, so a capture under it is silently
+mis-segmented. That used to be an `ensure!` refusing the combination, which is the wrong
+shape once the flag is gone (the user would have no way to comply), so the engine falls
+back and says so on the residual-stream line.
+
+**What it now costs unconditionally:** `x` and the IndexShare slots are sized `max_ctx`
+rather than `MAXROW` — 24 KB/token of residual plus `index_topk*4` per context token. At
+`max_ctx` 8192 that is ~201 MB + ~67 MB that a token-major run did not pay. The flag
+existed to avoid exactly that, so this is a deliberate trade, not a free win.
+
+It changes the ORDER the prompt walks
 the model and nothing else, so it moves the expert read count and **never** output —
 verified byte-identical on `--attn dense` (16 ids, `--dump-ids`) and gated by
 `tests/layer-major-neutrality.sh`. Measured 2.15x on prefill wall, 5.66x fewer expert reads;

@@ -771,8 +771,21 @@ impl<'a> GpuEngine<'a> {
         cfg: &'a ModelConfig,
         max_ctx: usize,
         mode: AttnMode,
-        layer_major_prefill: bool,
     ) -> Result<Self> {
+        // ALWAYS ON since 2026-08-03, except while capturing a trace — the `--layer-major-
+        // prefill` flag is gone and this is derived rather than chosen. Layer-major is
+        // 2.15x on prefill wall and 5.66x fewer expert reads, and the A/B that proved it
+        // output-identical has run; an opt-in nobody passes is a win nobody gets.
+        //
+        // The exception is not a preference. A v2 trace has no token delimiter and
+        // recovers one from the layer id DESCENDING, which a layer-major prefill never
+        // does, so a capture under it is silently mis-segmented — the worst shape for a
+        // file that costs a sole-tenant GPU half an hour. That used to be an `ensure!`
+        // refusing the combination; refusing is wrong once the flag is gone, because the
+        // user has no way to comply. Falling back is the same guarantee without the
+        // dead end, and it also keeps `x`/IndexShare narrow for the run that does not
+        // need them wide.
+        let layer_major_prefill = !pin.tracing();
         // The MoE block folds the shared expert into the routed batch at a single
         // kernel `inter = moe_inter`. Only valid when the shared expert has the routed
         // width, i.e. n_shared == 1 (GLM-5.2).
@@ -887,7 +900,9 @@ impl<'a> GpuEngine<'a> {
             (x_rows * cfg.hidden * 4) as f64 / 1e6,
             match layer_major_prefill {
                 true => " — layer-major prefill",
-                false => "",
+                // Only reachable under --trace; say so, because a reader who knows
+                // layer-major is the default would otherwise read a narrow `x` as a bug.
+                false => " — token-major prefill (--trace: layer-major mis-segments a v2 capture)",
             }
         );
         Ok(Self {
@@ -2762,12 +2777,6 @@ impl<'a> GpuEngine<'a> {
         // capture that costs a sole-tenant GPU half an hour and cannot be redone from the
         // file. Trace the sequential prefill; the layer-major read count is arithmetic
         // over the same trace's distinct (layer, expert) pairs.
-        ensure!(
-            !self.layer_major_prefill || !self.pin.tracing(),
-            "--layer-major-prefill with --trace: the v2 trace has no token delimiter and \
-             recovers one from the layer id descending, which a layer-major prefill never \
-             does. Capture with the sequential prefill instead"
-        );
         // The decode as ONE async flow: prefill (warm-up) then the token loop, driven
         // by a single current-thread runtime — `forward` awaits the expert stream
         // inline, so there's no per-layer block_on. The token loop is serial by data

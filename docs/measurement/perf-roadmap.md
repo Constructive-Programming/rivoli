@@ -50,7 +50,7 @@ verdict: The ranked performance roadmap. Live rows: #2 VQ_K codebook, #10 genera
 | 6b | o_proj split-K / x-tiling | follow-up #2 | — | — | **refuted and reverted** |
 | 7 | `mla_absorb` restructure | follow-up #4 | **−0.80 ms/tok, measured** | med | **done** |
 | 8 | Faster demand fetch (deeper queues, split reads, unpinned arena) | B | — | — | **closed as negative 2026-08-01** — the drive is already giving what the queue depth buys; see below |
-| 9 | Layer-major prefill | A | **prefill 2.15×**; expert reads 159.56 → 28.20/token (the compulsory floor); output byte-identical | med | **done, opt-in 2026-08-02** — `--layer-major-prefill`; decode pays a one-off ~2.7 s warm-up, 1.8% of the saving. `docs/reference/architecture.md` §14 |
+| 9 | Layer-major prefill | A | **prefill 2.15×**; expert reads 159.56 → 28.20/token (the compulsory floor); output byte-identical | med | **done; DEFAULT since 2026-08-03** — the flag is deleted and the mode is derived (`--trace` falls back to token-major, since a v2 capture mis-segments under it). Decode pays a one-off ~2.7 s warm-up, 1.8% of the saving. `docs/reference/architecture.md` §14 |
 | 10 | General-`R` MoE kernels (tiled GEMM) | follow-up #9 | the rest of #9: a 2-row pass still re-reads its experts from LPDDR5, and that is now the prefill bound | **high** | new — see below |
 | 11 | Better cache policy (residency / hit rate) | B | ceiling **8.6 ms/tok (2.4%)** at 115 GiB — and that is Belady's, not a reachable one | — | **closed as negative 2026-08-02 AT 115 GiB — still live at 61**; see below |
 

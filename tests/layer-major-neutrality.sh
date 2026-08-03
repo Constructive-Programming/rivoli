@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# `--layer-major-prefill` must move the EXPERT READ COUNT and never the output. This is the
+# Layer-major prefill (the default since 2026-08-03) must move the EXPERT READ COUNT
+# and never the output. This is the
 # paired check for that, one pair per `--attn` mode: prefill once token-major and once
 # layer-major, compare token IDS, and compare the reads/token the new PREFILL line reports.
 # Not text — different id sequences can decode to identical text, so a text diff reports
@@ -92,9 +93,19 @@ pair() { # pair <artifact> <attn> <label>
   extra=$(mode_flags "$attn")
   echo "=== $attn $label ${extra:+[$extra]} ==="
   # shellcheck disable=SC2086  # extra is a deliberately word-split flag list
-  a=$(arm "$art" "$attn" "$WORK/tok.ids" "$WORK/tok.log" $extra)
+  # The arms swapped on 2026-08-03, when `--layer-major-prefill` was deleted and
+  # layer-major became the default. The remaining way to force TOKEN-major is `--trace`:
+  # a v2 trace recovers token boundaries from the layer id descending, which a layer-major
+  # prefill never does, so the engine falls back for a capture. That makes the control arm
+  # `--trace` and the treatment arm bare. The trace file is a side effect we discard.
+  #
+  # It is a weaker control than the flag was — `--trace` also writes a trace per layer —
+  # but it does not touch the arithmetic, so the IDS comparison below still means what it
+  # meant. If that ever stops being true this script has no control left and should be
+  # retired rather than trusted.
+  a=$(arm "$art" "$attn" "$WORK/tok.ids" "$WORK/tok.log" --trace "$WORK/tok.trace" $extra)
   # shellcheck disable=SC2086
-  b=$(arm "$art" "$attn" "$WORK/lay.ids" "$WORK/lay.log" --layer-major-prefill $extra)
+  b=$(arm "$art" "$attn" "$WORK/lay.ids" "$WORK/lay.log" $extra)
   echo "  token-major: ${a:-<no PREFILL line — arm failed, see below>}"
   echo "  layer-major: ${b:-<no PREFILL line — arm failed, see below>}"
   if [ -z "$a" ] || [ -z "$b" ]; then

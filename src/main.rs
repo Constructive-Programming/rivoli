@@ -154,6 +154,13 @@ struct Args {
     #[arg(long)]
     pred_probe: bool,
 
+    /// Seconds without a token before the wedge watchdog aborts the process
+    /// (`--features trace`). Must comfortably exceed the slowest HEALTHY token — a
+    /// cold-miss token here is 1-2 s — so it trips only on a real wedge.
+    #[cfg(feature = "trace")]
+    #[arg(long, value_name = "SECS", default_value_t = 60)]
+    watchdog_secs: u64,
+
     /// Record the decode as real OTLP spans, up to BUDGET of them (bare `--spans` = 5000).
     /// Without it only the end-of-run metrics export; there is no timeline to build.
     ///
@@ -216,24 +223,6 @@ struct Args {
     #[arg(long, default_value_t = 0.8)]
     mtp_min_conf: f32,
 
-    /// Prefill the prompt LAYER-MAJOR: every token through layer L before any reaches
-    /// L+1, instead of every layer per token.
-    ///
-    /// Same arithmetic, different order. Token-major prefill evicts layer L's experts long
-    /// before the next token wants them — 154.75 expert reads per token over a 769-token
-    /// prompt. Layer-major reads each distinct (layer, expert) pair once: 24.02 per token,
-    /// the compulsory floor.
-    ///
-    /// Costs 24 KB of device memory per context token, because the whole prompt's residual
-    /// stream has to stay live across the model; under --attn dsa/misa another 8 KB/token,
-    /// since the indexer's reuse state has to be keyed by position rather than by row.
-    /// Works with every attention mode.
-    ///
-    /// Off by default until the wall-clock A/B is recorded in
-    /// docs/measurement/benchmarks.md. Passes are still 2 rows wide, so this buys the NVMe
-    /// reduction and not the LPDDR5 one — see `GpuEngine::prefill_layer_major`.
-    #[arg(long)]
-    layer_major_prefill: bool,
 
     /// DIAGNOSTIC: hash the residual stream after every layer.
     #[cfg(feature = "trace")]
@@ -724,23 +713,29 @@ fn main() -> Result<()> {
             &mc,
             max_ctx,
             cfg.attn.clone(),
-            a.layer_major_prefill,
         )?;
         #[cfg(feature = "trace")]
         engine.set_checksum_x(cfg.checksum_x);
         #[cfg(feature = "pred-probe")]
         engine.set_pred_probe(a.pred_probe);
         engine.set_moe_gain(a.moe_gain);
-        // Wedge watchdog: a hung GPU join can't be caught inside the decode loop, so
-        // a background thread aborts the process if no token lands for `wd_secs`.
-        let wd_secs = std::env::var("RIVOLI_WATCHDOG_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(60);
+        // Wedge watchdog: a hung GPU join can't be caught inside the decode loop, so a
+        // background thread aborts the process if no token lands for `--watchdog-secs`.
+        //
+        // `trace`-only, and the deadline is a FLAG. It was `RIVOLI_WATCHDOG_SECS` until
+        // 2026-08-03 — an env var is invisible to `--help`, absent from the command line
+        // `docs/measurement/benchmarks.md` records, and silently active in a build that
+        // looks stock, which is the same objection that retired `RIVOLI_SPANS` and
+        // `RIVOLI_TOPK`. The only env vars this engine still reads are `OTEL_*`, whose
+        // names are the OpenTelemetry spec's rather than ours, and `TMPDIR`.
+        //
         // Cloned rather than moved: server mode has to beat it from the accept loop too,
         // because an idle server produces no tokens and the watchdog cannot tell "waiting
         // for a request" from "wedged". See serve::serve.
-        let hb = rivoli::watchdog::spawn(std::time::Duration::from_secs(wd_secs))?;
+        #[cfg(feature = "trace")]
+        let hb = rivoli::watchdog::spawn(std::time::Duration::from_secs(a.watchdog_secs))?;
+        #[cfg(not(feature = "trace"))]
+        let hb = rivoli::watchdog::inert();
         engine.set_heartbeat(hb.clone());
         // --- `--ppl`: teacher-forced quality gate, not a decode -----------------------
         // Returns before `generate` because the two are mutually exclusive by design: a
