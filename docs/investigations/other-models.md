@@ -205,6 +205,46 @@ NVMe latency behind compute. On V4-Flash there is little latency to hide and the
 the bottleneck. The port is worth doing as a second architecture; it is not worth doing as a
 demonstration of expert streaming.
 
+## 5. Source weight formats — measured from the repos, 2026-08-03
+
+`convert` requires `<name>.weight` as **F8E4M3** plus `<name>.weight_scale_inv` as **F32**
+(`artifact/format.rs`). Neither target provides that for its routed experts. Per-dtype
+parameter counts from each repo's `safetensors` metadata, and repo sizes from its file tree:
+
+| | DeepSeek-V4-Flash-0731 | Kimi K3 |
+|---|---|---|
+| download | **162.5 GB**, 48 shards | **1.55 TB**, 96 shards |
+| total params | 304.18B | 2.78T |
+| routed experts | **296.35B as I8** (FP4 nibbles, 2/byte, e8m0 scales) | **2.72T as U8** (MXFP4, QAT) |
+| attention | **6.30B as F8_E4M3** ← the one thing that maps today | — |
+| everything else | 1.48B BF16, 37.7M F32, 2.33M I64 | 57.18B BF16, 11.1M F32 |
+
+**Both models' experts are already 4-bit.** That is the fact that decides the artifact
+format, and it cuts against re-quantizing to int3-vq:
+
+> `int4-scales.md` records that `vq3_to_i4` — deriving int4 from the *already lossy* vq3
+> rather than from fp8 — produced **PPL 73.43**, and the chain was DELETED. int4 became
+> usable (5.120) only when derived DIRECTLY from the fp8 source. Feeding a 4-bit expert into
+> a 3.25-bit VQ fit is the same shape of chain against the same kind of source.
+
+The difference between the two targets is whether we can afford to keep native precision:
+
+- **V4-Flash: we can.** Native 4-bit experts in the existing `.i4` container (nibble +
+  group scale) is ~157 GB, against ~120 GB for int3-vq. Spending 37 GB of an 860 GiB budget
+  to avoid a lossy-on-lossy chain is not a close call. Attention stays fp8 — it already is
+  fp8, and that half maps onto the resident path unchanged.
+- **K3: we cannot.** Native MXFP4 experts are ~1.45 TB. Even with GLM-5.2 deleted
+  (709 GB reclaimed → ~1.63 TB free) that leaves ~180 GB of headroom, and the 1.55 TB source
+  cannot be local at the same time — it has to stream from `/swarm/storage` during
+  conversion, exactly as GLM's fp8 source did. int3-vq at ~1.10 TB is the affordable option
+  and still needs GLM deleted.
+
+**The K3 penalty is measurable today, with no network.** GLM-5.2 carries BOTH `.i4` (4-bit,
+derived from fp8) and `.vq3` (3.25-bit, derived from fp8) twins for every MoE layer. Quantize
+the `.i4` into a vq3 and score it against the shipped vq3-from-fp8 on paired dNLL
+(`bin/ppl`, `tests/ppl-corpus-5000.txt`). That is the 4-bit → 3.25-bit chain K3 would take,
+measured on data already on disk. Do it before committing to a 1.55 TB transfer.
+
 ## What we did not build, and why
 
 No model-family abstraction, no `trait Architecture`, no registry, no per-model plugin. One
