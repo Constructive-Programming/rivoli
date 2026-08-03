@@ -1,6 +1,6 @@
 ---
 status: live
-verdict: Kimi K3 is a BITRATE problem, not a capacity one — 2.72T expert params is 1.03 TiB at int3-vq's 3.25 bits/weight against ~940 GiB reclaimable, and ≤2.5 bits fits; the real wall is a linear-attention kernel family for 69 of its 93 layers. DeepSeek-V4-Flash-0731 fits at ~120 GiB and its sqrt(softplus) router SHIPPED 2026-08-03, but it is not MLA, not residual-additive, and llama.cpp measured it compute-bound — so it barely exercises expert streaming.
+verdict: Both targets keep source fidelity — V4-Flash native FP4 in a new `.f4` container (~157 GB), K3 native MXFP4 (~1.45 TB) — because both ship 4-bit experts and re-quantizing to int3-vq is the lossy-on-lossy chain int4-scales.md records at PPL 73.43. NFS measures 154 MB/s against NVMe's 7.0 GB/s, so `/swarm` is the library and NVMe the working set; all three at native fidelity are 1.73 TiB against 1.69 TiB of disk. V4-Flash's sqrt(softplus) router SHIPPED 2026-08-03; its tensor naming is the reference scheme, not HuggingFace's, and it is neither MLA nor residual-additive.
 ---
 
 # Can rivoli run a model other than GLM-5.2?
@@ -244,6 +244,67 @@ derived from fp8) and `.vq3` (3.25-bit, derived from fp8) twins for every MoE la
 the `.i4` into a vq3 and score it against the shipped vq3-from-fp8 on paired dNLL
 (`bin/ppl`, `tests/ppl-corpus-5000.txt`). That is the 4-bit → 3.25-bit chain K3 would take,
 measured on data already on disk. Do it before committing to a 1.55 TB transfer.
+
+## 6. Decisions taken 2026-08-03 — storage layout and target formats
+
+**Formats.** Both models keep their source fidelity; neither is re-quantized:
+
+- **DeepSeek-V4-Flash-0731** → native FP4 experts in a new **`.f4`** container (~157 GB),
+  attention left at its native fp8 (6.30B F8_E4M3, which the resident path already handles).
+- **Kimi K3** → native **MXFP4** experts (~1.45 TB).
+
+**Layout: `/swarm` is the library, NVMe is the working set.** Measured 2026-08-03:
+
+| | throughput | GLM at 10.3 GB/token |
+|---|---|---|
+| local NVMe (btrfs RAID0) | **7.0 GB/s** | 0.35 s/token (2.85 tok/s today) |
+| `/swarm/storage` (NFS4.2, via `macvlan-shim`) | **154 MB/s** | **~67 s/token** |
+
+`dd iflag=direct`, 4 GiB, on a `.vq3` block and an fp8 shard respectively. A 45× read gap,
+so an artifact served from NFS is ~190× slower per token — the engine's whole design is
+hiding NVMe latency behind compute, and there is nothing to hide at 154 MB/s.
+
+It is also a capacity problem that deleting things cannot fix: K3 native MXFP4 (1.32 TiB)
++ V4-Flash `.f4` (146 GiB) + GLM vq3 (279 GiB) = **1.73 TiB against 1.69 TiB of total NVMe**.
+All three cannot be resident at native fidelity on an empty disk.
+
+Hence the split:
+
+```
+/swarm/storage/ai/rivoli/{glm5.2,kimi-k3,deepseek-v4-flash-0731}/   # library: sources AND artifacts
+/var/db/rivoli/<name>/                                             # working set: whatever is decoding
+```
+
+Swapping K3 in costs a ~2.4 h copy at 154 MB/s. That is fine for a model swap and fatal for
+a token, which is exactly the distinction the split encodes.
+
+**Not yet executed**: `/swarm/storage/ai/rivoli` is root-owned and this account has no
+passwordless sudo. Everything under it shares one `st_dev`, so the reorganization is instant
+renames; `openclaw/glm52-fp8` is on a *different* `st_dev`, so relocating that 581 GB source
+would be a real copy, not a rename — symlink it instead.
+
+## 7. V4-Flash tensor naming — it is NOT HuggingFace-style
+
+Read from `model.safetensors.index.json`. This is the reference-implementation scheme, and
+every `format!("model.layers.{l}...")` in `convert.rs`/`pin.rs` is wrong for it:
+
+| | GLM-5.2 (what convert expects) | DeepSeek-V4-Flash |
+|---|---|---|
+| expert | `model.layers.{l}.mlp.experts.{e}.{gate,up,down}_proj.weight` | `layers.{l}.ffn.experts.{e}.w{1,3,2}.weight` |
+| expert scale | `….weight_scale_inv` (F32) | `….scale` |
+| shared expert | `model.layers.{l}.mlp.shared_experts.…` | `layers.{l}.ffn.shared_experts.w{1,2,3}.…` |
+| attention | `self_attn.{q_a_proj,q_a_layernorm,q_b_proj,kv_a_proj_with_mqa,kv_a_layernorm,kv_b_proj,o_proj}` | `attn.{wq_a,q_norm,wq_b,wkv,kv_norm,wo_a,wo_b}` + `attn.attn_sink` |
+| norms | `input_layernorm` / `post_attention_layernorm` | `attn_norm` / `ffn_norm` |
+| embedding | `model.embed_tokens.weight` | `embed.weight` |
+| mHC | — | `hc_{attn,ffn}_{base,fn,scale}` — six per layer |
+
+`w1`/`w3`/`w2` is the reference's gate/up/down. Note **`wo_a`/`wo_b`**: the output projection
+is low-rank too, which GLM's single `o_proj` is not.
+
+> **Unverified absence.** The fetch returned layer-0 tensors and `embed.weight` only, so the
+> index was sampled, not read whole. It reported no `tid2eid`, indexer, or `eh_proj` tensors —
+> but `num_hash_layers: 3` and `num_nextn_predict_layers: 1` say hash routing and an MTP head
+> both exist. Treat those three as *not yet located*, not as absent.
 
 ## What we did not build, and why
 
