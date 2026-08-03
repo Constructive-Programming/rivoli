@@ -666,12 +666,20 @@ mod vktier {
         /// does not COMPILE, and a feature combination that cannot be built is worse than a
         /// registry lookup nobody times. `crate::backend::vk::read_raw` carries the argument in full.
         ///
-        /// `trace`-only, so it is never on the decode path.
+        /// **UN-GATED 2026-08-02. This said "`trace`-only, so it is never on the decode
+        /// path", and that stopped being true.** `GpuEngine::prefill_layer_major` reads the
+        /// prompt's last hidden row back through the host to normalise `x` row 0, on the
+        /// ordinary decode path, on both backends — so a `trace` gate here means
+        /// `--features vulkan` alone does not compile. It was caught by
+        /// `tests/feature-matrix.sh` on that combination and by nothing else: the
+        /// prescribed union names `rocm` and `trace` together, so both halves of the gate
+        /// were satisfied and the hole only opened for a backend nobody had built.
+        ///
+        /// The HIP twin was never gated, which is why this was a one-backend break.
         ///
         /// # Safety
         /// `src` must be a device address inside a live buffer, readable for `len` bytes,
         /// and no kernel may be concurrently writing them (call after a `device_sync`).
-        #[cfg(feature = "trace")]
         pub unsafe fn copy_out_raw(src: *const u8, len: usize, out: &mut Vec<u8>) -> Result<()> {
             // Reads the host mapping, which is not ordered against a recorded dispatch —
             // hence the sync, matching what the blocking `hipMemcpy` gives the HIP twin for

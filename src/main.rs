@@ -645,15 +645,28 @@ fn main() -> Result<()> {
         // Found 2026-08-01 while building server mode. Fixed by BATCHING the row selection
         // rather than refusing it: dsa/misa select per row and the head attends dense, and
         // streaming uploads one row set per row. All four modes speculate. See §13.
-        let mtp = !a.no_mtp && engine.has_mtp() && !engine.tracing();
+        // A verify pass is TWO token rows, and the Vulkan `.comp` shaders are single-row —
+        // `gemv_fp8` rejects `nrow=2` outright. Compile-time rather than a runtime probe,
+        // because the backend is fixed at build and this must be decided before the pin is.
+        //
+        // Added 2026-08-03 after tests/mode-matrix.sh ran the cross under both backends:
+        // every Vulkan cell loaded weights for ~2 minutes and then died mid-decode on
+        // `gemv_fp8: nrow=2`. `Config::validate_backend` refuses the unported MODES and
+        // ATTNS at startup for exactly this reason and simply did not know about the head,
+        // so the default flags were a guaranteed late crash on that backend.
+        let batched_rows = cfg!(not(feature = "vulkan"));
+        let mtp = !a.no_mtp && engine.has_mtp() && !engine.tracing() && batched_rows;
         if !a.no_mtp && !mtp {
             info!(
                 "speculative decode OFF: {}",
-                match engine.has_mtp() {
-                    false =>
+                match (batched_rows, engine.has_mtp()) {
+                    (false, _) =>
+                        "the Vulkan backend's shaders are single-row and a verify pass \
+                              needs two (rebuild with --features rocm)",
+                    (_, false) =>
                         "this artifact carries no MTP head (re-run bin/fp8_to_i4 to \
                               emit L78.i4 for int4/hybrid)",
-                    true => "--trace routes once per layer and a verify pass routes twice",
+                    _ => "--trace routes once per layer and a verify pass routes twice",
                 }
             );
         }
