@@ -254,6 +254,101 @@ fn moe_gain_in_band(s: &str) -> Result<f32, String> {
     }
 }
 
+/// Above this token budget, `-bench` arms [`BENCH_SCRIPT`] so EOS continues the
+/// conversation instead of ending the run. Below it the single default prompt still fits,
+/// and every historical `-bench 128/256/512` keeps its exact recorded behaviour — the
+/// default prompt stops on EOS at ~318 tokens, which is why 512 was the largest budget
+/// anyone recorded.
+const BENCH_SCRIPT_MIN: usize = 512;
+
+/// The opening turn of a scripted run, replacing the historical `-bench` prompt above
+/// [`BENCH_SCRIPT_MIN`]. `--prompt` still overrides it.
+///
+/// **Why not keep "The sky is blue because".** That prompt answers in ~318 tokens and then
+/// stops, which is the shape a two-line factual question has; every turn of a scripted run
+/// inherits that shape and the run ends up dominated by turn *boundaries* rather than by
+/// decoding. It is also a topic pivot — the follow-ups are about inference engines — and a
+/// conversation that changes subject at turn 2 is neither realistic nor good for the thing
+/// these runs measure, since incoherent context is what pushes this model toward the
+/// repetition the degeneration detector fires on.
+///
+/// So: an open-ended engineering request of the kind a real user actually sends. It asks
+/// for reasoning and for a bottleneck analysis, both of which are naturally long, and it
+/// frames the subject the thirteen follow-ups then drill into.
+const BENCH_SCRIPT_OPEN: &str = "I'm building a decode engine for a mixture-of-experts \
+     language model whose expert weights are far too large to fit in GPU memory, so most of \
+     them have to stream from an NVMe drive while the resident ones compute. Walk me \
+     through the architecture you would recommend end to end, explain the reasoning behind \
+     each choice, and be specific about where you expect the bottlenecks to be.";
+
+/// The historical `-bench` prompt, kept for budgets at or below [`BENCH_SCRIPT_MIN`] so
+/// every `-bench 128/256/512` in `docs/measurement/benchmarks.md` stays comparable. Those
+/// command lines do not record the prompt, so changing it for them would silently
+/// invalidate a year of recorded numbers with nothing to point at.
+const BENCH_PROMPT_LEGACY: &str = "The sky is blue because";
+
+/// The scripted follow-up turns, fed one per EOS. Thirteen turns on ONE subject, because
+/// a determinism or long-context run needs several thousand tokens of *coherent* output:
+/// `docs/00-orientation/TOUR.md` is explicit that a degenerate run looks fastest, and a
+/// repetition loop would also make the arena's access pattern unrepresentative.
+///
+/// Shape: seven turns drilling into the thread [`BENCH_SCRIPT_OPEN`] opens, an eighth
+/// asking for a full report (the longest single answer), then five rewrites of that report
+/// for five different audiences — each forced to restate the same material differently
+/// rather than continue it, which keeps output long without letting the model settle into
+/// a loop.
+///
+/// **Every turn asks for reasoning, trade-offs or examples on purpose.** A question that
+/// can be answered in two sentences makes a scripted run measure turn boundaries instead
+/// of decoding; these are written to elicit several hundred tokens each, which is also what
+/// a real user's turn looks like.
+///
+/// **These are a benchmark input and are frozen from the commit that adds them.** Editing
+/// one changes the token sequence, the routing, and hence the hit rate and every number a
+/// `-bench` above [`BENCH_SCRIPT_MIN`] produces, and the command line does not record the
+/// prompt. Add a turn rather than reword one.
+const BENCH_SCRIPT: [&str; 13] = [
+    "Go deeper on the routing itself: how does the gate pick experts for a token, why \
+     top-k rather than a softmax over all of them, and what goes wrong when the routing is \
+     unbalanced across experts?",
+    "Now the streaming path. Walk through everything that happens between the router \
+     naming an expert and that expert's weights being ready to compute on, and explain \
+     which parts of that can be overlapped with useful work and which cannot.",
+    "Compare the cache policies you would consider for keeping the most useful experts \
+     resident — LRU, 2Q, ARC, and anything else you think is worth considering — and \
+     explain the trade-offs with concrete examples of workloads where each one wins.",
+    "How would you measure whether that cache is doing its job? Name the specific metrics, \
+     explain what each one can and cannot tell you, and describe the ways each one can \
+     mislead someone who trusts it too much.",
+    "Move on to quantization. Compare 3-bit vector quantization against 4-bit scalar \
+     quantization for these expert weights, covering accuracy, decode cost, memory \
+     footprint and implementation complexity, and say which you would pick and why.",
+    "Explain the risks of evaluating a quantized model with free-running generation \
+     instead of a fixed scored corpus, and then describe an evaluation protocol you would \
+     actually trust, including how you would know it had enough statistical power.",
+    "Explain speculative decoding with a draft head: the mechanism, the arithmetic that \
+     decides whether it pays for itself, and the conditions under which it stops paying.",
+    "Now write a full report covering everything we have discussed — routing, streaming, \
+     caching, measurement, quantization, evaluation methodology and speculative decoding. \
+     Structure it properly, include the reasoning behind each recommendation, and call out \
+     the open questions you would want answered before committing to the design.",
+    "Rewrite that report for an executive audience: someone who has ten minutes, controls \
+     the budget, and has no machine learning background. Keep every recommendation but \
+     change how you justify it.",
+    "Rewrite it for a systems engineer who will implement the storage and caching layer. \
+     Assume they know operating systems, NVMe and io_uring well, and know nothing about \
+     transformers.",
+    "Rewrite it as onboarding documentation for a new engineer who will maintain this \
+     system, assuming they need to make changes safely before they understand the whole \
+     thing.",
+    "Rewrite it as a design review that argues against this approach as strongly as it \
+     can, so the team can test its own assumptions. Steel-man the alternatives rather than \
+     dismissing them.",
+    "Rewrite it as a postmortem written a year after adoption, assuming the system shipped \
+     and ran into exactly the problems you flagged, and include what the team should have \
+     done differently.",
+];
+
 /// Parse argv, accepting the legacy single-dash `-bench` alongside `--bench`.
 ///
 /// clap has no single-dash-long form, and `-bench N` is what every recorded command line
@@ -499,7 +594,21 @@ fn main() -> Result<()> {
     );
 
     // Tokenizer (tokenizer.json + generation_config.json, copied into the artifact).
-    let bench_prompt = cfg.prompt.as_deref().unwrap_or("The sky is blue because");
+    // Read from `cfg.bench` rather than `ngen` (computed below) because the prompt has to
+    // be framed before the tokenizer log; `--ppl`/`--port` set `ngen` to 0 and never use
+    // this string, so keying off the raw flag cannot pick the wrong one for a run that
+    // matters.
+    //
+    // `--prompt` DISARMS the script rather than keeping its turns. The follow-ups drill
+    // into what `BENCH_SCRIPT_OPEN` asked ("Go deeper on the routing itself…"), so bolting
+    // them onto an unrelated prompt produces a conversation that changes subject at turn 2
+    // — the incoherence this script exists to avoid. A custom prompt gets the old
+    // behaviour: decode until EOS or the budget.
+    let scripted = cfg.prompt.is_none() && cfg.bench.is_some_and(|n| n > BENCH_SCRIPT_MIN);
+    let bench_prompt = match scripted {
+        true => BENCH_SCRIPT_OPEN,
+        false => cfg.prompt.as_deref().unwrap_or(BENCH_PROMPT_LEGACY),
+    };
     let tok = rivoli::artifact::tokenizer::Tokenizer::load(&cfg.model)?;
     // Chat-framed, always: raw text leaves the model outside any assistant turn, so its
     // EOS ids (two of which are turn boundaries) are unreachable and decode runs to the
@@ -583,10 +692,32 @@ fn main() -> Result<()> {
         // KV cache from `prompt_ids` would allocate ~17 positions for an ~900-position
         // scoring pass. The server sizes from `--ctx`, since it cannot know its prompts
         // yet and the slabs are allocated exactly once. Take whichever run this actually is.
+        // Encoded here rather than beside `generate` because the KV cache is sized below
+        // and has to cover them: a follow-up's tokens occupy POSITIONS without ever
+        // entering `generated`, so `pos` outruns the token budget. Sizing from `ngen`
+        // alone aborted `-bench 1200` mid-run with "pos 1212 + 1 rows exceeds engine
+        // capacity max_ctx=1212" — the 13 turns are ~400 positions the budget never saw.
+        // Encoding up front also means a bad turn fails at startup rather than 3000 tokens
+        // into a sole-tenant run.
+        let followups: Vec<Vec<u32>> = match scripted {
+            true => BENCH_SCRIPT
+                .iter()
+                .map(|t| tok.encode_chat_continuation(t))
+                .collect::<Result<_>>()?,
+            false => Vec::new(),
+        };
+        let followup_pos: usize = followups.iter().map(Vec::len).sum();
+        if !followups.is_empty() {
+            info!(
+                "-bench {ngen} > {BENCH_SCRIPT_MIN}: scripted opening + {} follow-up turns \
+                 armed, {followup_pos} extra KV positions (EOS continues the conversation)",
+                followups.len()
+            );
+        }
         let max_ctx = match (&ppl_ids, a.port) {
             (Some(ids), _) => ids.len() + 1,
             (None, Some(_)) => a.ctx,
-            (None, None) => prompt_ids.len() + ngen + 1,
+            (None, None) => prompt_ids.len() + ngen + followup_pos + 1,
         };
         let mut engine = rivoli::gpu::GpuEngine::new(
             pin,
@@ -700,6 +831,7 @@ fn main() -> Result<()> {
             mtp,
             a.mtp_min_conf,
             &mut |_: u32| true,
+            &followups,
         )?;
         let dt = t0.elapsed().as_secs_f64();
         let (hits, misses) = (engine.hits(), engine.misses());

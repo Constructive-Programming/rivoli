@@ -576,6 +576,10 @@ mod live {
                 opts.mtp,
                 opts.mtp_min_conf,
                 on_tok,
+                // No scripted follow-ups: a request's turns arrive in its `messages` array
+                // and are framed by `encode_chat_turns` above. The script is a `-bench`
+                // harness only.
+                &[],
             )
         };
         let (ids, summary) = if stream {

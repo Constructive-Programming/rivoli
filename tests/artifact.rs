@@ -307,3 +307,44 @@ fn tool_framing_matches_the_checkpoint_template() {
         assert_eq!(got, want);
     });
 }
+
+/// `-bench`'s scripted follow-ups continue a conversation IN PLACE — the engine feeds
+/// `encode_chat_continuation`'s tokens at the current position rather than re-encoding and
+/// re-decoding the whole prefix. That is only correct if the resulting stream is what
+/// `encode_chat_turns` would have produced for the whole conversation, and nothing else
+/// checks it: the engine's copy lives in the KV cache, where it is unreadable.
+///
+/// So assert the seam directly. `one` is what the prompt put in the KV, `reply` is what
+/// the model then generated, and `cont` is what the follow-up feeds; concatenated they
+/// must equal the two-turn encoding token for token.
+///
+/// This is the same class of defect as `chat_framing_matches_the_checkpoint_template`
+/// above — one token of framing, silently wrong for months — and it is why the
+/// continuation is DERIVED from `encode_chat` rather than re-emitting the framing.
+#[test]
+fn bench_continuation_rejoins_the_multi_turn_framing() {
+    use rivoli::artifact::tokenizer::ChatOpts;
+    with_tokenizer(|tok| {
+        let o = ChatOpts::default();
+        let one = tok.encode_chat_turns(&[("user", "first")], &o).unwrap();
+        let reply = tok.encode("an answer").unwrap();
+        let cont = tok.encode_chat_continuation("second").unwrap();
+        let full = tok
+            .encode_chat_turns(
+                &[
+                    ("user", "first"),
+                    ("assistant", "an answer"),
+                    ("user", "second"),
+                ],
+                &o,
+            )
+            .unwrap();
+        let seam: Vec<u32> = [one.as_slice(), reply.as_slice(), cont.as_slice()].concat();
+        assert_eq!(
+            tok.decode_all(&seam).unwrap(),
+            tok.decode_all(&full).unwrap(),
+            "continuation seam must render as the two-turn conversation"
+        );
+        assert_eq!(seam, full, "and must match it token for token");
+    });
+}

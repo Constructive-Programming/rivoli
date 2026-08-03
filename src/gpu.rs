@@ -2715,8 +2715,29 @@ impl<'a> GpuEngine<'a> {
         // false when the client hangs up — otherwise a closed connection would keep the
         // sole-tenant GPU busy for the rest of the token budget. `-bench` passes `|_| true`.
         on_tok: &mut dyn FnMut(u32) -> bool,
+        // Scripted follow-up turns, already framed by `encode_chat_continuation`. On EOS,
+        // the next one is fed at the current position and decode continues; when they run
+        // out, EOS ends the run as it always did. Empty = the old behaviour exactly.
+        //
+        // This exists because EOS made `-bench N` unable to reach a large N at all: the
+        // default prompt stops at ~318 tokens, so `-bench 4500` silently measured 318 and
+        // looked like a clean short run. A harness that quietly tests a seventh of what it
+        // was asked for is worse than one that refuses.
+        followups: &[Vec<u32>],
     ) -> Result<(Vec<u32>, ProfileSummary)> {
         ensure!(!prompt_ids.is_empty(), "empty prompt");
+        // REFUSED rather than half-supported, the same call §13 makes for the combinations
+        // speculative decode cannot serve. A verify pass emits two tokens per iteration and
+        // can cross a turn boundary with the second one already speculated past it, so
+        // honouring a follow-up there means unwinding a row whose KV is already written.
+        // That is real work on the engine's most delicate path, for a diagnostic harness —
+        // and `-bench` scripts are run with `--no-mtp` anyway, since a determinism or
+        // long-context question wants the simple path.
+        ensure!(
+            followups.is_empty() || !mtp,
+            "-bench follow-up turns need --no-mtp: a verify pass emits two tokens at once \
+             and the second can already be speculated past the turn boundary"
+        );
         // Both preconditions are resolved by `main` (which downgrades to sequential
         // decode and says why), so reaching either of these is a caller bug rather than a
         // user one — but they stay, because both fail SILENTLY otherwise: a missing head
@@ -2858,9 +2879,41 @@ impl<'a> GpuEngine<'a> {
                 !on_tok(t) || g.len() >= ngen
             };
             let mut _i = 0usize;
+            let mut turn = 0usize;
             loop {
                 if let Some(hb) = &self.heartbeat {
                     hb.beat();
+                }
+                // A turn boundary is not the end of the run while the script has more to
+                // say. Feed the next follow-up AT THE CURRENT POSITION — no KV reset, no
+                // prefix re-decode — and keep going. The emitted EOS is deliberately not
+                // forwarded: the template ends an assistant turn with the NEXT `<|user|>`,
+                // which is the first token of the follow-up, so forwarding both would
+                // double it. `emit` still owns the budget, so this cannot overrun `ngen`.
+                // `draft` is always None here, because followups + mtp is refused above.
+                if eos.contains(&cur) && turn < followups.len() && generated.len() < ngen {
+                    for &t in &followups[turn] {
+                        if let Some(hb) = &self.heartbeat {
+                            hb.beat();
+                        }
+                        self.forward(t, pos).await?;
+                        pos += 1;
+                    }
+                    turn += 1;
+                    // Report the boundary. Without this a scripted run cannot answer the
+                    // one question asked of it — "did it decode long enough?" — because the
+                    // follow-up text never appears in the output (only generated tokens
+                    // do), so turns consumed is unobservable. It is also the tokens-per-turn
+                    // measurement, which is what says whether the script can reach a given
+                    // budget before it runs out of things to say.
+                    tracing::info!(
+                        "-bench: follow-up turn {}/{} at pos {pos}, {} tokens generated",
+                        turn,
+                        followups.len(),
+                        generated.len()
+                    );
+                    cur = self.argmax()?;
+                    continue;
                 }
                 if emit(&mut generated, cur) {
                     break;
