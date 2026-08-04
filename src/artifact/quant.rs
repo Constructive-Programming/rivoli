@@ -206,18 +206,80 @@ pub fn expert_base(layer: usize, e: usize, n_experts: usize) -> String {
     }
 }
 
-/// Unpadded on-disk bytes of one expert (gate‖up‖down concatenated).
-pub fn vq_expert_bytes(hidden: usize, moe_inter: usize) -> usize {
+/// Sum one format's `*_proj_bytes` over an expert's three projections. The `(o, i)` dims
+/// are format-independent, so this is the one place the "an expert is gate‖up‖down"
+/// structure is written; the three formats differ only in `proj`.
+fn expert_bytes(hidden: usize, moe_inter: usize, proj: fn(usize, usize) -> usize) -> usize {
     vq_expert_layout(hidden, moe_inter)
         .iter()
-        .map(|&(o, i)| vq_proj_bytes(o, i))
+        .map(|&(o, i)| proj(o, i))
         .sum()
+}
+
+/// Round an expert's unpadded size up to [`VQ_ALIGN`], so one expert is a single
+/// block-aligned O_DIRECT read. Shared by all three routed formats.
+fn expert_stride(bytes: usize) -> usize {
+    bytes.div_ceil(VQ_ALIGN) * VQ_ALIGN
+}
+
+/// Fill `n` consecutive expert blocks of `stride` bytes in `buf`, in parallel, calling
+/// `fill(e, &mut block[..bytes])` for each. The padding between `bytes` and `stride` is
+/// left as the caller found it.
+///
+/// One implementation for both converters. The split is by DISJOINT `split_at_mut` slices
+/// rather than by index, so the borrow checker witnesses that no two workers can touch the
+/// same block — with indices, an off-by-one in the chunking would be an aliasing bug the
+/// compiler could not see, and the whole point of this loop is that expert `e` lands at
+/// exactly `e · stride`.
+pub fn fill_expert_blocks(
+    buf: &mut [u8],
+    stride: usize,
+    bytes: usize,
+    n: usize,
+    fill: impl Fn(usize, &mut [u8]) -> anyhow::Result<()> + Sync,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(bytes <= stride, "expert bytes {bytes} > stride {stride}");
+    anyhow::ensure!(
+        buf.len() >= n * stride,
+        "buffer {} < {n} blocks of {stride}",
+        buf.len()
+    );
+    let threads = std::thread::available_parallelism().map_or(4, |t| t.get());
+    let per = n.div_ceil(threads.max(1)).max(1);
+    let fill = &fill;
+    std::thread::scope(|s| -> anyhow::Result<()> {
+        let mut rest = &mut buf[..n * stride];
+        let (mut e0, mut handles) = (0usize, Vec::new());
+        while e0 < n {
+            let take = per.min(n - e0);
+            let (mine, tail) = rest.split_at_mut(take * stride);
+            rest = tail;
+            let base = e0;
+            e0 += take;
+            handles.push(s.spawn(move || -> anyhow::Result<()> {
+                for (j, slot) in mine.chunks_exact_mut(stride).enumerate() {
+                    fill(base + j, &mut slot[..bytes])?;
+                }
+                Ok(())
+            }));
+        }
+        for h in handles {
+            h.join()
+                .map_err(|_| anyhow::anyhow!("expert worker panicked"))??;
+        }
+        Ok(())
+    })
+}
+
+/// Unpadded on-disk bytes of one expert (gate‖up‖down concatenated).
+pub fn vq_expert_bytes(hidden: usize, moe_inter: usize) -> usize {
+    expert_bytes(hidden, moe_inter, vq_proj_bytes)
 }
 
 /// Per-expert on-disk stride: [`vq_expert_bytes`] padded up to [`VQ_ALIGN`]. The
 /// fixed stride at which experts sit in a per-layer `.vq3` file.
 pub fn vq_expert_stride(hidden: usize, moe_inter: usize) -> usize {
-    vq_expert_bytes(hidden, moe_inter).div_ceil(VQ_ALIGN) * VQ_ALIGN
+    expert_stride(vq_expert_bytes(hidden, moe_inter))
 }
 
 /// One VQ projection borrowed from an on-disk expert block: packed 12-bit indices
@@ -673,6 +735,64 @@ pub fn f4_proj_bytes(o_dim: usize, i_dim: usize) -> usize {
     o_dim * f4_row_bytes(i_dim) + o_dim * f4_groups(i_dim)
 }
 
+/// Unpadded on-disk bytes of one FP4 expert (w1‖w1_scale‖w3‖w3_scale‖w2‖w2_scale — see
+/// [`V4_PROJ`] for why that is gate/up/down order).
+pub fn f4_expert_bytes(hidden: usize, moe_inter: usize) -> usize {
+    expert_bytes(hidden, moe_inter, f4_proj_bytes)
+}
+
+/// Per-expert on-disk stride: [`f4_expert_bytes`] padded up to [`VQ_ALIGN`], so one FP4
+/// expert is a single block-aligned read (mirrors the `.vq3`/`.i4` stride).
+pub fn f4_expert_stride(hidden: usize, moe_inter: usize) -> usize {
+    expert_stride(f4_expert_bytes(hidden, moe_inter))
+}
+
+/// fp8 `weight_scale_inv` tile size: 128×128 for both the GLM-5.2 checkpoint and
+/// DeepSeek-V4-Flash's `quantization_config.weight_block_size`. Distinct from
+/// [`F4_GROUP`] (32, along the input dim only), which is the FP4 experts' scheme.
+pub const FP8_BLOCK: usize = 128;
+
+// --- DeepSeek-V4-Flash tensor naming ------------------------------------------------
+//
+// V4's checkpoint uses its reference implementation's names, NOT HuggingFace's: no
+// `model.` prefix, `attn`/`ffn` rather than `self_attn`/`mlp`, `.scale` rather than
+// `.weight_scale_inv`, and `w1`/`w3`/`w2` rather than `gate_proj`/`up_proj`/`down_proj`.
+// Verified against the shipped `model.safetensors.index.json` (72,317 entries), 2026-08-04.
+
+/// V4's three expert projections in the SAME slot order as [`PROJ`] — i.e. gate, up, down.
+///
+/// **The order is `w1, w3, w2` and that is not a typo.** `inference/model.py`'s
+/// `Expert.forward` is `gate = self.w1(x)`, `up = self.w3(x)`, then `return self.w2(…)`,
+/// so w3 is the UP projection and w2 is down. Storing them in gate/up/down order keeps one
+/// slot index meaning one projection across all three of this engine's formats.
+///
+/// A `w2` in the wrong slot is caught by its shape (`[hidden, moe_inter]`, transposed from
+/// the other two). A `w1`/`w3` SWAP is not: they are the same shape, and a repack that
+/// swapped them would be internally consistent and byte-clean. Only a numerical oracle
+/// against the reference can see that, which is what S1b exists for.
+pub const V4_PROJ: [&str; 3] = ["w1", "w3", "w2"];
+
+/// [`V4_PROJ`] zipped against [`vq_expert_layout`] — the V4 analogue of [`expert_projs`].
+pub fn v4_expert_projs(hidden: usize, moe_inter: usize) -> ExpertProjs {
+    let [g, u, d] = vq_expert_layout(hidden, moe_inter);
+    [(V4_PROJ[0], g), (V4_PROJ[1], u), (V4_PROJ[2], d)]
+}
+
+/// V4's tensor prefix for expert `e` in `layer`; `e == n_experts` is the SHARED expert.
+/// The V4 analogue of [`expert_base`], and the boundary matters for the same reason —
+/// except that in V4 the two are not even the same *format*: routed experts are FP4
+/// (`I8` nibble pairs + `F8_E8M0` scales) and the shared expert is `F8_E4M3` at 128×128,
+/// so a block written past the boundary is not merely the wrong weights, it is the wrong
+/// arithmetic. `.f4` therefore holds routed experts ONLY; the shared expert rides the
+/// resident fp8 path.
+pub fn v4_expert_base(layer: usize, e: usize, n_experts: usize) -> String {
+    if e < n_experts {
+        format!("layers.{layer}.ffn.experts.{e}")
+    } else {
+        format!("layers.{layer}.ffn.shared_experts")
+    }
+}
+
 // jscpd:ignore-start — the four `matvec_*` oracles' PARAMETER LISTS. `matvec_i4` and
 // `matvec_i8` take character-identical arguments (`y, x, packed, scale, o_dim, i_dim`),
 // which rustfmt expands past 100 columns into eight lines — enough to clone against each
@@ -804,16 +924,13 @@ pub fn i4_proj_bytes(o_dim: usize, i_dim: usize) -> usize {
 /// Unpadded on-disk bytes of one int4 expert (gate‖gate_scale‖up‖up_scale‖down‖
 /// down_scale). Reuses [`vq_expert_layout`] — the (o,i) dims are format-independent.
 pub fn i4_expert_bytes(hidden: usize, moe_inter: usize) -> usize {
-    vq_expert_layout(hidden, moe_inter)
-        .iter()
-        .map(|&(o, i)| i4_proj_bytes(o, i))
-        .sum()
+    expert_bytes(hidden, moe_inter, i4_proj_bytes)
 }
 
 /// Per-expert on-disk stride: [`i4_expert_bytes`] padded up to [`VQ_ALIGN`], so one
 /// int4 expert is a single block-aligned read (mirrors the `.vq3` stride).
 pub fn i4_expert_stride(hidden: usize, moe_inter: usize) -> usize {
-    i4_expert_bytes(hidden, moe_inter).div_ceil(VQ_ALIGN) * VQ_ALIGN
+    expert_stride(i4_expert_bytes(hidden, moe_inter))
 }
 
 /// The six byte offsets within one int3-VQ expert block:
@@ -878,6 +995,9 @@ pub fn write_i4_proj(slot: &mut [u8], off: &[usize; 6], k: usize, packed: &[u8],
 
 #[cfg(test)]
 mod tests {
+    // Quantization tests compare against hand-computed constants; an `unwrap` that fires
+    // IS the failure report. Crate-wide these are `deny`.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
     /// Deterministic uniform `[-1, 1)` stream. One spelling of the LCG the tests below
@@ -1275,6 +1395,58 @@ mod tests {
         assert!(lo > 0.0 && lo.is_finite(), "b=0 must be 2^-127, got {lo}");
         assert_eq!(lo, f32::exp2(-127.0));
         assert!(e8m0(0xFF).is_err(), "0xFF is NaN and must be refused");
+    }
+
+    /// **`V4_PROJ`'s ORDER, derived from the reference rather than restated.**
+    ///
+    /// This exists because a mutation test found the hole: swapping `w1` and `w3` in the
+    /// constant is invisible to everything else in S1a. The `.f4` repack maps source name →
+    /// block slot through this one constant, so the writer and the byte-exactness verifier
+    /// both move — the artifact is self-consistently wrong, byte-clean, and only a
+    /// numerical oracle against the reference could see it. The two tensors even have
+    /// identical shapes, so no dimension check helps.
+    ///
+    /// So the order is read back out of `inference/model.py`'s `Expert.forward`
+    /// (`gate = self.w1(x)`, `up = self.w3(x)`, `return self.w2(…)`) and compared. That
+    /// turns the doc comment's citation from decoration into a check. Skipped when the
+    /// checkpoint is absent — and S1b's oracle remains the real gate, since this pins only
+    /// what the reference SAYS, not what rivoli then computes.
+    #[test]
+    fn v4_proj_order_matches_the_reference_expert_forward() {
+        const REF: &str = "/var/db/rivoli/deepseek-v4-flash-0731/inference/model.py";
+        let Ok(src) = std::fs::read_to_string(REF) else {
+            eprintln!("SKIP v4_proj_order: no reference at {REF} — V4_PROJ is UNPINNED");
+            return;
+        };
+        // `Expert.forward` only — `MoE.forward` and the mtp blocks mention `w1`/`w2` too.
+        let body = src
+            .split_once("class Expert(nn.Module)")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.split_once("class MoE(nn.Module)"))
+            .map(|(body, _)| body)
+            .expect("Expert class not found — the reference has been restructured");
+        let pick = |lhs: &str| -> String {
+            let at = body
+                .find(lhs)
+                .unwrap_or_else(|| panic!("{lhs:?} not in Expert.forward"));
+            let rest = &body[at + lhs.len()..];
+            let w = rest
+                .split_once('(')
+                .map(|(w, _)| w.trim())
+                .expect("no call after the projection");
+            assert!(w.starts_with('w') && w.len() == 2, "unexpected projection {w:?}");
+            w.to_string()
+        };
+        let got = [
+            pick("gate = self."),
+            pick("up = self."),
+            pick("return self."),
+        ];
+        assert_eq!(
+            got,
+            V4_PROJ.map(String::from),
+            "V4_PROJ is [gate, up, down]; the reference says {got:?}"
+        );
     }
 
     /// `.f4` shares `.i4`'s nibble packing but carries a one-byte scale per 32 weights
