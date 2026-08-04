@@ -2643,3 +2643,84 @@ events needs ~39,000 tokens of short runs (~65 runs). The affordable discriminat
 DIVERGENCE POSITION from more long pairs — one is localised so far (token 4042 of 5184). If
 events cluster high, context-dependence; if uniform over the run, per-token. Each pair is
 ~90 min of sole-tenant GPU, so price it before booking it.
+
+## VQ_K=2048: the codebook shrink and the byte saving are the SAME item and they cancel — 2026-08-04
+
+Roadmap #2 proposed `VQ_K` 4096 → 2048: a 16 KiB fp16 codebook (from 32 KiB) that fits L1,
+*and* an 11-bit index (from 12) that ships fewer bytes. Two probes, neither of which needs a
+requant, because kernel speed does not depend on index *values* and reconstruction error does
+not need the engine.
+
+**Instruments.** `docs/measurement/probes/vq_codebook.hip` — real dims (6144/2048), 9 experts,
+R=1, real 11-bit unpack, median of 3. `examples/vq_k_probe.rs` — real fp8 weights, 2^20
+subvectors (the shipped sample size), both codebooks fitted from the *same* sample by
+`learn_codebook_k`, scored on **held-out** experts with the shipping `quant_vq`/`vq_decode_proj`.
+
+### Probe A — the gather is a real wall; 11-bit packing hands the win straight back
+
+| arm | total | vs today | what it isolates |
+|---|---|---|---|
+| `k4096_b12_f16` | 1396 µs | 1.000× | today (1364/1376/1396 across 3 runs) |
+| `k4096_b12_f32` | 1885 µs | **0.739×** | calibration: 64 KiB codebook. The probe IS size-sensitive |
+| `k2048_b12_f16` | 1152 µs | **1.189×** | codebook shrink alone, zero byte change |
+| `k2048_b11_f16` | 1366 µs | **1.022×** | **the item as originally proposed** |
+| `k2048_b11w_f16` | 1357 µs | 1.029× | same, dword unpack — no better |
+| `k4096_b11_f16` | 1366 µs | 1.019× | 11-bit unpack carrying its own bytes |
+| `k256_b12_f16` | 1159 µs | 1.178× | asymptote — K=2048 already captures all of it |
+| `shared_gu_k4096` | 1374 µs | 1.016× | one codebook for gate+up (64→32 KiB aggregate) |
+
+Per kernel at K=2048/12-bit: `moe_gateup_vq` 934→741 µs (1.26×), `moe_down_vq` 462→411 µs (1.13×).
+
+**The two halves of the item fight each other.** The codebook shrink is worth 1.189×; adding
+the 11-bit packing collapses it to 1.022× *while* reading 7.7% fewer bytes. A 12-bit index
+never spans more than 2 bytes and its `shift ∈ {0,4}` is strength-reducible; an 11-bit index
+starting at bit 7 spans 3 and the shift is data-dependent. The dword-load variant behaves
+identically, so it is the lost shift pattern, not the extra byte load.
+
+**Mechanism, by inference and not by counter.** `shared_gu_k4096` refutes the obvious
+aggregate-footprint story: it halves gateup's total codebook footprint to the same 32 KiB that
+two 16 KiB tables occupy, and buys 1.6% where the two tables buy 26%. So the effect keys on the
+span each gather *stream* ranges over, knee between 16 and 32 KiB. There is no rocprof on this
+box; that is eight consistent arms, not a hardware counter.
+
+**The saving is 7.7%, not the 8.3% the bit ratio suggests** — the bf16 group scales do not
+shrink. Expert block 15.34 → 14.16 MB.
+
+**Packing is byte-exact but the unpack is not free.** `(i_dim/VQ_DIM)·11 % 8 == 0` needs
+`i_dim % 32 == 0`; `hidden=6144` and `moe_inter=2048` both pass, giving 2112 B and 704 B rows.
+
+### Probe B — K=2048 costs exactly what rate-distortion theory says
+
+| | mean relFrob (held-out) | vs K=4096 |
+|---|---|---|
+| K=4096 (today, 3.00 bpw) | 0.15509 | — |
+| **K=2048 (2.75 bpw)** | **0.18407** | **+18.68%** |
+| int4 (anchor, PPL 5.120) | 0.11858 | −23.54% |
+
+Spread across 3 projections × 3 held-out experts is under 0.2%. High-rate VQ theory for `d=4`
+predicts `2^0.25` = **+18.92%** for halving K; measured +18.68%. **The codebook is already on
+the asymptotic rate-distortion frontier** — an independent arrival at
+[`codebook-rotation.md`](../investigations/codebook-rotation.md)'s "int3-vq is rate-limited".
+Anchored on the 5.120/5.275 ladder that extrapolates to ~+0.024 nats, ~2.4× the 0.00995 bar,
+on the rung already worst of three. **That is a screen, not a gate** — the slope is
+extrapolated across two quantizer families, so the sign and rough size are trustworthy and the
+decision is not.
+
+**Sharing one codebook between gate and up is quality-free**: 0.15511/0.15510 joint vs
+0.15512/0.15501 separate, matching `codebook-rotation.md`'s cross-layer result. The kernel pays
+1.016× for it, so there is no reason to do it. Recorded so nobody re-measures it.
+
+### What this settles, and what it does not
+
+Two products at one quality price: **12-bit K=2048** is 1.189× on the MoE kernels for *no
+format change*, dropping the 117 ms compute floor to ~99; **11-bit K=2048** is 7.7% fewer bytes,
+transfer 181 → 167 ms. Both cost +18.68% relFrob.
+
+The first reading of this data recommended NO-GO, and half its reasoning was that the 1.189×
+"is spent on slack the fetch already covers" (181 ms transfer vs 117 ms compute). **That axis
+is retired** — see the scoring block at the head of
+[`perf-roadmap.md`](perf-roadmap.md). A win hidden behind another bottleneck is still energy and
+thermal headroom on every token forever, and the requant is paid once. Under the corrected
+scoring the row rests entirely on quality, where the only evidence is a screen. **Settle it with
+a requant and a real paired dNLL, and repeat every arm** — ~40% of 5k-token runs are silently
+corrupted (see "Long runs are NON-DETERMINISTIC" above).
