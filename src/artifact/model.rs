@@ -1,9 +1,159 @@
-//! Model dimensions, parsed from the snapshot's `config.json`. GLM-5.2 is an
-//! MLA (multi-head latent attention) + MoE architecture; the fields the decode
-//! path needs are pulled and validated at load.
+//! Model dimensions, parsed from the snapshot's `config.json`.
+//!
+//! **One type per architecture, and the type is the proof.** [`ModelConfig`] describes the
+//! MLA (multi-head latent attention) + dense-prefix lineage — GLM-5.2, DeepSeek-V3.
+//! [`V4Config`] describes DeepSeek-V4-Flash: shared-KV MQA, no dense layers, hash-routed
+//! prefix, FP4 experts. Each refuses the other by name at [`crate::arch::Arch`], *before*
+//! serde looks at a single dimension, so holding a value of either type is evidence about
+//! which architecture the snapshot is.
+//!
+//! **Neither type may give an absent field a default.** V4's config lacks
+//! `kv_lora_rank`, `qk_nope_head_dim`, `v_head_dim`, `intermediate_size` and
+//! `first_k_dense_replace` *because it is not MLA and has no dense layers* — not because
+//! they are optional. `#[serde(default)]` on those five would produce a `ModelConfig` that
+//! parses, reports zeros, and launches the MLA decode path against an MQA model: fluent
+//! output, wrong text, no crash. The same rule binds the other way and binds later
+//! stages: a V4 field that S2/S3 needs is added as REQUIRED, or the guard rots.
+//! `#[serde(default)]` survives here only on fields that are genuinely absent from *older
+//! snapshots of the same architecture* — each one says so at its declaration.
 
-use anyhow::{Context, Result};
+use crate::arch::Arch;
+use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
+
+/// Resolve a config document's architecture, from `model_type` and `architectures` BOTH.
+///
+/// Two independent statements of the same fact live in every config this engine has seen
+/// (verified 2026-08-04 over all six manifests and source configs under `/var/db/rivoli`
+/// and `/swarm/storage/ai/rivoli`: each carries `model_type` *and* `architectures`). When
+/// both are present they must agree — a disagreement means the file was hand-edited, and
+/// silently preferring one field would let that edit choose a decode path.
+///
+/// Absent-from-both and unrecognised are BOTH refusals. There is deliberately no fallback
+/// to the architecture this engine happens to run today: an artifact whose architecture we
+/// cannot name is one whose decode path we cannot choose, and choosing anyway is the exact
+/// failure this port is built to avoid — it does not crash, it produces fluent wrong text.
+fn arch_of(cfg: &serde_json::Value) -> Result<Arch> {
+    arch_of_named(cfg).map(|(a, _)| a)
+}
+
+/// [`arch_of`], also returning the config string it resolved — so a refusal can quote the
+/// file rather than only the enum variant.
+fn arch_of_named(cfg: &serde_json::Value) -> Result<(Arch, String)> {
+    let declared = cfg
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .into_iter()
+        .chain(
+            cfg.get("architectures")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str()),
+        );
+    let mut found: Option<(Arch, &str)> = None;
+    for s in declared {
+        let a =
+            Arch::from_manifest_str(s).with_context(|| format!("unsupported architecture {s:?}"))?;
+        if let Some((prev, prev_s)) = found {
+            ensure!(
+                prev == a,
+                "config disagrees with itself: {prev_s:?} and {s:?} name different architectures"
+            );
+        }
+        // Keep the FIRST — `model_type` when present, which is the canonical field and the
+        // one a reader will grep for. The agreement check above already compared it to
+        // every later spelling, so nothing is lost by not overwriting.
+        found.get_or_insert((a, s));
+    }
+    found.map(|(a, s)| (a, s.to_string())).context(
+        "config declares neither `model_type` nor `architectures` — refusing rather than \
+         assuming one. Every checkpoint and every artifact this engine has converted carries both",
+    )
+}
+
+/// `<dir>/manifest.json` if present (a converted artifact), else `<dir>/config.json` (a
+/// raw checkpoint). Shared by both configs' loaders so they cannot disagree on which file
+/// describes a directory.
+fn config_path(dir: &str) -> String {
+    match std::fs::metadata(format!("{dir}/manifest.json")) {
+        Ok(_) => format!("{dir}/manifest.json"),
+        Err(_) => format!("{dir}/config.json"),
+    }
+}
+
+/// The architecture `dir`'s artifact declares — the one discriminant, read from the one
+/// file.
+///
+/// No caller in this tree yet. It exists for the multi-model branch's `--help` rendering,
+/// which re-renders against the artifact's architecture; it is here rather than there so
+/// that the manifest is parsed in exactly one place. Today the live consumers of the
+/// discriminant are [`parse_config`]'s refusals.
+pub fn arch_of_artifact(dir: &str) -> Result<Arch> {
+    let path = config_path(dir);
+    let text = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
+    let doc: serde_json::Value = serde_json::from_str(&text)?;
+    arch_of(&doc).with_context(|| format!("parse {path}"))
+}
+
+/// A config schema that describes exactly one architecture.
+///
+/// The binding of schema to architecture is a trait CONSTANT rather than a check each
+/// impl remembers to write, so a third config added later cannot acquire a parse that
+/// skips the discriminant — [`parse_config`] is the only constructor and it always
+/// consults `ARCH`.
+pub trait ArchConfig: Sized + serde::de::DeserializeOwned {
+    /// The architecture a document must declare to parse as this type.
+    const ARCH: Arch;
+    /// Cross-field checks, run on every successful parse.
+    fn validate(&self) -> Result<()>;
+}
+
+/// Parse one config document as `T`, refusing it unless it declares `T::ARCH`.
+///
+/// The arch check happens BEFORE serde looks at a dimension, so "wrong architecture" is
+/// reported as itself rather than as whichever field the other architecture happens to
+/// omit first. `ModelConfig` used to fail V4 with `missing field kv_lora_rank`, which
+/// reads like a corrupt checkpoint rather than like a different model.
+pub fn parse_config<T: ArchConfig>(text: &str) -> Result<T> {
+    let doc: serde_json::Value = serde_json::from_str(text)?;
+    let (got, declared) = arch_of_named(&doc)?;
+    // The offending STRING as well as the resolved variant: `"deepseek_v4"` is what the
+    // reader will grep the config for, and `DeepseekV4` is what the code calls it.
+    ensure!(
+        got == T::ARCH,
+        "this snapshot declares {declared:?} ({got:?}), but this is the {:?} schema — the \
+         two architectures do not share a decode path",
+        T::ARCH
+    );
+    let cfg: T = serde_json::from_str(text)?;
+    cfg.validate()?;
+    Ok(cfg)
+}
+
+/// [`parse_config`] over `<dir>`'s manifest or config.
+pub fn load_config<T: ArchConfig>(dir: &str) -> Result<T> {
+    let path = config_path(dir);
+    let text = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
+    parse_config(&text).with_context(|| format!("parse {path}"))
+}
+
+/// Both of an expert's input widths must divide the group-scale span exactly.
+///
+/// `vq_row_bytes`/`vq_groups` and their `.f4` counterparts round up with only a
+/// `debug_assert` to catch a ragged dim, so in a RELEASE build a bad width silently
+/// truncates every expert row instead of failing. Each width is an `i_dim` for some
+/// projection — gate/up take `hidden`, down takes `moe_inter` — so one check covers both.
+fn ensure_group_aligned(hidden: usize, moe_inter: usize, group: usize, what: &str) -> Result<()> {
+    for (name, dim) in [("hidden", hidden), ("moe_inter", moe_inter)] {
+        ensure!(
+            dim.is_multiple_of(group),
+            "{name} {dim} is not a multiple of {what} {group} — expert rows would \
+             silently truncate in a release build"
+        );
+    }
+    Ok(())
+}
 
 /// GLM-5.2 nests theta under `rope_parameters`; we only need theta.
 #[derive(Debug, Clone, Deserialize)]
@@ -80,27 +230,8 @@ pub struct ModelConfig {
     rope_theta_flat: Option<f64>,
 }
 
-impl ModelConfig {
-    /// Load from the artifact's `manifest.json` (the config fields live at top level
-    /// alongside a `format` section; serde ignores the unknown key), falling back to a
-    /// bare `config.json` for reading a raw checkpoint.
-    pub fn load(dir: &str) -> Result<Self> {
-        let path = match std::fs::metadata(format!("{dir}/manifest.json")) {
-            Ok(_) => format!("{dir}/manifest.json"),
-            Err(_) => format!("{dir}/config.json"),
-        };
-        let text = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
-        Self::from_json(&text).with_context(|| format!("parse {path}"))
-    }
-
-    /// Parse and validate one config document. Split out of `load` so the tests can
-    /// drive the real boundary from a literal rather than re-implementing it — which
-    /// is how a test starts passing against itself.
-    fn from_json(text: &str) -> Result<Self> {
-        let cfg: Self = serde_json::from_str(text)?;
-        cfg.validate()?;
-        Ok(cfg)
-    }
+impl ArchConfig for ModelConfig {
+    const ARCH: Arch = Arch::GlmMoeDsa;
 
     /// Cheap semantic checks at the boundary, so a mismatched snapshot fails
     /// here with a clear message rather than as an out-of-bounds panic deep in
@@ -142,21 +273,14 @@ impl ModelConfig {
                  (GLM-5.2) or a top-level `rope_theta` (DeepSeek/Llama lineage)"
             );
         }
-        // `vq_row_bytes`/`vq_groups` divide by VQ_DIM and VQ_GROUP with only a
-        // `debug_assert` to catch a ragged dim, so in a RELEASE build a bad width
-        // silently truncates every expert row instead of failing. Both widths are
-        // an `i_dim` for some projection (gate/up take hidden, down takes moe_inter),
-        // and VQ_GROUP=64 is a multiple of the 8 the 12-bit packing needs, so this
-        // one check covers both. GLM-5.2: 6144, 2048 — both clean.
-        for (what, dim) in [("hidden", self.hidden), ("moe_inter", self.moe_inter)] {
-            if !dim.is_multiple_of(crate::artifact::quant::VQ_GROUP) {
-                anyhow::bail!(
-                    "{what} {dim} is not a multiple of VQ_GROUP {} — int3-vq rows would \
-                     silently truncate in a release build",
-                    crate::artifact::quant::VQ_GROUP
-                );
-            }
-        }
+        // VQ_GROUP=64 is a multiple of the 8 the 12-bit packing needs, so this one check
+        // covers the indices too. GLM-5.2: 6144, 2048 — both clean.
+        ensure_group_aligned(
+            self.hidden,
+            self.moe_inter,
+            crate::artifact::quant::VQ_GROUP,
+            stringify!(VQ_GROUP),
+        )?;
         // No ceiling on the intermediate widths: the LDS-staging MoE kernel that
         // imposed one (inter ≤ 16384, gfx1151's 64KB budget) is gone. `swiglu`
         // (linalg.hip) is elementwise with zero dynamic LDS, and moe.hip stages
@@ -164,6 +288,23 @@ impl ModelConfig {
         // guard would have refused the DeepSeek-V3 family on intermediate_size
         // 18432 for a constraint that no longer exists.
         Ok(())
+    }
+}
+
+impl ModelConfig {
+    /// Load from the artifact's `manifest.json` (the config fields live at top level
+    /// alongside a `format` section; serde ignores the unknown key), falling back to a
+    /// bare `config.json` for reading a raw checkpoint.
+    ///
+    /// Refuses a non-GLM snapshot by name. That refusal is the whole guard: every reader
+    /// of this type's public fields — `gpu.rs`, `pin.rs`, `main.rs` — obtains its value
+    /// from here, so a `ModelConfig` in hand IS the evidence that the snapshot is MLA.
+    ///
+    /// An inherent wrapper over [`load_config`] rather than a bare call, because ~8 call
+    /// sites across `gpu.rs`/`pin.rs`/`main.rs`/`bin` already spell `ModelConfig::load`.
+    /// `V4Config` is new and has none, so it uses the generic form directly.
+    pub fn load(dir: &str) -> Result<Self> {
+        load_config(dir)
     }
 
     /// The router affinity this model was trained with. Infallible because
@@ -230,18 +371,383 @@ impl ModelConfig {
     }
 }
 
+// ── DeepSeek-V4-Flash ───────────────────────────────────────────────────────────────
+//
+// A separate struct rather than optional fields on `ModelConfig`, and separate serde
+// declarations rather than a shared core. The duplication is the POINT: a shared schema
+// is exactly the mechanism by which a field added for one architecture would silently
+// satisfy the other's parse, which is the defect this stage exists to prevent. Making
+// them share would also move `ModelConfig`'s public fields behind a nested struct and
+// rewrite every `cfg.hidden` in gpu.rs/pin.rs/main.rs for no semantic gain.
+
+/// The `quantization_config` block. Checked rather than ignored: `.f4`'s repack and the
+/// resident fp8 path each assume one specific scheme, and a checkpoint quantized another
+/// way would decode to plausible-but-wrong weights with no error anywhere.
+#[derive(Debug, Clone, Deserialize)]
+struct QuantConfig {
+    fmt: String,
+    scale_fmt: String,
+    weight_block_size: Vec<usize>,
+}
+
+/// DeepSeek-V4-Flash-0731. Shared-KV MQA (one `wkv` entry serving as both K and V for
+/// all heads), grouped low-rank output projection, hyper-connection residuals, a
+/// hash-routed prefix, and routed experts shipped as FP4 nibbles with e8m0 block scales.
+///
+/// Every field is REQUIRED. See the module header for why that is not negotiable.
+#[derive(Debug, Clone, Deserialize)]
+pub struct V4Config {
+    #[serde(rename = "num_hidden_layers")]
+    pub n_layers: usize,
+    #[serde(rename = "hidden_size")]
+    pub hidden: usize,
+    #[serde(rename = "vocab_size")]
+    pub vocab: usize,
+
+    // --- shared-KV MQA. `head_dim` (512) is the FULL per-head width and the width of the
+    // single KV entry; `qk_rope_head_dim` (64) is its RoPE'd tail. There is no
+    // nope/rope SPLIT of separate tensors as in MLA — the last 64 dims of one 512-wide
+    // vector are rotated in place, which is why `qk_nope_head_dim` has no meaning here.
+    #[serde(rename = "num_attention_heads")]
+    pub n_heads: usize,
+    pub head_dim: usize,
+    pub qk_rope_head_dim: usize,
+    pub q_lora_rank: usize,
+    /// Groups the output projection is split into (`wo_a` is `[o_groups·o_lora_rank, …]`).
+    pub o_groups: usize,
+    pub o_lora_rank: usize,
+    /// One KV head, shared by all `n_heads` queries. Validated == 1: the whole attention
+    /// frontend is written against a single shared entry.
+    pub num_key_value_heads: usize,
+
+    // --- per-layer KV compression. `compress_ratios[l] == 0` means pure sliding-window
+    // (no compressor, no indexer, base `rope_theta`, YaRN OFF); `!= 0` selects
+    // `compress_rope_theta` WITH YaRN; `== 4` additionally carries an indexer.
+    pub compress_ratios: Vec<usize>,
+
+    // --- RoPE. Carried WHOLE, even though S1a reads none of it — the one exception to the
+    // "a field must have a reader" rule above, and it is earned. `precompute_freqs_cis`
+    // takes seven arguments and the reference's own `ModelArgs` DEFAULTS disagree with this
+    // checkpoint on two: `rope_factor: 40` against the config's 16, `compress_rope_theta:
+    // 40000.0` against 160000. A type exposing half the group invites S2 to take the rest
+    // from those defaults and build a wrong RoPE table on all 41 compressor layers — no
+    // error, just wrong positions. All of it, or none of it.
+    pub compress_rope_theta: f64,
+    pub rope_theta: f64,
+    pub rope_scaling: RopeScaling,
+    pub max_position_embeddings: usize,
+
+    // jscpd:ignore-start — the four MoE serde renames, which coincide with `ModelConfig`'s
+    // because both architectures declare these under the SAME JSON names.
+    //
+    // This one is a COST exemption, not a "the copy is the point" one, and it should be
+    // collapsed. The honest fix is a shared `#[serde(flatten)]` struct holding exactly
+    // these four — they carry the same meaning in both architectures and neither wants a
+    // default on any of them. What blocks it is that flattening nests `ModelConfig`'s
+    // fields, so every `cfg.n_experts` in gpu.rs/pin.rs/main.rs/bin becomes
+    // `cfg.moe.n_experts`; S1a is forbidden from touching gpu.rs while S1b holds it.
+    //
+    // What must NOT be shared, and is not: the fields around them. `ModelConfig` gives
+    // `norm_topk_prob` and `scoring_func` `#[serde(default)]` because GLM snapshots predate
+    // them; on V4 a missing `scoring_func` or `swiglu_limit` is silent-wrong arithmetic,
+    // not an old file, so both are required here.
+    //
+    // ponytail: collapse into a shared MoE-dims struct when the multi-model branch is free
+    // to move `ModelConfig`'s call sites.
+    // --- MoE ---
+    #[serde(rename = "n_routed_experts")]
+    pub n_experts: usize,
+    #[serde(rename = "num_experts_per_tok")]
+    pub top_k: usize,
+    #[serde(rename = "moe_intermediate_size")]
+    pub moe_inter: usize,
+    #[serde(rename = "n_shared_experts")]
+    pub n_shared: usize,
+    // jscpd:ignore-end
+    scoring_func: String,
+    /// The first `n_hash_layers` layers route by a `tid2eid[vocab, top_k]` table indexed
+    /// by token id — the router scores are computed but the SELECTION bypasses them.
+    /// Those layers carry `ffn.gate.tid2eid` and NO `ffn.gate.bias`; the rest are the
+    /// reverse. `layer_routes_by_hash` is the one reader.
+    #[serde(rename = "num_hash_layers")]
+    pub n_hash_layers: usize,
+    /// SwiGLU clamp. rivoli's SwiGLU is unclamped, so a lost `10.0` here is silent-wrong,
+    /// not a crash — required, and validated non-zero.
+    pub swiglu_limit: f64,
+    /// `"fp4"`. The `.f4` repack copies e2m1 nibbles verbatim; against an `"fp8"` export
+    /// of the same model it would read fp8 bytes as nibble pairs and produce noise.
+    pub expert_dtype: String,
+
+    // --- attention-tensor quantization ---
+    quantization_config: QuantConfig,
+
+    // --- lightning indexer, on the `compress_ratio == 4` layers. `indexer.wq_b` is
+    // `[index_n_heads · index_head_dim, q_lora_rank]`, confronted with the tensor by
+    // `convert_v4::write_layer_resident`. ---
+    pub index_n_heads: usize,
+    pub index_head_dim: usize,
+
+    /// Hyper-connection streams. `hc_*_fn` is `[_, hc_mult · hidden]`, likewise confronted
+    /// with the tensor by `convert_v4`.
+    pub hc_mult: usize,
+}
+
+/// The YaRN block. Required, and its `type` is checked — see the RoPE note in [`V4Config`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct RopeScaling {
+    pub beta_fast: u32,
+    pub beta_slow: u32,
+    pub factor: f64,
+    pub original_max_position_embeddings: usize,
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+impl ArchConfig for V4Config {
+    const ARCH: Arch = Arch::DeepseekV4;
+
+    /// Cross-field checks. Each one guards a failure that produces text rather than an
+    /// error, which is the whole hazard class of this port.
+    fn validate(&self) -> Result<()> {
+        // `compress_ratios` is indexed by layer id in `Attention.__init__`. The shipped
+        // config carries 46 entries for 43 layers (the tail belongs to the mtp blocks), so
+        // this is a floor, not an equality — but one entry short is an index panic mid-load
+        // or, worse, a layer silently treated as ratio 0.
+        ensure!(
+            self.compress_ratios.len() >= self.n_layers,
+            "compress_ratios has {} entries, need at least n_layers={}",
+            self.compress_ratios.len(),
+            self.n_layers
+        );
+        // Only 0 (sliding-window), 4 (compressor + indexer) and 128 (compressor only)
+        // appear, and `Attention.__init__` branches on `== 4` exactly. An unseen ratio
+        // would land in the "compressor, no indexer" arm by default; refuse instead.
+        for (l, &r) in self.compress_ratios.iter().take(self.n_layers).enumerate() {
+            ensure!(
+                matches!(r, 0 | 4 | 128),
+                "compress_ratios[{l}] = {r}; implemented: 0, 4, 128"
+            );
+        }
+        ensure!(
+            self.n_hash_layers <= self.n_layers,
+            "num_hash_layers {} > n_layers {}",
+            self.n_hash_layers,
+            self.n_layers
+        );
+        ensure!(
+            self.top_k <= self.n_experts,
+            "top_k {} > n_experts {}",
+            self.top_k,
+            self.n_experts
+        );
+        // `MoE.__init__` asserts this outright; the shared expert is a single always-on
+        // FFN in both the reference and rivoli's resident set.
+        ensure!(self.n_shared == 1, "n_shared_experts {} != 1", self.n_shared);
+        ensure!(
+            self.num_key_value_heads == 1,
+            "num_key_value_heads {} != 1 — this is shared-KV MQA, one entry for all heads",
+            self.num_key_value_heads
+        );
+        ensure!(
+            self.qk_rope_head_dim < self.head_dim,
+            "qk_rope_head_dim {} must be inside head_dim {}",
+            self.qk_rope_head_dim,
+            self.head_dim
+        );
+        // `wo_a` is viewed as `(o_groups, o_lora_rank, n_heads·head_dim/o_groups)`, so a
+        // ragged split would reshape into the wrong stride rather than fail.
+        ensure!(
+            self.o_groups > 0 && (self.n_heads * self.head_dim).is_multiple_of(self.o_groups),
+            "n_heads·head_dim ({}) not divisible by o_groups {}",
+            self.n_heads * self.head_dim,
+            self.o_groups
+        );
+        // A zero theta is a silently wrong RoPE, not a crash — `ModelConfig::validate`
+        // refuses one for the same reason. Both are live: ratio-0 layers use `rope_theta`,
+        // the other 41 use `compress_rope_theta`.
+        for (what, theta) in [
+            ("rope_theta", self.rope_theta),
+            ("compress_rope_theta", self.compress_rope_theta),
+        ] {
+            ensure!(theta > 0.0, "{what} {theta} must be positive");
+        }
+        ensure!(
+            self.rope_scaling.kind == "yarn"
+                && self.rope_scaling.factor > 0.0
+                && self.rope_scaling.original_max_position_embeddings > 0,
+            "rope_scaling type {:?} / factor {} / original {}: only YaRN is implemented, \
+             and a zero original length disables the interpolation branch entirely",
+            self.rope_scaling.kind,
+            self.rope_scaling.factor,
+            self.rope_scaling.original_max_position_embeddings
+        );
+        ensure!(
+            self.scoring_func == "sqrtsoftplus",
+            "scoring_func {:?}: V4 is sqrtsoftplus. A wrong router affinity picks \
+             plausible-but-wrong experts and never crashes",
+            self.scoring_func
+        );
+        ensure!(
+            self.swiglu_limit > 0.0,
+            "swiglu_limit {} — V4's SwiGLU is CLAMPED (10.0 in the shipped config) and \
+             rivoli's is not, so a zero here is silently unclamped arithmetic",
+            self.swiglu_limit
+        );
+        ensure!(
+            self.expert_dtype == "fp4",
+            "expert_dtype {:?}: the .f4 repack reads e2m1 nibble pairs, and an fp8 export \
+             of the same model would decode as noise",
+            self.expert_dtype
+        );
+        let q = &self.quantization_config;
+        ensure!(
+            q.fmt == "e4m3" && q.scale_fmt == "ue8m0",
+            "quantization_config {:?}/{:?}: the resident path decodes e4m3 weights with \
+             ue8m0 block scales",
+            q.fmt,
+            q.scale_fmt
+        );
+        ensure!(
+            q.weight_block_size == [crate::artifact::quant::FP8_BLOCK; 2],
+            "quantization_config.weight_block_size {:?} != [{}, {}]",
+            q.weight_block_size,
+            crate::artifact::quant::FP8_BLOCK,
+            crate::artifact::quant::FP8_BLOCK
+        );
+        // The FP4 group scale runs along the INPUT dim, so both expert input widths must
+        // divide it exactly — `f4_groups` rounds up, and a ragged tail would give the
+        // last group a scale covering fewer weights than the kernel assumes.
+        ensure_group_aligned(
+            self.hidden,
+            self.moe_inter,
+            crate::artifact::quant::F4_GROUP,
+            stringify!(F4_GROUP),
+        )
+    }
+}
+
+impl V4Config {
+    /// `compress_ratios[layer]`, bounds-checked against `n_layers` rather than against the
+    /// vector — the vector is longer (the mtp tail), and reading past `n_layers` would
+    /// return an mtp block's ratio for a main-path layer.
+    pub fn compress_ratio(&self, layer: usize) -> Result<usize> {
+        ensure!(layer < self.n_layers, "layer {layer} >= {}", self.n_layers);
+        Ok(self.compress_ratios[layer])
+    }
+
+    /// Whether this layer carries `attn.compressor.*` (ratio != 0). Also selects
+    /// `compress_rope_theta` + YaRN over the base theta with YaRN off.
+    pub fn layer_has_compressor(&self, layer: usize) -> Result<bool> {
+        Ok(self.compress_ratio(layer)? != 0)
+    }
+
+    /// Whether this layer carries `attn.indexer.*`. `Attention.__init__` builds one only
+    /// at ratio EXACTLY 4 — 21 of the 41 compressor layers in the shipped checkpoint.
+    pub fn layer_has_indexer(&self, layer: usize) -> Result<bool> {
+        Ok(self.compress_ratio(layer)? == 4)
+    }
+
+    /// Whether this layer's gate selects experts from `tid2eid` instead of from the
+    /// scores. Such a layer has `ffn.gate.tid2eid` and no `ffn.gate.bias`.
+    pub fn layer_routes_by_hash(&self, layer: usize) -> bool {
+        layer < self.n_hash_layers
+    }
+
+    // No `experts_per_layer` twin of `ModelConfig`'s. On V4 the two kinds of expert are
+    // not interchangeable: `top_k` routed experts are FP4 and stream from NVMe, while the
+    // one shared expert is fp8 e4m3 and is resident. A single `top_k + n_shared` count is
+    // right for a MoE launch and WRONG for per-token stream traffic, and it is the traffic
+    // number this port keeps needing — so the two are spelled out separately at each use.
+}
+
 /// The load boundary is the only place a foreign snapshot is inspected before its
 /// dimensions reach a kernel, so every refusal here is one that would otherwise be an
 /// out-of-bounds panic, a silently truncated expert row, or wrong experts with no crash.
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
     use super::*;
 
-    /// GLM-5.2's real values, as a JSON object that `overrides` can patch. Built as
-    /// text rather than a struct literal because the serde renames ARE the contract
-    /// under test — `n_routed_experts`, the nested rope, `first_k_dense_replace`.
+    /// `base` as a JSON object with `overrides` applied — a present key is replaced, an
+    /// empty value DELETES the key. Text rather than a struct literal because the serde
+    /// renames ARE the contract under test.
+    fn json_obj(base: &[(&str, &str)], overrides: &[(&str, &str)]) -> String {
+        let mut fields: Vec<(String, String)> = base
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        for (k, v) in overrides {
+            fields.retain(|(fk, _)| fk != k);
+            if !v.is_empty() {
+                fields.push((k.to_string(), v.to_string()));
+            }
+        }
+        let body: Vec<String> = fields.iter().map(|(k, v)| format!("\"{k}\":{v}")).collect();
+        format!("{{{}}}", body.join(","))
+    }
+
+    /// DeepSeek-V4-Flash-0731's real `config.json` values, field for field. Pinned against
+    /// the shipped file by `real_v4_config_parses` (skipped when the checkpoint is absent),
+    /// so this table cannot quietly become a fiction that only the unit tests believe.
+    const V4_BASE: &[(&str, &str)] = &[
+        ("model_type", r#""deepseek_v4""#),
+        ("architectures", r#"["DeepseekV4ForCausalLM"]"#),
+        ("num_hidden_layers", "43"),
+        ("hidden_size", "4096"),
+        ("vocab_size", "129280"),
+        ("num_attention_heads", "64"),
+        ("head_dim", "512"),
+        ("qk_rope_head_dim", "64"),
+        ("q_lora_rank", "1024"),
+        ("o_groups", "8"),
+        ("o_lora_rank", "1024"),
+        ("num_key_value_heads", "1"),
+        // 46 entries for 43 layers — the tail belongs to the mtp blocks. Layers 0 and 1
+        // are ratio 0, then 4 and 128 alternate to layer 42.
+        (
+            "compress_ratios",
+            "[0,0,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,\
+             4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,0,0,0]",
+        ),
+        ("compress_rope_theta", "160000"),
+        ("max_position_embeddings", "1048576"),
+        (
+            "rope_scaling",
+            r#"{"beta_fast":32,"beta_slow":1,"factor":16,
+                "original_max_position_embeddings":65536,"type":"yarn"}"#,
+        ),
+        ("rope_theta", "10000"),
+        ("n_routed_experts", "256"),
+        ("num_experts_per_tok", "6"),
+        ("moe_intermediate_size", "2048"),
+        ("n_shared_experts", "1"),
+        ("scoring_func", r#""sqrtsoftplus""#),
+        ("num_hash_layers", "3"),
+        ("swiglu_limit", "10.0"),
+        ("expert_dtype", r#""fp4""#),
+        (
+            "quantization_config",
+            r#"{"activation_scheme":"dynamic","fmt":"e4m3","quant_method":"fp8",
+                "scale_fmt":"ue8m0","weight_block_size":[128,128]}"#,
+        ),
+        ("index_n_heads", "64"),
+        ("index_head_dim", "128"),
+        ("hc_mult", "4"),
+    ];
+
+    fn v4_json(overrides: &[(&str, &str)]) -> String {
+        json_obj(V4_BASE, overrides)
+    }
+
+    fn parse_v4(overrides: &[(&str, &str)]) -> Result<V4Config> {
+        parse_config(&v4_json(overrides))
+    }
+
+    /// GLM-5.2's real values, as a JSON object that `overrides` can patch.
     fn cfg_json(overrides: &[(&str, &str)]) -> String {
-        let mut fields: Vec<(String, String)> = [
+        let base: Vec<(&str, &str)> = [
+            ("model_type", r#""glm_moe_dsa""#),
+            ("architectures", r#"["GlmMoeDsaForCausalLM"]"#),
             ("num_hidden_layers", "78"),
             ("hidden_size", "6144"),
             ("num_attention_heads", "64"),
@@ -261,24 +767,12 @@ mod tests {
             ("rms_norm_eps", "1e-5"),
             ("rope_parameters", r#"{"rope_theta": 8000000}"#),
         ]
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-        for (k, v) in overrides {
-            fields.retain(|(fk, _)| fk != k);
-            if !v.is_empty() {
-                fields.push((k.to_string(), v.to_string()));
-            }
-        }
-        let body: Vec<String> = fields
-            .iter()
-            .map(|(k, v)| format!("\"{k}\":{v}"))
-            .collect();
-        format!("{{{}}}", body.join(","))
+        .into();
+        json_obj(&base, overrides)
     }
 
     fn parse(overrides: &[(&str, &str)]) -> Result<ModelConfig> {
-        ModelConfig::from_json(&cfg_json(overrides))
+        parse_config(&cfg_json(overrides))
     }
 
     #[test]
@@ -351,5 +845,211 @@ mod tests {
         ] {
             assert!(parse(&bad).is_err(), "{bad:?} should not have loaded");
         }
+    }
+
+    // ── the architecture discriminant ──────────────────────────────────────────────
+
+    /// The discriminant is read from `model_type` AND `architectures`, is never defaulted,
+    /// and refuses a self-contradicting file. Absent-from-both is a refusal too: every
+    /// config and manifest under `/var/db/rivoli` and `/swarm/storage/ai/rivoli` carries
+    /// both (checked 2026-08-04, all six), so there is no artifact for a fallback to serve
+    /// — only a foreign one, which is exactly what must not be guessed at.
+    #[test]
+    fn arch_is_declared_never_defaulted() {
+        assert_eq!(
+            arch_of(&serde_json::json!({"model_type": "glm_moe_dsa"})).unwrap(),
+            Arch::GlmMoeDsa
+        );
+        // `architectures` alone is enough — that is the field the coordinator's `--help`
+        // rendering keys on, and GLM's shipped manifest carries it.
+        assert_eq!(
+            arch_of(&serde_json::json!({"architectures": ["DeepseekV4ForCausalLM"]})).unwrap(),
+            Arch::DeepseekV4
+        );
+        for (doc, want) in [
+            (serde_json::json!({}), "neither"),
+            (serde_json::json!({"model_type": "llama"}), "unsupported"),
+            (
+                serde_json::json!({"model_type":"glm_moe_dsa",
+                                   "architectures":["DeepseekV4ForCausalLM"]}),
+                "disagrees",
+            ),
+        ] {
+            let err = format!("{:#}", arch_of(&doc).unwrap_err());
+            assert!(err.contains(want), "expected {want:?} in: {err}");
+        }
+    }
+
+    /// The heart of S1a. A V4 config must not become a zero-filled `ModelConfig`, and the
+    /// refusal must NAME the architecture rather than blaming whichever MLA field V4
+    /// happens to omit first (it used to say `missing field kv_lora_rank`, which reads
+    /// like a corrupt checkpoint). Both directions, because a GLM config fed to the V4
+    /// converter is the same defect wearing the other hat.
+    #[test]
+    fn each_config_refuses_the_other_architecture() {
+        let err = format!("{:#}", parse_config::<ModelConfig>(&v4_json(&[])).unwrap_err());
+        assert!(
+            err.contains("deepseek_v4") && err.contains("GlmMoeDsa"),
+            "refusal must name what the file says AND what was expected: {err}"
+        );
+        assert!(
+            !err.contains("kv_lora_rank"),
+            "refused on a missing field instead of on the architecture: {err}"
+        );
+        let err = format!("{:#}", parse_config::<V4Config>(&cfg_json(&[])).unwrap_err());
+        assert!(err.contains("glm_moe_dsa") && err.contains("DeepseekV4"), "{err}");
+    }
+
+    // ── V4Config ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn v4_baseline_parses() {
+        let c = parse_v4(&[]).expect("V4-Flash's own config must load");
+        assert_eq!((c.n_layers, c.hidden, c.moe_inter), (43, 4096, 2048));
+        assert_eq!((c.top_k, c.n_shared), (6, 1));
+        assert_eq!(c.n_heads * c.head_dim, 32768); // == wq_b's out_dim
+    }
+
+    /// **No field of V4Config may be defaulted.** Dropping any one must fail the parse,
+    /// not yield a zero — that is the failure mode this whole stage is built around, and
+    /// it is checked field-by-field rather than by inspection so a `#[serde(default)]`
+    /// added later cannot slip through.
+    ///
+    /// Driven off `V4_BASE` itself, so a field added to the struct and to the fixture is
+    /// covered automatically; one added to the struct alone fails `v4_baseline_parses`.
+    #[test]
+    fn every_v4_field_is_required() {
+        for (k, _) in V4_BASE {
+            // The two discriminant keys are interchangeable — dropping ONE leaves the
+            // other, which is the point of reading both. Dropping both is covered by
+            // `arch_is_declared_never_defaulted`.
+            if matches!(*k, "model_type" | "architectures") {
+                continue;
+            }
+            assert!(
+                parse_v4(&[(k, "")]).is_err(),
+                "dropping {k:?} still parsed — it has acquired a default"
+            );
+        }
+    }
+
+    /// Each of these is silent-wrong if it slips through: a wrong router affinity picks
+    /// plausible experts, an unclamped SwiGLU changes arithmetic, an fp8 export read as
+    /// FP4 nibble pairs is noise, and a non-128 fp8 block mis-tiles every attention scale.
+    #[test]
+    fn v4_rejects_the_silently_wrong_settings() {
+        // One YaRN block, varied — the two bad cases differ only in the field under test,
+        // so neither can pass because of the other's value.
+        let rope = |orig: usize, kind: &str| {
+            format!(
+                r#"{{"beta_fast":32,"beta_slow":1,"factor":16,
+                    "original_max_position_embeddings":{orig},"type":"{kind}"}}"#
+            )
+        };
+        let (no_yarn, not_yarn) = (rope(0, "yarn"), rope(65536, "linear"));
+        for (bad, want) in [
+            (vec![("scoring_func", r#""sigmoid""#)], "sqrtsoftplus"),
+            (vec![("swiglu_limit", "0.0")], "CLAMPED"),
+            (vec![("expert_dtype", r#""fp8""#)], "e2m1"),
+            (vec![("num_key_value_heads", "8")], "MQA"),
+            (vec![("rope_theta", "0")], "must be positive"),
+            (vec![("compress_rope_theta", "0")], "must be positive"),
+            (vec![("rope_scaling", &no_yarn)], "interpolation branch"),
+            (vec![("rope_scaling", &not_yarn)], "only YaRN"),
+            (vec![("n_shared_experts", "2")], "n_shared_experts"),
+            (vec![("num_experts_per_tok", "300")], "top_k"),
+            (vec![("num_hash_layers", "99")], "num_hash_layers"),
+            (vec![("o_groups", "7")], "o_groups"),
+            (vec![("moe_intermediate_size", "2000")], "F4_GROUP"),
+            // Full length, one bad entry — otherwise the LENGTH check fires first and this
+            // case would pass without the value check existing at all.
+            (
+                vec![(
+                    "compress_ratios",
+                    "[0,0,7,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,\
+                     4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,0,0,0]",
+                )],
+                "implemented: 0, 4, 128",
+            ),
+            (vec![("compress_ratios", "[0,0,4]")], "at least n_layers"),
+            (
+                vec![(
+                    "quantization_config",
+                    r#"{"fmt":"e5m2","scale_fmt":"ue8m0","weight_block_size":[128,128]}"#,
+                )],
+                "e4m3",
+            ),
+            (
+                vec![(
+                    "quantization_config",
+                    r#"{"fmt":"e4m3","scale_fmt":"ue8m0","weight_block_size":[64,64]}"#,
+                )],
+                "weight_block_size",
+            ),
+        ] {
+            let err = format!("{:#}", parse_v4(&bad).unwrap_err());
+            assert!(err.contains(want), "expected {want:?} for {bad:?}, got: {err}");
+        }
+    }
+
+    /// The per-layer roles the converter and S1b both key on. Layer 0 is the one everyone
+    /// checks and it is the LEAST representative layer in the model: ratio 0 means no
+    /// compressor, no indexer, base theta and YaRN off. Layers 2 and 3 are the other two
+    /// shapes. Cross-checked against the shipped checkpoint's tensor sets in
+    /// `tests/v4_artifact.rs`.
+    #[test]
+    fn v4_layer_roles_follow_compress_ratios() {
+        let c = parse_v4(&[]).unwrap();
+        let role = |l: usize| {
+            (
+                c.compress_ratio(l).unwrap(),
+                c.layer_has_compressor(l).unwrap(),
+                c.layer_has_indexer(l).unwrap(),
+                c.layer_routes_by_hash(l),
+            )
+        };
+        assert_eq!(role(0), (0, false, false, true));
+        assert_eq!(role(1), (0, false, false, true));
+        assert_eq!(role(2), (4, true, true, true)); // last hash layer, first indexer
+        assert_eq!(role(3), (128, true, false, false));
+        assert_eq!(role(42), (4, true, true, false));
+        // 21 indexers among 41 compressor layers — the count `other-models.md` quotes.
+        let (comp, idx) = (0..c.n_layers).fold((0, 0), |(a, b), l| {
+            (
+                a + usize::from(c.layer_has_compressor(l).unwrap()),
+                b + usize::from(c.layer_has_indexer(l).unwrap()),
+            )
+        });
+        assert_eq!((comp, idx), (41, 21));
+        // The mtp tail is past n_layers and must stay unreachable: reading it would give
+        // an mtp block's ratio for a main-path layer.
+        assert!(c.compress_ratio(c.n_layers).is_err());
+    }
+
+    /// `V4_BASE` is a hand-copy of the shipped `config.json`. This is what stops it from
+    /// quietly becoming a fiction that only the unit tests believe.
+    ///
+    /// Structural, not a hand-listed tuple: EVERY key in `V4_BASE` is compared against the
+    /// real document, so the check grows with the table instead of covering whichever
+    /// seven fields someone happened to list. A drifted `o_groups` or `index_head_dim`
+    /// would otherwise be believed by every other V4 test in this file.
+    #[test]
+    fn v4_base_matches_the_shipped_config() {
+        const DIR: &str = "/var/db/rivoli/deepseek-v4-flash-0731";
+        let Ok(text) = std::fs::read_to_string(format!("{DIR}/config.json")) else {
+            eprintln!("SKIP v4_base_matches: no checkpoint at {DIR} — V4_BASE is UNPINNED");
+            return;
+        };
+        let real: serde_json::Value = serde_json::from_str(&text).unwrap();
+        for (k, v) in V4_BASE {
+            let want: serde_json::Value = serde_json::from_str(v)
+                .unwrap_or_else(|e| panic!("V4_BASE[{k}] is not valid JSON: {e}"));
+            let got = real.get(*k).unwrap_or_else(|| panic!("config.json has no {k:?}"));
+            assert_eq!(got, &want, "V4_BASE[{k}] has drifted from the shipped config");
+        }
+        // …and it parses, and is still refused as a ModelConfig from the file itself
+        // rather than only from the fixture.
+        parse_config::<V4Config>(&text).expect("the shipped config must parse");
+        assert!(ModelConfig::load(DIR).is_err());
     }
 }

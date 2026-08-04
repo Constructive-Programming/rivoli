@@ -92,8 +92,13 @@ pub enum Dtype {
     F32,
     U8,
     I8,
+    I64,
     Bf16,
     F8E4M3,
+    /// A bare 8-bit exponent, `2^(b-127)`. DeepSeek-V4-Flash's block scales — 128×128 on
+    /// the fp8 attention tensors, one per 32 weights along the input dim on the FP4
+    /// experts. Decoded by [`crate::artifact::quant::e8m0`].
+    F8E8M0,
 }
 
 impl Dtype {
@@ -102,8 +107,10 @@ impl Dtype {
             "F32" => Dtype::F32,
             "U8" => Dtype::U8,
             "I8" => Dtype::I8,
+            "I64" => Dtype::I64,
             "BF16" => Dtype::Bf16,
             "F8_E4M3" => Dtype::F8E4M3,
+            "F8_E8M0" => Dtype::F8E8M0,
             _ => return None,
         })
     }
@@ -113,8 +120,10 @@ impl Dtype {
             Dtype::F32 => "F32",
             Dtype::U8 => "U8",
             Dtype::I8 => "I8",
+            Dtype::I64 => "I64",
             Dtype::Bf16 => "BF16",
             Dtype::F8E4M3 => "F8_E4M3",
+            Dtype::F8E8M0 => "F8_E8M0",
         }
     }
 }
@@ -142,23 +151,89 @@ impl SafeWriter {
         self.tensors.push((name.into(), dtype, shape, bytes));
     }
 
-    /// Copy an fp8 tensor (`<name>.weight` F8E4M3 + `.weight_scale_inv` F32) from a
-    /// reader verbatim — the resident attn/dense/indexer projections.
-    pub fn copy_fp8(&mut self, src: &Safetensors, name: &str) -> Result<()> {
-        let (w, shape) = src.typed(&format!("{name}.weight"), Dtype::F8E4M3)?;
+    /// Add an fp8 weight and its f32 block scale under this engine's two resident names,
+    /// `<name>.weight` and `<name>.weight_scale_inv`. Both `copy_fp8` (GLM: the scale is
+    /// already f32) and `copy_fp8_e8m0` (V4: it is an e8m0 byte) end here, so the pair can
+    /// never be written under one convention by one converter and another by the other.
+    fn add_fp8_pair(
+        &mut self,
+        name: &str,
+        weight: &[u8],
+        shape: &[usize],
+        scale: Vec<u8>,
+        sshape: &[usize],
+    ) {
         self.add(
             format!("{name}.weight"),
             Dtype::F8E4M3,
             shape.to_vec(),
-            w.to_vec(),
+            weight.to_vec(),
         );
-        let (sc, ssh) = src.typed(&format!("{name}.weight_scale_inv"), Dtype::F32)?;
         self.add(
             format!("{name}.weight_scale_inv"),
             Dtype::F32,
-            ssh.to_vec(),
-            sc.to_vec(),
+            sshape.to_vec(),
+            scale,
         );
+    }
+
+    /// Copy an fp8 tensor (`<name>.weight` F8E4M3 + `.weight_scale_inv` F32) from a
+    /// reader verbatim — the resident attn/dense/indexer projections.
+    pub fn copy_fp8(&mut self, src: &Safetensors, name: &str) -> Result<()> {
+        let (w, shape) = src.typed(&format!("{name}.weight"), Dtype::F8E4M3)?;
+        let (sc, ssh) = src.typed(&format!("{name}.weight_scale_inv"), Dtype::F32)?;
+        self.add_fp8_pair(name, w, shape, sc.to_vec(), ssh);
+        Ok(())
+    }
+
+    /// Copy a V4 fp8 tensor (`<name>.weight` F8E4M3 + `<name>.scale` **F8_E8M0**) into
+    /// the resident set, widening only the SCALE: weight bytes verbatim, and each e8m0
+    /// exponent byte to the f32 `<name>.weight_scale_inv` the resident path already reads.
+    ///
+    /// **Lossless, and provably so.** e8m0 is a bare exponent with value `2^(b-127)`; every
+    /// b in 0..=254 is exactly representable in f32 (b=0 is 2^-127, an f32 subnormal but an
+    /// exact one — 2^-149 is the smallest), and 0xFF is the format's NaN, which
+    /// [`crate::artifact::quant::e8m0`] refuses rather than propagate into a whole block.
+    /// So this is a re-encoding of the same numbers, not a requantization — which is the
+    /// point: V4's attention is already fp8 at the 128×128 block size rivoli uses.
+    ///
+    /// The two conventions also AGREE on direction, which is the part that would be silent
+    /// if it did not: `inference/kernel.py`'s `fp8_gemm` accumulates
+    /// `C += C_local * scale_a * scale_b` (line 46) and `fp4_gemm` the same at line 509 —
+    /// a multiplier, exactly as `quant::dequant_fp8_block` applies GLM's. Were V4's the
+    /// reciprocal, every resident attention tensor would be off by `s²` with no error.
+    ///
+    /// The output is named `weight_scale_inv` rather than keeping the source's `.scale`
+    /// because that is this engine's name for "the f32 block multiplier of an fp8 weight",
+    /// and it is what `dequant_fp8` and `pin.rs` read. A tensor of a different dtype under
+    /// the source's name would be the more confusing of the two.
+    pub fn copy_fp8_e8m0(&mut self, src: &Safetensors, name: &str) -> Result<()> {
+        let (w, shape) = src.typed(&format!("{name}.weight"), Dtype::F8E4M3)?;
+        let (sc, ssh) = src.typed(&format!("{name}.scale"), Dtype::F8E8M0)?;
+        let block = crate::artifact::quant::FP8_BLOCK;
+        ensure!(shape.len() == 2, "{name}.weight: shape {shape:?} is not 2-D");
+        let want = [shape[0].div_ceil(block), shape[1].div_ceil(block)];
+        ensure!(
+            ssh == want,
+            "{name}.scale: shape {ssh:?} != {want:?} for a {shape:?} weight at block {block}"
+        );
+        let f32b: Vec<u8> = sc
+            .iter()
+            .map(|&b| crate::artifact::quant::e8m0(b).map(f32::to_le_bytes))
+            .collect::<Result<Vec<_>>>()
+            .with_context(|| format!("{name}.scale"))?
+            .concat();
+        self.add_fp8_pair(name, w, shape, f32b, ssh);
+        Ok(())
+    }
+
+    /// Copy a tensor verbatim — same dtype, same shape, same bytes. For the ones that are
+    /// already what the loader wants (`attn_sink` and the `hc_*` tables are F32; `embed`
+    /// and `head` stay BF16 because whether to requantize them is a QUALITY decision with
+    /// a measurement attached, not a conversion detail to settle here).
+    pub fn copy_verbatim(&mut self, src: &Safetensors, name: &str, dtype: Dtype) -> Result<()> {
+        let (b, shape) = src.typed(name, dtype)?;
+        self.add(name, dtype, shape.to_vec(), b.to_vec());
         Ok(())
     }
 
@@ -232,6 +307,42 @@ impl Safetensors {
         Self::open_files(std::slice::from_ref(&std::path::PathBuf::from(path)))
     }
 
+    /// mmap + index a NAMED subset of a checkpoint's shards, resolved through its
+    /// `model.safetensors.index.json`: every shard holding a tensor whose name `want`
+    /// accepts, and no others.
+    ///
+    /// [`Self::open_dir`] takes the whole directory, which is wrong for a partial convert
+    /// of a very large checkpoint for two reasons. It reads shards it will never touch —
+    /// V4-Flash is 48 of them, one per layer — and, more sharply, it fails on ANY truncated
+    /// shard. A checkpoint being fetched has truncated shards by definition, and refusing
+    /// to convert layer 0 because layer 31 is still downloading is a self-inflicted stall.
+    /// Selecting by name keeps the truncation check (a shard we DO need, still short, fails
+    /// loudly and by name) while ignoring the ones we do not.
+    pub fn open_indexed(dir: &str, want: impl Fn(&str) -> bool) -> Result<Self> {
+        let ipath = format!("{dir}/model.safetensors.index.json");
+        let idx: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&ipath).with_context(|| format!("read {ipath}"))?,
+        )
+        .with_context(|| format!("parse {ipath}"))?;
+        let map = idx["weight_map"]
+            .as_object()
+            .with_context(|| format!("{ipath}: no weight_map"))?;
+        let mut shards: Vec<String> = map
+            .iter()
+            .filter(|(name, _)| want(name))
+            .filter_map(|(_, sh)| sh.as_str().map(str::to_string))
+            .collect();
+        shards.sort();
+        shards.dedup();
+        ensure!(
+            !shards.is_empty(),
+            "{ipath}: no tensor matched the requested selection"
+        );
+        let paths: Vec<std::path::PathBuf> =
+            shards.iter().map(|s| format!("{dir}/{s}").into()).collect();
+        Self::open_files(&paths)
+    }
+
     fn open_files(paths: &[std::path::PathBuf]) -> Result<Self> {
         let mut mmaps = Vec::with_capacity(paths.len());
         let mut index = HashMap::new();
@@ -239,7 +350,19 @@ impl Safetensors {
             let file = std::fs::File::open(path).with_context(|| format!("open {path:?}"))?;
             // SAFETY: read-only for the reader's lifetime.
             let mmap = unsafe { Mmap::map(&file) }.with_context(|| format!("mmap {path:?}"))?;
+            ensure!(mmap.len() >= 8, "{path:?}: {} bytes, not a safetensors", mmap.len());
             let hlen = u64::from_le_bytes(mmap[..8].try_into()?) as usize;
+            // A TRUNCATED shard — a download still in flight, an interrupted copy — has a
+            // complete header describing data that is not there yet. Without this check
+            // the file opens, indexes cleanly, and every read past the end panics on a
+            // slice range deep inside a converter. Measured 2026-08-04: the V4-Flash
+            // checkpoint was being fetched while this code was written, and 21 of its 48
+            // shards were absent or partial at any given moment.
+            ensure!(
+                8 + hlen <= mmap.len(),
+                "{path:?}: header claims {hlen} bytes but the file is {} — truncated",
+                mmap.len()
+            );
             let hdr: serde_json::Value = serde_json::from_slice(&mmap[8..8 + hlen])
                 .with_context(|| format!("parse header {path:?}"))?;
             let base = 8 + hlen;
@@ -262,6 +385,14 @@ impl Safetensors {
                     .iter()
                     .map(|v| u(v).map(|x| x as usize))
                     .collect::<Result<_>>()?;
+                // Per-tensor, not just per-file: the data region can be short of what the
+                // LAST tensor claims even when the header itself parsed.
+                ensure!(
+                    base + e <= mmap.len(),
+                    "{path:?}: tensor {name} ends at {} but the file is {} — truncated",
+                    base + e,
+                    mmap.len()
+                );
                 index.insert(
                     name.clone(),
                     Loc {
@@ -335,6 +466,156 @@ impl Safetensors {
             w, &scale, o_dim, i_dim, block,
         ))
     }
+}
+
+// ── `.f4` repack (DeepSeek-V4-Flash's native FP4 routed experts) ────────────────
+//
+// V4 ships its routed experts ALREADY at 4 bits: `<proj>.weight` is `I8[o, i/2]` holding
+// e2m1 nibble pairs, `<proj>.scale` is `F8_E8M0[o, i/32]`. rivoli's `.f4` block is the
+// same nibbles and the same exponent bytes at O_DIRECT-aligned offsets — a REPACK, with
+// nothing fit, nothing re-rounded, and no error introduced.
+//
+// Two facts make the copy a plain `memcpy` rather than a transcode. Both are read from the
+// reference; neither is CHECKED here, and saying so matters because a copy cannot detect
+// either being wrong:
+//   * NIBBLE ORDER. torch's `float4_e2m1fn_x2` and `inference/convert.py:31-33`
+//     (`low = x & 0x0F; high = (x >> 4) & 0x0F; stack([TABLE[low], TABLE[high]])`) put
+//     logical element 2j in the LOW nibble of byte j — the convention `quant::matvec_i4`
+//     already reads. A repack under the opposite convention is the same byte copy, so this
+//     becomes checkable only when a `matvec_f4` exists to decode one. That is S3's, and it
+//     is the check to add there.
+//   * The SCALE GRID. `inference/kernel.py:468` declares
+//     `scales_b: T.Tensor[(N, ceildiv(K, 32))]` indexed `[n, k]` — `[o_dim, f4_groups]`
+//     row-major, which IS checked, by the shape guard in `F4Expert::spans`.
+
+/// One V4 routed expert, located in a source checkpoint: which tensors it is made of and
+/// what shape they must have.
+///
+/// A struct rather than four positional arguments repeated at every entry point, for the
+/// reason `SetDims` gives: nothing about a transposed `(hidden, moe_inter)` fails a check —
+/// an expert's three projections are `(moe_inter, hidden)·2 + (hidden, moe_inter)`, so the
+/// swap produces exactly the same byte count and streams the wrong weights. Named fields
+/// make the swap visible at the call site instead of invisible inside an argument list.
+pub struct F4Expert<'a> {
+    pub src: &'a Safetensors,
+    /// `layers.{l}.ffn.experts.{e}` — see `quant::v4_expert_base`.
+    pub base: String,
+    pub hidden: usize,
+    pub moe_inter: usize,
+}
+
+impl F4Expert<'_> {
+    /// This expert's six source spans, paired with their byte offset inside an `.f4`
+    /// block: `(w1, w1.scale, w3, w3.scale, w2, w2.scale)` — see
+    /// [`crate::artifact::quant::V4_PROJ`] for why that is gate/up/down order.
+    ///
+    /// ONE definition of the layout, used by both [`Self::pack`] and [`Self::diff`]. That
+    /// is deliberate: what the verifier must prove is that the VALUES pass through
+    /// untouched, and re-deriving the offsets in both places would only test that a copy
+    /// of the arithmetic agrees with itself. The layout is pinned separately, by
+    /// `f4_expert_bytes` (size) and by [`ExpertHeader`] (dims), and a wrong layout changes
+    /// the file's length.
+    fn spans(&self) -> Result<Vec<(usize, &[u8])>> {
+        let (hidden, moe_inter, base) = (self.hidden, self.moe_inter, &self.base);
+        let mut out = Vec::with_capacity(6);
+        let mut off = 0usize;
+        for (proj, (o_dim, i_dim)) in crate::artifact::quant::v4_expert_projs(hidden, moe_inter) {
+            // Shapes are checked, not trusted: `[o, i/2]` and `[o, i/32]` are the only pair
+            // the byte counts below are correct for, and a transposed or mis-blocked source
+            // would otherwise copy the right NUMBER of bytes in the wrong order — a file
+            // that passes every length check and decodes to noise.
+            let (w, wsh) = self.src.typed(&format!("{base}.{proj}.weight"), Dtype::I8)?;
+            ensure!(
+                wsh == [o_dim, i_dim / 2],
+                "{base}.{proj}.weight: shape {wsh:?} != [{o_dim},{}] (FP4 nibble pairs)",
+                i_dim / 2
+            );
+            let (sc, ssh) = self.src.typed(&format!("{base}.{proj}.scale"), Dtype::F8E8M0)?;
+            let groups = crate::artifact::quant::f4_groups(i_dim);
+            ensure!(
+                ssh == [o_dim, groups],
+                "{base}.{proj}.scale: shape {ssh:?} != [{o_dim},{groups}] (one e8m0 per {} \
+                 weights along the input dim)",
+                crate::artifact::quant::F4_GROUP
+            );
+            let wb = o_dim * crate::artifact::quant::f4_row_bytes(i_dim);
+            ensure!(
+                w.len() == wb && sc.len() == o_dim * groups,
+                "{base}.{proj}: source spans are shorter than their shapes"
+            );
+            out.push((off, w));
+            off += wb;
+            out.push((off, sc));
+            off += o_dim * groups;
+        }
+        // No `off == f4_expert_bytes(...)` assertion here: both sides sum the same
+        // `f4_proj_bytes` over the same `vq_expert_layout`, so it can never fire. The
+        // check that CAN is `pack`'s, on the buffer it was handed.
+        Ok(out)
+    }
+
+    /// Repack into `dst` (`f4_expert_bytes` long). A byte copy — nothing is fit, nothing
+    /// is re-rounded, and no error is introduced.
+    pub fn pack(&self, dst: &mut [u8]) -> Result<()> {
+        let want = crate::artifact::quant::f4_expert_bytes(self.hidden, self.moe_inter);
+        ensure!(
+            dst.len() == want,
+            "{}: destination is {} bytes, an expert block is {want}",
+            self.base,
+            dst.len()
+        );
+        for (off, bytes) in self.spans()? {
+            dst[off..off + bytes.len()].copy_from_slice(bytes);
+        }
+        Ok(())
+    }
+
+    /// Byte offsets within `block` that disagree with the source tensors. **Empty means
+    /// the repack was bit-exact**; anything else names where it was not.
+    ///
+    /// Returns the offsets rather than a bool so a caller can say WHICH bytes moved —
+    /// which is what lets `convert_v4 --verify` name where a 3.4 GB layer file went wrong.
+    /// Note that `diff` shares `spans()` with [`Self::pack`], so against a block derived
+    /// from `pack` it is a tautology; its value is against a block read back from DISK,
+    /// which is the only way `--verify` uses it.
+    pub fn diff(&self, block: &[u8]) -> Result<Vec<usize>> {
+        let mut bad = Vec::new();
+        for (off, want) in self.spans()? {
+            let got = block
+                .get(off..off + want.len())
+                .with_context(|| format!("{}: block shorter than the source spans", self.base))?;
+            if got != want {
+                bad.extend((0..want.len()).filter(|&k| got[k] != want[k]).map(|k| off + k));
+            }
+        }
+        Ok(bad)
+    }
+}
+
+/// Write `<out_dir>/manifest.json` and copy `aux` (tokenizer and friends) beside it, so
+/// the artifact is self-contained. The last step of every converter.
+///
+/// A missing aux file is a WARNING rather than an error: the artifact is still loadable
+/// without `generation_config.json`, and failing a multi-hour convert on its absence at
+/// the very end would be the worse trade. A missing manifest is not survivable, so that
+/// one propagates.
+pub fn finish_artifact(
+    tool: &str,
+    out_dir: &str,
+    src_dir: &str,
+    manifest: &serde_json::Value,
+    aux: &[&str],
+) -> Result<()> {
+    let path = format!("{out_dir}/manifest.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(manifest)?)
+        .with_context(|| format!("write {path}"))?;
+    for name in aux {
+        match std::fs::copy(format!("{src_dir}/{name}"), format!("{out_dir}/{name}")) {
+            Ok(_) => eprintln!("{tool}: copied {name}"),
+            Err(e) => eprintln!("{tool}: WARNING: {name} not copied ({e})"),
+        }
+    }
+    Ok(())
 }
 
 /// Provenance of the artifact's `.i4` expert set: which tool produced it, from what,
@@ -437,15 +718,25 @@ impl I4Source {
 
 // ── .vq3 expert files (streamed routed experts + resident shared) ───────────────
 
-/// `.vq3` per-file header. Little-endian, 40 bytes, at the start of every layer file.
-/// Self-describing: a dim/version mismatch or truncation fails loud on open.
+/// Per-file header for a routed-expert layer file. Little-endian, 40 bytes, at the start
+/// of the file. Self-describing: a dim/version mismatch or truncation fails loud on open.
+///
+/// **The dims are here because nothing else catches a transposition.** An expert's three
+/// projections are `(moe_inter, hidden) · 2 + (hidden, moe_inter)`, so swapping the two
+/// widths gives a file of EXACTLY the same size that passes every length check and streams
+/// the wrong bytes. `.i4` gets away without a header only because it is a twin of a `.vq3`
+/// that was already validated; `.f4` is standalone and carries one.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct Vq3Header {
-    pub magic: [u8; 4], // b"VQ3\0"
+pub struct ExpertHeader {
+    /// [`VQ3_MAGIC`] or [`F4_MAGIC`] — which format's blocks follow.
+    pub magic: [u8; 4],
     pub version: u32,
     pub layer: u32,
-    pub n_experts: u32, // ROUTED experts; the file holds n_experts + 1 blocks (last = shared)
+    /// ROUTED experts. `.vq3` holds `n_experts + 1` blocks (the last is the shared
+    /// expert); `.f4` holds exactly `n_experts`, because V4's shared expert is fp8 e4m3
+    /// and cannot share a file with FP4 blocks (see `quant::v4_expert_base`).
+    pub n_experts: u32,
     pub hidden: u32,
     pub moe_inter: u32,
     pub stride: u64, // per-expert O_DIRECT-aligned block stride
@@ -453,25 +744,36 @@ pub struct Vq3Header {
 }
 
 pub const VQ3_MAGIC: [u8; 4] = *b"VQ3\0";
-pub const VQ3_HEADER_BYTES: usize = 40;
+pub const F4_MAGIC: [u8; 4] = *b"FP4\0";
+pub const EXPERT_HEADER_BYTES: usize = 40;
 
-impl Vq3Header {
-    pub fn new(layer: usize, n_experts: usize, hidden: usize, moe_inter: usize) -> Self {
+impl ExpertHeader {
+    /// A header for one layer file. `stride` is the value the WRITER indexes blocks with,
+    /// passed in rather than re-derived here: re-deriving would let the header disagree
+    /// with the file it describes and still look self-consistent.
+    pub fn new(
+        magic: [u8; 4],
+        layer: usize,
+        n_experts: usize,
+        hidden: usize,
+        moe_inter: usize,
+        stride: usize,
+    ) -> Self {
         Self {
-            magic: VQ3_MAGIC,
+            magic,
             version: FormatMeta::VERSION,
             layer: layer as u32,
             n_experts: n_experts as u32,
             hidden: hidden as u32,
             moe_inter: moe_inter as u32,
-            stride: vq_expert_stride(hidden, moe_inter) as u64,
+            stride: stride as u64,
             reserved: 0,
         }
     }
 
     /// Serialize to the 40-byte on-disk header.
-    pub fn to_bytes(&self) -> [u8; VQ3_HEADER_BYTES] {
-        let mut b = [0u8; VQ3_HEADER_BYTES];
+    pub fn to_bytes(&self) -> [u8; EXPERT_HEADER_BYTES] {
+        let mut b = [0u8; EXPERT_HEADER_BYTES];
         b[0..4].copy_from_slice(&self.magic);
         b[4..8].copy_from_slice(&self.version.to_le_bytes());
         b[8..12].copy_from_slice(&self.layer.to_le_bytes());
@@ -484,7 +786,11 @@ impl Vq3Header {
     }
 
     fn from_bytes(b: &[u8]) -> Result<Self> {
-        ensure!(b.len() >= VQ3_HEADER_BYTES, "vq3 header short");
+        ensure!(
+            b.len() >= EXPERT_HEADER_BYTES,
+            "expert-file header short: {} bytes, need {EXPERT_HEADER_BYTES}",
+            b.len()
+        );
         let h = Self {
             magic: b[0..4].try_into()?,
             version: u32::from_le_bytes(b[4..8].try_into()?),
@@ -495,7 +801,13 @@ impl Vq3Header {
             stride: u64::from_le_bytes(b[24..32].try_into()?),
             reserved: u64::from_le_bytes(b[32..40].try_into()?),
         };
-        ensure!(h.magic == VQ3_MAGIC, "bad .vq3 magic");
+        ensure!(
+            h.magic == VQ3_MAGIC,
+            "expected .vq3 magic {VQ3_MAGIC:?}, file has {:?} — `.f4` files are not read \
+             through this path yet (S3 adds the reader and must relax BOTH this and \
+             `ExpertSet::open`'s `n_experts + 1` block count together)",
+            h.magic
+        );
         ensure!(
             h.version == FormatMeta::VERSION,
             ".vq3 version {} != {}",
@@ -574,9 +886,9 @@ impl ExpertSet {
             // for the streamer). Dims must match the config.
             let hdr = std::fs::read(path)
                 .ok()
-                .filter(|b| b.len() >= VQ3_HEADER_BYTES)
+                .filter(|b| b.len() >= EXPERT_HEADER_BYTES)
                 .with_context(|| format!("read {path} header"))?;
-            let h = Vq3Header::from_bytes(&hdr)?;
+            let h = ExpertHeader::from_bytes(&hdr)?;
             ensure!(
                 h.layer as usize == l
                     && h.n_experts as usize == d.n_experts
@@ -711,14 +1023,28 @@ pub fn load_codebooks(dir: &str) -> Result<[Vec<f32>; 3]> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // test setup: panic-on-failure is the readable idiom
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
+
     use super::*;
+
+    /// A fresh, empty scratch directory for one test. Every test here needs one and each
+    /// had spelled out the same four lines; a shared helper also guarantees the
+    /// remove-then-create, which a test that only created would inherit stale files from.
+    fn tmpdir(tag: &str) -> String {
+        let dir = std::env::temp_dir()
+            .join(format!("rivoli_{tag}"))
+            .to_string_lossy()
+            .to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn vq3_header_roundtrips() {
-        let h = Vq3Header::new(7, 256, 6144, 2048);
-        let back = Vq3Header::from_bytes(&h.to_bytes()).unwrap();
+        let h = ExpertHeader::new(VQ3_MAGIC, 7, 256, 6144, 2048, vq_expert_stride(6144, 2048));
+        let back = ExpertHeader::from_bytes(&h.to_bytes()).unwrap();
         assert_eq!(back.magic, VQ3_MAGIC);
         assert_eq!(back.layer, 7);
         assert_eq!(back.n_experts, 256);
@@ -728,16 +1054,12 @@ mod tests {
         // a corrupt magic must fail
         let mut bad = h.to_bytes();
         bad[0] = b'X';
-        assert!(Vq3Header::from_bytes(&bad).is_err());
+        assert!(ExpertHeader::from_bytes(&bad).is_err());
     }
 
     #[test]
     fn safewriter_roundtrips_through_reader() {
-        let dir = format!(
-            "{}/fmt_test",
-            std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into())
-        );
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tmpdir("fmt_test");
         let path = format!("{dir}/r.safetensors");
         let mut w = SafeWriter::new();
         let a: Vec<u8> = (0..48u8).collect(); // F32 [2,6]
@@ -762,9 +1084,7 @@ mod tests {
     /// weights rather than an obvious error.
     #[test]
     fn dequant_fp8_tiles_scales_and_rejects_bad_shapes() {
-        let dir = std::env::temp_dir().join("rivoli_deqfp8_test");
-        let dir = dir.to_string_lossy().to_string();
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tmpdir("deqfp8_test");
         let path = format!("{dir}/w.safetensors");
         // A [2,4] fp8 matrix with block=2 → a [1,2] scale grid: the left 2 columns
         // scale by 10, the right 2 by 100. A row/column-swapped tiling gives
@@ -803,9 +1123,7 @@ mod tests {
     /// an error (not silently "unstamped"), and a resumed run merges into one range.
     #[test]
     fn i4_source_round_trips_and_merges_adjoining_runs() {
-        let dir = std::env::temp_dir().join("rivoli_i4src_test");
-        let dir = dir.to_string_lossy().to_string();
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tmpdir("i4src_test");
         let mf = format!("{dir}/manifest.json");
         std::fs::write(&mf, br#"{"hidden_size":6144}"#).unwrap();
         assert!(I4Source::load(&dir).unwrap().is_none()); // no field yet
@@ -863,6 +1181,142 @@ mod tests {
         // Present-but-malformed is an error, never a silent "unstamped".
         std::fs::write(&mf, br#"{"i4_source":{"tool":"x"}}"#).unwrap();
         assert!(I4Source::load(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── the `.f4` repack ───────────────────────────────────────────────────────────
+
+    /// A tiny V4-shaped FP4 expert on disk. Dims are the smallest multiples of `F4_GROUP`
+    /// that give a projection more than one group, so a group-index error has somewhere to
+    /// show; `w1` and `w3` are given different content so a slot swap is not invisible.
+    struct F4Fixture {
+        dir: String,
+        hidden: usize,
+        moe_inter: usize,
+    }
+
+    impl F4Fixture {
+        fn new(tag: &str) -> Self {
+            use crate::artifact::quant::{F4_GROUP, f4_groups, f4_row_bytes, v4_expert_projs};
+            let dir = tmpdir(&format!("f4_{tag}"));
+            let (hidden, moe_inter) = (64, 32);
+            let mut w = SafeWriter::new();
+            for (proj, (o_dim, i_dim)) in v4_expert_projs(hidden, moe_inter) {
+                // `tag` is '1' | '3' | '2', which keeps the three projections distinct —
+                // in particular w1 != w3, which have identical shapes.
+                let t = usize::from(proj.as_bytes()[1]);
+                let weight: Vec<u8> = (0..o_dim * f4_row_bytes(i_dim))
+                    .map(|k| ((k * 7 + t) % 251) as u8)
+                    .collect();
+                let scale: Vec<u8> = (0..o_dim * f4_groups(i_dim))
+                    .map(|k| (100 + (k + t) % 50) as u8)
+                    .collect();
+                w.add(format!("e.{proj}.weight"), Dtype::I8, vec![o_dim, i_dim / 2], weight);
+                w.add(
+                    format!("e.{proj}.scale"),
+                    Dtype::F8E8M0,
+                    vec![o_dim, i_dim / F4_GROUP],
+                    scale,
+                );
+            }
+            w.write(&format!("{dir}/e.safetensors")).unwrap();
+            Self { dir, hidden, moe_inter }
+        }
+
+        fn open(&self) -> Safetensors {
+            Safetensors::open_file(&format!("{}/e.safetensors", self.dir)).unwrap()
+        }
+
+        fn expert<'a>(&self, src: &'a Safetensors) -> F4Expert<'a> {
+            F4Expert {
+                src,
+                base: "e".into(),
+                hidden: self.hidden,
+                moe_inter: self.moe_inter,
+            }
+        }
+    }
+
+    impl Drop for F4Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// **A packed `.f4` block is the six source tensors concatenated, in this order.**
+    ///
+    /// The expected block is built here from the tensor NAMES spelled out literally, not
+    /// from `F4Expert::spans` — that independence is the whole point. `pack` and `diff`
+    /// share `spans`, so `diff` can only ever report `block != pack's output`; asking it
+    /// about a block derived from `pack` is `A == A` and cannot fail. Comparing against a
+    /// literal order and a literal concatenation CAN fail, and does: verified by mutation
+    /// (2026-08-05) against a packer that swapped nibbles, a `V4_PROJ` with w1/w3
+    /// transposed, and `F4_GROUP` changed 32 → 64.
+    ///
+    /// What this does NOT establish is that the order is the RIGHT one — `w1` really being
+    /// gate and `w3` really being up is pinned separately, against the reference source, by
+    /// `quant::tests::v4_proj_order_matches_the_reference_expert_forward`. And nibble
+    /// ORDER within a byte is unchecked here by construction: a repack with the opposite
+    /// convention is the same byte copy. That becomes checkable only when a `matvec_f4`
+    /// exists to decode one, which is S3.
+    #[test]
+    fn f4_pack_concatenates_the_source_tensors_in_w1_w3_w2_order() {
+        use crate::artifact::quant::f4_expert_bytes;
+        let fx = F4Fixture::new("pack");
+        let st = fx.open();
+
+        let mut want = Vec::new();
+        for name in [
+            "e.w1.weight", "e.w1.scale",
+            "e.w3.weight", "e.w3.scale",
+            "e.w2.weight", "e.w2.scale",
+        ] {
+            let dt = if name.ends_with(".scale") { Dtype::F8E8M0 } else { Dtype::I8 };
+            want.extend_from_slice(st.typed(name, dt).unwrap().0);
+        }
+
+        let mut got = vec![0u8; f4_expert_bytes(fx.hidden, fx.moe_inter)];
+        fx.expert(&st).pack(&mut got).unwrap();
+        assert_eq!(got.len(), want.len(), "block size disagrees with the source spans");
+        assert_eq!(got, want, "the repack is not a straight concatenation");
+
+        // `diff` agrees with the same independently-built block, and reports the exact
+        // offset of a single changed byte — which is what makes `convert_v4 --verify`
+        // able to name where a 3.4 GB layer file went wrong.
+        let e = fx.expert(&st);
+        assert_eq!(e.diff(&want).unwrap(), Vec::<usize>::new());
+        for k in [0, want.len() / 3, want.len() - 1] {
+            let mut bad = want.clone();
+            bad[k] ^= 0xFF;
+            assert_eq!(e.diff(&bad).unwrap(), vec![k], "diff missed a flip at {k}");
+        }
+    }
+
+    /// A truncated shard — a download in flight, an interrupted copy — must be refused by
+    /// name, not indexed and then panicked on mid-read. Both the header's own extent and
+    /// the last tensor's are checked, because a file can be long enough for one and not
+    /// the other.
+    #[test]
+    fn a_truncated_shard_is_refused_rather_than_indexed() {
+        let dir = tmpdir("trunc");
+        let path = format!("{dir}/t.safetensors");
+        let mut w = SafeWriter::new();
+        w.add("t", Dtype::F32, vec![4], vec![0u8; 16]);
+        w.write(&path).unwrap();
+        let whole = std::fs::read(&path).unwrap();
+        Safetensors::open_file(&path).expect("the intact file must open");
+
+        for cut in [whole.len() - 8, 4] {
+            std::fs::write(&path, &whole[..cut]).unwrap();
+            let err = match Safetensors::open_file(&path) {
+                Ok(_) => panic!("cut to {cut} still opened"),
+                Err(e) => format!("{e:#}"),
+            };
+            assert!(
+                err.contains("truncated") || err.contains("not a safetensors"),
+                "cut to {cut}: {err}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

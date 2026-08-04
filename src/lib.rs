@@ -8,6 +8,11 @@
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
 pub mod backend;
 
+/// Which architecture an artifact is — the discriminant `artifact::model` reads out of the
+/// manifest and `main` renders `--help` against. Top level and backend-free on purpose:
+/// the offline converters resolve it too, and they build with no backend at all.
+pub mod arch;
+
 // Grouped by subsystem, mirroring docs/reference/architecture.md: where weights live (§1, §6), how
 // they get there (§3, §4), and what they are written in (§7).
 pub mod artifact;

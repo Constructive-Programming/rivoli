@@ -10,10 +10,14 @@
 
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
-use rivoli::artifact::format::{Dtype, FormatMeta, SafeWriter, Safetensors, Vq3Header};
+use rivoli::artifact::format::{
+    Dtype, ExpertHeader, FormatMeta, SafeWriter, Safetensors, VQ3_MAGIC, finish_artifact,
+};
 use rivoli::artifact::quant::{
-    ExpertProjs, PROJ, VQ_ALIGN, VQ_DIM, VQ_K, expert_base, expert_projs, learn_codebook, quant_vq,
-    read_f32, sample_subvectors, vq_expert_bytes, vq_proj_bytes, vq_row_bytes, write_le_scales,
+    ExpertProjs, FP8_BLOCK, PROJ, VQ_ALIGN, VQ_DIM, VQ_K, expert_base, expert_projs,
+    fill_expert_blocks,
+    learn_codebook, quant_vq, read_f32, sample_subvectors, vq_expert_bytes, vq_proj_bytes,
+    vq_row_bytes, write_le_scales,
 };
 use rivoli::math::bf16_to_f32;
 // Only the tests still take the layout on its own; the encoders go through `expert_projs`,
@@ -29,8 +33,6 @@ use rivoli::artifact::quant::vq_expert_layout;
 use rivoli::artifact::quant::VQ_GROUP;
 #[cfg(any(feature = "rocm", test))]
 use rivoli::math::f32_to_bf16;
-
-const FP8_BLOCK: usize = 128;
 
 /// GPU-accelerated encode: the nearest-codebook argmin (the run-time ceiling, ~VQ_K×
 /// the other work) offloaded to `rivoli_vq_encode`. Host still does fp8 dequant,
@@ -465,39 +467,18 @@ fn main() -> Result<()> {
             continue;
         }
         let mut buf = vec![0u8; VQ_ALIGN + (d.n_experts + 1) * stride];
-        let hdr = Vq3Header::new(l, d.n_experts, d.hidden, d.moe_inter).to_bytes();
+        let hdr =
+            ExpertHeader::new(VQ3_MAGIC, l, d.n_experts, d.hidden, d.moe_inter, stride).to_bytes();
         buf[..hdr.len()].copy_from_slice(&hdr);
         // Encode all n_experts+1 blocks (routed 0..n, shared = n) in parallel over
         // disjoint block slices — quant_vq is pure and Safetensors is Sync.
         let (src, cb, projs) = (&src, &codebooks, &projs);
         let enc = encoders.as_ref();
         let validate = args.validate;
-        let threads = std::thread::available_parallelism().map_or(4, |t| t.get());
-        let per = (d.n_experts + 1).div_ceil(threads);
-        std::thread::scope(|s| -> Result<()> {
-            let mut rest = &mut buf[VQ_ALIGN..];
-            let mut e0 = 0;
-            let mut handles = Vec::new();
-            while e0 <= d.n_experts {
-                let take = per.min(d.n_experts + 1 - e0);
-                let (mine, tail) = rest.split_at_mut(take * stride);
-                rest = tail;
-                let base_e = e0;
-                e0 += take;
-                handles.push(s.spawn(move || -> Result<()> {
-                    for (j, slot) in mine.chunks_exact_mut(stride).enumerate() {
-                        let e = base_e + j;
-                        let base = expert_base(l, e, d.n_experts);
-                        encode_expert(src, &base, projs, cb, &mut slot[..ebytes], enc, validate)?;
-                    }
-                    Ok(())
-                }));
-            }
-            for h in handles {
-                h.join()
-                    .map_err(|_| anyhow::anyhow!("encode worker panicked"))??;
-            }
-            Ok(())
+        let blocks = d.n_experts + 1;
+        fill_expert_blocks(&mut buf[VQ_ALIGN..], stride, ebytes, blocks, |e, slot| {
+            let base = expert_base(l, e, d.n_experts);
+            encode_expert(src, &base, projs, cb, slot, enc, validate)
         })
         .with_context(|| format!("encode layer {l}"))?;
         std::fs::write(&path, &buf)?;
@@ -569,21 +550,16 @@ fn main() -> Result<()> {
     }
     manifest["num_nextn_predict_layers"] = serde_json::json!(u8::from(mtp));
     manifest["format"] = serde_json::to_value(FormatMeta::current(FP8_BLOCK))?;
-    std::fs::write(
-        format!("{}/manifest.json", args.out_dir),
-        serde_json::to_vec_pretty(&manifest)?,
-    )?;
 
-    // 5. Copy the tokenizer files so the artifact is self-contained (the runtime
+    // 5. manifest + the tokenizer files, so the artifact is self-contained (the runtime
     // loads tokenizer.json + generation_config.json from the model dir).
-    for name in ["tokenizer.json", "generation_config.json"] {
-        let src = format!("{}/{name}", args.fp8_dir);
-        let dst = format!("{}/{name}", args.out_dir);
-        match std::fs::copy(&src, &dst) {
-            Ok(_) => eprintln!("convert: copied {name}"),
-            Err(e) => eprintln!("convert: WARNING: {name} not copied ({e})"),
-        }
-    }
+    finish_artifact(
+        "convert",
+        &args.out_dir,
+        &args.fp8_dir,
+        &manifest,
+        &["tokenizer.json", "generation_config.json"],
+    )?;
     eprintln!("convert: done — {} → {}", args.fp8_dir, args.out_dir);
     Ok(())
 }
