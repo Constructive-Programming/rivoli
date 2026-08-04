@@ -1,6 +1,6 @@
 ---
 status: live
-verdict: The staged plan to make V4-Flash decode. Corrects other-models.md on three points measured from the downloaded repo: experts are 148.25 GB native FP4 (138.1 GiB) so it DOES stream at ~83% residency, not "nearly fully resident"; 4.02 GB/token not 3.1; the partial fp8 KV act_quant is mandatory, not a --kv-fp8 to refuse; YaRN is per-layer, keyed to compress_ratio. DSpark/MTP is separable and out of scope.
+verdict: The staged plan to make V4-Flash decode. S1 LANDED 2026-08-05 (.f4 repack bit-exact over 10.27 GB; a 137-golden CPU oracle with five measured blind spots). Corrects other-models.md from the real repo: experts are 148.25 GB native FP4 (138.1 GiB) so it DOES stream at ~83% residency, not "nearly fully resident"; 3.449 GB/token, since the shared expert is fp8 and resident, not FP4 and streamed; the partial fp8 KV act_quant is mandatory, not a --kv-fp8 to refuse (that flag does not exist); YaRN is per-layer, keyed to compress_ratio. DSpark/MTP is separable and out of scope.
 ---
 
 # DeepSeek-V4-Flash-0731 → first decode, first benchmark
@@ -34,8 +34,22 @@ Measured from all 72,317 safetensors headers (2026-08-04):
 | KV compressor | 0.53 GB · indexer 0.28 · mHC 0.14 · router 0.11 |
 | **total** | **166.88 GB** |
 
-One routed expert (w1+w2+w3 incl. scales) is **13.37 MB**; top-6 + 1 shared × 43 layers =
-**4.02 GB/token**.
+One routed expert (w1+w2+w3 incl. scales) is **13.37 MB**; top-6 × 43 layers = **3.449
+GB/token** of stream traffic.
+
+> **CORRECTED 2026-08-05, by S1a and S1b independently.** This said **4.02 GB/token**, and
+> the row above lumped the shared expert in with the routed ones. Both errors are the same
+> mistake: the shared expert is **not FP4 and not streamed**. On disk
+> `shared_experts.w1.weight` is `F8_E4M3[2048,4096]` with `F8_E8M0[16,32]` scales — fp8 at
+> 128×128 blocking, **25.17 MB**, because `MoE.__init__` passes `expert_dtype` only to the
+> *routed* experts. It is resident, so it is not per-token traffic at all. The old figure
+> counted it at the routed expert's 13.37 MB *and* as streamed. Residency is unchanged
+> (~84% at `--max-mem` 115); the artifact total (148.25 GB = 147.17 routed + 1.08 shared)
+> was reproduced exactly from S1a's converted artifact rather than from the index.
+>
+> Consequence for `.f4`: the container holds `n_experts` blocks and **no shared block**,
+> unlike `.vq3`/`.i4`. A block past that boundary would be the wrong *arithmetic*, not
+> merely the wrong bytes.
 
 ### Three corrections that change the work
 
@@ -44,7 +58,8 @@ One routed expert (w1+w2+w3 incl. scales) is **13.37 MB**; top-6 + 1 shared × 4
    is the **int3-vq** figure, and §6 then decided to keep **native FP4**. At the format
    actually chosen the experts are **148.25 GB = 138.1 GiB**, which does *not* fit the pool:
    ~83% capacity residency, against GLM's ~41%. It streams — less than GLM, but it streams.
-   Per-token traffic is **4.02 GB, not 3.1**. The two sections were computed at different
+   Per-token traffic is **3.449 GB, not 3.1** (see the correction above; this first said
+   4.02). The two sections were computed at different
    bitrates and never reconciled.
 
 2. **`--kv-fp8` is not simply "refuse".** The reference *deliberately* fp8-quantizes the KV
@@ -139,7 +154,11 @@ separate silent-wrong risk:
 - Grouped low-rank output: `o.view(b, s, 8, -1)`, einsum against
   `wo_a.view(8, 1024, -1)`, then `wo_b`.
 - Per-layer YaRN/theta selection (§0.3), and the `Compressor`/`Indexer` pair
-  (`Indexer` exists **only** where `compress_ratio == 4`, which is why 21 of 41 have one).
+  (`Indexer` exists **only** where `compress_ratio == 4`: 41 layers carry a compressor, 21
+  of them an indexer. **`compress_ratios` has 46 entries for 43 layers** — the trailing
+  three are the MTP blocks — and the ratio-4 indices are `[2,4,…,42]`, so the **last layer
+  is ratio-4, not the ratio-0 tail the shape suggests**. S1b's first cut had 40 alternating
+  entries and silently lost layer 42's compressor and indexer.)
 - `Block.hc_pre`/`hc_post` (mHC, 4 streams, 20 Sinkhorn iters) and `Gate`'s hash path for
   `layer_id < 3` (`tid2eid`, selection bypasses the scores; the gate still produces weights).
 - `Expert.forward` with `swiglu_limit = 10.0`.
@@ -157,11 +176,58 @@ layer (with indexer) and a ratio-128 layer (without), and say which is which.
 
 ---
 
-## S2 — attention frontend on GPU. Gated against S1b. GPU required.
-## S3 — mHC + hash routing + clamped SwiGLU + the FP4 MoE kernel. Gated against S1b.
-## S4 — first decode, benchmark, quality assessment, ranked perf work.
+## S1 — LANDED 2026-08-05 (`3d32071`)
 
-Scoped after S1 reports. S4's quality assessment ranks on **paired dNLL from `bin/ppl`**, not
+S1a: `ModelConfig` and `V4Config` are **separate types** refusing each other by name before
+serde reads a dimension, so the five GLM-only fields stay *required* and no zero-filled
+`ModelConfig` is constructible. `.f4` repack proved at **768 experts, 0 of 10,267,668,480
+bytes differing**. Artifact for layers 0–2 at `/var/db/rivoli/v4-f4-l0-2`.
+
+S1b: `src/v4oracle/` — **137 float + 18 int goldens** over a ratio-0, a ratio-4 and a
+ratio-128 layer, from the real checkpoint. 27 tests. Its five *measured* blind spots and the
+`.compress_idxs`-is-order-not-set warning are in the module docs; read them before trusting
+a comparison.
+
+Union clippy is clean for the first time since `9182ffc`/`6859e61`.
+
+## S2 — the kernels. Three streams, gated against S1b's goldens.
+
+**None of these touch `src/gpu.rs`'s layer loop.** Each delivers kernels plus a host harness
+that scores them against the oracle, in the shape `tests/kernel.rs` already uses. Wiring the
+layer loop is S3, deliberately: three agents editing the decode loop in parallel produces a
+merge nobody can review, and a kernel that cannot be scored without the full forward pass is
+a kernel whose first failure is a whole wrong model.
+
+- **S2a — the MoE half.** `dot_f4` (e2m1 nibbles + e8m0 group-32 scales) and the
+  `moe_gateup_f4`/`moe_down_f4` pair, **clamped** SwiGLU (`swiglu_limit = 10.0`), hash
+  routing for layers 0–2 (`tid2eid`, `I64[129280,6]`; selection bypasses the scores, the
+  gate still produces the *weights*), and mHC (`hc_pre`/`hc_post`, 4 streams, 20 Sinkhorn
+  iterations). Note the shared expert is **fp8, not FP4** — a different kernel, already in
+  the tree.
+- **S2b — attention core.** MQA with one 512-d shared K=V entry for all 64 heads: the
+  weightless QK-norm, RoPE on the last 64 dims with **adjacent-pair** complex packing (NOT
+  rivoli's half-split — S1b flagged this), the partial `act_quant` on kv dims [0:448) at
+  block 64, the KV ring, `attn_sink` in the denominator only, the output **de-rotation**,
+  and the grouped `wo_a`/`wo_b`. Scoreable against the ratio-0 layers alone, which need no
+  compressor.
+- **S2c — compressor and indexer.** Both `Compressor` branches including
+  `overlap_transform`, the `Indexer` (ratio-4 layers only), the two per-layer `freqs_cis`
+  tables, and the window/compress top-k index generation. Scored on the ratio-4 and
+  ratio-128 goldens.
+
+**DECIDED 2026-08-05 — `wo_a` is bf16 in S2, not fp8.** It ships fp8+scale on disk, but
+`convert.py` dequantizes it and `Attention.forward` does a **bf16 einsum** with no activation
+quantization. An fp8 GEMV there would be faster and would *not* match the oracle bit-for-bit
+— which would put an unexplained delta into every attention comparison S2b makes, so a real
+bug and the format choice become indistinguishable at exactly the moment that distinction
+matters most. Match the reference now; re-open fp8 in S4 as a **measured** perf lever with
+the oracle available to price its error. This is the same discipline as not ranking on
+free-running tok/s: do not let two variables move at once.
+
+## S3 — wire the layer loop, first decode.
+## S4 — benchmark, quality assessment, ranked perf work.
+
+Scoped after S2 reports. S4's quality assessment ranks on **paired dNLL from `bin/ppl`**, not
 on a PPL point estimate and never on free-running tok/s — and note that at 5k tokens this
 engine has a ~40% silent-corruption rate on GLM (`benchmarks.md`, "Long runs are
 NON-DETERMINISTIC"), so **every arm gets repeated** before any number is quotable.
