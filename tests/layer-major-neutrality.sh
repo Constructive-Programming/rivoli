@@ -42,8 +42,13 @@ BIN=./target/release/rivoli
 # Overridable because a lock path can only be changed EVERYWHERE AT ONCE. Two cohorts on
 # two paths are not serialised against each other at all — they are two GPU tenants that
 # both believe they hold the mutex, which is strictly worse than no lock, since no lock at
-# least makes people careful. While any consumer is still on the old path, run this with
-# `RIVOLI_GPU_LOCK=/tmp/rivoli-gpu.lock` to stay in their queue.
+# least makes people careful.
+#
+# The 2026-08-02 move off `/tmp/rivoli-gpu.lock` is COMPLETE — every consumer in this repo
+# and llama-swap on rh-anine are all on `/var/run/sys-gpu.lock` (docs/reference/gpu-lock.md).
+# This line used to say "run with RIVOLI_GPU_LOCK=/tmp/rivoli-gpu.lock to stay in their
+# queue"; following that today would put you in a queue of one and create exactly the split
+# the paragraph above warns about. The override stays for the NEXT such migration.
 GPU_LOCK=${RIVOLI_GPU_LOCK:-/var/run/sys-gpu.lock}
 NGEN=${RIVOLI_NGEN:-8}
 LOW_TOPK=${RIVOLI_LOW_TOPK:-64}
