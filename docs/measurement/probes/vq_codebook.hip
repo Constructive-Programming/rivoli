@@ -37,11 +37,9 @@
 //                   gather is not the wall and item #2's benefit (i) is worth zero — no
 //                   value of K can beat K=256.
 //
-// Two 11-bit unpacks are offered because the difference between them is the whole cost:
-//   b11  — three scalar byte loads (the conservative form).
-//   b11w — one unaligned 4-byte load. Cheaper, but it reads up to 3 bytes past the last
-//          index of a projection, so the real format would have to pad. The slab here is
-//          over-allocated to make that safe.
+// A dword-load variant of the 11-bit unpack was measured and REMOVED: 1.029x against the
+// three-byte form's 1.022x, i.e. the cost is the lost strength-reducible shift, not the
+// extra byte load. benchmarks.md carries that; it does not need re-running.
 //
 // R=1 only. The row batch (`nrow=2`, speculative verify) amortizes the SAME gather over
 // more x rows, so it can only dilute a codebook effect, never create one; measuring the
@@ -83,7 +81,7 @@ __device__ __forceinline__ float bf16f(unsigned short b) {
 __device__ __forceinline__ float siluf(float x) { return x / (1.0f + expf(-x)); }
 
 // ── the two axes under test ───────────────────────────────────────────────────────────
-enum Unpack { U12, U11, U11W };
+enum Unpack { U12, U11 };
 
 // Index `t` of a packed row. U12 is byte-for-byte the shipping expression in
 // common.hpp::dot_vq_wave_r; the two U11 forms are the real 11-bit unpack, not a
@@ -102,10 +100,6 @@ __device__ __forceinline__ int vq_idx(const unsigned char* __restrict__ row, int
         // 11 bits from shift ∈ {0..7} ends at bit 17 → 3 bytes.
         unsigned int raw = (unsigned int)row[byte] | ((unsigned int)row[byte + 1] << 8) |
                            ((unsigned int)row[byte + 2] << 16);
-        return (int)((raw >> shift) & mask);
-    } else {
-        unsigned int raw;
-        __builtin_memcpy(&raw, row + byte, 4);  // unaligned dword; over-reads by ≤3 bytes
         return (int)((raw >> shift) & mask);
     }
 }
@@ -234,11 +228,10 @@ static unsigned rnd() {
 }
 
 // The result of one arm, so the table can be printed after every arm has run and the
-// baseline is known. gpu_us is the honest number; bytes is the arm's OWN traffic.
+// baseline is known.
 struct Row {
     const char* name;
     double gateup_us, down_us;
-    size_t bytes;
 };
 
 int main() {
@@ -252,7 +245,8 @@ int main() {
            100.0 * (1.0 - (double)expert_bytes(11) / (double)expert_bytes(12)));
 
     // ONE slab at the widest stride; each arm lays its experts out at its OWN stride, so
-    // the 11-bit arms genuinely touch fewer bytes. +64 B of slack covers U11W's over-read.
+    // the 11-bit arms genuinely touch fewer bytes. +64 B of slack covers the 11-bit unpack's
+    // 3-byte read at the slab's last index.
     size_t slab = expert_bytes(12) * NDESC + 64;
     unsigned char* hw = (unsigned char*)malloc(slab);
     for (size_t i = 0; i < slab; ++i) hw[i] = (unsigned char)rnd();
@@ -324,7 +318,7 @@ int main() {
     dim3 ga(((size_t)NDESC * INTER + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK), gb(256);
     dim3 gd(((size_t)NDESC * HIDDEN + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
 
-    Row rows[8];
+    Row rows[7];
     int nrows = 0;
 
     // One arm: warm up, then time the two kernels SEPARATELY, because they have different
@@ -348,12 +342,10 @@ int main() {
         CHK(hipEventRecord(e1, 0));
         CHK(hipDeviceSynchronize());
         CHK(hipEventElapsedTime(&ms_dn, e0, e1));
-        Row r = {name, ms_gu * 1000.0 / ITERS, ms_dn * 1000.0 / ITERS,
-                 expert_bytes(bits) * NDESC};
+        Row r = {name, ms_gu * 1000.0 / ITERS, ms_dn * 1000.0 / ITERS};
         rows[nrows++] = r;
-        printf("%-16s gateup %8.1f us   down %8.1f us   total %8.1f us   %6.1f GB/s\n", r.name,
-               r.gateup_us, r.down_us, r.gateup_us + r.down_us,
-               r.bytes / ((r.gateup_us + r.down_us) * 1e-6) / 1e9);
+        printf("%-16s gateup %8.1f us   down %8.1f us   total %8.1f us\n", r.name, r.gateup_us,
+               r.down_us, r.gateup_us + r.down_us);
         fflush(stdout);
     };
 
@@ -377,7 +369,6 @@ int main() {
     ARM("k4096_b12_f32", 12, U12, true, 4096);    // calibration: 64 KiB, pre-fp16
     ARM("k2048_b12_f16", 12, U12, false, 2048);   // benefit (i) alone
     ARM("k2048_b11_f16", 11, U11, false, 2048);   // the proposal, 3-byte unpack
-    ARM("k2048_b11w_f16", 11, U11W, false, 2048); // the proposal, dword unpack
     ARM("k4096_b11_f16", 11, U11, false, 4096);   // unpack cost alone
     ARM("k256_b12_f16", 12, U12, false, 256);     // asymptote: 2 KiB, cannot miss L1
 #undef ARM
@@ -408,23 +399,10 @@ int main() {
         });
 
     double base = rows[0].gateup_us + rows[0].down_us;
-    printf("\n%-16s %10s %10s %10s\n", "arm", "total us", "vs today", "GB/s");
+    printf("\n%-16s %10s %10s\n", "arm", "total us", "vs today");
     for (int i = 0; i < nrows; ++i) {
         double t = rows[i].gateup_us + rows[i].down_us;
-        printf("%-16s %10.1f %9.3fx %10.1f\n", rows[i].name, t, base / t,
-               rows[i].bytes / (t * 1e-6) / 1e9);
+        printf("%-16s %10.1f %9.3fx\n", rows[i].name, t, base / t);
     }
-    printf(
-        "\nREAD THIS ORDER:\n"
-        "  1. k4096_b12_f32 must be SLOWER than k4096_b12_f16. If it is not, the probe is\n"
-        "     insensitive to codebook size and every null below is meaningless.\n"
-        "  2. k256_b12_f16 is the ceiling on benefit (i). If it does not beat today, no K\n"
-        "     does, and the 'L1-resident' half of item #2 is worth zero.\n"
-        "  3. k4096_b11_f16 vs today is the 11-bit unpack's cost, paid in the same inner\n"
-        "     loop the codebook shrink is supposed to speed up.\n"
-        "  4. NOTE the GB/s column: 9 experts are re-read from the same slab every\n"
-        "     iteration, so this is cache-warm relative to the engine, which streams\n"
-        "     distinct experts from NVMe. Compare arms to each other, never to the\n"
-        "     in-engine moe bucket.\n");
     return 0;
 }

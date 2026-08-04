@@ -2683,6 +2683,11 @@ two 16 KiB tables occupy, and buys 1.6% where the two tables buy 26%. So the eff
 span each gather *stream* ranges over, knee between 16 and 32 KiB. There is no rocprof on this
 box; that is eight consistent arms, not a hardware counter.
 
+**`k2048_b11w_f16` was REMOVED from the probe on 2026-08-04, after this table.** Its whole
+job was to separate "the extra byte load" from "the lost shift pattern", and 1.029× against
+`k2048_b11_f16`'s 1.022× settles that. The number above stands as measured; the arm is gone
+because re-running it can only reproduce it.
+
 **The saving is 7.7%, not the 8.3% the bit ratio suggests** — the bf16 group scales do not
 shrink. Expert block 15.34 → 14.16 MB.
 

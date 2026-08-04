@@ -78,48 +78,26 @@ verdict: The ranked performance roadmap, re-scored 2026-08-04 on recurring cost 
 | 11 | Better cache policy (residency / hit rate) | B | ceiling **8.6 ms/tok (2.4%)** at 115 GiB — and that is Belady's, not a reachable one | — | **closed as negative 2026-08-02 AT 115 GiB — still live at 61**; see below |
 
 > **Item 2 was probed 2026-08-04 and it is TWO products at one quality price, not one item.**
-> `docs/measurement/probes/vq_codebook.hip` (real dims 6144/2048, 9 experts, R=1, real 11-bit
-> unpack, median of 3) and `examples/vq_k_probe.rs` (real fp8 weights, 2^20-subvector sample,
-> both codebooks from the same sample, scored on **held-out** experts).
->
-> | variant | recurring win | format cost |
-> |---|---|---|
-> | **12-bit container, K=2048** | MoE kernels **1.189×** (`gateup` 934→741 µs, `down` 462→411 µs); compute floor 117 → ~99 ms | **none** — only the codebook and encoder move |
-> | **11-bit container, K=2048** | 7.7% fewer bytes/token (2.25→2.08 GB); transfer 181 → 167 ms | index packing changes |
->
-> **The two halves of the original item fight each other, which is the finding.** The 16 KiB
-> codebook alone is worth 1.189×. Adding the 11-bit packing — the half that actually buys the
-> bytes — collapses it to **1.022×**, *while* reading 7.7% fewer bytes. A 12-bit index never
-> spans more than 2 bytes (`shift ∈ {0,4}`, strength-reducible); an 11-bit index starting at
-> bit 7 spans 3. A dword-load variant behaves identically (1.029×), so it is the loss of the
-> shift pattern, not the extra byte load. Calibration arms: `k4096_b12_f32` (64 KiB) is
-> **0.739×**, `k256_b12_f16` is 1.178× — so the probe is size-sensitive and **K=2048 already
-> captures the whole asymptote**. `shared_gu_k4096` (one codebook for gate+up, 64→32 KiB
-> aggregate) buys only 1.6%, which refutes the aggregate-footprint story: the effect keys on
-> the span each gather *stream* ranges over, knee between 16 and 32 KiB. No rocprof on this
-> box, so that mechanism is inference from eight consistent arms, not a counter reading.
->
-> **Quality is on the rate-distortion frontier, and that is the real cost.** Held-out mean
-> relFrob 0.15509 (K=4096) → 0.18407 (K=2048) = **+18.68%**; high-rate VQ theory for `d=4`
-> predicts `2^0.25` = **+18.92%** for halving K. Spread across 3 projections × 3 experts is
-> under 0.2%. There is no structural slack to recover — an independent arrival at
+> **12-bit K=2048** is **1.189×** on the MoE kernels for *no format change* (compute floor 117
+> → ~99 ms); **11-bit K=2048** is 7.7% fewer bytes (transfer 181 → 167 ms) but hands the kernel
+> win back at 1.022×, because an 11-bit index loses the strength-reducible `shift ∈ {0,4}`.
+> Both cost **+18.68%** held-out relFrob, against high-rate VQ theory's +18.92% for halving K
+> at `d=4` — the codebook is already on the rate-distortion frontier, an independent arrival at
 > [`codebook-rotation.md`](../investigations/codebook-rotation.md)'s "int3-vq is rate-limited".
-> int4 anchors at 0.11858. Extrapolated against the 5.120/5.275 ladder that is ~+0.024 nats,
-> ~2.4× the 0.00995 bar, **on the rung that is already worst of three**.
+> Extrapolated: ~+0.024 nats, ~2.4× the bar, on the rung already worst of three.
+>
+> Full arm table, calibration arms, the mechanism, and the joint-codebook result are in
+> [`benchmarks.md`](benchmarks.md), "VQ_K=2048"; the instruments are
+> `docs/measurement/probes/vq_codebook.hip` and `examples/vq_k_probe.rs`.
 >
 > **Why this row is NOT closed.** The first recommendation was NO-GO, and half its reasoning
 > was the retired axis above — "the 1.189× is spent on slack the fetch already covers." Under
-> the corrected scoring the 12-bit variant costs *nothing but the requant and the quality*,
-> and the requant amortizes. So the decision now rests **entirely on quality**, and
-> +18.68% relFrob is a **screen** extrapolated across two quantizer families — adequate to
-> reject a ~0-benefit row, not adequate to reject this one. **Settle it with a real paired
-> dNLL after a requant**, and repeat every arm: ~40% of 5k-token runs are silently corrupted
-> (see the warning under item 5).
->
-> Also measured and worth recording: sharing one codebook between gate and up is
-> **quality-free** (0.15511/0.15510 vs 0.15512/0.15501 separate), matching
-> `codebook-rotation.md`'s cross-layer result — but the kernel pays only 1.016× for it, so
-> there is no reason to do it.
+> the corrected scoring the 12-bit variant costs *nothing but the requant and the quality*, and
+> the requant amortizes. The decision now rests **entirely on quality**, where the only
+> evidence is a **screen** extrapolated across two quantizer families — adequate to reject a
+> ~0-benefit row, not adequate to reject this one. **Settle it with a real paired dNLL after a
+> requant**, and repeat every arm: ~40% of 5k-token runs are silently corrupted (see the
+> warning under item 5).
 
 > **Item 8 is a closed door, and it is worth knowing which door.** The demand fetch runs at
 > ~10 GB/s; `docs/measurement/probes/fetch_batch.hip` reproduces the engine's exact shape (pinned bounce

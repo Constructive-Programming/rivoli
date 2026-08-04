@@ -11,7 +11,7 @@
 //! distributions and therefore separate codebooks):
 //!
 //!   1. Builds the codebook sample EXACTLY as `bin/convert` does — one routed expert per
-//!      MoE layer, `sample_subvectors` at the stride that lands on `--sample-target`.
+//!      MoE layer, `sample_subvectors` at the stride that lands on `SAMPLE_TARGET`.
 //!   2. Fits BOTH codebooks from that ONE sample with `learn_codebook_k`, same iteration
 //!      cap, same RNG stream. Fitting them by two different procedures would measure the
 //!      procedures.
@@ -37,8 +37,8 @@
 
 use rivoli::artifact::format::Safetensors;
 use rivoli::artifact::quant::{
-    VQ_DIM, VQ_K, dequant_i4, expert_projs, learn_codebook_k, quant_i4, quant_vq,
-    sample_subvectors, vq_decode_proj, VqProj,
+    VQ_DIM, VQ_K, VqProj, dequant_i4, expert_projs, learn_codebook_k, quant_i4, quant_vq,
+    sample_subvectors, vq_decode_proj,
 };
 
 /// GLM-5.2, from the fp8 `config.json`. Hardcoded rather than parsed: this probe is
@@ -56,75 +56,32 @@ const FP8_BLOCK: usize = 128;
 /// 2.75 bpw (the proposal). Both must be ≤ `VQ_K` for the padding trick to work.
 const KS: [usize; 2] = [4096, 2048];
 
-struct Args {
-    fp8_dir: String,
-    sample_target: usize,
-    iters: usize,
-    /// Rows of each held-out matrix to encode. `quant_vq` is O(rows · i_dim/4 · K · 4)
-    /// and single-threaded per call, so this is the run-time dial; it is sharded across
-    /// cores below. 256 rows of gate is ~1.6e9 distance evaluations per K.
-    eval_rows: usize,
-    /// How many held-out (layer, expert) pairs to average over.
-    eval_experts: usize,
-    /// Also fit ONE K=4096 codebook over gate and up together and score both against it.
-    ///
-    /// Not part of the K question. It prices the alternative Probe A's `shared_gu_k4096`
-    /// arm measures on the kernel side: `moe_gateup_vq` gathers through gate's AND up's
-    /// codebooks at once, so sharing them halves that kernel's codebook working set
-    /// WITHOUT cutting the rate. The rate stays 3.00 bpw and every number here is
-    /// comparable to the K=4096 rows above, so the cost of sharing is the whole answer.
-    joint: bool,
-}
+/// 2^20 subvectors is what `convert` fits the shipped codebooks on, so the K=4096 arm is
+/// the shipped rate at the shipped sample size — 256 points per centroid. **Not a knob:**
+/// anything smaller flatters K=2048 by starving K=4096, which is the one way to get a
+/// wrong answer out of this probe.
+const SAMPLE_TARGET: usize = 1 << 20;
+/// k-means iteration cap, matching `convert`.
+const ITERS: usize = 40;
+/// Rows of each held-out matrix to encode. `quant_vq` is O(rows · i_dim/4 · K · 4) and
+/// single-threaded per call, so this is the run-time dial; it is sharded across cores
+/// below. 256 rows of gate is ~1.6e9 distance evaluations per K.
+const EVAL_ROWS: usize = 256;
+/// How many held-out (layer, expert) pairs to average over.
+const EVAL_EXPERTS: usize = 3;
 
-fn args() -> Args {
-    let a: Vec<String> = std::env::args().collect();
-    let get = |name: &str, default: usize| -> usize {
-        a.iter()
-            .position(|x| x == name)
-            .and_then(|i| a.get(i + 1))
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(default)
-    };
-    Args {
-        fp8_dir: a
-            .get(1)
-            .filter(|s| !s.starts_with('-'))
-            .cloned()
-            .unwrap_or_else(|| "/swarm/storage/ai/openclaw/glm52-fp8".into()),
-        // 2^20 subvectors is what `convert` fits the shipped codebooks on, so the K=4096
-        // arm here is the shipped rate at the shipped sample size — 256 points per
-        // centroid. Anything smaller would flatter K=2048 by starving K=4096.
-        sample_target: get("--sample-target", 1 << 20),
-        iters: get("--iters", 40),
-        eval_rows: get("--eval-rows", 256),
-        eval_experts: get("--eval-experts", 3),
-        joint: a.iter().any(|x| x == "--joint"),
-    }
-}
+/// A quantize-then-dequantize round trip, `(w, rows, i_dim) → ŵ`. The int4 anchor and the
+/// VQ arms differ *only* in this, which is what lets them share one eval path.
+type Roundtrip<'a> = dyn Fn(&[f32], usize, usize) -> Vec<f32> + 'a;
 
-/// `‖W − Ŵ‖_F / ‖W‖_F` and the mean per-row relative error. Frobenius is the aggregate
-/// the rate-distortion argument is about; the row mean is reported beside it because a
-/// projection whose error concentrates in a few rows and one that spreads it evenly have
-/// the same Frobenius and very different downstream behaviour (that concentration is
-/// exactly what killed per-row int4 scales — see `quant.rs`'s int4 module comment).
-fn err(w: &[f32], wh: &[f32], i_dim: usize) -> (f64, f64) {
+/// `‖W − Ŵ‖_F / ‖W‖_F`, the aggregate the rate-distortion argument is about.
+fn rel_frob(w: &[f32], wh: &[f32]) -> f64 {
     let (mut num, mut den) = (0.0f64, 0.0f64);
-    let mut rows = 0.0f64;
-    let mut nrow = 0usize;
-    for (a, b) in w.chunks_exact(i_dim).zip(wh.chunks_exact(i_dim)) {
-        let (mut rn, mut rd) = (0.0f64, 0.0f64);
-        for (&x, &y) in a.iter().zip(b) {
-            rn += f64::from(x - y) * f64::from(x - y);
-            rd += f64::from(x) * f64::from(x);
-        }
-        num += rn;
-        den += rd;
-        if rd > 0.0 {
-            rows += (rn / rd).sqrt();
-            nrow += 1;
-        }
+    for (&x, &y) in w.iter().zip(wh) {
+        num += f64::from(x - y) * f64::from(x - y);
+        den += f64::from(x) * f64::from(x);
     }
-    ((num / den).sqrt(), rows / nrow.max(1) as f64)
+    (num / den).sqrt()
 }
 
 /// `quant_vq` over `o_dim` rows, sharded across cores. Row-independent by construction —
@@ -175,8 +132,10 @@ fn pad(cb: &[f32]) -> Vec<f32> {
 }
 
 fn main() {
-    let a = args();
-    let src = Safetensors::open_dir(&a.fp8_dir).expect("open fp8 dir");
+    let fp8_dir = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/swarm/storage/ai/openclaw/glm52-fp8".into());
+    let src = Safetensors::open_dir(&fp8_dir).expect("open fp8 dir");
     let deq = |base: &str, proj: &str, o: usize, i: usize| -> Vec<f32> {
         src.dequant_fp8(&format!("{base}.{proj}"), o, i, FP8_BLOCK)
             .expect("dequant fp8")
@@ -184,51 +143,43 @@ fn main() {
     // `convert`'s sample layers: every MoE layer, one expert each, expert index = layer.
     let layers: Vec<usize> = (DENSE_LAYERS..N_LAYERS).collect();
     let per_expert = INTER * HIDDEN / VQ_DIM;
-    let stride = (layers.len() * per_expert / a.sample_target).max(1);
+    let stride = (layers.len() * per_expert / SAMPLE_TARGET).max(1);
     println!(
-        "fp8={}  sample: {} layers x 1 expert, stride {stride}  iters={}  \
-         eval: {} rows x {} held-out experts",
-        a.fp8_dir,
-        layers.len(),
-        a.iters,
-        a.eval_rows,
-        a.eval_experts
+        "fp8={fp8_dir}  sample: {} layers x 1 expert, stride {stride}  iters={ITERS}  \
+         eval: {EVAL_ROWS} rows x {EVAL_EXPERTS} held-out experts",
+        layers.len()
     );
     println!("K under test: {KS:?}  (12-bit=3.00bpw vs 11-bit=2.75bpw for the indices)\n");
 
     // Held-out (layer, expert) pairs, spread across the depth. The sample uses expert `l`
     // of layer `l`, so `l + 128 mod 256` is disjoint from it in every layer.
-    let picks: Vec<usize> = (0..a.eval_experts)
-        .map(|j| layers[(j + 1) * layers.len() / (a.eval_experts + 1)])
+    let picks: Vec<usize> = (0..EVAL_EXPERTS)
+        .map(|j| layers[(j + 1) * layers.len() / (EVAL_EXPERTS + 1)])
         .collect();
 
-    // `convert`'s sample: one routed expert per MoE layer, appended at `stride`.
-    let sample_of = |proj: &str, o_dim: usize, i_dim: usize, stride: usize, out: &mut Vec<f32>| {
-        for &l in &layers {
-            let base = format!("model.layers.{l}.mlp.experts.{}", l % N_EXPERTS);
-            sample_subvectors(&deq(&base, proj, o_dim, i_dim), i_dim, stride, out);
-        }
-    };
-    // Mean (relFrob, rowmean) of `cb` over the held-out experts, on the first `eval_rows`
-    // rows of each. Same rows for every codebook, so only the codebook differs.
-    let eval_of = |proj: &str, o_dim: usize, i_dim: usize, cb: &[f32]| -> (f64, f64) {
-        let (mut f, mut r) = (0.0, 0.0);
+    // Mean relFrob of `quant` over the held-out experts, on the first `EVAL_ROWS` rows of
+    // each. Same rows for every quantizer, so only the quantizer differs — which is what
+    // lets the int4 anchor share this path with the VQ arms instead of re-deriving it.
+    let eval_of = |proj: &str, o_dim: usize, i_dim: usize, quant: &Roundtrip| -> f64 {
+        let mut f = 0.0;
         for &l in &picks {
             let base = format!("model.layers.{l}.mlp.experts.{}", (l + N_EXPERTS / 2) % N_EXPERTS);
             let full = deq(&base, proj, o_dim, i_dim);
-            let rows = a.eval_rows.min(o_dim);
+            let rows = EVAL_ROWS.min(o_dim);
             let w = &full[..rows * i_dim];
-            let (df, dr) = err(w, &quant_vq_par(w, rows, i_dim, cb), i_dim);
-            f += df;
-            r += dr;
+            f += rel_frob(w, &quant(w, rows, i_dim));
         }
-        (f / picks.len() as f64, r / picks.len() as f64)
+        f / picks.len() as f64
     };
 
     for (p, &(proj, (o_dim, i_dim))) in expert_projs(HIDDEN, INTER).iter().enumerate() {
         let t0 = std::time::Instant::now();
+        // `convert`'s sample: one routed expert per MoE layer, appended at `stride`.
         let mut sample = Vec::new();
-        sample_of(proj, o_dim, i_dim, stride, &mut sample);
+        for &l in &layers {
+            let base = format!("model.layers.{l}.mlp.experts.{}", l % N_EXPERTS);
+            sample_subvectors(&deq(&base, proj, o_dim, i_dim), i_dim, stride, &mut sample);
+        }
         let nsub = sample.len() / VQ_DIM;
         println!(
             "[{p}] {proj} ({o_dim}x{i_dim})  sample {nsub} subvectors in {:.1}s",
@@ -238,7 +189,7 @@ fn main() {
             .iter()
             .map(|&k| {
                 let t = std::time::Instant::now();
-                let cb = learn_codebook_k(&sample, a.iters, k);
+                let cb = learn_codebook_k(&sample, ITERS, k);
                 println!(
                     "     k-means K={k:<5} {:.1}s  ({:.0} points/centroid)",
                     t.elapsed().as_secs_f64(),
@@ -249,63 +200,28 @@ fn main() {
             .collect();
         drop(sample);
 
-        let scored: Vec<(usize, (f64, f64))> = cbs
+        let scored: Vec<(usize, f64)> = cbs
             .iter()
-            .map(|(k, cb)| (*k, eval_of(proj, o_dim, i_dim, cb)))
+            .map(|(k, cb)| (*k, eval_of(proj, o_dim, i_dim, &|w, r, i| quant_vq_par(w, r, i, cb))))
             .collect();
-        let base = scored[0].1.0;
+        let base = scored[0].1;
         println!("  -> {proj} mean over {} held-out experts:", picks.len());
-        for (k, (f, r)) in &scored {
+        for (k, f) in &scored {
             println!(
-                "       K={k:<5} relFrob {f:.5}  rowmean {r:.5}   ({:+.2}% vs K=4096)",
+                "       K={k:<5} relFrob {f:.5}   ({:+.2}% vs K=4096)",
                 (f / base - 1.0) * 100.0
             );
         }
         // int4 on the SAME rows. An error ratio is uninterpretable without a rung of known
         // PPL beside it: int4 = 5.120, int3-vq (K=4096) = 5.275, and those two points are
         // what turns "+18.7% relFrob" into a PPL guess at all.
-        let (mut fi, mut ri) = (0.0, 0.0);
-        for &l in &picks {
-            let base_n = format!("model.layers.{l}.mlp.experts.{}", (l + N_EXPERTS / 2) % N_EXPERTS);
-            let full = deq(&base_n, proj, o_dim, i_dim);
-            let rows = a.eval_rows.min(o_dim);
-            let w = &full[..rows * i_dim];
-            let (pk, sc) = quant_i4(w, rows, i_dim);
-            let (f, r) = err(w, &dequant_i4(&pk, &sc, rows, i_dim), i_dim);
-            fi += f / picks.len() as f64;
-            ri += r / picks.len() as f64;
-        }
+        let fi = eval_of(proj, o_dim, i_dim, &|w, r, i| {
+            let (pk, sc) = quant_i4(w, r, i);
+            dequant_i4(&pk, &sc, r, i)
+        });
         println!(
-            "       int4  relFrob {fi:.5}  rowmean {ri:.5}   ({:+.2}% vs K=4096)\n",
+            "       int4  relFrob {fi:.5}   ({:+.2}% vs K=4096)\n",
             (fi / base - 1.0) * 100.0
         );
-    }
-
-    if a.joint {
-        // ONE K=4096 codebook for gate AND up. Same rate (3.00 bpw), same 12-bit index,
-        // same entry count — the only change is that `moe_gateup_vq`'s two gathers hit one
-        // 32 KiB table instead of two, which is the working-set halving Probe A's
-        // `shared_gu_k4096` arm times. `stride` doubles so the pooled sample is the same
-        // 2^20 subvectors the separate fits got; a bigger sample here would be the joint
-        // arm winning on sample size rather than on shareability.
-        println!("[joint] one K=4096 codebook shared by gate_proj and up_proj");
-        let t0 = std::time::Instant::now();
-        let mut sample = Vec::new();
-        for &(proj, (o, i)) in &expert_projs(HIDDEN, INTER)[..2] {
-            sample_of(proj, o, i, stride * 2, &mut sample);
-        }
-        println!(
-            "     sample {} subvectors in {:.1}s",
-            sample.len() / VQ_DIM,
-            t0.elapsed().as_secs_f64()
-        );
-        let t = std::time::Instant::now();
-        let cb = pad(&learn_codebook_k(&sample, a.iters, 4096));
-        println!("     k-means K=4096 {:.1}s", t.elapsed().as_secs_f64());
-        for &(proj, (o, i)) in &expert_projs(HIDDEN, INTER)[..2] {
-            let (f, r) = eval_of(proj, o, i, &cb);
-            println!("       {proj:<10} shared-K=4096  relFrob {f:.5}  rowmean {r:.5}");
-        }
-        println!("     compare against the per-projection K=4096 rows above.");
     }
 }
