@@ -281,23 +281,18 @@ fn artifact_resolved_help(argv: &[String]) -> bool {
     // rather than for "the first non-flag" keeps this honest around flag VALUES: a
     // `--ppl-out /some/dir` would fool a positional-counting parse, and getting it wrong
     // silently renders help for the wrong model.
-    let manifest = argv[1..].iter().find_map(|a| {
+    //
+    // Resolution itself is `artifact::model::arch_of_artifact`, NOT re-derived here. This
+    // read the manifest and both key spellings inline until a review caught it: a second
+    // reader is a second thing to keep in step, and `arch.rs`'s header states the rule it
+    // was breaking — there is exactly one architecture discriminant in the tree and nobody
+    // re-derives it. jscpd could not see it because the two spellings differed.
+    let dir = argv[1..].iter().find(|a| {
         ["manifest.json", "config.json"]
             .iter()
-            .map(|f| std::path::Path::new(a).join(f))
-            .find(|p| p.is_file())
+            .any(|f| std::path::Path::new(a).join(f).is_file())
     });
-    let arch = manifest
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .and_then(|v| {
-            // `architectures[0]` is what both checkpoints carry; `model_type` is DeepSeek's
-            // second spelling of the same fact. Neither is universal, so try both.
-            let a = v["architectures"][0].as_str().map(str::to_owned);
-            a.or_else(|| v["model_type"].as_str().map(str::to_owned))
-        })
-        .and_then(|s| rivoli::arch::Arch::from_manifest_str(&s));
-    let Some(arch) = arch else {
+    let Some(arch) = dir.and_then(|d| rivoli::artifact::model::arch_of_artifact(d).ok()) else {
         return false; // clap's generic help, which is the right answer when we know nothing
     };
 

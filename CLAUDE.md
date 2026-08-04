@@ -55,7 +55,7 @@ change that touches `telemetry.rs`, `eval.rs`, `gpu.rs` or a `ProfileSummary` fi
 
 **Duplication is a build error.** `build.rs` runs `jscpd --min-tokens 15` over `src/`,
 `tests/` and itself on every build and panics on any clone; `.jscpd.json` carries no
-`threshold`, so there is no budget. Seven regions are exempt via `jscpd:ignore-start`, each
+`threshold`, so there is no budget. Twelve regions are exempt via `jscpd:ignore-start`, each
 carrying its argument in place — the two backends' ABI walls, `math.rs`'s frozen
 `route_into_pre` oracle, and `glsl_numerics.rs`'s transliterations. Being a verbatim copy
 is the POINT in all three; everywhere else, factor it. jscpd is skipped with a warning if

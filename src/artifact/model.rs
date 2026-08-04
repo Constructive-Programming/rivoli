@@ -440,20 +440,24 @@ pub struct V4Config {
     // jscpd:ignore-start — the four MoE serde renames, which coincide with `ModelConfig`'s
     // because both architectures declare these under the SAME JSON names.
     //
-    // This one is a COST exemption, not a "the copy is the point" one, and it should be
-    // collapsed. The honest fix is a shared `#[serde(flatten)]` struct holding exactly
-    // these four — they carry the same meaning in both architectures and neither wants a
-    // default on any of them. What blocks it is that flattening nests `ModelConfig`'s
-    // fields, so every `cfg.n_experts` in gpu.rs/pin.rs/main.rs/bin becomes
-    // `cfg.moe.n_experts`; S1a is forbidden from touching gpu.rs while S1b holds it.
+    // The copy is the point, for the same reason this module keeps two separate serde
+    // declarations at all (see the module header): the two architectures agreeing on four
+    // JSON names today is a coincidence of the checkpoints, not a shared contract, and a
+    // shared struct would become the attractor for a fifth field that is NOT shared.
+    //
+    // PRICED, and rejected on the arithmetic rather than on scope. `#[serde(flatten)]` on
+    // both sides nests `ModelConfig`'s public fields, so every `cfg.n_experts` /
+    // `.top_k` / `.moe_inter` / `.n_shared` becomes `cfg.moe.*` — ~100 call sites across
+    // gpu.rs, pin.rs, format.rs, convert.rs, main.rs, i4_audit.rs and the tests — to
+    // delete FOUR LINES of serde attribute. This is a cost exemption and the tree has
+    // precedent for those: `gpu.rs:20` exempts the launcher import list because a glob
+    // import would cost the compile-time check that every name exists.
     //
     // What must NOT be shared, and is not: the fields around them. `ModelConfig` gives
     // `norm_topk_prob` and `scoring_func` `#[serde(default)]` because GLM snapshots predate
     // them; on V4 a missing `scoring_func` or `swiglu_limit` is silent-wrong arithmetic,
     // not an old file, so both are required here.
     //
-    // ponytail: collapse into a shared MoE-dims struct when the multi-model branch is free
-    // to move `ModelConfig`'s call sites.
     // --- MoE ---
     #[serde(rename = "n_routed_experts")]
     pub n_experts: usize,
