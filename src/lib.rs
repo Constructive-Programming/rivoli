@@ -18,6 +18,21 @@ pub mod arch;
 pub mod attn;
 pub mod indexer;
 pub mod math;
+
+/// The DeepSeek-V4-Flash numerical oracle (S1b of `docs/investigations/v4-flash-port.md`).
+///
+/// Backend-independent and engine-independent by construction: it imports nothing from
+/// `gpu`, `attn`, `math` or `artifact`, because an oracle that shares code with the
+/// implementation it judges is blind to any bug they share.
+///
+/// **Ungated, unlike `eval` and the pred-probe.** Those are gated because they put work on
+/// the per-token decode path; this has no runtime surface at all — nothing in a decode
+/// reaches it — so a feature would buy only build time. And it would cost something real:
+/// a feature-gated module here is compiled exactly as often as someone remembers to name
+/// its feature, which is how `otlp` sat broken on an `E0609` for weeks (CLAUDE.md). The
+/// oracle is what S2 and S3 are scored against; it must not be the thing that silently
+/// stopped compiling.
+pub mod v4oracle;
 pub mod telemetry;
 pub mod watchdog;
 
