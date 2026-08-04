@@ -1,6 +1,6 @@
 ---
 status: live
-verdict: The ranked performance roadmap. Live rows: #2 VQ_K codebook, #10 general-R MoE kernels. #5 DONE 2026-08-02 (HB 8→16, 2.08x kernel, −3.2 ms/tok, gated). #11 (cache policy) closed negative at 115 GiB — Belady's own ceiling is 8.6 ms/tok — but still live at 61.
+verdict: The ranked performance roadmap, re-scored 2026-08-04 on recurring cost rather than wall at today's bottleneck. Live rows: #2 VQ_K=2048 (1.189x MoE kernels at 12-bit, +18.7% relFrob, needs a real dNLL gate), #10 general-R MoE kernels. #5 DONE 2026-08-02 (HB 8→16, 2.08x kernel, −3.2 ms/tok, gated). #8 and #11 stay closed on complexity and quality — NOT on "bytes stop buying anything below the floor", which was the wrong axis.
 ---
 
 # rivoli — the ranked performance roadmap
@@ -9,13 +9,36 @@ verdict: The ranked performance roadmap. Live rows: #2 VQ_K codebook, #10 genera
 > [`investigations/perf-evidence.md`](../investigations/perf-evidence.md); method is in
 > [`how-to-measure.md`](how-to-measure.md).
 
+## How rows are scored — CORRECTED 2026-08-04
+
+> Rows #2, #8 and #11 were each closed or discounted with arithmetic of the form *"this win
+> hides behind the other bottleneck, so it buys ~0 ms of wall."* **That is the wrong axis,
+> and it was used three times.**
+>
+> A win that does not move `max(transfer, compute)` still removes work that runs **on every
+> token, forever**: GPU busy time is energy and thermal headroom on a unified-memory part,
+> and bytes not fetched are NVMe reads not performed. Meanwhile the costs those rows were
+> weighed against — a requant, a rebuild, a format migration — are paid **once**, against
+> millions of decodes. They amortize to ~0.
+>
+> So score a row on **recurring cost** (ms, joules, bytes/token) and put one-time costs on
+> the amortized side. What stays on the cost side is what is *permanent*: **quality,
+> complexity, maintenance.** Two consequences that bind:
+>
+> - A cheap quality **screen** is enough to reject a row whose benefit really is ~0. It is
+>   **not** enough once the cost side amortizes away — then the screen must become a real
+>   paired dNLL before the row can be closed.
+> - *"Below the floor, where bytes stop buying anything"* (item 11) and *"~2% overall"*
+>   (item 8) are both this error. Both closures happen to survive re-scoring, but on
+>   different grounds, re-stated in their notes below.
+
 ## Ranked roadmap
 
 | # | Item | Path | Est. impact | Effort | Status |
 |---|---|---|---|---|---|
 | 1 | `fp8_to_i4` | B | int4 PPL 73.43 → **5.12**, hybrid → **5.19** | low | **done** |
 | 1b | ~~`--hot-pct` re-tune~~ | B | — | — | **struck — flag deleted, unrunnable** |
-| 2 | VQ_K=2048 L1-resident codebook | B / follow-up #1 | med (lifts gather wall) + smaller experts | med (requant) | new |
+| 2 | VQ_K=2048 L1-resident codebook | B / follow-up #1 | **12-bit: 1.189× MoE kernels, compute floor 117→~99 ms. 11-bit: 7.7% fewer bytes, transfer 181→167 ms.** Both cost **+18.7% relFrob** | med (requant) | **PROBED 2026-08-04, NOT closed** — two variants at one quality price; needs a real dNLL gate, see below |
 | 3 | Batched-GEMV kernels | A | med now, unlocks MTP | med–high | **done, on `main`** — 6 kernels take `nrow`, bit-identical per row |
 | 4 | MTP / speculative decode | A | **1.108× measured** with `--mtp-min-conf 0.8` (0.93–0.95× ungated) | high | **DONE and WON 2026-07-31** — gate on draft confidence; see the note below |
 
@@ -54,6 +77,50 @@ verdict: The ranked performance roadmap. Live rows: #2 VQ_K codebook, #10 genera
 | 10 | General-`R` MoE kernels (tiled GEMM) | follow-up #9 | the rest of #9: a 2-row pass still re-reads its experts from LPDDR5, and that is now the prefill bound | **high** | new — see below |
 | 11 | Better cache policy (residency / hit rate) | B | ceiling **8.6 ms/tok (2.4%)** at 115 GiB — and that is Belady's, not a reachable one | — | **closed as negative 2026-08-02 AT 115 GiB — still live at 61**; see below |
 
+> **Item 2 was probed 2026-08-04 and it is TWO products at one quality price, not one item.**
+> `docs/measurement/probes/vq_codebook.hip` (real dims 6144/2048, 9 experts, R=1, real 11-bit
+> unpack, median of 3) and `examples/vq_k_probe.rs` (real fp8 weights, 2^20-subvector sample,
+> both codebooks from the same sample, scored on **held-out** experts).
+>
+> | variant | recurring win | format cost |
+> |---|---|---|
+> | **12-bit container, K=2048** | MoE kernels **1.189×** (`gateup` 934→741 µs, `down` 462→411 µs); compute floor 117 → ~99 ms | **none** — only the codebook and encoder move |
+> | **11-bit container, K=2048** | 7.7% fewer bytes/token (2.25→2.08 GB); transfer 181 → 167 ms | index packing changes |
+>
+> **The two halves of the original item fight each other, which is the finding.** The 16 KiB
+> codebook alone is worth 1.189×. Adding the 11-bit packing — the half that actually buys the
+> bytes — collapses it to **1.022×**, *while* reading 7.7% fewer bytes. A 12-bit index never
+> spans more than 2 bytes (`shift ∈ {0,4}`, strength-reducible); an 11-bit index starting at
+> bit 7 spans 3. A dword-load variant behaves identically (1.029×), so it is the loss of the
+> shift pattern, not the extra byte load. Calibration arms: `k4096_b12_f32` (64 KiB) is
+> **0.739×**, `k256_b12_f16` is 1.178× — so the probe is size-sensitive and **K=2048 already
+> captures the whole asymptote**. `shared_gu_k4096` (one codebook for gate+up, 64→32 KiB
+> aggregate) buys only 1.6%, which refutes the aggregate-footprint story: the effect keys on
+> the span each gather *stream* ranges over, knee between 16 and 32 KiB. No rocprof on this
+> box, so that mechanism is inference from eight consistent arms, not a counter reading.
+>
+> **Quality is on the rate-distortion frontier, and that is the real cost.** Held-out mean
+> relFrob 0.15509 (K=4096) → 0.18407 (K=2048) = **+18.68%**; high-rate VQ theory for `d=4`
+> predicts `2^0.25` = **+18.92%** for halving K. Spread across 3 projections × 3 experts is
+> under 0.2%. There is no structural slack to recover — an independent arrival at
+> [`codebook-rotation.md`](../investigations/codebook-rotation.md)'s "int3-vq is rate-limited".
+> int4 anchors at 0.11858. Extrapolated against the 5.120/5.275 ladder that is ~+0.024 nats,
+> ~2.4× the 0.00995 bar, **on the rung that is already worst of three**.
+>
+> **Why this row is NOT closed.** The first recommendation was NO-GO, and half its reasoning
+> was the retired axis above — "the 1.189× is spent on slack the fetch already covers." Under
+> the corrected scoring the 12-bit variant costs *nothing but the requant and the quality*,
+> and the requant amortizes. So the decision now rests **entirely on quality**, and
+> +18.68% relFrob is a **screen** extrapolated across two quantizer families — adequate to
+> reject a ~0-benefit row, not adequate to reject this one. **Settle it with a real paired
+> dNLL after a requant**, and repeat every arm: ~40% of 5k-token runs are silently corrupted
+> (see the warning under item 5).
+>
+> Also measured and worth recording: sharing one codebook between gate and up is
+> **quality-free** (0.15511/0.15510 vs 0.15512/0.15501 separate), matching
+> `codebook-rotation.md`'s cross-layer result — but the kernel pays only 1.016× for it, so
+> there is no reason to do it.
+
 > **Item 8 is a closed door, and it is worth knowing which door.** The demand fetch runs at
 > ~10 GB/s; `docs/measurement/probes/fetch_batch.hip` reproduces the engine's exact shape (pinned bounce
 > buffers, submit-*m*-drain-*m*, random 15.3 MB reads, GPU busy beside it) and the drive
@@ -74,6 +141,14 @@ verdict: The ranked performance roadmap. Live rows: #2 VQ_K codebook, #10 genera
 > That leaves **#2 as the only live fetch lever**: it moves *fewer bytes*, shortening the
 > busy 65% rather than trying to fill the idle 35% — and a smaller expert is also the one
 > thing that would make the idle window worth filling.
+>
+> **RE-SCORED 2026-08-04. The closure survives, but "~2% overall" was never the reason.**
+> 2% of every token forever is not a rounding error, and under the scoring correction above
+> it is a genuine recurring saving. What actually closes this row is that its cost is
+> **permanent, not one-time**: split reads mean "a real change to the ring", i.e. complexity
+> and failure surface carried for the life of the engine, against a 2% that only 18% of
+> layers see. The duty-cycle half closes on its own arithmetic and needs no re-scoring — a
+> +67 ms/token prefetch cost against a ≤85 ms/token ceiling is a **loss**, not a hidden win.
 
 > **Item 11 closes the OTHER byte lever, and it was never priced until 2026-08-02.** Hit rate
 > is the second of the two things that move bytes, and every policy on record — LRU vs 2Q vs
@@ -94,6 +169,20 @@ verdict: The ranked performance roadmap. Live rows: #2 VQ_K codebook, #10 genera
 > which also means the cheapest 105 ms on a starved machine is `--max-mem`, not a policy.
 > Full table, the transfer model and three optimism caveats in
 > [`benchmarks.md`](benchmarks.md), "The Belady bound on residency".
+>
+> **RE-SCORED 2026-08-04. "Below the floor, where bytes stop buying anything" is FALSE as
+> written** — it is the clearest instance of the retired axis, and this row is where the
+> phrase came from. Bytes not fetched below the compute floor are still NVMe reads not
+> performed: drive wear, power, and a fetch ring that idles instead of working. What is
+> capped at 8.6 ms/token is **wall**, not value.
+>
+> The closure still holds, on the cost side rather than the benefit side: another policy is
+> **permanent complexity** — a new implementation, a new tuning surface, and in `--mode
+> hybrid` a residency change is an *output* change (the INV-1 defect,
+> `docs/reference/architecture.md` §8b). That cost never amortizes. Weighed against ≤6.37 pp
+> of hit rate that Belady says nobody can reach anyway, the answer is unchanged: **do not
+> open another policy at 115 GiB.** At 61 GiB nothing about this row was ever
+> bottleneck-relative, so it is untouched by the correction.
 
 > **Item 5 is done, and it corrects three things this table said about it.** HB 8→16 halves
 > the DRAM KV re-read multiplier: **226.5 → 108.8 µs at nr512 (2.08×)**, 769.8 → 421.2 at
@@ -124,12 +213,15 @@ verdict: The ranked performance roadmap. Live rows: #2 VQ_K codebook, #10 genera
 **Suggested sequence, revised.** The original sequence led with #1 and treated #4 as the
 big multiplier; #1 has landed and #4 has a measured loss against it, so:
 
-1. **#5's HB × `MLA_MIN_TILES_PER_SPLIT` sweep** — the cheapest unclaimed win, and still
-   mandatory before any long-context work. Note it is a **4-site change** (`kernels/attn.hip`,
-   `kernels/vk/mla_latent_attend.comp`, and the two mirrored launcher constants in
-   `src/backend/vk.rs`), which the item's text does not say.
-2. **Path B (#2)** — the biggest remaining structural lever, on the 210 ms that is 60% of
-   wall. Now the *only* live item in Path B, since 1b is struck.
+1. ~~**#5's HB × `MLA_MIN_TILES_PER_SPLIT` sweep**~~ — **DONE 2026-08-02.** It was a 4-site
+   change (`kernels/attn.hip`, `kernels/vk/mla_latent_attend.comp`, and the two mirrored
+   launcher constants in `src/backend/vk.rs`), which the item's text did not say; and it had
+   one live parameter, not two.
+2. **Path B (#2), 12-bit variant** — probed 2026-08-04 and now blocked on **one measurement**:
+   a requant at K=2048 and a real paired dNLL. 1.189× on the MoE kernels for no format
+   change; the whole question is whether +18.68% relFrob lands inside the bar. Still the
+   *only* live item in Path B, since 1b is struck. Do the requant before re-arguing the row —
+   the screen has already given everything a screen can give.
 3. ~~**`tail`'s missing ~62%**~~ — **ANSWERED and struck.** The CLASS axis shows it is
    decode-loop host CPU (~6 ms of the 8.9 ms `cpu` bucket), not a hidden kernel. Promoting
    it was the right call on the evidence available; measuring it cost one run and demoted
