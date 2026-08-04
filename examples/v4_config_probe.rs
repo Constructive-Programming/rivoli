@@ -3,6 +3,7 @@
 //! port — delete once the port has a real gate.
 //!
 //! usage: cargo run --release --features rocm --example v4_config_probe -- <model-dir>
+#![allow(clippy::unwrap_used, clippy::expect_used)] // diagnostic: panic-on-failure is the idiom
 
 fn main() {
     let dir = std::env::args().nth(1).expect("usage: v4_config_probe <model-dir>");

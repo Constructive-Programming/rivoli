@@ -42,7 +42,11 @@ use tracing::info;
 #[command(
     name = "rivoli",
     version,
-    about = "GLM-5.2 int3-vq MoE decode engine (HIP/ROCm or Vulkan)"
+    // Architecture-neutral since the engine gained a second one: naming GLM here made the
+    // bare help contradict `rivoli <v4-artifact> --help` two lines later.
+    about = "MoE decode engine (HIP/ROCm or Vulkan). Architectures: glm-moe-dsa, deepseek-v4.\n\
+             Flags marked ARCHITECTURE-DEPENDENT resolve against the artifact: run\n\
+             `rivoli <artifact> --help` for the ones that model actually admits."
 )]
 struct Args {
     /// The converted artifact directory (manifest.json + codebooks + resident.safetensors
@@ -103,6 +107,8 @@ struct Args {
 
     /// Attention row selection. `auto` picks `dsa` when the artifact carries indexer
     /// weights AND the backend has the indexer kernels, else `dense` — see `resolve_attn`.
+    /// ARCHITECTURE-DEPENDENT: run `rivoli <artifact> --help` for the values this model
+    /// admits. Some architectures fix attention in the weights and do not take this flag.
     #[arg(long, default_value = "auto", value_parser = ["auto", "dense", "streaming", "dsa", "misa"])]
     attn: String,
 
@@ -243,8 +249,92 @@ fn moe_gain_in_band(s: &str) -> Result<f32, String> {
 /// matches, so `-b`, `--bench` and a positional path are all untouched.
 fn parse_args() -> Args {
     use clap::Parser;
-    let argv = std::env::args().map(|a| if a == "-bench" { "--bench".into() } else { a });
+    let argv: Vec<String> = std::env::args()
+        .map(|a| if a == "-bench" { "--bench".into() } else { a })
+        .collect();
+    // `--help` resolves against the artifact when one is named, BEFORE clap handles it.
+    if artifact_resolved_help(&argv) {
+        std::process::exit(0);
+    }
     Args::parse_from(argv)
+}
+
+/// Render `--help` against the architecture of the artifact on the command line, hiding
+/// flags that architecture has no use for. Returns `true` if help was printed.
+///
+/// The motivating case: `--attn`, `--sinks`, `--window` and `--misa-heads` are GLM
+/// row-selection knobs, and on DeepSeek-V4 attention is fixed by the weights — so a V4
+/// user reading generic help spends it on four flags that cannot do anything, and learns
+/// nothing about the one thing that differs between the two models. Help is the only
+/// output nothing else asserts on, which is why `arch.rs` pins its lists to the parser.
+///
+/// Degrades to clap's own help whenever it cannot do better: no artifact named, not a
+/// directory, no manifest, or an architecture string it does not recognise. An
+/// unrecognised architecture is NOT an error here — `main` refuses it a few lines later
+/// with a better message than a help renderer can give.
+fn artifact_resolved_help(argv: &[String]) -> bool {
+    let all = argv.iter().any(|a| a == "--help-all");
+    if !all && !argv.iter().any(|a| a == "--help" || a == "-h") {
+        return false;
+    }
+    // The first argument that is a directory holding a config document. Scanning for that
+    // rather than for "the first non-flag" keeps this honest around flag VALUES: a
+    // `--ppl-out /some/dir` would fool a positional-counting parse, and getting it wrong
+    // silently renders help for the wrong model.
+    let manifest = argv[1..].iter().find_map(|a| {
+        ["manifest.json", "config.json"]
+            .iter()
+            .map(|f| std::path::Path::new(a).join(f))
+            .find(|p| p.is_file())
+    });
+    let arch = manifest
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| {
+            // `architectures[0]` is what both checkpoints carry; `model_type` is DeepSeek's
+            // second spelling of the same fact. Neither is universal, so try both.
+            let a = v["architectures"][0].as_str().map(str::to_owned);
+            a.or_else(|| v["model_type"].as_str().map(str::to_owned))
+        })
+        .and_then(|s| rivoli::arch::Arch::from_manifest_str(&s));
+    let Some(arch) = arch else {
+        return false; // clap's generic help, which is the right answer when we know nothing
+    };
+
+    use clap::CommandFactory;
+    let mut cmd = Args::command().about(format!(
+        "rivoli — {} decode engine (HIP/ROCm or Vulkan)\nArchitecture: {} — {}",
+        arch.name(),
+        arch.name(),
+        arch.summary()
+    ));
+    let mut notes: Vec<String> = Vec::new();
+    if !all {
+        for id in arch.hidden_flags() {
+            cmd = cmd.mut_arg(*id, |a| a.hide(true));
+        }
+        if !arch.hidden_flags().is_empty() {
+            notes.push(format!(
+                "{} flag(s) that do not apply to {} are hidden — show them with --help-all.",
+                arch.hidden_flags().len(),
+                arch.name()
+            ));
+        }
+    }
+    match arch.attn_modes() {
+        Some(modes) => cmd = cmd.mut_arg("attn", |a| a.value_parser(modes.to_vec())),
+        // Say why the flag is gone. "Absent" and "inapplicable" read identically otherwise,
+        // and the first invites a bug report.
+        None => notes.push(format!("--attn: {}", arch.attn_fixed_note())),
+    }
+    if !notes.is_empty() {
+        cmd = cmd.after_help(notes.join("\n"));
+    }
+    // `.ok()` rather than `expect`: `rivoli <artifact> --help | head` closes the pipe early,
+    // and a help renderer that panics on EPIPE turns a normal shell idiom into a crash.
+    // There is nothing to recover *to* here — the next statement exits.
+    cmd.print_help().ok();
+    true
 }
 
 #[cfg(any(feature = "rocm", feature = "vulkan"))]

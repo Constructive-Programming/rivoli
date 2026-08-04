@@ -14,6 +14,7 @@ pub mod artifact;
 pub mod fetch;
 pub mod memory;
 
+pub mod arch;
 pub mod attn;
 pub mod indexer;
 pub mod math;
