@@ -1,6 +1,6 @@
 ---
 status: live
-verdict: Both targets keep source fidelity — V4-Flash native FP4 in a new `.f4` container (~157 GB), K3 native MXFP4 (~1.45 TB) — because both ship 4-bit experts and re-quantizing to int3-vq is the lossy-on-lossy chain int4-scales.md records at PPL 73.43. NFS measures 154 MB/s against NVMe's 7.0 GB/s, so `/swarm` is the library and NVMe the working set; all three at native fidelity are 1.73 TiB against 1.69 TiB of disk. V4-Flash's sqrt(softplus) router SHIPPED 2026-08-03; its tensor naming is the reference scheme, not HuggingFace's, and it is neither MLA nor residual-additive.
+verdict: Both targets keep source fidelity — V4-Flash native FP4 in a new `.f4` container (~157 GB), K3 native MXFP4 (~1.45 TB) — because both ship 4-bit experts and re-quantizing to int3-vq is the lossy-on-lossy chain int4-scales.md records at PPL 73.43. NFS measures 154 MB/s against NVMe's 7.0 GB/s, so `/swarm` is the library and NVMe the working set; all three at native fidelity are 1.73 TiB against 1.69 TiB of disk. FOUR CORRECTIONS 2026-08-05 from the downloaded repo, each dated in place: V4 DOES stream (138.1 GiB of experts, ~83% residency) so §3 is inverted; `--kv-fp8` does not exist and the partial fp8 KV act_quant is mandatory not forbidden; §7's "unverified absence" is resolved and missed a 41-layer KV compressor; the shared expert is fp8, not FP4.
 ---
 
 # Can rivoli run a model other than GLM-5.2?
@@ -26,9 +26,12 @@ places than expected.
 - **Kimi K3's capacity problem is a bitrate problem** (§2). It does not fit at int3-vq's
   3.25 bits/weight; it fits at ≤2.5, and the VQ constants are ours to change. The wall that
   is *not* negotiable is the 69 KDA linear-attention layers.
-- **DeepSeek-V4-Flash-0731 fits, and would barely stream at all** (§3) — which is worth
-  saying plainly, because streaming is the point of this engine. llama.cpp measured it
-  compute-bound.
+- ~~**DeepSeek-V4-Flash-0731 fits, and would barely stream at all** (§3)~~ — **WRONG,
+  corrected 2026-08-05.** That was priced at int3-vq; §6 of this file then chose native FP4,
+  where the experts are **138.1 GiB against a ~115 GiB pool — ~83% residency, so it streams**
+  (GLM is ~41%). Stream traffic is 3.449 GB/token. Full banner in §3. What survives is the
+  weaker form, and it still matters because streaming is the point of this engine: V4 streams
+  *much less* than GLM, and llama.cpp measured it compute-bound on the indexer/sinkhorn path.
 - **The router already ships** (§4). `sqrt(softplus(·))` behind a `Scoring` enum, verified
   against the reference implementation, with INV-1's frozen oracle still pinning sigmoid.
 
@@ -128,6 +131,23 @@ model but **is not in the release**, so speculative decode is off from the start
 (again reproducing the headline). At 0.406 B/weight that is **~105 GiB of experts, ~120 GiB
 with residents** — comfortable inside the 265 GiB already free, no deletion required.
 
+> **CORRECTED 2026-08-05 — this section's central claim is wrong, and the two numbers below
+> that carry it are wrong in the same way.** The repo is now downloaded and measured from all
+> 72,317 safetensors headers (`v4-flash-port.md` §0). Both errors come from pricing the model
+> at **int3-vq** while §6 of this same file decides to keep **native FP4**:
+>
+> - Experts are **148.25 GB = 138.1 GiB**, not "~105 GiB of experts, ~120 GiB with
+>   residents". Against a ~115 GiB practical `--max-mem` that is **~83% capacity residency**,
+>   not "nearly fully resident". **It streams** — less than GLM's ~41%, but it streams, and
+>   the paragraph below concluding otherwise does not survive.
+> - Stream traffic is **3.449 GB/token**, not 3.1. The shared expert is **fp8 e4m3 at
+>   128×128 (25.17 MB), not FP4** — `MoE.__init__` passes `expert_dtype` only to the *routed*
+>   experts — and being resident it is not per-token traffic at all. So "top-6 + 1 shared"
+>   is the wrong basis twice over: wrong size, and wrong to count.
+>
+> The int3-vq arithmetic below is left standing because §6's decision rests on comparing the
+> two formats, and erasing one half of that comparison would make the decision unreadable.
+
 **But it would barely stream.** Active experts are top-6 + 1 shared = 7 × 25.2M = 176M
 params/layer = 71 MB/layer at int3-vq, × 43 layers = **3.1 GB/token**, against GLM-5.2's
 9 × 37.7M × 75 = **10.3 GB/token**. That is 3.4× less traffic per token — and a ~120 GiB
@@ -184,7 +204,28 @@ of coherent text. No error, no crash."* Cause: V4 pre-quantizes K activations th
 e4m3 before cache storage, and re-quantizing already-constrained values corrupts attention
 into coherent-looking wrong output. They pin `type_k`/`type_v` to F16 in two places
 regardless of user flags. **rivoli has `--kv-fp8`, which does exactly the harmful thing.**
+<!-- see the correction immediately below: it does not, and the advice is inverted -->
+
 It must be refused on this architecture, not merely discouraged.
+
+> **CORRECTED 2026-08-05. Both halves of that sentence are wrong, and the advice inverts.**
+>
+> **`--kv-fp8` does not exist.** Not in `main.rs`, not anywhere in `src/`, `kernels/` or the
+> shaders — grepped 2026-08-05. The only fp8 near the KV path is the `kv_b` *weight* matrix
+> (`mla_value_fp8` / `mla_absorb_fp8`), which is a projection, not a cache. So this paragraph
+> prescribed adding a refusal for a flag that was never there — the "comment asserting a
+> check that does not exist" pattern, in prose.
+>
+> **And the underlying quantization is mandatory, not forbidden.** `Attention.forward` calls
+> `act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)` — it fp8-quantizes the KV
+> entry *deliberately and partially*: the **non-RoPE dims [0:448) at block 64**, leaving the
+> RoPE dims **[448:512) in bf16** "to match QAT" in its own comment. So there are two ways to
+> be wrong here, in opposite directions: applying a whole-tensor fp8 (double-quantizing and
+> corrupting the positional dims — the llama.cpp failure above), or omitting it entirely and
+> diverging from what the model was trained against. The llama.cpp hazard is real; the
+> mitigation named here is not.
+>
+> Found while writing `v4-flash-port.md` §0, by reading `model.py` rather than the paper.
 
 **Still unbuilt**, in dependency order: shared-K=V MQA attention (one `wkv: Linear(dim,
 head_dim)` + `kv_norm`, one entry serving as both K and V for all 64 heads, per-head QK-norm
@@ -300,6 +341,19 @@ every `format!("model.layers.{l}...")` in `convert.rs`/`pin.rs` is wrong for it:
 
 `w1`/`w3`/`w2` is the reference's gate/up/down. Note **`wo_a`/`wo_b`**: the output projection
 is low-rank too, which GLM's single `o_proj` is not.
+
+> **RESOLVED 2026-08-05 — all three exist.** The full index is now on disk: `ffn.gate.tid2eid`
+> on exactly 3 layers (`I64[129280, 6]`, matching `num_hash_layers`), `attn.indexer.*` on 21
+> layers (the ratio-4 ones), and a complete MTP block — in fact **three** of them,
+> `mtp.{0,1,2}`, each with a full 256-expert FFN, where the config says
+> `num_nextn_predict_layers: 1`. There is no `eh_proj`; V4 uses `main_proj`/`main_norm`.
+> The caution below was right and is kept for the method.
+>
+> **Also missed by the sampled read, and absent from §3's table entirely:** a per-layer KV
+> **compressor** on 41 layers (`attn.compressor.{wkv,wgate,norm,ape}`) driven by
+> `compress_ratios`, and a second RoPE base `compress_rope_theta: 160000`. `compress_ratios`
+> has 46 entries for 43 layers and its ratio-4 indices are `[2,4,…,42]`, so the **last layer
+> is ratio-4**, not the ratio-0 tail the trailing entries suggest.
 
 > **Unverified absence.** The fetch returned layer-0 tensors and `embed.weight` only, so the
 > index was sampled, not read whole. It reported no `tid2eid`, indexer, or `eh_proj` tensors —
