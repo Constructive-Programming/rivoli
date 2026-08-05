@@ -150,7 +150,7 @@ fn launch(x: &Buf, w: &Buf, y: &mut Buf, o_dim: usize, i_dim: usize) {
 /// when the caller next joins.
 unsafe fn launch_at(x: *const u8, w: *const u8, y: *mut u8, o_dim: usize, i_dim: usize) {
     let (x, w, y) = (x as *const f32, w as *const f32, y as *mut f32);
-    unsafe { launch_gemv_f32(x, w, o_dim, i_dim, 1, y) }.expect("launch");
+    unsafe { launch_gemv_f32(x, w, o_dim, i_dim, 1, y, std::ptr::null_mut()) }.expect("launch");
 }
 
 /// Random `w` and `x` for an `o_dim × i_dim` GEMV, and the host result — the opening four
@@ -1082,7 +1082,7 @@ fn guards_reject_degenerate_arguments() {
         // SAFETY: zero dims are rejected before any pointer is used.
         unsafe {
             let p = b.ptr() as *const f32;
-            launch_gemv_f32(p, p, o_dim, i_dim, 1, y.ptr_mut() as *mut f32)
+            launch_gemv_f32(p, p, o_dim, i_dim, 1, y.ptr_mut() as *mut f32, std::ptr::null_mut())
         }
     };
     assert!(degenerate(0, 4).is_err(), "o_dim = 0 must be rejected");

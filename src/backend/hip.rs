@@ -333,6 +333,7 @@ unsafe extern "C" {
         i_dim: i32,
         nrow: i32,
         y: *mut f32,
+        stream: *mut c_void,
     ) -> i32;
     fn rivoli_swiglu(g: *const f32, u: *const f32, n: i32, h: *mut f32) -> i32;
     fn rivoli_v4_swiglu_clamped(
@@ -1335,8 +1336,25 @@ pub unsafe fn launch_gemv_i8(
 
 /// f32 GEMV `y = W·x` (the MoE router gate).
 ///
+/// Takes a `stream`, and it is the only one of GLM's GEMVs that does. The reason is V4: this
+/// is the launcher `Gate.forward` maps to (`linear(x.float(), weight.float())`), so on the V4
+/// layer path it sits between `launch_v4_rmsnorm` and `launch_moe_expert_range_f4`, which both
+/// take one. Left on the null stream it would read a norm that no stream had been waited on —
+/// rivoli's streams are `hipStreamNonBlocking` — giving wrong logits and therefore a wrong
+/// SELECTION, which is the one V4 defect class no downstream numeric comparison can attribute.
+///
+/// Not a V4-only twin launcher, and the contrast with [`memcpy_dtod_async`] earlier in this
+/// file is the reason: those two are separate entry points because they differ in whether the
+/// HOST blocks, which is a contract split the arena relocation depends on. Two spellings of
+/// one dispatch differing only in a stream handle has no such justification.
+///
+/// All seven existing call sites pass `null_mut()` and are unchanged in behaviour, on both
+/// backends: `vk::launch_gemv_f32` routes the same argument through `Q::parse`, which maps 0
+/// and 1 alike to `Q::Main` for exactly this case.
+///
 /// # Safety
-/// Device pointers live until the next [`device_sync`].
+/// Device pointers must outlive `stream`'s completion. `stream` is a live `hipStream_t`, or
+/// null for the default stream.
 pub unsafe fn launch_gemv_f32(
     x: *const f32,
     w: *const f32,
@@ -1344,9 +1362,10 @@ pub unsafe fn launch_gemv_f32(
     i_dim: usize,
     nrow: usize,
     y: *mut f32,
+    stream: *mut c_void,
 ) -> Result<()> {
-    // SAFETY: caller's pointer contract.
-    let r = unsafe { rivoli_gemv_f32(x, w, o_dim as i32, i_dim as i32, nrow as i32, y) };
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
+    let r = unsafe { rivoli_gemv_f32(x, w, o_dim as i32, i_dim as i32, nrow as i32, y, stream) };
     check(r, "gemv_f32")
 }
 
@@ -1651,7 +1670,14 @@ pub unsafe fn launch_v4_act_quant(
 ) -> Result<()> {
     // SAFETY: caller's pointer contract; stream is a live HipStream handle.
     let r = unsafe {
-        rivoli_v4_act_quant(x, rows as i32, row_stride as i32, n as i32, block as i32, stream)
+        rivoli_v4_act_quant(
+            x,
+            rows as i32,
+            row_stride as i32,
+            n as i32,
+            block as i32,
+            stream,
+        )
     };
     check(r, "v4_act_quant")
 }

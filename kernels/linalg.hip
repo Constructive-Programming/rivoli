@@ -625,13 +625,19 @@ extern "C" int rivoli_gemv_i8(
     return e == hipSuccess ? 0 : -(int)e;
 }
 
+// Takes a STREAM, unlike the other GEMVs in this file, and it is the odd one out because of
+// DeepSeek-V4 rather than GLM: this is the router-gate GEMV (`Gate.forward`'s
+// `linear(x.float(), weight.float())`), so on the V4 layer path it sits between two launchers
+// that take one. `nullptr` is the null stream, so every existing caller is unchanged. The full
+// argument, and why this is not a V4-only twin launcher, is on `hip.rs::launch_gemv_f32` —
+// stated once, where a caller reads it.
 extern "C" int rivoli_gemv_f32(const float* x, const float* w, int o_dim, int i_dim, int nrow,
-                               float* y) {
+                               float* y, void* stream) {
     if (o_dim <= 0 || i_dim <= 0) return 1001;
     if (nrow != 1 && nrow != 2) return 1004;  // R is a template parameter — see gemv_fp8
     hipGetLastError();
-    hipLaunchKernelGGL(nrow == 2 ? gemv_f32_r2 : gemv_f32, ROW_GRID(o_dim), ROW_BLOCK, 0, 0,
-                       x, w, o_dim, i_dim, y);
+    hipLaunchKernelGGL(nrow == 2 ? gemv_f32_r2 : gemv_f32, ROW_GRID(o_dim), ROW_BLOCK, 0,
+                       (hipStream_t)stream, x, w, o_dim, i_dim, y);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

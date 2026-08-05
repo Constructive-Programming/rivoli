@@ -1134,7 +1134,15 @@ impl<'a> GpuEngine<'a> {
                 )?;
                 launch_rope(iqp, nh, hd, rope, pos, theta)?; // per head: stride hd, seg rope
                 // weights_proj is bf16→f32 [n_heads, hidden] — plain f32 GEMV.
-                launch_gemv_f32(xnp, ip.weights_proj, nh, cfg.hidden, 1, iwp)?;
+                launch_gemv_f32(
+                    xnp,
+                    ip.weights_proj,
+                    nh,
+                    cfg.hidden,
+                    1,
+                    iwp,
+                    std::ptr::null_mut(),
+                )?;
             }
 
             // Active head set for the O(nt) scan: all `nh` heads (DSA), or the MISA-routed
@@ -1355,7 +1363,15 @@ impl<'a> GpuEngine<'a> {
                             cr.add(cfg.hidden),
                         )?;
                     }
-                    launch_gemv_f32(catp, m.eh_proj, cfg.hidden, 2 * cfg.hidden, nrow, dst)?;
+                    launch_gemv_f32(
+                        catp,
+                        m.eh_proj,
+                        cfg.hidden,
+                        2 * cfg.hidden,
+                        nrow,
+                        dst,
+                        std::ptr::null_mut(),
+                    )?;
                 }
                 std::mem::swap(&mut self.x, &mut self.mtp_x);
                 Some(m)
@@ -1514,6 +1530,7 @@ impl<'a> GpuEngine<'a> {
                         hidden,
                         1,
                         self.pred_gl.ptr_mut() as *mut f32,
+                        std::ptr::null_mut(),
                     )?;
                 }
                 // Blocking D2H, but a cheap one HERE: the previous layer ended in
@@ -1706,7 +1723,17 @@ impl<'a> GpuEngine<'a> {
             } else {
                 // Router gate on device, then read logits to route on host.
                 // SAFETY: gate_w resident F32; glp device scratch.
-                unsafe { launch_gemv_f32(xnp, gate_w, cfg.n_experts, hidden, nrow, glp)? };
+                unsafe {
+                    launch_gemv_f32(
+                        xnp,
+                        gate_w,
+                        cfg.n_experts,
+                        hidden,
+                        nrow,
+                        glp,
+                        std::ptr::null_mut(),
+                    )?
+                };
                 // The gate-logits D2H is a blocking join, so timing around it is free —
                 // no sync we don't already pay. (All the always-on profile buckets wrap
                 // existing join/D2H points; none add a sync.)

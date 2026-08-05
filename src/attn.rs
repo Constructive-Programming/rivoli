@@ -748,19 +748,47 @@ pub mod v4 {
         // row at the same block size, so the two produce identical bytes.
         // SAFETY: caller's contract; `xq` is `[m, dim]` and `x` is not modified.
         unsafe {
-            memcpy_dtod_async(s.xq.cast(), io.x.cast(), m * d.dim * size_of::<f32>(), stream)?;
+            memcpy_dtod_async(
+                s.xq.cast(),
+                io.x.cast(),
+                m * d.dim * size_of::<f32>(),
+                stream,
+            )?;
             launch_v4_act_quant(s.xq, m, d.dim, d.dim, FP8_BLOCK, stream)?;
             let (q_lora, dim) = (d.q_lora_rank, d.dim);
             launch_v4_gemv_fp8(
-                s.xq, w.wq_a.w, w.wq_a.scale, m, q_lora, dim, FP8_BLOCK, 1, s.qr, stream,
+                s.xq,
+                w.wq_a.w,
+                w.wq_a.scale,
+                m,
+                q_lora,
+                dim,
+                FP8_BLOCK,
+                1,
+                s.qr,
+                stream,
             )?;
             launch_v4_rmsnorm(s.qr, w.q_norm, m, q_lora, d.norm_eps, stream)?;
             // The copy that made the set seven rather than six: `s.qr` is what `v4_rmsnorm`
             // just wrote on `stream`, and a blocking `memcpy_dtod` here does not wait for it.
-            memcpy_dtod_async(s.qrq.cast(), s.qr.cast(), m * q_lora * size_of::<f32>(), stream)?;
+            memcpy_dtod_async(
+                s.qrq.cast(),
+                s.qr.cast(),
+                m * q_lora * size_of::<f32>(),
+                stream,
+            )?;
             launch_v4_act_quant(s.qrq, m, q_lora, q_lora, FP8_BLOCK, stream)?;
             launch_v4_gemv_fp8(
-                s.qrq, w.wq_b.w, w.wq_b.scale, m, nhd, q_lora, FP8_BLOCK, 1, s.q, stream,
+                s.qrq,
+                w.wq_b.w,
+                w.wq_b.scale,
+                m,
+                nhd,
+                q_lora,
+                FP8_BLOCK,
+                1,
+                s.q,
+                stream,
             )?;
             // QK-norm BEFORE RoPE (model.py:504 then :505). Read off the reference, not
             // inferred from a green test -- which is the part that matters and is unchanged.
@@ -788,7 +816,16 @@ pub mod v4 {
 
             // -- kv --------------------------------------------------------------------
             launch_v4_gemv_fp8(
-                s.xq, w.wkv.w, w.wkv.scale, m, hd, dim, FP8_BLOCK, 1, s.kv, stream,
+                s.xq,
+                w.wkv.w,
+                w.wkv.scale,
+                m,
+                hd,
+                dim,
+                FP8_BLOCK,
+                1,
+                s.kv,
+                stream,
             )?;
             launch_v4_rmsnorm(s.kv, w.kv_norm, m, hd, d.norm_eps, stream)?;
             launch_v4_rope(s.kv, io.freqs, m, hd, rd, pos0, 1, false, stream)?;
@@ -884,11 +921,29 @@ pub mod v4 {
             // `groups = o_groups`: `o` is `m` rows of `o_groups` contiguous `gd`-wide
             // head runs, and output row `j` takes run `j / o_lora_rank`.
             launch_v4_gemv_fp8(
-                s.o, w.wo_a.w, w.wo_a.scale, m, gr, gd, FP8_BLOCK, d.o_groups, s.y, stream,
+                s.o,
+                w.wo_a.w,
+                w.wo_a.scale,
+                m,
+                gr,
+                gd,
+                FP8_BLOCK,
+                d.o_groups,
+                s.y,
+                stream,
             )?;
             launch_v4_act_quant(s.y, m, gr, gr, FP8_BLOCK, stream)?;
             launch_v4_gemv_fp8(
-                s.y, w.wo_b.w, w.wo_b.scale, m, d.dim, gr, FP8_BLOCK, 1, io.out, stream,
+                s.y,
+                w.wo_b.w,
+                w.wo_b.scale,
+                m,
+                d.dim,
+                gr,
+                FP8_BLOCK,
+                1,
+                io.out,
+                stream,
             )?;
         }
         Ok(())
@@ -992,8 +1047,18 @@ mod v4_guard_tests {
         let (w, s, io) = parts(1);
         // SAFETY: every pointer is null and none is read — the `rows` check precedes the
         // first launch, which is the property this asserts.
-        let e = unsafe { attention(&d, plain(), &w, &s, &io, Step::Prefill { seqlen: 4 }, std::ptr::null_mut()) }
-            .expect_err("a 4-row prefill into a 1-row scratch must be refused");
+        let e = unsafe {
+            attention(
+                &d,
+                plain(),
+                &w,
+                &s,
+                &io,
+                Step::Prefill { seqlen: 4 },
+                std::ptr::null_mut(),
+            )
+        }
+        .expect_err("a 4-row prefill into a 1-row scratch must be refused");
         let msg = format!("{e}");
         assert!(msg.contains("scratch rows"), "wrong rejection: {msg}");
 
@@ -1001,11 +1066,24 @@ mod v4_guard_tests {
         // the pointers are null — but the message proves the guard is a bound and not a
         // constant `false`, which is the shape S2 shipped twice.
         let (w, s, io) = parts(4);
-        let msg = match unsafe { attention(&d, plain(), &w, &s, &io, Step::Prefill { seqlen: 4 }, std::ptr::null_mut()) } {
+        let msg = match unsafe {
+            attention(
+                &d,
+                plain(),
+                &w,
+                &s,
+                &io,
+                Step::Prefill { seqlen: 4 },
+                std::ptr::null_mut(),
+            )
+        } {
             Ok(()) => String::new(),
             Err(e) => format!("{e}"),
         };
-        assert!(!msg.contains("scratch rows"), "the guard rejects a scratch that fits: {msg}");
+        assert!(
+            !msg.contains("scratch rows"),
+            "the guard rejects a scratch that fits: {msg}"
+        );
     }
 
     /// Requirement 12 — the two index spaces — at the one place a mismatch is silent.
@@ -1021,8 +1099,18 @@ mod v4_guard_tests {
         let (w, s, io) = parts(64);
         let lying = Sel { win: 64, ..plain() };
         // SAFETY: the shape guard precedes every launch.
-        let e = unsafe { attention(&d, lying, &w, &s, &io, Step::Decode { pos: 200 }, std::ptr::null_mut()) }
-            .expect_err("the (0, 0) idxs_shape in `parts` must be refused");
+        let e = unsafe {
+            attention(
+                &d,
+                lying,
+                &w,
+                &s,
+                &io,
+                Step::Decode { pos: 200 },
+                std::ptr::null_mut(),
+            )
+        }
+        .expect_err("the (0, 0) idxs_shape in `parts` must be refused");
         assert!(
             format!("{e}").contains("(1, 128)"),
             "attention took the selection width from the caller, not from Dims: {e}"
@@ -1037,8 +1125,18 @@ mod v4_guard_tests {
         d.head_dim = 0;
         let (w, s, io) = parts(64);
         // SAFETY: as above.
-        let e = unsafe { attention(&d, plain(), &w, &s, &io, Step::Decode { pos: 7 }, std::ptr::null_mut()) }
-            .expect_err("a zero head_dim must be refused before any launch");
+        let e = unsafe {
+            attention(
+                &d,
+                plain(),
+                &w,
+                &s,
+                &io,
+                Step::Decode { pos: 7 },
+                std::ptr::null_mut(),
+            )
+        }
+        .expect_err("a zero head_dim must be refused before any launch");
         let msg = format!("{e}");
         assert!(msg.contains("head_dim is zero"), "wrong rejection: {msg}");
 
@@ -1047,8 +1145,18 @@ mod v4_guard_tests {
         // true. It reached a launcher as guard code 1001 before `from_config` grew this.
         let mut d = dims();
         d.rope_head_dim = d.head_dim;
-        let e = unsafe { attention(&d, plain(), &w, &s, &io, Step::Decode { pos: 7 }, std::ptr::null_mut()) }
-            .expect_err("head_dim == rope_head_dim must be refused");
+        let e = unsafe {
+            attention(
+                &d,
+                plain(),
+                &w,
+                &s,
+                &io,
+                Step::Decode { pos: 7 },
+                std::ptr::null_mut(),
+            )
+        }
+        .expect_err("head_dim == rope_head_dim must be refused");
         assert!(format!("{e}").contains("is zero"), "wrong rejection: {e}");
     }
 }
