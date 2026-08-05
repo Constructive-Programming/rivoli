@@ -23,6 +23,18 @@ pub mod attn;
 pub mod indexer;
 pub mod math;
 
+/// V4-Flash's KV compressor and sparse indexer, host half (S2c of
+/// `docs/investigations/v4-flash-port.md`).
+///
+/// Ungated and backend-free for the same reason as `arch`: it is the two RoPE tables, the
+/// per-layer shape discriminants and the two *arithmetic* selection paths, all of which the
+/// offline converters and the CPU tests need without a device. The pooling and the scoring
+/// are device work (`kernels/v4comp.hip`).
+///
+/// Separate from [`indexer`], which is GLM's DSA lightning indexer: V4's `Indexer` shares
+/// the name and none of the structure — no `wk`, no `k_norm`, its own nested `Compressor`.
+pub mod v4compress;
+
 /// The DeepSeek-V4-Flash numerical oracle (S1b of `docs/investigations/v4-flash-port.md`).
 ///
 /// Backend-independent and engine-independent by construction: it imports nothing from
