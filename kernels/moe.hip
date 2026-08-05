@@ -283,7 +283,8 @@ __device__ __forceinline__ size_t f4_ng(int i_dim) {
 //
 // `x` must ALREADY be fp8-quantized (`act_quant_f8`) — this kernel cannot do it, see that
 // kernel's note. `limit` is `swiglu_limit` from the config, passed rather than #defined so
-// the kernel and `config.json` cannot drift; the launcher refuses `limit <= 0`, because an
+// the kernel and `config.json` cannot drift; the launcher refuses every value that would
+// DISABLE the clamp — `<= 0`, NaN and +/-inf alike — because an
 // unclamped SwiGLU on a `.f4` expert is `v4oracle::Defect::SwigluUnclamped` and there is no
 // V4 configuration that wants it.
 template <int R>
@@ -407,9 +408,23 @@ extern "C" int rivoli_moe_expert_range_f4(
     // 2026-07-31 by failing loudly at token 1 instead of silently computing a short row.
     if (nrow != 1) return 1003;
     if (e_start + e_count > n_desc) return 1004;
-    // `!(x > 0)` rather than `x <= 0`, so a NaN limit is refused too. Why refusing at all:
-    // see `moe_gateup_f4_impl`.
-    if (!(swiglu_limit > 0.0f)) return 1006;
+    // Every value that would DISABLE the clamp, refused. `x <= 0` would have admitted NaN;
+    // `!(x > 0)` alone admits +inf, which is the same destination and quieter — `fminf(gt,
+    // inf)` returns `gt`, so the clamp simply vanishes and the expert runs
+    // `v4oracle::Defect::SwigluUnclamped` with no error anywhere. Found 2026-08-05, after the
+    // one-sided form had been copied into `linalg.hip::rivoli_v4_swiglu_clamped` as a
+    // deliberate match; both were fixed together.
+    //
+    // Rejects NaN (every compare against NaN is false), 0, negative, -inf and +inf. The
+    // compare form follows `fwd.hip:224` for consistency and because it is one expression
+    // covering all of them — NOT for the robustness that comment claims: `build.rs:67` gives
+    // hipcc only `--offload-arch -O3 -fPIC`, so `-ffast-math` is not in play, and if it were,
+    // `-ffinite-math-only` would fold `limit < INFINITY` as readily as `isfinite()`. Why
+    // refusing at all: see `moe_gateup_f4_impl`.
+    //
+    // This is the launcher with REACHABLE callers, which is why it is the more urgent half:
+    // the shared expert's twin has none yet.
+    if (!(swiglu_limit > 0.0f && swiglu_limit < INFINITY)) return 1006;
     const ExpertDescF4* d = (const ExpertDescF4*)descs;
     hipStream_t s = (hipStream_t)stream;
     hipGetLastError();

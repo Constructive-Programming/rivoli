@@ -1041,42 +1041,46 @@ mod v4_guard_tests {
         (w, s, io)
     }
 
+    /// One `attention` call on the null stream, against a `parts()` triple.
+    ///
+    /// Extracted because rustfmt's reflow, after these calls gained a seventh argument, turned
+    /// four compact invocations into four identical eleven-line shapes that jscpd then refused
+    /// as clones. Worth doing anyway: the null stream and the SAFETY argument are stated once.
+    ///
+    /// # Safety
+    /// Every pointer in `p` is null, so soundness rests entirely on the call bailing BEFORE the
+    /// first launch. The obligation is not "the guard under test fires" — in
+    /// `a_decode_sized_scratch_refuses_a_prefill`'s second call the rows guard deliberately does
+    /// NOT fire, and it is `parts()`'s `idxs_shape: (0, 0)` backstop that stops it reaching a
+    /// launcher. The precondition is that the argument triple hits one of the pre-launch bails,
+    /// whichever one; `parts()` documents why it always does.
+    unsafe fn call(
+        d: &Dims,
+        sel: Sel,
+        p: &(Weights, Scratch, Io),
+        step: Step,
+    ) -> anyhow::Result<()> {
+        // SAFETY: as the doc above — null pointers, and every guard precedes every launch.
+        // `null_mut()` is the honest stream here: there is no launch for one to order.
+        unsafe { attention(d, sel, &p.0, &p.1, &p.2, step, std::ptr::null_mut()) }
+    }
+
     #[test]
     fn a_decode_sized_scratch_refuses_a_prefill() {
         let d = dims();
-        let (w, s, io) = parts(1);
+        let p = parts(1);
         // SAFETY: every pointer is null and none is read — the `rows` check precedes the
         // first launch, which is the property this asserts.
-        let e = unsafe {
-            attention(
-                &d,
-                plain(),
-                &w,
-                &s,
-                &io,
-                Step::Prefill { seqlen: 4 },
-                std::ptr::null_mut(),
-            )
-        }
-        .expect_err("a 4-row prefill into a 1-row scratch must be refused");
+        let e = unsafe { call(&d, plain(), &p, Step::Prefill { seqlen: 4 }) }
+            .expect_err("a 4-row prefill into a 1-row scratch must be refused");
         let msg = format!("{e}");
         assert!(msg.contains("scratch rows"), "wrong rejection: {msg}");
 
         // ...and the same call with room does NOT fail for this reason. It still fails —
         // the pointers are null — but the message proves the guard is a bound and not a
         // constant `false`, which is the shape S2 shipped twice.
-        let (w, s, io) = parts(4);
-        let msg = match unsafe {
-            attention(
-                &d,
-                plain(),
-                &w,
-                &s,
-                &io,
-                Step::Prefill { seqlen: 4 },
-                std::ptr::null_mut(),
-            )
-        } {
+        let p = parts(4);
+        let msg = match unsafe { call(&d, plain(), &p, Step::Prefill { seqlen: 4 }) } {
             Ok(()) => String::new(),
             Err(e) => format!("{e}"),
         };
@@ -1096,21 +1100,11 @@ mod v4_guard_tests {
     #[test]
     fn the_selection_window_cannot_disagree_with_the_ring_window() {
         let d = dims(); // window 128
-        let (w, s, io) = parts(64);
+        let p = parts(64);
         let lying = Sel { win: 64, ..plain() };
         // SAFETY: the shape guard precedes every launch.
-        let e = unsafe {
-            attention(
-                &d,
-                lying,
-                &w,
-                &s,
-                &io,
-                Step::Decode { pos: 200 },
-                std::ptr::null_mut(),
-            )
-        }
-        .expect_err("the (0, 0) idxs_shape in `parts` must be refused");
+        let e = unsafe { call(&d, lying, &p, Step::Decode { pos: 200 }) }
+            .expect_err("the (0, 0) idxs_shape in `parts` must be refused");
         assert!(
             format!("{e}").contains("(1, 128)"),
             "attention took the selection width from the caller, not from Dims: {e}"
@@ -1123,20 +1117,10 @@ mod v4_guard_tests {
         // and what requirement 7 is about. Ample rows, so the other guard is not in play.
         let mut d = dims();
         d.head_dim = 0;
-        let (w, s, io) = parts(64);
+        let p = parts(64);
         // SAFETY: as above.
-        let e = unsafe {
-            attention(
-                &d,
-                plain(),
-                &w,
-                &s,
-                &io,
-                Step::Decode { pos: 7 },
-                std::ptr::null_mut(),
-            )
-        }
-        .expect_err("a zero head_dim must be refused before any launch");
+        let e = unsafe { call(&d, plain(), &p, Step::Decode { pos: 7 }) }
+            .expect_err("a zero head_dim must be refused before any launch");
         let msg = format!("{e}");
         assert!(msg.contains("head_dim is zero"), "wrong rejection: {msg}");
 
@@ -1145,18 +1129,8 @@ mod v4_guard_tests {
         // true. It reached a launcher as guard code 1001 before `from_config` grew this.
         let mut d = dims();
         d.rope_head_dim = d.head_dim;
-        let e = unsafe {
-            attention(
-                &d,
-                plain(),
-                &w,
-                &s,
-                &io,
-                Step::Decode { pos: 7 },
-                std::ptr::null_mut(),
-            )
-        }
-        .expect_err("head_dim == rope_head_dim must be refused");
+        let e = unsafe { call(&d, plain(), &p, Step::Decode { pos: 7 }) }
+            .expect_err("head_dim == rope_head_dim must be refused");
         assert!(format!("{e}").contains("is zero"), "wrong rejection: {e}");
     }
 }

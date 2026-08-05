@@ -725,7 +725,8 @@ pub unsafe fn launch_moe_expert_range_i4(
 /// expert last. An index one past the end there reads the wrong expert; here it reads
 /// something that is not e2m1 nibbles at all, i.e. the wrong ARITHMETIC.
 ///
-/// `swiglu_limit` comes from the config (`10.0`); the launcher refuses `<= 0` because an
+/// `swiglu_limit` comes from the config (`10.0`); the launcher refuses every value that
+/// would disable the clamp — `<= 0`, NaN and `+/-inf` — because an
 /// unclamped SwiGLU on this path is a known silent defect, not a configuration.
 ///
 /// # Safety
@@ -1404,11 +1405,16 @@ pub unsafe fn launch_swiglu(g: *const f32, u: *const f32, n: usize, h: *mut f32)
 ///   `Expert.forward` reads it back with `.float()`) — `Defect::NoBf16Rounding`;
 /// - the product is bf16-rounded, the reference's `x.to(dtype)` in front of `w2`;
 /// - `F.silu`'s multiply form `g·sigmoid(g)`, not the division form, which `moe.hip` records
-///   as one rounding apart — enough to flip a whole bf16 ulp at a boundary.
+///   as one rounding apart that "would normally vanish under the bf16 store ... except
+///   exactly at a rounding boundary". This one is **true by construction and unexercised**:
+///   swapping the forms was measured bit-identical over all 512 outputs of the fp4 fixture
+///   (2026-08-05), which is what that comment predicts when the boundary is not reached.
+///   The decision below does not rest on it — the two bf16 roundings and the clamp are each
+///   demonstrated by a break that goes red.
 ///
 /// GLM has no `swiglu_limit` and should never acquire one, so passing an "unclamped"
 /// sentinel from its four call sites would put a value in the tree that no config can
-/// produce. This refuses `limit <= 0` **and NaN** (guard 1006, the same code `moe.hip`
+/// produce. This refuses `limit <= 0`, **NaN and `+/-inf`** (guard 1006, the same code `moe.hip`
 /// returns for the same check on the same argument), so unclamped is not spellable here.
 ///
 /// The clamp itself is one `kernels/common.hpp::swiglu_clamped`, shared with

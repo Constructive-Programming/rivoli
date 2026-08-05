@@ -270,8 +270,13 @@ extern "C" __global__ void swiglu(
 //   * this bf16-rounds BOTH operands before combining (`Linear` stores bf16 and
 //     `Expert.forward` reads it back with `.float()`) — `Defect::NoBf16Rounding`;
 //   * this uses `F.silu`'s multiply form `x·sigmoid(x)`, not `swiglu`'s division form
-//     `x/(1+e^-x)` — one rounding apart, and that rounding flips a whole bf16 ulp at a
-//     boundary, which the store below then freezes in;
+//     `x/(1+e^-x)` — one rounding apart, which `common.hpp::swiglu_clamped` point 3 says
+//     "would normally vanish under the bf16 store ... except exactly at a rounding
+//     boundary". **UNDEMONSTRATED, and say so: measured 2026-08-05, swapping the two forms
+//     in `moe_gateup_f4_impl` left the fp4 dispatch BIT-IDENTICAL across all 512 outputs.**
+//     That is the predicted result for a fixture that misses the boundary — it does not
+//     refute the reasoning, but no test in this tree exercises the case. An earlier draft of
+//     this line dropped the conditional and read as though the difference were routine;
 //   * this bf16-rounds the RESULT, which is the reference's `x.to(dtype)` before `w2`.
 //
 // So adding an `L` parameter to `swiglu` and passing something meaning "unclamped" from
@@ -658,14 +663,39 @@ extern "C" int rivoli_swiglu(const float* g, const float* u, int n, float* h) {
 extern "C" int rivoli_v4_swiglu_clamped(const float* g, const float* u, int n, float limit,
                                         float* h, void* stream) {
     if (n <= 0) return 1001;
-    // 1006, and deliberately the SAME code `moe.hip`'s fp4 launcher returns for the same
-    // check on the same argument — a reader who learned the code there gets it here. Written
-    // `!(limit > 0.0f)` rather than `limit <= 0.0f` so NaN is REJECTED: every comparison
-    // against NaN is false, so `limit <= 0` admits it, and a NaN limit makes
-    // `fminf(gt, limit)` return `gt` (fminf returns the non-NaN operand) — i.e. it degrades
-    // silently to the unclamped form this launcher exists to make unspellable, rather than
-    // producing NaN output someone would notice.
-    if (!(limit > 0.0f)) return 1006;
+    // 1006, and deliberately the SAME code AND the same expression as `moe.hip`'s fp4
+    // launcher, for the same check on the same argument — a reader who learned it there gets
+    // it here. Both refuse every value that would disable the clamp, and getting to that took
+    // two passes:
+    //
+    //   * `limit <= 0.0f` admits NaN, because every comparison against NaN is false. A NaN
+    //     limit makes `fminf(gt, limit)` return `gt` — `fminf` returns the non-NaN operand —
+    //     so it degrades silently to the unclamped form rather than producing NaN output
+    //     someone would notice. Hence `!(limit > 0.0f)`.
+    //   * `!(limit > 0.0f)` admits +INFINITY, which is the SAME destination and quieter still:
+    //     `fminf(gt, inf)` is `gt` and `fmaxf(ut, -inf)` is `ut`, so the clamp vanishes
+    //     entirely. Found 2026-08-05 — the first bullet closed the case in mind and left the
+    //     one beside it open, which is the shape this port keeps producing.
+    //
+    // The compare form rather than `isfinite()`, following `fwd.hip:224` — but NOT for the
+    // reason that comment gives. It says the compare form "avoids depending on `-ffast-math`
+    // having left `isfinite()` meaningful", and neither half holds here: `build.rs:67` passes
+    // hipcc only `--offload-arch -O3 -fPIC`, so `-ffast-math` is not in play at all, and if it
+    // were, `-ffinite-math-only` would fold `limit < INFINITY` to `true` exactly as readily as
+    // it folds `isfinite()`. The compare form is kept for consistency with `fwd.hip` and
+    // because it is one expression covering all four rejected values; it buys no extra
+    // robustness. Corrected 2026-08-05 — the code was right and the reason was not.
+    //
+    // **This guard is the ONLY thing rejecting +inf, and an earlier version of this comment
+    // said the opposite.** It claimed `V4Config::validate` required a finite positive
+    // `swiglu_limit` upstream, making this the redundant half. It does not:
+    // `artifact/model.rs:726` is `ensure!(self.swiglu_limit > 0.0, ...)`, which rejects NaN
+    // and zero and **admits +inf** — the identical one-sided spelling, in the identical
+    // shape, one layer up. Checked 2026-08-05 rather than assumed, which is the only reason
+    // this line is not still wrong. The upstream hole is recorded in
+    // `docs/investigations/v4-flash-port.md`; fixing it is `artifact/`'s call, and until it
+    // happens this launcher is the whole defence.
+    if (!(limit > 0.0f && limit < INFINITY)) return 1006;
     hipGetLastError();
     hipLaunchKernelGGL(v4_swiglu_clamped, dim3((unsigned)((n + 255) / 256)), dim3(256), 0,
                        (hipStream_t)stream, g, u, n, limit, h);
