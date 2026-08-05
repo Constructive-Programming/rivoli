@@ -363,8 +363,10 @@ pub mod v4 {
         /// A field never declared at all is invisible to it. Both are in `V4_BASE` now.
         pub fn from_config(cfg: &V4Config) -> Result<Self> {
             // `f64` in the config because JSON numbers are, `f32` in `Dims` because the
-            // kernels are. Narrowing is exact for the shipped 1e-6 and for any eps a
-            // config would carry.
+            // kernels are. The narrowing ROUNDS — 1e-6 is representable in
+            // neither format — but it lands on the same bits as the f32 literal `1e-6`, so
+            // there is no double-rounding surprise, and the ~5e-14 absolute error is
+            // thirteen orders below the norm it perturbs.
             let (window, norm_eps) = (cfg.sliding_window, cfg.rms_norm_eps as f32);
             let d = Self {
                 dim: cfg.hidden,
@@ -415,6 +417,17 @@ pub mod v4 {
                 if !n.is_multiple_of(FP8_BLOCK) {
                     bail!("v4 attention: {what} = {n} is not a multiple of {FP8_BLOCK}");
                 }
+            }
+            // The one extent the sweep above cannot reach, because it is DERIVED. A
+            // config with `qk_rope_head_dim == head_dim` — "rotate the whole head", which
+            // looks entirely ordinary — passes the rope bound (`512 > 512` is false), is
+            // even, and then satisfies the multiple-of-64 test below because
+            // `0.is_multiple_of(64)` is TRUE. That is the same `is_multiple_of`-admits-zero
+            // property the zero sweep was added for. It reached `launch_v4_act_quant` with
+            // `n = 0` and came back as `argument guard rejected (1001)`: late, opaque, and
+            // exactly what the sweep exists to prevent.
+            if d.head_dim == d.rope_head_dim {
+                bail!("v4 attention: head_dim - qk_rope_head_dim is zero");
             }
             if !(d.head_dim - d.rope_head_dim).is_multiple_of(KV_QUANT_BLOCK) {
                 bail!(

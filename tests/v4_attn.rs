@@ -609,8 +609,10 @@ fn each_in_scope_defect_is_further_away_than_the_kernels_are() {
     // re-associated f32 sum can land on the other side of a bf16 rounding boundary. If
     // this ever goes red, establish that it is that before relaxing it — the same
     // re-association would move a handful of elements by one ULP, where a real defect
-    // moves thousands by tens of thousands (see the separations below).
-    assert_eq!(floor, 0, "the kernels are no longer bit-exact against the oracle");
+    // moves thousands by tens of thousands. The assertion is DEFERRED to the end of this
+    // test so the per-defect table below still prints when it fires: asserting here
+    // aborted the run and withheld exactly the evidence this comment sends the reader to
+    // weigh.
 
     let mut worst: Option<(Defect, i32)> = None;
     for (stage, defect) in in_scope() {
@@ -632,6 +634,7 @@ fn each_in_scope_defect_is_further_away_than_the_kernels_are() {
     // the floor is visible as a shrinking margin before it is visible as a failure.
     let (d_worst, r_worst) = worst.expect("in_scope() is empty");
     println!("tightest margin: {d_worst:?} at {r_worst} ULP against a floor of {floor}");
+    assert_eq!(floor, 0, "the kernels are no longer bit-exact against the oracle");
 
     // ANTI-DRIFT. The oracle owns the defect set; this file names a subset of it. If a
     // breakage is added there, the complement changes and this fails — which forces S2b's
@@ -788,11 +791,16 @@ fn dims_accept_the_real_artifact_and_reject_a_ragged_kv_span() {
     let d = Dims::from_config(&cfg).expect("the shipped config must be runnable");
     assert_eq!((d.head_dim, d.rope_head_dim, d.n_heads), (512, 64, 64));
     assert_eq!((d.head_dim - d.rope_head_dim) % 64, 0, "the partial act_quant needs whole blocks");
-    // The two fields `V4Config` gained in `b5d4083`, read off the manifest rather than
-    // supplied by the caller. Asserted by VALUE: a parser that silently defaulted them
-    // would still produce a `Dims`, and 128/1e-6 are exactly the plausible defaults.
-    assert_eq!(d.window, 128, "sliding_window is not coming from the manifest");
-    assert!((d.norm_eps - 1e-6).abs() < 1e-12, "rms_norm_eps is not coming from the manifest");
+    // The two fields `V4Config` gained in `b5d4083`. What these pin is the WIRING —
+    // that `from_config` puts `cfg.sliding_window` into `Dims.window` and
+    // `cfg.rms_norm_eps` into `Dims.norm_eps`, rather than another field of the same
+    // type. They do NOT catch a defaulting parser, which an earlier comment here claimed:
+    // a `#[serde(default = "…")]` returning 128 passes this identically, and a bare
+    // `#[serde(default)]` yields 0 and is caught upstream by the zero sweep. The guard
+    // against defaults is `every_v4_field_is_required`, which covers both since
+    // `b5d4083` put them in `V4_BASE`.
+    assert_eq!(d.window, 128, "sliding_window is not wired through to Dims.window");
+    assert!((d.norm_eps - 1e-6).abs() < 1e-12, "rms_norm_eps is not wired through to Dims.norm_eps");
 
     // The rejection half. A `rope_head_dim` that leaves a ragged non-RoPE span would
     // make `act_quant` quantize a short tail block against its own amax — values the
@@ -810,14 +818,25 @@ fn dims_accept_the_real_artifact_and_reject_a_ragged_kv_span() {
     // kernels index with is in that list. A subset proves neither, and the first draft
     // shipped six of eight, omitting `n_heads` and `hidden`.
     //
-    // The rejection is matched on the FIELD NAME, not just on "is zero", so the sweep is
-    // also pinned to run before the divisibility checks — a reordering that let
-    // `head_dim = 0` fail as "not a multiple of 64" would pass a laxer assertion.
+    // The rejection is matched on the FIELD NAME, and what that buys is the field->label
+    // MAPPING — the only thing in this file that would catch `q_lora_rank` being wired to
+    // `cfg.o_lora_rank`, since both are 1024 in the shipped config and no value assertion
+    // separates them.
+    //
+    // It does NOT pin the sweep's position, though an earlier draft of this comment
+    // claimed it did. Traced against a sweep moved to the end of `from_config`: six of the
+    // cases pass every intervening check and still reach it with their own correct
+    // message, and the two that do not (`head_dim`, `o_groups`) are intercepted with
+    // messages containing no "is zero" at all — so a strict and a lax assertion have
+    // identical reordering sensitivity in all nine cases.
     /// One named extent, and how to zero it. Named so the array below is a table of
-    /// FIELDS rather than a tuple soup, and typed so the count is checked: `[ZeroCase; 8]`
-    /// stops being 8 the moment someone drops a case, which is how it shipped 6 of 8.
+    /// FIELDS rather than a tuple soup, and typed so the count is checked: `[ZeroCase; 9]`
+    /// stops being 9 the moment someone drops a case; it shipped 6 of 8, then 8 of 9.
     type ZeroCase = (&'static str, fn(&mut EngineV4Config));
-    let cases: [ZeroCase; 8] = [
+    let cases: [ZeroCase; 9] = [
+        // DERIVED, and the reason this list is 9 and not 8: the KV entry's non-RoPE span
+        // is what `act_quant` sizes on, and no config field holds it.
+        ("head_dim - qk_rope_head_dim", |c| c.qk_rope_head_dim = c.head_dim),
         ("sliding_window", |c| c.sliding_window = 0),
         ("n_heads", |c| c.n_heads = 0),
         ("o_groups", |c| c.o_groups = 0),
