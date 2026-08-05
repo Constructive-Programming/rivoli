@@ -161,32 +161,153 @@ fn flat_freqs(t: &[(f32, f32)]) -> Vec<f32> {
 // the metric
 // =======================================================================================
 
-/// The largest bf16 ULP gap between two slices, and where it is.
+/// A comparison of two `[n, d]` block sets, split by whether `act_quant` touched the dim.
 ///
-/// Both sides hold **bf16 values** — the kernel's last act on every row is `v4c_rbf16` and
-/// the oracle's is `round_bf16` — so the natural unit is exact and no epsilon is chosen:
-/// re-encode both and difference the codes. A gap of 0 is bit-identical; 1 is adjacent
-/// representable values.
+/// The split is the instrument. `act_quant` covers dims `[0, d - rd)` at block 64 and leaves
+/// the RoPE tail `[d - rd, d)` in bf16 (model.py:378), so **the tail is a direct window onto
+/// the pre-quantization arithmetic**. A disagreement confined to the quantized region cannot
+/// be a pooling, norm or RoPE bug; one that appears in the tail must be.
 ///
-/// Sign is handled by mapping to a monotone ordering first. Comparing raw bf16 codes across
-/// zero would report ~65000 for two values a hair apart, which would make the whole metric
-/// read as noise exactly where cancellation put the interesting cases.
-fn ulp_gap(want: &[f32], got: &[f32]) -> u32 {
-    assert_eq!(want.len(), got.len(), "ulp_gap: length mismatch");
+/// `worst_ratio` exists because e4m3 is a STEP function: a pre-quantization value a hair
+/// over a rounding boundary quantizes a whole step away, and one e4m3 step is
+/// [`E4M3_ULP`] = **exactly 16 bf16 codes**. By magnitude alone that is indistinguishable
+/// from a real ~9% arithmetic error; what distinguishes it is the RATIO landing on an e4m3
+/// step and only a handful of elements moving at all.
+struct Diff {
+    /// Max bf16 code gap over every element.
+    max: u32,
+    /// Max over dims `act_quant` rewrote.
+    max_quant: u32,
+    /// Max over the RoPE tail, which `act_quant` never touches.
+    max_tail: u32,
+    /// How many elements differ at all, out of how many.
+    differing: usize,
+    total: usize,
+    /// `(dim within the row, want, got)` at the largest gap.
+    worst: (usize, f32, f32),
+}
+
+impl Diff {
+    /// `got / want` at the worst element. One e4m3 step is a ratio in **[1.0667, 1.125]**
+    /// (or the reciprocal) depending where in the binade it lands — not `1.125` flat, which
+    /// only holds at mantissa 0. Outside that range the disagreement is not a boundary flip.
+    fn worst_ratio(&self) -> f32 {
+        let (_, w, g) = self.worst;
+        if w == 0.0 { f32::INFINITY } else { g / w }
+    }
+
+    fn one_line(&self, label: &str) -> String {
+        let head = format!(
+            "{label}: max={} (quant_dims={} rope_tail={}) differing={}/{} ({:.4}%)",
+            self.max,
+            self.max_quant,
+            self.max_tail,
+            self.differing,
+            self.total,
+            100.0 * self.differing as f64 / self.total as f64
+        );
+        // `worst` is only meaningful when something differed. Printing `ratio=inf` for a
+        // bit-identical pass would read as the pathological "want is zero" case on the one
+        // line a triager looks at.
+        if self.differing == 0 {
+            return format!("{head} bit-identical");
+        }
+        let (dim, w, g) = self.worst;
+        format!("{head} worst@dim{dim} want={w:e} got={g:e} ratio={:.4}", self.worst_ratio())
+    }
+}
+
+/// Compare two flattened `[n, d]` block sets in bf16 code space.
+///
+/// Both sides hold bf16 values — the kernel's last act on every row is `v4c_rbf16` and the
+/// oracle's is `round_bf16` — so the unit is exact and no epsilon is chosen: re-encode both
+/// and difference the codes. 0 is bit-identical, 1 is adjacent representable values.
+///
+/// Sign goes through a monotone ordering first. Raw bf16 codes across zero would report
+/// ~65000 for two values a hair apart, which would make the metric read as noise exactly
+/// where cancellation put the interesting cases.
+///
+/// **This is a RELATIVE metric and it has a known blind spot at zero**: a code gap says
+/// nothing about absolute magnitude, so an element near zero can report a large gap for a
+/// negligible absolute difference. That is why [`Diff`] carries `differing` and `worst` —
+/// the count and the actual pair are what separate that case from a real error, and the max
+/// alone cannot.
+fn diff(want: &[f32], got: &[f32], d: usize, rd: usize) -> Diff {
+    assert_eq!(want.len(), got.len(), "diff: length mismatch");
+    assert!(want.len().is_multiple_of(d), "diff: not a whole number of [d] rows");
     let ord = |x: f32| -> i32 {
         let c = i32::from(f32_to_bf16(x) as i16);
         if c < 0 { -32768 - c } else { c }
     };
-    want.iter().zip(got).map(|(&a, &b)| ord(a).abs_diff(ord(b))).max().unwrap_or(0)
+    let quant_dims = d - rd;
+    let mut out = Diff {
+        max: 0,
+        max_quant: 0,
+        max_tail: 0,
+        differing: 0,
+        total: want.len(),
+        worst: (0, 0.0, 0.0),
+    };
+    for (i, (&w, &g)) in want.iter().zip(got).enumerate() {
+        let e = ord(w).abs_diff(ord(g));
+        if e == 0 {
+            continue;
+        }
+        out.differing += 1;
+        let dim = i % d;
+        if dim < quant_dims {
+            out.max_quant = out.max_quant.max(e);
+        } else {
+            out.max_tail = out.max_tail.max(e);
+        }
+        if e > out.max {
+            out.max = e;
+            out.worst = (dim, w, g);
+        }
+    }
+    out
 }
 
-/// Print the gap with its label. The number is the evidence — a comparison that passed at 0
-/// ULP and one that passed at 3 look identical in a green test run, and only one of them
-/// says the kernel reproduces the reference.
-fn gap(label: &str, want: &[f32], got: &[f32]) -> u32 {
-    let g = ulp_gap(want, got);
-    println!("{label}: max bf16 ULP gap = {g}");
-    g
+/// The verdict on a CLEAN comparison, stated in the unit each region actually ends in.
+///
+/// Three conditions, and the point is that no one of them can be satisfied by loosening
+/// another: the RoPE tail is not quantized so it is held to the bf16 floor; the quantized
+/// dims may differ by at most one e4m3 step; and only a sliver of elements may differ at
+/// all. A real arithmetic error shows up in the tail, or moves more than one step, or moves
+/// the bulk of the elements — this rejects all three.
+fn assert_clean(name: &str, dv: &Diff) -> Vec<String> {
+    let mut bad = Vec::new();
+    if dv.max_tail > CLEAN_ULP {
+        bad.push(format!(
+            "{name}: RoPE tail {} > {CLEAN_ULP} bf16 ULP — `act_quant` never touches those \
+             dims, so this is the pooling, the norm or the rotation and not a rounding step",
+            dv.max_tail
+        ));
+    }
+    if dv.max_quant > E4M3_ULP {
+        bad.push(format!(
+            "{name}: quantized dims {} > one e4m3 step ({E4M3_ULP}) — more than a boundary flip",
+            dv.max_quant
+        ));
+    }
+    let frac = dv.differing as f64 / dv.total as f64;
+    if frac > MAX_BOUNDARY_FLIPS {
+        bad.push(format!(
+            "{name}: {}/{} elements differ ({:.3}%) — a boundary flip is rare and this is \
+             systematic, so the one-step allowance is covering a real error",
+            dv.differing, dv.total, 100.0 * frac
+        ));
+    }
+    bad
+}
+
+/// Compare and PRINT. The number is the evidence — a comparison that passed at 0 and one
+/// that passed at 3 look identical in a green run, and only one says the kernel reproduces
+/// the reference.
+fn gap(label: &str, want: &[f32], got: &[f32], d: usize, rd: usize) -> u32 {
+    let dv = diff(want, got, d, rd);
+    println!("{}", dv.one_line(label));
+    dv.max
 }
 
 /// The bound every clean comparison in this file is held to.
@@ -197,14 +318,60 @@ fn gap(label: &str, want: &[f32], got: &[f32]) -> u32 {
 /// relative ~1e-7, which the following bf16 store rounds away in almost every element and
 /// occasionally does not. `expf` versus `f32::exp` adds the same order again.
 ///
-/// 2 is chosen as "the re-association floor plus one", and the measured gaps are PRINTED so
-/// a future reader can see how much of it was actually used rather than trusting the bound.
+/// 2 is "the re-association floor plus one". It applies **only to the RoPE tail**, which is
+/// the last region still ending in a bf16 store — see [`E4M3_ULP`] for why it was the wrong
+/// unit for the rest, and for what the first real-weights run actually measured.
 const CLEAN_ULP: u32 = 2;
 
-/// How much further a defect must be than the clean comparison for the separation to mean
-/// anything. A defect that moved the output by 3 ULP against a clean gap of 2 would be
-/// inside the noise; one that moves it by 20x is not.
-const SEPARATION: u32 = 8;
+/// One e4m3 quantization step, in bf16 codes. **Exactly 16, in every binade.**
+///
+/// e4m3 carries 3 mantissa bits and bf16 carries 7, over the same exponent semantics: a
+/// value is `2^E·(1 + m/8)` against `2^E·(1 + n/128)`, so `m → m+1` *is* `n → n+16`. There
+/// is no binade dependence and no approximation in that.
+///
+/// **This is why the first real-weights run read 16 and why widening `CLEAN_ULP` would have
+/// been the wrong repair.** `act_quant` is the last thing that touches dims `[0, d - rd)`,
+/// so those dims do not end in a bf16 store at all — they end in an e4m3 one, and 16 codes
+/// is not "a 9% error", it is the SMALLEST nonzero disagreement those dims can express. It
+/// is the e4m3 1-ULP. Holding a quantized output to a bf16 ULP was a unit error in the
+/// harness, not a defect in the kernel.
+///
+/// The bound stays honest because it is one step and because two independent conditions sit
+/// beside it: the untouched RoPE tail is still held to [`CLEAN_ULP`], and
+/// [`MAX_BOUNDARY_FLIPS`] caps how many elements may move at all. A systematic error cannot
+/// hide under a one-step allowance while satisfying both.
+const E4M3_ULP: u32 = 16;
+
+/// The fraction of elements allowed to sit on the far side of an e4m3 rounding boundary.
+///
+/// Derived, and then actually SET at the derivation — which the first version of this
+/// constant was not, and a reviewer showed what that cost.
+///
+/// An element flips only if its pre-quantization value lies within the two implementations'
+/// relative disagreement `ε` of a boundary. The relative step is `(1/8)/(1 + m/8)` for
+/// `m ∈ [0,8)`, i.e. between **0.0667 and 0.125** — so the expected flip fraction is
+/// `ε / 0.0667`, not `ε / 0.125`; taking the wide end understates flips by up to 1.9x.
+/// Re-association puts `ε` near 1e-6, predicting well under one flip in 32768 elements;
+/// `ε = 1e-4` predicts 0.15%.
+///
+/// **This was 1% and that was wrong.** At 1% the three clean conditions were jointly
+/// satisfiable by a real systematic error: a uniform ~0.1% relative error (a wrong
+/// `norm_eps`, an `ape` scaled by 1e-3, a subtly wrong softmax) leaves the tail under one
+/// bf16 code — one code is 0.78% relative — flips the quantized dims by exactly one step
+/// where it flips them at all, and lands near 0.8% of elements. All three green, real bug.
+/// At 0.1% that example fails loudly, while still sitting ~40x above the worst `ε` the
+/// derivation admits. The measured fraction is printed on every comparison so this can be
+/// tightened from data rather than from argument.
+const MAX_BOUNDARY_FLIPS: f64 = 0.001;
+
+/// How far a defect must move the output before the comparison is said to resolve it.
+///
+/// Stated against the **quantization floor**, not against the clean gap. One e4m3 step is
+/// the smallest disagreement a quantized dim can express, so anything within a step or two
+/// of that is indistinguishable from a boundary flip. Four steps is the bound; the first
+/// real-weights run measured the `no-ape` separations at ~30000, nearly 2000 steps, so real
+/// defects clear this by three orders of magnitude and the bound is not what decides them.
+const RESOLVABLE: u32 = 4 * E4M3_ULP;
 
 // =======================================================================================
 // one cell
@@ -419,14 +586,21 @@ fn decode_script(ratio: usize, last: usize) -> Vec<(usize, usize)> {
 #[test]
 fn the_four_cells_reproduce_the_oracle() {
     let Some((ck, cfg, list)) = cells() else { return };
+    // Every cell reports BEFORE anything asserts. The first run of this file asserted inside
+    // the loop and failed on cell 1 of 4, so three quarters of the diagnostic never printed
+    // and the failure could not be told from a phase-dependent one. A gate that aborts on
+    // its first cell hands back a quarter of what it measured.
+    let mut over = Vec::new();
     for Spec { layer, script, name } in list {
         let mut cell = Cell::load(&ck, &cfg, layer);
         let (want, got) = cell.run(Defect::None, &script, None, None);
         assert!(!want.is_empty(), "{name}: the script emitted nothing — it gates nothing");
         assert!(got.iter().all(|v| v.is_finite()), "{name}: non-finite output");
-        let g = gap(name, &want, &got);
-        assert!(g <= CLEAN_ULP, "{name}: {g} ULP > {CLEAN_ULP}");
+        let dv = diff(&want, &got, cfg.head_dim, cfg.rope_head_dim);
+        println!("{}", dv.one_line(name));
+        over.extend(assert_clean(name, &dv));
     }
+    assert!(over.is_empty(), "clean comparison failed:\n  {}", over.join("\n  "));
 }
 
 /// The ratio-128 prefill at 256 reads NO compressor state — re-proved against the GPU.
@@ -472,7 +646,7 @@ fn zeroing_ape_reproduces_the_no_ape_defect_exactly() {
         let zeros = vec![0.0f32; cell.cw.ape.len()];
         let (clean, _) = cell.run(Defect::None, &script, None, None);
         let (broken, gpu) = cell.run(Defect::CompressorNoApe, &script, Some(&zeros), None);
-        assert_impersonates(name, "no-ape", &clean, &broken, &gpu);
+        assert_impersonates(name, "no-ape", &clean, &broken, &gpu, cfg.head_dim, cfg.rope_head_dim);
     }
 }
 
@@ -493,7 +667,7 @@ fn the_ratio_0_rope_table_reproduces_the_no_yarn_defect_exactly() {
         assert_ne!(plain, cell.table(Defect::None), "{name}: the two tables must differ");
         let (clean, _) = cell.run(Defect::None, &script, None, None);
         let (broken, gpu) = cell.run(Defect::RopeNoYarn, &script, None, Some(&plain));
-        assert_impersonates(name, "no-yarn", &clean, &broken, &gpu);
+        assert_impersonates(name, "no-yarn", &clean, &broken, &gpu, cfg.head_dim, cfg.rope_head_dim);
     }
 }
 
@@ -504,18 +678,32 @@ fn the_ratio_0_rope_table_reproduces_the_no_yarn_defect_exactly() {
 /// perturbation is only known to have changed something. Without the second, a kernel that
 /// ignored the perturbed input entirely — the exact failure being hunted — would pass,
 /// because the clean and defect oracles would be close and it would match both.
-fn assert_impersonates(cell: &str, what: &str, clean: &[f32], broken: &[f32], gpu: &[f32]) {
-    let hit = gap(&format!("{cell} {what}: gpu vs defect-oracle"), broken, gpu);
+fn assert_impersonates(
+    cell: &str,
+    what: &str,
+    clean: &[f32],
+    broken: &[f32],
+    gpu: &[f32],
+    d: usize,
+    rd: usize,
+) {
+    let hit = diff(broken, gpu, d, rd);
+    println!("{}", hit.one_line(&format!("{cell} {what}: gpu vs defect-oracle")));
+    let bad = assert_clean(&format!("{cell} {what} impersonation"), &hit);
     assert!(
-        hit <= CLEAN_ULP,
-        "{cell}: the {what} perturbation must land exactly where the oracle's own defect \
-         lands, got {hit} ULP > {CLEAN_ULP}"
+        bad.is_empty(),
+        "the {what} perturbation must land on the oracle's own defect to within the \
+         quantization floor (NOT bit-exactly -- `act_quant` makes one e4m3 step the smallest \
+         expressible disagreement):\n  {}",
+        bad.join("\n  ")
     );
-    let sep = gap(&format!("{cell} {what}: gpu vs CLEAN oracle"), clean, gpu);
+    let sep = gap(&format!("{cell} {what}: gpu vs CLEAN oracle"), clean, gpu, d, rd);
     assert!(
-        sep >= SEPARATION * CLEAN_ULP,
-        "{cell}: the {what} perturbation moved the output by only {sep} ULP, so this cell \
-         cannot see whether the input is consulted at all and must not be cited as covering it"
+        sep >= RESOLVABLE,
+        "{cell}: the {what} perturbation moved the output by only {sep} codes — under \
+         {RESOLVABLE} ({} e4m3 steps) it is not distinguishable from the quantization floor, \
+         so this cell cannot see whether the input is consulted at all",
+        RESOLVABLE / E4M3_ULP
     );
 }
 
@@ -549,32 +737,40 @@ fn each_in_scope_defect_is_further_from_the_gpu_than_the_clean_oracle_is() {
     let in_scope: Vec<Defect> = Defect::ALL.iter().copied().filter(|d| in_compressor_scope(*d)).collect();
     assert!(in_scope.len() >= 10, "the scope filter selected almost nothing");
 
+    let mut bad = Vec::new();
     for Spec { layer, script, name } in list {
         let mut cell = Cell::load(&ck, &cfg, layer);
         let (clean, gpu) = cell.run(Defect::None, &script, None, None);
-        let base = gap(&format!("{name} clean"), &clean, &gpu);
-        assert!(base <= CLEAN_ULP, "{name}: clean gap {base} — nothing below is meaningful");
+        let cd = diff(&clean, &gpu, cfg.head_dim, cfg.rope_head_dim);
+        println!("{}", cd.one_line(&format!("{name} clean")));
+        // RECORDED, not asserted here. An over-budget clean comparison makes the separations
+        // below uninterpretable, but it does not make them unmeasurable — and their pattern
+        // is diagnostic in its own right, so measuring them beats aborting.
+        bad.extend(assert_clean(name, &cd));
 
-        for &d in &in_scope {
+        for &def in &in_scope {
             // The two impersonations have their own, stronger tests above.
-            if matches!(d, Defect::CompressorNoApe | Defect::RopeNoYarn) {
+            if matches!(def, Defect::CompressorNoApe | Defect::RopeNoYarn) {
                 continue;
             }
-            let (broken, _) = cell.run(d, &script, None, None);
+            let (broken, _) = cell.run(def, &script, None, None);
             if broken == clean {
                 // INERT here, by construction. Printed rather than skipped silently: the
                 // point of naming it is that this cell must not be counted as covering it.
-                println!("{name}: {d:?} is INERT here — this cell covers it not at all");
+                println!("{name}: {def:?} is INERT here — this cell covers it not at all");
                 continue;
             }
-            let sep = gap(&format!("{name} {d:?}"), &broken, &gpu);
-            assert!(
-                sep >= SEPARATION * CLEAN_ULP,
-                "{name}: {d:?} sits {sep} ULP from the GPU against a clean {base} — the \
-                 metric cannot resolve it, so a kernel carrying that defect might well pass"
-            );
+            let sep = gap(&format!("{name} {def:?}"), &broken, &gpu, cfg.head_dim, cfg.rope_head_dim);
+            if sep < RESOLVABLE {
+                bad.push(format!("{name}/{def:?} sep={sep} < {RESOLVABLE}"));
+            }
         }
     }
+    assert!(
+        bad.is_empty(),
+        "the metric cannot resolve these, so a kernel carrying the defect might well pass: {}",
+        bad.join(" | ")
+    );
 }
 
 /// Does this breakage live anywhere the attention compressor touches?
@@ -661,11 +857,11 @@ fn the_overlap_defect_is_inert_at_ratio_128_and_live_at_ratio_4() {
     let (clean_4, gpu_4) = l2.run(Defect::None, &script_4, None, None);
     let (broken_4, _) = l2.run(Defect::CompressorNoOverlap, &script_4, None, None);
     assert_ne!(clean_4, broken_4, "at ratio 4 the defect must bite");
-    let sep = gap("ratio4 no-overlap vs gpu", &broken_4, &gpu_4);
+    let sep = gap("ratio4 no-overlap vs gpu", &broken_4, &gpu_4, cfg.head_dim, cfg.rope_head_dim);
     assert!(
-        sep >= SEPARATION * CLEAN_ULP,
+        sep >= RESOLVABLE,
         "the overlapping branch is the half of the compressor ratio 128 never runs, and this \
-         cell resolves it by only {sep} ULP"
+         cell resolves it by only {sep} bf16 codes"
     );
 }
 
@@ -688,4 +884,78 @@ fn the_two_geometries_differ_in_opposite_directions() {
         "ratio 128 HALVES the projection width and multiplies the window — a loader that \
          inferred one from the other would be right on exactly one of the two layers"
     );
+}
+
+/// **The instrument, before it is trusted to diagnose anything.** Needs no device.
+///
+/// The first run of this file reported 16 ULP and I proposed an explanation for it. An
+/// explanation resting on a metric nobody had exercised is a guess wearing a number, so this
+/// pins what `diff` reports for two differences whose answers are known independently:
+/// exactly one e4m3 step, and a value near zero.
+#[test]
+fn the_diff_metric_reports_what_it_claims() {
+    const D: usize = 512;
+    const RD: usize = 64;
+    // One e4m3 step at 1.5 -> 1.625. `act_quant` reconstructs `e4m3(v/s)·s`, so a
+    // pre-quantization value a hair either side of the boundary lands a whole step away.
+    //
+    // EXACTLY 16, and the arithmetic is independent of `diff`: bf16 codes 0x3FC0 and 0x3FD0
+    // differ by 0x10. An earlier version of this test derived 14.8 from `log2(1.625/1.5)·128`
+    // and asserted `14..=16` — bf16 codes are LINEAR in the mantissa, not logarithmic, so
+    // that derivation was wrong and the range it produced would have passed an implementation
+    // that violated the one claim this test exists to pin.
+    let mut want = vec![1.0f32; D];
+    let mut got = vec![1.0f32; D];
+    want[3] = 1.5;
+    got[3] = 1.625;
+    let dv = diff(&want, &got, D, RD);
+    assert_eq!(f32_to_bf16(1.5), 0x3FC0, "the fixture's own premise");
+    assert_eq!(f32_to_bf16(1.625), 0x3FD0);
+    assert_eq!(dv.max, E4M3_ULP, "one e4m3 step must read as exactly {E4M3_ULP} bf16 codes");
+    assert!((dv.worst_ratio() - 1.0833).abs() < 0.001, "ratio {} ", dv.worst_ratio());
+    assert_eq!(dv.differing, 1, "exactly one element moved");
+    assert_eq!((dv.max_quant, dv.max_tail), (dv.max, 0), "dim 3 is inside the quantized region");
+
+    // Binade-independence, which is the half the constant actually rests on. If this held
+    // only near 1.0 then `E4M3_ULP` would be a coincidence of the fixture rather than a
+    // property of the two formats, and the whole diagnosis above it would be unfounded.
+    for e in [-4i32, -1, 0, 3, 9] {
+        let base = 2.0f32.powi(e);
+        for m in 0..7 {
+            let a = base * (1.0 + m as f32 / 8.0);
+            let b = base * (1.0 + (m + 1) as f32 / 8.0);
+            let (mut wa, mut gb) = (vec![1.0f32; D], vec![1.0f32; D]);
+            wa[1] = a;
+            gb[1] = b;
+            assert_eq!(
+                diff(&wa, &gb, D, RD).max,
+                E4M3_ULP,
+                "one e4m3 step at 2^{e}·(1+{m}/8) must still be {E4M3_ULP} codes"
+            );
+        }
+    }
+
+    // The SPLIT is the whole diagnostic, so it must actually split. Same difference, moved
+    // into the RoPE tail, has to land in the other bucket — otherwise a tail-only failure
+    // would read as a quantization artifact and send the next reader the wrong way.
+    let (mut w2, mut g2) = (vec![1.0f32; D], vec![1.0f32; D]);
+    w2[D - 1] = 1.5;
+    g2[D - 1] = 1.625;
+    let dv2 = diff(&w2, &g2, D, RD);
+    assert_eq!((dv2.max_quant, dv2.max_tail), (0, dv2.max), "dim 511 is the untouched tail");
+
+    // The known blind spot, pinned rather than described: near zero the code gap is large
+    // for a negligible absolute difference. `differing` and `worst` are what distinguish it,
+    // which is why the verdict must never rest on `max` alone.
+    let (mut w3, mut g3) = (vec![1.0f32; D], vec![1.0f32; D]);
+    w3[7] = 1e-30;
+    g3[7] = 2e-30;
+    let dv3 = diff(&w3, &g3, D, RD);
+    assert!(dv3.max >= 100, "a doubling near zero reads as a whole binade: {}", dv3.max);
+    assert!((w3[7] - g3[7]).abs() < 1e-29, "…for an absolute difference of nothing");
+
+    // Identical input must read exactly zero, or every 0 printed above means nothing.
+    assert_eq!(diff(&want, &want, D, RD).max, 0);
+    assert_eq!(diff(&want, &want, D, RD).differing, 0);
+    println!("{}", dv.one_line("e4m3-step fixture"));
 }
