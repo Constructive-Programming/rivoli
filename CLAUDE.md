@@ -106,6 +106,19 @@ A featureless build compiles to a refusal stub — that is deliberate, not break
 
 - **The GPU is sole-tenant.** Never run two benchmarks at once. This also breaks *tests*:
   `DeviceTier::new` fails to allocate while a decode holds the budget.
+- **Always `-- --test-threads=1` on any suite that touches the device.** The "intermittent
+  `gpustream` hang" recorded here for months is **not intermittent** — diagnosed 2026-08-05.
+  libtest runs `#[test]`s in parallel, and each device test builds its own tier, pool and
+  io_uring ring; the tell in `/proc/<pid>/task/*/wchan` is **four `io_sq_thread`s**, meaning
+  four rings. Serialised, the same suite goes from a 12-minute hang to **3.52 s**. This is
+  why the per-binary sweeps in `docs/investigations/v4-flash-port.md` pass while a bare
+  `cargo test --release --features rocm` wedges. **`cargo test --lib` is a GPU arm** — it
+  contains device tests, so it needs the flock and the serialisation like everything else.
+- **Read GPU occupancy with `find /sys/class/kfd/kfd/proc/ -mindepth 1 -maxdepth 1 | wc -l`,
+  not `ls … | wc -l`.** The `ls` form returned **1 for an empty directory** at least once on
+  2026-08-05 (confirmed with `cat -A`: the literal string `(empty)`), which reads as a
+  phantom holder and was twice mistaken for a stale KFD entry. When a count is non-zero,
+  resolve the PID and confirm `/proc/<pid>` exists before believing it.
 - **Never `cargo build` between the two arms of a benchmark.** It evicts page cache and
   moved `ms/miss` from 1.36 to 5.14 in one measured pair.
 - **`distinct` / `longest repeated block` do NOT measure quality.** They fire identically on
