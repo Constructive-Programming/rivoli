@@ -1224,6 +1224,159 @@ mod torch_head_tail {
     ];
 }
 
+/// `kernels/common.hpp::wave_sum`, in the host: 32 strided partials, then the five-level
+/// `__shfl_down` ladder. Not a model of the device -- a transcription of the reduction order
+/// every V4 kernel actually uses, which is what makes the floor below a real number rather
+/// than a guess about parallelism.
+fn wave_sum(x: &[f32]) -> f32 {
+    const WAVE: usize = 32;
+    let mut p = [0.0f32; WAVE];
+    for (lane, acc) in p.iter_mut().enumerate() {
+        let (mut a, mut i) = (0.0f32, lane);
+        while i < x.len() {
+            a += x[i];
+            i += WAVE;
+        }
+        *acc = a;
+    }
+    let mut off = WAVE / 2;
+    while off > 0 {
+        // Every lane reads the PRE-round value, as a wave does.
+        let snap = p;
+        for lane in 0..WAVE {
+            if lane + off < WAVE {
+                p[lane] = snap[lane] + snap[lane + off];
+            }
+        }
+        off >>= 1;
+    }
+    p[0]
+}
+
+/// `golden.rs::Diff.rel`, which is the metric any gate on these goldens will use.
+fn rel_diff(a: &[f32], b: &[f32]) -> f32 {
+    let scale = b.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-30);
+    a.iter().zip(b).fold(0.0f32, |m, (p, q)| m.max((p - q).abs() / scale))
+}
+
+#[test]
+fn the_reassociation_floor_bounds_any_tolerance_these_goldens_can_have() {
+    // `forward.rs`'s module doc says the residual disagreement from re-association "is the
+    // floor on any tolerance built on these goldens". It has never been QUANTIFIED, and the
+    // number turns out to overturn a conclusion this file drew from toy dimensions.
+    //
+    // At `dim = 4096` the final `RMSNorm` sums 4096 f32 squares. The oracle sums them
+    // sequentially; every V4 kernel sums them with `wave_sum`. Both are correct. The
+    // measurement below is therefore what a CORRECT kernel costs against this oracle -- the
+    // noise any real-dims gate has to clear -- and it is compared against the SIGNAL of a
+    // real defect, taken from the oracle itself at the same dimensions.
+    //
+    // MEASURED 2026-08-05 at dim 4096 / hc_dim 16384. `rel` is max|a-b| / max|b|, and the
+    // pairing is worst-case noise against best-case signal, because that is what a fixed
+    // threshold has to survive:
+    //
+    //   noise, correct wave-reduced RMSNorm vs this oracle    3.6e-3 here, 7.1e-3 at 120
+    //                                                         out-of-tree draws
+    //   signal, HeadHcRsqrtPerCopy                            4.3e-3 here, 2.5e-3 there
+    //   signal, HeadHcNoRsqrt                                 3.9e-2 here, 8.0e-3 there
+    //
+    // **`HeadHcRsqrtPerCopy` and the noise floor are the same order of magnitude, and which
+    // is larger depends on the draw.** Here the signal leads by 1.2x; out of tree the noise
+    // led by 2x. A quantity that swaps places with the noise between fixtures cannot be
+    // gated at real dimensions by any fixed tolerance. `HeadHcNoRsqrt` clears by ~11x here
+    // and is genuinely gateable.
+    //
+    // Two things follow, and the first CORRECTS this file. The guidance in
+    // `the_head_mhc_rsqrt_is_load_bearing_in_every_case` read "the device-side head gate must
+    // be bitwise". That was inferred from toy dimensions and is wrong at real ones: a CORRECT
+    // wave-reduced kernel already differs from this oracle on ~0.08% of bf16 elements, so a
+    // bitwise gate would reject correct code. It is exactly the extrapolation
+    // v4-flash-port.md S3 item 16 warns against, and it was made here before being measured.
+    //
+    // Second: the mHC denominator's SCOPE cannot be settled by comparing full-width
+    // activations at all. It has to be read out of the kernel, or pinned by a small-dim
+    // absolute check where the reduction order is controlled -- which is what
+    // `the_head_tail_matches_torch_absolutely` is for.
+    let dim = 4096usize;
+    let cfg = V4Config { dim, vocab_size: 16, ..V4Config::toy() };
+    let hcd = cfg.hc_dim();
+    let mut w = NamedRng::new("reassoc-floor-weights");
+    let hw = HeadTailW {
+        hc_head_fn: (0..cfg.hc_mult * hcd).map(|_| w.unit() * 0.05).collect(),
+        hc_head_base: (0..cfg.hc_mult).map(|_| w.unit()).collect(),
+        hc_head_scale: vec![1.0 + w.unit() * 0.5],
+        norm: (0..dim).map(|_| bf16_decode(bf16_encode(1.0 + w.unit() * 0.3))).collect(),
+        lm_head: WMat::Dense { rows: cfg.vocab_size, cols: dim, v: vec![0.0; cfg.vocab_size * dim] },
+    };
+    let bf = |x: f32| bf16_decode(bf16_encode(x));
+
+    // Both quantities vary a lot per draw, so a single sample decides nothing -- the first
+    // version of this test drew once, found signal above noise, and would have reported the
+    // opposite conclusion. What a gate needs is a THRESHOLD, so the question is whether the
+    // two RANGES overlap: worst-case noise against best-case signal.
+    let (mut noise_max, mut percopy_min, mut norsqrt_min) = (0.0f32, f32::INFINITY, f32::INFINITY);
+    let mut flipped_total = 0usize;
+    for draw in 0..24 {
+        let mut r = NamedRng::new(&format!("reassoc-floor-draw-{draw}"));
+        let h: Vec<f32> = (0..hcd).map(|_| bf(r.unit())).collect();
+        let run = |d: Defect| {
+            let mut cap = Capture::default();
+            Oracle::new(cfg.clone(), d).head_tail(&hw, &h, 1, "floor", &mut cap);
+            cap.float("head.floor.final_norm_out").expect("final_norm_out").to_vec()
+        };
+        let truth = run(Defect::None);
+        percopy_min = percopy_min.min(rel_diff(&run(Defect::HeadHcRsqrtPerCopy), &truth));
+        norsqrt_min = norsqrt_min.min(rel_diff(&run(Defect::HeadHcNoRsqrt), &truth));
+
+        // NOISE: the same final RMSNorm, its 4096-term variance reduced by `wave_sum` instead
+        // of sequentially. Both correct; only the order differs.
+        let row: Vec<f32> = (0..dim).map(|_| bf(r.unit())).collect();
+        let sq: Vec<f32> = row.iter().map(|v| v * v).collect();
+        let norm_with = |var: f32| -> Vec<f32> {
+            let rs = (var / dim as f32 + cfg.norm_eps).sqrt().recip();
+            (0..dim).map(|i| bf(hw.norm[i] * (row[i] * rs))).collect()
+        };
+        let (sequential, waved) = (norm_with(sq.iter().sum::<f32>()), norm_with(wave_sum(&sq)));
+        flipped_total += waved.iter().zip(&sequential).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        noise_max = noise_max.max(rel_diff(&waved, &sequential));
+    }
+    println!(
+        "worst noise {noise_max:.3e} ({flipped_total} bf16 flips over 24 draws); \
+         best-case signal: PerCopy {percopy_min:.3e}, NoRsqrt {norsqrt_min:.3e}"
+    );
+
+    // A correct kernel is NOT bit-identical to this oracle at real dimensions. If that ever
+    // stopped being true a bitwise device gate would be back on the table, so it is asserted.
+    assert!(
+        flipped_total > 0 && noise_max > 1e-4,
+        "wave and sequential reduction agreed at dim {dim} ({flipped_total} flips, rel \
+         {noise_max:.3e}) -- the re-association floor has vanished, which would change what a \
+         device gate can do"
+    );
+
+    // A threshold needs MARGIN, not a favourable draw. Both quantities move by about 2x
+    // across fixtures -- an out-of-tree run at 120 draws put the noise at 7.09e-3 and this
+    // defect's signal at 2.5e-3, the opposite ordering to the one measured here -- so a
+    // separation of order 1x is no separation at all. `SEPARABLE` is the margin a real gate
+    // would need to survive that variance; it is a judgement, and the numbers it is applied
+    // to are printed above so the judgement can be re-examined rather than trusted.
+    const SEPARABLE: f32 = 4.0;
+    assert!(
+        percopy_min < SEPARABLE * noise_max,
+        "HeadHcRsqrtPerCopy's weakest signal ({percopy_min:.3e}) now clears the worst \
+         re-association noise ({noise_max:.3e}) by more than {SEPARABLE}x, so a real-dims \
+         threshold could resolve it after all. Good news -- re-measure and rewrite the \
+         guidance above rather than moving this assert"
+    );
+    // Not vacuous: another defect DOES clear it comfortably, so the bound measures this
+    // defect's weakness and not a fixture too feeble to move anything.
+    assert!(
+        norsqrt_min > SEPARABLE * noise_max,
+        "neither rsqrt defect clears the floor by {SEPARABLE}x (NoRsqrt {norsqrt_min:.3e} vs \
+         noise {noise_max:.3e}), so this test cannot tell a real floor from a dead fixture"
+    );
+}
+
 /// Is every value in `v` exactly representable in bf16?
 fn all_bf16(v: &[f32]) -> bool {
     v.iter().all(|&x| bf16_decode(bf16_encode(x)).to_bits() == x.to_bits())
@@ -1342,12 +1495,20 @@ fn the_head_mhc_rsqrt_is_load_bearing_in_every_case() {
     // earlier revision of this comment put the ulp at 2^-8 and concluded that `HeadHcNoRsqrt`
     // cleared it; that was wrong -- bf16 keeps 7 explicit mantissa bits, not 8.
     //
-    // Both are still caught in every case, because this file compares BIT-EXACTLY. The
-    // consequence is for whoever writes the device-side head gate: **it has to be bitwise,
-    // not `assert_close`** -- a tolerance anywhere near the bf16 floor misses both of these,
-    // and mis-scoping the mHC denominator is not an exotic mistake. The bound below is a
-    // fixture-regression pin at roughly a third of the measured worst case, NOT a claim that
-    // the gate resolves either defect under tolerance.
+    // Both are still caught here, because this file compares BIT-EXACTLY at TOY dimensions.
+    //
+    // **Do not carry that to the device.** An earlier revision of this comment concluded
+    // "the device-side head gate must be bitwise, not `assert_close`". That is WRONG at real
+    // dimensions, and `the_reassociation_floor_bounds_any_tolerance_these_goldens_can_have`
+    // measures why: at dim 4096 a CORRECT wave-reduced kernel already differs from this
+    // oracle on ~0.08% of bf16 elements, so a bitwise gate would reject correct code -- and
+    // `HeadHcRsqrtPerCopy`'s signal is the same ORDER as that noise, the two swapping places
+    // between fixtures. The mHC denominator's scope has to be settled by reading the kernel,
+    // or at small dimensions against `the_head_tail_matches_torch_absolutely`, and not by
+    // comparing full-width activations at all.
+    //
+    // The bound below is a fixture-regression pin at roughly a third of the measured worst
+    // case, NOT a claim that any gate resolves either defect under tolerance.
     //
     // Why it is small is itself the reason not to widen it away: the toy draws the residual
     // copies i.i.d., so their per-copy RMS agree to ~5%, and the per-copy rsqrt is then nearly

@@ -219,7 +219,30 @@ fn load_layer(ck: &Checkpoint, cfg: &V4Config, l: usize, experts: &[usize]) -> R
 ///
 /// `norm.weight` and `head.weight` go through the bf16 → f32 decode `RawTensor::to_f32`
 /// does, which is what `RMSNorm`/`ParallelHead` mean by "stored bf16, held f32".
-fn load_head_tail(ck: &Checkpoint) -> Result<HeadTailW> {
+fn load_head_tail(ck: &Checkpoint, cfg: &V4Config) -> Result<HeadTailW> {
+    // Shapes CHECKED, not merely documented. These goldens gate arithmetic and are blind to
+    // weight SELECTION -- a port handed the wrong tensor reproduces every one of them -- so
+    // the shape is the only thing between a mis-wired loader and a silently meaningless
+    // golden. It closes the mHC family completely, because the head's triple and a block's
+    // triple differ in EVERY extent: `hc_head_fn` is [4, 16384] against `hc_ffn_fn`'s
+    // [24, 16384], `hc_head_base` [4] against [24], `hc_head_scale` [1] against [3]. Feeding
+    // `layers.42.hc_ffn_*` here now fails loudly instead of producing plausible goldens.
+    //
+    // It does NOT close the other two, and no shape check can: `norm.weight` [4096] is
+    // indistinguishable from any layer's `attn_norm`/`ffn_norm`, and `head.weight`
+    // [129280, 4096] from `embed.weight`. Only a checkpoint run can.
+    let want = |name: &str, got: &[usize], expect: &[usize]| -> Result<()> {
+        if got == expect {
+            Ok(())
+        } else {
+            bail!("{name}: expected shape {expect:?}, checkpoint has {got:?}")
+        }
+    };
+    want("hc_head_fn", &ck.get("hc_head_fn")?.shape, &[cfg.hc_mult, cfg.hc_dim()])?;
+    want("hc_head_base", &ck.get("hc_head_base")?.shape, &[cfg.hc_mult])?;
+    want("hc_head_scale", &ck.get("hc_head_scale")?.shape, &[1])?;
+    want("norm.weight", &ck.get("norm.weight")?.shape, &[cfg.dim])?;
+    want("head.weight", &ck.get("head.weight")?.shape, &[cfg.vocab_size, cfg.dim])?;
     Ok(HeadTailW {
         hc_head_fn: dense_f32(ck, "hc_head_fn")?,
         hc_head_base: dense_f32(ck, "hc_head_base")?,
@@ -345,7 +368,7 @@ fn emit(model: &Path, out: &Path, layers: usize, decode_steps: usize) -> Result<
     let hw = ck.dense("embed.weight")?;
     // The head tail runs on its OWN probe, never on the layer chain's residual -- see
     // `fixed_probe`. That is why it is loaded here and not threaded through `drive`.
-    let tw = load_head_tail(&ck)?;
+    let tw = load_head_tail(&ck, &cfg)?;
 
     // Loaded ONCE and held across every phase: reloading layer 3's 256 experts per decode
     // step is 3.4 GB of reads each time, and this machine's memory is shared with a live
@@ -429,7 +452,7 @@ fn defects(model: &Path, layer: usize, decode_steps: usize) -> Result<()> {
     // expectations of its own -- a reader would have to know, unaided, that the row was a
     // fixture gap and not a finding. Costs `head.weight`, ~2.1 GB widened; `embed.weight` is
     // NOT loaded here at all, which is why the head tail's weights are their own struct.
-    let tw = load_head_tail(&ck)?;
+    let tw = load_head_tail(&ck, &cfg)?;
     // NOTE: the seed moved from "real-defect-probe" to "v4-head-probe" on 2026-08-05 when the
     // layer probe and the head probe became one generator. Every number this command prints
     // therefore moved with it, for that reason and not because any arithmetic changed. An
