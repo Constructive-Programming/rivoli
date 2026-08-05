@@ -624,6 +624,42 @@ that rule, so a check that must hold in a shipped binary is an `assert!`/`ensure
 its cost. `v4compress.rs`'s pair — whose doc calls them "what ENFORCES the bsz=1 scope cut" —
 should be promoted on that argument, not on this one.
 
+### FMA contraction is a SECOND uncontrolled source of oracle-vs-kernel divergence — 2026-08-05
+
+`build.rs:67` passes hipcc exactly `--offload-arch=<arch> -O3 -fPIC`. **There is no
+`-ffp-contract` flag anywhere in the build**, and clang's HIP default is
+`-ffp-contract=fast`. So every kernel in this tree contracts multiply-add into FMA unless
+its own file blocks it — `mla.hip` does, in one place, deliberately; nothing else accounts
+for it.
+
+Measured by the head-tail stage on the mHC blend at `dim 4096 × s 8`: **3 disagreements
+against a plain multiply-add host reference, 0 against `mul_add`**. Its first bitwise
+assertion was written against the *non*-contracted form, which works out to roughly a
+**1-in-5 spurious red per run** — and a spurious red there is indistinguishable in a log from
+a real regression.
+
+This sits *on top of* `wave_sum` re-association, which this port already knew about. Two
+independent sources, and the build controls neither. A host reference for any contracted
+expression must use `mul_add`, and the assertion should carry a bound that fires if
+contraction ever stops rather than silently passing.
+
+### `assert_close` over bitwise at real dims — RETRACTED and replaced, 2026-08-05
+
+An earlier instruction here — relayed by the coordinator — said the device-side head gate
+must be **bitwise, not `assert_close`**, on the argument that both mHC-rsqrt defects
+(4.899e-3 and 4.284e-4) sit under one bf16 ulp (7.81e-3) and a tolerance near the bf16 floor
+misses them. **That was derived at toy dims and is wrong at real ones.** At `dim 4096` a
+*correct* wave-reduced kernel already differs from the oracle on ~0.08% of bf16 elements, so
+a bitwise gate rejects correct code.
+
+The hardware settled it: the per-copy rsqrt defect was injected into the kernel and **caught
+at dim 256 and 512, and not at 1024**. So the resolution is a property of the dimension, not
+of the tolerance, and the right instrument is a defect ladder run at the dims where the
+defect is separable — not a bitwise assertion at the dims where it is not. This is
+requirement 16 ("toy-dim bit-exactness does not predict bit-exactness at depth") arriving
+from the other direction: toy-dim *separability* does not predict separability at depth
+either.
+
 ### Integration checkpoint — VERIFIED on the merged tree, 2026-08-05
 
 `c4367a9` (indexer) + `590cd65` (loading) merged into the integration branch and then
