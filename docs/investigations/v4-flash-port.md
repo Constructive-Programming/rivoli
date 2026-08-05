@@ -902,6 +902,44 @@ Until then these are two guards removed and not yet replaced, which is a worse p
 before `14a9009` — recorded here so it is a decision with a deadline rather than a deletion
 that quietly became permanent.
 
+### DEBT: the enforcing construction, handed back rather than landed — S3, 2026-08-05
+
+`2445645` deleted `RopeTable` and `Dims::compress_slot` on the argument that construction
+should prevent both defects instead of diagnosing them. The construction was **not** landed
+in that stretch, and this is the explicit hand-back rather than a silent deferral.
+
+**Why not landed, and it is not scope.** Both replacements have exactly one correct home —
+the layer loop — and the layer loop does not exist. Landing them anywhere else produces a
+`pub fn` with no caller, which is precisely what `compress_slot` was when it was deleted:
+one caller that used it backwards, and a decode arm with none. Re-adding a callerless
+helper to discharge a debt created by deleting a callerless helper is a loop, not progress.
+
+**What is owed, and what it costs until it is paid:**
+
+| owed | until then |
+|---|---|
+| `Io` built by something that takes `LayerKind` and calls `v4compress::rope_for_layer` itself, so the two-table selection has ONE site | nothing detects `Defect::RopeNoYarn`, on the one cell measured invisible to the numeric gate (`ratio4/decode`, sep 8 against `RESOLVABLE` 64) |
+| whoever places the compressor's output computing the decode slot as `window + start_pos / ratio`, with a test | requirement 2 is implemented nowhere and asserted nowhere; a caller that appends is right only until it skips a step, and speculative decode skips by construction |
+
+Both were **device-free** tests before deletion. Whoever builds the layer loop owns both,
+and this table is the acceptance criterion.
+
+### The full `cargo test --release --features rocm` hangs — S3, 2026-08-05
+
+Attempted on the merged tree; produced **zero** `test result` lines in 10 minutes and had to
+be killed. It reaches `Running unittests src/lib.rs` and stops there. That is CLAUDE.md's
+recorded intermittent `gpustream` hang, reproduced. Teardown was clean — 0 KFD holders and
+the flock free afterwards — so it wastes time rather than wedging the device.
+
+Consequence for anyone quoting a suite-wide number: **run the test binaries individually.**
+A per-binary sweep of all twelve V4 suites is 105 tests and takes under a minute:
+
+```
+v4_attn 8 · v4_kernel 17 · v4_compress_kernel 8 · v4_indexer_kernel 8 · v4_pin 1
+v4_hadamard_basis 4 · v4_attn_host 9 · v4_compress 7 · v4_oracle 27 · v4_loading 10
+v4_artifact 2 · v4_compress_probe 4        — all rc=0 at `2445645`
+```
+
 ## S4 — benchmark, quality assessment, ranked perf work.
 
 Scoped after S2 reports. S4's quality assessment ranks on **paired dNLL from `bin/ppl`**, not
