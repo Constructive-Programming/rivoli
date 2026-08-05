@@ -1,5 +1,10 @@
-//! **The V4-Flash indexer's device-side scoring, gated against S1b's oracle.**
-//! S2c-indexer of `docs/investigations/v4-flash-port.md`.
+//! **The V4-Flash indexer's device-side scoring.** S2c-indexer of
+//! `docs/investigations/v4-flash-port.md`.
+//!
+//! The two halves are gated against DIFFERENT references, and the difference matters:
+//! `v4_indexer_spread` against S1b's oracle, `v4_indexer_score` against a host
+//! transliteration of `model.py` that **the oracle currently contradicts** (see below). A
+//! green run of the score half is not a correctness verdict until the oracle's fix lands.
 //!
 //! Two kernels:
 //!
@@ -35,13 +40,19 @@
 //!
 //! # What this file provably cannot detect — read before trusting it
 //!
-//! * **Anything the oracle is also wrong about.** One such thing is *named and open*:
-//!   `Oracle::indexer` sums the per-head products as a bf16 RUNNING fold
-//!   (`acc = bf16(acc + bf16(dot·w))`), while PyTorch's `.sum(dim=2)` over a bf16 tensor
-//!   accumulates through `acc_type` — f32 — and rounds ONCE. The kernel reproduces the
-//!   oracle, deliberately, so this suite cannot see that difference at all. It is reported
-//!   as an open question rather than silently "fixed", because changing the oracle would
-//!   invalidate every shipped golden.
+//! * **Anything the oracle is also wrong about** — though the one instance this file found
+//!   is now CONFIRMED and fixed on this side. `Oracle::indexer` sums the per-head products
+//!   as a bf16 RUNNING fold, while `torch.sum` over bf16 accumulates through `acc_type` —
+//!   f32 — and rounds ONCE. That is a property of the reduction, measured off-repo against
+//!   CPU torch on 2026-08-05 by the coordinator, with no reproducer in this tree. The kernel
+//!   and [`host_score`] now both do what torch does and
+//!   [`host_score_accumulates_in_f32_not_bf16`] is the in-tree guard; **the oracle's fix is
+//!   owned elsewhere and has not landed**, so do not read a comparison against the current
+//!   indexer goldens as evidence in either direction.
+//! * **The summation ORDER.** The bf16 fold pinned it as a side effect and an f32
+//!   accumulator does not; torch's own reduction is vectorized and tree-shaped. The kernel
+//!   and [`host_score`] agree with each other exactly, and neither is pinned to torch's
+//!   order.
 //! * **The basis order** is *not* in this list any more. It was S1b's highest-risk
 //!   inference; `tests/v4_hadamard_basis.rs` settled it against `fast_hadamard_transform`'s
 //!   own documented contract on 2026-08-05, so the Hadamard this file exercises is pinned to
@@ -340,8 +351,15 @@ fn device_score(q: &[f32], kv: &[f32], w: &[f32], d: ScoreDims) -> Vec<f32> {
 
 /// `model.py:425-427` on the host — the value `v4_indexer_score` must reproduce.
 ///
-/// **Transcribed from `model.py`, not from `Oracle::indexer`**, and the distinction is the
-/// honest limit of this comparison. The oracle computes this chain inside `indexer`, but
+/// **Transcribed from `model.py`, not from `Oracle::indexer`** — and on 2026-08-05 that
+/// stopped being only a limitation and became the reason this file is right where the
+/// oracle is wrong: `Oracle::indexer` folds the head sum in bf16 per term, where
+/// `torch.sum` accumulates in f32 and rounds once. The oracle's fix is owned elsewhere;
+/// this reference already matches the measured behaviour, so **the two will disagree until
+/// it lands**, and a comparison against the current indexer goldens is not evidence either
+/// way.
+///
+/// The rest of the distinction is still the honest limit of this comparison. The oracle computes this chain inside `indexer`, but
 /// exposes neither the roped-and-spread `q` nor the scaled `weights`, so the kernel cannot be
 /// handed the oracle's own intermediates and scored on the oracle's own exported matrix.
 /// Making `Oracle::linear` public would close that, and it is recorded as an open item rather
@@ -361,15 +379,17 @@ fn host_score(q: &[f32], kv: &[f32], w: &[f32], d: ScoreDims) -> Vec<f32> {
             for hh in 0..d.heads {
                 let qh = &q[(t * d.heads + hh) * d.hd..(t * d.heads + hh + 1) * d.hd];
                 let kvc = &kv[c * d.hd..(c + 1) * d.hd];
-                // `einsum` -> bf16, `relu_()` in place -> bf16, `* weights` -> bf16,
-                // `.sum(dim=2)` -> a bf16 running fold. The last of those is the oracle's
-                // reading of `torch.sum` over bf16 and is the open question this file's
-                // header names; the kernel matches it deliberately.
+                // `einsum` -> bf16, `relu_()` in place -> bf16, `* weights` -> bf16.
+                // Those three are elementwise tensors the reference materializes, so each
+                // store is real.
                 let mut dot = rbf(qh.iter().zip(kvc).map(|(a, b)| a * b).sum::<f32>());
                 dot = dot.max(0.0);
-                acc = rbf(acc + rbf(dot * w[t * d.heads + hh]));
+                // `.sum(dim=2)` accumulates in f32 (`acc_type`) and rounds ONCE. This read
+                // a bf16 running fold until 2026-08-05, copying the oracle's error; see the
+                // kernel's note for what settled it.
+                acc += rbf(dot * w[t * d.heads + hh]);
             }
-            out[t * d.n_comp + c] = acc;
+            out[t * d.n_comp + c] = rbf(acc);
         }
     }
     out
@@ -513,4 +533,61 @@ fn the_score_launcher_refuses_an_empty_compressed_region() {
     assert!(go(ScoreDims { s: 0, ..ok }), "no query rows");
     assert!(go(ScoreDims { heads: 0, ..ok }), "no heads");
     assert!(go(ScoreDims { hd: 0, ..ok }), "zero head width");
+}
+
+/// **The guard that did not exist.** [`host_score`] accumulates the head sum in f32 and
+/// rounds once; a bf16 running fold gives a demonstrably different answer on this input.
+///
+/// Added on review. Nothing else in this file catches a revert: `host_score` was *copied
+/// from* the oracle's bf16 fold, which is how the defect arrived, and the only test that
+/// compares it to the kernel needs a GPU and the checkpoint and has never executed. So the
+/// one thing standing between this file and the bug it just fixed was a comment. This test
+/// runs on CPU, needs no checkpoint, and pins the arithmetic itself.
+///
+/// The construction is exact in both accumulators, so the expected values are literals
+/// rather than a tolerance:
+///
+/// * `kv` is the unit vector `e_0`, so each head's dot is just that head's `q[0]`.
+/// * head 0 contributes `1.0`; the other 63 contribute `2^-9` each.
+/// * bf16's ulp at 1.0 is `2^-7`, so `2^-9` is a quarter of it and **every one of the 63
+///   rounds away**: a running fold returns exactly `1.0`.
+/// * f32 accumulates `1 + 63·2^-9 = 1.123046875`, and the single closing bf16 round takes
+///   it to exactly `1.125`.
+///
+/// A one-in-eight relative gap out of a per-term difference of a quarter ulp is the point:
+/// the error compounds rather than averaging out, whatever the sign of the weights — which
+/// matters, because they ARE signed and the first version of this fix's rationale wrongly
+/// said otherwise.
+///
+/// Proved to fire on 2026-08-05 by reverting `host_score` to the fold: `got 1.0`, want
+/// 1.125.
+#[test]
+fn host_score_accumulates_in_f32_not_bf16() {
+    let d = ScoreDims { s: 1, n_comp: 1, heads: 64, hd: 128 };
+    let mut kv = vec![0.0f32; d.hd];
+    kv[0] = 1.0;
+    let mut q = vec![0.0f32; d.s * d.heads * d.hd];
+    for hh in 0..d.heads {
+        q[hh * d.hd] = if hh == 0 { 1.0 } else { (2.0f32).powi(-9) };
+    }
+    let w = vec![1.0f32; d.s * d.heads];
+
+    let got = host_score(&q, &kv, &w, d);
+    assert_eq!(got.len(), 1);
+    assert_eq!(
+        got[0].to_bits(),
+        1.125f32.to_bits(),
+        "f32 accumulation then one bf16 round is 1.125; got {:?}. A bf16 RUNNING fold gives \
+         exactly 1.0 here, which is what this test exists to reject.",
+        got[0]
+    );
+    // The negative control, computed inline so the claim above is executable rather than
+    // asserted: the fold this file used to implement really does return 1.0 on this input.
+    let rbf = |x: f32| bf16_decode(bf16_encode(x));
+    let mut fold = 0.0f32;
+    for hh in 0..d.heads {
+        fold = rbf(fold + rbf(q[hh * d.hd]));
+    }
+    assert_eq!(fold.to_bits(), 1.0f32.to_bits(), "the rejected fold must reach 1.0");
+    assert_ne!(fold.to_bits(), got[0].to_bits(), "...and must differ from the correct value");
 }

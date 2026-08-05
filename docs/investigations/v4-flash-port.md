@@ -342,6 +342,12 @@ second generalises past this defect:
   `v4compress.rs`'s `jscpd:ignore` region names for `freqs_cis`/`window_topk`/`compress_topk`,
   which is **still open**.
 
+**The quantizer is what makes the basis order observable at all**, and that is the durable
+lesson: an orthogonal rotation is invisible to a dot product, so before `fp4_act_quant` there
+is nothing to be right or wrong about. The order becomes load-bearing only through *which
+coordinates share a block-32 scale*. Any future change to the fp4 blocking re-opens this
+question; a change to the rotation alone does not.
+
 It mattered. Measured in the **bf16 score** `Indexer.forward` computes, over 64 row pairs:
 before quantization the two orders are **bit-identical on all 64** (`(Hq)·(Hk) = q·k` for any
 orthogonal `H`); with `fp4_act_quant`'s block-32 grouping they differ on **56 of 64**, by a
@@ -402,13 +408,40 @@ is why the finish is a field and not an argument.
   `freqs_cis`. **Making `Oracle::linear` public would close it**, and is left to whoever owns
   that file. The compressed KV the comparison runs on is real (`CompState::cache` after the
   oracle's own indexer compressor).
-* **A suspected oracle fidelity bug, reported not fixed.** `Oracle::indexer` sums the
-  per-head products as a bf16 RUNNING fold, `acc = bf16(acc + bf16(dot·w))`. PyTorch's
-  `.sum(dim=2)` over a bf16 tensor accumulates through `acc_type` — **f32** — and rounds
-  ONCE. If that is right, the oracle is wrong here and the kernel is wrong with it, and no
-  gate in this repo can see it. This is the second-highest-risk transliteration question in
-  the file whose highest-risk one was settled the same day, and it sits on the chain that
-  decides *which positions are attended*.
+* **An oracle fidelity bug — CONFIRMED 2026-08-05 by the coordinator, on CPU torch.**
+  `Oracle::indexer` sums the per-head products as a bf16 RUNNING fold,
+  `acc = bf16(acc + bf16(dot·w))`. `torch.sum` over a bf16 tensor accumulates through
+  `acc_type` — **f32** — and rounds **once**; only the output dtype is bf16.
+  `torch bf16 .sum() == f32-accumulate-round-once` measured **True**. Blast radius is
+  `.indexer_scores` and `.compress_idxs`: line 1241 is the only running-fold site in
+  `forward.rs`.
+
+  > **CORRECTED 2026-08-05 by S2c-indexer, against the reference.** The magnitudes first
+  > recorded here (62.6% of scores disagreeing, mean signed Δ −0.0048, "a systematic downward
+  > drift ~70× larger than for signed summands") were measured on the premise that the
+  > summands are **non-negative** — "relu'd, times *positive* weights". They are not.
+  > `weights_proj` is a bare `ColumnParallelLinear` with **no activation** (model.py:400),
+  > scaled only by the positive scalar at :424, so `weights` is **signed** and
+  > `relu(dot) * weight` is signed. The summands can cancel, and no claim about the
+  > *direction* of the error survives; the quoted percentages describe a distribution the
+  > model does not have. **The fix is unaffected** — `acc_type` is a property of the
+  > reduction, not of its input — and the error still compounds rather than averaging out,
+  > which is what `tests/v4_indexer_kernel.rs::host_score_accumulates_in_f32_not_bf16` pins:
+  > 63 of 64 terms at a quarter of a bf16 ulp vanish entirely, 1.0 against 1.125.
+
+  **Not settled by the fix:** the bf16 fold pinned the summation ORDER as a side effect and an
+  f32 accumulator does not. Torch's reduction is vectorized and tree-shaped, so its partial
+  sums differ from an ascending fold and can land either side of the final rounding. The
+  kernel and its host reference agree with each other exactly; **neither is pinned to torch's
+  ordering, and nothing in this repo could tell.**
+
+  **The kernel and `tests/v4_indexer_kernel.rs::host_score` were corrected to match torch on
+  2026-08-05; the oracle's own fix is owned by whoever owns `src/v4oracle/**`.** Until it
+  lands the two disagree, and a comparison against the current indexer goldens is not
+  evidence in either direction. Note the shape: this is the SECOND instance in one stage of
+  the same root cause the Hadamard finding exposed — every oracle test is self-relative, so
+  an error the oracle shares with its own defect matrix cancels, and only a comparison
+  against something outside the oracle's own source can see it.
 
 **e8m0 (requirement 15): the premise needs correcting before the gap can be closed.** The
 indexer consumes **no e8m0 scale bytes at all** — its weights are fp8 (`wq_b`, which ships a

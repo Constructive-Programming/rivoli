@@ -142,8 +142,9 @@ extern "C" __global__ void v4_indexer_spread(float* __restrict__ x, int d) {
 //   * the `hd`-term dot is a SEQUENTIAL f32 fold in the oracle, so a wave-parallel
 //     `wave_sum` here would re-associate it and the agreement would become a tolerance
 //     instead of a bit result;
-//   * the sum over `h` heads is a bf16 RUNNING fold — `acc = bf16(acc + bf16(dot * w))` —
-//     so it cannot be split across lanes at all without changing the value.
+//   * the sum over `h` heads is a SEQUENTIAL f32 fold over bf16 terms, so splitting it
+//     across lanes re-associates it just the same. (This said "a bf16 running fold" until
+//     2026-08-05 — that was the defect below, not the reason.)
 //
 // Every other kernel in this port re-associates something and pays for it in tolerance
 // (`v4c_block_sum` and `wave_sum` both say so at their definitions). This one does not need
@@ -153,18 +154,44 @@ extern "C" __global__ void v4_indexer_spread(float* __restrict__ x, int d) {
 // (t, c) with lanes over `hd`, and the price is that this stops being bit-exact.
 //
 // THE bf16 STORES ARE THE POINT. `einsum` on bf16 tensors returns bf16, `relu_()` is in
-// place on that bf16, `* weights` lands in bf16 (`weights_proj` is a bf16 `Linear`), and the
-// oracle models the reduction as a bf16 running sum. This chain decides WHICH blocks are
+// place on that bf16, and `* weights` lands in bf16 (`weights_proj` is a bf16 `Linear`).
+// Three elementwise tensors the reference materializes. This chain decides WHICH blocks are
 // attended, so dropping a store leaves values that are fluent and slightly too precise — and
 // a set comparison against the shipped goldens cannot see it, because at `index_topk = 512`
 // the selection is determined entirely by the causal mask.
 //
-// KNOWN OPEN QUESTION, and this kernel matches the ORACLE rather than resolving it:
-// PyTorch's `.sum(dim=2)` over a bf16 tensor accumulates through `acc_type`, i.e. in f32,
-// and rounds ONCE at the end — not the per-term bf16 fold the oracle performs. If the oracle
-// is wrong about that, this kernel is wrong with it and no comparison in this repo can see
-// it. Recorded in the S2c-indexer report; not silently "fixed" here, because changing the
-// oracle would invalidate every shipped golden and is not this stage's call.
+// THE REDUCTION ACCUMULATES IN f32 AND ROUNDS ONCE — measured, and it is where the oracle
+// and an earlier version of this kernel were both wrong.
+//
+// `.sum(dim=2)` over a bf16 tensor does NOT fold in bf16. PyTorch reductions on
+// reduced-precision floats accumulate through `acc_type`, i.e. f32, and round a single time
+// on the way out; only the OUTPUT dtype is bf16. `torch bf16 .sum() == f32-accumulate-
+// round-once` was verified True on CPU torch 2026-08-05 rather than argued.
+//
+// It matters over 64 terms because a bf16 running fold loses any addend smaller than half an
+// ulp of the running total, repeatedly — `host_score_accumulates_in_f32_not_bf16` pins a case
+// where 63 of the 64 terms vanish entirely and the two answers are 1.0 against 1.125.
+//
+// WHAT THE TERMS ARE NOT: an earlier version of this note claimed they are **non-negative**
+// ("relu'd, times positive weights"), and argued a monotonic downward bias from it. That is
+// WRONG and was corrected 2026-08-05 against the reference: `weights_proj` is a bare
+// `ColumnParallelLinear` with no activation (model.py:400), scaled only by the positive
+// scalar at :424, so `weights` is SIGNED. `relu(dot) * weight` is therefore signed, the
+// summands can cancel, and no claim about the direction of the error survives. Off-repo
+// magnitudes measured under that assumption are not quoted here for the same reason.
+//
+// The fix does not depend on any of that: `torch.sum` over bf16 accumulating through
+// `acc_type` is a property of the reduction, not of its input distribution.
+//
+// AND ONE THING THIS DOES NOT SETTLE: a bf16 running fold pinned the summation ORDER as a
+// side effect; an f32 accumulator does not. Torch's own reduction is vectorized and
+// tree-shaped, so over 64 terms its partial sums differ from this ascending fold and can land
+// either side of the final bf16 rounding. This kernel and `host_score` agree with each other
+// exactly; neither is pinned to torch's ordering, and nothing in this repo could tell.
+//
+// The per-term `rbf16(dot * w)` below STAYS: that is an elementwise bf16 tensor the reference
+// genuinely materializes (`index_score.relu_() * weights.unsqueeze(-1)`) before `.sum` ever
+// sees it. Only the ACCUMULATOR changes.
 // NO FMA CONTRACTION BELOW THIS LINE, and it is the difference between this kernel being
 // bit-exact and merely close. `dot += q[i] * kv[i]` contracts to `v_fmac_f32` by default —
 // hipcc is invoked with `-O3` only (build.rs), and HIP clang's default is
@@ -200,9 +227,11 @@ extern "C" __global__ void v4_indexer_score(const float* __restrict__ q,
         // would have crossed zero, which is a small set and not an empty one.
         dot = rbf16(dot);
         dot = fmaxf(dot, 0.0f);
-        acc = rbf16(acc + rbf16(dot * w[(size_t)t * heads + hh]));
+        // f32 accumulator over bf16 terms — `acc_type`. NOT `rbf16(acc + ...)`.
+        acc += rbf16(dot * w[(size_t)t * heads + hh]);
     }
-    score[id] = acc;
+    // The single rounding `.sum` performs on the way out to a bf16 result.
+    score[id] = rbf16(acc);
 }
 
 // ---------------------------------------------------------------------------------------

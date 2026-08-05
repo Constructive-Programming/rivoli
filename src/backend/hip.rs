@@ -1819,9 +1819,11 @@ pub unsafe fn launch_v4_indexer_spread(
 /// one. The causal mask and the top-k are the caller's, exactly as `Oracle::indexer` splits
 /// them.
 ///
-/// Bit-exact against the oracle by construction rather than by tolerance — the kernel's
-/// note says why the reduction is not parallelised — and it carries the oracle's own open
-/// question about whether `torch.sum` over bf16 rounds per term or once.
+/// Bit-exact against a faithful host reference by construction rather than by tolerance —
+/// the kernel's note says why the reduction is not parallelised, and why it accumulates in
+/// f32 and rounds once, which is what `torch.sum` over a bf16 tensor measurably does.
+/// `Oracle::indexer` still folds per term; until that is fixed the two disagree, and the
+/// disagreement is the oracle's.
 ///
 /// # Safety
 /// `q` is `s · heads · hd` f32; `kv` is `n_comp · hd` f32; `w` is `s · heads` f32; `score`

@@ -12,7 +12,9 @@
 //! The indexer's device half landed 2026-08-05 and is `kernels/v4indexer.hip`:
 //! `v4_indexer_spread` (the Hadamard + fp4 finish, which is also [`Geom::indexer`]'s) and
 //! `v4_indexer_score` (the `einsum`/relu/weight/sum chain), scored by
-//! `tests/v4_indexer_kernel.rs`. **The selection is not there** — the causal mask and the
+//! `tests/v4_indexer_kernel.rs` — the spread against the oracle, the score against a host
+//! transliteration of `model.py`, because the oracle's own head-sum is a confirmed defect as
+//! of 2026-08-05. Read that file's header before treating a green run as a verdict. **The selection is not there** — the causal mask and the
 //! top-k stay with the caller, because `Oracle::indexer` exports the full pre-top-k score
 //! matrix and comparing THAT is strictly stronger than comparing the selected sets, which
 //! are invariant at the shipped `index_topk` (see the plan doc's "A hole S3 inherits").
