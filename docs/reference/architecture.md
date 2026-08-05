@@ -420,8 +420,23 @@ The invariant: **a miss's eviction must never reclaim a key touched earlier in t
 batch.** Eviction (`pop_lru_skip`) skips the pinned set, so a hit or an earlier-admitted
 miss can't be evicted out from under the batch — otherwise the pin could not resolve its
 slot ("expert not resident after alloc"). Misses are allocated *before* any read is issued,
-so a relocation never races an in-flight fetch. This is the correctness spine of the cache;
-it is enforced structurally and covered by a batch-protocol stress test.
+so a relocation never races an in-flight fetch *within a batch*. This is the correctness
+spine of the cache; it is enforced structurally and covered by a batch-protocol stress test.
+
+> **OPEN, 2026-08-05 — this section is not sufficient, and the gap is not yet located.**
+> Two witnessed sole-tenant `--ppl` pairs diverge run-to-run, and the arms are **bit-identical
+> in (misses, relocations) for every layer before the divergence** — same 9,117 relocations,
+> same miss sequence, then a different answer. So the batch protocol above is doing exactly
+> what it claims and the fault is elsewhere: identical decisions, raced execution. INV-1 is
+> separately **exonerated** by direct measurement (0 of 388,875 records show routing
+> consulting anything outside its inputs), so routing is not the path either.
+>
+> The remaining window is two stages wide — layer *L-1*'s MoE compute and layer *L*'s
+> attention. **Action item, not a closed question.** Reproduce with
+> `--features corruption-probe --checksum-route`, under a contention witness; a relocation
+> sat at the last agreeing layer of one event, but 33.1% of all layer-records carry one, so
+> that is coincidence-shaped until ~5 events say otherwise. Full record and method in
+> [`benchmarks.md`](../measurement/benchmarks.md), "Long-run divergence".
 
 ---
 
