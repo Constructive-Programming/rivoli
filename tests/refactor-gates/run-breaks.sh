@@ -41,11 +41,20 @@ while IFS= read -r line; do
   bin=${test%% *}
   filter=""; [ "$bin" != "$test" ] && filter=${test#* }
 
-  before=$(cargo test --release --features rocm --test "$bin" $filter -- --test-threads=1 2>&1)
+  # Five of these rows drive device suites. capture.sh takes the lock and this did not --
+  # the one script in the gate suite that ignored its own standing hazard list. Build first,
+  # OUTSIDE the lock (CLAUDE.md: never cargo build between the arms of a measurement), then
+  # run under it with the witness re-checked inside.
+  cargo test --release --features rocm --test "$bin" --no-run >/dev/null 2>&1
+  before=$(flock -w 3600 /var/run/sys-gpu.lock bash -c '
+      n=$(find /sys/class/kfd/kfd/proc/ -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
+      [ "$n" -eq 0 ] || { echo "FOREIGN GPU HOLDER: $n"; exit 66; }
+      cargo test --release --features rocm --test '"$bin"' '"$filter"' -- --test-threads=1' 2>&1)
   if ! ran_and_passed "$before"; then
     printf '  %-44s SKIP: no test executed or already red\n' "$test"; fail=$((fail+1)); continue
   fi
 
+  BROKEN="$file"
   if ! python3 -c '
 import sys
 p,f,r = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -57,13 +66,27 @@ open(p,"w").write(s.replace(f, r, 1))
   fi
 
   BROKEN="$file"
-  out=$(cargo test --release --features rocm --test "$bin" $filter -- --test-threads=1 2>&1)
-  git checkout -- "$file"; BROKEN=""
+  cargo test --release --features rocm --test "$bin" --no-run >/dev/null 2>&1
+  out=$(flock -w 3600 /var/run/sys-gpu.lock bash -c '
+      cargo test --release --features rocm --test '"$bin"' '"$filter"' -- --test-threads=1' 2>&1)
+  git checkout -- "$file" || { echo "  RESTORE FAILED for $file"; exit 3; }
+  BROKEN=""
 
-  if ran_and_failed "$out" && grep -qF "$expect" <<<"$out"; then
+  # Strip libtest's own status lines before checking the message. `grep -F stream` against
+  # the raw output matches `test the_attention_block_is_entirely_on_its_stream ... FAILED`,
+  # so that row's subject check was unconditionally true and any red for any reason -- GPU
+  # contention, an unrelated assertion -- read as "message matches".
+  body=$(grep -vE '^test [a-z0-9_]+ \.\.\. (ok|FAILED)$|^    [a-z0-9_]+$|^failures:' <<<"$out")
+  if ran_and_failed "$out" && grep -qF "$expect" <<<"$body"; then
     printf '  %-44s RED, message matches\n' "$test"; pass=$((pass+1))
-  elif grep -q "error\[E0" <<<"$out"; then
-    printf '  %-44s COMPILER caught it (stronger than a test)\n' "$test"; pass=$((pass+1))
+  elif grep -qE "error\[E0|^error: " <<<"$out"; then
+    # NOT a pass. This branch is reached only when the test did not go red with the right
+    # message, and a build failure means the REPLACEMENT text no longer type-checks -- i.e.
+    # the row is stale for the tree it is gating. Scoring it green is how a corpus reports
+    # 7/7 forever while gating nothing: Track 2 changes launcher arity, row 7's replacement
+    # stops compiling, and the stream gate is never exercised again. hipcc says plain
+    # "error:", rustc says "error[E0...]"; both count.
+    printf '  %-44s COMPILE-BROKEN — row is stale, gate NOT exercised\n' "$test"; fail=$((fail+1))
   elif ran_and_failed "$out"; then
     printf '  %-44s RED but WRONG SUBJECT (wanted: %s)\n' "$test" "$expect"; fail=$((fail+1))
   else
@@ -71,5 +94,6 @@ open(p,"w").write(s.replace(f, r, 1))
   fi
 done < "$TSV"
 
+git diff --quiet || { echo "TREE LEFT DIRTY — a restore failed"; fail=$((fail+1)); }
 echo "breaks fired: $pass   problems: $fail"
 exit $(( fail > 0 ))

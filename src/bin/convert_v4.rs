@@ -65,6 +65,15 @@ struct Args {
     /// differing bytes; anything else is a defect in the writer, not a quantization error.
     #[arg(long)]
     verify: bool,
+
+    /// Verify and write NOTHING. Implies `--verify`.
+    ///
+    /// `--verify` alone is a flag on a converter: it still rewrites `resident.safetensors`
+    /// and `manifest.json` for `--from/--to`, so aiming a narrow `--verify` at a whole
+    /// artifact SILENTLY TRUNCATES it. Use this whenever the target is an artifact you want
+    /// to keep — which, for a verification pass, is always.
+    #[arg(long)]
+    verify_only: bool,
 }
 
 /// The resident (non-routed-expert) tensors of one layer, in the order they are written.
@@ -218,6 +227,7 @@ const MODEL_LEVEL: &[(&str, Emit)] = &[
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let args = Args { verify: args.verify || args.verify_only, ..args };
     let cfg: V4Config = load_config(&args.src_dir)?;
     let to = args.to.unwrap_or(cfg.n_layers);
     // Refused, not clamped: `--to 999` on a 43-layer model silently converting 43 layers
@@ -309,6 +319,21 @@ fn main() -> Result<()> {
             );
             eprintln!("convert_v4: verified L{l:02}.f4 — {ne} experts, 0 bytes differ");
         }
+    }
+
+    // A verification pass STOPS HERE. `--verify` on its own is a flag on a converter, so it
+    // still runs steps 2 and 3 below — and both are unconditional writes scoped to
+    // `--from/--to`. Pointing `--verify --from 0 --to 3` at a whole artifact therefore
+    // truncates its resident set to three layers and rewrites the manifest to claim `[0, 3]`,
+    // leaving 40 orphaned `.f4` files whose tensors are gone. Found by review 2026-08-05
+    // before it ran: `tests/refactor-gates/capture.sh` was about to do exactly that to the
+    // 146 GB `/var/db/rivoli/v4-f4-full`, and then decode the artifact it had just broken.
+    //
+    // With `--verify-only` the run is READ-ONLY, which is also what makes verifying all 43
+    // layers affordable — the expensive half of a convert is the writing, not the reading.
+    if args.verify_only {
+        eprintln!("convert_v4: verify-only — {} layer(s) checked, nothing written", layers.len());
+        return Ok(());
     }
 
     // 2. Resident set. ALWAYS rewritten, never reused — unlike a `.f4`, which is one
