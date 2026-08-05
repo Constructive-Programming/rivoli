@@ -50,15 +50,45 @@ use crate::v4oracle::weights::{V4Config, WMat};
 // deliberate breakages
 // ---------------------------------------------------------------------------------------
 
-/// A single, deliberately-wrong variant of the transliteration.
+/// Declares [`Defect`] and [`Defect::ALL`] from ONE list.
 ///
-/// These are not hypotheticals. Every one is a transcription slip a competent implementer
-/// makes when porting `model.py` to a kernel, and each is silent: it changes the text and
-/// nothing else. `tests/v4_oracle.rs` runs the whole set against the case grid and asserts,
-/// for each, both halves of the claim — the goldens it MUST perturb, and the goldens it
-/// MUST leave bit-identical. A defect that moves everything is evidence of nothing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Defect {
+/// The array used to be hand-maintained beside the enum, and its own doc said so: *"Adding a
+/// variant to the enum does NOT add it here — this array is hand-maintained and a variant
+/// missing from it is silently untested."* That is a real escape, not a hypothetical one: a
+/// variant absent from the list runs in NO matrix while the suite stays green and the count
+/// of defects goes UP. `tests/v4_oracle.rs::expect` forces the author to *classify* a new
+/// variant (its match is exhaustive and wildcard-free), but classifying is not listing.
+///
+/// A source-scanning test was written to catch that on 2026-08-05 and is now deleted with the
+/// array: generating both from one declaration removes the escape rather than detecting it.
+/// A variant not in this invocation does not exist; one that is in it reaches `ALL` by
+/// construction; a duplicate is `E0428` at compile time rather than a runtime assertion. The
+/// parser also could not see a non-bare variant — `Foo(usize)`, `Bar = 1` — which is exactly
+/// what harness consolidation would introduce.
+///
+/// Declaration order is `ALL` order, and `None` must stay first: `breakages()` filters it out
+/// by value, but `tests/v4_attn.rs`'s grid indexes off the order.
+macro_rules! defects {
+    ($( $(#[$m:meta])* $v:ident ),+ $(,)?) => {
+        /// A single, deliberately-wrong variant of the transliteration.
+        ///
+        /// These are not hypotheticals. Every one is a transcription slip a competent implementer
+        /// makes when porting `model.py` to a kernel, and each is silent: it changes the text and
+        /// nothing else. `tests/v4_oracle.rs` runs the whole set against the case grid and asserts,
+        /// for each, both halves of the claim — the goldens it MUST perturb, and the goldens it
+        /// MUST leave bit-identical. A defect that moves everything is evidence of nothing.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        pub enum Defect { $( $(#[$m])* $v ),+ }
+
+        impl Defect {
+            /// Every defect, `None` first. Generated from the same declaration as the enum,
+            /// so the two cannot drift.
+            pub const ALL: &'static [Defect] = &[ $( Defect::$v ),+ ];
+        }
+    };
+}
+
+defects! {
     /// The real transliteration.
     None,
 
@@ -254,67 +284,6 @@ pub enum Defect {
 }
 
 impl Defect {
-    /// Every defect, `None` first. The matrix iterates this list.
-    ///
-    /// **Adding a variant to the enum does NOT add it here** — this array is hand-maintained
-    /// and a variant missing from it is silently untested. What the tests DO force is that a
-    /// new variant gets an expectation: `tests/v4_oracle.rs::expect` matches exhaustively, so
-    /// the test will not compile until the variant is classified. Keep the two in step by
-    /// hand; `defect_list_has_no_duplicates` catches the other half of the mistake.
-    pub const ALL: &'static [Defect] = &[
-        Defect::None,
-        Defect::SkipQkNorm,
-        Defect::QkNormUsesQNormWeight,
-        Defect::QkNormAfterRope,
-        Defect::RopeAllDims,
-        Defect::RopeFirstDims,
-        Defect::RopeHalfSplit,
-        Defect::RopeNoYarn,
-        Defect::RopeYarnEverywhere,
-        Defect::RopeBaseThetaEverywhere,
-        Defect::SkipKvActQuant,
-        Defect::KvActQuantWholeTensor,
-        Defect::KvActQuantBlock128,
-        Defect::KvActQuantNoRoundScale,
-        Defect::SkipAttnSink,
-        Defect::AttnSinkNotMaxShifted,
-        Defect::PrefillRingWritesFirstWindow,
-        Defect::SkipOutputDerotation,
-        Defect::OutputDerotationForward,
-        Defect::WoGroupsSplitHeadDim,
-        Defect::WoGroupsInterleaved,
-        Defect::CompressorNoOverlap,
-        Defect::CompressorNoApe,
-        Defect::CompressorRopeAtBlockEnd,
-        Defect::IndexerNoRelu,
-        Defect::IndexerNoFp4Quant,
-        Defect::IndexerNoHadamard,
-        Defect::IndexerNoWeights,
-        Defect::IndexerBf16RunningSum,
-        Defect::SwigluUnclamped,
-        Defect::SwigluClampGateBothSides,
-        Defect::RouterSoftmax,
-        Defect::RouterNoSoftplusThreshold,
-        Defect::RouterBiasedWeights,
-        Defect::RouterNoRenorm,
-        Defect::RouterNoScale,
-        Defect::HashRoutingIgnored,
-        Defect::RouteWeightAfterW2,
-        Defect::SharedExpertWeighted,
-        Defect::Fp4NibbleSwap,
-        Defect::SinkhornOneFewerIter,
-        Defect::SinkhornCombTransposed,
-        Defect::HcPostNoComb,
-        Defect::HcPreNoRsqrt,
-        Defect::HeadHcNoRsqrt,
-        Defect::HeadHcRsqrtPerCopy,
-        Defect::HeadNormSkipped,
-        Defect::HeadNormNotBf16,
-        Defect::HeadNormOverAllTokens,
-        Defect::HeadLogitsFromFirstRow,
-        Defect::NoBf16Rounding,
-    ];
-
     /// Every variant except [`Defect::None`] -- the breakages proper.
     pub fn breakages() -> impl Iterator<Item = Defect> {
         Self::ALL.iter().copied().filter(|d| *d != Defect::None)

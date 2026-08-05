@@ -10,7 +10,6 @@
 #
 # STAGE BEFORE BREAKING. `git checkout --` on an unstaged tree reverts real work; that
 # happened to an agent on 2026-08-05.
-src/v4oracle/forward.rs	Defect::Fp4NibbleSwap,		v4_oracle every_defect_variant_reaches	never reach Defect::ALL
 src/artifact/format.rs	n_experts + usize::from(has_shared)	n_experts + 1	v4_loading f4_refuses_a_file_sized_for_a_shared_block	blocks_plus_one: this must be refused
 kernels/common.hpp	gt = fminf(gt, limit);	gt = fminf(fmaxf(gt, -limit), limit);	v4_kernel the_clamped_combine_is_bit_exact_elementwise	differs: g=
 kernels/linalg.hip	!(limit > 0.0f && limit < INFINITY)	!(limit > 0.0f)	v4_kernel v4_swiglu_clamped_guards	an infinite limit
