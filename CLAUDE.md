@@ -39,12 +39,35 @@ agrees. If you change a verdict, change both; the test will tell you which one y
 ## Build and test
 
 ```bash
+# DEVELOPING a feature — the dev profile, where debug_assert! is LIVE. Default to this.
+cargo test --features rocm                   # 100 tests
+
+# BENCHMARKS and performance evaluation ONLY.
 cargo build --release --features rocm        # or --features vulkan; NEVER both
-cargo test  --release --features rocm        # 100 tests
+cargo test  --release --features rocm
+
 cargo clippy --release --features rocm --all-targets
 # Before you claim a change compiles, ALSO run the union — see below.
 cargo clippy --release --features rocm,otlp,teacher-forcing,pred-probe,trace --all-targets
 ```
+
+**Develop on the dev profile. Use `--release` for benchmarks and performance evaluation
+only.** `[profile.release]` sets `lto` and `opt-level` and **no `debug-assertions`**, and no
+`.cargo/config.toml` overrides it — so under `--release` every `debug_assert!` in `src/` is
+compiled out. There are **32**, and the two in `v4compress.rs` are described by their own doc
+as "what ENFORCES the bsz=1 scope cut". Under `--release` they enforce nothing. Measured
+2026-08-05; the distribution is in `docs/investigations/v4-flash-port.md`.
+
+That is not a defect in the release profile — it is what every number in
+`docs/measurement/benchmarks.md` was measured under, and putting bounds and overflow checks
+on the hot path would change the thing being measured. It was a defect in *habit*: this file
+prescribed `--release` for everything, so nobody ever ran the checks. **A run that is not
+timing something should be a dev-profile run.**
+
+So `debug_assert!` is the right tool for a cheap internal check again — but it fires only for
+someone who follows the line above. A check that must hold in a shipped binary is an
+`assert!`/`ensure!` and pays its cost, and a `debug_assert!` whose comment claims it
+*enforces* anything is this repo's most common review finding wearing a new hat.
 
 **`--features rocm` alone does not compile `mod otlp`, `src/eval.rs`, or the pred-probe and
 trace paths.** That blind spot is not hypothetical: `otlp` sat broken for weeks on an

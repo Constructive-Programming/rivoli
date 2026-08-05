@@ -604,11 +604,25 @@ Two of them are load-bearing by their own documentation: `v4compress.rs`'s doc s
 review finding — *a comment asserting a check that does not exist* — reproduced 36 times by a
 profile setting rather than by any one author.
 
-**Do NOT fix this by setting `debug-assertions = true` in the release profile.** This is a
-decode engine measured in tok/s; turning on bounds and overflow checks across the hot path
-changes the thing being measured to fix a documentation problem. The repair is per-site:
-where a comment claims enforcement, promote to a real `assert!`/`ensure!` and pay the check;
-everywhere else, delete the `debug_assert!` and the claim with it. Booked for integration.
+**RESOLVED 2026-08-05 by changing the habit, not the code.** Two repairs were considered and
+both rejected. Setting `debug-assertions = true` on `[profile.release]` was rejected because
+that profile is what every number in `docs/measurement/benchmarks.md` was measured under, and
+bounds and overflow checks on the hot path change the thing being measured. A `debug` Cargo
+feature with a `debug_check!` macro was written and then **reverted**: a feature cannot set
+`debug-assertions` (it is a profile flag), so it required rewriting all 32 call sites to a
+private macro — 32 sites of churn, a second spelling to learn, and a macro whose only job was
+to reimplement a profile that already exists.
+
+The actual defect was the instruction in CLAUDE.md, which prescribed `--release` for *every*
+build, test and clippy run. Cargo's dev profile already sets `debug-assertions`. So the rule
+is now: **develop on the dev profile, and use `--release` for benchmarks and performance
+evaluation only.** The 32 `debug_assert!`s are live again for anyone following it, with no
+code change at all.
+
+What remains true and worth carrying: a `debug_assert!` fires only for someone who follows
+that rule, so a check that must hold in a shipped binary is an `assert!`/`ensure!` and pays
+its cost. `v4compress.rs`'s pair — whose doc calls them "what ENFORCES the bsz=1 scope cut" —
+should be promoted on that argument, not on this one.
 
 ### Integration checkpoint — VERIFIED on the merged tree, 2026-08-05
 
