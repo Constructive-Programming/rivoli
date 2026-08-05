@@ -1012,6 +1012,31 @@ helper to discharge a debt created by deleting a callerless helper is a loop, no
 | `Io` built by something that takes `LayerKind` and calls `v4compress::rope_for_layer` itself, so the two-table selection has ONE site | nothing detects `Defect::RopeNoYarn`, on the one cell measured invisible to the numeric gate (`ratio4/decode`, sep 8 against `RESOLVABLE` 64) |
 | whoever places the compressor's output computing the decode slot as `window + start_pos / ratio`, with a test | requirement 2 is implemented nowhere and asserted nowhere; a caller that appends is right only until it skips a step, and speculative decode skips by construction |
 
+> **PARTLY DISCHARGED 2026-08-05 by the compressed-layer cell, and one entry is corrected.**
+> Both rules now have a *caller* and a *test*, in `tests/v4_attn.rs`: `Gpu::new` builds the
+> rotary table through `rope_for_layer` keyed on `LayerKind` (and
+> `the_two_rope_table_constructions_agree_on_the_un_yarned_table` pins the un-YaRN'd arm
+> against `v4_rope_table_ratio0`, a comparison nothing in the tree performed before), and
+> `Gpu::compress_and_place` computes both destinations with `COMP_SLOTS` asserting the decode
+> slot. Measured: **a compressed-layer numeric gate separates a wrong rotary table
+> (`RopeNoYarn`) at 33,461 ULP.**
+>
+> **Read that narrowly.** It means the mistake will be VISIBLE once something drives the layer
+> loop through such a gate. It does NOT mean anything in the engine detects it — nothing does,
+> the owed item ("`Io` built by something that takes `LayerKind`") is untouched, and the cell
+> this table actually names, `ratio4/decode`, is still the measured-invisible one. Both
+> callers here are the TEST harness, so neither debt is retired; what has changed is that the
+> loop now has an executable specification of both rules to copy, with a seen-red record. The
+> harness is therefore a second implementation of the loop's placement rules, and it and the
+> future engine can drift with nothing able to notice.
+>
+> **The second entry's stated reason was wrong** and the correction matters more than the
+> discharge: "speculative decode skips by construction" is false — `compress` refuses
+> `seqlen > 1` at decode, so a speculating engine calls it once per position and a gap is a
+> bug, not a mode. And the requirement is **not observable through attention output at all**;
+> see the measurement above. A layer loop reviewed against numeric goldens alone would ship
+> the append rule green.
+
 Both were **device-free** tests before deletion. Whoever builds the layer loop owns both,
 and this table is the acceptance criterion.
 
@@ -1130,7 +1155,96 @@ port that a first-principles equivalence has been taken for a bitwise one.
 **A process failure to record: a review subagent ran the GPU tests without the lock.** It was
 given Bash and not told the device was held; it ran three GPU tests plus a `cargo check`. Any
 contention in that window is explained by it. Its numbers are not adopted here — the measured
-results below are from the run under `flock` with the KFD witness taken inside it.
+results below are from the run under `flock` with the KFD witness taken inside it. **The
+prohibition belongs in the review prompt**, because a subagent inherits Bash and is covered by
+nothing the parent does: *"Do not run anything that touches the GPU; read the code and the
+captured logs."* Reviews are meant to read code, so it costs nothing.
+
+### MEASURED on gfx1151, 2026-08-05 — every prediction held, and one gate did not
+
+Under `flock`, KFD witness taken inside the lock (empty on every run). Per-binary sweep,
+**117 passed over 14 suites**; the only failure is the pre-existing dev-profile
+`v4_loading::magic_separates_the_formats_when_the_length_cannot`
+(`src/artifact/quant.rs:128`, `i_dim 32 not a multiple of VQ_GROUP`), which predates this work
+and is in neither file it touches.
+
+| predicted | measured |
+|---|---|
+| ratio-0 floor unchanged at 0 | **0 ULP**, all three steps, every stage `differing=0` — the hoisted-RNG fix restored the dated numbers |
+| `q`, `kv_entry` bit-identical | **0/24576 and 0/3072**, every step |
+| `compressed` bit-identical | **0/256** at all three emitting steps (prefill, 15, 31) |
+| `attn_derot`, `attn_out` bit-identical, floor 0 | **0 ULP over 7 steps** |
+| 19-defect sweep ≥ 1000 ULP | **32,932–34,562**; tightest `KvActQuantWholeTensor` at 32,932 |
+| tightest margin from a compressor defect | **wrong** — it is `KvActQuantWholeTensor`; the two compressor defects sit at 33,790 and 33,584, mid-field |
+
+The `expf`-versus-`f32::exp` fallback did not bite: the pooling softmax agreed exactly at
+these dims, so no registry entry was needed and `ULP_BUDGET` was not touched.
+
+**THE NEGATIVE RESULT, and it is the most useful thing here: requirement 2 is invisible to
+the attention output.** Injecting the append rule — the decode slot as "the next free slot"
+instead of `window_size + start_pos / ratio` — left **every numeric golden bit-identical**,
+`attn_out` included, on a script built specifically to expose it. The reason is structural,
+not a fixture accident:
+
+```
+start_pos 31, ratio 8, window 8, n_comp = 4  ->  selection names cache rows 8,9,10,11
+correct: [8]=b0 [9]=b1 [10]=0  [11]=b3        oracle: [0]=b0 [1]=b1 [2]=0  [3]=b3
+append:  [8]=b0 [9]=b1 [10]=b3 [11]=0
+attended MULTISET in all three: { b0, b1, b3, zero-row }
+```
+
+The two rules differ by a **permutation** of the compressed region. The positional selection
+covers rows `0..n_comp`, which is exactly the highest slot the correct rule uses, so append
+never writes outside the selection and never overwrites a live row — and `sparse_attn`'s
+softmax over a set is permutation-invariant. **More gaps do not help**: the multiset is
+invariant under every permutation the two rules can produce. So the `COMP_SKIP_TO` gap did not
+buy what its comment claimed, for the *second* time (the first was the retracted
+speculative-decode framing).
+
+**Two premises, and both expire.** This holds only while (a) the compressed selection is the
+positional full prefix — `Sel::n_comp` REFUSES past `index_topk` rather than truncating — and
+(b) unwritten rows read as an agreed zero on both sides. Once the score-ordered `Indexer`
+lands, the selected SET is content-chosen and a permuted region changes which blocks are
+attended, not merely their fold order; and a compressed region reused across sequences without
+clearing holds stale rows rather than zeros, so the two rules read different values. The
+conclusion is scoped, not structural: **re-measure when either premise goes.** Stated because
+an unscoped version would be cited to justify not re-testing — and note that the engine's
+obligation to clear the compressed region between sequences is asserted nowhere today.
+
+What it buys instead, and what now gates the requirement: an assertion that block `b` sits at
+cache row `window + b`, read from the ring **directly** and compared against a slot spelled by
+hand in `COMP_SLOTS` — a source independent of the arithmetic under test. That goes red under
+the append rule and nothing else does. One of its two anti-vacuity arms was proved able to fire (the
+"emitted a block whose destination COMP_SLOTS does not name" arm). The other — "a COMP_SLOTS
+row names a step this script skips" — is reached only by a row whose `start_pos` is absent
+from the script; the break recorded above instead names a step that IS in the script but emits
+nothing, which short-circuits earlier. Recorded as a gap rather than claimed. Note the shape: a numeric oracle comparison, however tight, cannot see a **layout**
+error that permutes rows the selection covers uniformly. Requirement 2 could have been
+declared covered on a green run here, and would not have been.
+
+**SEEN-RED RECORD.** No gate below is trusted green without having been watched go red.
+
+| break | gate that fired | evidence |
+|---|---|---|
+| drop the prefill persist copy into `io.cache` | `attn_derot` at the FIRST decode step | 2031/2048 differing, rel 4.2e-1 |
+| drop the prefill `s.kv` tail copy | `attn_derot` at prefill | 10150/24576, rel 6.7e-1 |
+| decode slot → "next free" | `COMP_SLOTS` layout assertion | "block 3 is not at cache row 11" — **and no numeric golden moved** |
+| drop a `COMP_SLOTS` row | "a step emitted a block whose destination COMP_SLOTS does not name" | — |
+| add a `COMP_SLOTS` row for a non-emitting step | the golden lookup for `.compressed` | — |
+| engine forgets the layer compresses (`Sel.kind` → `Plain`) | the anti-vacuity assertion | "0 compressed columns past a window half of 12, largest selection index 11" |
+| ratio-0 rope table on a compressed layer (requirement 4, in the ENGINE) | `q` at prefill | 4375/24576, rel 1.06 |
+| poison probe 2 aimed at a SELECTED block | the bit-identical arm | paraphrase: the probe reported MOVED where the table requires identical |
+
+Each break was checked for effectiveness before its result was believed — the append break's
+patch was confirmed present in the source while the suite was green, which is what turned a
+"the gate works" reading into the finding above.
+
+**One self-inflicted loss, recorded because the rule that prevents it is already written
+down.** The layout assertion was added *after* the break script started and was not staged;
+the script's `git checkout -- tests/v4_attn.rs` (reverting a break) took the new work with it,
+and the next break then ran against the old file and passed for the wrong reason. CLAUDE.md's
+"stage before you inject a break" exists for exactly this. Re-applied and committed before any
+further injection.
 
 ## S4 — benchmark, quality assessment, ranked perf work.
 

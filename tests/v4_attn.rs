@@ -77,7 +77,14 @@
 //! `tests/v4_oracle.rs::qk_norm_order_is_a_rounding_difference_not_an_arithmetic_one` bounds
 //! against the cost of dropping bf16 rounding entirely — it is not an invisibility.
 //!
-//! A THIRD hole is in this file's own metric rather than in the oracle: `mono` rounds
+//! **A LAYOUT permutation of the compressed region** is the third, it is the strongest, and
+//! it was measured rather than argued. Moving a compressed block from its slot to another
+//! slot the selection also names leaves **all seven goldens bit-identical** — `sparse_attn`
+//! folds a softmax over a SET. So the decode-slot rule (`window_size + start_pos / ratio`,
+//! S3 requirement 2) is invisible to the entire oracle comparison, and is gated only by the
+//! `COMP_SLOTS` assertion. Measured 2026-08-05 by injecting the append rule.
+//!
+//! A FOURTH hole is in this file's own metric rather than in the oracle: `mono` rounds
 //! both sides to bf16 before differencing, so a kernel that stopped rounding its stores
 //! would score zero ULP. That one IS closed, by `Score::unrounded` — but by a property
 //! of the GPU output, not by the goldens, which is why it is named here and not in
@@ -123,7 +130,8 @@ const LAYER: usize = 0;
 /// Toy layer 3 is `compress_ratio == 8`: [`LayerKind::NonOverlap`], a compressor, **no
 /// indexer**, YaRN and `compress_rope_theta`. Layer 2 (ratio 4) is the other compressed
 /// class and is deliberately NOT the cell here — its `Indexer` returns
-/// **score-ordered** blocks (`forward.rs:776-782`) where [`v4_topk_idxs`] returns them
+/// **score-ordered** blocks (`Oracle::topk_idx` sorts by score, and the indexer selects
+/// through it) where [`v4_topk_idxs`] returns them
 /// positionally, so engine and oracle would fold `sparse_attn`'s softmax over the same SET
 /// in a different ORDER and every disagreement below would be uninterpretable. That is the
 /// gap `docs/investigations/v4-flash-port.md` §"The pre-indexer shortcut is narrower than it
@@ -316,6 +324,20 @@ fn plain_script() -> Vec<(usize, usize)> {
 /// GPU cache is zero-initialised in `Gpu::new`, the oracle's `CompState::cache` is
 /// `vec![0.0]`), while the selection at 31 names blocks 0..3.
 ///
+/// # CORRECTED 2026-08-05, a second time
+///
+/// This said the gap "is what makes the decode slot arithmetic observable at all". It is
+/// **not** observable in any numeric golden: the append rule leaves all seven bit-identical,
+/// because the two rules differ by a permutation of a region the positional selection covers
+/// uniformly. The gap's ONE consumer is the `(COMP_SKIP_TO, 3)` row of [`COMP_SLOTS`] —
+/// contiguate or shorten this script and that assertion goes vacuous with nothing to say so.
+///
+/// **That reasoning has an expiry.** It holds only while the compressed selection is the
+/// positional full prefix (`Sel::n_comp` REFUSES past `index_topk` rather than truncating)
+/// and unwritten rows read as an agreed zero on both sides. Once the score-ordered `Indexer`
+/// lands, a permuted region changes the attended SET, not just its order — and a cache reused
+/// across sequences without clearing holds stale rows rather than zeros. Re-measure then.
+///
 /// That makes the last step a **state-machine** probe, not a reference-faithful one: it
 /// certifies that the engine and the oracle implement the same deposit/emit/slide machine and
 /// that the emitted block lands at `start_pos / ratio`. It does NOT certify that the value is
@@ -370,8 +392,8 @@ fn comp_script(cfg: &V4Config) -> Vec<(usize, usize)> {
 /// half of the block agreeing first.
 ///
 /// The script is a parameter because the compressed cell needs one the ratio-0 cell does
-/// not — see [`comp_script`], whose deliberate GAP is what makes the decode slot
-/// arithmetic observable at all.
+/// not — see [`comp_script`], whose deliberate GAP is what makes the decode slot arithmetic
+/// observable in the LAYOUT. It is not observable in the output; see [`COMP_SKIP_TO`].
 fn drive_script(
     cfg: &V4Config,
     m: &ToyModel,
@@ -727,9 +749,11 @@ impl Gpu {
         let x = dev_f32(golden(p, "attn_norm_out"));
         let placed = self.compress_and_place(d, &x, p);
         let mut out = self.attend(d, p);
-        // Read back from where `sparse_attn` read them, NOT from the compressor's own
-        // `out` buffer: a placement that landed the blocks somewhere else entirely would
-        // still make that buffer compare clean, and WHERE they land is this cell's subject.
+        // Read back from the buffer `sparse_attn` indexes, at the offset the placement
+        // RETURNED — so this catches a wrong buffer (`s.kv` vs `io.cache`) and CANNOT catch
+        // a wrong row inside it. CORRECTED 2026-08-05: this claimed a placement "somewhere
+        // else entirely" would fail here. It would not; the row is the placement's own.
+        // `Gpu::cache_row` and `COMP_SLOTS` are what check the row.
         if let Some((off, blocks)) = placed {
             let src = if p.start_pos == 0 { &self.kv } else { &self.ring };
             out.compressed = read(src)[off * d.head_dim..(off + blocks) * d.head_dim].to_vec();
@@ -793,12 +817,8 @@ impl Gpu {
     /// is. Returns the bytes it replaced, so a probe can put them back and the next one
     /// starts from the same state.
     fn poke(&mut self, d: &Dims, row: usize, fill: f32) -> Vec<f32> {
+        let was = self.cache_row(d, row);
         let hd = d.head_dim;
-        // In bounds, with a message. The slice below would panic on overrun anyway, but as
-        // an index panic — and the caller most likely to overrun is a future probe at
-        // `window + n_comp` on a step where the selection covers the whole region.
-        assert!(row < self.ring_rows, "cache row {row} is past the {} the ring holds", self.ring_rows);
-        let was = read(&self.ring)[row * hd..(row + 1) * hd].to_vec();
         self.ring.copy_in_at(row * hd * size_of::<f32>(), &f32b(&vec![fill; hd])).expect("poke");
         was
     }
@@ -809,6 +829,11 @@ impl Gpu {
     /// the entire point: comparing against the offset the placement itself computed cannot
     /// detect a wrong offset. This takes the row from the caller.
     fn cache_row(&self, d: &Dims, row: usize) -> Vec<f32> {
+        // The one bounds guard, here rather than in `poke`, because THIS is the caller that
+        // can overrun: `poke`'s rows are gated by `base.n_comp < capacity` at its call site,
+        // while `cache_row`'s come from `COMP_SLOTS` — a hand-written table whose block index
+        // nothing else bounds. `poke`'s copy of this assert could not fire and was cut.
+        assert!(row < self.ring_rows, "cache row {row} is past the {} the ring holds", self.ring_rows);
         let hd = d.head_dim;
         read(&self.ring)[row * hd..(row + 1) * hd].to_vec()
     }
@@ -918,14 +943,20 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
-        Self::at(LAYER, &plain_script())
+        Self::at(LAYER, |_| plain_script())
     }
 
     /// The same, for any layer and script. `layer` reaches `drive_script` AND `Gpu::new`
     /// from this one argument, so a harness carrying layer 0's weights against layer 3's
     /// goldens is not constructible.
-    fn at(layer: usize, script: &[(usize, usize)]) -> Self {
+    fn at(layer: usize, script_of: impl Fn(&V4Config) -> Vec<(usize, usize)>) -> Self {
         let (cfg, model) = fixture();
+        // The script is built from `fixture()`'s OWN config, which is what makes
+        // `Harness::compressed`'s claim true rather than merely likely. It took a
+        // `&[(usize, usize)]` for one round and every compressed test then built a second
+        // `V4Config::toy()` to produce it — two configs agreeing only because `toy()` is
+        // deterministic, which is exactly the coupling this struct exists to prevent.
+        let script = &script_of(&cfg);
         let d = dims(&cfg);
         let clean = drive_script(&cfg, &model, Defect::None, layer, script);
         let max_m = script.iter().map(|&(s, _)| s).max().expect("an empty script gates nothing");
@@ -937,7 +968,7 @@ impl Harness {
     /// test cannot hold a second `V4Config::toy()` beside the one `fixture()` built — the
     /// coupling this struct's doc says it exists to prevent.
     fn compressed() -> Self {
-        Self::at(COMP_LAYER, &comp_script(&V4Config::toy()))
+        Self::at(COMP_LAYER, comp_script)
     }
 }
 
@@ -1831,8 +1862,9 @@ fn each_defect_moves_exactly_the_compressed_layer_goldens_it_should() {
 ///
 /// The four `attention` goldens are compared exactly as the ratio-0 cell compares them, and
 /// the compressed rows are compared as a fifth — read back out of the buffer `sparse_attn`
-/// indexed, not out of the compressor's own `out`, so a placement that landed them anywhere
-/// else fails here rather than passing on a clean-looking scratch.
+/// indexes, at the offset the placement returned. That catches a wrong BUFFER and cannot
+/// catch a wrong ROW inside it; the row is `COMP_SLOTS`'s job, for the reason measured on
+/// 2026-08-05 and recorded there.
 ///
 /// The anti-vacuity assertions are what make a green run mean something, and each names a
 /// way this could otherwise pass while testing the ratio-0 path twice:
@@ -1846,7 +1878,7 @@ fn each_defect_moves_exactly_the_compressed_layer_goldens_it_should() {
 /// * some later decode step emits — so the decode slot is exercised too.
 #[test]
 fn attention_matches_the_oracle_on_a_compressed_layer_in_both_phases() {
-    let Harness { d, clean, mut gpu, .. } = Harness::compressed();
+    let Harness { cfg, d, clean, mut gpu, .. } = Harness::compressed();
     let blocks = |p: &Phase| p.cap.counters.compressed_blocks;
     assert!(blocks(&clean[0]) > 0, "the prefill emits no block; the persist copy gates nothing");
     assert_eq!(
@@ -1891,20 +1923,47 @@ fn attention_matches_the_oracle_on_a_compressed_layer_in_both_phases() {
         // `compress_and_place`: the whole numeric comparison stayed green and only this went
         // red. More gaps do not help; the attended multiset is invariant under any
         // permutation the two rules can produce.
-        if let Some(&(_, block)) = COMP_SLOTS.iter().find(|&&(at, _)| at == p.start_pos) {
+        if let Some(&(_, first)) = COMP_SLOTS.iter().find(|&&(at, _)| at == p.start_pos) {
             seen_slots += 1;
-            let want = golden(p, "compressed");
-            let row = d.window + block;
-            assert_eq!(
-                gpu.cache_row(&d, row),
-                want[..d.head_dim],
-                "{}: compressed block {block} is not at cache row {row}. The persistent \
-                 region's slot is `window_size + start_pos / ratio`, never the next free \
-                 one — a caller that appends is right only until it skips a step",
-                p.tag
-            );
+            // `captured`, not `golden`: a table row naming a step that emits NOTHING is a
+            // fault in the table, and `golden`'s panic blames the oracle for it.
+            let want = captured(p, "compressed").unwrap_or_else(|| {
+                panic!(
+                    "COMP_SLOTS names start_pos {} but the reference emits no block there — \
+                     the table is wrong, not the oracle",
+                    p.start_pos
+                )
+            });
+            // EVERY block this step emitted, not just the first. `COMP_SLOTS` holds one
+            // index per step while the prefill rule is a RANGE (`0..seqlen/ratio`), and
+            // comparing `want[..head_dim]` silently checked only block 0 — correct today
+            // solely because `PROMPT / ratio == 1`. Raising `PROMPT` to 16 would have left
+            // the second block's destination checked by nothing, with both anti-vacuity
+            // asserts green because they count STEPS, not blocks.
+            for b in 0..want.len() / d.head_dim {
+                let (block, row) = (first + b, d.window + first + b);
+                let seg = &want[b * d.head_dim..(b + 1) * d.head_dim];
+                // SCORED at `ULP_BUDGET`, not bit-compared. Every other value comparison in
+                // this file allows one ULP for re-association; a bare `assert_eq!` here made
+                // a legitimate rounding flip fail with a message blaming the slot rule. A
+                // wrong row is not a near miss — it is a different vector or a zero row — so
+                // the budget costs this gate nothing.
+                let sc = score(&gpu.cache_row(&d, row), seg);
+                assert!(
+                    sc.max_ulp <= ULP_BUDGET,
+                    "{}: compressed block {block} is not at cache row {row} ({sc:?}). The \
+                     persistent slot is `window_size + start_pos / ratio` at decode and \
+                     `window_size + 0..blocks` at prefill — never the next free one, which \
+                     a caller that appends is right about only until it skips a step",
+                    p.tag
+                );
+            }
         }
-        // The fifth golden, and the only one that says WHERE the blocks landed.
+        // The fifth golden: the VALUES of the emitted blocks, read out of the buffer
+        // `sparse_attn` indexes. It does NOT say which row they sit at — that is the
+        // `COMP_SLOTS` assertion above, and this sentence claimed otherwise until
+        // 2026-08-05, when the append-rule measurement showed the readback uses the
+        // placement's own offset.
         match captured(p, "compressed") {
             Some(want) => {
                 assert_eq!(
@@ -1925,6 +1984,18 @@ fn attention_matches_the_oracle_on_a_compressed_layer_in_both_phases() {
             ),
         }
     }
+    // The slot the script SKIPS must still be untouched. Without this, a placement that
+    // wrote BOTH the correct slot and the next free one satisfies every row of `COMP_SLOTS`
+    // — the correct rows are all still right — and only this separates "writes the right
+    // slot" from "writes the right slot AMONG OTHERS". The oracle leaves block 2 unwritten
+    // (position 23 is skipped), and `Gpu::new` zeroes the ring, so both sides read zeros.
+    let skipped = d.window + COMP_SKIP_TO / cfg.compress_ratio(COMP_LAYER) - 1;
+    assert!(
+        gpu.cache_row(&d, skipped).iter().all(|v| *v == 0.0),
+        "cache row {skipped} holds the block the script SKIPS and must never be written; \
+         a placement that also appends would land a duplicate here"
+    );
+
     // BOTH directions. Every `COMP_SLOTS` row must have been reached, so a stale entry
     // cannot sit there looking like coverage; and every step that EMITTED must have had a
     // row, so a slot rule cannot go unchecked by being left out of the table.
@@ -2092,9 +2163,16 @@ fn compressed_sweep() -> Vec<Defect> {
 /// `each_in_scope_defect_is_further_away_than_the_kernels_are` applies to the ratio-0 layer,
 /// on the layer class 41 of 43 layers actually have.
 ///
-/// The floor is what this cell is really about. If the compressed blocks were placed at the
-/// wrong row, or the persist copy were missing, or the decode slot were "the next free one",
-/// the GPU would be far from the CLEAN oracle and this fails before any defect is tried.
+/// The floor is what this cell is really about: if the prefill's persist copy into
+/// `io.cache` were missing, the GPU would be far from the CLEAN oracle and this fails before
+/// any defect is tried (seen red — `attn_derot` 2031/2048 at the first decode step).
+///
+/// **CORRECTED 2026-08-05.** This also claimed a wrong ROW and a decode slot of "the next
+/// free one" would fail here. Measured: they do not. `reach` scores only the four `STAGES`
+/// tensors, and none of them can see a permutation of the compressed region — the append
+/// rule left every numeric golden BIT-IDENTICAL. The layout rule is gated only by the
+/// `COMP_SLOTS` assertion in
+/// `attention_matches_the_oracle_on_a_compressed_layer_in_both_phases`.
 #[test]
 fn each_compressed_defect_is_further_away_than_the_kernels_are() {
     let Harness { cfg, model, d, clean, mut gpu, layer, script } = Harness::compressed();

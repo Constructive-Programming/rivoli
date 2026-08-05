@@ -736,9 +736,13 @@ pub mod v4 {
             // different steps. Measured on a compressed layer: `Defect::QkNormAfterRope`
             // moves `.q` on 1287/24576 elements at rel 7.4e-3, and three goldens downstream
             // (`tests/v4_attn.rs::expect_moves`). What IS true is narrower and is why the
-            // defect stays out of both separation sweeps: the move is at the bf16 rounding
-            // scale, so a gate ranking on distance cannot separate it from the floor --
-            // `tests/v4_oracle.rs::qk_norm_order_is_a_rounding_difference_not_an_arithmetic_one`
+            // defect stays out of both separation sweeps: its distance measures the bf16
+            // ROUNDING scale rather than a defect's reach, so ranking it beside the others
+            // would misstate the sweep's resolution. (It is not that the sweep cannot see it
+            // -- the max-ULP metric prints 29,131 for it against a floor of 0, because that
+            // metric is a bf16-CODE distance and is blind at zero. An earlier wording of
+            // this line said "cannot separate it from the floor" and was wrong about the
+            // instrument.) `tests/v4_oracle.rs::qk_norm_order_is_a_rounding_difference_not_an_arithmetic_one`
             // bounds it by what dropping bf16 rounding entirely costs. Third time in this
             // port that an exact-arithmetic equivalence was taken for a bitwise one; see
             // `KV_QUANT_BLOCK` above for the second.
