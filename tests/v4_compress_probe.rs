@@ -29,14 +29,14 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use rivoli::v4compress::{LayerKind, compress_offset, compress_topk};
-use rivoli::v4oracle::forward::{Counters, Defect, IndexerW, LayerW, Oracle, Step};
+use rivoli::v4oracle::forward::{Counters, Defect, LayerW, Oracle, Step};
 use rivoli::v4oracle::weights::{V4Config, WMat};
 use std::collections::HashMap;
 
 mod common;
 use common::{
     EMIT_LEN, PROBE_LEN, PROBE_REMAINDER_LEN, RATIO_128_FIRST_DECODE_BLOCK, checkpoint,
-    compressor_w, probe,
+    compressor_w, indexer_w, probe,
 };
 
 // ---------------------------------------------------------------------------------------
@@ -44,31 +44,11 @@ use common::{
 // ---------------------------------------------------------------------------------------
 //
 // `compressor_w` and the probe lengths moved to `tests/common/mod.rs` when
-// `v4_compress_kernel.rs` needed the same two compressors. `indexer_w` stayed here: the
-// indexer is out of the kernel test's scope (it needs the fp4 path), so a second consumer
-// does not exist and moving it would put an unused loader in a module three test binaries
-// compile.
+// `v4_compress_kernel.rs` needed the same two compressors. `indexer_w` followed on
+// 2026-08-05 when `v4_indexer_kernel.rs` became its second consumer -- the comment here used
+// to argue that a second consumer did not exist, and the duplication gate found the copy the
+// moment one did.
 
-fn indexer_w(ck: &rivoli::v4oracle::weights::Checkpoint, layer: usize, c: &V4Config) -> IndexerW {
-    IndexerW {
-        // fp8 on disk (it ships a `.scale`), unlike `weights_proj`, which is bare bf16.
-        // Guessing GLM's `wk`/`k_norm` here is what broke S1a's first convert; V4's Indexer
-        // has neither.
-        wq_b: ck.fp8(&format!("layers.{layer}.attn.indexer.wq_b.weight")).unwrap(),
-        weights_proj: ck
-            .dense(&format!("layers.{layer}.attn.indexer.weights_proj.weight"))
-            .unwrap(),
-        // `rotate = true`: the indexer's own compressor Hadamard-rotates and fp4-quantizes
-        // where the attention's partially fp8-quantizes. Same class, different arithmetic.
-        compressor: compressor_w(
-            ck,
-            &format!("layers.{layer}.attn.indexer.compressor"),
-            4,
-            c.index_head_dim,
-            true,
-        ),
-    }
-}
 
 /// A `LayerW` carrier for [`Step`], whose weights are never read.
 ///
