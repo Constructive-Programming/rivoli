@@ -496,7 +496,8 @@ __device__ __forceinline__ float fast_round_scale(float amax, float max_inv) {
 // NOWHERE else — established BY INSPECTION on 2026-08-05, and by nothing that would go red
 // if it stopped being true (`act_quant_f8_is_bit_identical_to_the_oracle` gates the
 // subnormal ties against the ORACLE, not against `fwd.hip`). Including the two places the
-// two look different and are not: the early return here is at the RNE midpoint 464 where `fwd.hip`'s is at 448, but
+// two look different and are not: the early return here is at the RNE midpoint 464 where
+// `fwd.hip`'s is at 448, but
 // `[448, 464)` falls through to code 0x7e either way; and `a <= 2^-10` versus `a < 2^-10`
 // IS one of the subnormal ties (k = 0.5), not a separate case.
 //
@@ -541,7 +542,8 @@ __device__ __forceinline__ unsigned char f2e4m3_rne(float x) {
 // One element of a block-128 group, fused quantize-then-dequantize: the value a V4 GEMM
 // actually sees. `e4m3f` is reused rather than rewritten because DECODE is unambiguous —
 // only the ENCODE rule differs between the two engines. What pins the pair is the round
-// trip, in `tests/v4_kernel.rs::act_quant_f8_is_bit_identical_to_the_oracle`.
+// trip, in `tests/v4_kernel.rs::act_quant_f8_is_bit_identical_to_the_oracle`, over all 254
+// finite codes. That test's own doc states what the round trip can and cannot prove.
 __device__ __forceinline__ float act_quant_roundtrip(float x, float s) {
     // Written with comparisons, NOT `fminf`/`fmaxf`, so a NaN PROPAGATES. Those two return
     // the non-NaN operand, which would sanitize a NaN activation into -448 — a large finite

@@ -65,7 +65,7 @@ use rivoli::backend::hip::{
 use rivoli::memory::device::DeviceBuf;
 use rivoli::v4oracle::{
     forward::{Capture, Counters, Defect, ExpertW, LayerW, Oracle, Step},
-    numerics::{act_quant_inplace, bf16_decode, bf16_encode},
+    numerics::{act_quant_inplace, bf16_decode, bf16_encode, e4m3_decode},
     toy::{self, ToyModel},
     weights::{NamedRng, V4Config, WMat},
 };
@@ -219,7 +219,8 @@ impl F4Experts {
         }
         // SAFETY: `ExpertDescF4` is plain addresses, so the span is exactly the slice's bytes.
         let raw = unsafe {
-            std::slice::from_raw_parts(descs.as_ptr() as *const u8, std::mem::size_of_val(&descs[..]))
+            let bytes = std::mem::size_of_val(&descs[..]);
+            std::slice::from_raw_parts(descs.as_ptr() as *const u8, bytes)
         };
         Self { descs: to_device(raw), n: descs.len(), parts }
     }
@@ -304,6 +305,28 @@ impl Dispatch<'_> {
 /// it build device buffers and run an oracle expert pass to learn two integers.
 const PICKS: [usize; 2] = [1, 5];
 
+/// Two 128-element blocks covering EVERY finite e4m3 code, as `e4m3_decode(c) · 2^-8`.
+///
+/// Each block is 127 codes plus one pad, and the pad is what makes it 128 WIDE — which is
+/// what `act_quant`'s blocking and the oracle's `chunks_mut(128)` both require. It does NOT
+/// pin the scale and is not a new magnitude: it repeats `0x7e` (+448), a code the positive
+/// block already holds, and the negative block's own extreme is `0xfe` (−448) of the same
+/// magnitude. So `amax` is `448 · 2^-8 = 1.75` in both either way, and
+/// `fast_round_scale(1.75, 1/448)` is exactly `2^-8` (1.75/448 IS 2^-8, mantissa zero).
+/// Every element therefore divides back to the code's own decoded value, which is
+/// representable by construction, so the block round-trips to ITSELF and any disagreement
+/// with the oracle on ANY code shows up.
+///
+/// 0x7f and 0xff are the format's NaN; a NaN activation is fatal upstream, so it is not this
+/// fixture's business.
+fn e4m3_code_blocks() -> Vec<f32> {
+    const S: f32 = 1.0 / 256.0;
+    [0x00u8..=0x7e, 0x80..=0xfe]
+        .into_iter()
+        .flat_map(|codes| codes.map(|c| e4m3_decode(c) * S).chain([e4m3_decode(0x7e) * S]))
+        .collect()
+}
+
 /// A residual-stream-shaped activation: bf16-representable, scaled so the caller can drive
 /// the SwiGLU clamp on or off. `scale` is the knob the clamp test turns.
 fn draw_x(tag: &str, n: usize, scale: f32) -> Vec<f32> {
@@ -358,7 +381,8 @@ impl Case {
                 // asymmetry, it is `MoE.forward`'s own `counts[i] == 0` skip.
                 continue;
             }
-            for (a, b) in want.iter_mut().zip(&o.expert(&lw.experts[&e], &x, 1, Some(&[w]), &mut counters)) {
+            let out = o.expert(&lw.experts[&e], &x, 1, Some(&[w]), &mut counters);
+            for (a, b) in want.iter_mut().zip(&out) {
                 *a += b;
             }
         }
@@ -385,7 +409,12 @@ impl Case {
     }
 
     /// This case as a dispatch, with `experts` and the two knobs overridable by `broken`.
-    fn dispatch<'a>(&'a self, experts: &'a F4Experts, limit: f32, quantize_x: bool) -> Dispatch<'a> {
+    fn dispatch<'a>(
+        &'a self,
+        experts: &'a F4Experts,
+        limit: f32,
+        quantize_x: bool,
+    ) -> Dispatch<'a> {
         Dispatch { cfg: self.cfg, experts, x: &self.x, wexpert: &self.wexpert,
                    swiglu_limit: limit, quantize_x }
     }
@@ -669,6 +698,12 @@ fn act_quant_f8_is_bit_identical_to_the_oracle() {
         .chain(act_quant_block("actq-wide2").into_iter().map(|v| v * 0.125))
         .collect();
     host.extend_from_slice(&wide);
+    // Every finite e4m3 code, so the round trip is pinned over the whole format rather than
+    // over whatever magnitudes the tie fixture happened to reach. This is the ONLY
+    // exhaustive codec coverage in the suite — `the_fixture_exercises_the_codes_...`
+    // measures the fp4 side and finds it narrow (2 distinct e8m0 codes at toy scale).
+    let code_blocks = e4m3_code_blocks();
+    host.extend_from_slice(&code_blocks);
 
     let mut want = host.clone();
     for row in want.chunks_mut(128) {
@@ -677,13 +712,34 @@ fn act_quant_f8_is_bit_identical_to_the_oracle() {
 
     let mut b = to_device(&f32b(&host));
     let stream = HipStream::new().expect("stream");
-    // 128-wide rows for the first ROWS blocks, then the 256-wide one — dispatched as two
-    // calls over one buffer, which is also how the MoE uses it (`x` then `h`).
-    // SAFETY: the buffer holds `ROWS + 2` blocks of 128 live f32.
+    // The launch PLAN is the data, and the assertion sums the launch extents — not the
+    // fixture lengths. That distinction is the whole guard: `rows + wide + codes ==
+    // host.len()` reads like a check and is a TAUTOLOGY, because `host` is the
+    // concatenation of exactly those three pieces. It cannot fail, and it says nothing
+    // about what was dispatched.
+    //
+    // It has to be the launch arguments, because nothing downstream can help: the code
+    // blocks round-trip to THEMSELVES, so an undispatched one is bit-identical to a
+    // correctly quantized one in `got`. Halve the third extent or delete it and the suite
+    // went green — twice, under two earlier versions of this guard. Found by review
+    // 2026-08-05, after the first fix for it turned out to be the tautology above.
+    //
+    // Asserting BEFORE the `unsafe` block is also what makes its SAFETY claim true: an
+    // over-covering extent would write past the allocation before any later check ran.
+    let plan = [(ROWS, 128), (1, wide.len()), (code_blocks.len() / 128, 128)];
+    let covered: usize = plan.iter().map(|(r, n)| r * n).sum();
+    assert_eq!(covered, host.len(), "the launches do not cover the fixture exactly");
+    println!("act_quant_f8: {} blocks dispatched, {} of them e4m3-code blocks",
+             covered / 128, plan[2].0);
+    // SAFETY: `b` holds `host.len()` live f32, and the plan covers exactly that — asserted
+    // immediately above, from the same extents the loop dispatches.
     unsafe {
         let p = b.ptr_mut() as *mut f32;
-        launch_act_quant_f8(p, ROWS, 128, stream.raw()).expect("act_quant_f8 rows");
-        launch_act_quant_f8(p.add(ROWS * 128), 1, 256, stream.raw()).expect("act_quant_f8 wide");
+        let mut at = 0;
+        for (rows, row_len) in plan {
+            launch_act_quant_f8(p.add(at), rows, row_len, stream.raw()).expect("act_quant_f8");
+            at += rows * row_len;
+        }
     }
     let got = sync_f32(&b);
 
@@ -1033,7 +1089,8 @@ fn gpu_hc_pre(
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let stream = HipStream::new().expect("stream");
     let (hc, dim) = (cfg.hc_mult, cfg.dim);
-    let (hb, fb, sb, bb) = (to_device(&f32b(h)), to_device(&f32b(fnw)), to_device(&f32b(scale)), to_device(&f32b(base)));
+    let (hb, fb) = (to_device(&f32b(h)), to_device(&f32b(fnw)));
+    let (sb, bb) = (to_device(&f32b(scale)), to_device(&f32b(base)));
     let mut y = zeros(s * dim * 4);
     let mut post = zeros(s * hc * 4);
     let mut comb = zeros(s * hc * hc * 4);
@@ -1334,7 +1391,7 @@ fn ffn_out_matches_the_golden() {
     // The router's own goldens, exactly — a wrong selection here would otherwise show up
     // as a numeric miss at the end and be indistinguishable from an arithmetic bug.
     let want_i: Vec<i32> =
-        cap.int("L0.pre.router_indices").expect("router_indices").iter().map(|&e| e as i32).collect();
+        cap.int("L0.pre.router_indices").expect("indices").iter().map(|&e| e as i32).collect();
     assert_eq!(want_i, gi, "router indices");
     assert_matches(cap.float("L0.pre.router_weights").expect("router_weights"), &gw,
                  "router weights");
@@ -1389,7 +1446,7 @@ fn ffn_out_matches_the_golden() {
 /// flip in `h` that then propagates through `w2`.
 const TOL: f32 = 1.0 / 128.0;
 
-/// `(max abs error, tolerance)`, printed with the margin.
+/// `(max abs error, tolerance)`, printed side by side.
 fn compare(want: &[f32], got: &[f32], label: &str) -> (f32, f32) {
     assert_eq!(want.len(), got.len(), "{label}: length mismatch");
     report_rel(want, got, label, TOL)
@@ -1419,8 +1476,8 @@ fn assert_guards(cases: Vec<(u32, &str, Result<(), String>)>) {
 /// Every deliberate-break test in this file goes through here rather than through a bare
 /// `assert_ne!`, and the shared threshold is what makes the pair meaningful: a break that
 /// moved the result by less than [`TOL`] is a break the positive gate would NOT have
-/// caught, so it must fail here rather than pass. The margin printed by [`compare`] is how
-/// far from that line it actually landed.
+/// caught, so it must fail here rather than pass. [`compare`] prints `err` and `tol` for
+/// both directions, so how far past the line it landed is on the page either way.
 fn assert_disagrees(want: &[f32], got: &[f32], label: &str) {
     let (err, tol) = compare(want, got, &format!("{label} (must differ)"));
     assert!(
