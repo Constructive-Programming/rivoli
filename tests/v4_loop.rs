@@ -89,20 +89,21 @@
 //!
 //! The block performs **three** fp8 ACTIVATION requantizations — `act_quant(xq)`,
 //! `act_quant(qrq)`, `act_quant(y)` — each a 4-significant-bit step function sitting immediately
-//! downstream of a bf16 store. A bf16 ULP is 2^-8 to 2^-7 relative depending on where in the
-//! binade the value sits (`bf16_ulp` below computes the spacing form, 2^-7 at the bottom); an e4m3
-//! step is 2^-4. So the ordinary output of a re-associated reduction flips a quantization bin on a
-//! few percent of elements, each flip moves that element by 6.25%, and every downstream tensor is
-//! a dense reduction over the quantized vector — so ONE flip perturbs ALL of them, by 8x to 16x
-//! its own size.
+//! downstream of a bf16 store. A bf16 ULP is 2^-8..2^-7 relative and an e4m3 step is 2^-4..2^-3,
+//! depending on where in the binade the value sits — **16x larger at the same point**. So the
+//! ordinary output of a re-associated reduction flips a quantization bin on a few percent of
+//! elements, each flip moves that element 16x further than the difference that caused it, and
+//! every downstream tensor is a dense reduction over the quantized vector — so ONE flip perturbs
+//! ALL of them.
 //!
-//! Measured by transcribing this file's own pipeline to numpy and perturbing one stage. **The
-//! transcription IS the experiment, so the numbers are not reproducible from this comment** — see
-//! "What is owed" below.
+//! Measured by transcribing this file's own pipeline to numpy and perturbing one stage. The
+//! transcription IS the experiment — which ops, in which order, with the perturbation injected
+//! where — so it is committed rather than described: **`docs/measurement/probes/v4_attn_amplification.py`**
+//! prints every number in this section, in ~8 s, touching no GPU.
 //!
 //! | perturbation | effect |
 //! |---|---|
-//! | **1** of 13,312 `qrq` elements moved ONE e4m3 step | `q` differs on **5.4%** of 425,984 elements |
+//! | **1** of 13,312 `qrq` elements moved ONE e4m3 step | `q` differs on **4.6%** of 425,984 elements |
 //! | **1** of 32,768 `attn_derot` elements moved 1 bf16 ULP (`L1.dec0`) | `attn_out` differs on **21%**, `max_rel` **0.71** |
 //! | f32 vs **f64** accumulation, identical semantics, same weights | `attn_out` `max_rel` **1.35** on `L0.pre` |
 //!
@@ -117,8 +118,8 @@
 //! |---|---|---|
 //! | `attn_norm_out` | 0 | engine measures 0.05% — the ONLY tensor in the block with none |
 //! | `kv_entry` | 1 (`xq`) + its own partial block-64 | **bit-identical on all four** |
-//! | `q`, `attn_derot` | 2 (`xq`, `qrq`) | 0% – 4.2% |
-//! | `attn_out` | 3 (`xq`, `qrq`, `y`) | 0% – 12% |
+//! | `q`, `attn_derot` | 2 (`xq`, `qrq`) | 0% – 4.2%, p99.9 <= 25 ULP |
+//! | `attn_out` | 3 (`xq`, `qrq`, `y`) | 0% – **21%** |
 //!
 //! **What this retracts.** `docs/investigations/v4-flash-port.md` reads its bisection table as
 //! "`attn_out` is the first bad tensor … between the clean tensor and the wrong one there are
@@ -153,10 +154,16 @@
 //! fraction under-predicts the tail by ~30x in fraction terms. So the engine's error distribution
 //! has a HEAVIER TAIL than re-association noise on `attn_derot` alone would give. That residual is
 //! the open question, it is not settled by anything above, and the three upstream comparisons
-//! added below are what can settle it: if the engine's `attn_derot` comes back near the host sim's
-//! 0.01%–3% at ~1 ULP, the residual is inside the tail and the block is likely sound; if it comes
-//! back at percent-level `max_rel` or hundreds of ULP, there is a real defect and `q` and
-//! `kv_entry` say which side of `sparse_attn` it is on.
+//! added below are what can settle it.
+//!
+//! **Compare on the statistic the probe prints, not on the max.** The host sim's own `attn_derot`
+//! is heavy-tailed — on `L1.pre` the differing elements run median 1 ULP, p99 21, max 326 — so
+//! "hundreds of ULP" is NOT by itself a defect signature, and a criterion phrased that way would
+//! convict a correct engine. The discriminator is: `attn_derot` differing on <= ~3% of elements at
+//! p99.9 <= ~10 ULP is inside what fold order alone produces here; materially past that, or any
+//! movement at all in `kv_entry` (bit-identical on all four cells in the sim, and the only tensor
+//! in the block with just one act_quant upstream), is a real defect — and `q` vs `kv_entry` then
+//! says which side of `sparse_attn` it is on.
 //!
 //! ## What is deliberately NOT done here, and what is owed
 //!
@@ -169,12 +176,10 @@
 //! already states about itself: no break has ever been measured through `check` on any of them, so
 //! any number chosen now would be a second uncalibrated constant.
 //!
-//! **Owed, and tracked nowhere else yet** — two items, both small:
-//! * commit the numpy transcription under `docs/measurement/probes/`, beside the `.hip` probes,
-//!   so every number in this section is re-runnable. Right now they are not.
-//! * `src/bin/v4-oracle.rs`'s `emit()` hardcodes `Defect::None`. A `--defect` flag would make a
-//!   perturbed golden file one command away, which is exactly what calibrates the three bounds
-//!   this section declines to invent.
+//! **Owed, and tracked nowhere else yet:** `src/bin/v4-oracle.rs`'s `emit()` hardcodes
+//! `Defect::None`. A `--defect` flag would put a perturbed golden file one command away, which is
+//! exactly what calibrates the three bounds this section declines to invent — and `Defect::ALL`
+//! already enumerates the breakages worth calibrating against.
 
 // `rocm`, not `any(rocm, vulkan)`: `v4gpu` is `rocm`-gated because every launcher it drives is
 // `backend::hip`'s. Nothing here claims a Vulkan parity that has not been measured, which is
