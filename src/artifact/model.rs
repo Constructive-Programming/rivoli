@@ -581,13 +581,18 @@ pub struct V4Config {
     /// gate cannot pin the shipped 20, because at 20 a 4x4 positive matrix is far past
     /// convergence and 19 and 20 agree bit-for-bit (`launch_hc_pre`'s doc, and
     /// `tests/v4_oracle.rs::sinkhorn_has_converged_long_before_iteration_20`).
+    ///
+    /// **Carried with no reader in this crate yet, deliberately**, exactly as `index_topk`
+    /// and `routed_scale` are: the layer loop that would read it does not exist. The
+    /// alternative to declaring it now is the loop reaching for
+    /// `v4oracle::weights::V4Config`, which is the whole reason this field is here.
     pub hc_sinkhorn_iters: usize,
 
     /// `hc_eps` — and it is **five** things, not the one an earlier draft of this comment
     /// named. It is the floor added to `hc_head`'s sigmoid gate (`model.py:714`,
     /// `pre = sigmoid(...) + hc_eps`), and inside `hc_split_sinkhorn` it is *also* the
     /// `+ eps` after the comb softmax and in every row and column divide — `2·iters - 1` of
-    /// them per token (`kernel.py:407, :411, :419, :423`; `kernels/linalg.hip:347` and the
+    /// them per token (`kernel.py:408, :413, :419, :423`; `kernels/linalg.hip:347` and the
     /// `norm` lambda at :358). So a zero moves `comb` as well as `pre`, in opposite
     /// directions, and removes the guard from those divisions — harmless there, since the
     /// sums are strictly positive, but that is a reason rather than an absence.
@@ -603,6 +608,8 @@ pub struct V4Config {
     /// right — 1e-6 against a sigmoid output in (0, 1). It perturbs every gate by a hair, in
     /// the direction of less signal from every stream, uniformly across 43 layers. Small,
     /// systematic and unattributable is the worst shape a numeric error can have here.
+    ///
+    /// Carried with no reader yet, deliberately — see [`V4Config::hc_sinkhorn_iters`].
     pub hc_eps: f64,
 }
 

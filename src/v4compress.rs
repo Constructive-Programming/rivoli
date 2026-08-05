@@ -371,13 +371,18 @@ pub fn should_compress(kind: LayerKind, seqlen: usize, start_pos: usize) -> bool
 /// `[ring ‖ compressed]` buffer `attn::v4::Io::cache` describes — as `(first_row, count)`.
 /// `None` exactly when [`should_compress`] is false.
 ///
-/// This is the WRITE half of the split [`compress_offset`] owns for the READ half, and the
-/// reference keeps them in two places for the same reason: `Compressor.kv_cache` is the
+/// **A different coordinate system from [`compress_offset`], not the other half of one.**
+/// That function indexes the SELECTION space — at prefill the transient
+/// `torch.cat([kv, kv_compress])` (model.py:515/:531), so its prefill value is `seqlen`.
+/// This one indexes rows of the PERSISTENT `[ring ‖ compressed]` buffer, whose base is
+/// `window_size`. The two coincide at decode and disagree at prefill, and passing one where
+/// the other is due is the fluent-wrong `compress_offset`'s own doc warns about. They are
+/// two places because the reference keeps them in two places: `Compressor.kv_cache` is the
 /// **view** `Attention.kv_cache[:, win:]` (model.py:497), so the compressor's own
 /// `self.kv_cache[:, :seqlen // ratio]` at prefill and `[start_pos // ratio]` at decode
 /// (model.py:380 and :382) land at `window_size + …` in the one flat buffer this engine keeps.
 ///
-/// # `window_size` is 0 for the INDEXER's compressor
+/// # `region_base` is 0 for the INDEXER's compressor
 ///
 /// There are two `Compressor`s on every ratio-4 layer and they write into differently-shaped
 /// buffers. `Attention.forward` hands its own the **view** above, so its blocks start at
@@ -385,7 +390,7 @@ pub fn should_compress(kind: LayerKind, seqlen: usize, start_pos: usize) -> bool
 /// `self.compressor.kv_cache = self.kv_cache` (model.py:415) — and that buffer is registered
 /// as `[max_batch_size, max_seq_len // compress_ratio, head_dim]` (model.py:405): **no ring,
 /// no window prefix.** So the indexer's destination is `start_pos / ratio` outright, which is
-/// this function with `window_size = 0`.
+/// this function with `region_base = 0`.
 ///
 /// Spelled out because the natural wiring is to pass `cfg.sliding_window` at every call site,
 /// and the 21 layers that need the zero are exactly the 21 that also need the non-zero. The
@@ -422,7 +427,12 @@ pub fn should_compress(kind: LayerKind, seqlen: usize, start_pos: usize) -> bool
 /// phase discriminant in the caller's hands twice.
 pub fn compress_dst(
     kind: LayerKind,
-    window_size: usize,
+    // NOT `window_size`, which is what this was called for one round. It is the compressed
+    // region's BASE ROW, and that is `sliding_window` for the attention compressor and **0**
+    // for the indexer's — see the section above. A parameter named for the value one of its
+    // two callers passes is the shape `Dims::compress_slot` was deleted in: correct code
+    // whose signature reads wrong at the call site.
+    region_base: usize,
     seqlen: usize,
     start_pos: usize,
 ) -> Option<(usize, usize)> {
@@ -432,9 +442,9 @@ pub fn compress_dst(
     }
     Some(if start_pos == 0 {
         // Prefill emits every COMPLETE block at once, starting at the region's base.
-        (window_size, seqlen / ratio)
+        (region_base, seqlen / ratio)
     } else {
-        (window_size + start_pos / ratio, 1)
+        (region_base + start_pos / ratio, 1)
     })
 }
 

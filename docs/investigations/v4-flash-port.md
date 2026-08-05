@@ -597,9 +597,14 @@ a blind spot exactly as an oracle and an implementation can. Run the third.
 
 `Cargo.toml`'s `[profile.release]` sets `lto` and `opt-level` and **no `debug-assertions`**;
 there is no `.cargo/config.toml` overriding it, and CLAUDE.md prescribes `--release` for every
-build, test and clippy run. So all **36 `debug_assert!` occurrences in `src/`** are compiled
+build, test and clippy run. So all **32 `debug_assert!` occurrences in `src/`** are compiled
 out of every binary anyone here has ever run. They are not weak checks; they are absent ones.
 
+> **CORRECTED 2026-08-05 by S3: the count is 32, not 36.** 39 lines in `src/` match
+> `debug_assert`, seven of which are prose mentions inside comments. CLAUDE.md:57 and this
+> file's own line below both already said 32; only this paragraph said 36, and a later
+> section quoted it twice before the disagreement was noticed.
+>
 Distribution: `artifact/quant.rs` 17, `gpu.rs` 4, `v4compress.rs` 2, `artifact/model.rs` 2,
 `fetch/stream.rs` 2, and one each in `fetch/asyncfetch.rs`, `backend/vk.rs` and the three
 `v4oracle` files.
@@ -720,7 +725,7 @@ was deleted.
 | owed | cost until paid |
 |---|---|
 | `Io` built by something that takes `LayerKind` and calls `rope_for_layer` itself | nothing detects `Defect::RopeNoYarn`, on the one cell measured invisible to the numeric gate |
-| the compressor's placer computing `window + start_pos / ratio`, with a test | requirement 2 implemented nowhere, asserted nowhere; appending is right only until a step is skipped |
+| the compressor's placer computing `window + start_pos / ratio`, with a test | **PAID 2026-08-05 — `v4compress::compress_dst` + `tests/v4_compress.rs::compress_dst_is_positional_and_an_appending_placer_disagrees`.** Two corrections earned while this row stood: the indexer's nested compressor needs `window_size = 0` (model.py:405/:415), which this formula does not admit; and the skip is a general one, since speculative decode is unreachable on V4 (`kernels/moe.hip:409`). Still no production caller |
 
 **And the compressed-layer end-to-end test is still unwritten.** `tests/v4_attn.rs` pins
 `LAYER` to ratio-0, so the `io.cache` tail layout and compressed columns reaching
@@ -1010,7 +1015,7 @@ helper to discharge a debt created by deleting a callerless helper is a loop, no
 | owed | until then |
 |---|---|
 | `Io` built by something that takes `LayerKind` and calls `v4compress::rope_for_layer` itself, so the two-table selection has ONE site | nothing detects `Defect::RopeNoYarn`, on the one cell measured invisible to the numeric gate (`ratio4/decode`, sep 8 against `RESOLVABLE` 64) |
-| whoever places the compressor's output computing the decode slot as `window + start_pos / ratio`, with a test | requirement 2 is implemented nowhere and asserted nowhere; a caller that appends is right only until it skips a step, and speculative decode skips by construction |
+| whoever places the compressor's output computing the decode slot as `window + start_pos / ratio`, with a test | **PAID 2026-08-05 — `v4compress::compress_dst` + its test.** Two corrections to this row while it stood: speculative decode is NOT reachable on V4 (`kernels/moe.hip:409` refuses `nrow != 1`), so the motivating skip is a general one rather than that one; and the indexer's nested compressor takes `window_size = 0`, which this row's formula does not admit |
 
 Both were **device-free** tests before deletion. Whoever builds the layer loop owns both,
 and this table is the acceptance criterion.
@@ -1092,7 +1097,8 @@ one.** Measured on the merged tree: `Arena`, `cache`, all three `HybridPolicy` i
 expert_slot}` are **all byte-parameterised and already work at `RoutedFmt::F4`** — the pool
 substrate is not the problem. What is missing is three specific things, all inside `pin.rs`:
 `f4_slot_offsets` (the six intra-block projection offsets; `vq_slot_offsets` and
-`i4_slot_offsets` exist, the f4 twin appears nowhere in `src/` or `tests/`), an f4 arm in the
+`i4_slot_offsets` exist and the f4 twin is implemented nowhere — `pin.rs:1199` already
+names it as owed, so this restates a note rather than discovering one), an f4 arm in the
 private `TierFmt`/`ArenaPool` (whose `int4: bool` is a two-format flag, and whose `MlpVq`
 carries a `*const u16` scale where `ExpertDescF4` needs `*const u8`), and an `F4` variant of
 `Mode`, which `Pin::build`'s `match mode` selects on.
@@ -1145,7 +1151,7 @@ thread '…' panicked at src/artifact/quant.rs:128:
 assertion `left == right` failed: i_dim 32 not a multiple of VQ_GROUP
 ```
 
-That is one of the 36 `debug_assert!`s §"`debug_assert!` is dead in every build this project
+That is one of the 32 `debug_assert!`s §"`debug_assert!` is dead in every build this project
 runs" is about, doing exactly its job. The test builds a toy `.vq3` set at `MOE_INTER = 32` to
 prove magic separates the formats where length cannot, and 32 does not divide `VQ_GROUP`; the
 geometry it asks for is one no real artifact has. Under `--release` the assert is compiled out,
@@ -1156,7 +1162,7 @@ problem "by changing the habit, not the code" and rewrote CLAUDE.md to prescribe
 profile. The per-binary sweeps quoted immediately after it — §"ALL FIVE PREREQUISITES LANDED"'s
 117 and §"Integration checkpoint"'s 82 — were both run under `--release`, i.e. under the
 profile the same session had just deprecated. So "117 tests green" is a true statement about a
-build where 36 checks are absent, and the first dev-profile run of the same tree is red. Nobody
+build where 32 checks are absent, and the first dev-profile run of the same tree is red. Nobody
 re-ran the sweep under the new rule, and the rule's whole point was that the checks would fire.
 
 Not fixed here: the fix is either toy dims that divide `VQ_GROUP` or an assert that the test
@@ -1165,7 +1171,7 @@ count quoted from now on should say which of these it includes.**
 
 **What this stage landed, and what it deliberately did not.** `compress_dst` and its test —
 requirement 2's arithmetic and its first assertion, seen red by mutation before being trusted
-— plus the two config fields, their validation, and `V4Config::scoring()`. **The `Io`-building
+— plus the two config fields and their validation. **The `Io`-building
 construction of debt 1 was NOT landed, for the third time, and the reason has changed from an
 estimate to a measurement:** its only correct home is a layer loop, and the loop is blocked on
 2 and 3 above. Landing it now produces the callerless helper the debt was created by deleting.

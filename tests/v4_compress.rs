@@ -444,6 +444,14 @@ fn compress_dst_is_positional_and_an_appending_placer_disagrees() {
     // base. `should_compress` decides WHETHER with `(start_pos + 1) / ratio`; reusing that
     // to decide WHERE puts every ratio-128 block one slot late for the whole sequence.
     //
+    // `region_base = 0` — the INDEXER's nested compressor, which model.py:415 hands the
+    // whole buffer rather than the `[:, win:]` view, over an allocation with no ring
+    // (model.py:405). The 21 ratio-4 layers need BOTH bases, so the zero is not a degenerate
+    // case: it is the second real caller, and a `win`-shaped assumption here writes every
+    // indexer block 128 rows past its buffer.
+    assert_eq!(compress_dst(l2, 0, 1, 7), Some((1, 1)));
+    assert_eq!(compress_dst(l2, 0, EMIT_PROMPT_LEN, 0), Some((0, 3)));
+
     let l3 = LayerKind::from_ratio(128);
     assert_eq!(compress_dst(l3, win, 1, 127), Some((win, 1)));
     assert_eq!(compress_dst(l3, win, 1, 255), Some((win + 1, 1)));
