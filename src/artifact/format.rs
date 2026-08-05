@@ -9,6 +9,9 @@
 //!                        #   block = gate‖up‖down; block n_experts = the shared expert
 //! L{03..NN}.i4           # optional int4 twin of the .vq3 (bin/fp8_to_i4): headerless,
 //!                        #   (n_experts + 1) blocks from offset 0. Streamed under --i4.
+//! L{00..NN}.f4           # DeepSeek-V4-Flash (bin/convert_v4): header + exactly n_experts
+//!                        #   FP4 blocks and NO shared block — V4's shared expert is fp8
+//!                        #   e4m3 and rides `resident.safetensors`. See [`RoutedFmt`].
 //! ```
 
 use anyhow::{Context, Result, ensure};
@@ -18,8 +21,8 @@ use std::collections::HashMap;
 use std::os::fd::{AsRawFd, RawFd};
 
 use crate::artifact::quant::{
-    VQ_DIM, VQ_GROUP, VQ_INDEX_BITS, VQ_K, i4_expert_bytes, i4_expert_stride, vq_expert_bytes,
-    vq_expert_stride,
+    VQ_DIM, VQ_GROUP, VQ_INDEX_BITS, VQ_K, f4_expert_bytes, f4_expert_stride, i4_expert_bytes,
+    i4_expert_stride, vq_expert_bytes, vq_expert_stride,
 };
 
 /// The `format` section of `manifest.json` — everything the loader needs beyond
@@ -716,7 +719,55 @@ impl I4Source {
     }
 }
 
-// ── .vq3 expert files (streamed routed experts + resident shared) ───────────────
+/// The layer range an `.f4` artifact actually HOLDS, from `manifest.json`'s `f4_source`,
+/// confronted with the model's own layer count.
+///
+/// **Read, never inferred from `num_hidden_layers`.** `convert_v4` deliberately does not
+/// rewrite that field — its comment says why: every per-layer table in a V4 config
+/// (`compress_ratios`, `num_hash_layers`) is indexed by the REAL layer id, so a 3-layer
+/// artifact that renumbered itself as a 3-layer MODEL would mis-key all of them. A partial
+/// artifact of a 43-layer model is therefore normal, and `/var/db/rivoli/v4-f4-l0-2` is
+/// exactly that. Without this the loader walks to layer 3 and dies with
+/// "tensor layers.3.attn_norm.weight not found", which reads like a corrupt checkpoint
+/// rather than a partial artifact — the failure `convert_v4`'s own resident-set comment
+/// predicts.
+///
+/// Absent or malformed is an ERROR, unlike [`I4Source::load`]'s `Ok(None)`: `.i4`
+/// provenance diagnoses an artifact that loads either way, while this is the loader's only
+/// source for **which layers exist**, and `0..n_layers` is precisely the wrong guess for
+/// the partial artifact the field exists to describe. `to > n_layers` is a manifest whose
+/// two halves were written by different runs; `from >= to` is an artifact holding nothing.
+///
+/// One function rather than a type with a `load` and a `range`: the two were only ever
+/// called together, in that order, and the pair's only other caller was a test.
+pub fn f4_layer_range(dir: &str, n_layers: usize) -> Result<std::ops::Range<usize>> {
+    /// Just the field the loader needs. `tool`/`chain`/`src` are provenance for a human;
+    /// a field with no reader is how [`I4Source::group`] nearly became decoration.
+    #[derive(Deserialize)]
+    struct F4Source {
+        layers: [usize; 2],
+    }
+
+    let path = format!("{dir}/manifest.json");
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("read {path}"))?)
+            .with_context(|| format!("parse {path}"))?;
+    let f = v
+        .get_mut("f4_source")
+        .map(serde_json::Value::take)
+        .with_context(|| format!("{path} has no `f4_source` — not a convert_v4 artifact"))?;
+    let [from, to] = serde_json::from_value::<F4Source>(f)
+        .with_context(|| format!("{path}: f4_source malformed"))?
+        .layers;
+    ensure!(
+        from < to && to <= n_layers,
+        "{path}: f4_source.layers [{from}, {to}) is not a non-empty range inside \
+         [0, num_hidden_layers={n_layers})"
+    );
+    Ok(from..to)
+}
+
+// ── .vq3 / .i4 / .f4 expert files (streamed routed experts + resident shared) ────
 
 /// Per-file header for a routed-expert layer file. Little-endian, 40 bytes, at the start
 /// of the file. Self-describing: a dim/version mismatch or truncation fails loud on open.
@@ -724,8 +775,8 @@ impl I4Source {
 /// **The dims are here because nothing else catches a transposition.** An expert's three
 /// projections are `(moe_inter, hidden) · 2 + (hidden, moe_inter)`, so swapping the two
 /// widths gives a file of EXACTLY the same size that passes every length check and streams
-/// the wrong bytes. `.i4` gets away without a header only because it is a twin of a `.vq3`
-/// that was already validated; `.f4` is standalone and carries one.
+/// the wrong bytes. Which formats carry one, and why `.i4` does not, is
+/// [`RoutedFmt::magic`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ExpertHeader {
@@ -785,12 +836,21 @@ impl ExpertHeader {
         b
     }
 
-    fn from_bytes(b: &[u8]) -> Result<Self> {
-        ensure!(
-            b.len() >= EXPERT_HEADER_BYTES,
-            "expert-file header short: {} bytes, need {EXPERT_HEADER_BYTES}",
-            b.len()
-        );
+    /// Parse and validate a layer file's header against the format the CALLER is reading
+    /// for.
+    ///
+    /// The magic is a parameter rather than a constant because it is the only thing that
+    /// separates a `.vq3` from an `.f4` up front, and the two differ in BLOCK COUNT as well
+    /// as in content: reading one as the other addresses a whole expert stride past the end,
+    /// or stops one short. It is the discriminant the length check alone cannot be.
+    ///
+    /// `fmt` rather than a `(magic, extension)` pair, so the two cannot be mismatched by a
+    /// caller. A headerless format simply has no magic to check ([`RoutedFmt::magic`]).
+    /// Takes the array, not a slice: the length check this used to carry became a
+    /// compile-time truth once both callers switched to `[u8; EXPERT_HEADER_BYTES]` (the
+    /// 40-byte read below, and `to_bytes()` in the tests). A guard that cannot fire is
+    /// worse than none, so the type carries the length instead.
+    fn from_bytes(b: &[u8; EXPERT_HEADER_BYTES], fmt: RoutedFmt) -> Result<Self> {
         let h = Self {
             magic: b[0..4].try_into()?,
             version: u32::from_le_bytes(b[4..8].try_into()?),
@@ -801,16 +861,18 @@ impl ExpertHeader {
             stride: u64::from_le_bytes(b[24..32].try_into()?),
             reserved: u64::from_le_bytes(b[32..40].try_into()?),
         };
-        ensure!(
-            h.magic == VQ3_MAGIC,
-            "expected .vq3 magic {VQ3_MAGIC:?}, file has {:?} — `.f4` files are not read \
-             through this path yet (S3 adds the reader and must relax BOTH this and \
-             `ExpertSet::open`'s `n_experts + 1` block count together)",
-            h.magic
-        );
+        if let Some(want) = fmt.magic() {
+            ensure!(
+                h.magic == want,
+                "expected .{} magic {want:?}, file has {:?}",
+                fmt.ext(),
+                h.magic
+            );
+        }
         ensure!(
             h.version == FormatMeta::VERSION,
-            ".vq3 version {} != {}",
+            ".{} version {} != {}",
+            fmt.ext(),
             h.version,
             FormatMeta::VERSION
         );
@@ -818,149 +880,278 @@ impl ExpertHeader {
     }
 }
 
-/// The per-layer expert files, opened O_DIRECT — one type for BOTH routed formats
-/// (`.vq3` and `.i4`), which differ only by the block-start offset `hbytes` (one
-/// aligned header block for `.vq3`, 0 for the headerless `.i4`) and `.vq3`'s header
-/// validation on open. Routed experts (0..n_experts) stream via [`read_spec`]; the
-/// shared expert (block n_experts) is read once for resident placement via
-/// [`shared_block`]. An `.i4` block is gate‖gate_scale‖up‖up_scale‖down‖down_scale.
+/// Which container a routed-expert set is opened as.
+///
+/// A `bool` (`i4: true/false`) while there were two, and the bool could not have carried
+/// the property that actually separates the third: **`.f4` holds `n_experts` blocks and NO
+/// shared one.** V4's shared expert is `F8_E4M3` at 128×128, not FP4 (see
+/// [`crate::artifact::quant::v4_expert_base`]), so it cannot share a file with FP4 blocks —
+/// it rides `resident.safetensors` instead. Verified against the shipped artifact:
+/// `L00.f4` is `4096 + 256 × 13369344 = 3422556160` bytes exactly, so the `n_experts + 1`
+/// this replaced demanded 13.37 MB that is not in the file.
+#[derive(Clone, Copy)]
+pub enum RoutedFmt {
+    Vq3,
+    I4,
+    F4,
+}
+
+impl RoutedFmt {
+    /// The per-layer file's extension.
+    fn ext(self) -> &'static str {
+        match self {
+            RoutedFmt::Vq3 => "vq3",
+            RoutedFmt::I4 => "i4",
+            RoutedFmt::F4 => "f4",
+        }
+    }
+
+    /// The magic the file's header must carry, or `None` for the headerless `.i4`.
+    /// `.i4` gets away without one only because it is a twin of a `.vq3` that was already
+    /// validated against the same dims; `.vq3` and `.f4` are standalone and carry one.
+    fn magic(self) -> Option<[u8; 4]> {
+        match self {
+            RoutedFmt::Vq3 => Some(VQ3_MAGIC),
+            RoutedFmt::I4 => None,
+            RoutedFmt::F4 => Some(F4_MAGIC),
+        }
+    }
+
+    /// Byte offset of block 0. Derived from [`Self::magic`] rather than tabulated beside
+    /// it: "has a header" and "reserves an aligned block for it" are the same fact.
+    fn hbytes(self) -> usize {
+        match self.magic() {
+            Some(_) => crate::artifact::quant::VQ_ALIGN,
+            None => 0,
+        }
+    }
+
+    /// Whether a shared-expert block follows the `n_experts` routed ones.
+    ///
+    /// **The one definition of that fact.** [`ExpertSet::open_routed`] sizes the file with it and
+    /// [`ExpertSet::shared_block`] refuses without it, so a format cannot be sized for a
+    /// shared block it does not have, or refuse to hand back one it does. Before `.f4` this
+    /// lived only as a hard-coded `n_experts + 1` inside the length check — which is
+    /// exactly the pair the old `from_bytes` error told S3 to relax together.
+    fn has_shared(self) -> bool {
+        match self {
+            RoutedFmt::Vq3 | RoutedFmt::I4 => true,
+            RoutedFmt::F4 => false,
+        }
+    }
+
+    /// `(per-expert O_DIRECT-aligned stride, useful bytes in one block)`.
+    fn geometry(self, hidden: usize, moe_inter: usize) -> (usize, usize) {
+        match self {
+            RoutedFmt::Vq3 => (
+                vq_expert_stride(hidden, moe_inter),
+                vq_expert_bytes(hidden, moe_inter),
+            ),
+            RoutedFmt::I4 => (
+                i4_expert_stride(hidden, moe_inter),
+                i4_expert_bytes(hidden, moe_inter),
+            ),
+            RoutedFmt::F4 => (
+                f4_expert_stride(hidden, moe_inter),
+                f4_expert_bytes(hidden, moe_inter),
+            ),
+        }
+    }
+}
+
 /// The dimensions an expert set is opened against. `n_layers` is EXCLUSIVE and is the
 /// CALLER's bound, not the artifact's — the pin opens one layer past `cfg.n_layers` when
-/// the MTP head has an expert file.
+/// the MTP head has an expert file, and the V4 pin bounds it by the artifact's own
+/// `f4_source` range ([`f4_layer_range`]) rather than by `num_hidden_layers`.
 ///
 /// A struct rather than five positional `usize`s, because nothing about a transposed
 /// `(hidden, moe_inter)` fails a check: the set opens, every length matches, and it streams
 /// the wrong bytes. Five bare `usize`s in a row is the argument list that gets transposed.
 #[derive(Clone, Copy)]
 pub struct SetDims {
-    pub dense_layers: usize,
+    /// First layer with a file, and one past the last — [`SetDims::new`] takes them as the
+    /// `Range` they are and splits them here only to keep `SetDims` `Copy`. GLM's starts
+    /// after the dense prefix and may run one past `cfg.n_layers` for the MTP head; V4's is
+    /// the artifact's own `f4_source` range ([`f4_layer_range`]), and V4 has no dense
+    /// layers at all.
+    pub first_layer: usize,
     pub n_layers: usize,
     pub n_experts: usize,
     pub hidden: usize,
     pub moe_inter: usize,
 }
 
+impl SetDims {
+    /// Build from the layer range and the expert-block dims.
+    ///
+    /// Positional, against the "named fields make a transposition visible" argument above:
+    /// the struct literal was character-identical at both engine call sites bar the range,
+    /// which `jscpd` refuses. Every call site passes `…hidden, …moe_inter` as named field
+    /// accesses, so a swap stays readable there.
+    pub fn new(
+        layers: std::ops::Range<usize>,
+        n_experts: usize,
+        hidden: usize,
+        moe_inter: usize,
+    ) -> Self {
+        Self {
+            first_layer: layers.start,
+            n_layers: layers.end,
+            n_experts,
+            hidden,
+            moe_inter,
+        }
+    }
+}
+
+/// The per-layer expert files, opened O_DIRECT — one type for every routed format
+/// ([`RoutedFmt`]). Routed experts (`0..n_experts`) stream via [`ExpertSet::read_spec`];
+/// where the format carries a shared block (`.vq3`/`.i4`, block `n_experts`) it is read
+/// once for resident placement via [`ExpertSet::shared_block`]. An `.i4` block is
+/// gate‖gate_scale‖up‖up_scale‖down‖down_scale; an `.f4` block is w1‖w1_scale‖w3‖w3_scale‖
+/// w2‖w2_scale, the same gate/up/down slot order (see [`F4Expert::spans`]).
 pub struct ExpertSet {
-    files: Vec<std::fs::File>, // O_DIRECT, index = layer - dense_layers
-    dense_layers: usize,
+    files: Vec<std::fs::File>, // O_DIRECT, index = layer - first_layer
+    first_layer: usize,
     n_layers: usize,
     n_experts: usize,
     stride: usize,
     expert_bytes: usize,
-    hbytes: usize, // block 0 starts at hbytes (aligned): VQ_ALIGN for .vq3, 0 for .i4
+    hbytes: usize, // block 0 starts at hbytes (aligned): VQ_ALIGN for .vq3/.f4, 0 for .i4
+    /// Carried from [`RoutedFmt::has_shared`] so [`Self::shared_block`] and the length
+    /// check in [`Self::open_routed`] can never disagree about whether block `n_experts`
+    /// exists.
+    has_shared: bool,
 }
 
 impl ExpertSet {
-    /// Open the routed expert set in one format. `.vq3` reserves one aligned block for a
-    /// header and validates it against these dims; `.i4` is headerless and starts at 0.
+    /// Open the routed expert set in one format. See [`RoutedFmt`] — extension,
+    /// block-start offset, header magic, block count and block geometry are all read
+    /// from it.
     ///
-    /// ONE opener rather than two, because those three things (extension, block-start
-    /// offset, header validation) are the entire difference and the pin chooses between
-    /// them at RUNTIME — two entry points meant it wrote the identical six-argument
-    /// dimension list twice, and nothing about a transposed `(hidden, moe_inter)` fails a
-    /// length check: both sets open and stream the wrong bytes.
-    pub fn open_routed(dir: &str, i4: bool, d: SetDims) -> Result<Self> {
-        let (hidden, moe_inter) = (d.hidden, d.moe_inter);
-        let (ext, hbytes, stride, expert_bytes) = if i4 {
-            (
-                "i4",
-                0,
-                i4_expert_stride(hidden, moe_inter),
-                i4_expert_bytes(hidden, moe_inter),
-            )
-        } else {
-            // One aligned block reserved for the header.
-            let hb = crate::artifact::quant::VQ_ALIGN;
-            (
-                "vq3",
-                hb,
-                vq_expert_stride(hidden, moe_inter),
-                vq_expert_bytes(hidden, moe_inter),
-            )
-        };
-        Self::open(dir, ext, hbytes, stride, expert_bytes, d, |path, l| {
-            if i4 {
-                return Ok(()); // headerless
-            }
-            // Validate the header via a separate buffered read (the O_DIRECT fd is
-            // for the streamer). Dims must match the config.
-            let hdr = std::fs::read(path)
-                .ok()
-                .filter(|b| b.len() >= EXPERT_HEADER_BYTES)
-                .with_context(|| format!("read {path} header"))?;
-            let h = ExpertHeader::from_bytes(&hdr)?;
-            ensure!(
-                h.layer as usize == l
-                    && h.n_experts as usize == d.n_experts
-                    && h.hidden as usize == hidden
-                    && h.moe_inter as usize == moe_inter,
-                "{path}: header dims disagree with config"
-            );
-            Ok(())
-        })
-    }
-
-    /// The int3-VQ set by loose dimensions — `tests/artifact.rs` opens the shipped `.vq3`
-    /// this way. The engine's format is a runtime choice, so it goes through
-    /// [`ExpertSet::open_routed`] with a [`SetDims`] it names its fields into.
-    pub fn open_vq3(
-        dir: &str,
-        dense_layers: usize,
-        n_layers: usize,
-        n_experts: usize,
-        hidden: usize,
-        moe_inter: usize,
-    ) -> Result<Self> {
-        let d = SetDims {
-            dense_layers,
+    /// ONE opener rather than one per format, because those are the entire difference and
+    /// the pin chooses between them at RUNTIME — separate entry points meant writing the
+    /// identical dimension list once each, and nothing about a transposed
+    /// `(hidden, moe_inter)` fails a length check: every set opens and streams the wrong
+    /// bytes.
+    pub fn open_routed(dir: &str, fmt: RoutedFmt, d: SetDims) -> Result<Self> {
+        let SetDims {
+            first_layer,
             n_layers,
             n_experts,
             hidden,
             moe_inter,
-        };
-        Self::open_routed(dir, false, d)
-    }
-
-    fn open(
-        dir: &str,
-        ext: &str,
-        hbytes: usize,
-        stride: usize,
-        expert_bytes: usize,
-        d: SetDims,
-        validate: impl Fn(&str, usize) -> Result<()>,
-    ) -> Result<Self> {
-        let SetDims {
-            dense_layers,
-            n_layers,
-            n_experts,
-            ..
         } = d;
-        let want = hbytes + (n_experts + 1) * stride; // header + routed + shared
-        let mut files = Vec::with_capacity(n_layers - dense_layers);
-        for l in dense_layers..n_layers {
-            let path = format!("{dir}/L{l:02}.{ext}");
+        // Refused rather than left to underflow: `n_layers - first_layer` below is a
+        // `usize` subtraction, so an inverted range panicked inside `Vec::with_capacity`
+        // instead of naming the range. `open_vq3` takes loose arguments and cannot be
+        // relied on to have checked.
+        ensure!(
+            first_layer <= n_layers,
+            "layer range [{first_layer}, {n_layers}) is inverted"
+        );
+        let (stride, expert_bytes) = fmt.geometry(hidden, moe_inter);
+        let (hbytes, has_shared) = (fmt.hbytes(), fmt.has_shared());
+        // Routed blocks, plus the shared one only where the format has one. Both terms come
+        // from `fmt`, so the block count and `shared_block`'s refusal cannot disagree.
+        let want = hbytes + (n_experts + usize::from(has_shared)) * stride;
+        let mut files = Vec::with_capacity(n_layers - first_layer);
+        for l in first_layer..n_layers {
+            let path = format!("{dir}/L{l:02}.{}", fmt.ext());
             let f = open_direct(&path).with_context(|| format!("open {path}"))?;
             let len = f.metadata()?.len() as usize;
             ensure!(len == want, "{path}: {len} bytes, expected {want}");
-            validate(&path, l)?;
+            if fmt.magic().is_some() {
+                // Header via a separate BUFFERED fd — the O_DIRECT one belongs to the
+                // streamer, and 40 bytes at offset 0 is neither length- nor
+                // buffer-aligned.
+                //
+                // Read EXACTLY the header. This was `std::fs::read(path)`, which pulls the
+                // WHOLE layer file through the page cache to look at 40 bytes of it — and
+                // the cost was not small. **Measured on the GLM arm 2026-08-05**, both
+                // binaries built before either ran and the two alternated three times with
+                // no `cargo build` between them (`tests/artifact.rs::artifact_reads_back`
+                // over `/var/db/rivoli/glm52-vq3-full`, 76 `.vq3` layers, medians):
+                //
+                //     std::fs::read   180.1 s   298.49 GB read from the block device
+                //     40-byte pread     0.038 s   0.48 MB
+                //
+                // ~4700x, and it is startup on EVERY run — a one-time cost amortizes
+                // against nothing. V4 pays the same shape at 43 x 3,422,556,160 = 147 GB.
+                // A pre-existing defect in shipped GLM code that the `.f4` reader walked
+                // into, not one `.f4` introduced.
+                let mut raw = [0u8; EXPERT_HEADER_BYTES];
+                let mut hf = std::fs::File::open(&path)
+                    .with_context(|| format!("open {path} for its header"))?;
+                std::io::Read::read_exact(&mut hf, &mut raw)
+                    .with_context(|| format!("read {path} header"))?;
+                let h = ExpertHeader::from_bytes(&raw, fmt)?;
+                // `stride` is checked too, and it was not before. The converter writes the
+                // value it INDEXED BLOCKS WITH (`ExpertHeader::new`'s doc says why it is
+                // passed rather than re-derived) while `RoutedFmt::geometry` re-derives it
+                // here — so without this conjunct the header's one non-redundant field had
+                // no reader, and a writer whose stride disagreed with this build's would
+                // pass every check on a file of the right total length.
+                ensure!(
+                    h.layer as usize == l
+                        && h.n_experts as usize == n_experts
+                        && h.hidden as usize == hidden
+                        && h.moe_inter as usize == moe_inter
+                        && h.stride as usize == stride,
+                    "{path}: header (layer {} experts {} hidden {} moe_inter {} stride {}) \
+                     disagrees with config (layer {l} experts {n_experts} hidden {hidden} \
+                     moe_inter {moe_inter} stride {stride})",
+                    h.layer,
+                    h.n_experts,
+                    h.hidden,
+                    h.moe_inter,
+                    h.stride
+                );
+            }
             files.push(f);
         }
         Ok(Self {
             files,
-            dense_layers,
+            first_layer,
             n_layers,
             n_experts,
             stride,
             expert_bytes,
             hbytes,
+            has_shared,
         })
     }
 
+    /// The int3-VQ set by loose dimensions — `tests/artifact.rs` opens the shipped `.vq3`
+    /// this way, naming each dimension at the call site. The engine's own format is a
+    /// runtime choice, so it goes through [`ExpertSet::open_routed`] directly.
+    pub fn open_vq3(
+        dir: &str,
+        first_layer: usize,
+        n_layers: usize,
+        n_experts: usize,
+        hidden: usize,
+        moe_inter: usize,
+    ) -> Result<Self> {
+        let d = SetDims::new(first_layer..n_layers, n_experts, hidden, moe_inter);
+        Self::open_routed(dir, RoutedFmt::Vq3, d)
+    }
+
     /// Cold-read spec for a routed expert: `(fd, begin, useful_len)`, `begin` aligned.
+    ///
+    /// **Known-thin coverage on the GLM side, recorded 2026-08-05 and deliberately not
+    /// fixed here.** `begin` is a function of the EXPERT only, so the layer→file mapping
+    /// `files[layer - first_layer]` is observable solely through which fd comes back — and
+    /// `tests/artifact.rs` calls `read_spec(dense_layers, 0)` and nothing else, so a wrong
+    /// mapping survives it. `tests/v4_loading.rs`'s non-zero-start case is the one test that
+    /// pins this, by resolving each fd through `/proc/self/fd` and asserting the FILENAME.
+    /// That instrument was arrived at the hard way: two injected wrong mappings passed a
+    /// distinct-fds check and an offset check first, because `layer % files.len()` is
+    /// *identical* to `layer - first_layer` for a 3-layer artifact. Widening it to the GLM
+    /// set is a GLM-side change and belongs to whoever owns `tests/artifact.rs`.
     pub fn read_spec(&self, layer: usize, expert: usize) -> Result<(RawFd, usize, usize)> {
         ensure!(
-            (self.dense_layers..self.n_layers).contains(&layer),
+            (self.first_layer..self.n_layers).contains(&layer),
             "layer {layer} out of MoE range"
         );
         ensure!(
@@ -968,21 +1159,34 @@ impl ExpertSet {
             "expert {expert} >= {}",
             self.n_experts
         );
-        let fd = self.files[layer - self.dense_layers].as_raw_fd();
+        let fd = self.files[layer - self.first_layer].as_raw_fd();
         Ok((fd, self.hbytes + expert * self.stride, self.expert_bytes))
     }
 
     /// Read the shared expert's block (index `n_experts`) for resident placement, via a
     /// one-time buffered aligned pread.
+    ///
+    /// Refuses on a format that has no such block. That refusal is **not** redundant with
+    /// the EOF the read would otherwise hit: an `.f4` ends at exactly
+    /// `hbytes + n_experts·stride`, so `read_exact_at` there fails only by the accident of
+    /// the file stopping where it does — an `.f4` with any trailing bytes would return
+    /// garbage and call it a shared expert. The check is on the FORMAT, which is the fact.
     pub fn shared_block(&self, layer: usize) -> Result<Vec<u8>> {
         use std::os::unix::fs::FileExt;
         ensure!(
-            (self.dense_layers..self.n_layers).contains(&layer),
+            self.has_shared,
+            "this expert set has no shared block: it holds {} routed experts and stops \
+             there. V4's shared expert is fp8 e4m3 at 128x128, not FP4 — it is in \
+             `resident.safetensors`, not in the `.f4`",
+            self.n_experts
+        );
+        ensure!(
+            (self.first_layer..self.n_layers).contains(&layer),
             "layer {layer} out of MoE range"
         );
         let off = self.hbytes + self.n_experts * self.stride;
         // O_DIRECT needs aligned buffer+offset+len; read the full aligned stride.
-        let f = &self.files[layer - self.dense_layers];
+        let f = &self.files[layer - self.first_layer];
         let mut aligned = vec![0u8; self.stride];
         f.read_exact_at(&mut aligned, off as u64)
             .with_context(|| format!("read shared block layer {layer}"))?;
@@ -1044,7 +1248,7 @@ mod tests {
     #[test]
     fn vq3_header_roundtrips() {
         let h = ExpertHeader::new(VQ3_MAGIC, 7, 256, 6144, 2048, vq_expert_stride(6144, 2048));
-        let back = ExpertHeader::from_bytes(&h.to_bytes()).unwrap();
+        let back = ExpertHeader::from_bytes(&h.to_bytes(), RoutedFmt::Vq3).unwrap();
         assert_eq!(back.magic, VQ3_MAGIC);
         assert_eq!(back.layer, 7);
         assert_eq!(back.n_experts, 256);
@@ -1054,7 +1258,21 @@ mod tests {
         // a corrupt magic must fail
         let mut bad = h.to_bytes();
         bad[0] = b'X';
-        assert!(ExpertHeader::from_bytes(&bad).is_err());
+        assert!(ExpertHeader::from_bytes(&bad, RoutedFmt::Vq3).is_err());
+        // …and so must a WELL-FORMED header of the other format. This is the check the
+        // length test cannot make: a `.vq3` and an `.f4` of the same nominal dims differ
+        // in block count, so accepting either magic addresses past the last expert.
+        assert!(ExpertHeader::from_bytes(&h.to_bytes(), RoutedFmt::F4).is_err());
+        let f4 = ExpertHeader::new(F4_MAGIC, 7, 256, 6144, 2048, f4_expert_stride(6144, 2048));
+        assert!(ExpertHeader::from_bytes(&f4.to_bytes(), RoutedFmt::Vq3).is_err());
+        // Bidirectional: the correct pairing still parses, so the two refusals above are
+        // the magic and not a header that stopped round-tripping.
+        assert_eq!(
+            ExpertHeader::from_bytes(&f4.to_bytes(), RoutedFmt::F4)
+                .unwrap()
+                .magic,
+            F4_MAGIC
+        );
     }
 
     #[test]
