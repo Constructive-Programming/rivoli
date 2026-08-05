@@ -105,10 +105,12 @@ use rivoli::attn::{
     v4::{Dims, Fp8W, Io, Scratch, Step, Weights, attention},
     v4_rope_table_ratio0, v4_topk_idxs, Sel,
 };
+use rivoli::backend::gpustream::{HipStream, Timeline};
 use rivoli::backend::hip::{
-    device_sync, launch_v4_act_quant, launch_v4_gemv_fp8, launch_v4_rope,
-    launch_v4_sparse_attn, memcpy_dtod,
+    device_sync, fill_u32, launch_v4_act_quant, launch_v4_gemv_fp8, launch_v4_rope,
+    launch_v4_sparse_attn, memcpy_dtod_async,
 };
+use std::sync::Arc;
 use rivoli::math::{bf16_to_f32, e4m3_to_f32, f32_to_bf16, f32_to_e4m3};
 use rivoli::v4oracle::numerics::{FP8_MAX, act_quant_inplace, fast_round_scale};
 use rivoli::memory::device::DeviceBuf;
@@ -635,6 +637,15 @@ struct Gpu {
     /// columns silently vanishing.
     sel: Sel,
     comp: Option<Comp>,
+    /// The stream EVERY device operation in this harness runs on, including the compressor.
+    ///
+    /// Deliberately a real `hipStreamNonBlocking` stream rather than `null_mut()`, so that
+    /// every golden in this file is scored against the stream path — which is the only thing
+    /// a numerical gate can say about the 2026-08-05 stream conversion. It says the
+    /// arithmetic is unchanged; it says NOTHING about whether each operation landed on this
+    /// stream, because a launch on the null stream produces identical bytes. That question
+    /// needs [`the_attention_block_is_entirely_on_its_stream`], which observes it directly.
+    stream: HipStream,
 }
 
 impl Gpu {
@@ -668,6 +679,7 @@ impl Gpu {
             ring_rows: d.window + blocks,
             sel: base_sel(d, kind, cfg.index_topk),
             comp: Comp::new(cfg, lw, kind, max_m),
+            stream: HipStream::new().expect("hip stream"),
             xq: z(max_m * d.dim),
             qr: z(max_m * d.q_lora_rank),
             qrq: z(max_m * d.q_lora_rank),
@@ -782,9 +794,11 @@ impl Gpu {
         } else {
             Step::Decode { pos: p.start_pos }
         };
+        let stream = self.stream.raw();
         let s = self.scratch();
         // SAFETY: every buffer above outlives the `device_sync` on the next line.
-        unsafe { attention(d, sel, &self.weights, &s, &io, step) }.expect("v4 attention");
+        unsafe { attention(d, sel, &self.weights, &s, &io, step, stream) }
+            .expect("v4 attention");
         device_sync().expect("sync");
         let n = |b: &DeviceBuf, len: usize| read(b)[..len].to_vec();
         let nhd = d.n_heads * d.head_dim;
@@ -885,7 +899,9 @@ impl Gpu {
         };
         // SAFETY: every pointer above is a live `DeviceBuf` field of `self`, at the shape
         // `Buffers` documents; nothing here drops before the `device_sync` in `step`.
-        let blocks = unsafe { compress(&c.geom, &b, p.m, p.start_pos) }.expect("v4 compress");
+        let stream = self.stream.raw();
+        let blocks =
+            unsafe { compress(&c.geom, &b, p.m, p.start_pos, stream) }.expect("v4 compress");
         if blocks == 0 {
             return None;
         }
@@ -898,13 +914,14 @@ impl Gpu {
         unsafe {
             if p.start_pos == 0 {
                 let tail = self.kv.ptr_mut().cast::<f32>().add(p.m * hd);
-                memcpy_dtod(tail.cast(), src, blocks * row).expect("prefill kv tail");
-                memcpy_dtod(cache.add(d.window * hd).cast(), src, blocks * row)
+                memcpy_dtod_async(tail.cast(), src, blocks * row, stream)
+                    .expect("prefill kv tail");
+                memcpy_dtod_async(cache.add(d.window * hd).cast(), src, blocks * row, stream)
                     .expect("prefill cache persist");
                 Some((p.m, blocks))
             } else {
                 let slot = d.window + p.start_pos / ratio;
-                memcpy_dtod(cache.add(slot * hd).cast(), src, blocks * row)
+                memcpy_dtod_async(cache.add(slot * hd).cast(), src, blocks * row, stream)
                     .expect("decode cache slot");
                 Some((slot, blocks))
             }
@@ -1017,6 +1034,9 @@ fn sparse_attn_alone_matches_the_oracle_including_the_sink() {
     assert_eq!(rows, p.m);
     let idxb = dev_i32(&idx);
     let mut o = dev_f32(&vec![0.0f32; p.m * d.n_heads * d.head_dim]);
+    // On a real stream, not `null_mut()`, for the reason `Gpu::stream` states: a golden that
+    // only ever launched on the null stream would say nothing about the stream path.
+    let stream = HipStream::new().expect("hip stream");
     // SAFETY: all six buffers outlive the sync below.
     unsafe {
         launch_v4_sparse_attn(
@@ -1030,6 +1050,7 @@ fn sparse_attn_alone_matches_the_oracle_including_the_sink() {
             cols,
             (d.head_dim as f32).powf(-0.5),
             o.ptr_mut().cast(),
+            stream.raw(),
         )
     }
     .expect("v4_sparse_attn");
@@ -1194,6 +1215,216 @@ fn each_in_scope_defect_is_further_away_than_the_kernels_are() {
     );
 }
 
+
+/// **Every device operation in `attention` runs on the stream it was given — observed, not
+/// inferred.**
+///
+/// # Why every other test in this file is silent on this
+///
+/// The 2026-08-05 stream conversion is **invisible to output correctness by construction**. A
+/// kernel launched on the null stream and the same kernel launched on stream S compute
+/// identical bytes; the difference is only *when* they run relative to other work. So every
+/// golden above — all of which now drive a real stream, see [`Gpu::stream`] — says the
+/// arithmetic survived the conversion and says nothing whatever about whether the twenty-two
+/// call sites landed on that stream. "Output unchanged" is not "streams verified", and one
+/// launcher left behind on the null stream is precisely the silent race the original decline
+/// of a partial fix predicted.
+///
+/// # What this test observes
+///
+/// It gates the stream shut and checks that *nothing happened*. `Timeline::wait` enqueues a
+/// device-side "block until this counter reaches 1" (`hipStreamWaitValue64`) against a value
+/// nothing will ever signal, so every operation `attention` enqueues afterwards is parked.
+/// The nine destination buffers are then read back with a **blocking `hipMemcpy` D2H**, which
+/// runs on the null stream and — because rivoli's streams are `hipStreamNonBlocking` — does
+/// not wait for the gated stream. If any operation had been left on the null stream it would
+/// have executed during that window and its destination would no longer hold the poison.
+/// `Timeline::release` then retires the wait and the same nine buffers are checked to have
+/// changed, so the parked work was real work and not a launch that silently failed.
+///
+/// # What it does NOT observe
+///
+/// - **Not which stream.** It separates "on the given stream" from "on the null stream". Two
+///   operations placed on two *different* non-null streams would both be parked and both pass.
+///   Nothing in `attention` can do that today — it has one stream argument — so the case is
+///   unreachable rather than covered.
+/// - **Not ordering within the stream.** A stream is FIFO, so membership implies order here;
+///   the goldens are what say the order is right.
+/// - **Not the compressor.** `Harness::new` is a PLAIN layer, so `compress` never runs. Its
+///   own conversion is covered by `tests/v4_compress_kernel.rs` driving it on a real stream —
+///   which, by the same argument as above, is an arithmetic gate and not a membership one.
+///
+/// # Why the poison cannot hide a break
+///
+/// Twenty operations run on the arm this fixture takes: sixteen launches and four
+/// device-to-device copies. Each buffer gets a DISTINCT poison, and every group needs its own
+/// argument for why a null-stream member of it would be seen.
+///
+/// - **The four copies.** With one shared pattern, a copy from one poisoned buffer into
+///   another would be bit-invisible. Distinct patterns are the whole of what separates them.
+/// - **The four in-place `act_quant`s.** A constant block is quantized against its own amax,
+///   so a value already on the e4m3 grid would come back unchanged. Not argued — the poison is
+///   checked against the HOST `act_quant_inplace` below. That check generalises to the KV
+///   entry's block-64 quantization even though it is run at 128: for a constant-filled block
+///   `amax` is the same at every block size, and `v4_act_quant` always takes
+///   `fast_round_scale`, which is what `act_quant_inplace(.., true)` does.
+/// - **`sparse_attn`, and this is the one that nearly escapes.** With `q` and `kv` both
+///   constant the softmax is uniform, so `o` comes back holding a convex combination of
+///   `kv`'s single value — i.e. that value. `POISON[5] != POISON[4]` is the only reason it is
+///   visible. "Writes a buffer it does not read" would NOT have covered it.
+/// - **The two `rmsnorm`s and `qk_norm`.** In place, but a constant row normalises to about
+///   the weight (or to 1.0), which is not the constant.
+/// - **The three `rope`s.** Visible at ANY position, and not for the reason that first
+///   suggests itself: an earlier draft of this said a position-0 row is the identity and
+///   demanded `p.m >= 2`. `kernels/mla.hip::v4_rope` ends with an unconditional
+///   `row[i] = rbf16(row[i])` over the whole row, and every poison pattern here has non-zero
+///   mantissa bits below bf16's, so even the identity rotation moves it.
+/// - **The five `gemv_fp8`s.** Each writes a buffer it does not read, from a poisoned input.
+#[test]
+fn the_attention_block_is_entirely_on_its_stream() {
+    let Harness { d, clean, mut gpu, .. } = Harness::new();
+    let p = &clean[0];
+    // NO precondition on `p.m` against `d.window`, and an earlier draft of this test had one:
+    // `assert!(p.m <= d.window)`, on the belief that it drove the short-prefill arm. It does
+    // not — `PROMPT` is 12 and `V4Config::toy`'s `window_size` is 8, deliberately, so that a
+    // 12-token prompt reaches the ring wrap. That assertion was `12 <= 8` and fired on the
+    // fourth statement of the only test in this file that observes the stream conversion at
+    // all: a guard that ALWAYS fires, which is the mirror of the dead-guard shape this port
+    // has shipped five times. Caught by review 2026-08-05.
+    //
+    // The long-prefill arm is also the better arm: `cut = 12 % 8` is 4, so the KV write is
+    // TWO copies rather than one and the whole 8-row ring is written, not a 12-row prefix.
+
+    // The poison, one pattern per destination. Chosen as f32 bit patterns whose value is
+    // ordinary (no NaN/inf, which would make `act_quant`'s amax reduction meaningless) and
+    // whose low bits differ, so any copy between two of them shows.
+    const POISON: [u32; 9] = [
+        0x4321_0001, 0x4321_0002, 0x4321_0003, 0x4321_0004, 0x4321_0005, 0x4321_0006,
+        0x4321_0007, 0x4321_0008, 0x4321_0009,
+    ];
+    // NON-VACUITY for the four in-place `act_quant` operations, measured on the host with the
+    // oracle's own quantizer rather than argued: if a poison value survived quantization
+    // unchanged, a null-stream `act_quant` on that buffer would be invisible to this test.
+    for &pat in &POISON {
+        let v = f32::from_bits(pat);
+        let mut block = vec![v; 128];
+        act_quant_inplace(&mut block, 128, true);
+        assert!(
+            block.iter().any(|q| q.to_bits() != pat),
+            "poison {pat:#010x} ({v}) is a fixed point of act_quant, so a null-stream \
+             in-place quantization of a buffer holding it would leave no trace"
+        );
+    }
+
+    let x = dev_f32(golden(p, "attn_norm_out"));
+    let mut idx = Vec::new();
+    let shape =
+        v4_topk_idxs(Sel { seqlen: p.m, start_pos: 0, ..plain_sel(&d) }, &mut idx).unwrap();
+    let idxb = dev_i32(&idx);
+
+    // Poison every destination. `fill_u32` is itself a null-stream launch, which is fine and
+    // is why the `device_sync` below is not optional: the poison must be in place and the
+    // device idle before the gate goes up.
+    let nhd = d.n_heads * d.head_dim;
+    let gr = d.o_groups * d.o_lora_rank;
+    // The extent of each destination, in the SAME order as `POISON` and `NAMES`. `kv` is
+    // `p.m` rows and not `p.m + p.m/ratio`: `Harness::new` is a plain layer, so it has no
+    // compressed tail.
+    //
+    // `cache` is the WHOLE ring, not the rows this step writes, and that asymmetry is
+    // deliberate in both directions. The gated check is strictly stronger over more bytes: a
+    // null-stream copy landing at the wrong ring offset is caught wherever it lands. The
+    // post-release check is an `.any()`, so covering rows nobody writes cannot make it
+    // vacuous. Every other extent is exactly what the step writes, because there a poisoned
+    // byte past the end would prove nothing either way.
+    let plan: [usize; 9] = [
+        p.m * d.dim,                // xq
+        p.m * d.q_lora_rank,        // qr
+        p.m * d.q_lora_rank,        // qrq
+        p.m * nhd,                  // q
+        p.m * d.head_dim,           // kv
+        p.m * nhd,                  // o
+        p.m * gr,                   // y
+        gpu.ring_rows * d.head_dim, // cache
+        p.m * d.dim,                // out
+    ];
+    {
+        let bufs: [&mut DeviceBuf; 9] = [
+            &mut gpu.xq, &mut gpu.qr, &mut gpu.qrq, &mut gpu.q, &mut gpu.kv, &mut gpu.o,
+            &mut gpu.y, &mut gpu.ring, &mut gpu.out,
+        ];
+        for ((len, pat), b) in plan.into_iter().zip(POISON).zip(bufs) {
+            // SAFETY: `b` owns at least `len * 4` bytes by `Gpu::new`'s sizing.
+            unsafe { fill_u32(b.ptr_mut(), pat, len * size_of::<f32>()) }.expect("poison");
+        }
+    }
+    device_sync().expect("sync after poisoning");
+
+    let io = Io {
+        x: x.ptr().cast(),
+        freqs: gpu.freqs.ptr().cast(),
+        idxs: idxb.ptr().cast(),
+        idxs_shape: shape,
+        cache: gpu.ring.ptr_mut().cast(),
+        out: gpu.out.ptr_mut().cast(),
+    };
+    let stream = gpu.stream.raw();
+    let s = gpu.scratch();
+
+    // ONE readback, called twice — the nine buffers in `NAMES` order. Two literal copies of
+    // this array is what jscpd refused, and rightly: the two snapshots must be over the same
+    // buffers in the same order or the comparison below indexes one against the other's names.
+    let snapshot = |g: &Gpu| -> Vec<Vec<f32>> {
+        [&g.xq, &g.qr, &g.qrq, &g.q, &g.kv, &g.o, &g.y, &g.ring, &g.out].map(read).into()
+    };
+
+    let tl = Arc::new(Timeline::new().expect("timeline"));
+    // A watchdog, because the one operation in this test that could hang is the D2H readback:
+    // if some future HIP runtime made a blocking `hipMemcpy` wait on a NON-blocking stream,
+    // the read below would block on a gate nothing will open. A release from another thread
+    // turns that into a loud failed assertion instead of a wedged device holding the GPU lock
+    // — which this repo has paid for before. `release` is a monotone CAS, so the redundant
+    // call in the normal path is a no-op.
+    let watchdog = Arc::clone(&tl);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(20));
+        watchdog.release(1);
+    });
+
+    tl.wait(stream, 1).expect("gate the stream");
+    // SAFETY: every buffer above outlives the `device_sync` after the release below.
+    unsafe { attention(&d, plain_sel(&d), &gpu.weights, &s, &io, Step::Prefill { seqlen: p.m }, stream) }
+        .expect("v4 attention");
+
+    // Acquire load, no sync and no stall — so this cannot itself deadlock.
+    let armed = tl.completed();
+    let during = snapshot(&gpu);
+    // BEFORE any assertion, unconditionally: a panic here with the stream still gated would
+    // leave `HipStream::drop` calling `hipStreamDestroy` on a blocked stream.
+    tl.release(1);
+    device_sync().expect("sync after release");
+    let after = snapshot(&gpu);
+
+    assert_eq!(armed, 0, "the gate was already open, so nothing was ever parked");
+    const NAMES: [&str; 9] = ["xq", "qr", "qrq", "q", "kv", "o", "y", "cache", "out"];
+    for (i, (len, name)) in plan.into_iter().zip(NAMES).enumerate() {
+        let stale = during[i][..len].iter().position(|v| v.to_bits() != POISON[i]);
+        assert!(
+            stale.is_none(),
+            "`{name}` changed at element {} while the stream was GATED, so an operation \
+             writing it is not on that stream — with `hipStreamNonBlocking` that is an \
+             unordered read, not merely a slower path",
+            stale.unwrap()
+        );
+        assert!(
+            after[i][..len].iter().any(|v| v.to_bits() != POISON[i]),
+            "`{name}` still holds its poison after the release, so the work this test \
+             claims it parked never ran at all and the check above was vacuous"
+        );
+    }
+    println!("all 9 destinations parked while the stream was gated, all 9 written after");
+}
+
 /// The selection-shape check, both ways.
 ///
 /// It is the one guard here that protects against a SILENT wiring bug rather than a
@@ -1225,10 +1456,11 @@ fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
         out: gpu.out.ptr_mut().cast(),
     };
     let s = gpu.scratch();
+    let stream = gpu.stream.raw();
     // SAFETY: buffers outlive the call; it returns before any launch.
     let e = unsafe { attention(
                 &d,
-                plain_sel(&d), &gpu.weights, &s, &io, Step::Prefill { seqlen: short }) }
+                plain_sel(&d), &gpu.weights, &s, &io, Step::Prefill { seqlen: short }, stream) }
         .expect_err("a 4-row prefill must not accept an 8-column selection");
     assert!(format!("{e}").contains("selection"), "rejected for the wrong reason: {e}");
 
@@ -1236,7 +1468,7 @@ fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
     // SAFETY: as above; this one does launch, and the sync below joins it.
     unsafe { attention(
                 &d,
-                plain_sel(&d), &gpu.weights, &s, &io, Step::Prefill { seqlen: short }) }
+                plain_sel(&d), &gpu.weights, &s, &io, Step::Prefill { seqlen: short }, stream) }
         .expect("the correct shape must be accepted");
     device_sync().expect("sync");
 
@@ -1247,7 +1479,7 @@ fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
     io.idxs_shape = (1, short);
     let e = unsafe { attention(
                 &d,
-                plain_sel(&d), &gpu.weights, &s, &io, Step::Decode { pos: PROMPT }) }
+                plain_sel(&d), &gpu.weights, &s, &io, Step::Decode { pos: PROMPT }, stream) }
         .expect_err("a decode must not accept a narrowed prefill selection");
     assert!(format!("{e}").contains("selection"), "rejected for the wrong reason: {e}");
     let mut one = Vec::new();
@@ -1259,7 +1491,7 @@ fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
     // SAFETY: as above.
     unsafe { attention(
                 &d,
-                plain_sel(&d), &gpu.weights, &s, &io, Step::Decode { pos: PROMPT }) }
+                plain_sel(&d), &gpu.weights, &s, &io, Step::Decode { pos: PROMPT }, stream) }
         .expect("the correct decode shape must be accepted");
     device_sync().expect("sync");
 }
@@ -1280,32 +1512,47 @@ fn the_c_abi_argument_guards_reject_out_of_domain_shapes() {
         let e = format!("{}", r.expect_err(what));
         assert!(e.contains(code), "{what}: expected guard {code}, got {e}");
     };
+    // `null_mut()` for the stream throughout, and that is not laziness: every call here is
+    // rejected by an argument guard BEFORE `hipLaunchKernelGGL`, so there is no launch for a
+    // stream to order. A real stream would add a handle to each line and change nothing.
     // SAFETY: every call below is rejected by an argument guard before any launch, so no
     // pointer is dereferenced and the shapes never have to be real.
     unsafe {
         // head_dim past V4_ATTN_THREADS * V4_ATTN_ACC -- silently dropped dims otherwise.
         guard(
-            launch_v4_sparse_attn(p, p, p, b.ptr().cast(), 1, 1, 1025, 8, 1.0, pm),
+            launch_v4_sparse_attn(p, p, p, b.ptr().cast(), 1, 1, 1025, 8, 1.0, pm, std::ptr::null_mut()),
             "1002",
             "head_dim over the accumulator cap",
         );
         // ...and 1024 exactly is accepted, so the cap is a boundary and not a blanket no.
         guard(
-            launch_v4_sparse_attn(p, p, p, b.ptr().cast(), 1, 1, 1024, 1 << 20, 1.0, pm),
+            launch_v4_sparse_attn(p, p, p, b.ptr().cast(), 1, 1, 1024, 1 << 20, 1.0, pm, std::ptr::null_mut()),
             "1006",
             "a topk that overflows LDS",
         );
         // A `groups` that does not divide `n_out` would index a slice no input was sized
         // for. This is the guard the three-parameter form could not express at all.
         guard(
-            launch_v4_gemv_fp8(p, b.ptr(), p, 1, 10, 128, 128, 3, pm),
+            launch_v4_gemv_fp8(p, b.ptr(), p, 1, 10, 128, 128, 3, pm, std::ptr::null_mut()),
             "1004",
             "groups not dividing n_out",
         );
-        guard(launch_v4_gemv_fp8(p, b.ptr(), p, 1, 8, 128, 96, 1, pm), "1003", "non-power-of-two block");
+        guard(
+            launch_v4_gemv_fp8(p, b.ptr(), p, 1, 8, 128, 96, 1, pm, std::ptr::null_mut()),
+            "1003",
+            "non-power-of-two block",
+        );
         // `view_as_complex` cannot pair an odd count.
-        guard(launch_v4_rope(pm, p, 1, 8, 3, 0, 1, false), "1005", "odd rope_head_dim");
-        guard(launch_v4_rope(pm, p, 1, 8, 16, 0, 1, false), "1002", "rope span over the row");
+        guard(
+            launch_v4_rope(pm, p, 1, 8, 3, 0, 1, false, std::ptr::null_mut()),
+            "1005",
+            "odd rope_head_dim",
+        );
+        guard(
+            launch_v4_rope(pm, p, 1, 8, 16, 0, 1, false, std::ptr::null_mut()),
+            "1002",
+            "rope span over the row",
+        );
         // The ONLY assertion of the ragged-span guard, deliberately. 2026-08-05: it was
         // also asserted inside `act_quant_matches_the_oracle_on_the_subnormal_ties_...`,
         // holding the pre-renumbering code 1002; the kernel and this test moved to 1004
@@ -1314,7 +1561,11 @@ fn the_c_abi_argument_guards_reject_out_of_domain_shapes() {
         // guard rejection reads like a numerics failure in a log -- the test name says
         // "matches the oracle" and the output says "argument guard rejected". One guard,
         // one assertion.
-        guard(launch_v4_act_quant(pm, 1, 64, 60, 64), "1004", "a ragged quantization span");
+        guard(
+            launch_v4_act_quant(pm, 1, 64, 60, 64, std::ptr::null_mut()),
+            "1004",
+            "a ragged quantization span",
+        );
     }
 }
 
@@ -1456,7 +1707,8 @@ fn act_quant_matches_the_oracle_on_the_subnormal_ties_that_pick_the_rounding_rul
 
     let mut buf = dev_f32(&row);
     // SAFETY: `buf` is one row of BLOCK f32 and outlives the sync below.
-    unsafe { launch_v4_act_quant(buf.ptr_mut().cast(), 1, BLOCK, BLOCK, BLOCK) }
+    let stream = HipStream::new().expect("hip stream");
+    unsafe { launch_v4_act_quant(buf.ptr_mut().cast(), 1, BLOCK, BLOCK, BLOCK, stream.raw()) }
         .expect("v4_act_quant");
     device_sync().expect("sync");
     let got = read(&buf);

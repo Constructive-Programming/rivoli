@@ -71,6 +71,7 @@
 #![cfg(feature = "rocm")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use rivoli::backend::gpustream::HipStream;
 use rivoli::backend::hip::device_sync;
 use rivoli::math::f32_to_bf16;
 use rivoli::memory::device::DeviceBuf;
@@ -508,8 +509,13 @@ impl Cell {
             // SAFETY: every pointer above comes from a `Dev` alive for this iteration, at
             // the element counts just asserted; `device_sync` below completes the work
             // before any of them drops.
-            let n = unsafe { rivoli::v4compress::compress(&self.geom, &b, s, start_pos) }
-                .expect("compress launch");
+            // A real stream, not `null_mut()`: `compress` became stream-parameterised on
+            // 2026-08-05 and a suite that only ever passed null would score the arithmetic
+            // without ever exercising the argument. `device_sync` below joins every stream.
+            let stream = HipStream::new().expect("hip stream");
+            let n =
+                unsafe { rivoli::v4compress::compress(&self.geom, &b, s, start_pos, stream.raw()) }
+                    .expect("compress launch");
             device_sync().expect("device_sync");
             got.extend_from_slice(&out.read()[..n * d]);
         }

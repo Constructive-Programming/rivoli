@@ -1414,6 +1414,7 @@ fn batched_rows_are_bit_identical_to_single_rows() {
                     i_dim,
                     nrow,
                     yb.ptr_mut() as *mut f32,
+                    std::ptr::null_mut(),
                 )
             }
             .expect("gemv_f32");

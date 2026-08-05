@@ -85,10 +85,11 @@ __device__ __forceinline__ unsigned short f2bf16(float x) {
 
 // ── V4 shared device helpers ────────────────────────────────────────────────────
 //
-// Neither carries a `contract(off)` pragma, and neither needs one: `rbf16` is bit surgery
-// and `block_sum_lds`'s only operator is `+`, so there is no multiply for an FMA to absorb
-// in either. That is NOT true of `f2e4m3_rne` further down this file, which does carry one
-// — see the note there for what an ISA diff caught.
+// None of the three carries a `contract(off)` pragma, and none needs one: `rbf16` is bit
+// surgery, `block_sum_lds`'s only operator is `+`, and `swiglu_clamped`'s only `+` is
+// `1.0f + expf(...)`, whose addends are a constant and a call return — there is no multiply
+// for an FMA to absorb in any of them. That is NOT true of `f2e4m3_rne` further down this
+// file, which does carry one — see the note there for what an ISA diff caught.
 
 // bf16 round-trip in f32. V4 activations stay f32 on device and hold bf16-representable
 // values, which is what `Oracle::round_bf16` does to an `f32` Vec — the reference stores
@@ -137,6 +138,49 @@ __device__ __forceinline__ float block_sum_lds(float v, float* red) {
     float t = red[0];
     __syncthreads();
     return t;
+}
+
+// `Expert.forward`'s clamped SwiGLU intermediate, BEFORE the routing weight and before the
+// bf16 store: `silu(min(bf16(g), L)) · clamp(bf16(u), ±L)` (model.py:601-608).
+//
+// ONE definition, because there are two callers and they must agree bit for bit or the
+// comparison the whole port rests on stops meaning anything: `moe.hip::moe_gateup_f4_impl`
+// (the fp4 ROUTED experts) and `linalg.hip::v4_swiglu_clamped` (the fp8 SHARED expert).
+// `MoE.__init__` passes `swiglu_limit` to `shared_experts` as well as to the routed ones
+// (model.py:632), so the two run the same arithmetic on different weight formats. Hoisted
+// here rather than copied because `build.rs`'s jscpd gate does not scan `kernels/`
+// (build.rs:618) — a second copy is invisible to every tool in this tree except the
+// compiler, and `rbf16` above records that it had THREE copies before anyone noticed.
+//
+// There is deliberately NO unclamped mode. `limit <= 0` would make this the wrong function
+// (`v4oracle::Defect::SwigluUnclamped`, one contribution in seven, fluent and wrong), and
+// both launchers refuse it rather than letting a sentinel spell it — so this helper never
+// has to decide what a non-positive limit means.
+//
+// Four things here are load-bearing and each is a defect the oracle can name:
+//
+//  1. **bf16 FIRST, then clamp.** `Linear` stores bf16 and `Expert.forward` clamps what it
+//     read back (`self.w1(x).float()`). Clamping the f32 dot and rounding afterwards puts a
+//     different value on the boundary, and the boundary is the only place a clamped SwiGLU
+//     differs from an unclamped one at all.
+//  2. **The clamp is ASYMMETRIC.** `up` is clamped both sides, `gate` only from above.
+//     Clamping the gate from below too is `Defect::SwigluClampGateBothSides`.
+//  3. **`x · sigmoid(x)`, not `x / (1 + e^-x)`.** `F.silu` is the multiply form, and this is
+//     NOT `linalg.hip::swiglu`'s division form. The two differ by one rounding that would
+//     normally vanish under the bf16 store the callers apply — except exactly at a rounding
+//     boundary, where it flips a whole bf16 ulp. Matching the reference's association
+//     removes a systematic term from every comparison this port makes.
+//  4. **The product is returned UNROUNDED**, in f32. Both callers round it, but not at the
+//     same point: the fp4 path folds the routing weight in first and rounds
+//     `bf16(silu·up·w)`, which is where the reference rounds (`weights * x` precedes
+//     `x.to(dtype)`), while the shared expert has no routing weight at all
+//     (model.py:648) and rounds the bare product. Rounding here would double-round the fp4
+//     path — a second bf16 step the reference does not take.
+__device__ __forceinline__ float swiglu_clamped(float g, float u, float limit) {
+    float gt = rbf16(g), ut = rbf16(u);
+    ut = fminf(fmaxf(ut, -limit), limit);
+    gt = fminf(gt, limit);  // ASYMMETRIC: no lower clamp on the gate
+    return gt * (1.0f / (1.0f + expf(-gt))) * ut;
 }
 
 // fp8-e4m3 → f32 (matches math.rs::e4m3_to_f32). 1 sign / 4 exp (bias 7) / 3 mant;

@@ -61,11 +61,12 @@ use rivoli::backend::gpustream::HipStream;
 use rivoli::backend::hip::{
     ExpertDescF4, device_sync, launch_act_quant_f8, launch_hc_post, launch_hc_pre,
     launch_moe_acc_drain, launch_moe_expert_range_f4, launch_moe_gate_v4, launch_rmsnorm,
+    launch_v4_act_quant, launch_v4_gemv_fp8, launch_v4_swiglu_clamped,
 };
 use rivoli::memory::device::DeviceBuf;
 use rivoli::v4oracle::{
     forward::{Capture, Counters, Defect, ExpertW, LayerW, Oracle, Step},
-    numerics::{act_quant_inplace, bf16_decode, bf16_encode, e4m3_decode},
+    numerics::{act_quant_inplace, bf16_decode, bf16_encode, e4m3_decode, e8m0_decode, silu},
     toy::{self, ToyModel},
     weights::{NamedRng, V4Config, WMat},
 };
@@ -618,10 +619,16 @@ fn expert_range_f4_guards() {
         // end here is the wrong ARITHMETIC, not merely the wrong weights.
         (1004, "one expert past the descriptor array", go((hid, int, 0, 2, 1, lim, 1))),
         (1004, "e_start past the descriptor array", go((hid, int, 1, 1, 1, lim, 1))),
-        // 0.0 and NaN, not 0.0 and -10.0: `x <= 0` would reject the negative too, so only
-        // NaN distinguishes the `!(x > 0)` spelling that is actually there.
+        // Every value that disables the clamp, and each row is chosen to distinguish a
+        // SPELLING rather than to enumerate bad numbers. `-10.0` is absent because `x <= 0`
+        // would reject it too, so it separates nothing. NaN separates `!(x > 0)` from
+        // `x <= 0`. **+inf separates `!(x > 0 && x < INFINITY)` from `!(x > 0)`** — and that
+        // row was missing until 2026-08-05, which is exactly how the infinity route stayed
+        // open on the one clamp launcher that has callers: `fminf(gt, inf)` returns `gt`, so
+        // the clamp is simply gone, on every fp4 expert of every layer, silently.
         (1006, "unclamped swiglu", go((hid, int, 0, 1, 1, 0.0, 1))),
         (1006, "NaN swiglu limit", go((hid, int, 0, 1, 1, f32::NAN, 1))),
+        (1006, "infinite swiglu limit", go((hid, int, 0, 1, 1, f32::INFINITY, 1))),
     ];
     assert_guards(cases);
 }
@@ -1423,6 +1430,479 @@ fn ffn_out_matches_the_golden() {
         .map(|(a, b)| bf16_decode(bf16_encode(a + b)))
         .collect();
     assert_matches(cap.float("L0.pre.ffn_out").expect("ffn_out golden"), &got, "ffn_out");
+}
+
+// =======================================================================================
+// 7. the resident fp8 SHARED expert, and the clamp it did not have
+// =======================================================================================
+//
+// `MoE.__init__` hands `swiglu_limit` to `shared_experts` as well as to the routed ones
+// (model.py:632) and `Expert.forward` clamps both. Until 2026-08-05 the shared expert's only
+// available combine was `launch_swiglu`, which is GLM's, is unclamped, and rounds nothing —
+// `Defect::SwigluUnclamped` on one contribution in seven of every one of the 43 layers,
+// fluent and wrong. `launch_v4_swiglu_clamped` is the fix and this section is its gate.
+//
+// It gates the KERNEL, not the engine. As of 2026-08-05 the shared expert has no caller — the
+// V4 layer loop is being written separately — so what these tests establish is that the
+// clamped combine is correct and available, NOT that anything uses it. The wiring, and a gate
+// saying the caller reached for this launcher rather than for GLM's `launch_swiglu`, are owed
+// by that loop.
+//
+// # What separates a clamped kernel from an unclamped one, and where
+//
+// Nowhere, at ordinary activation scales. `swiglu_limit` is 10.0 and the toy weights put
+// `|w1·x|` and `|w3·x|` around 1, so a clamp test built on the natural fixture would pass
+// against a kernel with no clamp at all. That is not a hypothetical failure mode — it is the
+// one this repo has shipped five times, and `the_swiglu_clamp_is_live_and_the_fixture_reaches
+// _it` above exists because of it on the fp4 side.
+//
+// So the fixture's reachability is MEASURED, from the oracle's own `swiglu_clamp_events`,
+// which is counted while the oracle computes and is independent of what any kernel did. Both
+// ends of the bracket are asserted: at scale 1 the count is zero and the clamp must be
+// BIT-INERT, at scale 48 the count is positive and the clamp must change the answer.
+
+/// The shared expert's three fp8 weights on device — `(e4m3 bytes, f32 block scales)` per
+/// projection, in `[w1, w2, w3]` order.
+///
+/// The scale bytes are widened here through `e8m0_decode`, which is what
+/// `format.rs::copy_fp8_e8m0` does at conversion and is exact: every e8m0 code is a power of
+/// two. The oracle dequantizes the SAME bytes on its side through `WMat::row`, so a
+/// disagreement between the two decoders is inside what this comparison covers.
+///
+/// Matched exhaustively rather than with a let-else: the shared expert being fp8 is the whole
+/// reason it needs its own launcher, and a `.f4` block reaching here would be the wrong
+/// ARITHMETIC rather than the wrong bytes — the distinction `launch_moe_expert_range_f4`'s
+/// `n_desc` doc draws.
+fn upload_fp8_shared(e: &ExpertW) -> Vec<(DeviceBuf, DeviceBuf)> {
+    [&e.w1, &e.w2, &e.w3]
+        .into_iter()
+        .map(|m| match m {
+            WMat::Fp8 { w, s, .. } => {
+                let widened: Vec<f32> = s.iter().map(|&c| e8m0_decode(c)).collect();
+                (to_device(w), to_device(&f32b(&widened)))
+            }
+            WMat::Dense { .. } | WMat::Fp4 { .. } => {
+                panic!("the shared expert is fp8 e4m3 at 128x128 — `MoE.__init__` passes \
+                        `expert_dtype` only to the ROUTED experts")
+            }
+        })
+        .collect()
+}
+
+/// One row of the resident fp8 shared expert on the GPU: three `v4_gemv_fp8` and the clamped
+/// combine, `Expert.forward` with `weights = None`.
+///
+/// The launch order IS the arithmetic, so it is spelled rather than abstracted:
+/// `act_quant(x)` once (both `w1` and `w3` read the identical quantized row — the reference
+/// runs a separate `act_quant` inside each `Linear`, on the same row at the same block, so
+/// the bytes are identical), then `w1`/`w3`, then the combine, then `act_quant(h)` and `w2`.
+/// Every `v4_gemv_fp8` bf16-rounds its own output, which is where `Linear`'s bf16 store lives.
+///
+/// `limit` is a parameter and not `cfg.swiglu_limit` because the whole test below is an A/B
+/// on it. There is no way to ask for the unclamped form: the launcher refuses `<= 0`, NaN
+/// and `+/-inf`
+/// and NaN, so "effectively unclamped" has to be spelled as a huge positive limit.
+fn gpu_shared_expert(cfg: &V4Config, w: &[(DeviceBuf, DeviceBuf)], x: &[f32], limit: f32)
+    -> Vec<f32> {
+    let (dim, inter) = (cfg.dim, cfg.moe_inter_dim);
+    let stream = HipStream::new().expect("hip stream");
+    let (st, blk) = (stream.raw(), 128usize);
+    let mut xq = to_device(&f32b(x));
+    let mut g = zeros(inter * 4);
+    let mut u = zeros(inter * 4);
+    let mut out = zeros(dim * 4);
+    let sc = |i: usize| w[i].1.ptr().cast::<f32>();
+    // SAFETY: `xq` is one row of `dim` f32; `g`/`u` are `inter`; `out` is `dim`; each weight
+    // is `[o_dim, i_dim]` e4m3 with a 128x128 f32 scale grid by `upload_fp8_shared`'s
+    // contract. All five outlive the `device_sync` inside `sync_f32`.
+    unsafe {
+        launch_v4_act_quant(xq.ptr_mut().cast(), 1, dim, dim, blk, st).expect("act_quant x");
+        let xp = xq.ptr().cast::<f32>();
+        launch_v4_gemv_fp8(xp, w[0].0.ptr(), sc(0), 1, inter, dim, blk, 1, g.ptr_mut().cast(), st)
+            .expect("w1");
+        launch_v4_gemv_fp8(xp, w[2].0.ptr(), sc(2), 1, inter, dim, blk, 1, u.ptr_mut().cast(), st)
+            .expect("w3");
+        // IN PLACE into `g`: `h` becomes `w2`'s input, which is one fewer allocation and is
+        // how `gpu.rs` already drives GLM's `swiglu`. Safe by the kernel's own note.
+        launch_v4_swiglu_clamped(
+            g.ptr().cast(), u.ptr().cast(), inter, limit, g.ptr_mut().cast(), st,
+        )
+        .expect("clamped swiglu");
+        launch_v4_act_quant(g.ptr_mut().cast(), 1, inter, inter, blk, st).expect("act_quant h");
+        launch_v4_gemv_fp8(
+            g.ptr().cast(), w[1].0.ptr(), sc(1), 1, dim, inter, blk, 1, out.ptr_mut().cast(), st,
+        )
+        .expect("w2");
+    }
+    sync_f32(&out)
+}
+
+/// `swiglu_clamp_events` for one shared-expert call at `defect`, and the oracle's answer.
+///
+/// The count comes from the oracle rather than from anything the kernel reports, which is
+/// what makes the reachability claims below measurements instead of hopes.
+fn oracle_shared(defect: Defect, x: &[f32], layer: usize) -> (Vec<f32>, usize) {
+    let (cfg, m, _) = fixture();
+    let o = Oracle::new(cfg.clone(), defect);
+    let mut c = Counters::default();
+    let y = o.expert(&m.layers[layer].shared, x, 1, None, &mut c);
+    (y, c.swiglu_clamp_events)
+}
+
+/// The shared expert at an activation scale that NEVER reaches the clamp.
+///
+/// Two claims, and the second is the one a clamp test usually forgets. The fp8 path matches
+/// the oracle; and where the oracle says the bound never binds, the clamp is **bit-inert** —
+/// `limit = 10` and `limit = 1e6` produce identical bit patterns. That is the half of
+/// "the clamp must separate exactly where it should and nowhere else" which says *nowhere
+/// else*, and without it a kernel that clamped at the wrong threshold, or clamped `up` from
+/// the wrong side, could still pass the positive gate below.
+#[test]
+fn the_shared_expert_matches_the_oracle_where_the_clamp_never_binds() {
+    let (cfg, m, _) = fixture();
+    let x = draw_x("shared-x", cfg.dim, 1.0);
+    let (want, events) = oracle_shared(Defect::None, &x, 0);
+    assert_eq!(events, 0, "this case is the UNCLAMPED half of the bracket — pick a lower scale");
+    assert!(want.iter().any(|v| v.abs() > 1e-6), "the oracle produced nothing to compare");
+    let w = upload_fp8_shared(&m.layers[0].shared);
+    let got = gpu_shared_expert(cfg, &w, &x, cfg.swiglu_limit);
+    assert_matches(&want, &got, "shared expert (fp8), clamp not binding");
+    assert_eq!(
+        bits(&got),
+        bits(&gpu_shared_expert(cfg, &w, &x, 1e6)),
+        "the clamp changed the answer on a case where the oracle counted ZERO clamp events, \
+         so it is binding somewhere it must not — a wrong threshold, or `up` clamped on the \
+         wrong side"
+    );
+}
+
+/// The clamped SwiGLU on the shared expert, with the fixture measured to reach it.
+///
+/// Four arms, and each is here because it rules out a way the other three could be green
+/// against a wrong kernel:
+///
+/// 1. **The fixture reaches the clamp**, from the oracle's own event count. Without this the
+///    remaining three compare a clamp that never fired.
+/// 2. **The kernel matches the clamped oracle.** The positive gate.
+/// 3. **`limit = 1e6` disagrees with the clamped oracle**, so the clamp is what separates
+///    them at these inputs — and it must exceed the same [`TOL`] the positive arm passes at,
+///    which is what [`assert_disagrees`] enforces.
+/// 4. **`limit = 1e6` MATCHES the oracle running `Defect::SwigluUnclamped`.** This is the arm
+///    that makes 3 mean something: it says the break is *precisely* the unclamped form rather
+///    than some unrelated perturbation that happens to move the answer. A "break" that moved
+///    the result for the wrong reason would pass 3 and fail this.
+///
+/// The asymmetry gets its own test below; it is not visible from here.
+#[test]
+fn the_shared_expert_clamp_is_live_and_the_fixture_reaches_it() {
+    let (cfg, m, _) = fixture();
+    let x = draw_x("shared-x-big", cfg.dim, 48.0);
+    let (want, events) = oracle_shared(Defect::None, &x, 0);
+    assert!(
+        events > 0,
+        "the fixture never reaches `swiglu_limit`, so this test could not distinguish a \
+         clamped kernel from an unclamped one — raise the activation scale"
+    );
+    println!("shared expert: {events} clamp events at scale 48");
+    let w = upload_fp8_shared(&m.layers[0].shared);
+    assert_matches(&want, &gpu_shared_expert(cfg, &w, &x, cfg.swiglu_limit), "clamped shared");
+
+    // Effectively unclamped, but POSITIVE — the launcher refuses 0 and NaN outright, which is
+    // the stronger guarantee and the reason this arm goes the long way round.
+    let unclamped = gpu_shared_expert(cfg, &w, &x, 1e6);
+    assert_disagrees(&want, &unclamped, "shared expert with the limit raised to 1e6");
+    // No assertion that the defect oracle counted ZERO clamp events, and an earlier draft had
+    // one. It could not fail: `Oracle::expert` sets `limit = 0.0` for this defect and both
+    // increments of `swiglu_clamp_events` sit inside `if limit > 0.0`, so the count is
+    // structurally zero. A guard that nothing could make red is what this port has shipped
+    // five times, and three of the most recent four were added in answer to a review. The
+    // claim it was reaching for — that the defect really disables the clamp — is what the
+    // comparison on the next line says, from the numbers rather than from a counter.
+    let (want_unclamped, _) = oracle_shared(Defect::SwigluUnclamped, &x, 0);
+    assert_matches(&want_unclamped, &unclamped, "1e6 reproduces Defect::SwigluUnclamped");
+}
+
+/// The clamp is ASYMMETRIC — `up` on both sides, `gate` only from above (model.py:606-607) —
+/// and **this test CANNOT gate that. Measured, not assumed, and it is a property of the
+/// reference rather than of the fixture.**
+///
+/// The plausible wrong version is `Defect::SwigluClampGateBothSides`: clamping the gate from
+/// below too is one `fmaxf` and reads as a tidier symmetry. This test was written to reject it
+/// through the expert and it does not, which was caught on the GPU on 2026-08-05 by the
+/// test's own anti-vacuity arm rather than by a reviewer:
+///
+/// ```text
+/// shared expert: 12 gate values below -10 at scale 48
+/// the two clamp shapes on this fixture: err=3.125e-2  tol=9.424e-2   (max |want| = 1.206e1)
+/// ```
+///
+/// So the fixture DOES reach the case — 12 elements of it — and the two clamp shapes still
+/// agree to a third of the tolerance. Raising the activation scale cannot fix that, and the
+/// reason is a closed-form bound rather than a fixture accident. For `g <= -limit` the
+/// asymmetric form computes `silu(g)` and the symmetric one computes `silu(-limit)`, so the
+/// difference is at most
+///
+/// ```text
+/// |silu(g) - silu(-10)| <= |silu(-10)| = 4.540e-4      (silu -> 0 as g -> -inf)
+/// ```
+///
+/// times `|up| <= limit`, i.e. **4.540e-3 per ELEMENT of `h`**. `silu` has already annihilated
+/// the operand before the lower clamp could matter.
+///
+/// **The per-element bound is what is proved; the observed 3.125e-2 is not it.** That figure is
+/// max-abs on the expert's OUTPUT, after `w2` accumulates over `moe_inter_dim = 128` — 6.9x the
+/// per-element bound, which is accumulation, not a contradiction. Against a 9.424e-2 tolerance
+/// the live margin is **3x**, and the per-element bound sits **20x** under it. An earlier draft
+/// said "two orders below resolution", which is 1.3 orders for the bound and half an order for
+/// the thing actually measured.
+///
+/// **And the scale claim is narrower than first written.** An earlier draft said the
+/// non-separation held "at any activation scale" and was "provably impossible" to escape. The
+/// bound is per-element and scale-free, but the NUMBER of affected elements grows with scale
+/// while the tolerance saturates — `gt <= 10` and `|ut| <= 10` cap `h`, so `max|want|` stops
+/// growing. 12 of 128 elements are affected at scale 48; at a high enough scale most of `inter`
+/// would be, and the sum could clear `TOL`. So: **measured unresolvable at this fixture's
+/// scale**, with a per-element bound explaining why pushing a little harder will not help. Not
+/// a proof over all scales.
+///
+/// That is still a fact about `Expert.forward` worth recording: at `swiglu_limit = 10` the
+/// gate's missing lower clamp is very nearly a no-op numerically. It is worth matching — the
+/// reference is the spec — but it cannot be gated HERE.
+///
+/// **Where it IS gated:** [`the_clamped_combine_is_bit_exact_elementwise`], which compares the
+/// kernel to a host transliteration BIT FOR BIT and carries an explicit symmetric-clamp arm.
+/// At the combine there is no `w2` accumulation to bury a 4.540e-3 term in and no tolerance to
+/// hide under: `silu(-12)` and `silu(-10)` are `-7.373e-5` and `-4.540e-4`, which are nowhere
+/// near each other in bf16. Resolution is what moved, not the claim.
+///
+/// The pattern is `tests/v4_compress_kernel.rs`'s: record the measured separation, say plainly
+/// which metric cannot resolve it, and name the instrument that can — rather than widening
+/// [`TOL`] until a green appears, which here would have meant a 3x loosening that every other
+/// test in this file pays for.
+/// **This test still GATES the asymmetric clamp positively.** `assert_matches(&asym, &got)`
+/// below is the check that the kernel implements the reference's clamp, and deleting this test
+/// would lose it. Only the *rejection* of the symmetric variant moved elsewhere; the name is
+/// long because it warns about the half that moved, not because the rest is a no-op.
+#[test]
+fn the_shared_expert_gate_clamp_matches_and_the_asymmetry_is_below_resolution() {
+    let (cfg, m, _) = fixture();
+    let x = draw_x("shared-x-big", cfg.dim, 48.0);
+    let (asym, events) = oracle_shared(Defect::None, &x, 0);
+    let (sym, events_sym) = oracle_shared(Defect::SwigluClampGateBothSides, &x, 0);
+    // The fixture reaches the case: each `gi < -limit` is exactly one clamp event the
+    // asymmetric form does not count, so the DIFFERENCE is the population size.
+    assert!(
+        events_sym > events,
+        "the fixture has no gate value below -{}, so the measurement below would be reporting \
+         an empty case rather than an unresolvable one ({events_sym} events vs {events})",
+        cfg.swiglu_limit
+    );
+    println!(
+        "shared expert: {} gate values below -{} at scale 48",
+        events_sym - events,
+        cfg.swiglu_limit
+    );
+    // The positive gate still stands, and it is the point of the test: the kernel reproduces
+    // the ASYMMETRIC oracle.
+    let w = upload_fp8_shared(&m.layers[0].shared);
+    let got = gpu_shared_expert(cfg, &w, &x, cfg.swiglu_limit);
+    assert_matches(&asym, &got, "shared expert, gate clamped from above only");
+
+    // And the recorded non-separation, asserted so it cannot silently become a separation
+    // nobody noticed. `compare` prints both numbers either way.
+    //
+    // Note what is and is not pinned. The 4.540e-3 figure in the doc is a bound on ONE
+    // ELEMENT of `h`; the quantity asserted here is max-abs error on the expert's OUTPUT,
+    // after `w2` has accumulated over `moe_inter_dim = 128`. Those are different quantities
+    // and the measured 3.125e-2 is 6.9x the per-element bound, which is not a contradiction —
+    // it is the accumulation. An earlier message here claimed the bound made a larger value
+    // "impossible", which was false against the number printed on the very next line.
+    let (err, tol) = compare(&asym, &sym, "the two clamp shapes (recorded as UNRESOLVABLE)");
+    assert!(
+        err <= tol,
+        "the asymmetric and symmetric clamps now differ by err={err:.3e} > tol={tol:.3e} \
+         through the expert, against a recorded 3.125e-2. This test is a recorded \
+         NON-separation, so a red here means the recording is stale — re-measure before \
+         treating it as a new gate, and note the per-element bound in the doc does NOT govern \
+         this post-w2 quantity"
+    );
+}
+
+/// `v4_swiglu_clamped` elementwise against a host transliteration, BIT FOR BIT.
+///
+/// Bitwise is legitimate here and nowhere else in this file: the kernel is one thread per
+/// element with no reduction, so there is no summation order to diverge from and none of
+/// `assert_close`'s justification applies. `docs/investigations/v4-flash-port.md`
+/// §"`assert_close` over bitwise at real dims" retracted a bitwise gate over a WAVE-REDUCED
+/// kernel at dim 4096; that argument is about the reduction, not about elementwise ops.
+///
+/// The inputs are adversarial by construction rather than by luck. `expf` is the only
+/// transcendental and HIP's need not agree with Rust's to the last bit, so a disagreement
+/// here is reported with the offending element rather than swept into a tolerance — if this
+/// ever goes red on `expf` alone, the right response is to say so, not to widen it.
+#[test]
+fn the_clamped_combine_is_bit_exact_elementwise() {
+    let limit = 10.0f32;
+    // Straddling the bound on both sides and at it, plus the values that make an asymmetric
+    // clamp distinguishable from a symmetric one and a bf16-first clamp from a clamp-first
+    // one: `10.001` rounds DOWN to 10.0 in bf16 (bf16 has 8 mantissa bits, so the codes near
+    // 10 are 2^-5 = 0.03125 apart), so clamping before the round and after it differ on it.
+    let probes: Vec<f32> = vec![
+        0.0, -0.0, 0.5, -0.5, 1.0, -1.0, 9.9, -9.9, 9.999, -9.999, 10.0, -10.0, 10.001,
+        -10.001, 10.0625, -10.0625, 12.0, -12.0, 40.0, -40.0, 1e3, -1e3,
+    ];
+    let (mut g, mut u) = (Vec::new(), Vec::new());
+    for &a in &probes {
+        for &b in &probes {
+            g.push(a);
+            u.push(b);
+        }
+    }
+    let n = g.len();
+    // The host side, written as the reference reads: bf16 both, clamp `up` both sides, `gate`
+    // per `gate_clamp`, `F.silu`'s MULTIPLY form, bf16 the product.
+    //
+    // ONE definition, taking the gate clamp as a function, because the two arms below differ in
+    // exactly that expression and nothing else — which is also precisely the difference between
+    // model.py:607 and the tidier wrong version. Two near-copies said the same thing worse, and
+    // jscpd refused them (59 tokens).
+    let combine = |gate_clamp: &dyn Fn(f32) -> f32| -> Vec<f32> {
+        g.iter()
+            .zip(&u)
+            .map(|(&gv, &uv)| {
+                let gt = gate_clamp(bf16_decode(bf16_encode(gv)));
+                let ut = bf16_decode(bf16_encode(uv)).clamp(-limit, limit);
+                bf16_decode(bf16_encode(silu(gt) * ut))
+            })
+            .collect()
+    };
+    // `torch.clamp(gate, max=self.swiglu_limit)` — ABOVE only. The reference.
+    let want = combine(&|x: f32| x.min(limit));
+    let (gb, ub) = (to_device(&f32b(&g)), to_device(&f32b(&u)));
+    let mut hb = zeros(n * 4);
+    let stream = HipStream::new().expect("hip stream");
+    // SAFETY: three live `n`-element f32 buffers, outliving the sync in `sync_f32`.
+    unsafe {
+        launch_v4_swiglu_clamped(
+            gb.ptr().cast(), ub.ptr().cast(), n, limit, hb.ptr_mut().cast(), stream.raw(),
+        )
+    }
+    .expect("v4_swiglu_clamped");
+    let got = sync_f32(&hb);
+    // **THE ASYMMETRY GATE's anti-vacuity arm, and it is HOST vs HOST.** The same probes under
+    // a SYMMETRIC gate clamp — the plausible wrong version, and the one
+    // `the_shared_expert_gate_clamp_matches_and_the_asymmetry_is_below_resolution` measured itself
+    // unable to see through the expert.
+    //
+    // `sym` against `want`, NOT against `got`, and the difference decides what a failure
+    // MEANS. Comparing the symmetric host arm to the DEVICE output conflates two causes: a
+    // narrowed probe table, and a kernel that genuinely is symmetric. The second is the whole
+    // defect this arm exists to catch, and it would have been reported as "the probe table has
+    // no gate value below -10" — sending the next reader to fix the fixture. Removing the
+    // kernel from the comparison makes the claim unambiguous: *these two host functions differ
+    // on this input set*, therefore a kernel can be asked which one it implements. That is the
+    // same oracle-vs-oracle rule the relocated test's own history produced, applied here.
+    //
+    // The kernel-facing half is the bitwise `want` vs `got` check below, which is where a
+    // symmetric kernel actually goes red.
+    let sym = combine(&|x: f32| x.clamp(-limit, limit));
+    let moved = sym.iter().zip(&want).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+    assert!(
+        moved > 0,
+        "the symmetric and asymmetric gate clamps are BIT-IDENTICAL over {} probe pairs, so \
+         no comparison against them could tell the reference's clamp from the tidier wrong \
+         one — the probe table has no gate value below -{limit}",
+        g.len()
+    );
+    println!("asymmetric vs symmetric gate clamp: {moved}/{} probe pairs differ", g.len());
+    // An EDIT TRIPWIRE, not a measurement, and worth being plain about which: `probes` is a
+    // literal fifteen lines up, so this folds to a constant on today's tree and can only go
+    // red if someone narrows that table. That is exactly the change it is here to stop — a
+    // probe set inside the bound would compare two functions the clamp never touches — but it
+    // is not evidence about anything the kernel does.
+    let clamped_any = g.iter().zip(&u).any(|(&a, &b)| a > limit || b.abs() > limit);
+    assert!(clamped_any, "no probe crosses the limit — the table was narrowed");
+    if let Some(i) = want.iter().zip(&got).position(|(a, b)| a.to_bits() != b.to_bits()) {
+        panic!(
+            "element {i} differs: g={:?} u={:?} want={:?} ({:#010x}) got={:?} ({:#010x})",
+            g[i], u[i], want[i], want[i].to_bits(), got[i], got[i].to_bits()
+        );
+    }
+}
+
+/// The new launcher's guards, by CODE — including the one that matters most.
+///
+/// Two rows matter here and they are the same defect from opposite ends of the float line —
+/// both are values that make the clamp VANISH rather than values that make it fail loudly:
+///
+/// - **NaN**, which a `limit <= 0.0f` guard admits, because every comparison against NaN is
+///   false. `fminf(gt, NaN)` returns `gt` (`fminf` returns the non-NaN operand).
+/// - **+inf**, which `!(limit > 0.0f)` admits. `fminf(gt, inf)` is `gt` and
+///   `fmaxf(ut, -inf)` is `ut`, so the clamp is simply gone.
+///
+/// The guard is therefore `!(limit > 0.0f && limit < INFINITY)` in `kernels/linalg.hip`, which
+/// is the two-sided spelling — an earlier draft of this doc quoted the one-sided
+/// `!(limit > 0.0f)`, which is what let the `+inf` row be missing in the first place. Code
+/// 1006 is deliberately the same one `moe.hip`'s fp4 launcher returns for the same check on
+/// the same argument, and that launcher had the identical hole.
+#[test]
+fn v4_swiglu_clamped_guards() {
+    let mut b = zeros(64);
+    let (p, pm) = (b.ptr().cast::<f32>(), b.ptr_mut().cast::<f32>());
+    let nul = std::ptr::null_mut();
+    // `null_mut()` for the stream: every case is rejected before `hipLaunchKernelGGL`, so
+    // there is no launch for a stream to order.
+    // SAFETY: each call returns at an argument guard, before any pointer is read.
+    assert_guards(unsafe {
+        vec![
+            (1001, "zero elements", launch_v4_swiglu_clamped(p, p, 0, 10.0, pm, nul)
+                .map_err(|e| e.to_string())),
+            (1006, "an unclamped limit", launch_v4_swiglu_clamped(p, p, 16, 0.0, pm, nul)
+                .map_err(|e| e.to_string())),
+            (1006, "a negative limit", launch_v4_swiglu_clamped(p, p, 16, -1.0, pm, nul)
+                .map_err(|e| e.to_string())),
+            (1006, "a NaN limit", launch_v4_swiglu_clamped(p, p, 16, f32::NAN, pm, nul)
+                .map_err(|e| e.to_string())),
+            // +inf is the case a `!(limit > 0.0f)` guard ADMITS, and it disables the clamp
+            // exactly as thoroughly as `limit = 0` would: `fminf(gt, inf)` is `gt`. It sits
+            // next to the NaN row deliberately — the two are the same defect from opposite
+            // ends of the float line, and having only one of them on the page is how the
+            // other stayed open.
+            (1006, "an infinite limit", launch_v4_swiglu_clamped(p, p, 16, f32::INFINITY, pm, nul)
+                .map_err(|e| e.to_string())),
+        ]
+    });
+}
+
+/// The bit pattern of the fp4 dispatch, printed — the instrument for the 2026-08-05 hoist of
+/// the clamp out of `moe_gateup_f4_impl` and into `common.hpp::swiglu_clamped`.
+///
+/// That hoist had to be arithmetically inert, and "had to be" is not evidence. The hoist is
+/// five lines moving across a `__forceinline__` boundary; the association is preserved by
+/// hand (`swiglu_clamped` returns `(silu · up)` and the caller applies `· w`, which is the
+/// `((silu · up) · w)` the inline form computed), but **FMA contraction is uncontrolled
+/// tree-wide** — `build.rs:67` gives hipcc only `--offload-arch -O3 -fPIC` and clang's HIP
+/// default is `-ffp-contract=fast` — so a function boundary can change codegen even where the
+/// arithmetic is identical.
+///
+/// So it was measured, by running this test with `moe_gateup_f4_impl` reverted to the inline
+/// form and again with the hoist, and comparing the printed hash. The result is in the commit
+/// that made the change. This test stays because the hash is the cheapest possible tripwire
+/// on any future edit to that helper: it does not assert a value (a hard-coded hash would be
+/// a golden tied to one compiler and one GPU), it PRINTS one, next to the oracle comparison
+/// that says the value is also correct.
+#[test]
+fn the_fp4_dispatch_hash_pins_the_clamp_hoist() {
+    let c = Case::new(0, "moe-x-big", 48.0);
+    assert!(c.clamp_events > 0, "the hoisted clamp must be exercised by the case that pins it");
+    let got = c.gpu();
+    // FNV-1a over the bit patterns. Order-sensitive and 64-bit, so two runs that agree here
+    // agree element for element; a sum or an XOR would not say that.
+    let h = got.iter().fold(0xcbf2_9ce4_8422_2325u64, |a, v| {
+        (a ^ u64::from(v.to_bits())).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    println!("fp4 dispatch hash (clamp hoist tripwire): {h:#018x}");
+    assert_matches(&c.want, &got, "fp4 dispatch behind the hoisted clamp");
 }
 
 // =======================================================================================

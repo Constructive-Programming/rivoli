@@ -735,6 +735,7 @@ mod device {
         launch_v4_compress_state, launch_v4_dense_gemm_bf16, launch_v4_indexer_spread,
     };
     use anyhow::{Result, ensure};
+    use std::ffi::c_void;
 
     /// Every device pointer one `compress` call reads or writes.
     ///
@@ -779,18 +780,41 @@ mod device {
     /// decode is every position that does not complete a block. A zero return is not a
     /// failure; it is the reference's own control flow, and the state writes still happened.
     ///
-    /// Runs on the NULL stream. [`launch_v4_act_quant`] is S2b's and takes no stream
-    /// parameter, so threading one through here would put the last step of the pipeline on
-    /// a different stream from the four before it.
+    /// # Runs entirely on `stream`, and the earlier decline recorded here is REVERSED
     ///
-    /// **It is not one launcher, and requirement 9 says it is.** Counted on the merged tree
-    /// 2026-08-05: **six** of the launchers the V4 path uses take no stream, and they are
-    /// exactly S2b's set — the whole of `attn::v4::attention`. Giving this one a stream
-    /// would make the sentence above true and leave the attention block entirely on the null
-    /// stream, which is a comment asserting a property that does not hold. All six move
-    /// together, and with the `.f4` streaming pool that would give them something to overlap
-    /// with; neither exists yet. The names and the decision are in
-    /// `docs/investigations/v4-flash-port.md` §"The prerequisite inventory was taken again".
+    /// This function used to run on the null stream, handing `null` to the four compress
+    /// launchers that already took one, and this doc argued the fifth step
+    /// ([`launch_v4_act_quant`]) should not gain a stream because that would leave it on a
+    /// different stream from the four before it. Both halves of that have gone:
+    ///
+    /// - The premise it rested on — "with the `.f4` streaming pool that would give them
+    ///   something to overlap with; neither exists yet" — died when the pool landed and was
+    ///   measured at **1.082 ms/miss, 12.36 GB/s, `slot_stalls` 0** over the real 137.06 GiB
+    ///   expert set. There is now a routed fetch on every layer to hide compute behind.
+    /// - The count it stated was **short**, and by exactly the mechanism it was warning
+    ///   about. It said "**six** of the launchers the V4 path uses take no stream, and they
+    ///   are exactly S2b's set — the whole of `attn::v4::attention`". But
+    ///   `attn::v4::attention` also makes six `memcpy_dtod` calls, and `memcpy_dtod` is a
+    ///   BLOCKING `hipMemcpy`, not a launcher: host-blocking hid the hazard while the whole
+    ///   block sat on stream 0, and it becomes a read racing a stream-ordered write the
+    ///   moment the launchers move. The set is seven, and
+    ///   [`crate::backend::hip::memcpy_dtod_async`] is the seventh.
+    ///
+    /// This function is on `stream` because the hand-off requires it: it writes `b.fin.out`,
+    /// which at prefill is `s.kv`'s tail — the same buffer `attn::v4::attention` reads through
+    /// `sparse_attn`. rivoli's streams are `hipStreamNonBlocking` (`async.hip`), so leaving
+    /// the compressor on the null stream while attention runs on a stream would leave that
+    /// hand-off unordered. **Pass the SAME stream to both**, in the reference's order
+    /// (compressor, then attend).
+    ///
+    /// That pairing does not exist yet — as of 2026-08-05 the only caller of either function is
+    /// a test harness, and the V4 layer loop that would put them back to back is being written
+    /// separately. So the paragraph above is a REQUIREMENT ON THAT CALLER rather than a
+    /// description of something the tree does, and it is stated here because this is where its
+    /// reader is.
+    ///
+    /// The names and the history are in `docs/investigations/v4-flash-port.md`
+    /// §"The prerequisite inventory was taken again" (item 5) and requirement 9.
     ///
     /// # The caller must place `out` at BOTH destinations at prefill
     ///
@@ -824,13 +848,16 @@ mod device {
     /// `attn.rs`.
     ///
     /// # Safety
-    /// Every pointer in `b` must satisfy the shape contract on its field and outlive the
-    /// call; this function synchronizes nothing.
+    /// Every pointer in `b` must satisfy the shape contract on its field and must outlive
+    /// `stream`'s completion — not merely the call, which returns as soon as the last
+    /// operation is *enqueued*. This function synchronizes nothing. `stream` is a live
+    /// `hipStream_t`, or null for the default stream.
     pub unsafe fn compress(
         g: &Geom,
         b: &Buffers,
         seqlen: usize,
         start_pos: usize,
+        stream: *mut c_void,
     ) -> Result<usize> {
         // `(seqlen, start_pos)`, the same pair `should_compress`, `window_topk` and
         // `compress_topk` above take and the same pair `Compressor.forward` takes. An enum
@@ -855,7 +882,6 @@ mod device {
         // and no guard anywhere sees it. `from_ratio` is exact here: `Geom::attention` refuses
         // `Plain`, so the only ratios that reach this are 4 and the non-overlapping ones.
         let kind = LayerKind::from_ratio(ratio);
-        let null = std::ptr::null_mut();
 
         // `kv = self.wkv(x)`, `score = self.wgate(x)` (model.py:329-330), then the state
         // deposit — which runs in BOTH phases and BEFORE the emit decision, because the
@@ -866,8 +892,8 @@ mod device {
         let slot0 = start_pos % ratio;
         // SAFETY: caller's contract on `b`; both GEMMs write scratch checked above.
         unsafe {
-            launch_v4_dense_gemm_bf16(b.x, b.wkv, b.kv, seqlen, g.cd(), b.dim, null)?;
-            launch_v4_dense_gemm_bf16(b.x, b.wgate, b.score, seqlen, g.cd(), b.dim, null)?;
+            launch_v4_dense_gemm_bf16(b.x, b.wkv, b.kv, seqlen, g.cd(), b.dim, stream)?;
+            launch_v4_dense_gemm_bf16(b.x, b.wgate, b.score, seqlen, g.cd(), b.dim, stream)?;
             launch_v4_compress_state(
                 b.kv,
                 b.score,
@@ -877,7 +903,7 @@ mod device {
                 g.abi(),
                 seqlen,
                 slot0,
-                null,
+                stream,
             )?;
         }
 
@@ -890,13 +916,15 @@ mod device {
             let nblk = seqlen / ratio;
             // SAFETY: as above; `b.fin.out` is `nblk · d` by its field contract.
             unsafe {
-                launch_v4_compress_prefill(b.kv, b.score, b.ape, &b.fin, g.abi(), nblk, null)?;
+                launch_v4_compress_prefill(b.kv, b.score, b.ape, &b.fin, g.abi(), nblk, stream)?;
             }
             nblk
         } else {
             // SAFETY: as above; `b.fin.out` is one row of `d` by its field contract.
             unsafe {
-                launch_v4_compress_pool_decode(b.kv_state, b.score_state, &b.fin, g.abi(), start_pos, null)?;
+                launch_v4_compress_pool_decode(
+                    b.kv_state, b.score_state, &b.fin, g.abi(), start_pos, stream,
+                )?;
             }
             1
         };
@@ -918,7 +946,7 @@ mod device {
                 // would be the third (see `kernels/v4compress.hip`'s header).
                 // SAFETY: `b.fin.out` is `emitted · d` writable f32 by the field's contract.
                 Quantize::PartialFp8 => unsafe {
-                    launch_v4_act_quant(b.fin.out, emitted, d, d - rd, 64)?
+                    launch_v4_act_quant(b.fin.out, emitted, d, d - rd, 64, stream)?
                 },
                 // model.py:374-376 `rotate_activation(kv)` then `fp4_act_quant(kv, 32, True)`
                 // — the WHOLE row, `rd` included. Note what this does NOT do: it takes no
@@ -927,7 +955,7 @@ mod device {
                 // direction.
                 // SAFETY: as above; the spread reads and writes `emitted · d` in place.
                 Quantize::HadamardFp4 => unsafe {
-                    launch_v4_indexer_spread(b.fin.out, emitted, d, null)?
+                    launch_v4_indexer_spread(b.fin.out, emitted, d, stream)?
                 },
             }
         }

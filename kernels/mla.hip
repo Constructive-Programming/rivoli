@@ -472,8 +472,28 @@ extern "C" __global__ void v4_gemv_fp8(const float* __restrict__ x,
 // ── V4 launchers ────────────────────────────────────────────────────────────────────
 // Return codes follow this file's convention: 0 ok, POSITIVE argument guard, NEGATIVE
 // -hipError. All pointers device-resident; launch-only.
+//
+// **Every one takes a `stream`, and they took none until 2026-08-05.** These five plus
+// `attn.hip::rivoli_v4_sparse_attn` are the whole of `attn::v4::attention`, and they were
+// declined a stream once on the grounds that "there is nothing to overlap with". That
+// premise died when the `.f4` routed streaming pool landed and was measured at 1.082
+// ms/miss, 12.36 GB/s over the real 137.06 GiB expert set: there is now a fetch to overlap
+// compute with on every layer.
+//
+// They convert as a SET, and that is a correctness property rather than tidiness. rivoli's
+// streams are created `hipStreamNonBlocking` (`async.hip`), so the null stream carries no
+// implicit ordering against them — a stream-capable launcher next to a null-stream
+// neighbour reading the same buffer is an unordered activation, i.e. a silent wrong, which
+// is strictly worse than leaving the whole block on the null stream. The seventh member of
+// the set is not a launcher at all: `linalg.hip::rivoli_memcpy_dtod` is a BLOCKING
+// `hipMemcpy` and the block interleaves six of them with these launches, so it needed an
+// `_async` twin for the same reason. See that function's note.
+//
+// `stream` is trailing on all of them, matching `rivoli_hc_pre`/`rivoli_v4_dense_gemm_bf16`,
+// and `nullptr` is the null stream — so a caller that has no stream yet is unchanged.
 
-extern "C" int rivoli_v4_act_quant(float* x, int rows, int row_stride, int n, int block) {
+extern "C" int rivoli_v4_act_quant(float* x, int rows, int row_stride, int n, int block,
+                                   void* stream) {
     if (rows <= 0 || n <= 0 || block <= 0 || row_stride < n) return 1001;
     // `kernel.py::act_quant` asserts `N % block_size == 0`. Without this a ragged tail
     // block would be quantized against its own amax and produce values the reference
@@ -484,30 +504,33 @@ extern "C" int rivoli_v4_act_quant(float* x, int rows, int row_stride, int n, in
     if (n % block) return 1004;
     size_t total = (size_t)rows * (size_t)(n / block);
     hipGetLastError();
-    hipLaunchKernelGGL(v4_act_quant, dim3((unsigned)((total + 255) / 256)), dim3(256), 0, 0, x,
-                       rows, row_stride, n, block);
+    hipLaunchKernelGGL(v4_act_quant, dim3((unsigned)((total + 255) / 256)), dim3(256), 0,
+                       (hipStream_t)stream, x, rows, row_stride, n, block);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-extern "C" int rivoli_v4_rmsnorm(float* x, const float* w, int rows, int d, float eps) {
+extern "C" int rivoli_v4_rmsnorm(float* x, const float* w, int rows, int d, float eps,
+                                 void* stream) {
     if (rows <= 0 || d <= 0) return 1001;
     hipGetLastError();
-    hipLaunchKernelGGL(v4_rmsnorm, dim3((unsigned)rows), dim3(256), 0, 0, x, w, d, eps);
+    hipLaunchKernelGGL(v4_rmsnorm, dim3((unsigned)rows), dim3(256), 0, (hipStream_t)stream, x, w,
+                       d, eps);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-extern "C" int rivoli_v4_qk_norm(float* q, int rows, int d, float eps) {
+extern "C" int rivoli_v4_qk_norm(float* q, int rows, int d, float eps, void* stream) {
     if (rows <= 0 || d <= 0) return 1001;
     hipGetLastError();
-    hipLaunchKernelGGL(v4_qk_norm, dim3((unsigned)rows), dim3(256), 0, 0, q, d, eps);
+    hipLaunchKernelGGL(v4_qk_norm, dim3((unsigned)rows), dim3(256), 0, (hipStream_t)stream, q, d,
+                       eps);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
 
 extern "C" int rivoli_v4_rope(float* x, const float* tbl, int rows, int row_len, int rd,
-                              int pos0, int rows_per_pos, int inverse) {
+                              int pos0, int rows_per_pos, int inverse, void* stream) {
     if (rows <= 0 || row_len <= 0 || rd <= 0 || rows_per_pos <= 0 || pos0 < 0) return 1001;
     if (rd > row_len) return 1002;
     // `view_as_complex` needs an even count to pair, and the table holds rd/2 pairs.
@@ -516,14 +539,15 @@ extern "C" int rivoli_v4_rope(float* x, const float* tbl, int rows, int row_len,
     if (rd & 1) return 1005;
     if (rows % rows_per_pos) return 1004;
     hipGetLastError();
-    hipLaunchKernelGGL(v4_rope, dim3((unsigned)rows), dim3(256), 0, 0, x, tbl, row_len, rd, pos0,
-                       rows_per_pos, inverse);
+    hipLaunchKernelGGL(v4_rope, dim3((unsigned)rows), dim3(256), 0, (hipStream_t)stream, x, tbl,
+                       row_len, rd, pos0, rows_per_pos, inverse);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
 
 extern "C" int rivoli_v4_gemv_fp8(const float* x, const unsigned char* w, const float* wscale,
-                                  int m, int n_out, int k, int block, int groups, float* out) {
+                                  int m, int n_out, int k, int block, int groups, float* out,
+                                  void* stream) {
     if (m <= 0 || n_out <= 0 || k <= 0 || block <= 0 || groups <= 0) return 1001;
     if (block & (block - 1)) return 1003;  // blk_shift needs a power-of-two tile
     // A `groups` that does not divide `n_out` would send the last partial group's rows to
@@ -533,8 +557,8 @@ extern "C" int rivoli_v4_gemv_fp8(const float* x, const unsigned char* w, const 
     hipGetLastError();
     hipLaunchKernelGGL(v4_gemv_fp8,
                        dim3((unsigned)((total + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK)),
-                       dim3(ROWS_PER_BLOCK * WAVE), 0, 0, x, w, wscale, m, n_out, k, block,
-                       groups, out);
+                       dim3(ROWS_PER_BLOCK * WAVE), 0, (hipStream_t)stream, x, w, wscale, m, n_out,
+                       k, block, groups, out);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

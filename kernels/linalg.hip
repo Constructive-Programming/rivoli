@@ -259,6 +259,60 @@ extern "C" __global__ void swiglu(
     h[i] = (gv / (1.0f + expf(-gv))) * u[i];
 }
 
+// DeepSeek-V4's `Expert.forward` combine for the resident fp8 SHARED expert:
+// h[i] = bf16( silu(min(bf16(g[i]), L)) · clamp(bf16(u[i]), ±L) ).
+//
+// Sits here, directly under `swiglu`, so that the two are readable side by side — because
+// the interesting fact about them is that they are NOT the same function with a parameter,
+// and that is not obvious from either one alone. At NO value of `L` do they agree. Beyond
+// the clamp there are three differences, every one of them a defect the oracle can name:
+//
+//   * this bf16-rounds BOTH operands before combining (`Linear` stores bf16 and
+//     `Expert.forward` reads it back with `.float()`) — `Defect::NoBf16Rounding`;
+//   * this uses `F.silu`'s multiply form `x·sigmoid(x)`, not `swiglu`'s division form
+//     `x/(1+e^-x)` — one rounding apart, which `common.hpp::swiglu_clamped` point 3 says
+//     "would normally vanish under the bf16 store ... except exactly at a rounding
+//     boundary". **UNDEMONSTRATED, and say so: measured 2026-08-05, swapping the two forms
+//     in `moe_gateup_f4_impl` left the fp4 dispatch BIT-IDENTICAL across all 512 outputs.**
+//     That is the predicted result for a fixture that misses the boundary — it does not
+//     refute the reasoning, but no test in this tree exercises the case. An earlier draft of
+//     this line dropped the conditional and read as though the difference were routine;
+//   * this bf16-rounds the RESULT, which is the reference's `x.to(dtype)` before `w2`.
+//
+// So adding an `L` parameter to `swiglu` and passing something meaning "unclamped" from
+// GLM's four call sites could not have produced this kernel — it would have produced GLM's
+// arithmetic under a V4 name, which is the silent-wrong this whole port is built to avoid.
+// GLM has no `swiglu_limit` and never should: `rivoli_v4_swiglu_clamped` refuses
+// `L <= 0` (and NaN) exactly as `moe.hip`'s fp4 launcher does, so "unclamped" is not
+// spellable THROUGH THIS ENTRY POINT. Note what that does and does not buy as of
+// 2026-08-05: V4's shared expert has no caller yet, so nothing is currently prevented from
+// reaching for `swiglu` above instead — the guard makes the mistake unspellable here, not
+// unreachable everywhere. The launcher's Rust doc carries the same warning where a caller
+// will read it.
+//
+// The clamp itself is `common.hpp::swiglu_clamped`, shared with `moe_gateup_f4_impl`. The
+// routed fp4 experts and the shared fp8 expert must run the SAME arithmetic — `MoE.__init__`
+// hands `swiglu_limit` to both (model.py:632) — and two copies in `kernels/` would be
+// invisible to jscpd, which does not scan this directory.
+//
+// No routing weight, and that is the reference, not an omission: `MoE.forward` calls
+// `self.shared_experts(x)` with no `weights` argument (model.py:648). So unlike the fp4
+// path there is nothing to fold in before the store, and no `w == 0` NaN launder to carry.
+//
+// Safe in place (`h` may alias `g` or `u`), exactly as `swiglu` above and for the same
+// reason: each thread performs both reads, then one write, and that write DEPENDS on both
+// reads, so there is no ordering for the `__restrict__` qualifiers to license that would
+// observe the overwrite. `gpu.rs` already launches `swiglu` this way (`h == g`), which is
+// what the shared expert wants too — `g`'s buffer becomes `h` and then `w2`'s input, one
+// fewer scratch allocation per layer.
+extern "C" __global__ void v4_swiglu_clamped(
+    const float* __restrict__ g, const float* __restrict__ u, int n, float limit,
+    float* __restrict__ h) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    h[i] = rbf16(swiglu_clamped(g[i], u[i], limit));
+}
+
 // y[i] = x[i]·(1/sqrt(mean(x²)+eps))·w[i] — RMSNorm, matching math.rs. One block
 // reduces Σx² in LDS (tree order), then every thread scales.
 extern "C" __global__ void rmsnorm(
@@ -576,13 +630,19 @@ extern "C" int rivoli_gemv_i8(
     return e == hipSuccess ? 0 : -(int)e;
 }
 
+// Takes a STREAM, unlike the other GEMVs in this file, and it is the odd one out because of
+// DeepSeek-V4 rather than GLM: this is the router-gate GEMV (`Gate.forward`'s
+// `linear(x.float(), weight.float())`), so on the V4 layer path it sits between two launchers
+// that take one. `nullptr` is the null stream, so every existing caller is unchanged. The full
+// argument, and why this is not a V4-only twin launcher, is on `hip.rs::launch_gemv_f32` —
+// stated once, where a caller reads it.
 extern "C" int rivoli_gemv_f32(const float* x, const float* w, int o_dim, int i_dim, int nrow,
-                               float* y) {
+                               float* y, void* stream) {
     if (o_dim <= 0 || i_dim <= 0) return 1001;
     if (nrow != 1 && nrow != 2) return 1004;  // R is a template parameter — see gemv_fp8
     hipGetLastError();
-    hipLaunchKernelGGL(nrow == 2 ? gemv_f32_r2 : gemv_f32, ROW_GRID(o_dim), ROW_BLOCK, 0, 0,
-                       x, w, o_dim, i_dim, y);
+    hipLaunchKernelGGL(nrow == 2 ? gemv_f32_r2 : gemv_f32, ROW_GRID(o_dim), ROW_BLOCK, 0,
+                       (hipStream_t)stream, x, w, o_dim, i_dim, y);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
@@ -591,6 +651,54 @@ extern "C" int rivoli_swiglu(const float* g, const float* u, int n, float* h) {
     if (n <= 0) return 1001;
     hipGetLastError();
     hipLaunchKernelGGL(swiglu, dim3((n + 255) / 256), dim3(256), 0, 0, g, u, n, h);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+// Takes a STREAM, unlike `rivoli_swiglu` directly above. Same reason `rivoli_hc_pre` gives
+// below: rivoli's streams are `hipStreamNonBlocking` (`async.hip`), so the null stream does
+// not implicitly order against them, and this runs between two `rivoli_v4_gemv_fp8` launches
+// that are now stream-parameterised. A null-stream combine between two stream-ordered GEMVs
+// reads `g`/`u` before they are written — an unordered activation, which is a silent wrong.
+extern "C" int rivoli_v4_swiglu_clamped(const float* g, const float* u, int n, float limit,
+                                        float* h, void* stream) {
+    if (n <= 0) return 1001;
+    // 1006, and deliberately the SAME code AND the same expression as `moe.hip`'s fp4
+    // launcher, for the same check on the same argument — a reader who learned it there gets
+    // it here. Both refuse every value that would disable the clamp, and getting to that took
+    // two passes:
+    //
+    //   * `limit <= 0.0f` admits NaN, because every comparison against NaN is false. A NaN
+    //     limit makes `fminf(gt, limit)` return `gt` — `fminf` returns the non-NaN operand —
+    //     so it degrades silently to the unclamped form rather than producing NaN output
+    //     someone would notice. Hence `!(limit > 0.0f)`.
+    //   * `!(limit > 0.0f)` admits +INFINITY, which is the SAME destination and quieter still:
+    //     `fminf(gt, inf)` is `gt` and `fmaxf(ut, -inf)` is `ut`, so the clamp vanishes
+    //     entirely. Found 2026-08-05 — the first bullet closed the case in mind and left the
+    //     one beside it open, which is the shape this port keeps producing.
+    //
+    // The compare form rather than `isfinite()`, following `fwd.hip:224` — but NOT for the
+    // reason that comment gives. It says the compare form "avoids depending on `-ffast-math`
+    // having left `isfinite()` meaningful", and neither half holds here: `build.rs:67` passes
+    // hipcc only `--offload-arch -O3 -fPIC`, so `-ffast-math` is not in play at all, and if it
+    // were, `-ffinite-math-only` would fold `limit < INFINITY` to `true` exactly as readily as
+    // it folds `isfinite()`. The compare form is kept for consistency with `fwd.hip` and
+    // because it is one expression covering all four rejected values; it buys no extra
+    // robustness. Corrected 2026-08-05 — the code was right and the reason was not.
+    //
+    // **This guard is the ONLY thing rejecting +inf, and an earlier version of this comment
+    // said the opposite.** It claimed `V4Config::validate` required a finite positive
+    // `swiglu_limit` upstream, making this the redundant half. It does not:
+    // `artifact/model.rs:726` is `ensure!(self.swiglu_limit > 0.0, ...)`, which rejects NaN
+    // and zero and **admits +inf** — the identical one-sided spelling, in the identical
+    // shape, one layer up. Checked 2026-08-05 rather than assumed, which is the only reason
+    // this line is not still wrong. The upstream hole is recorded in
+    // `docs/investigations/v4-flash-port.md`; fixing it is `artifact/`'s call, and until it
+    // happens this launcher is the whole defence.
+    if (!(limit > 0.0f && limit < INFINITY)) return 1006;
+    hipGetLastError();
+    hipLaunchKernelGGL(v4_swiglu_clamped, dim3((unsigned)((n + 255) / 256)), dim3(256), 0,
+                       (hipStream_t)stream, g, u, n, limit, h);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
@@ -690,5 +798,31 @@ extern "C" int rivoli_device_sync() {
 // regions never overlap.
 extern "C" int rivoli_memcpy_dtod(void* dst, const void* src, size_t bytes) {
     hipError_t e = hipMemcpy(dst, src, bytes, hipMemcpyDeviceToDevice);
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+// STREAM-ORDERED device-to-device copy, for a pipeline whose kernels are on a stream.
+//
+// A separate entry point rather than a `stream` parameter on `rivoli_memcpy_dtod`, because
+// the two are not the same operation with a knob — the one above BLOCKS THE HOST, and the
+// arena relocation it serves needs exactly that. `memory/routed.rs` moves an expert's slot
+// while later reads may still resolve to the old address, and this repo has a measured
+// defect from a read outliving its layer and getting its slot copied out from under it
+// (9 of 8452 reads at `--max-mem 30`, non-deterministic output; pins do not stop
+// compaction). Making that path stream-ordered would replace a host barrier with a
+// per-stream one and reopen it. So: two names, and the blocking one keeps its callers.
+//
+// Why this exists at all — DeepSeek-V4's attention block interleaves six device-to-device
+// copies with sixteen kernel launches (`attn.rs::v4::attention`: `x -> xq`, `qr -> qrq`, and
+// four KV ring writes, of which one or two run depending on the phase). Once those kernels take a stream, a blocking `hipMemcpy` between two of them
+// does NOT wait on the stream: rivoli's streams are `hipStreamNonBlocking` (`async.hip`), so
+// the null stream has no implicit ordering against them. The copy would read `s.qr` before
+// `v4_rmsnorm` wrote it. Found 2026-08-05 while converting that block's six launchers —
+// converting six of the seven operations would have introduced the very race the earlier
+// decline of the partial fix predicted.
+extern "C" int rivoli_memcpy_dtod_async(void* dst, const void* src, size_t bytes,
+                                        void* stream) {
+    hipError_t e = hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToDevice,
+                                  (hipStream_t)stream);
     return e == hipSuccess ? 0 : -(int)e;
 }

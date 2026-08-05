@@ -2376,13 +2376,36 @@ pub unsafe fn launch_gemv_f32(
     i_dim: usize,
     nrow: usize,
     y: *mut f32,
+    stream: *mut std::ffi::c_void,
 ) -> Result<()> {
+    // Mirrors the `stream` the HIP twin took for DeepSeek-V4's router gate (2026-08-05), and
+    // it has to: `gpu.rs` reaches `launch_gemv_f32` through `crate::backend`, so a HIP-only
+    // signature change would not compile under `--features vulkan` at all.
+    //
+    // Behaviour-preserving at every existing call site. `Q::parse` maps 0 AND 1 to `Q::Main`,
+    // deliberately — "to keep reading NULL as `Main` from a HIP-shaped call site" — and
+    // `dispatch` is defined as exactly `dispatch_2d_on(Q::Main, p, push, groups_x, 1)`. So a
+    // `null_mut()` caller lands on the queue it landed on before, with the same grid.
+    //
+    // No V4 caller reaches this, and the honest statement of why is narrower than "V4 refuses
+    // under Vulkan": `Config::validate_backend` refuses on `Mode`/`AttnMode` and never on
+    // model family, and V4 has no decode path wired on EITHER backend yet. What is true is
+    // that `attn::v4` is `#[cfg(feature = "rocm")]`, so V4's own launchers cannot be named
+    // here. This exists for the parity rule, not for a caller.
+    //
+    // `Q::parse` AFTER the argument guards, not before, and it was the other way round for one
+    // draft. It is fallible, and putting it first meant that the day someone passes a real
+    // queue tag together with a bad `o_dim`, they get "stream token … is not one of this
+    // backend's queue tags" instead of the dimension error — a misleading message for a
+    // dimension bug. Unreachable today (every caller passes null, which always parses), which
+    // is exactly why it would have sat here until it was not.
     ensure!(o_dim > 0 && i_dim > 0, "gemv_f32: argument guard rejected");
     ensure!(
         nrow == 1,
         "gemv_f32: nrow={nrow} — batched token rows are not implemented on Vulkan \
          (the .comp shaders are single-row); use --features rocm"
     );
+    let q = Q::parse(stream)?;
     let g = gpu()?;
     let push = GemvF32Push {
         x: x as u64,
@@ -2391,10 +2414,12 @@ pub unsafe fn launch_gemv_f32(
         o_dim: o_dim as i32,
         i_dim: i_dim as i32,
     };
-    g.dispatch(
+    g.dispatch_2d_on(
+        q,
         &g.pipes.gemv_f32,
         &push,
         o_dim.div_ceil(ROWS_PER_BLOCK as usize) as u32,
+        1,
     )
 }
 

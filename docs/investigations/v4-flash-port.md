@@ -629,6 +629,21 @@ is now: **develop on the dev profile, and use `--release` for benchmarks and per
 evaluation only.** The 32 `debug_assert!`s are live again for anyone following it, with no
 code change at all.
 
+**What the dev profile COSTS, measured 2026-08-05 rather than assumed.** The same
+`tests/v4_compress_kernel.rs` took **719 s** on the dev profile against **43 s** under
+`--release` on the integration branch — **~17x**. That is not spread evenly: it lands on the
+oracle-heavy suites, because `src/v4oracle/` is a 4000-line CPU transliteration and an
+unoptimised build pays for every element of it. The device work is unaffected; `--lib`
+(98 tests) still finishes in 1.98 s and `v4_head_tail` in 0.30 s.
+
+The trade is still right — 32 live `debug_assert!`s for host-side work is worth minutes — but
+budget for it, and know the discriminator, because **17x makes a healthy run look like a
+hang** and this repo has a real hang to confuse it with. Compare ELAPSED against USER CPU:
+`ps -o etimes=` beside `/proc/<pid>/stat` field 14. At 96-99% of one thread the process is
+compute-bound in the oracle and is fine; a genuine device wedge sits near 0% with threads in
+`kfd_wait_on_events` and no CPU accumulating. The parallel-libtest hang is a third case again
+and has its own signature (one io_uring ring per test) — `--test-threads=1` is not optional.
+
 What remains true and worth carrying: a `debug_assert!` fires only for someone who follows
 that rule, so a check that must hold in a shipped binary is an `assert!`/`ensure!` and pays
 its cost. `v4compress.rs`'s pair — whose doc calls them "what ENFORCES the bsz=1 scope cut" —
@@ -771,6 +786,23 @@ the wiring, not suggestions:
    `hc_post`'s `y` must not alias `residual`. `Buffers` enforces only `scratch_rows`.
 9. **`act_quant` runs on the null stream** — S2b's launcher takes no stream argument. Must
    be fixed before an overlapped layer loop, or the streaming design is defeated silently.
+   — *PAID 2026-08-05, and it was SEVEN operations, not one, and not six. This requirement
+   named one launcher; §"The prerequisite inventory was taken again" item 5 corrected it to
+   six and declined it on the grounds that the `.f4` pool did not exist to overlap with.
+   Both numbers were wrong in the same direction. The pool landed (1.082 ms/miss, 12.36
+   GB/s, `slot_stalls` 0 over the real 137.06 GiB set), which killed the premise; and
+   `attn::v4::attention` also makes six `memcpy_dtod` calls, which are not launchers —
+   `linalg.hip::rivoli_memcpy_dtod` is a BLOCKING `hipMemcpy`, so host-blocking hid the
+   hazard while the whole block sat on stream 0 and it becomes a read racing a
+   stream-ordered write the moment the launchers move. Paying the six alone would have
+   introduced exactly the race the decline predicted. All six launchers plus a new
+   `memcpy_dtod_async` now take a trailing `stream`, as do `attn::v4::attention` and
+   `v4compress::compress`. `tests/v4_attn.rs::the_attention_block_is_entirely_on_its_stream`
+   gates it by parking the stream on a `Timeline` wait and asserting all nine destinations
+   still hold distinct poison. TWO null-stream holes remain on the V4 path and are
+   recorded rather than closed: `launch_gemv_f32` (the router logits — GLM's launcher, both
+   backends, callers in `gpu.rs`), and `launch_argmax`/sampling, which sits after the head
+   behind the end-of-forward sync and is accepted as-is.*
 10. `tid2eid` entries and e8m0 `0x00`/`0xff` scale bytes must be rejected **at load**; the
     kernels cannot.
 
@@ -965,6 +997,83 @@ back to the ratio-0 prediction, source 1 is confirmed and the remaining gap is s
 That control run is the measurement to make first; without it a compressed-layer number
 cannot be attributed at all.
 
+### An anti-vacuity arm that touches no code under test — S3-swiglu-streams, 2026-08-05
+
+Write the arm that compares the ORACLE to the ORACLE, not the kernel to the oracle. Its
+failure cannot be misread as a fault in the thing being tested, and that is the whole value.
+
+The case. `the_shared_expert_clamps_the_gate_from_above_only` was built to reject
+`Defect::SwigluClampGateBothSides` — clamping the SwiGLU gate from below as well, which is one
+`fmaxf` and reads as a tidier symmetry. Four arms: the fixture reaches gate values below
+`-limit` (measured from `swiglu_clamp_events`), the kernel matches the asymmetric oracle, the
+kernel differs from the symmetric oracle, **and the two oracles differ from each other.**
+
+That fourth arm is the one that failed on the GPU:
+
+```text
+shared expert: 12 gate values below -10 at scale 48
+the two clamp shapes on this fixture: err=3.125e-2  tol=9.424e-2   (max |want| = 1.206e1)
+```
+
+The fixture reaches the case — twelve elements of it — and the two clamp shapes still agree to
+a third of the tolerance. So the third arm could not have passed either, at any activation
+scale, and the test as written **could never reach a green regardless of what the kernel did**.
+Same shape as the four dead guards above and as this stage's `assert!(p.m <= d.window)` where
+`p.m` is 12 and the window is 8: a check written from a contract just read, correct about the
+case in mind and silent about the case beside it.
+
+**Why the order of arms decided the diagnosis.** Had only the kernel-facing arms existed, the
+red would have read *"the kernel disagrees with the symmetric oracle by less than tolerance"* —
+which is indistinguishable from a tolerance that needs widening. The natural repair is 3x
+`TOL`, it produces a green suite, it looks like diligence, and it silently degrades every other
+comparison in the file, because `TOL` is shared. The oracle-vs-oracle arm removes the kernel
+from the sentence entirely: *these two references do not differ*, therefore no kernel can be
+asked to tell them apart. One arm, and the difference between a correct diagnosis and a
+plausible repair that costs unrelated coverage.
+
+**Generalise it: in a defect matrix, assert that the defect oracle differs from the clean
+oracle BEFORE asserting anything about a kernel.** The check costs one comparison, needs no
+device, and converts a whole class of confusing reds into unambiguous ones.
+
+**Why no fixture could have fixed it — a bound, not a sample.** For `g <= -L` the asymmetric
+form computes `silu(g)` and the symmetric one `silu(-L)`; since `silu(x) -> 0` as `x -> -inf`,
+
+```text
+sup |silu(g) - silu(-L)|  =  |silu(-L)|          attained as g -> -inf
+|silu(-10)| = 4.5398e-4     x |up| <= L = 10     =  4.5398e-3 per element, ANY scale
+```
+
+Driving the fixture harder pushes the gate further negative, which makes `silu(g)` smaller,
+which makes the difference *converge to* the bound rather than exceed it. The obvious
+repair — raise the activation scale until it separates — is provably impossible, and finding
+that out empirically costs a GPU arm.
+
+Three ratios live near this number and they are not interchangeable; an earlier draft of this
+note quoted a fourth that was none of them. At `L = 1` the endpoint ratio
+`|silu(-1)|/|silu(-10)|` is **592.4x**, but the per-element bound also carries `|up| <= L`, so
+the quantity that actually governs observability, `(|silu(-1)|·1)/(|silu(-10)|·10)`, is
+**59.2x**. The bound ratio is the one to quote. State which one, next to the figure.
+
+So this is a fact about `Expert.forward`, not about the fixture: at `swiglu_limit = 10` the
+gate's missing lower clamp is very nearly a numerical no-op — still worth matching, because the
+reference is the spec, and it would bite at a smaller limit.
+
+**Where the coverage went, since moving a gate is the repair most able to shed coverage
+quietly.** To `the_clamped_combine_is_bit_exact_elementwise`, which compares the kernel to a
+host transliteration BIT FOR BIT over probes straddling the bound, with an explicit
+symmetric-clamp arm asserting `moved > 0` and printing the count. At the combine there is no
+`w2` accumulation to bury a 4.5e-3 term in and no tolerance to hide under: `silu(-12)` is
+`-7.373e-5` against `silu(-10)`'s `-4.540e-4`, nowhere near each other in bf16. Bitwise is
+legitimate **there and only there** — one thread per element, no reduction, so §"`assert_close`
+over bitwise at real dims" does not apply; that retraction is about a wave-reduced kernel.
+Coverage went UP: from an assertion that could not pass to one that measurably separates.
+
+The relocated test is not a comment. It keeps the positive gate, keeps the population
+measurement, and asserts the non-separation as `err <= tol`, so a future divergence fails and
+forces the bound to be re-derived before it is trusted as a new gate. Third use of
+`NO_YARN_BELOW_RESOLUTION`'s pattern: record the measured separation, name the metric that
+cannot resolve it, name the instrument that can.
+
 ### Two guards were built and then withdrawn — S3, 2026-08-05
 
 `14a9009` shipped a `RopeTable` newtype (a `*const f32` tagged `yarn: bool`, checked in
@@ -1150,6 +1259,82 @@ shared expert is fp8 and takes `launch_gemv_fp8` + `launch_swiglu`, and `launch_
 one of the 43 layers would run unclamped: `v4oracle::Defect::SwigluUnclamped`, one contribution
 in seven, fluent and wrong. The fix is a clamped fp8 combine — the three lines already sitting
 in `moe_gateup_f4_impl`, which `kernels/common.hpp` is the place for. Not written here.
+
+> **WRITTEN 2026-08-05, and NOT YET WIRED — the distinction matters.** `kernels/common.hpp::
+> swiglu_clamped` is now the single definition of the clamp, called by both
+> `moe_gateup_f4_impl` and a new `kernels/linalg.hip::v4_swiglu_clamped`, reached through
+> `launch_v4_swiglu_clamped(g, u, n, limit, h, stream)`. Gated by `tests/v4_kernel.rs` §7
+> against `Oracle::expert`, bidirectionally and with the fixture's reachability measured from
+> `swiglu_clamp_events` rather than assumed.
+>
+> Three corrections to the entry above. It is **four** statements, not three — the bf16
+> round-trip of both operands is part of the clamp's meaning, because `Expert.forward` clamps
+> what `Linear` stored as bf16 and read back with `.float()`. `hip.rs:1289` is a stale line
+> reference. And the fix could **not** have been a `limit` parameter on GLM's `launch_swiglu`:
+> at NO value of `limit` do the two agree, because V4 bf16-rounds both operands before the
+> clamp, bf16-rounds the product (`x.to(dtype)` before `w2`), and uses `F.silu`'s multiply
+> form `g·sigmoid(g)` against GLM's `g/(1+e^-g)` — three differences besides the clamp, each
+> a defect the oracle names. So it is a different function, not a parameterisation, and it
+> lives directly beside `swiglu` in `linalg.hip` so the difference reads side by side.
+>
+> **The defect is still live.** V4's MoE layer loop does not exist, so nothing calls this yet;
+> the first thing to wire the shared expert must reach for `launch_v4_swiglu_clamped` and not
+> `launch_swiglu`. The launcher refuses `limit <= 0` **and NaN** (guard 1006, the same code
+> `moe.hip` returns for the same check) — and ALSO `+/-inf`, see below. Written
+> `!(limit > 0.0f && limit < INFINITY)` rather than `limit <= 0.0f`
+> because every comparison against NaN is false, so `limit <= 0` ADMITS NaN, and `fminf(gt,
+> NaN)` returns `gt`: a NaN limit degrades silently to precisely the unclamped form the guard
+> exists to forbid.
+>
+> **THE SAME HOLE IS UPSTREAM, IN `artifact/`, AND IS NOT CLOSED.** `V4Config::validate`
+> (`src/artifact/model.rs:726`) is `ensure!(self.swiglu_limit > 0.0, ...)` — the identical
+> one-sided spelling, one layer up. It rejects NaN and zero and **admits `+inf`**. Found
+> 2026-08-05 by a review that checked a comment claiming the opposite: a draft of `linalg.hip`'s
+> guard said "kept even though `V4Config::validate` now requires a finite positive
+> `swiglu_limit` upstream", i.e. it told the next reader that the launcher guard was the
+> redundant half. It is the ONLY defence.
+>
+> Whether a config can actually carry `+inf` is worth checking rather than assuming — JSON has
+> no infinity literal, but `1e400` overflows to `inf` in most parsers, so
+> `"swiglu_limit": 1e400` is the concrete probe. `src/artifact/` was outside this stage's file
+> set, so this is recorded rather than fixed. The two-sided form is
+> `self.swiglu_limit > 0.0 && self.swiglu_limit.is_finite()`, and the negative-case table beside
+> `every_v4_field_is_required` is where the `1e400` row belongs.
+>
+> Third instance of one shape in a single stage: a check written from the case in mind, silent
+> about the case beside it, and then COPIED — `moe.hip` into `linalg.hip` by this stage, and
+> independently into `model.rs` by whoever wrote the validator.
+>
+> **One of the three differences is UNDEMONSTRATED, and that is a smaller claim than the one
+> first written — MEASURED 2026-08-05.** The multiply-vs-division silu form was swapped in
+> `moe_gateup_f4_impl` as a deliberate control during the hoist A/B, and the fp4 dispatch was
+> **bit-identical across all 512 outputs** (hash `0x045b3e1238423a65` either way). That does
+> **not** contradict `moe.hip:316-322`, which says the difference "would normally vanish under
+> the bf16 store below — except exactly at a rounding boundary". Bit-identical is the
+> PREDICTED result for a fixture that misses the boundary, and this fixture misses it.
+>
+> What is true: **nothing in the suite exercises the boundary case**, so choosing the multiply
+> form is sound reasoning that no test demonstrates. Recorded as *undemonstrated, not refuted*.
+> The distinction was nearly lost twice in one exchange — a paraphrase dropped the "would
+> normally vanish" clause, turning a conditional into a routine difference, and the shortened
+> form was then carried into two code comments (`linalg.hip`, `hip.rs::launch_v4_swiglu_clamped`)
+> before being caught. Both now say what is demonstrated. `common.hpp::swiglu_clamped`'s own
+> point 3 kept the conditional and was correct throughout.
+>
+> The separate-kernel decision does not rest on it. The two bf16 roundings and the clamp are
+> real and demonstrated — `C_symmetric` and `C_noupclamp` both go red, and `Defect::NoBf16Rounding`
+> is in the oracle's matrix — so the argument survives at three differences with one of them
+> marked "true by construction, unexercised".
+>
+> **Why the control mattered more than the finding.** It was run to prove the hoist A/B could
+> see anything at all, and it FAILED to move the hash — which reads exactly like a dead build,
+> especially with two stale build dirs in `target/` showing a `moe.o` older than `moe.hip`. The
+> correct order is: confirm the instrument is live (`build.rs:48,53` emits `rerun-if-changed`
+> per kernel source; the ACTIVE build dir's `moe.o` did rebuild), then find a control that DOES
+> move it (`limit * 0.5f` gives `0x2169ad11c8da5725`, `err=5.766e0` against `tol=1.113e-1`),
+> and only then quote a null result. Second instance of the `__fmul_rn` lesson: **check the
+> break before doubting the gate**, and a null result from an unvalidated instrument is not a
+> result.
 
 **3. There is no routed streaming pool for `.f4`, and the full artifact does not fit without
 one.** — *RESOLVED 2026-08-05; see §"The `.f4` pool landed" below, which also corrects the

@@ -283,7 +283,8 @@ __device__ __forceinline__ size_t f4_ng(int i_dim) {
 //
 // `x` must ALREADY be fp8-quantized (`act_quant_f8`) — this kernel cannot do it, see that
 // kernel's note. `limit` is `swiglu_limit` from the config, passed rather than #defined so
-// the kernel and `config.json` cannot drift; the launcher refuses `limit <= 0`, because an
+// the kernel and `config.json` cannot drift; the launcher refuses every value that would
+// DISABLE the clamp — `<= 0`, NaN and +/-inf alike — because an
 // unclamped SwiGLU on a `.f4` expert is `v4oracle::Defect::SwigluUnclamped` and there is no
 // V4 configuration that wants it.
 template <int R>
@@ -306,30 +307,29 @@ __device__ __forceinline__ void moe_gateup_f4_impl(
     if (lane == 0) {
 #pragma unroll
         for (int t = 0; t < R; ++t) {
-            // bf16 FIRST, then clamp: `Linear` stores bf16 and `Expert.forward` clamps what
-            // it read back. Clamping the f32 dot and rounding afterwards would put a
-            // different value on the boundary — and the boundary is the only place a
-            // clamped SwiGLU differs from an unclamped one at all.
-            float gt = rbf16(g[t]), ut = rbf16(u[t]);
-            ut = fminf(fmaxf(ut, -limit), limit);
-            gt = fminf(gt, limit);  // ASYMMETRIC: no lower clamp on the gate
-            // `x · sigmoid(x)`, NOT this file's `siluf` (`x / (1 + e^-x)`). The two differ
-            // by one rounding, and `F.silu` is the multiply form. It would normally vanish
-            // under the bf16 store below — except exactly at a rounding boundary, where it
-            // flips a whole bf16 ulp. Matching the reference's association removes a
-            // systematic term from every comparison this port makes; keeping `siluf` here
-            // would put a known difference into results whose whole job is to expose
-            // unknown ones.
-            float sg = gt * (1.0f / (1.0f + expf(-gt)));
+            // `common.hpp::swiglu_clamped` — bf16 both operands, clamp `up` both sides and
+            // `gate` only from above, `x·sigmoid(x)`, return the product UNROUNDED. It was
+            // these four statements inline here until 2026-08-05, hoisted when the fp8 SHARED
+            // expert needed the identical arithmetic (`launch_v4_swiglu_clamped`): the two
+            // must agree bit for bit, `kernels/` is not watched by jscpd, and a second copy
+            // would drift silently. The hoist was MEASURED bit-neutral, not assumed —
+            // `tests/v4_kernel.rs::the_fp4_dispatch_hash_pins_the_clamp_hoist` carries the
+            // hash and the argument.
+            float sw = swiglu_clamped(g[t], u[t], limit);
             // ENFORCED, not inherited. `0 · finite` is exactly zero, but the gate has no
-            // LOWER clamp, so a `w1` dot at -inf gives `sg = -inf · 0 = NaN`, and `NaN · 0`
-            // is NaN, not 0. `moe_fixed` then turns that NaN into a FINITE extreme
+            // LOWER clamp, so a `w1` dot at -inf gives `silu = -inf · 0 = NaN`, and
+            // `NaN · 0` is NaN, not 0. `moe_fixed` then turns that NaN into a FINITE extreme
             // (`fminf`/`fmaxf` return the non-NaN operand) — silent corruption of a row that
             // never asked for this expert. The int4 twin below carries the same guard on the
             // same argument; folding the routing weight into pass 1 only moves the hazard a
             // stage earlier, it does not remove it.
             float w = wexpert[(size_t)e * R + t];
-            h_out[((size_t)e * R + t) * inter + j] = w == 0.0f ? 0.0f : rbf16(sg * ut * w);
+            // `sw * w`, and `swiglu_clamped` already associated as `(silu · up)`, so this is
+            // the `((silu · up) · w)` the inline form computed. The bf16 store is HERE and
+            // not in the helper because the reference rounds after the routing weight
+            // (`weights * x` then `x.to(dtype)`), which the shared expert — having no
+            // routing weight — does not do.
+            h_out[((size_t)e * R + t) * inter + j] = w == 0.0f ? 0.0f : rbf16(sw * w);
         }
     }
 }
@@ -408,9 +408,23 @@ extern "C" int rivoli_moe_expert_range_f4(
     // 2026-07-31 by failing loudly at token 1 instead of silently computing a short row.
     if (nrow != 1) return 1003;
     if (e_start + e_count > n_desc) return 1004;
-    // `!(x > 0)` rather than `x <= 0`, so a NaN limit is refused too. Why refusing at all:
-    // see `moe_gateup_f4_impl`.
-    if (!(swiglu_limit > 0.0f)) return 1006;
+    // Every value that would DISABLE the clamp, refused. `x <= 0` would have admitted NaN;
+    // `!(x > 0)` alone admits +inf, which is the same destination and quieter — `fminf(gt,
+    // inf)` returns `gt`, so the clamp simply vanishes and the expert runs
+    // `v4oracle::Defect::SwigluUnclamped` with no error anywhere. Found 2026-08-05, after the
+    // one-sided form had been copied into `linalg.hip::rivoli_v4_swiglu_clamped` as a
+    // deliberate match; both were fixed together.
+    //
+    // Rejects NaN (every compare against NaN is false), 0, negative, -inf and +inf. The
+    // compare form follows `fwd.hip:224` for consistency and because it is one expression
+    // covering all of them — NOT for the robustness that comment claims: `build.rs:67` gives
+    // hipcc only `--offload-arch -O3 -fPIC`, so `-ffast-math` is not in play, and if it were,
+    // `-ffinite-math-only` would fold `limit < INFINITY` as readily as `isfinite()`. Why
+    // refusing at all: see `moe_gateup_f4_impl`.
+    //
+    // This is the launcher with REACHABLE callers, which is why it is the more urgent half:
+    // the shared expert's twin has none yet.
+    if (!(swiglu_limit > 0.0f && swiglu_limit < INFINITY)) return 1006;
     const ExpertDescF4* d = (const ExpertDescF4*)descs;
     hipStream_t s = (hipStream_t)stream;
     hipGetLastError();
