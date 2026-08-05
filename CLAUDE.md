@@ -72,9 +72,25 @@ someone who follows the line above. A check that must hold in a shipped binary i
 **`--features rocm` alone does not compile `mod otlp`, `src/eval.rs`, or the pred-probe and
 trace paths.** That blind spot is not hypothetical: `otlp` sat broken for weeks on an
 `E0609` — a `ProfileSummary` field renamed out from under it — while every prescribed
-command passed, because nothing built it. There is no CI, so a feature-gated module is
-checked exactly as often as someone remembers to name its feature. Add the union run to any
-change that touches `telemetry.rs`, `eval.rs`, `gpu.rs` or a `ProfileSummary` field.
+command passed, because nothing built it. Add the union run to any change that touches
+`telemetry.rs`, `eval.rs`, `gpu.rs` or a `ProfileSummary` field.
+
+> **CORRECTED 2026-08-05.** This said "**there is no CI**", and used that as the reason.
+> There is: `.github/workflows/ci.yml`, gated since `5ef1f9a`. What it actually runs is
+> narrower than "CI exists" and is the useful thing to know —
+>
+> | job | runs |
+> |---|---|
+> | `host` | `cargo fmt --check`; a proof that the jscpd gate is *armed*; `clippy --release --locked --all-targets`; `cargo test --release --locked` — both **featureless** |
+> | `vulkan` | `clippy --features vulkan`; `clippy --features vulkan,otlp,teacher-forcing,pred-probe,trace` (**the union, on Vulkan**); `cargo test --features vulkan` over `docs`, `invariants`, `kernel_coverage`, `glsl_numerics` only |
+>
+> So **there is no `rocm` arm and no GPU arm at all.** Every `--features rocm` build, every
+> HIP kernel, and every device test is checked exactly as often as someone runs it here. The
+> union-clippy instruction above stands — CI runs the union only against `vulkan`, so the
+> `rocm` union is genuinely unchecked. And `cargo fmt --check` **is** gated, so a change that
+> adds rustfmt violations breaks CI even though nothing local reports it; the tree has since
+> drifted, so fix only the hunks your diff touches and leave a tree-wide reformat to its own
+> `style:` commit rather than burying it in a feature change.
 
 **Duplication is a build error.** `build.rs` runs `jscpd --min-tokens 15` over `src/`,
 `tests/` and itself on every build and panics on any clone; `.jscpd.json` carries no
