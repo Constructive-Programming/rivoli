@@ -1984,17 +1984,31 @@ fn attention_matches_the_oracle_on_a_compressed_layer_in_both_phases() {
             ),
         }
     }
-    // The slot the script SKIPS must still be untouched. Without this, a placement that
-    // wrote BOTH the correct slot and the next free one satisfies every row of `COMP_SLOTS`
-    // — the correct rows are all still right — and only this separates "writes the right
-    // slot" from "writes the right slot AMONG OTHERS". The oracle leaves block 2 unwritten
-    // (position 23 is skipped), and `Gpu::new` zeroes the ring, so both sides read zeros.
-    let skipped = d.window + COMP_SKIP_TO / cfg.compress_ratio(COMP_LAYER) - 1;
-    assert!(
-        gpu.cache_row(&d, skipped).iter().all(|v| *v == 0.0),
-        "cache row {skipped} holds the block the script SKIPS and must never be written; \
-         a placement that also appends would land a duplicate here"
-    );
+    // EVERY compressed row `COMP_SLOTS` does not name must still be zero — the block the
+    // script skips (2) and the whole tail past it (4..capacity).
+    //
+    // Scoped this way because the narrow version was a DEAD GUARD, measured 2026-08-05. It
+    // checked only the skipped row, and a placement writing a duplicate there is caught
+    // first by the numeric comparison: row `window + 2` is inside the selection at
+    // `COMP_SKIP_TO`, so the duplicate replaces a zero row the oracle attends and
+    // `assert_within` fires several assertions earlier. Verified by injecting exactly that
+    // "belt and braces" placement — it died in `assert_within`, never reaching here.
+    //
+    // Widened to the unnamed TAIL, it states something nothing else does: a stray write to a
+    // row the selection does not cover is invisible to every numeric golden by construction,
+    // because `sparse_attn` only reads rows the selection names.
+    let written: Vec<usize> = COMP_SLOTS.iter().map(|&(_, b)| d.window + b).collect();
+    for row in d.window..d.window + cfg.max_seq_len / cfg.compress_ratio(COMP_LAYER) {
+        if written.contains(&row) {
+            continue;
+        }
+        assert!(
+            gpu.cache_row(&d, row).iter().all(|v| *v == 0.0),
+            "cache row {row} names no block this script emits and must never be written. \
+             A stray write past the selection is invisible to every numeric golden — \
+             `sparse_attn` reads only the rows the selection names"
+        );
+    }
 
     // BOTH directions. Every `COMP_SLOTS` row must have been reached, so a stale entry
     // cannot sit there looking like coverage; and every step that EMITTED must have had a
