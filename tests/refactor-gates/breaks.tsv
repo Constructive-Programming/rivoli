@@ -1,0 +1,14 @@
+# G4b — deliberate breaks recorded during the V4 port, as a runnable corpus.
+#
+# Each row: FILE <tab> FIND <tab> REPLACE <tab> TEST <tab> EXPECT-IN-OUTPUT
+# The driver stages the tree, applies the break, runs the test, asserts it FAILS and that
+# the message contains EXPECT, then restores with `git checkout --`.
+#
+# A break that goes GREEN is a regression the refactor caused.
+# A break whose message changes SUBJECT is the "0-ULP compare wearing a slot-rule failure
+# message" defect — the gate still fires but sends the reader to the wrong file.
+#
+# STAGE BEFORE BREAKING. `git checkout --` on an unstaged tree reverts real work; that
+# happened to an agent on 2026-08-05.
+src/v4oracle/forward.rs	Defect::Fp4NibbleSwap,		v4_oracle every_defect_variant_reaches	never reach Defect::ALL
+src/artifact/format.rs	n_experts + usize::from(has_shared)	n_experts + 1	v4_loading	bytes on disk, expected
