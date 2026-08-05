@@ -1783,7 +1783,7 @@ fn resolve(addr: u64, len: usize) -> Result<(vk::Buffer, u64)> {
 /// As [`resolve`], but keyed on the HOST mapping instead of the device address.
 ///
 /// The fetch path needs this and cannot use `resolve`: `pin.rs` hands the streamer
-/// `ArenaPool::host_ptr` — the io_uring DMA target — because that is the pointer an
+/// `RoutedPool::host_ptr` — the io_uring DMA target — because that is the pointer an
 /// O_DIRECT read and a CPU memcpy both need, and under HIP it is *also* the device address
 /// so one number served both. Here they are unrelated, so a copy expressed in host
 /// pointers has to be translated back. Same bounds and overflow checks, one predicate
@@ -2075,7 +2075,7 @@ impl Buf {
     ///
     /// This is the OTHER half of the pair [`ptr`](Self::ptr) documents: under HIP these
     /// are one number and `VmmBuf::ptr_mut` serves both purposes, which is why
-    /// `pin.rs`'s `ArenaPool` can use one base for descriptor arithmetic and for
+    /// `memory/routed.rs`'s `RoutedPool` can use one base for descriptor arithmetic and for
     /// `ReadSpec.dst`. Here they are unrelated, so the caller has to say which one it
     /// means. See docs/investigations/vulkan-port.md, "Host pointer != device address".
     pub fn host_mut(&mut self) -> *mut u8 {
@@ -2194,7 +2194,7 @@ pub unsafe fn memcpy_dtod(dst: *mut u8, src: *const u8, bytes: usize) -> Result<
 ///
 /// Both ends are HOST pointers, resolved back to their `VkBuffer` by [`resolve_host`]:
 /// `src` is a slot in the io_uring bounce arena ([`Buf::staging`]) and `dst` is a slot in
-/// the routed pool's mapping (`ArenaPool::host_ptr`). Passing host pointers is not a
+/// the routed pool's mapping (`RoutedPool::host_ptr`). Passing host pointers is not a
 /// concession — it is what makes the signature identical on both backends, since under HIP
 /// the same number is also the device address.
 ///

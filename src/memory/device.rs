@@ -694,7 +694,7 @@ mod vktier {
     ///
     /// Where the HIP `VmmBuf` hands out ONE pointer that `pin.rs` uses simultaneously as
     /// the io_uring O_DIRECT DMA target and as the base for every expert descriptor's
-    /// six device pointers (`ArenaPool::ptr`, `src/memory/pin.rs`), those are two numbers here
+    /// six device pointers (`RoutedPool::ptr`, `src/memory/routed.rs`), those are two numbers here
     /// and this type must hand them out separately — see docs/investigations/vulkan-port.md, "Host pointer
     /// != device address". [`VmmBuf::ptr`] is the device base, for descriptor
     /// arithmetic, [`VmmBuf::host_mut`] is the DMA target, and callers must say which

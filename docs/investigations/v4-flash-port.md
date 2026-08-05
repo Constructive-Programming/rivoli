@@ -1122,7 +1122,7 @@ serves it:
 | **shared expert (fp8)** | `launch_gemv_fp8` ×3 + a **clamped** SwiGLU | **blocked — 2** |
 | accumulate | `launch_moe_acc_drain` | ok |
 | `hc_head`, `ParallelHead` | `launch_v4_hc_head`, `launch_v4_dense_gemm_bf16` | ok |
-| routed experts must be somewhere | resident tier **or** streaming pool | **blocked — 3** |
+| routed experts must be somewhere | resident tier **or** streaming pool | **UNBLOCKED 2026-08-05 — 3** |
 
 **1. `V4Config` has neither `hc_sinkhorn_iters` nor `hc_eps`. FIXED here.** `launch_hc_pre`
 takes both, and its own doc says `iters` is "`hc_sinkhorn_iters` from the config… passing it
@@ -1152,7 +1152,9 @@ in seven, fluent and wrong. The fix is a clamped fp8 combine — the three lines
 in `moe_gateup_f4_impl`, which `kernels/common.hpp` is the place for. Not written here.
 
 **3. There is no routed streaming pool for `.f4`, and the full artifact does not fit without
-one.** Measured on the merged tree: `Arena`, `cache`, all three `HybridPolicy` impls,
+one.** — *RESOLVED 2026-08-05; see §"The `.f4` pool landed" below, which also corrects the
+"three specific things" estimate and reports what the residency actually costs.* Measured on
+the merged tree: `Arena`, `cache`, all three `HybridPolicy` impls,
 `AsyncFetch`/`Ticket`/`ReadSpec`, `Streamer` and `ExpertSet::{open_routed, read_spec,
 expert_slot}` are **all byte-parameterised and already work at `RoutedFmt::F4`** — the pool
 substrate is not the problem. What is missing is three specific things, all inside `pin.rs`:
@@ -1200,6 +1202,326 @@ separate mechanical fact that the batched verify pass rivoli ships on by default
 kernel behind it. Requirement 2's `start_pos / ratio` rule is still right and still worth
 having — a skipped step is not exclusive to speculation — but the motivating example is not
 currently reachable.
+
+### The `.f4` pool landed, and the substrate claim held — 2026-08-05
+
+**The pool exists and V4's routed experts stream.** `V4Pin::build` now takes a device budget
+and owns a `RoutedPool` over the `.f4` set; `V4Pin::routed.submit(layer, sel, …)` resolves
+each expert to six device addresses and a `Ticket`, exactly as GLM's does.
+
+**The byte-parameterised claim was verified rather than trusted, and it held — for the
+substrate.** `Arena` takes two `usize` strides and never names a format, `HybridPolicy` and
+`cache` account in bytes, `AsyncFetch`/`ReadSpec`/`Streamer` move `(fd, begin, len) → dst`
+spans, and `ExpertSet` already read its geometry off `RoutedFmt`. None of those needed a
+line. **What was NOT byte-parameterised is the layer above them**, and the estimate of
+"three specific things, all inside `pin.rs`" was low by one structural item:
+
+| owed by the estimate | what it actually took |
+|---|---|
+| `f4_slot_offsets` | landed — and the three formats' layouts now come off ONE walk (`quant::slot_offsets`), because a third hand-written copy is what jscpd refused and what would have drifted |
+| an f4 arm in `TierFmt`/`ArenaPool` | **the pool had to MOVE.** `ArenaPool` and `submit_layer` were private to GLM's `Pin`, and `Pin`/`V4Pin` are deliberately separate types. A second copy is a build error (`jscpd`) and, worse, a second place for the read-before-write rule to be wrong. It is now `src/memory/routed.rs::RoutedPool`, used by both |
+| an `F4` variant of `Mode`, which `Pin::build`'s `match mode` selects on | **declined, and it would have been wrong.** `Mode` selects GLM's routed format, and `Pin::build` places a shared expert *out of the routed slab* — which `.f4` does not have. An `F4` arm there would put a GLM-shaped placement path one `match` away from a V4 artifact, the exact thing `V4Pin` exists to prevent. `Pin::build` now refuses `RoutedFmt::F4` explicitly |
+| — | `MlpVq`/`VqWeight` had to go. Their `scales: *const u16` was already a half-truth for `.i4` (f32, reinterpreted at the launch site) and a wrong one for `.f4` (e8m0 is ONE byte). Now `ExpertSlot`/`ProjSlot`, six `*const u8`, and `gpu.rs` casts where it knows |
+
+### Nothing structural separates an `.f4` from an `.i4` — found 2026-08-05, by a test that failed
+
+Written as an assertion that the two layouts differ, expecting it to pass. It does not:
+
+```
+f4_slot_offsets(4096, 2048) == i4_slot_offsets(4096, 2048) == [0, 4194304, 4456448, 8650752, 8912896, 13107200]
+f4_expert_bytes(4096, 2048) == i4_expert_bytes(4096, 2048) == 13369344
+```
+
+`.f4` spends `ceil(i/32) × 1` byte on scales, `.i4` spends `ceil(i/128) × 4`, and those
+collide exactly when
+
+```text
+ceil(i/32) == 4 · ceil(i/128)      i.e.  i mod 128 ∈ {0} ∪ {97..127}
+```
+
+**That is 32 of every 128 dimensions — 25%, a BAND, not a property of the two models happening
+to use multiples of 128.** The first version of this section said "whenever `i_dim` is a
+multiple of 128", which is sufficient but incomplete and misleading in a specific way: a reader
+who changes a dimension to 96 finds the layouts separate and may conclude the collision was
+fixed. Widened 2026-08-05 after the coordinator reproduced the arithmetic independently.
+
+**Widening it exposed a second error in the same sentence, and this one was mine.** The band
+does NOT apply symmetrically to the two dimensions, because the six offsets and the block size
+are governed by different things:
+
+| | collides iff |
+|---|---|
+| the six slot offsets | `band(hidden)` — `moe_inter` cannot separate them at all |
+| `*_expert_bytes` / the file length | `band(hidden) && band(moe_inter)` |
+
+`off[2]` and `off[4]` are sums of w1's and w3's spans, whose `i_dim` is `hidden`; `off[5]` adds
+w2's PACKED bytes, which are `i/2` in both formats. w2's scale span — the only place `moe_inter`
+reaches the scale grid — *begins* at `off[5]`, so its length appears in no offset. `(4096, 96)`
+therefore has **identical offsets and different block sizes**. Found by the assertion failing,
+which is the only reason it is in this document rather than in the code as a confident aside.
+
+Both models are in the band on both dims (GLM 6144/2048, V4 4096/2048), so the two formats
+agree on all six slot offsets, on the block size, and therefore on the whole file length.
+`quant::f4_slot_offsets_match_the_shipped_block_and_are_indistinguishable_from_i4` pins both
+sides of the band on `hidden` (100/128/4096/6144 collide, 96/160/64 do not) and the
+offsets-collide-while-sizes-differ pair at `(4096, 96)`. A `.f4` block resolved through `i4_slot_offsets` finds every projection at
+exactly the right address and then decodes e2m1 nibbles as `n − 8` against a group-128 f32
+scale read out of e8m0 bytes: right bytes, wrong arithmetic, no length, offset or descriptor
+check able to see it.
+
+Three consequences, all acted on:
+
+- The header magic (`ExpertHeader::from_bytes`) and the descriptor TYPE
+  (`backend::ExpertDescF4`) are the *entire* separation. `tests/v4_loading.rs`'s
+  `magic_separates_the_formats_when_the_length_cannot` turns out to be named for a stronger
+  fact than its author had measured.
+- `TierFmt` carries a `RoutedFmt`, not the `int4: bool` it replaced.
+- **A guard was written, asked "what would have to be true for this to fire?", and deleted.**
+  `TierFmt::new` first took `(fmt, off)` and `ensure!`d the offsets were ascending and inside
+  the stride. Every routed block is padded up to `VQ_ALIGN`, so `.vq3`'s layout on an `.f4`
+  slot (`off[5]` 9,961,472 against a 13,369,344 stride) sits comfortably inside and passes —
+  and the pairing that actually costs correctness is invisible to any check at all. It is
+  now `TierFmt::new(&ExpertSet)`: the set answers for its own format and layout, so there is
+  nothing left to pair. `RoutedPool`'s "the two tiers agree on the read-table basis" `ensure!`
+  went the same way — each `TierFmt` indexes its own table with its own `first_layer`.
+
+### e8m0 `0xff` is rejected at repack; `0x00` is NOT, and the difference was measured
+
+§S3 requirement 10's routed half. `0xff` is the format's NaN; `common.hpp::e8m0f` decodes it
+correctly and `moe_fixed`'s saturating clamp then launders it into a finite ±2^14, so one bad
+byte is 32 weights of plausible garbage with no error anywhere. `F4Expert::spans` now refuses
+it, naming the projection and the `[row][col]`.
+
+**It runs at REPACK and not at decode, and that is a measurement, not a preference.** The
+routed scale bytes never pass through the host at decode — they DMA from NVMe straight into
+the pool slot. Three options were priced on the shipped 43-layer set:
+
+| where | cost | verdict |
+|---|---|---|
+| `convert_v4` / `F4Expert::spans` | zero — every byte is already in hand | **taken** |
+| `V4Pin::build`, whole set at startup | 8.6 GiB of reads *per run*, and it evicts 8.6 GiB of page cache the pool wants | declined |
+| per miss, on the landed slot | 786 KB/expert at **36.1 GB/s** (measured, max-reduce over bytes) = 21 µs/expert, ~5.4 ms/token at 258 misses — affordable, but there is no correct hook between "bytes landed" and "kernel reads" without a new sync | declined, recorded |
+
+The residual gap is stated rather than papered over: **a `.f4` produced by an older converter,
+or corrupted after conversion, is not covered.**
+
+**`0x00` is deliberately accepted.** The requirement was handed over as "reject `0x00`/`0xff`",
+but `0x00` is `2^-127` — a legal encoding that f32 carries exactly as a subnormal, and which
+`quant::e8m0` and `e8m0f` both special-case for that reason. Refusing it would invent a rule
+the format does not have. The kernel comment that motivated the requirement asks only for
+`0xff`; the `0x00` sentence beside it justifies the decoder's special case, not a refusal.
+
+**The shipped artifact, scanned end to end** (43 full layers + the `l3-5` fixture, reading
+only the scale spans — 8.6 GiB rather than 137 GiB):
+
+```
+9,261,023,232 e8m0 scale bytes.  9 distinct codes of 256, ALL in 0x76..=0x7e (2^-9..2^-1).
+0x00: 0     0xff: 0
+0x78 (2^-7) 3,746,687,561   0x79 (2^-6) 5,503,994,388   — 99.9% of the mass
+```
+
+Two things follow. The guard is green on every artifact that exists, so **only the injected
+break has ever made it speak** — recorded below. And §S3 item 15's "e8m0 exercises 2 distinct
+codes of 254 (`119..=120`)" is `0x77`/`0x78`: the toy fixtures cover the *second* most common
+real code and miss `0x79`, which is 59% of the checkpoint.
+
+### Guards, and the break that proved each one can fire — 2026-08-05
+
+Each break was applied to a **staged** tree, the named test run, then `git checkout --`.
+"Ineffective break" was the failure mode to avoid, so each was checked for going red before
+the guard was trusted green.
+
+| guard | break | result |
+|---|---|---|
+| e8m0 `0xff` refusal (`F4Expert::spans`) | deleted the refusal | `an_e8m0_nan_scale_byte_is_refused_at_repack_and_a_subnormal_one_is_not` FAILED, "slot 0: a 0xff scale byte must be refused" |
+| …and it is not a **first-byte** check | `sc.iter().take(1).position(…)` — the `COMP_SLOTS` shape, right rule wrong dimension | same test FAILED. The injected byte is at index 5, deliberately not 0 |
+| `f4_slot_offsets` | f4 scale span 1 → 2 bytes per group | 4 tests FAILED across `quant`, `format` and `v4_loading` — the shipped-geometry pin, the tiling invariant, the repack concatenation, and the set's self-description |
+| `RoutedFmt::slot_offsets` derives from the format | `F4 =>` resolved through `i4_slot_offsets` | `an_f4_set_reports_the_format_range_and_slot_layout_it_was_opened_with` FAILED **at the toy dims** — and `f4_slot_offsets_match_the_shipped_block…` stayed GREEN, which is the §"Nothing structural separates" finding reproducing itself as a test result |
+
+**The four device-gated guards, measured 2026-08-05 inside the flock** (0 KFD holders
+verified with `find`, not `ls` — see the instrument note below). Each break was built OUTSIDE
+the lock, run inside it, then `git checkout --`'d; the control was re-run green afterwards.
+
+| guard | break | result |
+|---|---|---|
+| `submit` range-checks before mutating | deleted the pre-flight loop | `a refused submit admitted the key anyway` |
+| `TierFmt::addressable` bounds the EXPERT | dropped `ensure!(expert < n_experts)` | the alias-to-layer-4's-expert-0 assertion fired |
+| `RoutedPool::new`'s one-batch floor | made the `ensure!` vacuous | `a pool too small for one batch must be refused at build` |
+| `submit`'s `MAX_BATCH` bound | `ensure!` → `debug_assert!` | fired. On the dev profile the `debug_assert!` itself panics; under `--release` it is compiled out and `is_hit[i]` becomes an out-of-bounds index instead, which is why it must be an `ensure!` |
+
+### Running the pool tests in parallel WEDGED the device — 2026-08-05
+
+`tests/v4_pool.rs` shipped as five `#[test]` fns. libtest runs those on parallel threads, and
+each one builds a `V4Pin` — a `DeviceTier` allocation, a pool VMM, and an io_uring ring. Five
+started at once: **19 threads, two in `kfd_wait_on_events`, four `io_sq_thread`s** (the tell —
+four rings means four pools), zero test output in 12 minutes, killed by PID. That is
+CLAUDE.md's recorded intermittent `gpustream` hang, and here it was self-inflicted and
+reproducible rather than intermittent. Teardown was clean: 0 holders and the flock free
+afterwards.
+
+`--test-threads=1` fixes it and is the wrong fix — it lives in whoever remembers to type it,
+and the failure mode for forgetting is a wedged sole-tenant GPU. `tests/v4_pin.rs` had already
+made this call (one test, an internal loop over fixtures), so the file now follows it: **green
+in 3.52 s.** Order inside it is load-bearing — the residency-destroying sweep runs last,
+because the case before it asserts that a cold pool misses everything.
+
+> **Instrument note, from the coordinator and worth carrying.**
+> `ls /sys/class/kfd/kfd/proc/ | wc -l` returned **1 for an empty directory** at least once
+> this session — the literal string `(empty)` on one line. That is a **phantom GPU holder**:
+> a count of 1 with no matching process. Use
+> `find /sys/class/kfd/kfd/proc/ -mindepth 1 -maxdepth 1 | wc -l`, which cannot do this, and
+> when a count is non-zero resolve the PID and confirm `/proc/<pid>` exists before believing
+> it. Every witness in this section used `find`.
+
+### GLM is unaffected by the pool moving out of its `Pin` — MEASURED 2026-08-05
+
+The refactor moved GLM's own hot path, so this is the arm that mattered. `--mode hybrid` was
+chosen deliberately: it is the only mode with two DIFFERENT `TierFmt`s, which is precisely what
+changed (`int4: bool` → `RoutedFmt`, and a per-tier read table with its own `first_layer`).
+
+`f3dcb85` vs `674bae5`, both binaries built before either ran, interleaved BASE/HEAD/BASE/HEAD
+inside one lock hold with no build between arms.
+`--bench 64 --mode hybrid --attn dense --cache-policy 2q --max-mem 115 --no-mtp`, the
+transformer prompt:
+
+| | BASE | HEAD |
+|---|---|---|
+| expert hit | **77.7% — 36595 hit / 14405 miss** | **77.7% — 36595 hit / 14405 miss** |
+| miss/token · GB/token | 131.95 · 2.02 GB | 131.95 · 2.02 GB |
+| per-layer miss-count histogram (`n=`) | 803 1367 1273 787 347 111 31 6 | **identical** |
+| printed output text | 81 B, `sha d19c60ea0f44fe75` | **byte-identical** |
+| tok/s | 1.85, 2.28 | 2.14, 2.25 |
+
+**The hit counters are exactly equal over 51,000 lookups, and so is the distribution of
+misses across layers.** Those are deterministic integer counters: any change to eviction,
+admission, relocation or the COLD/HOT split would move them. tok/s is within noise (the first
+BASE arm paid cold page cache). The only log difference is intentional — the line now reads
+`routed pool [2q vq3+i4]` from `memory::routed` rather than `[2q hybrid]` from `memory::pin`;
+`hybrid` still appears in the run's own config echo, so no run record loses its mode.
+
+*Read the text row narrowly:* 81 bytes is what `-bench` prints, not the whole 64-token
+completion. The decisive equality here is the counters.
+
+### What an `.f4` miss costs — MEASURED on the 43-layer artifact, 2026-08-05
+
+`tests/v4_pool.rs::measure_what_an_f4_miss_costs`, `#[ignore]`d (it needs the 146 GB set), on
+`/var/db/rivoli/v4-f4-full`. 258 distinct keys — `43 layers × top-6`, i.e. **exactly one
+token's routed traffic** — spread one batch per layer so the reads hit all 43 files:
+
+```
+.f4 routed set: 43 layers x 256 experts x 13369344 B = 137.06 GiB
+COLD: 258 misses, 3.21 GiB in 0.28 s
+  1.082 ms/miss (wall)   1.032 ms/miss (reaper fetch_ns)   12.36 GB/s
+  slot_stalls 0   io_wait 0.27 s
+WARM: 258 hits in 0.000 s = 0.001 ms/hit  (723x cheaper than a miss)
+```
+
+**This replaces the borrowed constant in the residency table below.** That table priced V4's
+traffic "at GLM's measured 12.3 GB/s"; the `.f4` path measures **12.36 GB/s and 1.082 ms per
+13.37 MB block**, and the same GLM run above measured 1.54 ms/miss for its larger 15.34/20.05
+MB experts — consistent bandwidth on both. The predicted per-miss cost was ~1.09 ms; it is
+1.082.
+
+**What this does NOT measure, and the distinction is the whole caveat.** It measures the price
+per byte, not the hit rate. A hit rate needs the router to choose experts, which needs the
+layer loop. So the traffic-per-token figures stay arithmetic on one factor and measured on the
+other:
+
+| | value | provenance |
+|---|---:|---|
+| one token, 100% miss | 3.21 GiB, **0.28 s** | measured |
+| one token at the residency floor (22.6% miss) | 58.3 misses, **63 ms** | 58.3 arithmetic × 1.082 ms measured |
+| GLM today, same machine | 131.95 misses, **203 ms** | measured |
+
+So V4's fetch load is **~3.2× lighter per token than the GLM configuration this repo ships at
+2.85 tok/s**, with the price half now measured on both sides. `slot_stalls 0` says the 16-entry
+ring is not undersized for `top_k = 6`.
+
+### Three defects the review found that the tests did not — 2026-08-05
+
+All three were in code written this stage, all three had a green test over them, and none
+would have been caught by running the suite. Recorded because the shape repeats.
+
+1. **`submit` mutated the pool before it validated the layer.** The range check lived in
+   phase 1c; phase 1b had already `admit`ed each miss into the policy, taken an arena slot,
+   bumped `misses` and poison-filled the slot. So a refused `submit` returned `Err` with
+   `resident(layer, e)` answering **true** for a key no read ever targeted — and the next
+   `submit` of it took the phase-1a HIT path and handed back an `ExpertSlot` pointing at
+   poison or at the previous tenant's weights. The silent-wrong-bytes case the ticket protocol
+   exists to prevent, reintroduced through the error path. The test asserted `is_err()`, which
+   passes either way. Now checked for the whole selection, on both tiers, before anything is
+   touched; the test asserts the counters and the residency map are unmoved.
+2. **`TierFmt::spec` bounded the layer and not the expert.** The index is
+   `row * n_experts + expert`, so on any row but the last an `expert >= n_experts` lands
+   inside the read table **on a later layer's row** and returns `Ok` with that layer's fd —
+   `(0, 256)` on the 3-layer fixture is layer 1's expert 0. `ExpertSet::read_spec` does bound
+   it, but that ran at table-BUILD time. The `.context()` message named a check that only held
+   on the last row. Both bounds now live in `TierFmt::row`.
+3. **The eviction test passed by 0.49 of one expert.** At `CAPACITY = 12 GiB` the fixture's
+   pool was 9.56 GiB against a 9.56 GiB routed set — short by **6,565,888 bytes**, so the
+   full sweep forced exactly ONE eviction and the test passed only because that victim
+   happened to be one of the three keys it sampled. Its justifying comment compared a binary
+   figure against a decimal one ("~9.5 GiB of pool for a 10.27 GB routed set") so a 0.06%
+   margin read as 8%. Now 5 GiB, the oversubscription is asserted rather than assumed
+   (`budget * 2 < routed`), and the conclusion is counted over every key against
+   `budget / stride` rather than sampled on three.
+
+The first two are the same shape as §"Two guards were built and then withdrawn": an ordering
+or a bound that no numeric gate can observe. The third is §"COMP_SLOTS checked only block 0"
+wearing a fixture constant instead of a loop bound.
+
+### The residency arithmetic, and it is FAVOURABLE — 2026-08-05
+
+The question the pool was built to answer: can it carry 137 GiB against ~115 GiB at
+acceptable cost? Measured against GLM's own shipped numbers, which is the only calibration
+available until a V4 decode runs.
+
+|  | GLM-5.2 (`--mode int3-vq`, shipped) | DeepSeek-V4-Flash |
+|---|---:|---:|
+| routed set | 279 GiB (76 × 3.94 GB `.vq3`) | **137.06 GiB** (43 × 256 × 13,369,344 B) |
+| `resident.safetensors` | 16.41 GB = 15.28 GiB | 9.56 GB = **8.90 GiB** |
+| pool at `--max-mem 115` | ~99.4 GiB | **~106.1 GiB** |
+| **residency** | **~35.6%** | **~77.4%** (8,516 slots of 11,008 keys) |
+| lookups/token | 600 (75 MoE × top-8) | 258 (43 × top-6) |
+| measured hit % | 77.7 (measured 2026-08-05) | — (needs the layer loop) |
+| measured ms/miss | 1.54 | **1.082** |
+| bytes/token at that hit % | 2.02 GB | 780 MB at the residency floor |
+| fetch ms/token | 203 (measured) | 63 (floor; 1.082 ms measured x 58.3 arithmetic) |
+
+V4 is a **bigger model with a far smaller streaming problem**: it holds 77% of its routed set
+resident where GLM holds 36%, and it looks up 258 experts a token where GLM looks up 600.
+Even at the pessimistic floor — hit rate equal to residency, i.e. no popularity skew at all —
+V4 moves `258 × 0.226 × 13.37 MB = 780 MB/token`, **2.6× less than the 2.02 GB/token GLM
+already ships at 2.85 tok/s**. At the **measured** 12.36 GB/s and 1.082 ms/miss (§"What an
+`.f4` miss costs") that is 63 ms/token of transfer against GLM's measured 203 ms. Any real skew
+(and V4's three hash-routed layers are perfectly cacheable by construction) only improves it.
+
+**So the pool is not the bottleneck, and the 83%-capacity framing overstated the difficulty**
+— it is 77.4% of a set that is looked up less than half as often. The per-miss cost should
+also be slightly *lower* than GLM's 1239 µs, since a `.f4` expert is 13.37 MB against
+`.vq3`'s 15.3 MB. The per-miss cost is now measured rather than
+predicted — 1.082 ms against a predicted ~1.09 — and it is indeed lower than GLM's 1.54 ms,
+since a `.f4` expert is 13.37 MB against `.vq3`'s 15.34 MB.
+**The hit-rate column remains arithmetic**: it needs the router, which needs the layer loop.
+A decode is what would settle it.
+
+### What still blocks a 43-layer decode — 2026-08-05
+
+The pool is no longer on this list. What is:
+
+1. **There is no V4 layer loop.** `src/gpu.rs` has no `V4Pin` reference and `src/main.rs` has
+   no V4 branch: nothing drives `attn::v4::attention`, `v4compress::compress`,
+   `launch_hc_pre/post`, the router, `RoutedPool::submit` or `launch_moe_expert_range_f4` in
+   sequence. This is the whole of S3's original brief and it is what remains.
+2. **The resident fp8 shared expert still has no clamped SwiGLU** (§"SIX short" item 2).
+   `swiglu_limit` reaches only `moe_gateup_f4_impl`; `launch_swiglu` is GLM's `silu(g)·u` and
+   takes no limit. Every layer's shared expert — one contribution in seven — would run
+   unclamped. Unchanged by this stage.
+3. **The six null-stream launchers** (§"SIX short" item 5). That item was declined on the
+   grounds that "with no `.f4` streaming pool there is nothing to overlap with, so threading a
+   stream through six launchers adds a parameter whose only possible value at every call site
+   is null". **That premise is now false.** There is something to overlap with, and the whole
+   design is the overlap. It should be paid with the layer loop, all six at once.
 
 ### The dev-profile sweep is RED, and the green one was measured where the checks are dead
 

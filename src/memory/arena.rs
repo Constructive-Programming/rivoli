@@ -61,6 +61,12 @@ impl Arena {
         }
     }
 
+    /// Total bytes this arena may hand out. Its own constructor argument, returned so the
+    /// pool can report it without a second copy of the number.
+    pub fn budget(&self) -> usize {
+        self.budget
+    }
+
     /// Byte offset of slot `idx` in the `hot`/cold tier — where the pin points the
     /// expert descriptor and DMAs the cold read.
     pub fn offset(&self, hot: bool, idx: usize) -> usize {

@@ -38,7 +38,7 @@ device budget into two regions, each a single VMM allocation made once at startu
 │                (optional) fp8/bf16 DSA indexer                            │
 │    global:     int8 embed, int8 lm_head, f32 final norm, 3 fp16 codebooks  │
 ├──────────────────────────────────────────────────────────────────────────┤
-│  ROUTED POOL (ArenaPool over a second VmmBuf, the rest ≈ 99 GiB)           │
+│  ROUTED POOL (RoutedPool over a second VmmBuf, the rest ≈ 99 GiB)          │
 │    a cache of streamed routed experts — never all resident at once         │
 │    two-ended byte arena: COLD (int3-vq) from the low end,                  │
 │                          HOT (int4) from the high end, split floats        │
@@ -49,7 +49,7 @@ device budget into two regions, each a single VMM allocation made once at startu
   every token. Filled in place at startup (`pread`/memcpy into host-mapped VMM — no
   separate H2D), then handed to kernels as raw device pointers. Bump-allocated: filled
   once, freed as a unit, so there is no free list.
-- **Routed pool** (`src/memory/arena.rs`, `src/memory/hybrid.rs`, `src/memory/pin.rs`): a fixed-size cache. The
+- **Routed pool** (`src/memory/arena.rs`, `src/memory/hybrid.rs`, `src/memory/routed.rs`): a fixed-size cache. The
   working set (≈19k distinct experts) dwarfs it (~6900 slots), so it evicts. This is where
   streaming and caching happen.
 
@@ -253,7 +253,7 @@ sequenceDiagram
   participant Comp as compute stream (residents)
   participant Miss as miss stream (in-flight experts)
 
-  Loop->>Reaper: submit_layer → batch of cold reads, one Ticket each
+  Loop->>Reaper: RoutedPool::submit → batch of cold reads, one Ticket each
   Reaper->>NVMe: submit all (SQPOLL, concurrent)
   Loop->>Comp: residents: wait_on(RESIDENT) + moe_expert_range → atomicAdd acc row 0
   Loop->>Miss: misses: wait_on(ticket) + moe_expert_range → atomicAdd acc row 1
@@ -293,7 +293,7 @@ are computed and combined. The launch is where fetch and compute overlap:
 ```mermaid
 flowchart LR
   G[router gate f32] --> S[top-8 select]
-  S --> SL["submit_layer:\nresolve hits + admit misses\n→ MlpVq descriptors + fmt flags + Tickets"]
+  S --> SL["RoutedPool::submit:\nresolve hits + admit misses\n→ ExpertSlot addresses + formats + Tickets"]
   SL --> CS["compute stream: residents\n(batched by format run)"]
   SL --> MS["miss stream: experts still in flight"]
   CS -->|"wait_on(ticket)"| K1["moe_expert_range (VQ) / _i4 (int4)"]
@@ -377,7 +377,7 @@ flowchart LR
 
 ## 6. Caching & residency — the byte-arena pool
 
-`src/memory/arena.rs`, `src/memory/hybrid.rs`, `src/memory/pin.rs`. The routed pool is a cache keyed by
+`src/memory/arena.rs`, `src/memory/hybrid.rs`, `src/memory/routed.rs`. The routed pool is a cache keyed by
 `(layer, expert)`; a hit reuses the resident slot, a miss evicts and streams.
 
 **Two-ended byte arena** (`arena.rs`): COLD (int3-vq, 15.3 MB) slots pack from the low end,
@@ -401,7 +401,7 @@ counts) and reporting a `Tier` (Cold/Hot) per admission so the pool knows which 
 missed expert lands in. `Tier` is the *minimal* interface between policy and pool — the
 policy's internal segments (2Q's A1in/Am, ARC's T1/T2) never leak.
 
-**The per-batch invariant that keeps it correct.** `submit_layer` runs three phases per MoE
+**The per-batch invariant that keeps it correct.** `RoutedPool::submit` runs three phases per MoE
 layer:
 
 1. `begin_batch()` — clear the policy's per-batch pin set.
@@ -463,7 +463,7 @@ concurrently. rivoli leans on Rust's type system so the unsafe interleavings are
   over-broad `unsafe Sync` on the HIP stream was removed precisely because it claimed more
   than was true).
 - **The cache invariant is enforced, not documented.** "Never evict a key touched this
-  batch" is not a comment — it is `pop_lru_skip(&pinned)`, and `submit_layer` returns
+  batch" is not a comment — it is `pop_lru_skip(&pinned)`, and `RoutedPool::submit` returns
   `Result`, so a slot that can't be resolved is a typed error, not a silent OOB. The
   arena's pointer arithmetic is derived from a `usize`-only model with its own host tests,
   so the device memcpy targets are correct *by construction of a proven integer model*.
@@ -525,7 +525,7 @@ different populations. Numbering converts "the doc drifted" into something a che
 > placement, not a race.
 >
 > The mechanism is not routing. Routing is clean, exactly as INV-1 and its test say. But in
-> hybrid the cache also decides an expert's **numeric format**: `Pin::submit_layer` fills
+> hybrid the cache also decides an expert's **numeric format**: `RoutedPool::submit` fills
 > `fmt` from the HOT/COLD slab placement (`HybridTwoQ`: A1in→COLD/vq3, Am→HOT/int4), and
 > `gpu.rs` branches on `fmt[i]` to pick `moe_expert_range_i4` or the VQ launcher. So
 > residency selects the arithmetic, and anything that perturbs the access sequence —
@@ -605,8 +605,10 @@ module root (`src/<group>.rs`) over a directory, so the tree mirrors the section
   run configuration discovered from the machine). §7.
 - **`memory/`** — where weights live and what decides which stay. `device`
   (`DeviceTier`/`VmmBuf`, the resident bump slab), `arena` (two-ended byte arena), `hybrid`
-  (byte-aware cache policies), `cache` (`OrderedSet`/`Tier`/`TwoQSplit` substrate), `pin`
-  (resident placement + the routed-expert `ArenaPool`, `submit_layer` protocol). §1, §6.
+  (byte-aware cache policies), `cache` (`OrderedSet`/`Tier`/`TwoQSplit` substrate), `routed`
+  (the streaming pool: `RoutedPool`, the `submit` protocol, one implementation for GLM's
+  `.vq3`/`.i4` and DeepSeek-V4's `.f4`), `pin` (resident placement, and the two
+  architectures' pins that own a `RoutedPool` each). §1, §6.
 - **`fetch/`** — getting cold bytes to the device without the GPU waiting. `stream`
   (io_uring O_DIRECT streamer), `asyncfetch` (the reaper + the ticketed dataflow). §3, §4.
 - **`backend/`** — the build-time waist (`rocm` XOR `vulkan`, one impl chosen at compile

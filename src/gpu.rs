@@ -34,7 +34,9 @@ use crate::backend::{
 use crate::fetch::asyncfetch::Ticket;
 use crate::math::{E4M3_BLOCK, route_into, topk_into};
 use crate::memory::device::DeviceBuf;
-use crate::memory::pin::{Fp8Mlp, IndexerPin, LayerMlp, MlpVq, Pin, TRACE_WINDOW};
+use crate::artifact::format::RoutedFmt;
+use crate::memory::pin::{Fp8Mlp, IndexerPin, LayerMlp, Pin};
+use crate::memory::routed::{ExpertSlot, TRACE_WINDOW};
 
 /// Fixed-point MoE accumulator rows: ONE PER STREAM (compute = 0, miss = 1), summed by
 /// `moe_acc_drain`. Not per expert — every expert on a stream shares its row, and integer
@@ -109,16 +111,22 @@ fn as_le_bytes<T: Copy>(v: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
-/// Build one expert's descriptor (six device pointers) from its resolved `MlpVq`.
-/// One `ExpertDesc` for both formats — the int4 kernel reinterprets the same bytes.
-fn desc_of_vq(m: &MlpVq) -> ExpertDesc {
+/// Build one expert's descriptor (six device pointers) from its resolved [`ExpertSlot`].
+/// One `ExpertDesc` for both of GLM's formats — the int4 kernel reinterprets the same bytes.
+///
+/// The three `as *const u16` casts are where "a slot is six byte addresses" meets "this
+/// kernel reads bf16 group scales here". They are not free of meaning: `.i4`'s scales are
+/// f32 and the int4 kernel reinterprets them again at its own launch site, which is exactly
+/// why `ExpertSlot` stopped pretending to know the width. `.f4` never reaches here — its
+/// e8m0 scales are one byte and `backend::ExpertDescF4` says so in the type.
+fn desc_of_vq(m: &ExpertSlot) -> ExpertDesc {
     ExpertDesc {
-        gate_indices: m.gate.indices,
-        gate_scales: m.gate.scales,
-        up_indices: m.up.indices,
-        up_scales: m.up.scales,
-        down_indices: m.down.indices,
-        down_scales: m.down.scales,
+        gate_indices: m.gate.packed,
+        gate_scales: m.gate.scale as *const u16,
+        up_indices: m.up.packed,
+        up_scales: m.up.scale as *const u16,
+        down_indices: m.down.packed,
+        down_scales: m.down.scale as *const u16,
     }
 }
 
@@ -172,7 +180,7 @@ unsafe fn rmsnorm_rows(
 /// expert in `experts` already gated by a wait enqueued on `stream`.
 #[allow(clippy::too_many_arguments)]
 unsafe fn launch_expert_range(
-    i4: bool,
+    fmt: RoutedFmt,
     x: *const f32,
     hidden: usize,
     inter: usize,
@@ -189,13 +197,20 @@ unsafe fn launch_expert_range(
     let (e_start, e_count) = (experts.start, experts.len());
     // SAFETY: forwarded verbatim from this function's own contract.
     unsafe {
-        match i4 {
-            true => launch_moe_expert_range_i4(
+        match fmt {
+            RoutedFmt::I4 => launch_moe_expert_range_i4(
                 x, hidden, inter, e_start, e_count, descs, wexpert, h, acc, nrow, stream,
             ),
-            false => launch_moe_expert_range(
+            RoutedFmt::Vq3 => launch_moe_expert_range(
                 x, hidden, inter, e_start, e_count, descs, cb0, cb1, cb2, wexpert, h, acc, nrow,
                 stream,
+            ),
+            // `.f4` needs `ExpertDescF4` (one-byte e8m0 scale pointers), not this
+            // `*const ExpertDesc`. Unreachable — `Mode` has no `F4` — and spelled out so a
+            // fourth variant cannot fall through a `_`.
+            RoutedFmt::F4 => anyhow::bail!(
+                "an .f4 expert reached GLM's MoE dispatch — it needs ExpertDescF4 and \
+                 launch_moe_expert_range_f4, not this descriptor"
             ),
         }
     }
@@ -285,7 +300,7 @@ struct Profile {
     /// Stamped directly rather than taken as `route_ns − route_wait_ns` so it survives
     /// someone adding a third thing to the route region.
     cpu_route_ns: u128,
-    /// Host time in `Pin::submit_layer` — residency lookups, policy/eviction
+    /// Host time in `RoutedPool::submit` — residency lookups, policy/eviction
     /// bookkeeping, slot assignment and read-spec construction for the layer's picks.
     cpu_submit_ns: u128,
 
@@ -591,13 +606,13 @@ pub struct GpuEngine<'a> {
     union: Vec<usize>,
     /// The three per-projection VQ codebooks (gate/up/down), fp16, resident.
     codebooks: [*const u16; 3],
-    mlps_vq: Vec<MlpVq>,
+    mlps_vq: Vec<ExpertSlot>,
     descs_vq: Vec<ExpertDesc>,
-    /// Per-expert format for the current layer's batch: `true` = int4 slab (launch the
-    /// int4 kernel + reinterprets the descriptor bytes), `false` = int3-VQ.
-    /// Filled by [`Pin::submit_layer`] for routed experts; the folded shared expert
-    /// appends [`Pin::shared_i4`].
-    fmt: Vec<bool>,
+    /// Per-expert format for the current layer's batch — which kernel decodes each slot.
+    /// Filled by [`RoutedPool::submit`] for routed experts; the folded shared expert
+    /// appends [`Pin::shared_fmt`]. Hybrid mixes int4 and int3-VQ within one batch, which
+    /// is why it is per-expert and not per-layer.
+    fmt: Vec<RoutedFmt>,
     /// Per-selected-expert: was it already resident? Drives the batched launch below.
     /// Per-descriptor device-side dependency. Replaces the `hit: Vec<bool>` residency mask,
     /// which encoded "do not await" as host data and could silently disagree with the real
@@ -904,11 +919,11 @@ impl<'a> GpuEngine<'a> {
     }
 
     pub fn hits(&self) -> u64 {
-        self.pin.hits
+        self.pin.routed.hits()
     }
 
     pub fn misses(&self) -> u64 {
-        self.pin.misses
+        self.pin.routed.misses()
     }
 
     /// Does the loaded artifact carry the MTP head?
@@ -920,7 +935,7 @@ impl<'a> GpuEngine<'a> {
     /// whether speculative decode is available — a verify pass routes twice per layer and
     /// submits the union, which the v2 trace format cannot express.
     pub fn tracing(&self) -> bool {
-        self.pin.tracing()
+        self.pin.routed.tracing()
     }
 
     pub fn set_moe_gain(&mut self, g: f32) {
@@ -1773,14 +1788,14 @@ impl<'a> GpuEngine<'a> {
                 // `route_ns` clock and behind the trace gate, so the decode path is
                 // byte-for-byte the work it was before and route_ns stays comparable
                 // across the change.
-                if self.pin.tracing() {
+                if self.pin.routed.tracing() {
                     topk_into(&self.choice, TRACE_WINDOW, &mut self.window);
                 }
                 // SUBMIT this layer's cold reads — each selected expert gets a load
                 // Signal (hit → ready; miss → resolves when its bytes land). The slot
                 // ADDRESSES are known now, so the descriptors below are valid pointers.
-                let miss0 = self.pin.misses;
-                // Residency must be sampled BEFORE submit_layer: it allocates slots for
+                let miss0 = self.pin.routed.misses();
+                // Residency must be sampled BEFORE `submit`: it allocates slots for
                 // misses, so afterwards everything reads as resident. A bitmask, not a
                 // Vec — this runs 78x per token and top_k is 8.
                 let warm_mask: u64 = if crate::telemetry::spans::enabled() {
@@ -1788,19 +1803,19 @@ impl<'a> GpuEngine<'a> {
                         .iter()
                         .take(64)
                         .enumerate()
-                        .filter(|&(_, &e)| self.pin.resident(l, e))
+                        .filter(|&(_, &e)| self.pin.routed.resident(l, e))
                         .fold(0u64, |m, (i, _)| m | (1 << i))
                 } else {
                     0
                 };
                 // Score the pre-attention prediction, and it has to be HERE for the same
-                // reason `warm_mask` does: `submit_layer` allocates the misses, so one line
+                // reason `warm_mask` does: `submit` allocates the misses, so one line
                 // later every expert reads as resident and `_miss` would score 0/0.
                 #[cfg(feature = "pred-probe")]
                 if self.pred_probe {
                     for &e in &self.union {
                         let predicted = self.pred_sel.contains(&e);
-                        let resident = self.pin.resident(l, e);
+                        let resident = self.pin.routed.resident(l, e);
                         self.pred_hit_sel += u64::from(predicted);
                         self.pred_tot_sel += 1;
                         if !resident {
@@ -1813,7 +1828,7 @@ impl<'a> GpuEngine<'a> {
                     // What a real prefetch would have SPENT: a read per predicted expert
                     // that is not already resident, whether or not it turns out to be used.
                     for &e in &self.pred_sel {
-                        if !self.pin.resident(l, e) {
+                        if !self.pin.routed.resident(l, e) {
                             self.pred_issued += 1;
                             self.pred_wasted += u64::from(!self.union.contains(&e));
                         }
@@ -1823,7 +1838,7 @@ impl<'a> GpuEngine<'a> {
                 // The UNION, not one row's picks: every expert any row routed to must be
                 // resident before the batch launches. Rows overlap ~31% (measured over
                 // 268 tokens x 75 layers), so 2 rows submit ~13.5 experts rather than 16.
-                self.pin.submit_layer(
+                self.pin.routed.submit(
                     l,
                     &self.union,
                     &self.window,
@@ -1838,7 +1853,7 @@ impl<'a> GpuEngine<'a> {
                 self.prof.cpu_submit_ns += e_sub.duration_since(t_sub).as_nanos();
                 crate::telemetry::spans::record("cpu/submit-layer", "decode", t_sub, e_sub);
                 // Residency x format, the pair that explains a layer's cost. `fmt` is
-                // filled by submit_layer in `union` order (the shared expert is pushed
+                // filled by `RoutedPool::submit` in `union` order (the shared expert is pushed
                 // after, so `take(union.len())` keeps this to the routed picks).
                 if crate::telemetry::spans::enabled() {
                     let mut st = crate::telemetry::spans::LayerState {
@@ -1846,9 +1861,9 @@ impl<'a> GpuEngine<'a> {
                         layer: l as i32,
                         ..Default::default()
                     };
-                    for (i, &i4) in self.fmt.iter().take(self.union.len()).enumerate() {
+                    for (i, &f) in self.fmt.iter().take(self.union.len()).enumerate() {
                         let warm = i < 64 && (warm_mask & (1 << i)) != 0;
-                        match (warm, i4) {
+                        match (warm, f == RoutedFmt::I4) {
                             (true, true) => st.warm_i4 += 1,
                             (false, true) => st.cold_i4 += 1,
                             (true, false) => st.warm_vq3 += 1,
@@ -1857,8 +1872,8 @@ impl<'a> GpuEngine<'a> {
                     }
                     crate::telemetry::spans::record_layer(st);
                 }
-                layer_misses = (self.pin.misses - miss0) as usize;
-                self.prof.fetch_n += self.pin.misses - miss0;
+                layer_misses = (self.pin.routed.misses() - miss0) as usize;
+                self.prof.fetch_n += self.pin.routed.misses() - miss0;
                 // Scatter each row's weights into the `[descriptor][row]` matrix the
                 // kernel reads as `wexpert[e*R + t]`. A row that did not route to a union
                 // expert leaves 0.0 there, and `moe_down_vq` SKIPS a zero weight — so a
@@ -1890,7 +1905,7 @@ impl<'a> GpuEngine<'a> {
                     // Weight 1.0 for EVERY row: the shared expert is unconditional, so it
                     // contributes to each row of the batch.
                     self.w.extend(std::iter::repeat_n(1.0, nrow));
-                    self.fmt.push(self.pin.shared_i4());
+                    self.fmt.push(self.pin.shared_fmt());
                     // The shared expert is in the RESIDENT tier, never streamed, so its
                     // dependency is already satisfied. It must still grow `tickets` with
                     // `fmt`/`descs` or the launch loop indexes past the end (it did once:
@@ -1918,8 +1933,8 @@ impl<'a> GpuEngine<'a> {
                 // the same six-pointer bytes (at its slot offsets).
                 let descs_ptr = self.descs_buf.ptr() as *const ExpertDesc;
                 // Per-expert format (routed experts from their slab; shared appended
-                // above). Cloned so the expert stream owns it (the small bool vec moves
-                // into the async closure). Hybrid mixes int4/vq3 within one batch.
+                // above). Cloned so the expert stream owns it (the small vec moves into the
+                // async closure). Hybrid mixes int4/vq3 within one batch.
                 let fmt = self.fmt.clone();
                 // Cloned alongside `fmt`: the launch loop indexes both while `self.pin` is
                 // borrowed for `wait_on`.
@@ -2034,7 +2049,7 @@ impl<'a> GpuEngine<'a> {
                     // launch is behind its dependency" true by reading the code, not by
                     // trusting this loop's classification.
                     for &t in &tickets[i..j] {
-                        self.pin.wait_on(t, cs_raw)?;
+                        self.pin.routed.wait_on(t, cs_raw)?;
                     }
                     // SAFETY: descs/codebooks resident; every expert in [i, j) has its
                     // dependency enqueued above; h/part device scratch; cs_raw live.
@@ -2074,7 +2089,7 @@ impl<'a> GpuEngine<'a> {
                     if tickets[e].is_resident() {
                         continue;
                     }
-                    self.pin.wait_on(tickets[e], ms_raw)?;
+                    self.pin.routed.wait_on(tickets[e], ms_raw)?;
                     // SAFETY: as above; this expert's bytes are gated by the wait just
                     // enqueued on the same stream.
                     unsafe {
@@ -2425,7 +2440,7 @@ impl<'a> GpuEngine<'a> {
              current bin/convert)"
         );
         ensure!(
-            !mtp || !self.pin.tracing(),
+            !mtp || !self.pin.routed.tracing(),
             "speculative decode with --trace: a verify pass routes twice per layer and \
              submits the union, which the v2 trace format cannot express"
         );
@@ -2458,15 +2473,15 @@ impl<'a> GpuEngine<'a> {
             // Profile the DECODE loop only (prefill is warm-up); reset the pin counters
             // too so hit%/misses describe steady-state decode, not the cold prefill.
             self.prof = Profile::default();
-            let hit0 = self.pin.hits;
-            let miss0 = self.pin.misses;
+            let hit0 = self.pin.routed.hits();
+            let miss0 = self.pin.routed.misses();
             // Baseline the reaper's counters too. `hits`/`misses` were already rebased
             // here but `fetch_ns` never was, so `fetch_wall_ms` has always folded the
             // PREFILL's (cold, expensive) fetch into the decode average. Invisible at
             // -bench 512 where 5 prompt tokens amortize away; at -bench 8 it reported
             // io-wait at 136% of wall, which is how it was found.
-            let fetch0 = self.pin.fetch_ns();
-            let io0 = self.pin.io_wait_ns();
+            let fetch0 = self.pin.routed.fetch_ns();
+            let io0 = self.pin.routed.io_wait_ns();
             // Tell the span recorder how long the run is, so it can spread its budget
             // across the whole decode instead of spending it all on the cold start.
             // Six leaf spans per MoE layer — cpu/launch, gate-d2h, route-into,
@@ -2479,7 +2494,7 @@ impl<'a> GpuEngine<'a> {
             #[cfg(feature = "trace")]
             let mut win_t = std::time::Instant::now();
             #[cfg(feature = "trace")]
-            let (mut win_hit, mut win_miss) = (self.pin.hits, self.pin.misses);
+            let (mut win_hit, mut win_miss) = (self.pin.routed.hits(), self.pin.routed.misses());
             #[cfg(feature = "trace")]
             let mut win_gen = 0usize;
             // `cur` is the token AT `pos`, decided but not yet fed through the model;
@@ -2575,11 +2590,11 @@ impl<'a> GpuEngine<'a> {
                 _i += 1;
                 // Bound trace loss to one token: the watchdog exits without destructors,
                 // so BufWriter's Drop is not a guarantee. No-op when not tracing.
-                self.pin.flush_trace()?;
+                self.pin.routed.flush_trace()?;
                 #[cfg(feature = "trace")]
                 if _i.is_multiple_of(WIN) {
                     let dt = win_t.elapsed().as_secs_f64();
-                    let (dh, dm) = (self.pin.hits - win_hit, self.pin.misses - win_miss);
+                    let (dh, dm) = (self.pin.routed.hits() - win_hit, self.pin.routed.misses() - win_miss);
                     let hit_pct = 100.0 * dh as f64 / (dh + dm).max(1) as f64;
                     // Tokens per PASS is now ≥ 1, so the window's rate has to divide the
                     // tokens actually emitted by the wall, not WIN by it.
@@ -2591,7 +2606,7 @@ impl<'a> GpuEngine<'a> {
                     );
                     win_t = std::time::Instant::now();
                     win_gen = generated.len();
-                    (win_hit, win_miss) = (self.pin.hits, self.pin.misses);
+                    (win_hit, win_miss) = (self.pin.routed.hits(), self.pin.routed.misses());
                 }
             }
             Ok::<_, anyhow::Error>((hit0, miss0, fetch0, io0, decode_wall))
@@ -2606,22 +2621,22 @@ impl<'a> GpuEngine<'a> {
         // outlived the last use of it until 2026-07-31, along with `tokio-stream`, which
         // had none at all.
         let summary = self.prof.summary(
-            self.pin.hits - hit0,
-            self.pin.misses - miss0,
+            self.pin.routed.hits() - hit0,
+            self.pin.routed.misses() - miss0,
             bytes_per_expert,
-            self.pin.fetch_ns().saturating_sub(fetch0),
-            self.pin.io_wait_ns().saturating_sub(io0),
+            self.pin.routed.fetch_ns().saturating_sub(fetch0),
+            self.pin.routed.io_wait_ns().saturating_sub(io0),
         );
         summary.report();
         // Zero on every run measured so far, and that IS the claim: the ticket gate on
         // staging-slot hand-out is satisfied on arrival for every read the engine issues,
         // because each is awaited inside its issuing layer. Reported when it is not, since
         // the alternative is the gate silently becoming the bottleneck it exists to prevent.
-        if self.pin.slot_stalls() > 0 {
+        if self.pin.routed.slot_stalls() > 0 {
             tracing::warn!(
                 "staging-slot stalls: {} — a layer waited for a slot whose bounce copy had \
                  not retired. The ring is undersized for the lookahead.",
-                self.pin.slot_stalls()
+                self.pin.routed.slot_stalls()
             );
         }
         if self.mtp_seen > 0 {

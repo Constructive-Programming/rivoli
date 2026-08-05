@@ -573,7 +573,7 @@ pub struct ProfileSummary {
     pub cpu_launch_ms: f64,
     /// Host time in `route_into` — sigmoid/bias/top-k over 256 experts per MoE layer.
     pub cpu_route_ms: f64,
-    /// Host time in `Pin::submit_layer` — residency, policy bookkeeping, read specs.
+    /// Host time in `RoutedPool::submit` — residency, policy bookkeeping, read specs.
     pub cpu_submit_ms: f64,
     /// The blocking half of `route_ms` (the gate-logits D2H).
     pub route_wait_ms: f64,

@@ -49,7 +49,7 @@ use std::thread::JoinHandle;
 
 /// One cold read: file range → pool slot. `dst` is the DMA TARGET for that slot, valid
 /// across threads and never CPU-dereferenced here — under HIP the pool's unified pointer,
-/// under Vulkan its host mapping (`ArenaPool::host_ptr`, not `ptr`).
+/// under Vulkan its host mapping (`RoutedPool::host_ptr`, not `ptr`).
 pub struct ReadSpec {
     pub fd: RawFd,
     pub begin: usize,
