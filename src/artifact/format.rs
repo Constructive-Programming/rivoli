@@ -14,7 +14,7 @@
 //!                        #   e4m3 and rides `resident.safetensors`. See [`RoutedFmt`].
 //! ```
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -520,9 +520,20 @@ impl F4Expert<'_> {
     /// the file's length.
     fn spans(&self) -> Result<Vec<(usize, &[u8])>> {
         let (hidden, moe_inter, base) = (self.hidden, self.moe_inter, &self.base);
+        // The offsets come from `f4_slot_offsets` — the SAME function the streaming pool
+        // points its `ExpertDescF4` at (`memory::routed::TierFmt`). This used to walk the
+        // spans and accumulate `off` itself, which made the writer and the reader two
+        // implementations of one layout: a shifted scale span would have been written and
+        // read consistently by rivoli and disagreed with nothing until the kernel decoded a
+        // projection against another one's exponents. Now a change to the layout moves both
+        // ends or neither.
+        let off = crate::artifact::quant::f4_slot_offsets(hidden, moe_inter);
         let mut out = Vec::with_capacity(6);
-        let mut off = 0usize;
-        for (proj, (o_dim, i_dim)) in crate::artifact::quant::v4_expert_projs(hidden, moe_inter) {
+        for (p, (proj, (o_dim, i_dim))) in
+            crate::artifact::quant::v4_expert_projs(hidden, moe_inter)
+                .into_iter()
+                .enumerate()
+        {
             // Shapes are checked, not trusted: `[o, i/2]` and `[o, i/32]` are the only pair
             // the byte counts below are correct for, and a transposed or mis-blocked source
             // would otherwise copy the right NUMBER of bytes in the wrong order — a file
@@ -546,14 +557,43 @@ impl F4Expert<'_> {
                 w.len() == wb && sc.len() == o_dim * groups,
                 "{base}.{proj}: source spans are shorter than their shapes"
             );
-            out.push((off, w));
-            off += wb;
-            out.push((off, sc));
-            off += o_dim * groups;
+            // **The e8m0 NaN check, and this is the one place in the engine that can make
+            // it.** `0xff` is the format's NaN. The kernel decodes it correctly
+            // (`common.hpp::e8m0f` returns a quiet NaN rather than `2^128`) but cannot
+            // REFUSE it, and `moe_fixed`'s saturating clamp then launders the NaN into a
+            // finite ±2^14 — so one bad byte is 32 weights of plausible garbage with no
+            // error anywhere. `docs/investigations/v4-flash-port.md` §S3 requirement 10.
+            //
+            // It runs HERE, at repack, because this is the only path that reads every
+            // routed scale byte: at decode the bytes DMA from NVMe straight into the pool
+            // slot and the host never sees them. Measured on the shipped 43-layer set
+            // (9,261,023,232 scale bytes): 9 distinct codes, all in `0x76..=0x7e`
+            // (2^-9..2^-1), zero `0x00` and zero `0xff` — so this guard is green on every
+            // artifact that exists, and the only thing that has made it speak is the
+            // injection in this file's own
+            // `an_e8m0_nan_scale_byte_is_refused_at_repack_and_a_subnormal_one_is_not`.
+            //
+            // `0x00` is deliberately NOT refused. It is `2^-127`, a legal encoding that
+            // `e8m0f` and `quant::e8m0` both decode exactly (f32 carries it as a
+            // subnormal); refusing it would be inventing a rule the format does not have.
+            // The reason it is worth a sentence is that `b << 23` WOULD hand back +0, which
+            // is why both decoders special-case it.
+            if let Some(k) = sc.iter().position(|&b| b == 0xff) {
+                bail!(
+                    "{base}.{proj}.scale[{}][{}] is 0xff — the e8m0 NaN. The FP4 kernels \
+                     cannot reject it and `moe_fixed`'s clamp turns it into a finite \
+                     ±2^14, so a whole {}-weight group would decode to plausible garbage.",
+                    k / groups,
+                    k % groups,
+                    crate::artifact::quant::F4_GROUP,
+                );
+            }
+            out.push((off[p * 2], w));
+            out.push((off[p * 2 + 1], sc));
         }
-        // No `off == f4_expert_bytes(...)` assertion here: both sides sum the same
-        // `f4_proj_bytes` over the same `vq_expert_layout`, so it can never fire. The
-        // check that CAN is `pack`'s, on the buffer it was handed.
+        // No `off[5] + …== f4_expert_bytes(…)` assertion here: `slot_offsets` derives both
+        // from the same per-projection byte counts, so it can never fire. The check that
+        // CAN is `pack`'s, on the buffer it was handed.
         Ok(out)
     }
 
@@ -581,6 +621,14 @@ impl F4Expert<'_> {
     /// Note that `diff` shares `spans()` with [`Self::pack`], so against a block derived
     /// from `pack` it is a tautology; its value is against a block read back from DISK,
     /// which is the only way `--verify` uses it.
+    ///
+    /// **Sharing `spans()` also means `diff` inherits its e8m0 `0xff` refusal, so on a source
+    /// carrying one it returns `Err` instead of a byte list.** Deliberate: a source with an
+    /// e8m0 NaN is unusable whether or not the bytes round-tripped, and "your source has a
+    /// NaN scale at w3[7][2]" is the more actionable of the two reports. `convert_v4
+    /// --verify` propagates it and never reaches its "N bytes differ" summary. Nothing
+    /// observable changes on the shipped artifact — measured zero `0xff` across all
+    /// 9,261,023,232 of its scale bytes.
     pub fn diff(&self, block: &[u8]) -> Result<Vec<usize>> {
         let mut bad = Vec::new();
         for (off, want) in self.spans()? {
@@ -889,7 +937,7 @@ impl ExpertHeader {
 /// it rides `resident.safetensors` instead. Verified against the shipped artifact:
 /// `L00.f4` is `4096 + 256 × 13369344 = 3422556160` bytes exactly, so the `n_experts + 1`
 /// this replaced demanded 13.37 MB that is not in the file.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoutedFmt {
     Vq3,
     I4,
@@ -897,8 +945,9 @@ pub enum RoutedFmt {
 }
 
 impl RoutedFmt {
-    /// The per-layer file's extension.
-    fn ext(self) -> &'static str {
+    /// The per-layer file's extension. Public because it is also how a routed FORMAT
+    /// names itself in a log line or an error — `RoutedPool` reports its tier with it.
+    pub fn ext(self) -> &'static str {
         match self {
             RoutedFmt::Vq3 => "vq3",
             RoutedFmt::I4 => "i4",
@@ -937,6 +986,20 @@ impl RoutedFmt {
         match self {
             RoutedFmt::Vq3 | RoutedFmt::I4 => true,
             RoutedFmt::F4 => false,
+        }
+    }
+
+    /// The six byte offsets of this format's projections inside one expert block, in
+    /// descriptor field order. Beside [`Self::geometry`] because the block SIZE and the
+    /// layout INSIDE it are one fact about a format — and because **no downstream check can
+    /// catch them being paired wrongly**: see `quant::f4_slot_offsets`, which has the
+    /// arithmetic. Derived here, so the pairing is unrepresentable.
+    fn slot_offsets(self, hidden: usize, moe_inter: usize) -> [usize; 6] {
+        use crate::artifact::quant::{f4_slot_offsets, i4_slot_offsets, vq_slot_offsets};
+        match self {
+            RoutedFmt::Vq3 => vq_slot_offsets(hidden, moe_inter),
+            RoutedFmt::I4 => i4_slot_offsets(hidden, moe_inter),
+            RoutedFmt::F4 => f4_slot_offsets(hidden, moe_inter),
         }
     }
 
@@ -1022,6 +1085,11 @@ pub struct ExpertSet {
     /// check in [`Self::open_routed`] can never disagree about whether block `n_experts`
     /// exists.
     has_shared: bool,
+    /// Which format these blocks are, and where its six projections sit inside one — both
+    /// resolved at open, from the same [`RoutedFmt`] that sized the file, so a tier cannot
+    /// be built against another format's layout ([`RoutedFmt::slot_offsets`]).
+    fmt: RoutedFmt,
+    slot_offsets: [usize; 6],
 }
 
 impl ExpertSet {
@@ -1119,7 +1187,30 @@ impl ExpertSet {
             expert_bytes,
             hbytes,
             has_shared,
+            fmt,
+            slot_offsets: fmt.slot_offsets(hidden, moe_inter),
         })
+    }
+
+    /// Which routed format this set holds.
+    pub fn fmt(&self) -> RoutedFmt {
+        self.fmt
+    }
+
+    /// The six projection offsets inside one of this set's expert blocks
+    /// ([`RoutedFmt::slot_offsets`]).
+    pub fn slot_offsets(&self) -> [usize; 6] {
+        self.slot_offsets
+    }
+
+    /// The layer range this set holds, absolute ids, end-exclusive.
+    pub fn layers(&self) -> std::ops::Range<usize> {
+        self.first_layer..self.n_layers
+    }
+
+    /// Routed experts per layer. Excludes the shared block where the format has one.
+    pub fn n_experts(&self) -> usize {
+        self.n_experts
     }
 
     /// The int3-VQ set by loose dimensions — `tests/artifact.rs` opens the shipped `.vq3`
@@ -1415,20 +1506,38 @@ mod tests {
 
     impl F4Fixture {
         fn new(tag: &str) -> Self {
+            Self::with_scale_byte(tag, None)
+        }
+
+        /// `poison = Some((slot, k, b))` overwrites projection `slot`'s scale byte `k` with
+        /// `b` — the one-field perturbation the e8m0 cases below need, so the control and
+        /// the break differ in exactly one byte and nothing else.
+        fn with_scale_byte(tag: &str, poison: Option<(usize, usize, u8)>) -> Self {
             use crate::artifact::quant::{F4_GROUP, f4_groups, f4_row_bytes, v4_expert_projs};
             let dir = tmpdir(&format!("f4_{tag}"));
             let (hidden, moe_inter) = (64, 32);
             let mut w = SafeWriter::new();
-            for (proj, (o_dim, i_dim)) in v4_expert_projs(hidden, moe_inter) {
+            for (slot, (proj, (o_dim, i_dim))) in
+                v4_expert_projs(hidden, moe_inter).into_iter().enumerate()
+            {
                 // `tag` is '1' | '3' | '2', which keeps the three projections distinct —
                 // in particular w1 != w3, which have identical shapes.
                 let t = usize::from(proj.as_bytes()[1]);
                 let weight: Vec<u8> = (0..o_dim * f4_row_bytes(i_dim))
                     .map(|k| ((k * 7 + t) % 251) as u8)
                     .collect();
-                let scale: Vec<u8> = (0..o_dim * f4_groups(i_dim))
+                // 100..=149 — inside the band the SHIPPED artifact actually uses
+                // (measured 2026-08-05 over all 9,261,023,232 of its scale bytes: 9 distinct
+                // codes, 0x76..=0x7e), and in particular never 0xff. So the clean fixture
+                // exercises the accept path rather than the reject one.
+                let mut scale: Vec<u8> = (0..o_dim * f4_groups(i_dim))
                     .map(|k| (100 + (k + t) % 50) as u8)
                     .collect();
+                if let Some((s, k, b)) = poison
+                    && s == slot
+                {
+                    scale[k] = b;
+                }
                 w.add(format!("e.{proj}.weight"), Dtype::I8, vec![o_dim, i_dim / 2], weight);
                 w.add(
                     format!("e.{proj}.scale"),
@@ -1459,6 +1568,78 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// **An e8m0 `0xff` scale byte is refused at repack, and `0x00` is not.**
+    ///
+    /// `0xff` is the format's NaN. `common.hpp::e8m0f` decodes it correctly — to a quiet
+    /// NaN, which is the right answer — and then `moe_fixed`'s saturating clamp launders it
+    /// into a finite ±2^14, so a single bad byte becomes 32 weights of plausible garbage
+    /// with no error anywhere downstream. The kernels cannot refuse it; this is the only
+    /// path in the engine that reads every routed scale byte, because at decode they DMA
+    /// from NVMe straight into the pool slot and the host never sees them.
+    /// `docs/investigations/v4-flash-port.md` §S3 requirement 10.
+    ///
+    /// **Both directions, and the second is the one that needed measuring.** The guard must
+    /// fire on `0xff` in any of the three projections — proved by injecting one, per
+    /// projection, and requiring the message to name it. And it must leave everything else
+    /// bit-identical: the requirement was handed over as "reject `0x00`/`0xff`", and `0x00`
+    /// is a LEGAL encoding (`2^-127`, which f32 carries exactly as a subnormal and which
+    /// both `quant::e8m0` and `e8m0f` special-case for that reason). Refusing it would be
+    /// inventing a rule the format does not have, so a `0x00` fixture must pack unchanged —
+    /// and it must pack to the SAME bytes the clean control does apart from that one, which
+    /// is what stops this from being a test that any accept-everything packer passes.
+    ///
+    /// Measured before writing either half: over the shipped 43-layer set, 9,261,023,232
+    /// scale bytes, 9 distinct codes, all in `0x76..=0x7e`, **zero `0x00` and zero `0xff`**.
+    /// So this guard is green on every artifact that exists and the injection above is the
+    /// only thing that has ever made it speak.
+    #[test]
+    fn an_e8m0_nan_scale_byte_is_refused_at_repack_and_a_subnormal_one_is_not() {
+        use crate::artifact::quant::f4_expert_bytes;
+        let clean = F4Fixture::new("e8m0_ok");
+        let st = clean.open();
+        let n = f4_expert_bytes(clean.hidden, clean.moe_inter);
+        let mut base = vec![0u8; n];
+        clean
+            .expert(&st)
+            .pack(&mut base)
+            .expect("a fixture with no 0xff must pack");
+
+        // One `0xff` per projection, at a byte that is not the first — a guard that only
+        // looked at scale[0] would pass a first-byte-only test.
+        for slot in 0..3 {
+            let fx = F4Fixture::with_scale_byte(&format!("e8m0_nan{slot}"), Some((slot, 5, 0xff)));
+            let st = fx.open();
+            let e = format!(
+                "{:#}",
+                fx.expert(&st)
+                    .pack(&mut vec![0u8; n])
+                    .err()
+                    .unwrap_or_else(|| panic!("slot {slot}: a 0xff scale byte must be refused"))
+            );
+            let proj = crate::artifact::quant::V4_PROJ[slot];
+            assert!(
+                e.contains(&format!("{proj}.scale[")) && e.contains("0xff"),
+                "slot {slot}: the refusal must name the projection and the byte, got: {e}"
+            );
+        }
+
+        // `0x00` passes, and changes exactly the byte it was written into. Two assertions,
+        // because "it packed" alone would also hold for a packer that dropped the scales.
+        let fx = F4Fixture::with_scale_byte("e8m0_zero", Some((1, 5, 0x00)));
+        let st = fx.open();
+        let mut got = vec![0u8; n];
+        fx.expert(&st)
+            .pack(&mut got)
+            .expect("0x00 is 2^-127, a legal e8m0 encoding — it must NOT be refused");
+        let diff: Vec<usize> = (0..n).filter(|&k| got[k] != base[k]).collect();
+        let off = crate::artifact::quant::f4_slot_offsets(fx.hidden, fx.moe_inter);
+        assert_eq!(
+            diff,
+            vec![off[3] + 5],
+            "a 0x00 in w3's scales must move exactly that byte of the block"
+        );
     }
 
     /// **A packed `.f4` block is the six source tensors concatenated, in this order.**

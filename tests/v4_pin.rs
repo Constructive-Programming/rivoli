@@ -79,7 +79,11 @@ struct Seen {
 fn check_one(dir: &str) -> Seen {
     let mut seen = Seen::default();
     let cfg: V4Config = load_config(dir).unwrap();
-    let pin = V4Pin::build(dir, &cfg).unwrap_or_else(|e| panic!("{dir} must load: {e:#}"));
+    // `V4Pin::build` now also builds the `.f4` streaming pool, so it takes a device budget.
+    // 12 GiB against a 3-layer fixture's ~2.5 GiB resident leaves ~9.5 GiB of pool — the
+    // pool's own behaviour is `tests/v4_pool.rs`'s subject; here it only has to construct.
+    let pin = V4Pin::build(dir, &cfg, 12 << 30, "2q", Default::default(), None)
+        .unwrap_or_else(|e| panic!("{dir} must load: {e:#}"));
     let range = pin.range();
 
     // The pin holds the ARTIFACT's layers, not the model's. Both fixtures are partial on

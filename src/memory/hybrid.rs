@@ -34,7 +34,7 @@ pub trait HybridPolicy {
     /// Bytes currently resident — the pin/tests check this never exceeds the budget.
     fn resident_bytes(&self) -> usize;
 
-    /// Start a new batch (the pin's `submit_layer`): clears the per-batch pin set so the
+    /// Start a new batch (`RoutedPool::submit`): clears the per-batch pin set so the
     /// next batch's evictions may reclaim the previous batch's keys again.
     fn begin_batch(&mut self) {
         self.base().pinned.clear();
@@ -617,7 +617,7 @@ mod tests {
         );
     }
 
-    // Mirrors the pin's submit_layer BATCH protocol (get()+protect() every hit, THEN
+    // Mirrors `RoutedPool::submit`'s BATCH protocol (get()+protect() every hit, THEN
     // admit() every miss). A miss's eviction must never drop a key touched earlier in
     // the SAME batch, else the pin can't resolve its slot ("expert not resident after
     // alloc"). The other tests drive keys one-at-a-time, so they never hit this.

@@ -94,7 +94,7 @@ fn parse_trace(r: impl BufRead) -> Result<Vec<Decision>> {
 
 /// Replay `trace` through `policy` at `cap` unit slots; return the `loaded` (resident-hit)
 /// count over the demand accesses. Two-pass per layer — hits first (protected), then
-/// misses — mirroring the pin's `submit_layer`.
+/// misses — mirroring the pool's `RoutedPool::submit`.
 fn replay(policy: &str, cap: usize, split: TwoQSplit, trace: &[Decision]) -> Result<u64> {
     // Unit strides: budget `cap` bytes == `cap` slots, cold==hot so the split is by
     // slot count exactly as the single-format engine sees it.
