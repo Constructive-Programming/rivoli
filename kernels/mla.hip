@@ -263,9 +263,21 @@ extern "C" int rivoli_mla_value_fp8(
 // `a*c - b*s` emits 4 `v_mul_f32` and ZERO fma-class instructions, while
 // `mla_absorb_fp8` above — same file, same flags, outside this pragma — emits 14. A
 // pragma in the wrong place would have been invisible otherwise, since the wrong answer
-// is still a plausible float. (Counts elsewhere in this section are NOT evidence of
-// contraction: `1.0f/sqrtf(x)` lowers to `v_rcp` plus FMA Newton steps, which is the
-// divide's own implementation and not a fusion of anything written here.)
+// is still a plausible float.
+//
+// **"fma-class" here means `v_fma_f32` and `v_fmac_f32` ONLY** — float FMAs, the thing
+// `contract(off)` governs. Re-measured 2026-08-05 and both numbers stand, but the
+// distinction was not stated and it matters: a `v_fma|v_mac|v_mad` grep reports 1 for
+// `v4_rope` and 32 for `mla_absorb_fp8`, because `v_mad_u64_u32`/`v_mad_i64_i32` are
+// ADDRESS arithmetic that contraction neither does nor should touch. On a kernel with
+// nine of those, a genuine one-instruction regression is a 10% move in a number nobody
+// looks twice at — found by the indexer agent on `v4_indexer_score`, where the pragma
+// moved 1 `v_fmac_f32` to 0 while the naive count read 10 → 9. Count narrowly, and
+// compare a DELTA rather than an absolute.
+//
+// (Counts elsewhere in this section are NOT evidence of contraction: `1.0f/sqrtf(x)`
+// lowers to `v_rcp` plus FMA Newton steps, which is the divide's own implementation and
+// not a fusion of anything written here.)
 #pragma clang fp contract(off)
 
 

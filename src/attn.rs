@@ -8,7 +8,7 @@
 //! free functions above it — see the banner below `streaming_rows`. V4 is MQA and shares
 //! none of the MLA machinery, so nothing before that banner applies to it.
 
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 use crate::v4compress::LayerKind;
 
 /// Which tokens each decode step attends over. Selected once per layer per token.
@@ -172,7 +172,10 @@ impl Sel {
         // the real indexer is.
         if self.kind.has_indexer() && live > self.index_topk {
             bail!(
-                "v4 selection: {live} compressed blocks at position {} exceeds index_topk                  {} on a ratio-{ratio} layer. Past {} positions the block set is decided by                  the indexer's SCORES, which are not wired yet; a positional selection here                  keeps the oldest blocks and silently stops attending everything newer.",
+                "v4 selection: {live} compressed blocks at position {} exceeds index_topk {} on a \
+                 ratio-{ratio} layer. Past {} positions the block set is decided by the \
+                 indexer's SCORES, which are not wired yet; a positional selection here \
+                 keeps the OLDEST blocks and silently stops attending everything newer.",
                 self.start_pos + rows,
                 self.index_topk,
                 ratio * (self.index_topk + 1)
@@ -209,9 +212,15 @@ pub fn v4_topk_idxs(sel: Sel, out: &mut Vec<i32>) -> Result<(usize, usize)> {
     if sel.win == 0 {
         return Ok((0, 0));
     }
+    // `out` is APPENDED to, so every length check below is against this mark and not
+    // against `out.len()` outright.
+    let start = out.len();
     let (rows, cols) = sel.shape()?;
-    let n_comp = sel.n_comp()?;
     let win = crate::v4compress::window_topk(sel.win, sel.seqlen, sel.start_pos);
+    // The window columns `window_topk` actually produced; `n_comp` is the rest of `cols`.
+    // Derived from the fill rather than re-running `Sel::n_comp` — which `shape()` has
+    // already called, so a second call could only return the same value or diverge.
+    let n_comp = cols - win.first().map_or(0, Vec::len);
     let comp = if n_comp == 0 {
         Vec::new()
     } else {
@@ -220,32 +229,48 @@ pub fn v4_topk_idxs(sel: Sel, out: &mut Vec<i32>) -> Result<(usize, usize)> {
     };
     for (t, w) in win.iter().enumerate() {
         out.extend_from_slice(w);
-        // `n_comp == 0` means the layer has no compressor OR no block exists yet; either
-        // way `comp` is empty and the row is the window alone.
         if let Some(c) = comp.get(t) {
-            out.extend_from_slice(&c[..n_comp]);
+            out.extend_from_slice(c);
         }
     }
-    debug_assert_eq!(out.len() % cols, 0);
+    // ONE check, and it must be `ensure!` rather than `debug_assert!`: this crate's
+    // `[profile.release]` sets no `debug-assertions` and CLAUDE.md prescribes
+    // `cargo test --release`, so a `debug_assert!` here is compiled out of every build
+    // this repo runs — verified, `cfg!(debug_assertions)` is false under `-O` and the
+    // body is not even evaluated. A ragged selection buffer is a silent-wrong: the kernel
+    // reads a row's worth of whatever follows as attention indices.
+    //
+    // Against `start`, not `out.len()`, because this function APPENDS — a `% cols == 0`
+    // test on the whole buffer fires on a legitimate non-empty append and passes on a
+    // short final row. It covers a short `win`, a short `comp` row and a missing `comp`
+    // row together, so the per-row checks it replaced were three ways to say this.
+    ensure!(
+        out.len() - start == rows * cols,
+        "v4 selection: wrote {} entries, {rows}x{cols} needs {}",
+        out.len() - start,
+        rows * cols
+    );
     Ok((rows, cols))
 }
 
 #[cfg(test)]
 mod v4_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
     use super::*;
+    use crate::v4compress::LayerKind;
 
     #[test]
     fn window_topk_prefill_is_causal_and_masks_nothing_reachable() {
         let mut v = Vec::new();
         // Prompt shorter than the window: `cols` shrinks to the prompt, and row `t` sees
         // exactly `0..=t`. A caller that assumed `win` columns would read past the row.
-        let (rows, cols) = v4_topk_idxs(Sel { win: 8, comp: None, seqlen: 3, start_pos: 0 }, &mut v);
+        let (rows, cols) = v4_topk_idxs(Sel { win: 8, kind: LayerKind::Plain, index_topk: 0, seqlen: 3, start_pos: 0 }, &mut v).unwrap();
         assert_eq!((rows, cols), (3, 3));
         assert_eq!(v, vec![0, -1, -1, 0, 1, -1, 0, 1, 2]);
 
         // Prompt past the window: the oldest position drops out of each row.
         v.clear();
-        let (rows, cols) = v4_topk_idxs(Sel { win: 2, comp: None, seqlen: 4, start_pos: 0 }, &mut v);
+        let (rows, cols) = v4_topk_idxs(Sel { win: 2, kind: LayerKind::Plain, index_topk: 0, seqlen: 4, start_pos: 0 }, &mut v).unwrap();
         assert_eq!((rows, cols), (4, 2));
         assert_eq!(v, vec![0, -1, 0, 1, 1, 2, 2, 3]);
     }
@@ -255,20 +280,20 @@ mod v4_tests {
         let mut v = Vec::new();
         // Before the wrap: slots 0..=start_pos, then masked. Ascending, NOT rotated —
         // rotating here would name slots the prefill never wrote.
-        let (rows, cols) = v4_topk_idxs(Sel { win: 4, comp: None, seqlen: 1, start_pos: 2 }, &mut v);
+        let (rows, cols) = v4_topk_idxs(Sel { win: 4, kind: LayerKind::Plain, index_topk: 0, seqlen: 1, start_pos: 2 }, &mut v).unwrap();
         assert_eq!((rows, cols), (1, 4));
         assert_eq!(v, vec![0, 1, 2, -1]);
 
         // At exactly `win - 1` the ring is full and the rotation starts; `start_pos = 3`
         // wrote slot 3, so the oldest slot is 0 and the list is already in order.
         v.clear();
-        v4_topk_idxs(Sel { win: 4, comp: None, seqlen: 1, start_pos: 3 }, &mut v);
+        v4_topk_idxs(Sel { win: 4, kind: LayerKind::Plain, index_topk: 0, seqlen: 1, start_pos: 3 }, &mut v).unwrap();
         assert_eq!(v, vec![0, 1, 2, 3]);
 
         // Past the wrap: slot `start_pos % win` holds the newest token and must come
         // LAST. At start_pos=5, win=4 the newest is slot 1, so the order is 2,3,0,1.
         v.clear();
-        v4_topk_idxs(Sel { win: 4, comp: None, seqlen: 1, start_pos: 5 }, &mut v);
+        v4_topk_idxs(Sel { win: 4, kind: LayerKind::Plain, index_topk: 0, seqlen: 1, start_pos: 5 }, &mut v).unwrap();
         assert_eq!(v, vec![2, 3, 0, 1]);
         // Every slot appears exactly once once the ring is full -- a rotation that
         // dropped or repeated one would still look ordered.
@@ -309,7 +334,7 @@ mod v4_tests {
 /// and performs one block's launches, so `tests/v4_attn.rs` drives exactly what S3 will.
 #[cfg(feature = "rocm")]
 pub mod v4 {
-    use super::{LayerKind, Sel};
+    use super::LayerKind;
     use crate::artifact::model::V4Config;
     use crate::backend::hip::{
         launch_v4_act_quant, launch_v4_gemv_fp8, launch_v4_qk_norm, launch_v4_rmsnorm,
@@ -332,6 +357,54 @@ pub mod v4 {
         /// `F8_E8M0` byte to f32 at conversion (`format.rs::copy_fp8_e8m0`), exactly —
         /// every e8m0 code is a power of two and so is exact in f32.
         pub scale: *const f32,
+    }
+
+    /// A device RoPE table, carrying WHICH of the two `Attention.__init__` builds.
+    ///
+    /// **This exists because the gate provably cannot see the mistake.** A ratio-0 layer
+    /// uses `rope_theta = 10000` with YaRN disabled (`original_seq_len = 0`); every
+    /// compressed layer uses `compress_rope_theta = 160000` WITH it. The two tables have
+    /// the same type, the same stride and the same shape, so a bare `*const f32` cannot
+    /// tell them apart and swapping them is `Defect::RopeNoYarn` — plausible frequencies
+    /// at every scale, fluent wrong text. S3 requirement 4.
+    ///
+    /// Measured 2026-08-05 on the GPU, `tests/v4_compress_kernel.rs`'s `ratio4/decode`
+    /// cell: the no-yarn impersonation is **bit-identical to the defect oracle** (max 0 of
+    /// 3072) and **8 bf16 codes from clean**. Units matter, and an earlier draft of this
+    /// paragraph had them wrong by 16x: `E4M3_ULP` is 16 bf16 codes and `RESOLVABLE` is
+    /// `4 * E4M3_ULP` = 64, so 8 is HALF an e4m3 step, not 8 of them. Prefill separates at
+    /// 31,215.
+    ///
+    /// **So that assertion is RED, and was already red at `78796eb`** — control run, 6
+    /// passed / 2 failed at both revisions, all 49 measurement lines byte-identical. It is
+    /// S2's inherited failure and is NOT evidence this type works. What it does establish
+    /// is that no decode-side numeric gate can see the swap, which is why the type carries
+    /// it instead.
+    ///
+    /// A caller can still hand [`RopeTable::yarn`] the ratio-0 pointer — but it has to
+    /// write the word, and `attention` checks the tag against the layer class it was given.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct RopeTable {
+        ptr: *const f32,
+        yarn: bool,
+    }
+
+    impl RopeTable {
+        /// The `compress_ratio == 0` table: base `rope_theta`, interpolation branch OFF.
+        ///
+        /// # Safety
+        /// `ptr` must be a live device allocation covering every position the step reaches.
+        pub unsafe fn ratio0(ptr: *const f32) -> Self {
+            Self { ptr, yarn: false }
+        }
+
+        /// The compressed layers' table: `compress_rope_theta` WITH YaRN.
+        ///
+        /// # Safety
+        /// As [`RopeTable::ratio0`].
+        pub unsafe fn yarn(ptr: *const f32) -> Self {
+            Self { ptr, yarn: true }
+        }
     }
 
     /// One layer's attention weights, device-resident.
@@ -396,8 +469,8 @@ pub mod v4 {
     pub struct Io {
         /// `[m, dim]` — `attn_norm`'s output. Not modified.
         pub x: *const f32,
-        /// Interleaved `(cos, sin)`, from [`super::v4_rope_table_ratio0`].
-        pub freqs: *const f32,
+        /// Interleaved `(cos, sin)`, TAGGED with which of the two tables it is.
+        pub freqs: RopeTable,
         /// `[idxs_shape.0, idxs_shape.1]` i32, from [`super::v4_topk_idxs`].
         pub idxs: *const i32,
         /// The `(rows, cols)` the caller actually uploaded. Checked against what this
@@ -607,12 +680,28 @@ pub mod v4 {
     /// `act_quant(kv[..., :-rope_head_dim], **64**, …)` — model.py:512, and NOT the 128
     /// every `Linear` uses.
     ///
-    /// **The oracle provably cannot see this number.** A ue8m0 scale is a power of two
-    /// and e4m3 is exactly scale-invariant under those, so re-blocking changes no value
-    /// until a block spans ~2^13 of dynamic range, which activations do not
-    /// (`tests/v4_oracle.rs::act_quant_block_size_is_almost_invisible_under_ue8m0_scales`
-    /// measures this and demotes `Defect::KvActQuantBlock128` out of the defect matrix
-    /// for it). It is 64 because model.py:512 says 64.
+    /// **CORRECTED 2026-08-05: the oracle CAN see this number; the max-ULP metric cannot.**
+    /// This said "provably cannot see", from the argument that a ue8m0 scale is a power of
+    /// two and e4m3 is exactly scale-invariant under those. The argument is sound only
+    /// while both blockings keep every value in range, and it breaks at a rounding
+    /// boundary. Measured on the GPU at `78796eb` and `e213df1` alike, `ratio4/prefill`:
+    ///
+    /// ```text
+    /// clean:              max=16  differing=5/32768
+    /// KvActQuantBlock128: max=16  differing=6/32768
+    /// ```
+    ///
+    /// Same max ULP, one more differing element — so `broken != clean` and the defect is
+    /// observable. What is true is narrower: a gate that ranks on max ULP alone cannot
+    /// separate it, which is why it sits at `sep=16` under a 64-code floor.
+    ///
+    /// Worth keeping as a warning about its own shape: a first-principles argument strong
+    /// enough to read as settled ("powers of two, therefore exactly invariant") survived
+    /// three readers who each had the contradicting numbers in front of them. Where a
+    /// comment is about to say something *cannot* be observed, check a run, not a
+    /// derivation.
+    ///
+    /// It is 64 because model.py:512 says 64.
     const KV_QUANT_BLOCK: usize = 64;
 
     /// Run one V4 attention block.
@@ -675,12 +764,29 @@ pub mod v4 {
         let (nh, hd, rd) = (d.n_heads, d.head_dim, d.rope_head_dim);
         let (nhd, gd) = (nh * hd, nh * hd / d.o_groups);
         let gr = d.o_groups * d.o_lora_rank;
-        // `seqlen`/`start_pos` come from `step`, NOT from `sel` — the caller supplies the
-        // layer's geometry and this function owns the phase, so the two cannot disagree.
-        // The shape then comes from the same `Sel::shape` that `v4_topk_idxs` sizes its
-        // buffer with, so the check is that the caller filled `io.idxs` for this step and
-        // not that two derivations happened to agree.
-        let want_idxs = super::Sel { seqlen: m, start_pos: pos0, ..sel }.shape()?;
+        // The table must match the layer class. `Attention.__init__` selects on
+        // `compress_ratio` being truthy and nothing else, so that is the predicate here.
+        let wants_yarn = sel.kind.compressor_ratio().is_some();
+        ensure!(
+            io.freqs.yarn == wants_yarn,
+            "v4 attention: {:?} needs the {} RoPE table, caller supplied the {} one \
+             (Defect::RopeNoYarn — both tables are plausible and the text stays fluent)",
+            sel.kind,
+            if wants_yarn { "YaRN" } else { "ratio-0" },
+            if io.freqs.yarn { "YaRN" } else { "ratio-0" }
+        );
+        // `win`, `seqlen` and `start_pos` ALL come from this call, not from `sel` — the
+        // caller supplies the layer's class and `index_topk`, and this function owns the
+        // geometry. `win` was left to the caller for one round and two reviewers
+        // independently found the hole: `Dims::window` still drives every ring write
+        // (`pos % d.window`) and the persist copy, so a `Sel` disagreeing with it produced
+        // a selection over the wrong slot space that matched its own `idxs_shape` and
+        // passed the guard below — in-bounds reads, no crash, fluent wrong text. It also
+        // took `win == 0` out of reach, which `Dims::validate` already refuses but
+        // `Sel::shape`'s early return would otherwise have turned into a silent `(0, 0)`
+        // that skipped the `index_topk` refusal entirely.
+        let sel = super::Sel { win: d.window, seqlen: m, start_pos: pos0, ..sel };
+        let want_idxs = sel.shape()?;
         if io.idxs_shape != want_idxs {
             bail!(
                 "v4 attention: {step:?} needs a {want_idxs:?} selection, caller uploaded {:?}",
@@ -708,12 +814,12 @@ pub mod v4 {
             // scalar commutes with a rotation. Read off the reference, not inferred from
             // a green test.
             launch_v4_qk_norm(s.q, m * nh, hd, d.norm_eps)?;
-            launch_v4_rope(s.q, io.freqs, m * nh, hd, rd, pos0, nh, false)?;
+            launch_v4_rope(s.q, io.freqs.ptr, m * nh, hd, rd, pos0, nh, false)?;
 
             // -- kv --------------------------------------------------------------------
             launch_v4_gemv_fp8(s.xq, w.wkv.w, w.wkv.scale, m, hd, dim, FP8_BLOCK, 1, s.kv)?;
             launch_v4_rmsnorm(s.kv, w.kv_norm, m, hd, d.norm_eps)?;
-            launch_v4_rope(s.kv, io.freqs, m, hd, rd, pos0, 1, false)?;
+            launch_v4_rope(s.kv, io.freqs.ptr, m, hd, rd, pos0, 1, false)?;
             // PARTIAL: the RoPE'd tail keeps bf16 precision. Quantizing the whole entry
             // is the llama.cpp failure mode v4-flash-port.md §0.2 names -- it corrupts
             // the positional dims and produces noise without a crash.
@@ -808,7 +914,7 @@ pub mod v4 {
             )?;
 
             // -- output ----------------------------------------------------------------
-            launch_v4_rope(s.o, io.freqs, m * nh, hd, rd, pos0, nh, true)?;
+            launch_v4_rope(s.o, io.freqs.ptr, m * nh, hd, rd, pos0, nh, true)?;
             // `o.view(b, s, o_groups, -1)` needs no gather: group `g` is the contiguous
             // run of heads `[g * n_heads/o_groups, ...)`, all `head_dim` dims of each.
             // `groups = o_groups`: `o` is `m` rows of `o_groups` contiguous `gd`-wide
@@ -823,9 +929,9 @@ pub mod v4 {
     }
 }
 
-/// The two guards `attention` gained in S3 (requirements 6 and 7), exercised.
+/// The guards `attention` gained in S3, exercised — requirements 2, 4, 6 and 7.
 ///
-/// **Both fire before any device call**, which is what makes this testable without a GPU
+/// **Every guard fires before any device call**, which is what makes this testable without a GPU
 /// and is also the property being pinned: `d.validate()` and the `s.rows` check are the
 /// first two statements, so every pointer below can be dangling and never be read. If a
 /// guard stopped firing the test would not quietly pass — it would run on into
@@ -839,7 +945,10 @@ pub mod v4 {
 /// MESSAGE, and the two cases are chosen to cross: the `Dims` case has ample rows, and the
 /// rows case has valid dims. Neither can be passing for the other's reason.
 ///
-/// **SEEN RED, 2026-08-05, before being trusted green.** With `d.validate()?` deleted and
+/// **SEEN RED, 2026-08-05, before being trusted green — the two requirement-6/7 tests
+/// specifically.** The later tests carry their own mutation records in-line, and
+/// `compress_slot_places_...` never calls `attention` at all, so the dangling-pointer
+/// argument above does not describe it. With `d.validate()?` deleted and
 /// the `ensure!` weakened to `m <= usize::MAX`, both tests failed — and failed on the
 /// backstop's message (`needs a (4, 4) selection, caller uploaded (0, 0)` and
 /// `needs a (1, 128) selection, …`), which is the evidence that a disabled guard lands on
@@ -849,7 +958,9 @@ pub mod v4 {
 #[cfg(all(test, feature = "rocm"))]
 mod v4_guard_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
-    use super::v4::{Dims, Fp8W, Io, Scratch, Step, Weights, attention};
+    use super::v4::{Dims, Fp8W, Io, RopeTable, Scratch, Step, Weights, attention};
+    use super::Sel;
+    use crate::v4compress::LayerKind;
 
     /// The shipped V4 geometry, so a rejection below is about the guard and not about a
     /// shape the kernels would refuse anyway.
@@ -865,6 +976,12 @@ mod v4_guard_tests {
             window: 128,
             norm_eps: 1e-6,
         }
+    }
+
+    /// A ratio-0 layer's selection descriptor. The guards under test precede anything
+    /// that reads `kind`, so `Plain` keeps these cases about the guards.
+    fn plain() -> Sel {
+        Sel { win: 128, kind: LayerKind::Plain, index_topk: 0, seqlen: 1, start_pos: 0 }
     }
 
     /// Dangling, and never dereferenced: both guards return before the first launch.
@@ -885,7 +1002,8 @@ mod v4_guard_tests {
         let s = Scratch { rows, xq: n, qr: n, qrq: n, q: n, kv: n, o: n, y: n };
         let io = Io {
             x: c,
-            freqs: c,
+            // SAFETY: never dereferenced — both guards return first.
+            freqs: unsafe { RopeTable::ratio0(c) },
             idxs: std::ptr::null(),
             // DELIBERATELY a shape no step wants, so the pre-existing selection guard is a
             // BACKSTOP: if either guard under test stopped firing, control reaches that
@@ -906,7 +1024,7 @@ mod v4_guard_tests {
         let (w, s, io) = parts(1);
         // SAFETY: every pointer is null and none is read — the `rows` check precedes the
         // first launch, which is the property this asserts.
-        let e = unsafe { attention(&d, None, &w, &s, &io, Step::Prefill { seqlen: 4 }) }
+        let e = unsafe { attention(&d, plain(), &w, &s, &io, Step::Prefill { seqlen: 4 }) }
             .expect_err("a 4-row prefill into a 1-row scratch must be refused");
         let msg = format!("{e}");
         assert!(msg.contains("scratch rows"), "wrong rejection: {msg}");
@@ -915,11 +1033,106 @@ mod v4_guard_tests {
         // the pointers are null — but the message proves the guard is a bound and not a
         // constant `false`, which is the shape S2 shipped twice.
         let (w, s, io) = parts(4);
-        let msg = match unsafe { attention(&d, None, &w, &s, &io, Step::Prefill { seqlen: 4 }) } {
+        let msg = match unsafe { attention(&d, plain(), &w, &s, &io, Step::Prefill { seqlen: 4 }) } {
             Ok(()) => String::new(),
             Err(e) => format!("{e}"),
         };
         assert!(!msg.contains("scratch rows"), "the guard rejects a scratch that fits: {msg}");
+    }
+
+    /// Requirement 4, which no numeric gate can reach at `ratio4/decode`.
+    /// The invariant two reviewers found missing, independently.
+    ///
+    /// `Sel::win` must not be able to disagree with `Dims::window`, which drives every ring
+    /// write (`pos % d.window`) and the persist copy. `attention` overrides it for exactly
+    /// that reason; SEEN RED with the override removed, where the call accepts a
+    /// 64-column selection over a ring that rotates modulo 128.
+    #[test]
+    fn the_selection_window_cannot_disagree_with_the_ring_window() {
+        let d = dims(); // window 128
+        let (w, s, io) = parts(64);
+        let lying = Sel { win: 64, ..plain() };
+        // SAFETY: the shape guard precedes every launch.
+        let e = unsafe { attention(&d, lying, &w, &s, &io, Step::Decode { pos: 200 }) }
+            .expect_err("the (0, 0) idxs_shape in `parts` must be refused");
+        assert!(
+            format!("{e}").contains("(1, 128)"),
+            "attention took the selection width from the caller, not from Dims: {e}"
+        );
+    }
+
+    #[test]
+    fn attention_refuses_the_wrong_rope_table_for_the_layer_class() {
+        let d = dims();
+        let (w, s, io) = parts(64);
+        // A compressed layer handed the ratio-0 table. `io` carries `RopeTable::ratio0`.
+        // `index_topk` from the shipped config, not 0: at 0 every ratio-4 layer refuses
+        // on the first completed block, and the positive arm below would clear the
+        // RopeNoYarn check only to die on that instead — passing for the wrong reason.
+        let comp = Sel { kind: LayerKind::from_ratio(4), index_topk: 512, ..plain() };
+        // SAFETY: as elsewhere in this module — the check precedes every launch.
+        let e = unsafe { attention(&d, comp, &w, &s, &io, Step::Decode { pos: 7 }) }
+            .expect_err("a ratio-4 layer must refuse the ratio-0 table");
+        assert!(format!("{e}").contains("RopeNoYarn"), "wrong rejection: {e}");
+
+        // ...and the reverse, so this is not an "always refuse compressed" guard: a
+        // ratio-0 layer handed the YaRN table must also be refused.
+        let mut io_yarn = io;
+        io_yarn.freqs = unsafe { RopeTable::yarn(std::ptr::null()) };
+        let e = unsafe { attention(&d, plain(), &w, &s, &io_yarn, Step::Decode { pos: 7 }) }
+            .expect_err("a ratio-0 layer must refuse the YaRN table");
+        assert!(format!("{e}").contains("RopeNoYarn"), "wrong rejection: {e}");
+
+        // ...and the MATCHING pairs must get past this check, or it is a constant `false`.
+        for (sel, io) in [(plain(), io), (comp, io_yarn)] {
+            let msg = match unsafe { attention(&d, sel, &w, &s, &io, Step::Decode { pos: 7 }) } {
+                Ok(()) => String::new(),
+                Err(e) => format!("{e}"),
+            };
+            assert!(!msg.contains("RopeNoYarn"), "a matching table was refused: {msg}");
+        }
+    }
+
+    /// `compress_slot`'s two arms — requirement 2's arithmetic, which has no caller yet on
+    /// the decode side and would otherwise ship untested.
+    #[test]
+    fn compress_slot_places_a_decode_block_at_its_own_slot_never_the_next_free_one() {
+        let d = dims(); // window 128
+        let r4 = LayerKind::from_ratio(4);
+
+        // A ratio-0 layer never emits.
+        assert_eq!(d.compress_slot(LayerKind::Plain, Step::Decode { pos: 3 }), None);
+        assert_eq!(d.compress_slot(LayerKind::Plain, Step::Prefill { seqlen: 64 }), None);
+
+        // Decode emits only on the position that COMPLETES a block, at `pos / ratio`.
+        for pos in 0..12 {
+            let got = d.compress_slot(r4, Step::Decode { pos });
+            let want = ((pos + 1) % 4 == 0).then(|| (128 + pos / 4, 1));
+            assert_eq!(got, want, "pos {pos}");
+        }
+        // The slot is a function of `pos` ALONE — no counter, nothing carried between
+        // calls — which is what makes skipping steps harmless. That is requirement 2, and
+        // it is a property of the SIGNATURE as much as of the body: this function cannot
+        // append because it is not told how many blocks came before.
+        //
+        // (An earlier comment here claimed the test showed "a caller that appended would
+        // put pos 19's block at slot 1". It shows no such thing — an appending caller is
+        // not modelled here at all, and the mutation written to prove it,
+        // `(pos + 1) / ratio - 1`, is ALGEBRAICALLY IDENTICAL on the reachable domain,
+        // because `should_compress` has already forced `pos + 1` to be a multiple of
+        // `ratio`. It passed, and proved nothing. The mutations that do go red are an
+        // off-by-one slot and a dropped window base.)
+        assert_eq!(d.compress_slot(r4, Step::Decode { pos: 19 }), Some((128 + 4, 1)));
+        assert_eq!(d.compress_slot(r4, Step::Decode { pos: 7 }), Some((128 + 1, 1)));
+
+        // Prefill emits every COMPLETE block, based at `seqlen` — the concatenation's
+        // tail, not the persistent region's.
+        assert_eq!(d.compress_slot(r4, Step::Prefill { seqlen: 3 }), None);
+        assert_eq!(d.compress_slot(r4, Step::Prefill { seqlen: 4 }), Some((4, 1)));
+        assert_eq!(d.compress_slot(r4, Step::Prefill { seqlen: 13 }), Some((13, 3)));
+        // Ratio 128 at a 13-token prompt emits nothing — the cell the oracle's shipped
+        // goldens never exercise.
+        assert_eq!(d.compress_slot(LayerKind::from_ratio(128), Step::Prefill { seqlen: 13 }), None);
     }
 
     #[test]
@@ -930,7 +1143,7 @@ mod v4_guard_tests {
         d.head_dim = 0;
         let (w, s, io) = parts(64);
         // SAFETY: as above.
-        let e = unsafe { attention(&d, None, &w, &s, &io, Step::Decode { pos: 7 }) }
+        let e = unsafe { attention(&d, plain(), &w, &s, &io, Step::Decode { pos: 7 }) }
             .expect_err("a zero head_dim must be refused before any launch");
         let msg = format!("{e}");
         assert!(msg.contains("head_dim is zero"), "wrong rejection: {msg}");
@@ -940,7 +1153,7 @@ mod v4_guard_tests {
         // true. It reached a launcher as guard code 1001 before `from_config` grew this.
         let mut d = dims();
         d.rope_head_dim = d.head_dim;
-        let e = unsafe { attention(&d, None, &w, &s, &io, Step::Decode { pos: 7 }) }
+        let e = unsafe { attention(&d, plain(), &w, &s, &io, Step::Decode { pos: 7 }) }
             .expect_err("head_dim == rope_head_dim must be refused");
         assert!(format!("{e}").contains("is zero"), "wrong rejection: {e}");
     }

@@ -565,10 +565,20 @@ __device__ __forceinline__ unsigned char f2e4m3_rne(float x) {
     // `v4_act_quant` here; `common.hpp` is included ABOVE that pragma and clang attaches FP
     // options per expression at parse time, so inlining into a `contract(off)` caller does
     // NOT restore the property — the subnormal branch's `scaled - m` (fed by `a * 512.0f`)
-    // began fusing. Counted inside `v4_act_quant` at `--offload-arch=gfx1151 -O3`:
-    // **7 fma-class instructions at 78796eb, 8 with this pragma removed, 7 with it.** The
-    // check was run in that order precisely so it was seen to go red before being trusted
-    // green.
+    // began fusing. Counted inside `v4_act_quant` at `--offload-arch=gfx1151 -O3`, and the
+    // delta is **one `v_fma_f32`**: 4 at 78796eb, 5 with this pragma removed, 4 with it
+    // (6 / 7 / 6 counting `v_fmac_f32` too). A third tier of 7 / 8 / 7 is
+    // reachable by also counting the one `v_div_fmas_f32` — DON'T: that belongs to the f32
+    // divide expansion (`v_div_scale` x2, `v_div_fmas`, `v_div_fixup`, all present here),
+    // which `mla.hip`'s pragma note already excludes as contraction evidence. It shows up
+    // in a naive grep only because "di*v_fma*s" contains the substring. The check was run in that order precisely so it was seen to go red
+    // before being trusted green.
+    //
+    // **Count `v_fma_f32`/`v_fmac_f32`, and compare a DELTA rather than an absolute.** A
+    // `v_fma|v_mac|v_mad` grep reads 15 / 16 / 15 here, because eight `v_mad_u64_u32` are
+    // ADDRESS arithmetic that contraction neither does nor should touch — enough to make a
+    // one-instruction regression look like noise. Found on `v4_indexer_score`, where the
+    // same pragma moved 1 `v_fmac_f32` to 0 while a naive count read 10 → 9.
     //
     // Values do not move either way: reaching this branch bounds `a` to (2^-10, 2^-6),
     // where `a` is normal and `a * 512.0f` is exact, so the FMA elides two roundings that

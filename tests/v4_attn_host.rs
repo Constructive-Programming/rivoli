@@ -15,24 +15,27 @@
 //! misreading.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
-use rivoli::attn::{CompressSel, Sel, v4_topk_idxs};
+use rivoli::attn::{Sel, v4_topk_idxs};
 use rivoli::v4oracle::forward::window_topk;
 
 /// The engine's flat buffer, re-shaped into the oracle's row form so the two can be
 /// compared as the same object.
 fn engine_rows(win: usize, seqlen: usize, start_pos: usize) -> Vec<Vec<i64>> {
-    engine_sel(win, None, seqlen, start_pos)
+    engine_sel(win, LayerKind::Plain, 0, seqlen, start_pos)
 }
 
-/// The general form: `comp: None` is a ratio-0 layer, `Some` a compressed one.
+/// The general form. `LayerKind::Plain` is a ratio-0 layer, for which `index_topk` is
+/// never read.
 fn engine_sel(
     win: usize,
-    comp: Option<CompressSel>,
+    kind: LayerKind,
+    index_topk: usize,
     seqlen: usize,
     start_pos: usize,
 ) -> Vec<Vec<i64>> {
     let mut flat = Vec::new();
-    let (rows, cols) = v4_topk_idxs(Sel { win, comp, seqlen, start_pos }, &mut flat);
+    let sel = Sel { win, kind, index_topk, seqlen, start_pos };
+    let (rows, cols) = v4_topk_idxs(sel, &mut flat).expect("selection within index_topk");
     assert_eq!(flat.len(), rows * cols, "returned shape does not describe the buffer");
     flat.chunks_exact(cols).map(|r| r.iter().map(|&v| i64::from(v)).collect()).collect()
 }
@@ -155,7 +158,7 @@ fn win_one_diverges_from_the_reference_and_is_unreachable() {
     // would make the model attend only its own token. The assertion is here so that the
     // divergence is a decision on the record and not a latent surprise for S3.
     let mut flat = Vec::new();
-    let (rows, cols) = v4_topk_idxs(Sel { win: 1, comp: None, seqlen: 3, start_pos: 0 }, &mut flat);
+    let (rows, cols) = v4_topk_idxs(Sel { win: 1, kind: LayerKind::Plain, index_topk: 0, seqlen: 3, start_pos: 0 }, &mut flat).unwrap();
     assert_eq!((rows, cols), (3, 1), "win=1 prefill no longer takes the prefill branch");
     assert_eq!(flat, vec![0, 1, 2]);
     assert_eq!(engine_rows(1, 3, 0), window_topk(1, 3, 0), "engine and oracle still agree");
@@ -208,7 +211,7 @@ fn fp8_times_a_power_of_two_is_exact_in_bf16_over_the_range_the_checkpoint_uses(
 // The COMPRESSED half of the selection — S3 prerequisite 5.
 // ═══════════════════════════════════════════════════════════════════════════════════
 //
-// `v4_topk_idxs(win, Some(comp), ..)` is `torch.cat([get_window_topk_idxs(...),
+// `v4_topk_idxs(Sel { comp: Some(..), .. })` is `torch.cat([get_window_topk_idxs(...),
 // get_compress_topk_idxs(...)], dim=-1)`. The oracle's twin is the pair
 // `window_topk` / `compress_topk`, which it also concatenates — so the two sides are
 // again structurally different (one flat i32 buffer with a derived offset, versus two
@@ -223,7 +226,23 @@ fn fp8_times_a_power_of_two_is_exact_in_bf16_over_the_range_the_checkpoint_uses(
 // softmax folds in. No test in this file exercises one line of sparse selection, and none
 // is named as though it did.
 
+use rivoli::v4compress::LayerKind;
 use rivoli::v4oracle::forward::compress_topk;
+use rivoli::v4oracle::weights::V4Config as OracleCfg;
+
+/// `index_topk` from the shipped config, never a literal.
+///
+/// **NOT `artifact::model::V4Config`, which does not carry it.** Three types in this tree
+/// are called some variant of "V4 config" and only two hold `index_topk`:
+/// `v4oracle::weights::V4Config` (this one, 512) and `artifact::model::ModelConfig` —
+/// which is GLM's, whose copy is validated by `indexer_layout()` against GLM's IndexShare.
+/// The artifact's `V4Config`, the one the engine will actually decode from, declares
+/// `index_n_heads` and `index_head_dim` and stops there, even though the shipped
+/// `manifest.json` carries `"index_topk": 512`. Adding it is a one-line serde field in the
+/// loading agent's file; until then this is the only in-tree source that is not a literal.
+fn shipped_index_topk() -> usize {
+    OracleCfg::v4_flash().index_topk
+}
 
 /// The reference's `torch.cat`, built from the oracle's two halves at an EXPLICIT offset.
 ///
@@ -250,8 +269,7 @@ fn oracle_rows(win: usize, ratio: usize, seqlen: usize, start_pos: usize) -> Vec
 }
 
 fn engine_comp_rows(win: usize, ratio: usize, seqlen: usize, start_pos: usize) -> Vec<Vec<i64>> {
-    let sel = CompressSel { ratio, index_topk: (ratio == 4).then_some(512) };
-    engine_sel(win, Some(sel), seqlen, start_pos)
+    engine_sel(win, LayerKind::from_ratio(ratio), shipped_index_topk(), seqlen, start_pos)
 }
 
 /// Shapes a compressed layer actually reaches. `seqlen` straddles multiples of `ratio`
@@ -314,40 +332,60 @@ fn the_compressed_comparison_can_fail() {
 }
 
 #[test]
-fn index_topk_caps_the_indexer_layers_and_only_those() {
-    // Behaviour, not a constructor: `index_topk: None` must mean "no cap", which is what a
-    // ratio-128 layer runs (`get_compress_topk_idxs` has no cap at all). Carrying a cap
-    // there would stop attending blocks past `128 * 513` positions, fluently.
+fn the_positional_selection_refuses_past_the_indexer_truncation_point() {
+    // **Refusal, not truncation, and the distinction is the whole point.**
+    // `Indexer.forward` keeps the top `index_topk` blocks BY SCORE. Keeping the first
+    // `index_topk` POSITIONALLY keeps the OLDEST — so past the cliff a capping
+    // implementation attends blocks 0..k and nothing newer, for the rest of the sequence,
+    // on 21 of 43 layers. Fluent, plausible, permanent, and it would produce a benchmark
+    // number nobody could impeach. `min(live, index_topk)` was written here first and is
+    // exactly that bug.
     //
-    // A SMALL cap, because the property needs a length where a cap would actually bite and
-    // the shipped 512 needs a 2052-token fixture to reach — the coverage cliff recorded in
-    // v4-flash-port.md. The arithmetic is the same at 3 as at 512.
+    // A SMALL `index_topk`, because the cliff at the shipped 512 needs a 2052-token
+    // fixture — the coverage cliff recorded in v4-flash-port.md. The arithmetic is the
+    // same at 3 as at 512, and the shipped value is asserted below rather than assumed.
+    let k = 3;
+    let r4 = LayerKind::from_ratio(4);
+    let sel = |kind, start_pos| Sel { win: 8, kind, index_topk: k, seqlen: 1, start_pos };
+
+    // Below the cliff: fine, and every existing block is selected.
+    // 3 blocks exist at start_pos 11 (`(11+1)/4`), and `index_topk` is 3.
+    assert_eq!(sel(r4, 11).shape().unwrap(), (1, 8 + 3));
+    // The last position that is still fine is `ratio * (index_topk + 1) - 1`.
+    assert_eq!(sel(r4, 4 * (k + 1) - 2).shape().unwrap().1, 8 + k);
+
+    // At the cliff: refused, and the message names the cause rather than a shape.
+    let e = sel(r4, 15).shape().expect_err("4 blocks against index_topk 3 must be refused");
+    let msg = format!("{e}");
+    assert!(msg.contains("index_topk"), "wrong rejection: {msg}");
+    assert!(msg.contains("OLDEST"), "the message does not say what goes wrong: {msg}");
+    // The message is a wrapped multi-line literal, and a dropped `\` continuation turns
+    // each wrap into ~18 literal spaces. That shipped once and this test stayed green,
+    // because greps for two words cannot see whitespace. Rust's own `\`-continuation eats
+    // the following indentation, so a correct literal has no double space anywhere.
+    assert!(!msg.contains("  "), "collapsed line continuation in the message: {msg:?}");
+    // ...and `v4_topk_idxs` refuses too, not just the shape probe. A fill that succeeded
+    // where the shape refused would be the engine attending a selection nothing checked.
     let mut flat = Vec::new();
-    let capped = CompressSel { ratio: 4, index_topk: Some(3) };
-    let uncapped = CompressSel { ratio: 4, index_topk: None };
+    assert!(v4_topk_idxs(sel(r4, 15), &mut flat).is_err(), "the fill did not refuse");
+    assert!(flat.is_empty(), "the fill wrote rows before refusing");
 
-    // Below the cap the two agree, which is what makes the pair above it meaningful:
-    // 3 blocks exist at start_pos 11 (`(11+1)/4`), and the cap is 3.
-    assert_eq!(Sel { win: 8, comp: Some(capped), seqlen: 1, start_pos: 11 }.shape().1, 8 + 3);
-    assert_eq!(Sel { win: 8, comp: Some(uncapped), seqlen: 1, start_pos: 11 }.shape().1, 8 + 3);
+    // A ratio-128 layer has NO `Indexer`, so `get_compress_topk_idxs` applies no cap and
+    // there is nothing to refuse. Same `index_topk`, same positions, must be accepted —
+    // this is the half that fails if the refusal is written against the ratio rather than
+    // against `has_indexer`.
+    let r128 = LayerKind::from_ratio(128);
+    assert!(!r128.has_indexer(), "the fixture no longer separates the two layer classes");
+    assert_eq!(sel(r128, 128 * (k + 1)).shape().unwrap().1, 8 + (k + 1));
 
-    // Above it they must diverge: 4 blocks exist at start_pos 15.
-    assert_eq!(
-        Sel { win: 8, comp: Some(capped), seqlen: 1, start_pos: 15 }.shape().1,
-        8 + 3,
-        "index_topk did not truncate where it must"
-    );
-    assert_eq!(
-        Sel { win: 8, comp: Some(uncapped), seqlen: 1, start_pos: 15 }.shape().1,
-        8 + 4,
-        "`None` applied a cap — a ratio-128 layer would lose blocks at long context"
-    );
-
-    // ...and the buffer the shape describes is the buffer that gets filled. A `shape()`
-    // that agreed with nothing would satisfy every assertion above.
-    flat.clear();
-    let sel = Sel { win: 8, comp: Some(capped), seqlen: 1, start_pos: 15 };
-    let (rows, cols) = v4_topk_idxs(sel, &mut flat);
-    assert_eq!((rows, cols), sel.shape());
-    assert_eq!(flat.len(), rows * cols);
+    // The shipped cliff, from the config rather than a literal.
+    let shipped = shipped_index_topk();
+    assert_eq!(shipped, 512);
+    assert_eq!(4 * (shipped + 1), 2052, "the truncation point moved");
+    assert!(Sel { win: 128, kind: r4, index_topk: shipped, seqlen: 1, start_pos: 2050 }
+        .shape()
+        .is_ok());
+    assert!(Sel { win: 128, kind: r4, index_topk: shipped, seqlen: 1, start_pos: 2051 }
+        .shape()
+        .is_err(), "2052 total positions must be the first refusal");
 }

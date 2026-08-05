@@ -64,8 +64,9 @@
 // apart and survives no skim.
 use rivoli::artifact::model::V4Config as EngineV4Config;
 use rivoli::artifact::quant::e8m0;
+use rivoli::v4compress::LayerKind;
 use rivoli::attn::{
-    v4::{Dims, Fp8W, Io, Scratch, Step, Weights, attention},
+    v4::{Dims, Fp8W, Io, RopeTable, Scratch, Step, Weights, attention},
     v4_rope_table_ratio0, v4_topk_idxs, Sel,
 };
 use rivoli::backend::hip::{
@@ -179,6 +180,16 @@ fn fixture() -> (V4Config, ToyModel) {
         .collect();
     m.layers[LAYER].wo_a = WMat::Fp8 { rows, cols, w, s };
     (cfg, m)
+}
+
+/// Every layer this file drives is ratio-0 (`LAYER = 0`), so the descriptor is `Plain` and
+/// `index_topk` is never read.
+///
+/// Every other `Sel` in this file is built from this one with `..plain_sel(d)`, so a field
+/// added to `Sel` lands in exactly one place. An earlier version of this comment claimed
+/// that and the call sites still spelled the literal out four more times.
+fn plain_sel(d: &Dims) -> Sel {
+    Sel { win: d.window, kind: LayerKind::Plain, index_topk: 0, seqlen: 1, start_pos: 0 }
 }
 
 fn dims(cfg: &V4Config) -> Dims {
@@ -417,7 +428,9 @@ impl Gpu {
     fn io(&mut self, x: &DeviceBuf, idxs: &DeviceBuf, idxs_shape: (usize, usize)) -> Io {
         Io {
             x: x.ptr().cast(),
-            freqs: self.freqs.ptr().cast(),
+            // SAFETY: `Gpu::new` builds this with `v4_rope_table_ratio0`, and `LAYER`
+            // is ratio-0 — the tag and the table agree by construction here.
+            freqs: unsafe { RopeTable::ratio0(self.freqs.ptr().cast()) },
             idxs: idxs.ptr().cast(),
             idxs_shape,
             cache: self.ring.ptr_mut().cast(),
@@ -429,7 +442,7 @@ impl Gpu {
     fn step(&mut self, d: &Dims, p: &Phase) -> [Vec<f32>; 4] {
         let x = dev_f32(golden(p, "attn_norm_out"));
         let mut idx = Vec::new();
-        let shape = v4_topk_idxs(Sel { win: d.window, comp: None, seqlen: p.m, start_pos: p.start_pos }, &mut idx);
+        let shape = v4_topk_idxs(Sel { seqlen: p.m, start_pos: p.start_pos, ..plain_sel(d) }, &mut idx).unwrap();
         let idxb = dev_i32(&idx);
         let io = self.io(&x, &idxb, shape);
         let step = if p.start_pos == 0 {
@@ -439,7 +452,7 @@ impl Gpu {
         };
         let s = self.scratch();
         // SAFETY: every buffer above outlives the `device_sync` on the next line.
-        unsafe { attention(d, None, &self.weights, &s, &io, step) }.expect("v4 attention");
+        unsafe { attention(d, plain_sel(d), &self.weights, &s, &io, step) }.expect("v4 attention");
         device_sync().expect("sync");
         let n = |b: &DeviceBuf, len: usize| read(b)[..len].to_vec();
         let nhd = d.n_heads * d.head_dim;
@@ -510,7 +523,7 @@ fn sparse_attn_alone_matches_the_oracle_including_the_sink() {
     let q = dev_f32(golden(p, "q"));
     let kv = dev_f32(golden(p, "kv_entry"));
     let mut idx = Vec::new();
-    let (rows, cols) = v4_topk_idxs(Sel { win: d.window, comp: None, seqlen: p.m, start_pos: 0 }, &mut idx);
+    let (rows, cols) = v4_topk_idxs(Sel { seqlen: p.m, start_pos: 0, ..plain_sel(&d) }, &mut idx).unwrap();
     assert_eq!(rows, p.m);
     let idxb = dev_i32(&idx);
     let mut o = dev_f32(&vec![0.0f32; p.m * d.n_heads * d.head_dim]);
@@ -675,12 +688,13 @@ fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
     assert!(short < d.window, "the collision this test needs does not exist");
     let x = dev_f32(&golden(p, "attn_norm_out")[..short * d.dim]);
     let mut idx = Vec::new();
-    let right = v4_topk_idxs(Sel { win: d.window, comp: None, seqlen: short, start_pos: 0 }, &mut idx);
+    let right = v4_topk_idxs(Sel { seqlen: short, start_pos: 0, ..plain_sel(&d) }, &mut idx).unwrap();
     assert_eq!(right, (short, short), "a short prefill no longer narrows its columns");
     let idxb = dev_i32(&idx);
     let mut io = Io {
         x: x.ptr().cast(),
-        freqs: gpu.freqs.ptr().cast(),
+        // SAFETY: as in `Gpu::io` — the ratio-0 table for a ratio-0 layer.
+        freqs: unsafe { RopeTable::ratio0(gpu.freqs.ptr().cast()) },
         idxs: idxb.ptr().cast(),
         idxs_shape: (short, d.window),
         cache: gpu.ring.ptr_mut().cast(),
@@ -690,7 +704,7 @@ fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
     // SAFETY: buffers outlive the call; it returns before any launch.
     let e = unsafe { attention(
                 &d,
-                None, &gpu.weights, &s, &io, Step::Prefill { seqlen: short }) }
+                plain_sel(&d), &gpu.weights, &s, &io, Step::Prefill { seqlen: short }) }
         .expect_err("a 4-row prefill must not accept an 8-column selection");
     assert!(format!("{e}").contains("selection"), "rejected for the wrong reason: {e}");
 
@@ -698,7 +712,7 @@ fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
     // SAFETY: as above; this one does launch, and the sync below joins it.
     unsafe { attention(
                 &d,
-                None, &gpu.weights, &s, &io, Step::Prefill { seqlen: short }) }
+                plain_sel(&d), &gpu.weights, &s, &io, Step::Prefill { seqlen: short }) }
         .expect("the correct shape must be accepted");
     device_sync().expect("sync");
 
@@ -709,11 +723,11 @@ fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
     io.idxs_shape = (1, short);
     let e = unsafe { attention(
                 &d,
-                None, &gpu.weights, &s, &io, Step::Decode { pos: PROMPT }) }
+                plain_sel(&d), &gpu.weights, &s, &io, Step::Decode { pos: PROMPT }) }
         .expect_err("a decode must not accept a narrowed prefill selection");
     assert!(format!("{e}").contains("selection"), "rejected for the wrong reason: {e}");
     let mut one = Vec::new();
-    let want = v4_topk_idxs(Sel { win: d.window, comp: None, seqlen: 1, start_pos: PROMPT }, &mut one);
+    let want = v4_topk_idxs(Sel { seqlen: 1, start_pos: PROMPT, ..plain_sel(&d) }, &mut one).unwrap();
     assert_eq!(want, (1, d.window), "decode no longer wants the full window");
     let oneb = dev_i32(&one);
     io.idxs = oneb.ptr().cast();
@@ -721,7 +735,7 @@ fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
     // SAFETY: as above.
     unsafe { attention(
                 &d,
-                None, &gpu.weights, &s, &io, Step::Decode { pos: PROMPT }) }
+                plain_sel(&d), &gpu.weights, &s, &io, Step::Decode { pos: PROMPT }) }
         .expect("the correct decode shape must be accepted");
     device_sync().expect("sync");
 }
