@@ -588,6 +588,28 @@ index with is in that list" was false when written. Nine extents, not eight.
 was the wrong list. Two reviews agreeing reads like confirmation and is not; they can share
 a blind spot exactly as an oracle and an implementation can. Run the third.
 
+### `debug_assert!` is dead in every build this project runs — found 2026-08-05
+
+`Cargo.toml`'s `[profile.release]` sets `lto` and `opt-level` and **no `debug-assertions`**;
+there is no `.cargo/config.toml` overriding it, and CLAUDE.md prescribes `--release` for every
+build, test and clippy run. So all **36 `debug_assert!` occurrences in `src/`** are compiled
+out of every binary anyone here has ever run. They are not weak checks; they are absent ones.
+
+Distribution: `artifact/quant.rs` 17, `gpu.rs` 4, `v4compress.rs` 2, `artifact/model.rs` 2,
+`fetch/stream.rs` 2, and one each in `fetch/asyncfetch.rs`, `backend/vk.rs` and the three
+`v4oracle` files.
+
+Two of them are load-bearing by their own documentation: `v4compress.rs`'s doc says they are
+"what ENFORCES the bsz=1 scope cut". They enforce nothing. That is this repo's most common
+review finding — *a comment asserting a check that does not exist* — reproduced 36 times by a
+profile setting rather than by any one author.
+
+**Do NOT fix this by setting `debug-assertions = true` in the release profile.** This is a
+decode engine measured in tok/s; turning on bounds and overflow checks across the hot path
+changes the thing being measured to fix a documentation problem. The repair is per-site:
+where a comment claims enforcement, promote to a real `assert!`/`ensure!` and pay the check;
+everywhere else, delete the `debug_assert!` and the claim with it. Booked for integration.
+
 ### Integration checkpoint — VERIFIED on the merged tree, 2026-08-05
 
 `c4367a9` (indexer) + `590cd65` (loading) merged into the integration branch and then
