@@ -124,6 +124,19 @@ fn routed_bytes(cfg: &V4Config, n_layers: usize) -> usize {
     n_layers * cfg.n_experts * f4_expert_stride(cfg.hidden, cfg.moe_inter)
 }
 
+/// One fixture, opened: the pin, a stream to enqueue ticket waits on, and the two things the
+/// cases index by. A struct because the three cases below take exactly these and `jscpd`
+/// refuses the third copy of the parameter list — which is the right call, since a
+/// `(&V4Config, &mut V4Pin, &Stream, usize, &str)` list is four same-shaped references and a
+/// transposition in it would compile.
+struct Case<'a> {
+    cfg: &'a V4Config,
+    pin: &'a mut V4Pin,
+    stream: &'a Stream,
+    layer: usize,
+    dir: &'a str,
+}
+
 fn open(dir: &str) -> (V4Config, V4Pin) {
     let cfg: V4Config = load_config(dir).unwrap();
     let pin = V4Pin::build(dir, &cfg, CAPACITY, "2q", Default::default(), None)
@@ -152,18 +165,18 @@ fn l0_2() -> Option<(V4Config, V4Pin, Stream, usize, String)> {
 ///    base, so `w3`'s scales are not `w2`'s;
 ///  * two different experts land in DIFFERENT slots holding DIFFERENT bytes, which is what
 ///    a pool that resolved every key to slot 0 would fail.
-#[test]
-fn a_resolved_slot_holds_that_experts_bytes_at_the_f4_offsets() {
-    let Some((cfg, mut pin, stream, layer, dir)) = l0_2() else { return };
+fn a_resolved_slot_holds_that_experts_bytes_at_the_f4_offsets(c: &mut Case<'_>) {
+    let Case { cfg, pin, stream, layer, dir } = c;
+    let (cfg, layer, dir) = (&**cfg, *layer, &**dir);
     // Not 0..k: expert ids that are far apart in the file, so a block-offset error of one
     // stride is visible rather than landing on a neighbour with similar content.
     let sel = [0usize, 7, 128, cfg.n_experts - 1];
-    let out = submit_and_land(&mut pin, &stream, layer, &sel);
+    let out = submit_and_land(pin, stream, layer, &sel);
 
     let off = f4_slot_offsets(cfg.hidden, cfg.moe_inter);
     let (_, _, len) = pin.f4.read_spec(layer, 0).unwrap();
     for (i, &e) in sel.iter().enumerate() {
-        let want = block_from_disk(&dir, &pin, layer, e);
+        let want = block_from_disk(dir, pin, layer, e);
         assert_eq!(want.len(), len);
         let base = out[i].gate.packed;
         assert_eq!(
@@ -203,7 +216,6 @@ fn a_resolved_slot_holds_that_experts_bytes_at_the_f4_offsets() {
 /// layer 3 and fail nothing else in this file. The comparison is against the FILE, resolved
 /// through the same `read_spec` the streamer used, so it is the bytes and not the arithmetic
 /// that is checked.
-#[test]
 fn the_pool_streams_by_absolute_layer_id_on_a_set_that_starts_at_three() {
     let Some(dir) = v4_artifact_dir::v4_artifact_l3_5("L03.f4") else { return };
     let (cfg, mut pin) = open(&dir);
@@ -256,6 +268,20 @@ fn the_pool_streams_by_absolute_layer_id_on_a_set_that_starts_at_three() {
         "expert {e} is past n_experts and must not resolve to layer 4's expert 0"
     );
     assert!(!pin.routed.resident(3, e));
+
+    // A selection wider than `submit`'s fixed `[bool; MAX_BATCH]` hit scratch. Refused, not
+    // indexed past — and it must be an `ensure!` and not a `debug_assert!`, because under
+    // `--release` (which every recorded benchmark runs) a `debug_assert!` is compiled out and
+    // this becomes an out-of-bounds panic mid-decode. V4 has 256 experts, so 33 is reachable.
+    let wide: Vec<usize> = (0..33).collect();
+    let e = format!(
+        "{:#}",
+        pin.routed
+            .submit(3, &wide, &[], &[], &mut o, &mut f, &mut t)
+            .err()
+            .expect("33 experts must be refused by the 32-slot batch scratch")
+    );
+    assert!(e.contains("batch scratch"), "got: {e}");
 }
 
 /// The pool refuses a budget it cannot make progress on, rather than failing mid-run with
@@ -265,7 +291,6 @@ fn the_pool_streams_by_absolute_layer_id_on_a_set_that_starts_at_three() {
 /// The number is the batch, not `top_k`: V4's are equal (single-row FP4 kernel), GLM's are
 /// not. Sized from the artifact's own resident footprint so the case is reached by a budget
 /// too small for six experts and not by one too small for the resident set.
-#[test]
 fn a_budget_too_small_for_one_batch_is_refused_at_build() {
     let Some(dir) = v4_artifact_dir::v4_artifact("L00.f4") else { return };
     let cfg: V4Config = load_config(&dir).unwrap();
@@ -295,13 +320,13 @@ fn a_budget_too_small_for_one_batch_is_refused_at_build() {
 /// The eviction sweep is sized from the pool's own arithmetic rather than from a guess: at
 /// `CAPACITY` the fixture leaves ~9.5 GiB for a 10.27 GB routed set, so touching every
 /// expert of every layer must evict.
-#[test]
-fn the_pool_hits_on_a_resubmit_and_evicts_when_the_working_set_exceeds_the_budget() {
-    let Some((cfg, mut pin, stream, layer, _dir)) = l0_2() else { return };
+fn the_pool_hits_on_a_resubmit_and_evicts_when_the_working_set_exceeds_the_budget(c: &mut Case<'_>) {
+    let Case { cfg, pin, stream, layer, .. } = c;
+    let (cfg, layer) = (&**cfg, *layer);
     let sel = [3usize, 9, 200];
 
     let (h0, m0) = (pin.routed.hits(), pin.routed.misses());
-    submit_and_land(&mut pin, &stream, layer, &sel);
+    submit_and_land(pin, stream, layer, &sel);
     assert_eq!(
         (pin.routed.hits() - h0, pin.routed.misses() - m0),
         (0, sel.len() as u64),
@@ -312,7 +337,7 @@ fn the_pool_hits_on_a_resubmit_and_evicts_when_the_working_set_exceeds_the_budge
     // **The premise, asserted rather than assumed.** Everything below is about what happens
     // when the working set exceeds the pool; if it does not, the sweep evicts nothing and
     // the failure message blames the pool for a property the fixture never asked of it.
-    let (budget, routed) = (pin.routed.budget(), routed_bytes(&cfg, pin.range().len()));
+    let (budget, routed) = (pin.routed.budget(), routed_bytes(cfg, pin.range().len()));
     assert!(
         budget * 2 < routed,
         "this fixture must be oversubscribed by a real margin, not by a rounding: pool \
@@ -322,7 +347,7 @@ fn the_pool_hits_on_a_resubmit_and_evicts_when_the_working_set_exceeds_the_budge
     );
 
     let (h1, m1) = (pin.routed.hits(), pin.routed.misses());
-    submit_and_land(&mut pin, &stream, layer, &sel);
+    submit_and_land(pin, stream, layer, &sel);
     assert_eq!(
         (pin.routed.hits() - h1, pin.routed.misses() - m1),
         (sel.len() as u64, 0),
@@ -334,7 +359,7 @@ fn the_pool_hits_on_a_resubmit_and_evicts_when_the_working_set_exceeds_the_budge
     // that the assertion above proved holds under half of them.
     for l in pin.range() {
         for chunk in (0..cfg.n_experts).collect::<Vec<_>>().chunks(cfg.top_k) {
-            submit_and_land(&mut pin, &stream, l, chunk);
+            submit_and_land(pin, stream, l, chunk);
         }
     }
     // **Counted over every key, not sampled on three.** `!sel.iter().all(resident)` passes
@@ -362,7 +387,7 @@ fn the_pool_hits_on_a_resubmit_and_evicts_when_the_working_set_exceeds_the_budge
         pin.range().len() * cfg.n_experts,
     );
     // And an evicted key re-reads correctly rather than resolving to a stale slot.
-    let out = submit_and_land(&mut pin, &stream, layer, &sel);
+    let out = submit_and_land(pin, stream, layer, &sel);
     assert_eq!(out.len(), sel.len());
 }
 
@@ -370,9 +395,9 @@ fn the_pool_hits_on_a_resubmit_and_evicts_when_the_working_set_exceeds_the_budge
 /// asserted on the V4 path because `gpu.rs`'s launch loop branches on `is_resident` to
 /// choose a stream, and a pool that handed out `RESIDENT` for a slot still being written
 /// would put the kernel on the compute stream with no wait at all.
-#[test]
-fn a_miss_carries_a_real_ticket_and_a_hit_carries_the_resident_one() {
-    let Some((_cfg, mut pin, stream, layer, _dir)) = l0_2() else { return };
+fn a_miss_carries_a_real_ticket_and_a_hit_carries_the_resident_one(c: &mut Case<'_>) {
+    let Case { pin, stream, layer, .. } = c;
+    let layer = *layer;
     let (mut o, mut f, mut t) = (Vec::new(), Vec::new(), Vec::new());
 
     pin.routed.submit(layer, &[42], &[], &[], &mut o, &mut f, &mut t).unwrap();
@@ -382,4 +407,39 @@ fn a_miss_carries_a_real_ticket_and_a_hit_carries_the_resident_one() {
 
     pin.routed.submit(layer, &[42], &[], &[], &mut o, &mut f, &mut t).unwrap();
     assert_eq!(t[0], Ticket::RESIDENT, "a hit must carry the satisfied ticket");
+}
+
+/// **ONE `#[test]`, and that is not tidiness — it is the only thing that keeps the device
+/// from being oversubscribed.**
+///
+/// libtest runs `#[test]` fns on parallel threads. Each case below builds a `V4Pin`, and a
+/// `V4Pin` is a `DeviceTier` allocation plus a pool VMM plus an io_uring ring — so five of
+/// them start at once, five tiers compete for a budget sized for one, and five `AsyncFetch`
+/// reapers race. Run that way on 2026-08-05 it **wedged the device**: 19 threads, two in
+/// `kfd_wait_on_events`, **four `io_sq_thread`s** (the tell — four rings, four pools), zero
+/// test output in 12 minutes, and it had to be killed by PID. That is CLAUDE.md's recorded
+/// `gpustream` hang, and here it was self-inflicted.
+///
+/// `--test-threads=1` fixes it and is the wrong fix: it lives in whoever remembers to type
+/// it, and the failure mode for forgetting is a wedged sole-tenant GPU. `tests/v4_pin.rs`
+/// already made this call — one test, an internal loop over fixtures — so this follows it.
+/// The cost is coarser test names; every assertion below carries its own message, which is
+/// what a failure actually needs.
+///
+/// **Order is load-bearing.** The `l0-2` cases share one pin to avoid re-reading its 2.6 GB
+/// resident set four times, so the residency-destroying sweep goes LAST: `hits_on_a_resubmit`
+/// asserts a cold pool misses everything, which a preceding sweep would have falsified.
+#[test]
+fn the_f4_streaming_pool() {
+    // No pin at all: this one asserts a build is REFUSED, so it must not hold the device.
+    a_budget_too_small_for_one_batch_is_refused_at_build();
+    // Its own artifact and its own pin — the only fixture whose range does not start at 0.
+    the_pool_streams_by_absolute_layer_id_on_a_set_that_starts_at_three();
+
+    let Some((cfg, mut pin, stream, layer, dir)) = l0_2() else { return };
+    let mut c = Case { cfg: &cfg, pin: &mut pin, stream: &stream, layer, dir: &dir };
+    a_resolved_slot_holds_that_experts_bytes_at_the_f4_offsets(&mut c);
+    a_miss_carries_a_real_ticket_and_a_hit_carries_the_resident_one(&mut c);
+    // LAST: evicts most of the pool.
+    the_pool_hits_on_a_resubmit_and_evicts_when_the_working_set_exceeds_the_budget(&mut c);
 }
