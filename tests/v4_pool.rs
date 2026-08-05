@@ -278,8 +278,7 @@ fn the_pool_streams_by_absolute_layer_id_on_a_set_that_starts_at_three() {
         "{:#}",
         pin.routed
             .submit(3, &wide, &[], &[], &mut o, &mut f, &mut t)
-            .err()
-            .expect("33 experts must be refused by the 32-slot batch scratch")
+            .expect_err("33 experts must be refused by the 32-slot batch scratch")
     );
     assert!(e.contains("batch scratch"), "got: {e}");
 }
@@ -442,4 +441,90 @@ fn the_f4_streaming_pool() {
     a_miss_carries_a_real_ticket_and_a_hit_carries_the_resident_one(&mut c);
     // LAST: evicts most of the pool.
     the_pool_hits_on_a_resubmit_and_evicts_when_the_working_set_exceeds_the_budget(&mut c);
+}
+
+/// **MEASUREMENT, not a gate.** `#[ignore]`d: it needs the 146 GB full artifact and ~2
+/// minutes of sole-tenant GPU, and it asserts almost nothing — it prints the two numbers the
+/// residency argument in `docs/investigations/v4-flash-port.md` was forced to borrow from
+/// GLM.
+///
+/// `cargo test --features rocm --test v4_pool -- --ignored --nocapture`, with
+/// `RIVOLI_V4_ARTIFACT_FULL` pointing at the 43-layer set.
+///
+/// **What it can and cannot measure, stated because the difference is the whole caveat.** It
+/// measures the per-miss cost and the achieved bandwidth of a 13,369,344-byte `.f4` block at
+/// the real stride, which is the half of the residency argument that does not need routing.
+/// It CANNOT measure a hit rate: that needs the router to choose experts, which needs the
+/// layer loop, which does not exist. So the traffic-per-token figures in that document stay
+/// arithmetic; only the price per byte becomes a measurement.
+///
+/// The pool is sized small on purpose (~4 GiB). Per-miss cost is a property of one aligned
+/// O_DIRECT read plus its bounce copy, not of how many slots sit beside it, and allocating
+/// the full ~106 GiB would spend two minutes on `VmmBuf::new` to measure the same thing.
+#[test]
+#[ignore = "measurement: needs the 146 GB full .f4 artifact and sole-tenant GPU"]
+fn measure_what_an_f4_miss_costs() {
+    let dir = std::env::var("RIVOLI_V4_ARTIFACT_FULL")
+        .unwrap_or_else(|_| "/var/db/rivoli/v4-f4-full".into());
+    let cfg: V4Config = load_config(&dir).unwrap();
+    let resident = std::fs::metadata(format!("{dir}/resident.safetensors")).unwrap().len() as usize;
+    let stride = f4_expert_stride(cfg.hidden, cfg.moe_inter);
+    let mut pin = V4Pin::build(&dir, &cfg, resident + (16 << 20) + (4 << 30), "2q",
+                               Default::default(), None).unwrap();
+    let stream = Stream::new().unwrap();
+    let range = pin.range();
+    assert_eq!(range.len(), cfg.n_layers, "this measurement wants the WHOLE 43-layer set");
+    println!(
+        "\n.f4 routed set: {} layers x {} experts x {stride} B = {:.2} GiB",
+        range.len(), cfg.n_experts,
+        routed_bytes(&cfg, range.len()) as f64 / (1u64 << 30) as f64,
+    );
+
+    // Distinct keys, `top_k` at a time, one layer after another — every one a cold miss.
+    // Spread across layers so the reads hit 43 different files, as a decode's would.
+    let batches: Vec<(usize, Vec<usize>)> = range
+        .clone()
+        .map(|l| (l, (0..cfg.top_k).map(|j| (l * 37 + j * 11) % cfg.n_experts).collect()))
+        .collect();
+    // One closure, two passes: `jscpd` refuses the second copy of a timed loop, and it is
+    // right to — the two passes must be the SAME work for the cold/warm ratio to mean
+    // anything, and two spellings is how they would stop being.
+    let pass = |pin: &mut V4Pin| {
+        let t = std::time::Instant::now();
+        for (l, sel) in &batches {
+            submit_and_land(pin, &stream, *l, sel);
+        }
+        t.elapsed()
+    };
+    let (h0, m0) = (pin.routed.hits(), pin.routed.misses());
+    let f0 = pin.routed.fetch_ns();
+    let wall = pass(&mut pin);
+    let (misses, fetch_ns) = (pin.routed.misses() - m0, pin.routed.fetch_ns() - f0);
+    assert_eq!(pin.routed.hits() - h0, 0, "every key here must be a cold miss");
+    assert_eq!(misses as usize, batches.len() * cfg.top_k);
+    let bytes = misses as f64 * stride as f64;
+    println!(
+        "COLD: {misses} misses, {:.2} GiB in {:.2} s\n  \
+         {:.3} ms/miss (wall)  {:.3} ms/miss (reaper fetch_ns)  {:.2} GB/s\n  \
+         slot_stalls {}  io_wait {:.2} s",
+        bytes / (1u64 << 30) as f64,
+        wall.as_secs_f64(),
+        wall.as_secs_f64() * 1e3 / misses as f64,
+        fetch_ns as f64 / 1e6 / misses as f64,
+        bytes / wall.as_secs_f64() / 1e9,
+        pin.routed.slot_stalls(),
+        pin.routed.io_wait_ns() as f64 / 1e9,
+    );
+
+    // The same keys again: all hits, so this prices what a resident expert costs the pool.
+    let (h1, m1) = (pin.routed.hits(), pin.routed.misses());
+    let hot = pass(&mut pin);
+    assert_eq!(pin.routed.misses() - m1, 0, "the second pass must be all hits");
+    println!(
+        "WARM: {} hits in {:.3} s = {:.3} ms/hit  ({:.0}x cheaper than a miss)\n",
+        pin.routed.hits() - h1,
+        hot.as_secs_f64(),
+        hot.as_secs_f64() * 1e3 / (pin.routed.hits() - h1) as f64,
+        wall.as_secs_f64() / hot.as_secs_f64(),
+    );
 }

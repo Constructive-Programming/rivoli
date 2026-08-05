@@ -1338,10 +1338,104 @@ the guard was trusted green.
 | `f4_slot_offsets` | f4 scale span 1 → 2 bytes per group | 4 tests FAILED across `quant`, `format` and `v4_loading` — the shipped-geometry pin, the tiling invariant, the repack concatenation, and the set's self-description |
 | `RoutedFmt::slot_offsets` derives from the format | `F4 =>` resolved through `i4_slot_offsets` | `an_f4_set_reports_the_format_range_and_slot_layout_it_was_opened_with` FAILED **at the toy dims** — and `f4_slot_offsets_match_the_shipped_block…` stayed GREEN, which is the §"Nothing structural separates" finding reproducing itself as a test result |
 
-`TierFmt::row`'s two bounds, `RoutedPool::submit`'s pre-flight range check, its
-`ensure!(sel.len() <= MAX_BATCH)`, and `RoutedPool::new`'s one-batch budget floor all have
-tests in `tests/v4_pool.rs` but need the device; **their break records are owed and are not
-claimed here.**
+**The four device-gated guards, measured 2026-08-05 inside the flock** (0 KFD holders
+verified with `find`, not `ls` — see the instrument note below). Each break was built OUTSIDE
+the lock, run inside it, then `git checkout --`'d; the control was re-run green afterwards.
+
+| guard | break | result |
+|---|---|---|
+| `submit` range-checks before mutating | deleted the pre-flight loop | `a refused submit admitted the key anyway` |
+| `TierFmt::addressable` bounds the EXPERT | dropped `ensure!(expert < n_experts)` | the alias-to-layer-4's-expert-0 assertion fired |
+| `RoutedPool::new`'s one-batch floor | made the `ensure!` vacuous | `a pool too small for one batch must be refused at build` |
+| `submit`'s `MAX_BATCH` bound | `ensure!` → `debug_assert!` | fired. On the dev profile the `debug_assert!` itself panics; under `--release` it is compiled out and `is_hit[i]` becomes an out-of-bounds index instead, which is why it must be an `ensure!` |
+
+### Running the pool tests in parallel WEDGED the device — 2026-08-05
+
+`tests/v4_pool.rs` shipped as five `#[test]` fns. libtest runs those on parallel threads, and
+each one builds a `V4Pin` — a `DeviceTier` allocation, a pool VMM, and an io_uring ring. Five
+started at once: **19 threads, two in `kfd_wait_on_events`, four `io_sq_thread`s** (the tell —
+four rings means four pools), zero test output in 12 minutes, killed by PID. That is
+CLAUDE.md's recorded intermittent `gpustream` hang, and here it was self-inflicted and
+reproducible rather than intermittent. Teardown was clean: 0 holders and the flock free
+afterwards.
+
+`--test-threads=1` fixes it and is the wrong fix — it lives in whoever remembers to type it,
+and the failure mode for forgetting is a wedged sole-tenant GPU. `tests/v4_pin.rs` had already
+made this call (one test, an internal loop over fixtures), so the file now follows it: **green
+in 3.52 s.** Order inside it is load-bearing — the residency-destroying sweep runs last,
+because the case before it asserts that a cold pool misses everything.
+
+> **Instrument note, from the coordinator and worth carrying.**
+> `ls /sys/class/kfd/kfd/proc/ | wc -l` returned **1 for an empty directory** at least once
+> this session — the literal string `(empty)` on one line. That is a **phantom GPU holder**:
+> a count of 1 with no matching process. Use
+> `find /sys/class/kfd/kfd/proc/ -mindepth 1 -maxdepth 1 | wc -l`, which cannot do this, and
+> when a count is non-zero resolve the PID and confirm `/proc/<pid>` exists before believing
+> it. Every witness in this section used `find`.
+
+### GLM is unaffected by the pool moving out of its `Pin` — MEASURED 2026-08-05
+
+The refactor moved GLM's own hot path, so this is the arm that mattered. `--mode hybrid` was
+chosen deliberately: it is the only mode with two DIFFERENT `TierFmt`s, which is precisely what
+changed (`int4: bool` → `RoutedFmt`, and a per-tier read table with its own `first_layer`).
+
+`f3dcb85` vs `674bae5`, both binaries built before either ran, interleaved BASE/HEAD/BASE/HEAD
+inside one lock hold with no build between arms.
+`--bench 64 --mode hybrid --attn dense --cache-policy 2q --max-mem 115 --no-mtp`, the
+transformer prompt:
+
+| | BASE | HEAD |
+|---|---|---|
+| expert hit | **77.7% — 36595 hit / 14405 miss** | **77.7% — 36595 hit / 14405 miss** |
+| miss/token · GB/token | 131.95 · 2.02 GB | 131.95 · 2.02 GB |
+| per-layer miss-count histogram (`n=`) | 803 1367 1273 787 347 111 31 6 | **identical** |
+| printed output text | 81 B, `sha d19c60ea0f44fe75` | **byte-identical** |
+| tok/s | 1.85, 2.28 | 2.14, 2.25 |
+
+**The hit counters are exactly equal over 51,000 lookups, and so is the distribution of
+misses across layers.** Those are deterministic integer counters: any change to eviction,
+admission, relocation or the COLD/HOT split would move them. tok/s is within noise (the first
+BASE arm paid cold page cache). The only log difference is intentional — the line now reads
+`routed pool [2q vq3+i4]` from `memory::routed` rather than `[2q hybrid]` from `memory::pin`;
+`hybrid` still appears in the run's own config echo, so no run record loses its mode.
+
+*Read the text row narrowly:* 81 bytes is what `-bench` prints, not the whole 64-token
+completion. The decisive equality here is the counters.
+
+### What an `.f4` miss costs — MEASURED on the 43-layer artifact, 2026-08-05
+
+`tests/v4_pool.rs::measure_what_an_f4_miss_costs`, `#[ignore]`d (it needs the 146 GB set), on
+`/var/db/rivoli/v4-f4-full`. 258 distinct keys — `43 layers × top-6`, i.e. **exactly one
+token's routed traffic** — spread one batch per layer so the reads hit all 43 files:
+
+```
+.f4 routed set: 43 layers x 256 experts x 13369344 B = 137.06 GiB
+COLD: 258 misses, 3.21 GiB in 0.28 s
+  1.082 ms/miss (wall)   1.032 ms/miss (reaper fetch_ns)   12.36 GB/s
+  slot_stalls 0   io_wait 0.27 s
+WARM: 258 hits in 0.000 s = 0.001 ms/hit  (723x cheaper than a miss)
+```
+
+**This replaces the borrowed constant in the residency table below.** That table priced V4's
+traffic "at GLM's measured 12.3 GB/s"; the `.f4` path measures **12.36 GB/s and 1.082 ms per
+13.37 MB block**, and the same GLM run above measured 1.54 ms/miss for its larger 15.34/20.05
+MB experts — consistent bandwidth on both. The predicted per-miss cost was ~1.09 ms; it is
+1.082.
+
+**What this does NOT measure, and the distinction is the whole caveat.** It measures the price
+per byte, not the hit rate. A hit rate needs the router to choose experts, which needs the
+layer loop. So the traffic-per-token figures stay arithmetic on one factor and measured on the
+other:
+
+| | value | provenance |
+|---|---:|---|
+| one token, 100% miss | 3.21 GiB, **0.28 s** | measured |
+| one token at the residency floor (22.6% miss) | 58.3 misses, **63 ms** | 58.3 arithmetic × 1.082 ms measured |
+| GLM today, same machine | 131.95 misses, **203 ms** | measured |
+
+So V4's fetch load is **~3.2× lighter per token than the GLM configuration this repo ships at
+2.85 tok/s**, with the price half now measured on both sides. `slot_stalls 0` says the 16-entry
+ring is not undersized for `top_k = 6`.
 
 ### Three defects the review found that the tests did not — 2026-08-05
 
@@ -1389,23 +1483,27 @@ available until a V4 decode runs.
 | pool at `--max-mem 115` | ~99.4 GiB | **~106.1 GiB** |
 | **residency** | **~35.6%** | **~77.4%** (8,516 slots of 11,008 keys) |
 | lookups/token | 600 (75 MoE × top-8) | 258 (43 × top-6) |
-| measured hit % | 78.0 | — |
-| bytes/token at that hit % | 2.02 GB | — |
+| measured hit % | 77.7 (measured 2026-08-05) | — (needs the layer loop) |
+| measured ms/miss | 1.54 | **1.082** |
+| bytes/token at that hit % | 2.02 GB | 780 MB at the residency floor |
+| fetch ms/token | 203 (measured) | 63 (floor; 1.082 ms measured x 58.3 arithmetic) |
 
 V4 is a **bigger model with a far smaller streaming problem**: it holds 77% of its routed set
 resident where GLM holds 36%, and it looks up 258 experts a token where GLM looks up 600.
 Even at the pessimistic floor — hit rate equal to residency, i.e. no popularity skew at all —
 V4 moves `258 × 0.226 × 13.37 MB = 780 MB/token`, **2.6× less than the 2.02 GB/token GLM
-already ships at 2.85 tok/s**. At GLM's measured 12.3 GB/s effective fetch bandwidth that is
-~63 ms/token of transfer against GLM's ~163 ms. Any real skew (and V4's three hash-routed
-layers are perfectly cacheable by construction) only improves it.
+already ships at 2.85 tok/s**. At the **measured** 12.36 GB/s and 1.082 ms/miss (§"What an
+`.f4` miss costs") that is 63 ms/token of transfer against GLM's measured 203 ms. Any real skew
+(and V4's three hash-routed layers are perfectly cacheable by construction) only improves it.
 
 **So the pool is not the bottleneck, and the 83%-capacity framing overstated the difficulty**
 — it is 77.4% of a set that is looked up less than half as often. The per-miss cost should
 also be slightly *lower* than GLM's 1239 µs, since a `.f4` expert is 13.37 MB against
-`.vq3`'s 15.3 MB. **None of these V4 rows is a wall-clock measurement**; they are the pool's
-own arithmetic plus GLM's measured bandwidth. A decode is what would settle it, and a decode
-needs the layer loop.
+`.vq3`'s 15.3 MB. The per-miss cost is now measured rather than
+predicted — 1.082 ms against a predicted ~1.09 — and it is indeed lower than GLM's 1.54 ms,
+since a `.f4` expert is 13.37 MB against `.vq3`'s 15.34 MB.
+**The hit-rate column remains arithmetic**: it needs the router, which needs the layer loop.
+A decode is what would settle it.
 
 ### What still blocks a 43-layer decode — 2026-08-05
 
