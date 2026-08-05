@@ -803,6 +803,16 @@ impl Gpu {
         was
     }
 
+    /// One `[head_dim]` row of the persistent cache, read back.
+    ///
+    /// Separate from the `(offset, blocks)` [`Gpu::compress_and_place`] returns, and that is
+    /// the entire point: comparing against the offset the placement itself computed cannot
+    /// detect a wrong offset. This takes the row from the caller.
+    fn cache_row(&self, d: &Dims, row: usize) -> Vec<f32> {
+        let hd = d.head_dim;
+        read(&self.ring)[row * hd..(row + 1) * hd].to_vec()
+    }
+
     fn unpoke(&mut self, d: &Dims, row: usize, was: &[f32]) {
         self.ring.copy_in_at(row * d.head_dim * size_of::<f32>(), &f32b(was)).expect("unpoke");
     }
@@ -1850,6 +1860,7 @@ fn attention_matches_the_oracle_on_a_compressed_layer_in_both_phases() {
         "no decode step emits, so the decode slot `window + start_pos/ratio` is never written"
     );
 
+    let mut seen_slots = 0usize;
     for p in &clean {
         let got = gpu.step(&d, p);
         // The compressed region is where the window region is not, so the offset a
@@ -1866,6 +1877,33 @@ fn attention_matches_the_oracle_on_a_compressed_layer_in_both_phases() {
             got.max_idx
         );
         assert_stages(p, &got);
+        // WHERE the block landed in the PERSISTENT region, against a slot spelled by hand
+        // in `COMP_SLOTS` rather than taken from the placement's own arithmetic.
+        //
+        // **This is the only assertion that gates S3 requirement 2, and it exists because
+        // measurement showed the obvious gate does not work.** Swapping "slot
+        // `start_pos / ratio`" for "the next free slot" leaves every numeric golden
+        // BIT-IDENTICAL, `attn_out` included. The two rules differ by a permutation of the
+        // compressed region; the positional selection covers rows `0..n_comp`, which is
+        // exactly the highest correct slot, so append never writes outside the selection and
+        // never overwrites a live row — and `sparse_attn`'s softmax over a set is
+        // permutation-invariant. Measured 2026-08-05 by injecting the append rule into
+        // `compress_and_place`: the whole numeric comparison stayed green and only this went
+        // red. More gaps do not help; the attended multiset is invariant under any
+        // permutation the two rules can produce.
+        if let Some(&(_, block)) = COMP_SLOTS.iter().find(|&&(at, _)| at == p.start_pos) {
+            seen_slots += 1;
+            let want = golden(p, "compressed");
+            let row = d.window + block;
+            assert_eq!(
+                gpu.cache_row(&d, row),
+                want[..d.head_dim],
+                "{}: compressed block {block} is not at cache row {row}. The persistent \
+                 region's slot is `window_size + start_pos / ratio`, never the next free \
+                 one — a caller that appends is right only until it skips a step",
+                p.tag
+            );
+        }
         // The fifth golden, and the only one that says WHERE the blocks landed.
         match captured(p, "compressed") {
             Some(want) => {
@@ -1887,7 +1925,25 @@ fn attention_matches_the_oracle_on_a_compressed_layer_in_both_phases() {
             ),
         }
     }
+    // BOTH directions. Every `COMP_SLOTS` row must have been reached, so a stale entry
+    // cannot sit there looking like coverage; and every step that EMITTED must have had a
+    // row, so a slot rule cannot go unchecked by being left out of the table.
+    assert_eq!(seen_slots, COMP_SLOTS.len(), "a COMP_SLOTS row names a step this script skips");
+    assert_eq!(
+        seen_slots,
+        clean.iter().filter(|p| blocks(p) > 0).count(),
+        "a step emitted a block whose destination COMP_SLOTS does not name"
+    );
 }
+
+/// `(start_pos, compressed block index)` for every step of [`comp_script`] that emits.
+///
+/// Spelled by hand from the rule — prefill writes blocks `0..seqlen/ratio`, a decode at
+/// `start_pos` writes block `start_pos / ratio` — so the assertion has a source independent
+/// of the arithmetic it checks. `(COMP_SKIP_TO, 3)` is the row the deliberate gap exists
+/// for: on a contiguous script the `n`-th emit is always block `n` and the append rule would
+/// satisfy this table too.
+const COMP_SLOTS: &[(usize, usize)] = &[(0, 0), (15, 1), (COMP_SKIP_TO, 3)];
 
 /// **The compressed region is read exactly where the selection names it, and nowhere else.**
 ///
