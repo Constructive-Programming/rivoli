@@ -94,7 +94,17 @@ command passed, because nothing built it. Add the union run to any change that t
 
 **Duplication is a build error.** `build.rs` runs `jscpd --min-tokens 15` over `src/`,
 `tests/` and itself on every build and panics on any clone; `.jscpd.json` carries no
-`threshold`, so there is no budget. Twelve regions are exempt via `jscpd:ignore-start`, each
+`threshold`, so there is no budget.
+
+**But `cargo clippy` does not reliably observe it.** Reported 2026-08-05: `clippy
+--all-targets` came back green **twice** on a tree that `build.rs`'s jscpd gate then rejected
+on the very next `cargo test --no-run` — the gate had not run, after an in-place `git apply`
+left the build script's fingerprint stale. (The observation is direct; the fingerprint
+mechanism is the reporter's diagnosis and is not independently confirmed.) The lesson does
+not depend on the cause: **clippy-green is not duplication-green.** Run something that
+actually re-runs `build.rs` before claiming a change is clone-free. The same reporter hit it
+twice more, both times on real clones **rustfmt had created** by reflowing calls that gained
+a seventh argument — so a mechanical formatting pass can manufacture duplication. Twelve regions are exempt via `jscpd:ignore-start`, each
 carrying its argument in place — the two backends' ABI walls, `math.rs`'s frozen
 `route_into_pre` oracle, and `glsl_numerics.rs`'s transliterations. Being a verbatim copy
 is the POINT in all three; everywhere else, factor it. jscpd is skipped with a warning if
