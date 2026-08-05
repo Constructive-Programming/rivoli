@@ -44,7 +44,7 @@ cargo test --features rocm                   # 100 tests
 
 # BENCHMARKS and performance evaluation ONLY.
 cargo build --release --features rocm        # or --features vulkan; NEVER both
-cargo test  --release --features rocm
+cargo test  --release --features rocm        # HANGS intermittently — see below; sweep per-binary
 
 cargo clippy --release --features rocm --all-targets
 # Before you claim a change compiles, ALSO run the union — see below.

@@ -688,6 +688,47 @@ fact red. The `v4_pin` row is worth reading precisely — it is one test, and it
 `all.hash && all.scored && all.indexer && all.compressor_only`, which no single fixture can
 satisfy. A machine holding only `v4-f4-l0-2` fails it rather than reporting coverage it lacks.
 
+### ALL FIVE PREREQUISITES LANDED — 117 tests green on the merged tree, 2026-08-05
+
+Four branches merged with **zero conflicts** and re-verified here, per-binary, under `flock`
+with the KFD witness taken inside the lock:
+
+| | | | |
+|---|---|---|---|
+| `v4_attn` 8 | `v4_kernel` 17 | `v4_compress_kernel` 8 | `v4_indexer_kernel` 8 |
+| `v4_pin` 1 | `v4_hadamard_basis` 4 | `v4_attn_host` 9 | `v4_compress` 7 |
+| `v4_oracle` 32 | `v4_loading` 10 | `v4_artifact` 2 | `v4_compress_probe` 4 |
+| `v4_head_tail` 4 | `invariants` 1 | `docs` 2 | **117 total, rc=0** |
+
+Union clippy silent. The five things S3 found missing when it tried to wire the loop —
+the `.f4` reader, the V4 resident loader, bf16 `embed`/`lm_head`, `hc_head`, and
+compressed-layer attention — all now exist and are gated.
+
+**`cargo test --release --features rocm` HANGS and cannot be quoted.** Reproduced
+2026-08-05: **zero `test result` lines in 10 minutes**, stopping at `Running unittests
+src/lib.rs` — CLAUDE.md's recorded intermittent `gpustream` hang. Teardown was clean (0 KFD
+holders, flock free), so it costs time rather than wedging the device. **The per-binary sweep
+above is the replacement and runs in under a minute.** Any suite-wide count quoted from that
+command — including "243 rocm tests green" earlier in this session — was almost certainly
+per-suite, and should be read that way.
+
+**Two device-free debts are owed, and are acceptance criteria for the layer loop.** Both
+were traded for an enforcing construction whose only correct home is the loop; landing them
+anywhere else produces a `pub fn` with no caller, which is what `compress_slot` *was* when it
+was deleted.
+
+| owed | cost until paid |
+|---|---|
+| `Io` built by something that takes `LayerKind` and calls `rope_for_layer` itself | nothing detects `Defect::RopeNoYarn`, on the one cell measured invisible to the numeric gate |
+| the compressor's placer computing `window + start_pos / ratio`, with a test | requirement 2 implemented nowhere, asserted nowhere; appending is right only until a step is skipped |
+
+**And the compressed-layer end-to-end test is still unwritten.** `tests/v4_attn.rs` pins
+`LAYER` to ratio-0, so the `io.cache` tail layout and compressed columns reaching
+`sparse_attn` are executed by nothing, on **41 of 43 layers**. `Cell` in
+`v4_compress_kernel.rs` is compressor-only and the oracle's `attention` is private, so an
+oracle comparison must drive `run_layer`: load a real layer's fp8 attention set and its
+compressor, run `compress`, place its output at both destinations, then `attention`.
+
 ## S3 — wire the layer loop, first decode.
 
 **Requirements banked from S2, each measured rather than supposed.** These are conditions on
