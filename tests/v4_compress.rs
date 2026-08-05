@@ -16,8 +16,8 @@
 //!    is exactly when the report needs rewriting.
 
 use rivoli::v4compress::{
-    LayerKind, RopeParams, compress_offset, compress_topk, freqs_cis, rope_for_layer,
-    should_compress, window_topk,
+    LayerKind, RopeParams, compress_dst, compress_offset, compress_topk, freqs_cis,
+    rope_for_layer, should_compress, window_topk,
 };
 use rivoli::v4oracle::weights::V4Config;
 
@@ -374,4 +374,101 @@ fn indexer_topk_never_cuts_at_the_emit_prompt() {
     assert_eq!(need, 2052, "2052 tokens before index_topk cuts anything");
     assert!((1..need).all(|s| s / 4 <= index_topk), "nothing below {need} cuts");
     assert!(need / 4 > index_topk, "{need} does cut");
+}
+
+// =======================================================================================
+// 3. the write side — where a compressed block LANDS
+// =======================================================================================
+
+/// **Requirement 2: the decode slot is `window + start_pos / ratio`, never "the next free
+/// one".** `docs/investigations/v4-flash-port.md` records this as implemented nowhere and
+/// asserted nowhere after `2445645` deleted `Dims::compress_slot`; this is the assertion,
+/// and [`compress_dst`] is the implementation.
+///
+/// **The anti-vacuity half is the second loop, and it is the whole test.** An appending
+/// placer — one that keeps a running count and writes the next row whenever a block is
+/// emitted — agrees with the positional one on every sequence that visits every position in
+/// order. That is the sequence a smoke test walks, so a green run over it proves nothing.
+/// The divergence needs a SKIPPED step. Requirement 2 names speculative decode as the way
+/// one arises, and on V4 that mechanism is NOT currently reachable — `kernels/moe.hip:409`
+/// refuses `nrow != 1` — so this walks the skip directly rather than claiming a caller that
+/// cannot exist yet. Below, positions 3 and 11 emit; the
+/// positional placer puts them at rows `win + 0` and `win + 2`, the appending one at
+/// `win + 0` and `win + 1`. The two `assert_eq!`s already imply the difference; the
+/// `assert_ne!` after them adds no coverage and is there so a later edit that made the
+/// two vectors agree could not be read as a simplification.
+///
+/// Cross-checked against the reference rather than against this crate: model.py:380 and :382
+/// writes `self.kv_cache[:, :seqlen // ratio]` at prefill and `[start_pos // ratio]` at
+/// decode, and `Compressor.kv_cache` is the VIEW `Attention.kv_cache[:, win:]`
+/// (model.py:497) — so `window_size +` is the flattening of that view, not a convention.
+#[test]
+fn compress_dst_is_positional_and_an_appending_placer_disagrees() {
+    let win = cfg().window_size;
+    let l2 = LayerKind::from_ratio(4);
+
+    // Prefill: every complete block at once, at the region's base. 13 // 4 == 3.
+    assert_eq!(compress_dst(l2, win, EMIT_PROMPT_LEN, 0), Some((win, 3)));
+    // Shorter than one block emits nothing — `should_compress`'s prefill arm, and the row
+    // must not be reported as "the base, zero blocks", which a caller would memcpy as a
+    // zero-length write and then trust the rows.
+    assert_eq!(compress_dst(l2, win, 3, 0), None);
+
+    // Decode: one block, on the position that completes it, at slot `start_pos / ratio`.
+    for p in 0..64 {
+        let want = ((p + 1) % 4 == 0).then_some((win + p / 4, 1));
+        assert_eq!(compress_dst(l2, win, 1, p), want, "ratio-4 decode at start_pos {p}");
+    }
+
+    // THE REQUIREMENT. Walk positions 0..=11 but SKIP 4..=7 — one accepted two-token draft
+    // is enough to do this — and compare against an appending placer.
+    let mut appended = win;
+    let mut positional = Vec::new();
+    let mut appending = Vec::new();
+    for p in [0, 1, 2, 3, 8, 9, 10, 11] {
+        if let Some((row, n)) = compress_dst(l2, win, 1, p) {
+            positional.push(row);
+            appending.push(appended);
+            appended += n;
+        }
+    }
+    assert_eq!(positional, vec![win, win + 2], "blocks 0 and 2 complete at 3 and 11");
+    assert_eq!(appending, vec![win, win + 1], "an appending placer packs them adjacently");
+    assert_ne!(
+        positional, appending,
+        "if these agree the test is vacuous — a skipped step MUST separate the two placers"
+    );
+
+    // The ratio-128 boundary, and it is this function's OWN arithmetic rather than the
+    // gate's: the first block completes at 127, and `127 / 128` is 0, so it lands at the
+    // base. `should_compress` decides WHETHER with `(start_pos + 1) / ratio`; reusing that
+    // to decide WHERE puts every ratio-128 block one slot late for the whole sequence.
+    //
+    // `region_base = 0` — the INDEXER's nested compressor, which model.py:415 hands the
+    // whole buffer rather than the `[:, win:]` view, over an allocation with no ring
+    // (model.py:405). The 21 ratio-4 layers need BOTH bases, so the zero is not a degenerate
+    // case: it is the second real caller, and a `win`-shaped assumption here writes every
+    // indexer block 128 rows past its buffer.
+    assert_eq!(compress_dst(l2, 0, 1, 7), Some((1, 1)));
+    assert_eq!(compress_dst(l2, 0, EMIT_PROMPT_LEN, 0), Some((0, 3)));
+
+    let l3 = LayerKind::from_ratio(128);
+    assert_eq!(compress_dst(l3, win, 1, 127), Some((win, 1)));
+    assert_eq!(compress_dst(l3, win, 1, 255), Some((win + 1, 1)));
+    // Prefill at ratio 128, where `seqlen / ratio` actually truncates something: 300 tokens
+    // are two complete blocks and a 44-token remainder the compressor keeps in `kv_state`.
+    // At ratio 4 the remainder is at most 3, so a wrong divisor hides there.
+    assert_eq!(compress_dst(l3, win, 300, 0), Some((win, 2)));
+
+    // **`LayerKind::Plain` returns `None` from the `?`, BEFORE either division.** This is
+    // not the `should_compress` gate and is not covered by
+    // `ratio_128_pooling_is_unreachable_at_the_emit_prompt`, which never calls this
+    // function — a draft of this test dropped these two lines as "delegation" and that was
+    // wrong: `compress_dst` has TWO independent `None` sources and only this one stands
+    // between a ratio-0 layer and `seqlen / 0`. Reorder the two guards and the rest of the
+    // suite stays green while every ratio-0 layer panics.
+    let l0 = LayerKind::from_ratio(0);
+    assert_eq!(l0.compressor_ratio(), None, "the `?` this test relies on must be the one that fires");
+    assert_eq!(compress_dst(l0, win, EMIT_PROMPT_LEN, 0), None);
+    assert_eq!(compress_dst(l0, win, 1, 7), None);
 }

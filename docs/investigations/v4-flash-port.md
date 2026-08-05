@@ -1,6 +1,6 @@
 ---
 status: live
-verdict: The staged plan to make V4-Flash decode. S1 LANDED 2026-08-05 (.f4 repack bit-exact over 10.27 GB; a 137-golden CPU oracle with five measured blind spots). Corrects other-models.md from the real repo: experts are 148.25 GB native FP4 (138.1 GiB) so it DOES stream at ~83% residency, not "nearly fully resident"; 3.449 GB/token, since the shared expert is fp8 and resident, not FP4 and streamed; the partial fp8 KV act_quant is mandatory, not a --kv-fp8 to refuse (that flag does not exist); YaRN is per-layer, keyed to compress_ratio. DSpark/MTP is separable and out of scope.
+verdict: The staged plan to make V4-Flash decode. S1 LANDED 2026-08-05 (.f4 repack bit-exact over 10.27 GB; a 137-golden CPU oracle with five measured blind spots). Corrects other-models.md from the real repo: experts are 148.25 GB native FP4 (138.1 GiB) so it DOES stream at ~83% residency, not "nearly fully resident"; 3.449 GB/token, since the shared expert is fp8 and resident, not FP4 and streamed; the partial fp8 KV act_quant is mandatory, not a --kv-fp8 to refuse (that flag does not exist); YaRN is per-layer, keyed to compress_ratio. DSpark/MTP is separable and out of scope. S3 re-took the prerequisite inventory against Transformer.forward: SIX more are missing, four still unfixed, so the layer loop is not writable yet — see its section for the list. The dev-profile sweep is also RED at a2504eb.
 ---
 
 # DeepSeek-V4-Flash-0731 → first decode, first benchmark
@@ -597,9 +597,14 @@ a blind spot exactly as an oracle and an implementation can. Run the third.
 
 `Cargo.toml`'s `[profile.release]` sets `lto` and `opt-level` and **no `debug-assertions`**;
 there is no `.cargo/config.toml` overriding it, and CLAUDE.md prescribes `--release` for every
-build, test and clippy run. So all **36 `debug_assert!` occurrences in `src/`** are compiled
+build, test and clippy run. So all **32 `debug_assert!` occurrences in `src/`** are compiled
 out of every binary anyone here has ever run. They are not weak checks; they are absent ones.
 
+> **CORRECTED 2026-08-05 by S3: the count is 32, not 36.** 39 lines in `src/` match
+> `debug_assert`, seven of which are prose mentions inside comments. CLAUDE.md:57 and this
+> file's own line below both already said 32; only this paragraph said 36, and a later
+> section quoted it twice before the disagreement was noticed.
+>
 Distribution: `artifact/quant.rs` 17, `gpu.rs` 4, `v4compress.rs` 2, `artifact/model.rs` 2,
 `fetch/stream.rs` 2, and one each in `fetch/asyncfetch.rs`, `backend/vk.rs` and the three
 `v4oracle` files.
@@ -720,7 +725,7 @@ was deleted.
 | owed | cost until paid |
 |---|---|
 | `Io` built by something that takes `LayerKind` and calls `rope_for_layer` itself | nothing detects `Defect::RopeNoYarn`, on the one cell measured invisible to the numeric gate |
-| the compressor's placer computing `window + start_pos / ratio`, with a test | requirement 2 implemented nowhere, asserted nowhere; appending is right only until a step is skipped |
+| the compressor's placer computing `window + start_pos / ratio`, with a test | **PAID 2026-08-05 — `v4compress::compress_dst` + `tests/v4_compress.rs::compress_dst_is_positional_and_an_appending_placer_disagrees`.** Two corrections earned while this row stood: the indexer's nested compressor needs `window_size = 0` (model.py:405/:415), which this formula does not admit; and the skip is a general one, since speculative decode is unreachable on V4 (`kernels/moe.hip:409`). Still no production caller |
 
 **And the compressed-layer end-to-end test is still unwritten.** `tests/v4_attn.rs` pins
 `LAYER` to ratio-0, so the `io.cache` tail layout and compressed columns reaching
@@ -1010,7 +1015,7 @@ helper to discharge a debt created by deleting a callerless helper is a loop, no
 | owed | until then |
 |---|---|
 | `Io` built by something that takes `LayerKind` and calls `v4compress::rope_for_layer` itself, so the two-table selection has ONE site | nothing detects `Defect::RopeNoYarn`, on the one cell measured invisible to the numeric gate (`ratio4/decode`, sep 8 against `RESOLVABLE` 64) |
-| whoever places the compressor's output computing the decode slot as `window + start_pos / ratio`, with a test | requirement 2 is implemented nowhere and asserted nowhere; a caller that appends is right only until it skips a step, and speculative decode skips by construction |
+| whoever places the compressor's output computing the decode slot as `window + start_pos / ratio`, with a test | **PAID 2026-08-05 — `v4compress::compress_dst` + its test.** Two corrections to this row while it stood: speculative decode is NOT reachable on V4 (`kernels/moe.hip:409` refuses `nrow != 1`), so the motivating skip is a general one rather than that one; and the indexer's nested compressor takes `window_size = 0`, which this row's formula does not admit |
 
 Both were **device-free** tests before deletion. Whoever builds the layer loop owns both,
 and this table is the acceptance criterion.
@@ -1030,6 +1035,149 @@ v4_attn 8 · v4_kernel 17 · v4_compress_kernel 8 · v4_indexer_kernel 8 · v4_p
 v4_hadamard_basis 4 · v4_attn_host 9 · v4_compress 7 · v4_oracle 27 · v4_loading 10
 v4_artifact 2 · v4_compress_probe 4        — all rc=0 at `2445645`
 ```
+
+### The prerequisite inventory was taken again, and it is SIX short — S3, 2026-08-05
+
+§"ALL FIVE PREREQUISITES LANDED" closed the five things the first S3 attempt found missing.
+A second pass over the same question — *what does one `Block.forward` call need that does not
+exist* — found **six more**, each checked in the tree rather than inferred. Two are fixed
+below; four are not, and the loop cannot be written past them.
+
+The five that landed were real and the count was honest. What the count could not see is that
+it was a list of *what the previous attempt had tripped over*, not a traversal of
+`Transformer.forward`. This one is the traversal. Every op is named, with the kernel that
+serves it:
+
+| `Transformer.forward` / `Block.forward` step | what serves it | state |
+|---|---|---|
+| `embed` → `hc_mult` copies | `launch_v4_embed_bf16_row` | ok |
+| `hc_pre` (Sinkhorn) | `launch_hc_pre` | **was blocked — see 1** |
+| `attn_norm`, `ffn_norm`, final norm | `launch_v4_rmsnorm` | ok |
+| `Attention.forward`, every layer class | `attn::v4::attention` | ok |
+| `Compressor.forward` | `v4compress::compress` | ok |
+| `hc_post` | `launch_hc_post` | ok |
+| router logits | `launch_gemv_f32` (GLM's dense f32) | ok — matches `linear(x.float(), weight.float())` |
+| routing + weights | host, `math::route_into` | ok |
+| routed experts (fp4) | `launch_act_quant_f8` then `launch_moe_expert_range_f4` | ok |
+| **shared expert (fp8)** | `launch_gemv_fp8` ×3 + a **clamped** SwiGLU | **blocked — 2** |
+| accumulate | `launch_moe_acc_drain` | ok |
+| `hc_head`, `ParallelHead` | `launch_v4_hc_head`, `launch_v4_dense_gemm_bf16` | ok |
+| routed experts must be somewhere | resident tier **or** streaming pool | **blocked — 3** |
+
+**1. `V4Config` has neither `hc_sinkhorn_iters` nor `hc_eps`. FIXED here.** `launch_hc_pre`
+takes both, and its own doc says `iters` is "`hc_sinkhorn_iters` from the config… passing it
+from `V4Config` rather than baking it in is what keeps the count from drifting from
+`config.json`". No such field existed. The only Rust declaration of either name was
+`v4oracle::weights::V4Config`, which is the **oracle's** transliteration and is exactly what
+the engine must not read — the hazard `index_topk`'s own doc names ("three types declare a
+field of this name… which is exactly the setup where the decode path reaches for the wrong
+one"). Both are in `config.json` (`hc_sinkhorn_iters: 20`, `hc_eps: 1e-06`), both are now
+required fields with a non-zero `validate`, and both are in `V4_BASE` so
+`every_v4_field_is_required` covers them.
+
+Worth recording *why* the gap survived S1a's "every field is REQUIRED" discipline: that rule
+and its test both drive off the field list, and a field nobody declared is invisible to a test
+that enumerates declarations. It is the same structural blind spot that hid `sliding_window`
+and `rms_norm_eps` until `b5d4083` — third instance, same mechanism, and nothing yet catches
+it except someone writing the caller.
+
+**2. The resident fp8 SHARED expert has no clamped SwiGLU, and `swiglu_limit` applies to it.**
+`MoE.__init__` passes `swiglu_limit` to `shared_experts` as well as to the routed ones
+(model.py:632), and `Expert.forward` clamps `up` on both sides and `gate` from above.
+`kernels/moe.hip::moe_gateup_f4_impl` implements exactly that — for **fp4** experts. The
+shared expert is fp8 and takes `launch_gemv_fp8` + `launch_swiglu`, and `launch_swiglu`
+(`hip.rs:1289`) is GLM's, is `silu(g)·u`, and **takes no limit**. So the shared expert of every
+one of the 43 layers would run unclamped: `v4oracle::Defect::SwigluUnclamped`, one contribution
+in seven, fluent and wrong. The fix is a clamped fp8 combine — the three lines already sitting
+in `moe_gateup_f4_impl`, which `kernels/common.hpp` is the place for. Not written here.
+
+**3. There is no routed streaming pool for `.f4`, and the full artifact does not fit without
+one.** Measured on the merged tree: `Arena`, `cache`, all three `HybridPolicy` impls,
+`AsyncFetch`/`Ticket`/`ReadSpec`, `Streamer` and `ExpertSet::{open_routed, read_spec,
+expert_slot}` are **all byte-parameterised and already work at `RoutedFmt::F4`** — the pool
+substrate is not the problem. What is missing is three specific things, all inside `pin.rs`:
+`f4_slot_offsets` (the six intra-block projection offsets; `vq_slot_offsets` and
+`i4_slot_offsets` exist and the f4 twin is implemented nowhere — `pin.rs:1199` already
+names it as owed, so this restates a note rather than discovering one), an f4 arm in the
+private `TierFmt`/`ArenaPool` (whose `int4: bool` is a two-format flag, and whose `MlpVq`
+carries a `*const u16` scale where `ExpertDescF4` needs `*const u8`), and an `F4` variant of
+`Mode`, which `Pin::build`'s `match mode` selects on.
+
+The size argument is the reason this cannot be deferred: `/var/db/rivoli/v4-f4-full` is
+**146 GB**, of which `resident.safetensors` is 9.1 GB and the 43 `L*.f4` files are 137 GiB —
+against the ~115 GiB `--max-mem` this machine runs GLM at. **A first decode of the whole model
+is blocked on the pool.** The two 3-layer fixtures do fit resident (9.8 GB of experts each), so
+a layer loop can be gated end-to-end before the pool exists — but three layers of a 43-layer
+model is a golden comparison, not a decode, and calling it one would be the reading this
+document has already had to retract twice.
+
+**4. `launch_moe_gate_v4` is unreachable from the engine as the pin is built, and one of the
+two is redundant.** The launcher takes `tid2eid` as a **device** `*const i64`;
+`V4Pin`'s `V4Route::Hash` parses it to a **host** `Vec<u32>` and its doc argues that placing
+"6.2 MB of `tid2eid` per hash layer on the device to index it there would buy nothing". Both
+are defensible and they are opposite. The pin's is the one that matches GLM's shipped design
+(routing is host work; `math::route_into` is the router), so the kernel is a verified,
+8-test-covered launcher with no reachable caller — the shape `Dims::compress_slot` was in when
+it was deleted. Not a blocker for the loop; recorded so the next stage decides deliberately
+rather than discovering it at the call site.
+
+**5. Requirement 9 names one of SIX null-stream launchers, so paying it alone would assert a
+property that does not hold.** Counted on the merged tree: of the 19 launchers the V4 path
+uses, thirteen take a `stream` and **six do not** — `v4_act_quant`, `v4_rmsnorm`, `v4_qk_norm`,
+`v4_rope`, `v4_gemv_fp8`, `v4_sparse_attn`. That is precisely S2b's attention set, i.e. the
+whole of `attn::v4::attention`. Requirement 9 reads as one launcher's omission; it is the
+attention block's. **Declined as written**, for the reason `V4Pin::build` declined a `capacity`
+argument: with no `.f4` streaming pool (3 above) there is nothing to overlap with, so
+threading a stream through six launchers today adds a parameter whose only possible value at
+every call site is null. It should be paid *with* the pool, all six at once, and the
+requirement should say six.
+
+**6. The fp4 MoE kernel refuses `nrow != 1`** (`kernels/moe.hip:409`, guard 1003; only `R = 1`
+is instantiated, "no measurement exists for V4"). So a V4 decode is **structurally
+single-row** — speculative decode cannot be enabled on this path at all, whatever the MTP
+scope cut says. The plan's §"Scope cut" removes DSpark as a *modelling* decision; this is the
+separate mechanical fact that the batched verify pass rivoli ships on by default has no V4
+kernel behind it. Requirement 2's `start_pos / ratio` rule is still right and still worth
+having — a skipped step is not exclusive to speculation — but the motivating example is not
+currently reachable.
+
+### The dev-profile sweep is RED, and the green one was measured where the checks are dead
+
+`tests/v4_loading.rs::magic_separates_the_formats_when_the_length_cannot` **fails on the dev
+profile at `a2504eb`** — reproduced with every S3 edit reverted, so it predates this stage:
+
+```
+thread '…' panicked at src/artifact/quant.rs:128:
+assertion `left == right` failed: i_dim 32 not a multiple of VQ_GROUP
+```
+
+That is one of the 32 `debug_assert!`s §"`debug_assert!` is dead in every build this project
+runs" is about, doing exactly its job. The test builds a toy `.vq3` set at `MOE_INTER = 32` to
+prove magic separates the formats where length cannot, and 32 does not divide `VQ_GROUP`; the
+geometry it asks for is one no real artifact has. Under `--release` the assert is compiled out,
+`vq_row_bytes` rounds up, and the test passes.
+
+**The finding is not the test — it is the sequence.** That section resolved the dead-assert
+problem "by changing the habit, not the code" and rewrote CLAUDE.md to prescribe the dev
+profile. The per-binary sweeps quoted immediately after it — §"ALL FIVE PREREQUISITES LANDED"'s
+117 and §"Integration checkpoint"'s 82 — were both run under `--release`, i.e. under the
+profile the same session had just deprecated. So "117 tests green" is a true statement about a
+build where 32 checks are absent, and the first dev-profile run of the same tree is red. Nobody
+re-ran the sweep under the new rule, and the rule's whole point was that the checks would fire.
+
+Not fixed here: the fix is either toy dims that divide `VQ_GROUP` or an assert that the test
+declares it is provoking, and both are `tests/v4_loading.rs`'s owner's call. **Any dev-profile
+count quoted from now on should say which of these it includes.**
+
+**What this stage landed, and what it deliberately did not.** `compress_dst` and its test —
+requirement 2's arithmetic and its first assertion, seen red by mutation before being trusted
+— plus the two config fields and their validation. **The `Io`-building
+construction of debt 1 was NOT landed, for the third time, and the reason has changed from an
+estimate to a measurement:** its only correct home is a layer loop, and the loop is blocked on
+2 and 3 above. Landing it now produces the callerless helper the debt was created by deleting.
+`compress_dst` is at the same risk and was landed anyway because its *test* is a caller that
+exercises both arms — including the decode arm `compress_slot` never had one for, which is the
+specific hole that made deleting it correct.
 
 ## S4 — benchmark, quality assessment, ranked perf work.
 

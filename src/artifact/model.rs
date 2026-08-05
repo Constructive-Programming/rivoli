@@ -551,6 +551,66 @@ pub struct V4Config {
     /// Hyper-connection streams. `hc_*_fn` is `[_, hc_mult · hidden]`, likewise confronted
     /// with the tensor by `convert_v4`.
     pub hc_mult: usize,
+
+    /// Sinkhorn passes in `hc_split_sinkhorn` — `Block.hc_pre`'s row/column normalization
+    /// of the mHC mixing matrix (model.py:686).
+    ///
+    /// **Added 2026-08-05 by S3, because the layer loop could not be written without it.**
+    /// `launch_hc_pre` takes it as a parameter *specifically* so the kernel and `config.json`
+    /// cannot drift, and its doc says "passing it from `V4Config`" — but no such field
+    /// existed, only `v4oracle::weights::V4Config::hc_sinkhorn_iters`, which is the oracle's
+    /// own transliteration and must not be what the engine reads. That is the exact shape
+    /// `index_topk`'s doc warns about: three types declare a field of one name and the decode
+    /// path reaches for the wrong one.
+    ///
+    /// Required like every other field here, so the `ensure!` in `validate` reaches exactly
+    /// one case: a config that writes `0` explicitly. `rivoli_hc_pre` already refuses that
+    /// (`kernels/linalg.hip:642`, `if (iters < 1) return 1003`), so this is a load-boundary
+    /// restatement of a check the kernel makes — worth the two lines because the load
+    /// boundary names the FIELD and the kernel names a code, and because a config is read
+    /// once while the launcher fires 43 times a token.
+    ///
+    /// **What a zero would cost is smaller than it sounds, and an earlier draft of this
+    /// comment overstated it as "the matrix is never normalized at all".** It is not:
+    /// `hc_sinkhorn` runs a row softmax and one column divide BEFORE the loop
+    /// (`kernels/linalg.hip:370`, `norm(1, HC_MULT);`, and `kernel.py:401-415` agrees), and
+    /// only the remaining `iters - 1` passes are the plain row/column refinements. So zero
+    /// loses the refinement, not the normalization.
+    ///
+    /// The reason the value must be *read* rather than *checked* is unchanged: a numeric
+    /// gate cannot pin the shipped 20, because at 20 a 4x4 positive matrix is far past
+    /// convergence and 19 and 20 agree bit-for-bit (`launch_hc_pre`'s doc, and
+    /// `tests/v4_oracle.rs::sinkhorn_has_converged_long_before_iteration_20`).
+    ///
+    /// **Carried with no reader in this crate yet, deliberately**, exactly as `index_topk`
+    /// and `routed_scale` are: the layer loop that would read it does not exist. The
+    /// alternative to declaring it now is the loop reaching for
+    /// `v4oracle::weights::V4Config`, which is the whole reason this field is here.
+    pub hc_sinkhorn_iters: usize,
+
+    /// `hc_eps` — and it is **five** things, not the one an earlier draft of this comment
+    /// named. It is the floor added to `hc_head`'s sigmoid gate (`model.py:714`,
+    /// `pre = sigmoid(...) + hc_eps`), and inside `hc_split_sinkhorn` it is *also* the
+    /// `+ eps` after the comb softmax and in every row and column divide — `2·iters - 1` of
+    /// them per token (`kernel.py:408, :413, :419, :423`; `kernels/linalg.hip:347` and the
+    /// `norm` lambda at :358). So a zero moves `comb` as well as `pre`, in opposite
+    /// directions, and removes the guard from those divisions — harmless there, since the
+    /// sums are strictly positive, but that is a reason rather than an absence.
+    ///
+    /// `model.py:686` is the `hc_split_sinkhorn(...)` CALL; the expression itself is in
+    /// `inference/kernel.py`, a different file.
+    ///
+    /// Added with `hc_sinkhorn_iters` and for the same reason: `launch_hc_pre` and
+    /// `launch_v4_hc_head` both take it and nothing here supplied it. `f64` because JSON
+    /// numbers are; the kernels narrow to f32 at the call, as `rms_norm_eps` already does.
+    ///
+    /// Required rather than defaulted for the reason a default of 0.0 would be *nearly*
+    /// right — 1e-6 against a sigmoid output in (0, 1). It perturbs every gate by a hair, in
+    /// the direction of less signal from every stream, uniformly across 43 layers. Small,
+    /// systematic and unattributable is the worst shape a numeric error can have here.
+    ///
+    /// Carried with no reader yet, deliberately — see [`V4Config::hc_sinkhorn_iters`].
+    pub hc_eps: f64,
 }
 
 /// The YaRN block. Required, and its `type` is checked — see the RoPE note in [`V4Config`].
@@ -689,6 +749,24 @@ impl ArchConfig for V4Config {
             crate::artifact::quant::FP8_BLOCK,
             crate::artifact::quant::FP8_BLOCK
         );
+        // Both mHC scalars are checked non-zero here rather than left to the kernels, and
+        // the two cases differ. `hc_sinkhorn_iters == 0` IS refused downstream —
+        // `kernels/linalg.hip:642` returns guard 1003 — so this is a restatement at the load
+        // boundary, which names the field where the kernel names a code. `hc_eps == 0` is
+        // refused by nothing: it is arithmetic, not a shape, and it perturbs every gate and
+        // every Sinkhorn divide by 1e-6 uniformly, which no per-layer tolerance would read
+        // as anything but depth. That one is the reason this pair is here at all.
+        ensure!(
+            self.hc_sinkhorn_iters > 0,
+            "hc_sinkhorn_iters is 0 — `hc_split_sinkhorn`'s refinement passes would all be \
+             skipped, on every layer (and `rivoli_hc_pre` refuses it with guard 1003)"
+        );
+        ensure!(
+            self.hc_eps > 0.0,
+            "hc_eps {} must be positive — it floors `hc_head`'s sigmoid gate AND every \
+             row/column divide inside hc_split_sinkhorn",
+            self.hc_eps
+        );
         // The FP4 group scale runs along the INPUT dim, so both expert input widths must
         // divide it exactly — `f4_groups` rounds up, and a ragged tail would give the
         // last group a scale covering fewer weights than the kernel assumes.
@@ -812,6 +890,8 @@ mod tests {
         ("index_head_dim", "128"),
         ("index_topk", "512"),
         ("hc_mult", "4"),
+        ("hc_sinkhorn_iters", "20"),
+        ("hc_eps", "1e-06"),
     ];
 
     fn v4_json(overrides: &[(&str, &str)]) -> String {
@@ -1061,6 +1141,12 @@ mod tests {
             (vec![("num_experts_per_tok", "300")], "top_k"),
             (vec![("num_hash_layers", "99")], "num_hash_layers"),
             (vec![("o_groups", "7")], "o_groups"),
+            // PRESENT but zero, like `index_topk` below: dropping either key fails as a
+            // MISSING FIELD and never reaches the bound, so without these two rows both
+            // `ensure!`s are unproved-reachable — the false-green shape this block's
+            // `index_topk` note already calls out.
+            (vec![("hc_sinkhorn_iters", "0")], "hc_sinkhorn_iters is 0"),
+            (vec![("hc_eps", "0.0")], "must be positive"),
             (vec![("moe_intermediate_size", "2000")], "F4_GROUP"),
             // Full length, one bad entry — otherwise the LENGTH check fires first and this
             // case would pass without the value check existing at all.
