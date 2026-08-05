@@ -11,4 +11,4 @@
 # STAGE BEFORE BREAKING. `git checkout --` on an unstaged tree reverts real work; that
 # happened to an agent on 2026-08-05.
 src/v4oracle/forward.rs	Defect::Fp4NibbleSwap,		v4_oracle every_defect_variant_reaches	never reach Defect::ALL
-src/artifact/format.rs	n_experts + usize::from(has_shared)	n_experts + 1	v4_loading f4_refuses_a_file_sized_for_a_shared_block	bytes on disk, expected
+src/artifact/format.rs	n_experts + usize::from(has_shared)	n_experts + 1	v4_loading f4_refuses_a_file_sized_for_a_shared_block	blocks_plus_one: this must be refused
