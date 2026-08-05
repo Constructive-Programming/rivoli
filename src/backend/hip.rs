@@ -27,6 +27,42 @@ pub struct ExpertDesc {
     pub down_scales: *const u16,
 }
 
+/// One DeepSeek-V4 routed expert's six device pointers — `moe.hip`'s `ExpertDescF4`.
+///
+/// Separate from [`ExpertDesc`] rather than a third interpretation of it. Dispatching a
+/// `.f4` block through [`launch_moe_expert_range_i4`] would decode e2m1 nibbles as
+/// `nibble − 8` at group 128 instead of group 32 — plausible magnitudes from the wrong
+/// codebook, and there is no shape, size or scale check downstream that could find it. The
+/// scales are `*const u8` because e8m0 IS one byte, a third width beside VQ's bf16 and
+/// int4's f32, which is where [`ExpertDesc`]'s "one layout, kernel picks the
+/// interpretation" stops being honest.
+///
+/// **The separation is a signpost, not a proof.** Every real dispatch reaches its
+/// descriptor array through `buf.ptr() as *const _`, and that cast compiles either way —
+/// only construction sites are type-checked. Making it a proof needs the keep-alive buffer
+/// and the typed address to be ONE value (a `DescArray<T>` owning the `DeviceBuf` and
+/// handing out only `*const T`), which reaches `gpu.rs`'s own
+/// `self.descs_buf.ptr() as *const ExpertDesc` and so belongs to S3's wiring rather than
+/// here.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ExpertDescF4 {
+    /// `w1` — the GATE projection, `[inter, hidden]` as e2m1 nibble pairs.
+    pub gate_packed: *const u8,
+    /// `[inter, ceil(hidden / F4_GROUP)]` e8m0 bytes, row-major, one scale ROW per output
+    /// row — not the 128x128 tile grid fp8 uses.
+    pub gate_scale: *const u8,
+    /// `w3` — the UP projection. Same shape as `w1`, which is exactly why a swap of the
+    /// two is invisible to every structural check (`quant.rs::V4_PROJ`).
+    pub up_packed: *const u8,
+    /// `[inter, ceil(hidden / F4_GROUP)]` — same grid as `gate_scale`.
+    pub up_scale: *const u8,
+    /// `w2` — the DOWN projection, `[hidden, inter]`.
+    pub down_packed: *const u8,
+    /// `[hidden, ceil(inter / F4_GROUP)]` — the reduction dim is `inter` here, not `hidden`.
+    pub down_scale: *const u8,
+}
+
 // jscpd:ignore-start
 //
 // EXEMPT FROM THE DUPLICATION GATE, and this is the only kind of thing that is.
@@ -88,6 +124,71 @@ unsafe extern "C" {
         h: *mut f32,
         acc: *mut u64,
         nrow: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    #[allow(clippy::too_many_arguments)]
+    fn rivoli_moe_expert_range_f4(
+        x: *const f32,
+        hidden: i32,
+        inter: i32,
+        e_start: i32,
+        e_count: i32,
+        n_desc: i32,
+        descs: *const ExpertDescF4,
+        wexpert: *const f32,
+        swiglu_limit: f32,
+        h: *mut f32,
+        acc: *mut u64,
+        nrow: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    fn rivoli_act_quant_f8(v: *mut f32, n_rows: i32, row_len: i32, stream: *mut c_void) -> i32;
+
+    #[allow(clippy::too_many_arguments)]
+    fn rivoli_moe_gate_v4(
+        logits: *const f32,
+        bias: *const f32,
+        tid2eid: *const i64,
+        input_id: i32,
+        vocab_size: i32,
+        n_experts: i32,
+        k: i32,
+        route_scale: f32,
+        weights: *mut f32,
+        indices: *mut i32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    #[allow(clippy::too_many_arguments)]
+    fn rivoli_hc_pre(
+        h: *const f32,
+        fnw: *const f32,
+        scale: *const f32,
+        base: *const f32,
+        s: i32,
+        hc: i32,
+        dim: i32,
+        iters: i32,
+        norm_eps: f32,
+        hc_eps: f32,
+        y: *mut f32,
+        post: *mut f32,
+        comb: *mut f32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    #[allow(clippy::too_many_arguments)]
+    fn rivoli_hc_post(
+        x: *const f32,
+        residual: *const f32,
+        post: *const f32,
+        comb: *const f32,
+        s: i32,
+        hc: i32,
+        dim: i32,
+        y: *mut f32,
         stream: *mut c_void,
     ) -> i32;
 
@@ -428,6 +529,248 @@ pub unsafe fn launch_moe_expert_range_i4(
         )
     };
     check(r, "moe_expert_range_i4")
+}
+
+/// DeepSeek-V4 counterpart of [`launch_moe_expert_range_i4`]: FP4 experts (e2m1 nibbles,
+/// one e8m0 scale per 32 weights along the reduction dim) for the absolute range
+/// `[e_start, e_start+e_count)` on `stream`. Contributions land in the same fixed-point
+/// `acc` row, so this shares [`launch_moe_acc_drain`] with the other two formats.
+///
+/// **`x` must already be fp8-quantized** by [`launch_act_quant_f8`] — V4 quantizes the
+/// activation in front of every quantized `Linear` and this path cannot do it per output
+/// row (see `linalg.hip::act_quant_f8`). The `h` re-quantization between the two passes IS
+/// done here, because forgetting it is silent.
+///
+/// `n_desc` is the length of the `descs` array. It exists because `.f4` holds
+/// `n_experts` blocks and **no shared block** — V4's shared expert is fp8 e4m3 at 128x128
+/// and stays resident — unlike `.vq3`/`.i4`, which hold `n_experts + 1` with the shared
+/// expert last. An index one past the end there reads the wrong expert; here it reads
+/// something that is not e2m1 nibbles at all, i.e. the wrong ARITHMETIC.
+///
+/// `swiglu_limit` comes from the config (`10.0`); the launcher refuses `<= 0` because an
+/// unclamped SwiGLU on this path is a known silent defect, not a configuration.
+///
+/// # Safety
+/// Every device pointer (`descs`/packed weights/`wexpert`/`x`/`h`/`acc`) must outlive
+/// `stream`'s completion — await its [`Signal`](crate::backend::gpustream::Signal).
+///
+/// **`wexpert` and `h` are indexed by ABSOLUTE expert id, not by position within
+/// `[e_start, e_start+e_count)`** — the same convention as `descs`, and the same one
+/// [`launch_moe_expert_range`] uses. So both must be sized for `n_desc`, not for `e_count`:
+/// `wexpert` is `n_desc·nrow` f32 and `h` is `n_desc·nrow·inter` f32. A caller that read
+/// these as range-relative and allocated `e_count` of them would run off the end the first
+/// time it passed `e_start > 0`, which is the first thing a two-stream pipeline does.
+/// `x` is `nrow` rows of `hidden` f32 and `acc` is `nrow` rows of `hidden` u64.
+///
+/// `x` and `h` must be **16-byte aligned**, and this is UNCHECKED: `dot_f4_wave_r`'s fast
+/// path gates on the WEIGHT row's 4-byte alignment and then issues `float4` loads on the
+/// activation regardless, so a misaligned `x` faults rather than falling back to the scalar
+/// tail. Every `DeviceBuf` allocation satisfies it (`hipMalloc`); a pointer into the middle
+/// of one need not.
+///
+/// `x` and `h` must not ALIAS: both are `__restrict__` in the kernel.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_moe_expert_range_f4(
+    x: *const f32,
+    hidden: usize,
+    inter: usize,
+    e_start: usize,
+    e_count: usize,
+    n_desc: usize,
+    descs: *const ExpertDescF4,
+    wexpert: *const f32,
+    swiglu_limit: f32,
+    h: *mut f32,
+    acc: *mut u64,
+    nrow: usize,
+    stream: *mut c_void,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
+    let r = unsafe {
+        rivoli_moe_expert_range_f4(
+            x,
+            hidden as i32,
+            inter as i32,
+            e_start as i32,
+            e_count as i32,
+            n_desc as i32,
+            descs,
+            wexpert,
+            swiglu_limit,
+            h,
+            acc,
+            nrow as i32,
+            stream,
+        )
+    };
+    check(r, "moe_expert_range_f4")
+}
+
+/// `kernel.py::act_quant(v, 128, "ue8m0", inplace=True)` over `n_rows x row_len` f32, in
+/// place — the fp8 activation quantization V4 performs in front of every quantized
+/// `Linear`, fp4-weight ones included.
+///
+/// Fused quantize-then-dequantize: the buffer stays f32 and holds `e4m3(v/s)·s`. That is
+/// what the reference's `inplace=True` does and what the oracle models, so the values a
+/// following GEMV consumes are the reference's own.
+///
+/// # Safety
+/// `v` is `n_rows · row_len` live f32 for `stream`'s duration.
+pub unsafe fn launch_act_quant_f8(
+    v: *mut f32,
+    n_rows: usize,
+    row_len: usize,
+    stream: *mut c_void,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
+    let r = unsafe { rivoli_act_quant_f8(v, n_rows as i32, row_len as i32, stream) };
+    check(r, "act_quant_f8")
+}
+
+/// `model.py::Gate.forward` for ONE token: `logits` (a dense f32 GEMV against
+/// `gate.weight`) into `k` routing weights and `k` expert indices.
+///
+/// Exactly one of `bias` and `tid2eid` may be non-null, and the launcher refuses any other
+/// combination. A hash layer (`layer_id < n_hash_layers`) has `tid2eid` and no bias; a
+/// scored layer has a bias and no `tid2eid`. The two refused combinations are the two
+/// silent defects this router invites: routing a hash layer by score, and letting the
+/// selection bias reach the weights.
+///
+/// `tid2eid` is `[vocab_size, k]` **i64** — the checkpoint's dtype. `model.py` declares the
+/// parameter `torch.int32`, but every `layers.N.ffn.gate.tid2eid` on disk is `I64`.
+///
+/// `vocab_size` is `tid2eid`'s row count and is checked against `input_id` (guard 1003); it is
+/// ignored on a scored layer, which has no table to run off. **Entries of `tid2eid` are not
+/// range-checked** — see `moe.hip`'s note; S3 validates the table at load.
+///
+/// # Safety
+/// `logits` is `n_experts` f32; `bias`, when non-null, the same; `tid2eid`, when non-null,
+/// `vocab_size · k` i64. `weights`/`indices` hold `k` elements. All must outlive `stream`'s
+/// completion — await its [`Signal`](crate::backend::gpustream::Signal).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_moe_gate_v4(
+    logits: *const f32,
+    bias: *const f32,
+    tid2eid: *const i64,
+    input_id: usize,
+    vocab_size: usize,
+    n_experts: usize,
+    k: usize,
+    route_scale: f32,
+    weights: *mut f32,
+    indices: *mut i32,
+    stream: *mut c_void,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
+    let r = unsafe {
+        rivoli_moe_gate_v4(
+            logits,
+            bias,
+            tid2eid,
+            input_id as i32,
+            vocab_size as i32,
+            n_experts as i32,
+            k as i32,
+            route_scale,
+            weights,
+            indices,
+            stream,
+        )
+    };
+    check(r, "moe_gate_v4")
+}
+
+/// `model.py::Block.hc_pre` over `s` tokens: reduce the `hc` residual copies to one with
+/// Sinkhorn-normalised learned weights, and emit the `post`/`comb` the matching
+/// [`launch_hc_post`] consumes.
+///
+/// `iters` is `hc_sinkhorn_iters` from the config. **A numerical comparison cannot gate
+/// its exact value**: at 20 passes a 4x4 positive matrix is far past convergence, so 19 and
+/// 20 agree bit-for-bit (`tests/v4_oracle.rs::sinkhorn_has_converged_long_before_
+/// iteration_20`). Passing it from `V4Config` rather than baking it in is what keeps the
+/// count from drifting from `config.json`; what tests can and do prove is that the
+/// parameter is LIVE (2 and 20 disagree).
+///
+/// `hc` is checked against the kernel's `HC_MULT`, not merely passed: `mix_hc = (2+hc)·hc`
+/// is how the mHC weights are packed on disk, so a mismatch is a different checkpoint.
+///
+/// # Safety
+/// `h` is `s · hc · dim` f32, `fnw` is `(2+hc)·hc` rows of `hc·dim`, `scale` is 3 and
+/// `base` is `(2+hc)·hc`. Outputs: `y` `s·dim`, `post` `s·hc`, `comb` `s·hc·hc`. All must
+/// outlive `stream`'s completion — await its
+/// [`Signal`](crate::backend::gpustream::Signal) — and no output may alias `h`, which is
+/// `__restrict__` in the kernel.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_hc_pre(
+    h: *const f32,
+    fnw: *const f32,
+    scale: *const f32,
+    base: *const f32,
+    s: usize,
+    hc: usize,
+    dim: usize,
+    iters: usize,
+    norm_eps: f32,
+    hc_eps: f32,
+    y: *mut f32,
+    post: *mut f32,
+    comb: *mut f32,
+    stream: *mut c_void,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
+    let r = unsafe {
+        rivoli_hc_pre(
+            h,
+            fnw,
+            scale,
+            base,
+            s as i32,
+            hc as i32,
+            dim as i32,
+            iters as i32,
+            norm_eps,
+            hc_eps,
+            y,
+            post,
+            comb,
+            stream,
+        )
+    };
+    check(r, "hc_pre")
+}
+
+/// `model.py::Block.hc_post`: expand the sublayer output `x` back to `hc` residual copies,
+/// mixing the pre-sublayer `residual` through `comb`.
+///
+/// `comb` is indexed `[source, dest]`. Transposing it leaves every output row a
+/// combination of the same vectors, so no magnitude or norm check can see it.
+///
+/// # Safety
+/// `x` is `s·dim` f32, `residual` and `y` are `s·hc·dim`, `post` is `s·hc`, `comb` is
+/// `s·hc·hc`. All must outlive `stream`'s completion — await its
+/// [`Signal`](crate::backend::gpustream::Signal).
+///
+/// **`y` must not alias `residual`.** An in-place residual expansion is the obvious thing to
+/// want and it is wrong twice over: the two are `__restrict__`, and thread `i` writes
+/// `y[i]` while other threads are still reading every source copy of `residual`, with no
+/// barrier between them.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_hc_post(
+    x: *const f32,
+    residual: *const f32,
+    post: *const f32,
+    comb: *const f32,
+    s: usize,
+    hc: usize,
+    dim: usize,
+    y: *mut f32,
+    stream: *mut c_void,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
+    let r = unsafe {
+        rivoli_hc_post(x, residual, post, comb, s as i32, hc as i32, dim as i32, y, stream)
+    };
+    check(r, "hc_post")
 }
 
 /// Drain the fixed-point MoE accumulator into the residual:

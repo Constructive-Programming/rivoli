@@ -221,6 +221,324 @@ extern "C" int rivoli_moe_acc_drain_s(float* x, unsigned long long* acc, int n, 
     return e == hipSuccess ? 0 : -(int)e;
 }
 
+// ══ FP4 MoE — DeepSeek-V4-Flash's native routed experts ══════════════════════════════
+//
+// Same two-pass skeleton as the VQ and int4 paths, and FIVE differences from them, every
+// one of which is silent-wrong if it is dropped. They are listed here because a reader who
+// pattern-matches this onto the int4 twin below will get all five wrong at once.
+//
+//  1. The ACTIVATION is fp8. `model.py::linear` quantizes `x` to e4m3 at block 128 with a
+//     ue8m0 scale BEFORE the fp4 GEMM. This path therefore consumes an already-quantized
+//     `x` (`linalg.hip::act_quant_f8`), and `h` is re-quantized between the two passes.
+//     Feeding raw activations is a ~2^-3 relative error on every product: fluent, wrong.
+//  2. The SwiGLU is CLAMPED, and ASYMMETRICALLY — `up` to [-limit, +limit], `gate` from
+//     ABOVE only (model.py:606-607). rivoli's SwiGLU is unclamped.
+//  3. The ROUTING WEIGHT multiplies the SwiGLU intermediate, not the expert's output
+//     (model.py:610). Algebraically the same; NOT the same here, because the reference
+//     rounds the weighted intermediate to bf16 before `w2`.
+//  4. bf16 lands between every step. `Linear` returns bf16, so `gate`, `up`, the weighted
+//     intermediate and the expert output are each rounded — four roundings the GLM path
+//     does not have.
+//  5. `.f4` holds `n_experts` blocks and NO shared block: V4's shared expert is fp8 e4m3
+//     at 128×128 and rides the resident path. A descriptor one past the end is not the
+//     wrong bytes, it is the wrong ARITHMETIC — hence `n_desc` on the launcher.
+
+// Defined in linalg.hip. Declared rather than called from Rust so the sequence
+// gate/up → re-quantize → down cannot be issued with the middle step missing; see
+// `rivoli_moe_expert_range_f4`.
+extern "C" int rivoli_act_quant_f8(float* v, int n_rows, int row_len, void* stream);
+
+struct ExpertDescF4 {
+    const unsigned char* gate_packed;  // w1: [inter · hidden/2] e2m1 nibble pairs
+    const unsigned char* gate_scale;   // [inter · f4_ng(hidden)] e8m0 bytes
+    const unsigned char* up_packed;    // w3 — NOT w2; see quant.rs::V4_PROJ
+    const unsigned char* up_scale;
+    const unsigned char* down_packed;  // w2: [hidden · inter/2]
+    const unsigned char* down_scale;   // [hidden · f4_ng(inter)]
+};
+
+// f4_groups inline (i_dim is the reduction dim of the projection) — matches
+// quant.rs::f4_groups, the sizing `F4Expert::spans` lays the scale spans out with.
+//
+// CEIL here, FLOOR in the oracle (`WMat::Fp4::row` uses `cols / 32`). They disagree on a
+// reduction dim that is not a multiple of 32, and the disagreement is a scale ROW STRIDE —
+// every output row past the first would read the wrong scales, silently. What makes them
+// agree is `rivoli_moe_expert_range_f4`'s `% ACT_QUANT_BLOCK` guard (128 % 32 == 0), which
+// lives in neither expression; recorded here so a future non-128 reduction dim does not
+// walk into it.
+__device__ __forceinline__ size_t f4_ng(int i_dim) {
+    return (size_t)((i_dim + F4_GROUP - 1) / F4_GROUP);
+}
+
+// bf16 round-trip. Every `Linear` in the reference returns bf16 and the residual stream is
+// bf16, so this is where the reference's precision actually lives — dropping it is worth
+// ~2^-8 relative per step, two orders above the summation-order floor the oracle's
+// tolerance is built on.
+__device__ __forceinline__ float bf16r(float x) {
+    return bf16f(f2bf16(x));
+}
+
+// Pass 1: h[(e·R + t)·inter + j] = bf16(silu(min(bf16(w1_j·x), L)) · clamp(bf16(w3_j·x), ±L)
+//                                       · wexpert[e·R + t])
+//
+// `x` must ALREADY be fp8-quantized (`act_quant_f8`) — this kernel cannot do it, see that
+// kernel's note. `limit` is `swiglu_limit` from the config, passed rather than #defined so
+// the kernel and `config.json` cannot drift; the launcher refuses `limit <= 0`, because an
+// unclamped SwiGLU on a `.f4` expert is `v4oracle::Defect::SwigluUnclamped` and there is no
+// V4 configuration that wants it.
+template <int R>
+__device__ __forceinline__ void moe_gateup_f4_impl(
+    const float* __restrict__ x, int hidden, int inter, int e_start, int e_count,
+    const ExpertDescF4* __restrict__ descs, const float* __restrict__ wexpert, float limit,
+    float* __restrict__ h_out) {
+    int lane = threadIdx.x & (WAVE - 1);
+    size_t r = (size_t)blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / WAVE;
+    if (r >= (size_t)e_count * inter) return;
+    int e = e_start + (int)(r / inter);
+    int j = (int)(r % inter);
+    const ExpertDescF4 d = descs[e];
+    size_t rb = (size_t)(hidden / 2), ng = f4_ng(hidden);
+    float g[R], u[R];
+    dot_f4_wave_r<R>(x, hidden, d.gate_packed + (size_t)j * rb, d.gate_scale + (size_t)j * ng,
+                     hidden, lane, g);
+    dot_f4_wave_r<R>(x, hidden, d.up_packed + (size_t)j * rb, d.up_scale + (size_t)j * ng,
+                     hidden, lane, u);
+    if (lane == 0) {
+#pragma unroll
+        for (int t = 0; t < R; ++t) {
+            // bf16 FIRST, then clamp: `Linear` stores bf16 and `Expert.forward` clamps what
+            // it read back. Clamping the f32 dot and rounding afterwards would put a
+            // different value on the boundary — and the boundary is the only place a
+            // clamped SwiGLU differs from an unclamped one at all.
+            float gt = bf16r(g[t]), ut = bf16r(u[t]);
+            ut = fminf(fmaxf(ut, -limit), limit);
+            gt = fminf(gt, limit);  // ASYMMETRIC: no lower clamp on the gate
+            // `x · sigmoid(x)`, NOT this file's `siluf` (`x / (1 + e^-x)`). The two differ
+            // by one rounding, and `F.silu` is the multiply form. It would normally vanish
+            // under the bf16 store below — except exactly at a rounding boundary, where it
+            // flips a whole bf16 ulp. Matching the reference's association removes a
+            // systematic term from every comparison this port makes; keeping `siluf` here
+            // would put a known difference into results whose whole job is to expose
+            // unknown ones.
+            float sg = gt * (1.0f / (1.0f + expf(-gt)));
+            // ENFORCED, not inherited. `0 · finite` is exactly zero, but the gate has no
+            // LOWER clamp, so a `w1` dot at -inf gives `sg = -inf · 0 = NaN`, and `NaN · 0`
+            // is NaN, not 0. `moe_fixed` then turns that NaN into a FINITE extreme
+            // (`fminf`/`fmaxf` return the non-NaN operand) — silent corruption of a row that
+            // never asked for this expert. The int4 twin below carries the same guard on the
+            // same argument; folding the routing weight into pass 1 only moves the hazard a
+            // stage earlier, it does not remove it.
+            float w = wexpert[(size_t)e * R + t];
+            h_out[((size_t)e * R + t) * inter + j] = w == 0.0f ? 0.0f : bf16r(sg * ut * w);
+        }
+    }
+}
+
+// Pass 2: acc[t][o] += fixed(bf16(w2_o · h[e][t])). The routing weight is ALREADY in `h`
+// (see the block comment's point 3), so unlike the VQ/int4 twins this takes no `wexpert`
+// — one source of truth for the routing, and no way for a mask to disagree with the data.
+//
+// A row that did not route to `e` gets `h == 0` exactly — pass 1 ENFORCES that rather than
+// deriving it (see the note there) — hence a dot of exactly 0.0 and `moe_fixed(0) == 0`.
+// Adding it is a no-op, so riding through the arithmetic is bit-identical to skipping it.
+// It is not free, but it is not the cost either: the weight read is, and that happens
+// either way.
+//
+// `h` must have been re-quantized to fp8 between the passes: `w2` is a quantized `Linear`
+// like any other and quantizes its own input.
+template <int R>
+__device__ __forceinline__ void moe_down_f4_impl(
+    int hidden, int inter, int e_start, int e_count, const ExpertDescF4* __restrict__ descs,
+    const float* __restrict__ h_in, unsigned long long* __restrict__ acc) {
+    int lane = threadIdx.x & (WAVE - 1);
+    size_t r = (size_t)blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / WAVE;
+    if (r >= (size_t)e_count * hidden) return;
+    int e = e_start + (int)(r / hidden);
+    int o = (int)(r % hidden);
+    const ExpertDescF4 d = descs[e];
+    size_t rb = (size_t)(inter / 2), ng = f4_ng(inter);
+    const float* he = h_in + (size_t)e * R * inter;
+    float dv[R];
+    dot_f4_wave_r<R>(he, inter, d.down_packed + (size_t)o * rb, d.down_scale + (size_t)o * ng,
+                     inter, lane, dv);
+    if (lane == 0) {
+#pragma unroll
+        for (int t = 0; t < R; ++t)
+            atomicAdd(&acc[(size_t)t * hidden + o], moe_fixed(bf16r(dv[t])));
+    }
+}
+
+extern "C" __global__ void moe_gateup_f4(
+    const float* __restrict__ x, int hidden, int inter, int e_start, int e_count,
+    const ExpertDescF4* __restrict__ descs, const float* __restrict__ wexpert, float limit,
+    float* __restrict__ h_out) {
+    moe_gateup_f4_impl<1>(x, hidden, inter, e_start, e_count, descs, wexpert, limit, h_out);
+}
+
+extern "C" __global__ void moe_down_f4(
+    int hidden, int inter, int e_start, int e_count, const ExpertDescF4* __restrict__ descs,
+    const float* __restrict__ h_in, unsigned long long* __restrict__ acc) {
+    moe_down_f4_impl<1>(hidden, inter, e_start, e_count, descs, h_in, acc);
+}
+
+// gate/up + the `h` re-quantization + down for the absolute expert range
+// [e_start, e_start+e_count), on a caller-owned stream. THREE launches, not two:
+// `act_quant_f8` between the passes is not an optimisation, it is `w2`'s own input
+// quantization (see `moe_down_f4_impl`).
+//
+// `n_desc` is the length of `descs` — the guard `.f4`'s missing shared block needs, and the
+// only argument this launcher has that its VQ and int4 twins do not. See point 5 of the FP4
+// block comment above for why.
+extern "C" int rivoli_moe_expert_range_f4(
+    const float* x, int hidden, int inter, int e_start, int e_count, int n_desc,
+    const void* descs, const float* wexpert, float swiglu_limit, float* h,
+    unsigned long long* acc, int nrow, void* stream) {
+    // `e_start < 0` is house style, matching the VQ and int4 twins, and is unreachable
+    // through `launch_moe_expert_range_f4`, which takes a `usize`.
+    if (hidden <= 0 || inter <= 0 || e_count <= 0 || e_start < 0 || n_desc <= 0) return 1001;
+    // Both reduction dims must be whole ACT_QUANT_BLOCKs — which also makes them whole
+    // F4_GROUPs, since 128 % 32 == 0. See `rivoli_act_quant_f8` for why a ragged tail is
+    // refused rather than handled.
+    if (hidden % ACT_QUANT_BLOCK || inter % ACT_QUANT_BLOCK) return 1002;
+    // ONLY R=1 is instantiated. Not an oversight: the VQ and int4 twins carry R=2 because
+    // speculative decode was MEASURED to pay there (1.108x at `--mtp-min-conf 0.8`), and no
+    // such measurement exists for V4 — the S1b oracle is `bsz = 1` only, so a two-row FP4
+    // kernel could not even be scored. `rivoli_moe_expert_range_i4` refused every nrow > 1
+    // for the same reason until a caller existed, and that guard EARNED ITS KEEP on
+    // 2026-07-31 by failing loudly at token 1 instead of silently computing a short row.
+    if (nrow != 1) return 1003;
+    if (e_start + e_count > n_desc) return 1004;
+    // `!(x > 0)` rather than `x <= 0`, so a NaN limit is refused too. Why refusing at all:
+    // see `moe_gateup_f4_impl`.
+    if (!(swiglu_limit > 0.0f)) return 1006;
+    const ExpertDescF4* d = (const ExpertDescF4*)descs;
+    hipStream_t s = (hipStream_t)stream;
+    hipGetLastError();
+    dim3 grid_a(((size_t)e_count * inter + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+    hipLaunchKernelGGL(moe_gateup_f4, grid_a, dim3(256), 0, s, x, hidden, inter, e_start, e_count,
+                       d, wexpert, swiglu_limit, h);
+    hipError_t e = hipGetLastError();
+    if (e != hipSuccess) return -(int)e;
+    // Only THIS range's `h` rows. Quantizing the whole buffer would race the experts other
+    // streams are still writing, and would re-quantize rows a previous range already did —
+    // idempotent only by luck, since the second pass's amax is the first pass's output.
+    int rc = rivoli_act_quant_f8(h + (size_t)e_start * nrow * inter, e_count * nrow, inter, s);
+    if (rc != 0) return rc;
+    dim3 grid_b(((size_t)e_count * hidden + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+    hipLaunchKernelGGL(moe_down_f4, grid_b, dim3(256), 0, s, hidden, inter, e_start, e_count, d, h,
+                       acc);
+    e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+// ── V4 router (`model.py::Gate.forward`, `score_func == "sqrtsoftplus"`) ─────────
+//
+// Takes the gate logits (a DENSE f32 GEMV — `Gate.forward` opens with
+// `linear(x.float(), self.weight.float())`, so no activation quantization and no fp8) and
+// produces the top-k routing weights and indices.
+//
+// Two things here are easy to lose and impossible to see afterwards:
+//
+//   * the load-balancing `bias` shifts the scores used for SELECTION and is absent from
+//     the scores used as WEIGHTS (model.py:577-585). Using the shifted scores as weights
+//     changes every routed magnitude by an amount that looks like ordinary variation.
+//   * a HASH layer takes its indices from `tid2eid[input_id]` and bypasses the scores
+//     entirely — but the gate still RUNS, and its scores still become the weights. Reading
+//     `tid2eid` and skipping the gate leaves the weights uninitialised or uniform, which
+//     decodes fluently and wrongly. That is why this kernel takes both and the launcher
+//     refuses any combination but the model's own two.
+//
+// `sqrt(softplus(·))` uses PyTorch's DEFAULT `threshold = 20`: above it `softplus` IS the
+// identity, and `ln(1 + e^x)` in f32 saturates to +inf near x = 88. Without the branch a
+// large logit produces `sqrt(inf)` and the whole row renormalises to NaN.
+//
+// ONE BLOCK, and the selection runs on ONE THREAD. `torch.topk` is descending with ties to
+// the LOWER index, and a k-pass serial argmax is that rule by construction, where a
+// tree-reduced (value, index) pair is that rule only if the tie-break is written correctly
+// at every level.
+//
+// The work is n_experts·k = 1536 LDS compares per layer per token. NOT MEASURED — S4 should
+// price it before anyone parallelises it, and it is written here as a serial scan because
+// being obviously right is worth more than being fast until that number exists.
+extern "C" __global__ void moe_gate_v4(
+    const float* __restrict__ logits, const float* __restrict__ bias,
+    const long long* __restrict__ tid2eid, int input_id, int n_experts, int k,
+    float route_scale, float* __restrict__ weights, int* __restrict__ indices) {
+    extern __shared__ float gate_lds[];
+    float* orig = gate_lds;                // sqrt(softplus(logit)) — the WEIGHT scores
+    float* sel = gate_lds + n_experts;     // + bias — the SELECTION scores
+    for (int e = threadIdx.x; e < n_experts; e += blockDim.x) {
+        float l = logits[e];
+        // F.softplus's threshold=20 identity branch, which the reference relies on without
+        // naming it. See the block comment.
+        // `expf`/`logf`, NOT `__expf`/`__logf`: the fast intrinsics carry ~2 ulp, and this
+        // value is compared against a CPU oracle whose claimed floor is re-association.
+        float sp = l > 20.0f ? l : logf(1.0f + expf(l));
+        orig[e] = sqrtf(sp);
+        sel[e] = orig[e] + (bias ? bias[e] : 0.0f);
+    }
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    for (int j = 0; j < k; ++j) {
+        int pick;
+        if (tid2eid) {
+            pick = (int)tid2eid[(size_t)input_id * k + j];
+        } else {
+            // Descending, ties to the LOWER index: `>` (not `>=`) keeps the first-seen
+            // maximum, and the scan runs in ascending expert order.
+            pick = 0;
+            float best = sel[0];
+            for (int e = 1; e < n_experts; ++e) {
+                if (sel[e] > best) { best = sel[e]; pick = e; }
+            }
+            sel[pick] = -INFINITY;  // mask, so pass j+1 finds the next
+        }
+        indices[j] = pick;
+        weights[j] = orig[pick];  // the UNSHIFTED score — never `sel`
+    }
+    // `weights /= weights.sum()` then `*= route_scale`, in that order and only for the
+    // non-softmax score functions (V4 is `sqrtsoftplus`, so always).
+    float sum = 0.0f;
+    for (int j = 0; j < k; ++j) sum += weights[j];
+    for (int j = 0; j < k; ++j) weights[j] = (weights[j] / sum) * route_scale;
+}
+
+// `n_experts` f32 of LDS for the weight scores and as many again for the selection scores.
+//
+// The two arrays are separate because the bias must NOT reach the weights: one array with
+// the bias added in place is exactly `Defect::RouterBiasedWeights`, and it would be a
+// one-line "simplification" that no shape or magnitude check could find afterwards.
+//
+// **Entries of `tid2eid` are NOT range-checked** — a value outside `[0, n_experts)` reads
+// off the end of the LDS score array. Checking it per pick would put a branch on every
+// selection to catch a defect in a table that is loaded once, so S3 validates the table at
+// load instead. Recorded here because "the kernel checks it" is what a reader would assume.
+//
+// Takes a STREAM for the reason `rivoli_hc_pre` gives.
+extern "C" int rivoli_moe_gate_v4(
+    const float* logits, const float* bias, const long long* tid2eid, int input_id,
+    int vocab_size, int n_experts, int k, float route_scale, float* weights, int* indices,
+    void* stream) {
+    if (n_experts <= 0 || k <= 0 || k > n_experts) return 1001;
+    // A hash layer has `tid2eid` and NO bias; a scored layer has a bias and NO `tid2eid`
+    // (model.py:561-566). The other two combinations are the two silent-wrongs this router
+    // invites — routing by score on a hash layer, and biasing the weights — so they are
+    // refused here rather than resolved by precedence inside the kernel.
+    if ((tid2eid != 0) == (bias != 0)) return 1002;
+    // `input_id < 0` was the guard here and it could not fire: the Rust launcher takes a
+    // `usize`, so reaching a negative i32 needs a host index above 2^31. The reachable
+    // overrun is off the OTHER end — `tid2eid[input_id * k + j]` past a `[vocab_size, k]`
+    // table — so that is what is checked. `vocab_size` is ignored on a scored layer, where
+    // there is no table to run off.
+    if (tid2eid && (input_id < 0 || input_id >= vocab_size)) return 1003;
+    hipGetLastError();
+    hipLaunchKernelGGL(moe_gate_v4, dim3(1), dim3(256), 2 * n_experts * sizeof(float),
+                       (hipStream_t)stream, logits, bias, tid2eid, input_id, n_experts, k,
+                       route_scale, weights, indices);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
 // ── int4 MoE (group-scaled "warm expert" format): same two-pass shape as the VQ
 //    path, decoding via dot_i4_wave with one f32 scale per I4_GROUP weights applied
 //    INSIDE the dot. One descriptor per expert (six device pointers), absolute
