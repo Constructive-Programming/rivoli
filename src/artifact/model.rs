@@ -419,6 +419,15 @@ pub struct V4Config {
     /// One KV head, shared by all `n_heads` queries. Validated == 1: the whole attention
     /// frontend is written against a single shared entry.
     pub num_key_value_heads: usize,
+    /// The sliding-window span, and the size of the KV ring. Required, not defaulted:
+    /// `Attention.forward` indexes the cache as `kv_cache[:, start_pos % win]`, so a wrong
+    /// `win` silently attends to the wrong rows rather than failing. S2b had to pass this
+    /// in explicitly because it was missing here.
+    pub sliding_window: usize,
+    /// RMSNorm epsilon, used by `q_norm`/`kv_norm` AND by the weightless QK-norm. Required
+    /// for the same reason: a default that differs from the checkpoint shifts every norm
+    /// slightly and produces fluent, wrong text.
+    pub rms_norm_eps: f64,
 
     // --- per-layer KV compression. `compress_ratios[l] == 0` means pure sliding-window
     // (no compressor, no indexer, base `rope_theta`, YaRN OFF); `!= 0` selects
@@ -706,6 +715,8 @@ mod tests {
         ("o_groups", "8"),
         ("o_lora_rank", "1024"),
         ("num_key_value_heads", "1"),
+        ("sliding_window", "128"),
+        ("rms_norm_eps", "1e-06"),
         // 46 entries for 43 layers — the tail belongs to the mtp blocks. Layers 0 and 1
         // are ratio 0, then 4 and 128 alternate to layer 42.
         (
