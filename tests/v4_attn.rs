@@ -265,7 +265,7 @@ struct Score {
     /// through `f32_to_bf16` before differencing, so a kernel that stopped rounding its
     /// stores would keep extra f32 mantissa and still score `max_ulp = 0` — every value
     /// would round back to the same bf16. `Defect::NoBf16Rounding` is exactly that
-    /// breakage and `v4_rbf16` appears in every kernel S2b adds, so it is in scope. The
+    /// breakage and `rbf16` appears in every kernel S2b adds, so it is in scope. The
     /// oracle cannot supply the check (its goldens are bf16 on both sides by
     /// construction); it has to be a property of the GPU output on its own.
     unrounded: usize,
@@ -352,6 +352,7 @@ struct Gpu {
     ring: DeviceBuf,
     out: DeviceBuf,
     freqs: DeviceBuf,
+    max_m: usize,
 }
 
 impl Gpu {
@@ -377,6 +378,7 @@ impl Gpu {
             _w: w,
             _norms: norms,
             weights,
+            max_m,
             xq: z(max_m * d.dim),
             qr: z(max_m * d.q_lora_rank),
             qrq: z(max_m * d.q_lora_rank),
@@ -398,6 +400,7 @@ impl Gpu {
 
     fn scratch(&mut self) -> Scratch {
         Scratch {
+            rows: self.max_m,
             xq: self.xq.ptr_mut().cast(),
             qr: self.qr.ptr_mut().cast(),
             qrq: self.qrq.ptr_mut().cast(),
@@ -861,7 +864,7 @@ fn dims_accept_the_real_artifact_and_reject_a_ragged_kv_span() {
 /// The model fixture cannot cover this and no amount of it would. `act_quant`'s
 /// power-of-two scale puts a block's largest element in [224, 448], so an element only
 /// reaches e4m3's subnormals when it is ~2^15 below its block's peak — which drawn
-/// activations essentially never are. That range is precisely where `v4_f2e4m3_rne` and
+/// activations essentially never are. That range is precisely where `f2e4m3_rne` and
 /// rivoli's own `math.rs::f32_to_e4m3` disagree: the kernel rounds subnormal ties to
 /// nearest-EVEN because V4 was trained against CUDA's `cvt.rn.satfinite.e4m3x2.f32`,
 /// while rivoli's rule for GLM is half-away-from-zero.

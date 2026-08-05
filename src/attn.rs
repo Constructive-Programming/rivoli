@@ -240,7 +240,7 @@ pub mod v4 {
         launch_v4_act_quant, launch_v4_gemv_fp8, launch_v4_qk_norm, launch_v4_rmsnorm,
         launch_v4_rope, launch_v4_sparse_attn, memcpy_dtod,
     };
-    use anyhow::{Result, bail};
+    use anyhow::{Result, bail, ensure};
 
     /// The block size V4's attention weights are quantized on — `weight_block_size:
     /// [128, 128]` in the checkpoint's `quantization_config`, and also `kernel.py`'s
@@ -282,7 +282,7 @@ pub mod v4 {
         pub wo_b: Fp8W,
     }
 
-    /// Per-call scratch, device-resident, sized for `m` query rows.
+    /// Per-call scratch, device-resident, sized for `rows` query rows.
     ///
     /// `qr` and `qrq` are separate buffers holding the same values, and that is not
     /// waste: `qr` is `q_norm(wq_a(x))` and a ratio-4 layer's `Indexer` consumes it
@@ -291,6 +291,11 @@ pub mod v4 {
     /// which the compressor and the indexer both read.
     #[derive(Clone, Copy)]
     pub struct Scratch {
+        /// How many query rows every buffer below is sized for, checked against the `m`
+        /// the step implies. The failure it catches is REUSE — allocate once at `max_m`,
+        /// then hand a `Prefill` to a decode-sized scratch. Same hazard and same fix as
+        /// `v4compress::Buffers::scratch_rows`, which cites this struct for its reason.
+        pub rows: usize,
         /// `[m, dim]` — the activation-quantized copy of `x`.
         pub xq: *mut f32,
         /// `[m, q_lora_rank]`
@@ -379,6 +384,23 @@ pub mod v4 {
                 window,
                 norm_eps,
             };
+            d.validate()?;
+            Ok(d)
+        }
+
+        /// Every relation the kernels assume, checked against the values actually held.
+        ///
+        /// Called by `from_config` AND by [`attention`]: `Dims` is `Copy` with `pub`
+        /// fields, so a struct literal or a later `d.head_dim = 0` skips `from_config`
+        /// entirely — and the struct literal is what `tests/v4_attn.rs::dims` does today,
+        /// which is the shape a layer loop copies by default (S3 requirement 7). Sealing
+        /// the fields stops the literal and not the mutation, and costs every reader an
+        /// accessor; checking at the point of use stops both, for ~15 integer compares
+        /// against a 4096-wide GEMV.
+        pub fn validate(&self) -> Result<()> {
+            // `self` under a short name, so the checks below read as they did when they
+            // were inlined in `from_config` rather than gaining 40 `self.`.
+            let d = self;
             // EVERY extent, not just the three that read as counts. `is_multiple_of`
             // admits zero (`0.is_multiple_of(128)` is true) and so do `0 > 0` and
             // `0.is_multiple_of(2)`, so without this a `head_dim` or `q_lora_rank` of 0
@@ -387,7 +409,7 @@ pub mod v4 {
             // is the interesting one: it means no RoPE at all, which is a legal-looking
             // config and a completely different model.
             for (v, what) in [
-                (window, "sliding_window"),
+                (d.window, "sliding_window"),
                 (d.n_heads, "n_heads"),
                 (d.o_groups, "o_groups"),
                 (d.dim, "hidden"),
@@ -439,7 +461,7 @@ pub mod v4 {
             if !(d.n_heads * d.head_dim).is_multiple_of(d.o_groups) {
                 bail!("v4 attention: n_heads*head_dim is not divisible by o_groups");
             }
-            Ok(d)
+            Ok(())
         }
     }
 
@@ -458,8 +480,8 @@ pub mod v4 {
     ///
     /// # Safety
     /// Every pointer in `w`, `s` and `io` must be a live device allocation of at least
-    /// the size documented on its field, for the `m` implied by `step` (`seqlen` at
-    /// prefill, 1 at decode), and must stay live until the next
+    /// the size documented on its field — `s`'s buffers for `s.rows` rows, which this
+    /// checks against the `m` the step implies — and must stay live until the next
     /// [`crate::backend::hip::device_sync`]. `io.freqs` must cover position
     /// `start_pos + m - 1`.
     ///
@@ -475,6 +497,12 @@ pub mod v4 {
     ///   every entry must be `< seqlen` and at decode `< window`. The shape is checked
     ///   below; the VALUES are not and cannot be cheaply, which is the cost of letting
     ///   the caller own the selection buffer.
+    /// - **`io.x` and `io.out` must hold `s.rows` rows too.** They are the other two
+    ///   `[m, dim]` buffers, and `s.rows` is deliberately the ONE number that governs all
+    ///   nine: a second capacity field on [`Io`] would be a second thing to get right, and
+    ///   the check below would then pass while `io.out` — the buffer the next layer reads
+    ///   — still overran. Sized off the same allocation as [`Scratch`]'s and they cannot
+    ///   disagree.
     pub unsafe fn attention(
         d: &Dims,
         w: &Weights,
@@ -482,6 +510,7 @@ pub mod v4 {
         io: &Io,
         step: Step,
     ) -> Result<()> {
+        d.validate()?;
         let (m, pos0) = match step {
             Step::Prefill { seqlen } => (seqlen, 0),
             Step::Decode { pos } => (1, pos),
@@ -489,6 +518,11 @@ pub mod v4 {
         if m == 0 {
             bail!("v4 attention: zero query rows");
         }
+        ensure!(
+            m <= s.rows,
+            "v4 attention: {step:?} needs {m} scratch rows, caller allocated {}",
+            s.rows
+        );
         let (nh, hd, rd) = (d.n_heads, d.head_dim, d.rope_head_dim);
         let (nhd, gd) = (nh * hd, nh * hd / d.o_groups);
         let gr = d.o_groups * d.o_lora_rank;
@@ -603,5 +637,128 @@ pub mod v4 {
             launch_v4_gemv_fp8(s.y, w.wo_b.w, w.wo_b.scale, m, d.dim, gr, FP8_BLOCK, 1, io.out)?;
         }
         Ok(())
+    }
+}
+
+/// The two guards `attention` gained in S3 (requirements 6 and 7), exercised.
+///
+/// **Both fire before any device call**, which is what makes this testable without a GPU
+/// and is also the property being pinned: `d.validate()` and the `s.rows` check are the
+/// first two statements, so every pointer below can be dangling and never be read. If a
+/// guard stopped firing the test would not quietly pass — it would run on into
+/// `memcpy_dtod` with a null destination.
+///
+/// **This is the rejecting half only, and deliberately so.** The accepting half is the
+/// whole of `tests/v4_attn.rs`, which drives `attention` to completion against the oracle
+/// with `rows == max_m` and valid dims; if either guard were inverted, all five of its
+/// comparisons would fail to run at all. What a rejection-only test cannot do by itself is
+/// tell "the guard fired" from "something failed" — so each case below asserts on the
+/// MESSAGE, and the two cases are chosen to cross: the `Dims` case has ample rows, and the
+/// rows case has valid dims. Neither can be passing for the other's reason.
+///
+/// **SEEN RED, 2026-08-05, before being trusted green.** With `d.validate()?` deleted and
+/// the `ensure!` weakened to `m <= usize::MAX`, both tests failed — and failed on the
+/// backstop's message (`needs a (4, 4) selection, caller uploaded (0, 0)` and
+/// `needs a (1, 128) selection, …`), which is the evidence that a disabled guard lands on
+/// the selection bail rather than on a launcher. This repo has shipped a tautological
+/// anti-vacuity assertion twice and reported it working both times; the mutation is why
+/// this one is not a third.
+#[cfg(all(test, feature = "rocm"))]
+mod v4_guard_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
+    use super::v4::{Dims, Fp8W, Io, Scratch, Step, Weights, attention};
+
+    /// The shipped V4 geometry, so a rejection below is about the guard and not about a
+    /// shape the kernels would refuse anyway.
+    fn dims() -> Dims {
+        Dims {
+            dim: 4096,
+            n_heads: 64,
+            head_dim: 512,
+            rope_head_dim: 64,
+            q_lora_rank: 1024,
+            o_groups: 8,
+            o_lora_rank: 1024,
+            window: 128,
+            norm_eps: 1e-6,
+        }
+    }
+
+    /// Dangling, and never dereferenced: both guards return before the first launch.
+    fn parts(rows: usize) -> (Weights, Scratch, Io) {
+        let n = std::ptr::null_mut::<f32>();
+        let c = std::ptr::null::<f32>();
+        let f = Fp8W { w: std::ptr::null(), scale: c };
+        let w = Weights {
+            wq_a: f,
+            q_norm: c,
+            wq_b: f,
+            wkv: f,
+            kv_norm: c,
+            attn_sink: c,
+            wo_a: f,
+            wo_b: f,
+        };
+        let s = Scratch { rows, xq: n, qr: n, qrq: n, q: n, kv: n, o: n, y: n };
+        let io = Io {
+            x: c,
+            freqs: c,
+            idxs: std::ptr::null(),
+            // DELIBERATELY a shape no step wants, so the pre-existing selection guard is a
+            // BACKSTOP: if either guard under test stopped firing, control reaches that
+            // bail instead of a launcher, and the assertions below fail on the message
+            // rather than the process dying on a null device pointer. That is what lets
+            // these two tests be mutated to red safely — which they were, before they were
+            // trusted green (see the module doc).
+            idxs_shape: (0, 0),
+            ring: n,
+            out: n,
+        };
+        (w, s, io)
+    }
+
+    #[test]
+    fn a_decode_sized_scratch_refuses_a_prefill() {
+        let d = dims();
+        let (w, s, io) = parts(1);
+        // SAFETY: every pointer is null and none is read — the `rows` check precedes the
+        // first launch, which is the property this asserts.
+        let e = unsafe { attention(&d, &w, &s, &io, Step::Prefill { seqlen: 4 }) }
+            .expect_err("a 4-row prefill into a 1-row scratch must be refused");
+        let msg = format!("{e}");
+        assert!(msg.contains("scratch rows"), "wrong rejection: {msg}");
+
+        // ...and the same call with room does NOT fail for this reason. It still fails —
+        // the pointers are null — but the message proves the guard is a bound and not a
+        // constant `false`, which is the shape S2 shipped twice.
+        let (w, s, io) = parts(4);
+        let msg = match unsafe { attention(&d, &w, &s, &io, Step::Prefill { seqlen: 4 }) } {
+            Ok(()) => String::new(),
+            Err(e) => format!("{e}"),
+        };
+        assert!(!msg.contains("scratch rows"), "the guard rejects a scratch that fits: {msg}");
+    }
+
+    #[test]
+    fn attention_revalidates_dims_that_never_saw_from_config() {
+        // A `Dims` mutated AFTER construction — exactly what `from_config` cannot prevent
+        // and what requirement 7 is about. Ample rows, so the other guard is not in play.
+        let mut d = dims();
+        d.head_dim = 0;
+        let (w, s, io) = parts(64);
+        // SAFETY: as above.
+        let e = unsafe { attention(&d, &w, &s, &io, Step::Decode { pos: 7 }) }
+            .expect_err("a zero head_dim must be refused before any launch");
+        let msg = format!("{e}");
+        assert!(msg.contains("head_dim is zero"), "wrong rejection: {msg}");
+
+        // The derived extent, which no config field holds and the zero sweep cannot reach:
+        // `head_dim == rope_head_dim` makes the KV span zero and `0.is_multiple_of(64)` is
+        // true. It reached a launcher as guard code 1001 before `from_config` grew this.
+        let mut d = dims();
+        d.rope_head_dim = d.head_dim;
+        let e = unsafe { attention(&d, &w, &s, &io, Step::Decode { pos: 7 }) }
+            .expect_err("head_dim == rope_head_dim must be refused");
+        assert!(format!("{e}").contains("is zero"), "wrong rejection: {e}");
     }
 }

@@ -419,7 +419,7 @@ extern "C" __global__ void hc_pre(
     for (int d = t; d < dim; d += nt) {
         float acc = 0.0f;
         for (int c = 0; c < HC_MULT; ++c) acc += pre[c] * flat[(size_t)c * dim + d];
-        yo[d] = bf16f(f2bf16(acc));
+        yo[d] = rbf16(acc);
     }
     if (t < HC_MULT) post_out[(size_t)blockIdx.x * HC_MULT + t] = post[t];
     if (t < HC_MULT * HC_MULT) comb_out[(size_t)blockIdx.x * HC_MULT * HC_MULT + t] = comb[t];
@@ -443,7 +443,7 @@ extern "C" __global__ void hc_post(
     float acc = post[tok * HC_MULT + k] * x[tok * dim + d];
     for (int j = 0; j < HC_MULT; ++j)
         acc += comb[(tok * HC_MULT + j) * HC_MULT + k] * residual[(tok * HC_MULT + j) * dim + d];
-    y[i] = bf16f(f2bf16(acc));  // `.type_as(x)` — the residual stream is bf16
+    y[i] = rbf16(acc);  // `.type_as(x)` — the residual stream is bf16
 }
 
 // Interleaved RoPE (matching attn.rs) on `count` segments of `seg` elements:

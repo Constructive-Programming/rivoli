@@ -219,7 +219,7 @@ impl Diff {
 
 /// Compare two flattened `[n, d]` block sets in bf16 code space.
 ///
-/// Both sides hold bf16 values — the kernel's last act on every row is `v4c_rbf16` and the
+/// Both sides hold bf16 values — the kernel's last act on every row is `rbf16` and the
 /// oracle's is `round_bf16` — so the unit is exact and no epsilon is chosen: re-encode both
 /// and difference the codes. 0 is bit-identical, 1 is adjacent representable values.
 ///
@@ -312,7 +312,7 @@ fn gap(label: &str, want: &[f32], got: &[f32], d: usize, rd: usize) -> u32 {
 
 /// The bound every clean comparison in this file is held to.
 ///
-/// Not zero, and the reason is specific: `v4c_block_sum` folds the RMSNorm's sum-of-squares
+/// Not zero, and the reason is specific: `block_sum_lds` folds the RMSNorm's sum-of-squares
 /// as a tree over 256 threads while the oracle folds it sequentially over 512 elements, and
 /// `wave_sum` does the same to both projection dots. That re-association moves `rs` by a
 /// relative ~1e-7, which the following bf16 store rounds away in almost every element and

@@ -242,7 +242,12 @@ decision prevented the duplication it named and not the one beside it.
 
 Not a bug in the gate — a known scope whose implication nobody had drawn. **S3 lifts one
 copy of each into `common.hpp`**; it needs `mla.hip` edits that no S2 agent was permitted to
-make. Whether jscpd should scan `kernels/` at all is a separate question: the two backends'
+make. — *DONE 2026-08-05; §"Landed by S3" has the result. Two things are worth carrying
+forward: the lift moved `f2e4m3_rne` out from under `mla.hip`'s `contract(off)` and an ISA
+diff caught the FMA that appeared, and the first pass still left a FOURTH hand copy
+(`v4_act_quant`'s clamp-and-encode loop) eight lines below its own note saying the
+duplication was gone. Both were found by review, neither by a test.* Whether jscpd should
+scan `kernels/` at all is a separate question: the two backends'
 ABI walls are already `jscpd:ignore`d for being deliberate copies, so turning it on there
 would need its own exemption pass first.
 
@@ -333,6 +338,8 @@ the wiring, not suggestions:
 
 *Correctness, will produce fluent wrong output if missed:*
 1. **`rmsnorm` must bf16-round its output.** V4's `RMSNorm` returns bf16; rivoli's does not.
+   — *CORRECTED 2026-08-05: this points at the wrong kernel. See §"Requirement 1 does not
+   need a change to GLM's `rmsnorm`" below.*
    Worth **7.5e-3 on a 3.1 max (0.24%)**, and supplying it host-side makes the mHC chain
    reproduce the goldens *exactly* — so the requirement is both real and sufficient. Shared
    with GLM, which is why no S2 agent could close it.
@@ -350,10 +357,12 @@ the wiring, not suggestions:
 
 *Structural, will fault or silently corrupt:*
 6. **`Scratch` sizing is unchecked** — a decode-sized scratch handed a `Prefill` overruns
-   every buffer. A `capacity` field is three lines.
+   every buffer. A `capacity` field is three lines. — *LANDED 2026-08-05 as `Scratch::rows`.*
 7. **`Dims`' public fields make `from_config`'s validation bypassable** — including the
    derived-extent check above — **and the test fixture already bypasses it.** That is the
-   path S3 will copy by default.
+   path S3 will copy by default. — *LANDED 2026-08-05: `Dims::validate`, called from
+   `attention` too. Sealing the fields was rejected — it stops a struct literal and not a
+   later `d.head_dim = 0`.*
 8. `x`/`h` must be 16-byte aligned: unchecked, faults rather than falling back. `wexpert`,
    `h`, `descs` are indexed by **absolute** expert id and sized `n_desc`, not `e_count`.
    `hc_post`'s `y` must not alias `residual`. `Buffers` enforces only `scratch_rows`.
@@ -365,6 +374,7 @@ the wiring, not suggestions:
 *Housekeeping S3 owns because no S2 agent was permitted to:*
 11. **Lift one copy each of `f2e4m3_rne` and `fast_round_scale` into `common.hpp`** (see the
     jscpd blind-spot note above), plus `v4_block_sum`/`v4_rbf16`. Needs `mla.hip` edits.
+    — *LANDED 2026-08-05, and it was not free: see §"Landed by S3".*
 12. Prefill and decode index **different spaces** (absolute positions vs ring slots) and
     nothing in the types says so.
 13. `mod v4` is `#[cfg(feature = "rocm")]` and `vk.rs` has no counterparts, so
@@ -380,6 +390,146 @@ the wiring, not suggestions:
 16. **Toy-dim bit-exactness does not predict bit-exactness at depth.** At real dims there
     are 16× the terms, f32 re-association grows and bf16 flips become likely. Do not build
     a gate on the 0.000e0 results.
+
+### The 16 requirements are conditions on a loop that has five missing prerequisites — S3, 2026-08-05
+
+**The list above is a list of ways to get the wiring wrong. None of its entries is a thing
+that has to be BUILT for the wiring to exist**, and five such things do not exist. Read as
+a work plan the section reads as "connect the parts"; the parts do not meet. Each of these
+was checked in the tree, not inferred:
+
+1. **There is no `.f4` reader.** `ExpertHeader::from_bytes` (`format.rs:804`) hard-rejects
+   any magic but `VQ3_MAGIC`; `ExpertSet::open` (`:939`) computes its length check as
+   `(n_experts + 1) * stride` and a `.f4` file has exactly `n_experts` blocks;
+   `ExpertSet::open_routed` (`:862`) matches only `"vq3"`/`"i4"`. The in-source note at
+   `format.rs:804` says the first TWO must be relaxed **together**; `open_routed`'s extension
+   match is a third it does not mention. `shared_block`
+   must become unreachable for `.f4` rather than return the block past the end.
+2. **There is no V4 resident-weight loader.** `Pin::build` takes `cfg: &'a ModelConfig` and
+   `LayerPin` is MLA-shaped (`q_a/q_b/kv_a/kv_b/o_proj`). Nothing loads
+   `resident.safetensors`' V4 tensors — the fp8 attention set, `attn_sink`, the four norms,
+   the gate (`weight` plus `bias` **or** `tid2eid`), the six `hc_*` parameters, the
+   compressor's `ape/wkv/wgate/norm`, the indexer's tensors, or the fp8 shared expert.
+   `bin/convert_v4` **writes** all of them; nothing reads them.
+3. **`embed` and `head` are int8 on the pin and bf16 in the artifact.**
+   `launch_embed_i8_row` and `launch_gemv_i8` are the only two kernels for those roles;
+   `convert_v4.rs`'s `MODEL_LEVEL` emits `embed.weight` and `head.weight` as bf16. Two kernels are missing.
+   `v4_dense_gemm_bf16` is closer than it looks — runtime `(m, n, k)`, a bf16 `[n,k]`
+   weight, so at `m=1, n=vocab, k=hidden` it computes a bf16 head GEMV correctly. The
+   objection to reusing it is SHAPE, not capability: one wave per output element is a
+   129,280-wave launch over a one-row activation. That is a performance argument carrying
+   no measurement yet, so the honest instruction is "call it first, then price it", not
+   "write a kernel".
+4. **`hc_head` exists nowhere** — not in `kernels/`, not in `src/`, and deliberately not in
+   the oracle (`forward.rs:1783`: the head tail "is NOT transliterated here"). So the last
+   three ops of `Transformer.forward` — `hc_head`, the final `RMSNorm`, `ParallelHead` —
+   have neither an implementation nor a golden. **The first decode's logits are ungated by
+   construction**, and no tolerance chosen against per-layer goldens changes that.
+5. **`attn::v4::attention` cannot express a compressed layer, which is 41 of the 43.** It
+   derives the selection shape itself — `(seqlen, seqlen.min(window))` at prefill,
+   `(1, window)` at decode — and *rejects* anything else. A compressed layer's selection is
+   `cat([window_topk, compress_topk])`, so the width is `window + n_comp` and the `kv_src`
+   it attends must be `[ring ‖ compressed]`, which is a different buffer in each phase —
+   `Attention.forward`'s `start_pos == 0` arm builds `torch.cat([kv, kv_compress])` and
+   attends *that*, while the decode arm attends `self.kv_cache` whole. The function's
+   own doc says "for a `compress_ratio == 0` layer"; what was not drawn is that this makes
+   it unable to run **every layer but 0 and 1**.
+
+None of these is hard. Together they are more than "wire the loop", and the estimate that
+put 16 conditions and no prerequisites in one stage is the thing to correct.
+
+### The pre-indexer shortcut is narrower than it sounds — S3, 2026-08-05
+
+The briefing S3 was given (and the reading that makes a pre-indexer decode sound free)
+was: *"`index_topk` is 512 and the ratio-4 layers compress 4 tokens per block, so below
+~2052 tokens `index_topk` never truncates and block selection is purely positional —
+`compress_topk` in the oracle is a pure positional function."* **The two halves are each
+true of a different code path and joining them is false.**
+
+`compress_topk` (`v4oracle/forward.rs:1308`) is positional and takes no scores, and its own
+doc scopes it to "where `compress_ratio != 4`". `Oracle::attention` (`:1437-1462`) selects
+`lw.indexer` when it is `Some`, which `bin/v4-oracle.rs`'s `load_layer` pins to exactly the
+ratio-4 layers (a `match (ratio == 4, ck.has_prefix("…indexer."))` that `bail!`s on either
+mismatch);
+`compress_topk` is the **ratio-128 fallback**. `Oracle::indexer` (`:1173`) computes the
+full `[s, n_comp]` score matrix at **every** prompt length — there is no length gate on
+that path.
+
+What is true, and it is the useful half: `k = index_topk.min(n_comp)` with
+`n_comp = (start_pos + s) / ratio`, so truncation begins at `ratio * (index_topk + 1)` =
+**2052 total positions** (asserted by `tests/v4_compress.rs::indexer_topk_never_cuts_at_the_emit_prompt`). Below it the selected
+**set** is every causally-legal block — fixed by the mask, not by any score — so a *set*
+comparison cannot distinguish a right ranking from a wrong one, which is the hole recorded
+above. Two consequences the loose phrasing hides:
+
+- The engine may generate the set positionally below 2052 and attend the same blocks. It
+  may **not** expect `.compress_idxs` to compare: `topk_idx` returns **score-ordered** rows
+  (`forward.rs:776-782`, and `tests/v4_compress_probe.rs:331`), so the golden is a
+  permutation of the engine's positional order even when both are right. Compare as a SET.
+- Same set, different **order**, is not the same arithmetic. `sparse_attn` folds an online
+  softmax over the rows in the order given, so a positional engine and a score-ordered
+  oracle differ in the low bits of every compressed layer's output. That is a floor under
+  any tolerance at real dims, and it is not re-association from the kernels — it is a
+  *deliberate* difference this shortcut introduces.
+- 2052 is a bound on `start_pos + seqlen`, not on the prompt. A 13-token prompt crosses it
+  after 2039 generated tokens.
+
+### Requirement 1 does not need a change to GLM's `rmsnorm` — S3, 2026-08-05
+
+Requirement 1 reads "rivoli's `rmsnorm` does not bf16-round … Shared with GLM, which is why
+no S2 agent could close it." **The kernel that must not change is not the kernel the V4 loop
+should call.** `mla.hip::v4_rmsnorm` (S2b's) already stores `rbf16(w[i] * (row[i] * rs))`,
+is one block per row, and is in-place. `linalg.hip::rmsnorm` (GLM's) is out-of-place, does
+not round, and is **single-row** — `dim3(1)`, one mean over its whole `n`, so handing it
+`s * dim` takes a joint statistic over every token and reads the norm weight past its
+allocation (found by review 2026-08-05, `tests/v4_kernel.rs:1165`).
+
+So the requirement is satisfied by *selection*, not by an edit: `attn_norm` and `ffn_norm`
+go through `launch_v4_rmsnorm`, in place on `hc_pre`'s `y` (which is `[s, dim]` scratch, not
+the residual — the residual is the `[s, hc, dim]` `h` that `hc_post` reads). The measured
+7.5e-3 gap and GLM's kernel both stay exactly where they are.
+
+### Landed by S3 — 2026-08-05
+
+Requirements 6, 7 and 11; the reasoning is at the code (`common.hpp`'s V4 helper block,
+`attn::v4::Scratch::rows`, `attn::v4::Dims::validate`). **Requirement 11 did not close the
+hole it came from:** lifting four functions by hand is not a mechanism, `build.rs` still
+does not scan `kernels/`, and the next pair of parallel agents can re-derive the same
+arithmetic with nothing to stop them.
+
+**Requirement 11 was not free, and neither problem was found by a test.** Two review
+findings, both real:
+
+- **The lift introduced an FMA.** `mla.hip` opens a file-scope `#pragma clang fp
+  contract(off)`; `common.hpp` is included ABOVE it, and clang attaches FP options per
+  expression at parse time, so pointing `v4_act_quant` at `common.hpp::f2e4m3_rne` put its
+  subnormal branch under default contraction. Counted inside `v4_act_quant` at
+  `--offload-arch=gfx1151 -O3`: **7 fma-class instructions at 78796eb, 8 after the lift, 7
+  with a per-function `contract(off)` restored** — run in that order so the check was seen
+  to go red. No value moved (the branch bounds `a` to (2^-10, 2^-6) where `a * 512.0f` is
+  exact), but `mla.hip`'s "VERIFIED IN THE ISA" note and the `ULP_BUDGET = 1` it justifies
+  in `tests/v4_attn.rs` had both quietly become false. Restored rather than documented away.
+- **A fourth copy survived the first pass.** `v4_act_quant`'s clamp-and-encode loop was
+  `common.hpp::act_quant_roundtrip` open-coded — same divide, same deliberate ternaries (so
+  a NaN propagates instead of being laundered into -448 by `fminf`), same encode — sitting
+  eight lines below the note claiming the duplication was lifted. Now calls the shared one.
+  `moe.hip::bf16r` was a fifth: an identical body to `rbf16` under a transposed name, both
+  in scope in one translation unit.
+
+The **only** remaining ISA deltas against 78796eb are a clamp-order swap in `v4_act_quant`
+(`act_quant_roundtrip` tests the low bound first; identical for every input including NaN)
+and one added `s_barrier` each in `v4_rmsnorm`/`v4_qk_norm` from the trailing
+`__syncthreads()` — 1012 → 1024 bytes of code.
+
+**Still not verified on a GPU.** `tests/v4_attn.rs`, `tests/v4_kernel.rs` and
+`tests/v4_compress_kernel.rs` are what would show a numerics change and none has been run.
+The ISA diff bounds the risk; it does not replace them.
+
+**Named gap this leaves.** Nothing in the tree asserts the no-contraction property — it is
+a hand reading of the ISA in a comment, and this stage broke it without anything going red.
+A check would be a grep of the compiled `.s` for fma-class instructions inside the V4 kernel
+symbols. Not built here; recorded so the next reader knows the comment is the only guard.
+
 ## S4 — benchmark, quality assessment, ranked perf work.
 
 Scoped after S2 reports. S4's quality assessment ranks on **paired dNLL from `bin/ppl`**, not
