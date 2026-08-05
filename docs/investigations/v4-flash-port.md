@@ -1952,6 +1952,19 @@ removes the only place the requirement is stated as code); replacing `Phase` wit
 silence-when-the-user-already-asked, and without it `--no-mtp` on a V4 artifact prints a lecture
 about a flag the user just disabled).
 
+#### The stream work exists on another branch — S3-loop2, 2026-08-05
+
+The streams agent landed a trailing `stream` on all six V4 launchers plus `memcpy_dtod_async`,
+`launch_v4_swiglu_clamped` and `launch_gemv_f32`, each accepting `null_mut()`. **Not in this branch,
+and no forward plan is filed here** — a 34-line checklist was written and cut, because `investigations/`
+is "asked, answered, closed" and a plan for work on another branch rots the day it lands, in a
+directory nobody re-reads. Each item is stated at the call site it will edit instead: the
+`launch_v4_swiglu_clamped` swap at `V4Engine::shared_expert`, the four `device_sync`s at the module
+header, the `_stream` parameters by their own existence, and the two the checklist was the only
+record of — `memcpy_dtod_async` at the compressor placements, and the note that
+`launch_gemv_f32`'s per-row loop survives the rebase because its guard is on `nrow`, not on the
+stream.
+
 #### A process failure to record, and it is the one this document already warned about
 
 **I ran `cargo test --lib` outside the flock while the coordinator held the device.** CLAUDE.md

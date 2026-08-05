@@ -60,7 +60,18 @@
 //!
 //! **This loop does not claim to be race-free and no comment here should be read as saying
 //! so.** Every function below takes `stream` and threads it to whichever launcher accepts one,
-//! so the conversion is an argument per call site rather than a restructuring.
+//! so the conversion is an argument per call site rather than a restructuring. The launchers exist
+//! on another branch; the one item requirement 9 never named is the blocking `memcpy_dtod` above —
+//! converting the six without also taking `memcpy_dtod_async` leaves the overlap defeated and this
+//! header claiming otherwise. Marked at the two placements that use it.
+//!
+//! **And three launchers here ALREADY take a stream and are handed `null_mut()`:**
+//! [`launch_hc_pre`], [`launch_hc_post`] and [`launch_moe_acc_drain`]. That is correct today —
+//! everything around them is null-stream, so a non-null one would reorder against the norms — but
+//! it is the reason (1)-(3) above cannot narrow the day the other six convert: the
+//! hyper-connections and the accumulator drain would still serialise the layer, and the six-launcher
+//! count would read as complete. Three one-token edits, on no requirement's list; found by review,
+//! which is the only reason they are written down at all.
 
 use crate::artifact::model::V4Config;
 use crate::artifact::quant::{FP8_BLOCK, f4_expert_stride, read_f32};
@@ -855,6 +866,10 @@ impl V4Engine {
         // were bounded above. `memcpy_dtod` requires non-overlap, which holds: `cache` and
         // `a_kv` are distinct allocations and `out` is a third.
         unsafe {
+            // REBASE: `memcpy_dtod_async` here and below. This is a blocking `hipMemcpy` on the
+            // null stream (`kernels/linalg.hip:692`), so it is a full serialisation point in the
+            // middle of an otherwise-streamed sequence — converting the six V4 launchers without
+            // also converting these two leaves the overlap defeated.
             memcpy_dtod(cache.add(persist_base * hd).cast(), src, blocks * row)
                 .context("persisting the compressed region")?;
             if sel_base != persist_base {
@@ -1180,6 +1195,12 @@ impl V4Engine {
         let h = self.moe_h.ptr_mut().cast::<f32>();
         let descs = self.descs.ptr().cast::<ExpertDescF4>();
         let wexpert = self.wexpert.ptr().cast::<f32>();
+        // Narrowed here rather than held on `self`: the narrowing is deterministic, and
+        // `V4Config::validate` already checks the f32 it produces is positive AND finite — the
+        // second half because a finite f64 above ~3.4e38 saturates to `f32::INFINITY`, which passes
+        // every `> 0.0` test and makes `fminf(gt, inf)` a no-op, i.e. `Defect::SwigluUnclamped`
+        // silently. A copy of that check here was written and removed: `validate` runs on every
+        // path into this engine, and the version here was one-sided anyway.
         let limit = self.cfg.swiglu_limit as f32;
         let (cs, ms) = (self.compute_stream.raw(), self.miss_stream.raw());
         let null: *mut c_void = std::ptr::null_mut();
@@ -1302,7 +1323,8 @@ impl V4Engine {
             // no decode and no golden comparison could ever have run. Found by review before any
             // device did. `nrow == 2` is reachable and deliberately unused: V4 is structurally
             // single-row (`kernels/moe.hip:409`), so pairing rows here would buy one fewer
-            // launch of a 256x4096 GEMV against a second index space to get wrong.
+            // launch of a 256x4096 GEMV against a second index space to get wrong. The loop is
+            // NOT a null-stream artefact: the guard is on `nrow`, so it survives the rebase.
             let logits = self.gate_logits.ptr_mut().cast::<f32>();
             let x0 = xw.cast::<f32>();
             for t in 0..m {
