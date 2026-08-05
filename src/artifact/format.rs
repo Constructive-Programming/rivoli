@@ -1138,6 +1138,17 @@ impl ExpertSet {
     }
 
     /// Cold-read spec for a routed expert: `(fd, begin, useful_len)`, `begin` aligned.
+    ///
+    /// **Known-thin coverage on the GLM side, recorded 2026-08-05 and deliberately not
+    /// fixed here.** `begin` is a function of the EXPERT only, so the layer→file mapping
+    /// `files[layer - first_layer]` is observable solely through which fd comes back — and
+    /// `tests/artifact.rs` calls `read_spec(dense_layers, 0)` and nothing else, so a wrong
+    /// mapping survives it. `tests/v4_loading.rs`'s non-zero-start case is the one test that
+    /// pins this, by resolving each fd through `/proc/self/fd` and asserting the FILENAME.
+    /// That instrument was arrived at the hard way: two injected wrong mappings passed a
+    /// distinct-fds check and an offset check first, because `layer % files.len()` is
+    /// *identical* to `layer - first_layer` for a 3-layer artifact. Widening it to the GLM
+    /// set is a GLM-side change and belongs to whoever owns `tests/artifact.rs`.
     pub fn read_spec(&self, layer: usize, expert: usize) -> Result<(RawFd, usize, usize)> {
         ensure!(
             (self.first_layer..self.n_layers).contains(&layer),
