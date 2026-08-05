@@ -226,3 +226,387 @@ extern "C" int rivoli_mla_value_fp8(
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// DeepSeek-V4-Flash attention front half — S2b of docs/investigations/v4-flash-port.md
+// ═══════════════════════════════════════════════════════════════════════════════════
+//
+// V4 is MQA, not MLA: ONE 512-wide `wkv` entry is both the key and the value for all 64
+// heads, and its last `rope_head_dim` dims carry the position. So none of the `mla_*`
+// kernels above apply — there is no per-head K/V, no nope/rope tensor split, and no
+// latent cache. What is here is `Attention.forward`'s elementwise and GEMV work
+// (inference/model.py:490-548); the softmax core is `v4_sparse_attn` in attn.hip.
+//
+// EVERY defect available in this path is silent-wrong — a missing QK-norm, RoPE on the
+// wrong pairing, the partial fp8 quantization applied to the whole entry. The gate is
+// `src/v4oracle/`'s goldens, so each kernel below is written to reproduce the VALUE the
+// reference produces, not merely its shape; where a value cannot be reproduced the
+// reason is stated in place.
+//
+// FP CONTRACTION IS OFF for this section. `-ffp-contract=fast` would fuse `a*c - b*s`
+// into an FMA, which is a different VALUE, not a different summation order — and the
+// oracle's stated contract (src/v4oracle/forward.rs, "Fidelity") is that it reproduces
+// every value change and declines only re-association. Leaving contraction on would put
+// an unexplained delta into every comparison S2b makes, exactly as an fp8 `wo_a` would
+// (the plan's DECIDED note of 2026-08-05). These kernels are elementwise and
+// memory-bound, so the pragma costs nothing measurable; the fp8 dot below is
+// deliberately outside it — `dot_fp8_wave` is defined in `common.hpp`, included ABOVE
+// this line, so it never enters the pragma's lexical scope; that is the mechanism, not
+// an accident of where the GEMV happens to sit in this file. It also already
+// re-associates, so contraction is not the dominant term there.
+//
+// The cost has NOT been measured. These kernels are elementwise and bound by the bytes
+// they move, so the expectation is that it is free — but that is an expectation, and S4
+// is where it gets priced with the oracle available to bound the error either way.
+//
+// VERIFIED IN THE ISA, not assumed: at `--offload-arch=gfx1151 -O3`, `v4_rope`'s
+// `a*c - b*s` emits 4 `v_mul_f32` and ZERO fma-class instructions, while
+// `mla_absorb_fp8` above — same file, same flags, outside this pragma — emits 14. A
+// pragma in the wrong place would have been invisible otherwise, since the wrong answer
+// is still a plausible float. (Counts elsewhere in this section are NOT evidence of
+// contraction: `1.0f/sqrtf(x)` lowers to `v_rcp` plus FMA Newton steps, which is the
+// divide's own implementation and not a fusion of anything written here.)
+#pragma clang fp contract(off)
+
+// bf16 round-trip in f32. Activations stay f32 on device and hold bf16-representable
+// values, which is exactly what `Oracle::round_bf16` does to an `f32` Vec — the
+// reference stores bf16 at every point marked below, and matching WHERE it rounds is
+// what makes the goldens comparable at all.
+__device__ __forceinline__ float v4_rbf16(float x) { return bf16f(f2bf16(x)); }
+
+// f32 → e4m3, round-to-nearest-EVEN including the subnormal range.
+//
+// NOT `fwd.hip::f2e4m3`, and the difference is load-bearing. That one mirrors
+// `math.rs::f32_to_e4m3`, which rounds subnormals HALF-AWAY-FROM-ZERO (`.round()`);
+// V4 was trained against CUDA's `cvt.rn.satfinite.e4m3x2.f32`, which is RNE, and
+// `src/v4oracle/numerics.rs::e4m3_encode` models RNE for that reason. The two disagree
+// on exact halfway subnormals only — including `|x| == 2^-10`, where rivoli's rule
+// returns 2^-9 and V4's returns 0. `act_quant`'s power-of-two scale puts a block's
+// largest element in [224, 448], so an element reaches the subnormal range only ~2^15
+// below its block's peak: rare, real, and invisible to any tolerance. Copying the two
+// mantissa branches was preferred over generalising `fwd.hip`'s, which is on the GLM
+// decode path and must keep rivoli's rule.
+__device__ __forceinline__ unsigned char v4_f2e4m3_rne(float x) {
+    if (isnan(x)) return 0x7f;
+    unsigned char sign = signbit(x) ? 0x80 : 0;
+    float a = fabsf(x);
+    if (a >= 464.0f) return sign | 0x7e;       // midpoint to the absent next code
+    if (a <= 0.0009765625f) return sign;       // <= 2^-10: tie goes to 0 (even mantissa)
+    unsigned int bits;
+    __builtin_memcpy(&bits, &a, sizeof(bits));
+    int e = (int)((bits >> 23) & 0xffu) - 127;
+    if (e < -6) {
+        float scaled = a * 512.0f;             // subnormal quantum is 2^-9
+        float m = floorf(scaled);
+        float rem = scaled - m;
+        if (rem > 0.5f || (rem == 0.5f && ((unsigned int)m & 1u))) m += 1.0f;
+        unsigned int mi = (unsigned int)m;
+        return mi >= 8u ? (sign | 0x08) : (sign | (unsigned char)mi);
+    }
+    unsigned int mant = bits & 0x007fffffu;
+    unsigned int m3 = mant >> 20;
+    unsigned int rem = mant & 0x000fffffu;
+    if (rem > 0x00080000u || (rem == 0x00080000u && (m3 & 1u))) m3 += 1;
+    int exp = e + 7;
+    if (m3 == 8u) { m3 = 0; exp += 1; }
+    // DEAD, in this and in `numerics.rs::e4m3_encode` alike: the `a >= 464` return above
+    // bounds `e <= 8`, so `exp <= 15`, and at `e == 8` the fraction is in [1, 1.8125)
+    // which gives `m3 <= 6` with no round-up — so `exp == 15` only ever arrives via the
+    // carry, which sets `m3 = 0`. Kept because this function's value is being a
+    // statement-for-statement mirror; deleting one arm would make the two stop reading
+    // as the same function.
+    if (exp >= 15 && m3 >= 7u) return sign | 0x7e;
+    return sign | ((unsigned char)exp << 3) | (unsigned char)m3;
+}
+
+// `kernel.py::fast_round_scale(amax, 1/448)` — 2^ceil(log2(amax/448)) by IEEE-754 bit
+// surgery, NOT `log2f`/`ceilf`. The reference does the bit surgery, so a libm-accurate
+// version would disagree with it wherever the two disagree, and the whole point of the
+// ue8m0 scale is that it is a bare power of two.
+__device__ __forceinline__ float v4_round_scale(float amax) {
+    float t = amax * (1.0f / 448.0f);
+    unsigned int b;
+    __builtin_memcpy(&b, &t, sizeof(b));
+    int e = (int)((b >> 23) & 0xffu) - 127 + ((b & 0x007fffffu) ? 1 : 0);
+    unsigned int r = (unsigned int)(e + 127) << 23;
+    float s;
+    __builtin_memcpy(&s, &r, sizeof(s));
+    return s;
+}
+
+// `kernel.py::act_quant(x, block, scale_fmt="ue8m0", inplace=True)` — the fused
+// quantize-then-dequantize that SIMULATES fp8 inside a bf16 tensor. Two call sites with
+// different arguments, which is the entire reason this is one kernel and not two:
+//   * every quantized `Linear` runs it over the whole activation row at block 128
+//     (model.py:120/123), so the goldens are "what fp8 arithmetic produces", not
+//     "f32 reference values";
+//   * the KV entry runs it over dims [0, n) at block **64** with the RoPE tail left
+//     alone (model.py:512), which is why `n` is separate from `row_stride`.
+//
+// The result needs no bf16 rounding afterwards: an e4m3 value has at most 4 significant
+// bits and the scale is a bare power of two, so `e4m3 * s` lands exactly in bf16's 8 as
+// long as the product stays normal — which it does here, since the 1e-4 amax floor puts
+// the smallest scale this can produce at 2^-22 against a bf16 subnormal floor of 2^-133.
+// The reference's `inplace` cast back to bf16 is therefore a no-op, and so is the
+// oracle's `round_bf16` after `act_quant_inplace`. Checked over every e4m3 code against
+// scale codes 40..=200 by
+// `tests/v4_attn_host.rs::fp8_times_a_power_of_two_is_exact_in_bf16_over_the_range_the_checkpoint_uses`,
+// which also exhibits the tiny-scale boundary where it stops holding.
+//
+// One thread per (row, block): `block` is 64 or 128, the amax scan and the write-back
+// are serial over it, and the whole op moves ~2 KB per token. Parallelising inside a
+// block would buy nothing and would re-associate an absmax that is exact today.
+extern "C" __global__ void v4_act_quant(float* __restrict__ x, int rows, int row_stride,
+                                        int n, int block) {
+    int nb = n / block;
+    size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (id >= (size_t)rows * (size_t)nb) return;
+    float* seg = x + (size_t)(id / nb) * row_stride + (size_t)(id % nb) * block;
+    // `T.max(amax_local[i], 1e-4)`: the floor keeps an all-zero block from producing a
+    // zero scale and a division by zero. Seeding the scan with it is the same value.
+    float amax = 1e-4f;
+    for (int i = 0; i < block; ++i) amax = fmaxf(amax, fabsf(seg[i]));
+    float s = v4_round_scale(amax);
+    for (int i = 0; i < block; ++i) {
+        // Ternaries, NOT `fminf(fmaxf(...))`. C99's fmin/fmax return the non-NaN operand,
+        // so they would LAUNDER a NaN activation into -448 and hand the rest of the layer
+        // a finite, plausible number; Rust's `f32::clamp`, which the oracle uses,
+        // propagates it. A comparison against NaN is false, so NaN falls through both
+        // branches here, `v4_f2e4m3_rne` maps it to 0x7f and `e4m3f` gives NaN back —
+        // matching the oracle and keeping an upstream failure visible.
+        float t = seg[i] / s;
+        t = t > 448.0f ? 448.0f : (t < -448.0f ? -448.0f : t);
+        seg[i] = e4m3f(v4_f2e4m3_rne(t)) * s;
+    }
+}
+
+// Block-wide sum of `v` into every thread. `red` is caller-owned LDS of `blockDim.x`
+// floats; on return every thread holds the total. RE-ASSOCIATED relative to the
+// oracle's sequential fold — this is the one place these kernels knowingly diverge, and
+// it is the floor any tolerance built on the goldens has to clear.
+__device__ __forceinline__ float v4_block_sum(float v, float* red) {
+    red[threadIdx.x] = v;
+    __syncthreads();
+    for (int o = blockDim.x >> 1; o > 0; o >>= 1) {
+        if ((int)threadIdx.x < o) red[threadIdx.x] += red[threadIdx.x + o];
+        __syncthreads();
+    }
+    return red[0];
+}
+
+// `RMSNorm.forward` (model.py:197-202) — `q_norm` and `kv_norm`. FP32 internals: the
+// reference opens with an explicit `x = x.float()`, so the statistic, the epsilon and
+// the reciprocal square root are all f32 no matter that `x` arrived as bf16. The
+// learned weight multiplies AFTER the scale (`(self.weight * x)`, not `(w*v)*rs`), and
+// the store is bf16.
+//
+// One block per row. `1.0f/sqrtf` and not `rsqrtf`: `rsqrtf` is a hardware
+// approximation, and this factor multiplies the whole row, so its error is not a
+// rounding difference — it is a systematic scale on every downstream logit.
+extern "C" __global__ void v4_rmsnorm(float* __restrict__ x, const float* __restrict__ w,
+                                      int d, float eps) {
+    __shared__ float red[256];
+    float* row = x + (size_t)blockIdx.x * d;
+    float p = 0.0f;
+    for (int i = threadIdx.x; i < d; i += blockDim.x) p += row[i] * row[i];
+    float rs = 1.0f / sqrtf(v4_block_sum(p, red) / (float)d + eps);
+    for (int i = threadIdx.x; i < d; i += blockDim.x) row[i] = v4_rbf16(w[i] * (row[i] * rs));
+}
+
+// The QK-norm, model.py:504: `q *= rsqrt(q.square().mean(-1) + eps)` over `head_dim`,
+// applied after the unflatten to (heads, head_dim), with **NO learnable weight**.
+//
+// TWO things here are invisible to the gate and had to be read off the reference:
+//
+// 1. It runs BEFORE the RoPE (model.py:504 then :505). The oracle CANNOT see the order
+//    — `apply_rotary_emb` rotates adjacent pairs, so it preserves `mean(q^2)`, and a
+//    scalar commutes with a rotation; `Defect::QkNormAfterRope` is demoted out of the
+//    defect matrix for exactly that reason (tests/v4_oracle.rs::
+//    qk_norm_order_is_a_rounding_difference_not_an_arithmetic_one). The launch order in
+//    src/attn.rs is therefore justified by model.py, not by a green test.
+// 2. It is computed in **BF16**, unlike `v4_rmsnorm`. `RMSNorm.forward` opens with
+//    `x = x.float()`; model.py:504 does not, and `q` is bf16 out of `fp8_gemm`, so the
+//    square, the mean, the `+ eps` and the `rsqrt` are all bf16-valued. Keeping the
+//    statistic in f32 leaves the factor up to 2^-9 (~0.2%) off, identically for every
+//    dim of a head, which scales that head's whole logit row.
+//
+// INHERITED INFERENCE, and the sharpest one in this file: torch reduces a bf16 `.mean`
+// through an f32 accumulator (`acc_type`) with a bf16 result. `src/v4oracle/forward.rs`
+// marks the same reading INFERRED, and this kernel copies it — so if it is wrong, both
+// are wrong the same way and no golden can tell. That is a shared blind spot created by
+// agreeing with the instrument, and it is stated here because nothing else in the tree
+// states it.
+extern "C" __global__ void v4_qk_norm(float* __restrict__ q, int d, float eps) {
+    __shared__ float red[256];
+    float* row = q + (size_t)blockIdx.x * d;
+    float p = 0.0f;
+    // Per-element squares are bf16; the accumulator is f32 (the inference above). The
+    // round-trip also blocks FMA contraction of the square into the accumulate.
+    for (int i = threadIdx.x; i < d; i += blockDim.x) p += v4_rbf16(row[i] * row[i]);
+    float var = v4_rbf16(v4_block_sum(p, red) / (float)d);
+    float rs = v4_rbf16(1.0f / sqrtf(v4_rbf16(var + eps)));
+    for (int i = threadIdx.x; i < d; i += blockDim.x) row[i] = v4_rbf16(row[i] * rs);
+}
+
+// `apply_rotary_emb` (model.py:238-250) over the LAST `rd` dims of each row.
+//
+// **ADJACENT PAIRS `(2i, 2i+1)`**, because the reference rotates through
+// `torch.view_as_complex`. This is NOT what `linalg.hip::rope_interleave` does: that one
+// reads the adjacent pair and WRITES the half-split slots `(i, half+i)`, which is the
+// GLM/HF convention and carries a permutation. Reusing it here would be
+// `Defect::RopeHalfSplit`, which the oracle enumerates as a deliberate breakage —
+// v4-flash-port.md calls this the single most likely silent-wrong in S2b's scope, and
+// both rotations produce fluent text.
+//
+// The angles come from a precomputed `(cos, sin)` table rather than being computed here,
+// because the per-layer YaRN selection lives in the table (model.py:481-488) and a
+// kernel that computed `theta^(-2i/rd)` itself would have to re-derive the
+// interpolation. Row `r` uses position `pos0 + r/rows_per_pos`: `rows_per_pos` is
+// `n_heads` for q and for the output de-rotation (whose rows are per (token, head)) and
+// 1 for the KV entry (one row per token).
+//
+// `inverse` conjugates the rotation — `apply_rotary_emb(o[..., -rd:], freqs_cis, True)`
+// at model.py:539, the output de-rotation. Omitting it, or applying the forward
+// rotation there, are both silent and both in the defect matrix.
+//
+// One thread owns a whole pair, so the read-before-write is per-thread and needs no
+// barrier. The trailing sweep is `round_bf16(row)` over the WHOLE row, as the oracle
+// does: the untouched dims are already bf16 so it is a no-op on them, and doing it
+// unconditionally removes a standing assumption about what the previous kernel left.
+extern "C" __global__ void v4_rope(float* __restrict__ x, const float* __restrict__ tbl,
+                                   int row_len, int rd, int pos0, int rows_per_pos,
+                                   int inverse) {
+    float* row = x + (size_t)blockIdx.x * row_len;
+    float* seg = row + (row_len - rd);
+    const float* t = tbl + (size_t)(pos0 + (int)blockIdx.x / rows_per_pos) * rd;
+    for (int i = threadIdx.x; i < rd / 2; i += blockDim.x) {
+        float c = t[2 * i], s = inverse ? -t[2 * i + 1] : t[2 * i + 1];
+        float a = seg[2 * i], b = seg[2 * i + 1];
+        seg[2 * i] = a * c - b * s;
+        seg[2 * i + 1] = a * s + b * c;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < row_len; i += blockDim.x) row[i] = v4_rbf16(row[i]);
+}
+
+// The quantized `Linear` of model.py:114-127, and the grouped `wo_a` einsum of
+// model.py:541-544, as ONE kernel — they differ only in which slice of the input a given
+// output row reads.
+//
+// `out[r][j] = bf16( Σ_i x_row(r, j)[i] · e4m3(w[j][i]) · wscale[j/block][i/block] )`
+//
+// with `x_row(r, j) = x + (r·groups + j/(n_out/groups))·k`, i.e. the input is `m` rows of
+// `groups` consecutive k-wide slices and output row `j` reads slice `j/(n_out/groups)`.
+//   * `Linear`: `groups = 1`, so every output row reads the whole activation row.
+//   * `wo_a`: `groups = o_groups`. `o.view(b, s, n_groups, -1)` over a head-major
+//     flattening makes group `g` the CONTIGUOUS run of heads [g·(n_heads/n_groups), …) —
+//     all `head_dim` dims of each — so the einsum needs no gather, only the right base.
+//
+// ONE parameter, not three. The first cut took `x_row_stride`, `group_rows` and
+// `x_group_stride` separately, and at every call site they were `k`, `n_out/groups` and
+// `k` — so the only reachable configurations were the two above, and the other
+// combinations were an unchecked way to read past the input. The bound is now exactly
+// `m·groups·k` and follows from the arguments instead of being a relation
+// (`(n_out/group_rows − 1)·x_group_stride + k ≤ x_row_stride`) that nothing verified.
+//
+// NO activation quantization here. `Linear.forward` does its `act_quant` before calling
+// the GEMM, so `v4_act_quant` is a separate launch on the caller's side; `wo_a` gets none
+// at all, which is the whole content of the plan's DECIDED note of 2026-08-05 — `wo_a`
+// ships fp8 on disk and `convert.py` dequantizes it to bf16 (convert.py:123-127), and an
+// fp8 GEMV here would not match the oracle bit-for-bit, making a real bug and the format
+// choice indistinguishable. Reading the fp8 bytes and dequantizing here is NOT a third
+// option: over the scale range any weight tensor uses it produces the same bf16 values
+// `convert.py` would have written (4 significant bits into 8), measured by
+// `tests/v4_attn_host.rs::fp8_times_a_power_of_two_is_exact_in_bf16_over_the_range_the_checkpoint_uses`.
+//
+// One wave per output row, via `dot_fp8_wave` — whose summation order is NOT the
+// oracle's sequential fold. That re-association is the floor on the tolerance, and it is
+// measured rather than assumed (tests/v4_attn.rs).
+extern "C" __global__ void v4_gemv_fp8(const float* __restrict__ x,
+                                       const unsigned char* __restrict__ w,
+                                       const float* __restrict__ wscale, int m, int n_out,
+                                       int k, int block, int groups,
+                                       float* __restrict__ out) {
+    __shared__ float lut[256];
+    e4m3_lut_build(lut, threadIdx.x);
+    __syncthreads();
+    size_t id = (size_t)blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / WAVE;
+    if (id >= (size_t)m * (size_t)n_out) return;
+    int r = (int)(id / n_out), j = (int)(id % n_out);
+    int bsh = blk_shift(block);
+    const float* xr = x + ((size_t)r * groups + (size_t)(j / (n_out / groups))) * (size_t)k;
+    float acc = dot_fp8_wave(xr, w + (size_t)j * k,
+                             wscale + (size_t)(j >> bsh) * ((k + block - 1) / block), k,
+                             block, (int)(threadIdx.x & (WAVE - 1)), lut);
+    if ((threadIdx.x & (WAVE - 1)) == 0) out[(size_t)r * n_out + j] = v4_rbf16(acc);
+}
+
+// ── V4 launchers ────────────────────────────────────────────────────────────────────
+// Return codes follow this file's convention: 0 ok, POSITIVE argument guard, NEGATIVE
+// -hipError. All pointers device-resident; launch-only.
+
+extern "C" int rivoli_v4_act_quant(float* x, int rows, int row_stride, int n, int block) {
+    if (rows <= 0 || n <= 0 || block <= 0 || row_stride < n) return 1001;
+    // `kernel.py::act_quant` asserts `N % block_size == 0`. Without this a ragged tail
+    // block would be quantized against its own amax and produce values the reference
+    // cannot produce — silently, since every shape in the model divides evenly today.
+    // 1004 is this file's divisibility code (cf. rivoli_v4_gemv_fp8 below); 1002 is a
+    // size bound. Getting them the wrong way round costs nothing at the call site and
+    // misleads everyone who learned the codes from the other ~60 launchers.
+    if (n % block) return 1004;
+    size_t total = (size_t)rows * (size_t)(n / block);
+    hipGetLastError();
+    hipLaunchKernelGGL(v4_act_quant, dim3((unsigned)((total + 255) / 256)), dim3(256), 0, 0, x,
+                       rows, row_stride, n, block);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+extern "C" int rivoli_v4_rmsnorm(float* x, const float* w, int rows, int d, float eps) {
+    if (rows <= 0 || d <= 0) return 1001;
+    hipGetLastError();
+    hipLaunchKernelGGL(v4_rmsnorm, dim3((unsigned)rows), dim3(256), 0, 0, x, w, d, eps);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+extern "C" int rivoli_v4_qk_norm(float* q, int rows, int d, float eps) {
+    if (rows <= 0 || d <= 0) return 1001;
+    hipGetLastError();
+    hipLaunchKernelGGL(v4_qk_norm, dim3((unsigned)rows), dim3(256), 0, 0, q, d, eps);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+extern "C" int rivoli_v4_rope(float* x, const float* tbl, int rows, int row_len, int rd,
+                              int pos0, int rows_per_pos, int inverse) {
+    if (rows <= 0 || row_len <= 0 || rd <= 0 || rows_per_pos <= 0 || pos0 < 0) return 1001;
+    if (rd > row_len) return 1002;
+    // `view_as_complex` needs an even count to pair, and the table holds rd/2 pairs.
+    // 1005, not 1003: 1003 is "power-of-two tile" everywhere else in this file, and a
+    // parity requirement is not that.
+    if (rd & 1) return 1005;
+    if (rows % rows_per_pos) return 1004;
+    hipGetLastError();
+    hipLaunchKernelGGL(v4_rope, dim3((unsigned)rows), dim3(256), 0, 0, x, tbl, row_len, rd, pos0,
+                       rows_per_pos, inverse);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+extern "C" int rivoli_v4_gemv_fp8(const float* x, const unsigned char* w, const float* wscale,
+                                  int m, int n_out, int k, int block, int groups, float* out) {
+    if (m <= 0 || n_out <= 0 || k <= 0 || block <= 0 || groups <= 0) return 1001;
+    if (block & (block - 1)) return 1003;  // blk_shift needs a power-of-two tile
+    // A `groups` that does not divide `n_out` would send the last partial group's rows to
+    // a slice index no input was sized for, and read past the end.
+    if (n_out % groups) return 1004;
+    size_t total = (size_t)m * (size_t)n_out;
+    hipGetLastError();
+    hipLaunchKernelGGL(v4_gemv_fp8,
+                       dim3((unsigned)((total + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK)),
+                       dim3(ROWS_PER_BLOCK * WAVE), 0, 0, x, w, wscale, m, n_out, k, block,
+                       groups, out);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
