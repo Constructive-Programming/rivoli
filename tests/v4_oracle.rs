@@ -31,7 +31,7 @@
 //! weights so the toy's verdict is cross-checked rather than trusted.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use rivoli::v4oracle::forward::{Capture, Defect, Oracle, Step};
+use rivoli::v4oracle::forward::{Capture, Defect, HeadTailW, Oracle, Step};
 use rivoli::v4oracle::golden::{Diff, GoldenSet, diff, identical};
 use rivoli::v4oracle::numerics::{
     FP4_MAX, FP8_MAX, act_quant_inplace, bf16_decode, bf16_encode, e2m1_decode, e2m1_encode,
@@ -444,6 +444,13 @@ fn run(layer: usize, prompt: usize, defect: Defect) -> Run {
         let ids = fixed_ids(cfg, &format!("ids-{tag}"), s);
         let step = Step { lw, layer, s, start_pos, input_ids: &ids, phase: &tag };
         o.run_layer(&step, &mut st, &mut h, &mut caps[slot]);
+        // The head tail, on THIS layer's output. `bin/v4-oracle` deliberately refuses to do
+        // that (see `HeadTailW`) because a logits vector taken at 4 of 43 layers is not a
+        // quantity the model computes and would be misread as one. Here nothing is ever read
+        // as a model quantity -- the whole file is a structural gate on the toy -- and the
+        // composition buys the thing a standalone head fixture could not: every layer defect
+        // is shown to REACH the logits, so the head tail is proved unable to mask one.
+        o.head_tail(&m.head_tail, &h, s, &tag, &mut caps[slot]);
     }
     let [pre, dec] = caps;
     Run { pre, dec }
@@ -532,6 +539,22 @@ fn expect(d: Defect) -> Option<Expect> {
             &[".in", ".attn_norm_out", ".q", ".kv_entry", ".compressed"],
         ),
 
+        // MEASURED over the whole grid, 2026-08-05: this moves exactly ONE score element, at
+        // (layer 2, prompt 12, decode step 2), out of ~60 live scores -- and never moves
+        // `.compress_idxs` or anything downstream. A matrix row would be false in 15 of the
+        // 16 cases.
+        //
+        // That is a statement about the FIXTURE, not about the defect. The toy runs
+        // `index_n_heads = 4`, so the reduction has 3 rounding opportunities where the model's
+        // 64 heads have 63, and at 64 heads the same fold disagrees with torch **72.6%** of
+        // the time (`Oracle::bf16_sum`). Raising the toy's head count would let the grid see
+        // it, and is deliberately NOT done here: `V4Config::toy` is the shared fixture for
+        // `tests/v4_attn.rs` and `tests/v4_kernel.rs` and moving it would invalidate their
+        // goldens. Covered absolutely instead, by
+        // `bf16_reduction_matches_torch_and_not_a_running_fold`, which is the only kind of
+        // check that could have caught this class at all -- see that test's header.
+        Defect::IndexerBf16RunningSum => None,
+
         Defect::SwigluUnclamped
         | Defect::SwigluClampGateBothSides
         | Defect::RouterNoSoftplusThreshold => None,
@@ -568,6 +591,23 @@ fn expect(d: Defect) -> Option<Expect> {
         // a claim no implementation could violate. Demoted to targeted tests, the same way
         // `KvActQuantBlock128` and `SinkhornOneFewerIter` were.
         Defect::HcPreNoRsqrt | Defect::NoBf16Rounding => None,
+
+        // -- head tail ------------------------------------------------------------------
+        // Same shape of problem as `HcPreNoRsqrt`: both reach every head golden and the only
+        // thing upstream of them is the layer stack, which `head_tail` cannot touch because
+        // it takes `&[f32]`. A silence Rust's own types enforce is not evidence about this
+        // gate, so both are targeted rather than matrix rows.
+        Defect::HeadHcNoRsqrt | Defect::HeadHcRsqrtPerCopy => None,
+
+        // `.hc_head_out` is the real silent half here, and it is violable: an implementation
+        // that fused `hc_head` with the final norm -- the obvious single-kernel shortcut,
+        // since both are reductions over the same row -- would move it.
+        Defect::HeadNormSkipped | Defect::HeadNormNotBf16 | Defect::HeadNormOverAllTokens => {
+            e(&[".final_norm_out", ".logits"], &[".hc_head_out"])
+        }
+        Defect::HeadLogitsFromFirstRow => {
+            e(&[".logits"], &[".hc_head_out", ".final_norm_out"])
+        }
 
         // Mathematically INERT: `apply_rotary_emb` rotates adjacent pairs, so it PRESERVES
         // `q.square().mean(-1)`, and a scalar scale commutes with a rotation. The two orders
@@ -608,6 +648,15 @@ fn reachable(d: Defect, c: &Case, base: &Run) -> bool {
         // ...and `tid2eid` only on hash layers.
         Defect::HashRoutingIgnored => c.layer < cfg.n_hash_layers,
 
+        // Both are INERT at one row, by construction rather than by fixture: `x[:, -1]` IS
+        // `x[:, 0]` when there is one row, and a per-token RMS over one token IS the joint
+        // one. Every decode step here is `s == 1`, so the whole Decode capture must come back
+        // bit-identical -- which is also why these two are dangerous in the field. A decode
+        // smoke test cannot see either, and the engine spends almost all its life at s == 1.
+        Defect::HeadNormOverAllTokens | Defect::HeadLogitsFromFirstRow => {
+            c.phase == Phase::Prefill
+        }
+
         _ => true,
     }
 }
@@ -626,6 +675,13 @@ fn cases() -> Vec<Case> {
 }
 
 fn matching<'a>(ds: &'a [Diff], suffix: &str) -> Vec<&'a Diff> {
+    // The whole suffix scheme rests on the leading dot. Without it `"norm_out"` would match
+    // `head.*.final_norm_out` AND `.attn_norm_out` AND `.ffn_norm_out`, and `"_out"` would
+    // sweep up `.attn_out`, `.ffn_out` and `.out` together -- a silent widening that reads
+    // exactly like a correct row. With every suffix dotted there is no collision in the
+    // current name set. That was previously only a naming convention and a comment; this is
+    // what actually enforces it.
+    assert!(suffix.starts_with('.'), "golden suffix {suffix:?} must carry its leading dot");
     ds.iter().filter(|d| d.name.ends_with(suffix)).collect()
 }
 
@@ -661,6 +717,7 @@ fn defect_matrix_is_bidirectional() {
     let baselines = baselines();
     let mut reached = 0usize;
     let mut silenced = 0usize;
+    let mut propagated = 0usize;
     // (defect -> its fingerprint in every case). Two defects with the SAME vector are the
     // same defect wearing two names, and the matrix would then count one piece of evidence
     // twice. This is not hypothetical: `RopeNoYarn` and `RopeBaseThetaEverywhere` were
@@ -706,6 +763,30 @@ fn defect_matrix_is_bidirectional() {
                     );
                 }
             }
+            // The head tail must not be able to MASK an upstream error. Wherever a defect
+            // moved the layer's residual output, the logits have to move too -- otherwise a
+            // per-layer golden could fail while the token that comes out is unchanged, or,
+            // far worse, the reverse. Checked here rather than in its own test because `ds`
+            // is already computed: a second pass over the grid would double this file's
+            // runtime for evidence that is free at this point.
+            // Paired by STEP, not any-to-any across the capture. A Decode capture holds four
+            // steps, so an any/any check would be satisfied by a defect that moved `.out` at
+            // `dec0` and the logits at `dec3` -- which is not the claim. Both names carry the
+            // same `{tag}`, so the pairing is free.
+            for h in matching(&ds, ".out").iter().filter(|h| h.changed > 0) {
+                let tag = h.name.split('.').nth(1).unwrap_or_default();
+                let want = format!("head.{tag}.logits");
+                let lg = ds.iter().find(|x| x.name == want).unwrap_or_else(|| {
+                    panic!("{d:?} at {c:?}: {} moved but there is no {want} to check", h.name)
+                });
+                assert!(
+                    lg.changed > 0,
+                    "{d:?} at {c:?}: moved {} but left {want} bit-identical -- the head tail \
+                     absorbed the error",
+                    h.name
+                );
+                propagated += 1;
+            }
             reached += 1;
         }
         for (other, theirs) in &prints {
@@ -719,6 +800,20 @@ fn defect_matrix_is_bidirectional() {
     }
     assert!(reached > 200, "only {reached} reachable (defect, case) pairs were asserted");
     assert!(silenced > 40, "only {silenced} unreachable pairs -- too little silent evidence");
+    // The propagation claim above is only worth anything if it was exercised. A change that
+    // stopped `.out` from moving anywhere -- or that dropped the head tail out of `run` --
+    // would leave the `if` cold and the assertion inside it vacuously satisfied.
+    // MEASURED 2026-08-05: 1046 (defect, case, step) triples move a layer `.out`, and every
+    // one of them moves that same step's logits. The bound is a witness, not the observation
+    // -- set well under 1046 so ordinary fixture drift does not trip it, and far enough above
+    // zero that dropping the head tail out of `run`, or a change that stopped `.out` moving,
+    // would. (It read 417 while the check paired per CAPTURE rather than per step.)
+    assert!(
+        propagated > 400,
+        "only {propagated} (defect, case, step) triples moved a layer .out -- 1046 did when \
+         this was measured -- so the \"the head tail cannot mask an upstream error\" claim is \
+         nearly untested"
+    );
 }
 
 #[test]
@@ -916,6 +1011,384 @@ fn defect_list_has_no_duplicates() {
 // 3. targeted tests for the magnitude-gated defects
 // =======================================================================================
 
+/// `(terms, torch `.sum()`, the running bf16 fold)` — captured from CPU PyTorch, 2026-08-05.
+///
+/// Shaped like the indexer's real summand, `relu(einsum) * weights_proj(x)`: the `relu_` at
+/// model.py:427 applies to the einsum output ONLY, and `weights_proj` is a bare
+/// `ColumnParallelLinear` with no activation (model.py:400, :424) scaled by a positive
+/// scalar — so the weights are **signed** and the terms can cancel. An earlier version of
+/// this fixture assumed non-negative terms; that was wrong, and every conclusion about the
+/// error having a systematic direction went with it (see `Oracle::bf16_sum`).
+///
+/// Two properties the rows are chosen for, because a fixture that merely "differs" proves
+/// nothing:
+/// - Row 1 is a CONTROL the two semantics agree on, so separation elsewhere is a fact about
+///   the semantics and not about the data being uniformly hostile.
+/// - The rest separate, at `n = 4` (the toy's `index_n_heads`) and `n = 64` (the model's).
+///
+/// These are SAMPLED, so their separation is a property of a seed. The case that separates
+/// by construction is built in the test body rather than tabulated here — `vanishing_terms`.
+type ReductionCase = (&'static [f32], f32, f32);
+const TORCH_REDUCTIONS: &[ReductionCase] = &[
+    // toy `index_n_heads` = 4.0: torch .sum() = -1.4765625, running fold = -1.484375
+    (
+        &[
+        -0.016967773, -0.100097656, -0.49023438, -0.87109375
+        ],
+        -1.4765625,
+        -1.484375,
+    ),
+    // CONTROL: the two agree here: torch .sum() = -1.234375, running fold = -1.234375
+    (
+        &[
+        -1.2578125, 0.0, 0.026245117, 0.0
+        ],
+        -1.234375,
+        -1.234375,
+    ),
+    // model `index_n_heads` = 64.0: torch .sum() = -2.109375, running fold = -2.09375
+    (
+        &[
+        0.103515625, 0.0, 0.0, 0.26367188, 0.35546875, 0.1796875, 0.0, -0.359375, 0.0, 0.33203125,
+        1.9375, 0.0, 0.0, 0.0, 1.8125, -2.9375, 0.0, 0.0, -0.51953125, 0.0, -0.203125, 0.0,
+        0.06738281, -0.265625, 0.0, -0.08105469, -0.5078125, 0.0, 0.75390625, 0.0, 0.0, -0.9921875,
+        0.0, 0.0, -0.24707031, 0.5, -0.26367188, 0.0, -0.111328125, 0.0, 0.0, 0.0, -0.048095703,
+        0.0, 0.0, 0.0, 0.103027344, 0.0, 0.0, -0.057617188, 0.0, -0.55078125, 0.0, -0.24804688,
+        0.0, 0.0, 0.0, -1.1171875, 0.0, 0.0, 0.0, 0.0, -0.0065307617, 0.0
+        ],
+        -2.109375,
+        -2.09375,
+    ),
+    // 64.0 heads, magnitudes spread 32x: torch .sum() = 94.5, running fold = 94.0
+    (
+        &[
+        0.0, 5.90625, 0.0, 0.0, 0.0, 14.1875, -10.625, 70.0, 8.625, -4.59375, 0.0, 0.0, 0.0, 2.65625,
+        -22.5, -3.0625, 0.0, 103.0, 0.0, 0.0, 8.9375, 18.0, 10.9375, 0.0, 4.3125, 38.25, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 5.90625, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -27.625, -13.8125, 0.0,
+        7.65625, 0.0, 0.0, 0.0, 5.25, -17.875, -0.056396484, -43.25, -33.75, -9.5, 1.7421875,
+        7.78125, -2.921875, -9.625, 0.0, -28.625, -0.88671875, -3.96875, 0.0, 14.1875
+        ],
+        94.5,
+        94.0,
+    ),
+];
+
+#[test]
+fn bf16_reduction_matches_torch_and_not_a_running_fold() {
+    // **The test that would have caught the 2026-08-05 indexer defect, and the reason it has
+    // to be shaped like this.** Every other test in this file is SELF-RELATIVE -- a defected
+    // capture against an undefected one -- so an error the oracle shares with its own defect
+    // matrix cancels on both sides and is invisible. The running-bf16-fold reduction at
+    // model.py:427 was exactly that for the life of the file. Nothing short of an ABSOLUTE
+    // comparison against the reference's own semantics can see that class of bug.
+    //
+    // The expected values are PyTorch's, captured out of tree (see `TORCH_REDUCTIONS`), not
+    // recomputed here from a restatement of the oracle.
+    let (cfg, _) = model();
+    let good = Oracle::new(cfg.clone(), Defect::None);
+    let bad = Oracle::new(cfg.clone(), Defect::IndexerBf16RunningSum);
+    let mut separated = 0usize;
+    for (i, (terms, torch_sum, torch_fold)) in TORCH_REDUCTIONS.iter().enumerate() {
+        let got = good.bf16_sum(terms.iter().copied());
+        assert_eq!(
+            got.to_bits(),
+            torch_sum.to_bits(),
+            "row {i}: oracle {got:e} != torch .sum() {torch_sum:e} -- the reduction does not \
+             accumulate in f32 and round once"
+        );
+        let fold = bad.bf16_sum(terms.iter().copied());
+        assert_eq!(
+            fold.to_bits(),
+            torch_fold.to_bits(),
+            "row {i}: the running-fold variant is not the fold torch reproduces, so the \
+             defect does not model the bug that was actually here"
+        );
+        separated += usize::from(torch_sum.to_bits() != torch_fold.to_bits());
+    }
+    // Bidirectional: the data must be able to TELL THEM APART, and must also contain a case
+    // where they legitimately agree -- a fixture on which everything differs would prove
+    // nothing about resolution. Row 1 is that control.
+    assert_eq!(separated, TORCH_REDUCTIONS.len() - 1, "the fixture's separation changed");
+    // The rows above separate because the seed found rows that do; reseed them and that could
+    // change. This one separates because it cannot do anything else. bf16 keeps 7 explicit
+    // mantissa bits, so the ulp at 1.0 is 2^-7 and 63 terms of 2^-10 -- an EIGHTH of an ulp
+    // each -- are individually rounded away by a running fold, while together they are worth
+    // 7.9 ulps: 1.0 against 1.0625, with no sampling in it. (Verified against this crate's
+    // own codec: bf16(1.0 + 2^-8) == 1.0, bf16(1.0 + 2^-7) == 1.0078125, and
+    // (1.0625 - 1.0) / 2^-7 == 8 exactly.)
+    //
+    // 1.0625 is PyTorch's answer for this vector, not arithmetic restated here — captured in
+    // the same session as the table above.
+    let vanishing_terms: Vec<f32> =
+        std::iter::once(1.0f32).chain(std::iter::repeat_n(2.0f32.powi(-10), 63)).collect();
+    assert!(all_bf16(&vanishing_terms), "the construction must be exact in bf16 to mean anything");
+    assert_eq!(
+        good.bf16_sum(vanishing_terms.iter().copied()),
+        1.0625,
+        "f32 accumulation must keep 63 eighth-ulp terms; torch gives 1.0625"
+    );
+    assert_eq!(
+        bad.bf16_sum(vanishing_terms.iter().copied()),
+        1.0,
+        "a running fold must round every one of them away"
+    );
+}
+
+/// The head tail at toy dimensions, captured from CPU PyTorch on 2026-08-05.
+///
+/// **This is the ABSOLUTE gate on the head tail, and the reason it exists is the same reason
+/// `bf16_reduction_matches_torch_and_not_a_running_fold` exists.** Every other head-tail
+/// assertion in this file is SELF-RELATIVE -- a defected capture against an undefected one --
+/// so a transliteration error shared by `hc_head` and its own defect variants cancels on both
+/// sides and passes silently. That is exactly how the indexer's running-fold survived. If
+/// `hc_head`'s rsqrt were scoped wrong in both the base path and `HeadHcRsqrtPerCopy`, or the
+/// final norm's eps landed outside the sqrt in both, the other 30 tests would still be green.
+///
+/// Generated by transliterating model.py:709-716 (`hc_head`), :197-202 (`RMSNorm`) and
+/// :731-740 (`ParallelHead`, `full_logits=False`) straight into torch calls -- not by
+/// restating the Rust. Dimensions are deliberately tiny (`hc_mult` 4, `dim` 8, `s` 2,
+/// `vocab` 5) so the whole fixture is readable, and `s = 2` so `x[:, -1]` is a real choice.
+///
+/// Dtypes follow the checkpoint, and the test asserts that they do: `H`, `NORM_W` and
+/// `LM_HEAD` are bf16-representable because the checkpoint stores them bf16, while `FN` is
+/// full f32 because `hc_head_fn` is F32 on disk -- so the mixes dot exercises f32 mantissas
+/// that a bf16 fixture would have hidden.
+#[rustfmt::skip]
+mod torch_head_tail {
+    pub const HC_MULT: usize = 4;
+    pub const DIM: usize = 8;
+    pub const S: usize = 2;
+    pub const VOCAB: usize = 5;
+    pub const H: &[f32] = &[
+        -0.05517578, -0.28710938, -0.14746094, -0.0078125, -1.796875, -0.2578125, 1.921875,
+        -0.23632813, 2.21875, -0.25, 0.53125, 0.578125, 0.9375, 0.52734375, -0.2109375,
+        0.51953125, -0.54296875, 1.390625, 0.08544922, -0.21777344, 0.31054688, 0.66796875,
+        0.39648438, -0.33203125, -1.609375, -0.12011719, -0.06689453, -0.13671875, 0.6328125,
+        -0.5390625, 1.390625, -0.96484375, -0.9375, 2.0, 0.10986328, -0.33984375, -0.796875,
+        -0.74609375, -0.62109375, -1.4375, 1.9765625, -0.06738281, -1.625, -0.38867188,
+        -0.546875, 0.10986328, 1.40625, -0.703125, 0.11816406, -0.37109375, -0.0021514893,
+        0.59765625, 1.546875, 0.33789063, -0.5078125, 0.17285156, -0.15820313, -2.265625,
+        1.4375, -0.13574219, 2.71875, 1.4609375, -1.328125, -0.11425781
+    ];
+    pub const FN: &[f32] = &[
+        0.440603, -0.66241807, -0.24728929, -0.13473506, 0.6656537, 0.9849724, 0.039184332,
+        0.093170285, -0.13936427, -0.40719315, 0.01683204, -0.8812992, -0.8122814, 0.3493402,
+        -0.08314953, 0.021388406, 1.1909121, -1.0306041, -0.11617905, 0.19755034, -0.012285116,
+        -0.4201789, -0.16754936, 0.050195172, 0.5776188, -0.03540141, 0.5788603, -0.065610915,
+        0.031231571, 0.89210266, 1.1707971, 0.44770864, -0.20019218, -0.7726562, 0.5258006,
+        0.56279606, -0.5170723, 0.27976602, 0.16123955, -0.3741502, 0.96389794, -0.21715029,
+        -0.4851133, -0.112384826, 0.017547777, -0.15141359, -0.6811052, -0.36952764,
+        0.18584248, 0.19504797, -0.93740416, -0.13653417, -0.3739525, -0.7811996, 0.65430826,
+        0.04110952, 0.7716346, -0.4844922, -0.37774345, 0.156617, -0.35271907, -0.92980933,
+        0.04721228, -0.39673546, -0.22678863, -0.006180152, 0.9809605, 0.3741006, -0.31392458,
+        -0.70439285, 0.09982608, -0.14046784, -0.9091174, -0.21177873, -1.3339996, 0.27655193,
+        0.3117143, -0.21688096, -0.31344137, -0.60645866, -0.38015386, -0.49603975,
+        -0.12530302, -0.63456744, -0.047734298, -0.17878447, -0.35324326, -0.33005747,
+        -0.4325743, -0.43922296, -0.2842426, 0.046071798, -0.9829653, -0.50217706, 0.75698155,
+        0.17544046, 0.5727456, 0.29420432, 1.1298723, -0.33078817, 0.27781653, -0.36367008,
+        0.824201, 0.16153276, -0.15936637, -0.9153573, -0.026848827, -1.0524422, 0.14650427,
+        0.40450522, 0.51041394, 0.730945, 0.005767892, -0.6457507, 0.40119773, -0.0018267105,
+        0.25621048, 0.17447938, -0.64957625, -0.077361606, 1.3280479, 0.0018734756,
+        -0.17327635, 0.46909046, -1.0369962, 0.3421054, 0.30048266, 0.3960198
+    ];
+    pub const BASE: &[f32] = &[
+        -1.8474996, -1.169862, -0.7948558, -0.084306315
+    ];
+    pub const SCALE: &[f32] = &[
+        0.9867983
+    ];
+    pub const NORM_W: &[f32] = &[
+        1.4375, -0.52734375, -1.484375, -0.10253906, -1.546875, 0.859375, -1.6484375,
+        -0.5859375
+    ];
+    pub const LM_HEAD: &[f32] = &[
+        -0.8125, 1.421875, 0.37695313, 0.54296875, -0.5234375, 1.3046875, -0.67578125,
+        -1.0703125, -0.48242188, 0.38085938, -2.484375, 2.4375, -1.2109375, -1.3203125,
+        -0.828125, -0.25195313, 0.3671875, -0.40820313, -1.8203125, -0.53125, -1.1171875,
+        0.39257813, 0.55859375, 2.3125, 0.72265625, -0.031982422, -0.7109375, 0.109375,
+        0.58203125, 0.40625, -0.6328125, 0.18164063, -1.1640625, 0.56640625, 0.953125,
+        0.052001953, 0.1328125, -0.7890625, -0.953125, -0.65234375
+    ];
+    pub const HC_HEAD_OUT: &[f32] = &[
+        1.75, -0.033935547, 0.45507813, 0.453125, 0.83984375, 0.515625, -0.092285156,
+        0.36914063, 0.046875, -0.17871094, 0.07763672, -0.025878906, 0.28515625, 0.14257813,
+        -0.11425781, -0.096191406
+    ];
+    pub const FINAL_NORM_OUT: &[f32] = &[
+        3.328125, 0.02355957, -0.890625, -0.061279297, -1.7109375, 0.5859375, 0.20117188,
+        -0.28515625, 0.46875, 0.65625, -0.8046875, 0.018432617, -3.078125, 0.85546875, 1.3125,
+        0.39257813
+    ];
+    pub const LOGITS: &[f32] = &[
+        1.6791062, 3.4799843, 6.7748985, -1.3114338, -3.5308638
+    ];
+}
+
+/// Is every value in `v` exactly representable in bf16?
+fn all_bf16(v: &[f32]) -> bool {
+    v.iter().all(|&x| bf16_decode(bf16_encode(x)).to_bits() == x.to_bits())
+}
+
+#[test]
+fn the_head_tail_matches_torch_absolutely() {
+    use torch_head_tail as t;
+    // The fixture must be adversarial in the way it claims: bf16 where the checkpoint stores
+    // bf16, and NOT bf16 for `hc_head_fn`, which is F32 on disk. If `FN` were bf16-valued the
+    // mixes dot would never exercise an f32 mantissa and this gate would be weaker than it
+    // reads.
+    assert!(all_bf16(t::H), "the residual stream must be bf16, as the reference stores it");
+    assert!(all_bf16(t::NORM_W) && all_bf16(t::LM_HEAD), "norm/head weights are bf16 on disk");
+    assert!(!all_bf16(t::FN), "hc_head_fn is F32 on disk; a bf16 fixture would not exercise it");
+
+    let cfg = V4Config { dim: t::DIM, vocab_size: t::VOCAB, ..V4Config::toy() };
+    assert_eq!(cfg.hc_mult, t::HC_MULT, "the fixture was captured at hc_mult 4");
+    let o = Oracle::new(cfg.clone(), Defect::None);
+    let hw = HeadTailW {
+        hc_head_fn: t::FN.to_vec(),
+        hc_head_base: t::BASE.to_vec(),
+        hc_head_scale: t::SCALE.to_vec(),
+        norm: t::NORM_W.to_vec(),
+        lm_head: WMat::Dense { rows: t::VOCAB, cols: t::DIM, v: t::LM_HEAD.to_vec() },
+    };
+    let mut cap = Capture::default();
+    o.head_tail(&hw, t::H, t::S, "abs", &mut cap);
+
+    // Bitwise, not `assert_close`. At these dimensions a sequential f32 dot reproduces
+    // torch's reduction exactly -- checked when the fixture was captured, all 5 logits equal
+    // -- so there is no re-association slack to hide behind, and the two bf16 tensors are
+    // quantized coarsely enough that any real disagreement clears the format anyway.
+    for (name, want) in [
+        ("hc_head_out", t::HC_HEAD_OUT),
+        ("final_norm_out", t::FINAL_NORM_OUT),
+        ("logits", t::LOGITS),
+    ] {
+        let got = cap.float(&format!("head.abs.{name}")).unwrap_or_else(|| panic!("{name} missing"));
+        assert_eq!(got.len(), want.len(), "head.abs.{name} length");
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "head.abs.{name}[{i}]: oracle {g:e} != torch {w:e} -- the transliteration \
+                 disagrees with the reference, and no self-relative test in this file can see it"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_head_tail_stores_bf16_where_the_reference_does_and_f32_where_it_does_not() {
+    // The dtype boundary is the whole of the head tail's precision contract, and it is a live
+    // choice on the device: `hc_head` returns `y.to(dtype)` and `RMSNorm.forward` returns
+    // `(...).to(dtype)` -- both bf16 -- while `ParallelHead.forward` is `F.linear(x.float(),
+    // weight)` on an f32 parameter and is never stored back. Getting the last one wrong by
+    // reusing a bf16-storing GEMV is silent: the argmax usually survives it.
+    let (cfg, _) = model();
+    let r = run(3, 12, Defect::None);
+    // Prefill (12 rows in) and a decode step (1 row in), because the claim that `logits` is
+    // ONE row is only a claim at all when more than one row went in.
+    for (cap, phase) in [(&r.pre, "pre"), (&r.dec, "dec0")] {
+        let get = |n: &str| {
+            cap.float(&format!("head.{phase}.{n}"))
+                .unwrap_or_else(|| panic!("head.{phase}.{n} is missing"))
+                .to_vec()
+        };
+        let (hc, nm, lg) = (get("hc_head_out"), get("final_norm_out"), get("logits"));
+        // The `[s, dim]` shapes are NOT re-asserted here: `Capture::push` already refuses a
+        // tensor whose length disagrees with its declared shape, and `head_tail` declares
+        // them from the same `cfg`. `logits` IS asserted, because it is the one shape a
+        // correct-looking implementation gets wrong -- `ParallelHead.forward` slices
+        // `x[:, -1]`, so 12 rows in must still give ONE row of logits out. An implementation
+        // that returned all rows would push `[s, vocab]` and satisfy `push` perfectly.
+        assert_eq!(lg.len(), cfg.vocab_size, "head.{phase}.logits is not a single row");
+        for (n, v) in [("hc_head_out", &hc), ("final_norm_out", &nm), ("logits", &lg)] {
+            assert!(v.iter().all(|x| x.is_finite()), "head.{phase}.{n} has a non-finite value");
+            assert!(v.iter().any(|&x| x != 0.0), "head.{phase}.{n} is all zero");
+        }
+        assert!(all_bf16(&hc), "head.{phase}.hc_head_out is not bf16 -- `y.to(dtype)` was lost");
+        assert!(all_bf16(&nm), "head.{phase}.final_norm_out is not bf16 -- RMSNorm's store was lost");
+        // The other direction, and the load-bearing one. `all_bf16` on all three would pass
+        // an implementation that rounded everything; this forbids it. Not a probabilistic
+        // hope: each logit is an f32 dot product of `dim` bf16 terms, so landing on a bf16
+        // grid point needs its low 16 mantissa bits to come out zero. If this fires, the
+        // logits are being stored through bf16 somewhere -- the head is wrong, not unlucky.
+        assert!(
+            !all_bf16(&lg),
+            "every one of head.{phase}.logits' {} values is bf16-representable -- the logits \
+             were stored through bf16, which the reference never does",
+            lg.len()
+        );
+    }
+}
+
+#[test]
+fn the_head_mhc_rsqrt_is_load_bearing_in_every_case() {
+    // `expect()` gives these two no matrix row: everything they can reach, they reach, and
+    // the only thing upstream is the layer stack, which `head_tail` cannot touch because it
+    // borrows `h` immutably. So what is assertable here is what a matrix row would otherwise
+    // have given -- that each fires in EVERY case, and that they are not one defect wearing
+    // two names.
+    //
+    // **The magnitudes are a NEGATIVE result and are recorded as one.** The prediction before
+    // measuring was that both would clear one bf16 ulp, on the reasoning that dropping or
+    // mis-scoping an rsqrt of ~1.7 moves the mHC gates by ~10%. Measured over the 16-case
+    // grid, 2026-08-05, smallest relative movement of any head golden:
+    //
+    //   HeadHcNoRsqrt       4.899e-3  (median .hc_head_out 7.9e-2, max 2.1e-1)
+    //   HeadHcRsqrtPerCopy  4.284e-4  (median .logits 3.6e-3, max 7.6e-3)
+    //
+    // The bf16 ulp at 1.0 is 2^-7 = 7.8125e-3, so **the prediction failed for BOTH** -- their
+    // worst cases sit 1.6x and 18x BELOW one ulp of the tensor's own scale. (`Diff.rel`
+    // normalises by `max |b|`, so the ulp at the tensor's max is the right comparison.) An
+    // earlier revision of this comment put the ulp at 2^-8 and concluded that `HeadHcNoRsqrt`
+    // cleared it; that was wrong -- bf16 keeps 7 explicit mantissa bits, not 8.
+    //
+    // Both are still caught in every case, because this file compares BIT-EXACTLY. The
+    // consequence is for whoever writes the device-side head gate: **it has to be bitwise,
+    // not `assert_close`** -- a tolerance anywhere near the bf16 floor misses both of these,
+    // and mis-scoping the mHC denominator is not an exotic mistake. The bound below is a
+    // fixture-regression pin at roughly a third of the measured worst case, NOT a claim that
+    // the gate resolves either defect under tolerance.
+    //
+    // Why it is small is itself the reason not to widen it away: the toy draws the residual
+    // copies i.i.d., so their per-copy RMS agree to ~5%, and the per-copy rsqrt is then nearly
+    // the joint one. Whether the trained model's `hc_post` spreads them further is not
+    // something this fixture can answer.
+    let mut prints = Vec::new();
+    for d in [Defect::HeadHcNoRsqrt, Defect::HeadHcRsqrtPerCopy] {
+        let mut worst = f32::INFINITY;
+        let mut fps = Vec::new();
+        for c in cases() {
+            let base = run(c.layer, c.prompt, Defect::None);
+            let got = run(c.layer, c.prompt, d);
+            let ds = diff(base.of(c.phase), got.of(c.phase));
+            for suffix in [".hc_head_out", ".final_norm_out", ".logits"] {
+                let hits = matching(&ds, suffix);
+                assert!(!hits.is_empty(), "{d:?} at {c:?}: no *{suffix} golden exists");
+                assert!(
+                    hits.iter().all(|h| h.changed > 0),
+                    "{d:?} at {c:?}: left a *{suffix} golden bit-identical"
+                );
+                worst = hits.iter().fold(worst, |m, h| m.min(h.rel));
+            }
+            // The layer stack is untouched. Trivially true today -- `head_tail` takes
+            // `&[f32]` -- and kept as a tripwire for the day someone gives it `&mut`.
+            for h in matching(&ds, ".attn_out").iter().chain(matching(&ds, ".out").iter()) {
+                assert_eq!(h.changed, 0, "{d:?} at {c:?}: reached {} in the layer", h.name);
+            }
+            fps.push(fingerprint(got.of(c.phase)));
+        }
+        println!("{d:?}: smallest relative movement over the grid = {worst:.3e}");
+        assert!(
+            worst > 1.4e-4,
+            "{d:?}'s smallest movement fell to {worst:.3e}, below the 1.4e-4 pin (a third of \
+             the 4.284e-4 measured on 2026-08-05). The fixture has become less able to \
+             separate this defect, not more -- re-measure before moving the pin"
+        );
+        prints.push((d, fps));
+    }
+    assert_ne!(prints[0].1, prints[1].1, "the two head-rsqrt defects compute the same thing");
+}
+
 fn targeted_defects() -> Vec<Defect> {
     vec![
         Defect::SwigluUnclamped,
@@ -926,6 +1399,9 @@ fn targeted_defects() -> Vec<Defect> {
         Defect::QkNormAfterRope,
         Defect::HcPreNoRsqrt,
         Defect::NoBf16Rounding,
+        Defect::HeadHcNoRsqrt,
+        Defect::HeadHcRsqrtPerCopy,
+        Defect::IndexerBf16RunningSum,
     ]
 }
 

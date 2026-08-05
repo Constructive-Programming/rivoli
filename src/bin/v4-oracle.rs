@@ -19,7 +19,7 @@
 
 use anyhow::{Context, Result, bail};
 use rivoli::v4oracle::forward::{
-    Capture, CompressorW, Defect, ExpertW, HeadW, IndexerW, LayerW, Oracle, Step,
+    Capture, CompressorW, Defect, ExpertW, HeadTailW, IndexerW, LayerW, Oracle, Step,
 };
 use rivoli::v4oracle::golden::{GoldenSet, diff};
 use rivoli::v4oracle::numerics::{bf16_decode, bf16_encode};
@@ -212,6 +212,57 @@ fn load_layer(ck: &Checkpoint, cfg: &V4Config, l: usize, experts: &[usize]) -> R
     })
 }
 
+/// The head tail's weights. Names verified against the checkpoint index, not guessed:
+/// `hc_head_{fn,base,scale}` are F32 `[4, 16384]`/`[4]`/`[1]`, `norm.weight` is BF16 `[4096]`
+/// and `head.weight` BF16 `[129280, 4096]` — the same six `bin/convert_v4`'s `MODEL_LEVEL`
+/// emits.
+///
+/// `norm.weight` and `head.weight` go through the bf16 → f32 decode `RawTensor::to_f32`
+/// does, which is what `RMSNorm`/`ParallelHead` mean by "stored bf16, held f32".
+fn load_head_tail(ck: &Checkpoint) -> Result<HeadTailW> {
+    Ok(HeadTailW {
+        hc_head_fn: dense_f32(ck, "hc_head_fn")?,
+        hc_head_base: dense_f32(ck, "hc_head_base")?,
+        hc_head_scale: dense_f32(ck, "hc_head_scale")?,
+        norm: dense_f32(ck, "norm.weight")?,
+        lm_head: ck.dense("head.weight")?,
+    })
+}
+
+/// A fixed, bf16-representable `[s, hc_mult, dim]` probe.
+///
+/// Used for TWO things in `defects`: the layer's residual input and the head tail's input.
+/// They are the same buffer because both only need a fixed, reproducible stimulus, and one
+/// generator is one place for the seed to live.
+///
+/// **Synthetic on purpose, and this is the whole reason the head tail can be emitted at all.**
+/// Composing it with the layer chain at `--layers 4` of 43 would produce a logits vector that
+/// is not any quantity the model computes, and a tensor named `logits` sitting next to real
+/// per-layer goldens is the most misusable thing this file could write. A declared probe
+/// cannot be read as a residual stream; the head tail is a pure function of its input, so the
+/// golden gates exactly the same arithmetic either way. See `HeadTailW`'s doc.
+fn fixed_probe(cfg: &V4Config, s: usize) -> Vec<f32> {
+    let mut r = rivoli::v4oracle::weights::NamedRng::new("v4-head-probe");
+    (0..s * cfg.hc_mult * cfg.dim).map(|_| bf16_decode(bf16_encode(r.unit()))).collect()
+}
+
+/// Run the head tail on `probe` and record it, input included.
+///
+/// The input is pushed HERE rather than inside `Oracle::head_tail`, so that the golden file
+/// is self-contained: a device-side comparison needs the `h` that produced these logits, and
+/// a golden whose input lives only in a function it cannot call is not a gate.
+///
+/// `s > 1` matters -- at one row `x[:, -1]` and `x[:, 0]` coincide and the final norm's
+/// per-token statistic is its joint one, so two of the head defects become inert. Both
+/// callers pass the prompt length, which `open()` has already refused below 4.
+fn head_goldens(o: &Oracle, tw: &HeadTailW, cfg: &V4Config, probe: &[f32], cap: &mut Capture) {
+    let row = cfg.hc_mult * cfg.dim;
+    assert_eq!(probe.len() % row, 0, "the probe is not a whole number of [hc_mult, dim] rows");
+    let s = probe.len() / row;
+    cap.push("head.probe.in", &[s, cfg.hc_mult, cfg.dim], probe.to_vec());
+    o.head_tail(tw, probe, s, "probe", cap);
+}
+
 /// Which routed experts a layer will actually use.
 ///
 /// Hash layers are free: `tid2eid[input_id]` needs no activations at all. Score-routed
@@ -291,10 +342,10 @@ fn emit(model: &Path, out: &Path, layers: usize, decode_steps: usize) -> Result<
     let (cfg, ck, ids) = open(model)?;
     let s = ids.len();
     let o = Oracle::new(cfg.clone(), Defect::None);
-    // Only the embedding. The head tail (`hc_head`, the final norm, `ParallelHead`) is not
-    // transliterated -- see `HeadW`. A logits golden taken at 4 of 43 layers would be the
-    // most misusable thing in this file.
-    let hw = HeadW { embed: ck.dense("embed.weight")? };
+    let hw = ck.dense("embed.weight")?;
+    // The head tail runs on its OWN probe, never on the layer chain's residual -- see
+    // `fixed_probe`. That is why it is loaded here and not threaded through `drive`.
+    let tw = load_head_tail(&ck)?;
 
     // Loaded ONCE and held across every phase: reloading layer 3's 256 experts per decode
     // step is 3.4 GB of reads each time, and this machine's memory is shared with a live
@@ -309,6 +360,7 @@ fn emit(model: &Path, out: &Path, layers: usize, decode_steps: usize) -> Result<
     let mut cap = Capture::default();
     cap.push("embed", &[s, cfg.hc_mult, cfg.dim], o.embed(&hw, &ids));
     drive(&o, &lws, &ids, decode_steps, &mut cap, |_, here| o.embed(&hw, here));
+    head_goldens(&o, &tw, &cfg, &fixed_probe(&cfg, s), &mut cap);
 
     let meta = vec![
         ("model".into(), model.display().to_string()),
@@ -328,9 +380,11 @@ fn emit(model: &Path, out: &Path, layers: usize, decode_steps: usize) -> Result<
         ),
         (
             "caveats".into(),
-            "bsz=1; no LM head (logits at 4 of 43 layers would be meaningless); ratio-128 \
-             compression is NOT exercised at this prompt length -- it needs >=128 tokens; \
-             summation order is not pinned (see v4oracle/forward.rs)"
+            "bsz=1; the head.probe.* tensors are the head tail run on a SYNTHETIC probe \
+             (head.probe.in), NOT on the layer chain -- they are not the model's logits and \
+             say nothing about what it would generate; ratio-128 compression is NOT exercised \
+             at this prompt length -- it needs >=128 tokens; summation order is not pinned \
+             (see v4oracle/forward.rs)"
                 .into(),
         ),
     ];
@@ -370,10 +424,17 @@ fn defects(model: &Path, layer: usize, decode_steps: usize) -> Result<()> {
     // the real chain: running layers 0..L first would make every defect's effect depend on
     // the layers before it, which is the opposite of an isolation test.
     let lws = vec![load_layer(&ck, &cfg, layer, &experts)?];
-    let mut r = rivoli::v4oracle::weights::NamedRng::new("real-defect-probe");
-    let probe: Vec<f32> = (0..ids.len() * cfg.hc_mult * cfg.dim)
-        .map(|_| bf16_decode(bf16_encode(r.unit())))
-        .collect();
+    // The head tail rides along on the same probe. Without it the six `Head*` defects would
+    // print `-- NOTHING --` here for want of a golden to move, and this table has no
+    // expectations of its own -- a reader would have to know, unaided, that the row was a
+    // fixture gap and not a finding. Costs `head.weight`, ~2.1 GB widened; `embed.weight` is
+    // NOT loaded here at all, which is why the head tail's weights are their own struct.
+    let tw = load_head_tail(&ck)?;
+    // NOTE: the seed moved from "real-defect-probe" to "v4-head-probe" on 2026-08-05 when the
+    // layer probe and the head probe became one generator. Every number this command prints
+    // therefore moved with it, for that reason and not because any arithmetic changed. An
+    // older printout is not comparable against a newer one.
+    let probe = fixed_probe(&cfg, ids.len());
     let row = cfg.hc_mult * cfg.dim;
 
     let capture = |d: Defect| {
@@ -382,6 +443,7 @@ fn defects(model: &Path, layer: usize, decode_steps: usize) -> Result<()> {
         drive(&o, &lws, &ids, decode_steps, &mut cap, |phase, _| {
             if phase == 0 { probe.clone() } else { probe[..row].to_vec() }
         });
+        head_goldens(&o, &tw, &cfg, &probe, &mut cap);
         cap
     };
     let base = capture(Defect::None);

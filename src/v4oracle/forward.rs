@@ -154,6 +154,16 @@ pub enum Defect {
     IndexerNoHadamard,
     /// Drop the `weights_proj` per-head factor, i.e. sum the head scores unweighted.
     IndexerNoWeights,
+    /// Round the head-score accumulator to bf16 after EVERY term instead of accumulating in
+    /// f32 and rounding once (model.py:427's `.sum(dim=2)`).
+    ///
+    /// **This was the oracle's own behaviour until 2026-08-05** — see `Oracle::bf16_sum` for
+    /// the measurement that settled it. It is kept as a defect precisely because it was
+    /// believed correct: every test in this file is self-relative, so an error the oracle
+    /// shared with its own defect matrix cancelled everywhere and nothing could see it. The
+    /// absolute check is `bf16_reduction_matches_torch_and_not_a_running_fold`;
+    /// this variant is its other half.
+    IndexerBf16RunningSum,
 
     // -- MoE ----------------------------------------------------------------------------
     /// `swiglu_limit = 0` — the unclamped SwiGLU rivoli ships.
@@ -194,10 +204,52 @@ pub enum Defect {
     /// Drop the `* rsqrt(mean(x^2) + eps)` factor on the mHC mixes.
     HcPreNoRsqrt,
 
+    // -- head tail ----------------------------------------------------------------------
+    /// Drop the `* rsqrt(mean(x^2) + eps)` factor on `hc_head`'s mixes (model.py:712-713).
+    /// The head's own copy of the mistake `HcPreNoRsqrt` models inside a block: two separate
+    /// sites, and a port can get one right and the other wrong.
+    HeadHcNoRsqrt,
+    /// Take `hc_head`'s RMS per hyper-connection COPY (`mean` over `dim`) and apply copy
+    /// `j`'s to mix `j`, instead of one statistic over the full `hc_mult * dim` flattened
+    /// row. `hc_head_fn` yields exactly as many mixes as there are copies, so the
+    /// wrong version type-checks and produces the same shapes — it is only wrong by value.
+    /// It would NOT line up in `hc_pre`, which has 24 mixes against 4 copies.
+    HeadHcRsqrtPerCopy,
+    /// Skip the final `RMSNorm` entirely (`self.head(self.norm(h))`, model.py:923). The
+    /// natural slip for anyone who reads `hc_head` as already normalising.
+    HeadNormSkipped,
+    /// Run the final `RMSNorm` but return f32, skipping the bf16 store `RMSNorm.forward`
+    /// performs on the way out. Measured at 7.5e-3 on a 3.1 max (0.24%) elsewhere in this
+    /// port, and it is a live choice on the device: `kernels/mla.hip::v4_rmsnorm` bf16-rounds
+    /// and `kernels/linalg.hip::rmsnorm` does not.
+    HeadNormNotBf16,
+    /// Take the final `RMSNorm`'s statistic JOINTLY over all `s * dim` values instead of per
+    /// token: what handing a single-row norm kernel an `s x dim` buffer does. Invisible at
+    /// decode (`s == 1`), which is the only shape most smoke tests run.
+    ///
+    /// Only the STATISTIC is modelled. `kernels/linalg.hip::rmsnorm` would also read its
+    /// `dim`-long gain past the end of the tensor, which is undefined rather than wrapped;
+    /// this tiles the gain instead, which is the charitable realization. The joint statistic
+    /// is the load-bearing half, and an out-of-bounds read is not a thing an oracle can
+    /// stand in for anyway.
+    HeadNormOverAllTokens,
+    /// `ParallelHead.forward` slices `x[:, -1]`; take `x[:, 0]` instead. Also invisible at
+    /// decode, and at prefill it produces perfectly well-formed logits for the wrong token.
+    HeadLogitsFromFirstRow,
+
     // -- precision ----------------------------------------------------------------------
-    /// Keep everything in f32, skipping every bf16 store. Not a bug anyone would ship — it
+    /// Skip the bf16 stores that go through `round_bf16`. Not a bug anyone would ship — it
     /// is here to MEASURE how much of the golden's value is bf16 fidelity, which sets the
     /// floor for any tolerance derived from these goldens.
+    ///
+    /// **It does NOT reach every bf16 store, so the floor it reports is optimistic.** Four
+    /// sites on the indexer path round through `bf16_decode(bf16_encode(..))` directly and
+    /// ignore this flag: the `weights_proj * scale` store, the einsum store, the per-term
+    /// `dot * wt` store, and `bf16_sum`'s final round. Three predate this variant; the fourth
+    /// arrived with the 2026-08-05 reduction fix. They are bf16-by-reference on purpose --
+    /// that chain's precision selects WHICH positions are attended -- so routing them through
+    /// here would make the flag change the attended SET, not just the precision.
+    /// `qk_norm`'s `b()` closure is the same pattern for the same reason.
     NoBf16Rounding,
 }
 
@@ -238,6 +290,7 @@ impl Defect {
         Defect::IndexerNoFp4Quant,
         Defect::IndexerNoHadamard,
         Defect::IndexerNoWeights,
+        Defect::IndexerBf16RunningSum,
         Defect::SwigluUnclamped,
         Defect::SwigluClampGateBothSides,
         Defect::RouterSoftmax,
@@ -253,6 +306,12 @@ impl Defect {
         Defect::SinkhornCombTransposed,
         Defect::HcPostNoComb,
         Defect::HcPreNoRsqrt,
+        Defect::HeadHcNoRsqrt,
+        Defect::HeadHcRsqrtPerCopy,
+        Defect::HeadNormSkipped,
+        Defect::HeadNormNotBf16,
+        Defect::HeadNormOverAllTokens,
+        Defect::HeadLogitsFromFirstRow,
         Defect::NoBf16Rounding,
     ];
 
@@ -563,6 +622,49 @@ impl Oracle {
         }
     }
 
+    /// A bf16 REDUCTION as PyTorch performs one: accumulate in **f32**, round to bf16 **once**
+    /// at the end. Its only call site is the indexer's per-head score sum (model.py:427).
+    ///
+    /// **Corrected 2026-08-05.** It previously rounded the accumulator after every term — a
+    /// running bf16 fold — under a comment reading "`.sum(dim=2)` -> bf16". That is true of
+    /// the output DTYPE and false of the ACCUMULATOR: torch reduces reduced-precision floats
+    /// through `acc_type`, i.e. f32, and rounds to the output dtype once. **The justification
+    /// is that fidelity argument, and only that** — `acc_type` is a property of the reduction
+    /// and the oracle was modelling the output dtype in its place.
+    ///
+    /// Measured on CPU torch, 2026-08-05, at this call site's real summand
+    /// `relu(einsum) * weights_proj(x)` — note the `relu_` applies to the einsum ONLY and
+    /// `weights_proj` is a bare `Linear` with no activation (model.py:400, :424), so the
+    /// terms are **signed and can cancel**. 64 heads, 4000 trials: the running fold disagreed
+    /// with `x.sum()` **72.6%** of the time, max |delta| **0.25**, mean signed delta
+    /// **-1.7e-4**. An independent run reported 73.0% / 0.125 / +1.4e-4.
+    ///
+    /// So it is **noise, not drift** — there is no systematic direction, and any claim of one
+    /// comes from assuming non-negative summands, which this site does not have. A 72.6%
+    /// disagreement rate at up to 0.25 absolute is sufficient on its own: this chain decides
+    /// WHICH positions are attended, and `.compress_idxs` is recorded score-ORDERED, so a
+    /// perturbation changes the arithmetic even when the selected set survives it.
+    ///
+    /// **What this does NOT close.** The old fold pinned the summation ORDER as a side
+    /// effect; an f32 accumulator does not, and torch's reduction is vectorized and
+    /// tree-shaped while this one is a sequential fold. "Accumulate in f32, round once" does
+    /// not by itself pick a unique answer. Measured rather than argued, 2026-08-05: a
+    /// sequential f32 fold rounded once agreed with `torch.sum()` bit for bit in
+    /// **20000 of 20000** trials — 5000 each at n = 4, n = 64, n = 512, and n = 64 with
+    /// magnitudes spread 32x. Not a proof: re-association noise is ~2^-21 relative against a
+    /// 2^-8 half-ulp rounding margin (the bf16 ulp at 1.0 is 2^-7 -- bf16 keeps 7 explicit
+    /// mantissa bits), so a disagreement needs the f32 result to land within re-association
+    /// distance of a rounding boundary, which is rare rather than impossible. Treat the
+    /// ordering as unpinned-but-unobserved, and if a device kernel ever disagrees here by
+    /// exactly one bf16 ulp, this is the first place to look.
+    pub fn bf16_sum(&self, terms: impl Iterator<Item = f32>) -> f32 {
+        let b = |x: f32| bf16_decode(bf16_encode(x));
+        match self.defect {
+            Defect::IndexerBf16RunningSum => terms.fold(0.0f32, |a, t| b(a + t)),
+            _ => b(terms.sum::<f32>()),
+        }
+    }
+
     /// One dequantized weight row, honouring `Fp4NibbleSwap`.
     fn wrow(&self, w: &WMat, r: usize, buf: &mut Vec<f32>) {
         w.row(r, buf);
@@ -617,8 +719,28 @@ impl Oracle {
         out
     }
 
-    /// `RMSNorm.forward` — fp32 internals, learned weight, caller rounds the store.
+    /// `RMSNorm.forward` — fp32 internals, learned weight, then the bf16 store the reference
+    /// performs on the way out (`(self.weight * x).to(dtype)`, model.py:202).
     fn rmsnorm(&self, x: &mut [f32], d: usize, w: &[f32]) {
+        self.rmsnorm_raw(x, d, w);
+        self.round_bf16(x);
+    }
+
+    /// `RMSNorm.forward` without that store.
+    ///
+    /// Split out for the head tail alone, which needs both halves independently: the store is
+    /// what `Defect::HeadNormNotBf16` suppresses, and `d` is what `HeadNormOverAllTokens`
+    /// widens to `s * dim`. Both are choices a device implementation actually faces —
+    /// `kernels/mla.hip::v4_rmsnorm` bf16-rounds and is one block per row, while
+    /// `kernels/linalg.hip::rmsnorm` neither rounds nor spans rows.
+    fn rmsnorm_raw(&self, x: &mut [f32], d: usize, w: &[f32]) {
+        // `zip` below stops at the shorter side, so a short `w` would leave the tail of every
+        // row not merely un-gained but UN-SCALED by `rs`, and say nothing. That is reachable:
+        // the checkpoint carries `norm.weight` [4096] beside `q_norm.weight` [1024] and
+        // `kv_norm.weight` [512], and `load_head_tail` flattens whatever tensor it is handed.
+        // Same reasoning as `hc_head`'s `hc_head_scale` assert -- read the shape rather than
+        // trust the caller -- and this was the one norm parameter whose mis-load was silent.
+        assert_eq!(w.len(), d, "RMSNorm weight must be [d]; a short one truncates in silence");
         for row in x.chunks_mut(d) {
             let var = row.iter().map(|v| v * v).sum::<f32>() / d as f32;
             let rs = (var + self.cfg.norm_eps).sqrt().recip();
@@ -626,7 +748,6 @@ impl Oracle {
                 *v = g * (*v * rs);
             }
         }
-        self.round_bf16(x);
     }
 
     /// The QK-norm: `q *= rsqrt(q.square().mean(-1) + eps)` over `head_dim`, applied after
@@ -848,6 +969,35 @@ impl Oracle {
         (pre, post, comb)
     }
 
+    /// `torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)` — collapse one token's `hc_mult`
+    /// residual copies by the gate vector `pre`, writing `dim` values.
+    ///
+    /// Extracted because `hc_pre` and `hc_head` share it VERBATIM in the reference too
+    /// (model.py:687 and :715 are the same expression), so this is one behaviour with two
+    /// call sites rather than two behaviours that happen to look alike — the case where
+    /// factoring cannot hide a divergence. (It was forced by `jscpd`, which flagged the two
+    /// copies at 98 tokens; the reference-shares-it argument is why the answer was to factor
+    /// rather than to add an ignore marker.)
+    ///
+    /// Each output element accumulates across the copies in copy order, the order `hc_pre`
+    /// had before the extraction -- which the diff shows directly, the body being the same
+    /// fold with `out.iter_mut().enumerate()` in place of `for d in 0..dim`. So no golden
+    /// moved, by inspection rather than by measurement. A 200-trial bitwise run at
+    /// `hc = 4, dim = 257`, with gate weights and residual copies spread across 2^-20..2^10
+    /// so that cancellation was available, agreed at **0 bitwise differences**, and reported 184
+    /// differences under a one-ulp control -- but that only confirmed that an identical fold
+    /// is identical.
+    fn hc_blend(&self, pre: &[f32], flat: &[f32], out: &mut [f32]) {
+        let dim = self.cfg.dim;
+        for (d, o) in out.iter_mut().enumerate() {
+            let mut acc = 0.0f32;
+            for (c, &p) in pre.iter().enumerate() {
+                acc += p * flat[c * dim + d];
+            }
+            *o = acc;
+        }
+    }
+
     /// `Block.hc_pre`. `h` is `[s, hc, dim]`; the rsqrt is over the FULL `hc * dim`
     /// flattened row, not per copy.
     #[allow(clippy::type_complexity)]
@@ -878,13 +1028,7 @@ impl Oracle {
                 *m = flat.iter().zip(w).map(|(a, b)| a * b).sum::<f32>() * rs;
             }
             let (pre, post, comb) = self.sinkhorn(&mixes, scale, base);
-            for d in 0..dim {
-                let mut acc = 0.0f32;
-                for (c, &p) in pre.iter().enumerate() {
-                    acc += p * flat[c * dim + d];
-                }
-                y[t * dim + d] = acc;
-            }
+            self.hc_blend(&pre, flat, &mut y[t * dim..(t + 1) * dim]);
             posts[t * hc..(t + 1) * hc].copy_from_slice(&post);
             combs[t * hc * hc..(t + 1) * hc * hc].copy_from_slice(&comb);
         }
@@ -1221,26 +1365,28 @@ impl Oracle {
         for t in 0..s {
             let mut score = vec![0.0f32; n_comp];
             for (ci, sc) in score.iter_mut().enumerate() {
-                let mut acc = 0.0f32;
-                for hh in 0..h {
+                // `einsum` -> bf16, `relu_()` in place -> bf16, `* weights` -> bf16 are all
+                // ELEMENTWISE and genuinely land in bf16 (model.py:426-427); the final
+                // `.sum(dim=2)` is a REDUCTION and accumulates in f32, rounding once. Those
+                // two halves were conflated here until 2026-08-05 -- see `bf16_sum`, which
+                // carries the measurement. This chain decides WHICH blocks are attended, so
+                // a faithful kernel's bf16 and an f32 oracle can disagree on the SET near a
+                // tie, which no numeric tolerance would show.
+                *sc = self.bf16_sum((0..h).map(|hh| {
                     let qh = &q[(t * h + hh) * hd..(t * h + hh + 1) * hd];
                     let kvc = &cs.cache[ci * hd..(ci + 1) * hd];
-                    let mut dot = 0.0f32;
-                    for i in 0..hd {
-                        dot += qh[i] * kvc[i];
-                    }
-                    // `einsum` -> bf16, `relu_()` in place -> bf16, `* weights` -> bf16,
-                    // `.sum(dim=2)` -> bf16 (model.py:426-427). This chain decides WHICH
-                    // blocks are attended, so a faithful kernel's bf16 and an f32 oracle can
-                    // disagree on the SET near a tie, which no numeric tolerance would show.
-                    let mut dot = bf16_decode(bf16_encode(dot));
+                    // The einsum itself: f32 accumulation, one bf16 store, which is torch's
+                    // bf16 matmul and was already right.
+                    let mut dot = bf16_decode(bf16_encode(
+                        (0..hd).map(|i| qh[i] * kvc[i]).sum::<f32>(),
+                    ));
                     if self.defect != Defect::IndexerNoRelu {
                         dot = dot.max(0.0);
                     }
-                    let wt = if self.defect == Defect::IndexerNoWeights { 1.0 } else { w[t * h + hh] };
-                    acc = bf16_decode(bf16_encode(acc + bf16_decode(bf16_encode(dot * wt))));
-                }
-                *sc = acc;
+                    let wt =
+                        if self.defect == Defect::IndexerNoWeights { 1.0 } else { w[t * h + hh] };
+                    bf16_decode(bf16_encode(dot * wt))
+                }));
             }
             // Causal mask over compressed blocks, applied before topk (model.py:430-432)
             // and again to the SELECTED indices afterwards (:434-436) — the second pass is
@@ -1778,31 +1924,170 @@ impl Oracle {
 // drivers
 // ---------------------------------------------------------------------------------------
 
-/// The embedding, and nothing else.
+/// `Block.hc_head`, the final `RMSNorm`, and `ParallelHead` — the head tail's weights.
 ///
-/// **The head tail of `Transformer.forward` -- `Block.hc_head`, the final `RMSNorm`, and
-/// `ParallelHead` -- is NOT transliterated here.** It was, and nothing executed it: the
-/// goldens stop at layer 4 of 43, so a logits vector taken there is meaningless, and an
-/// unverified transliteration that looks verified by sitting next to verified ones is worse
-/// than an acknowledged gap. S4 adds it, with its own goldens, when a full-depth run exists.
-pub struct HeadW {
-    pub embed: WMat,
+/// **Transliterated 2026-08-05, but never driven from the layer chain, and that restriction
+/// is the point.** The note this replaces refused to transliterate the head tail at all, on
+/// the grounds that the goldens stop at layer 4 of 43 and so a logits vector taken there is
+/// not any quantity the model computes. That argument is still correct and is preserved by
+/// construction: `bin/v4-oracle` never composes [`Oracle::head_tail`] with `run_layer`. It
+/// drives it from a declared synthetic probe instead, so the emitted golden cannot be
+/// mistaken for the model's logits — its input is visibly not a residual stream — while still
+/// exercising the real weights at the real `dim` and `vocab_size`, which is all the device
+/// side needs to be scored against.
+///
+/// What that buys is the whole point of the exercise: before it, the first decode's logits
+/// were **ungated by construction**. Every per-layer golden could be perfect and the sampled
+/// token still wrong, with nothing in the tree able to say so.
+///
+/// What it still does NOT cover, stated so nobody has to infer it:
+/// - **The composition.** No golden anywhere asserts that 43 layers followed by this head
+///   tail produce a particular logits vector. Only S4, with a full-depth run, can.
+/// - **Weight SELECTION.** These are arithmetic goldens over whatever this struct is handed.
+///   A port that fed `layers.42.hc_ffn_fn` where `hc_head_fn` was due would reproduce every
+///   golden here exactly. The loader is what has to get that right.
+/// - **Sampling.** `sample(logits, temperature)` (model.py:924) is out of scope, as is
+///   `forward_spec` and everything MTP.
+///
+/// A struct of its own rather than fields hung off the embedding, because the two are
+/// separately loadable: `bin/v4-oracle defects` drives the head tail and never embeds
+/// anything, and `embed.weight` is 2.1 GB once widened to f32 on a machine whose memory is
+/// shared with a live decode.
+pub struct HeadTailW {
+    /// `hc_head_fn`, `[hc_mult, hc_mult * dim]`. F32 on disk — `Transformer.__init__` builds
+    /// it under `with set_dtype(torch.float32)`, so unlike the block weights there is no
+    /// quantization and no bf16 store anywhere in its use.
+    pub hc_head_fn: Vec<f32>,
+    /// `hc_head_base`, `[hc_mult]` — one bias per hyper-connection copy.
+    pub hc_head_base: Vec<f32>,
+    /// `hc_head_scale`, `[1]`. A single scalar broadcast over every mix, where a `Block`'s
+    /// `hc_*_scale` is `[3]` (pre, post, comb). Reusing the block's layout here would index
+    /// past the tensor rather than merely computing the wrong thing, which is the one mistake
+    /// on this path that fails loudly.
+    pub hc_head_scale: Vec<f32>,
+    /// `norm.weight`, `[dim]` — the final `RMSNorm`'s learned gain.
+    pub norm: Vec<f32>,
+    /// `head.weight`, `[vocab_size, dim]`. bf16 in the checkpoint and held as f32 by
+    /// `ParallelHead`, so it takes `linear()`'s dense branch: **no activation quantization**,
+    /// and the logits come out f32 and are never rounded.
+    pub lm_head: WMat,
 }
 
 impl Oracle {
     /// `Transformer.forward` lines 914-916: embed, then expand to `hc_mult` copies.
     /// Returns `[s, hc_mult, dim]`.
-    pub fn embed(&self, hw: &HeadW, ids: &[u32]) -> Vec<f32> {
+    pub fn embed(&self, embed: &WMat, ids: &[u32]) -> Vec<f32> {
         let (hc, dim) = (self.cfg.hc_mult, self.cfg.dim);
         let mut row = Vec::with_capacity(dim);
         let mut out = Vec::with_capacity(ids.len() * hc * dim);
         for &t in ids {
-            hw.embed.row(t as usize, &mut row);
+            embed.row(t as usize, &mut row);
             for _ in 0..hc {
                 out.extend_from_slice(&row);
             }
         }
         out
+    }
+
+    /// `Block.hc_head` (model.py:709-716). `h` is `[s, hc_mult, dim]`; the result is
+    /// `[s, dim]`, bf16 as `y.to(dtype)` leaves it.
+    ///
+    /// This is `hc_pre`'s *pre* branch and nothing else: no Sinkhorn, no `post`, no
+    /// combination matrix. It cannot be reached by reusing `hc_split_sinkhorn` even by
+    /// accident — that wants `(2 + hc) * hc = 24` mixes and `hc_head_fn` yields `hc = 4` —
+    /// which is why there is no defect for "ran the Sinkhorn here".
+    ///
+    /// Called as `layer.hc_head(...)` on the LAST block, so `norm_eps`/`hc_eps` are that
+    /// block's. They are `args.norm_eps`/`args.hc_eps`, identical to the Transformer's, so
+    /// reading them from `cfg` is exact rather than approximate.
+    fn hc_head(&self, hw: &HeadTailW, h: &[f32], s: usize) -> Vec<f32> {
+        let (hc, dim) = (self.cfg.hc_mult, self.cfg.dim);
+        let hcd = hc * dim;
+        assert_eq!(h.len(), s * hcd);
+        assert_eq!(hw.hc_head_fn.len(), hc * hcd);
+        assert_eq!(hw.hc_head_base.len(), hc);
+        // `[1]`, not `[3]`: read the shape rather than trusting the caller to have loaded the
+        // right tensor. `hc_attn_scale` has the same name shape and three entries, and
+        // indexing [0] of it would be silently plausible.
+        assert_eq!(hw.hc_head_scale.len(), 1, "hc_head_scale is a scalar, not a Block's [3]");
+        let mut y = vec![0.0f32; s * dim];
+        for t in 0..s {
+            let flat = &h[t * hcd..(t + 1) * hcd];
+            // `torch.rsqrt(x.square().mean(-1, keepdim=True) + norm_eps)` over the FULL
+            // flattened row. One statistic for every mix; the per-copy variant below is the
+            // wrong version, kept so the gate can be shown to reject it.
+            let rs: Vec<f32> = match self.defect {
+                Defect::HeadHcNoRsqrt => vec![1.0; hc],
+                Defect::HeadHcRsqrtPerCopy => (0..hc)
+                    .map(|c| {
+                        let seg = &flat[c * dim..(c + 1) * dim];
+                        let var = seg.iter().map(|v| v * v).sum::<f32>() / dim as f32;
+                        (var + self.cfg.norm_eps).sqrt().recip()
+                    })
+                    .collect(),
+                _ => {
+                    let var = flat.iter().map(|v| v * v).sum::<f32>() / hcd as f32;
+                    vec![(var + self.cfg.norm_eps).sqrt().recip(); hc]
+                }
+            };
+            let mut pre = vec![0.0f32; hc];
+            for (j, p) in pre.iter_mut().enumerate() {
+                let w = &hw.hc_head_fn[j * hcd..(j + 1) * hcd];
+                let m = flat.iter().zip(w).map(|(a, b)| a * b).sum::<f32>() * rs[j];
+                *p = sigmoid(m * hw.hc_head_scale[0] + hw.hc_head_base[j]) + self.cfg.hc_eps;
+            }
+            self.hc_blend(&pre, flat, &mut y[t * dim..(t + 1) * dim]);
+        }
+        // `y.to(dtype)` — the residual stream this came from is bf16.
+        self.round_bf16(&mut y);
+        y
+    }
+
+    /// The whole head tail: `hc_head`, the final `RMSNorm`, then `ParallelHead`
+    /// (model.py:922-923). Returns the `[vocab_size]` logits and records three goldens under
+    /// `head.{phase}.`.
+    ///
+    /// It does NOT record its input. The caller owns that: in `bin/v4-oracle` the input is a
+    /// declared probe and is pushed there as `head.probe.in`, and in the defect matrix it is
+    /// already recorded as the layer's `.out`. Recording it here as well would put a second
+    /// copy under a name ending in `.in`, which the matrix treats as fixed-by-construction —
+    /// a silent claim no implementation could violate would then be attached to a tensor that
+    /// every upstream defect moves.
+    pub fn head_tail(&self, hw: &HeadTailW, h: &[f32], s: usize, phase: &str, cap: &mut Capture) {
+        let (dim, vocab) = (self.cfg.dim, self.cfg.vocab_size);
+        let mut x = self.hc_head(hw, h, s);
+        cap.push(&format!("head.{phase}.hc_head_out"), &[s, dim], x.clone());
+
+        if self.defect != Defect::HeadNormSkipped {
+            match self.defect {
+                // A single-row norm kernel handed `s x dim`: one statistic over everything,
+                // the learned gain still landing per dim because it repeats every `dim`.
+                // Tiling the weight is how that is expressed with one norm routine rather
+                // than a second copy of the loop.
+                Defect::HeadNormOverAllTokens => {
+                    let tiled: Vec<f32> = (0..s).flat_map(|_| hw.norm.iter().copied()).collect();
+                    self.rmsnorm_raw(&mut x, s * dim, &tiled);
+                }
+                _ => self.rmsnorm_raw(&mut x, dim, &hw.norm),
+            }
+            if self.defect != Defect::HeadNormNotBf16 {
+                self.round_bf16(&mut x);
+            }
+        }
+        // `final_norm_out`, not `norm_out`: the matrix selects goldens by NAME SUFFIX, and
+        // `.norm_out` would sit one character away from matching `.attn_norm_out` and
+        // `.ffn_norm_out` for anyone who later writes the suffix without the leading dot.
+        cap.push(&format!("head.{phase}.final_norm_out"), &[s, dim], x.clone());
+
+        // `ParallelHead.forward` with `full_logits=False`: `x[:, -1]` — the LAST row only.
+        let row = if self.defect == Defect::HeadLogitsFromFirstRow { 0 } else { s - 1 };
+        // `F.linear(x.float(), self.weight)` on an f32 parameter: the dense branch, so no
+        // activation quantization, and the result is f32 and stays f32. Rounding it to bf16
+        // here would be a defect all of its own; there is no store in the reference to model.
+        let logits = self.linear(&x[row * dim..(row + 1) * dim], 1, dim, &hw.lm_head);
+        // Recorded, not returned. Both callers read their logits back out of `cap`, and a
+        // return value would offer a second path to the number the goldens are the record of.
+        cap.push(&format!("head.{phase}.logits"), &[1, vocab], logits);
     }
 
     /// `Block.forward` (model.py:695-707) for one layer, in place on the residual stream.

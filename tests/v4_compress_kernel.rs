@@ -830,7 +830,22 @@ fn in_compressor_scope(d: Defect) -> bool {
         | Defect::SinkhornOneFewerIter
         | Defect::SinkhornCombTransposed
         | Defect::HcPostNoComb
-        | Defect::HcPreNoRsqrt => false,
+        | Defect::HcPreNoRsqrt
+        // Added by the head-tail stage, 2026-08-05, because this match is exhaustive and
+        // wildcard-free BY DESIGN -- the doc above asks the adding stage to classify rather
+        // than let a new variant default. Classification only; no logic here changed.
+        //
+        // `IndexerBf16RunningSum` is the indexer's per-head score reduction, and the indexer
+        // has its OWN compressor -- distinct instance, distinct algorithm (fp4 + Hadamard,
+        // not partial fp8). It cannot reach the attention compressor. The six `Head*`
+        // variants live strictly after the last block, downstream of everything here.
+        | Defect::IndexerBf16RunningSum
+        | Defect::HeadHcNoRsqrt
+        | Defect::HeadHcRsqrtPerCopy
+        | Defect::HeadNormSkipped
+        | Defect::HeadNormNotBf16
+        | Defect::HeadNormOverAllTokens
+        | Defect::HeadLogitsFromFirstRow => false,
     }
 }
 
