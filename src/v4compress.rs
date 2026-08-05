@@ -5,10 +5,11 @@
 //! implies, and the two *arithmetic* selection paths (`get_window_topk_idxs` :261,
 //! `get_compress_topk_idxs` :275) that need no learned weights and so belong on the host.
 //!
-//! The pooling itself, and the indexer's scoring, are device work. Those kernels and their
-//! launchers do **not exist yet** — S2c's device half is unwritten as of this commit, and
-//! naming a file here that `ls kernels/` does not show would send the next reader to prove a
-//! negative.
+//! The pooling itself is device work: `kernels/v4compress.hip`, launched in the reference's
+//! own order by [`compress`] below and scored against `Oracle::compressor` by
+//! `tests/v4_compress_kernel.rs`. **The indexer's scoring is still unwritten** — it needs
+//! the e2m1/e8m0 primitives S2a owns, and naming a kernel here that `ls kernels/` does not
+//! show would send the next reader to prove a negative.
 //!
 //! # This is NOT the DSA indexer in `indexer.rs`
 //!
@@ -356,4 +357,309 @@ pub fn should_compress(kind: LayerKind, seqlen: usize, start_pos: usize) -> bool
     // zero. A decode-only smoke test would not have shown it.
     let Some(ratio) = kind.compressor_ratio() else { return false };
     if start_pos == 0 { seqlen >= ratio } else { (start_pos + 1).is_multiple_of(ratio) }
+}
+
+// ---------------------------------------------------------------------------------------
+// the device half — S2c's kernels and the order they run in
+// ---------------------------------------------------------------------------------------
+
+/// One compressor's geometry, in the exact `repr(C)` layout `kernels/v4compress.hip`'s
+/// `V4Comp` expects.
+///
+/// Fields are PRIVATE and [`Geom::attention`] is the only constructor, because three of the six
+/// integers are derived and a caller that computed one of them from a stale `coff` gets a
+/// kernel that reads the right shape at the wrong stride — `ape`'s row stride is `cd`, and
+/// at ratio 4 that is 1024 while at ratio 128 it is 512. Handing the kernel six loose
+/// `i32`s would make every one of those six positions plausible in the others.
+///
+/// Built from [`LayerKind`], not a raw ratio, so [`LayerKind::Plain`] — which has no
+/// `Compressor` object at all in the reference — cannot produce one.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Geom {
+    ratio: i32,
+    coff: i32,
+    d: i32,
+    cd: i32,
+    ents: i32,
+    rd: i32,
+    eps: f32,
+}
+
+// The `repr(C)` mirror, pinned at compile time. `v4c_guard` already catches a REORDER of
+// the six `int`s at run time — swap `ratio`/`coff` or `cd`/`ents` and guard 1003 fires,
+// swap `d`/`rd` and 1002 does — which a size check cannot do, since a reorder is
+// size-invariant. What the guard cannot catch is a field being ADDED, REMOVED, or changed
+// WIDTH on one side only, because then the two structs are different objects and the guard
+// is reading whichever bytes happen to line up. These two catch that, at the file where the
+// edit was made. `backend/vk.rs`'s `ExpertDesc` assert is the same idiom.
+const _: () = assert!(
+    size_of::<Geom>() == 28 && align_of::<Geom>() == 4,
+    "Geom must stay six i32 and one f32 — the layout kernels/v4compress.hip's V4Comp declares"
+);
+const _: () = assert!(
+    size_of::<Finish>() == 3 * size_of::<*const f32>(),
+    "Finish must stay three pointers — kernels/v4compress.hip's V4Fin"
+);
+
+impl Geom {
+    /// The **attention** compressor's geometry — `rotate = false` (model.py:377-378: the
+    /// partial block-64 `act_quant` over dims `[0, d - rd)`).
+    ///
+    /// **Named `attention`, not `new`, and that name is the guard.** The reference's other
+    /// `Compressor` is the indexer's nested one, `rotate = true`, which does
+    /// `rotate_activation` + `fp4_act_quant` over the WHOLE row instead — a different
+    /// algorithm, not a different parameter. Its geometry is otherwise identical in shape
+    /// (`Overlap`, `index_head_dim`, same `rope_head_dim`), so a `Geom` built for it would
+    /// pass every launcher guard and [`compress`] would run the attention finish over it:
+    /// block-64 e4m3 on dims `[0, 64)` where Hadamard-plus-fp4 on all 128 was due. Finite,
+    /// plausible, wrong. There is deliberately **no constructor** for it — the fields are
+    /// private and this is the only one — so the state is unrepresentable rather than
+    /// merely undocumented. Adding `Geom::indexer` must land together with the fp4 finish.
+    ///
+    /// `None` for [`LayerKind::Plain`]: the reference's `Attention.__init__` builds a
+    /// `Compressor` only when `compress_ratio` is truthy, so there is no geometry to
+    /// describe and every arithmetic path below would divide by zero.
+    ///
+    /// `d` is the *compressor's* head_dim — `args.head_dim` (512) for the attention
+    /// compressor, `args.index_head_dim` (128) for the indexer's. They are different
+    /// geometries on the SAME layer, and taking one for the other still "works".
+    ///
+    /// Only the ratio is validated here, by the `LayerKind` that carries it. `d`,
+    /// `rope_head_dim` and `norm_eps` are taken on trust and checked by `v4c_guard` at the
+    /// launch (1002 for `rd > d` or odd `rd`, 1001 for a zero). That split is deliberate
+    /// rather than an omission: those three come from the config, so a bad one is a bad
+    /// checkpoint and belongs at the wall where every launcher sees it — but it does mean a
+    /// `Geom` can exist that no launcher will accept, and the error names a code and not a
+    /// field.
+    pub fn attention(kind: LayerKind, d: usize, rope_head_dim: usize, norm_eps: f32) -> Option<Self> {
+        let ratio = kind.compressor_ratio()?;
+        let coff = kind.coff();
+        Some(Self {
+            ratio: ratio as i32,
+            coff: coff as i32,
+            d: d as i32,
+            cd: (coff * d) as i32,
+            ents: (coff * ratio) as i32,
+            rd: rope_head_dim as i32,
+            eps: norm_eps,
+        })
+    }
+
+    /// `coff * d` — the width `wkv`/`wgate` project to and `ape`'s row stride.
+    pub fn cd(self) -> usize {
+        self.cd as usize
+    }
+
+    /// `compress_ratio`. Public because [`crate::backend::hip`]'s safety contracts are
+    /// stated in it — `ape` is `ratio * cd`, and a caller outside this module that cannot
+    /// read the field cannot check the contract it is being asked to uphold.
+    pub fn ratio(self) -> usize {
+        self.ratio as usize
+    }
+
+    /// This compressor's `head_dim` — the width of ONE pooled block. Not [`Geom::cd`],
+    /// which is twice this on an overlapping layer.
+    pub fn d(self) -> usize {
+        self.d as usize
+    }
+
+    /// `rope_head_dim`: only the LAST this-many dims of a pooled row are rotated, and the
+    /// first `d - rd` are what `act_quant` covers.
+    pub fn rd(self) -> usize {
+        self.rd as usize
+    }
+
+    /// `coff * ratio` — entries in one pooling window, and the row count of both state
+    /// buffers.
+    pub fn ents(self) -> usize {
+        self.ents as usize
+    }
+
+    /// Elements in `kv_state` / `score_state`: `[coff*ratio, coff*d]`.
+    pub fn state_len(self) -> usize {
+        self.ents() * self.cd()
+    }
+}
+
+/// What the compressor's finish stage reads and writes — the same three pointers for both
+/// pool kernels, in `kernels/v4compress.hip`'s `V4Fin` layout.
+///
+/// One struct rather than three parameters because the three must AGREE with each other and
+/// nothing in a flat argument list makes them:
+///
+/// * `freqs` must be the layer's **compressed** table (`compress_rope_theta = 160000` WITH
+///   YaRN). The ratio-0 table has the same type, stride and shape, and substituting it is
+///   `Defect::RopeNoYarn` — plausible frequencies at every scale, fluent wrong text.
+///   [`rope_for_layer`] is the only thing that should have produced it.
+/// * `norm` is `[d]`, the **compressor's own** `RMSNorm` weight — not the layer's `kv_norm`,
+///   which is also `[d]` and also f32.
+/// * `out` is `[nblk, d]` at prefill and one row at decode.
+///
+/// The grouping was forced by `build.rs`'s duplication gate, which found the three repeated
+/// across the two pool call sites. It is kept because the gate was right about the shape of
+/// the problem: `Defect::RopeNoYarn` is a mismatch BETWEEN these pointers, so they should be
+/// chosen once, together, and not three times each.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Finish {
+    pub norm: *const f32,
+    pub freqs: *const f32,
+    pub out: *mut f32,
+}
+
+#[cfg(feature = "rocm")]
+pub use device::{Buffers, compress};
+
+/// The launch sequence for one `Compressor.forward`.
+///
+/// Split out from `attn.rs`'s equivalent deliberately: the compressor is scored on its own
+/// against `Oracle::compressor`, and S3 wires it into the layer loop. Nothing here touches
+/// `gpu.rs`.
+#[cfg(feature = "rocm")]
+mod device {
+    use super::{Finish, Geom, LayerKind, should_compress};
+    use crate::backend::hip::{
+        launch_v4_act_quant, launch_v4_compress_pool_decode, launch_v4_compress_prefill,
+        launch_v4_compress_state, launch_v4_dense_gemm_bf16,
+    };
+    use anyhow::{Result, ensure};
+
+    /// Every device pointer one `compress` call reads or writes.
+    ///
+    /// `scratch_rows` is carried WITH the two scratch pointers rather than beside them.
+    /// `docs/investigations/v4-flash-port.md` §"A hole S3 inherits" records the matching
+    /// hazard on S2b's `Scratch`: one sized for decode and handed a prefill overruns every
+    /// buffer, silently, because a `*mut f32` has no length. Here the capacity travels with
+    /// the pointers and [`compress`] checks it against the phase before any launch.
+    pub struct Buffers {
+        /// `[rows, dim]` f32 activations — the reference's `x.float()`.
+        pub x: *const f32,
+        /// `args.dim` — the model dim, and the reduction extent of both projections. It is
+        /// NOT derivable from [`Geom`], which describes the compressor's output geometry
+        /// only, and it is the one dimension `wkv`/`wgate`/`x` must agree on.
+        pub dim: usize,
+        /// `[cd, dim]` bf16. Checkpoint dtype; `bf16f` reproduces it exactly on device.
+        pub wkv: *const u16,
+        /// `[cd, dim]` bf16.
+        pub wgate: *const u16,
+        /// `[ratio, cd]` f32.
+        pub ape: *const f32,
+        /// `Compressor.norm`'s weight, the layer's COMPRESSED rotary table, and the
+        /// destination. See [`Finish`] for what each must be and why they are one field.
+        pub fin: Finish,
+        /// `[ents, cd]` f32, zero-initialised.
+        pub kv_state: *mut f32,
+        /// `[ents, cd]` f32, **-inf**-initialised. Zero-initialising it instead makes every
+        /// never-written slot a live pooling entry with weight `exp(0 - m)`, which is a
+        /// plausible number and a wrong window.
+        pub score_state: *mut f32,
+        /// `[scratch_rows, cd]` f32.
+        pub kv: *mut f32,
+        /// `[scratch_rows, cd]` f32.
+        pub score: *mut f32,
+        pub scratch_rows: usize,
+    }
+
+    /// Run `Compressor.forward` for one layer, one call.
+    ///
+    /// Returns the number of compressed blocks written to `out` — **zero** where the
+    /// reference returns `None`, which at prefill is any prompt shorter than `ratio` and at
+    /// decode is every position that does not complete a block. A zero return is not a
+    /// failure; it is the reference's own control flow, and the state writes still happened.
+    ///
+    /// Runs on the NULL stream. [`launch_v4_act_quant`] is S2b's and takes no stream
+    /// parameter, so threading one through here would put the last step of the pipeline on
+    /// a different stream from the four before it. S3 should give that launcher a stream
+    /// before wiring this into an overlapped layer loop.
+    ///
+    /// # Safety
+    /// Every pointer in `b` must satisfy the shape contract on its field and outlive the
+    /// call; this function synchronizes nothing.
+    pub unsafe fn compress(
+        g: &Geom,
+        b: &Buffers,
+        seqlen: usize,
+        start_pos: usize,
+    ) -> Result<usize> {
+        // `(seqlen, start_pos)`, the same pair `should_compress`, `window_topk` and
+        // `compress_topk` above take and the same pair `Compressor.forward` takes. An enum
+        // over the two phases lived here briefly and was cut: it made `start_pos == 0` at
+        // decode unrepresentable, which is worth something, but it did so by introducing a
+        // THIRD spelling of the pair in a module whose other three entry points use the
+        // pair — and the state it actually needed to exclude is `seqlen > 1` at decode,
+        // which it did not exclude either. That one is checked here.
+        ensure!(
+            start_pos == 0 || seqlen == 1,
+            "compress: decode consumes one row (bsz=1 scope cut), got {seqlen}"
+        );
+        ensure!(
+            seqlen <= b.scratch_rows,
+            "compress: {seqlen} rows into scratch sized for {}",
+            b.scratch_rows
+        );
+        let (ratio, d, rd) = (g.ratio as usize, g.d as usize, g.rd as usize);
+        // Reconstructed rather than passed in. `Geom` was BUILT from a `LayerKind` and
+        // stores its ratio, so a second `kind` parameter could only ever disagree with it —
+        // layer 42's `Geom` beside layer 41's `kind` gives a plausible wrong emission count
+        // and no guard anywhere sees it. `from_ratio` is exact here: `Geom::attention` refuses
+        // `Plain`, so the only ratios that reach this are 4 and the non-overlapping ones.
+        let kind = LayerKind::from_ratio(ratio);
+        let null = std::ptr::null_mut();
+
+        // `kv = self.wkv(x)`, `score = self.wgate(x)` (model.py:329-330), then the state
+        // deposit — which runs in BOTH phases and BEFORE the emit decision, because the
+        // reference writes the state and only then returns `None`.
+        //
+        // `slot0` is the whole difference between the phases and needs no branch: prefill
+        // has `start_pos == 0`, and `0 % ratio` is the 0 it wants.
+        let slot0 = start_pos % ratio;
+        // SAFETY: caller's contract on `b`; both GEMMs write scratch checked above.
+        unsafe {
+            launch_v4_dense_gemm_bf16(b.x, b.wkv, b.kv, seqlen, g.cd(), b.dim, null)?;
+            launch_v4_dense_gemm_bf16(b.x, b.wgate, b.score, seqlen, g.cd(), b.dim, null)?;
+            launch_v4_compress_state(
+                b.kv,
+                b.score,
+                b.ape,
+                b.kv_state,
+                b.score_state,
+                g,
+                seqlen,
+                slot0,
+                null,
+            )?;
+        }
+
+        // Zero is the reference's own `return` before `self.norm(...)`, not a failure: at
+        // ratio 128 it is every prompt under 128 tokens and 127 of every 128 decode steps.
+        // The state deposit above already happened either way.
+        let emitted = if !should_compress(kind, seqlen, start_pos) {
+            0
+        } else if start_pos == 0 {
+            let nblk = seqlen / ratio;
+            // SAFETY: as above; `b.fin.out` is `nblk · d` by its field contract.
+            unsafe {
+                launch_v4_compress_prefill(b.kv, b.score, b.ape, &b.fin, g, nblk, null)?;
+            }
+            nblk
+        } else {
+            // SAFETY: as above; `b.fin.out` is one row of `d` by its field contract.
+            unsafe {
+                launch_v4_compress_pool_decode(b.kv_state, b.score_state, &b.fin, g, start_pos, null)?;
+            }
+            1
+        };
+
+        if emitted > 0 {
+            // model.py:378 `act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)` —
+            // dims [0, d-rd) at block **64**, leaving the RoPE tail in bf16 to match QAT.
+            // S2b's kernel, not a second one: `n` separate from `row_stride` is exactly
+            // this partial extent, and a second e4m3 quantizer in this tree would be the
+            // third (see `kernels/v4compress.hip`'s header).
+            // SAFETY: `b.fin.out` is `emitted · d` writable f32 by the field's contract.
+            unsafe { launch_v4_act_quant(b.fin.out, emitted, d, d - rd, 64)? };
+        }
+        Ok(emitted)
+    }
 }

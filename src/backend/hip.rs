@@ -4,6 +4,7 @@
 
 #![cfg(feature = "rocm")]
 
+use crate::v4compress::{Finish, Geom};
 use anyhow::{Result, bail};
 use std::ffi::c_void;
 
@@ -408,6 +409,44 @@ unsafe extern "C" {
         topk: i32,
         scale: f32,
         o: *mut f32,
+    ) -> i32;
+
+    fn rivoli_v4_dense_gemm_bf16(
+        x: *const f32,
+        w: *const u16,
+        out: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn rivoli_v4_compress_state(
+        kv: *const f32,
+        score: *const f32,
+        ape: *const f32,
+        kv_state: *mut f32,
+        score_state: *mut f32,
+        p: *const Geom,
+        s: i32,
+        slot0: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn rivoli_v4_compress_prefill(
+        kv: *const f32,
+        score: *const f32,
+        ape: *const f32,
+        f: *const Finish,
+        p: *const Geom,
+        nblk: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn rivoli_v4_compress_pool_decode(
+        kv_state: *mut f32,
+        score_state: *mut f32,
+        f: *const Finish,
+        p: *const Geom,
+        start_pos: i32,
+        stream: *mut c_void,
     ) -> i32;
 }
 // jscpd:ignore-end
@@ -1590,5 +1629,140 @@ pub unsafe fn launch_v4_sparse_attn(
         )
     };
     check(r, "v4_sparse_attn")
+}
+
+/// `out[m, n] = x[m, k] · w[n, k]^T` with `w` in **bf16** — the un-quantized `F.linear`
+/// path, which is the one `Compressor.wkv`/`wgate` take (`Linear(..., dtype=float32)`,
+/// model.py:302).
+///
+/// Deliberately NOT [`launch_v4_gemv_fp8`]: that one quantizes the activation to fp8 at
+/// block 128 in front of the GEMM, which the reference does only for quantized `Linear`s.
+/// Sending the compressor through it would introduce a quantization the reference never
+/// applies, and the resulting error would be indistinguishable from a pooling bug.
+///
+/// # Safety
+/// `x` is `m · k` live f32, `w` is `n · k` live u16, `out` is `m · n` writable f32, none
+/// aliasing another (every kernel parameter is `__restrict__`), all live until `stream`
+/// completes. `stream` is a live `hipStream_t`, or null for the default stream.
+pub unsafe fn launch_v4_dense_gemm_bf16(
+    x: *const f32,
+    w: *const u16,
+    out: *mut f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    stream: *mut c_void,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
+    let r = unsafe { rivoli_v4_dense_gemm_bf16(x, w, out, m as i32, n as i32, k as i32, stream) };
+    check(r, "v4_dense_gemm_bf16")
+}
+
+/// The state deposit of `Compressor.forward` — **both phases**, which are one operation
+/// distinguished only by `slot0`.
+///
+/// A prefill of `s` tokens deposits its `s % ratio` trailing rows starting at slot 0; a
+/// decode deposits its single row at slot `start_pos % ratio`. See
+/// `kernels/v4compress.hip::v4_compress_state` for why that is a unification and not a
+/// coincidence.
+///
+/// Must be launched on **every** call, including one that emits no block: the reference
+/// writes the state and only then returns `None`. At ratio 128 that is every prompt under
+/// 128 tokens and 127 of every 128 decode steps.
+///
+/// Refuses `s <= 0` (guard 1005) and a `slot0` whose run would leave the `[ratio, cd]`
+/// `ape` table (guard 1008).
+///
+/// # Safety
+/// `kv`/`score` are `s · p.cd()` live f32; `ape` is `p.ratio() · p.cd()`; the two state
+/// buffers are `p.state_len()` writable f32. None may alias another — every kernel
+/// parameter is `__restrict__`. `p` is read host-side before the launch; the device buffers
+/// must outlive `stream`'s completion. `stream` is a live `hipStream_t`, or null for the
+/// default stream.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_v4_compress_state(
+    kv: *const f32,
+    score: *const f32,
+    ape: *const f32,
+    kv_state: *mut f32,
+    score_state: *mut f32,
+    p: &Geom,
+    s: usize,
+    slot0: usize,
+    stream: *mut c_void,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
+    let r = unsafe {
+        rivoli_v4_compress_state(
+            kv,
+            score,
+            ape,
+            kv_state,
+            score_state,
+            p,
+            s as i32,
+            slot0 as i32,
+            stream,
+        )
+    };
+    check(r, "v4_compress_state")
+}
+
+/// Prefill pooling for `nblk` compressed blocks — `overlap_transform`, the per-feature
+/// softmax over the pooling window, the bf16 store, `RMSNorm`, and the RoPE at each block's
+/// FIRST absolute position.
+///
+/// Does **not** run `act_quant`; call [`launch_v4_act_quant`] over dims `[0, d - rd)` at
+/// block 64 afterwards, which is the order and the partial extent model.py:373-378 uses.
+///
+/// Refuses `nblk <= 0` (guard 1006) rather than launching nothing and returning success,
+/// which would hand the caller an unwritten `out`.
+///
+/// # Safety
+/// `kv`/`score` are at least `nblk · p.ratio() · p.cd()` live f32; `ape` is
+/// `p.ratio() · p.cd()`; `f` satisfies [`Finish`]'s field contract with `out` sized
+/// `nblk · p.d()` and `freqs` covering position `(nblk - 1) · p.ratio()`. None may alias
+/// another. All must outlive `stream`'s completion; `stream` is a live `hipStream_t`, or
+/// null for the default stream.
+pub unsafe fn launch_v4_compress_prefill(
+    kv: *const f32,
+    score: *const f32,
+    ape: *const f32,
+    f: &Finish,
+    p: &Geom,
+    nblk: usize,
+    stream: *mut c_void,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
+    let r = unsafe { rivoli_v4_compress_prefill(kv, score, ape, f, p, nblk as i32, stream) };
+    check(r, "v4_compress_prefill")
+}
+
+/// Pool one COMPLETED decode window out of the compressor state into a single block, and
+/// slide the window.
+///
+/// Reads no activation: this step's row was already deposited by
+/// [`launch_v4_compress_state`], `ape` included. Call **only** when
+/// `(start_pos + 1) % ratio == 0`; the launcher refuses otherwise (guard 1009) rather than
+/// pooling a half-filled window into finite, plausible, wrong numbers.
+///
+/// # Safety
+/// The two state buffers are `p.state_len()` f32 and are read-modify-written; `f` satisfies
+/// [`Finish`]'s field contract with `out` sized one row of `p.d()` and `freqs` covering
+/// position `(start_pos / ratio) * ratio`. None may alias another. All must outlive
+/// `stream`'s completion; `stream` is a live `hipStream_t`, or null for the default stream.
+pub unsafe fn launch_v4_compress_pool_decode(
+    kv_state: *mut f32,
+    score_state: *mut f32,
+    f: &Finish,
+    p: &Geom,
+    start_pos: usize,
+    stream: *mut c_void,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
+    let r = unsafe {
+        rivoli_v4_compress_pool_decode(kv_state, score_state, f, p, start_pos as i32, stream)
+    };
+    check(r, "v4_compress_pool_decode")
 }
 // jscpd:ignore-end

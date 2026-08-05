@@ -23,13 +23,17 @@ pub mod attn;
 pub mod indexer;
 pub mod math;
 
-/// V4-Flash's KV compressor and sparse indexer, host half (S2c of
+/// V4-Flash's KV compressor and sparse indexer (S2c of
 /// `docs/investigations/v4-flash-port.md`).
 ///
-/// Ungated and backend-free for the same reason as `arch`: it is the two RoPE tables, the
-/// per-layer shape discriminants and the two *arithmetic* selection paths, all of which the
-/// offline converters and the CPU tests need without a device. The pooling and the scoring
-/// are device work (`kernels/v4comp.hip`).
+/// The host half is backend-free for the same reason as `arch`: it is the two RoPE tables,
+/// the per-layer shape discriminants and the two *arithmetic* selection paths, all of which
+/// the offline converters and the CPU tests need without a device.
+///
+/// The pooling is `kernels/v4compress.hip`, launched by the `rocm`-gated `device` submodule
+/// — so this module is no longer *entirely* ungated, and the split is deliberate: everything
+/// above `mod device` still compiles and tests with no feature and no GPU. The indexer's
+/// scoring is still device work that does not exist yet; it needs S2a's e2m1/e8m0 block.
 ///
 /// Separate from [`indexer`], which is GLM's DSA lightning indexer: V4's `Indexer` shares
 /// the name and none of the structure — no `wk`, no `k_norm`, its own nested `Compressor`.
