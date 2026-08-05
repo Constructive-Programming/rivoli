@@ -516,6 +516,37 @@ pub struct V4Config {
     // `convert_v4::write_layer_resident`. ---
     pub index_n_heads: usize,
     pub index_head_dim: usize,
+    /// How many compressed blocks the lightning indexer keeps:
+    /// `index_score.topk(min(index_topk, end_pos // ratio))` (`model.py:433`).
+    ///
+    /// **Required, and the reason is NOT the one `routed_scale` carries.** There the
+    /// reference's default (`1.`) disagrees with the checkpoint (`1.5`), so a reader taking
+    /// the default is silently wrong. Here they agree — `ModelArgs.index_topk` is 512
+    /// (`model.py:77`) and so is the shipped config, a pairing `v4_base_matches_the_shipped_config`
+    /// checks against the real file. The hazard is the other one: serde's `usize` default is
+    /// **0**, which is a legal-looking value rather than an obviously-absent one.
+    /// `topk(min(0, n))` yields a zero-width selection, `Attention.forward` concatenates it
+    /// with the sliding-window list (`model.py:519`), and the `cat` is perfectly legal — so
+    /// every `compress_ratio == 4` layer silently degrades to pure sliding-window attention.
+    /// Fluent, wrong, no error: the same class as `routed_scale`, reached by the other route.
+    /// (An earlier version of this comment claimed it "fails loudly"; it does not, and the
+    /// oracle agrees — `forward.rs`'s `topk_idx(&score, 0)` returns an empty row.)
+    ///
+    /// No upper bound is available or needed: `min(index_topk, end_pos / ratio)` clamps from
+    /// above, so an absurd value is a no-op, and nothing in this crate is sized by it.
+    ///
+    /// **Carried with no reader in this crate yet, deliberately** — like `routed_scale`, and
+    /// for a sharper reason: THREE types declare a field of this name (`ModelConfig`'s, read
+    /// by `gpu.rs`; `v4oracle::weights::V4Config`'s, hard-coded to 512; and this one), which
+    /// is exactly the setup where the decode path reaches for the wrong one.
+    ///
+    /// For anyone who finds it looking inert: at 512 it does not truncate until **2052
+    /// tokens** — `4 * (index_topk + 1)`, enforced by `tests/v4_compress.rs`'s
+    /// `indexer_topk_never_cuts_at_the_emit_prompt` and recorded in
+    /// `docs/investigations/v4-flash-port.md`, "A hole S3 inherits". Below that the
+    /// selection is decided entirely by the causal mask, so a wrong value changes nothing
+    /// observable. That is a property of the prompt length, not evidence the field is unused.
+    pub index_topk: usize,
 
     /// Hyper-connection streams. `hc_*_fn` is `[_, hc_mult · hidden]`, likewise confronted
     /// with the tensor by `convert_v4`.
@@ -616,6 +647,12 @@ impl ArchConfig for V4Config {
             "scoring_func {:?}: V4 is sqrtsoftplus. A wrong router affinity picks \
              plausible-but-wrong experts and never crashes",
             self.scoring_func
+        );
+        ensure!(
+            self.index_topk > 0,
+            "index_topk must be positive — at 0 the indexer selects no compressed blocks \
+             and every compress_ratio == 4 layer silently falls back to sliding-window \
+             attention"
         );
         // A zero or negative scale silently zeroes or flips every routed contribution
         // while the shared expert keeps working — degraded fluent text, not a crash.
@@ -725,7 +762,7 @@ mod tests {
     }
 
     /// DeepSeek-V4-Flash-0731's real `config.json` values, field for field. Pinned against
-    /// the shipped file by `real_v4_config_parses` (skipped when the checkpoint is absent),
+    /// the shipped file by `v4_base_matches_the_shipped_config` (skipped when absent),
     /// so this table cannot quietly become a fiction that only the unit tests believe.
     const V4_BASE: &[(&str, &str)] = &[
         ("model_type", r#""deepseek_v4""#),
@@ -773,6 +810,7 @@ mod tests {
         ),
         ("index_n_heads", "64"),
         ("index_head_dim", "128"),
+        ("index_topk", "512"),
         ("hc_mult", "4"),
     ];
 
@@ -950,16 +988,25 @@ mod tests {
         assert_eq!((c.top_k, c.n_shared), (6, 1));
         // 1.5, NOT `ModelArgs.route_scale`'s default of 1. — see the field's doc.
         assert_eq!(c.routed_scale, 1.5);
+        assert_eq!(c.index_topk, 512); // parsed, not defaulted — see the field's doc
+
         assert_eq!(c.n_heads * c.head_dim, 32768); // == wq_b's out_dim
     }
 
-    /// **No field of V4Config may be defaulted.** Dropping any one must fail the parse,
+    /// **No TOP-LEVEL field of V4Config may be defaulted.** Dropping any one must fail the parse,
     /// not yield a zero — that is the failure mode this whole stage is built around, and
     /// it is checked field-by-field rather than by inspection so a `#[serde(default)]`
     /// added later cannot slip through.
     ///
     /// Driven off `V4_BASE` itself, so a field added to the struct and to the fixture is
     /// covered automatically; one added to the struct alone fails `v4_baseline_parses`.
+    ///
+    /// **Top-level only, and the doc above says so for that reason.** `V4_BASE`'s rows are
+    /// whole JSON values, so dropping `rope_scaling` drops the table entire — the five
+    /// fields of [`RopeScaling`] and the three of `QuantConfig` are never individually
+    /// checked for requiredness. A `#[serde(default)]` on one of those would pass this
+    /// test. Closing it means a second loop over the nested tables, which is worth doing
+    /// the next time either grows a field.
     #[test]
     fn every_v4_field_is_required() {
         for (k, _) in V4_BASE {
@@ -969,9 +1016,20 @@ mod tests {
             if matches!(*k, "model_type" | "architectures") {
                 continue;
             }
+            // **On the serde error, not on `is_err()`.** A bare `is_err()` cannot tell
+            // "the field is required" from "the field is defaulted and `validate()`
+            // happens to reject the default" — and that is not hypothetical: `index_topk`
+            // defaults to 0 under `#[serde(default)]`, and `validate()` refuses 0, so an
+            // injected `#[serde(default)]` on it passed this test unchanged. Requiring the
+            // MISSING-FIELD error separates the two.
+            let err = format!("{:#}", parse_v4(&[(k, "")]).unwrap_err());
+            // Naming the field too, not just "missing field": serde reports the JSON name,
+            // so this also proves the error is about the key that was dropped rather than
+            // some other one the fixture happens to be short of.
             assert!(
-                parse_v4(&[(k, "")]).is_err(),
-                "dropping {k:?} still parsed — it has acquired a default"
+                err.contains(&format!("missing field `{k}`")),
+                "dropping {k:?} did not fail as a missing field — it has acquired a \
+                 default, and something downstream rejected that default instead. Got: {err}"
             );
         }
     }
@@ -1015,6 +1073,9 @@ mod tests {
                 "implemented: 0, 4, 128",
             ),
             (vec![("compress_ratios", "[0,0,4]")], "at least n_layers"),
+            // PRESENT but zero — dropping the key fails as a MISSING FIELD and never
+            // reaches this bound.
+            (vec![("index_topk", "0")], "index_topk must be positive"),
             (
                 vec![(
                     "quantization_config",
