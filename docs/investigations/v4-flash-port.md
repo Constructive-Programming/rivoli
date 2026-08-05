@@ -293,6 +293,40 @@ Every *compressor* defect separates enormously; only the three `act_quant` **arg
 defects sit at or below the quantizer's own step, because they perturb it by less than one
 of its steps.
 
+> **CORRECTED 2026-08-05 by S2c-indexer, on hardware — the SECOND correction to this
+> section, and it should be read with the first.** The coordinator has already recorded that
+> the non-coverage is **13 cells**, not the handful this table lists, `NoBf16Rounding` at
+> `sep=16` on both ratio-128 cells included. This adds the part that correction does not
+> carry, and one detail it rounds off.
+>
+> **The scale-invariance argument below is too strong, and the data disproving it was in the
+> same output it was written from.** It says `KvActQuantBlock128` is inert "for a reason no
+> threshold can fix" — ue8m0 scales are powers of two, e4m3 is exactly scale-invariant under
+> them, so *no* gate can see it at *any* threshold. That holds at three of the four cells. At
+> `ratio4/prefill` it does not:
+>
+> ```
+> ratio4/prefill clean:              max=16  differing=5/32768
+> ratio4/prefill KvActQuantBlock128: max=16  differing=6/32768   want=3.5 got=3.25
+> ```
+>
+> Same max, **different element count** — so `broken != clean` and the defect is observable.
+> Invariance is exact only while both blockings keep every value inside e4m3's range; at a
+> rounding boundary they diverge, which is what `3.5` against `3.25` in the `[2,4)` binade is.
+>
+> **Why it survived three readings is the part worth keeping.** The claim is an argument from
+> first principles — powers of two, therefore exactly invariant — and it is *nearly* true.
+> That was enough that its author, the coordinator quoting it as settled, and S2c-indexer on
+> first pass all accepted it without checking it against a `differing=` count already on
+> screen. A derivation that is right in kind and wrong at the boundary is harder to catch than
+> a wrong number, because nobody looks.
+>
+> **The detail:** this table lists **three** `act_quant` defects. Four are measured under the
+> floor — `KvActQuantWholeTensor` (29 and 38) appears nowhere here.
+>
+> The live list is `BELOW_RESOLUTION` in `tests/v4_compress_kernel.rs`, which asserts each
+> entry's measured separation exactly. Not restated here, so the numbers have one home.
+
 **DECISION: record this as named non-coverage. Do NOT lower `RESOLVABLE`.** Lowering it to
 admit `sep=8` is the budget-not-measurement move S2c2 spent this round undoing, and it would
 buy nothing real: `KvActQuantBlock128` is inert *for a reason already in this document* —
@@ -364,13 +398,31 @@ of the binade *base* — and that inflated figure had already been copied into t
 Counting distinct **bf16 scores** needs no ulp arithmetic at all, and is the quantity the
 selection actually reads.
 
-### The indexer's device half — S2c-indexer, 2026-08-05. WRITTEN, NOT YET RUN.
+### The indexer's device half — S2c-indexer, 2026-08-05. MEASURED.
 
 `kernels/v4indexer.hip` (`v4_indexer_spread`, `v4_indexer_score`), the fp4 activation
 quantizer in `common.hpp` (`f2e2m1`, `fp4_quant_roundtrip`), `Geom::indexer`, and
-`tests/v4_indexer_kernel.rs`. **The GPU was held by the coordinator throughout, so not one
-of these kernels has executed.** Everything below is a compile-and-review result; the
-measured column is empty on purpose.
+`tests/v4_indexer_kernel.rs`. **8/8 on hardware, every comparison BIT-IDENTICAL:**
+
+| comparison | result |
+|---|---|
+| `indexer_spread` vs the oracle's `hadamard_rotate` + `fp4_act_quant_inplace` | **1152/1152** |
+| the same over 60 binades of block scale | **7680/7680** |
+| `indexer_score` on the checkpoint's own compressed KV | **48/48** |
+| `indexer_score` base / no-weights / no-fp4 | **20/20** each |
+
+Read the score rows narrowly. They are against a host transliteration of `model.py:425-427`,
+**not** against `Oracle::indexer`, which still carries the confirmed head-sum defect below —
+so they are an arithmetic-and-plumbing verdict, not a correctness verdict. The **spread** rows
+are against the oracle and are a real verdict.
+
+**The `contract(off)` pragma is verified in the ISA and was run RED FIRST**: 1
+`v_fmac_f32_e32` with the pragma removed, 0 with it restored. The counts and the counting
+trap that comes with them — a naive `v_fma|v_mac|v_mad` grep reports 10 against 9, because 9
+of those are pure ADDRESS arithmetic the pragma neither does nor should touch — are stated
+once, at the pragma in `kernels/v4indexer.hip`. Worth knowing elsewhere: `mla.hip`'s
+equivalent note counts "fma-class" without excluding integer MADs, so its 14 may be
+similarly inflated.
 
 **Requirement 5 is discharged.** `Geom` split into `GeomAbi` (the `repr(C)` mirror, still
 28 bytes with its layout assert) plus a `Quantize` field, and `compress` matches on it
@@ -453,6 +505,55 @@ What this path *does* exercise is the same exponent domain through `fast_round_s
 2 the suite reaches today. **`e8m0f`'s decode of a scale BYTE — including `0x00` and `0xff` —
 remains uncovered, and nothing on the indexer path can reach it.** Requirement 10 is still
 the only thing that will.
+
+### `v4_compress_kernel` was RED from the S2 merge — fixed 2026-08-05 by S2c-indexer
+
+Reproduced at `ae2dd33` before touching anything: **6 passed, 2 failed, exit 101**. Both
+failures were bookkeeping in the sense that no kernel was wrong, and neither was bookkeeping
+in what it revealed.
+
+**1. A decision written into prose but not into the assertion.**
+`each_in_scope_defect_is_further_from_the_gpu_than_the_clean_oracle_is` demanded
+`sep >= RESOLVABLE` on cells the *"compressor gate cannot resolve `act_quant`'s arguments —
+DECIDED 2026-08-05"* section above had already ruled out. The decision stands and
+`RESOLVABLE` was **not** lowered — that is the budget-not-measurement move that section spent
+a round undoing. The non-coverage now lives at the assertion as `BELOW_RESOLUTION`, an
+**expected value, not a skip**: each entry must reproduce its measured separation *exactly*,
+so a cell that gains resolution fires; each entry must be *reached*, so a dead one cannot
+absorb a regression; and an unrecorded cell below the floor still fails.
+
+**The measured non-coverage is broader than that section recorded** — 13 cells, not the
+three it tabulated at one cell. Two it names nowhere: `KvActQuantWholeTensor` (29 and 38),
+and `NoBf16Rounding` at `sep=16` on **both** ratio-128 cells, which is exactly one e4m3 step
+and is not an `act_quant` argument at all. The full table is in `BELOW_RESOLUTION`; it is not
+restated here, so the number lives in one place.
+
+**And that section's scale-invariance argument is not universal.** It calls
+`KvActQuantBlock128` inert "for a reason no threshold can fix" — ue8m0 scales are powers of
+two, e4m3 is exactly scale-invariant under them. True at three of four cells. At
+`ratio4/prefill` the defect is **live**: `sep=16`, 6 of 32768 elements, `want=3.5 got=3.25`,
+adjacent codes in the `[2,4)` binade. Invariance is exact only while both blockings keep
+every value inside the format's range; at a rounding boundary they diverge. An entry reaches
+`BELOW_RESOLUTION` only if `broken != clean`, so that row is itself the disproof of "at any
+threshold".
+
+**2. A guard working correctly, and it was telling us something.**
+`the_ratio_0_rope_table_reproduces_the_no_yarn_defect_exactly` fails at `ratio4/decode` with
+a **perfect** impersonation — max=0, bit-identical against the defect-injected oracle — and a
+separation from the clean oracle of only **8 codes**, half an e4m3 step. The anti-vacuity half
+is right to reject that: the cell cannot distinguish "consulted the wrong table" from "did not
+consult the table at all".
+
+**`RopeNoYarn` is S3 requirement 4** — `Io.freqs` cannot tell the ratio-0 table from the YaRN
+one — one of the five defects here that produce fluent wrong output. So the honest record is:
+`ratio4/decode` is **non-separating at a measured sep=8, and this suite cannot see requirement
+4 at RATIO-4 decode** — not "at decode", since `ratio128/decode` is unrecorded and still
+required to separate. `ratio4/prefill` separates at **31,215** and is still required; that
+cell is what gates the requirement. Not papered into green.
+
+Every one of the four new gates was proved able to fire by deliberate break before the fix
+was committed — a changed recorded value, a removed record, a dead record, and the no-yarn
+expected value.
 
 ### Convergence between two reviews is not confirmation — S2b, 2026-08-05
 

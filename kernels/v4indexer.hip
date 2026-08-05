@@ -201,6 +201,21 @@ extern "C" __global__ void v4_indexer_spread(float* __restrict__ x, int d) {
 // comparison. `mla.hip`, `linalg.hip` and `attn.hip` each set this pragma for the same
 // reason; found here by review before the kernel ever ran.
 //
+// VERIFIED IN THE ISA on 2026-08-05, and run RED FIRST so the check was seen to move. At
+// `--offload-arch=gfx1151 -O3 --cuda-device-only -S`, counting only FLOAT fma-class
+// instructions between `v4_indexer_score:` and its `.Lfunc_end`:
+//
+//     pragma removed:  1 x v_fmac_f32_e32      <- the inner dot's multiply-add, fused
+//     pragma restored: 0                        <- no float fusion anywhere in the kernel
+//
+// and `v4_indexer_spread` is unchanged at 0 either way, which is the measured form of this
+// note's claim that widening the pragma would suppress nothing there.
+//
+// COUNT FLOAT OPS ONLY. A naive `v_fma|v_mac|v_mad` grep reports 10 against 9 here, because
+// the kernel also emits 8 x `v_mad_u64_u32` and 1 x `v_mad_i64_i32` of pure ADDRESS
+// arithmetic that the pragma neither does nor should touch. Those 9 swamp the one signal
+// that matters and would have made a real regression look like noise.
+//
 // Scoped to the scoring kernel: `v4_indexer_spread` above has no multiply-add to fuse (the
 // Hadamard is pure adds and subtracts, and the fp4 scale is a single multiply), so widening
 // the pragma would suppress nothing and would suggest it had.
