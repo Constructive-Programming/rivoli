@@ -1,6 +1,6 @@
 ---
 status: live
-verdict: A staged 30% code reduction (36,100 -> ~25,400 lines) across four tracks. Retiring the Vulkan backend is 6,600 of it and must run ALONE because its cfg sites reach 21 files. 50% was the ask and is NOT reachable without deleting further features or merging ModelConfig/V4Config, which reintroduces a defect class that has bitten twice.
+verdict: A staged 39% code reduction (36,100 -> ~22,050 lines) over two waves and nine tracks. Retiring the Vulkan backend is 6,600 of it and must run ALONE because its cfg sites reach 21 files. ~43% of this tree is TEST code and is not a line-count target: consolidating duplicated scaffolding is in scope, cutting coverage is not. 50% remains unreachable without dropping features beyond Vulkan.
 ---
 
 # Refactor 2026-08 — the plan
@@ -20,8 +20,8 @@ would accelerate it.
 
 ## The 50% question, answered honestly
 
-50% is 18,050 lines. The four selected tracks total **~10,700 (30%)**. The gap is not
-recoverable by being cleverer:
+50% is 18,050 lines. Wave 1's four tracks total **~10,700 (30%)**; wave 2 adds **~3,350**, reaching **~14,050
+(39%)**. The remaining gap is not recoverable by being cleverer:
 
 - **~2,500** is `src/v4oracle/`, a deliberate second implementation. Its whole value is being
   redundant — a 44-defect matrix that static goldens cannot replace. Deleting it deletes the
@@ -231,22 +231,133 @@ proceed.
 
 ---
 
+# Wave 2 — folded in 2026-08-05
+
+Measured after wave 1 was scoped. None of these was visible until the baseline was taken
+properly; each is grounded below.
+
+**A finding that reframes Track 3.** In-src `#[cfg(test)]` blocks hold **~4,000–4,500 code
+lines** — `quant.rs` 418, `model.rs` 313, `format.rs` 279, `math.rs` 214, `hybrid.rs` 187,
+`telemetry.rs` 185, `serve.rs` 162, `arena.rs` 162, and `backend/vk.rs` ~1,125 which Track 1
+deletes anyway. With `tests/` that is **~43% of the tree in test code.**
+
+**This is not a place to hunt for lines.** Five separately-written copies of one harness
+produced five instances of one guard bug in a month, so *consolidating scaffolding* is
+justified and in scope. *Cutting coverage* is not, and the V4 decode is the argument:
+correct-sounding English out of a loop that is 58% wrong. Any track below that reduces what
+is asserted, rather than how many times it is spelled, is out of scope by construction.
+
+## Track F — extend Track 3 into `src/` · ~1,000 · with Track 3
+
+Track 3 as scoped touches only `tests/`. The in-src blocks carry the same fixture-building,
+golden-loading and ULP-comparison duplication. Same harness, same **G4** gate: every recorded
+deliberate break re-runs red with the same message naming the same subject.
+
+## Track G — collapse the converters · ~700 · after Track 4
+
+`convert.rs` 528 + `convert_v4` 226 + `fp8_to_i4` 158 + `add_indexer` 44 share one skeleton:
+read safetensors → per-layer loop → pack → atomic `.part`+rename → manifest → copy tokenizer
+→ optional `--verify`. Cheaper after Track 4, which extracts the safetensors half.
+
+**Preserve verbatim:** `convert_v4 --verify` compares the re-read **file against the mmap'd
+source**, deliberately *not* against the buffer it just wrote, because that comparison could
+never fail. If the shared skeleton averages that away it has made the gate unfireable.
+
+**Gate:** G2 on both artifact formats — 0 bytes differ over the real checkpoint.
+
+## Track H — delete `i4_audit` · 697 · anytime, independent
+
+A straight deletion, not a refactor. Both citations are **closed** investigations
+(`codebook-rotation.md:172`, `int4-scales.md:186,190`), and `int4-scales.md` already records
+*"2026-08-01: `i4_audit` no longer re-derives them"* — the capability those docs describe was
+removed from the tool before this. The investigations keep the record.
+
+**Preserved at tag `i4-audit-retired`** (annotated, with the restore command in the tag
+message). Restore with `git checkout i4-audit-retired -- src/bin/i4_audit.rs` if an int4
+quantization question reopens; do not rewrite it.
+
+**Gate:** nothing references it after removal — `grep` `docs/`, `tests/`, `*.sh`, `Cargo.toml`
+— and `architecture.md:711`'s `src/bin/` inventory is updated in the same commit.
+
+## Track I — the shared layer-loop skeleton · ~600 · after Track 0
+
+`gpu.rs` and `v4gpu.rs` share prefill / decode / argmax / EOS / profile-summary. The merge
+already produced a jscpd clone between them that was **in neither branch alone**, which is
+the mechanical evidence that the skeleton is common.
+
+**The bodies stay apart.** Merging the per-layer work is how a GLM-shaped path ends up running
+on a V4 config — the same argument that keeps `ModelConfig` and `V4Config` separate, which
+caught two misplaced fields this month. Factor the *loop*, not the *layer*.
+
+**Blocked on Track 0**, which owns `v4gpu.rs` until `attn_out` is diagnosed.
+
+**Gate:** G1 on both a GLM and a V4 decode — byte-identical output, and GLM's expert hit
+counters identical, the way the pool refactor was proven (36595 hit / 14405 miss, exactly
+equal across arms).
+
+## Track K — unify the format/offset families · ~350 · after Track 4
+
+`format.rs` 1,110 + `quant.rs` 1,029 carry three parallel `*_proj_bytes` / `*_slot_offsets`
+families for `.vq3` / `.i4` / `.f4`. **Measured 2026-08-05: `.f4` and `.i4` produce identical
+offsets across a band of dimensions** — equal iff `ceil(i/32) == 4*ceil(i/128)`, which holds
+for every `i` in `97..=128 (mod 128)`, and **`moe_inter` cannot separate them at all**,
+because w2's scale span begins at `off[5]` and so its length appears in no offset.
+
+So the arithmetic already says there are fewer families than there are spellings. The unified
+form must keep the property that the block count and `shared_block`'s refusal read **one**
+`RoutedFmt::has_shared`, so they cannot disagree — that is what closed the `n_experts + 1`
+trap.
+
+**Gate:** G2, plus the existing `v4_loading` format-separation tests must still go red under
+the recorded break (restoring `n_experts + 1` rejects the shipped `L00.f4` at 3422556160 vs
+3435925504 — exactly one stride).
+
+## Declined, with reasons
+
+- **`otlp`** — ~150 lines for three heavy dependencies. Worth doing for **build time**, not
+  for the line count; different justification, decide separately.
+- **`misa` / `dsa`** (48 / 52 refs) — retiring `misa` might reach 500 lines, but whether it is
+  live science or the next thing to retire is a research call, not a measurement.
+- **Dead code** — hunted and not found: 5 `allow(dead_code)`, ~13 single-file `pub fn`s (mostly
+  FFI decls), no unused dependencies. The mass here is deliberate.
+
+---
+
 ## Sequencing
 
 ```
-now      Track 0  (attn_out)      ─┐  parallel, own attn.rs + v4gpu.rs
-         Track 0b (encoding)      ─┘  parallel, own tokenizer + new module
+now    Track 0  (attn_out)       ─┐ parallel, owns attn.rs + v4gpu.rs
+       Track 0b (encoding)       ─┤ parallel, owns tokenizer + new module
+       Track H  (rm i4_audit)    ─┘ independent of everything; tag already cut
 
-wave 1   Track 1  (retire Vulkan)     ALONE — cfg sites reach 21 files
+s1     Track 1  (retire Vulkan)     ALONE — cfg sites reach 21 files
 
-wave 2   Track 2  (ABI macro)      ─┐  parallel, disjoint file sets
-         Track 4  (crates)         ─┘
+s2     Track 2  (ABI macro)      ─┐ parallel, disjoint file sets
+       Track 4  (crates)         ─┘
 
-wave 3   Track 3  (test harness)       ALONE — needs 1, 2, 4 settled
+s3     Track G  (converters)     ─┐ parallel; G and K both build on Track 4
+       Track K  (format/offset)  ─┤
+       Track I  (loop skeleton)  ─┘ needs Track 0 to have released v4gpu.rs
+
+s4     Track 3  (tests/)         ─┐ ALONE as a pair — the safety net goes last
+       Track F  (in-src tests)   ─┘
 ```
 
-**Projected:** 36,100 → ~25,400, a **30%** reduction, with every feature except the Vulkan
-backend intact.
+| track | lines | gate |
+|---|---:|---|
+| 1 retire Vulkan | 6,600 | G1 + featureless build + asserted cell count |
+| 3 tests/ harness | 2,200 | **G4** |
+| 4 crates | 1,000 | G2 |
+| 2 ABI macro | 1,000 | **G3** per launcher |
+| F in-src tests | 1,000 | **G4** |
+| G converters | 700 | G2 |
+| H rm i4_audit | 697 | no inbound refs |
+| I loop skeleton | 600 | G1 on GLM **and** V4 |
+| K format/offset | 350 | G2 + recorded break still red |
+| **total** | **~14,050** | **39%** |
+
+**Projected:** 36,100 → ~22,050, a **39%** reduction, with every feature except the Vulkan
+backend and the `i4_audit` forensic tool intact.
 
 ## What would be a successful negative result
 
