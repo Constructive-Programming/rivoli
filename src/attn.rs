@@ -725,10 +725,23 @@ pub mod v4 {
             memcpy_dtod(s.qrq.cast(), s.qr.cast(), m * q_lora * size_of::<f32>())?;
             launch_v4_act_quant(s.qrq, m, q_lora, q_lora, FP8_BLOCK)?;
             launch_v4_gemv_fp8(s.qrq, w.wq_b.w, w.wq_b.scale, m, nhd, q_lora, FP8_BLOCK, 1, s.q)?;
-            // QK-norm BEFORE RoPE (model.py:504 then :505). The oracle cannot see this
-            // order -- RoPE rotates adjacent pairs, so it preserves `mean(q^2)`, and a
-            // scalar commutes with a rotation. Read off the reference, not inferred from
-            // a green test.
+            // QK-norm BEFORE RoPE (model.py:504 then :505). Read off the reference, not
+            // inferred from a green test -- which is the part that matters and is unchanged.
+            //
+            // CORRECTED 2026-08-05: this said "the oracle cannot see this order". It can.
+            // The argument was that RoPE rotates adjacent pairs so it preserves `mean(q^2)`
+            // and a scalar commutes with a rotation -- exact, and about exact arithmetic.
+            // `Oracle::qk_norm` computes that statistic in BF16, faithfully (it is bf16 in
+            // the reference), so `rs` is quantized to ~0.4% steps and the two orders land on
+            // different steps. Measured on a compressed layer: `Defect::QkNormAfterRope`
+            // moves `.q` on 1287/24576 elements at rel 7.4e-3, and three goldens downstream
+            // (`tests/v4_attn.rs::expect_moves`). What IS true is narrower and is why the
+            // defect stays out of both separation sweeps: the move is at the bf16 rounding
+            // scale, so a gate ranking on distance cannot separate it from the floor --
+            // `tests/v4_oracle.rs::qk_norm_order_is_a_rounding_difference_not_an_arithmetic_one`
+            // bounds it by what dropping bf16 rounding entirely costs. Third time in this
+            // port that an exact-arithmetic equivalence was taken for a bitwise one; see
+            // `KV_QUANT_BLOCK` above for the second.
             launch_v4_qk_norm(s.q, m * nh, hd, d.norm_eps)?;
             launch_v4_rope(s.q, io.freqs, m * nh, hd, rd, pos0, nh, false)?;
 

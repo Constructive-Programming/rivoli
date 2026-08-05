@@ -72,14 +72,17 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use rivoli::backend::hip::device_sync;
-use rivoli::math::{bf16_to_f32, f32_to_bf16};
+use rivoli::math::f32_to_bf16;
 use rivoli::memory::device::DeviceBuf;
 use rivoli::v4compress::{Buffers, Finish, Geom, LayerKind};
 use rivoli::v4oracle::forward::{CompState, CompressorW, Counters, Defect, Oracle};
-use rivoli::v4oracle::weights::{Checkpoint, V4Config, WMat};
+use rivoli::v4oracle::weights::{Checkpoint, V4Config};
 
 mod common;
-use common::{EMIT_LEN, PROBE_LEN, PROBE_REMAINDER_LEN, checkpoint, compressor_w, probe};
+use common::{
+    EMIT_LEN, PROBE_LEN, PROBE_REMAINDER_LEN, bf16_rows, checkpoint, compressor_w, flat_freqs,
+    probe,
+};
 
 /// The SECOND ratio-128 decode block, at `(255 + 1) % 128 == 0`.
 ///
@@ -145,37 +148,10 @@ impl Dev {
     }
 }
 
-/// One `WMat::Dense` weight as the bf16 codes the kernel decodes with `bf16f`.
-///
-/// Asserts the round-trip is EXACT rather than assuming it. The checkpoint stores these in
-/// bf16 and `Checkpoint::dense` widens them to f32, so re-encoding must be lossless — if it
-/// ever is not, the kernel is being fed a different matrix from the oracle and every
-/// comparison below silently measures that instead of the pooling.
-fn bf16_rows(w: &WMat) -> Vec<u16> {
-    let (rows, cols) = (w.rows(), w.cols());
-    let mut out = Vec::with_capacity(rows * cols);
-    let mut buf = Vec::new();
-    for r in 0..rows {
-        w.row(r, &mut buf);
-        for &v in &buf {
-            let code = f32_to_bf16(v);
-            assert_eq!(
-                bf16_to_f32(code),
-                v,
-                "compressor weight row {r} is not bf16-exact: the oracle and the kernel \
-                 would be reading different numbers"
-            );
-            out.push(code);
-        }
-    }
-    out
-}
-
-/// `Oracle::freqs`'s `(cos, sin)` pairs, flattened to the `[pos][2*i], [pos][2*i+1]` layout
-/// `v4c_finish_row` indexes.
-fn flat_freqs(t: &[(f32, f32)]) -> Vec<f32> {
-    t.iter().flat_map(|&(c, s)| [c, s]).collect()
-}
+// `bf16_rows` and `flat_freqs` moved to `tests/common/mod.rs` on 2026-08-05, when
+// `v4_attn.rs`'s compressed-layer cell became a second consumer of both and `build.rs`'s
+// duplication gate refused the copy. Neither touches a device type, which is that module's
+// rule for what may live there.
 
 // =======================================================================================
 // the metric

@@ -1031,6 +1031,107 @@ v4_hadamard_basis 4 · v4_attn_host 9 · v4_compress 7 · v4_oracle 27 · v4_loa
 v4_artifact 2 · v4_compress_probe 4        — all rc=0 at `2445645`
 ```
 
+### The compressed-layer cell — PREDICTED BEFORE MEASURING, S3-e2e, 2026-08-05
+
+The gap: `tests/v4_attn.rs` pinned `LAYER` to ratio-0, so the `io.cache` tail layout, the
+prefill persist copy, the decode slot and compressed columns reaching `sparse_attn` were
+executed by nothing, on **41 of 43 layers**. The cell added here drives toy layer 3
+(`compress_ratio == 8`, `NonOverlap`, no indexer) through `compress` → both placements →
+`attention`, against `Oracle::run_layer`.
+
+**Why the toy and not `/var/db/rivoli/v4-f4-l3-5`.** What is uncovered is *plumbing* — which
+buffer holds the compressed rows, at which offset, written when — and plumbing is
+dimension-independent. The real-weights arm would cost a V4 `LayerW` loader and the full MoE
+per step (`forward.rs:1091`: 3.4 GB of experts per layer, which is why `Oracle::compressor`
+was made `pub` rather than driven through `run_layer`), and requirement 16 already says
+toy-dim bit-exactness does not predict real-dim bit-exactness — so a real-dims number here
+would not license one either. Recorded as a scope decision, not an oversight: **this cell
+says nothing about the compressed path at `head_dim = 512`.**
+
+**Ratio-4 is deliberately not the cell**, and that is the sharpest limit. `Oracle::attention`
+selects `lw.indexer` at ratio 4 and `topk_idx` returns **score-ordered** rows, while
+`v4_topk_idxs` returns them positionally. Same set below 2052 positions, different fold
+order through `sparse_attn`'s softmax — so every disagreement on a ratio-4 cell would be
+uninterpretable, which is §"The pre-indexer shortcut is narrower than it sounds" arriving at
+its consequence. `attention` branches on neither the ratio nor `has_indexer`, only on
+`Sel::shape`'s `n_comp`, so the plumbing under test is the same on both classes; the
+**arithmetic** at ratio 4 is not covered.
+
+**Stated before the hardware ran, so it cannot be fitted afterwards:**
+
+| | predicted |
+|---|---|
+| ratio-0 cell after the harness refactor | unchanged, floor **0** — no arithmetic moved |
+| `q`, `kv_entry` on the compressed layer | **bit-identical** |
+| `compressed` (the pooled blocks, read back from where `sparse_attn` indexed them) | **bit-identical** |
+| `attn_derot`, `attn_out` | **bit-identical**, floor **0** |
+| the 19-defect separation sweep | every entry ≥ 1000 bf16 ULP; tightest margin from a compressor defect |
+
+The reasoning, and the fallback that would falsify it: the ratio-0 cell already measures 0 at
+these dims. A compressed layer adds a fold over `ents = 8` pooling entries per feature, an
+RMSNorm over 256, and `topk` growing 8 → 9..12 columns. Tree-vs-sequential re-association is
+~1e-7 relative against a bf16 step of ~0.4%, so the expected flip count over a 256-element
+block is ~0.006. `v4_compress_kernel.rs` measured 3 of 4 cells bit-identical at **real** dims
+over 32768 elements; 256 elements is ~128x less exposure. **The one uncontrolled source is
+`expf` versus `f32::exp`** in the pooling softmax, which that suite names as a bound it cannot
+supply. If it bites, `compressed` moves by exactly one e4m3 step (**16 bf16 codes**) on a
+handful of elements — over `ULP_BUDGET = 1`, and the honest response is a recorded registry
+entry, never a widened budget.
+
+**Found before the hardware, and it corrects two shipped comments.** `src/attn.rs`'s launch
+sequence says of the QK-norm's position "The oracle cannot see this order", and
+`tests/v4_attn.rs`'s header listed it beside `KvActQuantBlock128` as one of two defects
+"invisible to these goldens". Measured device-free on the compressed layer,
+`Defect::QkNormAfterRope` moves **four** goldens on 4–13% of their elements
+(`q` rel 7.4e-3, `attn_out` rel 9.1e-3). The mathematical argument is sound — RoPE rotates
+adjacent pairs so it preserves `q.square().mean(-1)`, and a scalar commutes with a rotation —
+but `Oracle::qk_norm` computes that statistic in **bf16** (`forward.rs:768`, faithfully: it is
+bf16 in the reference), so `rs` is quantized to ~0.4% steps and the two orders land on
+different steps. It is a *rounding* difference, which
+`tests/v4_oracle.rs::qk_norm_order_is_a_rounding_difference_not_an_arithmetic_one` already
+bounds against dropping bf16 rounding entirely — it is not an *invisibility*, and the two
+exclusions were being carried as one fact. `KvActQuantBlock128` really is bit-inert here and
+is now asserted so.
+
+The generalisable part: both claims were arguments from exact arithmetic about a pipeline that
+rounds. That is the same shape as the `KvActQuantBlock128` scale-invariance derivation this
+document already records as "right in kind and wrong at the boundary" — the third time in this
+port that a first-principles equivalence has been taken for a bitwise one.
+
+**What the three reviews caught, and two of them are this document's own named failure mode.**
+
+- **A guard whose condition cannot occur, added in response to the previous review.** The
+  first round left the compressed sweep without the ratio-0 sweep's schedule-length assert;
+  the fix moved it into `reach` so neither caller could forget it. It is a **no-op**: no
+  `Defect` can change the step count, because `drive_script` pushes one `Phase` per script
+  entry unconditionally and nothing in `run_layer` is defect-conditional. Kept, re-scoped, and
+  re-worded to the condition that IS reachable — a caller pairing `refs` and `mine` from the
+  two cells' different-length scripts, which `zip` truncates silently. `moved`'s
+  presence-mismatch arms are dead for the same kind of reason (`.compressed`'s existence is a
+  pure function of `(seqlen, start_pos, ratio)`) and now say so instead of advertising
+  themselves as the instrument's strongest protection.
+- **A synthetic state sold as a production one.** `COMP_SKIP_TO` justified its deliberate gap
+  with "speculative decode advances `start_pos` by more than one and produces exactly this gap
+  in production". **Retracted.** `compress` refuses `seqlen > 1` at `start_pos > 0`, so an
+  engine accepting two speculative tokens calls it once per POSITION; a gap is a bug, not a
+  mode. The gap is still *necessary* — a block is skipped only when positions are, and the
+  decode slot `start_pos / ratio` agrees with "next free slot" on every contiguous script — but
+  what it certifies is narrower than it read. At position 31 both implementations pool a block
+  from slots last written at positions {16, 9, 10, 11, 12, 13, 14, 31} rather than 24..31, and
+  RoPE it at 24. That is a **state-machine** probe: it shows engine and oracle implement the
+  same deposit/emit/slide machine and that the block lands at the right slot, not that the
+  value is what `model.py` computes for a real sequence. The reference-faithful evidence is the
+  prefill and the contiguous decodes.
+- **A silent re-fixturing of the ratio-0 cell.** The per-layer `wo_a` seed (`…-fp8-L{layer}`)
+  changed layer 0's synthetic weights, against which `floor == 0` and the `r >= 8` separations
+  are asserted exactly and dated. One hoisted RNG under the original name restores them. The
+  same change carried a comment on the `h-{tag}` seed arguing against exactly this.
+
+**A process failure to record: a review subagent ran the GPU tests without the lock.** It was
+given Bash and not told the device was held; it ran three GPU tests plus a `cargo check`. Any
+contention in that window is explained by it. Its numbers are not adopted here — the measured
+results below are from the run under `flock` with the KFD witness taken inside it.
+
 ## S4 — benchmark, quality assessment, ranked perf work.
 
 Scoped after S2 reports. S4's quality assessment ranks on **paired dNLL from `bin/ppl`**, not
