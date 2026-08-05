@@ -66,7 +66,7 @@ use rivoli::artifact::model::V4Config as EngineV4Config;
 use rivoli::artifact::quant::e8m0;
 use rivoli::attn::{
     v4::{Dims, Fp8W, Io, Scratch, Step, Weights, attention},
-    v4_rope_table_ratio0, v4_window_topk,
+    v4_rope_table_ratio0, v4_topk_idxs, Sel,
 };
 use rivoli::backend::hip::{
     device_sync, launch_v4_act_quant, launch_v4_gemv_fp8, launch_v4_rope,
@@ -420,7 +420,7 @@ impl Gpu {
             freqs: self.freqs.ptr().cast(),
             idxs: idxs.ptr().cast(),
             idxs_shape,
-            ring: self.ring.ptr_mut().cast(),
+            cache: self.ring.ptr_mut().cast(),
             out: self.out.ptr_mut().cast(),
         }
     }
@@ -429,7 +429,7 @@ impl Gpu {
     fn step(&mut self, d: &Dims, p: &Phase) -> [Vec<f32>; 4] {
         let x = dev_f32(golden(p, "attn_norm_out"));
         let mut idx = Vec::new();
-        let shape = v4_window_topk(d.window, p.m, p.start_pos, &mut idx);
+        let shape = v4_topk_idxs(Sel { win: d.window, comp: None, seqlen: p.m, start_pos: p.start_pos }, &mut idx);
         let idxb = dev_i32(&idx);
         let io = self.io(&x, &idxb, shape);
         let step = if p.start_pos == 0 {
@@ -439,7 +439,7 @@ impl Gpu {
         };
         let s = self.scratch();
         // SAFETY: every buffer above outlives the `device_sync` on the next line.
-        unsafe { attention(d, &self.weights, &s, &io, step) }.expect("v4 attention");
+        unsafe { attention(d, None, &self.weights, &s, &io, step) }.expect("v4 attention");
         device_sync().expect("sync");
         let n = |b: &DeviceBuf, len: usize| read(b)[..len].to_vec();
         let nhd = d.n_heads * d.head_dim;
@@ -510,7 +510,7 @@ fn sparse_attn_alone_matches_the_oracle_including_the_sink() {
     let q = dev_f32(golden(p, "q"));
     let kv = dev_f32(golden(p, "kv_entry"));
     let mut idx = Vec::new();
-    let (rows, cols) = v4_window_topk(d.window, p.m, 0, &mut idx);
+    let (rows, cols) = v4_topk_idxs(Sel { win: d.window, comp: None, seqlen: p.m, start_pos: 0 }, &mut idx);
     assert_eq!(rows, p.m);
     let idxb = dev_i32(&idx);
     let mut o = dev_f32(&vec![0.0f32; p.m * d.n_heads * d.head_dim]);
@@ -669,13 +669,13 @@ fn each_in_scope_defect_is_further_away_than_the_kernels_are() {
 fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
     let Harness { d, clean, mut gpu, .. } = Harness::new();
     let p = &clean[0];
-    // A prefill of 4 against a window of 8: `v4_window_topk` returns 4 columns, and the
+    // A prefill of 4 against a window of 8: `v4_topk_idxs` returns 4 columns, and the
     // whole point is that `window` is the plausible wrong answer.
     let short = 4usize;
     assert!(short < d.window, "the collision this test needs does not exist");
     let x = dev_f32(&golden(p, "attn_norm_out")[..short * d.dim]);
     let mut idx = Vec::new();
-    let right = v4_window_topk(d.window, short, 0, &mut idx);
+    let right = v4_topk_idxs(Sel { win: d.window, comp: None, seqlen: short, start_pos: 0 }, &mut idx);
     assert_eq!(right, (short, short), "a short prefill no longer narrows its columns");
     let idxb = dev_i32(&idx);
     let mut io = Io {
@@ -683,18 +683,22 @@ fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
         freqs: gpu.freqs.ptr().cast(),
         idxs: idxb.ptr().cast(),
         idxs_shape: (short, d.window),
-        ring: gpu.ring.ptr_mut().cast(),
+        cache: gpu.ring.ptr_mut().cast(),
         out: gpu.out.ptr_mut().cast(),
     };
     let s = gpu.scratch();
     // SAFETY: buffers outlive the call; it returns before any launch.
-    let e = unsafe { attention(&d, &gpu.weights, &s, &io, Step::Prefill { seqlen: short }) }
+    let e = unsafe { attention(
+                &d,
+                None, &gpu.weights, &s, &io, Step::Prefill { seqlen: short }) }
         .expect_err("a 4-row prefill must not accept an 8-column selection");
     assert!(format!("{e}").contains("selection"), "rejected for the wrong reason: {e}");
 
     io.idxs_shape = right;
     // SAFETY: as above; this one does launch, and the sync below joins it.
-    unsafe { attention(&d, &gpu.weights, &s, &io, Step::Prefill { seqlen: short }) }
+    unsafe { attention(
+                &d,
+                None, &gpu.weights, &s, &io, Step::Prefill { seqlen: short }) }
         .expect("the correct shape must be accepted");
     device_sync().expect("sync");
 
@@ -703,17 +707,21 @@ fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
     // answer here is the narrowed prefill shape -- the exact inverse of the mistake
     // above, and it must be rejected too.
     io.idxs_shape = (1, short);
-    let e = unsafe { attention(&d, &gpu.weights, &s, &io, Step::Decode { pos: PROMPT }) }
+    let e = unsafe { attention(
+                &d,
+                None, &gpu.weights, &s, &io, Step::Decode { pos: PROMPT }) }
         .expect_err("a decode must not accept a narrowed prefill selection");
     assert!(format!("{e}").contains("selection"), "rejected for the wrong reason: {e}");
     let mut one = Vec::new();
-    let want = v4_window_topk(d.window, 1, PROMPT, &mut one);
+    let want = v4_topk_idxs(Sel { win: d.window, comp: None, seqlen: 1, start_pos: PROMPT }, &mut one);
     assert_eq!(want, (1, d.window), "decode no longer wants the full window");
     let oneb = dev_i32(&one);
     io.idxs = oneb.ptr().cast();
     io.idxs_shape = want;
     // SAFETY: as above.
-    unsafe { attention(&d, &gpu.weights, &s, &io, Step::Decode { pos: PROMPT }) }
+    unsafe { attention(
+                &d,
+                None, &gpu.weights, &s, &io, Step::Decode { pos: PROMPT }) }
         .expect("the correct decode shape must be accepted");
     device_sync().expect("sync");
 }

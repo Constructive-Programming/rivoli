@@ -530,6 +530,38 @@ a hand reading of the ISA in a comment, and this stage broke it without anything
 A check would be a grep of the compiled `.s` for fma-class instructions inside the V4 kernel
 symbols. Not built here; recorded so the next reader knows the comment is the only guard.
 
+### Separation predicted at real dims, BEFORE measuring — S3, 2026-08-05
+
+Requirement 16 says toy-dim bit-exactness does not predict bit-exactness at depth, and
+forbids building a gate on S2's `0.000e0`. Stated here so it cannot be fitted afterwards.
+
+**A ratio-0 layer, one layer, real dims.** ≥99% of elements bit-identical; the remainder at
+exactly **1 bf16 ULP**; none above 2. The reasoning: the kernels reduce in a wave/LDS tree
+and the oracle folds sequentially, so the f32 disagreement grows from ~16× more terms — but
+every stage boundary re-truncates to bf16 (eps ≈ 2^-8), so an f32 delta of ~2^-20 relative
+only survives the store when the value sits within that of a bf16 rounding boundary. If the
+measured spread exceeds 2 ULP on a ratio-0 layer, the cause is a defect and not depth, and
+that is the prediction's whole point.
+
+**A compressed layer is predicted WORSE, and for a reason that is not re-association.** Two
+sources stack on top of the above:
+
+1. `sparse_attn` folds an online softmax over the selected rows **in the order given**.
+   Below 2052 positions a pre-indexer engine iterates blocks positionally and the oracle
+   iterates them in `topk_idx`'s score order — the same set, a different fold. That is a
+   permutation of ~`n_comp` terms, not a tree-vs-sequential difference, and it moves the
+   running max as well as the sum.
+2. The compressed rows arrive through the compressor's own pooling and partial `act_quant`,
+   so they carry S2c's measured floor (three of four cells bit-identical, the fourth one
+   e4m3 boundary flip on 0.0153% of elements) before attention touches them.
+
+So: **1–4 bf16 ULP on the compressed layers, with the excess over the ratio-0 prediction
+attributable to fold ORDER rather than to depth.** The way to tell those two apart is to
+feed the engine the oracle's own `.compress_idxs` order for one run — if the spread drops
+back to the ratio-0 prediction, source 1 is confirmed and the remaining gap is source 2.
+That control run is the measurement to make first; without it a compressed-layer number
+cannot be attributed at all.
+
 ## S4 — benchmark, quality assessment, ranked perf work.
 
 Scoped after S2 reports. S4's quality assessment ranks on **paired dNLL from `bin/ppl`**, not
