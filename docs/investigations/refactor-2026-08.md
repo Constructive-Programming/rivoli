@@ -279,6 +279,22 @@ quantization question reopens; do not rewrite it.
 **Gate:** nothing references it after removal — `grep` `docs/`, `tests/`, `*.sh`, `Cargo.toml`
 — and `architecture.md:711`'s `src/bin/` inventory is updated in the same commit.
 
+> **DONE 2026-08-05. Two corrections that generalise to the other deletion tracks.**
+>
+> 1. **"no inbound refs" was false — there were seven files, one of them build-breaking.**
+>    `.github/workflows/release.yml:104` packaged the binary into every release tarball from a
+>    hand-written `for b in rivoli convert … i4_audit ppl replay` loop. It fails at
+>    `install -m755 target/release/i4_audit`, at TAG time, and is invisible to `cargo build`,
+>    `cargo clippy` and every test. **Any track deleting a `src/bin/` target must check that
+>    loop.**
+> 2. **The gate as written is unsatisfiable.** "Nothing references it" contradicts the
+>    corrected-in-place convention — closing this out *added* mentions. What was actually met:
+>    **no BUILD reference, and every surviving prose mention sits in a dated note naming the
+>    tag.** Use that wording for Tracks G and K.
+>
+> Open: the tag is **never pushed** (`git ls-remote --tags origin` has only the three
+> `archive/*`) and breaks the `archive/` convention — decide before merge, `int4-scales.md` §8.
+
 ## Track I — the shared layer-loop skeleton · ~600 · after Track 0
 
 `gpu.rs` and `v4gpu.rs` share prefill / decode / argmax / EOS / profile-summary. The merge
@@ -351,7 +367,7 @@ s4     Track 3  (tests/)         ─┐ ALONE as a pair — the safety net goes 
 | 2 ABI macro | 1,000 | **G3** per launcher |
 | F in-src tests | 1,000 | **G4** |
 | G converters | 700 | G2 |
-| H rm i4_audit | 697 | no inbound refs |
+| H rm i4_audit | 697 | ~~no inbound refs~~ **DONE 2026-08-05** — there were seven files, one build-breaking; see Track H |
 | I loop skeleton | 600 | G1 on GLM **and** V4 |
 | K format/offset | 350 | G2 + recorded break still red |
 | **total** | **~14,050** | **39%** |

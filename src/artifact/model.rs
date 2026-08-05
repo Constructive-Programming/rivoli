@@ -457,7 +457,7 @@ pub struct V4Config {
     // PRICED, and rejected on the arithmetic rather than on scope. `#[serde(flatten)]` on
     // both sides nests `ModelConfig`'s public fields, so every `cfg.n_experts` /
     // `.top_k` / `.moe_inter` / `.n_shared` becomes `cfg.moe.*` — ~100 call sites across
-    // gpu.rs, pin.rs, format.rs, convert.rs, main.rs, i4_audit.rs and the tests — to
+    // gpu.rs, pin.rs, format.rs, convert.rs, main.rs and the tests — to
     // delete FOUR LINES of serde attribute. This is a cost exemption and the tree has
     // precedent for those: `gpu.rs:20` exempts the launcher import list because a glob
     // import would cost the compile-time check that every name exists.

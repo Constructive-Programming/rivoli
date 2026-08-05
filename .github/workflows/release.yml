@@ -101,7 +101,12 @@ jobs:
           # The engine plus the offline tools, which are useless separately: you cannot run
           # rivoli without an artifact, and `convert`/`fp8_to_i4`/`add_indexer` are what
           # build one. README's conversion recipe names all three.
-          for b in rivoli convert fp8_to_i4 add_indexer i4_audit ppl replay; do
+          #
+          # Hand-maintained, not derived from `src/bin/` — so a deleted tool fails `install`
+          # at TAG time and nothing before it (that is how `i4_audit` survived here until
+          # 2026-08-05), and an added one is silently missing. `convert_v4` and `v4-oracle`
+          # are missing right now.
+          for b in rivoli convert fp8_to_i4 add_indexer ppl replay; do
             install -m755 "target/release/$b" "dist/$NAME/$b"
           done
           install -m644 README.md BUILD-INFO.txt "dist/$NAME/"

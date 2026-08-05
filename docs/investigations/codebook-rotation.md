@@ -173,6 +173,10 @@ different checkpoint, or a fine-tune that pushes layers apart. The measurement i
   > modes run. The `.i4`-as-reference fallback below is no longer needed and is kept only
   > because it remains a valid *comparative* reference if the NFS mount is unavailable.
 
+  > **AMENDED 2026-08-05: `i4_audit` was retired too** — same reason as `vq_study.rs` (this
+  > file's header note), tag `i4-audit-retired`, restore per `investigations/int4-scales.md`
+  > §8. The correction above still stands; only the instrument changed.
+
   **The constraint is bandwidth, not availability: 62 MB/s over NFS** (measured, 512 MB cold
   read). The whole set is ~2.6 hours end to end, so nothing here sweeps it. Safetensors is
   seekable and the index maps tensor → shard, so read only the experts you sample: one

@@ -132,8 +132,8 @@ looked at nothing" fails instead of passing.
 
 Tagging `vX.Y.Z` runs `.github/workflows/release.yml`, which builds `--features rocm`
 for gfx1151, runs the full test suite **on the device**, and publishes a tarball of the
-engine plus the offline tools (`convert`, `fp8_to_i4`, `add_indexer`, `i4_audit`, `ppl`,
-`replay`) with a `BUILD-INFO.txt` naming the commit, toolchain and target arch.
+engine plus the offline tools (`convert`, `fp8_to_i4`, `add_indexer`, `ppl`, `replay`) with
+a `BUILD-INFO.txt` naming the commit, toolchain and target arch.
 
 It needs a **self-hosted runner** labelled `rocm` and `gfx1151`: the ROCm toolchain does not
 fit a GitHub-hosted runner, and a binary for one GPU architecture is only worth shipping if
@@ -249,7 +249,7 @@ test that pins it — is in [`docs/reference/serving.md`](docs/reference/serving
 src/            engine — format, quant, pin (residency + streaming), gpu (forward),
                 arena/hybrid (byte-arena pool + policies), stream (io_uring),
                 asyncfetch/gpustream (async load‖compute overlap), math, model, ...
-src/bin/        convert, fp8_to_i4, add_indexer, i4_audit, ppl, replay
+src/bin/        convert, convert_v4, fp8_to_i4, add_indexer, ppl, replay, v4-oracle
 kernels/*.hip   HIP kernels (moe, mla, attn, linalg, indexer, fwd, async, vmm)
 examples/       dot_bench — per-format dot microbench (int4 vs int3-vq vs fp8, rocm);
                 moe_bench — the MoE kernels alone, same source on both backends
