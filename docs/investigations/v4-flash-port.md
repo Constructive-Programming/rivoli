@@ -1061,6 +1061,41 @@ v4_hadamard_basis 4 · v4_attn_host 9 · v4_compress 7 · v4_oracle 27 · v4_loa
 v4_artifact 2 · v4_compress_probe 4        — all rc=0 at `2445645`
 ```
 
+### Three carried notes on `compress_dst` — from S3-e2e, 2026-08-05, verified in the tree
+
+Handed over when the E2E harness and `compress_dst` turned out to be two implementations of
+one rule that had never met — the harness forked before `compress_dst` landed.
+
+1. **The prefill places at TWO destinations from ONE `compress` call**, so pointing the
+   harness at `compress_dst` needs two calls, not one: `region_base = seqlen` for the `s.kv`
+   concatenation and `region_base = window_size` for the persistent region. Those are exactly
+   `compress_offset`'s two branches (`v4compress.rs:350` — `seqlen` at prefill, `window_size`
+   at decode), so it should compose. **If it does not compose, that is a finding**: it would
+   mean `compress_dst` models the decode rule and only part of the prefill one.
+
+2. **Keep `COMP_SLOTS` when the switch happens.** The instinct will be to delete the
+   hand-spelled slot table as redundant once shipped code computes the slot. That re-creates
+   the circularity the switch is meant to escape — harness calls `compress_dst`, harness
+   asserts against `compress_dst`. Calling the shipped function *and* asserting the row
+   against the table is the strong form: the table is the only **non-circular** statement of
+   the rule in that loop.
+
+3. **`region_base` can be made unrepresentably wrong rather than merely documented.** The
+   trap exists because `kind` does not determine `region_base` — `Overlap` is *both* the
+   attention compressor and the indexer's nested one, needing `sliding_window` and **0**. But
+   what distinguishes them already exists in the file: `Geom` (`v4compress.rs:511`) carries
+   `quant: Quantize`, `PartialFp8` for the attention compressor and `HadamardFp4` for the
+   indexer's, set by whichever of `Geom::attention` / `Geom::indexer` ran. **Taking `&Geom`
+   instead of `kind` plus a loose `usize` makes the mismatch unconstructible** — the same
+   argument `Geom`'s own doc already makes about the finish algorithm. Five paragraphs of
+   warning beside a parameter that invites the error is the pattern this stage kept finding,
+   and this one has a type-level fix sitting in the same file.
+
+**Scope, because it will be read too broadly:** `compress_dst`'s own test gates the
+*function*. A harness switched onto it would gate that the *placement path uses it* and that
+the result lands where `sparse_attn` reads. Both are needed; "`compress_dst` is tested" does
+not imply the placement is covered.
+
 ### The prerequisite inventory was taken again, and it is SIX short — S3, 2026-08-05
 
 §"ALL FIVE PREREQUISITES LANDED" closed the five things the first S3 attempt found missing.
