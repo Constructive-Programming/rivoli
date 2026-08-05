@@ -1234,6 +1234,24 @@ declared covered on a green run here, and would not have been.
 | engine forgets the layer compresses (`Sel.kind` → `Plain`) | the anti-vacuity assertion | "0 compressed columns past a window half of 12, largest selection index 11" |
 | ratio-0 rope table on a compressed layer (requirement 4, in the ENGINE) | `q` at prefill | 4375/24576, rel 1.06 |
 | poison probe 2 aimed at a SELECTED block | the bit-identical arm | paraphrase: the probe reported MOVED where the table requires identical |
+| a `COMP_SLOTS` row naming a start_pos absent from the script | "a COMP_SLOTS row names a step this script skips" | — |
+| a `COMP_SLOTS` row naming an in-script step that emits nothing | "COMP_SLOTS names start_pos 14 but the reference emits no block there — the table is wrong, not the oracle" | — |
+| a stray write to a compressed row PAST the selection | "cache row 13 names no block this script emits and must never be written" | **caught by nothing else** — every numeric golden passed |
+
+**Two more dead guards were found this way, making four in this stage.** `Gpu::poke`'s bounds
+assert could not fire (its callers are gated by `base.n_comp < capacity` at the call site); it
+moved to `Gpu::cache_row`, whose rows come from a hand-written table and are bounded by
+nothing. And the first version of the unwritten-row check tested only the SKIPPED block's row
+— a placement writing a duplicate there is caught earlier by `assert_within`, because that row
+is inside the selection. Verified by injecting exactly that "belt and braces" placement: it
+died in the numeric comparison and never reached the check. Widened to every compressed row
+`COMP_SLOTS` does not name, it states something nothing else does, and a stray write to row 13
+proves it.
+
+The pattern is worth naming: **three of the four dead guards were added in response to a
+review finding.** A reviewer says "X is unchecked", the obvious check gets written, and nobody
+asks whether X was reachable. The question that catches it is the one this stage's brief
+opens with, applied to the *fix* and not only to the code under review.
 
 Each break was checked for effectiveness before its result was believed — the append break's
 patch was confirmed present in the source while the suite was green, which is what turned a
