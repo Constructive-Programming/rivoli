@@ -69,6 +69,16 @@ pub mod serve;
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
 pub mod gpu;
 
+/// DeepSeek-V4-Flash's layer loop — [`gpu`]'s counterpart, not a branch inside it.
+///
+/// **`rocm` only, and that is a decision rather than a gap.** Every launcher it drives is
+/// `crate::backend::hip`'s; `backend/vk.rs` has no `v4_*` twin, and 16 of GLM's 29 kernels are
+/// what the Vulkan port has today. Stubs here would claim a parity nothing has measured, which
+/// is `tests/kernel_coverage.rs`'s standing rule for this port — so a `--features vulkan` build
+/// has no V4 decode path at all and `main` refuses the artifact at startup.
+#[cfg(feature = "rocm")]
+pub mod v4gpu;
+
 /// Teacher-forced scoring (`--ppl`). An instrument, not an engine feature — nothing in a
 /// decode reaches it — so it is a module boundary AND a feature boundary, and the two
 /// cannot drift apart. `bin/ppl`, which does the statistics over its output, is pure host

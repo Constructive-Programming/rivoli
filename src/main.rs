@@ -408,6 +408,199 @@ fn main() -> Result<()> {
     )
 }
 
+/// The device bytes a pin may use.
+///
+/// Extracted so the GLM and V4 branches cannot drift: an over-count here comes straight out of
+/// the routed pool's share, and a budget that differed between the two architectures would look
+/// like a residency difference in every log line.
+///
+/// `--max-mem` is honoured LITERALLY — no OS reserve. The user asked for that size, so it is
+/// allowed to OOM at pin build; the auto path just leaves `OS_RESERVE` free (there is no hard
+/// footprint ceiling — the old NaN cliff was our own bug, since fixed).
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
+fn device_budget(max_mem: Option<u64>) -> Result<usize> {
+    use rivoli::artifact::config::OS_RESERVE;
+    const GIB: f64 = (1u64 << 30) as f64;
+    let (free, _total) = rivoli::memory::device::mem_info()?;
+    Ok(match max_mem {
+        Some(m) => {
+            info!(
+                "device pool budget {:.1} GiB (--max-mem, literal — no reserve; may OOM)",
+                m as f64 / GIB
+            );
+            m as usize
+        }
+        None => {
+            let cap = free.saturating_sub(OS_RESERVE as usize);
+            info!(
+                "device pool budget {:.1} GiB (auto: free {:.1} GiB − {:.0} GiB OS reserve)",
+                cap as f64 / GIB,
+                free as f64 / GIB,
+                OS_RESERVE as f64 / GIB,
+            );
+            cap
+        }
+    })
+}
+
+/// The wedge watchdog's timeout. A hung GPU join cannot be caught inside a decode loop, so a
+/// background thread aborts the process if no token lands for this long.
+///
+/// One function because both architectures spawn one, and a default that differed between them
+/// would make "the watchdog fired" mean two things. An env var rather than a flag, deliberately:
+/// it is not an instrument (it produces no measurement and changes no arithmetic) — it is a
+/// last-resort abort, and CLAUDE.md's "instruments go behind a feature AND a flag" is about the
+/// former. It predates this split and is left as it was found.
+#[cfg(any(feature = "rocm", feature = "vulkan"))]
+fn watchdog_secs() -> u64 {
+    std::env::var("RIVOLI_WATCHDOG_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60)
+}
+
+/// The DeepSeek-V4-Flash decode, which shares no engine type with GLM's.
+///
+/// A separate function rather than a `match` arm inside `main` because it forks BEFORE
+/// `ModelConfig::load` — every line of `main` after that point is `&ModelConfig`-typed, and
+/// `ModelConfig::load` refuses a V4 manifest with a message about the two architectures not sharing
+/// a decode path. That message is still correct and still reachable (`parse_config` is generic over
+/// both schemas, so any OTHER caller handed a V4 manifest gets it); what changed is that the
+/// dispatch now happens before `main` can reach it, so a user never sees it for the one case where
+/// it is no longer true.
+///
+/// **Flags this path does not have, refused rather than ignored.** `arch.rs` already carries the
+/// help policy — `Arch::DeepseekV4.hidden_flags()` hides `attn`/`sinks`/`window`/`misa_heads`,
+/// and `attn_modes()` returns `None` because V4's attention is fixed by the weights — so `--help`
+/// does not offer them. `--help` hiding a flag is not the same as the parser rejecting it, which
+/// is why the explicit forms are refused below. `arch.rs`'s own header names `resolve_attn` as a
+/// legitimate refusal site and `validate_backend` as not one, so this is the third: the branch
+/// that knows both the architecture and the flags.
+/// `attn`/`port`/`no_mtp` are passed individually rather than as `&Args`: `Config` takes
+/// ownership of four of `Args`' `String`s just above the dispatch, so `&a` is not borrowable
+/// there. The three are differently typed, so none is substitutable for another.
+#[cfg(all(feature = "rocm", not(feature = "vulkan")))]
+fn run_v4(cfg: &Config, attn: &str, port: Option<u16>, no_mtp: bool) -> Result<()> {
+    use rivoli::arch::Arch;
+    let arch = Arch::DeepseekV4;
+    let v4: rivoli::artifact::model::V4Config =
+        rivoli::artifact::model::load_config(&cfg.model)?;
+    info!(
+        "model: {} ({}) — {} layers, hidden {}, {} heads x head_dim {}, {} experts top{}, \
+         window {}, hc_mult {}, vocab {}",
+        arch.name(),
+        arch.summary(),
+        v4.n_layers,
+        v4.hidden,
+        v4.n_heads,
+        v4.head_dim,
+        v4.n_experts,
+        v4.top_k,
+        v4.sliding_window,
+        v4.hc_mult,
+        v4.vocab
+    );
+    // Every flag this branch cannot honour, refused with the reason. `--attn` is compared
+    // against the string rather than against the resolved `AttnMode`, because `resolve_attn`
+    // already turned `auto` into `dense` — a value that is meaningless here rather than wrong,
+    // and refusing it would refuse the default.
+    if attn != "auto" {
+        bail!(
+            "--attn does not apply to a {} artifact: {}. It is hidden from this artifact's \
+             --help for the same reason (arch.rs::attn_modes returns None).",
+            arch.name(),
+            arch.attn_fixed_note()
+        );
+    }
+    if cfg.mode != rivoli::artifact::config::Mode::default() {
+        bail!(
+            "--mode {} selects a GLM routed-expert format. A {} artifact carries `.f4` \
+             (fp4 e2m1 with e8m0 group scales) and there is no second format to pick.",
+            cfg.mode,
+            arch.name()
+        );
+    }
+    if port.is_some() {
+        bail!(
+            "--port is not wired for {} yet: `serve::serve` takes a `&mut GpuEngine`, which is \
+             GLM-typed. Nothing here is missing a kernel; it is a signature.",
+            arch.name()
+        );
+    }
+    // Speculative decode is OFF and cannot be turned on — say so once, the way the Vulkan
+    // downgrade does, and only when the user did not already ask for it off.
+    if !no_mtp {
+        info!(
+            "speculative decode OFF for {}: the fp4 MoE kernel refuses nrow != 1 \
+             (kernels/moe.hip:409, guard 1003 — only R = 1 is instantiated, and the 1.108x that \
+             justifies R = 2 for GLM's VQ/int4 kernels has no V4 measurement behind it), so a V4 \
+             decode is structurally single-row and a batched verify pass has no kernel.",
+            arch.name()
+        );
+    }
+    let ngen = cfg
+        .bench
+        .context("nothing to do: pass -bench <tokens> to decode")?;
+
+    let tok = rivoli::artifact::tokenizer::Tokenizer::load(&cfg.model)?;
+    let bench_prompt = cfg.prompt.as_deref().unwrap_or("The sky is blue because");
+    // **RAW, not chat-framed, and that is a gap rather than a choice.**
+    // `Tokenizer::encode_chat_turns` is a hand-port of GLM's `chat_template.jinja` down to the
+    // byte — `[gMASK] <sop> <|user|> …` — and none of those six literals exists in this
+    // tokenizer, so calling it would take its own `warn!`-and-raw-encode fallback. Doing that
+    // deliberately, with the reason, beats reaching a GLM-shaped path and being told about it in
+    // a warning that reads like a defect. The consequence is real and is the same one
+    // `encode_chat`'s doc names: outside an assistant turn, a turn-boundary EOS is unreachable,
+    // so a decode may run to `-bench` every time. V4's `chat_template.jinja` lives only in the
+    // fp8 SOURCE and `bin/convert_v4` does not copy it.
+    let prompt_ids = tok.encode(bench_prompt)?;
+    info!(
+        "tokenizer: prompt {bench_prompt:?} -> {} tokens RAW (no chat template in a .f4 \
+         artifact); eos={:?}",
+        prompt_ids.len(),
+        tok.eos
+    );
+
+    let cap = device_budget(cfg.max_mem)?;
+    let t = std::time::Instant::now();
+    let pin = rivoli::memory::pin::V4Pin::build(
+        &cfg.model,
+        &v4,
+        cap,
+        &cfg.cache_policy,
+        cfg.two_q,
+        cfg.trace.as_deref(),
+    )?;
+    info!("v4 pin built in {:.1}s", t.elapsed().as_secs_f64());
+    let mut engine = rivoli::v4gpu::V4Engine::new(pin, v4, prompt_ids.len(), ngen)?;
+    // Wedge watchdog, same as GLM's. A V4 layer streams 6 of 256 experts against GLM's 8 of 256
+    // over half as many layers, so the shared default is if anything generous here.
+    let hb = rivoli::watchdog::spawn(std::time::Duration::from_secs(watchdog_secs()))?;
+    let ids = engine.generate(&prompt_ids, ngen, &tok.eos, &mut |_: u32| {
+        hb.beat();
+        true
+    })?;
+    // The text is printed and NOT assessed. `distinct`/`longest repeated block` fire identically
+    // on a repetition loop, on spliced corruption and on prose that restates a paragraph on
+    // purpose (CLAUDE.md — they have misled three investigations here), and this loop has two
+    // NAMED deviations from the reference (the unclamped shared expert, and positional block
+    // selection on the ratio-4 layers). A degeneration verdict on top of that would be a number
+    // standing in for a gate. `tests/v4_loop.rs` is the gate.
+    info!("{bench_prompt}{}", tok.decode_all(&ids)?);
+    Ok(())
+}
+
+/// The Vulkan arm: there is no V4 decode path, and a stub would claim a parity nothing measured.
+#[cfg(all(feature = "vulkan", not(feature = "rocm")))]
+fn run_v4(_cfg: &Config, _attn: &str, _port: Option<u16>, _no_mtp: bool) -> Result<()> {
+    bail!(
+        "this is a Vulkan build and it has no DeepSeek-V4 decode path: every launcher the V4 \
+         layer loop drives is `backend::hip`'s, and `backend/vk.rs` has no v4_* twin (16 of 29 \
+         kernels are ported — docs/investigations/vulkan-port.md). Rebuild with --features rocm. \
+         Stubs are deliberately absent: they would claim a parity nothing has measured."
+    )
+}
+
 /// A build with no compute backend cannot reach this: see the stub above.
 #[cfg(any(feature = "rocm", feature = "vulkan"))]
 fn main() -> Result<()> {
@@ -484,6 +677,18 @@ fn main() -> Result<()> {
 
     if !std::path::Path::new(&cfg.model).is_dir() {
         bail!("model dir not found: {}", cfg.model);
+    }
+
+    // **Which architecture, before anything reads a dimension.** `ModelConfig::load` below
+    // hard-assumes GLM's schema and every line after it is `&ModelConfig`-typed; handed a V4
+    // manifest it refuses with a message about the two architectures not sharing a decode path,
+    // which was true and is now the wrong message. There is deliberately no `--arch` flag —
+    // `arch.rs`'s header states why: a flag naming the architecture is a flag that can disagree
+    // with the weights, and disagreeing launches the wrong attention path and produces fluent
+    // wrong text rather than crashing.
+    match rivoli::artifact::model::arch_of_artifact(&cfg.model)? {
+        rivoli::arch::Arch::GlmMoeDsa => {}
+        rivoli::arch::Arch::DeepseekV4 => return run_v4(&cfg, &a.attn, a.port, a.no_mtp),
     }
 
     // Model dimensions from the artifact's manifest.json.
@@ -602,32 +807,7 @@ fn main() -> Result<()> {
 
     #[cfg(any(feature = "rocm", feature = "vulkan"))]
     {
-        use rivoli::artifact::config::OS_RESERVE;
-        const GIB: f64 = (1u64 << 30) as f64;
-        let (free, _total) = rivoli::memory::device::mem_info()?;
-        // `--max-mem` is honoured LITERALLY — no OS reserve; the user asked for that
-        // size, so it's allowed to OOM/fail at pin build. The auto path just leaves
-        // OS_RESERVE free (there is no hard footprint ceiling — the old NaN cliff was
-        // our own bug, since fixed).
-        let cap = match cfg.max_mem {
-            Some(m) => {
-                info!(
-                    "device pool budget {:.1} GiB (--max-mem, literal — no reserve; may OOM)",
-                    m as f64 / GIB
-                );
-                m as usize
-            }
-            None => {
-                let cap = free.saturating_sub(OS_RESERVE as usize);
-                info!(
-                    "device pool budget {:.1} GiB (auto: free {:.1} GiB − {:.0} GiB OS reserve)",
-                    cap as f64 / GIB,
-                    free as f64 / GIB,
-                    OS_RESERVE as f64 / GIB,
-                );
-                cap
-            }
-        };
+        let cap = device_budget(cfg.max_mem)?;
         // dsa/misa need the resident DSA indexer placed by Pin::build.
         let want_indexer = matches!(
             cfg.attn,
@@ -660,16 +840,10 @@ fn main() -> Result<()> {
         #[cfg(feature = "pred-probe")]
         engine.set_pred_probe(a.pred_probe);
         engine.set_moe_gain(a.moe_gain);
-        // Wedge watchdog: a hung GPU join can't be caught inside the decode loop, so
-        // a background thread aborts the process if no token lands for `wd_secs`.
-        let wd_secs = std::env::var("RIVOLI_WATCHDOG_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(60);
         // Cloned rather than moved: server mode has to beat it from the accept loop too,
         // because an idle server produces no tokens and the watchdog cannot tell "waiting
         // for a request" from "wedged". See serve::serve.
-        let hb = rivoli::watchdog::spawn(std::time::Duration::from_secs(wd_secs))?;
+        let hb = rivoli::watchdog::spawn(std::time::Duration::from_secs(watchdog_secs()))?;
         engine.set_heartbeat(hb.clone());
         // --- `--ppl`: teacher-forced quality gate, not a decode -----------------------
         // Returns before `generate` because the two are mutually exclusive by design: a
