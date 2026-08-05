@@ -31,6 +31,8 @@
 //! weights so the toy's verdict is cross-checked rather than trusted.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use rivoli::v4oracle::forward::{Capture, Defect, HeadTailW, Oracle, Step};
 use rivoli::v4oracle::golden::{Diff, GoldenSet, diff, identical};
 use rivoli::v4oracle::numerics::{
@@ -999,15 +1001,85 @@ fn a_duplicate_golden_name_is_rejected() {
 
 #[test]
 fn defect_list_has_no_duplicates() {
-    // `Defect::ALL` is hand-maintained (see its doc). This catches the half of the mistake
-    // that is catchable: a variant listed twice, which would double-count its evidence in
-    // the matrix. A variant MISSING from the list is caught by nothing here -- only by
-    // `expect()`'s exhaustive match forcing the author to classify it.
+    // `Defect::ALL` is hand-maintained (see its doc). A variant listed twice would
+    // double-count its evidence in the matrix.
     let mut seen = std::collections::HashSet::new();
     for &d in Defect::ALL {
         assert!(seen.insert(d), "{d:?} appears twice in Defect::ALL");
     }
-    assert!(Defect::breakages().count() + 1 == Defect::ALL.len());
+}
+
+/// Every `Defect` variant reaches [`Defect::ALL`] — checked against the SOURCE, because
+/// nothing in the type system can.
+///
+/// **This replaces a tautology.** The line here was
+/// `assert!(Defect::breakages().count() + 1 == Defect::ALL.len())`, and `breakages()` is
+/// defined as `ALL.iter().filter(|d| *d != None)` — so it read `ALL.len() - 1 + 1 ==
+/// ALL.len()` and could not fail. It sat directly beneath a comment correctly stating that a
+/// missing variant "is caught by nothing here", which is the worst place for an assertion
+/// that cannot fire: a reader skims the `assert!` and stops.
+///
+/// The comment's fallback was `expect()`'s exhaustive match, and that backstop is REAL —
+/// verified wildcard-free, so a new variant fails to compile until it is classified. But
+/// classifying a variant in `expect()` does not put it in `ALL`, and both matrix drivers
+/// (`defect_matrix_is_bidirectional`, `every_defect_carries_both_halves_of_its_claim`)
+/// iterate `ALL`. So the residual escape is: add a variant, get the compile error, classify
+/// it, forget the list — and it silently runs in nothing, while the suite stays green and
+/// the count of defects goes UP.
+///
+/// Source-scanning rather than `match`-based on purpose: an exhaustive 51-arm match proves
+/// every `ALL` entry is a variant, which is the direction that already holds. Only the text
+/// can prove the other direction. Same instrument as `tests/docs.rs` and
+/// `arch_help_matches_the_parser`.
+#[test]
+fn every_defect_variant_reaches_the_all_list() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/v4oracle/forward.rs"),
+    )
+    .expect("read forward.rs");
+
+    let cut = |from: &str, to: &str| {
+        let a = src.find(from).unwrap_or_else(|| panic!("anchor {from:?} moved"));
+        let b = src[a..].find(to).unwrap_or_else(|| panic!("terminator {to:?} moved")) + a;
+        src[a..b].to_string()
+    };
+    // Anchored on the declarations themselves; if either is renamed this panics rather than
+    // silently comparing two empty sets, which is how this class of test goes vacuous.
+    let enum_body = cut("pub enum Defect {", "\n}");
+    let all_body = cut("pub const ALL: &'static [Defect] = &[", "\n    ];");
+
+    let variants: Vec<&str> = enum_body
+        .lines()
+        .filter_map(|l| {
+            let t = l.trim().trim_end_matches(',');
+            let plain = !t.is_empty()
+                && t.chars().next().is_some_and(char::is_uppercase)
+                && t.chars().all(|c| c.is_alphanumeric());
+            plain.then_some(t)
+        })
+        .collect();
+    assert!(
+        variants.len() > 40,
+        "parsed only {} variants — the enum's shape changed and this test just went vacuous",
+        variants.len()
+    );
+
+    let missing = common::absent(&variants, |v| {
+        all_body.contains(&format!("Defect::{v}")) || all_body.contains(&format!("{v},"))
+    });
+    assert!(
+        missing.is_empty(),
+        "{} Defect variant(s) never reach Defect::ALL, so they run in NO matrix: {missing:?}. \
+         `expect()` forced you to classify them; the list is the separate step it cannot force.",
+        missing.len()
+    );
+    assert_eq!(
+        variants.len(),
+        Defect::ALL.len(),
+        "the enum has {} variants and ALL has {} entries",
+        variants.len(),
+        Defect::ALL.len()
+    );
 }
 
 // =======================================================================================

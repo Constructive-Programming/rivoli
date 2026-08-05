@@ -509,3 +509,22 @@ pub fn probe(name: &str, n: usize, dim: usize) -> Vec<f32> {
     (0..n * dim).map(|_| bf16_decode(bf16_encode(r.unit()))).collect()
 }
 
+
+/// Names from `names` for which `present` is false — the "coverage census" shape shared by
+/// every source-scanning test here.
+///
+/// Factored 2026-08-05 because `jscpd` refused the second copy, and it was right: this idiom
+/// had reached `tests/kernel_coverage.rs` and `tests/v4_oracle.rs` independently, which is
+/// the same drift this module's header records for `assert_close` and `f16b`.
+///
+/// The caller keeps its own `assert!` and its own message. That is deliberate — the message
+/// is the whole value of a census failure (*which* names, and what the reader should do
+/// about them), and a shared message would have to be generic enough to be useless. Only the
+/// set arithmetic is common.
+pub fn absent<'a, S: AsRef<str>>(names: &'a [S], present: impl Fn(&str) -> bool) -> Vec<&'a str> {
+    names
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|n| !present(n))
+        .collect()
+}

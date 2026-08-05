@@ -32,6 +32,8 @@
 //! SAY SO, and not let a green suite imply otherwise. Recorded here so the next reader
 //! knows the boundary of the claim rather than inferring a wider one — which is exactly
 //! the inference the `bf16f` note in `common.glsl` had to be rewritten to stop.
+mod common;
+
 #![allow(clippy::expect_used)]
 
 /// Read a source file relative to the crate root.
@@ -72,10 +74,7 @@ fn every_launcher_has_an_oracle() {
     );
 
     let tests = source("tests/vk.rs");
-    let missing: Vec<&String> = launchers
-        .iter()
-        .filter(|name| !tests.contains(&format!("launch_{name}(")))
-        .collect();
+    let missing = common::absent(&launchers, |name| tests.contains(&format!("launch_{name}(")));
 
     assert!(
         missing.is_empty(),
