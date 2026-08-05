@@ -11,17 +11,20 @@
 //! bytes would carry arbitrary e8m0 scales and could make a defect look inert for reasons
 //! that have nothing to do with the model.
 
-use crate::v4oracle::forward::{CompressorW, ExpertW, HeadW, IndexerW, LayerW};
+use crate::v4oracle::forward::{CompressorW, ExpertW, HeadTailW, IndexerW, LayerW};
 use crate::v4oracle::numerics::{
     FP4_MAX, FP8_MAX, bf16_decode, bf16_encode, e2m1_encode, e4m3_encode, fast_log2_ceil,
     fast_pow2,
 };
 use crate::v4oracle::weights::{NamedRng, V4Config, WMat};
 
-/// A whole toy model: all layers plus the head.
+/// A whole toy model: all layers, plus the head tail.
+///
+/// No embedding. `Oracle::embed` is reached only from `bin/v4-oracle`, which loads the real
+/// `embed.weight`; a toy embedding matrix was built on every `model()` and read by nothing.
 pub struct ToyModel {
     pub layers: Vec<LayerW>,
-    pub head: HeadW,
+    pub head_tail: HeadTailW,
 }
 
 fn draw(name: &str, n: usize, scale: f32) -> Vec<f32> {
@@ -218,6 +221,22 @@ pub fn build(c: &V4Config) -> ToyModel {
         .collect();
     ToyModel {
         layers,
-        head: HeadW { embed: dense("embed", c.vocab_size, c.dim, 0.05) },
+        head_tail: HeadTailW {
+            // Drawn at the same scales as the per-block mHC weights above, because the head's
+            // are the same kind of parameter: `hc_head_fn` is a projection of the flattened
+            // `hc_mult * dim` row, and `hc_head_base` a per-copy bias into a sigmoid. A base
+            // drawn much wider would saturate every gate and make `HeadHcNoRsqrt` inert for a
+            // reason that has nothing to do with the model.
+            hc_head_fn: draw("hc_head_fn", c.hc_mult * c.hc_dim(), 0.05),
+            hc_head_base: draw("hc_head_base", c.hc_mult, 1.0),
+            // `[1]`, matching the checkpoint. Centred on 1.0 like the block scales so the
+            // sigmoid argument keeps the same order of magnitude as the mixes.
+            hc_head_scale: draw("hc_head_scale", 1, 0.5).iter().map(|x| 1.0 + x).collect(),
+            norm: draw("norm", c.dim, 0.3).iter().map(|x| 1.0 + x).collect(),
+            // bf16 in the checkpoint, so bf16 here: `dense` rounds. The logits GEMM is the
+            // one place in the model with no activation quantization at all, and a toy that
+            // stored f32 weights would understate the noise the real one carries.
+            lm_head: dense("head", c.vocab_size, c.dim, 0.05),
+        },
     }
 }

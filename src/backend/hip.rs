@@ -420,6 +420,28 @@ unsafe extern "C" {
         k: i32,
         stream: *mut c_void,
     ) -> i32;
+    fn rivoli_v4_embed_bf16_row(
+        w: *const u16,
+        token: i32,
+        hidden: i32,
+        hc: i32,
+        x: *mut f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn rivoli_v4_hc_head(
+        h: *const f32,
+        fnw: *const f32,
+        base: *const f32,
+        scale: *const f32,
+        pre: *mut f32,
+        y: *mut f32,
+        s: i32,
+        hc: i32,
+        dim: i32,
+        eps: f32,
+        hc_eps: f32,
+        stream: *mut c_void,
+    ) -> i32;
     fn rivoli_v4_compress_state(
         kv: *const f32,
         score: *const f32,
@@ -1777,6 +1799,65 @@ pub unsafe fn launch_v4_compress_pool_decode(
     };
     check(r, "v4_compress_pool_decode")
 }
+// --- head tail (S3) -------------------------------------------------------------------
+// Appended as one block so the merge against the other V4 stages stays reviewable.
+
+/// `Transformer.forward` 914-916: gather token `token`'s bf16 embedding row and broadcast it
+/// into `hc` copies. `x` receives `hc * hidden` f32.
+///
+/// # Safety
+/// `w` is `>= (token + 1) * hidden` live u16, `x` is `hc * hidden` writable f32, they do not
+/// alias (both are `__restrict__`), and both outlive `stream`'s completion. `stream` is a
+/// live `hipStream_t`, or null for the default stream.
+pub unsafe fn launch_v4_embed_bf16_row(
+    w: *const u16,
+    token: usize,
+    hidden: usize,
+    hc: usize,
+    x: *mut f32,
+    stream: *mut c_void,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
+    let r = unsafe {
+        rivoli_v4_embed_bf16_row(w, token as i32, hidden as i32, hc as i32, x, stream)
+    };
+    check(r, "v4_embed_bf16_row")
+}
+
+/// `Block.hc_head` (model.py:709-716): collapse `[s, hc, dim]` to `[s, dim]`, bf16-rounded.
+///
+/// Two kernels on one stream, so no host sync sits between them. `pre` is `s * hc` f32 of
+/// SCRATCH — the gate vector — and is written before it is read.
+///
+/// # Safety
+/// `h` is `s * hc * dim` live f32; `fnw` is `hc * hc * dim`; `base` is `hc`; `scale` is 1;
+/// `pre` is `s * hc` writable; `y` is `s * dim` writable. None aliases another (every kernel
+/// parameter is `__restrict__`) and all outlive `stream`'s completion. `stream` is a live
+/// `hipStream_t`, or null for the default stream.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_v4_hc_head(
+    h: *const f32,
+    fnw: *const f32,
+    base: *const f32,
+    scale: *const f32,
+    pre: *mut f32,
+    y: *mut f32,
+    s: usize,
+    hc: usize,
+    dim: usize,
+    eps: f32,
+    hc_eps: f32,
+    stream: *mut c_void,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
+    let r = unsafe {
+        rivoli_v4_hc_head(
+            h, fnw, base, scale, pre, y, s as i32, hc as i32, dim as i32, eps, hc_eps, stream,
+        )
+    };
+    check(r, "v4_hc_head")
+}
+
 // jscpd:ignore-end
 
 /// `rotate_activation` then `fp4_act_quant(·, 32, inplace=True)` over `rows` rows of `d`
