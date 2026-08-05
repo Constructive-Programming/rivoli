@@ -271,7 +271,81 @@ from the YaRN one — mixing them is `Defect::RopeNoYarn`, fluent and wrong. And
 sizing is unchecked: a scratch allocated for decode and handed a `Prefill` overruns every
 buffer.
 
+### Convergence between two reviews is not confirmation — S2b, 2026-08-05
+
+S2b committed with two of three reviews, judging the third's question already answered. It
+was wrong, and the shape of the miss is worth more than the bug.
+
+The correctness reviewer found that **`head_dim == qk_rope_head_dim`** — "rotate the whole
+head", an ordinary-looking config — builds a valid `Dims` and passes *every* check, because
+`(512 - 512).is_multiple_of(64)` is `0.is_multiple_of(64)`, which is **true**. That is the
+same `is_multiple_of`-admits-zero property the zero-extent sweep was added for, landing on
+the one extent the sweep structurally cannot reach: `head_dim - rope_head_dim` is
+**derived**, no config field holds it, and it is what `act_quant` sizes on. It surfaced as
+opaque guard code 1001 at first launch — precisely the failure the sweep exists to prevent.
+
+So the previous commit's claim that the test "proves MEMBERSHIP: every extent the kernels
+index with is in that list" was false when written. Nine extents, not eight.
+
+**The generalisable part:** ponytail and code-quality both converged on "the list is 6 of 8"
+— a *counting* error. Only the reviewer tracing execution paths found that the list itself
+was the wrong list. Two reviews agreeing reads like confirmation and is not; they can share
+a blind spot exactly as an oracle and an implementation can. Run the third.
+
 ## S3 — wire the layer loop, first decode.
+
+**Requirements banked from S2, each measured rather than supposed.** These are conditions on
+the wiring, not suggestions:
+
+*Correctness, will produce fluent wrong output if missed:*
+1. **`rmsnorm` must bf16-round its output.** V4's `RMSNorm` returns bf16; rivoli's does not.
+   Worth **7.5e-3 on a 3.1 max (0.24%)**, and supplying it host-side makes the mHC chain
+   reproduce the goldens *exactly* — so the requirement is both real and sufficient. Shared
+   with GLM, which is why no S2 agent could close it.
+2. **`compress` returns the block COUNT, not the block INDEX.** At decode the block belongs
+   at cache slot `start_pos / ratio`. A caller that appends is correct only while it never
+   skips a step — and speculation is on by default.
+3. **`score_state` must be `-inf`-initialised, `kv_state` zeroed.** After a prefill shorter
+   than `ratio`, slots the decode pool reads were never written; zeros make them live
+   entries with weight `exp(0-m)`.
+4. **`Io.freqs` cannot distinguish the ratio-0 table from the YaRN one** — it is a raw
+   pointer. Mixing them is `Defect::RopeNoYarn`: fluent and wrong.
+5. **`Geom::indexer` must land with the fp4 finish**, never before. The indexer's compressor
+   has the attention compressor's *shape* and a different *algorithm*; a `Geom` built for it
+   passes every guard and runs block-64 e4m3 where fp4 over all 128 is due.
+
+*Structural, will fault or silently corrupt:*
+6. **`Scratch` sizing is unchecked** — a decode-sized scratch handed a `Prefill` overruns
+   every buffer. A `capacity` field is three lines.
+7. **`Dims`' public fields make `from_config`'s validation bypassable** — including the
+   derived-extent check above — **and the test fixture already bypasses it.** That is the
+   path S3 will copy by default.
+8. `x`/`h` must be 16-byte aligned: unchecked, faults rather than falling back. `wexpert`,
+   `h`, `descs` are indexed by **absolute** expert id and sized `n_desc`, not `e_count`.
+   `hc_post`'s `y` must not alias `residual`. `Buffers` enforces only `scratch_rows`.
+9. **`act_quant` runs on the null stream** — S2b's launcher takes no stream argument. Must
+   be fixed before an overlapped layer loop, or the streaming design is defeated silently.
+10. `tid2eid` entries and e8m0 `0x00`/`0xff` scale bytes must be rejected **at load**; the
+    kernels cannot.
+
+*Housekeeping S3 owns because no S2 agent was permitted to:*
+11. **Lift one copy each of `f2e4m3_rne` and `fast_round_scale` into `common.hpp`** (see the
+    jscpd blind-spot note above), plus `v4_block_sum`/`v4_rbf16`. Needs `mla.hip` edits.
+12. Prefill and decode index **different spaces** (absolute positions vs ring slots) and
+    nothing in the types says so.
+13. `mod v4` is `#[cfg(feature = "rocm")]` and `vk.rs` has no counterparts, so
+    `tests/kernel_coverage.rs` does not see these launchers. Whether V4 gets a Vulkan arm is
+    S3's call; **stubs would claim a parity nothing has measured.**
+
+*Known-thin coverage S3 inherits as written, not as hoped:*
+14. The **fast-path→tail handoff in the MoE kernels is exercised by nothing** — neither
+    kernel runs both paths in one call at toy dims, while the launcher's `% 128` guard
+    admits e.g. 384, which would hit it. A real gap in shipped code.
+15. **e8m0 exercises 2 distinct codes of 254** (`119..=120`); a decode bug on any other is
+    invisible to the whole suite. Toy-fixture artifact; the real checkpoint spreads wider.
+16. **Toy-dim bit-exactness does not predict bit-exactness at depth.** At real dims there
+    are 16× the terms, f32 re-association grows and bf16 flips become likely. Do not build
+    a gate on the 0.000e0 results.
 ## S4 — benchmark, quality assessment, ranked perf work.
 
 Scoped after S2 reports. S4's quality assessment ranks on **paired dNLL from `bin/ppl`**, not
