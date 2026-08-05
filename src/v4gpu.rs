@@ -76,7 +76,7 @@
 use crate::artifact::model::V4Config;
 use crate::artifact::quant::{FP8_BLOCK, f4_expert_stride, read_f32};
 use crate::attn::{Sel, v4, v4_topk_idxs};
-use crate::backend::Stream;
+use crate::backend::{NULL_STREAM, Stream};
 use crate::backend::hip::{
     ExpertDescF4, device_sync, fill_u32, launch_act_quant_f8, launch_argmax, launch_gemv_f32,
     launch_hc_post, launch_hc_pre, launch_moe_acc_drain, launch_moe_expert_range_f4, launch_swiglu,
@@ -937,7 +937,7 @@ impl V4Engine {
         // SAFETY: every pointer above is either a pin placement outliving this engine or a
         // `DeviceBuf` field of `self`, at the shape `Buffers` documents. `compress` takes no
         // stream today (see this module's header); `_stream` is what it gets when it does.
-        let blocks = unsafe { compress(&c.geom, &b, p.seqlen, p.start_pos) }
+        let blocks = unsafe { compress(&c.geom, &b, p.seqlen, p.start_pos, NULL_STREAM) }
             .with_context(|| format!("layer {layer} compressor at {p:?}"))?;
         Ok((blocks, c.blocks.ptr()))
     }
@@ -1009,7 +1009,7 @@ impl V4Engine {
         // `s`/`io` is a `DeviceBuf` field of `self` at the size its field documents, and no two
         // are the same allocation — `xq` is attention's own scratch here, re-derived from `io.x`
         // inside `attention` before any read.
-        unsafe { v4::attention(&self.dims, sel, &w, &s, &io, step) }
+        unsafe { v4::attention(&self.dims, sel, &w, &s, &io, step, NULL_STREAM) }
             .with_context(|| format!("layer {layer} attention at ({m}, {start_pos})"))
     }
 
@@ -1284,8 +1284,8 @@ impl V4Engine {
         // outliving this engine; `g`/`u` are `max_m * inter` and `out` is `max_m * dim`, four
         // distinct allocations.
         unsafe {
-            launch_v4_gemv_fp8(xq, gate.packed, gate.scale, m, inter, dim, FP8_BLOCK, 1, g)?;
-            launch_v4_gemv_fp8(xq, up.packed, up.scale, m, inter, dim, FP8_BLOCK, 1, u)?;
+            launch_v4_gemv_fp8(xq, gate.packed, gate.scale, m, inter, dim, FP8_BLOCK, 1, g, NULL_STREAM)?;
+            launch_v4_gemv_fp8(xq, up.packed, up.scale, m, inter, dim, FP8_BLOCK, 1, u, NULL_STREAM)?;
             // See the doc above: unclamped, and the wrong silu form. One line, and one
             // contribution in seven of every layer's FFN.
             launch_swiglu(g, u, m * inter, g)?;
@@ -1295,7 +1295,9 @@ impl V4Engine {
             launch_act_quant_f8(g, m, inter, std::ptr::null_mut())?;
             // WRITES `sub` — does not accumulate into it. `MoE.forward` starts from `y = zeros`
             // and the routed drain adds on top; see `routed_experts`.
-            launch_v4_gemv_fp8(g, down.packed, down.scale, m, dim, inter, FP8_BLOCK, 1, out)?;
+            launch_v4_gemv_fp8(
+                g, down.packed, down.scale, m, dim, inter, FP8_BLOCK, 1, out, NULL_STREAM,
+            )?;
         }
         Ok(())
     }
@@ -1328,7 +1330,7 @@ impl V4Engine {
             let logits = self.gate_logits.ptr_mut().cast::<f32>();
             let x0 = xw.cast::<f32>();
             for t in 0..m {
-                launch_gemv_f32(x0.add(t * dim), gate_w, n_experts, dim, 1, logits.add(t * n_experts))?;
+                launch_gemv_f32(x0.add(t * dim), gate_w, n_experts, dim, 1, logits.add(t * n_experts), NULL_STREAM)?;
             }
             // Now quantize, for the experts. In place at block 128 over the full row, which is
             // what every quantized `Linear` in the reference performs.
@@ -1392,7 +1394,7 @@ impl V4Engine {
             // token and read the norm weight past its allocation. V4's `RMSNorm` returns bf16 and
             // this kernel rounds, which is S3 requirement 1 satisfied by SELECTION rather than by
             // editing a shared kernel.
-            launch_v4_rmsnorm(self.xw.ptr_mut().cast(), norm, m, dim, self.dims.norm_eps)?;
+            launch_v4_rmsnorm(self.xw.ptr_mut().cast(), norm, m, dim, self.dims.norm_eps, NULL_STREAM)?;
         }
         Ok(())
     }
@@ -1500,7 +1502,7 @@ impl V4Engine {
                     dim,
                     hc,
                     self.h[0].ptr_mut().cast::<f32>().add(t * hc * dim),
-                    std::ptr::null_mut(),
+                    NULL_STREAM,
                 )?;
             }
         }
@@ -1556,6 +1558,7 @@ impl V4Engine {
                 1,
                 dim,
                 self.dims.norm_eps,
+                NULL_STREAM,
             )?;
             // `head.weight` is bf16 in the artifact and there is no int8 head to reach for.
             // `launch_v4_dense_gemm_bf16` computes exactly this at `m = 1`: runtime `(m, n, k)` over
@@ -1836,8 +1839,8 @@ impl V4Engine {
         let u = self.sh_u.ptr_mut().cast::<f32>();
         // SAFETY: identical to `shared_expert`'s first two launches, on the same buffers.
         unsafe {
-            launch_v4_gemv_fp8(xq, gate.packed, gate.scale, m, inter, dim, FP8_BLOCK, 1, g)?;
-            launch_v4_gemv_fp8(xq, up.packed, up.scale, m, inter, dim, FP8_BLOCK, 1, u)?;
+            launch_v4_gemv_fp8(xq, gate.packed, gate.scale, m, inter, dim, FP8_BLOCK, 1, g, NULL_STREAM)?;
+            launch_v4_gemv_fp8(xq, up.packed, up.scale, m, inter, dim, FP8_BLOCK, 1, u, NULL_STREAM)?;
         }
         device_sync()?;
         let read = |b: &DeviceBuf| -> Result<Vec<f32>> {

@@ -1144,7 +1144,7 @@ impl<'a> GpuEngine<'a> {
                     cfg.hidden,
                     1,
                     iwp,
-                    std::ptr::null_mut(),
+                    crate::backend::NULL_STREAM,
                 )?;
             }
 
