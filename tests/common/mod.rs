@@ -13,6 +13,13 @@
 //! utility, which is more machinery than the warning is worth.
 #![allow(dead_code)]
 #![allow(clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
+
+use rivoli::v4compress::LayerKind;
+use rivoli::v4oracle::forward::CompressorW;
+use rivoli::v4oracle::numerics::{bf16_decode, bf16_encode};
+use rivoli::v4oracle::weights::{Checkpoint, NamedRng};
+use std::path::Path;
 
 /// Every file under `root` with extension `ext`, recursively. Unsorted.
 ///
@@ -349,3 +356,94 @@ impl Lcg {
         ((self.0 >> 32) as f32 / u32::MAX as f32) * 2.0 - 1.0
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// V4-Flash checkpoint scaffolding, shared by `v4_compress_probe.rs` and
+// `v4_compress_kernel.rs`
+// ---------------------------------------------------------------------------------------
+//
+// These moved here from `v4_compress_probe.rs` when the kernel test needed the same loader:
+// both drive the SAME two compressors (layer 2 at ratio 4, layer 3 at ratio 128), one
+// against the oracle alone and one against the GPU, and a second copy of `compressor_w`
+// would be a second set of shape assertions that could drift apart while both stayed green.
+// `build.rs`'s duplication gate watches `tests/`, so it would also be a build error.
+//
+// No device type appears here, which is this module's rule: `DeviceBuf` lives in the rocm
+// test file that owns it.
+
+pub const CKPT: &str = "/var/db/rivoli/deepseek-v4-flash-0731";
+/// `bin/v4-oracle`'s `PROMPT` tokenizes to 13 ids — the length every hole is keyed to.
+pub const EMIT_LEN: usize = 13;
+/// Two whole ratio-128 blocks.
+///
+/// It does NOT exercise a block-to-block state carry, which an earlier version of this
+/// comment claimed: at ratio 128 `overlap` is false and `256 % 128 == 0`, so both the
+/// `overlap && cutoff >= ratio` and the `remainder > 0` state writes are skipped and
+/// prefill pools every block independently. Two reviewers disproved the claim the same way
+/// — substitute zero-length `kv_state`/`score_state` and the output is bit-identical.
+///
+/// Two blocks still earn their keep, for the reason that survives: the blocks are RoPE'd at
+/// `freqs_cis[0:256:128]`, i.e. positions 0 and 128, so a wrong per-block rope position or
+/// unflatten stride is observable here and would be hidden by a single block (position 0,
+/// where the rotation is the identity).
+pub const PROBE_LEN: usize = 256;
+/// A ratio-128 prefill with a REMAINDER, which is the only prefill path that writes the
+/// compressor state — and the state the decode branch then reads.
+pub const PROBE_REMAINDER_LEN: usize = 300;
+/// Ratio-128 decode completes its first block here: `(start_pos + 1) % 128 == 0`.
+pub const RATIO_128_FIRST_DECODE_BLOCK: usize = 127;
+
+pub fn checkpoint() -> Option<Checkpoint> {
+    if !Path::new(CKPT).join("model.safetensors.index.json").exists() {
+        eprintln!("SKIP: no checkpoint at {CKPT}");
+        return None;
+    }
+    Some(Checkpoint::open(Path::new(CKPT)).expect("opening checkpoint"))
+}
+
+
+/// One layer's `attn.compressor.*`, at `head_dim` and `rotate` set by which compressor it is.
+///
+/// Loading these directly rather than through `bin/v4-oracle`'s `load_layer` is the whole
+/// point: `load_layer` also pulls the layer's routed experts, which is 3.4 GB per layer, and
+/// none of it is read by `Oracle::compressor`.
+pub fn compressor_w(ck: &Checkpoint, prefix: &str, ratio: usize, d: usize, rotate: bool) -> CompressorW {
+    let kind = LayerKind::from_ratio(ratio);
+    let cw = CompressorW {
+        ratio,
+        overlap: kind.overlap(),
+        d,
+        rotate,
+        ape: ck.get(&format!("{prefix}.ape")).unwrap().to_f32().unwrap(),
+        wkv: ck.dense(&format!("{prefix}.wkv.weight")).unwrap(),
+        wgate: ck.dense(&format!("{prefix}.wgate.weight")).unwrap(),
+        norm: ck.get(&format!("{prefix}.norm.weight")).unwrap().to_f32().unwrap(),
+    };
+    // The shape trap from the S2c brief, asserted rather than assumed: `ape` is
+    // [ratio, coff*d], so [4, 1024] at ratio 4 (coff 2) and [128, 512] at ratio 128 (coff 1).
+    // A loader that inferred the width from `d` alone gets 512, which is WRONG on the ratio-4
+    // attention compressor and right on ratio 128 -- an earlier version of this comment had
+    // that backwards. The error is a silent misindex, not a length mismatch, because both
+    // widths are 512-multiples.
+    assert_eq!(
+        cw.ape.len(),
+        ratio * kind.coff() * d,
+        "{prefix}: ape is [ratio, coff*d] = [{ratio}, {}]",
+        kind.coff() * d
+    );
+    // `[out, in]`, the torch `Linear` convention `Oracle::linear` reads: rows are the
+    // projection width, cols the model dim. Asserting `cols` here instead passed on L2 by
+    // coincidence of both being 4096-adjacent and is the axis mix-up worth pinning.
+    assert_eq!(cw.wkv.rows(), kind.coff() * d, "{prefix}: wkv projects TO coff*d");
+    assert_eq!(cw.wgate.rows(), kind.coff() * d, "{prefix}: wgate matches wkv");
+    assert_eq!(cw.wkv.cols(), cw.wgate.cols(), "{prefix}: both read the same model dim");
+    assert_eq!(cw.norm.len(), d, "{prefix}: norm is over head_dim, not coff*head_dim");
+    cw
+}
+
+/// A deterministic bf16 activation block, `[n, dim]`.
+pub fn probe(name: &str, n: usize, dim: usize) -> Vec<f32> {
+    let mut r = NamedRng::new(name);
+    (0..n * dim).map(|_| bf16_decode(bf16_encode(r.unit()))).collect()
+}
+
