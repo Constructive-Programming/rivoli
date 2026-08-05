@@ -339,6 +339,21 @@ __device__ __forceinline__ float dot_i4_wave(const float* __restrict__ v,
     return wave_sum(a0 + a1);
 }
 
+// One bf16 STORE: round an f32 through bf16 and back.
+//
+// V4's activations live in bf16 between operations, so every `.to(dtype)`, every
+// `RMSNorm.forward` return and every `apply_rotary_emb` copy-back is one of these. Dropping
+// one leaves values that are fluent and slightly too precise, which no magnitude check sees
+// (`v4oracle::Defect::NoBf16Rounding`).
+//
+// Here rather than per-kernel because it had been written THREE times — `mla.hip::v4_rbf16`,
+// `v4compress.hip::v4c_rbf16` and a third copy in `v4indexer.hip`, each `static` to its
+// translation unit and so unreachable from the others. `kernels/` is not watched by
+// `build.rs`'s jscpd gate, so nothing mechanical would ever have found them. `v4indexer.hip`
+// now calls this one; collapsing the other two is the plan's requirement 11 and needs
+// `mla.hip` edits no S2 agent was permitted to make.
+__device__ __forceinline__ float rbf16(float x) { return bf16f(f2bf16(x)); }
+
 // ── OCP MX FP4 (DeepSeek-V4-Flash's native routed experts) ──────────────────────
 //
 // e2m1 nibbles with ONE e8m0 (bare power-of-two) scale per F4_GROUP weights along the
@@ -554,6 +569,66 @@ __device__ __forceinline__ float act_quant_roundtrip(float x, float s) {
     float q = x / s;
     q = q < -FP8_MAX ? -FP8_MAX : (q > FP8_MAX ? FP8_MAX : q);
     return e4m3f(f2e4m3_rne(q)) * s;
+}
+
+// ── fp4 ACTIVATION quantization (`kernel.py::fp4_act_quant`, inplace=True) ──────
+//
+// The indexer's simulator, not the expert weights' codec. `dot_f4_wave_r` above DECODES
+// packed e2m1 nibbles that came off the checkpoint; this pair ENCODES an activation and
+// decodes it straight back, which is how `Indexer.forward` simulates fp4 in a bf16 tensor
+// (model.py:376 and :422 — both `q` and the indexer's compressed kv go through it).
+//
+// Three constants differ from the fp8 block above and every one is silent-wrong if it
+// drifts: the block is **32**, not 128; the ceiling is **6**, not 448; and there is no
+// `round_scale` switch — `fp4_quant_kernel` has none, so the scale is ALWAYS rounded up to
+// a power of two. Mirrors `v4oracle::numerics::fp4_act_quant_inplace`.
+#define FP4_QUANT_BLOCK 32
+#define FP4_MAX 6.0f
+#define FP4_MAX_INV (1.0f / FP4_MAX)
+// `6 * 2^-126` — the fp4 kernel's amax floor, where `act_quant`'s is 1e-4. 2^-126 is f32's
+// smallest NORMAL (`f32::from_bits(1 << 23)` in the oracle), and `6 * 2^-126` is exactly
+// `1.5 * 2^-124`, so the product is exact rather than a decimal approximation of one.
+#define FP4_QUANT_AMAX_FLOOR (FP4_MAX * 1.17549435082228750797e-38f)
+
+// f32 → e2m1 nibble, round-to-nearest-EVEN, saturating at ±6.
+//
+// COUNTS midpoints passed rather than searching for the nearest magnitude, and that is not
+// a micro-optimization — it is the correctness argument. The eight magnitudes have seven
+// midpoints, so the number passed IS the code, saturation falls out (a huge input passes
+// all seven and lands on 7), and the tie rule is one term. A nearest-neighbour search does
+// NOT saturate: `1e9 - 6.0f == 1e9` makes every candidate equidistant, the tie rule keeps
+// the first, and the encoder returns ZERO. That was a real bug in the oracle, caught by
+// `tests/v4_oracle.rs::e2m1_encode_is_nearest_ties_to_even`, and this is a transcription of
+// the fixed version — `v4oracle::numerics::e2m1_encode`.
+//
+// Ties go to the even mantissa bit, which on an ascending table means "up at an odd-indexed
+// midpoint, down at an even-indexed one": 0.25 -> 0, 0.75 -> 1.0, 1.25 -> 1.0, 1.75 -> 2.0,
+// 2.5 -> 2.0, 3.5 -> 4.0, 5.0 -> 4.0.
+//
+// NaN gives code 0 with NaN's sign bit: every comparison against a NaN is false, so nothing
+// is counted. The oracle does the same thing for the same reason. Unreachable through
+// `fp4_quant_roundtrip`, whose clamp precedes it, and stated so the two agree by argument
+// and not by luck.
+__device__ __forceinline__ unsigned int f2e2m1(float x) {
+    const float mid[7] = {0.25f, 0.75f, 1.25f, 1.75f, 2.5f, 3.5f, 5.0f};
+    float a = fabsf(x);
+    unsigned int code = 0;
+#pragma unroll
+    for (int i = 0; i < 7; ++i) code += (a > mid[i] || (a == mid[i] && (i & 1))) ? 1u : 0u;
+    return (signbit(x) ? 8u : 0u) | code;
+}
+
+// One element of a block-32 group, fused quantize-then-dequantize: the value the indexer's
+// einsum actually sees. `e2m1f` is reused rather than rewritten because DECODE is
+// unambiguous — only the ENCODE rule is a choice.
+//
+// Comparisons, NOT `fminf`/`fmaxf`, for the reason `act_quant_roundtrip` states: those
+// return the non-NaN operand and would launder a NaN into -6, where the oracle's
+// `f32::clamp` propagates it.
+__device__ __forceinline__ float fp4_quant_roundtrip(float x, float s) {
+    float q = x / s;
+    q = q < -FP4_MAX ? -FP4_MAX : (q > FP4_MAX ? FP4_MAX : q);
+    return e2m1f(f2e2m1(q)) * s;
 }
 
 #include <hip/hip_fp16.h>

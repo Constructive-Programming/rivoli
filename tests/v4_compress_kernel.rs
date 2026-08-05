@@ -26,9 +26,20 @@
 //!    defect-injected oracle must dwarf the distance to the clean one. This is S2b's
 //!    method (`tests/v4_attn.rs`) and it proves the METRIC has resolution, not that this
 //!    kernel would fail if broken in that specific way.
-//! 3. **Named inertness.** A defect that cannot fire on a cell is asserted to leave the
-//!    oracle bit-identical, so that "the kernel matched" on that cell is recorded as
-//!    proving nothing about it rather than being silently counted as coverage.
+//! 3. **Named inertness.** A defect that cannot fire on a cell is PRINTED as inert and
+//!    skipped, so "the kernel matched" there is recorded as proving nothing rather than
+//!    counted as coverage. Note what this is NOT: the sweep does not *assert* inertness, so
+//!    a defect that silently becomes inert on an unrecorded cell still passes with a printed
+//!    line. Exactly one pair is genuinely asserted, by
+//!    `the_overlap_defect_is_inert_at_ratio_128_and_live_at_ratio_4`; technique 4's
+//!    `reached[]` pass covers the 13 recorded pairs. Everything else here is a print.
+//! 4. **Recorded non-coverage, as an EXPECTED VALUE.** Where the metric provably cannot
+//!    resolve a defect, the cell is listed in [`BELOW_RESOLUTION`] (or
+//!    [`NO_YARN_BELOW_RESOLUTION`]) with its measured separation, and asserted to reproduce
+//!    that number exactly. A cell that gains resolution fires; an entry that stops being
+//!    reached fires. This replaced a bare `sep >= RESOLVABLE` that had left the suite RED
+//!    from the S2 merge until 2026-08-05, because the decision not to require those cells
+//!    lived only in a document.
 //!
 //! # What this file provably cannot detect — read this before trusting it
 //!
@@ -37,7 +48,16 @@
 //!   construction. `src/v4compress.rs`'s `jscpd:ignore` region makes the same point about
 //!   the host half and is worth reading.
 //! * **The indexer's compressor** (`rotate = true`: Hadamard + fp4 instead of the partial
-//!   fp8). Out of S2c's scope, not exercised, not claimed.
+//!   fp8). Not exercised here; it landed 2026-08-05 and is scored by
+//!   `tests/v4_indexer_kernel.rs`.
+//! * **The four `act_quant` ARGUMENT defects, at every cell**, plus `NoBf16Rounding` on the
+//!   ratio-128 cells. All 13 sit at or under one e4m3 step — see [`BELOW_RESOLUTION`]. This
+//!   suite verifies the COMPRESSOR and delegates `act_quant` to S2b's own tests.
+//! * **`Defect::RopeNoYarn` at `ratio4/decode`** — the impersonation is perfect there and
+//!   the separation from clean is 8 codes, so that cell cannot tell "wrong table" from "no
+//!   table". `RopeNoYarn` is the plan doc's S3 **requirement 4**, so state it plainly:
+//!   **this suite cannot see requirement 4 at decode.** `ratio4/prefill` separates at
+//!   31,215 and is what gates it.
 //! * **`expf` agreement.** The pooling softmax calls `expf` on device and `f32::exp` on the
 //!   host. They are not required to agree bit-for-bit and the tolerance absorbs the
 //!   difference, so a softmax that was wrong by less than that is invisible. The
@@ -646,7 +666,10 @@ fn zeroing_ape_reproduces_the_no_ape_defect_exactly() {
         let zeros = vec![0.0f32; cell.cw.ape.len()];
         let (clean, _) = cell.run(Defect::None, &script, None, None);
         let (broken, gpu) = cell.run(Defect::CompressorNoApe, &script, Some(&zeros), None);
-        assert_impersonates(name, "no-ape", &clean, &broken, &gpu, cfg.head_dim, cfg.rope_head_dim);
+        // `None`: every cell must separate on `no-ape`, and every cell does.
+        assert_impersonates(
+            name, "no-ape", &clean, &broken, &gpu, cfg.head_dim, cfg.rope_head_dim, None,
+        );
     }
 }
 
@@ -661,13 +684,136 @@ fn zeroing_ape_reproduces_the_no_ape_defect_exactly() {
 #[test]
 fn the_ratio_0_rope_table_reproduces_the_no_yarn_defect_exactly() {
     let Some((ck, cfg, list)) = cells() else { return };
+    assert_records_are_well_formed();
+    assert_no_yarn_records_are_live(&list.iter().map(|s| s.name).collect::<Vec<_>>());
     for Spec { layer, script, name } in list {
         let mut cell = Cell::load(&ck, &cfg, layer);
         let plain = cell.table(Defect::RopeNoYarn);
         assert_ne!(plain, cell.table(Defect::None), "{name}: the two tables must differ");
         let (clean, _) = cell.run(Defect::None, &script, None, None);
         let (broken, gpu) = cell.run(Defect::RopeNoYarn, &script, None, Some(&plain));
-        assert_impersonates(name, "no-yarn", &clean, &broken, &gpu, cfg.head_dim, cfg.rope_head_dim);
+        let expect = NO_YARN_BELOW_RESOLUTION.iter().find(|(c, _)| *c == name).map(|(_, s)| *s);
+        assert_impersonates(
+            name, "no-yarn", &clean, &broken, &gpu, cfg.head_dim, cfg.rope_head_dim, expect,
+        );
+    }
+}
+
+/// **Cells the metric provably cannot resolve, with the separation MEASURED on hardware.**
+///
+/// `docs/investigations/v4-flash-port.md`'s *"The compressor gate cannot resolve
+/// `act_quant`'s arguments — DECIDED 2026-08-05"* section made this decision and the decision
+/// stands: `RESOLVABLE` is NOT lowered to admit `sep=8`, because that is the
+/// budget-not-measurement move that section spent a round undoing.
+///
+/// **But the scale-invariance argument that section rests on is not universal, and this
+/// registry is the evidence.** It says `KvActQuantBlock128` is inert "for a reason no
+/// threshold can fix" — ue8m0 scales are powers of two and e4m3 is exactly scale-invariant
+/// under them. That holds at three of the four cells, where the defect is INERT and the
+/// sweep prints it as covering nothing. At `ratio4/prefill` it is **live**: `sep=16`, one
+/// e4m3 step, on 6 of 32768 elements, `want=3.5 got=3.25` — adjacent codes in the `[2,4)`
+/// binade. Scale-invariance is exact only while both scales keep every value inside the
+/// format's range; at a rounding boundary the two blockings disagree. An entry can only
+/// appear here if it was REACHED, and reaching requires `broken != clean`, so the presence
+/// of that row is itself the disproof of "at any threshold".
+///
+/// What was wrong until 2026-08-05 is that the decision lived only in prose 200 lines away in
+/// a document, while the assertion still demanded what the section had decided not to
+/// require — so the suite was RED from the S2 merge onward. The non-coverage is encoded here
+/// instead, at the assertion, with its argument in place.
+///
+/// **An EXPECTED VALUE, not a skip.** Each entry is asserted to reproduce its recorded
+/// separation exactly, so a cell that stops being unresolvable still fires; every entry must
+/// be reached, so a stale one cannot silently swallow a case that no longer occurs; and a
+/// cell absent from this list must separate. An exclusion list that quietly absorbed a future
+/// regression would be the same class of defect one level up — a guard that cannot fire.
+///
+/// **The list is broader than the plan doc's section recorded**, which tabulated three
+/// `act_quant`-argument defects at one cell. Measured across all four cells it is 13
+/// entries. Two additions that section names nowhere: `KvActQuantWholeTensor` (29 and 38),
+/// and `NoBf16Rounding` on both ratio-128 cells at `sep=16` — exactly one e4m3 step, i.e.
+/// the bf16 stores move the ratio-128 output by less than the quantizer's own grain, and
+/// that one is not an `act_quant` argument at all.
+const BELOW_RESOLUTION: &[(&str, Defect, u32)] = &[
+    ("ratio4/prefill", Defect::SkipKvActQuant, 14),
+    ("ratio4/prefill", Defect::KvActQuantWholeTensor, 29),
+    ("ratio4/prefill", Defect::KvActQuantBlock128, 16),
+    ("ratio4/prefill", Defect::KvActQuantNoRoundScale, 23),
+    ("ratio4/decode", Defect::SkipKvActQuant, 8),
+    ("ratio4/decode", Defect::KvActQuantNoRoundScale, 22),
+    ("ratio128/prefill+remainder", Defect::SkipKvActQuant, 8),
+    ("ratio128/prefill+remainder", Defect::KvActQuantWholeTensor, 38),
+    ("ratio128/prefill+remainder", Defect::KvActQuantNoRoundScale, 17),
+    ("ratio128/prefill+remainder", Defect::NoBf16Rounding, 16),
+    ("ratio128/decode", Defect::SkipKvActQuant, 8),
+    ("ratio128/decode", Defect::KvActQuantNoRoundScale, 18),
+    ("ratio128/decode", Defect::NoBf16Rounding, 16),
+];
+
+/// The `RopeNoYarn` impersonation cells that land inside the quantization floor, measured.
+///
+/// **This one is not bookkeeping.** `RopeNoYarn` is the plan doc's S3 **requirement 4** —
+/// `Io.freqs` is a raw pointer that cannot tell the ratio-0 table from the YaRN one, and
+/// mixing them is fluent wrong output. At `ratio4/decode` the impersonation is *perfect*
+/// (max=0 against the defect-injected oracle, bit-identical) and the separation from the
+/// clean oracle is only **8 codes**, half an e4m3 step: the cell cannot distinguish
+/// "consulted the wrong table" from "did not consult the table at all".
+///
+/// So the honest statement, and it is a coverage result rather than a pass: **this suite
+/// cannot see requirement 4 at RATIO-4 decode.** Not "at decode" — `ratio128/decode` is
+/// absent from this list and is still required to separate, which review caught as an
+/// over-generalization.
+///
+/// The mechanism, corrected: `ratio4/decode` is `decode_script(4, 23)`, so `Cell::run`
+/// concatenates the 3 prefill blocks with the ones completing at positions 15, 19 and 23 —
+/// six blocks spanning 0..23, and `sep` is the max over all of them. Every one of those
+/// positions is small enough that the ratio-0 and YaRN tables barely diverge. An earlier
+/// version of this comment said "one compressed block at `start_pos = 7`", which is not what
+/// the fixture runs. `ratio4/prefill` separates at 31,215 and is what actually gates the
+/// requirement; it is deliberately still required.
+const NO_YARN_BELOW_RESOLUTION: &[(&str, u32)] = &[("ratio4/decode", 8)];
+
+/// Every [`NO_YARN_BELOW_RESOLUTION`] entry names a cell this run actually visits.
+///
+/// The same anti-vacuity the sweep applies to `BELOW_RESOLUTION`, and it is here because
+/// review asked why one registry had the guard and the other did not — an asymmetry with no
+/// argument behind it. A single entry is not a reason: if `ratio4/decode` ever leaves the
+/// cell list, this record would sit there looking like considered non-coverage while naming
+/// nothing, which is precisely what the other guard exists to prevent.
+fn assert_records_are_well_formed() {
+    // EVERY recorded value must sit BELOW the floor. Without this both registries assert
+    // only `sep == want`, so an entry of 31215 would pass -- and the failure message would
+    // still print "(inside the quantization floor)", a false claim emitted by the assertion
+    // itself. That is the exclusion list absorbing a SEPARATING cell, which is the exact
+    // failure these registries are documented to prevent. Found by review; the arm was
+    // untested because no deliberate break reached it.
+    for (c, d, s) in BELOW_RESOLUTION {
+        assert!(
+            *s < RESOLVABLE,
+            "BELOW_RESOLUTION {c}/{d:?} records {s} >= {RESOLVABLE} -- a separating cell \
+             must not be recorded as non-coverage"
+        );
+    }
+    for (c, s) in NO_YARN_BELOW_RESOLUTION {
+        assert!(*s < RESOLVABLE, "NO_YARN_BELOW_RESOLUTION {c} records {s} >= {RESOLVABLE}");
+    }
+    // Duplicates make the second entry permanently unreachable, because both lookups take
+    // the FIRST match -- a guard that cannot fire, reported as a dead entry pointing at the
+    // wrong row.
+    for (i, (c, d, _)) in BELOW_RESOLUTION.iter().enumerate() {
+        assert!(
+            !BELOW_RESOLUTION[..i].iter().any(|(c2, d2, _)| c2 == c && d2 == d),
+            "BELOW_RESOLUTION has a duplicate {c}/{d:?}; the second can never be reached"
+        );
+    }
+}
+
+fn assert_no_yarn_records_are_live(cells: &[&str]) {
+    for (c, s) in NO_YARN_BELOW_RESOLUTION {
+        assert!(
+            cells.contains(c),
+            "NO_YARN_BELOW_RESOLUTION records {c} at sep={s}, but this run has no such cell"
+        );
     }
 }
 
@@ -678,6 +824,7 @@ fn the_ratio_0_rope_table_reproduces_the_no_yarn_defect_exactly() {
 /// perturbation is only known to have changed something. Without the second, a kernel that
 /// ignored the perturbed input entirely — the exact failure being hunted — would pass,
 /// because the clean and defect oracles would be close and it would match both.
+#[allow(clippy::too_many_arguments)]
 fn assert_impersonates(
     cell: &str,
     what: &str,
@@ -686,6 +833,9 @@ fn assert_impersonates(
     gpu: &[f32],
     d: usize,
     rd: usize,
+    // `None` = this cell must separate. `Some(n)` = it is recorded as landing inside the
+    // quantization floor at exactly `n` codes, and must still do so.
+    expect_sep: Option<u32>,
 ) {
     let hit = diff(broken, gpu, d, rd);
     println!("{}", hit.one_line(&format!("{cell} {what}: gpu vs defect-oracle")));
@@ -698,13 +848,25 @@ fn assert_impersonates(
         bad.join("\n  ")
     );
     let sep = gap(&format!("{cell} {what}: gpu vs CLEAN oracle"), clean, gpu, d, rd);
-    assert!(
-        sep >= RESOLVABLE,
-        "{cell}: the {what} perturbation moved the output by only {sep} codes — under \
-         {RESOLVABLE} ({} e4m3 steps) it is not distinguishable from the quantization floor, \
-         so this cell cannot see whether the input is consulted at all",
-        RESOLVABLE / E4M3_ULP
-    );
+    match expect_sep {
+        // Recorded as non-separating. Asserted as an EXACT expected value, not skipped: if
+        // this cell ever gains resolution the record is stale and must be revisited, and a
+        // silent skip would let that pass as coverage it is not.
+        Some(want) => assert_eq!(
+            sep, want,
+            "{cell}: the {what} separation is RECORDED as {want} codes (inside the {RESOLVABLE}-code \
+             quantization floor, so this cell cannot see the defect). It measured {sep}. \
+             Either the kernel changed or the fixture did -- update the {what} registry \
+             and say why in docs/investigations/v4-flash-port.md"
+        ),
+        None => assert!(
+            sep >= RESOLVABLE,
+            "{cell}: the {what} perturbation moved the output by only {sep} codes — under \
+             {RESOLVABLE} ({} e4m3 steps) it is not distinguishable from the quantization \
+             floor, so this cell cannot see whether the input is consulted at all",
+            RESOLVABLE / E4M3_ULP
+        ),
+    }
 }
 
 // =======================================================================================
@@ -734,10 +896,16 @@ fn each_in_scope_defect_is_further_from_the_gpu_than_the_clean_oracle_is() {
     // the same argument `src/v4compress.rs` makes about wildcards on domain enums — and the
     // moment a new breakage is added is exactly when someone must decide whether the
     // compressor can see it.
+    assert_records_are_well_formed();
     let in_scope: Vec<Defect> = Defect::ALL.iter().copied().filter(|d| in_compressor_scope(*d)).collect();
     assert!(in_scope.len() >= 10, "the scope filter selected almost nothing");
 
     let mut bad = Vec::new();
+    // Which `BELOW_RESOLUTION` entries this run actually reached. An exclusion list with a
+    // dead entry is the failure this test exists to not become: the entry would sit there
+    // looking like considered non-coverage while the case it names had stopped occurring —
+    // or, worse, had become INERT and been skipped by the branch above.
+    let mut reached = vec![false; BELOW_RESOLUTION.len()];
     for Spec { layer, script, name } in list {
         let mut cell = Cell::load(&ck, &cfg, layer);
         let (clean, gpu) = cell.run(Defect::None, &script, None, None);
@@ -761,10 +929,35 @@ fn each_in_scope_defect_is_further_from_the_gpu_than_the_clean_oracle_is() {
                 continue;
             }
             let sep = gap(&format!("{name} {def:?}"), &broken, &gpu, cfg.head_dim, cfg.rope_head_dim);
-            if sep < RESOLVABLE {
-                bad.push(format!("{name}/{def:?} sep={sep} < {RESOLVABLE}"));
+            let known = BELOW_RESOLUTION.iter().position(|(c, d, _)| *c == name && *d == def);
+            if let Some(i) = known {
+                reached[i] = true;
+            }
+            match known.map(|i| BELOW_RESOLUTION[i].2) {
+                // Recorded non-coverage: must reproduce its measured separation EXACTLY. A
+                // cell that gained resolution fails here rather than quietly passing, which
+                // is the whole difference between an expected value and a skip.
+                Some(want) if sep != want => bad.push(format!(
+                    "{name}/{def:?} sep={sep}, RECORDED {want} — the record is stale"
+                )),
+                Some(_) => {}
+                // Not recorded, and the metric cannot see it.
+                None if sep < RESOLVABLE => {
+                    bad.push(format!("{name}/{def:?} sep={sep} < {RESOLVABLE}, NOT RECORDED"))
+                }
+                None => {}
             }
         }
+    }
+    for (i, hit) in reached.iter().enumerate() {
+        let (c, d, s) = BELOW_RESOLUTION[i];
+        assert!(
+            hit,
+            "BELOW_RESOLUTION records {c}/{d:?} at sep={s}, but this run never measured that \
+             pair — the entry is dead and would absorb a future regression silently. Four \
+             the cell list changed or the defect became INERT there (which the branch above \
+             skips, and which is a DIFFERENT coverage statement); the defect left `in_compressor_scope`; or it is `CompressorNoApe`/`RopeNoYarn`, which this loop skips because they have their own stronger tests, making such an entry unreachable by construction."
+        );
     }
     assert!(
         bad.is_empty(),

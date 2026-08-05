@@ -293,6 +293,40 @@ Every *compressor* defect separates enormously; only the three `act_quant` **arg
 defects sit at or below the quantizer's own step, because they perturb it by less than one
 of its steps.
 
+> **CORRECTED 2026-08-05 by S2c-indexer, on hardware — the SECOND correction to this
+> section, and it should be read with the first.** The coordinator has already recorded that
+> the non-coverage is **13 cells**, not the handful this table lists, `NoBf16Rounding` at
+> `sep=16` on both ratio-128 cells included. This adds the part that correction does not
+> carry, and one detail it rounds off.
+>
+> **The scale-invariance argument below is too strong, and the data disproving it was in the
+> same output it was written from.** It says `KvActQuantBlock128` is inert "for a reason no
+> threshold can fix" — ue8m0 scales are powers of two, e4m3 is exactly scale-invariant under
+> them, so *no* gate can see it at *any* threshold. That holds at three of the four cells. At
+> `ratio4/prefill` it does not:
+>
+> ```
+> ratio4/prefill clean:              max=16  differing=5/32768
+> ratio4/prefill KvActQuantBlock128: max=16  differing=6/32768   want=3.5 got=3.25
+> ```
+>
+> Same max, **different element count** — so `broken != clean` and the defect is observable.
+> Invariance is exact only while both blockings keep every value inside e4m3's range; at a
+> rounding boundary they diverge, which is what `3.5` against `3.25` in the `[2,4)` binade is.
+>
+> **Why it survived three readings is the part worth keeping.** The claim is an argument from
+> first principles — powers of two, therefore exactly invariant — and it is *nearly* true.
+> That was enough that its author, the coordinator quoting it as settled, and S2c-indexer on
+> first pass all accepted it without checking it against a `differing=` count already on
+> screen. A derivation that is right in kind and wrong at the boundary is harder to catch than
+> a wrong number, because nobody looks.
+>
+> **The detail:** this table lists **three** `act_quant` defects. Four are measured under the
+> floor — `KvActQuantWholeTensor` (29 and 38) appears nowhere here.
+>
+> The live list is `BELOW_RESOLUTION` in `tests/v4_compress_kernel.rs`, which asserts each
+> entry's measured separation exactly. Not restated here, so the numbers have one home.
+
 **DECISION: record this as named non-coverage. Do NOT lower `RESOLVABLE`.** Lowering it to
 admit `sep=8` is the budget-not-measurement move S2c2 spent this round undoing, and it would
 buy nothing real: `KvActQuantBlock128` is inert *for a reason already in this document* —
@@ -304,6 +338,234 @@ blind spot reappearing one layer out, not a new gap.
 fixture engineered to separate RNE from half-away-from-zero, which is the property that
 actually matters. So the honest statement is that **this gate verifies the compressor and
 delegates `act_quant` to S2b's** — not that `act_quant` is unverified.
+
+> **How the RED suite shipped — the coordinator's error, recorded 2026-08-05.** I merged S2
+> having run `docs`, `invariants` and `v4_oracle` but *not* the three kernel suites, and
+> wrote "measured" in the merge commit. The full suite had already failed to complete twice
+> that session — once from a GPU contention error of mine, once from the known `gpustream`
+> hang — and the merge went ahead anyway. The rule this breaks is already in CLAUDE.md; what
+> is new is that a **green subset was read as a green suite**.
+>
+> A second error of mine sits on top of it: I then reported the failing set as "exactly the
+> cells this section rules out", having read the DECIDED table as a record of what *fails*
+> when it was a record of what had been *considered*. The measured figure is 13 cells, and it
+> is S2c-indexer's below, not mine.
+
+### The Hadamard basis order — SETTLED 2026-08-05 by S2c-indexer, and it was load-bearing
+
+S1b flagged `numerics::hadamard_rotate`'s basis order as **its single highest-risk
+inference**: `model.py:256` imports `hadamard_transform` from `fast_hadamard_transform`, the
+package is not vendored with the checkpoint, and `inference/requirements.txt` does not pin a
+version — so the order could not be read off the reference. It was resolved by reading the
+**package**, not by agreeing with the oracle:
+
+1. `fast_hadamard_transform.hadamard_transform`'s own docstring: *"Equivalent to
+   `F.linear(x, torch.tensor(scipy.linalg.hadamard(dim))) * scale`"*. The package ships that
+   equivalence as executable code (`hadamard_transform_ref`) and its test suite asserts the
+   CUDA kernel matches it **elementwise** at `dim = 128` — which is what excludes a
+   permutation, since a reordered output disagrees maximally on random input.
+2. Checked in **both** sdists that could satisfy the unpinned requirement (1.0.4.post1 and
+   1.1.0); docstring and reference body are character-identical, so the missing pin does not
+   reopen it.
+3. `scipy.linalg.hadamard` is **Sylvester's construction** — natural/Kronecker order, not
+   sequency — by its docstring and its source.
+
+The oracle was **right**. `tests/v4_hadamard_basis.rs` now pins `hadamard_rotate` to an
+explicitly-constructed Sylvester matrix bit-for-bit and carries the chain.
+
+**The part worth banking is that nothing shipped could have told us.** `hadamard_rotate` was
+patched to the sequency order — a pure permutation, still orthogonal, still symmetric — and
+the whole CPU suite re-run: `v4_oracle.rs` 27/27, `v4_compress.rs` 7/7 and
+`v4_compress_probe.rs` 4/4 **all passed**, the ranking probe included. Two reasons, and the
+second generalises past this defect:
+
+* `hadamard_is_its_own_inverse` cannot separate the candidates because **both** orderings are
+  symmetric, and symmetry is exactly the condition for involution. Now asserted.
+* **Every oracle test is self-relative.** A `Defect` arm and its baseline both run through the
+  same primitive, so an error the oracle and its own defect matrix share cancels. That is the
+  limit of comparing an implementation to an oracle, and the only way past it is to compare
+  the oracle to something that did not come from the oracle's source — the same gap
+  `v4compress.rs`'s `jscpd:ignore` region names for `freqs_cis`/`window_topk`/`compress_topk`,
+  which is **still open**.
+
+**The quantizer is what makes the basis order observable at all**, and that is the durable
+lesson: an orthogonal rotation is invisible to a dot product, so before `fp4_act_quant` there
+is nothing to be right or wrong about. The order becomes load-bearing only through *which
+coordinates share a block-32 scale*. Any future change to the fp4 blocking re-opens this
+question; a change to the rotation alone does not.
+
+It mattered. Measured in the **bf16 score** `Indexer.forward` computes, over 64 row pairs:
+before quantization the two orders are **bit-identical on all 64** (`(Hq)·(Hk) = q·k` for any
+orthogonal `H`); with `fp4_act_quant`'s block-32 grouping they differ on **56 of 64**, by a
+median **7%** and a maximum **104%** of the larger score, against a ~0.8% bf16 step. The
+whole mechanism is *which coordinates share an fp4 scale*.
+
+Two review findings from this round are worth keeping as method. The negative control
+("sequency fails the same gate") **did not call the function under test** — it compared two
+locally-built matrices to each other, and so would have stayed green under the exact defect
+it claimed to catch; all three reviews found it, and the gate and its control are now one
+test so a rename cannot separate them. And the first cut scored the impact in "bf16 ulps"
+using `|v| · 2^-8`, which is one binade wrong — 8 significand bits give a spacing of `2^-7`
+of the binade *base* — and that inflated figure had already been copied into three documents.
+Counting distinct **bf16 scores** needs no ulp arithmetic at all, and is the quantity the
+selection actually reads.
+
+### The indexer's device half — S2c-indexer, 2026-08-05. MEASURED.
+
+`kernels/v4indexer.hip` (`v4_indexer_spread`, `v4_indexer_score`), the fp4 activation
+quantizer in `common.hpp` (`f2e2m1`, `fp4_quant_roundtrip`), `Geom::indexer`, and
+`tests/v4_indexer_kernel.rs`. **8/8 on hardware, every comparison BIT-IDENTICAL:**
+
+| comparison | result |
+|---|---|
+| `indexer_spread` vs the oracle's `hadamard_rotate` + `fp4_act_quant_inplace` | **1152/1152** |
+| the same over 60 binades of block scale | **7680/7680** |
+| `indexer_score` on the checkpoint's own compressed KV | **48/48** |
+| `indexer_score` base / no-weights / no-fp4 | **20/20** each |
+
+Read the score rows narrowly. They are against a host transliteration of `model.py:425-427`,
+**not** against `Oracle::indexer`, which still carries the confirmed head-sum defect below —
+so they are an arithmetic-and-plumbing verdict, not a correctness verdict. The **spread** rows
+are against the oracle and are a real verdict.
+
+**The `contract(off)` pragma is verified in the ISA and was run RED FIRST**: 1
+`v_fmac_f32_e32` with the pragma removed, 0 with it restored. The counts and the counting
+trap that comes with them — a naive `v_fma|v_mac|v_mad` grep reports 10 against 9, because 9
+of those are pure ADDRESS arithmetic the pragma neither does nor should touch — are stated
+once, at the pragma in `kernels/v4indexer.hip`. Worth knowing elsewhere: `mla.hip`'s
+equivalent note counts "fma-class" without excluding integer MADs, so its 14 may be
+similarly inflated.
+
+**Requirement 5 is discharged.** `Geom` split into `GeomAbi` (the `repr(C)` mirror, still
+28 bytes with its layout assert) plus a `Quantize` field, and `compress` matches on it
+exhaustively with no wildcard. `Geom::indexer` refuses every `LayerKind` but `Overlap`,
+since an `Indexer` exists only at ratio 4. The hazard is that
+`Geom::attention(Overlap, index_head_dim, …)` and `Geom::indexer(Overlap, index_head_dim, …)`
+agree on **all six integers the kernel sees** — no dimension guard can separate them, which
+is why the finish is a field and not an argument.
+
+**Three findings from review that no amount of running would have surfaced sooner:**
+
+1. **FMA contraction would have broken the bit-exactness claim.** `dot += q[i]*kv[i]`
+   contracts to `v_fmac_f32` under hipcc's default `-ffp-contract=fast-honor-pragmas` — one
+   rounding per term where the host does two. Every comparison would have failed, and failed
+   *looking like a numerics bug*. `#pragma clang fp contract(off)` added, scoped to the
+   scoring kernel; `mla.hip`, `linalg.hip` and `attn.hip` already do this and mla.hip records
+   an ISA verification. **That verification has not been repeated here** — it needs the ISA
+   dump, which is a build-time step, and is the first thing to do on GO.
+2. **A guard called unreachable was reachable.** The spread launcher's `d % 32` check was
+   commented as unreachable behind the power-of-two check; `d = 16` clears the latter and
+   fires the former. Comment corrected, case added to the test.
+3. `v4i_rbf16` would have been the **third** copy of `bf16f(f2bf16(x))`. Lifted to
+   `common.hpp::rbf16` instead — three copies down to two without touching `mla.hip`.
+   Requirement 11 now covers the **block-quantize loop** as well (`mla.hip::v4_act_quant`,
+   `linalg.hip`, and this file are three spellings of seed-amax → `fast_round_scale` →
+   roundtrip).
+
+**Two things this stage does NOT cover, both named rather than papered over:**
+
+* **The score chain is gated against a host transliteration of `model.py:425-427`, not
+  against `Oracle::indexer`.** The oracle computes that chain internally but exposes neither
+  the roped-and-spread `q` nor the scaled `weights`, so the kernel cannot be handed its
+  intermediates. That makes it a *second* transliteration, and a misreading shared with the
+  oracle is invisible — the same gap `v4compress.rs`'s `jscpd:ignore` region names for
+  `freqs_cis`. **Making `Oracle::linear` public would close it**, and is left to whoever owns
+  that file. The compressed KV the comparison runs on is real (`CompState::cache` after the
+  oracle's own indexer compressor).
+* **An oracle fidelity bug — CONFIRMED 2026-08-05 by the coordinator, on CPU torch.**
+  `Oracle::indexer` sums the per-head products as a bf16 RUNNING fold,
+  `acc = bf16(acc + bf16(dot·w))`. `torch.sum` over a bf16 tensor accumulates through
+  `acc_type` — **f32** — and rounds **once**; only the output dtype is bf16.
+  `torch bf16 .sum() == f32-accumulate-round-once` measured **True**. Blast radius is
+  `.indexer_scores` and `.compress_idxs`: line 1241 is the only running-fold site in
+  `forward.rs`.
+
+  > **CORRECTED 2026-08-05 by S2c-indexer, against the reference.** The magnitudes first
+  > recorded here (62.6% of scores disagreeing, mean signed Δ −0.0048, "a systematic downward
+  > drift ~70× larger than for signed summands") were measured on the premise that the
+  > summands are **non-negative** — "relu'd, times *positive* weights". They are not.
+  > `weights_proj` is a bare `ColumnParallelLinear` with **no activation** (model.py:400),
+  > scaled only by the positive scalar at :424, so `weights` is **signed** and
+  > `relu(dot) * weight` is signed. The summands can cancel, and no claim about the
+  > *direction* of the error survives; the quoted percentages describe a distribution the
+  > model does not have. **The fix is unaffected** — `acc_type` is a property of the
+  > reduction, not of its input — and the error still compounds rather than averaging out,
+  > which is what `tests/v4_indexer_kernel.rs::host_score_accumulates_in_f32_not_bf16` pins:
+  > 63 of 64 terms at a quarter of a bf16 ulp vanish entirely, 1.0 against 1.125.
+
+  **Not settled by the fix:** the bf16 fold pinned the summation ORDER as a side effect and an
+  f32 accumulator does not. Torch's reduction is vectorized and tree-shaped, so its partial
+  sums differ from an ascending fold and can land either side of the final rounding. The
+  kernel and its host reference agree with each other exactly; **neither is pinned to torch's
+  ordering, and nothing in this repo could tell.**
+
+  **The kernel and `tests/v4_indexer_kernel.rs::host_score` were corrected to match torch on
+  2026-08-05; the oracle's own fix is owned by whoever owns `src/v4oracle/**`.** Until it
+  lands the two disagree, and a comparison against the current indexer goldens is not
+  evidence in either direction. Note the shape: this is the SECOND instance in one stage of
+  the same root cause the Hadamard finding exposed — every oracle test is self-relative, so
+  an error the oracle shares with its own defect matrix cancels, and only a comparison
+  against something outside the oracle's own source can see it.
+
+**e8m0 (requirement 15): the premise needs correcting before the gap can be closed.** The
+indexer consumes **no e8m0 scale bytes at all** — its weights are fp8 (`wq_b`, which ships a
+`.scale`) and bf16 (`weights_proj`, `wkv`, `wgate`); there is no packed fp4 weight tensor on
+this path, so `dot_f4_wave_r`'s `e8m0f` is never called. Verified against the checkpoint
+index: layer 2 carries exactly seven `attn.indexer.*` tensors and only `wq_b` has a `.scale`.
+What this path *does* exercise is the same exponent domain through `fast_round_scale`, so
+`fp4_block_scale_covers_sixty_binades_not_two` sweeps 60 binades of block scale against the
+2 the suite reaches today. **`e8m0f`'s decode of a scale BYTE — including `0x00` and `0xff` —
+remains uncovered, and nothing on the indexer path can reach it.** Requirement 10 is still
+the only thing that will.
+
+### `v4_compress_kernel` was RED from the S2 merge — fixed 2026-08-05 by S2c-indexer
+
+Reproduced at `ae2dd33` before touching anything: **6 passed, 2 failed, exit 101**. Both
+failures were bookkeeping in the sense that no kernel was wrong, and neither was bookkeeping
+in what it revealed.
+
+**1. A decision written into prose but not into the assertion.**
+`each_in_scope_defect_is_further_from_the_gpu_than_the_clean_oracle_is` demanded
+`sep >= RESOLVABLE` on cells the *"compressor gate cannot resolve `act_quant`'s arguments —
+DECIDED 2026-08-05"* section above had already ruled out. The decision stands and
+`RESOLVABLE` was **not** lowered — that is the budget-not-measurement move that section spent
+a round undoing. The non-coverage now lives at the assertion as `BELOW_RESOLUTION`, an
+**expected value, not a skip**: each entry must reproduce its measured separation *exactly*,
+so a cell that gains resolution fires; each entry must be *reached*, so a dead one cannot
+absorb a regression; and an unrecorded cell below the floor still fails.
+
+**The measured non-coverage is broader than that section recorded** — 13 cells, not the
+three it tabulated at one cell. Two it names nowhere: `KvActQuantWholeTensor` (29 and 38),
+and `NoBf16Rounding` at `sep=16` on **both** ratio-128 cells, which is exactly one e4m3 step
+and is not an `act_quant` argument at all. The full table is in `BELOW_RESOLUTION`; it is not
+restated here, so the number lives in one place.
+
+**And that section's scale-invariance argument is not universal.** It calls
+`KvActQuantBlock128` inert "for a reason no threshold can fix" — ue8m0 scales are powers of
+two, e4m3 is exactly scale-invariant under them. True at three of four cells. At
+`ratio4/prefill` the defect is **live**: `sep=16`, 6 of 32768 elements, `want=3.5 got=3.25`,
+adjacent codes in the `[2,4)` binade. Invariance is exact only while both blockings keep
+every value inside the format's range; at a rounding boundary they diverge. An entry reaches
+`BELOW_RESOLUTION` only if `broken != clean`, so that row is itself the disproof of "at any
+threshold".
+
+**2. A guard working correctly, and it was telling us something.**
+`the_ratio_0_rope_table_reproduces_the_no_yarn_defect_exactly` fails at `ratio4/decode` with
+a **perfect** impersonation — max=0, bit-identical against the defect-injected oracle — and a
+separation from the clean oracle of only **8 codes**, half an e4m3 step. The anti-vacuity half
+is right to reject that: the cell cannot distinguish "consulted the wrong table" from "did not
+consult the table at all".
+
+**`RopeNoYarn` is S3 requirement 4** — `Io.freqs` cannot tell the ratio-0 table from the YaRN
+one — one of the five defects here that produce fluent wrong output. So the honest record is:
+`ratio4/decode` is **non-separating at a measured sep=8, and this suite cannot see requirement
+4 at RATIO-4 decode** — not "at decode", since `ratio128/decode` is unrecorded and still
+required to separate. `ratio4/prefill` separates at **31,215** and is still required; that
+cell is what gates the requirement. Not papered into green.
+
+Every one of the four new gates was proved able to fire by deliberate break before the fix
+was committed — a changed recorded value, a removed record, a dead record, and the no-yarn
+expected value.
 
 ### Convergence between two reviews is not confirmation — S2b, 2026-08-05
 
@@ -325,6 +587,29 @@ index with is in that list" was false when written. Nine extents, not eight.
 — a *counting* error. Only the reviewer tracing execution paths found that the list itself
 was the wrong list. Two reviews agreeing reads like confirmation and is not; they can share
 a blind spot exactly as an oracle and an implementation can. Run the third.
+
+### Integration checkpoint — VERIFIED on the merged tree, 2026-08-05
+
+`c4367a9` (indexer) + `590cd65` (loading) merged into the integration branch and then
+**re-run here**, under `flock`, with the KFD witness re-checked *inside* the lock (the lock is
+advisory; a foreign holder is invisible to it alone):
+
+| suite | result |
+|---|---|
+| `v4_oracle` | 27 passed |
+| `v4_attn` | 8 passed |
+| `v4_kernel` | 17 passed |
+| `v4_compress_kernel` | 8 passed (was 6 passed / 2 failed / exit 101 at `78796eb`) |
+| `v4_indexer_kernel` | 8 passed |
+| `v4_pin` | 1 passed — union over BOTH fixtures |
+| `v4_loading` | 10 passed |
+| `invariants` / `docs` | 1 / 2 passed |
+
+**82 tests, overall rc=0**, plus union clippy at 0 findings. This is the check `78796eb` did
+not get: a green subset was written up there as a green suite, and the kernel suites were in
+fact red. The `v4_pin` row is worth reading precisely — it is one test, and it passes only if
+`all.hash && all.scored && all.indexer && all.compressor_only`, which no single fixture can
+satisfy. A machine holding only `v4-f4-l0-2` fails it rather than reporting coverage it lacks.
 
 ## S3 — wire the layer loop, first decode.
 

@@ -35,6 +35,7 @@ fn main() {
     }
     let kernels = [
         "linalg", "moe", "mla", "attn", "fwd", "vmm", "indexer", "async", "v4compress",
+        "v4indexer",
     ];
     let hipcc = std::env::var("HIPCC").unwrap_or_else(|_| "hipcc".into());
     // ponytail: default gfx1151 (Strix Halo); override for other ROCm nodes (e.g.

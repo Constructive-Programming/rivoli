@@ -16,9 +16,9 @@
 #![allow(clippy::unwrap_used)]
 
 use rivoli::v4compress::LayerKind;
-use rivoli::v4oracle::forward::CompressorW;
+use rivoli::v4oracle::forward::{CompressorW, IndexerW};
 use rivoli::v4oracle::numerics::{bf16_decode, bf16_encode};
-use rivoli::v4oracle::weights::{Checkpoint, NamedRng};
+use rivoli::v4oracle::weights::{Checkpoint, NamedRng, V4Config};
 use std::path::Path;
 
 /// Every file under `root` with extension `ext`, recursively. Unsorted.
@@ -442,6 +442,32 @@ pub fn compressor_w(ck: &Checkpoint, prefix: &str, ratio: usize, d: usize, rotat
 }
 
 /// A deterministic bf16 activation block, `[n, dim]`.
+/// One layer's `attn.indexer.*`, as [`IndexerW`].
+///
+/// Lifted here from `v4_compress_probe.rs` when `v4_indexer_kernel.rs` became a second
+/// consumer and `build.rs`'s duplication gate found the copy. The comment that moved with it
+/// is the load-bearing part: `wq_b` is fp8 on disk (it ships a `.scale`), unlike
+/// `weights_proj`, which is bare bf16 — and V4's `Indexer` has **no `wk` and no `k_norm`**.
+/// Guessing GLM's names here is what broke S1a's first convert.
+///
+/// `rotate = true` on the nested compressor: the indexer's own Hadamard-and-fp4 finish where
+/// the attention compressor partially fp8-quantizes. Same class, different arithmetic.
+pub fn indexer_w(ck: &Checkpoint, layer: usize, c: &V4Config) -> IndexerW {
+    IndexerW {
+        wq_b: ck.fp8(&format!("layers.{layer}.attn.indexer.wq_b.weight")).unwrap(),
+        weights_proj: ck
+            .dense(&format!("layers.{layer}.attn.indexer.weights_proj.weight"))
+            .unwrap(),
+        compressor: compressor_w(
+            ck,
+            &format!("layers.{layer}.attn.indexer.compressor"),
+            4,
+            c.index_head_dim,
+            true,
+        ),
+    }
+}
+
 pub fn probe(name: &str, n: usize, dim: usize) -> Vec<f32> {
     let mut r = NamedRng::new(name);
     (0..n * dim).map(|_| bf16_decode(bf16_encode(r.unit()))).collect()

@@ -305,8 +305,11 @@ fn act_quant_block_size_is_almost_invisible_under_ue8m0_scales() {
 #[test]
 fn hadamard_is_its_own_inverse() {
     // H/sqrt(n) is orthogonal and symmetric, so applying it twice is the identity. This
-    // pins the transform's SHAPE without settling its basis ORDER, which is the part that
-    // is INFERRED (see `numerics::hadamard_rotate`) and which no property here can decide.
+    // pins the transform's SHAPE without settling its basis ORDER — no property here can
+    // decide that, because every candidate order is orthogonal and symmetric and so passes
+    // this test identically. The order is settled SEPARATELY, against the package's own
+    // documented contract, in `tests/v4_hadamard_basis.rs`; it was marked INFERRED here
+    // until 2026-08-05.
     let mut r = NamedRng::new("hadamard");
     for n in [2usize, 8, 128] {
         let orig: Vec<f32> = (0..n).map(|_| r.unit()).collect();
