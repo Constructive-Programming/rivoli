@@ -32,9 +32,9 @@
 //! SAY SO, and not let a green suite imply otherwise. Recorded here so the next reader
 //! knows the boundary of the claim rather than inferring a wider one — which is exactly
 //! the inference the `bf16f` note in `common.glsl` had to be rewritten to stop.
-mod common;
-
 #![allow(clippy::expect_used)]
+
+mod common;
 
 /// Read a source file relative to the crate root.
 ///
