@@ -67,6 +67,42 @@ pub fn f16b(v: &[f32]) -> Vec<u8> {
     )
 }
 
+/// One `WMat::Dense` weight as the bf16 codes a kernel decodes with `bf16f`.
+///
+/// Asserts the round-trip is EXACT rather than assuming it. The checkpoint stores these in
+/// bf16 and `Checkpoint::dense` widens them to f32, so re-encoding must be lossless — if it
+/// ever is not, the kernel is being fed a different matrix from the oracle and every
+/// comparison downstream silently measures that instead of the arithmetic.
+///
+/// Here rather than in one test file because two suites now upload the compressor's
+/// `wkv`/`wgate` — `v4_compress_kernel.rs` at the real checkpoint and `v4_attn.rs` at the toy
+/// — and `build.rs`'s duplication gate sees a second copy.
+pub fn bf16_rows(w: &rivoli::v4oracle::weights::WMat) -> Vec<u16> {
+    let (rows, cols) = (w.rows(), w.cols());
+    let mut out = Vec::with_capacity(rows * cols);
+    let mut buf = Vec::new();
+    for r in 0..rows {
+        w.row(r, &mut buf);
+        for &v in &buf {
+            let code = rivoli::math::f32_to_bf16(v);
+            assert_eq!(
+                rivoli::math::bf16_to_f32(code),
+                v,
+                "compressor weight row {r} is not bf16-exact: the oracle and the kernel \
+                 would be reading different numbers"
+            );
+            out.push(code);
+        }
+    }
+    out
+}
+
+/// `(cos, sin)` pairs flattened to the `[pos][2*i], [pos][2*i+1]` layout every V4 rotary
+/// consumer indexes — `v4c_finish_row` on the device and `Io::freqs` in `attn::v4`.
+pub fn flat_freqs(t: &[(f32, f32)]) -> Vec<f32> {
+    t.iter().flat_map(|&(c, s)| [c, s]).collect()
+}
+
 /// Little-endian bytes → f32 vec, the inverse of [`f32b`] for readback.
 ///
 /// Delegates to the engine's own decoder rather than repeating it: an oracle that read
