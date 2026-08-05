@@ -19,12 +19,10 @@
 //
 // A NOTE ON DUPLICATION, because this file had to choose. `kernels/` is NOT watched by
 // `build.rs`'s jscpd gate (which covers `src/`, `tests/` and itself), so nothing mechanical
-// stops a kernel from re-deriving arithmetic another kernel already has. That has already
-// happened once: `common.hpp::f2e4m3_rne`/`fast_round_scale` (S2a) and
-// `mla.hip::v4_f2e4m3_rne`/`v4_round_scale` (S2b) are the same two functions written twice,
-// independently, by two agents told not to duplicate the fp4 codec and told nothing about
-// e4m3. This file adds NO format codec of its own. What it does re-spell is noted at each
-// site with what it is a copy of and why the copy exists.
+// stops a kernel from re-deriving arithmetic another kernel already has — twice over, for
+// two agents who could not see each other's work. S3 requirement 11 lifted the survivors
+// into `common.hpp`; the gate is still blind to this directory, so the hazard stands. See
+// `docs/investigations/v4-flash-port.md`, "The duplication gate cannot see `kernels/`".
 
 #include "common.hpp"
 
@@ -48,29 +46,6 @@ struct V4Comp {
     int rd;     // rope_head_dim; only the LAST rd dims of a pooled row are rotated
     float eps;  // norm_eps
 };
-
-// Block-wide sum of `v` into every thread, over `red` (caller-owned LDS of blockDim.x).
-//
-// A RE-SPELLING of `mla.hip::v4_block_sum`, which is `static` to that translation unit and
-// so unreachable from here. Six lines and no format arithmetic, but it is a genuine copy
-// and the right fix is to lift ONE of them into `common.hpp` — recorded in the S2c report
-// rather than done here, because `common.hpp` has two other owners mid-flight.
-//
-// RE-ASSOCIATED relative to the oracle's sequential fold, deliberately and unavoidably.
-// This is the floor under every tolerance in `tests/v4_compress_kernel.rs`.
-__device__ __forceinline__ float v4c_block_sum(float v, float* red) {
-    red[threadIdx.x] = v;
-    __syncthreads();
-    for (int o = blockDim.x >> 1; o > 0; o >>= 1) {
-        if (threadIdx.x < o) red[threadIdx.x] += red[threadIdx.x + o];
-        __syncthreads();
-    }
-    float t = red[0];
-    __syncthreads();
-    return t;
-}
-
-__device__ __forceinline__ float v4c_rbf16(float x) { return bf16f(f2bf16(x)); }
 
 // What `v4c_finish_row` reads and writes. The three travel together because they must AGREE
 // with each other, and nothing in a flat argument list makes them:
@@ -199,7 +174,7 @@ __device__ __forceinline__ void v4c_pool_row(const float* const* kvp, const floa
 // be one launch per compressed block — 512 launches for a 2048-token prefill at ratio 4.
 __device__ __forceinline__ void v4c_finish_row(float* __restrict__ row, V4Fin f, int pos,
                                                V4Comp p, float* red) {
-    for (int e = threadIdx.x; e < p.d; e += blockDim.x) row[e] = v4c_rbf16(row[e]);
+    for (int e = threadIdx.x; e < p.d; e += blockDim.x) row[e] = rbf16(row[e]);
     __syncthreads();
 
     float part = 0.0f;
@@ -208,9 +183,9 @@ __device__ __forceinline__ void v4c_finish_row(float* __restrict__ row, V4Fin f,
     // gfx1151 and the oracle computes `(var + eps).sqrt().recip()`. The difference is a
     // single factor applied to every dim of the row, so it survives the bf16 rounding that
     // follows and does not average out.
-    float rs = 1.0f / sqrtf(v4c_block_sum(part, red) / (float)p.d + p.eps);
+    float rs = 1.0f / sqrtf(block_sum_lds(part, red) / (float)p.d + p.eps);
     for (int e = threadIdx.x; e < p.d; e += blockDim.x) {
-        row[e] = v4c_rbf16(f.norm[e] * (row[e] * rs));
+        row[e] = rbf16(f.norm[e] * (row[e] * rs));
     }
     __syncthreads();
 
@@ -223,7 +198,7 @@ __device__ __forceinline__ void v4c_finish_row(float* __restrict__ row, V4Fin f,
         seg[2 * i + 1] = a * s + b * c;
     }
     __syncthreads();
-    for (int e = threadIdx.x; e < p.d; e += blockDim.x) row[e] = v4c_rbf16(row[e]);
+    for (int e = threadIdx.x; e < p.d; e += blockDim.x) row[e] = rbf16(row[e]);
 }
 
 // The state deposit — ONE kernel for both phases, because they are one operation.

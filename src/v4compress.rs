@@ -703,6 +703,37 @@ mod device {
     /// a different stream from the four before it. S3 should give that launcher a stream
     /// before wiring this into an overlapped layer loop.
     ///
+    /// # The caller must place `out` at BOTH destinations at prefill
+    ///
+    /// `Compressor.forward` does two writes, and only one of them is `out`. It assigns
+    /// `self.kv_cache[:, :seqlen // ratio]` — the PERSISTENT compressed region, which every
+    /// later decode step selects by position — **and** returns the same blocks for
+    /// `Attention.forward` to `torch.cat` onto the prompt's KV for THIS step's attention.
+    ///
+    /// So at prefill a caller must land these blocks at `s.kv + seqlen * head_dim` (the
+    /// concatenation `attn::v4::attention` reads now) and COPY them to
+    /// `cache + window_size * head_dim` (what the next decode reads).
+    ///
+    /// **A device copy after ONE call — never a second call.** [`Finish`] carries a single
+    /// `out`, so "write both destinations" reads like two invocations; it is not. Every
+    /// path here runs [`launch_v4_compress_state`] before the emit decision, and that is a
+    /// read-modify-write of `kv_state`/`score_state` (the decode path also slides the
+    /// window). A second call re-deposits the same rows into the pooling state and slides
+    /// again — finite, plausible, wrong, and it corrupts exactly the state S3 requirement 3
+    /// is about. At decode the single
+    /// block goes to `cache + (window_size + start_pos / ratio) * head_dim` — the slot
+    /// `start_pos / ratio`, NOT "the next free one": a caller that appends is right only
+    /// until it skips a step, and speculative decode skips steps by construction.
+    ///
+    /// **`attention` does neither, deliberately** — it only reads those rows. Omitting the
+    /// persistent write is silent and one phase delayed: the prefill attends correctly and
+    /// the first decode step then reads an unwritten compressed region. Nothing in the tree
+    /// zeroes that allocation and `hipMalloc` does not, so the reading is either garbage (a
+    /// loud NaN blow-up) or — if some future allocator zeroes it — silent, because zeros are
+    /// live entries at weight `exp(0 - max)` rather than absent ones. Recorded
+    /// here rather than at the reading end because nobody editing this function greps
+    /// `attn.rs`.
+    ///
     /// # Safety
     /// Every pointer in `b` must satisfy the shape contract on its field and outlive the
     /// call; this function synchronizes nothing.

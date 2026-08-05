@@ -263,76 +263,23 @@ extern "C" int rivoli_mla_value_fp8(
 // `a*c - b*s` emits 4 `v_mul_f32` and ZERO fma-class instructions, while
 // `mla_absorb_fp8` above — same file, same flags, outside this pragma — emits 14. A
 // pragma in the wrong place would have been invisible otherwise, since the wrong answer
-// is still a plausible float. (Counts elsewhere in this section are NOT evidence of
-// contraction: `1.0f/sqrtf(x)` lowers to `v_rcp` plus FMA Newton steps, which is the
-// divide's own implementation and not a fusion of anything written here.)
+// is still a plausible float.
+//
+// **"fma-class" here means `v_fma_f32` and `v_fmac_f32` ONLY** — float FMAs, the thing
+// `contract(off)` governs. Re-measured 2026-08-05 and both numbers stand, but the
+// distinction was not stated and it matters: a `v_fma|v_mac|v_mad` grep reports 1 for
+// `v4_rope` and 32 for `mla_absorb_fp8`, because `v_mad_u64_u32`/`v_mad_i64_i32` are
+// ADDRESS arithmetic that contraction neither does nor should touch. On a kernel with
+// nine of those, a genuine one-instruction regression is a 10% move in a number nobody
+// looks twice at — found by the indexer agent on `v4_indexer_score`, where the pragma
+// moved 1 `v_fmac_f32` to 0 while the naive count read 10 → 9. Count narrowly, and
+// compare a DELTA rather than an absolute.
+//
+// (Counts elsewhere in this section are NOT evidence of contraction: `1.0f/sqrtf(x)`
+// lowers to `v_rcp` plus FMA Newton steps, which is the divide's own implementation and
+// not a fusion of anything written here.)
 #pragma clang fp contract(off)
 
-// bf16 round-trip in f32. Activations stay f32 on device and hold bf16-representable
-// values, which is exactly what `Oracle::round_bf16` does to an `f32` Vec — the
-// reference stores bf16 at every point marked below, and matching WHERE it rounds is
-// what makes the goldens comparable at all.
-__device__ __forceinline__ float v4_rbf16(float x) { return bf16f(f2bf16(x)); }
-
-// f32 → e4m3, round-to-nearest-EVEN including the subnormal range.
-//
-// NOT `fwd.hip::f2e4m3`, and the difference is load-bearing. That one mirrors
-// `math.rs::f32_to_e4m3`, which rounds subnormals HALF-AWAY-FROM-ZERO (`.round()`);
-// V4 was trained against CUDA's `cvt.rn.satfinite.e4m3x2.f32`, which is RNE, and
-// `src/v4oracle/numerics.rs::e4m3_encode` models RNE for that reason. The two disagree
-// on exact halfway subnormals only — including `|x| == 2^-10`, where rivoli's rule
-// returns 2^-9 and V4's returns 0. `act_quant`'s power-of-two scale puts a block's
-// largest element in [224, 448], so an element reaches the subnormal range only ~2^15
-// below its block's peak: rare, real, and invisible to any tolerance. Copying the two
-// mantissa branches was preferred over generalising `fwd.hip`'s, which is on the GLM
-// decode path and must keep rivoli's rule.
-__device__ __forceinline__ unsigned char v4_f2e4m3_rne(float x) {
-    if (isnan(x)) return 0x7f;
-    unsigned char sign = signbit(x) ? 0x80 : 0;
-    float a = fabsf(x);
-    if (a >= 464.0f) return sign | 0x7e;       // midpoint to the absent next code
-    if (a <= 0.0009765625f) return sign;       // <= 2^-10: tie goes to 0 (even mantissa)
-    unsigned int bits;
-    __builtin_memcpy(&bits, &a, sizeof(bits));
-    int e = (int)((bits >> 23) & 0xffu) - 127;
-    if (e < -6) {
-        float scaled = a * 512.0f;             // subnormal quantum is 2^-9
-        float m = floorf(scaled);
-        float rem = scaled - m;
-        if (rem > 0.5f || (rem == 0.5f && ((unsigned int)m & 1u))) m += 1.0f;
-        unsigned int mi = (unsigned int)m;
-        return mi >= 8u ? (sign | 0x08) : (sign | (unsigned char)mi);
-    }
-    unsigned int mant = bits & 0x007fffffu;
-    unsigned int m3 = mant >> 20;
-    unsigned int rem = mant & 0x000fffffu;
-    if (rem > 0x00080000u || (rem == 0x00080000u && (m3 & 1u))) m3 += 1;
-    int exp = e + 7;
-    if (m3 == 8u) { m3 = 0; exp += 1; }
-    // DEAD, in this and in `numerics.rs::e4m3_encode` alike: the `a >= 464` return above
-    // bounds `e <= 8`, so `exp <= 15`, and at `e == 8` the fraction is in [1, 1.8125)
-    // which gives `m3 <= 6` with no round-up — so `exp == 15` only ever arrives via the
-    // carry, which sets `m3 = 0`. Kept because this function's value is being a
-    // statement-for-statement mirror; deleting one arm would make the two stop reading
-    // as the same function.
-    if (exp >= 15 && m3 >= 7u) return sign | 0x7e;
-    return sign | ((unsigned char)exp << 3) | (unsigned char)m3;
-}
-
-// `kernel.py::fast_round_scale(amax, 1/448)` — 2^ceil(log2(amax/448)) by IEEE-754 bit
-// surgery, NOT `log2f`/`ceilf`. The reference does the bit surgery, so a libm-accurate
-// version would disagree with it wherever the two disagree, and the whole point of the
-// ue8m0 scale is that it is a bare power of two.
-__device__ __forceinline__ float v4_round_scale(float amax) {
-    float t = amax * (1.0f / 448.0f);
-    unsigned int b;
-    __builtin_memcpy(&b, &t, sizeof(b));
-    int e = (int)((b >> 23) & 0xffu) - 127 + ((b & 0x007fffffu) ? 1 : 0);
-    unsigned int r = (unsigned int)(e + 127) << 23;
-    float s;
-    __builtin_memcpy(&s, &r, sizeof(s));
-    return s;
-}
 
 // `kernel.py::act_quant(x, block, scale_fmt="ue8m0", inplace=True)` — the fused
 // quantize-then-dequantize that SIMULATES fp8 inside a bf16 tensor. Two call sites with
@@ -364,34 +311,15 @@ extern "C" __global__ void v4_act_quant(float* __restrict__ x, int rows, int row
     float* seg = x + (size_t)(id / nb) * row_stride + (size_t)(id % nb) * block;
     // `T.max(amax_local[i], 1e-4)`: the floor keeps an all-zero block from producing a
     // zero scale and a division by zero. Seeding the scan with it is the same value.
-    float amax = 1e-4f;
+    float amax = ACT_QUANT_AMAX_FLOOR;
     for (int i = 0; i < block; ++i) amax = fmaxf(amax, fabsf(seg[i]));
-    float s = v4_round_scale(amax);
-    for (int i = 0; i < block; ++i) {
-        // Ternaries, NOT `fminf(fmaxf(...))`. C99's fmin/fmax return the non-NaN operand,
-        // so they would LAUNDER a NaN activation into -448 and hand the rest of the layer
-        // a finite, plausible number; Rust's `f32::clamp`, which the oracle uses,
-        // propagates it. A comparison against NaN is false, so NaN falls through both
-        // branches here, `v4_f2e4m3_rne` maps it to 0x7f and `e4m3f` gives NaN back —
-        // matching the oracle and keeping an upstream failure visible.
-        float t = seg[i] / s;
-        t = t > 448.0f ? 448.0f : (t < -448.0f ? -448.0f : t);
-        seg[i] = e4m3f(v4_f2e4m3_rne(t)) * s;
-    }
-}
-
-// Block-wide sum of `v` into every thread. `red` is caller-owned LDS of `blockDim.x`
-// floats; on return every thread holds the total. RE-ASSOCIATED relative to the
-// oracle's sequential fold — this is the one place these kernels knowingly diverge, and
-// it is the floor any tolerance built on the goldens has to clear.
-__device__ __forceinline__ float v4_block_sum(float v, float* red) {
-    red[threadIdx.x] = v;
-    __syncthreads();
-    for (int o = blockDim.x >> 1; o > 0; o >>= 1) {
-        if ((int)threadIdx.x < o) red[threadIdx.x] += red[threadIdx.x + o];
-        __syncthreads();
-    }
-    return red[0];
+    float s = fast_round_scale(amax, FP8_MAX_INV);
+    // `act_quant_roundtrip`, not a local clamp-and-encode. This loop body WAS a fourth
+    // hand copy of `common.hpp`'s — the same divide, the same deliberate ternaries (which
+    // exist so a NaN PROPAGATES rather than being laundered into -448 by `fminf`/`fmaxf`),
+    // the same encode — sitting eight lines under a note claiming the duplication was
+    // lifted. Found by review, 2026-08-05.
+    for (int i = 0; i < block; ++i) seg[i] = act_quant_roundtrip(seg[i], s);
 }
 
 // `RMSNorm.forward` (model.py:197-202) — `q_norm` and `kv_norm`. FP32 internals: the
@@ -409,8 +337,8 @@ extern "C" __global__ void v4_rmsnorm(float* __restrict__ x, const float* __rest
     float* row = x + (size_t)blockIdx.x * d;
     float p = 0.0f;
     for (int i = threadIdx.x; i < d; i += blockDim.x) p += row[i] * row[i];
-    float rs = 1.0f / sqrtf(v4_block_sum(p, red) / (float)d + eps);
-    for (int i = threadIdx.x; i < d; i += blockDim.x) row[i] = v4_rbf16(w[i] * (row[i] * rs));
+    float rs = 1.0f / sqrtf(block_sum_lds(p, red) / (float)d + eps);
+    for (int i = threadIdx.x; i < d; i += blockDim.x) row[i] = rbf16(w[i] * (row[i] * rs));
 }
 
 // The QK-norm, model.py:504: `q *= rsqrt(q.square().mean(-1) + eps)` over `head_dim`,
@@ -442,10 +370,10 @@ extern "C" __global__ void v4_qk_norm(float* __restrict__ q, int d, float eps) {
     float p = 0.0f;
     // Per-element squares are bf16; the accumulator is f32 (the inference above). The
     // round-trip also blocks FMA contraction of the square into the accumulate.
-    for (int i = threadIdx.x; i < d; i += blockDim.x) p += v4_rbf16(row[i] * row[i]);
-    float var = v4_rbf16(v4_block_sum(p, red) / (float)d);
-    float rs = v4_rbf16(1.0f / sqrtf(v4_rbf16(var + eps)));
-    for (int i = threadIdx.x; i < d; i += blockDim.x) row[i] = v4_rbf16(row[i] * rs);
+    for (int i = threadIdx.x; i < d; i += blockDim.x) p += rbf16(row[i] * row[i]);
+    float var = rbf16(block_sum_lds(p, red) / (float)d);
+    float rs = rbf16(1.0f / sqrtf(rbf16(var + eps)));
+    for (int i = threadIdx.x; i < d; i += blockDim.x) row[i] = rbf16(row[i] * rs);
 }
 
 // `apply_rotary_emb` (model.py:238-250) over the LAST `rd` dims of each row.
@@ -486,7 +414,7 @@ extern "C" __global__ void v4_rope(float* __restrict__ x, const float* __restric
         seg[2 * i + 1] = a * s + b * c;
     }
     __syncthreads();
-    for (int i = threadIdx.x; i < row_len; i += blockDim.x) row[i] = v4_rbf16(row[i]);
+    for (int i = threadIdx.x; i < row_len; i += blockDim.x) row[i] = rbf16(row[i]);
 }
 
 // The quantized `Linear` of model.py:114-127, and the grouped `wo_a` einsum of
@@ -538,7 +466,7 @@ extern "C" __global__ void v4_gemv_fp8(const float* __restrict__ x,
     float acc = dot_fp8_wave(xr, w + (size_t)j * k,
                              wscale + (size_t)(j >> bsh) * ((k + block - 1) / block), k,
                              block, (int)(threadIdx.x & (WAVE - 1)), lut);
-    if ((threadIdx.x & (WAVE - 1)) == 0) out[(size_t)r * n_out + j] = v4_rbf16(acc);
+    if ((threadIdx.x & (WAVE - 1)) == 0) out[(size_t)r * n_out + j] = rbf16(acc);
 }
 
 // ── V4 launchers ────────────────────────────────────────────────────────────────────

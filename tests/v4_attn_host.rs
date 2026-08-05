@@ -1,6 +1,6 @@
 //! The V4 selection arithmetic, scored against S1b's oracle on the HOST.
 //!
-//! `src/attn.rs::v4_window_topk` decides which cache slots every query attends. It is a
+//! `src/attn.rs::v4_topk_idxs` decides which cache slots every query attends. It is a
 //! *selection*, so no numeric tolerance can stand in for it: a wrong rotation attends to
 //! real vectors at the wrong positions and produces fluent wrong text. It is also pure,
 //! so it can be gated without a GPU — which is why it lives here rather than in
@@ -13,16 +13,29 @@
 //! shape — so a transcription slip in either shows up. The properties asserted below do
 //! not depend on either implementation and are the part that survives a shared
 //! misreading.
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
-use rivoli::attn::v4_window_topk;
+use rivoli::attn::{Sel, v4_topk_idxs};
 use rivoli::v4oracle::forward::window_topk;
 
 /// The engine's flat buffer, re-shaped into the oracle's row form so the two can be
 /// compared as the same object.
 fn engine_rows(win: usize, seqlen: usize, start_pos: usize) -> Vec<Vec<i64>> {
+    engine_sel(win, LayerKind::Plain, 0, seqlen, start_pos)
+}
+
+/// The general form. `LayerKind::Plain` is a ratio-0 layer, for which `index_topk` is
+/// never read.
+fn engine_sel(
+    win: usize,
+    kind: LayerKind,
+    index_topk: usize,
+    seqlen: usize,
+    start_pos: usize,
+) -> Vec<Vec<i64>> {
     let mut flat = Vec::new();
-    let (rows, cols) = v4_window_topk(win, seqlen, start_pos, &mut flat);
+    let sel = Sel { win, kind, index_topk, seqlen, start_pos };
+    let (rows, cols) = v4_topk_idxs(sel, &mut flat).expect("selection within index_topk");
     assert_eq!(flat.len(), rows * cols, "returned shape does not describe the buffer");
     flat.chunks_exact(cols).map(|r| r.iter().map(|&v| i64::from(v)).collect()).collect()
 }
@@ -145,7 +158,7 @@ fn win_one_diverges_from_the_reference_and_is_unreachable() {
     // would make the model attend only its own token. The assertion is here so that the
     // divergence is a decision on the record and not a latent surprise for S3.
     let mut flat = Vec::new();
-    let (rows, cols) = v4_window_topk(1, 3, 0, &mut flat);
+    let (rows, cols) = v4_topk_idxs(Sel { win: 1, kind: LayerKind::Plain, index_topk: 0, seqlen: 3, start_pos: 0 }, &mut flat).unwrap();
     assert_eq!((rows, cols), (3, 1), "win=1 prefill no longer takes the prefill branch");
     assert_eq!(flat, vec![0, 1, 2]);
     assert_eq!(engine_rows(1, 3, 0), window_topk(1, 3, 0), "engine and oracle still agree");
@@ -192,4 +205,187 @@ fn fp8_times_a_power_of_two_is_exact_in_bf16_over_the_range_the_checkpoint_uses(
     let tiny = e4m3_to_f32(0x01) * f32::exp2(-126.0); // 2^-9 * 2^-126 = 2^-135
     assert!(tiny > 0.0, "the f32 product itself underflowed, which is a different failure");
     assert!(!exact(tiny), "the bf16 subnormal floor moved; re-derive the range above");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// The COMPRESSED half of the selection — S3 prerequisite 5.
+// ═══════════════════════════════════════════════════════════════════════════════════
+//
+// `v4_topk_idxs(Sel { comp: Some(..), .. })` is `torch.cat([get_window_topk_idxs(...),
+// get_compress_topk_idxs(...)], dim=-1)`. The oracle's twin is the pair
+// `window_topk` / `compress_topk`, which it also concatenates — so the two sides are
+// again structurally different (one flat i32 buffer with a derived offset, versus two
+// `Vec<Vec<i64>>` joined by the caller) and a transcription slip in either shows up.
+//
+// **WHAT THIS DOES NOT COVER, stated because the shape of it has burned this repo.**
+// `compress_topk` is the reference's `else` branch — the path a **ratio-128** layer takes,
+// where there is no `Indexer`. A **ratio-4** layer runs `Indexer.forward` instead, which
+// SCORES. Everything below is therefore a full gate for ratio-128 and, for ratio-4, a gate
+// on the positional stand-in only: it agrees with the indexer on the SET while
+// `index_topk` cannot truncate, and never on the score ORDER that `sparse_attn`'s online
+// softmax folds in. No test in this file exercises one line of sparse selection, and none
+// is named as though it did.
+
+use rivoli::v4compress::LayerKind;
+use rivoli::v4oracle::forward::compress_topk;
+use rivoli::v4oracle::weights::V4Config as OracleCfg;
+
+/// `index_topk` from the shipped config, never a literal.
+///
+/// **NOT `artifact::model::V4Config`, which does not carry it.** Three types in this tree
+/// are called some variant of "V4 config" and only two hold `index_topk`:
+/// `v4oracle::weights::V4Config` (this one, 512) and `artifact::model::ModelConfig` —
+/// which is GLM's, whose copy is validated by `indexer_layout()` against GLM's IndexShare.
+/// The artifact's `V4Config`, the one the engine will actually decode from, declares
+/// `index_n_heads` and `index_head_dim` and stops there, even though the shipped
+/// `manifest.json` carries `"index_topk": 512`. Adding it is a one-line serde field in the
+/// loading agent's file; until then this is the only in-tree source that is not a literal.
+fn shipped_index_topk() -> usize {
+    OracleCfg::v4_flash().index_topk
+}
+
+/// The reference's `torch.cat`, built from the oracle's two halves at an EXPLICIT offset.
+///
+/// Explicit so the defect cases below can pass a wrong one through the identical
+/// concatenation — otherwise each would need its own copy of these four lines, and each
+/// copy would be a place for the defect to be built differently from the thing it claims
+/// to perturb.
+fn oracle_cat(
+    win: usize,
+    ratio: usize,
+    seqlen: usize,
+    start_pos: usize,
+    offset: usize,
+) -> Vec<Vec<i64>> {
+    let w = window_topk(win, seqlen, start_pos);
+    let c = compress_topk(ratio, seqlen, start_pos, offset);
+    assert_eq!(w.len(), c.len(), "the two halves disagree on the row count");
+    w.into_iter().zip(c).map(|(a, b)| a.into_iter().chain(b).collect()).collect()
+}
+
+/// `offset` is `kv.size(1)` at prefill and `window_size` at decode — model.py:521.
+fn oracle_rows(win: usize, ratio: usize, seqlen: usize, start_pos: usize) -> Vec<Vec<i64>> {
+    oracle_cat(win, ratio, seqlen, start_pos, if start_pos == 0 { seqlen } else { win })
+}
+
+fn engine_comp_rows(win: usize, ratio: usize, seqlen: usize, start_pos: usize) -> Vec<Vec<i64>> {
+    engine_sel(win, LayerKind::from_ratio(ratio), shipped_index_topk(), seqlen, start_pos)
+}
+
+/// Shapes a compressed layer actually reaches. `seqlen` straddles multiples of `ratio`
+/// because the remainder is what decides how many blocks exist, and `start_pos` straddles
+/// multiples of `ratio` because that is where a decode step emits one.
+fn comp_cases() -> Vec<(usize, usize, usize, usize)> {
+    let mut v = Vec::new();
+    for &(win, ratio) in &[(8usize, 4usize), (128, 4), (128, 128), (4, 4)] {
+        for seqlen in [1usize, ratio - 1, ratio, ratio + 1, 2 * ratio, 3 * ratio + 2, 130] {
+            v.push((win, ratio, seqlen, 0));
+        }
+        for sp in [1usize, ratio - 1, ratio, ratio + 1, 2 * ratio - 1, win, win + 1, 300] {
+            v.push((win, ratio, 1, sp));
+        }
+    }
+    v
+}
+
+#[test]
+fn compressed_selection_matches_the_oracle_below_the_truncation_point() {
+    let mut checked = 0usize;
+    let mut saw_blocks = 0usize;
+    for (win, ratio, seqlen, start_pos) in comp_cases() {
+        let want = oracle_rows(win, ratio, seqlen, start_pos);
+        let got = engine_comp_rows(win, ratio, seqlen, start_pos);
+        assert_eq!(got, want, "win={win} ratio={ratio} seqlen={seqlen} start_pos={start_pos}");
+        // How many compressed columns this shape actually produced.
+        let n = got[0].len() - if start_pos == 0 { seqlen.min(win) } else { win };
+        saw_blocks += usize::from(n > 0);
+        checked += 1;
+    }
+    assert!(checked >= 50, "only {checked} shapes compared");
+    // ANTI-VACUITY, and the specific one this file needs: every case could agree because
+    // every case produced ZERO compressed columns, which is `window_topk` re-tested under
+    // a longer name. `saw_blocks` counts the cases that actually appended blocks.
+    assert!(saw_blocks >= 30, "only {saw_blocks} of {checked} shapes produced any block");
+}
+
+#[test]
+fn the_compressed_comparison_can_fail() {
+    // Same discipline as `the_comparison_above_can_fail`: three slips a port makes here,
+    // each rejected by the SAME comparison, at shapes `comp_cases()` covers.
+    let (win, ratio, seqlen) = (8usize, 4usize, 12usize);
+    let right = oracle_rows(win, ratio, seqlen, 0);
+
+    // 1. The offset omitted — the classic. Blocks then name rows inside the WINDOW
+    //    region, which are real KV vectors at completely unrelated positions.
+    let no_offset = oracle_cat(win, ratio, seqlen, 0, 0);
+    assert_ne!(no_offset, right, "the compressed offset is not observable at seqlen={seqlen}");
+
+    // 2. Decode's offset used at prefill (`win` instead of `kv.size(1)`). Same shape,
+    //    every block shifted by `seqlen - win`.
+    let decode_offset = oracle_cat(win, ratio, seqlen, 0, win);
+    assert_ne!(decode_offset, right, "the two offsets coincide at seqlen={seqlen} win={win}");
+
+    // 3. The causal mask dropped, so row `t` attends blocks built from tokens after it.
+    //    Row 0 is the discriminating one: it may see NO block at all.
+    let unmasked: Vec<i64> = (0..seqlen / ratio).map(|c| (c + seqlen) as i64).collect();
+    assert_ne!(unmasked, right[0][win.min(seqlen)..], "row 0's mask is not observable");
+}
+
+#[test]
+fn the_positional_selection_refuses_past_the_indexer_truncation_point() {
+    // **Refusal, not truncation, and the distinction is the whole point.**
+    // `Indexer.forward` keeps the top `index_topk` blocks BY SCORE. Keeping the first
+    // `index_topk` POSITIONALLY keeps the OLDEST — so past the cliff a capping
+    // implementation attends blocks 0..k and nothing newer, for the rest of the sequence,
+    // on 21 of 43 layers. Fluent, plausible, permanent, and it would produce a benchmark
+    // number nobody could impeach. `min(live, index_topk)` was written here first and is
+    // exactly that bug.
+    //
+    // A SMALL `index_topk`, because the cliff at the shipped 512 needs a 2052-token
+    // fixture — the coverage cliff recorded in v4-flash-port.md. The arithmetic is the
+    // same at 3 as at 512, and the shipped value is asserted below rather than assumed.
+    let k = 3;
+    let r4 = LayerKind::from_ratio(4);
+    let sel = |kind, start_pos| Sel { win: 8, kind, index_topk: k, seqlen: 1, start_pos };
+
+    // Below the cliff: fine, and every existing block is selected.
+    // 3 blocks exist at start_pos 11 (`(11+1)/4`), and `index_topk` is 3.
+    assert_eq!(sel(r4, 11).shape().unwrap(), (1, 8 + 3));
+    // The last position that is still fine is `ratio * (index_topk + 1) - 1`.
+    assert_eq!(sel(r4, 4 * (k + 1) - 2).shape().unwrap().1, 8 + k);
+
+    // At the cliff: refused, and the message names the cause rather than a shape.
+    let e = sel(r4, 15).shape().expect_err("4 blocks against index_topk 3 must be refused");
+    let msg = format!("{e}");
+    assert!(msg.contains("index_topk"), "wrong rejection: {msg}");
+    assert!(msg.contains("OLDEST"), "the message does not say what goes wrong: {msg}");
+    // The message is a wrapped multi-line literal, and a dropped `\` continuation turns
+    // each wrap into ~18 literal spaces. That shipped once and this test stayed green,
+    // because greps for two words cannot see whitespace. Rust's own `\`-continuation eats
+    // the following indentation, so a correct literal has no double space anywhere.
+    assert!(!msg.contains("  "), "collapsed line continuation in the message: {msg:?}");
+    // ...and `v4_topk_idxs` refuses too, not just the shape probe. A fill that succeeded
+    // where the shape refused would be the engine attending a selection nothing checked.
+    let mut flat = Vec::new();
+    assert!(v4_topk_idxs(sel(r4, 15), &mut flat).is_err(), "the fill did not refuse");
+    assert!(flat.is_empty(), "the fill wrote rows before refusing");
+
+    // A ratio-128 layer has NO `Indexer`, so `get_compress_topk_idxs` applies no cap and
+    // there is nothing to refuse. Same `index_topk`, same positions, must be accepted —
+    // this is the half that fails if the refusal is written against the ratio rather than
+    // against `has_indexer`.
+    let r128 = LayerKind::from_ratio(128);
+    assert!(!r128.has_indexer(), "the fixture no longer separates the two layer classes");
+    assert_eq!(sel(r128, 128 * (k + 1)).shape().unwrap().1, 8 + (k + 1));
+
+    // The shipped cliff, from the config rather than a literal.
+    let shipped = shipped_index_topk();
+    assert_eq!(shipped, 512);
+    assert_eq!(4 * (shipped + 1), 2052, "the truncation point moved");
+    assert!(Sel { win: 128, kind: r4, index_topk: shipped, seqlen: 1, start_pos: 2050 }
+        .shape()
+        .is_ok());
+    assert!(Sel { win: 128, kind: r4, index_topk: shipped, seqlen: 1, start_pos: 2051 }
+        .shape()
+        .is_err(), "2052 total positions must be the first refusal");
 }

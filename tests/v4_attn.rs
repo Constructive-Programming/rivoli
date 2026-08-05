@@ -64,9 +64,10 @@
 // apart and survives no skim.
 use rivoli::artifact::model::V4Config as EngineV4Config;
 use rivoli::artifact::quant::e8m0;
+use rivoli::v4compress::LayerKind;
 use rivoli::attn::{
     v4::{Dims, Fp8W, Io, Scratch, Step, Weights, attention},
-    v4_rope_table_ratio0, v4_window_topk,
+    v4_rope_table_ratio0, v4_topk_idxs, Sel,
 };
 use rivoli::backend::hip::{
     device_sync, launch_v4_act_quant, launch_v4_gemv_fp8, launch_v4_rope,
@@ -181,6 +182,16 @@ fn fixture() -> (V4Config, ToyModel) {
     (cfg, m)
 }
 
+/// Every layer this file drives is ratio-0 (`LAYER = 0`), so the descriptor is `Plain` and
+/// `index_topk` is never read.
+///
+/// Every other `Sel` in this file is built from this one with `..plain_sel(d)`, so a field
+/// added to `Sel` lands in exactly one place. An earlier version of this comment claimed
+/// that and the call sites still spelled the literal out four more times.
+fn plain_sel(d: &Dims) -> Sel {
+    Sel { win: d.window, kind: LayerKind::Plain, index_topk: 0, seqlen: 1, start_pos: 0 }
+}
+
 fn dims(cfg: &V4Config) -> Dims {
     Dims {
         dim: cfg.dim,
@@ -265,7 +276,7 @@ struct Score {
     /// through `f32_to_bf16` before differencing, so a kernel that stopped rounding its
     /// stores would keep extra f32 mantissa and still score `max_ulp = 0` — every value
     /// would round back to the same bf16. `Defect::NoBf16Rounding` is exactly that
-    /// breakage and `v4_rbf16` appears in every kernel S2b adds, so it is in scope. The
+    /// breakage and `rbf16` appears in every kernel S2b adds, so it is in scope. The
     /// oracle cannot supply the check (its goldens are bf16 on both sides by
     /// construction); it has to be a property of the GPU output on its own.
     unrounded: usize,
@@ -352,6 +363,7 @@ struct Gpu {
     ring: DeviceBuf,
     out: DeviceBuf,
     freqs: DeviceBuf,
+    max_m: usize,
 }
 
 impl Gpu {
@@ -377,6 +389,7 @@ impl Gpu {
             _w: w,
             _norms: norms,
             weights,
+            max_m,
             xq: z(max_m * d.dim),
             qr: z(max_m * d.q_lora_rank),
             qrq: z(max_m * d.q_lora_rank),
@@ -398,6 +411,7 @@ impl Gpu {
 
     fn scratch(&mut self) -> Scratch {
         Scratch {
+            rows: self.max_m,
             xq: self.xq.ptr_mut().cast(),
             qr: self.qr.ptr_mut().cast(),
             qrq: self.qrq.ptr_mut().cast(),
@@ -417,7 +431,7 @@ impl Gpu {
             freqs: self.freqs.ptr().cast(),
             idxs: idxs.ptr().cast(),
             idxs_shape,
-            ring: self.ring.ptr_mut().cast(),
+            cache: self.ring.ptr_mut().cast(),
             out: self.out.ptr_mut().cast(),
         }
     }
@@ -426,7 +440,7 @@ impl Gpu {
     fn step(&mut self, d: &Dims, p: &Phase) -> [Vec<f32>; 4] {
         let x = dev_f32(golden(p, "attn_norm_out"));
         let mut idx = Vec::new();
-        let shape = v4_window_topk(d.window, p.m, p.start_pos, &mut idx);
+        let shape = v4_topk_idxs(Sel { seqlen: p.m, start_pos: p.start_pos, ..plain_sel(d) }, &mut idx).unwrap();
         let idxb = dev_i32(&idx);
         let io = self.io(&x, &idxb, shape);
         let step = if p.start_pos == 0 {
@@ -436,7 +450,7 @@ impl Gpu {
         };
         let s = self.scratch();
         // SAFETY: every buffer above outlives the `device_sync` on the next line.
-        unsafe { attention(d, &self.weights, &s, &io, step) }.expect("v4 attention");
+        unsafe { attention(d, plain_sel(d), &self.weights, &s, &io, step) }.expect("v4 attention");
         device_sync().expect("sync");
         let n = |b: &DeviceBuf, len: usize| read(b)[..len].to_vec();
         let nhd = d.n_heads * d.head_dim;
@@ -507,7 +521,7 @@ fn sparse_attn_alone_matches_the_oracle_including_the_sink() {
     let q = dev_f32(golden(p, "q"));
     let kv = dev_f32(golden(p, "kv_entry"));
     let mut idx = Vec::new();
-    let (rows, cols) = v4_window_topk(d.window, p.m, 0, &mut idx);
+    let (rows, cols) = v4_topk_idxs(Sel { seqlen: p.m, start_pos: 0, ..plain_sel(&d) }, &mut idx).unwrap();
     assert_eq!(rows, p.m);
     let idxb = dev_i32(&idx);
     let mut o = dev_f32(&vec![0.0f32; p.m * d.n_heads * d.head_dim]);
@@ -671,13 +685,13 @@ fn each_in_scope_defect_is_further_away_than_the_kernels_are() {
 fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
     let Harness { d, clean, mut gpu, .. } = Harness::new();
     let p = &clean[0];
-    // A prefill of 4 against a window of 8: `v4_window_topk` returns 4 columns, and the
+    // A prefill of 4 against a window of 8: `v4_topk_idxs` returns 4 columns, and the
     // whole point is that `window` is the plausible wrong answer.
     let short = 4usize;
     assert!(short < d.window, "the collision this test needs does not exist");
     let x = dev_f32(&golden(p, "attn_norm_out")[..short * d.dim]);
     let mut idx = Vec::new();
-    let right = v4_window_topk(d.window, short, 0, &mut idx);
+    let right = v4_topk_idxs(Sel { seqlen: short, start_pos: 0, ..plain_sel(&d) }, &mut idx).unwrap();
     assert_eq!(right, (short, short), "a short prefill no longer narrows its columns");
     let idxb = dev_i32(&idx);
     let mut io = Io {
@@ -685,18 +699,22 @@ fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
         freqs: gpu.freqs.ptr().cast(),
         idxs: idxb.ptr().cast(),
         idxs_shape: (short, d.window),
-        ring: gpu.ring.ptr_mut().cast(),
+        cache: gpu.ring.ptr_mut().cast(),
         out: gpu.out.ptr_mut().cast(),
     };
     let s = gpu.scratch();
     // SAFETY: buffers outlive the call; it returns before any launch.
-    let e = unsafe { attention(&d, &gpu.weights, &s, &io, Step::Prefill { seqlen: short }) }
+    let e = unsafe { attention(
+                &d,
+                plain_sel(&d), &gpu.weights, &s, &io, Step::Prefill { seqlen: short }) }
         .expect_err("a 4-row prefill must not accept an 8-column selection");
     assert!(format!("{e}").contains("selection"), "rejected for the wrong reason: {e}");
 
     io.idxs_shape = right;
     // SAFETY: as above; this one does launch, and the sync below joins it.
-    unsafe { attention(&d, &gpu.weights, &s, &io, Step::Prefill { seqlen: short }) }
+    unsafe { attention(
+                &d,
+                plain_sel(&d), &gpu.weights, &s, &io, Step::Prefill { seqlen: short }) }
         .expect("the correct shape must be accepted");
     device_sync().expect("sync");
 
@@ -705,17 +723,21 @@ fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
     // answer here is the narrowed prefill shape -- the exact inverse of the mistake
     // above, and it must be rejected too.
     io.idxs_shape = (1, short);
-    let e = unsafe { attention(&d, &gpu.weights, &s, &io, Step::Decode { pos: PROMPT }) }
+    let e = unsafe { attention(
+                &d,
+                plain_sel(&d), &gpu.weights, &s, &io, Step::Decode { pos: PROMPT }) }
         .expect_err("a decode must not accept a narrowed prefill selection");
     assert!(format!("{e}").contains("selection"), "rejected for the wrong reason: {e}");
     let mut one = Vec::new();
-    let want = v4_window_topk(d.window, 1, PROMPT, &mut one);
+    let want = v4_topk_idxs(Sel { seqlen: 1, start_pos: PROMPT, ..plain_sel(&d) }, &mut one).unwrap();
     assert_eq!(want, (1, d.window), "decode no longer wants the full window");
     let oneb = dev_i32(&one);
     io.idxs = oneb.ptr().cast();
     io.idxs_shape = want;
     // SAFETY: as above.
-    unsafe { attention(&d, &gpu.weights, &s, &io, Step::Decode { pos: PROMPT }) }
+    unsafe { attention(
+                &d,
+                plain_sel(&d), &gpu.weights, &s, &io, Step::Decode { pos: PROMPT }) }
         .expect("the correct decode shape must be accepted");
     device_sync().expect("sync");
 }
@@ -866,7 +888,7 @@ fn dims_accept_the_real_artifact_and_reject_a_ragged_kv_span() {
 /// The model fixture cannot cover this and no amount of it would. `act_quant`'s
 /// power-of-two scale puts a block's largest element in [224, 448], so an element only
 /// reaches e4m3's subnormals when it is ~2^15 below its block's peak — which drawn
-/// activations essentially never are. That range is precisely where `v4_f2e4m3_rne` and
+/// activations essentially never are. That range is precisely where `f2e4m3_rne` and
 /// rivoli's own `math.rs::f32_to_e4m3` disagree: the kernel rounds subnormal ties to
 /// nearest-EVEN because V4 was trained against CUDA's `cvt.rn.satfinite.e4m3x2.f32`,
 /// while rivoli's rule for GLM is half-away-from-zero.

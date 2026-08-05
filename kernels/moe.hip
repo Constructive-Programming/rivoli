@@ -270,13 +270,13 @@ __device__ __forceinline__ size_t f4_ng(int i_dim) {
     return (size_t)((i_dim + F4_GROUP - 1) / F4_GROUP);
 }
 
-// bf16 round-trip. Every `Linear` in the reference returns bf16 and the residual stream is
-// bf16, so this is where the reference's precision actually lives — dropping it is worth
-// ~2^-8 relative per step, two orders above the summation-order floor the oracle's
-// tolerance is built on.
-__device__ __forceinline__ float bf16r(float x) {
-    return bf16f(f2bf16(x));
-}
+// The bf16 round-trip below is `common.hpp::rbf16`. It was a local `bf16r` with an
+// identical body until 2026-08-05 — `rbf16`/`bf16r` in one translation unit is a
+// transposition between two names for the same thing, in a file where picking the wrong
+// one would be invisible because both were correct. Every `Linear` in the reference
+// returns bf16 and the residual stream is bf16, so this is where the reference's precision
+// actually lives: dropping it is worth ~2^-8 relative per step, two orders above the
+// summation-order floor the oracle's tolerance is built on.
 
 // Pass 1: h[(e·R + t)·inter + j] = bf16(silu(min(bf16(w1_j·x), L)) · clamp(bf16(w3_j·x), ±L)
 //                                       · wexpert[e·R + t])
@@ -310,7 +310,7 @@ __device__ __forceinline__ void moe_gateup_f4_impl(
             // it read back. Clamping the f32 dot and rounding afterwards would put a
             // different value on the boundary — and the boundary is the only place a
             // clamped SwiGLU differs from an unclamped one at all.
-            float gt = bf16r(g[t]), ut = bf16r(u[t]);
+            float gt = rbf16(g[t]), ut = rbf16(u[t]);
             ut = fminf(fmaxf(ut, -limit), limit);
             gt = fminf(gt, limit);  // ASYMMETRIC: no lower clamp on the gate
             // `x · sigmoid(x)`, NOT this file's `siluf` (`x / (1 + e^-x)`). The two differ
@@ -329,7 +329,7 @@ __device__ __forceinline__ void moe_gateup_f4_impl(
             // same argument; folding the routing weight into pass 1 only moves the hazard a
             // stage earlier, it does not remove it.
             float w = wexpert[(size_t)e * R + t];
-            h_out[((size_t)e * R + t) * inter + j] = w == 0.0f ? 0.0f : bf16r(sg * ut * w);
+            h_out[((size_t)e * R + t) * inter + j] = w == 0.0f ? 0.0f : rbf16(sg * ut * w);
         }
     }
 }
@@ -364,7 +364,7 @@ __device__ __forceinline__ void moe_down_f4_impl(
     if (lane == 0) {
 #pragma unroll
         for (int t = 0; t < R; ++t)
-            atomicAdd(&acc[(size_t)t * hidden + o], moe_fixed(bf16r(dv[t])));
+            atomicAdd(&acc[(size_t)t * hidden + o], moe_fixed(rbf16(dv[t])));
     }
 }
 

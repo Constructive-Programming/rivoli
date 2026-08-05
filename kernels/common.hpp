@@ -83,6 +83,62 @@ __device__ __forceinline__ unsigned short f2bf16(float x) {
     return (unsigned short)((b + r) >> 16);
 }
 
+// ── V4 shared device helpers ────────────────────────────────────────────────────
+//
+// Neither carries a `contract(off)` pragma, and neither needs one: `rbf16` is bit surgery
+// and `block_sum_lds`'s only operator is `+`, so there is no multiply for an FMA to absorb
+// in either. That is NOT true of `f2e4m3_rne` further down this file, which does carry one
+// — see the note there for what an ISA diff caught.
+
+// bf16 round-trip in f32. V4 activations stay f32 on device and hold bf16-representable
+// values, which is what `Oracle::round_bf16` does to an `f32` Vec — the reference stores
+// bf16 at every point the kernels mark, and matching WHERE it rounds is what makes the
+// goldens comparable at all.
+//
+// Dropping it leaves values that are fluent and slightly TOO PRECISE, which no magnitude
+// check sees — `v4oracle::Defect::NoBf16Rounding`.
+//
+// `kernels/` is not watched by `build.rs`'s jscpd gate, so nothing mechanical finds a
+// duplicated device helper. This one had THREE independent per-TU copies before it was
+// hoisted, and the only tool that ever caught the duplication was the compiler — on a clean
+// merge of two agents' identical hunks into this header, which does not overlap and so does
+// not conflict. `moe.hip` spelled its copy `bf16r`; that one carries the magnitude the
+// rounding is worth.
+__device__ __forceinline__ float rbf16(float x) { return bf16f(f2bf16(x)); }
+
+// Block-wide sum of `v` into every thread. `red` is caller-owned LDS of `blockDim.x`
+// floats; on return every thread holds the total.
+//
+// **REQUIRES A POWER-OF-TWO `blockDim.x`.** The halving ladder drops the odd element at
+// every level where it is not — at 6 threads `red[2]` never reaches `red[0]` — and the
+// result is a quietly wrong sum, not a fault. Every caller launches 256. Stated because
+// this is now reachable from `attn.hip`/`linalg.hip`/`moe.hip`/`fwd.hip`, where a
+// 192-thread block is an ordinary edit; `wave_max` above documents its own precondition
+// for the same reason.
+//
+// RE-ASSOCIATED relative to the oracle's sequential fold — this is the one place the V4
+// kernels knowingly diverge from it, and it is the floor any tolerance built on the
+// goldens has to clear.
+//
+// The trailing `__syncthreads()` is what makes `red` reusable for a second reduction in the
+// same kernel; the other of the two spellings this was unified from lacked it. No shipped
+// caller reduces twice, so it buys one barrier per row against a landmine for the first
+// caller that does. That barrier is NEW for `v4_rmsnorm` and `v4_qk_norm`, which had the
+// spelling without it: one extra block barrier per token per norm, on the decode path.
+// UNMEASURED — these kernels are bandwidth-bound so the expectation is that it is free,
+// but that is an expectation, in the same sense as `mla.hip`'s pragma note.
+__device__ __forceinline__ float block_sum_lds(float v, float* red) {
+    red[threadIdx.x] = v;
+    __syncthreads();
+    for (int o = blockDim.x >> 1; o > 0; o >>= 1) {
+        if ((int)threadIdx.x < o) red[threadIdx.x] += red[threadIdx.x + o];
+        __syncthreads();
+    }
+    float t = red[0];
+    __syncthreads();
+    return t;
+}
+
 // fp8-e4m3 → f32 (matches math.rs::e4m3_to_f32). 1 sign / 4 exp (bias 7) / 3 mant;
 // exp==0 subnormal = sign·(m/8)·2^-6; (exp==15, mant==7) = NaN.
 __device__ __forceinline__ float e4m3f(unsigned char b) {
@@ -339,20 +395,6 @@ __device__ __forceinline__ float dot_i4_wave(const float* __restrict__ v,
     return wave_sum(a0 + a1);
 }
 
-// One bf16 STORE: round an f32 through bf16 and back.
-//
-// V4's activations live in bf16 between operations, so every `.to(dtype)`, every
-// `RMSNorm.forward` return and every `apply_rotary_emb` copy-back is one of these. Dropping
-// one leaves values that are fluent and slightly too precise, which no magnitude check sees
-// (`v4oracle::Defect::NoBf16Rounding`).
-//
-// Here rather than per-kernel because it had been written THREE times — `mla.hip::v4_rbf16`,
-// `v4compress.hip::v4c_rbf16` and a third copy in `v4indexer.hip`, each `static` to its
-// translation unit and so unreachable from the others. `kernels/` is not watched by
-// `build.rs`'s jscpd gate, so nothing mechanical would ever have found them. `v4indexer.hip`
-// now calls this one; collapsing the other two is the plan's requirement 11 and needs
-// `mla.hip` edits no S2 agent was permitted to make.
-__device__ __forceinline__ float rbf16(float x) { return bf16f(f2bf16(x)); }
 
 // ── OCP MX FP4 (DeepSeek-V4-Flash's native routed experts) ──────────────────────
 //
@@ -495,6 +537,10 @@ __device__ __forceinline__ void dot_f4_wave_r(const float* __restrict__ v, int v
 // everywhere except that it rounds the log FIRST, so a value one ulp below a power of two
 // lands on a different binade — one factor-of-two error per group, invisible in aggregate.
 __device__ __forceinline__ float fast_round_scale(float amax, float max_inv) {
+    // Paired with `f2e4m3_rne`'s pragma below — see the argument there. Inert today (the
+    // product feeds a bitcast, not an add, so there is nothing to fuse); present so the
+    // two halves of `act_quant` carry the same property rather than one of them.
+#pragma clang fp contract(off)
     unsigned int b;
     float y = amax * max_inv;
     __builtin_memcpy(&b, &y, sizeof(b));
@@ -520,6 +566,34 @@ __device__ __forceinline__ float fast_round_scale(float amax, float max_inv) {
 // encoder that will ever be compared against the oracle, and a known difference inside a
 // result whose whole job is to expose unknown ones is the thing this port cannot afford.
 __device__ __forceinline__ unsigned char f2e4m3_rne(float x) {
+    // **Load-bearing, and MEASURED IN THE ISA rather than argued — 2026-08-05.** This
+    // function had a twin inside `mla.hip`, below that file's own file-scope
+    // `#pragma clang fp contract(off)`. S3 requirement 11 deleted the twin and pointed
+    // `v4_act_quant` here; `common.hpp` is included ABOVE that pragma and clang attaches FP
+    // options per expression at parse time, so inlining into a `contract(off)` caller does
+    // NOT restore the property — the subnormal branch's `scaled - m` (fed by `a * 512.0f`)
+    // began fusing. Counted inside `v4_act_quant` at `--offload-arch=gfx1151 -O3`, and the
+    // delta is **one `v_fma_f32`**: 4 at 78796eb, 5 with this pragma removed, 4 with it
+    // (6 / 7 / 6 counting `v_fmac_f32` too). A third tier of 7 / 8 / 7 is
+    // reachable by also counting the one `v_div_fmas_f32` — DON'T: that belongs to the f32
+    // divide expansion (`v_div_scale` x2, `v_div_fmas`, `v_div_fixup`, all present here),
+    // which `mla.hip`'s pragma note already excludes as contraction evidence. It shows up
+    // in a naive grep only because "di*v_fma*s" contains the substring. The check was run in that order precisely so it was seen to go red
+    // before being trusted green.
+    //
+    // **Count `v_fma_f32`/`v_fmac_f32`, and compare a DELTA rather than an absolute.** A
+    // `v_fma|v_mac|v_mad` grep reads 15 / 16 / 15 here, because eight `v_mad_u64_u32` are
+    // ADDRESS arithmetic that contraction neither does nor should touch — enough to make a
+    // one-instruction regression look like noise. Found on `v4_indexer_score`, where the
+    // same pragma moved 1 `v_fmac_f32` to 0 while a naive count read 10 → 9.
+    //
+    // Values do not move either way: reaching this branch bounds `a` to (2^-10, 2^-6),
+    // where `a` is normal and `a * 512.0f` is exact, so the FMA elides two roundings that
+    // were already no-ops. The pragma is here for the CLAIM, not the arithmetic —
+    // `mla.hip`'s "VERIFIED IN THE ISA" note and the `ULP_BUDGET = 1` it justifies in
+    // `tests/v4_attn.rs` both rest on contraction being absent from the V4 path, and a
+    // silent 8th instruction makes those two false while nothing goes red.
+#pragma clang fp contract(off)
     if (isnan(x)) return 0x7f;
     unsigned char sign = signbit(x) ? 0x80 : 0x00;
     float a = fabsf(x);
@@ -537,6 +611,9 @@ __device__ __forceinline__ unsigned char f2e4m3_rne(float x) {
         // Subnormal: value = m·2^-9, m in 1..=7 (m == 8 promotes to the smallest normal,
         // code 0x08). floor + explicit tie test rather than `rintf`, so the rule is on the
         // page instead of in the hardware's current rounding mode.
+        //
+        // `a * 512.0f` feeding `scaled - m` is the fusable pair the function's pragma
+        // exists for.
         float scaled = a * 512.0f;
         float m = floorf(scaled), rem = scaled - m;
         if (rem > 0.5f || (rem == 0.5f && ((unsigned int)m & 1u))) m += 1.0f;
