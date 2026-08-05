@@ -150,10 +150,11 @@ impl TierFmt {
     /// guard was written, and then asked what would have to be true for it to fire: nothing
     /// realistic. Every routed block is padded up to `VQ_ALIGN`, so `.vq3`'s layout on an
     /// `.f4` slot (9,961,472 against a 13,369,344 stride) sits comfortably inside it and
-    /// passes — and `.f4` and `.i4` tile identically at every real dimension, so the pairing
-    /// that actually costs correctness is invisible to any check at all. A guard that cannot
-    /// fire is worse than none; the fix is that the set knows its own format, so there is
-    /// nothing left to pair wrongly.
+    /// passes — and `.f4` and `.i4` tile identically for 25% of all `i_dim`, both models'
+    /// dimensions included (`quant::f4_slot_offsets` has the identity), so the pairing that
+    /// actually costs correctness is invisible to any check at all. A guard that cannot fire
+    /// is worse than none; the fix is that the set knows its own format, so there is nothing
+    /// left to pair wrongly.
     pub fn new(src: &ExpertSet) -> Result<Self> {
         let layers = src.layers();
         let n_experts = src.n_experts();

@@ -1232,10 +1232,39 @@ f4_slot_offsets(4096, 2048) == i4_slot_offsets(4096, 2048) == [0, 4194304, 44564
 f4_expert_bytes(4096, 2048) == i4_expert_bytes(4096, 2048) == 13369344
 ```
 
-`.f4` spends `ceil(i/32) × 1` byte on scales, `.i4` spends `ceil(i/128) × 4`, and **those are
-the same number whenever `i_dim` is a multiple of 128** — every dimension either model ships.
-So the two formats agree on all six slot offsets, on the block size, and therefore on the
-whole file length. A `.f4` block resolved through `i4_slot_offsets` finds every projection at
+`.f4` spends `ceil(i/32) × 1` byte on scales, `.i4` spends `ceil(i/128) × 4`, and those
+collide exactly when
+
+```text
+ceil(i/32) == 4 · ceil(i/128)      i.e.  i mod 128 ∈ {0} ∪ {97..127}
+```
+
+**That is 32 of every 128 dimensions — 25%, a BAND, not a property of the two models happening
+to use multiples of 128.** The first version of this section said "whenever `i_dim` is a
+multiple of 128", which is sufficient but incomplete and misleading in a specific way: a reader
+who changes a dimension to 96 finds the layouts separate and may conclude the collision was
+fixed. Widened 2026-08-05 after the coordinator reproduced the arithmetic independently.
+
+**Widening it exposed a second error in the same sentence, and this one was mine.** The band
+does NOT apply symmetrically to the two dimensions, because the six offsets and the block size
+are governed by different things:
+
+| | collides iff |
+|---|---|
+| the six slot offsets | `band(hidden)` — `moe_inter` cannot separate them at all |
+| `*_expert_bytes` / the file length | `band(hidden) && band(moe_inter)` |
+
+`off[2]` and `off[4]` are sums of w1's and w3's spans, whose `i_dim` is `hidden`; `off[5]` adds
+w2's PACKED bytes, which are `i/2` in both formats. w2's scale span — the only place `moe_inter`
+reaches the scale grid — *begins* at `off[5]`, so its length appears in no offset. `(4096, 96)`
+therefore has **identical offsets and different block sizes**. Found by the assertion failing,
+which is the only reason it is in this document rather than in the code as a confident aside.
+
+Both models are in the band on both dims (GLM 6144/2048, V4 4096/2048), so the two formats
+agree on all six slot offsets, on the block size, and therefore on the whole file length.
+`quant::f4_slot_offsets_match_the_shipped_block_and_are_indistinguishable_from_i4` pins both
+sides of the band on `hidden` (100/128/4096/6144 collide, 96/160/64 do not) and the
+offsets-collide-while-sizes-differ pair at `(4096, 96)`. A `.f4` block resolved through `i4_slot_offsets` finds every projection at
 exactly the right address and then decodes e2m1 nibbles as `n − 8` against a group-128 f32
 scale read out of e8m0 bytes: right bytes, wrong arithmetic, no length, offset or descriptor
 check able to see it.

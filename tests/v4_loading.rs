@@ -456,8 +456,9 @@ fn an_f4_set_that_does_not_start_at_layer_zero_is_addressed_by_absolute_id() {
 /// offsets fitted the stride. That check could not fire: every routed block is padded to
 /// `VQ_ALIGN`, so another format's shorter layout sits inside it, and `.f4`/`.i4` tile
 /// identically at every real dimension anyway. The set now derives all four, and this is
-/// what pins the derivation — including that it is the `.f4` layout and not `.i4`'s, which
-/// at these toy dims (`i_dim % 128 != 0`) are distinguishable and at V4's are not.
+/// what pins the derivation — including that it is the `.f4` layout and not `.i4`'s, which at
+/// these toy dims are distinguishable and at V4's are not (the two collide for 25% of all
+/// `i_dim`; `quant::f4_slot_offsets` has the identity).
 #[test]
 fn an_f4_set_reports_the_format_range_and_slot_layout_it_was_opened_with() {
     use rivoli::artifact::quant::{f4_slot_offsets, i4_slot_offsets};
@@ -470,8 +471,8 @@ fn an_f4_set_reports_the_format_range_and_slot_layout_it_was_opened_with() {
     assert_ne!(
         set.slot_offsets(),
         i4_slot_offsets(HIDDEN, MOE_INTER),
-        "at (64, 32) the two nibble layouts differ — at 4096/2048 they do NOT, which is \
-         why this is derived rather than passed in"
+        "at (64, 32) the two nibble layouts differ — inside the collision band (which \
+         includes 4096/2048) they do NOT, which is why this is derived rather than passed in"
     );
     // NOT asserted here: "every offset is inside the block". Both sides would come from
     // `f4_slot_offsets`/`f4_expert_bytes` over the same dims, so it cannot fail for any

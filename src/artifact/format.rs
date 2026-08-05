@@ -992,8 +992,10 @@ impl RoutedFmt {
     /// The six byte offsets of this format's projections inside one expert block, in
     /// descriptor field order. Beside [`Self::geometry`] because the block SIZE and the
     /// layout INSIDE it are one fact about a format — and because **no downstream check can
-    /// catch them being paired wrongly**: see `quant::f4_slot_offsets`, which has the
-    /// arithmetic. Derived here, so the pairing is unrepresentable.
+    /// catch them being paired wrongly.** `.f4` and `.i4` tile a block identically for 25% of
+    /// all `i_dim` (`ceil(i/32) == 4·ceil(i/128)`, i.e. `i mod 128 ∈ {0} ∪ {97..127}`), both
+    /// models' dimensions included; `quant::f4_slot_offsets` has the arithmetic. Derived here,
+    /// so the pairing is unrepresentable rather than merely warned about.
     fn slot_offsets(self, hidden: usize, moe_inter: usize) -> [usize; 6] {
         use crate::artifact::quant::{f4_slot_offsets, i4_slot_offsets, vq_slot_offsets};
         match self {

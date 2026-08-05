@@ -1186,10 +1186,30 @@ mod tests {
     ///
     /// **And it asserts that `.f4` and `.i4` are byte-identical here, which is not what was
     /// expected and is the more useful half.** Both pack nibbles at `i_dim/2` bytes a row;
-    /// `.f4` spends `ceil(i/32) × 1` byte on scales and `.i4` spends `ceil(i/128) × 4`, and
-    /// those are the SAME NUMBER whenever `i_dim` is a multiple of 128 — which it is for
-    /// every dimension either model ships. So at V4's dims the two formats agree on all six
-    /// offsets, on `*_expert_bytes`, and therefore on the whole file length.
+    /// `.f4` spends `ceil(i/32) × 1` byte on scales and `.i4` spends `ceil(i/128) × 4`. Those
+    /// collide exactly when
+    ///
+    /// ```text
+    /// ceil(i/32) == 4 · ceil(i/128)      i.e.  i mod 128 ∈ {0} ∪ {97..127}
+    /// ```
+    ///
+    /// **which is 32 of every 128 dimensions — 25%, a BAND and not a special case.** Stating
+    /// it as "`i_dim` is a multiple of 128" (as the first version of this doc did) is
+    /// sufficient but badly incomplete, and misleading in a specific way: a reader who changes
+    /// a dimension to 96 finds the layouts separate and may conclude the collision was fixed.
+    /// It was not — 100 collides, 96 and 160 do not.
+    ///
+    /// **And the two things it governs are not the same thing.** The six OFFSETS collide iff
+    /// `band(hidden)`; the block SIZE collides iff `band(hidden) && band(moe_inter)`.
+    /// `moe_inter` reaches the scale grid only through w2, whose scale span begins AT `off[5]`
+    /// and so appears in no offset — it changes `*_expert_bytes` and nothing the offset array
+    /// can see. Both corrections are from 2026-08-05: the band from the coordinator
+    /// reproducing the arithmetic, the `hidden`-only part from the assertion below failing on
+    /// `(4096, 96)` when it was written expecting symmetry.
+    ///
+    /// Both models are in the band on both dims (GLM 6144/2048, V4 4096/2048), so at V4's
+    /// dims the two formats agree on all six offsets, on `*_expert_bytes`, and therefore on
+    /// the whole file length.
     ///
     /// The consequence is worth stating where someone will read it: **nothing structural can
     /// separate an `.f4` from an `.i4`.** Not the length, not the slot offsets, not a
@@ -1201,9 +1221,9 @@ mod tests {
     /// descriptor TYPE (`backend::ExpertDescF4` vs `ExpertDesc`). That is why
     /// `memory::routed::TierFmt` carries a `RoutedFmt` and not the `int4: bool` it replaced.
     ///
-    /// They do diverge at dims where `i_dim % 128 != 0` — the toy `(64, 32)` fixtures in
-    /// `tests/v4_loading.rs` are such a case — so a check that compares them is not vacuous
-    /// everywhere, only where it matters.
+    /// They do diverge outside that band — the toy `(64, 32)` fixtures in
+    /// `tests/v4_loading.rs` are such a case (32 and 64 are both `< 97 mod 128`) — so a check
+    /// that compares them is not vacuous everywhere, only where it matters.
     #[test]
     fn f4_slot_offsets_match_the_shipped_block_and_are_indistinguishable_from_i4() {
         // DeepSeek-V4-Flash: hidden 4096, moe_intermediate_size 2048.
@@ -1242,10 +1262,42 @@ mod tests {
         assert_ne!(off, vq_slot_offsets(hidden, inter));
         assert_ne!(f4_expert_bytes(hidden, inter), vq_expert_bytes(hidden, inter));
 
-        // Where they DO differ: `i_dim` not a multiple of 128. `tests/v4_loading.rs`'s toy
-        // fixtures live here, which is the only reason a test can SEE an `.f4` set resolved
-        // through `.i4`'s layout at all. There is no runtime check for it — that is the
-        // finding above, not an omission.
+        // **The six OFFSETS turn on `hidden` ALONE — `moe_inter` cannot separate them.**
+        // Found by this assertion failing on `(4096, 96)`, which was written expecting the
+        // band to apply symmetrically. It does not: `off[2]` and `off[4]` are sums of w1's and
+        // w3's spans, whose `i_dim` is `hidden`; `off[5]` adds w2's PACKED bytes, which are
+        // `i/2` in both formats. w2's scale length — the only place `moe_inter` reaches the
+        // scale grid — is past `off[5]` and appears in no offset at all. So `moe_inter`
+        // changes `*_expert_bytes` and nothing this array can see.
+        //
+        // The offsets therefore collide iff `band(hidden)`, and the block SIZE collides iff
+        // `band(hidden) && band(moe_inter)`. Both models are in the band on both dims
+        // (GLM 6144/2048, V4 4096/2048), so both collide completely.
+        let band = |i: usize| i.div_ceil(32) == 4 * i.div_ceil(128);
+        assert!(band(hidden) && band(inter), "both of V4's dims are in the band");
+        for h in [100usize, 128, 4096, 6144] {
+            assert!(band(h));
+            assert_eq!(
+                f4_slot_offsets(h, inter),
+                i4_slot_offsets(h, inter),
+                "hidden {h} is in the band, so the layouts must be indistinguishable"
+            );
+        }
+        for h in [96usize, 160, 64] {
+            assert!(!band(h));
+            assert_ne!(
+                f4_slot_offsets(h, inter),
+                i4_slot_offsets(h, inter),
+                "hidden {h} is outside the band — if this collides, the band moved"
+            );
+        }
+        // `moe_inter` out of band moves the block SIZE and leaves every offset alone. This is
+        // the pair that made the point, so it is the pair that is pinned.
+        assert_eq!(f4_slot_offsets(hidden, 96), i4_slot_offsets(hidden, 96));
+        assert_ne!(f4_expert_bytes(hidden, 96), i4_expert_bytes(hidden, 96));
+        // `tests/v4_loading.rs`'s toy fixtures are out of band on BOTH, which is the only
+        // reason a test can SEE an `.f4` set resolved through `.i4`'s layout at all. There is
+        // no runtime check for it — that is the finding above, not an omission.
         assert_ne!(f4_slot_offsets(64, 32), i4_slot_offsets(64, 32));
     }
 
