@@ -224,6 +224,31 @@ matters most. Match the reference now; re-open fp8 in S4 as a **measured** perf 
 the oracle available to price its error. This is the same discipline as not ranking on
 free-running tok/s: do not let two variables move at once.
 
+### A hole S3 inherits unless it acts — recorded 2026-08-05 by S2c
+
+**The shipped goldens at `index_topk = 512` are set-invariant, and a set comparison against
+them cannot see a wrong ranking.** Measured at real weights, layer 2, 13 tokens:
+`indexer_truncated = 0` and the selected sets are `[[-1,-1,-1], [-1,-1,13], [-1,13,14],
+[13,14,15]]` — determined **entirely by the causal mask**. `IndexerNoWeights` and
+`IndexerNoRelu` both move `.indexer_scores` and leave the set bit-identical. So the gate
+accepts an arbitrarily wrong ranking, confirmed rather than argued.
+
+Lowering `index_topk` fixes it — `indexer_truncated = 13`, and row 12 then selects a
+strictly *older* block than row 11, which is the assertion S2c pins, because a monotonic
+pick would just be re-testing the causal mask and calling it a ranking test. But reaching
+truncation at the **shipped** 512 needs **≥2052 tokens**.
+
+Consequence: the oracle's ranking code is proven discriminating; the *shipped goldens* are
+not. **Any stage scored only against them inherits the hole.** If S3 leans on
+`.compress_idxs`, it needs either a long-prompt golden or the lowered-`index_topk` probe
+wired in. This is the same shape as the recorded trap where a `--attn dsa` A/B under 2048
+tokens passes vacuously.
+
+Related, from S2b: `Io.freqs` is a raw pointer that cannot distinguish the ratio-0 table
+from the YaRN one — mixing them is `Defect::RopeNoYarn`, fluent and wrong. And `Scratch`
+sizing is unchecked: a scratch allocated for decode and handed a `Prefill` overruns every
+buffer.
+
 ## S3 — wire the layer loop, first decode.
 ## S4 — benchmark, quality assessment, ranked perf work.
 
