@@ -367,6 +367,77 @@ pub fn should_compress(kind: LayerKind, seqlen: usize, start_pos: usize) -> bool
     if start_pos == 0 { seqlen >= ratio } else { (start_pos + 1).is_multiple_of(ratio) }
 }
 
+/// Where this call's compressed block(s) belong in the **persistent** KV cache — the
+/// `[ring ‖ compressed]` buffer `attn::v4::Io::cache` describes — as `(first_row, count)`.
+/// `None` exactly when [`should_compress`] is false.
+///
+/// This is the WRITE half of the split [`compress_offset`] owns for the READ half, and the
+/// reference keeps them in two places for the same reason: `Compressor.kv_cache` is the
+/// **view** `Attention.kv_cache[:, win:]` (model.py:497), so the compressor's own
+/// `self.kv_cache[:, :seqlen // ratio]` at prefill and `[start_pos // ratio]` at decode
+/// (model.py:380 and :382) land at `window_size + …` in the one flat buffer this engine keeps.
+///
+/// # `window_size` is 0 for the INDEXER's compressor
+///
+/// There are two `Compressor`s on every ratio-4 layer and they write into differently-shaped
+/// buffers. `Attention.forward` hands its own the **view** above, so its blocks start at
+/// `win`. `Indexer.forward` hands its nested one the *whole* buffer —
+/// `self.compressor.kv_cache = self.kv_cache` (model.py:415) — and that buffer is registered
+/// as `[max_batch_size, max_seq_len // compress_ratio, head_dim]` (model.py:405): **no ring,
+/// no window prefix.** So the indexer's destination is `start_pos / ratio` outright, which is
+/// this function with `window_size = 0`.
+///
+/// Spelled out because the natural wiring is to pass `cfg.sliding_window` at every call site,
+/// and the 21 layers that need the zero are exactly the 21 that also need the non-zero. The
+/// symptom would appear at the indexer, 128 rows past the end of a buffer this function's own
+/// test says nothing about — an out-of-bounds write, or a silent overwrite if the two land in
+/// one arena. The parameter is taken rather than derived from [`LayerKind`] precisely so both
+/// callers can exist; it cannot be defaulted.
+///
+/// # `start_pos / ratio`, never "the next free slot"
+///
+/// The decode row is a pure function of the POSITION, and that is the whole content of
+/// `docs/investigations/v4-flash-port.md` requirement 2. A caller that appends — keeps a
+/// running count and writes the next row each time a block is emitted — agrees with this on
+/// every sequence that visits every position in order, and diverges the first time a step is
+/// skipped.
+///
+/// **The usual example is not currently reachable on V4, and saying otherwise would be the
+/// load-bearing lie.** Requirement 2 motivates this with "speculative decode skips steps by
+/// construction", which is true of rivoli's GLM path — but `kernels/moe.hip:409` refuses
+/// `nrow != 1` (guard 1003, only `R = 1` instantiated), so a V4 decode is structurally
+/// single-row and no verify pass can advance `start_pos` by two. The rule is still right and
+/// still worth having: a skipped step is not exclusive to speculation, and the day the fp4
+/// MoE gains an `R = 2` this becomes live with nothing to warn anyone.
+///
+/// The divergence is silent. An appended block is a real pooled row of real numbers sitting
+/// one slot early, so every later query selects it BY POSITION, weights it `exp(l - max)`,
+/// and attends a window that is off by `ratio` tokens on 41 of 43 layers — fluent, wrong, and
+/// permanent for the rest of the sequence.
+/// `tests/v4_compress.rs::compress_dst_is_positional_and_an_appending_placer_disagrees` pins it by
+/// running a skipped step against an appending placer and asserting they disagree.
+///
+/// `seqlen` is read only at prefill and `start_pos` only at decode; both are taken because
+/// [`should_compress`] needs the pair, and splitting this into two functions would put the
+/// phase discriminant in the caller's hands twice.
+pub fn compress_dst(
+    kind: LayerKind,
+    window_size: usize,
+    seqlen: usize,
+    start_pos: usize,
+) -> Option<(usize, usize)> {
+    let ratio = kind.compressor_ratio()?;
+    if !should_compress(kind, seqlen, start_pos) {
+        return None;
+    }
+    Some(if start_pos == 0 {
+        // Prefill emits every COMPLETE block at once, starting at the region's base.
+        (window_size, seqlen / ratio)
+    } else {
+        (window_size + start_pos / ratio, 1)
+    })
+}
+
 // ---------------------------------------------------------------------------------------
 // the device half — S2c's kernels and the order they run in
 // ---------------------------------------------------------------------------------------
@@ -700,8 +771,16 @@ mod device {
     ///
     /// Runs on the NULL stream. [`launch_v4_act_quant`] is S2b's and takes no stream
     /// parameter, so threading one through here would put the last step of the pipeline on
-    /// a different stream from the four before it. S3 should give that launcher a stream
-    /// before wiring this into an overlapped layer loop.
+    /// a different stream from the four before it.
+    ///
+    /// **It is not one launcher, and requirement 9 says it is.** Counted on the merged tree
+    /// 2026-08-05: **six** of the launchers the V4 path uses take no stream, and they are
+    /// exactly S2b's set — the whole of `attn::v4::attention`. Giving this one a stream
+    /// would make the sentence above true and leave the attention block entirely on the null
+    /// stream, which is a comment asserting a property that does not hold. All six move
+    /// together, and with the `.f4` streaming pool that would give them something to overlap
+    /// with; neither exists yet. The names and the decision are in
+    /// `docs/investigations/v4-flash-port.md` §"The prerequisite inventory was taken again".
     ///
     /// # The caller must place `out` at BOTH destinations at prefill
     ///
