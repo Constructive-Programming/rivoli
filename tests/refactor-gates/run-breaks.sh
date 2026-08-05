@@ -18,6 +18,15 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   exit 2
 fi
 
+# Restore on ANY exit, not just the happy path. A 10-minute harness timeout killed this
+# script between "apply break" and "git checkout --" on 2026-08-05 and left the ORACLE
+# modified -- the one file everything else is scored against. Without this trap the next
+# measurement would have been taken against a deliberately broken reference.
+BROKEN=""
+restore() { [ -n "$BROKEN" ] && git checkout -- $BROKEN 2>/dev/null; BROKEN=""; }
+trap 'restore; echo "  (interrupted — tree restored)"; exit 130' INT TERM HUP
+trap restore EXIT
+
 # "test result: ok. N passed" with N>0, or it did not run.
 ran_and_passed() { grep -qE "test result: ok\. [1-9][0-9]* passed" <<<"$1"; }
 ran_and_failed() { grep -qE "test result: FAILED\. [0-9]+ passed; [1-9]" <<<"$1"; }
@@ -47,8 +56,9 @@ open(p,"w").write(s.replace(f, r, 1))
     printf '  %-44s ANCHOR MISSING — corpus is stale\n' "$test"; fail=$((fail+1)); continue
   fi
 
+  BROKEN="$file"
   out=$(cargo test --release --features rocm --test "$bin" $filter -- --test-threads=1 2>&1)
-  git checkout -- "$file"
+  git checkout -- "$file"; BROKEN=""
 
   if ran_and_failed "$out" && grep -qF "$expect" <<<"$out"; then
     printf '  %-44s RED, message matches\n' "$test"; pass=$((pass+1))
