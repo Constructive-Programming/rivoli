@@ -1067,13 +1067,19 @@ impl ExpertSet {
                 // buffer-aligned.
                 //
                 // Read EXACTLY the header. This was `std::fs::read(path)`, which pulls the
-                // whole layer file through the page cache to look at 40 bytes of it:
-                // 3,422,556,160 bytes rather than 40, per layer, at every open. Measured
-                // 2026-08-05 on `/var/db/rivoli/v4-f4-l0-2/L00.f4`: 1451-1566 ms for the
-                // whole-file read against 0.004-0.042 ms for this one. Over V4's 43 layers
-                // that is 147 GB and ~62 s of startup. GLM pays the same shape harder —
-                // `/var/db/rivoli/glm52-vq3-full` is 76 `.vq3` files of 3,941,208,064 bytes
-                // each (299 GB) — so this is a pre-existing cost, not one `.f4` introduced.
+                // WHOLE layer file through the page cache to look at 40 bytes of it — and
+                // the cost was not small. **Measured on the GLM arm 2026-08-05**, both
+                // binaries built before either ran and the two alternated three times with
+                // no `cargo build` between them (`tests/artifact.rs::artifact_reads_back`
+                // over `/var/db/rivoli/glm52-vq3-full`, 76 `.vq3` layers, medians):
+                //
+                //     std::fs::read   180.1 s   298.49 GB read from the block device
+                //     40-byte pread     0.038 s   0.48 MB
+                //
+                // ~4700x, and it is startup on EVERY run — a one-time cost amortizes
+                // against nothing. V4 pays the same shape at 43 x 3,422,556,160 = 147 GB.
+                // A pre-existing defect in shipped GLM code that the `.f4` reader walked
+                // into, not one `.f4` introduced.
                 let mut raw = [0u8; EXPERT_HEADER_BYTES];
                 let mut hf = std::fs::File::open(&path)
                     .with_context(|| format!("open {path} for its header"))?;

@@ -1312,9 +1312,13 @@ pub struct V4Pin {
     pub head: Bf16Weight,
     pub final_norm: *const f32,
     pub hc_head: HyperConn,
-    /// Indexed by layer id. [`V4Pin::build`] requires the artifact's range to start at 0,
-    /// so `layers.len()` is also how many layers the model has here.
-    pub layers: Vec<V4LayerPin>,
+    /// Artifact order, so `layers[0]` is layer [`Self::range`]`.start` — which is NOT
+    /// always 0. Private, and reachable only through [`Self::layer`], because that offset is
+    /// exactly the kind of thing a caller gets right once and then forgets: an absolute
+    /// layer id used as a direct index into a pin over layers 3..6 reads layer 6's weights
+    /// for layer 3 and never fails.
+    layers: Vec<V4LayerPin>,
+    range: std::ops::Range<usize>,
     /// The `.f4` set: fd owner for the routed pool, and the thing whose headers and lengths
     /// — one per layer in the artifact's range — were validated at startup rather than at
     /// the first miss. `read_spec` is the streaming pool's input.
@@ -1419,14 +1423,11 @@ impl V4Pin {
         // Which layers the artifact HOLDS. `num_hidden_layers` is the model's; the two
         // differ on every partial convert. See `f4_layer_range`.
         let range = f4_layer_range(dir, cfg.n_layers)?;
-        ensure!(
-            range.start == 0,
-            "artifact holds layers [{}, {}): a forward pass has to start at layer 0, and \
-             this artifact has no residual stream to enter at {}",
-            range.start,
-            range.end,
-            range.start
-        );
+        // NOT required to start at 0. That is a property of a DECODE — a forward pass has
+        // no residual stream to enter at layer 3 — and belongs where the decode is set up,
+        // not in a loader. Refusing it here made every partial artifact but the first
+        // unloadable, and `/var/db/rivoli/v4-f4-l3-5` is the one that carries the scored
+        // router and the ratio-128-without-indexer shape that layers 0-2 have neither of.
         // fp8 block size, and the same VQ-param/version gate every artifact passes.
         let block = FormatMeta::load(dir)?.fp8_block;
         let st = Safetensors::open_dir(dir)?;
@@ -1554,8 +1555,28 @@ impl V4Pin {
             final_norm,
             hc_head,
             layers,
+            range,
             f4,
         })
+    }
+
+    /// The layer range this pin holds, in the model's own numbering.
+    pub fn range(&self) -> std::ops::Range<usize> {
+        self.range.clone()
+    }
+
+    /// One layer's resident weights by ABSOLUTE layer id.
+    ///
+    /// The only way in, so the artifact-order offset cannot be applied twice or not at all.
+    pub fn layer(&self, l: usize) -> Result<&V4LayerPin> {
+        self.layers
+            .get(l.checked_sub(self.range.start).unwrap_or(usize::MAX))
+            .with_context(|| {
+                format!(
+                    "layer {l} is outside this artifact's range [{}, {})",
+                    self.range.start, self.range.end
+                )
+            })
     }
 }
 

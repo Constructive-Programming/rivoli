@@ -17,6 +17,7 @@
 //! few KB; the real-artifact cases skip loudly when it is absent.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
+use rivoli::artifact::model::V4Config;
 use rivoli::artifact::format::{
     EXPERT_HEADER_BYTES, ExpertHeader, ExpertSet, F4_MAGIC, RoutedFmt, SetDims, VQ3_MAGIC,
     f4_layer_range,
@@ -25,7 +26,6 @@ use rivoli::artifact::quant::{VQ_ALIGN, f4_expert_stride, i4_expert_stride, vq_e
 
 #[path = "common/v4_artifact_dir.rs"]
 mod v4_artifact_dir;
-use v4_artifact_dir::v4_artifact;
 
 /// Toy dims: the smallest that keep the three formats' strides distinct and give each
 /// projection more than one FP4 group. `f4_expert_stride(64, 32)` is one `VQ_ALIGN` block.
@@ -301,8 +301,11 @@ fn f4_header_dims_and_layer_id_are_confronted_with_the_config() {
 #[test]
 fn an_inverted_layer_range_is_refused_rather_than_underflowing() {
     let s = write_f4_set("inverted", 2, Defect::OK);
+    // Built from bindings, not the literal `2..1`: clippy's `reversed_empty_ranges` fires
+    // on the literal, and this range being reversed is the fixture, not a mistake.
+    let (from, to) = (2, 1);
     refuses(
-        open_f4(&s, SetDims::new(2..1, N_EXPERTS, HIDDEN, MOE_INTER)),
+        open_f4(&s, SetDims::new(from..to, N_EXPERTS, HIDDEN, MOE_INTER)),
         "inverted",
         "is inverted",
     );
@@ -372,14 +375,22 @@ fn f4_source_range_is_read_and_confronted_with_the_layer_count() {
 
 // ── against the shipped artifact ────────────────────────────────────────────────
 
+/// Open a shipped artifact's `.f4` set at the range its own manifest declares.
+fn open_shipped(dir: &str) -> (V4Config, std::ops::Range<usize>, ExpertSet) {
+    let cfg: V4Config = rivoli::artifact::model::load_config(dir).unwrap();
+    let range = f4_layer_range(dir, cfg.n_layers).unwrap();
+    let d = SetDims::new(range.clone(), cfg.n_experts, cfg.hidden, cfg.moe_inter);
+    let set = ExpertSet::open_routed(dir, RoutedFmt::F4, d).unwrap();
+    (cfg, range, set)
+}
+
 /// The synthetic fixtures above are toy-dimension. This is the arithmetic that actually
 /// broke, at the real 256 × 13369344, read from the file `convert_v4 --verify` produced.
 #[test]
 fn the_shipped_f4_artifact_opens_at_its_own_layer_range() {
-    let Some(dir) = v4_artifact("L00.f4") else { return };
-    let cfg: rivoli::artifact::model::V4Config = rivoli::artifact::model::load_config(&dir).unwrap();
-    let range = f4_layer_range(&dir, cfg.n_layers).unwrap();
-    assert_eq!(range.start, 0, "a decodable artifact starts at layer 0");
+    let Some(dir) = v4_artifact_dir::v4_artifact("L00.f4") else { return };
+    let (cfg, range, set) = open_shipped(&dir);
+    assert_eq!(range.start, 0, "this fixture is the starts-at-zero case");
     assert!(
         range.end < cfg.n_layers,
         "this fixture is deliberately PARTIAL — if it ever covers all {} layers it has \
@@ -387,8 +398,6 @@ fn the_shipped_f4_artifact_opens_at_its_own_layer_range() {
         cfg.n_layers
     );
 
-    let d = SetDims::new(range.clone(), cfg.n_experts, cfg.hidden, cfg.moe_inter);
-    let set = ExpertSet::open_routed(&dir, RoutedFmt::F4, d).unwrap();
     let stride = f4_expert_stride(cfg.hidden, cfg.moe_inter);
     let len = std::fs::metadata(format!("{dir}/L00.f4")).unwrap().len() as usize;
     assert_eq!(
@@ -403,4 +412,40 @@ fn the_shipped_f4_artifact_opens_at_its_own_layer_range() {
     // directory both pass for reasons that are not the guard — an EOF and a missing file
     // respectively — so they are proved in the synthetic cases, where the message can be
     // checked.
+}
+
+/// The layers-3-5 artifact: a `.f4` set whose range does **not** start at 0.
+///
+/// `l0-2` cannot test this at all — `layer - first_layer` is the identity there, so an
+/// `ExpertSet` that ignored `first_layer` entirely would pass every other case in this
+/// file. Here layer 3 is `files[0]`, and asking for layer 0 must be refused rather than
+/// silently returning layer 3's descriptor.
+#[test]
+fn an_f4_set_that_does_not_start_at_layer_zero_is_addressed_by_absolute_id() {
+    let Some(dir) = v4_artifact_dir::v4_artifact_l3_5("L03.f4") else { return };
+    let (_cfg, range, set) = open_shipped(&dir);
+    assert_eq!(range, 3..6, "this fixture is the non-zero-start case");
+
+    // **Each layer's descriptor must point at that layer's FILE.** Resolved through
+    // `/proc/self/fd`, because every weaker phrasing is satisfiable by a wrong mapping that
+    // happens to coincide on this fixture: `layer % files.len()` equals `layer -
+    // first_layer` for exactly 3..6 over 3 files, and an injected version of it passed a
+    // distinct-fds check and an offset check. The filename cannot coincide.
+    for l in range.clone() {
+        let (fd, begin, _) = set.read_spec(l, 0).unwrap();
+        let path = std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap();
+        assert!(
+            path.ends_with(format!("L{l:02}.f4")),
+            "layer {l} resolved to {path:?}"
+        );
+        // Expert 0 sits at the header offset in EVERY layer file — the block offset is a
+        // function of the expert, not the layer, so this is what would alias if the layer
+        // mapping were the only thing distinguishing them.
+        assert_eq!(begin, VQ_ALIGN, "layer {l} expert 0");
+    }
+    // Below and above the range are refused, not wrapped.
+    for l in [0, 1, 2, 6] {
+        assert!(set.read_spec(l, 0).is_err(), "layer {l} is not in [3, 6)");
+    }
+    assert!(set.shared_block(3).is_err(), "still an .f4: no shared block");
 }

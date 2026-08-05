@@ -12,15 +12,21 @@
 //! any of those pairs changes an `o_dim` that the config predicts independently, which is
 //! what the assertions below compare against.
 //!
-//! **What this CANNOT see, stated rather than implied:**
-//!   * `w1` and `w3` (gate and up) have identical shapes, so a swap between them is
-//!     dimensionally invisible here — as `quant::V4_PROJ`'s doc says, only a numerical
-//!     oracle can catch it, which is what `src/v4oracle/` exists for.
-//!   * The shipped fixture is layers 0-2 and `num_hash_layers` is 3, so **every layer it
-//!     holds is hash-routed**: the `V4Route::Scored` arm, the `ffn.gate.bias` extent check,
-//!     and the ratio-128 compressor-without-indexer shape are constructed by NO artifact on
-//!     this machine. `tests/v4_artifact.rs` records the same gap for the converter and walks
-//!     the checkpoint index instead. Closing it needs an artifact covering a layer >= 3.
+//! Both shipped fixtures are driven, and between them they cover every branch:
+//!
+//! | fixture | layers | ratios | routing | compressor / indexer |
+//! |---|---|---|---|---|
+//! | `v4-f4-l0-2` | 0-2 | 0, 0, 4 | all **hash** (`num_hash_layers` = 3) | none, none, both |
+//! | `v4-f4-l3-5` | 3-5 | 128, 4, 128 | all **scored** | all three, layer 4 only |
+//!
+//! `l3-5` is also the only one whose range does not start at 0, so it is what proves
+//! `V4Pin::layer`'s absolute-id mapping — against `l0-2` alone an off-by-`range.start` bug
+//! is invisible, because the offset is zero.
+//!
+//! **What this CANNOT see, stated rather than implied:** `w1` and `w3` (gate and up) have
+//! identical shapes, so a swap between them is dimensionally invisible here — as
+//! `quant::V4_PROJ`'s doc says, only a numerical oracle can catch it, which is what
+//! `src/v4oracle/` exists for.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 #![cfg(any(feature = "rocm", feature = "vulkan"))]
 
@@ -29,29 +35,75 @@ use rivoli::memory::pin::{V4Pin, V4Route};
 
 #[path = "common/v4_artifact_dir.rs"]
 mod v4_artifact_dir;
-use v4_artifact_dir::v4_artifact;
 
 #[test]
 fn v4_pin_places_every_tensor_into_the_field_its_dimensions_predict() {
-    let Some(dir) = v4_artifact("resident.safetensors") else { return };
-    let cfg: V4Config = load_config(&dir).unwrap();
-    let pin = V4Pin::build(&dir, &cfg).expect("the shipped artifact must load");
-
-    // The pin holds the ARTIFACT's layers, not the model's. The fixture is partial on
-    // purpose; if it ever stops being, this stops testing the case it was chosen for.
+    let mut ran = 0;
+    let mut all = Seen::default();
+    for dir in [
+        v4_artifact_dir::v4_artifact("resident.safetensors"),
+        v4_artifact_dir::v4_artifact_l3_5("resident.safetensors"),
+    ]
+        .into_iter()
+        .flatten()
+    {
+        let s = check_one(&dir);
+        all.hash |= s.hash;
+        all.scored |= s.scored;
+        all.indexer |= s.indexer;
+        all.compressor_only |= s.compressor_only;
+        ran += 1;
+    }
+    assert!(ran > 0, "no V4 artifact on this machine — nothing was checked");
+    // The union, asserted. Otherwise a machine with only `l0-2` would run all-green having
+    // never constructed a `V4Route::Scored`, and this test would report coverage it does
+    // not have — which is the failure mode this whole port keeps re-learning.
     assert!(
-        pin.layers.len() < cfg.n_layers,
-        "this fixture must stay PARTIAL — it holds {} of {} layers",
-        pin.layers.len(),
+        all.hash && all.scored && all.indexer && all.compressor_only,
+        "the fixtures present did not cover every branch: {all:?} — `l0-2` gives hash + \
+         ratio-4, `l3-5` gives scored + ratio-128-without-indexer, and both are needed"
+    );
+}
+
+/// Which branches a fixture actually constructed. Returned rather than asserted inside,
+/// because no single artifact covers all of them and a per-fixture assertion would either
+/// fail on the other one or assert nothing.
+#[derive(Default, Debug)]
+struct Seen {
+    hash: bool,
+    scored: bool,
+    indexer: bool,
+    compressor_only: bool,
+}
+
+fn check_one(dir: &str) -> Seen {
+    let mut seen = Seen::default();
+    let cfg: V4Config = load_config(dir).unwrap();
+    let pin = V4Pin::build(dir, &cfg).unwrap_or_else(|e| panic!("{dir} must load: {e:#}"));
+    let range = pin.range();
+
+    // The pin holds the ARTIFACT's layers, not the model's. Both fixtures are partial on
+    // purpose; if one stops being, it stops testing the case it was chosen for.
+    assert!(
+        range.len() < cfg.n_layers,
+        "{dir} must stay PARTIAL — it holds {} of {} layers",
+        range.len(),
         cfg.n_layers
     );
+    // Absolute ids only. Outside the range must be refused rather than wrapping into
+    // another layer's weights — the failure `V4Pin::layer` exists to make impossible.
+    assert!(pin.layer(range.end).is_err(), "{dir}: past the end");
+    if range.start > 0 {
+        assert!(pin.layer(range.start - 1).is_err(), "{dir}: before the start");
+    }
 
     let (h, hd, qk) = (cfg.hidden, cfg.head_dim, cfg.q_lora_rank);
     let heads = cfg.n_heads * hd;
     assert_eq!((pin.embed.o_dim, pin.embed.i_dim), (cfg.vocab, h));
     assert_eq!((pin.head.o_dim, pin.head.i_dim), (cfg.vocab, h));
 
-    for (l, p) in pin.layers.iter().enumerate() {
+    for l in range.clone() {
+        let p = pin.layer(l).unwrap();
         let dims = |w: &rivoli::memory::pin::Fp8Weight| (w.o_dim, w.i_dim);
         // Every one of these is a different (o_dim, i_dim), so a tensor resolved into the
         // wrong field moves at least one of them.
@@ -73,6 +125,7 @@ fn v4_pin_places_every_tensor_into_the_field_its_dimensions_predict() {
         // branch's tensor — so a disagreement is a failed load, not a silent fallback.
         match &p.route {
             V4Route::Hash { tid2eid } => {
+                seen.hash = true;
                 assert!(cfg.layer_routes_by_hash(l), "layer {l} hash-routed, config says no");
                 assert_eq!(tid2eid.len(), cfg.vocab * cfg.top_k, "layer {l} tid2eid extent");
                 // Already range-checked at load; confirm the invariant survived into the pin
@@ -84,6 +137,7 @@ fn v4_pin_places_every_tensor_into_the_field_its_dimensions_predict() {
                 );
             }
             V4Route::Scored { bias } => {
+                seen.scored = true;
                 assert!(!cfg.layer_routes_by_hash(l), "layer {l} scored, config says hash");
                 assert_eq!(bias.len(), cfg.n_experts, "layer {l} gate bias");
             }
@@ -103,6 +157,8 @@ fn v4_pin_places_every_tensor_into_the_field_its_dimensions_predict() {
             "layer {l} indexer presence (ratio {})",
             cfg.compress_ratio(l).unwrap()
         );
+        seen.indexer |= p.indexer.is_some();
+        seen.compressor_only |= p.compressor.is_some() && p.indexer.is_none();
         if let Some(ix) = &p.indexer {
             assert_eq!(
                 dims(&ix.wq_b),
@@ -112,9 +168,12 @@ fn v4_pin_places_every_tensor_into_the_field_its_dimensions_predict() {
         }
     }
 
-    // The routed set is addressable and stops at the last ROUTED expert — the `.f4` has no
-    // shared block, and `V4Pin` must not have opened it as though it did.
-    assert!(pin.f4.read_spec(0, cfg.n_experts - 1).is_ok());
-    assert!(pin.f4.read_spec(0, cfg.n_experts).is_err());
-    assert!(pin.f4.shared_block(0).is_err());
+    // The routed set is addressable at the artifact's OWN first layer — not at 0, which is
+    // not in `l3-5` at all — and stops at the last ROUTED expert: the `.f4` has no shared
+    // block and `V4Pin` must not have opened it as though it did.
+    let l0 = range.start;
+    assert!(pin.f4.read_spec(l0, cfg.n_experts - 1).is_ok(), "{dir}");
+    assert!(pin.f4.read_spec(l0, cfg.n_experts).is_err(), "{dir}");
+    assert!(pin.f4.shared_block(l0).is_err(), "{dir}");
+    seen
 }
