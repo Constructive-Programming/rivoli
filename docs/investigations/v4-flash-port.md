@@ -305,6 +305,59 @@ fixture engineered to separate RNE from half-away-from-zero, which is the proper
 actually matters. So the honest statement is that **this gate verifies the compressor and
 delegates `act_quant` to S2b's** — not that `act_quant` is unverified.
 
+### The Hadamard basis order — SETTLED 2026-08-05 by S2c-indexer, and it was load-bearing
+
+S1b flagged `numerics::hadamard_rotate`'s basis order as **its single highest-risk
+inference**: `model.py:256` imports `hadamard_transform` from `fast_hadamard_transform`, the
+package is not vendored with the checkpoint, and `inference/requirements.txt` does not pin a
+version — so the order could not be read off the reference. It was resolved by reading the
+**package**, not by agreeing with the oracle:
+
+1. `fast_hadamard_transform.hadamard_transform`'s own docstring: *"Equivalent to
+   `F.linear(x, torch.tensor(scipy.linalg.hadamard(dim))) * scale`"*. The package ships that
+   equivalence as executable code (`hadamard_transform_ref`) and its test suite asserts the
+   CUDA kernel matches it **elementwise** at `dim = 128` — which is what excludes a
+   permutation, since a reordered output disagrees maximally on random input.
+2. Checked in **both** sdists that could satisfy the unpinned requirement (1.0.4.post1 and
+   1.1.0); docstring and reference body are character-identical, so the missing pin does not
+   reopen it.
+3. `scipy.linalg.hadamard` is **Sylvester's construction** — natural/Kronecker order, not
+   sequency — by its docstring and its source.
+
+The oracle was **right**. `tests/v4_hadamard_basis.rs` now pins `hadamard_rotate` to an
+explicitly-constructed Sylvester matrix bit-for-bit and carries the chain.
+
+**The part worth banking is that nothing shipped could have told us.** `hadamard_rotate` was
+patched to the sequency order — a pure permutation, still orthogonal, still symmetric — and
+the whole CPU suite re-run: `v4_oracle.rs` 27/27, `v4_compress.rs` 7/7 and
+`v4_compress_probe.rs` 4/4 **all passed**, the ranking probe included. Two reasons, and the
+second generalises past this defect:
+
+* `hadamard_is_its_own_inverse` cannot separate the candidates because **both** orderings are
+  symmetric, and symmetry is exactly the condition for involution. Now asserted.
+* **Every oracle test is self-relative.** A `Defect` arm and its baseline both run through the
+  same primitive, so an error the oracle and its own defect matrix share cancels. That is the
+  limit of comparing an implementation to an oracle, and the only way past it is to compare
+  the oracle to something that did not come from the oracle's source — the same gap
+  `v4compress.rs`'s `jscpd:ignore` region names for `freqs_cis`/`window_topk`/`compress_topk`,
+  which is **still open**.
+
+It mattered. Measured in the **bf16 score** `Indexer.forward` computes, over 64 row pairs:
+before quantization the two orders are **bit-identical on all 64** (`(Hq)·(Hk) = q·k` for any
+orthogonal `H`); with `fp4_act_quant`'s block-32 grouping they differ on **56 of 64**, by a
+median **7%** and a maximum **104%** of the larger score, against a ~0.8% bf16 step. The
+whole mechanism is *which coordinates share an fp4 scale*.
+
+Two review findings from this round are worth keeping as method. The negative control
+("sequency fails the same gate") **did not call the function under test** — it compared two
+locally-built matrices to each other, and so would have stayed green under the exact defect
+it claimed to catch; all three reviews found it, and the gate and its control are now one
+test so a rename cannot separate them. And the first cut scored the impact in "bf16 ulps"
+using `|v| · 2^-8`, which is one binade wrong — 8 significand bits give a spacing of `2^-7`
+of the binade *base* — and that inflated figure had already been copied into three documents.
+Counting distinct **bf16 scores** needs no ulp arithmetic at all, and is the quantity the
+selection actually reads.
+
 ### Convergence between two reviews is not confirmation — S2b, 2026-08-05
 
 S2b committed with two of three reviews, judging the third's question already answered. It
