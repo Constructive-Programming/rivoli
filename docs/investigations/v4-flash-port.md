@@ -309,10 +309,19 @@ delegates `act_quant` to S2b's** — not that `act_quant` is unverified.
 > assertion, so `cargo test --release --features rocm --test v4_compress_kernel` has been
 > RED since the S2 merge (`78796eb`): 6 passed, 2 failed, exit 101.** Verified by the
 > coordinator on the merged tree, not inferred. `each_in_scope_defect_is_further_from_the_gpu_than_the_clean_oracle_is`
-> fails on exactly the cells this section rules out — `SkipKvActQuant` at max=14 against a
-> **clean** cell of max=16, i.e. the defect is *closer* to the GPU than clean is;
-> `KvActQuantBlock128` at max=16, identical to clean; `KvActQuantNoRoundScale` at 23.
+> fails on `SkipKvActQuant` at max=14 against a **clean** cell of max=16 — i.e. the defect
+> is *closer* to the GPU than clean is — on `KvActQuantBlock128` at max=16, identical to
+> clean, and on `KvActQuantNoRoundScale` at 23.
 >
+> > **CORRECTED AGAIN, same day.** The paragraph above said these were "exactly the cells
+> > this section rules out". They are not. On hardware the non-coverage is **13 cells, not
+> > the four tabulated above**, and it includes **`NoBf16Rounding` at `sep=16` on both
+> > ratio-128 cells** — exactly one e4m3 step, and *not an `act_quant` argument at all*, so
+> > this section's framing ("only the three `act_quant` **argument** defects") understated
+> > both the count and the kind. The error was mine: I read the DECIDED table as the
+> > failing set instead of running the sweep and reading the failing set. The table was a
+> > record of what had been *considered*, and I treated it as a record of what *fails*.
+> 
 > The DECISION stands and `RESOLVABLE` must still not be lowered. What was wrong is leaving
 > an assertion demanding the thing the section had just decided not to require. **A red
 > suite is worse than an absent test**: with no CI, every agent who runs the prescribed
