@@ -385,6 +385,12 @@ struct TierFmt {
 /// rebalance the arena emits a relocation, which we execute as a synchronous device
 /// memcpy of the expert's bytes and remap its key. `slot_of`/`key_at` are inverse maps.
 struct ArenaPool {
+    /// Compaction relocations executed. Counted because arena relocation is the standing
+    /// suspect for the long-run divergence and nothing was measuring how often it fires —
+    /// `--checksum-route` records the per-layer delta so a divergence coordinate can be
+    /// checked against what the arena did at that coordinate
+    /// (docs/measurement/benchmarks.md, "Long-run corruption").
+    relocs: u64,
     #[allow(dead_code)] // RAII owner of the pool VMM; addressed via `base`/`host_base`
     buf: VmmBuf,
     /// The DEVICE base: what every expert descriptor's six projection pointers are built
@@ -547,6 +553,8 @@ impl ArenaPool {
         unsafe { memcpy_dtod(dst, src, stride)? };
         self.slot_of.insert(moved, (r.hot, r.to));
         self.key_at.insert((r.hot, r.to), moved);
+        self.relocs += 1;
+
         // The relocation copies the bytes with the key, so `moved` stays loaded. Nothing
         // else changes state: the source slot is now free and holds no key.
         Ok(())
@@ -554,6 +562,14 @@ impl ArenaPool {
 }
 
 impl<'a> Pin<'a> {
+    /// Compaction relocations executed so far (`--checksum-route`). Read as a per-layer
+    /// delta: the question is whether a divergence coordinate coincides with the arena
+    /// moving bytes, not how many it moved overall.
+    #[cfg(feature = "corruption-probe")]
+    pub fn relocs(&self) -> u64 {
+        self.routed.relocs
+    }
+
     /// Enqueue the device-side wait for `t` on `stream_raw`. The ONLY way to consume a
     /// ticket — so a launch cannot happen without its dependency.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -827,6 +843,7 @@ impl<'a> Pin<'a> {
         // need `&mut buf` and `buf` is moved into the struct after.
         let host_base = buf.host_mut();
         let routed = ArenaPool {
+            relocs: 0,
             buf,
             base,
             host_base,

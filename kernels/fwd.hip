@@ -235,3 +235,39 @@ extern "C" int rivoli_flag_nonfinite(const float* x, int n, unsigned tag, unsign
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
+
+// XOR-fold the exact bits of `x[0..n]` into `out[slot]` — the `--hash-layers` probe
+// (`--features corruption-probe`). Two runs of the same input must agree slot for slot; the
+// FIRST slot that differs names the (position, layer) where a run diverged, which is the
+// question the long-run corruption investigation cannot answer from output text alone
+// (docs/measurement/benchmarks.md, "Long-run corruption").
+//
+// XOR because it is commutative AND associative, so the fold is bit-identical whatever order
+// the atomics land in. A float sum would be neither, and would report divergence on every
+// token from scheduling jitter alone — the probe has to be quieter than the bug it hunts.
+// The index is mixed in so a permutation of the same values is still a different hash.
+//
+// Same discipline as flag_nonfinite above, for the same measured reason: this stays on the
+// DEVICE and adds NO sync. `--checksum-x` copied `x` to the host per layer and made the
+// fault disappear entirely; the caller drains all 78 slots in ONE D2H per token instead.
+extern "C" __global__ void hash_rows(const float* __restrict__ x, int n,
+                                     unsigned long long* __restrict__ out) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    unsigned int bits;
+    __builtin_memcpy(&bits, &x[i], sizeof(bits));
+    // splitmix64 finalizer over (bits, index): a one-bit change anywhere reaches the whole
+    // word, so an XOR fold cannot cancel two nearby differences against each other.
+    unsigned long long z = ((unsigned long long)i << 32) ^ (unsigned long long)bits;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    atomicXor(out, z ^ (z >> 31));
+}
+
+extern "C" int rivoli_hash_rows(const float* x, int n, unsigned long long* out) {
+    if (n <= 0) return 1001;
+    hipGetLastError();
+    hipLaunchKernelGGL(hash_rows, dim3((n + 255) / 256), dim3(256), 0, 0, x, n, out);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}

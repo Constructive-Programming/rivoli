@@ -31,7 +31,10 @@ MODE="${1:-full}"
 # Mutually exclusive — one backend per build, no runtime selection. Never both in one cell.
 BACKENDS=(rocm vulkan)
 # The optional, non-backend features. `default` is empty and is not a cell.
-OPTIONAL=(otlp teacher-forcing pred-probe trace)
+# `trace` implies `corruption-probe`, but both are listed: the powerset must still cover
+# corruption-probe ALONE, which is the configuration the divergence probes actually run in
+# (trace's arena poison-fill carries a device_sync that perturbs what they measure).
+OPTIONAL=(otlp teacher-forcing pred-probe trace corruption-probe)
 
 read -r -a BACKENDS <<<"${RIVOLI_BACKENDS:-${BACKENDS[*]}}"
 

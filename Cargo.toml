@@ -83,7 +83,13 @@ otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 # EXPENSIVE audits: correctness probes (--checksum-x/XSUM) + fine-grained per-op
 # perf timing + windowed tok/s. Off by default; `--features rocm,trace`. (The cheap
 # per-token profiling + the PROFILE summary are ALWAYS ON, no feature needed.)
-trace = []
+trace = ["corruption-probe"]
+# `--checksum-x`: a per-layer XOR hash of the residual, folded ON DEVICE and drained once
+# per token. Split out of `trace` on 2026-08-04 because trace's arena poison-fill carries
+# its own device_sync, and this probe hunts an intermittent race that added syncs MASK
+# (docs/measurement/benchmarks.md, "Long-run corruption"). `trace` still implies it, so a
+# trace build keeps the flag it always had.
+corruption-probe = []
 
 # The microbench is `#![cfg(feature = "rocm")]` end to end; without the feature it
 # compiles to an empty file and cargo rejects it for having no main. Skip it instead.

@@ -2729,3 +2729,98 @@ thermal headroom on every token forever, and the requant is paid once. Under the
 scoring the row rests entirely on quality, where the only evidence is a screen. **Settle it with
 a requant and a real paired dNLL, and repeat every arm** — ~40% of 5k-token runs are silently
 corrupted (see "Long runs are NON-DETERMINISTIC" above).
+
+## Long-run divergence: a RACE, not residency — INV-1 exonerated, and the first witnessed pairs — 2026-08-05
+
+Follows "Long-run corruption: four mechanisms eliminated" above. **Still not root-caused**, but
+two whole classes are now closed and the measurement itself was wrong in a way worth recording.
+
+### First: the earlier numbers were taken without a contention witness
+
+`flock /var/run/sys-gpu.lock` is **advisory**, and another agent on this box runs GPU tests
+without it — observed directly on 2026-08-04 (`cargo test --test v4_compress_probe`, out of a
+nested worktree, concurrent with a locked `--ppl` run). A contended arm is *unattributable*:
+contention moves timing, timing moves cache decisions, and a divergence between two arms is
+then explained equally well by the bug and by the neighbour.
+
+**The tell, and it is a general one.** The arms WITHOUT the extra probe ran SLOWER than the
+arms with it (2485.6/2428.9 s vs 2247.3/2301.4 s). A probe that adds work cannot make a run
+faster, so the ordering being backwards is contention. A reproduction claim was made on that
+pair and **retracted**.
+
+Every pair below therefore carries a per-arm **witness log** — every PID holding `/dev/kfd` or
+a render node, sampled every 20 s, minus the arm's own. The rule is fixed before the data: a
+non-empty witness means the arm is **discarded, not interpreted**. Both arms of both pairs
+below sampled ZERO.
+
+> This retroactively puts a question mark over the `~40% of runs` and `token 4042` /
+> `17 nats` figures in the two sections above: those runs had no witness either. They are not
+> hereby wrong — but the *rate* is unestablished, and a single unwitnessed pair should not be
+> quoted as one.
+
+### The witnessed pairs
+
+`--mode int3-vq --no-mtp --attn dsa --max-mem 90`, `ppl-corpus-5000`, sole-tenant, witness empty:
+
+| pair | arm 1 | arm 2 | first divergence (pos, layer) |
+|---|---:|---:|---|
+| A | 4.126882 | 4.175782 | (258, 62) |
+| B | 4.848965 | 4.302220 | (265, 60) |
+
+**It reproduces on a clean machine**, so the fault is real and not an artifact of contention.
+Pair B's 0.55 PPL spread is the ~0.5 recorded originally; pair A's 0.049 is not. The
+divergence POSITION moves between pairs, which rules out anything deterministic about token
+4042 and is the signature of a race rather than a data-dependent bug.
+
+### INV-1 is EXONERATED, by direct measurement
+
+`--checksum-route` (`--features corruption-probe`) records, per MoE layer, an FNV-1a hash of
+the gate logits the router SAW and of the experts it PICKED. Routing is a pure host-side
+function of `gl_host`, which is already on the host, so this costs **no device traffic and no
+I/O during the run** — the log is held in memory and written after the last token.
+
+Across **388,875 records per arm** (5185 positions x 75 MoE layers), in both pairs:
+
+> **Rows where the gate logits AGREE and the picks DIFFER: 0.**
+
+Routing is a pure function of its inputs, exactly as INV-1 and
+`math.rs::inv_1_routing_never_consults_the_cache` claim. Where the picks diverge, the *logits*
+diverged first and at the same row — routing faithfully reflecting an already-corrupted
+residual. **The `hit_pct`-tracks-output correlation that motivated this check is a symptom,
+not a cause**, and `--mode int3-vq` remains output-neutral to residency as documented.
+
+### The load-bearing result: identical decisions, different answer
+
+`--checksum-route` also records each layer's **misses** and **compaction relocations**. The
+relocation counter (`ArenaPool::relocs`) did not exist before this: arena relocation has been
+the standing suspect since the NaN investigation and nothing was counting how often it fires.
+
+In pair B, over all **19,932 layer-records before the divergence**, the two arms are
+**bit-identical in (misses, relocs)** — same 9,117 relocations, same miss sequence, same
+everything. Then they diverge.
+
+**So the arena and the fetch path made exactly the same decisions in both arms.** The
+divergence is not a different residency, a different eviction, or a different relocation —
+it is the *same* work producing a *different* result. That is a timing race, and it closes
+the residency-driven family of explanations completely.
+
+Base rates at the divergence, so the coordinate is not over-read: **33.1%** of layer-records
+carry >=1 relocation and **91.8%** carry >=1 miss. Pair B's last-identical layer (265, 59) had
+one of each, which is therefore **unremarkable** — one event cannot implicate compaction, and
+this one does not.
+
+### What would settle it
+
+More witnessed pairs, scored the same way: if the layer immediately before divergence carries
+a relocation in ~5 of 5 events against a 33% base rate, compaction is implicated; if it tracks
+33%, it is not. Each pair is ~85 min of sole-tenant GPU. Note that the divergence window is
+two stages wide either way — layer *L-1*'s MoE compute and layer *L*'s attention both sit
+between the last agreeing router and the first disagreeing one.
+
+**A note on the other probe.** `--checksum-x` was rewritten the same day (per-layer host copy
+-> on-device XOR fold, one D2H per token) because the old form was the `--checksum-x` that
+`kernels/fwd.hip` records as masking the intermittent NaN outright. Four runs with the new
+form were still bit-identical where unprobed runs were not — but that comparison is
+CONTAMINATED (it is the retracted pair above), so **whether the on-device form still masks is
+unresolved**. It is verified quiet across two `--bench 32` runs and correctly red at `l=3`
+under `--moe-gain 1.001`; that is all it is verified for.

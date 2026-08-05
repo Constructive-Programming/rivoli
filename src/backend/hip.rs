@@ -206,6 +206,8 @@ unsafe extern "C" {
     ) -> i32;
     fn rivoli_vadd(x: *mut f32, y: *const f32, n: i32) -> i32;
     fn rivoli_flag_nonfinite(x: *const f32, n: i32, tag: u32, flag: *mut u32) -> i32;
+    #[cfg(feature = "corruption-probe")]
+    fn rivoli_hash_rows(x: *const f32, n: i32, out: *mut u64) -> i32;
     fn rivoli_vaxpy(x: *mut f32, y: *const f32, g: f32, n: i32) -> i32;
     fn rivoli_argmax(logits: *const f32, n: i32, out_idx: *mut i32, out_val: *mut f32) -> i32;
 
@@ -755,6 +757,20 @@ pub unsafe fn launch_flag_nonfinite(
     // SAFETY: caller's pointer contract.
     let r = unsafe { rivoli_flag_nonfinite(x, n as i32, tag, flag) };
     check(r, "flag_nonfinite")
+}
+
+/// XOR-fold `x[0..n]`'s bits into `out` — the `--hash-layers` divergence probe.
+///
+/// Adds no sync, deliberately: see [`launch_flag_nonfinite`] above and the kernel comment
+/// for the measurement that forces it (`--checksum-x` masked the fault it was hunting).
+///
+/// # Safety
+/// `x` must be `n` device f32; `out` one device u64, zeroed before the layer folds into it.
+#[cfg(feature = "corruption-probe")]
+pub unsafe fn launch_hash_rows(x: *const f32, n: usize, out: *mut u64) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r = unsafe { rivoli_hash_rows(x, n as i32, out) };
+    check(r, "hash_rows")
 }
 
 /// `x += y` — the residual add. (`--moe-gain != 1` takes [`launch_vaxpy`] instead.)

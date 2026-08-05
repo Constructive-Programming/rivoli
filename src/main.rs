@@ -224,10 +224,17 @@ struct Args {
     mtp_min_conf: f32,
 
 
-    /// DIAGNOSTIC: hash the residual stream after every layer.
-    #[cfg(feature = "trace")]
+    /// DIAGNOSTIC: XOR-hash the residual stream after every layer, on the device.
+    #[cfg(feature = "corruption-probe")]
     #[arg(long)]
     checksum_x: bool,
+
+    /// DIAGNOSTIC: write per-MoE-layer (gate-logit, pick) hashes here. Host-side only —
+    /// no device traffic, no I/O until the run ends, because perturbing either masks the
+    /// divergence this exists to find.
+    #[cfg(feature = "corruption-probe")]
+    #[arg(long, value_name = "PATH")]
+    checksum_route: Option<String>,
 }
 
 /// `--moe-gain`'s band. A hand-written parser because clap's `range` value_parser is
@@ -437,10 +444,11 @@ fn main() -> Result<()> {
     if let Some(budget) = a.spans {
         rivoli::telemetry::spans::init(budget);
     }
-    // `--checksum-x` only exists in a `trace` build; elsewhere the field is dead-false.
-    #[cfg(feature = "trace")]
+    // `--checksum-x` only exists in a `corruption-probe` build (which `trace` implies);
+    // elsewhere the field is dead-false.
+    #[cfg(feature = "corruption-probe")]
     let checksum_x = a.checksum_x;
-    #[cfg(not(feature = "trace"))]
+    #[cfg(not(feature = "corruption-probe"))]
     let checksum_x = false;
     // The one run-identity attribute the OTLP root span cannot read back off `cfg`, since
     // `attn` is moved into it below and `AttnMode` has no Display.
@@ -714,8 +722,10 @@ fn main() -> Result<()> {
             max_ctx,
             cfg.attn.clone(),
         )?;
-        #[cfg(feature = "trace")]
-        engine.set_checksum_x(cfg.checksum_x);
+        #[cfg(feature = "corruption-probe")]
+        engine.set_checksum_x(cfg.checksum_x)?;
+        #[cfg(feature = "corruption-probe")]
+        engine.set_checksum_route(a.checksum_route.is_some());
         #[cfg(feature = "pred-probe")]
         engine.set_pred_probe(a.pred_probe);
         engine.set_moe_gain(a.moe_gain);
@@ -752,6 +762,12 @@ fn main() -> Result<()> {
                 cfg.mode, cfg.cache_policy, a.moe_gain
             );
             rivoli::eval::run(&mut engine, &ids, a.ppl_out.as_ref(), &label)?;
+            // After the run, never during it: the log is held in memory precisely so the
+            // measurement is not perturbed by its own instrument.
+            #[cfg(feature = "corruption-probe")]
+            if let Some(p) = &a.checksum_route {
+                engine.dump_route_log(p)?;
+            }
             return Ok(());
         }
 

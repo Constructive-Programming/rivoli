@@ -751,18 +751,33 @@ pub struct GpuEngine<'a> {
     tail_ev_start: Event,
     tail_ev_end: Event,
     /// One-shot latch so the first non-finite residual is reported once, not 78x per
-    /// position for the rest of the run (`trace` only).
-    #[cfg(feature = "trace")]
-    nan_seen: bool,
     /// Tail events recorded this token and not yet read. False on the very first
     /// `argmax` (the prompt's forward has run, but so has its `record`) — kept as a
     /// guard anyway so an early-exit path cannot read an unrecorded event.
     tail_ev_pending: bool,
-    /// DIAGNOSTIC (`--checksum-x`, `trace` only): hash the residual stream each layer.
-    #[cfg(feature = "trace")]
+    /// DIAGNOSTIC (`--checksum-x`): XOR-hash the residual after every layer, on the
+    /// device, and drain all of them in ONE D2H per token. See the launch site.
+    #[cfg(feature = "corruption-probe")]
     checksum_x: bool,
-    #[cfg(feature = "trace")]
-    ck_buf: Vec<u8>,
+    /// `[n_layers]` device u64, one XOR-fold slot per layer. Allocated only when the flag
+    /// is on, so a probe build that does not pass it costs nothing.
+    #[cfg(feature = "corruption-probe")]
+    hash_dev: Option<DeviceBuf>,
+    /// `--checksum-route`: `(pos, layer, gate-logit hash, pick hash)` per MoE layer, held
+    /// in memory and written once at the end. Costs NO device traffic and NO I/O during
+    /// the run — `gl_host` is already on the host because routing is a host-side function
+    /// of it. That is the whole design: `--checksum-x`'s per-token D2H/H2D was measured to
+    /// MASK the run-to-run divergence it was built to localise (benchmarks.md), so the
+    /// instrument that replaces it must touch neither the device nor the disk mid-run.
+    #[cfg(feature = "corruption-probe")]
+    route_log: Option<Vec<RouteRec>>,
+    /// Row 0's (gate-logit, pick) hashes, held from the routing site until the end of the
+    /// layer — the misses and relocations that row must be scored against are not counted
+    /// until then, and they are the whole reason to record it.
+    #[cfg(feature = "corruption-probe")]
+    route_pending: Option<(u64, u64)>,
+    #[cfg(feature = "corruption-probe")]
+    hash_host: Vec<u8>,
 }
 
 impl<'a> GpuEngine<'a> {
@@ -1018,18 +1033,22 @@ impl<'a> GpuEngine<'a> {
             miss_stream: Stream::miss()?,
             moe_ev_start: Event::new()?,
             moe_ev_end: Event::new()?,
-            #[cfg(feature = "trace")]
-            nan_seen: false,
             tail_ev_start: Event::new()?,
             tail_ev_end: Event::new()?,
             tail_ev_pending: false,
             idx_ev_start: Event::new()?,
             idx_ev_end: Event::new()?,
             idx_ev_pending: false,
-            #[cfg(feature = "trace")]
+            #[cfg(feature = "corruption-probe")]
             checksum_x: false,
-            #[cfg(feature = "trace")]
-            ck_buf: Vec::new(),
+            #[cfg(feature = "corruption-probe")]
+            hash_dev: None,
+            #[cfg(feature = "corruption-probe")]
+            route_log: None,
+            #[cfg(feature = "corruption-probe")]
+            route_pending: None,
+            #[cfg(feature = "corruption-probe")]
+            hash_host: Vec::new(),
             heartbeat: None,
             pin,
         })
@@ -1068,9 +1087,48 @@ impl<'a> GpuEngine<'a> {
     }
 
     /// DIAGNOSTIC: hash the residual stream after every layer (`--checksum-x`).
-    #[cfg(feature = "trace")]
-    pub fn set_checksum_x(&mut self, on: bool) {
+    #[cfg(feature = "corruption-probe")]
+    pub fn set_checksum_x(&mut self, on: bool) -> Result<()> {
         self.checksum_x = on;
+        if on && self.hash_dev.is_none() {
+            let n = self.cfg.n_layers;
+            // hipMalloc does not zero and the fold is an XOR, so an unzeroed slab would
+            // corrupt the first token's hashes — the one token an investigation into
+            // divergence position least wants to distrust.
+            let mut b = DeviceBuf::new(n * 8)?;
+            b.copy_in_at(0, &vec![0u8; n * 8])?;
+            self.hash_dev = Some(b);
+            self.hash_host = vec![0u8; n * 8];
+        }
+        Ok(())
+    }
+
+    /// DIAGNOSTIC (`--checksum-route`): record what the router SAW and what it PICKED,
+    /// per MoE layer. Two runs of one input answer INV-1 directly — if the gate logits
+    /// match and the picks differ, routing consulted something outside its inputs; if the
+    /// logits themselves differ, routing is a pure function fed corrupted state and the
+    /// fault is upstream of it.
+    #[cfg(feature = "corruption-probe")]
+    pub fn set_checksum_route(&mut self, on: bool) {
+        self.route_log = on.then(Vec::new);
+    }
+
+    /// Write the `--checksum-route` log. One line per (pos, layer); the first line that
+    /// differs between two runs is the coordinate the investigation wants.
+    #[cfg(feature = "corruption-probe")]
+    pub fn dump_route_log(&self, path: &str) -> Result<()> {
+        let Some(log) = &self.route_log else {
+            return Ok(());
+        };
+        // Built whole and written once, rather than streamed through a BufWriter: the log
+        // is a few MB, and the run is already over by the time this is called.
+        let mut out = format!("# rivoli-route v2 pos layer gl pk misses relocs rows={}\n", log.len());
+        for (pos, l, gl, pk, miss, rel) in log {
+            out.push_str(&format!("{pos} {l} {gl:016x} {pk:016x} {miss} {rel}\n"));
+        }
+        std::fs::write(path, out).with_context(|| format!("write {path}"))?;
+        tracing::info!("wrote {} route records to {path}", log.len());
+        Ok(())
     }
 
     /// DIAGNOSTIC (`--pred-probe`): can a layer's experts be predicted BEFORE its attention
@@ -1764,6 +1822,8 @@ impl<'a> GpuEngine<'a> {
             // This layer's miss count, hoisted so the end-of-layer bracket read can bucket
             // by it. 0 on dense layers, which never enter the MoE branch.
             let mut layer_misses = 0usize;
+            #[cfg(feature = "corruption-probe")]
+            let mut layer_relocs = 0u32;
             // Open the launch-cost span. Everything from here to the gate D2H (MoE) or
             // the end of the dense MLP is host-side kernel issue — EXCEPT the indexer's
             // joins on the `--attn dsa` arms, so the close subtracts whatever
@@ -2055,6 +2115,16 @@ impl<'a> GpuEngine<'a> {
                         }
                     }
                 }
+                // `--checksum-route`: fold row 0's gate logits and its picks. FNV-1a over
+                // the logits' exact bytes — this must detect a one-ulp difference, so it
+                // hashes the bit pattern and never the value.
+                #[cfg(feature = "corruption-probe")]
+                if self.route_log.is_some() {
+                    self.route_pending = Some((
+                        fnv1a64(self.gl_host[..ne].iter().map(|&b| u64::from(b))),
+                        fnv1a64(self.sel_row[0].iter().map(|&e| e as u64)),
+                    ));
+                }
                 // The host half of the route region, stamped rather than derived.
                 let e_route = std::time::Instant::now();
                 self.prof.cpu_route_ns += e_route.duration_since(t_route).as_nanos();
@@ -2072,6 +2142,8 @@ impl<'a> GpuEngine<'a> {
                 // Signal (hit → ready; miss → resolves when its bytes land). The slot
                 // ADDRESSES are known now, so the descriptors below are valid pointers.
                 let miss0 = self.pin.misses;
+                #[cfg(feature = "corruption-probe")]
+                let reloc0 = self.pin.relocs();
                 // Residency must be sampled BEFORE submit_layer: it allocates slots for
                 // misses, so afterwards everything reads as resident. A bitmask, not a
                 // Vec — this runs 78x per token and top_k is 8.
@@ -2150,6 +2222,10 @@ impl<'a> GpuEngine<'a> {
                     crate::telemetry::spans::record_layer(st);
                 }
                 layer_misses = (self.pin.misses - miss0) as usize;
+                #[cfg(feature = "corruption-probe")]
+                {
+                    layer_relocs = (self.pin.relocs() - reloc0) as u32;
+                }
                 self.prof.fetch_n += self.pin.misses - miss0;
                 // Scatter each row's weights into the `[descriptor][row]` matrix the
                 // kernel reads as `wexpert[e*R + t]`. A row that did not route to a union
@@ -2483,43 +2559,62 @@ impl<'a> GpuEngine<'a> {
                 self.prof.idx_gpu_ns += (ms as f64 * 1e6) as u128;
                 self.prof.idx_layers += 1;
             }
-            // DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer,
-            // and — the reason this also scans for non-finite values — localise the
-            // intermittent NaN. The production guard only fires at `argmax`, i.e. after
-            // all 78 layers of all ~70 prefill positions, so it says the run is broken
-            // without saying where. This names the first (pos, layer) that goes bad, and
-            // whether that layer had cold misses.
-            #[cfg(feature = "trace")]
-            if self.checksum_x {
-                let n = hidden * 4;
-                // `xp`, not `x.ptr()`: this hashes THIS PASS's row 0, which under
-                // layer-major prefill is somewhere in the middle of `x` rather than at its
-                // start. Hashing row 0 of the buffer would report the same first prompt
-                // token 78 times and localise nothing.
-                // SAFETY: `xp` is this pass's residual row 0, `hidden` f32 inside `x`; the
-                // sync above retired every writer.
-                unsafe { DeviceBuf::copy_out_raw(xp as *const u8, n, &mut self.ck_buf)? };
-                let mut hh: u64 = 0xcbf2_9ce4_8422_2325;
-                for &b in self.ck_buf.iter() {
-                    hh ^= b as u64;
-                    hh = hh.wrapping_mul(0x1000_0000_01b3);
+            // DIAGNOSTIC (`--checksum-x`): XOR-fold this layer's residual into its own
+            // slot, ON THE DEVICE. Two runs of one input must agree slot for slot, so the
+            // first slot that differs names the (pos, layer) a run diverged at — the
+            // question the long-run corruption cannot answer from output text alone
+            // (benchmarks.md, "Long-run corruption").
+            //
+            // **REWRITTEN 2026-08-04, and the rewrite is the point.** This used to
+            // `copy_out_raw` the residual to the host EVERY layer and hash it there. That
+            // is the `--checksum-x` the `flag_nonfinite` kernel comment records as
+            // perturbing timing enough to MASK the intermittent NaN entirely — an
+            // instrument that cannot be used on the bug it was built for. The fold now
+            // stays on the device and all `n_layers` slots come back in ONE D2H per token.
+            //
+            // The non-finite scan that used to ride along is gone, not lost:
+            // `launch_flag_nonfinite` below already localises the first bad residual to a
+            // (pos, layer) tag, unconditionally and on the argmax D2H the tail pays anyway.
+            //
+            // `xp`, not `x.ptr()`: this hashes THIS PASS's row 0, which under layer-major
+            // prefill sits in the middle of `x` rather than at its start. Hashing row 0 of
+            // the buffer would report the same first prompt token 78 times and localise
+            // nothing.
+            // `--checksum-route`: the layer is over, so its miss and relocation counts are
+            // final. Recording them BESIDE the hashes is the point — a divergence coordinate
+            // is only actionable next to what the fetch path did at that coordinate.
+            #[cfg(feature = "corruption-probe")]
+            if let (Some((gl, pk)), Some(log)) =
+                (self.route_pending.take(), self.route_log.as_mut())
+            {
+                log.push((pos as u32, l as u16, gl, pk, layer_misses as u32, layer_relocs));
+            }
+            #[cfg(feature = "corruption-probe")]
+            if let Some(hd) = self.hash_dev.as_mut().filter(|_| self.checksum_x) {
+                // SAFETY: `xp` is this pass's residual row 0, `hidden` f32 inside `x` and
+                // retired by the sync above; `l < n_layers` is the slab's own extent.
+                unsafe {
+                    crate::backend::launch_hash_rows(
+                        xp,
+                        hidden,
+                        (hd.ptr_mut() as *mut u64).add(l),
+                    )?;
                 }
-                let bad = self
-                    .ck_buf
-                    .chunks_exact(4)
-                    .filter(|c| !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_finite())
-                    .count();
-                if bad > 0 && !self.nan_seen {
-                    self.nan_seen = true;
-                    tracing::error!(
-                        "FIRST NON-FINITE RESIDUAL at pos={pos} layer={l}: {bad}/{hidden} \
-                         elements. misses this layer={}, dense={}. Everything downstream \
-                         is poisoned, so only this first report localises the fault.",
-                        self.prof.fetch_n,
-                        dense_mlp.is_some(),
-                    );
-                }
-                tracing::info!("XSUM pos={pos} l={l} x={hh:016x} nonfinite={bad}");
+            }
+        }
+
+        // Drain every layer's hash in ONE D2H, then re-zero for the next token. Both
+        // transfers are ~n_layers*8 bytes and land where the end-of-layer sync has already
+        // idled the device — the per-LAYER copy this replaced is what masked the fault.
+        #[cfg(feature = "corruption-probe")]
+        if self.checksum_x {
+            if let Some(hd) = self.hash_dev.as_mut() {
+                hd.copy_out_into(&mut self.hash_host)?;
+                hd.copy_in_at(0, &vec![0u8; self.hash_host.len()])?;
+            }
+            for (l, c) in self.hash_host.chunks_exact(8).enumerate() {
+                let hh = u64::from_le_bytes(c.try_into().unwrap_or([0; 8]));
+                tracing::info!("XSUM pos={pos} l={l} x={hh:016x}");
             }
         }
 
@@ -3126,6 +3221,22 @@ impl<'a> GpuEngine<'a> {
         }
         Ok((generated, summary))
     }
+}
+
+/// One `--checksum-route` record: `(pos, layer, gate-logit hash, pick hash, misses,
+/// relocations)`. The dump writes these column names into its header, so the file stays
+/// readable without this type in hand.
+#[cfg(feature = "corruption-probe")]
+type RouteRec = (u32, u16, u64, u64, u32, u32);
+
+/// FNV-1a over already-widened values — the `--checksum-route` fold. Takes an iterator so
+/// the gate logits (bytes, hashed as their exact bit pattern so a one-ulp move is visible)
+/// and the picks (expert indices) share one implementation instead of two loops that drift.
+#[cfg(feature = "corruption-probe")]
+fn fnv1a64(vals: impl Iterator<Item = u64>) -> u64 {
+    vals.fold(0xcbf2_9ce4_8422_2325, |h, v| {
+        (h ^ v).wrapping_mul(0x1000_0000_01b3)
+    })
 }
 
 #[cfg(test)]
