@@ -528,7 +528,13 @@ impl Oracle {
     /// `Attention.__init__`'s per-layer table selection (model.py:481-488): compressed
     /// layers get YaRN and `compress_rope_theta`; `compress_ratio == 0` disables the
     /// interpolation branch (`original_seq_len = 0`) and uses base `rope_theta`.
-    fn freqs(&self, layer: usize) -> &[(f32, f32)] {
+    /// `pub` for S2c: the compressor and indexer goldens are otherwise reachable only
+    /// through `run_layer`, which drags in the full MoE and 3.4 GB of experts per layer.
+    /// Driving these in isolation is what closes three measured coverage holes -- ratio-128
+    /// pooling (no golden at all at a 13-token prompt), its empty `[13,0]` selection
+    /// tensor, and the ranking, which `index_topk` never truncates below 2052 tokens.
+    /// Visibility only; no behaviour change.
+    pub fn freqs(&self, layer: usize) -> &[(f32, f32)] {
         let compressed = self.cfg.compress_ratio(layer) != 0;
         match self.defect {
             Defect::RopeNoYarn if compressed => &self.freqs_no_yarn_compress_theta,
@@ -937,7 +943,13 @@ impl Oracle {
     /// `None` case the state updates have still happened, exactly as the reference does
     /// (model.py:331-367).
     #[allow(clippy::too_many_arguments)]
-    fn compressor(
+    /// `pub` for S2c: the compressor and indexer goldens are otherwise reachable only
+    /// through `run_layer`, which drags in the full MoE and 3.4 GB of experts per layer.
+    /// Driving these in isolation is what closes three measured coverage holes -- ratio-128
+    /// pooling (no golden at all at a 13-token prompt), its empty `[13,0]` selection
+    /// tensor, and the ranking, which `index_topk` never truncates below 2052 tokens.
+    /// Visibility only; no behaviour change.
+    pub fn compressor(
         &self,
         cw: &CompressorW,
         cs: &mut CompState,
@@ -1155,7 +1167,13 @@ impl Oracle {
     /// selection under test, and so a consumer can tell a `topk` tie-break disagreement from
     /// a real scoring disagreement.
     #[allow(clippy::too_many_arguments)]
-    fn indexer(
+    /// `pub` for S2c: the compressor and indexer goldens are otherwise reachable only
+    /// through `run_layer`, which drags in the full MoE and 3.4 GB of experts per layer.
+    /// Driving these in isolation is what closes three measured coverage holes -- ratio-128
+    /// pooling (no golden at all at a 13-token prompt), its empty `[13,0]` selection
+    /// tensor, and the ranking, which `index_topk` never truncates below 2052 tokens.
+    /// Visibility only; no behaviour change.
+    pub fn indexer(
         &self,
         step: &Step,
         iw: &IndexerW,
@@ -1281,7 +1299,13 @@ pub fn window_topk(win: usize, seqlen: usize, start_pos: usize) -> Vec<Vec<i64>>
 
 /// `model.py::get_compress_topk_idxs` — the arithmetic (indexer-free) compressed selection
 /// used where `compress_ratio != 4`.
-fn compress_topk(ratio: usize, seqlen: usize, start_pos: usize, offset: usize) -> Vec<Vec<i64>> {
+/// `pub` for S2c: the compressor and indexer goldens are otherwise reachable only
+/// through `run_layer`, which drags in the full MoE and 3.4 GB of experts per layer.
+/// Driving these in isolation is what closes three measured coverage holes -- ratio-128
+/// pooling (no golden at all at a 13-token prompt), its empty `[13,0]` selection
+/// tensor, and the ranking, which `index_topk` never truncates below 2052 tokens.
+/// Visibility only; no behaviour change.
+pub fn compress_topk(ratio: usize, seqlen: usize, start_pos: usize, offset: usize) -> Vec<Vec<i64>> {
     if start_pos > 0 {
         vec![(0..(start_pos + 1) / ratio).map(|i| (i + offset) as i64).collect()]
     } else {
