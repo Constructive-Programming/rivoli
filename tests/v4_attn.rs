@@ -642,9 +642,14 @@ fn each_in_scope_defect_is_further_away_than_the_kernels_are() {
     // are recorded, not derived, for exactly that reason.
     let listed: Vec<Defect> = in_scope().into_iter().map(|(_, x)| x).collect();
     let outside = Defect::breakages().filter(|x| !listed.contains(x)).count();
+    // 28 -> 35 on 2026-08-05, by the head-tail stage. Seven added, ALL outside S2b's scope
+    // and re-decided rather than assumed: `IndexerBf16RunningSum` is the indexer's per-head
+    // score reduction, and the six `Head*` variants live after the last block entirely, so
+    // none of them can reach an attention golden. Classification only; `in_scope()` is
+    // unchanged, which is why the first count still reads 15.
     assert_eq!(
         (listed.len(), outside),
-        (15, 28),
+        (15, 35),
         "the oracle's defect set changed: {} in S2b's scope, {outside} outside. Re-decide \
          which side each new breakage falls on -- and note that `QkNormAfterRope` and \
          `KvActQuantBlock128` are outside because the oracle CANNOT see them, not because \
