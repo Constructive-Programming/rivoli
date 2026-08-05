@@ -305,6 +305,40 @@ fixture engineered to separate RNE from half-away-from-zero, which is the proper
 actually matters. So the honest statement is that **this gate verifies the compressor and
 delegates `act_quant` to S2b's** — not that `act_quant` is unverified.
 
+> **CORRECTED 2026-08-05 — the decision above was written into prose and NOT into the
+> assertion, so `cargo test --release --features rocm --test v4_compress_kernel` has been
+> RED since the S2 merge (`78796eb`): 6 passed, 2 failed, exit 101.** Verified by the
+> coordinator on the merged tree, not inferred. `each_in_scope_defect_is_further_from_the_gpu_than_the_clean_oracle_is`
+> fails on exactly the cells this section rules out — `SkipKvActQuant` at max=14 against a
+> **clean** cell of max=16, i.e. the defect is *closer* to the GPU than clean is;
+> `KvActQuantBlock128` at max=16, identical to clean; `KvActQuantNoRoundScale` at 23.
+>
+> The DECISION stands and `RESOLVABLE` must still not be lowered. What was wrong is leaving
+> an assertion demanding the thing the section had just decided not to require. **A red
+> suite is worse than an absent test**: with no CI, every agent who runs the prescribed
+> command sees two failures and learns to scroll past them, which is how a real regression
+> gets absorbed later. Named non-coverage belongs in the assertion, next to its argument —
+> not 200 lines away in a doc — and as an *expected value* rather than a skip, so that a
+> cell which stops being inert still fires.
+>
+> The second failure, `the_ratio_0_rope_table_reproduces_the_no_yarn_defect_exactly`, is a
+> **guard working correctly.** At `ratio4/decode` the GPU running the ratio-0 table is
+> `max=0, bit-identical` to the defect oracle — the impersonation is perfect — but it sits
+> only `sep=8` from the CLEAN oracle, under the 64-code (4 e4m3 step) bar. So the cell
+> cannot distinguish "consulted the wrong table" from "did not consult the input at all",
+> and the guard says so. That is the anti-vacuity check earning its place. It matters
+> because **`RopeNoYarn` is S3 requirement 4** — mixing the ratio-0 and YaRN tables through
+> `Io.freqs` — one of the five defects that produce fluent wrong output, and this suite
+> cannot see it at that cell. Record the cell as non-separating with its measured `sep`;
+> the prefill cell separates at 31,215 and must keep being required.
+>
+> **How it shipped:** the coordinator merged S2 having run `docs`, `invariants` and
+> `v4_oracle` but *not* the three kernel suites, and wrote "measured" in the merge commit.
+> The full suite had already failed to complete twice that session — once from a GPU
+> contention error, once from the known `gpustream` hang — and the merge went ahead anyway.
+> The rule this breaks is already in CLAUDE.md; what is new is that a *green* subset was
+> read as a green suite.
+
 ### Convergence between two reviews is not confirmation — S2b, 2026-08-05
 
 S2b committed with two of three reviews, judging the third's question already answered. It
