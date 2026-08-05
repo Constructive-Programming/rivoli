@@ -156,26 +156,39 @@ fn gap(got: &[f32], want: &[f32]) -> Gap {
     g
 }
 
-/// Report every gap, and gate on the one thing that separates a wiring error from a named
-/// numeric deviation.
+/// Every comparison this run made, so ONE window produces the whole picture.
+///
+/// The first gate run panicked on the FIRST tensor and told me nothing about the other five — on a
+/// device held exclusively and queued for. Collecting and failing once at the end costs nothing and
+/// is the difference between one datum and a bisection. That the run needed a second window to
+/// learn what a single one could have is the process finding, not the numeric one.
+static FAILURES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Report every gap; record, do not panic. See [`FAILURES`].
 fn check(what: &str, got: &[f32], want: &[f32], bound: f32) {
     let g = gap(got, want);
     eprintln!(
-        "  {what:<28} max_rel {:.3e}  max_abs {:.3e}  bf16 differ {}/{} ({:.2}%)",
+        "  {what:<30} max_rel {:.3e}  max_abs {:.3e}  bf16 differ {}/{} ({:.2}%)",
         g.max_rel,
         g.max_abs,
         g.bf16_differing,
         g.total,
         100.0 * g.bf16_differing as f64 / g.total as f64,
     );
-    assert_eq!(g.nonfinite, 0, "{what}: {} non-finite elements — a defect, not a tolerance", g.nonfinite);
-    assert!(
-        g.max_rel < bound,
-        "{what}: max_rel {:.3e} exceeds the {bound:.0e} separation. That bound is CHOSEN, not measured here; the port's \
-         4.2e-1..1.06 figures are `tests/v4_attn.rs`'s, on tensors this file does not read. It sits \
-         far above re-association and far below a wiring error. {g:?}",
-        g.max_rel
-    );
+    let mut f = FAILURES.lock().expect("poisoned");
+    if g.nonfinite > 0 {
+        f.push(format!("{what}: {} non-finite — a defect, not a tolerance", g.nonfinite));
+    }
+    if g.max_rel >= bound {
+        // The bound is CHOSEN, not measured through this gate — see the header.
+        f.push(format!("{what}: max_rel {:.3e} >= the {bound:.0e} separation ({g:?})", g.max_rel));
+    }
+}
+
+/// Fail once, with everything.
+fn report() {
+    let f = FAILURES.lock().expect("poisoned");
+    assert!(f.is_empty(), "{} comparison(s) outside bound:\n  {}", f.len(), f.join("\n  "));
 }
 
 /// One golden tensor by name. Fails loudly on a miss: a typo'd name silently comparing nothing
@@ -354,7 +367,38 @@ fn every_layer_matches_the_oracle_at_real_weights(
             // The reference's own residual for this layer and phase — NOT the engine's
             // accumulated one, so each layer's number is that layer's.
             e.set_residual(golden(gs, &format!("L{l}.{tag}.in"))).expect("set residual");
+            // The EARLIEST comparable tensor: `hc_pre` + `attn_norm`, before attention runs.
+            // Idempotent, so `probe_layer` below re-runs it harmlessly. This is what says whether
+            // the hyper-connection prologue or the attention block owns the error.
+            let anp = e.probe_pre_norm(l, false, &here, start_pos).expect("pre_norm probe");
+            check(
+                &format!("L{l}.{tag}.attn_norm_out"),
+                &anp,
+                golden(gs, &format!("L{l}.{tag}.attn_norm_out")),
+                5e-2,
+            );
+            // Between `attn_norm_out` and `ffn_norm_out` there are exactly two ops. This is the
+            // one in the middle. Safe to re-run here because these are ratio-0 layers — the probe
+            // refuses a compressing one rather than trusting the caller.
+            let ao = e.probe_attn_out(l, &here, start_pos).expect("attn_out probe");
+            check(
+                &format!("L{l}.{tag}.attn_out"),
+                &ao,
+                golden(gs, &format!("L{l}.{tag}.attn_out")),
+                5e-2,
+            );
             e.probe_layer(l, &here, start_pos).expect("probe_layer");
+            // **The bisection.** `xw` still holds this layer's `ffn_norm_out` — `moe` quantizes a
+            // COPY into `xq`. Everything up to and including attention, `hc_post`, the second
+            // `hc_pre` and its norm is upstream of it; the whole MoE is downstream. Compared before
+            // `.out` so the report reads in pipeline order.
+            let fno = e.probe_working(m).expect("working readback");
+            check(
+                &format!("L{l}.{tag}.ffn_norm_out"),
+                &fno,
+                golden(gs, &format!("L{l}.{tag}.ffn_norm_out")),
+                5e-2,
+            );
             let got = e.residual(m).expect("residual readback");
             // The two stages inside the block are not separately readable — `attention`'s output
             // and the MoE's both land in one scratch buffer that the next `hc_post` consumes — so
@@ -476,4 +520,5 @@ fn the_v4_layer_loop() {
     let Some(gs) = open_goldens() else { return };
     let ids = prompt_ids(&gs);
     every_layer_matches_the_oracle_at_real_weights(&dir, &cfg, &gs, &ids);
+    report();
 }

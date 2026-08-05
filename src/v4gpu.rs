@@ -1346,6 +1346,57 @@ impl V4Engine {
         Ok(())
     }
 
+    /// `hc_pre` then the sublayer's `RMSNorm`, into `xw`/`post`/`comb`.
+    ///
+    /// Split out of [`V4Engine::layer`] so [`V4Engine::probe_pre_norm`] can stop here — the first
+    /// gate run localised a real error to somewhere in `hc_pre -> attn_norm -> attention ->
+    /// hc_post -> hc_pre -> ffn_norm` and could not say which, because `ffn_norm_out` is the
+    /// earliest tensor the loop leaves readable. This is the one before it.
+    ///
+    /// Idempotent: it reads the residual and writes only scratch, touching no KV ring and no
+    /// pooling state. That is what makes it safe to run before a full `layer` on the same input.
+    fn pre_norm(&mut self, layer: usize, ffn: bool, m: usize) -> Result<()> {
+        let (dim, hc) = (self.cfg.hidden, self.cfg.hc_mult);
+        let null = std::ptr::null_mut();
+        let lp = self.pin.layer(layer)?;
+        let (hcw, norm) = if ffn {
+            (lp.hc_ffn, lp.ffn_norm)
+        } else {
+            (lp.hc_attn, lp.attn_norm)
+        };
+        // SAFETY: `h[cur]` is `m * hc * dim`; `xw` is `m * dim`, `post` `m * hc`, `comb`
+        // `m * hc * hc`, and none of the three aliases `h` — `launch_hc_pre` requires exactly
+        // that, since `h` is `__restrict__` in the kernel.
+        unsafe {
+            launch_hc_pre(
+                self.h[self.cur].ptr().cast(),
+                hcw.func,
+                // `scale` THEN `base`. `launch_v4_hc_head` takes them the other way round and both
+                // are `*const f32`, so a swap compiles, runs, and is finite.
+                hcw.scale,
+                hcw.base,
+                m,
+                hc,
+                dim,
+                self.cfg.hc_sinkhorn_iters,
+                self.dims.norm_eps,
+                self.cfg.hc_eps as f32,
+                self.xw.ptr_mut().cast(),
+                self.post.ptr_mut().cast(),
+                self.comb.ptr_mut().cast(),
+                null,
+            )?;
+            // `launch_v4_rmsnorm`, in place on `hc_pre`'s output — NOT GLM's `linalg.hip::rmsnorm`,
+            // which is out-of-place, does not bf16-round, and is SINGLE-ROW (`dim3(1)`, one mean
+            // over its whole `n`), so handing it `m * dim` would take a joint statistic over every
+            // token and read the norm weight past its allocation. V4's `RMSNorm` returns bf16 and
+            // this kernel rounds, which is S3 requirement 1 satisfied by SELECTION rather than by
+            // editing a shared kernel.
+            launch_v4_rmsnorm(self.xw.ptr_mut().cast(), norm, m, dim, self.dims.norm_eps)?;
+        }
+        Ok(())
+    }
+
     /// One `Block.forward` over `m` rows at `start_pos`.
     ///
     /// The order is `Block.forward`'s (model.py:695-707) and the oracle's `run_layer`:
@@ -1358,42 +1409,7 @@ impl V4Engine {
         let (dim, hc) = (self.cfg.hidden, self.cfg.hc_mult);
         let null = std::ptr::null_mut();
         for ffn in [false, true] {
-            let lp = self.pin.layer(layer)?;
-            let (hcw, norm) = if ffn {
-                (lp.hc_ffn, lp.ffn_norm)
-            } else {
-                (lp.hc_attn, lp.attn_norm)
-            };
-            // SAFETY: `h[cur]` is `m * hc * dim`; `xw` is `m * dim`, `post` `m * hc`, `comb`
-            // `m * hc * hc`, and none of the three aliases `h` — `launch_hc_pre` requires exactly
-            // that, since `h` is `__restrict__` in the kernel.
-            unsafe {
-                launch_hc_pre(
-                    self.h[self.cur].ptr().cast(),
-                    hcw.func,
-                    // `scale` THEN `base`. `launch_v4_hc_head` takes them the other way round and
-                    // both are `*const f32`, so a swap compiles, runs, and is finite.
-                    hcw.scale,
-                    hcw.base,
-                    m,
-                    hc,
-                    dim,
-                    self.cfg.hc_sinkhorn_iters,
-                    self.dims.norm_eps,
-                    self.cfg.hc_eps as f32,
-                    self.xw.ptr_mut().cast(),
-                    self.post.ptr_mut().cast(),
-                    self.comb.ptr_mut().cast(),
-                    null,
-                )?;
-                // `launch_v4_rmsnorm`, in place on `hc_pre`'s output — NOT GLM's
-                // `linalg.hip::rmsnorm`, which is out-of-place, does not bf16-round, and is
-                // SINGLE-ROW (`dim3(1)`, one mean over its whole `n`), so handing it `m * dim`
-                // would take a joint statistic over every token and read the norm weight past its
-                // allocation. V4's `RMSNorm` returns bf16 and this kernel rounds, which is S3
-                // requirement 1 satisfied by SELECTION rather than by editing a shared kernel.
-                launch_v4_rmsnorm(self.xw.ptr_mut().cast(), norm, m, dim, self.dims.norm_eps)?;
-            }
+            self.pre_norm(layer, ffn, m)?;
 
             if ffn {
                 self.moe(layer, m)?;
@@ -1711,6 +1727,69 @@ impl V4Engine {
     /// See [`V4Engine::pool_hits`].
     pub fn pool_misses(&self) -> u64 {
         self.pin.routed.misses() - self.misses0
+    }
+
+    /// The attention sublayer's output — `sub` after `attention`, before `hc_post`.
+    ///
+    /// The last bisection point between `attn_norm_out` (clean) and `ffn_norm_out` (wrong): those
+    /// two are separated by exactly `attention` and `hc_post`, and this sits between them.
+    ///
+    /// **Only sound on a ratio-0 layer, and that is not a caller's convention — it is checked.**
+    /// It runs the attention half, which writes the KV ring. On a `Plain` layer that write is
+    /// idempotent (prefill copies the same rows, decode rewrites the same slot with the same
+    /// bytes), so a later `probe_layer` on the same step is unaffected. On a compressing layer it
+    /// is emphatically not: `compress` read-modify-writes the pooling state and the decode path
+    /// slides the window, so a second pass double-deposits — the exact trap
+    /// `v4compress::compress` documents at its "never a second call".
+    pub fn probe_attn_out(&mut self, layer: usize, ids: &[u32], start_pos: usize) -> Result<Vec<f32>> {
+        let kind = self.layers[layer - self.range.start].kind;
+        ensure!(
+            kind.compressor_ratio().is_none(),
+            "probe_attn_out on layer {layer} ({kind:?}): re-running the attention half of a \
+             compressing layer double-deposits into its pooling state"
+        );
+        let m = self.begin_step(ids, start_pos).context("probe_attn_out")?;
+        ensure!(self.loaded_rows == m, "probe_attn_out: residual holds {} rows, not {m}", self.loaded_rows);
+        self.pre_norm(layer, false, m)?;
+        self.attention_block(layer, Phase { seqlen: m, start_pos }, std::ptr::null_mut())?;
+        device_sync()?;
+        let mut bytes = Vec::new();
+        self.sub.copy_out_prefix(&mut bytes, m * self.cfg.hidden * size_of::<f32>())?;
+        Ok(read_f32(&bytes))
+    }
+
+    /// `hc_pre` + the sublayer norm ALONE, returning `xw`.
+    ///
+    /// The earliest comparable tensor in a block: `attn_norm_out` at `ffn = false`. Idempotent, so
+    /// it may run before [`V4Engine::probe_layer`] on the same loaded residual.
+    pub fn probe_pre_norm(
+        &mut self,
+        layer: usize,
+        ffn: bool,
+        ids: &[u32],
+        start_pos: usize,
+    ) -> Result<Vec<f32>> {
+        let m = self.begin_step(ids, start_pos).context("probe_pre_norm")?;
+        ensure!(self.loaded_rows == m, "probe_pre_norm: residual holds {} rows, not {m}", self.loaded_rows);
+        self.pre_norm(layer, ffn, m)?;
+        self.probe_working(m)
+    }
+
+    /// The `[m, dim]` working tensor — `hc_pre`'s output after its `RMSNorm`.
+    ///
+    /// **The bisection point the block-output comparison lacks.** After [`V4Engine::probe_layer`]
+    /// this holds the FFN's `ffn_norm_out`: `moe` copies it into `xq` and quantizes THAT, leaving
+    /// this intact. So everything up to and including attention, `hc_post`, the second `hc_pre` and
+    /// its norm is UPSTREAM of it, and the entire MoE — router, routed experts, shared expert,
+    /// accumulator drain — is downstream. `L{l}.{tag}.ffn_norm_out` is the golden.
+    ///
+    /// Added after the first gate run came back at `max_rel 23.78` on `L0.pre.out` with no way to
+    /// say which half moved, which is the limitation that run's own comment predicted.
+    pub fn probe_working(&self, m: usize) -> Result<Vec<f32>> {
+        device_sync()?;
+        let mut bytes = Vec::new();
+        self.xw.copy_out_prefix(&mut bytes, m * self.cfg.hidden * size_of::<f32>())?;
+        Ok(read_f32(&bytes))
     }
 
     /// The routing decision of the LAST row the previous [`V4Engine::probe_layer`] drove:

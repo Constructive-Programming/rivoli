@@ -2007,6 +2007,100 @@ still moves it — the seen-red record measures a dropped prefill persist copy a
 the comparison cannot attribute which half moved. Adding two more readbacks would fix that and was
 not done, because the block output is what the next layer consumes.
 
+### MEASURED on gfx1151, 2026-08-05 — the loop RUNS, the goldens say attention is WRONG, and the text is fluent
+
+Four gate runs and one 43-layer decode, all under `flock` with the KFD witness taken inside with
+`find`. **The headline is the disagreement**: a 43-layer decode completes and emits plausible
+English, while the per-layer goldens localise a real defect to `attn_out`. The text is not evidence
+and this section exists so nobody reads it as such.
+
+#### The bisection, layer 0 prefill, real weights, real dims
+
+| tensor | max_rel | max_abs | bf16 codes differing | verdict |
+|---|---:|---:|---:|---|
+| `attn_norm_out` | 7.14e-3 | 4.88e-4 | **26 / 53,248 (0.05%)** | CLEAN — `hc_pre` + `RMSNorm` are right |
+| `attn_out` | 3.50e1 | 7.81e-2 | **30,841 / 53,248 (57.9%)** | **WRONG — the first bad tensor** |
+| `ffn_norm_out` | 5.42e0 | 3.13e-2 | 28,141 / 53,248 (52.9%) | inherited |
+| `.out` (block) | 2.38e1 | 4.49e-2 | 69,265 / 212,992 (32.5%) | inherited |
+| `router_weights` | 2.89e-3 | 3.17e-4 | 2 / 6 | CLEAN |
+| `head.probe.logits` | 2.77e-3 | 3.34e-5 | **47 / 129,280 (0.04%)** | CLEAN |
+
+The same shape holds on L1 and on both decode cells. `attn_norm_out`'s 4.88e-4 on a ±0.21 tensor is
+~1 bf16 ULP — the port's own prediction for a ratio-0 layer at real dims, met exactly.
+`attn_out`'s 7.81e-2 on a ±7.7 tensor is ~20 ULP over 58% of elements, which is not re-association.
+
+**What this rules IN and OUT.** Between the clean tensor and the wrong one there are exactly two
+ops, and the probe that split them puts the boundary at `attention` rather than `hc_post`. So:
+`hc_pre`, both `RMSNorm`s, the whole router (sqrtsoftplus + `tid2eid` + renormalise + `route_scale`),
+`hc_head`, the final norm and `ParallelHead` are all confirmed correct against real weights.
+
+**And `tests/v4_attn.rs` is GREEN — 13 passed, in the same lock hold.** That suite drives the same
+`attn::v4::attention` on a ratio-0 layer against the same oracle and measures **0 ULP**, at TOY
+dims. So this is either a real-dims-only defect in the attention block, or a difference between how
+the harness constructs its arguments and how `v4gpu` does. **The two have never been compared**,
+and that is the next stage's first job. One unchecked difference is already known: `V4Pin`'s
+`Fp8Weight` carries `o_dim`/`i_dim`/`block`, and `V4Engine`'s adapter to `attn::v4::Fp8W` DISCARDS
+all three — `attention` re-derives every extent from `Dims`, so a pin whose placed shape disagrees
+with the config is invisible. `Fp8W` has no extents to check against.
+
+This is §S3 requirement 16 arriving with force ("toy-dim bit-exactness does not predict bit-exactness
+at depth… do not build a gate on the 0.000e0 results"), and the useful correction to it: the toy-dim
+result did not merely fail to predict the real-dim one, it hid a defect that only real weights and
+real extents can reach.
+
+#### PREDICTION HELD: the missing shared-expert clamp is INERT at this prompt
+
+Predicted before measuring, from `swiglu_limit = 10.0` against a `ffn_norm_out` range of ±1.1.
+Measured over four cells by `V4Engine::probe_shared_operands`:
+
+```
+max|gate|  3.891  5.000  2.969  3.312        max|up|  5.656  6.688  4.875  4.000
+```
+
+All well under 10, so the clamp never binds and `Defect::SwigluUnclamped` contributes **nothing** at
+this prompt. That is worth more than a confirmed guess: it REMOVES the leading suspect for the FFN
+half and is why the bisection above could be trusted to point at attention. It does not generalise —
+a longer or higher-entropy prompt can reach 10, and the operands are a 4096-wide reduction.
+
+#### The 43-layer decode: it composes, and its output is not evidence
+
+`rivoli /var/db/rivoli/v4-f4-full --bench 16 --max-mem 115`, dev profile, rc=0:
+
+```
+v4 resident footprint 8.90 GiB over layers [0, 43); routed set 137.06 GiB,
+pool budget 106.08 GiB (77.4% residency)      pin built in 26.2s
+prefill 1.42s over 5 tokens; 16 generated in 3.41s = 4.688 tok/s
+expert lookups 3284 hit / 1876 miss (63.6% hit), 25.08 GB fetched, 117.2 misses/token
+
+  "The sky is blue because of Rayleigh scattering. The sky is blue because of Rayleigh scattering. The sky is"
+```
+
+**Mechanically it holds together**: 43 layers compose, the pool carries a 137 GiB routed set against
+a 106 GiB budget, nothing faults, and the argmax finiteness check passed on all 16 tokens. Those are
+the facts no test in this tree covers and they are the decode's real result.
+
+**The text is fluent, on-topic, factually correct — and the goldens say the attention block is wrong
+by ~20 bf16 ULP on 58% of elements.** The goldens win. This is the exact failure CLAUDE.md warns
+about, produced deliberately and recorded so the next reader has a concrete instance: `distinct` and
+`longest repeated block` would BOTH fire here (the output repeats a sentence), and both would be
+firing for the wrong reason — the repetition is not the defect the goldens found, and a run with the
+defect fixed could repeat just as happily. Neither metric can see a 20-ULP attention error.
+
+**The hit rate is a COLD-START artefact, not a steady state.** 63.6% measured against a 77.4%
+residency floor the arithmetic called pessimistic — because 21 tokens is 5,160 lookups into an 8,519-slot
+pool that starts empty, so most of the "misses" are the pool filling. 117.2 misses/token against the
+predicted 58.3 is the same artefact. **No hit-rate claim should be made from this run**; it needs a
+warm pool and a long enough decode, which is S4's.
+
+#### What the gate still cannot see, stated plainly
+
+Weight **selection**. Every comparison here is arithmetic on tensors the loader chose, so a pin that
+placed `attn_norm` where `ffn_norm` belongs — same shape, same dtype — reproduces every golden that
+does not touch the swap. `bin/v4-oracle`'s `load_head_tail` makes this argument about `norm.weight`
+vs `embed.weight` and concludes "only a checkpoint run can". The 43-layer decode IS that run, and it
+produced fluent text, which is weak evidence that gross selection is right and no evidence at all
+about anything subtler.
+
 ## S4 — benchmark, quality assessment, ranked perf work.
 
 Scoped after S2 reports. S4's quality assessment ranks on **paired dNLL from `bin/ppl`**, not
