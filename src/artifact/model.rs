@@ -477,6 +477,23 @@ pub struct V4Config {
     #[serde(rename = "n_shared_experts")]
     pub n_shared: usize,
     // jscpd:ignore-end
+    /// `Gate.forward`'s last line, `weights *= self.route_scale` (`model.py:588`), applied
+    /// to every routed expert's weight after the top-k renormalization.
+    ///
+    /// **Required, and it is the RoPE block's argument again — the one place that exception
+    /// was earned.** `ModelArgs.route_scale` defaults to `1.` (`model.py:56`) while this
+    /// checkpoint ships `1.5` (both `config.json`'s `routed_scaling_factor` and the
+    /// reference's own `inference/config.json` `"route_scale": 1.5`). A reader taking the
+    /// default would scale every routed contribution by 1/1.5 — fluent, wrong, no crash.
+    /// Carried with no reader in this crate yet, deliberately, so the MoE combine cannot
+    /// reach for the default when it lands.
+    ///
+    /// There is no `norm_topk_prob` twin, and that is not an oversight: `Gate.forward`
+    /// renormalizes on `score_func != "softmax"` (`model.py:587`), NOT on the config flag,
+    /// and V4's `scoring_func` is `sqrtsoftplus` — so the renormalization is unconditional
+    /// here and the config's `norm_topk_prob: true` has no effect to carry.
+    #[serde(rename = "routed_scaling_factor")]
+    pub routed_scale: f64,
     scoring_func: String,
     /// The first `n_hash_layers` layers route by a `tid2eid[vocab, top_k]` table indexed
     /// by token id — the router scores are computed but the SELECTION bypasses them.
@@ -599,6 +616,14 @@ impl ArchConfig for V4Config {
             "scoring_func {:?}: V4 is sqrtsoftplus. A wrong router affinity picks \
              plausible-but-wrong experts and never crashes",
             self.scoring_func
+        );
+        // A zero or negative scale silently zeroes or flips every routed contribution
+        // while the shared expert keeps working — degraded fluent text, not a crash.
+        ensure!(
+            self.routed_scale > 0.0,
+            "routed_scaling_factor {} must be positive — it multiplies every routed \
+             expert's weight (`Gate.forward`'s `weights *= route_scale`)",
+            self.routed_scale
         );
         ensure!(
             self.swiglu_limit > 0.0,
@@ -736,6 +761,7 @@ mod tests {
         ("num_experts_per_tok", "6"),
         ("moe_intermediate_size", "2048"),
         ("n_shared_experts", "1"),
+        ("routed_scaling_factor", "1.5"),
         ("scoring_func", r#""sqrtsoftplus""#),
         ("num_hash_layers", "3"),
         ("swiglu_limit", "10.0"),
@@ -922,6 +948,8 @@ mod tests {
         let c = parse_v4(&[]).expect("V4-Flash's own config must load");
         assert_eq!((c.n_layers, c.hidden, c.moe_inter), (43, 4096, 2048));
         assert_eq!((c.top_k, c.n_shared), (6, 1));
+        // 1.5, NOT `ModelArgs.route_scale`'s default of 1. — see the field's doc.
+        assert_eq!(c.routed_scale, 1.5);
         assert_eq!(c.n_heads * c.head_dim, 32768); // == wq_b's out_dim
     }
 
