@@ -12,3 +12,8 @@
 # happened to an agent on 2026-08-05.
 src/v4oracle/forward.rs	Defect::Fp4NibbleSwap,		v4_oracle every_defect_variant_reaches	never reach Defect::ALL
 src/artifact/format.rs	n_experts + usize::from(has_shared)	n_experts + 1	v4_loading f4_refuses_a_file_sized_for_a_shared_block	blocks_plus_one: this must be refused
+kernels/common.hpp	gt = fminf(gt, limit);	gt = fminf(fmaxf(gt, -limit), limit);	v4_kernel the_clamped_combine_is_bit_exact_elementwise	differs
+kernels/linalg.hip	!(limit > 0.0f && limit < INFINITY)	!(limit > 0.0f)	v4_kernel v4_swiglu_clamped_guards	inf
+kernels/moe.hip	!(swiglu_limit > 0.0f && swiglu_limit < INFINITY)	!(swiglu_limit > 0.0f)	v4_kernel expert_range_f4_guards	inf
+src/v4oracle/forward.rs	_ => b(terms.sum::<f32>()),	_ => terms.fold(0.0f32, |a, t| b(a + t)),	v4_oracle bf16_reduction_matches_torch_and_not_a_running_fold	running fold
+src/attn.rs	launch_v4_qk_norm(s.q, m * nh, hd, d.norm_eps, stream)?;	launch_v4_qk_norm(s.q, m * nh, hd, d.norm_eps, std::ptr::null_mut())?;	v4_attn the_attention_block_is_entirely_on_its_stream	stream
