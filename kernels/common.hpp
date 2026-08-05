@@ -52,6 +52,19 @@ __device__ __forceinline__ float wave_sum(float v) {
     return v;
 }
 
+// Max across a wave, result on EVERY lane. A butterfly rather than `wave_sum`'s ladder,
+// which is legal here and not there: `fmaxf` is EXACTLY associative, so the two orders
+// agree bit-for-bit, and the caller needs the result on every lane anyway.
+//
+// REQUIRES A FULL WAVE. `__shfl_xor` against an inactive lane is undefined, and unlike
+// `wave_sum` — whose ladder leaves lane 0 right regardless — this promises every lane. Its
+// one caller satisfies it: `act_quant_f8`'s early return is wave-uniform, because `b` is
+// derived from `threadIdx.x / WAVE`.
+__device__ __forceinline__ float wave_max(float v) {
+    for (int o = WAVE / 2; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor(v, o, WAVE));
+    return v;
+}
+
 // bf16 → f32: bf16 is the high 16 bits of f32 (matches math.rs::bf16_to_f32).
 __device__ __forceinline__ float bf16f(unsigned short b) {
     unsigned int u = ((unsigned int)b) << 16;
@@ -324,6 +337,221 @@ __device__ __forceinline__ float dot_i4_wave(const float* __restrict__ v,
         a0 += v[i] * (float)(n - 8) * scalerow[i >> I4_GROUP_SHIFT];
     }
     return wave_sum(a0 + a1);
+}
+
+// ── OCP MX FP4 (DeepSeek-V4-Flash's native routed experts) ──────────────────────
+//
+// e2m1 nibbles with ONE e8m0 (bare power-of-two) scale per F4_GROUP weights along the
+// input dim. Three things separate this from the int4 block above and every one of them
+// is silent-wrong if it drifts:
+//
+//   * the codebook is NON-UNIFORM ({0,.5,1,1.5,2,3,4,6}), not `nibble − 8`, so an int4
+//     decode of fp4 bytes produces plausible magnitudes and wrong text;
+//   * the group is 32, not 128 — a group stride read from I4_GROUP mis-scales 3 of every
+//     4 groups while leaving the first one right, which is exactly the kind of bug that
+//     looks like "mostly working";
+//   * the scale grid is [o_dim, ceil(K/32)] row-major, one scale ROW per output row,
+//     where fp8's is a 128×128 TILE grid shared by 128 output rows.
+//
+// MUST match quant.rs (F4_GROUP / F4_LUT / e8m0) and v4oracle::numerics (e2m1_decode /
+// e8m0_decode). The oracle is the reference; these two are independently written from the
+// same format definition, which is the point — see v4oracle/numerics.rs's module doc.
+#define F4_GROUP 32
+#define F4_GROUP_SHIFT 5
+static_assert((1 << F4_GROUP_SHIFT) == F4_GROUP, "F4_GROUP_SHIFT must be log2(F4_GROUP)");
+static_assert(F4_GROUP % 8 == 0, "the dword fast path's 8 columns must not straddle a group");
+
+// e2m1 nibble → f32. 1 sign / 2 exp (bias 1) / 1 mantissa; no infinities, no NaN, so a
+// bare arithmetic decode is TOTAL — every one of the 16 codes is a finite value.
+//
+// Arithmetic rather than a 16-entry lookup on purpose: the fast path decodes 8 nibbles
+// from one dword and each is consumed once, so a table would be a divergent index into
+// either scratch or LDS for values that cost two selects to compute. `(e - 1) & 3` keeps
+// the shift in range on the e == 0 arm the ternary never takes.
+__device__ __forceinline__ float e2m1f(unsigned int nib) {
+    unsigned int e = (nib >> 1) & 3u, m = nib & 1u;
+    float mag = e ? (1.0f + 0.5f * (float)m) * (float)(1u << ((e - 1u) & 3u))
+                  : 0.5f * (float)m;
+    return (nib & 8u) ? -mag : mag;
+}
+
+// e8m0 scale byte → f32, `2^(b − 127)` (matches v4oracle::numerics::e8m0_decode).
+//
+// Both endpoints are spelled out rather than left to the exponent-field shift. 0xff is the
+// format's NaN, which is the right DECODE — reading it as `2^128` would be worse — but it
+// does not poison anything downstream: `moe_fixed`'s saturating clamp launders a NaN into a
+// finite ±2^14 (`fminf`/`fmaxf` return the non-NaN operand). So a 0xff scale byte must be
+// REJECTED AT LOAD, in S3, alongside the `tid2eid` range check `moe_gate_v4` names.
+// b == 0 is 2^-127, which is BELOW f32's smallest normal, so `b << 23` would silently hand
+// back +0 — a whole 32-weight group zeroed with no error anywhere.
+//
+// These bytes come off the CHECKPOINT (`<proj>.scale`, copied verbatim by the `.f4`
+// repack), not from `fast_round_scale`, so "our quantizer cannot emit them" is not an
+// argument that applies here: the FORMAT permits both, and what the converter happened to
+// produce is not a property this decoder gets to assume.
+__device__ __forceinline__ float e8m0f(unsigned char b) {
+    if (b == 0xff) return __int_as_float(0x7fc00000);
+    if (b == 0) return __uint_as_float(1u << 22);
+    return __uint_as_float((unsigned int)b << 23);
+}
+
+// Wave-cooperative group-scaled FP4 dot, R token rows against ONE read of the weight row:
+//   out[t] = Σ_i v[t·v_stride + i] · e2m1(nibble(i)) · e8m0(scalerow[i / F4_GROUP])
+// `row` = packed[o·(dim/2)..], `scalerow` = scale + o·ceil(dim/F4_GROUP). Result on lane 0.
+//
+// Same two-path shape as `dot_i4_wave_r` — a dword (8 nibbles = 8 consecutive columns) per
+// lane when `row` is 4-byte aligned, a scalar tail otherwise — for the same reason: 8
+// columns starting at a multiple of 8 always share ONE group scale, so the scale decode
+// amortises 8×. The nibble ORDER is the checked half: nibble k of the dword is column
+// col+k, i.e. a byte's LOW nibble is the EVEN column, which is what `convert.py`'s
+// `stack([TABLE[low], TABLE[high]]).flatten()` and `WMat::Fp4::row` both mean. Reading it
+// high-first is a permutation INSIDE each scale group, so it survives every summary
+// statistic — `v4oracle::Defect::Fp4NibbleSwap` is what keeps it A/B-able.
+//
+// NOT merged with `dot_i4_wave_r` above, and the reason is arithmetic rather than caution:
+// that one multiplies `v[i] · (n−8) · scale` PER ELEMENT because hoisting its f32 group
+// scale would re-associate the product (see its own note, and the bit-identity constraint
+// `tests/kernel.rs` pins on it). This one hoists the scale out of eight columns, which is
+// legal only because e8m0 is a bare power of two and the multiply is therefore exact. A
+// shared template would need a policy parameter meaning "is this scale exact?" — an
+// abstraction whose two instantiations disagree at the one line it exists to share.
+template <int R>
+__device__ __forceinline__ void dot_f4_wave_r(const float* __restrict__ v, int v_stride,
+                                              const unsigned char* __restrict__ row,
+                                              const unsigned char* __restrict__ scalerow,
+                                              int dim, int lane, float* __restrict__ out) {
+    float a0[R], a1[R];
+#pragma unroll
+    for (int t = 0; t < R; ++t) { a0[t] = 0.0f; a1[t] = 0.0f; }
+    int base = 0;
+    // Predicated on the WEIGHT row's 4-byte alignment, which is what the dword read needs.
+    // The `float4` loads below are on the ACTIVATION and are NOT checked — a 16-byte-aligned
+    // `v` is an unchecked caller obligation (`launch_moe_expert_range_f4`'s `# Safety`), and
+    // a misaligned one faults rather than falling back to the tail.
+    if ((((size_t)row) & 3u) == 0) {
+        const unsigned int* rw = (const unsigned int*)row;
+        for (; base + WAVE * 8 <= dim; base += WAVE * 8) {
+            int col = base + lane * 8;
+            unsigned int w = rw[col >> 3];             // 8 nibbles = 8 consecutive columns
+            float s = e8m0f(scalerow[col >> F4_GROUP_SHIFT]);  // one group for all 8
+            // Decoded ONCE for every row — the weight side is the expensive half.
+            float n0 = e2m1f(w), n1 = e2m1f(w >> 4), n2 = e2m1f(w >> 8), n3 = e2m1f(w >> 12);
+            float n4 = e2m1f(w >> 16), n5 = e2m1f(w >> 20), n6 = e2m1f(w >> 24),
+                  n7 = e2m1f(w >> 28);
+#pragma unroll
+            for (int t = 0; t < R; ++t) {
+                const float* vt = v + (size_t)t * v_stride;
+                float4 x0 = *(const float4*)(vt + col);
+                float4 x1 = *(const float4*)(vt + col + 4);
+                a0[t] += s * (x0.x * n0 + x0.y * n1 + x0.z * n2 + x0.w * n3);
+                a1[t] += s * (x1.x * n4 + x1.y * n5 + x1.z * n6 + x1.w * n7);
+            }
+        }
+    }
+    for (int i = base + lane; i < dim; i += WAVE) {
+        unsigned char b = row[i >> 1];
+        unsigned int n = (i & 1) ? (unsigned int)(b >> 4) : (unsigned int)(b & 0x0F);
+        float s = e8m0f(scalerow[i >> F4_GROUP_SHIFT]);
+#pragma unroll
+        for (int t = 0; t < R; ++t) a0[t] += v[(size_t)t * v_stride + i] * e2m1f(n) * s;
+    }
+#pragma unroll
+    for (int t = 0; t < R; ++t) out[t] = wave_sum(a0[t] + a1[t]);
+}
+
+// ── fp8 activation quantization (`kernel.py::act_quant`, inplace=True) ──────────
+//
+// Every quantized `Linear` in V4 quantizes its ACTIVATION to fp8 before the GEMM — fp4
+// weights included (`model.py::linear` line 120). So the numbers a `dot_f4` consumes are
+// not the layer's activations, they are `e4m3(x/s)·s` at block 128 with a power-of-two `s`.
+// Skipping it is silent: the magnitudes are within 2^-3 relative of the right ones.
+//
+// The shipped config sets `scale_fmt: "ue8m0"` (via `scale_dtype: "fp8"`, ModelArgs's
+// default), so the scale is ALWAYS rounded UP to a power of two. That is not a knob here —
+// a runtime `round_scale` would be a second code path with no caller.
+#define ACT_QUANT_BLOCK 128
+#define FP8_MAX 448.0f
+#define FP8_MAX_INV (1.0f / FP8_MAX)
+// `T.max(amax_local[i], 1e-4)` — keeps an all-zero block from dividing by zero.
+#define ACT_QUANT_AMAX_FLOOR 1e-4f
+
+// `fast_log2_ceil` / `fast_pow2` / `fast_round_scale` from kernel.py:22-38, by the same
+// IEEE-754 bit surgery. Transcribed, not reimplemented: `ceilf(log2f(x))` agrees with this
+// everywhere except that it rounds the log FIRST, so a value one ulp below a power of two
+// lands on a different binade — one factor-of-two error per group, invisible in aggregate.
+__device__ __forceinline__ float fast_round_scale(float amax, float max_inv) {
+    unsigned int b;
+    float y = amax * max_inv;
+    __builtin_memcpy(&b, &y, sizeof(b));
+    int e = (int)((b >> 23) & 0xffu) - 127 + ((b & 0x7fffffu) ? 1 : 0);
+    return __uint_as_float((unsigned int)(e + 127) << 23);
+}
+
+// f32 → e4m3, round-to-nearest-EVEN, saturating at ±448.
+//
+// NOT `kernels/fwd.hip`'s `f2e4m3` (which rounds half-away-from-zero below 2^-6 — rivoli's
+// own rule, mirroring `math.rs::f32_to_e4m3`): V4 was trained against CUDA's
+// `cvt.rn.satfinite.e4m3x2.f32`, which is RNE all the way down, and that is what
+// `v4oracle::numerics::e4m3_encode` models. The two differ on exact halfway subnormals and
+// NOWHERE else — established BY INSPECTION on 2026-08-05, and by nothing that would go red
+// if it stopped being true (`act_quant_f8_is_bit_identical_to_the_oracle` gates the
+// subnormal ties against the ORACLE, not against `fwd.hip`). Including the two places the
+// two look different and are not: the early return here is at the RNE midpoint 464 where `fwd.hip`'s is at 448, but
+// `[448, 464)` falls through to code 0x7e either way; and `a <= 2^-10` versus `a < 2^-10`
+// IS one of the subnormal ties (k = 0.5), not a separate case.
+//
+// One ulp on a tie is not much, and it is still worth its own function: this is the only
+// encoder that will ever be compared against the oracle, and a known difference inside a
+// result whose whole job is to expose unknown ones is the thing this port cannot afford.
+__device__ __forceinline__ unsigned char f2e4m3_rne(float x) {
+    if (isnan(x)) return 0x7f;
+    unsigned char sign = signbit(x) ? 0x80 : 0x00;
+    float a = fabsf(x);
+    // 448 is the largest finite magnitude and 464 the midpoint to the absent next code, so
+    // RNE sends everything below it to 448 and the format saturates above.
+    if (a >= 464.0f) return sign | 0x7e;
+    // Below half the subnormal quantum (2^-10) everything rounds to zero; EXACTLY 2^-10 is
+    // a tie between 0 (mantissa 0, even) and 2^-9 (mantissa 1, odd), so it goes to zero too
+    // — hence `<=`, not `<`.
+    if (a <= 0.0009765625f) return sign;
+    unsigned int b;
+    __builtin_memcpy(&b, &a, sizeof(b));
+    int e = (int)((b >> 23) & 0xffu) - 127;
+    if (e < -6) {
+        // Subnormal: value = m·2^-9, m in 1..=7 (m == 8 promotes to the smallest normal,
+        // code 0x08). floor + explicit tie test rather than `rintf`, so the rule is on the
+        // page instead of in the hardware's current rounding mode.
+        float scaled = a * 512.0f;
+        float m = floorf(scaled), rem = scaled - m;
+        if (rem > 0.5f || (rem == 0.5f && ((unsigned int)m & 1u))) m += 1.0f;
+        unsigned int mi = (unsigned int)m;
+        return mi >= 8u ? (unsigned char)(sign | 0x08) : (unsigned char)(sign | mi);
+    }
+    // Normal: keep 3 mantissa bits, RNE on the 20 dropped ones.
+    unsigned int mant = b & 0x7fffffu, m3 = mant >> 20, rem = mant & 0xfffffu;
+    if (rem > 0x80000u || (rem == 0x80000u && (m3 & 1u))) m3 += 1u;
+    int exp = e + 7;
+    if (m3 == 8u) { m3 = 0u; exp += 1; }
+    // Unreachable given the `a >= 464` return above (which caps m3 at 6 when exp is 15);
+    // kept because it is the format's own bound and costs one compare.
+    if (exp >= 15 && m3 >= 7u) return sign | 0x7e;
+    return (unsigned char)(sign | (unsigned char)(exp << 3) | (unsigned char)m3);
+}
+
+// One element of a block-128 group, fused quantize-then-dequantize: the value a V4 GEMM
+// actually sees. `e4m3f` is reused rather than rewritten because DECODE is unambiguous —
+// only the ENCODE rule differs between the two engines. What pins the pair is the round
+// trip, in `tests/v4_kernel.rs::act_quant_f8_is_bit_identical_to_the_oracle`.
+__device__ __forceinline__ float act_quant_roundtrip(float x, float s) {
+    // Written with comparisons, NOT `fminf`/`fmaxf`, so a NaN PROPAGATES. Those two return
+    // the non-NaN operand, which would sanitize a NaN activation into -448 — a large finite
+    // value where the oracle's `f32::clamp` keeps the NaN and `e4m3_encode` maps it to 0x7f.
+    // Unreachable from any fixture (no NaN inputs) and a NaN activation is already fatal
+    // upstream, but `act_quant_f8_is_bit_identical_to_the_oracle` claims BIT identity, and a
+    // known place where that does not hold is worth one line to remove rather than to note.
+    float q = x / s;
+    q = q < -FP8_MAX ? -FP8_MAX : (q > FP8_MAX ? FP8_MAX : q);
+    return e4m3f(f2e4m3_rne(q)) * s;
 }
 
 #include <hip/hip_fp16.h>

@@ -74,11 +74,23 @@ pub fn f32v(b: &[u8]) -> Vec<f32> {
 /// that passed on 2x, and only one of them is evidence of anything.
 pub fn assert_close(want: &[f32], got: &[f32], label: &str) {
     let (err, tol) = report(want, got, label);
-    let mx = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     assert!(
         err <= tol,
-        "{label}: err={err:.3e} > tol={tol:.3e} max={mx:.3e}"
+        "{label}: err={err:.3e} > tol={tol:.3e} max={:.3e}",
+        max_abs(want)
     );
+}
+
+/// The largest magnitude in a slice — the scale every tolerance in this suite is stated
+/// against.
+///
+/// Extracted because a second tolerance FORMULA now exists: `tests/v4_kernel.rs` bounds
+/// relative to the bf16 quantum instead of [`err_tol`]'s `1e-3·max + 1e-3`, whose absolute
+/// floor is 5% of the signal at that fixture's scale. The formulas differ on purpose; the
+/// SCALE they are stated against must not, and three copies of this fold were the duplicate
+/// the gate found.
+pub fn max_abs(v: &[f32]) -> f32 {
+    v.iter().fold(0.0f32, |m, x| m.max(x.abs()))
 }
 
 /// [`err_tol`] plus the margin line, returning the pair so the caller decides what a
@@ -87,8 +99,30 @@ pub fn assert_close(want: &[f32], got: &[f32], label: &str) {
 /// margin is the evidence, and a second copy of the format string is a second format.
 pub fn report(want: &[f32], got: &[f32], label: &str) -> (f32, f32) {
     let (err, tol) = err_tol(want, got);
+    report_margin(label, err, tol, max_abs(want))
+}
+
+/// [`report`] against a tolerance RELATIVE to the largest expected element, for callers
+/// whose signal is too small for [`err_tol`]'s `1e-3` absolute floor to mean anything —
+/// `tests/v4_kernel.rs`, where one routed MoE layer's output is ~2e-2 and that floor would
+/// be 5% of it.
+///
+/// Takes the ratio and computes the metric itself. An earlier version took `(err, tol, mx)`
+/// — three interchangeable `f32`s, where swapping the first two inverts the printed margin
+/// AND turns the caller's `err <= tol` into `tol <= err`, a gate that goes green on every
+/// failure. That is this module's own argument about six bare `usize` in a row, made about
+/// `f32`.
+pub fn report_rel(want: &[f32], got: &[f32], label: &str, rel: f32) -> (f32, f32) {
+    let mx = max_abs(want);
+    report_margin(label, max_err(want, got), rel * mx, mx)
+}
+
+/// The comparison LINE, given an error and whatever bound the caller holds it to. Private:
+/// [`report`] and [`report_rel`] are the two ways in, and a third caller would be a third
+/// tolerance with no argument attached to it.
+fn report_margin(label: &str, err: f32, tol: f32, mx: f32) -> (f32, f32) {
     println!(
-        "{label}: err={err:.3e} tol={tol:.3e} margin={:.1}x",
+        "{label}: err={err:.3e} tol={tol:.3e} max={mx:.3e} margin={:.1}x",
         tol / err.max(f32::MIN_POSITIVE)
     );
     (err, tol)
@@ -98,12 +132,13 @@ pub fn report(want: &[f32], got: &[f32], label: &str) -> (f32, f32) {
 /// [`assert_close`] and `vk.rs`'s multi-shape `Shapes::close`, which records instead of
 /// panicking. Two copies of a tolerance formula is two tolerances.
 pub fn err_tol(want: &[f32], got: &[f32]) -> (f32, f32) {
-    let mx = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    let err = want
-        .iter()
-        .zip(got)
-        .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
-    (err, 1e-3 * mx + 1e-3)
+    (max_err(want, got), 1e-3 * max_abs(want) + 1e-3)
+}
+
+/// The largest absolute disagreement between two slices — the error metric every
+/// comparison in this suite uses, whatever tolerance it is held to.
+fn max_err(want: &[f32], got: &[f32]) -> f32 {
+    want.iter().zip(got).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()))
 }
 
 /// `n` positive per-block scales, `|f·0.1| + 0.01`. Every fp8 oracle in both backend files
