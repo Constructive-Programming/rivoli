@@ -588,6 +588,29 @@ index with is in that list" was false when written. Nine extents, not eight.
 was the wrong list. Two reviews agreeing reads like confirmation and is not; they can share
 a blind spot exactly as an oracle and an implementation can. Run the third.
 
+### Integration checkpoint — VERIFIED on the merged tree, 2026-08-05
+
+`c4367a9` (indexer) + `590cd65` (loading) merged into the integration branch and then
+**re-run here**, under `flock`, with the KFD witness re-checked *inside* the lock (the lock is
+advisory; a foreign holder is invisible to it alone):
+
+| suite | result |
+|---|---|
+| `v4_oracle` | 27 passed |
+| `v4_attn` | 8 passed |
+| `v4_kernel` | 17 passed |
+| `v4_compress_kernel` | 8 passed (was 6 passed / 2 failed / exit 101 at `78796eb`) |
+| `v4_indexer_kernel` | 8 passed |
+| `v4_pin` | 1 passed — union over BOTH fixtures |
+| `v4_loading` | 10 passed |
+| `invariants` / `docs` | 1 / 2 passed |
+
+**82 tests, overall rc=0**, plus union clippy at 0 findings. This is the check `78796eb` did
+not get: a green subset was written up there as a green suite, and the kernel suites were in
+fact red. The `v4_pin` row is worth reading precisely — it is one test, and it passes only if
+`all.hash && all.scored && all.indexer && all.compressor_only`, which no single fixture can
+satisfy. A machine holding only `v4-f4-l0-2` fails it rather than reporting coverage it lacks.
+
 ## S3 — wire the layer loop, first decode.
 
 **Requirements banked from S2, each measured rather than supposed.** These are conditions on
