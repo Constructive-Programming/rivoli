@@ -18,8 +18,11 @@
 #![cfg(any(feature = "rocm", feature = "vulkan"))]
 
 use crate::artifact::config::Mode;
-use crate::artifact::format::{Dtype, ExpertSet, FormatMeta, Safetensors, SetDims, load_codebooks};
-use crate::artifact::model::ModelConfig;
+use crate::artifact::format::{
+    Dtype, ExpertSet, FormatMeta, RoutedFmt, Safetensors, SetDims, f4_layer_range,
+    load_codebooks,
+};
+use crate::artifact::model::{ModelConfig, V4Config};
 use crate::artifact::quant::{
     VQ_DIM, VQ_K, i4_expert_bytes, i4_slot_offsets, vq_expert_bytes, vq_slot_offsets,
 };
@@ -219,11 +222,7 @@ fn place_fp8(
     block: usize,
 ) -> Result<Fp8Weight> {
     let (w, shape) = st.typed(&format!("{name}.weight"), Dtype::F8E4M3)?;
-    ensure!(
-        shape.len() == 2,
-        "{name}.weight: expected 2-D, got {shape:?}"
-    );
-    let (o_dim, i_dim) = (shape[0], shape[1]);
+    let (o_dim, i_dim) = dims2(&format!("{name}.weight"), shape)?;
     let (sc, _) = st.typed(&format!("{name}.weight_scale_inv"), Dtype::F32)?;
     let packed = tier.place(w)?;
     let scale = tier.place(sc)?;
@@ -236,12 +235,19 @@ fn place_fp8(
     })
 }
 
+/// A weight matrix's `(o_dim, i_dim)`, refusing anything that is not 2-D. Every placer
+/// that carries dims takes them from the tensor's own shape rather than from `cfg`, so this
+/// is the one place the rank is confronted.
+fn dims2(name: &str, shape: &[usize]) -> Result<(usize, usize)> {
+    ensure!(shape.len() == 2, "{name}: expected 2-D, got {shape:?}");
+    Ok((shape[0], shape[1]))
+}
+
 /// Place an int8 per-row weight (`<name>` I8 + `<name>.scale` F32) into the tier
 /// (embed / lm_head). Dims from the `[o_dim, i_dim]` shape.
 fn place_i8(tier: &mut DeviceTier, st: &Safetensors, name: &str) -> Result<Int8Weight> {
     let (w, shape) = st.typed(name, Dtype::I8)?;
-    ensure!(shape.len() == 2, "{name}: expected 2-D, got {shape:?}");
-    let (o_dim, i_dim) = (shape[0], shape[1]);
+    let (o_dim, i_dim) = dims2(name, shape)?;
     let (sc, _) = st.typed(&format!("{name}.scale"), Dtype::F32)?;
     let packed = tier.place(w)?;
     let scale = tier.place(sc)?;
@@ -316,6 +322,26 @@ fn place_indexer(
 /// `.indexer` filter — `bin/add_indexer` writes nothing else into it. `cb_resident` and
 /// `shared_i4` add the two resident things no safetensors holds: the 3 fp16 VQ codebooks,
 /// and one shared expert per MoE layer out of the `.vq3`/`.i4` slab.
+/// Total bytes of the `*.safetensors` in an artifact directory, less one file by name.
+///
+/// Shared by [`resident_bytes`] (GLM) and [`V4Pin::build`], and the reason is the one
+/// [`resident_bytes`] gives at length: the converter writes exactly the tensor list the pin
+/// places, so the FILE is the footprint and a second derivation of the placement layout is
+/// the copy that drifts. `skip` is GLM's unplaced `indexer.safetensors`; V4 has none.
+fn safetensors_bytes(dir: &str, skip: Option<&str>) -> Result<usize> {
+    let mut total = 0usize;
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read dir {dir}"))? {
+        let p = entry.with_context(|| format!("read dir {dir}"))?.path();
+        let is_st = p.extension().is_some_and(|x| x == "safetensors");
+        let skipped = skip.is_some_and(|s| p.file_name().is_some_and(|n| n == s));
+        if !is_st || skipped {
+            continue;
+        }
+        total += p.metadata().with_context(|| format!("stat {p:?}"))?.len() as usize;
+    }
+    Ok(total)
+}
+
 fn resident_bytes(
     dir: &str,
     cfg: &ModelConfig,
@@ -324,17 +350,7 @@ fn resident_bytes(
     cb_resident: bool,
     want_indexer: bool,
 ) -> Result<usize> {
-    let mut total = 0usize;
-    for entry in std::fs::read_dir(dir).with_context(|| format!("read dir {dir}"))? {
-        let p = entry.with_context(|| format!("read dir {dir}"))?.path();
-        let is_st = p.extension().is_some_and(|x| x == "safetensors");
-        let unplaced_indexer =
-            !want_indexer && p.file_name().is_some_and(|n| n == "indexer.safetensors");
-        if !is_st || unplaced_indexer {
-            continue;
-        }
-        total += p.metadata().with_context(|| format!("stat {p:?}"))?.len() as usize;
-    }
+    let total = safetensors_bytes(dir, (!want_indexer).then_some("indexer.safetensors"))?;
     let shared = if shared_i4 {
         i4_expert_bytes(cfg.hidden, cfg.moe_inter)
     } else {
@@ -616,18 +632,17 @@ impl<'a> Pin<'a> {
         tracing::info!("mtp head: {}", if mtp { "present" } else { "absent" });
         // Both formats open against the SAME dims, named once — the two cannot end up
         // opened against different ones (which every length check would happily pass).
-        let dims = SetDims {
-            dense_layers: cfg.dense_layers,
-            n_layers: n_pin,
-            n_experts: cfg.n_experts,
-            hidden: cfg.hidden,
-            moe_inter: cfg.moe_inter,
-        };
+        let dims = SetDims::new(
+            cfg.dense_layers..n_pin,
+            cfg.n_experts,
+            cfg.hidden,
+            cfg.moe_inter,
+        );
         let vq_src = vq_present
-            .then(|| ExpertSet::open_routed(dir, false, dims))
+            .then(|| ExpertSet::open_routed(dir, RoutedFmt::Vq3, dims))
             .transpose()?;
         let i4_src = i4
-            .then(|| ExpertSet::open_routed(dir, true, dims))
+            .then(|| ExpertSet::open_routed(dir, RoutedFmt::I4, dims))
             .transpose()?;
         let shared_i4 = i4;
         // Slot byte layouts, one per format (which projection's indices/scales sit
@@ -1169,6 +1184,481 @@ fn build_moe_table(
         }
     }
     Ok(table)
+}
+
+// ── DeepSeek-V4-Flash resident set ──────────────────────────────────────────────
+//
+// A SEPARATE type from [`Pin`], for the reason `artifact::model` keeps `V4Config` separate
+// from `ModelConfig`: the two architectures share no tensor name, no attention shape and
+// no expert format, and a single pin parameterised by an arch flag would be a GLM-shaped
+// placement path one `if` away from running on a V4 artifact. What IS shared is factored —
+// `place_f32`/`place_fp8`/`place_shared`'s `DeviceTier` plumbing, `safetensors_bytes`, and
+// `ExpertSet` itself.
+//
+// What this does NOT own, and why:
+//   * The routed FP4 streaming pool. `ArenaPool` needs an `f4_slot_offsets` (the six
+//     projection offsets inside one block) in `artifact::quant` and a format flag on the
+//     MoE launcher in `gpu.rs` — neither file is this agent's. The `.f4` set is opened and
+//     validated here and left public as `f4`, which is the input the pool is built from.
+//   * The embed/head kernels. V4 carries `embed` and `head` as bf16 (`convert_v4`'s
+//     `MODEL_LEVEL`), while `launch_embed_i8_row`/`launch_gemv_i8` are int8-only.
+
+/// A resolved bf16 matrix in the tier: raw bf16 halves + dims.
+///
+/// Distinct from [`Int8Weight`] rather than widened into an f32 buffer at load: widening
+/// would double `embed`+`head` from 2.1 GB to 4.2 GB of resident set to paper over the
+/// missing kernels, and `convert_v4` kept them bf16 on purpose — whether to requantize is a
+/// quality question with a paired-dNLL measurement attached, not a loader's decision.
+#[derive(Clone, Copy)]
+pub struct Bf16Weight {
+    pub packed: *const u16,
+    pub o_dim: usize,
+    pub i_dim: usize,
+}
+
+/// One hyper-connection block's three f32 tables: `<base>_base`, `<base>_fn`, `<base>_scale`.
+/// The same triple serves `layers.{l}.hc_attn`, `layers.{l}.hc_ffn` and the model-level
+/// `hc_head`, which is why it is one type and one placer rather than three.
+#[derive(Clone, Copy)]
+pub struct HyperConn {
+    pub base: *const f32,
+    /// `_fn` — spelled out because `fn` is a keyword.
+    pub func: *const f32,
+    pub scale: *const f32,
+}
+
+/// One `Compressor`'s four tensors, all f32 in the artifact.
+///
+/// They are f32 because `Compressor.__init__` declares `wkv`/`wgate` fp32 and its forward
+/// runs `x.float()` ("compression need fp32", the reference's own comment), so
+/// `convert_v4::write_compressor` widens rather than choosing. Extents are NOT stored: they
+/// vary with `compress_ratio` (`ape` is `[ratio, coff·head_dim]`, `coff = 1 + (ratio == 4)`)
+/// and belong to the attention path that reads them, not to the pin that places them.
+#[derive(Clone, Copy)]
+pub struct V4Compressor {
+    pub ape: *const f32,
+    pub norm: *const f32,
+    pub wgate: *const f32,
+    pub wkv: *const f32,
+}
+
+/// The lightning indexer on a `compress_ratio == 4` layer.
+///
+/// **Nothing like GLM's [`IndexerPin`].** V4's `Indexer.__init__` gives it a second
+/// `Compressor` of its own to build the keys it scores against — it has no `wk`/`k_norm`.
+/// Its `compressor` is not `Option`: an indexer without one cannot exist.
+#[derive(Clone, Copy)]
+pub struct V4IndexerPin {
+    pub wq_b: Fp8Weight,
+    pub weights_proj: *const f32,
+    pub compressor: V4Compressor,
+}
+
+/// How a layer's gate SELECTS experts.
+///
+/// A sum type rather than two `Option`s because the two are exclusive in the checkpoint —
+/// a hash layer carries `ffn.gate.tid2eid` and no `.bias`, a scored layer the reverse — so
+/// `Some`/`Some` and `None`/`None` are states no artifact can be in.
+/// `V4Config::layer_routes_by_hash` decides which, and `convert_v4` wrote whichever it
+/// decided, so the config and the artifact cannot disagree without one of them failing.
+///
+/// Both variants are HOST-side, like [`Pin::moe_bias`]: V4's routing (sqrtsoftplus scoring,
+/// bias, top-k) runs on the CPU, and the hash path is a lookup by TOKEN ID, which the host
+/// already holds. Placing 6.2 MB of `tid2eid` per hash layer on the device to index it
+/// there would buy nothing.
+pub enum V4Route {
+    /// `tid2eid[token * top_k + j]` — already range-checked, see [`parse_tid2eid`].
+    Hash { tid2eid: Vec<u32> },
+    /// The router correction bias added before top-k, `n_experts` long.
+    Scored { bias: Vec<f32> },
+}
+
+/// One V4 layer's resident weights.
+pub struct V4LayerPin {
+    pub attn_norm: *const f32,
+    pub ffn_norm: *const f32,
+    /// `q_norm` (over `q_lora_rank`) and `kv_norm` (over `head_dim`). The weightless QK-norm
+    /// that follows `wq_b` has no tensor at all — it is `rsqrt(mean(q²) + eps)`.
+    pub q_norm: *const f32,
+    pub kv_norm: *const f32,
+    /// `[n_heads]` f32, added to the softmax DENOMINATOR only.
+    pub attn_sink: *const f32,
+    pub wq_a: Fp8Weight,
+    pub wq_b: Fp8Weight,
+    /// ONE kv entry, `head_dim` wide, serving as both K and V for every head.
+    pub wkv: Fp8Weight,
+    pub wo_a: Fp8Weight,
+    pub wo_b: Fp8Weight,
+    /// Router gate `[n_experts, hidden]` f32, device-side (the scores are a GEMV).
+    pub gate_w: *const f32,
+    pub route: V4Route,
+    pub hc_attn: HyperConn,
+    pub hc_ffn: HyperConn,
+    /// The always-on shared expert — fp8 e4m3, resident, NOT in the `.f4`.
+    pub shared: Fp8Mlp,
+    /// Present iff `compress_ratio != 0`.
+    pub compressor: Option<V4Compressor>,
+    /// Present iff `compress_ratio == 4`.
+    pub indexer: Option<V4IndexerPin>,
+}
+
+/// The V4 resident weight set, plus the validated `.f4` routed-expert source.
+pub struct V4Pin {
+    #[allow(dead_code)] // RAII owner of the slab every pointer below points into.
+    tier: DeviceTier,
+    /// `[vocab, hidden]` bf16. See [`Bf16Weight`] — exposed, not consumed.
+    pub embed: Bf16Weight,
+    /// `head.weight`, `[vocab, hidden]` bf16. Untied from `embed` in this checkpoint.
+    pub head: Bf16Weight,
+    pub final_norm: *const f32,
+    pub hc_head: HyperConn,
+    /// Artifact order, so `layers[0]` is layer [`Self::range`]`.start` — which is NOT
+    /// always 0. Private, and reachable only through [`Self::layer`], because that offset is
+    /// exactly the kind of thing a caller gets right once and then forgets: an absolute
+    /// layer id used as a direct index into a pin over layers 3..6 reads layer 6's weights
+    /// for layer 3 and never fails.
+    layers: Vec<V4LayerPin>,
+    range: std::ops::Range<usize>,
+    /// The `.f4` set: fd owner for the routed pool, and the thing whose headers and lengths
+    /// — one per layer in the artifact's range — were validated at startup rather than at
+    /// the first miss. `read_spec` is the streaming pool's input.
+    pub f4: ExpertSet,
+}
+
+/// Place a bf16 matrix verbatim (`embed` / `head`). Dims from its `[o_dim, i_dim]` shape.
+fn place_bf16(tier: &mut DeviceTier, st: &Safetensors, name: &str) -> Result<Bf16Weight> {
+    let (w, shape) = st.typed(name, Dtype::Bf16)?;
+    let (o_dim, i_dim) = dims2(name, shape)?;
+    Ok(Bf16Weight {
+        packed: tier.place(w)? as *const u16,
+        o_dim,
+        i_dim,
+    })
+}
+
+/// Place one hyper-connection triple. `base` is the tensor-name PREFIX (`hc_head`,
+/// `layers.3.hc_attn`), not a directory.
+fn place_hc(tier: &mut DeviceTier, st: &Safetensors, base: &str) -> Result<HyperConn> {
+    Ok(HyperConn {
+        base: place_f32(tier, st, &format!("{base}_base"))?,
+        func: place_f32(tier, st, &format!("{base}_fn"))?,
+        scale: place_f32(tier, st, &format!("{base}_scale"))?,
+    })
+}
+
+/// Place one `Compressor` — the attention's own or the indexer's, which differ only in
+/// width and are therefore the same four names under different prefixes.
+fn place_compressor(tier: &mut DeviceTier, st: &Safetensors, base: &str) -> Result<V4Compressor> {
+    Ok(V4Compressor {
+        ape: place_f32(tier, st, &format!("{base}.ape"))?,
+        norm: place_f32(tier, st, &format!("{base}.norm.weight"))?,
+        wgate: place_f32(tier, st, &format!("{base}.wgate.weight"))?,
+        wkv: place_f32(tier, st, &format!("{base}.wkv.weight"))?,
+    })
+}
+
+/// `ffn.gate.tid2eid` (I64) parsed into expert ids that are valid by construction.
+///
+/// **Nothing has ever looked at these.** `convert_v4` shape-checks the tensor against
+/// `[vocab, top_k]` and then `copy_verbatim`s it, so no VALUE is ever read, and the MoE
+/// launch path indexes its descriptor array with whatever arrives. An entry
+/// outside `0..n_experts` therefore selects another expert's slot, or reads past the array;
+/// `docs/investigations/v4-flash-port.md` §S3 item 10 records it as a load-time obligation
+/// precisely because the kernels cannot make it.
+///
+/// Parsed to `u32` rather than checked and left `i64`, so the check and the storage are one
+/// act: a negative or oversized id cannot exist in the returned vector. `u32::try_from`
+/// rather than `as u32` because the cast truncates — 2^32 would become 0, an id that is
+/// perfectly in range. 775,680 entries per hash layer x 3 layers, read once at startup.
+///
+/// Takes the three scalars rather than `&V4Config` so its test needs no config, and so no
+/// machine can end up running a vacuous version of it.
+fn parse_tid2eid(
+    raw: &[u8],
+    shape: &[usize],
+    vocab: usize,
+    top_k: usize,
+    n_experts: usize,
+) -> Result<Vec<u32>> {
+    ensure!(
+        shape == [vocab, top_k],
+        "ffn.gate.tid2eid: shape {shape:?} != [{vocab}, {top_k}]"
+    );
+    // The EXTENT, separately from the shape. `Safetensors::typed` matches the dtype and
+    // nothing else — `Loc.len` comes from the header's `data_offsets` and is never
+    // confronted with `product(shape) x 8` — so a tensor whose byte span disagrees with its
+    // declared shape passes the check above, `chunks_exact` drops the partial tail, and the
+    // returned table is SHORT. `V4Route::Hash`'s consumer indexes it at
+    // `token * top_k + j`, so a short table is an out-of-bounds read for the last tokens.
+    let want = vocab * top_k * 8;
+    ensure!(
+        raw.len() == want,
+        "ffn.gate.tid2eid: {} bytes for shape [{vocab}, {top_k}] — expected {want}",
+        raw.len()
+    );
+    raw.chunks_exact(8)
+        .enumerate()
+        .map(|(k, c)| {
+            let v = i64::from_le_bytes(c.try_into()?);
+            let e = u32::try_from(v).ok().filter(|&e| (e as usize) < n_experts);
+            e.with_context(|| {
+                format!(
+                    "ffn.gate.tid2eid[{}][{}] = {v}, outside 0..n_experts={n_experts}",
+                    k / top_k,
+                    k % top_k,
+                )
+            })
+        })
+        .collect()
+}
+
+impl V4Pin {
+    /// Build the V4 resident set from artifact directory `dir`.
+    ///
+    /// No `capacity` argument, unlike [`Pin::build`]: the resident footprint is the
+    /// artifact's own size, not a budget, and the rest of the device budget has nothing to
+    /// grow yet — the routed pool is not wired here (see the module note above). A
+    /// `capacity` this ignored would be a parameter documenting a policy that does not run.
+    pub fn build(dir: &str, cfg: &V4Config) -> Result<Self> {
+        // Which layers the artifact HOLDS. `num_hidden_layers` is the model's; the two
+        // differ on every partial convert. See `f4_layer_range`.
+        let range = f4_layer_range(dir, cfg.n_layers)?;
+        // NOT required to start at 0. That is a property of a DECODE — a forward pass has
+        // no residual stream to enter at layer 3 — and belongs where the decode is set up,
+        // not in a loader. Refusing it here made every partial artifact but the first
+        // unloadable, and `/var/db/rivoli/v4-f4-l3-5` is the one that carries the scored
+        // router and the ratio-128-without-indexer shape that layers 0-2 have neither of.
+        // fp8 block size, and the same VQ-param/version gate every artifact passes.
+        let block = FormatMeta::load(dir)?.fp8_block;
+        let st = Safetensors::open_dir(dir)?;
+        // Spans exactly the artifact's range — NOT `0..cfg.n_layers` — and validates every
+        // header and length here rather than at the first miss.
+        let f4 = ExpertSet::open_routed(
+            dir,
+            RoutedFmt::F4,
+            SetDims::new(range.clone(), cfg.n_experts, cfg.hidden, cfg.moe_inter),
+        )?;
+
+        // The total of every `*.safetensors` in `dir` — `convert_v4` writes only
+        // `resident.safetensors`, so that is what this is. Everything placed comes out of
+        // it, so the length is an upper bound and can never UNDER-count, which is the
+        // failure `DeviceTier::place` bails on. It over-counts by the two host-side tensors
+        // (`tid2eid`, `ffn.gate.bias`), costing only unused tier. Nothing to add: V4 has no
+        // codebooks, and its shared expert is already inside the file rather than in the
+        // routed slab.
+        // Alignment slack. `DeviceTier::place` starts every reservation at
+        // `used.next_multiple_of(256)` (`device::bump`), so total padding is under 256 B per
+        // placement; V4 places ~40 tensors a layer over <=43 layers plus 4 model-level, so
+        // under 0.5 MB. 16 MiB is ~30x that bound — deliberately loose, because an
+        // under-count is what `DeviceTier::place` bails on while an over-count only costs
+        // unused tier (there is no routed pool competing for the remainder yet).
+        const SLACK: usize = 16 << 20;
+        let resident = safetensors_bytes(dir, None)?;
+        tracing::info!(
+            "v4 resident footprint {:.2} GiB over layers [{}, {})",
+            resident as f64 / (1u64 << 30) as f64,
+            range.start,
+            range.end,
+        );
+        let mut tier = DeviceTier::new(resident + SLACK)?;
+
+        let embed = place_bf16(&mut tier, &st, "embed.weight")?;
+        let head = place_bf16(&mut tier, &st, "head.weight")?;
+        let final_norm = place_f32(&mut tier, &st, "norm.weight")?;
+        let hc_head = place_hc(&mut tier, &st, "hc_head")?;
+
+        let mut layers = Vec::with_capacity(range.len());
+        for l in range.clone() {
+            let lb = format!("layers.{l}");
+            let a = format!("{lb}.attn");
+            // Driven off the CONFIG, never off `st.has(…)` — the same choice `convert_v4`
+            // made and for the same reason: a layer whose tensors disagree with
+            // `compress_ratios`/`num_hash_layers` must fail here, not silently take
+            // whichever branch the artifact happens to satisfy.
+            let route = if cfg.layer_routes_by_hash(l) {
+                let (raw, shape) = st.typed(&format!("{lb}.ffn.gate.tid2eid"), Dtype::I64)?;
+                V4Route::Hash {
+                    tid2eid: parse_tid2eid(raw, shape, cfg.vocab, cfg.top_k, cfg.n_experts)
+                        .with_context(|| format!("layer {l}"))?,
+                }
+            } else {
+                let (raw, _) = st.typed(&format!("{lb}.ffn.gate.bias"), Dtype::F32)?;
+                let bias = crate::artifact::quant::read_f32(raw);
+                ensure!(
+                    bias.len() == cfg.n_experts,
+                    "layer {l} ffn.gate.bias has {} entries, expected {}",
+                    bias.len(),
+                    cfg.n_experts
+                );
+                V4Route::Scored { bias }
+            };
+            let mut fp8 = |name: &str| place_fp8(&mut tier, &st, &format!("{a}.{name}"), block);
+            let (wq_a, wq_b) = (fp8("wq_a")?, fp8("wq_b")?);
+            let (wkv, wo_a, wo_b) = (fp8("wkv")?, fp8("wo_a")?, fp8("wo_b")?);
+            // `e == n_experts` selects `ffn.shared_experts` — see `v4_expert_base`.
+            let shared_base =
+                crate::artifact::quant::v4_expert_base(l, cfg.n_experts, cfg.n_experts);
+            // gate/up/down == w1/w3/w2. `V4_PROJ` carries the argument for that order; the
+            // slot meaning has to match `Fp8Mlp`'s fields, not the tensors' names.
+            let [w1, w3, w2] = crate::artifact::quant::V4_PROJ;
+            let mut sh = |p: &str| place_fp8(&mut tier, &st, &format!("{shared_base}.{p}"), block);
+            let shared = Fp8Mlp {
+                gate: sh(w1)?,
+                up: sh(w3)?,
+                down: sh(w2)?,
+            };
+            layers.push(V4LayerPin {
+                attn_norm: place_f32(&mut tier, &st, &format!("{lb}.attn_norm.weight"))?,
+                ffn_norm: place_f32(&mut tier, &st, &format!("{lb}.ffn_norm.weight"))?,
+                q_norm: place_f32(&mut tier, &st, &format!("{a}.q_norm.weight"))?,
+                kv_norm: place_f32(&mut tier, &st, &format!("{a}.kv_norm.weight"))?,
+                attn_sink: place_f32(&mut tier, &st, &format!("{a}.attn_sink"))?,
+                wq_a,
+                wq_b,
+                wkv,
+                wo_a,
+                wo_b,
+                gate_w: place_f32(&mut tier, &st, &format!("{lb}.ffn.gate.weight"))?,
+                route,
+                hc_attn: place_hc(&mut tier, &st, &format!("{lb}.hc_attn"))?,
+                hc_ffn: place_hc(&mut tier, &st, &format!("{lb}.hc_ffn"))?,
+                shared,
+                compressor: cfg
+                    .layer_has_compressor(l)?
+                    .then(|| place_compressor(&mut tier, &st, &format!("{a}.compressor")))
+                    .transpose()?,
+                indexer: cfg
+                    .layer_has_indexer(l)?
+                    .then(|| -> Result<V4IndexerPin> {
+                        Ok(V4IndexerPin {
+                            wq_b: place_fp8(&mut tier, &st, &format!("{a}.indexer.wq_b"), block)?,
+                            weights_proj: place_f32(
+                                &mut tier,
+                                &st,
+                                &format!("{a}.indexer.weights_proj.weight"),
+                            )?,
+                            compressor: place_compressor(
+                                &mut tier,
+                                &st,
+                                &format!("{a}.indexer.compressor"),
+                            )?,
+                        })
+                    })
+                    .transpose()?,
+            });
+        }
+
+        Ok(Self {
+            tier,
+            embed,
+            head,
+            final_norm,
+            hc_head,
+            layers,
+            range,
+            f4,
+        })
+    }
+
+    /// The layer range this pin holds, in the model's own numbering.
+    pub fn range(&self) -> std::ops::Range<usize> {
+        self.range.clone()
+    }
+
+    /// One layer's resident weights by ABSOLUTE layer id.
+    ///
+    /// The only way in, so the artifact-order offset cannot be applied twice or not at all.
+    pub fn layer(&self, l: usize) -> Result<&V4LayerPin> {
+        self.layers
+            .get(l.checked_sub(self.range.start).unwrap_or(usize::MAX))
+            .with_context(|| {
+                format!(
+                    "layer {l} is outside this artifact's range [{}, {})",
+                    self.range.start, self.range.end
+                )
+            })
+    }
+}
+
+#[cfg(test)]
+mod v4_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
+    use super::*;
+
+    const VOCAB: usize = 4;
+    const TOP_K: usize = 3;
+    const N_EXPERTS: usize = 8;
+
+    fn le(v: &[i64]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    /// **`tid2eid` values are checked at load because nothing else can check them.**
+    /// `convert_v4` shape-checks the tensor and copies it verbatim, and the MoE launch path
+    /// indexes descriptors with whatever arrives, so an out-of-range id reads another
+    /// expert's slot.
+    ///
+    /// Both directions: a table of valid ids must survive UNCHANGED — a check that mangled
+    /// good data would be worse than none — and each way of being invalid must be caught.
+    /// Unconditional: `parse_tid2eid` takes three scalars rather than a `&V4Config`
+    /// precisely so this cannot degrade into a skip on a machine without the checkpoint.
+    #[test]
+    fn tid2eid_entries_are_range_checked_and_valid_ones_pass_through() {
+        let good: Vec<i64> = (0..(VOCAB * TOP_K) as i64).map(|k| k % 8).collect();
+        let got = parse_tid2eid(&le(&good), &[VOCAB, TOP_K], VOCAB, TOP_K, N_EXPERTS).unwrap();
+        assert_eq!(
+            got,
+            good.iter().map(|&v| v as u32).collect::<Vec<_>>(),
+            "valid ids must pass through bit-identically"
+        );
+
+        // One entry at a time, so each failure is attributable to that value rather than to
+        // a table broken in several ways at once.
+        for (label, bad) in [
+            ("== n_experts", N_EXPERTS as i64),
+            ("> n_experts", N_EXPERTS as i64 + 1),
+            ("negative", -1i64),
+            // 2^32 truncates to 0 under `as u32` — an id that is perfectly IN range. This
+            // is the case only `u32::try_from` catches.
+            ("wraps u32", 1i64 << 32),
+        ] {
+            let mut v = good.clone();
+            v[5] = bad;
+            let e = format!(
+                "{:#}",
+                parse_tid2eid(&le(&v), &[VOCAB, TOP_K], VOCAB, TOP_K, N_EXPERTS)
+                    .err()
+                    .unwrap_or_else(|| panic!("{label} ({bad}) must be refused"))
+            );
+            assert!(
+                e.contains(&format!("[{}][{}] = {bad}", 5 / TOP_K, 5 % TOP_K)),
+                "{label}: the refusal must name the offending entry, got: {e}"
+            );
+        }
+
+        // A shape that is not [vocab, top_k] is refused before any value is read, or the
+        // row/column arithmetic in the message above would be nonsense.
+        assert!(parse_tid2eid(&le(&good), &[TOP_K, VOCAB], VOCAB, TOP_K, N_EXPERTS).is_err());
+
+        // The EXTENT, which the shape does not imply. `Safetensors::typed` matches the
+        // dtype only, so a tensor whose byte span is shorter than its declared shape gets
+        // here — and `chunks_exact` would silently drop the tail and return a SHORT table
+        // that the consumer indexes at `token * top_k + j`. Both a truncated buffer and a
+        // ragged one (not a multiple of 8) must be refused, not rounded off.
+        for (label, raw) in [
+            ("truncated", le(&good[..good.len() - 1])),
+            ("ragged", le(&good)[..VOCAB * TOP_K * 8 - 3].to_vec()),
+            ("too long", le(&[good.clone(), vec![0]].concat())),
+        ] {
+            let e = format!(
+                "{:#}",
+                parse_tid2eid(&raw, &[VOCAB, TOP_K], VOCAB, TOP_K, N_EXPERTS)
+                    .err()
+                    .unwrap_or_else(|| panic!("{label} must be refused"))
+            );
+            assert!(e.contains("expected 96"), "{label}: got {e}");
+        }
+    }
 }
 
 #[cfg(test)]

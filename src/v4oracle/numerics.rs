@@ -239,16 +239,27 @@ pub fn fp4_act_quant_inplace(row: &mut [f32], block: usize) {
 /// `model.py::rotate_activation` — the randomized-Hadamard spread applied before fp4
 /// quantization in the indexer and its compressor, `scale = n^-0.5`.
 ///
-/// **INFERRED, and the highest-risk inference in this file.** `fast_hadamard_transform.
-/// hadamard_transform` is an external package that is not vendored with the checkpoint, so
-/// its basis ORDER cannot be read off the reference. This implements the Sylvester
-/// (natural-order) Walsh-Hadamard transform, which is what that package computes for
-/// power-of-two sizes. `H` is symmetric, so left- vs right-multiplication is not a
-/// degree of freedom; sequency-vs-natural ordering is, and would permute the fp4 quant
-/// groups without changing any magnitude. Consequence if wrong: the *indexer's* top-k
-/// selection shifts, which changes which positions are attended — a defect no tolerance on
-/// an activation can see. `forward.rs` therefore emits the indexer's selected indices as a
-/// golden of their own, so S2 compares SETS, not just numbers.
+/// **The basis order is natural (Sylvester), CONFIRMED 2026-08-05** against
+/// `fast_hadamard_transform`'s own documented contract. It shipped as "INFERRED, and the
+/// highest-risk inference in this file", because the package is not vendored with the
+/// checkpoint and `inference/requirements.txt` does not pin it — so the order could not be
+/// read off the reference, only off the dependency. It was, and this implementation was
+/// right.
+///
+/// **`tests/v4_hadamard_basis.rs` holds the evidence chain, the gate and the measurement.**
+/// It pins this function to an explicitly constructed Sylvester matrix bit-for-bit and
+/// carries its own negative control. Deliberately not restated here: the numbers belong with
+/// the code that produces them, and an earlier version of this comment carried a copy that
+/// was already wrong when it was written.
+///
+/// Why it mattered, which is the part worth having at the call site: sequency-vs-natural
+/// ordering permutes the fp4 quantization GROUPS without changing any magnitude. Nothing
+/// upstream of `fp4_act_quant_inplace` can see it — every candidate order is orthogonal, so
+/// the dot product is unchanged — and everything downstream is a different ranking. The
+/// consequence had it been wrong is that the *indexer's* top-k selection shifts, changing
+/// which positions are attended; no tolerance on an activation can see that, which is why
+/// `forward.rs` emits the indexer's selected indices as a golden of their own and S2
+/// compares SETS, not just numbers.
 pub fn hadamard_rotate(row: &mut [f32]) {
     let n = row.len();
     debug_assert!(n.is_power_of_two(), "Hadamard needs a power-of-two length");

@@ -13,7 +13,9 @@
 //     `v4compress.rs::compress` launches it. Writing a second one here would be a third
 //     copy of e4m3-RNE in this tree — see the note on `f2e4m3_rne` below.
 //   * The indexer's compressor (`rotate = true`: Hadamard + fp4 instead of partial fp8).
-//     Out of S2c's scope by the plan; it needs S2a's e2m1/e8m0 block.
+//     LANDED 2026-08-05 as `kernels/v4indexer.hip::v4_indexer_spread`, which
+//     `v4compress.rs::compress` launches as the finish when `Geom::indexer` built the
+//     geometry. Only the FINISH is there; the pooling below is shared by both compressors.
 //
 // A NOTE ON DUPLICATION, because this file had to choose. `kernels/` is NOT watched by
 // `build.rs`'s jscpd gate (which covers `src/`, `tests/` and itself), so nothing mechanical
@@ -34,7 +36,7 @@
 // `d`, `cd`, `ents` and `rd` are all plausible in each other's positions, and `cd`/`ents`
 // are DERIVED — `cd = coff*d`, `ents = coff*ratio` — so a caller that computed one from a
 // stale `coff` would produce a kernel that reads the right shape with the wrong stride.
-// `v4compress.rs::Geom` is the only constructor and derives all three.
+// `v4compress.rs::GeomAbi`, which only `Geom::build` constructs, derives all three.
 struct V4Comp {
     int ratio;
     int coff;   // 1 + overlap (model.py:298)
@@ -392,7 +394,7 @@ static int v4c_guard(V4Comp p) {
     // `coff` and `ratio` are NOT independent: `Compressor.overlap` is `compress_ratio == 4`
     // and nothing else (model.py:296). Without this, `{ratio: 128, coff: 2}` passes every
     // check above and runs the overlapping gather at ratio 128 — finite, plausible, wrong.
-    // Unreachable through `Geom::new`, which derives `coff` from `LayerKind`; reachable
+    // Unreachable through `Geom::build`, which derives `coff` from `LayerKind`; reachable
     // through the raw ABI, which is what this wall is for.
     //
     // `ratio <= 1` above rather than `<= 0`: at ratio 1 the state deposit computes
