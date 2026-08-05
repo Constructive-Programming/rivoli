@@ -224,6 +224,28 @@ matters most. Match the reference now; re-open fp8 in S4 as a **measured** perf 
 the oracle available to price its error. This is the same discipline as not ranking on
 free-running tok/s: do not let two variables move at once.
 
+### The duplication gate cannot see `kernels/` — found 2026-08-05 by S2c2
+
+**`f2e4m3_rne` and `fast_round_scale` were written twice, independently**, by two agents who
+never saw each other's work: `kernels/common.hpp` (S2a, `03b956f`) and `kernels/mla.hip` as
+`v4_f2e4m3_rne` / `v4_round_scale` (S2b, `e76e0d4`). Same function, same subnormal-tie
+argument, same bit surgery, arrived at separately — because rivoli's own `f32_to_e4m3`
+rounds half-away-from-zero where V4 was trained against RNE, so both needed a replacement.
+`v4_block_sum` and `v4_rbf16` are a third pair.
+
+**`build.rs:618` is `const SCAN: &[&str] = &["src", "tests", "build.rs"]`.** `kernels/` is
+not scanned, and the doc comment above it says so — "this repo's own Rust". So the gate this
+repo treats as absolute (*"Duplication is a build error… `.jscpd.json` carries no
+`threshold`, so there is no budget"*) is **structurally blind to the HIP and GLSL sources**,
+which is where the most numerics-sensitive code in the engine lives. The fp4-ownership
+decision prevented the duplication it named and not the one beside it.
+
+Not a bug in the gate — a known scope whose implication nobody had drawn. **S3 lifts one
+copy of each into `common.hpp`**; it needs `mla.hip` edits that no S2 agent was permitted to
+make. Whether jscpd should scan `kernels/` at all is a separate question: the two backends'
+ABI walls are already `jscpd:ignore`d for being deliberate copies, so turning it on there
+would need its own exemption pass first.
+
 ### A hole S3 inherits unless it acts — recorded 2026-08-05 by S2c
 
 **The shipped goldens at `index_topk = 512` are set-invariant, and a set comparison against
