@@ -278,6 +278,174 @@ extern "C" __global__ void rmsnorm(
     for (int i = t; i < n; i += blockDim.x) y[i] = x[i] * inv * w[i];
 }
 
+// `kernel.py::act_quant(x, 128, "ue8m0", …, inplace=True)` over `n_rows × row_len` f32,
+// IN PLACE — the fused quantize-then-dequantize DeepSeek-V4 puts in front of EVERY
+// quantized `Linear`, fp4-weight ones included (`model.py::linear` line 120).
+//
+// Its own kernel rather than folded into `dot_f4_wave_r` because the block is 128 wide and
+// spans the whole reduction dim: a wave that owns one output row sees only its own strided
+// slice of `x`, so it cannot compute the block amax. Hoisting it also makes it run ONCE per
+// activation instead of once per output row — `w1` and `w3` consume the identical
+// quantized `x`, and so does the resident fp8 shared expert.
+//
+// One wave per 128-element group. `row_len % ACT_QUANT_BLOCK == 0` is the reference's own
+// `assert N % block_size == 0` (kernel.py:112) and the launcher enforces it, so the group
+// tiling below never straddles a row boundary.
+extern "C" __global__ void act_quant_f8(float* __restrict__ v, size_t nblk) {
+    int lane = threadIdx.x & (WAVE - 1);
+    size_t b = (size_t)blockIdx.x * (blockDim.x / WAVE) + threadIdx.x / WAVE;
+    if (b >= nblk) return;
+    float* seg = v + b * ACT_QUANT_BLOCK;
+    float amax = 0.0f;
+    for (int i = lane; i < ACT_QUANT_BLOCK; i += WAVE) amax = fmaxf(amax, fabsf(seg[i]));
+    amax = fmaxf(wave_max(amax), ACT_QUANT_AMAX_FLOOR);
+    float s = fast_round_scale(amax, FP8_MAX_INV);
+    for (int i = lane; i < ACT_QUANT_BLOCK; i += WAVE) seg[i] = act_quant_roundtrip(seg[i], s);
+}
+
+// ── mHC: hyper-connections (`model.py::Block.hc_pre` / `hc_post`) ───────────────
+//
+// V4 does not carry ONE residual stream, it carries `HC_MULT` copies. `hc_pre` reduces
+// them to one with learned Sinkhorn-normalised weights before the attention/MoE sublayer;
+// `hc_post` expands the sublayer's single output back to `HC_MULT`, mixing in the
+// pre-sublayer copies through a learned combination matrix. A plain residual add in place
+// of `hc_post` runs, converges to nothing useful, and never errors.
+//
+// HC_MULT is 4 and is not a knob: `hc_split_sinkhorn`'s `mix_hc = (2 + hc)·hc` layout is
+// how the mHC weights are PACKED on disk, so another value is a different checkpoint. The
+// launchers refuse anything else rather than pretending to generalise.
+#define HC_MULT 4
+#define HC_MIX ((2 + HC_MULT) * HC_MULT)
+
+// `kernel.py::hc_split_sinkhorn` for one token, on ONE thread.
+//
+// Serial because it is 24 inputs and a 4x4 matrix: the whole routine is ~640 flops, and a
+// parallel version would have to reproduce the reference's summation order across lanes to
+// stay comparable at all. Note the asymmetry a port loses first — the FIRST normalisation
+// is a row *softmax* followed by a column divide, and only the remaining `iters - 1`
+// passes are plain row/column divides.
+//
+// `iters` is a parameter, not a constant, so the count comes from `config.json` through
+// `V4Config` and cannot drift. It is NOT gated by any numerical comparison: at 20 passes a
+// 4x4 positive matrix is far past convergence, so 19 and 20 agree bit-for-bit and no
+// golden can tell them apart (`tests/v4_oracle.rs::sinkhorn_has_converged_long_before_
+// iteration_20`). What IS gated is that the parameter is live — 2 vs 20 moves the output.
+__device__ __forceinline__ void hc_sinkhorn(
+    const float* __restrict__ mixes, const float* __restrict__ scale,
+    const float* __restrict__ base, int iters, float eps, float* __restrict__ pre,
+    float* __restrict__ post, float* __restrict__ comb) {
+    // `2 * sigmoid(x)`, not `2 / (1 + e^-x)`: the reference multiplies the finished
+    // sigmoid, and folding the 2 into the numerator moves the rounding.
+    for (int j = 0; j < HC_MULT; ++j) {
+        pre[j] = 1.0f / (1.0f + expf(-(mixes[j] * scale[0] + base[j]))) + eps;
+        post[j] = 2.0f * (1.0f / (1.0f + expf(-(mixes[j + HC_MULT] * scale[1]
+                                                + base[j + HC_MULT]))));
+    }
+    for (int j = 0; j < HC_MULT * HC_MULT; ++j)
+        comb[j] = mixes[j + 2 * HC_MULT] * scale[2] + base[j + 2 * HC_MULT];
+    // comb = comb.softmax(-1) + eps, row by row. Max/exp/sum in the reference's own order.
+    for (int j = 0; j < HC_MULT; ++j) {
+        float* row = comb + j * HC_MULT;
+        float m = row[0];
+        for (int t = 1; t < HC_MULT; ++t) m = fmaxf(m, row[t]);
+        float s = 0.0f;
+        for (int t = 0; t < HC_MULT; ++t) { row[t] = expf(row[t] - m); s += row[t]; }
+        for (int t = 0; t < HC_MULT; ++t) row[t] = row[t] / s + eps;
+    }
+    // `comb / (comb.sum(-1) + eps)` and `comb / (comb.sum(-2) + eps)` differ only in which
+    // index they hold fixed, so one normaliser takes that as a (hold, run) stride pair. Two
+    // copies would be two places to get the eps or the axis wrong.
+    auto norm = [&](int hold, int run) {
+        for (int fixed = 0; fixed < HC_MULT; ++fixed) {
+            float* c = comb + fixed * hold;
+            float s = 0.0f;
+            for (int r = 0; r < HC_MULT; ++r) s += c[r * run];
+            for (int r = 0; r < HC_MULT; ++r) c[r * run] /= s + eps;
+        }
+    };
+    // The reference's own sequence: ONE column pass, then `iters - 1` row/column PAIRS.
+    // Written out rather than folded into a `2·iters − 1` loop with a parity switch — the
+    // switch IS the axis, and swapping its two strides is exactly as silent as two loops
+    // disagreeing, while this reads against `Oracle::sinkhorn` line for line.
+    norm(1, HC_MULT);  // column: hold the dest index, run over the source
+    for (int i = 1; i < iters; ++i) {
+        norm(HC_MULT, 1);  // row: hold the source index, run over the dest
+        norm(1, HC_MULT);
+    }
+}
+
+// `Block.hc_pre`: one block per token. `h` is [s, HC_MULT, dim]; the rsqrt is over the FULL
+// HC_MULT·dim flattened row, not per copy — a per-copy norm is a different (and plausible)
+// statistic that leaves every magnitude in range.
+//
+// Returns the reduced `y` [s, dim] plus the `post`/`comb` the matching `hc_post` needs, so
+// the Sinkhorn runs ONCE per token per sublayer rather than twice.
+extern "C" __global__ void hc_pre(
+    const float* __restrict__ h, const float* __restrict__ fnw, const float* __restrict__ scale,
+    const float* __restrict__ base, int dim, int iters, float norm_eps, float hc_eps,
+    float* __restrict__ y, float* __restrict__ post_out, float* __restrict__ comb_out) {
+    __shared__ float red[256];
+    __shared__ float mixes[HC_MIX];
+    __shared__ float pre[HC_MULT], post[HC_MULT], comb[HC_MULT * HC_MULT];
+    int t = threadIdx.x, nt = blockDim.x;
+    size_t hcd = (size_t)HC_MULT * dim;
+    const float* flat = h + (size_t)blockIdx.x * hcd;
+
+    float local = 0.0f;
+    for (size_t i = t; i < hcd; i += nt) local += flat[i] * flat[i];
+    red[t] = local;
+    __syncthreads();
+    for (int s = nt / 2; s > 0; s >>= 1) {
+        if (t < s) red[t] += red[t + s];
+        __syncthreads();
+    }
+    float rs = 1.0f / sqrtf(red[0] / (float)hcd + norm_eps);
+
+    // One wave per mix row, three rounds at 256 threads (HC_MIX = 24, 8 waves).
+    int lane = t & (WAVE - 1), w = t / WAVE, nw = nt / WAVE;
+    for (int j = w; j < HC_MIX; j += nw) {
+        const float* wr = fnw + (size_t)j * hcd;
+        float acc = 0.0f;
+        for (size_t i = lane; i < hcd; i += WAVE) acc += flat[i] * wr[i];
+        acc = wave_sum(acc);
+        if (lane == 0) mixes[j] = acc * rs;
+    }
+    __syncthreads();
+    if (t == 0) hc_sinkhorn(mixes, scale, base, iters, hc_eps, pre, post, comb);
+    __syncthreads();
+
+    // y[d] = Σ_c pre[c]·flat[c·dim + d], then back to bf16 (`y.to(dtype)`).
+    float* yo = y + (size_t)blockIdx.x * dim;
+    for (int d = t; d < dim; d += nt) {
+        float acc = 0.0f;
+        for (int c = 0; c < HC_MULT; ++c) acc += pre[c] * flat[(size_t)c * dim + d];
+        yo[d] = bf16f(f2bf16(acc));
+    }
+    if (t < HC_MULT) post_out[(size_t)blockIdx.x * HC_MULT + t] = post[t];
+    if (t < HC_MULT * HC_MULT) comb_out[(size_t)blockIdx.x * HC_MULT * HC_MULT + t] = comb[t];
+}
+
+// `Block.hc_post`: y[t][k][d] = post[t][k]·x[t][d] + Σ_j comb[t][j][k]·residual[t][j][d].
+//
+// `comb` is indexed [SOURCE, DEST] — the Sinkhorn row-softmax runs over the dest index and
+// the column normalisation over the source index. Transposing it keeps every output row a
+// combination of the same vectors, so it survives every magnitude and norm check
+// (`v4oracle::Defect::SinkhornCombTransposed`); only a numerical comparison sees it.
+extern "C" __global__ void hc_post(
+    const float* __restrict__ x, const float* __restrict__ residual,
+    const float* __restrict__ post, const float* __restrict__ comb, int s, int dim,
+    float* __restrict__ y) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)s * HC_MULT * dim) return;
+    int d = (int)(i % dim);
+    int k = (int)((i / dim) % HC_MULT);
+    size_t tok = i / dim / HC_MULT;
+    float acc = post[tok * HC_MULT + k] * x[tok * dim + d];
+    for (int j = 0; j < HC_MULT; ++j)
+        acc += comb[(tok * HC_MULT + j) * HC_MULT + k] * residual[(tok * HC_MULT + j) * dim + d];
+    y[i] = bf16f(f2bf16(acc));  // `.type_as(x)` — the residual stream is bf16
+}
+
 // Interleaved RoPE (matching attn.rs) on `count` segments of `seg` elements:
 // segment s at base[s*stride..+seg]; pair (2j,2j+1) rotates by pos·theta^(-2j/seg)
 // into (j, half+j). Double angles (long-context arg reduction); one block/segment,
@@ -431,6 +599,63 @@ extern "C" int rivoli_rmsnorm(const float* x, const float* w, int n, float eps, 
     if (n <= 0) return 1001;
     hipGetLastError();
     hipLaunchKernelGGL(rmsnorm, dim3(1), dim3(256), 0, 0, x, w, n, eps, y);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+// `n_rows` rows of `row_len` f32, quantized in place on `stream`.
+//
+// `row_len % ACT_QUANT_BLOCK` is REFUSED (1002) rather than handled with a short tail
+// block: the reference asserts the same thing, and a tail block would quantize the last
+// few columns against a scale the reference never computes — values it cannot produce,
+// with no error anywhere. `nblk` is computed here and passed in, so the kernel's bound and
+// the grid that covers it come from ONE expression.
+extern "C" int rivoli_act_quant_f8(float* v, int n_rows, int row_len, void* stream) {
+    if (n_rows <= 0 || row_len <= 0) return 1001;
+    if (row_len % ACT_QUANT_BLOCK) return 1002;
+    size_t nblk = (size_t)n_rows * (size_t)(row_len / ACT_QUANT_BLOCK);
+    int waves = 256 / WAVE;
+    hipGetLastError();
+    hipLaunchKernelGGL(act_quant_f8, dim3((nblk + waves - 1) / waves), dim3(256), 0,
+                       (hipStream_t)stream, v, nblk);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+// One block per token, 256 threads — the LDS reduction tree in `hc_pre` needs a
+// power-of-two block, and `HC_MIX = 24` needs at least 8 waves to finish in three rounds.
+//
+// Takes a STREAM, unlike `rmsnorm`/`swiglu` above. rivoli's streams are created
+// `hipStreamNonBlocking` (`async.hip`), so the null stream does NOT implicitly order against
+// them: an mHC result on stream 0 feeding an FP4 expert range on a caller stream would be
+// unordered, and an unordered residual is a silent wrong.
+//
+// `hc` is taken and CHECKED rather than assumed: the caller reads it from `V4Config`, so a
+// checkpoint with a different `hc_mult` fails here instead of silently reading the mHC
+// weights at the wrong stride (`mix_hc = (2 + hc)·hc` is the packing).
+extern "C" int rivoli_hc_pre(
+    const float* h, const float* fnw, const float* scale, const float* base, int s, int hc,
+    int dim, int iters, float norm_eps, float hc_eps, float* y, float* post, float* comb,
+    void* stream) {
+    if (s <= 0 || dim <= 0) return 1001;
+    if (hc != HC_MULT) return 1002;
+    if (iters < 1) return 1003;
+    hipGetLastError();
+    hipLaunchKernelGGL(hc_pre, dim3(s), dim3(256), 0, (hipStream_t)stream, h, fnw, scale, base,
+                       dim, iters, norm_eps, hc_eps, y, post, comb);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+extern "C" int rivoli_hc_post(
+    const float* x, const float* residual, const float* post, const float* comb, int s, int hc,
+    int dim, float* y, void* stream) {
+    if (s <= 0 || dim <= 0) return 1001;
+    if (hc != HC_MULT) return 1002;
+    size_t n = (size_t)s * HC_MULT * dim;
+    hipGetLastError();
+    hipLaunchKernelGGL(hc_post, dim3((n + 255) / 256), dim3(256), 0, (hipStream_t)stream, x,
+                       residual, post, comb, s, dim, y);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
