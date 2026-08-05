@@ -722,10 +722,29 @@ impl ArchConfig for V4Config {
              expert's weight (`Gate.forward`'s `weights *= route_scale`)",
             self.routed_scale
         );
+        // Checked in the f32 domain the KERNELS work in, not only in the f64 JSON carries.
+        // `kernels/moe.hip:413` guards `!(swiglu_limit > 0.0f)` — spelled that way rather than
+        // `<= 0.0f` because NaN fails every comparison and `fminf(gt, NaN)` returns `gt`, so `<=`
+        // would admit the one value that silently disables the clamp. A bare `> 0.0` here misses
+        // BOTH narrowing failures, and they fail in opposite ways:
+        //
+        //   * UNDERFLOW. `as f32` rounds to nearest even, so any `0 < x <= 2^-150`
+        //     (7.006492321624085e-46) becomes `0.0f32` — and 7.1e-46 does NOT, it rounds up to the
+        //     min subnormal. The consequence is LOUD: guard 1006 at the first MoE layer of prefill.
+        //   * OVERFLOW. Float-to-float `as` saturates, so any finite `x > ~3.4e38` becomes
+        //     `f32::INFINITY`, which passes every `> 0.0` test — and `fminf(gt, inf) == gt`, so the
+        //     clamp becomes a NO-OP. That is exactly `v4oracle::Defect::SwigluUnclamped`, SILENT,
+        //     and wrong all the way to the output.
+        //
+        // The silent direction is the one worth the check, which is why this is `is_finite()` and
+        // not just a positivity test. Both verified numerically 2026-08-05.
+        let narrowed = self.swiglu_limit as f32;
         ensure!(
-            self.swiglu_limit > 0.0,
-            "swiglu_limit {} — V4's SwiGLU is CLAMPED (10.0 in the shipped config) and \
-             rivoli's is not, so a zero here is silently unclamped arithmetic",
+            narrowed > 0.0 && narrowed.is_finite(),
+            "swiglu_limit {} narrows to {narrowed} in f32, which is the domain the MoE kernel's \
+             clamp works in. V4's SwiGLU is CLAMPED (10.0 in the shipped config) and rivoli's is \
+             not, so a zero here is a rejected launch and an infinity is silently unclamped \
+             arithmetic",
             self.swiglu_limit
         );
         ensure!(
@@ -1131,6 +1150,15 @@ mod tests {
         for (bad, want) in [
             (vec![("scoring_func", r#""sigmoid""#)], "sqrtsoftplus"),
             (vec![("swiglu_limit", "0.0")], "CLAMPED"),
+            // The two f64 -> f32 NARROWING failures, which a bare `> 0.0` on the f64 admits.
+            // Both are device-free here and were not testable where this check first lived
+            // (`V4Engine::new`, which allocates device buffers and needs a real pin).
+            // `1e-46` underflows to `0.0f32`: LOUD, guard 1006 at the first MoE layer.
+            (vec![("swiglu_limit", "1e-46")], "narrows to 0"),
+            // `1e39` saturates to `f32::INFINITY`, passes every `> 0.0`, and makes
+            // `fminf(gt, inf)` a no-op — SILENT `Defect::SwigluUnclamped`. This row is the one
+            // that matters; the check was one-sided until a review found it.
+            (vec![("swiglu_limit", "1e39")], "narrows to inf"),
             (vec![("expert_dtype", r#""fp8""#)], "e2m1"),
             (vec![("num_key_value_heads", "8")], "MQA"),
             (vec![("rope_theta", "0")], "must be positive"),

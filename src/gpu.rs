@@ -106,8 +106,11 @@ fn top1_prob(bytes: &[u8]) -> f32 {
     (1.0 / sum) as f32
 }
 
-fn as_le_bytes<T: Copy>(v: &[T]) -> &[u8] {
-    // SAFETY: `T: Copy` POD (u32/f32/repr(C) ExpertDesc); LE host == LE bytes.
+/// `pub(crate)` for `v4gpu`, which uploads `ExpertDescF4`/f32/i32 arrays the same way.
+/// A second copy would be a `build.rs` duplication error, and a wrapper that only forwards
+/// would be a third name for two lines.
+pub(crate) fn as_le_bytes<T: Copy>(v: &[T]) -> &[u8] {
+    // SAFETY: `T: Copy` POD (u32/f32/i32/repr(C) ExpertDesc, ExpertDescF4); LE host == LE bytes.
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 

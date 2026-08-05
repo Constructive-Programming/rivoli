@@ -542,6 +542,39 @@ different populations. Numbering converts "the doc drifted" into something a che
 | **INV-4** | A device-side wait may be enqueued BEFORE its producer exists and still waits (the property `hipStreamWaitEvent` lacks) — one half per backend, since they reach it by different mechanisms | `gpustream.rs::inv_4_wait_enqueued_before_signal_still_waits`, `tests/vk.rs::inv_4_…` |
 | **INV-5** | An expert cannot be launched without enqueueing its data dependency: every descriptor carries a `Ticket` and `wait_on` is the only way to consume one | `pin.rs::inv_5_every_descriptor_carries_a_ticket` |
 | **INV-6** | A wait can always be released from the HOST, so a producer that dies owing a ticket cannot hang the device — one half per backend (HIP: monotone CAS into signal memory; Vulkan: `vkSignalSemaphore`) | `gpustream.rs::inv_6_a_host_release_retires_an_enqueued_wait`, `tests/vk.rs::inv_6_…` |
+| **INV-7** | On V4, a compressed block's destination row is a pure function of its POSITION — `window_size + start_pos / ratio`, never "the next free slot" — in both coordinate systems the layer loop writes | `v4gpu.rs::inv_7_a_compressed_blocks_row_is_a_pure_function_of_its_position`, `tests/v4_compress.rs::compress_dst_is_positional_…` |
+
+INV-7 is the V4 layer loop's, and it is **two halves like INV-4 and INV-6** — for a different
+reason, though. The registering half must live under `src/` because `tests/invariants.rs` walks
+`src/` only; the half in `tests/v4_compress.rs` is the older and broader one (the gapped script
+against an appending placer, the ratio-128 boundary, `region_base = 0` for the indexer's nested
+compressor, and the `Plain` refusal before either division). What the `src/` half adds is the part
+that belongs to the loop rather than to `compress_dst`: at prefill ONE block has TWO destinations
+and they differ (the persistent region base, and the prompt length in the transient
+`torch.cat([kv, kv_compress])` the selection indexes), while at decode they COINCIDE — and that
+equality is what makes the loop's single branch correct.
+
+The `src/` half also carries the one line that ties the row's "the layer loop" wording to
+something executable: `compress_and_place` writes the second destination only when
+`sel_base != persist_base`, and it tests THAT rather than the phase — so the invariant holds of the
+loop only if the two bases differ at prefill and coincide at decode. A review found the row claiming
+a property of the loop while both cited tests exercised pure functions; that predicate is asserted
+device-free, including the boundary where a prompt of exactly `sliding_window` tokens collapses the
+two bases and the single-write path is correct anyway.
+
+It is in this registry at all because it is the one rule this port has **measured to be invisible
+to a numeric gate**. Injecting the append rule left every attention golden bit-identical, `attn_out`
+included, on a script built specifically to expose it: the two rules differ by a permutation of a
+compressed region the selection covers uniformly, and `sparse_attn`'s online softmax is
+permutation-invariant over a set. So it could have been declared covered on a green numeric run and
+would not have been. Both halves use a hand-spelled row table, deliberately not derived from
+`compress_dst`, on a script with a GAP — the rules agree on every contiguous script, so a gapless
+test passes against the bug, and each half asserts that agreement so a later "tidying" fails
+instead. Two premises scope the invariant and both expire: the compressed selection is the
+positional full prefix today, and unwritten rows read as an agreed zero on both sides. Once the
+score-ordered `Indexer` lands the selected SET becomes content-chosen and a permuted region changes
+which blocks are attended, not merely their fold order — re-measure then.
+`docs/investigations/v4-flash-port.md` §"MEASURED on gfx1151" carries the numbers.
 
 INV-4 is the foundation of the ticketed dataflow that replaced the `hit` mask: it is what
 lets consumers be recorded up front, behind waits on values nothing has signalled yet.
@@ -623,6 +656,13 @@ module root (`src/<group>.rs`) over a directory, so the tree mirrors the section
 - **Top level** — `gpu` (the async forward pass, single- or two-row: `MAXROW`, §13), `math`,
   `attn`/`indexer` (attention modes + DSA), `telemetry` (the always-on PROFILE summary,
   plus the `otlp` feature below), `watchdog`.
+- **Top level, DeepSeek-V4 only** — `v4gpu` (its layer loop: `gpu`'s counterpart, not a branch
+  inside it, because the two share no per-layer step), `v4compress` (the KV compressor and the
+  sparse indexer's host half), `v4oracle` (the CPU transliteration S2/S3 are scored against).
+  `v4gpu` is **`rocm`-only** where `gpu` is `any(rocm, vulkan)`: every launcher it drives is
+  `backend::hip`'s and `backend/vk.rs` has no `v4_*` twin, so a Vulkan build refuses a V4 artifact
+  at startup rather than carrying stubs that would claim an unmeasured parity. `v4compress`'s host
+  half and `v4oracle` are ungated — see `src/lib.rs` for each argument.
 - **`--features otlp`** — exports the same intervals the PROFILE summary sums as real OTLP
   spans and metrics, one emission at run end. Off by default: the opentelemetry stack is
   heavy, and the rule that keeps instruments out of a stock binary applies here as it does
