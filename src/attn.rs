@@ -355,13 +355,17 @@ pub mod v4 {
         /// Derive from the artifact's config, validating every relation the kernels
         /// assume. Parsed once here so `attention` can trust its dimensions.
         ///
-        /// **`window` and `norm_eps` are passed in because S1a's [`V4Config`] does not
-        /// carry them.** The manifest has `sliding_window: 128` and `rms_norm_eps: 1e-6`
-        /// and `V4Config` parses neither; they are required, not optional, so they are
-        /// arguments rather than defaults — a defaulted window size would size the ring
-        /// wrong and change which tokens every layer attends to, silently. This is a
-        /// gap in S1a's config parser, not a decision — `docs/investigations/v4-flash-port.md` does not record it, so do not go looking there for the argument.
-        pub fn from_config(cfg: &V4Config, window: usize, norm_eps: f32) -> Result<Self> {
+        /// `sliding_window` and `rms_norm_eps` come from the config like everything
+        /// else. They did NOT until `b5d4083`, which declared them for the first time.
+        ///
+        /// Worth recording why the gap survived that long: `every_v4_field_is_required` drives off
+        /// `V4_BASE` and can only prove that *declared* fields lack a `#[serde(default)]`.
+        /// A field never declared at all is invisible to it. Both are in `V4_BASE` now.
+        pub fn from_config(cfg: &V4Config) -> Result<Self> {
+            // `f64` in the config because JSON numbers are, `f32` in `Dims` because the
+            // kernels are. Narrowing is exact for the shipped 1e-6 and for any eps a
+            // config would carry.
+            let (window, norm_eps) = (cfg.sliding_window, cfg.rms_norm_eps as f32);
             let d = Self {
                 dim: cfg.hidden,
                 n_heads: cfg.n_heads,

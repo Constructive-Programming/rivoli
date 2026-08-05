@@ -58,6 +58,11 @@
 #![cfg(feature = "rocm")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+// Both V4 configs are in scope in this file and they are deliberately separate types
+// (`src/v4oracle/weights.rs`: the instrument must not share code with the thing it
+// judges). Aliased to name WHICH one -- `V4Cfg` next to `V4Config` is one abbreviation
+// apart and survives no skim.
+use rivoli::artifact::model::V4Config as EngineV4Config;
 use rivoli::artifact::quant::e8m0;
 use rivoli::attn::{
     v4::{Dims, Fp8W, Io, Scratch, Step, Weights, attention},
@@ -585,6 +590,27 @@ fn each_in_scope_defect_is_further_away_than_the_kernels_are() {
     let mine: Vec<[Vec<f32>; 4]> = clean.iter().map(|p| gpu.step(&d, p)).collect();
     let floor = reach(&clean, &mine);
     println!("kernel-vs-oracle floor: {floor} bf16 ULP over {} steps", clean.len());
+    // MEASURED 2026-08-05 on gfx1151: 0 ULP at prefill and both decode steps.
+    //
+    // That is 0 ULP, which is NOT by itself bit-identity: `mono` rounds both sides to
+    // bf16 before differencing, so `max_ulp == 0` means "identical after rounding" —
+    // the very hole `Score::unrounded` exists to cover, and this test never calls
+    // `assert_within`, so it never checks it. Bit-identity is a fact BORROWED from
+    // `attention_matches_the_oracle_at_every_stage_of_a_ratio_zero_layer`, which asserts
+    // `unrounded == 0` on these same four tensors. Stated as a borrow because writing
+    // "i.e. bit-identical" here would assert a check this test does not make.
+    //
+    // Pinned at 0 rather
+    // than at `ULP_BUDGET`, because the budget is what the argument allows and this is
+    // what the kernels do — and a silent drift from 0 to 1 is the first observable sign
+    // of a second error source appearing.
+    //
+    // A 1-ULP flip IS theoretically reachable: the block reductions re-associate, and a
+    // re-associated f32 sum can land on the other side of a bf16 rounding boundary. If
+    // this ever goes red, establish that it is that before relaxing it — the same
+    // re-association would move a handful of elements by one ULP, where a real defect
+    // moves thousands by tens of thousands (see the separations below).
+    assert_eq!(floor, 0, "the kernels are no longer bit-exact against the oracle");
 
     let mut worst: Option<(Defect, i32)> = None;
     for (stage, defect) in in_scope() {
@@ -728,15 +754,22 @@ fn the_c_abi_argument_guards_reject_out_of_domain_shapes() {
         // `view_as_complex` cannot pair an odd count.
         guard(launch_v4_rope(pm, p, 1, 8, 3, 0, 1, false), "1005", "odd rope_head_dim");
         guard(launch_v4_rope(pm, p, 1, 8, 16, 0, 1, false), "1002", "rope span over the row");
+        // The ONLY assertion of the ragged-span guard, deliberately. 2026-08-05: it was
+        // also asserted inside `act_quant_matches_the_oracle_on_the_subnormal_ties_...`,
+        // holding the pre-renumbering code 1002; the kernel and this test moved to 1004
+        // together and that copy did not, so the run failed on a stale string AFTER the
+        // numerics comparison had already passed. It cost two wrong diagnoses, because a
+        // guard rejection reads like a numerics failure in a log -- the test name says
+        // "matches the oracle" and the output says "argument guard rejected". One guard,
+        // one assertion.
         guard(launch_v4_act_quant(pm, 1, 64, 60, 64), "1004", "a ragged quantization span");
     }
 }
 
 /// `Dims::from_config` against the artifact the port will actually run on.
 ///
-/// It is the only path that reads S1a's `V4Config`, and it is where the two fields that
-/// config does NOT carry — `sliding_window` and `rms_norm_eps` — have to be supplied by
-/// hand.
+/// It is the only path that reads S1a's `V4Config`, including `sliding_window` and
+/// `rms_norm_eps`, which that config did not parse at all until `b5d4083`.
 ///
 /// A MISSING ARTIFACT IS A FAILURE, not a skip. The first draft of this printed a SKIP
 /// line and returned green, which is worse than useless: libtest captures stdout on a
@@ -751,23 +784,56 @@ fn dims_accept_the_real_artifact_and_reject_a_ragged_kv_span() {
         "no V4 artifact at {DIR}: S2b's only check against the SHIPPED config cannot run. \
          Produce it with `bin/convert_v4` (S1a) rather than letting this pass."
     );
-    let cfg: rivoli::artifact::model::V4Config =
-        rivoli::artifact::model::load_config(DIR).expect("V4 config");
-    // From the manifest, which `V4Config` does not parse: `sliding_window: 128` and
-    // `rms_norm_eps: 1e-6`.
-    let d = Dims::from_config(&cfg, 128, 1e-6).expect("the shipped config must be runnable");
+    let cfg: EngineV4Config = rivoli::artifact::model::load_config(DIR).expect("V4 config");
+    let d = Dims::from_config(&cfg).expect("the shipped config must be runnable");
     assert_eq!((d.head_dim, d.rope_head_dim, d.n_heads), (512, 64, 64));
     assert_eq!((d.head_dim - d.rope_head_dim) % 64, 0, "the partial act_quant needs whole blocks");
+    // The two fields `V4Config` gained in `b5d4083`, read off the manifest rather than
+    // supplied by the caller. Asserted by VALUE: a parser that silently defaulted them
+    // would still produce a `Dims`, and 128/1e-6 are exactly the plausible defaults.
+    assert_eq!(d.window, 128, "sliding_window is not coming from the manifest");
+    assert!((d.norm_eps - 1e-6).abs() < 1e-12, "rms_norm_eps is not coming from the manifest");
 
     // The rejection half. A `rope_head_dim` that leaves a ragged non-RoPE span would
     // make `act_quant` quantize a short tail block against its own amax — values the
     // reference cannot produce, and silent, since every shipped shape divides evenly.
     let mut ragged = cfg.clone();
     ragged.qk_rope_head_dim = 66;
-    let e = Dims::from_config(&ragged, 128, 1e-6).expect_err("a ragged KV span must be refused");
+    let e = Dims::from_config(&ragged).expect_err("a ragged KV span must be refused");
     assert!(format!("{e}").contains("not a multiple of 64"), "wrong rejection: {e}");
-    // ...and a zero window, which would size the ring to nothing.
-    assert!(Dims::from_config(&cfg, 0, 1e-6).is_err(), "a zero window must be refused");
+    // Zero extents. `is_multiple_of` admits zero, so without `from_config`'s explicit
+    // sweep each of these reached a launcher as an opaque guard code.
+    //
+    // ALL EIGHT the sweep covers, not a sample. The production side is one loop over a
+    // literal list, so six cases would not exercise six code paths — they would exercise
+    // one branch six times. What this can prove is MEMBERSHIP: that every extent the
+    // kernels index with is in that list. A subset proves neither, and the first draft
+    // shipped six of eight, omitting `n_heads` and `hidden`.
+    //
+    // The rejection is matched on the FIELD NAME, not just on "is zero", so the sweep is
+    // also pinned to run before the divisibility checks — a reordering that let
+    // `head_dim = 0` fail as "not a multiple of 64" would pass a laxer assertion.
+    /// One named extent, and how to zero it. Named so the array below is a table of
+    /// FIELDS rather than a tuple soup, and typed so the count is checked: `[ZeroCase; 8]`
+    /// stops being 8 the moment someone drops a case, which is how it shipped 6 of 8.
+    type ZeroCase = (&'static str, fn(&mut EngineV4Config));
+    let cases: [ZeroCase; 8] = [
+        ("sliding_window", |c| c.sliding_window = 0),
+        ("n_heads", |c| c.n_heads = 0),
+        ("o_groups", |c| c.o_groups = 0),
+        ("hidden", |c| c.hidden = 0),
+        ("head_dim", |c| c.head_dim = 0),
+        ("qk_rope_head_dim", |c| c.qk_rope_head_dim = 0),
+        ("q_lora_rank", |c| c.q_lora_rank = 0),
+        ("o_lora_rank", |c| c.o_lora_rank = 0),
+    ];
+    for (name, mutate) in cases {
+        let mut bad = cfg.clone();
+        mutate(&mut bad);
+        let e = Dims::from_config(&bad).expect_err("a zero extent must be refused");
+        let want = format!("{name} is zero");
+        assert!(format!("{e}").contains(&want), "expected `{want}`, got: {e}");
+    }
 }
 
 /// `v4_act_quant` against the oracle, on data CHOSEN to reach e4m3's subnormal range and
@@ -834,12 +900,6 @@ fn act_quant_matches_the_oracle_on_the_subnormal_ties_that_pick_the_rounding_rul
         &got[..16],
         &want[..16]
     );
-
-    // The launcher's ragged-block guard, which protects against quantizing a short tail
-    // against its own amax — values the reference cannot produce, silently.
-    let e = unsafe { launch_v4_act_quant(buf.ptr_mut().cast(), 1, BLOCK, BLOCK - 1, BLOCK) }
-        .expect_err("a span that is not a whole number of blocks must be refused");
-    assert!(format!("{e}").contains("1002"), "wrong rejection: {e}");
 }
 
 /// **The comparator itself, proved able to go red.** Needs no device.
