@@ -290,3 +290,156 @@ extern "C" int rivoli_mla_attend(
     e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// DeepSeek-V4-Flash attention core — S2b of docs/investigations/v4-flash-port.md
+// ═══════════════════════════════════════════════════════════════════════════════════
+//
+// `kernel.py::sparse_attn`. Nothing above applies: V4 is MQA over ONE `head_dim`-wide
+// entry that is simultaneously the key and the value for all `h` heads (`T.gemm` is
+// called twice against the same `kv_shared`), gathered by an explicit per-query index
+// list rather than by a causal bound.
+//
+// FP CONTRACTION OFF, same argument as the V4 section of mla.hip: the logit dot and the
+// value accumulation below run in the SAME order as `Oracle::sparse_attn`'s folds, so
+// with contraction off the only divergence left in this kernel is `expf` and the two
+// block reductions — which makes the goldens a far sharper instrument than they would
+// otherwise be. This kernel reads 16 MB/token/layer out of `kv` (128 slots x 512 f32 x
+// 64 head-blocks), so it should be bound by that and not by VALU — but the pragma's cost
+// has NOT been measured, and S4 is where it gets priced rather than asserted.
+#pragma clang fp contract(off)
+
+#define V4_ATTN_THREADS 256
+// Output dims per thread. Caps `head_dim` at V4_ATTN_THREADS * V4_ATTN_ACC = 1024; the
+// launcher rejects more rather than dropping dims, which is what an unchecked bound
+// would do — silently, and only in the tail of every head.
+#define V4_ATTN_ACC 4
+
+// o[t][head] = ( Σ_j softmax_j(q[t][head]·kv[idx[t][j]] · scale) · kv[idx[t][j]] )
+// with `attn_sink[head]` added to the softmax DENOMINATOR ONLY.
+//
+// THE SINK IS NOT A KEY. `kernel.py:345-346` adds `exp(attn_sink[i] - scores_max[i])` to
+// `sum_exp` after the last block and never adds a matching term to `acc_o`: it is a
+// learned per-head leak of probability mass. Note that "a sink treated as a real key
+// with a zero value vector" is algebraically THIS, so that is not a distinct mistake;
+// the one this shape actually invites is forgetting the running-max shift, which weights
+// the sink by a factor of exp(max) and is `Defect::AttnSinkNotMaxShifted`.
+//
+// `idx < 0` masks a slot (`get_window_topk_idxs` pads with -1 before the window fills,
+// and masks the acausal half at prefill). Masked slots contribute nothing to the max,
+// the sum or the accumulator, and are never dereferenced.
+//
+// A FULLY-MASKED QUERY POISONS ITS OUTPUT WITH NaN rather than producing 0/inf. The
+// oracle asserts on this case (`query {t} head {hh} attends to nothing`); a kernel
+// cannot, and 0/inf = 0 is a plausible-looking answer for a query that attended to
+// nothing at all. NaN propagates to the comparison, which is the loudest thing available
+// here. It is unreachable in the reference — every query's own position is in its window
+// — so this guards a wiring mistake in the index list, not a model state.
+//
+// Two passes, not the reference's online (flash) softmax: the same mathematics, and the
+// logits fit LDS at every `topk` this model reaches (128 window slots at ratio 0, plus
+// `index_topk` compressed slots where S2c adds them). One block per (query row, head).
+extern "C" __global__ void v4_sparse_attn(const float* __restrict__ q,
+                                          const float* __restrict__ kv,
+                                          const float* __restrict__ sink,
+                                          const int* __restrict__ idxs, int h, int d,
+                                          int topk, float scale, float* __restrict__ o) {
+    extern __shared__ float lds[];
+    float* qs = lds;          // [d]   this head's query row
+    float* lg = lds + d;      // [topk] logits, then softmax weights
+    __shared__ float red[V4_ATTN_THREADS];
+    __shared__ float bc[2];   // running max, then the denominator
+
+    const int tid = (int)threadIdx.x;
+    const int head = (int)blockIdx.x, t = (int)blockIdx.y;
+    const float* qrow = q + ((size_t)t * h + head) * d;
+    const int* ix = idxs + (size_t)t * topk;
+    for (int i = tid; i < d; i += V4_ATTN_THREADS) qs[i] = qrow[i];
+    __syncthreads();
+
+    // Logits. One thread owns a whole key, so the d-loop is sequential in the same order
+    // as the oracle's `for i in 0..d { acc += qh[i] * k[i] }`.
+    float mx = -INFINITY;
+    for (int j = tid; j < topk; j += V4_ATTN_THREADS) {
+        int p = ix[j];
+        float l = -INFINITY;
+        if (p >= 0) {
+            const float* kr = kv + (size_t)p * d;
+            float a = 0.0f;
+            for (int i = 0; i < d; ++i) a += qs[i] * kr[i];
+            l = a * scale;
+        }
+        lg[j] = l;
+        mx = fmaxf(mx, l);
+    }
+    red[tid] = mx;
+    __syncthreads();
+    for (int s = V4_ATTN_THREADS >> 1; s > 0; s >>= 1) {
+        if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+        __syncthreads();
+    }
+    if (tid == 0) bc[0] = red[0];
+    __syncthreads();
+    mx = bc[0];
+
+    float ps = 0.0f;
+    for (int j = tid; j < topk; j += V4_ATTN_THREADS) {
+        float e = (ix[j] >= 0) ? expf(lg[j] - mx) : 0.0f;
+        lg[j] = e;
+        ps += e;
+    }
+    red[tid] = ps;
+    __syncthreads();
+    for (int s = V4_ATTN_THREADS >> 1; s > 0; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) bc[1] = isfinite(mx) ? red[0] + expf(sink[head] - mx) : NAN;
+    __syncthreads();
+    const float denom = bc[1];
+
+    // Values. `j` ascends over ALL slots, which is the oracle's accumulation order; the
+    // dims a thread owns are `V4_ATTN_THREADS` apart, so a wave reads 32 consecutive
+    // floats of `kv` per step.
+    float acc[V4_ATTN_ACC];
+#pragma unroll
+    for (int c = 0; c < V4_ATTN_ACC; ++c) acc[c] = 0.0f;
+    for (int j = 0; j < topk; ++j) {
+        int p = ix[j];
+        if (p < 0) continue;
+        const float* kr = kv + (size_t)p * d;
+        const float e = lg[j];
+#pragma unroll
+        for (int c = 0; c < V4_ATTN_ACC; ++c) {
+            int i = tid + c * V4_ATTN_THREADS;
+            if (i < d) acc[c] += e * kr[i];
+        }
+    }
+    // `sparse_attn` writes a bf16 tensor.
+    float* orow = o + ((size_t)t * h + head) * d;
+#pragma unroll
+    for (int c = 0; c < V4_ATTN_ACC; ++c) {
+        int i = tid + c * V4_ATTN_THREADS;
+        if (i < d) orow[i] = bf16f(f2bf16(acc[c] / denom));
+    }
+}
+
+extern "C" int rivoli_v4_sparse_attn(const float* q, const float* kv, const float* sink,
+                                     const int* idxs, int m, int h, int d, int topk,
+                                     float scale, float* o) {
+    if (m <= 0 || h <= 0 || d <= 0 || topk <= 0) return 1001;
+    // 1002 is the size-bound code this tree uses (attn.hip's flash launcher, indexer.hip).
+    // THIS is the guard between a `head_dim` past the per-thread accumulator and output
+    // dims that are silently never written — the tail of every head, with no error and no
+    // fault. Nothing in the model approaches it (512 against a cap of 1024), which is
+    // exactly why it has to be a hard rejection rather than a comment.
+    if (d > V4_ATTN_THREADS * V4_ATTN_ACC) return 1002;
+    size_t lds = ((size_t)d + (size_t)topk) * sizeof(float);
+    // The static `red`/`bc` are counted here too: they come out of the same 64 KB.
+    if (lds + sizeof(float) * (V4_ATTN_THREADS + 2) > 65536) return 1006;
+    hipGetLastError();
+    hipLaunchKernelGGL(v4_sparse_attn, dim3((unsigned)h, (unsigned)m), dim3(V4_ATTN_THREADS),
+                       (unsigned)lds, 0, q, kv, sink, idxs, h, d, topk, scale, o);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}

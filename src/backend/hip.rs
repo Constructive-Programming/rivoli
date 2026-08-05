@@ -373,6 +373,42 @@ unsafe extern "C" {
         hd: i32,
         e: *mut f32,
     ) -> i32;
+    fn rivoli_v4_act_quant(x: *mut f32, rows: i32, row_stride: i32, n: i32, block: i32) -> i32;
+    fn rivoli_v4_rmsnorm(x: *mut f32, w: *const f32, rows: i32, d: i32, eps: f32) -> i32;
+    fn rivoli_v4_qk_norm(q: *mut f32, rows: i32, d: i32, eps: f32) -> i32;
+    fn rivoli_v4_rope(
+        x: *mut f32,
+        tbl: *const f32,
+        rows: i32,
+        row_len: i32,
+        rd: i32,
+        pos0: i32,
+        rows_per_pos: i32,
+        inverse: i32,
+    ) -> i32;
+    fn rivoli_v4_gemv_fp8(
+        x: *const f32,
+        w: *const u8,
+        wscale: *const f32,
+        m: i32,
+        n_out: i32,
+        k: i32,
+        block: i32,
+        groups: i32,
+        out: *mut f32,
+    ) -> i32;
+    fn rivoli_v4_sparse_attn(
+        q: *const f32,
+        kv: *const f32,
+        sink: *const f32,
+        idxs: *const i32,
+        m: i32,
+        h: i32,
+        d: i32,
+        topk: i32,
+        scale: f32,
+        o: *mut f32,
+    ) -> i32;
 }
 // jscpd:ignore-end
 
@@ -1373,5 +1409,186 @@ pub unsafe fn launch_index_head_route(
     let r =
         unsafe { rivoli_index_head_route(q, w, pool, m_blocks as i32, nh as i32, hd as i32, e) };
     check(r, "index_head_route")
+}
+
+// ── DeepSeek-V4-Flash attention (S2b) ───────────────────────────────────────────────
+//
+// HIP-ONLY, deliberately, and this is the one thing about them that is not obvious.
+// `tests/kernel_coverage.rs::every_launcher_has_an_oracle` is keyed on `backend/vk.rs`,
+// so a launcher that exists only here is invisible to it — there is no automatic gate
+// saying these are exercised. `tests/v4_attn.rs` is the whole of their coverage, and
+// every caller must be `#[cfg(feature = "rocm")]` or `--features vulkan` will not
+// resolve the name. S3 decides whether V4 gets a Vulkan arm at all; until it does,
+// adding stubs to `vk.rs` would claim a parity that does not exist.
+
+/// `kernel.py::act_quant(x, block, "ue8m0", inplace=True)` in place over `rows` rows of
+/// `row_stride` floats, quantizing the first `n` of each. `n < row_stride` is the KV
+/// entry's PARTIAL quantization (model.py:512, dims `[0, head_dim - rope_head_dim)` at
+/// block 64); `n == row_stride` at block 128 is what every quantized `Linear` does to
+/// its activation before the GEMM.
+///
+/// # Safety
+/// `x` is a device buffer of at least `rows * row_stride` f32, live until the next
+/// [`device_sync`].
+pub unsafe fn launch_v4_act_quant(
+    x: *mut f32,
+    rows: usize,
+    row_stride: usize,
+    n: usize,
+    block: usize,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r =
+        unsafe { rivoli_v4_act_quant(x, rows as i32, row_stride as i32, n as i32, block as i32) };
+    check(r, "v4_act_quant")
+}
+
+/// `RMSNorm.forward` over `rows` rows of `d` floats, in place: f32 statistic, learned
+/// weight, bf16-rounded store.
+///
+/// # Safety
+/// Device pointers live until the next [`device_sync`]: `x` (`rows * d` f32), `w` (`d`
+/// f32).
+pub unsafe fn launch_v4_rmsnorm(
+    x: *mut f32,
+    w: *const f32,
+    rows: usize,
+    d: usize,
+    eps: f32,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r = unsafe { rivoli_v4_rmsnorm(x, w, rows as i32, d as i32, eps) };
+    check(r, "v4_rmsnorm")
+}
+
+/// The weightless per-head QK-norm of model.py:504, in place over `rows = s * n_heads`
+/// rows of `head_dim`. Must be launched BEFORE the RoPE — see the kernel's note: the
+/// oracle provably cannot see the order, so it comes from the reference.
+///
+/// # Safety
+/// `q` is a device buffer of at least `rows * d` f32, live until the next
+/// [`device_sync`].
+pub unsafe fn launch_v4_qk_norm(q: *mut f32, rows: usize, d: usize, eps: f32) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r = unsafe { rivoli_v4_qk_norm(q, rows as i32, d as i32, eps) };
+    check(r, "v4_qk_norm")
+}
+
+/// `apply_rotary_emb` over the last `rd` dims of each of `rows` rows, ADJACENT-PAIR
+/// (`view_as_complex`), from a precomputed `(cos, sin)` table. Row `r` takes position
+/// `pos0 + r / rows_per_pos`. `inverse` conjugates it — the output de-rotation.
+///
+/// # Safety
+/// Device pointers live until the next [`device_sync`]: `x` (`rows * row_len` f32),
+/// `tbl` (at least `(pos0 + rows / rows_per_pos) * rd` f32, interleaved cos/sin).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_v4_rope(
+    x: *mut f32,
+    tbl: *const f32,
+    rows: usize,
+    row_len: usize,
+    rd: usize,
+    pos0: usize,
+    rows_per_pos: usize,
+    inverse: bool,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r = unsafe {
+        rivoli_v4_rope(
+            x,
+            tbl,
+            rows as i32,
+            row_len as i32,
+            rd as i32,
+            pos0 as i32,
+            rows_per_pos as i32,
+            i32::from(inverse),
+        )
+    };
+    check(r, "v4_rope")
+}
+
+/// fp8-e4m3 GEMV with 128x128 block scales and a bf16-rounded output.
+///
+/// `x` is `m` rows of `groups` consecutive `k`-wide slices; output row `j` reads slice
+/// `j / (n_out / groups)` of its row. `groups = 1` is a plain `Linear` (every output row
+/// sees the whole activation); `groups = o_groups` is the grouped `wo_a` einsum, whose
+/// input groups are contiguous runs of heads and so need no gather.
+///
+/// Does NOT quantize the activation — [`launch_v4_act_quant`] is a separate launch where
+/// the reference performs one, and `wo_a` gets none at all.
+///
+/// # Safety
+/// Device pointers live until the next [`device_sync`]: `x` (`m * groups * k` f32), `w`
+/// (`n_out * k` bytes), `wscale` (`ceil(n_out/block) * ceil(k/block)` f32), `out`
+/// (`m * n_out` f32). The `x` bound is exact and follows from the arguments; an earlier
+/// signature took the row and group strides separately, where the in-bounds relation was
+/// a three-way inequality nothing checked.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_v4_gemv_fp8(
+    x: *const f32,
+    w: *const u8,
+    wscale: *const f32,
+    m: usize,
+    n_out: usize,
+    k: usize,
+    block: usize,
+    groups: usize,
+    out: *mut f32,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r = unsafe {
+        rivoli_v4_gemv_fp8(
+            x,
+            w,
+            wscale,
+            m as i32,
+            n_out as i32,
+            k as i32,
+            block as i32,
+            groups as i32,
+            out,
+        )
+    };
+    check(r, "v4_gemv_fp8")
+}
+
+/// `kernel.py::sparse_attn` — MQA over one `d`-wide entry that is both key and value for
+/// all `h` heads, gathered by `idxs` (`-1` masks a slot), with `sink` entering the
+/// softmax DENOMINATOR only.
+///
+/// # Safety
+/// Device pointers live until the next [`device_sync`]: `q` (`m * h * d` f32), `kv`
+/// (`d` f32 per row, indexed by `idxs`, so at least `max(idxs) + 1` rows), `sink` (`h`
+/// f32), `idxs` (`m * topk` i32), `o` (`m * h * d` f32).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_v4_sparse_attn(
+    q: *const f32,
+    kv: *const f32,
+    sink: *const f32,
+    idxs: *const i32,
+    m: usize,
+    h: usize,
+    d: usize,
+    topk: usize,
+    scale: f32,
+    o: *mut f32,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    let r = unsafe {
+        rivoli_v4_sparse_attn(
+            q,
+            kv,
+            sink,
+            idxs,
+            m as i32,
+            h as i32,
+            d as i32,
+            topk as i32,
+            scale,
+            o,
+        )
+    };
+    check(r, "v4_sparse_attn")
 }
 // jscpd:ignore-end
