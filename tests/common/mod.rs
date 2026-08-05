@@ -521,7 +521,7 @@ pub fn probe(name: &str, n: usize, dim: usize) -> Vec<f32> {
 /// is the whole value of a census failure (*which* names, and what the reader should do
 /// about them), and a shared message would have to be generic enough to be useless. Only the
 /// set arithmetic is common.
-pub fn absent<'a, S: AsRef<str>>(names: &'a [S], present: impl Fn(&str) -> bool) -> Vec<&'a str> {
+pub fn absent<S: AsRef<str>>(names: &[S], present: impl Fn(&str) -> bool) -> Vec<&str> {
     names
         .iter()
         .map(AsRef::as_ref)
