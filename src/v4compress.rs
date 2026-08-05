@@ -7,9 +7,15 @@
 //!
 //! The pooling itself is device work: `kernels/v4compress.hip`, launched in the reference's
 //! own order by [`compress`] below and scored against `Oracle::compressor` by
-//! `tests/v4_compress_kernel.rs`. **The indexer's scoring is still unwritten** — it needs
-//! the e2m1/e8m0 primitives S2a owns, and naming a kernel here that `ls kernels/` does not
-//! show would send the next reader to prove a negative.
+//! `tests/v4_compress_kernel.rs`.
+//!
+//! The indexer's device half landed 2026-08-05 and is `kernels/v4indexer.hip`:
+//! `v4_indexer_spread` (the Hadamard + fp4 finish, which is also [`Geom::indexer`]'s) and
+//! `v4_indexer_score` (the `einsum`/relu/weight/sum chain), scored by
+//! `tests/v4_indexer_kernel.rs`. **The selection is not there** — the causal mask and the
+//! top-k stay with the caller, because `Oracle::indexer` exports the full pre-top-k score
+//! matrix and comparing THAT is strictly stronger than comparing the selected sets, which
+//! are invariant at the shipped `index_topk` (see the plan doc's "A hole S3 inherits").
 //!
 //! # This is NOT the DSA indexer in `indexer.rs`
 //!
@@ -363,20 +369,42 @@ pub fn should_compress(kind: LayerKind, seqlen: usize, start_pos: usize) -> bool
 // the device half — S2c's kernels and the order they run in
 // ---------------------------------------------------------------------------------------
 
-/// One compressor's geometry, in the exact `repr(C)` layout `kernels/v4compress.hip`'s
-/// `V4Comp` expects.
+/// Which quantization `Compressor.forward` finishes with — the `rotate` flag of
+/// `Compressor.__init__` (model.py:290), which is the ONLY thing that differs between the
+/// attention compressor and the indexer's nested one.
 ///
-/// Fields are PRIVATE and [`Geom::attention`] is the only constructor, because three of the six
-/// integers are derived and a caller that computed one of them from a stale `coff` gets a
-/// kernel that reads the right shape at the wrong stride — `ape`'s row stride is `cd`, and
-/// at ratio 4 that is 1024 while at ratio 128 it is 512. Handing the kernel six loose
-/// `i32`s would make every one of those six positions plausible in the others.
+/// An enum rather than a `bool`, and carried inside [`Geom`] rather than passed beside it,
+/// because the two are a different *algorithm* over an identical *shape*. `compress` matches
+/// on it exhaustively, so a third finish cannot be added without the compiler naming this
+/// site — and there is no wildcard arm to swallow it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Quantize {
+    /// `rotate = false` — model.py:378, `act_quant(kv[..., :-rd], 64, …)`: block-64 e4m3
+    /// over dims `[0, d - rd)` only, leaving the RoPE tail in bf16 to match QAT.
+    PartialFp8,
+    /// `rotate = true` — model.py:374-376, `rotate_activation` then
+    /// `fp4_act_quant(·, 32)`: the Hadamard spread and fp4 over the WHOLE row.
+    HadamardFp4,
+}
+
+/// The `repr(C)` mirror of `kernels/v4compress.hip`'s `V4Comp`, and the only part of
+/// [`Geom`] that crosses the ABI wall.
 ///
-/// Built from [`LayerKind`], not a raw ratio, so [`LayerKind::Plain`] — which has no
-/// `Compressor` object at all in the reference — cannot produce one.
+/// Split out from [`Geom`] when [`Geom::indexer`] landed. It would have been simpler to add
+/// an eighth field to the one struct, and that is exactly what was rejected: `Geom` now
+/// carries a [`Quantize`] that no kernel reads, and a `repr(C)` type whose Rust half has
+/// fields the C half does not is the hazard the layout assertion below exists to catch —
+/// "then the two structs are different objects and the guard is reading whichever bytes
+/// happen to line up". Two types keeps one of them an exact mirror.
+///
+/// Fields are PRIVATE and [`Geom`]'s constructors are the only way in, because three of the
+/// six integers are derived and a caller that computed one from a stale `coff` gets a kernel
+/// that reads the right shape at the wrong stride — `ape`'s row stride is `cd`, and at ratio
+/// 4 that is 1024 while at ratio 128 it is 512. Handing the kernel six loose `i32`s would
+/// make every one of those positions plausible in the others.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Geom {
+pub struct GeomAbi {
     ratio: i32,
     coff: i32,
     d: i32,
@@ -384,6 +412,22 @@ pub struct Geom {
     ents: i32,
     rd: i32,
     eps: f32,
+}
+
+/// One compressor's geometry **and the finish it owes**.
+///
+/// Built from [`LayerKind`], not a raw ratio, so [`LayerKind::Plain`] — which has no
+/// `Compressor` object at all in the reference — cannot produce one.
+///
+/// The pairing is the whole point of the type. `docs/investigations/v4-flash-port.md`
+/// requirement 5 banks it: the indexer's compressor has the attention compressor's *shape*
+/// and a different *algorithm*, so a geometry built for one and finished as the other passes
+/// every dimension guard and runs block-64 e4m3 where fp4 over all 128 is due. Finite,
+/// plausible, wrong. Here the algorithm is a field, chosen once by whichever constructor ran.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Geom {
+    abi: GeomAbi,
+    quant: Quantize,
 }
 
 // The `repr(C)` mirror, pinned at compile time. `v4c_guard` already catches a REORDER of
@@ -394,8 +438,8 @@ pub struct Geom {
 // is reading whichever bytes happen to line up. These two catch that, at the file where the
 // edit was made. `backend/vk.rs`'s `ExpertDesc` assert is the same idiom.
 const _: () = assert!(
-    size_of::<Geom>() == 28 && align_of::<Geom>() == 4,
-    "Geom must stay six i32 and one f32 — the layout kernels/v4compress.hip's V4Comp declares"
+    size_of::<GeomAbi>() == 28 && align_of::<GeomAbi>() == 4,
+    "GeomAbi must stay six i32 and one f32 — the layout kernels/v4compress.hip's V4Comp declares"
 );
 const _: () = assert!(
     size_of::<Finish>() == 3 * size_of::<*const f32>(),
@@ -413,9 +457,10 @@ impl Geom {
     /// (`Overlap`, `index_head_dim`, same `rope_head_dim`), so a `Geom` built for it would
     /// pass every launcher guard and [`compress`] would run the attention finish over it:
     /// block-64 e4m3 on dims `[0, 64)` where Hadamard-plus-fp4 on all 128 was due. Finite,
-    /// plausible, wrong. There is deliberately **no constructor** for it — the fields are
-    /// private and this is the only one — so the state is unrepresentable rather than
-    /// merely undocumented. Adding `Geom::indexer` must land together with the fp4 finish.
+    /// plausible, wrong. Its constructor is [`Geom::indexer`], which landed **together with**
+    /// the fp4 finish on 2026-08-05 as the plan's requirement 5 demands; the state stays
+    /// unrepresentable because [`Quantize`] is a field chosen by whichever constructor ran,
+    /// not an argument [`compress`] could be handed wrongly.
     ///
     /// `None` for [`LayerKind::Plain`]: the reference's `Attention.__init__` builds a
     /// `Compressor` only when `compress_ratio` is truthy, so there is no geometry to
@@ -433,47 +478,105 @@ impl Geom {
     /// `Geom` can exist that no launcher will accept, and the error names a code and not a
     /// field.
     pub fn attention(kind: LayerKind, d: usize, rope_head_dim: usize, norm_eps: f32) -> Option<Self> {
+        Self::build(kind, d, rope_head_dim, norm_eps, Quantize::PartialFp8)
+    }
+
+    /// The **indexer's** compressor geometry — `rotate = true` (model.py:404,
+    /// `Compressor(args, compress_ratio, self.head_dim, True)`).
+    ///
+    /// Landed together with the fp4 finish and not before, which is
+    /// `docs/investigations/v4-flash-port.md` requirement 5 discharged: the state this type
+    /// must not permit is a geometry that says "indexer" while [`compress`] runs the
+    /// attention finish over it, and the way it is prevented is that [`Quantize`] is a field
+    /// rather than a second argument to `compress`.
+    ///
+    /// `None` unless the layer is [`LayerKind::Overlap`]. An `Indexer` exists **only** where
+    /// `compress_ratio == 4` (model.py:474 — 21 of the 43 layers, at indices `[2, 4, …, 42]`),
+    /// and its nested `Compressor` is constructed with that same ratio, so ratio 128 and
+    /// ratio 0 are both unrepresentable here rather than merely undocumented. That is
+    /// stricter than [`Geom::attention`], which accepts every ratio with a compressor.
+    ///
+    /// `d` is `args.index_head_dim` (128), **not** `args.head_dim` (512). They are different
+    /// geometries on the SAME layer and taking one for the other still "works" — every
+    /// downstream shape is a multiple of both.
+    pub fn indexer(kind: LayerKind, d: usize, rope_head_dim: usize, norm_eps: f32) -> Option<Self> {
+        // `has_indexer`, not `compressor_ratio().is_some()`: the question here is whether the
+        // layer HAS an indexer, and routing it through the accessor that answers exactly that
+        // means a future change to which ratios carry one lands in a single place.
+        if !kind.has_indexer() {
+            return None;
+        }
+        Self::build(kind, d, rope_head_dim, norm_eps, Quantize::HadamardFp4)
+    }
+
+    /// The shared body of the two constructors. Private, and taking [`Quantize`] as an
+    /// argument, so that the derivation of `cd`/`ents` exists once — two copies of it is two
+    /// places for a `coff` to go stale — while the only public ways in still name their
+    /// algorithm.
+    fn build(
+        kind: LayerKind,
+        d: usize,
+        rope_head_dim: usize,
+        norm_eps: f32,
+        quant: Quantize,
+    ) -> Option<Self> {
         let ratio = kind.compressor_ratio()?;
         let coff = kind.coff();
         Some(Self {
-            ratio: ratio as i32,
-            coff: coff as i32,
-            d: d as i32,
-            cd: (coff * d) as i32,
-            ents: (coff * ratio) as i32,
-            rd: rope_head_dim as i32,
-            eps: norm_eps,
+            abi: GeomAbi {
+                ratio: ratio as i32,
+                coff: coff as i32,
+                d: d as i32,
+                cd: (coff * d) as i32,
+                ents: (coff * ratio) as i32,
+                rd: rope_head_dim as i32,
+                eps: norm_eps,
+            },
+            quant,
         })
+    }
+
+    /// The `repr(C)` half, for the launchers. `pub` because `backend::hip` is a different
+    /// module and Rust has no friend declaration; it hands out a shared reference to an
+    /// all-private-field type, so a caller can pass it across the wall and cannot build or
+    /// mutate one.
+    pub fn abi(&self) -> &GeomAbi {
+        &self.abi
+    }
+
+    /// Which finish this geometry owes. See [`Quantize`].
+    pub fn quantize(self) -> Quantize {
+        self.quant
     }
 
     /// `coff * d` — the width `wkv`/`wgate` project to and `ape`'s row stride.
     pub fn cd(self) -> usize {
-        self.cd as usize
+        self.abi.cd as usize
     }
 
     /// `compress_ratio`. Public because [`crate::backend::hip`]'s safety contracts are
     /// stated in it — `ape` is `ratio * cd`, and a caller outside this module that cannot
     /// read the field cannot check the contract it is being asked to uphold.
     pub fn ratio(self) -> usize {
-        self.ratio as usize
+        self.abi.ratio as usize
     }
 
     /// This compressor's `head_dim` — the width of ONE pooled block. Not [`Geom::cd`],
     /// which is twice this on an overlapping layer.
     pub fn d(self) -> usize {
-        self.d as usize
+        self.abi.d as usize
     }
 
     /// `rope_head_dim`: only the LAST this-many dims of a pooled row are rotated, and the
     /// first `d - rd` are what `act_quant` covers.
     pub fn rd(self) -> usize {
-        self.rd as usize
+        self.abi.rd as usize
     }
 
     /// `coff * ratio` — entries in one pooling window, and the row count of both state
     /// buffers.
     pub fn ents(self) -> usize {
-        self.ents as usize
+        self.abi.ents as usize
     }
 
     /// Elements in `kv_state` / `score_state`: `[coff*ratio, coff*d]`.
@@ -508,6 +611,31 @@ pub struct Finish {
     pub out: *mut f32,
 }
 
+/// The four extents `Indexer.forward`'s scoring contracts over
+/// (`einsum("bshd,btd->bsht")`, model.py:425).
+///
+/// A struct because they are four bare `usize` in a row and every one is plausible in any
+/// other's position — the same argument `Finish` makes about its three pointers, and the one
+/// `tests/common/mod.rs::Mla` makes about six. `heads` and `hd` in particular are 64 and 128
+/// on every layer that has an indexer, so a transposed pair indexes a real row of `q` and
+/// produces a finite score.
+///
+/// What it does NOT buy, stated because the neighbouring types do enforce something: there
+/// are no derived fields here and no relation between them to check, so this is naming and
+/// nothing else. `n_comp` is `end_pos / ratio` and the rest come from the config; a wrong
+/// one is caught by the launcher's bounds or not at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScoreDims {
+    /// Query rows: the prompt length at prefill, 1 at decode.
+    pub s: usize,
+    /// Compressed blocks visible to this call, `(start_pos + seqlen) / ratio`.
+    pub n_comp: usize,
+    /// `args.index_n_heads` (64) — NOT the attention's `n_heads`, which is also 64.
+    pub heads: usize,
+    /// `args.index_head_dim` (128) — NOT `args.head_dim` (512).
+    pub hd: usize,
+}
+
 #[cfg(feature = "rocm")]
 pub use device::{Buffers, compress};
 
@@ -518,10 +646,10 @@ pub use device::{Buffers, compress};
 /// `gpu.rs`.
 #[cfg(feature = "rocm")]
 mod device {
-    use super::{Finish, Geom, LayerKind, should_compress};
+    use super::{Finish, Geom, LayerKind, Quantize, should_compress};
     use crate::backend::hip::{
         launch_v4_act_quant, launch_v4_compress_pool_decode, launch_v4_compress_prefill,
-        launch_v4_compress_state, launch_v4_dense_gemm_bf16,
+        launch_v4_compress_state, launch_v4_dense_gemm_bf16, launch_v4_indexer_spread,
     };
     use anyhow::{Result, ensure};
 
@@ -598,7 +726,7 @@ mod device {
             "compress: {seqlen} rows into scratch sized for {}",
             b.scratch_rows
         );
-        let (ratio, d, rd) = (g.ratio as usize, g.d as usize, g.rd as usize);
+        let (ratio, d, rd) = (g.ratio(), g.d(), g.rd());
         // Reconstructed rather than passed in. `Geom` was BUILT from a `LayerKind` and
         // stores its ratio, so a second `kind` parameter could only ever disagree with it —
         // layer 42's `Geom` beside layer 41's `kind` gives a plausible wrong emission count
@@ -624,7 +752,7 @@ mod device {
                 b.ape,
                 b.kv_state,
                 b.score_state,
-                g,
+                g.abi(),
                 seqlen,
                 slot0,
                 null,
@@ -640,25 +768,46 @@ mod device {
             let nblk = seqlen / ratio;
             // SAFETY: as above; `b.fin.out` is `nblk · d` by its field contract.
             unsafe {
-                launch_v4_compress_prefill(b.kv, b.score, b.ape, &b.fin, g, nblk, null)?;
+                launch_v4_compress_prefill(b.kv, b.score, b.ape, &b.fin, g.abi(), nblk, null)?;
             }
             nblk
         } else {
             // SAFETY: as above; `b.fin.out` is one row of `d` by its field contract.
             unsafe {
-                launch_v4_compress_pool_decode(b.kv_state, b.score_state, &b.fin, g, start_pos, null)?;
+                launch_v4_compress_pool_decode(b.kv_state, b.score_state, &b.fin, g.abi(), start_pos, null)?;
             }
             1
         };
 
         if emitted > 0 {
-            // model.py:378 `act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)` —
-            // dims [0, d-rd) at block **64**, leaving the RoPE tail in bf16 to match QAT.
-            // S2b's kernel, not a second one: `n` separate from `row_stride` is exactly
-            // this partial extent, and a second e4m3 quantizer in this tree would be the
-            // third (see `kernels/v4compress.hip`'s header).
-            // SAFETY: `b.fin.out` is `emitted · d` writable f32 by the field's contract.
-            unsafe { launch_v4_act_quant(b.fin.out, emitted, d, d - rd, 64)? };
+            // `if self.rotate:` (model.py:374). The two arms are a different ALGORITHM over
+            // an identical shape, which is why the choice is a field of `Geom` and not a
+            // parameter here: both arms accept every geometry this function can hold, so
+            // nothing downstream would reject the wrong one.
+            //
+            // Matched exhaustively and with no wildcard. `docs/investigations/v4-flash-port.md`
+            // requirement 5 is that `Geom::indexer` may not exist without this arm, and a
+            // `_ =>` here would let a third `Quantize` silently take the fp8 path.
+            match g.quant {
+                // model.py:378 `act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)`
+                // — dims [0, d-rd) at block **64**, leaving the RoPE tail in bf16 to match
+                // QAT. S2b's kernel, not a second one: `n` separate from `row_stride` is
+                // exactly this partial extent, and a second e4m3 quantizer in this tree
+                // would be the third (see `kernels/v4compress.hip`'s header).
+                // SAFETY: `b.fin.out` is `emitted · d` writable f32 by the field's contract.
+                Quantize::PartialFp8 => unsafe {
+                    launch_v4_act_quant(b.fin.out, emitted, d, d - rd, 64)?
+                },
+                // model.py:374-376 `rotate_activation(kv)` then `fp4_act_quant(kv, 32, True)`
+                // — the WHOLE row, `rd` included. Note what this does NOT do: it takes no
+                // `rd` argument at all, because the indexer's finish has no partial extent.
+                // Passing `d - rd` here would be the same silent-wrong in the other
+                // direction.
+                // SAFETY: as above; the spread reads and writes `emitted · d` in place.
+                Quantize::HadamardFp4 => unsafe {
+                    launch_v4_indexer_spread(b.fin.out, emitted, d, null)?
+                },
+            }
         }
         Ok(emitted)
     }

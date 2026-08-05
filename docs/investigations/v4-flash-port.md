@@ -358,6 +358,69 @@ of the binade *base* — and that inflated figure had already been copied into t
 Counting distinct **bf16 scores** needs no ulp arithmetic at all, and is the quantity the
 selection actually reads.
 
+### The indexer's device half — S2c-indexer, 2026-08-05. WRITTEN, NOT YET RUN.
+
+`kernels/v4indexer.hip` (`v4_indexer_spread`, `v4_indexer_score`), the fp4 activation
+quantizer in `common.hpp` (`f2e2m1`, `fp4_quant_roundtrip`), `Geom::indexer`, and
+`tests/v4_indexer_kernel.rs`. **The GPU was held by the coordinator throughout, so not one
+of these kernels has executed.** Everything below is a compile-and-review result; the
+measured column is empty on purpose.
+
+**Requirement 5 is discharged.** `Geom` split into `GeomAbi` (the `repr(C)` mirror, still
+28 bytes with its layout assert) plus a `Quantize` field, and `compress` matches on it
+exhaustively with no wildcard. `Geom::indexer` refuses every `LayerKind` but `Overlap`,
+since an `Indexer` exists only at ratio 4. The hazard is that
+`Geom::attention(Overlap, index_head_dim, …)` and `Geom::indexer(Overlap, index_head_dim, …)`
+agree on **all six integers the kernel sees** — no dimension guard can separate them, which
+is why the finish is a field and not an argument.
+
+**Three findings from review that no amount of running would have surfaced sooner:**
+
+1. **FMA contraction would have broken the bit-exactness claim.** `dot += q[i]*kv[i]`
+   contracts to `v_fmac_f32` under hipcc's default `-ffp-contract=fast-honor-pragmas` — one
+   rounding per term where the host does two. Every comparison would have failed, and failed
+   *looking like a numerics bug*. `#pragma clang fp contract(off)` added, scoped to the
+   scoring kernel; `mla.hip`, `linalg.hip` and `attn.hip` already do this and mla.hip records
+   an ISA verification. **That verification has not been repeated here** — it needs the ISA
+   dump, which is a build-time step, and is the first thing to do on GO.
+2. **A guard called unreachable was reachable.** The spread launcher's `d % 32` check was
+   commented as unreachable behind the power-of-two check; `d = 16` clears the latter and
+   fires the former. Comment corrected, case added to the test.
+3. `v4i_rbf16` would have been the **third** copy of `bf16f(f2bf16(x))`. Lifted to
+   `common.hpp::rbf16` instead — three copies down to two without touching `mla.hip`.
+   Requirement 11 now covers the **block-quantize loop** as well (`mla.hip::v4_act_quant`,
+   `linalg.hip`, and this file are three spellings of seed-amax → `fast_round_scale` →
+   roundtrip).
+
+**Two things this stage does NOT cover, both named rather than papered over:**
+
+* **The score chain is gated against a host transliteration of `model.py:425-427`, not
+  against `Oracle::indexer`.** The oracle computes that chain internally but exposes neither
+  the roped-and-spread `q` nor the scaled `weights`, so the kernel cannot be handed its
+  intermediates. That makes it a *second* transliteration, and a misreading shared with the
+  oracle is invisible — the same gap `v4compress.rs`'s `jscpd:ignore` region names for
+  `freqs_cis`. **Making `Oracle::linear` public would close it**, and is left to whoever owns
+  that file. The compressed KV the comparison runs on is real (`CompState::cache` after the
+  oracle's own indexer compressor).
+* **A suspected oracle fidelity bug, reported not fixed.** `Oracle::indexer` sums the
+  per-head products as a bf16 RUNNING fold, `acc = bf16(acc + bf16(dot·w))`. PyTorch's
+  `.sum(dim=2)` over a bf16 tensor accumulates through `acc_type` — **f32** — and rounds
+  ONCE. If that is right, the oracle is wrong here and the kernel is wrong with it, and no
+  gate in this repo can see it. This is the second-highest-risk transliteration question in
+  the file whose highest-risk one was settled the same day, and it sits on the chain that
+  decides *which positions are attended*.
+
+**e8m0 (requirement 15): the premise needs correcting before the gap can be closed.** The
+indexer consumes **no e8m0 scale bytes at all** — its weights are fp8 (`wq_b`, which ships a
+`.scale`) and bf16 (`weights_proj`, `wkv`, `wgate`); there is no packed fp4 weight tensor on
+this path, so `dot_f4_wave_r`'s `e8m0f` is never called. Verified against the checkpoint
+index: layer 2 carries exactly seven `attn.indexer.*` tensors and only `wq_b` has a `.scale`.
+What this path *does* exercise is the same exponent domain through `fast_round_scale`, so
+`fp4_block_scale_covers_sixty_binades_not_two` sweeps 60 binades of block scale against the
+2 the suite reaches today. **`e8m0f`'s decode of a scale BYTE — including `0x00` and `0xff` —
+remains uncovered, and nothing on the indexer path can reach it.** Requirement 10 is still
+the only thing that will.
+
 ### Convergence between two reviews is not confirmation — S2b, 2026-08-05
 
 S2b committed with two of three reviews, judging the third's question already answered. It

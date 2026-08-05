@@ -4,7 +4,7 @@
 
 #![cfg(feature = "rocm")]
 
-use crate::v4compress::{Finish, Geom};
+use crate::v4compress::{Finish, GeomAbi, ScoreDims};
 use anyhow::{Result, bail};
 use std::ffi::c_void;
 
@@ -426,7 +426,7 @@ unsafe extern "C" {
         ape: *const f32,
         kv_state: *mut f32,
         score_state: *mut f32,
-        p: *const Geom,
+        p: *const GeomAbi,
         s: i32,
         slot0: i32,
         stream: *mut c_void,
@@ -436,7 +436,7 @@ unsafe extern "C" {
         score: *const f32,
         ape: *const f32,
         f: *const Finish,
-        p: *const Geom,
+        p: *const GeomAbi,
         nblk: i32,
         stream: *mut c_void,
     ) -> i32;
@@ -444,8 +444,20 @@ unsafe extern "C" {
         kv_state: *mut f32,
         score_state: *mut f32,
         f: *const Finish,
-        p: *const Geom,
+        p: *const GeomAbi,
         start_pos: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn rivoli_v4_indexer_spread(x: *mut f32, rows: i32, d: i32, stream: *mut c_void) -> i32;
+    fn rivoli_v4_indexer_score(
+        q: *const f32,
+        kv: *const f32,
+        w: *const f32,
+        score: *mut f32,
+        s: i32,
+        n_comp: i32,
+        heads: i32,
+        hd: i32,
         stream: *mut c_void,
     ) -> i32;
 }
@@ -1686,7 +1698,7 @@ pub unsafe fn launch_v4_compress_state(
     ape: *const f32,
     kv_state: *mut f32,
     score_state: *mut f32,
-    p: &Geom,
+    p: &GeomAbi,
     s: usize,
     slot0: usize,
     stream: *mut c_void,
@@ -1729,7 +1741,7 @@ pub unsafe fn launch_v4_compress_prefill(
     score: *const f32,
     ape: *const f32,
     f: &Finish,
-    p: &Geom,
+    p: &GeomAbi,
     nblk: usize,
     stream: *mut c_void,
 ) -> Result<()> {
@@ -1755,7 +1767,7 @@ pub unsafe fn launch_v4_compress_pool_decode(
     kv_state: *mut f32,
     score_state: *mut f32,
     f: &Finish,
-    p: &Geom,
+    p: &GeomAbi,
     start_pos: usize,
     stream: *mut c_void,
 ) -> Result<()> {
@@ -1766,3 +1778,74 @@ pub unsafe fn launch_v4_compress_pool_decode(
     check(r, "v4_compress_pool_decode")
 }
 // jscpd:ignore-end
+
+/// `rotate_activation` then `fp4_act_quant(·, 32, inplace=True)` over `rows` rows of `d`
+/// floats, in place — `Oracle::indexer_spread` (forward.rs:1130-1138) and the finish
+/// `Compressor.forward` performs when `rotate = true` (model.py:374-376).
+///
+/// Applied to BOTH the indexer's `q` rows and its nested compressor's pooled rows, which is
+/// why it is one launcher rather than a step inside either. [`launch_v4_act_quant`] is the
+/// *other* compressor's finish and takes a partial extent; this one has none — the Hadamard
+/// covers the whole row, RoPE tail included. Handing either the other's extent is finite,
+/// plausible and wrong, so `v4compress::Geom` carries which is due and
+/// `v4compress::compress` matches on it.
+///
+/// `d` must be a power of two no greater than 256 and a multiple of 32; the launcher
+/// refuses otherwise (guards 1002/1003/1004) rather than transforming a length the
+/// reference would have zero-padded, or quantizing a ragged tail against its own amax.
+///
+/// # Safety
+/// `x` is `rows · d` writable, 4-byte-aligned, device-resident f32, read and written in
+/// place, and outlives `stream`'s completion. `stream` is a live `hipStream_t`, or null for
+/// the default stream.
+pub unsafe fn launch_v4_indexer_spread(
+    x: *mut f32,
+    rows: usize,
+    d: usize,
+    stream: *mut c_void,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
+    let r = unsafe { rivoli_v4_indexer_spread(x, rows as i32, d as i32, stream) };
+    check(r, "v4_indexer_spread")
+}
+
+/// `Indexer.forward`'s scoring (model.py:425-427): `einsum("bshd,btd->bsht")`, `relu_()`,
+/// the per-head `weights` multiply, and the sum over heads — into `[s, n_comp]`.
+///
+/// Writes the FULL pre-top-k score matrix, not a selection. That is deliberate and it is
+/// what makes this scoreable: the shipped goldens' selected sets are invariant at
+/// `index_topk = 512` (`docs/investigations/v4-flash-port.md`, "A hole S3 inherits"), so a
+/// set comparison accepts an arbitrarily wrong ranking, while the score matrix cannot hide
+/// one. The causal mask and the top-k are the caller's, exactly as `Oracle::indexer` splits
+/// them.
+///
+/// Bit-exact against the oracle by construction rather than by tolerance — the kernel's
+/// note says why the reduction is not parallelised — and it carries the oracle's own open
+/// question about whether `torch.sum` over bf16 rounds per term or once.
+///
+/// # Safety
+/// `q` is `s · heads · hd` f32; `kv` is `n_comp · hd` f32; `w` is `s · heads` f32; `score`
+/// is `s · n_comp` writable f32. **None may alias another** — every kernel parameter is
+/// `__restrict__`, so that covers the three inputs against each other and not only `score`
+/// against them. All 4-byte aligned, device-resident, and outliving `stream`'s completion;
+/// `stream` is a live `hipStream_t`, or null for the default stream.
+pub unsafe fn launch_v4_indexer_score(
+    q: *const f32,
+    kv: *const f32,
+    w: *const f32,
+    score: *mut f32,
+    dims: ScoreDims,
+    stream: *mut c_void,
+) -> Result<()> {
+    // `dims`, not `d`: `d` means a head width everywhere else in this file, including in
+    // `launch_v4_indexer_spread` directly above.
+    //
+    // Narrowed once, all four together, so the `as i32` soup is not interleaved with the
+    // pointers at the call. `ScoreDims` is what keeps the four in the right order.
+    let ScoreDims { s, n_comp, heads, hd } = dims;
+    let (s, n_comp) = (s as i32, n_comp as i32);
+    let (heads, hd) = (heads as i32, hd as i32);
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
+    let r = unsafe { rivoli_v4_indexer_score(q, kv, w, score, s, n_comp, heads, hd, stream) };
+    check(r, "v4_indexer_score")
+}
