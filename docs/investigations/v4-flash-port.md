@@ -271,6 +271,40 @@ from the YaRN one — mixing them is `Defect::RopeNoYarn`, fluent and wrong. And
 sizing is unchecked: a scratch allocated for decode and handed a `Prefill` overruns every
 buffer.
 
+### The compressor gate cannot resolve `act_quant`'s arguments — DECIDED 2026-08-05
+
+S2c2's compressor kernel is verified: three of four cells **bit-identical** to the oracle,
+the fourth off by a single e4m3 boundary flip on **5 of 32768 elements (0.0153%)** — with
+`rope_tail = 1` proving the arithmetic upstream of quantization is exact, `quant_dims = 16`
+being exactly one e4m3 step, and `want=3.5 got=3.25` being adjacent codes in the `[2,4)`
+binade. Four independent predictions, none tuned. The original "16 ULP" was a **unit error
+in the harness**, not a kernel defect.
+
+What remains red is the defect sweep, and it is a **coverage** result:
+
+| defect | separation |
+|---|---|
+| `CompressorNoOverlap` / `RopeHalfSplit` / `CompressorRopeAtBlockEnd` / `RopeAllDims` | 31,324 – 32,848 |
+| `SkipKvActQuant` | **8** |
+| `KvActQuantNoRoundScale` | **22** |
+| `KvActQuantBlock128` | **INERT — covers it not at all** |
+
+Every *compressor* defect separates enormously; only the three `act_quant` **argument**
+defects sit at or below the quantizer's own step, because they perturb it by less than one
+of its steps.
+
+**DECISION: record this as named non-coverage. Do NOT lower `RESOLVABLE`.** Lowering it to
+admit `sep=8` is the budget-not-measurement move S2c2 spent this round undoing, and it would
+buy nothing real: `KvActQuantBlock128` is inert *for a reason already in this document* —
+ue8m0 scales are powers of two and e4m3 is exactly scale-invariant under them, so **no gate
+scored against this oracle can see that defect**, at any threshold. It is S1b's documented
+blind spot reappearing one layer out, not a new gap.
+
+`act_quant` is S2b's kernel and is verified there: its 8/8 run includes the subnormal-tie
+fixture engineered to separate RNE from half-away-from-zero, which is the property that
+actually matters. So the honest statement is that **this gate verifies the compressor and
+delegates `act_quant` to S2b's** — not that `act_quant` is unverified.
+
 ### Convergence between two reviews is not confirmation — S2b, 2026-08-05
 
 S2b committed with two of three reviews, judging the third's question already answered. It
