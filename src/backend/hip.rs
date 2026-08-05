@@ -93,6 +93,12 @@ pub struct ExpertDescF4 {
 unsafe extern "C" {
     fn rivoli_device_sync() -> i32;
     fn rivoli_memcpy_dtod(dst: *mut u8, src: *const u8, bytes: usize) -> i32;
+    fn rivoli_memcpy_dtod_async(
+        dst: *mut u8,
+        src: *const u8,
+        bytes: usize,
+        stream: *mut c_void,
+    ) -> i32;
     fn rivoli_fill_u32(dst: *mut u8, pat: u32, bytes: usize) -> i32;
 
     #[allow(clippy::too_many_arguments)]
@@ -329,6 +335,14 @@ unsafe extern "C" {
         y: *mut f32,
     ) -> i32;
     fn rivoli_swiglu(g: *const f32, u: *const f32, n: i32, h: *mut f32) -> i32;
+    fn rivoli_v4_swiglu_clamped(
+        g: *const f32,
+        u: *const f32,
+        n: i32,
+        limit: f32,
+        h: *mut f32,
+        stream: *mut c_void,
+    ) -> i32;
     fn rivoli_rmsnorm(x: *const f32, w: *const f32, n: i32, eps: f32, y: *mut f32) -> i32;
     fn rivoli_rope(base: *mut f32, count: i32, stride: i32, seg: i32, pos: i32, theta: f64) -> i32;
     fn rivoli_vq_encode(
@@ -374,9 +388,24 @@ unsafe extern "C" {
         hd: i32,
         e: *mut f32,
     ) -> i32;
-    fn rivoli_v4_act_quant(x: *mut f32, rows: i32, row_stride: i32, n: i32, block: i32) -> i32;
-    fn rivoli_v4_rmsnorm(x: *mut f32, w: *const f32, rows: i32, d: i32, eps: f32) -> i32;
-    fn rivoli_v4_qk_norm(q: *mut f32, rows: i32, d: i32, eps: f32) -> i32;
+    fn rivoli_v4_act_quant(
+        x: *mut f32,
+        rows: i32,
+        row_stride: i32,
+        n: i32,
+        block: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn rivoli_v4_rmsnorm(
+        x: *mut f32,
+        w: *const f32,
+        rows: i32,
+        d: i32,
+        eps: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn rivoli_v4_qk_norm(q: *mut f32, rows: i32, d: i32, eps: f32, stream: *mut c_void) -> i32;
+    #[allow(clippy::too_many_arguments)]
     fn rivoli_v4_rope(
         x: *mut f32,
         tbl: *const f32,
@@ -386,7 +415,9 @@ unsafe extern "C" {
         pos0: i32,
         rows_per_pos: i32,
         inverse: i32,
+        stream: *mut c_void,
     ) -> i32;
+    #[allow(clippy::too_many_arguments)]
     fn rivoli_v4_gemv_fp8(
         x: *const f32,
         w: *const u8,
@@ -397,7 +428,9 @@ unsafe extern "C" {
         block: i32,
         groups: i32,
         out: *mut f32,
+        stream: *mut c_void,
     ) -> i32;
+    #[allow(clippy::too_many_arguments)]
     fn rivoli_v4_sparse_attn(
         q: *const f32,
         kv: *const f32,
@@ -409,6 +442,7 @@ unsafe extern "C" {
         topk: i32,
         scale: f32,
         o: *mut f32,
+        stream: *mut c_void,
     ) -> i32;
 
     fn rivoli_v4_dense_gemm_bf16(
@@ -513,6 +547,40 @@ pub unsafe fn memcpy_dtod(dst: *mut u8, src: *const u8, bytes: usize) -> Result<
     check(
         unsafe { rivoli_memcpy_dtod(dst, src, bytes) },
         "memcpy_dtod",
+    )
+}
+
+/// STREAM-ORDERED device-to-device copy — for a pipeline whose kernels are on a stream.
+///
+/// A second entry point rather than a `stream` argument on [`memcpy_dtod`], because the two
+/// are not one operation with a knob: that one **blocks the host**, and the arena relocation
+/// it serves needs exactly that. `memory/routed.rs` compacts a slot while later reads may
+/// still resolve to the old address, and this repo carries a measured defect from a read
+/// outliving its layer and having its slot copied out from under it — 9 of 8452 reads at
+/// `--max-mem 30`, non-deterministic output, and pins do not stop compaction. Replacing that
+/// host barrier with a per-stream one would reopen it.
+///
+/// Added 2026-08-05 for `attn::v4::attention`, which interleaves six device-to-device copies
+/// with sixteen launches. Those launches now take a stream, and a blocking `hipMemcpy`
+/// between two of them does NOT wait on it: rivoli's streams are `hipStreamNonBlocking`, so
+/// the null stream has no implicit ordering against them, and the copy would read `s.qr`
+/// before `v4_rmsnorm` wrote it. See the banner above the V4 attention launchers.
+///
+/// # Safety
+/// `dst` and `src` must be valid, `bytes`-sized, NON-OVERLAPPING device regions, and must
+/// outlive `stream`'s completion — this returns as soon as the copy is *enqueued*, which is
+/// the whole difference from [`memcpy_dtod`] and the whole hazard. `stream` is a live
+/// `hipStream_t`, or null for the default stream.
+pub unsafe fn memcpy_dtod_async(
+    dst: *mut u8,
+    src: *const u8,
+    bytes: usize,
+    stream: *mut c_void,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
+    check(
+        unsafe { rivoli_memcpy_dtod_async(dst, src, bytes, stream) },
+        "memcpy_dtod_async",
     )
 }
 
@@ -1292,6 +1360,59 @@ pub unsafe fn launch_swiglu(g: *const f32, u: *const f32, n: usize, h: *mut f32)
     check(r, "swiglu")
 }
 
+/// DeepSeek-V4's `Expert.forward` combine, for the resident fp8 **shared** expert:
+/// `h = bf16( silu(min(bf16(g), limit)) · clamp(bf16(u), ±limit) )`. Safe in place.
+///
+/// `MoE.__init__` hands `swiglu_limit` to `shared_experts` as well as to the routed ones
+/// (model.py:632) and `Expert.forward` clamps both, so the shared expert needs the same
+/// clamped arithmetic `launch_moe_expert_range_f4` already runs on the fp4 routed experts.
+/// **NOT YET WIRED, as of 2026-08-05, and this launcher existing does not fix anything by
+/// itself.** The only caller of the unclamped [`launch_swiglu`] is GLM's dense MLP in
+/// `gpu.rs`; V4's MoE layer loop, which is what would call this, does not exist yet. So the
+/// state of the tree is: the clamped combine is available and gated
+/// (`tests/v4_kernel.rs` §7), and the first thing to wire the shared expert must call THIS
+/// and not [`launch_swiglu`] — because reaching for that one gives
+/// `v4oracle::Defect::SwigluUnclamped` on one contribution in seven of all 43 layers,
+/// fluent and wrong.
+///
+/// # Why this is not [`launch_swiglu`] with a `limit`
+///
+/// **At no value of `limit` would the two agree**, so a parameter could not have expressed
+/// it. [`launch_swiglu`] is `(g/(1+e^-g))·u` and rounds nothing. Three differences besides
+/// the clamp, each of them a defect the oracle names:
+///
+/// - both operands are bf16-rounded **before** the clamp (`Linear` stores bf16 and
+///   `Expert.forward` reads it back with `.float()`) — `Defect::NoBf16Rounding`;
+/// - the product is bf16-rounded, the reference's `x.to(dtype)` in front of `w2`;
+/// - `F.silu`'s multiply form `g·sigmoid(g)`, not the division form, which `moe.hip` records
+///   as one rounding apart — enough to flip a whole bf16 ulp at a boundary.
+///
+/// GLM has no `swiglu_limit` and should never acquire one, so passing an "unclamped"
+/// sentinel from its four call sites would put a value in the tree that no config can
+/// produce. This refuses `limit <= 0` **and NaN** (guard 1006, the same code `moe.hip`
+/// returns for the same check on the same argument), so unclamped is not spellable here.
+///
+/// The clamp itself is one `kernels/common.hpp::swiglu_clamped`, shared with
+/// `moe_gateup_f4_impl`: the routed and shared paths must agree bit for bit, and `kernels/`
+/// is not scanned by `build.rs`'s jscpd gate, so a second copy would have drifted unseen.
+///
+/// # Safety
+/// `g`, `u` and `h` are each `n` f32 and must outlive `stream`'s completion. `h` may alias
+/// `g` or `u` — every thread reads both, then writes once, and that write depends on both
+/// reads. `stream` is a live `hipStream_t`, or null for the default stream.
+pub unsafe fn launch_v4_swiglu_clamped(
+    g: *const f32,
+    u: *const f32,
+    n: usize,
+    limit: f32,
+    h: *mut f32,
+    stream: *mut c_void,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
+    let r = unsafe { rivoli_v4_swiglu_clamped(g, u, n as i32, limit, h, stream) };
+    check(r, "v4_swiglu_clamped")
+}
+
 /// RMSNorm `y = x·rsqrt(mean(x²)+eps)·w`.
 ///
 /// # Safety
@@ -1486,6 +1607,23 @@ pub unsafe fn launch_index_head_route(
 
 // ── DeepSeek-V4-Flash attention (S2b) ───────────────────────────────────────────────
 //
+// **All six take a `stream`, and none did before 2026-08-05.** They are the whole of
+// `attn::v4::attention`, and a stream was declined here once on the grounds that "there is
+// nothing to overlap with". That premise died when the `.f4` routed streaming pool landed
+// and was measured at 1.082 ms/miss, 12.36 GB/s, `slot_stalls` 0 over the real 137.06 GiB
+// expert set — the layer's routed fetch is now real work to hide compute behind.
+//
+// The set converts together or not at all, and that is correctness, not neatness. rivoli's
+// streams are `hipStreamNonBlocking` (`async.hip`), so the null stream carries NO implicit
+// ordering against them: one stream-capable launcher beside a null-stream neighbour over the
+// same buffer is an unordered read, which is silently wrong, where leaving the whole block
+// on the null stream is merely slow. A half-converted set is worse than either end.
+//
+// The seventh member of the set is not a launcher: [`memcpy_dtod`] is a BLOCKING
+// `hipMemcpy` and `attn::v4::attention` interleaves six of them with these launches, so it
+// needed [`memcpy_dtod_async`]. Counting six LAUNCHERS and paying six would have reproduced
+// the very race the earlier decline predicted. `docs/investigations/v4-flash-port.md` requirement 9.
+//
 // HIP-ONLY, deliberately, and this is the one thing about them that is not obvious.
 // `tests/kernel_coverage.rs::every_launcher_has_an_oracle` is keyed on `backend/vk.rs`,
 // so a launcher that exists only here is invisible to it — there is no automatic gate
@@ -1501,18 +1639,20 @@ pub unsafe fn launch_index_head_route(
 /// its activation before the GEMM.
 ///
 /// # Safety
-/// `x` is a device buffer of at least `rows * row_stride` f32, live until the next
-/// [`device_sync`].
+/// `x` is a device buffer of at least `rows * row_stride` f32, and must outlive `stream`'s
+/// completion. `stream` is a live `hipStream_t`, or null for the default stream.
 pub unsafe fn launch_v4_act_quant(
     x: *mut f32,
     rows: usize,
     row_stride: usize,
     n: usize,
     block: usize,
+    stream: *mut c_void,
 ) -> Result<()> {
-    // SAFETY: caller's pointer contract.
-    let r =
-        unsafe { rivoli_v4_act_quant(x, rows as i32, row_stride as i32, n as i32, block as i32) };
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
+    let r = unsafe {
+        rivoli_v4_act_quant(x, rows as i32, row_stride as i32, n as i32, block as i32, stream)
+    };
     check(r, "v4_act_quant")
 }
 
@@ -1520,17 +1660,18 @@ pub unsafe fn launch_v4_act_quant(
 /// weight, bf16-rounded store.
 ///
 /// # Safety
-/// Device pointers live until the next [`device_sync`]: `x` (`rows * d` f32), `w` (`d`
-/// f32).
+/// Device pointers must outlive `stream`'s completion: `x` (`rows * d` f32), `w` (`d` f32).
+/// `stream` is a live `hipStream_t`, or null for the default stream.
 pub unsafe fn launch_v4_rmsnorm(
     x: *mut f32,
     w: *const f32,
     rows: usize,
     d: usize,
     eps: f32,
+    stream: *mut c_void,
 ) -> Result<()> {
-    // SAFETY: caller's pointer contract.
-    let r = unsafe { rivoli_v4_rmsnorm(x, w, rows as i32, d as i32, eps) };
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
+    let r = unsafe { rivoli_v4_rmsnorm(x, w, rows as i32, d as i32, eps, stream) };
     check(r, "v4_rmsnorm")
 }
 
@@ -1539,11 +1680,17 @@ pub unsafe fn launch_v4_rmsnorm(
 /// oracle provably cannot see the order, so it comes from the reference.
 ///
 /// # Safety
-/// `q` is a device buffer of at least `rows * d` f32, live until the next
-/// [`device_sync`].
-pub unsafe fn launch_v4_qk_norm(q: *mut f32, rows: usize, d: usize, eps: f32) -> Result<()> {
-    // SAFETY: caller's pointer contract.
-    let r = unsafe { rivoli_v4_qk_norm(q, rows as i32, d as i32, eps) };
+/// `q` is a device buffer of at least `rows * d` f32, and must outlive `stream`'s
+/// completion. `stream` is a live `hipStream_t`, or null for the default stream.
+pub unsafe fn launch_v4_qk_norm(
+    q: *mut f32,
+    rows: usize,
+    d: usize,
+    eps: f32,
+    stream: *mut c_void,
+) -> Result<()> {
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
+    let r = unsafe { rivoli_v4_qk_norm(q, rows as i32, d as i32, eps, stream) };
     check(r, "v4_qk_norm")
 }
 
@@ -1552,8 +1699,9 @@ pub unsafe fn launch_v4_qk_norm(q: *mut f32, rows: usize, d: usize, eps: f32) ->
 /// `pos0 + r / rows_per_pos`. `inverse` conjugates it — the output de-rotation.
 ///
 /// # Safety
-/// Device pointers live until the next [`device_sync`]: `x` (`rows * row_len` f32),
-/// `tbl` (at least `(pos0 + rows / rows_per_pos) * rd` f32, interleaved cos/sin).
+/// Device pointers must outlive `stream`'s completion: `x` (`rows * row_len` f32), `tbl`
+/// (at least `(pos0 + rows / rows_per_pos) * rd` f32, interleaved cos/sin). `stream` is a
+/// live `hipStream_t`, or null for the default stream.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn launch_v4_rope(
     x: *mut f32,
@@ -1564,8 +1712,9 @@ pub unsafe fn launch_v4_rope(
     pos0: usize,
     rows_per_pos: usize,
     inverse: bool,
+    stream: *mut c_void,
 ) -> Result<()> {
-    // SAFETY: caller's pointer contract.
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
     let r = unsafe {
         rivoli_v4_rope(
             x,
@@ -1576,6 +1725,7 @@ pub unsafe fn launch_v4_rope(
             pos0 as i32,
             rows_per_pos as i32,
             i32::from(inverse),
+            stream,
         )
     };
     check(r, "v4_rope")
@@ -1592,11 +1742,12 @@ pub unsafe fn launch_v4_rope(
 /// the reference performs one, and `wo_a` gets none at all.
 ///
 /// # Safety
-/// Device pointers live until the next [`device_sync`]: `x` (`m * groups * k` f32), `w`
+/// Device pointers must outlive `stream`'s completion: `x` (`m * groups * k` f32), `w`
 /// (`n_out * k` bytes), `wscale` (`ceil(n_out/block) * ceil(k/block)` f32), `out`
 /// (`m * n_out` f32). The `x` bound is exact and follows from the arguments; an earlier
 /// signature took the row and group strides separately, where the in-bounds relation was
-/// a three-way inequality nothing checked.
+/// a three-way inequality nothing checked. `stream` is a live `hipStream_t`, or null for
+/// the default stream.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn launch_v4_gemv_fp8(
     x: *const f32,
@@ -1608,8 +1759,9 @@ pub unsafe fn launch_v4_gemv_fp8(
     block: usize,
     groups: usize,
     out: *mut f32,
+    stream: *mut c_void,
 ) -> Result<()> {
-    // SAFETY: caller's pointer contract.
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
     let r = unsafe {
         rivoli_v4_gemv_fp8(
             x,
@@ -1621,6 +1773,7 @@ pub unsafe fn launch_v4_gemv_fp8(
             block as i32,
             groups as i32,
             out,
+            stream,
         )
     };
     check(r, "v4_gemv_fp8")
@@ -1631,9 +1784,10 @@ pub unsafe fn launch_v4_gemv_fp8(
 /// softmax DENOMINATOR only.
 ///
 /// # Safety
-/// Device pointers live until the next [`device_sync`]: `q` (`m * h * d` f32), `kv`
-/// (`d` f32 per row, indexed by `idxs`, so at least `max(idxs) + 1` rows), `sink` (`h`
-/// f32), `idxs` (`m * topk` i32), `o` (`m * h * d` f32).
+/// Device pointers must outlive `stream`'s completion: `q` (`m * h * d` f32), `kv` (`d` f32
+/// per row, indexed by `idxs`, so at least `max(idxs) + 1` rows), `sink` (`h` f32), `idxs`
+/// (`m * topk` i32), `o` (`m * h * d` f32). `stream` is a live `hipStream_t`, or null for
+/// the default stream.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn launch_v4_sparse_attn(
     q: *const f32,
@@ -1646,8 +1800,9 @@ pub unsafe fn launch_v4_sparse_attn(
     topk: usize,
     scale: f32,
     o: *mut f32,
+    stream: *mut c_void,
 ) -> Result<()> {
-    // SAFETY: caller's pointer contract.
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
     let r = unsafe {
         rivoli_v4_sparse_attn(
             q,
@@ -1660,6 +1815,7 @@ pub unsafe fn launch_v4_sparse_attn(
             topk as i32,
             scale,
             o,
+            stream,
         )
     };
     check(r, "v4_sparse_attn")

@@ -170,7 +170,7 @@ impl Fixture {
         // statistic over every token -- `Defect::HeadNormOverAllTokens`, invisible at s == 1.
         // SAFETY: `yb` is `s * dim` live f32, `nb` is `dim`; both outlive the sync.
         unsafe {
-            launch_v4_rmsnorm(yb.pm(), nb.p(), self.s, dim, self.cfg.norm_eps)
+            launch_v4_rmsnorm(yb.pm(), nb.p(), self.s, dim, self.cfg.norm_eps, stream.raw())
                 .expect("v4_rmsnorm");
         }
         let norm_out = yb.read();

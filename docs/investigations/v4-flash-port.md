@@ -771,6 +771,23 @@ the wiring, not suggestions:
    `hc_post`'s `y` must not alias `residual`. `Buffers` enforces only `scratch_rows`.
 9. **`act_quant` runs on the null stream** — S2b's launcher takes no stream argument. Must
    be fixed before an overlapped layer loop, or the streaming design is defeated silently.
+   — *PAID 2026-08-05, and it was SEVEN operations, not one, and not six. This requirement
+   named one launcher; §"The prerequisite inventory was taken again" item 5 corrected it to
+   six and declined it on the grounds that the `.f4` pool did not exist to overlap with.
+   Both numbers were wrong in the same direction. The pool landed (1.082 ms/miss, 12.36
+   GB/s, `slot_stalls` 0 over the real 137.06 GiB set), which killed the premise; and
+   `attn::v4::attention` also makes six `memcpy_dtod` calls, which are not launchers —
+   `linalg.hip::rivoli_memcpy_dtod` is a BLOCKING `hipMemcpy`, so host-blocking hid the
+   hazard while the whole block sat on stream 0 and it becomes a read racing a
+   stream-ordered write the moment the launchers move. Paying the six alone would have
+   introduced exactly the race the decline predicted. All six launchers plus a new
+   `memcpy_dtod_async` now take a trailing `stream`, as do `attn::v4::attention` and
+   `v4compress::compress`. `tests/v4_attn.rs::the_attention_block_is_entirely_on_its_stream`
+   gates it by parking the stream on a `Timeline` wait and asserting all nine destinations
+   still hold distinct poison. TWO null-stream holes remain on the V4 path and are
+   recorded rather than closed: `launch_gemv_f32` (the router logits — GLM's launcher, both
+   backends, callers in `gpu.rs`), and `launch_argmax`/sampling, which sits after the head
+   behind the end-of-forward sync and is accepted as-is.*
 10. `tid2eid` entries and e8m0 `0x00`/`0xff` scale bytes must be rejected **at load**; the
     kernels cannot.
 
@@ -1150,6 +1167,31 @@ shared expert is fp8 and takes `launch_gemv_fp8` + `launch_swiglu`, and `launch_
 one of the 43 layers would run unclamped: `v4oracle::Defect::SwigluUnclamped`, one contribution
 in seven, fluent and wrong. The fix is a clamped fp8 combine — the three lines already sitting
 in `moe_gateup_f4_impl`, which `kernels/common.hpp` is the place for. Not written here.
+
+> **WRITTEN 2026-08-05, and NOT YET WIRED — the distinction matters.** `kernels/common.hpp::
+> swiglu_clamped` is now the single definition of the clamp, called by both
+> `moe_gateup_f4_impl` and a new `kernels/linalg.hip::v4_swiglu_clamped`, reached through
+> `launch_v4_swiglu_clamped(g, u, n, limit, h, stream)`. Gated by `tests/v4_kernel.rs` §7
+> against `Oracle::expert`, bidirectionally and with the fixture's reachability measured from
+> `swiglu_clamp_events` rather than assumed.
+>
+> Three corrections to the entry above. It is **four** statements, not three — the bf16
+> round-trip of both operands is part of the clamp's meaning, because `Expert.forward` clamps
+> what `Linear` stored as bf16 and read back with `.float()`. `hip.rs:1289` is a stale line
+> reference. And the fix could **not** have been a `limit` parameter on GLM's `launch_swiglu`:
+> at NO value of `limit` do the two agree, because V4 bf16-rounds both operands before the
+> clamp, bf16-rounds the product (`x.to(dtype)` before `w2`), and uses `F.silu`'s multiply
+> form `g·sigmoid(g)` against GLM's `g/(1+e^-g)` — three differences besides the clamp, each
+> a defect the oracle names. So it is a different function, not a parameterisation, and it
+> lives directly beside `swiglu` in `linalg.hip` so the difference reads side by side.
+>
+> **The defect is still live.** V4's MoE layer loop does not exist, so nothing calls this yet;
+> the first thing to wire the shared expert must reach for `launch_v4_swiglu_clamped` and not
+> `launch_swiglu`. The launcher refuses `limit <= 0` **and NaN** (guard 1006, the same code
+> `moe.hip` returns for the same check) — written `!(limit > 0.0f)` rather than `limit <= 0.0f`
+> because every comparison against NaN is false, so `limit <= 0` ADMITS NaN, and `fminf(gt,
+> NaN)` returns `gt`: a NaN limit degrades silently to precisely the unclamped form the guard
+> exists to forbid.
 
 **3. There is no routed streaming pool for `.f4`, and the full artifact does not fit without
 one.** — *RESOLVED 2026-08-05; see §"The `.f4` pool landed" below, which also corrects the

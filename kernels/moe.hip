@@ -306,30 +306,29 @@ __device__ __forceinline__ void moe_gateup_f4_impl(
     if (lane == 0) {
 #pragma unroll
         for (int t = 0; t < R; ++t) {
-            // bf16 FIRST, then clamp: `Linear` stores bf16 and `Expert.forward` clamps what
-            // it read back. Clamping the f32 dot and rounding afterwards would put a
-            // different value on the boundary — and the boundary is the only place a
-            // clamped SwiGLU differs from an unclamped one at all.
-            float gt = rbf16(g[t]), ut = rbf16(u[t]);
-            ut = fminf(fmaxf(ut, -limit), limit);
-            gt = fminf(gt, limit);  // ASYMMETRIC: no lower clamp on the gate
-            // `x · sigmoid(x)`, NOT this file's `siluf` (`x / (1 + e^-x)`). The two differ
-            // by one rounding, and `F.silu` is the multiply form. It would normally vanish
-            // under the bf16 store below — except exactly at a rounding boundary, where it
-            // flips a whole bf16 ulp. Matching the reference's association removes a
-            // systematic term from every comparison this port makes; keeping `siluf` here
-            // would put a known difference into results whose whole job is to expose
-            // unknown ones.
-            float sg = gt * (1.0f / (1.0f + expf(-gt)));
+            // `common.hpp::swiglu_clamped` — bf16 both operands, clamp `up` both sides and
+            // `gate` only from above, `x·sigmoid(x)`, return the product UNROUNDED. It was
+            // these four statements inline here until 2026-08-05, hoisted when the fp8 SHARED
+            // expert needed the identical arithmetic (`launch_v4_swiglu_clamped`): the two
+            // must agree bit for bit, `kernels/` is not watched by jscpd, and a second copy
+            // would drift silently. The hoist was MEASURED bit-neutral, not assumed —
+            // `tests/v4_kernel.rs::the_fp4_dispatch_hash_pins_the_clamp_hoist` carries the
+            // hash and the argument.
+            float sw = swiglu_clamped(g[t], u[t], limit);
             // ENFORCED, not inherited. `0 · finite` is exactly zero, but the gate has no
-            // LOWER clamp, so a `w1` dot at -inf gives `sg = -inf · 0 = NaN`, and `NaN · 0`
-            // is NaN, not 0. `moe_fixed` then turns that NaN into a FINITE extreme
+            // LOWER clamp, so a `w1` dot at -inf gives `silu = -inf · 0 = NaN`, and
+            // `NaN · 0` is NaN, not 0. `moe_fixed` then turns that NaN into a FINITE extreme
             // (`fminf`/`fmaxf` return the non-NaN operand) — silent corruption of a row that
             // never asked for this expert. The int4 twin below carries the same guard on the
             // same argument; folding the routing weight into pass 1 only moves the hazard a
             // stage earlier, it does not remove it.
             float w = wexpert[(size_t)e * R + t];
-            h_out[((size_t)e * R + t) * inter + j] = w == 0.0f ? 0.0f : rbf16(sg * ut * w);
+            // `sw * w`, and `swiglu_clamped` already associated as `(silu · up)`, so this is
+            // the `((silu · up) · w)` the inline form computed. The bf16 store is HERE and
+            // not in the helper because the reference rounds after the routing weight
+            // (`weights * x` then `x.to(dtype)`), which the shared expert — having no
+            // routing weight — does not do.
+            h_out[((size_t)e * R + t) * inter + j] = w == 0.0f ? 0.0f : rbf16(sw * w);
         }
     }
 }

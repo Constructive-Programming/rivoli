@@ -336,9 +336,10 @@ pub mod v4 {
     use crate::artifact::model::V4Config;
     use crate::backend::hip::{
         launch_v4_act_quant, launch_v4_gemv_fp8, launch_v4_qk_norm, launch_v4_rmsnorm,
-        launch_v4_rope, launch_v4_sparse_attn, memcpy_dtod,
+        launch_v4_rope, launch_v4_sparse_attn, memcpy_dtod_async,
     };
     use anyhow::{Result, bail, ensure};
+    use std::ffi::c_void;
 
     /// The block size V4's attention weights are quantized on — `weight_block_size:
     /// [128, 128]` in the checkpoint's `quantization_config`, and also `kernel.py`'s
@@ -633,18 +634,46 @@ pub mod v4 {
 
     /// Run one V4 attention block.
     ///
+    /// # Everything runs on ONE stream, and that is a correctness requirement
+    ///
+    /// The twenty-two device call sites below — sixteen launches across six launcher
+    /// functions, and six device-to-device copies, of which three or four run on any one call
+    /// because the KV write branches by phase — all take `stream`, and none of them did before
+    /// 2026-08-05. (Counted, 2026-08-05, after review found an earlier draft of this sentence
+    /// saying "thirteen … six launchers and five copies", which does not even sum. The wrong
+    /// "thirteen" was the port doc's count of how many of the V4 path's NINETEEN launchers
+    /// already took a stream, borrowed into a sentence about one function body.) Two facts
+    /// make the set
+    /// indivisible. rivoli's streams are created `hipStreamNonBlocking` (`async.hip`), so the
+    /// null stream carries no implicit ordering against them; and the block is a straight-line
+    /// data dependency, every step reading what the one before it wrote. So a single operation
+    /// left on the null stream reads a buffer whose producer has not been waited on — an
+    /// unordered activation, which is fluent wrong text, where the fully-null version this
+    /// replaces was merely slow.
+    ///
+    /// The copies are the part that is easy to miss and were missed once: the port doc's
+    /// requirement 9 counted **six** null-stream launchers "i.e. the whole of
+    /// `attn::v4::attention`", and the six `memcpy_dtod` calls are in this function and are
+    /// not launchers. `memcpy_dtod` is a BLOCKING `hipMemcpy`, so host-blocking hid the
+    /// hazard while everything was on stream 0; the moment the launchers moved, it became a
+    /// read racing a stream-ordered write. Hence [`memcpy_dtod_async`], and hence the count
+    /// is seven, not six.
+    ///
+    /// `stream` may be null — that is the default stream and reproduces the old behaviour
+    /// exactly, which is what lets a caller adopt this before it owns a stream.
+    ///
     /// # Safety
     /// Every pointer in `w`, `s` and `io` must be a live device allocation of at least
     /// the size documented on its field — `s`'s buffers for `s.rows` rows, which this
-    /// checks against the `m` the step implies — and must stay live until the next
-    /// [`crate::backend::hip::device_sync`]. `io.freqs` must cover position
-    /// `start_pos + m - 1`.
+    /// checks against the `m` the step implies — and must stay live until `stream`
+    /// completes. `io.freqs` must cover position `start_pos + m - 1`. `stream` is a live
+    /// `hipStream_t`, or null for the default stream.
     ///
     /// Four further obligations, none of which a plausible caller satisfies by
     /// accident:
     ///
-    /// - **Everything must be pairwise NON-OVERLAPPING.** `memcpy_dtod`'s own contract
-    ///   forbids overlap, and every GEMV needs its input and output disjoint. The
+    /// - **Everything must be pairwise NON-OVERLAPPING.** [`memcpy_dtod_async`]'s own
+    ///   contract forbids overlap, and every GEMV needs its input and output disjoint. The
     ///   [`Scratch`] docs explain why `qr`/`qrq` are separate buffers, which reads as
     ///   though that were the only separation this needs; it is not.
     /// - **`io.idxs` must name rows that exist in what the step attends.** The kernel
@@ -667,6 +696,7 @@ pub mod v4 {
     ///   the check below would then pass while `io.out` — the buffer the next layer reads
     ///   — still overran. Sized off the same allocation as [`Scratch`]'s and they cannot
     ///   disagree.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn attention(
         d: &Dims,
         sel: super::Sel,
@@ -674,6 +704,7 @@ pub mod v4 {
         s: &Scratch,
         io: &Io,
         step: Step,
+        stream: *mut c_void,
     ) -> Result<()> {
         d.validate()?;
         let (m, pos0) = match step {
@@ -717,14 +748,20 @@ pub mod v4 {
         // row at the same block size, so the two produce identical bytes.
         // SAFETY: caller's contract; `xq` is `[m, dim]` and `x` is not modified.
         unsafe {
-            memcpy_dtod(s.xq.cast(), io.x.cast(), m * d.dim * size_of::<f32>())?;
-            launch_v4_act_quant(s.xq, m, d.dim, d.dim, FP8_BLOCK)?;
+            memcpy_dtod_async(s.xq.cast(), io.x.cast(), m * d.dim * size_of::<f32>(), stream)?;
+            launch_v4_act_quant(s.xq, m, d.dim, d.dim, FP8_BLOCK, stream)?;
             let (q_lora, dim) = (d.q_lora_rank, d.dim);
-            launch_v4_gemv_fp8(s.xq, w.wq_a.w, w.wq_a.scale, m, q_lora, dim, FP8_BLOCK, 1, s.qr)?;
-            launch_v4_rmsnorm(s.qr, w.q_norm, m, q_lora, d.norm_eps)?;
-            memcpy_dtod(s.qrq.cast(), s.qr.cast(), m * q_lora * size_of::<f32>())?;
-            launch_v4_act_quant(s.qrq, m, q_lora, q_lora, FP8_BLOCK)?;
-            launch_v4_gemv_fp8(s.qrq, w.wq_b.w, w.wq_b.scale, m, nhd, q_lora, FP8_BLOCK, 1, s.q)?;
+            launch_v4_gemv_fp8(
+                s.xq, w.wq_a.w, w.wq_a.scale, m, q_lora, dim, FP8_BLOCK, 1, s.qr, stream,
+            )?;
+            launch_v4_rmsnorm(s.qr, w.q_norm, m, q_lora, d.norm_eps, stream)?;
+            // The copy that made the set seven rather than six: `s.qr` is what `v4_rmsnorm`
+            // just wrote on `stream`, and a blocking `memcpy_dtod` here does not wait for it.
+            memcpy_dtod_async(s.qrq.cast(), s.qr.cast(), m * q_lora * size_of::<f32>(), stream)?;
+            launch_v4_act_quant(s.qrq, m, q_lora, q_lora, FP8_BLOCK, stream)?;
+            launch_v4_gemv_fp8(
+                s.qrq, w.wq_b.w, w.wq_b.scale, m, nhd, q_lora, FP8_BLOCK, 1, s.q, stream,
+            )?;
             // QK-norm BEFORE RoPE (model.py:504 then :505). Read off the reference, not
             // inferred from a green test -- which is the part that matters and is unchanged.
             //
@@ -746,17 +783,19 @@ pub mod v4 {
             // bounds it by what dropping bf16 rounding entirely costs. Third time in this
             // port that an exact-arithmetic equivalence was taken for a bitwise one; see
             // `KV_QUANT_BLOCK` above for the second.
-            launch_v4_qk_norm(s.q, m * nh, hd, d.norm_eps)?;
-            launch_v4_rope(s.q, io.freqs, m * nh, hd, rd, pos0, nh, false)?;
+            launch_v4_qk_norm(s.q, m * nh, hd, d.norm_eps, stream)?;
+            launch_v4_rope(s.q, io.freqs, m * nh, hd, rd, pos0, nh, false, stream)?;
 
             // -- kv --------------------------------------------------------------------
-            launch_v4_gemv_fp8(s.xq, w.wkv.w, w.wkv.scale, m, hd, dim, FP8_BLOCK, 1, s.kv)?;
-            launch_v4_rmsnorm(s.kv, w.kv_norm, m, hd, d.norm_eps)?;
-            launch_v4_rope(s.kv, io.freqs, m, hd, rd, pos0, 1, false)?;
+            launch_v4_gemv_fp8(
+                s.xq, w.wkv.w, w.wkv.scale, m, hd, dim, FP8_BLOCK, 1, s.kv, stream,
+            )?;
+            launch_v4_rmsnorm(s.kv, w.kv_norm, m, hd, d.norm_eps, stream)?;
+            launch_v4_rope(s.kv, io.freqs, m, hd, rd, pos0, 1, false, stream)?;
             // PARTIAL: the RoPE'd tail keeps bf16 precision. Quantizing the whole entry
             // is the llama.cpp failure mode v4-flash-port.md §0.2 names -- it corrupts
             // the positional dims and produces noise without a crash.
-            launch_v4_act_quant(s.kv, m, hd, hd - rd, KV_QUANT_BLOCK)?;
+            launch_v4_act_quant(s.kv, m, hd, hd - rd, KV_QUANT_BLOCK, stream)?;
         }
 
         // -- cache and attention ---------------------------------------------------------
@@ -775,7 +814,7 @@ pub mod v4 {
         let kv_src: *const f32 = unsafe {
             match step {
                 Step::Prefill { seqlen } if seqlen <= d.window => {
-                    memcpy_dtod(io.cache.cast(), s.kv.cast(), seqlen * row)?;
+                    memcpy_dtod_async(io.cache.cast(), s.kv.cast(), seqlen * row, stream)?;
                     s.kv
                 }
                 Step::Prefill { seqlen } => {
@@ -783,22 +822,29 @@ pub mod v4 {
                     // positions. Seeding with the FIRST window instead is right exactly
                     // when the prompt fits, which is why a short fixture cannot see it.
                     let cut = seqlen % d.window;
-                    memcpy_dtod(
+                    memcpy_dtod_async(
                         io.cache.add(cut * hd).cast(),
                         s.kv.add((seqlen - d.window) * hd).cast(),
                         (d.window - cut) * row,
+                        stream,
                     )?;
                     if cut > 0 {
-                        memcpy_dtod(
+                        memcpy_dtod_async(
                             io.cache.cast(),
                             s.kv.add((seqlen - cut) * hd).cast(),
                             cut * row,
+                            stream,
                         )?;
                     }
                     s.kv
                 }
                 Step::Decode { pos } => {
-                    memcpy_dtod(io.cache.add((pos % d.window) * hd).cast(), s.kv.cast(), row)?;
+                    memcpy_dtod_async(
+                        io.cache.add((pos % d.window) * hd).cast(),
+                        s.kv.cast(),
+                        row,
+                        stream,
+                    )?;
                     io.cache
                 }
             }
@@ -828,19 +874,22 @@ pub mod v4 {
                 topk,
                 (hd as f32).powf(-0.5),
                 s.o,
+                stream,
             )?;
 
             // -- output ----------------------------------------------------------------
-            launch_v4_rope(s.o, io.freqs, m * nh, hd, rd, pos0, nh, true)?;
+            launch_v4_rope(s.o, io.freqs, m * nh, hd, rd, pos0, nh, true, stream)?;
             // `o.view(b, s, o_groups, -1)` needs no gather: group `g` is the contiguous
             // run of heads `[g * n_heads/o_groups, ...)`, all `head_dim` dims of each.
             // `groups = o_groups`: `o` is `m` rows of `o_groups` contiguous `gd`-wide
             // head runs, and output row `j` takes run `j / o_lora_rank`.
             launch_v4_gemv_fp8(
-                s.o, w.wo_a.w, w.wo_a.scale, m, gr, gd, FP8_BLOCK, d.o_groups, s.y,
+                s.o, w.wo_a.w, w.wo_a.scale, m, gr, gd, FP8_BLOCK, d.o_groups, s.y, stream,
             )?;
-            launch_v4_act_quant(s.y, m, gr, gr, FP8_BLOCK)?;
-            launch_v4_gemv_fp8(s.y, w.wo_b.w, w.wo_b.scale, m, d.dim, gr, FP8_BLOCK, 1, io.out)?;
+            launch_v4_act_quant(s.y, m, gr, gr, FP8_BLOCK, stream)?;
+            launch_v4_gemv_fp8(
+                s.y, w.wo_b.w, w.wo_b.scale, m, d.dim, gr, FP8_BLOCK, 1, io.out, stream,
+            )?;
         }
         Ok(())
     }
@@ -852,7 +901,7 @@ pub mod v4 {
 /// and is also the property being pinned: `d.validate()` and the `s.rows` check are the
 /// first two statements, so every pointer below can be dangling and never be read. If a
 /// guard stopped firing the test would not quietly pass — it would run on into
-/// `memcpy_dtod` with a null destination.
+/// `memcpy_dtod_async` with a null destination.
 ///
 /// **This is the rejecting half only, and deliberately so.** The accepting half is the
 /// whole of `tests/v4_attn.rs`, which drives `attention` to completion against the oracle
@@ -871,6 +920,10 @@ pub mod v4 {
 /// the selection bail rather than on a launcher. This repo has shipped a tautological
 /// anti-vacuity assertion twice and reported it working both times; the mutation is why
 /// this one is not a third.
+/// Every call below passes `std::ptr::null_mut()` for the stream, and that is the honest
+/// argument rather than a shortcut: these cases return before the first launch, so there is
+/// no device work for a stream to order. A real `HipStream` here would also make the module
+/// need a device to construct one, which is exactly the property the doc above rests on.
 #[cfg(all(test, feature = "rocm"))]
 mod v4_guard_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
@@ -939,7 +992,7 @@ mod v4_guard_tests {
         let (w, s, io) = parts(1);
         // SAFETY: every pointer is null and none is read — the `rows` check precedes the
         // first launch, which is the property this asserts.
-        let e = unsafe { attention(&d, plain(), &w, &s, &io, Step::Prefill { seqlen: 4 }) }
+        let e = unsafe { attention(&d, plain(), &w, &s, &io, Step::Prefill { seqlen: 4 }, std::ptr::null_mut()) }
             .expect_err("a 4-row prefill into a 1-row scratch must be refused");
         let msg = format!("{e}");
         assert!(msg.contains("scratch rows"), "wrong rejection: {msg}");
@@ -948,7 +1001,7 @@ mod v4_guard_tests {
         // the pointers are null — but the message proves the guard is a bound and not a
         // constant `false`, which is the shape S2 shipped twice.
         let (w, s, io) = parts(4);
-        let msg = match unsafe { attention(&d, plain(), &w, &s, &io, Step::Prefill { seqlen: 4 }) } {
+        let msg = match unsafe { attention(&d, plain(), &w, &s, &io, Step::Prefill { seqlen: 4 }, std::ptr::null_mut()) } {
             Ok(()) => String::new(),
             Err(e) => format!("{e}"),
         };
@@ -968,7 +1021,7 @@ mod v4_guard_tests {
         let (w, s, io) = parts(64);
         let lying = Sel { win: 64, ..plain() };
         // SAFETY: the shape guard precedes every launch.
-        let e = unsafe { attention(&d, lying, &w, &s, &io, Step::Decode { pos: 200 }) }
+        let e = unsafe { attention(&d, lying, &w, &s, &io, Step::Decode { pos: 200 }, std::ptr::null_mut()) }
             .expect_err("the (0, 0) idxs_shape in `parts` must be refused");
         assert!(
             format!("{e}").contains("(1, 128)"),
@@ -984,7 +1037,7 @@ mod v4_guard_tests {
         d.head_dim = 0;
         let (w, s, io) = parts(64);
         // SAFETY: as above.
-        let e = unsafe { attention(&d, plain(), &w, &s, &io, Step::Decode { pos: 7 }) }
+        let e = unsafe { attention(&d, plain(), &w, &s, &io, Step::Decode { pos: 7 }, std::ptr::null_mut()) }
             .expect_err("a zero head_dim must be refused before any launch");
         let msg = format!("{e}");
         assert!(msg.contains("head_dim is zero"), "wrong rejection: {msg}");
@@ -994,7 +1047,7 @@ mod v4_guard_tests {
         // true. It reached a launcher as guard code 1001 before `from_config` grew this.
         let mut d = dims();
         d.rope_head_dim = d.head_dim;
-        let e = unsafe { attention(&d, plain(), &w, &s, &io, Step::Decode { pos: 7 }) }
+        let e = unsafe { attention(&d, plain(), &w, &s, &io, Step::Decode { pos: 7 }, std::ptr::null_mut()) }
             .expect_err("head_dim == rope_head_dim must be refused");
         assert!(format!("{e}").contains("is zero"), "wrong rejection: {e}");
     }
