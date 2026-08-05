@@ -6,6 +6,11 @@
 //! discovered from the machine. See docs/reference/architecture.md §7.
 
 pub mod config;
+/// DeepSeek-V4's prompt encoding. Beside [`tokenizer`] rather than inside it because it is
+/// a different job: this produces the STRING, `tokenizer` turns it into ids. It is also the
+/// only turn framing in this crate that is a port of executable Python rather than of a
+/// Jinja template — the checkpoint ships no `chat_template.jinja` on purpose.
+pub mod dsv4_encoding;
 pub mod format;
 pub mod model;
 pub mod quant;
