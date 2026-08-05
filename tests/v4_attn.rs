@@ -66,7 +66,7 @@ use rivoli::artifact::model::V4Config as EngineV4Config;
 use rivoli::artifact::quant::e8m0;
 use rivoli::v4compress::LayerKind;
 use rivoli::attn::{
-    v4::{Dims, Fp8W, Io, RopeTable, Scratch, Step, Weights, attention},
+    v4::{Dims, Fp8W, Io, Scratch, Step, Weights, attention},
     v4_rope_table_ratio0, v4_topk_idxs, Sel,
 };
 use rivoli::backend::hip::{
@@ -428,9 +428,7 @@ impl Gpu {
     fn io(&mut self, x: &DeviceBuf, idxs: &DeviceBuf, idxs_shape: (usize, usize)) -> Io {
         Io {
             x: x.ptr().cast(),
-            // SAFETY: `Gpu::new` builds this with `v4_rope_table_ratio0`, and `LAYER`
-            // is ratio-0 — the tag and the table agree by construction here.
-            freqs: unsafe { RopeTable::ratio0(self.freqs.ptr().cast()) },
+            freqs: self.freqs.ptr().cast(),
             idxs: idxs.ptr().cast(),
             idxs_shape,
             cache: self.ring.ptr_mut().cast(),
@@ -693,8 +691,7 @@ fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
     let idxb = dev_i32(&idx);
     let mut io = Io {
         x: x.ptr().cast(),
-        // SAFETY: as in `Gpu::io` — the ratio-0 table for a ratio-0 layer.
-        freqs: unsafe { RopeTable::ratio0(gpu.freqs.ptr().cast()) },
+        freqs: gpu.freqs.ptr().cast(),
         idxs: idxb.ptr().cast(),
         idxs_shape: (short, d.window),
         cache: gpu.ring.ptr_mut().cast(),

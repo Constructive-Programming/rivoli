@@ -95,9 +95,15 @@ __device__ __forceinline__ unsigned short f2bf16(float x) {
 // bf16 at every point the kernels mark, and matching WHERE it rounds is what makes the
 // goldens comparable at all.
 //
-// `moe.hip` spelled this `bf16r` until 2026-08-05. Both names in scope in one translation
-// unit is a character transposition between two functions with identical bodies, which is
-// the worst case for a skim of a numerics file — so there is now one.
+// Dropping it leaves values that are fluent and slightly TOO PRECISE, which no magnitude
+// check sees — `v4oracle::Defect::NoBf16Rounding`.
+//
+// `kernels/` is not watched by `build.rs`'s jscpd gate, so nothing mechanical finds a
+// duplicated device helper. This one had THREE independent per-TU copies before it was
+// hoisted, and the only tool that ever caught the duplication was the compiler — on a clean
+// merge of two agents' identical hunks into this header, which does not overlap and so does
+// not conflict. `moe.hip` spelled its copy `bf16r`; that one carries the magnitude the
+// rounding is worth.
 __device__ __forceinline__ float rbf16(float x) { return bf16f(f2bf16(x)); }
 
 // Block-wide sum of `v` into every thread. `red` is caller-owned LDS of `blockDim.x`
@@ -389,20 +395,6 @@ __device__ __forceinline__ float dot_i4_wave(const float* __restrict__ v,
     return wave_sum(a0 + a1);
 }
 
-// One bf16 STORE: round an f32 through bf16 and back.
-//
-// V4's activations live in bf16 between operations, so every `.to(dtype)`, every
-// `RMSNorm.forward` return and every `apply_rotary_emb` copy-back is one of these. Dropping
-// one leaves values that are fluent and slightly too precise, which no magnitude check sees
-// (`v4oracle::Defect::NoBf16Rounding`).
-//
-// Here rather than per-kernel because it had been written THREE times — `mla.hip::v4_rbf16`,
-// `v4compress.hip::v4c_rbf16` and a third copy in `v4indexer.hip`, each `static` to its
-// translation unit and so unreachable from the others. `kernels/` is not watched by
-// `build.rs`'s jscpd gate, so nothing mechanical would ever have found them. `v4indexer.hip`
-// now calls this one; collapsing the other two is the plan's requirement 11 and needs
-// `mla.hip` edits no S2 agent was permitted to make.
-__device__ __forceinline__ float rbf16(float x) { return bf16f(f2bf16(x)); }
 
 // ── OCP MX FP4 (DeepSeek-V4-Flash's native routed experts) ──────────────────────
 //

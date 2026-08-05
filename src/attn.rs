@@ -200,8 +200,8 @@ impl Sel {
 /// **The two phases index DIFFERENT spaces.** At prefill the window columns are absolute
 /// positions `0..seqlen` and the compressed ones continue from `seqlen`; at decode they are
 /// ring SLOTS `0..window_size` and the compressed ones continue from `window_size`.
-/// `v4compress::compress_offset` owns that split and [`v4::Dims::compress_slot`] is its
-/// write-side half.
+/// `v4compress::compress_offset` owns that split; the write-side half belongs to whoever
+/// places the compressor's output, which is `v4compress::compress`'s caller.
 ///
 /// **This is the POSITIONAL compressed selection.** For a ratio-128 layer that is the whole
 /// story — the reference has no `Indexer` there. For a ratio-4 layer it stands in for
@@ -257,7 +257,6 @@ pub fn v4_topk_idxs(sel: Sel, out: &mut Vec<i32>) -> Result<(usize, usize)> {
 mod v4_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
     use super::*;
-    use crate::v4compress::LayerKind;
 
     #[test]
     fn window_topk_prefill_is_causal_and_masks_nothing_reachable() {
@@ -334,7 +333,6 @@ mod v4_tests {
 /// and performs one block's launches, so `tests/v4_attn.rs` drives exactly what S3 will.
 #[cfg(feature = "rocm")]
 pub mod v4 {
-    use super::LayerKind;
     use crate::artifact::model::V4Config;
     use crate::backend::hip::{
         launch_v4_act_quant, launch_v4_gemv_fp8, launch_v4_qk_norm, launch_v4_rmsnorm,
@@ -357,54 +355,6 @@ pub mod v4 {
         /// `F8_E8M0` byte to f32 at conversion (`format.rs::copy_fp8_e8m0`), exactly —
         /// every e8m0 code is a power of two and so is exact in f32.
         pub scale: *const f32,
-    }
-
-    /// A device RoPE table, carrying WHICH of the two `Attention.__init__` builds.
-    ///
-    /// **This exists because the gate provably cannot see the mistake.** A ratio-0 layer
-    /// uses `rope_theta = 10000` with YaRN disabled (`original_seq_len = 0`); every
-    /// compressed layer uses `compress_rope_theta = 160000` WITH it. The two tables have
-    /// the same type, the same stride and the same shape, so a bare `*const f32` cannot
-    /// tell them apart and swapping them is `Defect::RopeNoYarn` — plausible frequencies
-    /// at every scale, fluent wrong text. S3 requirement 4.
-    ///
-    /// Measured 2026-08-05 on the GPU, `tests/v4_compress_kernel.rs`'s `ratio4/decode`
-    /// cell: the no-yarn impersonation is **bit-identical to the defect oracle** (max 0 of
-    /// 3072) and **8 bf16 codes from clean**. Units matter, and an earlier draft of this
-    /// paragraph had them wrong by 16x: `E4M3_ULP` is 16 bf16 codes and `RESOLVABLE` is
-    /// `4 * E4M3_ULP` = 64, so 8 is HALF an e4m3 step, not 8 of them. Prefill separates at
-    /// 31,215.
-    ///
-    /// **So that assertion is RED, and was already red at `78796eb`** — control run, 6
-    /// passed / 2 failed at both revisions, all 49 measurement lines byte-identical. It is
-    /// S2's inherited failure and is NOT evidence this type works. What it does establish
-    /// is that no decode-side numeric gate can see the swap, which is why the type carries
-    /// it instead.
-    ///
-    /// A caller can still hand [`RopeTable::yarn`] the ratio-0 pointer — but it has to
-    /// write the word, and `attention` checks the tag against the layer class it was given.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct RopeTable {
-        ptr: *const f32,
-        yarn: bool,
-    }
-
-    impl RopeTable {
-        /// The `compress_ratio == 0` table: base `rope_theta`, interpolation branch OFF.
-        ///
-        /// # Safety
-        /// `ptr` must be a live device allocation covering every position the step reaches.
-        pub unsafe fn ratio0(ptr: *const f32) -> Self {
-            Self { ptr, yarn: false }
-        }
-
-        /// The compressed layers' table: `compress_rope_theta` WITH YaRN.
-        ///
-        /// # Safety
-        /// As [`RopeTable::ratio0`].
-        pub unsafe fn yarn(ptr: *const f32) -> Self {
-            Self { ptr, yarn: true }
-        }
     }
 
     /// One layer's attention weights, device-resident.
@@ -456,7 +406,7 @@ pub mod v4 {
         /// compressed one**, because at prefill `sparse_attn` reads
         /// `torch.cat([kv, kv_compress], dim=1)` and the selection indexes that
         /// concatenation as one space. The compressor writes the tail, at
-        /// [`Dims::compress_slot`]. Nothing here can check it — see [`Scratch::rows`].
+        /// `v4compress::compress`. Nothing here can check it — see [`Scratch::rows`].
         pub kv: *mut f32,
         /// `[m, n_heads * head_dim]`
         pub o: *mut f32,
@@ -469,8 +419,37 @@ pub mod v4 {
     pub struct Io {
         /// `[m, dim]` — `attn_norm`'s output. Not modified.
         pub x: *const f32,
-        /// Interleaved `(cos, sin)`, TAGGED with which of the two tables it is.
-        pub freqs: RopeTable,
+        /// Interleaved `(cos, sin)` for THIS layer's class.
+        ///
+        /// **Build it as `v4compress::freqs_cis(rope_for_layer(compressed, rope_theta,
+        /// kind), ..)`, with the same `kind` this call gets.** A ratio-0 layer uses
+        /// `rope_theta = 10000` with YaRN off; every compressed layer uses
+        /// `compress_rope_theta = 160000` with it. The two tables have the same type,
+        /// stride and shape, so nothing here can tell them apart, and swapping them is
+        /// `Defect::RopeNoYarn` — plausible frequencies at every scale, fluent wrong text.
+        /// S3 requirement 4.
+        ///
+        /// **Nothing here checks this.** A `RopeTable` newtype tagged `yarn: bool` did,
+        /// and was dropped as a second place to state the same fact wrongly;
+        /// `rope_for_layer` is the single source and calling it is on the caller. Note what
+        /// that trade actually is — the mismatch is no less REPRESENTABLE than before, it
+        /// is merely undiagnosed, and the enforcing caller does not exist yet.
+        ///
+        /// Why this needs saying at all: **no numeric gate catches it at RATIO-4 decode**,
+        /// and that is now recorded rather than incidental. Not "at decode" — an earlier
+        /// draft of this said that and it is the over-generalization the suite itself
+        /// retracted: `ratio128/decode` is NOT in the exempt registry and is still required
+        /// to separate.
+        /// `tests/v4_compress_kernel.rs`'s `ratio4/decode` cell scores the no-yarn swap
+        /// bit-identical to the defect oracle and 8 bf16 codes from clean — under the
+        /// `RESOLVABLE` floor of 64 (`4 * E4M3_ULP`, and `E4M3_ULP` is 16 bf16 codes, so 8
+        /// is half an e4m3 step). That suite lists the cell in `NO_YARN_BELOW_RESOLUTION`
+        /// with its measured separation and asserts it reproduces the defect exactly,
+        /// rather than lowering `RESOLVABLE` to admit it, and says outright that it "cannot
+        /// see requirement 4 at RATIO-4 decode". `ratio4/prefill` separates at 31,215 and is
+        /// what gates the requirement — though note it is asserted only at `>= RESOLVABLE`,
+        /// so a 500x collapse in that separation would still pass.
+        pub freqs: *const f32,
         /// `[idxs_shape.0, idxs_shape.1]` i32, from [`super::v4_topk_idxs`].
         pub idxs: *const i32,
         /// The `(rows, cols)` the caller actually uploaded. Checked against what this
@@ -623,58 +602,6 @@ pub mod v4 {
             Ok(())
         }
 
-        /// Which rows this step's compressed blocks occupy, and how many there are —
-        /// `(first_row, n_blocks)`, or `None` when the step emits none.
-        ///
-        /// **Rows, not a pointer, and not `unsafe`.** It was both, and a review caught
-        /// that its one caller used the "destination" as a memcpy SOURCE — the name and
-        /// the only use disagreed. Rows are what both sides actually want: the compressor
-        /// writes there and the persist copy reads there, and the pointer arithmetic
-        /// belongs at whichever call site holds the base. It also makes the arithmetic
-        /// testable without a device, which `v4_guard_tests` now does for both arms.
-        ///
-        /// **The `Decode` arm has no caller yet** — `attention` reaches only the `Prefill`
-        /// one, because the compressor call that needs the decode row is
-        /// `v4compress`'s and the layer loop that sequences the two does not exist. It is
-        /// here, and tested, because it is the half that carries requirement 2.
-        ///
-        /// **S3 requirements 2 and 12 in one function.** Requirement 12 is that prefill
-        /// and decode index different spaces with nothing in the types saying so — here
-        /// the row is relative to `s.kv` at prefill and to `io.cache` at decode, which the
-        /// `Step` arms name. Requirement 2 is that at decode the block belongs at cache
-        /// slot `start_pos / ratio`: a caller that APPENDS is right only until it skips a
-        /// step, and speculative decode skips steps by construction.
-        ///
-        /// `None` rather than a zero count, because "emit nothing" and "emit zero blocks
-        /// at row N" are different instructions to a caller about to launch a kernel.
-        pub fn compress_slot(&self, kind: LayerKind, step: Step) -> Option<(usize, usize)> {
-            // `LayerKind`, not a ratio: `Plain` has no compressor and a raw `0` would turn
-            // both divisions below into a panic.
-            let ratio = kind.compressor_ratio()?;
-            let (seqlen, start_pos) = match step {
-                Step::Prefill { seqlen } => (seqlen, 0),
-                Step::Decode { pos } => (1, pos),
-            };
-            // The reference's own predicate for BOTH phases, already gated against the
-            // oracle in `v4compress`. Re-deriving `(pos + 1) % ratio == 0` here is how this
-            // file ended up with a second port of four `model.py` functions to begin with.
-            if !crate::v4compress::should_compress(kind, seqlen, start_pos) {
-                return None;
-            }
-            match step {
-                // The prompt's compressed blocks are the TAIL of what `sparse_attn` reads,
-                // because the reference concatenates rather than caching first
-                // (`torch.cat([kv, kv_compress], dim=1)`). Block 0 is at row `seqlen`,
-                // which is `v4compress::compress_offset` for the same step.
-                Step::Prefill { seqlen } => Some((seqlen, seqlen / ratio)),
-                // Decode emits ONE block when the window closes, into the persistent
-                // region behind the ring — `Compressor.forward`'s
-                // `kv_cache[start_pos // ratio]`. `start_pos / ratio`, never "the next
-                // free one": a caller that appends is right only until it skips a step,
-                // and speculative decode skips steps by construction.
-                Step::Decode { pos } => Some((self.window + pos / ratio, 1)),
-            }
-        }
     }
 
     /// `act_quant(kv[..., :-rope_head_dim], **64**, …)` — model.py:512, and NOT the 128
@@ -713,7 +640,7 @@ pub mod v4 {
     /// [`crate::backend::hip::device_sync`]. `io.freqs` must cover position
     /// `start_pos + m - 1`.
     ///
-    /// Two further obligations, neither of which a plausible caller satisfies by
+    /// Four further obligations, none of which a plausible caller satisfies by
     /// accident:
     ///
     /// - **Everything must be pairwise NON-OVERLAPPING.** `memcpy_dtod`'s own contract
@@ -729,11 +656,11 @@ pub mod v4 {
     ///   are not and cannot be cheaply, which is the cost of letting the caller own the
     ///   selection buffer.
     /// - **On a compressed layer the compressor must already have run for this same
-    ///   `step`.** `attention` copies the prompt's blocks out of `s.kv`'s tail into the
-    ///   persistent region but never writes them, so calling it first propagates
-    ///   uninitialised device memory into rows every later decode step selects BY
-    ///   POSITION and weights with `exp(l - max)`. The reference's order is
-    ///   compressor-then-attend and so is this.
+    ///   `step`, and must have written BOTH destinations.** `attention` only reads the
+    ///   compressed rows — `s.kv`'s tail at prefill, `io.cache`'s tail at decode — and
+    ///   writes neither. Running it first hands `sparse_attn` uninitialised device memory
+    ///   in rows that every later decode step selects BY POSITION and weights with
+    ///   `exp(l - max)`. The reference's order is compressor-then-attend, and so is this.
     /// - **`io.x` and `io.out` must hold `s.rows` rows too.** They are the other two
     ///   `[m, dim]` buffers, and `s.rows` is deliberately the ONE number that governs all
     ///   nine: a second capacity field on [`Io`] would be a second thing to get right, and
@@ -764,22 +691,11 @@ pub mod v4 {
         let (nh, hd, rd) = (d.n_heads, d.head_dim, d.rope_head_dim);
         let (nhd, gd) = (nh * hd, nh * hd / d.o_groups);
         let gr = d.o_groups * d.o_lora_rank;
-        // The table must match the layer class. `Attention.__init__` selects on
-        // `compress_ratio` being truthy and nothing else, so that is the predicate here.
-        let wants_yarn = sel.kind.compressor_ratio().is_some();
-        ensure!(
-            io.freqs.yarn == wants_yarn,
-            "v4 attention: {:?} needs the {} RoPE table, caller supplied the {} one \
-             (Defect::RopeNoYarn — both tables are plausible and the text stays fluent)",
-            sel.kind,
-            if wants_yarn { "YaRN" } else { "ratio-0" },
-            if io.freqs.yarn { "YaRN" } else { "ratio-0" }
-        );
         // `win`, `seqlen` and `start_pos` ALL come from this call, not from `sel` — the
         // caller supplies the layer's class and `index_topk`, and this function owns the
         // geometry. `win` was left to the caller for one round and two reviewers
         // independently found the hole: `Dims::window` still drives every ring write
-        // (`pos % d.window`) and the persist copy, so a `Sel` disagreeing with it produced
+        // (`pos % d.window`), so a `Sel` disagreeing with it produced
         // a selection over the wrong slot space that matched its own `idxs_shape` and
         // passed the guard below — in-bounds reads, no crash, fluent wrong text. It also
         // took `win == 0` out of reach, which `Dims::validate` already refuses but
@@ -814,12 +730,12 @@ pub mod v4 {
             // scalar commutes with a rotation. Read off the reference, not inferred from
             // a green test.
             launch_v4_qk_norm(s.q, m * nh, hd, d.norm_eps)?;
-            launch_v4_rope(s.q, io.freqs.ptr, m * nh, hd, rd, pos0, nh, false)?;
+            launch_v4_rope(s.q, io.freqs, m * nh, hd, rd, pos0, nh, false)?;
 
             // -- kv --------------------------------------------------------------------
             launch_v4_gemv_fp8(s.xq, w.wkv.w, w.wkv.scale, m, hd, dim, FP8_BLOCK, 1, s.kv)?;
             launch_v4_rmsnorm(s.kv, w.kv_norm, m, hd, d.norm_eps)?;
-            launch_v4_rope(s.kv, io.freqs.ptr, m, hd, rd, pos0, 1, false)?;
+            launch_v4_rope(s.kv, io.freqs, m, hd, rd, pos0, 1, false)?;
             // PARTIAL: the RoPE'd tail keeps bf16 precision. Quantizing the whole entry
             // is the llama.cpp failure mode v4-flash-port.md §0.2 names -- it corrupts
             // the positional dims and produces noise without a crash.
@@ -833,14 +749,12 @@ pub mod v4 {
         //
         // A compressed layer needs no extra arm here, and that is the whole point of the
         // buffer layout: at prefill the compressor has already written its blocks to
-        // `s.kv`'s TAIL (`compress_slot`), so `s.kv` IS `torch.cat([kv, kv_compress])`; at
+        // `s.kv`'s TAIL, so `s.kv` IS `torch.cat([kv, kv_compress])`; at
         // decode the compressed region is `io.cache`'s tail behind the ring, which is the
         // reference's own `compressor.kv_cache = self.kv_cache[:, win:]` view. Both are
         // one contiguous buffer and `sparse_attn` indexes straight into it.
         let row = hd * size_of::<f32>();
-        // SAFETY: caller's contract. Every copy in THIS match stays inside
-        // `cache[0, window)` — the persist copy further down deliberately does not, and is
-        // bounded by `cache`'s compressed region instead.
+        // SAFETY: caller's contract; every copy below stays inside `cache[0, window)`.
         let kv_src: *const f32 = unsafe {
             match step {
                 Step::Prefill { seqlen } if seqlen <= d.window => {
@@ -873,30 +787,16 @@ pub mod v4 {
             }
         };
 
-        // The prompt's compressed blocks have to reach the PERSISTENT region as well as
-        // the concatenation `sparse_attn` is about to read. The reference does both from
-        // inside `Compressor.forward` — it assigns `self.kv_cache[:, :seqlen//ratio]` and
-        // ALSO returns the blocks for `Attention.forward` to `torch.cat`. Here the
-        // compressor writes only the concatenation (`compress_slot`), so the persistent
-        // copy is made here, once, next to the ring seeding it is the exact analogue of.
+        // `attention` does NOT persist the prompt's compressed blocks; it only reads them.
+        // `Compressor.forward` does two writes — `self.kv_cache[:, :seqlen//ratio]` AND the
+        // return value `Attention.forward` concatenates — and doing only the second here
+        // meant reaching into `s.kv`'s tail for rows this function never wrote. The
+        // obligation is on `v4compress::compress`'s doc, where its reader is.
         //
-        // Omitting it is silent and delayed: the prefill attends correctly, and the first
-        // decode step then reads an unwritten compressed region — zeros, which are live
-        // entries with weight `exp(0 - max)` rather than absent ones. That is S3
-        // requirement 3's failure arriving one phase later than requirement 3 describes it.
-        if matches!(step, Step::Prefill { .. })
-            && let Some((first, n)) = d.compress_slot(sel.kind, step)
-        {
-            // SAFETY: caller's contract. The compressor wrote `n` blocks at `s.kv`'s row
-            // `first`, and `io.cache`'s compressed region is `[window, window + max/ratio)`.
-            unsafe {
-                memcpy_dtod(
-                    io.cache.add(d.window * hd).cast(),
-                    s.kv.add(first * hd).cast(),
-                    n * row,
-                )?;
-            }
-        }
+        // `Finish` has ONE `out`, so the second destination is a device COPY after a single
+        // `compress` call, never a second call: `compress` read-modify-writes
+        // `kv_state`/`score_state` before it decides whether to emit, so calling it twice
+        // deposits the same rows into the pooling window twice and slides it twice.
 
         // SAFETY: caller's contract.
         unsafe {
@@ -914,7 +814,7 @@ pub mod v4 {
             )?;
 
             // -- output ----------------------------------------------------------------
-            launch_v4_rope(s.o, io.freqs.ptr, m * nh, hd, rd, pos0, nh, true)?;
+            launch_v4_rope(s.o, io.freqs, m * nh, hd, rd, pos0, nh, true)?;
             // `o.view(b, s, o_groups, -1)` needs no gather: group `g` is the contiguous
             // run of heads `[g * n_heads/o_groups, ...)`, all `head_dim` dims of each.
             // `groups = o_groups`: `o` is `m` rows of `o_groups` contiguous `gd`-wide
@@ -929,7 +829,7 @@ pub mod v4 {
     }
 }
 
-/// The guards `attention` gained in S3, exercised — requirements 2, 4, 6 and 7.
+/// The guards `attention` gained in S3, exercised — requirements 6 and 7.
 ///
 /// **Every guard fires before any device call**, which is what makes this testable without a GPU
 /// and is also the property being pinned: `d.validate()` and the `s.rows` check are the
@@ -946,9 +846,8 @@ pub mod v4 {
 /// rows case has valid dims. Neither can be passing for the other's reason.
 ///
 /// **SEEN RED, 2026-08-05, before being trusted green — the two requirement-6/7 tests
-/// specifically.** The later tests carry their own mutation records in-line, and
-/// `compress_slot_places_...` never calls `attention` at all, so the dangling-pointer
-/// argument above does not describe it. With `d.validate()?` deleted and
+/// specifically.** The window-vs-ring test carries its own mutation record in-line. With
+/// `d.validate()?` deleted and
 /// the `ensure!` weakened to `m <= usize::MAX`, both tests failed — and failed on the
 /// backstop's message (`needs a (4, 4) selection, caller uploaded (0, 0)` and
 /// `needs a (1, 128) selection, …`), which is the evidence that a disabled guard lands on
@@ -958,7 +857,7 @@ pub mod v4 {
 #[cfg(all(test, feature = "rocm"))]
 mod v4_guard_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
-    use super::v4::{Dims, Fp8W, Io, RopeTable, Scratch, Step, Weights, attention};
+    use super::v4::{Dims, Fp8W, Io, Scratch, Step, Weights, attention};
     use super::Sel;
     use crate::v4compress::LayerKind;
 
@@ -1002,8 +901,7 @@ mod v4_guard_tests {
         let s = Scratch { rows, xq: n, qr: n, qrq: n, q: n, kv: n, o: n, y: n };
         let io = Io {
             x: c,
-            // SAFETY: never dereferenced — both guards return first.
-            freqs: unsafe { RopeTable::ratio0(c) },
+            freqs: c,
             idxs: std::ptr::null(),
             // DELIBERATELY a shape no step wants, so the pre-existing selection guard is a
             // BACKSTOP: if either guard under test stopped firing, control reaches that
@@ -1040,11 +938,11 @@ mod v4_guard_tests {
         assert!(!msg.contains("scratch rows"), "the guard rejects a scratch that fits: {msg}");
     }
 
-    /// Requirement 4, which no numeric gate can reach at `ratio4/decode`.
+    /// Requirement 12 — the two index spaces — at the one place a mismatch is silent.
     /// The invariant two reviewers found missing, independently.
     ///
     /// `Sel::win` must not be able to disagree with `Dims::window`, which drives every ring
-    /// write (`pos % d.window`) and the persist copy. `attention` overrides it for exactly
+    /// write (`pos % d.window`). `attention` overrides it for exactly
     /// that reason; SEEN RED with the override removed, where the call accepts a
     /// 64-column selection over a ring that rotates modulo 128.
     #[test]
@@ -1059,80 +957,6 @@ mod v4_guard_tests {
             format!("{e}").contains("(1, 128)"),
             "attention took the selection width from the caller, not from Dims: {e}"
         );
-    }
-
-    #[test]
-    fn attention_refuses_the_wrong_rope_table_for_the_layer_class() {
-        let d = dims();
-        let (w, s, io) = parts(64);
-        // A compressed layer handed the ratio-0 table. `io` carries `RopeTable::ratio0`.
-        // `index_topk` from the shipped config, not 0: at 0 every ratio-4 layer refuses
-        // on the first completed block, and the positive arm below would clear the
-        // RopeNoYarn check only to die on that instead — passing for the wrong reason.
-        let comp = Sel { kind: LayerKind::from_ratio(4), index_topk: 512, ..plain() };
-        // SAFETY: as elsewhere in this module — the check precedes every launch.
-        let e = unsafe { attention(&d, comp, &w, &s, &io, Step::Decode { pos: 7 }) }
-            .expect_err("a ratio-4 layer must refuse the ratio-0 table");
-        assert!(format!("{e}").contains("RopeNoYarn"), "wrong rejection: {e}");
-
-        // ...and the reverse, so this is not an "always refuse compressed" guard: a
-        // ratio-0 layer handed the YaRN table must also be refused.
-        let mut io_yarn = io;
-        io_yarn.freqs = unsafe { RopeTable::yarn(std::ptr::null()) };
-        let e = unsafe { attention(&d, plain(), &w, &s, &io_yarn, Step::Decode { pos: 7 }) }
-            .expect_err("a ratio-0 layer must refuse the YaRN table");
-        assert!(format!("{e}").contains("RopeNoYarn"), "wrong rejection: {e}");
-
-        // ...and the MATCHING pairs must get past this check, or it is a constant `false`.
-        for (sel, io) in [(plain(), io), (comp, io_yarn)] {
-            let msg = match unsafe { attention(&d, sel, &w, &s, &io, Step::Decode { pos: 7 }) } {
-                Ok(()) => String::new(),
-                Err(e) => format!("{e}"),
-            };
-            assert!(!msg.contains("RopeNoYarn"), "a matching table was refused: {msg}");
-        }
-    }
-
-    /// `compress_slot`'s two arms — requirement 2's arithmetic, which has no caller yet on
-    /// the decode side and would otherwise ship untested.
-    #[test]
-    fn compress_slot_places_a_decode_block_at_its_own_slot_never_the_next_free_one() {
-        let d = dims(); // window 128
-        let r4 = LayerKind::from_ratio(4);
-
-        // A ratio-0 layer never emits.
-        assert_eq!(d.compress_slot(LayerKind::Plain, Step::Decode { pos: 3 }), None);
-        assert_eq!(d.compress_slot(LayerKind::Plain, Step::Prefill { seqlen: 64 }), None);
-
-        // Decode emits only on the position that COMPLETES a block, at `pos / ratio`.
-        for pos in 0..12 {
-            let got = d.compress_slot(r4, Step::Decode { pos });
-            let want = ((pos + 1) % 4 == 0).then(|| (128 + pos / 4, 1));
-            assert_eq!(got, want, "pos {pos}");
-        }
-        // The slot is a function of `pos` ALONE — no counter, nothing carried between
-        // calls — which is what makes skipping steps harmless. That is requirement 2, and
-        // it is a property of the SIGNATURE as much as of the body: this function cannot
-        // append because it is not told how many blocks came before.
-        //
-        // (An earlier comment here claimed the test showed "a caller that appended would
-        // put pos 19's block at slot 1". It shows no such thing — an appending caller is
-        // not modelled here at all, and the mutation written to prove it,
-        // `(pos + 1) / ratio - 1`, is ALGEBRAICALLY IDENTICAL on the reachable domain,
-        // because `should_compress` has already forced `pos + 1` to be a multiple of
-        // `ratio`. It passed, and proved nothing. The mutations that do go red are an
-        // off-by-one slot and a dropped window base.)
-        assert_eq!(d.compress_slot(r4, Step::Decode { pos: 19 }), Some((128 + 4, 1)));
-        assert_eq!(d.compress_slot(r4, Step::Decode { pos: 7 }), Some((128 + 1, 1)));
-
-        // Prefill emits every COMPLETE block, based at `seqlen` — the concatenation's
-        // tail, not the persistent region's.
-        assert_eq!(d.compress_slot(r4, Step::Prefill { seqlen: 3 }), None);
-        assert_eq!(d.compress_slot(r4, Step::Prefill { seqlen: 4 }), Some((4, 1)));
-        assert_eq!(d.compress_slot(r4, Step::Prefill { seqlen: 13 }), Some((13, 3)));
-        // Ratio 128 at a 13-token prompt emits nothing — the cell the oracle's shipped
-        // goldens never exercise.
-        assert_eq!(d.compress_slot(LayerKind::from_ratio(128), Step::Prefill { seqlen: 13 }), None);
     }
 
     #[test]

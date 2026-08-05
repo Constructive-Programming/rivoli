@@ -869,6 +869,39 @@ back to the ratio-0 prediction, source 1 is confirmed and the remaining gap is s
 That control run is the measurement to make first; without it a compressed-layer number
 cannot be attributed at all.
 
+### Two guards were built and then withdrawn — S3, 2026-08-05
+
+`14a9009` shipped a `RopeTable` newtype (a `*const f32` tagged `yarn: bool`, checked in
+`attention` against the layer class) and a `Dims::compress_slot` (the compressed block's row
+and count, per phase). Both had tests; both were mutated to red before being trusted. Both
+are **deleted**. What ruled them out is worth as much as what they did:
+
+- **`RopeTable` diagnosed a mismatch that construction can prevent.**
+  `v4compress::rope_for_layer(compressed, rope_theta, kind)` already keys on `LayerKind` —
+  the same `compressor_ratio().is_some()` predicate the guard used — and moves theta and
+  `original_seq_len` together. A caller who builds from `kind` cannot produce the mismatch;
+  the tag was a second place to state the same fact, and therefore a second place to state
+  it wrongly.
+- **`compress_slot` had one caller and it used the function backwards** — the "destination"
+  was read as a memcpy source. Its decode arm, the half carrying requirement 2, had no
+  caller at all.
+
+**Both withdrawals cost real coverage, and neither cost is theoretical.** `attention` no
+longer detects `Defect::RopeNoYarn`, on the one path this port has *measured* as invisible
+to its numeric gate (`ratio4/decode`, sep 8 against a `RESOLVABLE` of 64). And requirement
+2's decode slot — `start_pos / ratio`, never "the next free one", the rule speculative
+decode breaks by construction — is now implemented nowhere and asserted nowhere; it survives
+only as prose on `v4compress::compress`. Both were device-free tests. The trade is only
+sound if the enforcing construction actually lands:
+
+- `Io` must be built by something that takes `kind` and calls `rope_for_layer` itself, so
+  the two-table selection has exactly one site.
+- Whatever places the compressor's output must compute the decode slot, and be tested on it.
+
+Until then these are two guards removed and not yet replaced, which is a worse position than
+before `14a9009` — recorded here so it is a decision with a deadline rather than a deletion
+that quietly became permanent.
+
 ## S4 — benchmark, quality assessment, ranked perf work.
 
 Scoped after S2 reports. S4's quality assessment ranks on **paired dNLL from `bin/ppl`**, not
