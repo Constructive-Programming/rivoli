@@ -460,6 +460,121 @@ fn desc_never_read() -> ExpertDescF4 {
     }
 }
 
+/// The first `n` f32 of a device buffer, host-side.
+///
+/// Every probe in this file wants exactly this and four of them wanted it in one function, which
+/// `build.rs`'s jscpd gate does not permit spelled four times. Takes an element count and not a
+/// byte count, because every caller has the former and the `* size_of::<f32>()` was the part that
+/// was easy to drop.
+///
+/// **Does NOT sync.** The caller owns that, and every one of them does it once for the whole
+/// group rather than once per tensor — `device_sync` after four blocking D2H copies would be
+/// three joins that prove nothing.
+fn read_prefix(b: &DeviceBuf, n: usize) -> Result<Vec<f32>> {
+    let mut bytes = Vec::new();
+    b.copy_out_prefix(&mut bytes, n * size_of::<f32>())?;
+    Ok(read_f32(&bytes))
+}
+
+/// Everything ONE [`V4Engine::probe_attn_stages`] call leaves readable, in pipeline order.
+///
+/// A struct and not a 4-tuple: all four are `Vec<f32>`, so every permutation type-checks and the
+/// failure is a comparison against the wrong golden. Same argument [`Phase`] makes about its two
+/// `usize`.
+///
+/// `attn_core_out` is deliberately absent and **cannot** be added — the output de-rotation is IN
+/// PLACE on `s.o` (`launch_v4_rope(s.o, .., inverse = true)`), so by the time `attention` returns
+/// the pre-image is gone. `tests/v4_attn.rs` drives `sparse_attn` separately for exactly that
+/// reason; this makes the same partition available at real weights, minus that one cell.
+///
+/// # These four are NOT equally sharp
+///
+/// [`AttnStages::kv_entry`] is the sharpest instrument here and [`AttnStages::attn_out`] is the
+/// bluntest — the opposite of how the two read, since `attn_out` is the one with the familiar name
+/// and the block-shaped meaning. **Bisect from `kv_entry` outwards, not from `attn_out` inwards.**
+///
+/// The reason is structural rather than a property of this port: the block performs three fp8
+/// activation requantizations, each a step function that amplifies re-association noise ~16x, and
+/// a tensor's distance from the oracle is set by how many of them sit upstream of it. The
+/// mechanism, the measured amplification and the per-tensor ladder are stated ONCE, in
+/// `tests/v4_loop.rs`'s `# CORRECTED 2026-08-05` header. They are deliberately not restated here:
+/// an earlier draft copied the table into this doc and the two had already contradicted each other
+/// on the size of a bf16 ULP within the same session — jscpd does not see comments, so nothing
+/// would have caught it.
+pub struct AttnStages {
+    /// `[m, n_heads, head_dim]` — `s.q` after QK-norm and RoPE. Golden `L{l}.{tag}.q`.
+    pub q: Vec<f32>,
+    /// `[m, head_dim]` — `s.kv` after `kv_norm`, RoPE and the partial block-64 `act_quant`.
+    /// Golden `L{l}.{tag}.kv_entry`.
+    pub kv_entry: Vec<f32>,
+    /// `[m, n_heads, head_dim]` — `s.o` after `sparse_attn` AND the in-place de-rotation.
+    /// Golden `L{l}.{tag}.attn_derot`.
+    pub attn_derot: Vec<f32>,
+    /// `[m, dim]` — `io.out`: the grouped `wo_a`, `act_quant`, then `wo_b`.
+    /// Golden `L{l}.{tag}.attn_out`.
+    pub attn_out: Vec<f32>,
+}
+
+impl AttnStages {
+    /// Each tensor with the golden SUFFIX that names it and the `max_rel` bound derived for it,
+    /// **sharpest first** — the order of the amplifier ladder, so a caller printing these prints
+    /// the most diagnostic row first and the first line to move is the one to believe.
+    ///
+    /// This exists because the struct's whole argument for not being a 4-tuple — that four
+    /// `Vec<f32>` in a row are permutable and the failure is a silent comparison against the wrong
+    /// golden — was defeated at its only call site, which paired the fields with their names in a
+    /// hand-written array. Found by review. Pairing them HERE, next to the field declarations,
+    /// is the only place the two can be checked against each other by eye.
+    ///
+    /// # Where the bounds come from, and how little they buy
+    ///
+    /// **Derived, not chosen**: each is `sqrt(envelope_max * weakest_defect_above_the_envelope)`,
+    /// where the envelope is what a correct implementation produces given the `attn_norm_out`
+    /// deviation the device actually has (26 of 53,248 elements at 1 bf16 ULP, measured on
+    /// gfx1151 2026-08-06) and the defect column is measured over the **in-scope subset of
+    /// `Defect::ALL`**, not over a hand-picked pair. §8 of
+    /// `docs/measurement/probes/v4_attn_amplification.py` prints both inputs.
+    ///
+    /// | tensor | envelope max | weakest defect ABOVE it | bound | ratio | device |
+    /// |---|---:|---|---:|---:|---:|
+    /// | `kv_entry` | 2.56 | `RopeHalfSplit` 116 | **17** | 45x | 0.95 |
+    /// | `q` | 49.5 | `RopeFirstDims` 1,482 | **275** | 30x | 27.1 |
+    /// | `attn_derot` | 20.1 | `SkipKvActQuant` 26.8 | **23** | **1.3x** | 6.93 |
+    /// | `attn_out` | 53.8 | `KvActQuantWholeTensor` 94.6 | **71** | **1.6x** | 35.0 |
+    ///
+    /// **CORRECTED 2026-08-06.** A first version computed the defect column from TWO variants
+    /// (`RopeHalfSplit`, `SkipQkNorm`) and shipped 17/420/130/350 with a claimed "41x to 71x on
+    /// every row". Adversarial review measured all eighteen in-scope defects: `RopeHalfSplit` is
+    /// the weakest only for `kv_entry`; for `q` it is the STRONGEST of three, and for `attn_derot`
+    /// and `attn_out` the true weakest are 30x and 24x smaller. The old bounds were up to 5.6x
+    /// looser than the rule they cited, and **seven of eighteen defects cleared all four at once**
+    /// — including `QkNormAfterRope`, which moves `attn_out` by 32.7, i.e. LESS than the device's
+    /// own 35.0, so no bound on that tensor can ever separate it.
+    ///
+    /// **So read the ratio column, not the bound.** `kv_entry` and `q` separate by 45x and 30x and
+    /// are real gates. `attn_derot` and `attn_out` separate by 1.3x and 1.6x: they are barely
+    /// gates at all, and that is a property of `max_rel` on a tensor two and three fp8
+    /// requantizations deep, not something a better constant fixes. `max_rel` is floor-dominated
+    /// and near-blind to SCALING defects — `SkipQkNorm` roughly doubles every element of `q` and
+    /// reads 1.07. The statistic that separated every defect review could construct is the
+    /// differing-element FRACTION, and nothing in this tree asserts it yet; that is the owed work
+    /// recorded in `tests/v4_loop.rs`.
+    ///
+    /// Two further limits. The envelope draws its perturbed element POSITIONS uniformly at random,
+    /// while the device's are wherever `hc_pre`'s fold order crossed a bf16 boundary — clustering
+    /// them instead moves `attn_derot`'s envelope over an 18x range. And every number here is
+    /// `L0.pre`; the same four constants gate `L1` and both decode cells, where the input
+    /// deviation is up to 5x larger.
+    pub fn scored(&self) -> [(&'static str, &[f32], f32); 4] {
+        [
+            ("kv_entry", &self.kv_entry, 1.7e1),
+            ("q", &self.q, 2.75e2),
+            ("attn_derot", &self.attn_derot, 2.3e1),
+            ("attn_out", &self.attn_out, 7.1e1),
+        ]
+    }
+}
+
 /// Everything one V4 decode needs that does not vary between tokens.
 ///
 /// Every device buffer is allocated once in [`V4Engine::new`] and none per token, which is
@@ -1660,10 +1775,7 @@ impl V4Engine {
     /// Read the residual stream back — the first `m` rows of `[m, hc_mult, dim]`.
     pub fn residual(&self, m: usize) -> Result<Vec<f32>> {
         device_sync()?;
-        let want = m * self.cfg.hc_mult * self.cfg.hidden;
-        let mut bytes = Vec::new();
-        self.h[self.cur].copy_out_prefix(&mut bytes, want * size_of::<f32>())?;
-        Ok(read_f32(&bytes))
+        read_prefix(&self.h[self.cur], m * self.cfg.hc_mult * self.cfg.hidden)
     }
 
     /// Drive ONE layer over `ids` at `start_pos`, on whatever residual is loaded.
@@ -1732,10 +1844,8 @@ impl V4Engine {
         self.pin.routed.misses() - self.misses0
     }
 
-    /// The attention sublayer's output — `sub` after `attention`, before `hc_post`.
-    ///
-    /// The last bisection point between `attn_norm_out` (clean) and `ffn_norm_out` (wrong): those
-    /// two are separated by exactly `attention` and `hc_post`, and this sits between them.
+    /// One `attention` call's four readable tensors. See [`AttnStages`] for what each implicates,
+    /// for why they are not equally sharp, and for why `attn_core_out` cannot be among them.
     ///
     /// **Only sound on a ratio-0 layer, and that is not a caller's convention — it is checked.**
     /// It runs the attention half, which writes the KV ring. On a `Plain` layer that write is
@@ -1744,21 +1854,42 @@ impl V4Engine {
     /// is emphatically not: `compress` read-modify-writes the pooling state and the decode path
     /// slides the window, so a second pass double-deposits — the exact trap
     /// `v4compress::compress` documents at its "never a second call".
-    pub fn probe_attn_out(&mut self, layer: usize, ids: &[u32], start_pos: usize) -> Result<Vec<f32>> {
+    pub fn probe_attn_stages(
+        &mut self,
+        layer: usize,
+        ids: &[u32],
+        start_pos: usize,
+    ) -> Result<AttnStages> {
         let kind = self.layers[layer - self.range.start].kind;
         ensure!(
             kind.compressor_ratio().is_none(),
-            "probe_attn_out on layer {layer} ({kind:?}): re-running the attention half of a \
+            "probe_attn_stages on layer {layer} ({kind:?}): re-running the attention half of a \
              compressing layer double-deposits into its pooling state"
         );
-        let m = self.begin_step(ids, start_pos).context("probe_attn_out")?;
-        ensure!(self.loaded_rows == m, "probe_attn_out: residual holds {} rows, not {m}", self.loaded_rows);
+        let m = self
+            .begin_step(ids, start_pos)
+            .context("probe_attn_stages")?;
+        ensure!(
+            self.loaded_rows == m,
+            "probe_attn_stages: residual holds {} rows, not {m}",
+            self.loaded_rows
+        );
+        let p = Phase {
+            seqlen: m,
+            start_pos,
+        };
         self.pre_norm(layer, false, m)?;
-        self.attention_block(layer, Phase { seqlen: m, start_pos }, std::ptr::null_mut())?;
+        self.attention_block(layer, p, NULL_STREAM)?;
+        // ONE join for all four readbacks below. `read_prefix` deliberately does not sync.
         device_sync()?;
-        let mut bytes = Vec::new();
-        self.sub.copy_out_prefix(&mut bytes, m * self.cfg.hidden * size_of::<f32>())?;
-        Ok(read_f32(&bytes))
+        let (dim, hd) = (self.cfg.hidden, self.cfg.head_dim);
+        let nhd = self.cfg.n_heads * hd;
+        Ok(AttnStages {
+            q: read_prefix(&self.a_q, m * nhd)?,
+            kv_entry: read_prefix(&self.a_kv, m * hd)?,
+            attn_derot: read_prefix(&self.a_o, m * nhd)?,
+            attn_out: read_prefix(&self.sub, m * dim)?,
+        })
     }
 
     /// `hc_pre` + the sublayer norm ALONE, returning `xw`.
@@ -1790,9 +1921,7 @@ impl V4Engine {
     /// say which half moved, which is the limitation that run's own comment predicted.
     pub fn probe_working(&self, m: usize) -> Result<Vec<f32>> {
         device_sync()?;
-        let mut bytes = Vec::new();
-        self.xw.copy_out_prefix(&mut bytes, m * self.cfg.hidden * size_of::<f32>())?;
-        Ok(read_f32(&bytes))
+        read_prefix(&self.xw, m * self.cfg.hidden)
     }
 
     /// The routing decision of the LAST row the previous [`V4Engine::probe_layer`] drove:
@@ -1843,12 +1972,10 @@ impl V4Engine {
             launch_v4_gemv_fp8(xq, up.packed, up.scale, m, inter, dim, FP8_BLOCK, 1, u, NULL_STREAM)?;
         }
         device_sync()?;
-        let read = |b: &DeviceBuf| -> Result<Vec<f32>> {
-            let mut bytes = Vec::new();
-            b.copy_out_prefix(&mut bytes, m * inter * size_of::<f32>())?;
-            Ok(read_f32(&bytes))
-        };
-        Ok((read(&self.sh_g)?, read(&self.sh_u)?))
+        Ok((
+            read_prefix(&self.sh_g, m * inter)?,
+            read_prefix(&self.sh_u, m * inter)?,
+        ))
     }
 
     /// Prefill, then greedy decode. Returns the generated ids.
