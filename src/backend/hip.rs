@@ -1053,6 +1053,136 @@ launchers! {
         d: usize as i32,
         stream: *mut c_void,
     );
+
+    /// MLA flash attention `clat = Σ_t softmax((qabs·L_t + qrope·R_t)·scale)·L_t` over
+    /// the fp8-e4m3 latent cache (per-128 block scales) + bf16 roped key, head-batched,
+    /// split-KV when `partial` is non-null.
+    ///
+    /// `rows` (nullable) lists the `nr` attended token indices for DSA sparse attention;
+    /// null = dense over the whole `0..nr` causal prefix.
+    ///
+    /// # Safety
+    /// Async device pointers live until the next [`device_sync`]: `qabs` (`h·kvl` f32),
+    /// `qrope` (`h·rope` f32), `lc8`/`lscale`/`rc` the KV cache (indexed by token — up to
+    /// `pos+1` rows; `n_blocks = kvl/128`), `rows` (`nr` u32 or null), `clat` (`h·kvl`
+    /// f32), `partial` ([`attend_scratch_floats`] f32 or null = single split).
+    launch_attend -> rivoli_mla_attend, "mla_attend" (
+        qabs: *const f32,
+        qrope: *const f32,
+        lc8: *const u8,
+        lscale: *const f32,
+        rc: *const u16,
+        rows: *const u32,
+        h: usize as i32,
+        nr: usize as i32,
+        kvl: usize as i32,
+        rope: usize as i32,
+        n_blocks: usize as i32,
+        scale: f32,
+        clat: *mut f32,
+        partial: *mut f32,
+    );
+
+    /// `apply_rotary_emb` over the last `rd` dims of each of `rows` rows, ADJACENT-PAIR
+    /// (`view_as_complex`), from a precomputed `(cos, sin)` table. Row `r` takes position
+    /// `pos0 + r / rows_per_pos`. `inverse` conjugates it — the output de-rotation.
+    ///
+    /// # Safety
+    /// Device pointers must outlive `stream`'s completion: `x` (`rows * row_len` f32), `tbl`
+    /// (at least `(pos0 + rows / rows_per_pos) * rd` f32, interleaved cos/sin). `stream` is a
+    /// live `hipStream_t`, or null for the default stream.
+    launch_v4_rope -> rivoli_v4_rope, "v4_rope" (
+        x: *mut f32,
+        tbl: *const f32,
+        rows: usize as i32,
+        row_len: usize as i32,
+        rd: usize as i32,
+        pos0: usize as i32,
+        rows_per_pos: usize as i32,
+        inverse: bool as i32,
+        stream: *mut c_void,
+    );
+
+    /// The state deposit of `Compressor.forward` — **both phases**, which are one operation
+    /// distinguished only by `slot0`.
+    ///
+    /// A prefill of `s` tokens deposits its `s % ratio` trailing rows starting at slot 0; a
+    /// decode deposits its single row at slot `start_pos % ratio`. See
+    /// `kernels/v4compress.hip::v4_compress_state` for why that is a unification and not a
+    /// coincidence.
+    ///
+    /// Must be launched on **every** call, including one that emits no block: the reference
+    /// writes the state and only then returns `None`. At ratio 128 that is every prompt under
+    /// 128 tokens and 127 of every 128 decode steps.
+    ///
+    /// Refuses `s <= 0` (guard 1005) and a `slot0` whose run would leave the `[ratio, cd]`
+    /// `ape` table (guard 1008).
+    ///
+    /// # Safety
+    /// `kv`/`score` are `s · p.cd()` live f32; `ape` is `p.ratio() · p.cd()`; the two state
+    /// buffers are `p.state_len()` writable f32. None may alias another — every kernel
+    /// parameter is `__restrict__`. `p` is read host-side before the launch; the device buffers
+    /// must outlive `stream`'s completion. `stream` is a live `hipStream_t`, or null for the
+    /// default stream.
+    launch_v4_compress_state -> rivoli_v4_compress_state, "v4_compress_state" (
+        kv: *const f32,
+        score: *const f32,
+        ape: *const f32,
+        kv_state: *mut f32,
+        score_state: *mut f32,
+        p: &GeomAbi as *const GeomAbi,
+        s: usize as i32,
+        slot0: usize as i32,
+        stream: *mut c_void,
+    );
+
+    /// Prefill pooling for `nblk` compressed blocks — `overlap_transform`, the per-feature
+    /// softmax over the pooling window, the bf16 store, `RMSNorm`, and the RoPE at each block's
+    /// FIRST absolute position.
+    ///
+    /// Does **not** run `act_quant`; call [`launch_v4_act_quant`] over dims `[0, d - rd)` at
+    /// block 64 afterwards, which is the order and the partial extent model.py:373-378 uses.
+    ///
+    /// Refuses `nblk <= 0` (guard 1006) rather than launching nothing and returning success,
+    /// which would hand the caller an unwritten `out`.
+    ///
+    /// # Safety
+    /// `kv`/`score` are at least `nblk · p.ratio() · p.cd()` live f32; `ape` is
+    /// `p.ratio() · p.cd()`; `f` satisfies [`Finish`]'s field contract with `out` sized
+    /// `nblk · p.d()` and `freqs` covering position `(nblk - 1) · p.ratio()`. None may alias
+    /// another. All must outlive `stream`'s completion; `stream` is a live `hipStream_t`, or
+    /// null for the default stream.
+    launch_v4_compress_prefill -> rivoli_v4_compress_prefill, "v4_compress_prefill" (
+        kv: *const f32,
+        score: *const f32,
+        ape: *const f32,
+        f: &Finish as *const Finish,
+        p: &GeomAbi as *const GeomAbi,
+        nblk: usize as i32,
+        stream: *mut c_void,
+    );
+
+    /// Pool one COMPLETED decode window out of the compressor state into a single block, and
+    /// slide the window.
+    ///
+    /// Reads no activation: this step's row was already deposited by
+    /// [`launch_v4_compress_state`], `ape` included. Call **only** when
+    /// `(start_pos + 1) % ratio == 0`; the launcher refuses otherwise (guard 1009) rather than
+    /// pooling a half-filled window into finite, plausible, wrong numbers.
+    ///
+    /// # Safety
+    /// The two state buffers are `p.state_len()` f32 and are read-modify-written; `f` satisfies
+    /// [`Finish`]'s field contract with `out` sized one row of `p.d()` and `freqs` covering
+    /// position `(start_pos / ratio) * ratio`. None may alias another. All must outlive
+    /// `stream`'s completion; `stream` is a live `hipStream_t`, or null for the default stream.
+    launch_v4_compress_pool_decode -> rivoli_v4_compress_pool_decode, "v4_compress_pool_decode" (
+        kv_state: *mut f32,
+        score_state: *mut f32,
+        f: &Finish as *const Finish,
+        p: &GeomAbi as *const GeomAbi,
+        start_pos: usize as i32,
+        stream: *mut c_void,
+    );
 }
 // jscpd:ignore-end
 
@@ -1089,21 +1219,28 @@ launchers! {
 //
 // EXEMPT FROM THE DUPLICATION GATE — the residual hand-written half of the ABI wall.
 //
-// Six launchers and their declarations did not fit `launchers!` above, and the macro refuses
-// what it cannot prove mechanical rather than reshaping it. Each is here for a stated reason:
+// ONE launcher does not fit `launchers!` above, and the macro refuses what it cannot prove
+// mechanical rather than reshaping it.
 //
-//   `launch_attend`                  no `rivoli_attend`; the symbol is `rivoli_mla_attend`
-//   `launch_v4_rope`                 passes `i32::from(inverse)`, not a cast
-//   `launch_v4_compress_state`       takes `&GeomAbi` where the ABI wants `*const GeomAbi`
-//   `launch_v4_compress_prefill`     `&Finish` -> `*const Finish`, same coercion
-//   `launch_v4_compress_pool_decode` `&Finish` -> `*const Finish`, same coercion
-//   `launch_v4_indexer_score`        destructures `ScoreDims` first, with prose saying why
+//   `launch_v4_indexer_score`  destructures `ScoreDims` into four i32s before the call, with
+//                              prose in place saying the struct exists to keep the four in the
+//                              right order. A positional 1:1 DSL cannot express one parameter
+//                              becoming four arguments, and the alternative — four bare `usize`
+//                              on the wrapper — deletes the thing the struct is for.
 //
-// The three `&T` cases could be admitted by a DSL form meaning "different extern type, passed
-// by coercion rather than by cast", and the `bool` one by writing `inverse as i32`. Neither was
-// done: both would change the text the expansion gate compares, for three launchers and one
-// argument, and the gate holding EXACTLY is worth more than four more conversions. Revisit
-// only with the gate re-baselined deliberately, not as a side effect.
+// > **FIVE MORE WERE CONVERTED 2026-08-06, and how says more than what.** This list read six.
+// > `launch_attend` was never a real exception: the extern scanner terminated on `-> i32;`, and
+// > `rivoli_mla_attend_scratch_floats` returns `usize`, so it swallowed the following
+// > declaration whole and `rivoli_mla_attend` looked absent. The other four — one
+// > `i32::from(bool)` and three `&T` arguments passed to `*const T` by coercion — were declined
+// > on the argument that converting them would move the text the expansion gate compares.
+// >
+// > That argument was backwards, and correcting it is the useful part. The gate is not the
+// > thing being protected; the CODE is. So the gate was re-baselined to the intended text
+// > FIRST, run to confirm it went red against the tree as it stood, and only then were the five
+// > moved — turning it green again. A gate you may never re-baseline is not a safety net, it is
+// > a freeze, and the way to keep it honest is to state the new expectation before writing the
+// > code that meets it, not to leave code unconverted because the snapshot would move.
 //
 // The exemption itself is the same argument as the block above — these are same-shaped
 // parameter lists for different kernels. Re-measured 2026-08-06 with the markers deleted: 6
@@ -1121,66 +1258,8 @@ unsafe extern "C" {
 
     fn rivoli_mla_attend_scratch_floats(h: i32, kvl: i32) -> usize;
 
-    #[allow(clippy::too_many_arguments)]
-    fn rivoli_mla_attend(
-        qabs: *const f32,
-        qrope: *const f32,
-        lc8: *const u8,
-        lscale: *const f32,
-        rc: *const u16,
-        rows: *const u32,
-        h: i32,
-        nr: i32,
-        kvl: i32,
-        rope: i32,
-        n_blocks: i32,
-        scale: f32,
-        clat: *mut f32,
-        partial: *mut f32,
-    ) -> i32;
-
     // DSA lightning indexer (indexer.hip).
-    #[allow(clippy::too_many_arguments)]
-    fn rivoli_v4_rope(
-        x: *mut f32,
-        tbl: *const f32,
-        rows: i32,
-        row_len: i32,
-        rd: i32,
-        pos0: i32,
-        rows_per_pos: i32,
-        inverse: i32,
-        stream: *mut c_void,
-    ) -> i32;
 
-    fn rivoli_v4_compress_state(
-        kv: *const f32,
-        score: *const f32,
-        ape: *const f32,
-        kv_state: *mut f32,
-        score_state: *mut f32,
-        p: *const GeomAbi,
-        s: i32,
-        slot0: i32,
-        stream: *mut c_void,
-    ) -> i32;
-    fn rivoli_v4_compress_prefill(
-        kv: *const f32,
-        score: *const f32,
-        ape: *const f32,
-        f: *const Finish,
-        p: *const GeomAbi,
-        nblk: i32,
-        stream: *mut c_void,
-    ) -> i32;
-    fn rivoli_v4_compress_pool_decode(
-        kv_state: *mut f32,
-        score_state: *mut f32,
-        f: *const Finish,
-        p: *const GeomAbi,
-        start_pos: i32,
-        stream: *mut c_void,
-    ) -> i32;
     fn rivoli_v4_indexer_score(
         q: *const f32,
         kv: *const f32,
@@ -1288,57 +1367,6 @@ pub fn attend_scratch_floats(h: usize, kvl: usize) -> usize {
     unsafe { rivoli_mla_attend_scratch_floats(h as i32, kvl as i32) }
 }
 
-/// MLA flash attention `clat = Σ_t softmax((qabs·L_t + qrope·R_t)·scale)·L_t` over
-/// the fp8-e4m3 latent cache (per-128 block scales) + bf16 roped key, head-batched,
-/// split-KV when `partial` is non-null.
-///
-/// `rows` (nullable) lists the `nr` attended token indices for DSA sparse attention;
-/// null = dense over the whole `0..nr` causal prefix.
-///
-/// # Safety
-/// Async device pointers live until the next [`device_sync`]: `qabs` (`h·kvl` f32),
-/// `qrope` (`h·rope` f32), `lc8`/`lscale`/`rc` the KV cache (indexed by token — up to
-/// `pos+1` rows; `n_blocks = kvl/128`), `rows` (`nr` u32 or null), `clat` (`h·kvl`
-/// f32), `partial` ([`attend_scratch_floats`] f32 or null = single split).
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn launch_attend(
-    qabs: *const f32,
-    qrope: *const f32,
-    lc8: *const u8,
-    lscale: *const f32,
-    rc: *const u16,
-    rows: *const u32,
-    h: usize,
-    nr: usize,
-    kvl: usize,
-    rope: usize,
-    n_blocks: usize,
-    scale: f32,
-    clat: *mut f32,
-    partial: *mut f32,
-) -> Result<()> {
-    // SAFETY: caller's pointer contract.
-    let r = unsafe {
-        rivoli_mla_attend(
-            qabs,
-            qrope,
-            lc8,
-            lscale,
-            rc,
-            rows,
-            h as i32,
-            nr as i32,
-            kvl as i32,
-            rope as i32,
-            n_blocks as i32,
-            scale,
-            clat,
-            partial,
-        )
-    };
-    check(r, "mla_attend")
-}
-
 // ── DSA lightning indexer ───────────────────────────────────────────────────────
 
 // ── DeepSeek-V4-Flash attention (S2b) ───────────────────────────────────────────────
@@ -1379,150 +1407,6 @@ pub unsafe fn launch_attend(
 // `v4_qk_norm` on their own. An earlier version of this line said `v4_attn.rs` covered all
 // six and was wrong about two.
 
-/// `apply_rotary_emb` over the last `rd` dims of each of `rows` rows, ADJACENT-PAIR
-/// (`view_as_complex`), from a precomputed `(cos, sin)` table. Row `r` takes position
-/// `pos0 + r / rows_per_pos`. `inverse` conjugates it — the output de-rotation.
-///
-/// # Safety
-/// Device pointers must outlive `stream`'s completion: `x` (`rows * row_len` f32), `tbl`
-/// (at least `(pos0 + rows / rows_per_pos) * rd` f32, interleaved cos/sin). `stream` is a
-/// live `hipStream_t`, or null for the default stream.
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn launch_v4_rope(
-    x: *mut f32,
-    tbl: *const f32,
-    rows: usize,
-    row_len: usize,
-    rd: usize,
-    pos0: usize,
-    rows_per_pos: usize,
-    inverse: bool,
-    stream: *mut c_void,
-) -> Result<()> {
-    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
-    let r = unsafe {
-        rivoli_v4_rope(
-            x,
-            tbl,
-            rows as i32,
-            row_len as i32,
-            rd as i32,
-            pos0 as i32,
-            rows_per_pos as i32,
-            i32::from(inverse),
-            stream,
-        )
-    };
-    check(r, "v4_rope")
-}
-
-/// The state deposit of `Compressor.forward` — **both phases**, which are one operation
-/// distinguished only by `slot0`.
-///
-/// A prefill of `s` tokens deposits its `s % ratio` trailing rows starting at slot 0; a
-/// decode deposits its single row at slot `start_pos % ratio`. See
-/// `kernels/v4compress.hip::v4_compress_state` for why that is a unification and not a
-/// coincidence.
-///
-/// Must be launched on **every** call, including one that emits no block: the reference
-/// writes the state and only then returns `None`. At ratio 128 that is every prompt under
-/// 128 tokens and 127 of every 128 decode steps.
-///
-/// Refuses `s <= 0` (guard 1005) and a `slot0` whose run would leave the `[ratio, cd]`
-/// `ape` table (guard 1008).
-///
-/// # Safety
-/// `kv`/`score` are `s · p.cd()` live f32; `ape` is `p.ratio() · p.cd()`; the two state
-/// buffers are `p.state_len()` writable f32. None may alias another — every kernel
-/// parameter is `__restrict__`. `p` is read host-side before the launch; the device buffers
-/// must outlive `stream`'s completion. `stream` is a live `hipStream_t`, or null for the
-/// default stream.
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn launch_v4_compress_state(
-    kv: *const f32,
-    score: *const f32,
-    ape: *const f32,
-    kv_state: *mut f32,
-    score_state: *mut f32,
-    p: &GeomAbi,
-    s: usize,
-    slot0: usize,
-    stream: *mut c_void,
-) -> Result<()> {
-    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
-    let r = unsafe {
-        rivoli_v4_compress_state(
-            kv,
-            score,
-            ape,
-            kv_state,
-            score_state,
-            p,
-            s as i32,
-            slot0 as i32,
-            stream,
-        )
-    };
-    check(r, "v4_compress_state")
-}
-
-/// Prefill pooling for `nblk` compressed blocks — `overlap_transform`, the per-feature
-/// softmax over the pooling window, the bf16 store, `RMSNorm`, and the RoPE at each block's
-/// FIRST absolute position.
-///
-/// Does **not** run `act_quant`; call [`launch_v4_act_quant`] over dims `[0, d - rd)` at
-/// block 64 afterwards, which is the order and the partial extent model.py:373-378 uses.
-///
-/// Refuses `nblk <= 0` (guard 1006) rather than launching nothing and returning success,
-/// which would hand the caller an unwritten `out`.
-///
-/// # Safety
-/// `kv`/`score` are at least `nblk · p.ratio() · p.cd()` live f32; `ape` is
-/// `p.ratio() · p.cd()`; `f` satisfies [`Finish`]'s field contract with `out` sized
-/// `nblk · p.d()` and `freqs` covering position `(nblk - 1) · p.ratio()`. None may alias
-/// another. All must outlive `stream`'s completion; `stream` is a live `hipStream_t`, or
-/// null for the default stream.
-pub unsafe fn launch_v4_compress_prefill(
-    kv: *const f32,
-    score: *const f32,
-    ape: *const f32,
-    f: &Finish,
-    p: &GeomAbi,
-    nblk: usize,
-    stream: *mut c_void,
-) -> Result<()> {
-    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
-    let r = unsafe { rivoli_v4_compress_prefill(kv, score, ape, f, p, nblk as i32, stream) };
-    check(r, "v4_compress_prefill")
-}
-
-/// Pool one COMPLETED decode window out of the compressor state into a single block, and
-/// slide the window.
-///
-/// Reads no activation: this step's row was already deposited by
-/// [`launch_v4_compress_state`], `ape` included. Call **only** when
-/// `(start_pos + 1) % ratio == 0`; the launcher refuses otherwise (guard 1009) rather than
-/// pooling a half-filled window into finite, plausible, wrong numbers.
-///
-/// # Safety
-/// The two state buffers are `p.state_len()` f32 and are read-modify-written; `f` satisfies
-/// [`Finish`]'s field contract with `out` sized one row of `p.d()` and `freqs` covering
-/// position `(start_pos / ratio) * ratio`. None may alias another. All must outlive
-/// `stream`'s completion; `stream` is a live `hipStream_t`, or null for the default stream.
-pub unsafe fn launch_v4_compress_pool_decode(
-    kv_state: *mut f32,
-    score_state: *mut f32,
-    f: &Finish,
-    p: &GeomAbi,
-    start_pos: usize,
-    stream: *mut c_void,
-) -> Result<()> {
-    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
-    let r = unsafe {
-        rivoli_v4_compress_pool_decode(kv_state, score_state, f, p, start_pos as i32, stream)
-    };
-    check(r, "v4_compress_pool_decode")
-}
 // --- head tail (S3) -------------------------------------------------------------------
 // Appended as one block so the merge against the other V4 stages stays reviewable.
 
