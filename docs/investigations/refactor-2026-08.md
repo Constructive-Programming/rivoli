@@ -563,6 +563,35 @@ trap.
 the recorded break (restoring `n_experts + 1` rejects the shipped `L00.f4` at 3422556160 vs
 3435925504 — exactly one stride).
 
+> **CLOSED 2026-08-07 — already done, and the fixture blocker is cleared.** Re-measured before
+> briefing, on the rule the previous four tracks earned. The "three parallel families" have
+> already been unified; what is left per format is the format itself.
+>
+> **The shared half exists and is named.** `RoutedFmt` dispatches `ext` / `magic` /
+> `header_bytes` / `has_shared` / `slot_offsets` / `geometry` in one `match` each, and
+> `quant::{slot_offsets, expert_bytes, expert_stride, vq_expert_layout}` are the generics all
+> three call — `f4_expert_bytes` is literally `expert_bytes(hidden, moe_inter, f4_proj_bytes)`,
+> and `f4_slot_offsets` is `slot_offsets(h, mi, |o, i| (o * f4_row_bytes(i), o * f4_groups(i)))`.
+>
+> **This track's stated requirement is already satisfied.** It asks that "the block count and
+> `shared_block`'s refusal read ONE `RoutedFmt::has_shared`". That method exists, and its doc
+> records the `n_experts + 1` trap it closed. Its stated hazard is likewise already handled:
+> `RoutedFmt::slot_offsets`'s doc carries the `.f4`/`.i4` collision (identical tiling for
+> `i mod 128 ∈ {0} ∪ {97..127}`, both models included) and says the pairing is *"unrepresentable
+> rather than merely warned about"* — which is the fix this track was scoped to make.
+>
+> **What remains is ~70 code lines across three formats, and it is irreducible.** Six functions
+> per format, mostly 3 lines, each stating one of the three things that ARE the format: row
+> packing (`i/4·12/8` vs `i.div_ceil(2)`), group size (64 / 128 / 32), and scale width (bf16 2 B
+> / f32 4 B / e8m0 1 B). Collapsing those into a `RoutedFmt`-keyed table replaces three named,
+> greppable functions with a lookup and saves nothing — the same call the ABI macro made in
+> reverse, and the same one Track G made about the converter loop.
+>
+> **The `v4_loading` blocker recorded above is fixed** (`MOE_INTER` 32 → 128, commit `c935c49`),
+> so the gate's premise — those tests going red for the RIGHT reason — now holds. The recorded
+> break's numbers (3422556160 vs 3435925504) were measured against the shipped `L00.f4`, not the
+> fixture, so they stand unchanged.
+
 > **BEFORE TOUCHING THIS TRACK: `tests/v4_loading.rs` is RED on the dev profile, and its whole
 > fixture family computes strides at an illegal shape.** Found 2026-08-06 by Track 4, which
 > ran the full suite on the **dev** profile — the first time anything had.
@@ -630,7 +659,7 @@ s4     Track 3  (tests/)         ─┐ ALONE as a pair — the safety net goes 
 | G converters | ~~700~~ **~0 net — DONE 2026-08-06** | **G2 held on BOTH formats** (the GLM half ran for the first time). 4 of 7 phases were already factored; the value was one atomicity defect in the only step where the two copies diverged, see Track G |
 | H rm i4_audit | 697 | ~~no inbound refs~~ **DONE 2026-08-05** — there were seven files, one build-breaking; see Track H |
 | I loop skeleton | ~~600~~ **DECLINED 2026-08-07** | Measured: **0** cross-file jscpd clones at min-tokens 10, and 4 of 5 "shared" items are not shared. Common core is ~20 lines. See Track I |
-| K format/offset | 350 | G2 + recorded break still red |
+| K format/offset | ~~350~~ **CLOSED 2026-08-07 — already done** | `RoutedFmt` + `quant::{slot_offsets,expert_bytes,expert_stride}` already unify them; the ~70 lines left ARE the three formats. See Track K |
 | **total** | **~14,050** | **39%** |
 
 **Projected:** 36,100 → ~22,050, a **39%** reduction, with every feature except the Vulkan
