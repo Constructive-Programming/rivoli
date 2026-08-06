@@ -1,6 +1,6 @@
 ---
 status: closed-negative
-verdict: Porting the engine to Vulkan across four phases — the journal, not the rules. It shipped and decoded, then was RETIRED 2026-08-06 as an unfinished port: 16 of 29 kernels, 6 of 36 mode-matrix cells decoding, ~1.9x slower, no DeepSeek-V4 path. Code at tag archive/vulkan-backend-hb16; the inventory and the shader rules are in vulkan-kernels.md.
+verdict: Porting the engine to Vulkan across four phases — the journal, not the rules. It shipped and decoded, then was RETIRED 2026-08-06 as an unfinished port: 16 of 29 kernels, 6 of its own 36 mode-matrix cells decoding (of 72; 36 per backend), ~1.9x slower, no DeepSeek-V4 path. Code at tag archive/vulkan-backend-hb16; the inventory and the shader rules are in vulkan-kernels.md.
 ---
 
 # rivoli — Vulkan backend (retired)
@@ -13,7 +13,7 @@ verdict: Porting the engine to Vulkan across four phases — the journal, not th
 > those measurements stand.
 >
 > What changed is the judgement, not the data. Classified by the user as **an unfinished
-> port, not a feature**: 16 of 29 kernels, 6 of 36 `tests/mode-matrix.sh` cells decoding
+> port, not a feature**: 16 of 29 kernels, 6 of its own 36 `tests/mode-matrix.sh` cells decoding (of 72; 36 per backend)
 > against 30 refusing, ~1.9x slower on the single configuration it supported, and no
 > DeepSeek-V4 decode path at all — while every V4 launcher signature change cost a parallel
 > edit to a backend that could not use it.

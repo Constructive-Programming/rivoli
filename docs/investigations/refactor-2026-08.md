@@ -143,7 +143,7 @@ an artifact of framing.
 > deleted rather than re-keyed, so **no launcher in the tree has a coverage census**.
 > Re-keying it onto `src/backend/hip.rs` is the obvious repair and is unclaimed.
 
-**Rationale.** 6 of 36 cells decode (`tests/mode-matrix.sh`), 16 of 29 kernels, ~1.9× slower,
+**Rationale.** 6 of the Vulkan arm's 36 cells decode (`tests/mode-matrix.sh`, 72 cells over two backends), 16 of 29 kernels, ~1.9× slower,
 refuses `int4`/`hybrid`/`dsa`/`misa` at startup, and cannot run V4 at all. Every V4 launcher
 signature change this month cost a parallel edit to a backend that cannot use it. Classified
 by the user as an **unfinished port, not a feature**.

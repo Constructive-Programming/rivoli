@@ -1,6 +1,6 @@
 ---
 status: closed-negative
-verdict: RETIRED 2026-08-06 as an unfinished port, not a feature — 16 of 29 kernels, 6 of 36 mode-matrix cells decoding and 30 refusing, ~1.9x slower on --mode int3-vq --attn dense, and no DeepSeek-V4 path at all. Kept as the inventory of what was and was not ported, the numerics and index-width rules, and the mechanised-guard registry; code at tag archive/vulkan-backend-hb16.
+verdict: RETIRED 2026-08-06 as an unfinished port, not a feature — 16 of 29 kernels, 6 of its own 36 mode-matrix cells decoding and 30 refusing (of 72; 36 per backend), ~1.9x slower on --mode int3-vq --attn dense, and no DeepSeek-V4 path at all. Kept as the inventory of what was and was not ported, the numerics and index-width rules, and the mechanised-guard registry; code at tag archive/vulkan-backend-hb16.
 ---
 
 # rivoli — Vulkan kernel inventory
@@ -14,7 +14,7 @@ verdict: RETIRED 2026-08-06 as an unfinished port, not a feature — 16 of 29 ke
 > commit earlier and missing the HB=16 work).
 >
 > **Why it was retired, measured at retirement:** 16 of 29 kernels ported; `tests/mode-matrix.sh`
-> ran 6 of 36 cells to a decode and 30 refused at startup; ~1.9x slower than ROCm on the one
+> ran 6 of its own 36 cells to a decode and 30 refused at startup (the matrix was 72, 36 per backend); ~1.9x slower than ROCm on the one
 > configuration it could run (`--mode int3-vq --attn dense`); `--mode int4`/`hybrid` and
 > `--attn dsa`/`misa` refused at startup; and no DeepSeek-V4 decode path at all. Every V4
 > launcher signature change cost a parallel edit to a backend that could not use it. The
