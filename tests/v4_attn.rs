@@ -1120,9 +1120,9 @@ impl Harness {
     ///
     /// The two sweeps below deliberately do NOT use this and bind the whole harness instead.
     /// That is not an inconsistency to tidy: they call [`Harness::under`], which borrows
-    /// `cfg`/`model`/`layer`/`script` — the four fields this drops — so they need the harness
-    /// alive. Consuming here and borrowing there is the actual difference between the two
-    /// groups.
+    /// `cfg`/`model`/`layer`/`script`, three of which this drops (`cfg` comes back in the
+    /// tuple) — so they need the harness alive. Consuming here and borrowing there is the
+    /// real difference between the two groups, not a style split to tidy away.
     fn parts(self) -> (V4Config, Dims, Vec<Phase>, Gpu) {
         (self.cfg, self.d, self.clean, self.gpu)
     }

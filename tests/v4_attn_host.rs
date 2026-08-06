@@ -306,21 +306,48 @@ fn shipped_index_topk() -> usize {
     OracleCfg::v4_flash().index_topk
 }
 
+/// One case the compressed sweep runs: the window, the ratio, and the step being taken.
+///
+/// Named for what `comp_cases` yields rather than `Shape`, because `start_pos` is a position
+/// in a decode and not a dimension — and this domain already spends `Dims`, `Geom` and
+/// `LayerKind` on shape-ish concepts.
+///
+/// **Four bare `usize` that travelled together through `comp_cases`, both references and the
+/// engine call** — and every one is plausible in any other's position, so a transposition
+/// compiles. Worse than usual here: `oracle_rows` and `engine_comp_rows` took the same four in
+/// the same order, so a swap at the CASE would feed both sides the same wrong shape and the
+/// comparison would stay green while testing something nobody chose. One struct, built once
+/// per case, removes the position entirely.
+///
+/// `Debug` is derived so the sweep's failure message is `{c:?}` rather than four hand-written
+/// interpolations: a fifth field added later then appears in the report automatically, instead
+/// of joining the sweep and silently never being named — this struct's own drift-by-position
+/// hazard, moved from the call sites into the message.
+///
+/// It also clears the tree's last duplication-gate clone, which straddled the src/tests
+/// boundary: `oracle_cat` used to restate `compress_topk`'s own
+/// `(ratio, seqlen, start_pos, offset)` four-in-a-row, and `oracle_cat` is a SUPERSET of that
+/// list which forwards to it. There was no `src`-side fix — `compress_topk` is `pub`, its
+/// signature is the reference's, and collapsing it to one line is 101 characters against a
+/// `max_width` of 100. An exemption there would have had to argue "a test helper happens to
+/// take the same parameters", which is not an argument about that code.
+#[derive(Clone, Copy, Debug)]
+struct CompCase {
+    win: usize,
+    ratio: usize,
+    seqlen: usize,
+    start_pos: usize,
+}
+
 /// The reference's `torch.cat`, built from the oracle's two halves at an EXPLICIT offset.
 ///
 /// Explicit so the defect cases below can pass a wrong one through the identical
 /// concatenation — otherwise each would need its own copy of these four lines, and each
 /// copy would be a place for the defect to be built differently from the thing it claims
 /// to perturb.
-fn oracle_cat(
-    win: usize,
-    ratio: usize,
-    seqlen: usize,
-    start_pos: usize,
-    offset: usize,
-) -> Vec<Vec<i64>> {
-    let w = window_topk(win, seqlen, start_pos);
-    let c = compress_topk(ratio, seqlen, start_pos, offset);
+fn oracle_cat(s: CompCase, offset: usize) -> Vec<Vec<i64>> {
+    let w = window_topk(s.win, s.seqlen, s.start_pos);
+    let c = compress_topk(s.ratio, s.seqlen, s.start_pos, offset);
     assert_eq!(w.len(), c.len(), "the two halves disagree on the row count");
     w.into_iter()
         .zip(c)
@@ -329,30 +356,24 @@ fn oracle_cat(
 }
 
 /// `offset` is `kv.size(1)` at prefill and `window_size` at decode — model.py:521.
-fn oracle_rows(win: usize, ratio: usize, seqlen: usize, start_pos: usize) -> Vec<Vec<i64>> {
-    oracle_cat(
-        win,
-        ratio,
-        seqlen,
-        start_pos,
-        if start_pos == 0 { seqlen } else { win },
-    )
+fn oracle_rows(s: CompCase) -> Vec<Vec<i64>> {
+    oracle_cat(s, if s.start_pos == 0 { s.seqlen } else { s.win })
 }
 
-fn engine_comp_rows(win: usize, ratio: usize, seqlen: usize, start_pos: usize) -> Vec<Vec<i64>> {
+fn engine_comp_rows(s: CompCase) -> Vec<Vec<i64>> {
     engine_sel(
-        win,
-        LayerKind::from_ratio(ratio),
+        s.win,
+        LayerKind::from_ratio(s.ratio),
         shipped_index_topk(),
-        seqlen,
-        start_pos,
+        s.seqlen,
+        s.start_pos,
     )
 }
 
 /// Shapes a compressed layer actually reaches. `seqlen` straddles multiples of `ratio`
 /// because the remainder is what decides how many blocks exist, and `start_pos` straddles
 /// multiples of `ratio` because that is where a decode step emits one.
-fn comp_cases() -> Vec<(usize, usize, usize, usize)> {
+fn comp_cases() -> Vec<CompCase> {
     // The four positions around a `ratio` boundary that BOTH axes have to sweep: the first,
     // the last before a block completes, the completing one, and the first of the next block.
     // Written once because they are the same four for the same reason — the remainder decides
@@ -366,13 +387,23 @@ fn comp_cases() -> Vec<(usize, usize, usize, usize)> {
             .into_iter()
             .chain([2 * ratio, 3 * ratio + 2, 130])
         {
-            v.push((win, ratio, seqlen, 0));
+            v.push(CompCase {
+                win,
+                ratio,
+                seqlen,
+                start_pos: 0,
+            });
         }
         for sp in straddle(ratio)
             .into_iter()
             .chain([2 * ratio - 1, win, win + 1, 300])
         {
-            v.push((win, ratio, 1, sp));
+            v.push(CompCase {
+                win,
+                ratio,
+                seqlen: 1,
+                start_pos: sp,
+            });
         }
     }
     v
@@ -382,15 +413,17 @@ fn comp_cases() -> Vec<(usize, usize, usize, usize)> {
 fn compressed_selection_matches_the_oracle_below_the_truncation_point() {
     let mut checked = 0usize;
     let mut saw_blocks = 0usize;
-    for (win, ratio, seqlen, start_pos) in comp_cases() {
-        let want = oracle_rows(win, ratio, seqlen, start_pos);
-        let got = engine_comp_rows(win, ratio, seqlen, start_pos);
-        assert_eq!(
-            got, want,
-            "win={win} ratio={ratio} seqlen={seqlen} start_pos={start_pos}"
-        );
-        // How many compressed columns this shape actually produced.
-        let n = got[0].len() - if start_pos == 0 { seqlen.min(win) } else { win };
+    for c in comp_cases() {
+        let want = oracle_rows(c);
+        let got = engine_comp_rows(c);
+        assert_eq!(got, want, "{c:?}");
+        // How many compressed columns this case actually produced.
+        let n = got[0].len()
+            - if c.start_pos == 0 {
+                c.seqlen.min(c.win)
+            } else {
+                c.win
+            };
         saw_blocks += usize::from(n > 0);
         checked += 1;
     }
@@ -409,11 +442,17 @@ fn the_compressed_comparison_can_fail() {
     // Same discipline as `the_comparison_above_can_fail`: three slips a port makes here,
     // each rejected by the SAME comparison, at shapes `comp_cases()` covers.
     let (win, ratio, seqlen) = (8usize, 4usize, 12usize);
-    let right = oracle_rows(win, ratio, seqlen, 0);
+    let c = CompCase {
+        win,
+        ratio,
+        seqlen,
+        start_pos: 0,
+    };
+    let right = oracle_rows(c);
 
     // 1. The offset omitted — the classic. Blocks then name rows inside the WINDOW
     //    region, which are real KV vectors at completely unrelated positions.
-    let no_offset = oracle_cat(win, ratio, seqlen, 0, 0);
+    let no_offset = oracle_cat(c, 0);
     assert_ne!(
         no_offset, right,
         "the compressed offset is not observable at seqlen={seqlen}"
@@ -421,7 +460,7 @@ fn the_compressed_comparison_can_fail() {
 
     // 2. Decode's offset used at prefill (`win` instead of `kv.size(1)`). Same shape,
     //    every block shifted by `seqlen - win`.
-    let decode_offset = oracle_cat(win, ratio, seqlen, 0, win);
+    let decode_offset = oracle_cat(c, win);
     assert_ne!(
         decode_offset, right,
         "the two offsets coincide at seqlen={seqlen} win={win}"

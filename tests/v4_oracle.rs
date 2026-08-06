@@ -32,6 +32,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
+use common::residual_probe;
 
 use rivoli::v4oracle::forward::{Capture, Defect, HeadTailW, Oracle, Step};
 use rivoli::v4oracle::golden::{Diff, GoldenSet, diff, identical};
@@ -524,19 +525,6 @@ fn model() -> &'static (V4Config, ToyModel) {
     })
 }
 
-/// A fixed, bf16-representable residual stream. Fixed so that a defect at prefill cannot
-/// change the decode step's INPUT: only the layer's own cached state carries the defect
-/// forward, which is what makes "this case is unaffected" a statement about the defect
-/// rather than about propagation.
-///
-/// `common::probe` with this oracle's row width spelled at the call: the residual stream is
-/// `hc_mult * dim` wide, and the seeded bf16 draw underneath was a second copy of `probe`'s
-/// until `build.rs`'s duplication gate found it. Same `NamedRng` sequence either way, so the
-/// fixtures are unchanged.
-fn fixed_h(cfg: &V4Config, tag: &str, s: usize) -> Vec<f32> {
-    common::probe(tag, s, cfg.hc_mult * cfg.dim)
-}
-
 fn fixed_ids(cfg: &V4Config, tag: &str, s: usize) -> Vec<u32> {
     let mut r = NamedRng::new(tag);
     (0..s).map(|_| r.below(cfg.vocab_size) as u32).collect()
@@ -554,7 +542,7 @@ fn run(layer: usize, prompt: usize, defect: Defect) -> Run {
     let steps = std::iter::once((0usize, "pre".to_string(), prompt, 0usize))
         .chain((0..DECODE_STEPS).map(|i| (1usize, format!("dec{i}"), 1, prompt + i)));
     for (slot, tag, s, start_pos) in steps {
-        let mut h = fixed_h(cfg, &format!("h-{tag}"), s);
+        let mut h = residual_probe(cfg, &format!("h-{tag}"), s);
         let ids = fixed_ids(cfg, &format!("ids-{tag}"), s);
         let step = Step {
             lw,
@@ -1253,10 +1241,19 @@ type ReductionCase = (&'static [f32], f32, f32);
 // a genuinely duplicated `ReductionCase` is a real defect class in these registries (the
 // sibling compressor suite runs `assert_records_are_well_formed` for exactly that). Packing the
 // rows instead removes the five-line windows without touching one measured value, and leaves
-// the gate able to see a duplicated ROW. The reflow was checked by extracting every numeric
-// literal before and after: 156 tokens, same order, identical.
+// the gate able to see a duplicated ROW -- rows are 7 to 17 lines, still over the window, and
+// `bf16_reduction_matches_torch_and_not_a_running_fold` asserts it DIRECTLY as well, so the
+// premise does not rest on a text gate that is skipped whenever `npx` is absent.
 //
-// `torch_head_tail` below carries the same attribute for the same reason.
+// The reflow was checked by extracting every numeric literal from the table before and after:
+// **144**, same order, byte-identical. (Re-running that check gives 144, not the 156 an
+// earlier version of this note claimed; 156 counts the twelve numerals inside the `//` row
+// comments, which are not literals. The comments are byte-identical too.)
+//
+// `torch_head_tail` below carries the same attribute. Its own doc argues nothing about
+// rustfmt or jscpd -- it was authored packed for readability, before the interaction
+// `build.rs` records was known -- so it is a precedent for the FORM, not a prior statement of
+// this reason. The reason is stated here.
 #[rustfmt::skip]
 const TORCH_REDUCTIONS: &[ReductionCase] = &[
     // toy `index_n_heads` = 4.0: torch .sum() = -1.4765625, running fold = -1.484375
@@ -1324,6 +1321,23 @@ fn bf16_reduction_matches_torch_and_not_a_running_fold() {
     //
     // The expected values are PyTorch's, captured out of tree (see `TORCH_REDUCTIONS`), not
     // recomputed here from a restatement of the oracle.
+    //
+    // NO TWO ROWS ARE THE SAME CASE. The table's `#[rustfmt::skip]` comment argues that packing
+    // it beats a `jscpd:ignore` region precisely because a duplicated `ReductionCase` stays
+    // visible -- but jscpd is a text gate that is skipped when `npx` is absent and reports a
+    // lower bound on a tree that is not rustfmt-clean. Leaving the premise to it while
+    // asserting nothing here is the asymmetry `assert_records_are_well_formed` exists to close
+    // in the sibling compressor suite, so it is closed here too. A duplicate row is dead
+    // weight that reads as coverage: `separated` counts it twice and the sweep looks broader
+    // than it is.
+    for (i, (terms, _, _)) in TORCH_REDUCTIONS.iter().enumerate() {
+        assert!(
+            !TORCH_REDUCTIONS[..i].iter().any(|(t, _, _)| t == terms),
+            "TORCH_REDUCTIONS row {i} repeats an earlier row's terms; it adds no case and \
+             inflates the separation count below"
+        );
+    }
+
     let (cfg, _) = model();
     let good = Oracle::new(cfg.clone(), Defect::None);
     let bad = Oracle::new(cfg.clone(), Defect::IndexerBf16RunningSum);
@@ -2032,7 +2046,7 @@ fn sinkhorn_has_converged_long_before_iteration_20() {
     let ids = fixed_ids(cfg, "ids-pre", 5);
     let drive = |c: &V4Config, d: Defect| {
         let o = Oracle::new(c.clone(), d);
-        let mut h = fixed_h(cfg, "h-pre", 5);
+        let mut h = residual_probe(cfg, "h-pre", 5);
         common::prefill_capture(&o, &m.layers[0], 0, &ids, &mut h)
     };
     let full = drive(cfg, Defect::None);
@@ -2086,7 +2100,7 @@ fn softplus_threshold_only_matters_for_large_router_logits() {
     let (cfg, m) = model();
     let layer = 3; // score-routed
     let ids = fixed_ids(cfg, "ids-pre-5", 5);
-    let x: Vec<f32> = fixed_h(cfg, "gate-x", 5)
+    let x: Vec<f32> = residual_probe(cfg, "gate-x", 5)
         .into_iter()
         .take(5 * cfg.dim)
         .collect();

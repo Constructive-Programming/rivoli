@@ -69,7 +69,9 @@ const CAPACITY: usize = 5 << 30;
 /// differently from the other two.
 ///
 /// The refusal cases further down do NOT come through here and still spell the raw call:
-/// each asserts `is_err()`, and this helper eats the `Result`. So the transposition risk
+/// each needs the `Result`, which this helper eats. Two assert `is_err()`; the third greps the
+/// refusal's message for "batch scratch", because a too-wide selection could be refused by any
+/// of several guards and only the text says which one fired. So the transposition risk
 /// above is closed on the accepted path and left open at those three — which is the right
 /// trade, since a refusal case that transposed its buffers is still refused.
 fn submit(

@@ -179,9 +179,11 @@ fn host_spread(rows: &mut [f32], d: usize) {
 ///
 /// **Not the only copy in `tests/`, and the count above is deliberately scoped.**
 /// `v4_hadamard_basis.rs::rbf` is this function byte for byte, under another name and with a
-/// doc making the same argument; `v4_head_tail.rs:90` and two closures further down this file
-/// are the scalar form. `build.rs`'s gate sees none of them — each is under `.jscpd.json`'s
-/// `minLines: 5` — which is a reason it did not force the issue, not a licence. The real home
+/// doc making the same argument; `v4_head_tail.rs::bf` and two closures further down this
+/// file are the scalar form. `build.rs`'s gate sees none of them — each is under jscpd's
+/// DEFAULT `minLines: 5`, which `.jscpd.json` does NOT set, so raising it is a one-line config
+/// change nobody would find by grepping the file that is supposed to govern the gate. That is
+/// a reason the gate did not force the issue, not a licence. The real home
 /// is `tests/common/mod.rs` (it touches no device type), and consolidating there means
 /// editing a file this change does not otherwise touch. Left as a named follow-up rather than
 /// done silently, so the next reader knows the duplication is known and not merely unseen.
@@ -355,11 +357,20 @@ fn geom_indexer_and_geom_attention_do_not_finish_the_same_way() {
 
     assert_eq!(a.quantize(), Quantize::PartialFp8);
     assert_eq!(i.quantize(), Quantize::HadamardFp4);
-    // Identical to the kernel, different to `compress`. This IS entailed by `Geom::build`,
-    // whose `GeomAbi` literal does not read `quant` — review flagged it as tautological and
-    // it is kept anyway, as the executable statement of the HAZARD rather than as a test of
-    // the port: it is the reason no dimension guard can catch the confusion, and if it ever
-    // fails the argument for the `Quantize` field has weakened, which is a thing to know.
+    // Identical to the kernel, different to `compress`. This IS entailed, and since the
+    // 2026-08-06 `src/` dedup it is entailed STRUCTURALLY rather than by inspection:
+    // `Geom::indexer` now builds its abi as `..Self::attention(kind, d, rope_head_dim,
+    // norm_eps)?`, a functional update overriding only `quant`, so the two halves cannot
+    // differ. Before that both constructors were wrappers around one private `Geom::build`
+    // holding the single `GeomAbi` literal, called once each with a different `Quantize`; the
+    // dedup inlined it into the already-existing `Geom::attention` and deleted it, so this was
+    // an inlining and not a rename.
+    //
+    // Review flagged the assertion as tautological and it is kept anyway, as the executable
+    // statement of the HAZARD rather than as a test of the port: it is the reason no dimension
+    // guard can catch the confusion, and if it ever fails the argument for the `Quantize`
+    // field has weakened, which is a thing to know. `Geom::indexer` points back at this FILE
+    // and this assertion (not at the test name, which appears nowhere in `src/`).
     // The companion `assert_ne!(a, i)` was deleted; it restated the two lines above it.
     assert_eq!(a.abi(), i.abi(), "the ABI halves must be indistinguishable");
 

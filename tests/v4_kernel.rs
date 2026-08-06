@@ -73,7 +73,7 @@ use rivoli::v4oracle::{
 use std::sync::OnceLock;
 
 mod common;
-use common::{f32b, f32v, max_abs, report_rel};
+use common::{f32b, f32v, max_abs, report_rel, residual_probe};
 
 // =======================================================================================
 // fixture
@@ -1419,7 +1419,7 @@ fn gpu_rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
 /// against a re-derivation.
 fn capture(layer: usize, s: usize) -> (Capture, Vec<f32>, Vec<u32>) {
     let (cfg, m, o) = fixture();
-    let mut h = common::probe("hc-h", s, cfg.hc_mult * cfg.dim);
+    let mut h = residual_probe(cfg, "hc-h", s);
     let mut ri = NamedRng::new("hc-ids");
     let ids: Vec<u32> = (0..s).map(|_| ri.below(cfg.vocab_size) as u32).collect();
     let h0 = h.clone();
@@ -1607,7 +1607,7 @@ fn sinkhorn_iteration_count_is_live() {
     let (cfg, m, _) = fixture();
     const S: usize = 2;
     let lw = &m.layers[0];
-    let h = common::probe("sink-h", S, cfg.hc_mult * cfg.dim);
+    let h = residual_probe(cfg, "sink-h", S);
     assert!(cfg.hc_sinkhorn_iters >= 2, "this test subtracts one below");
     let run = |iters| gpu_hc_pre(cfg, &h, HcW::attn(lw), S, iters);
     let (_, _, c20) = run(cfg.hc_sinkhorn_iters);
@@ -2346,8 +2346,8 @@ fn guard_err<T, E: std::fmt::Display>(r: Result<T, E>) -> Result<T, String> {
 ///
 /// The code, not `is_err`: a check that accepted any error would still pass if someone
 /// replaced a power-of-two test with `block != 128`, or if an unrelated dimension guard
-/// started swallowing the case first. Three guard tests share this, which is also what stops
-/// three copies of the message format from drifting.
+/// started swallowing the case first. Five guard tests share this across six call sites, which
+/// is also what stops six copies of the message format from drifting.
 fn assert_guards(cases: Vec<(u32, &str, Result<(), String>)>) {
     for (want, case, r) in cases {
         let msg = r.expect_err(case);
