@@ -1400,15 +1400,57 @@ impl V4Engine {
     /// with a named hole, not a gate on the model.
     fn shared_expert(&mut self, layer: usize, m: usize) -> Result<()> {
         let (dim, inter) = (self.cfg.hidden, self.cfg.moe_inter);
-        let lp = self.pin.layer(layer)?;
-        let (gate, up, down) = (lp.shared.gate, lp.shared.up, lp.shared.down);
-        let xq = self.xq.ptr().cast::<f32>();
+        // BEFORE the launches, not after: a bad `layer` has to return without having issued
+        // anything to the device, which is what the single pin lookup here used to guarantee.
+        let down = self.pin.layer(layer)?.shared.down;
+        self.shared_gate_up(layer, m)?;
         let g = self.sh_g.ptr_mut().cast::<f32>();
         let u = self.sh_u.ptr_mut().cast::<f32>();
         let out = self.sub.ptr_mut().cast::<f32>();
-        // SAFETY: `xq` holds `m * dim` fp8-quantized f32; the three weights are pin placements
-        // outliving this engine; `g`/`u` are `max_m * inter` and `out` is `max_m * dim`, four
-        // distinct allocations.
+        // SAFETY: `down` is a pin placement outliving this engine; `g`/`u` are `max_m * inter`
+        // and `out` is `max_m * dim`, three distinct allocations, and `shared_gate_up` has just
+        // filled `g` and `u` for these same `m` rows.
+        unsafe {
+            // See the doc above: unclamped, and the wrong silu form. One line, and one
+            // contribution in seven of every layer's FFN.
+            launch_swiglu(g, u, m * inter, g)?;
+            // The `w2` input is act-quantized. The routed path does this for itself inside
+            // `launch_moe_expert_range_f4` ("The `h` re-quantization between the two passes IS
+            // done here, because forgetting it is silent"); here it has to be explicit.
+            launch_act_quant_f8(g, m, inter, std::ptr::null_mut())?;
+            // WRITES `sub` — does not accumulate into it. `MoE.forward` starts from `y = zeros`
+            // and the routed drain adds on top; see `routed_experts`.
+            launch_v4_gemv_fp8(
+                g,
+                down.packed,
+                down.scale,
+                m,
+                dim,
+                inter,
+                FP8_BLOCK,
+                1,
+                out,
+                NULL_STREAM,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// `Expert.forward`'s two input projections for the SHARED expert — `w1` into `sh_g` and
+    /// `w3` into `sh_u`, over all `m` rows.
+    ///
+    /// Split out because [`V4Engine::probe_shared_operands`] has to run exactly these two and
+    /// cannot read them back from `shared_expert`: that method writes the SwiGLU product over
+    /// `sh_g` in place.
+    fn shared_gate_up(&mut self, layer: usize, m: usize) -> Result<()> {
+        let (dim, inter) = (self.cfg.hidden, self.cfg.moe_inter);
+        let lp = self.pin.layer(layer)?;
+        let (gate, up) = (lp.shared.gate, lp.shared.up);
+        let xq = self.xq.ptr().cast::<f32>();
+        let g = self.sh_g.ptr_mut().cast::<f32>();
+        let u = self.sh_u.ptr_mut().cast::<f32>();
+        // SAFETY: `xq` holds `m * dim` fp8-quantized f32; both weights are pin placements
+        // outliving this engine; `g` and `u` are `max_m * inter`, three distinct allocations.
         unsafe {
             launch_v4_gemv_fp8(
                 xq,
@@ -1432,27 +1474,6 @@ impl V4Engine {
                 FP8_BLOCK,
                 1,
                 u,
-                NULL_STREAM,
-            )?;
-            // See the doc above: unclamped, and the wrong silu form. One line, and one
-            // contribution in seven of every layer's FFN.
-            launch_swiglu(g, u, m * inter, g)?;
-            // The `w2` input is act-quantized. The routed path does this for itself inside
-            // `launch_moe_expert_range_f4` ("The `h` re-quantization between the two passes IS
-            // done here, because forgetting it is silent"); here it has to be explicit.
-            launch_act_quant_f8(g, m, inter, std::ptr::null_mut())?;
-            // WRITES `sub` — does not accumulate into it. `MoE.forward` starts from `y = zeros`
-            // and the routed drain adds on top; see `routed_experts`.
-            launch_v4_gemv_fp8(
-                g,
-                down.packed,
-                down.scale,
-                m,
-                dim,
-                inter,
-                FP8_BLOCK,
-                1,
-                out,
                 NULL_STREAM,
             )?;
         }
@@ -2032,39 +2053,8 @@ impl V4Engine {
         layer: usize,
         m: usize,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
-        let (dim, inter) = (self.cfg.hidden, self.cfg.moe_inter);
-        let lp = self.pin.layer(layer)?;
-        let (gate, up) = (lp.shared.gate, lp.shared.up);
-        let xq = self.xq.ptr().cast::<f32>();
-        let g = self.sh_g.ptr_mut().cast::<f32>();
-        let u = self.sh_u.ptr_mut().cast::<f32>();
-        // SAFETY: identical to `shared_expert`'s first two launches, on the same buffers.
-        unsafe {
-            launch_v4_gemv_fp8(
-                xq,
-                gate.packed,
-                gate.scale,
-                m,
-                inter,
-                dim,
-                FP8_BLOCK,
-                1,
-                g,
-                NULL_STREAM,
-            )?;
-            launch_v4_gemv_fp8(
-                xq,
-                up.packed,
-                up.scale,
-                m,
-                inter,
-                dim,
-                FP8_BLOCK,
-                1,
-                u,
-                NULL_STREAM,
-            )?;
-        }
+        let inter = self.cfg.moe_inter;
+        self.shared_gate_up(layer, m)?;
         device_sync()?;
         Ok((
             read_prefix(&self.sh_g, m * inter)?,

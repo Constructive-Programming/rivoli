@@ -297,18 +297,14 @@ mod tests {
         let (g, bias) = gate_and_bias(&mut r, 256);
         let mut differed = 0;
         for &k in &[1usize, 6, 8] {
-            let (mut s1, mut c1, mut sel1) = (vec![0.0; 256], vec![0.0; 256], Vec::new());
-            let (mut s2, mut c2, mut sel2) = (vec![0.0; 256], vec![0.0; 256], Vec::new());
-            route_into(&g, &bias, k, Scoring::Sigmoid, &mut s1, &mut c1, &mut sel1);
-            route_into(
-                &g,
-                &bias,
-                k,
-                Scoring::SqrtSoftplus,
-                &mut s2,
-                &mut c2,
-                &mut sel2,
-            );
+            // One call site, so ONLY the `Scoring` can differ between the two runs.
+            let run = |scoring| {
+                let (mut s, mut c, mut sel) = (vec![0.0; 256], vec![0.0; 256], Vec::new());
+                route_into(&g, &bias, k, scoring, &mut s, &mut c, &mut sel);
+                (s, sel)
+            };
+            let (s1, sel1) = run(Scoring::Sigmoid);
+            let (s2, sel2) = run(Scoring::SqrtSoftplus);
             assert_eq!(sel1.len(), k);
             assert_eq!(sel2.len(), k);
             assert!(

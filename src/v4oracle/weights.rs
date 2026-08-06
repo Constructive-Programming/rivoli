@@ -10,7 +10,7 @@
 //! `bin/v4-oracle` emits goldens from, and it re-runs the same matrix as a cross-check so
 //! the toy's verdict is not taken on trust.
 
-use crate::v4oracle::numerics::{bf16_decode, e2m1_decode, e4m3_decode, e8m0_decode};
+use crate::v4oracle::numerics::{bf16_decode, bf16_encode, e2m1_decode, e4m3_decode, e8m0_decode};
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashMap;
 use std::path::Path;
@@ -299,6 +299,26 @@ pub enum WMat {
         w: Vec<u8>,
         s: Vec<u8>,
     },
+    // jscpd:ignore-start
+    //
+    // THESE FOUR FIELDS ARE THE ON-DISK SCHEMA, NOT A COPY-PASTE, so the gate is switched
+    // off over this variant. Blanking one side of a pair is enough for jscpd, so the
+    // `Fp8` declaration above and the `Checkpoint::fp8` construction below carry no marker;
+    // the same argument covers all three sites. The companion region is at
+    // `Checkpoint::fp8`.
+    //
+    // The checkpoint stores both quantized formats as (rows, cols, weight bytes, scale
+    // bytes). Only the scale GRID differs -- 128x128 blocks for fp8, 32 elements of K per
+    // output row for fp4 -- and nothing in the bytes says which, so the variant has to carry
+    // it: decoding an fp4 tensor against the fp8 grid reads real scales at wrong strides and
+    // yields finite, plausible, wrong weights on every expert.
+    //
+    // The factoring that would remove the text is `Fp8(Q)`/`Fp4(Q)` over one payload struct.
+    // It does keep the distinction -- the variant still discriminates every `match` in
+    // `WMat` -- so this is not a safety argument; it is that the hop costs a `.0` in every
+    // arm of `rows`/`cols`/`row` and at every construction and pattern site in `tests/`, to
+    // satisfy a 15-token window that cannot tell a schema from a duplication. Two payload
+    // STRUCTS (`Blocked`/`Grouped`) would not even do that -- same clone one level down.
     /// `float4_e2m1fn_x2` weights (two nibbles per byte along K) with `float8_e8m0fnu`
     /// scales per 32 elements of K. `linear()` quantizes the activation to fp8 at block 128.
     Fp4 {
@@ -307,6 +327,7 @@ pub enum WMat {
         w: Vec<u8>,
         s: Vec<u8>,
     },
+    // jscpd:ignore-end
 }
 
 impl WMat {
@@ -577,12 +598,17 @@ impl Checkpoint {
                 s.shape
             );
         }
+        // jscpd:ignore-start -- see the argument at `WMat::Fp4`. Identical payloads are
+        // constructed identically; what differs is the shape check ABOVE each of these, and
+        // it stays put so each names its own format in its own message. Blanking this side
+        // is enough, so `Checkpoint::fp4`'s tail carries no marker.
         Ok(WMat::Fp8 {
             rows,
             cols,
             w: w.bytes,
             s: s.bytes,
         })
+        // jscpd:ignore-end
     }
 
     /// An fp4 expert weight plus its `.scale`. The checkpoint stores the nibbles as `I8`.
@@ -662,4 +688,22 @@ impl NamedRng {
     pub fn below(&mut self, n: usize) -> usize {
         (self.next_u64() % n as u64) as usize
     }
+}
+
+/// `n` values in `[-scale, scale)` from the named seed. Reproducible from the name alone.
+pub fn draw(name: &str, n: usize, scale: f32) -> Vec<f32> {
+    let mut r = NamedRng::new(name);
+    (0..n).map(|_| r.unit() * scale).collect()
+}
+
+/// [`draw`], rounded to what bf16 can hold exactly.
+///
+/// The round-trip is the load-bearing part: a stimulus the checkpoint's dtype cannot
+/// represent gets rounded by the engine and not by the oracle, and that difference reads as
+/// a defect at every golden downstream of it.
+pub fn fixed_bf16(name: &str, n: usize, scale: f32) -> Vec<f32> {
+    draw(name, n, scale)
+        .into_iter()
+        .map(|x| bf16_decode(bf16_encode(x)))
+        .collect()
 }

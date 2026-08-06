@@ -600,7 +600,23 @@ impl Geom {
         rope_head_dim: usize,
         norm_eps: f32,
     ) -> Option<Self> {
-        Self::build(kind, d, rope_head_dim, norm_eps, Quantize::PartialFp8)
+        // The one derivation of `cd`/`ents`: [`Geom::indexer`] refines what this returns
+        // rather than repeating it, because two copies of the arithmetic are two places for
+        // a `coff` to go stale.
+        let ratio = kind.compressor_ratio()?;
+        let coff = kind.coff();
+        Some(Self {
+            abi: GeomAbi {
+                ratio: ratio as i32,
+                coff: coff as i32,
+                d: d as i32,
+                cd: (coff * d) as i32,
+                ents: (coff * ratio) as i32,
+                rd: rope_head_dim as i32,
+                eps: norm_eps,
+            },
+            quant: Quantize::PartialFp8,
+        })
     }
 
     /// The **indexer's** compressor geometry — `rotate = true` (model.py:404,
@@ -628,33 +644,13 @@ impl Geom {
         if !kind.has_indexer() {
             return None;
         }
-        Self::build(kind, d, rope_head_dim, norm_eps, Quantize::HadamardFp4)
-    }
-
-    /// The shared body of the two constructors. Private, and taking [`Quantize`] as an
-    /// argument, so that the derivation of `cd`/`ents` exists once — two copies of it is two
-    /// places for a `coff` to go stale — while the only public ways in still name their
-    /// algorithm.
-    fn build(
-        kind: LayerKind,
-        d: usize,
-        rope_head_dim: usize,
-        norm_eps: f32,
-        quant: Quantize,
-    ) -> Option<Self> {
-        let ratio = kind.compressor_ratio()?;
-        let coff = kind.coff();
+        // Sound because `quant` is not an input to any derived integer, which is not left to
+        // this comment: `tests/v4_indexer_kernel.rs` asserts `a.abi() == i.abi()` for exactly
+        // this pair. The `?` cannot fire — `has_indexer()` implies ratio 4, which
+        // `compressor_ratio()` answers `Some` for.
         Some(Self {
-            abi: GeomAbi {
-                ratio: ratio as i32,
-                coff: coff as i32,
-                d: d as i32,
-                cd: (coff * d) as i32,
-                ents: (coff * ratio) as i32,
-                rd: rope_head_dim as i32,
-                eps: norm_eps,
-            },
-            quant,
+            quant: Quantize::HadamardFp4,
+            ..Self::attention(kind, d, rope_head_dim, norm_eps)?
         })
     }
 
