@@ -435,8 +435,8 @@ pub struct LayerState {
 /// combined while leaving every magnitude plausible.
 #[derive(Default, Clone)]
 pub struct Capture {
-    pub floats: Vec<(String, Vec<usize>, Vec<f32>)>,
-    pub ints: Vec<(String, Vec<usize>, Vec<i64>)>,
+    pub floats: Vec<Named<f32>>,
+    pub ints: Vec<Named<i64>>,
     pub counters: Counters,
 }
 
@@ -493,36 +493,47 @@ impl Capture {
     /// before `run_layer` started prefixing the layer id. Silent shadowing is the failure
     /// mode this whole oracle exists to not have.
     pub fn push(&mut self, name: &str, shape: &[usize], v: Vec<f32>) {
-        assert_eq!(
-            shape.iter().product::<usize>(),
-            v.len(),
-            "{name}: shape/len mismatch"
-        );
-        assert!(self.float(name).is_none(), "duplicate golden name {name}");
-        self.floats.push((name.to_string(), shape.to_vec(), v));
+        push_unique(&mut self.floats, name, shape, v);
     }
     /// Record an integer (selection) tensor. Same uniqueness rule as [`Capture::push`].
     pub fn push_i(&mut self, name: &str, shape: &[usize], v: Vec<i64>) {
-        assert_eq!(
-            shape.iter().product::<usize>(),
-            v.len(),
-            "{name}: shape/len mismatch"
-        );
-        assert!(self.int(name).is_none(), "duplicate golden name {name}");
-        self.ints.push((name.to_string(), shape.to_vec(), v));
+        push_unique(&mut self.ints, name, shape, v);
     }
     pub fn float(&self, name: &str) -> Option<&[f32]> {
-        self.floats
-            .iter()
-            .find(|(n, _, _)| n == name)
-            .map(|(_, _, v)| v.as_slice())
+        find_tensor(&self.floats, name)
     }
     pub fn int(&self, name: &str) -> Option<&[i64]> {
-        self.ints
-            .iter()
-            .find(|(n, _, _)| n == name)
-            .map(|(_, _, v)| v.as_slice())
+        find_tensor(&self.ints, name)
     }
+}
+
+/// One recorded tensor: `(name, shape, values)`.
+type Named<T> = (String, Vec<usize>, Vec<T>);
+
+/// The FIRST tensor of this name, which is what makes [`push_unique`]'s duplicate assertion
+/// load-bearing rather than decorative. Generic so `floats` and `ints` cannot drift apart.
+fn find_tensor<'a, T>(from: &'a [Named<T>], name: &str) -> Option<&'a [T]> {
+    from.iter()
+        .find(|(n, _, _)| n == name)
+        .map(|(_, _, v)| v.as_slice())
+}
+
+/// Append one named tensor, refusing a duplicate name and a shape that does not describe it.
+///
+/// Takes the destination list rather than `&mut Capture`: `floats` and `ints` are SEPARATE
+/// namespaces, and a helper that searched both would refuse a legal `foo` recorded once as
+/// each. So each call still fails for its own caller's reason, and names its own tensor.
+fn push_unique<T>(into: &mut Vec<Named<T>>, name: &str, shape: &[usize], v: Vec<T>) {
+    assert_eq!(
+        shape.iter().product::<usize>(),
+        v.len(),
+        "{name}: shape/len mismatch"
+    );
+    assert!(
+        find_tensor(into, name).is_none(),
+        "duplicate golden name {name}"
+    );
+    into.push((name.to_string(), shape.to_vec(), v));
 }
 
 // ---------------------------------------------------------------------------------------
@@ -920,6 +931,16 @@ fn topk_idx(v: &[f32], k: usize) -> Vec<usize> {
 // Block: hyper-connections
 // ---------------------------------------------------------------------------------------
 
+/// The Sinkhorn mixture one `hc_pre` produced, for the `hc_post` that closes the SAME
+/// sublayer — `post` is `[s, hc]` and `comb` is `[s, hc, hc]`.
+///
+/// A block runs the pair twice, around attention and around the FFN, at identical types and
+/// shapes: crossing the two halves was a well-typed call before this type existed.
+struct HcMix {
+    post: Vec<f32>,
+    comb: Vec<f32>,
+}
+
 impl Oracle {
     /// `kernel.py::hc_split_sinkhorn` for one token.
     ///
@@ -1017,7 +1038,6 @@ impl Oracle {
 
     /// `Block.hc_pre`. `h` is `[s, hc, dim]`; the rsqrt is over the FULL `hc * dim`
     /// flattened row, not per copy.
-    #[allow(clippy::type_complexity)]
     fn hc_pre(
         &self,
         h: &[f32],
@@ -1025,12 +1045,12 @@ impl Oracle {
         fnw: &[f32],
         scale: &[f32],
         base: &[f32],
-    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    ) -> (Vec<f32>, HcMix) {
         let (hc, dim, mix) = (self.cfg.hc_mult, self.cfg.dim, self.cfg.mix_hc());
         let hcd = hc * dim;
         let mut y = vec![0.0f32; s * dim];
-        let mut posts = vec![0.0f32; s * hc];
-        let mut combs = vec![0.0f32; s * hc * hc];
+        let mut post = vec![0.0f32; s * hc];
+        let mut comb = vec![0.0f32; s * hc * hc];
         for t in 0..s {
             let flat = &h[t * hcd..(t + 1) * hcd];
             let var = flat.iter().map(|v| v * v).sum::<f32>() / hcd as f32;
@@ -1044,30 +1064,24 @@ impl Oracle {
                 let w = &fnw[j * hcd..(j + 1) * hcd];
                 *m = flat.iter().zip(w).map(|(a, b)| a * b).sum::<f32>() * rs;
             }
-            let (pre, post, comb) = self.sinkhorn(&mixes, scale, base);
+            let (pre, row_post, row_comb) = self.sinkhorn(&mixes, scale, base);
             self.hc_blend(&pre, flat, &mut y[t * dim..(t + 1) * dim]);
-            posts[t * hc..(t + 1) * hc].copy_from_slice(&post);
-            combs[t * hc * hc..(t + 1) * hc * hc].copy_from_slice(&comb);
+            post[t * hc..(t + 1) * hc].copy_from_slice(&row_post);
+            comb[t * hc * hc..(t + 1) * hc * hc].copy_from_slice(&row_comb);
         }
         // `y.to(dtype)` — back to bf16.
         self.round_bf16(&mut y);
-        (y, posts, combs)
+        (y, HcMix { post, comb })
     }
 
     /// `Block.hc_post`: `y[k] = post[k] * x + sum_j comb[j, k] * residual[j]`.
     ///
-    /// `comb` is indexed `[source, dest]` — the Sinkhorn row-softmax runs over the DEST
+    /// `mix.comb` is indexed `[source, dest]` — the Sinkhorn row-softmax runs over the DEST
     /// index and the column normalisation over the SOURCE index. Transposing it keeps every
     /// row of the result a convex-ish combination of the same vectors and is therefore
     /// invisible to any magnitude check.
-    fn hc_post(
-        &self,
-        x: &[f32],
-        residual: &[f32],
-        post: &[f32],
-        comb: &[f32],
-        s: usize,
-    ) -> Vec<f32> {
+    fn hc_post(&self, x: &[f32], residual: &[f32], mix: &HcMix, s: usize) -> Vec<f32> {
+        let HcMix { post, comb } = mix;
         let (hc, dim) = (self.cfg.hc_mult, self.cfg.dim);
         let mut y = vec![0.0f32; s * hc * dim];
         for t in 0..s {
@@ -1458,6 +1472,18 @@ impl Oracle {
 // Attention
 // ---------------------------------------------------------------------------------------
 
+/// `[[f(t, j) for j in range(cols)] for t in range(seqlen)]` — the shape BOTH prefill
+/// comprehensions in `model.py` have, and nothing else.
+///
+/// It owns the RECTANGULARITY that `attn::v4_topk_idxs` refuses a ragged buffer for, and no
+/// selection logic: every index and every `-1` below stays with its own function, so a wrong
+/// one cannot travel between [`window_topk`] and [`compress_topk`].
+fn prefill_rows(seqlen: usize, cols: usize, f: impl Fn(usize, usize) -> i64) -> Vec<Vec<i64>> {
+    (0..seqlen)
+        .map(|t| (0..cols).map(|j| f(t, j)).collect())
+        .collect()
+}
+
 /// `model.py::get_window_topk_idxs` — the sliding-window index list for each query row.
 pub fn window_topk(win: usize, seqlen: usize, start_pos: usize) -> Vec<Vec<i64>> {
     if start_pos >= win.saturating_sub(1) && start_pos > 0 {
@@ -1470,17 +1496,15 @@ pub fn window_topk(win: usize, seqlen: usize, start_pos: usize) -> Vec<Vec<i64>>
         v.resize(win, -1);
         vec![v]
     } else {
-        (0..seqlen)
-            .map(|t| {
-                let base = t.saturating_sub(win - 1);
-                (0..win.min(seqlen))
-                    .map(|j| {
-                        let v = base + j;
-                        if v > t { -1 } else { v as i64 }
-                    })
-                    .collect()
-            })
-            .collect()
+        // `win == 0` gives `cols == 0`, so `win - 1` is never reached and this is `seqlen`
+        // empty rows rather than the overflow panic a dev-profile build used to take. Not
+        // reachable: `attn::v4_topk_idxs` returns early on `win == 0` and `sliding_window` is
+        // 128 in the shipped config. Recorded because it is the one input on which this
+        // spelling and the nested one it replaced differ.
+        prefill_rows(seqlen, win.min(seqlen), |t, j| {
+            let v = t.saturating_sub(win - 1) + j;
+            if v > t { -1 } else { v as i64 }
+        })
     }
 }
 
@@ -1505,19 +1529,17 @@ pub fn compress_topk(
                 .collect(),
         ]
     } else {
-        (0..seqlen)
-            .map(|t| {
-                (0..seqlen / ratio)
-                    .map(|c| {
-                        if c >= (t + 1) / ratio {
-                            -1
-                        } else {
-                            (c + offset) as i64
-                        }
-                    })
-                    .collect()
-            })
-            .collect()
+        // `seqlen / ratio` is evaluated here rather than inside the row, so `ratio == 0`
+        // divides by zero even at `seqlen == 0`, where the nested spelling returned `vec![]`.
+        // `ratio == 0` already panicked for every other `seqlen` — on `(t + 1) / ratio` — so
+        // it was never a supported input; only the empty case moved.
+        prefill_rows(seqlen, seqlen / ratio, |t, c| {
+            if c >= (t + 1) / ratio {
+                -1
+            } else {
+                (c + offset) as i64
+            }
+        })
     }
 }
 
@@ -1624,26 +1646,24 @@ impl Oracle {
         self.rmsnorm(&mut qr, c.q_lora_rank, &lw.q_norm);
         let mut q = self.linear(&qr, s, c.q_lora_rank, &lw.wq_b);
         self.round_bf16(&mut q);
-        if self.defect == Defect::QkNormAfterRope {
-            for i in 0..s * nh {
-                self.rope_row(
-                    &mut q[i * d..(i + 1) * d],
-                    rd,
-                    (start_pos + i / nh, freqs),
-                    false,
-                );
-            }
+        // `Defect::QkNormAfterRope` is a SWAP and nothing else, so the rope loop is written
+        // once and only the `qk_norm` call moves across it. Two transcriptions of the loop
+        // are two places for the defect arm to stop being the clean arm's mirror image,
+        // which would make the A/B measure something other than the swap.
+        let after = self.defect == Defect::QkNormAfterRope;
+        if !after {
             self.qk_norm(&mut q, d, &lw.q_norm);
-        } else {
+        }
+        for i in 0..s * nh {
+            self.rope_row(
+                &mut q[i * d..(i + 1) * d],
+                rd,
+                (start_pos + i / nh, freqs),
+                false,
+            );
+        }
+        if after {
             self.qk_norm(&mut q, d, &lw.q_norm);
-            for i in 0..s * nh {
-                self.rope_row(
-                    &mut q[i * d..(i + 1) * d],
-                    rd,
-                    (start_pos + i / nh, freqs),
-                    false,
-                );
-            }
         }
         cap.push(&format!("{tag}.q"), &[s, nh, d], q.clone());
 
@@ -2222,8 +2242,7 @@ impl Oracle {
         );
 
         let residual = h.clone();
-        let (mut x, post, comb) =
-            self.hc_pre(h, s, &lw.hc_attn_fn, &lw.hc_attn_scale, &lw.hc_attn_base);
+        let (mut x, mix) = self.hc_pre(h, s, &lw.hc_attn_fn, &lw.hc_attn_scale, &lw.hc_attn_base);
         self.rmsnorm(&mut x, self.cfg.dim, &lw.attn_norm);
         cap.push(
             &format!("{tag}.attn_norm_out"),
@@ -2232,11 +2251,10 @@ impl Oracle {
         );
         let a = self.attention(step, st, &x, cap);
         cap.push(&format!("{tag}.attn_out"), &[s, self.cfg.dim], a.clone());
-        *h = self.hc_post(&a, &residual, &post, &comb, s);
+        *h = self.hc_post(&a, &residual, &mix, s);
 
         let residual = h.clone();
-        let (mut x, post, comb) =
-            self.hc_pre(h, s, &lw.hc_ffn_fn, &lw.hc_ffn_scale, &lw.hc_ffn_base);
+        let (mut x, mix) = self.hc_pre(h, s, &lw.hc_ffn_fn, &lw.hc_ffn_scale, &lw.hc_ffn_base);
         self.rmsnorm(&mut x, self.cfg.dim, &lw.ffn_norm);
         cap.push(
             &format!("{tag}.ffn_norm_out"),
@@ -2245,7 +2263,7 @@ impl Oracle {
         );
         let f = self.moe(step, &x, cap);
         cap.push(&format!("{tag}.ffn_out"), &[s, self.cfg.dim], f.clone());
-        *h = self.hc_post(&f, &residual, &post, &comb, s);
+        *h = self.hc_post(&f, &residual, &mix, s);
 
         cap.push(
             &format!("{tag}.out"),

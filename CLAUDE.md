@@ -113,16 +113,31 @@ mechanism is the reporter's diagnosis and is not independently confirmed.) The l
 not depend on the cause: **clippy-green is not duplication-green.** Run something that
 actually re-runs `build.rs` before claiming a change is clone-free. The same reporter hit it
 twice more, both times on real clones **rustfmt had created** by reflowing calls that gained
-a seventh argument — so a mechanical formatting pass can manufacture duplication. **Eight**
-regions are exempt via `jscpd:ignore-start`, down from fourteen on 2026-08-06. Two went with
-`glsl_numerics.rs`; the other **four were deleted because their entire argument named a file
-the Vulkan retirement removed** — `gpustream.rs`'s `Stream::raw` ("mirrors
-`vkstream::Stream::raw`"), its `Timeline` Send/Sync twin, its INV-4 half, and `gpu.rs`'s
-launcher import list. jscpd was re-run without each: still 0 clones, so they were suppressing
-nothing. **A stale exemption is a hole in the gate** — when the justification names a deleted
-file, delete the exemption rather than rewording it. The survivors each carry their argument
-in place: the HIP ABI wall (two regions), `math.rs`'s frozen `route_into_pre` oracle, and
-`v4oracle/numerics.rs`'s transliterations. Being a verbatim copy is the POINT in each; everywhere else, factor it.
+a seventh argument — so a mechanical formatting pass can manufacture duplication. **Ten**
+regions are exempt via `jscpd:ignore-start`: eight on 2026-08-06, down from fourteen, plus
+two added the same day for `v4oracle/weights.rs`'s `WMat::Fp4` (see below). Of the six that
+went, two were `glsl_numerics.rs`'s and the other **four were deleted because their entire
+argument named a file the Vulkan retirement removed** — `gpustream.rs`'s `Stream::raw`
+("mirrors `vkstream::Stream::raw`"), its `Timeline` Send/Sync twin, its INV-4 half, and
+`gpu.rs`'s launcher import list. jscpd was re-run without each: still 0 clones, so they were
+suppressing nothing. **A stale exemption is a hole in the gate** — when the justification
+names a deleted file, delete the exemption rather than rewording it. The survivors each carry
+their argument in place: the HIP ABI wall (`backend/hip.rs`, two regions), `math.rs`'s frozen
+`route_into_pre` oracle, `v4oracle/numerics.rs`'s transliterations, `v4compress.rs`'s three
+functions restated from the oracle, `artifact/model.rs`'s serde renames, `artifact/quant.rs`'s
+`matvec_*` parameter lists, `tests/v4_attn.rs`, and the two `WMat` ones. Being a verbatim copy
+is the POINT in each; everywhere else, factor it.
+
+> **The `WMat` pair, added 2026-08-06 with the `src/` dedup.** `WMat::Fp8` and `WMat::Fp4`
+> carry the same four fields because that IS the checkpoint's storage layout for both
+> quantized formats — only the scale grid differs, and nothing in the bytes says which, so the
+> variant has to carry it. Unlike the others this is not "a verbatim copy is the point": the
+> factoring that removes the text (`Fp8(Q)`/`Fp4(Q)` over one payload struct) would keep the
+> distinction, and was declined on cost — a `.0` hop in every arm of `WMat::rows`/`cols`/`row`
+> and at every construction and pattern site in `tests/`. **If that hop is ever paid for
+> another reason, delete these two exemptions rather than keeping them.** One clone remains
+> unresolved and is not exempted: `v4oracle::compress_topk`'s parameter list against
+> `tests/v4_attn_host.rs::oracle_cat`'s, which only the `tests/` side can fix.
 jscpd is skipped with a warning if `npx` is absent, so the crate still builds without Node.
 
 `src/` is grouped by subsystem — `artifact/ memory/ fetch/ backend/` plus `gpu math attn

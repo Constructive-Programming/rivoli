@@ -23,7 +23,7 @@ use rivoli::v4oracle::forward::{
 };
 use rivoli::v4oracle::golden::{GoldenSet, diff};
 use rivoli::v4oracle::numerics::{bf16_decode, bf16_encode};
-use rivoli::v4oracle::weights::{Checkpoint, V4Config, WMat};
+use rivoli::v4oracle::weights::{Checkpoint, V4Config, WMat, fixed_bf16};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -289,10 +289,7 @@ fn load_head_tail(ck: &Checkpoint, cfg: &V4Config) -> Result<HeadTailW> {
 /// cannot be read as a residual stream; the head tail is a pure function of its input, so the
 /// golden gates exactly the same arithmetic either way. See `HeadTailW`'s doc.
 fn fixed_probe(cfg: &V4Config, s: usize) -> Vec<f32> {
-    let mut r = rivoli::v4oracle::weights::NamedRng::new("v4-head-probe");
-    (0..s * cfg.hc_mult * cfg.dim)
-        .map(|_| bf16_decode(bf16_encode(r.unit())))
-        .collect()
+    fixed_bf16("v4-head-probe", s * cfg.hc_mult * cfg.dim, 1.0)
 }
 
 /// Run the head tail on `probe` and record it, input included.

@@ -13,9 +13,9 @@
 
 use crate::v4oracle::forward::{CompressorW, ExpertW, HeadTailW, IndexerW, LayerW};
 use crate::v4oracle::numerics::{
-    FP4_MAX, FP8_MAX, bf16_decode, bf16_encode, e2m1_encode, e4m3_encode, fast_log2_ceil, fast_pow2,
+    FP4_MAX, FP8_MAX, e2m1_encode, e4m3_encode, fast_log2_ceil, fast_pow2,
 };
-use crate::v4oracle::weights::{NamedRng, V4Config, WMat};
+use crate::v4oracle::weights::{NamedRng, V4Config, WMat, draw, fixed_bf16};
 
 /// A whole toy model: all layers, plus the head tail.
 ///
@@ -26,17 +26,9 @@ pub struct ToyModel {
     pub head_tail: HeadTailW,
 }
 
-fn draw(name: &str, n: usize, scale: f32) -> Vec<f32> {
-    let mut r = NamedRng::new(name);
-    (0..n).map(|_| r.unit() * scale).collect()
-}
-
 /// A bf16 tensor, exactly as the checkpoint would store it.
 fn dense(name: &str, rows: usize, cols: usize, scale: f32) -> WMat {
-    let v = draw(name, rows * cols, scale)
-        .into_iter()
-        .map(|x| bf16_decode(bf16_encode(x)))
-        .collect();
+    let v = fixed_bf16(name, rows * cols, scale);
     WMat::Dense { rows, cols, v }
 }
 

@@ -264,38 +264,43 @@ mod v4_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
     use super::*;
 
+    /// [`v4_topk_idxs`] on a ratio-0 layer, which is every case these two tests drive.
+    ///
+    /// `LayerKind::Plain` has no compressed columns, so `index_topk` is never read, and only
+    /// the three positional values vary. The `Result` is RETURNED rather than unwrapped so a
+    /// refusal panics at the case that caused it — `Result::unwrap` is `#[track_caller]` and
+    /// would otherwise name this line for all six. Each case still asserts a hardcoded
+    /// vector, which is what catches an argument transposed at one of them.
+    fn plain_topk(
+        win: usize,
+        seqlen: usize,
+        pos: usize,
+        out: &mut Vec<i32>,
+    ) -> Result<(usize, usize)> {
+        v4_topk_idxs(
+            Sel {
+                win,
+                kind: LayerKind::Plain,
+                index_topk: 0,
+                seqlen,
+                start_pos: pos,
+            },
+            out,
+        )
+    }
+
     #[test]
     fn window_topk_prefill_is_causal_and_masks_nothing_reachable() {
         let mut v = Vec::new();
         // Prompt shorter than the window: `cols` shrinks to the prompt, and row `t` sees
         // exactly `0..=t`. A caller that assumed `win` columns would read past the row.
-        let (rows, cols) = v4_topk_idxs(
-            Sel {
-                win: 8,
-                kind: LayerKind::Plain,
-                index_topk: 0,
-                seqlen: 3,
-                start_pos: 0,
-            },
-            &mut v,
-        )
-        .unwrap();
+        let (rows, cols) = plain_topk(8, 3, 0, &mut v).unwrap();
         assert_eq!((rows, cols), (3, 3));
         assert_eq!(v, vec![0, -1, -1, 0, 1, -1, 0, 1, 2]);
 
         // Prompt past the window: the oldest position drops out of each row.
         v.clear();
-        let (rows, cols) = v4_topk_idxs(
-            Sel {
-                win: 2,
-                kind: LayerKind::Plain,
-                index_topk: 0,
-                seqlen: 4,
-                start_pos: 0,
-            },
-            &mut v,
-        )
-        .unwrap();
+        let (rows, cols) = plain_topk(2, 4, 0, &mut v).unwrap();
         assert_eq!((rows, cols), (4, 2));
         assert_eq!(v, vec![0, -1, 0, 1, 1, 2, 2, 3]);
     }
@@ -305,50 +310,20 @@ mod v4_tests {
         let mut v = Vec::new();
         // Before the wrap: slots 0..=start_pos, then masked. Ascending, NOT rotated —
         // rotating here would name slots the prefill never wrote.
-        let (rows, cols) = v4_topk_idxs(
-            Sel {
-                win: 4,
-                kind: LayerKind::Plain,
-                index_topk: 0,
-                seqlen: 1,
-                start_pos: 2,
-            },
-            &mut v,
-        )
-        .unwrap();
+        let (rows, cols) = plain_topk(4, 1, 2, &mut v).unwrap();
         assert_eq!((rows, cols), (1, 4));
         assert_eq!(v, vec![0, 1, 2, -1]);
 
         // At exactly `win - 1` the ring is full and the rotation starts; `start_pos = 3`
         // wrote slot 3, so the oldest slot is 0 and the list is already in order.
         v.clear();
-        v4_topk_idxs(
-            Sel {
-                win: 4,
-                kind: LayerKind::Plain,
-                index_topk: 0,
-                seqlen: 1,
-                start_pos: 3,
-            },
-            &mut v,
-        )
-        .unwrap();
+        plain_topk(4, 1, 3, &mut v).unwrap();
         assert_eq!(v, vec![0, 1, 2, 3]);
 
         // Past the wrap: slot `start_pos % win` holds the newest token and must come
         // LAST. At start_pos=5, win=4 the newest is slot 1, so the order is 2,3,0,1.
         v.clear();
-        v4_topk_idxs(
-            Sel {
-                win: 4,
-                kind: LayerKind::Plain,
-                index_topk: 0,
-                seqlen: 1,
-                start_pos: 5,
-            },
-            &mut v,
-        )
-        .unwrap();
+        plain_topk(4, 1, 5, &mut v).unwrap();
         assert_eq!(v, vec![2, 3, 0, 1]);
         // Every slot appears exactly once once the ring is full -- a rotation that
         // dropped or repeated one would still look ordered.

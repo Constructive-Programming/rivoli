@@ -984,18 +984,17 @@ mod tests {
     /// purpose: the reference skips top-k renormalization for it.
     #[test]
     fn scoring_func_is_resolved_or_refused() {
-        assert_eq!(
-            parse(&[("scoring_func", r#""sqrtsoftplus""#)])
-                .unwrap()
-                .scoring(),
-            crate::math::Scoring::SqrtSoftplus
-        );
-        assert_eq!(
-            parse(&[("scoring_func", r#""sigmoid""#)])
-                .unwrap()
-                .scoring(),
-            crate::math::Scoring::Sigmoid
-        );
+        // Table-driven, so the message has to name WHICH spelling failed.
+        for (raw, want) in [
+            (r#""sqrtsoftplus""#, crate::math::Scoring::SqrtSoftplus),
+            (r#""sigmoid""#, crate::math::Scoring::Sigmoid),
+        ] {
+            assert_eq!(
+                parse(&[("scoring_func", raw)]).unwrap().scoring(),
+                want,
+                "scoring_func {raw} resolved wrong"
+            );
+        }
         for bad in [r#""softmax""#, r#""gumbel""#] {
             let err = parse(&[("scoring_func", bad)]).unwrap_err().to_string();
             assert!(err.contains("scoring_func"), "unhelpful message: {err}");
