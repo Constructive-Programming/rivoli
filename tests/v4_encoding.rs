@@ -30,6 +30,10 @@ use serde_json::Value;
 mod v4_artifact_dir;
 
 /// The checkpoint's `encoding/` folder, or `None` when this machine has no checkpoint.
+///
+/// ADV-11: `tests/v4_artifact.rs` reads the same `RIVOLI_V4_SRC` but SKIPS on a missing
+/// weights index, where this FAILS on a missing `encoding/`. Not reconciled — that file is
+/// not this change's to move — so the panic names which file wanted what.
 fn encoding_dir() -> Option<String> {
     v4_artifact_dir::v4_artifact_at(
         "RIVOLI_V4_SRC",
@@ -81,11 +85,9 @@ fn case_1_thinking_with_tools() {
     // The reference's own round-trip: slice the two assistant turns back out of the prompt
     // it just built and parse them. This is what proves encode and parse are inverse — a
     // parser tested only on hand-written strings can agree with a wrong encoder.
-    let marker = "<｜Assistant｜><think>";
-    let first = prompt.find(marker).unwrap() + marker.len();
-    let first_end = prompt[first..].find("<｜User｜>").unwrap() + first;
-    let tc = parse_message_from_completion_text(&prompt[first..first_end], ThinkingMode::Thinking)
-        .unwrap();
+    let turns = assistant_turns(&prompt);
+    assert_eq!(turns.len(), 2, "{prompt:?}");
+    let tc = parse_message_from_completion_text(turns[0], ThinkingMode::Thinking).unwrap();
     assert_eq!(
         tc.reasoning_content,
         "The user wants to know the weather in Beijing. I should use the get_weather tool."
@@ -99,8 +101,7 @@ fn case_1_thinking_with_tools() {
         }]
     );
 
-    let last = prompt.rfind(marker).unwrap() + marker.len();
-    let fin = parse_message_from_completion_text(&prompt[last..], ThinkingMode::Thinking).unwrap();
+    let fin = parse_message_from_completion_text(turns[1], ThinkingMode::Thinking).unwrap();
     assert_eq!(
         fin.reasoning_content,
         "Got the weather data. Let me format a nice response."
@@ -121,10 +122,9 @@ fn case_2_thinking_without_tools() {
         ThinkingMode::Thinking,
     );
 
-    let marker = "<｜Assistant｜><think>";
-    let last = prompt.rfind(marker).unwrap() + marker.len();
+    let turns = assistant_turns(&prompt);
     let parsed =
-        parse_message_from_completion_text(&prompt[last..], ThinkingMode::Thinking).unwrap();
+        parse_message_from_completion_text(turns[turns.len() - 1], ThinkingMode::Thinking).unwrap();
     assert_eq!(
         parsed.reasoning_content,
         "The user asks about the capital of France. It is Paris."
@@ -237,21 +237,17 @@ fn differential_against_the_reference() {
     let run = std::process::Command::new("python3")
         .args([driver, &dir, in_path.to_str().unwrap()])
         .output();
-    let run = match run {
-        Ok(r) => r,
-        Err(e) => {
-            // Symmetric with `v4_artifact_at`'s rule, and for its reason: someone who
-            // pointed this at a checkpoint deliberately must not get a green run from a
-            // stderr line libtest hides. Without the var, no python3 is the ordinary case.
-            assert!(
-                std::env::var("RIVOLI_V4_SRC").is_err(),
-                "RIVOLI_V4_SRC is set but python3 will not run ({e}) — refusing to pass by \
-                 skipping"
-            );
-            eprintln!("SKIP differential_against_the_reference: cannot run python3 ({e})");
-            return;
-        }
-    };
+    // ADV-8. No skip here, deliberately. `encoding_dir()` has already resolved, so the
+    // checkpoint IS on this machine — and a green run that compared nothing is the vacuity
+    // pattern this repo keeps re-learning (libtest hides stderr on a passing test, so the
+    // `eprintln!` this used to do was invisible in an ordinary run). If the checkpoint is
+    // here, the strongest gate in the tree runs or the suite goes red.
+    let run = run.unwrap_or_else(|e| {
+        panic!(
+            "the checkpoint is present at {dir} but python3 will not run ({e}) — refusing to \
+             pass by skipping the differential. Install python3 or move the checkpoint."
+        )
+    });
     // The input file is left behind ON FAILURE on purpose: the driver's docstring tells you
     // to re-run it by hand, and that needs the corpus that failed.
     assert!(
@@ -259,20 +255,36 @@ fn differential_against_the_reference() {
         "reference driver failed: {}",
         String::from_utf8_lossy(&run.stderr)
     );
-    let want: Vec<Option<String>> = serde_json::from_slice(&run.stdout).unwrap();
+    let want: Vec<Value> = serde_json::from_slice(&run.stdout).unwrap();
     std::fs::remove_file(&in_path).ok();
 
     assert_eq!(want.len(), cases.len());
     // A corpus the reference refuses would "agree" on every refusal and compare nothing.
     // It refuses NONE of these today, so this is exact rather than a slack bound: a case the
     // reference starts refusing is visible the day it happens instead of being absorbed.
-    let encoded = want.iter().filter(|w| w.is_some()).count();
+    let encoded = want.iter().filter(|w| w["encoded"].is_string()).count();
     assert_eq!(
         encoded,
         cases.len(),
         "the reference refused {} cases — the corpus is garbage, not coverage",
         cases.len() - encoded
     );
+    // BOUNDED: `assistant_turns` matches `<｜Assistant｜><think>`, which only the thinking
+    // framing emits — so chat-mode cases and every `drop_thinking`-stripped turn contribute
+    // nothing, and `parse_message_from_completion_text(_, Chat)` has no differential coverage
+    // at all. The hermetic unit tests own that arm. Consistent on both sides, so a bounded
+    // claim rather than a gap.
+    //
+    // Both directions are counted so neither can go quiet: the corpus currently encodes
+    // 607/607 and yields 282 assistant turns, of which 75 PARSE on both sides and 207 are
+    // refused by both (a trailing generation prompt and a `wo_eos` turn are unparseable by
+    // design). A change that dropped the parsed count to zero would still "agree" everywhere.
+    // Exact, and measured: the corpus is fixed-seed. 607 cases yield 282 assistant turns, of
+    // which these parse on both sides and the rest are refused by both — a trailing generation
+    // prompt and a `wo_eos` turn are unparseable by design, so agreeing on a refusal is the
+    // common outcome and cannot be the only one.
+    const PARSED_TURNS: usize = 75;
+    let mut parsed_both = 0;
     for (case, want) in cases.iter().zip(&want) {
         let opts = EncodeOpts {
             thinking: match case["thinking"].as_str().unwrap() {
@@ -289,12 +301,74 @@ fn differential_against_the_reference() {
         };
         let got = messages_from_openai(case["messages"].as_array().unwrap())
             .and_then(|m| encode_messages(m, &opts));
-        match (want, got) {
-            (Some(want), Ok(got)) => assert_eq!(&got, want, "diverged on {case}"),
-            (None, Err(_)) => {}
+        let prompt = match (want["encoded"].as_str(), got) {
+            (Some(want), Ok(got)) => {
+                assert_eq!(&got, want, "diverged on {case}");
+                got
+            }
+            (None, Err(_)) => continue,
             (want, got) => panic!("reference {want:?} vs port {got:?} on {case}"),
+        };
+
+        // ADV-9: the same corpus, back through the PARSER. The reference sliced the assistant
+        // turns out of the string it had just built and parsed each one; slice identically and
+        // compare, so a parser that agrees with a WRONG encoder still fails.
+        // The SPANS, not just their count. Both sides refuse 207 of 282 turns, and inside that
+        // majority `null == Err` no matter what was sliced — so comparing counts alone let a
+        // boundary divergence between the two `assistant_turns` hide completely. This turns
+        // "kept in sync by comment" into a checked assertion.
+        let turns = assistant_turns(&prompt);
+        assert_eq!(
+            serde_json::to_value(&turns).unwrap(),
+            want["turns"],
+            "the two assistant_turns disagree on {case}"
+        );
+        let want_parses = want["parses"].as_array().unwrap();
+        for (turn, want) in turns.iter().zip(want_parses) {
+            let got = parse_message_from_completion_text(turn, ThinkingMode::Thinking);
+            match (want, got) {
+                (Value::Null, Err(_)) => {}
+                (want, Ok(got)) if !want.is_null() => {
+                    // Compared as one value rather than field by field: a field added to
+                    // `ParsedMessage` later is then diffed for free instead of silently
+                    // skipped by three hand-written asserts.
+                    let calls: Vec<Vec<String>> = got
+                        .tool_calls
+                        .iter()
+                        .map(|t| vec![t.name.clone(), t.arguments.clone()])
+                        .collect();
+                    let got = serde_json::json!({
+                        "content": got.content, "reasoning": got.reasoning_content,
+                        "calls": calls,
+                    });
+                    assert_eq!(&got, want, "parse diverged on {turn:?}");
+                    parsed_both += 1;
+                }
+                (want, got) => panic!("parse: reference {want:?} vs port {got:?} on {turn:?}"),
+            }
         }
     }
+    assert_eq!(
+        parsed_both, PARSED_TURNS,
+        "the parse half of this differential compared {parsed_both} turns, not {PARSED_TURNS} \
+         — a fixed-seed corpus should not drift, and a slack bound here would hide a 50% \
+         regression the way the encode gate above refuses to"
+    );
+}
+
+/// Every completion-shaped span of `prompt`: after a thinking-mode assistant prefix, up to
+/// the next user turn or the end.
+///
+/// One expression so that `assistant_turns` in `tests/dsv4_reference_driver.py` — which must
+/// slice identically, or a mismatch is the slicing's fault and not the parser's — is
+/// checkable against it at a glance rather than by reading two loops.
+fn assistant_turns(prompt: &str) -> Vec<&str> {
+    const MARKER: &str = "<｜Assistant｜><think>";
+    prompt
+        .split(MARKER)
+        .skip(1)
+        .map(|turn| turn.split("<｜User｜>").next().unwrap_or(turn))
+        .collect()
 }
 
 /// A handful of hand-built adversarial conversations, then 600 from a fixed seed.

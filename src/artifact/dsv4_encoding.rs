@@ -78,15 +78,24 @@
 //!   on a role that cannot render them (`system`, `latest_reminder`) is a `KeyError` there,
 //!   because `tool_calls_from_openai_format` runs before the role dispatch, and is accepted
 //!   here because only the assistant arm parses the key. No well-formed request reaches it.
-//! - **It also refuses a list of things the reference RENDERS.** Each is an input no real
-//!   client sends, and each is a shape whose rendering is not worth guessing at because the
-//!   reference reaches it through Python's `str()`/`repr()` rather than through JSON.
-//!   Enumerated because "it refuses more" is not a property anyone should have to rediscover:
+//! - **OpenAI's array-of-parts `content` is ACCEPTED**, flattened through the reference's own
+//!   `content_blocks` rule. It is standard in their schema and clients send it constantly.
+//!   Precisely: on a `user` turn the reference raises TypeError, so there are no bytes and
+//!   this fills a hole; on `system`/`developer`/`assistant` it emits a deterministic Python
+//!   list repr and this **deliberately contradicts it**, because a list repr is not a
+//!   sequence the model was trained on. The empty array agrees with the reference on those
+//!   roles (`content or ""`). It is the one shape whose bytes the differential structurally
+//!   cannot pin — see `text_content`.
+//! - **It also refuses a list of things the reference RENDERS.** Each is a shape whose
+//!   rendering is not worth guessing at, because the reference reaches it through Python's
+//!   `str()`/`repr()` rather than through JSON — and, with array-of-parts now accepted, none
+//!   of them is a shape a conforming OpenAI client emits. Enumerated because "it refuses
+//!   more" is not a property anyone should have to rediscover:
 //!
 //!   | input | the reference renders | here |
 //!   |---|---|---|
-//!   | `content` non-string on `system`/`assistant` | `str()` of it (`5`, a list repr) | refused |
-//!   | `content` falsy non-string (`[]`, `0`, `false`) on those | `""`, via `content or ""` | refused |
+//!   | `content` a non-string, non-array scalar anywhere | `str()` of it | refused |
+//!   | `content` falsy non-string, non-array (`0`, `false`) | `""`, via `content or ""` | refused |
 //!   | `content` non-string on `latest_reminder` | `str()`/repr — no `or ""` guard at all | refused |
 //!   | `content` a scalar or object on a `tool` turn | `str()`: `true`→`True`, `{}`→`{}` | refused |
 //!   | a content block's `type` non-string | `[Unsupported {'a': 1}]`, Python's repr | refused |
@@ -475,18 +484,19 @@ impl ToolCall {
     }
 }
 
-/// One entry of a `tool` message's block list, rendered.
+/// One entry of a **`tool` message's** content list — the reference's INNER walker, the
+/// `isinstance(tool_content, list)` loop nested inside its `tool_result` arm.
 ///
-/// Five arms, and each one is a measurement rather than a reading of the README — the
-/// reference walks these blocks by hand (`encoding_dsv4.py`'s `isinstance(tool_content,
-/// list)` branch) instead of formatting them, so every shape has its own observable
-/// behaviour. Measured 2026-08-06.
+/// Four arms, each a measurement rather than a reading of the README: the reference walks
+/// these by hand instead of formatting them, so every shape has its own observable
+/// behaviour. Measured 2026-08-06. The OUTER walker is [`content_block_text`], which has one
+/// arm more; they are separate functions there and separate here.
 fn tool_block_text(b: &Value) -> Result<String> {
     // A block that is not an OBJECT is `AttributeError: 'str' object has no attribute 'get'`
     // there — it is not an unsupported block, it is not a block.
     let b = b
         .as_object()
-        .ok_or_else(|| anyhow::anyhow!("a `tool` content block must be an object, got {b}"))?;
+        .ok_or_else(|| anyhow::anyhow!("a content block must be an object, got {b}"))?;
     match b.get("type") {
         Some(Value::String(ty)) if ty == "text" => Ok(match b.get("text") {
             // `.get("text", "")` — absent is `""` on both sides.
@@ -496,8 +506,8 @@ fn tool_block_text(b: &Value) -> Result<String> {
             // there, where `unwrap_or_default()` quietly emptied the block here. This is the
             // shape a client sends when a tool returned nothing. Review finding, 2026-08-06.
             Some(other) => bail!(
-                "a `tool` text block's `text` must be a string, got {other}; the reference \
-                 raises TypeError on this"
+                "a text block's `text` must be a string, got {other}; the reference raises \
+                 TypeError on this"
             ),
         }),
         // A non-text block is NAMED, not dropped — the reference's own placeholder, because
@@ -511,17 +521,53 @@ fn tool_block_text(b: &Value) -> Result<String> {
         // all. Refused rather than guessed at. A binding rather than four spelled-out arms:
         // `Value` is `serde_json`'s, not ours.
         Some(ty) => bail!(
-            "a `tool` content block's `type` must be a string, got {ty}; the reference \
-             interpolates Python's repr of it"
+            "a content block's `type` must be a string, got {ty}; the reference interpolates \
+             Python's repr of it"
         ),
     }
+}
+
+/// One entry of a `user`/`system`/`assistant` **array-form `content`** — the reference's
+/// OUTER walker, `render_message`'s `content_blocks` branch.
+///
+/// Differs from the inner walker by exactly one arm, so it delegates for the rest: a
+/// `tool_result` block keeps its PAYLOAD, `<tool_result>…</tool_result>`, where the inner
+/// walker would only name the type and drop the content. Getting that wrong was the shape of
+/// a review finding on 2026-08-06 — the comment cited this branch as the rule and the code
+/// ran the other one.
+fn content_block_text(b: &Value) -> Result<String> {
+    let is_tool_result = b.get("type").and_then(Value::as_str) == Some("tool_result");
+    if !is_tool_result {
+        return tool_block_text(b);
+    }
+    Ok(format!(
+        "<tool_result>{}</tool_result>",
+        tool_content_text(b.get("content"))?
+    ))
+}
+
+/// `\n\n`-join a block list through `walk`. One function because both walkers are folded
+/// identically and the two four-line copies were a jscpd tripwire waiting on one more line.
+fn join_blocks(blocks: &[Value], walk: fn(&Value) -> Result<String>) -> Result<String> {
+    Ok(blocks
+        .iter()
+        .map(walk)
+        .collect::<Result<Vec<_>>>()?
+        .join("\n\n"))
 }
 
 /// A `tool` message's `content`, rendered. A plain string passes through; the block list
 /// some clients send is `\n\n`-joined here, at the boundary, because nothing downstream ever
 /// looks at the structure.
 fn tool_content(msg: &Value) -> Result<String> {
-    Ok(match msg.get("content") {
+    tool_content_text(msg.get("content"))
+}
+
+/// The same, from the raw field — which is where a `tool_result` block inside an array-form
+/// `content` carries it, rather than on a message. Takes `Option` because absent and null
+/// differ here and nowhere else.
+fn tool_content_text(content: Option<&Value>) -> Result<String> {
+    Ok(match content {
         // Absent and NULL differ here, measured 2026-08-06: `msg.get("content", "")` yields
         // `""` when the key is missing and `None` when it is present-and-null, and only the
         // second reaches the template — as the word `None`. Same `str()` that makes a bare
@@ -535,11 +581,7 @@ fn tool_content(msg: &Value) -> Result<String> {
         // this comment had already inverted once when the walker moved above.)
         Some(Value::Null) => "None".to_string(),
         Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(blocks)) => blocks
-            .iter()
-            .map(tool_block_text)
-            .collect::<Result<Vec<_>>>()?
-            .join("\n\n"),
+        Some(Value::Array(blocks)) => join_blocks(blocks, tool_block_text)?,
         // The reference formats a scalar straight into its string template, so `5` becomes
         // `<tool_result>5</tool_result>` — but `true` becomes `True` and `null` becomes
         // `None`, because that is Python's `str()` and not JSON. Refused rather than either
@@ -552,25 +594,41 @@ fn tool_content(msg: &Value) -> Result<String> {
     })
 }
 
-/// Read the `content` of a turn whose content is plain text. Absent or null becomes `""` —
-/// the reference's `content or ""`.
+/// The `content` of a `system`, `developer`, `user` or `assistant` turn: a string, or
+/// OpenAI's array of content parts. Absent or null becomes `""` — the reference's
+/// `content or ""`, which `developer` then rejects via its own non-empty assert.
 ///
-/// **A present-but-non-string `content` is an ERROR, and this is the most important refusal
-/// in the file.** `{"role": "user", "content": [{"type": "text", "text": "hi"}]}` is the
-/// standard OpenAI multimodal shape and clients emit it routinely. The reference raises
-/// `TypeError` on it for a user turn (`prompt += content`) and renders Python's *list repr*
-/// into the prompt for a system or assistant turn (`"{content}".format(...)`) — neither is a
-/// prompt. Defaulting to `""` instead, which is what `as_str().unwrap_or_default()` does,
-/// would silently drop the user's entire question and leave `<｜User｜><｜Assistant｜><think>`.
-/// Found in review 2026-08-05.
+/// A string, or OpenAI's array of content parts (see the arm below). Anything else is an
+/// ERROR rather than a silent `""` — `as_str().unwrap_or_default()` would drop the user's
+/// entire question and leave `<｜User｜><｜Assistant｜><think>`, a prompt that looks perfectly
+/// well formed. Found in review 2026-08-05.
 fn text_content(msg: &Value) -> Result<String> {
     match msg.get("content") {
         None | Some(Value::Null) => Ok(String::new()),
         Some(Value::String(s)) => Ok(s.clone()),
+        // OpenAI's ARRAY-OF-PARTS content, which is standard in their schema and which real
+        // clients send constantly. Accepted, and walked by `content_block_text`.
+        //
+        // A DELIBERATE divergence, and the only one here that makes this port accept
+        // something the reference does not encode identically. The reference has no coherent
+        // handling of this shape: on a `user` turn it raises TypeError (so there are no
+        // reference bytes to be faithful TO — this fills a hole rather than contradicting
+        // one), and on `system`/`developer`/`assistant` it formats Python's list repr,
+        // `[{'type': 'text', 'text': 'hi'}]`, single quotes and all, which cannot be a
+        // sequence the model was trained on.
+        //
+        // The rule followed is `render_message`'s `content_blocks` branch. That branch is
+        // NOT dead — `merge_tool_messages` attaches `content_blocks` to every user message,
+        // so it is the live rendering path for every user turn in every conversation, which
+        // is what `message_from_openai`'s `user` arm below already says. What is unreachable
+        // is a CLIENT-supplied `content_blocks` key, because the merge rebuilds the dict and
+        // discards it. So this is the reference's own live rule for a list of parts, reached
+        // by a spelling it happens to reject. Measured 2026-08-06.
+        Some(Value::Array(blocks)) => Ok(join_blocks(blocks, content_block_text)?),
         Some(other) => bail!(
-            "`content` must be a string, got {other}. The reference's templates are string \
-             templates: a block list raises TypeError on a user turn there and renders a \
-             Python list repr on a system or assistant turn. Flatten it before encoding."
+            "`content` must be a string or an array of content parts, got {other}. The \
+             reference's templates are string templates and would format Python's `str()` of \
+             this into the prompt."
         ),
     }
 }
@@ -2032,16 +2090,13 @@ mod tests {
             "no `function`",
         );
 
-        // The one that matters most: OpenAI's multimodal `content` array. The reference
-        // raises TypeError on a user turn and renders a Python list repr on a system turn;
-        // defaulting to "" would drop the user's whole question and still leave a prompt
-        // that looks perfectly well formed.
+        // A scalar `content` is refused: defaulting to "" would drop the user's whole
+        // question and still leave a prompt that looks perfectly well formed. The ARRAY form
+        // is ACCEPTED — see `openai_array_form_content_is_flattened`.
         refuses(
-            &json!({"role": "user", "content": [{"type": "text", "text": "hi"}]}),
+            &json!({"role": "user", "content": 5}),
             "`content` must be a string",
         );
-        // …but a TOOL turn's content IS allowed to be a list: the reference walks that one.
-        assert!(message_from_openai(&json!({"role": "tool", "tool_call_id": "c", "content": [{"type": "text", "text": "hi"}]})).is_ok());
 
         refuses(
             &json!({"role": "system", "content": "S", "tools": "f"}),
@@ -2159,6 +2214,59 @@ mod tests {
         refuses(&missing, "no `function.arguments`");
     }
 
+    /// OpenAI's array-of-parts `content`, which real clients send constantly.
+    ///
+    /// **The one shape whose bytes the differential structurally cannot pin** — a seed
+    /// carrying them would turn it red, correctly, because on `user` the reference raises and
+    /// on `system`/`assistant` it emits a Python list repr this deliberately contradicts.
+    /// `text_content` carries the argument; these are the only tests guarding those bytes.
+    #[test]
+    fn openai_array_form_content_is_flattened() {
+        let chat = EncodeOpts::new(ThinkingMode::Chat);
+        let parts = json!([{"type": "text", "text": "hi"}, {"type": "text", "text": "there"}]);
+        assert_eq!(
+            ok(&json!([{"role": "user", "content": parts}]), &chat),
+            "<｜begin▁of▁sentence｜><｜User｜>hi\n\nthere<｜Assistant｜></think>"
+        );
+        // A single part is the overwhelmingly common form and must be indistinguishable from
+        // the plain string — a client that switches spelling must not switch prompts.
+        let one = json!([{"role": "user", "content": [{"type": "text", "text": "hi"}]}]);
+        assert_eq!(
+            ok(&one, &chat),
+            ok(&json!([{"role": "user", "content": "hi"}]), &chat)
+        );
+        // A `tool_result` part keeps its PAYLOAD — this is the arm that separates the outer
+        // walker from the inner one, and routing it through the inner one silently deleted a
+        // tool's entire output while leaving a well-formed-looking prompt. Byte-verified
+        // against the reference's `content_blocks` branch, nested list included, 2026-08-06.
+        let tr = json!([{"role": "user", "content": [
+            {"type": "text", "text": "q"},
+            {"type": "tool_result", "content": "x"},
+            {"type": "tool_result", "content": [{"type": "text", "text": "r"}, {"type": "img"}]},
+            {"type": "image_url"}]}]);
+        assert_eq!(
+            ok(&tr, &chat),
+            "<｜begin▁of▁sentence｜><｜User｜>q\n\n<tool_result>x</tool_result>\n\n<tool_result>r\n\n[Unsupported img]</tool_result>\n\n[Unsupported image_url]<｜Assistant｜></think>"
+        );
+        // An image part is NAMED, not dropped: the model should see something was there.
+        let img = json!([{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": "http://x"}}]}]);
+        assert!(ok(&img, &chat).contains("what is this\n\n[Unsupported image_url]"));
+        // The same on `system`, where the reference emits a Python list repr instead.
+        let sys = json!([{"role": "system", "content": [{"type": "text", "text": "S"}]},
+                         {"role": "user", "content": "U"}]);
+        assert_eq!(
+            ok(&sys, &chat),
+            "<｜begin▁of▁sentence｜>S<｜User｜>U<｜Assistant｜></think>"
+        );
+        // An empty array is an empty turn, not an error.
+        assert_eq!(
+            ok(&json!([{"role": "user", "content": []}]), &chat),
+            "<｜begin▁of▁sentence｜><｜User｜><｜Assistant｜></think>"
+        );
+    }
+
     /// Every row of the over-refusal table in this module's header, executed — except the
     /// `id` half of the ids row, which `non_string_fields_are_refused_not_ignored` owns.
     ///
@@ -2171,21 +2279,27 @@ mod tests {
     fn the_over_refusal_table_is_real() {
         let a_tool = json!([{"type": "function", "function": {"name": "f"}}]);
         for (msg, needle) in [
-            // `content` non-string, and the falsy family the reference maps to "".
+            // `content` a non-array scalar, and the falsy family the reference maps to "".
+            // (An ARRAY is accepted — `openai_array_form_content_is_flattened` — but one
+            // whose entries are not objects still fails, inside the block walker.)
             (
                 json!({"role": "system", "content": 5}),
                 "`content` must be a string",
             ),
             (
                 json!({"role": "assistant", "content": [1, 2]}),
-                "`content` must be a string",
+                "content block must be an object",
             ),
             (
-                json!({"role": "system", "content": []}),
+                json!({"role": "system", "content": true}),
                 "`content` must be a string",
             ),
             (
                 json!({"role": "assistant", "content": 0}),
+                "`content` must be a string",
+            ),
+            (
+                json!({"role": "user", "content": false}),
                 "`content` must be a string",
             ),
             // `latest_reminder`, the role with no `or ""` guard anywhere.

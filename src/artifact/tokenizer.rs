@@ -328,9 +328,8 @@ impl Tokenizer {
     /// `tests/v4_encoding.rs::special_tokens_survive_the_tokenizer` is the gate on the claim
     /// and carries the argument.
     ///
-    /// Two lines and, as of this commit, **no caller**: `main.rs`'s V4 branch still encodes
-    /// its `-bench` prompt raw. It is here so that wiring is one call rather than two, and
-    /// so the tokenizing half has a named home to hang that gate off.
+    /// Called by `main.rs`'s V4 `-bench` branch, which encoded its prompt RAW until
+    /// 2026-08-06 — see the argument at that call site for what that cost.
     pub fn encode_dsv4(&self, messages: Vec<Message>, opts: &EncodeOpts) -> Result<Vec<u32>> {
         self.encode(&dsv4_encoding::encode_messages(messages, opts)?)
     }
