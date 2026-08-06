@@ -710,7 +710,7 @@ module root (`src/<group>.rs`) over a directory, so the tree mirrors the section
   `kernels/vk/*.comp` → SPIR-V via the `build.rs` vulkan arm (the second backend).
 - `src/bin/` — `convert`, `convert_v4`, `fp8_to_i4`, `add_indexer`, `ppl`, `replay`,
   `v4-oracle`. (There is no `pack_i4`, no longer a `vq3_to_i4`, and no longer an `i4_audit`
-  — retired 2026-08-05, preserved at tag `i4-audit-retired`, with the why and the restore
+  — retired 2026-08-05, preserved at tag `archive/i4-audit`, with the why and the restore
   recipe in `investigations/int4-scales.md` §8; docs that reference any of the three are
   stale. `convert_v4` and `v4-oracle` are absent from `release.yml`'s packaging list, which
   is hand-maintained.)

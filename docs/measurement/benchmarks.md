@@ -318,7 +318,7 @@ Until then, `--mode int4` and `--mode hybrid` quality numbers are bounded above 
 > int3-vq's 5.28, and a branch-gain sweep falsified the attenuation hypothesis outright.
 
 > **2026-08-05: `bin/i4_audit`, the instrument behind this section and the next, is retired**
-> — tag `i4-audit-retired`, restore per `investigations/int4-scales.md` §8. Its name is left
+> — tag `archive/i4-audit`, restore per `investigations/int4-scales.md` §8. Its name is left
 > in place below because naming the instrument that produced a number is the point of
 > recording it; only its availability changed. Its `VQ_GAIN` arm went earlier, 2026-08-01, so
 > it is not in the tag either.

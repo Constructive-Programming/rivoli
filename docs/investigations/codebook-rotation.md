@@ -174,7 +174,7 @@ different checkpoint, or a fine-tune that pushes layers apart. The measurement i
   > because it remains a valid *comparative* reference if the NFS mount is unavailable.
 
   > **AMENDED 2026-08-05: `i4_audit` was retired too** — same reason as `vq_study.rs` (this
-  > file's header note), tag `i4-audit-retired`, restore per `investigations/int4-scales.md`
+  > file's header note), tag `archive/i4-audit`, restore per `investigations/int4-scales.md`
   > §8. The correction above still stands; only the instrument changed.
 
   **The constraint is bandwidth, not availability: 62 MB/s over NFS** (measured, 512 MB cold

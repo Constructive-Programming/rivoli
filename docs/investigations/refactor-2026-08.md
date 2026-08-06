@@ -272,9 +272,10 @@ A straight deletion, not a refactor. Both citations are **closed** investigation
 *"2026-08-01: `i4_audit` no longer re-derives them"* — the capability those docs describe was
 removed from the tool before this. The investigations keep the record.
 
-**Preserved at tag `i4-audit-retired`** (annotated, with the restore command in the tag
-message). Restore with `git checkout i4-audit-retired -- src/bin/i4_audit.rs` if an int4
-quantization question reopens; do not rewrite it.
+**Preserved at tag `archive/i4-audit`** (annotated, pushed). If an int4 quantization question
+reopens, restore rather than rewrite — recipe and its two traps in `int4-scales.md` §8, which
+is the single source of truth for it. (A bare `git checkout … -- src/bin/i4_audit.rs` is
+**not** it, and stops working once Track K lands.)
 
 **Gate:** nothing references it after removal — `grep` `docs/`, `tests/`, `*.sh`, `Cargo.toml`
 — and `architecture.md:711`'s `src/bin/` inventory is updated in the same commit.
@@ -292,8 +293,9 @@ quantization question reopens; do not rewrite it.
 >    **no BUILD reference, and every surviving prose mention sits in a dated note naming the
 >    tag.** Use that wording for Tracks G and K.
 >
-> Open: the tag is **never pushed** (`git ls-remote --tags origin` has only the three
-> `archive/*`) and breaks the `archive/` convention — decide before merge, `int4-scales.md` §8.
+> Also deleted: `quant::vq_decode_proj`, whose only caller this was. **Cut a deletion's
+> orphans in the same commit** — it was briefly kept for a bit-identity with `matvec_vq` that
+> no test checked, which is the failure mode the track existed to remove.
 
 ## Track I — the shared layer-loop skeleton · ~600 · after Track 0
 

@@ -197,7 +197,7 @@ through some of the same code, so it is a reconstruction and is labelled as one.
 > live arms are unchanged: `--scan`, `--verify`, `--xcheck`, `--scale-study`.
 
 > **2026-08-05: `i4_audit` is gone entirely**, four live arms and all — tag
-> `i4-audit-retired`, restore recipe and traps in §8. Every number in this document stands as
+> `archive/i4-audit`, restore recipe and traps in §8. Every number in this document stands as
 > recorded; the tool is how you would *re-derive* one, not where any of them lives.
 
 | | rel-L2 (whole row) | bulk (\|w\| ≤ p99) | tail | gain |
@@ -343,12 +343,12 @@ tool was retired 2026-08-05; re-running this gate needs it back, §8.)*
   `--xcheck` (`.i4` ↔ `.vq3`, the one that can fail), `--scale-study` (α sweep, weight and
   output space), plus dead-row and bulk/tail statistics.
 
-  > **RETIRED 2026-08-05**, tag `i4-audit-retired`, commit `4c81c89`. The live reason to
+  > **RETIRED 2026-08-05**, tag `archive/i4-audit`, commit `4c81c89`. The live reason to
   > restore it is §10's: `--scale-study` is what scores a candidate `I4_GROUP` against f64
   > fp8 truth, and §10's table came out of it.
   >
   > ```
-  > git worktree add /tmp/i4a i4-audit-retired && cd /tmp/i4a   # NOT a bare checkout — see below
+  > git worktree add /tmp/i4a archive/i4-audit && cd /tmp/i4a   # NOT a bare checkout — see below
   > cargo run --bin i4_audit -- \                               # no --features: CPU-only
   >     /var/db/rivoli/glm52-vq3-full /swarm/storage/ai/openclaw/glm52-fp8 \
   >     --scale-study --layer 3 --experts 7
@@ -361,12 +361,7 @@ tool was retired 2026-08-05; re-running this gate needs it back, §8.)*
   > fifteen unresolved imports — and 698 lines re-entering a factored tree can trip the jscpd
   > gate, which has no threshold.
   >
-  > **⚠ The tag is LOCAL-ONLY as of 2026-08-05.** `git ls-remote --tags origin` has only the
-  > three `archive/*` tags, and `4c81c89` is not reachable from `origin/main` — so every
-  > restore command here is a dangling ref on any other clone until someone runs
-  > `git push origin i4-audit-retired` (and it should arguably be re-cut as `archive/i4-audit`
-  > to match the other three). Once the deletion branch lands the *content* survives in
-  > history regardless, via `git show 4c81c89:src/bin/i4_audit.rs`.
+  > `quant::vq_decode_proj` went with it, as its only caller, and comes back the same way.
 - `tests/artifact.rs::i4_bytes_are_what_the_checkpoint_quantizes_to` — exact, CPU-only,
   provenance-gated on `i4_source`. (Still gated: a TEST may reasonably demand the label,
   since it is asserting what the bytes were derived *from*, which length cannot show. The

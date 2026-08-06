@@ -1102,7 +1102,7 @@ fn moe_i4_real_data_matches_cpu() {
 /// draws, which is exactly why quoting a same-distribution-but-different-seed anchor
 /// (as an earlier revision did) is not good enough.
 ///
-/// Retired 2026-08-05, tag `i4-audit-retired`; restore per `docs/investigations/int4-scales.md`
+/// Retired 2026-08-05, tag `archive/i4-audit`; restore per `docs/investigations/int4-scales.md`
 /// §8, then:
 ///
 ///     cargo run --bin i4_audit -- /var/db/rivoli/glm52-vq3-full \
