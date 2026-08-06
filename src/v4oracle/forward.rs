@@ -752,7 +752,13 @@ impl Oracle {
 
     /// The QK-norm: `q *= rsqrt(q.square().mean(-1) + eps)` over `head_dim`, applied after
     /// the unflatten to (heads, head_dim), with **no learnable weight** (model.py:504).
-    fn qk_norm(&self, q: &mut [f32], head_dim: usize, q_norm_w: &[f32]) {
+    ///
+    /// `pub` since 2026-08-06 so `tests/v4_head_tail.rs` can score
+    /// `kernels/mla.hip::v4_qk_norm` against it. The alternative was a host transliteration
+    /// of the seven lines below, which `build.rs`'s duplication gate would have rejected —
+    /// and rightly, because a reference carrying the same bf16 placement as the thing it
+    /// scores is wrong in the same places.
+    pub fn qk_norm(&self, q: &mut [f32], head_dim: usize, q_norm_w: &[f32]) {
         if self.defect == Defect::SkipQkNorm {
             return;
         }

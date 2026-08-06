@@ -1,16 +1,21 @@
-//! The backend-neutral half of the kernel-oracle scaffolding, shared by `tests/vk.rs`,
-//! `tests/kernel.rs`, `tests/docs.rs` and `tests/invariants.rs`.
+//! The kernel-oracle scaffolding, shared across the test binaries in `tests/`.
 //!
 //! It was copy-pasted per file until 2026-07-30, and the copies had already started to
 //! drift: two spellings of the same `Lcg` bug note, two `assert_close` bodies with the
 //! same tolerance, and `f16b`/`u16b` present in one file and re-derived in the other.
-//! Anything that touches a device TYPE stays in the test file that owns it — `dev` is
-//! `DeviceBuf` under HIP and `Buf` under Vulkan, and that difference is the point of
-//! having two files.
 //!
-//! `dead_code` is allowed because this module is compiled into EACH test binary, and
-//! neither uses every helper. The alternative is per-consumer cfg gates on a test
-//! utility, which is more machinery than the warning is worth.
+//! > **CORRECTED 2026-08-06.** This was "the backend-NEUTRAL half", and the rule was that a
+//! > helper touching a device TYPE stayed in the test file owning it, because that type was
+//! > `DeviceBuf` under HIP and `Buf` under Vulkan. There is one backend, so the rule's whole
+//! > argument named a file that no longer exists and it is deleted rather than reworded.
+//! > `dev`/`zeros`/`back`/`ok` are here now. **Five older oracle files still spell their own
+//! > uploader** (`v4_kernel`, `v4_attn`, `v4_head_tail`, `v4_compress_kernel`,
+//! > `v4_indexer_kernel`) and survive the duplication gate only because their `.expect`
+//! > strings differ — that is a half-migration, not a design.
+//!
+//! `dead_code` is allowed because this module is compiled into EACH test binary, and none
+//! of them uses every helper. The alternative is per-consumer cfg gates on a test utility,
+//! which is more machinery than the warning is worth.
 #![allow(dead_code)]
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
@@ -112,6 +117,165 @@ pub fn f32v(b: &[u8]) -> Vec<f32> {
     rivoli::artifact::quant::read_f32(b)
 }
 
+/// Little-endian bytes → fixed-width words, `f` being the `from_le_bytes` that decodes one.
+///
+/// ONE body for both widths, and it is load-bearing rather than tidy. `chunks_exact(N)
+/// .map(from_le_bytes)` is already spelled in `quant.rs::read_f32` and in `bin/convert.rs`'s
+/// VQ encoder; writing [`u16v`] and [`u32v`] out as two more bodies takes the tree from
+/// **0 clones to 2** under `build.rs`'s gate. Measured both ways on 2026-08-06, because a
+/// reviewer proposed exactly that simplification.
+///
+/// What makes it worth a comment is where jscpd points: the two clones it reports are
+/// `quant.rs`<->`v4oracle/weights.rs` and `quant.rs`<->`bin/convert.rs` — **neither names
+/// this file.** The copies here are the members that tip an existing pair over the
+/// threshold, so the gate sends you to `src/` for a duplicate you introduced in `tests/`.
+fn le_words<const N: usize, T>(b: &[u8], f: impl Fn([u8; N]) -> T) -> Vec<T> {
+    b.chunks_exact(N)
+        .map(|c| f(c.try_into().expect("chunks_exact yields exactly N")))
+        .collect()
+}
+
+/// Little-endian bytes → u16 vec — bf16 key caches, fp16 codebooks, VQ indices.
+pub fn u16v(b: &[u8]) -> Vec<u16> {
+    le_words(b, u16::from_le_bytes)
+}
+
+/// Little-endian bytes → u32 vec — the non-finite flag and `index_topk`'s row set.
+pub fn u32v(b: &[u8]) -> Vec<u32> {
+    le_words(b, u32::from_le_bytes)
+}
+
+// ---------------------------------------------------------------------------------------
+// Device scaffolding. See the CORRECTED note in this module's header for why it is no
+// longer kept out of here.
+// ---------------------------------------------------------------------------------------
+
+/// Upload `b` to a fresh device buffer.
+///
+/// `max(1)` because a zero-length allocation is not a thing this allocator does — the
+/// sentence is `tests/v4_kernel.rs`'s, and four of the five per-file uploaders this one
+/// supersedes carry the guard. The copy promoted here (from `tests/kernel.rs`) was the one
+/// that did NOT, which would have made the shared helper strictly weaker than the copies it
+/// replaces. Reachable through `zeros(0)` or an empty fixture, not by anything today.
+#[cfg(feature = "rocm")]
+pub fn dev(b: &[u8]) -> rivoli::memory::device::DeviceBuf {
+    let mut d = rivoli::memory::device::DeviceBuf::new(b.len().max(1)).expect("alloc");
+    d.copy_in_at(0, b).expect("fill");
+    d
+}
+
+/// A zeroed device buffer of `n` bytes — a kernel destination.
+///
+/// ZEROED rather than uninitialised, and load-bearing for the oracles that compare a
+/// destination the kernel only PARTLY writes — `append_kv` fills one row of a five-row slab,
+/// `index_pool_push` one block of a three-block pool. The untouched remainder is asserted
+/// too, so a wrote-the-wrong-row defect shows up as a mismatch against zero rather than as
+/// noise.
+#[cfg(feature = "rocm")]
+pub fn zeros(n: usize) -> rivoli::memory::device::DeviceBuf {
+    dev(&vec![0u8; n])
+}
+
+/// A launch that must succeed, with the launcher named.
+///
+/// Every oracle here passes dims the kernel's own guards accept, so an `Err` is a guard that
+/// MOVED, not a case to handle.
+///
+/// It exists for `fwd_kernel.rs` and `indexer_kernel.rs` specifically, which is why the
+/// older oracle files still use `.expect` under their own blanket allow. Those two gained
+/// the same allow with the same three-line preamble and `build.rs`'s duplication gate
+/// rejected it — a clone produced by suppressing a lint instead of removing its cause. This
+/// removes the cause, and `expect_used = "deny"` stays live in both files.
+///
+/// `{e:#}` so an `anyhow` chain prints its causes; a launcher's guard code is in the
+/// innermost one and `{e}` would drop it.
+#[cfg(feature = "rocm")]
+pub fn ok<T>(r: anyhow::Result<T>, what: &str) -> T {
+    r.unwrap_or_else(|e| panic!("{what} refused the launch: {e:#}"))
+}
+
+/// Join the device, then read a buffer back. The join is HERE rather than at each call
+/// site because forgetting it reads the destination before the kernel has written it,
+/// which fails as a wrong ANSWER rather than as a missing sync — the most expensive
+/// possible spelling of the mistake.
+#[cfg(feature = "rocm")]
+pub fn back(d: &rivoli::memory::device::DeviceBuf) -> Vec<u8> {
+    rivoli::backend::hip::device_sync().expect("device_sync");
+    d.copy_out().expect("copy_out")
+}
+
+/// Assert two slices are BIT-IDENTICAL, reporting the first disagreement and how many
+/// there are.
+///
+/// For the kernels with **one thread per output element and no reduction**, where exact
+/// agreement with a host transliteration is a property of the arithmetic rather than luck.
+/// Anything that reduces gets [`assert_rel`] instead — or [`assert_close`] where its shared
+/// `1e-3·max + 1e-3` floor is honest for the fixture's scale. Measured on this tree, a
+/// correct wave-reduced kernel differs from its oracle on ~0.08% of bf16 elements at dim
+/// 4096, so a bitwise gate there rejects correct code.
+///
+/// Prints the element count on success: "identical" over 4 elements and over 4096 are not
+/// the same evidence.
+pub fn assert_bitwise<T: PartialEq + std::fmt::Debug>(want: &[T], got: &[T], label: &str) {
+    assert_eq!(want.len(), got.len(), "{label}: length");
+    let bad: Vec<usize> = (0..want.len()).filter(|&i| want[i] != got[i]).collect();
+    match bad.first() {
+        None => println!("{label}: {} elements, bit-identical", want.len()),
+        Some(&i) => panic!(
+            "{label}: {} of {} elements differ; first at {i}: want {:?}, got {:?}",
+            bad.len(),
+            want.len(),
+            want[i],
+            got[i]
+        ),
+    }
+}
+
+/// [`assert_bitwise`] over f32 BIT PATTERNS.
+///
+/// Not `assert_bitwise(want, got)` directly on the floats: `PartialEq` for f32 says
+/// `-0.0 == 0.0`, so a sign-dropping defect passes an assertion that claims exactness, and
+/// says `NaN != NaN`, so a NaN-poisoned buffer fails one for the wrong reason. Five call
+/// sites spelled the `.to_bits()` fold on both operands; `tests/v4_kernel.rs` and
+/// `tests/v4_hadamard_basis.rs` each keep a private `bits()` for the same reason.
+pub fn assert_bits(want: &[f32], got: &[f32], label: &str) {
+    let b = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+    assert_bitwise(&b(want), &b(got), label);
+}
+
+/// `golden.rs::Diff.rel` — max absolute disagreement over the largest expected magnitude.
+///
+/// The metric the oracle's own gate uses, so an anti-vacuity arm here is scored the same way
+/// the goldens are. Moved out of `tests/v4_head_tail.rs` on 2026-08-06 when
+/// `tests/indexer_kernel.rs` reimplemented it under another name.
+pub fn rel(got: &[f32], want: &[f32]) -> f32 {
+    // Length first: `zip` truncates, so a short `got` would score 0.0 and read as perfect
+    // agreement.
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "comparing tensors of different length"
+    );
+    max_err(want, got) / max_abs(want).max(1e-30)
+}
+
+/// [`report_rel`] promoted to an assertion, for oracles whose agreement is far tighter
+/// than [`err_tol`]'s `1e-3·max + 1e-3` floor and would pass on two orders of headroom
+/// under it.
+///
+/// Takes its ratio per call rather than sharing one: a single `TOL` shared across a file is
+/// how a widening made for one comparison silently degrades every other, and these
+/// oracles' honest tolerances differ by four orders of magnitude — `swiglu` is one `expf`
+/// apart from the host, `index_head_route` is an LDS tree reduction.
+pub fn assert_rel(want: &[f32], got: &[f32], label: &str, ratio: f32) {
+    let (err, tol) = report_rel(want, got, label, ratio);
+    assert!(
+        err <= tol,
+        "{label}: err={err:.3e} > tol={tol:.3e} (rel={ratio:.1e} of max={:.3e})",
+        max_abs(want)
+    );
+}
+
 /// Report the max error AND the threshold it was compared against. Printing BOTH is the
 /// point: a green oracle that passed on 100x of headroom looks exactly like one that passed
 /// on 2x, and only one of them is evidence of anything.
@@ -137,9 +301,9 @@ pub fn max_abs(v: &[f32]) -> f32 {
 }
 
 /// [`err_tol`] plus the comparison line, returning the pair so the caller decides what a
-/// failure means: [`assert_close`] panics, `vk.rs`'s `Shapes::close` records and keeps
-/// going. The PRINT is what they share, and a second copy of the format string is a second
-/// format.
+/// failure means. It had two callers with two answers — [`assert_close`] panics, and the
+/// retired `vk.rs`'s `Shapes::close` recorded and kept going. The PRINT is what they shared,
+/// and a second copy of the format string is a second format.
 pub fn report(want: &[f32], got: &[f32], label: &str) -> (f32, f32) {
     let (err, tol) = err_tol(want, got);
     report_line(label, err, tol, max_abs(want))
@@ -178,8 +342,7 @@ fn report_line(label: &str, err: f32, tol: f32, mx: f32) -> (f32, f32) {
 }
 
 /// `(max abs error, tolerance)` for a want/got pair — the shared arithmetic behind
-/// [`assert_close`] and `vk.rs`'s multi-shape `Shapes::close`, which records instead of
-/// panicking. Two copies of a tolerance formula is two tolerances.
+/// [`assert_close`] and [`report`]. Two copies of a tolerance formula is two tolerances.
 pub fn err_tol(want: &[f32], got: &[f32]) -> (f32, f32) {
     (max_err(want, got), 1e-3 * max_abs(want) + 1e-3)
 }
@@ -192,8 +355,8 @@ fn max_err(want: &[f32], got: &[f32]) -> f32 {
         .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()))
 }
 
-/// `n` positive per-block scales, `|f·0.1| + 0.01`. Every fp8 oracle in both backend files
-/// draws them this way, and the 0.01 floor is load-bearing rather than tidy: a tile whose
+/// `n` positive per-block scales, `|f·0.1| + 0.01`. Every fp8 oracle draws them this way,
+/// and the 0.01 floor is load-bearing rather than tidy: a tile whose
 /// scale rounds to zero makes the comparison for that tile vacuous, and `assert_close`'s
 /// relative tolerance would not show it.
 pub fn block_scales(r: &mut Lcg, n: usize) -> Vec<f32> {
@@ -202,11 +365,12 @@ pub fn block_scales(r: &mut Lcg, n: usize) -> Vec<f32> {
 
 /// An fp8 GEMV case: e4m3 weights, `n_scales` block scales, the input, and the host result.
 ///
-/// `n_scales` is the caller's, not computed here, because the two backends spell the scale
-/// grid differently (`i_dim / block` against `i_dim.div_ceil(block)`) and unifying that
-/// would change one of them for a shape neither currently tries. The DRAW ORDER — weights,
-/// scales, x — is the part that has to be shared: it is what makes a seed mean the same
-/// data on both sides.
+/// `n_scales` is the caller's, not computed here. That was because the two backends spelled
+/// the scale grid differently (`i_dim / block` against `i_dim.div_ceil(block)`); with one
+/// backend left, **the parameter is now a knob nothing turns and could be computed** —
+/// noted rather than done, because collapsing it is a change to a fixture no current shape
+/// distinguishes. The DRAW ORDER — weights, scales, x — is the part that has to be shared:
+/// it is what makes a seed mean the same data at both call sites.
 pub fn gemv_fp8_case(
     r: &mut Lcg,
     o_dim: usize,
@@ -406,8 +570,7 @@ impl Lcg {
 // would be a second set of shape assertions that could drift apart while both stayed green.
 // `build.rs`'s duplication gate watches `tests/`, so it would also be a build error.
 //
-// No device type appears here, which is this module's rule: `DeviceBuf` lives in the rocm
-// test file that owns it.
+// jscpd:ignore-free by construction: the loader is spelled once and both suites call it.
 
 pub const CKPT: &str = "/var/db/rivoli/deepseek-v4-flash-0731";
 /// `bin/v4-oracle`'s `PROMPT` tokenizes to 13 ids — the length every hole is keyed to.
@@ -550,13 +713,10 @@ pub fn probe(name: &str, n: usize, dim: usize) -> Vec<f32> {
 /// had reached `tests/kernel_coverage.rs` and `tests/v4_oracle.rs` independently, which is
 /// the same drift this module's header records for `assert_close` and `f16b`.
 ///
-/// > **CORRECTED 2026-08-06.** `tests/kernel_coverage.rs` was deleted with the Vulkan backend
-/// > and it was this helper's ONLY caller — `tests/v4_oracle.rs` never called it, so the
-/// > sentence above overstated the drift even when written. The helper is kept, unused, for
-/// > one reason: re-keying that launcher-to-oracle census onto `src/backend/hip.rs` is an
-/// > open repair (see `src/backend/hip.rs`, the V4 launcher note), and this is the shape it
-/// > needs. `#![allow(dead_code)]` on this module is why nothing warns. If that repair is
-/// > declined, delete this.
+/// > **CORRECTED 2026-08-06.** The paragraph above overstates: `tests/v4_oracle.rs` never
+/// > called this, so `tests/kernel_coverage.rs` was always the only caller. That census was
+/// > deleted with the Vulkan backend and restored the same day, re-keyed onto
+/// > `src/backend/`, so the helper has a caller again.
 ///
 /// The caller keeps its own `assert!` and its own message. That is deliberate — the message
 /// is the whole value of a census failure (*which* names, and what the reader should do

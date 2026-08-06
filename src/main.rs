@@ -183,7 +183,11 @@ struct Args {
     spans: Option<usize>,
 
     /// Scale the whole MoE branch by `g` before the residual add. An EXPERIMENT knob, not
-    /// a tuning parameter (kernels/fwd.hip::vaxpy). The band is generous but finite: a
+    /// a tuning parameter. Applied in `moe_acc_drain`'s fixed-point conversion, and ONLY on
+    /// MoE layers — the 3 dense layers share `vadd` and must not be attenuated, or "the MoE
+    /// branch is too strong" and "the MLP branch is" stop being distinguishable. (This named
+    /// `kernels/fwd.hip::vaxpy` until 2026-08-06; that kernel had no caller and is deleted.)
+    /// The band is generous but finite: a
     /// sweep that silently ran at 0 or a negative gain would produce a confidently
     /// degenerate arm. g = 1.0 is bit-identical to the plain vadd.
     #[arg(long, value_name = "G", default_value_t = 1.0, value_parser = moe_gain_in_band)]

@@ -7,25 +7,22 @@ use rivoli::artifact::quant::{VQ_DIM, VQ_K, matvec_vq, quant_vq};
 use rivoli::backend::gpustream::HipStream;
 use rivoli::backend::hip::{
     ExpertDesc, attend_scratch_floats, device_sync, launch_argmax, launch_attend, launch_gemv_fp8,
-    launch_gemv_i8, launch_gemv_vq, launch_index_topk, launch_mla_absorb_fp8, launch_mla_value_fp8,
-    launch_moe_acc_drain, launch_moe_expert_range, launch_moe_expert_range_i4, launch_vadd,
+    launch_gemv_i4, launch_gemv_i8, launch_gemv_vq, launch_index_topk, launch_mla_absorb_fp8,
+    launch_mla_value_fp8, launch_moe_acc_drain, launch_moe_expert_range,
+    launch_moe_expert_range_i4, launch_rope, launch_swiglu, launch_vadd, launch_vq_encode,
 };
 use rivoli::math::{bf16_to_f32, e4m3_to_f32, f32_to_bf16, f32_to_e4m3, silu, softmax};
 use rivoli::memory::device::DeviceBuf;
 
 mod common;
 use common::{
-    Att, Lcg, Mla, MoeRange, assert_close, block_scales, f16b, f32b, f32v, gemv_fp8_case,
-    i8_weights, u16b, want_i8,
+    Att, Lcg, Mla, MoeRange, assert_bits, assert_bitwise, assert_close, assert_rel, back,
+    block_scales, dev, f16b, f32b, f32v, gemv_fp8_case, i8_weights, u16b, u16v, want_i8, zeros,
 };
 
-/// Upload `b` to a fresh device buffer. Backend-typed, so it stays here rather than in
-/// `common`: this is `DeviceBuf` under HIP and `Buf` under Vulkan.
-fn dev(b: &[u8]) -> DeviceBuf {
-    let mut d = DeviceBuf::new(b.len()).expect("alloc");
-    d.copy_in_at(0, b).expect("fill");
-    d
-}
+// `dev` lived here until 2026-08-06, "backend-typed, so it stays here rather than in
+// `common`: this is `DeviceBuf` under HIP and `Buf` under Vulkan." There is one backend,
+// so the argument is gone and so is the copy — see `common`'s header.
 
 /// A launcher result against an expected guard code: `None` must be ACCEPTED, `Some(n)`
 /// rejected with `n` somewhere in the message.
@@ -95,6 +92,19 @@ fn gemv_i8(io: GemvIo<'_>, o_dim: usize, i_dim: usize, nrow: usize) {
     let (x, p, s, y) = io.ptrs();
     // SAFETY: as `gemv_fp8`; `x` holds `nrow` rows of i_dim and `y` `nrow` rows of o_dim.
     unsafe { launch_gemv_i8(x, p, s, o_dim, i_dim, nrow, y) }.expect("gemv_i8");
+}
+
+/// `gemv_i4` — the standalone `dot_i4_wave` microbench kernel. Single-row only.
+///
+/// Takes [`GemvIo`] like its two neighbours even though its `scale` is per GROUP rather
+/// than per row or per tile: the four BUFFERS are the same four in the same order, and the
+/// point of the shared operand is that a transposed pair moves both a launcher and its
+/// oracle at once. What differs is the sizes the caller allocates, which is its own job.
+fn gemv_i4(io: GemvIo<'_>, o_dim: usize, i_dim: usize) {
+    let (x, p, s, y) = io.ptrs();
+    // SAFETY: as `gemv_fp8`; `packed` is `o_dim · i4_row_bytes(i_dim)` and `scale` is
+    // `o_dim · i4_groups(i_dim)` f32.
+    unsafe { launch_gemv_i4(x, p, s, o_dim, i_dim, y) }.expect("gemv_i4");
 }
 
 /// The fp8 kv_b block, its block-scale grid, and the destination — everything one MLA
@@ -1625,4 +1635,227 @@ fn batched_rows_are_bit_identical_to_single_rows() {
             "moe_i4 row 1 must be bit-identical"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// `linalg.hip`'s remaining launchers. All four were uncovered until 2026-08-06 —
+// `tests/kernel_coverage.rs` named them, which is what that census is for.
+// ---------------------------------------------------------------------------
+
+/// `swiglu` — the dense fp8 MLP's combine, `h = silu(g)·u`.
+///
+/// **The oracle is NOT `math::silu`, and that is the whole subtlety of this test.**
+/// `math::silu` is `x·sigmoid(x)`, the MULTIPLY form; `linalg.hip::swiglu` is
+/// `gv/(1 + e^-gv)`, the DIVISION form. `kernels/linalg.hip` records the pair as "one
+/// rounding apart, which would normally vanish under the bf16 store ... except exactly at a
+/// rounding boundary" — but there is no bf16 store on THIS path, so the difference reaches
+/// the output directly and an oracle that reached for `silu` would be measuring the wrong
+/// function at a tolerance loose enough to hide it.
+///
+/// Run IN PLACE (`h` aliases `g`), because that is how `gpu.rs:2010` and `v4gpu.rs:1406` —
+/// the only two callers — launch it, and the aliasing is a documented safety claim rather
+/// than an accident. A kernel that read `g[i]` after writing `h[i]` would still pass a
+/// non-aliased test.
+#[test]
+fn swiglu_matches_the_division_form_in_place() {
+    let n = 4096;
+    let mut r = Lcg(0x5717);
+    // ±6 rather than ±1: silu is very nearly linear on [-1, 1], so a defect that dropped
+    // the sigmoid entirely would land inside a relative tolerance on that range. The
+    // saturating tails are where the function has shape.
+    let g: Vec<f32> = (0..n).map(|_| r.f() * 6.0).collect();
+    let u: Vec<f32> = (0..n).map(|_| r.f()).collect();
+    let want: Vec<f32> = g
+        .iter()
+        .zip(&u)
+        .map(|(&gv, &uv)| (gv / (1.0 + (-gv).exp())) * uv)
+        .collect();
+
+    let mut gb = dev(&f32b(&g));
+    let ub = dev(&f32b(&u));
+    // SAFETY: `g`, `u` and `h` are each `n` live device f32; `h == g` is the aliasing the
+    // launcher's contract permits — every thread reads both operands, then writes once.
+    let gp = gb.ptr_mut() as *mut f32;
+    unsafe { launch_swiglu(gp as *const f32, ub.ptr() as *const f32, n, gp) }.expect("swiglu");
+    let got = f32v(&back(&gb));
+
+    // 1e-5 relative, not `assert_close`'s `1e-3·max + 1e-3`. The only honest disagreement
+    // is device `expf` against Rust's, and a relative error `e` in `e^-g` becomes at most
+    // `e` in `1/(1+e^-g)` — so the bound is a few ULP of the result. It is 1e-5 rather than
+    // 1e-6 because ROCm's `expf` is specified to a few ULP, not correctly rounded, and one
+    // device window is not the place to discover the difference. At this fixture's scale
+    // the shared floor would be ~7% of the signal and would pass a kernel that had dropped
+    // `u` entirely over half its range; 1e-5 is still ~700x tighter than that.
+    assert_rel(&want, &got, "swiglu (in place)", 1e-5);
+}
+
+/// `rope_interleave` — the GLM rotary, `count` segments of `seg` at `stride`.
+///
+/// Two arms, and the first is the sharp one:
+///
+/// * **pos 0 is a bit-exact PERMUTATION.** The rotation is the identity there
+///   (`cos 0 = 1`, `sin 0 = 0`), so `v[j] = v[2j]` and `v[half+j] = v[2j+1]` exactly — no
+///   transcendental, no tolerance, one thread per element. This is what pins the layout
+///   half of the kernel: the adjacent-pair READ and the half-split WRITE.
+///   `kernels/mla.hip` calls confusing that permutation with V4's adjacent-pair rotation
+///   "the single most likely silent-wrong" in the port, and both spellings produce fluent
+///   text, so it is worth a gate that cannot be widened.
+/// * **A real position** for the angles, at a tolerance, since `pow`/`cos`/`sin` are libm
+///   on both sides and are not required to agree bit for bit.
+///
+/// `stride > seg` in both arms. Every production call but one passes `stride == seg`;
+/// `gpu.rs:1886` ropes each of `h` query heads at `stride = qh` over `seg = rope`, so a
+/// kernel that walked `seg` instead of `stride` would be wrong there alone.
+#[test]
+fn rope_interleaves_pairs_and_is_a_permutation_at_position_zero() {
+    let (count, stride, seg, theta) = (5usize, 24usize, 16usize, 10000.0f64);
+    let half = seg / 2;
+    let mut r = Lcg(0x2909);
+    let base: Vec<f32> = (0..count * stride).map(|_| r.f()).collect();
+
+    let run = |pos: usize| -> Vec<f32> {
+        let mut b = dev(&f32b(&base));
+        // SAFETY: `base` is `count * stride` live device f32 for the whole call.
+        unsafe { launch_rope(b.ptr_mut() as *mut f32, count, stride, seg, pos, theta) }
+            .expect("rope");
+        f32v(&back(&b))
+    };
+
+    let host = |pos: usize| -> Vec<f32> {
+        let mut v = base.clone();
+        for s in 0..count {
+            let row = &base[s * stride..s * stride + seg];
+            for j in 0..half {
+                let (a, b) = (row[2 * j], row[2 * j + 1]);
+                // f64 throughout, matching the kernel: it computes the angle in double and
+                // narrows only the final cos/sin. Doing the ladder in f32 would disagree
+                // with a CORRECT kernel by more than the tolerance below at large `pos`,
+                // which is the arg-reduction the double is there for.
+                let ang = pos as f64 * theta.powf(-2.0 * j as f64 / seg as f64);
+                let (cs, sn) = (ang.cos() as f32, ang.sin() as f32);
+                v[s * stride + j] = a * cs - b * sn;
+                v[s * stride + half + j] = b * cs + a * sn;
+            }
+        }
+        v
+    };
+
+    assert_bits(
+        &host(0),
+        &run(0),
+        "rope at pos 0 (pure de-interleave permutation)",
+    );
+    assert_rel(&host(137), &run(137), "rope at pos 137", 1e-6);
+}
+
+/// `vq_encode` — the offline converter's argmin accelerator.
+///
+/// **The reference is computed a DIFFERENT way from the kernel, on purpose.** The kernel
+/// minimises `‖c_k‖² − 2·s·c_k`, which is half the flops and the same argmin; this
+/// minimises the true squared distance `Σ_d (s_d − c_kd)²`. `quant_vq`'s own `nearest` is
+/// the first form and is a private closure, so re-spelling it here would be a
+/// transliteration that shares the kernel's algebra — and a misread sign or tie-break would
+/// be invisible because both sides carry it. `build.rs`'s duplication gate said the same
+/// thing about the same block, which is the second reason it is not that.
+///
+/// The independent form is also what makes `cbnorm` an actual input rather than a shared
+/// assumption: it is the ONE argument the kernel takes on trust, and if `codebook_norms`
+/// were wrong the kernel would pick a non-nearest codeword and this would say so. That is
+/// why the production precompute is used rather than a test-local one — the kernel is only
+/// ever fed that function's output (`bin/convert.rs`).
+#[test]
+fn vq_encode_picks_the_nearest_codebook_entry() {
+    let n = 512;
+    let mut r = Lcg(0x7A11);
+    let cb: Vec<f32> = (0..VQ_K * VQ_DIM).map(|_| r.f()).collect();
+    let sub: Vec<f32> = (0..n * VQ_DIM).map(|_| r.f()).collect();
+    let cbnorm = rivoli::artifact::quant::codebook_norms(&cb);
+
+    let idxb = {
+        let (sb, cbb, nb) = (dev(&f32b(&sub)), dev(&f32b(&cb)), dev(&f32b(&cbnorm)));
+        let mut idxb = zeros(n * 2);
+        // SAFETY: `sub` is n·VQ_DIM f32, the codebook VQ_K·VQ_DIM f32, `cbnorm` VQ_K f32,
+        // and `idx` n u16 — all live for the call.
+        unsafe {
+            launch_vq_encode(
+                sb.ptr() as *const f32,
+                cbb.ptr() as *const f32,
+                nb.ptr() as *const f32,
+                n,
+                idxb.ptr_mut() as *mut u16,
+            )
+        }
+        .expect("vq_encode");
+        u16v(&back(&idxb))
+    };
+
+    let dist2 = |i: usize, k: usize| -> f32 {
+        (0..VQ_DIM)
+            .map(|d| {
+                let e = sub[i * VQ_DIM + d] - cb[k * VQ_DIM + d];
+                e * e
+            })
+            .sum()
+    };
+    let mut want = Vec::with_capacity(n);
+    let mut margin = f32::INFINITY;
+    for i in 0..n {
+        let (mut lo, mut second, mut bk) = (f32::INFINITY, f32::INFINITY, 0u16);
+        for k in 0..VQ_K {
+            match dist2(i, k) {
+                d if d < lo => (second, lo, bk) = (lo, d, k as u16),
+                d if d < second => second = d,
+                _ => {}
+            }
+        }
+        want.push(bk);
+        margin = margin.min(second - lo);
+    }
+
+    // Exact index equality is only DECIDABLE while the winner is strictly separated: the
+    // kernel's `‖c‖² − 2·s·c` and this `Σ(s−c)²` have the same argmin in exact arithmetic
+    // and may round to different orders at a true tie, so a near-tie would turn a correct
+    // kernel red. Printed as well as asserted — a seed whose margin collapsed would
+    // otherwise fail with no clue that the fixture, not the kernel, had moved.
+    println!("vq_encode: tightest runner-up margin over {n} subvectors = {margin:.3e}");
+    // The threshold has to exclude margins the two ALGEBRAS cannot separate, not just exact
+    // ties: at VQ_DIM 4 both discriminants carry ~1e-6 of independent f32 rounding, so a
+    // 2e-6 margin would be undecidable. Measured at this seed the tightest is 9.94e-5, so
+    // 1e-5 sits ~10x under the fixture and ~5x over the rounding floor.
+    assert!(
+        margin > 1e-5,
+        "fixture has a near-tie; exact indices are not decidable"
+    );
+    assert_bitwise(&want, &idxb, "vq_encode indices");
+}
+
+/// `gemv_i4` — the group-scaled int4 dot, against `quant.rs::matvec_i4`.
+///
+/// **This kernel has no caller in `src/`.** It exists so `dot_i4_wave`'s decode throughput
+/// can be measured against `gemv_vq`/`gemv_fp8` free of the routing confound, and
+/// `examples/dot_bench.rs` is its only user — which checked it against this same oracle
+/// and then threw the result away in a `println!`. An example is not a test: nothing runs
+/// it, and `cargo test` never noticed that. The kernel is the same `dot_i4_wave` the MoE
+/// int4 experts run, so a change to it silently changes what the benchmark measures.
+///
+/// Not bitwise: the dot is a wave reduction, so its summation order is not the oracle's and
+/// cannot be made to be. Nor `assert_close` — measured here, the disagreement is 6.68e-6
+/// against that shared tolerance's 1.79e-2, which is 2677x of headroom, and its absolute
+/// floor alone is 13.6% of the smallest output (0.1315).
+#[test]
+fn gemv_i4_matches_oracle() {
+    let (o_dim, i_dim) = (64usize, 256usize);
+    let mut r = Lcg(0x1D40);
+    let w: Vec<f32> = (0..o_dim * i_dim).map(|_| r.f()).collect();
+    let (packed, scale) = rivoli::artifact::quant::quant_i4(&w, o_dim, i_dim);
+    let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
+    let mut want = vec![0.0f32; o_dim];
+    rivoli::artifact::quant::matvec_i4(&mut want, &x, &packed, &scale, o_dim, i_dim);
+
+    let (xb, pb, sb) = (dev(&f32b(&x)), dev(&packed), dev(&f32b(&scale)));
+    let mut yb = zeros(o_dim * 4);
+    gemv_i4(GemvIo::new(&xb, &pb, &sb, &mut yb), o_dim, i_dim);
+    // 1e-5 relative: 25x above the measured 4e-7, and still far tighter than a wrong
+    // group-scale index or a dropped `-8` nibble bias, both of which are O(1).
+    assert_rel(&want, &f32v(&back(&yb)), "gemv_i4", 1e-5);
 }
