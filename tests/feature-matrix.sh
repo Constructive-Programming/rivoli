@@ -77,7 +77,18 @@ echo
 
 # The featureless build FIRST, and it is not a formality: with no backend the crate compiles
 # to a refusal stub, which is deliberate and has broken before when a module forgot its gate.
-run "(no features) — refusal stub" cargo check --release --quiet
+#
+# `-D warnings` and `--all-targets` because this is the ONE cell that stands in for CI's
+# `host` job, and without them it could not: `dead_code` is a warning, so this cell passed
+# green from 243d438 to 68e83b3 over four ungated `BENCH_*` constants in main.rs that CI
+# rejected outright. A gate that cannot go red is not a gate. Proven both ways before this
+# line was written — un-gate one of those constants and this cell fails.
+#
+# The backend cells below deliberately keep the looser bar: no CI job builds a backend at
+# all, so there is no bar to match them to, and raising it here would be an unreviewed
+# change to a build nothing else checks.
+run "(no features) — refusal stub" \
+  env RUSTFLAGS="-D warnings" cargo check --release --quiet --all-targets
 
 while IFS= read -r sub; do
   for b in "${BACKENDS[@]}"; do
