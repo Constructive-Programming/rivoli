@@ -43,19 +43,32 @@ say "G3  kernel ISA — AMDGCN, not the x86 launch stubs"
 # so disassembling the object yields the HOST launch stub — a function of the kernel
 # SIGNATURE, not its body. Measured 2026-08-05: 0 AMDGCN instructions. A kernel-body rewrite
 # left it byte-identical, which is precisely what this gate exists to catch.
+BUNDLER=$(command -v clang-offload-bundler || ls /usr/lib/llvm/*/bin/clang-offload-bundler 2>/dev/null | head -1)
+BUNDLE_TARGET=${BUNDLE_TARGET:-hipv4-amdgcn-amd-amdhsa--gfx1151}
+[ -x "$BUNDLER" ] || unrun g3 "clang-offload-bundler not found — cannot reach the device image"
 outdir=$(find target/release/build -maxdepth 2 -name out -type d -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
 if [ -n "$outdir" ]; then
   for o in "$outdir"/*.o; do
     [ -f "$o" ] || continue
     n_obj=$((n_obj+1))
-    fat=$(mktemp); llvm-objcopy --dump-section=.hip_fatbin="$fat" "$o" /dev/null 2>/dev/null
+    # THREE steps, not two. `.hip_fatbin` is a `__CLANG_OFFLOAD_BUNDLE__` container, NOT an
+    # ELF -- llvm-objdump rejects it with "not recognized as a valid object file", and with
+    # stderr discarded that produced an EMPTY disassembly whose sha256 was recorded as if it
+    # were a measurement. Every object hashed to 01ba4719c80b6fe9, the hash of a bare newline.
+    # Ten copies of the hash of nothing, and G3 would have compared equal to itself across any
+    # kernel change at all. Caught 2026-08-06 by the amdgcn-instruction counter below, which is
+    # the only reason this reads UNRUN instead of green.
+    fat=$(mktemp); dev=$(mktemp)
+    llvm-objcopy --dump-section=.hip_fatbin="$fat" "$o" /dev/null 2>/dev/null
     if [ -s "$fat" ]; then
-      d=$(llvm-objdump -d --triple=amdgcn-amd-amdhsa "$fat" 2>/dev/null | grep -vE '^/|file format')
+      "$BUNDLER" --unbundle --type=o --targets="$BUNDLE_TARGET" \
+                 --input="$fat" --output="$dev" 2>/dev/null
+      d=$(llvm-objdump -d "$dev" 2>/dev/null | grep -vE '^/|file format')
       c=$(grep -cE 's_endpgm|v_mov_b32|v_fmac_f32|v_add_f32' <<<"$d")
       n_gcn=$((n_gcn+c))
       printf '%s  %s\n' "$(sha256sum <<<"$d" | cut -c1-16)" "$o"
     fi
-    rm -f "$fat"
+    rm -f "$fat" "$dev"
   done >> "$OUT/g3-isa.txt"
 fi
 echo "  objects=$n_obj  amdgcn-instructions=$n_gcn  outdir=${outdir:-none}"
