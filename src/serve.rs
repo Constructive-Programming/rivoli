@@ -338,10 +338,10 @@ fn delta<'a>(sent: &str, full: &'a str) -> Option<&'a str> {
 // part, which is the part CI can run.
 // ---------------------------------------------------------------------------------------
 
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 pub use live::serve;
 
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 mod live {
     use super::{
         Opts, Req, delta, messages_to_turns, parse_tool_calls, read_req, split_think, streamable,

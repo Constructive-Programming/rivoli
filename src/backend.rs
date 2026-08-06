@@ -1,101 +1,74 @@
-//! The compute-backend waist: one implementation, chosen at BUILD time.
+//! The compute-backend waist: one implementation, HIP/ROCm, selected at BUILD time.
 //!
-//! No trait, no dynamic dispatch — the two backends are never live at once, so a vtable in
-//! front of every `launch_*` on the decode hot path would buy nothing.
+//! No trait, no dynamic dispatch — there is one backend, and even when there were two they
+//! were never live at once, so a vtable in front of every `launch_*` on the decode hot path
+//! would buy nothing.
 //!
-//! # This IS the seam now. `gpu.rs`, `pin.rs` and `asyncfetch.rs` import it.
+//! # This IS the seam. `gpu.rs`, `pin.rs` and `asyncfetch.rs` import it.
 //!
 //! An earlier version of this file was a plan with no consumers, and said so. Phase 4
-//! increment 1 wired it up. Two things changed to make that possible, and both are the
-//! reason the surface below is wider than a list of launchers:
+//! increment 1 wired it up. The surface below is wider than a list of launchers because the
+//! stream/event types are part of the boundary, not incidental: `gpu.rs` used to import
+//! `crate::backend::gpustream::{HipEvent, HipStream, Signal, stream_signal}` directly. They
+//! are re-exported here under BACKEND-NEUTRAL names — [`Stream`], [`Event`] — so no module
+//! above this one spells a backend into a type name. [`Signal`] is not re-exported but
+//! DEFINED here — see its own note.
 //!
-//! - **The stream/event types are part of the boundary, not incidental.** `gpu.rs` used to
-//!   import `crate::backend::gpustream::{HipEvent, HipStream, Signal, stream_signal}` directly, and
-//!   `HipStream` has no Vulkan analogue as such. They are re-exported here under
-//!   BACKEND-NEUTRAL names — [`Stream`], [`Event`] — so no module above this one spells a
-//!   backend into a type name. `src/backend/vkstream.rs` is the Vulkan side. [`Signal`] is
-//!   not re-exported but DEFINED here — see its own note.
-//! - **The two backends do not agree on what a device pointer is.** Under HIP one number
-//!   is both a host and a device address; under Vulkan they are unrelated. That asymmetry
-//!   is NOT hidden here — it cannot be. `device.rs`'s `VmmBuf` hands out both bases and
-//!   `pin.rs` picks per consumer (descriptors take the device base, the io_uring DMA
-//!   target takes the host base). See docs/investigations/vulkan-port.md, "Host pointer != device address".
+//! # Why a "waist" with only one thing behind it — RETIRED 2026-08-06
 //!
-//! # What is NOT equal across the seam
+//! A second backend, Vulkan, lived behind this seam from its Phase-1 port until 2026-08-06,
+//! when it was retired as an unfinished port rather than a feature: **6 of 36 mode-matrix
+//! cells decoding, 16 of 29 kernels, ~1.9x slower on `--mode int3-vq --attn dense`,
+//! refusing `int4`/`hybrid`/`dsa`/`misa` at startup, and no DeepSeek-V4 path at all.** The
+//! code, the shaders and the full inventory of what it did and did not have are preserved
+//! at the tag `archive/vulkan-backend-hb16`; the standing shader obligations and the
+//! per-kernel table moved to `docs/investigations/vulkan-kernels.md`.
 //!
-//! Compiling is not equivalence. Two of the three differences this list used to carry are
-//! GONE as of Phase 4 increment 2 and are recorded here because their absence is the point:
-//! the Vulkan side runs THREE QUEUES with the fetch↔compute overlap measured at 97%
-//! (ROCm 96%), and `Event` returns real GPU milliseconds from a timestamp query pool rather
-//! than a `0.0` that arithmetic downstream turned into "0% hidden".
+//! Two things it forced on this file are worth keeping in view, because they still shape
+//! code above the waist and would otherwise look arbitrary:
 //!
-//! What remains unequal, and is load-bearing for anyone reading a Vulkan run's output:
-//!
-//! 1. **13 of 29 kernels refuse rather than run.** `Config::validate_backend` rejects the
-//!    configurations that would reach them (`--attn dsa|misa`, `--mode int4|hybrid`) at
-//!    startup; the launchers themselves return `Err` as a backstop. The `--mode` and
-//!    `--attn auto` DEFAULTS therefore differ by backend — see `config::Mode`.
-//! 1b. **Six PORTED kernels are single-row.** A different thing from a deferred kernel and
-//!    worth its own line: `gemv_fp8`, `gemv_f32`, `gemv_i8`, `mla_absorb_fp8`,
-//!    `mla_value_fp8` and `moe_expert_range` all run correctly here at `nrow == 1` and
-//!    refuse above it, because the `.comp` shaders carry no row axis. That makes
-//!    SPECULATIVE DECODE (the two-row verify pass, ARCHITECTURE §13) ROCm-only. Unlike the
-//!    13, this is not gated at startup — an artifact carrying the MTP head fails at the
-//!    first layer of the first token with a message naming `--features rocm`. Acceptable
-//!    only because the Vulkan default is `--mode int3-vq` while the head rides `.vq3`, so
-//!    the combination is reachable; if a Vulkan run is ever expected to carry one, this
-//!    belongs in `validate_backend` instead.
-//! 2. **The MoE kernels are ~2.1x slower than the HIP originals**, which is now the whole of
-//!    the throughput gap (measured per-phase; docs/investigations/vulkan-port.md, "Increment 2: measured"). A
-//!    Vulkan run's tok/s is not a statement about the engine's design, and after
-//!    increment 2 it is not a statement about its scheduling either.
-//! 3. **A `Stream` here NAMES a queue rather than owning one.** `Stream::compute()` and
-//!    `Stream::fetch()` exist on both backends so the role is chosen by the consumer that
-//!    knows it; HIP ignores the distinction, Vulkan cannot.
-
-// One backend per build. Both at once is not a configuration that could work — the two
-// `pub use` globs below would collide on every shared name, and the resulting hundred
-// ambiguity errors would bury the one fact that matters.
-#[cfg(all(feature = "rocm", feature = "vulkan"))]
-compile_error!(
-    "features `rocm` and `vulkan` are mutually exclusive: one compute backend per build, \
-     selected at build time (docs/investigations/vulkan-port.md, \"Backend selection\"). Pick one."
-);
+//! - **The two backends did not agree on what a device pointer is.** Under HIP one number
+//!   is both a host and a device address; under Vulkan they were unrelated. That asymmetry
+//!   was never hidden here — it could not be. `device.rs`'s `VmmBuf` still hands out both
+//!   bases and `pin.rs` still picks per consumer (descriptors take the device base, the
+//!   io_uring DMA target takes the host base). Under HIP alone the two coincide, so the
+//!   distinction now costs nothing and buys a `VmmBuf` that cannot silently conflate them.
+//! - **A [`Stream`] NAMES a queue rather than owning one.** `Stream::compute()` and
+//!   `Stream::fetch()` exist so the role is chosen by the consumer that knows it. HIP
+//!   ignores the distinction; Vulkan could not. Kept because the call sites read better
+//!   for it, not because anything now depends on the difference.
 
 // NEITHER feature is a legal build — `cargo test` runs the backend-independent half of the
 // crate (config, math, quant, arena, cache, telemetry) with no device at all. It is
 // expressed by this module's ABSENCE rather than by a `compile_error!` here: `lib.rs` gates
-// `pub mod backend` on `any(rocm, vulkan)`, so a featureless build simply has no waist, and
-// `main.rs` bails with a message naming both features when asked to decode without one. A
+// `pub mod backend` on `feature = "rocm"`, so a featureless build simply has no waist, and
+// `main.rs` bails with a message naming the feature when asked to decode without one. A
 // `compile_error!` for the neither case would fire on `cargo test` and break the very
 // builds that keep the shared code honest.
+//
+// **That gate is why there are no `#[cfg(feature = "rocm")]` attributes below.** This file
+// is only ever compiled when `rocm` is on, so an inner gate would be always-true — noise
+// that reads like a live choice. It was a real choice until 2026-08-06, when the second
+// backend was retired; do not re-add the attributes without first changing `lib.rs`, and
+// do not "simplify" `lib.rs`'s gate away, because THAT is what keeps the featureless build
+// compiling.
 
-// The two implementations live under this module (`src/backend/`) rather than beside it,
-// so the waist and the things it selects between are one subtree.
-#[cfg(feature = "rocm")]
+// The implementation lives under this module (`src/backend/`) rather than beside it, so the
+// waist and the thing it selects stay one subtree. There were two until 2026-08-06 —
+// `vk.rs` and `vkstream.rs`, chosen by a `vulkan` feature that this file made mutually
+// exclusive with `rocm` via a `compile_error!`. Both are preserved at the tag
+// `archive/vulkan-backend-hb16`.
 pub mod gpustream;
-#[cfg(feature = "rocm")]
 pub mod hip;
-#[cfg(feature = "vulkan")]
-pub mod vk;
-#[cfg(feature = "vulkan")]
-pub mod vkstream;
 
-#[cfg(all(feature = "rocm", not(feature = "vulkan")))]
-mod imp {
-    pub use crate::backend::gpustream::{
-        HipEvent as Event, HipStream as Stream, Timeline, stream_signal,
-    };
-    pub use crate::backend::hip::*;
-}
-
-#[cfg(all(feature = "vulkan", not(feature = "rocm")))]
-mod imp {
-    pub use crate::backend::vk::*;
-    pub use crate::backend::vkstream::{Event, Stream, stream_signal};
-}
-
-pub use imp::*;
+// Re-exported under BACKEND-NEUTRAL names. Still worth doing with one backend: it is what
+// stops every module above this one from spelling `HipStream` into its own signatures, and
+// it is the whole reason the waist survived the second backend's removal as a seam rather
+// than dissolving into `use crate::backend::hip::*`.
+pub use crate::backend::gpustream::{
+    HipEvent as Event, HipStream as Stream, Timeline, stream_signal,
+};
+pub use crate::backend::hip::*;
 
 /// "Deliberately not on a stream" — the null stream, named.
 ///
@@ -113,7 +86,9 @@ pub use imp::*;
 pub const NULL_STREAM: *mut std::ffi::c_void = std::ptr::null_mut();
 
 // ---------------------------------------------------------------------------
-// Shared by both backends — the parts of the waist that are not backend-specific.
+// The parts of the waist that are not backend-specific. They live here rather than in
+// `hip.rs` because they were shared by both backends; with one left, "not backend-specific"
+// is still the right home for them — see `Signal`'s note for why it did not move down.
 // ---------------------------------------------------------------------------
 
 use atomic_waker::AtomicWaker;
@@ -128,17 +103,20 @@ use std::task::{Context, Poll};
 ///
 /// # ONE definition, not one per backend
 ///
-/// This was two byte-identical copies, in `gpustream.rs` and `vk.rs`. `Signal` crosses the
-/// waist — `gpu.rs` and `asyncfetch.rs` await one without knowing which backend built it —
-/// so a drift between the copies would not have been a compile error on either build; it
-/// would have been a `Future` that polls differently depending on a feature flag. Nothing
-/// in it is backend-specific: it is a flag, a waker, and the double-check that closes the
-/// race between them.
+/// This was two byte-identical copies, in `gpustream.rs` and `vk.rs` (the latter deleted
+/// 2026-08-06 with the Vulkan backend; tag `archive/vulkan-backend-hb16`). `Signal` crosses
+/// the waist — `gpu.rs` and `asyncfetch.rs` await one without knowing which backend built
+/// it — so a drift between the copies would not have been a compile error on either build;
+/// it would have been a `Future` that polls differently depending on a feature flag.
+/// Nothing in it is backend-specific: it is a flag, a waker, and the double-check that
+/// closes the race between them.
 ///
-/// What IS per-backend is only how a signal gets ARMED — `hipLaunchHostFunc` on one side, a
-/// timeline-semaphore waiter thread on the other — and that stays in each backend's module,
-/// as an inherent `impl` on this type (Rust allows those in any module of the defining
-/// crate).
+/// It stays HERE, above the one remaining backend, rather than moving down into
+/// `gpustream.rs`: the reason it was hoisted was that consumers await it without knowing
+/// the producer, and that is still true. What IS per-backend is only how a signal gets
+/// ARMED — `hipLaunchHostFunc` today, a timeline-semaphore waiter thread on the Vulkan side
+/// — and that stays in the backend's own module, as an inherent `impl` on this type (Rust
+/// allows those in any module of the defining crate).
 #[derive(Clone)]
 pub struct Signal(Arc<SignalState>);
 
@@ -209,7 +187,8 @@ impl Future for Signal {
 /// .block_on(..)` at eight sites — no `tokio::sync`, no `#[tokio::main]`, no `spawn`, no
 /// timers, and the declared `sync`/`macros` features were dead. That is twelve crates for a
 /// park/unpark loop `std::thread` already has, and `tests/vk.rs` had already written this
-/// one with the note "fifteen lines of std beats pulling in a runtime".
+/// one with the note "fifteen lines of std beats pulling in a runtime". (That test file was
+/// deleted 2026-08-06 with the Vulkan backend; the argument it made is why this is here.)
 ///
 /// It is enough because the CONCURRENCY HERE IS GPU STREAMS, not CPU tasks (this module's
 /// header says so): the decode loop awaits one thing at a time and the overlap it is waiting

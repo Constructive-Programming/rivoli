@@ -1,4 +1,4 @@
-#![cfg(any(feature = "rocm", feature = "vulkan"))]
+#![cfg(feature = "rocm")]
 //! Per-expert async loads: the io_uring→future adapter under the expert stream.
 //!
 //! Backend-independent: the fetch stream and the [`Timeline`] both come from

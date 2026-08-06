@@ -28,7 +28,7 @@
 //! `quant::V4_PROJ`'s doc says, only a numerical oracle can catch it, which is what
 //! `src/v4oracle/` exists for.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
-#![cfg(any(feature = "rocm", feature = "vulkan"))]
+#![cfg(feature = "rocm")]
 
 use rivoli::artifact::model::{V4Config, load_config};
 use rivoli::memory::pin::{V4Pin, V4Route};

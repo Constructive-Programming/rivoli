@@ -20,28 +20,28 @@ pub const OS_RESERVE: u64 = 16 << 30;
 /// expert) is unaffected; this only picks how the 256 routed experts/layer decode.
 /// See docs/reference/modes.md for the tradeoffs.
 ///
-/// # The DEFAULT is backend-dependent, and that is the lesser of two wrongs
+/// # The default is `hybrid`, unconditionally, since 2026-08-06
 ///
-/// `hybrid` on `rocm`, `int3-vq` on `vulkan`. The Vulkan backend has no int4 expert kernels
-/// (docs/investigations/vulkan-port.md ports 16 of 29), so `validate_backend` rejects `hybrid` — which meant a
-/// bare `rivoli <model>` on a Vulkan build failed on its own default, before it read a
-/// single byte of the artifact. A first command that errors out is a bad seam, and "pick a
-/// mode this build can actually run" is a better default than "pick the mode the other
-/// build prefers and then refuse".
+/// It used to be backend-dependent — `hybrid` on `rocm`, `int3-vq` on `vulkan` — because the
+/// Vulkan backend had no int4 expert kernels, so `validate_backend` rejected `hybrid` and a
+/// bare `rivoli <model>` on a Vulkan build failed on its own default before reading a byte
+/// of the artifact. With that backend retired the divergence has no second side, so the
+/// `cfg_attr` pair is gone and `hybrid` is simply the default.
 ///
-/// It IS a divergence, and the alternative — one default, refused half the time — was
-/// worse. `--mode` is echoed in `Config`'s Display and in the OTLP run attributes, so no
-/// measurement can silently attribute one mode's numbers to the other.
+/// The reasoning is kept because it is the general rule, not a Vulkan detail: **a default
+/// must be a configuration the build can actually run.** If a backend is ever added that
+/// cannot do int4, this is the knob, and the note above records what the choice cost —
+/// `--mode` is echoed in `Config`'s Display and in the OTLP run attributes precisely so no
+/// measurement can silently attribute one mode's numbers to another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
     /// Every routed expert is int3-VQ (`.vq3`): smallest, most slots, gather-bound.
-    #[cfg_attr(feature = "vulkan", default)]
     Int3Vq,
     /// Every routed expert is int4 (`.i4`): ~1.8× faster compute, bigger, fewer slots.
     Int4,
     /// Frequent experts int4 (HOT), the rest int3-VQ (COLD). Needs both file sets; the
     /// byte-aware policy floats the split.
-    #[cfg_attr(not(feature = "vulkan"), default)]
+    #[default]
     Hybrid,
 }
 
@@ -102,18 +102,19 @@ pub struct Config {
     pub two_q: crate::memory::cache::TwoQSplit,
     /// DIAGNOSTIC (`--checksum-x`): hash the residual stream after every layer.
     pub checksum_x: bool,
-    /// Routed-expert format mode (`--mode int3-vq|int4|hybrid`; default `hybrid` on `rocm`,
-    /// `int3-vq` on `vulkan` — see [`Mode`] for why the default differs). docs/reference/modes.md has the
-    /// tradeoffs. Set by `main`, like the checksum diagnostics.
+    /// Routed-expert format mode (`--mode int3-vq|int4|hybrid`; default `hybrid`).
+    /// docs/reference/modes.md has the tradeoffs. Set by `main`, like the checksum
+    /// diagnostics.
     pub mode: Mode,
     /// Device budget override, bytes (`--max-mem <GiB>`). None (default) auto-sizes to
     /// `free − OS_RESERVE`. `Some(n)` uses exactly `n` — no OS reserve; the user asked
     /// for it, so it's allowed to OOM/fail at build.
     pub max_mem: Option<u64>,
     /// Attention row-selection mode (`--attn auto|dense|streaming|dsa|misa`, resolved
-    /// in `main`). `auto` picks `dsa` when the artifact carries indexer weights AND the
-    /// backend has the indexer kernels, else `dense` — on a Vulkan build it is always
-    /// `dense`, and says so. dsa/misa need the resident DSA indexer.
+    /// in `main`). `auto` picks `dsa` when the artifact carries indexer weights, else
+    /// `dense`. dsa/misa need the resident DSA indexer. (`auto` also used to consider
+    /// whether the backend HAD the indexer kernels — the Vulkan build never did, and was
+    /// retired 2026-08-06.)
     pub attn: crate::attn::AttnMode,
 }
 
@@ -158,59 +159,6 @@ pub fn check_budget(max_mem: Option<u64>) -> Result<()> {
     Ok(())
 }
 
-impl Config {
-    /// Reject, AT STARTUP, the configurations whose kernels the selected backend does not
-    /// have. Nothing to reject on `rocm`, which is the reference backend.
-    ///
-    /// The Vulkan launchers for these paths return `Err` too, but that fires mid-decode —
-    /// after the artifact is mmapped, the tier is filled and forty layers have run. Same
-    /// information, an order of magnitude more expensive to receive. See docs/investigations/vulkan-port.md,
-    /// "Kernel inventory — port 16 of 29".
-    ///
-    /// The ONLY startup gate that reads the build's features, and it is kept that way on
-    /// purpose. A sibling `validate` policed flag COMBINATIONS — a property of the
-    /// configuration, the same on every machine — until 2026-08-01, when it was deleted for
-    /// having had an `Ok(())` body since `top-m` was retired. It was ever separate because
-    /// folding a build-time capability gate into it made its tests pass or fail depending on
-    /// which feature the suite was compiled with; the symptom was
-    /// `top_m_in_hybrid_mode_fails_loudly` failing under `--features vulkan` on the wrong
-    /// error entirely. Any future combination gate belongs in its own function for the same
-    /// reason, not in here. `main` also asks the `--moe-gain` gate, which has no `Config`
-    /// field to hang off.
-    #[cfg(feature = "vulkan")]
-    pub fn validate_backend(&self) -> Result<()> {
-        use crate::attn::AttnMode;
-        if self.mode != Mode::Int3Vq {
-            bail!(
-                "--mode {} needs the int4 expert kernels, which the Vulkan backend does not \
-                 have (docs/investigations/vulkan-port.md defers them). Use --mode int3-vq, or rebuild with \
-                 --features rocm.",
-                self.mode
-            );
-        }
-        // `Dense` and `Streaming` share the ported attention path; DSA and MISA need the
-        // five indexer kernels plus `layernorm`, none of which is ported. `auto` is
-        // resolved to a concrete mode before this runs, so it cannot slip through.
-        if matches!(self.attn, AttnMode::Dsa | AttnMode::Misa { .. }) {
-            bail!(
-                "--attn {:?} needs the DSA lightning-indexer kernels (index_append/score/\
-                 topk/pool_push/head_route and layernorm), which the Vulkan backend does not \
-                 have (docs/investigations/vulkan-port.md defers them). Use --attn dense or --attn streaming, or \
-                 rebuild with --features rocm.",
-                self.attn
-            );
-        }
-        Ok(())
-    }
-
-    /// The non-Vulkan arm of `validate_backend`: `rocm` has every kernel, so there is
-    /// nothing to refuse.
-    #[cfg(not(feature = "vulkan"))]
-    pub fn validate_backend(&self) -> Result<()> {
-        Ok(())
-    }
-}
-
 impl fmt::Display for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         const GIB: f64 = (1u64 << 30) as f64;
@@ -237,93 +185,27 @@ impl fmt::Display for Config {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
     use super::*;
 
-    fn cfg(mode: Mode) -> Config {
-        Config {
-            model: "/nonexistent".into(),
-            bench: Some(1),
-            trace: None,
-            prompt: None,
-            cache_policy: "lru".into(),
-            two_q: crate::memory::cache::TwoQSplit::default(),
-            checksum_x: false,
-            mode,
-            max_mem: None,
-            attn: crate::attn::AttnMode::Dense,
-        }
-    }
-
-    /// THE DEFAULT CONFIGURATION MUST RUN ON THE BUILD THAT HAS IT.
+    /// THE DEFAULT MODE SELECTS WHICH ROUTED-EXPERT ARITHMETIC RUNS, so it changes decode
+    /// output — pin it.
     ///
-    /// A bare `rivoli <model>` on a Vulkan build used to fail twice before reading a byte of
-    /// the artifact: `--mode` defaulted to `hybrid`, which `validate_backend` refuses, and
-    /// `--attn auto` resolved to `dsa` on any artifact carrying indexer weights, which it
-    /// also refuses. This half of the fix is testable here; the `auto` half lives in
-    /// `main::resolve_attn` and needs a real artifact to exercise, so it is verified by
-    /// running the binary rather than by a unit test.
+    /// This replaces `the_default_mode_passes_the_backend_gate`, which was deleted on
+    /// 2026-08-06 together with `Config::validate_backend`. That test called the gate and,
+    /// by its own doc, "on `rocm` … asserts nothing"; with one backend it would have been
+    /// vacuous in every configuration. The rule it was defending survives in [`Mode`]'s
+    /// header — *a default must be a configuration the build can actually run* — and this
+    /// is the half of it that can still fail: the default is `Hybrid`, and a stray
+    /// `#[default]` moved to another variant would otherwise be caught by nothing.
     ///
-    /// Backend-independent by construction — on `rocm`, `validate_backend` is a no-op and
-    /// this asserts nothing; on `vulkan` it is the whole point.
+    /// Deliberately backend-free so it runs in the featureless build, which since the
+    /// Vulkan job was deleted is the only configuration CI compiles.
     #[test]
-    fn the_default_mode_passes_the_backend_gate() {
-        cfg(Mode::default())
-            .validate_backend()
-            .expect("the default --mode must be one this build's backend can run");
-    }
-
-    /// The Vulkan capability gate: int3-vq + dense/streaming pass; int4, hybrid, dsa and
-    /// misa are refused AT STARTUP with a message naming both the missing kernels and the
-    /// way out. See docs/investigations/vulkan-port.md, "Kernel inventory — port 16 of 29".
-    #[cfg(feature = "vulkan")]
-    #[test]
-    fn vulkan_refuses_the_unported_modes() {
-        use crate::attn::AttnMode;
-        let with_attn = |m: Mode, a: AttnMode| {
-            let mut c = cfg(m);
-            c.attn = a;
-            c
-        };
-        for a in [
-            AttnMode::Dense,
-            AttnMode::Streaming {
-                sinks: 4,
-                window: 512,
-            },
-        ] {
-            with_attn(Mode::Int3Vq, a)
-                .validate_backend()
-                .expect("int3-vq + a ported attention mode is the supported configuration");
-        }
-        for m in [Mode::Int4, Mode::Hybrid] {
-            let e = with_attn(m, AttnMode::Dense)
-                .validate_backend()
-                .expect_err("int4 expert kernels are not ported");
-            assert_refusal_names(&e, "int4 expert kernels");
-        }
-        for a in [AttnMode::Dsa, AttnMode::Misa { active_heads: 4 }] {
-            let e = with_attn(Mode::Int3Vq, a)
-                .validate_backend()
-                .expect_err("the DSA indexer kernels are not ported");
-            assert_refusal_names(&e, "index_append");
-        }
-    }
-
-    /// A backend refusal has to say BOTH what is missing and how to get it, and the two
-    /// are asserted together because a message carrying only one is the failure that
-    /// matters: "int4 expert kernels are not ported" sends a reader hunting through docs,
-    /// and "--features rocm" on its own does not say what for.
-    ///
-    /// Gated to match its only caller. Without the cfg this is dead code under `rocm`,
-    /// where there is nothing to refuse.
-    #[cfg(feature = "vulkan")]
-    fn assert_refusal_names(e: &anyhow::Error, missing: &str) {
-        let msg = e.to_string();
-        assert!(msg.contains(missing), "must name what is missing: {msg}");
-        assert!(
-            msg.contains("--features rocm"),
-            "must name the way out: {msg}"
+    fn the_default_mode_is_hybrid() {
+        assert_eq!(
+            Mode::default(),
+            Mode::Hybrid,
+            "changing the default --mode changes decode output; see docs/reference/modes.md"
         );
     }
 }

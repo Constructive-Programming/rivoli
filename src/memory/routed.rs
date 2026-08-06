@@ -241,10 +241,12 @@ pub struct RoutedPool {
     /// of the two the CPU may touch.
     ///
     /// Under HIP these are the SAME NUMBER — unified addressing — so this field costs
-    /// nothing there and changes no behaviour. Under Vulkan they are unrelated, and
-    /// resolving both once here is what keeps [`RoutedPool::ptr`] and
-    /// [`RoutedPool::host_ptr`] a single `add` each on the fetch path. See
-    /// docs/investigations/vulkan-port.md, "Host pointer != device address".
+    /// nothing there and changes no behaviour. It existed because the retired Vulkan backend
+    /// made the two unrelated numbers (2026-08-06); resolving both once here still keeps
+    /// [`RoutedPool::ptr`] and [`RoutedPool::host_ptr`] a single `add` each on the fetch
+    /// path, and keeps the two spellings from collapsing into one. See
+    /// [`crate::memory::device::VmmBuf::host_mut`] — under HIP the coincidence holds, and
+    /// the split is a naming CONVENTION now, not something the type system checks.
     host_base: *mut u8,
     arena: Arena,
     policy: Box<dyn HybridPolicy>,
@@ -356,10 +358,11 @@ impl RoutedPool {
         );
         let mut buf = VmmBuf::new(budget)?;
         let base = buf.ptr_mut();
-        // Both bases resolved ONCE, here. Under HIP `host_mut` and `ptr_mut` return the
-        // same number and this is a no-op; under Vulkan they are the device address and the
-        // permanent host mapping, and the two consumers below must not be able to confuse
-        // them.
+        // Both bases resolved ONCE, here. Under HIP `host_mut` and `ptr_mut` return the same
+        // number, so this is a no-op — pinned by
+        // `device.rs::vmmbuf_host_and_device_bases_coincide_under_hip`. The two spellings are
+        // kept so the two consumers below cannot bake that coincidence in; they were genuinely
+        // different numbers under the Vulkan backend, retired 2026-08-06.
         let host_base = buf.host_mut();
         // Ring sized for one layer's worst case: one demand read per expert, one aligned
         // block each, in every format.
@@ -407,9 +410,10 @@ impl RoutedPool {
     /// The slot's DEVICE address — the base every expert descriptor's six projection
     /// pointers are built from, and what `memcpy_dtod`/`fill_u32` take.
     ///
-    /// NOT host-dereferenceable under Vulkan. It happens to be under HIP, where unified
-    /// addressing makes this and [`RoutedPool::host_ptr`] the same number; relying on that
-    /// is what the split exists to prevent.
+    /// Host-dereferenceable under HIP, where unified addressing makes this and
+    /// [`RoutedPool::host_ptr`] the same number — but relying on that is what the split
+    /// exists to prevent. It was NOT dereferenceable under the retired Vulkan backend
+    /// (2026-08-06), which is where the rule came from.
     fn ptr(&self, hot: bool, idx: usize) -> *mut u8 {
         // SAFETY: arena.offset < budget, within the pool VMM.
         unsafe { self.base.add(self.arena.offset(hot, idx)) }
@@ -753,13 +757,13 @@ impl RoutedPool {
         // the diagnostic would then cause the corruption it exists to detect. One join
         // per layer-with-misses orders them.
         //
-        // Under Vulkan the hazard is the same one wearing different clothes, and the fix
-        // covers it for a DIFFERENT reason: the fill is a `vkCmdFillBuffer` recorded into
-        // the open command buffer, while the reaper's staging copy is a synchronous host
-        // memcpy on another thread (see stream.rs's `stage`). Nothing orders a recorded-
-        // but-unsubmitted fill against a host write, so the join is what submits and
-        // retires it before any read is queued. It happens to be load-bearing on both
-        // backends; do not delete it as HIP-specific.
+        // This IS HIP-specific, and it is load-bearing: the poison fill is on the default
+        // stream while the reaper's copy is on a non-blocking fetch stream, so nothing orders
+        // them without the join. (A second paragraph here argued the same join was needed for
+        // a different reason under Vulkan — a recorded-but-unsubmitted `vkCmdFillBuffer`
+        // racing a host memcpy — and concluded "do not delete it as HIP-specific". That
+        // backend was retired 2026-08-06; the HIP argument above stands alone and is the
+        // reason the join is here.)
         //
         // CAVEAT, and it is the same trap `--checksum-x` fell into: this sync may itself
         // perturb the race being hunted. It sits at a different point (after allocation,

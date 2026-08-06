@@ -8,23 +8,25 @@
 # "did anything break": too slow to run after a change, and a combination that CRASHES is
 # indistinguishable from one that simply was not selected this round.
 #
-# THERE IS NO HAND-WRITTEN LIST OF WHAT VULKAN SUPPORTS, deliberately. Vulkan ports 16 of 29
-# kernels, so most cells cannot run there — and a declared support list is exactly the thing
-# that drifts (bench-matrix.sh enumerated `top-m` for months after the policy was deleted).
-# Instead every cell RUNS and the outcome is classified. `Config::validate_backend` refuses
-# the unported combinations at startup with a message naming the backend, before the pin is
-# built, so those cells cost seconds and are reported as `refused` rather than as failures.
-# A newly ported kernel therefore flips a cell refused -> ok with nothing to update here.
+# EVERY CELL MUST DECODE. That is new as of 2026-08-06 and it is why there is no longer a
+# `refused` outcome: the Vulkan backend ported 16 of 29 kernels, so 30 of its 36 cells were
+# refused at startup by `Config::validate_backend`, and this script classified those as
+# `refused` rather than as failures. Retiring that backend retired the whole category —
+# `rocm` has every kernel, so a configuration the CLI accepts is one the engine can run, and
+# a refusal now means a BUG. It is therefore classified as CRASH, loudly, rather than
+# silently absorbed by a branch that used to be normal.
 #
-# What that cannot tell you is a guard that STOPPED firing (refused -> ok looks like a port).
-# `config.rs::vulkan_refuses_the_unported_modes` pins the guard itself; the two are
-# complementary and neither replaces the other.
+# The design principle that produced that branch still holds and is worth keeping in view:
+# THERE WAS NO HAND-WRITTEN LIST OF WHAT THE BACKEND SUPPORTED, deliberately, because a
+# declared support list is exactly the thing that drifts (bench-matrix.sh enumerated `top-m`
+# for months after the policy was deleted). Every cell RUNS and the outcome is classified.
+# If a second backend ever returns, restore the refusal branch rather than a support list.
 #
 # Usage: tests/mode-matrix.sh [artifact] [ngen] [backend ...]
 #   RIVOLI_MAX_MEM=115  RIVOLI_TIMEOUT=900  RIVOLI_GPU_LOCK=/var/run/sys-gpu.lock
 #
-# COST: 36 cells per backend, each a fresh process. Under rocm all 36 decode (~130 s of
-# artifact load each, so ~90 min); under vulkan 6 decode and 30 refuse in seconds, ~15 min.
+# COST: 36 cells, each a fresh process, all of which decode (~130 s of artifact load each,
+# so ~90 min). It was 36 per backend across two backends until 2026-08-06.
 # A pre-release gate, not a per-commit one. One process per cell is deliberate: a shared one
 # would leave the expert pool warm for whichever cell ran second.
 #
@@ -46,7 +48,7 @@ GPU_LOCK="${RIVOLI_GPU_LOCK:-/var/run/sys-gpu.lock}"
 # Declared as arrays because tests/matrix.rs parses THESE LINES and compares them with what
 # the CLI accepts and with Cargo.toml's backend features. Editing a loop without editing
 # these is a test failure, which is the point.
-BACKENDS=(rocm vulkan)
+BACKENDS=(rocm)
 MODES=(int3-vq int4 hybrid)
 POLICIES=(lru 2q arc)
 # `auto` is excluded deliberately: it resolves to dense or dsa at startup, so a cell for it
@@ -71,7 +73,7 @@ for backend in "${BACKENDS[@]}"; do
     TOTAL_FAIL=$((TOTAL_FAIL + 1)); continue
   fi
 
-  PASS=0; REFUSED=0; FAIL=0; FAILED=(); REFUSALS=()
+  PASS=0; FAIL=0; FAILED=()
   for mode in "${MODES[@]}"; do
     for attn in "${ATTNS[@]}"; do
       for pol in "${POLICIES[@]}"; do
@@ -97,10 +99,6 @@ for backend in "${BACKENDS[@]}"; do
         elif [ $rc -eq 124 ] || [ $rc -eq 137 ]; then
           FAIL=$((FAIL + 1)); FAILED+=("$cell — TIMEOUT ${TIMEOUT}s")
           printf 'FAIL     %-26s TIMEOUT\n' "$cell"
-        elif [ $rc -ne 0 ] && grep -aqiE "Vulkan backend|not implemented on the Vulkan" "$out"; then
-          # A stated refusal, not a breakage: the engine says which kernel is missing.
-          REFUSED=$((REFUSED + 1)); REFUSALS+=("$cell")
-          printf 'refused  %-26s (unported on %s)\n' "$cell" "$backend"
         elif [ $rc -ne 0 ]; then
           FAIL=$((FAIL + 1)); FAILED+=("$cell — CRASH rc=$rc")
           printf 'FAIL     %-26s CRASH rc=%s\n' "$cell" "$rc"
@@ -120,8 +118,7 @@ for backend in "${BACKENDS[@]}"; do
     done
   done
 
-  echo "----- $backend: $PASS decoded, $REFUSED refused, $FAIL failed of $((PASS + REFUSED + FAIL))"
-  [ "$REFUSED" -gt 0 ] && printf '      refused: %s\n' "${REFUSALS[*]}"
+  echo "----- $backend: $PASS decoded, $FAIL failed of $((PASS + FAIL))"
   if [ "$FAIL" -gt 0 ]; then
     printf '      FAILED: %s\n' "${FAILED[@]}"
     TOTAL_FAIL=$((TOTAL_FAIL + FAIL))

@@ -7,8 +7,8 @@
 //! liburing system lib). This module owns the O_DIRECT alignment math (block-aligned
 //! offset/length/buffer), the fds, and the VMM destination pointers; the two BACKEND ops
 //! (host staging arena, async H2D copy) are `rivoli_*` wrappers in `kernels/async.hip` under
-//! `rocm` and `vk::Buf::staging` + `vk::copy_h2d_async` under `vulkan` — see [`stage`], the
-//! whole of the difference.
+//! `rocm` — see [`stage`], which was the whole of the per-backend difference until the
+//! Vulkan half was deleted with that backend on 2026-08-06.
 //!
 //! There is ONE destination path and no flag to change it: every read lands in a HOST
 //! staging arena and is async-copied from there into the VMM slot (`queue`'s `dst` is the
@@ -21,8 +21,10 @@
 //!    vs ≤6.18.35-r1) and the staging hop began as the workaround. It no longer reproduces
 //!    on 6.18.38, so that part is history — but it is the history that constrains the
 //!    arena: it must be host memory the kernel can pin, NEVER device-local, or the read
-//!    into it reintroduces the original fault. [`stage`]'s Vulkan half excludes
-//!    `DEVICE_LOCAL` from the arena for exactly this reason; do not undo that.
+//!    into it reintroduces the original fault. Under HIP the arena is `hipHostMalloc`'d and
+//!    is host memory by construction; the retired Vulkan half had to exclude `DEVICE_LOCAL`
+//!    explicitly for the same reason, which is the clearest statement of the constraint a
+//!    future backend inherits.
 //! 2. **DMA into VMM device pages runs at half the bandwidth.** 5.66 GB/s vs 12.4 GB/s
 //!    into the pinned arena, so writing the read straight into VMM more than DOUBLES the
 //!    cost of a miss. Measured 2026-07-30, int3-vq/dense/lru @512: marginal cost per
@@ -47,10 +49,10 @@
 //! SQ tail at once, so the batch is genuinely concurrent. Falls back to a plain ring
 //! (the QD1 perf arm, still correct) if SQPOLL setup is refused.
 //!
-//! Needs a backend (`rocm` or `vulkan`) — its sole consumer is the GPU decode pin. The
+//! Needs a backend — its sole consumer is the GPU decode pin. The
 //! ring itself is backend-independent; only the two staging ops differ, and they are the
 //! whole of [`stage`] below.
-#![cfg(any(feature = "rocm", feature = "vulkan"))]
+#![cfg(feature = "rocm")]
 
 use anyhow::{Result, ensure};
 use io_uring::{IoUring, opcode, types};
@@ -95,13 +97,17 @@ mod stage {
         unsafe { ffi::rivoli_pinned_alloc(bytes as u64) as *mut u8 }
     }
 
-    /// `_bytes` is unused — HIP tracks the pinned registration's size itself. It is in the
-    /// signature so both backends' `free` are called identically; the Vulkan one needs the
-    /// size because `std::alloc::dealloc` demands the original `Layout`.
+    /// HIP tracks the pinned registration's size itself, so this takes only the pointer.
+    ///
+    /// It took an unused `_bytes` until 2026-08-06 so both backends' `free` were called
+    /// identically — the Vulkan one needed it because `std::alloc::dealloc` demands the
+    /// original `Layout`. With one backend that threaded a value through `Streamer`
+    /// construction and `Drop` purely to be discarded, so it is gone, on the same reasoning
+    /// as `device.rs::bump`'s `pad`. A backend whose deallocator needs the size needs it back.
     ///
     /// # Safety
     /// `p` came from [`alloc`] and is freed exactly once.
-    pub unsafe fn free(p: *mut u8, _bytes: usize) {
+    pub unsafe fn free(p: *mut u8) {
         unsafe { ffi::rivoli_pinned_free(p as *mut c_void) };
     }
 
@@ -127,121 +133,6 @@ mod stage {
         } else {
             Err(format!("hip rc {rc}"))
         }
-    }
-}
-
-/// The Vulkan half of [`stage`], and both operations are now the DMA-engine equivalents of
-/// the HIP ones rather than host memory work.
-///
-/// # This was a synchronous CPU memcpy, and that was a violation of the design
-///
-/// Until Phase 4 increment 2, `copy_to_slot` here was `std::ptr::copy_nonoverlapping`: the
-/// REAPER THREAD's CPU moving ~2.16 GB per token, synchronously, blocking the ring it was
-/// supposed to be draining. It produced correct tokens, which is exactly why it survived a
-/// merge — the engine's streaming design is not a tuning layer over the arithmetic, it IS
-/// the architecture, and a backend that serialises fetch against compute does not implement
-/// it (docs/investigations/vulkan-port.md).
-///
-/// What replaces it: the arena is a HOST-VISIBLE `vk::Buf` ([`crate::backend::vk::Buf::staging`], so
-/// non-device-local where the device offers the choice — see below), and the move into the
-/// pool slot is a `vkCmdCopyBuffer` recorded on the FETCH QUEUE. It returns before the bytes
-/// land, and the read's `Signal` — armed by `asyncfetch.rs` on that same queue immediately
-/// after — is what says they have. That is `rivoli_memcpy_h2d_async`'s contract, kept.
-///
-/// # The arena must NOT be device-local, and that is the amdgpu bug the staging hop began as
-///
-/// The arena is the destination of an O_DIRECT io_uring read, so the kernel must
-/// `get_user_pages` it. That is precisely what amdgpu refused for device-local VMM pages
-/// (this module's header, reason 1: EFAULT, ≤6.18.35-r1 regression), which is why reads
-/// stage through host memory at all. Allocating the arena out of device-local memory would
-/// reintroduce the very failure the hop was built to avoid, so
-/// [`crate::backend::vk::Buf::staging`] excludes `DEVICE_LOCAL` when the device has any
-/// alternative — and warns when it does not.
-#[cfg(feature = "vulkan")]
-mod stage {
-    use crate::backend::vk::Buf;
-    use std::collections::HashMap;
-    use std::ffi::c_void;
-    use std::sync::Mutex;
-
-    /// Live staging arenas, keyed by the host base [`alloc`] handed out.
-    ///
-    /// The arena is a `Buf` (so that `vk::copy_h2d_async` can resolve its host pointer back
-    /// to a `VkBuffer`), but `Streamer` holds only a `*mut u8` — the shape the HIP side's
-    /// `hipHostMalloc` dictates and the shape io_uring needs. Something has to own the `Buf`
-    /// in between, and a map keyed by base is the smallest thing that can: `free` takes the
-    /// entry out and drops it, which releases the allocation exactly once.
-    ///
-    /// A `Mutex<HashMap>` for what is normally ONE entry looks heavy, and the alternative —
-    /// a single `Mutex<Option<Buf>>` — is wrong: `cargo test` builds several `Streamer`s on
-    /// parallel threads, and a one-slot cell would have the second arena evict the first
-    /// while io_uring still had SQEs pointing into it. Touched twice per process per arena,
-    /// never on the fetch path.
-    static ARENAS: Mutex<Option<HashMap<usize, Buf>>> = Mutex::new(None);
-
-    /// A HOST-VISIBLE device buffer whose mapping an O_DIRECT read may land in, and whose
-    /// bytes a DMA copy may read. Null on failure — including a poisoned registry, because
-    /// handing back memory nothing owns would leak it silently.
-    pub fn alloc(bytes: usize) -> *mut u8 {
-        let Ok(mut buf) = Buf::staging(bytes) else {
-            return std::ptr::null_mut();
-        };
-        let host = buf.host_mut();
-        // `vkMapMemory` guarantees `minMemoryMapAlignment`, which is page-sized on every
-        // driver we have seen and is NOT required to be. An unaligned base makes every
-        // O_DIRECT read fail EINVAL deep inside the reaper, so it is checked here rather
-        // than assumed — the same guard `VmmBuf::new` carries for the pool.
-        if !(host as usize).is_multiple_of(crate::backend::vk::O_DIRECT_ALIGN) {
-            tracing::error!(
-                "staging arena mapping {host:?} is not {}-byte aligned, so io_uring O_DIRECT \
-                 reads into it would fail with EINVAL",
-                crate::backend::vk::O_DIRECT_ALIGN
-            );
-            return std::ptr::null_mut();
-        }
-        let Ok(mut reg) = ARENAS.lock() else {
-            return std::ptr::null_mut();
-        };
-        reg.get_or_insert_with(HashMap::new)
-            .insert(host as usize, buf);
-        host
-    }
-
-    /// # Safety
-    /// `p` came from [`alloc`]; freed exactly once. `bytes` is unused — the `Buf` knows its
-    /// own size — and is in the signature so both backends' `free` are called identically.
-    pub unsafe fn free(p: *mut u8, _bytes: usize) {
-        // Taken out of the map and dropped OUTSIDE the guard: `Buf::drop` flushes the
-        // device (`Gpu::sync`), and holding an unrelated lock across a device join is how
-        // a lock-ordering deadlock gets built.
-        let taken = ARENAS
-            .lock()
-            .ok()
-            .and_then(|mut reg| reg.as_mut().and_then(|m| m.remove(&(p as usize))));
-        drop(taken);
-    }
-
-    /// ASYNC device copy of the staged read into its pool slot, on the FETCH queue. Returns
-    /// BEFORE the bytes land; the caller's `Signal`, armed on the same queue next, is what
-    /// says they have.
-    ///
-    /// `stream` is accepted for signature parity and checked rather than used: the queue is
-    /// [`crate::backend::vk::Q::Fetch`] by construction here, and a caller that passed some other
-    /// stream would be describing a copy this function is not making.
-    ///
-    /// # Safety
-    /// `dst` owns `n` writable bytes in the pool's host mapping and stays valid until the
-    /// copy's signal fires; `src` is a live arena slot holding `n` bytes; the two do not
-    /// overlap (distinct allocations).
-    pub unsafe fn copy_to_slot(
-        dst: *mut u8,
-        src: *const u8,
-        n: usize,
-        _stream: *mut c_void,
-    ) -> Result<(), String> {
-        // SAFETY: the caller's contract, forwarded — `n` readable bytes at `src`, `n`
-        // writable at `dst`, non-overlapping, both inside live `Buf` mappings.
-        unsafe { crate::backend::vk::copy_h2d_async(dst, src, n) }.map_err(|e| format!("{e:#}"))
     }
 }
 
@@ -280,9 +171,6 @@ pub struct Streamer {
     /// `arena + user_data * span`. HIP-pinned under `rocm`, a host-visible `vk::Buf`
     /// under `vulkan` — see [`stage`]. Never null: every read stages through it.
     arena: *mut u8,
-    /// `arena`'s byte size, kept because `stage::free` needs it (the Vulkan side's
-    /// `dealloc` requires the original `Layout`).
-    arena_bytes: usize,
     /// Per-SLOT VMM destination + aligned read length. `reap` copies
     /// `nbytes` from the arena slot into `dst`. Indexed by staging slot — which is the
     /// read's `user_data` — and NOT cleared per batch: a slot's lifetime is owned by its
@@ -336,7 +224,6 @@ impl Streamer {
             entries,
             span,
             arena,
-            arena_bytes,
             dst: vec![std::ptr::null_mut(); entries as usize],
             nbytes: vec![0; entries as usize],
             min_res: vec![0; entries as usize],
@@ -530,10 +417,10 @@ impl Drop for Streamer {
         // SAFETY: `ring` is never touched again; `ManuallyDrop::drop` runs exactly once
         // (single owner, no Clone).
         unsafe { ManuallyDrop::drop(&mut self.ring) };
-        // SAFETY: `arena` came from `stage::alloc(self.arena_bytes)` and `new` refuses to
+        // SAFETY: `arena` came from `stage::alloc` and `new` refuses to
         // build a `Streamer` around a null one, so this is a live allocation; single
         // owner, no Clone, so it is freed exactly once.
-        unsafe { stage::free(self.arena, self.arena_bytes) };
+        unsafe { stage::free(self.arena) };
     }
 }
 

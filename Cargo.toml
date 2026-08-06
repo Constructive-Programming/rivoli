@@ -35,10 +35,6 @@ atomic-waker = { version = "1", optional = true }
 # directly — no liburing system lib. The HIP bounce arena + async H2D copy stay in
 # kernels/async.hip (the codebase keeps HIP behind rivoli_* C wrappers).
 io-uring = { version = "0.7", optional = true }
-# Vulkan compute backend (the `vulkan` feature) — raw bindings, no allocator and no
-# object model, which is the shape this codebase already has (see docs/investigations/vulkan-port.md).
-# Pinned: ash releases slowly and the surface used here is core 1.2/1.3.
-ash = { version = "0.38", optional = true }
 # CLI parsing. `default-features = false` on purpose: the default set pulls anstream +
 # anstyle{,-parse,-query,-wincon} + colorchoice + utf8parse for COLOURED help, and every
 # invocation of this binary is either a benchmark script or a run whose output is piped to
@@ -65,18 +61,13 @@ teacher-forcing = []
 pred-probe = []
 default = []
 # build.rs compiles kernels/*.hip via hipcc; pulls in the async streaming stack.
+#
+# THE ONLY BACKEND, since 2026-08-06. A `vulkan` feature selected a second one until then;
+# it was retired as an unfinished port (6 of 36 mode-matrix cells decoding, 16 of 29
+# kernels, ~1.9x slower, no V4 path at all) and the code is preserved at the tag
+# `archive/vulkan-backend-hb16`. `backend.rs` therefore no longer switches between two
+# implementations — but it is still a waist, because the featureless build has neither.
 rocm = ["dep:atomic-waker", "dep:io-uring"]
-# The second compute backend: build.rs compiles kernels/vk/*.comp via glslc. MUTUALLY
-# EXCLUSIVE with `rocm` — one backend per build, no runtime selection (docs/investigations/vulkan-port.md).
-# The async streaming stack is now the SAME set `rocm` pulls in: phase 4 integration put
-# `gpu.rs`/`pin.rs`/`asyncfetch.rs`/`stream.rs` behind `any(rocm, vulkan)`, so the
-# io_uring streamer and the futures pipeline are compiled for both backends. Trimming
-# this list again means un-gating those modules again.
-vulkan = [
-    "dep:ash",
-    "dep:atomic-waker",
-    "dep:io-uring",
-]
 # OTLP export of the always-on decode summary (one span/run, opt-in at runtime via
 # OTEL_EXPORTER_OTLP_ENDPOINT). Off by default — the opentelemetry stack is heavy.
 otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
@@ -91,13 +82,19 @@ trace = []
 name = "dot_bench"
 required-features = ["rocm"]
 
-# Backend-neutral: the same source builds under either backend, which is the point — it is
-# the only like-for-like kernel comparison available (dot_bench measures gemv_vq, which
-# Vulkan does not have). No `required-features`, because that field is an AND list and this
-# example wants "rocm OR vulkan"; pinning it to one backend would delete the comparison.
+# Still no `required-features`, and the reason CHANGED on 2026-08-06 — do not "tidy" this
+# into `required-features = ["rocm"]` without reading both halves.
 #
-# A featureless `cargo check/test --all-targets` builds this target and SUCCEEDS: the
-# source gates its items individually and keeps a stub `main` that refuses at runtime.
+# It used to exist to compare the two backends on the same source: the only like-for-like
+# kernel comparison available, since dot_bench measures gemv_vq, which Vulkan never had.
+# That reason died with the Vulkan backend. DO NOT GO LOOKING FOR THE COMPARISON — there is
+# one backend now, and this is a rocm microbench like dot_bench.
+#
+# What survives is the second reason, which is why the shape is unchanged: a featureless
+# `cargo check/test --all-targets` BUILDS this target and succeeds, because the source
+# gates its items individually and keeps a stub `main` that refuses at runtime. Adding
+# `required-features` would make cargo skip it instead — and since the `vulkan` CI job went
+# with the backend, the featureless job is the only one left that compiles this file at all.
 # It used to carry one file-scope `#![cfg(any(rocm, vulkan))]`, which blanked the file and
 # made cargo reject the example for having no `main` — so a featureless `cargo test` died
 # on `E0601` here, reading like a missing function rather than a missing feature.

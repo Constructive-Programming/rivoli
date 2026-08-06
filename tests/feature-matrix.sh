@@ -23,13 +23,15 @@
 #           compiling. ~7 combos per backend.
 #   full  — the whole powerset of the optional features per backend. ~33 combos, and the
 #           only tier that can catch a PAIR of features interacting.
-#   RIVOLI_BACKENDS="rocm" narrows the backends (vulkan needs glslc; rocm needs hipcc).
+#   RIVOLI_BACKENDS="rocm" narrows the backends. There is only `rocm` since 2026-08-06, so
+#           the knob is vestigial today; it is kept because BACKENDS is what tests/matrix.rs
+#           asserts against Cargo.toml, and a second backend would want it back.
 set -uo pipefail
 
 MODE="${1:-full}"
 
 # Mutually exclusive — one backend per build, no runtime selection. Never both in one cell.
-BACKENDS=(rocm vulkan)
+BACKENDS=(rocm)
 # The optional, non-backend features. `default` is empty and is not a cell.
 OPTIONAL=(otlp teacher-forcing pred-probe trace)
 

@@ -325,9 +325,9 @@ mod v4_tests {
 /// [`Sel`] carrying the layer's [`LayerKind`], and the compressed region is the tail of
 /// `s.kv` at prefill and of `io.cache` at decode.
 ///
-/// HIP-only, because [`crate::backend::hip`] is where the `v4_*` launchers live and
-/// `backend/vk.rs` has no twin. That is S3's decision to make, not a gap to paper over
-/// with stubs that would claim a parity nothing has measured.
+/// HIP-only, because [`crate::backend::hip`] is where the `v4_*` launchers live — and since
+/// 2026-08-06 it is the only backend. The gate predates that: the retired Vulkan backend had
+/// no twin, and stubs claiming an unmeasured parity were declined rather than written.
 ///
 /// This does not touch `gpu.rs`'s layer loop: it takes device pointers the caller owns
 /// and performs one block's launches, so `tests/v4_attn.rs` drives exactly what S3 will.

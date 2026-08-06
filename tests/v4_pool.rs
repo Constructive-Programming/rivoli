@@ -22,12 +22,12 @@
 //! Deliberate breaks that proved each of these can fail are recorded in
 //! `docs/investigations/v4-flash-port.md`.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
-// **`rocm`, not `any(rocm, vulkan)`**, and for two reasons rather than one. The readback
-// below reads a DEVICE address as a host pointer, which only unified addressing makes legal;
-// and `Stream::new()` is HIP's signature — the Vulkan `Stream` takes a device, a queue family
-// and a timeline semaphore, so this file would not compile there even without the readback.
-// The pool itself is backend-neutral; nothing here claims a Vulkan parity that has not been
-// measured, which is `tests/kernel_coverage.rs`'s standing rule for this port.
+// **`rocm`**, and the gate is narrower than "the only backend". Two things here are HIP's
+// specifically: the readback below reads a DEVICE address as a host pointer, which only
+// unified addressing makes legal, and `Stream::new()` is HIP's signature. Both were recorded
+// when a second backend existed to be excluded (the Vulkan `Stream` took a device, a queue
+// family and a timeline semaphore); they are kept because they say WHY this file is gated,
+// which "there is one backend" does not. The pool itself is backend-neutral.
 #![cfg(feature = "rocm")]
 
 use rivoli::artifact::format::RoutedFmt;

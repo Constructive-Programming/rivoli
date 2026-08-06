@@ -1,9 +1,31 @@
 ---
-status: closed-shipped
-verdict: Porting the engine to Vulkan across four phases — the journal, not the rules. Shipped and decoding; the live inventory AND every standing shader obligation moved to reference/vulkan-kernels.md on 2026-08-01.
+status: closed-negative
+verdict: Porting the engine to Vulkan across four phases — the journal, not the rules. It shipped and decoded, then was RETIRED 2026-08-06 as an unfinished port: 16 of 29 kernels, 6 of 36 mode-matrix cells decoding, ~1.9x slower, no DeepSeek-V4 path. Code at tag archive/vulkan-backend-hb16; the inventory and the shader rules are in vulkan-kernels.md.
 ---
 
-# rivoli — Vulkan backend (`vulkan` feature)
+# rivoli — Vulkan backend (retired)
+
+> **CORRECTED 2026-08-06.** This was `status: closed-shipped` and its verdict said
+> "Shipped and decoding". Both were true when written and neither is now: **the Vulkan
+> backend was deleted from the tree on 2026-08-06** and the `vulkan` feature no longer
+> exists. The status is `closed-negative` because the code is gone, not because the port
+> failed at what it attempted — it did decode, it did reach 97% fetch/compute overlap, and
+> those measurements stand.
+>
+> What changed is the judgement, not the data. Classified by the user as **an unfinished
+> port, not a feature**: 16 of 29 kernels, 6 of 36 `tests/mode-matrix.sh` cells decoding
+> against 30 refusing, ~1.9x slower on the single configuration it supported, and no
+> DeepSeek-V4 decode path at all — while every V4 launcher signature change cost a parallel
+> edit to a backend that could not use it.
+>
+> Everything is preserved at the tag **`archive/vulkan-backend-hb16`**. Note that the
+> earlier tag `archive/vulkan-backend` points one commit further back and **predates the
+> HB=16 work** (`c434de3`, +54/-18 across `vk.rs` and `mla_latent_attend.comp`); prefer the
+> `-hb16` tag.
+>
+> The companion [`vulkan-kernels.md`](vulkan-kernels.md) moved here from `reference/` the
+> same day and holds the inventory, the numerics/index-width rules and the two OPEN fp8-dot
+> gaps — the parts worth reading if these kernels are ever ported to a third API.
 
 > **NAV — 117 KB, a port journal across four phases. Do not read whole.**
 > Current capability is one section: **"Kernel inventory — port 16 of 29"**. That gives
@@ -121,7 +143,7 @@ Mechanical mappings:
 
 ### Required device features
 
-> **MOVED 2026-08-01 to [`reference/vulkan-kernels.md`](../reference/vulkan-kernels.md),
+> **MOVED 2026-08-01 to [`vulkan-kernels.md`](vulkan-kernels.md),
 > "Device requirements".** This list is what the backend demands of a device *today* — live
 > reference, not a decision the port once made — and twelve shaders cite it. It was the
 > largest piece of live content still on the closed shelf. The requirement that generated
@@ -361,7 +383,7 @@ guard.
 
 ### Bit-exactness with `math.rs`
 
-> **MOVED 2026-08-01 to [`reference/vulkan-kernels.md`](../reference/vulkan-kernels.md),
+> **MOVED 2026-08-01 to [`vulkan-kernels.md`](vulkan-kernels.md),
 > "Numerics that must stay bit-exact" and "Index width".** Both are standing obligations on
 > anyone editing a shader, not port history: the NaN divergence between `f2bf16` and
 > `half::bf16::from_f32` still binds, and the index ceiling is cited by five shaders that

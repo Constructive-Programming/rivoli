@@ -1,53 +1,56 @@
-//! Matched MoE-kernel microbench — the SAME source, both backends.
+//! MoE-kernel microbench: `moe_expert_range` + `moe_acc_drain` at the engine's real dims.
 //!
-//! `examples/dot_bench.rs` cannot answer "how much slower are the Vulkan shaders?"
-//! because it measures `gemv_vq`/`gemv_i4`, which the Vulkan backend does not have. This
-//! measures `moe_expert_range` + `moe_acc_drain`, which both backends do have, at the
-//! engine's real dims — so the number is a like-for-like kernel comparison.
+//! # THE CROSS-BACKEND COMPARISON THIS EXISTED FOR IS GONE — do not go looking for it
 //!
-//! Why it is needed: the in-engine `moe` bucket reads 675 ms on Vulkan against 276 ms on
-//! ROCm, but that bucket contains launch overhead, host-gated launch bubbles between
-//! per-expert `sig.await`s, and the drain. Isolating the kernels separates
-//! "the shaders are slow" from "the orchestration is slow", and only the first is a
-//! shader problem.
+//! This was written as the SAME source under both backends, because `examples/dot_bench.rs`
+//! could not answer "how much slower are the Vulkan shaders?" — it measures
+//! `gemv_vq`/`gemv_i4`, which that backend never had. These two kernels it did have, so
+//! this was the only like-for-like kernel comparison available. The question it answered:
+//! the in-engine `moe` bucket read 675 ms on Vulkan against 276 ms on ROCm, and isolating
+//! the kernels separated "the shaders are slow" from "the orchestration is slow".
 //!
-//! Run: `cargo run --release --features rocm   --example moe_bench`
-//!      `cargo run --release --features vulkan --example moe_bench`
+//! The Vulkan backend was retired on 2026-08-06 (`archive/vulkan-backend-hb16`), so this is
+//! now a rocm microbench like `dot_bench`. It is kept because timing these two kernels in
+//! isolation is still the way to tell a slow kernel from a slow launch pattern.
 //!
-//! Every item below is gated on a backend feature INDIVIDUALLY rather than by one
-//! `#![cfg(any(rocm, vulkan))]` at file scope. That inner attribute blanks the whole file,
-//! and cargo then rejects the example for having no `main` — so a featureless
-//! `cargo test` / `cargo check --all-targets` failed on THIS FILE with `E0601`, which
-//! reads like a missing function rather than a missing feature. The stub `main` at the
-//! bottom is what the gating buys: a build with no backend produces a binary that says so.
+//! Run: `cargo run --release --features rocm --example moe_bench`
+//!
+//! Every item below is gated on `rocm` INDIVIDUALLY rather than by one
+//! `#![cfg(feature = "rocm")]` at file scope, and Cargo.toml deliberately gives this target
+//! no `required-features`. That inner attribute blanks the whole file, and cargo then
+//! rejects the example for having no `main` — so a featureless `cargo test` /
+//! `cargo check --all-targets` failed on THIS FILE with `E0601`, which reads like a missing
+//! function rather than a missing feature. The stub `main` at the bottom is what the gating
+//! buys: a build with no backend produces a binary that says so. Since the `vulkan` CI job
+//! went with the backend, the featureless job is the only one that compiles this file.
 #![allow(clippy::expect_used)]
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 use rivoli::artifact::quant::{VQ_DIM, VQ_K, vq_expert_bytes, vq_slot_offsets};
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 use rivoli::backend::{
     Event, ExpertDesc, Stream, device_sync, launch_moe_acc_drain, launch_moe_expert_range,
 };
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 use rivoli::memory::device::DeviceBuf;
 
 /// The engine's shapes (GLM-5.2): hidden 6144, moe_inter 2048, top-8 routed + 1 shared.
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 const HIDDEN: usize = 6144;
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 const INTER: usize = 2048;
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 const NDESC: usize = 9;
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 const ITERS: usize = 40;
 /// Widest token-row batch measured. Buffers are sized for this and the `nrow=1` arm just
 /// uses the first row of each, so both arms read the SAME weight slab — which is the whole
 /// comparison: how much does a second token row cost when the weights are already being read?
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 const MAXROW: usize = 2;
 
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 struct Rng(u64);
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 impl Rng {
     fn next(&mut self) -> u32 {
         self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -59,7 +62,7 @@ impl Rng {
 /// through a codebook, and a constant index would make every lane hit one entry — turning
 /// a scattered read into a broadcast and timing something the real kernel never does.
 /// (`dot_bench` has the same note for the same reason.)
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 fn pattern(n: usize, seed: u64) -> Vec<u8> {
     let mut r = Rng(seed);
     let p: Vec<u8> = (0..4096).map(|_| r.next() as u8).collect();
@@ -68,25 +71,23 @@ fn pattern(n: usize, seed: u64) -> Vec<u8> {
     v
 }
 
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 fn f32b(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 fn dev(b: &[u8]) -> DeviceBuf {
     let mut d = DeviceBuf::new(b.len().max(4)).expect("alloc");
     d.copy_in_at(0, b).expect("fill");
     d
 }
 
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 fn main() {
-    let backend = if cfg!(feature = "vulkan") {
-        "vulkan"
-    } else {
-        "rocm"
-    };
+    // Still printed, though `rocm` is now the only value: a benchmark line that does not
+    // name its arm cannot be compared against an older one that did.
+    let backend = "rocm";
     let slot = vq_expert_bytes(HIDDEN, INTER);
     let off = vq_slot_offsets(HIDDEN, INTER);
     println!("backend={backend}  hidden={HIDDEN} inter={INTER} ndesc={NDESC}");
@@ -259,11 +260,11 @@ fn main() {
 ///
 /// Exists so this file yields a `main` in EVERY configuration — see the note at the top.
 /// Mirrors `src/main.rs`'s refusal: exit non-zero and name the fix.
-#[cfg(not(any(feature = "rocm", feature = "vulkan")))]
+#[cfg(not(feature = "rocm"))]
 fn main() {
     eprintln!(
         "moe_bench measures the MoE kernels and this build has no compute backend. \
-         Re-run with `--features rocm` or `--features vulkan` (exactly one)."
+         Re-run with `--features rocm`."
     );
     std::process::exit(1);
 }

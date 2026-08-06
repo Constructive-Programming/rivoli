@@ -1,11 +1,16 @@
 //! rivoli — GLM-5.2 MoE decode engine (int3-vq / int4 / hybrid routed experts).
 //! See docs/reference/architecture.md for the module map and docs/reference/modes.md for the run modes.
 
-/// The build-time backend switch (`rocm` XOR `vulkan`) — see docs/investigations/vulkan-port.md. Gated on a
-/// backend being selected: with neither feature the crate is its backend-independent half
-/// (config, math, quant, arena, cache, telemetry), which has no waist to switch. That is
-/// why `backend.rs` carries no `compile_error!` for the neither case — see the note there.
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+/// The compute backend. Gated on `rocm` being selected: with no feature the crate is its
+/// backend-independent half (config, math, quant, arena, cache, telemetry), which has no
+/// waist at all. That is why `backend.rs` carries no `compile_error!` for the neither case
+/// — see the note there, and **do not collapse this `cfg` away**: it is the single line
+/// that keeps the featureless build (all of CI's `host` job) compiling.
+///
+/// This was a `rocm` XOR `vulkan` switch until 2026-08-06. The Vulkan backend was retired
+/// as an unfinished port — 6 of 36 mode-matrix cells decoding, 16 of 29 kernels, no V4 path
+/// — and is preserved at the tag `archive/vulkan-backend-hb16`.
+#[cfg(feature = "rocm")]
 pub mod backend;
 
 /// Which architecture an artifact is — the discriminant `artifact::model` reads out of the
@@ -63,19 +68,18 @@ pub mod watchdog;
 /// message flattening, the streaming detokenizer) is pure host code, and the featureless
 /// build is the one CI runs. `serve()` itself, which drives a live engine, carries the
 /// backend cfg a second time inside.
-#[cfg(any(feature = "rocm", feature = "vulkan", test))]
+#[cfg(any(feature = "rocm", test))]
 pub mod serve;
 
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 pub mod gpu;
 
 /// DeepSeek-V4-Flash's layer loop — [`gpu`]'s counterpart, not a branch inside it.
 ///
-/// **`rocm` only, and that is a decision rather than a gap.** Every launcher it drives is
-/// `crate::backend::hip`'s; `backend/vk.rs` has no `v4_*` twin, and 16 of GLM's 29 kernels are
-/// what the Vulkan port has today. Stubs here would claim a parity nothing has measured, which
-/// is `tests/kernel_coverage.rs`'s standing rule for this port — so a `--features vulkan` build
-/// has no V4 decode path at all and `main` refuses the artifact at startup.
+/// **`rocm` only — which since 2026-08-06 is the only backend there is.** Every launcher it
+/// drives is `crate::backend::hip`'s. The gate predates that: the Vulkan backend had no
+/// `v4_*` twin and never would have, and "no V4 decode path at all" was one of the measured
+/// reasons it was retired rather than finished.
 #[cfg(feature = "rocm")]
 pub mod v4gpu;
 
@@ -83,5 +87,5 @@ pub mod v4gpu;
 /// decode reaches it — so it is a module boundary AND a feature boundary, and the two
 /// cannot drift apart. `bin/ppl`, which does the statistics over its output, is pure host
 /// arithmetic and needs no gate at all.
-#[cfg(all(feature = "teacher-forcing", any(feature = "rocm", feature = "vulkan")))]
+#[cfg(all(feature = "teacher-forcing", feature = "rocm"))]
 pub mod eval;

@@ -11,7 +11,7 @@ pub mod arena;
 pub mod cache;
 pub mod device;
 pub mod hybrid;
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 pub mod pin;
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 pub mod routed;

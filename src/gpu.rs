@@ -8,19 +8,22 @@
 //! [`GpuEngine::dsa_select_layer`]), fp8-e4m3 KV latent cache, VQ-int3 routed + shared
 //! experts.
 //!
-//! Every device call goes through [`crate::backend`], so this file is backend-independent:
-//! it compiles under `rocm` and under `vulkan`. What is NOT equal across that seam —
-//! single-queue serialisation, zero-valued GPU timing spans, and the DSA/int4 kernels that
-//! refuse on Vulkan — is enumerated in `backend.rs`'s header. Needs a backend either way;
-//! without a device there is nothing to decode on.
-#![cfg(any(feature = "rocm", feature = "vulkan"))]
+//! Every device call goes through [`crate::backend`], so this file names no backend type —
+//! it spells [`crate::backend::Stream`] and [`crate::backend::Event`], never `HipStream`.
+//! That is what the waist buys and what a second backend would reuse; see `backend.rs`'s
+//! "# Why a waist with only one thing behind it". It compiled under `rocm` and `vulkan`
+//! until 2026-08-06, and the list of what was NOT equal across that seam went with the
+//! backend. Needs a backend; without a device there is nothing to decode on.
+#![cfg(feature = "rocm")]
 
 use crate::artifact::model::ModelConfig;
 use crate::attn::{AttnMode, streaming_rows};
-// jscpd:ignore-start — the engine's launcher import list. `tests/vk.rs` imports very
-// nearly the same set for the same reason: both call every launcher. A `use` list is
-// not factorable in Rust short of a glob import, which would cost the compile-time
-// check that every name here actually exists in the selected backend.
+// The engine's launcher import list. A duplication-gate exemption wrapped it until
+// 2026-08-06 because `tests/vk.rs` imported very nearly the same set for the same reason —
+// both called every launcher. That file is gone and there is one such list now, so the
+// exemption was suppressing nothing (re-measured without it: 0 clones). The list stays
+// explicit rather than a glob import, which would cost the compile-time check that every
+// name here actually exists in the backend.
 use crate::backend::{
     Event, ExpertDesc, Stream, device_sync, fill_u32, launch_append_kv, launch_argmax,
     launch_attend, launch_embed_i8_row, launch_flag_nonfinite, launch_gather_rope, launch_gemv_f32,
@@ -30,7 +33,6 @@ use crate::backend::{
     launch_moe_expert_range_i4, launch_rmsnorm, launch_rope, launch_swiglu, launch_vadd,
     stream_signal,
 };
-// jscpd:ignore-end
 use crate::fetch::asyncfetch::Ticket;
 use crate::math::{E4M3_BLOCK, route_into, topk_into};
 use crate::memory::device::DeviceBuf;

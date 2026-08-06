@@ -3,7 +3,7 @@
 //! [`stream`] is the io_uring submit-all/join-once reader and the O_DIRECT alignment math;
 //! [`asyncfetch`] is the ticketed dataflow that lets a kernel be enqueued behind bytes that
 //! have not landed yet. See docs/reference/architecture.md §3 and §4.
-#![cfg(any(feature = "rocm", feature = "vulkan"))]
+#![cfg(feature = "rocm")]
 
 pub mod asyncfetch;
 pub mod stream;

@@ -69,23 +69,27 @@ pub struct ExpertDescF4 {
 // EXEMPT FROM THE DUPLICATION GATE, and this is the only kind of thing that is.
 //
 // What follows is not code, it is an ABI: the argument lists of the C entry points in
-// `kernels/*.hip`. They necessarily match the Vulkan launchers in `backend/vk.rs`, because
-// `rocm` and `vulkan` are mutually exclusive and `backend.rs` cfg-selects one glob of the
-// SAME names — `gpu.rs` calls `launch_attend` and gets whichever was compiled. Identical
-// signatures are the contract, not copy-paste.
+// `kernels/*.hip`. Every item mirrors one of those entry points, and the mirroring IS the
+// contract — identical signatures, not copy-paste. Until 2026-08-06 they also had to match
+// the Vulkan launchers in `backend/vk.rs`, because `backend.rs` cfg-selected one glob of the
+// SAME names; that second obligation is gone with the backend, but the first is unchanged
+// and is the whole reason for the exemption.
 //
-// It cannot be deduplicated without making the code worse. `vk.rs`'s own note above
-// `launch_gemv_fp8` states the reason: "the two must stay readable side by side for the
-// bit-exactness comparison to be checkable by eye. Bundling them into a struct here and
-// not there would put a translation step between the two signatures, which is the one
+// It cannot be deduplicated without making the code worse. The retired `vk.rs` stated the
+// reason above its own `launch_gemv_fp8`, and it generalises: "the two must stay readable
+// side by side for the bit-exactness comparison to be checkable by eye. Bundling them into a
+// struct here and not there would put a translation step between the two signatures, which is the one
 // place this port cannot afford one." A macro that declares each signature once would
 // remove ~15 of these while breaking goto-definition on every launcher, and roughly 25 of
 // the rest are DIFFERENT kernels that merely take the same shape (`gemv_fp8`/`i8`/`i4`/`vq`
 // all take `x, packed, scale, o_dim, i_dim, y`) — there is one copy of each already and
 // nothing to merge.
 //
-// The real instrument for "do the two backends agree" is behavioural, not syntactic:
-// `tests/xbackend.rs` runs each arm under its own feature and compares raw output bytes.
+// The real instrument for "do the two backends agree" was behavioural, not syntactic:
+// `tests/xbackend.rs` ran each arm under its own feature and compared raw output bytes. It
+// was deleted 2026-08-06 with the second backend — a comparison needs two — and is preserved
+// at `archive/vulkan-backend-hb16`. What it found is recorded in
+// docs/investigations/vulkan-port.md §"1463 of 4096".
 //
 // The gate stays live over everything else in this file — it found four genuine
 // duplicated-logic clones here on 2026-08-01 (`record_barrier`, `Stream::live`,
@@ -599,10 +603,11 @@ pub unsafe fn fill_u32(dst: *mut u8, pat: u32, bytes: usize) -> Result<()> {
 // jscpd:ignore-start
 //
 // THE LAUNCHER WALL — same exemption, and for the same reason, as the `extern "C"` block
-// above and `vk.rs`'s wall: from here to the end of the file every item is a signature
-// that mirrors either a `kernels/*.hip` entry point or the Vulkan launcher of the same
-// name, and the mirroring is the contract. See the note above the extern block for the
-// full argument, and for why a signature-declaring macro would not pay.
+// above: from here to the end of the file every item is a signature mirroring a
+// `kernels/*.hip` entry point, and the mirroring is the contract. (It mirrored the Vulkan
+// launcher of the same name too, until that backend was retired 2026-08-06.) See the note
+// above the extern block for the full argument, and for why a signature-declaring macro
+// would not pay.
 //
 // The gate stays live over everything above — `check`, `device_sync` and the memcpy/fill
 // helpers, which is where this file has logic rather than declarations.
@@ -947,7 +952,9 @@ pub unsafe fn launch_hc_post(
 ) -> Result<()> {
     // SAFETY: caller's pointer contract; stream is a live HipStream handle.
     let r = unsafe {
-        rivoli_hc_post(x, residual, post, comb, s as i32, hc as i32, dim as i32, y, stream)
+        rivoli_hc_post(
+            x, residual, post, comb, s as i32, hc as i32, dim as i32, y, stream,
+        )
     };
     check(r, "hc_post")
 }
@@ -1649,13 +1656,17 @@ pub unsafe fn launch_index_head_route(
 // needed [`memcpy_dtod_async`]. Counting six LAUNCHERS and paying six would have reproduced
 // the very race the earlier decline predicted. `docs/investigations/v4-flash-port.md` requirement 9.
 //
-// HIP-ONLY, deliberately, and this is the one thing about them that is not obvious.
-// `tests/kernel_coverage.rs::every_launcher_has_an_oracle` is keyed on `backend/vk.rs`,
-// so a launcher that exists only here is invisible to it — there is no automatic gate
-// saying these are exercised. `tests/v4_attn.rs` is the whole of their coverage, and
-// every caller must be `#[cfg(feature = "rocm")]` or `--features vulkan` will not
-// resolve the name. S3 decides whether V4 gets a Vulkan arm at all; until it does,
-// adding stubs to `vk.rs` would claim a parity that does not exist.
+// NO AUTOMATIC GATE SAYS THESE ARE EXERCISED, and that is now true of every launcher in
+// this file, not just the V4 ones. `tests/kernel_coverage.rs::every_launcher_has_an_oracle`
+// was the launcher-to-oracle census; it was keyed on `backend/vk.rs` and was DELETED with
+// that backend on 2026-08-06 rather than re-keyed onto this file. Nothing replaced it.
+// `tests/v4_attn.rs` is the whole of the V4 launchers' coverage.
+//
+// Re-keying that census onto `src/backend/hip.rs` is the obvious repair and is recorded as
+// a testing gap in `docs/investigations/refactor-2026-08.md` §Track 1. Its original
+// motivation is worth keeping in view: a tranche once shipped two of its hardest kernels
+// unexercised while the suite's test COUNT rose, which is exactly what a census catches and
+// a green suite does not.
 
 /// `kernel.py::act_quant(x, block, "ue8m0", inplace=True)` in place over `rows` rows of
 /// `row_stride` floats, quantizing the first `n` of each. `n < row_stride` is the KV
@@ -2006,9 +2017,8 @@ pub unsafe fn launch_v4_embed_bf16_row(
     stream: *mut c_void,
 ) -> Result<()> {
     // SAFETY: caller's pointer contract; stream is a live HipStream handle.
-    let r = unsafe {
-        rivoli_v4_embed_bf16_row(w, token as i32, hidden as i32, hc as i32, x, stream)
-    };
+    let r =
+        unsafe { rivoli_v4_embed_bf16_row(w, token as i32, hidden as i32, hc as i32, x, stream) };
     check(r, "v4_embed_bf16_row")
 }
 
@@ -2113,7 +2123,12 @@ pub unsafe fn launch_v4_indexer_score(
     //
     // Narrowed once, all four together, so the `as i32` soup is not interleaved with the
     // pointers at the call. `ScoreDims` is what keeps the four in the right order.
-    let ScoreDims { s, n_comp, heads, hd } = dims;
+    let ScoreDims {
+        s,
+        n_comp,
+        heads,
+        hd,
+    } = dims;
     let (s, n_comp) = (s as i32, n_comp as i32);
     let (heads, hd) = (heads as i32, hd as i32);
     // SAFETY: caller's pointer contract; stream is a live HipStream handle.
