@@ -1,12 +1,21 @@
-//! The backend-neutral half of the kernel-oracle scaffolding, shared by `tests/vk.rs`,
-//! `tests/kernel.rs`, `tests/docs.rs` and `tests/invariants.rs`.
+//! The device-free half of the kernel-oracle scaffolding, shared by ten test binaries:
+//! `docs`, `invariants`, `kernel`, `v4_attn`, `v4_compress_kernel`, `v4_compress_probe`,
+//! `v4_head_tail`, `v4_indexer_kernel`, `v4_kernel` and `v4_oracle`.
 //!
 //! It was copy-pasted per file until 2026-07-30, and the copies had already started to
 //! drift: two spellings of the same `Lcg` bug note, two `assert_close` bodies with the
 //! same tolerance, and `f16b`/`u16b` present in one file and re-derived in the other.
-//! Anything that touches a device TYPE stays in the test file that owns it — `dev` is
-//! `DeviceBuf` under HIP and `Buf` under Vulkan, and that difference is the point of
-//! having two files.
+//!
+//! **Anything that touches a device TYPE stays in the test file that owns it.**
+//!
+//! > **CORRECTED 2026-08-06.** That rule used to be argued from the two backends — "`dev` is
+//! > `DeviceBuf` under HIP and `Buf` under Vulkan, and that difference is the point of having
+//! > two files" — and the header also named `tests/vk.rs`. Vulkan was retired 2026-08-06 and
+//! > `vk.rs` is gone, so the stated reason names something that no longer exists. The rule
+//! > survives on a different and stronger ground, re-derived rather than inherited: this
+//! > module is compiled into EVERY binary in the list above, and `docs` and `invariants` are
+//! > GPU-free registry checks. A device type here would drag HIP into both of them, and they
+//! > would stop being runnable without a card.
 //!
 //! `dead_code` is allowed because this module is compiled into EACH test binary, and
 //! neither uses every helper. The alternative is per-consumer cfg gates on a test
@@ -16,7 +25,7 @@
 #![allow(clippy::unwrap_used)]
 
 use rivoli::v4compress::LayerKind;
-use rivoli::v4oracle::forward::{CompressorW, IndexerW};
+use rivoli::v4oracle::forward::{Capture, CompressorW, IndexerW, LayerW, Oracle, Step};
 use rivoli::v4oracle::numerics::{bf16_decode, bf16_encode};
 use rivoli::v4oracle::weights::{Checkpoint, NamedRng, V4Config};
 use std::path::Path;
@@ -507,7 +516,6 @@ pub fn compressor_w(
     cw
 }
 
-/// A deterministic bf16 activation block, `[n, dim]`.
 /// One layer's `attn.indexer.*`, as [`IndexerW`].
 ///
 /// Lifted here from `v4_compress_probe.rs` when `v4_indexer_kernel.rs` became a second
@@ -536,6 +544,50 @@ pub fn indexer_w(ck: &Checkpoint, layer: usize, c: &V4Config) -> IndexerW {
     }
 }
 
+/// Drive one PREFILL `run_layer` over `h` and return what it captured.
+///
+/// `tests/v4_kernel.rs` and `tests/v4_oracle.rs` each built the same six-field `Step` at
+/// `start_pos: 0, phase: "pre"`, wrapped in the same `fresh_state`/`Capture`/`run_layer`
+/// sequence, and `build.rs`'s duplication gate found the copy. Nothing here touches a device
+/// type, which is this module's rule for what may live in it.
+///
+/// **`s` is `ids.len()`, not a parameter.** Both copies passed the two separately, and a
+/// `Step` whose `s` disagreed with its `input_ids` length is a fixture neither could have
+/// caught: `run_layer` walks `s` positions through whatever id slice it was handed, so a
+/// mismatch silently makes every golden downstream a capture of a prompt nobody wrote.
+///
+/// The state is dropped on the way out because both callers dropped it. A caller that needs
+/// to drive a second step against the same state wants `run_layer` directly — this is the
+/// one-shot prefill, and pretending otherwise would hand back a state whose `start_pos` the
+/// caller would have to reconstruct.
+pub fn prefill_capture(
+    o: &Oracle,
+    lw: &LayerW,
+    layer: usize,
+    ids: &[u32],
+    h: &mut Vec<f32>,
+) -> Capture {
+    let mut st = o.fresh_state(layer);
+    let mut cap = Capture::default();
+    let step = Step {
+        lw,
+        layer,
+        s: ids.len(),
+        start_pos: 0,
+        input_ids: ids,
+        phase: "pre",
+    };
+    o.run_layer(&step, &mut st, h, &mut cap);
+    cap
+}
+
+/// A deterministic bf16 activation block, `[n, dim]`, seeded by `name`.
+///
+/// **Changing the draw or the `NamedRng` sequence re-bases goldens in four suites at once** —
+/// `v4_oracle`, `v4_indexer_kernel`, `v4_compress_kernel` and `v4_compress_probe` — and
+/// `v4_oracle`'s `fixed_h` reaches it indirectly, so the blast radius is not visible from
+/// that file. This doc line was orphaned onto `indexer_w` until 2026-08-06, which is how a
+/// shared fixture source ended up with nothing at its definition saying what it is shared by.
 pub fn probe(name: &str, n: usize, dim: usize) -> Vec<f32> {
     let mut r = NamedRng::new(name);
     (0..n * dim)

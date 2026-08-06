@@ -353,29 +353,25 @@ fn engine_comp_rows(win: usize, ratio: usize, seqlen: usize, start_pos: usize) -
 /// because the remainder is what decides how many blocks exist, and `start_pos` straddles
 /// multiples of `ratio` because that is where a decode step emits one.
 fn comp_cases() -> Vec<(usize, usize, usize, usize)> {
+    // The four positions around a `ratio` boundary that BOTH axes have to sweep: the first,
+    // the last before a block completes, the completing one, and the first of the next block.
+    // Written once because they are the same four for the same reason — the remainder decides
+    // how many blocks exist — and because two hand-written copies of a boundary list is how
+    // one axis quietly loses a case. Shared with the `start_pos` sweep below, which appends
+    // its own tail.
+    let straddle = |ratio: usize| [1usize, ratio - 1, ratio, ratio + 1];
     let mut v = Vec::new();
     for &(win, ratio) in &[(8usize, 4usize), (128, 4), (128, 128), (4, 4)] {
-        for seqlen in [
-            1usize,
-            ratio - 1,
-            ratio,
-            ratio + 1,
-            2 * ratio,
-            3 * ratio + 2,
-            130,
-        ] {
+        for seqlen in straddle(ratio)
+            .into_iter()
+            .chain([2 * ratio, 3 * ratio + 2, 130])
+        {
             v.push((win, ratio, seqlen, 0));
         }
-        for sp in [
-            1usize,
-            ratio - 1,
-            ratio,
-            ratio + 1,
-            2 * ratio - 1,
-            win,
-            win + 1,
-            300,
-        ] {
+        for sp in straddle(ratio)
+            .into_iter()
+            .chain([2 * ratio - 1, win, win + 1, 300])
+        {
             v.push((win, ratio, 1, sp));
         }
     }
@@ -512,27 +508,26 @@ fn the_positional_selection_refuses_past_the_indexer_truncation_point() {
     let shipped = shipped_index_topk();
     assert_eq!(shipped, 512);
     assert_eq!(4 * (shipped + 1), 2052, "the truncation point moved");
-    assert!(
+    // The two sides of the shipped cliff differ ONLY in `start_pos`, so they are asked the
+    // same way: five fields spelled twice is five chances for the accepted case and the
+    // refused one to differ somewhere other than the position under test, which would make
+    // the pair prove nothing about where the cliff is.
+    let at_shipped = |start_pos| {
         Sel {
             win: 128,
             kind: r4,
             index_topk: shipped,
             seqlen: 1,
-            start_pos: 2050
+            start_pos,
         }
         .shape()
-        .is_ok()
+    };
+    assert!(
+        at_shipped(2050).is_ok(),
+        "2051 total positions is one below the cliff and must still be accepted"
     );
     assert!(
-        Sel {
-            win: 128,
-            kind: r4,
-            index_topk: shipped,
-            seqlen: 1,
-            start_pos: 2051
-        }
-        .shape()
-        .is_err(),
+        at_shipped(2051).is_err(),
         "2052 total positions must be the first refusal"
     );
 }

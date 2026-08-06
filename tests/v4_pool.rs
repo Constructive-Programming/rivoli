@@ -58,6 +58,32 @@ mod v4_artifact_dir;
 /// it silently.
 const CAPACITY: usize = 5 << 30;
 
+/// One raw `submit`: the resolved slots, their formats, and their tickets, with nothing
+/// waited on.
+///
+/// Split out of [`submit_and_land`] because the ticket case below needs a submit that has
+/// NOT been waited on — an unwaited miss is the only state in which `Ticket::is_resident` is
+/// false, and that is the thing it asserts. Two spellings of the same three-buffer call is
+/// what `build.rs`'s duplication gate found, and it is also two chances to pass `o`/`f`/`t`
+/// in the wrong order: `submit` takes three `&mut Vec` in a row and only `t` is typed
+/// differently from the other two.
+///
+/// The refusal cases further down do NOT come through here and still spell the raw call:
+/// each asserts `is_err()`, and this helper eats the `Result`. So the transposition risk
+/// above is closed on the accepted path and left open at those three — which is the right
+/// trade, since a refusal case that transposed its buffers is still refused.
+fn submit(
+    pin: &mut V4Pin,
+    layer: usize,
+    sel: &[usize],
+) -> (Vec<ExpertSlot>, Vec<RoutedFmt>, Vec<Ticket>) {
+    let (mut out, mut fmt, mut tickets) = (Vec::new(), Vec::new(), Vec::new());
+    pin.routed
+        .submit(layer, sel, &[], &[], &mut out, &mut fmt, &mut tickets)
+        .unwrap_or_else(|e| panic!("submit layer {layer}: {e:#}"));
+    (out, fmt, tickets)
+}
+
 /// Submit `sel` at `layer`, wait for every ticket, and return the resolved slots.
 ///
 /// The waits go on a real stream and are followed by a full `device_sync`, because the
@@ -71,10 +97,7 @@ fn submit_and_land(
     layer: usize,
     sel: &[usize],
 ) -> Vec<ExpertSlot> {
-    let (mut out, mut fmt, mut tickets) = (Vec::new(), Vec::new(), Vec::new());
-    pin.routed
-        .submit(layer, sel, &[], &[], &mut out, &mut fmt, &mut tickets)
-        .unwrap_or_else(|e| panic!("submit layer {layer}: {e:#}"));
+    let (out, fmt, tickets) = submit(pin, layer, sel);
     assert_eq!(out.len(), sel.len());
     assert!(
         fmt.iter().all(|&f| f == RoutedFmt::F4),
@@ -444,23 +467,21 @@ fn a_miss_carries_a_real_ticket_and_a_hit_carries_the_resident_one(c: &mut Case<
         pin, stream, layer, ..
     } = c;
     let layer = *layer;
-    let (mut o, mut f, mut t) = (Vec::new(), Vec::new(), Vec::new());
 
-    pin.routed
-        .submit(layer, &[42], &[], &[], &mut o, &mut f, &mut t)
-        .unwrap();
+    let (_, _, cold) = submit(pin, layer, &[42]);
     assert!(
-        !t[0].is_resident(),
+        !cold[0].is_resident(),
         "a cold expert must carry a real dependency"
     );
-    pin.routed.wait_on(t[0], stream.raw()).unwrap();
+    pin.routed.wait_on(cold[0], stream.raw()).unwrap();
     device_sync().unwrap();
 
-    pin.routed
-        .submit(layer, &[42], &[], &[], &mut o, &mut f, &mut t)
-        .unwrap();
+    // The SAME submit again, deliberately: re-asking for an expert that has now landed is how
+    // the hit path is reached at all, so this second call is the test and not a copy of the
+    // first. Only the ticket it hands back differs, which is the assertion below.
+    let (_, _, hot) = submit(pin, layer, &[42]);
     assert_eq!(
-        t[0],
+        hot[0],
         Ticket::RESIDENT,
         "a hit must carry the satisfied ticket"
     );

@@ -660,7 +660,7 @@ fn expert_range_f4_guards() {
                 stream.raw(),
             )
         };
-        r.map_err(|e| format!("{e:#}"))
+        guard_err(r)
     };
     let (hid, int, lim) = (cfg.dim, cfg.moe_inter_dim, cfg.swiglu_limit);
 
@@ -991,7 +991,6 @@ fn gate_logits(lw: &LayerW, x: &[f32]) -> Vec<f32> {
 /// bias/`tid2eid` combinations the reference never produces and needs them REJECTED — a
 /// helper that derived them from a layer could not express an illegal one. Returns the
 /// `Result` for the same reason.
-#[allow(clippy::too_many_arguments)]
 fn gate_call(
     cfg: &V4Config,
     logits: *const f32,
@@ -1006,7 +1005,7 @@ fn gate_call(
     // (when non-null) is `vocab_size · k` and covers `input_id`, and both outputs hold `k`.
     // Every rejected combination returns before a dereference; the sync below is inside the
     // buffers' lifetimes.
-    unsafe {
+    guard_err(unsafe {
         launch_moe_gate_v4(
             logits,
             bias,
@@ -1020,8 +1019,42 @@ fn gate_call(
             i.ptr_mut() as *mut i32,
             stream.raw(),
         )
-    }
-    .map_err(|e| format!("{e:#}"))
+    })
+}
+
+/// [`gate_call`]'s accepted path: require the launch, join it, and read both output buffers
+/// back as `(weights, indices)`.
+///
+/// The whole tail both scoring probes share, which is why it takes the `Result` rather than
+/// leaving the `.expect` at each site — that split is what `build.rs`'s duplication gate
+/// found. The guard test deliberately does not come here: it needs the `Result` unconsumed.
+///
+/// One place is also where the index DECODE belongs. `ib` comes back as bytes and `k` `i32`s
+/// are cut out of it at stride 4 by hand; a second copy of that loop is a second chance to
+/// take the wrong four bytes, which returns plausible expert ids assembled from the halves of
+/// two real ones. The weights would still match, and only the selection comparison would go
+/// red — pointing the reader at the router rather than at the readback.
+///
+/// `wb` and `ib` are two adjacent `&mut DeviceBuf` and a transposition would compile — the
+/// hazard `HcW` and `Widths` exist to remove elsewhere. It is left as a pair here because
+/// both callers pass them straight through from their own `gate_call` in that call's order,
+/// so the two lines sit together and a swap is visible at the site rather than hidden behind
+/// a constructor.
+fn gate_landed(
+    r: Result<(), String>,
+    wb: &mut DeviceBuf,
+    ib: &mut DeviceBuf,
+    k: usize,
+) -> (Vec<f32>, Vec<i32>) {
+    r.expect("moe_gate_v4");
+    device_sync().expect("device sync");
+    let iv = ib.copy_out().expect("indices");
+    (
+        f32v(&wb.copy_out().expect("weights")),
+        (0..k)
+            .map(|j| i32::from_le_bytes(iv[j * 4..j * 4 + 4].try_into().unwrap()))
+            .collect(),
+    )
 }
 
 /// Run `moe_gate_v4` for one token of a real layer. `input_id` is read only where the layer
@@ -1036,7 +1069,7 @@ fn gpu_gate(cfg: &V4Config, lw: &LayerW, logits: &[f32], input_id: usize) -> (Ve
         .map(|t| to_device(&t.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()));
     let mut wb = zeros(k * 4);
     let mut ib = zeros(k * 4);
-    gate_call(
+    let r = gate_call(
         cfg,
         lb.ptr() as *const f32,
         bias.as_ref()
@@ -1046,16 +1079,8 @@ fn gpu_gate(cfg: &V4Config, lw: &LayerW, logits: &[f32], input_id: usize) -> (Ve
         input_id,
         &mut wb,
         &mut ib,
-    )
-    .expect("moe_gate_v4");
-    device_sync().expect("device sync");
-    let iv = ib.copy_out().expect("indices");
-    (
-        f32v(&wb.copy_out().expect("weights")),
-        (0..k)
-            .map(|j| i32::from_le_bytes(iv[j * 4..j * 4 + 4].try_into().unwrap()))
-            .collect(),
-    )
+    );
+    gate_landed(r, &mut wb, &mut ib, k)
 }
 
 /// Both router modes against the oracle: a hash layer (0-2, `tid2eid`, no bias) and a
@@ -1150,7 +1175,7 @@ fn the_router_breaks_ties_towards_the_lower_expert_id() {
     let mut pick = |logits: &[f32]| {
         let lb = to_device(&f32b(logits));
         // A scored layer (bias, no table), because ties only matter where a top-k runs.
-        gate_call(
+        let r = gate_call(
             cfg,
             lb.ptr() as *const f32,
             zero_bias.ptr() as *const f32,
@@ -1158,13 +1183,9 @@ fn the_router_breaks_ties_towards_the_lower_expert_id() {
             0,
             &mut wb,
             &mut ib,
-        )
-        .expect("moe_gate_v4");
-        device_sync().expect("device sync");
-        let iv = ib.copy_out().expect("indices");
-        (0..k)
-            .map(|j| i32::from_le_bytes(iv[j * 4..j * 4 + 4].try_into().unwrap()))
-            .collect::<Vec<i32>>()
+        );
+        // Only the selection matters here; the weights are all equal by construction.
+        gate_landed(r, &mut wb, &mut ib, k).1
     };
 
     // Every score identical: the k lowest ids, in ascending order.
@@ -1248,20 +1269,56 @@ fn the_router_refuses_what_it_claims_to() {
 // 5. mHC
 // =======================================================================================
 
+/// One sublayer's three mHC tensors, in the order `hc_pre` reads them.
+///
+/// A struct rather than three adjacent `&[f32]` parameters. `fn`, `scale` and `base` have
+/// different LENGTHS but the same type, they were spelled adjacently at three call sites, and
+/// a transposition compiles: `hc_pre` uploads each into its own buffer and reads them at the
+/// strides its own arguments imply, so swapping two would produce finite, plausible numbers
+/// from the wrong tensors — and both this and the golden it is scored against would be
+/// reading the same wrong thing only if the ORACLE were wrong the same way, which it is not,
+/// so it would surface as an unexplained numeric gap. Naming the constructors
+/// [`HcW::attn`]/[`HcW::ffn`] also removes the second mistake available here: a caller
+/// mixing `hc_attn_scale` into the ffn triple.
+///
+/// The same argument `tests/common/mod.rs`'s `Mla` makes about six `usize`.
+#[derive(Clone, Copy)]
+struct HcW<'a> {
+    fnw: &'a [f32],
+    scale: &'a [f32],
+    base: &'a [f32],
+}
+
+impl<'a> HcW<'a> {
+    fn attn(lw: &'a LayerW) -> Self {
+        Self {
+            fnw: &lw.hc_attn_fn,
+            scale: &lw.hc_attn_scale,
+            base: &lw.hc_attn_base,
+        }
+    }
+
+    fn ffn(lw: &'a LayerW) -> Self {
+        Self {
+            fnw: &lw.hc_ffn_fn,
+            scale: &lw.hc_ffn_scale,
+            base: &lw.hc_ffn_base,
+        }
+    }
+}
+
 /// `hc_pre` for one sublayer, returning `(y, post, comb)` device-side readbacks.
 fn gpu_hc_pre(
     cfg: &V4Config,
     h: &[f32],
-    fnw: &[f32],
-    scale: &[f32],
-    base: &[f32],
+    w: HcW<'_>,
     s: usize,
     iters: usize,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let stream = HipStream::new().expect("stream");
     let (hc, dim) = (cfg.hc_mult, cfg.dim);
-    let (hb, fb) = (to_device(&f32b(h)), to_device(&f32b(fnw)));
-    let (sb, bb) = (to_device(&f32b(scale)), to_device(&f32b(base)));
+    let (hb, fb) = (to_device(&f32b(h)), to_device(&f32b(w.fnw)));
+    let (sb, bb) = (to_device(&f32b(w.scale)), to_device(&f32b(w.base)));
     let mut y = zeros(s * dim * 4);
     let mut post = zeros(s * hc * 4);
     let mut comb = zeros(s * hc * hc * 4);
@@ -1362,24 +1419,11 @@ fn gpu_rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
 /// against a re-derivation.
 fn capture(layer: usize, s: usize) -> (Capture, Vec<f32>, Vec<u32>) {
     let (cfg, m, o) = fixture();
-    let mut r = NamedRng::new("hc-h");
-    let mut h: Vec<f32> = (0..s * cfg.hc_mult * cfg.dim)
-        .map(|_| bf16_decode(bf16_encode(r.unit())))
-        .collect();
+    let mut h = common::probe("hc-h", s, cfg.hc_mult * cfg.dim);
     let mut ri = NamedRng::new("hc-ids");
     let ids: Vec<u32> = (0..s).map(|_| ri.below(cfg.vocab_size) as u32).collect();
     let h0 = h.clone();
-    let mut cap = Capture::default();
-    let mut st = o.fresh_state(layer);
-    let step = Step {
-        lw: &m.layers[layer],
-        layer,
-        s,
-        start_pos: 0,
-        input_ids: &ids,
-        phase: "pre",
-    };
-    o.run_layer(&step, &mut st, &mut h, &mut cap);
+    let cap = common::prefill_capture(o, &m.layers[layer], layer, &ids, &mut h);
     (cap, h0, ids)
 }
 
@@ -1441,15 +1485,7 @@ fn mhc_reproduces_the_layer_goldens() {
         rounded
     };
 
-    let (y, post, comb) = gpu_hc_pre(
-        cfg,
-        &h_in,
-        &lw.hc_attn_fn,
-        &lw.hc_attn_scale,
-        &lw.hc_attn_base,
-        S,
-        iters,
-    );
+    let (y, post, comb) = gpu_hc_pre(cfg, &h_in, HcW::attn(lw), S, iters);
     assert_matches(
         &g("L0.pre.attn_norm_out"),
         &norm(&y, &lw.attn_norm, "attn"),
@@ -1457,15 +1493,7 @@ fn mhc_reproduces_the_layer_goldens() {
     );
 
     let h1 = gpu_hc_post(cfg, &g("L0.pre.attn_out"), &h_in, &post, &comb, S);
-    let (y2, post2, comb2) = gpu_hc_pre(
-        cfg,
-        &h1,
-        &lw.hc_ffn_fn,
-        &lw.hc_ffn_scale,
-        &lw.hc_ffn_base,
-        S,
-        iters,
-    );
+    let (y2, post2, comb2) = gpu_hc_pre(cfg, &h1, HcW::ffn(lw), S, iters);
     assert_matches(
         &g("L0.pre.ffn_norm_out"),
         &norm(&y2, &lw.ffn_norm, "ffn"),
@@ -1519,7 +1547,7 @@ fn the_mhc_launchers_refuse_what_they_claim_to() {
     let pre = |s, hc, iters| {
         // SAFETY: every rejected case returns before a dereference, and the accepted one is
         // sized by the buffers above; all of them outlive the sync that follows it.
-        unsafe {
+        guard_err(unsafe {
             launch_hc_pre(
                 hp,
                 fp,
@@ -1536,8 +1564,7 @@ fn the_mhc_launchers_refuse_what_they_claim_to() {
                 cp,
                 stream.raw(),
             )
-        }
-        .map_err(|e| format!("{e:#}"))
+        })
     };
     let (hc, it) = (cfg.hc_mult, cfg.hc_sinkhorn_iters);
     assert!(pre(1, hc, it).is_ok(), "the accepted case must be accepted");
@@ -1554,8 +1581,7 @@ fn the_mhc_launchers_refuse_what_they_claim_to() {
         // SAFETY: same — rejected before a dereference, accepted within the buffers. `y`
         // (`dim`) is the sublayer output and `expanded` (`hc·dim`) the destination; they are
         // DISTINCT, because `hc_post` reads `x[tok·dim+d]` while writing every copy.
-        unsafe { launch_hc_post(yp, hp, pp, cp, s, hc, cfg.dim, ep, stream.raw()) }
-            .map_err(|e| format!("{e:#}"))
+        guard_err(unsafe { launch_hc_post(yp, hp, pp, cp, s, hc, cfg.dim, ep, stream.raw()) })
     };
     assert!(
         post_call(1, hc).is_ok(),
@@ -1581,22 +1607,9 @@ fn sinkhorn_iteration_count_is_live() {
     let (cfg, m, _) = fixture();
     const S: usize = 2;
     let lw = &m.layers[0];
-    let mut r = NamedRng::new("sink-h");
-    let h: Vec<f32> = (0..S * cfg.hc_mult * cfg.dim)
-        .map(|_| bf16_decode(bf16_encode(r.unit())))
-        .collect();
+    let h = common::probe("sink-h", S, cfg.hc_mult * cfg.dim);
     assert!(cfg.hc_sinkhorn_iters >= 2, "this test subtracts one below");
-    let run = |iters| {
-        gpu_hc_pre(
-            cfg,
-            &h,
-            &lw.hc_attn_fn,
-            &lw.hc_attn_scale,
-            &lw.hc_attn_base,
-            S,
-            iters,
-        )
-    };
+    let run = |iters| gpu_hc_pre(cfg, &h, HcW::attn(lw), S, iters);
     let (_, _, c20) = run(cfg.hc_sinkhorn_iters);
     let (_, _, c2) = run(2);
     let (_, _, c19) = run(cfg.hc_sinkhorn_iters - 1);
@@ -2315,6 +2328,18 @@ fn compare(want: &[f32], got: &[f32], label: &str) -> (f32, f32) {
 fn assert_matches(want: &[f32], got: &[f32], label: &str) {
     let (err, tol) = compare(want, got, label);
     assert!(err <= tol, "{label}: err={err:.3e} > tol={tol:.3e}");
+}
+
+/// A launcher's error rendered the way [`assert_guards`] matches on it.
+///
+/// **`{e:#}` and not `{e}`, which is the load-bearing part and the whole reason this is one
+/// function.** The guard code lives in the CHAINED context, so `{e}` prints only the
+/// outermost message and every code assertion in this file stops matching at once — and
+/// `assert_guards` reports that as "want guard 1002, got ...", i.e. as a failing guard rather
+/// than as a broken format. Four launcher wrappers ended this way; two of the copies were
+/// what `build.rs`'s duplication gate found.
+fn guard_err<T, E: std::fmt::Display>(r: Result<T, E>) -> Result<T, String> {
+    r.map_err(|e| format!("{e:#}"))
 }
 
 /// Assert each launcher `Result` carries the guard CODE it is paired with.
