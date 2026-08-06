@@ -116,7 +116,17 @@ else
   # Hashing the raw log makes G1 red on EVERY run, and a gate that always fires gets deleted.
   for f in g1-glm g1-v4; do
     [ -s "$OUT/$f.raw" ] || continue
-    sed -E 's/^[0-9]{4}-[0-9-]+T[0-9:.]+Z? +//; s/[0-9]+\.[0-9]+ ?(s|ms|tok\/s|%|GB)/N\1/g' \
+    # STRIP ANSI FIRST. `tracing_subscriber::fmt` colourizes, so every line begins with
+    # `\x1b[2m` and a `^[0-9]{4}` anchor never matches -- all 21 timestamps survived into the
+    # hash and G1 could not pass, on any tree, ever. Written 2026-08-05 and never run
+    # end-to-end until Track 1 ran check.sh; the repair that made G1 actually decode turned it
+    # from vacuously GREEN into permanently RED, and nothing caught the swap because nobody
+    # had run the comparison half. Same root cause as G3 hashing the empty string.
+    #
+    # Timing is normalized too, not just timestamps: ms/s/tok-s/%/GB move run to run on a
+    # shared box and are not decode-determined. What must NOT be normalized is anything the
+    # decode chose -- token ids, hit/miss counts, histogram buckets, the emitted text.
+    sed -E 's/\x1b\[[0-9;]*m//g; s/^[0-9]{4}-[0-9-]+T[0-9:.]+Z? +//; s/[0-9]+\.[0-9]+ ?(s|ms|tok\/s|%|GB)/N\1/g' \
       "$OUT/$f.raw" > "$OUT/$f.txt"
     sha256sum "$OUT/$f.txt" | cut -c1-16 | xargs echo "  $f sha:"
   done
