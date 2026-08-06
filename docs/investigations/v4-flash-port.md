@@ -2216,13 +2216,23 @@ The same shape holds on L1 and on both decode cells. `attn_norm_out`'s 4.88e-4 o
 
 > **CORRECTED 2026-08-06 — both claims on this line are wrong, and they were mine.**
 >
-> **"~20 ULP" is a unit error.** It divides `max_abs` by the bf16 ULP at `|x|≈1.2`, but the
-> maximum occurs where `|x|≈13`, one binade set higher. Per element it is **~2.5 ULP**:
+> **"~20 ULP" is a unit error — and so was my first correction of it.** The figure is
+> **10.0 ULP**, MEASURED by `probe_attn_stages` on 2026-08-06. Every other value in this
+> table was derived by *assuming* a magnitude, and the four assumptions disagree by 16×:
 >
-> | | bf16 ULP | 7.81e-2 in ULP |
-> |---|---:|---:|
-> | at `\|x\|=1.2` | 0.00391 | 20.0 ← what I quoted |
-> | at `\|x\|=13.1` | 0.03125 | **2.5** ← the real figure |
+> | mantissa width | `\|x\|` binade | bf16 ULP | 7.81e-2 in ULP | |
+> |---|---|---:|---:|---|
+> | 2⁻⁸ *(wrong — bf16 has 7 explicit bits)* | `[1,2)` | 0.00391 | 20.0 | my original claim |
+> | 2⁻⁸ *(wrong)* | `[8,16)` | 0.03125 | 2.5 | my "correction", wrong twice over |
+> | **2⁻⁷ (bf16)** | **`[1,2)`** | **0.00781** | **10.0** | **measured** |
+> | 2⁻⁷ (bf16) | `[8,16)` | 0.0625 | 1.25 | |
+>
+> I said 20.0 using the wrong mantissa width. I then "corrected" it to 2.5 using the wrong
+> width **and** the wrong binade, and dated that into this file. `max_abs` does not sit at
+> `|x|≈13` at all — it sits in `[1,2)`, which only the instrument could say. **Three of these
+> four numbers are defensible-looking arithmetic and all three are wrong**; the lesson is not
+> "check the binade" but that a per-element ULP figure quoted without an instrument is a
+> guess wearing a unit.
 >
 > **"the first bad tensor" reads a bisection into an amplification gradient.** V4's attention
 > block performs **three fp8 `act_quant` steps** (`xq`, `qrq`, `y`). An e4m3 step is 2⁻⁴..2⁻³
@@ -2243,13 +2253,35 @@ The same shape holds on L1 and on both decode cells. `attn_norm_out`'s 4.88e-4 o
 > retracted is the verdict column and the inference chain built on it — including the
 > "confirmed correct" list below, which was only ever "less amplified".
 >
-> **Still open.** The one-parameter fit that suggested a residual defect (fraction swept at a
-> fixed ±1 ULP) was reviewed 2026-08-06 and found to reject a null model this file's own probe
-> calls the wrong shape — real fold noise is heavy-tailed, median 1 ULP, p99 21, max 326. A
-> two-axis sweep brackets the engine's three statistics simultaneously, and `max_rel` alone
-> spans 9.79–21.13 across 12 seeds at one point. So the residual is **not evidence of a
-> defect**; it is also not evidence there is none. The discriminating measurement is reading
-> `attn_derot` off the DEVICE, which has not been done.
+> **RESOLVED 2026-08-06 by measuring the device.** The residual is **withdrawn** — it swept
+> one parameter at fixed magnitude against a null model this file's own probe documents as the
+> wrong shape. `probe_attn_stages` then read the stages off the DEVICE:
+>
+> | stage | L0 prefill differing | |
+> |---|---:|---|
+> | `attn_norm_out` | 26 / 53,248 | **every one at exactly 1 ULP** (`>1ULP` = 0) |
+> | `kv_entry` | 0.69% | |
+> | `q` | 6.69% | |
+> | `attn_derot` | 14.48% | |
+> | `attn_out` | 57.92% | |
+>
+> At decode `attn_norm_out`, `kv_entry` and `q` are **bit-identical** and `attn_derot` still
+> moves 14% — the ring it attends was written by the prefill. **Everything traces to one ULP
+> of input.** Feeding the device's own measured input deviation into the transcription
+> reproduces `kv_entry` and `q` jointly at percentile 55/62 on L0 and **5/15 on L1**: the
+> device is *closer* to the oracle than a typical draw.
+>
+> **There is no visible defect in the attention block.** Narrower than "no defect": see the
+> separations below.
+>
+> **The bounds gate two of four tensors, and the ratios say which.** Derived against all
+> **eighteen** in-scope defects (a first draft used two, and seven of the eighteen cleared it
+> simultaneously): `17 / 275 / 23 / 71`, separating at **45× / 30× / 1.3× / 1.6×**. So
+> `kv_entry` and `q` gate; `attn_derot` and `attn_out` barely do. `QkNormAfterRope` moves
+> `attn_out` **less than the device does**, so no bound on that tensor can ever separate it,
+> and `max_rel` is near-blind to scaling defects — `SkipQkNorm` doubles every element of `q`
+> and reads 1.07. `ffn_norm_out` and `.out` keep the underived 5e-2 and stay RED; their
+> envelope needs `hc_post` and the MoE transcribed.
 
 **What this rules IN and OUT.** Between the clean tensor and the wrong one there are exactly two
 ops, and the probe that split them puts the boundary at `attention` rather than `hc_post`. So:
