@@ -105,15 +105,29 @@ pub enum Dtype {
 }
 
 impl Dtype {
-    fn parse(s: &str) -> Option<Dtype> {
-        Some(match s {
-            "F32" => Dtype::F32,
-            "U8" => Dtype::U8,
-            "I8" => Dtype::I8,
-            "I64" => Dtype::I64,
-            "BF16" => Dtype::Bf16,
-            "F8_E4M3" => Dtype::F8E4M3,
-            "F8_E8M0" => Dtype::F8E8M0,
+    /// Narrow the `safetensors` crate's dtype to the ones this engine decodes.
+    ///
+    /// This enum stays rather than becoming a re-export because the crate's is
+    /// `#[non_exhaustive]` with ~20 variants: every `match` on it would need a `_` arm, and
+    /// the point of a closed seven-variant enum is that adding a dtype is a COMPILE error at
+    /// each decode site instead of a runtime fallthrough. The narrowing happens once, here.
+    ///
+    /// **That is not hypothetical, and 0.8.0 is why.** Its two additions over 0.7.0 are
+    /// `F8_E4M3FNUZ` and `F8_E5M2FNUZ` — the AMD/Graphcore fp8 encodings, a different
+    /// exponent bias and no signed zero, and this engine runs on AMD. The `_` arm below
+    /// REFUSES them. A re-export would instead have let an FNUZ tensor reach
+    /// `quant::dequant_fp8_block`, which decodes OCP e4m3 unconditionally: every weight off by
+    /// a power of two, no error anywhere, fluent wrong output. The bytes do not say which
+    /// encoding they are — only the dtype string does — so this match is the whole check.
+    fn narrow(d: safetensors::Dtype) -> Option<Dtype> {
+        Some(match d {
+            safetensors::Dtype::F32 => Dtype::F32,
+            safetensors::Dtype::U8 => Dtype::U8,
+            safetensors::Dtype::I8 => Dtype::I8,
+            safetensors::Dtype::I64 => Dtype::I64,
+            safetensors::Dtype::BF16 => Dtype::Bf16,
+            safetensors::Dtype::F8_E4M3 => Dtype::F8E4M3,
+            safetensors::Dtype::F8_E8M0 => Dtype::F8E8M0,
             _ => return None,
         })
     }
@@ -356,61 +370,55 @@ impl Safetensors {
             let file = std::fs::File::open(path).with_context(|| format!("open {path:?}"))?;
             // SAFETY: read-only for the reader's lifetime.
             let mmap = unsafe { Mmap::map(&file) }.with_context(|| format!("mmap {path:?}"))?;
-            ensure!(
-                mmap.len() >= 8,
-                "{path:?}: {} bytes, not a safetensors",
-                mmap.len()
-            );
-            let hlen = u64::from_le_bytes(mmap[..8].try_into()?) as usize;
-            // A TRUNCATED shard — a download still in flight, an interrupted copy — has a
-            // complete header describing data that is not there yet. Without this check
-            // the file opens, indexes cleanly, and every read past the end panics on a
-            // slice range deep inside a converter. Measured 2026-08-04: the V4-Flash
-            // checkpoint was being fetched while this code was written, and 21 of its 48
-            // shards were absent or partial at any given moment.
-            ensure!(
-                8 + hlen <= mmap.len(),
-                "{path:?}: header claims {hlen} bytes but the file is {} — truncated",
-                mmap.len()
-            );
-            let hdr: serde_json::Value = serde_json::from_slice(&mmap[8..8 + hlen])
-                .with_context(|| format!("parse header {path:?}"))?;
+            // `read_metadata`, not `SafeTensors::deserialize`: the latter hands back
+            // `TensorView`s BORROWING the buffer, and `Self` owns the mmaps — that is the
+            // self-referential struct this offset index exists to avoid. `read_metadata`
+            // returns the header length and owned offsets, which is exactly what `Loc` wants.
+            //
+            // It subsumes both truncation checks this used to make by hand, and is stricter
+            // than either: it requires `8 + header + data == file length` EXACTLY, where the
+            // hand-rolled pair only asked that the last tensor end at or before EOF. It also
+            // checks contiguity and that each tensor's byte extent matches its own
+            // shape × dtype, per tensor, which nothing here did.
+            //
+            // Why that matters, kept from the hand-rolled version: a TRUNCATED shard — a
+            // download still in flight, an interrupted copy — carries a complete header
+            // describing data that is not there yet. Unchecked, the file opens, indexes
+            // cleanly, and every read past the end panics on a slice range deep inside a
+            // converter. Measured 2026-08-04: the V4-Flash checkpoint was being fetched while
+            // this code was written, and 21 of its 48 shards were absent or partial at any
+            // given moment. The crate's error names neither the file nor that diagnosis, so
+            // both are added back here — a correct check with an unreadable message gets
+            // misread as corruption.
+            //
+            // The context offers truncation as ONE cause and not the only one, because
+            // `read_metadata` also rejects a malformed header — bad offsets, a shape that
+            // disagrees with its own extent. Naming only truncation would send a reader
+            // hunting a download that finished fine. The crate's own reason is appended by
+            // anyhow after this line, and it is the half that says which.
+            let (hlen, meta) = safetensors::SafeTensors::read_metadata(&mmap)
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .with_context(|| {
+                    format!(
+                        "{path:?}: not a readable safetensors ({} bytes) — truncated, still \
+                         downloading, or a malformed header",
+                        mmap.len()
+                    )
+                })?;
             let base = 8 + hlen;
             let shard = mmaps.len();
-            for (name, t) in hdr
-                .as_object()
-                .context("safetensors header not an object")?
-            {
-                if name == "__metadata__" {
-                    continue;
-                }
-                let u = |v: &serde_json::Value| v.as_u64().context("non-integer header field");
-                let off = t["data_offsets"].as_array().context("data_offsets")?;
-                let (b, e) = (u(&off[0])? as usize, u(&off[1])? as usize);
-                let dtype = Dtype::parse(t["dtype"].as_str().context("dtype")?)
+            for (name, t) in meta.tensors() {
+                let dtype = Dtype::narrow(t.dtype)
                     .with_context(|| format!("unsupported dtype for {name}"))?;
-                let shape = t["shape"]
-                    .as_array()
-                    .context("shape")?
-                    .iter()
-                    .map(|v| u(v).map(|x| x as usize))
-                    .collect::<Result<_>>()?;
-                // Per-tensor, not just per-file: the data region can be short of what the
-                // LAST tensor claims even when the header itself parsed.
-                ensure!(
-                    base + e <= mmap.len(),
-                    "{path:?}: tensor {name} ends at {} but the file is {} — truncated",
-                    base + e,
-                    mmap.len()
-                );
+                let (b, e) = t.data_offsets;
                 index.insert(
-                    name.clone(),
+                    name,
                     Loc {
                         shard,
                         begin: base + b,
                         len: e - b,
                         dtype,
-                        shape,
+                        shape: t.shape.clone(),
                     },
                 );
             }
@@ -1752,6 +1760,73 @@ mod tests {
                 err.contains("truncated") || err.contains("not a safetensors"),
                 "cut to {cut}: {err}"
             );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reader stopped doing its own offset arithmetic on 2026-08-06 and the comment
+    /// there claims the `safetensors` crate checks strictly MORE. That is the kind of claim
+    /// this repo keeps finding to be false, so it is a test.
+    ///
+    /// The three rejected headers are each the plausible-but-wrong case rather than garbage:
+    /// every one parses as JSON, names a real dtype, and is the right total length, so the
+    /// old hand-rolled reader indexed all three and would have handed out a mis-shaped or
+    /// mis-placed tensor. None of them was reachable by `--verify`, because a converter
+    /// compares bytes it laid out itself.
+    ///
+    /// **The control arm is the point.** Without a well-formed file that must OPEN, three
+    /// `is_err()`s prove only that the reader rejects things — a reader that rejected
+    /// everything would pass. It also pins which property each arm violates: the control and
+    /// the first case differ in exactly one integer.
+    ///
+    /// Each arm asserts the error it should get, not merely that there was one. Bare
+    /// `is_err()` on all three would stay green if a single coarse check started catching
+    /// everything — the arms would stop being three tests and nothing would say so. `shape`
+    /// must fail on the extent-vs-dtype rule and the other two on placement, and the two
+    /// placement arms name the tensor at fault, which is the only thing separating them.
+    #[test]
+    fn a_header_that_disagrees_with_its_own_shape_is_refused() {
+        let dir = tmpdir("hdrmath");
+        let path = format!("{dir}/t.safetensors");
+        let write = |hdr: &str, data: usize| {
+            let mut b = (hdr.len() as u64).to_le_bytes().to_vec();
+            b.extend_from_slice(hdr.as_bytes());
+            b.resize(b.len() + data, 0u8);
+            std::fs::write(&path, &b).unwrap();
+        };
+
+        write(
+            r#"{"t":{"dtype":"F32","shape":[4],"data_offsets":[0,16]}}"#,
+            16,
+        );
+        Safetensors::open_file(&path).expect("the well-formed control must open");
+
+        for (why, hdr, data, want) in [
+            (
+                "shape says 8 f32 = 32 bytes but the extent is 16",
+                r#"{"t":{"dtype":"F32","shape":[8],"data_offsets":[0,16]}}"#,
+                16,
+                "invalid shape, data type, or offset for tensor",
+            ),
+            (
+                "the only tensor does not start at offset 0",
+                r#"{"t":{"dtype":"F32","shape":[4],"data_offsets":[8,24]}}"#,
+                24,
+                "invalid offset for tensor `t`",
+            ),
+            (
+                "two tensors leave an 8-byte hole between them",
+                r#"{"a":{"dtype":"F32","shape":[4],"data_offsets":[0,16]},"b":{"dtype":"F32","shape":[4],"data_offsets":[24,40]}}"#,
+                40,
+                "invalid offset for tensor `b`",
+            ),
+        ] {
+            write(hdr, data);
+            let err = match Safetensors::open_file(&path) {
+                Ok(_) => panic!("accepted: {why}"),
+                Err(e) => format!("{e:#}"),
+            };
+            assert!(err.contains(want), "{why}: wanted {want:?}, got {err:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

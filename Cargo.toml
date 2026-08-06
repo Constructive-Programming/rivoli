@@ -48,6 +48,24 @@ clap = { version = "4", default-features = false, features = [
     "error-context",
     "suggestions",
 ] }
+# Safetensors header parsing — the READER half only. Both hand-rolled readers (the engine's
+# `artifact::format::Safetensors`, the oracle's independent `v4oracle::Checkpoint`) walked the
+# `u64 hlen ‖ JSON ‖ data` framing and its offset arithmetic by hand. `read_metadata` replaces
+# that and checks strictly MORE: offsets contiguous from 0, and `end - begin == shape.product()
+# * dtype.size()` for every tensor in the shard at open time, not just the one being fetched.
+#
+# **The WRITER is deliberately NOT adopted, and cannot be.** `safetensors::serialize` sorts
+# tensors by (descending dtype, then name) and pads the header to a multiple of 8 with spaces;
+# `SafeWriter` preserves insertion order and does not pad. Same tensors, different bytes — so
+# adopting it would make every artifact already on disk unreproducible by its own converter,
+# which is the one thing G2 exists to forbid. `SafeWriter` stays hand-rolled and says so.
+#
+# `default-features = false, features = ["alloc"]` for the same reason as clap's above: the
+# `std` feature exists to pull `dep:tempfile` for `serialize_to_file`'s atomic rename — part
+# of the writer we are not using — and it costs tempfile + rustix + linux-raw-sys + fastrand.
+# 8 transitive crates down to 4. The only thing given up is `impl std::error::Error`, so these
+# errors cross into anyhow by Display rather than by `?`.
+safetensors = { version = "0.8.0", default-features = false, features = ["alloc"] }
 
 [features]
 # Teacher-forced scoring (`--ppl`). Off by default: it is a quality INSTRUMENT, not

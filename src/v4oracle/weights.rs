@@ -393,24 +393,23 @@ pub enum Dtype {
 }
 
 impl Dtype {
-    fn parse(s: &str) -> Result<Self> {
-        Ok(match s {
-            "BF16" => Dtype::Bf16,
-            "F32" => Dtype::F32,
-            "F8_E4M3" => Dtype::F8E4M3,
-            "F8_E8M0" => Dtype::F8E8M0,
-            "I8" => Dtype::I8,
-            "I64" => Dtype::I64,
-            other => bail!("unhandled safetensors dtype {other}"),
+    /// Narrow the `safetensors` crate's dtype to the six this checkpoint uses. Kept as its
+    /// own closed enum rather than a re-export for the reason given on the engine side: the
+    /// crate's is `#[non_exhaustive]`, so every match would need a `_` arm — and 0.8.0's
+    /// `F8_E4M3FNUZ` is a live example of a dtype whose bytes are indistinguishable from
+    /// `F8_E4M3` but whose exponent bias is not. The oracle refuses it here for the same
+    /// reason the engine does, and refusing it SEPARATELY is the point: a shared narrowing
+    /// would make one misreading agree with itself across both implementations.
+    fn narrow(d: safetensors::Dtype) -> Result<Self> {
+        Ok(match d {
+            safetensors::Dtype::BF16 => Dtype::Bf16,
+            safetensors::Dtype::F32 => Dtype::F32,
+            safetensors::Dtype::F8_E4M3 => Dtype::F8E4M3,
+            safetensors::Dtype::F8_E8M0 => Dtype::F8E8M0,
+            safetensors::Dtype::I8 => Dtype::I8,
+            safetensors::Dtype::I64 => Dtype::I64,
+            other => bail!("unhandled safetensors dtype {other:?}"),
         })
-    }
-    fn width(self) -> usize {
-        match self {
-            Dtype::I64 => 8,
-            Dtype::F32 => 4,
-            Dtype::Bf16 => 2,
-            Dtype::F8E4M3 | Dtype::F8E8M0 | Dtype::I8 => 1,
-        }
     }
 }
 
@@ -458,6 +457,15 @@ impl RawTensor {
 ///
 /// Deliberately not `src/artifact/`'s loader: the oracle judges the engine, so sharing a
 /// reader with it would make any misreading of the checkpoint invisible to both.
+///
+/// **NARROWED 2026-08-06.** Both this and `artifact::format::Safetensors` now parse the
+/// header through the `safetensors` crate, so one third-party parser does sit on both sides
+/// of that boundary. The independence claim above is unchanged and this is why: what the
+/// oracle exists to catch is a disagreement about *arithmetic* — dequant, scale direction,
+/// block tiling, reduction order — and none of that is in the framing. A framing bug is not
+/// a quiet disagreement the two could share; it reads the wrong bytes and both sides produce
+/// garbage loudly. The shard SELECTION, the dtype narrowing, and every decode below stay
+/// separately written, which is where a shared misreading could actually hide.
 pub struct Checkpoint {
     root: std::path::PathBuf,
     index: HashMap<String, String>,
@@ -509,61 +517,36 @@ impl Checkpoint {
         // caught by the length check below rather than by a fault.
         let map = unsafe { memmap2::Mmap::map(&file) }
             .with_context(|| format!("mmapping {}", path.display()))?;
-        if map.len() < 8 {
-            bail!("{} is too short to be a safetensors file", path.display());
-        }
-        let hdr_len = u64::from_le_bytes([
-            map[0], map[1], map[2], map[3], map[4], map[5], map[6], map[7],
-        ]) as usize;
-        let hdr_end = 8 + hdr_len;
-        if map.len() < hdr_end {
-            bail!("{} header is truncated", path.display());
-        }
-        let hdr: serde_json::Value = serde_json::from_slice(&map[8..hdr_end])?;
-        let e = hdr.get(name).ok_or_else(|| {
+        // Everything this used to check by hand, `read_metadata` now checks for every tensor
+        // in the shard: `8 + header + data == file length` exactly, offsets contiguous from
+        // zero, and `end - begin == shape.product() * dtype.size()`. That last one was the
+        // `want` comparison here, and it needed a `checked_sub` because `b - a` would WRAP in
+        // release on a malformed header with `b < a`; the crate does the same subtraction
+        // under a `e < s` guard. `Dtype::width` existed only to compute `want` and went with
+        // it. The "shard is incomplete (still downloading?)" diagnosis does not survive in
+        // the crate's error, so it is restored in the context below — the check is what
+        // matters, but an unreadable message from a correct check gets misread as corruption.
+        // It is offered as one cause among several, not as the diagnosis: `read_metadata`
+        // rejects a malformed header too, and naming only truncation would send a reader
+        // hunting a download that finished fine. anyhow appends the crate's own reason, which
+        // is the half that says which.
+        let (hdr_len, meta) = safetensors::SafeTensors::read_metadata(&map)
+            .map_err(|e| anyhow!("{e}"))
+            .with_context(|| {
+                format!(
+                    "{}: not a readable safetensors — the shard may be incomplete (still \
+                     downloading), or its header malformed",
+                    path.display()
+                )
+            })?;
+        let info = meta.info(name).ok_or_else(|| {
             anyhow!("index says {name} is in {shard}, but its header has no such tensor")
         })?;
-        let dtype = Dtype::parse(
-            e.get("dtype")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| anyhow!("{name}: no dtype"))?,
-        )?;
-        let shape: Vec<usize> = e
-            .get("shape")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| anyhow!("{name}: no shape"))?
-            .iter()
-            .filter_map(|v| v.as_u64().map(|u| u as usize))
-            .collect();
-        let off = e
-            .get("data_offsets")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| anyhow!("{name}: no data_offsets"))?;
-        let (a, b) = match (
-            off.first().and_then(|v| v.as_u64()),
-            off.get(1).and_then(|v| v.as_u64()),
-        ) {
-            (Some(a), Some(b)) => (a as usize, b as usize),
-            _ => bail!("{name}: malformed data_offsets"),
-        };
-        let want = shape.iter().product::<usize>() * dtype.width();
-        // `b - a` would WRAP in release on a malformed header with b < a, and the wrapped
-        // value would then almost certainly fail the `want` comparison -- but "almost
-        // certainly" is not a bound, so subtract checked.
-        let len = b.checked_sub(a).filter(|l| *l == want).ok_or_else(|| {
-            anyhow!("{name}: header says [{a}, {b}) for shape {shape:?} {dtype:?}, expected {want} bytes")
-        })?;
-        debug_assert_eq!(len, want);
-        if hdr_end + b > map.len() {
-            bail!(
-                "{}: tensor {name} runs past the end of the file — the shard is incomplete \
-                 (still downloading?)",
-                path.display()
-            );
-        }
+        let (a, b) = info.data_offsets;
+        let hdr_end = 8 + hdr_len;
         Ok(RawTensor {
-            dtype,
-            shape,
+            dtype: Dtype::narrow(info.dtype).with_context(|| format!("tensor {name}"))?,
+            shape: info.shape.clone(),
             bytes: map[hdr_end + a..hdr_end + b].to_vec(),
         })
     }

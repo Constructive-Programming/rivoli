@@ -250,6 +250,78 @@ artifact formats. The existing HTTP framing tests are pure host code and already
 rather than against the buffer it just wrote, because that comparison could never fail —
 preserve that reasoning if the skeleton moves.
 
+> **DONE 2026-08-06 — ~1,000 estimated, −23 delivered, and the estimate was wrong in a way
+> worth recording.** Two of the three sub-items were already done or should not be done, and
+> that was only visible after measuring the replaceable surface rather than the file sizes.
+>
+> The **−23** is net: the reader swap is **−67** and the anti-vacuity test it needed is
+> **+43**. Quoting only the −67 would be the more flattering number and the wrong one — the
+> test is not overhead attached to the refactor, it is the part that makes the refactor
+> checkable, and this plan's own line is that ~43% of the tree is test code and that is not a
+> line-count target. A track that trades 67 lines of hand-rolled arithmetic for 43 lines of
+> executable proof has done well; a track that reports −67 and does not mention the test has
+> mis-stated its result.
+>
+> **(1) safetensors — DONE, −67 in the readers, +43 in test, +4 transitive crates.** Both readers now parse
+> the header through `safetensors::SafeTensors::read_metadata`. **The ~500 estimate counted
+> two things the crate does not provide.**
+>
+> - **The WRITER cannot be adopted, at all.** `safetensors::serialize` sorts tensors by
+>   (descending dtype, then name) and pads the header to a multiple of 8 with spaces;
+>   `SafeWriter` preserves insertion order and does not pad. Same tensors, different bytes.
+>   Swapping it would make every artifact already on disk unreproducible by its own
+>   converter — G2 does not merely fail, it fails by construction. This was found by reading
+>   `prepare()` before writing any code, and it is the reason the sub-item is a third of its
+>   estimate. `SafeWriter` stays hand-rolled with the argument recorded in `Cargo.toml`.
+> - **The shard-selection layer has no crate equivalent** — `open_dir`, `open_indexed` (the
+>   partial-checkpoint path), `Checkpoint::open` over `model.safetensors.index.json`. That is
+>   most of what looked like "hand-rolled parsing" by line count.
+>
+>   What the crate DOES replace is the offset arithmetic, and it checks strictly more than
+>   either hand-rolled reader did: exact `8 + header + data == file length`, offsets
+>   contiguous from zero, and `end - begin == shape.product() * dtype.size()` for **every**
+>   tensor at open, not just the one being fetched. The oracle's `checked_sub` guard and
+>   `Dtype::width` existed only for that last check and went with it.
+>
+>   Two things were deliberately kept. Both `Dtype` enums stay closed rather than becoming
+>   re-exports, because the crate's is `#[non_exhaustive]`: a `_` arm at every decode site
+>   turns "a new dtype appears" from a compile error into a runtime fallthrough. And the
+>   dependency is `default-features = false, features = ["alloc"]` — `std` exists to pull
+>   `dep:tempfile` for `serialize_to_file`, part of the writer we are not using, at a cost of
+>   tempfile + rustix + linux-raw-sys + fastrand. 8 transitive crates down to 4.
+>
+>   The claim "checks strictly more" is now `format.rs::a_header_that_disagrees_with_its_own_
+>   shape_is_refused`, with a control arm that must OPEN — three `is_err()`s alone would pass
+>   for a reader that rejected everything.
+>
+> **(2) HTTP — DECLINED, and the plan's own escape clause is why.** `tiny_http` keeps
+> "no async runtime" but not the rest. `Server::http` spawns an accept thread plus a task
+> pool that **grows without bound** — `task_pool.rs::spawn`: *"If no thread is available,
+> spawns a new one"* — and it reimplements the HTTP/1.1 keep-alive state machine that
+> `serve.rs` deleted on purpose (`Connection: close`, one request per connection).
+>
+> Priced honestly: it replaces **~110 lines** of framing (`read_req` 40, the response writers
+> ~48, the accept loop) and would delete ~40 lines of test that currently guard a real hazard
+> — `a_short_body_fails_rather_than_serving_a_truncated_prompt`. The ~400 estimate was the
+> whole module minus tests; the other ~700 lines are OpenAI protocol semantics, tool-call
+> parsing and SSE shaping, which no HTTP crate touches. So: 5 crates and an unbounded thread
+> pool, in the one process that must stay sole-tenant on the GPU, for ~110 lines net. The
+> single robustness gain — chunked request bodies — is a **documented, tested, deliberate
+> refusal** in `read_req`, not a gap.
+>
+> **(3) `half` — ALREADY DONE, nothing to migrate.** `math.rs::f32_to_bf16`/`bf16_to_f32`/
+> `f32_to_f16` already delegate to `half`. What remains hand-rolled is not a duplicate of
+> anything: `half` 2.7 ships only `f16` and `bf16`, so `f32_to_e4m3`, `e4m3_to_f32` and
+> `quant::e8m0` have no crate to defer to, and `v4oracle/numerics.rs`'s `bf16_encode`/
+> `bf16_decode` are the deliberate reference transliterations that are jscpd-exempt for
+> exactly that reason. The ~100 estimate was of code that had already been retired.
+>
+> **The generalisable lesson, and it applies to Tracks G and K.** Every over-estimate here
+> came from sizing a sub-item by the FILE and discounting by intuition. The replaceable
+> surface is the only number worth writing down, and it is cheap to measure first: read the
+> candidate crate's `prepare`/`serialize`/`spawn` before writing a line. Track G's ~700 and
+> Track K's ~350 were produced the same way and should be re-measured, not trusted.
+
 ## Track 3 — One golden / defect-matrix harness · ~2,200 lines · LAST, alone
 
 **Owns `tests/**`.** Runs after Tracks 1, 2 and 4 have landed, because Track 1 deletes
@@ -416,6 +488,32 @@ trap.
 the recorded break (restoring `n_experts + 1` rejects the shipped `L00.f4` at 3422556160 vs
 3435925504 — exactly one stride).
 
+> **BEFORE TOUCHING THIS TRACK: `tests/v4_loading.rs` is RED on the dev profile, and its whole
+> fixture family computes strides at an illegal shape.** Found 2026-08-06 by Track 4, which
+> ran the full suite on the **dev** profile — the first time anything had.
+>
+> `magic_separates_the_formats_when_the_length_cannot` panics in `quant.rs:162`,
+> `vq_groups`'s `debug_assert_eq!(i_dim % VQ_GROUP, 0)`, with `i_dim 32`. The cause is one
+> constant: the fixture's `MOE_INTER = 32` against `VQ_GROUP = 64`.
+>
+> **Under `--release` the assert is compiled out and `32 / 64` evaluates to 0 groups**, so
+> `vq_expert_stride` returns a stride with the scales array *entirely omitted* — and the test
+> passes, because the fixture and the reader are both doing the same wrong arithmetic. This is
+> the "output-neutral because both sides share the error" shape, and the only instrument that
+> could see it was the `debug_assert` that the prescribed profile deleted. Confirmed
+> pre-existing at `bbecf74`, byte-identical failure; **not** caused by Track 4.
+>
+> Two consequences for this track, neither optional:
+> - The *magic* half of that test is sound; the **length** half has been asserting at a
+>   degenerate shape where no VQ scale bytes exist at all. Before unifying the offset
+>   families, raise `MOE_INTER` to a legal multiple of `VQ_GROUP` and re-derive the recorded
+>   break's numbers — the 3422556160 / 3435925504 pair above was measured against the shipped
+>   artifact, not this fixture, so it stands, but nothing else in the file does.
+> - The gate says these tests "must still go red under the recorded break". **One of them is
+>   red right now for an unrelated reason**, which is precisely how a break corpus stops
+>   discriminating. Fix the fixture first, confirm the suite is green, and only then trust a
+>   red as evidence of anything.
+
 ## Declined, with reasons
 
 - **`otlp`** — ~150 lines for three heavy dependencies. Worth doing for **build time**, not
@@ -451,8 +549,8 @@ s4     Track 3  (tests/)         ─┐ ALONE as a pair — the safety net goes 
 |---|---:|---|
 | 1 retire Vulkan | ~~6,600~~ **12,420 — DONE 2026-08-06** | ~~G1 + featureless build + asserted cell count~~ **all held**; estimate was 2x low, see Track 1 |
 | 3 tests/ harness | 2,200 | **G4** |
-| 4 crates | 1,000 | G2 |
-| 2 ABI macro | 1,000 | **G3** per launcher |
+| 4 crates | ~~1,000~~ **23 net — DONE 2026-08-06** | **G1/G2/G3 all held**; −67 in the readers, +43 in the test that proves the new checks fire. Estimate 43x high — the writer is unswappable and 2 of 3 sub-items were already done or declined, see Track 4 |
+| 2 ABI macro | ~~1,000~~ **737 — DONE 2026-08-06** | ~~G3~~ **G5 expansion + G1 on GLM and V4, all held**; G3 was structurally blind to it, see Track 2 |
 | F in-src tests | 1,000 | **G4** |
 | G converters | 700 | G2 |
 | H rm i4_audit | 697 | ~~no inbound refs~~ **DONE 2026-08-05** — there were seven files, one build-breaking; see Track H |
@@ -463,9 +561,31 @@ s4     Track 3  (tests/)         ─┐ ALONE as a pair — the safety net goes 
 **Projected:** 36,100 → ~22,050, a **39%** reduction, with every feature except the Vulkan
 backend and the `i4_audit` forensic tool intact.
 
+> **The total row is the ORIGINAL projection and is not a running tally — do not read it as
+> one.** It has never summed the per-track column, and after four completed tracks the two
+> disagree in both directions. Measured 2026-08-06, same instrument as the baseline table
+> (non-comment, non-blank lines under `src/ tests/ kernels/`): **34,579**, against a 36,100
+> baseline — a drop of 1,521, not the ~13,900 the completed rows add up to. The difference is
+> not an error in either number: **the V4-Flash port is adding code to the same tree these
+> tracks are removing it from**, and `tests/` has grown 11,328 → 11,820 across the same span.
+> Anyone auditing progress needs the delta measured at two shas of the same file set, not a
+> column sum. Left uncorrected rather than rewritten, because the projection is what the
+> tracks were scoped against.
+
 ## What would be a successful negative result
 
 Any track that reports "this cannot be done at acceptable cost, here is the measurement" is a
 success. Specifically: if Track 2's macro cannot carry the per-launcher prose, it should stop
 at the extern decls and say so. If `tiny_http` cannot preserve the no-runtime property, Track
 4 should skip it. If the break corpus cannot be made runnable, Track 3 does not start.
+
+> **The `tiny_http` clause fired on 2026-08-06, but not on the condition it names.**
+> `tiny_http` *does* preserve "no async runtime" — it is threads, not futures — so a track
+> checking only the stated condition would have proceeded. It was declined on two properties
+> the clause did not think to ask about: an **unbounded** thread pool, and a reimplemented
+> keep-alive state machine that `serve.rs` deleted on purpose. Full accounting under Track 4.
+>
+> Worth generalising, because the next two crate swaps inherit it: **an escape clause names
+> the objection you already thought of, and passing it is not the same as being safe.** The
+> question to ask a candidate crate is "what does it add", not "does it violate the one
+> constraint I wrote down".
