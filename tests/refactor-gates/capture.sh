@@ -126,7 +126,33 @@ else
     # Timing is normalized too, not just timestamps: ms/s/tok-s/%/GB move run to run on a
     # shared box and are not decode-determined. What must NOT be normalized is anything the
     # decode chose -- token ids, hit/miss counts, histogram buckets, the emitted text.
-    sed -E 's/\x1b\[[0-9;]*m//g; s/^[0-9]{4}-[0-9-]+T[0-9:.]+Z? +//; s/[0-9]+\.[0-9]+ ?(s|ms|tok\/s|%|GB)/N\1/g' \
+    #
+    # THE NUMBER HAD TO HAVE A DECIMAL POINT, and most timings do not. Found 2026-08-06 by
+    # Track 2, whose expansion gate had already PROVEN the change emits identical code: G1
+    # still came back red on GLM, on three lines, every difference an integer-valued timing.
+    # `[0-9]+\.[0-9]+` cannot match `moe 348ms`, `1153us` or `38%`, and `us` was not a unit at
+    # all — so the whole per-layer `moe/layer by miss count` histogram and both PROFILE lines
+    # survived into the hash. The decimal is now optional and `us` is a unit.
+    #
+    # `span 1153->12507us` needs its own rule: the left number carries no unit of its own.
+    #
+    # The counts in that same histogram — `n=137`, `n=356`, `1775 hit`, `181.58 miss` — are
+    # decode-determined and were byte-identical across both arms. They stay visible: the unit
+    # alternation is what separates the two, and nothing without one of those suffixes is
+    # touched. That is the line this gate has to hold, and widening the regex is exactly where
+    # it would be easiest to lose it — `181.58 miss` is one character away from matching `ms`.
+    #
+    # AND IT WAS ALMOST LOST, on the first attempt at this repair. A plain `%` in the unit
+    # alternation also matched the banner's `2q_kin=8% 2q_kout=20%`, which are CONFIGURATION,
+    # not timing — so widening the gate to see three more timing lines silently blinded it to
+    # a changed cache parameter. The percent rule therefore refuses to fire after `=`: a
+    # timing percentage is written ` 38%` or `+985%`, a setting is written `kin=8%`. It keys on
+    # the character BEFORE the number, and that has to be a whitelist rather than `[^=]`:
+    # `[^=]` happily starts the match one digit in, turning `2q_kout=20%` into `2N%` — the
+    # setting still hidden, and now corrupted in a way that reads like a real difference.
+    sed -E 's/\x1b\[[0-9;]*m//g; s/^[0-9]{4}-[0-9-]+T[0-9:.]+Z? +//;
+            s/[0-9]+(\.[0-9]+)? ?(tok\/s|ms|us|GB|s)/N\2/g;
+            s/([ (+-])[0-9]+(\.[0-9]+)?%/\1N%/g; s/span [0-9]+->/span N->/g' \
       "$OUT/$f.raw" > "$OUT/$f.txt"
     sha256sum "$OUT/$f.txt" | cut -c1-16 | xargs echo "  $f sha:"
   done

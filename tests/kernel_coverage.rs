@@ -146,6 +146,22 @@ fn every_launcher_has_an_oracle() {
     // to its own reader.
     let decl = format!("pub unsafe fn {}", "launch_");
 
+    // TWO declaration forms since 2026-08-06, and the census must see both.
+    //
+    // Track 2 replaced 41 of the 47 hand-written launcher/extern pairs with `launchers! { … }`
+    // declarations, where a launcher reads `launch_gemv_vq -> rivoli_gemv_vq, "gemv_vq" (`.
+    // Six remain hand-written (a `bool` argument, three `&T`-to-`*const T` coercions, one
+    // symbol with no matching extern, one destructuring body) — so the old pattern is still
+    // live and dropping it would silently shrink the denominator by six.
+    //
+    // **This census is why the macro's DSL spells `launch_*` out instead of pasting it from a
+    // stem.** A `paste!`-built ident would put the name nowhere in the source, and the only
+    // thing that noticed would be this floor — which is exactly what happened when the batch
+    // conversion first ran: 6 found against a floor of 40, failing loudly. That failure was
+    // the check working. It is recorded here because the tempting repair is to lower the
+    // floor, and the correct one was to make the names greppable again.
+    let stem = format!("{}{}", "launch", "_");
+
     // The whole backend directory, not one file. Keying on the single path
     // `src/backend/vk.rs` is what let the last move break this census, and a launcher that
     // relocated into a sibling module would leave the census silently — the denominator
@@ -153,9 +169,18 @@ fn every_launcher_has_an_oracle() {
     let backend = corpus("src/backend", "");
     let launchers: Vec<String> = backend
         .lines()
-        .filter_map(|l| l.trim_start().strip_prefix(&decl))
-        .filter_map(|rest| rest.split('(').next())
-        .map(|n| n.to_string())
+        .map(str::trim_start)
+        .filter_map(|l| {
+            l.strip_prefix(&decl)
+                .and_then(|rest| rest.split('(').next())
+                .or_else(|| {
+                    // `launch_<name> -> rivoli_<sym>, "<tag>" (`
+                    l.strip_prefix(&stem)
+                        .filter(|_| l.contains(" -> rivoli_"))
+                        .and_then(|rest| rest.split(" ->").next())
+                })
+        })
+        .map(str::to_string)
         .collect();
 
     // Anti-vacuity: a parse that silently matches nothing passes forever. This has bitten
