@@ -254,6 +254,11 @@ fn moe_gain_in_band(s: &str) -> Result<f32, String> {
 /// and every historical `-bench 128/256/512` keeps its exact recorded behaviour — the
 /// default prompt stops on EOS at ~318 tokens, which is why 512 was the largest budget
 /// anyone recorded.
+// The whole `BENCH_*` group is read only by the rocm `main` below, so it is gated by the
+// file rule at the top rather than left to warn. Featureless CI has been red on exactly
+// these four since 243d438 (2026-08-03) — `fn main` was gated `any(rocm, vulkan)` there and
+// the constants were not gated at all — so this is not fallout from retiring Vulkan.
+#[cfg(feature = "rocm")]
 const BENCH_SCRIPT_MIN: usize = 512;
 
 /// The opening turn of a scripted run, replacing the historical `-bench` prompt above
@@ -270,6 +275,7 @@ const BENCH_SCRIPT_MIN: usize = 512;
 /// So: an open-ended engineering request of the kind a real user actually sends. It asks
 /// for reasoning and for a bottleneck analysis, both of which are naturally long, and it
 /// frames the subject the thirteen follow-ups then drill into.
+#[cfg(feature = "rocm")]
 const BENCH_SCRIPT_OPEN: &str = "I'm building a decode engine for a mixture-of-experts \
      language model whose expert weights are far too large to fit in GPU memory, so most of \
      them have to stream from an NVMe drive while the resident ones compute. Walk me \
@@ -280,6 +286,7 @@ const BENCH_SCRIPT_OPEN: &str = "I'm building a decode engine for a mixture-of-e
 /// every `-bench 128/256/512` in `docs/measurement/benchmarks.md` stays comparable. Those
 /// command lines do not record the prompt, so changing it for them would silently
 /// invalidate a year of recorded numbers with nothing to point at.
+#[cfg(feature = "rocm")]
 const BENCH_PROMPT_LEGACY: &str = "The sky is blue because";
 
 /// The scripted follow-up turns, fed one per EOS. Thirteen turns on ONE subject, because
@@ -302,6 +309,7 @@ const BENCH_PROMPT_LEGACY: &str = "The sky is blue because";
 /// one changes the token sequence, the routing, and hence the hit rate and every number a
 /// `-bench` above [`BENCH_SCRIPT_MIN`] produces, and the command line does not record the
 /// prompt. Add a turn rather than reword one.
+#[cfg(feature = "rocm")]
 const BENCH_SCRIPT: [&str; 13] = [
     "Go deeper on the routing itself: how does the gate pick experts for a token, why \
      top-k rather than a softmax over all of them, and what goes wrong when the routing is \
