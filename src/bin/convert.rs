@@ -12,6 +12,7 @@ use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use rivoli::artifact::format::{
     Dtype, ExpertHeader, FormatMeta, SafeWriter, Safetensors, VQ3_MAGIC, finish_artifact,
+    write_atomic,
 };
 use rivoli::artifact::quant::{
     ExpertProjs, FP8_BLOCK, PROJ, VQ_ALIGN, VQ_DIM, VQ_K, expert_base, expert_projs,
@@ -480,7 +481,12 @@ fn main() -> Result<()> {
             encode_expert(src, &base, projs, cb, slot, enc, validate)
         })
         .with_context(|| format!("encode layer {l}"))?;
-        std::fs::write(&path, &buf)?;
+        // NOT `std::fs::write`: the `continue` above skips an existing path without reading
+        // it, so a run killed mid-write would leave a short 3.7 GB `L{ll}.vq3` that re-running
+        // this command can never repair. `convert_v4` has had the tmp+rename since it was
+        // written and this loop did not — see [`write_atomic`] for how that divergence was
+        // found and why there is now one implementation.
+        write_atomic(&path, &buf)?;
         eprintln!("convert: wrote {path}");
     }
 

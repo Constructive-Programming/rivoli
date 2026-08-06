@@ -23,7 +23,7 @@ use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use rivoli::artifact::format::{
     Dtype, EXPERT_HEADER_BYTES, ExpertHeader, F4_MAGIC, F4Expert, FormatMeta, SafeWriter,
-    Safetensors, finish_artifact,
+    Safetensors, finish_artifact, write_atomic,
 };
 use rivoli::artifact::model::{V4Config, load_config};
 use rivoli::artifact::quant::{
@@ -293,10 +293,9 @@ fn main() -> Result<()> {
             .with_context(|| format!("repack layer {l}"))?;
             // tmp→rename: `std::fs::write` is not atomic and a layer file is 3.4 GB, so a run
             // killed mid-write would otherwise leave a short `L{ll}.f4` that the next run
-            // reuses and never re-reads. Rename within one directory is atomic.
-            let part = format!("{path}.part");
-            std::fs::write(&part, &buf).with_context(|| format!("write {part}"))?;
-            std::fs::rename(&part, &path).with_context(|| format!("rename {part} -> {path}"))?;
+            // reuses and never re-reads. Shared with `bin/convert` since 2026-08-06, which
+            // did NOT have it — see [`write_atomic`].
+            write_atomic(&path, &buf)?;
             eprintln!("convert_v4: wrote {path} ({} bytes)", buf.len());
         }
 

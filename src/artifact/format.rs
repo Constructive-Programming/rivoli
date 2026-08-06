@@ -666,6 +666,33 @@ impl F4Expert<'_> {
     }
 }
 
+/// Write `bytes` to `path` via `<path>.part` + rename. Rename within one directory is
+/// atomic, so a reader sees either no file or the whole file — never a short one.
+///
+/// **Why every converter must use this, and not `std::fs::write`.** Both converters resume by
+/// SKIPPING an output path that already exists, without reading it (`bin/convert` `continue`s,
+/// `convert_v4` sets `reused`). A layer file is 3–5 GB. So a non-atomic write plus a kill
+/// leaves a short `L{ll}.{ext}` that re-running the tool can never repair — the artifact then
+/// fails at load on `open_routed`'s `ensure!(len == want)`, and the fix is a manual `rm` of a
+/// file nobody would suspect.
+///
+/// **Found 2026-08-06, and this function exists because of HOW it was found.** `convert_v4`
+/// had the tmp+rename from the day it was written and `bin/convert` did not — two hand-written
+/// copies of one per-layer loop, and the single step where they diverged was the one carrying
+/// the defect. Track G was scoped to collapse those loops for the line count; the line count
+/// is small and this was the real find. One implementation now, so they cannot drift again.
+///
+/// **The guarantee is against process death, not power loss.** There is deliberately no
+/// `fsync` here: it matches what `convert_v4` has always done, and an `fsync` per 3.5 GB layer
+/// is a real cost to buy a property no converter has ever claimed. `I4Source::stamp` DOES
+/// fsync its manifest, and that asymmetry is correct — a torn manifest is unrecoverable, a
+/// torn layer file is regenerable.
+pub fn write_atomic(path: &str, bytes: &[u8]) -> Result<()> {
+    let part = format!("{path}.part");
+    std::fs::write(&part, bytes).with_context(|| format!("write {part}"))?;
+    std::fs::rename(&part, path).with_context(|| format!("rename {part} -> {path}"))
+}
+
 /// Write `<out_dir>/manifest.json` and copy `aux` (tokenizer and friends) beside it, so
 /// the artifact is self-contained. The last step of every converter.
 ///
@@ -1761,6 +1788,38 @@ mod tests {
                 "cut to {cut}: {err}"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [`write_atomic`] must leave the destination holding exactly the bytes given, and leave
+    /// no `.part` behind — a surviving `.part` beside a 3.7 GB layer file is indistinguishable
+    /// from a run still in progress, which is the confusion the helper exists to end.
+    ///
+    /// The third arm is the one worth having: a STALE `.part` left by a previous kill must be
+    /// overwritten, not appended to or trusted. It is seeded LONGER than the real payload, so
+    /// a rename of an un-truncated leftover would leave a file that is too long and the length
+    /// assertion catches it. Seeding it shorter would let a plain `write` pass by accident.
+    #[test]
+    fn write_atomic_replaces_a_stale_part_and_leaves_none_behind() {
+        let dir = tmpdir("atomic");
+        let path = format!("{dir}/L07.vq3");
+        let part = format!("{path}.part");
+
+        write_atomic(&path, b"first").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        assert!(!std::path::Path::new(&part).exists(), "left a .part behind");
+
+        write_atomic(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second", "did not replace");
+
+        std::fs::write(&part, vec![0xAAu8; 4096]).unwrap();
+        write_atomic(&path, b"third").unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"third",
+            "a stale .part survived into the destination"
+        );
+        assert!(!std::path::Path::new(&part).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

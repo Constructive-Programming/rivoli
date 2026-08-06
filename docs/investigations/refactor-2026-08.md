@@ -49,6 +49,7 @@ A change is a **refactor** iff every gate that applies to it holds:
 |---|---|---|
 | **G1 byte-identical output** | anything on a decode path | same prompt, same seed, `sha256` of the emitted text and of the logits probe. Not "looks the same" |
 | **G2 byte-identical artifact** | converters, format, quant | `convert_v4 --verify` over the real 43-layer checkpoint: 0 bytes differ |
+| | | **G2 covered only HALF of what it claims, until 2026-08-06.** Every track's gate says "on both artifact formats", and `capture.sh` only ever ran `convert_v4 --verify-only`. **Nothing re-ran `bin/convert`** — G1 decodes a pre-built `.vq3` artifact, so the GLM converter had NO gate at all, and Track 4's atomicity fix landed in a file nothing could check. The missing half now exists and is cheap to repeat: copy `codebooks.f32` out of a reference artifact into an empty dir (it is REUSED, not relearned — relearn it and the bytes legitimately move), then `convert /swarm/storage/ai/openclaw/glm52-fp8 <dir> --layers 1`, and compare `L03.vq3` against the shipped one. **Reference: `sha256 0e2bf30164e6e39c` = `/var/db/rivoli/glm52-vq3-full/L03.vq3`.** Cost per arm: **31.5 min, 6.8 GB**, CPU encode, no GPU and no lock. Run it against a stored sha rather than as an A/B and it is one arm, not two |
 | **G3 byte-identical ISA** | launchers, kernels, anything a macro emits | `llvm-objdump` diff of the built object. Count narrowly — a naive `v_fma\|v_mac\|v_mad` grep is mostly `v_mad_u64_u32` address arithmetic |
 | | | **G3 was vacuous until 2026-08-06 and is now real.** `.hip_fatbin` is a `__CLANG_OFFLOAD_BUNDLE__`, not an ELF, so the first version hashed x86 host stubs and the "fix" after that hashed **the empty string** — `01ba4719c80b6fe9`, sha256 of a bare newline, ten times. `capture.sh` now runs `clang-offload-bundler --unbundle` first and carries an anti-vacuity counter. **Seen red:** a `MOE_ACC_SHIFT` change in `common.hpp` moved `1f2d388ef9693af0 → 55debbd25d59a9a5`. Do not trust a green G3 you have not first made go red |
 | **G4 the break corpus** | anything touching tests | every recorded deliberate break still goes red, **with the same message naming the same subject**. A break that goes green is a regression; a break whose message changes subject is the "0-ULP compare wearing a slot-rule failure message" defect again |
@@ -398,6 +399,42 @@ never fail. If the shared skeleton averages that away it has made the gate unfir
 
 **Gate:** G2 on both artifact formats — 0 bytes differ over the real checkpoint.
 
+> **PARTLY DONE 2026-08-06 — the ~700 was not there, and measuring that found a defect.**
+>
+> **Four of the seven phases this track lists as "shared" were already factored:** reading
+> safetensors is `artifact::format::Safetensors`, the per-block fill is
+> `quant::fill_expert_blocks`, and manifest + tokenizer are both `finish_artifact`. `--verify`
+> exists once, in `convert_v4` only. `convert_v4.rs`'s own header has said it all along —
+> *"the two share almost nothing: there is no codebook to learn, no VQ encode, and no fp8
+> dequant on the routed path."* jscpd is at 0 clones tree-wide, which rules out copy-paste;
+> the phase-by-phase reading above is what rules out parallel structure.
+>
+> **What WAS duplicated is the ~25-line per-layer loop, and the one step where the two copies
+> diverged was the one carrying a defect.** `convert_v4` wrote each layer via `.part`+rename;
+> `bin/convert` called `std::fs::write` directly. Both resume by SKIPPING an output path that
+> exists without reading it, and a layer file is 3.7 GB — so a killed `convert` left a short
+> `L{ll}.vq3` that re-running the same command could never repair. Precisely: NOT silent
+> corruption, because `open_routed`'s `ensure!(len == want)` catches it at load; the cost was
+> an unrepairable-by-retry state needing a manual `rm` of a file nobody would suspect.
+>
+> Now one `format::write_atomic`, called by both, with a 3-arm test — including a **stale
+> `.part` seeded LONGER than the payload**, so an un-truncated leftover surviving into the
+> destination fails on length; seeded shorter, a plain `write` would pass by accident.
+> Verified red by deleting the rename (`left a .part behind`). Deliberately no `fsync`: that
+> matches what `convert_v4` always did, and the guarantee is against process death, not power
+> loss. `I4Source::stamp` DOES fsync its manifest and that asymmetry is right — a torn
+> manifest is unrecoverable, a torn layer file is regenerable.
+>
+> **Verified by the G2 half that had never been run** (see the gates table): `convert --layers
+> 1` reproduces the shipped `L03.vq3` at `0e2bf30164e6e39c` both before and after the change,
+> with no stray `.part`. 31m26s before, 31m33s after — the extra rename is 0.4%, inside noise.
+>
+> **Line count: roughly flat.** What the track bought is that the two loops can no longer
+> drift on this again. The remaining loop text is genuinely divergent — block count differs by
+> the shared expert, the magic differs, the pack closure IS the format — and collapsing it
+> further would put a `has_shared` flag and a format enum into a skeleton to save ~20 lines.
+> **Not worth it; that is this track's answer, not a deferral.**
+
 ## Track H — delete `i4_audit` · 697 · anytime, independent
 
 A straight deletion, not a refactor. Both citations are **closed** investigations
@@ -552,7 +589,7 @@ s4     Track 3  (tests/)         ─┐ ALONE as a pair — the safety net goes 
 | 4 crates | ~~1,000~~ **23 net — DONE 2026-08-06** | **G1/G2/G3 all held**; −67 in the readers, +43 in the test that proves the new checks fire. Estimate 43x high — the writer is unswappable and 2 of 3 sub-items were already done or declined, see Track 4 |
 | 2 ABI macro | ~~1,000~~ **737 — DONE 2026-08-06** | ~~G3~~ **G5 expansion + G1 on GLM and V4, all held**; G3 was structurally blind to it, see Track 2 |
 | F in-src tests | 1,000 | **G4** |
-| G converters | 700 | G2 |
+| G converters | ~~700~~ **~0 net — DONE 2026-08-06** | **G2 held on BOTH formats** (the GLM half ran for the first time). 4 of 7 phases were already factored; the value was one atomicity defect in the only step where the two copies diverged, see Track G |
 | H rm i4_audit | 697 | ~~no inbound refs~~ **DONE 2026-08-05** — there were seven files, one build-breaking; see Track H |
 | I loop skeleton | 600 | G1 on GLM **and** V4 |
 | K format/offset | 350 | G2 + recorded break still red |

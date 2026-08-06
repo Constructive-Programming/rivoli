@@ -28,9 +28,24 @@ use rivoli::artifact::quant::{VQ_ALIGN, f4_expert_stride, i4_expert_stride, vq_e
 mod v4_artifact_dir;
 
 /// Toy dims: the smallest that keep the three formats' strides distinct and give each
-/// projection more than one FP4 group. `f4_expert_stride(64, 32)` is one `VQ_ALIGN` block.
+/// projection more than one FP4 group.
+///
+/// **`MOE_INTER` was 32 until 2026-08-06, and that was an ILLEGAL VQ shape.** `VQ_GROUP` is
+/// 64, so `vq_groups(32)` trips `quant.rs`'s `debug_assert_eq!(i_dim % VQ_GROUP, 0)` — this
+/// file was red on the dev profile. It went unnoticed because under `--release` the assert is
+/// compiled out and `32 / 64` evaluates to **0 groups**, so `vq_expert_stride` returned a
+/// stride with the scale array entirely omitted, and the tests passed: the fixture and the
+/// reader were doing the same wrong arithmetic, and a comparison cannot see an error both
+/// sides share. `i4_groups`/`f4_groups` use `div_ceil` and were never affected; VQ is the one
+/// strict path.
+///
+/// **128 and not 64, and this is the part to not "simplify".** 64 is the smallest legal value,
+/// but `f4_header_dims_and_layer_id_are_confronted_with_the_config` asserts that a TRANSPOSED
+/// header reports `hidden {MOE_INTER} moe_inter {HIDDEN}`. With the two equal, a transposition
+/// is undetectable and that test passes vacuously — trading a red test for a dead one. They
+/// must stay distinct, and both multiples of `VQ_GROUP`.
 const HIDDEN: usize = 64;
-const MOE_INTER: usize = 32;
+const MOE_INTER: usize = 128;
 const N_EXPERTS: usize = 4;
 const N_LAYERS: usize = 2;
 
