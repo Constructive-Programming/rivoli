@@ -47,7 +47,12 @@ fn rows() -> Vec<Row> {
             // (row 1 deletes text) and `IFS=$'\t' read` collapsing it shifted every field
             // left, which is how the driver first ran the wrong test entirely.
             let f: Vec<&str> = l.split('\t').collect();
-            assert!(f.len() >= 5, "breaks.tsv:{}: want 5 tab-separated columns, got {}", i + 1, f.len());
+            assert!(
+                f.len() >= 5,
+                "breaks.tsv:{}: want 5 tab-separated columns, got {}",
+                i + 1,
+                f.len()
+            );
             let (bin, test) = match f[3].split_once(' ') {
                 Some((b, t)) => (b.to_string(), Some(t.to_string())),
                 None => (f[3].to_string(), None),
@@ -63,7 +68,10 @@ fn rows() -> Vec<Row> {
             }
         })
         .collect();
-    assert!(!v.is_empty(), "breaks.tsv parsed to zero rows — this test just went vacuous");
+    assert!(
+        !v.is_empty(),
+        "breaks.tsv parsed to zero rows — this test just went vacuous"
+    );
     v
 }
 
@@ -97,7 +105,12 @@ fn every_break_names_a_test_that_exists() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     for r in rows() {
         let p = root.join("tests").join(format!("{}.rs", r.bin));
-        assert!(p.exists(), "breaks.tsv:{}: no test binary tests/{}.rs", r.line, r.bin);
+        assert!(
+            p.exists(),
+            "breaks.tsv:{}: no test binary tests/{}.rs",
+            r.line,
+            r.bin
+        );
         if let Some(t) = &r.test {
             let src = std::fs::read_to_string(&p).unwrap();
             // A cargo filter is a SUBSTRING match over test names, not an exact name, so
@@ -114,7 +127,8 @@ fn every_break_names_a_test_that_exists() {
                 !selected.is_empty(),
                 "breaks.tsv:{}: filter {t:?} selects NO test in tests/{}.rs. A filter that \
                  matches nothing prints `test result: ok. 0 passed` and reads as GREEN.",
-                r.line, r.bin
+                r.line,
+                r.bin
             );
         }
     }
@@ -126,28 +140,39 @@ fn no_expect_fragment_is_satisfiable_by_libtest_boilerplate() {
     // that appears in the test's own name, or in libtest's own vocabulary, cannot enforce
     // that — libtest prints `test <name> ... FAILED` and a `failures:` block on every red.
     const BOILERPLATE: &[&str] = &[
-        "FAILED", "failures", "test result", "panicked", "error", "assertion", "left", "right",
+        "FAILED",
+        "failures",
+        "test result",
+        "panicked",
+        "error",
+        "assertion",
+        "left",
+        "right",
     ];
     for r in rows() {
         assert!(
             r.expect.len() >= 8,
             "breaks.tsv:{}: expect {:?} is too short to be a subject — `inf` matched \
              `info`/`infer`/`Infinity` anywhere in build output",
-            r.line, r.expect
+            r.line,
+            r.expect
         );
         if let Some(t) = &r.test {
             assert!(
                 !t.contains(&r.expect),
                 "breaks.tsv:{}: expect {:?} is a substring of the test NAME {:?}, so libtest \
                  echoing the name satisfies the check and any red reads as 'message matches'",
-                r.line, r.expect, t
+                r.line,
+                r.expect,
+                t
             );
         }
         for b in BOILERPLATE {
             assert!(
                 !r.expect.eq_ignore_ascii_case(b),
                 "breaks.tsv:{}: expect {:?} is libtest boilerplate present on every failure",
-                r.line, r.expect
+                r.line,
+                r.expect
             );
         }
     }

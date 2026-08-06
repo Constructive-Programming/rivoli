@@ -39,5 +39,9 @@ pub fn v4_artifact(probe: &str) -> Option<String> {
 /// Layers 3-5: scored routing, ratios 128/4/128, range does NOT start at 0 — the only
 /// fixture that can catch an `ExpertSet` or a `V4Pin` ignoring `first_layer`.
 pub fn v4_artifact_l3_5(probe: &str) -> Option<String> {
-    v4_artifact_at("RIVOLI_V4_ARTIFACT_L3_5", "/var/db/rivoli/v4-f4-l3-5", probe)
+    v4_artifact_at(
+        "RIVOLI_V4_ARTIFACT_L3_5",
+        "/var/db/rivoli/v4-f4-l3-5",
+        probe,
+    )
 }

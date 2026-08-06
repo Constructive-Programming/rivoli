@@ -21,7 +21,8 @@
 //!
 //! Deliberate breaks that proved each of these can fail are recorded in
 //! `docs/investigations/v4-flash-port.md`.
-#![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+// tests: panic-on-failure is the idiom
 // **`rocm`**, and the gate is narrower than "the only backend". Two things here are HIP's
 // specifically: the readback below reads a DEVICE address as a host pointer, which only
 // unified addressing makes legal, and `Stream::new()` is HIP's signature. Both were recorded
@@ -64,7 +65,12 @@ const CAPACITY: usize = 5 << 30;
 /// `device_sync` alone would return before any of that happened and the readback below would
 /// see whatever was in the slot. This is the host-side spelling of what `gpu.rs`'s expert
 /// loop does per launch.
-fn submit_and_land(pin: &mut V4Pin, stream: &Stream, layer: usize, sel: &[usize]) -> Vec<ExpertSlot> {
+fn submit_and_land(
+    pin: &mut V4Pin,
+    stream: &Stream,
+    layer: usize,
+    sel: &[usize],
+) -> Vec<ExpertSlot> {
     let (mut out, mut fmt, mut tickets) = (Vec::new(), Vec::new(), Vec::new());
     pin.routed
         .submit(layer, sel, &[], &[], &mut out, &mut fmt, &mut tickets)
@@ -166,7 +172,13 @@ fn l0_2() -> Option<(V4Config, V4Pin, Stream, usize, String)> {
 ///  * two different experts land in DIFFERENT slots holding DIFFERENT bytes, which is what
 ///    a pool that resolved every key to slot 0 would fail.
 fn a_resolved_slot_holds_that_experts_bytes_at_the_f4_offsets(c: &mut Case<'_>) {
-    let Case { cfg, pin, stream, layer, dir } = c;
+    let Case {
+        cfg,
+        pin,
+        stream,
+        layer,
+        dir,
+    } = c;
     let (cfg, layer, dir) = (&**cfg, *layer, &**dir);
     // Not 0..k: expert ids that are far apart in the file, so a block-offset error of one
     // stride is visible rather than landing on a neighbour with similar content.
@@ -187,9 +199,12 @@ fn a_resolved_slot_holds_that_experts_bytes_at_the_f4_offsets(c: &mut Case<'_>) 
         // The six addresses, against the layout — `gate.packed` IS the block base, so these
         // are deltas and a wrong `slot_offsets` moves at least one.
         let got = [
-            out[i].gate.packed, out[i].gate.scale,
-            out[i].up.packed, out[i].up.scale,
-            out[i].down.packed, out[i].down.scale,
+            out[i].gate.packed,
+            out[i].gate.scale,
+            out[i].up.packed,
+            out[i].up.scale,
+            out[i].down.packed,
+            out[i].down.scale,
         ];
         for (k, &p) in got.iter().enumerate() {
             assert_eq!(
@@ -201,7 +216,10 @@ fn a_resolved_slot_holds_that_experts_bytes_at_the_f4_offsets(c: &mut Case<'_>) 
     }
     // Distinct experts, distinct slots, distinct bytes. Experts 0 and 128 of a real layer
     // are independently trained, so equal content would mean the pool aliased them.
-    assert_ne!(out[0].gate.packed, out[2].gate.packed, "two experts share a slot");
+    assert_ne!(
+        out[0].gate.packed, out[2].gate.packed,
+        "two experts share a slot"
+    );
     assert_ne!(
         slot_bytes(out[0].gate.packed, 4096),
         slot_bytes(out[2].gate.packed, 4096),
@@ -217,7 +235,9 @@ fn a_resolved_slot_holds_that_experts_bytes_at_the_f4_offsets(c: &mut Case<'_>) 
 /// through the same `read_spec` the streamer used, so it is the bytes and not the arithmetic
 /// that is checked.
 fn the_pool_streams_by_absolute_layer_id_on_a_set_that_starts_at_three() {
-    let Some(dir) = v4_artifact_dir::v4_artifact_l3_5("L03.f4") else { return };
+    let Some(dir) = v4_artifact_dir::v4_artifact_l3_5("L03.f4") else {
+        return;
+    };
     let (cfg, mut pin) = open(&dir);
     let stream = Stream::new().unwrap();
     let range = pin.range();
@@ -237,8 +257,14 @@ fn the_pool_streams_by_absolute_layer_id_on_a_set_that_starts_at_three() {
         );
         seen.push(want);
     }
-    assert_ne!(seen[0], seen[1], "layers 3 and 4 must not hold the same expert 11");
-    assert_ne!(seen[1], seen[2], "layers 4 and 5 must not hold the same expert 11");
+    assert_ne!(
+        seen[0], seen[1],
+        "layers 3 and 4 must not hold the same expert 11"
+    );
+    assert_ne!(
+        seen[1], seen[2],
+        "layers 4 and 5 must not hold the same expert 11"
+    );
 
     // **Outside the range is refused, and the refusal leaves the pool UNCHANGED.** The
     // second half is the one that had a bug: `submit` used to range-check in phase 1c, after
@@ -249,10 +275,15 @@ fn the_pool_streams_by_absolute_layer_id_on_a_set_that_starts_at_three() {
     let (mut o, mut f, mut t) = (Vec::new(), Vec::new(), Vec::new());
     let (h, m) = (pin.routed.hits(), pin.routed.misses());
     assert!(
-        pin.routed.submit(2, &[0], &[], &[], &mut o, &mut f, &mut t).is_err(),
+        pin.routed
+            .submit(2, &[0], &[], &[], &mut o, &mut f, &mut t)
+            .is_err(),
         "layer 2 is below this artifact's range and must not resolve"
     );
-    assert!(!pin.routed.resident(2, 0), "a refused submit admitted the key anyway");
+    assert!(
+        !pin.routed.resident(2, 0),
+        "a refused submit admitted the key anyway"
+    );
     assert_eq!(
         (pin.routed.hits(), pin.routed.misses()),
         (h, m),
@@ -264,7 +295,9 @@ fn the_pool_streams_by_absolute_layer_id_on_a_set_that_starts_at_three() {
     // so this is exactly that case.
     let e = cfg.n_experts;
     assert!(
-        pin.routed.submit(3, &[e], &[], &[], &mut o, &mut f, &mut t).is_err(),
+        pin.routed
+            .submit(3, &[e], &[], &[], &mut o, &mut f, &mut t)
+            .is_err(),
         "expert {e} is past n_experts and must not resolve to layer 4's expert 0"
     );
     assert!(!pin.routed.resident(3, e));
@@ -291,10 +324,14 @@ fn the_pool_streams_by_absolute_layer_id_on_a_set_that_starts_at_three() {
 /// not. Sized from the artifact's own resident footprint so the case is reached by a budget
 /// too small for six experts and not by one too small for the resident set.
 fn a_budget_too_small_for_one_batch_is_refused_at_build() {
-    let Some(dir) = v4_artifact_dir::v4_artifact("L00.f4") else { return };
+    let Some(dir) = v4_artifact_dir::v4_artifact("L00.f4") else {
+        return;
+    };
     let cfg: V4Config = load_config(&dir).unwrap();
     // Resident + 16 MiB slack + room for five of the six experts one layer demands.
-    let resident = std::fs::metadata(format!("{dir}/resident.safetensors")).unwrap().len() as usize;
+    let resident = std::fs::metadata(format!("{dir}/resident.safetensors"))
+        .unwrap()
+        .len() as usize;
     let stride = f4_expert_stride(cfg.hidden, cfg.moe_inter);
     let capacity = resident + (16 << 20) + 5 * stride;
     let e = format!(
@@ -319,8 +356,16 @@ fn a_budget_too_small_for_one_batch_is_refused_at_build() {
 /// The eviction sweep is sized from the pool's own arithmetic rather than from a guess: at
 /// `CAPACITY` the fixture leaves ~9.5 GiB for a 10.27 GB routed set, so touching every
 /// expert of every layer must evict.
-fn the_pool_hits_on_a_resubmit_and_evicts_when_the_working_set_exceeds_the_budget(c: &mut Case<'_>) {
-    let Case { cfg, pin, stream, layer, .. } = c;
+fn the_pool_hits_on_a_resubmit_and_evicts_when_the_working_set_exceeds_the_budget(
+    c: &mut Case<'_>,
+) {
+    let Case {
+        cfg,
+        pin,
+        stream,
+        layer,
+        ..
+    } = c;
     let (cfg, layer) = (&**cfg, *layer);
     let sel = [3usize, 9, 200];
 
@@ -395,17 +440,30 @@ fn the_pool_hits_on_a_resubmit_and_evicts_when_the_working_set_exceeds_the_budge
 /// choose a stream, and a pool that handed out `RESIDENT` for a slot still being written
 /// would put the kernel on the compute stream with no wait at all.
 fn a_miss_carries_a_real_ticket_and_a_hit_carries_the_resident_one(c: &mut Case<'_>) {
-    let Case { pin, stream, layer, .. } = c;
+    let Case {
+        pin, stream, layer, ..
+    } = c;
     let layer = *layer;
     let (mut o, mut f, mut t) = (Vec::new(), Vec::new(), Vec::new());
 
-    pin.routed.submit(layer, &[42], &[], &[], &mut o, &mut f, &mut t).unwrap();
-    assert!(!t[0].is_resident(), "a cold expert must carry a real dependency");
+    pin.routed
+        .submit(layer, &[42], &[], &[], &mut o, &mut f, &mut t)
+        .unwrap();
+    assert!(
+        !t[0].is_resident(),
+        "a cold expert must carry a real dependency"
+    );
     pin.routed.wait_on(t[0], stream.raw()).unwrap();
     device_sync().unwrap();
 
-    pin.routed.submit(layer, &[42], &[], &[], &mut o, &mut f, &mut t).unwrap();
-    assert_eq!(t[0], Ticket::RESIDENT, "a hit must carry the satisfied ticket");
+    pin.routed
+        .submit(layer, &[42], &[], &[], &mut o, &mut f, &mut t)
+        .unwrap();
+    assert_eq!(
+        t[0],
+        Ticket::RESIDENT,
+        "a hit must carry the satisfied ticket"
+    );
 }
 
 /// **ONE `#[test]`, and that is not tidiness — it is the only thing that keeps the device
@@ -435,8 +493,16 @@ fn the_f4_streaming_pool() {
     // Its own artifact and its own pin — the only fixture whose range does not start at 0.
     the_pool_streams_by_absolute_layer_id_on_a_set_that_starts_at_three();
 
-    let Some((cfg, mut pin, stream, layer, dir)) = l0_2() else { return };
-    let mut c = Case { cfg: &cfg, pin: &mut pin, stream: &stream, layer, dir: &dir };
+    let Some((cfg, mut pin, stream, layer, dir)) = l0_2() else {
+        return;
+    };
+    let mut c = Case {
+        cfg: &cfg,
+        pin: &mut pin,
+        stream: &stream,
+        layer,
+        dir: &dir,
+    };
     a_resolved_slot_holds_that_experts_bytes_at_the_f4_offsets(&mut c);
     a_miss_carries_a_real_ticket_and_a_hit_carries_the_resident_one(&mut c);
     // LAST: evicts most of the pool.
@@ -467,16 +533,30 @@ fn measure_what_an_f4_miss_costs() {
     let dir = std::env::var("RIVOLI_V4_ARTIFACT_FULL")
         .unwrap_or_else(|_| "/var/db/rivoli/v4-f4-full".into());
     let cfg: V4Config = load_config(&dir).unwrap();
-    let resident = std::fs::metadata(format!("{dir}/resident.safetensors")).unwrap().len() as usize;
+    let resident = std::fs::metadata(format!("{dir}/resident.safetensors"))
+        .unwrap()
+        .len() as usize;
     let stride = f4_expert_stride(cfg.hidden, cfg.moe_inter);
-    let mut pin = V4Pin::build(&dir, &cfg, resident + (16 << 20) + (4 << 30), "2q",
-                               Default::default(), None).unwrap();
+    let mut pin = V4Pin::build(
+        &dir,
+        &cfg,
+        resident + (16 << 20) + (4 << 30),
+        "2q",
+        Default::default(),
+        None,
+    )
+    .unwrap();
     let stream = Stream::new().unwrap();
     let range = pin.range();
-    assert_eq!(range.len(), cfg.n_layers, "this measurement wants the WHOLE 43-layer set");
+    assert_eq!(
+        range.len(),
+        cfg.n_layers,
+        "this measurement wants the WHOLE 43-layer set"
+    );
     println!(
         "\n.f4 routed set: {} layers x {} experts x {stride} B = {:.2} GiB",
-        range.len(), cfg.n_experts,
+        range.len(),
+        cfg.n_experts,
         routed_bytes(&cfg, range.len()) as f64 / (1u64 << 30) as f64,
     );
 
@@ -484,7 +564,14 @@ fn measure_what_an_f4_miss_costs() {
     // Spread across layers so the reads hit 43 different files, as a decode's would.
     let batches: Vec<(usize, Vec<usize>)> = range
         .clone()
-        .map(|l| (l, (0..cfg.top_k).map(|j| (l * 37 + j * 11) % cfg.n_experts).collect()))
+        .map(|l| {
+            (
+                l,
+                (0..cfg.top_k)
+                    .map(|j| (l * 37 + j * 11) % cfg.n_experts)
+                    .collect(),
+            )
+        })
         .collect();
     // One closure, two passes: `jscpd` refuses the second copy of a timed loop, and it is
     // right to — the two passes must be the SAME work for the cold/warm ratio to mean
@@ -500,7 +587,11 @@ fn measure_what_an_f4_miss_costs() {
     let f0 = pin.routed.fetch_ns();
     let wall = pass(&mut pin);
     let (misses, fetch_ns) = (pin.routed.misses() - m0, pin.routed.fetch_ns() - f0);
-    assert_eq!(pin.routed.hits() - h0, 0, "every key here must be a cold miss");
+    assert_eq!(
+        pin.routed.hits() - h0,
+        0,
+        "every key here must be a cold miss"
+    );
     assert_eq!(misses as usize, batches.len() * cfg.top_k);
     let bytes = misses as f64 * stride as f64;
     println!(
@@ -519,7 +610,11 @@ fn measure_what_an_f4_miss_costs() {
     // The same keys again: all hits, so this prices what a resident expert costs the pool.
     let (h1, m1) = (pin.routed.hits(), pin.routed.misses());
     let hot = pass(&mut pin);
-    assert_eq!(pin.routed.misses() - m1, 0, "the second pass must be all hits");
+    assert_eq!(
+        pin.routed.misses() - m1,
+        0,
+        "the second pass must be all hits"
+    );
     println!(
         "WARM: {} hits in {:.3} s = {:.3} ms/hit  ({:.0}x cheaper than a miss)\n",
         pin.routed.hits() - h1,

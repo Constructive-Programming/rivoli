@@ -361,7 +361,11 @@ fn bf16_ulp(v: f32) -> f32 {
 const REL_FLOOR: f32 = 1e-3;
 
 fn gap(got: &[f32], want: &[f32]) -> Gap {
-    assert_eq!(got.len(), want.len(), "comparing tensors of different lengths");
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "comparing tensors of different lengths"
+    );
     let mut g = Gap {
         max_rel: 0.0,
         max_abs: 0.0,
@@ -437,7 +441,10 @@ fn check(what: &str, got: &[f32], want: &[f32], bound: Option<f32>) {
     );
     let mut f = FAILURES.lock().expect("poisoned");
     if g.nonfinite > 0 {
-        f.push(format!("{what}: {} non-finite — a defect, not a tolerance", g.nonfinite));
+        f.push(format!(
+            "{what}: {} non-finite — a defect, not a tolerance",
+            g.nonfinite
+        ));
     }
     // The breached bound is named in the message: two different ones are live in a run (5e-2 on
     // five tensors, 1e-2 on `router_weights`), and `FAILURES` is the whole record of a run on a
@@ -454,7 +461,12 @@ fn check(what: &str, got: &[f32], want: &[f32], bound: Option<f32>) {
 /// Fail once, with everything.
 fn report() {
     let f = FAILURES.lock().expect("poisoned");
-    assert!(f.is_empty(), "{} comparison(s) outside bound:\n  {}", f.len(), f.join("\n  "));
+    assert!(
+        f.is_empty(),
+        "{} comparison(s) outside bound:\n  {}",
+        f.len(),
+        f.join("\n  ")
+    );
 }
 
 /// One golden tensor by name. Fails loudly on a miss: a typo'd name silently comparing nothing
@@ -512,7 +524,10 @@ fn open_goldens() -> Option<GoldenSet> {
         Ok(mut f) => Some(GoldenSet::read(&mut f).expect("reading the golden file")),
         Err(e) => {
             // An explicitly-set path that does not resolve is a failure, not a skip.
-            assert!(named.is_none(), "{GOLDENS_ENV}={path} does not open ({e}) — refusing to pass by skipping");
+            assert!(
+                named.is_none(),
+                "{GOLDENS_ENV}={path} does not open ({e}) — refusing to pass by skipping"
+            );
             eprintln!(
                 "SKIP: no goldens at {path}. Generate with:\n  \
                  cargo run --release --bin v4-oracle -- emit --model \
@@ -540,7 +555,11 @@ fn a_pin_that_does_not_start_at_layer_zero_cannot_decode() -> bool {
     let cfg: V4Config = load_config(&dir).expect("l3-5 config");
     let pin = V4Pin::build(&dir, &cfg, CAPACITY, "2q", Default::default(), None)
         .expect("the LOADER must accept a partial artifact — that is the whole point of the split");
-    assert_eq!(pin.range(), 3..6, "the fixture whose range does not start at 0");
+    assert_eq!(
+        pin.range(),
+        3..6,
+        "the fixture whose range does not start at 0"
+    );
     // `map(|_| ())` because `V4Engine` is not `Debug` and `expect_err` wants it to be. Turning
     // the Ok side into `()` is the narrow fix; deriving `Debug` on an engine holding 30 raw
     // device pointers would print addresses and imply they were inspectable.
@@ -583,8 +602,13 @@ fn every_layer_matches_the_oracle_at_real_weights(
     ids: &[u32],
 ) {
     let layers: usize = meta(gs, "layers").parse().expect("layers metadata");
-    let steps: usize = meta(gs, "decode_steps").parse().expect("decode_steps metadata");
-    assert!(layers >= 2, "the goldens must cover at least the two ratio-0 layers, not {layers}");
+    let steps: usize = meta(gs, "decode_steps")
+        .parse()
+        .expect("decode_steps metadata");
+    assert!(
+        layers >= 2,
+        "the goldens must cover at least the two ratio-0 layers, not {layers}"
+    );
     eprintln!(
         "goldens: {} tokens, {layers} layers, {steps} decode step(s); model {}",
         ids.len(),
@@ -625,18 +649,25 @@ fn every_layer_matches_the_oracle_at_real_weights(
             // Each decode step re-feeds the prompt's LAST token, exactly as `drive` does. Not a
             // claim about what the model would generate: it makes the capture a well-defined
             // function of the prompt and the cached state.
-            (format!("dec{}", phase - 1), vec![last], ids.len() + phase - 1)
+            (
+                format!("dec{}", phase - 1),
+                vec![last],
+                ids.len() + phase - 1,
+            )
         };
         for &l in &scored {
             let m = here.len();
             eprintln!("L{l}.{tag}  ({m} row(s) at start_pos {start_pos})");
             // The reference's own residual for this layer and phase — NOT the engine's
             // accumulated one, so each layer's number is that layer's.
-            e.set_residual(golden(gs, &format!("L{l}.{tag}.in"))).expect("set residual");
+            e.set_residual(golden(gs, &format!("L{l}.{tag}.in")))
+                .expect("set residual");
             // The EARLIEST comparable tensor: `hc_pre` + `attn_norm`, before attention runs.
             // Idempotent, so `probe_layer` below re-runs it harmlessly. This is what says whether
             // the hyper-connection prologue or the attention block owns the error.
-            let anp = e.probe_pre_norm(l, false, &here, start_pos).expect("pre_norm probe");
+            let anp = e
+                .probe_pre_norm(l, false, &here, start_pos)
+                .expect("pre_norm probe");
             check(
                 &format!("L{l}.{tag}.attn_norm_out"),
                 &anp,
@@ -692,8 +723,11 @@ fn every_layer_matches_the_oracle_at_real_weights(
             // The LAST row, which is what `probe_route` holds — stated rather than assumed.
             let (want_i, want_w) = (&ri[(m - 1) * k..m * k], &rw[(m - 1) * k..m * k]);
             let mut pairs: Vec<(usize, f32)> = ids_got.iter().copied().zip(w_got).collect();
-            let mut want: Vec<(usize, f32)> =
-                want_i.iter().map(|&i| i as usize).zip(want_w.iter().copied()).collect();
+            let mut want: Vec<(usize, f32)> = want_i
+                .iter()
+                .map(|&i| i as usize)
+                .zip(want_w.iter().copied())
+                .collect();
             pairs.sort_by_key(|&(e, _)| e);
             want.sort_by_key(|&(e, _)| e);
             let got_ids: Vec<usize> = pairs.iter().map(|&(e, _)| e).collect();
@@ -741,7 +775,10 @@ fn every_layer_matches_the_oracle_at_real_weights(
         "no expert missed, so the streaming path (miss_stream, wait_on, acc row 1) ran zero times \
          and this test's green says nothing about it"
     );
-    assert!(hits > 0, "no expert hit, so the resident path ran zero times");
+    assert!(
+        hits > 0,
+        "no expert hit, so the resident path ran zero times"
+    );
 
     // --- the head tail, on the oracle's DECLARED probe ---------------------------------
     //
@@ -788,7 +825,11 @@ fn the_v4_layer_loop() {
         // vacuous, and the only thing worse than that is not knowing it was.
         eprintln!(
             "SKIP: no l0-2 V4 artifact on this machine. layer-0 refusal: {}",
-            if refused { "CHECKED (l3-5 present)" } else { "not checked (no l3-5 either)" }
+            if refused {
+                "CHECKED (l3-5 present)"
+            } else {
+                "not checked (no l3-5 either)"
+            }
         );
         return;
     };

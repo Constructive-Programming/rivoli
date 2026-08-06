@@ -202,17 +202,16 @@ impl V4Config {
     pub fn assert_matches_reference_json(&self, json_path: &Path) -> Result<()> {
         let text = std::fs::read_to_string(json_path)
             .with_context(|| format!("reading {}", json_path.display()))?;
-        let j: serde_json::Value =
-            serde_json::from_str(&text).with_context(|| format!("parsing {}", json_path.display()))?;
+        let j: serde_json::Value = serde_json::from_str(&text)
+            .with_context(|| format!("parsing {}", json_path.display()))?;
         let mut bad = Vec::new();
         {
-            let mut num = |key: &str, mine: f64| {
-                match j.get(key).and_then(serde_json::Value::as_f64) {
+            let mut num =
+                |key: &str, mine: f64| match j.get(key).and_then(serde_json::Value::as_f64) {
                     Some(theirs) if theirs == mine => {}
                     Some(theirs) => bad.push(format!("{key}: oracle {mine} vs config {theirs}")),
                     None => bad.push(format!("{key}: absent from config, oracle assumes {mine}")),
-                }
-            };
+                };
             num("vocab_size", self.vocab_size as f64);
             num("dim", self.dim as f64);
             num("moe_inter_dim", self.moe_inter_dim as f64);
@@ -245,14 +244,22 @@ impl V4Config {
             // The oracle implements exactly one scoring function. A checkpoint that asked
             // for another would make every routing golden wrong, silently.
             Some("sqrtsoftplus") => {}
-            other => bad.push(format!("score_func: oracle implements sqrtsoftplus, config says {other:?}")),
+            other => bad.push(format!(
+                "score_func: oracle implements sqrtsoftplus, config says {other:?}"
+            )),
         }
         let theirs: Vec<usize> = j
             .get("compress_ratios")
             .and_then(serde_json::Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_u64().map(|u| u as usize)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64().map(|u| u as usize))
+                    .collect()
+            })
             .unwrap_or_default();
-        if theirs.len() < self.n_layers || theirs[..self.n_layers] != self.compress_ratios[..self.n_layers] {
+        if theirs.len() < self.n_layers
+            || theirs[..self.n_layers] != self.compress_ratios[..self.n_layers]
+        {
             bad.push(format!(
                 "compress_ratios: oracle {:?} vs config {:?}",
                 &self.compress_ratios[..self.n_layers.min(self.compress_ratios.len())],
@@ -279,13 +286,27 @@ pub enum WMat {
     /// quantization**. Used for `compressor.{wkv,wgate}`, `indexer.weights_proj`,
     /// `gate.weight`, and `attn.wo_a` (which is fp8 on disk but is consumed raw by the
     /// einsum — see `forward.rs`).
-    Dense { rows: usize, cols: usize, v: Vec<f32> },
+    Dense {
+        rows: usize,
+        cols: usize,
+        v: Vec<f32>,
+    },
     /// `float8_e4m3fn` weights with `float8_e8m0fnu` scales on a 128x128 grid.
     /// `linear()` quantizes the activation to fp8 at block 128 before the GEMM.
-    Fp8 { rows: usize, cols: usize, w: Vec<u8>, s: Vec<u8> },
+    Fp8 {
+        rows: usize,
+        cols: usize,
+        w: Vec<u8>,
+        s: Vec<u8>,
+    },
     /// `float4_e2m1fn_x2` weights (two nibbles per byte along K) with `float8_e8m0fnu`
     /// scales per 32 elements of K. `linear()` quantizes the activation to fp8 at block 128.
-    Fp4 { rows: usize, cols: usize, w: Vec<u8>, s: Vec<u8> },
+    Fp4 {
+        rows: usize,
+        cols: usize,
+        w: Vec<u8>,
+        s: Vec<u8>,
+    },
 }
 
 impl WMat {
@@ -394,7 +415,9 @@ impl RawTensor {
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
-            d => bail!("{d:?} carries a separate scale tensor; decode it as a WMat, not an f32 array"),
+            d => bail!(
+                "{d:?} carries a separate scale tensor; decode it as a WMat, not an f32 array"
+            ),
         })
     }
 
@@ -433,7 +456,10 @@ impl Checkpoint {
             .iter()
             .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
             .collect();
-        Ok(Self { root: root.to_path_buf(), index })
+        Ok(Self {
+            root: root.to_path_buf(),
+            index,
+        })
     }
 
     /// Does the index carry any tensor under `prefix`? Used to *discover* what a layer
@@ -473,11 +499,13 @@ impl Checkpoint {
             bail!("{} header is truncated", path.display());
         }
         let hdr: serde_json::Value = serde_json::from_slice(&map[8..hdr_end])?;
-        let e = hdr
-            .get(name)
-            .ok_or_else(|| anyhow!("index says {name} is in {shard}, but its header has no such tensor"))?;
+        let e = hdr.get(name).ok_or_else(|| {
+            anyhow!("index says {name} is in {shard}, but its header has no such tensor")
+        })?;
         let dtype = Dtype::parse(
-            e.get("dtype").and_then(serde_json::Value::as_str).ok_or_else(|| anyhow!("{name}: no dtype"))?,
+            e.get("dtype")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("{name}: no dtype"))?,
         )?;
         let shape: Vec<usize> = e
             .get("shape")
@@ -490,7 +518,10 @@ impl Checkpoint {
             .get("data_offsets")
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| anyhow!("{name}: no data_offsets"))?;
-        let (a, b) = match (off.first().and_then(|v| v.as_u64()), off.get(1).and_then(|v| v.as_u64())) {
+        let (a, b) = match (
+            off.first().and_then(|v| v.as_u64()),
+            off.get(1).and_then(|v| v.as_u64()),
+        ) {
             (Some(a), Some(b)) => (a as usize, b as usize),
             _ => bail!("{name}: malformed data_offsets"),
         };
@@ -509,14 +540,22 @@ impl Checkpoint {
                 path.display()
             );
         }
-        Ok(RawTensor { dtype, shape, bytes: map[hdr_end + a..hdr_end + b].to_vec() })
+        Ok(RawTensor {
+            dtype,
+            shape,
+            bytes: map[hdr_end + a..hdr_end + b].to_vec(),
+        })
     }
 
     /// A dense (bf16/f32) matrix as a [`WMat`].
     pub fn dense(&self, name: &str) -> Result<WMat> {
         let t = self.get(name)?;
         let (rows, cols) = two_dims(name, &t.shape)?;
-        Ok(WMat::Dense { rows, cols, v: t.to_f32()? })
+        Ok(WMat::Dense {
+            rows,
+            cols,
+            v: t.to_f32()?,
+        })
     }
 
     /// An fp8 weight plus its `.scale`.
@@ -525,13 +564,25 @@ impl Checkpoint {
         let s = self.get(&scale_name(name)?)?;
         let (rows, cols) = two_dims(name, &w.shape)?;
         if w.dtype != Dtype::F8E4M3 || s.dtype != Dtype::F8E8M0 {
-            bail!("{name}: expected F8_E4M3 + F8_E8M0 scale, got {:?} + {:?}", w.dtype, s.dtype);
+            bail!(
+                "{name}: expected F8_E4M3 + F8_E8M0 scale, got {:?} + {:?}",
+                w.dtype,
+                s.dtype
+            );
         }
         let want = [rows.div_ceil(128), cols.div_ceil(128)];
         if s.shape != want {
-            bail!("{name}.scale: expected {want:?} for a 128x128 grid over {rows}x{cols}, got {:?}", s.shape);
+            bail!(
+                "{name}.scale: expected {want:?} for a 128x128 grid over {rows}x{cols}, got {:?}",
+                s.shape
+            );
         }
-        Ok(WMat::Fp8 { rows, cols, w: w.bytes, s: s.bytes })
+        Ok(WMat::Fp8 {
+            rows,
+            cols,
+            w: w.bytes,
+            s: s.bytes,
+        })
     }
 
     /// An fp4 expert weight plus its `.scale`. The checkpoint stores the nibbles as `I8`.
@@ -547,7 +598,12 @@ impl Checkpoint {
                 s.shape
             );
         }
-        Ok(WMat::Fp4 { rows, cols, w: w.bytes, s: s.bytes })
+        Ok(WMat::Fp4 {
+            rows,
+            cols,
+            w: w.bytes,
+            s: s.bytes,
+        })
     }
 }
 

@@ -163,7 +163,10 @@ fn main() {
     let eval_of = |proj: &str, o_dim: usize, i_dim: usize, quant: &Roundtrip| -> f64 {
         let mut f = 0.0;
         for &l in &picks {
-            let base = format!("model.layers.{l}.mlp.experts.{}", (l + N_EXPERTS / 2) % N_EXPERTS);
+            let base = format!(
+                "model.layers.{l}.mlp.experts.{}",
+                (l + N_EXPERTS / 2) % N_EXPERTS
+            );
             let full = deq(&base, proj, o_dim, i_dim);
             let rows = EVAL_ROWS.min(o_dim);
             let w = &full[..rows * i_dim];
@@ -202,7 +205,12 @@ fn main() {
 
         let scored: Vec<(usize, f64)> = cbs
             .iter()
-            .map(|(k, cb)| (*k, eval_of(proj, o_dim, i_dim, &|w, r, i| quant_vq_par(w, r, i, cb))))
+            .map(|(k, cb)| {
+                (
+                    *k,
+                    eval_of(proj, o_dim, i_dim, &|w, r, i| quant_vq_par(w, r, i, cb)),
+                )
+            })
             .collect();
         let base = scored[0].1;
         println!("  -> {proj} mean over {} held-out experts:", picks.len());

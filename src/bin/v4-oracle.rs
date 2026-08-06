@@ -94,7 +94,9 @@ fn config(model: &Path) -> Result<V4Config> {
 fn tokenize(model: &Path) -> Result<Vec<u32>> {
     let tk = tokenizers::Tokenizer::from_file(model.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("loading tokenizer.json: {e}"))?;
-    let enc = tk.encode(PROMPT, false).map_err(|e| anyhow::anyhow!("tokenizing: {e}"))?;
+    let enc = tk
+        .encode(PROMPT, false)
+        .map_err(|e| anyhow::anyhow!("tokenizing: {e}"))?;
     Ok(enc.get_ids().to_vec())
 }
 
@@ -122,7 +124,13 @@ fn dequantized_to_bf16(ck: &Checkpoint, name: &str) -> Result<WMat> {
     Ok(WMat::Dense { rows, cols, v })
 }
 
-fn load_compressor(ck: &Checkpoint, p: &str, ratio: usize, d: usize, rotate: bool) -> Result<CompressorW> {
+fn load_compressor(
+    ck: &Checkpoint,
+    p: &str,
+    ratio: usize,
+    d: usize,
+    rotate: bool,
+) -> Result<CompressorW> {
     Ok(CompressorW {
         ratio,
         overlap: ratio == 4,
@@ -168,8 +176,12 @@ fn load_layer(ck: &Checkpoint, cfg: &V4Config, l: usize, experts: &[usize]) -> R
         hc_ffn_base: dense_f32(ck, &format!("{p}.hc_ffn_base"))?,
         hc_ffn_scale: dense_f32(ck, &format!("{p}.hc_ffn_scale"))?,
         gate_w: ck.dense(&format!("{p}.ffn.gate.weight"))?,
-        gate_bias: (!hash).then(|| dense_f32(ck, &format!("{p}.ffn.gate.bias"))).transpose()?,
-        tid2eid: hash.then(|| ck.get(&format!("{p}.ffn.gate.tid2eid"))?.to_i64()).transpose()?,
+        gate_bias: (!hash)
+            .then(|| dense_f32(ck, &format!("{p}.ffn.gate.bias")))
+            .transpose()?,
+        tid2eid: hash
+            .then(|| ck.get(&format!("{p}.ffn.gate.tid2eid"))?.to_i64())
+            .transpose()?,
         compressor: (ratio != 0)
             .then(|| load_compressor(ck, &format!("{a}.compressor"), ratio, cfg.head_dim, false))
             .transpose()?,
@@ -238,11 +250,23 @@ fn load_head_tail(ck: &Checkpoint, cfg: &V4Config) -> Result<HeadTailW> {
             bail!("{name}: expected shape {expect:?}, checkpoint has {got:?}")
         }
     };
-    want("hc_head_fn", &ck.get("hc_head_fn")?.shape, &[cfg.hc_mult, cfg.hc_dim()])?;
-    want("hc_head_base", &ck.get("hc_head_base")?.shape, &[cfg.hc_mult])?;
+    want(
+        "hc_head_fn",
+        &ck.get("hc_head_fn")?.shape,
+        &[cfg.hc_mult, cfg.hc_dim()],
+    )?;
+    want(
+        "hc_head_base",
+        &ck.get("hc_head_base")?.shape,
+        &[cfg.hc_mult],
+    )?;
     want("hc_head_scale", &ck.get("hc_head_scale")?.shape, &[1])?;
     want("norm.weight", &ck.get("norm.weight")?.shape, &[cfg.dim])?;
-    want("head.weight", &ck.get("head.weight")?.shape, &[cfg.vocab_size, cfg.dim])?;
+    want(
+        "head.weight",
+        &ck.get("head.weight")?.shape,
+        &[cfg.vocab_size, cfg.dim],
+    )?;
     Ok(HeadTailW {
         hc_head_fn: dense_f32(ck, "hc_head_fn")?,
         hc_head_base: dense_f32(ck, "hc_head_base")?,
@@ -266,7 +290,9 @@ fn load_head_tail(ck: &Checkpoint, cfg: &V4Config) -> Result<HeadTailW> {
 /// golden gates exactly the same arithmetic either way. See `HeadTailW`'s doc.
 fn fixed_probe(cfg: &V4Config, s: usize) -> Vec<f32> {
     let mut r = rivoli::v4oracle::weights::NamedRng::new("v4-head-probe");
-    (0..s * cfg.hc_mult * cfg.dim).map(|_| bf16_decode(bf16_encode(r.unit()))).collect()
+    (0..s * cfg.hc_mult * cfg.dim)
+        .map(|_| bf16_decode(bf16_encode(r.unit())))
+        .collect()
 }
 
 /// Run the head tail on `probe` and record it, input included.
@@ -280,7 +306,11 @@ fn fixed_probe(cfg: &V4Config, s: usize) -> Vec<f32> {
 /// callers pass the prompt length, which `open()` has already refused below 4.
 fn head_goldens(o: &Oracle, tw: &HeadTailW, cfg: &V4Config, probe: &[f32], cap: &mut Capture) {
     let row = cfg.hc_mult * cfg.dim;
-    assert_eq!(probe.len() % row, 0, "the probe is not a whole number of [hc_mult, dim] rows");
+    assert_eq!(
+        probe.len() % row,
+        0,
+        "the probe is not a whole number of [hc_mult, dim] rows"
+    );
     let s = probe.len() / row;
     cap.push("head.probe.in", &[s, cfg.hc_mult, cfg.dim], probe.to_vec());
     o.head_tail(tw, probe, s, "probe", cap);
@@ -297,8 +327,11 @@ fn experts_for(ck: &Checkpoint, cfg: &V4Config, l: usize, ids: &[u32]) -> Result
     }
     let map = ck.get(&format!("layers.{l}.ffn.gate.tid2eid"))?.to_i64()?;
     let k = cfg.n_activated_experts;
-    let mut set: Vec<usize> =
-        ids.iter().flat_map(|&t| map[t as usize * k..(t as usize + 1) * k].to_vec()).map(|e| e as usize).collect();
+    let mut set: Vec<usize> = ids
+        .iter()
+        .flat_map(|&t| map[t as usize * k..(t as usize + 1) * k].to_vec())
+        .map(|e| e as usize)
+        .collect();
     set.sort_unstable();
     set.dedup();
     Ok(set)
@@ -334,14 +367,29 @@ fn drive(
         let (n, start_pos, here, tag) = if phase == 0 {
             (s, 0usize, ids.to_vec(), "pre".to_string())
         } else {
-            (1usize, s + phase - 1, vec![ids[s - 1]], format!("dec{}", phase - 1))
+            (
+                1usize,
+                s + phase - 1,
+                vec![ids[s - 1]],
+                format!("dec{}", phase - 1),
+            )
         };
         let mut h = h_for(phase, &here);
         for (l, lw) in lws.iter().enumerate() {
-            let step = Step { lw, layer: l, s: n, start_pos, input_ids: &here, phase: &tag };
+            let step = Step {
+                lw,
+                layer: l,
+                s: n,
+                start_pos,
+                input_ids: &here,
+                phase: &tag,
+            };
             o.run_layer(&step, &mut states[l], &mut h, cap);
         }
-        eprintln!("{tag}: start_pos {start_pos}, {n} row(s), {} layers", lws.len());
+        eprintln!(
+            "{tag}: start_pos {start_pos}, {n} row(s), {} layers",
+            lws.len()
+        );
     }
 }
 
@@ -376,13 +424,19 @@ fn emit(model: &Path, out: &Path, layers: usize, decode_steps: usize) -> Result<
     let mut lws = Vec::with_capacity(layers);
     for l in 0..layers {
         let experts = experts_for(&ck, &cfg, l, &ids)?;
-        eprintln!("layer {l} (ratio {}): {} routed experts", cfg.compress_ratio(l), experts.len());
+        eprintln!(
+            "layer {l} (ratio {}): {} routed experts",
+            cfg.compress_ratio(l),
+            experts.len()
+        );
         lws.push(load_layer(&ck, &cfg, l, &experts)?);
     }
 
     let mut cap = Capture::default();
     cap.push("embed", &[s, cfg.hc_mult, cfg.dim], o.embed(&hw, &ids));
-    drive(&o, &lws, &ids, decode_steps, &mut cap, |_, here| o.embed(&hw, here));
+    drive(&o, &lws, &ids, decode_steps, &mut cap, |_, here| {
+        o.embed(&hw, here)
+    });
     head_goldens(&o, &tw, &cfg, &fixed_probe(&cfg, s), &mut cap);
 
     let meta = vec![
@@ -414,10 +468,18 @@ fn emit(model: &Path, out: &Path, layers: usize, decode_steps: usize) -> Result<
     let g = GoldenSet::from_capture(meta, cap);
     let mut f = std::io::BufWriter::new(std::fs::File::create(out)?);
     g.write(&mut f)?;
-    eprintln!("wrote {} float and {} int goldens to {}", g.floats.len(), g.ints.len(), out.display());
+    eprintln!(
+        "wrote {} float and {} int goldens to {}",
+        g.floats.len(),
+        g.ints.len(),
+        out.display()
+    );
     for (n, shape, v) in &g.floats {
-        let (lo, hi) =
-            v.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &x| (a.min(x), b.max(x)));
+        let (lo, hi) = v
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &x| {
+                (a.min(x), b.max(x))
+            });
         eprintln!("  {n:<30} {shape:?} range [{lo:.4e}, {hi:.4e}]");
     }
     Ok(())
@@ -442,7 +504,11 @@ fn defects(model: &Path, layer: usize, decode_steps: usize) -> Result<()> {
     // `moe` on the first such expert -- a crash, not a silent wrong, but still an
     // instrument that cannot measure the thing it was built to measure.
     let experts: Vec<usize> = (0..cfg.n_routed_experts).collect();
-    eprintln!("layer {layer}, ratio {}, all {} experts", cfg.compress_ratio(layer), experts.len());
+    eprintln!(
+        "layer {layer}, ratio {}, all {} experts",
+        cfg.compress_ratio(layer),
+        experts.len()
+    );
     // Only the target layer is loaded, and it is driven from a FIXED probe rather than from
     // the real chain: running layers 0..L first would make every defect's effect depend on
     // the layers before it, which is the opposite of an isolation test.
@@ -464,7 +530,11 @@ fn defects(model: &Path, layer: usize, decode_steps: usize) -> Result<()> {
         let o = Oracle::new(cfg.clone(), d);
         let mut cap = Capture::default();
         drive(&o, &lws, &ids, decode_steps, &mut cap, |phase, _| {
-            if phase == 0 { probe.clone() } else { probe[..row].to_vec() }
+            if phase == 0 {
+                probe.clone()
+            } else {
+                probe[..row].to_vec()
+            }
         });
         head_goldens(&o, &tw, &cfg, &probe, &mut cap);
         cap

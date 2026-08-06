@@ -49,7 +49,6 @@ use common::{
 // to argue that a second consumer did not exist, and the duplication gate found the copy the
 // moment one did.
 
-
 /// A `LayerW` carrier for [`Step`], whose weights are never read.
 ///
 /// `Oracle::indexer` destructures `let Step { s, start_pos, .. } = *step` and touches nothing
@@ -57,7 +56,11 @@ use common::{
 /// real ones so that if `indexer` ever starts reading `step.lw`, this fails loudly on a
 /// zero-sized matrix instead of quietly scoring against the wrong layer's weights.
 fn step_carrier() -> LayerW {
-    let e = || WMat::Dense { rows: 0, cols: 0, v: Vec::new() };
+    let e = || WMat::Dense {
+        rows: 0,
+        cols: 0,
+        v: Vec::new(),
+    };
     LayerW {
         attn_sink: Vec::new(),
         wq_a: e(),
@@ -81,7 +84,11 @@ fn step_carrier() -> LayerW {
         compressor: None,
         indexer: None,
         experts: HashMap::new(),
-        shared: rivoli::v4oracle::forward::ExpertW { w1: e(), w2: e(), w3: e() },
+        shared: rivoli::v4oracle::forward::ExpertW {
+            w1: e(),
+            w2: e(),
+            w3: e(),
+        },
     }
 }
 
@@ -108,14 +115,21 @@ fn ratio_128_pooling_is_gated_at_a_long_probe_and_absent_at_the_emit_prompt() {
     // asserted too. Without it the only coff-2 tensor this file checks is the indexer's
     // [4, 256], and the width the brief actually warns about goes unverified.
     let l2 = compressor_w(&ck, "layers.2.attn.compressor", 4, c.head_dim, false);
-    assert_eq!(l2.ape.len(), 4 * 2 * c.head_dim, "L2 attention ape is [4, 1024]");
+    assert_eq!(
+        l2.ape.len(),
+        4 * 2 * c.head_dim,
+        "L2 attention ape is [4, 1024]"
+    );
 
     let run = |d: Defect, n: usize| {
         let o = Oracle::new(c.clone(), d);
         // The oracle's own state constructor rather than a re-derived one. On THIS path
         // only `cache` is read (see `PROBE_LEN`); the state matters in the remainder and
         // decode arms below.
-        let mut cs = o.fresh_state(freqs_layer).comp.expect("layer 3 has a compressor");
+        let mut cs = o
+            .fresh_state(freqs_layer)
+            .comp
+            .expect("layer 3 has a compressor");
         let mut ctr = Counters::default();
         let x = probe("l3-probe", n, c.dim);
         let out = o.compressor(&cw, &mut cs, &x, n, 0, o.freqs(freqs_layer), &mut ctr);
@@ -124,7 +138,10 @@ fn ratio_128_pooling_is_gated_at_a_long_probe_and_absent_at_the_emit_prompt() {
 
     // The hole, reproduced at real weights: nothing at all comes out.
     let (short, ctr) = run(Defect::None, EMIT_LEN);
-    assert!(short.is_none(), "13 tokens < ratio 128: no block, hence no golden");
+    assert!(
+        short.is_none(),
+        "13 tokens < ratio 128: no block, hence no golden"
+    );
     assert_eq!(ctr.compressed_blocks, 0);
 
     // The hole, closed: two whole blocks, of the width the config implies.
@@ -140,7 +157,10 @@ fn ratio_128_pooling_is_gated_at_a_long_probe_and_absent_at_the_emit_prompt() {
         let (broken, _) = run(d, PROBE_LEN);
         let broken = broken.expect("the defect must not change WHETHER a block is emitted");
         assert_eq!(broken.len(), base.len(), "{d:?} changes values, not shape");
-        assert!(broken.iter().zip(&base).any(|(a, b)| a != b), "{d:?} must move the pooled rows");
+        assert!(
+            broken.iter().zip(&base).any(|(a, b)| a != b),
+            "{d:?} must move the pooled rows"
+        );
     }
 
     // The silent half: a breakage that lives only in the overlapping branch must leave a
@@ -157,7 +177,11 @@ fn ratio_128_pooling_is_gated_at_a_long_probe_and_absent_at_the_emit_prompt() {
     // A prefill with a remainder: the ONE prefill path that writes `kv_state`/`score_state`
     // on a non-overlapping compressor, and therefore the state a later decode would read.
     let (rem, ctr) = run(Defect::None, PROBE_REMAINDER_LEN);
-    assert_eq!(ctr.compressed_blocks, PROBE_REMAINDER_LEN / 128, "300 tokens pools 2 blocks");
+    assert_eq!(
+        ctr.compressed_blocks,
+        PROBE_REMAINDER_LEN / 128,
+        "300 tokens pools 2 blocks"
+    );
     assert_eq!(rem.expect("emits").len(), 2 * c.head_dim);
 }
 
@@ -181,7 +205,10 @@ fn ratio_128_decode_completes_exactly_one_block_at_start_pos_127() {
         let mut ctr = Counters::default();
         // Seed with a short prefill, exactly as the emit run does, then step.
         let x = probe("l3-dec-pre", EMIT_LEN, c.dim);
-        assert!(o.compressor(&cw, &mut cs, &x, EMIT_LEN, 0, o.freqs(3), &mut ctr).is_none());
+        assert!(
+            o.compressor(&cw, &mut cs, &x, EMIT_LEN, 0, o.freqs(3), &mut ctr)
+                .is_none()
+        );
         let mut emitted_at = Vec::new();
         let mut last = None;
         for start_pos in EMIT_LEN..=RATIO_128_FIRST_DECODE_BLOCK {
@@ -195,7 +222,11 @@ fn ratio_128_decode_completes_exactly_one_block_at_start_pos_127() {
     };
 
     let (at, block, ctr) = run(Defect::None);
-    assert_eq!(at, vec![RATIO_128_FIRST_DECODE_BLOCK], "exactly one block, exactly at 127");
+    assert_eq!(
+        at,
+        vec![RATIO_128_FIRST_DECODE_BLOCK],
+        "exactly one block, exactly at 127"
+    );
     assert_eq!(ctr.compressed_blocks, 1);
     let base = block.expect("a block at 127");
     assert_eq!(base.len(), c.head_dim, "decode emits one row, not a matrix");
@@ -204,9 +235,17 @@ fn ratio_128_decode_completes_exactly_one_block_at_start_pos_127() {
     // And it is gated: the same two breakages move the decode-pooled row.
     for d in [Defect::CompressorNoApe, Defect::CompressorRopeAtBlockEnd] {
         let (at, block, _) = run(d);
-        assert_eq!(at, vec![RATIO_128_FIRST_DECODE_BLOCK], "{d:?} changes values, not timing");
+        assert_eq!(
+            at,
+            vec![RATIO_128_FIRST_DECODE_BLOCK],
+            "{d:?} changes values, not timing"
+        );
         assert!(
-            block.expect("still emits").iter().zip(&base).any(|(a, b)| a != b),
+            block
+                .expect("still emits")
+                .iter()
+                .zip(&base)
+                .any(|(a, b)| a != b),
             "{d:?} must move the decode-pooled row"
         );
     }
@@ -232,26 +271,39 @@ fn ratio_128_selection_is_vacuous_at_the_emit_prompt_and_discriminating_at_the_p
         rivoli::v4oracle::forward::compress_topk(128, n, 0, compress_offset(c.window_size, n, 0))
     };
     let as_i64 = |v: Vec<Vec<i32>>| -> Vec<Vec<i64>> {
-        v.into_iter().map(|r| r.into_iter().map(i64::from).collect()).collect()
+        v.into_iter()
+            .map(|r| r.into_iter().map(i64::from).collect())
+            .collect()
     };
 
     // The hole: 13 rows of zero columns. Any implementation returning nothing agrees.
     let short = mine(EMIT_LEN);
     assert_eq!(short.len(), EMIT_LEN);
-    assert_eq!(short.concat().len(), 0, "the golden carries no values to be wrong about");
+    assert_eq!(
+        short.concat().len(),
+        0,
+        "the golden carries no values to be wrong about"
+    );
     assert_eq!(as_i64(short), theirs(EMIT_LEN));
 
     // Closed: 2 real columns, and the causal structure is now observable — early queries see
     // nothing, the last query sees both blocks.
     let long = mine(PROBE_LEN);
     assert_eq!(long[0].len(), PROBE_LEN / 128);
-    assert!(long[0].iter().all(|&x| x == -1), "query 0 may read no completed block");
+    assert!(
+        long[0].iter().all(|&x| x == -1),
+        "query 0 may read no completed block"
+    );
     assert_eq!(
         long[PROBE_LEN - 1].iter().filter(|&&x| x != -1).count(),
         2,
         "the last query may read both completed blocks"
     );
-    assert_eq!(as_i64(long), theirs(PROBE_LEN), "drift tripwire against the oracle's copy");
+    assert_eq!(
+        as_i64(long),
+        theirs(PROBE_LEN),
+        "drift tripwire against the oracle's copy"
+    );
 }
 
 // =======================================================================================
@@ -273,7 +325,11 @@ fn ratio_128_selection_is_vacuous_at_the_emit_prompt_and_discriminating_at_the_p
 fn indexer_ranking_is_blind_at_index_topk_512_and_sighted_when_it_truncates() {
     let Some(ck) = checkpoint() else { return };
     let base_cfg = V4Config::v4_flash();
-    assert_eq!(base_cfg.compress_ratio(2), 4, "layer 2 is the ratio-4 class and has an Indexer");
+    assert_eq!(
+        base_cfg.compress_ratio(2),
+        4,
+        "layer 2 is the ratio-4 class and has an Indexer"
+    );
     assert_eq!(base_cfg.index_topk, 512);
     let iw = indexer_w(&ck, 2, &base_cfg);
     let carrier = step_carrier();
@@ -290,7 +346,14 @@ fn indexer_ranking_is_blind_at_index_topk_512_and_sighted_when_it_truncates() {
         let mut cs = o.fresh_state(2).idx_comp.expect("layer 2 has an indexer");
         let mut ctr = Counters::default();
         let mut scores = Vec::new();
-        let step = Step { lw: &carrier, layer: 2, s: n, start_pos: 0, input_ids: &[], phase: "pre" };
+        let step = Step {
+            lw: &carrier,
+            layer: 2,
+            s: n,
+            start_pos: 0,
+            input_ids: &[],
+            phase: "pre",
+        };
         let x = probe("l2-x", n, c.dim);
         let qr = probe("l2-qr", n, c.q_lora_rank);
         let idxs = o.indexer(
@@ -334,7 +397,10 @@ fn indexer_ranking_is_blind_at_index_topk_512_and_sighted_when_it_truncates() {
     // selected set does not move at all: the gate is blind to both.
     for d in [Defect::IndexerNoWeights, Defect::IndexerNoRelu] {
         let (idx, scores, _) = arm(512, EMIT_LEN, d);
-        assert_ne!(scores, base_scores, "{d:?} must move `.indexer_scores` -- else it is inert");
+        assert_ne!(
+            scores, base_scores,
+            "{d:?} must move `.indexer_scores` -- else it is inert"
+        );
         assert_eq!(
             as_sets(&idx),
             as_sets(&base_idx),
@@ -352,14 +418,22 @@ fn indexer_ranking_is_blind_at_index_topk_512_and_sighted_when_it_truncates() {
         "index_topk must actually CUT, else the probe is not exercising the ranking and the \
          coverage is still absent"
     );
-    assert_eq!(sharp_scores, base_scores, "lowering index_topk changes selection, never scoring");
+    assert_eq!(
+        sharp_scores, base_scores,
+        "lowering index_topk changes selection, never scoring"
+    );
 
     // The truncated pick is driven by the SCORES, not by the causal mask's ordering. If the
     // top-k were degenerate -- always "the newest legal block" -- the picked index would rise
     // monotonically with the query row, and the set comparison would then be testing the mask
     // a second time rather than the ranking. Measured at real weights it does NOT: the picks
     // run [.., 13, 13, 15, 14], so row 12 selects a strictly older block than row 11.
-    let picks: Vec<i64> = sharp_idx.iter().flatten().copied().filter(|&x| x >= 0).collect();
+    let picks: Vec<i64> = sharp_idx
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|&x| x >= 0)
+        .collect();
     assert!(
         picks.windows(2).any(|w| w[1] < w[0]),
         "the truncated selection must not be monotonic in the query row, else it is the \
@@ -380,7 +454,11 @@ fn indexer_ranking_is_blind_at_index_topk_512_and_sighted_when_it_truncates() {
     assert!(ctr.indexer_truncated > 0, "the long arm must truncate too");
     for d in ranking_defects {
         let (idx, scores, _) = arm(1, 64, d);
-        assert!(scores.iter().all(|v| v.is_finite() || *v == f32::NEG_INFINITY));
+        assert!(
+            scores
+                .iter()
+                .all(|v| v.is_finite() || *v == f32::NEG_INFINITY)
+        );
         assert_ne!(
             as_sets(&idx),
             as_sets(&long_idx),

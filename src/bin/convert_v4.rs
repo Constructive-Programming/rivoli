@@ -22,8 +22,8 @@
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use rivoli::artifact::format::{
-    Dtype, EXPERT_HEADER_BYTES, ExpertHeader, F4_MAGIC, FormatMeta, SafeWriter, Safetensors,
-    F4Expert, finish_artifact,
+    Dtype, EXPERT_HEADER_BYTES, ExpertHeader, F4_MAGIC, F4Expert, FormatMeta, SafeWriter,
+    Safetensors, finish_artifact,
 };
 use rivoli::artifact::model::{V4Config, load_config};
 use rivoli::artifact::quant::{
@@ -110,7 +110,10 @@ fn write_layer_resident(
         (format!("{lb}.attn.wkv.weight"), vec![hd, h]),
         (
             format!("{lb}.attn.wo_a.weight"),
-            vec![cfg.o_groups * cfg.o_lora_rank, cfg.n_heads * hd / cfg.o_groups],
+            vec![
+                cfg.o_groups * cfg.o_lora_rank,
+                cfg.n_heads * hd / cfg.o_groups,
+            ],
         ),
         (
             format!("{lb}.attn.wo_b.weight"),
@@ -121,7 +124,10 @@ fn write_layer_resident(
         (format!("{lb}.attn_norm.weight"), vec![h]),
     ] {
         let got = src.shape(&name)?;
-        ensure!(got == want, "{name}: shape {got:?}, config implies {want:?}");
+        ensure!(
+            got == want,
+            "{name}: shape {got:?}, config implies {want:?}"
+        );
     }
     for t in ["attn_norm", "ffn_norm", "attn.q_norm", "attn.kv_norm"] {
         w.add_widened(src, &format!("{lb}.{t}.weight"))?;
@@ -227,7 +233,10 @@ const MODEL_LEVEL: &[(&str, Emit)] = &[
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let args = Args { verify: args.verify || args.verify_only, ..args };
+    let args = Args {
+        verify: args.verify || args.verify_only,
+        ..args
+    };
     let cfg: V4Config = load_config(&args.src_dir)?;
     let to = args.to.unwrap_or(cfg.n_layers);
     // Refused, not clamped: `--to 999` on a 43-layer model silently converting 43 layers
@@ -247,8 +256,7 @@ fn main() -> Result<()> {
     // opening one would fail the whole run over a layer we are not converting.
     let wanted: Vec<String> = layers.iter().map(|l| format!("layers.{l}.")).collect();
     let src = Safetensors::open_indexed(&args.src_dir, |n| {
-        MODEL_LEVEL.iter().any(|&(t, _)| t == n)
-            || wanted.iter().any(|p| n.starts_with(p.as_str()))
+        MODEL_LEVEL.iter().any(|&(t, _)| t == n) || wanted.iter().any(|p| n.starts_with(p.as_str()))
     })?;
     eprintln!(
         "convert_v4: hidden={hidden} moe_inter={moe_inter} experts={ne} layers {}..{to} \
@@ -332,7 +340,10 @@ fn main() -> Result<()> {
     // With `--verify-only` the run is READ-ONLY, which is also what makes verifying all 43
     // layers affordable — the expensive half of a convert is the writing, not the reading.
     if args.verify_only {
-        eprintln!("convert_v4: verify-only — {} layer(s) checked, nothing written", layers.len());
+        eprintln!(
+            "convert_v4: verify-only — {} layer(s) checked, nothing written",
+            layers.len()
+        );
         return Ok(());
     }
 

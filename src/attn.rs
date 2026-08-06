@@ -8,8 +8,8 @@
 //! free functions above it — see the banner below `streaming_rows`. V4 is MQA and shares
 //! none of the MLA machinery, so nothing before that banner applies to it.
 
-use anyhow::{Result, bail, ensure};
 use crate::v4compress::LayerKind;
+use anyhow::{Result, bail, ensure};
 
 /// Which tokens each decode step attends over. Selected once per layer per token.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,8 +101,9 @@ mod tests {
 /// right theta and no interpolation is `Defect::RopeNoYarn`: the frequencies stay
 /// plausible at every scale and the text stays fluent. S2c owns the compressed table.
 pub fn v4_rope_table_ratio0(rd: usize, max_pos: usize, theta: f32) -> Vec<f32> {
-    let inv: Vec<f32> =
-        (0..rd / 2).map(|i| 1.0 / theta.powf((2 * i) as f32 / rd as f32)).collect();
+    let inv: Vec<f32> = (0..rd / 2)
+        .map(|i| 1.0 / theta.powf((2 * i) as f32 / rd as f32))
+        .collect();
     let mut out = Vec::with_capacity(max_pos * rd);
     for t in 0..max_pos {
         for f in &inv {
@@ -149,14 +150,19 @@ impl Sel {
             return Ok((0, 0));
         }
         let rows = if self.start_pos == 0 { self.seqlen } else { 1 };
-        let win_cols =
-            if self.start_pos == 0 { self.seqlen.min(self.win) } else { self.win };
+        let win_cols = if self.start_pos == 0 {
+            self.seqlen.min(self.win)
+        } else {
+            self.win
+        };
         Ok((rows, win_cols + self.n_comp()?))
     }
 
     /// Compressed columns — `end_pos // ratio`, refused past the truncation point.
     fn n_comp(&self) -> Result<usize> {
-        let Some(ratio) = self.kind.compressor_ratio() else { return Ok(0) };
+        let Some(ratio) = self.kind.compressor_ratio() else {
+            return Ok(0);
+        };
         let rows = if self.start_pos == 0 { self.seqlen } else { 1 };
         let live = (self.start_pos + rows) / ratio;
         // **REFUSE, do not cap.** `Indexer.forward` keeps the top `index_topk` blocks BY
@@ -263,13 +269,33 @@ mod v4_tests {
         let mut v = Vec::new();
         // Prompt shorter than the window: `cols` shrinks to the prompt, and row `t` sees
         // exactly `0..=t`. A caller that assumed `win` columns would read past the row.
-        let (rows, cols) = v4_topk_idxs(Sel { win: 8, kind: LayerKind::Plain, index_topk: 0, seqlen: 3, start_pos: 0 }, &mut v).unwrap();
+        let (rows, cols) = v4_topk_idxs(
+            Sel {
+                win: 8,
+                kind: LayerKind::Plain,
+                index_topk: 0,
+                seqlen: 3,
+                start_pos: 0,
+            },
+            &mut v,
+        )
+        .unwrap();
         assert_eq!((rows, cols), (3, 3));
         assert_eq!(v, vec![0, -1, -1, 0, 1, -1, 0, 1, 2]);
 
         // Prompt past the window: the oldest position drops out of each row.
         v.clear();
-        let (rows, cols) = v4_topk_idxs(Sel { win: 2, kind: LayerKind::Plain, index_topk: 0, seqlen: 4, start_pos: 0 }, &mut v).unwrap();
+        let (rows, cols) = v4_topk_idxs(
+            Sel {
+                win: 2,
+                kind: LayerKind::Plain,
+                index_topk: 0,
+                seqlen: 4,
+                start_pos: 0,
+            },
+            &mut v,
+        )
+        .unwrap();
         assert_eq!((rows, cols), (4, 2));
         assert_eq!(v, vec![0, -1, 0, 1, 1, 2, 2, 3]);
     }
@@ -279,20 +305,50 @@ mod v4_tests {
         let mut v = Vec::new();
         // Before the wrap: slots 0..=start_pos, then masked. Ascending, NOT rotated —
         // rotating here would name slots the prefill never wrote.
-        let (rows, cols) = v4_topk_idxs(Sel { win: 4, kind: LayerKind::Plain, index_topk: 0, seqlen: 1, start_pos: 2 }, &mut v).unwrap();
+        let (rows, cols) = v4_topk_idxs(
+            Sel {
+                win: 4,
+                kind: LayerKind::Plain,
+                index_topk: 0,
+                seqlen: 1,
+                start_pos: 2,
+            },
+            &mut v,
+        )
+        .unwrap();
         assert_eq!((rows, cols), (1, 4));
         assert_eq!(v, vec![0, 1, 2, -1]);
 
         // At exactly `win - 1` the ring is full and the rotation starts; `start_pos = 3`
         // wrote slot 3, so the oldest slot is 0 and the list is already in order.
         v.clear();
-        v4_topk_idxs(Sel { win: 4, kind: LayerKind::Plain, index_topk: 0, seqlen: 1, start_pos: 3 }, &mut v).unwrap();
+        v4_topk_idxs(
+            Sel {
+                win: 4,
+                kind: LayerKind::Plain,
+                index_topk: 0,
+                seqlen: 1,
+                start_pos: 3,
+            },
+            &mut v,
+        )
+        .unwrap();
         assert_eq!(v, vec![0, 1, 2, 3]);
 
         // Past the wrap: slot `start_pos % win` holds the newest token and must come
         // LAST. At start_pos=5, win=4 the newest is slot 1, so the order is 2,3,0,1.
         v.clear();
-        v4_topk_idxs(Sel { win: 4, kind: LayerKind::Plain, index_topk: 0, seqlen: 1, start_pos: 5 }, &mut v).unwrap();
+        v4_topk_idxs(
+            Sel {
+                win: 4,
+                kind: LayerKind::Plain,
+                index_topk: 0,
+                seqlen: 1,
+                start_pos: 5,
+            },
+            &mut v,
+        )
+        .unwrap();
         assert_eq!(v, vec![2, 3, 0, 1]);
         // Every slot appears exactly once once the ring is full -- a rotation that
         // dropped or repeated one would still look ordered.
@@ -602,7 +658,6 @@ pub mod v4 {
             }
             Ok(())
         }
-
     }
 
     /// `act_quant(kv[..., :-rope_head_dim], **64**, …)` — model.py:512, and NOT the 128
@@ -732,7 +787,12 @@ pub mod v4 {
         // took `win == 0` out of reach, which `Dims::validate` already refuses but
         // `Sel::shape`'s early return would otherwise have turned into a silent `(0, 0)`
         // that skipped the `index_topk` refusal entirely.
-        let sel = super::Sel { win: d.window, seqlen: m, start_pos: pos0, ..sel };
+        let sel = super::Sel {
+            win: d.window,
+            seqlen: m,
+            start_pos: pos0,
+            ..sel
+        };
         let want_idxs = sel.shape()?;
         if io.idxs_shape != want_idxs {
             bail!(
@@ -982,8 +1042,8 @@ pub mod v4 {
 #[cfg(all(test, feature = "rocm"))]
 mod v4_guard_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
-    use super::v4::{Dims, Fp8W, Io, Scratch, Step, Weights, attention};
     use super::Sel;
+    use super::v4::{Dims, Fp8W, Io, Scratch, Step, Weights, attention};
     use crate::v4compress::LayerKind;
 
     /// The shipped V4 geometry, so a rejection below is about the guard and not about a
@@ -1005,14 +1065,23 @@ mod v4_guard_tests {
     /// A ratio-0 layer's selection descriptor. The guards under test precede anything
     /// that reads `kind`, so `Plain` keeps these cases about the guards.
     fn plain() -> Sel {
-        Sel { win: 128, kind: LayerKind::Plain, index_topk: 0, seqlen: 1, start_pos: 0 }
+        Sel {
+            win: 128,
+            kind: LayerKind::Plain,
+            index_topk: 0,
+            seqlen: 1,
+            start_pos: 0,
+        }
     }
 
     /// Dangling, and never dereferenced: both guards return before the first launch.
     fn parts(rows: usize) -> (Weights, Scratch, Io) {
         let n = std::ptr::null_mut::<f32>();
         let c = std::ptr::null::<f32>();
-        let f = Fp8W { w: std::ptr::null(), scale: c };
+        let f = Fp8W {
+            w: std::ptr::null(),
+            scale: c,
+        };
         let w = Weights {
             wq_a: f,
             q_norm: c,
@@ -1023,7 +1092,16 @@ mod v4_guard_tests {
             wo_a: f,
             wo_b: f,
         };
-        let s = Scratch { rows, xq: n, qr: n, qrq: n, q: n, kv: n, o: n, y: n };
+        let s = Scratch {
+            rows,
+            xq: n,
+            qr: n,
+            qrq: n,
+            q: n,
+            kv: n,
+            o: n,
+            y: n,
+        };
         let io = Io {
             x: c,
             freqs: c,

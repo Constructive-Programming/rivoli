@@ -16,8 +16,8 @@
 //!    is exactly when the report needs rewriting.
 
 use rivoli::v4compress::{
-    LayerKind, RopeParams, compress_dst, compress_offset, compress_topk, freqs_cis,
-    rope_for_layer, should_compress, window_topk,
+    LayerKind, RopeParams, compress_dst, compress_offset, compress_topk, freqs_cis, rope_for_layer,
+    should_compress, window_topk,
 };
 use rivoli::v4oracle::weights::V4Config;
 
@@ -63,15 +63,27 @@ fn window_topk_matches_the_oracle() {
     let mut checked_branches = [0usize; 3];
     for win in [4usize, 8, cfg().window_size] {
         for seqlen in [1usize, 3, 5, 13, 129, 300] {
-            for start_pos in [0usize, 1, 2, win - 1, win, win + 1, 2 * win, 2 * win + 3, 511] {
+            for start_pos in [
+                0usize,
+                1,
+                2,
+                win - 1,
+                win,
+                win + 1,
+                2 * win,
+                2 * win + 3,
+                511,
+            ] {
                 // Decode is always a single query row; prefill passes the whole prompt. The
                 // reference conflates these in one function, so feeding `seqlen > 1` with
                 // `start_pos > 0` asks a question the model never asks.
                 let s = if start_pos == 0 { seqlen } else { 1 };
                 let want = rivoli::v4oracle::forward::window_topk(win, s, start_pos);
                 let got = window_topk(win, s, start_pos);
-                let got64: Vec<Vec<i64>> =
-                    got.iter().map(|r| r.iter().map(|&x| i64::from(x)).collect()).collect();
+                let got64: Vec<Vec<i64>> = got
+                    .iter()
+                    .map(|r| r.iter().map(|&x| i64::from(x)).collect())
+                    .collect();
                 assert_eq!(
                     got64, want,
                     "window_topk(win={win}, seqlen={s}, start_pos={start_pos}) differs from the oracle"
@@ -110,17 +122,33 @@ fn branch_of(win: usize, start_pos: usize) -> usize {
 fn layer_42_is_ratio_4_not_the_zero_tail() {
     let c = cfg();
     assert_eq!(c.compress_ratios.len(), 46, "46 ratio entries");
-    assert_eq!(c.n_layers, 43, "for 43 layers — the mismatch that causes the trap");
+    assert_eq!(
+        c.n_layers, 43,
+        "for 43 layers — the mismatch that causes the trap"
+    );
 
-    let kinds: Vec<LayerKind> =
-        (0..c.n_layers).map(|l| LayerKind::from_ratio(c.compress_ratio(l))).collect();
-    assert_eq!(kinds[42], LayerKind::Overlap, "layer 42 carries BOTH a compressor and an indexer");
-    assert_eq!(kinds.iter().filter(|k| k.compressor_ratio().is_some()).count(), 41);
+    let kinds: Vec<LayerKind> = (0..c.n_layers)
+        .map(|l| LayerKind::from_ratio(c.compress_ratio(l)))
+        .collect();
+    assert_eq!(
+        kinds[42],
+        LayerKind::Overlap,
+        "layer 42 carries BOTH a compressor and an indexer"
+    );
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| k.compressor_ratio().is_some())
+            .count(),
+        41
+    );
 
     // The ratio-4 layers are exactly [2, 4, .., 42] — an even run that ENDS at 42, so an
     // implementation that stops at 40 loses one and still looks periodic. This one equality
     // subsumes the first/last/count assertions it replaced.
-    let ratio4: Vec<usize> = (0..c.n_layers).filter(|&l| kinds[l].has_indexer()).collect();
+    let ratio4: Vec<usize> = (0..c.n_layers)
+        .filter(|&l| kinds[l].has_indexer())
+        .collect();
     assert_eq!(ratio4, (0..21).map(|i| 2 + 2 * i).collect::<Vec<_>>());
 
     // The boundary itself, from BOTH sides — the counts above are invariant to where the
@@ -128,8 +156,14 @@ fn layer_42_is_ratio_4_not_the_zero_tail() {
     // exactly why trimming from the wrong end went unnoticed once already.
     assert_eq!(c.compress_ratios[42], 4, "last real layer is compressed");
     assert_eq!(c.compress_ratios[43], 0, "first MTP entry is not");
-    let wrong_trim = c.compress_ratios[3..3 + c.n_layers].iter().filter(|&&r| r == 4).count();
-    assert_ne!(wrong_trim, 21, "a wrong-end trim must NOT reproduce the right indexer count");
+    let wrong_trim = c.compress_ratios[3..3 + c.n_layers]
+        .iter()
+        .filter(|&&r| r == 4)
+        .count();
+    assert_ne!(
+        wrong_trim, 21,
+        "a wrong-end trim must NOT reproduce the right indexer count"
+    );
 }
 
 /// `coff` drives every compressor tensor's width, and it differs between L2 and L3.
@@ -189,20 +223,45 @@ fn yarn_applies_only_to_compressed_layers_and_only_above_the_band() {
         beta_fast: c.beta_fast,
         beta_slow: c.beta_slow,
     };
-    assert_eq!((c.rope_head_dim, c.rope_factor), (RD, FACTOR), "config still matches this test");
+    assert_eq!(
+        (c.rope_head_dim, c.rope_factor),
+        (RD, FACTOR),
+        "config still matches this test"
+    );
     let plain = rope_for_layer(compressed, c.rope_theta, LayerKind::Plain);
     let comp = rope_for_layer(compressed, c.rope_theta, LayerKind::Overlap);
     // `..compressed` is what guarantees a rotary parameter added later reaches both tables.
     // Prose cannot hold that; this can.
     assert_eq!(
-        (plain.rope_head_dim, plain.factor, plain.beta_fast, plain.beta_slow),
-        (comp.rope_head_dim, comp.factor, comp.beta_fast, comp.beta_slow),
+        (
+            plain.rope_head_dim,
+            plain.factor,
+            plain.beta_fast,
+            plain.beta_slow
+        ),
+        (
+            comp.rope_head_dim,
+            comp.factor,
+            comp.beta_fast,
+            comp.beta_slow
+        ),
         "the two tables must differ ONLY in theta and original_seq_len"
     );
     // A ratio-128 layer is compressed too, so it gets the SAME table as ratio-4.
-    assert_eq!(rope_for_layer(compressed, c.rope_theta, LayerKind::from_ratio(128)).theta, c.compress_rope_theta);
-    assert_eq!((plain.theta, plain.original_seq_len), (10000.0, 0), "ratio-0 disables YaRN");
-    assert_eq!((comp.theta, comp.original_seq_len), (160000.0, 65536), "ratio-4 enables it");
+    assert_eq!(
+        rope_for_layer(compressed, c.rope_theta, LayerKind::from_ratio(128)).theta,
+        c.compress_rope_theta
+    );
+    assert_eq!(
+        (plain.theta, plain.original_seq_len),
+        (10000.0, 0),
+        "ratio-0 disables YaRN"
+    );
+    assert_eq!(
+        (comp.theta, comp.original_seq_len),
+        (160000.0, 65536),
+        "ratio-4 enables it"
+    );
 
     let seqlen = 4;
     let fp = freqs_cis(plain, seqlen);
@@ -221,9 +280,15 @@ fn yarn_applies_only_to_compressed_layers_and_only_above_the_band() {
 
     // Band edges, computed here from the config rather than taken from the implementation.
     let base = 160000.0f64;
-    let fcd = |rot: f64| RD as f64 * (65536.0f64 / (rot * 2.0 * std::f64::consts::PI)).ln() / (2.0 * base.ln());
+    let fcd = |rot: f64| {
+        RD as f64 * (65536.0f64 / (rot * 2.0 * std::f64::consts::PI)).ln() / (2.0 * base.ln())
+    };
     let (low, high) = (fcd(32.0).floor(), fcd(1.0).ceil());
-    assert_eq!((low, high), (15.0, 25.0), "YaRN correction range for the shipped config");
+    assert_eq!(
+        (low, high),
+        (15.0, 25.0),
+        "YaRN correction range for the shipped config"
+    );
 
     let raw = |i: usize| 1.0f64 / base.powf((2 * i) as f64 / RD as f64);
     // `atan2`, not `acos`: every angle here is small, so `cos` is within f32 rounding of
@@ -258,7 +323,10 @@ fn yarn_applies_only_to_compressed_layers_and_only_above_the_band() {
             );
         }
     }
-    assert_ne!(fp, fc, "the two per-layer tables must not be the same table");
+    assert_ne!(
+        fp, fc,
+        "the two per-layer tables must not be the same table"
+    );
 }
 
 // =======================================================================================
@@ -289,15 +357,27 @@ fn ratio_128_pooling_is_unreachable_at_the_emit_prompt() {
     // Decode only compresses on the position that completes a block: start_pos = 127, 255,
     // ... Reaching the first one needs 115 decode steps past a 13-token prompt.
     let first = (EMIT_PROMPT_LEN..4096).find(|&p| should_compress(l3, 1, p));
-    assert_eq!(first, Some(127), "the first ratio-128 decode block completes at start_pos 127");
+    assert_eq!(
+        first,
+        Some(127),
+        "the first ratio-128 decode block completes at start_pos 127"
+    );
     for p in EMIT_PROMPT_LEN..127 {
-        assert!(!should_compress(l3, 1, p), "no block completes at start_pos {p}");
+        assert!(
+            !should_compress(l3, 1, p),
+            "no block completes at start_pos {p}"
+        );
     }
     // For contrast, ratio 4 compresses immediately and often — which is why L2 is covered
     // and L3 is not, from the same run.
     let l2 = LayerKind::from_ratio(4);
     assert!(should_compress(l2, EMIT_PROMPT_LEN, 0));
-    assert_eq!((EMIT_PROMPT_LEN..20).filter(|&p| should_compress(l2, 1, p)).count(), 2);
+    assert_eq!(
+        (EMIT_PROMPT_LEN..20)
+            .filter(|&p| should_compress(l2, 1, p))
+            .count(),
+        2
+    );
 
     // And a ratio-0 layer has no Compressor at all, so the answer is false in BOTH phases.
     // As a raw `usize` this read `13 >= 0` == true at prefill and `is_multiple_of(0)` ==
@@ -305,9 +385,18 @@ fn ratio_128_pooling_is_unreachable_at_the_emit_prompt() {
     // divide-by-zero. `LayerKind` makes the state unrepresentable; this pins it.
     let l0 = LayerKind::from_ratio(0);
     assert_eq!(l0.compressor_ratio(), None);
-    assert!(!should_compress(l0, EMIT_PROMPT_LEN, 0), "ratio-0 never compresses at prefill");
-    assert!(!should_compress(l0, 1, 7), "ratio-0 never compresses at decode");
-    assert!(compress_topk(l0, EMIT_PROMPT_LEN, 0, 13).is_empty(), "ratio-0 selects nothing");
+    assert!(
+        !should_compress(l0, EMIT_PROMPT_LEN, 0),
+        "ratio-0 never compresses at prefill"
+    );
+    assert!(
+        !should_compress(l0, 1, 7),
+        "ratio-0 never compresses at decode"
+    );
+    assert!(
+        compress_topk(l0, EMIT_PROMPT_LEN, 0, 13).is_empty(),
+        "ratio-0 selects nothing"
+    );
 }
 
 /// **The ratio-128 SELECTION golden is a `[13, 0]` empty tensor.**
@@ -325,15 +414,25 @@ fn ratio_128_selection_golden_is_empty_and_therefore_vacuous() {
     let l3 = LayerKind::from_ratio(128);
     let sel = compress_topk(l3, EMIT_PROMPT_LEN, 0, offset);
     assert_eq!(sel.len(), EMIT_PROMPT_LEN, "one row per query");
-    assert!(sel.iter().all(Vec::is_empty), "every row is empty: seqlen/ratio == 0");
+    assert!(
+        sel.iter().all(Vec::is_empty),
+        "every row is empty: seqlen/ratio == 0"
+    );
     assert_eq!(sel.concat().len(), 0, "the golden carries no values at all");
 
     // The same function on a prompt long enough to matter is NOT vacuous, which is what
     // makes the emptiness above a property of the prompt rather than of the code.
     let long = 512usize;
     let sel = compress_topk(l3, long, 0, compress_offset(cfg().window_size, long, 0));
-    assert_eq!(sel[0].len(), long / 128, "4 compressed blocks exist at 512 tokens");
-    assert!(sel[0].iter().all(|&x| x == -1), "query 0 may read none of them");
+    assert_eq!(
+        sel[0].len(),
+        long / 128,
+        "4 compressed blocks exist at 512 tokens"
+    );
+    assert!(
+        sel[0].iter().all(|&x| x == -1),
+        "query 0 may read none of them"
+    );
     assert_eq!(
         sel[long - 1].iter().filter(|&&x| x != -1).count(),
         (long) / 128,
@@ -364,7 +463,11 @@ fn indexer_topk_never_cuts_at_the_emit_prompt() {
     assert_eq!(index_topk, 512);
     let n_comp = EMIT_PROMPT_LEN / 4;
     assert_eq!(n_comp, 3);
-    assert_eq!(index_topk.min(n_comp), n_comp, "top-k selects every block: no ranking is tested");
+    assert_eq!(
+        index_topk.min(n_comp),
+        n_comp,
+        "top-k selects every block: no ranking is tested"
+    );
 
     // The prompt length at which the ranking would start to bite, for the record: the first
     // seqlen whose compressed-block count exceeds index_topk. Stated as a closed form and
@@ -372,7 +475,10 @@ fn indexer_topk_never_cuts_at_the_emit_prompt() {
     // cannot pass by being compared only against itself.
     let need = 4 * (index_topk + 1);
     assert_eq!(need, 2052, "2052 tokens before index_topk cuts anything");
-    assert!((1..need).all(|s| s / 4 <= index_topk), "nothing below {need} cuts");
+    assert!(
+        (1..need).all(|s| s / 4 <= index_topk),
+        "nothing below {need} cuts"
+    );
     assert!(need / 4 > index_topk, "{need} does cut");
 }
 
@@ -417,7 +523,11 @@ fn compress_dst_is_positional_and_an_appending_placer_disagrees() {
     // Decode: one block, on the position that completes it, at slot `start_pos / ratio`.
     for p in 0..64 {
         let want = ((p + 1) % 4 == 0).then_some((win + p / 4, 1));
-        assert_eq!(compress_dst(l2, win, 1, p), want, "ratio-4 decode at start_pos {p}");
+        assert_eq!(
+            compress_dst(l2, win, 1, p),
+            want,
+            "ratio-4 decode at start_pos {p}"
+        );
     }
 
     // THE REQUIREMENT. Walk positions 0..=11 but SKIP 4..=7 — one accepted two-token draft
@@ -432,8 +542,16 @@ fn compress_dst_is_positional_and_an_appending_placer_disagrees() {
             appended += n;
         }
     }
-    assert_eq!(positional, vec![win, win + 2], "blocks 0 and 2 complete at 3 and 11");
-    assert_eq!(appending, vec![win, win + 1], "an appending placer packs them adjacently");
+    assert_eq!(
+        positional,
+        vec![win, win + 2],
+        "blocks 0 and 2 complete at 3 and 11"
+    );
+    assert_eq!(
+        appending,
+        vec![win, win + 1],
+        "an appending placer packs them adjacently"
+    );
     assert_ne!(
         positional, appending,
         "if these agree the test is vacuous — a skipped step MUST separate the two placers"
@@ -468,7 +586,11 @@ fn compress_dst_is_positional_and_an_appending_placer_disagrees() {
     // between a ratio-0 layer and `seqlen / 0`. Reorder the two guards and the rest of the
     // suite stays green while every ratio-0 layer panics.
     let l0 = LayerKind::from_ratio(0);
-    assert_eq!(l0.compressor_ratio(), None, "the `?` this test relies on must be the one that fires");
+    assert_eq!(
+        l0.compressor_ratio(),
+        None,
+        "the `?` this test relies on must be the one that fires"
+    );
     assert_eq!(compress_dst(l0, win, EMIT_PROMPT_LEN, 0), None);
     assert_eq!(compress_dst(l0, win, 1, 7), None);
 }

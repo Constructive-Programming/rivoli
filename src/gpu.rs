@@ -24,6 +24,7 @@ use crate::attn::{AttnMode, streaming_rows};
 // exemption was suppressing nothing (re-measured without it: 0 clones). The list stays
 // explicit rather than a glob import, which would cost the compile-time check that every
 // name here actually exists in the backend.
+use crate::artifact::format::RoutedFmt;
 use crate::backend::{
     Event, ExpertDesc, Stream, device_sync, fill_u32, launch_append_kv, launch_argmax,
     launch_attend, launch_embed_i8_row, launch_flag_nonfinite, launch_gather_rope, launch_gemv_f32,
@@ -36,7 +37,6 @@ use crate::backend::{
 use crate::fetch::asyncfetch::Ticket;
 use crate::math::{E4M3_BLOCK, route_into, topk_into};
 use crate::memory::device::DeviceBuf;
-use crate::artifact::format::RoutedFmt;
 use crate::memory::pin::{Fp8Mlp, IndexerPin, LayerMlp, Pin};
 use crate::memory::routed::{ExpertSlot, TRACE_WINDOW};
 
@@ -786,12 +786,7 @@ pub struct GpuEngine<'a> {
 }
 
 impl<'a> GpuEngine<'a> {
-    pub fn new(
-        pin: Pin<'a>,
-        cfg: &'a ModelConfig,
-        max_ctx: usize,
-        mode: AttnMode,
-    ) -> Result<Self> {
+    pub fn new(pin: Pin<'a>, cfg: &'a ModelConfig, max_ctx: usize, mode: AttnMode) -> Result<Self> {
         // ALWAYS ON since 2026-08-03, except while capturing a trace — the `--layer-major-
         // prefill` flag is gone and this is derived rather than chosen. Layer-major is
         // 2.15x on prefill wall and 5.66x fewer expert reads, and the A/B that proved it
@@ -3059,7 +3054,10 @@ impl<'a> GpuEngine<'a> {
                 #[cfg(feature = "trace")]
                 if _i.is_multiple_of(WIN) {
                     let dt = win_t.elapsed().as_secs_f64();
-                    let (dh, dm) = (self.pin.routed.hits() - win_hit, self.pin.routed.misses() - win_miss);
+                    let (dh, dm) = (
+                        self.pin.routed.hits() - win_hit,
+                        self.pin.routed.misses() - win_miss,
+                    );
                     let hit_pct = 100.0 * dh as f64 / (dh + dm).max(1) as f64;
                     // Tokens per PASS is now ≥ 1, so the window's rate has to divide the
                     // tokens actually emitted by the wall, not WIN by it.

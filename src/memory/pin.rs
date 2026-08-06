@@ -19,8 +19,7 @@
 
 use crate::artifact::config::Mode;
 use crate::artifact::format::{
-    Dtype, ExpertSet, FormatMeta, RoutedFmt, Safetensors, SetDims, f4_layer_range,
-    load_codebooks,
+    Dtype, ExpertSet, FormatMeta, RoutedFmt, Safetensors, SetDims, f4_layer_range, load_codebooks,
 };
 use crate::artifact::model::{ModelConfig, V4Config};
 use crate::artifact::quant::{
@@ -531,7 +530,10 @@ impl<'a> Pin<'a> {
         // A tier descriptor per format. Everything but WHICH SET comes off the set itself
         // (format, slot offsets, stride, layer range), so the two arms differ in one word.
         let tier_fmt = |src: &Option<ExpertSet>, what: &str| -> Result<TierFmt> {
-            TierFmt::new(src.as_ref().with_context(|| format!("{what} source missing"))?)
+            TierFmt::new(
+                src.as_ref()
+                    .with_context(|| format!("{what} source missing"))?,
+            )
         };
         // COLD/HOT tiers by mode. Single-format shares one format across both tiers.
         let (cold, hot) = match mode {
@@ -598,9 +600,7 @@ impl<'a> Pin<'a> {
             RoutedFmt::Vq3
         }
     }
-
 }
-
 
 // ── DeepSeek-V4-Flash resident set ──────────────────────────────────────────────
 //

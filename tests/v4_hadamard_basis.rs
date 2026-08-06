@@ -75,7 +75,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
-use rivoli::v4oracle::numerics::{bf16_decode, bf16_encode, fp4_act_quant_inplace, hadamard_rotate};
+use rivoli::v4oracle::numerics::{
+    bf16_decode, bf16_encode, fp4_act_quant_inplace, hadamard_rotate,
+};
 use rivoli::v4oracle::weights::{NamedRng, V4Config};
 
 // ---------------------------------------------------------------------------------------
@@ -130,14 +132,23 @@ fn sylvester(n: usize) -> Vec<i32> {
 /// — an ordering bug that looks exactly like a working function.
 fn sequency(n: usize) -> Vec<i32> {
     let h = sylvester(n);
-    let changes =
-        |r: usize| (0..n - 1).filter(|&c| h[r * n + c] != h[r * n + c + 1]).count();
+    let changes = |r: usize| {
+        (0..n - 1)
+            .filter(|&c| h[r * n + c] != h[r * n + c + 1])
+            .count()
+    };
     let mut keys: Vec<usize> = (0..n).map(changes).collect();
     keys.sort_unstable();
-    assert_eq!(keys, (0..n).collect::<Vec<_>>(), "n={n}: sign-change counts must be 0..n");
+    assert_eq!(
+        keys,
+        (0..n).collect::<Vec<_>>(),
+        "n={n}: sign-change counts must be 0..n"
+    );
     let mut rows: Vec<usize> = (0..n).collect();
     rows.sort_by_key(|&r| changes(r));
-    rows.iter().flat_map(|&r| h[r * n..(r + 1) * n].iter().copied()).collect()
+    rows.iter()
+        .flat_map(|&r| h[r * n..(r + 1) * n].iter().copied())
+        .collect()
 }
 
 /// `F.linear(x, H) * scale` = `x @ Hᵀ * scale`, the operation the package documents.
@@ -156,7 +167,9 @@ fn linear_by(h: &[i32], x: &[f32], scale: f32) -> Vec<f32> {
     debug_assert_eq!(h.len(), n * n, "matrix must be [{n}, {n}]");
     (0..n)
         .map(|r| {
-            let acc: f64 = (0..n).map(|c| f64::from(h[r * n + c]) * f64::from(x[c])).sum();
+            let acc: f64 = (0..n)
+                .map(|c| f64::from(h[r * n + c]) * f64::from(x[c]))
+                .sum();
             (acc as f32) * scale
         })
         .collect()
@@ -188,7 +201,10 @@ fn rbf(v: &mut [f32]) {
 /// tests with.
 fn index_head_dim() -> usize {
     let n = V4Config::v4_flash().index_head_dim;
-    assert!(n.is_power_of_two(), "index_head_dim={n} would need the package's zero-padding");
+    assert!(
+        n.is_power_of_two(),
+        "index_head_dim={n} would need the package's zero-padding"
+    );
     n
 }
 
@@ -203,7 +219,11 @@ fn index_head_dim() -> usize {
 /// docstring matrix there would be nothing to be right about.
 #[test]
 fn sylvester_is_the_scipy_docstring_matrix_and_sequency_is_not() {
-    assert_eq!(sylvester(4), SCIPY_DOCSTRING_H4.to_vec(), "scipy.linalg.hadamard(4)");
+    assert_eq!(
+        sylvester(4),
+        SCIPY_DOCSTRING_H4.to_vec(),
+        "scipy.linalg.hadamard(4)"
+    );
     assert_ne!(
         sequency(4),
         SCIPY_DOCSTRING_H4.to_vec(),
@@ -238,8 +258,14 @@ fn both_candidate_matrices_are_symmetric_so_involution_cannot_separate_them() {
         |h: &[i32], n: usize| (0..n).all(|r| (0..n).all(|c| h[r * n + c] == h[c * n + r]));
     for lg in 0..=7 {
         let n = 1usize << lg;
-        assert!(symmetric(&sylvester(n), n), "n={n}: Sylvester order is not symmetric");
-        assert!(symmetric(&sequency(n), n), "n={n}: sequency order is not symmetric");
+        assert!(
+            symmetric(&sylvester(n), n),
+            "n={n}: Sylvester order is not symmetric"
+        );
+        assert!(
+            symmetric(&sequency(n), n),
+            "n={n}: sequency order is not symmetric"
+        );
     }
 }
 
@@ -283,7 +309,11 @@ fn hadamard_rotate_is_the_sylvester_matrix_and_not_the_sequency_one() {
         let seq = linear_by(&sequency(n), &x, scale);
         if sylvester(n) == sequency(n) {
             assert!(n <= 2, "n={n}: the orders may coincide only at n <= 2");
-            assert_eq!(bits(&seq), bits(&got), "n={n}: identical matrices cannot disagree");
+            assert_eq!(
+                bits(&seq),
+                bits(&got),
+                "n={n}: identical matrices cannot disagree"
+            );
         } else {
             assert_ne!(
                 bits(&seq),
@@ -294,8 +324,15 @@ fn hadamard_rotate_is_the_sylvester_matrix_and_not_the_sequency_one() {
             separated.push(n);
         }
     }
-    assert_eq!(separated, vec![4, 8, 16, 32, 64, 128], "every width above 2 separates");
-    assert!(separated.contains(&index_head_dim()), "the model's own width must be covered");
+    assert_eq!(
+        separated,
+        vec![4, 8, 16, 32, 64, 128],
+        "every width above 2 separates"
+    );
+    assert!(
+        separated.contains(&index_head_dim()),
+        "the model's own width must be covered"
+    );
 }
 
 // ---------------------------------------------------------------------------------------
@@ -363,7 +400,9 @@ fn basis_order_survives_only_through_the_fp4_grouping() {
     };
     // `einsum(...)` → bf16. One store, as model.py:426 performs.
     let score = |a: &[f32], b: &[f32]| -> f32 {
-        bf16_decode(bf16_encode(a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>()))
+        bf16_decode(bf16_encode(
+            a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>(),
+        ))
     };
 
     // `|dn - ds| / max(|dn|, |ds|)`, which lies in [0, 2] and needs no floor. Dividing by

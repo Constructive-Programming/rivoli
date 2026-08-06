@@ -210,7 +210,10 @@ impl Diff {
             return format!("{head} bit-identical");
         }
         let (dim, w, g) = self.worst;
-        format!("{head} worst@dim{dim} want={w:e} got={g:e} ratio={:.4}", self.worst_ratio())
+        format!(
+            "{head} worst@dim{dim} want={w:e} got={g:e} ratio={:.4}",
+            self.worst_ratio()
+        )
     }
 }
 
@@ -231,7 +234,10 @@ impl Diff {
 /// alone cannot.
 fn diff(want: &[f32], got: &[f32], d: usize, rd: usize) -> Diff {
     assert_eq!(want.len(), got.len(), "diff: length mismatch");
-    assert!(want.len().is_multiple_of(d), "diff: not a whole number of [d] rows");
+    assert!(
+        want.len().is_multiple_of(d),
+        "diff: not a whole number of [d] rows"
+    );
     let ord = |x: f32| -> i32 {
         let c = i32::from(f32_to_bf16(x) as i16);
         if c < 0 { -32768 - c } else { c }
@@ -292,7 +298,9 @@ fn assert_clean(name: &str, dv: &Diff) -> Vec<String> {
         bad.push(format!(
             "{name}: {}/{} elements differ ({:.3}%) — a boundary flip is rare and this is \
              systematic, so the one-step allowance is covering a real error",
-            dv.differing, dv.total, 100.0 * frac
+            dv.differing,
+            dv.total,
+            100.0 * frac
         ));
     }
     bad
@@ -393,9 +401,20 @@ struct Cell {
 impl Cell {
     fn load(ck: &rivoli::v4oracle::weights::Checkpoint, cfg: &V4Config, layer: usize) -> Self {
         let ratio = cfg.compress_ratio(layer);
-        let cw = compressor_w(ck, &format!("layers.{layer}.attn.compressor"), ratio, cfg.head_dim, false);
-        let geom = Geom::attention(LayerKind::from_ratio(ratio), cfg.head_dim, cfg.rope_head_dim, cfg.norm_eps)
-            .expect("a compressed layer has a Geom");
+        let cw = compressor_w(
+            ck,
+            &format!("layers.{layer}.attn.compressor"),
+            ratio,
+            cfg.head_dim,
+            false,
+        );
+        let geom = Geom::attention(
+            LayerKind::from_ratio(ratio),
+            cfg.head_dim,
+            cfg.rope_head_dim,
+            cfg.norm_eps,
+        )
+        .expect("a compressed layer has a Geom");
         Self {
             wkv: Dev::u16(&bf16_rows(&cw.wkv)),
             wgate: Dev::u16(&bf16_rows(&cw.wgate)),
@@ -448,8 +467,10 @@ impl Cell {
         freqs_over: Option<&[f32]>,
     ) -> (Vec<f32>, Vec<f32>) {
         let o = Oracle::new(self.cfg.clone(), defect);
-        let mut cs: CompState =
-            o.fresh_state(self.layer).comp.expect("a compressed layer has compressor state");
+        let mut cs: CompState = o
+            .fresh_state(self.layer)
+            .comp
+            .expect("a compressed layer has compressor state");
         let mut ctr = Counters::default();
         let d = self.cfg.head_dim;
         let (cd, ents) = (self.geom.cd(), self.geom.ents());
@@ -468,7 +489,11 @@ impl Cell {
         for &(s, start_pos) in steps {
             // Same activations to both sides. `probe` is seeded by name, so the fixture is
             // reproducible and a rerun compares the same numbers.
-            let x = probe(&format!("l{}-s{s}-p{start_pos}", self.layer), s, self.cfg.dim);
+            let x = probe(
+                &format!("l{}-s{s}-p{start_pos}", self.layer),
+                s,
+                self.cfg.dim,
+            );
             if let Some(v) = o.compressor(
                 &self.cw,
                 &mut cs,
@@ -503,8 +528,14 @@ impl Cell {
             // The shape contract `Buffers` states only in prose, checked against the
             // lengths `Dev` carries. Without this the file would be asserting agreement
             // between an oracle and a kernel reading past the end of its inputs.
-            assert!(kv.len >= s * cd && score.len >= s * cd, "scratch too small for {s} rows");
-            assert!(kv_state.len == self.geom.state_len(), "state buffer is [ents, cd]");
+            assert!(
+                kv.len >= s * cd && score.len >= s * cd,
+                "scratch too small for {s} rows"
+            );
+            assert!(
+                kv_state.len == self.geom.state_len(),
+                "state buffer is [ents, cd]"
+            );
             assert!(self.ape.len == self.ratio() * cd, "ape is [ratio, coff*d]");
             // SAFETY: every pointer above comes from a `Dev` alive for this iteration, at
             // the element counts just asserted; `device_sync` below completes the work
@@ -552,13 +583,29 @@ fn cells() -> Option<(Checkpoint, V4Config, Vec<Spec>)> {
     let ck = checkpoint()?;
     let cfg = V4Config::v4_flash();
     assert_eq!(cfg.compress_ratio(2), 4, "layer 2 is the overlapping class");
-    assert_eq!(cfg.compress_ratio(3), 128, "layer 3 is the non-overlapping class");
-    let spec = |layer, script, name| Spec { layer, script, name };
+    assert_eq!(
+        cfg.compress_ratio(3),
+        128,
+        "layer 3 is the non-overlapping class"
+    );
+    let spec = |layer, script, name| Spec {
+        layer,
+        script,
+        name,
+    };
     let list = vec![
         spec(2, vec![(PROBE_LEN, 0)], "ratio4/prefill"),
         spec(2, decode_script(4, 23), "ratio4/decode"),
-        spec(3, vec![(PROBE_REMAINDER_LEN, 0)], "ratio128/prefill+remainder"),
-        spec(3, decode_script(128, RATIO_128_SECOND_DECODE_BLOCK), "ratio128/decode"),
+        spec(
+            3,
+            vec![(PROBE_REMAINDER_LEN, 0)],
+            "ratio128/prefill+remainder",
+        ),
+        spec(
+            3,
+            decode_script(128, RATIO_128_SECOND_DECODE_BLOCK),
+            "ratio128/decode",
+        ),
     ];
     Some((ck, cfg, list))
 }
@@ -573,7 +620,10 @@ fn decode_script(ratio: usize, last: usize) -> Vec<(usize, usize)> {
     let mut v = vec![(EMIT_LEN, 0)];
     v.extend((EMIT_LEN..=last).map(|p| (1, p)));
     assert!(
-        v.iter().filter(|&&(s, p)| s == 1 && (p + 1) % ratio == 0).count() >= 2,
+        v.iter()
+            .filter(|&&(s, p)| s == 1 && (p + 1) % ratio == 0)
+            .count()
+            >= 2,
         "a decode script must complete at least two blocks, else the RoPE position and the \
          block index cannot be told apart"
     );
@@ -587,22 +637,39 @@ fn decode_script(ratio: usize, last: usize) -> Vec<(usize, usize)> {
 /// Ratio 4 (layer 2) and ratio 128 (layer 3), prefill and decode, against the clean oracle.
 #[test]
 fn the_four_cells_reproduce_the_oracle() {
-    let Some((ck, cfg, list)) = cells() else { return };
+    let Some((ck, cfg, list)) = cells() else {
+        return;
+    };
     // Every cell reports BEFORE anything asserts. The first run of this file asserted inside
     // the loop and failed on cell 1 of 4, so three quarters of the diagnostic never printed
     // and the failure could not be told from a phase-dependent one. A gate that aborts on
     // its first cell hands back a quarter of what it measured.
     let mut over = Vec::new();
-    for Spec { layer, script, name } in list {
+    for Spec {
+        layer,
+        script,
+        name,
+    } in list
+    {
         let mut cell = Cell::load(&ck, &cfg, layer);
         let (want, got) = cell.run(Defect::None, &script, None, None);
-        assert!(!want.is_empty(), "{name}: the script emitted nothing — it gates nothing");
-        assert!(got.iter().all(|v| v.is_finite()), "{name}: non-finite output");
+        assert!(
+            !want.is_empty(),
+            "{name}: the script emitted nothing — it gates nothing"
+        );
+        assert!(
+            got.iter().all(|v| v.is_finite()),
+            "{name}: non-finite output"
+        );
         let dv = diff(&want, &got, cfg.head_dim, cfg.rope_head_dim);
         println!("{}", dv.one_line(name));
         over.extend(assert_clean(name, &dv));
     }
-    assert!(over.is_empty(), "clean comparison failed:\n  {}", over.join("\n  "));
+    assert!(
+        over.is_empty(),
+        "clean comparison failed:\n  {}",
+        over.join("\n  ")
+    );
 }
 
 /// The ratio-128 prefill at 256 reads NO compressor state — re-proved against the GPU.
@@ -619,12 +686,19 @@ fn the_four_cells_reproduce_the_oracle() {
 #[test]
 fn state_is_not_read_by_the_ratio_128_prefill_at_a_whole_multiple() {
     let Some((ck, cfg, _)) = cells() else { return };
-    assert_eq!(PROBE_LEN % 128, 0, "the claim is scoped to a whole multiple of the ratio");
+    assert_eq!(
+        PROBE_LEN % 128,
+        0,
+        "the claim is scoped to a whole multiple of the ratio"
+    );
     let mut cell = Cell::load(&ck, &cfg, 3);
     let (_, base) = cell.run(Defect::None, &[(PROBE_LEN, 0)], None, None);
     let (_, again) = cell.run(Defect::None, &[(PROBE_LEN, 0)], None, None);
     assert!(!base.is_empty(), "256 tokens pools two ratio-128 blocks");
-    assert_eq!(base, again, "the harness is not deterministic — nothing else here is evidence");
+    assert_eq!(
+        base, again,
+        "the harness is not deterministic — nothing else here is evidence"
+    );
 }
 
 // =======================================================================================
@@ -642,15 +716,29 @@ fn state_is_not_read_by_the_ratio_128_prefill_at_a_whole_multiple() {
 /// assertion and fail the second.
 #[test]
 fn zeroing_ape_reproduces_the_no_ape_defect_exactly() {
-    let Some((ck, cfg, list)) = cells() else { return };
-    for Spec { layer, script, name } in list {
+    let Some((ck, cfg, list)) = cells() else {
+        return;
+    };
+    for Spec {
+        layer,
+        script,
+        name,
+    } in list
+    {
         let mut cell = Cell::load(&ck, &cfg, layer);
         let zeros = vec![0.0f32; cell.cw.ape.len()];
         let (clean, _) = cell.run(Defect::None, &script, None, None);
         let (broken, gpu) = cell.run(Defect::CompressorNoApe, &script, Some(&zeros), None);
         // `None`: every cell must separate on `no-ape`, and every cell does.
         assert_impersonates(
-            name, "no-ape", &clean, &broken, &gpu, cfg.head_dim, cfg.rope_head_dim, None,
+            name,
+            "no-ape",
+            &clean,
+            &broken,
+            &gpu,
+            cfg.head_dim,
+            cfg.rope_head_dim,
+            None,
         );
     }
 }
@@ -665,18 +753,39 @@ fn zeroing_ape_reproduces_the_no_ape_defect_exactly() {
 /// type system tells the two tables apart, so a test has to.
 #[test]
 fn the_ratio_0_rope_table_reproduces_the_no_yarn_defect_exactly() {
-    let Some((ck, cfg, list)) = cells() else { return };
+    let Some((ck, cfg, list)) = cells() else {
+        return;
+    };
     assert_records_are_well_formed();
     assert_no_yarn_records_are_live(&list.iter().map(|s| s.name).collect::<Vec<_>>());
-    for Spec { layer, script, name } in list {
+    for Spec {
+        layer,
+        script,
+        name,
+    } in list
+    {
         let mut cell = Cell::load(&ck, &cfg, layer);
         let plain = cell.table(Defect::RopeNoYarn);
-        assert_ne!(plain, cell.table(Defect::None), "{name}: the two tables must differ");
+        assert_ne!(
+            plain,
+            cell.table(Defect::None),
+            "{name}: the two tables must differ"
+        );
         let (clean, _) = cell.run(Defect::None, &script, None, None);
         let (broken, gpu) = cell.run(Defect::RopeNoYarn, &script, None, Some(&plain));
-        let expect = NO_YARN_BELOW_RESOLUTION.iter().find(|(c, _)| *c == name).map(|(_, s)| *s);
+        let expect = NO_YARN_BELOW_RESOLUTION
+            .iter()
+            .find(|(c, _)| *c == name)
+            .map(|(_, s)| *s);
         assert_impersonates(
-            name, "no-yarn", &clean, &broken, &gpu, cfg.head_dim, cfg.rope_head_dim, expect,
+            name,
+            "no-yarn",
+            &clean,
+            &broken,
+            &gpu,
+            cfg.head_dim,
+            cfg.rope_head_dim,
+            expect,
         );
     }
 }
@@ -724,8 +833,16 @@ const BELOW_RESOLUTION: &[(&str, Defect, u32)] = &[
     ("ratio4/decode", Defect::SkipKvActQuant, 8),
     ("ratio4/decode", Defect::KvActQuantNoRoundScale, 22),
     ("ratio128/prefill+remainder", Defect::SkipKvActQuant, 8),
-    ("ratio128/prefill+remainder", Defect::KvActQuantWholeTensor, 38),
-    ("ratio128/prefill+remainder", Defect::KvActQuantNoRoundScale, 17),
+    (
+        "ratio128/prefill+remainder",
+        Defect::KvActQuantWholeTensor,
+        38,
+    ),
+    (
+        "ratio128/prefill+remainder",
+        Defect::KvActQuantNoRoundScale,
+        17,
+    ),
     ("ratio128/prefill+remainder", Defect::NoBf16Rounding, 16),
     ("ratio128/decode", Defect::SkipKvActQuant, 8),
     ("ratio128/decode", Defect::KvActQuantNoRoundScale, 18),
@@ -777,14 +894,19 @@ fn assert_records_are_well_formed() {
         );
     }
     for (c, s) in NO_YARN_BELOW_RESOLUTION {
-        assert!(*s < RESOLVABLE, "NO_YARN_BELOW_RESOLUTION {c} records {s} >= {RESOLVABLE}");
+        assert!(
+            *s < RESOLVABLE,
+            "NO_YARN_BELOW_RESOLUTION {c} records {s} >= {RESOLVABLE}"
+        );
     }
     // Duplicates make the second entry permanently unreachable, because both lookups take
     // the FIRST match -- a guard that cannot fire, reported as a dead entry pointing at the
     // wrong row.
     for (i, (c, d, _)) in BELOW_RESOLUTION.iter().enumerate() {
         assert!(
-            !BELOW_RESOLUTION[..i].iter().any(|(c2, d2, _)| c2 == c && d2 == d),
+            !BELOW_RESOLUTION[..i]
+                .iter()
+                .any(|(c2, d2, _)| c2 == c && d2 == d),
             "BELOW_RESOLUTION has a duplicate {c}/{d:?}; the second can never be reached"
         );
     }
@@ -820,7 +942,10 @@ fn assert_impersonates(
     expect_sep: Option<u32>,
 ) {
     let hit = diff(broken, gpu, d, rd);
-    println!("{}", hit.one_line(&format!("{cell} {what}: gpu vs defect-oracle")));
+    println!(
+        "{}",
+        hit.one_line(&format!("{cell} {what}: gpu vs defect-oracle"))
+    );
     let bad = assert_clean(&format!("{cell} {what} impersonation"), &hit);
     assert!(
         bad.is_empty(),
@@ -829,7 +954,13 @@ fn assert_impersonates(
          expressible disagreement):\n  {}",
         bad.join("\n  ")
     );
-    let sep = gap(&format!("{cell} {what}: gpu vs CLEAN oracle"), clean, gpu, d, rd);
+    let sep = gap(
+        &format!("{cell} {what}: gpu vs CLEAN oracle"),
+        clean,
+        gpu,
+        d,
+        rd,
+    );
     match expect_sep {
         // Recorded as non-separating. Asserted as an EXACT expected value, not skipped: if
         // this cell ever gains resolution the record is stale and must be revisited, and a
@@ -868,7 +999,9 @@ fn assert_impersonates(
 /// as coverage of the overlapping branch by anyone scanning the list.
 #[test]
 fn each_in_scope_defect_is_further_from_the_gpu_than_the_clean_oracle_is() {
-    let Some((ck, cfg, list)) = cells() else { return };
+    let Some((ck, cfg, list)) = cells() else {
+        return;
+    };
     // The compressor's own breakages, the RoPE ones inside `v4c_finish_row`, the four
     // `act_quant` ones (S2b's kernel, this module's call arguments) and the bf16 stores.
     // Defects outside the compressor — the attention core, the router, the MoE, the indexer
@@ -879,8 +1012,15 @@ fn each_in_scope_defect_is_further_from_the_gpu_than_the_clean_oracle_is() {
     // moment a new breakage is added is exactly when someone must decide whether the
     // compressor can see it.
     assert_records_are_well_formed();
-    let in_scope: Vec<Defect> = Defect::ALL.iter().copied().filter(|d| in_compressor_scope(*d)).collect();
-    assert!(in_scope.len() >= 10, "the scope filter selected almost nothing");
+    let in_scope: Vec<Defect> = Defect::ALL
+        .iter()
+        .copied()
+        .filter(|d| in_compressor_scope(*d))
+        .collect();
+    assert!(
+        in_scope.len() >= 10,
+        "the scope filter selected almost nothing"
+    );
 
     let mut bad = Vec::new();
     // Which `BELOW_RESOLUTION` entries this run actually reached. An exclusion list with a
@@ -888,7 +1028,12 @@ fn each_in_scope_defect_is_further_from_the_gpu_than_the_clean_oracle_is() {
     // looking like considered non-coverage while the case it names had stopped occurring —
     // or, worse, had become INERT and been skipped by the branch above.
     let mut reached = vec![false; BELOW_RESOLUTION.len()];
-    for Spec { layer, script, name } in list {
+    for Spec {
+        layer,
+        script,
+        name,
+    } in list
+    {
         let mut cell = Cell::load(&ck, &cfg, layer);
         let (clean, gpu) = cell.run(Defect::None, &script, None, None);
         let cd = diff(&clean, &gpu, cfg.head_dim, cfg.rope_head_dim);
@@ -910,8 +1055,16 @@ fn each_in_scope_defect_is_further_from_the_gpu_than_the_clean_oracle_is() {
                 println!("{name}: {def:?} is INERT here — this cell covers it not at all");
                 continue;
             }
-            let sep = gap(&format!("{name} {def:?}"), &broken, &gpu, cfg.head_dim, cfg.rope_head_dim);
-            let known = BELOW_RESOLUTION.iter().position(|(c, d, _)| *c == name && *d == def);
+            let sep = gap(
+                &format!("{name} {def:?}"),
+                &broken,
+                &gpu,
+                cfg.head_dim,
+                cfg.rope_head_dim,
+            );
+            let known = BELOW_RESOLUTION
+                .iter()
+                .position(|(c, d, _)| *c == name && *d == def);
             if let Some(i) = known {
                 reached[i] = true;
             }
@@ -924,9 +1077,9 @@ fn each_in_scope_defect_is_further_from_the_gpu_than_the_clean_oracle_is() {
                 )),
                 Some(_) => {}
                 // Not recorded, and the metric cannot see it.
-                None if sep < RESOLVABLE => {
-                    bad.push(format!("{name}/{def:?} sep={sep} < {RESOLVABLE}, NOT RECORDED"))
-                }
+                None if sep < RESOLVABLE => bad.push(format!(
+                    "{name}/{def:?} sep={sep} < {RESOLVABLE}, NOT RECORDED"
+                )),
                 None => {}
             }
         }
@@ -1047,7 +1200,13 @@ fn the_overlap_defect_is_inert_at_ratio_128_and_live_at_ratio_4() {
     let (clean_4, gpu_4) = l2.run(Defect::None, &script_4, None, None);
     let (broken_4, _) = l2.run(Defect::CompressorNoOverlap, &script_4, None, None);
     assert_ne!(clean_4, broken_4, "at ratio 4 the defect must bite");
-    let sep = gap("ratio4 no-overlap vs gpu", &broken_4, &gpu_4, cfg.head_dim, cfg.rope_head_dim);
+    let sep = gap(
+        "ratio4 no-overlap vs gpu",
+        &broken_4,
+        &gpu_4,
+        cfg.head_dim,
+        cfg.rope_head_dim,
+    );
     assert!(
         sep >= RESOLVABLE,
         "the overlapping branch is the half of the compressor ratio 128 never runs, and this \
@@ -1068,7 +1227,10 @@ fn the_two_geometries_differ_in_opposite_directions() {
     let g4 = Geom::attention(LayerKind::Overlap, 512, 64, 1e-6).unwrap();
     let g128 = Geom::attention(LayerKind::NonOverlap(128), 512, 64, 1e-6).unwrap();
     assert_eq!((g4.cd(), g4.ents(), g4.state_len()), (1024, 8, 8192));
-    assert_eq!((g128.cd(), g128.ents(), g128.state_len()), (512, 128, 65536));
+    assert_eq!(
+        (g128.cd(), g128.ents(), g128.state_len()),
+        (512, 128, 65536)
+    );
     assert!(
         g4.cd() > g128.cd() && g4.ents() < g128.ents(),
         "ratio 128 HALVES the projection width and multiplies the window — a loader that \
@@ -1101,10 +1263,21 @@ fn the_diff_metric_reports_what_it_claims() {
     let dv = diff(&want, &got, D, RD);
     assert_eq!(f32_to_bf16(1.5), 0x3FC0, "the fixture's own premise");
     assert_eq!(f32_to_bf16(1.625), 0x3FD0);
-    assert_eq!(dv.max, E4M3_ULP, "one e4m3 step must read as exactly {E4M3_ULP} bf16 codes");
-    assert!((dv.worst_ratio() - 1.0833).abs() < 0.001, "ratio {} ", dv.worst_ratio());
+    assert_eq!(
+        dv.max, E4M3_ULP,
+        "one e4m3 step must read as exactly {E4M3_ULP} bf16 codes"
+    );
+    assert!(
+        (dv.worst_ratio() - 1.0833).abs() < 0.001,
+        "ratio {} ",
+        dv.worst_ratio()
+    );
     assert_eq!(dv.differing, 1, "exactly one element moved");
-    assert_eq!((dv.max_quant, dv.max_tail), (dv.max, 0), "dim 3 is inside the quantized region");
+    assert_eq!(
+        (dv.max_quant, dv.max_tail),
+        (dv.max, 0),
+        "dim 3 is inside the quantized region"
+    );
 
     // Binade-independence, which is the half the constant actually rests on. If this held
     // only near 1.0 then `E4M3_ULP` would be a coincidence of the fixture rather than a
@@ -1132,7 +1305,11 @@ fn the_diff_metric_reports_what_it_claims() {
     w2[D - 1] = 1.5;
     g2[D - 1] = 1.625;
     let dv2 = diff(&w2, &g2, D, RD);
-    assert_eq!((dv2.max_quant, dv2.max_tail), (0, dv2.max), "dim 511 is the untouched tail");
+    assert_eq!(
+        (dv2.max_quant, dv2.max_tail),
+        (0, dv2.max),
+        "dim 511 is the untouched tail"
+    );
 
     // The known blind spot, pinned rather than described: near zero the code gap is large
     // for a negligible absolute difference. `differing` and `worst` are what distinguish it,
@@ -1141,8 +1318,15 @@ fn the_diff_metric_reports_what_it_claims() {
     w3[7] = 1e-30;
     g3[7] = 2e-30;
     let dv3 = diff(&w3, &g3, D, RD);
-    assert!(dv3.max >= 100, "a doubling near zero reads as a whole binade: {}", dv3.max);
-    assert!((w3[7] - g3[7]).abs() < 1e-29, "…for an absolute difference of nothing");
+    assert!(
+        dv3.max >= 100,
+        "a doubling near zero reads as a whole binade: {}",
+        dv3.max
+    );
+    assert!(
+        (w3[7] - g3[7]).abs() < 1e-29,
+        "…for an absolute difference of nothing"
+    );
 
     // Identical input must read exactly zero, or every 0 printed above means nothing.
     assert_eq!(diff(&want, &want, D, RD).max, 0);

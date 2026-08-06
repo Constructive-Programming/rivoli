@@ -35,7 +35,8 @@
 
 use rivoli::backend::gpustream::HipStream;
 use rivoli::backend::hip::{
-    device_sync, launch_v4_dense_gemm_bf16, launch_v4_embed_bf16_row, launch_v4_hc_head, launch_v4_rmsnorm,
+    device_sync, launch_v4_dense_gemm_bf16, launch_v4_embed_bf16_row, launch_v4_hc_head,
+    launch_v4_rmsnorm,
 };
 use rivoli::memory::device::DeviceBuf;
 use rivoli::v4oracle::{
@@ -97,9 +98,15 @@ fn rel(got: &[f32], want: &[f32]) -> f32 {
     // Length first: `zip` truncates, so a short `got` would score 0.0 and read as perfect
     // agreement. Not reachable today -- both sides derive from the same `cfg` -- but it is
     // the failure mode `golden.rs::diff_section` calls fail-open and refuses by design.
-    assert_eq!(got.len(), want.len(), "comparing tensors of different length");
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "comparing tensors of different length"
+    );
     let s = want.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-30);
-    got.iter().zip(want).fold(0.0f32, |m, (a, b)| m.max((a - b).abs() / s))
+    got.iter()
+        .zip(want)
+        .fold(0.0f32, |m, (a, b)| m.max((a - b).abs() / s))
 }
 
 /// A head-tail fixture at the given `dim`, with everything bf16 where the checkpoint is.
@@ -112,7 +119,11 @@ struct Fixture {
 
 impl Fixture {
     fn new(dim: usize, vocab: usize, s: usize) -> Self {
-        let cfg = V4Config { dim, vocab_size: vocab, ..V4Config::toy() };
+        let cfg = V4Config {
+            dim,
+            vocab_size: vocab,
+            ..V4Config::toy()
+        };
         let hcd = cfg.hc_dim();
         let mut r = NamedRng::new("v4-head-tail-device");
         let hw = HeadTailW {
@@ -134,7 +145,8 @@ impl Fixture {
     /// The oracle's three head-tail goldens.
     fn oracle(&self) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let mut cap = Capture::default();
-        Oracle::new(self.cfg.clone(), Defect::None).head_tail(&self.hw, &self.h, self.s, "d", &mut cap);
+        Oracle::new(self.cfg.clone(), Defect::None)
+            .head_tail(&self.hw, &self.h, self.s, "d", &mut cap);
         let g = |n: &str| cap.float(&format!("head.d.{n}")).expect(n).to_vec();
         (g("hc_head_out"), g("final_norm_out"), g("logits"))
     }
@@ -150,7 +162,9 @@ impl Fixture {
         let bb = Dev::f32s(&self.hw.hc_head_base);
         let sb = Dev::f32s(&self.hw.hc_head_scale);
         let nb = Dev::f32s(&self.hw.norm);
-        let WMat::Dense { v: lm, .. } = &self.hw.lm_head else { panic!("lm_head is Dense") };
+        let WMat::Dense { v: lm, .. } = &self.hw.lm_head else {
+            panic!("lm_head is Dense")
+        };
         let lb = Dev::u16s(&as_bf16(lm));
         let mut preb = Dev::blank(self.s * hc * 4);
         let mut yb = Dev::blank(self.s * dim * 4);
@@ -159,8 +173,18 @@ impl Fixture {
         // and outlives the sync below; none aliases another.
         unsafe {
             launch_v4_hc_head(
-                hb.p(), fnb.p(), bb.p(), sb.p(), preb.pm(), yb.pm(),
-                self.s, hc, dim, self.cfg.norm_eps, self.cfg.hc_eps, stream.raw(),
+                hb.p(),
+                fnb.p(),
+                bb.p(),
+                sb.p(),
+                preb.pm(),
+                yb.pm(),
+                self.s,
+                hc,
+                dim,
+                self.cfg.norm_eps,
+                self.cfg.hc_eps,
+                stream.raw(),
             )
             .expect("v4_hc_head");
         }
@@ -170,8 +194,15 @@ impl Fixture {
         // statistic over every token -- `Defect::HeadNormOverAllTokens`, invisible at s == 1.
         // SAFETY: `yb` is `s * dim` live f32, `nb` is `dim`; both outlive the sync.
         unsafe {
-            launch_v4_rmsnorm(yb.pm(), nb.p(), self.s, dim, self.cfg.norm_eps, stream.raw())
-                .expect("v4_rmsnorm");
+            launch_v4_rmsnorm(
+                yb.pm(),
+                nb.p(),
+                self.s,
+                dim,
+                self.cfg.norm_eps,
+                stream.raw(),
+            )
+            .expect("v4_rmsnorm");
         }
         let norm_out = yb.read();
         // `ParallelHead.forward` slices `x[:, -1]` -- the LAST row only.
@@ -179,8 +210,16 @@ impl Fixture {
         // SAFETY: `last` is the final `dim` f32 of `yb`; `lb` is `vocab * dim` live u16;
         // `lgb` is `vocab` writable f32. m=1 n=vocab k=dim matches the kernel's [m,k]x[n,k].
         unsafe {
-            launch_v4_dense_gemm_bf16(last, lb.p() as *const u16, lgb.pm(), 1, vocab, dim, stream.raw())
-                .expect("v4_dense_gemm_bf16");
+            launch_v4_dense_gemm_bf16(
+                last,
+                lb.p() as *const u16,
+                lgb.pm(),
+                1,
+                vocab,
+                dim,
+                stream.raw(),
+            )
+            .expect("v4_dense_gemm_bf16");
         }
         (hc_out, norm_out, lgb.read(), preb.read())
     }
@@ -194,8 +233,16 @@ fn the_embedding_gather_is_bit_exact_and_broadcasts_every_copy() {
     let (vocab, hidden, hc) = (512usize, 256usize, 4usize);
     let mut r = NamedRng::new("v4-embed-bf16");
     let table: Vec<f32> = (0..vocab * hidden).map(|_| bf(r.unit())).collect();
-    let cfg = V4Config { dim: hidden, vocab_size: vocab, ..V4Config::toy() };
-    let w = WMat::Dense { rows: vocab, cols: hidden, v: table.clone() };
+    let cfg = V4Config {
+        dim: hidden,
+        vocab_size: vocab,
+        ..V4Config::toy()
+    };
+    let w = WMat::Dense {
+        rows: vocab,
+        cols: hidden,
+        v: table.clone(),
+    };
     let o = Oracle::new(cfg, Defect::None);
     let stream = HipStream::new().expect("stream");
     let tb = Dev::u16s(&as_bf16(&table));
@@ -204,22 +251,40 @@ fn the_embedding_gather_is_bit_exact_and_broadcasts_every_copy() {
         // SAFETY: `tb` holds `vocab * hidden` u16 and `token < vocab`; `xb` is `hc * hidden`
         // writable f32. Both outlive the download below.
         unsafe {
-            launch_v4_embed_bf16_row(tb.p() as *const u16, token, hidden, hc, xb.pm(), stream.raw())
-                .expect("v4_embed_bf16_row");
+            launch_v4_embed_bf16_row(
+                tb.p() as *const u16,
+                token,
+                hidden,
+                hc,
+                xb.pm(),
+                stream.raw(),
+            )
+            .expect("v4_embed_bf16_row");
         }
         let got = xb.read();
         let want = o.embed(&w, &[token as u32]);
         assert_eq!(want.len(), got.len(), "token {token}: shape");
         for (i, (g, x)) in got.iter().zip(&want).enumerate() {
-            assert_eq!(g.to_bits(), x.to_bits(), "token {token} element {i}: {g:e} vs {x:e}");
+            assert_eq!(
+                g.to_bits(),
+                x.to_bits(),
+                "token {token} element {i}: {g:e} vs {x:e}"
+            );
         }
         // The broadcast is the part a port forgets: `h.unsqueeze(2).repeat(1, 1, hc, 1)`.
         // Asserted directly, because a kernel writing only copy 0 would leave the rest zero
         // and still match `want` on the first `hidden` values if `want` were sliced.
         for c in 1..hc {
-            assert_eq!(&got[c * hidden..(c + 1) * hidden], &got[..hidden], "copy {c} differs");
+            assert_eq!(
+                &got[c * hidden..(c + 1) * hidden],
+                &got[..hidden],
+                "copy {c} differs"
+            );
         }
-        assert!(got[..hidden].iter().any(|v| *v != 0.0), "token {token} row is all zero");
+        assert!(
+            got[..hidden].iter().any(|v| *v != 0.0),
+            "token {token} row is all zero"
+        );
     }
 }
 
@@ -233,10 +298,17 @@ fn the_head_tail_matches_the_oracle_at_toy_dimensions() {
     let (g_hc, g_nm, g_lg, _) = f.device();
     let (r_hc, r_nm, r_lg) = (rel(&g_hc, &w_hc), rel(&g_nm, &w_nm), rel(&g_lg, &w_lg));
     println!("toy dims: hc_head_out {r_hc:.3e}, final_norm_out {r_nm:.3e}, logits {r_lg:.3e}");
-    for (n, r) in [("hc_head_out", r_hc), ("final_norm_out", r_nm), ("logits", r_lg)] {
+    for (n, r) in [
+        ("hc_head_out", r_hc),
+        ("final_norm_out", r_nm),
+        ("logits", r_lg),
+    ] {
         assert!(r < 1e-3, "{n} disagrees with the oracle by {r:.3e}");
     }
-    assert!(g_lg.len() == 64 && g_lg.iter().any(|v| *v != 0.0), "logits are empty or all zero");
+    assert!(
+        g_lg.len() == 64 && g_lg.iter().any(|v| *v != 0.0),
+        "logits are empty or all zero"
+    );
 }
 
 #[test]
@@ -258,7 +330,10 @@ fn the_blend_is_bit_exact_given_the_gate() {
     let (w_hc, _, _) = f.oracle();
     let (g_hc, _, _, pre) = f.device();
     assert_eq!(pre.len(), f.s * hc, "one gate weight per (token, copy)");
-    assert!(pre.iter().all(|p| *p > 0.0 && *p < 1.0 + 1e-3), "gate is a sigmoid plus hc_eps");
+    assert!(
+        pre.iter().all(|p| *p > 0.0 && *p < 1.0 + 1e-3),
+        "gate is a sigmoid plus hc_eps"
+    );
 
     // The blend alone, on the device's own gate vector, in the reference's order -- computed
     // BOTH ways, because whether hipcc contracts `acc += p * x` into an FMA decides which one
@@ -281,16 +356,29 @@ fn the_blend_is_bit_exact_given_the_gate() {
     let miss = |w: &[f32]| {
         // `zip` stops at the shorter side, so a truncated `got` would score ZERO mismatches
         // and pass as agreement. The oracle documents the same hazard for `RMSNorm`'s weight.
-        assert_eq!(g_hc.len(), w.len(), "length mismatch would make the comparison vacuous");
-        g_hc.iter().zip(w).filter(|(a, b)| a.to_bits() != b.to_bits()).count()
+        assert_eq!(
+            g_hc.len(),
+            w.len(),
+            "length mismatch would make the comparison vacuous"
+        );
+        g_hc.iter()
+            .zip(w)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count()
     };
     let (m_plain, m_fma) = (miss(&plain), miss(&fma));
-    println!("dim {dim} s {}: blend vs plain-mul {m_plain}, vs mul_add {m_fma}", f.s);
+    println!(
+        "dim {dim} s {}: blend vs plain-mul {m_plain}, vs mul_add {m_fma}",
+        f.s
+    );
     // MEASURED 2026-08-05 at this fixture: 3 and 0. The kernel contracts, so `mul_add` is what
     // it actually computes and `+ p * x` is not. Asserting the latter bitwise would have been
     // FLAKY, not wrong-looking -- roughly a 1-in-5 spurious red at the fixture this test
     // originally used, and indistinguishable from a real regression when it fired.
-    assert_eq!(m_fma, 0, "the blend no longer reproduces an FMA reduction over the copies");
+    assert_eq!(
+        m_fma, 0,
+        "the blend no longer reproduces an FMA reduction over the copies"
+    );
     assert!(
         m_plain > 0,
         "the blend now matches a NON-contracted sum, so hipcc has stopped contracting (or the \
@@ -299,10 +387,20 @@ fn the_blend_is_bit_exact_given_the_gate() {
     );
 
     // And the gate's own contribution, which is NOT zero and must not be pinned to zero.
-    let differing = g_hc.iter().zip(&w_hc).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+    let differing = g_hc
+        .iter()
+        .zip(&w_hc)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
     let r = rel(&g_hc, &w_hc);
-    println!("dim 1024: vs oracle {differing}/{} elements differ, rel {r:.3e}", w_hc.len());
-    assert!(r < 1e-2, "hc_head_out moved by {r:.3e}, past a rounding-scale disagreement");
+    println!(
+        "dim 1024: vs oracle {differing}/{} elements differ, rel {r:.3e}",
+        w_hc.len()
+    );
+    assert!(
+        r < 1e-2,
+        "hc_head_out moved by {r:.3e}, past a rounding-scale disagreement"
+    );
 }
 
 #[test]
@@ -326,5 +424,8 @@ fn the_lm_head_needs_no_kernel_of_its_own() {
     assert_eq!(g_lg.len(), 1024, "one row of logits, whatever s was");
     let r = rel(&g_lg, &w_lg);
     println!("lm_head via v4_dense_gemm_bf16 at vocab 1024: rel {r:.3e}");
-    assert!(r < 1e-3, "the existing dense GEMM does not reproduce the lm_head: rel {r:.3e}");
+    assert!(
+        r < 1e-3,
+        "the existing dense GEMM does not reproduce the lm_head: rel {r:.3e}"
+    );
 }

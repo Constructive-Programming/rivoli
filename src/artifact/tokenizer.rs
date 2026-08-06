@@ -222,7 +222,10 @@ impl Tokenizer {
         // The fallback path (an artifact whose tokenizer predates the chat tokens) returns
         // a RAW encoding with no prefix, and blindly dropping two tokens there would eat
         // real text. Check for the prefix instead of assuming it.
-        let prefix = [self.inner.token_to_id("[gMASK]"), self.inner.token_to_id("<sop>")];
+        let prefix = [
+            self.inner.token_to_id("[gMASK]"),
+            self.inner.token_to_id("<sop>"),
+        ];
         match (prefix, full.first(), full.get(1)) {
             ([Some(g), Some(s)], Some(&a), Some(&b)) if g == a && s == b => Ok(full[2..].to_vec()),
             _ => Ok(full),

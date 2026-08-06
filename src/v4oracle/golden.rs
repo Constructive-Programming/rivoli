@@ -20,7 +20,11 @@ pub struct GoldenSet {
 
 impl GoldenSet {
     pub fn from_capture(meta: Vec<(String, String)>, cap: Capture) -> Self {
-        Self { meta, floats: cap.floats, ints: cap.ints }
+        Self {
+            meta,
+            floats: cap.floats,
+            ints: cap.ints,
+        }
     }
 
     pub fn write(&self, w: &mut impl Write) -> Result<()> {
@@ -79,8 +83,9 @@ fn get_tensors<const N: usize, T>(r: &mut impl Read, dec: fn([u8; N]) -> T) -> R
     let mut out = Vec::new();
     for _ in 0..get_u64(r)? {
         let n = get_str(r)?;
-        let shape: Vec<usize> =
-            (0..get_u64(r)?).map(|_| get_u64(r).map(|v| v as usize)).collect::<Result<_>>()?;
+        let shape: Vec<usize> = (0..get_u64(r)?)
+            .map(|_| get_u64(r).map(|v| v as usize))
+            .collect::<Result<_>>()?;
         let len = get_u64(r)? as usize;
         let mut v = Vec::with_capacity(len);
         let mut b = [0u8; N];
@@ -117,7 +122,9 @@ fn union_names<T>(a: &Tensors<T>, b: &Tensors<T>) -> Vec<String> {
 
 /// One tensor of `v` by name, with its declared shape.
 fn find<'t, T>(v: &'t Tensors<T>, n: &str) -> Option<(&'t [usize], &'t [T])> {
-    v.iter().find(|(m, _, _)| m == n).map(|(_, s, x)| (s.as_slice(), x.as_slice()))
+    v.iter()
+        .find(|(m, _, _)| m == n)
+        .map(|(_, s, x)| (s.as_slice(), x.as_slice()))
 }
 
 /// Compare one section (all floats, or all ints), given how to score a matched pair.
@@ -139,9 +146,19 @@ fn diff_section<T>(
         .map(|n| match (find(a, &n), find(b, &n)) {
             (Some((sa, x)), Some((sb, y))) if sa == sb && x.len() == y.len() => {
                 let (rel, changed) = score(x, y);
-                Diff { name: n, rel, changed, total: x.len() }
+                Diff {
+                    name: n,
+                    rel,
+                    changed,
+                    total: x.len(),
+                }
             }
-            _ => Diff { name: n, rel: f32::INFINITY, changed: usize::MAX, total: 0 },
+            _ => Diff {
+                name: n,
+                rel: f32::INFINITY,
+                changed: usize::MAX,
+                total: 0,
+            },
         })
         .collect()
 }
@@ -152,7 +169,11 @@ pub fn diff(a: &Capture, b: &Capture) -> Vec<Diff> {
         // Relative to the tensor's own scale: activations span several orders of magnitude
         // between layers, so one absolute epsilon would be both too tight and too loose.
         let scale = y.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-30);
-        let changed = x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count();
+        let changed = x
+            .iter()
+            .zip(y)
+            .filter(|(p, q)| p.to_bits() != q.to_bits())
+            .count();
         // Non-finite pairs are skipped rather than folded: the indexer's masked scores are
         // `-inf` on both sides and `(-inf) - (-inf)` is NaN, which `f32::max` would silently
         // swallow. `changed` still counts them bit-for-bit, so nothing is lost.

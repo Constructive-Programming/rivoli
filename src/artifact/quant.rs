@@ -1279,14 +1279,23 @@ mod tests {
         // the shipped file's own stride.
         assert_eq!(off[5] + hidden * f4_groups(inter), 13_369_344);
         assert_eq!(f4_expert_bytes(hidden, inter), 13_369_344);
-        assert_eq!(f4_expert_stride(hidden, inter), 13_369_344, "no padding at these dims");
+        assert_eq!(
+            f4_expert_stride(hidden, inter),
+            13_369_344,
+            "no padding at these dims"
+        );
         assert_eq!(4096 + 256 * f4_expert_stride(hidden, inter), 3_422_556_160);
 
         // Every packed span 4-byte aligned, so `dot_f4_wave_r`'s dword fast path is taken
         // rather than falling back to its scalar tail. A PERFORMANCE property, not a
         // correctness one — the kernel predicates on the alignment and handles both.
         for k in [0, 2, 4] {
-            assert_eq!(off[k] % 4, 0, "packed span {} is not 4-byte aligned", off[k]);
+            assert_eq!(
+                off[k] % 4,
+                0,
+                "packed span {} is not 4-byte aligned",
+                off[k]
+            );
         }
 
         // The coincidence, pinned so it is a known fact rather than a surprise at a call
@@ -1297,11 +1306,17 @@ mod tests {
             "at i_dim % 128 == 0 the two nibble formats tile identically — if this ever \
              stops being true, the claim in this test's doc has to change with it"
         );
-        assert_eq!(f4_expert_bytes(hidden, inter), i4_expert_bytes(hidden, inter));
+        assert_eq!(
+            f4_expert_bytes(hidden, inter),
+            i4_expert_bytes(hidden, inter)
+        );
         // `.vq3` is genuinely a different size (12-bit indices over VQ_DIM=4), so it is the
         // one format a length check does separate.
         assert_ne!(off, vq_slot_offsets(hidden, inter));
-        assert_ne!(f4_expert_bytes(hidden, inter), vq_expert_bytes(hidden, inter));
+        assert_ne!(
+            f4_expert_bytes(hidden, inter),
+            vq_expert_bytes(hidden, inter)
+        );
 
         // **The six OFFSETS turn on `hidden` ALONE — `moe_inter` cannot separate them.**
         // Found by this assertion failing on `(4096, 96)`, which was written expecting the
@@ -1315,7 +1330,10 @@ mod tests {
         // `band(hidden) && band(moe_inter)`. Both models are in the band on both dims
         // (GLM 6144/2048, V4 4096/2048), so both collide completely.
         let band = |i: usize| i.div_ceil(32) == 4 * i.div_ceil(128);
-        assert!(band(hidden) && band(inter), "both of V4's dims are in the band");
+        assert!(
+            band(hidden) && band(inter),
+            "both of V4's dims are in the band"
+        );
         for h in [100usize, 128, 4096, 6144] {
             assert!(band(h));
             assert_eq!(
@@ -1354,11 +1372,18 @@ mod tests {
         let (hidden, inter) = (6144usize, 2048usize);
         let [(go, gi), (uo, ui), _] = vq_expert_layout(hidden, inter);
         for (name, off, proj) in [
-            ("vq3", vq_slot_offsets(hidden, inter), vq_proj_bytes as fn(usize, usize) -> usize),
+            (
+                "vq3",
+                vq_slot_offsets(hidden, inter),
+                vq_proj_bytes as fn(usize, usize) -> usize,
+            ),
             ("i4", i4_slot_offsets(hidden, inter), i4_proj_bytes),
             ("f4", f4_slot_offsets(hidden, inter), f4_proj_bytes),
         ] {
-            assert_eq!(off[0], 0, "{name}: the block starts at the first projection");
+            assert_eq!(
+                off[0], 0,
+                "{name}: the block starts at the first projection"
+            );
             assert_eq!(off[2], proj(go, gi), "{name}: up_packed");
             assert_eq!(off[4], proj(go, gi) + proj(uo, ui), "{name}: down_packed");
         }
@@ -1657,7 +1682,10 @@ mod tests {
                 .split_once('(')
                 .map(|(w, _)| w.trim())
                 .expect("no call after the projection");
-            assert!(w.starts_with('w') && w.len() == 2, "unexpected projection {w:?}");
+            assert!(
+                w.starts_with('w') && w.len() == 2,
+                "unexpected projection {w:?}"
+            );
             w.to_string()
         };
         let got = [

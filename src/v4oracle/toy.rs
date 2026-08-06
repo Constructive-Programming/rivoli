@@ -13,8 +13,7 @@
 
 use crate::v4oracle::forward::{CompressorW, ExpertW, HeadTailW, IndexerW, LayerW};
 use crate::v4oracle::numerics::{
-    FP4_MAX, FP8_MAX, bf16_decode, bf16_encode, e2m1_encode, e4m3_encode, fast_log2_ceil,
-    fast_pow2,
+    FP4_MAX, FP8_MAX, bf16_decode, bf16_encode, e2m1_encode, e4m3_encode, fast_log2_ceil, fast_pow2,
 };
 use crate::v4oracle::weights::{NamedRng, V4Config, WMat};
 
@@ -81,7 +80,10 @@ fn fp8(name: &str, rows: usize, cols: usize, scale: f32) -> WMat {
 /// LOW NIBBLE FIRST — the order `inference/convert.py` documents by unpacking
 /// `stack([FP4_TABLE[low], FP4_TABLE[high]]).flatten()`.
 fn fp4(name: &str, rows: usize, cols: usize, scale: f32) -> WMat {
-    assert!(cols.is_multiple_of(32), "fp4 needs K divisible by the group size");
+    assert!(
+        cols.is_multiple_of(32),
+        "fp4 needs K divisible by the group size"
+    );
     let v = draw(name, rows * cols, scale);
     let groups = cols / 32;
     let mut w = vec![0u8; rows * cols / 2];
@@ -111,9 +113,17 @@ fn expert(name: &str, c: &V4Config, quantized: bool) -> ExpertW {
     let (dim, inter) = (c.dim, c.moe_inter_dim);
     let mk = |suffix: &str, rows, cols| {
         let n = format!("{name}.{suffix}");
-        if quantized { fp4(&n, rows, cols, 0.03) } else { fp8(&n, rows, cols, 0.03) }
+        if quantized {
+            fp4(&n, rows, cols, 0.03)
+        } else {
+            fp8(&n, rows, cols, 0.03)
+        }
     };
-    ExpertW { w1: mk("w1", inter, dim), w2: mk("w2", dim, inter), w3: mk("w3", inter, dim) }
+    ExpertW {
+        w1: mk("w1", inter, dim),
+        w2: mk("w2", dim, inter),
+        w3: mk("w3", inter, dim),
+    }
 }
 
 fn compressor(name: &str, c: &V4Config, ratio: usize, d: usize, rotate: bool) -> CompressorW {
@@ -127,7 +137,10 @@ fn compressor(name: &str, c: &V4Config, ratio: usize, d: usize, rotate: bool) ->
         ape: draw(&format!("{name}.ape"), ratio * coff * d, 0.5),
         wkv: dense(&format!("{name}.wkv"), coff * d, c.dim, 0.05),
         wgate: dense(&format!("{name}.wgate"), coff * d, c.dim, 0.05),
-        norm: draw(&format!("{name}.norm"), d, 0.3).iter().map(|x| 1.0 + x).collect(),
+        norm: draw(&format!("{name}.norm"), d, 0.3)
+            .iter()
+            .map(|x| 1.0 + x)
+            .collect(),
     }
 }
 
@@ -146,7 +159,12 @@ pub fn build(c: &V4Config) -> ToyModel {
                     .iter()
                     .map(|x| 1.0 + x)
                     .collect(),
-                wq_b: fp8(&format!("{p}.wq_b"), c.n_heads * c.head_dim, c.q_lora_rank, 0.03),
+                wq_b: fp8(
+                    &format!("{p}.wq_b"),
+                    c.n_heads * c.head_dim,
+                    c.q_lora_rank,
+                    0.03,
+                ),
                 wkv: fp8(&format!("{p}.wkv"), c.head_dim, c.dim, 0.03),
                 kv_norm: draw(&format!("{p}.kv_norm"), c.head_dim, 0.3)
                     .iter()
@@ -158,7 +176,12 @@ pub fn build(c: &V4Config) -> ToyModel {
                     c.n_heads * c.head_dim / c.o_groups,
                     0.03,
                 ),
-                wo_b: fp8(&format!("{p}.wo_b"), c.dim, c.o_groups * c.o_lora_rank, 0.03),
+                wo_b: fp8(
+                    &format!("{p}.wo_b"),
+                    c.dim,
+                    c.o_groups * c.o_lora_rank,
+                    0.03,
+                ),
                 attn_norm: draw(&format!("{p}.attn_norm"), c.dim, 0.3)
                     .iter()
                     .map(|x| 1.0 + x)
@@ -231,7 +254,10 @@ pub fn build(c: &V4Config) -> ToyModel {
             hc_head_base: draw("hc_head_base", c.hc_mult, 1.0),
             // `[1]`, matching the checkpoint. Centred on 1.0 like the block scales so the
             // sigmoid argument keeps the same order of magnitude as the mixes.
-            hc_head_scale: draw("hc_head_scale", 1, 0.5).iter().map(|x| 1.0 + x).collect(),
+            hc_head_scale: draw("hc_head_scale", 1, 0.5)
+                .iter()
+                .map(|x| 1.0 + x)
+                .collect(),
             norm: draw("norm", c.dim, 0.3).iter().map(|x| 1.0 + x).collect(),
             // bf16 in the checkpoint, so bf16 here: `dense` rounds. The logits GEMM is the
             // one place in the model with no activation quantization at all, and a toy that

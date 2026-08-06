@@ -339,8 +339,9 @@ impl RoutedPool {
             budget as f64 / (1u64 << 30) as f64,
             one_batch as f64 / (1u64 << 30) as f64,
         );
-        let policy = crate::memory::hybrid::make(policy_name, budget, cold_stride, hot_stride, two_q)
-            .with_context(|| format!("unknown --cache-policy {policy_name} (lru|2q|arc)"))?;
+        let policy =
+            crate::memory::hybrid::make(policy_name, budget, cold_stride, hot_stride, two_q)
+                .with_context(|| format!("unknown --cache-policy {policy_name} (lru|2q|arc)"))?;
         // BOTH tiers named. This printed `Mode` before the split and the naive replacement
         // was `cold.fmt.ext()` alone — which prints `[2q vq3]` for the DEFAULT hybrid mode,
         // naming half the pool and asserting a single-format one. Every benchmark log in

@@ -44,8 +44,8 @@ fn v4_pin_places_every_tensor_into_the_field_its_dimensions_predict() {
         v4_artifact_dir::v4_artifact("resident.safetensors"),
         v4_artifact_dir::v4_artifact_l3_5("resident.safetensors"),
     ]
-        .into_iter()
-        .flatten()
+    .into_iter()
+    .flatten()
     {
         let s = check_one(&dir);
         all.hash |= s.hash;
@@ -54,7 +54,10 @@ fn v4_pin_places_every_tensor_into_the_field_its_dimensions_predict() {
         all.compressor_only |= s.compressor_only;
         ran += 1;
     }
-    assert!(ran > 0, "no V4 artifact on this machine — nothing was checked");
+    assert!(
+        ran > 0,
+        "no V4 artifact on this machine — nothing was checked"
+    );
     // The union, asserted. Otherwise a machine with only `l0-2` would run all-green having
     // never constructed a `V4Route::Scored`, and this test would report coverage it does
     // not have — which is the failure mode this whole port keeps re-learning.
@@ -98,7 +101,10 @@ fn check_one(dir: &str) -> Seen {
     // another layer's weights — the failure `V4Pin::layer` exists to make impossible.
     assert!(pin.layer(range.end).is_err(), "{dir}: past the end");
     if range.start > 0 {
-        assert!(pin.layer(range.start - 1).is_err(), "{dir}: before the start");
+        assert!(
+            pin.layer(range.start - 1).is_err(),
+            "{dir}: before the start"
+        );
     }
 
     let (h, hd, qk) = (cfg.hidden, cfg.head_dim, cfg.q_lora_rank);
@@ -116,7 +122,11 @@ fn check_one(dir: &str) -> Seen {
         // ONE kv entry, head_dim wide, serving as both K and V for all heads.
         assert_eq!(dims(&p.wkv), (hd, h), "layer {l} wkv");
         let o_rank = cfg.o_groups * cfg.o_lora_rank;
-        assert_eq!(dims(&p.wo_a), (o_rank, heads / cfg.o_groups), "layer {l} wo_a");
+        assert_eq!(
+            dims(&p.wo_a),
+            (o_rank, heads / cfg.o_groups),
+            "layer {l} wo_a"
+        );
         assert_eq!(dims(&p.wo_b), (h, o_rank), "layer {l} wo_b");
         // The shared expert: fp8 e4m3 and RESIDENT, so it must be here and not in the .f4.
         // `down` is the transposed one, which is what makes it distinguishable from the
@@ -130,8 +140,15 @@ fn check_one(dir: &str) -> Seen {
         match &p.route {
             V4Route::Hash { tid2eid } => {
                 seen.hash = true;
-                assert!(cfg.layer_routes_by_hash(l), "layer {l} hash-routed, config says no");
-                assert_eq!(tid2eid.len(), cfg.vocab * cfg.top_k, "layer {l} tid2eid extent");
+                assert!(
+                    cfg.layer_routes_by_hash(l),
+                    "layer {l} hash-routed, config says no"
+                );
+                assert_eq!(
+                    tid2eid.len(),
+                    cfg.vocab * cfg.top_k,
+                    "layer {l} tid2eid extent"
+                );
                 // Already range-checked at load; confirm the invariant survived into the pin
                 // rather than trusting that the parser ran.
                 assert!(
@@ -142,7 +159,10 @@ fn check_one(dir: &str) -> Seen {
             }
             V4Route::Scored { bias } => {
                 seen.scored = true;
-                assert!(!cfg.layer_routes_by_hash(l), "layer {l} scored, config says hash");
+                assert!(
+                    !cfg.layer_routes_by_hash(l),
+                    "layer {l} scored, config says hash"
+                );
                 assert_eq!(bias.len(), cfg.n_experts, "layer {l} gate bias");
             }
         }

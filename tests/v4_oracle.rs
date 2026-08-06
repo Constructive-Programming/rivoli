@@ -50,7 +50,10 @@ use std::sync::OnceLock;
 
 /// Every finite `float8_e4m3fn` magnitude, ascending, with its code.
 fn e4m3_finite_codes() -> Vec<(u8, f32)> {
-    (0u8..=0x7e).map(|c| (c, e4m3_decode(c))).filter(|(_, v)| v.is_finite()).collect()
+    (0u8..=0x7e)
+        .map(|c| (c, e4m3_decode(c)))
+        .filter(|(_, v)| v.is_finite())
+        .collect()
 }
 
 /// Nearest-with-ties-to-even, by enumerating the format. Deliberately dumb and deliberately
@@ -81,23 +84,35 @@ fn e4m3_and_bf16_decode_match_the_format_by_hand() {
     // definition (1-4-3, bias 7, no infinities, S.1111.111 = NaN), not off the code.
     for (code, want) in [
         (0x00u8, 0.0f32),
-        (0x01, 1.0 / 512.0),          // smallest subnormal: quantum 2^-9
-        (0x07, 7.0 / 512.0),          // largest subnormal
-        (0x08, 1.0 / 64.0),           // smallest normal: 2^-6
-        (0x38, 1.0),                  // exp 7 == bias, mantissa 0
-        (0x3f, 1.875),                // exp 7, mantissa 7 -> 1 + 7/8
-        (0x78, 256.0),                // exp 15, mantissa 0
-        (0x7e, 448.0),                // largest finite: 1.75 * 2^8
+        (0x01, 1.0 / 512.0), // smallest subnormal: quantum 2^-9
+        (0x07, 7.0 / 512.0), // largest subnormal
+        (0x08, 1.0 / 64.0),  // smallest normal: 2^-6
+        (0x38, 1.0),         // exp 7 == bias, mantissa 0
+        (0x3f, 1.875),       // exp 7, mantissa 7 -> 1 + 7/8
+        (0x78, 256.0),       // exp 15, mantissa 0
+        (0x7e, 448.0),       // largest finite: 1.75 * 2^8
     ] {
         assert_eq!(e4m3_decode(code), want, "e4m3 code {code:#04x}");
-        assert_eq!(e4m3_decode(code | 0x80), -want, "e4m3 code {:#04x}", code | 0x80);
+        assert_eq!(
+            e4m3_decode(code | 0x80),
+            -want,
+            "e4m3 code {:#04x}",
+            code | 0x80
+        );
     }
-    assert!(e4m3_decode(0x7f).is_nan() && e4m3_decode(0xff).is_nan(), "S.1111.111 is NaN");
+    assert!(
+        e4m3_decode(0x7f).is_nan() && e4m3_decode(0xff).is_nan(),
+        "S.1111.111 is NaN"
+    );
 
     // bf16 is f32's top 16 bits; likewise pinned by hand rather than by round-tripping.
-    for (bits, want) in
-        [(0x0000u16, 0.0f32), (0x3f80, 1.0), (0x4000, 2.0), (0xbf80, -1.0), (0x3f00, 0.5)]
-    {
+    for (bits, want) in [
+        (0x0000u16, 0.0f32),
+        (0x3f80, 1.0),
+        (0x4000, 2.0),
+        (0xbf80, -1.0),
+        (0x3f00, 0.5),
+    ] {
         assert_eq!(bf16_decode(bits), want, "bf16 {bits:#06x}");
     }
     assert!(bf16_decode(0x7f80).is_infinite() && bf16_decode(0x7fc0).is_nan());
@@ -125,7 +140,8 @@ fn e4m3_encode_is_nearest_ties_to_even() {
         let want = nearest_e4m3(a.abs());
         let got = e4m3_encode(a.abs());
         assert_eq!(
-            got, want,
+            got,
+            want,
             "e4m3_encode({a:e}) = {got:#04x} ({}) but nearest-ties-even is {want:#04x} ({})",
             e4m3_decode(got),
             e4m3_decode(want)
@@ -134,7 +150,10 @@ fn e4m3_encode_is_nearest_ties_to_even() {
     }
     // The random probes at +/-512 are half out of range, so the reachable count is well
     // below the number generated. Asserted so the sweep cannot quietly shrink to nothing.
-    assert!(checked > 30_000, "only {checked} probes reached the assertion");
+    assert!(
+        checked > 30_000,
+        "only {checked} probes reached the assertion"
+    );
     assert_eq!(e4m3_encode(1e30), 0x7e, "saturate, not overflow");
     assert_eq!(e4m3_encode(-1e30), 0xfe);
     assert!(e4m3_decode(0x7f).is_nan() && e4m3_decode(0xff).is_nan());
@@ -160,11 +179,21 @@ fn e2m1_encode_is_nearest_ties_to_even() {
     // The seven midpoints between the eight magnitudes, each named with the value the
     // even-mantissa rule demands. Written out rather than computed: this is the one place a
     // shared helper would let a wrong rule agree with itself.
-    for (probe, want) in
-        [(0.25, 0.0), (0.75, 1.0), (1.25, 1.0), (1.75, 2.0), (2.5, 2.0), (3.5, 4.0), (5.0, 4.0)]
-    {
+    for (probe, want) in [
+        (0.25, 0.0),
+        (0.75, 1.0),
+        (1.25, 1.0),
+        (1.75, 2.0),
+        (2.5, 2.0),
+        (3.5, 4.0),
+        (5.0, 4.0),
+    ] {
         assert_eq!(e2m1_decode(e2m1_encode(probe)), want, "e2m1 tie at {probe}");
-        assert_eq!(e2m1_decode(e2m1_encode(-probe)), -want, "e2m1 tie at -{probe}");
+        assert_eq!(
+            e2m1_decode(e2m1_encode(-probe)),
+            -want,
+            "e2m1 tie at -{probe}"
+        );
     }
     let mags = [0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
     let mut r = NamedRng::new("e2m1-sweep");
@@ -172,7 +201,11 @@ fn e2m1_encode_is_nearest_ties_to_even() {
         let a = r.unit() * 8.0;
         let got = e2m1_decode(e2m1_encode(a));
         let best = mags.iter().fold(f32::INFINITY, |b: f32, &m| {
-            if (a.abs() - m).abs() < (a.abs() - b).abs() { m } else { b }
+            if (a.abs() - m).abs() < (a.abs() - b).abs() {
+                m
+            } else {
+                b
+            }
         });
         assert!(
             (got.abs() - best).abs() < 1e-6 || a.abs() > 6.0,
@@ -182,7 +215,11 @@ fn e2m1_encode_is_nearest_ties_to_even() {
     assert_eq!(e2m1_decode(e2m1_encode(1e9)), 6.0, "saturate at +6");
     assert_eq!(e2m1_decode(e2m1_encode(-1e9)), -6.0);
     for c in 0u8..16 {
-        assert_eq!(e2m1_encode(e2m1_decode(c)), c, "code {c} is not its own nearest");
+        assert_eq!(
+            e2m1_encode(e2m1_decode(c)),
+            c,
+            "code {c} is not its own nearest"
+        );
     }
 }
 
@@ -212,7 +249,11 @@ fn bf16_roundtrip_is_exact_for_every_pattern() {
         if v.is_nan() {
             continue;
         }
-        assert_eq!(bf16_encode(v), b as u16, "bf16 pattern {b:#06x} did not survive");
+        assert_eq!(
+            bf16_encode(v),
+            b as u16,
+            "bf16 pattern {b:#06x} did not survive"
+        );
     }
 }
 
@@ -223,9 +264,19 @@ fn fast_round_scale_is_the_smallest_power_of_two_that_covers_amax() {
         let amax = (r.unit() * 6.0).exp().abs().max(1e-8);
         let s = fast_round_scale(amax, 1.0 / FP8_MAX);
         assert!(s.is_finite() && s > 0.0);
-        assert_eq!(s.to_bits() & 0x007f_ffff, 0, "scale {s} is not a power of two");
-        assert!(amax / s <= FP8_MAX * 1.0000001, "scale {s} does not cover amax {amax}");
-        assert!(amax / (s / 2.0) > FP8_MAX, "scale {s} is not the SMALLEST that covers {amax}");
+        assert_eq!(
+            s.to_bits() & 0x007f_ffff,
+            0,
+            "scale {s} is not a power of two"
+        );
+        assert!(
+            amax / s <= FP8_MAX * 1.0000001,
+            "scale {s} does not cover amax {amax}"
+        );
+        assert!(
+            amax / (s / 2.0) > FP8_MAX,
+            "scale {s} is not the SMALLEST that covers {amax}"
+        );
     }
 }
 
@@ -238,20 +289,42 @@ fn act_quant_is_partial_and_block_sized() {
     let orig: Vec<f32> = (0..256).map(|_| r.unit() * 3.0).collect();
     let mut a = orig.clone();
     act_quant_inplace(&mut a[..192], 64, true);
-    assert_eq!(&a[192..], &orig[192..], "the un-quantized tail was modified");
-    assert!(a[..192].iter().zip(&orig[..192]).any(|(x, y)| x != y), "nothing was quantized");
+    assert_eq!(
+        &a[192..],
+        &orig[192..],
+        "the un-quantized tail was modified"
+    );
+    assert!(
+        a[..192].iter().zip(&orig[..192]).any(|(x, y)| x != y),
+        "nothing was quantized"
+    );
 
     let mut c = orig.clone();
     act_quant_inplace(&mut c[..192], 64, false);
     assert_ne!(a, c, "ue8m0 scale rounding made no difference");
-    assert_eq!(&c[192..], &orig[192..], "the un-quantized tail was modified");
+    assert_eq!(
+        &c[192..],
+        &orig[192..],
+        "the un-quantized tail was modified"
+    );
 
     // fp4 saturates far earlier, so the same input must survive fp8 and not fp4.
     let mut d = orig.clone();
     fp4_act_quant_inplace(&mut d, 32);
-    let err_fp8 = a[..192].iter().zip(&orig[..192]).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
-    let err_fp4 = d[..192].iter().zip(&orig[..192]).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
-    assert!(err_fp4 > err_fp8, "fp4 ({err_fp4}) should be coarser than fp8 ({err_fp8})");
+    let err_fp8 = a[..192]
+        .iter()
+        .zip(&orig[..192])
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max);
+    let err_fp4 = d[..192]
+        .iter()
+        .zip(&orig[..192])
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max);
+    assert!(
+        err_fp4 > err_fp8,
+        "fp4 ({err_fp4}) should be coarser than fp8 ({err_fp8})"
+    );
     assert!(d.iter().all(|v| v.abs() <= FP4_MAX * 1024.0));
 }
 
@@ -275,7 +348,10 @@ fn act_quant_block_size_is_almost_invisible_under_ue8m0_scales() {
     let (mut a, mut b) = (ordinary.clone(), ordinary.clone());
     act_quant_inplace(&mut a, 64, true);
     act_quant_inplace(&mut b, 128, true);
-    assert_eq!(a, b, "the invisibility claim above is wrong -- re-derive it before trusting this");
+    assert_eq!(
+        a, b,
+        "the invisibility claim above is wrong -- re-derive it before trusting this"
+    );
 
     // The narrow window where it IS visible: a block spanning ~2^25, so the coarse scale
     // flushes the small elements to zero.
@@ -287,9 +363,19 @@ fn act_quant_block_size_is_almost_invisible_under_ue8m0_scales() {
     let (mut a, mut b) = (wide.clone(), wide.clone());
     act_quant_inplace(&mut a, 64, true);
     act_quant_inplace(&mut b, 128, true);
-    assert_ne!(a[64..128], b[64..128], "even a 2^25 in-block range did not separate the two");
-    assert!(b[64..128].iter().all(|&v| v == 0.0), "block 128 should flush the tiny run to zero");
-    assert!(a[64..128].iter().all(|&v| v != 0.0), "block 64 should resolve the tiny run");
+    assert_ne!(
+        a[64..128],
+        b[64..128],
+        "even a 2^25 in-block range did not separate the two"
+    );
+    assert!(
+        b[64..128].iter().all(|&v| v == 0.0),
+        "block 128 should flush the tiny run to zero"
+    );
+    assert!(
+        a[64..128].iter().all(|&v| v != 0.0),
+        "block 64 should resolve the tiny run"
+    );
 
     // ...and the same thing THROUGH the defect, so this test covers `KvActQuantBlock128`
     // rather than merely covering the function it would have perturbed. Listing a defect in
@@ -317,7 +403,10 @@ fn hadamard_is_its_own_inverse() {
         let orig: Vec<f32> = (0..n).map(|_| r.unit()).collect();
         let mut v = orig.clone();
         hadamard_rotate(&mut v);
-        assert!(v.iter().zip(&orig).any(|(a, b)| a != b), "n={n}: transform was a no-op");
+        assert!(
+            v.iter().zip(&orig).any(|(a, b)| a != b),
+            "n={n}: transform was a no-op"
+        );
         hadamard_rotate(&mut v);
         for (a, b) in v.iter().zip(&orig) {
             assert!((a - b).abs() < 1e-5, "n={n}: not involutive ({a} vs {b})");
@@ -325,9 +414,14 @@ fn hadamard_is_its_own_inverse() {
         // Norm preservation is the other half of orthogonality.
         let mut w = orig.clone();
         hadamard_rotate(&mut w);
-        let (no, nw): (f32, f32) =
-            (orig.iter().map(|x| x * x).sum(), w.iter().map(|x| x * x).sum());
-        assert!((no - nw).abs() < 1e-4 * no.max(1.0), "n={n}: norm {no} -> {nw}");
+        let (no, nw): (f32, f32) = (
+            orig.iter().map(|x| x * x).sum(),
+            w.iter().map(|x| x * x).sum(),
+        );
+        assert!(
+            (no - nw).abs() < 1e-4 * no.max(1.0),
+            "n={n}: norm {no} -> {nw}"
+        );
     }
 }
 
@@ -336,10 +430,16 @@ fn softplus_threshold_is_load_bearing() {
     // Below 20 the two forms agree; above it the naive form overflows f32 and the
     // sqrt-softplus router would produce inf weights and then NaN after renormalisation.
     for x in [-30.0f32, -1.0, 0.0, 5.0, 19.9] {
-        assert!((softplus(x) - (1.0 + x.exp()).ln()).abs() < 1e-6, "disagreement at {x}");
+        assert!(
+            (softplus(x) - (1.0 + x.exp()).ln()).abs() < 1e-6,
+            "disagreement at {x}"
+        );
     }
     assert_eq!(softplus(100.0), 100.0);
-    assert!((1.0f32 + 100.0f32.exp()).ln().is_infinite(), "the naive form is expected to blow up");
+    assert!(
+        (1.0f32 + 100.0f32.exp()).ln().is_infinite(),
+        "the naive form is expected to blow up"
+    );
 }
 
 #[test]
@@ -425,7 +525,9 @@ fn model() -> &'static (V4Config, ToyModel) {
 /// rather than about propagation.
 fn fixed_h(cfg: &V4Config, tag: &str, s: usize) -> Vec<f32> {
     let mut r = NamedRng::new(tag);
-    (0..s * cfg.hc_mult * cfg.dim).map(|_| bf16_decode(bf16_encode(r.unit()))).collect()
+    (0..s * cfg.hc_mult * cfg.dim)
+        .map(|_| bf16_decode(bf16_encode(r.unit())))
+        .collect()
 }
 
 fn fixed_ids(cfg: &V4Config, tag: &str, s: usize) -> Vec<u32> {
@@ -447,7 +549,14 @@ fn run(layer: usize, prompt: usize, defect: Defect) -> Run {
     for (slot, tag, s, start_pos) in steps {
         let mut h = fixed_h(cfg, &format!("h-{tag}"), s);
         let ids = fixed_ids(cfg, &format!("ids-{tag}"), s);
-        let step = Step { lw, layer, s, start_pos, input_ids: &ids, phase: &tag };
+        let step = Step {
+            lw,
+            layer,
+            s,
+            start_pos,
+            input_ids: &ids,
+            phase: &tag,
+        };
         o.run_layer(&step, &mut st, &mut h, &mut caps[slot]);
         // The head tail, on THIS layer's output. `bin/v4-oracle` deliberately refuses to do
         // that (see `HeadTailW`) because a logits vector taken at 4 of 43 layers is not a
@@ -510,26 +619,37 @@ fn expect(d: Defect) -> Option<Expect> {
         // would claim a resolution the oracle does not have.
         Defect::KvActQuantBlock128 => None,
 
-        Defect::SkipAttnSink | Defect::AttnSinkNotMaxShifted => {
-            e(&[".attn_core_out"], &[".in", ".attn_norm_out", ".q", ".kv_entry", ".compressed"])
-        }
-        Defect::PrefillRingWritesFirstWindow => {
-            e(&[".attn_core_out"], &[".in", ".attn_norm_out", ".q", ".kv_entry"])
-        }
+        Defect::SkipAttnSink | Defect::AttnSinkNotMaxShifted => e(
+            &[".attn_core_out"],
+            &[".in", ".attn_norm_out", ".q", ".kv_entry", ".compressed"],
+        ),
+        Defect::PrefillRingWritesFirstWindow => e(
+            &[".attn_core_out"],
+            &[".in", ".attn_norm_out", ".q", ".kv_entry"],
+        ),
 
-        Defect::SkipOutputDerotation | Defect::OutputDerotationForward => {
-            e(&[".attn_derot"], &[".in", ".attn_norm_out", ".q", ".kv_entry", ".attn_core_out"])
-        }
+        Defect::SkipOutputDerotation | Defect::OutputDerotationForward => e(
+            &[".attn_derot"],
+            &[".in", ".attn_norm_out", ".q", ".kv_entry", ".attn_core_out"],
+        ),
         Defect::WoGroupsSplitHeadDim | Defect::WoGroupsInterleaved => e(
             &[".attn_out"],
-            &[".in", ".attn_norm_out", ".q", ".kv_entry", ".attn_core_out", ".attn_derot"],
+            &[
+                ".in",
+                ".attn_norm_out",
+                ".q",
+                ".kv_entry",
+                ".attn_core_out",
+                ".attn_derot",
+            ],
         ),
 
         Defect::CompressorNoOverlap
         | Defect::CompressorNoApe
-        | Defect::CompressorRopeAtBlockEnd => {
-            e(&[".compressed"], &[".in", ".attn_norm_out", ".q", ".kv_entry"])
-        }
+        | Defect::CompressorRopeAtBlockEnd => e(
+            &[".compressed"],
+            &[".in", ".attn_norm_out", ".q", ".kv_entry"],
+        ),
         Defect::IndexerNoRelu
         | Defect::IndexerNoFp4Quant
         | Defect::IndexerNoHadamard
@@ -567,20 +687,30 @@ fn expect(d: Defect) -> Option<Expect> {
         Defect::RouterSoftmax
         | Defect::RouterBiasedWeights
         | Defect::RouterNoRenorm
-        | Defect::RouterNoScale => {
-            e(&[".router_weights"], &[".in", ".attn_norm_out", ".attn_out", ".ffn_norm_out"])
-        }
-        Defect::HashRoutingIgnored => {
-            e(&[".router_indices"], &[".in", ".attn_norm_out", ".attn_out", ".ffn_norm_out"])
-        }
-        Defect::RouteWeightAfterW2 | Defect::SharedExpertWeighted => {
-            e(&[".ffn_out"], &[".ffn_norm_out", ".router_weights", ".router_indices"])
-        }
+        | Defect::RouterNoScale => e(
+            &[".router_weights"],
+            &[".in", ".attn_norm_out", ".attn_out", ".ffn_norm_out"],
+        ),
+        Defect::HashRoutingIgnored => e(
+            &[".router_indices"],
+            &[".in", ".attn_norm_out", ".attn_out", ".ffn_norm_out"],
+        ),
+        Defect::RouteWeightAfterW2 | Defect::SharedExpertWeighted => e(
+            &[".ffn_out"],
+            &[".ffn_norm_out", ".router_weights", ".router_indices"],
+        ),
         Defect::Fp4NibbleSwap => e(
             &[".ffn_out"],
             // Attention is fp8 and the shared expert is fp8; only the ROUTED experts are
             // fp4, so nothing before the MoE may move.
-            &[".in", ".attn_norm_out", ".q", ".kv_entry", ".attn_out", ".router_weights"],
+            &[
+                ".in",
+                ".attn_norm_out",
+                ".q",
+                ".kv_entry",
+                ".attn_out",
+                ".router_weights",
+            ],
         ),
 
         // See `sinkhorn_has_converged_long_before_iteration_20`.
@@ -589,7 +719,14 @@ fn expect(d: Defect) -> Option<Expect> {
             &[".ffn_norm_out", ".out"],
             // `pre` comes straight from the mixes and never sees the Sinkhorn iterations,
             // so the attention half of the block is untouched by a combination-matrix bug.
-            &[".in", ".attn_norm_out", ".q", ".kv_entry", ".attn_core_out", ".attn_out"],
+            &[
+                ".in",
+                ".attn_norm_out",
+                ".q",
+                ".kv_entry",
+                ".attn_core_out",
+                ".attn_out",
+            ],
         ),
         // Both of these reach EVERY golden downstream of `hc_pre` -- which is all of them --
         // so neither has a silent half to declare, and `.in` (fixed by the driver) would be
@@ -610,9 +747,7 @@ fn expect(d: Defect) -> Option<Expect> {
         Defect::HeadNormSkipped | Defect::HeadNormNotBf16 | Defect::HeadNormOverAllTokens => {
             e(&[".final_norm_out", ".logits"], &[".hc_head_out"])
         }
-        Defect::HeadLogitsFromFirstRow => {
-            e(&[".logits"], &[".hc_head_out", ".final_norm_out"])
-        }
+        Defect::HeadLogitsFromFirstRow => e(&[".logits"], &[".hc_head_out", ".final_norm_out"]),
 
         // Mathematically INERT: `apply_rotary_emb` rotates adjacent pairs, so it PRESERVES
         // `q.square().mean(-1)`, and a scalar scale commutes with a rotation. The two orders
@@ -658,9 +793,7 @@ fn reachable(d: Defect, c: &Case, base: &Run) -> bool {
         // one. Every decode step here is `s == 1`, so the whole Decode capture must come back
         // bit-identical -- which is also why these two are dangerous in the field. A decode
         // smoke test cannot see either, and the engine spends almost all its life at s == 1.
-        Defect::HeadNormOverAllTokens | Defect::HeadLogitsFromFirstRow => {
-            c.phase == Phase::Prefill
-        }
+        Defect::HeadNormOverAllTokens | Defect::HeadLogitsFromFirstRow => c.phase == Phase::Prefill,
 
         _ => true,
     }
@@ -672,7 +805,11 @@ fn cases() -> Vec<Case> {
     for layer in 0..cfg.n_layers {
         for prompt in PROMPTS {
             for phase in [Phase::Prefill, Phase::Decode] {
-                v.push(Case { layer, prompt, phase });
+                v.push(Case {
+                    layer,
+                    prompt,
+                    phase,
+                });
             }
         }
     }
@@ -686,7 +823,10 @@ fn matching<'a>(ds: &'a [Diff], suffix: &str) -> Vec<&'a Diff> {
     // exactly like a correct row. With every suffix dotted there is no collision in the
     // current name set. That was previously only a naming convention and a comment; this is
     // what actually enforces it.
-    assert!(suffix.starts_with('.'), "golden suffix {suffix:?} must carry its leading dot");
+    assert!(
+        suffix.starts_with('.'),
+        "golden suffix {suffix:?} must carry its leading dot"
+    );
     ds.iter().filter(|d| d.name.ends_with(suffix)).collect()
 }
 
@@ -696,23 +836,27 @@ fn matching<'a>(ds: &'a [Diff], suffix: &str) -> Vec<&'a Diff> {
 /// as well as values -- and so there is only one place that knows how a capture is laid out.
 fn fingerprint(c: &Capture) -> u64 {
     let mut buf = Vec::new();
-    GoldenSet::from_capture(Vec::new(), c.clone()).write(&mut buf).unwrap();
+    GoldenSet::from_capture(Vec::new(), c.clone())
+        .write(&mut buf)
+        .unwrap();
     buf.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
         (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
     })
 }
 
 fn first_change(ds: &[Diff]) -> String {
-    ds.iter()
-        .find(|d| d.changed > 0)
-        .map_or_else(|| "nothing".to_string(), |d| format!("{} ({} elements)", d.name, d.changed))
+    ds.iter().find(|d| d.changed > 0).map_or_else(
+        || "nothing".to_string(),
+        |d| format!("{} ({} elements)", d.name, d.changed),
+    )
 }
 
 /// The undefected run for every (layer, prompt) in the grid.
 fn baselines() -> std::collections::HashMap<(usize, usize), Run> {
     let mut m = std::collections::HashMap::new();
     for c in cases() {
-        m.entry((c.layer, c.prompt)).or_insert_with(|| run(c.layer, c.prompt, Defect::None));
+        m.entry((c.layer, c.prompt))
+            .or_insert_with(|| run(c.layer, c.prompt, Defect::None));
     }
     m
 }
@@ -782,7 +926,10 @@ fn defect_matrix_is_bidirectional() {
                 let tag = h.name.split('.').nth(1).unwrap_or_default();
                 let want = format!("head.{tag}.logits");
                 let lg = ds.iter().find(|x| x.name == want).unwrap_or_else(|| {
-                    panic!("{d:?} at {c:?}: {} moved but there is no {want} to check", h.name)
+                    panic!(
+                        "{d:?} at {c:?}: {} moved but there is no {want} to check",
+                        h.name
+                    )
                 });
                 assert!(
                     lg.changed > 0,
@@ -803,8 +950,14 @@ fn defect_matrix_is_bidirectional() {
         }
         prints.push((d, mine));
     }
-    assert!(reached > 200, "only {reached} reachable (defect, case) pairs were asserted");
-    assert!(silenced > 40, "only {silenced} unreachable pairs -- too little silent evidence");
+    assert!(
+        reached > 200,
+        "only {reached} reachable (defect, case) pairs were asserted"
+    );
+    assert!(
+        silenced > 40,
+        "only {silenced} unreachable pairs -- too little silent evidence"
+    );
     // The propagation claim above is only worth anything if it was exercised. A change that
     // stopped `.out` from moving anywhere -- or that dropped the head tail out of `run` --
     // would leave the `if` cold and the assertion inside it vacuously satisfied.
@@ -829,14 +982,30 @@ fn every_defect_carries_both_halves_of_its_claim() {
     let targeted = targeted_defects();
     for d in Defect::breakages() {
         let Some(exp) = expect(d) else {
-            assert!(targeted.contains(&d), "{d:?} has no matrix row and no targeted test");
+            assert!(
+                targeted.contains(&d),
+                "{d:?} has no matrix row and no targeted test"
+            );
             continue;
         };
         assert!(!targeted.contains(&d), "{d:?} is covered twice; pick one");
-        assert!(!exp.loud.is_empty(), "{d:?} declares nothing it must perturb");
-        let n_reach = cases().iter().filter(|c| reachable(d, c, &baselines[&(c.layer, c.prompt)])).count();
-        assert!(n_reach > 0, "{d:?} is unreachable in every case, so nothing tests it");
-        let real_silent = exp.silent.iter().filter(|s| !TRIVIAL_SILENT.contains(s)).count();
+        assert!(
+            !exp.loud.is_empty(),
+            "{d:?} declares nothing it must perturb"
+        );
+        let n_reach = cases()
+            .iter()
+            .filter(|c| reachable(d, c, &baselines[&(c.layer, c.prompt)]))
+            .count();
+        assert!(
+            n_reach > 0,
+            "{d:?} is unreachable in every case, so nothing tests it"
+        );
+        let real_silent = exp
+            .silent
+            .iter()
+            .filter(|s| !TRIVIAL_SILENT.contains(s))
+            .count();
         assert!(
             real_silent > 0 || n_reach < cases().len(),
             "{d:?} is reachable everywhere AND declares no NON-TRIVIAL golden it must leave \
@@ -854,7 +1023,10 @@ fn the_grid_actually_covers_three_layer_classes() {
     let (cfg, _) = model();
     let classes: Vec<usize> = (0..cfg.n_layers).map(|l| cfg.compress_ratio(l)).collect();
     assert!(classes.contains(&0), "no ratio-0 layer");
-    assert!(classes.contains(&4), "no ratio-4 layer (the only kind with an Indexer)");
+    assert!(
+        classes.contains(&4),
+        "no ratio-4 layer (the only kind with an Indexer)"
+    );
     assert!(
         classes.iter().any(|&r| r != 0 && r != 4),
         "no compressed layer WITHOUT an indexer -- layer 0 and layer 2 alone would leave the \
@@ -864,13 +1036,30 @@ fn the_grid_actually_covers_three_layer_classes() {
         let r = run(l, 12, Defect::None);
         let has_idx = r.pre.float(&format!("L{l}.pre.indexer_scores")).is_some();
         let has_comp = r.pre.float(&format!("L{l}.pre.compressed")).is_some();
-        assert_eq!(has_idx, ratio == 4, "layer {l} (ratio {ratio}) indexer presence is wrong");
-        assert_eq!(has_comp, ratio != 0, "layer {l} (ratio {ratio}) compressor presence is wrong");
-        assert!(r.pre.int(&format!("L{l}.pre.router_indices")).is_some(), "layer {l} recorded no routing");
+        assert_eq!(
+            has_idx,
+            ratio == 4,
+            "layer {l} (ratio {ratio}) indexer presence is wrong"
+        );
+        assert_eq!(
+            has_comp,
+            ratio != 0,
+            "layer {l} (ratio {ratio}) compressor presence is wrong"
+        );
+        assert!(
+            r.pre.int(&format!("L{l}.pre.router_indices")).is_some(),
+            "layer {l} recorded no routing"
+        );
         // and the goldens are not degenerate
         let out = r.pre.float(&format!("L{l}.pre.out")).expect("L{l}.pre.out");
-        assert!(out.iter().all(|v| v.is_finite()), "layer {l} produced non-finite output");
-        assert!(out.iter().any(|&v| v != 0.0), "layer {l} produced an all-zero output");
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "layer {l} produced non-finite output"
+        );
+        assert!(
+            out.iter().any(|&v| v != 0.0),
+            "layer {l} produced an all-zero output"
+        );
     }
     // The ring must actually rotate at the long prompt and not at the short one, or
     // `PrefillRingWritesFirstWindow` has no silent case.
@@ -888,7 +1077,11 @@ fn the_comparator_itself_can_go_red() {
     let mut b = a.pre.clone();
     // By NAME: an index into `floats` is an ordering detail, and a reorder would silently
     // move this probe onto a different tensor (or an empty one, which `v[0]` would panic on).
-    let (_, _, v) = b.floats.iter_mut().find(|(n, _, _)| n.ends_with(".q")).expect("a .q golden");
+    let (_, _, v) = b
+        .floats
+        .iter_mut()
+        .find(|(n, _, _)| n.ends_with(".q"))
+        .expect("a .q golden");
     v[0] = f32::from_bits(v[0].to_bits() ^ 1);
     assert!(!identical(&a.pre, &b), "a one-ulp change went undetected");
 
@@ -903,7 +1096,10 @@ fn the_comparator_itself_can_go_red() {
     let mut f = a.pre.clone();
     let (_, shape, _) = &mut f.floats[0];
     *shape = vec![shape.iter().product()];
-    assert!(!identical(&a.pre, &f), "a RESHAPE with identical values read as agreement");
+    assert!(
+        !identical(&a.pre, &f),
+        "a RESHAPE with identical values read as agreement"
+    );
 }
 
 #[test]
@@ -923,18 +1119,34 @@ fn the_safetensors_reader_rejects_malformed_headers() {
         r#"{"weight_map":{"ok":"a.st","short":"b.st","backwards":"c.st","past_end":"d.st"}}"#,
     )
     .unwrap();
-    write("a.st", r#"{"ok":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#, &1.0f32
-        .to_le_bytes()
-        .iter()
-        .chain(2.0f32.to_le_bytes().iter())
-        .copied()
-        .collect::<Vec<u8>>());
+    write(
+        "a.st",
+        r#"{"ok":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#,
+        &1.0f32
+            .to_le_bytes()
+            .iter()
+            .chain(2.0f32.to_le_bytes().iter())
+            .copied()
+            .collect::<Vec<u8>>(),
+    );
     // shape [2] F32 needs 8 bytes; the header claims 4.
-    write("b.st", r#"{"short":{"dtype":"F32","shape":[2],"data_offsets":[0,4]}}"#, &[0u8; 4]);
+    write(
+        "b.st",
+        r#"{"short":{"dtype":"F32","shape":[2],"data_offsets":[0,4]}}"#,
+        &[0u8; 4],
+    );
     // data_offsets reversed -- `b - a` would WRAP in release.
-    write("c.st", r#"{"backwards":{"dtype":"F32","shape":[2],"data_offsets":[8,0]}}"#, &[0u8; 8]);
+    write(
+        "c.st",
+        r#"{"backwards":{"dtype":"F32","shape":[2],"data_offsets":[8,0]}}"#,
+        &[0u8; 8],
+    );
     // well-formed header, truncated body: the shard is still downloading.
-    write("d.st", r#"{"past_end":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#, &[0u8; 4]);
+    write(
+        "d.st",
+        r#"{"past_end":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#,
+        &[0u8; 4],
+    );
 
     let ck = rivoli::v4oracle::weights::Checkpoint::open(&dir).unwrap();
     assert_eq!(ck.get("ok").unwrap().to_f32().unwrap(), vec![1.0, 2.0]);
@@ -971,17 +1183,17 @@ fn the_golden_file_survives_a_round_trip() {
     // prefix forever and every other test would still pass. S2 loads goldens through
     // `GoldenSet::read`.
     let cap = run(2, 12, Defect::None).pre;
-    let want = GoldenSet::from_capture(
-        vec![("k".to_string(), "v".to_string())],
-        cap.clone(),
-    );
+    let want = GoldenSet::from_capture(vec![("k".to_string(), "v".to_string())], cap.clone());
     let mut buf = Vec::new();
     want.write(&mut buf).unwrap();
     let got = GoldenSet::read(&mut buf.as_slice()).unwrap();
     assert_eq!(got.meta, want.meta);
     assert_eq!(got.floats, want.floats);
     assert_eq!(got.ints, want.ints);
-    assert!(!got.floats.is_empty() && !got.ints.is_empty(), "the round trip carried nothing");
+    assert!(
+        !got.floats.is_empty() && !got.ints.is_empty(),
+        "the round trip carried nothing"
+    );
     // ...and it must reject something that is not a golden file, or the magic is decoration.
     assert!(GoldenSet::read(&mut b"not a golden".as_slice()).is_err());
 }
@@ -996,10 +1208,11 @@ fn a_duplicate_golden_name_is_rejected() {
     c.push("x", &[2], vec![1.0, 2.0]);
     assert!(std::panic::catch_unwind(move || c.push("x", &[2], vec![3.0, 4.0])).is_err());
     let mut c = Capture::default();
-    assert!(std::panic::catch_unwind(move || c.push("y", &[3], vec![1.0])).is_err(), "shape/len");
+    assert!(
+        std::panic::catch_unwind(move || c.push("y", &[3], vec![1.0])).is_err(),
+        "shape/len"
+    );
 }
-
-
 
 // =======================================================================================
 // 3. targeted tests for the magnitude-gated defects
@@ -1026,29 +1239,79 @@ type ReductionCase = (&'static [f32], f32, f32);
 const TORCH_REDUCTIONS: &[ReductionCase] = &[
     // toy `index_n_heads` = 4.0: torch .sum() = -1.4765625, running fold = -1.484375
     (
-        &[
-        -0.016967773, -0.100097656, -0.49023438, -0.87109375
-        ],
+        &[-0.016967773, -0.100097656, -0.49023438, -0.87109375],
         -1.4765625,
         -1.484375,
     ),
     // CONTROL: the two agree here: torch .sum() = -1.234375, running fold = -1.234375
-    (
-        &[
-        -1.2578125, 0.0, 0.026245117, 0.0
-        ],
-        -1.234375,
-        -1.234375,
-    ),
+    (&[-1.2578125, 0.0, 0.026245117, 0.0], -1.234375, -1.234375),
     // model `index_n_heads` = 64.0: torch .sum() = -2.109375, running fold = -2.09375
     (
         &[
-        0.103515625, 0.0, 0.0, 0.26367188, 0.35546875, 0.1796875, 0.0, -0.359375, 0.0, 0.33203125,
-        1.9375, 0.0, 0.0, 0.0, 1.8125, -2.9375, 0.0, 0.0, -0.51953125, 0.0, -0.203125, 0.0,
-        0.06738281, -0.265625, 0.0, -0.08105469, -0.5078125, 0.0, 0.75390625, 0.0, 0.0, -0.9921875,
-        0.0, 0.0, -0.24707031, 0.5, -0.26367188, 0.0, -0.111328125, 0.0, 0.0, 0.0, -0.048095703,
-        0.0, 0.0, 0.0, 0.103027344, 0.0, 0.0, -0.057617188, 0.0, -0.55078125, 0.0, -0.24804688,
-        0.0, 0.0, 0.0, -1.1171875, 0.0, 0.0, 0.0, 0.0, -0.0065307617, 0.0
+            0.103515625,
+            0.0,
+            0.0,
+            0.26367188,
+            0.35546875,
+            0.1796875,
+            0.0,
+            -0.359375,
+            0.0,
+            0.33203125,
+            1.9375,
+            0.0,
+            0.0,
+            0.0,
+            1.8125,
+            -2.9375,
+            0.0,
+            0.0,
+            -0.51953125,
+            0.0,
+            -0.203125,
+            0.0,
+            0.06738281,
+            -0.265625,
+            0.0,
+            -0.08105469,
+            -0.5078125,
+            0.0,
+            0.75390625,
+            0.0,
+            0.0,
+            -0.9921875,
+            0.0,
+            0.0,
+            -0.24707031,
+            0.5,
+            -0.26367188,
+            0.0,
+            -0.111328125,
+            0.0,
+            0.0,
+            0.0,
+            -0.048095703,
+            0.0,
+            0.0,
+            0.0,
+            0.103027344,
+            0.0,
+            0.0,
+            -0.057617188,
+            0.0,
+            -0.55078125,
+            0.0,
+            -0.24804688,
+            0.0,
+            0.0,
+            0.0,
+            -1.1171875,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            -0.0065307617,
+            0.0,
         ],
         -2.109375,
         -2.09375,
@@ -1056,11 +1319,70 @@ const TORCH_REDUCTIONS: &[ReductionCase] = &[
     // 64.0 heads, magnitudes spread 32x: torch .sum() = 94.5, running fold = 94.0
     (
         &[
-        0.0, 5.90625, 0.0, 0.0, 0.0, 14.1875, -10.625, 70.0, 8.625, -4.59375, 0.0, 0.0, 0.0, 2.65625,
-        -22.5, -3.0625, 0.0, 103.0, 0.0, 0.0, 8.9375, 18.0, 10.9375, 0.0, 4.3125, 38.25, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 5.90625, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -27.625, -13.8125, 0.0,
-        7.65625, 0.0, 0.0, 0.0, 5.25, -17.875, -0.056396484, -43.25, -33.75, -9.5, 1.7421875,
-        7.78125, -2.921875, -9.625, 0.0, -28.625, -0.88671875, -3.96875, 0.0, 14.1875
+            0.0,
+            5.90625,
+            0.0,
+            0.0,
+            0.0,
+            14.1875,
+            -10.625,
+            70.0,
+            8.625,
+            -4.59375,
+            0.0,
+            0.0,
+            0.0,
+            2.65625,
+            -22.5,
+            -3.0625,
+            0.0,
+            103.0,
+            0.0,
+            0.0,
+            8.9375,
+            18.0,
+            10.9375,
+            0.0,
+            4.3125,
+            38.25,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            5.90625,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            -27.625,
+            -13.8125,
+            0.0,
+            7.65625,
+            0.0,
+            0.0,
+            0.0,
+            5.25,
+            -17.875,
+            -0.056396484,
+            -43.25,
+            -33.75,
+            -9.5,
+            1.7421875,
+            7.78125,
+            -2.921875,
+            -9.625,
+            0.0,
+            -28.625,
+            -0.88671875,
+            -3.96875,
+            0.0,
+            14.1875,
         ],
         94.5,
         94.0,
@@ -1102,7 +1424,11 @@ fn bf16_reduction_matches_torch_and_not_a_running_fold() {
     // Bidirectional: the data must be able to TELL THEM APART, and must also contain a case
     // where they legitimately agree -- a fixture on which everything differs would prove
     // nothing about resolution. Row 1 is that control.
-    assert_eq!(separated, TORCH_REDUCTIONS.len() - 1, "the fixture's separation changed");
+    assert_eq!(
+        separated,
+        TORCH_REDUCTIONS.len() - 1,
+        "the fixture's separation changed"
+    );
     // The rows above separate because the seed found rows that do; reseed them and that could
     // change. This one separates because it cannot do anything else. bf16 keeps 7 explicit
     // mantissa bits, so the ulp at 1.0 is 2^-7 and 63 terms of 2^-10 -- an EIGHTH of an ulp
@@ -1113,9 +1439,13 @@ fn bf16_reduction_matches_torch_and_not_a_running_fold() {
     //
     // 1.0625 is PyTorch's answer for this vector, not arithmetic restated here — captured in
     // the same session as the table above.
-    let vanishing_terms: Vec<f32> =
-        std::iter::once(1.0f32).chain(std::iter::repeat_n(2.0f32.powi(-10), 63)).collect();
-    assert!(all_bf16(&vanishing_terms), "the construction must be exact in bf16 to mean anything");
+    let vanishing_terms: Vec<f32> = std::iter::once(1.0f32)
+        .chain(std::iter::repeat_n(2.0f32.powi(-10), 63))
+        .collect();
+    assert!(
+        all_bf16(&vanishing_terms),
+        "the construction must be exact in bf16 to mean anything"
+    );
     assert_eq!(
         good.bf16_sum(vanishing_terms.iter().copied()),
         1.0625,
@@ -1250,7 +1580,9 @@ fn wave_sum(x: &[f32]) -> f32 {
 /// `golden.rs::Diff.rel`, which is the metric any gate on these goldens will use.
 fn rel_diff(a: &[f32], b: &[f32]) -> f32 {
     let scale = b.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-30);
-    a.iter().zip(b).fold(0.0f32, |m, (p, q)| m.max((p - q).abs() / scale))
+    a.iter()
+        .zip(b)
+        .fold(0.0f32, |m, (p, q)| m.max((p - q).abs() / scale))
 }
 
 #[test]
@@ -1292,15 +1624,25 @@ fn the_reassociation_floor_bounds_any_tolerance_these_goldens_can_have() {
     // absolute check where the reduction order is controlled -- which is what
     // `the_head_tail_matches_torch_absolutely` is for.
     let dim = 4096usize;
-    let cfg = V4Config { dim, vocab_size: 16, ..V4Config::toy() };
+    let cfg = V4Config {
+        dim,
+        vocab_size: 16,
+        ..V4Config::toy()
+    };
     let hcd = cfg.hc_dim();
     let mut w = NamedRng::new("reassoc-floor-weights");
     let hw = HeadTailW {
         hc_head_fn: (0..cfg.hc_mult * hcd).map(|_| w.unit() * 0.05).collect(),
         hc_head_base: (0..cfg.hc_mult).map(|_| w.unit()).collect(),
         hc_head_scale: vec![1.0 + w.unit() * 0.5],
-        norm: (0..dim).map(|_| bf16_decode(bf16_encode(1.0 + w.unit() * 0.3))).collect(),
-        lm_head: WMat::Dense { rows: cfg.vocab_size, cols: dim, v: vec![0.0; cfg.vocab_size * dim] },
+        norm: (0..dim)
+            .map(|_| bf16_decode(bf16_encode(1.0 + w.unit() * 0.3)))
+            .collect(),
+        lm_head: WMat::Dense {
+            rows: cfg.vocab_size,
+            cols: dim,
+            v: vec![0.0; cfg.vocab_size * dim],
+        },
     };
     let bf = |x: f32| bf16_decode(bf16_encode(x));
 
@@ -1316,7 +1658,9 @@ fn the_reassociation_floor_bounds_any_tolerance_these_goldens_can_have() {
         let run = |d: Defect| {
             let mut cap = Capture::default();
             Oracle::new(cfg.clone(), d).head_tail(&hw, &h, 1, "floor", &mut cap);
-            cap.float("head.floor.final_norm_out").expect("final_norm_out").to_vec()
+            cap.float("head.floor.final_norm_out")
+                .expect("final_norm_out")
+                .to_vec()
         };
         let truth = run(Defect::None);
         percopy_min = percopy_min.min(rel_diff(&run(Defect::HeadHcRsqrtPerCopy), &truth));
@@ -1331,7 +1675,11 @@ fn the_reassociation_floor_bounds_any_tolerance_these_goldens_can_have() {
             (0..dim).map(|i| bf(hw.norm[i] * (row[i] * rs))).collect()
         };
         let (sequential, waved) = (norm_with(sq.iter().sum::<f32>()), norm_with(wave_sum(&sq)));
-        flipped_total += waved.iter().zip(&sequential).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        flipped_total += waved
+            .iter()
+            .zip(&sequential)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
         noise_max = noise_max.max(rel_diff(&waved, &sequential));
     }
     println!(
@@ -1373,7 +1721,8 @@ fn the_reassociation_floor_bounds_any_tolerance_these_goldens_can_have() {
 
 /// Is every value in `v` exactly representable in bf16?
 fn all_bf16(v: &[f32]) -> bool {
-    v.iter().all(|&x| bf16_decode(bf16_encode(x)).to_bits() == x.to_bits())
+    v.iter()
+        .all(|&x| bf16_decode(bf16_encode(x)).to_bits() == x.to_bits())
 }
 
 #[test]
@@ -1383,19 +1732,40 @@ fn the_head_tail_matches_torch_absolutely() {
     // bf16, and NOT bf16 for `hc_head_fn`, which is F32 on disk. If `FN` were bf16-valued the
     // mixes dot would never exercise an f32 mantissa and this gate would be weaker than it
     // reads.
-    assert!(all_bf16(t::H), "the residual stream must be bf16, as the reference stores it");
-    assert!(all_bf16(t::NORM_W) && all_bf16(t::LM_HEAD), "norm/head weights are bf16 on disk");
-    assert!(!all_bf16(t::FN), "hc_head_fn is F32 on disk; a bf16 fixture would not exercise it");
+    assert!(
+        all_bf16(t::H),
+        "the residual stream must be bf16, as the reference stores it"
+    );
+    assert!(
+        all_bf16(t::NORM_W) && all_bf16(t::LM_HEAD),
+        "norm/head weights are bf16 on disk"
+    );
+    assert!(
+        !all_bf16(t::FN),
+        "hc_head_fn is F32 on disk; a bf16 fixture would not exercise it"
+    );
 
-    let cfg = V4Config { dim: t::DIM, vocab_size: t::VOCAB, ..V4Config::toy() };
-    assert_eq!(cfg.hc_mult, t::HC_MULT, "the fixture was captured at hc_mult 4");
+    let cfg = V4Config {
+        dim: t::DIM,
+        vocab_size: t::VOCAB,
+        ..V4Config::toy()
+    };
+    assert_eq!(
+        cfg.hc_mult,
+        t::HC_MULT,
+        "the fixture was captured at hc_mult 4"
+    );
     let o = Oracle::new(cfg.clone(), Defect::None);
     let hw = HeadTailW {
         hc_head_fn: t::FN.to_vec(),
         hc_head_base: t::BASE.to_vec(),
         hc_head_scale: t::SCALE.to_vec(),
         norm: t::NORM_W.to_vec(),
-        lm_head: WMat::Dense { rows: t::VOCAB, cols: t::DIM, v: t::LM_HEAD.to_vec() },
+        lm_head: WMat::Dense {
+            rows: t::VOCAB,
+            cols: t::DIM,
+            v: t::LM_HEAD.to_vec(),
+        },
     };
     let mut cap = Capture::default();
     o.head_tail(&hw, t::H, t::S, "abs", &mut cap);
@@ -1409,7 +1779,9 @@ fn the_head_tail_matches_torch_absolutely() {
         ("final_norm_out", t::FINAL_NORM_OUT),
         ("logits", t::LOGITS),
     ] {
-        let got = cap.float(&format!("head.abs.{name}")).unwrap_or_else(|| panic!("{name} missing"));
+        let got = cap
+            .float(&format!("head.abs.{name}"))
+            .unwrap_or_else(|| panic!("{name} missing"));
         assert_eq!(got.len(), want.len(), "head.abs.{name} length");
         for (i, (g, w)) in got.iter().zip(want).enumerate() {
             assert_eq!(
@@ -1446,13 +1818,30 @@ fn the_head_tail_stores_bf16_where_the_reference_does_and_f32_where_it_does_not(
         // correct-looking implementation gets wrong -- `ParallelHead.forward` slices
         // `x[:, -1]`, so 12 rows in must still give ONE row of logits out. An implementation
         // that returned all rows would push `[s, vocab]` and satisfy `push` perfectly.
-        assert_eq!(lg.len(), cfg.vocab_size, "head.{phase}.logits is not a single row");
-        for (n, v) in [("hc_head_out", &hc), ("final_norm_out", &nm), ("logits", &lg)] {
-            assert!(v.iter().all(|x| x.is_finite()), "head.{phase}.{n} has a non-finite value");
+        assert_eq!(
+            lg.len(),
+            cfg.vocab_size,
+            "head.{phase}.logits is not a single row"
+        );
+        for (n, v) in [
+            ("hc_head_out", &hc),
+            ("final_norm_out", &nm),
+            ("logits", &lg),
+        ] {
+            assert!(
+                v.iter().all(|x| x.is_finite()),
+                "head.{phase}.{n} has a non-finite value"
+            );
             assert!(v.iter().any(|&x| x != 0.0), "head.{phase}.{n} is all zero");
         }
-        assert!(all_bf16(&hc), "head.{phase}.hc_head_out is not bf16 -- `y.to(dtype)` was lost");
-        assert!(all_bf16(&nm), "head.{phase}.final_norm_out is not bf16 -- RMSNorm's store was lost");
+        assert!(
+            all_bf16(&hc),
+            "head.{phase}.hc_head_out is not bf16 -- `y.to(dtype)` was lost"
+        );
+        assert!(
+            all_bf16(&nm),
+            "head.{phase}.final_norm_out is not bf16 -- RMSNorm's store was lost"
+        );
         // The other direction, and the load-bearing one. `all_bf16` on all three would pass
         // an implementation that rounded everything; this forbids it. Not a probabilistic
         // hope: each logit is an f32 dot product of `dim` bf16 terms, so landing on a bf16
@@ -1518,7 +1907,10 @@ fn the_head_mhc_rsqrt_is_load_bearing_in_every_case() {
             let ds = diff(base.of(c.phase), got.of(c.phase));
             for suffix in [".hc_head_out", ".final_norm_out", ".logits"] {
                 let hits = matching(&ds, suffix);
-                assert!(!hits.is_empty(), "{d:?} at {c:?}: no *{suffix} golden exists");
+                assert!(
+                    !hits.is_empty(),
+                    "{d:?} at {c:?}: no *{suffix} golden exists"
+                );
                 assert!(
                     hits.iter().all(|h| h.changed > 0),
                     "{d:?} at {c:?}: left a *{suffix} golden bit-identical"
@@ -1527,8 +1919,15 @@ fn the_head_mhc_rsqrt_is_load_bearing_in_every_case() {
             }
             // The layer stack is untouched. Trivially true today -- `head_tail` takes
             // `&[f32]` -- and kept as a tripwire for the day someone gives it `&mut`.
-            for h in matching(&ds, ".attn_out").iter().chain(matching(&ds, ".out").iter()) {
-                assert_eq!(h.changed, 0, "{d:?} at {c:?}: reached {} in the layer", h.name);
+            for h in matching(&ds, ".attn_out")
+                .iter()
+                .chain(matching(&ds, ".out").iter())
+            {
+                assert_eq!(
+                    h.changed, 0,
+                    "{d:?} at {c:?}: reached {} in the layer",
+                    h.name
+                );
             }
             fps.push(fingerprint(got.of(c.phase)));
         }
@@ -1541,7 +1940,10 @@ fn the_head_mhc_rsqrt_is_load_bearing_in_every_case() {
         );
         prints.push((d, fps));
     }
-    assert_ne!(prints[0].1, prints[1].1, "the two head-rsqrt defects compute the same thing");
+    assert_ne!(
+        prints[0].1, prints[1].1,
+        "the two head-rsqrt defects compute the same thing"
+    );
 }
 
 fn targeted_defects() -> Vec<Defect> {
@@ -1565,7 +1967,9 @@ fn expert_at_scale(defect: Defect, scale: f32) -> (Vec<f32>, usize) {
     let (cfg, m) = model();
     let o = Oracle::new(cfg.clone(), defect);
     let mut r = NamedRng::new("swiglu-probe");
-    let x: Vec<f32> = (0..cfg.dim).map(|_| bf16_decode(bf16_encode(r.unit() * scale))).collect();
+    let x: Vec<f32> = (0..cfg.dim)
+        .map(|_| bf16_decode(bf16_encode(r.unit() * scale)))
+        .collect();
     let mut counters = Default::default();
     let y = o.expert(&m.layers[0].experts[&0], &x, 1, None, &mut counters);
     (y, counters.swiglu_clamp_events)
@@ -1601,11 +2005,22 @@ fn the_selection_golden_moves_when_topk_truncates() {
     for (prompt, want_truncation) in [(5usize, false), (12, true)] {
         let base = run(2, prompt, Defect::None);
         let cut = base.pre.counters.indexer_truncated + base.dec.counters.indexer_truncated;
-        assert_eq!(cut > 0, want_truncation, "prompt {prompt}: {cut} truncating query rows");
+        assert_eq!(
+            cut > 0,
+            want_truncation,
+            "prompt {prompt}: {cut} truncating query rows"
+        );
         let want = selected(&base);
-        assert!(!want.is_empty(), "prompt {prompt}: no selection golden at all");
+        assert!(
+            !want.is_empty(),
+            "prompt {prompt}: no selection golden at all"
+        );
         let mut movers = Vec::new();
-        for d in [Defect::IndexerNoHadamard, Defect::IndexerNoRelu, Defect::IndexerNoWeights] {
+        for d in [
+            Defect::IndexerNoHadamard,
+            Defect::IndexerNoRelu,
+            Defect::IndexerNoWeights,
+        ] {
             if selected(&run(2, prompt, d)) != want {
                 movers.push(d);
             }
@@ -1636,8 +2051,14 @@ fn qk_norm_order_is_a_rounding_difference_not_an_arithmetic_one() {
             .filter(|x| x.name.ends_with(".q"))
             .fold(0.0f32, |m, x| m.max(x.rel))
     };
-    let (order, rounding) = (worst(Defect::QkNormAfterRope), worst(Defect::NoBf16Rounding));
-    assert!(rounding > 0.0, "NoBf16Rounding moved nothing, so there is no yardstick");
+    let (order, rounding) = (
+        worst(Defect::QkNormAfterRope),
+        worst(Defect::NoBf16Rounding),
+    );
+    assert!(
+        rounding > 0.0,
+        "NoBf16Rounding moved nothing, so there is no yardstick"
+    );
     assert!(
         order <= rounding,
         "QK-norm order moved .q by {order:.3e}, more than dropping bf16 entirely \
@@ -1657,12 +2078,16 @@ fn hc_pre_rsqrt_and_bf16_rounding_reach_the_whole_block() {
         let ds = diff(&base.pre, &got.pre);
         for suffix in [".attn_norm_out", ".q", ".attn_out", ".ffn_norm_out", ".out"] {
             assert!(
-                ds.iter().filter(|x| x.name.ends_with(suffix)).any(|x| x.changed > 0),
+                ds.iter()
+                    .filter(|x| x.name.ends_with(suffix))
+                    .any(|x| x.changed > 0),
                 "{d:?} left *{suffix} untouched"
             );
         }
         assert!(
-            ds.iter().filter(|x| x.name.ends_with(".in")).all(|x| x.changed == 0),
+            ds.iter()
+                .filter(|x| x.name.ends_with(".in"))
+                .all(|x| x.changed == 0),
             "{d:?} moved the driver-supplied input, which is impossible"
         );
     }
@@ -1686,8 +2111,14 @@ fn sinkhorn_has_converged_long_before_iteration_20() {
         let mut st = o.fresh_state(0);
         let mut h = fixed_h(cfg, "h-pre", 5);
         let mut cap = Capture::default();
-        let step =
-            Step { lw: &m.layers[0], layer: 0, s: 5, start_pos: 0, input_ids: &ids, phase: "pre" };
+        let step = Step {
+            lw: &m.layers[0],
+            layer: 0,
+            s: 5,
+            start_pos: 0,
+            input_ids: &ids,
+            phase: "pre",
+        };
         o.run_layer(&step, &mut st, &mut h, &mut cap);
         cap
     };
@@ -1714,8 +2145,14 @@ fn swiglu_clamp_fires_only_above_its_limit() {
     for d in [Defect::SwigluUnclamped, Defect::SwigluClampGateBothSides] {
         let (cold_ref, n_cold) = expert_at_scale(Defect::None, 0.3);
         let (cold_def, _) = expert_at_scale(d, 0.3);
-        assert_eq!(n_cold, 0, "the probe was supposed to stay inside +/-10 ({d:?})");
-        assert_eq!(cold_ref, cold_def, "{d:?} moved an expert whose activations never clamp");
+        assert_eq!(
+            n_cold, 0,
+            "the probe was supposed to stay inside +/-10 ({d:?})"
+        );
+        assert_eq!(
+            cold_ref, cold_def,
+            "{d:?} moved an expert whose activations never clamp"
+        );
 
         let (hot_ref, n_hot) = expert_at_scale(Defect::None, 300.0);
         let (hot_def, _) = expert_at_scale(d, 300.0);
@@ -1736,7 +2173,10 @@ fn softplus_threshold_only_matters_for_large_router_logits() {
     let (cfg, m) = model();
     let layer = 3; // score-routed
     let ids = fixed_ids(cfg, "ids-pre-5", 5);
-    let x: Vec<f32> = fixed_h(cfg, "gate-x", 5).into_iter().take(5 * cfg.dim).collect();
+    let x: Vec<f32> = fixed_h(cfg, "gate-x", 5)
+        .into_iter()
+        .take(5 * cfg.dim)
+        .collect();
 
     for (scale, want_differ) in [(1.0f32, false), (400.0, true)] {
         // Swapping ONLY the gate weight keeps everything else identical, so any difference
@@ -1750,7 +2190,14 @@ fn softplus_threshold_only_matters_for_large_router_logits() {
         let mut got = Vec::new();
         for d in [Defect::None, Defect::RouterNoSoftplusThreshold] {
             let o = Oracle::new(cfg.clone(), d);
-            let step = Step { lw: &layer_w, layer, s: 5, start_pos: 0, input_ids: &ids, phase: "g" };
+            let step = Step {
+                lw: &layer_w,
+                layer,
+                s: 5,
+                start_pos: 0,
+                input_ids: &ids,
+                phase: "g",
+            };
             let mut counters = Default::default();
             got.push((o.gate(&step, &x, &mut counters).0, counters));
         }

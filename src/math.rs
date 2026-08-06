@@ -259,11 +259,11 @@ mod tests {
     #[test]
     fn sqrt_softplus_matches_the_reference_and_is_monotonic() {
         for (x, want) in [
-            (0.0f32, 0.832_554_6f32),   // sqrt(ln 2) = sqrt(0.693147)
-            (1.0, 1.145_976_7),         // sqrt(ln(1+e)) = sqrt(1.313262)
-            (-1.0, 0.559_698_1),        // sqrt(ln(1+1/e)) = sqrt(0.313262)
-            (10.0, 3.162_284_6),        // sqrt(10.0000454)
-            (-10.0, 0.006_737_9),       // sqrt(4.539889e-5)
+            (0.0f32, 0.832_554_6f32), // sqrt(ln 2) = sqrt(0.693147)
+            (1.0, 1.145_976_7),       // sqrt(ln(1+e)) = sqrt(1.313262)
+            (-1.0, 0.559_698_1),      // sqrt(ln(1+1/e)) = sqrt(0.313262)
+            (10.0, 3.162_284_6),      // sqrt(10.0000454)
+            (-10.0, 0.006_737_9),     // sqrt(4.539889e-5)
         ] {
             let got = sqrt_softplus(x);
             assert!(
@@ -300,11 +300,25 @@ mod tests {
             let (mut s1, mut c1, mut sel1) = (vec![0.0; 256], vec![0.0; 256], Vec::new());
             let (mut s2, mut c2, mut sel2) = (vec![0.0; 256], vec![0.0; 256], Vec::new());
             route_into(&g, &bias, k, Scoring::Sigmoid, &mut s1, &mut c1, &mut sel1);
-            route_into(&g, &bias, k, Scoring::SqrtSoftplus, &mut s2, &mut c2, &mut sel2);
+            route_into(
+                &g,
+                &bias,
+                k,
+                Scoring::SqrtSoftplus,
+                &mut s2,
+                &mut c2,
+                &mut sel2,
+            );
             assert_eq!(sel1.len(), k);
             assert_eq!(sel2.len(), k);
-            assert!(s1.iter().all(|v| (0.0..=1.0).contains(v)), "sigmoid escaped (0,1)");
-            assert!(s2.iter().all(|v| v.is_finite() && *v >= 0.0), "sqrt-softplus not finite");
+            assert!(
+                s1.iter().all(|v| (0.0..=1.0).contains(v)),
+                "sigmoid escaped (0,1)"
+            );
+            assert!(
+                s2.iter().all(|v| v.is_finite() && *v >= 0.0),
+                "sqrt-softplus not finite"
+            );
             if sel1 != sel2 {
                 differed += 1;
             }

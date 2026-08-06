@@ -187,7 +187,9 @@ pub fn err_tol(want: &[f32], got: &[f32]) -> (f32, f32) {
 /// The largest absolute disagreement between two slices — the error metric every
 /// comparison in this suite uses, whatever tolerance it is held to.
 fn max_err(want: &[f32], got: &[f32]) -> f32 {
-    want.iter().zip(got).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()))
+    want.iter()
+        .zip(got)
+        .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()))
 }
 
 /// `n` positive per-block scales, `|f·0.1| + 0.01`. Every fp8 oracle in both backend files
@@ -430,20 +432,28 @@ pub const PROBE_REMAINDER_LEN: usize = 300;
 pub const RATIO_128_FIRST_DECODE_BLOCK: usize = 127;
 
 pub fn checkpoint() -> Option<Checkpoint> {
-    if !Path::new(CKPT).join("model.safetensors.index.json").exists() {
+    if !Path::new(CKPT)
+        .join("model.safetensors.index.json")
+        .exists()
+    {
         eprintln!("SKIP: no checkpoint at {CKPT}");
         return None;
     }
     Some(Checkpoint::open(Path::new(CKPT)).expect("opening checkpoint"))
 }
 
-
 /// One layer's `attn.compressor.*`, at `head_dim` and `rotate` set by which compressor it is.
 ///
 /// Loading these directly rather than through `bin/v4-oracle`'s `load_layer` is the whole
 /// point: `load_layer` also pulls the layer's routed experts, which is 3.4 GB per layer, and
 /// none of it is read by `Oracle::compressor`.
-pub fn compressor_w(ck: &Checkpoint, prefix: &str, ratio: usize, d: usize, rotate: bool) -> CompressorW {
+pub fn compressor_w(
+    ck: &Checkpoint,
+    prefix: &str,
+    ratio: usize,
+    d: usize,
+    rotate: bool,
+) -> CompressorW {
     let kind = LayerKind::from_ratio(ratio);
     let cw = CompressorW {
         ratio,
@@ -453,7 +463,11 @@ pub fn compressor_w(ck: &Checkpoint, prefix: &str, ratio: usize, d: usize, rotat
         ape: ck.get(&format!("{prefix}.ape")).unwrap().to_f32().unwrap(),
         wkv: ck.dense(&format!("{prefix}.wkv.weight")).unwrap(),
         wgate: ck.dense(&format!("{prefix}.wgate.weight")).unwrap(),
-        norm: ck.get(&format!("{prefix}.norm.weight")).unwrap().to_f32().unwrap(),
+        norm: ck
+            .get(&format!("{prefix}.norm.weight"))
+            .unwrap()
+            .to_f32()
+            .unwrap(),
     };
     // The shape trap from the S2c brief, asserted rather than assumed: `ape` is
     // [ratio, coff*d], so [4, 1024] at ratio 4 (coff 2) and [128, 512] at ratio 128 (coff 1).
@@ -470,10 +484,26 @@ pub fn compressor_w(ck: &Checkpoint, prefix: &str, ratio: usize, d: usize, rotat
     // `[out, in]`, the torch `Linear` convention `Oracle::linear` reads: rows are the
     // projection width, cols the model dim. Asserting `cols` here instead passed on L2 by
     // coincidence of both being 4096-adjacent and is the axis mix-up worth pinning.
-    assert_eq!(cw.wkv.rows(), kind.coff() * d, "{prefix}: wkv projects TO coff*d");
-    assert_eq!(cw.wgate.rows(), kind.coff() * d, "{prefix}: wgate matches wkv");
-    assert_eq!(cw.wkv.cols(), cw.wgate.cols(), "{prefix}: both read the same model dim");
-    assert_eq!(cw.norm.len(), d, "{prefix}: norm is over head_dim, not coff*head_dim");
+    assert_eq!(
+        cw.wkv.rows(),
+        kind.coff() * d,
+        "{prefix}: wkv projects TO coff*d"
+    );
+    assert_eq!(
+        cw.wgate.rows(),
+        kind.coff() * d,
+        "{prefix}: wgate matches wkv"
+    );
+    assert_eq!(
+        cw.wkv.cols(),
+        cw.wgate.cols(),
+        "{prefix}: both read the same model dim"
+    );
+    assert_eq!(
+        cw.norm.len(),
+        d,
+        "{prefix}: norm is over head_dim, not coff*head_dim"
+    );
     cw
 }
 
@@ -490,7 +520,9 @@ pub fn compressor_w(ck: &Checkpoint, prefix: &str, ratio: usize, d: usize, rotat
 /// the attention compressor partially fp8-quantizes. Same class, different arithmetic.
 pub fn indexer_w(ck: &Checkpoint, layer: usize, c: &V4Config) -> IndexerW {
     IndexerW {
-        wq_b: ck.fp8(&format!("layers.{layer}.attn.indexer.wq_b.weight")).unwrap(),
+        wq_b: ck
+            .fp8(&format!("layers.{layer}.attn.indexer.wq_b.weight"))
+            .unwrap(),
         weights_proj: ck
             .dense(&format!("layers.{layer}.attn.indexer.weights_proj.weight"))
             .unwrap(),
@@ -506,9 +538,10 @@ pub fn indexer_w(ck: &Checkpoint, layer: usize, c: &V4Config) -> IndexerW {
 
 pub fn probe(name: &str, n: usize, dim: usize) -> Vec<f32> {
     let mut r = NamedRng::new(name);
-    (0..n * dim).map(|_| bf16_decode(bf16_encode(r.unit()))).collect()
+    (0..n * dim)
+        .map(|_| bf16_decode(bf16_encode(r.unit())))
+        .collect()
 }
-
 
 /// Names from `names` for which `present` is false — the "coverage census" shape shared by
 /// every source-scanning test here.

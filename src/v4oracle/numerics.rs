@@ -141,7 +141,11 @@ pub fn e2m1_decode(nib: u8) -> f32 {
 pub fn e2m1_encode(x: f32) -> u8 {
     const MID: [f32; 7] = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0];
     let a = x.abs();
-    let code = MID.iter().enumerate().filter(|&(i, &m)| a > m || (a == m && i % 2 == 1)).count();
+    let code = MID
+        .iter()
+        .enumerate()
+        .filter(|&(i, &m)| a > m || (a == m && i % 2 == 1))
+        .count();
     (if x.is_sign_negative() { 0x08 } else { 0x00 }) | code as u8
 }
 
@@ -201,8 +205,15 @@ fn simulate_block_quant(
     roundtrip: fn(f32) -> f32,
 ) {
     for chunk in row.chunks_mut(block) {
-        let amax = chunk.iter().fold(0.0f32, |a, v| a.max(v.abs())).max(amax_floor);
-        let s = if round_scale { fast_round_scale(amax, 1.0 / max) } else { amax / max };
+        let amax = chunk
+            .iter()
+            .fold(0.0f32, |a, v| a.max(v.abs()))
+            .max(amax_floor);
+        let s = if round_scale {
+            fast_round_scale(amax, 1.0 / max)
+        } else {
+            amax / max
+        };
         for v in chunk.iter_mut() {
             *v = roundtrip((*v / s).clamp(-max, max)) * s;
         }
@@ -220,7 +231,9 @@ fn simulate_block_quant(
 /// Blocks run along the LAST dimension; `row` is one flattened leading index, matching the
 /// kernel's `x.view(-1, N)`.
 pub fn act_quant_inplace(row: &mut [f32], block: usize, round_scale: bool) {
-    simulate_block_quant(row, block, 1e-4, FP8_MAX, round_scale, |q| e4m3_decode(e4m3_encode(q)));
+    simulate_block_quant(row, block, 1e-4, FP8_MAX, round_scale, |q| {
+        e4m3_decode(e4m3_encode(q))
+    });
 }
 
 /// `kernel.py::fp4_act_quant(x, block_size, inplace=True)`. The scale is ALWAYS rounded —

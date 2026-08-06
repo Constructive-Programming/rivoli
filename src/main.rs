@@ -229,7 +229,6 @@ struct Args {
     #[arg(long, default_value_t = 0.8)]
     mtp_min_conf: f32,
 
-
     /// DIAGNOSTIC: hash the residual stream after every layer.
     #[cfg(feature = "trace")]
     #[arg(long)]
@@ -547,7 +546,6 @@ fn device_budget(max_mem: Option<u64>) -> Result<usize> {
     })
 }
 
-
 /// The DeepSeek-V4-Flash decode, which shares no engine type with GLM's.
 ///
 /// A separate function rather than a `match` arm inside `main` because it forks BEFORE
@@ -569,7 +567,13 @@ fn device_budget(max_mem: Option<u64>) -> Result<usize> {
 /// ownership of four of `Args`' `String`s just above the dispatch, so `&a` is not borrowable
 /// there. The three are differently typed, so none is substitutable for another.
 #[cfg(feature = "rocm")]
-fn run_v4(cfg: &Config, attn: &str, port: Option<u16>, no_mtp: bool, watchdog_secs: u64) -> Result<()> {
+fn run_v4(
+    cfg: &Config,
+    attn: &str,
+    port: Option<u16>,
+    no_mtp: bool,
+    watchdog_secs: u64,
+) -> Result<()> {
     use rivoli::arch::Arch;
     // Inside the function rather than at the top of the file: it then inherits this `cfg`
     // instead of restating it, and a gate that cannot be restated cannot drift out of step.
@@ -787,10 +791,18 @@ fn main() -> Result<()> {
     // wrong text rather than crashing.
     match rivoli::artifact::model::arch_of_artifact(&cfg.model)? {
         rivoli::arch::Arch::GlmMoeDsa => {}
-        rivoli::arch::Arch::DeepseekV4 => return run_v4(&cfg, &a.attn, a.port, a.no_mtp, {
-            #[cfg(feature = "trace")] { a.watchdog_secs }
-            #[cfg(not(feature = "trace"))] { 60 }
-        }),
+        rivoli::arch::Arch::DeepseekV4 => {
+            return run_v4(&cfg, &a.attn, a.port, a.no_mtp, {
+                #[cfg(feature = "trace")]
+                {
+                    a.watchdog_secs
+                }
+                #[cfg(not(feature = "trace"))]
+                {
+                    60
+                }
+            });
+        }
     }
 
     // Model dimensions from the artifact's manifest.json.
@@ -972,12 +984,7 @@ fn main() -> Result<()> {
             (None, Some(_)) => a.ctx,
             (None, None) => prompt_ids.len() + ngen + followup_pos + 1,
         };
-        let mut engine = rivoli::gpu::GpuEngine::new(
-            pin,
-            &mc,
-            max_ctx,
-            cfg.attn.clone(),
-        )?;
+        let mut engine = rivoli::gpu::GpuEngine::new(pin, &mc, max_ctx, cfg.attn.clone())?;
         #[cfg(feature = "trace")]
         engine.set_checksum_x(cfg.checksum_x);
         #[cfg(feature = "pred-probe")]

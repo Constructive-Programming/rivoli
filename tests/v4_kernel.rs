@@ -194,7 +194,11 @@ impl F4Experts {
             };
             let mut push = |m: &WMat| {
                 let (w, sc) = fp4_spans(m);
-                let wb = if swap_nibbles { to_device(&nibble_swapped(w)) } else { to_device(w) };
+                let wb = if swap_nibbles {
+                    to_device(&nibble_swapped(w))
+                } else {
+                    to_device(w)
+                };
                 let sb = to_device(sc);
                 // Addresses taken BEFORE the move. Recovering them as `parts[n-2]`/`[n-1]`
                 // after the pushes works until someone adds a third buffer, at which point the
@@ -223,7 +227,11 @@ impl F4Experts {
             let bytes = std::mem::size_of_val(&descs[..]);
             std::slice::from_raw_parts(descs.as_ptr() as *const u8, bytes)
         };
-        Self { descs: to_device(raw), n: descs.len(), parts }
+        Self {
+            descs: to_device(raw),
+            n: descs.len(),
+            parts,
+        }
     }
 }
 
@@ -264,7 +272,11 @@ impl Dispatch<'_> {
     /// exercises `e_start > 0`.
     fn in_ranges(&self, ranges: &[(usize, usize)]) -> Vec<f32> {
         let (hidden, inter) = (self.cfg.dim, self.cfg.moe_inter_dim);
-        assert_eq!(self.wexpert.len(), self.experts.n, "one routing weight per expert");
+        assert_eq!(
+            self.wexpert.len(),
+            self.experts.n,
+            "one routing weight per expert"
+        );
         let stream = HipStream::new().expect("stream");
         let mut xb = to_device(&f32b(self.x));
         let wb = to_device(&f32b(self.wexpert));
@@ -280,15 +292,29 @@ impl Dispatch<'_> {
         // distinct locals, so the `ptr_mut()` calls would borrow-check inline too.
         let (xp, wp) = (xb.ptr() as *const f32, wb.ptr() as *const f32);
         let dp = self.experts.descs.ptr() as *const ExpertDescF4;
-        let (hp, ap, op) =
-            (hb.ptr_mut() as *mut f32, ab.ptr_mut() as *mut u64, ob.ptr_mut() as *mut f32);
+        let (hp, ap, op) = (
+            hb.ptr_mut() as *mut f32,
+            ab.ptr_mut() as *mut u64,
+            ob.ptr_mut() as *mut f32,
+        );
         // SAFETY: every buffer above is sized for `experts.n` ABSOLUTE expert slots and is
         // alive until the sync; every range is inside that bound.
         unsafe {
             for &(e_start, e_count) in ranges {
                 launch_moe_expert_range_f4(
-                    xp, hidden, inter, e_start, e_count, self.experts.n, dp, wp,
-                    self.swiglu_limit, hp, ap, 1, stream.raw(),
+                    xp,
+                    hidden,
+                    inter,
+                    e_start,
+                    e_count,
+                    self.experts.n,
+                    dp,
+                    wp,
+                    self.swiglu_limit,
+                    hp,
+                    ap,
+                    1,
+                    stream.raw(),
                 )
                 .expect("moe_expert_range_f4");
             }
@@ -324,7 +350,11 @@ fn e4m3_code_blocks() -> Vec<f32> {
     const S: f32 = 1.0 / 256.0;
     [0x00u8..=0x7e, 0x80..=0xfe]
         .into_iter()
-        .flat_map(|codes| codes.map(|c| e4m3_decode(c) * S).chain([e4m3_decode(0x7e) * S]))
+        .flat_map(|codes| {
+            codes
+                .map(|c| e4m3_decode(c) * S)
+                .chain([e4m3_decode(0x7e) * S])
+        })
         .collect()
 }
 
@@ -332,7 +362,9 @@ fn e4m3_code_blocks() -> Vec<f32> {
 /// the SwiGLU clamp on or off. `scale` is the knob the clamp test turns.
 fn draw_x(tag: &str, n: usize, scale: f32) -> Vec<f32> {
     let mut r = NamedRng::new(tag);
-    (0..n).map(|_| bf16_decode(bf16_encode(r.unit() * scale))).collect()
+    (0..n)
+        .map(|_| bf16_decode(bf16_encode(r.unit() * scale)))
+        .collect()
 }
 
 /// One expert-comparison case: a layer, an activation, a fixed set of picks, and the
@@ -393,8 +425,11 @@ impl Case {
         // case runs at activation scale 48 — well inside, but close enough that leaving this
         // unstated would make a future scale bump a confusing red.
         let mx = max_abs(&want);
-        assert!(mx < 8192.0, "case output {mx:.3e} is within 2x of moe_fixed's 2^14 clamp, \
-                              which the oracle does not have — lower the activation scale");
+        assert!(
+            mx < 8192.0,
+            "case output {mx:.3e} is within 2x of moe_fixed's 2^14 clamp, \
+                              which the oracle does not have — lower the activation scale"
+        );
 
         let all: Vec<&ExpertW> = (0..cfg.n_routed_experts).map(|e| &lw.experts[&e]).collect();
         let experts = F4Experts::upload(&all, Wiring::Correct);
@@ -416,13 +451,20 @@ impl Case {
         limit: f32,
         quantize_x: bool,
     ) -> Dispatch<'a> {
-        Dispatch { cfg: self.cfg, experts, x: &self.x, wexpert: &self.wexpert,
-                   swiglu_limit: limit, quantize_x }
+        Dispatch {
+            cfg: self.cfg,
+            experts,
+            x: &self.x,
+            wexpert: &self.wexpert,
+            swiglu_limit: limit,
+            quantize_x,
+        }
     }
 
     /// The GPU answer for this case, under the reference wiring and the config's clamp.
     fn gpu(&self) -> Vec<f32> {
-        self.dispatch(&self.experts, self.cfg.swiglu_limit, true).run()
+        self.dispatch(&self.experts, self.cfg.swiglu_limit, true)
+            .run()
     }
 
     /// The GPU answer with ONE thing broken, and nothing else changed.
@@ -447,8 +489,14 @@ impl Case {
 fn routed_experts_match_the_oracle() {
     let c = Case::new(0, "moe-x", 1.0);
     // Not vacuous: a comparison against an all-zero want would pass for any kernel.
-    assert!(c.want.iter().any(|v| v.abs() > 1e-6), "the oracle produced nothing to compare");
-    assert_eq!(c.clamp_events, 0, "this case is the UNCLAMPED half of the clamp bracket");
+    assert!(
+        c.want.iter().any(|v| v.abs() > 1e-6),
+        "the oracle produced nothing to compare"
+    );
+    assert_eq!(
+        c.clamp_events, 0,
+        "this case is the UNCLAMPED half of the clamp bracket"
+    );
     assert_matches(&c.want, &c.gpu(), "routed experts (fp4)");
 }
 
@@ -475,7 +523,10 @@ fn the_silent_fp4_breaks_are_visible() {
     let lim = c.cfg.swiglu_limit;
     for (label, got) in [
         ("w1/w3 swapped", c.broken(Wiring::SwapGateUp, lim, true)),
-        ("nibbles read high-first", c.broken(Wiring::SwapNibbles, lim, true)),
+        (
+            "nibbles read high-first",
+            c.broken(Wiring::SwapNibbles, lim, true),
+        ),
         ("x not fp8-quantized", c.broken(Wiring::Correct, lim, false)),
     ] {
         assert_disagrees(&c.want, &got, label);
@@ -526,11 +577,24 @@ fn an_unrouted_expert_contributes_exactly_zero() {
     let named: Vec<&ExpertW> = PICKS.iter().map(|&e| c.all[e]).collect();
     let two = F4Experts::upload(&named, Wiring::Correct);
     let w = PICKS.map(|e| c.wexpert[e]);
-    let just_two = Dispatch { cfg: c.cfg, experts: &two, x: &c.x, wexpert: &w,
-                              swiglu_limit: c.cfg.swiglu_limit, quantize_x: true }
-        .run();
-    assert_eq!(bits(&full), bits(&just_two), "an unrouted expert perturbed the sum");
-    assert!(full.iter().any(|v| v.abs() > 1e-6), "both arms produced zero — nothing compared");
+    let just_two = Dispatch {
+        cfg: c.cfg,
+        experts: &two,
+        x: &c.x,
+        wexpert: &w,
+        swiglu_limit: c.cfg.swiglu_limit,
+        quantize_x: true,
+    }
+    .run();
+    assert_eq!(
+        bits(&full),
+        bits(&just_two),
+        "an unrouted expert perturbed the sum"
+    );
+    assert!(
+        full.iter().any(|v| v.abs() > 1e-6),
+        "both arms produced zero — nothing compared"
+    );
 }
 
 /// `wexpert`, `h` and `descs` are indexed by ABSOLUTE expert id, so a dispatch split into
@@ -556,7 +620,11 @@ fn a_dispatch_split_into_ranges_matches_one_range() {
     assert_matches(&c.want, &split, "routed experts, dispatched as two ranges");
     // And bit-identical to the single-range dispatch: the fixed-point accumulator makes the
     // sum associative, so splitting it must change nothing at all, not merely little.
-    assert_eq!(bits(&c.gpu()), bits(&split), "range split perturbed the sum");
+    assert_eq!(
+        bits(&c.gpu()),
+        bits(&split),
+        "range split perturbed the sum"
+    );
 }
 
 /// Every launcher guard, by CODE. Accepting any error would pass a build where an
@@ -596,7 +664,10 @@ fn expert_range_f4_guards() {
     };
     let (hid, int, lim) = (cfg.dim, cfg.moe_inter_dim, cfg.swiglu_limit);
 
-    assert!(go((hid, int, 0, 1, 1, lim, 1)).is_ok(), "the accepted case must be accepted");
+    assert!(
+        go((hid, int, 0, 1, 1, lim, 1)).is_ok(),
+        "the accepted case must be accepted"
+    );
     // The accepted case LAUNCHED. Join before the buffers drop: a launcher's `Ok` is
     // `hipGetLastError()` immediately after the launch, so an asynchronous fault would
     // otherwise surface in whichever test calls `device_sync()` next — and `cargo test` runs
@@ -607,8 +678,16 @@ fn expert_range_f4_guards() {
         (1001, "zero hidden", go((0, int, 0, 1, 1, lim, 1))),
         // 129 is not a multiple of ACT_QUANT_BLOCK. `assert N % block_size == 0` is the
         // reference's own; a ragged tail would quantize against a scale it never computes.
-        (1002, "hidden not a whole act-quant block", go((129, int, 0, 1, 1, lim, 1))),
-        (1002, "inter not a whole act-quant block", go((hid, 96, 0, 1, 1, lim, 1))),
+        (
+            1002,
+            "hidden not a whole act-quant block",
+            go((129, int, 0, 1, 1, lim, 1)),
+        ),
+        (
+            1002,
+            "inter not a whole act-quant block",
+            go((hid, 96, 0, 1, 1, lim, 1)),
+        ),
         // BOTH sides of 1, which is what separates `!= 1` from a `> 1` that would accept 0.
         // The FP4 path instantiates only R=1: no measurement justifies a second row, and the
         // oracle is bsz=1, so one could not be scored even if it existed.
@@ -617,8 +696,16 @@ fn expert_range_f4_guards() {
         // THE `.f4` BOUNDARY. `.vq3`/`.i4` carry the shared expert as block `n_experts`;
         // `.f4` does not, because V4's shared expert is fp8 e4m3 at 128x128. One past the
         // end here is the wrong ARITHMETIC, not merely the wrong weights.
-        (1004, "one expert past the descriptor array", go((hid, int, 0, 2, 1, lim, 1))),
-        (1004, "e_start past the descriptor array", go((hid, int, 1, 1, 1, lim, 1))),
+        (
+            1004,
+            "one expert past the descriptor array",
+            go((hid, int, 0, 2, 1, lim, 1)),
+        ),
+        (
+            1004,
+            "e_start past the descriptor array",
+            go((hid, int, 1, 1, 1, lim, 1)),
+        ),
         // Every value that disables the clamp, and each row is chosen to distinguish a
         // SPELLING rather than to enumerate bad numbers. `-10.0` is absent because `x <= 0`
         // would reject it too, so it separates nothing. NaN separates `!(x > 0)` from
@@ -627,8 +714,16 @@ fn expert_range_f4_guards() {
         // open on the one clamp launcher that has callers: `fminf(gt, inf)` returns `gt`, so
         // the clamp is simply gone, on every fp4 expert of every layer, silently.
         (1006, "unclamped swiglu", go((hid, int, 0, 1, 1, 0.0, 1))),
-        (1006, "NaN swiglu limit", go((hid, int, 0, 1, 1, f32::NAN, 1))),
-        (1006, "infinite swiglu limit", go((hid, int, 0, 1, 1, f32::INFINITY, 1))),
+        (
+            1006,
+            "NaN swiglu limit",
+            go((hid, int, 0, 1, 1, f32::NAN, 1)),
+        ),
+        (
+            1006,
+            "infinite swiglu limit",
+            go((hid, int, 0, 1, 1, f32::INFINITY, 1)),
+        ),
     ];
     assert_guards(cases);
 }
@@ -695,8 +790,9 @@ fn act_quant_block(seed: &str) -> Vec<f32> {
 #[test]
 fn act_quant_f8_is_bit_identical_to_the_oracle() {
     const ROWS: usize = 6;
-    let mut host: Vec<f32> =
-        (0..ROWS).flat_map(|r| act_quant_block(&format!("actq-{r}"))).collect();
+    let mut host: Vec<f32> = (0..ROWS)
+        .flat_map(|r| act_quant_block(&format!("actq-{r}")))
+        .collect();
     // A row of two blocks, to prove the tiling advances by 128 within a row rather than
     // treating each row as one block: the second block's amax differs from the first's, so
     // a kernel that reused one scale for the whole row produces different numbers.
@@ -735,9 +831,16 @@ fn act_quant_f8_is_bit_identical_to_the_oracle() {
     // over-covering extent would write past the allocation before any later check ran.
     let plan = [(ROWS, 128), (1, wide.len()), (code_blocks.len() / 128, 128)];
     let covered: usize = plan.iter().map(|(r, n)| r * n).sum();
-    assert_eq!(covered, host.len(), "the launches do not cover the fixture exactly");
-    println!("act_quant_f8: {} blocks dispatched, {} of them e4m3-code blocks",
-             covered / 128, plan[2].0);
+    assert_eq!(
+        covered,
+        host.len(),
+        "the launches do not cover the fixture exactly"
+    );
+    println!(
+        "act_quant_f8: {} blocks dispatched, {} of them e4m3-code blocks",
+        covered / 128,
+        plan[2].0
+    );
     // SAFETY: `b` holds `host.len()` live f32, and the plan covers exactly that — asserted
     // immediately above, from the same extents the loop dispatches.
     unsafe {
@@ -750,8 +853,11 @@ fn act_quant_f8_is_bit_identical_to_the_oracle() {
     }
     let got = sync_f32(&b);
 
-    assert_ne!(bits(&want), bits(&host),
-               "the quantizer left the input unchanged — nothing was compared");
+    assert_ne!(
+        bits(&want),
+        bits(&host),
+        "the quantizer left the input unchanged — nothing was compared"
+    );
     assert_eq!(want.len(), got.len());
     if let Some(i) = (0..want.len()).find(|&i| want[i].to_bits() != got[i].to_bits()) {
         panic!(
@@ -818,8 +924,11 @@ fn the_fixture_exercises_the_codes_the_decoders_are_credited_with() {
     let mut nibbles = [0usize; 16];
     let mut scales = std::collections::BTreeSet::new();
     for &e in &PICKS {
-        for w in [&m.layers[0].experts[&e].w1, &m.layers[0].experts[&e].w3,
-                  &m.layers[0].experts[&e].w2] {
+        for w in [
+            &m.layers[0].experts[&e].w1,
+            &m.layers[0].experts[&e].w3,
+            &m.layers[0].experts[&e].w2,
+        ] {
             let (packed, s) = fp4_spans(w);
             for b in packed {
                 nibbles[(b & 0x0f) as usize] += 1;
@@ -829,7 +938,10 @@ fn the_fixture_exercises_the_codes_the_decoders_are_credited_with() {
         }
     }
     let missing: Vec<usize> = (0..16).filter(|&n| nibbles[n] == 0).collect();
-    assert!(missing.is_empty(), "e2m1 codes never exercised by a ROUTED expert: {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "e2m1 codes never exercised by a ROUTED expert: {missing:?}"
+    );
     // Printed, so it needs `cargo test -- --nocapture` to read: the BOUND is what a reader
     // wants and any threshold on it here would be a number picked to pass. `e8m0f`'s two
     // special codes — 0x00 (2^-127, an f32 subnormal) and 0xff (NaN) — are decoded by
@@ -840,7 +952,10 @@ fn the_fixture_exercises_the_codes_the_decoders_are_credited_with() {
         scales.iter().next(),
         scales.iter().next_back()
     );
-    assert!(!scales.contains(&0u8) && !scales.contains(&0xffu8), "a special e8m0 code leaked in");
+    assert!(
+        !scales.contains(&0u8) && !scales.contains(&0xffu8),
+        "a special e8m0 code leaked in"
+    );
 }
 
 // =======================================================================================
@@ -924,8 +1039,10 @@ fn gpu_gate(cfg: &V4Config, lw: &LayerW, logits: &[f32], input_id: usize) -> (Ve
     gate_call(
         cfg,
         lb.ptr() as *const f32,
-        bias.as_ref().map_or(std::ptr::null(), |b| b.ptr() as *const f32),
-        hash.as_ref().map_or(std::ptr::null(), |t| t.ptr() as *const i64),
+        bias.as_ref()
+            .map_or(std::ptr::null(), |b| b.ptr() as *const f32),
+        hash.as_ref()
+            .map_or(std::ptr::null(), |t| t.ptr() as *const i64),
         input_id,
         &mut wb,
         &mut ib,
@@ -935,7 +1052,9 @@ fn gpu_gate(cfg: &V4Config, lw: &LayerW, logits: &[f32], input_id: usize) -> (Ve
     let iv = ib.copy_out().expect("indices");
     (
         f32v(&wb.copy_out().expect("weights")),
-        (0..k).map(|j| i32::from_le_bytes(iv[j * 4..j * 4 + 4].try_into().unwrap())).collect(),
+        (0..k)
+            .map(|j| i32::from_le_bytes(iv[j * 4..j * 4 + 4].try_into().unwrap()))
+            .collect(),
     )
 }
 
@@ -950,10 +1069,21 @@ fn the_router_matches_the_oracle_in_both_modes() {
     for layer in [0usize, 3] {
         let lw = &m.layers[layer];
         let hash = lw.tid2eid.is_some();
-        assert_eq!(hash, layer < cfg.n_hash_layers, "layer {layer} is not the mode expected");
+        assert_eq!(
+            hash,
+            layer < cfg.n_hash_layers,
+            "layer {layer} is not the mode expected"
+        );
         let x = draw_x(&format!("gate-x-{layer}"), cfg.dim, 1.0);
         let ids = [7u32];
-        let step = Step { lw, layer, s: 1, start_pos: 0, input_ids: &ids, phase: "probe" };
+        let step = Step {
+            lw,
+            layer,
+            s: 1,
+            start_pos: 0,
+            input_ids: &ids,
+            phase: "probe",
+        };
         let (want_w, want_i) = o.gate(&step, &x, &mut Counters::default());
 
         let (got_w, got_i) = gpu_gate(cfg, lw, &gate_logits(lw, &x), ids[0] as usize);
@@ -974,7 +1104,10 @@ fn the_router_matches_the_oracle_in_both_modes() {
 fn hash_routing_bypasses_the_scores_for_selection_only() {
     let (cfg, m, _) = fixture();
     let lw = &m.layers[0];
-    assert!(lw.tid2eid.is_some(), "layer 0 must be a hash layer for this to mean anything");
+    assert!(
+        lw.tid2eid.is_some(),
+        "layer 0 must be a hash layer for this to mean anything"
+    );
     let x = draw_x("gate-x-0", cfg.dim, 1.0);
     let base = gate_logits(lw, &x);
     // A shift, not a scale: `sqrt(softplus(·))` is monotone, so a positive scale would
@@ -1017,19 +1150,30 @@ fn the_router_breaks_ties_towards_the_lower_expert_id() {
     let mut pick = |logits: &[f32]| {
         let lb = to_device(&f32b(logits));
         // A scored layer (bias, no table), because ties only matter where a top-k runs.
-        gate_call(cfg, lb.ptr() as *const f32, zero_bias.ptr() as *const f32, std::ptr::null(),
-                  0, &mut wb, &mut ib)
-            .expect("moe_gate_v4");
+        gate_call(
+            cfg,
+            lb.ptr() as *const f32,
+            zero_bias.ptr() as *const f32,
+            std::ptr::null(),
+            0,
+            &mut wb,
+            &mut ib,
+        )
+        .expect("moe_gate_v4");
         device_sync().expect("device sync");
         let iv = ib.copy_out().expect("indices");
-        (0..k).map(|j| i32::from_le_bytes(iv[j * 4..j * 4 + 4].try_into().unwrap()))
+        (0..k)
+            .map(|j| i32::from_le_bytes(iv[j * 4..j * 4 + 4].try_into().unwrap()))
             .collect::<Vec<i32>>()
     };
 
     // Every score identical: the k lowest ids, in ascending order.
     let all_tied: Vec<i32> = (0..k as i32).collect();
-    assert_eq!(all_tied, pick(&vec![1.0f32; cfg.n_routed_experts]),
-               "an all-tied row did not select the k lowest expert ids");
+    assert_eq!(
+        all_tied,
+        pick(&vec![1.0f32; cfg.n_routed_experts]),
+        "an all-tied row did not select the k lowest expert ids"
+    );
 
     // A tied PAIR at the top, below a run of lower scores: the two highest-scoring ids, and
     // the lower one first. Placed at the END of the row so a scan that kept the LAST maximum
@@ -1039,8 +1183,11 @@ fn the_router_breaks_ties_towards_the_lower_expert_id() {
     logits[a] = 4.0;
     logits[b] = 4.0;
     let got = pick(&logits);
-    assert_eq!(vec![a as i32, b as i32], got[..2].to_vec(),
-               "a tied pair did not come back lower-id first");
+    assert_eq!(
+        vec![a as i32, b as i32],
+        got[..2].to_vec(),
+        "a tied pair did not come back lower-id first"
+    );
 }
 
 /// Every router guard, by CODE.
@@ -1066,16 +1213,33 @@ fn the_router_refuses_what_it_claims_to() {
     let lp = logits.ptr() as *const f32;
     let mut go = |c, b, t, id| gate_call(c, lp, b, t, id, &mut wb, &mut ib);
 
-    assert!(go(cfg, bp, std::ptr::null(), 0).is_ok(), "a scored layer must be accepted");
-    assert!(go(cfg, std::ptr::null(), tp, 0).is_ok(), "a hash layer must be accepted");
+    assert!(
+        go(cfg, bp, std::ptr::null(), 0).is_ok(),
+        "a scored layer must be accepted"
+    );
+    assert!(
+        go(cfg, std::ptr::null(), tp, 0).is_ok(),
+        "a hash layer must be accepted"
+    );
     device_sync().expect("device sync"); // both accepted cases launched
 
     // `k > n_experts` needs a config the toy cannot supply, since `V4Config` pins k < n.
-    let big = V4Config { n_activated_experts: cfg.n_routed_experts + 1, ..cfg.clone() };
+    let big = V4Config {
+        n_activated_experts: cfg.n_routed_experts + 1,
+        ..cfg.clone()
+    };
     assert_guards(vec![
         (1002, "both a bias and a hash table", go(cfg, bp, tp, 0)),
-        (1002, "neither", go(cfg, std::ptr::null(), std::ptr::null(), 0)),
-        (1003, "input_id past the table", go(cfg, std::ptr::null(), tp, cfg.vocab_size)),
+        (
+            1002,
+            "neither",
+            go(cfg, std::ptr::null(), std::ptr::null(), 0),
+        ),
+        (
+            1003,
+            "input_id past the table",
+            go(cfg, std::ptr::null(), tp, cfg.vocab_size),
+        ),
         (1001, "k > n_experts", go(&big, bp, std::ptr::null(), 0)),
     ]);
 }
@@ -1166,7 +1330,10 @@ fn gpu_hc_post(
 /// number is on the record rather than absorbed into a tolerance. **S3 owns supplying it.**
 fn gpu_rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
     let dim = w.len();
-    assert!(x.len().is_multiple_of(dim), "x must be whole rows of the norm weight");
+    assert!(
+        x.len().is_multiple_of(dim),
+        "x must be whole rows of the norm weight"
+    );
     let (xb, wb) = (to_device(&f32b(x)), to_device(&f32b(w)));
     let mut y = zeros(x.len() * 4);
     // ONE LAUNCH PER TOKEN. `rivoli_rmsnorm` is single-row — `dim3(1)`, one mean over its
@@ -1204,7 +1371,14 @@ fn capture(layer: usize, s: usize) -> (Capture, Vec<f32>, Vec<u32>) {
     let h0 = h.clone();
     let mut cap = Capture::default();
     let mut st = o.fresh_state(layer);
-    let step = Step { lw: &m.layers[layer], layer, s, start_pos: 0, input_ids: &ids, phase: "pre" };
+    let step = Step {
+        lw: &m.layers[layer],
+        layer,
+        s,
+        start_pos: 0,
+        input_ids: &ids,
+        phase: "pre",
+    };
     o.run_layer(&step, &mut st, &mut h, &mut cap);
     (cap, h0, ids)
 }
@@ -1232,9 +1406,17 @@ fn mhc_reproduces_the_layer_goldens() {
     let (cap, h_in, _) = capture(0, S);
     let lw = &m.layers[0];
     let iters = cfg.hc_sinkhorn_iters;
-    let g = |n: &str| cap.float(n).unwrap_or_else(|| panic!("golden {n}")).to_vec();
+    let g = |n: &str| {
+        cap.float(n)
+            .unwrap_or_else(|| panic!("golden {n}"))
+            .to_vec()
+    };
 
-    assert_eq!(h_in, g("L0.pre.in"), "the driver's h is not what the oracle recorded");
+    assert_eq!(
+        h_in,
+        g("L0.pre.in"),
+        "the driver's h is not what the oracle recorded"
+    );
 
     // The bf16 store `rmsnorm` is missing (see `gpu_rmsnorm`). Measured on the way past so
     // the size of the gap is recorded rather than inferred: `report` prints the unrounded
@@ -1246,7 +1428,11 @@ fn mhc_reproduces_the_layer_goldens() {
         // Asserted, not merely printed: `println!` is captured and discarded on a green run,
         // so "the number is on the record" would be a claim about output nobody sees. This
         // goes red exactly when the wrapper stops being needed.
-        let (err, _) = compare(&raw, &rounded, &format!("{label}: rmsnorm's missing bf16 store"));
+        let (err, _) = compare(
+            &raw,
+            &rounded,
+            &format!("{label}: rmsnorm's missing bf16 store"),
+        );
         assert!(
             err > 0.0,
             "{label}: rmsnorm's output is already bf16-representable — the missing store has \
@@ -1255,16 +1441,36 @@ fn mhc_reproduces_the_layer_goldens() {
         rounded
     };
 
-    let (y, post, comb) =
-        gpu_hc_pre(cfg, &h_in, &lw.hc_attn_fn, &lw.hc_attn_scale, &lw.hc_attn_base, S, iters);
-    assert_matches(&g("L0.pre.attn_norm_out"), &norm(&y, &lw.attn_norm, "attn"),
-                 "hc_pre(attn) then rmsnorm");
+    let (y, post, comb) = gpu_hc_pre(
+        cfg,
+        &h_in,
+        &lw.hc_attn_fn,
+        &lw.hc_attn_scale,
+        &lw.hc_attn_base,
+        S,
+        iters,
+    );
+    assert_matches(
+        &g("L0.pre.attn_norm_out"),
+        &norm(&y, &lw.attn_norm, "attn"),
+        "hc_pre(attn) then rmsnorm",
+    );
 
     let h1 = gpu_hc_post(cfg, &g("L0.pre.attn_out"), &h_in, &post, &comb, S);
-    let (y2, post2, comb2) =
-        gpu_hc_pre(cfg, &h1, &lw.hc_ffn_fn, &lw.hc_ffn_scale, &lw.hc_ffn_base, S, iters);
-    assert_matches(&g("L0.pre.ffn_norm_out"), &norm(&y2, &lw.ffn_norm, "ffn"),
-                 "hc_post(attn) then hc_pre(ffn) then rmsnorm");
+    let (y2, post2, comb2) = gpu_hc_pre(
+        cfg,
+        &h1,
+        &lw.hc_ffn_fn,
+        &lw.hc_ffn_scale,
+        &lw.hc_ffn_base,
+        S,
+        iters,
+    );
+    assert_matches(
+        &g("L0.pre.ffn_norm_out"),
+        &norm(&y2, &lw.ffn_norm, "ffn"),
+        "hc_post(attn) then hc_pre(ffn) then rmsnorm",
+    );
 
     let out = gpu_hc_post(cfg, &g("L0.pre.ffn_out"), &h1, &post2, &comb2, S);
     assert_matches(&g("L0.pre.out"), &out, "hc_post(ffn)");
@@ -1283,8 +1489,11 @@ fn the_mhc_launchers_refuse_what_they_claim_to() {
     let lw = &m.layers[0];
     let stream = HipStream::new().expect("stream");
     let h = zeros(cfg.hc_mult * cfg.dim * 4);
-    let (f, sc, b) = (to_device(&f32b(&lw.hc_attn_fn)), to_device(&f32b(&lw.hc_attn_scale)),
-                      to_device(&f32b(&lw.hc_attn_base)));
+    let (f, sc, b) = (
+        to_device(&f32b(&lw.hc_attn_fn)),
+        to_device(&f32b(&lw.hc_attn_scale)),
+        to_device(&f32b(&lw.hc_attn_base)),
+    );
     // Sized for the ACCEPTED case each launcher runs, which is the half of a guard test
     // that actually touches memory: `hc_pre` writes `s·dim`, `hc_post` writes `s·hc·dim`.
     // A single shared output buffer sized for `hc_pre` would let `hc_post`'s accepted arm
@@ -1295,17 +1504,38 @@ fn the_mhc_launchers_refuse_what_they_claim_to() {
     let mut comb = zeros(cfg.hc_mult * cfg.hc_mult * 4);
 
     // Addresses hoisted so the two closures below vary only their guarded arguments.
-    let (hp, fp, scp, bp_) = (h.ptr() as *const f32, f.ptr() as *const f32,
-                              sc.ptr() as *const f32, b.ptr() as *const f32);
-    let (yp, pp, cp) = (y.ptr_mut() as *mut f32, post.ptr_mut() as *mut f32,
-                        comb.ptr_mut() as *mut f32);
+    let (hp, fp, scp, bp_) = (
+        h.ptr() as *const f32,
+        f.ptr() as *const f32,
+        sc.ptr() as *const f32,
+        b.ptr() as *const f32,
+    );
+    let (yp, pp, cp) = (
+        y.ptr_mut() as *mut f32,
+        post.ptr_mut() as *mut f32,
+        comb.ptr_mut() as *mut f32,
+    );
     let ep = expanded.ptr_mut() as *mut f32;
     let pre = |s, hc, iters| {
         // SAFETY: every rejected case returns before a dereference, and the accepted one is
         // sized by the buffers above; all of them outlive the sync that follows it.
         unsafe {
-            launch_hc_pre(hp, fp, scp, bp_, s, hc, cfg.dim, iters, cfg.norm_eps, cfg.hc_eps, yp,
-                          pp, cp, stream.raw())
+            launch_hc_pre(
+                hp,
+                fp,
+                scp,
+                bp_,
+                s,
+                hc,
+                cfg.dim,
+                iters,
+                cfg.norm_eps,
+                cfg.hc_eps,
+                yp,
+                pp,
+                cp,
+                stream.raw(),
+            )
         }
         .map_err(|e| format!("{e:#}"))
     };
@@ -1327,13 +1557,15 @@ fn the_mhc_launchers_refuse_what_they_claim_to() {
         unsafe { launch_hc_post(yp, hp, pp, cp, s, hc, cfg.dim, ep, stream.raw()) }
             .map_err(|e| format!("{e:#}"))
     };
-    assert!(post_call(1, hc).is_ok(), "the accepted case must be accepted");
+    assert!(
+        post_call(1, hc).is_ok(),
+        "the accepted case must be accepted"
+    );
     device_sync().expect("device sync");
     assert_guards(vec![
         (1001, "hc_post zero tokens", post_call(0, hc)),
         (1002, "hc_post hc_mult 2", post_call(1, 2)),
     ]);
-
 }
 
 /// The Sinkhorn iteration count reaches the arithmetic.
@@ -1355,7 +1587,15 @@ fn sinkhorn_iteration_count_is_live() {
         .collect();
     assert!(cfg.hc_sinkhorn_iters >= 2, "this test subtracts one below");
     let run = |iters| {
-        gpu_hc_pre(cfg, &h, &lw.hc_attn_fn, &lw.hc_attn_scale, &lw.hc_attn_base, S, iters)
+        gpu_hc_pre(
+            cfg,
+            &h,
+            &lw.hc_attn_fn,
+            &lw.hc_attn_scale,
+            &lw.hc_attn_base,
+            S,
+            iters,
+        )
     };
     let (_, _, c20) = run(cfg.hc_sinkhorn_iters);
     let (_, _, c2) = run(2);
@@ -1364,15 +1604,21 @@ fn sinkhorn_iteration_count_is_live() {
     // threshold picked here: `sinkhorn_has_converged_long_before_iteration_20` asserts
     // `!identical(20, 2)`, and a magnitude threshold would be a weaker statement that could
     // pass for a kernel whose `iters` only tickled the low bits.
-    assert_ne!(bits(&c20), bits(&c2),
-               "2 and {} iterations agree — `iters` never reaches the kernel",
-               cfg.hc_sinkhorn_iters);
+    assert_ne!(
+        bits(&c20),
+        bits(&c2),
+        "2 and {} iterations agree — `iters` never reaches the kernel",
+        cfg.hc_sinkhorn_iters
+    );
     // The blind spot itself, asserted in the direction the oracle asserts it. If this ever
     // goes red, convergence has stopped holding on the GPU where it holds on the CPU — which
     // would mean `SinkhornOneFewerIter` becomes gateable AND that the two arithmetics have
     // diverged somewhere worth finding.
-    assert_eq!(bits(&c20), bits(&c19),
-               "19 and 20 iterations disagree on the GPU where they agree on the CPU");
+    assert_eq!(
+        bits(&c20),
+        bits(&c19),
+        "19 and 20 iterations disagree on the GPU where they agree on the CPU"
+    );
 }
 
 // =======================================================================================
@@ -1392,16 +1638,26 @@ fn ffn_out_matches_the_golden() {
     let layer = 0usize;
     let lw = &m.layers[layer];
     let (cap, _, ids) = capture(layer, 1);
-    let x = cap.float("L0.pre.ffn_norm_out").expect("ffn_norm_out golden").to_vec();
+    let x = cap
+        .float("L0.pre.ffn_norm_out")
+        .expect("ffn_norm_out golden")
+        .to_vec();
 
     let (gw, gi) = gpu_gate(cfg, lw, &gate_logits(lw, &x), ids[0] as usize);
     // The router's own goldens, exactly — a wrong selection here would otherwise show up
     // as a numeric miss at the end and be indistinguishable from an arithmetic bug.
-    let want_i: Vec<i32> =
-        cap.int("L0.pre.router_indices").expect("indices").iter().map(|&e| e as i32).collect();
+    let want_i: Vec<i32> = cap
+        .int("L0.pre.router_indices")
+        .expect("indices")
+        .iter()
+        .map(|&e| e as i32)
+        .collect();
     assert_eq!(want_i, gi, "router indices");
-    assert_matches(cap.float("L0.pre.router_weights").expect("router_weights"), &gw,
-                 "router weights");
+    assert_matches(
+        cap.float("L0.pre.router_weights").expect("router_weights"),
+        &gw,
+        "router weights",
+    );
 
     // ONE weight per expert, which is what `moe_gateup_f4`'s `wexpert` layout can express
     // — so a token routed TWICE to one expert would be unrepresentable, and the reference
@@ -1414,14 +1670,23 @@ fn ffn_out_matches_the_golden() {
     // load rather than inherit this assumption silently.
     let mut wexpert = vec![0.0f32; cfg.n_routed_experts];
     for (j, &e) in gi.iter().enumerate() {
-        assert_eq!(wexpert[e as usize], 0.0, "expert {e} was picked twice for one token");
+        assert_eq!(
+            wexpert[e as usize], 0.0,
+            "expert {e} was picked twice for one token"
+        );
         wexpert[e as usize] = gw[j];
     }
     let experts: Vec<&ExpertW> = (0..cfg.n_routed_experts).map(|e| &lw.experts[&e]).collect();
     let e = F4Experts::upload(&experts, Wiring::Correct);
-    let routed = Dispatch { cfg, experts: &e, x: &x, wexpert: &wexpert,
-                            swiglu_limit: cfg.swiglu_limit, quantize_x: true }
-        .run();
+    let routed = Dispatch {
+        cfg,
+        experts: &e,
+        x: &x,
+        wexpert: &wexpert,
+        swiglu_limit: cfg.swiglu_limit,
+        quantize_x: true,
+    }
+    .run();
 
     let shared = o.expert(&lw.shared, &x, 1, None, &mut Counters::default());
     let got: Vec<f32> = routed
@@ -1429,7 +1694,11 @@ fn ffn_out_matches_the_golden() {
         .zip(&shared)
         .map(|(a, b)| bf16_decode(bf16_encode(a + b)))
         .collect();
-    assert_matches(cap.float("L0.pre.ffn_out").expect("ffn_out golden"), &got, "ffn_out");
+    assert_matches(
+        cap.float("L0.pre.ffn_out").expect("ffn_out golden"),
+        &got,
+        "ffn_out",
+    );
 }
 
 // =======================================================================================
@@ -1482,8 +1751,10 @@ fn upload_fp8_shared(e: &ExpertW) -> Vec<(DeviceBuf, DeviceBuf)> {
                 (to_device(w), to_device(&f32b(&widened)))
             }
             WMat::Dense { .. } | WMat::Fp4 { .. } => {
-                panic!("the shared expert is fp8 e4m3 at 128x128 — `MoE.__init__` passes \
-                        `expert_dtype` only to the ROUTED experts")
+                panic!(
+                    "the shared expert is fp8 e4m3 at 128x128 — `MoE.__init__` passes \
+                        `expert_dtype` only to the ROUTED experts"
+                )
             }
         })
         .collect()
@@ -1502,8 +1773,12 @@ fn upload_fp8_shared(e: &ExpertW) -> Vec<(DeviceBuf, DeviceBuf)> {
 /// on it. There is no way to ask for the unclamped form: the launcher refuses `<= 0`, NaN
 /// and `+/-inf`
 /// and NaN, so "effectively unclamped" has to be spelled as a huge positive limit.
-fn gpu_shared_expert(cfg: &V4Config, w: &[(DeviceBuf, DeviceBuf)], x: &[f32], limit: f32)
-    -> Vec<f32> {
+fn gpu_shared_expert(
+    cfg: &V4Config,
+    w: &[(DeviceBuf, DeviceBuf)],
+    x: &[f32],
+    limit: f32,
+) -> Vec<f32> {
     let (dim, inter) = (cfg.dim, cfg.moe_inter_dim);
     let stream = HipStream::new().expect("hip stream");
     let (st, blk) = (stream.raw(), 128usize);
@@ -1518,19 +1793,55 @@ fn gpu_shared_expert(cfg: &V4Config, w: &[(DeviceBuf, DeviceBuf)], x: &[f32], li
     unsafe {
         launch_v4_act_quant(xq.ptr_mut().cast(), 1, dim, dim, blk, st).expect("act_quant x");
         let xp = xq.ptr().cast::<f32>();
-        launch_v4_gemv_fp8(xp, w[0].0.ptr(), sc(0), 1, inter, dim, blk, 1, g.ptr_mut().cast(), st)
-            .expect("w1");
-        launch_v4_gemv_fp8(xp, w[2].0.ptr(), sc(2), 1, inter, dim, blk, 1, u.ptr_mut().cast(), st)
-            .expect("w3");
+        launch_v4_gemv_fp8(
+            xp,
+            w[0].0.ptr(),
+            sc(0),
+            1,
+            inter,
+            dim,
+            blk,
+            1,
+            g.ptr_mut().cast(),
+            st,
+        )
+        .expect("w1");
+        launch_v4_gemv_fp8(
+            xp,
+            w[2].0.ptr(),
+            sc(2),
+            1,
+            inter,
+            dim,
+            blk,
+            1,
+            u.ptr_mut().cast(),
+            st,
+        )
+        .expect("w3");
         // IN PLACE into `g`: `h` becomes `w2`'s input, which is one fewer allocation and is
         // how `gpu.rs` already drives GLM's `swiglu`. Safe by the kernel's own note.
         launch_v4_swiglu_clamped(
-            g.ptr().cast(), u.ptr().cast(), inter, limit, g.ptr_mut().cast(), st,
+            g.ptr().cast(),
+            u.ptr().cast(),
+            inter,
+            limit,
+            g.ptr_mut().cast(),
+            st,
         )
         .expect("clamped swiglu");
         launch_v4_act_quant(g.ptr_mut().cast(), 1, inter, inter, blk, st).expect("act_quant h");
         launch_v4_gemv_fp8(
-            g.ptr().cast(), w[1].0.ptr(), sc(1), 1, dim, inter, blk, 1, out.ptr_mut().cast(), st,
+            g.ptr().cast(),
+            w[1].0.ptr(),
+            sc(1),
+            1,
+            dim,
+            inter,
+            blk,
+            1,
+            out.ptr_mut().cast(),
+            st,
         )
         .expect("w2");
     }
@@ -1562,8 +1873,14 @@ fn the_shared_expert_matches_the_oracle_where_the_clamp_never_binds() {
     let (cfg, m, _) = fixture();
     let x = draw_x("shared-x", cfg.dim, 1.0);
     let (want, events) = oracle_shared(Defect::None, &x, 0);
-    assert_eq!(events, 0, "this case is the UNCLAMPED half of the bracket — pick a lower scale");
-    assert!(want.iter().any(|v| v.abs() > 1e-6), "the oracle produced nothing to compare");
+    assert_eq!(
+        events, 0,
+        "this case is the UNCLAMPED half of the bracket — pick a lower scale"
+    );
+    assert!(
+        want.iter().any(|v| v.abs() > 1e-6),
+        "the oracle produced nothing to compare"
+    );
     let w = upload_fp8_shared(&m.layers[0].shared);
     let got = gpu_shared_expert(cfg, &w, &x, cfg.swiglu_limit);
     assert_matches(&want, &got, "shared expert (fp8), clamp not binding");
@@ -1605,12 +1922,20 @@ fn the_shared_expert_clamp_is_live_and_the_fixture_reaches_it() {
     );
     println!("shared expert: {events} clamp events at scale 48");
     let w = upload_fp8_shared(&m.layers[0].shared);
-    assert_matches(&want, &gpu_shared_expert(cfg, &w, &x, cfg.swiglu_limit), "clamped shared");
+    assert_matches(
+        &want,
+        &gpu_shared_expert(cfg, &w, &x, cfg.swiglu_limit),
+        "clamped shared",
+    );
 
     // Effectively unclamped, but POSITIVE — the launcher refuses 0 and NaN outright, which is
     // the stronger guarantee and the reason this arm goes the long way round.
     let unclamped = gpu_shared_expert(cfg, &w, &x, 1e6);
-    assert_disagrees(&want, &unclamped, "shared expert with the limit raised to 1e6");
+    assert_disagrees(
+        &want,
+        &unclamped,
+        "shared expert with the limit raised to 1e6",
+    );
     // No assertion that the defect oracle counted ZERO clamp events, and an earlier draft had
     // one. It could not fail: `Oracle::expert` sets `limit = 0.0` for this defect and both
     // increments of `swiglu_clamp_events` sit inside `if limit > 0.0`, so the count is
@@ -1619,7 +1944,11 @@ fn the_shared_expert_clamp_is_live_and_the_fixture_reaches_it() {
     // claim it was reaching for — that the defect really disables the clamp — is what the
     // comparison on the next line says, from the numbers rather than from a counter.
     let (want_unclamped, _) = oracle_shared(Defect::SwigluUnclamped, &x, 0);
-    assert_matches(&want_unclamped, &unclamped, "1e6 reproduces Defect::SwigluUnclamped");
+    assert_matches(
+        &want_unclamped,
+        &unclamped,
+        "1e6 reproduces Defect::SwigluUnclamped",
+    );
 }
 
 /// The clamp is ASYMMETRIC — `up` on both sides, `gate` only from above (model.py:606-607) —
@@ -1717,7 +2046,11 @@ fn the_shared_expert_gate_clamp_matches_and_the_asymmetry_is_below_resolution() 
     // and the measured 3.125e-2 is 6.9x the per-element bound, which is not a contradiction —
     // it is the accumulation. An earlier message here claimed the bound made a larger value
     // "impossible", which was false against the number printed on the very next line.
-    let (err, tol) = compare(&asym, &sym, "the two clamp shapes (recorded as UNRESOLVABLE)");
+    let (err, tol) = compare(
+        &asym,
+        &sym,
+        "the two clamp shapes (recorded as UNRESOLVABLE)",
+    );
     assert!(
         err <= tol,
         "the asymmetric and symmetric clamps now differ by err={err:.3e} > tol={tol:.3e} \
@@ -1748,8 +2081,8 @@ fn the_clamped_combine_is_bit_exact_elementwise() {
     // one: `10.001` rounds DOWN to 10.0 in bf16 (bf16 has 8 mantissa bits, so the codes near
     // 10 are 2^-5 = 0.03125 apart), so clamping before the round and after it differ on it.
     let probes: Vec<f32> = vec![
-        0.0, -0.0, 0.5, -0.5, 1.0, -1.0, 9.9, -9.9, 9.999, -9.999, 10.0, -10.0, 10.001,
-        -10.001, 10.0625, -10.0625, 12.0, -12.0, 40.0, -40.0, 1e3, -1e3,
+        0.0, -0.0, 0.5, -0.5, 1.0, -1.0, 9.9, -9.9, 9.999, -9.999, 10.0, -10.0, 10.001, -10.001,
+        10.0625, -10.0625, 12.0, -12.0, 40.0, -40.0, 1e3, -1e3,
     ];
     let (mut g, mut u) = (Vec::new(), Vec::new());
     for &a in &probes {
@@ -1784,7 +2117,12 @@ fn the_clamped_combine_is_bit_exact_elementwise() {
     // SAFETY: three live `n`-element f32 buffers, outliving the sync in `sync_f32`.
     unsafe {
         launch_v4_swiglu_clamped(
-            gb.ptr().cast(), ub.ptr().cast(), n, limit, hb.ptr_mut().cast(), stream.raw(),
+            gb.ptr().cast(),
+            ub.ptr().cast(),
+            n,
+            limit,
+            hb.ptr_mut().cast(),
+            stream.raw(),
         )
     }
     .expect("v4_swiglu_clamped");
@@ -1806,7 +2144,11 @@ fn the_clamped_combine_is_bit_exact_elementwise() {
     // The kernel-facing half is the bitwise `want` vs `got` check below, which is where a
     // symmetric kernel actually goes red.
     let sym = combine(&|x: f32| x.clamp(-limit, limit));
-    let moved = sym.iter().zip(&want).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+    let moved = sym
+        .iter()
+        .zip(&want)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
     assert!(
         moved > 0,
         "the symmetric and asymmetric gate clamps are BIT-IDENTICAL over {} probe pairs, so \
@@ -1814,18 +2156,36 @@ fn the_clamped_combine_is_bit_exact_elementwise() {
          one — the probe table has no gate value below -{limit}",
         g.len()
     );
-    println!("asymmetric vs symmetric gate clamp: {moved}/{} probe pairs differ", g.len());
+    println!(
+        "asymmetric vs symmetric gate clamp: {moved}/{} probe pairs differ",
+        g.len()
+    );
     // An EDIT TRIPWIRE, not a measurement, and worth being plain about which: `probes` is a
     // literal fifteen lines up, so this folds to a constant on today's tree and can only go
     // red if someone narrows that table. That is exactly the change it is here to stop — a
     // probe set inside the bound would compare two functions the clamp never touches — but it
     // is not evidence about anything the kernel does.
-    let clamped_any = g.iter().zip(&u).any(|(&a, &b)| a > limit || b.abs() > limit);
-    assert!(clamped_any, "no probe crosses the limit — the table was narrowed");
-    if let Some(i) = want.iter().zip(&got).position(|(a, b)| a.to_bits() != b.to_bits()) {
+    let clamped_any = g
+        .iter()
+        .zip(&u)
+        .any(|(&a, &b)| a > limit || b.abs() > limit);
+    assert!(
+        clamped_any,
+        "no probe crosses the limit — the table was narrowed"
+    );
+    if let Some(i) = want
+        .iter()
+        .zip(&got)
+        .position(|(a, b)| a.to_bits() != b.to_bits())
+    {
         panic!(
             "element {i} differs: g={:?} u={:?} want={:?} ({:#010x}) got={:?} ({:#010x})",
-            g[i], u[i], want[i], want[i].to_bits(), got[i], got[i].to_bits()
+            g[i],
+            u[i],
+            want[i],
+            want[i].to_bits(),
+            got[i],
+            got[i].to_bits()
         );
     }
 }
@@ -1855,21 +2215,37 @@ fn v4_swiglu_clamped_guards() {
     // SAFETY: each call returns at an argument guard, before any pointer is read.
     assert_guards(unsafe {
         vec![
-            (1001, "zero elements", launch_v4_swiglu_clamped(p, p, 0, 10.0, pm, nul)
-                .map_err(|e| e.to_string())),
-            (1006, "an unclamped limit", launch_v4_swiglu_clamped(p, p, 16, 0.0, pm, nul)
-                .map_err(|e| e.to_string())),
-            (1006, "a negative limit", launch_v4_swiglu_clamped(p, p, 16, -1.0, pm, nul)
-                .map_err(|e| e.to_string())),
-            (1006, "a NaN limit", launch_v4_swiglu_clamped(p, p, 16, f32::NAN, pm, nul)
-                .map_err(|e| e.to_string())),
+            (
+                1001,
+                "zero elements",
+                launch_v4_swiglu_clamped(p, p, 0, 10.0, pm, nul).map_err(|e| e.to_string()),
+            ),
+            (
+                1006,
+                "an unclamped limit",
+                launch_v4_swiglu_clamped(p, p, 16, 0.0, pm, nul).map_err(|e| e.to_string()),
+            ),
+            (
+                1006,
+                "a negative limit",
+                launch_v4_swiglu_clamped(p, p, 16, -1.0, pm, nul).map_err(|e| e.to_string()),
+            ),
+            (
+                1006,
+                "a NaN limit",
+                launch_v4_swiglu_clamped(p, p, 16, f32::NAN, pm, nul).map_err(|e| e.to_string()),
+            ),
             // +inf is the case a `!(limit > 0.0f)` guard ADMITS, and it disables the clamp
             // exactly as thoroughly as `limit = 0` would: `fminf(gt, inf)` is `gt`. It sits
             // next to the NaN row deliberately — the two are the same defect from opposite
             // ends of the float line, and having only one of them on the page is how the
             // other stayed open.
-            (1006, "an infinite limit", launch_v4_swiglu_clamped(p, p, 16, f32::INFINITY, pm, nul)
-                .map_err(|e| e.to_string())),
+            (
+                1006,
+                "an infinite limit",
+                launch_v4_swiglu_clamped(p, p, 16, f32::INFINITY, pm, nul)
+                    .map_err(|e| e.to_string()),
+            ),
         ]
     });
 }
@@ -1894,7 +2270,10 @@ fn v4_swiglu_clamped_guards() {
 #[test]
 fn the_fp4_dispatch_hash_pins_the_clamp_hoist() {
     let c = Case::new(0, "moe-x-big", 48.0);
-    assert!(c.clamp_events > 0, "the hoisted clamp must be exercised by the case that pins it");
+    assert!(
+        c.clamp_events > 0,
+        "the hoisted clamp must be exercised by the case that pins it"
+    );
     let got = c.gpu();
     // FNV-1a over the bit patterns. Order-sensitive and 64-bit, so two runs that agree here
     // agree element for element; a sum or an XOR would not say that.
@@ -1947,7 +2326,10 @@ fn assert_matches(want: &[f32], got: &[f32], label: &str) {
 fn assert_guards(cases: Vec<(u32, &str, Result<(), String>)>) {
     for (want, case, r) in cases {
         let msg = r.expect_err(case);
-        assert!(msg.contains(&want.to_string()), "{case}: want guard {want}, got {msg:?}");
+        assert!(
+            msg.contains(&want.to_string()),
+            "{case}: want guard {want}, got {msg:?}"
+        );
     }
 }
 

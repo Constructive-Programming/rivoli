@@ -36,9 +36,10 @@ fn checkpoint() -> Option<String> {
 /// Every tensor name in the index, which needs no shard to be present — so this runs
 /// against a partially-downloaded checkpoint too.
 fn index_names(dir: &str) -> HashSet<String> {
-    let v: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(format!("{dir}/model.safetensors.index.json")).unwrap())
-            .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(format!("{dir}/model.safetensors.index.json")).unwrap(),
+    )
+    .unwrap();
     v["weight_map"]
         .as_object()
         .unwrap()
@@ -139,14 +140,23 @@ fn config_dims_match_the_tensor_shapes() {
     // ratio 0 (no compressor), ratio 4 (compressor + indexer), ratio 128 (compressor only).
     for l in [0, 2, 3] {
         let want = [
-            (format!("layers.{l}.attn.wq_a.weight"), vec![cfg.q_lora_rank, cfg.hidden]),
+            (
+                format!("layers.{l}.attn.wq_a.weight"),
+                vec![cfg.q_lora_rank, cfg.hidden],
+            ),
             (
                 format!("layers.{l}.attn.wq_b.weight"),
                 vec![cfg.n_heads * cfg.head_dim, cfg.q_lora_rank],
             ),
-            (format!("layers.{l}.attn.wkv.weight"), vec![cfg.head_dim, cfg.hidden]),
+            (
+                format!("layers.{l}.attn.wkv.weight"),
+                vec![cfg.head_dim, cfg.hidden],
+            ),
             (format!("layers.{l}.attn.attn_sink"), vec![cfg.n_heads]),
-            (format!("layers.{l}.ffn.gate.weight"), vec![cfg.n_experts, cfg.hidden]),
+            (
+                format!("layers.{l}.ffn.gate.weight"),
+                vec![cfg.n_experts, cfg.hidden],
+            ),
             (
                 format!("layers.{l}.hc_attn_fn"),
                 vec![24, cfg.hc_mult * cfg.hidden],
@@ -157,11 +167,13 @@ fn config_dims_match_the_tensor_shapes() {
         }
         if cfg.layer_has_indexer(l).unwrap() {
             assert_eq!(
-                st.shape(&format!("layers.{l}.attn.indexer.wq_b.weight")).unwrap(),
+                st.shape(&format!("layers.{l}.attn.indexer.wq_b.weight"))
+                    .unwrap(),
                 &[cfg.index_n_heads * cfg.index_head_dim, cfg.q_lora_rank]
             );
             assert_eq!(
-                st.shape(&format!("layers.{l}.attn.indexer.weights_proj.weight")).unwrap(),
+                st.shape(&format!("layers.{l}.attn.indexer.weights_proj.weight"))
+                    .unwrap(),
                 &[cfg.index_n_heads, cfg.hidden]
             );
         }

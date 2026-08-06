@@ -181,7 +181,11 @@ pub fn rope_for_layer(compressed: RopeParams, rope_theta: f32, kind: LayerKind) 
         // base theta travels with it. Keeping 160000 here while dropping YaRN is
         // `Defect::RopeNoYarn` -- the frequencies stay plausible at every scale, which is
         // what makes it the insidious half of the selection.
-        RopeParams { theta: rope_theta, original_seq_len: 0, ..compressed }
+        RopeParams {
+            theta: rope_theta,
+            original_seq_len: 0,
+            ..compressed
+        }
     }
 }
 
@@ -226,8 +230,9 @@ pub fn rope_for_layer(compressed: RopeParams, rope_theta: f32, kind: LayerKind) 
 pub fn freqs_cis(p: RopeParams, seqlen: usize) -> Vec<(f32, f32)> {
     let dim = p.rope_head_dim;
     let half = dim / 2;
-    let mut freqs: Vec<f32> =
-        (0..half).map(|i| 1.0 / p.theta.powf((2 * i) as f32 / dim as f32)).collect();
+    let mut freqs: Vec<f32> = (0..half)
+        .map(|i| 1.0 / p.theta.powf((2 * i) as f32 / dim as f32))
+        .collect();
     if p.original_seq_len > 0 {
         let base = f64::from(p.theta);
         let fcd = |rot: f64| {
@@ -239,7 +244,11 @@ pub fn freqs_cis(p: RopeParams, seqlen: usize) -> Vec<(f32, f32)> {
         // `linear_ramp_factor`'s `if min == max: max += 0.001` -- a guard against a zero
         // denominator, kept because dropping it turns a degenerate config into a NaN table
         // rather than into the reference's (arbitrary but finite) ramp.
-        let (min, max) = if low == high { (low, high + 0.001) } else { (low, high) };
+        let (min, max) = if low == high {
+            (low, high + 0.001)
+        } else {
+            (low, high)
+        };
         let (min, max) = (min as f32, max as f32);
         for (i, f) in freqs.iter_mut().enumerate() {
             let smooth = 1.0 - ((i as f32 - min) / (max - min)).clamp(0.0, 1.0);
@@ -266,7 +275,10 @@ pub fn window_topk(win: usize, seqlen: usize, start_pos: usize) -> Vec<Vec<i32>>
     // See `compress_topk`: the decode branches ignore `seqlen`, so a caller passing more
     // than one query row at `start_pos > 0` gets one row back for N queries and no error.
     // rivoli ships speculative decode on by default, so that caller is not hypothetical.
-    debug_assert!(start_pos == 0 || seqlen == 1, "decode is one query row (bsz=1 scope cut)");
+    debug_assert!(
+        start_pos == 0 || seqlen == 1,
+        "decode is one query row (bsz=1 scope cut)"
+    );
     if start_pos >= win.saturating_sub(1) && start_pos > 0 {
         // Ring is full: read oldest-first, starting just past the slot about to be
         // overwritten. `start_pos %= window_size` in the reference.
@@ -313,14 +325,23 @@ pub fn compress_topk(
     start_pos: usize,
     offset: usize,
 ) -> Vec<Vec<i32>> {
-    let Some(ratio) = kind.compressor_ratio() else { return Vec::new() };
+    let Some(ratio) = kind.compressor_ratio() else {
+        return Vec::new();
+    };
     // One row per query. `Attention.forward` zips this against the window list, so a decode
     // call carrying more than one query row would silently score every speculative row
     // against row 0's index set. The oracle asserts the same thing at its own call site
     // (`forward.rs:1412`) and calls it what ENFORCES the bsz=1 scope cut.
-    debug_assert!(start_pos == 0 || seqlen == 1, "decode is one query row (bsz=1 scope cut)");
+    debug_assert!(
+        start_pos == 0 || seqlen == 1,
+        "decode is one query row (bsz=1 scope cut)"
+    );
     if start_pos > 0 {
-        vec![(0..(start_pos + 1) / ratio).map(|i| (i + offset) as i32).collect()]
+        vec![
+            (0..(start_pos + 1) / ratio)
+                .map(|i| (i + offset) as i32)
+                .collect(),
+        ]
     } else {
         (0..seqlen)
             .map(|t| {
@@ -330,7 +351,13 @@ pub fn compress_topk(
                     // reference writes this as `arange(1, seqlen+1) // ratio`, so row `t`
                     // compares against `(t+1) // ratio` -- off-by-one here silently grants
                     // each query one block of the future.
-                    .map(|c| if c >= (t + 1) / ratio { -1 } else { (c + offset) as i32 })
+                    .map(|c| {
+                        if c >= (t + 1) / ratio {
+                            -1
+                        } else {
+                            (c + offset) as i32
+                        }
+                    })
                     .collect()
             })
             .collect()
@@ -363,8 +390,14 @@ pub fn should_compress(kind: LayerKind, seqlen: usize, start_pos: usize) -> bool
     // `is_multiple_of(0)` (always false) at decode -- two different answers for one layer,
     // and the prefill one would send every ratio-0 layer into `compress_topk` to divide by
     // zero. A decode-only smoke test would not have shown it.
-    let Some(ratio) = kind.compressor_ratio() else { return false };
-    if start_pos == 0 { seqlen >= ratio } else { (start_pos + 1).is_multiple_of(ratio) }
+    let Some(ratio) = kind.compressor_ratio() else {
+        return false;
+    };
+    if start_pos == 0 {
+        seqlen >= ratio
+    } else {
+        (start_pos + 1).is_multiple_of(ratio)
+    }
 }
 
 /// Where this call's compressed block(s) belong in the **persistent** KV cache — the
@@ -561,7 +594,12 @@ impl Geom {
     /// checkpoint and belongs at the wall where every launcher sees it — but it does mean a
     /// `Geom` can exist that no launcher will accept, and the error names a code and not a
     /// field.
-    pub fn attention(kind: LayerKind, d: usize, rope_head_dim: usize, norm_eps: f32) -> Option<Self> {
+    pub fn attention(
+        kind: LayerKind,
+        d: usize,
+        rope_head_dim: usize,
+        norm_eps: f32,
+    ) -> Option<Self> {
         Self::build(kind, d, rope_head_dim, norm_eps, Quantize::PartialFp8)
     }
 
@@ -924,7 +962,12 @@ mod device {
             // SAFETY: as above; `b.fin.out` is one row of `d` by its field contract.
             unsafe {
                 launch_v4_compress_pool_decode(
-                    b.kv_state, b.score_state, &b.fin, g.abi(), start_pos, stream,
+                    b.kv_state,
+                    b.score_state,
+                    &b.fin,
+                    g.abi(),
+                    start_pos,
+                    stream,
                 )?;
             }
             1

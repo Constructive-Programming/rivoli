@@ -76,13 +76,13 @@
 use crate::artifact::model::V4Config;
 use crate::artifact::quant::{FP8_BLOCK, f4_expert_stride, read_f32};
 use crate::attn::{Sel, v4, v4_topk_idxs};
-use crate::backend::{NULL_STREAM, Stream};
 use crate::backend::hip::{
     ExpertDescF4, device_sync, fill_u32, launch_act_quant_f8, launch_argmax, launch_gemv_f32,
     launch_hc_post, launch_hc_pre, launch_moe_acc_drain, launch_moe_expert_range_f4, launch_swiglu,
     launch_v4_dense_gemm_bf16, launch_v4_embed_bf16_row, launch_v4_gemv_fp8, launch_v4_hc_head,
     launch_v4_rmsnorm, memcpy_dtod,
 };
+use crate::backend::{NULL_STREAM, Stream};
 use crate::gpu::as_le_bytes;
 use crate::math::{Scoring, f32_to_bf16, route_into};
 use crate::memory::device::DeviceBuf;
@@ -746,8 +746,8 @@ impl V4Engine {
         let idx_cols = cfg.sliding_window + max_ctx.div_ceil(INDEXED_RATIO);
         let mut layers = Vec::with_capacity(range.len());
         for l in range.clone() {
-            let kind =
-                LayerKind::from_config(&cfg, l).with_context(|| format!("classifying layer {l}"))?;
+            let kind = LayerKind::from_config(&cfg, l)
+                .with_context(|| format!("classifying layer {l}"))?;
             // The pin's compressor for this layer, so `Comp` can narrow its weights. Read
             // through `V4Pin::layer`, which applies the artifact-order offset exactly once.
             let cw = pin.layer(l)?.compressor;
@@ -962,8 +962,8 @@ impl V4Engine {
             );
             return Ok(());
         };
-        let (persist_base, want) = persist
-            .context("compress_dst named a selection destination and no persistent one")?;
+        let (persist_base, want) =
+            persist.context("compress_dst named a selection destination and no persistent one")?;
         // The same tripwire in the other direction, and this one compares COUNTS rather than
         // presence: `compress` emits `seqlen / ratio` at prefill and 1 at decode, and
         // `compress_dst` says the same thing from the same inputs. Both memcpys below are sized
@@ -1296,7 +1296,8 @@ impl V4Engine {
             self.descs_host[e] = desc_of_f4(s);
         }
         self.descs.copy_in_at(0, as_le_bytes(&self.descs_host))?;
-        self.wexpert.copy_in_at(0, as_le_bytes(&self.wexpert_host))?;
+        self.wexpert
+            .copy_in_at(0, as_le_bytes(&self.wexpert_host))?;
 
         // SAFETY: `xq` holds `max_m * dim` f32 and `t < m <= max_m`.
         let x = unsafe { self.xq.ptr().cast::<f32>().add(t * dim) };
@@ -1343,9 +1344,19 @@ impl V4Engine {
                 // accumulate into row 1 so the two streams never share a cache line.
                 unsafe {
                     launch_moe_expert_range_f4(
-                        x, dim, inter, e, 1, n_desc, descs, wexpert, limit, h,
+                        x,
+                        dim,
+                        inter,
+                        e,
+                        1,
+                        n_desc,
+                        descs,
+                        wexpert,
+                        limit,
+                        h,
                         if resident { acc } else { acc.add(dim) },
-                        1, stream,
+                        1,
+                        stream,
                     )?;
                 }
             }
@@ -1399,8 +1410,30 @@ impl V4Engine {
         // outliving this engine; `g`/`u` are `max_m * inter` and `out` is `max_m * dim`, four
         // distinct allocations.
         unsafe {
-            launch_v4_gemv_fp8(xq, gate.packed, gate.scale, m, inter, dim, FP8_BLOCK, 1, g, NULL_STREAM)?;
-            launch_v4_gemv_fp8(xq, up.packed, up.scale, m, inter, dim, FP8_BLOCK, 1, u, NULL_STREAM)?;
+            launch_v4_gemv_fp8(
+                xq,
+                gate.packed,
+                gate.scale,
+                m,
+                inter,
+                dim,
+                FP8_BLOCK,
+                1,
+                g,
+                NULL_STREAM,
+            )?;
+            launch_v4_gemv_fp8(
+                xq,
+                up.packed,
+                up.scale,
+                m,
+                inter,
+                dim,
+                FP8_BLOCK,
+                1,
+                u,
+                NULL_STREAM,
+            )?;
             // See the doc above: unclamped, and the wrong silu form. One line, and one
             // contribution in seven of every layer's FFN.
             launch_swiglu(g, u, m * inter, g)?;
@@ -1411,7 +1444,16 @@ impl V4Engine {
             // WRITES `sub` — does not accumulate into it. `MoE.forward` starts from `y = zeros`
             // and the routed drain adds on top; see `routed_experts`.
             launch_v4_gemv_fp8(
-                g, down.packed, down.scale, m, dim, inter, FP8_BLOCK, 1, out, NULL_STREAM,
+                g,
+                down.packed,
+                down.scale,
+                m,
+                dim,
+                inter,
+                FP8_BLOCK,
+                1,
+                out,
+                NULL_STREAM,
             )?;
         }
         Ok(())
@@ -1445,7 +1487,15 @@ impl V4Engine {
             let logits = self.gate_logits.ptr_mut().cast::<f32>();
             let x0 = xw.cast::<f32>();
             for t in 0..m {
-                launch_gemv_f32(x0.add(t * dim), gate_w, n_experts, dim, 1, logits.add(t * n_experts), NULL_STREAM)?;
+                launch_gemv_f32(
+                    x0.add(t * dim),
+                    gate_w,
+                    n_experts,
+                    dim,
+                    1,
+                    logits.add(t * n_experts),
+                    NULL_STREAM,
+                )?;
             }
             // Now quantize, for the experts. In place at block 128 over the full row, which is
             // what every quantized `Linear` in the reference performs.
@@ -1509,7 +1559,14 @@ impl V4Engine {
             // token and read the norm weight past its allocation. V4's `RMSNorm` returns bf16 and
             // this kernel rounds, which is S3 requirement 1 satisfied by SELECTION rather than by
             // editing a shared kernel.
-            launch_v4_rmsnorm(self.xw.ptr_mut().cast(), norm, m, dim, self.dims.norm_eps, NULL_STREAM)?;
+            launch_v4_rmsnorm(
+                self.xw.ptr_mut().cast(),
+                norm,
+                m,
+                dim,
+                self.dims.norm_eps,
+                NULL_STREAM,
+            )?;
         }
         Ok(())
     }
@@ -1531,7 +1588,14 @@ impl V4Engine {
             if ffn {
                 self.moe(layer, m)?;
             } else {
-                self.attention_block(layer, Phase { seqlen: m, start_pos }, null)?;
+                self.attention_block(
+                    layer,
+                    Phase {
+                        seqlen: m,
+                        start_pos,
+                    },
+                    null,
+                )?;
             }
 
             let dst = 1 - self.cur;
@@ -1904,7 +1968,11 @@ impl V4Engine {
         start_pos: usize,
     ) -> Result<Vec<f32>> {
         let m = self.begin_step(ids, start_pos).context("probe_pre_norm")?;
-        ensure!(self.loaded_rows == m, "probe_pre_norm: residual holds {} rows, not {m}", self.loaded_rows);
+        ensure!(
+            self.loaded_rows == m,
+            "probe_pre_norm: residual holds {} rows, not {m}",
+            self.loaded_rows
+        );
         self.pre_norm(layer, ffn, m)?;
         self.probe_working(m)
     }
@@ -1959,7 +2027,11 @@ impl V4Engine {
     /// still holds that layer's quantized `ffn_norm` output until the next layer's attention
     /// overwrites it. It recomputes the two GEMVs rather than reading `sh_g` back, because
     /// `shared_expert` writes the SwiGLU product over `sh_g` in place.
-    pub fn probe_shared_operands(&mut self, layer: usize, m: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+    pub fn probe_shared_operands(
+        &mut self,
+        layer: usize,
+        m: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
         let (dim, inter) = (self.cfg.hidden, self.cfg.moe_inter);
         let lp = self.pin.layer(layer)?;
         let (gate, up) = (lp.shared.gate, lp.shared.up);
@@ -1968,8 +2040,30 @@ impl V4Engine {
         let u = self.sh_u.ptr_mut().cast::<f32>();
         // SAFETY: identical to `shared_expert`'s first two launches, on the same buffers.
         unsafe {
-            launch_v4_gemv_fp8(xq, gate.packed, gate.scale, m, inter, dim, FP8_BLOCK, 1, g, NULL_STREAM)?;
-            launch_v4_gemv_fp8(xq, up.packed, up.scale, m, inter, dim, FP8_BLOCK, 1, u, NULL_STREAM)?;
+            launch_v4_gemv_fp8(
+                xq,
+                gate.packed,
+                gate.scale,
+                m,
+                inter,
+                dim,
+                FP8_BLOCK,
+                1,
+                g,
+                NULL_STREAM,
+            )?;
+            launch_v4_gemv_fp8(
+                xq,
+                up.packed,
+                up.scale,
+                m,
+                inter,
+                dim,
+                FP8_BLOCK,
+                1,
+                u,
+                NULL_STREAM,
+            )?;
         }
         device_sync()?;
         Ok((
@@ -2065,7 +2159,11 @@ mod tests {
     /// is still fine. Off by one here is 4 positions of silently-dropped context.
     #[test]
     fn the_positional_selection_ceiling_is_the_indexers_truncation_point() {
-        assert_eq!(positional_context_limit(512), 2052, "the shipped config's bound");
+        assert_eq!(
+            positional_context_limit(512),
+            2052,
+            "the shipped config's bound"
+        );
         // The bound is on `start_pos + seqlen`, so it scales with `index_topk` and not with the
         // layer count or the window. A config with a smaller indexer is a tighter engine.
         assert_eq!(positional_context_limit(0), INDEXED_RATIO);
@@ -2101,16 +2199,32 @@ mod tests {
         // because `sparse_attn` reads `torch.cat([kv, kv_compress])` and indexes it as one space.
         let seqlen = 12usize;
         let sel_base = compress_offset(WIN, seqlen, 0);
-        assert_eq!(compress_dst(kind, WIN, seqlen, 0), Some((WIN, seqlen / RATIO)));
-        assert_eq!(compress_dst(kind, sel_base, seqlen, 0), Some((seqlen, seqlen / RATIO)));
-        assert_ne!(WIN, seqlen, "the two prefill destinations must differ, or this proves nothing");
+        assert_eq!(
+            compress_dst(kind, WIN, seqlen, 0),
+            Some((WIN, seqlen / RATIO))
+        );
+        assert_eq!(
+            compress_dst(kind, sel_base, seqlen, 0),
+            Some((seqlen, seqlen / RATIO))
+        );
+        assert_ne!(
+            WIN, seqlen,
+            "the two prefill destinations must differ, or this proves nothing"
+        );
 
         // ...and at decode they COINCIDE, which is what says decode has one destination rather
         // than two. The loop branches on this equality and not on the phase, so it is the
         // property that makes the single branch correct.
         for pos in [15usize, 23, 31] {
-            assert_eq!(compress_offset(WIN, 1, pos), WIN, "decode's selection base IS the ring base");
-            assert_eq!(compress_dst(kind, WIN, 1, pos), Some((WIN + pos / RATIO, 1)));
+            assert_eq!(
+                compress_offset(WIN, 1, pos),
+                WIN,
+                "decode's selection base IS the ring base"
+            );
+            assert_eq!(
+                compress_dst(kind, WIN, 1, pos),
+                Some((WIN + pos / RATIO, 1))
+            );
         }
 
         // **The loop's OWN half: the predicate its single branch rests on.** `compress_and_place`
@@ -2119,7 +2233,11 @@ mod tests {
         // coincide at decode. A review found the registry row claiming a property of the layer loop
         // while both cited tests exercised only the pure functions; this is the one line that ties
         // them together, and it is device-free.
-        assert_ne!(compress_offset(WIN, seqlen, 0), WIN, "prefill: two destinations");
+        assert_ne!(
+            compress_offset(WIN, seqlen, 0),
+            WIN,
+            "prefill: two destinations"
+        );
         for pos in [15usize, 23, 31] {
             assert_eq!(compress_offset(WIN, 1, pos), WIN, "decode: one destination");
         }
@@ -2127,7 +2245,11 @@ mod tests {
         // prompt length is not the window, so a prompt of exactly `WIN` tokens collapses them.
         // Asserted so a reader knows the branch takes the one-write path there too, correctly —
         // both destinations are row `WIN` and one memcpy serves both.
-        assert_eq!(compress_offset(WIN, WIN, 0), WIN, "a prompt of exactly `window` tokens coincides");
+        assert_eq!(
+            compress_offset(WIN, WIN, 0),
+            WIN,
+            "a prompt of exactly `window` tokens coincides"
+        );
 
         // The registry row's "never the next free slot", on the only script shape that separates
         // the two rules: skip 23. The rules AGREE on every contiguous script, which is asserted
@@ -2143,10 +2265,18 @@ mod tests {
             (positional, appending)
         };
         let (pos_gap, app_gap) = rows(&[15, 31]);
-        assert_eq!((pos_gap.as_slice(), app_gap.as_slice()), (&[9, 11][..], &[8, 9][..]));
-        assert_ne!(pos_gap, app_gap, "a skipped step MUST separate the two placers");
+        assert_eq!(
+            (pos_gap.as_slice(), app_gap.as_slice()),
+            (&[9, 11][..], &[8, 9][..])
+        );
+        assert_ne!(
+            pos_gap, app_gap,
+            "a skipped step MUST separate the two placers"
+        );
         let (pos_c, app_c) = rows(&[7, 15, 23, 31]);
-        assert_eq!(pos_c, app_c, "contiguous: the two rules agree, which is why the gap is needed");
+        assert_eq!(
+            pos_c, app_c,
+            "contiguous: the two rules agree, which is why the gap is needed"
+        );
     }
-
 }

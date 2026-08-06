@@ -34,10 +34,22 @@ fn engine_sel(
     start_pos: usize,
 ) -> Vec<Vec<i64>> {
     let mut flat = Vec::new();
-    let sel = Sel { win, kind, index_topk, seqlen, start_pos };
+    let sel = Sel {
+        win,
+        kind,
+        index_topk,
+        seqlen,
+        start_pos,
+    };
     let (rows, cols) = v4_topk_idxs(sel, &mut flat).expect("selection within index_topk");
-    assert_eq!(flat.len(), rows * cols, "returned shape does not describe the buffer");
-    flat.chunks_exact(cols).map(|r| r.iter().map(|&v| i64::from(v)).collect()).collect()
+    assert_eq!(
+        flat.len(),
+        rows * cols,
+        "returned shape does not describe the buffer"
+    );
+    flat.chunks_exact(cols)
+        .map(|r| r.iter().map(|&v| i64::from(v)).collect())
+        .collect()
 }
 
 /// Every shape the ratio-0 layers reach, plus the boundaries around the ring wrap.
@@ -55,7 +67,15 @@ fn cases() -> Vec<(usize, usize, usize)> {
         }
         // Decode, straddling the wrap. `start_pos > 0` throughout: `start_pos == 0` is
         // prefill by definition in the reference.
-        for sp in [1usize, win - 2, win - 1, win, win + 1, 3 * win - 1, 5 * win + 2] {
+        for sp in [
+            1usize,
+            win - 2,
+            win - 1,
+            win,
+            win + 1,
+            3 * win - 1,
+            5 * win + 2,
+        ] {
             if sp > 0 {
                 v.push((win, 1, sp));
             }
@@ -88,14 +108,28 @@ fn the_comparison_above_can_fail() {
     let right = window_topk(win, 1, sp);
     // Off-by-one on the wrap boundary: rotate from `start_pos % win` instead of
     // `start_pos % win + 1`, so the newest slot is listed first instead of last.
-    let rotated_wrong: Vec<Vec<i64>> =
-        vec![(sp % win..win).chain(0..sp % win).map(|i| i as i64).collect()];
-    assert_ne!(rotated_wrong, right, "the wrap boundary is not observable at win={win}");
+    let rotated_wrong: Vec<Vec<i64>> = vec![
+        (sp % win..win)
+            .chain(0..sp % win)
+            .map(|i| i as i64)
+            .collect(),
+    ];
+    assert_ne!(
+        rotated_wrong, right,
+        "the wrap boundary is not observable at win={win}"
+    );
     // Ascending slots — right while the ring is filling, wrong once it has wrapped.
     let unrotated: Vec<Vec<i64>> = vec![(0..win).map(|i| i as i64).collect()];
-    assert_ne!(unrotated, right, "rotation is not observable at start_pos={sp}");
+    assert_ne!(
+        unrotated, right,
+        "rotation is not observable at start_pos={sp}"
+    );
     // A prefill row list handed to a decode step: right length, wrong space entirely.
-    assert_ne!(window_topk(win, win, 0)[win - 1], right[0], "prefill and decode coincide");
+    assert_ne!(
+        window_topk(win, win, 0)[win - 1],
+        right[0],
+        "prefill and decode coincide"
+    );
 }
 
 #[test]
@@ -158,10 +192,28 @@ fn win_one_diverges_from_the_reference_and_is_unreachable() {
     // would make the model attend only its own token. The assertion is here so that the
     // divergence is a decision on the record and not a latent surprise for S3.
     let mut flat = Vec::new();
-    let (rows, cols) = v4_topk_idxs(Sel { win: 1, kind: LayerKind::Plain, index_topk: 0, seqlen: 3, start_pos: 0 }, &mut flat).unwrap();
-    assert_eq!((rows, cols), (3, 1), "win=1 prefill no longer takes the prefill branch");
+    let (rows, cols) = v4_topk_idxs(
+        Sel {
+            win: 1,
+            kind: LayerKind::Plain,
+            index_topk: 0,
+            seqlen: 3,
+            start_pos: 0,
+        },
+        &mut flat,
+    )
+    .unwrap();
+    assert_eq!(
+        (rows, cols),
+        (3, 1),
+        "win=1 prefill no longer takes the prefill branch"
+    );
     assert_eq!(flat, vec![0, 1, 2]);
-    assert_eq!(engine_rows(1, 3, 0), window_topk(1, 3, 0), "engine and oracle still agree");
+    assert_eq!(
+        engine_rows(1, 3, 0),
+        window_topk(1, 3, 0),
+        "engine and oracle still agree"
+    );
 }
 
 /// **`wo_a` may be read as fp8 and dequantized rather than held as bf16 — and here is
@@ -191,7 +243,11 @@ fn fp8_times_a_power_of_two_is_exact_in_bf16_over_the_range_the_checkpoint_uses(
             if v.is_nan() {
                 continue;
             }
-            assert!(exact(v * s), "e4m3 {b:#04x} ({v}) * 2^{} is not exact in bf16", i32::from(code) - 127);
+            assert!(
+                exact(v * s),
+                "e4m3 {b:#04x} ({v}) * 2^{} is not exact in bf16",
+                i32::from(code) - 127
+            );
             checked += 1;
         }
     }
@@ -203,8 +259,14 @@ fn fp8_times_a_power_of_two_is_exact_in_bf16_over_the_range_the_checkpoint_uses(
     // Unreachable for a weight tensor -- `act_quant`'s own scales bottom out at 2^-22 --
     // but stated here so the claim above carries its range and not just its conclusion.
     let tiny = e4m3_to_f32(0x01) * f32::exp2(-126.0); // 2^-9 * 2^-126 = 2^-135
-    assert!(tiny > 0.0, "the f32 product itself underflowed, which is a different failure");
-    assert!(!exact(tiny), "the bf16 subnormal floor moved; re-derive the range above");
+    assert!(
+        tiny > 0.0,
+        "the f32 product itself underflowed, which is a different failure"
+    );
+    assert!(
+        !exact(tiny),
+        "the bf16 subnormal floor moved; re-derive the range above"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════
@@ -260,16 +322,31 @@ fn oracle_cat(
     let w = window_topk(win, seqlen, start_pos);
     let c = compress_topk(ratio, seqlen, start_pos, offset);
     assert_eq!(w.len(), c.len(), "the two halves disagree on the row count");
-    w.into_iter().zip(c).map(|(a, b)| a.into_iter().chain(b).collect()).collect()
+    w.into_iter()
+        .zip(c)
+        .map(|(a, b)| a.into_iter().chain(b).collect())
+        .collect()
 }
 
 /// `offset` is `kv.size(1)` at prefill and `window_size` at decode — model.py:521.
 fn oracle_rows(win: usize, ratio: usize, seqlen: usize, start_pos: usize) -> Vec<Vec<i64>> {
-    oracle_cat(win, ratio, seqlen, start_pos, if start_pos == 0 { seqlen } else { win })
+    oracle_cat(
+        win,
+        ratio,
+        seqlen,
+        start_pos,
+        if start_pos == 0 { seqlen } else { win },
+    )
 }
 
 fn engine_comp_rows(win: usize, ratio: usize, seqlen: usize, start_pos: usize) -> Vec<Vec<i64>> {
-    engine_sel(win, LayerKind::from_ratio(ratio), shipped_index_topk(), seqlen, start_pos)
+    engine_sel(
+        win,
+        LayerKind::from_ratio(ratio),
+        shipped_index_topk(),
+        seqlen,
+        start_pos,
+    )
 }
 
 /// Shapes a compressed layer actually reaches. `seqlen` straddles multiples of `ratio`
@@ -278,10 +355,27 @@ fn engine_comp_rows(win: usize, ratio: usize, seqlen: usize, start_pos: usize) -
 fn comp_cases() -> Vec<(usize, usize, usize, usize)> {
     let mut v = Vec::new();
     for &(win, ratio) in &[(8usize, 4usize), (128, 4), (128, 128), (4, 4)] {
-        for seqlen in [1usize, ratio - 1, ratio, ratio + 1, 2 * ratio, 3 * ratio + 2, 130] {
+        for seqlen in [
+            1usize,
+            ratio - 1,
+            ratio,
+            ratio + 1,
+            2 * ratio,
+            3 * ratio + 2,
+            130,
+        ] {
             v.push((win, ratio, seqlen, 0));
         }
-        for sp in [1usize, ratio - 1, ratio, ratio + 1, 2 * ratio - 1, win, win + 1, 300] {
+        for sp in [
+            1usize,
+            ratio - 1,
+            ratio,
+            ratio + 1,
+            2 * ratio - 1,
+            win,
+            win + 1,
+            300,
+        ] {
             v.push((win, ratio, 1, sp));
         }
     }
@@ -295,7 +389,10 @@ fn compressed_selection_matches_the_oracle_below_the_truncation_point() {
     for (win, ratio, seqlen, start_pos) in comp_cases() {
         let want = oracle_rows(win, ratio, seqlen, start_pos);
         let got = engine_comp_rows(win, ratio, seqlen, start_pos);
-        assert_eq!(got, want, "win={win} ratio={ratio} seqlen={seqlen} start_pos={start_pos}");
+        assert_eq!(
+            got, want,
+            "win={win} ratio={ratio} seqlen={seqlen} start_pos={start_pos}"
+        );
         // How many compressed columns this shape actually produced.
         let n = got[0].len() - if start_pos == 0 { seqlen.min(win) } else { win };
         saw_blocks += usize::from(n > 0);
@@ -305,7 +402,10 @@ fn compressed_selection_matches_the_oracle_below_the_truncation_point() {
     // ANTI-VACUITY, and the specific one this file needs: every case could agree because
     // every case produced ZERO compressed columns, which is `window_topk` re-tested under
     // a longer name. `saw_blocks` counts the cases that actually appended blocks.
-    assert!(saw_blocks >= 30, "only {saw_blocks} of {checked} shapes produced any block");
+    assert!(
+        saw_blocks >= 30,
+        "only {saw_blocks} of {checked} shapes produced any block"
+    );
 }
 
 #[test]
@@ -318,17 +418,27 @@ fn the_compressed_comparison_can_fail() {
     // 1. The offset omitted — the classic. Blocks then name rows inside the WINDOW
     //    region, which are real KV vectors at completely unrelated positions.
     let no_offset = oracle_cat(win, ratio, seqlen, 0, 0);
-    assert_ne!(no_offset, right, "the compressed offset is not observable at seqlen={seqlen}");
+    assert_ne!(
+        no_offset, right,
+        "the compressed offset is not observable at seqlen={seqlen}"
+    );
 
     // 2. Decode's offset used at prefill (`win` instead of `kv.size(1)`). Same shape,
     //    every block shifted by `seqlen - win`.
     let decode_offset = oracle_cat(win, ratio, seqlen, 0, win);
-    assert_ne!(decode_offset, right, "the two offsets coincide at seqlen={seqlen} win={win}");
+    assert_ne!(
+        decode_offset, right,
+        "the two offsets coincide at seqlen={seqlen} win={win}"
+    );
 
     // 3. The causal mask dropped, so row `t` attends blocks built from tokens after it.
     //    Row 0 is the discriminating one: it may see NO block at all.
     let unmasked: Vec<i64> = (0..seqlen / ratio).map(|c| (c + seqlen) as i64).collect();
-    assert_ne!(unmasked, right[0][win.min(seqlen)..], "row 0's mask is not observable");
+    assert_ne!(
+        unmasked,
+        right[0][win.min(seqlen)..],
+        "row 0's mask is not observable"
+    );
 }
 
 #[test]
@@ -346,7 +456,13 @@ fn the_positional_selection_refuses_past_the_indexer_truncation_point() {
     // same at 3 as at 512, and the shipped value is asserted below rather than assumed.
     let k = 3;
     let r4 = LayerKind::from_ratio(4);
-    let sel = |kind, start_pos| Sel { win: 8, kind, index_topk: k, seqlen: 1, start_pos };
+    let sel = |kind, start_pos| Sel {
+        win: 8,
+        kind,
+        index_topk: k,
+        seqlen: 1,
+        start_pos,
+    };
 
     // Below the cliff: fine, and every existing block is selected.
     // 3 blocks exist at start_pos 11 (`(11+1)/4`), and `index_topk` is 3.
@@ -355,19 +471,30 @@ fn the_positional_selection_refuses_past_the_indexer_truncation_point() {
     assert_eq!(sel(r4, 4 * (k + 1) - 2).shape().unwrap().1, 8 + k);
 
     // At the cliff: refused, and the message names the cause rather than a shape.
-    let e = sel(r4, 15).shape().expect_err("4 blocks against index_topk 3 must be refused");
+    let e = sel(r4, 15)
+        .shape()
+        .expect_err("4 blocks against index_topk 3 must be refused");
     let msg = format!("{e}");
     assert!(msg.contains("index_topk"), "wrong rejection: {msg}");
-    assert!(msg.contains("OLDEST"), "the message does not say what goes wrong: {msg}");
+    assert!(
+        msg.contains("OLDEST"),
+        "the message does not say what goes wrong: {msg}"
+    );
     // The message is a wrapped multi-line literal, and a dropped `\` continuation turns
     // each wrap into ~18 literal spaces. That shipped once and this test stayed green,
     // because greps for two words cannot see whitespace. Rust's own `\`-continuation eats
     // the following indentation, so a correct literal has no double space anywhere.
-    assert!(!msg.contains("  "), "collapsed line continuation in the message: {msg:?}");
+    assert!(
+        !msg.contains("  "),
+        "collapsed line continuation in the message: {msg:?}"
+    );
     // ...and `v4_topk_idxs` refuses too, not just the shape probe. A fill that succeeded
     // where the shape refused would be the engine attending a selection nothing checked.
     let mut flat = Vec::new();
-    assert!(v4_topk_idxs(sel(r4, 15), &mut flat).is_err(), "the fill did not refuse");
+    assert!(
+        v4_topk_idxs(sel(r4, 15), &mut flat).is_err(),
+        "the fill did not refuse"
+    );
     assert!(flat.is_empty(), "the fill wrote rows before refusing");
 
     // A ratio-128 layer has NO `Indexer`, so `get_compress_topk_idxs` applies no cap and
@@ -375,17 +502,37 @@ fn the_positional_selection_refuses_past_the_indexer_truncation_point() {
     // this is the half that fails if the refusal is written against the ratio rather than
     // against `has_indexer`.
     let r128 = LayerKind::from_ratio(128);
-    assert!(!r128.has_indexer(), "the fixture no longer separates the two layer classes");
+    assert!(
+        !r128.has_indexer(),
+        "the fixture no longer separates the two layer classes"
+    );
     assert_eq!(sel(r128, 128 * (k + 1)).shape().unwrap().1, 8 + (k + 1));
 
     // The shipped cliff, from the config rather than a literal.
     let shipped = shipped_index_topk();
     assert_eq!(shipped, 512);
     assert_eq!(4 * (shipped + 1), 2052, "the truncation point moved");
-    assert!(Sel { win: 128, kind: r4, index_topk: shipped, seqlen: 1, start_pos: 2050 }
+    assert!(
+        Sel {
+            win: 128,
+            kind: r4,
+            index_topk: shipped,
+            seqlen: 1,
+            start_pos: 2050
+        }
         .shape()
-        .is_ok());
-    assert!(Sel { win: 128, kind: r4, index_topk: shipped, seqlen: 1, start_pos: 2051 }
+        .is_ok()
+    );
+    assert!(
+        Sel {
+            win: 128,
+            kind: r4,
+            index_topk: shipped,
+            seqlen: 1,
+            start_pos: 2051
+        }
         .shape()
-        .is_err(), "2052 total positions must be the first refusal");
+        .is_err(),
+        "2052 total positions must be the first refusal"
+    );
 }

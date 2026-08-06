@@ -44,6 +44,7 @@ pub mod math;
 /// the name and none of the structure — no `wk`, no `k_norm`, its own nested `Compressor`.
 pub mod v4compress;
 
+pub mod telemetry;
 /// The DeepSeek-V4-Flash numerical oracle (S1b of `docs/investigations/v4-flash-port.md`).
 ///
 /// Backend-independent and engine-independent by construction: it imports nothing from
@@ -58,7 +59,6 @@ pub mod v4compress;
 /// oracle is what S2 and S3 are scored against; it must not be the thing that silently
 /// stopped compiling.
 pub mod v4oracle;
-pub mod telemetry;
 pub mod watchdog;
 
 /// The OpenAI-compatible HTTP server (`--port`), for llama-swap and friends.

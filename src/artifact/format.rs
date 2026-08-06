@@ -214,7 +214,10 @@ impl SafeWriter {
         let (w, shape) = src.typed(&format!("{name}.weight"), Dtype::F8E4M3)?;
         let (sc, ssh) = src.typed(&format!("{name}.scale"), Dtype::F8E8M0)?;
         let block = crate::artifact::quant::FP8_BLOCK;
-        ensure!(shape.len() == 2, "{name}.weight: shape {shape:?} is not 2-D");
+        ensure!(
+            shape.len() == 2,
+            "{name}.weight: shape {shape:?} is not 2-D"
+        );
         let want = [shape[0].div_ceil(block), shape[1].div_ceil(block)];
         ensure!(
             ssh == want,
@@ -353,7 +356,11 @@ impl Safetensors {
             let file = std::fs::File::open(path).with_context(|| format!("open {path:?}"))?;
             // SAFETY: read-only for the reader's lifetime.
             let mmap = unsafe { Mmap::map(&file) }.with_context(|| format!("mmap {path:?}"))?;
-            ensure!(mmap.len() >= 8, "{path:?}: {} bytes, not a safetensors", mmap.len());
+            ensure!(
+                mmap.len() >= 8,
+                "{path:?}: {} bytes, not a safetensors",
+                mmap.len()
+            );
             let hlen = u64::from_le_bytes(mmap[..8].try_into()?) as usize;
             // A TRUNCATED shard — a download still in flight, an interrupted copy — has a
             // complete header describing data that is not there yet. Without this check
@@ -538,13 +545,17 @@ impl F4Expert<'_> {
             // the byte counts below are correct for, and a transposed or mis-blocked source
             // would otherwise copy the right NUMBER of bytes in the wrong order — a file
             // that passes every length check and decodes to noise.
-            let (w, wsh) = self.src.typed(&format!("{base}.{proj}.weight"), Dtype::I8)?;
+            let (w, wsh) = self
+                .src
+                .typed(&format!("{base}.{proj}.weight"), Dtype::I8)?;
             ensure!(
                 wsh == [o_dim, i_dim / 2],
                 "{base}.{proj}.weight: shape {wsh:?} != [{o_dim},{}] (FP4 nibble pairs)",
                 i_dim / 2
             );
-            let (sc, ssh) = self.src.typed(&format!("{base}.{proj}.scale"), Dtype::F8E8M0)?;
+            let (sc, ssh) = self
+                .src
+                .typed(&format!("{base}.{proj}.scale"), Dtype::F8E8M0)?;
             let groups = crate::artifact::quant::f4_groups(i_dim);
             ensure!(
                 ssh == [o_dim, groups],
@@ -636,7 +647,11 @@ impl F4Expert<'_> {
                 .get(off..off + want.len())
                 .with_context(|| format!("{}: block shorter than the source spans", self.base))?;
             if got != want {
-                bad.extend((0..want.len()).filter(|&k| got[k] != want[k]).map(|k| off + k));
+                bad.extend(
+                    (0..want.len())
+                        .filter(|&k| got[k] != want[k])
+                        .map(|k| off + k),
+                );
             }
         }
         Ok(bad)
@@ -1540,7 +1555,12 @@ mod tests {
                 {
                     scale[k] = b;
                 }
-                w.add(format!("e.{proj}.weight"), Dtype::I8, vec![o_dim, i_dim / 2], weight);
+                w.add(
+                    format!("e.{proj}.weight"),
+                    Dtype::I8,
+                    vec![o_dim, i_dim / 2],
+                    weight,
+                );
                 w.add(
                     format!("e.{proj}.scale"),
                     Dtype::F8E8M0,
@@ -1549,7 +1569,11 @@ mod tests {
                 );
             }
             w.write(&format!("{dir}/e.safetensors")).unwrap();
-            Self { dir, hidden, moe_inter }
+            Self {
+                dir,
+                hidden,
+                moe_inter,
+            }
         }
 
         fn open(&self) -> Safetensors {
@@ -1668,17 +1692,28 @@ mod tests {
 
         let mut want = Vec::new();
         for name in [
-            "e.w1.weight", "e.w1.scale",
-            "e.w3.weight", "e.w3.scale",
-            "e.w2.weight", "e.w2.scale",
+            "e.w1.weight",
+            "e.w1.scale",
+            "e.w3.weight",
+            "e.w3.scale",
+            "e.w2.weight",
+            "e.w2.scale",
         ] {
-            let dt = if name.ends_with(".scale") { Dtype::F8E8M0 } else { Dtype::I8 };
+            let dt = if name.ends_with(".scale") {
+                Dtype::F8E8M0
+            } else {
+                Dtype::I8
+            };
             want.extend_from_slice(st.typed(name, dt).unwrap().0);
         }
 
         let mut got = vec![0u8; f4_expert_bytes(fx.hidden, fx.moe_inter)];
         fx.expert(&st).pack(&mut got).unwrap();
-        assert_eq!(got.len(), want.len(), "block size disagrees with the source spans");
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "block size disagrees with the source spans"
+        );
         assert_eq!(got, want, "the repack is not a straight concatenation");
 
         // `diff` agrees with the same independently-built block, and reports the exact

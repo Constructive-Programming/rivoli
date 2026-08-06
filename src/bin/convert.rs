@@ -15,9 +15,8 @@ use rivoli::artifact::format::{
 };
 use rivoli::artifact::quant::{
     ExpertProjs, FP8_BLOCK, PROJ, VQ_ALIGN, VQ_DIM, VQ_K, expert_base, expert_projs,
-    fill_expert_blocks,
-    learn_codebook, quant_vq, read_f32, sample_subvectors, vq_expert_bytes, vq_proj_bytes,
-    vq_row_bytes, write_le_scales,
+    fill_expert_blocks, learn_codebook, quant_vq, read_f32, sample_subvectors, vq_expert_bytes,
+    vq_proj_bytes, vq_row_bytes, write_le_scales,
 };
 use rivoli::math::bf16_to_f32;
 // Only the tests still take the layout on its own; the encoders go through `expert_projs`,

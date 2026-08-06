@@ -53,8 +53,8 @@ fn arch_of_named(cfg: &serde_json::Value) -> Result<(Arch, String)> {
         );
     let mut found: Option<(Arch, &str)> = None;
     for s in declared {
-        let a =
-            Arch::from_manifest_str(s).with_context(|| format!("unsupported architecture {s:?}"))?;
+        let a = Arch::from_manifest_str(s)
+            .with_context(|| format!("unsupported architecture {s:?}"))?;
         if let Some((prev, prev_s)) = found {
             ensure!(
                 prev == a,
@@ -663,7 +663,11 @@ impl ArchConfig for V4Config {
         );
         // `MoE.__init__` asserts this outright; the shared expert is a single always-on
         // FFN in both the reference and rivoli's resident set.
-        ensure!(self.n_shared == 1, "n_shared_experts {} != 1", self.n_shared);
+        ensure!(
+            self.n_shared == 1,
+            "n_shared_experts {} != 1",
+            self.n_shared
+        );
         ensure!(
             self.num_key_value_heads == 1,
             "num_key_value_heads {} != 1 — this is shared-KV MQA, one entry for all heads",
@@ -981,11 +985,15 @@ mod tests {
     #[test]
     fn scoring_func_is_resolved_or_refused() {
         assert_eq!(
-            parse(&[("scoring_func", r#""sqrtsoftplus""#)]).unwrap().scoring(),
+            parse(&[("scoring_func", r#""sqrtsoftplus""#)])
+                .unwrap()
+                .scoring(),
             crate::math::Scoring::SqrtSoftplus
         );
         assert_eq!(
-            parse(&[("scoring_func", r#""sigmoid""#)]).unwrap().scoring(),
+            parse(&[("scoring_func", r#""sigmoid""#)])
+                .unwrap()
+                .scoring(),
             crate::math::Scoring::Sigmoid
         );
         for bad in [r#""softmax""#, r#""gumbel""#] {
@@ -1065,7 +1073,10 @@ mod tests {
     /// converter is the same defect wearing the other hat.
     #[test]
     fn each_config_refuses_the_other_architecture() {
-        let err = format!("{:#}", parse_config::<ModelConfig>(&v4_json(&[])).unwrap_err());
+        let err = format!(
+            "{:#}",
+            parse_config::<ModelConfig>(&v4_json(&[])).unwrap_err()
+        );
         assert!(
             err.contains("deepseek_v4") && err.contains("GlmMoeDsa"),
             "refusal must name what the file says AND what was expected: {err}"
@@ -1074,8 +1085,14 @@ mod tests {
             !err.contains("kv_lora_rank"),
             "refused on a missing field instead of on the architecture: {err}"
         );
-        let err = format!("{:#}", parse_config::<V4Config>(&cfg_json(&[])).unwrap_err());
-        assert!(err.contains("glm_moe_dsa") && err.contains("DeepseekV4"), "{err}");
+        let err = format!(
+            "{:#}",
+            parse_config::<V4Config>(&cfg_json(&[])).unwrap_err()
+        );
+        assert!(
+            err.contains("glm_moe_dsa") && err.contains("DeepseekV4"),
+            "{err}"
+        );
     }
 
     // ── V4Config ───────────────────────────────────────────────────────────────────
@@ -1206,7 +1223,10 @@ mod tests {
             ),
         ] {
             let err = format!("{:#}", parse_v4(&bad).unwrap_err());
-            assert!(err.contains(want), "expected {want:?} for {bad:?}, got: {err}");
+            assert!(
+                err.contains(want),
+                "expected {want:?} for {bad:?}, got: {err}"
+            );
         }
     }
 
@@ -1262,8 +1282,13 @@ mod tests {
         for (k, v) in V4_BASE {
             let want: serde_json::Value = serde_json::from_str(v)
                 .unwrap_or_else(|e| panic!("V4_BASE[{k}] is not valid JSON: {e}"));
-            let got = real.get(*k).unwrap_or_else(|| panic!("config.json has no {k:?}"));
-            assert_eq!(got, &want, "V4_BASE[{k}] has drifted from the shipped config");
+            let got = real
+                .get(*k)
+                .unwrap_or_else(|| panic!("config.json has no {k:?}"));
+            assert_eq!(
+                got, &want,
+                "V4_BASE[{k}] has drifted from the shipped config"
+            );
         }
         // …and it parses, and is still refused as a ModelConfig from the file itself
         // rather than only from the fixture.

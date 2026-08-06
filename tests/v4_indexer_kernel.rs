@@ -72,7 +72,9 @@ use rivoli::backend::hip::{device_sync, launch_v4_indexer_score, launch_v4_index
 use rivoli::memory::device::DeviceBuf;
 use rivoli::v4compress::{Geom, LayerKind, Quantize, ScoreDims};
 use rivoli::v4oracle::forward::{Counters, Defect, Oracle};
-use rivoli::v4oracle::numerics::{bf16_decode, bf16_encode, fp4_act_quant_inplace, hadamard_rotate};
+use rivoli::v4oracle::numerics::{
+    bf16_decode, bf16_encode, fp4_act_quant_inplace, hadamard_rotate,
+};
 use rivoli::v4oracle::weights::V4Config;
 
 mod common;
@@ -149,12 +151,13 @@ fn assert_bits(want: &[f32], got: &[f32], label: &str) {
 fn host_spread(rows: &mut [f32], d: usize) {
     for row in rows.chunks_exact_mut(d) {
         hadamard_rotate(row);
-        row.iter_mut().for_each(|x| *x = bf16_decode(bf16_encode(*x)));
+        row.iter_mut()
+            .for_each(|x| *x = bf16_decode(bf16_encode(*x)));
         fp4_act_quant_inplace(row, 32);
-        row.iter_mut().for_each(|x| *x = bf16_decode(bf16_encode(*x)));
+        row.iter_mut()
+            .for_each(|x| *x = bf16_decode(bf16_encode(*x)));
     }
 }
-
 
 /// Upload, spread in place, read back — the whole device side of one spread comparison.
 ///
@@ -244,11 +247,19 @@ fn fp4_block_scale_covers_sixty_binades_not_two() {
         .chunks_exact(d)
         .map(|r| r.iter().fold(0.0f32, |m, v| m.max(v.abs())).log2().ceil() as i32)
         .collect();
-    assert!(binades.len() >= 55, "the fixture must span many binades, got {}", binades.len());
+    assert!(
+        binades.len() >= 55,
+        "the fixture must span many binades, got {}",
+        binades.len()
+    );
 
     let mut want = host_in.clone();
     host_spread(&mut want, d);
-    assert_bits(&want, &device_spread(&host_in, 60, d), "spread over 60 binades");
+    assert_bits(
+        &want,
+        &device_spread(&host_in, 60, d),
+        "spread over 60 binades",
+    );
 }
 
 /// The launcher refuses the shapes whose failure would be silent, and each refusal is shown
@@ -269,10 +280,16 @@ fn the_spread_launcher_refuses_widths_the_hadamard_cannot_transform() {
     assert!(bad(0, 128), "zero rows");
     assert!(bad(1, 0), "zero width");
     assert!(bad(1, 512), "wider than the LDS tile");
-    assert!(bad(1, 96), "not a power of two -- the reference would zero-pad this");
+    assert!(
+        bad(1, 96),
+        "not a power of two -- the reference would zero-pad this"
+    );
     // Guard 1004, and it is NOT unreachable behind the power-of-two check as the kernel's
     // comment claimed until review: 16 is a power of two and is still a ragged fp4 block.
-    assert!(bad(1, 16), "a power of two SMALLER than the fp4 block of 32");
+    assert!(
+        bad(1, 16),
+        "a power of two SMALLER than the fp4 block of 32"
+    );
     // And the shape the model actually uses is ACCEPTED, so the guards above are not simply
     // refusing everything.
     // SAFETY: `buf` is 1024 f32 >= 1 * 128.
@@ -313,8 +330,14 @@ fn geom_indexer_and_geom_attention_do_not_finish_the_same_way() {
 
     // An `Indexer` exists ONLY at ratio 4 (model.py:474), so the other two classes cannot
     // produce one -- stricter than `Geom::attention`, which accepts every compressor.
-    assert!(Geom::indexer(LayerKind::NonOverlap(128), hd, rd, eps).is_none(), "ratio 128");
-    assert!(Geom::indexer(LayerKind::Plain, hd, rd, eps).is_none(), "ratio 0");
+    assert!(
+        Geom::indexer(LayerKind::NonOverlap(128), hd, rd, eps).is_none(),
+        "ratio 128"
+    );
+    assert!(
+        Geom::indexer(LayerKind::Plain, hd, rd, eps).is_none(),
+        "ratio 0"
+    );
     assert!(
         Geom::attention(LayerKind::NonOverlap(128), c.head_dim, rd, eps).is_some(),
         "...while the attention compressor does exist at ratio 128, so the line above is a \
@@ -412,12 +435,32 @@ fn indexer_score_is_bit_identical_on_the_checkpoints_compressed_kv() {
     let o = Oracle::new(c.clone(), Defect::None);
     let mut cs = o.fresh_state(2).idx_comp.expect("layer 2 has an indexer");
     let mut ctr = Counters::default();
-    o.compressor(&iw.compressor, &mut cs, &probe("l2-x", n, c.dim), n, 0, o.freqs(2), &mut ctr);
-    assert_eq!(ctr.compressed_blocks, n / 4, "the probe must fill the compressed cache");
+    o.compressor(
+        &iw.compressor,
+        &mut cs,
+        &probe("l2-x", n, c.dim),
+        n,
+        0,
+        o.freqs(2),
+        &mut ctr,
+    );
+    assert_eq!(
+        ctr.compressed_blocks,
+        n / 4,
+        "the probe must fill the compressed cache"
+    );
 
-    let d = ScoreDims { s: 3, n_comp: n / 4, heads: c.index_n_heads, hd: c.index_head_dim };
+    let d = ScoreDims {
+        s: 3,
+        n_comp: n / 4,
+        heads: c.index_n_heads,
+        hd: c.index_head_dim,
+    };
     let kv = cs.cache[..d.n_comp * d.hd].to_vec();
-    assert!(kv.iter().any(|v| *v != 0.0), "the cache must not be all zeros");
+    assert!(
+        kv.iter().any(|v| *v != 0.0),
+        "the cache must not be all zeros"
+    );
 
     // `q` through the same spread the real path applies, so the two sides of the dot are
     // both fp4-quantized values — the regime the score chain actually runs in.
@@ -434,7 +477,11 @@ fn indexer_score_is_bit_identical_on_the_checkpoints_compressed_kv() {
     // it is what a sign error upstream would give. So the matrix must have real content, and
     // this is checked on the DEVICE's output rather than the host's.
     let nz = got.iter().filter(|v| **v != 0.0).count();
-    assert!(nz * 4 > got.len(), "the score matrix must not be mostly zero: {nz}/{}", got.len());
+    assert!(
+        nz * 4 > got.len(),
+        "the score matrix must not be mostly zero: {nz}/{}",
+        got.len()
+    );
 }
 
 /// **The deliberate breaks.** Each perturbs one input the way a real defect would and is
@@ -454,7 +501,12 @@ fn indexer_score_is_bit_identical_on_the_checkpoints_compressed_kv() {
 #[test]
 fn the_score_comparison_rejects_perturbed_inputs_and_only_the_right_ones() {
     let c = V4Config::v4_flash();
-    let d = ScoreDims { s: 4, n_comp: 5, heads: c.index_n_heads, hd: c.index_head_dim };
+    let d = ScoreDims {
+        s: 4,
+        n_comp: 5,
+        heads: c.index_n_heads,
+        hd: c.index_head_dim,
+    };
     let mut q = probe("brk-q", d.s * d.heads, d.hd);
     host_spread(&mut q, d.hd);
     let mut kv = probe("brk-kv", d.n_comp, d.hd);
@@ -473,7 +525,10 @@ fn the_score_comparison_rejects_perturbed_inputs_and_only_the_right_ones() {
     let broken = device(&q, &kv, &ones);
     assert_bits(&host_score(&q, &kv, &ones, d), &broken, "score/no-weights");
     assert!(
-        broken.iter().zip(&base).any(|(a, b)| a.to_bits() != b.to_bits()),
+        broken
+            .iter()
+            .zip(&base)
+            .any(|(a, b)| a.to_bits() != b.to_bits()),
         "IndexerNoWeights must move the score matrix, else the fixture's weights are all 1"
     );
 
@@ -481,12 +536,16 @@ fn the_score_comparison_rejects_perturbed_inputs_and_only_the_right_ones() {
     let mut q_nofp4 = probe("brk-q", d.s * d.heads, d.hd);
     for row in q_nofp4.chunks_exact_mut(d.hd) {
         hadamard_rotate(row);
-        row.iter_mut().for_each(|x| *x = bf16_decode(bf16_encode(*x)));
+        row.iter_mut()
+            .for_each(|x| *x = bf16_decode(bf16_encode(*x)));
     }
     let broken = device(&q_nofp4, &kv, &w);
     assert_bits(&host_score(&q_nofp4, &kv, &w, d), &broken, "score/no-fp4");
     assert!(
-        broken.iter().zip(&base).any(|(a, b)| a.to_bits() != b.to_bits()),
+        broken
+            .iter()
+            .zip(&base)
+            .any(|(a, b)| a.to_bits() != b.to_bits()),
         "IndexerNoFp4Quant must move the score matrix"
     );
 
@@ -500,13 +559,22 @@ fn the_score_comparison_rejects_perturbed_inputs_and_only_the_right_ones() {
     let moved = device(&q_last, &kv, &w);
     let untouched = (d.s - 1) * d.n_comp;
     assert_eq!(
-        moved[..untouched].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-        base[..untouched].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        moved[..untouched]
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        base[..untouched]
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
         "perturbing query {} must leave every earlier query's row bit-identical",
         d.s - 1
     );
     assert!(
-        moved[untouched..].iter().zip(&base[untouched..]).any(|(a, b)| a.to_bits() != b.to_bits()),
+        moved[untouched..]
+            .iter()
+            .zip(&base[untouched..])
+            .any(|(a, b)| a.to_bits() != b.to_bits()),
         "...and must move its own row, else the perturbation did nothing anywhere"
     );
 }
@@ -528,7 +596,12 @@ fn the_score_launcher_refuses_an_empty_compressed_region() {
         // SAFETY: refused before any launch in every case asserted here.
         unsafe { launch_v4_indexer_score(p, p, p, m, d, std::ptr::null_mut()) }.is_err()
     };
-    let ok = ScoreDims { s: 1, n_comp: 1, heads: c.index_n_heads, hd: c.index_head_dim };
+    let ok = ScoreDims {
+        s: 1,
+        n_comp: 1,
+        heads: c.index_n_heads,
+        hd: c.index_head_dim,
+    };
     assert!(go(ScoreDims { n_comp: 0, ..ok }), "empty compressed region");
     assert!(go(ScoreDims { s: 0, ..ok }), "no query rows");
     assert!(go(ScoreDims { heads: 0, ..ok }), "no heads");
@@ -563,7 +636,12 @@ fn the_score_launcher_refuses_an_empty_compressed_region() {
 /// 1.125.
 #[test]
 fn host_score_accumulates_in_f32_not_bf16() {
-    let d = ScoreDims { s: 1, n_comp: 1, heads: 64, hd: 128 };
+    let d = ScoreDims {
+        s: 1,
+        n_comp: 1,
+        heads: 64,
+        hd: 128,
+    };
     let mut kv = vec![0.0f32; d.hd];
     kv[0] = 1.0;
     let mut q = vec![0.0f32; d.s * d.heads * d.hd];
@@ -588,6 +666,14 @@ fn host_score_accumulates_in_f32_not_bf16() {
     for hh in 0..d.heads {
         fold = rbf(fold + rbf(q[hh * d.hd]));
     }
-    assert_eq!(fold.to_bits(), 1.0f32.to_bits(), "the rejected fold must reach 1.0");
-    assert_ne!(fold.to_bits(), got[0].to_bits(), "...and must differ from the correct value");
+    assert_eq!(
+        fold.to_bits(),
+        1.0f32.to_bits(),
+        "the rejected fold must reach 1.0"
+    );
+    assert_ne!(
+        fold.to_bits(),
+        got[0].to_bits(),
+        "...and must differ from the correct value"
+    );
 }

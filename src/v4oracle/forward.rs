@@ -369,7 +369,6 @@ pub struct LayerW {
     pub shared: ExpertW,
 }
 
-
 /// Everything one `Block.forward` call needs that does not vary within it.
 ///
 /// A struct rather than eight more parameters: `attention`, `moe`, `gate` and `run_layer`
@@ -494,21 +493,35 @@ impl Capture {
     /// before `run_layer` started prefixing the layer id. Silent shadowing is the failure
     /// mode this whole oracle exists to not have.
     pub fn push(&mut self, name: &str, shape: &[usize], v: Vec<f32>) {
-        assert_eq!(shape.iter().product::<usize>(), v.len(), "{name}: shape/len mismatch");
+        assert_eq!(
+            shape.iter().product::<usize>(),
+            v.len(),
+            "{name}: shape/len mismatch"
+        );
         assert!(self.float(name).is_none(), "duplicate golden name {name}");
         self.floats.push((name.to_string(), shape.to_vec(), v));
     }
     /// Record an integer (selection) tensor. Same uniqueness rule as [`Capture::push`].
     pub fn push_i(&mut self, name: &str, shape: &[usize], v: Vec<i64>) {
-        assert_eq!(shape.iter().product::<usize>(), v.len(), "{name}: shape/len mismatch");
+        assert_eq!(
+            shape.iter().product::<usize>(),
+            v.len(),
+            "{name}: shape/len mismatch"
+        );
         assert!(self.int(name).is_none(), "duplicate golden name {name}");
         self.ints.push((name.to_string(), shape.to_vec(), v));
     }
     pub fn float(&self, name: &str) -> Option<&[f32]> {
-        self.floats.iter().find(|(n, _, _)| n == name).map(|(_, _, v)| v.as_slice())
+        self.floats
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .map(|(_, _, v)| v.as_slice())
     }
     pub fn int(&self, name: &str) -> Option<&[i64]> {
-        self.ints.iter().find(|(n, _, _)| n == name).map(|(_, _, v)| v.as_slice())
+        self.ints
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .map(|(_, _, v)| v.as_slice())
     }
 }
 
@@ -542,7 +555,8 @@ impl Oracle {
         // rather than inside the defect so the two rope defects cannot collapse into one
         // table and be counted as two independent pieces of evidence.
         let freqs_no_yarn_compress_theta = precompute_freqs_cis(&cfg, 0, cfg.compress_rope_theta);
-        let freqs_yarn_base_theta = precompute_freqs_cis(&cfg, cfg.original_seq_len, cfg.rope_theta);
+        let freqs_yarn_base_theta =
+            precompute_freqs_cis(&cfg, cfg.original_seq_len, cfg.rope_theta);
         Self {
             cfg,
             defect,
@@ -576,10 +590,15 @@ impl Oracle {
     pub fn fresh_state(&self, layer: usize) -> LayerState {
         let c = &self.cfg;
         let ratio = c.compress_ratio(layer);
-        let comp = (ratio != 0).then(|| new_comp_state(ratio, c.head_dim, ratio == 4, c.max_seq_len));
+        let comp =
+            (ratio != 0).then(|| new_comp_state(ratio, c.head_dim, ratio == 4, c.max_seq_len));
         let idx_comp =
             (ratio == 4).then(|| new_comp_state(ratio, c.index_head_dim, true, c.max_seq_len));
-        LayerState { win_cache: vec![0.0; c.window_size * c.head_dim], comp, idx_comp }
+        LayerState {
+            win_cache: vec![0.0; c.window_size * c.head_dim],
+            comp,
+            idx_comp,
+        }
     }
 
     fn round_bf16(&self, v: &mut [f32]) {
@@ -652,7 +671,12 @@ impl Oracle {
         // and CLAUDE.md prescribes `cargo test --release`, so a debug assertion here would
         // never run in the only configuration anyone uses. These are per-GEMM, not
         // per-element -- the cost is nil against a 4000-line CPU oracle.
-        assert_eq!(w.cols(), k, "linear: weight expects k={}, got {k}", w.cols());
+        assert_eq!(
+            w.cols(),
+            k,
+            "linear: weight expects k={}, got {k}",
+            w.cols()
+        );
         assert_eq!(x.len(), m * k);
         let n = w.rows();
         // For quantized weights the activation is first quantized to fp8 at block 128 with
@@ -663,7 +687,10 @@ impl Oracle {
                 // `kernel.py::act_quant` line 112: `assert N % block_size == 0`. Without
                 // this, a future config with a non-multiple K would quantize a short tail
                 // block and produce values the reference cannot produce, silently.
-                assert!(k.is_multiple_of(128), "act_quant needs K % 128 == 0, got {k}");
+                assert!(
+                    k.is_multiple_of(128),
+                    "act_quant needs K % 128 == 0, got {k}"
+                );
                 let mut q = x.to_vec();
                 for row in q.chunks_mut(k) {
                     act_quant_inplace(row, 128, true);
@@ -709,7 +736,11 @@ impl Oracle {
         // `kv_norm.weight` [512], and `load_head_tail` flattens whatever tensor it is handed.
         // Same reasoning as `hc_head`'s `hc_head_scale` assert -- read the shape rather than
         // trust the caller -- and this was the one norm parameter whose mis-load was silent.
-        assert_eq!(w.len(), d, "RMSNorm weight must be [d]; a short one truncates in silence");
+        assert_eq!(
+            w.len(),
+            d,
+            "RMSNorm weight must be [d]; a short one truncates in silence"
+        );
         for row in x.chunks_mut(d) {
             let var = row.iter().map(|v| v * v).sum::<f32>() / d as f32;
             let rs = (var + self.cfg.norm_eps).sqrt().recip();
@@ -806,8 +837,9 @@ fn precompute_freqs_cis(cfg: &V4Config, original_seq_len: usize, base: f32) -> V
     // through Python's `math.log`/`floor`). Computing the table in f64 throughout leaves a
     // sub-bf16-ulp angle error that still shows up as sporadic one-ulp disagreement against
     // a faithful implementation.
-    let mut freqs: Vec<f32> =
-        (0..half).map(|i| 1.0 / base.powf((2 * i) as f32 / dim as f32)).collect();
+    let mut freqs: Vec<f32> = (0..half)
+        .map(|i| 1.0 / base.powf((2 * i) as f32 / dim as f32))
+        .collect();
     if original_seq_len > 0 {
         let base = f64::from(base);
         let fcd = |rot: f64| {
@@ -816,7 +848,11 @@ fn precompute_freqs_cis(cfg: &V4Config, original_seq_len: usize, base: f32) -> V
         };
         let low = fcd(beta_fast as f64).floor().max(0.0);
         let high = fcd(beta_slow as f64).ceil().min(dim as f64 - 1.0);
-        let (min, max) = if low == high { (low, high + 0.001) } else { (low, high) };
+        let (min, max) = if low == high {
+            (low, high + 0.001)
+        } else {
+            (low, high)
+        };
         let (min, max) = (min as f32, max as f32);
         for (i, f) in freqs.iter_mut().enumerate() {
             let ramp = ((i as f32 - min) / (max - min)).clamp(0.0, 1.0);
@@ -891,7 +927,12 @@ impl Oracle {
     /// combination logits. Note the FIRST normalisation pair is a row *softmax* followed by
     /// a column divide, and only the remaining `iters - 1` passes are plain row/column
     /// divides — that asymmetry is easy to lose in a port.
-    fn sinkhorn(&self, mixes: &[f32], scale: &[f32], base: &[f32]) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    fn sinkhorn(
+        &self,
+        mixes: &[f32],
+        scale: &[f32],
+        base: &[f32],
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let hc = self.cfg.hc_mult;
         let eps = self.cfg.hc_eps;
         let mut pre = vec![0.0f32; hc];
@@ -903,7 +944,8 @@ impl Oracle {
         }
         for j in 0..hc {
             for k in 0..hc {
-                comb[j * hc + k] = mixes[j * hc + k + 2 * hc] * scale[2] + base[j * hc + k + 2 * hc];
+                comb[j * hc + k] =
+                    mixes[j * hc + k + 2 * hc] * scale[2] + base[j * hc + k + 2 * hc];
             }
         }
         // comb = comb.softmax(-1) + eps
@@ -917,7 +959,13 @@ impl Oracle {
         // differ only in which index they hold fixed, so one normaliser takes that as an
         // index function. Two copies would be two places to get the eps or the axis wrong.
         let norm = |c: &mut [f32], by_row: bool| {
-            let at = |fixed: usize, run: usize| if by_row { fixed * hc + run } else { run * hc + fixed };
+            let at = |fixed: usize, run: usize| {
+                if by_row {
+                    fixed * hc + run
+                } else {
+                    run * hc + fixed
+                }
+            };
             for fixed in 0..hc {
                 let s: f32 = (0..hc).map(|r| c[at(fixed, r)]).sum();
                 for r in 0..hc {
@@ -1012,7 +1060,14 @@ impl Oracle {
     /// index and the column normalisation over the SOURCE index. Transposing it keeps every
     /// row of the result a convex-ish combination of the same vectors and is therefore
     /// invisible to any magnitude check.
-    fn hc_post(&self, x: &[f32], residual: &[f32], post: &[f32], comb: &[f32], s: usize) -> Vec<f32> {
+    fn hc_post(
+        &self,
+        x: &[f32],
+        residual: &[f32],
+        post: &[f32],
+        comb: &[f32],
+        s: usize,
+    ) -> Vec<f32> {
         let (hc, dim) = (self.cfg.hc_mult, self.cfg.dim);
         let mut y = vec![0.0f32; s * hc * dim];
         for t in 0..s {
@@ -1040,7 +1095,6 @@ impl Oracle {
         self.round_bf16(&mut y);
         y
     }
-
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1182,7 +1236,8 @@ impl Oracle {
             let mut sb = vec![0.0f32; ents * d];
             for j in 0..ents {
                 let half = if overlap && j >= ratio { d } else { 0 };
-                kb[j * d..(j + 1) * d].copy_from_slice(&cs.kv_state[j * cd + half..j * cd + half + d]);
+                kb[j * d..(j + 1) * d]
+                    .copy_from_slice(&cs.kv_state[j * cd + half..j * cd + half + d]);
                 sb[j * d..(j + 1) * d]
                     .copy_from_slice(&cs.score_state[j * cd + half..j * cd + half + d]);
             }
@@ -1300,7 +1355,12 @@ impl Oracle {
     ) -> Vec<Vec<i64>> {
         let Step { s, start_pos, .. } = *step;
         let c = &self.cfg;
-        let (h, hd, ratio, rd) = (c.index_n_heads, c.index_head_dim, iw.compressor.ratio, c.rope_head_dim);
+        let (h, hd, ratio, rd) = (
+            c.index_n_heads,
+            c.index_head_dim,
+            iw.compressor.ratio,
+            c.rope_head_dim,
+        );
         let end_pos = start_pos + s;
 
         let mut q = self.linear(qr, s, c.q_lora_rank, &iw.wq_b);
@@ -1346,21 +1406,27 @@ impl Oracle {
                     let kvc = &cs.cache[ci * hd..(ci + 1) * hd];
                     // The einsum itself: f32 accumulation, one bf16 store, which is torch's
                     // bf16 matmul and was already right.
-                    let mut dot = bf16_decode(bf16_encode(
-                        (0..hd).map(|i| qh[i] * kvc[i]).sum::<f32>(),
-                    ));
+                    let mut dot =
+                        bf16_decode(bf16_encode((0..hd).map(|i| qh[i] * kvc[i]).sum::<f32>()));
                     if self.defect != Defect::IndexerNoRelu {
                         dot = dot.max(0.0);
                     }
-                    let wt =
-                        if self.defect == Defect::IndexerNoWeights { 1.0 } else { w[t * h + hh] };
+                    let wt = if self.defect == Defect::IndexerNoWeights {
+                        1.0
+                    } else {
+                        w[t * h + hh]
+                    };
                     bf16_decode(bf16_encode(dot * wt))
                 }));
             }
             // Causal mask over compressed blocks, applied before topk (model.py:430-432)
             // and again to the SELECTED indices afterwards (:434-436) — the second pass is
             // what turns a fully-masked row's arbitrary topk into -1s.
-            let limit = if start_pos == 0 { (t + 1) / ratio } else { n_comp };
+            let limit = if start_pos == 0 {
+                (t + 1) / ratio
+            } else {
+                n_comp
+            };
             if start_pos == 0 {
                 for (ci, sc) in score.iter_mut().enumerate() {
                     if ci >= limit {
@@ -1374,7 +1440,13 @@ impl Oracle {
             let sel = topk_idx(&score, k);
             out.push(
                 sel.iter()
-                    .map(|&i| if start_pos == 0 && i >= limit { -1 } else { (i + offset) as i64 })
+                    .map(|&i| {
+                        if start_pos == 0 && i >= limit {
+                            -1
+                        } else {
+                            (i + offset) as i64
+                        }
+                    })
                     .collect(),
             );
         }
@@ -1420,14 +1492,29 @@ pub fn window_topk(win: usize, seqlen: usize, start_pos: usize) -> Vec<Vec<i64>>
 /// pooling (no golden at all at a 13-token prompt), its empty `[13,0]` selection
 /// tensor, and the ranking, which `index_topk` never truncates below 2052 tokens.
 /// Visibility only; no behaviour change.
-pub fn compress_topk(ratio: usize, seqlen: usize, start_pos: usize, offset: usize) -> Vec<Vec<i64>> {
+pub fn compress_topk(
+    ratio: usize,
+    seqlen: usize,
+    start_pos: usize,
+    offset: usize,
+) -> Vec<Vec<i64>> {
     if start_pos > 0 {
-        vec![(0..(start_pos + 1) / ratio).map(|i| (i + offset) as i64).collect()]
+        vec![
+            (0..(start_pos + 1) / ratio)
+                .map(|i| (i + offset) as i64)
+                .collect(),
+        ]
     } else {
         (0..seqlen)
             .map(|t| {
                 (0..seqlen / ratio)
-                    .map(|c| if c >= (t + 1) / ratio { -1 } else { (c + offset) as i64 })
+                    .map(|c| {
+                        if c >= (t + 1) / ratio {
+                            -1
+                        } else {
+                            (c + offset) as i64
+                        }
+                    })
                     .collect()
             })
             .collect()
@@ -1506,12 +1593,29 @@ impl Oracle {
     }
 
     /// `Attention.forward` (model.py:490-548).
-    fn attention(&self, step: &Step, st: &mut LayerState, x: &[f32], cap: &mut Capture) -> Vec<f32> {
-        let Step { lw, layer, s, start_pos, .. } = *step;
+    fn attention(
+        &self,
+        step: &Step,
+        st: &mut LayerState,
+        x: &[f32],
+        cap: &mut Capture,
+    ) -> Vec<f32> {
+        let Step {
+            lw,
+            layer,
+            s,
+            start_pos,
+            ..
+        } = *step;
         let tag = step.tag();
         let c = &self.cfg;
-        let (win, ratio, rd, d, nh) =
-            (c.window_size, c.compress_ratio(layer), c.rope_head_dim, c.head_dim, c.n_heads);
+        let (win, ratio, rd, d, nh) = (
+            c.window_size,
+            c.compress_ratio(layer),
+            c.rope_head_dim,
+            c.head_dim,
+            c.n_heads,
+        );
         let freqs = self.freqs(layer);
 
         // -- q ---------------------------------------------------------------------------
@@ -1522,13 +1626,23 @@ impl Oracle {
         self.round_bf16(&mut q);
         if self.defect == Defect::QkNormAfterRope {
             for i in 0..s * nh {
-                self.rope_row(&mut q[i * d..(i + 1) * d], rd, (start_pos + i / nh, freqs), false);
+                self.rope_row(
+                    &mut q[i * d..(i + 1) * d],
+                    rd,
+                    (start_pos + i / nh, freqs),
+                    false,
+                );
             }
             self.qk_norm(&mut q, d, &lw.q_norm);
         } else {
             self.qk_norm(&mut q, d, &lw.q_norm);
             for i in 0..s * nh {
-                self.rope_row(&mut q[i * d..(i + 1) * d], rd, (start_pos + i / nh, freqs), false);
+                self.rope_row(
+                    &mut q[i * d..(i + 1) * d],
+                    rd,
+                    (start_pos + i / nh, freqs),
+                    false,
+                );
             }
         }
         cap.push(&format!("{tag}.q"), &[s, nh, d], q.clone());
@@ -1538,7 +1652,12 @@ impl Oracle {
         self.round_bf16(&mut kv);
         self.rmsnorm(&mut kv, d, &lw.kv_norm);
         for t in 0..s {
-            self.rope_row(&mut kv[t * d..(t + 1) * d], rd, (start_pos + t, freqs), false);
+            self.rope_row(
+                &mut kv[t * d..(t + 1) * d],
+                rd,
+                (start_pos + t, freqs),
+                false,
+            );
             self.kv_act_quant(&mut kv[t * d..(t + 1) * d], d, rd);
         }
         cap.push(&format!("{tag}.kv_entry"), &[s, d], kv.clone());
@@ -1630,7 +1749,6 @@ impl Oracle {
         };
         let mut o = self.sparse_attn(&q, &full, &lw.attn_sink, &topk, s, (d as f32).powf(-0.5));
 
-
         // -- output ----------------------------------------------------------------------
         // Captured on BOTH sides of the de-rotation on purpose: without the pre-image, a
         // de-rotation defect has no golden that must stay identical and the check loses its
@@ -1639,7 +1757,12 @@ impl Oracle {
         if self.defect != Defect::SkipOutputDerotation {
             let inverse = self.defect != Defect::OutputDerotationForward;
             for i in 0..s * nh {
-                self.rope_row(&mut o[i * d..(i + 1) * d], rd, (start_pos + i / nh, freqs), inverse);
+                self.rope_row(
+                    &mut o[i * d..(i + 1) * d],
+                    rd,
+                    (start_pos + i / nh, freqs),
+                    inverse,
+                );
             }
         }
         cap.push(&format!("{tag}.attn_derot"), &[s, nh, d], o.clone());
@@ -1695,7 +1818,12 @@ impl Oracle {
     ///   `tid2eid[input_id]` and bypass the scores entirely — but the gate still runs, and
     ///   its scores still become the weights.
     pub fn gate(&self, step: &Step, x: &[f32], counters: &mut Counters) -> (Vec<f32>, Vec<usize>) {
-        let Step { lw, s: m, input_ids, .. } = *step;
+        let Step {
+            lw,
+            s: m,
+            input_ids,
+            ..
+        } = *step;
         let c = &self.cfg;
         let k = c.n_activated_experts;
         let logits = self.linear(x, m, c.dim, &lw.gate_w);
@@ -1748,7 +1876,11 @@ impl Oracle {
                 }
                 _ => topk_idx(&selection[t * n..(t + 1) * n], k),
             };
-            let src = if self.defect == Defect::RouterBiasedWeights { &selection } else { &original };
+            let src = if self.defect == Defect::RouterBiasedWeights {
+                &selection
+            } else {
+                &original
+            };
             for (j, &e) in sel.iter().enumerate() {
                 idx[t * k + j] = e;
                 wts[t * k + j] = src[t * n + e];
@@ -1846,13 +1978,21 @@ impl Oracle {
         let k = c.n_activated_experts;
         let (wts, idx) = self.gate(step, x, &mut cap.counters);
         cap.push(&format!("{tag}.router_weights"), &[m, k], wts.clone());
-        cap.push_i(&format!("{tag}.router_indices"), &[m, k], idx.iter().map(|&i| i as i64).collect());
+        cap.push_i(
+            &format!("{tag}.router_indices"),
+            &[m, k],
+            idx.iter().map(|&i| i as i64).collect(),
+        );
 
         let mut y = vec![0.0f32; m * c.dim];
-        let mut by_expert: std::collections::BTreeMap<usize, Vec<(usize, f32)>> = Default::default();
+        let mut by_expert: std::collections::BTreeMap<usize, Vec<(usize, f32)>> =
+            Default::default();
         for t in 0..m {
             for j in 0..k {
-                by_expert.entry(idx[t * k + j]).or_default().push((t, wts[t * k + j]));
+                by_expert
+                    .entry(idx[t * k + j])
+                    .or_default()
+                    .push((t, wts[t * k + j]));
             }
         }
         for (e, rows) in &by_expert {
@@ -1978,7 +2118,11 @@ impl Oracle {
         // `[1]`, not `[3]`: read the shape rather than trusting the caller to have loaded the
         // right tensor. `hc_attn_scale` has the same name shape and three entries, and
         // indexing [0] of it would be silently plausible.
-        assert_eq!(hw.hc_head_scale.len(), 1, "hc_head_scale is a scalar, not a Block's [3]");
+        assert_eq!(
+            hw.hc_head_scale.len(),
+            1,
+            "hc_head_scale is a scalar, not a Block's [3]"
+        );
         let mut y = vec![0.0f32; s * dim];
         for t in 0..s {
             let flat = &h[t * hcd..(t + 1) * hcd];
@@ -2046,10 +2190,18 @@ impl Oracle {
         // `final_norm_out`, not `norm_out`: the matrix selects goldens by NAME SUFFIX, and
         // `.norm_out` would sit one character away from matching `.attn_norm_out` and
         // `.ffn_norm_out` for anyone who later writes the suffix without the leading dot.
-        cap.push(&format!("head.{phase}.final_norm_out"), &[s, dim], x.clone());
+        cap.push(
+            &format!("head.{phase}.final_norm_out"),
+            &[s, dim],
+            x.clone(),
+        );
 
         // `ParallelHead.forward` with `full_logits=False`: `x[:, -1]` — the LAST row only.
-        let row = if self.defect == Defect::HeadLogitsFromFirstRow { 0 } else { s - 1 };
+        let row = if self.defect == Defect::HeadLogitsFromFirstRow {
+            0
+        } else {
+            s - 1
+        };
         // `F.linear(x.float(), self.weight)` on an f32 parameter: the dense branch, so no
         // activation quantization, and the result is f32 and stays f32. Rounding it to bf16
         // here would be a defect all of its own; there is no store in the reference to model.
@@ -2063,13 +2215,21 @@ impl Oracle {
     pub fn run_layer(&self, step: &Step, st: &mut LayerState, h: &mut Vec<f32>, cap: &mut Capture) {
         let Step { lw, s, .. } = *step;
         let tag = step.tag();
-        cap.push(&format!("{tag}.in"), &[s, self.cfg.hc_mult, self.cfg.dim], h.clone());
+        cap.push(
+            &format!("{tag}.in"),
+            &[s, self.cfg.hc_mult, self.cfg.dim],
+            h.clone(),
+        );
 
         let residual = h.clone();
         let (mut x, post, comb) =
             self.hc_pre(h, s, &lw.hc_attn_fn, &lw.hc_attn_scale, &lw.hc_attn_base);
         self.rmsnorm(&mut x, self.cfg.dim, &lw.attn_norm);
-        cap.push(&format!("{tag}.attn_norm_out"), &[s, self.cfg.dim], x.clone());
+        cap.push(
+            &format!("{tag}.attn_norm_out"),
+            &[s, self.cfg.dim],
+            x.clone(),
+        );
         let a = self.attention(step, st, &x, cap);
         cap.push(&format!("{tag}.attn_out"), &[s, self.cfg.dim], a.clone());
         *h = self.hc_post(&a, &residual, &post, &comb, s);
@@ -2078,11 +2238,19 @@ impl Oracle {
         let (mut x, post, comb) =
             self.hc_pre(h, s, &lw.hc_ffn_fn, &lw.hc_ffn_scale, &lw.hc_ffn_base);
         self.rmsnorm(&mut x, self.cfg.dim, &lw.ffn_norm);
-        cap.push(&format!("{tag}.ffn_norm_out"), &[s, self.cfg.dim], x.clone());
+        cap.push(
+            &format!("{tag}.ffn_norm_out"),
+            &[s, self.cfg.dim],
+            x.clone(),
+        );
         let f = self.moe(step, &x, cap);
         cap.push(&format!("{tag}.ffn_out"), &[s, self.cfg.dim], f.clone());
         *h = self.hc_post(&f, &residual, &post, &comb, s);
 
-        cap.push(&format!("{tag}.out"), &[s, self.cfg.hc_mult, self.cfg.dim], h.clone());
+        cap.push(
+            &format!("{tag}.out"),
+            &[s, self.cfg.hc_mult, self.cfg.dim],
+            h.clone(),
+        );
     }
 }

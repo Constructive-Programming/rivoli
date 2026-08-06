@@ -17,11 +17,11 @@
 //! few KB; the real-artifact cases skip loudly when it is absent.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
-use rivoli::artifact::model::V4Config;
 use rivoli::artifact::format::{
     EXPERT_HEADER_BYTES, ExpertHeader, ExpertSet, F4_MAGIC, RoutedFmt, SetDims, VQ3_MAGIC,
     f4_layer_range,
 };
+use rivoli::artifact::model::V4Config;
 use rivoli::artifact::quant::{VQ_ALIGN, f4_expert_stride, i4_expert_stride, vq_expert_stride};
 
 #[path = "common/v4_artifact_dir.rs"]
@@ -361,12 +361,32 @@ fn f4_source_range_is_read_and_confronted_with_the_layer_count() {
 
     for (tag, body, needle) in [
         ("absent", r#"{"num_hidden_layers":43}"#, "no `f4_source`"),
-        ("no_layers", r#"{"f4_source":{"tool":"convert_v4"}}"#, "malformed"),
-        ("not_a_pair", r#"{"f4_source":{"layers":[0,1,2]}}"#, "malformed"),
+        (
+            "no_layers",
+            r#"{"f4_source":{"tool":"convert_v4"}}"#,
+            "malformed",
+        ),
+        (
+            "not_a_pair",
+            r#"{"f4_source":{"layers":[0,1,2]}}"#,
+            "malformed",
+        ),
         // Ranges describing more than the model has, nothing at all, or backwards.
-        ("past_the_end", r#"{"f4_source":{"layers":[0,44]}}"#, "not a non-empty range"),
-        ("empty", r#"{"f4_source":{"layers":[3,3]}}"#, "not a non-empty range"),
-        ("backwards", r#"{"f4_source":{"layers":[5,2]}}"#, "not a non-empty range"),
+        (
+            "past_the_end",
+            r#"{"f4_source":{"layers":[0,44]}}"#,
+            "not a non-empty range",
+        ),
+        (
+            "empty",
+            r#"{"f4_source":{"layers":[3,3]}}"#,
+            "not a non-empty range",
+        ),
+        (
+            "backwards",
+            r#"{"f4_source":{"layers":[5,2]}}"#,
+            "not a non-empty range",
+        ),
     ] {
         write(body);
         refuses(f4_layer_range(&s.dir(), 43), tag, needle);
@@ -388,7 +408,9 @@ fn open_shipped(dir: &str) -> (V4Config, std::ops::Range<usize>, ExpertSet) {
 /// broke, at the real 256 × 13369344, read from the file `convert_v4 --verify` produced.
 #[test]
 fn the_shipped_f4_artifact_opens_at_its_own_layer_range() {
-    let Some(dir) = v4_artifact_dir::v4_artifact("L00.f4") else { return };
+    let Some(dir) = v4_artifact_dir::v4_artifact("L00.f4") else {
+        return;
+    };
     let (cfg, range, set) = open_shipped(&dir);
     assert_eq!(range.start, 0, "this fixture is the starts-at-zero case");
     assert!(
@@ -422,7 +444,9 @@ fn the_shipped_f4_artifact_opens_at_its_own_layer_range() {
 /// silently returning layer 3's descriptor.
 #[test]
 fn an_f4_set_that_does_not_start_at_layer_zero_is_addressed_by_absolute_id() {
-    let Some(dir) = v4_artifact_dir::v4_artifact_l3_5("L03.f4") else { return };
+    let Some(dir) = v4_artifact_dir::v4_artifact_l3_5("L03.f4") else {
+        return;
+    };
     let (_cfg, range, set) = open_shipped(&dir);
     assert_eq!(range, 3..6, "this fixture is the non-zero-start case");
 
@@ -447,7 +471,10 @@ fn an_f4_set_that_does_not_start_at_layer_zero_is_addressed_by_absolute_id() {
     for l in [0, 1, 2, 6] {
         assert!(set.read_spec(l, 0).is_err(), "layer {l} is not in [3, 6)");
     }
-    assert!(set.shared_block(3).is_err(), "still an .f4: no shared block");
+    assert!(
+        set.shared_block(3).is_err(),
+        "still an .f4: no shared block"
+    );
 }
 
 /// **The set answers for its own layout, so nothing can be paired with the wrong one.**

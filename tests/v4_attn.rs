@@ -98,25 +98,26 @@
 // apart and survives no skim.
 use rivoli::artifact::model::V4Config as EngineV4Config;
 use rivoli::artifact::quant::e8m0;
-use rivoli::v4compress::{
-    Buffers, Finish, Geom, LayerKind, RopeParams, compress, freqs_cis, rope_for_layer,
-};
 use rivoli::attn::{
+    Sel,
     v4::{Dims, Fp8W, Io, Scratch, Step, Weights, attention},
-    v4_rope_table_ratio0, v4_topk_idxs, Sel,
+    v4_rope_table_ratio0, v4_topk_idxs,
 };
 use rivoli::backend::gpustream::{HipStream, Timeline};
 use rivoli::backend::hip::{
     device_sync, fill_u32, launch_v4_act_quant, launch_v4_gemv_fp8, launch_v4_rope,
     launch_v4_sparse_attn, memcpy_dtod_async,
 };
-use std::sync::Arc;
 use rivoli::math::{bf16_to_f32, e4m3_to_f32, f32_to_bf16, f32_to_e4m3};
-use rivoli::v4oracle::numerics::{FP8_MAX, act_quant_inplace, fast_round_scale};
 use rivoli::memory::device::DeviceBuf;
+use rivoli::v4compress::{
+    Buffers, Finish, Geom, LayerKind, RopeParams, compress, freqs_cis, rope_for_layer,
+};
 use rivoli::v4oracle::forward::{Capture, Defect, Oracle, Step as OStep};
+use rivoli::v4oracle::numerics::{FP8_MAX, act_quant_inplace, fast_round_scale};
 use rivoli::v4oracle::toy::{self, ToyModel};
 use rivoli::v4oracle::weights::{NamedRng, V4Config, WMat};
+use std::sync::Arc;
 
 mod common;
 use common::{bf16_rows, f32b, f32v, flat_freqs};
@@ -192,11 +193,20 @@ impl Fp8Buf {
         let WMat::Fp8 { w, s, .. } = m else {
             panic!("v4: expected an fp8 weight, the kernels read no other format here");
         };
-        let scales: Vec<f32> = s.iter().map(|&c| e8m0(c).expect("e8m0 scale code")).collect();
-        Self { w: dev_bytes(w), s: dev_f32(&scales) }
+        let scales: Vec<f32> = s
+            .iter()
+            .map(|&c| e8m0(c).expect("e8m0 scale code"))
+            .collect();
+        Self {
+            w: dev_bytes(w),
+            s: dev_f32(&scales),
+        }
     }
     fn ptr(&self) -> Fp8W {
-        Fp8W { w: self.w.ptr(), scale: self.s.ptr().cast() }
+        Fp8W {
+            w: self.w.ptr(),
+            scale: self.s.ptr().cast(),
+        }
     }
 }
 
@@ -222,7 +232,10 @@ impl Fp8Buf {
 fn fixture() -> (V4Config, ToyModel) {
     let cfg = V4Config::toy();
     let mut m = toy::build(&cfg);
-    let (rows, cols) = (cfg.o_groups * cfg.o_lora_rank, cfg.n_heads * cfg.head_dim / cfg.o_groups);
+    let (rows, cols) = (
+        cfg.o_groups * cfg.o_lora_rank,
+        cfg.n_heads * cfg.head_dim / cfg.o_groups,
+    );
     // BOTH layers this file drives. `Gpu::new` calls `Fp8Buf::new` on `wo_a`, which panics
     // on a `Dense`, so a layer added to the drive list without being added here fails
     // loudly at upload rather than silently comparing a different weight.
@@ -272,7 +285,13 @@ fn plain_sel(d: &Dims) -> Sel {
 /// A `Sel` for a layer of any class, and **the one place a field added to `Sel` lands** —
 /// every other `Sel` in this file is built from a `base_sel` with `..`.
 fn base_sel(d: &Dims, kind: LayerKind, index_topk: usize) -> Sel {
-    Sel { win: d.window, kind, index_topk, seqlen: 1, start_pos: 0 }
+    Sel {
+        win: d.window,
+        kind,
+        index_topk,
+        seqlen: 1,
+        start_pos: 0,
+    }
 }
 
 fn dims(cfg: &V4Config) -> Dims {
@@ -299,7 +318,9 @@ struct Phase {
 
 /// The ratio-0 schedule: one prefill, then [`DECODES`] contiguous decode steps.
 fn plain_script() -> Vec<(usize, usize)> {
-    std::iter::once((PROMPT, 0)).chain((0..DECODES).map(|i| (1, PROMPT + i))).collect()
+    std::iter::once((PROMPT, 0))
+        .chain((0..DECODES).map(|i| (1, PROMPT + i)))
+        .collect()
 }
 
 /// The last decode position of [`comp_script`], reached by SKIPPING one that would have
@@ -371,7 +392,11 @@ fn comp_script(cfg: &V4Config) -> Vec<(usize, usize)> {
          and the block index `start_pos/ratio` are both 0 and cannot be told apart"
     );
     // The gap, asserted as a gap: some position this script SKIPS would have emitted.
-    let ran: Vec<usize> = v.iter().filter(|&&(s, _)| s == 1).map(|&(_, p)| p).collect();
+    let ran: Vec<usize> = v
+        .iter()
+        .filter(|&&(s, _)| s == 1)
+        .map(|&(_, p)| p)
+        .collect();
     let last = *ran.last().expect("the script has decode steps");
     assert!(
         (PROMPT..last).any(|p| emits(p) && !ran.contains(&p)),
@@ -407,19 +432,35 @@ fn drive_script(
     let mut st = o.fresh_state(layer);
     let mut out = Vec::new();
     for (k, &(s, start_pos)) in script.iter().enumerate() {
-        let tag = if k == 0 { "pre".to_string() } else { format!("dec{}", k - 1) };
+        let tag = if k == 0 {
+            "pre".to_string()
+        } else {
+            format!("dec{}", k - 1)
+        };
         // Seeded by PHASE only, not by layer: the ratio-0 cell's measured floor and every
         // separation in `each_in_scope_defect_is_further_away_than_the_kernels_are` were
         // taken against these activations, and re-seeding per layer would silently move
         // numbers this file asserts exactly.
         let mut h = draw(&format!("h-{tag}"), s * cfg.hc_mult * cfg.dim);
-        let ids: Vec<u32> =
-            (0..s).map(|i| ((start_pos + i) * 7 % cfg.vocab_size) as u32).collect();
+        let ids: Vec<u32> = (0..s)
+            .map(|i| ((start_pos + i) * 7 % cfg.vocab_size) as u32)
+            .collect();
         let mut cap = Capture::default();
-        let step =
-            OStep { lw: &m.layers[layer], layer, input_ids: &ids, phase: &tag, s, start_pos };
+        let step = OStep {
+            lw: &m.layers[layer],
+            layer,
+            input_ids: &ids,
+            phase: &tag,
+            s,
+            start_pos,
+        };
         o.run_layer(&step, &mut st, &mut h, &mut cap);
-        out.push(Phase { tag: step.tag(), m: s, start_pos, cap });
+        out.push(Phase {
+            tag: step.tag(),
+            m: s,
+            start_pos,
+            cap,
+        });
     }
     out
 }
@@ -431,7 +472,10 @@ fn draw(name: &str, n: usize) -> Vec<f32> {
 
 fn golden<'a>(p: &'a Phase, suffix: &str) -> &'a [f32] {
     captured(p, suffix).unwrap_or_else(|| {
-        panic!("golden {}.{suffix} is missing -- the oracle no longer emits it", p.tag)
+        panic!(
+            "golden {}.{suffix} is missing -- the oracle no longer emits it",
+            p.tag
+        )
     })
 }
 
@@ -476,10 +520,20 @@ fn mono(x: f32) -> i32 {
 }
 
 fn score(got: &[f32], want: &[f32]) -> Score {
-    assert_eq!(got.len(), want.len(), "shape disagreement is not a tolerance question");
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "shape disagreement is not a tolerance question"
+    );
     let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-30);
-    let mut s =
-        Score { max_ulp: 0, rel: 0.0, differing: 0, total: got.len(), nans: 0, unrounded: 0 };
+    let mut s = Score {
+        max_ulp: 0,
+        rel: 0.0,
+        differing: 0,
+        total: got.len(),
+        nans: 0,
+        unrounded: 0,
+    };
     for (&a, &b) in got.iter().zip(want) {
         // The low 16 bits of a bf16-valued f32 are zero. Checked on `got` only: `want`
         // is the oracle's, which rounds by construction.
@@ -528,7 +582,10 @@ fn assert_within(what: &str, got: &[f32], want: &[f32]) -> Score {
          since it rounds both sides. {s:?}",
         s.unrounded
     );
-    assert!(s.max_ulp <= ULP_BUDGET, "{what}: over the {ULP_BUDGET}-ULP budget -- {s:?}");
+    assert!(
+        s.max_ulp <= ULP_BUDGET,
+        "{what}: over the {ULP_BUDGET}-ULP budget -- {s:?}"
+    );
     s
 }
 
@@ -652,10 +709,12 @@ impl Gpu {
     fn new(cfg: &V4Config, model: &ToyModel, d: &Dims, max_m: usize, layer: usize) -> Self {
         let lw = &model.layers[layer];
         let kind = LayerKind::from_ratio(cfg.compress_ratio(layer));
-        let w: Vec<Fp8Buf> =
-            [&lw.wq_a, &lw.wq_b, &lw.wkv, &lw.wo_a, &lw.wo_b].map(Fp8Buf::new).into();
-        let norms: Vec<DeviceBuf> =
-            [&lw.q_norm, &lw.kv_norm, &lw.attn_sink].map(|v| dev_f32(v)).into();
+        let w: Vec<Fp8Buf> = [&lw.wq_a, &lw.wq_b, &lw.wkv, &lw.wo_a, &lw.wo_b]
+            .map(Fp8Buf::new)
+            .into();
+        let norms: Vec<DeviceBuf> = [&lw.q_norm, &lw.kv_norm, &lw.attn_sink]
+            .map(|v| dev_f32(v))
+            .into();
         let weights = Weights {
             wq_a: w[0].ptr(),
             q_norm: norms[0].ptr().cast(),
@@ -767,7 +826,11 @@ impl Gpu {
         // else entirely" would fail here. It would not; the row is the placement's own.
         // `Gpu::cache_row` and `COMP_SLOTS` are what check the row.
         if let Some((off, blocks)) = placed {
-            let src = if p.start_pos == 0 { &self.kv } else { &self.ring };
+            let src = if p.start_pos == 0 {
+                &self.kv
+            } else {
+                &self.ring
+            };
             out.compressed = read(src)[off * d.head_dim..(off + blocks) * d.head_dim].to_vec();
         }
         out
@@ -785,7 +848,11 @@ impl Gpu {
     fn attend(&mut self, d: &Dims, p: &Phase) -> StepOut {
         let x = dev_f32(golden(p, "attn_norm_out"));
         let mut idx = Vec::new();
-        let sel = Sel { seqlen: p.m, start_pos: p.start_pos, ..self.sel };
+        let sel = Sel {
+            seqlen: p.m,
+            start_pos: p.start_pos,
+            ..self.sel
+        };
         let shape = v4_topk_idxs(sel, &mut idx).unwrap();
         let idxb = dev_i32(&idx);
         let io = self.io(&x, &idxb, shape);
@@ -797,8 +864,7 @@ impl Gpu {
         let stream = self.stream.raw();
         let s = self.scratch();
         // SAFETY: every buffer above outlives the `device_sync` on the next line.
-        unsafe { attention(d, sel, &self.weights, &s, &io, step, stream) }
-            .expect("v4 attention");
+        unsafe { attention(d, sel, &self.weights, &s, &io, step, stream) }.expect("v4 attention");
         device_sync().expect("sync");
         let n = |b: &DeviceBuf, len: usize| read(b)[..len].to_vec();
         let nhd = d.n_heads * d.head_dim;
@@ -809,7 +875,14 @@ impl Gpu {
             // `if start_pos == 0 { seqlen.min(win) } else { win }` in the harness could
             // drift from the engine's and would then report a compressed column count that
             // was wrong in exactly the direction that hides a missing one.
-            n_comp: shape.1 - Sel { kind: LayerKind::Plain, ..sel }.shape().unwrap().1,
+            n_comp: shape.1
+                - Sel {
+                    kind: LayerKind::Plain,
+                    ..sel
+                }
+                .shape()
+                .unwrap()
+                .1,
             // The largest index the selection actually names. `n_comp > 0` says the
             // compressed COLUMNS exist; this says they are not all `-1`, which is the
             // vacuous way for a compressed selection to be present and read nothing.
@@ -833,7 +906,9 @@ impl Gpu {
     fn poke(&mut self, d: &Dims, row: usize, fill: f32) -> Vec<f32> {
         let was = self.cache_row(d, row);
         let hd = d.head_dim;
-        self.ring.copy_in_at(row * hd * size_of::<f32>(), &f32b(&vec![fill; hd])).expect("poke");
+        self.ring
+            .copy_in_at(row * hd * size_of::<f32>(), &f32b(&vec![fill; hd]))
+            .expect("poke");
         was
     }
 
@@ -847,13 +922,19 @@ impl Gpu {
         // can overrun: `poke`'s rows are gated by `base.n_comp < capacity` at its call site,
         // while `cache_row`'s come from `COMP_SLOTS` — a hand-written table whose block index
         // nothing else bounds. `poke`'s copy of this assert could not fire and was cut.
-        assert!(row < self.ring_rows, "cache row {row} is past the {} the ring holds", self.ring_rows);
+        assert!(
+            row < self.ring_rows,
+            "cache row {row} is past the {} the ring holds",
+            self.ring_rows
+        );
         let hd = d.head_dim;
         read(&self.ring)[row * hd..(row + 1) * hd].to_vec()
     }
 
     fn unpoke(&mut self, d: &Dims, row: usize, was: &[f32]) {
-        self.ring.copy_in_at(row * d.head_dim * size_of::<f32>(), &f32b(was)).expect("unpoke");
+        self.ring
+            .copy_in_at(row * d.head_dim * size_of::<f32>(), &f32b(was))
+            .expect("unpoke");
     }
 
     /// `Compressor.forward` for this step, with its output placed where the reference puts
@@ -872,12 +953,7 @@ impl Gpu {
     /// **At decode the slot is `start_pos / ratio`, never "the next free one."** That is
     /// requirement 2 of `docs/investigations/v4-flash-port.md`, and the two rules agree on
     /// every contiguous script — which is why [`comp_script`] has a gap in it.
-    fn compress_and_place(
-        &mut self,
-        d: &Dims,
-        x: &DeviceBuf,
-        p: &Phase,
-    ) -> Option<(usize, usize)> {
+    fn compress_and_place(&mut self, d: &Dims, x: &DeviceBuf, p: &Phase) -> Option<(usize, usize)> {
         let c = self.comp.as_mut()?;
         let fin = Finish {
             norm: c.norm.ptr().cast(),
@@ -914,8 +990,7 @@ impl Gpu {
         unsafe {
             if p.start_pos == 0 {
                 let tail = self.kv.ptr_mut().cast::<f32>().add(p.m * hd);
-                memcpy_dtod_async(tail.cast(), src, blocks * row, stream)
-                    .expect("prefill kv tail");
+                memcpy_dtod_async(tail.cast(), src, blocks * row, stream).expect("prefill kv tail");
                 memcpy_dtod_async(cache.add(d.window * hd).cast(), src, blocks * row, stream)
                     .expect("prefill cache persist");
                 Some((p.m, blocks))
@@ -976,9 +1051,21 @@ impl Harness {
         let script = &script_of(&cfg);
         let d = dims(&cfg);
         let clean = drive_script(&cfg, &model, Defect::None, layer, script);
-        let max_m = script.iter().map(|&(s, _)| s).max().expect("an empty script gates nothing");
+        let max_m = script
+            .iter()
+            .map(|&(s, _)| s)
+            .max()
+            .expect("an empty script gates nothing");
         let gpu = Gpu::new(&cfg, &model, &d, max_m, layer);
-        Self { cfg, model, d, clean, gpu, layer, script: script.to_vec() }
+        Self {
+            cfg,
+            model,
+            d,
+            clean,
+            gpu,
+            layer,
+            script: script.to_vec(),
+        }
     }
 
     /// The compressed cell's harness. The script comes from the harness's OWN `cfg`, so a
@@ -993,7 +1080,9 @@ impl Harness {
 
 #[test]
 fn attention_matches_the_oracle_at_every_stage_of_a_ratio_zero_layer() {
-    let Harness { d, clean, mut gpu, .. } = Harness::new();
+    let Harness {
+        d, clean, mut gpu, ..
+    } = Harness::new();
     for p in &clean {
         let got = gpu.step(&d, p);
         assert_eq!(got.n_comp, 0, "a ratio-0 layer has no compressed columns");
@@ -1021,7 +1110,9 @@ fn assert_stages(p: &Phase, got: &StepOut) {
 /// disagreement here cannot be blamed on an upstream projection.
 #[test]
 fn sparse_attn_alone_matches_the_oracle_including_the_sink() {
-    let Harness { d, clean, model, .. } = Harness::new();
+    let Harness {
+        d, clean, model, ..
+    } = Harness::new();
     let sink = dev_f32(&model.layers[LAYER].attn_sink);
     // Prefill only: at prefill `sparse_attn` reads the prompt's own KV, so `.kv_entry`
     // IS the whole of what it attends. At decode it reads the ring, which is state this
@@ -1030,7 +1121,15 @@ fn sparse_attn_alone_matches_the_oracle_including_the_sink() {
     let q = dev_f32(golden(p, "q"));
     let kv = dev_f32(golden(p, "kv_entry"));
     let mut idx = Vec::new();
-    let (rows, cols) = v4_topk_idxs(Sel { seqlen: p.m, start_pos: 0, ..plain_sel(&d) }, &mut idx).unwrap();
+    let (rows, cols) = v4_topk_idxs(
+        Sel {
+            seqlen: p.m,
+            start_pos: 0,
+            ..plain_sel(&d)
+        },
+        &mut idx,
+    )
+    .unwrap();
     assert_eq!(rows, p.m);
     let idxb = dev_i32(&idx);
     let mut o = dev_f32(&vec![0.0f32; p.m * d.n_heads * d.head_dim]);
@@ -1099,7 +1198,10 @@ fn in_scope() -> Vec<(&'static str, Defect)> {
 /// capture files them under. Spelled once so the two scoring loops below cannot drift
 /// into comparing `.attn_derot` against `.attn_out`.
 fn stages(o: &StepOut) -> impl Iterator<Item = (&'static str, &'static str, &[f32])> {
-    STAGES.iter().zip(&o.v).map(|(&(name, blame), v)| (name, blame, v.as_slice()))
+    STAGES
+        .iter()
+        .zip(&o.v)
+        .map(|(&(name, blame), v)| (name, blame, v.as_slice()))
 }
 
 /// The four goldens one `attention` call leaves behind: the name the capture files each
@@ -1130,7 +1232,11 @@ fn reach(refs: &[Phase], mine: &[StepOut]) -> i32 {
     // here from the ratio-0 sweep — named a state that cannot occur. What CAN occur is the
     // caller error: this file now has two cells with two scripts of different lengths, and
     // `reach(&ratio0_clean, &compressed_mine)` type-checks.
-    assert_eq!(refs.len(), mine.len(), "refs and mine come from different runs");
+    assert_eq!(
+        refs.len(),
+        mine.len(),
+        "refs and mine come from different runs"
+    );
     refs.iter()
         .zip(mine)
         .flat_map(|(p, v)| stages(v).map(|(name, _, got)| score(got, golden(p, name)).max_ulp))
@@ -1140,13 +1246,24 @@ fn reach(refs: &[Phase], mine: &[StepOut]) -> i32 {
 
 #[test]
 fn each_in_scope_defect_is_further_away_than_the_kernels_are() {
-    let Harness { cfg, model, d, clean, mut gpu, layer, script } = Harness::new();
+    let Harness {
+        cfg,
+        model,
+        d,
+        clean,
+        mut gpu,
+        layer,
+        script,
+    } = Harness::new();
     // The GPU's own output for every step, taken ONCE and reused: every distance below
     // is measured from the same point, so the numbers are comparable to each other and
     // not merely each to its own baseline.
     let mine: Vec<StepOut> = clean.iter().map(|p| gpu.step(&d, p)).collect();
     let floor = reach(&clean, &mine);
-    println!("kernel-vs-oracle floor: {floor} bf16 ULP over {} steps", clean.len());
+    println!(
+        "kernel-vs-oracle floor: {floor} bf16 ULP over {} steps",
+        clean.len()
+    );
     // MEASURED 2026-08-05 on gfx1151: 0 ULP at prefill and both decode steps.
     //
     // That is 0 ULP, which is NOT by itself bit-identity: `mono` rounds both sides to
@@ -1189,7 +1306,10 @@ fn each_in_scope_defect_is_further_away_than_the_kernels_are() {
     // the floor is visible as a shrinking margin before it is visible as a failure.
     let (d_worst, r_worst) = worst.expect("in_scope() is empty");
     println!("tightest margin: {d_worst:?} at {r_worst} ULP against a floor of {floor}");
-    assert_eq!(floor, 0, "the kernels are no longer bit-exact against the oracle");
+    assert_eq!(
+        floor, 0,
+        "the kernels are no longer bit-exact against the oracle"
+    );
 
     // ANTI-DRIFT. The oracle owns the defect set; this file names a subset of it. If a
     // breakage is added there, the complement changes and this fails — which forces S2b's
@@ -1214,7 +1334,6 @@ fn each_in_scope_defect_is_further_away_than_the_kernels_are() {
         listed.len()
     );
 }
-
 
 /// **Every device operation in `attention` runs on the stream it was given — observed, not
 /// inferred.**
@@ -1282,7 +1401,9 @@ fn each_in_scope_defect_is_further_away_than_the_kernels_are() {
 /// - **The five `gemv_fp8`s.** Each writes a buffer it does not read, from a poisoned input.
 #[test]
 fn the_attention_block_is_entirely_on_its_stream() {
-    let Harness { d, clean, mut gpu, .. } = Harness::new();
+    let Harness {
+        d, clean, mut gpu, ..
+    } = Harness::new();
     let p = &clean[0];
     // NO precondition on `p.m` against `d.window`, and an earlier draft of this test had one:
     // `assert!(p.m <= d.window)`, on the belief that it drove the short-prefill arm. It does
@@ -1299,8 +1420,15 @@ fn the_attention_block_is_entirely_on_its_stream() {
     // ordinary (no NaN/inf, which would make `act_quant`'s amax reduction meaningless) and
     // whose low bits differ, so any copy between two of them shows.
     const POISON: [u32; 9] = [
-        0x4321_0001, 0x4321_0002, 0x4321_0003, 0x4321_0004, 0x4321_0005, 0x4321_0006,
-        0x4321_0007, 0x4321_0008, 0x4321_0009,
+        0x4321_0001,
+        0x4321_0002,
+        0x4321_0003,
+        0x4321_0004,
+        0x4321_0005,
+        0x4321_0006,
+        0x4321_0007,
+        0x4321_0008,
+        0x4321_0009,
     ];
     // NON-VACUITY for the four in-place `act_quant` operations, measured on the host with the
     // oracle's own quantizer rather than argued: if a poison value survived quantization
@@ -1318,8 +1446,15 @@ fn the_attention_block_is_entirely_on_its_stream() {
 
     let x = dev_f32(golden(p, "attn_norm_out"));
     let mut idx = Vec::new();
-    let shape =
-        v4_topk_idxs(Sel { seqlen: p.m, start_pos: 0, ..plain_sel(&d) }, &mut idx).unwrap();
+    let shape = v4_topk_idxs(
+        Sel {
+            seqlen: p.m,
+            start_pos: 0,
+            ..plain_sel(&d)
+        },
+        &mut idx,
+    )
+    .unwrap();
     let idxb = dev_i32(&idx);
 
     // Poison every destination. `fill_u32` is itself a null-stream launch, which is fine and
@@ -1350,8 +1485,15 @@ fn the_attention_block_is_entirely_on_its_stream() {
     ];
     {
         let bufs: [&mut DeviceBuf; 9] = [
-            &mut gpu.xq, &mut gpu.qr, &mut gpu.qrq, &mut gpu.q, &mut gpu.kv, &mut gpu.o,
-            &mut gpu.y, &mut gpu.ring, &mut gpu.out,
+            &mut gpu.xq,
+            &mut gpu.qr,
+            &mut gpu.qrq,
+            &mut gpu.q,
+            &mut gpu.kv,
+            &mut gpu.o,
+            &mut gpu.y,
+            &mut gpu.ring,
+            &mut gpu.out,
         ];
         for ((len, pat), b) in plan.into_iter().zip(POISON).zip(bufs) {
             // SAFETY: `b` owns at least `len * 4` bytes by `Gpu::new`'s sizing.
@@ -1375,7 +1517,11 @@ fn the_attention_block_is_entirely_on_its_stream() {
     // this array is what jscpd refused, and rightly: the two snapshots must be over the same
     // buffers in the same order or the comparison below indexes one against the other's names.
     let snapshot = |g: &Gpu| -> Vec<Vec<f32>> {
-        [&g.xq, &g.qr, &g.qrq, &g.q, &g.kv, &g.o, &g.y, &g.ring, &g.out].map(read).into()
+        [
+            &g.xq, &g.qr, &g.qrq, &g.q, &g.kv, &g.o, &g.y, &g.ring, &g.out,
+        ]
+        .map(read)
+        .into()
     };
 
     let tl = Arc::new(Timeline::new().expect("timeline"));
@@ -1393,8 +1539,18 @@ fn the_attention_block_is_entirely_on_its_stream() {
 
     tl.wait(stream, 1).expect("gate the stream");
     // SAFETY: every buffer above outlives the `device_sync` after the release below.
-    unsafe { attention(&d, plain_sel(&d), &gpu.weights, &s, &io, Step::Prefill { seqlen: p.m }, stream) }
-        .expect("v4 attention");
+    unsafe {
+        attention(
+            &d,
+            plain_sel(&d),
+            &gpu.weights,
+            &s,
+            &io,
+            Step::Prefill { seqlen: p.m },
+            stream,
+        )
+    }
+    .expect("v4 attention");
 
     // Acquire load, no sync and no stall — so this cannot itself deadlock.
     let armed = tl.completed();
@@ -1405,10 +1561,15 @@ fn the_attention_block_is_entirely_on_its_stream() {
     device_sync().expect("sync after release");
     let after = snapshot(&gpu);
 
-    assert_eq!(armed, 0, "the gate was already open, so nothing was ever parked");
+    assert_eq!(
+        armed, 0,
+        "the gate was already open, so nothing was ever parked"
+    );
     const NAMES: [&str; 9] = ["xq", "qr", "qrq", "q", "kv", "o", "y", "cache", "out"];
     for (i, (len, name)) in plan.into_iter().zip(NAMES).enumerate() {
-        let stale = during[i][..len].iter().position(|v| v.to_bits() != POISON[i]);
+        let stale = during[i][..len]
+            .iter()
+            .position(|v| v.to_bits() != POISON[i]);
         assert!(
             stale.is_none(),
             "`{name}` changed at element {} while the stream was GATED, so an operation \
@@ -1436,16 +1597,33 @@ fn the_attention_block_is_entirely_on_its_stream() {
 /// a guard that rejects everything is not a guard.
 #[test]
 fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
-    let Harness { d, clean, mut gpu, .. } = Harness::new();
+    let Harness {
+        d, clean, mut gpu, ..
+    } = Harness::new();
     let p = &clean[0];
     // A prefill of 4 against a window of 8: `v4_topk_idxs` returns 4 columns, and the
     // whole point is that `window` is the plausible wrong answer.
     let short = 4usize;
-    assert!(short < d.window, "the collision this test needs does not exist");
+    assert!(
+        short < d.window,
+        "the collision this test needs does not exist"
+    );
     let x = dev_f32(&golden(p, "attn_norm_out")[..short * d.dim]);
     let mut idx = Vec::new();
-    let right = v4_topk_idxs(Sel { seqlen: short, start_pos: 0, ..plain_sel(&d) }, &mut idx).unwrap();
-    assert_eq!(right, (short, short), "a short prefill no longer narrows its columns");
+    let right = v4_topk_idxs(
+        Sel {
+            seqlen: short,
+            start_pos: 0,
+            ..plain_sel(&d)
+        },
+        &mut idx,
+    )
+    .unwrap();
+    assert_eq!(
+        right,
+        (short, short),
+        "a short prefill no longer narrows its columns"
+    );
     let idxb = dev_i32(&idx);
     let mut io = Io {
         x: x.ptr().cast(),
@@ -1458,18 +1636,37 @@ fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
     let s = gpu.scratch();
     let stream = gpu.stream.raw();
     // SAFETY: buffers outlive the call; it returns before any launch.
-    let e = unsafe { attention(
-                &d,
-                plain_sel(&d), &gpu.weights, &s, &io, Step::Prefill { seqlen: short }, stream) }
-        .expect_err("a 4-row prefill must not accept an 8-column selection");
-    assert!(format!("{e}").contains("selection"), "rejected for the wrong reason: {e}");
+    let e = unsafe {
+        attention(
+            &d,
+            plain_sel(&d),
+            &gpu.weights,
+            &s,
+            &io,
+            Step::Prefill { seqlen: short },
+            stream,
+        )
+    }
+    .expect_err("a 4-row prefill must not accept an 8-column selection");
+    assert!(
+        format!("{e}").contains("selection"),
+        "rejected for the wrong reason: {e}"
+    );
 
     io.idxs_shape = right;
     // SAFETY: as above; this one does launch, and the sync below joins it.
-    unsafe { attention(
-                &d,
-                plain_sel(&d), &gpu.weights, &s, &io, Step::Prefill { seqlen: short }, stream) }
-        .expect("the correct shape must be accepted");
+    unsafe {
+        attention(
+            &d,
+            plain_sel(&d),
+            &gpu.weights,
+            &s,
+            &io,
+            Step::Prefill { seqlen: short },
+            stream,
+        )
+    }
+    .expect("the correct shape must be accepted");
     device_sync().expect("sync");
 
     // The decode arm, which the first draft of this test named and never ran. Decode
@@ -1477,22 +1674,53 @@ fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
     // answer here is the narrowed prefill shape -- the exact inverse of the mistake
     // above, and it must be rejected too.
     io.idxs_shape = (1, short);
-    let e = unsafe { attention(
-                &d,
-                plain_sel(&d), &gpu.weights, &s, &io, Step::Decode { pos: PROMPT }, stream) }
-        .expect_err("a decode must not accept a narrowed prefill selection");
-    assert!(format!("{e}").contains("selection"), "rejected for the wrong reason: {e}");
+    let e = unsafe {
+        attention(
+            &d,
+            plain_sel(&d),
+            &gpu.weights,
+            &s,
+            &io,
+            Step::Decode { pos: PROMPT },
+            stream,
+        )
+    }
+    .expect_err("a decode must not accept a narrowed prefill selection");
+    assert!(
+        format!("{e}").contains("selection"),
+        "rejected for the wrong reason: {e}"
+    );
     let mut one = Vec::new();
-    let want = v4_topk_idxs(Sel { seqlen: 1, start_pos: PROMPT, ..plain_sel(&d) }, &mut one).unwrap();
-    assert_eq!(want, (1, d.window), "decode no longer wants the full window");
+    let want = v4_topk_idxs(
+        Sel {
+            seqlen: 1,
+            start_pos: PROMPT,
+            ..plain_sel(&d)
+        },
+        &mut one,
+    )
+    .unwrap();
+    assert_eq!(
+        want,
+        (1, d.window),
+        "decode no longer wants the full window"
+    );
     let oneb = dev_i32(&one);
     io.idxs = oneb.ptr().cast();
     io.idxs_shape = want;
     // SAFETY: as above.
-    unsafe { attention(
-                &d,
-                plain_sel(&d), &gpu.weights, &s, &io, Step::Decode { pos: PROMPT }, stream) }
-        .expect("the correct decode shape must be accepted");
+    unsafe {
+        attention(
+            &d,
+            plain_sel(&d),
+            &gpu.weights,
+            &s,
+            &io,
+            Step::Decode { pos: PROMPT },
+            stream,
+        )
+    }
+    .expect("the correct decode shape must be accepted");
     device_sync().expect("sync");
 }
 
@@ -1520,13 +1748,37 @@ fn the_c_abi_argument_guards_reject_out_of_domain_shapes() {
     unsafe {
         // head_dim past V4_ATTN_THREADS * V4_ATTN_ACC -- silently dropped dims otherwise.
         guard(
-            launch_v4_sparse_attn(p, p, p, b.ptr().cast(), 1, 1, 1025, 8, 1.0, pm, std::ptr::null_mut()),
+            launch_v4_sparse_attn(
+                p,
+                p,
+                p,
+                b.ptr().cast(),
+                1,
+                1,
+                1025,
+                8,
+                1.0,
+                pm,
+                std::ptr::null_mut(),
+            ),
             "1002",
             "head_dim over the accumulator cap",
         );
         // ...and 1024 exactly is accepted, so the cap is a boundary and not a blanket no.
         guard(
-            launch_v4_sparse_attn(p, p, p, b.ptr().cast(), 1, 1, 1024, 1 << 20, 1.0, pm, std::ptr::null_mut()),
+            launch_v4_sparse_attn(
+                p,
+                p,
+                p,
+                b.ptr().cast(),
+                1,
+                1,
+                1024,
+                1 << 20,
+                1.0,
+                pm,
+                std::ptr::null_mut(),
+            ),
             "1006",
             "a topk that overflows LDS",
         );
@@ -1590,7 +1842,11 @@ fn dims_accept_the_real_artifact_and_reject_a_ragged_kv_span() {
     let cfg: EngineV4Config = rivoli::artifact::model::load_config(DIR).expect("V4 config");
     let d = Dims::from_config(&cfg).expect("the shipped config must be runnable");
     assert_eq!((d.head_dim, d.rope_head_dim, d.n_heads), (512, 64, 64));
-    assert_eq!((d.head_dim - d.rope_head_dim) % 64, 0, "the partial act_quant needs whole blocks");
+    assert_eq!(
+        (d.head_dim - d.rope_head_dim) % 64,
+        0,
+        "the partial act_quant needs whole blocks"
+    );
     // The two fields `V4Config` gained in `b5d4083`. What these pin is the WIRING —
     // that `from_config` puts `cfg.sliding_window` into `Dims.window` and
     // `cfg.rms_norm_eps` into `Dims.norm_eps`, rather than another field of the same
@@ -1599,8 +1855,14 @@ fn dims_accept_the_real_artifact_and_reject_a_ragged_kv_span() {
     // `#[serde(default)]` yields 0 and is caught upstream by the zero sweep. The guard
     // against defaults is `every_v4_field_is_required`, which covers both since
     // `b5d4083` put them in `V4_BASE`.
-    assert_eq!(d.window, 128, "sliding_window is not wired through to Dims.window");
-    assert!((d.norm_eps - 1e-6).abs() < 1e-12, "rms_norm_eps is not wired through to Dims.norm_eps");
+    assert_eq!(
+        d.window, 128,
+        "sliding_window is not wired through to Dims.window"
+    );
+    assert!(
+        (d.norm_eps - 1e-6).abs() < 1e-12,
+        "rms_norm_eps is not wired through to Dims.norm_eps"
+    );
 
     // The rejection half. A `rope_head_dim` that leaves a ragged non-RoPE span would
     // make `act_quant` quantize a short tail block against its own amax — values the
@@ -1608,7 +1870,10 @@ fn dims_accept_the_real_artifact_and_reject_a_ragged_kv_span() {
     let mut ragged = cfg.clone();
     ragged.qk_rope_head_dim = 66;
     let e = Dims::from_config(&ragged).expect_err("a ragged KV span must be refused");
-    assert!(format!("{e}").contains("not a multiple of 64"), "wrong rejection: {e}");
+    assert!(
+        format!("{e}").contains("not a multiple of 64"),
+        "wrong rejection: {e}"
+    );
     // Zero extents. `is_multiple_of` admits zero, so without `from_config`'s explicit
     // sweep each of these reached a launcher as an opaque guard code.
     //
@@ -1636,7 +1901,9 @@ fn dims_accept_the_real_artifact_and_reject_a_ragged_kv_span() {
     let cases: [ZeroCase; 9] = [
         // DERIVED, and the reason this list is 9 and not 8: the KV entry's non-RoPE span
         // is what `act_quant` sizes on, and no config field holds it.
-        ("head_dim - qk_rope_head_dim", |c| c.qk_rope_head_dim = c.head_dim),
+        ("head_dim - qk_rope_head_dim", |c| {
+            c.qk_rope_head_dim = c.head_dim
+        }),
         ("sliding_window", |c| c.sliding_window = 0),
         ("n_heads", |c| c.n_heads = 0),
         ("o_groups", |c| c.o_groups = 0),
@@ -1651,7 +1918,10 @@ fn dims_accept_the_real_artifact_and_reject_a_ragged_kv_span() {
         mutate(&mut bad);
         let e = Dims::from_config(&bad).expect_err("a zero extent must be refused");
         let want = format!("{name} is zero");
-        assert!(format!("{e}").contains(&want), "expected `{want}`, got: {e}");
+        assert!(
+            format!("{e}").contains(&want),
+            "expected `{want}`, got: {e}"
+        );
     }
 }
 
@@ -1689,9 +1959,18 @@ fn act_quant_matches_the_oracle_on_the_subnormal_ties_that_pick_the_rounding_rul
     // ANTI-VACUITY, in two parts.
     // 1. The data must actually land in the subnormal band, or it tests the normal path
     //    twice. The band is |x| < 2^-6 * s.
-    let s = fast_round_scale(row.iter().fold(0.0f32, |a, v| a.max(v.abs())).max(1e-4), 1.0 / FP8_MAX);
-    let sub = want.iter().filter(|v| **v != 0.0 && v.abs() < s * 0.015625).count();
-    assert!(sub >= 8, "only {sub} outputs are subnormal — this block does not reach the branch");
+    let s = fast_round_scale(
+        row.iter().fold(0.0f32, |a, v| a.max(v.abs())).max(1e-4),
+        1.0 / FP8_MAX,
+    );
+    let sub = want
+        .iter()
+        .filter(|v| **v != 0.0 && v.abs() < s * 0.015625)
+        .count();
+    assert!(
+        sub >= 8,
+        "only {sub} outputs are subnormal — this block does not reach the branch"
+    );
     // 2. The data must SEPARATE the two rounding rules. `math.rs::f32_to_e4m3` is
     //    rivoli's half-away-from-zero encoder; if it produced the same block, then
     //    matching the oracle below would not be evidence that the kernel uses RNE.
@@ -1715,7 +1994,9 @@ fn act_quant_matches_the_oracle_on_the_subnormal_ties_that_pick_the_rounding_rul
     // Bit-exact, not within a tolerance: `act_quant` is comparisons, a power-of-two
     // scale and a table lookup. There is no re-association in it to excuse a difference.
     assert!(
-        got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()),
+        got.iter()
+            .zip(&want)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
         "v4_act_quant disagrees with the oracle on the subnormal ties:\n  got  {:?}\n  want {:?}",
         &got[..16],
         &want[..16]
@@ -1741,13 +2022,21 @@ fn the_comparator_fires_on_each_class_of_wrongness_and_stays_quiet_otherwise() {
     // Identical input: every signal silent. Without this the three below prove only that
     // the signals fire, not that they discriminate.
     let s = score(&clean, &clean);
-    assert_eq!((s.max_ulp, s.differing, s.nans, s.unrounded), (0, 0, 0, 0), "{s:?}");
+    assert_eq!(
+        (s.max_ulp, s.differing, s.nans, s.unrounded),
+        (0, 0, 0, 0),
+        "{s:?}"
+    );
 
     // 1. ULP: one value moved by a single bf16 step.
     let mut off = clean.clone();
     off[7] = bf16_to_f32(f32_to_bf16(off[7]) + 1);
     let s = score(&off, &clean);
-    assert_eq!((s.max_ulp, s.differing), (1, 1), "a one-step move must read as 1 ULP: {s:?}");
+    assert_eq!(
+        (s.max_ulp, s.differing),
+        (1, 1),
+        "a one-step move must read as 1 ULP: {s:?}"
+    );
 
     // 2. `unrounded`: a value that is NOT bf16-representable. It rounds back to exactly
     //    the golden, so `max_ulp` stays 0 -- which is the blindness this signal exists
@@ -1756,7 +2045,10 @@ fn the_comparator_fires_on_each_class_of_wrongness_and_stays_quiet_otherwise() {
     extra[3] = f32::from_bits(clean[3].to_bits() | 0x0000_1234);
     let s = score(&extra, &clean);
     assert_eq!(s.unrounded, 1, "extra f32 mantissa must be seen: {s:?}");
-    assert_eq!(s.max_ulp, 0, "the ULP metric is supposed to be blind here -- {s:?}");
+    assert_eq!(
+        s.max_ulp, 0,
+        "the ULP metric is supposed to be blind here -- {s:?}"
+    );
     assert_eq!(s.differing, 1, "and the bit compare is supposed to see it");
 
     // 3. NaN, one side only. Counted separately, never folded into a distance.
@@ -1767,7 +2059,11 @@ fn the_comparator_fires_on_each_class_of_wrongness_and_stays_quiet_otherwise() {
 
     // `mono` across zero and across the sign -- the ordering the ULP count rests on.
     // -0.0 and +0.0 are the same number one step apart in bits, and must score 0 ULP.
-    assert_eq!(score(&[-0.0f32], &[0.0f32]).max_ulp, 0, "signed zero is not a ULP apart");
+    assert_eq!(
+        score(&[-0.0f32], &[0.0f32]).max_ulp,
+        0,
+        "signed zero is not a ULP apart"
+    );
     // The smallest positive and smallest negative bf16 straddle zero, two steps apart
     // (+min, 0, -min); a naive bit subtraction would call them 2^15 apart.
     //
@@ -1776,14 +2072,21 @@ fn the_comparator_fires_on_each_class_of_wrongness_and_stays_quiet_otherwise() {
     // and went red. `mono` was right and the expectation was not, which is the more
     // useful way round for an assertion about a metric to fail.
     let (tiny_p, tiny_n) = (bf16_to_f32(0x0001), bf16_to_f32(0x8001));
-    assert_eq!(score(&[tiny_p], &[tiny_n]).max_ulp, 2, "mono is not monotone across zero");
+    assert_eq!(
+        score(&[tiny_p], &[tiny_n]).max_ulp,
+        2,
+        "mono is not monotone across zero"
+    );
     // ...and the normal boundary really is 128 subnormal codes above zero, so the ULP
     // count is a count of representable values and not of exponent steps.
     assert_eq!(score(&[bf16_to_f32(0x0080)], &[0.0f32]).max_ulp, 128);
     // ...and it is monotone across the whole ladder, not just near zero.
     let (a, b) = (bf(-3.5), bf(-3.25));
     assert!(mono(a) < mono(b), "mono is not increasing on negatives");
-    assert!(mono(bf(-1.0)) < mono(bf(1.0)), "mono does not order across the sign");
+    assert!(
+        mono(bf(-1.0)) < mono(bf(1.0)),
+        "mono does not order across the sign"
+    );
 }
 
 // ═══ the compressed layer — 41 of the model's 43 ════════════════════════════════════
@@ -1836,7 +2139,11 @@ const OBSERVED: [&str; 7] = [
 fn moved(clean: &[Phase], broken: &[Phase]) -> Vec<(&'static str, Score)> {
     // Not "the defect changed the schedule", which no `Defect` can do — see the doc above.
     // This catches the two runs having been driven from different scripts.
-    assert_eq!(clean.len(), broken.len(), "the two runs walked different scripts");
+    assert_eq!(
+        clean.len(),
+        broken.len(),
+        "the two runs walked different scripts"
+    );
     OBSERVED
         .into_iter()
         .filter_map(|name| {
@@ -1903,10 +2210,22 @@ fn expect_moves(d: Defect) -> &'static [&'static str] {
     // The three most common shapes, named once so a typo in one arm cannot masquerade as a
     // considered classification.
     const AFTER_Q: &[&str] = &["q", "attn_core_out", "attn_derot", "attn_out"];
-    const AFTER_KV: &[&str] = &["kv_entry", "compressed", "attn_core_out", "attn_derot", "attn_out"];
+    const AFTER_KV: &[&str] = &[
+        "kv_entry",
+        "compressed",
+        "attn_core_out",
+        "attn_derot",
+        "attn_out",
+    ];
     const AFTER_CORE: &[&str] = &["attn_core_out", "attn_derot", "attn_out"];
-    const EVERY_ROPE: &[&str] =
-        &["q", "kv_entry", "compressed", "attn_core_out", "attn_derot", "attn_out"];
+    const EVERY_ROPE: &[&str] = &[
+        "q",
+        "kv_entry",
+        "compressed",
+        "attn_core_out",
+        "attn_derot",
+        "attn_out",
+    ];
     match d {
         Defect::None => &[],
         // The q path: `qk_norm` is q-only, so `kv_entry` and `compressed` must not move.
@@ -1935,9 +2254,9 @@ fn expect_moves(d: Defect) -> &'static [&'static str] {
         Defect::RopeNoYarn | Defect::RopeBaseThetaEverywhere => EVERY_ROPE,
         // The KV quantizer, which the compressor's finish also calls (`forward.rs:1253`) —
         // which is why `compressed` is in this list and not only `kv_entry`.
-        Defect::SkipKvActQuant
-        | Defect::KvActQuantWholeTensor
-        | Defect::KvActQuantNoRoundScale => AFTER_KV,
+        Defect::SkipKvActQuant | Defect::KvActQuantWholeTensor | Defect::KvActQuantNoRoundScale => {
+            AFTER_KV
+        }
         Defect::SkipAttnSink | Defect::AttnSinkNotMaxShifted => AFTER_CORE,
         // Prefill-only, and it shows up at DECODE: the prefill attends `kv ++ compressed`
         // and never reads the ring it just seeded, so its own output is untouched and the
@@ -2069,7 +2388,10 @@ fn each_defect_moves_exactly_the_compressed_layer_goldens_it_should() {
     }
     let mut bad = Vec::new();
     for def in Defect::breakages() {
-        let got = moved(&clean, &drive_script(&cfg, &model, def, COMP_LAYER, &script));
+        let got = moved(
+            &clean,
+            &drive_script(&cfg, &model, def, COMP_LAYER, &script),
+        );
         // Both magnitudes on every moved stage, because they disagree and the disagreement
         // is the point (see `moved`): `ulp` is a bf16-CODE distance and blind at zero, `rel`
         // is scale-relative. A `differing`/`total` count separates a systematic move from a
@@ -2077,7 +2399,10 @@ fn each_defect_moves_exactly_the_compressed_layer_goldens_it_should() {
         let evidence: Vec<String> = got
             .iter()
             .map(|(n, s)| {
-                format!("{n}[ulp={} rel={:.2e} {}/{}]", s.max_ulp, s.rel, s.differing, s.total)
+                format!(
+                    "{n}[ulp={} rel={:.2e} {}/{}]",
+                    s.max_ulp, s.rel, s.differing, s.total
+                )
             })
             .collect();
         println!("  {def:<32?} {}", evidence.join(" "));
@@ -2087,8 +2412,16 @@ fn each_defect_moves_exactly_the_compressed_layer_goldens_it_should() {
         // missing name — and the two halves mean opposite things, so they are named apart.
         let want = expect_moves(def);
         let names: Vec<&str> = got.iter().map(|&(n, _)| n).collect();
-        let extra: Vec<&str> = names.iter().copied().filter(|n| !want.contains(n)).collect();
-        let missing: Vec<&str> = want.iter().copied().filter(|n| !names.contains(n)).collect();
+        let extra: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|n| !want.contains(n))
+            .collect();
+        let missing: Vec<&str> = want
+            .iter()
+            .copied()
+            .filter(|n| !names.contains(n))
+            .collect();
         if !extra.is_empty() || !missing.is_empty() {
             bad.push(format!(
                 "{def:?}: reached {extra:?} which it is classified as NOT touching; \
@@ -2130,9 +2463,18 @@ fn each_defect_moves_exactly_the_compressed_layer_goldens_it_should() {
 /// * some later decode step emits — so the decode slot is exercised too.
 #[test]
 fn attention_matches_the_oracle_on_a_compressed_layer_in_both_phases() {
-    let Harness { cfg, d, clean, mut gpu, .. } = Harness::compressed();
+    let Harness {
+        cfg,
+        d,
+        clean,
+        mut gpu,
+        ..
+    } = Harness::compressed();
     let blocks = |p: &Phase| p.cap.counters.compressed_blocks;
-    assert!(blocks(&clean[0]) > 0, "the prefill emits no block; the persist copy gates nothing");
+    assert!(
+        blocks(&clean[0]) > 0,
+        "the prefill emits no block; the persist copy gates nothing"
+    );
     assert_eq!(
         blocks(&clean[1]),
         0,
@@ -2265,7 +2607,11 @@ fn attention_matches_the_oracle_on_a_compressed_layer_in_both_phases() {
     // BOTH directions. Every `COMP_SLOTS` row must have been reached, so a stale entry
     // cannot sit there looking like coverage; and every step that EMITTED must have had a
     // row, so a slot rule cannot go unchecked by being left out of the table.
-    assert_eq!(seen_slots, COMP_SLOTS.len(), "a COMP_SLOTS row names a step this script skips");
+    assert_eq!(
+        seen_slots,
+        COMP_SLOTS.len(),
+        "a COMP_SLOTS row names a step this script skips"
+    );
     assert_eq!(
         seen_slots,
         clean.iter().filter(|p| blocks(p) > 0).count(),
@@ -2304,7 +2650,13 @@ const COMP_SLOTS: &[(usize, usize)] = &[(0, 0), (15, 1), (COMP_SKIP_TO, 3)];
 /// instead.
 #[test]
 fn the_compressed_region_is_read_exactly_where_the_selection_names_it() {
-    let Harness { cfg, d, clean, mut gpu, .. } = Harness::compressed();
+    let Harness {
+        cfg,
+        d,
+        clean,
+        mut gpu,
+        ..
+    } = Harness::compressed();
     for p in &clean {
         gpu.step(&d, p);
     }
@@ -2323,7 +2675,10 @@ fn the_compressed_region_is_read_exactly_where_the_selection_names_it() {
     // read that is not there. Establish the baseline is stable, then perturb it.
     let again = gpu.attend(&d, p);
     assert!(
-        again.v[3].iter().zip(&base.v[3]).all(|(a, b)| a.to_bits() == b.to_bits()),
+        again.v[3]
+            .iter()
+            .zip(&base.v[3])
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
         "`attend` is not idempotent, so nothing below is attributable to the poison"
     );
 
@@ -2338,7 +2693,11 @@ fn the_compressed_region_is_read_exactly_where_the_selection_names_it() {
     // and probe 2 is what turns probe 1 from "reads at least here" into "reads exactly here".
     for (row, what, must_move) in [
         (d.window, "compressed block 0 (selected)", true),
-        (d.window + base.n_comp, "the first compressed block PAST the selection", false),
+        (
+            d.window + base.n_comp,
+            "the first compressed block PAST the selection",
+            false,
+        ),
     ] {
         let was = gpu.poke(&d, row, POISON);
         let got = gpu.attend(&d, p);
@@ -2356,7 +2715,10 @@ fn the_compressed_region_is_read_exactly_where_the_selection_names_it() {
     // only check that it delivered.
     let restored = gpu.attend(&d, p);
     assert!(
-        restored.v[3].iter().zip(&base.v[3]).all(|(a, b)| a.to_bits() == b.to_bits()),
+        restored.v[3]
+            .iter()
+            .zip(&base.v[3])
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
         "`unpoke` did not restore the cache: a later test sharing this harness would run on \
          a poisoned buffer"
     );
@@ -2383,10 +2745,22 @@ fn the_two_rope_table_constructions_agree_on_the_un_yarned_table() {
         rope_for_layer(compressed, cfg.rope_theta, LayerKind::Plain),
         cfg.max_seq_len,
     ));
-    assert_eq!(direct.len(), via_selector.len(), "the two tables are not even the same shape");
-    let differing =
-        direct.iter().zip(&via_selector).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-    assert_eq!(differing, 0, "{differing} of {} entries differ", direct.len());
+    assert_eq!(
+        direct.len(),
+        via_selector.len(),
+        "the two tables are not even the same shape"
+    );
+    let differing = direct
+        .iter()
+        .zip(&via_selector)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    assert_eq!(
+        differing,
+        0,
+        "{differing} of {} entries differ",
+        direct.len()
+    );
     // ANTI-VACUITY: `rope_for_layer` must actually be making a CHOICE here. Handing it a
     // compressed `LayerKind` has to produce a different table, or the equality above would
     // hold for a selector that ignored its argument entirely.
@@ -2394,7 +2768,10 @@ fn the_two_rope_table_constructions_agree_on_the_un_yarned_table() {
         rope_for_layer(compressed, cfg.rope_theta, LayerKind::from_ratio(8)),
         cfg.max_seq_len,
     ));
-    assert_ne!(direct, yarn, "`rope_for_layer` returns the same table for both layer classes");
+    assert_ne!(
+        direct, yarn,
+        "`rope_for_layer` returns the same table for both layer classes"
+    );
 }
 
 /// The compressed cell's separation sweep: every breakage [`expect_moves`] says reaches one
@@ -2415,7 +2792,11 @@ fn the_two_rope_table_constructions_agree_on_the_un_yarned_table() {
 ///   `NoBf16Rounding` is covered instead by `Score::unrounded`, a property of the GPU output.
 fn compressed_sweep() -> Vec<Defect> {
     Defect::breakages()
-        .filter(|d| expect_moves(*d).iter().any(|n| STAGES.iter().any(|(s, _)| s == n)))
+        .filter(|d| {
+            expect_moves(*d)
+                .iter()
+                .any(|n| STAGES.iter().any(|(s, _)| s == n))
+        })
         .filter(|d| {
             !matches!(
                 d,
@@ -2441,10 +2822,21 @@ fn compressed_sweep() -> Vec<Defect> {
 /// `attention_matches_the_oracle_on_a_compressed_layer_in_both_phases`.
 #[test]
 fn each_compressed_defect_is_further_away_than_the_kernels_are() {
-    let Harness { cfg, model, d, clean, mut gpu, layer, script } = Harness::compressed();
+    let Harness {
+        cfg,
+        model,
+        d,
+        clean,
+        mut gpu,
+        layer,
+        script,
+    } = Harness::compressed();
     let mine: Vec<StepOut> = clean.iter().map(|p| gpu.step(&d, p)).collect();
     let floor = reach(&clean, &mine);
-    println!("compressed-layer kernel-vs-oracle floor: {floor} bf16 ULP over {} steps", clean.len());
+    println!(
+        "compressed-layer kernel-vs-oracle floor: {floor} bf16 ULP over {} steps",
+        clean.len()
+    );
 
     // No `sweep.len() == N` anti-drift record, deliberately: a new `Defect` variant is
     // already a COMPILE error at `expect_moves`, which is the same moment and the same
@@ -2472,5 +2864,8 @@ fn each_compressed_defect_is_further_away_than_the_kernels_are() {
     // the ratio-0 sweep gives. Pinned at what the kernels DO, not at what `ULP_BUDGET`
     // allows: a silent drift from 0 to 1 is the first observable sign of a second error
     // source, and on this cell it would most likely be the compressor's e4m3 boundary.
-    assert_eq!(floor, 0, "the compressed layer is no longer bit-exact against the oracle");
+    assert_eq!(
+        floor, 0,
+        "the compressed layer is no longer bit-exact against the oracle"
+    );
 }
