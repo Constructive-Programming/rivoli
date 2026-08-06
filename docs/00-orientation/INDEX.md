@@ -33,13 +33,14 @@ measured, kept; the result is in the engine. `closed-mixed` — parts of both, b
 | [`modes.md`](../reference/modes.md) | live | The --mode × --cache-policy matrix and which knob does what. Quality ladder: int4 5.120 > hybrid 5.189 > int3-vq 5.275. |
 | [`vulkan-kernels.md`](../reference/vulkan-kernels.md) | live | What the Vulkan backend has and what binds anyone editing a shader: 16 of 29 kernels, ~1.9x slower on --mode int3-vq --attn dense, the device requirements, the numerics and index-width rules, the mechanised-guard registry, and two OPEN fp8-dot gaps. |
 | [`serving.md`](../reference/serving.md) | live | The OpenAI HTTP server (--port). Thinking defaults OFF and is a prompt prefill, not a flag; tool calling works; sampling and /v1/completions do not, on purpose. |
+| [`gpu-lock.md`](../reference/gpu-lock.md) | live | llama-swap's Vulkan pod on rh-anine now shares the SAME /var/run/sys-gpu.lock every bare-metal GPU command already flocks (TOUR.md, docs/measurement/) — no rivoli code changes, this documents the other side of an existing contract. |
 
 ## measurement/ — how to measure, and what was measured
 
 | doc | status | verdict |
 |---|---|---|
 | [`how-to-measure.md`](../measurement/how-to-measure.md) | live | How to measure, and the four-out-of-five lesson that says why the ISA beats a profile. |
-| [`perf-roadmap.md`](../measurement/perf-roadmap.md) | live | The ranked performance roadmap. Live rows: #2 VQ_K codebook, #5 the MLA HB sweep. |
+| [`perf-roadmap.md`](../measurement/perf-roadmap.md) | live | The ranked performance roadmap, re-scored 2026-08-04 on recurring cost rather than wall at today's bottleneck. Live rows: #2 VQ_K=2048 (1.189x MoE kernels at 12-bit, +18.7% relFrob, needs a real dNLL gate), #10 general-R MoE kernels. #5 DONE 2026-08-02 (HB 8→16, 2.08x kernel, −3.2 ms/tok, gated). #8 and #11 stay closed on complexity and quality — NOT on "bytes stop buying anything below the floor", which was the wrong axis. |
 | [`traces.md`](../measurement/traces.md) | live | The --features otlp instrument: its three switches, what the engine emits, and how to read a trace. Verified end to end 2026-08-01, after it had stopped compiling. |
 | [`gpu-profiling.md`](../measurement/gpu-profiling.md) | live | Why ROCm GPU profiling does not work on this part, and what to do instead. Only if you are attaching a profiler. |
 | [`benchmarks.md`](../measurement/benchmarks.md) | data | Append-only measurements. Never read whole — grep for the config. The top table predates the .i4 rebuild and says so. |

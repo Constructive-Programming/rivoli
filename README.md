@@ -139,7 +139,7 @@ It needs a **self-hosted runner** labelled `rocm` and `gfx1151`: the ROCm toolch
 fit a GitHub-hosted runner, and a binary for one GPU architecture is only worth shipping if
 it has been run on that architecture. With no such runner the job queues rather than
 failing — a tag should not release without hardware verification. The GPU is sole-tenant, so
-the test step takes the same `/tmp/rivoli-gpu.lock` every other consumer takes, and builds
+the test step takes the same `/var/run/sys-gpu.lock` every other consumer takes, and builds
 outside it.
 
 The tag must match `version` in `Cargo.toml`; the workflow refuses the release otherwise,

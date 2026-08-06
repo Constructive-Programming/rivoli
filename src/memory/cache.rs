@@ -110,6 +110,49 @@ impl Default for TwoQSplit {
     /// (This is also the leading explanation for ARC underperforming here: its B1/B2
     /// ghosts are full-capacity by construction, pinning it to the bad end of this
     /// axis with no way to tune off it.)
+    ///
+    /// > **CORRECTED 2026-08-02 — two of the claims above no longer hold at today's
+    /// > pool, and the numbers that produced them were measured at ~3.6k slots.**
+    /// > Re-swept at **6874** slots (int3-vq, `--max-mem 115`) on two preserved traces: a
+    /// > 769-token prefill (18,474 unique) and the 288-pass decode (14,982 unique) already
+    /// > kept for the OPT work. See docs/measurement/benchmarks.md, "2Q kin/kout re-sweep".
+    /// >
+    /// > 1. **"Kout is the axis that matters" is now false, and the mechanism says why.**
+    /// >    The 6.1 pp spread above (20 % 77.56 vs 100 % 71.43) is **0.46 pp** on prefill
+    /// >    and **0.17 pp** on decode today. The stated cause — spurious promotions from a
+    /// >    stale ghost — scales with pressure, and unique/slots fell from 13k/3.6k = 3.6
+    /// >    to 2.7 and 2.2. The reasoning survives; the effect shrank out from under it.
+    /// > 2. **The whole grid is flat, so these constants are a don't-care.** Across
+    /// >    kin 3-66 % x kout 25-800 % the total range is **0.51 pp** (decode) and
+    /// >    **0.92 pp** (prefill). The best cells beat this default by only 0.37 and
+    /// >    0.23 pp, and they are not the same cell — 40 %/25 % on decode, 20 %/25 % on
+    /// >    prefill — which is what a best cell drawn from noise looks like. Note kout 25 %
+    /// >    now edges the shipped 20 % on both. **Do not retune on this evidence**; there
+    /// >    is nothing here to win, and a knife-edge default is worse than a flat one.
+    /// > 3. **The ARC parenthetical is not supported, and ARC's failure is CONDITIONAL.**
+    /// >    At batch 1 ARC does not underperform at all — 119.46 reads/token against LRU
+    /// >    117.66 and 2Q 119.62 on decode; 157.78 against 157.90 and 154.75 on prefill.
+    /// >    It collapses only once a batch's working set exceeds capacity (point 5): on
+    /// >    prefill at batch 32 it reads 219.79 against 2Q's 157.55, while on decode at
+    /// >    batch 32 it reads 117.23 and BEATS 2Q. Where it does collapse, full-capacity
+    /// >    ghosts cannot be the cause — the whole kout axis is worth 0.7 pp there against
+    /// >    a ~10 pp gap. The surviving candidate is ARC's ADAPTIVE `p`, which grows the
+    /// >    recency half on B1 ghost hits — spurious under a batch union, where a key
+    /// >    recurs because the whole LAYER recurs. **Untested**; A1out and B1/B2 are not
+    /// >    the same mechanism (A1out feeds promotion, B1/B2 drive adaptation), so this
+    /// >    refutes the stated explanation without establishing its replacement.
+    /// > 4. **Under batching these constants become load-bearing.** At batch 32 on prefill
+    /// >    the same grid spans **1.81 % to 43.42 %** and kin 3 %/kout 50 % beats this
+    /// >    default by **+8.26 pp**. Small kin wins because A1in is a hard cap on how much
+    /// >    of a scan reaches the protected set.
+    /// > 5. **What predicts all of the above is one number: a batch's working set,
+    /// >    `distinct-experts-per-token x batch`, against capacity.** Under it, every
+    /// >    policy is within a few reads/token and the grid is flat. Over it, nothing a
+    /// >    batch loads survives into the next and recency-driven policies collapse. The
+    /// >    two traces straddle the line at batch 32 — prefill 7,776 > 6874 (collapse),
+    /// >    decode 6,621 < 6874 (no collapse) — which is what makes it a rule rather than
+    /// >    a curve. Nothing in the engine batches the MoE beyond the 2-row verify pass
+    /// >    today, so points 3-5 are prerequisites for batched prefill, not live tuning.
     fn default() -> Self {
         Self {
             kin_pct: 8,

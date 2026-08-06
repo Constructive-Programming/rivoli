@@ -29,7 +29,23 @@
 
 #include "common.hpp"
 
-#define HB 8        // heads per block (one width-32 subgroup each)
+// 8 → 16 on 2026-08-02, measured. HB is the DRAM KV re-read multiplier (⌈H/HB⌉×), so
+// doubling it halves the cache traffic: **226.5 → 108.8 µs at nr512 (2.08×) and 769.8 →
+// 421.2 µs at nr2048 (1.83×)**, min-of-5 interleaved, and −3.2 ms/token of `route` in
+// engine. Free in registers (47 VGPRs, no spill, at both values) and LDS is unchanged —
+// the tile is TILE-sized and `acc` moved to registers earlier, which is what decoupled HB
+// from LDS and made this possible at all.
+//
+// It is NOT bit-identical above nr≈640, and the roadmap said it would be. `by_work` =
+// ⌈nr/TILE⌉/MLA_MIN_TILES_PER_SPLIT binds below that and gives both HB values the same
+// cut; above it `by_grid` = ⌈MLA_TARGET_BLOCKS/⌈H/HB⌉⌉ binds, and doubling HB doubles it,
+// so the split plan and therefore the f32 summation order change. Gated on that basis:
+// paired dNLL **+0.00217 nats, 95% CI [−0.00243, +0.00676]** against a 0.00995 bar
+// (ppl-corpus-5000, --attn dense, both arms reproduced byte-identically twice).
+//
+// `MLA_MIN_TILES_PER_SPLIT` 4→2 was swept alongside and is INERT at both HB values —
+// `tps` rounds back — so it stays at 4. See docs/measurement/benchmarks.md, "The MLA HB sweep".
+#define HB 16       // heads per block (one width-32 subgroup each)
 #define TILE 16     // KV tokens staged into LDS per step
 // Score-reduction subgroup width. MUST stay a divisor of the physical wavefront
 // (32 on gfx1151) so a head's HB-th 32-lane group never straddles two wavefronts.

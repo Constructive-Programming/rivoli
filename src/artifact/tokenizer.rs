@@ -199,6 +199,36 @@ impl Tokenizer {
         self.encode_chat_turns(&[("user", text)], &ChatOpts::default())
     }
 
+    /// The tokens that CONTINUE an in-progress conversation with one more user turn:
+    /// `<|user|>{text} <|assistant|> <think> </think>`, to be fed at the current position
+    /// after the model has emitted its turn-ending token. `-bench`'s follow-up script is
+    /// the only caller — the server re-decodes the whole prefix instead (`serve.rs`), which
+    /// is fine per request and quadratic over a scripted run.
+    ///
+    /// **Derived from [`Self::encode_chat`] rather than re-emitting the framing**, so it
+    /// cannot drift from the template the way a second hand-port would; this file's own
+    /// header records that the last drift went unnoticed for months. The only edit is
+    /// dropping the two-token `[gMASK] <sop>` conversation prefix, which the model has
+    /// already seen and which mid-stream would put it somewhere it never saw in training.
+    ///
+    /// This lands byte-identical to what `encode_chat_turns` would emit for the whole
+    /// conversation, because with `thinking` off (the default) the generation prompt
+    /// `<|assistant|> <think> </think>` is exactly the framing an assistant HISTORY turn
+    /// gets. One documented divergence: the template `.trim()`s history content and
+    /// generated text is not re-trimmed, so a turn ending in whitespace differs by that
+    /// whitespace. Harmless here, and the alternative is re-tokenizing the output.
+    pub fn encode_chat_continuation(&self, text: &str) -> Result<Vec<u32>> {
+        let full = self.encode_chat(text)?;
+        // The fallback path (an artifact whose tokenizer predates the chat tokens) returns
+        // a RAW encoding with no prefix, and blindly dropping two tokens there would eat
+        // real text. Check for the prefix instead of assuming it.
+        let prefix = [self.inner.token_to_id("[gMASK]"), self.inner.token_to_id("<sop>")];
+        match (prefix, full.first(), full.get(1)) {
+            ([Some(g), Some(s)], Some(&a), Some(&b)) if g == a && s == b => Ok(full[2..].to_vec()),
+            _ => Ok(full),
+        }
+    }
+
     /// The same framing over a MULTI-TURN conversation, which is what an OpenAI `messages`
     /// array is. **This is a hand-port of the checkpoint's `chat_template.jinja`, and it is
     /// meant to match it byte for byte:**

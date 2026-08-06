@@ -261,14 +261,12 @@ pub struct RoutedPool {
     ///
     /// A key is removed on eviction and on relocation-into, and inserted only when its
     /// read signal has resolved. `trace` only — it costs a hash op per expert per layer.
-    #[cfg(feature = "trace")]
     loaded: std::collections::HashSet<u32>,
     /// Misses submitted by the PREVIOUS layer, marked loaded at the top of the next
     /// `submit`. Correct because layer L's per-expert awaits and its unconditional
     /// end-of-layer `device_sync` both complete before layer L+1 submits — so by then
     /// every byte of L's batch has landed. Deferring this way avoids plumbing a
     /// completion callback through `gpu.rs`'s async expert loop.
-    #[cfg(feature = "trace")]
     pending_loaded: Vec<u32>,
     cold: TierFmt,
     hot: TierFmt,
@@ -377,9 +375,7 @@ impl RoutedPool {
             policy,
             slot_of: HashMap::new(),
             key_at: HashMap::new(),
-            #[cfg(feature = "trace")]
             loaded: std::collections::HashSet::new(),
-            #[cfg(feature = "trace")]
             pending_loaded: Vec::new(),
             cold,
             hot,
@@ -432,7 +428,6 @@ impl RoutedPool {
 
     /// Record that `key`'s bytes have landed in its current slot. Called once per MISS,
     /// after that read's signal resolves.
-    #[cfg(feature = "trace")]
     fn mark_loaded(&mut self, key: u32) {
         self.loaded.insert(key);
     }
@@ -440,7 +435,6 @@ impl RoutedPool {
     /// Has `key`'s data actually landed since it was last admitted? A HIT on a key for
     /// which this is false is a read of uninitialised or stale bytes — the fault this
     /// instrumentation exists to catch.
-    #[cfg(feature = "trace")]
     fn is_loaded(&self, key: u32) -> bool {
         self.loaded.contains(&key)
     }
@@ -462,7 +456,6 @@ impl RoutedPool {
             self.key_at.remove(&s);
             // Evicted: its bytes are no longer this key's, and the slot is about to be
             // handed to someone else.
-            #[cfg(feature = "trace")]
             self.loaded.remove(&ev);
             self.arena.free(s.0, s.1);
         }
@@ -480,7 +473,6 @@ impl RoutedPool {
         self.key_at.insert((hot, idx), key);
         // Freshly admitted: a slot with no bytes in it yet. `mark_loaded` clears this
         // once the read lands. A HIT observed while a key is in this state is the bug.
-        #[cfg(feature = "trace")]
         self.loaded.remove(&key);
         // POISON the slot before its bytes land, so a read-before-write is deterministic.
         //
@@ -676,7 +668,6 @@ impl RoutedPool {
         // New batch: clear the policy's per-batch pin set. Phase 1a's protect() and 1b's
         // admit() then pin every touched key so a later miss's eviction can't reclaim it.
         // The previous layer's reads have all landed (its awaits + end-of-layer sync).
-        #[cfg(feature = "trace")]
         {
             let done = std::mem::take(&mut self.pending_loaded);
             for k in done {
@@ -731,7 +722,6 @@ impl RoutedPool {
                 // kernel reads uninitialised memory (NaN) or another expert's weights
                 // (finite, wrong, silent). Reported once per occurrence rather than
                 // fataling, so a run keeps going and the pattern is visible.
-                #[cfg(feature = "trace")]
                 if !self.is_loaded(key) {
                     tracing::error!(
                         "READ-BEFORE-WRITE: layer={layer} expert={e} counted as a cache \
@@ -810,7 +800,6 @@ impl RoutedPool {
         // Phase 2: hand the whole batch to the reaper — it queues+submits (all reads
         // start at once) and signals each miss's ticket when its copy lands.
         // Queue this batch's misses to be marked loaded at the next layer.
-        #[cfg(feature = "trace")]
         for &i in &miss_sel {
             self.pending_loaded.push(expert_key(layer, sel[i]));
         }

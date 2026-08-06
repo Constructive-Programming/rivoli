@@ -26,7 +26,7 @@
 //      IDLE GPU is measuring a machine the engine never runs on. `-hog` reproduces the load.
 //
 // build: hipcc -O2 --offload-arch=gfx1151 -o /tmp/fetch_batch docs/measurement/probes/fetch_batch.hip
-// run:   flock /tmp/rivoli-gpu.lock -c '/tmp/fetch_batch /var/db/rivoli/glm52-vq3-full'
+// run:   flock /var/run/sys-gpu.lock -c '/tmp/fetch_batch /var/db/rivoli/glm52-vq3-full'
 #define _GNU_SOURCE
 #include <hip/hip_runtime.h>
 #include <fcntl.h>

@@ -123,6 +123,40 @@ pub fn vq_row_bytes(i_dim: usize) -> usize {
     i_dim / VQ_DIM * VQ_INDEX_BITS / 8
 }
 
+/// Decode one VQ projection to a DENSE row-major `W[o_dim, i_dim]` — the inverse of
+/// [`quant_vq`], and the SINGLE VQ reader.
+///
+/// **RESTORED 2026-08-06 from tag `archive/i4-audit`.** Track H deleted this as having zero
+/// callers *including tests*, which was true on that branch and false on `main`:
+/// `examples/vq_k_probe.rs` (added 2026-08-04) calls it and names it "the shipping decoder".
+/// Same shape as the `release.yml` consumer the same track found — a live user outside the
+/// branch's field of view. A reachability claim is scoped to the tree that measured it.
+///
+/// Its historical caller was `bin/i4_audit`, which compared what this returns
+/// `vq3 → int4` chain must decode identically or its "old set" baseline describes a
+/// converter that never existed. (The same rule [`write_i4_proj`] states for the `.i4`
+/// writer.)
+///
+/// Materializes `o_dim·i_dim` f32 — offline use only; the decode path is
+/// [`matvec_vq`], which never builds the dense matrix.
+pub fn vq_decode_proj(p: &VqProj, codebook: &[f32]) -> Vec<f32> {
+    let (o_dim, i_dim) = (p.o_dim, p.i_dim);
+    let (rb, ng, nsub) = (vq_row_bytes(i_dim), vq_groups(i_dim), i_dim / VQ_DIM);
+    let mut w = vec![0f32; o_dim * i_dim];
+    for o in 0..o_dim {
+        let ir = &p.indices[o * rb..(o + 1) * rb];
+        for k in 0..nsub {
+            let g = (o * ng + (k * VQ_DIM) / VQ_GROUP) * 2;
+            let s = bf16_to_f32(u16::from_le_bytes([p.scales[g], p.scales[g + 1]]));
+            let c = &codebook[get_idx(ir, k) * VQ_DIM..][..VQ_DIM];
+            for (d, &cw) in c.iter().enumerate() {
+                w[o * i_dim + k * VQ_DIM + d] = s * cw;
+            }
+        }
+    }
+    w
+}
+
 /// Number of bf16 group scales in one VQ row (`i_dim / VQ_GROUP`).
 pub fn vq_groups(i_dim: usize) -> usize {
     debug_assert_eq!(
@@ -539,10 +573,28 @@ pub fn sample_subvectors(w: &[f32], i_dim: usize, stride: usize, out: &mut Vec<f
 
 /// k-means (k-means++ seed, threaded Lloyd, convergence-stopped) → VQ_K·VQ_DIM.
 pub fn learn_codebook(sample: &[f32], max_iters: usize) -> Vec<f32> {
+    learn_codebook_k(sample, max_iters, VQ_K)
+}
+
+/// [`learn_codebook`] at an ARBITRARY entry count → `k·VQ_DIM`.
+///
+/// Exists so a rate study can fit a `k ≠ VQ_K` codebook the SAME way the shipped one is
+/// fitted — same k-means++ seed, same RNG stream, same convergence test. The alternative
+/// (a second copy of the learner in the study binary) measures the difference between two
+/// fitting procedures and calls it a difference between two rates; that is the trap the
+/// per-layer-codebook study named when this learner was moved here rather than left in the
+/// converter. `learn_codebook` is this function at `k = VQ_K`, so the shipping fit is
+/// bit-identical to what it was — there is no second implementation to drift.
+///
+/// The returned codebook is NOT directly usable by [`quant_vq`] when `k < VQ_K`: that
+/// encoder scans `0..VQ_K`. Pad to `VQ_K·VQ_DIM` with a far-away filler (`1e30`) so the
+/// unused entries can never win a nearest-lookup — the trick `bin/convert` and the unit
+/// tests already use.
+pub fn learn_codebook_k(sample: &[f32], max_iters: usize, k: usize) -> Vec<f32> {
     let n = sample.len() / VQ_DIM;
-    assert!(n >= VQ_K, "sample {n} < VQ_K {VQ_K}");
+    assert!(n >= k, "sample {n} < k {k}");
     let threads = std::thread::available_parallelism().map_or(4, |t| t.get());
-    let mut c = vec![0.0f32; VQ_K * VQ_DIM];
+    let mut c = vec![0.0f32; k * VQ_DIM];
     let mut rng = 0x2545_F491_4F6C_DD1Du64;
     let mut next = move || {
         rng ^= rng << 13;
@@ -551,7 +603,7 @@ pub fn learn_codebook(sample: &[f32], max_iters: usize) -> Vec<f32> {
         (rng >> 11) as f64 / (1u64 << 53) as f64
     };
     let mut mind = vec![1.0f32; n];
-    for j in 0..VQ_K {
+    for j in 0..k {
         let total: f64 = mind.iter().map(|&d| d as f64).sum();
         let mut t = next() * total;
         let mut pick = n - 1;
@@ -582,13 +634,13 @@ pub fn learn_codebook(sample: &[f32], max_iters: usize) -> Vec<f32> {
                 }
                 let c = &c;
                 hs.push(s.spawn(move || {
-                    let mut sum = vec![0.0f32; VQ_K * VQ_DIM];
-                    let mut cnt = vec![0u32; VQ_K];
+                    let mut sum = vec![0.0f32; k * VQ_DIM];
+                    let mut cnt = vec![0u32; k];
                     let mut dist = 0.0f64;
                     for i in lo..hi {
                         let v = &sample[i * VQ_DIM..(i + 1) * VQ_DIM];
                         let mut best = (f32::INFINITY, 0usize);
-                        for j in 0..VQ_K {
+                        for j in 0..k {
                             let cc = &c[j * VQ_DIM..(j + 1) * VQ_DIM];
                             let d: f32 = v.iter().zip(cc).map(|(&x, &y)| (x - y) * (x - y)).sum();
                             if d < best.0 {
@@ -606,8 +658,8 @@ pub fn learn_codebook(sample: &[f32], max_iters: usize) -> Vec<f32> {
             }
             hs.into_iter().filter_map(|h| h.join().ok()).collect()
         });
-        let mut sum = vec![0.0f32; VQ_K * VQ_DIM];
-        let mut cnt = vec![0u32; VQ_K];
+        let mut sum = vec![0.0f32; k * VQ_DIM];
+        let mut cnt = vec![0u32; k];
         let mut dist = 0.0f64;
         for (ps, pc, pd) in parts {
             for (a, b) in sum.iter_mut().zip(ps) {
@@ -618,7 +670,7 @@ pub fn learn_codebook(sample: &[f32], max_iters: usize) -> Vec<f32> {
             }
             dist += pd;
         }
-        for j in 0..VQ_K {
+        for j in 0..k {
             if cnt[j] > 0 {
                 for d in 0..VQ_DIM {
                     c[j * VQ_DIM + d] = sum[j * VQ_DIM + d] / cnt[j] as f32;

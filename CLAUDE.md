@@ -33,8 +33,9 @@ agrees. If you change a verdict, change both; the test will tell you which one y
 | speculative decode | on by default, **1.108×** via `--mtp-min-conf 0.8` (ungated it is 0.93–0.95×, a loss). All modes carry the head since 2026-07-31 |
 | LOOKA hints (`--hint-k`) | **DELETED 2026-07-31** — measured inert (0.9% of evictions, ≤+0.1pp hit). `docs/investigations/cross-layer-prefetch.md` keeps the record |
 | `top-m` routing | **RETIRED**, removed from the engine |
-| Vulkan | decodes `--mode int3-vq --attn dense`; 16 of 29 kernels; 6 more are single-row; ~1.9× slower |
+| Vulkan | decodes `--mode int3-vq` with `--attn dense` **or `streaming`** (they share the ported attention path); 16 of 29 kernels; 6 more are single-row, so **speculation is off there** — `main` downgrades and says so. `--mode int4/hybrid` and `--attn dsa/misa` refuse at startup. Measured by `tests/mode-matrix.sh`: 6 of 36 cells decode, 30 refuse. ~1.9× slower |
 | MoE accumulation | fixed-point (`MOE_ACC_SHIFT 44`), no cross-stream join |
+| layer-major prefill | **default since 2026-08-03** (flag deleted; `--trace` falls back to token-major): prefill **2.15×**, reads **159.56 → 28.20/token** (the floor), output byte-identical, every `--attn` mode. Decode pays a ONE-OFF ~2.7 s warm-up (1.8% of the prefill saving; the "1.55× slower decode" reading is a 13-pass artifact). Closing the sweep token-major was tried and **reverted** — useless. `architecture.md` §14 |
 
 ## Build and test
 
@@ -45,6 +46,8 @@ cargo test --features rocm                   # 100 tests
 # BENCHMARKS and performance evaluation ONLY.
 cargo build --release --features rocm        # or --features vulkan; NEVER both
 cargo test  --release --features rocm        # HANGS intermittently — see below; sweep per-binary
+tests/feature-matrix.sh                      # every feature combo compiles (~34 cells, no GPU)
+tests/mode-matrix.sh <artifact>              # mode x policy x attn under BOTH backends (~105 min, GPU)
 
 cargo clippy --release --features rocm --all-targets
 # Before you claim a change compiles, ALSO run the union — see below.

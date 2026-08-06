@@ -21,7 +21,7 @@ originally documented.
 | `fetch_stream_ops.hip` | What does the reaper pay per completed read, above the NVMe? | the per-read `hipLaunchHostFunc` was dead; deleted 2026-08-01 |
 | `vk_validation/` | Do the Vulkan validation checkers actually fire on this driver + layer? | answered, deleted; source in git at `77b5500:docs/measurement/probes/vk_validation` |
 
-**Run every one of these under the GPU lock** (`flock /tmp/rivoli-gpu.lock -c '…'`) — they
+**Run every one of these under the GPU lock** (`flock /var/run/sys-gpu.lock -c '…'`) — they
 allocate device memory and take real bandwidth, so an unlocked probe corrupts whatever
 benchmark is running beside it, and vice versa. The two fetch probes are also the reason to
 say it twice: their whole point is to measure a drive under a *specific* concurrent load, so
@@ -39,6 +39,40 @@ piece of dead work on the reaper's critical path.
 Both are honest about a real hazard: **QD1 varies 7.7–12.5 GB/s across runs of the same
 probe.** Any conclusion that needs a single-digit percentage from them needs repeats, and the
 "~26% unexplained" this pair was written to chase turned out to be mostly that spread.
+
+## `seq_vs_random` — the third fetch probe, and it settled a NEGATIVE
+
+Asks one thing for layer-major prefill (`benchmarks.md`, "Batch coalescing"): a layer-major
+pass reads ~246 of a layer file's 257 experts, so should it read the whole file instead of
+scattering per-expert reads through it? Two arms, **same request size, same request count,
+same file, only the offset ORDER differs** — which isolates sequentiality from request size,
+the confound a "big sequential vs small random" comparison would bake in.
+
+**Answer: offset order buys nothing.** At QD>=2 the arms sit within +-1.5% (12.4-14.8 GB/s);
+only QD1 shows sequential ahead, by 4%. At 15.34 MB a request is already large enough that
+the seek is amortised to nothing, so "random" at expert granularity is sequential as far as
+the array is concerned. Layer-major should be planned at the SAME ~13 GB/s the demand fetch
+already gets — it wins on bytes moved, not on the rate they move at.
+
+**It also produced a false positive worth keeping.** A first pass reported request size
+climbing 14.2 -> 19 GB/s at 256 MB, and it did not replicate: under a rotated chunk order
+with a drift control at both ends of every rep, the same 512 MB config spanned **5.05-14.26
+GB/s**. The cause is sample size — 512 MB over a 3.9 GB file is 7 requests, so the number is
+one slow read, not a bandwidth. This is the hazard the section above already names, met
+again: *any conclusion needing a single-digit percentage from these probes needs repeats.*
+The first pass also advanced chunk size, layer file and time-under-load together, so none of
+the three could be separated. Both defects were in the instrument, neither in the drive.
+
+Pure C, no HIP — this asks what the ARRAY does, and a GPU in the picture would only add the
+`fetch_batch` GPU-busy variable this probe has no use for. Build and run:
+
+```sh
+gcc -O2 -o seq_vs_random seq_vs_random.c -lpthread
+flock /var/run/sys-gpu.lock ./seq_vs_random <layer.vq3> <rand|seq> <qd> <nreq> [chunk_mb]
+```
+
+Take the lock: the array is shared with any co-tenant decode, and its reads are exactly what
+this measures.
 
 ## `vk_validation` — trust a silence, but verify it first
 

@@ -52,10 +52,14 @@ CELLS=()
 if [ "$ROUND" = 1 ]; then
   for mode in int3-vq int4 hybrid; do
     for attn in dense streaming dsa misa; do
-      for pol in lru 2q arc top-m; do
-        # config.rs::validate rejects top-m + hybrid outright (the hybrid rank-driven
-        # tier rule is not built; a fallback would credit its behaviour to top-m).
-        [ "$pol" = top-m ] && [ "$mode" = hybrid ] && continue
+      # CORRECTED 2026-08-02: this looped over `top-m` as a fourth policy, and carried a
+      # `[ "$pol" = top-m ] && [ "$mode" = hybrid ] && continue` skip for a validate() rule
+      # that also no longer exists. `top-m` was retired from the engine and `--cache-policy`
+      # now rejects it outright, so 8 of round 1's 44 cells could only die on `invalid
+      # value` — counted as CRASH by this runner, i.e. reported as breakage rather than as
+      # coverage that had quietly gone. tests/matrix.rs now asserts this list against the
+      # CLI's own accepted values so the next retirement cannot drift the same way.
+      for pol in lru 2q arc; do
         CELLS+=("$mode $attn $pol")
       done
     done

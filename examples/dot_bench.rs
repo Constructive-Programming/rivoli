@@ -365,6 +365,16 @@ fn run_attend(h: usize, kvl: usize, rope: usize) {
             .expect("attend");
         });
         println!("mla_attend  [h{h} nr{nr} kvl{kvl}]  {us:8.1}us");
+        // HB and MLA_MIN_TILES_PER_SPLIT both feed `mla_plan_splits`, so a sweep of them
+        // is bit-identical only while the PLAN is unchanged — and whether it is cannot be
+        // read off the timing. At H=64/nr=512 three of the four (HB, MIN) cells land on
+        // n_splits=8 and one lands on 16; this line is what tells them apart. The other
+        // rows in this file grew the same fingerprint for the same reason (docs/measurement/benchmarks.md,
+        // "A fingerprint is the only instrument that shows bit-identity").
+        println!(
+            "            fnv {:016x}  (h{h} nr{nr} kvl{kvl} rope{rope})",
+            fnv(&clat.copy_out().expect("out"))
+        );
     }
 }
 

@@ -19,7 +19,7 @@
 // and only the first shows up as lost fetch bandwidth.
 //
 // build: hipcc -O2 --offload-arch=gfx1151 -o /tmp/fetch_stream_ops docs/measurement/probes/fetch_stream_ops.hip
-// run:   flock /tmp/rivoli-gpu.lock -c /tmp/fetch_stream_ops
+// run:   flock /var/run/sys-gpu.lock -c /tmp/fetch_stream_ops
 #include <hip/hip_runtime.h>
 #include <cstdio>
 #include <ctime>

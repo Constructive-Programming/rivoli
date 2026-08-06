@@ -747,32 +747,46 @@ impl Gpu {
             sub.supported_stages.contains(vk::ShaderStageFlags::COMPUTE),
             "subgroup operations in COMPUTE",
         );
-        // The shaders declare local_size_x = BLOCK. Vulkan only GUARANTEES 128
-        // invocations and (128,128,64), both below the 256 we need, so a conformant
-        // minimum-limits device would fail vkCreateComputePipelines with an opaque
-        // ERROR_INITIALIZATION_FAILED instead of naming the limit. gfx1151 allows
-        // 1024; the point of this function is the machines that are not gfx1151.
+        // Most shaders declare local_size_x = BLOCK (256), but `mla_latent_attend`
+        // declares MLA_HB*MLA_SUBW, which is 512 since HB went 8->16 on 2026-08-02. Check
+        // the LARGER: a device that allows 256 would load every other pipeline and then
+        // fail on attend alone. Vulkan only GUARANTEES 128 invocations and (128,128,64),
+        // both below what we need, so a conformant minimum-limits device would fail
+        // vkCreateComputePipelines with an opaque ERROR_INITIALIZATION_FAILED instead of
+        // naming the limit. gfx1151 allows 1024; the point of this function is the
+        // machines that are not gfx1151.
+        const WG_THREADS: u32 = if BLOCK > MLA_ATTEND_BLOCK {
+            BLOCK
+        } else {
+            MLA_ATTEND_BLOCK
+        };
         let lim = p2.properties.limits;
         need(
-            lim.max_compute_work_group_invocations >= BLOCK,
+            lim.max_compute_work_group_invocations >= WG_THREADS,
             &format!(
-                "maxComputeWorkGroupInvocations >= {BLOCK} (device allows {})",
+                "maxComputeWorkGroupInvocations >= {WG_THREADS} (device allows {})",
                 lim.max_compute_work_group_invocations
             ),
         );
         need(
-            lim.max_compute_work_group_size[0] >= BLOCK,
+            lim.max_compute_work_group_size[0] >= WG_THREADS,
             &format!(
-                "maxComputeWorkGroupSize[0] >= {BLOCK} (device allows {})",
+                "maxComputeWorkGroupSize[0] >= {WG_THREADS} (device allows {})",
                 lim.max_compute_work_group_size[0]
             ),
         );
         // VUID-VkPipelineShaderStageCreateInfo-pNext-02759: local_size_x must fit in
-        // maxComputeWorkgroupSubgroups * requiredSubgroupSize.
+        // maxComputeWorkgroupSubgroups * requiredSubgroupSize. Attend is MLA_HB subgroups
+        // (16), more than the ROWS_PER_BLOCK (8) every other shader needs.
+        const WG_SUBGROUPS: u32 = if ROWS_PER_BLOCK > MLA_HB as u32 {
+            ROWS_PER_BLOCK
+        } else {
+            MLA_HB as u32
+        };
         need(
-            size.max_compute_workgroup_subgroups >= ROWS_PER_BLOCK,
+            size.max_compute_workgroup_subgroups >= WG_SUBGROUPS,
             &format!(
-                "maxComputeWorkgroupSubgroups >= {ROWS_PER_BLOCK} (device allows {})",
+                "maxComputeWorkgroupSubgroups >= {WG_SUBGROUPS} (device allows {})",
                 size.max_compute_workgroup_subgroups
             ),
         );
@@ -3449,7 +3463,14 @@ pub unsafe fn launch_mla_absorb_fp8(
 // what actually holds that one.
 //
 // ponytail: fold these into build.rs alongside the split-K threshold when that lands.
-const MLA_HB: usize = 8;
+// MLA_HB now comes from the generated `dims.rs` (build.rs's `VK_MLA_HB`), which also feeds
+// the shader's `-DHB`. It used to be declared here AND in the shader, pinned by the assert
+// below — see the note on that assert for why it stopped holding at HB=16.
+//
+// The attention workgroup is `MLA_HB * MLA_SUBW` threads, which since 2026-08-02 is 512 and
+// is NO LONGER `BLOCK` (256). Anything that assumed those were the same is wrong now;
+// `missing_features` checks the device against both.
+const MLA_ATTEND_BLOCK: u32 = (MLA_HB * MLA_SUBW) as u32;
 const MLA_TILE: usize = 16;
 const MLA_SUBW: usize = 32;
 const MLA_ACC_REGS: usize = 16;
@@ -3485,10 +3506,19 @@ const _: () = assert!(
 // `local_size_x = HB*SUBW`. If the launcher's HB drifted below the shader's, the upper
 // heads would never be dispatched and their `clat` rows would keep their previous
 // contents; if it drifted above, the extra workgroups would read past `qabs`.
-const _: () = assert!(
-    MLA_HB * MLA_SUBW == BLOCK as usize,
-    "MLA_HB*MLA_SUBW must equal the shaders' workgroup size (ROWS_PER_BLOCK*WAVE)"
-);
+// **This assert used to read `MLA_HB * MLA_SUBW == BLOCK`, and it held by COINCIDENCE.**
+// `BLOCK` is `ROWS_PER_BLOCK * WAVE` = 8*32, and MLA_HB*MLA_SUBW was also 8*32, so the two
+// unrelated quantities matched and the check looked like it was pinning the launcher to the
+// attention shader. It was not — it pinned it to an unrelated kernel's geometry. Raising
+// HB to 16 (2026-08-02) broke the coincidence, and rewriting it as `== 512` would have been
+// a tautology: both sides would derive from MLA_HB.
+//
+// The coupling it was reaching for — launcher HB vs SHADER HB — is now structural instead:
+// build.rs emits `MLA_HB` into `dims.rs` and passes the SAME value as `-DHB`, and the
+// shader `#error`s if HB is not defined. One source, so there is nothing left to assert.
+// What remains worth pinning is that SUBW is a whole subgroup — asserted just below, where
+// it always was — and the device limits, which `missing_features` now checks against the
+// attention workgroup rather than only `BLOCK`.
 // SUBW vs WAVE. The shader has its own `#error` for this, but the launcher's split-plan
 // arithmetic assumes it too, and a mismatch there is not a compile error on that side.
 const _: () = assert!(
