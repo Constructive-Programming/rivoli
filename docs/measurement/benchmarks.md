@@ -317,6 +317,12 @@ Until then, `--mode int4` and `--mode hybrid` quality numbers are bounded above 
 > The end-to-end test this section called for was run: `--mode int4` measures PPL 73.43 against
 > int3-vq's 5.28, and a branch-gain sweep falsified the attenuation hypothesis outright.
 
+> **2026-08-05: `bin/i4_audit`, the instrument behind this section and the next, is retired**
+> — tag `archive/i4-audit`, restore per `investigations/int4-scales.md` §8. Its name is left
+> in place below because naming the instrument that produced a number is the point of
+> recording it; only its availability changed. Its `VQ_GAIN` arm went earlier, 2026-08-01, so
+> it is not in the tag either.
+
 The `.i4` set was rebuilt straight from fp8 (`bin/fp8_to_i4`, chain `fp8->int4`), removing
 the second quantization stage. The weights got measurably closer to ground truth **and
 decode quality got worse**, which is the shape of a bug that better weights unmask. It is

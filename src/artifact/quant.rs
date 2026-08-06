@@ -20,10 +20,10 @@ pub fn read_f32(bytes: &[u8]) -> Vec<f32> {
 /// `x` per input column. Each oracle then asserts its OWN packed array against the
 /// geometry it just derived, which is why those checks stay at the call sites.
 ///
-/// Debug-only, because these are oracles and `bin/i4_audit` sweeps them per expert per
-/// layer — a release-mode length check would be pure cost on a path that only ever runs
-/// against arrays this module also built. `#[track_caller]` so a failure names the oracle
-/// that was mis-called rather than this line.
+/// Debug-only, because these are oracles swept per expert per layer by the kernel tests —
+/// a release-mode length check would be pure cost on a path that only ever runs against
+/// arrays this module also built. `#[track_caller]` so a failure names the oracle that was
+/// mis-called rather than this line.
 #[track_caller]
 fn debug_check_gemv(y: &[f32], x: &[f32], o_dim: usize, i_dim: usize) {
     debug_assert_eq!(y.len(), o_dim);
@@ -194,10 +194,10 @@ pub fn write_le_scales<const N: usize>(dst: &mut [u8], scales: impl Iterator<Ite
 /// The checkpoint tensor prefix of expert `e` in `layer`. Routed experts are numbered;
 /// `e == n_experts` is the SHARED expert, which lives under an entirely different name.
 ///
-/// Beside `PROJ` for the same reason: three tools (`convert`, `fp8_to_i4`, `i4_audit`)
-/// walk a layer's `n_experts + 1` blocks in this order, and a copy that got the boundary
-/// wrong would quantize the shared expert's weights into a routed slot — producing a file
-/// of exactly the right size that every length check passes.
+/// Beside `PROJ` for the same reason: two tools (`convert`, `fp8_to_i4`) walk a layer's
+/// `n_experts + 1` blocks in this order, and a copy that got the boundary wrong would
+/// quantize the shared expert's weights into a routed slot — producing a file of exactly
+/// the right size that every length check passes.
 pub fn expert_base(layer: usize, e: usize, n_experts: usize) -> String {
     if e < n_experts {
         format!("model.layers.{layer}.mlp.experts.{e}")
@@ -295,8 +295,8 @@ impl VqProj<'_> {
     /// The borrowed group scales as the little-endian bf16 WORDS [`matvec_vq`] takes.
     ///
     /// Allocates, so it is for offline and test use only — the decode path never calls it
-    /// (`matvec_vq` is handed words the loader already has, and [`vq_decode_proj`] reads
-    /// the two bytes in place). It exists because the byte→word convention is THIS
+    /// (`matvec_vq` is handed words the loader already has). It exists because the
+    /// byte→word convention is THIS
     /// module's: every caller that re-spelled `u16::from_le_bytes` over `chunks_exact(2)`
     /// was a copy of a layout rule that belongs here, and one of them lives in a binary
     /// that never sees a change to this format.
@@ -340,11 +340,12 @@ pub fn set_idx(row: &mut [u8], k: usize, idx: u16) {
     row[base + 1] |= (v >> 8) as u8;
 }
 
-/// Read the 12-bit codebook index of the `k`-th subvector of a packed row. Public so
-/// the offline readers (`bin/i4_audit`, [`vq_decode_proj`]) decode indices identically
-/// to `matvec_vq`.
+/// Read the 12-bit codebook index of the `k`-th subvector of a packed row — the one place
+/// the 12-bits-per-index packing is spelled out, so [`matvec_vq`] and the tests cannot drift
+/// apart on it. Private since 2026-08-05: it was `pub` for "the offline readers", and both
+/// of those (`bin/i4_audit`, `vq_decode_proj`) are now retired to tag `archive/i4-audit`.
 #[inline]
-pub fn get_idx(row: &[u8], k: usize) -> usize {
+fn get_idx(row: &[u8], k: usize) -> usize {
     let (base, shift) = (k * VQ_INDEX_BITS / 8, (k * VQ_INDEX_BITS) % 8);
     (((row[base] as u16 | (row[base + 1] as u16) << 8) >> shift) & 0xFFF) as usize
 }
@@ -499,32 +500,16 @@ pub fn matvec_vq(
     }
 }
 
-/// Decode one VQ projection to a DENSE row-major `W[o_dim, i_dim]` — the inverse of
-/// [`quant_vq`], and the SINGLE VQ reader: `bin/i4_audit` compares what this returns
-/// against the fp8 ground truth, and any audit that reproduces the retired
-/// `vq3 → int4` chain must decode identically or its "old set" baseline describes a
-/// converter that never existed. (The same rule [`write_i4_proj`] states for the `.i4`
-/// writer.)
-///
-/// Materializes `o_dim·i_dim` f32 — offline use only; the decode path is
-/// [`matvec_vq`], which never builds the dense matrix.
-pub fn vq_decode_proj(p: &VqProj, codebook: &[f32]) -> Vec<f32> {
-    let (o_dim, i_dim) = (p.o_dim, p.i_dim);
-    let (rb, ng, nsub) = (vq_row_bytes(i_dim), vq_groups(i_dim), i_dim / VQ_DIM);
-    let mut w = vec![0f32; o_dim * i_dim];
-    for o in 0..o_dim {
-        let ir = &p.indices[o * rb..(o + 1) * rb];
-        for k in 0..nsub {
-            let g = (o * ng + (k * VQ_DIM) / VQ_GROUP) * 2;
-            let s = bf16_to_f32(u16::from_le_bytes([p.scales[g], p.scales[g + 1]]));
-            let c = &codebook[get_idx(ir, k) * VQ_DIM..][..VQ_DIM];
-            for (d, &cw) in c.iter().enumerate() {
-                w[o * i_dim + k * VQ_DIM + d] = s * cw;
-            }
-        }
-    }
-    w
-}
+// `vq_decode_proj` — dense `.vq3` decode, the unfused inverse of `quant_vq` — was DELETED
+// 2026-08-05 with `bin/i4_audit`, its only caller. It is at tag `archive/i4-audit` and comes
+// back with the tool if a VQ question reopens.
+//
+// It was briefly kept as "the one unfused statement of the read convention", which is the
+// wrong reason: nothing exercised it, not even a test, so it asserted a bit-identity with
+// `matvec_vq` that nothing checked and that would drift silently. An unverified reference
+// implementation is worse than none — a reader trusts it. `dequant_i4` reads as the same
+// shape but is NOT: it has a round-trip test against `quant_i4`, which is exactly the
+// difference, and why it stays.
 
 // ── codebook learning ───────────────────────────────────────────────────────
 //
@@ -801,7 +786,7 @@ pub fn v4_expert_base(layer: usize, e: usize, n_experts: usize) -> String {
 //
 // The honest fix is a `Weights<'_>` sum type (`Fp8{packed,scale,block} | I4{..} | I8{..} |
 // Vq{..}`), which would also make "int4 scales with an int8 packed array" unrepresentable
-// — worth doing, but it rewrites call sites in i4_audit, convert, tests/kernel.rs and
+// — worth doing, but it rewrites call sites in convert, tests/kernel.rs and
 // tests/common. Renaming a parameter to break the hash was the alternative and is exactly
 // the masking this gate exists to undo.
 /// Reference int4 GEMV `y[o] = Σ_i x[i]·(nibble(o,i) − 8)·scale[o, i/I4_GROUP]` — the
@@ -898,6 +883,10 @@ pub fn quant_i4(w: &[f32], o_dim: usize, i_dim: usize) -> (Vec<u8>, Vec<f32>) {
 /// with basis vectors: an audit that reconstructs weights through the very routine it
 /// is auditing cannot detect a decode bug. The round trip `dequant_i4(quant_i4(w))` is
 /// unit-tested below, which is what keeps the two spellings honest.
+///
+/// No non-test caller since `i4_audit` was retired 2026-08-05 (tag `archive/i4-audit`) —
+/// "offline use" above is now only that tool, restored. It stays where the VQ equivalent
+/// went, because the round trip below actually pins the second spelling to the first.
 pub fn dequant_i4(packed: &[u8], scale: &[f32], o_dim: usize, i_dim: usize) -> Vec<f32> {
     let (rb, ng) = (i4_row_bytes(i_dim), i4_groups(i_dim));
     debug_assert_eq!(scale.len(), o_dim * ng);

@@ -1102,8 +1102,11 @@ fn moe_i4_real_data_matches_cpu() {
 /// draws, which is exactly why quoting a same-distribution-but-different-seed anchor
 /// (as an earlier revision did) is not good enough.
 ///
-///     cargo run --release --bin i4_audit -- /var/db/rivoli/glm52-vq3-full <fp8-dir> \
-///         --layer 3 --experts 0,7,256
+/// Retired 2026-08-05, tag `archive/i4-audit`; restore per `docs/investigations/int4-scales.md`
+/// §8, then:
+///
+///     cargo run --bin i4_audit -- /var/db/rivoli/glm52-vq3-full \
+///         /swarm/storage/ai/openclaw/glm52-fp8 --layer 3 --experts 0,7,256
 #[test]
 fn moe_i4_real_data_vs_fp8_ground_truth() {
     use rivoli::artifact::format::{FormatMeta, I4Source, Safetensors};
@@ -1224,7 +1227,8 @@ fn moe_i4_real_data_vs_fp8_ground_truth() {
     // anchored at rel_l2 0.2951 / gain 1.0009; group-128 measures 0.1698 / 1.0493 on the
     // same artifact coordinates and seed — a 42% error reduction, and the reason `--mode
     // int4` went from PPL 73.43 to 5.12. Changing `I4_GROUP` moves these ON PURPOSE:
-    // re-anchor with `bin/i4_audit`, do not widen. (A mismatched artifact never reaches
+    // re-anchor with the retired `bin/i4_audit` (see the doc comment above), do not widen.
+    // (A mismatched artifact never reaches
     // here — the group gate above skips it, because reading one yields rel_l2=NaN and this
     // assertion would then blame a "systematic gain error" for a stale file.)
     assert!(

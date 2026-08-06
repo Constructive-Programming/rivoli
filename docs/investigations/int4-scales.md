@@ -196,6 +196,10 @@ through some of the same code, so it is a reconstruction and is labelled as one.
 > reconstruction that has already served its comparison does not need a standing tool. The
 > live arms are unchanged: `--scan`, `--verify`, `--xcheck`, `--scale-study`.
 
+> **2026-08-05: `i4_audit` is gone entirely**, four live arms and all — tag
+> `archive/i4-audit`, restore recipe and traps in §8. Every number in this document stands as
+> recorded; the tool is how you would *re-derive* one, not where any of them lives.
+
 | | rel-L2 (whole row) | bulk (\|w\| ≤ p99) | tail | gain |
 |---|---:|---:|---:|---:|
 | new `.i4` | **0.205** | **0.215** | **0.065** | **1.0008** |
@@ -246,8 +250,9 @@ zeroed). The old `.i4` was not better designed; it was pre-conditioned upstream.
 **But which upstream property did it?** Two candidates, and they are not distinguished here:
 (a) `.vq3`'s scale per **64** weights, or (b) `quant_vq`'s **least-squares scale refit**, which
 is MMSE-like and shrinks by `1 − relL2²` — measured 0.9766, and the mechanism this repo has
-actually evidenced (`bin/i4_audit`'s `VQ_GAIN` — removed 2026-08-01, see §2's note; the
-0.9766 is recorded in docs/measurement/benchmarks.md). MMSE shrinkage biting harder in
+actually evidenced (`bin/i4_audit`'s `VQ_GAIN` — removed 2026-08-01, and the whole tool
+retired 2026-08-05; see §2's notes and §8. The 0.9766 is recorded in
+docs/measurement/benchmarks.md). MMSE shrinkage biting harder in
 the tail than at the median would drop `amax/median` 7.2 → 6.8 with **no appeal to group size
 at all**. This is load-bearing: if the benefit came from (b), then group-wise int4 *without* an
 MMSE/LS scale fit will not reproduce it, and 365 GB gets rewritten on the wrong half of the
@@ -308,13 +313,14 @@ one — that would be an importer, not a re-derivation.
 | `kernels/moe.hip` (`moe_gateup_i4`, `moe_down_i4`) | applies the scale **outside** the dot (`d.gate_scale[j]`). Group scales break exactly that. `dot_vq_wave` in the same file already does per-group scaling — use it as the template. |
 | `src/quant.rs` | `i4_row_bytes`, `quant_i4`, `dequant_i4`, `matvec_i4`, `i4_proj_bytes`, `i4_expert_bytes`, `i4_expert_stride`, `i4_slot_offsets` all encode per-row layout. |
 | `tests/artifact.rs` | asserts on-disk bytes equal `quant_i4`'s output; rewritten with it. |
-| `src/bin/i4_audit.rs` | every mode slices via `off[k*2+1]`. |
+| `src/bin/i4_audit.rs` | every mode slices via `off[k*2+1]`. *(This change shipped; the file was then retired 2026-08-05 — §8. A restore from the tag already carries the group-128 slicing.)* |
 | `docs/reference/modes.md` | group scales grow bytes/expert, moving the **18.9 MB/expert** figure — which sets pool slots and hit rate, i.e. the whole int4-vs-int3-vq residency tradeoff. |
 
 **Acceptance gate.** `--mode int4` must reach PPL within ~10% of int3-vq's 5.28 on
 `tests/ppl-corpus.txt` at `--max-mem 100`, and `bin/i4_audit`'s `>50%-zero` row count for
 `L03 e0 down_proj` must collapse from **603**. If group-wise int4 cannot clear the first, the
-mode should be removed rather than shipped.
+mode should be removed rather than shipped. *(Gate met — int4 shipped at PPL 5.120. The
+tool was retired 2026-08-05; re-running this gate needs it back, §8.)*
 
 ---
 
@@ -336,6 +342,26 @@ mode should be removed rather than shipped.
 - `bin/i4_audit` — `--scan` (all 197,376,000 scales), `--verify` (wide bit-identity),
   `--xcheck` (`.i4` ↔ `.vq3`, the one that can fail), `--scale-study` (α sweep, weight and
   output space), plus dead-row and bulk/tail statistics.
+
+  > **RETIRED 2026-08-05**, tag `archive/i4-audit`, commit `4c81c89`. The live reason to
+  > restore it is §10's: `--scale-study` is what scores a candidate `I4_GROUP` against f64
+  > fp8 truth, and §10's table came out of it.
+  >
+  > ```
+  > git worktree add /tmp/i4a archive/i4-audit && cd /tmp/i4a   # NOT a bare checkout — see below
+  > cargo run --bin i4_audit -- \                               # no --features: CPU-only
+  >     /var/db/rivoli/glm52-vq3-full /swarm/storage/ai/openclaw/glm52-fp8 \
+  >     --scale-study --layer 3 --experts 7
+  > ```
+  >
+  > **Take the whole tree, not the file.** The tag preserves the pre-refactor tree on purpose:
+  > the tool imports fifteen names from `quant`/`format` (`i4_slot_offsets`,
+  > `vq_expert_layout`, …) that are exactly the offset families Track K of
+  > `refactor-2026-08.md` unifies, so after Track K a bare `git checkout … -- src/bin/` gives
+  > fifteen unresolved imports — and 698 lines re-entering a factored tree can trip the jscpd
+  > gate, which has no threshold.
+  >
+  > `quant::vq_decode_proj` went with it, as its only caller, and comes back the same way.
 - `tests/artifact.rs::i4_bytes_are_what_the_checkpoint_quantizes_to` — exact, CPU-only,
   provenance-gated on `i4_source`. (Still gated: a TEST may reasonably demand the label,
   since it is asserting what the bytes were derived *from*, which length cannot show. The
@@ -371,7 +397,8 @@ so 64 (matching `.vq3`) can be swept without touching anything else.
 365 GB conversion was riding on: did the old `.i4` behave better because `.vq3` carries
 group-of-64 scales, or because `quant_vq` refits its scales by least squares? Those predict
 opposite things about group-wise RTN. `i4_audit --scale-study` scores every candidate against
-f64 fp8 truth (expert 7 `down_proj`, 6144×2048):
+f64 fp8 truth (expert 7 `down_proj`, 6144×2048) — **this is the one live reason to restore the
+tool, retired 2026-08-05; see §8**:
 
 | scheme | W relL2 | zeros | gain |
 |---|---:|---:|---:|

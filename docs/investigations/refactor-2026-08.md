@@ -272,12 +272,30 @@ A straight deletion, not a refactor. Both citations are **closed** investigation
 *"2026-08-01: `i4_audit` no longer re-derives them"* — the capability those docs describe was
 removed from the tool before this. The investigations keep the record.
 
-**Preserved at tag `i4-audit-retired`** (annotated, with the restore command in the tag
-message). Restore with `git checkout i4-audit-retired -- src/bin/i4_audit.rs` if an int4
-quantization question reopens; do not rewrite it.
+**Preserved at tag `archive/i4-audit`** (annotated, pushed). If an int4 quantization question
+reopens, restore rather than rewrite — recipe and its two traps in `int4-scales.md` §8, which
+is the single source of truth for it. (A bare `git checkout … -- src/bin/i4_audit.rs` is
+**not** it, and stops working once Track K lands.)
 
 **Gate:** nothing references it after removal — `grep` `docs/`, `tests/`, `*.sh`, `Cargo.toml`
 — and `architecture.md:711`'s `src/bin/` inventory is updated in the same commit.
+
+> **DONE 2026-08-05. Two corrections that generalise to the other deletion tracks.**
+>
+> 1. **"no inbound refs" was false — there were seven files, one of them build-breaking.**
+>    `.github/workflows/release.yml:104` packaged the binary into every release tarball from a
+>    hand-written `for b in rivoli convert … i4_audit ppl replay` loop. It fails at
+>    `install -m755 target/release/i4_audit`, at TAG time, and is invisible to `cargo build`,
+>    `cargo clippy` and every test. **Any track deleting a `src/bin/` target must check that
+>    loop.**
+> 2. **The gate as written is unsatisfiable.** "Nothing references it" contradicts the
+>    corrected-in-place convention — closing this out *added* mentions. What was actually met:
+>    **no BUILD reference, and every surviving prose mention sits in a dated note naming the
+>    tag.** Use that wording for Tracks G and K.
+>
+> Also deleted: `quant::vq_decode_proj`, whose only caller this was. **Cut a deletion's
+> orphans in the same commit** — it was briefly kept for a bit-identity with `matvec_vq` that
+> no test checked, which is the failure mode the track existed to remove.
 
 ## Track I — the shared layer-loop skeleton · ~600 · after Track 0
 
@@ -351,7 +369,7 @@ s4     Track 3  (tests/)         ─┐ ALONE as a pair — the safety net goes 
 | 2 ABI macro | 1,000 | **G3** per launcher |
 | F in-src tests | 1,000 | **G4** |
 | G converters | 700 | G2 |
-| H rm i4_audit | 697 | no inbound refs |
+| H rm i4_audit | 697 | ~~no inbound refs~~ **DONE 2026-08-05** — there were seven files, one build-breaking; see Track H |
 | I loop skeleton | 600 | G1 on GLM **and** V4 |
 | K format/offset | 350 | G2 + recorded break still red |
 | **total** | **~14,050** | **39%** |
