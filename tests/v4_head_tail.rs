@@ -35,7 +35,8 @@
 
 use rivoli::backend::gpustream::HipStream;
 use rivoli::backend::hip::{
-    device_sync, launch_v4_dense_gemm_bf16, launch_v4_embed_bf16_row, launch_v4_hc_head, launch_v4_rmsnorm,
+    device_sync, launch_v4_dense_gemm_bf16, launch_v4_embed_bf16_row, launch_v4_hc_head,
+    launch_v4_qk_norm, launch_v4_rmsnorm,
 };
 use rivoli::memory::device::DeviceBuf;
 use rivoli::v4oracle::{
@@ -45,14 +46,16 @@ use rivoli::v4oracle::{
 };
 
 mod common;
-use common::{f32b, f32v, u16b};
+use common::{assert_bits, f32b, f32v, rel, u16b};
 
 /// This file's device plumbing.
 ///
-/// Owned here rather than shared: `tests/common/mod.rs` states the rule in as many words --
-/// "anything that touches a device TYPE stays in the test file that owns it", because `dev`
-/// is `DeviceBuf` under HIP and `Buf` under Vulkan. `tests/v4_compress_kernel.rs` wraps it in
-/// a struct for the same reason.
+/// Owned here rather than shared, and the reason it USED to give is gone: `tests/common/mod.rs`
+/// stated that "anything that touches a device TYPE stays in the test file that owns it",
+/// because `dev` was `DeviceBuf` under HIP and `Buf` under Vulkan. That rule died with the
+/// second backend on 2026-08-06 and `common` now owns `dev`/`zeros`/`back`. What keeps this
+/// struct is narrower: the typed `p()`/`pm()`/`read()` accessors, which the four bare
+/// functions do not provide. `tests/v4_compress_kernel.rs` wraps it the same way.
 struct Dev(DeviceBuf);
 
 impl Dev {
@@ -92,15 +95,8 @@ fn bf(x: f32) -> f32 {
 fn as_bf16(v: &[f32]) -> Vec<u16> {
     v.iter().map(|x| bf16_encode(*x)).collect()
 }
-/// `golden.rs::Diff.rel` — the metric the oracle's own gate uses.
-fn rel(got: &[f32], want: &[f32]) -> f32 {
-    // Length first: `zip` truncates, so a short `got` would score 0.0 and read as perfect
-    // agreement. Not reachable today -- both sides derive from the same `cfg` -- but it is
-    // the failure mode `golden.rs::diff_section` calls fail-open and refuses by design.
-    assert_eq!(got.len(), want.len(), "comparing tensors of different length");
-    let s = want.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-30);
-    got.iter().zip(want).fold(0.0f32, |m, (a, b)| m.max((a - b).abs() / s))
-}
+// `rel` — `golden.rs::Diff.rel`, the metric the oracle's own gate uses — moved to
+// `common` on 2026-08-06 when `tests/indexer_kernel.rs` reimplemented it under another name.
 
 /// A head-tail fixture at the given `dim`, with everything bf16 where the checkpoint is.
 struct Fixture {
@@ -327,4 +323,62 @@ fn the_lm_head_needs_no_kernel_of_its_own() {
     let r = rel(&g_lg, &w_lg);
     println!("lm_head via v4_dense_gemm_bf16 at vocab 1024: rel {r:.3e}");
     assert!(r < 1e-3, "the existing dense GEMM does not reproduce the lm_head: rel {r:.3e}");
+}
+
+/// `kernels/mla.hip::v4_qk_norm` against `Oracle::qk_norm`.
+///
+/// Here rather than in `tests/v4_attn.rs` because of what it IS rather than where it is
+/// called: it is a per-row bf16-rounded RMS normalisation, the direct sibling of
+/// `v4_rmsnorm` above, and the two differ in exactly the way this file already exists to
+/// pin — where the statistic is taken and in what precision. `v4_attn.rs` scores the whole
+/// attention block, in which this kernel's contribution is one bf16 step wide.
+///
+/// **Bit-exact, and that is forced rather than chosen.** The kernel bf16-rounds `rs`, so
+/// its output lands on a ~0.4% lattice; any tolerance loose enough to absorb a
+/// re-association would be looser than the quantum and would absorb a wrong `rs` with it.
+/// The two sides can only disagree if the f32 variance falls within a reduction's worth of
+/// a bf16 tie point — the tree sum against the oracle's sequential one — which then costs a
+/// whole step. Should this ever flake, it is that, and the fix is a different seed, not a
+/// tolerance.
+///
+/// **No learnable weight**, model.py:504. The kernel takes none, and `Defect::
+/// QkNormUsesQNormWeight` is the oracle's name for supplying one — so `q_norm_w` below is a
+/// single 1.0 that `Defect::None` never reads, not a fixture with meaning.
+///
+/// Six rows, not one. `attn::v4::attention` launches this as `m * n_heads` rows in a single
+/// grid, and the statistic is per row: a kernel that reduced over the whole buffer, or that
+/// indexed `blockIdx.x` against the wrong stride, is invisible at one row.
+#[test]
+fn v4_qk_norm_matches_the_oracle_bit_for_bit() {
+    let (rows, head_dim) = (6usize, 128usize);
+    let cfg = V4Config::toy();
+    let mut r = NamedRng::new("v4-qk-norm-device");
+    // Per-row scales spanning 32x (`1 << (i / head_dim)` over six rows is 1..32), so each
+    // row's `rs` is a different number — measured, they run 1.758 down to 0.0532. Drawn from
+    // one distribution every row would normalise by nearly the same factor, and a cross-row
+    // statistic bug would land inside the bf16 quantum.
+    let q: Vec<f32> = (0..rows * head_dim)
+        .map(|i| bf(r.unit() * (1 << (i / head_dim)) as f32))
+        .collect();
+
+    let mut want = q.clone();
+    Oracle::new(cfg.clone(), Defect::None).qk_norm(&mut want, head_dim, &[1.0]);
+
+    let stream = HipStream::new().expect("stream");
+    let mut qb = Dev::f32s(&q);
+    // SAFETY: `qb` is `rows * head_dim` live f32, written in place, and outlives the sync
+    // inside `read`. `stream` is a live HipStream handle.
+    unsafe {
+        launch_v4_qk_norm(qb.pm(), rows, head_dim, cfg.norm_eps, stream.raw())
+            .expect("v4_qk_norm");
+    }
+    let got = qb.read();
+
+    // Anti-vacuity, host against host: the normalisation must have MOVED the input, or
+    // "the kernel matches the oracle" is satisfied by a kernel that writes nothing. The
+    // per-row scale spread above is what makes this large.
+    let moved = rel(&want, &q);
+    println!("v4_qk_norm: the norm moves the input by rel {moved:.3e}");
+    assert!(moved > 0.5, "the fixture is already normalised; the comparison is vacuous");
+    assert_bits(&want, &got, "v4_qk_norm");
 }

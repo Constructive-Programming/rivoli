@@ -142,6 +142,13 @@ an artifact of framing.
 > (2) `tests/kernel_coverage.rs` was the launcher-to-oracle census, keyed on `vk.rs`; it was
 > deleted rather than re-keyed, so **no launcher in the tree has a coverage census**.
 > Re-keying it onto `src/backend/hip.rs` is the obvious repair and is unclaimed.
+>
+> > **CLOSED 2026-08-06.** (2) is repaired. The census is restored, keyed on `src/backend/`
+> > rather than on one file, so a launcher relocating into a sibling module no longer leaves
+> > it silently. It found **18 of 48 launchers with no oracle** — `hip.rs` had never been
+> > scanned — and thirteen new device oracles closed that to one: `launch_vaxpy`, which has
+> > **no caller anywhere in the tree** and is proposed for deletion rather than for a test.
+> > (1) is unchanged and still open.
 
 **Rationale.** 6 of 36 cells decode (`tests/mode-matrix.sh`), 16 of 29 kernels, ~1.9× slower,
 refuses `int4`/`hybrid`/`dsa`/`misa` at startup, and cannot run V4 at all. Every V4 launcher

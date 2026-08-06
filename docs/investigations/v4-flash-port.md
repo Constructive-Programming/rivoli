@@ -815,6 +815,12 @@ the wiring, not suggestions:
 13. `mod v4` is `#[cfg(feature = "rocm")]` and `vk.rs` has no counterparts, so
     `tests/kernel_coverage.rs` does not see these launchers. Whether V4 gets a Vulkan arm is
     S3's call; **stubs would claim a parity nothing has measured.**
+    — *CLOSED 2026-08-06, and both halves of it died at once. There is no `vk.rs`, and the
+    census was re-keyed to walk `src/backend/` rather than one file, so it now counts all
+    fourteen `launch_v4_*`. Twelve are named directly by a test; the three `v4_compress_*`
+    are the sole `INDIRECT` row, exercised as one unit through `v4compress::compress` by
+    `tests/v4_compress_kernel.rs`. The warning about stubs outlived its subject and is worth
+    keeping as a rule — `tests/v4_loop.rs` states it there.*
 
 *Known-thin coverage S3 inherits as written, not as hoped:*
 14. The **fast-path→tail handoff in the MoE kernels is exercised by nothing** — neither

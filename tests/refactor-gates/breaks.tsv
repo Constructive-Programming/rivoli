@@ -16,3 +16,33 @@ kernels/linalg.hip	!(limit > 0.0f && limit < INFINITY)	!(limit > 0.0f)	v4_kernel
 kernels/moe.hip	!(swiglu_limit > 0.0f && swiglu_limit < INFINITY)	!(swiglu_limit > 0.0f)	v4_kernel expert_range_f4_guards	infinite swiglu limit
 src/v4oracle/forward.rs	_ => b(terms.sum::<f32>()),	_ => terms.fold(0.0f32, |a, t| b(a + t)),	v4_oracle bf16_reduction_matches_torch_and_not_a_running_fold	does not accumulate in f32 and round once
 src/attn.rs	launch_v4_qk_norm(s.q, m * nh, hd, d.norm_eps, stream)?;	launch_v4_qk_norm(s.q, m * nh, hd, d.norm_eps, std::ptr::null_mut())?;	v4_attn the_attention_block_is_entirely_on_its_stream	while the stream was GATED
+#
+# --- launcher-census oracles, added 2026-08-06 with tests/kernel_coverage.rs -------------
+#
+# Thirteen new device oracles closed an 18-of-48 launcher coverage gap. Every one of them
+# is registered here, and that is the point rather than diligence: the census counts a NAME,
+# so it is satisfied by an oracle that asserts nothing, and these rows are what stop the
+# repair from being exactly that. A test nobody has seen red is not coverage.
+#
+# All fourteen break an ARGUMENT at the call site rather than a `kernels/*.hip` body. Not
+# laziness -- a kernel edit rebuilds every kernel through `build.rs`, and the defects worth
+# gating here are index and shape errors, which is what an argument break IS. The four that
+# would need a kernel edit (a wrong rounding mode, a dropped `__syncthreads`) are not
+# expressible this way and are NOT claimed.
+#
+tests/fwd_kernel.rs	                token,	                token + 1,	fwd_kernel embed_i8_row_gathers_the_requested_row	of 1024 elements differ
+tests/fwd_kernel.rs	                nope,	                nope - 1,	fwd_kernel gather_rope_extracts_each_heads_roped_segment	of 512 elements differ
+tests/fwd_kernel.rs	                pos,	                pos + 1,	fwd_kernel append_kv_quantizes_one_row_and_leaves_the_slab_alone	latent codes
+tests/fwd_kernel.rs	        let amax = blk.iter().fold(0.0f32, |m, &v| m.max(v.abs()));	        let amax = latent.iter().fold(0.0f32, |m, &v| m.max(v.abs()));	fwd_kernel append_kv_quantizes_one_row_and_leaves_the_slab_alone	latent codes
+tests/fwd_kernel.rs	        fire(&poison(700, f32::NAN), 5, &mut flag),	        fire(&poison(700, 1.0), 5, &mut flag),	fwd_kernel flag_nonfinite_records_the_first_fault_only	NaN must flag
+tests/fwd_kernel.rs	        fire(&poison(3, f32::NAN), 0, &mut sentinel),	        fire(&poison(3, f32::NAN), 1, &mut sentinel),	fwd_kernel flag_nonfinite_records_the_first_fault_only	atomicCAS comparand
+tests/indexer_kernel.rs	                bb.ptr() as *const f32,	                wb.ptr() as *const f32,	indexer_kernel layernorm_centres_scales_and_biases	rel=1.0e-4
+tests/indexer_kernel.rs	        unsafe { launch_index_append(kb.ptr() as *const f32, cb.ptr_mut() as *mut u16, pos, hd) },	        unsafe { launch_index_append(kb.ptr() as *const f32, cb.ptr_mut() as *mut u16, pos + 1, hd) },	indexer_kernel index_append_stores_one_bf16_key_row	of 896 elements differ
+tests/indexer_kernel.rs	                launch_index_pool_push(kb.ptr() as *const f32, pool.ptr_mut() as *mut f32, t, hd)	                launch_index_pool_push(kb.ptr() as *const f32, pool.ptr_mut() as *mut f32, t + 1, hd)	indexer_kernel index_pool_push_keeps_the_exact_block_running_mean	of 384 elements differ
+tests/indexer_kernel.rs	    let hb = dev(&subset	    let hb = dev(&[0usize, 1, 2, 3]	indexer_kernel index_score_reduces_over_the_active_heads_only	MISA, 4 of 64 heads
+tests/indexer_kernel.rs	                m_blocks,	                m_blocks - 1,	indexer_kernel index_head_route_averages_over_the_block_pool	rel=1.0e-5
+tests/kernel.rs	    unsafe { launch_swiglu(gp as *const f32, ub.ptr() as *const f32, n, gp) }.expect("swiglu");	    unsafe { launch_swiglu(ub.ptr() as *const f32, gp as *const f32, n, gp) }.expect("swiglu");	kernel swiglu_matches_the_division_form_in_place	rel=1.0e-5
+tests/kernel.rs	        unsafe { launch_rope(b.ptr_mut() as *mut f32, count, stride, seg, pos, theta) }	        unsafe { launch_rope(b.ptr_mut() as *mut f32, count, seg, seg, pos, theta) }	kernel rope_interleaves_pairs_and_is_a_permutation_at_position_zero	pure de-interleave
+tests/kernel.rs	        let (sb, cbb, nb) = (dev(&f32b(&sub)), dev(&f32b(&cb)), dev(&f32b(&cbnorm)));	        let (sb, cbb, nb) = (dev(&f32b(&sub)), dev(&f32b(&cb)), dev(&f32b(&cbnorm.iter().map(|v| -v).collect::<Vec<f32>>())));	kernel vq_encode_picks_the_nearest_codebook_entry	vq_encode indices
+tests/kernel.rs	    gemv_i4(GemvIo::new(&xb, &pb, &sb, &mut yb), o_dim, i_dim);	    gemv_i4(GemvIo::new(&xb, &pb, &sb, &mut yb), o_dim, i_dim / 2);	kernel gemv_i4_matches_oracle	rel=1.0e-5
+tests/v4_head_tail.rs	        launch_v4_qk_norm(qb.pm(), rows, head_dim, cfg.norm_eps, stream.raw())	        launch_v4_qk_norm(qb.pm(), rows / 2, head_dim * 2, cfg.norm_eps, stream.raw())	v4_head_tail v4_qk_norm_matches_the_oracle_bit_for_bit	of 768 elements differ

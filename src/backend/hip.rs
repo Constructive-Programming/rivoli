@@ -1656,17 +1656,24 @@ pub unsafe fn launch_index_head_route(
 // needed [`memcpy_dtod_async`]. Counting six LAUNCHERS and paying six would have reproduced
 // the very race the earlier decline predicted. `docs/investigations/v4-flash-port.md` requirement 9.
 //
-// NO AUTOMATIC GATE SAYS THESE ARE EXERCISED, and that is now true of every launcher in
-// this file, not just the V4 ones. `tests/kernel_coverage.rs::every_launcher_has_an_oracle`
-// was the launcher-to-oracle census; it was keyed on `backend/vk.rs` and was DELETED with
-// that backend on 2026-08-06 rather than re-keyed onto this file. Nothing replaced it.
-// `tests/v4_attn.rs` is the whole of the V4 launchers' coverage.
+// A GATE NOW SAYS THESE ARE EXERCISED. None did until 2026-08-06: this block used to read
+// "NO AUTOMATIC GATE SAYS THESE ARE EXERCISED, and that is now true of every launcher in
+// this file" — `tests/kernel_coverage.rs::every_launcher_has_an_oracle` was keyed on
+// `backend/vk.rs` and was deleted with that backend rather than re-keyed. It has been
+// restored, keyed on `src/backend/` as a whole so the next file move does not repeat the
+// deletion. On arrival it found 18 of this file's 48 launchers with no oracle at all.
 //
-// Re-keying that census onto `src/backend/hip.rs` is the obvious repair and is recorded as
-// a testing gap in `docs/investigations/refactor-2026-08.md` §Track 1. Its original
-// motivation is worth keeping in view: a tranche once shipped two of its hardest kernels
-// unexercised while the suite's test COUNT rose, which is exactly what a census catches and
-// a green suite does not.
+// Read what it does and does not claim before trusting it: it counts a NAME in `tests/`,
+// not an assertion, and it is not feature-gated, so it passes under a featureless build
+// where none of the oracles it counts can even compile. Its original motivation is worth
+// keeping in view: a tranche once shipped two of its hardest kernels unexercised while the
+// suite's test COUNT rose, which is exactly what a census catches and a green suite does
+// not.
+//
+// The substance behind the count, for these six: `tests/v4_attn.rs` scores four of them
+// inside the whole attention block, and `tests/v4_head_tail.rs` scores `v4_rmsnorm` and
+// `v4_qk_norm` on their own. An earlier version of this line said `v4_attn.rs` covered all
+// six and was wrong about two.
 
 /// `kernel.py::act_quant(x, block, "ue8m0", inplace=True)` in place over `rows` rows of
 /// `row_stride` floats, quantizing the first `n` of each. `n < row_stride` is the KV

@@ -318,11 +318,15 @@ authority: **`build.rs::vulkan()` runs the SPIR-V guards on every shader, every 
 | 11 | `no_array_parameters` | `build.rs`, whole-array `OpLoad` scan | GLSL's copy-in/copy-out of array parameters. `e4m3_lut_build(inout float lut[256], …)` gave every invocation a private 1 KB copy; the fp8 table became noise (err = 8.6e37). It passed a clean compile, `spirv-val`, every other guard, and GPU-AV — the reads were IN BOUNDS. |
 | 12 | `no_barrier_without_memory` | `build.rs`, barrier + storage scan | A bare `barrier()`, which orders SHARED memory only (0x108, no `UniformMemory` bit) where HIP's `__syncthreads()` orders global too. `rope_interleave` shipped this way and passed on today's RADV. The skip set (`BARRIER_EXEMPT`) is PINNED and a stale entry fails the build. |
 | 8 | transcription lock | `tests/glsl_numerics.rs` | `f2e4m3`/`f2bf16` in `common.glsl` drifting from the CPU transcriptions that test them. It hashes the two function bodies and fails on a change — a stale transcription would keep passing while testing a function the shader no longer has. |
-| 10 | launcher coverage | `tests/kernel_coverage.rs` | A `launch_*` in `src/backend/vk.rs` with no test. Tranche 2a ported six kernels and shipped `gemv_i8`/`gemv_fp8` never once executed, while the suite went 16 tests to 23 — coverage grew while the gap grew faster. |
+| 10 | launcher coverage | `tests/kernel_coverage.rs` | A `launch_*` in `src/backend/vk.rs` with no test. Tranche 2a ported six kernels and shipped `gemv_i8`/`gemv_fp8` never once executed, while the suite went 16 tests to 23 — coverage grew while the gap grew faster. **Re-keyed 2026-08-06 onto `src/backend/` and still live** — the only rule in this table that outlived the backend, because its subject was never Vulkan-specific, and the one row here that is not archived. It found 18 of 48 `hip.rs` launchers unexercised on arrival. |
 
 **Numbers 1, 3–7 are not recoverable.** The surviving labels are the code's own — `build.rs`
 says "ninth", "eleventh", "twelfth"; the tests say "EIGHTH" and "TENTH"; rule 2 is pinned by
-this document's own pre-flight table naming it for the subgroup ban. The rest were never
+this document's own pre-flight table naming it for the subgroup ban. **Row 10 is now the
+exception to that sourcing:** the re-key deleted the "TENTH MECHANISED RULE" ordinal from
+`tests/kernel_coverage.rs`, because it indexed this archived table and nothing maintains the
+numbering. The row keeps its number here as history; the code no longer asserts one. The
+rest were never
 written down anywhere that survived, so the gaps above are honest rather than reserved. **If
 you add a guard, put its number in its doc comment** — that is the only reason eight of
 these are still identifiable.

@@ -247,9 +247,11 @@
 //! weakness the derivation still has. `Defect::ALL` already enumerates the breakages.
 
 // `rocm`: `v4gpu` is `rocm`-gated because every launcher it drives is `backend::hip`'s, and
-// since 2026-08-06 that is the only backend. The rule this used to cite by name
-// (`tests/kernel_coverage.rs`, deleted with the Vulkan backend) is worth stating directly,
-// because it outlived its enforcer: do not add stubs that claim a parity nothing measured.
+// since 2026-08-06 that is the only backend. The rule this cites — do not add stubs that
+// claim a parity nothing measured — is worth stating directly whatever enforces it. It
+// briefly had no enforcer at all: `tests/kernel_coverage.rs` went with the Vulkan backend on
+// 2026-08-06 and was restored the same day, re-keyed onto `src/backend/`. The sentence
+// "it outlived its enforcer" stood here in between.
 #![cfg(feature = "rocm")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
