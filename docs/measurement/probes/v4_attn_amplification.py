@@ -41,10 +41,12 @@ Inputs, both read-only:
    `attn_norm_out` (zero upstream) reads clean and `attn_out` (three) reads worst, for
    any implementation.
 
-5. And the residual that keeps `tests/v4_loop.rs` red: no single uniform 1-ULP
-   perturbation of `attn_derot` reproduces all three of the engine's recorded statistics
-   for `L0.pre.attn_out` at once. Matching the differing fraction needs ~3e-3; matching
-   `max_rel` needs ~1e-1. The engine's error tail is heavier than amplification alone.
+5. RETRACTED 2026-08-06. This claimed a RESIDUAL -- that no single uniform 1-ULP
+   perturbation reproduces the engine's three `attn_out` statistics at once, so its tail
+   was heavier than amplification explains. The sweep behind it varies only the FRACTION
+   perturbed at a fixed magnitude, while section 2 shows real fold noise is heavy-tailed
+   in magnitude too; rejecting a null already known to be the wrong shape yields no
+   residual. Section 9 replaces it, driven by the device's own measured input deviation.
 
 # Two things this CANNOT say
 
@@ -91,6 +93,11 @@ REL_FLOOR = 1e-3
 # The engine's own numbers for L0.pre.attn_out, from the bisection table in
 # docs/investigations/v4-flash-port.md. Quoted so the sweep below can be read against them.
 ENGINE = dict(differ=57.9, max_abs=7.81e-2, max_rel=3.50e1)
+# The engine's `L0.pre` bisection, MEASURED on gfx1151 2026-08-06 by `tests/v4_loop.rs`. The
+# `attn_norm_out` count is the INPUT deviation every envelope below is built from -- it is the
+# device's own, not a fitted parameter, and every one of its 26 differences is exactly 1 ULP.
+DEVICE_ANO_DIFFER = 26
+DEVICE_L0_PRE = dict(kv_entry=9.460e-1, q=2.710e1, attn_derot=6.933e0, attn_out=3.498e1)
 
 
 # --- safetensors ------------------------------------------------------------------
@@ -400,6 +407,12 @@ def attention(art, gold, layer, tag, m, pos, ring, tbl):
     kv = act_quant(kv.ravel(), m, HEAD_DIM, HEAD_DIM - ROPE_HEAD_DIM, 64)
 
     if pos == 0:  # prefill: attend the prompt's own KV, by ABSOLUTE position, causally
+        # The ring write is the engine's (`memcpy(io.cache, s.kv, seqlen * row)` at
+        # attn.rs:854), so it belongs here -- but the CALLER re-seeds from the oracle's
+        # `kv_entry` afterwards, because otherwise this line silently defeats that seeding
+        # and the decode cell is scored against a ring this transcription produced. Found by
+        # review; the numbers did not move (kv_entry is bit-identical on all four cells),
+        # which is exactly why nothing would have caught it.
         ring[:m] = kv.reshape(m, HEAD_DIM)
         src = kv.reshape(m, HEAD_DIM)
         idxs = np.full((m, m), -1, np.int64)
@@ -437,6 +450,52 @@ def attention(art, gold, layer, tag, m, pos, ring, tbl):
 
 
 # --- checks -------------------------------------------------------------------------
+
+
+def block_with_defect(art, gold, layer, half_split=False, skip_qk=False):
+    """The prefill block with ONE deliberate breakage, for calibrating a bound against it.
+
+    `RopeHalfSplit` writes the half-split slots `(i, rd/2 + i)` where the reference rotates
+    ADJACENT pairs `(2i, 2i+1)` -- `docs/investigations/v4-flash-port.md` calls it the single
+    most likely silent-wrong in this scope, and both rotations produce fluent text.
+    `SkipQkNorm` drops model.py:504 entirely. Neither crashes; that is the point.
+    """
+    m = gold[f"L{layer}.pre.attn_norm_out"].size // DIM
+    tbl = rope_table(ROPE_HEAD_DIM, 4096, ROPE_THETA)
+    wkv, wqa, wqb = (fp8w(art, layer, n) for n in ("wkv", "wq_a", "wq_b"))
+    woa, wob = rbf16(fp8w(art, layer, "wo_a")), fp8w(art, layer, "wo_b")
+    kn, qn = f32t(art, layer, "kv_norm.weight"), f32t(art, layer, "q_norm.weight")
+    sink = f32t(art, layer, "attn_sink")
+
+    def rope(v, rows, rpp, inv):
+        if not half_split:
+            return v4_rope(v, tbl, rows, HEAD_DIM, ROPE_HEAD_DIM, 0, rpp, inv)
+        a = v.reshape(rows, HEAD_DIM).copy()
+        seg = a[:, HEAD_DIM - ROPE_HEAD_DIM :]
+        t = tbl[np.arange(rows) // rpp]
+        c, sn = t[:, 0::2], (-t[:, 1::2] if inv else t[:, 1::2])
+        h = ROPE_HEAD_DIM // 2
+        p_, q_ = seg[:, :h].copy(), seg[:, h:].copy()
+        seg[:, :h], seg[:, h:] = p_ * c - q_ * sn, p_ * sn + q_ * c
+        return rbf16(a)
+
+    xq = act_quant(gold[f"L{layer}.pre.attn_norm_out"].copy(), m, DIM, DIM, 128)
+    kv = v4_rmsnorm(gemv(xq, wkv, m, HEAD_DIM, DIM, 1), kn, m, HEAD_DIM)
+    kv = act_quant(rope(kv.ravel(), m, 1, False).ravel(), m, HEAD_DIM, HEAD_DIM - ROPE_HEAD_DIM, 64)
+    qr = v4_rmsnorm(gemv(xq, wqa, m, Q_LORA, DIM, 1), qn, m, Q_LORA)
+    qq = act_quant(qr.copy().ravel(), m, Q_LORA, Q_LORA, 128)
+    qv = gemv(qq, wqb, m, NHD, Q_LORA, 1).ravel()
+    if not skip_qk:
+        qv = v4_qk_norm(qv, m * N_HEADS, HEAD_DIM).ravel()
+    q = rope(qv, m * N_HEADS, N_HEADS, False)
+    idxs = np.full((m, m), -1, np.int64)
+    for t in range(m):
+        idxs[t, : t + 1] = np.arange(t + 1)
+    core = sparse_attn(q.ravel(), kv.ravel(), sink, idxs, m, N_HEADS, HEAD_DIM, HEAD_DIM**-0.5)
+    derot = rope(core.ravel(), m * N_HEADS, N_HEADS, True)
+    y = gemv(derot.ravel(), woa, m, GR, GD, O_GROUPS)
+    out = gemv(act_quant(y.copy().ravel(), m, GR, GR, 128), wob, m, DIM, GR, 1)
+    return dict(kv_entry=kv.ravel(), q=q.ravel(), attn_derot=derot.ravel(), attn_out=out.ravel())
 
 
 def check_conversion():
@@ -490,9 +549,14 @@ def main():
         # They are bit-identical (the kv_entry rows below say so), but using the run's own
         # would make that claim circular.
         ring = np.zeros((WINDOW, HEAD_DIM), dtype=np.float32)
-        ring[:m_pre] = gold[f"L{layer}.pre.kv_entry"].reshape(m_pre, HEAD_DIM)
         for tag, m, pos in (("pre", m_pre, 0), ("dec0", 1, m_pre)):
             got, tail, tail_no_aq = attention(art, gold, layer, tag, m, pos, ring, tbl)
+            if pos == 0:
+                # AFTER the prefill, not before: `attention` writes the ring itself, so a
+                # seed placed before the call is overwritten by it. Re-seeding here is what
+                # makes the decode cell a function of the ORACLE's prefill KV rather than of
+                # this transcription's, so `L*.dec0.*` is not scored against its own output.
+                ring[:m_pre] = gold[f"L{layer}.pre.kv_entry"].reshape(m_pre, HEAD_DIM)
             tails[(layer, tag)] = (got, tail, tail_no_aq)
             for k in ("q", "kv_entry", "attn_core_out", "attn_derot", "attn_out"):
                 sc = score(got[k], gold[f"L{layer}.{tag}.{k}"])
@@ -568,15 +632,16 @@ def main():
     for layer, tag, m, pos in ((0, "pre", m_pre, 0),):
         a32 = tails[(layer, tag)][0]["attn_out"]
         ACC[0] = np.float64
+        # `pre` only, so the ring is written by the call and never read across steps.
         ring = np.zeros((WINDOW, HEAD_DIM), dtype=np.float32)
-        ring[:m_pre] = gold[f"L{layer}.pre.kv_entry"].reshape(m_pre, HEAD_DIM)
         a64 = attention(art, gold, layer, tag, m, pos, ring, tbl)[0]["attn_out"]
         ACC[0] = np.float32
         line(f"L{layer}.{tag}.attn_out f32-vs-f64", score(a32, a64))
     print("  ^ that is the distance between two implementations that are BOTH correct.")
-    print(f"  `tests/v4_loop.rs` asserts max_rel < 5e-2 on this tensor.\n")
+    print("  `tests/v4_loop.rs` asserted max_rel < 5e-2 on this tensor until 2026-08-06; the")
+    print("  derived replacement is in section 8. 1.352 is why 5e-2 was unmeetable.\n")
 
-    print("== 7. the residual: no single perturbation of `attn_derot` matches the engine")
+    print("== 7. RETRACTED sweep (kept for the amplification it shows; see the note after it)")
     print(f"  ENGINE, L0.pre.attn_out (v4-flash-port.md): differ {ENGINE['differ']}%  "
           f"max_abs {ENGINE['max_abs']:.2e}  max_rel {ENGINE['max_rel']:.2e}")
     derot = gold["L0.pre.attn_derot"].copy()
@@ -593,11 +658,90 @@ def main():
         b[mask] = (b[mask].astype(np.int64) + step[mask]).astype(np.uint32)
         line(f"1 bf16 ULP on {p:.0e} of elements", score(tail(b.view(np.float32)), want))
     print()
-    print("  Read the sweep against the ENGINE line above: the differing fraction is matched")
-    print("  around 3e-3, but max_abs and max_rel are not matched until ~1e-1 -- a ~30x")
-    print("  disagreement. Amplification explains the SHAPE and most of the magnitude; the")
-    print("  remaining tail is what `probe_attn_stages` reading `attn_derot` off the device")
-    print("  is for. That is why tests/v4_loop.rs stays RED rather than having its bound moved.")
+    print("== 8. the DERIVED bounds in `AttnStages::scored`, and both of their inputs")
+    # ENVELOPE: what a CORRECT implementation produces given the deviation the DEVICE actually
+    # has in `attn_norm_out` -- 26 of 53,248 elements at exactly 1 bf16 ULP, measured on gfx1151
+    # 2026-08-06. The size is the device's; only the seed varies.
+    # DEFECT: how far a real breakage moves the same tensor. The bound is the geometric mean,
+    # so it sits a comparable factor above one and below the other.
+    stages = ("kv_entry", "q", "attn_derot", "attn_out")
+    x0 = gold["L0.pre.attn_norm_out"].copy()
+    env = {k: [] for k in stages}
+    for seed in range(30):
+        rng = np.random.default_rng(seed)
+        b = x0.view(np.uint32).copy()
+        idx = rng.choice(x0.size, DEVICE_ANO_DIFFER, replace=False)
+        st = (rng.integers(0, 2, DEVICE_ANO_DIFFER) * 2 - 1) * 0x10000
+        b[idx] = (b[idx].astype(np.int64) + st).astype(np.uint32)
+        ring = np.zeros((WINDOW, HEAD_DIM), dtype=np.float32)
+        g = attention(art, {**gold, "L0.pre.attn_norm_out": b.view(np.float32)},
+                      0, "pre", m_pre, 0, ring, tbl)[0]
+        for k in stages:
+            env[k].append(score(g[k], gold[f"L0.pre.{k}"])["max_rel"])
+    half = block_with_defect(art, gold, 0, half_split=True)
+    noqk = block_with_defect(art, gold, 0, skip_qk=True)
+    print(f"  {'tensor':11s} {'envelope max':>13s} {'RopeHalfSplit':>14s} {'SkipQkNorm':>11s}"
+          f" {'weakest seen':>13s} {'-> bound':>9s} {'ratio':>7s} {'DEVICE':>8s}")
+    for k in stages:
+        e = max(env[k])
+        cand = [v for v in (score(half[k], gold[f"L0.pre.{k}"])["max_rel"],
+                            score(noqk[k], gold[f"L0.pre.{k}"])["max_rel"]) if v > e]
+        d = min(cand) if cand else float("nan")
+        print(f"  {k:11s} {e:13.3g} {score(half[k], gold[f'L0.pre.{k}'])['max_rel']:14.3g}"
+              f" {score(noqk[k], gold[f'L0.pre.{k}'])['max_rel']:11.3g} {d:13.3g}"
+              f" {(e * d) ** 0.5:9.3g} {d / e:6.0f}x {DEVICE_L0_PRE[k]:8.3g}")
+    print("  A defect BELOW a tensor's envelope is excluded from `weakest seen` -- that tensor")
+    print("  cannot see it, and folding it in would manufacture a bound that gates nothing.\n")
+    section9(art, gold, tbl, m_pre)
+
+    print("  RETRACTED 2026-08-06: an earlier version of this probe read the sweep above as a")
+    print("  RESIDUAL -- the differing fraction is matched near 3e-3 while max_abs and max_rel")
+    print("  are not matched until ~1e-1 -- and concluded the engine's tail was heavier than")
+    print("  amplification explains. That is a straw man. This sweep varies ONE parameter (the")
+    print("  FRACTION perturbed) at a fixed 1 ULP magnitude, while section 2 shows real fold")
+    print("  noise is heavy-TAILED in magnitude too. Rejecting a null model already known to be")
+    print("  the wrong shape produces no residual, and `max_rel` here is seed-noisy besides.")
+    print("  The sweep is kept because it still shows the AMPLIFICATION; it settles nothing")
+    print("  about the engine. Section 9 is what settles that, from the device's own input.")
+
+
+def section9(art, gold, tbl, m_pre):
+    """Does the DEVICE's measured input deviation reproduce its measured output deviation?
+
+    This is the section that settles it, and the only one whose inputs both come from the
+    device. `tests/v4_loop.rs` measured, on gfx1151 2026-08-06, that the engine's
+    `attn_norm_out` differs from the oracle on 26/53,248 elements at L0 and 132/53,248 at L1
+    (8 of those at 2 ULP, the rest at 1). Perturb the GOLDEN input by exactly that much --
+    size from the device, only the seed varying -- and ask where the device's `kv_entry` and
+    `q` land in the resulting distribution. Inside it, amplification is the whole story.
+    """
+    print("== 9. the device's own input deviation -> its own output deviation (40 seeds)")
+    for layer, nd, n2, dkv, dq in ((0, 26, 0, 0.69, 6.69), (1, 132, 8, 1.58, 23.25)):
+        x0 = gold[f"L{layer}.pre.attn_norm_out"].copy()
+        kvs, qs = [], []
+        for seed in range(40):
+            rng = np.random.default_rng(seed)
+            b = x0.view(np.uint32).copy()
+            idx = rng.choice(x0.size, nd, replace=False)
+            mag = np.full(nd, 0x10000, dtype=np.int64)
+            mag[:n2] = 0x20000
+            st = (rng.integers(0, 2, nd) * 2 - 1) * mag
+            b[idx] = (b[idx].astype(np.int64) + st).astype(np.uint32)
+            ring = np.zeros((WINDOW, HEAD_DIM), dtype=np.float32)
+            g = attention(art, {**gold, f"L{layer}.pre.attn_norm_out": b.view(np.float32)},
+                          layer, "pre", m_pre, 0, ring, tbl)[0]
+            kvs.append(score(g["kv_entry"], gold[f"L{layer}.pre.kv_entry"])["differ"])
+            qs.append(score(g["q"], gold[f"L{layer}.pre.q"])["differ"])
+        kvs, qs = np.array(kvs), np.array(qs)
+        print(f"  L{layer}.pre  device attn_norm_out {nd}/53,248 differ ({n2} above 1 ULP)")
+        for nm, arr, dev in (("kv_entry", kvs, dkv), ("q", qs, dq)):
+            print(f"    {nm:9s} sim p10 {np.percentile(arr, 10):6.2f}  median "
+                  f"{np.median(arr):6.2f}  p90 {np.percentile(arr, 90):6.2f}   device {dev:6.2f}"
+                  f"  -> percentile {100 * (arr < dev).mean():3.0f}")
+    print("  The device is mid-distribution on L0 and in the LOW tail on L1 -- no coordinate")
+    print("  where it is WORSE than a correct implementation with its input deviation. That is")
+    print("  the opposite of a defect signature, and it is why the bounds in section 8 are")
+    print("  derived rather than the engine being called broken.\n")
 
 
 if __name__ == "__main__":

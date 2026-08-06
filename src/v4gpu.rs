@@ -515,6 +515,66 @@ pub struct AttnStages {
     pub attn_out: Vec<f32>,
 }
 
+impl AttnStages {
+    /// Each tensor with the golden SUFFIX that names it and the `max_rel` bound derived for it,
+    /// **sharpest first** — the order of the amplifier ladder, so a caller printing these prints
+    /// the most diagnostic row first and the first line to move is the one to believe.
+    ///
+    /// This exists because the struct's whole argument for not being a 4-tuple — that four
+    /// `Vec<f32>` in a row are permutable and the failure is a silent comparison against the wrong
+    /// golden — was defeated at its only call site, which paired the fields with their names in a
+    /// hand-written array. Found by review. Pairing them HERE, next to the field declarations,
+    /// is the only place the two can be checked against each other by eye.
+    ///
+    /// # Where the bounds come from, and how little they buy
+    ///
+    /// **Derived, not chosen**: each is `sqrt(envelope_max * weakest_defect_above_the_envelope)`,
+    /// where the envelope is what a correct implementation produces given the `attn_norm_out`
+    /// deviation the device actually has (26 of 53,248 elements at 1 bf16 ULP, measured on
+    /// gfx1151 2026-08-06) and the defect column is measured over the **in-scope subset of
+    /// `Defect::ALL`**, not over a hand-picked pair. §8 of
+    /// `docs/measurement/probes/v4_attn_amplification.py` prints both inputs.
+    ///
+    /// | tensor | envelope max | weakest defect ABOVE it | bound | ratio | device |
+    /// |---|---:|---|---:|---:|---:|
+    /// | `kv_entry` | 2.56 | `RopeHalfSplit` 116 | **17** | 45x | 0.95 |
+    /// | `q` | 49.5 | `RopeFirstDims` 1,482 | **275** | 30x | 27.1 |
+    /// | `attn_derot` | 20.1 | `SkipKvActQuant` 26.8 | **23** | **1.3x** | 6.93 |
+    /// | `attn_out` | 53.8 | `KvActQuantWholeTensor` 94.6 | **71** | **1.6x** | 35.0 |
+    ///
+    /// **CORRECTED 2026-08-06.** A first version computed the defect column from TWO variants
+    /// (`RopeHalfSplit`, `SkipQkNorm`) and shipped 17/420/130/350 with a claimed "41x to 71x on
+    /// every row". Adversarial review measured all eighteen in-scope defects: `RopeHalfSplit` is
+    /// the weakest only for `kv_entry`; for `q` it is the STRONGEST of three, and for `attn_derot`
+    /// and `attn_out` the true weakest are 30x and 24x smaller. The old bounds were up to 5.6x
+    /// looser than the rule they cited, and **seven of eighteen defects cleared all four at once**
+    /// — including `QkNormAfterRope`, which moves `attn_out` by 32.7, i.e. LESS than the device's
+    /// own 35.0, so no bound on that tensor can ever separate it.
+    ///
+    /// **So read the ratio column, not the bound.** `kv_entry` and `q` separate by 45x and 30x and
+    /// are real gates. `attn_derot` and `attn_out` separate by 1.3x and 1.6x: they are barely
+    /// gates at all, and that is a property of `max_rel` on a tensor two and three fp8
+    /// requantizations deep, not something a better constant fixes. `max_rel` is floor-dominated
+    /// and near-blind to SCALING defects — `SkipQkNorm` roughly doubles every element of `q` and
+    /// reads 1.07. The statistic that separated every defect review could construct is the
+    /// differing-element FRACTION, and nothing in this tree asserts it yet; that is the owed work
+    /// recorded in `tests/v4_loop.rs`.
+    ///
+    /// Two further limits. The envelope draws its perturbed element POSITIONS uniformly at random,
+    /// while the device's are wherever `hc_pre`'s fold order crossed a bf16 boundary — clustering
+    /// them instead moves `attn_derot`'s envelope over an 18x range. And every number here is
+    /// `L0.pre`; the same four constants gate `L1` and both decode cells, where the input
+    /// deviation is up to 5x larger.
+    pub fn scored(&self) -> [(&'static str, &[f32], f32); 4] {
+        [
+            ("kv_entry", &self.kv_entry, 1.7e1),
+            ("q", &self.q, 2.75e2),
+            ("attn_derot", &self.attn_derot, 2.3e1),
+            ("attn_out", &self.attn_out, 7.1e1),
+        ]
+    }
+}
+
 /// Everything one V4 decode needs that does not vary between tokens.
 ///
 /// Every device buffer is allocated once in [`V4Engine::new`] and none per token, which is

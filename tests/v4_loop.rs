@@ -132,54 +132,119 @@
 //! The ordering in that table is what the block's arithmetic produces for ANY implementation.
 //!
 //! That doc also reads `attn_out`'s `max_abs 7.81e-2` as "~20 ULP … which is not re-association".
-//! **That number is a unit error**: it divides a `max_abs` taken at the tensor's largest elements
-//! (|x| up to 13.1) by the bf16 ULP at a typical one (|x| ~ 1.2). Per element, with the same 1e-3
-//! floor `max_rel` uses, it is ~2.5 ULP — and a bare numpy-vs-oracle fold difference on this exact
-//! tensor already reaches p99.9 = 2 ULP, max 39.
+//! **That is a unit error** — it divides `max_abs` by the bf16 ULP at an element other than the one
+//! it occurred on. `Gap::abs_ulp` now MEASURES it: **10.0**, at an element with |x| in [1, 2). Do
+//! not trust the earlier corrections either, including the `2.5` this header asserted for one
+//! revision and the `1.25` implied by the tensor's true maximum — all three were derived by
+//! assuming a magnitude, and all three were wrong. 10 ULP is squarely re-association here: a bare
+//! numpy-vs-oracle fold difference on this same tensor reaches p99.9 = 17.8.
 //!
-//! ## What it does NOT retract — the residual, which is why this file stays RED
+//! ## MEASURED ON THE DEVICE 2026-08-06 — and it retracted the residual AND my own discriminator
 //!
-//! The amplification explains the SHAPE and most of the magnitude. It does not explain all of it.
-//! Sweeping "1 bf16 ULP on a fraction of `attn_derot`" through the tail and matching the engine's
-//! three recorded statistics for `L0.pre.attn_out` (57.9% differing, `max_abs` 7.81e-2,
-//! `max_rel` 3.50e1) gives INCONSISTENT answers:
+//! An earlier version of this section claimed a RESIDUAL: that no single perturbation of
+//! `attn_derot` reproduced the engine's three `attn_out` statistics at once, so its error tail was
+//! heavier than amplification explained. **That was a straw man and it is withdrawn.** The sweep
+//! behind it varied ONE parameter — the fraction of perturbed elements — at a fixed ±1 ULP
+//! magnitude, while this same header records real fold-order noise as heavy-tailed (median 1 ULP,
+//! p99 21, max 326). Rejecting a null model already known to be the wrong shape produces no
+//! residual. Review caught it; a 2-D sweep brackets all three statistics at once.
 //!
-//! | statistic | engine | perturbation fraction that reproduces it |
-//! |---|---:|---|
-//! | bf16 codes differing | 57.9% | ~3e-3 (measured 56.8%) |
-//! | `max_abs` | 7.81e-2 | ~1e-1 (measured 7.03e-2) |
-//! | `max_rel` | 3.50e1 | ~1e-1 (measured 3.67e1) |
+//! It also said: "**any movement at all in `kv_entry` … is a real defect**". **That was wrong, and
+//! the device would have been convicted by it.** It was written from a host sim driven by the
+//! oracle's EXACT `attn_norm_out`, where `kv_entry` is bit-identical on all four cells. The engine
+//! does not have an exact input: its `attn_norm_out` differs on 26/53,248 elements (all at exactly
+//! 1 ULP — clean re-association in `hc_pre` + `RMSNorm`), and `act_quant(xq)` amplifies that.
+//! A criterion that assumes a perfect input cannot judge an implementation that has a real one.
 //!
-//! A single uniform ±1-ULP perturbation cannot produce all three at once — matching the differing
-//! fraction under-predicts the tail by ~30x in fraction terms. So the engine's error distribution
-//! has a HEAVIER TAIL than re-association noise on `attn_derot` alone would give. That residual is
-//! the open question, it is not settled by anything above, and the three upstream comparisons
-//! added below are what can settle it.
+//! What the device says, layer 0 prefill, against the goldens:
 //!
-//! **Compare on the statistic the probe prints, not on the max.** The host sim's own `attn_derot`
-//! is heavy-tailed — on `L1.pre` the differing elements run median 1 ULP, p99 21, max 326 — so
-//! "hundreds of ULP" is NOT by itself a defect signature, and a criterion phrased that way would
-//! convict a correct engine. The discriminator is: `attn_derot` differing on <= ~3% of elements at
-//! p99.9 <= ~10 ULP is inside what fold order alone produces here; materially past that, or any
-//! movement at all in `kv_entry` (bit-identical on all four cells in the sim, and the only tensor
-//! in the block with just one act_quant upstream), is a real defect — and `q` vs `kv_entry` then
-//! says which side of `sparse_attn` it is on.
+//! | tensor | differ | max_abs | max_rel | reading |
+//! |---|---:|---:|---:|---|
+//! | `attn_norm_out` | 0.05% | 4.9e-4 | 7.1e-3 | every difference exactly 1 ULP, `>1ULP` = **0** |
+//! | `kv_entry` | 0.69% | 6.3e-2 | 9.5e-1 | |
+//! | `q` | 6.69% | 9.4e-2 | 2.7e1 | |
+//! | `attn_derot` | 14.48% | 6.3e-2 | 6.9e0 | |
+//! | `attn_out` | 57.92% | 7.8e-2 | 3.5e1 | |
 //!
-//! ## What is deliberately NOT done here, and what is owed
+//! **Feeding the device's own measured input deviation into the transcription reproduces its
+//! output deviation, jointly, on both layers.** Perturbing the golden `attn_norm_out` by exactly
+//! the deviation the device has — 26 elements at 1 ULP on L0, 132 (8 of them 2 ULP) on L1 — and
+//! running the block, over 40 seeds:
 //!
-//! `attn_out`'s bound is left at 5e-2 and this file stays RED on it. The measurement above says
-//! the bound is mis-sited AND that a residual is unexplained; neither says the engine is right. A
-//! host transcription agreeing with the oracle says nothing about what the KERNELS compute.
-//! Widening the bound to go green would convert an open question into a false answer.
+//! | cell | device `kv_entry` | sim p10/median/p90 | device `q` | sim p10/median/p90 | device percentile |
+//! |---|---:|---|---:|---|---|
+//! | L0.pre | 0.69% | 0.00 / 0.62 / 1.49 | 6.69% | 0.00 / 6.17 / 13.68 | **55th, 62nd** |
+//! | L1.pre | 1.58% | 1.38 / 2.62 / 3.99 | 23.25% | 26.02 / 32.86 / 46.00 | **15th, 5th** |
 //!
-//! The three upstream tensors are REPORTED and not asserted, for the reason the `.out` bound
-//! already states about itself: no break has ever been measured through `check` on any of them, so
-//! any number chosen now would be a second uncalibrated constant.
+//! The perturbation SIZE is the device's own measurement, not a fitted parameter; only the seed
+//! varies. The device lands mid-distribution on L0 and in the LOW tail on L1 — i.e. **closer to
+//! the oracle than a typical correct implementation with its input deviation**. There is no
+//! coordinate in which it is worse than the model predicts, which is the opposite of a defect
+//! signature.
 //!
-//! **Owed, and tracked nowhere else yet:** `src/bin/v4-oracle.rs`'s `emit()` hardcodes
-//! `Defect::None`. A `--defect` flag would put a perturbed golden file one command away, which is
-//! exactly what calibrates the three bounds this section declines to invent — and `Defect::ALL`
-//! already enumerates the breakages worth calibrating against.
+//! The decode cells corroborate: at `L1.dec0` the engine's `attn_norm_out`, `kv_entry` and `q` are
+//! all **bit-identical** to the oracle, and `attn_derot` still differs on 14% — because the ring
+//! it attends was written by the PREFILL, whose `kv_entry` differed. Inherited, not independent.
+//!
+//! **Conclusion, and it is narrower than the first draft of this line claimed.** The 5e-2 bound
+//! was unmeetable and is gone. The engine's deviation is CONSISTENT with one ULP of
+//! `attn_norm_out` re-association amplified by three fp8 requantizations, and adversarial review
+//! could not construct a defect from `Defect::ALL` consistent with the device's differing-fraction
+//! vector — every one it tried lands at percentile 0 or 100 against the device. That is real
+//! evidence and it is stronger than what the assertions below encode.
+//!
+//! **It is not "no defect is visible", which this said for one revision.** Two gaps stop it:
+//!
+//! * The envelope draws its perturbed element POSITIONS uniformly at random. The device's 26 are
+//!   wherever `hc_pre`'s fold order crossed a bf16 boundary, and their indices were never
+//!   recorded. Clustering them into one token row instead inverts the §9 percentile result — the
+//!   device goes from mid-distribution to worse than every sample on 4 of 4 coordinates. Which
+//!   model is right is UNMEASURED, and it is cheap to settle: `probe_pre_norm` already returns
+//!   `attn_norm_out`, so dumping the differing INDICES and driving the envelope from them would
+//!   replace a distribution-over-an-assumption with one deterministic number.
+//! * The input deviation is ATTRIBUTED to re-association from its magnitude. A systematic ~1e-6
+//!   relative error in the pre-norm path — a hardware `rsqrtf` where `kernels/mla.hip:331` argues
+//!   for `1.0f/sqrtf`, or eps outside the sqrt — has the same 26-elements-at-1-ULP signature. The
+//!   discriminator is sign-correlation within a row (systematic) versus sign-random
+//!   (re-association), and it was not run.
+//!
+//! ## The bounds below are DERIVED, and the derivation is runnable
+//!
+//! `AttnStages::scored` carries the four bounds, the table they come from, and — read this before
+//! trusting them — how little two of them buy. Each is the geometric mean of an ENVELOPE and the
+//! weakest DEFECT above it, measured over the in-scope subset of `Defect::ALL`. The separations
+//! are **45x (`kv_entry`), 30x (`q`), 1.3x (`attn_derot`), 1.6x (`attn_out`)**: the first two are
+//! real gates, the last two barely gate at all, and **seven of eighteen in-scope defects cleared
+//! the looser first-draft bounds simultaneously**. `QkNormAfterRope` moves `attn_out` LESS than
+//! the device does, so no bound on that tensor can separate it at any value.
+//!
+//! **`max_rel` is the wrong statistic and these bounds are the best it admits.** It is
+//! floor-dominated and near-blind to SCALING defects — `SkipQkNorm` roughly doubles every element
+//! of `q` and reads 1.07 against a 275 bound. The statistic that separated every defect review
+//! could construct is the differing-element FRACTION, and nothing here asserts it. That is the
+//! single highest-value thing owed on this file: `Gap` already computes `bf16_differing` and
+//! `check` already prints it.
+//!
+//! Two things that derivation is NOT. It is calibrated through the HOST TRANSCRIPTION, not through
+//! `check` — so it inherits the transcription's fidelity, and the probe says plainly that it
+//! models `src/attn.rs` rather than the kernels. And the envelope depends on today's
+//! `attn_norm_out` deviation; if `hc_pre` or `v4_rmsnorm` changes, re-run §8 rather than trusting
+//! these four numbers.
+//!
+//! ## What stays RED, and why that is the honest state
+//!
+//! `ffn_norm_out` and `.out` keep the **underived 5e-2** and this file stays red on them. They are
+//! downstream of the same amplifier — `.out` is `attn_out` diluted through `hc_post` with four
+//! residual copies, then the whole MoE — so the bound is wrong for them too, in the same
+//! direction and for the same reason. It is not moved, because measuring their envelope needs
+//! `hc_pre`/`hc_post` and the MoE transcribed, and neither is in this track's file set. **Red on
+//! an underived bound is honest; green on a widened one is not**, and that applies as much to the
+//! two tensors I could not calibrate as to the four I could.
+//!
+//! **Owed, tracked nowhere else:** `src/bin/v4-oracle.rs`'s `emit()` hardcodes `Defect::None`. A
+//! `--defect` flag would put a perturbed golden one command away and let the four bounds above be
+//! re-derived through THIS gate rather than through a host transcription — which is the one
+//! weakness the derivation still has. `Defect::ALL` already enumerates the breakages.
 
 // `rocm`, not `any(rocm, vulkan)`: `v4gpu` is `rocm`-gated because every launcher it drives is
 // `backend::hip`'s. Nothing here claims a Vulkan parity that has not been measured, which is
@@ -239,8 +304,10 @@ struct Gap {
     /// **Added 2026-08-05 because the other three units all mislead here, in opposite
     /// directions.** `max_abs` is taken wherever the tensor is largest, so dividing it by the ULP
     /// at a TYPICAL element inflates it — on `attn_out`, whose values run 1.2 median to 13.1 max,
-    /// `max_abs 7.8e-2` reads as "~10 ULP" against the median and is 1.25 ULP at the element it
-    /// actually occurred on. And `max_rel` carries a 1e-3 floor, so a one-ULP move on a near-zero
+    /// `attn_out`, whose values run 1.2 median to 13.1 max, `max_abs 7.8e-2` reads as "~10 ULP"
+    /// against the median. **CORRECTED 2026-08-06: this said "and is 1.25 ULP at the element it
+    /// actually occurred on". That was another assumed magnitude — see [`Gap::abs_ulp`], which
+    /// measures it at 10.0.** And `max_rel` carries a 1e-3 floor, so a one-ULP move on a near-zero
     /// element manufactures a large ratio: the host sim's worst `attn_out` `max_rel` of 2.4e-1 sits
     /// on an element of magnitude 6.0e-4. This is the unit that is the same size everywhere,
     /// which is what makes "1" mean the same thing across every tensor this file compares.
@@ -248,6 +315,27 @@ struct Gap {
     /// Differences strictly larger than one ULP. Re-association plus a bf16 store produces ones;
     /// a wiring error produces thousands. The COUNT is what separates them, not the max.
     above_1ulp: usize,
+    /// `max_abs` expressed in ULP **of the element `max_abs` occurred on**.
+    ///
+    /// **This is the exact quantity `docs/investigations/v4-flash-port.md` got wrong**, and it is
+    /// printed because "print what you cite" is the rule that failure broke. That doc divided
+    /// `max_abs 7.81e-2` by a bf16 ULP taken at some other element, read 20.0, and concluded
+    /// "which is not re-association".
+    ///
+    /// **Three people then produced three different corrections, all by ASSUMING which element
+    /// `max_abs` sat on, and all wrong.** 20.0 is the ULP at |x| = 0.6; 2.5 is the ULP at |x| = 7.7
+    /// (the tensor's quoted range, and the figure this comment itself asserted for one revision);
+    /// 1.25 is the ULP at |x| = 13.1 (its true max). **Measured, it is 10.0** — `max_abs` occurs at
+    /// an element with |x| in [1, 2), and 10 ULP is squarely inside re-association here (a bare
+    /// numpy-vs-oracle fold difference on this tensor reaches p99.9 = 17.8). Four derivations,
+    /// one measurement, and the measurement agreed with none of them. That is the entire argument
+    /// for computing this in the instrument instead of in a comment.
+    ///
+    /// Distinct from [`Gap::max_ulp`], which maximises `d / ulp(b)` over ALL elements and is
+    /// therefore dominated by near-zero references sitting on `REL_FLOOR` — it reads ~5,000 on the
+    /// same tensor. Three different numbers, all defensible, none interchangeable: this is the one
+    /// that answers "is the biggest absolute difference large for where it is?".
+    abs_ulp: f32,
     total: usize,
     nonfinite: usize,
 }
@@ -279,6 +367,7 @@ fn gap(got: &[f32], want: &[f32]) -> Gap {
         bf16_differing: 0,
         max_ulp: 0.0,
         above_1ulp: 0,
+        abs_ulp: 0.0,
         total: got.len(),
         nonfinite: 0,
     };
@@ -291,7 +380,10 @@ fn gap(got: &[f32], want: &[f32]) -> Gap {
             g.bf16_differing += 1;
         }
         let d = (a - b).abs();
-        g.max_abs = g.max_abs.max(d);
+        if d > g.max_abs {
+            g.max_abs = d;
+            g.abs_ulp = d / bf16_ulp(b);
+        }
         let u = d / bf16_ulp(b);
         g.max_ulp = g.max_ulp.max(u);
         if u > 1.0 {
@@ -332,13 +424,14 @@ fn check(what: &str, got: &[f32], want: &[f32], bound: Option<f32>) {
     };
     eprintln!(
         "  {what:<32} ULP max {:>9.1}  >1ULP {:>7}  bf16 differ {:>7}/{:<7} ({:5.2}%)  \
-         max_abs {:.3e}  max_rel {:.3e}{unbounded}",
+         max_abs {:.3e} ({:.1} ULP there)  max_rel {:.3e}{unbounded}",
         g.max_ulp,
         g.above_1ulp,
         g.bf16_differing,
         g.total,
         100.0 * g.bf16_differing as f64 / g.total as f64,
         g.max_abs,
+        g.abs_ulp,
         g.max_rel,
     );
     let mut f = FAILURES.lock().expect("poisoned");
@@ -557,16 +650,9 @@ fn every_layer_matches_the_oracle_at_real_weights(
             let st = e
                 .probe_attn_stages(l, &here, start_pos)
                 .expect("attn stages probe");
-            for (name, got, bound) in [
-                ("kv_entry", &st.kv_entry, None),
-                ("q", &st.q, None),
-                ("attn_derot", &st.attn_derot, None),
-                // The one CHOSEN bound in this group, left exactly where it was. What the header
-                // measures about it is a finding, not a licence to move it.
-                ("attn_out", &st.attn_out, Some(5e-2)),
-            ] {
+            for (name, got, bound) in st.scored() {
                 let w = format!("L{l}.{tag}.{name}");
-                check(&w, got, golden(gs, &w), bound);
+                check(&w, got, golden(gs, &w), Some(bound));
             }
             e.probe_layer(l, &here, start_pos).expect("probe_layer");
             // **The bisection.** `xw` still holds this layer's `ffn_norm_out` — `moe` quantizes a
