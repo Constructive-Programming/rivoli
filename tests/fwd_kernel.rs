@@ -9,13 +9,15 @@
 //! here rather than there because that file is already 1.6k lines and these share no
 //! scaffolding with its GEMV and MoE oracles.
 //!
-//! **`vaxpy` is the one `fwd.hip` launcher left without an oracle, and that is deliberate.**
-//! It has NO caller anywhere in the tree: `--moe-gain` reaches the residual add through
-//! `launch_moe_acc_drain`'s gain multiply on MoE layers (`gpu.rs`), and dense layers take
-//! the unscaled `launch_vadd`. Its last caller was a Vulkan stub that existed only to
-//! satisfy this census. An oracle written to turn the census green would keep a dead kernel
-//! compiled and call that coverage, so the census is left RED on `launch_vaxpy` pending a
-//! decision to delete it — `docs/investigations/refactor-2026-08.md` §Track 1.
+//! **`fwd.hip` had a fifth launcher, `vaxpy`, and this file is why it is gone.** The census
+//! named it as uncovered and the honest answer was not an oracle: it had NO caller anywhere
+//! in the tree. `--moe-gain` reaches the residual add through `launch_moe_acc_drain`'s gain
+//! multiply on MoE layers, and dense layers take the unscaled `launch_vadd`; its last caller
+//! was a Vulkan stub that existed only to satisfy this census. A test written to turn the
+//! census green would have kept a dead kernel compiled and called that coverage — the exact
+//! substitution of a name for a check that the census exists to prevent. Deleted 2026-08-06,
+//! kernel and launcher together, along with the two comments on `launch_vadd` and
+//! `--moe-gain` that asserted a live path and kept it looking reachable.
 //!
 //! **Every comparison in this file is BITWISE**, and that is a property of the kernels
 //! rather than a standard of strictness: each is one thread per output element with no

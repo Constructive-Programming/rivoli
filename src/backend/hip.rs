@@ -318,7 +318,6 @@ unsafe extern "C" {
     ) -> i32;
     fn rivoli_vadd(x: *mut f32, y: *const f32, n: i32) -> i32;
     fn rivoli_flag_nonfinite(x: *const f32, n: i32, tag: u32, flag: *mut u32) -> i32;
-    fn rivoli_vaxpy(x: *mut f32, y: *const f32, g: f32, n: i32) -> i32;
     fn rivoli_argmax(logits: *const f32, n: i32, out_idx: *mut i32, out_val: *mut f32) -> i32;
 
     fn rivoli_gemv_i8(
@@ -1286,7 +1285,13 @@ pub unsafe fn launch_flag_nonfinite(
     check(r, "flag_nonfinite")
 }
 
-/// `x += y` — the residual add. (`--moe-gain != 1` takes [`launch_vaxpy`] instead.)
+/// `x += y` — the residual add on a dense-MLP layer.
+///
+/// It said "`--moe-gain != 1` takes `launch_vaxpy` instead" until 2026-08-06, and that had
+/// been false for some time: `--moe-gain` folds into [`launch_moe_acc_drain`]'s `gain`
+/// multiply, which is the MoE layer's residual add, and the 3 dense layers must NOT be
+/// attenuated with it. `vaxpy` was deleted — this comment is why it survived, since a
+/// launcher that a doc comment says is on a live path reads as reachable to every grep.
 ///
 /// # Safety
 /// `x` and `y` must be device pointers to at least `n` f32.
@@ -1294,16 +1299,6 @@ pub unsafe fn launch_vadd(x: *mut f32, y: *const f32, n: usize) -> Result<()> {
     // SAFETY: caller's pointer contract.
     let r = unsafe { rivoli_vadd(x, y, n as i32) };
     check(r, "vadd")
-}
-
-/// `x += g·y` — the residual add with a branch gain (see kernels/fwd.hip::vaxpy).
-///
-/// # Safety
-/// `x` and `y` must be device pointers to at least `n` f32.
-pub unsafe fn launch_vaxpy(x: *mut f32, y: *const f32, g: f32, n: usize) -> Result<()> {
-    // SAFETY: caller guarantees both buffers hold `n` device f32.
-    let r = unsafe { rivoli_vaxpy(x, y, g, n as i32) };
-    check(r, "vaxpy")
 }
 
 /// Greedy argmax over `logits[0..n]` → (`out_idx`, `out_val`); lowest index on a

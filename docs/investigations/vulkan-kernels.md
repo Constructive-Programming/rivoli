@@ -59,7 +59,11 @@ runs the model, and it cuts 13 kernels from the port.
   goes through `moe_*_vq`; nothing in the forward pass calls these.
 - `moe_gateup_i4`, `moe_down_i4` (`moe.hip`) — only needed for `--mode int4|hybrid`.
 - `indexer.hip` ×5 plus `layernorm` (`linalg.hip`, the indexer's k_norm) — the DSA path.
-- `vaxpy` (`fwd.hip`) — reached only by `--moe-gain != 1`, an experiment knob. `vadd`, the
+- `vaxpy` (`fwd.hip`) — **DELETED 2026-08-06.** The line below was already wrong when
+  written: `--moe-gain` folds into `moe_acc_drain`'s multiply, so this kernel had no caller
+  at all, and the launcher census restored that day is what finally said so. Kept as the
+  record of how a kernel stays compiled for months — a doc claiming a live path.
+  Reached only by `--moe-gain != 1`, an experiment knob. `vadd`, the
   g = 1 case, IS ported and is what every normal decode uses.
 
 **Ported but SINGLE-ROW, as of 2026-07-31 — a third category this inventory did not have.**

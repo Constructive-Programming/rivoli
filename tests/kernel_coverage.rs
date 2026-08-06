@@ -162,7 +162,9 @@ fn every_launcher_has_an_oracle() {
     // twice already — once when a filter skipped the only file it existed to police, and
     // once when a naming convention changed underneath a scanner.
     //
-    // The floor is 40 against a MEASURED 48 on 2026-08-06. It was 5 when this scanned
+    // The floor is 40 against a MEASURED 47 on 2026-08-06 (48 until `launch_vaxpy`, which
+    // this census found uncovered and which turned out to be dead, was deleted the same
+    // day). It was 5 when this scanned
     // `vk.rs`, which had ~16; carried over unexamined it would have tolerated a parse that
     // found a tenth of them, and re-keying a check onto a 3x larger subject without
     // re-deriving its floor is how an anti-vacuity guard quietly becomes vacuous.

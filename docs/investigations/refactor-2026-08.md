@@ -146,9 +146,11 @@ an artifact of framing.
 > > **CLOSED 2026-08-06.** (2) is repaired. The census is restored, keyed on `src/backend/`
 > > rather than on one file, so a launcher relocating into a sibling module no longer leaves
 > > it silently. It found **18 of 48 launchers with no oracle** — `hip.rs` had never been
-> > scanned — and thirteen new device oracles closed that to one: `launch_vaxpy`, which has
-> > **no caller anywhere in the tree** and is proposed for deletion rather than for a test.
-> > (1) is unchanged and still open.
+> > scanned — and thirteen new device oracles closed that to one: `launch_vaxpy`, which had
+> > **no caller anywhere in the tree**. It was deleted rather than tested, kernel and
+> > launcher together, and the census is green at **47 of 47**. All 22 rows of
+> > `tests/refactor-gates/breaks.tsv` were fired on device the same day: 22 red, right
+> > subject, 0 problems. (1) is unchanged and still open.
 
 **Rationale.** 6 of 36 cells decode (`tests/mode-matrix.sh`), 16 of 29 kernels, ~1.9× slower,
 refuses `int4`/`hybrid`/`dsa`/`misa` at startup, and cannot run V4 at all. Every V4 launcher
