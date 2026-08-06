@@ -1449,33 +1449,30 @@ impl V4Engine {
         let xq = self.xq.ptr().cast::<f32>();
         let g = self.sh_g.ptr_mut().cast::<f32>();
         let u = self.sh_u.ptr_mut().cast::<f32>();
+        // One loop rather than two launches written out: the two differ ONLY in (weight, dest),
+        // and spelling the other eight arguments twice is how `m`/`inter`/`dim` get transposed
+        // in one copy and not the other. jscpd does not catch this pair — 25 tokens against a
+        // `minTokens` of 15, but the two blocks are not textually adjacent enough to register
+        // until the threshold drops to 10, which is below what the gate runs at (measured
+        // 2026-08-07 while sizing Track I). So this one is on the reader, and now it is not.
+        //
         // SAFETY: `xq` holds `m * dim` fp8-quantized f32; both weights are pin placements
         // outliving this engine; `g` and `u` are `max_m * inter`, three distinct allocations.
-        unsafe {
-            launch_v4_gemv_fp8(
-                xq,
-                gate.packed,
-                gate.scale,
-                m,
-                inter,
-                dim,
-                FP8_BLOCK,
-                1,
-                g,
-                NULL_STREAM,
-            )?;
-            launch_v4_gemv_fp8(
-                xq,
-                up.packed,
-                up.scale,
-                m,
-                inter,
-                dim,
-                FP8_BLOCK,
-                1,
-                u,
-                NULL_STREAM,
-            )?;
+        for (w, dst) in [(gate, g), (up, u)] {
+            unsafe {
+                launch_v4_gemv_fp8(
+                    xq,
+                    w.packed,
+                    w.scale,
+                    m,
+                    inter,
+                    dim,
+                    FP8_BLOCK,
+                    1,
+                    dst,
+                    NULL_STREAM,
+                )?;
+            }
         }
         Ok(())
     }

@@ -484,6 +484,44 @@ caught two misplaced fields this month. Factor the *loop*, not the *layer*.
 counters identical, the way the pool refactor was proven (36595 hit / 14405 miss, exactly
 equal across arms).
 
+> **DECLINED 2026-08-07 — the skeleton is not there, and the evidence above is stale.**
+>
+> **The jscpd claim no longer holds, and today the same instrument says the opposite.** Run
+> over `gpu.rs` + `v4gpu.rs` alone at `--min-tokens 10` — BELOW the gate's 15 — jscpd finds 9
+> clones and **zero of them cross the file boundary**: 8 are inside `v4gpu.rs`, 1 inside
+> `gpu.rs`. Whatever the merge produced has since gone. (Watch the probe: jscpd silently scans
+> nothing without `.jscpd.json`'s `"format": ["rust"]`, reporting `Detection time: 0.077ms` and
+> 0 clones. Copy the config in, and confirm it reports ~43,000 tokens analysed, before
+> believing a zero from it.)
+>
+> **Structurally, four of the five "shared" items are not shared:**
+>
+> | claimed | measured |
+> |---|---|
+> | profile-summary | `v4gpu.rs` contains the string `summary` **zero** times. GLM has `Profile`/`ProfileSummary`; V4 has none |
+> | prefill | GLM runs a layer-major schedule (`layer_major_schedule`, its own two tests); V4 is ONE `forward(prompt, 0)` — whole-prompt by construction, because `attention`'s and `compress`'s prefill arms both are |
+> | argmax | GLM's is multi-row (`argmax_rows(n)`, `MAXROW`) because MTP verifies several rows per pass; V4's is single-row and **cannot** be otherwise — `kernels/moe.hip:409` refuses `nrow != 1` |
+> | decode loop | GLM's `generate` is **412 lines** (speculation, confidence gating, followups, profile, watchdog, checksum probes); V4's is **56** |
+> | EOS | genuinely common — and it is one `eos.contains(&cur)` |
+>
+> The actual common core is **~20 lines**: prefill → argmax → `loop { eos, on_tok, forward,
+> argmax, pos += 1 }` → log. Extracting that behind a trait means abstracting over two
+> different config types, two Pin types, a profiler that exists on one side only, and —
+> worst — over *whether speculation is possible at all*, which is a property of the MoE kernel,
+> not of the loop. **That is a net complexity increase to save ~20 lines, and it is the exact
+> shape this track's own "the bodies stay apart" paragraph warns about**, one level up.
+>
+> **What the measurement DID find is that the duplication is intra-file, not cross-file.**
+> `v4gpu.rs` carries 8 self-clones at min-tokens 10. Seven are `)?; } Ok(()) }` trailers — noise,
+> and the reason the gate sits at 15. The eighth is real and now fixed: `shared_gate_up` wrote
+> the same 10-argument `launch_v4_gemv_fp8` twice, differing only in (weight, dest), which is
+> how `m`/`inter`/`dim` get transposed in one copy and not the other. Collapsed to a loop over
+> `[(gate, g), (up, u)]`.
+>
+> **If someone reopens this, the target is `v4gpu.rs` against itself, not `v4gpu.rs` against
+> `gpu.rs`.** And re-run the probe first: this track was scoped on a clone that no longer
+> exists.
+
 ### Two checks Track H bought for every later track — 2026-08-06
 
 **1. `.github/workflows/release.yml` has a hand-written binary list.** Track H's deletion of
@@ -591,7 +629,7 @@ s4     Track 3  (tests/)         ─┐ ALONE as a pair — the safety net goes 
 | F in-src tests | 1,000 | **G4** |
 | G converters | ~~700~~ **~0 net — DONE 2026-08-06** | **G2 held on BOTH formats** (the GLM half ran for the first time). 4 of 7 phases were already factored; the value was one atomicity defect in the only step where the two copies diverged, see Track G |
 | H rm i4_audit | 697 | ~~no inbound refs~~ **DONE 2026-08-05** — there were seven files, one build-breaking; see Track H |
-| I loop skeleton | 600 | G1 on GLM **and** V4 |
+| I loop skeleton | ~~600~~ **DECLINED 2026-08-07** | Measured: **0** cross-file jscpd clones at min-tokens 10, and 4 of 5 "shared" items are not shared. Common core is ~20 lines. See Track I |
 | K format/offset | 350 | G2 + recorded break still red |
 | **total** | **~14,050** | **39%** |
 
