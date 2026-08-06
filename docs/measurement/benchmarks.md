@@ -2735,3 +2735,44 @@ thermal headroom on every token forever, and the requant is paid once. Under the
 scoring the row rests entirely on quality, where the only evidence is a screen. **Settle it with
 a requant and a real paired dNLL, and repeat every arm** — ~40% of 5k-token runs are silently
 corrupted (see "Long runs are NON-DETERMINISTIC" above).
+
+---
+
+## 2026-08-06 — every gate green at once, first time since `5ef1f9a`
+
+Recorded because the *combination* had never held, not because any single number is new.
+CI's `host` job had failed at `cargo fmt --check` — step 4, before clippy and test — for
+**141 commits**, so the two steps that would have caught the rest never ran in that window.
+
+| gate | result | was |
+|---|---|---|
+| `cargo fmt --check` | **0 hunks** | 680 across 41 files |
+| jscpd (`minTokens: 15`, no threshold) | **0 clones** | 52 |
+| jscpd exemptions | **8** | 8 — none added |
+| featureless `RUSTFLAGS=-D warnings` | **0 errors** | 4 (`BENCH_*`, unreached by CI) |
+| union clippy | **0 findings** | 0 |
+| device suites, 21 binaries | **166 passed** | — |
+| `tests/mode-matrix.sh` | **36/36 decoded** | 36/36 (72-cell matrix before Vulkan retired) |
+| launcher census | **47 / 47** | 18 of 48 with no oracle |
+| break corpus | **22/22 red, right subject** | 6 |
+
+**The clone count is the entry worth reading twice.** The tree reported **0 clones with 680
+rustfmt hunks outstanding, and 52 the moment `cargo fmt` ran.** Nothing was added: jscpd
+tokenizes, and line-breaking differences push blocks under `minTokens`, so formatting drift
+had been hiding real duplication from a gate that carries no threshold. That also puts an
+asterisk on `build.rs`'s own "181 clones → 0" record from 2026-08-01 — it spans the same
+drift window, so an unknown share of that zero was formatting rather than dedup. `build.rs`
+now prints a **LOWER BOUND** warning whenever the tree is not rustfmt-clean.
+
+All 52 were resolved by factoring, not suppression. Two findings justify the exercise on
+their own: a **25-line clone in `v4gpu.rs` sat behind a comment asserting the two copies were
+identical**, and `Widths`' comment claimed a transposed pair "would underflow and panic" when
+under `--release` it **wraps** — `max_tail` stays 0 and the tail check passes vacuously, so a
+transposition would have silently *widened* that gate. Neither was findable while formatting
+hid the duplication.
+
+**Still red, and correctly so:** `tests/v4_loop.rs`. `ffn_norm_out` (52.85% differing,
+max_rel 5.419e0) and `.out` (32.52%, max_rel 2.378e1) carry the **underived 5e-2 bound**,
+which needs `hc_post` and the MoE transcribed before it can be replaced by a measured one.
+The four tensors that *do* have derived bounds separate at 45× / 30× / 1.3× / 1.6×. Red on an
+underived bound is the honest state; do not widen it to make this table uniform.
