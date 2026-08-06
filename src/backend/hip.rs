@@ -155,13 +155,31 @@ macro_rules! launchers {
 // wrapper" was true and is what `launchers!` above removed — 1307 code lines to 685, with the
 // comment count going UP.
 //
-// The other ground is unchanged and is why this marker is still here. Roughly 25 of these are
-// DIFFERENT kernels that merely take the SAME SHAPE — `gemv_fp8`, `gemv_i8`, `gemv_i4` and
-// `gemv_vq` all take `x, packed, scale, o_dim, i_dim, y`, because that is what a group-scaled
-// GEMV takes. There is one copy of each already and nothing to merge; jscpd sees a token
-// sequence and cannot see that the kernels behind them are unrelated. Re-measured 2026-08-06
-// with the markers deleted: **11 clones, every one of them a pair of same-shaped parameter
-// lists inside this block**, none of them logic.
+// The other ground is unchanged and is why this marker is still here, though the number that
+// came with it was wrong and is corrected below.
+//
+// > **MEASURED 2026-08-06, correcting the inherited claim.** The original note said "roughly 25
+// > are DIFFERENT kernels that merely take the same shape — `gemv_fp8`/`i8`/`i4`/`vq` all take
+// > `x, packed, scale, o_dim, i_dim, y`". Counted rather than asserted: the 41 declarations
+// > below have **41 distinct parameter lists — zero exact duplicates**, and exactly one PAIR
+// > shares even a type sequence under different names (`act_quant_f8` and `v4_indexer_spread`,
+// > both `*mut f32, i32, i32, *mut c_void`). The `gemv` family does not actually agree:
+// > `gemv_vq` takes seven parameters (`indices`, `scales`, `codebook`), `gemv_i4` takes six.
+//
+// What jscpd matches is a shared PREFIX, not a shared list. `moe_expert_range` and
+// `moe_expert_range_i4` agree on `x, hidden, inter, e_start, e_count, descs` and then diverge.
+// Re-measured with the markers deleted: **11 clones, every one a prefix run between two
+// adjacent declarations**, none of them logic.
+//
+// **A named-prefix DSL would work and is still refused.** `@moe_head, gate_cb: …` is a
+// tt-muncher away and would save perhaps 40-60 lines across the ~10 launchers sharing a prefix.
+// It costs the one property this wall exists for — you could no longer read the C signature off
+// the Rust declaration, and "the mirroring IS the contract" is the whole argument for the file.
+// The clearest candidate is also the worst one: `moe_expert_range` takes `*const ExpertDesc` and
+// `_f4` takes `*const ExpertDescF4` plus an extra `n_desc`, and [`ExpertDescF4`]'s own note says
+// dispatching an `.f4` block through the i4 path decodes e2m1 nibbles at the wrong group size
+// with **no downstream check that could find it**. Factoring their common prefix behind one name
+// moves those two toward each other, which is the opposite of what that separation is for.
 //
 // **The region is narrower than what it replaced, and deliberately so.** The old markers
 // bracketed lines 67-524 and 602-2061 — nearly the whole file. Track 2 moved the code out from
