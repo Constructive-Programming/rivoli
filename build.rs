@@ -203,6 +203,34 @@ fn no_duplicated_rust() {
             return;
         }
     };
+    // A CLEAN RESULT IS ONLY MEANINGFUL ON A RUSTFMT-CLEAN TREE, and that is not a style
+    // preference — it is the gate's correctness precondition.
+    //
+    // jscpd tokenizes. Two blocks that differ only in line breaking tokenize differently
+    // enough to fall under `minTokens`, so unformatted code can carry real duplication past
+    // this gate. Measured 2026-08-06: the tree reported **0 clones** with 680 rustfmt hunks
+    // outstanding, and **52** the moment `cargo fmt` ran. Nothing was added — the formatter
+    // let the tokenizer see what was already there.
+    //
+    // That also puts an asterisk on this file's own history: the "181 clones -> 0" recorded
+    // above was measured across a window in which the tree drifted out of rustfmt, so an
+    // unknown share of that zero was drift rather than dedup.
+    //
+    // A WARNING, not a hard failure: `cargo build` on a tree someone is mid-edit in must not
+    // refuse, and CI gates `cargo fmt --check` in its own step anyway. What this must never
+    // do is let a green jscpd run be read as "no duplication" when it can only mean "no
+    // duplication the tokenizer could see".
+    let fmt_clean = std::process::Command::new("cargo")
+        .args(["fmt", "--check", "--quiet"])
+        .output()
+        .map_or(true, |o| o.status.success());
+    if !fmt_clean {
+        println!(
+            "cargo:warning=tree is not rustfmt-clean, so the jscpd result below is a LOWER \
+             BOUND -- formatting differences hide clones from the tokenizer (measured \
+             2026-08-06: 0 reported at 680 outstanding hunks, 52 after `cargo fmt`)"
+        );
+    }
     match out.status.code() {
         Some(0) => {}
         // BOTH streams: the clone list is on stdout, but an invocation-level complaint can
