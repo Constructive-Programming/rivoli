@@ -313,6 +313,30 @@ caught two misplaced fields this month. Factor the *loop*, not the *layer*.
 counters identical, the way the pool refactor was proven (36595 hit / 14405 miss, exactly
 equal across arms).
 
+### Two checks Track H bought for every later track — 2026-08-06
+
+**1. `.github/workflows/release.yml` has a hand-written binary list.** Track H's deletion of
+`src/bin/i4_audit.rs` would have broken the release job: the loop
+`for b in rivoli convert fp8_to_i4 add_indexer i4_audit ppl replay` packaged it into every
+tarball. **Nothing local catches this** — `cargo build`, union clippy and every test stay
+green, and it fails at `install -m755 target/release/<bin>`, at TAG time, in a job that only
+runs on a release. **Tracks G and K both touch `src/bin/`; check that loop.**
+
+This also retires the gate I wrote for Track H. *"Nothing references it"* is unsatisfiable
+here, because closing a track under the correct-in-place convention **adds** mentions. The
+honest form, which Track H met and which G and K should use:
+
+> no BUILD reference remains, and every surviving prose mention sits in a dated note naming
+> the tag.
+
+**2. Intra-doc links are unverified tree-wide.** `RUSTDOCFLAGS="-D warnings" cargo doc` fails
+on this tree today — measured 2026-08-06, **45 error lines**: one ambiguous `[`format`]` plus
+~20 unresolved paths (`crate::backend::gpustream::Signal` ×6, `launch_moe_acc_drain` ×3). All
+pre-existing, and **rustdoc is in neither CI job**, so nothing catches a link a refactor
+breaks. **This lands hardest on Track K**, which moves `quant`/`format` symbols that other
+modules link to by path. Either add `cargo doc` to the track's own gate or accept that the
+docs' cross-references rot silently — but decide it, do not inherit it.
+
 ## Track K — unify the format/offset families · ~350 · after Track 4
 
 `format.rs` 1,110 + `quant.rs` 1,029 carry three parallel `*_proj_bytes` / `*_slot_offsets`
