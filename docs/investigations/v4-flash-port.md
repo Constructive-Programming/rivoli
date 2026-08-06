@@ -2298,7 +2298,18 @@ ops, and the probe that split them puts the boundary at `attention` rather than 
 `attn::v4::attention` on a ratio-0 layer against the same oracle and measures **0 ULP**, at TOY
 dims. So this is either a real-dims-only defect in the attention block, or a difference between how
 the harness constructs its arguments and how `v4gpu` does. **The two have never been compared**,
-and that is the next stage's first job. One unchecked difference is already known: `V4Pin`'s
+and that is the next stage's first job.
+
+> **SUPERSEDED 2026-08-06 by the RESOLVED block above — read that first.** This paragraph and
+> the two below it were written while `attn_out` was believed to be "the first bad tensor". The
+> device measurement withdrew that: `attn_norm_out` differs on 26 of 53,248 elements at exactly
+> 1 ULP and everything downstream traces to it through three fp8 `act_quant` steps, so the
+> toy-dim/real-dim gap is **amplification, not a hidden defect**, and "the harness builds its
+> arguments differently" is no longer a live hypothesis. What survives is the `Fp8W` observation
+> below — still true, still unchecked, and still worth a guard; it is simply not the explanation
+> for anything measured here.
+
+One unchecked difference is already known: `V4Pin`'s
 `Fp8Weight` carries `o_dim`/`i_dim`/`block`, and `V4Engine`'s adapter to `attn::v4::Fp8W` DISCARDS
 all three — `attention` re-derives every extent from `Dims`, so a pin whose placed shape disagrees
 with the config is invisible. `Fp8W` has no extents to check against.

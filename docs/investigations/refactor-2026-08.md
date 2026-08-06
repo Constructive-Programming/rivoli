@@ -50,6 +50,7 @@ A change is a **refactor** iff every gate that applies to it holds:
 | **G1 byte-identical output** | anything on a decode path | same prompt, same seed, `sha256` of the emitted text and of the logits probe. Not "looks the same" |
 | **G2 byte-identical artifact** | converters, format, quant | `convert_v4 --verify` over the real 43-layer checkpoint: 0 bytes differ |
 | **G3 byte-identical ISA** | launchers, kernels, anything a macro emits | `llvm-objdump` diff of the built object. Count narrowly — a naive `v_fma\|v_mac\|v_mad` grep is mostly `v_mad_u64_u32` address arithmetic |
+| | | **G3 was vacuous until 2026-08-06 and is now real.** `.hip_fatbin` is a `__CLANG_OFFLOAD_BUNDLE__`, not an ELF, so the first version hashed x86 host stubs and the "fix" after that hashed **the empty string** — `01ba4719c80b6fe9`, sha256 of a bare newline, ten times. `capture.sh` now runs `clang-offload-bundler --unbundle` first and carries an anti-vacuity counter. **Seen red:** a `MOE_ACC_SHIFT` change in `common.hpp` moved `1f2d388ef9693af0 → 55debbd25d59a9a5`. Do not trust a green G3 you have not first made go red |
 | **G4 the break corpus** | anything touching tests | every recorded deliberate break still goes red, **with the same message naming the same subject**. A break that goes green is a regression; a break whose message changes subject is the "0-ULP compare wearing a slot-rule failure message" defect again |
 
 **G4 is the one that makes Track 3 safe and it is non-negotiable.**
@@ -92,6 +93,22 @@ while the pin's `Fp8Weight` carries `block`, `o_dim`, `i_dim` — all three disc
 is invisible.
 
 **This track is why Track 2 must not touch the six V4 attention launchers in its first wave.**
+
+> **CLOSED 2026-08-06 — no defect. The exclusion above is LIFTED and `v4gpu.rs` is released.**
+> The premise of this track was wrong twice over. "~20 bf16 ULP" used a 2⁻⁸ mantissa; bf16 has
+> 7 explicit bits, so 7.81e-2 in `[1,2)` is **10.0 ULP**, and the "correction" to 2.5 was wrong
+> in the binade as well. More importantly the bisection itself was invalid: V4's attention block
+> performs **three fp8 `act_quant` steps**, an e4m3 step is 2⁻⁴..2⁻³ relative against a bf16 ULP
+> at 2⁻⁸..2⁻⁷ — **16× larger** — so distance from the oracle tracks how many quantizations sit
+> upstream, not where a defect is. Measured on the device: `attn_norm_out` differs on 26 of
+> 53,248 elements **all at exactly 1 ULP**, and one such element produces 21% differing in
+> `attn_out`. There is no visible defect in the attention block.
+>
+> Consequences for this plan: **Track 2 may convert all 47 launchers** — G3 per launcher is the
+> protection, and it is now a real gate (seen red, below). **Track I is unblocked.** What stays
+> open is unrelated to the ownership: `ffn_norm_out` and `.out` hold the underived 5e-2 bound
+> and `tests/v4_loop.rs` is correctly RED there until `hc_post` and the MoE are transcribed.
+> Full record in `v4-flash-port.md`, "RESOLVED 2026-08-06 by measuring the device".
 
 ## Track 0b — the prompt encoding, and it blocks any quality number
 
@@ -351,7 +368,8 @@ the mechanical evidence that the skeleton is common.
 on a V4 config — the same argument that keeps `ModelConfig` and `V4Config` separate, which
 caught two misplaced fields this month. Factor the *loop*, not the *layer*.
 
-**Blocked on Track 0**, which owns `v4gpu.rs` until `attn_out` is diagnosed.
+~~**Blocked on Track 0**, which owns `v4gpu.rs` until `attn_out` is diagnosed.~~
+**UNBLOCKED 2026-08-06** — Track 0 closed with no defect; see its CLOSED note.
 
 **Gate:** G1 on both a GLM and a V4 decode — byte-identical output, and GLM's expert hit
 counters identical, the way the pool refactor was proven (36595 hit / 14405 miss, exactly
