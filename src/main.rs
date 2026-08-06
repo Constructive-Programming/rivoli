@@ -576,7 +576,11 @@ fn run_v4(
     attn: &str,
     port: Option<u16>,
     no_mtp: bool,
-    watchdog_secs: u64,
+    // Gated to match the `Args` field it comes from, which has been `#[cfg(feature = "trace")]`
+    // since the watchdog moved off an env var. Ungated it was an unused parameter on every
+    // `--features rocm` build without `trace` — a warning nothing watches, because CI has no
+    // rocm arm at all and the local union run always has `trace` on. Found 2026-08-06.
+    #[cfg(feature = "trace")] watchdog_secs: u64,
 ) -> Result<()> {
     use rivoli::arch::Arch;
     // Inside the function rather than at the top of the file: it then inherits this `cfg`
@@ -796,16 +800,14 @@ fn main() -> Result<()> {
     match rivoli::artifact::model::arch_of_artifact(&cfg.model)? {
         rivoli::arch::Arch::GlmMoeDsa => {}
         rivoli::arch::Arch::DeepseekV4 => {
-            return run_v4(&cfg, &a.attn, a.port, a.no_mtp, {
-                #[cfg(feature = "trace")]
-                {
-                    a.watchdog_secs
-                }
-                #[cfg(not(feature = "trace"))]
-                {
-                    60
-                }
-            });
+            // Two calls rather than one with a cfg'd argument: `#[cfg]` on a call ARGUMENT is
+            // not stable (it needs `stmt_expr_attributes`), only on a formal parameter. The
+            // previous shape passed a hard-coded `60` on the non-`trace` side, which looked
+            // like a default and was in fact a value the callee could not use.
+            #[cfg(feature = "trace")]
+            return run_v4(&cfg, &a.attn, a.port, a.no_mtp, a.watchdog_secs);
+            #[cfg(not(feature = "trace"))]
+            return run_v4(&cfg, &a.attn, a.port, a.no_mtp);
         }
     }
 
