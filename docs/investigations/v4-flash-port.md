@@ -2204,7 +2204,7 @@ and this section exists so nobody reads it as such.
 | tensor | max_rel | max_abs | bf16 codes differing | verdict |
 |---|---:|---:|---:|---|
 | `attn_norm_out` | 7.14e-3 | 4.88e-4 | **26 / 53,248 (0.05%)** | CLEAN — `hc_pre` + `RMSNorm` are right |
-| `attn_out` | 3.50e1 | 7.81e-2 | **30,841 / 53,248 (57.9%)** | **WRONG — the first bad tensor** |
+| `attn_out` | 3.50e1 | 7.81e-2 | **30,841 / 53,248 (57.9%)** | ~~WRONG — the first bad tensor~~ **RETRACTED, see below** |
 | `ffn_norm_out` | 5.42e0 | 3.13e-2 | 28,141 / 53,248 (52.9%) | inherited |
 | `.out` (block) | 2.38e1 | 4.49e-2 | 69,265 / 212,992 (32.5%) | inherited |
 | `router_weights` | 2.89e-3 | 3.17e-4 | 2 / 6 | CLEAN |
@@ -2213,6 +2213,43 @@ and this section exists so nobody reads it as such.
 The same shape holds on L1 and on both decode cells. `attn_norm_out`'s 4.88e-4 on a ±0.21 tensor is
 ~1 bf16 ULP — the port's own prediction for a ratio-0 layer at real dims, met exactly.
 `attn_out`'s 7.81e-2 on a ±7.7 tensor is ~20 ULP over 58% of elements, which is not re-association.
+
+> **CORRECTED 2026-08-06 — both claims on this line are wrong, and they were mine.**
+>
+> **"~20 ULP" is a unit error.** It divides `max_abs` by the bf16 ULP at `|x|≈1.2`, but the
+> maximum occurs where `|x|≈13`, one binade set higher. Per element it is **~2.5 ULP**:
+>
+> | | bf16 ULP | 7.81e-2 in ULP |
+> |---|---:|---:|
+> | at `\|x\|=1.2` | 0.00391 | 20.0 ← what I quoted |
+> | at `\|x\|=13.1` | 0.03125 | **2.5** ← the real figure |
+>
+> **"the first bad tensor" reads a bisection into an amplification gradient.** V4's attention
+> block performs **three fp8 `act_quant` steps** (`xq`, `qrq`, `y`). An e4m3 step is 2⁻⁴..2⁻³
+> relative; a bf16 ULP is 2⁻⁸..2⁻⁷ — **16× smaller**. So ordinary re-association flips a
+> quantization bin, the flip moves that element 16× further than the difference causing it,
+> and every downstream tensor is a dense reduction over the quantized vector. Distance from
+> the oracle tracks **how many `act_quant`s sit upstream**, which is exactly the table's shape:
+> `attn_norm_out` 0 → 0.05%, `kv_entry` 1 → bit-identical, `q`/`attn_derot` 2 → 0–4.2%,
+> `attn_out` 3 → 0–21%. `router_weights` and `head.probe.logits` are clean because neither
+> path has an activation quantization at all.
+>
+> Measured by `docs/measurement/probes/v4_attn_amplification.py` (host-only, ~8 s): **one
+> observed 1-ULP difference in `attn_derot` — 1 element in 32,768 — produces 21% differing in
+> `attn_out`**. And f32 versus f64 accumulation, **two implementations that are both correct**,
+> differ on 6.96% at `max_rel` 1.352 — **27× outside the 5e-2 `tests/v4_loop.rs` asserts**.
+>
+> **What is NOT retracted:** the numbers in the table, and that `v4_loop` is red. What is
+> retracted is the verdict column and the inference chain built on it — including the
+> "confirmed correct" list below, which was only ever "less amplified".
+>
+> **Still open.** The one-parameter fit that suggested a residual defect (fraction swept at a
+> fixed ±1 ULP) was reviewed 2026-08-06 and found to reject a null model this file's own probe
+> calls the wrong shape — real fold noise is heavy-tailed, median 1 ULP, p99 21, max 326. A
+> two-axis sweep brackets the engine's three statistics simultaneously, and `max_rel` alone
+> spans 9.79–21.13 across 12 seeds at one point. So the residual is **not evidence of a
+> defect**; it is also not evidence there is none. The discriminating measurement is reading
+> `attn_derot` off the DEVICE, which has not been done.
 
 **What this rules IN and OUT.** Between the clean tensor and the wrong one there are exactly two
 ops, and the probe that split them puts the boundary at `attention` rather than `hc_post`. So:
