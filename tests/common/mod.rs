@@ -1,27 +1,45 @@
-//! The kernel-oracle scaffolding, shared across the test binaries in `tests/`.
+//! The device-free half of the kernel-oracle scaffolding, shared by ten test binaries:
+//! `docs`, `invariants`, `kernel`, `v4_attn`, `v4_compress_kernel`, `v4_compress_probe`,
+//! `v4_head_tail`, `v4_indexer_kernel`, `v4_kernel` and `v4_oracle`.
 //!
 //! It was copy-pasted per file until 2026-07-30, and the copies had already started to
 //! drift: two spellings of the same `Lcg` bug note, two `assert_close` bodies with the
 //! same tolerance, and `f16b`/`u16b` present in one file and re-derived in the other.
 //!
-//! > **CORRECTED 2026-08-06.** This was "the backend-NEUTRAL half", and the rule was that a
-//! > helper touching a device TYPE stayed in the test file owning it, because that type was
-//! > `DeviceBuf` under HIP and `Buf` under Vulkan. There is one backend, so the rule's whole
-//! > argument named a file that no longer exists and it is deleted rather than reworded.
-//! > `dev`/`zeros`/`back`/`ok` are here now. **Five older oracle files still spell their own
-//! > uploader** (`v4_kernel`, `v4_attn`, `v4_head_tail`, `v4_compress_kernel`,
-//! > `v4_indexer_kernel`) and survive the duplication gate only because their `.expect`
-//! > strings differ — that is a half-migration, not a design.
+//! **A helper that touches a device TYPE is `#[cfg(feature = "rocm")]`-gated here, not
+//! banished to the file that owns it.**
 //!
-//! `dead_code` is allowed because this module is compiled into EACH test binary, and none
-//! of them uses every helper. The alternative is per-consumer cfg gates on a test utility,
-//! which is more machinery than the warning is worth.
+//! > **CORRECTED 2026-08-06, reconciling two same-day corrections that disagreed.** The old
+//! > rule — device types stay in the owning test file — was argued from the two backends:
+//! > `dev` was `DeviceBuf` under HIP and `Buf` under Vulkan, "and that difference is the
+//! > point of having two files". Vulkan was retired 2026-08-06, so that argument names
+//! > something that no longer exists.
+//! >
+//! > Two agents corrected this independently within hours and landed on opposite answers.
+//! > One deleted the rule and moved `dev`/`zeros`/`back`/`ok` here. The other kept it,
+//! > re-derived on stronger ground: this module compiles into EVERY binary listed above, and
+//! > `docs` and `invariants` are GPU-free registry checks, so a device type here would put
+//! > both behind a device.
+//! >
+//! > **The second argument is right and the first is safe, because of a fact neither stated:
+//! > the moved helpers are `#[cfg(feature = "rocm")]`.** Verified — `cargo check --test docs`
+//! > featureless, with them present, is 0 errors. So they can live here, and the constraint
+//! > that survives is the gate, not the location. Move a device helper here ungated and you
+//! > break `docs` and `invariants`, which is the failure the second agent predicted.
+//!
+//! **Five older oracle files still spell their own uploader** (`v4_kernel`, `v4_attn`,
+//! `v4_head_tail`, `v4_compress_kernel`, `v4_indexer_kernel`) and survive the duplication
+//! gate only because their `.expect` strings differ — a half-migration, not a design.
+//!
+//! `dead_code` is allowed because this module is compiled into EACH test binary and none
+//! uses every helper. The alternative is per-consumer cfg gates on a test utility, which is
+//! more machinery than the warning is worth.
 #![allow(dead_code)]
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
 use rivoli::v4compress::LayerKind;
-use rivoli::v4oracle::forward::{CompressorW, IndexerW};
+use rivoli::v4oracle::forward::{Capture, CompressorW, IndexerW, LayerW, Oracle, Step};
 use rivoli::v4oracle::numerics::{bf16_decode, bf16_encode};
 use rivoli::v4oracle::weights::{Checkpoint, NamedRng, V4Config};
 use std::path::Path;
@@ -670,7 +688,6 @@ pub fn compressor_w(
     cw
 }
 
-/// A deterministic bf16 activation block, `[n, dim]`.
 /// One layer's `attn.indexer.*`, as [`IndexerW`].
 ///
 /// Lifted here from `v4_compress_probe.rs` when `v4_indexer_kernel.rs` became a second
@@ -699,6 +716,68 @@ pub fn indexer_w(ck: &Checkpoint, layer: usize, c: &V4Config) -> IndexerW {
     }
 }
 
+/// Drive one PREFILL `run_layer` over `h` and return what it captured.
+///
+/// `tests/v4_kernel.rs` and `tests/v4_oracle.rs` each built the same six-field `Step` at
+/// `start_pos: 0, phase: "pre"`, wrapped in the same `fresh_state`/`Capture`/`run_layer`
+/// sequence, and `build.rs`'s duplication gate found the copy. Nothing here touches a device
+/// type, which is this module's rule for what may live in it.
+///
+/// **`s` is `ids.len()`, not a parameter.** Both copies passed the two separately, and a
+/// `Step` whose `s` disagreed with its `input_ids` length is a fixture neither could have
+/// caught: `run_layer` walks `s` positions through whatever id slice it was handed, so a
+/// mismatch silently makes every golden downstream a capture of a prompt nobody wrote.
+///
+/// The state is dropped on the way out because both callers dropped it. A caller that needs
+/// to drive a second step against the same state wants `run_layer` directly — this is the
+/// one-shot prefill, and pretending otherwise would hand back a state whose `start_pos` the
+/// caller would have to reconstruct.
+pub fn prefill_capture(
+    o: &Oracle,
+    lw: &LayerW,
+    layer: usize,
+    ids: &[u32],
+    h: &mut Vec<f32>,
+) -> Capture {
+    let mut st = o.fresh_state(layer);
+    let mut cap = Capture::default();
+    let step = Step {
+        lw,
+        layer,
+        s: ids.len(),
+        start_pos: 0,
+        input_ids: ids,
+        phase: "pre",
+    };
+    o.run_layer(&step, &mut st, h, &mut cap);
+    cap
+}
+
+/// A deterministic RESIDUAL-STREAM block, `[s, hc_mult * dim]`, seeded by `tag`.
+///
+/// [`probe`] with the one row width that is not arbitrary. `hc_mult * dim` is what the mHC
+/// residual is, and it was spelled at three call sites in two files under two different
+/// treatments — `v4_oracle`'s `fixed_h` wrapped it and argued the wrapper was worth it, while
+/// `v4_kernel` inlined the identical product twice with no comment. jscpd sees none of that
+/// (each site was a single expression, far under its default `minLines: 5`), which makes it a
+/// "known, not merely unseen" case rather than a licence to leave it.
+///
+/// Fixed per `tag` so a defect at prefill cannot change a later step's INPUT: only the
+/// layer's own cached state carries a defect forward, which is what makes "this case is
+/// unaffected" a statement about the defect rather than about propagation.
+pub fn residual_probe(cfg: &V4Config, tag: &str, s: usize) -> Vec<f32> {
+    probe(tag, s, cfg.hc_mult * cfg.dim)
+}
+
+/// A deterministic bf16 activation block, `[n, dim]`, seeded by `name`.
+///
+/// **Changing the draw or the `NamedRng` sequence re-bases goldens in five suites at once** —
+/// `v4_oracle`, `v4_kernel`, `v4_indexer_kernel`, `v4_compress_kernel` and
+/// `v4_compress_probe`. `v4_oracle` and `v4_kernel` reach it only through
+/// [`residual_probe`], so neither file can see its own exposure from its own source.
+///
+/// This doc line was orphaned onto `indexer_w` until 2026-08-06, which is how a shared
+/// fixture source ended up with nothing at its definition saying what it is shared by.
 pub fn probe(name: &str, n: usize, dim: usize) -> Vec<f32> {
     let mut r = NamedRng::new(name);
     (0..n * dim)

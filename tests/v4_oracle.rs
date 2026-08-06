@@ -32,6 +32,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
+use common::residual_probe;
 
 use rivoli::v4oracle::forward::{Capture, Defect, HeadTailW, Oracle, Step};
 use rivoli::v4oracle::golden::{Diff, GoldenSet, diff, identical};
@@ -287,13 +288,31 @@ fn act_quant_is_partial_and_block_sized() {
     // because "it changed something" would pass for a whole-tensor quantizer too.
     let mut r = NamedRng::new("act-quant");
     let orig: Vec<f32> = (0..256).map(|_| r.unit() * 3.0).collect();
+    // The partial-quantization property, asked the same way of both scale modes — and the
+    // message names WHICH one, because "the tail was modified" without that sends the reader
+    // to whichever `act_quant_inplace` call they read first.
+    let tail_intact = |v: &[f32], which: &str| {
+        assert_eq!(
+            &v[192..],
+            &orig[192..],
+            "{which}: the un-quantized tail was modified"
+        );
+    };
+    // The largest error `act_quant` introduced over the quantized prefix. One spelling
+    // because the fp8/fp4 comparison below is only meaningful if both sides are measured
+    // against the same reference in the same way; two folds is two chances to slice one of
+    // them differently, and the assertion would still read as a statement about the formats.
+    let max_err = |v: &[f32]| {
+        v[..192]
+            .iter()
+            .zip(&orig[..192])
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
+
     let mut a = orig.clone();
     act_quant_inplace(&mut a[..192], 64, true);
-    assert_eq!(
-        &a[192..],
-        &orig[192..],
-        "the un-quantized tail was modified"
-    );
+    tail_intact(&a, "ue8m0-rounded");
     assert!(
         a[..192].iter().zip(&orig[..192]).any(|(x, y)| x != y),
         "nothing was quantized"
@@ -302,25 +321,12 @@ fn act_quant_is_partial_and_block_sized() {
     let mut c = orig.clone();
     act_quant_inplace(&mut c[..192], 64, false);
     assert_ne!(a, c, "ue8m0 scale rounding made no difference");
-    assert_eq!(
-        &c[192..],
-        &orig[192..],
-        "the un-quantized tail was modified"
-    );
+    tail_intact(&c, "unrounded scale");
 
     // fp4 saturates far earlier, so the same input must survive fp8 and not fp4.
     let mut d = orig.clone();
     fp4_act_quant_inplace(&mut d, 32);
-    let err_fp8 = a[..192]
-        .iter()
-        .zip(&orig[..192])
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0, f32::max);
-    let err_fp4 = d[..192]
-        .iter()
-        .zip(&orig[..192])
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0, f32::max);
+    let (err_fp8, err_fp4) = (max_err(&a), max_err(&d));
     assert!(
         err_fp4 > err_fp8,
         "fp4 ({err_fp4}) should be coarser than fp8 ({err_fp8})"
@@ -519,17 +525,6 @@ fn model() -> &'static (V4Config, ToyModel) {
     })
 }
 
-/// A fixed, bf16-representable residual stream. Fixed so that a defect at prefill cannot
-/// change the decode step's INPUT: only the layer's own cached state carries the defect
-/// forward, which is what makes "this case is unaffected" a statement about the defect
-/// rather than about propagation.
-fn fixed_h(cfg: &V4Config, tag: &str, s: usize) -> Vec<f32> {
-    let mut r = NamedRng::new(tag);
-    (0..s * cfg.hc_mult * cfg.dim)
-        .map(|_| bf16_decode(bf16_encode(r.unit())))
-        .collect()
-}
-
 fn fixed_ids(cfg: &V4Config, tag: &str, s: usize) -> Vec<u32> {
     let mut r = NamedRng::new(tag);
     (0..s).map(|_| r.below(cfg.vocab_size) as u32).collect()
@@ -547,7 +542,7 @@ fn run(layer: usize, prompt: usize, defect: Defect) -> Run {
     let steps = std::iter::once((0usize, "pre".to_string(), prompt, 0usize))
         .chain((0..DECODE_STEPS).map(|i| (1usize, format!("dec{i}"), 1, prompt + i)));
     for (slot, tag, s, start_pos) in steps {
-        let mut h = fixed_h(cfg, &format!("h-{tag}"), s);
+        let mut h = residual_probe(cfg, &format!("h-{tag}"), s);
         let ids = fixed_ids(cfg, &format!("ids-{tag}"), s);
         let step = Step {
             lw,
@@ -1236,82 +1231,61 @@ fn a_duplicate_golden_name_is_rejected() {
 /// These are SAMPLED, so their separation is a property of a seed. The case that separates
 /// by construction is built in the test body rather than tabulated here — `vanishing_terms`.
 type ReductionCase = (&'static [f32], f32, f32);
+// **`#[rustfmt::skip]`, and it is what keeps the duplication gate armed over this table.**
+//
+// These are captured f32 values, one measurement per element. Formatted normally, rustfmt puts
+// each on its own line, and several rows carry runs of `0.0` long enough that jscpd calls one
+// five-line window a clone of the window one element over. There is nothing to factor — a
+// repeated `0.0` here IS the measurement — so the first instinct was a `jscpd:ignore` region.
+// That was wrong: an ignore would blanket the whole table INCLUDING every row added later, and
+// a genuinely duplicated `ReductionCase` is a real defect class in these registries (the
+// sibling compressor suite runs `assert_records_are_well_formed` for exactly that). Packing the
+// rows instead removes the five-line windows without touching one measured value, and leaves
+// the gate able to see a duplicated ROW -- rows are 7 to 17 lines, still over the window, and
+// `bf16_reduction_matches_torch_and_not_a_running_fold` asserts it DIRECTLY as well, so the
+// premise does not rest on a text gate that is skipped whenever `npx` is absent.
+//
+// The reflow was checked by extracting every numeric literal from the table before and after:
+// **144**, same order, byte-identical. (Re-running that check gives 144, not the 156 an
+// earlier version of this note claimed; 156 counts the twelve numerals inside the `//` row
+// comments, which are not literals. The comments are byte-identical too.)
+//
+// `torch_head_tail` below carries the same attribute. Its own doc argues nothing about
+// rustfmt or jscpd -- it was authored packed for readability, before the interaction
+// `build.rs` records was known -- so it is a precedent for the FORM, not a prior statement of
+// this reason. The reason is stated here.
+#[rustfmt::skip]
 const TORCH_REDUCTIONS: &[ReductionCase] = &[
     // toy `index_n_heads` = 4.0: torch .sum() = -1.4765625, running fold = -1.484375
     (
-        &[-0.016967773, -0.100097656, -0.49023438, -0.87109375],
+        &[
+            -0.016967773, -0.100097656, -0.49023438, -0.87109375,
+        ],
         -1.4765625,
         -1.484375,
     ),
     // CONTROL: the two agree here: torch .sum() = -1.234375, running fold = -1.234375
-    (&[-1.2578125, 0.0, 0.026245117, 0.0], -1.234375, -1.234375),
+    (
+        &[
+            -1.2578125, 0.0, 0.026245117, 0.0,
+        ],
+        -1.234375,
+        -1.234375,
+    ),
     // model `index_n_heads` = 64.0: torch .sum() = -2.109375, running fold = -2.09375
     (
         &[
-            0.103515625,
-            0.0,
-            0.0,
-            0.26367188,
-            0.35546875,
-            0.1796875,
-            0.0,
-            -0.359375,
-            0.0,
-            0.33203125,
-            1.9375,
-            0.0,
-            0.0,
-            0.0,
-            1.8125,
-            -2.9375,
-            0.0,
-            0.0,
-            -0.51953125,
-            0.0,
-            -0.203125,
-            0.0,
-            0.06738281,
-            -0.265625,
-            0.0,
-            -0.08105469,
-            -0.5078125,
-            0.0,
-            0.75390625,
-            0.0,
-            0.0,
-            -0.9921875,
-            0.0,
-            0.0,
-            -0.24707031,
-            0.5,
-            -0.26367188,
-            0.0,
-            -0.111328125,
-            0.0,
-            0.0,
-            0.0,
-            -0.048095703,
-            0.0,
-            0.0,
-            0.0,
-            0.103027344,
-            0.0,
-            0.0,
-            -0.057617188,
-            0.0,
-            -0.55078125,
-            0.0,
-            -0.24804688,
-            0.0,
-            0.0,
-            0.0,
-            -1.1171875,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            -0.0065307617,
-            0.0,
+            0.103515625, 0.0, 0.0, 0.26367188, 0.35546875, 0.1796875,
+            0.0, -0.359375, 0.0, 0.33203125, 1.9375, 0.0,
+            0.0, 0.0, 1.8125, -2.9375, 0.0, 0.0,
+            -0.51953125, 0.0, -0.203125, 0.0, 0.06738281, -0.265625,
+            0.0, -0.08105469, -0.5078125, 0.0, 0.75390625, 0.0,
+            0.0, -0.9921875, 0.0, 0.0, -0.24707031, 0.5,
+            -0.26367188, 0.0, -0.111328125, 0.0, 0.0, 0.0,
+            -0.048095703, 0.0, 0.0, 0.0, 0.103027344, 0.0,
+            0.0, -0.057617188, 0.0, -0.55078125, 0.0, -0.24804688,
+            0.0, 0.0, 0.0, -1.1171875, 0.0, 0.0,
+            0.0, 0.0, -0.0065307617, 0.0,
         ],
         -2.109375,
         -2.09375,
@@ -1319,70 +1293,17 @@ const TORCH_REDUCTIONS: &[ReductionCase] = &[
     // 64.0 heads, magnitudes spread 32x: torch .sum() = 94.5, running fold = 94.0
     (
         &[
-            0.0,
-            5.90625,
-            0.0,
-            0.0,
-            0.0,
-            14.1875,
-            -10.625,
-            70.0,
-            8.625,
-            -4.59375,
-            0.0,
-            0.0,
-            0.0,
-            2.65625,
-            -22.5,
-            -3.0625,
-            0.0,
-            103.0,
-            0.0,
-            0.0,
-            8.9375,
-            18.0,
-            10.9375,
-            0.0,
-            4.3125,
-            38.25,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            5.90625,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            -27.625,
-            -13.8125,
-            0.0,
-            7.65625,
-            0.0,
-            0.0,
-            0.0,
-            5.25,
-            -17.875,
-            -0.056396484,
-            -43.25,
-            -33.75,
-            -9.5,
-            1.7421875,
-            7.78125,
-            -2.921875,
-            -9.625,
-            0.0,
-            -28.625,
-            -0.88671875,
-            -3.96875,
-            0.0,
-            14.1875,
+            0.0, 5.90625, 0.0, 0.0, 0.0, 14.1875,
+            -10.625, 70.0, 8.625, -4.59375, 0.0, 0.0,
+            0.0, 2.65625, -22.5, -3.0625, 0.0, 103.0,
+            0.0, 0.0, 8.9375, 18.0, 10.9375, 0.0,
+            4.3125, 38.25, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 5.90625, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, -27.625,
+            -13.8125, 0.0, 7.65625, 0.0, 0.0, 0.0,
+            5.25, -17.875, -0.056396484, -43.25, -33.75, -9.5,
+            1.7421875, 7.78125, -2.921875, -9.625, 0.0, -28.625,
+            -0.88671875, -3.96875, 0.0, 14.1875,
         ],
         94.5,
         94.0,
@@ -1400,6 +1321,23 @@ fn bf16_reduction_matches_torch_and_not_a_running_fold() {
     //
     // The expected values are PyTorch's, captured out of tree (see `TORCH_REDUCTIONS`), not
     // recomputed here from a restatement of the oracle.
+    //
+    // NO TWO ROWS ARE THE SAME CASE. The table's `#[rustfmt::skip]` comment argues that packing
+    // it beats a `jscpd:ignore` region precisely because a duplicated `ReductionCase` stays
+    // visible -- but jscpd is a text gate that is skipped when `npx` is absent and reports a
+    // lower bound on a tree that is not rustfmt-clean. Leaving the premise to it while
+    // asserting nothing here is the asymmetry `assert_records_are_well_formed` exists to close
+    // in the sibling compressor suite, so it is closed here too. A duplicate row is dead
+    // weight that reads as coverage: `separated` counts it twice and the sweep looks broader
+    // than it is.
+    for (i, (terms, _, _)) in TORCH_REDUCTIONS.iter().enumerate() {
+        assert!(
+            !TORCH_REDUCTIONS[..i].iter().any(|(t, _, _)| t == terms),
+            "TORCH_REDUCTIONS row {i} repeats an earlier row's terms; it adds no case and \
+             inflates the separation count below"
+        );
+    }
+
     let (cfg, _) = model();
     let good = Oracle::new(cfg.clone(), Defect::None);
     let bad = Oracle::new(cfg.clone(), Defect::IndexerBf16RunningSum);
@@ -2108,19 +2046,8 @@ fn sinkhorn_has_converged_long_before_iteration_20() {
     let ids = fixed_ids(cfg, "ids-pre", 5);
     let drive = |c: &V4Config, d: Defect| {
         let o = Oracle::new(c.clone(), d);
-        let mut st = o.fresh_state(0);
-        let mut h = fixed_h(cfg, "h-pre", 5);
-        let mut cap = Capture::default();
-        let step = Step {
-            lw: &m.layers[0],
-            layer: 0,
-            s: 5,
-            start_pos: 0,
-            input_ids: &ids,
-            phase: "pre",
-        };
-        o.run_layer(&step, &mut st, &mut h, &mut cap);
-        cap
+        let mut h = residual_probe(cfg, "h-pre", 5);
+        common::prefill_capture(&o, &m.layers[0], 0, &ids, &mut h)
     };
     let full = drive(cfg, Defect::None);
     assert!(
@@ -2173,7 +2100,7 @@ fn softplus_threshold_only_matters_for_large_router_logits() {
     let (cfg, m) = model();
     let layer = 3; // score-routed
     let ids = fixed_ids(cfg, "ids-pre-5", 5);
-    let x: Vec<f32> = fixed_h(cfg, "gate-x", 5)
+    let x: Vec<f32> = residual_probe(cfg, "gate-x", 5)
         .into_iter()
         .take(5 * cfg.dim)
         .collect();

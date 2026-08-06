@@ -135,9 +135,17 @@ is the POINT in each; everywhere else, factor it.
 > factoring that removes the text (`Fp8(Q)`/`Fp4(Q)` over one payload struct) would keep the
 > distinction, and was declined on cost — a `.0` hop in every arm of `WMat::rows`/`cols`/`row`
 > and at every construction and pattern site in `tests/`. **If that hop is ever paid for
-> another reason, delete these two exemptions rather than keeping them.** One clone remains
-> unresolved and is not exempted: `v4oracle::compress_topk`'s parameter list against
-> `tests/v4_attn_host.rs::oracle_cat`'s, which only the `tests/` side can fix.
+> another reason, delete these two exemptions rather than keeping them.**
+>
+> **CORRECTED 2026-08-06, same day.** This said "one clone remains unresolved and is not
+> exempted: `v4oracle::compress_topk`'s parameter list against
+> `tests/v4_attn_host.rs::oracle_cat`'s, which only the `tests/` side can fix." The `tests/`
+> side then fixed it, by giving `oracle_cat` a `CompCase` struct in place of four bare `usize`
+> — see that struct's doc for why there was no `src`-side fix (`compress_topk` is `pub`, its
+> signature is the reference's, and collapsing it to one line is 101 characters against a
+> `max_width` of 100). **The tree is at ZERO clones, none of them exempted away.** The record
+> of what the clone was is kept here rather than deleted, on the same argument as the `WMat`
+> note above.
 jscpd is skipped with a warning if `npx` is absent, so the crate still builds without Node.
 
 `src/` is grouped by subsystem — `artifact/ memory/ fetch/ backend/` plus `gpu math attn

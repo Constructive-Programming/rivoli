@@ -217,6 +217,66 @@ impl Diff {
     }
 }
 
+/// The two head widths every comparison in this file is stated against: the compressor's
+/// output width `d`, and the RoPE tail `rd` that sits inside it and is NOT quantized.
+///
+/// A pair rather than two adjacent `usize` arguments, because [`diff`] splits its verdict on
+/// `quant_dims = d - rd`: transposed, every element lands in the wrong bucket, so `max_quant`
+/// is scored against the tail's bf16 floor and `max_tail` against the e4m3 allowance. Both
+/// totals stay right and the verdict inverts. `tests/common/mod.rs`'s `Mla` makes this
+/// argument about six `usize`; here it is two, and they travel together through the metric,
+/// the printer and the impersonation assertion.
+///
+/// **[`Widths::checked`] is what actually prevents it, not the subtraction.** An earlier
+/// version of this comment claimed a transposed pair "would underflow and panic". That is
+/// PROFILE-DEPENDENT, which is worse than simply wrong: on the dev profile `overflow-checks`
+/// is on and `64 - 512` does panic, so the claim holds exactly where someone would check it.
+/// Under `--release` — where `[profile.release]` sets no `overflow-checks` — it WRAPS,
+/// `quant_dims` becomes ~2^64, `dim < quant_dims` holds for every element, `max_tail` stays 0
+/// and `assert_clean`'s tail check passes vacuously. So the protection evaporated in the one
+/// profile CLAUDE.md prescribes for measurement runs, and a transposition would have LOOSENED
+/// the gate there in silence. An `assert!` is profile-independent; the subtraction is not. The
+/// `assert!` holds in both profiles and costs nothing: it runs once per `Widths` built, and
+/// every `Widths` in this file comes from [`Widths::of`] or a literal pair in a test. (No
+/// count here on purpose — it has been wrong twice.) [`widths_rejects_a_transposed_pair`] and
+/// [`widths_rejects_an_empty_rope_tail`] are the proof each half can fire.
+#[derive(Clone, Copy)]
+struct Widths {
+    d: usize,
+    rd: usize,
+}
+
+impl Widths {
+    fn of(cfg: &V4Config) -> Self {
+        Self::checked(cfg.head_dim, cfg.rope_head_dim)
+    }
+
+    /// The one constructor, so no `Widths` exists that [`diff`] could mis-bucket.
+    ///
+    /// `rd > 0` is a PRECONDITION of this file, not an accident: an empty RoPE tail leaves
+    /// `max_tail` never assigned, so `assert_clean` would print a tail verdict of 0 for a
+    /// region it never looked at. Every layer class shipped today has one; a future class
+    /// without one needs `assert_clean` reconsidered, not this loosened.
+    fn checked(d: usize, rd: usize) -> Self {
+        // TWO asserts, not one conjunction: `(512, 0)` is not a transposition, and a single
+        // message would send that reader hunting for a swap that is not there. It would also
+        // leave both `#[should_panic]` tests below matching the same substring, so neither
+        // would be pinned to its own condition.
+        assert!(
+            rd < d,
+            "Widths {{ d: {d}, rd: {rd} }}: the RoPE tail sits strictly inside the head width \
+             — this pair is transposed, and `diff` would score every element against the \
+             wrong bound rather than fail"
+        );
+        assert!(
+            rd > 0,
+            "Widths {{ d: {d}, rd: 0 }}: an empty RoPE tail leaves `max_tail` unassigned, so \
+             `assert_clean`'s tail verdict would pass vacuously"
+        );
+        Self { d, rd }
+    }
+}
+
 /// Compare two flattened `[n, d]` block sets in bf16 code space.
 ///
 /// Both sides hold bf16 values — the kernel's last act on every row is `rbf16` and the
@@ -232,7 +292,8 @@ impl Diff {
 /// negligible absolute difference. That is why [`Diff`] carries `differing` and `worst` —
 /// the count and the actual pair are what separate that case from a real error, and the max
 /// alone cannot.
-fn diff(want: &[f32], got: &[f32], d: usize, rd: usize) -> Diff {
+fn diff(want: &[f32], got: &[f32], w: Widths) -> Diff {
+    let (d, rd) = (w.d, w.rd);
     assert_eq!(want.len(), got.len(), "diff: length mismatch");
     assert!(
         want.len().is_multiple_of(d),
@@ -309,8 +370,8 @@ fn assert_clean(name: &str, dv: &Diff) -> Vec<String> {
 /// Compare and PRINT. The number is the evidence — a comparison that passed at 0 and one
 /// that passed at 3 look identical in a green run, and only one says the kernel reproduces
 /// the reference.
-fn gap(label: &str, want: &[f32], got: &[f32], d: usize, rd: usize) -> u32 {
-    let dv = diff(want, got, d, rd);
+fn gap(label: &str, want: &[f32], got: &[f32], w: Widths) -> u32 {
+    let dv = diff(want, got, w);
     println!("{}", dv.one_line(label));
     dv.max
 }
@@ -579,6 +640,23 @@ struct Spec {
     name: &'static str,
 }
 
+/// A spec's cell, loaded, together with its CLEAN `(oracle, gpu)` pair.
+///
+/// The opening move of all four sweeps below, which spelled it identically — a destructuring
+/// `for Spec { layer, script, name }`, a `Cell::load`, and a `run(Defect::None, ..)` — and
+/// `build.rs`'s duplication gate found the copies. It is also the pairing that must not
+/// drift: every distance any sweep reports is measured from this baseline, and a loop that
+/// loaded one spec's cell and baselined another's script would produce numbers that are
+/// meaningless and entirely plausible.
+///
+/// The cell comes back live because three of the four callers go on to `run` it under a
+/// defect, and re-`load`ing would re-read the layer's weights.
+fn load_and_baseline(ck: &Checkpoint, cfg: &V4Config, spec: &Spec) -> (Cell, Vec<f32>, Vec<f32>) {
+    let mut cell = Cell::load(ck, cfg, spec.layer);
+    let (want, got) = cell.run(Defect::None, &spec.script, None, None);
+    (cell, want, got)
+}
+
 fn cells() -> Option<(Checkpoint, V4Config, Vec<Spec>)> {
     let ck = checkpoint()?;
     let cfg = V4Config::v4_flash();
@@ -644,15 +722,11 @@ fn the_four_cells_reproduce_the_oracle() {
     // the loop and failed on cell 1 of 4, so three quarters of the diagnostic never printed
     // and the failure could not be told from a phase-dependent one. A gate that aborts on
     // its first cell hands back a quarter of what it measured.
+    let w = Widths::of(&cfg);
     let mut over = Vec::new();
-    for Spec {
-        layer,
-        script,
-        name,
-    } in list
-    {
-        let mut cell = Cell::load(&ck, &cfg, layer);
-        let (want, got) = cell.run(Defect::None, &script, None, None);
+    for spec in &list {
+        let name = spec.name;
+        let (_, want, got) = load_and_baseline(&ck, &cfg, spec);
         assert!(
             !want.is_empty(),
             "{name}: the script emitted nothing — it gates nothing"
@@ -661,7 +735,7 @@ fn the_four_cells_reproduce_the_oracle() {
             got.iter().all(|v| v.is_finite()),
             "{name}: non-finite output"
         );
-        let dv = diff(&want, &got, cfg.head_dim, cfg.rope_head_dim);
+        let dv = diff(&want, &got, w);
         println!("{}", dv.one_line(name));
         over.extend(assert_clean(name, &dv));
     }
@@ -719,27 +793,13 @@ fn zeroing_ape_reproduces_the_no_ape_defect_exactly() {
     let Some((ck, cfg, list)) = cells() else {
         return;
     };
-    for Spec {
-        layer,
-        script,
-        name,
-    } in list
-    {
-        let mut cell = Cell::load(&ck, &cfg, layer);
+    let w = Widths::of(&cfg);
+    for spec in &list {
+        let (mut cell, clean, _) = load_and_baseline(&ck, &cfg, spec);
         let zeros = vec![0.0f32; cell.cw.ape.len()];
-        let (clean, _) = cell.run(Defect::None, &script, None, None);
-        let (broken, gpu) = cell.run(Defect::CompressorNoApe, &script, Some(&zeros), None);
+        let (broken, gpu) = cell.run(Defect::CompressorNoApe, &spec.script, Some(&zeros), None);
         // `None`: every cell must separate on `no-ape`, and every cell does.
-        assert_impersonates(
-            name,
-            "no-ape",
-            &clean,
-            &broken,
-            &gpu,
-            cfg.head_dim,
-            cfg.rope_head_dim,
-            None,
-        );
+        assert_impersonates(spec.name, "no-ape", &clean, &broken, &gpu, w, None);
     }
 }
 
@@ -758,35 +818,22 @@ fn the_ratio_0_rope_table_reproduces_the_no_yarn_defect_exactly() {
     };
     assert_records_are_well_formed();
     assert_no_yarn_records_are_live(&list.iter().map(|s| s.name).collect::<Vec<_>>());
-    for Spec {
-        layer,
-        script,
-        name,
-    } in list
-    {
-        let mut cell = Cell::load(&ck, &cfg, layer);
+    let w = Widths::of(&cfg);
+    for spec in &list {
+        let name = spec.name;
+        let (mut cell, clean, _) = load_and_baseline(&ck, &cfg, spec);
         let plain = cell.table(Defect::RopeNoYarn);
         assert_ne!(
             plain,
             cell.table(Defect::None),
             "{name}: the two tables must differ"
         );
-        let (clean, _) = cell.run(Defect::None, &script, None, None);
-        let (broken, gpu) = cell.run(Defect::RopeNoYarn, &script, None, Some(&plain));
+        let (broken, gpu) = cell.run(Defect::RopeNoYarn, &spec.script, None, Some(&plain));
         let expect = NO_YARN_BELOW_RESOLUTION
             .iter()
             .find(|(c, _)| *c == name)
             .map(|(_, s)| *s);
-        assert_impersonates(
-            name,
-            "no-yarn",
-            &clean,
-            &broken,
-            &gpu,
-            cfg.head_dim,
-            cfg.rope_head_dim,
-            expect,
-        );
+        assert_impersonates(name, "no-yarn", &clean, &broken, &gpu, w, expect);
     }
 }
 
@@ -928,20 +975,18 @@ fn assert_no_yarn_records_are_live(cells: &[&str]) {
 /// perturbation is only known to have changed something. Without the second, a kernel that
 /// ignored the perturbed input entirely — the exact failure being hunted — would pass,
 /// because the clean and defect oracles would be close and it would match both.
-#[allow(clippy::too_many_arguments)]
 fn assert_impersonates(
     cell: &str,
     what: &str,
     clean: &[f32],
     broken: &[f32],
     gpu: &[f32],
-    d: usize,
-    rd: usize,
+    w: Widths,
     // `None` = this cell must separate. `Some(n)` = it is recorded as landing inside the
     // quantization floor at exactly `n` codes, and must still do so.
     expect_sep: Option<u32>,
 ) {
-    let hit = diff(broken, gpu, d, rd);
+    let hit = diff(broken, gpu, w);
     println!(
         "{}",
         hit.one_line(&format!("{cell} {what}: gpu vs defect-oracle"))
@@ -958,8 +1003,7 @@ fn assert_impersonates(
         &format!("{cell} {what}: gpu vs CLEAN oracle"),
         clean,
         gpu,
-        d,
-        rd,
+        w,
     );
     match expect_sep {
         // Recorded as non-separating. Asserted as an EXACT expected value, not skipped: if
@@ -1028,15 +1072,11 @@ fn each_in_scope_defect_is_further_from_the_gpu_than_the_clean_oracle_is() {
     // looking like considered non-coverage while the case it names had stopped occurring —
     // or, worse, had become INERT and been skipped by the branch above.
     let mut reached = vec![false; BELOW_RESOLUTION.len()];
-    for Spec {
-        layer,
-        script,
-        name,
-    } in list
-    {
-        let mut cell = Cell::load(&ck, &cfg, layer);
-        let (clean, gpu) = cell.run(Defect::None, &script, None, None);
-        let cd = diff(&clean, &gpu, cfg.head_dim, cfg.rope_head_dim);
+    let w = Widths::of(&cfg);
+    for spec in &list {
+        let name = spec.name;
+        let (mut cell, clean, gpu) = load_and_baseline(&ck, &cfg, spec);
+        let cd = diff(&clean, &gpu, w);
         println!("{}", cd.one_line(&format!("{name} clean")));
         // RECORDED, not asserted here. An over-budget clean comparison makes the separations
         // below uninterpretable, but it does not make them unmeasurable — and their pattern
@@ -1048,20 +1088,14 @@ fn each_in_scope_defect_is_further_from_the_gpu_than_the_clean_oracle_is() {
             if matches!(def, Defect::CompressorNoApe | Defect::RopeNoYarn) {
                 continue;
             }
-            let (broken, _) = cell.run(def, &script, None, None);
+            let (broken, _) = cell.run(def, &spec.script, None, None);
             if broken == clean {
                 // INERT here, by construction. Printed rather than skipped silently: the
                 // point of naming it is that this cell must not be counted as covering it.
                 println!("{name}: {def:?} is INERT here — this cell covers it not at all");
                 continue;
             }
-            let sep = gap(
-                &format!("{name} {def:?}"),
-                &broken,
-                &gpu,
-                cfg.head_dim,
-                cfg.rope_head_dim,
-            );
+            let sep = gap(&format!("{name} {def:?}"), &broken, &gpu, w);
             let known = BELOW_RESOLUTION
                 .iter()
                 .position(|(c, d, _)| *c == name && *d == def);
@@ -1204,8 +1238,7 @@ fn the_overlap_defect_is_inert_at_ratio_128_and_live_at_ratio_4() {
         "ratio4 no-overlap vs gpu",
         &broken_4,
         &gpu_4,
-        cfg.head_dim,
-        cfg.rope_head_dim,
+        Widths::of(&cfg),
     );
     assert!(
         sep >= RESOLVABLE,
@@ -1238,6 +1271,36 @@ fn the_two_geometries_differ_in_opposite_directions() {
     );
 }
 
+/// **[`Widths::checked`] rejects a transposed pair — the proof that guard can fire.**
+///
+/// Why an `assert!` and not the subtraction is argued once, at [`Widths`]. This test is the
+/// other half: the replacement must itself be exercised, or it is the same shape of claim one
+/// level up.
+///
+/// LOOSENING is the failure mode the pair closes, and it needs a case per conjunct. Every
+/// other test in this file passes a legitimate `(512, 64)`, so a bound relaxed in either
+/// direction stays green for all of them; an INVERTED condition would go red everywhere at
+/// once. This case covers `rd < d` and [`widths_rejects_an_empty_rope_tail`] covers `rd > 0`,
+/// which is why the assert is two statements and not one conjunction — a guard whose loosened
+/// form is invisible is what [`assert_records_are_well_formed`] spends its lines preventing
+/// for this file's two coverage registries.
+#[test]
+#[should_panic(expected = "transposed")]
+fn widths_rejects_a_transposed_pair() {
+    // The shipped shape with its two fields swapped: `rope_head_dim` 64 is the tail INSIDE
+    // `head_dim` 512, so (64, 512) is exactly the mistake.
+    let _ = Widths::checked(64, 512);
+}
+
+/// ...and a zero tail is rejected too — the half a transposition cannot produce, which is why
+/// it matches its OWN message rather than the transposition one. Why it matters, at
+/// [`Widths::checked`].
+#[test]
+#[should_panic(expected = "empty RoPE tail")]
+fn widths_rejects_an_empty_rope_tail() {
+    let _ = Widths::checked(512, 0);
+}
+
 /// **The instrument, before it is trusted to diagnose anything.** Needs no device.
 ///
 /// The first run of this file reported 16 ULP and I proposed an explanation for it. An
@@ -1246,8 +1309,9 @@ fn the_two_geometries_differ_in_opposite_directions() {
 /// exactly one e4m3 step, and a value near zero.
 #[test]
 fn the_diff_metric_reports_what_it_claims() {
-    const D: usize = 512;
-    const RD: usize = 64;
+    // Synthetic widths, not the config's: this test pins what the METRIC reports, so the
+    // shape only has to be a legal one.
+    let w = Widths::checked(512, 64);
     // One e4m3 step at 1.5 -> 1.625. `act_quant` reconstructs `e4m3(v/s)·s`, so a
     // pre-quantization value a hair either side of the boundary lands a whole step away.
     //
@@ -1256,11 +1320,11 @@ fn the_diff_metric_reports_what_it_claims() {
     // and asserted `14..=16` — bf16 codes are LINEAR in the mantissa, not logarithmic, so
     // that derivation was wrong and the range it produced would have passed an implementation
     // that violated the one claim this test exists to pin.
-    let mut want = vec![1.0f32; D];
-    let mut got = vec![1.0f32; D];
+    let mut want = vec![1.0f32; w.d];
+    let mut got = vec![1.0f32; w.d];
     want[3] = 1.5;
     got[3] = 1.625;
-    let dv = diff(&want, &got, D, RD);
+    let dv = diff(&want, &got, w);
     assert_eq!(f32_to_bf16(1.5), 0x3FC0, "the fixture's own premise");
     assert_eq!(f32_to_bf16(1.625), 0x3FD0);
     assert_eq!(
@@ -1287,11 +1351,11 @@ fn the_diff_metric_reports_what_it_claims() {
         for m in 0..7 {
             let a = base * (1.0 + m as f32 / 8.0);
             let b = base * (1.0 + (m + 1) as f32 / 8.0);
-            let (mut wa, mut gb) = (vec![1.0f32; D], vec![1.0f32; D]);
+            let (mut wa, mut gb) = (vec![1.0f32; w.d], vec![1.0f32; w.d]);
             wa[1] = a;
             gb[1] = b;
             assert_eq!(
-                diff(&wa, &gb, D, RD).max,
+                diff(&wa, &gb, w).max,
                 E4M3_ULP,
                 "one e4m3 step at 2^{e}·(1+{m}/8) must still be {E4M3_ULP} codes"
             );
@@ -1301,10 +1365,10 @@ fn the_diff_metric_reports_what_it_claims() {
     // The SPLIT is the whole diagnostic, so it must actually split. Same difference, moved
     // into the RoPE tail, has to land in the other bucket — otherwise a tail-only failure
     // would read as a quantization artifact and send the next reader the wrong way.
-    let (mut w2, mut g2) = (vec![1.0f32; D], vec![1.0f32; D]);
-    w2[D - 1] = 1.5;
-    g2[D - 1] = 1.625;
-    let dv2 = diff(&w2, &g2, D, RD);
+    let (mut w2, mut g2) = (vec![1.0f32; w.d], vec![1.0f32; w.d]);
+    w2[w.d - 1] = 1.5;
+    g2[w.d - 1] = 1.625;
+    let dv2 = diff(&w2, &g2, w);
     assert_eq!(
         (dv2.max_quant, dv2.max_tail),
         (0, dv2.max),
@@ -1314,10 +1378,10 @@ fn the_diff_metric_reports_what_it_claims() {
     // The known blind spot, pinned rather than described: near zero the code gap is large
     // for a negligible absolute difference. `differing` and `worst` are what distinguish it,
     // which is why the verdict must never rest on `max` alone.
-    let (mut w3, mut g3) = (vec![1.0f32; D], vec![1.0f32; D]);
+    let (mut w3, mut g3) = (vec![1.0f32; w.d], vec![1.0f32; w.d]);
     w3[7] = 1e-30;
     g3[7] = 2e-30;
-    let dv3 = diff(&w3, &g3, D, RD);
+    let dv3 = diff(&w3, &g3, w);
     assert!(
         dv3.max >= 100,
         "a doubling near zero reads as a whole binade: {}",
@@ -1329,7 +1393,7 @@ fn the_diff_metric_reports_what_it_claims() {
     );
 
     // Identical input must read exactly zero, or every 0 printed above means nothing.
-    assert_eq!(diff(&want, &want, D, RD).max, 0);
-    assert_eq!(diff(&want, &want, D, RD).differing, 0);
+    assert_eq!(diff(&want, &want, w).max, 0);
+    assert_eq!(diff(&want, &want, w).differing, 0);
     println!("{}", dv.one_line("e4m3-step fixture"));
 }

@@ -110,6 +110,17 @@ fn down(b: &DeviceBuf, n: usize) -> Vec<f32> {
     common::f32v(&bytes)
 }
 
+/// Whether ANY element disagrees bit-wise — the resolution check every deliberate break
+/// below makes, and the exact negation of what [`assert_bits`] requires.
+///
+/// One spelling, because the three call sites each state it about a different perturbation
+/// and each keeps its own `assert!` and message: naming which break went inert is the whole
+/// value of that failure, and only the comparison is common. Bits and not `!=`: a break that
+/// moved a value to a different NaN payload is a move, and `f32::ne` would call it a match.
+fn any_bits_differ(a: &[f32], b: &[f32]) -> bool {
+    a.iter().zip(b).any(|(x, y)| x.to_bits() != y.to_bits())
+}
+
 /// Bit-for-bit, and REPORT the first disagreement rather than a count.
 ///
 /// Exact, not a tolerance. Both kernels here are bit-exact against the oracle by
@@ -147,16 +158,38 @@ fn assert_bits(want: &[f32], got: &[f32], label: &str) {
 /// `fp4_act_quant_inplace` ARE the oracle's, so the only thing restated is the order of the
 /// four steps — and the bf16 store between the rotation and the quantization is the step a
 /// port drops, so having it visible at the comparison site is worth more than hiding it
-/// behind one call.
+/// behind one call. Only the STORE is named ([`store_bf16`]); the four steps still read as
+/// four here, which is the whole of that argument.
 fn host_spread(rows: &mut [f32], d: usize) {
     for row in rows.chunks_exact_mut(d) {
         hadamard_rotate(row);
-        row.iter_mut()
-            .for_each(|x| *x = bf16_decode(bf16_encode(*x)));
+        store_bf16(row);
         fp4_act_quant_inplace(row, 32);
-        row.iter_mut()
-            .for_each(|x| *x = bf16_decode(bf16_encode(*x)));
+        store_bf16(row);
     }
+}
+
+/// `x = bf16(x)` over a row — the reference's store after each transform.
+///
+/// Named because it appears three times IN THIS FILE: twice in [`host_spread`] and once in
+/// the `IndexerNoFp4Quant` break, which is that function with the quantization removed. Three
+/// spellings of a round-trip through `bf16_encode`/`bf16_decode` is three places to write
+/// `bf16_decode(bf16_encode(x))` the other way round, which is the identity and would make
+/// every store silently absent.
+///
+/// **Not the only copy in `tests/`, and the count above is deliberately scoped.**
+/// `v4_hadamard_basis.rs::rbf` is this function byte for byte, under another name and with a
+/// doc making the same argument; `v4_head_tail.rs::bf` and two closures further down this
+/// file are the scalar form. `build.rs`'s gate sees none of them — each is under jscpd's
+/// DEFAULT `minLines: 5`, which `.jscpd.json` does NOT set, so raising it is a one-line config
+/// change nobody would find by grepping the file that is supposed to govern the gate. That is
+/// a reason the gate did not force the issue, not a licence. The real home
+/// is `tests/common/mod.rs` (it touches no device type), and consolidating there means
+/// editing a file this change does not otherwise touch. Left as a named follow-up rather than
+/// done silently, so the next reader knows the duplication is known and not merely unseen.
+fn store_bf16(row: &mut [f32]) {
+    row.iter_mut()
+        .for_each(|x| *x = bf16_decode(bf16_encode(*x)));
 }
 
 /// Upload, spread in place, read back — the whole device side of one spread comparison.
@@ -172,6 +205,19 @@ fn device_spread(host_in: &[f32], rows: usize, d: usize) -> Vec<f32> {
         .expect("spread launch");
     device_sync().expect("sync");
     down(&buf, rows * d)
+}
+
+/// Spread `host_in` on the host and on the device and require the two to agree bit for bit.
+///
+/// The `label` stays the caller's, and that is the whole reason this takes one: `assert_bits`
+/// prints it at the first differing element, and the two callers mean different things by a
+/// difference — one says the spread arithmetic is wrong, the other says it is wrong on a
+/// binade the shipped fixtures never reach. A shared message would send the reader to the
+/// wrong fixture.
+fn assert_spread_matches(host_in: &[f32], rows: usize, d: usize, label: &str) {
+    let mut want = host_in.to_vec();
+    host_spread(&mut want, d);
+    assert_bits(&want, &device_spread(host_in, rows, d), label);
 }
 
 // =======================================================================================
@@ -192,10 +238,7 @@ fn indexer_spread_is_bit_identical_to_the_oracle() {
     // `assert x.dtype == torch.bfloat16` guarantees it receives.
     let host_in = probe("spread", rows, d);
 
-    let mut want = host_in.clone();
-    host_spread(&mut want, d);
-
-    assert_bits(&want, &device_spread(&host_in, rows, d), "indexer_spread");
+    assert_spread_matches(&host_in, rows, d, "indexer_spread");
 }
 
 /// **Widening the e8m0 exponent coverage the whole S2 suite lacks.**
@@ -253,13 +296,7 @@ fn fp4_block_scale_covers_sixty_binades_not_two() {
         binades.len()
     );
 
-    let mut want = host_in.clone();
-    host_spread(&mut want, d);
-    assert_bits(
-        &want,
-        &device_spread(&host_in, 60, d),
-        "spread over 60 binades",
-    );
+    assert_spread_matches(&host_in, 60, d, "spread over 60 binades");
 }
 
 /// The launcher refuses the shapes whose failure would be silent, and each refusal is shown
@@ -320,11 +357,20 @@ fn geom_indexer_and_geom_attention_do_not_finish_the_same_way() {
 
     assert_eq!(a.quantize(), Quantize::PartialFp8);
     assert_eq!(i.quantize(), Quantize::HadamardFp4);
-    // Identical to the kernel, different to `compress`. This IS entailed by `Geom::build`,
-    // whose `GeomAbi` literal does not read `quant` — review flagged it as tautological and
-    // it is kept anyway, as the executable statement of the HAZARD rather than as a test of
-    // the port: it is the reason no dimension guard can catch the confusion, and if it ever
-    // fails the argument for the `Quantize` field has weakened, which is a thing to know.
+    // Identical to the kernel, different to `compress`. This IS entailed, and since the
+    // 2026-08-06 `src/` dedup it is entailed STRUCTURALLY rather than by inspection:
+    // `Geom::indexer` now builds its abi as `..Self::attention(kind, d, rope_head_dim,
+    // norm_eps)?`, a functional update overriding only `quant`, so the two halves cannot
+    // differ. Before that both constructors were wrappers around one private `Geom::build`
+    // holding the single `GeomAbi` literal, called once each with a different `Quantize`; the
+    // dedup inlined it into the already-existing `Geom::attention` and deleted it, so this was
+    // an inlining and not a rename.
+    //
+    // Review flagged the assertion as tautological and it is kept anyway, as the executable
+    // statement of the HAZARD rather than as a test of the port: it is the reason no dimension
+    // guard can catch the confusion, and if it ever fails the argument for the `Quantize`
+    // field has weakened, which is a thing to know. `Geom::indexer` points back at this FILE
+    // and this assertion (not at the test name, which appears nowhere in `src/`).
     // The companion `assert_ne!(a, i)` was deleted; it restated the two lines above it.
     assert_eq!(a.abi(), i.abi(), "the ABI halves must be indistinguishable");
 
@@ -525,27 +571,23 @@ fn the_score_comparison_rejects_perturbed_inputs_and_only_the_right_ones() {
     let broken = device(&q, &kv, &ones);
     assert_bits(&host_score(&q, &kv, &ones, d), &broken, "score/no-weights");
     assert!(
-        broken
-            .iter()
-            .zip(&base)
-            .any(|(a, b)| a.to_bits() != b.to_bits()),
+        any_bits_differ(&broken, &base),
         "IndexerNoWeights must move the score matrix, else the fixture's weights are all 1"
     );
 
-    // `IndexerNoFp4Quant`: `q` rotated but not quantized.
+    // `IndexerNoFp4Quant`: `q` rotated but not quantized. This is `host_spread` with the
+    // `fp4_act_quant_inplace` line and its trailing store deleted, and it is spelled out
+    // rather than shared so the two steps that DO run stay visible beside the one that does
+    // not — a defect model whose omission you cannot see is not evidence of anything.
     let mut q_nofp4 = probe("brk-q", d.s * d.heads, d.hd);
     for row in q_nofp4.chunks_exact_mut(d.hd) {
         hadamard_rotate(row);
-        row.iter_mut()
-            .for_each(|x| *x = bf16_decode(bf16_encode(*x)));
+        store_bf16(row);
     }
     let broken = device(&q_nofp4, &kv, &w);
     assert_bits(&host_score(&q_nofp4, &kv, &w, d), &broken, "score/no-fp4");
     assert!(
-        broken
-            .iter()
-            .zip(&base)
-            .any(|(a, b)| a.to_bits() != b.to_bits()),
+        any_bits_differ(&broken, &base),
         "IndexerNoFp4Quant must move the score matrix"
     );
 
@@ -571,10 +613,7 @@ fn the_score_comparison_rejects_perturbed_inputs_and_only_the_right_ones() {
         d.s - 1
     );
     assert!(
-        moved[untouched..]
-            .iter()
-            .zip(&base[untouched..])
-            .any(|(a, b)| a.to_bits() != b.to_bits()),
+        any_bits_differ(&moved[untouched..], &base[untouched..]),
         "...and must move its own row, else the perturbation did nothing anywhere"
     );
 }

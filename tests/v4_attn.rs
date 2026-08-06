@@ -282,6 +282,38 @@ fn plain_sel(d: &Dims) -> Sel {
     base_sel(d, LayerKind::Plain, 0)
 }
 
+/// The selection for one step of a ratio-0 layer: its `(rows, cols)` shape and the uploaded
+/// index buffer, from ONE fill.
+///
+/// Four tests built this identically — a `Sel` differing from [`plain_sel`] only in
+/// `seqlen`/`start_pos`, filled into a fresh `Vec`, uploaded — and `build.rs`'s duplication
+/// gate found the copies. The pairing is the reason to keep it one function: every caller
+/// goes on to set `Io { idxs, idxs_shape }` from these two, and `attention` reads the buffer
+/// at the stride the SHAPE names. A test that uploaded one fill's indices beside another
+/// fill's shape would hand the kernel a selection indexing off the end of its own buffer —
+/// and the shape-guard test below exists precisely because that mismatch is silent.
+///
+/// The shape is RETURNED rather than asserted here: two callers require a specific one and
+/// say so in their own words (a short prefill narrows to `seqlen`, a decode wants the full
+/// window), and those two claims are the opposite halves of one guard.
+fn upload_plain_selection(
+    d: &Dims,
+    seqlen: usize,
+    start_pos: usize,
+) -> ((usize, usize), DeviceBuf) {
+    let mut idx = Vec::new();
+    let shape = v4_topk_idxs(
+        Sel {
+            seqlen,
+            start_pos,
+            ..plain_sel(d)
+        },
+        &mut idx,
+    )
+    .unwrap();
+    (shape, dev_i32(&idx))
+}
+
 /// A `Sel` for a layer of any class, and **the one place a field added to `Sel` lands** —
 /// every other `Sel` in this file is built from a `base_sel` with `..`.
 fn base_sel(d: &Dims, kind: LayerKind, index_topk: usize) -> Sel {
@@ -1074,15 +1106,44 @@ impl Harness {
     fn compressed() -> Self {
         Self::at(COMP_LAYER, comp_script)
     }
+
+    /// The four fields a scoring test reads: the config, the dims, the oracle's captures and
+    /// the device side.
+    ///
+    /// A method rather than a `let Harness { .. } = ..` at each site. rustfmt breaks that
+    /// pattern over three or more lines and five tests carried the same field list, which
+    /// `build.rs`'s duplication gate found. Unlike the list it replaces, the four types here
+    /// are all distinct, so nothing a transposition could reach compiles.
+    ///
+    /// Consuming, because `gpu` must move: a harness left half-emptied beside its own `Gpu`
+    /// is two handles on one set of device buffers.
+    ///
+    /// The two sweeps below deliberately do NOT use this and bind the whole harness instead.
+    /// That is not an inconsistency to tidy: they call [`Harness::under`], which borrows
+    /// `cfg`/`model`/`layer`/`script`, three of which this drops (`cfg` comes back in the
+    /// tuple) — so they need the harness alive. Consuming here and borrowing there is the
+    /// real difference between the two groups, not a style split to tidy away.
+    fn parts(self) -> (V4Config, Dims, Vec<Phase>, Gpu) {
+        (self.cfg, self.d, self.clean, self.gpu)
+    }
+
+    /// Re-drive this harness's script under `defect` — the reference a sweep scores against.
+    ///
+    /// A method so the two sweeps do not unpack `cfg`, `model`, `layer` and `script` purely
+    /// to hand them straight back to `drive_script`; the full seven-field destructure stood
+    /// in both and was the last of these the gate found. It also closes the only way they
+    /// could disagree: driving one cell's script at another cell's layer type-checks, and
+    /// `reach` would then report a number that is wrong and entirely plausible.
+    fn under(&self, defect: Defect) -> Vec<Phase> {
+        drive_script(&self.cfg, &self.model, defect, self.layer, &self.script)
+    }
 }
 
 // ═══ tests ══════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn attention_matches_the_oracle_at_every_stage_of_a_ratio_zero_layer() {
-    let Harness {
-        d, clean, mut gpu, ..
-    } = Harness::new();
+    let (_, d, clean, mut gpu) = Harness::new().parts();
     for p in &clean {
         let got = gpu.step(&d, p);
         assert_eq!(got.n_comp, 0, "a ratio-0 layer has no compressed columns");
@@ -1120,18 +1181,8 @@ fn sparse_attn_alone_matches_the_oracle_including_the_sink() {
     let p = &clean[0];
     let q = dev_f32(golden(p, "q"));
     let kv = dev_f32(golden(p, "kv_entry"));
-    let mut idx = Vec::new();
-    let (rows, cols) = v4_topk_idxs(
-        Sel {
-            seqlen: p.m,
-            start_pos: 0,
-            ..plain_sel(&d)
-        },
-        &mut idx,
-    )
-    .unwrap();
+    let ((rows, cols), idxb) = upload_plain_selection(&d, p.m, 0);
     assert_eq!(rows, p.m);
-    let idxb = dev_i32(&idx);
     let mut o = dev_f32(&vec![0.0f32; p.m * d.n_heads * d.head_dim]);
     // On a real stream, not `null_mut()`, for the reason `Gpu::stream` states: a golden that
     // only ever launched on the null stream would say nothing about the stream path.
@@ -1246,23 +1297,15 @@ fn reach(refs: &[Phase], mine: &[StepOut]) -> i32 {
 
 #[test]
 fn each_in_scope_defect_is_further_away_than_the_kernels_are() {
-    let Harness {
-        cfg,
-        model,
-        d,
-        clean,
-        mut gpu,
-        layer,
-        script,
-    } = Harness::new();
+    let mut h = Harness::new();
     // The GPU's own output for every step, taken ONCE and reused: every distance below
     // is measured from the same point, so the numbers are comparable to each other and
     // not merely each to its own baseline.
-    let mine: Vec<StepOut> = clean.iter().map(|p| gpu.step(&d, p)).collect();
-    let floor = reach(&clean, &mine);
+    let mine: Vec<StepOut> = h.clean.iter().map(|p| h.gpu.step(&h.d, p)).collect();
+    let floor = reach(&h.clean, &mine);
     println!(
         "kernel-vs-oracle floor: {floor} bf16 ULP over {} steps",
-        clean.len()
+        h.clean.len()
     );
     // MEASURED 2026-08-05 on gfx1151: 0 ULP at prefill and both decode steps.
     //
@@ -1290,7 +1333,7 @@ fn each_in_scope_defect_is_further_away_than_the_kernels_are() {
 
     let mut worst: Option<(Defect, i32)> = None;
     for (stage, defect) in in_scope() {
-        let r = reach(&drive_script(&cfg, &model, defect, layer, &script), &mine);
+        let r = reach(&h.under(defect), &mine);
         println!("  {stage:<14} {defect:<32?} reach={r} ULP");
         if worst.is_none_or(|(_, w)| r < w) {
             worst = Some((defect, r));
@@ -1401,9 +1444,7 @@ fn each_in_scope_defect_is_further_away_than_the_kernels_are() {
 /// - **The five `gemv_fp8`s.** Each writes a buffer it does not read, from a poisoned input.
 #[test]
 fn the_attention_block_is_entirely_on_its_stream() {
-    let Harness {
-        d, clean, mut gpu, ..
-    } = Harness::new();
+    let (_, d, clean, mut gpu) = Harness::new().parts();
     let p = &clean[0];
     // NO precondition on `p.m` against `d.window`, and an earlier draft of this test had one:
     // `assert!(p.m <= d.window)`, on the belief that it drove the short-prefill arm. It does
@@ -1445,17 +1486,7 @@ fn the_attention_block_is_entirely_on_its_stream() {
     }
 
     let x = dev_f32(golden(p, "attn_norm_out"));
-    let mut idx = Vec::new();
-    let shape = v4_topk_idxs(
-        Sel {
-            seqlen: p.m,
-            start_pos: 0,
-            ..plain_sel(&d)
-        },
-        &mut idx,
-    )
-    .unwrap();
-    let idxb = dev_i32(&idx);
+    let (shape, idxb) = upload_plain_selection(&d, p.m, 0);
 
     // Poison every destination. `fill_u32` is itself a null-stream launch, which is fine and
     // is why the `device_sync` below is not optional: the poison must be in place and the
@@ -1597,9 +1628,7 @@ fn the_attention_block_is_entirely_on_its_stream() {
 /// a guard that rejects everything is not a guard.
 #[test]
 fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
-    let Harness {
-        d, clean, mut gpu, ..
-    } = Harness::new();
+    let (_, d, clean, mut gpu) = Harness::new().parts();
     let p = &clean[0];
     // A prefill of 4 against a window of 8: `v4_topk_idxs` returns 4 columns, and the
     // whole point is that `window` is the plausible wrong answer.
@@ -1609,22 +1638,12 @@ fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
         "the collision this test needs does not exist"
     );
     let x = dev_f32(&golden(p, "attn_norm_out")[..short * d.dim]);
-    let mut idx = Vec::new();
-    let right = v4_topk_idxs(
-        Sel {
-            seqlen: short,
-            start_pos: 0,
-            ..plain_sel(&d)
-        },
-        &mut idx,
-    )
-    .unwrap();
+    let (right, idxb) = upload_plain_selection(&d, short, 0);
     assert_eq!(
         right,
         (short, short),
         "a short prefill no longer narrows its columns"
     );
-    let idxb = dev_i32(&idx);
     let mut io = Io {
         x: x.ptr().cast(),
         freqs: gpu.freqs.ptr().cast(),
@@ -1635,38 +1654,37 @@ fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
     };
     let s = gpu.scratch();
     let stream = gpu.stream.raw();
-    // SAFETY: buffers outlive the call; it returns before any launch.
-    let e = unsafe {
-        attention(
-            &d,
-            plain_sel(&d),
-            &gpu.weights,
-            &s,
-            &io,
-            Step::Prefill { seqlen: short },
-            stream,
-        )
-    }
-    .expect_err("a 4-row prefill must not accept an 8-column selection");
-    assert!(
-        format!("{e}").contains("selection"),
-        "rejected for the wrong reason: {e}"
+    // Four calls that vary ONLY in `io.idxs_shape` and the phase; every other argument is the
+    // same object at all four, and four copies of the seven-argument list is what `build.rs`'s
+    // duplication gate found. The `Result` comes back untouched on purpose: two of the four
+    // must fail and two must succeed, so the helper must not decide which.
+    //
+    // SAFETY: `io`'s buffers, `s` and `gpu.weights` outlive every call and the syncs that
+    // follow the two accepted ones. The two rejected calls return before any launch.
+    let go =
+        |io: &Io, step| unsafe { attention(&d, plain_sel(&d), &gpu.weights, &s, io, step, stream) };
+    // Both rejections must name the SELECTION. A shape mismatch coming back as an allocation
+    // or launch failure would satisfy `expect_err` while proving the guard never ran.
+    //
+    // `arm` is passed rather than inferred from the panic LOCATION, which is what two separate
+    // `assert!`s used to give: routed through one closure they would share a line number, so
+    // the panic could no longer say which of the two inverse mistakes went uncaught. Each
+    // caller also keeps its own `expect_err` message for the Err-ness itself.
+    let for_selection = |arm: &str, e: anyhow::Error| {
+        assert!(
+            format!("{e}").contains("selection"),
+            "{arm}: rejected for the wrong reason: {e}"
+        );
+    };
+
+    for_selection(
+        "short prefill",
+        go(&io, Step::Prefill { seqlen: short })
+            .expect_err("a 4-row prefill must not accept an 8-column selection"),
     );
 
     io.idxs_shape = right;
-    // SAFETY: as above; this one does launch, and the sync below joins it.
-    unsafe {
-        attention(
-            &d,
-            plain_sel(&d),
-            &gpu.weights,
-            &s,
-            &io,
-            Step::Prefill { seqlen: short },
-            stream,
-        )
-    }
-    .expect("the correct shape must be accepted");
+    go(&io, Step::Prefill { seqlen: short }).expect("the correct shape must be accepted");
     device_sync().expect("sync");
 
     // The decode arm, which the first draft of this test named and never ran. Decode
@@ -1674,53 +1692,21 @@ fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
     // answer here is the narrowed prefill shape -- the exact inverse of the mistake
     // above, and it must be rejected too.
     io.idxs_shape = (1, short);
-    let e = unsafe {
-        attention(
-            &d,
-            plain_sel(&d),
-            &gpu.weights,
-            &s,
-            &io,
-            Step::Decode { pos: PROMPT },
-            stream,
-        )
-    }
-    .expect_err("a decode must not accept a narrowed prefill selection");
-    assert!(
-        format!("{e}").contains("selection"),
-        "rejected for the wrong reason: {e}"
+    for_selection(
+        "decode",
+        go(&io, Step::Decode { pos: PROMPT })
+            .expect_err("a decode must not accept a narrowed prefill selection"),
     );
-    let mut one = Vec::new();
-    let want = v4_topk_idxs(
-        Sel {
-            seqlen: 1,
-            start_pos: PROMPT,
-            ..plain_sel(&d)
-        },
-        &mut one,
-    )
-    .unwrap();
+
+    let (want, oneb) = upload_plain_selection(&d, 1, PROMPT);
     assert_eq!(
         want,
         (1, d.window),
         "decode no longer wants the full window"
     );
-    let oneb = dev_i32(&one);
     io.idxs = oneb.ptr().cast();
     io.idxs_shape = want;
-    // SAFETY: as above.
-    unsafe {
-        attention(
-            &d,
-            plain_sel(&d),
-            &gpu.weights,
-            &s,
-            &io,
-            Step::Decode { pos: PROMPT },
-            stream,
-        )
-    }
-    .expect("the correct decode shape must be accepted");
+    go(&io, Step::Decode { pos: PROMPT }).expect("the correct decode shape must be accepted");
     device_sync().expect("sync");
 }
 
@@ -1746,8 +1732,11 @@ fn the_c_abi_argument_guards_reject_out_of_domain_shapes() {
     // SAFETY: every call below is rejected by an argument guard before any launch, so no
     // pointer is dereferenced and the shapes never have to be real.
     unsafe {
-        // head_dim past V4_ATTN_THREADS * V4_ATTN_ACC -- silently dropped dims otherwise.
-        guard(
+        // The two `sparse_attn` cases differ ONLY in `head_dim` and `topk`; the other nine
+        // arguments are stand-ins the guard returns before reading. Naming just the two puts
+        // the boundary on one line each — which is the claim being made — instead of burying
+        // it in the eleventh and twelfth positions of a repeated list.
+        let sparse_attn_at = |head_dim, topk| {
             launch_v4_sparse_attn(
                 p,
                 p,
@@ -1755,30 +1744,22 @@ fn the_c_abi_argument_guards_reject_out_of_domain_shapes() {
                 b.ptr().cast(),
                 1,
                 1,
-                1025,
-                8,
+                head_dim,
+                topk,
                 1.0,
                 pm,
                 std::ptr::null_mut(),
-            ),
+            )
+        };
+        // head_dim past V4_ATTN_THREADS * V4_ATTN_ACC -- silently dropped dims otherwise.
+        guard(
+            sparse_attn_at(1025, 8),
             "1002",
             "head_dim over the accumulator cap",
         );
         // ...and 1024 exactly is accepted, so the cap is a boundary and not a blanket no.
         guard(
-            launch_v4_sparse_attn(
-                p,
-                p,
-                p,
-                b.ptr().cast(),
-                1,
-                1,
-                1024,
-                1 << 20,
-                1.0,
-                pm,
-                std::ptr::null_mut(),
-            ),
+            sparse_attn_at(1024, 1 << 20),
             "1006",
             "a topk that overflows LDS",
         );
@@ -2463,13 +2444,7 @@ fn each_defect_moves_exactly_the_compressed_layer_goldens_it_should() {
 /// * some later decode step emits — so the decode slot is exercised too.
 #[test]
 fn attention_matches_the_oracle_on_a_compressed_layer_in_both_phases() {
-    let Harness {
-        cfg,
-        d,
-        clean,
-        mut gpu,
-        ..
-    } = Harness::compressed();
+    let (cfg, d, clean, mut gpu) = Harness::compressed().parts();
     let blocks = |p: &Phase| p.cap.counters.compressed_blocks;
     assert!(
         blocks(&clean[0]) > 0,
@@ -2650,13 +2625,7 @@ const COMP_SLOTS: &[(usize, usize)] = &[(0, 0), (15, 1), (COMP_SKIP_TO, 3)];
 /// instead.
 #[test]
 fn the_compressed_region_is_read_exactly_where_the_selection_names_it() {
-    let Harness {
-        cfg,
-        d,
-        clean,
-        mut gpu,
-        ..
-    } = Harness::compressed();
+    let (cfg, d, clean, mut gpu) = Harness::compressed().parts();
     for p in &clean {
         gpu.step(&d, p);
     }
@@ -2822,20 +2791,12 @@ fn compressed_sweep() -> Vec<Defect> {
 /// `attention_matches_the_oracle_on_a_compressed_layer_in_both_phases`.
 #[test]
 fn each_compressed_defect_is_further_away_than_the_kernels_are() {
-    let Harness {
-        cfg,
-        model,
-        d,
-        clean,
-        mut gpu,
-        layer,
-        script,
-    } = Harness::compressed();
-    let mine: Vec<StepOut> = clean.iter().map(|p| gpu.step(&d, p)).collect();
-    let floor = reach(&clean, &mine);
+    let mut h = Harness::compressed();
+    let mine: Vec<StepOut> = h.clean.iter().map(|p| h.gpu.step(&h.d, p)).collect();
+    let floor = reach(&h.clean, &mine);
     println!(
         "compressed-layer kernel-vs-oracle floor: {floor} bf16 ULP over {} steps",
-        clean.len()
+        h.clean.len()
     );
 
     // No `sweep.len() == N` anti-drift record, deliberately: a new `Defect` variant is
@@ -2846,7 +2807,7 @@ fn each_compressed_defect_is_further_away_than_the_kernels_are() {
     // second thing to update.
     let mut worst: Option<(Defect, i32)> = None;
     for def in compressed_sweep() {
-        let r = reach(&drive_script(&cfg, &model, def, layer, &script), &mine);
+        let r = reach(&h.under(def), &mine);
         println!("  {def:<32?} reach={r} ULP");
         if worst.is_none_or(|(_, w)| r < w) {
             worst = Some((def, r));
