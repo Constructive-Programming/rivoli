@@ -2,6 +2,7 @@
 //! the `tokenizers` crate. Hand-rolling BPE would be the archetypal wheel to
 //! not reinvent; this is a 19 MB trained vocab.
 
+use crate::artifact::dsv4_encoding::{self, EncodeOpts, Message};
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use std::io::{self, Write};
@@ -69,7 +70,10 @@ impl serde_json::ser::Formatter for PythonSpacing {
     }
 }
 
-fn python_json(v: &Value) -> String {
+/// `pub(crate)` because `artifact::dsv4_encoding` needs the identical spacing for DeepSeek's
+/// tool schemas — its reference implementation renders them with the same `json.dumps`. A
+/// second copy would be a `build.rs` duplication error, and worse, a second thing to fix.
+pub(crate) fn python_json(v: &Value) -> String {
     let mut buf = Vec::new();
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, PythonSpacing);
     match serde::Serialize::serialize(v, &mut ser) {
@@ -312,6 +316,22 @@ impl Tokenizer {
             out.push(think_close);
         }
         Ok(out)
+    }
+
+    /// DeepSeek-V4's turn framing: build the prompt string with
+    /// [`crate::artifact::dsv4_encoding`], then tokenize it.
+    ///
+    /// **A string, not a token-id list, and that is the opposite of the GLM path above** —
+    /// which builds ids precisely so it does not depend on the tokenizer matching `[gMASK]`
+    /// inside a string. Here it must, because the reference implementation IS a string
+    /// producer. That rests on every framing token being an `added_tokens` entry;
+    /// `tests/v4_encoding.rs::special_tokens_survive_the_tokenizer` is the gate on the claim
+    /// and carries the argument.
+    ///
+    /// Called by `main.rs`'s V4 `-bench` branch, which encoded its prompt RAW until
+    /// 2026-08-06 — see the argument at that call site for what that cost.
+    pub fn encode_dsv4(&self, messages: Vec<Message>, opts: &EncodeOpts) -> Result<Vec<u32>> {
+        self.encode(&dsv4_encoding::encode_messages(messages, opts)?)
     }
 
     /// Encode prompt text to token ids with NO special tokens — raw continuation.

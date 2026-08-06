@@ -482,9 +482,11 @@ fn watchdog_secs() -> u64 {
 #[cfg(all(feature = "rocm", not(feature = "vulkan")))]
 fn run_v4(cfg: &Config, attn: &str, port: Option<u16>, no_mtp: bool) -> Result<()> {
     use rivoli::arch::Arch;
+    // Inside the function rather than at the top of the file: it then inherits this `cfg`
+    // instead of restating it, and a gate that cannot be restated cannot drift out of step.
+    use rivoli::artifact::dsv4_encoding::{EncodeOpts, Message, ThinkingMode};
     let arch = Arch::DeepseekV4;
-    let v4: rivoli::artifact::model::V4Config =
-        rivoli::artifact::model::load_config(&cfg.model)?;
+    let v4: rivoli::artifact::model::V4Config = rivoli::artifact::model::load_config(&cfg.model)?;
     info!(
         "model: {} ({}) — {} layers, hidden {}, {} heads x head_dim {}, {} experts top{}, \
          window {}, hc_mult {}, vocab {}",
@@ -541,22 +543,34 @@ fn run_v4(cfg: &Config, attn: &str, port: Option<u16>, no_mtp: bool) -> Result<(
     let ngen = cfg
         .bench
         .context("nothing to do: pass -bench <tokens> to decode")?;
+    // NOTE for anyone comparing against a V4 figure recorded before 2026-08-06: with the chat
+    // framing below, EOS is REACHABLE for the first time, so `-bench N` may now return fewer
+    // than N tokens where it always ran to the budget. tok/s divides by the tokens actually
+    // produced, so the rate stays comparable — the token count does not, and neither does the
+    // text, which was measured off-template.
 
     let tok = rivoli::artifact::tokenizer::Tokenizer::load(&cfg.model)?;
     let bench_prompt = cfg.prompt.as_deref().unwrap_or("The sky is blue because");
-    // **RAW, not chat-framed, and that is a gap rather than a choice.**
-    // `Tokenizer::encode_chat_turns` is a hand-port of GLM's `chat_template.jinja` down to the
-    // byte — `[gMASK] <sop> <|user|> …` — and none of those six literals exists in this
-    // tokenizer, so calling it would take its own `warn!`-and-raw-encode fallback. Doing that
-    // deliberately, with the reason, beats reaching a GLM-shaped path and being told about it in
-    // a warning that reads like a defect. The consequence is real and is the same one
-    // `encode_chat`'s doc names: outside an assistant turn, a turn-boundary EOS is unreachable,
-    // so a decode may run to `-bench` every time. V4's `chat_template.jinja` lives only in the
-    // fp8 SOURCE and `bin/convert_v4` does not copy it.
-    let prompt_ids = tok.encode(bench_prompt)?;
+    // CHAT-FRAMED. This was raw until 2026-08-06 and that was the whole of the "V4 repeats
+    // itself and never stops" defect: raw text puts the model outside any assistant turn, where
+    // it is doing document continuation and has no reason to emit `<｜end▁of▁sentence｜>` — so
+    // every decode ran to `-bench` and the first one emitted "The sky is blue because of
+    // Rayleigh scattering." three times over. EOS handling was never wrong. (Not
+    // `encode_chat_turns`: that is GLM's Jinja template, whose literals this tokenizer lacks.
+    // This checkpoint ships no template at all — `artifact::dsv4_encoding` ports the Python
+    // its README points at instead.)
+    //
+    // `Chat`, not `Thinking`: the prompt ends `<｜Assistant｜></think>`, closing the reasoning
+    // block before it opens so the model answers immediately. `Thinking` would end at an open
+    // `<think>` and spend the whole `-bench` budget reasoning — at V4 decode rates a benchmark
+    // would measure deliberation, not answering. Thinking is a PREFILL, not a flag.
+    let prompt_ids = tok.encode_dsv4(
+        vec![Message::user(bench_prompt)],
+        &EncodeOpts::new(ThinkingMode::Chat),
+    )?;
     info!(
-        "tokenizer: prompt {bench_prompt:?} -> {} tokens RAW (no chat template in a .f4 \
-         artifact); eos={:?}",
+        "tokenizer: prompt {bench_prompt:?} -> {} tokens, DeepSeek-V4 chat framing \
+         (<｜begin▁of▁sentence｜> … <｜User｜> … <｜Assistant｜></think>); eos={:?}",
         prompt_ids.len(),
         tok.eos
     );
@@ -586,7 +600,15 @@ fn run_v4(cfg: &Config, attn: &str, port: Option<u16>, no_mtp: bool) -> Result<(
     // NAMED deviations from the reference (the unclamped shared expert, and positional block
     // selection on the ratio-4 layers). A degeneration verdict on top of that would be a number
     // standing in for a gate. `tests/v4_loop.rs` is the gate.
-    info!("{bench_prompt}{}", tok.decode_all(&ids)?);
+    // Prompt and reply LABELLED and on separate lines. Concatenating them was right while the
+    // prompt was raw and the model was continuing a document; under chat framing `generate`
+    // returns the assistant's answer alone, and an answer normally restates the question — so
+    // `{bench_prompt}{reply}` printed "The sky is blue becauseThe sky is blue because of
+    // Rayleigh scattering", which is exactly the repetition signature this branch's framing
+    // comment says was fixed. This repo has burned three investigations on misread repetition
+    // (CLAUDE.md); a bench log must not manufacture a fourth. Review finding, 2026-08-06.
+    info!("prompt: {bench_prompt:?}");
+    info!("reply : {:?}", tok.decode_all(&ids)?);
     Ok(())
 }
 
