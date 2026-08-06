@@ -233,8 +233,9 @@ Rows = format mode, columns = cache policy. The grid is complete — these three
 all there are. (It once carried a fourth column for `top-m`, which was single-format only;
 `config.rs::validate` rejected `top-m` + `hybrid` outright. Both the policy and that
 validator are gone — `Config::validate` was an `Ok(())` stub after the retirement and was
-deleted 2026-08-01; `validate_backend`, which refuses `--mode int4|hybrid` under Vulkan,
-is a different function and is still live.)
+deleted 2026-08-01. A sibling `validate_backend` refused `--mode int4|hybrid` under Vulkan
+and outlived it by five days: it became an `Ok(())` stub when that backend was retired on
+2026-08-06 and was deleted the same day, for the same reason.)
 
 | | `lru` | `2q` *(default)* | `arc` |
 |---|---|---|---|

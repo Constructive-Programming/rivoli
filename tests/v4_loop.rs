@@ -246,9 +246,10 @@
 //! re-derived through THIS gate rather than through a host transcription — which is the one
 //! weakness the derivation still has. `Defect::ALL` already enumerates the breakages.
 
-// `rocm`, not `any(rocm, vulkan)`: `v4gpu` is `rocm`-gated because every launcher it drives is
-// `backend::hip`'s. Nothing here claims a Vulkan parity that has not been measured, which is
-// `tests/kernel_coverage.rs`'s standing rule for this port.
+// `rocm`: `v4gpu` is `rocm`-gated because every launcher it drives is `backend::hip`'s, and
+// since 2026-08-06 that is the only backend. The rule this used to cite by name
+// (`tests/kernel_coverage.rs`, deleted with the Vulkan backend) is worth stating directly,
+// because it outlived its enforcer: do not add stubs that claim a parity nothing measured.
 #![cfg(feature = "rocm")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 

@@ -519,7 +519,8 @@ pub struct Geom {
 // size-invariant. What the guard cannot catch is a field being ADDED, REMOVED, or changed
 // WIDTH on one side only, because then the two structs are different objects and the guard
 // is reading whichever bytes happen to line up. These two catch that, at the file where the
-// edit was made. `backend/vk.rs`'s `ExpertDesc` assert is the same idiom.
+// edit was made. (`backend/vk.rs`'s `ExpertDesc` assert was the same idiom until that file
+// was deleted 2026-08-06; `src/backend/hip.rs`'s `ExpertDesc` carries it now.)
 const _: () = assert!(
     size_of::<GeomAbi>() == 28 && align_of::<GeomAbi>() == 4,
     "GeomAbi must stay six i32 and one f32 — the layout kernels/v4compress.hip's V4Comp declares"

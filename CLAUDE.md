@@ -1,9 +1,10 @@
 # rivoli — orientation for agents
 
 GLM-5.2 MoE decode engine. 78 layers (3 dense, 75 MoE), 256 experts top-8, hidden 6144,
-vocab 154880. AMD Strix Halo gfx1151, unified LPDDR5 via GTT. Rust + HIP/ROCm, with a
-second Vulkan backend. The routed experts do not fit in memory, so they stream from NVMe
-while the resident ones compute — that overlap is the whole design.
+vocab 154880. AMD Strix Halo gfx1151, unified LPDDR5 via GTT. Rust + HIP/ROCm — one
+backend; a second, Vulkan, was retired 2026-08-06. The routed experts do not fit in memory,
+so they stream from NVMe while the resident ones compute — that overlap is the whole
+design.
 
 ## Read this before opening anything in `docs/`
 
@@ -33,7 +34,7 @@ agrees. If you change a verdict, change both; the test will tell you which one y
 | speculative decode | on by default, **1.108×** via `--mtp-min-conf 0.8` (ungated it is 0.93–0.95×, a loss). All modes carry the head since 2026-07-31 |
 | LOOKA hints (`--hint-k`) | **DELETED 2026-07-31** — measured inert (0.9% of evictions, ≤+0.1pp hit). `docs/investigations/cross-layer-prefetch.md` keeps the record |
 | `top-m` routing | **RETIRED**, removed from the engine |
-| Vulkan | decodes `--mode int3-vq` with `--attn dense` **or `streaming`** (they share the ported attention path); 16 of 29 kernels; 6 more are single-row, so **speculation is off there** — `main` downgrades and says so. `--mode int4/hybrid` and `--attn dsa/misa` refuse at startup. Measured by `tests/mode-matrix.sh`: 6 of 36 cells decode, 30 refuse. ~1.9× slower |
+| Vulkan | **RETIRED 2026-08-06** — classified an unfinished port, not a feature. At retirement: 6 of 36 mode-matrix cells decoded and 30 refused, 16 of 29 kernels, ~1.9× slower, no DeepSeek-V4 path at all. Preserved at tag `archive/vulkan-backend-hb16`; `docs/investigations/vulkan-kernels.md` keeps the inventory. **`rocm` is the only backend** — there is no `--features vulkan` |
 | MoE accumulation | fixed-point (`MOE_ACC_SHIFT 44`), no cross-stream join |
 | layer-major prefill | **default since 2026-08-03** (flag deleted; `--trace` falls back to token-major): prefill **2.15×**, reads **159.56 → 28.20/token** (the floor), output byte-identical, every `--attn` mode. Decode pays a ONE-OFF ~2.7 s warm-up (1.8% of the prefill saving; the "1.55× slower decode" reading is a 13-pass artifact). Closing the sweep token-major was tried and **reverted** — useless. `architecture.md` §14 |
 
@@ -44,10 +45,10 @@ agrees. If you change a verdict, change both; the test will tell you which one y
 cargo test --features rocm                   # 100 tests
 
 # BENCHMARKS and performance evaluation ONLY.
-cargo build --release --features rocm        # or --features vulkan; NEVER both
+cargo build --release --features rocm        # the only backend
 cargo test  --release --features rocm        # HANGS intermittently — see below; sweep per-binary
-tests/feature-matrix.sh                      # every feature combo compiles (~34 cells, no GPU)
-tests/mode-matrix.sh <artifact>              # mode x policy x attn under BOTH backends (~105 min, GPU)
+tests/feature-matrix.sh                      # every feature combo compiles (18 cells, no GPU)
+tests/mode-matrix.sh <artifact>              # mode x policy x attn, 36 cells, all decode (~90 min, GPU)
 
 cargo clippy --release --features rocm --all-targets
 # Before you claim a change compiles, ALSO run the union — see below.
@@ -82,15 +83,20 @@ command passed, because nothing built it. Add the union run to any change that t
 > There is: `.github/workflows/ci.yml`, gated since `5ef1f9a`. What it actually runs is
 > narrower than "CI exists" and is the useful thing to know —
 >
+> **UPDATED 2026-08-06:** the `vulkan` job went with the backend, so there is ONE job.
+>
 > | job | runs |
 > |---|---|
-> | `host` | `cargo fmt --check`; a proof that the jscpd gate is *armed*; `clippy --release --locked --all-targets`; `cargo test --release --locked` — both **featureless** |
-> | `vulkan` | `clippy --features vulkan`; `clippy --features vulkan,otlp,teacher-forcing,pred-probe,trace` (**the union, on Vulkan**); `cargo test --features vulkan` over `docs`, `invariants`, `kernel_coverage`, `glsl_numerics` only |
+> | `host` | `cargo fmt --check`; a proof that the jscpd gate is *armed*; `clippy --release --locked --all-targets`; `clippy --features otlp,teacher-forcing,pred-probe,trace --all-targets`; `cargo test --release --locked` — all **featureless** |
 >
 > So **there is no `rocm` arm and no GPU arm at all.** Every `--features rocm` build, every
 > HIP kernel, and every device test is checked exactly as often as someone runs it here. The
-> union-clippy instruction above stands — CI runs the union only against `vulkan`, so the
-> `rocm` union is genuinely unchecked. And `cargo fmt --check` **is** gated, so a change that
+> featureless union step does cover `mod otlp` (gated on its own feature, with no backend in
+> the cfg — that is the E0609 class, and it is now watched). **`src/eval.rs` is
+> `all(teacher-forcing, rocm)`, so no CI job compiles it** — but CI never had a rocm arm to
+> lose, and the local union run below is its real and prescribed coverage. The
+> union-clippy instruction above stands and is now the only thing
+> that checks it. And `cargo fmt --check` **is** gated, so a change that
 > adds rustfmt violations breaks CI even though nothing local reports it; the tree has since
 > drifted, so fix only the hunks your diff touches and leave a tree-wide reformat to its own
 > `style:` commit rather than burying it in a feature change.
@@ -107,11 +113,17 @@ mechanism is the reporter's diagnosis and is not independently confirmed.) The l
 not depend on the cause: **clippy-green is not duplication-green.** Run something that
 actually re-runs `build.rs` before claiming a change is clone-free. The same reporter hit it
 twice more, both times on real clones **rustfmt had created** by reflowing calls that gained
-a seventh argument — so a mechanical formatting pass can manufacture duplication. Twelve regions are exempt via `jscpd:ignore-start`, each
-carrying its argument in place — the two backends' ABI walls, `math.rs`'s frozen
-`route_into_pre` oracle, and `glsl_numerics.rs`'s transliterations. Being a verbatim copy
-is the POINT in all three; everywhere else, factor it. jscpd is skipped with a warning if
-`npx` is absent, so the crate still builds without Node.
+a seventh argument — so a mechanical formatting pass can manufacture duplication. **Eight**
+regions are exempt via `jscpd:ignore-start`, down from fourteen on 2026-08-06. Two went with
+`glsl_numerics.rs`; the other **four were deleted because their entire argument named a file
+the Vulkan retirement removed** — `gpustream.rs`'s `Stream::raw` ("mirrors
+`vkstream::Stream::raw`"), its `Timeline` Send/Sync twin, its INV-4 half, and `gpu.rs`'s
+launcher import list. jscpd was re-run without each: still 0 clones, so they were suppressing
+nothing. **A stale exemption is a hole in the gate** — when the justification names a deleted
+file, delete the exemption rather than rewording it. The survivors each carry their argument
+in place: the HIP ABI wall (two regions), `math.rs`'s frozen `route_into_pre` oracle, and
+`v4oracle/numerics.rs`'s transliterations. Being a verbatim copy is the POINT in each; everywhere else, factor it.
+jscpd is skipped with a warning if `npx` is absent, so the crate still builds without Node.
 
 `src/` is grouped by subsystem — `artifact/ memory/ fetch/ backend/` plus `gpu math attn
 indexer telemetry watchdog eval` at top level. See `docs/reference/architecture.md` §11.

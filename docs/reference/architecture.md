@@ -281,8 +281,9 @@ sequenceDiagram
   local tokio current-thread runtime until 2026-08-01; it is now `backend.rs`'s 15-line
   park/unpark loop. Same shape, same guarantee, one fewer dependency tree.)*
 - **The reaper is the only other thread** (`src/fetch/asyncfetch.rs`). It owns the demand ring
-  and a dedicated fetch stream (`backend::Stream::fetch()` — a `hipStream_t` under `rocm`, a
-  third `VkQueue` with its own ring and timeline under `vulkan`); it queues+submits the batch,
+  and a dedicated fetch stream (`backend::Stream::fetch()` — a `hipStream_t`; the retired
+  Vulkan backend used a third `VkQueue` with its own ring and timeline, which is why the
+  role is named rather than assumed); it queues+submits the batch,
   reaps completions one-by-one, and arms each read's `Signal` on the fetch stream *after*
   kicking its bounce→slot copy — so `load(e)` resolves when the **copy** lands, not merely
   the NVMe read. A cache **hit** never enters here; its load is `Signal::ready()`.
@@ -331,8 +332,9 @@ flowchart LR
 
   **Mind the primitive.** `hipStreamWaitEvent` captures an event's state at ENQUEUE time, so
   a wait enqueued before the producer records is a silent no-op — and enqueueing up front is
-  the entire point. HIP uses `hipStreamWaitValue64`; Vulkan attaches the wait to a submit.
-  Both are tested (INV-4), per backend, because they reach the property differently.
+  the entire point. HIP uses `hipStreamWaitValue64` (the retired Vulkan backend attached the
+  wait to a submit — a different mechanism reaching the same property, which is why INV-4 is
+  stated as a property rather than as a call). Tested by INV-4.
 
   **Residents are launched FIRST, and that ordering is load-bearing.** The compute stream is
   FIFO, so enqueueing in `sel` order puts every resident expert behind the first miss's wait
@@ -349,8 +351,8 @@ flowchart LR
   layer-with-misses (a 1-miss layer costs +145 µs over 0-miss at baseline, +527 µs here).
   That is wake latency on the wait — the GPU notices the value later than a host-func
   callback did. Recovering it needed the misses off the critical stream (multiple compute
-  queues; Vulkan already has three), not a cheaper wait — which is what the miss stream
-  below does.
+  queues — the retired Vulkan backend already had three), not a cheaper wait — which is what
+  the miss stream below does.
 - **Fixed-point accumulation, and NO join (§12).** Every expert `atomicAdd`s
   `round(w·down·h · 2^44)` as an i64 into a shared row instead of writing its own f32 partial
   row. Integer addition associates, so completion order cannot reach the result and the
@@ -546,9 +548,9 @@ different populations. Numbering converts "the doc drifted" into something a che
 > expert identity rather than to residency, which changes what `hybrid` *is* (its whole
 > premise is "hot experts get the better format"), so it is a design call rather than a
 > patch. No INV-n is claimed here because no invariant currently holds.
-| **INV-4** | A device-side wait may be enqueued BEFORE its producer exists and still waits (the property `hipStreamWaitEvent` lacks) — one half per backend, since they reach it by different mechanisms | `gpustream.rs::inv_4_wait_enqueued_before_signal_still_waits`, `tests/vk.rs::inv_4_…` |
+| **INV-4** | A device-side wait may be enqueued BEFORE its producer exists and still waits (the property `hipStreamWaitEvent` lacks) | `gpustream.rs::inv_4_wait_enqueued_before_signal_still_waits` (a second half lived in `tests/vk.rs` until the Vulkan backend was retired 2026-08-06) |
 | **INV-5** | An expert cannot be launched without enqueueing its data dependency: every descriptor carries a `Ticket` and `wait_on` is the only way to consume one | `pin.rs::inv_5_every_descriptor_carries_a_ticket` |
-| **INV-6** | A wait can always be released from the HOST, so a producer that dies owing a ticket cannot hang the device — one half per backend (HIP: monotone CAS into signal memory; Vulkan: `vkSignalSemaphore`) | `gpustream.rs::inv_6_a_host_release_retires_an_enqueued_wait`, `tests/vk.rs::inv_6_…` |
+| **INV-6** | A wait can always be released from the HOST, so a producer that dies owing a ticket cannot hang the device (HIP: monotone CAS into signal memory) | `gpustream.rs::inv_6_a_host_release_retires_an_enqueued_wait` (the Vulkan half, `vkSignalSemaphore`, went with that backend 2026-08-06) |
 | **INV-7** | On V4, a compressed block's destination row is a pure function of its POSITION — `window_size + start_pos / ratio`, never "the next free slot" — in both coordinate systems the layer loop writes | `v4gpu.rs::inv_7_a_compressed_blocks_row_is_a_pure_function_of_its_position`, `tests/v4_compress.rs::compress_dst_is_positional_…` |
 
 INV-7 is the V4 layer loop's, and it is **two halves like INV-4 and INV-6** — for a different
@@ -651,25 +653,29 @@ module root (`src/<group>.rs`) over a directory, so the tree mirrors the section
   architectures' pins that own a `RoutedPool` each). §1, §6.
 - **`fetch/`** — getting cold bytes to the device without the GPU waiting. `stream`
   (io_uring O_DIRECT streamer), `asyncfetch` (the reaper + the ticketed dataflow). §3, §4.
-- **`backend/`** — the build-time waist (`rocm` XOR `vulkan`, one impl chosen at compile
-  time, no vtable). `src/backend.rs` is the seam itself; `hip`/`gpustream` and
-  `vk`/`vkstream` are the two implementations under it. `gpu`, `memory::pin`,
-  `fetch::asyncfetch` and `fetch::stream` import the seam, never a backend directly. Vulkan
-  decodes `--mode int3-vq --attn dense` over three queues with the overlap intact
-  (established by increment 1 vs 2, not by the retracted 96/97% figures — §3), ~1.9x slower
-  end to end, all of it MoE kernel throughput; its
-  `.comp` shaders are SINGLE-ROW, so six launchers refuse `nrow > 1` and speculative decode
-  is ROCm-only (§13). See `docs/investigations/vulkan-port.md`.
+- **`backend/`** — the build-time waist (`rocm`, one impl chosen at compile time, no
+  vtable). `src/backend.rs` is the seam itself; `hip`/`gpustream` are the implementation
+  under it. `gpu`, `memory::pin`, `fetch::asyncfetch` and `fetch::stream` import the seam,
+  never a backend directly. **A waist with one thing behind it is deliberate**: it is what
+  keeps `HipStream` out of every module above, and `lib.rs` gates the whole module on `rocm`
+  so the featureless build still compiles.
+  > **RETIRED 2026-08-06.** A second implementation, `vk`/`vkstream`, sat behind this seam
+  > until the Vulkan backend was deleted — it decoded `--mode int3-vq --attn dense` over
+  > three queues with the overlap intact, ~1.9x slower end to end (all of it MoE kernel
+  > throughput), and its `.comp` shaders were SINGLE-ROW, so six launchers refused
+  > `nrow > 1` and speculative decode was ROCm-only (§13). Tag
+  > `archive/vulkan-backend-hb16`; `docs/investigations/vulkan-kernels.md`.
 - **Top level** — `gpu` (the async forward pass, single- or two-row: `MAXROW`, §13), `math`,
   `attn`/`indexer` (attention modes + DSA), `telemetry` (the always-on PROFILE summary,
   plus the `otlp` feature below), `watchdog`.
 - **Top level, DeepSeek-V4 only** — `v4gpu` (its layer loop: `gpu`'s counterpart, not a branch
   inside it, because the two share no per-layer step), `v4compress` (the KV compressor and the
   sparse indexer's host half), `v4oracle` (the CPU transliteration S2/S3 are scored against).
-  `v4gpu` is **`rocm`-only** where `gpu` is `any(rocm, vulkan)`: every launcher it drives is
-  `backend::hip`'s and `backend/vk.rs` has no `v4_*` twin, so a Vulkan build refuses a V4 artifact
-  at startup rather than carrying stubs that would claim an unmeasured parity. `v4compress`'s host
-  half and `v4oracle` are ungated — see `src/lib.rs` for each argument.
+  `v4gpu` is **`rocm`-only**, as is `gpu` — since 2026-08-06 that is the only backend, but the
+  gate predates it: every launcher `v4gpu` drives is `backend::hip`'s, the Vulkan backend had
+  no `v4_*` twin, and "no V4 decode path at all" was one of the measured reasons it was
+  retired rather than finished. `v4compress`'s host half and `v4oracle` are ungated — see
+  `src/lib.rs` for each argument.
 - **`--features otlp`** — exports the same intervals the PROFILE summary sums as real OTLP
   spans and metrics, one emission at run end. Off by default: the opentelemetry stack is
   heavy, and the rule that keeps instruments out of a stock binary applies here as it does
@@ -685,7 +691,7 @@ module root (`src/<group>.rs`) over a directory, so the tree mirrors the section
   no async runtime, one request per connection, one request at a time. That is a consequence
   of the engine, not a shortcut — the GPU is sole-tenant and the decode is ~3 tok/s, so a
   connection pool would queue exactly what the device already serialises. Its cfg is
-  `any(rocm, vulkan, test)` rather than the usual backend pair: HTTP framing, the multi-turn
+  `any(rocm, test)` rather than the plain backend gate: HTTP framing, the multi-turn
   chat template and the streaming detokenizer are host code, and the featureless build is
   the one CI runs, so the half worth testing is the half that has no backend. **Its one
   non-obvious coupling is the `watchdog`**: an idle server produces no tokens, so it beats
@@ -713,8 +719,9 @@ module root (`src/<group>.rs`) over a directory, so the tree mirrors the section
   rather than a boundary. Measures the pre-attention router's recall (§3's prefetch
   question). The flag is what a `docs/measurement/benchmarks.md` entry can record; the feature is what keeps
   a blocking per-layer D2H out of a shipped binary.
-- `kernels/*.hip` — moe, mla, attn, linalg, indexer, fwd, async, vmm (HIP/rocm).
-  `kernels/vk/*.comp` → SPIR-V via the `build.rs` vulkan arm (the second backend).
+- `kernels/*.hip` — moe, mla, attn, linalg, indexer, fwd, async, vmm (HIP/rocm). A
+  `kernels/vk/*.comp` set compiled to SPIR-V via a `build.rs` vulkan arm until 2026-08-06;
+  both are gone with the backend.
 - `src/bin/` — `convert`, `convert_v4`, `fp8_to_i4`, `add_indexer`, `ppl`, `replay`,
   `v4-oracle`. (There is no `pack_i4`, no longer a `vq3_to_i4`, and no longer an `i4_audit`
   — retired 2026-08-05, preserved at tag `archive/i4-audit`, with the why and the restore
@@ -843,8 +850,9 @@ regression would be charging a workload change to a code change.
   >
   > **The reasoning above stays, because it is why the reduce had to go**, and
   > `moe_acc_drain.comp`'s header carries the same argument beside the code.
-- Vulkan: `shaderBufferInt64Atomics` is now a REQUIRED device feature (gfx1151 has it), and
-  `missing_features` names it. `GL_EXT_shader_atomic_int64` in `moe_down_vq.comp`.
+- Vulkan (**retired 2026-08-06**, kept because it records what the arithmetic demanded of a
+  second API): `shaderBufferInt64Atomics` was a REQUIRED device feature (gfx1151 has it) and
+  `missing_features` named it. `GL_EXT_shader_atomic_int64` in `moe_down_vq.comp`.
 - `moe_ev_start`/`_end` still bracket honestly. `_end` records on an idle compute stream
   after BOTH streams are awaited, so it covers the miss stream's experts too. This was the
   flagged risk — a bracket that quietly narrows when work moves off the stream it spans is
@@ -1032,8 +1040,10 @@ weight read. That single term was the whole error; `docs/measurement/benchmarks.
 ### Refused rather than half-supported
 
 Tracing (a verify pass routes twice per layer and submits the union, which the v2 trace
-format cannot spell), and every batched launcher on Vulkan. `main` resolves the tracing case
-by downgrading to sequential decode and saying so, rather than failing.
+format cannot spell). It ALSO applied to every batched launcher on Vulkan, whose `.comp`
+shaders were single-row — that clause died with the backend on 2026-08-06, and with it the
+compile-time `batched_rows` gate in `main`. `main` resolves the tracing case by downgrading
+to sequential decode and saying so, rather than failing.
 
 **No attention mode is on this list any more.** All four batch their row selection — see the
 correction below, and the one under it for streaming.

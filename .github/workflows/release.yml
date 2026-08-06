@@ -90,9 +90,12 @@ jobs:
       # so a rebooted runner fails this step instead of racing interactive work — restore
       # with `sudo install -m 666 -o "$USER" /dev/null /run/sys-gpu.lock`.
       #
-      # `--test-threads=1` is not tidiness: tests/vk.rs:186 documents that VALIDATION_ERRORS
-      # is process-global, so under parallel threads a message caused by one test fails
-      # whichever test reads the counter next and names the wrong one.
+      # `--test-threads=1` is not tidiness. libtest runs #[test]s in parallel and each device
+      # test builds its own tier, pool and io_uring ring; the tell in /proc/<pid>/task/*/wchan
+      # is four io_sq_threads. Serialised, the same suite goes from a 12-minute hang to 3.52 s
+      # (CLAUDE.md, "Measurement discipline"). This used to cite tests/vk.rs:186 and a
+      # process-global VALIDATION_ERRORS counter; that file went with the Vulkan backend on
+      # 2026-08-06, and the io_uring reason is the stronger one and applies to every arm.
       - name: Test on the device (sole-tenant, under the shared lock)
         run: |
           flock /var/run/sys-gpu.lock \

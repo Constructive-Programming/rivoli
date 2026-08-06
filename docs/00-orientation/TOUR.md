@@ -6,8 +6,8 @@ verdict: New here? Read this and stop. The engine in two pages, plus the five th
 # rivoli — the two-page tour
 
 A decode engine for **GLM-5.2**, a 78-layer mixture-of-experts model, running on one **AMD
-Strix Halo** APU (gfx1151, 40 CUs, unified LPDDR5). Rust, with HIP/ROCm as the primary
-backend and a second Vulkan one.
+Strix Halo** APU (gfx1151, 40 CUs, unified LPDDR5). Rust, on HIP/ROCm — the only backend
+since a second, Vulkan, was retired 2026-08-06 (`docs/investigations/vulkan-kernels.md`).
 
 ## The one fact the whole design follows from
 
@@ -81,7 +81,7 @@ Read [`reference/architecture.md`](../reference/architecture.md) for the real ve
 ## Build and test
 
 ```bash
-cargo build --release --features rocm        # or --features vulkan; NEVER both
+cargo build --release --features rocm        # the only backend
 flock /var/run/sys-gpu.lock -c 'cargo test --release --features rocm'
 cargo clippy --release --features rocm --all-targets
 ```

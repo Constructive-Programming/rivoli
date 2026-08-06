@@ -144,11 +144,21 @@ fn the_feature_matrix_covers_every_cargo_feature() {
          declared: {declared:?}\n  matrix:   {covered:?}"
     );
 
-    // The decode sweep runs under the BACKEND features specifically — they are the pair
-    // that changes which kernels exist, so a cell can pass on one and not compile on the
-    // other. That is not hypothetical: `--features vulkan` stopped compiling the day
-    // `prefill_layer_major` started calling a `copy_out_raw` the Vulkan `DeviceBuf` only
-    // had under `trace`, and the prescribed `rocm,...,trace` union could never have shown it.
+    // The decode sweep runs under the BACKEND features specifically — they are what changes
+    // which kernels exist, so a cell can pass on one backend and not compile on another.
+    // That was not hypothetical: `--features vulkan` stopped compiling the day
+    // `prefill_layer_major` started calling a `copy_out_raw` the Vulkan `DeviceBuf` only had
+    // under `trace`, and the prescribed `rocm,...,trace` union could never have shown it.
+    //
+    // Both lists hold one entry since 2026-08-06, but this compares TWO DIFFERENT FILES, so
+    // it can still fire: the way to break it is to edit one script's `BACKENDS` and not the
+    // other's. It costs nothing and keeps the two scripts' notion of a backend welded
+    // together. (An earlier version of this comment claimed the assertion was vacuous. It is
+    // not, and saying so was an invitation to delete a live check.)
+    //
+    // The assertion above it — BACKENDS ∪ OPTIONAL == Cargo.toml's [features] — is the one
+    // that did the work here: it made deleting the `vulkan` feature a test failure until
+    // both scripts were updated.
     assert_eq!(
         script_array(&sh, "BACKENDS"),
         script_array(&read("tests/mode-matrix.sh"), "BACKENDS"),

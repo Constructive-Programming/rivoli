@@ -15,7 +15,7 @@
 //! streams the expert in via io_uring O_DIRECT (`.vq3`/`.i4` block = one aligned read).
 //!
 //! Needs a backend (`rocm` or `vulkan`): without a device there is nothing to pin.
-#![cfg(any(feature = "rocm", feature = "vulkan"))]
+#![cfg(feature = "rocm")]
 
 use crate::artifact::config::Mode;
 use crate::artifact::format::{

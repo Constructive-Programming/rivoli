@@ -127,14 +127,16 @@ impl HipStream {
         Self::new()
     }
 
-    // jscpd:ignore-start — mirrors `vkstream::Stream::raw`. Same name, same signature,
-    // different body (a HIP stream handle here, a `Q` tag there); `backend.rs` cfg-selects
-    // one of the two under the SAME path, so the signature is the contract.
+    // A duplication-gate exemption wrapped this until 2026-08-06 and was removed with the
+    // Vulkan backend. Its whole argument was "mirrors `vkstream::Stream::raw` — same name,
+    // same signature, different body; `backend.rs` cfg-selects one of the two under the SAME
+    // path, so the signature is the contract." There is no second implementation to mirror,
+    // so it was suppressing nothing: jscpd was re-run without it and still reports 0 clones.
+    // A stale exemption is a hole in the gate, which is why it went rather than being reworded.
     #[inline]
     pub fn raw(&self) -> *mut c_void {
         self.0
     }
-    // jscpd:ignore-end
 }
 
 impl Drop for HipStream {
@@ -241,15 +243,15 @@ mod tests {
 /// is free once `completed() >= release[i]`.
 pub struct Timeline(*mut c_void);
 
-// jscpd:ignore-start — the twin `unsafe impl Send/Sync for Timeline` in `vk.rs` is two
-// lines over a DIFFERENT type, discharged by a different argument (Vulkan semaphores are
-// internally synchronised for wait/signal/query). Two types cannot share one impl.
+// A duplication-gate exemption covered these two lines until 2026-08-06; its argument was
+// that the twin `unsafe impl Send/Sync for Timeline` in `vk.rs` was two lines over a
+// DIFFERENT type. There is no twin now, so it was suppressing nothing — re-measured with it
+// removed: 0 clones.
 //
 // SAFETY: the counter is device signal memory; the HIP calls that touch it are
 // stream-ordered and internally synchronised, and Rust-side access is an atomic load.
 unsafe impl Send for Timeline {}
 unsafe impl Sync for Timeline {}
-// jscpd:ignore-end
 
 impl Timeline {
     pub fn new() -> Result<Self> {
@@ -363,14 +365,12 @@ mod timeline_tests {
         let s = HipStream::new().expect("stream");
         // The wait goes in first, against a value NOTHING on any stream will ever signal —
         // this is the dead-producer case, not a race with a slow one.
-        // jscpd:ignore-start — INV-4's two halves. `tests/vk.rs` asserts the SAME property
-        // against the Vulkan timeline, and the assertions are identical because the
-        // invariant is: a wait enqueued before anything signals must still retire, and a
-        // release must never move a timeline backwards. `rocm` and `vulkan` are mutually
-        // exclusive features, so there is no module where one copy could compile for both —
-        // a shared helper is not available at any price. Same category as the ABI walls in
-        // hip.rs/vk.rs, and the reason INV-4 is registered once in architecture.md §8b
-        // while being tested twice.
+        // INV-4 had two halves until 2026-08-06: `tests/vk.rs` asserted the SAME property
+        // against the Vulkan timeline, and a duplication-gate exemption sat here because the
+        // two assertions were necessarily identical and no module could host a shared helper
+        // for mutually exclusive features. One half remains, so the exemption went with the
+        // other — re-measured without it: 0 clones. INV-4 is still registered once in
+        // architecture.md §8b, and is now tested once.
         t.wait(s.raw(), 7)
             .expect("wait enqueues against a value no stream will write");
         t.release(7);
@@ -387,7 +387,6 @@ mod timeline_tests {
             7,
             "release must never move a timeline backwards"
         );
-        // jscpd:ignore-end
     }
 
     /// Values only move forward, and `completed()` observes them without a sync — the

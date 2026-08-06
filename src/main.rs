@@ -1,6 +1,5 @@
 //! rivoli — GLM-5.2 MoE decode engine (routed experts int3-vq/int4/hybrid; the default is
-//! hybrid on `rocm` and int3-vq on `vulkan`, whose int4 kernels are not ported — see
-//! docs/reference/modes.md and `config::Mode`). The artifact IS the model: point
+//! hybrid — see docs/reference/modes.md and `config::Mode`). The artifact IS the model: point
 //! `rivoli` at a converted artifact directory (manifest.json + codebooks.f32 +
 //! resident.safetensors + `L{ll}.vq3` + tokenizer) and it decodes on device.
 //!
@@ -12,11 +11,11 @@ use anyhow::{Result, bail};
 // The decode path's imports and helpers. A featureless build compiles this file down to
 // the refusal stub in `main` (see there for why the binary still builds at all), so
 // everything only the real `main` reaches is gated with it rather than left to warn.
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 use anyhow::Context;
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 use rivoli::artifact::config::Config;
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 use tracing::info;
 
 // NOTE: doc comments on this struct and its fields are USER-FACING — clap renders them as
@@ -44,7 +43,7 @@ use tracing::info;
     version,
     // Architecture-neutral since the engine gained a second one: naming GLM here made the
     // bare help contradict `rivoli <v4-artifact> --help` two lines later.
-    about = "MoE decode engine (HIP/ROCm or Vulkan). Architectures: glm-moe-dsa, deepseek-v4.\n\
+    about = "MoE decode engine (HIP/ROCm). Architectures: glm-moe-dsa, deepseek-v4.\n\
              Flags marked ARCHITECTURE-DEPENDENT resolve against the artifact: run\n\
              `rivoli <artifact> --help` for the ones that model actually admits."
 )]
@@ -89,8 +88,8 @@ struct Args {
     #[arg(long)]
     think: bool,
 
-    /// Routed-expert format. Default: hybrid on rocm, int3-vq on vulkan (whose int4
-    /// kernels are not ported) — see docs/reference/modes.md and `config::Mode`.
+    /// Routed-expert format. Default: hybrid — see docs/reference/modes.md and
+    /// `config::Mode`.
     #[arg(long, default_value_t, value_parser = rivoli::artifact::config::Mode::parse)]
     mode: rivoli::artifact::config::Mode,
 
@@ -192,11 +191,12 @@ struct Args {
 
     /// Write the generated token ids, one per line.
     ///
-    /// For **gate A** of the Vulkan acceptance gate (docs/investigations/vulkan-port.md): agreement on token
-    /// IDs for K tokens. Comparing decoded TEXT is not a substitute — different id
-    /// sequences can decode to identical text, so a text diff reports only a lower bound
-    /// on divergence. Gate A is a standing obligation across commits, so it needs an
-    /// instrument rather than an eyeball.
+    /// Written for **gate A** of the Vulkan acceptance gate (`archive/vulkan-backend-hb16`,
+    /// docs/investigations/vulkan-kernels.md): agreement on token IDs for K tokens. That
+    /// backend is retired, but the instrument outlived it and the argument is general —
+    /// comparing decoded TEXT is not a substitute, because different id sequences can decode
+    /// to identical text, so a text diff reports only a lower bound on divergence. Any
+    /// two-arm comparison across a refactor wants this rather than an eyeball.
     #[arg(long, value_name = "PATH")]
     dump_ids: Option<String>,
 
@@ -401,7 +401,7 @@ fn artifact_resolved_help(argv: &[String]) -> bool {
 
     use clap::CommandFactory;
     let mut cmd = Args::command().about(format!(
-        "rivoli — {} decode engine (HIP/ROCm or Vulkan)\nArchitecture: {} — {}",
+        "rivoli — {} decode engine (HIP/ROCm)\nArchitecture: {} — {}",
         arch.name(),
         arch.name(),
         arch.summary()
@@ -435,7 +435,7 @@ fn artifact_resolved_help(argv: &[String]) -> bool {
     true
 }
 
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 /// Does the artifact carry resident DSA indexer weights? (`auto` picks `dsa` iff so AND the
 /// backend has the indexer kernels — see [`resolve_attn`].)
 /// Checks layer 0's `wk` — `indexer_layout` guarantees layer 0 is a full layer, so
@@ -449,28 +449,22 @@ fn artifact_has_indexer(model_dir: &str) -> bool {
 
 /// Resolve `--attn` (with `auto` → dsa/dense by artifact contents) into an `AttnMode`.
 ///
-/// `auto` ALSO asks what the backend can run. The Vulkan build has none of the five DSA
-/// indexer kernels, so `auto` resolving to `dsa` on an artifact that carries indexer weights
-/// made a bare `rivoli <model>` fail on its own default — the second of the two ways it did.
-/// `cfg!` rather than `#[cfg]` so both arms keep compiling on both backends and
-/// `artifact_has_indexer` is still called (and still reported) either way: the reason for
-/// the choice is worth logging, since "auto picked dense" is otherwise indistinguishable
-/// from "this artifact has no indexer".
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+/// `auto` used to ALSO ask what the backend could run: the Vulkan build had none of the five
+/// DSA indexer kernels, so `auto` resolving to `dsa` on an artifact carrying indexer weights
+/// made a bare `rivoli <model>` fail on its own default. That backend was retired 2026-08-06
+/// and the only remaining one has every kernel, so the question is now purely about the
+/// artifact.
+///
+/// The reason for the choice is still logged: "auto picked dense" is otherwise
+/// indistinguishable from "this artifact has no indexer".
+#[cfg(feature = "rocm")]
 fn resolve_attn(a: &Args) -> Result<rivoli::attn::AttnMode> {
     use rivoli::attn::AttnMode;
     let mode = if a.attn == "auto" {
-        match (artifact_has_indexer(&a.model), cfg!(feature = "vulkan")) {
-            (true, false) => "dsa",
-            (true, true) => {
-                eprintln!(
-                    "--attn auto: the artifact carries DSA indexer weights, but this is a \
-                     Vulkan build and the lightning-indexer kernels are not ported \
-                     (docs/investigations/vulkan-port.md) — resolving to `dense`. Use --features rocm for dsa."
-                );
-                "dense"
-            }
-            (false, _) => "dense",
+        if artifact_has_indexer(&a.model) {
+            "dsa"
+        } else {
+            "dense"
         }
     } else {
         a.attn.as_str()
@@ -501,13 +495,12 @@ fn resolve_attn(a: &Args) -> Result<rivoli::attn::AttnMode> {
 ///
 /// `parse_args` still runs, so `--help` and flag validation work in a featureless build —
 /// which is the one useful thing it can do.
-#[cfg(not(any(feature = "rocm", feature = "vulkan")))]
+#[cfg(not(feature = "rocm"))]
 fn main() -> Result<()> {
     let _ = parse_args();
     bail!(
         "rivoli was built with NO compute backend and cannot decode. Rebuild with \
-         `--features rocm` (HIP/ROCm) or `--features vulkan` — exactly one; they are \
-         mutually exclusive (src/backend.rs, docs/investigations/vulkan-port.md)."
+         `--features rocm` (HIP/ROCm), the only backend (src/backend.rs)."
     )
 }
 
@@ -520,7 +513,7 @@ fn main() -> Result<()> {
 /// `--max-mem` is honoured LITERALLY — no OS reserve. The user asked for that size, so it is
 /// allowed to OOM at pin build; the auto path just leaves `OS_RESERVE` free (there is no hard
 /// footprint ceiling — the old NaN cliff was our own bug, since fixed).
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 fn device_budget(max_mem: Option<u64>) -> Result<usize> {
     use rivoli::artifact::config::OS_RESERVE;
     const GIB: f64 = (1u64 << 30) as f64;
@@ -567,7 +560,7 @@ fn device_budget(max_mem: Option<u64>) -> Result<usize> {
 /// `attn`/`port`/`no_mtp` are passed individually rather than as `&Args`: `Config` takes
 /// ownership of four of `Args`' `String`s just above the dispatch, so `&a` is not borrowable
 /// there. The three are differently typed, so none is substitutable for another.
-#[cfg(all(feature = "rocm", not(feature = "vulkan")))]
+#[cfg(feature = "rocm")]
 fn run_v4(cfg: &Config, attn: &str, port: Option<u16>, no_mtp: bool, watchdog_secs: u64) -> Result<()> {
     use rivoli::arch::Arch;
     // Inside the function rather than at the top of the file: it then inherits this `cfg`
@@ -617,8 +610,10 @@ fn run_v4(cfg: &Config, attn: &str, port: Option<u16>, no_mtp: bool, watchdog_se
             arch.name()
         );
     }
-    // Speculative decode is OFF and cannot be turned on — say so once, the way the Vulkan
-    // downgrade does, and only when the user did not already ask for it off.
+    // Speculative decode is OFF and cannot be turned on — say so once, and only when the
+    // user did not already ask for it off. (This mirrored a Vulkan single-row downgrade
+    // message that was deleted with that backend on 2026-08-06; the V4 reason below is
+    // unrelated and still live.)
     if !no_mtp {
         info!(
             "speculative decode OFF for {}: the fp4 MoE kernel refuses nrow != 1 \
@@ -709,19 +704,8 @@ fn run_v4(cfg: &Config, attn: &str, port: Option<u16>, no_mtp: bool, watchdog_se
     Ok(())
 }
 
-/// The Vulkan arm: there is no V4 decode path, and a stub would claim a parity nothing measured.
-#[cfg(all(feature = "vulkan", not(feature = "rocm")))]
-fn run_v4(_cfg: &Config, _attn: &str, _port: Option<u16>, _no_mtp: bool, _watchdog_secs: u64) -> Result<()> {
-    bail!(
-        "this is a Vulkan build and it has no DeepSeek-V4 decode path: every launcher the V4 \
-         layer loop drives is `backend::hip`'s, and `backend/vk.rs` has no v4_* twin (16 of 29 \
-         kernels are ported — docs/investigations/vulkan-port.md). Rebuild with --features rocm. \
-         Stubs are deliberately absent: they would claim a parity nothing has measured."
-    )
-}
-
 /// A build with no compute backend cannot reach this: see the stub above.
-#[cfg(any(feature = "rocm", feature = "vulkan"))]
+#[cfg(feature = "rocm")]
 fn main() -> Result<()> {
     let a = parse_args();
     let attn = resolve_attn(&a)?;
@@ -763,24 +747,12 @@ fn main() -> Result<()> {
         max_mem: a.max_mem.map(|g| g.saturating_mul(1 << 30)),
         attn,
     };
-    // Does the backend this binary was built with have the kernels this configuration
-    // needs? A no-op under `rocm`; refuses `--mode int4|hybrid` / `--attn dsa|misa` under
-    // `vulkan`, at the door rather than forty layers into the first token.
-    cfg.validate_backend()?;
-    // `--moe-gain` is the one backend-gated knob that is NOT a `Config` field, so it is
-    // checked here rather than in `validate_backend` with the others. g == 1 takes the
-    // ported `vadd`; anything else takes `vaxpy`, which the Vulkan backend defers. Rejected
-    // at startup for the same reason as the modes: the alternative is discovering it forty
-    // layers into the first token.
-    #[cfg(feature = "vulkan")]
-    if a.moe_gain != 1.0 {
-        bail!(
-            "--moe-gain {} needs the `vaxpy` kernel, which the Vulkan backend does \
-             not have (docs/investigations/vulkan-port.md defers it; `vadd`, the g = 1 case, is ported). Drop the \
-             flag, or rebuild with --features rocm.",
-            a.moe_gain
-        );
-    }
+    // There is no startup capability gate any more. `Config::validate_backend` refused
+    // `--mode int4|hybrid` and `--attn dsa|misa` at the door on Vulkan builds, and a
+    // `--moe-gain != 1` check beside it refused the `vaxpy` kernel that backend deferred.
+    // Both went with the backend on 2026-08-06: `rocm` has every kernel, so every
+    // configuration the CLI accepts is one this build can run, and a gate that can only
+    // return `Ok(())` is the shape this file's own history has deleted before.
 
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -941,7 +913,7 @@ fn main() -> Result<()> {
             .context("nothing to do: pass -bench <tokens> to decode, or --port <PORT> to serve")?,
     };
 
-    #[cfg(any(feature = "rocm", feature = "vulkan"))]
+    #[cfg(feature = "rocm")]
     {
         let cap = device_budget(cfg.max_mem)?;
         // dsa/misa need the resident DSA indexer placed by Pin::build.
@@ -1055,28 +1027,23 @@ fn main() -> Result<()> {
         // Found 2026-08-01 while building server mode. Fixed by BATCHING the row selection
         // rather than refusing it: dsa/misa select per row and the head attends dense, and
         // streaming uploads one row set per row. All four modes speculate. See §13.
-        // A verify pass is TWO token rows, and the Vulkan `.comp` shaders are single-row —
-        // `gemv_fp8` rejects `nrow=2` outright. Compile-time rather than a runtime probe,
-        // because the backend is fixed at build and this must be decided before the pin is.
-        //
-        // Added 2026-08-03 after tests/mode-matrix.sh ran the cross under both backends:
-        // every Vulkan cell loaded weights for ~2 minutes and then died mid-decode on
-        // `gemv_fp8: nrow=2`. `Config::validate_backend` refuses the unported MODES and
-        // ATTNS at startup for exactly this reason and simply did not know about the head,
-        // so the default flags were a guaranteed late crash on that backend.
-        let batched_rows = cfg!(not(feature = "vulkan"));
-        let mtp = !a.no_mtp && engine.has_mtp() && !engine.tracing() && batched_rows;
+        // A verify pass is TWO token rows. That used to be a backend question: the Vulkan
+        // `.comp` shaders were single-row and `gemv_fp8` rejected `nrow=2` outright, so a
+        // `batched_rows = cfg!(not(feature = "vulkan"))` gated speculation off at compile
+        // time. Discovered 2026-08-03 when tests/mode-matrix.sh ran the cross under both
+        // backends and every Vulkan cell loaded weights for ~2 minutes before dying
+        // mid-decode. With that backend retired (2026-08-06) every kernel takes two rows,
+        // so the only remaining reasons to skip speculation are properties of the ARTIFACT
+        // and the RUN.
+        let mtp = !a.no_mtp && engine.has_mtp() && !engine.tracing();
         if !a.no_mtp && !mtp {
             info!(
                 "speculative decode OFF: {}",
-                match (batched_rows, engine.has_mtp()) {
-                    (false, _) =>
-                        "the Vulkan backend's shaders are single-row and a verify pass \
-                              needs two (rebuild with --features rocm)",
-                    (_, false) =>
-                        "this artifact carries no MTP head (re-run bin/fp8_to_i4 to \
-                              emit L78.i4 for int4/hybrid)",
-                    _ => "--trace routes once per layer and a verify pass routes twice",
+                if engine.has_mtp() {
+                    "--trace routes once per layer and a verify pass routes twice"
+                } else {
+                    "this artifact carries no MTP head (re-run bin/fp8_to_i4 to \
+                     emit L78.i4 for int4/hybrid)"
                 }
             );
         }
@@ -1206,12 +1173,12 @@ fn main() -> Result<()> {
             // different backends/modes — the same discipline `--ppl-out` uses.
             writeln!(
                 w,
-                "# rivoli-ids v1 backend={} mode={} policy={} attn={} tokens={}",
-                if cfg!(feature = "vulkan") {
-                    "vulkan"
-                } else {
-                    "rocm"
-                },
+                // `backend=` is spelled into the literal because `rocm` is the only value it
+                // can take since 2026-08-06. Still EMITTED, though: the header exists so two
+                // dump files cannot be silently compared across arms, and a field that
+                // vanishes when it becomes constant makes old dumps unreadable against new
+                // ones. A second backend puts the `{}` back.
+                "# rivoli-ids v1 backend=rocm mode={} policy={} attn={} tokens={}",
                 cfg.mode,
                 cfg.cache_policy,
                 a_attn,

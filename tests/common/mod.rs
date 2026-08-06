@@ -517,6 +517,14 @@ pub fn probe(name: &str, n: usize, dim: usize) -> Vec<f32> {
 /// had reached `tests/kernel_coverage.rs` and `tests/v4_oracle.rs` independently, which is
 /// the same drift this module's header records for `assert_close` and `f16b`.
 ///
+/// > **CORRECTED 2026-08-06.** `tests/kernel_coverage.rs` was deleted with the Vulkan backend
+/// > and it was this helper's ONLY caller — `tests/v4_oracle.rs` never called it, so the
+/// > sentence above overstated the drift even when written. The helper is kept, unused, for
+/// > one reason: re-keying that launcher-to-oracle census onto `src/backend/hip.rs` is an
+/// > open repair (see `src/backend/hip.rs`, the V4 launcher note), and this is the shape it
+/// > needs. `#![allow(dead_code)]` on this module is why nothing warns. If that repair is
+/// > declined, delete this.
+///
 /// The caller keeps its own `assert!` and its own message. That is deliberate — the message
 /// is the whole value of a census failure (*which* names, and what the reader should do
 /// about them), and a shared message would have to be generic enough to be useless. Only the

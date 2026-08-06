@@ -114,7 +114,34 @@ an artifact of framing.
 
 ---
 
-## Track 1 — Retire the Vulkan backend · ~6,600 lines · RUNS ALONE
+## Track 1 — Retire the Vulkan backend · ~~~6,600 lines~~ **DONE 2026-08-06** · RAN ALONE
+
+> **DONE 2026-08-06.** Landed as one commit on top of `8293e50`. Measured
+> **12,420 deletions / 519 insertions across 58 files**, of which 10,857 raw lines were the
+> 28 deleted files; **5,427 code lines** (non-blank, non-comment) in the deleted `.rs` alone.
+> Code preserved at tag **`archive/vulkan-backend-hb16`** — NOT `archive/vulkan-backend`,
+> which predates `c434de3` (HB=16) by one commit and is 54 insertions short of what shipped.
+>
+> **The ~6,600 estimate was ~2x low**, and the gap is instructive rather than an arithmetic
+> slip: it counted the five Vulkan-only files as *code* lines and missed four consumers
+> entirely — `examples/moe_bench.rs` (16 cfg sites, more than any file but `main.rs`),
+> `tests/xbackend.rs` (a cross-backend byte comparison that cannot exist with one backend),
+> `tests/kernel_coverage.rs`, and the cfg sweep itself, which was **79 sites across 18
+> files**, not 63 across 17. See "Vulkan-only files" below for the corrected inventory.
+>
+> **Gates:** G1/G2/G3 all RAN and held; `tests/feature-matrix.sh` shrank 34 → **18 cells**,
+> asserted by `tests/matrix.rs`, not eyeballed; `mode-matrix.sh` lost its 36-cell Vulkan arm
+> and its `refused` outcome, since a refusal now means a bug.
+>
+> **Two things it cost, disclosed rather than inherited.** (1) The `vulkan` CI job was the
+> only one running the union clippy AND the only one running `cargo test` under a backend
+> feature; a featureless union step in `host` recovers `mod otlp` (the `E0609` class) but
+> **`src/eval.rs` is `all(teacher-forcing, rocm)` and is now compiled by no CI job**. That
+> is a known gap, not a silent one, and NOT the `otlp` failure mode: CI never had a rocm arm
+> to lose, and `eval.rs` is covered by the local rocm union run CLAUDE.md prescribes.
+> (2) `tests/kernel_coverage.rs` was the launcher-to-oracle census, keyed on `vk.rs`; it was
+> deleted rather than re-keyed, so **no launcher in the tree has a coverage census**.
+> Re-keying it onto `src/backend/hip.rs` is the obvious repair and is unclaimed.
 
 **Rationale.** 6 of 36 cells decode (`tests/mode-matrix.sh`), 16 of 29 kernels, ~1.9× slower,
 refuses `int4`/`hybrid`/`dsa`/`misa` at startup, and cannot run V4 at all. Every V4 launcher
@@ -123,6 +150,13 @@ by the user as an **unfinished port, not a feature**.
 
 **Vulkan-only files (6,210 measured):** `tests/vk.rs` 2550 · `src/backend/vk.rs` 2407 ·
 `tests/glsl_numerics.rs` 303 · `src/backend/vkstream.rs` 38 · `kernels/vk/*` ~900.
+
+> **CORRECTED 2026-08-06.** Raw lines, as deleted: `src/backend/vk.rs` **4148** (2413 code —
+> the merge brought `c434de3`'s HB=16 work, +54) · `tests/vk.rs` **4060** (2550 code) ·
+> `kernels/vk/*` **1770** across 22 files · `tests/glsl_numerics.rs` **499** (303) ·
+> `src/backend/vkstream.rs` **123** (38). Plus two files the estimate did not list at all:
+> `tests/xbackend.rs` **160** (81) and `tests/kernel_coverage.rs` **97** (42). Total
+> **10,857 raw**. The modified-file sweep removed a further net 1,069 lines across 28 files.
 
 **cfg sites in 21 further files:** `main.rs` 11 · `tests/xbackend.rs` 9 · `memory/device.rs` 8
 · `artifact/config.rs` 6 · `backend.rs` 5 · `lib.rs` 4 · `serve.rs` 2 · `memory.rs` 2 ·
@@ -239,6 +273,7 @@ properly; each is grounded below.
 **A finding that reframes Track 3.** In-src `#[cfg(test)]` blocks hold **~4,000–4,500 code
 lines** — `quant.rs` 418, `model.rs` 313, `format.rs` 279, `math.rs` 214, `hybrid.rs` 187,
 `telemetry.rs` 185, `serve.rs` 162, `arena.rs` 162, and `backend/vk.rs` ~1,125 which Track 1
+(**done 2026-08-06** — so re-derive this estimate WITHOUT the vk.rs term before starting)
 deletes anyway. With `tests/` that is **~43% of the tree in test code.**
 
 **This is not a place to hunt for lines.** Five separately-written copies of one harness
@@ -372,7 +407,7 @@ now    Track 0  (attn_out)       ─┐ parallel, owns attn.rs + v4gpu.rs
        Track 0b (encoding)       ─┤ parallel, owns tokenizer + new module
        Track H  (rm i4_audit)    ─┘ independent of everything; tag already cut
 
-s1     Track 1  (retire Vulkan)     ALONE — cfg sites reach 21 files
+s1     Track 1  (retire Vulkan)     ALONE — DONE 2026-08-06; was 79 cfg sites over 18 files
 
 s2     Track 2  (ABI macro)      ─┐ parallel, disjoint file sets
        Track 4  (crates)         ─┘
@@ -387,7 +422,7 @@ s4     Track 3  (tests/)         ─┐ ALONE as a pair — the safety net goes 
 
 | track | lines | gate |
 |---|---:|---|
-| 1 retire Vulkan | 6,600 | G1 + featureless build + asserted cell count |
+| 1 retire Vulkan | ~~6,600~~ **12,420 — DONE 2026-08-06** | ~~G1 + featureless build + asserted cell count~~ **all held**; estimate was 2x low, see Track 1 |
 | 3 tests/ harness | 2,200 | **G4** |
 | 4 crates | 1,000 | G2 |
 | 2 ABI macro | 1,000 | **G3** per launcher |
