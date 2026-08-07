@@ -1,4 +1,5 @@
 ---
+scope: glm
 status: closed-negative
 verdict: LOOKA hints and the pilot prefetcher: REMOVED 2026-07-31. The veto bound on 0.9% of evictions; the prefetcher predicted at 99% precision and still cost more than it saved.
 ---

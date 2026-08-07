@@ -1,4 +1,5 @@
 ---
+scope: glm
 status: closed-negative
 verdict: RETIRED 2026-08-06 as an unfinished port, not a feature — 16 of 29 kernels, 6 of its own 36 mode-matrix cells decoding and 30 refusing (of 72; 36 per backend), ~1.9x slower on --mode int3-vq --attn dense, and no DeepSeek-V4 path at all. Kept as the inventory of what was and was not ported, the numerics and index-width rules, and the mechanised-guard registry; code at tag archive/vulkan-backend-hb16.
 ---

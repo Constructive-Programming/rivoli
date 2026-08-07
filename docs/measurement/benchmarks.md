@@ -1,4 +1,5 @@
 ---
+scope: engine
 status: data
 verdict: Append-only measurements. Never read whole — grep for the config. The top table predates the .i4 rebuild and says so.
 ---

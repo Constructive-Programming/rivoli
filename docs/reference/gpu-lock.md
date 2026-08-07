@@ -1,4 +1,5 @@
 ---
+scope: engine
 status: live
 verdict: llama-swap's Vulkan pod on rh-anine now shares the SAME /var/run/sys-gpu.lock every bare-metal GPU command already flocks (TOUR.md, docs/measurement/) — no rivoli code changes, this documents the other side of an existing contract.
 ---

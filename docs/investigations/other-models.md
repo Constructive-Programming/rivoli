@@ -1,4 +1,5 @@
 ---
+scope: engine
 status: live
 verdict: Both targets keep source fidelity — V4-Flash native FP4 in a new `.f4` container (~157 GB), K3 native MXFP4 (~1.45 TB) — because both ship 4-bit experts and re-quantizing to int3-vq is the lossy-on-lossy chain int4-scales.md records at PPL 73.43. NFS measures 154 MB/s against NVMe's 7.0 GB/s, so `/swarm` is the library and NVMe the working set; all three at native fidelity are 1.73 TiB against 1.69 TiB of disk. FOUR CORRECTIONS 2026-08-05 from the downloaded repo, each dated in place: V4 DOES stream (138.1 GiB of experts, ~83% residency) so §3 is inverted; `--kv-fp8` does not exist and the partial fp8 KV act_quant is mandatory not forbidden; §7's "unverified absence" is resolved and missed a 41-layer KV compressor; the shared expert is fp8, not FP4.
 ---

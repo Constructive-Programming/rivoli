@@ -1,4 +1,5 @@
 ---
+scope: glm
 status: closed-negative
 verdict: DSA indexer offload to the NPU: not worth it — M1a (measured 2026-08-07) closed the decoupled window for GLM's DSA indexer (verbatim 1-step-stale costs +0.89 nats; only the diagonal-patched variant is unmeasured). The device top-k it recommended shipped instead (−9.4 ms/token).
 ---

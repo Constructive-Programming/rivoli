@@ -1,4 +1,5 @@
 ---
+scope: glm
 status: closed-negative
 verdict: Hadamard/QuIP rotation for int3-vq: CLOSED 2026-08-01. A per-layer codebook recovers 0.09% against a 2% bar, so there is nothing to homogenise. int3-vq is rate-limited.
 ---

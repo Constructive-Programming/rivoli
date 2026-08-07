@@ -1,4 +1,5 @@
 ---
+scope: v4
 status: closed-mixed
 verdict: ANSWERED 2026-08-07, built and measured the same day — `emit --defect` exists, the loader refuses a mismatched golden (proven red live), and all seven gate arms ran with every red/green outcome matching its pre-registered prediction. The four derived attention bounds were scored THROUGH the gate for the first time; each anchor defect went red, but `attn_derot`'s 1.3x separation survived by only 1.07x at worst (24.5 vs 23), and both kv-quant defects left their home tensor `kv_entry` GREEN under its 17 bound — every red came from downstream. `SinkhornIterCountProbe` ran fully green, settling unlock #3 negatively — no live bound sees the one defect the checkpoint discriminates and the toy cannot; the gate saw its `ffn_norm_out` movement (69.6% of elements differing) only in an unbounded reported row — so `ffn-norm-out-envelope.md` still owes the transcription and cannot be closed by a perturbed golden alone.
 ---

@@ -1,4 +1,5 @@
 ---
+scope: v4
 status: live
 verdict: OPEN. `ffn_norm_out` and `.out` carry no bound at all since 2026-08-07 — they report and assert only that the row was reached. The 5e-2 they used to carry was the same constant four attention tensors were re-derived away FROM, whose derived values came out 17, 275, 23 and 71. Two substitutes have been measured and REFUTED: the differing-element fraction at 1.42x (probe sweep), and, later the same day, a perturbed-golden A/B through the gate itself — a `SinkhornIterCountProbe` golden ran the gate green, with a same-tensor fraction separation of only 1.20x. The work is transcribing `hc_post` + the MoE to compute the envelope, unblocked since Track 0 released the files on 2026-08-06.
 ---

@@ -1,5 +1,6 @@
-//! The docs registry check: every file under `docs/` carries `status:` + `verdict:` front
-//! matter, and `docs/00-orientation/INDEX.md` lists it with the SAME verdict.
+//! The docs registry check: every file under `docs/` carries `status:` + `scope:` +
+//! `verdict:` front matter, and `docs/00-orientation/INDEX.md` lists it with the SAME
+//! verdict and shows the same scope.
 //!
 //! This is the INV-n trick (see `tests/invariants.rs`) applied to documentation, and it
 //! exists for the same reason: prose drifted from reality repeatedly and nothing noticed.
@@ -28,6 +29,10 @@ const STATUSES: [&str; 5] = [
     "closed-mixed",
     "data",
 ];
+// Whose evidence backs the verdict. A closed verdict rules its question out only for its
+// scope: npu-offload.md's closed-negative was measured on GLM-5.2 and says nothing about
+// the V4 port (2026-08-07, the correction that motivated this field).
+const SCOPES: [&str; 3] = ["glm", "v4", "engine"];
 
 fn docs_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("docs")
@@ -50,20 +55,24 @@ fn markdown_files() -> Vec<String> {
     out
 }
 
-/// `(status, verdict)` from a file's front matter, or `None` if it has none.
-fn front_matter(body: &str) -> Option<(String, String)> {
+/// `(status, verdict, scope)` from a file's front matter, or `None` if it has none.
+/// `scope` stays an `Option` so a missing one is its own finding, not a missing-front-matter.
+fn front_matter(body: &str) -> Option<(String, String, Option<String>)> {
     let rest = body.strip_prefix("---\n")?;
     let end = rest.find("\n---")?;
     let mut status = None;
     let mut verdict = None;
+    let mut scope = None;
     for line in rest[..end].lines() {
         if let Some(v) = line.strip_prefix("status:") {
             status = Some(v.trim().to_string());
         } else if let Some(v) = line.strip_prefix("verdict:") {
             verdict = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("scope:") {
+            scope = Some(v.trim().to_string());
         }
     }
-    Some((status?, verdict?))
+    Some((status?, verdict?, scope))
 }
 
 #[test]
@@ -74,12 +83,21 @@ fn every_doc_declares_a_status_and_a_verdict() {
         let body = std::fs::read_to_string(root.join(&f)).expect(&f);
         match front_matter(&body) {
             None => bad.push(format!("{f}: no `status:`/`verdict:` front matter")),
-            Some((s, v)) => {
+            Some((s, v, sc)) => {
                 if !STATUSES.contains(&s.as_str()) {
                     bad.push(format!("{f}: status `{s}` is not one of {STATUSES:?}"));
                 }
                 if v.len() < 20 {
                     bad.push(format!("{f}: verdict is too short to rule the file out"));
+                }
+                match sc {
+                    None => bad.push(format!(
+                        "{f}: no `scope:` — whose evidence backs this? one of {SCOPES:?}"
+                    )),
+                    Some(sc) if !SCOPES.contains(&sc.as_str()) => {
+                        bad.push(format!("{f}: scope `{sc}` is not one of {SCOPES:?}"));
+                    }
+                    Some(_) => {}
                 }
             }
         }
@@ -112,12 +130,13 @@ fn the_index_lists_every_doc_with_a_matching_verdict() {
 
     let mut missing = Vec::new();
     let mut mismatched = Vec::new();
+    let mut scope_drift = Vec::new();
     for f in markdown_files() {
         if f == INDEX {
             continue; // the index does not list itself
         }
         let body = std::fs::read_to_string(root.join(&f)).expect(&f);
-        let Some((_, verdict)) = front_matter(&body) else {
+        let Some((_, verdict, scope)) = front_matter(&body) else {
             continue; // reported by the test above
         };
         let name = f.rsplit('/').next().unwrap_or(&f);
@@ -134,6 +153,19 @@ fn the_index_lists_every_doc_with_a_matching_verdict() {
         if !index_norm.contains(&norm(&verdict)) {
             mismatched.push(format!("{f}\n      front matter: {verdict}"));
         }
+        // The scope is a table cell (`| glm |`), matched on the doc's own index row so one
+        // doc's cell cannot satisfy another doc's check. A row is a line starting `| [`
+        // whose link target ends in this filename — prose mentions (the header's
+        // `docs/README.md`, the scope paragraph naming npu-offload.md) matched a bare
+        // `contains(name)` on the first red run of this check.
+        let row = index
+            .lines()
+            .find(|l| l.starts_with("| [") && l.contains(&format!("{name})")));
+        if let (Some(sc), Some(row)) = (scope, row) {
+            if !row.contains(&format!("| {sc} |")) {
+                scope_drift.push(format!("{f}: front matter says `{sc}`, index row lacks it"));
+            }
+        }
     }
     assert!(
         missing.is_empty(),
@@ -147,5 +179,11 @@ fn the_index_lists_every_doc_with_a_matching_verdict() {
          reader uses to decide not to open the file, so a stale row there is worse than a \
          stale file.",
         mismatched.join("\n  ")
+    );
+    assert!(
+        scope_drift.is_empty(),
+        "scope drift between a doc and {INDEX}:\n  {}\n\nA verdict without a visible scope \
+         reads as engine-wide, and closed-on-GLM has already been mistaken for closed.",
+        scope_drift.join("\n  ")
     );
 }
