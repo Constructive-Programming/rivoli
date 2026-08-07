@@ -347,6 +347,62 @@ the same message naming the same subject. Build the corpus **first**, as a runna
 before changing a line of harness. If the corpus cannot be made runnable, this track does not
 proceed.
 
+> **G4 RAN 2026-08-07: 22 of 22 breaks fired RED, every message matching its expected subject,
+> 0 problems, tree restored clean.** The precondition is met — `tests/refactor-gates/breaks.tsv`
+> + `run-breaks.sh` already exist and work. Cost: one pass, GPU lock held for the five device
+> rows. **This is the single most valuable instrument in the repo and also the most dangerous
+> to run** — it edits source and depends on `git checkout --` to restore, which is why the
+> driver refuses a dirty tree and restores on `INT`/`TERM`/`HUP`/`EXIT`. That trap is not
+> theoretical: a 10-minute harness timeout once killed it between "apply break" and "restore"
+> and left **the oracle** modified, the one file everything else is scored against.
+>
+> **CLOSED 2026-08-07 — the consolidation this track proposed has already happened.**
+> Re-measured before briefing, as this section itself asks. Every number below moved:
+>
+> | claim | when written | measured 2026-08-07 |
+> |---|---|---|
+> | `tests/common/` | 285 lines | **857**, with **42** public items |
+> | files sharing it | "seven files independently load goldens" | **19** test files `mod common` it |
+> | `v4_oracle.rs` helpers | 11 ULP/golden | **0** — they moved to `common/` |
+> | `v4_kernel.rs` helpers | 6 | **1** |
+> | textual duplication | the motivation | **jscpd 0** over `tests/` at min-tokens 15 |
+>
+> `common/mod.rs` now carries precisely what the track listed as duplicated — `assert_bitwise`,
+> `assert_bits`, `assert_rel`, `assert_close`, `rel`, `max_abs`, `report`, `report_rel`,
+> `err_tol`, `f32v`/`u16v`/`u32v`, `dev`/`zeros`/`back`/`ok` — plus the `Mla`, `Att`,
+> `MoeRange` and `Lcg` fixtures.
+>
+> **The design requirements hold too**, and they were the durable half:
+> - **`TOL` is file-local** (`v4_kernel.rs:2319`), not the shared constant whose "repair" this
+>   section warns would silently degrade every other comparison. There is exactly one.
+> - **Anti-vacuity is pervasive and argued in place** — `v4_attn.rs` alone names it at eleven
+>   sites, each saying what would pass vacuously and why it cannot.
+>
+> **What is left is test CASES, not harness**, and this plan's own front matter forbids
+> touching them: *"~43% of this tree is TEST code and is not a line-count target: consolidating
+> duplicated scaffolding is in scope, cutting coverage is not."* The four large files
+> (`v4_attn` 1540, `v4_oracle` 1510, `v4_kernel` 1406, `kernel` 1291) are 48–58 test functions
+> each, over a port whose only defence against fluent wrong output they are.
+
+## Track F — extend the harness into `src/` — **CLOSED 2026-08-07, on a structural reason**
+
+Measured: **5,024** in-src `#[cfg(test)]` code lines, up from the ~4,000 estimated.
+
+**But `src/`'s unit tests CANNOT use `tests/common/`, and that is Rust, not neglect.** Each
+file under `tests/` compiles as its own integration-test crate; `src/`'s `#[cfg(test)]` modules
+live in the library crate. There is no import path between them. Sharing would mean either
+moving helpers into the library behind a `test-support` feature — shipping test scaffolding in
+the crate's public surface, and a feature nothing in CI builds — or duplicating them, which is
+the thing being complained about.
+
+`quant.rs:842` already records hitting this wall from the other side. The tree is at **jscpd 0**
+over `src/` and `tests/` regardless, so whatever similarity remains is below a 15-token clone
+and not mechanically detectable as duplication.
+
+**Reopen only with a concrete defect this would have caught.** The estimate was ~1,000 lines;
+the achievable number is ~0 without a feature-gated test-support module, and that trade has to
+be argued on its own merits rather than on a line count.
+
 **Design requirements, each from a defect this month:**
 - An **anti-vacuity arm that involves no code under test** — assert the defect oracle differs
   from the clean oracle *before* asserting anything about a kernel. Its failure cannot be
@@ -652,10 +708,10 @@ s4     Track 3  (tests/)         ─┐ ALONE as a pair — the safety net goes 
 | track | lines | gate |
 |---|---:|---|
 | 1 retire Vulkan | ~~6,600~~ **12,420 — DONE 2026-08-06** | ~~G1 + featureless build + asserted cell count~~ **all held**; estimate was 2x low, see Track 1 |
-| 3 tests/ harness | 2,200 | **G4** |
+| 3 tests/ harness | ~~2,200~~ **CLOSED 2026-08-07 — already done** | **G4 RAN: 22/22 red, subjects match.** `tests/common` is 857 lines used by 19 files, not 285 used by 7; jscpd 0. See Track 3 |
 | 4 crates | ~~1,000~~ **23 net — DONE 2026-08-06** | **G1/G2/G3 all held**; −67 in the readers, +43 in the test that proves the new checks fire. Estimate 43x high — the writer is unswappable and 2 of 3 sub-items were already done or declined, see Track 4 |
 | 2 ABI macro | ~~1,000~~ **737 — DONE 2026-08-06** | ~~G3~~ **G5 expansion + G1 on GLM and V4, all held**; G3 was structurally blind to it, see Track 2 |
-| F in-src tests | 1,000 | **G4** |
+| F in-src tests | ~~1,000~~ **CLOSED 2026-08-07** | Structural: `src/` unit tests cannot import `tests/common` — separate crates. See Track F |
 | G converters | ~~700~~ **~0 net — DONE 2026-08-06** | **G2 held on BOTH formats** (the GLM half ran for the first time). 4 of 7 phases were already factored; the value was one atomicity defect in the only step where the two copies diverged, see Track G |
 | H rm i4_audit | 697 | ~~no inbound refs~~ **DONE 2026-08-05** — there were seven files, one build-breaking; see Track H |
 | I loop skeleton | ~~600~~ **DECLINED 2026-08-07** | Measured: **0** cross-file jscpd clones at min-tokens 10, and 4 of 5 "shared" items are not shared. Common core is ~20 lines. See Track I |
