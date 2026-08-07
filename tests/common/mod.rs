@@ -719,7 +719,7 @@ pub fn indexer_w(ck: &Checkpoint, layer: usize, c: &V4Config) -> IndexerW {
 /// Drive one PREFILL `run_layer` over `h` and return what it captured.
 ///
 /// `tests/v4_kernel.rs` and `tests/v4_oracle.rs` each built the same six-field `LayerCtx` at
-/// `start_pos: 0, phase: "pre"`, wrapped in the same `fresh_state`/`Capture`/`run_layer`
+/// `start_pos: 0, step_tag: "pre"`, wrapped in the same `fresh_state`/`Capture`/`run_layer`
 /// sequence, and `build.rs`'s duplication gate found the copy. Nothing here touches a device
 /// type, which is this module's rule for what may live in it.
 ///
@@ -747,7 +747,7 @@ pub fn prefill_capture(
         s: ids.len(),
         start_pos: 0,
         input_ids: ids,
-        phase: "pre",
+        step_tag: "pre",
     };
     o.run_layer(&step, &mut st, h, &mut cap);
     cap

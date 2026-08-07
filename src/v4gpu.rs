@@ -222,7 +222,7 @@ impl RopeTables {
 /// `compress_offset` and `window_topk` all take exactly this pair, and swapping it pools the
 /// wrong window at the wrong position. Same argument `attn::Sel` makes about its own four.
 #[derive(Clone, Copy, Debug)]
-struct Span {
+struct Extent {
     /// Query rows: the prompt length at prefill, 1 at decode.
     seqlen: usize,
     /// 0 means prefill, throughout the reference.
@@ -479,7 +479,7 @@ fn read_prefix(b: &DeviceBuf, n: usize) -> Result<Vec<f32>> {
 /// Everything ONE [`V4Engine::probe_attn_stages`] call leaves readable, in pipeline order.
 ///
 /// A struct and not a 4-tuple: all four are `Vec<f32>`, so every permutation type-checks and the
-/// failure is a comparison against the wrong golden. Same argument [`Span`] makes about its two
+/// failure is a comparison against the wrong golden. Same argument [`Extent`] makes about its two
 /// `usize`.
 ///
 /// `attn_core_out` is deliberately absent and **cannot** be added — the output de-rotation is IN
@@ -878,7 +878,7 @@ impl V4Engine {
     /// PERSISTENT cache, so the first call here uses it a little outside its stated meaning —
     /// deliberately, because the arithmetic is identical and a second placement function would be
     /// a second place for the rule to be wrong.
-    fn compress_and_place(&mut self, layer: usize, p: Span, stream: *mut c_void) -> Result<()> {
+    fn compress_and_place(&mut self, layer: usize, p: Extent, stream: *mut c_void) -> Result<()> {
         let (win, hd) = (self.cfg.sliding_window, self.cfg.head_dim);
         let li = layer - self.range.start;
         let kind = self.layers[li].kind;
@@ -1010,7 +1010,7 @@ impl V4Engine {
     fn run_compress(
         &mut self,
         layer: usize,
-        p: Span,
+        p: Extent,
         _stream: *mut c_void,
     ) -> Result<(usize, *const u8)> {
         let li = layer - self.range.start;
@@ -1065,7 +1065,7 @@ impl V4Engine {
     /// uninitialised device memory in rows every later decode step selects BY POSITION and
     /// weights with `exp(l - max)`. Doing both here rather than at two call sites is what makes
     /// it impossible to get right in prefill and wrong in decode.
-    fn attention_block(&mut self, layer: usize, p: Span, stream: *mut c_void) -> Result<()> {
+    fn attention_block(&mut self, layer: usize, p: Extent, stream: *mut c_void) -> Result<()> {
         let (m, start_pos) = (p.seqlen, p.start_pos);
         let li = layer - self.range.start;
         let kind = self.layers[li].kind;
@@ -1607,7 +1607,7 @@ impl V4Engine {
             } else {
                 self.attention_block(
                     layer,
-                    Span {
+                    Extent {
                         seqlen: m,
                         start_pos,
                     },
@@ -1955,7 +1955,7 @@ impl V4Engine {
             "probe_attn_stages: residual holds {} rows, not {m}",
             self.loaded_rows
         );
-        let p = Span {
+        let p = Extent {
             seqlen: m,
             start_pos,
         };

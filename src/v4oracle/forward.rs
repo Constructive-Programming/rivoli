@@ -399,19 +399,19 @@ pub struct LayerCtx<'a> {
     pub input_ids: &'a [u32],
     /// Which call this is: `"pre"` for the prefill, `"dec0"`, `"dec1"`, ... for the decode
     /// steps. NOT the golden prefix -- see [`LayerCtx::tag`].
-    pub phase: &'a str,
+    pub step_tag: &'a str,
 }
 
 impl LayerCtx<'_> {
-    /// The prefix every recorded golden carries: `L{layer}.{phase}`.
+    /// The prefix every recorded golden carries: `L{layer}.{step_tag}`.
     ///
     /// A method, not a field, because it must be impossible to apply inconsistently. When
     /// the layer id was prepended in `run_layer` alone, the goldens pushed inside
-    /// `attention` and `moe` kept the bare phase tag, a four-layer run wrote `pre.q` four
+    /// `attention` and `moe` kept the bare step tag, a four-layer run wrote `pre.q` four
     /// times, and `Capture::float` -- which returns the FIRST match -- silently hid three of
     /// them. Every push in this file goes through here.
     pub fn tag(&self) -> String {
-        format!("L{}.{}", self.layer, self.phase)
+        format!("L{}.{}", self.layer, self.step_tag)
     }
 }
 
@@ -973,7 +973,7 @@ impl Oracle {
     /// combination logits. Note the FIRST normalisation pair is a row *softmax* followed by
     /// a column divide, and only the remaining `iters - 1` passes are plain row/column
     /// divides — that asymmetry is easy to lose in a port.
-    fn sinkhorn(
+    fn hc_split_sinkhorn(
         &self,
         mixes: &[f32],
         scale: &[f32],
@@ -1089,7 +1089,7 @@ impl Oracle {
                 let w = &fnw[j * hcd..(j + 1) * hcd];
                 *m = flat.iter().zip(w).map(|(a, b)| a * b).sum::<f32>() * rs;
             }
-            let (pre, row_post, row_comb) = self.sinkhorn(&mixes, scale, base);
+            let (pre, row_post, row_comb) = self.hc_split_sinkhorn(&mixes, scale, base);
             self.hc_blend(&pre, flat, &mut y[t * dim..(t + 1) * dim]);
             post[t * hc..(t + 1) * hc].copy_from_slice(&row_post);
             comb[t * hc * hc..(t + 1) * hc * hc].copy_from_slice(&row_comb);
@@ -2208,7 +2208,7 @@ impl Oracle {
 
     /// The whole head tail: `hc_head`, the final `RMSNorm`, then `ParallelHead`
     /// (model.py:922-923). Returns the `[vocab_size]` logits and records three goldens under
-    /// `head.{phase}.`.
+    /// `head.{step_tag}.`.
     ///
     /// It does NOT record its input. The caller owns that: in `bin/v4-oracle` the input is a
     /// declared probe and is pushed there as `head.probe.in`, and in the defect matrix it is
@@ -2216,10 +2216,23 @@ impl Oracle {
     /// copy under a name ending in `.in`, which the matrix treats as fixed-by-construction —
     /// a silent claim no implementation could violate would then be attached to a tensor that
     /// every upstream defect moves.
-    pub fn head_tail(&self, hw: &HeadTailW, h: &[f32], s: usize, phase: &str, cap: &mut Capture) {
+    pub fn head_tail(
+        &self,
+        hw: &HeadTailW,
+        h: &[f32],
+        s: usize,
+        step_tag: &str,
+        cap: &mut Capture,
+    ) {
         let (dim, vocab) = (self.cfg.dim, self.cfg.vocab_size);
+        // Both `[s, dim]` goldens below go through here. Two spelled-out `cap.push` calls is
+        // what they were until the `step_tag` rename pushed each past `max_width` and rustfmt
+        // reflowed them into a literal 27-token clone — the manufactured-duplication case
+        // CLAUDE.md warns about. One closure states the prefix and the shape once.
+        let mut record =
+            |name: &str, v: Vec<f32>| cap.push(&format!("head.{step_tag}.{name}"), &[s, dim], v);
         let mut x = self.hc_head(hw, h, s);
-        cap.push(&format!("head.{phase}.hc_head_out"), &[s, dim], x.clone());
+        record("hc_head_out", x.clone());
 
         if self.defect != Defect::HeadNormSkipped {
             match self.defect {
@@ -2240,11 +2253,7 @@ impl Oracle {
         // `final_norm_out`, not `norm_out`: the matrix selects goldens by NAME SUFFIX, and
         // `.norm_out` would sit one character away from matching `.attn_norm_out` and
         // `.ffn_norm_out` for anyone who later writes the suffix without the leading dot.
-        cap.push(
-            &format!("head.{phase}.final_norm_out"),
-            &[s, dim],
-            x.clone(),
-        );
+        record("final_norm_out", x.clone());
 
         // `ParallelHead.forward` with `full_logits=False`: `x[:, -1]` — the LAST row only.
         let row = if self.defect == Defect::HeadLogitsFromFirstRow {
@@ -2258,7 +2267,7 @@ impl Oracle {
         let logits = self.linear(&x[row * dim..(row + 1) * dim], 1, dim, &hw.lm_head);
         // Recorded, not returned. Both callers read their logits back out of `cap`, and a
         // return value would offer a second path to the number the goldens are the record of.
-        cap.push(&format!("head.{phase}.logits"), &[1, vocab], logits);
+        cap.push(&format!("head.{step_tag}.logits"), &[1, vocab], logits);
     }
 
     /// `Block.forward` (model.py:695-707) for one layer, in place on the residual stream.

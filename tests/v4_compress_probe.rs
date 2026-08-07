@@ -352,7 +352,7 @@ fn indexer_ranking_is_blind_at_index_topk_512_and_sighted_when_it_truncates() {
             s: n,
             start_pos: 0,
             input_ids: &[],
-            phase: "pre",
+            step_tag: "pre",
         };
         let x = probe("l2-x", n, c.dim);
         let qr = probe("l2-qr", n, c.q_lora_rank);

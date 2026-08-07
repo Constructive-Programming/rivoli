@@ -17,14 +17,20 @@
 //!
 //! # What this file CANNOT detect, measured rather than assumed
 //!
-//! 1. **The Sinkhorn iteration count.** At `hc_sinkhorn_iters = 20` a 4x4 positive matrix
-//!    is far past convergence: 19 and 20 agree BIT-FOR-BIT, so no golden distinguishes
-//!    them (`tests/v4_oracle.rs::sinkhorn_has_converged_long_before_iteration_20`, which is
+//! 1. **The Sinkhorn iteration count, ON THIS FIXTURE.** At `hc_sinkhorn_iters = 20` the toy
+//!    fixture's 4x4 matrix reaches a bitwise fixed point: 19 and 20 agree BIT-FOR-BIT, so no
+//!    golden built on it distinguishes them
+//!    (`tests/v4_oracle.rs::sinkhorn_has_converged_long_before_iteration_20`, which is also
 //!    why `Defect::SinkhornIterCountProbe` is excluded from the oracle's own matrix). What
 //!    [`sinkhorn_iteration_count_is_live`] proves is strictly weaker and is all that is
-//!    available: the parameter reaches the arithmetic (2 and 20 disagree). The exact value
-//!    is gated by SOURCING, not by measurement — it is passed from `V4Config`, which
-//!    `V4Config::assert_matches_reference_json` pins to `config.json`.
+//!    available here: the parameter reaches the arithmetic (2 and 20 disagree). The exact
+//!    value is gated by SOURCING, not by measurement on this fixture — it is passed from
+//!    `V4Config`, which `V4Config::assert_matches_reference_json` pins to `config.json`.
+//!
+//!    > **CORRECTED 2026-08-07.** This said flatly that "a 4x4 positive matrix is far past
+//!    > convergence", as a fact about the arithmetic. It is a fact about these weights. On
+//!    > the checkpoint 19 vs 20 moves 39,893/53,248 of `L0.pre.ffn_norm_out` and all 78
+//!    > router weights, so a real-weights golden is not blind to the count — this file is.
 //! 2. **The shared expert.** It is fp8 e4m3 at 128x128, not FP4, and is a different kernel
 //!    that is already in the tree. [`ffn_out_matches_the_golden`] fills it in from the
 //!    ORACLE, so that test says nothing about rivoli's fp8 path.
@@ -1107,7 +1113,7 @@ fn the_router_matches_the_oracle_in_both_modes() {
             s: 1,
             start_pos: 0,
             input_ids: &ids,
-            phase: "probe",
+            step_tag: "probe",
         };
         let (want_w, want_i) = o.gate(&step, &x, &mut Counters::default());
 
@@ -1596,12 +1602,14 @@ fn the_mhc_launchers_refuse_what_they_claim_to() {
 
 /// The Sinkhorn iteration count reaches the arithmetic.
 ///
-/// **This is NOT a check that the count is 20**, and it cannot be: at 20 passes the 4x4
-/// matrix has converged and 19 and 20 agree bit-for-bit — the oracle's own matrix excludes
-/// `Defect::SinkhornIterCountProbe` for that measured reason. What is provable is that the
-/// parameter is live rather than ignored, which is what makes SOURCING it from `V4Config`
-/// (and `V4Config::assert_matches_reference_json` pinning that to `config.json`) the actual
-/// gate on the value.
+/// **This is NOT a check that the count is 20**, and on this fixture it cannot be: at 20
+/// passes the toy's 4x4 matrix has reached a bitwise fixed point and 19 and 20 agree
+/// bit-for-bit — the oracle's own matrix excludes `Defect::SinkhornIterCountProbe` for that
+/// measured reason. What is provable here is that the parameter is live rather than ignored,
+/// which is what makes SOURCING it from `V4Config` (and
+/// `V4Config::assert_matches_reference_json` pinning that to `config.json`) the actual gate
+/// on the value. A golden emitted from the CHECKPOINT would gate it directly — see the
+/// dated note on `sinkhorn_has_converged_long_before_iteration_20`.
 #[test]
 fn sinkhorn_iteration_count_is_live() {
     let (cfg, m, _) = fixture();
@@ -1624,9 +1632,10 @@ fn sinkhorn_iteration_count_is_live() {
         cfg.hc_sinkhorn_iters
     );
     // The blind spot itself, asserted in the direction the oracle asserts it. If this ever
-    // goes red, convergence has stopped holding on the GPU where it holds on the CPU — which
-    // would mean `SinkhornIterCountProbe` becomes gateable AND that the two arithmetics have
-    // diverged somewhere worth finding.
+    // goes red, the fixture's fixed point has stopped holding on the GPU where it holds on
+    // the CPU — which would mean the two arithmetics have diverged somewhere worth finding.
+    // It would NOT be news that the count is observable in general: on the checkpoint it
+    // already is.
     assert_eq!(
         bits(&c20),
         bits(&c19),

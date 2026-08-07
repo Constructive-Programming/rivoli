@@ -139,7 +139,7 @@ macro_rules! launchers {
             pub unsafe fn $rust($($arg: $rt),*) -> Result<()> {
                 // SAFETY: caller's pointer contract.
                 let r = unsafe { $sym($($arg $(as $ct)?),*) };
-                ensure_hip_decode_status(r, $tag)
+                ensure_hip_status(r, $tag)
             }
         )*
     };
@@ -373,12 +373,16 @@ launchers! {
     /// Sinkhorn-normalised learned weights, and emit the `post`/`comb` the matching
     /// [`launch_hc_post`] consumes.
     ///
-    /// `iters` is `hc_sinkhorn_iters` from the config. **A numerical comparison cannot gate
-    /// its exact value**: at 20 passes a 4x4 positive matrix is far past convergence, so 19 and
-    /// 20 agree bit-for-bit (`tests/v4_oracle.rs::sinkhorn_has_converged_long_before_
-    /// iteration_20`). Passing it from `V4Config` rather than baking it in is what keeps the
-    /// count from drifting from `config.json`; what tests can and do prove is that the
-    /// parameter is LIVE (2 and 20 disagree).
+    /// `iters` is `hc_sinkhorn_iters` from the config. Passing it from `V4Config` rather than
+    /// baking it in is what keeps the count from drifting from `config.json`; what the tests
+    /// here prove is that the parameter is LIVE (2 and 20 disagree).
+    ///
+    /// > **CORRECTED 2026-08-07.** This said a numerical comparison *cannot* gate the exact
+    /// > value, "at 20 passes a 4x4 positive matrix is far past convergence, so 19 and 20
+    /// > agree bit-for-bit". True of the toy fixture, false of the checkpoint — 19 vs 20
+    /// > moves 39,893/53,248 of `L0.pre.ffn_norm_out` there. A real-weights golden would
+    /// > gate the count; the toy fixture these kernel tests run on cannot. Measurement in
+    /// > `tests/v4_oracle.rs::sinkhorn_has_converged_long_before_iteration_20`.
     ///
     /// `hc` is checked against the kernel's `HC_MULT`, not merely passed: `mix_hc = (2+hc)·hc`
     /// is how the mHC weights are packed on disk, so a mismatch is a different checkpoint.
@@ -1274,7 +1278,7 @@ unsafe extern "C" {
 }
 
 /// Launcher return-code check: 0 = ok, POSITIVE = arg guard, NEGATIVE = -(hipError_t).
-fn ensure_hip_decode_status(r: i32, name: &str) -> Result<()> {
+fn ensure_hip_status(r: i32, name: &str) -> Result<()> {
     if r == 0 {
         Ok(())
     } else if r > 0 {
@@ -1287,7 +1291,7 @@ fn ensure_hip_decode_status(r: i32, name: &str) -> Result<()> {
 /// Block until all launched kernels retire — one join per token.
 pub fn device_sync() -> Result<()> {
     // SAFETY: hipDeviceSynchronize, no pointers.
-    ensure_hip_decode_status(unsafe { rivoli_device_sync() }, "device_sync")
+    ensure_hip_status(unsafe { rivoli_device_sync() }, "device_sync")
 }
 
 /// Synchronous device-to-device copy of `bytes` from `src` to `dst` — the routed
@@ -1298,7 +1302,7 @@ pub fn device_sync() -> Result<()> {
 /// `dst` and `src` must be valid, `bytes`-sized, NON-OVERLAPPING device regions (the
 /// arena guarantees distinct slots).
 pub unsafe fn memcpy_dtod(dst: *mut u8, src: *const u8, bytes: usize) -> Result<()> {
-    ensure_hip_decode_status(
+    ensure_hip_status(
         unsafe { rivoli_memcpy_dtod(dst, src, bytes) },
         "memcpy_dtod",
     )
@@ -1332,7 +1336,7 @@ pub unsafe fn memcpy_dtod_async(
     stream: *mut c_void,
 ) -> Result<()> {
     // SAFETY: caller's pointer contract; stream is a live HipStream handle.
-    ensure_hip_decode_status(
+    ensure_hip_status(
         unsafe { rivoli_memcpy_dtod_async(dst, src, bytes, stream) },
         "memcpy_dtod_async",
     )
@@ -1346,7 +1350,7 @@ pub unsafe fn memcpy_dtod_async(
 /// # Safety
 /// `dst` must be a device pointer owning at least `bytes`.
 pub unsafe fn fill_u32(dst: *mut u8, pat: u32, bytes: usize) -> Result<()> {
-    ensure_hip_decode_status(unsafe { rivoli_fill_u32(dst, pat, bytes) }, "fill_u32")
+    ensure_hip_status(unsafe { rivoli_fill_u32(dst, pat, bytes) }, "fill_u32")
 }
 
 //
@@ -1455,6 +1459,6 @@ pub unsafe fn launch_v4_indexer_score(
     let (heads, hd) = (heads as i32, hd as i32);
     // SAFETY: caller's pointer contract; stream is a live HipStream handle.
     let r = unsafe { rivoli_v4_indexer_score(q, kv, w, score, s, n_comp, heads, hd, stream) };
-    ensure_hip_decode_status(r, "v4_indexer_score")
+    ensure_hip_status(r, "v4_indexer_score")
 }
 // jscpd:ignore-end

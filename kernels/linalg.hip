@@ -380,10 +380,14 @@ extern "C" __global__ void act_quant_f8(float* __restrict__ v, size_t nblk) {
 // passes are plain row/column divides.
 //
 // `iters` is a parameter, not a constant, so the count comes from `config.json` through
-// `V4Config` and cannot drift. It is NOT gated by any numerical comparison: at 20 passes a
-// 4x4 positive matrix is far past convergence, so 19 and 20 agree bit-for-bit and no
-// golden can tell them apart (`tests/v4_oracle.rs::sinkhorn_has_converged_long_before_
-// iteration_20`). What IS gated is that the parameter is live — 2 vs 20 moves the output.
+// `V4Config` and cannot drift. What the kernel tests gate is that the parameter is live —
+// 2 vs 20 moves the output.
+//
+// CORRECTED 2026-08-07: this said the count is "NOT gated by any numerical comparison: at
+// 20 passes a 4x4 positive matrix is far past convergence, so 19 and 20 agree bit-for-bit
+// and no golden can tell them apart". That holds for the toy fixture the kernel tests use,
+// not for the checkpoint, where 19 vs 20 moves 39,893/53,248 of `L0.pre.ffn_norm_out`. See
+// `tests/v4_oracle.rs::sinkhorn_has_converged_long_before_iteration_20`.
 __device__ __forceinline__ void hc_sinkhorn(
     const float* __restrict__ mixes, const float* __restrict__ scale,
     const float* __restrict__ base, int iters, float eps, float* __restrict__ pre,

@@ -130,6 +130,17 @@ Port it **against the reference's own test cases**, not by inference. Until it l
 benchmark or quality number measures the wrong thing, and any "degenerate output" reading is
 an artifact of framing.
 
+> **CLOSED 2026-08-07 — shipped, and this section had gone stale unnoticed.** The encoder is
+> `src/artifact/dsv4_encoding.rs` (2,830 lines) with `tests/v4_encoding.rs` beside it, ported
+> against the reference's own test cases as instructed. The sentence above — "Nothing in
+> rivoli ports it" — has been false for some time.
+>
+> **This was the only track in the document with no closure note**, found while auditing what
+> remained of the refactor. Worth recording as a process failure rather than just fixing: the
+> other eight tracks each closed in place because closing them was part of the work, and 0b
+> did not because it was scoped as a blocker for someone else's numbers rather than as a
+> track with a gate. A blocker that is nobody's track is a blocker nobody closes.
+
 ---
 
 ## Track 1 — Retire the Vulkan backend · ~~~6,600 lines~~ **DONE 2026-08-06** · RAN ALONE

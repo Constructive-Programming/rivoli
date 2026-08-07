@@ -25,7 +25,7 @@ pub trait HybridPolicy {
     /// The shared geometry and per-batch pin set. Every policy owns one, and treats it
     /// identically, which is why the two batch methods below are defaults over it rather
     /// than the same four lines written out once per policy.
-    fn base(&mut self) -> &mut TierGeomAndBudget;
+    fn geom(&mut self) -> &mut TierGeomAndBudget;
     fn contains(&self, k: u32) -> bool;
     /// Record an access and report whether it landed. A hit refreshes recency IN its tier
     /// and returns true; a miss changes nothing and returns false — `admit` is its other half.
@@ -38,20 +38,20 @@ pub trait HybridPolicy {
     /// Start a new batch (`RoutedPool::submit`): clears the per-batch pin set so the
     /// next batch's evictions may reclaim the previous batch's keys again.
     fn begin_batch(&mut self) {
-        self.base().pinned.clear();
+        self.geom().pinned.clear();
     }
     /// Pin a just-hit key for the rest of this batch — eviction must not take it, else
     /// the pin can't resolve its slot ("expert not resident after alloc"). Touching to
     /// MRU is NOT enough: `hit` already promotes the access to its tier's MRU end, and a
     /// big/skewed batch can still drain a whole tier past that end.
     fn protect(&mut self, k: u32) {
-        self.base().pinned.insert(k);
+        self.geom().pinned.insert(k);
     }
 }
 
 /// Byte geometry + the per-batch pin set: the state every policy carries identically.
 ///
-/// `pub` only because [`HybridPolicy::base`] is — every field is private and every method
+/// `pub` only because [`HybridPolicy::geom`] is — every field is private and every method
 /// is module-local, so nothing outside this file can do anything with one. It exists so
 /// `begin_batch`/`protect` are written once instead of once per policy.
 pub struct TierGeomAndBudget {
@@ -82,7 +82,7 @@ impl TierGeomAndBudget {
     }
 }
 
-/// Emit [`HybridPolicy::base`] for a policy that carries its [`TierGeomAndBudget`] as field `b`.
+/// Emit [`HybridPolicy::geom`] for a policy that carries its [`TierGeomAndBudget`] as field `b`.
 ///
 /// Three tokens of glue that cannot be a trait default — a default body cannot name a
 /// field — so all three policies wrote it out, and `cargo fmt` made the three copies
@@ -90,9 +90,9 @@ impl TierGeomAndBudget {
 /// impl). This macro is the single place the "field `b`" convention is stated; the
 /// alternative, storing `TierGeomAndBudget` outside the policy, would reshape the trait and every
 /// call site in `pin.rs` for no behaviour change.
-macro_rules! impl_base {
+macro_rules! impl_geom {
     () => {
-        fn base(&mut self) -> &mut TierGeomAndBudget {
+        fn geom(&mut self) -> &mut TierGeomAndBudget {
             &mut self.b
         }
     };
@@ -253,7 +253,7 @@ impl HybridLru {
     }
 }
 impl HybridPolicy for HybridLru {
-    impl_base!();
+    impl_geom!();
     fn contains(&self, k: u32) -> bool {
         self.cold.contains(k) || self.hot.contains(k)
     }
@@ -327,7 +327,7 @@ impl HybridTwoQ {
     }
 }
 impl HybridPolicy for HybridTwoQ {
-    impl_base!();
+    impl_geom!();
     fn contains(&self, k: u32) -> bool {
         self.am.contains(k) || self.a1in.contains(k)
     }
@@ -420,7 +420,7 @@ impl HybridArc {
     }
 }
 impl HybridPolicy for HybridArc {
-    impl_base!();
+    impl_geom!();
     fn contains(&self, k: u32) -> bool {
         self.t1.contains(k) || self.t2.contains(k)
     }

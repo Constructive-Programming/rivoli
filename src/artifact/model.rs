@@ -577,10 +577,16 @@ pub struct V4Config {
     /// only the remaining `iters - 1` passes are the plain row/column refinements. So zero
     /// loses the refinement, not the normalization.
     ///
-    /// The reason the value must be *read* rather than *checked* is unchanged: a numeric
-    /// gate cannot pin the shipped 20, because at 20 a 4x4 positive matrix is far past
-    /// convergence and 19 and 20 agree bit-for-bit (`launch_hc_pre`'s doc, and
-    /// `tests/v4_oracle.rs::sinkhorn_has_converged_long_before_iteration_20`).
+    /// The reason the value must be *read* rather than *checked* is unchanged: it is a
+    /// config value, and the engine reading its own is not something a gate substitutes for.
+    ///
+    /// > **CORRECTED 2026-08-07.** This said a numeric gate *cannot* pin the shipped 20,
+    /// > "because at 20 a 4x4 positive matrix is far past convergence and 19 and 20 agree
+    /// > bit-for-bit". That is the toy fixture's behaviour, not the checkpoint's: on real
+    /// > weights 19 vs 20 moves 39,893/53,248 of `L0.pre.ffn_norm_out` and all 78 router
+    /// > weights, so a golden emitted from the checkpoint DOES distinguish them. The full
+    /// > measurement and how the error happened are in
+    /// > `tests/v4_oracle.rs::sinkhorn_has_converged_long_before_iteration_20`.
     ///
     /// **Carried with no reader in this crate yet, deliberately**, exactly as `index_topk`
     /// and `routed_scale` are: the layer loop that would read it does not exist. The

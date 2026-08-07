@@ -285,10 +285,17 @@
 //! it. Transcribing `hc_post` + the MoE is the work, and it is now unblocked — Track 0 released
 //! these files on 2026-08-06.
 //!
-//! **Owed, tracked nowhere else:** `src/bin/v4-oracle.rs`'s `emit()` hardcodes `Defect::None`. A
-//! `--defect` flag would put a perturbed golden one command away and let the four bounds above be
-//! re-derived through THIS gate rather than through a host transcription — which is the one
-//! weakness the derivation still has. `Defect::ALL` already enumerates the breakages.
+//! **Both owed items now have plans, 2026-08-07.** They were tracked nowhere but this header
+//! until then, which is why the second one had sat unbuilt since it was first named:
+//!
+//! * `docs/investigations/ffn-norm-out-envelope.md` — the envelope for these two tensors, and
+//!   the refuted differing-element-fraction substitute above.
+//! * `docs/investigations/real-weights-defect-goldens.md` — `src/bin/v4-oracle.rs`'s `emit()`
+//!   hardcodes `Defect::None`; a `--defect` flag would put a perturbed golden one command away
+//!   and let the four bounds above be re-derived through THIS gate rather than through a host
+//!   transcription, which is the one weakness the derivation still has. `Defect::ALL` already
+//!   enumerates the breakages. Newly justified: the checkpoint discriminates a defect the toy
+//!   fixture is bit-blind to.
 
 // `rocm`: `v4gpu` is `rocm`-gated because every launcher it drives is `backend::hip`'s, and
 // since 2026-08-06 that is the only backend. The rule this cites — do not add stubs that

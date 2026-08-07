@@ -482,7 +482,7 @@ fn drive_script(
             lw: &m.layers[layer],
             layer,
             input_ids: &ids,
-            phase: &tag,
+            step_tag: &tag,
             s,
             start_pos,
         };

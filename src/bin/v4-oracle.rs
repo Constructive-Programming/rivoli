@@ -379,7 +379,7 @@ fn drive(
                 s: n,
                 start_pos,
                 input_ids: &here,
-                phase: &tag,
+                step_tag: &tag,
             };
             o.run_layer(&step, &mut states[l], &mut h, cap);
         }

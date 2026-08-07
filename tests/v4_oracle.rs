@@ -550,7 +550,7 @@ fn run(layer: usize, prompt: usize, defect: Defect) -> Run {
             s,
             start_pos,
             input_ids: &ids,
-            phase: &tag,
+            step_tag: &tag,
         };
         o.run_layer(&step, &mut st, &mut h, &mut caps[slot]);
         // The head tail, on THIS layer's output. `bin/v4-oracle` deliberately refuses to do
@@ -2140,7 +2140,7 @@ fn softplus_threshold_only_matters_for_large_router_logits() {
                 s: 5,
                 start_pos: 0,
                 input_ids: &ids,
-                phase: "g",
+                step_tag: "g",
             };
             let mut counters = Default::default();
             got.push((o.gate(&step, &x, &mut counters).0, counters));
