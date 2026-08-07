@@ -7,8 +7,19 @@
 //!
 //! ```text
 //! v4-oracle emit    --model /var/db/rivoli/deepseek-v4-flash-0731 --out goldens.bin
+//! v4-oracle emit    --defect RopeHalfSplit --out goldens-ropehalfsplit.bin ...
 //! v4-oracle defects --model /var/db/rivoli/deepseek-v4-flash-0731 --layer 2
+//! v4-oracle cmp     base.bin perturbed.bin
 //! ```
+//!
+//! `--defect` emits the goldens under one deliberate breakage, so a derived tolerance can be
+//! checked THROUGH the gate it protects instead of beside it
+//! (`docs/investigations/real-weights-defect-goldens.md`). The defect name is written into
+//! the file's own metadata and `GoldenSet::expect_defect` refuses a mismatch at load; the
+//! `--out` name must carry the defect name too, so a perturbed file cannot sit at a neutral
+//! path. `cmp` prints every tensor of two golden files, zeros included -- the bit-identical
+//! rows are the informative half of a defect A/B, because a defect that moves everything
+//! proves nothing.
 //!
 //! **Read `tests/v4_oracle.rs` before trusting a golden from this.** That file is where the
 //! gate is *proved* — ~40 deliberate breakages, each asserted both to perturb the goldens it
@@ -39,11 +50,21 @@ const PROMPT: &str = "The capital of France is Paris, and the capital of Japan i
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let cmd = args.next().unwrap_or_default();
+    if cmd == "cmp" {
+        // Positional paths, deliberately: `cmp --a x --b y` invites transposing the flag
+        // names, and the two files are not symmetric (A is the base `max_rel` scales by).
+        let (a, b) = (args.next(), args.next());
+        let (Some(a), Some(b), None) = (a, b, args.next()) else {
+            bail!("usage: v4-oracle cmp <base.bin> <perturbed.bin>");
+        };
+        return cmp_goldens(Path::new(&a), Path::new(&b));
+    }
     let mut model = PathBuf::from("/var/db/rivoli/deepseek-v4-flash-0731");
     let mut out = PathBuf::from("v4-goldens.bin");
     let mut layers = 4usize;
     let mut decode_steps = 2usize;
     let mut layer = 2usize;
+    let mut defect: Option<Defect> = None;
     let mut rest = args;
     let mut seen: Vec<String> = Vec::new();
     while let Some(flag) = rest.next() {
@@ -54,6 +75,19 @@ fn main() -> Result<()> {
             "--layers" => layers = next(&mut rest, &flag)?.parse()?,
             "--decode-steps" => decode_steps = next(&mut rest, &flag)?.parse()?,
             "--layer" => layer = next(&mut rest, &flag)?.parse()?,
+            // An unknown name is a hard refusal that lists every variant -- see
+            // `Defect::from_flag`. `--defect None` is spellable and goes through the same
+            // path as omitting the flag, so the base arm of an A/B is the same code.
+            // A SECOND `--defect` refuses rather than last-wins: `--defect X --defect None`
+            // would write a CLEAN golden to a path named X -- exactly the file that lies to
+            // the human the out-name rule below protects (review, 2026-08-07).
+            "--defect" => {
+                if defect.is_some() {
+                    bail!("--defect given twice");
+                }
+                defect =
+                    Some(Defect::from_flag(&next(&mut rest, &flag)?).map_err(anyhow::Error::msg)?);
+            }
             other => bail!("unknown argument {other}"),
         }
     }
@@ -64,11 +98,21 @@ fn main() -> Result<()> {
         "defects" if seen.iter().any(|f| f == "--out" || f == "--layers") => {
             bail!("defects takes --layer; it writes no file and drives one layer")
         }
-        "emit" => emit(&model, &out, layers, decode_steps),
+        "defects" if seen.iter().any(|f| f == "--defect") => {
+            bail!("defects drives every breakage itself; --defect belongs to emit")
+        }
+        "emit" => emit(
+            &model,
+            &out,
+            layers,
+            decode_steps,
+            defect.unwrap_or(Defect::None),
+        ),
         "defects" => defects(&model, layer, decode_steps),
         _ => bail!(
-            "usage:\n  v4-oracle emit    [--model DIR] [--out FILE] [--layers N] [--decode-steps K]\
-             \n  v4-oracle defects [--model DIR] [--layer L] [--decode-steps K]"
+            "usage:\n  v4-oracle emit    [--model DIR] [--out FILE] [--layers N] [--decode-steps K] [--defect NAME]\
+             \n  v4-oracle defects [--model DIR] [--layer L] [--decode-steps K]\
+             \n  v4-oracle cmp     <base.bin> <perturbed.bin>"
         ),
     }
 }
@@ -406,10 +450,35 @@ fn open(model: &Path) -> Result<(V4Config, Checkpoint, Vec<u32>)> {
 // emit
 // ---------------------------------------------------------------------------------------
 
-fn emit(model: &Path, out: &Path, layers: usize, decode_steps: usize) -> Result<()> {
+fn emit(
+    model: &Path,
+    out: &Path,
+    layers: usize,
+    decode_steps: usize,
+    defect: Defect,
+) -> Result<()> {
+    let name = format!("{defect:?}");
+    if defect != Defect::None {
+        // A perturbed golden is an instrument artefact and must never sit at a path a
+        // benchmark or a gate could pick up by default -- `v4-goldens.bin` most of all.
+        // The file's own metadata is the check the LOADER enforces; this one is for the
+        // human who ls's a directory of .bin files six weeks from now.
+        let file_name = out.file_name().and_then(|f| f.to_str()).unwrap_or_default();
+        if !file_name
+            .to_ascii_lowercase()
+            .contains(&name.to_ascii_lowercase())
+        {
+            bail!(
+                "--defect {name} requires an --out whose file name carries the defect name \
+                 (got {file_name:?}) -- a perturbed golden at a neutral path is the hazard \
+                 this flag was designed around"
+            );
+        }
+        eprintln!("PERTURBED EMIT: every golden below is wrong on purpose ({name})");
+    }
     let (cfg, ck, ids) = open(model)?;
     let s = ids.len();
-    let o = Oracle::new(cfg.clone(), Defect::None);
+    let o = Oracle::new(cfg.clone(), defect);
     let hw = ck.dense("embed.weight")?;
     // The head tail runs on its OWN probe, never on the layer chain's residual -- see
     // `fixed_probe`. That is why it is loaded here and not threaded through `drive`.
@@ -437,6 +506,9 @@ fn emit(model: &Path, out: &Path, layers: usize, decode_steps: usize) -> Result<
     head_goldens(&o, &tw, &cfg, &fixed_probe(&cfg, s), &mut cap);
 
     let meta = vec![
+        // Written for EVERY emit, `None` included: a reader must be able to distinguish
+        // "declared unperturbed" from "predates the flag" without guessing.
+        (rivoli::v4oracle::golden::DEFECT_KEY.into(), name),
         ("model".into(), model.display().to_string()),
         ("prompt".into(), PROMPT.to_string()),
         ("prompt_ids".into(), format!("{ids:?}")),
@@ -554,5 +626,84 @@ fn defects(model: &Path, layer: usize, decode_steps: usize) -> Result<()> {
             }
         );
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------
+// cmp, over two golden FILES
+// ---------------------------------------------------------------------------------------
+
+/// Print how two golden files differ, EVERY tensor, zeros included.
+///
+/// The zero rows are the point. A defect's evidence is bidirectional -- the tensors it
+/// claims to move must move, and everything else must be bit-identical -- and the second
+/// half is the informative one, because a defect that moves everything proves nothing.
+/// `defects` answers that in memory for one probe-driven layer; this answers it for the
+/// emit path's real layer chain, which is what `tests/v4_loop.rs` actually consumes.
+///
+/// The one thing it DOES refuse is a pair taken at different prompts: every tensor then
+/// differs for a reason that is not a defect, and the table would read as "moves
+/// everything" -- the exact misreading the zero rows exist to prevent. (A layers or
+/// decode-steps mismatch needs no guard: it floods the table with MISSING rows, which is
+/// its own signal.) Beyond that, the diff itself is judged by whoever runs the A/B; two
+/// identical files are branded by the summary line, and the header names what each side
+/// claims to be. Exits nonzero only on an unreadable file or that provenance mismatch.
+fn cmp_goldens(a: &Path, b: &Path) -> Result<()> {
+    let read = |p: &Path| -> Result<GoldenSet> {
+        let f = std::fs::File::open(p).with_context(|| format!("opening {}", p.display()))?;
+        GoldenSet::read(&mut std::io::BufReader::new(f))
+    };
+    let (ga, gb) = (read(a)?, read(b)?);
+    if ga.meta_get("prompt_ids") != gb.meta_get("prompt_ids") {
+        bail!(
+            "the two files were emitted at different prompts -- every tensor would differ \
+             for a reason that is not a defect"
+        );
+    }
+    println!("A: {} (--defect {})", a.display(), ga.defect());
+    println!("B: {} (--defect {})", b.display(), gb.defect());
+    let cap = |g: GoldenSet| Capture {
+        floats: g.floats,
+        ints: g.ints,
+        counters: Default::default(),
+    };
+    // B first: `diff` scales `rel` by its SECOND argument, and the base (A) is the
+    // reference a perturbation should be read against. Scaling by the perturbed side
+    // understates a defect that inflates a tensor and explodes on one that collapses it
+    // toward zero (review, 2026-08-07). `changed` is symmetric either way.
+    let ds = diff(&cap(gb), &cap(ga));
+    let structural = ds.iter().filter(|d| d.changed == usize::MAX).count();
+    let moved = ds.iter().filter(|d| d.changed > 0).count() - structural;
+    println!(
+        "{:<32} {:>9}/{:<9} {:>11}",
+        "tensor", "changed", "total", "max_rel"
+    );
+    for d in &ds {
+        // `usize::MAX` is `diff`'s marker for a tensor missing on one side or reshaped --
+        // see `diff_section`. Printed as what it means, not as a 20-digit count.
+        if d.changed == usize::MAX {
+            println!("{:<32} MISSING ON ONE SIDE, OR RESHAPED", d.name);
+        } else {
+            println!(
+                "{:<32} {:>9}/{:<9} {:>11.3e}",
+                d.name, d.changed, d.total, d.rel
+            );
+        }
+    }
+    // Structural rows counted apart from moved ones: every number above is elementwise,
+    // and a summary that folded "reshaped" into "differs" would not be the same statistic
+    // as its own table.
+    let s = (structural > 0)
+        .then(|| format!(" ({structural} structurally mismatched)"))
+        .unwrap_or_default();
+    println!(
+        "{moved} of {} tensors differ{s}{}",
+        ds.len(),
+        if moved == 0 && structural == 0 {
+            " -- IDENTICAL FILES: this pair cannot A/B anything"
+        } else {
+            ""
+        }
+    );
     Ok(())
 }

@@ -316,8 +316,19 @@ def goldens(path):
         o += n
         return v
 
+    meta = {}
     for _ in range(u64()):
-        s(), s()
+        k = s()
+        meta[k] = s()
+    # `v4-oracle emit --defect` (2026-08-07) writes the perturbation name into this header,
+    # and EVERY consumer must refuse a mismatch, not only the Rust gate: an envelope derived
+    # from a deliberately-wrong golden is an instrument artefact with nothing in the output
+    # to say so. Files older than the flag carry no key and are necessarily unperturbed.
+    defect = meta.get("defect", "None")
+    assert defect == "None", (
+        f"{path} was emitted under --defect {defect}; this probe derives the envelope of a "
+        "CORRECT implementation and must never read a perturbed golden"
+    )
     out = {}
     for _ in range(u64()):
         name = s()

@@ -2163,3 +2163,28 @@ fn softplus_threshold_only_matters_for_large_router_logits() {
         );
     }
 }
+
+/// The `--defect` flag's parser, both directions -- `v4-oracle emit` trusts it to make a
+/// typo IMPOSSIBLE to mistake for `None`, because a silent fallback would emit two
+/// identical goldens and an A/B that cannot fail.
+#[test]
+fn defect_from_flag_roundtrips_and_refuses_loudly() {
+    // `ALL` includes `None` first, so this also proves `--defect None` is spellable --
+    // the base arm of an A/B goes through the same code path as omitting the flag.
+    for &d in Defect::ALL {
+        assert_eq!(Defect::from_flag(&format!("{d:?}")), Ok(d));
+    }
+    // The refusal must LIST every variant -- the message is how a caller discovers the
+    // spelling, and a list that silently dropped one would make that variant unreachable
+    // from the command line in practice.
+    let err = Defect::from_flag("RopeHalfSplt").expect_err("a typo must refuse");
+    for &d in Defect::ALL {
+        assert!(
+            err.contains(&format!("{d:?}")),
+            "the refusal must list {d:?}: {err}"
+        );
+    }
+    // Exact match only. Forgiving case would put every name one typo away from another,
+    // and the cost of strictness is one re-run with the spelling the error just printed.
+    Defect::from_flag("ropehalfsplit").expect_err("case must not be forgiven");
+}

@@ -296,6 +296,12 @@
 //!   transcription, which is the one weakness the derivation still has. `Defect::ALL` already
 //!   enumerates the breakages. Newly justified: the checkpoint discriminates a defect the toy
 //!   fixture is bit-blind to.
+//!
+//!   **BUILT 2026-08-07.** `emit --defect <name>` exists; the file's own metadata carries the
+//!   name and `open_goldens` refuses a mismatch against `RIVOLI_V4_GOLDENS_DEFECT` (default
+//!   `None`) before comparing anything. The host-side bidirectional evidence and the exact
+//!   through-the-gate runs, with their pre-registered predictions, are in that doc — the GPU
+//!   half had not run when this note was written.
 
 // `rocm`: `v4gpu` is `rocm`-gated because every launcher it drives is `backend::hip`'s, and
 // since 2026-08-06 that is the only backend. The rule this cites — do not add stubs that
@@ -340,6 +346,17 @@ const CAPACITY: usize = 5 << 30;
 /// Where `v4-oracle emit --layers 2 --decode-steps 1` put its output.
 const GOLDENS_ENV: &str = "RIVOLI_V4_GOLDENS";
 const GOLDENS_DEFAULT: &str = "/var/db/rivoli/v4-goldens-l2.bin";
+
+/// The `--defect` the golden file must declare -- `"None"` unless set.
+///
+/// Set it ONLY to score this gate against a deliberately perturbed golden
+/// (`docs/investigations/real-weights-defect-goldens.md`); the run is then EXPECTED red on
+/// the tensors that defect moves, and a green is the finding. Same env-var idiom as
+/// [`GOLDENS_ENV`], and fail-safe in both directions: the file's own header is checked
+/// against this before anything is compared, so a perturbed golden at the default path
+/// fails at load instead of reading as an engine defect, and a stale expectation against a
+/// clean file fails the same way.
+const GOLDENS_DEFECT_ENV: &str = "RIVOLI_V4_GOLDENS_DEFECT";
 
 /// How far apart two tensors are, in the two units that mean different things.
 ///
@@ -558,10 +575,7 @@ fn golden<'g>(gs: &'g GoldenSet, name: &str) -> &'g [f32] {
 }
 
 fn meta<'g>(gs: &'g GoldenSet, key: &str) -> &'g str {
-    gs.meta
-        .iter()
-        .find(|(k, _)| k == key)
-        .map(|(_, v)| v.as_str())
+    gs.meta_get(key)
         .unwrap_or_else(|| panic!("the golden file carries no {key:?} in its metadata"))
 }
 
@@ -586,12 +600,32 @@ fn prompt_ids(gs: &GoldenSet) -> Vec<u32> {
 fn open_goldens() -> Option<GoldenSet> {
     let named = std::env::var(GOLDENS_ENV).ok();
     let path = named.clone().unwrap_or_else(|| GOLDENS_DEFAULT.to_string());
+    let expected = std::env::var(GOLDENS_DEFECT_ENV).unwrap_or_else(|_| "None".into());
+    // A typo'd expectation must fail as "unknown name", not as a file mismatch: the
+    // mismatch message cannot say which side is wrong, and this one can.
+    rivoli::v4oracle::forward::Defect::from_flag(&expected)
+        .unwrap_or_else(|e| panic!("{GOLDENS_DEFECT_ENV}: {e}"));
     match std::fs::File::open(&path) {
-        Ok(mut f) => Some(GoldenSet::read(&mut f).expect("reading the golden file")),
+        Ok(mut f) => {
+            let gs = GoldenSet::read(&mut f).expect("reading the golden file");
+            // The loader-side half of the --defect contract; unit-tested in
+            // `v4oracle/golden.rs`. Runs before ANY comparison, so a perturbed file never
+            // gets far enough to go numerically red for the wrong reason.
+            gs.expect_defect(&expected)
+                .unwrap_or_else(|e| panic!("{path}: {e}"));
+            if expected != "None" {
+                eprintln!("goldens declare --defect {expected}: scoring the gate, red is expected");
+            }
+            Some(gs)
+        }
         Err(e) => {
-            // An explicitly-set path that does not resolve is a failure, not a skip.
+            // An explicitly-set path that does not resolve is a failure, not a skip — and so
+            // is a defect EXPECTATION with no file to check it against: skipping would record
+            // the gate as having survived a defect it was never scored on (the false-finding
+            // shape review named on 2026-08-07, since arms of the scoring protocol read
+            // "green is the finding").
             assert!(
-                named.is_none(),
+                named.is_none() && std::env::var(GOLDENS_DEFECT_ENV).is_err(),
                 "{GOLDENS_ENV}={path} does not open ({e}) — refusing to pass by skipping"
             );
             eprintln!(
@@ -897,6 +931,14 @@ fn every_layer_matches_the_oracle_at_real_weights(
 fn the_v4_layer_loop() {
     let refused = a_pin_that_does_not_start_at_layer_zero_cannot_decode();
     let Some(dir) = v4_artifact("resident.safetensors") else {
+        // This skip runs BEFORE open_goldens, so its green must also be forbidden when a
+        // defect expectation is set — otherwise a missing artifact turns a scoring run into
+        // a pass and the expectation is never consulted at all.
+        assert!(
+            std::env::var(GOLDENS_DEFECT_ENV).is_err(),
+            "{GOLDENS_DEFECT_ENV} is set but there is no artifact to score against — \
+             refusing to pass by skipping"
+        );
         // Say what did and did not run. A green result on a machine with neither fixture is
         // vacuous, and the only thing worse than that is not knowing it was.
         eprintln!(

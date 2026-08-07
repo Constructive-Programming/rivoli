@@ -303,6 +303,28 @@ impl Defect {
     pub fn breakages() -> impl Iterator<Item = Defect> {
         Self::ALL.iter().copied().filter(|d| *d != Defect::None)
     }
+
+    /// The variant whose `Debug` name is exactly `name` -- the parser behind
+    /// `v4-oracle emit --defect`.
+    ///
+    /// The `Err` carries EVERY variant name, because the caller's one job is to refuse
+    /// loudly: a typo that silently fell back to `None` would emit two identical goldens
+    /// and an A/B that cannot fail -- this repo's most-repeated failure shape, and the
+    /// reason this is `Result` rather than `Option`. Exact match only; forgiving case
+    /// would put every name one typo away from a different one.
+    pub fn from_flag(name: &str) -> Result<Defect, String> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|d| format!("{d:?}") == name)
+            .ok_or_else(|| {
+                let all: Vec<String> = Self::ALL.iter().map(|d| format!("{d:?}")).collect();
+                format!(
+                    "unknown defect {name:?}. The variants are: {}",
+                    all.join(", ")
+                )
+            })
+    }
 }
 
 // ---------------------------------------------------------------------------------------

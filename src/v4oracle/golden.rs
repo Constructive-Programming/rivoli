@@ -10,6 +10,11 @@ use std::io::{Read, Write};
 
 const MAGIC: &[u8; 8] = b"RIVV4GLD";
 
+/// The metadata key `v4-oracle emit` records its `--defect` under -- one constant, because
+/// the writer (the bin) and the readers below must agree on the spelling or the check
+/// silently degrades to "every file is legacy".
+pub const DEFECT_KEY: &str = "defect";
+
 pub struct GoldenSet {
     /// Free-form provenance: the config, the prompt, the commit. Written into the file so a
     /// golden can never be separated from what produced it.
@@ -51,6 +56,46 @@ impl GoldenSet {
         let floats = get_tensors(r, f32::from_le_bytes)?;
         let ints = get_tensors(r, i64::from_le_bytes)?;
         Ok(Self { meta, floats, ints })
+    }
+
+    /// One metadata value by key. The single lookup every consumer goes through --
+    /// [`GoldenSet::defect`], `tests/v4_loop.rs::meta`, `cmp`'s provenance check -- because
+    /// three hand-rolled `.iter().find(...)` chains over the same field are a jscpd clone
+    /// waiting to be typed (review, 2026-08-07).
+    pub fn meta_get(&self, key: &str) -> Option<&str> {
+        self.meta
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The `Defect` name this set was emitted under.
+    ///
+    /// A file with no [`DEFECT_KEY`] predates the `--defect` flag (2026-08-07) and was
+    /// therefore produced by a binary that could only run `Defect::None` -- absence IS
+    /// `"None"`, not an unknown. Every emit since writes the key unconditionally,
+    /// `"None"` included, so treating absence as `None` is not a fail-open going forward.
+    pub fn defect(&self) -> &str {
+        self.meta_get(DEFECT_KEY).unwrap_or("None")
+    }
+
+    /// Refuse a set emitted under any defect other than `expected`.
+    ///
+    /// The loader-side half of the `--defect` contract
+    /// (`docs/investigations/real-weights-defect-goldens.md`): a perturbed golden that can
+    /// be mistaken for a `Defect::None` one is worse than no perturbation feature at all.
+    /// A gate that calls this before comparing fails AT LOAD on a mismatched file, instead
+    /// of going numerically red in a way that reads as an engine defect.
+    pub fn expect_defect(&self, expected: &str) -> Result<()> {
+        let got = self.defect();
+        if got == expected {
+            Ok(())
+        } else {
+            bail!(
+                "this golden set was emitted under --defect {got}, but the comparison \
+                 expects {expected} -- refusing to score against a perturbed reference"
+            )
+        }
     }
 }
 
@@ -223,4 +268,53 @@ fn get_str(r: &mut impl Read) -> Result<String> {
     let mut b = vec![0u8; n];
     r.read_exact(&mut b)?;
     Ok(String::from_utf8(b)?)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
+mod tests {
+    use super::*;
+
+    /// A minimal set, pushed through the SAME write/read the gate uses -- an in-memory
+    /// struct would not prove the header survives the file format.
+    fn roundtrip(meta: Vec<(String, String)>) -> GoldenSet {
+        let g = GoldenSet {
+            meta,
+            floats: vec![("t".into(), vec![2], vec![1.0, 2.0])],
+            ints: vec![],
+        };
+        let mut buf = Vec::new();
+        g.write(&mut buf).expect("write");
+        GoldenSet::read(&mut buf.as_slice()).expect("read")
+    }
+
+    #[test]
+    fn a_perturbed_golden_cannot_pass_as_none() {
+        let g = roundtrip(vec![(DEFECT_KEY.into(), "RopeHalfSplit".into())]);
+        assert_eq!(g.defect(), "RopeHalfSplit");
+        let err = g
+            .expect_defect("None")
+            .expect_err("the mismatch must refuse");
+        // Both names must appear: the message is the whole diagnosis of a stale env var
+        // OR a stale file, and it cannot say which side is wrong.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RopeHalfSplit") && msg.contains("None"),
+            "{msg}"
+        );
+        g.expect_defect("RopeHalfSplit")
+            .expect("the declared match must pass");
+    }
+
+    #[test]
+    fn a_legacy_file_without_the_key_is_none() {
+        // Pre-flag files were emitted by a binary that could only run `Defect::None`,
+        // so absence is a safe `None` -- but only for files that really lack the key.
+        let g = roundtrip(vec![("model".into(), "/x".into())]);
+        assert_eq!(g.defect(), "None");
+        g.expect_defect("None")
+            .expect("legacy files must stay loadable");
+        g.expect_defect("RopeHalfSplit")
+            .expect_err("a legacy file must not satisfy a perturbed expectation");
+    }
 }
