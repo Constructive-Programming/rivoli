@@ -575,6 +575,40 @@ impl AttnStages {
     }
 }
 
+/// Per-token decode phase buckets — V4's half of GLM's always-on PROFILE line, under
+/// GLM's discipline (`gpu.rs::Profile`): every span wraps host work or a blocking call the
+/// decode already pays, so accumulating costs two `Instant` reads per bracket and adds no
+/// device sync, event, or join. Two fields and not `ProfileSummary`, because that struct's
+/// other axes (class spans, the indexer, MTP) would print zeros here and a zero that means
+/// "not measured" reading as "measured zero" is this repo's named telemetry trap.
+///
+/// What each bucket brackets, exactly — the names follow GLM's and approximate like GLM's:
+///
+/// * `route_ns` — the gate-logits D2H plus [`V4Engine::route_row`]'s host math. The D2H is
+///   the layer's FIRST blocking call and the null stream carries everything before it, so
+///   the wait drains the attention half, both `hc_pre`/norm launches and the gate GEMV
+///   still in flight: most of `route` is attention GPU time, not routing. GLM's `route`
+///   contains the same drain behind the same D2H, which is what keeps the columns
+///   comparable — and is why the HB=16 attention win was quoted in `route` there.
+/// * `moe_ns` — [`V4Engine::shared_expert`] plus [`V4Engine::routed_experts`]: the shared
+///   expert's launches, the pool submit, both existing `device_sync`s (expert compute and
+///   whatever fetch was not hidden behind it), and the drain launch. The analog of GLM's
+///   `moe` block_on wall.
+/// * fetch, miss count, ms/miss and GB/token come from [`crate::memory::RoutedPool`]'s own
+///   off-thread counters (`fetch_ns`, `misses`), exactly the values GLM's summary reads —
+///   the reaper's wall overlaps the decode's, so fetch is NOT a share of wall there or here.
+///
+/// The remainder printed with them is `wall − route − moe`: the decode thread outside the
+/// two brackets — attention/norm/hc LAUNCH time (their GPU time drains into `route`), the
+/// end-of-layer sync (acc drain + `hc_post`), and the whole head tail (`hc_head`, final
+/// norm, the bf16 lm_head GEMV, argmax sync + D2H). Non-negative by construction: both
+/// buckets are sub-spans of the decode wall on one thread.
+#[derive(Default)]
+struct V4Profile {
+    route_ns: u128,
+    moe_ns: u128,
+}
+
 /// Everything one V4 decode needs that does not vary between tokens.
 ///
 /// Every device buffer is allocated once in [`V4Engine::new`] and none per token, which is
@@ -672,6 +706,7 @@ pub struct V4Engine {
     miss_stream: Stream,
     hits0: u64,
     misses0: u64,
+    prof: V4Profile,
 }
 
 impl V4Engine {
@@ -811,6 +846,7 @@ impl V4Engine {
             miss_stream: Stream::miss()?,
             hits0,
             misses0,
+            prof: V4Profile::default(),
             pin,
             cfg,
         };
@@ -1520,12 +1556,21 @@ impl V4Engine {
             launch_act_quant_f8(xq.cast(), m, dim, std::ptr::null_mut())?;
         }
         // The one blocking D2H on the per-layer path, and GLM pays the same one: `route_into` is
-        // host math. `m * n_experts` f32 — 1 KB at decode.
+        // host math. `m * n_experts` f32 — 1 KB at decode. The bracket is free — the D2H is a
+        // join the path already pays (see [`V4Profile`] for what its wait actually contains).
+        let t0 = std::time::Instant::now();
         self.gate_logits.copy_out_into(&mut self.gl_host)?;
+        self.prof.route_ns += t0.elapsed().as_nanos();
+        let t0 = std::time::Instant::now();
         self.shared_expert(layer, m)?;
+        self.prof.moe_ns += t0.elapsed().as_nanos();
         for t in 0..m {
+            let r0 = std::time::Instant::now();
             self.route_row(layer, t)?;
+            let r1 = std::time::Instant::now();
             self.routed_experts(layer, t)?;
+            self.prof.route_ns += r1.duration_since(r0).as_nanos();
+            self.prof.moe_ns += r1.elapsed().as_nanos();
         }
         Ok(())
     }
@@ -2084,6 +2129,12 @@ impl V4Engine {
         let mut cur = self.argmax()?;
         let mut out = Vec::with_capacity(max_new);
         let t1 = std::time::Instant::now();
+        // Decode-only buckets: whatever the prefill accumulated is discarded here, and the
+        // pool counters are re-read here, so the PROFILE line below decomposes exactly the
+        // wall that `tok/s` is computed over — not the prefill's.
+        self.prof = V4Profile::default();
+        let fetch0 = self.pin.routed.fetch_ns();
+        let miss1 = self.pin.routed.misses();
         let mut pos = prompt.len();
         loop {
             if eos.contains(&cur) {
@@ -2118,6 +2169,34 @@ impl V4Engine {
             100.0 * dh as f64 / (dh + dm).max(1) as f64,
             dm as f64 * stride as f64 / 1e9,
             dm as f64 / out.len().max(1) as f64,
+        );
+        // The per-token phase decomposition, decode-only (see [`V4Profile`] for what each
+        // bucket brackets). Same denominator as `tok/s` above — `out.len()` — so the terms
+        // and the wall stay one arithmetic. `fetch`/`miss` here are the DECODE deltas, where
+        // the hit/miss line above spans prefill too; both GLM conventions, kept so the two
+        // engines' lines read alike.
+        let n = out.len().max(1) as f64;
+        let wall_ms = decode * 1e3 / n;
+        let route_ms = self.prof.route_ns as f64 / 1e6 / n;
+        let moe_ms = self.prof.moe_ns as f64 / 1e6 / n;
+        let fetch_ns = (self.pin.routed.fetch_ns() - fetch0) as f64;
+        let dec_miss = self.pin.routed.misses() - miss1;
+        let remainder_ms = wall_ms - route_ms - moe_ms;
+        debug_assert!(
+            remainder_ms >= 0.0,
+            "negative PROFILE remainder ({remainder_ms:.3} ms/tok): a bucket exceeds the wall"
+        );
+        // No `(gpu Nms)` term: GLM's is a HIP-event bracket on its compute stream, and V4 has
+        // no event pair to read at an existing join yet. Absent rather than zero. moe/fetch at
+        // 0.1 ms where GLM prints whole ms: its moe wall is ~250 ms, V4's terms are expected
+        // an order smaller, and the decomposition exists to resolve them.
+        tracing::info!(
+            "PROFILE/tok: {wall_ms:.1}ms wall | route {route_ms:.1}ms | moe {moe_ms:.1}ms | \
+             fetch {:.1}ms | {:.2} miss, {:.2}ms/miss, {:.2} GB | remainder {remainder_ms:.1}ms",
+            fetch_ns / 1e6 / n,
+            dec_miss as f64 / n,
+            fetch_ns / 1e6 / dec_miss.max(1) as f64,
+            dec_miss as f64 * stride as f64 / 1e9 / n,
         );
         self.pin.routed.flush_trace()?;
         Ok(out)

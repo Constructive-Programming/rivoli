@@ -2791,6 +2791,16 @@ target/release/rivoli /var/db/rivoli/glm52-vq3-full --max-mem 115 -bench 512 --p
 target/release/rivoli /var/db/rivoli/v4-f4-full                  -bench 512 --prompt "<prompt>"
 ```
 
+> **CORRECTED 2026-08-07.** `"<prompt>"` above was the only record of the prompt — the text
+> itself was in no doc, which made the decomposition's flag-identical re-run
+> (`docs/investigations/v4-decode-decomposition.md` M2) impossible to specify. Recovered the
+> same day from the run's own log (the startup tokenizer line quotes it byte-complete;
+> 218 tokens confirmed). It is, verbatim:
+>
+> ```
+> You are the lead engineer for a distributed log-ingestion platform handling 4 TB/day across 12 regions. Design a backpressure-aware streaming pipeline that replaces our current at-least-once Kafka consumer fleet, which is suffering duplicate writes during regional failovers and 95th-percentile end-to-end latency spikes above 30 seconds. Your answer must: (1) propose a concrete architecture naming each component and the protocol between them; (2) explain how exactly-once semantics survive a mid-flight region loss, including the idempotency-key scheme and its storage cost at our volume; (3) give pseudocode for the consumer's flow-control loop, including how it detects and sheds load under downstream store degradation; (4) enumerate the top five failure modes of your own design and the monitoring signal that detects each one before customers do; and (5) lay out a three-phase migration plan from the current fleet with rollback criteria at each phase. Be specific about numbers: partition counts, batch sizes, timeout values, and the reasoning behind each.
+> ```
+
 | | GLM-5.2 (hybrid, dsa, MTP gated) | V4-Flash (.f4, MTP structurally off) |
 |---|---:|---:|
 | prefill, 218 tokens | 72.8 s (layer-major) | **20.12 s** |
