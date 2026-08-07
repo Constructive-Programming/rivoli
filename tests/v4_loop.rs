@@ -264,7 +264,7 @@
 //! * 43 defects run. **13 move nothing at all** on this probe, and only **9 move `ffn_norm_out`.**
 //!   A statistic cannot gate a defect that does not move the tensor, so the fraction's in-scope
 //!   subset here is 9 of 43 — smaller than `max_rel`'s.
-//! * Of those 9 the weakest is **`SinkhornOneFewerIter` at 39,893/53,248 = 74.9%**, against the
+//! * Of those 9 the weakest is **`SinkhornIterCountProbe` at 39,893/53,248 = 74.9%**, against the
 //!   device's **28,141/53,248 = 52.85%**. That is a separation of **1.42x**.
 //!
 //! **1.42x is the same order as the two bounds this file already calls barely-gates** —
@@ -277,7 +277,7 @@
 //!
 //! **CORRECTED the same day, before it was committed.** A first version of this paragraph quoted
 //! "88.5%" as the weakest mover and called it "a real separation". That was read off an
-//! INCOMPLETE run — the matrix was still executing, and `SinkhornOneFewerIter` at 74.9% had not
+//! INCOMPLETE run — the matrix was still executing, and `SinkhornIterCountProbe` at 74.9% had not
 //! printed yet. The conclusion inverted when the run finished. Do not quote this table from a
 //! partial log; it takes 7 minutes and prints `EXIT=0` when it is done.
 //!

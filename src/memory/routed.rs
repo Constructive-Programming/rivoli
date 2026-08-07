@@ -26,7 +26,7 @@ use crate::artifact::format::{ExpertSet, RoutedFmt};
 use crate::backend::memcpy_dtod;
 use crate::fetch::asyncfetch::{AsyncFetch, ReadSpec, Ticket};
 use crate::fetch::stream::{Streamer, slot_span};
-use crate::memory::arena::{Arena, Reloc, Step};
+use crate::memory::arena::{AllocOutcome, Arena, Reloc};
 use crate::memory::cache;
 use crate::memory::device::VmmBuf;
 use crate::memory::hybrid::HybridPolicy;
@@ -340,7 +340,7 @@ impl RoutedPool {
             one_batch as f64 / (1u64 << 30) as f64,
         );
         let policy =
-            crate::memory::hybrid::make(policy_name, budget, cold_stride, hot_stride, two_q)
+            crate::memory::hybrid::policy_for(policy_name, budget, cold_stride, hot_stride, two_q)
                 .with_context(|| format!("unknown --cache-policy {policy_name} (lru|2q|arc)"))?;
         // BOTH tiers named. This printed `Mode` before the split and the naive replacement
         // was `cold.fmt.ext()` alone — which prints `[2q vq3]` for the DEFAULT hybrid mode,
@@ -467,9 +467,9 @@ impl RoutedPool {
         let hot = adm.tier == cache::Tier::Hot;
         let idx = loop {
             match self.arena.alloc_step(hot) {
-                Step::Placed(idx) => break idx,
-                Step::Relocated(r) => self.relocate(r)?,
-                Step::NeedFree => {
+                AllocOutcome::Placed(idx) => break idx,
+                AllocOutcome::Relocated(r) => self.relocate(r)?,
+                AllocOutcome::NeedFree => {
                     bail!("arena NeedFree after policy eviction — byte-accounting bug")
                 }
             }
@@ -718,9 +718,9 @@ impl RoutedPool {
         let mut is_hit = [false; MAX_BATCH];
         for (i, &e) in sel.iter().enumerate() {
             let key = expert_key(layer, e);
-            // `get` refreshes recency; the physical slot is deliberately NOT read here —
-            // phase 1c takes it from `slot_of` after any same-batch relocation settles.
-            if self.policy.get(key) {
+            // The physical slot is deliberately NOT read here — phase 1c takes it from
+            // `slot_of` after any same-batch relocation settles.
+            if self.policy.hit(key) {
                 self.hits += 1;
                 // THE CHECK. A hit hands the kernel a slot pointer and a resolved
                 // RESIDENT ticket, so nothing downstream waits. If the bytes never landed, the

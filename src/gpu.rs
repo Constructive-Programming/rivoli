@@ -2179,7 +2179,7 @@ impl<'a> GpuEngine<'a> {
                 // filled by `RoutedPool::submit` in `union` order (the shared expert is pushed
                 // after, so `take(union.len())` keeps this to the routed picks).
                 if crate::telemetry::spans::enabled() {
-                    let mut st = crate::telemetry::spans::LayerState {
+                    let mut st = crate::telemetry::spans::ExpertComposition {
                         tok: pos as u32,
                         layer: l as i32,
                         ..Default::default()

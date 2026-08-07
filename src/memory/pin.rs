@@ -809,7 +809,7 @@ fn parse_tid2eid(
         "ffn.gate.tid2eid: shape {shape:?} != [{vocab}, {top_k}]"
     );
     // The EXTENT, separately from the shape. `Safetensors::typed` matches the dtype and
-    // nothing else — `Loc.len` comes from the header's `data_offsets` and is never
+    // nothing else — `TensorDesc.len` comes from the header's `data_offsets` and is never
     // confronted with `product(shape) x 8` — so a tensor whose byte span disagrees with its
     // declared shape passes the check above, `chunks_exact` drops the partial tail, and the
     // returned table is SHORT. `V4Route::Hash`'s consumer indexes it at

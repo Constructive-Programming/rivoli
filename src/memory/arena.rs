@@ -9,8 +9,8 @@
 //! expert weights and remaps the key. Pure `usize` bookkeeping here — fully host-tested.
 //!
 //! Driver contract (the pin's alloc loop): call [`Arena::alloc_step`] repeatedly for the
-//! wanted tier until it returns [`Step::Placed`]. On [`Step::Relocated`] copy the slot
-//! bytes and remap that key, then call again; on [`Step::NeedFree`] evict one slot
+//! wanted tier until it returns [`AllocOutcome::Placed`]. On [`AllocOutcome::Relocated`] copy the slot
+//! bytes and remap that key, then call again; on [`AllocOutcome::NeedFree`] evict one slot
 //! (the OTHER tier first) and [`Arena::free`] it, then call again.
 
 /// Relocate the slot at `from` to `to` within the `hot` tier (a device memcpy of one
@@ -22,9 +22,9 @@ pub struct Reloc {
     pub to: usize,
 }
 
-/// One step of allocating a slot. See the module contract.
+/// What one turn of [`Arena::alloc_step`] resolved to. See the module contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Step {
+pub enum AllocOutcome {
     /// A slot of the requested tier is ready at this index — done.
     Placed(usize),
     /// Copy the slot bytes `from`→`to` and remap that key, then call `alloc_step` again.
@@ -135,38 +135,38 @@ impl Arena {
     }
 
     /// One step toward placing a slot of the `hot` tier. See the module contract.
-    pub fn alloc_step(&mut self, hot: bool) -> Step {
+    pub fn alloc_step(&mut self, hot: bool) -> AllocOutcome {
         let need = self.stride(hot);
         // 1) A hole in this tier — reuse it outright.
         if let Some(i) = self.free_list(hot).pop() {
-            return Step::Placed(i);
+            return AllocOutcome::Placed(i);
         }
         // 2) The gap has room — grow this frontier into it.
         if self.gap() >= need {
             let i = self.frontier(hot);
             self.set_frontier(hot, i + 1);
-            return Step::Placed(i);
+            return AllocOutcome::Placed(i);
         }
         // 3) Compact the other tier: relocate its top slot into one of its holes so its
         //    frontier retreats and the gap grows. Needs a hole to move into.
         let other = !hot;
         let ohi = self.frontier(other);
         if ohi == 0 {
-            return Step::NeedFree; // other tier empty — caller must free THIS tier
+            return AllocOutcome::NeedFree; // other tier empty — caller must free THIS tier
         }
         let top = ohi - 1;
         if let Some(h) = self.free_list(other).pop() {
             self.set_frontier(other, top); // top vacated → gap grows by the other stride
             self.retreat(other); // cascade past any hole now exposed at the frontier, so
             // the NEXT compaction never relocates a keyless hole
-            return Step::Relocated(Reloc {
+            return AllocOutcome::Relocated(Reloc {
                 hot: other,
                 from: top,
                 to: h,
             });
         }
         // 4) Other tier is packed solid (no holes) — caller must evict one of its slots.
-        Step::NeedFree
+        AllocOutcome::NeedFree
     }
 }
 
@@ -224,12 +224,12 @@ mod tests {
         fn admit(&mut self, k: u32, hot: bool) {
             loop {
                 match self.a.alloc_step(hot) {
-                    Step::Placed(idx) => {
+                    AllocOutcome::Placed(idx) => {
                         self.at.insert(k, (hot, idx));
                         self.next_free_victim.push(k);
                         break;
                     }
-                    Step::Relocated(r) => {
+                    AllocOutcome::Relocated(r) => {
                         // find the key at (r.hot, r.from), move it to (r.hot, r.to)
                         let moved = *self
                             .at
@@ -239,7 +239,7 @@ mod tests {
                             .0;
                         self.at.insert(moved, (r.hot, r.to));
                     }
-                    Step::NeedFree => {
+                    AllocOutcome::NeedFree => {
                         // evict the oldest victim in the OTHER tier if any, else oldest overall
                         let other = !hot;
                         let pick = self
@@ -291,7 +291,7 @@ mod tests {
         let mut a = Arena::new(30, 3, 3);
         // grow 3 cold
         for i in 0..3 {
-            assert_eq!(a.alloc_step(false), Step::Placed(i));
+            assert_eq!(a.alloc_step(false), AllocOutcome::Placed(i));
         }
         assert_eq!(a.cold_hi, 3);
         // free the top → frontier retreats to 2 (no hole left behind)
@@ -301,7 +301,7 @@ mod tests {
         // free a middle → becomes a hole; next alloc reuses it (not a new frontier slot)
         a.free(false, 0);
         assert_eq!(a.cold_hi, 2);
-        assert_eq!(a.alloc_step(false), Step::Placed(0));
+        assert_eq!(a.alloc_step(false), AllocOutcome::Placed(0));
     }
 
     // Regression: compaction must cascade the frontier retreat, so a SECOND compaction
@@ -314,14 +314,14 @@ mod tests {
         let mut key_at: HashMap<(bool, usize), u32> = HashMap::new();
         for k in 0..5u32 {
             match a.alloc_step(false) {
-                Step::Placed(i) => {
+                AllocOutcome::Placed(i) => {
                     key_at.insert((false, i), k);
                 }
                 s => panic!("cold grow: unexpected {s:?}"),
             }
         }
         match a.alloc_step(true) {
-            Step::Placed(i) => {
+            AllocOutcome::Placed(i) => {
                 key_at.insert((true, i), 100);
             }
             s => panic!("hot grow: unexpected {s:?}"),
@@ -335,14 +335,14 @@ mod tests {
         let mut steps = 0;
         loop {
             match a.alloc_step(true) {
-                Step::Placed(_) => break,
-                Step::Relocated(r) => {
+                AllocOutcome::Placed(_) => break,
+                AllocOutcome::Relocated(r) => {
                     let k = key_at.remove(&(r.hot, r.from)).unwrap_or_else(|| {
                         panic!("relocated a keyless hole at {:?}", (r.hot, r.from))
                     });
                     key_at.insert((r.hot, r.to), k);
                 }
-                Step::NeedFree => panic!("unexpected NeedFree with free bytes available"),
+                AllocOutcome::NeedFree => panic!("unexpected NeedFree with free bytes available"),
             }
             steps += 1;
             assert!(steps < 10, "compaction did not converge");

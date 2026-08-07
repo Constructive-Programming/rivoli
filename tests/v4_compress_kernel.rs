@@ -1189,7 +1189,7 @@ fn in_compressor_scope(d: Defect) -> bool {
         | Defect::RouteWeightAfterW2
         | Defect::SharedExpertWeighted
         | Defect::Fp4NibbleSwap
-        | Defect::SinkhornOneFewerIter
+        | Defect::SinkhornIterCountProbe
         | Defect::SinkhornCombTransposed
         | Defect::HcPostNoComb
         | Defect::HcPreNoRsqrt

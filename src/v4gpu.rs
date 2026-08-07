@@ -215,14 +215,14 @@ impl RopeTables {
     }
 }
 
-/// One compressor call's phase.
+/// The rows one compressor/attention call covers, and where they start.
 ///
 /// A struct because `seqlen` and `start_pos` are two `usize` in a row, every permutation
 /// type-checks, and the failure is not a panic: `compress`, `should_compress`, `compress_dst`,
 /// `compress_offset` and `window_topk` all take exactly this pair, and swapping it pools the
 /// wrong window at the wrong position. Same argument `attn::Sel` makes about its own four.
 #[derive(Clone, Copy, Debug)]
-struct Phase {
+struct Span {
     /// Query rows: the prompt length at prefill, 1 at decode.
     seqlen: usize,
     /// 0 means prefill, throughout the reference.
@@ -243,7 +243,7 @@ struct Phase {
 /// `[1024, 4096]` at ratio 4, `[512, 4096]` at ratio 128, matching `[cd, dim]`); `convert_v4`
 /// widens them to f32 because `Compressor.__init__` declares the module fp32, and this narrows
 /// the same values back. A widened bf16 round-trips bit-identically, so no value moves — which
-/// also means it is not a deviation to name. `tests/v4_attn.rs::Comp::new` has always done this
+/// also means it is not a deviation to name. `tests/v4_attn.rs::LayerCompressor::new` has always done this
 /// (`u16b(&bf16_rows(&cw.wkv))`); the engine simply had no counterpart.
 ///
 /// Adds **≈0.5 GB** of device memory over 43 layers — 21 ratio-4 layers at 16.8 MB for the
@@ -261,7 +261,7 @@ fn narrow_to_bf16(src: *const f32, n: usize) -> Result<DeviceBuf> {
     // `copy_out_raw` sets `bytes` to exactly the length it was given, so `half.len() == n` holds
     // by construction. A check for it was written here and cut: it could not fire, and what a
     // caller CAN get wrong — passing the wrong extent — is invisible from inside this function.
-    // The extent is `Comp::new`'s, computed from the same `Geom` the kernel is handed.
+    // The extent is `LayerCompressor::new`'s, computed from the same `Geom` the kernel is handed.
     let half: Vec<u16> = read_f32(&bytes).into_iter().map(f32_to_bf16).collect();
     let mut d = DeviceBuf::new(std::mem::size_of_val(half.as_slice()))?;
     d.copy_in_at(0, as_le_bytes(&half))?;
@@ -278,7 +278,7 @@ fn narrow_to_bf16(src: *const f32, n: usize) -> Result<DeviceBuf> {
 /// call them `kv_state`/`score_state`/`kv`/`score`. That is deliberate: all four are `[.., cd]`
 /// f32 and two of them are the pooling STATE while two are this call's PROJECTIONS, so the
 /// short names are the pair most worth being unable to confuse at the literal below.
-struct Comp {
+struct LayerCompressor {
     geom: Geom,
     /// `[cd, dim]` bf16 — the pin's f32 `wkv`/`wgate` narrowed to what the GEMM indexes. See
     /// [`narrow_to_bf16`] for why the pin's own pointers cannot be handed over directly.
@@ -291,7 +291,7 @@ struct Comp {
     blocks: DeviceBuf,
 }
 
-impl Comp {
+impl LayerCompressor {
     fn new(
         cfg: &V4Config,
         kind: LayerKind,
@@ -348,7 +348,7 @@ impl Comp {
 }
 
 /// One layer's persistent decode state.
-struct LayerState {
+struct DeviceLayer {
     kind: LayerKind,
     /// `[window_size + max_ctx/ratio, head_dim]` f32 — the ring FIRST, then the compressed
     /// region, contiguous and in that order. That is what `attn::v4::Io::cache` requires and
@@ -359,10 +359,10 @@ struct LayerState {
     /// Rows in `cache`. Carried because `DeviceBuf` has no length and the placement indexes it
     /// by row — the same reason `tests/v4_attn.rs::Gpu` carries `ring_rows`.
     cache_rows: usize,
-    comp: Option<Comp>,
+    comp: Option<LayerCompressor>,
 }
 
-impl LayerState {
+impl DeviceLayer {
     fn new(
         cfg: &V4Config,
         kind: LayerKind,
@@ -380,7 +380,7 @@ impl LayerState {
             kind,
             cache: DeviceBuf::new(rows * cfg.head_dim * size_of::<f32>())?,
             cache_rows: rows,
-            comp: Comp::new(cfg, kind, max_m, cw)?,
+            comp: LayerCompressor::new(cfg, kind, max_m, cw)?,
         };
         s.reset(cfg)?;
         Ok(s)
@@ -479,7 +479,7 @@ fn read_prefix(b: &DeviceBuf, n: usize) -> Result<Vec<f32>> {
 /// Everything ONE [`V4Engine::probe_attn_stages`] call leaves readable, in pipeline order.
 ///
 /// A struct and not a 4-tuple: all four are `Vec<f32>`, so every permutation type-checks and the
-/// failure is a comparison against the wrong golden. Same argument [`Phase`] makes about its two
+/// failure is a comparison against the wrong golden. Same argument [`Span`] makes about its two
 /// `usize`.
 ///
 /// `attn_core_out` is deliberately absent and **cannot** be added — the output de-rotation is IN
@@ -584,7 +584,7 @@ pub struct V4Engine {
     cfg: V4Config,
     dims: v4::Dims,
     rope: RopeTables,
-    layers: Vec<LayerState>,
+    layers: Vec<DeviceLayer>,
     /// Which layers this pin holds. `0..n_layers` for a whole-model decode; a shorter prefix is
     /// a golden comparison and [`V4Engine::new`] says so at startup.
     range: std::ops::Range<usize>,
@@ -748,10 +748,10 @@ impl V4Engine {
         for l in range.clone() {
             let kind = LayerKind::from_config(&cfg, l)
                 .with_context(|| format!("classifying layer {l}"))?;
-            // The pin's compressor for this layer, so `Comp` can narrow its weights. Read
+            // The pin's compressor for this layer, so `LayerCompressor` can narrow its weights. Read
             // through `V4Pin::layer`, which applies the artifact-order offset exactly once.
             let cw = pin.layer(l)?.compressor;
-            layers.push(LayerState::new(&cfg, kind, max_ctx, max_m, cw.as_ref())?);
+            layers.push(DeviceLayer::new(&cfg, kind, max_ctx, max_m, cw.as_ref())?);
         }
 
         let (hits0, misses0) = (pin.routed.hits(), pin.routed.misses());
@@ -878,7 +878,7 @@ impl V4Engine {
     /// PERSISTENT cache, so the first call here uses it a little outside its stated meaning —
     /// deliberately, because the arithmetic is identical and a second placement function would be
     /// a second place for the rule to be wrong.
-    fn compress_and_place(&mut self, layer: usize, p: Phase, stream: *mut c_void) -> Result<()> {
+    fn compress_and_place(&mut self, layer: usize, p: Span, stream: *mut c_void) -> Result<()> {
         let (win, hd) = (self.cfg.sliding_window, self.cfg.head_dim);
         let li = layer - self.range.start;
         let kind = self.layers[li].kind;
@@ -977,7 +977,7 @@ impl V4Engine {
         let row = hd * size_of::<f32>();
         let cache = self.layers[li].cache.ptr_mut().cast::<f32>();
         let tail = self.a_kv.ptr_mut().cast::<f32>();
-        // SAFETY: `out` holds `blocks * head_dim` f32 by `Comp`'s sizing, and both destinations
+        // SAFETY: `out` holds `blocks * head_dim` f32 by `LayerCompressor`'s sizing, and both destinations
         // were bounded above. `memcpy_dtod` requires non-overlap, which holds: `cache` and
         // `a_kv` are distinct allocations and `out` is a third.
         unsafe {
@@ -1005,12 +1005,12 @@ impl V4Engine {
     /// earlier doc here claimed the split was what kept `compress` to one call site, which is
     /// backwards: this function *is* the second entry point, and what keeps the call to one is
     /// that this one is private with a single caller. Returning `src` rather than letting the
-    /// caller re-reach for `comp.blocks` is what removed a third `Option<Comp>` probe whose
+    /// caller re-reach for `comp.blocks` is what removed a third `Option<LayerCompressor>` probe whose
     /// comment had to open "Unreachable:".
     fn run_compress(
         &mut self,
         layer: usize,
-        p: Phase,
+        p: Span,
         _stream: *mut c_void,
     ) -> Result<(usize, *const u8)> {
         let li = layer - self.range.start;
@@ -1023,10 +1023,9 @@ impl V4Engine {
         let (dim, max_m) = (self.cfg.hidden, self.max_m);
         let x = self.xw.ptr().cast::<f32>();
         // As above: guaranteed `Some` by the caller's early return, reported rather than panicked.
-        let c = self.layers[li]
-            .comp
-            .as_mut()
-            .with_context(|| format!("layer {layer} ran its compressor without a Comp"))?;
+        let c = self.layers[li].comp.as_mut().with_context(|| {
+            format!("layer {layer} compresses but its DeviceLayer has no compressor state")
+        })?;
         let b = Buffers {
             x,
             dim,
@@ -1066,14 +1065,14 @@ impl V4Engine {
     /// uninitialised device memory in rows every later decode step selects BY POSITION and
     /// weights with `exp(l - max)`. Doing both here rather than at two call sites is what makes
     /// it impossible to get right in prefill and wrong in decode.
-    fn attention_block(&mut self, layer: usize, p: Phase, stream: *mut c_void) -> Result<()> {
+    fn attention_block(&mut self, layer: usize, p: Span, stream: *mut c_void) -> Result<()> {
         let (m, start_pos) = (p.seqlen, p.start_pos);
         let li = layer - self.range.start;
         let kind = self.layers[li].kind;
         self.compress_and_place(layer, p, stream)?;
 
         // `win`, `seqlen` and `start_pos` are overwritten by `attention` from its own `Dims` and
-        // `Step`; the caller supplies only the layer's class and `index_topk`. That is not
+        // `Pass`; the caller supplies only the layer's class and `index_topk`. That is not
         // redundancy — a `Sel` whose `win` disagreed with `Dims::window` produced a selection
         // over the wrong slot space that matched its own `idxs_shape` and passed every guard, so
         // the values here must be the ones `attention` would compute anyway.
@@ -1116,9 +1115,9 @@ impl V4Engine {
         };
         let io = self.io_for(kind, li, shape)?;
         let step = if start_pos == 0 {
-            v4::Step::Prefill { seqlen: m }
+            v4::Pass::Prefill { seqlen: m }
         } else {
-            v4::Step::Decode { pos: start_pos }
+            v4::Pass::Decode { pos: start_pos }
         };
         // SAFETY: every pointer in `w` is a pin placement outliving this engine; every pointer in
         // `s`/`io` is a `DeviceBuf` field of `self` at the size its field documents, and no two
@@ -1608,7 +1607,7 @@ impl V4Engine {
             } else {
                 self.attention_block(
                     layer,
-                    Phase {
+                    Span {
                         seqlen: m,
                         start_pos,
                     },
@@ -1956,7 +1955,7 @@ impl V4Engine {
             "probe_attn_stages: residual holds {} rows, not {m}",
             self.loaded_rows
         );
-        let p = Phase {
+        let p = Span {
             seqlen: m,
             start_pos,
         };
@@ -2098,7 +2097,7 @@ impl V4Engine {
             // `start_pos == 0` means the selection's window columns are ABSOLUTE positions
             // `0..seqlen` over the prompt's own KV, and `start_pos > 0` means they are ring SLOTS
             // `0..window_size`. `v4compress::compress_offset` owns that split and
-            // `attn::v4::Step` is the discriminant. What this loop contributes is that `pos` is
+            // `attn::v4::Pass` is the discriminant. What this loop contributes is that `pos` is
             // never 0 here — the prefill consumed position 0 — so the decode arm is unreachable
             // with a prefill's index space and vice versa.
             self.forward(&[cur], pos)?;

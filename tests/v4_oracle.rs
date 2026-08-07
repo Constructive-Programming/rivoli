@@ -34,7 +34,7 @@
 mod common;
 use common::residual_probe;
 
-use rivoli::v4oracle::forward::{Capture, Defect, HeadTailW, Oracle, Step};
+use rivoli::v4oracle::forward::{Capture, Defect, HeadTailW, LayerCtx, Oracle};
 use rivoli::v4oracle::golden::{Diff, GoldenSet, diff, identical};
 use rivoli::v4oracle::numerics::{
     FP4_MAX, FP8_MAX, act_quant_inplace, bf16_decode, bf16_encode, e2m1_decode, e2m1_encode,
@@ -544,7 +544,7 @@ fn run(layer: usize, prompt: usize, defect: Defect) -> Run {
     for (slot, tag, s, start_pos) in steps {
         let mut h = residual_probe(cfg, &format!("h-{tag}"), s);
         let ids = fixed_ids(cfg, &format!("ids-{tag}"), s);
-        let step = Step {
+        let step = LayerCtx {
             lw,
             layer,
             s,
@@ -709,7 +709,7 @@ fn expect(d: Defect) -> Option<Expect> {
         ),
 
         // See `sinkhorn_has_converged_long_before_iteration_20`.
-        Defect::SinkhornOneFewerIter => None,
+        Defect::SinkhornIterCountProbe => None,
         Defect::SinkhornCombTransposed | Defect::HcPostNoComb => e(
             &[".ffn_norm_out", ".out"],
             // `pre` comes straight from the mixes and never sees the Sinkhorn iterations,
@@ -726,7 +726,7 @@ fn expect(d: Defect) -> Option<Expect> {
         // Both of these reach EVERY golden downstream of `hc_pre` -- which is all of them --
         // so neither has a silent half to declare, and `.in` (fixed by the driver) would be
         // a claim no implementation could violate. Demoted to targeted tests, the same way
-        // `KvActQuantBlock128` and `SinkhornOneFewerIter` were.
+        // `KvActQuantBlock128` and `SinkhornIterCountProbe` were.
         Defect::HcPreNoRsqrt | Defect::NoBf16Rounding => None,
 
         // -- head tail ------------------------------------------------------------------
@@ -1890,7 +1890,7 @@ fn targeted_defects() -> Vec<Defect> {
         Defect::SwigluClampGateBothSides,
         Defect::RouterNoSoftplusThreshold,
         Defect::KvActQuantBlock128,
-        Defect::SinkhornOneFewerIter,
+        Defect::SinkhornIterCountProbe,
         Defect::QkNormAfterRope,
         Defect::HcPreNoRsqrt,
         Defect::NoBf16Rounding,
@@ -2051,9 +2051,9 @@ fn sinkhorn_has_converged_long_before_iteration_20() {
     };
     let full = drive(cfg, Defect::None);
     assert!(
-        identical(&full, &drive(cfg, Defect::SinkhornOneFewerIter)),
+        identical(&full, &drive(cfg, Defect::SinkhornIterCountProbe)),
         "19 and 20 iterations disagree -- the convergence claim above is wrong, and \
-         `SinkhornOneFewerIter` belongs back in the matrix"
+         `SinkhornIterCountProbe` belongs back in the matrix"
     );
     let mut two = cfg.clone();
     two.hc_sinkhorn_iters = 2;
@@ -2117,7 +2117,7 @@ fn softplus_threshold_only_matters_for_large_router_logits() {
         let mut got = Vec::new();
         for d in [Defect::None, Defect::RouterNoSoftplusThreshold] {
             let o = Oracle::new(cfg.clone(), d);
-            let step = Step {
+            let step = LayerCtx {
                 lw: &layer_w,
                 layer,
                 s: 5,

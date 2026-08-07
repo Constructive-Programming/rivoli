@@ -29,7 +29,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use rivoli::v4compress::{LayerKind, compress_offset, compress_topk};
-use rivoli::v4oracle::forward::{Counters, Defect, LayerW, Oracle, Step};
+use rivoli::v4oracle::forward::{Counters, Defect, LayerCtx, LayerW, Oracle};
 use rivoli::v4oracle::weights::{V4Config, WMat};
 use std::collections::HashMap;
 
@@ -49,9 +49,9 @@ use common::{
 // to argue that a second consumer did not exist, and the duplication gate found the copy the
 // moment one did.
 
-/// A `LayerW` carrier for [`Step`], whose weights are never read.
+/// A `LayerW` carrier for [`LayerCtx`], whose weights are never read.
 ///
-/// `Oracle::indexer` destructures `let Step { s, start_pos, .. } = *step` and touches nothing
+/// `Oracle::indexer` destructures `let LayerCtx { s, start_pos, .. } = *step` and touches nothing
 /// else on it, so the layer here is a placeholder. Spelled as empty matrices rather than as
 /// real ones so that if `indexer` ever starts reading `step.lw`, this fails loudly on a
 /// zero-sized matrix instead of quietly scoring against the wrong layer's weights.
@@ -346,7 +346,7 @@ fn indexer_ranking_is_blind_at_index_topk_512_and_sighted_when_it_truncates() {
         let mut cs = o.fresh_state(2).idx_comp.expect("layer 2 has an indexer");
         let mut ctr = Counters::default();
         let mut scores = Vec::new();
-        let step = Step {
+        let step = LayerCtx {
             lw: &carrier,
             layer: 2,
             s: n,

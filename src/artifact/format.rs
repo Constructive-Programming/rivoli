@@ -294,7 +294,8 @@ impl SafeWriter {
     }
 }
 
-struct Loc {
+/// One tensor's entry in the index: where its bytes are, and how to read them.
+struct TensorDesc {
     shard: usize,
     begin: usize,
     len: usize,
@@ -306,7 +307,7 @@ struct Loc {
 /// the multi-shard fp8 source (converter) and the single resident file (loader).
 pub struct Safetensors {
     mmaps: Vec<Mmap>,
-    index: HashMap<String, Loc>,
+    index: HashMap<String, TensorDesc>,
 }
 
 impl Safetensors {
@@ -373,7 +374,7 @@ impl Safetensors {
             // `read_metadata`, not `SafeTensors::deserialize`: the latter hands back
             // `TensorView`s BORROWING the buffer, and `Self` owns the mmaps — that is the
             // self-referential struct this offset index exists to avoid. `read_metadata`
-            // returns the header length and owned offsets, which is exactly what `Loc` wants.
+            // returns the header length and owned offsets, which is exactly what `TensorDesc` wants.
             //
             // It subsumes both truncation checks this used to make by hand, and is stricter
             // than either: it requires `8 + header + data == file length` EXACTLY, where the
@@ -413,7 +414,7 @@ impl Safetensors {
                 let (b, e) = t.data_offsets;
                 index.insert(
                     name,
-                    Loc {
+                    TensorDesc {
                         shard,
                         begin: base + b,
                         len: e - b,
@@ -427,7 +428,7 @@ impl Safetensors {
         Ok(Self { mmaps, index })
     }
 
-    fn loc(&self, name: &str) -> Result<&Loc> {
+    fn loc(&self, name: &str) -> Result<&TensorDesc> {
         self.index
             .get(name)
             .with_context(|| format!("tensor {name} not found"))

@@ -507,7 +507,7 @@ pub mod v4 {
     /// exhaustive, and the two phases differ in more than one way — the ring write, what
     /// `sparse_attn` reads, and which index SPACE the selection is in.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum Step {
+    pub enum Pass {
         Prefill { seqlen: usize },
         Decode { pos: usize },
     }
@@ -733,13 +733,13 @@ pub mod v4 {
         w: &Weights,
         s: &Scratch,
         io: &Io,
-        step: Step,
+        step: Pass,
         stream: *mut c_void,
     ) -> Result<()> {
         d.validate()?;
         let (m, pos0) = match step {
-            Step::Prefill { seqlen } => (seqlen, 0),
-            Step::Decode { pos } => (1, pos),
+            Pass::Prefill { seqlen } => (seqlen, 0),
+            Pass::Decode { pos } => (1, pos),
         };
         if m == 0 {
             bail!("v4 attention: zero query rows");
@@ -885,11 +885,11 @@ pub mod v4 {
         // SAFETY: caller's contract; every copy below stays inside `cache[0, window)`.
         let kv_src: *const f32 = unsafe {
             match step {
-                Step::Prefill { seqlen } if seqlen <= d.window => {
+                Pass::Prefill { seqlen } if seqlen <= d.window => {
                     memcpy_dtod_async(io.cache.cast(), s.kv.cast(), seqlen * row, stream)?;
                     s.kv
                 }
-                Step::Prefill { seqlen } => {
+                Pass::Prefill { seqlen } => {
                     // Slot `t % window` holds position `t`, for the last `window`
                     // positions. Seeding with the FIRST window instead is right exactly
                     // when the prompt fits, which is why a short fixture cannot see it.
@@ -910,7 +910,7 @@ pub mod v4 {
                     }
                     s.kv
                 }
-                Step::Decode { pos } => {
+                Pass::Decode { pos } => {
                     memcpy_dtod_async(
                         io.cache.add((pos % d.window) * hd).cast(),
                         s.kv.cast(),
@@ -1018,7 +1018,7 @@ pub mod v4 {
 mod v4_guard_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
     use super::Sel;
-    use super::v4::{Dims, Fp8W, Io, Scratch, Step, Weights, attention};
+    use super::v4::{Dims, Fp8W, Io, Pass, Scratch, Weights, attention};
     use crate::v4compress::LayerKind;
 
     /// The shipped V4 geometry, so a rejection below is about the guard and not about a
@@ -1111,7 +1111,7 @@ mod v4_guard_tests {
         d: &Dims,
         sel: Sel,
         p: &(Weights, Scratch, Io),
-        step: Step,
+        step: Pass,
     ) -> anyhow::Result<()> {
         // SAFETY: as the doc above — null pointers, and every guard precedes every launch.
         // `null_mut()` is the honest stream here: there is no launch for one to order.
@@ -1124,7 +1124,7 @@ mod v4_guard_tests {
         let p = parts(1);
         // SAFETY: every pointer is null and none is read — the `rows` check precedes the
         // first launch, which is the property this asserts.
-        let e = unsafe { call(&d, plain(), &p, Step::Prefill { seqlen: 4 }) }
+        let e = unsafe { call(&d, plain(), &p, Pass::Prefill { seqlen: 4 }) }
             .expect_err("a 4-row prefill into a 1-row scratch must be refused");
         let msg = format!("{e}");
         assert!(msg.contains("scratch rows"), "wrong rejection: {msg}");
@@ -1133,7 +1133,7 @@ mod v4_guard_tests {
         // the pointers are null — but the message proves the guard is a bound and not a
         // constant `false`, which is the shape S2 shipped twice.
         let p = parts(4);
-        let msg = match unsafe { call(&d, plain(), &p, Step::Prefill { seqlen: 4 }) } {
+        let msg = match unsafe { call(&d, plain(), &p, Pass::Prefill { seqlen: 4 }) } {
             Ok(()) => String::new(),
             Err(e) => format!("{e}"),
         };
@@ -1156,7 +1156,7 @@ mod v4_guard_tests {
         let p = parts(64);
         let lying = Sel { win: 64, ..plain() };
         // SAFETY: the shape guard precedes every launch.
-        let e = unsafe { call(&d, lying, &p, Step::Decode { pos: 200 }) }
+        let e = unsafe { call(&d, lying, &p, Pass::Decode { pos: 200 }) }
             .expect_err("the (0, 0) idxs_shape in `parts` must be refused");
         assert!(
             format!("{e}").contains("(1, 128)"),
@@ -1172,7 +1172,7 @@ mod v4_guard_tests {
         d.head_dim = 0;
         let p = parts(64);
         // SAFETY: as above.
-        let e = unsafe { call(&d, plain(), &p, Step::Decode { pos: 7 }) }
+        let e = unsafe { call(&d, plain(), &p, Pass::Decode { pos: 7 }) }
             .expect_err("a zero head_dim must be refused before any launch");
         let msg = format!("{e}");
         assert!(msg.contains("head_dim is zero"), "wrong rejection: {msg}");
@@ -1182,7 +1182,7 @@ mod v4_guard_tests {
         // true. It reached a launcher as guard code 1001 before `from_config` grew this.
         let mut d = dims();
         d.rope_head_dim = d.head_dim;
-        let e = unsafe { call(&d, plain(), &p, Step::Decode { pos: 7 }) }
+        let e = unsafe { call(&d, plain(), &p, Pass::Decode { pos: 7 }) }
             .expect_err("head_dim == rope_head_dim must be refused");
         assert!(format!("{e}").contains("is zero"), "wrong rejection: {e}");
     }

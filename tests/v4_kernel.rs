@@ -20,7 +20,7 @@
 //! 1. **The Sinkhorn iteration count.** At `hc_sinkhorn_iters = 20` a 4x4 positive matrix
 //!    is far past convergence: 19 and 20 agree BIT-FOR-BIT, so no golden distinguishes
 //!    them (`tests/v4_oracle.rs::sinkhorn_has_converged_long_before_iteration_20`, which is
-//!    why `Defect::SinkhornOneFewerIter` is excluded from the oracle's own matrix). What
+//!    why `Defect::SinkhornIterCountProbe` is excluded from the oracle's own matrix). What
 //!    [`sinkhorn_iteration_count_is_live`] proves is strictly weaker and is all that is
 //!    available: the parameter reaches the arithmetic (2 and 20 disagree). The exact value
 //!    is gated by SOURCING, not by measurement — it is passed from `V4Config`, which
@@ -65,7 +65,7 @@ use rivoli::backend::hip::{
 };
 use rivoli::memory::device::DeviceBuf;
 use rivoli::v4oracle::{
-    forward::{Capture, Counters, Defect, ExpertW, LayerW, Oracle, Step},
+    forward::{Capture, Counters, Defect, ExpertW, LayerCtx, LayerW, Oracle},
     numerics::{act_quant_inplace, bf16_decode, bf16_encode, e4m3_decode, e8m0_decode, silu},
     toy::{self, ToyModel},
     weights::{NamedRng, V4Config, WMat},
@@ -1101,7 +1101,7 @@ fn the_router_matches_the_oracle_in_both_modes() {
         );
         let x = draw_x(&format!("gate-x-{layer}"), cfg.dim, 1.0);
         let ids = [7u32];
-        let step = Step {
+        let step = LayerCtx {
             lw,
             layer,
             s: 1,
@@ -1598,7 +1598,7 @@ fn the_mhc_launchers_refuse_what_they_claim_to() {
 ///
 /// **This is NOT a check that the count is 20**, and it cannot be: at 20 passes the 4x4
 /// matrix has converged and 19 and 20 agree bit-for-bit — the oracle's own matrix excludes
-/// `Defect::SinkhornOneFewerIter` for that measured reason. What is provable is that the
+/// `Defect::SinkhornIterCountProbe` for that measured reason. What is provable is that the
 /// parameter is live rather than ignored, which is what makes SOURCING it from `V4Config`
 /// (and `V4Config::assert_matches_reference_json` pinning that to `config.json`) the actual
 /// gate on the value.
@@ -1625,7 +1625,7 @@ fn sinkhorn_iteration_count_is_live() {
     );
     // The blind spot itself, asserted in the direction the oracle asserts it. If this ever
     // goes red, convergence has stopped holding on the GPU where it holds on the CPU — which
-    // would mean `SinkhornOneFewerIter` becomes gateable AND that the two arithmetics have
+    // would mean `SinkhornIterCountProbe` becomes gateable AND that the two arithmetics have
     // diverged somewhere worth finding.
     assert_eq!(
         bits(&c20),

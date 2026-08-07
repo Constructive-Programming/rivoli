@@ -159,7 +159,7 @@ fn coalesce(trace: &[Decision], b: usize) -> Vec<Decision> {
 fn replay(policy: &str, cap: usize, split: TwoQSplit, trace: &[Decision]) -> Result<u64> {
     // Unit strides: budget `cap` bytes == `cap` slots, cold==hot so the split is by
     // slot count exactly as the single-format engine sees it.
-    let mut p: Box<dyn HybridPolicy> = hybrid::make(policy, cap, 1, 1, split)
+    let mut p: Box<dyn HybridPolicy> = hybrid::policy_for(policy, cap, 1, 1, split)
         .with_context(|| format!("unknown policy {policy}"))?;
     let mut loaded = 0u64;
     let mut miss: Vec<u32> = Vec::new();
@@ -167,7 +167,7 @@ fn replay(policy: &str, cap: usize, split: TwoQSplit, trace: &[Decision]) -> Res
         p.begin_batch(); // one MoE layer = one batch (mirrors the pin)
         miss.clear();
         for &k in d {
-            if p.get(k) {
+            if p.hit(k) {
                 loaded += 1;
                 p.protect(k);
             } else {
@@ -184,7 +184,7 @@ fn replay(policy: &str, cap: usize, split: TwoQSplit, trace: &[Decision]) -> Res
 /// Belady's OPT: the `loaded` count a CLAIRVOYANT evictor reaches on this trace at `cap`
 /// slots. No online policy can beat it, so it is the ceiling the rows above are short of.
 ///
-/// **Deliberately not a [`HybridPolicy`], and deliberately not in `hybrid::make`.** It needs
+/// **Deliberately not a [`HybridPolicy`], and deliberately not in `hybrid::policy_for`.** It needs
 /// the whole future, which the trait does not offer (and `replay` calls `get` for every hit
 /// before `admit` for any miss, so a policy-side access counter would not even see trace
 /// order). Registering it would also put `--cache-policy opt` in the engine's `--help` for

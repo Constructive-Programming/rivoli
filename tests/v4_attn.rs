@@ -100,7 +100,7 @@ use rivoli::artifact::model::V4Config as EngineV4Config;
 use rivoli::artifact::quant::e8m0;
 use rivoli::attn::{
     Sel,
-    v4::{Dims, Fp8W, Io, Scratch, Step, Weights, attention},
+    v4::{Dims, Fp8W, Io, Pass, Scratch, Weights, attention},
     v4_rope_table_ratio0, v4_topk_idxs,
 };
 use rivoli::backend::gpustream::{HipStream, Timeline};
@@ -113,7 +113,7 @@ use rivoli::memory::device::DeviceBuf;
 use rivoli::v4compress::{
     Buffers, Finish, Geom, LayerKind, RopeParams, compress, freqs_cis, rope_for_layer,
 };
-use rivoli::v4oracle::forward::{Capture, Defect, Oracle, Step as OStep};
+use rivoli::v4oracle::forward::{Capture, Defect, LayerCtx, Oracle};
 use rivoli::v4oracle::numerics::{FP8_MAX, act_quant_inplace, fast_round_scale};
 use rivoli::v4oracle::toy::{self, ToyModel};
 use rivoli::v4oracle::weights::{NamedRng, V4Config, WMat};
@@ -478,7 +478,7 @@ fn drive_script(
             .map(|i| ((start_pos + i) * 7 % cfg.vocab_size) as u32)
             .collect();
         let mut cap = Capture::default();
-        let step = OStep {
+        let step = LayerCtx {
             lw: &m.layers[layer],
             layer,
             input_ids: &ids,
@@ -629,7 +629,7 @@ fn assert_within(what: &str, got: &[f32], want: &[f32]) -> Score {
 /// Present only on a compressed layer. `Geom::attention` returns `None` for
 /// [`LayerKind::Plain`], so the `Option` here is that refusal carried through rather than a
 /// second decision about which layers have a compressor.
-struct Comp {
+struct LayerCompressor {
     geom: Geom,
     wkv: DeviceBuf,
     wgate: DeviceBuf,
@@ -642,7 +642,7 @@ struct Comp {
     out: DeviceBuf,
 }
 
-impl Comp {
+impl LayerCompressor {
     /// `None` on a ratio-0 layer, in both halves at once: `Geom::attention` refuses
     /// `LayerKind::Plain` and `toy::build` gives such a layer no `CompressorW`. Asserted
     /// rather than assumed — the two must agree, and a layer with one and not the other is
@@ -725,7 +725,7 @@ struct Gpu {
     /// two a caller could get wrong — and getting `kind` wrong is a layer's compressed
     /// columns silently vanishing.
     sel: Sel,
-    comp: Option<Comp>,
+    comp: Option<LayerCompressor>,
     /// The stream EVERY device operation in this harness runs on, including the compressor.
     ///
     /// Deliberately a real `hipStreamNonBlocking` stream rather than `null_mut()`, so that
@@ -769,7 +769,7 @@ impl Gpu {
             max_m,
             ring_rows: d.window + blocks,
             sel: base_sel(d, kind, cfg.index_topk),
-            comp: Comp::new(cfg, lw, kind, max_m),
+            comp: LayerCompressor::new(cfg, lw, kind, max_m),
             stream: HipStream::new().expect("hip stream"),
             xq: z(max_m * d.dim),
             qr: z(max_m * d.q_lora_rank),
@@ -889,9 +889,9 @@ impl Gpu {
         let idxb = dev_i32(&idx);
         let io = self.io(&x, &idxb, shape);
         let step = if p.start_pos == 0 {
-            Step::Prefill { seqlen: p.m }
+            Pass::Prefill { seqlen: p.m }
         } else {
-            Step::Decode { pos: p.start_pos }
+            Pass::Decode { pos: p.start_pos }
         };
         let stream = self.stream.raw();
         let s = self.scratch();
@@ -1577,7 +1577,7 @@ fn the_attention_block_is_entirely_on_its_stream() {
             &gpu.weights,
             &s,
             &io,
-            Step::Prefill { seqlen: p.m },
+            Pass::Prefill { seqlen: p.m },
             stream,
         )
     }
@@ -1679,12 +1679,12 @@ fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
 
     for_selection(
         "short prefill",
-        go(&io, Step::Prefill { seqlen: short })
+        go(&io, Pass::Prefill { seqlen: short })
             .expect_err("a 4-row prefill must not accept an 8-column selection"),
     );
 
     io.idxs_shape = right;
-    go(&io, Step::Prefill { seqlen: short }).expect("the correct shape must be accepted");
+    go(&io, Pass::Prefill { seqlen: short }).expect("the correct shape must be accepted");
     device_sync().expect("sync");
 
     // The decode arm, which the first draft of this test named and never ran. Decode
@@ -1694,7 +1694,7 @@ fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
     io.idxs_shape = (1, short);
     for_selection(
         "decode",
-        go(&io, Step::Decode { pos: PROMPT })
+        go(&io, Pass::Decode { pos: PROMPT })
             .expect_err("a decode must not accept a narrowed prefill selection"),
     );
 
@@ -1706,7 +1706,7 @@ fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
     );
     io.idxs = oneb.ptr().cast();
     io.idxs_shape = want;
-    go(&io, Step::Decode { pos: PROMPT }).expect("the correct decode shape must be accepted");
+    go(&io, Pass::Decode { pos: PROMPT }).expect("the correct decode shape must be accepted");
     device_sync().expect("sync");
 }
 
@@ -2328,7 +2328,7 @@ fn expect_moves(d: Defect) -> &'static [&'static str] {
         | Defect::RouteWeightAfterW2
         | Defect::SharedExpertWeighted
         | Defect::Fp4NibbleSwap
-        | Defect::SinkhornOneFewerIter
+        | Defect::SinkhornIterCountProbe
         | Defect::SinkhornCombTransposed
         | Defect::HcPostNoComb
         | Defect::HeadHcNoRsqrt

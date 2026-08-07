@@ -39,7 +39,7 @@
 #![allow(clippy::unwrap_used)]
 
 use rivoli::v4compress::LayerKind;
-use rivoli::v4oracle::forward::{Capture, CompressorW, IndexerW, LayerW, Oracle, Step};
+use rivoli::v4oracle::forward::{Capture, CompressorW, IndexerW, LayerCtx, LayerW, Oracle};
 use rivoli::v4oracle::numerics::{bf16_decode, bf16_encode};
 use rivoli::v4oracle::weights::{Checkpoint, NamedRng, V4Config};
 use std::path::Path;
@@ -718,13 +718,13 @@ pub fn indexer_w(ck: &Checkpoint, layer: usize, c: &V4Config) -> IndexerW {
 
 /// Drive one PREFILL `run_layer` over `h` and return what it captured.
 ///
-/// `tests/v4_kernel.rs` and `tests/v4_oracle.rs` each built the same six-field `Step` at
+/// `tests/v4_kernel.rs` and `tests/v4_oracle.rs` each built the same six-field `LayerCtx` at
 /// `start_pos: 0, phase: "pre"`, wrapped in the same `fresh_state`/`Capture`/`run_layer`
 /// sequence, and `build.rs`'s duplication gate found the copy. Nothing here touches a device
 /// type, which is this module's rule for what may live in it.
 ///
 /// **`s` is `ids.len()`, not a parameter.** Both copies passed the two separately, and a
-/// `Step` whose `s` disagreed with its `input_ids` length is a fixture neither could have
+/// `LayerCtx` whose `s` disagreed with its `input_ids` length is a fixture neither could have
 /// caught: `run_layer` walks `s` positions through whatever id slice it was handed, so a
 /// mismatch silently makes every golden downstream a capture of a prompt nobody wrote.
 ///
@@ -741,7 +741,7 @@ pub fn prefill_capture(
 ) -> Capture {
     let mut st = o.fresh_state(layer);
     let mut cap = Capture::default();
-    let step = Step {
+    let step = LayerCtx {
         lw,
         layer,
         s: ids.len(),

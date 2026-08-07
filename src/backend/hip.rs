@@ -139,7 +139,7 @@ macro_rules! launchers {
             pub unsafe fn $rust($($arg: $rt),*) -> Result<()> {
                 // SAFETY: caller's pointer contract.
                 let r = unsafe { $sym($($arg $(as $ct)?),*) };
-                check(r, $tag)
+                ensure_hip_decode_status(r, $tag)
             }
         )*
     };
@@ -1274,7 +1274,7 @@ unsafe extern "C" {
 }
 
 /// Launcher return-code check: 0 = ok, POSITIVE = arg guard, NEGATIVE = -(hipError_t).
-fn check(r: i32, name: &str) -> Result<()> {
+fn ensure_hip_decode_status(r: i32, name: &str) -> Result<()> {
     if r == 0 {
         Ok(())
     } else if r > 0 {
@@ -1287,7 +1287,7 @@ fn check(r: i32, name: &str) -> Result<()> {
 /// Block until all launched kernels retire — one join per token.
 pub fn device_sync() -> Result<()> {
     // SAFETY: hipDeviceSynchronize, no pointers.
-    check(unsafe { rivoli_device_sync() }, "device_sync")
+    ensure_hip_decode_status(unsafe { rivoli_device_sync() }, "device_sync")
 }
 
 /// Synchronous device-to-device copy of `bytes` from `src` to `dst` — the routed
@@ -1298,7 +1298,7 @@ pub fn device_sync() -> Result<()> {
 /// `dst` and `src` must be valid, `bytes`-sized, NON-OVERLAPPING device regions (the
 /// arena guarantees distinct slots).
 pub unsafe fn memcpy_dtod(dst: *mut u8, src: *const u8, bytes: usize) -> Result<()> {
-    check(
+    ensure_hip_decode_status(
         unsafe { rivoli_memcpy_dtod(dst, src, bytes) },
         "memcpy_dtod",
     )
@@ -1332,7 +1332,7 @@ pub unsafe fn memcpy_dtod_async(
     stream: *mut c_void,
 ) -> Result<()> {
     // SAFETY: caller's pointer contract; stream is a live HipStream handle.
-    check(
+    ensure_hip_decode_status(
         unsafe { rivoli_memcpy_dtod_async(dst, src, bytes, stream) },
         "memcpy_dtod_async",
     )
@@ -1346,7 +1346,7 @@ pub unsafe fn memcpy_dtod_async(
 /// # Safety
 /// `dst` must be a device pointer owning at least `bytes`.
 pub unsafe fn fill_u32(dst: *mut u8, pat: u32, bytes: usize) -> Result<()> {
-    check(unsafe { rivoli_fill_u32(dst, pat, bytes) }, "fill_u32")
+    ensure_hip_decode_status(unsafe { rivoli_fill_u32(dst, pat, bytes) }, "fill_u32")
 }
 
 //
@@ -1455,6 +1455,6 @@ pub unsafe fn launch_v4_indexer_score(
     let (heads, hd) = (heads as i32, hd as i32);
     // SAFETY: caller's pointer contract; stream is a live HipStream handle.
     let r = unsafe { rivoli_v4_indexer_score(q, kv, w, score, s, n_comp, heads, hd, stream) };
-    check(r, "v4_indexer_score")
+    ensure_hip_decode_status(r, "v4_indexer_score")
 }
 // jscpd:ignore-end

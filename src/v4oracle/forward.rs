@@ -225,8 +225,17 @@ defects! {
     Fp4NibbleSwap,
 
     // -- mHC ----------------------------------------------------------------------------
-    /// Run `hc_sinkhorn_iters - 1` iterations.
-    SinkhornOneFewerIter,
+    /// Run `hc_sinkhorn_iters - 1` iterations — the off-by-one from counting the leading
+    /// column pass as an iteration when the config already does.
+    ///
+    /// **Named a probe, not a defect, because at the shipped count it changes nothing:**
+    /// the 4x4 matrix has converged long before iteration 20 and 19 vs 20 is bit-identical
+    /// on CPU and GPU alike. It carries no tolerance and sits outside the defect matrix for
+    /// that measured reason (`sinkhorn_has_converged_long_before_iteration_20`,
+    /// `sinkhorn_iteration_count_is_live`). What it is FOR is proving the parameter reaches
+    /// the arithmetic at all, which is what makes sourcing it from `V4Config` the real gate
+    /// on its value.
+    SinkhornIterCountProbe,
     /// Index the combination matrix `[dest, source]` instead of `[source, dest]`.
     SinkhornCombTransposed,
     /// Drop the `comb @ residual` term from `hc_post` — a plain residual add.
@@ -376,18 +385,18 @@ pub struct LayerW {
 /// `start_pos` to get swapped. `s` is the number of query rows — the prompt length at
 /// prefill, and 1 at decode, which is also `start_pos`'s discriminant (`start_pos == 0`
 /// means prefill throughout the reference).
-pub struct Step<'a> {
+pub struct LayerCtx<'a> {
     pub lw: &'a LayerW,
     pub layer: usize,
     pub s: usize,
     pub start_pos: usize,
     pub input_ids: &'a [u32],
     /// Which call this is: `"pre"` for the prefill, `"dec0"`, `"dec1"`, ... for the decode
-    /// steps. NOT the golden prefix -- see [`Step::tag`].
+    /// steps. NOT the golden prefix -- see [`LayerCtx::tag`].
     pub phase: &'a str,
 }
 
-impl Step<'_> {
+impl LayerCtx<'_> {
     /// The prefix every recorded golden carries: `L{layer}.{phase}`.
     ///
     /// A method, not a field, because it must be impossible to apply inconsistently. When
@@ -417,7 +426,11 @@ pub struct CompState {
     pub cache: Vec<f32>,
 }
 
-pub struct LayerState {
+/// One layer's host-side caches, carried across decode steps: the sliding-window ring
+/// plus the two compressors' pooling state. Named for the ring because that is the part
+/// `Oracle::attention` indexes modulo the window; the two `CompState` halves are
+/// append-only.
+pub struct LayerRings {
     /// `[window_size, head_dim]` — the sliding-window ring only. The compressed region
     /// lives in `comp.cache`.
     pub win_cache: Vec<f32>,
@@ -598,14 +611,14 @@ impl Oracle {
         }
     }
 
-    pub fn fresh_state(&self, layer: usize) -> LayerState {
+    pub fn fresh_state(&self, layer: usize) -> LayerRings {
         let c = &self.cfg;
         let ratio = c.compress_ratio(layer);
         let comp =
             (ratio != 0).then(|| new_comp_state(ratio, c.head_dim, ratio == 4, c.max_seq_len));
         let idx_comp =
             (ratio == 4).then(|| new_comp_state(ratio, c.index_head_dim, true, c.max_seq_len));
-        LayerState {
+        LayerRings {
             win_cache: vec![0.0; c.window_size * c.head_dim],
             comp,
             idx_comp,
@@ -1001,7 +1014,7 @@ impl Oracle {
             }
         };
         norm(&mut comb, false);
-        let iters = if self.defect == Defect::SinkhornOneFewerIter {
+        let iters = if self.defect == Defect::SinkhornIterCountProbe {
             self.cfg.hc_sinkhorn_iters - 1
         } else {
             self.cfg.hc_sinkhorn_iters
@@ -1363,7 +1376,7 @@ impl Oracle {
     /// Visibility only; no behaviour change.
     pub fn indexer(
         &self,
-        step: &Step,
+        step: &LayerCtx,
         iw: &IndexerW,
         cs: &mut CompState,
         x: &[f32],
@@ -1373,7 +1386,7 @@ impl Oracle {
         counters: &mut Counters,
         scores_out: &mut Vec<f32>,
     ) -> Vec<Vec<i64>> {
-        let Step { s, start_pos, .. } = *step;
+        let LayerCtx { s, start_pos, .. } = *step;
         let c = &self.cfg;
         let (h, hd, ratio, rd) = (
             c.index_n_heads,
@@ -1623,12 +1636,12 @@ impl Oracle {
     /// `Attention.forward` (model.py:490-548).
     fn attention(
         &self,
-        step: &Step,
-        st: &mut LayerState,
+        step: &LayerCtx,
+        st: &mut LayerRings,
         x: &[f32],
         cap: &mut Capture,
     ) -> Vec<f32> {
-        let Step {
+        let LayerCtx {
             lw,
             layer,
             s,
@@ -1843,8 +1856,13 @@ impl Oracle {
     /// - hash layers (`layer_id < n_hash_layers`) take their indices from
     ///   `tid2eid[input_id]` and bypass the scores entirely — but the gate still runs, and
     ///   its scores still become the weights.
-    pub fn gate(&self, step: &Step, x: &[f32], counters: &mut Counters) -> (Vec<f32>, Vec<usize>) {
-        let Step {
+    pub fn gate(
+        &self,
+        step: &LayerCtx,
+        x: &[f32],
+        counters: &mut Counters,
+    ) -> (Vec<f32>, Vec<usize>) {
+        let LayerCtx {
             lw,
             s: m,
             input_ids,
@@ -1997,8 +2015,8 @@ impl Oracle {
     /// `MoE.forward`. Accumulates in f32 in ASCENDING EXPERT ID, then adds the shared
     /// expert last — the reference's order, kept because it is free to keep and re-ordering
     /// a 7-term f32 sum is one more thing a consumer would have to allow for.
-    fn moe(&self, step: &Step, x: &[f32], cap: &mut Capture) -> Vec<f32> {
-        let Step { lw, s: m, .. } = *step;
+    fn moe(&self, step: &LayerCtx, x: &[f32], cap: &mut Capture) -> Vec<f32> {
+        let LayerCtx { lw, s: m, .. } = *step;
         let tag = step.tag();
         let c = &self.cfg;
         let k = c.n_activated_experts;
@@ -2238,8 +2256,14 @@ impl Oracle {
     }
 
     /// `Block.forward` (model.py:695-707) for one layer, in place on the residual stream.
-    pub fn run_layer(&self, step: &Step, st: &mut LayerState, h: &mut Vec<f32>, cap: &mut Capture) {
-        let Step { lw, s, .. } = *step;
+    pub fn run_layer(
+        &self,
+        step: &LayerCtx,
+        st: &mut LayerRings,
+        h: &mut Vec<f32>,
+        cap: &mut Capture,
+    ) {
+        let LayerCtx { lw, s, .. } = *step;
         let tag = step.tag();
         cap.push(
             &format!("{tag}.in"),

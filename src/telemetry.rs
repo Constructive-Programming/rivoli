@@ -202,7 +202,7 @@ pub mod spans {
     /// different animal from eight warm vq3 ones — and it is knowable only here, between
     /// the residency check and the format decision.
     #[derive(Clone, Copy, Default)]
-    pub struct LayerState {
+    pub struct ExpertComposition {
         pub tok: u32,
         pub layer: i32,
         pub cold_i4: u16,
@@ -211,10 +211,10 @@ pub mod spans {
         pub warm_vq3: u16,
     }
 
-    static LAYERS: OnceLock<Mutex<Vec<LayerState>>> = OnceLock::new();
+    static LAYERS: OnceLock<Mutex<Vec<ExpertComposition>>> = OnceLock::new();
 
     /// Record a layer's expert composition. Same enable gate as `record`.
-    pub fn record_layer(st: LayerState) {
+    pub fn record_layer(st: ExpertComposition) {
         if log().is_none() || !SAMPLED.load(Ordering::Relaxed) {
             return;
         }
@@ -227,7 +227,7 @@ pub mod spans {
     }
 
     /// Drain the per-layer expert composition.
-    pub fn drain_layers() -> Vec<LayerState> {
+    pub fn drain_layers() -> Vec<ExpertComposition> {
         LAYERS
             .get()
             .and_then(|m| m.lock().ok().map(|mut v| std::mem::take(&mut *v)))
@@ -818,7 +818,7 @@ mod otlp {
         // Every span here is closed with `end_with_timestamp`. `end()` would stamp
         // `now()` and silently discard the builder's `with_end_time`.
         let cx = opentelemetry::Context::current_with_span(span);
-        let layer_states: BTreeMap<(u32, i32), super::spans::LayerState> =
+        let layer_states: BTreeMap<(u32, i32), super::spans::ExpertComposition> =
             super::spans::drain_layers()
                 .into_iter()
                 .map(|st| ((st.tok, st.layer), st))

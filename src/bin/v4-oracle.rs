@@ -19,7 +19,7 @@
 
 use anyhow::{Context, Result, bail};
 use rivoli::v4oracle::forward::{
-    Capture, CompressorW, Defect, ExpertW, HeadTailW, IndexerW, LayerW, Oracle, Step,
+    Capture, CompressorW, Defect, ExpertW, HeadTailW, IndexerW, LayerCtx, LayerW, Oracle,
 };
 use rivoli::v4oracle::golden::{GoldenSet, diff};
 use rivoli::v4oracle::numerics::{bf16_decode, bf16_encode};
@@ -373,7 +373,7 @@ fn drive(
         };
         let mut h = h_for(phase, &here);
         for (l, lw) in lws.iter().enumerate() {
-            let step = Step {
+            let step = LayerCtx {
                 lw,
                 layer: l,
                 s: n,
