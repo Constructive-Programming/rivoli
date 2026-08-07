@@ -15,7 +15,9 @@ verdict: DSA indexer offload to the NPU: not worth it. The answer is in the firs
 Status: **M0 and M1 MEASURED (2026-07-26). The no-NPU device top-k is now WIRED and
 MEASURED (2026-07-27): −9.4 ms/token, 2.1% of wall, selection exact.** M0 clears ≥4k. M1
 clears via the decoupled window only, and everything past it still sits behind M1a, which
-remains not implementable as written. The NPU is live on
+~~remains not implementable as written~~ (**2026-08-07: now implementable — mechanism
+built behind `--features stale-sel` + `--stale-sel`, measurement planned but not run; see
+the dated note under the M1a milestone**). The NPU is live on
 this node — XRT 2.21, amdxdna 0.1, firmware 1.1.2, `/dev/accel/accel0`, Strix Halo NPU at
 `0000:c8:00.1` — and 100% idle during decode. This plan is **exclusive to one workload: the
 DSA sparse indexer.** The other NPU candidate (a spec-decode drafter) was analysed and set
@@ -727,6 +729,71 @@ a GPU∥NPU one.**
   1-step-stale / periodic-refresh selection offline against the exact selection; measure the
   perplexity delta on `tests/ppl-corpus-5000.txt` via `--ppl`.
 
+  > **UPDATE 2026-08-07 — the mechanism now EXISTS; the measurement is planned but NOT
+  > yet run.** M1a is implementable as of this date, behind `--features stale-sel` plus
+  > `--stale-sel` (feature AND flag, per the house rule; no env var). Scope note first:
+  > everything here is about **GLM-5.2's DSA indexer**, like the rest of this document —
+  > whatever this measurement decides, it decides for this workload, not for the
+  > DeepSeek-V4 port's indexer, whose NPU question is a separate and open one.
+  >
+  > **What was built** (`src/gpu.rs::dsa_select_layer`, `src/indexer.rs::StaleShare`):
+  > per full layer, a `index_topk`-row device cache (plain `hipMalloc`, deliberately NOT a
+  > routed-arena slot — the arena compacts under long-lived reads, the recorded relocation
+  > defect). At every scored token the layer **serves** the selection stored at token
+  > `t−1` (a D2D into the layer's `sel` slot, enqueued before `index_topk` overwrites its
+  > source; null-stream program order makes read-then-overwrite safe) and **stores** the
+  > selection `index_topk` just computed from token `t`'s query. The fresh selection is
+  > still computed every token — that is the work an NPU would absorb, so the run prices
+  > *staleness*, not skipped work. Shared layers reuse the SERVED selection, as they would
+  > under the real design. The flag off (or the feature absent) compiles/branches to the
+  > exact path unchanged.
+  >
+  > **The first-token decision the old text asked for:** at the crossing token
+  > (`nt = index_topk + 1`) nothing is stored, and the layer attends DENSE over the whole
+  > prefix — exact, one row more than a top-k attend, and what the real decoupled design
+  > would do (dense needs no selection at all). It cannot flatter the stale arm past that
+  > single token. Below `index_topk` there is nothing to be stale about — the indexer
+  > computes no selection there — so both arms are identical by construction. The served
+  > stale selection is used **verbatim**: it was scored before the current token's key
+  > existed, so the diagonal may be absent. Patching the diagonal back in is a different,
+  > better variant; it gets measured only if verbatim fails, as its own arm.
+  >
+  > **Refusals, all loud:** not under `--ppl` → startup error (single-row forwards are the
+  > only shape with a well-defined per-layer predecessor; speculation/prefill rows are
+  > refused again per-layer as defense); not `--attn dsa` → startup error (dense/streaming
+  > have no selection, misa's head-route was never in the decoupled budget); corpus not
+  > longer than `index_topk + 2` tokens → startup error (a scored NLL at position `p`
+  > comes from the forward at `p−1`, and the last forward is never scored, so the first
+  > corpus length where a SCORED position saw a stale selection is `index_topk + 3`); and
+  > a `--stale-sel` run that finishes with ZERO stale serves **refuses to return its
+  > NLLs** rather than emit an `.nll` indistinguishable from a baseline arm — the "dsa
+  > A/B under 2048 tokens covers nothing" trap, now a gate that goes red. Engagement is
+  > counted (`stale_served`) and printed.
+  >
+  > **The planned measurement** (paired, per docs/measurement/perf-roadmap.md's standard;
+  > needs the sole-tenant GPU): one binary, `--features rocm,teacher-forcing,stale-sel`;
+  > arm A `--ppl tests/ppl-corpus-5000.txt` exact, arm B identical plus `--stale-sel`;
+  > `--attn dsa --mode int3-vq` (single-format — hybrid's residency-picks-arithmetic
+  > defect forbids quality A/Bs there), cache settings held fixed; no `cargo build`
+  > between arms; flock + contention witness per arm. Rank on **paired dNLL from
+  > `bin/ppl`**, not the PPL column; an interval straddling zero is inconclusive.
+  > **Power caveat, stated up front:** the first `index_topk` positions are identical by
+  > construction and the crossing token is exact-dense, so only ~2.9k of the corpus's
+  > ~5.0k positions carry any signal — the full-file paired test dilutes its t-statistic
+  > by roughly √(2.9/5.0), and the honest secondary read is the same statistics over the
+  > positions past 2049 only. **Built-in contamination control:** the first-2048 NLL
+  > prefix must match between arms bit-for-bit; any difference means something other than
+  > staleness moved (contention, the timing-race class), and the pair is discarded. If
+  > more power is needed, the recorded remedy is a symlinked shadow artifact with
+  > `index_topk` lowered in its manifest, SHARED by both arms — with the caveat that a
+  > lowered threshold is a different selection regime (fewer rows, each mis-pick heavier),
+  > so a shadow-run verdict screens but does not settle the k=2048 question.
+  >
+  > **What a failure means, scoped:** if verbatim 1-step-stale measurably damages quality
+  > here, the decoupled window — the only window left — is closed for **GLM's DSA
+  > indexer**, and with it this plan's M2/M3. That is this document's workload; it says
+  > nothing about the V4 indexer.
+
 - **M2 — indexer on the NPU.** Port the kernels; validate the **selected set** matches the
   GPU indexer on a fixed long-context input (not bit-exact scores).
 
@@ -792,7 +859,7 @@ comparing nothing. Everything below the wiring step is still unbuilt.
 | Wiring into `dsa_select_layer` | **DONE**, default on — **−9.4 ms/token (2.1% of wall)** |
 | Selection matches the host in-engine | **10,752 full layers exact**, sentinel intact, output byte-identical across all arms |
 | `device_sync` deletion | costed separately: **−2.5 ms/token**, consistently signed, 4× smaller than the top-k. Sync KEPT — 0.6% of wall at n=2 vs `route`'s comparability |
-| M1a / anything NPU | untouched, and M1a is still not implementable |
+| M1a / anything NPU | ~~untouched, and M1a is still not implementable~~ **CORRECTED 2026-08-07: M1a's mechanism is BUILT** (`--features stale-sel` + `--stale-sel`; see the dated note under the M1a milestone). The measurement is planned, not run. Anything NPU: still untouched |
 
 ### The wiring, and its two invariants
 

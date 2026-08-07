@@ -119,7 +119,7 @@ jobs:
       # with no backend in the cfg, so it IS built here. `teacher-forcing` is named for
       # completeness and adds nothing without `rocm` — see the header.
       - name: clippy (every feature-gated module a deviceless runner can reach)
-        run: cargo clippy --release --locked --features otlp,teacher-forcing,pred-probe,trace --all-targets
+        run: cargo clippy --release --locked --features otlp,teacher-forcing,pred-probe,trace,stale-sel --all-targets
 
       - name: test
         run: cargo test --release --locked

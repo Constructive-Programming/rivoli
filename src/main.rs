@@ -159,6 +159,17 @@ struct Args {
     #[arg(long)]
     pred_probe: bool,
 
+    /// Attend every full DSA layer past `index_topk` with the selection computed from the
+    /// PREVIOUS token's indexer query — the staleness an NPU indexer running in the
+    /// decoupled window would impose (M1a, docs/investigations/npu-offload.md; semantics
+    /// in `indexer::StaleShare`'s doc). A quality instrument: runs only under `--ppl`
+    /// with `--attn dsa`, refuses anything else at startup, and an A/B's statistical
+    /// power comes only from the positions past `index_topk` — size the corpus
+    /// accordingly.
+    #[cfg(feature = "stale-sel")]
+    #[arg(long)]
+    stale_sel: bool,
+
     /// Seconds without a token before the wedge watchdog aborts the process
     /// (`--features trace`). Must comfortably exceed the slowest HEALTHY token — a
     /// cold-miss token here is 1-2 s — so it trips only on a real wedge.
@@ -995,6 +1006,37 @@ fn main() -> Result<()> {
         engine.set_checksum_x(cfg.checksum_x);
         #[cfg(feature = "pred-probe")]
         engine.set_pred_probe(a.pred_probe);
+        // `--stale-sel` has exactly one consumer — the M1a paired A/B under `--ppl` — so
+        // everything else is refused at the door rather than mid-run: a free-running
+        // decode would hand the stale cache the multi-row passes (speculative verify,
+        // prefill) it refuses per-layer, and a corpus that never crosses `index_topk`
+        // would score the exact path while looking like a stale arm (the recorded
+        // "dsa A/B under 2048 tokens covers nothing" trap, now a startup error).
+        #[cfg(feature = "stale-sel")]
+        if a.stale_sel {
+            match &ppl_ids {
+                None => bail!(
+                    "--stale-sel runs only under --ppl (build with --features \
+                     rocm,teacher-forcing,stale-sel): it is the M1a quality instrument, \
+                     not a decode mode"
+                ),
+                // `+ 2`, not `+ 1`: a scored NLL at position p comes from the forward at
+                // p−1 (nt = p), the first genuinely stale forward is nt = index_topk + 2,
+                // and the last forward's NLL is never scored (no next token) — so the
+                // first corpus length where a SCORED position saw a stale selection is
+                // index_topk + 3 tokens.
+                Some(ids) => anyhow::ensure!(
+                    ids.len() > mc.index_topk + 2,
+                    "--stale-sel with a {}-token corpus is vacuous: no scored position \
+                     would see a stale selection until the corpus exceeds index_topk + 2 \
+                     = {} tokens — use tests/ppl-corpus-5000.txt, or a shadow artifact \
+                     with index_topk lowered in its manifest",
+                    ids.len(),
+                    mc.index_topk + 2
+                ),
+            }
+            engine.arm_stale_sel()?;
+        }
         engine.set_moe_gain(a.moe_gain);
         // Wedge watchdog: a hung GPU join can't be caught inside the decode loop, so a
         // background thread aborts the process if no token lands for `--watchdog-secs`.
@@ -1024,8 +1066,18 @@ fn main() -> Result<()> {
             // `bin/ppl` labels a cell with `split_whitespace().take(3)`, so these three
             // fields ARE the label. `moe_gain` is among them because a gain sweep differs
             // in nothing else — six arms would otherwise be indistinguishable downstream.
+            // The stale arm tags the MODE field for the same reason: the M1a A/B holds
+            // mode/policy/moe_gain identical by design (that is the pairing), so without
+            // the tag its two arms would collapse into one cell name.
+            #[cfg(feature = "stale-sel")]
+            let stale_tag = match a.stale_sel {
+                true => "+stale-sel",
+                false => "",
+            };
+            #[cfg(not(feature = "stale-sel"))]
+            let stale_tag = "";
             let label = format!(
-                "mode={} policy={} moe_gain={}",
+                "mode={}{stale_tag} policy={} moe_gain={}",
                 cfg.mode, cfg.cache_policy, a.moe_gain
             );
             rivoli::eval::run(&mut engine, &ids, a.ppl_out.as_ref(), &label)?;

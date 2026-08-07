@@ -47,12 +47,12 @@ cargo test --features rocm                   # 100 tests
 # BENCHMARKS and performance evaluation ONLY.
 cargo build --release --features rocm        # the only backend
 cargo test  --release --features rocm        # HANGS intermittently — see below; sweep per-binary
-tests/feature-matrix.sh                      # every feature combo compiles (18 cells, no GPU)
+tests/feature-matrix.sh                      # every feature combo compiles (34 cells, no GPU)
 tests/mode-matrix.sh <artifact>              # mode x policy x attn, 36 cells, all decode (~90 min, GPU)
 
 cargo clippy --release --features rocm --all-targets
 # Before you claim a change compiles, ALSO run the union — see below.
-cargo clippy --release --features rocm,otlp,teacher-forcing,pred-probe,trace --all-targets
+cargo clippy --release --features rocm,otlp,teacher-forcing,pred-probe,trace,stale-sel --all-targets
 ```
 
 **Develop on the dev profile. Use `--release` for benchmarks and performance evaluation
