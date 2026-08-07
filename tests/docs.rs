@@ -161,10 +161,10 @@ fn the_index_lists_every_doc_with_a_matching_verdict() {
         let row = index
             .lines()
             .find(|l| l.starts_with("| [") && l.contains(&format!("{name})")));
-        if let (Some(sc), Some(row)) = (scope, row) {
-            if !row.contains(&format!("| {sc} |")) {
-                scope_drift.push(format!("{f}: front matter says `{sc}`, index row lacks it"));
-            }
+        if let (Some(sc), Some(row)) = (scope, row)
+            && !row.contains(&format!("| {sc} |"))
+        {
+            scope_drift.push(format!("{f}: front matter says `{sc}`, index row lacks it"));
         }
     }
     assert!(
