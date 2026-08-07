@@ -1,7 +1,7 @@
 ---
 scope: v4
 status: live
-verdict: OPEN. V4 decodes at 5.389 tok/s (185.5 ms/token) against a ~65-70 ms/token bandwidth floor — 2.8x, so ~120 ms/token is not bytes. M1 DONE 2026-08-07 (route/moe/fetch buckets + printed remainder in v4gpu, GLM semantics, no new syncs); M1b DONE (the HB 8→16 fix does not transfer — it was mla_latent_attend, not the MoE GEMV, and at R=1 the fp4 path has no shared-operand reuse axis for it). M2 — one instrumented decode on the recorded command — is prepared and NOT yet run; it ranks the levers.
+verdict: OPEN, decomposed. M2 measured 2026-08-07: 190.9 ms/token = route 78.9 + moe 71.9 + remainder 40.0, fetch 11.9 overlapped (4.96 miss/token decode-only — the head-to-head's 17.0 was prefill-polluted; candidate 1 "unhidden fetch" is DEAD). Output byte-identical; wall +2.9% vs the recorded run, above the ±1% gate — variance suspected (n=1), buckets not certified free. Floor re-derived ~62 ms/token (~16 tok/s ceiling, kill condition not triggered); neither big phase is bandwidth-bound. Ranked levers to 10 tok/s: moe ~49 ms above its bytes (fp4 kernel ISA read, launch geometry; HB-transfer dead per M1b) > route ~46 ms above bytes (attention phase needs its own split) > remainder 40 ms (head tail + launches). M3 attacks in that order.
 ---
 
 # Where do V4-Flash's 185 ms/token go?
@@ -24,6 +24,14 @@ NVMe side: 17 misses x 13.37 MB = **227 MB/token**, ~32 ms serial at 7 GB/s — 
 overlap quality unmeasured. The engine runs at **2.8x its bandwidth floor**; ~120 ms/token
 is unattributed. Every number above is arithmetic over one run's summary line — the
 decomposition does not exist because **v4gpu has no phase buckets**.
+
+*[CORRECTED 2026-08-07, by M2 below — three of the four rows are superseded: the 17.0
+miss/token divides prefill+decode misses by decode tokens (decode-only is 4.96, 66
+MB/token); the 8.90 GiB resident term includes the ~1.06 GB embed, a row gather not a
+per-token read; and the "shared expert ~0.5 GB" row is both undersized (43 × 3 × 2048 ×
+4096 fp8 ≈ 1.08 GB) and double-counted — shared weights are pin placements inside the
+8.90 GiB. Floor re-derived ~62 ms/token ≈ 16 tok/s. The table is kept as the state the
+investigation opened on.]*
 
 ## Candidate sinks, in guessed order (all UNMEASURED — that is the point)
 
@@ -51,7 +59,7 @@ decomposition does not exist because **v4gpu has no phase buckets**.
 - **M1b — the kernel read (no GPU). DONE 2026-08-07, §"M1b — DONE" below.** Read `kernels/moe.hip`'s fp4 path against the HB-16
   lesson and `docs/measurement/how-to-measure.md`'s ISA-first rule; record whether the GLM
   fix applies, as prose in this doc.
-- **M2 — one instrumented decode (GPU, via the coordinator). PREPARED, not run — §"M2 — PREPARED" below.** Same command as the recorded
+- **M2 — one instrumented decode (GPU, via the coordinator). DONE 2026-08-07 — §"M2 — MEASURED" below.** Same command as the recorded
   512-token benchmark. Record the decomposition in `docs/measurement/benchmarks.md` and
   update this doc's verdict with the measured ranking.
 - **M3 — attack in measured order.** Out of scope for this stretch; the M2 table decides it.
@@ -94,7 +102,7 @@ prefill/decode line land wholly on one side; and `-bench 512`'s wall covers 511 
 divided by 512 tokens (the prefill argmax supplies the first) — a ~0.2% understatement
 applied identically to wall and every bucket, so the decomposition stays one arithmetic.
 
-Cost bound, by argument as GLM's is: ~8 `Instant` reads per MoE layer per token (~350
+Cost bound, by argument as GLM's is: 7 `Instant` reads per MoE layer per token (~300
 reads/token, O(10 µs) against a 185 ms token) and **no new sync, event, or join** — every
 bracket closes at a blocking call the decode already pays. The real control is M2 itself:
 its wall must sit within ~1% of the recorded 185.5 ms/token or the buckets are not free,
@@ -134,26 +142,58 @@ Read against `kernels/moe.hip`'s fp4 path (`moe_gateup_f4_impl` / `moe_down_f4_i
 One geometry observation recorded while reading, as M2 candidate mechanism rather than
 claim: `routed_experts` launches **one expert per call** (`e_count = 1`) — 3 kernel
 launches + a ticket wait per expert, ~19 host launches per MoE layer for the routed path,
-~850/token, issued serially by the host loop onto two streams.
+~820/token, issued serially by the host loop onto two streams.
 
-## M2 — PREPARED 2026-08-07, not run: the exact command
+## M2 — MEASURED 2026-08-07: the decomposition, the ranking, and the kill-condition check
+
+Full record in `docs/measurement/benchmarks.md` "V4 decode decomposition"; this section
+carries the reading. Run as staged below, witnessed clean, output **byte-identical** to the
+recorded head-to-head.
+
+**The gate missed first: wall 190.9 ms/token vs the recorded 185.5, +2.9% against a ±1%
+control** — variance suspected (the bucket cost bound is ~500x smaller than the delta, see
+the record), but at n=1 the buckets are *not certified free*, and that caveat rides on
+every number here.
+
+```
+PROFILE/tok: 190.9ms wall | route 78.9ms | moe 71.9ms | fetch 11.9ms | 4.96 miss, 2.40ms/miss, 0.07 GB | remainder 40.0ms
+```
+
+- **Candidate 1 (unhidden fetch) is DEAD.** Decode-only fetch is 4.96 miss/token = 66
+  MB/token, 11.9 ms/token *off-thread*; the 17.0 miss/token that priced the "~32 ms if
+  serial" fear was prefill-polluted.
+- **Candidate 3 (dense/attention) is measured at route ≈ 78.9 ms — ~46 ms above its ~33 ms
+  of bytes.** The phase runs at ~2.4x its traffic; *which* op eats it needs the phase's own
+  split (or a kernel microbench) before a lever is named.
+- **Candidate 2 (fp4 kernel rate) is now WARRANTED an ISA read** by M1b's own decision
+  rule: moe ≈ 71.9 ms against ~23 ms of routed+shared bytes, ~49 ms excess that fetch
+  overlap cannot explain (all of fetch is 11.9). What replaces the dead HB premise: read
+  `dot_f4_wave_r`/`moe_gateup_f4`'s ISA for load width and wave occupancy, and price the
+  one-expert-per-launch geometry (M1b's geometry observation above — the kernel already
+  takes an `e_count`).
+- **Candidate 4 (launch/host overhead) is the remainder: 40.0 ms/token**, holding the
+  ~820/token routed-path launches, 43 end-of-layer syncs, and the whole head tail (incl. the
+  `(1, 129280, 4096)` bf16 head GEMV the port flagged as a shape objection). Cheapest next
+  instrument: a tail bracket at the existing argmax join.
+
+**Kill-condition check — the floor survives, corrected ~10% down.** Three errors found in
+the opening table, none fatal: the 8.90 GiB resident term includes the ~1.06 GB embed
+matrix (a row gather, not a per-token read); the "shared expert ~0.5 GB" row was undersized
+(≈1.08 GB) AND double-counted — shared weights sit inside the 8.90 GiB resident footprint,
+not beside it; and the NVMe term used the prefill-polluted miss rate. Re-derived: routed
+3.45 GB + per-token resident ~8.5 GB ≈ 11.95 GB ≈ **~62 ms/token ≈ 16 tok/s ceiling**. 10 tok/s (≤100 ms/token) needs ~91 of the ~129 ms/token
+now measured above bytes — still no quality tradeoff required, and the three excesses
+above are the ranked budget for it.
+
+## M2 — provenance of the command
 
 The recorded head-to-head wrote a literal `"<prompt>"` where its prompt should be — the
 218-token text was in no doc. Recovered 2026-08-07 from the run's own log (startup
-tokenizer line, byte-complete, 218 tokens confirmed) and recorded in benchmarks.md beside
-the run, in a dated note. The instrumented decode is flag-identical to the recorded one:
-
-```
-flock /var/run/sys-gpu.lock -c \
-  'target/release/rivoli /var/db/rivoli/v4-f4-full -bench 512 --prompt "<the 218-token prompt now recorded in benchmarks.md>"'
-```
-
-Release build BEFORE taking the lock. Witness: `docs/reference/gpu-lock.md`'s corrected
-note establishes that KFD is blind to llama-swap's Vulkan tenants; the sampling plan built
-on it is this investigation's own — per-minute KFD holder count AND `mem_info_gtt_used`
-AND the llama-swap `/running` HTTP probe, any step-change beyond the run's own footprint
-discarding the run with a timestamp. Control = the recorded 95.0 s / 185.5 ms/token wall,
-±~1% or the buckets are reported as non-free before the decomposition is read.
+tokenizer line, byte-complete, 218 tokens confirmed) and recorded verbatim in
+benchmarks.md's head-to-head CORRECTED note. The instrumented command as run — flag-identical,
+flock-wrapped, release built before the lock, with the per-minute KFD+GTT+llama-swap
+witness (`docs/reference/gpu-lock.md`'s corrected note is why KFD alone is insufficient) —
+is in the benchmarks.md record, the canonical home for a recorded command.
 
 ## Kill condition
 
@@ -161,3 +201,8 @@ If M2 shows the floor arithmetic above is wrong (e.g. the dense phase does not r
 8.9 GiB, or achievable bandwidth on this path is far below 193.8 GB/s), say so and re-derive
 the ceiling before proposing any lever — a target computed from a wrong floor is how GLM's
 early perf rounds went wrong, per `docs/measurement/perf-roadmap.md`'s opening.
+
+*[Applied 2026-08-07: M2 tested it. The floor was wrong by ~10%, in the direction and for
+the reasons recorded in the CORRECTED bracket under "The measured budget" — re-derived ~62
+ms/token, ceiling ~16 tok/s, no kill. The levers above are ranked against the corrected
+floor.]*

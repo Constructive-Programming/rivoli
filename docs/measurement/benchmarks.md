@@ -2809,6 +2809,12 @@ target/release/rivoli /var/db/rivoli/v4-f4-full                  -bench 512 --pr
 | MTP | 66.1% accepted, 1.410 tok/pass | off (fp4 MoE kernel is R=1 only) |
 | output | 512/512, coherent, on-task | 512/512, coherent, on-task |
 
+> **CORRECTED 2026-08-07, by the decomposition below.** The V4 "17.0 miss/tok" row divides
+> the run's TOTAL misses (prefill included) by decode tokens; decode-only is **4.96
+> miss/token (~98.1% decode hit)**, and line "(2)"'s "V4's ~0.23" GB/token inherits the
+> same pollution (decode-only ~0.07). The 95.4% hit is likewise pooled. See "V4 decode
+> decomposition" below.
+
 Both arms produced full-budget, on-task answers — read, not just counted. Two observations,
 not conclusions: (1) V4 decodes 2.6× faster *without* speculation, on residency (95.4% vs
 67.7% hit at these artifact sizes and default budgets) — the GLM arm fetched 2.77 GB/token
@@ -2816,3 +2822,57 @@ against V4's ~0.23; (2) the GLM hybrid arm emitted two stray in-word `odesk` tok
 ("batch.odesk", "IKodesk") in otherwise clean prose. n=1, greedy, `--mode hybrid` — the mode
 whose arithmetic is residency-dependent (INV-1 exception, architecture.md §8b). Not filed as
 a defect from one run; if it recurs, A/B it on a single-format mode first.
+
+## V4 decode decomposition — route 78.9 / moe 71.9 / remainder 40.0 ms/token (2026-08-07)
+
+The one instrumented decode `docs/investigations/v4-decode-decomposition.md` M2 asked for:
+flag-identical to the head-to-head above (same binary flags, same 218-token prompt — now
+recorded verbatim in that section's CORRECTED note), release, `wt/v4-decode-decomp` commit
+`f009ecf` (M1 buckets in), sole tenant under the exclusive flock with a per-minute
+KFD+GTT+llama-swap witness (clean: the only KFD holder and the only GTT step were this
+run's own; `{"running":[]}` throughout).
+
+```
+flock /var/run/sys-gpu.lock -c 'target/release/rivoli /var/db/rivoli/v4-f4-full -bench 512 --prompt "<the 218-token prompt above>"'
+```
+
+**The control first, because it missed its gate: wall 97.73 s (190.9 ms/token, 5.239
+tok/s) against the recorded 95.00 s (185.5 ms/token) — +2.9%, above the ±1% the plan set
+for calling the buckets free.** What the pair can and cannot say: the buckets' cost is
+bounded by ~300 host clock reads/token (O(10 µs), no added sync/event/join — argued at
+`v4gpu.rs::V4Profile`), ~500x too small to explain +5.4 ms/token, and the output is
+**byte-identical** (reply text compared byte-for-byte; expert lookups identical at
+179389 hit / 8693 miss) — but n=1 against n=1 cannot attribute the delta, so it is
+recorded as run-to-run variance *suspected*, buckets *not certified free*. A paired
+instrumented-vs-uninstrumented A/B settles it if the 2.9% ever matters; every number below
+carries that caveat.
+
+```
+PROFILE/tok: 190.9ms wall | route 78.9ms | moe 71.9ms | fetch 11.9ms | 4.96 miss, 2.40ms/miss, 0.07 GB | remainder 40.0ms
+```
+
+| bucket | ms/tok | share | first-order bytes at 193.8 GB/s | above bytes |
+|---|---:|---:|---:|---:|
+| route (= attention/dense GPU drain + host routing) | 78.9 | 41% | ~6.4 GB ≈ 33 ms | **~46 ms** |
+| moe (= shared + routed experts + unhidden fetch) | 71.9 | 38% | ~4.5 GB ≈ 23 ms | **~49 ms** |
+| remainder (= launches, per-layer syncs, head tail) | 40.0 | 21% | head ~1.06 GB ≈ 5.5 ms | **~34 ms** |
+| fetch (off-thread, overlaps wall) | 11.9 | — | 66 MB NVMe ≈ 9.5 ms at 7 GB/s | — |
+
+The byte columns are arithmetic over the run's own footprint lines (resident 8.90 GiB =
+9.56 GB; head ~1.06 GB lands in the remainder; shared experts ~1.08 GB land in moe; the
+rest drains into `route`'s D2H), not measurements — the buckets are the measurements.
+
+Findings in one line each — the reading and the ranked levers live in the plan doc
+(`docs/investigations/v4-decode-decomposition.md` §"M2 — MEASURED"):
+
+1. Neither big phase is bandwidth-bound: route and moe together run ~95 ms/token above
+   their traffic. Floor re-derived ~62 ms/token; kill condition not triggered.
+2. Fetch is dead as a sink: decode-only is 4.96 miss/token (~98.1% decode hit) = 66
+   MB/token, 11.9 ms/token off-thread (2.40 ms/miss) — ~6150 of the 8693 misses were
+   prefill's (derived from the 2-decimal PROFILE print, ±2; the raw decode-only integer
+   is logged nowhere).
+3. The remainder is 40 ms/token — above GLM's ~25 on 43 layers against 78.
+4. Corrections to the head-to-head's derived table: the 8.90 GiB "read once per token"
+   resident term includes the embed matrix, gathered one row per token (per-token resident
+   read ~8.5 GB, not 9.56), and its "shared expert ~0.5 GB" floor row was undersized
+   (≈1.08 GB) and double-counted — the shared weights live inside the 8.90 GiB.
