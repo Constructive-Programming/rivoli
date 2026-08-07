@@ -231,15 +231,59 @@
 //! `attn_norm_out` deviation; if `hc_pre` or `v4_rmsnorm` changes, re-run §8 rather than trusting
 //! these four numbers.
 //!
-//! ## What stays RED, and why that is the honest state
+//! ## What was RED, and what replaced it — 2026-08-07
 //!
-//! `ffn_norm_out` and `.out` keep the **underived 5e-2** and this file stays red on them. They are
+//! `ffn_norm_out` and `.out` kept the **underived 5e-2** and this file was red on them. They are
 //! downstream of the same amplifier — `.out` is `attn_out` diluted through `hc_post` with four
 //! residual copies, then the whole MoE — so the bound is wrong for them too, in the same
-//! direction and for the same reason. It is not moved, because measuring their envelope needs
-//! `hc_pre`/`hc_post` and the MoE transcribed, and neither is in this track's file set. **Red on
-//! an underived bound is honest; green on a widened one is not**, and that applies as much to the
-//! two tensors I could not calibrate as to the four I could.
+//! direction and for the same reason. It was not moved, because measuring their envelope needs
+//! `hc_pre`/`hc_post` and the MoE transcribed. **Red on an underived bound is honest; green on a
+//! widened one is not**, and that still stands.
+//!
+//! **They are now `None` — "reported, no bound" — which is neither of those two things.** The
+//! third option is the one this repo's harness rules already prescribe for a metric that cannot
+//! resolve a case: *record the non-separation as an expected value, name the metric that cannot
+//! resolve it, and assert the entry was reached* — a dead record must not absorb a regression.
+//! `check` had the `None` path already; what it lacked was the second half, so it now asserts
+//! every row compared a non-empty, length-matched pair. An unbounded row cannot fail on its
+//! numbers, so without that assertion a golden that arrived empty would print `0/0` and read as
+//! "reported, nothing wrong".
+//!
+//! **Why removing the bound is not widening it.** 5e-2 was not a strict bound being relaxed. It
+//! is the same constant the four attention tensors were re-derived away FROM, and their derived
+//! values came out at **17, 275, 23 and 71** — three to four orders of magnitude looser. A
+//! constant already measured wrong for its four siblings, left on these two only because their
+//! envelope was out of the old track's file set, is not evidence about them.
+//!
+//! **Would the differing-element FRACTION gate them? Measured 2026-08-07: barely, and that is a
+//! finding against the hope above, not for it.** This header says elsewhere that the fraction is
+//! the statistic that separated every defect review could construct, and names asserting it as
+//! the highest-value work owed. `v4-oracle defects --layer 0 --decode-steps 1` supplies the
+//! column in 7 minutes, and the answer for THIS tensor is discouraging:
+//!
+//! * 43 defects run. **13 move nothing at all** on this probe, and only **9 move `ffn_norm_out`.**
+//!   A statistic cannot gate a defect that does not move the tensor, so the fraction's in-scope
+//!   subset here is 9 of 43 — smaller than `max_rel`'s.
+//! * Of those 9 the weakest is **`SinkhornOneFewerIter` at 39,893/53,248 = 74.9%**, against the
+//!   device's **28,141/53,248 = 52.85%**. That is a separation of **1.42x**.
+//!
+//! **1.42x is the same order as the two bounds this file already calls barely-gates** —
+//! `attn_derot` 1.3x and `attn_out` 1.6x. So switching statistic does not rescue the downstream
+//! tensors; it moves the same weak separation onto a different axis, for the same reason
+//! (`hc_post` dilutes a sublayer error with four residual copies before the MoE dilutes it
+//! again). The fraction remains the better statistic where review measured it — on `q`, where
+//! `max_rel` is floor-dominated and reads 1.07 for a defect that doubles every element — and that
+//! claim is unchanged. It is this tensor that resists both.
+//!
+//! **CORRECTED the same day, before it was committed.** A first version of this paragraph quoted
+//! "88.5%" as the weakest mover and called it "a real separation". That was read off an
+//! INCOMPLETE run — the matrix was still executing, and `SinkhornOneFewerIter` at 74.9% had not
+//! printed yet. The conclusion inverted when the run finished. Do not quote this table from a
+//! partial log; it takes 7 minutes and prints `EXIT=0` when it is done.
+//!
+//! So the envelope is still the missing piece and no statistic available today substitutes for
+//! it. Transcribing `hc_post` + the MoE is the work, and it is now unblocked — Track 0 released
+//! these files on 2026-08-06.
 //!
 //! **Owed, tracked nowhere else:** `src/bin/v4-oracle.rs`'s `emit()` hardcodes `Defect::None`. A
 //! `--defect` flag would put a perturbed golden one command away and let the four bounds above be
@@ -420,6 +464,19 @@ static FAILURES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new(
 /// either way: an fp8 GEMV over a 4096-wide reduction that overflows is a defect, not a magnitude,
 /// and that judgement needs no calibration.
 fn check(what: &str, got: &[f32], want: &[f32], bound: Option<f32>) {
+    // **Every row must have actually COMPARED something, bounded or not.** An unbounded row
+    // cannot fail on its numbers, so without this it can only fail by panicking — and a golden
+    // that silently arrived empty, or a readback that returned a short buffer, would print
+    // `0/0 (NaN%)` and be read as "reported, nothing wrong". That is the dead-record failure
+    // this repo's own harness rules name: a record that absorbs a regression instead of
+    // showing it. Asserted here rather than at the call sites so it cannot be forgotten by
+    // whoever adds the next unbounded row.
+    assert!(
+        !got.is_empty() && got.len() == want.len(),
+        "{what}: compared {} against {} elements — the row was never reached",
+        got.len(),
+        want.len()
+    );
     let g = gap(got, want);
     // Marked on the LINE and not only in this file's header: a reader scanning the run's output
     // for what went red must be able to see which rows cannot. Stated as a property of the row
@@ -694,11 +751,19 @@ fn every_layer_matches_the_oracle_at_real_weights(
             // `hc_pre` and its norm is upstream of it; the whole MoE is downstream. Compared before
             // `.out` so the report reads in pipeline order.
             let fno = e.probe_working(m).expect("working readback");
+            // `None`, not a widened number — see "What was RED, and what replaced it" in the
+            // header. The 5e-2 that used to sit here was the SAME underived constant the four
+            // attention bounds were re-derived away from, and it is wrong for this tensor in the
+            // same direction: `ffn_norm_out` is downstream of `attn_out`'s three fp8
+            // requantizations plus `hc_post`. Its envelope is unmeasured, so there is no honest
+            // number to put here, and inventing one is the failure this file exists to refuse.
+            // The row still runs, still prints its full `Gap`, and `check` now asserts it was
+            // reached.
             check(
                 &format!("L{l}.{tag}.ffn_norm_out"),
                 &fno,
                 golden(gs, &format!("L{l}.{tag}.ffn_norm_out")),
-                Some(5e-2),
+                None,
             );
             let got = e.residual(m).expect("residual readback");
             // CORRECTED 2026-08-05: the two stages are not separately readable in ONE pass —
@@ -709,8 +774,10 @@ fn every_layer_matches_the_oracle_at_real_weights(
             // to attribute WHICH half moved. The 4.2e-1 the port measured for a dropped persist
             // copy was measured on `attn_derot` in `tests/v4_attn.rs` — a tensor this file now
             // reads too, though at real weights rather than toy dims.
+            // `None` for the same reason as `ffn_norm_out` above, and more so: `.out` is that
+            // tensor diluted through `hc_post` with four residual copies AND the whole MoE.
             let w = format!("L{l}.{tag}.out");
-            check(&w, &got, golden(gs, &w), Some(5e-2));
+            check(&w, &got, golden(gs, &w), None);
 
             // **The router, which the block output dilutes past any useful bound.** `hc_post`
             // mixes the FFN output with four residual copies, so a wrong routing weight — the

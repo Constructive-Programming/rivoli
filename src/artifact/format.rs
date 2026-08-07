@@ -687,8 +687,20 @@ impl F4Expert<'_> {
 /// is a real cost to buy a property no converter has ever claimed. `I4Source::stamp` DOES
 /// fsync its manifest, and that asymmetry is correct — a torn manifest is unrecoverable, a
 /// torn layer file is regenerable.
+/// **The temp name carries the pid, and that is not decoration** — self-review 2026-08-07,
+/// the same lesson `bin/ppl`, `v4_loading`, `v4_encoding` and `v4_oracle` each learned on
+/// their own scratch paths. Agents share this machine and `convert` takes no lock (it is CPU
+/// only; the GPU flock does not serialise it), so two runs into one `out_dir` are reachable.
+/// On a FIXED `<path>.part` both would `File::create` + truncate + write the same path
+/// concurrently, and the rename would then publish interleaved bytes. Interleaving two writes
+/// **of equal length** yields a file of exactly the right length, so `open_routed`'s
+/// `ensure!(len == want)` passes it — the one corruption shape that gets past the loader.
+///
+/// The cost is that a killed run leaves `L{ll}.vq3.<pid>.part` behind instead of a name the
+/// next run overwrites. That is the better failure: multi-GB debris under an obviously
+/// non-artifact name is visible, and silent wrong content is not.
 pub fn write_atomic(path: &str, bytes: &[u8]) -> Result<()> {
-    let part = format!("{path}.part");
+    let part = format!("{path}.{}.part", std::process::id());
     std::fs::write(&part, bytes).with_context(|| format!("write {part}"))?;
     std::fs::rename(&part, path).with_context(|| format!("rename {part} -> {path}"))
 }
@@ -1791,35 +1803,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// [`write_atomic`] must leave the destination holding exactly the bytes given, and leave
-    /// no `.part` behind — a surviving `.part` beside a 3.7 GB layer file is indistinguishable
-    /// from a run still in progress, which is the confusion the helper exists to end.
+    /// Every `*.part` currently in `dir`, as bare file names.
+    fn walk_parts(dir: &str) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".part"))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// [`write_atomic`] must leave the destination holding exactly the bytes given and no temp
+    /// file of its own behind — a surviving `.part` beside a 3.7 GB layer file is
+    /// indistinguishable from a run still in progress, which is the confusion it exists to end.
     ///
-    /// The third arm is the one worth having: a STALE `.part` left by a previous kill must be
-    /// overwritten, not appended to or trusted. It is seeded LONGER than the real payload, so
-    /// a rename of an un-truncated leftover would leave a file that is too long and the length
-    /// assertion catches it. Seeding it shorter would let a plain `write` pass by accident.
+    /// **The leftover check scans for ANY `*.part`, never for one predicted name.** The first
+    /// version asserted `!exists("{path}.part")`, and when the temp gained its pid suffix that
+    /// assertion kept passing while checking a path the code no longer creates — green,
+    /// and blind to the exact thing it was written for. A directory scan cannot go stale that
+    /// way. Caught in self-review 2026-08-07, one edit after introducing it.
+    ///
+    /// The third arm is the one worth having, and the pid suffix CHANGED what it proves. It
+    /// used to say a stale `.part` is overwritten; now it says another process's debris is
+    /// **not adopted** — `write_atomic` must publish its own bytes and leave the foreign file
+    /// untouched rather than renaming it into place. Seeded longer than the payload, so
+    /// adopting it would fail on length rather than on content.
     #[test]
-    fn write_atomic_replaces_a_stale_part_and_leaves_none_behind() {
+    fn write_atomic_publishes_its_own_bytes_and_never_adopts_foreign_debris() {
         let dir = tmpdir("atomic");
         let path = format!("{dir}/L07.vq3");
-        let part = format!("{path}.part");
+        let strays = || {
+            walk_parts(&dir)
+                .into_iter()
+                .filter(|p| !p.contains("foreign"))
+                .collect::<Vec<_>>()
+        };
 
         write_atomic(&path, b"first").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"first");
-        assert!(!std::path::Path::new(&part).exists(), "left a .part behind");
+        assert_eq!(strays(), Vec::<String>::new(), "left a temp file behind");
 
         write_atomic(&path, b"second").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"second", "did not replace");
 
-        std::fs::write(&part, vec![0xAAu8; 4096]).unwrap();
+        // Another process's abandoned temp, in the same directory, for the same destination.
+        let foreign = format!("{path}.foreign.part");
+        std::fs::write(&foreign, vec![0xAAu8; 4096]).unwrap();
         write_atomic(&path, b"third").unwrap();
         assert_eq!(
             std::fs::read(&path).unwrap(),
             b"third",
-            "a stale .part survived into the destination"
+            "foreign debris reached the destination"
         );
-        assert!(!std::path::Path::new(&part).exists());
+        assert!(
+            std::path::Path::new(&foreign).exists(),
+            "consumed another process's temp file"
+        );
+        assert_eq!(strays(), Vec::<String>::new());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
