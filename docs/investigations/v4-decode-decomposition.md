@@ -1,7 +1,7 @@
 ---
 scope: v4
 status: live
-verdict: OPEN, decomposed. M2 measured 2026-08-07: 190.9 ms/token = route 78.9 + moe 71.9 + remainder 40.0, fetch 11.9 overlapped (4.96 miss/token decode-only — the head-to-head's 17.0 was prefill-polluted; candidate 1 "unhidden fetch" is DEAD). Output byte-identical; wall +2.9% vs the recorded run, above the ±1% gate — variance suspected (n=1), buckets not certified free. Floor re-derived ~62 ms/token (~16 tok/s ceiling, kill condition not triggered); neither big phase is bandwidth-bound. Ranked levers to 10 tok/s: moe ~49 ms above its bytes (fp4 kernel ISA read, launch geometry; HB-transfer dead per M1b) > route ~46 ms above bytes (attention phase needs its own split) > remainder 40 ms (head tail + launches). M3 attacks in that order. M3a ISA read 2026-08-07: the fp4 decode is instruction-issue-bound (195 instr per 128 weight bytes/wave, e2m1 decode = 8 exec-mask regions per dword, flat loads on the weight side) — kernel rate is ~5-10 ms of the 49; prediction registered before measuring: batching resident experts per layer into one range launch moves moe by −3 to −8 ms/token, byte-identical, misses stay per-expert.
+verdict: OPEN, first lever LANDED. M3b measured 2026-08-07: batching a layer's resident experts into one range launch (misses stay per-expert behind their tickets) took moe 70.6 → 54.7 ms/token and wall 186.2 → 169.9 = 5.887 tok/s (+9.6%), output byte-identical, hit/miss identical, fetch fell — the registered prediction (−3..−8) was wrong on the GOOD side: per-launch cost is the ~25 µs host-bubble class, not the 1.97 µs dispatch floor it was priced on. tail measured 8.2 of the 39.1 ms remainder. Residue to 10 tok/s (~70 ms off the wall): route ~76 (attention phase still needs its own split) > moe ~32 above bytes (fp4 kernel issue-bound per the M3a ISA read: 195 instr per 128 weight bytes/wave, exec-mask e2m1 decode, flat loads; miss exposure and shared GEMV unpriced) > remainder ~31 non-tail. M2's decomposition and floor (~62 ms/token ≈ 16 tok/s ceiling) stand; buckets still not certified free (wall spread ±1.5% over three stock-class runs).
 ---
 
 # Where do V4-Flash's 185 ms/token go?
@@ -238,7 +238,23 @@ costs the rest — i.e. **launch geometry is predicted the MINOR half of the moe
 and if the measured delta is under ~3 ms/token it is inside the recorded ±2.9% wall
 variance's bucket-level noise and the arms need replicates before any claim.
 
-## M3b — the geometry change (2026-08-07, host-verified; NOT yet measured) and the staged A/B
+> **SCORED 2026-08-07, by the M3b A/B: wrong on the good side — measured Δmoe is −15.9
+> ms/token against the −3..−8 band.** Direction, byte-identity and a non-growing fetch (it
+> fell) were as predicted; the magnitude was priced on the wrong constant — the 1.97 µs
+> device dispatch floor, where the recovery divides out to the ~25 µs host-bubble class.
+> That makes the geometry twice the top of its band and the largest single priced
+> component, though still smaller than the ~32 ms residual. The full accounting, and why
+> the residual stays named-not-priced, is in benchmarks.md "V4 launch-geometry A/B".
+
+## M3b — the geometry change, MEASURED 2026-08-07: moe 70.6 → 54.7, wall 186.2 → 169.9 = 5.887 tok/s
+
+Full record and every gate result in `docs/measurement/benchmarks.md` "V4 launch-geometry
+A/B" — all gates passed. Δmoe = **−15.9 ms/token**, all of it in the wall (+9.6% tok/s);
+`tail` measured 8.2 of the 39.1 ms remainder, ranking item (3)'s first number. The
+prediction above is SCORED at its own paragraph. New measured state: **169.9 ms/token;
+10 tok/s needs ~70 more off the wall** — the ranked residue is in the verdict.
+
+*The staging protocol below is kept as run:*
 
 Landed on `wt/v4-moe-launch`: `routed_experts` writes descriptors and routing weights in
 LAUNCH order (residents compacted at `[0, n_res)`, misses after), launches the residents as
@@ -247,8 +263,8 @@ on the miss stream behind its own ticket — the straggler story M3a's predictio
 Plus the tail bracket at the argmax join (remainder's head share, printed inside the
 remainder term) and the raw decode-miss integer M2 found itself unable to recover.
 
-**Staged, not run — two release arms, both binaries built BEFORE the device is requested,
-nothing built between arms:**
+**Two release arms, both binaries built BEFORE the device was requested, nothing built
+between arms** *(staged 2026-08-07 pre-GO, run the same day as written)*:
 
 - arm S (stock): `c656eac` via `git archive` into a scratch tree, `cargo build --release
   --features rocm` there.

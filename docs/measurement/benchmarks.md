@@ -2876,3 +2876,58 @@ Findings in one line each — the reading and the ranked levers live in the plan
    resident term includes the embed matrix, gathered one row per token (per-token resident
    read ~8.5 GB, not 9.56), and its "shared expert ~0.5 GB" floor row was undersized
    (≈1.08 GB) and double-counted — the shared weights live inside the 8.90 GiB.
+
+## V4 launch-geometry A/B — moe 70.6 → 54.7 ms/token, output byte-identical (2026-08-07)
+
+The A/B `docs/investigations/v4-decode-decomposition.md` M3b staged: stock `c656eac` (built
+from `git archive` into a scratch tree) vs batched `94e72f0` (`wt/v4-moe-launch`: resident
+experts of a layer in ONE `[0, n_res)` range launch, misses still one launch each behind
+their own ticket). Both release binaries built BEFORE the device was requested, nothing
+built between arms, stock first, each arm flock-wrapped with a per-minute KFD+GTT+llama-swap
+witness (clean both arms: only the run's own KFD holder, GTT flat at the same value,
+`{"running":[]}` throughout). Command per arm, flag-identical to M2's, the 218-token prompt
+verbatim from the head-to-head CORRECTED note:
+
+```
+flock /var/run/sys-gpu.lock -c '<arm-binary> /var/db/rivoli/v4-f4-full -bench 512 --prompt "<prompt>"'
+```
+
+```
+stock   (c656eac): PROFILE/tok: 186.2ms wall | route 75.8ms | moe 70.6ms | fetch 10.4ms | 4.96 miss, 2.09ms/miss, 0.07 GB | remainder 39.7ms
+batched (94e72f0): PROFILE/tok: 169.9ms wall | route 76.1ms | moe 54.7ms | fetch  9.6ms | 4.96 miss (2538 raw), 1.95ms/miss, 0.07 GB | remainder 39.1ms (tail 8.2ms)
+```
+
+**Correctness gates first, all pass:** generated text **byte-identical** (2025 bytes,
+`cmp` clean, same md5), expert lookups identical (179389 hit / 8693 miss, both arms), and
+`fetch` did not grow — it fell 10.4 → 9.6 ms/token (2.09 → 1.95 ms/miss), so batching did
+not serialise hits behind misses; the straggler path held.
+
+**The instrument (moe bucket): −15.9 ms/token, and the wall carries all of it** (−16.3;
+decode 95.34 s = 5.370 → 86.97 s = **5.887 tok/s**, +9.6%). route unmoved (75.8 → 76.1),
+remainder unmoved (39.7 → 39.1). Prefill also fell, 20.19 → 16.57 s (−18%) — prefill runs
+the same per-row routed path, so it collects the same launch saving 218 rows deep.
+
+**The registered prediction (M3a: −3 to −8, point −5) was wrong on the good side, and the
+error is localisable:** the band priced ~630 removed launches at GLM's measured 1.97 µs
+device dispatch floor. The recovered 15.9 ms over those ~630 divides out to ~25 µs each —
+the class of the measured host→GPU join tax (11–20 µs) and of `src/gpu.rs`'s named
+"per-expert host-gated launch bubbles" suspect, not the dispatch floor; the quotient sits
+above the 11–20 µs band because it also folds in the removed act_quant micro-launches and
+chain-boundary bubbles, unlabeled. Same error family how-to-measure.md documents for ISA
+reads — mechanism right, magnitude not — here in launch accounting.
+The moe bucket still sits ~32 ms above its ~23 ms of bytes; the live candidates (fp4
+kernel rate, miss-fetch exposure under the closing sync, shared-expert fp8 GEMV rate)
+stay candidates — decomposing a bucket by inference is the documented mistake, so they
+are named, not priced from the bucket (kernel rate's ~5–10 ms is the M3a ISA balance's
+number, not the bucket's).
+
+Two riders: **`tail` = 8.2 of the 39.1 ms remainder** (first number for M2 ranking item
+(3): the head tail is about a fifth of the remainder; the other ~31 ms is per-layer
+attention/hc/norm launch + end-of-layer sync). And the stock arm re-lands the M2-class
+build at 186.2 ms/token against M2's 190.9 and the head-to-head's 185.5 — three points
+spanning ±1.5% (one uninstrumented build, two bucketed; the bucket cost bound is ~500×
+below the spread), which supports M2's "run-to-run variance suspected" reading of its
++2.9% gate miss (still n too small to certify the buckets free; noted, not settled). The
+2538 raw decode misses land inside M2's print-precision band (8693 − 2538 = 6155 prefill
+misses against the derived ~6150, band 6151–6156; the raw integer is logged since
+`94e72f0`).
