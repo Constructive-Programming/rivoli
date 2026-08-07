@@ -2777,3 +2777,32 @@ max_rel 5.419e0) and `.out` (32.52%, max_rel 2.378e1) carry the **underived 5e-2
 which needs `hc_post` and the MoE transcribed before it can be replaced by a measured one.
 The four tensors that *do* have derived bounds separate at 45× / 30× / 1.3× / 1.6×. Red on an
 underived bound is the honest state; do not widen it to make this table uniform.
+
+## GLM-5.2 vs DeepSeek-V4-Flash — 512-token decode, one complex prompt (2026-08-07)
+
+First head-to-head on the merged tree (`main` post scope/goldens/M1a merges, release
+profile). One 218-token five-part systems-design prompt, identical text both arms,
+`-bench 512`, sole tenant under the exclusive flock with a per-minute GTT+KFD witness
+(clean both arms; llama-swap `{"running":[]}` throughout — checked because an unwrapped
+`qwen3-embedding-4b` had stomped a dev-suite run earlier the same evening).
+
+```
+target/release/rivoli /var/db/rivoli/glm52-vq3-full --max-mem 115 -bench 512 --prompt "<prompt>"
+target/release/rivoli /var/db/rivoli/v4-f4-full                  -bench 512 --prompt "<prompt>"
+```
+
+| | GLM-5.2 (hybrid, dsa, MTP gated) | V4-Flash (.f4, MTP structurally off) |
+|---|---:|---:|
+| prefill, 218 tokens | 72.8 s (layer-major) | **20.12 s** |
+| decode | 512 in 320.5 s = **2.07 tok/s** | 512 in 95.0 s = **5.389 tok/s** |
+| expert hit (decode) | 67.7%, 180.4 miss/tok, 1.44 ms/miss | **95.4%**, 17.0 miss/tok |
+| MTP | 66.1% accepted, 1.410 tok/pass | off (fp4 MoE kernel is R=1 only) |
+| output | 512/512, coherent, on-task | 512/512, coherent, on-task |
+
+Both arms produced full-budget, on-task answers — read, not just counted. Two observations,
+not conclusions: (1) V4 decodes 2.6× faster *without* speculation, on residency (95.4% vs
+67.7% hit at these artifact sizes and default budgets) — the GLM arm fetched 2.77 GB/token
+against V4's ~0.23; (2) the GLM hybrid arm emitted two stray in-word `odesk` tokens
+("batch.odesk", "IKodesk") in otherwise clean prose. n=1, greedy, `--mode hybrid` — the mode
+whose arithmetic is residency-dependent (INV-1 exception, architecture.md §8b). Not filed as
+a defect from one run; if it recurs, A/B it on a single-format mode first.
