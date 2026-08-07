@@ -1,7 +1,7 @@
 ---
 scope: v4
 status: live
-verdict: OPEN, decomposed. M2 measured 2026-08-07: 190.9 ms/token = route 78.9 + moe 71.9 + remainder 40.0, fetch 11.9 overlapped (4.96 miss/token decode-only — the head-to-head's 17.0 was prefill-polluted; candidate 1 "unhidden fetch" is DEAD). Output byte-identical; wall +2.9% vs the recorded run, above the ±1% gate — variance suspected (n=1), buckets not certified free. Floor re-derived ~62 ms/token (~16 tok/s ceiling, kill condition not triggered); neither big phase is bandwidth-bound. Ranked levers to 10 tok/s: moe ~49 ms above its bytes (fp4 kernel ISA read, launch geometry; HB-transfer dead per M1b) > route ~46 ms above bytes (attention phase needs its own split) > remainder 40 ms (head tail + launches). M3 attacks in that order.
+verdict: OPEN, decomposed. M2 measured 2026-08-07: 190.9 ms/token = route 78.9 + moe 71.9 + remainder 40.0, fetch 11.9 overlapped (4.96 miss/token decode-only — the head-to-head's 17.0 was prefill-polluted; candidate 1 "unhidden fetch" is DEAD). Output byte-identical; wall +2.9% vs the recorded run, above the ±1% gate — variance suspected (n=1), buckets not certified free. Floor re-derived ~62 ms/token (~16 tok/s ceiling, kill condition not triggered); neither big phase is bandwidth-bound. Ranked levers to 10 tok/s: moe ~49 ms above its bytes (fp4 kernel ISA read, launch geometry; HB-transfer dead per M1b) > route ~46 ms above bytes (attention phase needs its own split) > remainder 40 ms (head tail + launches). M3 attacks in that order. M3a ISA read 2026-08-07: the fp4 decode is instruction-issue-bound (195 instr per 128 weight bytes/wave, e2m1 decode = 8 exec-mask regions per dword, flat loads on the weight side) — kernel rate is ~5-10 ms of the 49; prediction registered before measuring: batching resident experts per layer into one range launch moves moe by −3 to −8 ms/token, byte-identical, misses stay per-expert.
 ---
 
 # Where do V4-Flash's 185 ms/token go?
@@ -184,6 +184,87 @@ not beside it; and the NVMe term used the prefill-polluted miss rate. Re-derived
 3.45 GB + per-token resident ~8.5 GB ≈ 11.95 GB ≈ **~62 ms/token ≈ 16 tok/s ceiling**. 10 tok/s (≤100 ms/token) needs ~91 of the ~129 ms/token
 now measured above bytes — still no quality tradeoff required, and the three excesses
 above are the ranked budget for it.
+
+## M3a — the fp4 ISA read (2026-08-07, no GPU), and the registered prediction
+
+`hipcc --offload-arch=gfx1151 -O3 -fPIC -S kernels/moe.hip` — the build's own flags
+(`build.rs:76`), read before any code was written, per `how-to-measure.md`'s ISA-first rule.
+Both fp4 kernels compile to 0 LDS, 0 scratch, 48 VGPR (`moe_gateup_f4`) / 38 VGPR
+(`moe_down_f4`) — 16 waves/SIMD, so **occupancy is not the limiter**. The story is the
+inner loop. One iteration of `dot_f4_wave_r`'s dword fast path — one wave consuming 256
+columns = 128 packed weight bytes + 8 scale bytes — is **195 instructions, 117 of them
+VALU, of which ~10 are the FMAs the loop exists to do**:
+
+- **The e2m1 decode is eight exec-mask branch regions per dword.** The `e ? (1+m/2)·2^(e−1)
+  : m/2` ternary compiles to `v_cmpx_ne_u32` + `s_mov exec` / `s_or exec` around a 5-VALU
+  else-arm, PER NIBBLE — ~11 instructions each, ~88 of the 195. The `(e−1)&3` trick kept
+  the shift in range but did not make the select branchless.
+- **The sign pass is 8 more `v_and`+`v_cmp`+`v_cndmask` triplets**, and the e8m0 scale
+  decode is a further exec-branchy region (the 0xff/0 special cases) per iteration.
+- **The weight dword and the scale byte lower to `flat_load_b32` / `flat_load_d16_u8`** —
+  generic-address-space loads, because both pointers come out of the `ExpertDescF4` struct
+  read from memory and clang cannot prove them global. On gfx11 flat loads take the slower
+  path and count against `lgkmcnt` too; the loop carries three `s_waitcnt`s, one mid-body.
+  The activation side is clean (`s_clause`'d `global_load_b128` ×2).
+
+Balance arithmetic (~2.9 GHz, 80 SIMDs, 1 wave-instr/SIMD/cycle): the loop delivers 128 B
+per 195 issue slots ≈ **0.66 B/cycle/SIMD, against the 0.84 needed to stream 193.8 GB/s**
+— instruction-issue-bound at ~79% of achievable bandwidth in the IDEAL case (VOPD dual-issue
+buys some back; the flat-load latency and mid-loop waits take more). So the ISA puts the
+routed compute floor at ≥ ~23 ms/token against the 18 ms of bytes — **kernel rate explains
+~5–10 ms of the 49 ms excess, not most of it.** The fixes it names — branchless e2m1,
+global-address-space descriptor pointers — are kernel changes, out of this stretch's scope
+(plumbing only), recorded as the M3 kernel-rate lever.
+
+**Launch geometry, what the source + ISA say together:** `routed_experts` launches one
+expert per `rivoli_moe_expert_range_f4` call — 3 kernels each (gate/up, a 16-block
+`act_quant_f8`, down), ~19 launches/MoE-layer on the routed path, ~820/token — although the
+kernel's `[e_start, e_count)` range form was written as the hook for exactly this batching
+(`kernels/moe.hip:173-176`). Batching the RESIDENT experts of a layer into one range call
+removes ~630 launches/token (device dispatch floor 1.97 µs measured on GLM), ~5 of 6
+`act_quant` micro-launches per layer, and the drain-to-16-block-kernel pipeline bubbles at
+each of the ~12 removed chain boundaries per layer. Misses must stay per-expert launches on
+the miss stream — batching them would gate the whole batch on the LAST fetch (2.40 ms/miss
+measured), serialising hits behind misses.
+
+**Prediction, registered before the measurement so it can be wrong:** resident-batching
+moves the `moe` bucket by **−3 to −8 ms/token (point: −5)**, byte-identical output (integer
+fixed-point accumulation is order-free by design — `MOE_ACC_SHIFT`'s contract,
+`kernels/common.hpp:14-37`), fetch bucket unchanged. The remaining ~40 ms of the 49 is
+predicted to split: instruction-issue-bound decode ~5–10 ms, miss fetch exposed inside the
+layer's closing `device_sync` ~8–10 ms (4.96 misses × 2.40 ms, less the ~0.5 ms/layer of
+resident compute that can hide it), shared-expert fp8 GEMV rate + per-layer H2D/sync fixed
+costs the rest — i.e. **launch geometry is predicted the MINOR half of the moe excess**,
+and if the measured delta is under ~3 ms/token it is inside the recorded ±2.9% wall
+variance's bucket-level noise and the arms need replicates before any claim.
+
+## M3b — the geometry change (2026-08-07, host-verified; NOT yet measured) and the staged A/B
+
+Landed on `wt/v4-moe-launch`: `routed_experts` writes descriptors and routing weights in
+LAUNCH order (residents compacted at `[0, n_res)`, misses after), launches the residents as
+ONE `[0, n_res)` range call on the compute stream, and keeps every miss a separate launch
+on the miss stream behind its own ticket — the straggler story M3a's prediction depends on.
+Plus the tail bracket at the argmax join (remainder's head share, printed inside the
+remainder term) and the raw decode-miss integer M2 found itself unable to recover.
+
+**Staged, not run — two release arms, both binaries built BEFORE the device is requested,
+nothing built between arms:**
+
+- arm S (stock): `c656eac` via `git archive` into a scratch tree, `cargo build --release
+  --features rocm` there.
+- arm B (batched): this branch's committed HEAD, same build line.
+- command per arm, flag-identical to M2's (the 218-token prompt verbatim in benchmarks.md's
+  head-to-head CORRECTED note), each under the exclusive flock with the per-minute
+  KFD+GTT+llama-swap witness, stock first:
+  `flock /var/run/sys-gpu.lock -c '<arm-binary> /var/db/rivoli/v4-f4-full -bench 512 --prompt "<prompt>"'`
+
+**Gates, registered with the prediction:** (1) correctness — generated text byte-identical
+across arms, and hit/miss counts identical (routing and submit order are untouched); any
+token difference is a BUG in the regrouping, not noise. (2) the instrument is the `moe`
+bucket, NOT wall — the recorded +2.9% run-to-run wall variance swallows a 5 ms win; if
+|Δmoe| < ~3 ms/token the arms need replicates before any claim. (3) `fetch` must not grow —
+growth is the tell that batching serialised hits behind misses. (4) `tail` from arm B is
+M2 ranking item (3)'s first number, free from the same run.
 
 ## M2 — provenance of the command
 
