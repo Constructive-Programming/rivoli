@@ -1,6 +1,6 @@
 ---
 status: closed-negative
-verdict: DSA indexer offload to the NPU: not worth it. The answer is in the first 40 lines; the device top-k it recommended shipped instead (−9.4 ms/token).
+verdict: DSA indexer offload to the NPU: not worth it — M1a (measured 2026-08-07) closed the decoupled window for GLM's DSA indexer (verbatim 1-step-stale costs +0.89 nats; only the diagonal-patched variant is unmeasured). The device top-k it recommended shipped instead (−9.4 ms/token).
 ---
 
 # rivoli — NPU offload plan: the DSA indexer
@@ -10,14 +10,16 @@ verdict: DSA indexer offload to the NPU: not worth it. The answer is in the firs
 > real only above `index_topk` = 2048, half to three-quarters of it was never GPU work,
 > and the part that was — a device top-k kernel — **is built and shipped** (−9.4 ms/token,
 > selection bit-identical to the host over 10,752 real layers). The NPU itself remains
-> unbuilt and the exact-overlap design was falsified on engine data.
+> unbuilt and the exact-overlap design was falsified on engine data — **and 2026-08-07 the
+> decoupled design fell too, on quality (M1a: verbatim 1-step-stale, +0.89 nats)**.
 
 Status: **M0 and M1 MEASURED (2026-07-26). The no-NPU device top-k is now WIRED and
 MEASURED (2026-07-27): −9.4 ms/token, 2.1% of wall, selection exact.** M0 clears ≥4k. M1
 clears via the decoupled window only, and everything past it still sits behind M1a, which
-~~remains not implementable as written~~ (**2026-08-07: now implementable — mechanism
-built behind `--features stale-sel` + `--stale-sel`, measurement planned but not run; see
-the dated note under the M1a milestone**). The NPU is live on
+~~remains not implementable as written~~ (**2026-08-07: implemented behind `--features
+stale-sel` + `--stale-sel`, and MEASURED the same day — verbatim 1-step-stale FAILS,
+tail mean dNLL +0.89 nats, closing the decoupled window for GLM's DSA indexer; see the
+MEASURED note under the M1a milestone**). The NPU is live on
 this node — XRT 2.21, amdxdna 0.1, firmware 1.1.2, `/dev/accel/accel0`, Strix Halo NPU at
 `0000:c8:00.1` — and 100% idle during decode. This plan is **exclusive to one workload: the
 DSA sparse indexer.** The other NPU candidate (a spec-decode drafter) was analysed and set
@@ -42,7 +44,10 @@ and the NPU changes only the draft cost, not the verify-union penalty that sank 
 3. **The exact-overlap design (window 1) fails on engine data, at every context measured.**
    The window is ~369 µs in-engine; the indexer plus its selection step needs 409 µs at
    2.4k and 552 µs at 5.2k. It is not close, and the gap widens with context.
-4. **The decoupled design (window 2) is established only to 5.2k.** It clears there
+4. **The decoupled design (window 2) is established only to 5.2k.** (**2026-08-07: the
+   timing clearance is now moot — M1a measured verbatim 1-step-stale at +0.89 nats tail
+   dNLL, so window 2 is closed on QUALITY for GLM's DSA indexer; see the MEASURED note
+   under the M1a milestone.**) It clears there
    comfortably. At 32k it clears on one reading of the MoE window and fails on the other,
    and the favourable reading rests on treating ~1.4 ms/layer as GPU idle when the only
    *measured* idle is 0.12 ms/layer. It also misses the 3 dense-MLP full layers at 32k
@@ -794,6 +799,39 @@ a GPU∥NPU one.**
   > indexer**, and with it this plan's M2/M3. That is this document's workload; it says
   > nothing about the V4 indexer.
 
+  > **MEASURED 2026-08-07 — verbatim 1-step-stale FAILS, decisively. The decoupled
+  > window is CLOSED for GLM's DSA indexer, and with it M2/M3.** The paired A/B ran as
+  > planned above (sole tenant, flock, per-arm witness sampling kfd + `mem_info_gtt_used`
+  > + the llama-swap probe every 60 s — all samples clean on both arms; one binary,
+  > `--mode int3-vq --cache-policy lru --attn dsa --max-mem 100`, no build between arms):
+  >
+  > | read | mean dNLL (nats) | 95% CI | worse% | PPL |
+  > |---|---|---|---|---|
+  > | full file, 5184 positions | **+0.53923** | [+0.50362, +0.57484] | 49.3 | 4.1126 → 7.0518 |
+  > | tail only (past 2049), 3136 positions | **+0.89138** | [+0.83587, +0.94689] | 81.4 | 3.7844 → 9.2283 |
+  >
+  > The 1% bar is 0.00995 nats; the tail interval sits ~90× past it, and `worse% = 81.4`
+  > says the damage is broad, not a few outliers. Every planned control passed: the gate
+  > proof refused a 763-token corpus with the vacuous-corpus error and wrote no `.nll`;
+  > the first-2048 prefix was **bit-identical** between arms (divergence begins exactly at
+  > prediction 2049, the crossing token); and the engagement count was **65,835 = 21 full
+  > layers × 3,135 scored stale forwards** — exactly the arithmetic predicts, so the
+  > instrument served precisely the selections it claims. Side observation, mechanically
+  > expected: the stale arm's expert-cache hit rate moved (71.96% → 69.15%) because a
+  > different attend output routes differently; a reminder that this flag, like hybrid's
+  > residency defect, changes the trajectory and must never be on in a run that isn't
+  > this measurement. Raw rows: `docs/measurement/m1a-stale-selection/` (exact.nll /
+  > stale.nll, engine logs, per-arm witnesses, and vacuous.log — the gate-refusal proof).
+  >
+  > **What this closes, and the one thing it does not.** VERBATIM 1-step-stale — the form
+  > window 2 gets for free — is dead here: no overlap saving of ≤2.7% of wall survives a
+  > +0.89-nat quality collapse. Scope: **GLM-5.2's DSA indexer on this engine**; it says
+  > nothing about the V4 indexer. The variant registered above before the measurement —
+  > patching the current token's diagonal into the served selection (one extra attend row,
+  > no extra NPU work) — remains unmeasured. Anyone reopening this line owes that arm
+  > FIRST, under this same harness; nothing else in M2/M3 is worth touching unless it
+  > passes.
+
 - **M2 — indexer on the NPU.** Port the kernels; validate the **selected set** matches the
   GPU indexer on a fixed long-context input (not bit-exact scores).
 
@@ -859,7 +897,7 @@ comparing nothing. Everything below the wiring step is still unbuilt.
 | Wiring into `dsa_select_layer` | **DONE**, default on — **−9.4 ms/token (2.1% of wall)** |
 | Selection matches the host in-engine | **10,752 full layers exact**, sentinel intact, output byte-identical across all arms |
 | `device_sync` deletion | costed separately: **−2.5 ms/token**, consistently signed, 4× smaller than the top-k. Sync KEPT — 0.6% of wall at n=2 vs `route`'s comparability |
-| M1a / anything NPU | ~~untouched, and M1a is still not implementable~~ **CORRECTED 2026-08-07: M1a's mechanism is BUILT** (`--features stale-sel` + `--stale-sel`; see the dated note under the M1a milestone). The measurement is planned, not run. Anything NPU: still untouched |
+| M1a / anything NPU | ~~untouched, and M1a is still not implementable~~ **CORRECTED 2026-08-07: M1a is BUILT and MEASURED — FAILS; see the MEASURED note under the M1a milestone.** Only the diagonal-patched variant remains unmeasured. Anything NPU: still untouched, and now moot for GLM's DSA indexer (the V4 indexer is out of scope) |
 
 ### The wiring, and its two invariants
 

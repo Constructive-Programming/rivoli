@@ -1,0 +1,14 @@
+[2m2026-08-07T15:44:12.156667Z[0m [32m INFO[0m [2mrivoli[0m[2m:[0m rivoli 0.1.0 | model=/var/db/rivoli/glm52-vq3-full bench=None mode=int3-vq attn=Dsa cache_policy=lru 2q_kin=8% 2q_kout=20% trace=None prompt=None os_reserve=16GiB max_mem=100GiB
+[2m2026-08-07T15:44:12.157472Z[0m [32m INFO[0m [2mrivoli[0m[2m:[0m model: 78 layers (3 dense) hidden=6144 heads=64 experts=256 top8 moe_inter=2048 vocab=154880
+[2m2026-08-07T15:44:12.157478Z[0m [32m INFO[0m [2mrivoli[0m[2m:[0m mla: q_lora=2048 kv_lora=512 qk=192+64 v_head=256 rope_theta=8000000
+[2m2026-08-07T15:44:12.460691Z[0m [32m INFO[0m [2mrivoli[0m[2m:[0m tokenizer: prompt "The sky is blue because" -> 11 tokens chat-framed [154822, 154824, 154827, 785, 12877, 374, 6303, 1576, 154828, 154841, 154842]; eos=[154820, 154827, 154829]
+[2m2026-08-07T15:44:12.487121Z[0m [32m INFO[0m [2mrivoli::eval[0m[2m:[0m ppl corpus "/home/rhansen/workspace/constructive.dev/rivoli/.claude/worktrees/npu-m1a-stale-selection/tests/ppl-corpus-5000.txt": 25885 bytes, 5185 tokens, fnv1a64 2a6ac2b42812bf58
+[2m2026-08-07T15:44:12.653971Z[0m [32m INFO[0m [2mrivoli[0m[2m:[0m device pool budget 100.0 GiB (--max-mem, literal — no reserve; may OOM)
+[2m2026-08-07T15:44:12.655999Z[0m [32m INFO[0m [2mrivoli::memory::pin[0m[2m:[0m mtp head: present
+[2m2026-08-07T15:44:12.691215Z[0m [32m INFO[0m [2mrivoli::memory::pin[0m[2m:[0m computed resident footprint 16.56 GiB (tier 16.81 GiB incl. slack)
+[2m2026-08-07T15:44:17.338622Z[0m [32m INFO[0m [2mrivoli::memory::routed[0m[2m:[0m routed pool [lru vq3]: 83.2 GiB budget (~5824 slots, cold 15335424B / hot 15335424B)
+[2m2026-08-07T15:44:28.564578Z[0m [32m INFO[0m [2mrivoli[0m[2m:[0m pin built in 15.9s
+[2m2026-08-07T15:44:28.564864Z[0m [32m INFO[0m [2mrivoli::gpu[0m[2m:[0m DSA row selection: device index_topk
+[2m2026-08-07T15:44:28.847364Z[0m [32m INFO[0m [2mrivoli::gpu[0m[2m:[0m residual stream: 5186 rows (127.5 MB) — layer-major prefill
+[2m2026-08-07T16:22:38.731471Z[0m [32m INFO[0m [2mrivoli::eval[0m[2m:[0m PPL: 4.112592 (mean NLL 1.414054 over 5184 predicted tokens, 2289.8s) | hit 71.96%
+[2m2026-08-07T16:22:38.744290Z[0m [32m INFO[0m [2mrivoli::eval[0m[2m:[0m wrote 5184 per-token NLLs to /home/rhansen/workspace/constructive.dev/rivoli/.claude/worktrees/npu-m1a-stale-selection/m1a-out/exact.nll
