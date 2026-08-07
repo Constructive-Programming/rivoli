@@ -693,9 +693,11 @@ fn cmp_goldens(a: &Path, b: &Path) -> Result<()> {
     // Structural rows counted apart from moved ones: every number above is elementwise,
     // and a summary that folded "reshaped" into "differs" would not be the same statistic
     // as its own table.
-    let s = (structural > 0)
-        .then(|| format!(" ({structural} structurally mismatched)"))
-        .unwrap_or_default();
+    let s = if structural > 0 {
+        format!(" ({structural} structurally mismatched)")
+    } else {
+        String::new()
+    };
     println!(
         "{moved} of {} tensors differ{s}{}",
         ds.len(),
