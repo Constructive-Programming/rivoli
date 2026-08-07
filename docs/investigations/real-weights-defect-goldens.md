@@ -1,4 +1,5 @@
 ---
+scope: v4
 status: live
 verdict: OPEN, and newly justified by measurement. `v4-oracle emit` hardcodes `Defect::None`, so every derived tolerance in this repo is validated by host transcription rather than through the gate it protects. A `--defect` flag is the whole change; `Defect::ALL` already enumerates the breakages and the `defects` subcommand already drives them. The reason to build it is no longer aesthetic: on 2026-08-07 the checkpoint was measured to discriminate a defect the toy fixture is bit-blind to (39,893/53,248 elements vs exactly 0), so real-weights goldens are strictly stronger, not merely more realistic.
 ---

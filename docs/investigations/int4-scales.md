@@ -1,4 +1,5 @@
 ---
+scope: glm
 status: closed-shipped
 verdict: Why int4 was unusable and how group-128 scales fixed it: PPL 73.43 → 5.120, making int4 the best-quality mode. RESOLVED.
 ---

@@ -1,4 +1,5 @@
 ---
+scope: glm
 status: live
 verdict: The --mode × --cache-policy matrix and which knob does what. Quality ladder: int4 5.120 > hybrid 5.189 > int3-vq 5.275.
 ---

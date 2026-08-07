@@ -1,4 +1,5 @@
 ---
+scope: glm
 status: closed-negative
 verdict: DSA indexer offload to the NPU: not worth it. The answer is in the first 40 lines; the device top-k it recommended shipped instead (−9.4 ms/token).
 ---

@@ -1,4 +1,5 @@
 ---
+scope: glm
 status: live
 verdict: The engine as it is. The one doc meant to be read whole; §8b is the INV registry, enforced by tests/invariants.rs.
 ---

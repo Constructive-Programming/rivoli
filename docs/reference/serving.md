@@ -1,4 +1,5 @@
 ---
+scope: glm
 status: live
 verdict: The OpenAI HTTP server (--port). Thinking defaults OFF and is a prompt prefill, not a flag; tool calling works; sampling and /v1/completions do not, on purpose.
 ---

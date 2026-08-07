@@ -1,4 +1,5 @@
 ---
+scope: engine
 status: live
 verdict: Why ROCm GPU profiling does not work on this part, and what to do instead. Only if you are attaching a profiler.
 ---

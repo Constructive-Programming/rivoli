@@ -1,4 +1,5 @@
 ---
+scope: glm
 status: closed-mixed
 verdict: Phase profile and per-kernel tranches behind the roadmap. The "Where the time goes" block is STALE and inverted — see its banner.
 ---

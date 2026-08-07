@@ -1,4 +1,5 @@
 ---
+scope: glm
 status: closed-negative
 verdict: Porting the engine to Vulkan across four phases — the journal, not the rules. It shipped and decoded, then was RETIRED 2026-08-06 as an unfinished port: 16 of 29 kernels, 6 of its own 36 mode-matrix cells decoding (of 72; 36 per backend), ~1.9x slower, no DeepSeek-V4 path. Code at tag archive/vulkan-backend-hb16; the inventory and the shader rules are in vulkan-kernels.md.
 ---

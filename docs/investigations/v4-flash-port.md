@@ -1,4 +1,5 @@
 ---
+scope: v4
 status: live
 verdict: The staged plan to make V4-Flash decode. S1 LANDED 2026-08-05 (.f4 repack bit-exact over 10.27 GB; a 137-golden CPU oracle with five measured blind spots). Corrects other-models.md from the real repo: experts are 148.25 GB native FP4 (138.1 GiB) so it DOES stream at ~83% residency, not "nearly fully resident"; 3.449 GB/token, since the shared expert is fp8 and resident, not FP4 and streamed; the partial fp8 KV act_quant is mandatory, not a --kv-fp8 to refuse (that flag does not exist); YaRN is per-layer, keyed to compress_ratio. DSpark/MTP is separable and out of scope. The LAYER LOOP LANDED 2026-08-05 (src/v4gpu.rs + a main.rs V4 branch + a real-weight per-layer gate) and has NOT yet run on a device; three deviations from the reference are named at their call sites (unclamped shared expert, positional block selection on the ratio-4 layers, un-rounded MoE output) and reviews caught two criticals before the GPU did. The dev-profile sweep is also RED at a2504eb.
 ---

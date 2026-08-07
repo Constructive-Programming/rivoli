@@ -1,4 +1,5 @@
 ---
+scope: engine
 status: live
 verdict: The --features otlp instrument: its three switches, what the engine emits, and how to read a trace. Verified end to end 2026-08-01, after it had stopped compiling.
 ---

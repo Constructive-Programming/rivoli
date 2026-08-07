@@ -1,4 +1,5 @@
 ---
+scope: v4
 status: live
 verdict: OPEN. `ffn_norm_out` and `.out` carry no bound at all since 2026-08-07 — they report and assert only that the row was reached. The 5e-2 they used to carry was the same constant four attention tensors were re-derived away FROM, whose derived values came out 17, 275, 23 and 71. The differing-element fraction was measured as a substitute and REFUTED at 1.42x, the same order as the two bounds already called barely-gates. The work is transcribing `hc_post` + the MoE to compute the envelope, unblocked since Track 0 released the files on 2026-08-06.
 ---

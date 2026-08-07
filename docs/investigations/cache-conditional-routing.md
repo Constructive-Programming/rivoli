@@ -1,4 +1,5 @@
 ---
+scope: glm
 status: closed-negative
 verdict: top-m routing: RETIRED 2026-07-30. Cost +3.63% PPL on int3-vq and +12.7% on int4 against a ~1% bar, and made every cache change an output change.
 ---
