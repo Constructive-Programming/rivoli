@@ -2042,6 +2042,23 @@ fn sinkhorn_has_converged_long_before_iteration_20() {
     //
     // What it can see is gross truncation, which is the failure that actually matters: a
     // port that ran two passes would be caught. Both halves below.
+    //
+    // > **CORRECTED 2026-08-07. The paragraph above is true of THIS FIXTURE and false of the
+    // > checkpoint.** It was written as a claim about the algorithm ("a 4x4 positive matrix
+    // > is far past convergence") and read that way ever since, including by the doc on
+    // > `Defect::SinkhornIterCountProbe`, which said the variant changes nothing at the
+    // > shipped count. `v4-oracle defects --layer 0 --decode-steps 1` on the real weights
+    // > disagrees: 19 vs 20 moves **39,893/53,248** of `L0.pre.ffn_norm_out`, **all 78**
+    // > router weights, 50,812/53,248 of `ffn_out` and 143,026/212,992 of `out`. Convergence
+    // > is to within f32 rounding, and whether the last ulp settles is weight-dependent; the
+    // > toy's mixes settle and the checkpoint's do not, after which `hc_post` and the MoE
+    // > spread that difference across most of the block.
+    // >
+    // > The sweep reports differing-element COUNTS, not magnitudes, so this establishes
+    // > non-identity on the real model and says nothing about size. The error came from
+    // > generalising one fixture's bit-identity into a statement about the arithmetic —
+    // > exactly the "most-trusted case is the blind spot" failure. The assertion below is
+    // > still correct as a statement about the fixture, and is what it now claims to be.
     let (cfg, m) = model();
     let ids = fixed_ids(cfg, "ids-pre", 5);
     let drive = |c: &V4Config, d: Defect| {
@@ -2052,8 +2069,8 @@ fn sinkhorn_has_converged_long_before_iteration_20() {
     let full = drive(cfg, Defect::None);
     assert!(
         identical(&full, &drive(cfg, Defect::SinkhornIterCountProbe)),
-        "19 and 20 iterations disagree -- the convergence claim above is wrong, and \
-         `SinkhornIterCountProbe` belongs back in the matrix"
+        "19 and 20 iterations disagree ON THE FIXTURE -- this oracle's blindness to the \
+         cut is the whole claim here, and it has stopped holding"
     );
     let mut two = cfg.clone();
     two.hc_sinkhorn_iters = 2;

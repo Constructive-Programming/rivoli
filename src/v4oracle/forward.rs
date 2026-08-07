@@ -228,13 +228,19 @@ defects! {
     /// Run `hc_sinkhorn_iters - 1` iterations — the off-by-one from counting the leading
     /// column pass as an iteration when the config already does.
     ///
-    /// **Named a probe, not a defect, because at the shipped count it changes nothing:**
-    /// the 4x4 matrix has converged long before iteration 20 and 19 vs 20 is bit-identical
-    /// on CPU and GPU alike. It carries no tolerance and sits outside the defect matrix for
-    /// that measured reason (`sinkhorn_has_converged_long_before_iteration_20`,
-    /// `sinkhorn_iteration_count_is_live`). What it is FOR is proving the parameter reaches
-    /// the arithmetic at all, which is what makes sourcing it from `V4Config` the real gate
-    /// on its value.
+    /// **Its detectability is weight-dependent, which is why it carries no tolerance and
+    /// sits in `targeted_defects()` rather than the matrix.** On the toy fixture the 4x4
+    /// matrix reaches a BITWISE fixed point well before iteration 20, so 19 and 20 agree
+    /// exactly and `sinkhorn_has_converged_long_before_iteration_20` asserts that. **On the
+    /// checkpoint they do not agree**: measured 2026-08-07 with `v4-oracle defects --layer 0
+    /// --decode-steps 1`, this moves 39,893/53,248 of `L0.pre.ffn_norm_out`, all 78 router
+    /// weights, and 143,026/212,992 of `L0.pre.out`. Convergence is to within f32 rounding;
+    /// whether the last ulp settles depends on the mixes, and `hc_post` plus the MoE spread
+    /// the difference from there. Counts, not magnitudes — the sweep does not measure size.
+    ///
+    /// **The name is provisional (2026-08-07)** and probably wrong: it replaced
+    /// `SinkhornOneFewerIter` on the toy reading alone, and the checkpoint number above
+    /// landed afterwards. This is a defect that one fixture cannot see, not a probe.
     SinkhornIterCountProbe,
     /// Index the combination matrix `[dest, source]` instead of `[source, dest]`.
     SinkhornCombTransposed,
