@@ -557,6 +557,20 @@ struct DeviceIndexer {
     /// widths: a streaming selection is rebuilt every pass and can be `max_ctx` long,
     /// while this one has to SURVIVE passes and is never longer than `index_topk`.
     sel: DeviceBuf,
+    /// `--stale-sel` (M1a, docs/investigations/npu-offload.md): per full layer, the
+    /// selection `index_topk` computed at the PREVIOUS token — the thing an NPU indexer
+    /// running in the decoupled window would hand this token's attend. One `index_topk`-u32
+    /// buffer per slab, plus the host-side lag bookkeeping in [`crate::indexer::StaleShare`].
+    /// Empty until [`GpuEngine::arm_stale_sel`] arms it, so a stock run allocates nothing.
+    ///
+    /// Plain `DeviceBuf`s (hipMalloc), NOT routed-arena slots, deliberately: this cache
+    /// must survive from one token to the next, and the arena compacts slots under reads
+    /// that outlive their layer — the recorded relocation defect (9/8452 reads at
+    /// `--max-mem 30`). A stable allocation is immune by construction.
+    #[cfg(feature = "stale-sel")]
+    stale_bufs: Vec<DeviceBuf>,
+    #[cfg(feature = "stale-sel")]
+    stale_meta: crate::indexer::StaleShare,
     // --- MISA head routing (empty/unused in dsa mode) ---
     pool: Vec<DeviceBuf>, // per full layer, ⌈max_ctx/MISA_BLOCK⌉ rows of index_head_dim f32
     e: DeviceBuf,         // index_n_heads f32 — router estimates
@@ -739,6 +753,18 @@ pub struct GpuEngine<'a> {
     pred_issued: u64,
     #[cfg(feature = "pred-probe")]
     pred_wasted: u64,
+    /// `--stale-sel`: on, plus its proof-of-engagement tally — full layers that attended
+    /// over a genuinely stale (previous-token) selection. The counter exists because this
+    /// repo has already run a dsa A/B whose scored path never engaged (every position
+    /// under `index_topk`) and read the green result as coverage — `nll_forced` REFUSES
+    /// to finish a `--stale-sel` run with `stale_served == 0` rather than emit an `.nll`
+    /// indistinguishable from a real stale arm. (Dense crossing serves are not counted:
+    /// exactly one per full layer whenever the run crosses at all, so a count would be
+    /// derivable — always `kc.len()`.)
+    #[cfg(feature = "stale-sel")]
+    stale_sel: bool,
+    #[cfg(feature = "stale-sel")]
+    stale_served: u64,
     argmax_host: Vec<u8>,
     /// Always-on cheap per-token profiling (see [`Profile`]).
     prof: Profile,
@@ -863,6 +889,12 @@ impl<'a> GpuEngine<'a> {
                 head_sel: Vec::new(),
                 heads_u32: Vec::new(),
                 heads_buf: DeviceBuf::new(cfg.index_n_heads * 4)?,
+                // Armed (allocated + sized) only by `arm_stale_sel`; a stock engine
+                // carries two empty Vecs here and no device bytes.
+                #[cfg(feature = "stale-sel")]
+                stale_bufs: Vec::new(),
+                #[cfg(feature = "stale-sel")]
+                stale_meta: crate::indexer::StaleShare::new(0),
             })
         } else {
             None
@@ -1027,6 +1059,10 @@ impl<'a> GpuEngine<'a> {
             pred_issued: 0,
             #[cfg(feature = "pred-probe")]
             pred_wasted: 0,
+            #[cfg(feature = "stale-sel")]
+            stale_sel: false,
+            #[cfg(feature = "stale-sel")]
+            stale_served: 0,
             argmax_host: Vec::with_capacity(ARGMAX_BYTES),
             prof: Profile::default(),
             compute_stream: Stream::compute()?,
@@ -1108,6 +1144,37 @@ impl<'a> GpuEngine<'a> {
         self.pred_probe = on;
     }
 
+    /// Arm `--stale-sel` (M1a, docs/investigations/npu-offload.md): allocate one
+    /// `index_topk`-row selection cache per full indexer layer and switch
+    /// [`GpuEngine::dsa_select_layer`]'s scored path to serve-then-store.
+    ///
+    /// Refuses anything but plain DSA. MISA reaches the same selection code, but its
+    /// head-route already does a mid-layer D2H round-trip whose whole cost structure the
+    /// decoupled-window argument never priced — a stale MISA number would answer a question
+    /// nobody asked. Dense/streaming never compute a selection at all, so the flag would be
+    /// silently inert there, which is worse than a refusal.
+    #[cfg(feature = "stale-sel")]
+    pub fn arm_stale_sel(&mut self) -> Result<()> {
+        ensure!(
+            matches!(self.mode, AttnMode::Dsa),
+            "--stale-sel needs --attn dsa (resolved mode: {:?}) — dense/streaming compute \
+             no selection to be stale about, and misa's head-route was never in the \
+             decoupled-window budget",
+            self.mode
+        );
+        let topk = self.cfg.index_topk;
+        let idx = self
+            .idx
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("--stale-sel under dsa but no device indexer"))?;
+        for _ in 0..idx.kc.len() {
+            idx.stale_bufs.push(DeviceBuf::new(topk * 4)?);
+        }
+        idx.stale_meta = crate::indexer::StaleShare::new(idx.kc.len());
+        self.stale_sel = true;
+        Ok(())
+    }
+
     /// DSA/MISA row selection for one full/shared layer, for EVERY token row of the pass —
     /// row `r` is the token at `pos + r`. Returns each row's attend set `(rows_ptr, nr)`; a
     /// null pointer means dense over `0..nr`. `xnp` is the layer input (post
@@ -1154,6 +1221,19 @@ impl<'a> GpuEngine<'a> {
             AttnMode::Misa { active_heads } => Some(active_heads),
             _ => None,
         };
+        // `--stale-sel` exists for `--ppl`, whose forwards are single-row by construction.
+        // A multi-row pass would be a speculative verify or a prefill, where "the previous
+        // token's selection" is ill-defined per row (row 1's predecessor is row 0 of the
+        // SAME pass, whose selection is fresh, not stale) — refusing is honest, simulating
+        // it would quietly measure a different staleness than the one M1a asks about.
+        #[cfg(feature = "stale-sel")]
+        if self.stale_sel {
+            ensure!(
+                nrow == 1,
+                "--stale-sel serves one row per pass, got nrow={nrow} (a speculative \
+                 verify or prefill pass) — it runs only under --ppl's single-row forwards"
+            );
+        }
         let idx = self
             .idx
             .as_mut()
@@ -1363,6 +1443,54 @@ impl<'a> GpuEngine<'a> {
             // exactly nr = min(topk, nt) = topk of them (the dense guard above already
             // took every nt <= topk). Both buffers are engine-owned.
             let rowp = unsafe { sel_base.add(s * topk) };
+            // `--stale-sel` (M1a): serve what the PREVIOUS token's query selected, store
+            // what this one's selects. The scoring above still ran from the CURRENT query
+            // — that is the work an NPU would do concurrently, and pricing a run that
+            // skipped it would conflate "stale" with "free". Serve-then-store ordering is
+            // load-bearing twice: the D2D that publishes the old selection is enqueued
+            // before `index_topk` overwrites its source (null-stream program order makes
+            // read-then-overwrite safe), and `stored()` is read before `store()` for the
+            // same reason host-side.
+            #[cfg(feature = "stale-sel")]
+            if self.stale_sel {
+                let stale = idx.stale_bufs[slab].ptr_mut();
+                let (sptr, snr, sdense) = match idx.stale_meta.stored(slab) {
+                    // Crossing token: nothing stored yet, attend dense over the whole
+                    // prefix — exact, one row more than a top-k attend, and what the real
+                    // decoupled design would do (see StaleShare's doc for the argument).
+                    None => (std::ptr::null(), nt, true),
+                    // SAFETY: `sel` slot s and this slab's cache are distinct engine-owned
+                    // allocations of exactly `topk` u32 each.
+                    Some(pnr) => {
+                        unsafe {
+                            crate::backend::memcpy_dtod_async(
+                                rowp as *mut u8,
+                                stale as *const u8,
+                                topk * 4,
+                                crate::backend::NULL_STREAM,
+                            )?;
+                        }
+                        (rowp as *const u32, pnr, false)
+                    }
+                };
+                // SAFETY: same contract as the exact arm below — `scp` holds `nt`
+                // just-written scores and the cache is `topk` u32, which is exactly what
+                // the kernel writes (the dense guard took every nt <= topk).
+                unsafe {
+                    launch_index_topk(scp as *const f32, nt, topk, stale as *mut u32)?;
+                }
+                idx.stale_meta.store(slab, nr);
+                // Shared layers reuse the SERVED selection, not the stored one — the slot
+                // state must describe what this token's attends actually see.
+                idx.last_dense[s] = sdense;
+                idx.last_nr[s] = snr;
+                *slot = (sptr, snr);
+                scored_nt = nt;
+                if !sdense {
+                    self.stale_served += 1;
+                }
+                continue;
+            }
             unsafe {
                 launch_index_topk(scp as *const f32, nt, topk, rowp)?;
             }
@@ -2663,8 +2791,22 @@ impl<'a> GpuEngine<'a> {
                 if let Some(hb) = &self.heartbeat {
                     hb.beat();
                 }
+                // The engagement gate below must count only serves whose forward's NLL is
+                // actually scored: the LAST forward runs (this loop breaks after it) but
+                // its logits are never pushed, so its serves are rolled back — otherwise
+                // a corpus of exactly index_topk + 2 tokens would return a
+                // baseline-identical .nll under a green gate whenever a caller arms
+                // without main's corpus-length check.
+                #[cfg(feature = "stale-sel")]
+                let served_before = self.stale_served;
                 self.forward(tok, pos).await?;
-                let Some(&next) = ids.get(pos + 1) else { break };
+                let Some(&next) = ids.get(pos + 1) else {
+                    #[cfg(feature = "stale-sel")]
+                    {
+                        self.stale_served = served_before;
+                    }
+                    break;
+                };
                 ensure!(
                     (next as usize) < vocab,
                     "token {next} outside vocab {vocab}"
@@ -2676,6 +2818,26 @@ impl<'a> GpuEngine<'a> {
             }
             Ok(out)
         })?;
+        // Proof of engagement, and a gate that can go red: this repo has already run a dsa
+        // A/B whose scored path never engaged (every position at or under `index_topk`) and
+        // read the green result as coverage. A `--stale-sel` run that never served a stale
+        // selection scored the EXACT path, and an `.nll` from it is indistinguishable
+        // downstream from a baseline arm — so refuse to return one.
+        #[cfg(feature = "stale-sel")]
+        if self.stale_sel {
+            tracing::info!(
+                "stale-sel: {} full-layer attends served a one-step-stale selection",
+                self.stale_served
+            );
+            ensure!(
+                self.stale_served > 0,
+                "--stale-sel never engaged: no forward got past nt = index_topk + 1 = {}, \
+                 so this run scored the exact path and its .nll must not be used as a \
+                 stale arm (tests/ppl-corpus-5000.txt clears the default threshold; a \
+                 shorter corpus needs a shadow artifact with index_topk lowered)",
+                self.cfg.index_topk + 1
+            );
+        }
         Ok(out)
     }
 

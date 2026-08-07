@@ -77,6 +77,11 @@ teacher-forcing = []
 # per-layer cost `--hint-k` was retired for. Gated rather than merely defaulted off so the
 # shipped binary cannot carry it, and so nobody reads a tok/s off a probe build.
 pred-probe = []
+# 1-step-stale DSA row selection (`--stale-sel`) — M1a of docs/investigations/npu-offload.md,
+# the quality gate the whole NPU-offload question is behind. A quality INSTRUMENT for `--ppl`
+# A/Bs, not a decode path: same feature-AND-flag rule as the two above. Mechanism and the
+# serve/store semantics: `indexer::StaleShare`'s doc and `gpu.rs::dsa_select_layer`.
+stale-sel = []
 default = []
 # build.rs compiles kernels/*.hip via hipcc; pulls in the async streaming stack.
 #

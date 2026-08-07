@@ -33,7 +33,7 @@ MODE="${1:-full}"
 # Mutually exclusive — one backend per build, no runtime selection. Never both in one cell.
 BACKENDS=(rocm)
 # The optional, non-backend features. `default` is empty and is not a cell.
-OPTIONAL=(otlp teacher-forcing pred-probe trace)
+OPTIONAL=(otlp teacher-forcing pred-probe trace stale-sel)
 
 read -r -a BACKENDS <<<"${RIVOLI_BACKENDS:-${BACKENDS[*]}}"
 
