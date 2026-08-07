@@ -1,7 +1,7 @@
 ---
 scope: engine
 status: live
-verdict: llama-swap's Vulkan pod on rh-anine now shares the SAME /var/run/sys-gpu.lock every bare-metal GPU command already flocks (TOUR.md, docs/measurement/) — no rivoli code changes, this documents the other side of an existing contract.
+verdict: llama-swap's pod shares /var/run/sys-gpu.lock — but only for SOME models (CORRECTED 2026-08-07, verified live 3x - whisper and the embedding model hold GTT with no lock). Until hr-fleet wraps every cmd, a GPU witness must sample mem_info_gtt_used, not just the flock and KFD.
 ---
 
 # GPU lock — coordinating with llama-swap on rh-anine
@@ -12,6 +12,21 @@ now, which reopens the hazard `flock /var/run/sys-gpu.lock -c '…'` has always 
 between concurrent bare-metal runs, but not against a `llama-swap`-managed `llama-server`/
 `whisper-server` child starting at the same time — until now `llama-swap` had no idea that
 lock file existed.
+
+> **CORRECTED 2026-08-07 — the fix below is PARTIAL, verified live three times in one
+> evening.** The `gpu-lock-wait.sh` wrapper covers only SOME models: `qwen3.6-medium` held a
+> proper shared flock while resident (observed in `/proc/locks`), but `whisper-large-v3-turbo`
+> and `qwen3-embedding-4b` loaded and held 1.6–4 GB of GTT with **no lock at all** — twice
+> while a bare-metal exclusive flock was actively HELD. Consequences until hr-fleet's
+> `fleet/ai/llama-swap.yaml` wraps every model's `cmd`: (1) the flock is NOT sufficient
+> protection against llama-swap tenants; (2) `/sys/class/kfd/kfd/proc/` cannot see them
+> either — they are Vulkan allocations via render nodes, so a GPU witness must also sample
+> `/sys/class/drm/card0/device/mem_info_gtt_used` (the engine's own sole-tenant guard reads
+> the same counter and refuses above 1 GiB, which is how all three intrusions were caught);
+> (3) `curl http://<llama-swap>/running` names the tenant and `curl .../unload` clears it,
+> reversibly — models reload on demand. Methodology recorded in
+> `docs/measurement/benchmarks.md` ("GLM-5.2 vs DeepSeek-V4-Flash", 2026-08-07) and the
+> m1a-stale-selection round.
 
 **This is now fixed on the `llama-swap` side, with zero changes needed here.** `hr-fleet`'s
 `fleet/ai/llama-swap.yaml` wraps every model's `cmd` in a script that takes a **shared** flock

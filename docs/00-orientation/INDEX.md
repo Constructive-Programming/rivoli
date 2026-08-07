@@ -39,7 +39,7 @@ says nothing about V4 and must be re-evaluated there before it forecloses anythi
 | [`architecture.md`](../reference/architecture.md) | glm | live | The engine as it is. The one doc meant to be read whole; §8b is the INV registry, enforced by tests/invariants.rs. |
 | [`modes.md`](../reference/modes.md) | glm | live | The --mode × --cache-policy matrix and which knob does what. Quality ladder: int4 5.120 > hybrid 5.189 > int3-vq 5.275. |
 | [`serving.md`](../reference/serving.md) | glm | live | The OpenAI HTTP server (--port). Thinking defaults OFF and is a prompt prefill, not a flag; tool calling works; sampling and /v1/completions do not, on purpose. |
-| [`gpu-lock.md`](../reference/gpu-lock.md) | engine | live | llama-swap's Vulkan pod on rh-anine now shares the SAME /var/run/sys-gpu.lock every bare-metal GPU command already flocks (TOUR.md, docs/measurement/) — no rivoli code changes, this documents the other side of an existing contract. |
+| [`gpu-lock.md`](../reference/gpu-lock.md) | engine | live | llama-swap's pod shares /var/run/sys-gpu.lock — but only for SOME models (CORRECTED 2026-08-07, verified live 3x - whisper and the embedding model hold GTT with no lock). Until hr-fleet wraps every cmd, a GPU witness must sample mem_info_gtt_used, not just the flock and KFD. |
 
 ## measurement/ — how to measure, and what was measured
 
