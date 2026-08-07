@@ -1,6 +1,6 @@
 ---
 status: live
-verdict: OPEN. `ffn_norm_out` and `.out` carry no bound at all since 2026-08-07 — they report and assert only that the row was reached. The 5e-2 they used to carry was the same constant four attention tensors were re-derived away FROM, whose derived values came out 17, 275, 23 and 71. The differing-element fraction was measured as a substitute and REFUTED at 1.42x, the same order as the two bounds already called barely-gates. The work is transcribing `hc_post` + the MoE to compute the envelope, unblocked since Track 0 released the files on 2026-08-06.
+verdict: OPEN. `ffn_norm_out` and `.out` carry no bound at all since 2026-08-07 — they report and assert only that the row was reached. The 5e-2 they used to carry was the same constant four attention tensors were re-derived away FROM, whose derived values came out 17, 275, 23 and 71. Two substitutes have been measured and REFUTED: the differing-element fraction at 1.42x (probe sweep), and, later the same day, a perturbed-golden A/B through the gate itself — a `SinkhornIterCountProbe` golden ran the gate green, with a same-tensor fraction separation of only 1.20x. The work is transcribing `hc_post` + the MoE to compute the envelope, unblocked since Track 0 released the files on 2026-08-06.
 ---
 
 # What bound do `ffn_norm_out` and `.out` actually deserve?
@@ -19,10 +19,16 @@ of them by three to four orders of magnitude:
 
 | tensor | old | derived |
 |---|---:|---:|
-| `attn_norm_out` | 5e-2 | 17 |
+| `kv_entry` | 5e-2 | 17 |
 | `q` | 5e-2 | 275 |
-| `kv_entry` | 5e-2 | 23 |
-| `attn_derot` | 5e-2 | 71 |
+| `attn_derot` | 5e-2 | 23 |
+| `attn_out` | 5e-2 | 71 |
+
+> **CORRECTED 2026-08-07.** This table listed `attn_norm_out` (which was never re-derived —
+> it still carries the chosen 5e-2) and omitted `attn_out`, shifting three bounds onto the
+> wrong tensors. The four derived tensors and their bounds are as now shown
+> (`src/v4gpu.rs::AttnStages::scored`); the body's later mention of "`attn_out` at 1.6x"
+> always referred to a row this table failed to carry.
 
 A constant already measured wrong for four siblings, left on two others only because their
 envelope sat outside an earlier track's file set, is not evidence about those two. It was
@@ -66,6 +72,20 @@ again.
 > conclusion.** It was read off an INCOMPLETE run — the matrix was still executing and the
 > 74.9% row had not printed. Do not quote this table from a partial log. It takes 7 minutes
 > and prints `EXIT=0` when it is done.
+
+**Also tried and refuted, 2026-08-07 — the perturbed-golden shortcut.**
+[`real-weights-defect-goldens.md`](real-weights-defect-goldens.md) hoped its `--defect` flag
+"may close this doc cheaply". Measured through the gate the same day: a
+`SinkhornIterCountProbe` golden ran the whole `tests/v4_loop.rs` gate **GREEN** — no bounded
+row breached, and everything the defect moved sat in the unbounded "reported" rows. Two
+distinct fractions, not to be conflated: the defect's own footprint on `L1.pre.ffn_norm_out`
+is **91.1%** of elements (golden vs perturbed golden, that doc's fixed-probe finding — the
+74.9% above is probe-driven and does not transfer); what the gate saw is **69.6%** differing
+(device vs perturbed golden, `max_rel` 6.35, carrying the device's own noise). Against the
+same-tensor device baseline — arm 1's `L1.pre.ffn_norm_out` at **58.1%**, not the 52.85%
+`L0.pre` figure — the separation is **1.20x**, weaker still than the 1.42x above. So no
+statistic currently asserted, and no perturbed golden, substitutes for the envelope. The
+transcription below remains the work.
 
 ## The work
 

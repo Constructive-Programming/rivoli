@@ -297,11 +297,15 @@
 //!   enumerates the breakages. Newly justified: the checkpoint discriminates a defect the toy
 //!   fixture is bit-blind to.
 //!
-//!   **BUILT 2026-08-07.** `emit --defect <name>` exists; the file's own metadata carries the
-//!   name and `open_goldens` refuses a mismatch against `RIVOLI_V4_GOLDENS_DEFECT` (default
-//!   `None`) before comparing anything. The host-side bidirectional evidence and the exact
-//!   through-the-gate runs, with their pre-registered predictions, are in that doc — the GPU
-//!   half had not run when this note was written.
+//!   **BUILT AND MEASURED 2026-08-07, investigation CLOSED.** `emit --defect <name>` exists;
+//!   the file's own metadata carries the name and `open_goldens` refuses a mismatch against
+//!   `RIVOLI_V4_GOLDENS_DEFECT` (default `None`) before comparing anything. All seven gate
+//!   arms ran the same day; every red/green matched its pre-registered prediction. The four
+//!   bounds above have now been scored through THIS gate: each anchor defect went red,
+//!   though `attn_derot`'s held by only 1.07x at worst (24.5 vs 23, prefill cells only) and
+//!   both kv-quant defects left `kv_entry` itself green — its 17 bound gates the RoPE
+//!   class, not the act_quant family that lives on that tensor. The full table is in that
+//!   doc.
 
 // `rocm`: `v4gpu` is `rocm`-gated because every launcher it drives is `backend::hip`'s, and
 // since 2026-08-06 that is the only backend. The rule this cites — do not add stubs that

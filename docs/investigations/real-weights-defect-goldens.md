@@ -1,6 +1,6 @@
 ---
-status: live
-verdict: OPEN, GPU half pending — the flag EXISTS since 2026-08-07 (`emit --defect`, defect name in the file's own header, loader refuses a mismatch) and the host half is measured, bidirectionally, on five perturbed real-weights goldens; each moves exactly the tensors its toy row claims and leaves the rest bit-identical. One finding already, against this doc's own headline: the sweep's 74.9% `ffn_norm_out` figure for `SinkhornIterCountProbe` does not survive the emit chain — driven by the real residual instead of the fixed probe, its direct footprint is 1 element in 53,248, so detectability is input-dependent as well as weight-dependent. The through-the-gate runs are prepared with pre-registered predictions and not yet run.
+status: closed-mixed
+verdict: ANSWERED 2026-08-07, built and measured the same day — `emit --defect` exists, the loader refuses a mismatched golden (proven red live), and all seven gate arms ran with every red/green outcome matching its pre-registered prediction. The four derived attention bounds were scored THROUGH the gate for the first time; each anchor defect went red, but `attn_derot`'s 1.3x separation survived by only 1.07x at worst (24.5 vs 23), and both kv-quant defects left their home tensor `kv_entry` GREEN under its 17 bound — every red came from downstream. `SinkhornIterCountProbe` ran fully green, settling unlock #3 negatively — no live bound sees the one defect the checkpoint discriminates and the toy cannot; the gate saw its `ffn_norm_out` movement (69.6% of elements differing) only in an unbounded reported row — so `ffn-norm-out-envelope.md` still owes the transcription and cannot be closed by a perturbed golden alone.
 ---
 
 # Can a bound be derived through the gate instead of beside it?
@@ -78,6 +78,12 @@ forced are in the dated notes on `sinkhorn_has_converged_long_before_iteration_2
    checked the other way round: emit a golden under a defect the bound is supposed to catch,
    and confirm the gate goes red. A bound that stays green against a defect it claims to catch
    is the finding.
+
+   > **CORRECTED 2026-08-07, at closure.** The mapping above was shifted one tensor and is
+   > wrong on three of four rows. The derived four are `kv_entry` **17**, `q` **275**,
+   > `attn_derot` **23**, `attn_out` **71** (`src/v4gpu.rs::AttnStages::scored`);
+   > `attn_norm_out` is not one of them — it still carries the chosen, underived 5e-2. The
+   > §MEASURED section below uses the correct mapping.
 2. **A real bidirectional test for every bound.** The pattern this repo already trusts — the
    defect must move the tensors it claims to and leave the rest bit-identical — becomes
    available at real dims instead of toy dims.
@@ -101,7 +107,7 @@ pick the defects a given bound claims to catch.
   leave the tensors it does not claim *bit-identical* — is the half that makes the check
   informative, and it is the half that is easy to skip when the run is expensive.
 
-## 2026-08-07 — built, and the host half measured. The GPU half is prepared, not run.
+## 2026-08-07 — built, host half measured; the GPU half ran the same day (§MEASURED below)
 
 ### What exists now
 
@@ -171,7 +177,7 @@ transfer to the goldens the gate actually consumes. The justification for the fl
 chain-amplified L1 numbers (48,526/53,248 = 91.1% on `L1.pre.ffn_norm_out`), not the probe
 sweep's 74.9%.
 
-### The GPU half, prepared and NOT run — with predictions registered before measuring
+### The GPU half — arms and predictions, registered before measuring (results in §MEASURED)
 
 The goldens are reproducible in ~20 s each (deterministic host arithmetic; the `None` emit
 was verified byte-identical across runs and tensor-identical to the deployed fixture):
@@ -186,8 +192,8 @@ cargo run --release --bin v4-oracle -- emit --layers 2 --decode-steps 1 \
     --defect SinkhornIterCountProbe --out v4-goldens-l2-sinkhornitercountprobe.bin
 ```
 
-(One prepared set currently also sits in the 2026-08-07 session scratchpad, but the commands
-above are the durable record — a session temp path is not.) Build outside the lock
+(The set the arms actually ran sat in the 2026-08-07 session scratchpad; the commands above
+are the durable record — a session temp path is not.) Build outside the lock
 (`cargo test --features rocm --test v4_loop --no-run`), then per arm, dev profile,
 `--test-threads=1`, flocked:
 
@@ -214,3 +220,49 @@ Caveat on 3–7: the numbers behind the predictions are per-element `max_rel` fr
 transcription at `L0.pre`, while `cmp`'s column is tensor-scale-relative — they are not the
 same statistic, which is exactly why the runs go through the gate instead of being declared
 from this table.
+
+### MEASURED 2026-08-07, same day — all seven arms
+
+KFD occupancy was checked via `/sys/class/kfd/kfd/proc/` before each arm and was 0 every
+time; those echoes live in the session transcript, not in the arm logs, so the logs alone
+cannot corroborate this line. Every red/green outcome matched its pre-registered prediction.
+Values are the gate's per-element `max_rel` at `L0.pre` — the cell the predictions were
+registered for — with the arm maximum noted where it changes a ratio:
+
+| arm | predicted | actual |
+|---|---|---|
+| 1 baseline `None` | GREEN | **GREEN**, 3.8 s |
+| 2 arming proof (defect var unset) | RED at load | **RED at load**: "emitted under --defect RopeHalfSplit … expects None" |
+| 3 `RopeHalfSplit` | RED, kv_entry ≥ 17, q ≥ 275 | **RED**, 20 rows: `kv_entry` **360** (arm max 497 = 29x over), `q` **3468** (arm max 3804 = 13.8x), `attn_derot` 2813, `attn_out` 2656, `router_weights` red too (up to 0.19) |
+| 4 `RopeFirstDims` | RED, q ≥ 275 | **RED**, 20 rows: `q` **2422** (8.8x), `kv_entry` 707 (arm max 1632), `attn_derot` up to 3765 (164x, the arm's largest ratio) |
+| 5 `SkipKvActQuant` | red predicted, green is the finding | **RED**: `attn_derot` **23.9 vs 23** at `L0.pre`, **24.5 = 1.07x at worst** (`L1.pre`); `attn_out` 85.9 (arm max 88.0); `router_weights` 1.09e-2 vs 1e-2 on both decode cells; 8 rows total |
+| 6 `KvActQuantWholeTensor` | red predicted, green is the finding | **RED**: `attn_out` **144.8 vs 71** (2.0x), `attn_derot` 55.9, `router_weights` red on 4 of 4 cells (up to 1.77e-2); 9 rows |
+| 7 `SinkhornIterCountProbe` | GREEN overall | **GREEN** — no bounded row breached. Tightest margins: `attn_out` 35.0 vs 71 (2.0x headroom, and exactly the device's own baseline), `router_weights` 2.9e-3 vs 1e-2, `attn_norm_out` 1.0e-2 vs 5e-2, `q` 27.1 vs 275. `ffn_norm_out` differed on **69.6%** of elements at `max_rel` 6.35 — an unbounded "reported" row |
+
+Three findings beyond the predictions themselves:
+
+1. **The two barely-gates did catch their anchor defects, but `attn_derot`'s margin is 7%.**
+   24.5 at worst against a bound of 23 is the 1.3x separation nearly exhausted in practice —
+   and it went red only at the two prefill cells; both decode cells sat well inside 23
+   (10.2, 5.9). It held this time; nothing about that number says it holds for a weaker
+   expression of the same defect class.
+2. **Both kv-quant defects leave their HOME tensor green.** `kv_entry` — where
+   `SkipKvActQuant` and `KvActQuantWholeTensor` actually live — stayed under its 17 bound in
+   both arms; every red came from `attn_derot`/`attn_out`/`router_weights` downstream. So
+   `kv_entry`'s "45x separation, real gate" claim holds for defects that move it
+   multiplicatively (the RoPE class) and NOT for the act_quant family at that very tensor:
+   `max_rel` cannot see quantization-shaped movement (bounded by one quant step ≈ 6%
+   relative) at the tensor it occurs on. The bisection ladder's "believe the first line that
+   moves" heuristic survives — but as a *count* reading (`bf16 differ` lit up on `kv_entry`
+   in both arms: 0.69% → 82.5% and 12.1%), not a bounded one.
+3. **Arm 7's green settles unlock #3 negatively, by measurement.** No bounded row breached;
+   the defect is visible only in the unbounded rows. Two numbers that must not be conflated:
+   the defect's own footprint on `L1.pre.ffn_norm_out` is **91.1%** (golden vs golden, §the
+   finding above), while the gate saw **69.6%** differing (device vs perturbed golden, which
+   carries the device's own noise inside it). Against the same-tensor device baseline from
+   arm 1 — `L1.pre.ffn_norm_out` at **58.1%**, NOT the 52.85% `L0.pre` figure — that is a
+   **1.20x** fraction separation, even weaker than the 1.42x host refutation in
+   [`ffn-norm-out-envelope.md`](ffn-norm-out-envelope.md), which now records this second
+   refutation and still owns the `hc_post` + MoE transcription as the work.
+
+**Closed.**
