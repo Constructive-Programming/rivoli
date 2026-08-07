@@ -443,11 +443,11 @@ fn desc_of_f4(s: &ExpertSlot) -> ExpertDescF4 {
 
 /// A descriptor that faults if it is ever read.
 ///
-/// `descs` is indexed by ABSOLUTE expert id and sized `n_desc`, so 250 of its 256 entries belong
-/// to experts this token did not route to and no launch names them (every dispatch below is a
-/// range of exactly one selected id). Filling them with nulls rather than with a copy of some
-/// resolved expert is the difference between a fault and a plausible wrong weight the day a
-/// range is computed wrongly.
+/// `descs` is written in LAUNCH order and sized `n_desc`, so 250 of its 256 entries sit past
+/// this token's selection and no launch names them (the dispatches below cover exactly
+/// `[0, sel.len())`: one resident range plus one single-descriptor range per miss). Filling
+/// them with nulls rather than with a copy of some resolved expert is the difference between
+/// a fault and a plausible wrong weight the day a range is computed wrongly.
 fn desc_never_read() -> ExpertDescF4 {
     let n = std::ptr::null();
     ExpertDescF4 {
@@ -578,7 +578,7 @@ impl AttnStages {
 /// Per-token decode phase buckets — V4's half of GLM's always-on PROFILE line, under
 /// GLM's discipline (`gpu.rs::Profile`): every span wraps host work or a blocking call the
 /// decode already pays, so accumulating costs two `Instant` reads per bracket and adds no
-/// device sync, event, or join. Two fields and not `ProfileSummary`, because that struct's
+/// device sync, event, or join. Three fields and not `ProfileSummary`, because that struct's
 /// other axes (class spans, the indexer, MTP) would print zeros here and a zero that means
 /// "not measured" reading as "measured zero" is this repo's named telemetry trap.
 ///
@@ -603,10 +603,19 @@ impl AttnStages {
 /// end-of-layer sync (acc drain + `hc_post`), and the whole head tail (`hc_head`, final
 /// norm, the bf16 lm_head GEMV, argmax sync + D2H). Non-negative by construction: both
 /// buckets are sub-spans of the decode wall on one thread.
+///
+/// * `tail_ns` — M2's ranking item (3), the remainder's own decomposition: the head-tail
+///   launches ([`V4Engine::head_tail`]) plus [`V4Engine::argmax`] — whose `device_sync` is
+///   where the whole tail's GPU time drains, the existing join the M1 rule requires. Printed
+///   INSIDE the remainder term, not beside it: the remainder stays `wall − route − moe` and
+///   `tail` names the head share of it, leaving `remainder − tail` = the per-layer
+///   launch/sync residue (candidate 4's other half). A sub-span of the remainder by
+///   construction — disjoint from both brackets on the same thread.
 #[derive(Default)]
 struct V4Profile {
     route_ns: u128,
     moe_ns: u128,
+    tail_ns: u128,
 }
 
 /// Everything one V4 decode needs that does not vary between tokens.
@@ -683,7 +692,16 @@ pub struct V4Engine {
     sel: Vec<usize>,
     /// `[n_desc]` f32 indexed by ABSOLUTE expert id, zero for every expert this token did not
     /// route to. The kernel skips a zero weight, so the zeros are correctness and not thrift.
+    /// The scatter source for [`V4Engine::routed_experts`]'s launch-order gather, and read
+    /// directly by the probe API's last-row weights — which is why it stays absolute.
     wexpert_host: Vec<f32>,
+    /// `[n_desc]` f32 in LAUNCH order — the descriptor index space the device buffers share
+    /// (residents at `[0, n_res)`, misses after; see [`V4Engine::routed_experts`]). Gathered
+    /// from [`V4Engine::wexpert_host`] per token row. Entries past this row's selection are
+    /// never written after construction, so they stay zero — and a zero weight makes a
+    /// wrongly-computed launch range write `h = 0` instead of plausible values, the same
+    /// defense the null descriptors give the pointer side.
+    wexpert_launch: Vec<f32>,
     wexpert: DeviceBuf,
     descs_host: Vec<ExpertDescF4>,
     descs: DeviceBuf,
@@ -691,8 +709,9 @@ pub struct V4Engine {
     fmts: Vec<crate::artifact::format::RoutedFmt>,
     tickets: Vec<crate::fetch::asyncfetch::Ticket>,
     moe_acc: DeviceBuf,
-    /// `[n_desc, nrow, inter]` f32 — also indexed by absolute expert id per the launcher's
-    /// contract, so it is sized for `n_desc` and not for one range's `e_count`.
+    /// `[n_desc, nrow, inter]` f32 — indexed by the same launch-order descriptor index as
+    /// `descs`/`wexpert` per the launcher's contract, so it is sized for `n_desc` and not
+    /// for one range's `e_count`.
     moe_h: DeviceBuf,
     sh_g: DeviceBuf,
     sh_u: DeviceBuf,
@@ -826,6 +845,7 @@ impl V4Engine {
             zero_bias: vec![0.0; n_desc],
             sel: Vec::with_capacity(cfg.top_k),
             wexpert_host: vec![0.0; n_desc],
+            wexpert_launch: vec![0.0; n_desc],
             wexpert: f32s(n_desc)?,
             descs_host: vec![desc_never_read(); n_desc],
             descs: DeviceBuf::new(n_desc * size_of::<ExpertDescF4>())?,
@@ -1256,9 +1276,10 @@ impl V4Engine {
         );
         let scale = self.cfg.routed_scale as f32 / sum;
         self.wexpert_host.fill(0.0);
-        // Indexed by ABSOLUTE expert id — `launch_moe_expert_range_f4`'s `wexpert` and `h` both
-        // are, and both are sized `n_desc` rather than `e_count`. The id is in range on both
-        // paths and by two independent mechanisms: the scored path selects indices OF this
+        // Indexed by ABSOLUTE expert id — this is the scatter [`V4Engine::routed_experts`]
+        // gathers into launch order (and the probe API reads directly), sized `n_desc` rather
+        // than `e_count`. The id is in range on both paths and by two independent
+        // mechanisms: the scored path selects indices OF this
         // `n_desc`-long array, and the hash path's values were range-checked into a `Vec<u32>` by
         // `parse_tid2eid` at load — which is the only place that can, since the kernel's own note
         // says it does not. `submit` checks it a third time. An `ensure!` here was written and cut
@@ -1320,19 +1341,43 @@ impl V4Engine {
         // **Refilled with nulls first, and the first version of this did not.** It wrote only the
         // selected entries and its comment claimed "the rest stay `desc_never_read()`" — true for
         // the first token of the first layer and false ever after: the previous token's six
-        // descriptors survive at their absolute ids. That is strictly worse than the null it was
+        // descriptors survive. That is strictly worse than the null it was
         // meant to preserve. A stale descriptor names a pool SLOT, and a slot the policy has since
         // evicted holds a different expert's bytes at exactly the right addresses — so a
         // wrongly-computed range would read plausible wrong weights on the one path where the
         // ticket protocol cannot help, instead of faulting. 256 pointer-sextuple writes per token
         // per layer against a 13.37 MB expert fetch is not a cost worth trading for that.
+        //
+        // **Written in LAUNCH order, not at absolute ids (M3b, 2026-08-07):** residents at
+        // `[0, n_res)`, misses after, so the residents form the one CONTIGUOUS range the
+        // launcher's `[e_start, e_count)` form was left as a hook for (`kernels/moe.hip:173`)
+        // — one 3-launch range call where M2 counted 3 per expert, ~820 launches/token.
+        // Byte-identity across the regrouping is the fixed-point accumulator's contract:
+        // every expert's `h` row and `moe_fixed` term is computed from the same descriptor,
+        // `x` and weight regardless of which launch carries it, and integer addition is
+        // associative and commutative, so the `acc` sums cannot depend on the grouping
+        // (`common.hpp`'s MOE_ACC_SHIFT block). A duplicate pick (reachable only through a
+        // hash-table row) gets one compact slot per occurrence and accumulates once each —
+        // the same total the absolute layout produced by launching its shared slot twice.
         self.descs_host.fill(desc_never_read());
-        for (&e, s) in self.sel.iter().zip(&self.slots) {
-            self.descs_host[e] = desc_of_f4(s);
+        let mut n_res = 0;
+        let mut c = 0;
+        for resident in [true, false] {
+            for i in 0..self.sel.len() {
+                if self.tickets[i].is_resident() != resident {
+                    continue;
+                }
+                self.descs_host[c] = desc_of_f4(&self.slots[i]);
+                self.wexpert_launch[c] = self.wexpert_host[self.sel[i]];
+                c += 1;
+            }
+            if resident {
+                n_res = c;
+            }
         }
         self.descs.copy_in_at(0, as_le_bytes(&self.descs_host))?;
         self.wexpert
-            .copy_in_at(0, as_le_bytes(&self.wexpert_host))?;
+            .copy_in_at(0, as_le_bytes(&self.wexpert_launch))?;
 
         // SAFETY: `xq` holds `max_m * dim` f32 and `t < m <= max_m`.
         let x = unsafe { self.xq.ptr().cast::<f32>().add(t * dim) };
@@ -1365,36 +1410,41 @@ impl V4Engine {
         // 3.05 -> 2.44 tok/s, because a resident expert's compute is what overlaps the in-flight
         // ones' reads. Every launch enqueues its ticket's wait first: `wait_on` is the only way
         // to consume a ticket, so a launch cannot happen without its data dependency.
-        for resident in [true, false] {
-            for i in 0..self.sel.len() {
-                if self.tickets[i].is_resident() != resident {
-                    continue;
-                }
-                let stream = if resident { cs } else { ms };
-                self.pin.routed.wait_on(self.tickets[i], stream)?;
-                let e = self.sel[i];
-                // SAFETY: `descs`/`wexpert`/`h`/`acc`/`x` are `DeviceBuf` fields of `self` sized
-                // per the launcher's contract, and `e < n_desc` was checked in `route_row` and
-                // again by `submit`'s pre-flight range check over the whole selection. Misses
-                // accumulate into row 1 so the two streams never share a cache line.
-                unsafe {
-                    launch_moe_expert_range_f4(
-                        x,
-                        dim,
-                        inter,
-                        e,
-                        1,
-                        n_desc,
-                        descs,
-                        wexpert,
-                        limit,
-                        h,
-                        if resident { acc } else { acc.add(dim) },
-                        1,
-                        stream,
-                    )?;
-                }
+        //
+        // SAFETY (both calls below): `descs`/`wexpert`/`h`/`acc`/`x` are `DeviceBuf` fields of
+        // `self` sized per the launcher's contract, and every launched range lies within
+        // `[0, sel.len())` — compact indices written just above, and `sel.len() = top_k <=
+        // n_experts = n_desc` by `V4Config::validate`. Misses accumulate into `acc` row 1 so
+        // the two streams never share a cache line.
+        let launch_range = |e_start: usize, e_count: usize, acc: *mut u64, stream| unsafe {
+            launch_moe_expert_range_f4(
+                x, dim, inter, e_start, e_count, n_desc, descs, wexpert, limit, h, acc, 1, stream,
+            )
+        };
+        // The residents' waits are timeline waits on value 0 (`AsyncFetch::wait` early-returns
+        // on them, enqueuing nothing) — kept because consuming the ticket is the protocol,
+        // not because they gate anything — so ONE range launch computes every resident
+        // without waiting on any fetch.
+        for i in 0..self.sel.len() {
+            if self.tickets[i].is_resident() {
+                self.pin.routed.wait_on(self.tickets[i], cs)?;
             }
+        }
+        if n_res > 0 {
+            launch_range(0, n_res, acc, cs)?;
+        }
+        // Misses stay ONE LAUNCH EACH, each behind its own ticket only: folding them into the
+        // resident range (or into one miss range) would gate the whole batch on the LAST fetch
+        // to land — 2.40 ms/miss measured at M2 — serialising hits behind misses. The compact
+        // index keeps ascending in the same order the placement loop wrote, so straggler `j`
+        // reads descriptor `n_res + j`.
+        for (j, i) in (0..self.sel.len())
+            .filter(|&i| !self.tickets[i].is_resident())
+            .enumerate()
+        {
+            self.pin.routed.wait_on(self.tickets[i], ms)?;
+            // SAFETY: row 1 of an `MOE_ACC_ROWS * dim` accumulator; see the block above.
+            launch_range(n_res + j, 1, unsafe { acc.add(dim) }, ms)?;
         }
         // Header item 2: the drain's contract is that EVERY stream which accumulated into `acc`
         // has already completed.
@@ -1750,7 +1800,12 @@ impl V4Engine {
         for l in self.range.clone() {
             self.layer(l, m, start_pos)?;
         }
-        self.head_tail(m)
+        // Launch time only — the tail's GPU wall drains into `argmax`'s sync, the other half
+        // of the same bracket.
+        let t0 = std::time::Instant::now();
+        let r = self.head_tail(m);
+        self.prof.tail_ns += t0.elapsed().as_nanos();
+        r
     }
 
     /// `hc_head`, the final `RMSNorm`, `ParallelHead` — the last three ops of
@@ -1838,6 +1893,10 @@ impl V4Engine {
     /// onto a stream. This port's record is that the sync someone forgets is the failure mode, so
     /// it is written down as owned rather than inferred from where the launchers happen to run.
     fn argmax(&mut self) -> Result<u32> {
+        // The tail bracket's blocking half: this `device_sync` is where the head GEMV and
+        // everything else still on the null stream drains, a join the decode already pays —
+        // so the bracket is two `Instant` reads and no new sync.
+        let t0 = std::time::Instant::now();
         // SAFETY: `logits` holds `vocab` f32; `argmax_dev` holds an i32 then an f32, and the
         // second pointer is offset by exactly the first's width.
         unsafe {
@@ -1853,6 +1912,7 @@ impl V4Engine {
         // errors, so the slicing below is total. A length `ensure!` was written here and cut for
         // being unable to fire — the failure mode this stage was briefed on.
         self.argmax_dev.copy_out_into(&mut self.argmax_host)?;
+        self.prof.tail_ns += t0.elapsed().as_nanos();
         let idx = i32::from_le_bytes(self.argmax_host[..4].try_into()?);
         let val = f32::from_le_bytes(self.argmax_host[4..8].try_into()?);
         // A non-finite top logit is a defect and not a sampling outcome. It is also the visible
@@ -2179,6 +2239,7 @@ impl V4Engine {
         let wall_ms = decode * 1e3 / n;
         let route_ms = self.prof.route_ns as f64 / 1e6 / n;
         let moe_ms = self.prof.moe_ns as f64 / 1e6 / n;
+        let tail_ms = self.prof.tail_ns as f64 / 1e6 / n;
         let fetch_ns = (self.pin.routed.fetch_ns() - fetch0) as f64;
         let dec_miss = self.pin.routed.misses() - miss1;
         let remainder_ms = wall_ms - route_ms - moe_ms;
@@ -2186,13 +2247,24 @@ impl V4Engine {
             remainder_ms >= 0.0,
             "negative PROFILE remainder ({remainder_ms:.3} ms/tok): a bucket exceeds the wall"
         );
+        // 1e-6: the three buckets and the wall are independently-rounded f64 sums, so the
+        // comparison needs a slack far below the µs a real violation would show.
+        debug_assert!(
+            tail_ms <= remainder_ms + 1e-6,
+            "tail ({tail_ms:.3} ms/tok) exceeds the remainder ({remainder_ms:.3}): the tail \
+             bracket overlaps a phase bucket"
+        );
         // No `(gpu Nms)` term: GLM's is a HIP-event bracket on its compute stream, and V4 has
         // no event pair to read at an existing join yet. Absent rather than zero. moe/fetch at
         // 0.1 ms where GLM prints whole ms: its moe wall is ~250 ms, V4's terms are expected
-        // an order smaller, and the decomposition exists to resolve them.
+        // an order smaller, and the decomposition exists to resolve them. The raw miss count
+        // rides beside the rounded rate because M2 could recover it only to ±2 from the
+        // per-token print; `tail` prints inside the remainder because it is a sub-span of it,
+        // not a fourth bucket.
         tracing::info!(
             "PROFILE/tok: {wall_ms:.1}ms wall | route {route_ms:.1}ms | moe {moe_ms:.1}ms | \
-             fetch {:.1}ms | {:.2} miss, {:.2}ms/miss, {:.2} GB | remainder {remainder_ms:.1}ms",
+             fetch {:.1}ms | {:.2} miss ({dec_miss} raw), {:.2}ms/miss, {:.2} GB | \
+             remainder {remainder_ms:.1}ms (tail {tail_ms:.1}ms)",
             fetch_ns / 1e6 / n,
             dec_miss as f64 / n,
             fetch_ns / 1e6 / dec_miss.max(1) as f64,

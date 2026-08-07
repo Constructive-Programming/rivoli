@@ -264,7 +264,7 @@ launchers! {
     );
 
     /// DeepSeek-V4 counterpart of [`launch_moe_expert_range_i4`]: FP4 experts (e2m1 nibbles,
-    /// one e8m0 scale per 32 weights along the reduction dim) for the absolute range
+    /// one e8m0 scale per 32 weights along the reduction dim) for the descriptor range
     /// `[e_start, e_start+e_count)` on `stream`. Contributions land in the same fixed-point
     /// `acc` row, so this shares [`launch_moe_acc_drain`] with the other two formats.
     ///
@@ -287,9 +287,10 @@ launchers! {
     /// Every device pointer (`descs`/packed weights/`wexpert`/`x`/`h`/`acc`) must outlive
     /// `stream`'s completion — await its [`Signal`](crate::backend::gpustream::Signal).
     ///
-    /// **`wexpert` and `h` are indexed by ABSOLUTE expert id, not by position within
-    /// `[e_start, e_start+e_count)`** — the same convention as `descs`, and the same one
-    /// [`launch_moe_expert_range`] uses. So both must be sized for `n_desc`, not for `e_count`:
+    /// **`wexpert` and `h` are indexed by the DESCRIPTOR index — whatever placement the
+    /// caller chose for `descs` — not by position within `[e_start, e_start+e_count)`.**
+    /// (`v4gpu::routed_experts` writes launch order since 2026-08-07; the GLM twins'
+    /// callers write absolute ids.) So both must be sized for `n_desc`, not for `e_count`:
     /// `wexpert` is `n_desc·nrow` f32 and `h` is `n_desc·nrow·inter` f32. A caller that read
     /// these as range-relative and allocated `e_count` of them would run off the end the first
     /// time it passed `e_start > 0`, which is the first thing a two-stream pipeline does.

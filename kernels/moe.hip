@@ -170,10 +170,12 @@ extern "C" __global__ void moe_acc_drain(
 
 // --- Streaming-pipeline launchers: gate/up + down for an ABSOLUTE expert range on
 //     a caller-owned stream (so load DMA and this compute overlap on the GPU), and
-//     a stream-scoped reduce. The pipeline currently launches ONE expert per range
+//     a stream-scoped reduce. The GLM pipeline launches ONE expert per range
 //     (e_count=1, per-expert Signal overlap); the [e_start,e_count) range form is the
-//     hook for a future batching of RESIDENT experts (whose Signals are already ready)
-//     into a single launch, to cut host-gated launch bubbles.
+//     hook for a batching of RESIDENT experts (whose Signals are already ready)
+//     into a single launch, to cut host-gated launch bubbles. [2026-08-07: the V4 fp4
+//     caller cashed that hook in — `v4gpu::routed_experts` batches its residents into one
+//     range in LAUNCH order; this GLM vq/i4 path still launches one per range.]
 // `nrow` token rows through ONE read of the expert weights. The grid is unchanged — the
 // row axis is inside each wave, not beside it — so this is the same launch shape doing
 // nrow times the arithmetic against the same bytes.
@@ -381,8 +383,9 @@ extern "C" __global__ void moe_down_f4(
     moe_down_f4_impl<1>(hidden, inter, e_start, e_count, descs, h_in, acc);
 }
 
-// gate/up + the `h` re-quantization + down for the absolute expert range
-// [e_start, e_start+e_count), on a caller-owned stream. THREE launches, not two:
+// gate/up + the `h` re-quantization + down for the descriptor range
+// [e_start, e_start+e_count) — the caller's placement, launch order since 2026-08-07 —
+// on a caller-owned stream. THREE launches, not two:
 // `act_quant_f8` between the passes is not an optimisation, it is `w2`'s own input
 // quantization (see `moe_down_f4_impl`).
 //
