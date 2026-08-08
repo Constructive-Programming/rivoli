@@ -3267,3 +3267,86 @@ Levers 1+2 project to −25..−40 ms against the needed −31: the top of that 
 it and the bottom falls 6 short — **10 tok/s needs the fp8 recovery to land mid-band or
 better, with levers 3–5 as the margin.** No quality tradeoff appears anywhere in the
 list, and the attack ORDER — though not the recoveries — is now measured, not guessed.
+
+## V4 fp8-MLP + shared-overlap A/B — wall 129.5 → 109.0 ms/token = 9.175 tok/s (+18.8%), output byte-identical; the wall band MISSED LOW, first bad-side miss of the series (2026-08-08)
+
+The M7 A/B (`docs/investigations/v4-decode-decomposition.md` §M7; predictions
+registered there before this run). Arm S = `97b8891` via `git archive` into a scratch
+tree; arm B = `wt/v4-fp8-gemv` at `d4e307a` (lever 1: `#pragma unroll 8` on
+`fp8_dot_strided`'s dword loop; lever 2: the shared-expert chain on its own stream,
+enqueued after `sync1`). Both release binaries built BEFORE the first device request,
+nothing built between arms. Command per arm, flag-identical to M2..M6, the 218-token
+prompt verbatim (md5 `bc71afa745d980be7d21860f70ad96aa`), exclusive flock with a
+30-second KFD+GTT witness per arm:
+
+```
+flock /var/run/sys-gpu.lock <arm-binary> /var/db/rivoli/v4-f4-full -bench 512 --prompt "<the 218-token prompt>"
+```
+
+**One arm was DISCARDED by the witness, and the discard is the protocol working.** The
+first arm-S run showed a foreign GTT step mid-run (108.27 → 110.06 GB at minute two —
+a 1.66 GiB tenant loading with no `/dev/kfd` holder visible to this user), measured
+168.2 ms/token (+28.8% over the recorded 130.6) with every latency-bound span inflated
+(hcn 11.4 vs 5.6, qkv 30.2 vs 20.3). The intruder's allocation survived its process and
+blocked arm B's sole-tenant gate at 1.7 GiB until a manufactured lock-waiter fired the
+coordinator's broker. The CLEAN re-run (witnessed: own pid only, GTT flat) replicated
+the M6 record almost exactly — the drift theory died with it. Discarded log kept
+beside the record (`arm-S-DISCARDED`).
+
+**The clean arms** (S first line, B second; S wall −0.84% of the recorded 130.6 — gate
+(1) passes; every S span within 0.1–1.1 of the M6 control):
+
+```
+PROFILE/tok: 129.5ms wall | route 58.5ms | moe 48.0ms | fetch 9.0ms | 4.96 miss (2538 raw), 1.82ms/miss | remainder 23.1ms (tail 8.2ms)
+PROFILE/tok: 109.0ms wall | route 46.2ms | moe 39.3ms | fetch 9.5ms | 4.96 miss (2538 raw), 1.91ms/miss | remainder 23.4ms (tail 8.2ms)
+ATTN-SPLIT:  qkv 20.2 | attend 3.2 | oproj 29.7 | attn 53.1 (resid 0.00)
+ATTN-SPLIT:  qkv 16.6 | attend 3.1 | oproj 21.4 | attn 41.1 (resid 0.00)
+MOE-SPLIT:   sh_enq 0.4 | desc 0.3 | h2d 15.5 | sync1 0.4 | launch 0.5 | sync2 30.7 | drain 0.1 | moe 48.0 (resid 0.0) | gpu: shared 15.9, res 24.3, miss 8.6
+MOE-SPLIT:   sh_enq 0.7 | desc 0.4 | h2d  1.3 | sync1 0.4 | launch 0.6 | sync2 35.8 | drain 0.1 | moe 39.3 (resid 0.0) | gpu: shared 16.0, res 27.7, miss 8.9
+```
+
+**Gates, in registered order.** (1) Byte-identity FIRST: both arms' escape-decoded
+replies md5 to the recorded `75b19fcde806059b45c515259feb16d2` (1983 bytes), expert
+lookups 179389 hit / 8693 miss and 2538 raw decode misses on both — identical to each
+other and to every recorded arm since M5. (2) Split identities exact on both arms
+(ATTN resid 0.00, MOE resid 0.0). (3) Spans, each against its own §M7 band:
+
+| span | S | B | Δ | band | verdict |
+|---|---:|---:|---:|---|---|
+| qkv | 20.2 | 16.6 | −3.6 | 11.5–15.5 | **MISS high by 1.1** (Δ real: >3) |
+| oproj | 29.7 | 21.4 | −8.3 | 15.5–19 | **MISS high by 2.4** (Δ real) |
+| gpu shared | 15.9 | 16.0 | +0.1 | 6.5–9.5 | **no claim — instrument confounded** (below) |
+| h2d | 15.5 | 1.3 | −14.2 | 0.3–2 | **IN BAND** — the overlap worked |
+| sync2 | 30.7 | 35.8 | +5.1 | ±3 tell | **tell FIRES** — contention, score lever 2 on wall |
+| wall | 129.5 | 109.0 | −20.5 | −22..−42 | **MISS LOW by 1.5** — first bad-side miss of the series |
+
+attend/hcn/cmp/gate/tail all flat (≤0.1) — the untouched spans did not move, which is
+the instrument-sanity check passing.
+
+**The reading.** Lever 1 recovered **~45% of the fp8 GEMV excess, not the ~90% the
+bands priced**: qkv now 1.89× its 8.8 ms of bytes (was 2.30×), oproj 1.44× its 14.9
+(was 1.99×). Direction and mechanism confirmed (the spans moved exactly where the MLP
+model said, and nothing else moved); magnitude short — the loop at 8× in-flight is
+still ~1.5–1.9× bytes, so either the next MLP rung (the loop is now ~30 instr/128 B —
+headroom for a wider unroll exists only past the 96-VGPR granule) or a second
+mechanism (launch gaps between the chain's 12 ops; L2/GTT behavior under 24
+requests/wave) holds the residue. Lever 2's h2d landed IN BAND (15.5 → 1.3) but the
+registered sync2 tell fired: the overlapped chain contends with the resident batch
+(res attribution 24.3 → 27.7, ms/miss 1.82 → 1.91), so lever 2's wall value is the
+**net moe Δ −8.7**, not the −14 the h2d collapse alone would suggest. The registered
+res/miss ±1.5 tell scores with it: res +3.4 FIRES (the same contention, one cause,
+two instruments), miss +0.3 does not. The `gpu shared`
+span cannot score lever 1 this round: its conditions changed between arms (serial on
+an empty device vs overlapping the resident batch), so its flatness is confounded —
+a serial microbench or a same-schedule pair is needed before any claim about the
+chain's kernel rate. Prefill 15.35 → 16.54 s (single observation each, spread across
+the day's three runs 15.35–18.35 — unclaimed variance, booked here for honesty).
+
+**Verdict: 109.0 ms/token = 9.175 tok/s, +18.8% arm-to-arm, byte-identical — and 10
+tok/s is NOT reached: the wall Δ −20.5 fell 1.5 short of the registered band's nearest
+edge (−22), which §M7 said in advance would mean levers 3/4 are still needed.** Residue to 100
+ms/token: ~9.0 ms. Ranked from this run's own numbers: qkv+oproj residual above bytes
+~14.3 (the fp8 loop's next rung) > sync2/res contention +3.4..+5.1 (schedule or accept)
+> miss 8.9 (pure fetch latency, lever 3) > hcn +4.8 (closed rung). The M-series error
+family now has a bad-side member: M3b/M5 missed good, M4/M6 missed a component, M7
+missed low on the wall.
