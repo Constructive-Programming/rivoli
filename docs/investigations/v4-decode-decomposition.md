@@ -857,9 +857,8 @@ span scored against its OWN band; a win in one does not excuse another):
 > **SCORED 2026-08-08, by the A/B below (record: benchmarks.md "V4 fp8-MLP +
 > shared-overlap A/B"): wall 129.5 → 109.0 = 9.175 tok/s (+18.8%), byte-identical,
 > counters identical — and the wall Δ −20.5 fell 1.5 SHORT of the −22..−42 band's
-> nearest edge: the
-> series' first bad-side miss, and the pre-registered honesty clause applies — 10
-> tok/s is NOT reached and levers 3/4 are still needed.** Per span: qkv −3.6 and
+> nearest edge: the series' first bad-side miss, and the pre-registered honesty
+> clause applies — 10 tok/s is NOT reached and levers 3/4 are still needed.** Per span: qkv −3.6 and
 > oproj −8.3 (both real, both bands MISSED high — the unroll recovered ~45% of the
 > GEMV excess, not ~90%; the loop still runs 1.4–1.9× bytes); h2d 15.5 → 1.3 IN BAND
 > (lever 2's plumbing worked); the sync2 tell FIRED (+5.1: the overlapped chain

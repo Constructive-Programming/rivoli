@@ -3277,7 +3277,9 @@ tree; arm B = `wt/v4-fp8-gemv` at `d4e307a` (lever 1: `#pragma unroll 8` on
 enqueued after `sync1`). Both release binaries built BEFORE the first device request,
 nothing built between arms. Command per arm, flag-identical to M2..M6, the 218-token
 prompt verbatim (md5 `bc71afa745d980be7d21860f70ad96aa`), exclusive flock with a
-30-second KFD+GTT witness per arm:
+30-second KFD+GTT witness per arm (a deviation from the staged per-minute
+KFD+GTT+llama-swap form: denser sampling, no llama-swap column — the endpoint was
+absent on this box; the KFD+GTT pair is what caught the discard below):
 
 ```
 flock /var/run/sys-gpu.lock <arm-binary> /var/db/rivoli/v4-f4-full -bench 512 --prompt "<the 218-token prompt>"
@@ -3293,12 +3295,12 @@ coordinator's broker. The CLEAN re-run (witnessed: own pid only, GTT flat) repli
 the M6 record almost exactly — the drift theory died with it. Discarded log kept
 beside the record (`arm-S-DISCARDED`).
 
-**The clean arms** (S first line, B second; S wall −0.84% of the recorded 130.6 — gate
-(1) passes; every S span within 0.1–1.1 of the M6 control):
+**The clean arms** (S first line, B second; S wall −0.84% of the recorded 130.6 — the
+M6-control wall gate passes; every S span within 0.1–1.1 of the M6 control):
 
 ```
-PROFILE/tok: 129.5ms wall | route 58.5ms | moe 48.0ms | fetch 9.0ms | 4.96 miss (2538 raw), 1.82ms/miss | remainder 23.1ms (tail 8.2ms)
-PROFILE/tok: 109.0ms wall | route 46.2ms | moe 39.3ms | fetch 9.5ms | 4.96 miss (2538 raw), 1.91ms/miss | remainder 23.4ms (tail 8.2ms)
+PROFILE/tok: 129.5ms wall | route 58.5ms | moe 48.0ms | fetch 9.0ms | 4.96 miss (2538 raw), 1.82ms/miss, 0.07 GB | remainder 23.1ms (tail 8.2ms)
+PROFILE/tok: 109.0ms wall | route 46.2ms | moe 39.3ms | fetch 9.5ms | 4.96 miss (2538 raw), 1.91ms/miss, 0.07 GB | remainder 23.4ms (tail 8.2ms)
 ATTN-SPLIT:  qkv 20.2 | attend 3.2 | oproj 29.7 | attn 53.1 (resid 0.00)
 ATTN-SPLIT:  qkv 16.6 | attend 3.1 | oproj 21.4 | attn 41.1 (resid 0.00)
 MOE-SPLIT:   sh_enq 0.4 | desc 0.3 | h2d 15.5 | sync1 0.4 | launch 0.5 | sync2 30.7 | drain 0.1 | moe 48.0 (resid 0.0) | gpu: shared 15.9, res 24.3, miss 8.6
@@ -3317,7 +3319,7 @@ other and to every recorded arm since M5. (2) Split identities exact on both arm
 | oproj | 29.7 | 21.4 | −8.3 | 15.5–19 | **MISS high by 2.4** (Δ real) |
 | gpu shared | 15.9 | 16.0 | +0.1 | 6.5–9.5 | **no claim — instrument confounded** (below) |
 | h2d | 15.5 | 1.3 | −14.2 | 0.3–2 | **IN BAND** — the overlap worked |
-| sync2 | 30.7 | 35.8 | +5.1 | ±3 tell | **tell FIRES** — contention, score lever 2 on wall |
+| sync2 | 30.7 | 35.8 | +5.1 | ±3 tell | **tell FIRES** (registered form: +4.2 vs the recorded 31.6 — past ±3 either way) — contention, score lever 2 on wall |
 | wall | 129.5 | 109.0 | −20.5 | −22..−42 | **MISS LOW by 1.5** — first bad-side miss of the series |
 
 attend/hcn/cmp/gate/tail all flat (≤0.1) — the untouched spans did not move, which is
@@ -3329,7 +3331,7 @@ bands priced**: qkv now 1.89× its 8.8 ms of bytes (was 2.30×), oproj 1.44× it
 model said, and nothing else moved); magnitude short — the loop at 8× in-flight is
 still ~1.5–1.9× bytes, so either the next MLP rung (the loop is now ~30 instr/128 B —
 headroom for a wider unroll exists only past the 96-VGPR granule) or a second
-mechanism (launch gaps between the chain's 12 ops; L2/GTT behavior under 24
+mechanism (launch gaps between the chain's five launches; L2/GTT behavior under 24
 requests/wave) holds the residue. Lever 2's h2d landed IN BAND (15.5 → 1.3) but the
 registered sync2 tell fired: the overlapped chain contends with the resident batch
 (res attribution 24.3 → 27.7, ms/miss 1.82 → 1.91), so lever 2's wall value is the
