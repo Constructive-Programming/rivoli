@@ -3088,4 +3088,84 @@ and KFD) `docs/reference/gpu-lock.md`'s correction documents.
 The residual reading — what the −5.3 cashes out against the M3a slot model, what stays
 unpriced inside moe's remaining ~31.6 ms above the byte floor, and `route` (75.9,
 untouched in both A/Bs) as the top residue — lives in the M3c SCORED note and the doc's
-verdict; the PROFILE lines above carry the record.
+verdict; the PROFILE lines above carry the record. *[Dated 2026-08-08: "route as the top
+residue" was true when written and is answered two sections down — the "V4 hcn A/B" cut
+route to 58.0; the doc's verdict now carries M5's ranking, and the M3c SCORED note
+remains the home of the moe residual reading.]*
+
+## V4 hcn A/B — hcn 40.7 → 5.6 ms/token, wall 168.2 → 130.7 = 7.652 tok/s, output byte-identical (2026-08-08)
+
+The A/B `docs/investigations/v4-decode-decomposition.md` M5 staged: stock `2e226e9` (built
+from `git archive` into a scratch tree) vs the widened-`hc_pre` commit `6b1461c`
+(`wt/v4-hcn`: block 256 → 1024 = one wave per mix row, sum-of-squares frozen at
+`HC_RED = 256`, `#pragma unroll 8` on both strided load loops — schedule-only by
+construction and by ISA diff). Both release binaries built before the device was
+requested, nothing built between arms, stock first. Command per arm flag-identical to
+M2/M3b/M3c (the 218-token prompt verbatim from the head-to-head CORRECTED note), each
+under the exclusive flock with the per-minute KFD+GTT+llama-swap witness. Occupancy this
+run used the coordinator's queue-behind-the-lock maneuver: a flock-wrapped llama-swap
+tenant (qwen3.6, Vulkan — GTT 30.9 GiB with **kfd=0**, another datum for gpu-lock.md's
+"KFD alone is insufficient") held a shared lock, our exclusive waiter queued, the
+coordinator unloaded it as the waiter appeared (twice — the tenant reloaded between
+arms); the in-run witness stayed strict and shows GTT flat at rivoli's own 100.8 GiB in
+every mid-run sample, the tenant queued in "starting" and never touching the device.
+Sample counts stated because they are small: 2 mid-run samples for arm S, **1** for arm
+B (the per-minute cadence left arm B's final ~51 s unsampled) — the flat-GTT claim is
+exactly that thin, and the queued-tenant mechanism plus identical output carry the rest.
+
+```
+arm S (2e226e9): PROFILE/tok: 168.2ms wall | route 75.8ms | moe 50.9ms | fetch 11.8ms | 4.96 miss (2538 raw), 2.38ms/miss, 0.07 GB | remainder 41.6ms (tail 8.2ms)
+                 ROUTE-SPLIT/tok: attn 52.9ms | cmp 9.2ms | hcn 40.7ms | gate 3.1ms | win 107.4ms (resid 1.5ms) | d2h 74.9ms + host 0.9ms   (prefill 16.21 s, 5.944 tok/s)
+arm B (6b1461c): PROFILE/tok: 130.7ms wall | route 58.0ms | moe 48.9ms | fetch  9.9ms | 4.96 miss (2538 raw), 1.99ms/miss, 0.07 GB | remainder 23.8ms (tail 8.2ms)
+                 ROUTE-SPLIT/tok: attn 52.8ms | cmp 9.2ms | hcn  5.6ms | gate 3.2ms | win  72.2ms (resid 1.4ms) | d2h 57.4ms + host 0.6ms   (prefill 15.72 s, 7.652 tok/s)
+```
+
+**Correctness gates, all pass.** Reply prefix (2017 bytes, the log's escaped truncation)
+**byte-identical**, md5 `0ebcf62c20c6981b0ad7ca04ccfff270` — recorded per the convention
+the M3b retrospective set. The cross-run cmp the route-split record staged is DONE and
+passes: both arms escape-decode to the 1983-byte raw prefix at exactly M4's recorded md5
+`75b19fcde806059b45c515259feb16d2` — every witnessed run of this benchmark since M4 has
+decoded the same reply. Expert lookups identical (179389 hit / 8693 miss, 2538 raw
+decode misses, 116.22 GB). Arm S's hcn 40.7 replicates M4's 41.2 (baseline stable);
+the device test suite (`tests/v4_kernel.rs`, 25 tests incl. the hc chain goldens) passed
+on the new launch shape before the arms ran.
+
+**The verdict: Δhcn = −35.1 ms/token — outside the registered −15..−30 band on the good
+side, the M3-series error family a third time** (mechanism right, magnitude priced on a
+conservative constant). The band priced the width lever (8 → 24 waves = 3×) and treated
+the unroll as garnish; the two MULTIPLY (2 → 16 loads in flight per wave × 3× waves =
+24× memory-level parallelism), so the mixes phase fell through the band to its transit
+floor. Measured per-layer hcn is now ~130 µs for the whole five-launch chain. Inside
+that, one equation in two unknowns — 86·`hc_pre` + ~1.0 ms of priced norms/`hc_post` +
+bubbles = 5.6 — so the pair is a JOINT constraint, not two derived facts: `hc_pre` ≈
+40–55 µs/launch (~53 at zero bubbles, and it cannot sit below the registered ~50 µs
+transit floor without the floor being wrong), which pins bubbles ≤ ~1.3 ms if that floor
+holds (≤ ~4.6 unconditionally). Either way the M4 ~5.4 ms bubble figure is retired as an
+upper bound — the whole hcn bucket, kernels included, is now 5.6 — and `hc_pre` sits at
+the floor's edge ("cannot go below ~50–100 µs in one workgroup"), not the ~145 µs point.
+
+**Where the wall win came from — measured by the instrument's own identity, not
+inferred.** Δwall −37.5 ≈ Δroute −17.8 + Δremainder −17.8 + Δmoe −2.0 (print rounding;
+fetch −1.9 rides inside moe's sync). The two 17.8s are the two `hc_pre` executions per
+layer — the identical launch on both sublayers, so equal per-side savings is what the
+mechanism predicts, and its arrival is corroboration: Δd2h = −17.5 (hc_pre(ffn)'s GPU
+time used to drain in the gate-logits D2H wait = route), and Δ(win − d2h) = −17.7
+(hc_pre(attn)'s time used to serialise the host at cmp's blocking calls — the selection
+upload every step, the placement copies on emitting steps — which stream-order behind
+`hc_pre`+`attn_norm`; host wall the PROFILE line books as remainder). The route-side gap
+of 0.3 is exactly Δhost (route ≡ d2h + host), so the pairing closes as an identity, not
+to a residual; the remainder side closes to 0.1. `tail` is 8.2 in both arms (the
+untouched `hc_head` as control) and attn/cmp/gate move ≤0.1 — the shared-window failure
+mode did not fire. moe −2.0 and fetch −1.9 (identical bytes, 2.38 → 1.99 ms/miss) are
+not banked: the fetch movement is inside its recorded 9.6–11.9 spread and rides inside
+moe's closing sync, which is what places the non-fetch moe movement (~0.1) inside moe's
+own recorded spread. Prefill 16.21 → 15.72 s (−3%): at s = 218 the widened block also
+helps prefill; observed, not claimed beyond that.
+
+**hcn is CLOSED at this rung.** 5.6 against 0.8 of bytes = +4.8 above bytes, now BOTTOM
+of the big three: the ranked residue to 10 tok/s (~31 of the 130.7) is **moe ~+31 over
+its 18 ms byte floor > attn +28.9 > hcn +4.8 > cmp +3.8 > gate +2.3**. The next hcn
+rungs (splitting the mixes across workgroups, fusing `v4_rmsnorm` into `hc_pre`) are
+each priced ≤ ~2–4 ms and re-open only if the wall closes on ~100 ms and needs them;
+the next lever by the table is moe's miss-exposure/shared-GEMV residue or attn's fp8
+projections (the intra-attention split or the ISA read, per M4's ranking).

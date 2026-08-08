@@ -1,7 +1,7 @@
 ---
 scope: v4
 status: live
-verdict: OPEN, three levers LANDED and the route span SPLIT. M3b (2026-08-07, launch geometry): moe 70.6 → 54.7 ms/token, +9.6% tok/s. M3c (2026-08-08, branchless e2m1/e8m0 + global-AS descriptor loads, fp4 dot loop 195 → 105 instr per 128 weight bytes): moe 54.9 → 49.6, wall 165.3 = 6.048 tok/s — the registered prediction (−4..−10, point −6) landed IN BAND at −5.3, the first of the series to do so. Output byte-identical and counters identical across every arm. M4 (2026-08-08) split route with four event-pair sub-spans, no new join: attn 53.2 | cmp 9.1 | hcn 41.2 | gate 3.2 | win 107.7 (resid 1.0) — WRONG at the headline: hcn (hyper-connections + norms) measured 41.2 against a 4–8 band and 0.8 ms of bytes, the engine's largest above-bytes excess and the new #1 lever (read the hc/norm kernels host-side next); fp8 GEMV rate demoted to #2; cmp and gate closed at budget; resid 1.0 kills the gate-D2H width micro-lever. Residue to 10 tok/s (~65 ms off the 165.3 wall): hcn +40.4 > moe +31.6 over its 18 ms byte floor (miss exposure, shared GEMV unpriced) > attn +29.3 > remainder ~31 non-tail. M2's floor (~62 ms/token ≈ 16 tok/s ceiling) stands; buckets still not certified free (wall spread ±1.5% over stock-class runs).
+verdict: OPEN, four levers LANDED and the route span SPLIT. M3b (2026-08-07, launch geometry): moe 70.6 → 54.7 ms/token, +9.6% tok/s. M3c (2026-08-08, branchless e2m1/e8m0 + global-AS descriptor loads, fp4 dot loop 195 → 105 instr per 128 weight bytes): moe 54.9 → 49.6, wall 165.3 = 6.048 tok/s — the registered prediction (−4..−10, point −6) landed IN BAND at −5.3, the first of the series to do so. M4 (2026-08-08) split route with four event-pair sub-spans, no new join: attn 53.2 | cmp 9.1 | hcn 41.2 | gate 3.2 | win 107.7 (resid 1.0) — WRONG at the headline: hcn (hyper-connections + norms) measured 41.2 against a 4–8 band and 0.8 ms of bytes, the engine's largest above-bytes excess; cmp and gate closed at budget; resid 1.0 kills the gate-D2H width micro-lever. M5 (2026-08-08, the hcn read + fix, schedule-only: hc_pre 256 → 1024 threads = one wave per mix row, sum-of-squares frozen at HC_RED, unroll-8): hcn 40.7 → 5.6, wall 130.7 = 7.652 tok/s (+26.5% over M3c's 6.048; arm-to-arm +28.7%), Δhcn −35.1 vs the registered −15..−30 band — the error family a third time, the good side a second (M4 missed high); the width and unroll levers MULTIPLY (24× loads in flight); hcn CLOSED at this rung, +4.8 above bytes. Output byte-identical and counters identical across every arm (M5: reply-prefix md5 recorded, escape-decoding to M4's recorded 1983-byte md5). Residue to 10 tok/s (~31 ms off the 130.7 wall): moe ~+31 over its 18 ms byte floor (miss exposure, shared GEMV unpriced) > attn +28.9 > hcn +4.8; remainder's non-tail 15.6 is no longer ranked apart — it overlaps the ranked spans (win − d2h = 14.8). M2's floor (~62 ms/token ≈ 16 tok/s ceiling) stands; buckets still not certified free (recorded stock-class wall spread ±1.5%, and M5's arm S sat +1.75% over the recorded 165.3).
 ---
 
 # Where do V4-Flash's 185 ms/token go?
@@ -297,7 +297,9 @@ four bands hit, and the headline was wrong — the **hyper-connection/norm chain
 The ranked levers are in the verdict; the named next step is a host-side read of the
 hc/norm kernels (`kernels/linalg.hip` — the 20-pass Sinkhorn in `hc_pre` and GLM's
 `dim3(1)`-rmsnorm precedent are the candidates, per benchmarks.md's named-not-priced
-list).
+list). *[Done — M5 below, 2026-08-08: the read attributed it, the fix removed 35.1 of
+the 41.2, and the verdict now carries M5's residue ranking; M4's own ranking survives in
+benchmarks.md "V4 route split".]*
 
 *The staging record below is kept as written pre-GO:*
 
@@ -588,6 +590,16 @@ result still leaves a priced next rung and −30 is the model's hard edge. The r
 lands in benchmarks.md beside "V4 route split"; a passing byte-identity gate also keeps
 `tests/v4_loop.rs` §8's envelope valid without a re-run (its own note names `hc_pre`
 changes as the trigger) — a failing one owes §8 a re-run on top of being a bug.
+
+> **SCORED 2026-08-08, by the A/B: measured Δhcn = −35.1 ms/token — outside the −15..−30
+> band on the GOOD side, the M3-series error family a third time (the good side a
+> second; M4 missed high).** Byte-identity, identical counters, flat tail and
+> attn/cmp/gate ≤0.1 all as predicted; wall −37.5 (Δhcn plus −2.4 of unbanked moe/fetch
+> movement). What the band missed: it priced the width lever (3×) and treated the unroll
+> as garnish, but the levers MULTIPLY (24× loads in flight), so `hc_pre` fell to the
+> registered floor's own edge instead of the ~145 µs point. New state 130.7 ms/token =
+> 7.652 tok/s; hcn CLOSED at this rung. Full record, every gate, the wall-win
+> attribution and the retired bubble bound: benchmarks.md "V4 hcn A/B".
 
 ## M2 — provenance of the command
 
