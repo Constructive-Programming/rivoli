@@ -3432,3 +3432,14 @@ arithmetic, and the quality-gate apparatus it requires are registered in §M8 as
 next stretch's opening. The doc stays live on that item and the fp4 re-open (which
 this round sharpened: 140 GB/s-class resident fp4 against a same-box 222 GB/s fp8
 benchmark now reads kernel-side).
+
+## V4 M9 split-k — measured on branch `wt/v4-splitk`, kernel NOT merged (2026-08-08)
+
+The split-k round ran to completion and is recorded in full on branch `wt/v4-splitk`
+(commits `697246c` kernel, `6642312` scored record — kept unmerged because merging the
+kernel enables it flaglessly and the verdict is DO NOT ENABLE). Headline, duplicated here
+so main's ledger is complete: 17/512 argmax flips all at near-ties, max |dlogit| 8.14,
+deterministic (twin 264,767,496-byte dumps identical); perf NULL (wall +0.8, dqkv −0.9
+vs band −2.3..−2.9 — serial-idle microbench rates do not transfer into the overlapped
+engine). The quality apparatus (`--logit-dump`/`--force-tokens`, `Defect::SplitKFoldOrder`,
+`docs/measurement/probes/v4_logit_drift.py`) merged as `a552e33` and stays available.
