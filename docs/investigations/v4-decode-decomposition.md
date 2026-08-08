@@ -1,7 +1,7 @@
 ---
 scope: v4
 status: live
-verdict: OPEN, first lever LANDED. M3b measured 2026-08-07: batching a layer's resident experts into one range launch (misses stay per-expert behind their tickets) took moe 70.6 → 54.7 ms/token and wall 186.2 → 169.9 = 5.887 tok/s (+9.6%), output byte-identical, hit/miss identical, fetch fell — the registered prediction (−3..−8) was wrong on the GOOD side: per-launch cost is the ~25 µs host-bubble class, not the 1.97 µs dispatch floor it was priced on. tail measured 8.2 of the 39.1 ms remainder. Residue to 10 tok/s (~70 ms off the wall): route ~76 (attention phase still needs its own split) > moe ~32 above bytes (fp4 kernel issue-bound per the M3a ISA read: 195 instr per 128 weight bytes/wave, exec-mask e2m1 decode, flat loads; miss exposure and shared GEMV unpriced) > remainder ~31 non-tail. M2's decomposition and floor (~62 ms/token ≈ 16 tok/s ceiling) stand; buckets still not certified free (wall spread ±1.5% over three stock-class runs).
+verdict: OPEN, two levers LANDED. M3c measured 2026-08-08: branchless e2m1/e8m0 decode + global-address-space descriptor loads (fp4 dot loop 195 → 105 instr per 128 weight bytes) took moe 54.9 → 49.6 ms/token and wall 170.3 → 165.3 = 6.048 tok/s (+3.0%), output byte-identical, hit/miss identical, fetch flat in bytes — the registered prediction (−4..−10, point −6) landed IN BAND at −5.3, the first M3-series prediction to do so. M3b (launch geometry, moe 70.6 → 54.7, 2026-08-07) stands under it. Residue to 10 tok/s (~65 ms off the wall): route ~76 (attention phase still needs its own split) > moe ~31.6 above the 18 ms byte floor (issue-bound excess cashed out; miss exposure and shared GEMV unpriced) > remainder ~31 non-tail. M2's decomposition and floor (~62 ms/token ≈ 16 tok/s ceiling) stand; buckets still not certified free (wall spread ±1.5% over three stock-class runs).
 ---
 
 # Where do V4-Flash's 185 ms/token go?
@@ -352,6 +352,17 @@ stream and the closing `device_sync` hide most of what the kernel no longer spen
 |Δmoe| < 3 ms/token, that is inside recorded bucket noise — replicates before any claim,
 and a null result gets recorded WITH the 105-count that proves the instructions were
 really removed: that dissociation would itself be the finding (the bound was elsewhere).
+
+> **SCORED 2026-08-08, by the A/B below: measured Δmoe = −5.3 ms/token — INSIDE the
+> −4..−10 band, 0.7 off the −6 point.** First M3-series prediction to land in its band.
+> Byte-identity and hit/miss identity as predicted; fetch BYTES identical, fetch time
+> +0.6 ms — inside the recorded 9.6–11.9 replicate spread. Wall 170.3 → 165.3 =
+> 6.048 tok/s (+3.0%). Full record and every gate result in benchmarks.md "V4 fp4
+> kernel-rate A/B". The −5.3 sits where the −5 issue-bound core predicted, which prices
+> THIS lever's slot model right; the point alone cannot apportion the two unpriced terms
+> it sits between (flat-load latency above, sync-hidden compute below), so neither is
+> claimed. The residual ~31.6 ms of moe above the byte floor is the M3a split (miss
+> exposure, shared-expert GEMV, per-layer fixed costs), still named-not-priced.
 
 *Host validation, all green 2026-08-08: dev-profile `cargo test --features rocm --no-run`
 (jscpd gate re-armed via `touch build.rs` after rustfmt — it has manufactured clones here
