@@ -792,16 +792,28 @@ fn ev_span_ns(a: &Event, b: &Event, what: &str) -> Result<u128> {
 ///
 /// Every device buffer is allocated once in [`V4Engine::new`] and none per token, which is
 /// `gpu.rs`'s rule and why a decode does not allocate on the hot path.
-/// State behind [`V4Engine::arm_logit_trace`] — see that method for the file format and
-/// `trace_step` for the forcing rule.
+/// State behind TWO constructors — [`V4Engine::arm_logit_trace`] (`--logit-dump`, see that
+/// method for the file format) and [`V4Engine::nll_forced`] (`--ppl`) — with `trace_step`
+/// owning the one forcing rule both share.
 #[cfg(feature = "teacher-forcing")]
 struct LogitTrace {
-    out: std::io::BufWriter<std::fs::File>,
+    /// `--logit-dump`'s `.lt` file. `None` when [`V4Engine::nll_forced`] armed this trace
+    /// for `--ppl` instead — that instrument has no file of its own, it scores the SAME
+    /// per-position row `trace_step` already reads and writes nothing to disk (`eval::run_v4`
+    /// writes the one `.nll` file, and it writes THAT after `generate` returns, not per step).
+    out: Option<std::io::BufWriter<std::fs::File>>,
     /// Token to CONSUME at each recorded position, replacing the engine's own argmax —
     /// arm K of a drift A/B forces arm S's recorded stream so every position stays
-    /// comparable instead of only the prefix before the first divergence.
+    /// comparable instead of only the prefix before the first divergence. `--ppl` forces
+    /// the corpus itself (`ids[1..]`), so the same field is also the list `--ppl` is scored
+    /// against: `trace_step` never needs a second, separate target array.
     force: Option<Vec<u32>>,
     pos: usize,
+    /// `--ppl`'s accumulator: `Some` exactly when [`V4Engine::nll_forced`] armed this trace,
+    /// growing by one NLL per recorded position. This is the "third scoring loop" a `--ppl`
+    /// on V4 would otherwise need — instead it rides `trace_step`, which already reads the
+    /// row `--logit-dump` would have dumped.
+    nlls: Option<Vec<f32>>,
 }
 
 pub struct V4Engine {
@@ -902,11 +914,13 @@ pub struct V4Engine {
     logits: DeviceBuf,
     argmax_dev: DeviceBuf,
     argmax_host: Vec<u8>,
-    /// §M9's quality instrument (`--logit-dump` / `--force-tokens`), armed by
-    /// [`V4Engine::arm_logit_trace`], `None` on every stock run. Behind `teacher-forcing`
-    /// because that is what it is — the V4 sibling of `--ppl`, a teacher-forced quality
-    /// instrument that puts a per-token vocab-sized D2H on the decode path, so a tok/s
-    /// from a build that could even ARM it means nothing.
+    /// Backs TWO instruments, `None` on every stock run: §M9's `--logit-dump` /
+    /// `--force-tokens` drift A/B, armed by [`V4Engine::arm_logit_trace`] (writes a `.lt`
+    /// file); and `--ppl`'s corpus perplexity, armed by [`V4Engine::nll_forced`] (writes
+    /// nothing per step, just accumulates NLLs). Both are teacher-forced quality
+    /// instruments that put a per-token vocab-sized D2H on the decode path (`trace_step`),
+    /// so a tok/s from a build that could even ARM either means nothing — that shared cost
+    /// is why they share this one field rather than each carrying their own.
     #[cfg(feature = "teacher-forcing")]
     logit_trace: Option<LogitTrace>,
 
@@ -2535,15 +2549,22 @@ impl V4Engine {
         let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
         out.write_all(b"V4LT")?;
         out.write_all(&u32::try_from(self.cfg.vocab)?.to_le_bytes())?;
-        self.logit_trace = Some(LogitTrace { out, force, pos: 0 });
+        self.logit_trace = Some(LogitTrace {
+            out: Some(out),
+            force,
+            pos: 0,
+            nlls: None,
+        });
         Ok(())
     }
 
-    /// One trace step: record the engine's own argmax and the full logit row, then return
-    /// the token the decode should CONSUME — the forced one where a force list covers this
-    /// position, the engine's own otherwise (a short list forces a prefix and free-runs the
-    /// rest, which the arming log line states). A no-op returning `own` when the trace is
-    /// not armed, so the stock decode path is untouched even in a `teacher-forcing` build.
+    /// One trace step: record the engine's own argmax and the full logit row (when
+    /// `--logit-dump` armed a file), score the row against the token about to be forced
+    /// (when [`V4Engine::nll_forced`] armed an accumulator), then return the token the
+    /// decode should CONSUME — the forced one where a force list covers this position, the
+    /// engine's own otherwise (a short list forces a prefix and free-runs the rest, which
+    /// the arming log line states). A no-op returning `own` when the trace is not armed, so
+    /// the stock decode path is untouched even in a `teacher-forcing` build.
     #[cfg(feature = "teacher-forcing")]
     fn trace_step(&mut self, own: u32) -> Result<u32> {
         use std::io::Write;
@@ -2552,23 +2573,74 @@ impl V4Engine {
         }
         // The full-row D2H is the instrument's price (~vocab * 4 B per token, blocking) and
         // is exactly why this sits behind the feature: `read_prefix` joins the device, so a
-        // wall measured through it is the instrument's, not the decode's.
+        // wall measured through it is the instrument's, not the decode's. `as_le_bytes`
+        // reinterprets rather than re-encodes — both `--logit-dump`'s file and `--ppl`'s
+        // `eval::nll_of` want the same LE row, so there is one conversion, not two.
         let row = read_prefix(&self.logits, self.cfg.vocab)?;
-        let tr = self.logit_trace.as_mut().expect("checked above");
-        tr.out.write_all(&own.to_le_bytes())?;
-        let mut bytes = Vec::with_capacity(row.len() * 4);
-        for v in &row {
-            bytes.extend_from_slice(&v.to_le_bytes());
+        let row_le = as_le_bytes(&row);
+        let tr = self
+            .logit_trace
+            .as_mut()
+            .context("trace_step: logit_trace was Some just above")?;
+        // The token about to be forced IS the corpus's true next token whenever
+        // `nll_forced` armed this trace (it built `force` from the corpus itself) — so
+        // scoring against `next` needs no second, separate target list.
+        let next = tr.force.as_ref().and_then(|f| f.get(tr.pos)).copied();
+        if let (Some(nlls), Some(target)) = (tr.nlls.as_mut(), next) {
+            nlls.push(crate::eval::nll_of(row_le, target as usize)?);
         }
-        tr.out.write_all(&bytes)?;
-        let next = tr
-            .force
-            .as_ref()
-            .and_then(|f| f.get(tr.pos))
-            .copied()
-            .unwrap_or(own);
+        if let Some(out) = tr.out.as_mut() {
+            out.write_all(&own.to_le_bytes())?;
+            out.write_all(row_le)?;
+        }
         tr.pos += 1;
-        Ok(next)
+        Ok(next.unwrap_or(own))
+    }
+
+    /// `--ppl`, on a V4 artifact — teacher-forces `corpus` through `generate`'s free-run loop
+    /// via the SAME force hook `--force-tokens` uses, rather than a second bespoke forward
+    /// loop. That reuse is not a style preference: `forward` only ever produces logits for
+    /// the LAST row of whatever slice it is given (`head_tail` slices `m - 1`), so a
+    /// batched multi-token forward cannot score every position — the per-token forward loop
+    /// this needs already exists here, as `generate`'s decode arm.
+    ///
+    /// `corpus[0]` is context only (the prefill), `corpus[1..]` is both what gets forced AND
+    /// what each position is scored against — the same split `GpuEngine::nll_forced` uses
+    /// for GLM. Concretely: prefill on `corpus[..1]` produces the logits that predict
+    /// `corpus[1]`; `trace_step` scores those logits against `force[0] == corpus[1]` and
+    /// forces `corpus[1]`; the loop's first `forward` call then runs on `corpus[1]` at
+    /// position 1, whose resulting logits predict `corpus[2]`, scored against `force[1] ==
+    /// corpus[2]`; and so on. `max_new = corpus.len() - 1` stops `generate` right after the
+    /// last forced token is pushed, so `corpus[corpus.len() - 1]` is never itself forwarded
+    /// — there is no `corpus[corpus.len()]` to score it against, so GLM's twin forwards it
+    /// too and simply discards the result; this skips that wasted pass.
+    ///
+    /// `eos` is passed empty, not the tokenizer's real EOS set: a corpus token that happens
+    /// to collide with an EOS id must still be forced and scored, not treated as an early
+    /// stop. `nll_forced`'s GLM twin has no EOS check at all — this matches that by
+    /// construction rather than by adding one.
+    #[cfg(feature = "teacher-forcing")]
+    pub fn nll_forced(
+        &mut self,
+        corpus: &[u32],
+        on_tok: &mut dyn FnMut(u32) -> bool,
+    ) -> Result<Vec<f32>> {
+        ensure!(
+            corpus.len() >= 2,
+            "a V4 --ppl corpus needs at least 2 tokens: one for context, one to score"
+        );
+        self.logit_trace = Some(LogitTrace {
+            out: None,
+            force: Some(corpus[1..].to_vec()),
+            pos: 0,
+            nlls: Some(Vec::with_capacity(corpus.len() - 1)),
+        });
+        self.generate(&corpus[..1], corpus.len() - 1, &[], on_tok)?;
+        let tr = self.logit_trace.take().context(
+            "nll_forced: logit_trace was armed just above, and generate does not clear it",
+        )?;
+        tr.nlls
+            .context("nll_forced: logit_trace was armed with Some(nlls) just above")
     }
 
     /// The next token to consume: the device argmax, through the trace hook when a
@@ -2635,11 +2707,16 @@ impl V4Engine {
         }
         #[cfg(feature = "teacher-forcing")]
         if let Some(tr) = self.logit_trace.as_mut() {
-            use std::io::Write;
-            // A BufWriter flushes on drop but swallows the error there; a truncated dump
-            // read as "no drift past position N" is exactly the silent kind this
-            // instrument exists to rule out.
-            tr.out.flush()?;
+            // `--ppl` (`nll_forced`) arms this trace with `out: None` — nothing to flush,
+            // and `nll_forced` reads `nlls` back out of the same struct once `generate`
+            // returns.
+            if let Some(out) = tr.out.as_mut() {
+                use std::io::Write;
+                // A BufWriter flushes on drop but swallows the error there; a truncated
+                // dump read as "no drift past position N" is exactly the silent kind this
+                // instrument exists to rule out.
+                out.flush()?;
+            }
         }
         let (hits, misses) = (self.pin.routed.hits(), self.pin.routed.misses());
         let (dh, dm) = (hits - self.hits0, misses - self.misses0);

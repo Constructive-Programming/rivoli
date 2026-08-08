@@ -68,8 +68,10 @@ clap = { version = "4", default-features = false, features = [
 safetensors = { version = "0.8.0", default-features = false, features = ["alloc"] }
 
 [features]
-# Teacher-forced scoring — GLM's `--ppl` (`src/eval.rs`) and, since §M9, V4's
-# `--logit-dump`/`--force-tokens` (`v4gpu::V4Engine::arm_logit_trace`): the same class of
+# Teacher-forced scoring — `--ppl` (`src/eval.rs`), which since 2026-08-08 scores EITHER
+# architecture (`GpuEngine::nll_forced` for GLM, `V4Engine::nll_forced` for V4 — the latter
+# rides the same hook as V4's own `--logit-dump`/`--force-tokens`
+# (`v4gpu::V4Engine::arm_logit_trace`), added at §M9). All of it is the same class of
 # instrument (a forced decode scored per position, blocking D2H on the decode path), so it
 # shares the feature rather than doubling `tests/feature-matrix.sh`'s powerset. Off by
 # default: quality INSTRUMENTS, not part of decoding.

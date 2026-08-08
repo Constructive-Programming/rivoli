@@ -137,8 +137,22 @@ struct Args {
     /// instead of generating. The quality instrument for any change that CAN move output
     /// (a format or a kernel); never a free-running decode. Cache changes no longer need it
     /// — routing is residency-blind, so they are output-neutral by construction.
+    ///
+    /// Works on BOTH architectures since 2026-08-08. GLM scores it through
+    /// `GpuEngine::nll_forced`'s own forward loop (`src/eval.rs::run`); a V4 artifact scores
+    /// it through `V4Engine::nll_forced`, which reuses `generate`'s free-run loop and the
+    /// same force hook `--logit-dump`/`--force-tokens` use, rather than a second bespoke
+    /// scoring loop — see that method's doc for why V4 had no per-token forward to
+    /// duplicate in the first place. `conflicts_with_all` below because both a V4 `--ppl`
+    /// run and a V4 `--logit-dump` run arm the SAME `logit_trace` field: running both would
+    /// silently clobber whichever armed second.
     #[cfg(feature = "teacher-forcing")]
-    #[arg(long, value_name = "TEXT_FILE", requires = "ppl_out")]
+    #[arg(
+        long,
+        value_name = "TEXT_FILE",
+        requires = "ppl_out",
+        conflicts_with_all = ["logit_dump", "force_tokens"]
+    )]
     ppl: Option<String>,
 
     /// Where `--ppl` writes its per-token NLLs.
@@ -151,7 +165,14 @@ struct Args {
     /// (docs/investigations/v4-decode-decomposition.md). Format at
     /// `V4Engine::arm_logit_trace`; read by docs/measurement/probes/v4_logit_drift.py.
     /// Adds a blocking vocab-sized D2H per token, so no wall from a run carrying it is a
-    /// benchmark. Under `teacher-forcing` because it is V4's `--ppl`-class instrument.
+    /// benchmark.
+    ///
+    /// A DIFFERENT question from `--ppl`, and not replaced by it: this is a differential
+    /// A/B between two BUILDS on a free-running decode (argmax flips, max |Δlogit|), where
+    /// `--ppl` is corpus perplexity under teacher forcing. Under `teacher-forcing` because
+    /// both are instruments on the same per-token logit row, not because they answer the
+    /// same question — see `V4Engine::nll_forced` for how `--ppl` now reuses this same
+    /// `logit_trace` hook for its own, unrelated purpose.
     #[cfg(feature = "teacher-forcing")]
     #[arg(long, value_name = "PATH")]
     logit_dump: Option<String>,
@@ -612,6 +633,13 @@ struct V4Instr {
     logit_dump: Option<String>,
     #[cfg(feature = "teacher-forcing")]
     force_tokens: Option<String>,
+    /// `--ppl` / `--ppl-out`. Clap's `conflicts_with_all` on `Args::ppl` already refuses a
+    /// run that also sets `logit_dump`/`force_tokens` — both arm the one `logit_trace`
+    /// field — so `run_v4` does not need to re-check that here.
+    #[cfg(feature = "teacher-forcing")]
+    ppl: Option<String>,
+    #[cfg(feature = "teacher-forcing")]
+    ppl_out: Option<String>,
 }
 
 #[cfg(feature = "rocm")]
@@ -688,16 +716,43 @@ fn run_v4(
             arch.name()
         );
     }
-    let ngen = cfg
-        .bench
-        .context("nothing to do: pass -bench <tokens> to decode")?;
+    let tok = rivoli::artifact::tokenizer::Tokenizer::load(&cfg.model)?;
+    // `--ppl` scores a fixed corpus instead of decoding, so `-bench` is meaningless there —
+    // the same split GLM's `main` makes for its own `ppl_ids`. Loaded here, before `ngen` and
+    // before the pin is built, because `V4Engine::new`'s sizing below has to know which of the
+    // two runs this is.
+    #[cfg(feature = "teacher-forcing")]
+    let ppl_ids: Option<Vec<u32>> = match &instr.ppl {
+        Some(path) => {
+            let ids = rivoli::eval::load_corpus(path, &tok)?;
+            // Checked here, before the pin/engine below size themselves off `ids.len() - 1`
+            // (see that computation's comment) — an underflow there would be a panic with no
+            // token count in it, for a failure `V4Engine::nll_forced` would refuse anyway.
+            anyhow::ensure!(
+                ids.len() >= 2,
+                "--ppl corpus {path:?} tokenizes to {} token(s); need at least 2 to score a \
+                 prediction",
+                ids.len()
+            );
+            Some(ids)
+        }
+        None => None,
+    };
+    #[cfg(not(feature = "teacher-forcing"))]
+    let ppl_ids: Option<Vec<u32>> = None;
+    let ngen = match ppl_ids.is_some() {
+        true => 0,
+        false => cfg.bench.context(
+            "nothing to do: pass -bench <tokens> to decode, or --ppl <text> --ppl-out <path> \
+             to score",
+        )?,
+    };
     // NOTE for anyone comparing against a V4 figure recorded before 2026-08-06: with the chat
     // framing below, EOS is REACHABLE for the first time, so `-bench N` may now return fewer
     // than N tokens where it always ran to the budget. tok/s divides by the tokens actually
     // produced, so the rate stays comparable — the token count does not, and neither does the
     // text, which was measured off-template.
 
-    let tok = rivoli::artifact::tokenizer::Tokenizer::load(&cfg.model)?;
     let bench_prompt = cfg.prompt.as_deref().unwrap_or("The sky is blue because");
     // CHAT-FRAMED. This was raw until 2026-08-06 and that was the whole of the "V4 repeats
     // itself and never stops" defect: raw text puts the model outside any assistant turn, where
@@ -734,7 +789,22 @@ fn run_v4(
         cfg.trace.as_deref(),
     )?;
     info!("v4 pin built in {:.1}s", t.elapsed().as_secs_f64());
-    let mut engine = rivoli::v4gpu::V4Engine::new(pin, v4, prompt_ids.len(), ngen)?;
+    // Sizing differs for the two runs this can be. The free-run path needs `max_m` to cover
+    // the widest single `forward` call, which is the whole chat prompt (prefill is ONE call
+    // over it). `V4Engine::nll_forced` never calls `forward` with more than one token at a
+    // time — even its own "prefill" is `ids[..1]` (see that method's doc for why one-at-a-time
+    // is not a shortcut here, it is what `generate`'s existing loop already does) — so scoring
+    // needs `max_m` of only 1, and needs `max_ctx` to cover the CORPUS rather than the unused
+    // chat prompt: `ids.len() + 1`, matching the `(Some(ids), _) => ids.len() + 1` GLM's `main`
+    // already uses for the same reason. Getting this wrong is silent: `max_ctx` undersized to
+    // the chat prompt's ~17 tokens would only surface as an `ensure!` failure deep in
+    // `forward` once the corpus walk outran it, on whatever corpus a caller happened to size
+    // large enough to reach that position.
+    let (size_prompt_len, size_ngen) = match &ppl_ids {
+        Some(ids) => (1, ids.len() - 1),
+        None => (prompt_ids.len(), ngen),
+    };
+    let mut engine = rivoli::v4gpu::V4Engine::new(pin, v4, size_prompt_len, size_ngen)?;
     #[cfg(feature = "teacher-forcing")]
     if let Some(path) = &instr.logit_dump {
         // `--force-tokens` without `--logit-dump` is refused by clap (`requires`), so the
@@ -782,6 +852,32 @@ fn run_v4(
     let hb = rivoli::watchdog::spawn(std::time::Duration::from_secs(watchdog_secs))?;
     #[cfg(not(feature = "trace"))]
     let hb = rivoli::watchdog::inert();
+    // --- `--ppl` on a V4 artifact: teacher-forced quality gate, not a decode -------------
+    // Same shape as the GLM branch (`src/main.rs`'s other `rivoli::eval::run` call): return
+    // before the free-running `generate` below, because the two are mutually exclusive by
+    // design. `V4Engine::nll_forced` does the scoring; `rivoli::eval::run_v4` is the same
+    // log-and-write tail `rivoli::eval::run` uses for GLM, so the two `.nll` files this
+    // engine can produce are byte-for-byte the same format regardless of which architecture
+    // wrote them.
+    #[cfg(feature = "teacher-forcing")]
+    if let Some(ids) = ppl_ids {
+        // `bin/ppl` names a cell with `split_whitespace().take(3)`; there is no format or
+        // gain knob on this path (`--mode`/`--moe-gain` either refuse or are unread for a
+        // V4 artifact — see the checks above), so `cache_policy` is the one field that can
+        // actually distinguish two V4 `--ppl` cells from each other.
+        let label = format!("arch=v4 policy={}", cfg.cache_policy);
+        rivoli::eval::run_v4(
+            &mut engine,
+            &ids,
+            instr.ppl_out.as_ref(),
+            &label,
+            &mut |_: u32| {
+                hb.beat();
+                true
+            },
+        )?;
+        return Ok(());
+    }
     let ids = engine.generate(&prompt_ids, ngen, &tok.eos, &mut |_: u32| {
         hb.beat();
         true
@@ -890,6 +986,10 @@ fn main() -> Result<()> {
                 logit_dump: a.logit_dump.clone(),
                 #[cfg(feature = "teacher-forcing")]
                 force_tokens: a.force_tokens.clone(),
+                #[cfg(feature = "teacher-forcing")]
+                ppl: a.ppl.clone(),
+                #[cfg(feature = "teacher-forcing")]
+                ppl_out: a.ppl_out.clone(),
             };
             // Two calls rather than one with a cfg'd argument: `#[cfg]` on a call ARGUMENT is
             // not stable (it needs `stmt_expr_attributes`), only on a formal parameter. The
@@ -902,13 +1002,15 @@ fn main() -> Result<()> {
         }
     }
     // The V4-only instruments, refused rather than ignored on the GLM path — a flag that
-    // silently does nothing is this repo's named failure shape. GLM's quality instrument
-    // is `--ppl`.
+    // silently does nothing is this repo's named failure shape. `--ppl` is NOT in this
+    // list: since 2026-08-08 it works on both architectures (`V4Engine::nll_forced`), so a
+    // GLM artifact falls through to the ordinary `--ppl` handling below instead of being
+    // refused here.
     #[cfg(feature = "teacher-forcing")]
     if a.logit_dump.is_some() || a.force_tokens.is_some() {
         bail!(
             "--logit-dump/--force-tokens are V4-only instruments; this artifact is GLM. \
-             The GLM quality instrument is --ppl."
+             Use --ppl for a quality gate on either architecture."
         );
     }
 
