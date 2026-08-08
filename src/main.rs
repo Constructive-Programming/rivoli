@@ -143,9 +143,11 @@ struct Args {
     /// it through `V4Engine::nll_forced`, which reuses `generate`'s free-run loop and the
     /// same force hook `--logit-dump`/`--force-tokens` use, rather than a second bespoke
     /// scoring loop — see that method's doc for why V4 had no per-token forward to
-    /// duplicate in the first place. `conflicts_with_all` below because both a V4 `--ppl`
-    /// run and a V4 `--logit-dump` run arm the SAME `logit_trace` field: running both would
-    /// silently clobber whichever armed second.
+    /// duplicate in the first place. `conflicts_with_all` below because on V4 both a
+    /// `--ppl` run and a `--logit-dump` run arm the SAME `logit_trace` field — running both
+    /// would silently clobber whichever armed second — and on GLM the two are simply two
+    /// instruments asking for one run (scoring returns before the dump's decode would
+    /// start); one uniform refusal covers both readings.
     #[cfg(feature = "teacher-forcing")]
     #[arg(
         long,
@@ -160,26 +162,30 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     ppl_out: Option<String>,
 
-    /// V4 only: dump every decode position's full logit row (plus the engine's own argmax)
-    /// to PATH — the drift instrument for §M9's split-k quality A/B
-    /// (docs/investigations/v4-decode-decomposition.md). Format at
-    /// `V4Engine::arm_logit_trace`; read by docs/measurement/probes/v4_logit_drift.py.
-    /// Adds a blocking vocab-sized D2H per token, so no wall from a run carrying it is a
-    /// benchmark.
+    /// Dump every decode position's full logit row (plus the engine's own argmax) to PATH
+    /// — the drift instrument for build-vs-build quality A/Bs, born as §M9's split-k gate
+    /// (docs/investigations/v4-decode-decomposition.md), on BOTH architectures since
+    /// 2026-08-08 (V4-only before). Format at `eval::LogitTrace::for_dump`; read by
+    /// docs/measurement/probes/v4_logit_drift.py. Adds a blocking vocab-sized D2H per
+    /// token, so no wall from a run carrying it is a benchmark. On a GLM artifact it
+    /// additionally REQUIRES `--no-mtp`: a verify pass emits up to two tokens per
+    /// iteration, which would silently break the per-position comparability this exists
+    /// for. `conflicts_with = "port"`: it is a `-bench` instrument, and a server decode
+    /// has no single positional stream to dump.
     ///
     /// A DIFFERENT question from `--ppl`, and not replaced by it: this is a differential
     /// A/B between two BUILDS on a free-running decode (argmax flips, max |Δlogit|), where
     /// `--ppl` is corpus perplexity under teacher forcing. Under `teacher-forcing` because
     /// both are instruments on the same per-token logit row, not because they answer the
-    /// same question — see `V4Engine::nll_forced` for how `--ppl` now reuses this same
+    /// same question — see `V4Engine::nll_forced` for how `--ppl` reuses this same
     /// `logit_trace` hook for its own, unrelated purpose.
     #[cfg(feature = "teacher-forcing")]
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", conflicts_with = "port")]
     logit_dump: Option<String>,
 
-    /// V4 only, requires --logit-dump: teacher-force the decode to CONSUME these tokens
-    /// (text file, one id per line — e.g. the argmax column of a previous --logit-dump)
-    /// while recording what the engine would have chosen. Two arms forced on one file are
+    /// Requires --logit-dump: teacher-force the decode to CONSUME these tokens (text file,
+    /// one id per line — e.g. the argmax column of a previous --logit-dump) while
+    /// recording what the engine would have chosen. Two arms forced on one file are
     /// positionally comparable at every position, which is what lets an A/B count argmax
     /// flips over all 512 rather than up to the first divergence. A short file forces a
     /// prefix and free-runs the rest.
@@ -602,6 +608,27 @@ fn device_budget(max_mem: Option<u64>) -> Result<usize> {
     })
 }
 
+/// Load `--force-tokens` (when given) and print the one arming line both engines share —
+/// the parse itself is `eval::load_force_tokens` (refused loudly on any bad line). The
+/// engine-specific `arm_logit_trace` call stays at each site because the two engines share
+/// no type; everything engine-independent about arming is here, once.
+#[cfg(all(feature = "rocm", feature = "teacher-forcing"))]
+fn force_list_for(dump: &str, force_path: Option<&str>) -> Result<Option<Vec<u32>>> {
+    let force = force_path
+        .map(rivoli::eval::load_force_tokens)
+        .transpose()?;
+    info!(
+        "logit trace armed: dump {dump}, forcing {} token(s){}",
+        force.as_ref().map_or(0, Vec::len),
+        if force.is_some() {
+            " (positions past the list free-run)"
+        } else {
+            " (free-running)"
+        }
+    );
+    Ok(force)
+}
+
 /// The DeepSeek-V4-Flash decode, which shares no engine type with GLM's.
 ///
 /// A separate function rather than a `match` arm inside `main` because it forks BEFORE
@@ -622,10 +649,11 @@ fn device_budget(max_mem: Option<u64>) -> Result<usize> {
 /// `attn`/`port`/`no_mtp` are passed individually rather than as `&Args`: `Config` takes
 /// ownership of four of `Args`' `String`s just above the dispatch, so `&a` is not borrowable
 /// there. The three are differently typed, so none is substitutable for another.
-/// The V4-only instrument flags, bundled so `run_v4`'s signature does not multiply cfg'd
-/// parameters (see the dispatch site). Empty — and `Default`-constructible — without
-/// `teacher-forcing`. Gated like its only consumer, `run_v4`, so a backend-less build
-/// does not carry a never-constructed struct.
+/// The instrument flags `run_v4` consumes (V4-only until 2026-08-08, now shared with the
+/// GLM branch, which reads them off `Args` directly), bundled so `run_v4`'s signature does
+/// not multiply cfg'd parameters (see the dispatch site). Empty — and
+/// `Default`-constructible — without `teacher-forcing`. Gated like its only consumer,
+/// `run_v4`, so a backend-less build does not carry a never-constructed struct.
 #[cfg(feature = "rocm")]
 #[derive(Default)]
 struct V4Instr {
@@ -807,36 +835,11 @@ fn run_v4(
     let mut engine = rivoli::v4gpu::V4Engine::new(pin, v4, size_prompt_len, size_ngen)?;
     #[cfg(feature = "teacher-forcing")]
     if let Some(path) = &instr.logit_dump {
-        // `--force-tokens` without `--logit-dump` is refused by clap (`requires`), so the
-        // one shape left to guard is a force file that fails to parse — refused loudly
-        // rather than truncated to its valid prefix, because a silently-shortened force
-        // list turns a positionally-comparable A/B into a free-running one at some
-        // position nobody chose.
-        let force = instr
-            .force_tokens
-            .as_deref()
-            .map(|p| -> Result<Vec<u32>> {
-                std::fs::read_to_string(p)?
-                    .lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty())
-                    .map(|l| {
-                        l.parse::<u32>()
-                            .map_err(|e| anyhow::anyhow!("--force-tokens {p}: {l:?}: {e}"))
-                    })
-                    .collect()
-            })
-            .transpose()?;
-        info!(
-            "logit trace armed: dump {path}, forcing {} token(s){}",
-            force.as_ref().map_or(0, Vec::len),
-            if force.is_some() {
-                " (positions past the list free-run)"
-            } else {
-                " (free-running)"
-            }
-        );
-        engine.arm_logit_trace(std::path::Path::new(path), force)?;
+        // No `--no-mtp` requirement here, unlike the GLM branch: this decode is
+        // structurally single-row (the fp4 MoE kernel refuses nrow != 1, see the startup
+        // message above), so there is no speculative pass to break comparability.
+        let force = force_list_for(path, instr.force_tokens.as_deref())?;
+        engine.arm_logit_trace(path, force)?;
     }
     #[cfg(not(feature = "teacher-forcing"))]
     let V4Instr {} = instr; // consume the empty bundle so the parameter is not unused
@@ -1001,16 +1004,23 @@ fn main() -> Result<()> {
             return run_v4(&cfg, &a.attn, a.port, a.no_mtp, instr);
         }
     }
-    // The V4-only instruments, refused rather than ignored on the GLM path — a flag that
-    // silently does nothing is this repo's named failure shape. `--ppl` is NOT in this
-    // list: since 2026-08-08 it works on both architectures (`V4Engine::nll_forced`), so a
-    // GLM artifact falls through to the ordinary `--ppl` handling below instead of being
-    // refused here.
+    // (Until 2026-08-08 a bail! here refused --logit-dump/--force-tokens as "V4-only
+    // instruments" — both now work on a GLM artifact too, armed further down once the
+    // engine exists.) What IS still refused here, at the door rather than after the
+    // minutes-long pin build below: `--logit-dump` without an explicit `--no-mtp`. The
+    // refusal reads the FLAG, not the resolved `mtp` — that is also false when the
+    // artifact merely lacks a head or `--trace` is on, and a dump recorded under
+    // "speculation happened to be off" stops being reproducible the day the artifact
+    // gains a head. Requiring the flag keeps the recorded command line self-sufficient;
+    // docs/measurement/benchmarks.md replays command lines, not machine states.
+    // `gpu.rs::generate` carries the structural twin (armed + mtp bails), so bypassing
+    // this is a caller bug, not a silent downgrade.
     #[cfg(feature = "teacher-forcing")]
-    if a.logit_dump.is_some() || a.force_tokens.is_some() {
+    if a.logit_dump.is_some() && !a.no_mtp {
         bail!(
-            "--logit-dump/--force-tokens are V4-only instruments; this artifact is GLM. \
-             Use --ppl for a quality gate on either architecture."
+            "--logit-dump on a GLM artifact requires --no-mtp: a verify pass emits up to \
+             two tokens per iteration, which silently breaks the per-position \
+             comparability the dump exists for"
         );
     }
 
@@ -1274,6 +1284,15 @@ fn main() -> Result<()> {
             );
             rivoli::eval::run(&mut engine, &ids, a.ppl_out.as_ref(), &label)?;
             return Ok(());
+        }
+
+        // --- `--logit-dump` / `--force-tokens` on a GLM artifact (V4-only until
+        // 2026-08-08) — the build-vs-build drift instrument, not a quality gate; `--ppl`
+        // above remains that. The `--no-mtp` requirement was already enforced at the
+        // door, before the pin build (see the check beside the arch dispatch).
+        #[cfg(feature = "teacher-forcing")]
+        if let Some(path) = &a.logit_dump {
+            engine.arm_logit_trace(path, force_list_for(path, a.force_tokens.as_deref())?)?;
         }
 
         let t0 = std::time::Instant::now();

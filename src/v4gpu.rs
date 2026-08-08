@@ -792,30 +792,6 @@ fn ev_span_ns(a: &Event, b: &Event, what: &str) -> Result<u128> {
 ///
 /// Every device buffer is allocated once in [`V4Engine::new`] and none per token, which is
 /// `gpu.rs`'s rule and why a decode does not allocate on the hot path.
-/// State behind TWO constructors — [`V4Engine::arm_logit_trace`] (`--logit-dump`, see that
-/// method for the file format) and [`V4Engine::nll_forced`] (`--ppl`) — with `trace_step`
-/// owning the one forcing rule both share.
-#[cfg(feature = "teacher-forcing")]
-struct LogitTrace {
-    /// `--logit-dump`'s `.lt` file. `None` when [`V4Engine::nll_forced`] armed this trace
-    /// for `--ppl` instead — that instrument has no file of its own, it scores the SAME
-    /// per-position row `trace_step` already reads and writes nothing to disk (`eval::run_v4`
-    /// writes the one `.nll` file, and it writes THAT after `generate` returns, not per step).
-    out: Option<std::io::BufWriter<std::fs::File>>,
-    /// Token to CONSUME at each recorded position, replacing the engine's own argmax —
-    /// arm K of a drift A/B forces arm S's recorded stream so every position stays
-    /// comparable instead of only the prefix before the first divergence. `--ppl` forces
-    /// the corpus itself (`ids[1..]`), so the same field is also the list `--ppl` is scored
-    /// against: `trace_step` never needs a second, separate target array.
-    force: Option<Vec<u32>>,
-    pos: usize,
-    /// `--ppl`'s accumulator: `Some` exactly when [`V4Engine::nll_forced`] armed this trace,
-    /// growing by one NLL per recorded position. This is the "third scoring loop" a `--ppl`
-    /// on V4 would otherwise need — instead it rides `trace_step`, which already reads the
-    /// row `--logit-dump` would have dumped.
-    nlls: Option<Vec<f32>>,
-}
-
 pub struct V4Engine {
     pin: V4Pin,
     cfg: V4Config,
@@ -920,9 +896,11 @@ pub struct V4Engine {
     /// nothing per step, just accumulates NLLs). Both are teacher-forced quality
     /// instruments that put a per-token vocab-sized D2H on the decode path (`trace_step`),
     /// so a tok/s from a build that could even ARM either means nothing — that shared cost
-    /// is why they share this one field rather than each carrying their own.
+    /// is why they share this one field rather than each carrying their own. The state and
+    /// the forcing/format rules live in [`crate::eval::LogitTrace`], shared with GLM's
+    /// engine since 2026-08-08.
     #[cfg(feature = "teacher-forcing")]
-    logit_trace: Option<LogitTrace>,
+    logit_trace: Option<crate::eval::LogitTrace>,
 
     compute_stream: Stream,
     miss_stream: Stream,
@@ -2530,71 +2508,43 @@ impl V4Engine {
     }
 
     /// Arm the per-position logit trace (and optionally teacher-force the decode) — §M9's
-    /// quality instrument, `--logit-dump`/`--force-tokens` in `main`.
+    /// quality instrument, `--logit-dump`/`--force-tokens` in `main`. State, forcing rule
+    /// and the dump byte format all live in [`crate::eval::LogitTrace`] (shared with GLM's
+    /// engine since 2026-08-08); this method contributes only V4's vocab.
     ///
-    /// File format, written here and read by
-    /// `docs/measurement/probes/v4_logit_drift.py`: `b"V4LT"`, vocab as u32 LE, then per
-    /// decode position: the engine's OWN argmax as u32 LE followed by all `vocab` logits
-    /// as f32 LE. The recorded argmax is the engine's own choice GIVEN the (possibly
-    /// forced) history — under forcing that is exactly the per-position statistic the
-    /// drift gates count, and two arms forced on the same token file are positionally
-    /// comparable for all 512 positions rather than only up to the first divergence.
+    /// The recorded argmax is the engine's own choice GIVEN the (possibly forced) history —
+    /// under forcing that is exactly the per-position statistic the drift gates count, and
+    /// two arms forced on the same token file are positionally comparable for all 512
+    /// positions rather than only up to the first divergence.
     #[cfg(feature = "teacher-forcing")]
-    pub fn arm_logit_trace(
-        &mut self,
-        path: &std::path::Path,
-        force: Option<Vec<u32>>,
-    ) -> Result<()> {
-        use std::io::Write;
-        let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
-        out.write_all(b"V4LT")?;
-        out.write_all(&u32::try_from(self.cfg.vocab)?.to_le_bytes())?;
-        self.logit_trace = Some(LogitTrace {
-            out: Some(out),
+    pub fn arm_logit_trace(&mut self, path: &str, force: Option<Vec<u32>>) -> Result<()> {
+        self.logit_trace = Some(crate::eval::LogitTrace::for_dump(
+            path,
+            self.cfg.vocab,
             force,
-            pos: 0,
-            nlls: None,
-        });
+        )?);
         Ok(())
     }
 
-    /// One trace step: record the engine's own argmax and the full logit row (when
-    /// `--logit-dump` armed a file), score the row against the token about to be forced
-    /// (when [`V4Engine::nll_forced`] armed an accumulator), then return the token the
-    /// decode should CONSUME — the forced one where a force list covers this position, the
-    /// engine's own otherwise (a short list forces a prefix and free-runs the rest, which
-    /// the arming log line states). A no-op returning `own` when the trace is not armed, so
+    /// One trace step: read this position's logit row off the device and hand it to
+    /// [`crate::eval::LogitTrace::step`], which records/scores it and returns the token
+    /// the decode should CONSUME. A no-op returning `own` when the trace is not armed, so
     /// the stock decode path is untouched even in a `teacher-forcing` build.
     #[cfg(feature = "teacher-forcing")]
     fn trace_step(&mut self, own: u32) -> Result<u32> {
-        use std::io::Write;
         if self.logit_trace.is_none() {
             return Ok(own);
         }
         // The full-row D2H is the instrument's price (~vocab * 4 B per token, blocking) and
         // is exactly why this sits behind the feature: `read_prefix` joins the device, so a
         // wall measured through it is the instrument's, not the decode's. `as_le_bytes`
-        // reinterprets rather than re-encodes — both `--logit-dump`'s file and `--ppl`'s
-        // `eval::nll_of` want the same LE row, so there is one conversion, not two.
+        // reinterprets rather than re-encodes — the dump file and `eval::nll_of` want the
+        // same LE row, so there is one conversion, not two.
         let row = read_prefix(&self.logits, self.cfg.vocab)?;
-        let row_le = as_le_bytes(&row);
-        let tr = self
-            .logit_trace
+        self.logit_trace
             .as_mut()
-            .context("trace_step: logit_trace was Some just above")?;
-        // The token about to be forced IS the corpus's true next token whenever
-        // `nll_forced` armed this trace (it built `force` from the corpus itself) — so
-        // scoring against `next` needs no second, separate target list.
-        let next = tr.force.as_ref().and_then(|f| f.get(tr.pos)).copied();
-        if let (Some(nlls), Some(target)) = (tr.nlls.as_mut(), next) {
-            nlls.push(crate::eval::nll_of(row_le, target as usize)?);
-        }
-        if let Some(out) = tr.out.as_mut() {
-            out.write_all(&own.to_le_bytes())?;
-            out.write_all(row_le)?;
-        }
-        tr.pos += 1;
-        Ok(next.unwrap_or(own))
+            .context("trace_step: logit_trace was Some just above")?
+            .step(own, as_le_bytes(&row))
     }
 
     /// `--ppl`, on a V4 artifact — teacher-forces `corpus` through `generate`'s free-run loop
@@ -2629,18 +2579,14 @@ impl V4Engine {
             corpus.len() >= 2,
             "a V4 --ppl corpus needs at least 2 tokens: one for context, one to score"
         );
-        self.logit_trace = Some(LogitTrace {
-            out: None,
-            force: Some(corpus[1..].to_vec()),
-            pos: 0,
-            nlls: Some(Vec::with_capacity(corpus.len() - 1)),
-        });
+        self.logit_trace = Some(crate::eval::LogitTrace::for_scoring(corpus));
         self.generate(&corpus[..1], corpus.len() - 1, &[], on_tok)?;
-        let tr = self.logit_trace.take().context(
-            "nll_forced: logit_trace was armed just above, and generate does not clear it",
-        )?;
-        tr.nlls
-            .context("nll_forced: logit_trace was armed with Some(nlls) just above")
+        self.logit_trace
+            .take()
+            .context(
+                "nll_forced: logit_trace was armed just above, and generate does not clear it",
+            )?
+            .into_nlls()
     }
 
     /// The next token to consume: the device argmax, through the trace hook when a
@@ -2705,18 +2651,11 @@ impl V4Engine {
             cur = self.next_token()?;
             pos += 1;
         }
+        // Flush any armed dump before returning (a scoring trace flushes nothing; see
+        // `eval::LogitTrace::flush` for why the drop path is not trusted with this).
         #[cfg(feature = "teacher-forcing")]
         if let Some(tr) = self.logit_trace.as_mut() {
-            // `--ppl` (`nll_forced`) arms this trace with `out: None` — nothing to flush,
-            // and `nll_forced` reads `nlls` back out of the same struct once `generate`
-            // returns.
-            if let Some(out) = tr.out.as_mut() {
-                use std::io::Write;
-                // A BufWriter flushes on drop but swallows the error there; a truncated
-                // dump read as "no drift past position N" is exactly the silent kind this
-                // instrument exists to rule out.
-                out.flush()?;
-            }
+            tr.flush()?;
         }
         let (hits, misses) = (self.pin.routed.hits(), self.pin.routed.misses());
         let (dh, dm) = (hits - self.hits0, misses - self.misses0);

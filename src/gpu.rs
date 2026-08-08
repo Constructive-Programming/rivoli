@@ -680,6 +680,17 @@ pub struct GpuEngine<'a> {
     rc: Vec<DeviceBuf>,
     n_kv_blocks: usize, // kvl / E4M3_BLOCK
     heartbeat: Option<crate::watchdog::Heartbeat>,
+    /// `--logit-dump` / `--force-tokens` on a GLM artifact (V4-only until 2026-08-08),
+    /// armed by [`GpuEngine::arm_logit_trace`], `None` on every stock run. State, forcing
+    /// rule and dump byte format are [`crate::eval::LogitTrace`]'s, shared with
+    /// `V4Engine`. Costs a blocking vocab-sized D2H per emitted token when armed, so no
+    /// run carrying it is a benchmark. REFUSED under speculation — `generate` bails when
+    /// armed with `mtp` — because a verify pass emits up to two tokens per iteration and
+    /// the rows-per-position bookkeeping under acceptance would silently break the
+    /// positional comparability the instrument exists for; `main` names `--no-mtp` in its
+    /// own earlier refusal.
+    #[cfg(feature = "teacher-forcing")]
+    logit_trace: Option<crate::eval::LogitTrace>,
     // Host routing/argmax scratch.
     scores: Vec<f32>,
     choice: Vec<f32>,
@@ -1082,6 +1093,8 @@ impl<'a> GpuEngine<'a> {
             #[cfg(feature = "trace")]
             ck_buf: Vec::new(),
             heartbeat: None,
+            #[cfg(feature = "teacher-forcing")]
+            logit_trace: None,
             pin,
         })
     }
@@ -2848,6 +2861,43 @@ impl<'a> GpuEngine<'a> {
         Ok(self.argmax_rows(1)?[0])
     }
 
+    /// Arm `--logit-dump`/`--force-tokens` on this engine. GLM-side since 2026-08-08
+    /// (V4-only before); everything but the vocab is [`crate::eval::LogitTrace`]'s.
+    /// `generate` refuses to run armed with `mtp` — see the field doc for why the caller
+    /// must pass `--no-mtp` first.
+    #[cfg(feature = "teacher-forcing")]
+    pub fn arm_logit_trace(&mut self, path: &str, force: Option<Vec<u32>>) -> Result<()> {
+        let vocab = self.cfg.vocab;
+        self.logit_trace = Some(crate::eval::LogitTrace::for_dump(path, vocab, force)?);
+        Ok(())
+    }
+
+    /// The next token to consume on the sequential (non-speculative) path: row 0's device
+    /// argmax, through the trace hook when a `teacher-forcing` build has one armed. One
+    /// definition for the post-prefill seed, the plain decode step and the follow-up
+    /// re-seed, so the three sites cannot diverge on whether they record — the same shape
+    /// `V4Engine::next_token` carries. The speculative branches keep raw
+    /// `argmax`/`argmax_rows`: they are unreachable while a trace is armed (`generate`'s
+    /// precondition), and hooking them anyway would imply a rows-per-position semantics
+    /// this instrument deliberately refuses.
+    fn next_token(&mut self) -> Result<u32> {
+        let own = self.argmax()?;
+        #[cfg(feature = "teacher-forcing")]
+        if self.logit_trace.is_some() {
+            // Row 0's vocab-wide prefix is the whole instrument's price: one blocking D2H
+            // per emitted token, which is why an armed build's wall is not a benchmark.
+            let nbytes = self.cfg.vocab * 4;
+            let mut row = Vec::with_capacity(nbytes);
+            self.logits.copy_out_prefix(&mut row, nbytes)?;
+            return self
+                .logit_trace
+                .as_mut()
+                .context("next_token: logit_trace was Some just above")?
+                .step(own, &row);
+        }
+        Ok(own)
+    }
+
     /// Greedy argmax over each of the pass's `n` logit rows — reduced ON DEVICE, so only
     /// [`ARGMAX_BYTES`] come back per pass however many rows it carried. The kernel
     /// reproduces the host fold exactly (strict `>`: ties keep the lowest index, NaN never
@@ -2987,6 +3037,19 @@ impl<'a> GpuEngine<'a> {
             "speculative decode with --trace: a verify pass routes twice per layer and \
              submits the union, which the v2 trace format cannot express"
         );
+        // The structural backstop behind main's `--logit-dump needs --no-mtp` refusal.
+        // UNREACHABLE TODAY — every current caller is closed off (main's door check,
+        // clap's `--port` conflict, `nll_forced`'s own loop) — so this guards the future
+        // caller who arms a trace and calls `generate(mtp=true)` directly. Kept because
+        // that mistake would otherwise fail SILENTLY: a verify pass emits up to TWO
+        // tokens per iteration through `argmax_rows` and the speculative branches never
+        // call the hook, so the dump would come out short with no error anywhere —
+        // per-position comparability broken and nothing to say so.
+        #[cfg(feature = "teacher-forcing")]
+        ensure!(
+            !mtp || self.logit_trace.is_none(),
+            "logit trace armed with speculative decode on: pass --no-mtp"
+        );
         // Same class of refusal, same reason. A v2 trace is "one line per MoE layer" with
         // no token delimiter, so a reader recovers token boundaries from the layer id
         // going back down. Layer-major prefill emits every token's layer 0, then every
@@ -3090,7 +3153,9 @@ impl<'a> GpuEngine<'a> {
             // `cur` is the token AT `pos`, decided but not yet fed through the model;
             // `x` row 0 holds h_{pos-1} and the head's KV is filled through row pos-1.
             // `draft` is the head's prediction for pos+1, made from that same h.
-            let mut cur = self.argmax()?;
+            // `next_token`, not `argmax`: the logit-trace hook (no-op unarmed) lives
+            // there, and the seed is decode position 0 of a dump.
+            let mut cur = self.next_token()?;
             let mut draft = match mtp {
                 true => Some(self.mtp_draft(&[cur], pos).await?),
                 false => None,
@@ -3140,7 +3205,7 @@ impl<'a> GpuEngine<'a> {
                         followups.len(),
                         generated.len()
                     );
-                    cur = self.argmax()?;
+                    cur = self.next_token()?;
                     continue;
                 }
                 if emit(&mut generated, cur) {
@@ -3149,7 +3214,7 @@ impl<'a> GpuEngine<'a> {
                 match draft {
                     None => {
                         self.forward(cur, pos).await?;
-                        cur = self.argmax()?;
+                        cur = self.next_token()?;
                         pos += 1;
                     }
                     // GATED OUT. The head is not confident enough for a verify pass to pay
@@ -3237,6 +3302,12 @@ impl<'a> GpuEngine<'a> {
             }
             Ok::<_, anyhow::Error>((hit0, miss0, fetch0, io0, decode_wall))
         })?;
+        // Flush any armed dump before the profile epilogue (see `eval::LogitTrace::flush`
+        // for why the drop path is not trusted with this).
+        #[cfg(feature = "teacher-forcing")]
+        if let Some(trace) = &mut self.logit_trace {
+            trace.flush()?;
+        }
         self.prof.wall_ns = decode_wall.elapsed().as_nanos();
         self.prof.tokens = generated.len() as u64;
         let bytes_per_expert =

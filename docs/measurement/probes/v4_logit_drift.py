@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Score two `--logit-dump` traces against each other — §M9's drift gates (b) and (d).
 
-The dump format is `V4Engine::arm_logit_trace`'s: `b"V4LT"`, vocab as u32 LE, then per
-decode position a u32 LE (the engine's OWN argmax at that position, given its — possibly
-forced — history) followed by `vocab` f32 LE logits. Two arms teacher-forced on the SAME
-`--force-tokens` file are positionally comparable at every position, which is what lets
-this count argmax flips over all of them instead of up to the first divergence.
+The dump format is defined at `eval::LogitTrace::for_dump` since 2026-08-08 (it was
+`V4Engine::arm_logit_trace`'s, and BOTH architectures now write it — the `V4LT` magic is a
+kept misnomer, see that doc): `b"V4LT"`, vocab as u32 LE, then per decode position a u32 LE
+(the engine's OWN argmax at that position, given its — possibly forced — history) followed
+by `vocab` f32 LE logits. Two arms teacher-forced on the SAME `--force-tokens` file are
+positionally comparable at every position, which is what lets this count argmax flips over
+all of them instead of up to the first divergence.
 
     python3 docs/measurement/probes/v4_logit_drift.py A.lt B.lt          # gate (b)
     python3 docs/measurement/probes/v4_logit_drift.py --tokens A.lt      # emit force file
