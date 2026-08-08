@@ -904,6 +904,179 @@ own band — |Δspan| < 3 ms ⇒ that span replicates before any claim; (3) both
 identities hold as in M6; (4) the record lands in benchmarks.md beside "V4 double
 split".
 
+## M8 — the replicate round + the second-rung reads, STAGED 2026-08-08 (no GPU yet)
+
+M7 left three claims entered at n = 1 and a residue (~9 ms to 100 ms/token) whose top
+lever is a second fp8 rung nobody has read for. This stretch is the owed replicate round
+plus the reads, staged before any lever is built — the M-series has paid four times for
+attacking before instrumenting, and once (M7's wall band) for pricing a rung on the
+previous rung's constant.
+
+**What the replicate round settles (two control decodes at HEAD, no code change; the
+|Δ| < 3 ms rule governs, spreads recorded against the M7 arm-B line):**
+
+- **res > 24: the SERIAL replicate already exists and this section books it** —
+  review-surfaced, not new device time: M7's clean arm S ran the M6-class binary
+  (serial chain) and read res 24.3 against M6's 24.2, |Δ| = 0.1. The M6 conditional is
+  therefore SETTLED at n = 2 serial: **the fp4 re-open stands — resident compute is
+  1.38–1.39× its 17.5 ms of bytes with the shared chain out of the way** (the 88-instr
+  issue rung does not follow, as registered; the question that re-opens is
+  memory-system/geometry, and it is exactly what the microbench below prices). What the
+  HEAD controls test is different and stated as such: does the CONTENDED 27.7-class
+  reading (27.7/17.5 = 1.58×, the overlap's +3.4 included) hold within ±3 run-to-run —
+  overlap stability, not the serial threshold, which a contended control cannot see.
+- **miss < 10** — three points exist, all under the kill: 9.7 (M6), 8.6 (M7 S), 8.9
+  (M7 B). The controls add two; at ≥ 10 replicated, miss exposure outranks the fp8
+  residual. Under it, the kill stays unfired and lever 3 stays dead on the structural
+  grounds below.
+- **sync2 contention** — M7 scored lever 2 on wall because sync2 rose +5.1 (and res
+  +3.4, one cause two instruments). If the controls hold sync2 at 35–36 with res ~27–28,
+  the contention is the steady price of the overlap (accepted: its alternative is the
+  pre-M7 serial chain, measured −8.7 worse net). If sync2 keeps CLIMBING or scatters ±5,
+  the overlap is unstable and lever 2 is to be re-judged on replicate walls.
+
+**The fp8 second-rung read (host, DONE — scratch-tree ISA, `hipcc --offload-arch=gfx1151
+-O3 -fPIC -S`, `build.rs:76`'s flags, tree untouched):**
+
+- **`#pragma unroll 12`/`16` are DEAD, by the emitted ISA:** both compile to the
+  serialized anti-pattern the M7 fix removed — VGPR 26, a full `vmcnt(0)` drain every
+  iteration, no clauses — the backend refuses to hold more than 8 iterations of loads in
+  flight at the default occupancy target, and `amdgpu_waves_per_eu(1,12)` does NOT
+  unlock it (same 26/serialized). The pragma path ends at 8.
+- **A hand pair-step (two dwords per iteration, `#pragma unroll 8` = 16 dwords, 2
+  KB/wave in flight) DOES compile to the wanted shape:** VGPR 104, both loop bodies
+  pipelined (waits counted down, `s_clause`'d loads, no in-body `vmcnt(0)`). Cost: 104
+  VGPR crosses the 96 granule — **12 waves/SIMD, kernel-wide** — so per-SIMD in-flight
+  moves 16×1 KB = 16 KB → 12×2 KB = 24 KB (+50%) while occupancy drops 25%. The probe
+  form guards the deep path on per-lane trips ≥ 16, so k = 1024 — wq_b, the 33.55 MB
+  qkv tensor at exactly 8 trips — keeps the M7 8-deep schedule (but pays the kernel's
+  12 waves; a real lever would split it out as its own kernel to keep 16). Fold order
+  is ascending `j` per lane in BOTH paths — bit-identical by the M5/M7 argument.
+- **LDS x-preload is DEAD at k = 8192:** 32 KB of x + the 1 KB LUT per 256-thread block
+  caps LDS occupancy near ~6 waves/SIMD on the one shape (wo_b) with the most to gain.
+- **A branchless VALU e4m3 decode attacks a non-binding constraint:** the loop is ~30
+  instr/128 B against the 0.84 B/cycle/SIMD streaming needs — ~5× issue headroom. M7's
+  disease was memory-level parallelism, not issue; removing the LDS LUT buys issue.
+- **The dose–response arithmetic that keeps this a probe and not a lever:** M7's own A/B
+  raised per-wave in-flight 8× and bought 1.39× rate (oproj 29.7 → 21.4) — far below
+  Little-linear, so the kernel is no longer simply latency-bound. Extrapolating that
+  curve, +50% in-flight at −25% waves prices at **−1..−4 ms wall — under the 9 ms
+  residue on its own**, with a real regression risk on wq_b. That is not a basis to
+  build on; it is a basis to measure.
+- **The convergence observation, which is the closure hypothesis:** post-M7 oproj runs
+  1.44× its bytes and the fp4 resident batch 1.38–1.39× (24.2 and 24.3 over 17.5 — the
+  SERIAL pair deliberately, not the contended 27.7: oproj runs in the attn phase outside
+  the moe overlap window, so serial-vs-serial is the like-for-like comparison) — two
+  kernels, different formats, different loops, ONE ratio. If the machine's effective
+  rate for this access pattern (thousands of concurrent wave-streams, 1 KB advances,
+  GTT) is ~135–150 GB/s rather than the 193.8 the byte bands price, then BOTH kernels
+  already sit at the real floor, the ~14.3 "excess" is the machine, and the last ~9 ms
+  is not reachable by any schedule-only lever. One serial measurement decides this.
+
+**The straggler/miss overlap read (miss 8.9, lever 3): DEAD this stretch, structurally.**
+Absorbing stragglers past `sync2` means a miss kernel's slot read outlives its layer —
+the arena-relocation window (reads that outlive a layer get their slot compacted from
+under them; pins do not stop compaction), M3b's own invariant set. The drain's contract
+is that every accumulating stream has retired before it launches, and the fixed-point
+accumulator design carries NO cross-stream join by decision. Not schedule-only; recorded
+as the boundary of this constraint set, not attacked.
+
+**The instrument added (this commit): `examples/dot_bench` grows a `v4gemv` section** —
+`v4_gemv_fp8` serial at the engine's seven decode shapes (m = 1), weights rotated over
+enough device copies to spill L2, matvec_fp8 oracle check + fnv per row. This is the
+instrument the M7 record names as missing (`gpu shared` was unscorable because the
+in-engine spans confound rate with exposure). The probe binary is the SAME example built
+in a scratch tree with the pair-16 patch applied to `fp8_dot_strided` — the engine never
+runs the probe kernel; the patch (verbatim, applied to `kernels/common.hpp`'s dword
+loop) replaces the loop with:
+
+```c
+    int j = start;
+    if (n4 >= 16 * stride) {  // UNIFORM across lanes: `start + ...` diverges at k=2048
+#pragma unroll 8
+        for (; j + stride < n4; j += 2 * stride) {
+            unsigned int pa = w4[j];
+            unsigned int pb = w4[j + stride];
+            int ia = j << 2;
+            int ib = (j + stride) << 2;
+            float sa = scalerow[ia >> bsh];
+            float sb = scalerow[ib >> bsh];
+            acc += sa * (x[ia]     * lut[(unsigned char)pa]
+                       + x[ia + 1] * lut[(unsigned char)(pa >> 8)]
+                       + x[ia + 2] * lut[(unsigned char)(pa >> 16)]
+                       + x[ia + 3] * lut[(unsigned char)(pa >> 24)]);
+            acc += sb * (x[ib]     * lut[(unsigned char)pb]
+                       + x[ib + 1] * lut[(unsigned char)(pb >> 8)]
+                       + x[ib + 2] * lut[(unsigned char)(pb >> 16)]
+                       + x[ib + 3] * lut[(unsigned char)(pb >> 24)]);
+        }
+    }
+#pragma unroll 8
+    for (; j < n4; j += stride) {
+        unsigned int p = w4[j];
+        int i0 = j << 2;
+        float s = scalerow[i0 >> bsh];
+        acc += s * (x[i0]     * lut[(unsigned char)p]
+                  + x[i0 + 1] * lut[(unsigned char)(p >> 8)]
+                  + x[i0 + 2] * lut[(unsigned char)(p >> 16)]
+                  + x[i0 + 3] * lut[(unsigned char)(p >> 24)]);
+    }
+```
+
+**Registered expectations for the microbench (instrument expectations, not a lever
+prediction — the lever prediction is owed only if a lever is selected):**
+
+- Stock rows at the three 33.55 MB shapes (wq_b, wo_a, wo_b): **120–160 GB/s** if the
+  effective-floor hypothesis holds. **≥ 180 GB/s** instead says the serial kernel is
+  fine and the engine's residual lives in exposure/launch mechanics — a different lever
+  class, and the pair-16 rung dies without an engine A/B. **160–180 is the gray band**:
+  neither hypothesis is refuted from the stock rows alone, and the probe delta becomes
+  the deciding instrument (a probe that adds ≥ +25% on top of 160+ would clear the
+  193.8 ceiling — physically capped, so in the gray band the probe reads as "how much
+  headroom was left", and the closure arithmetic uses the MEASURED stock rate either
+  way).
+- Probe vs stock at the deep-path shapes (k ≥ 2048): **< +10% ⇒ the second rung is
+  dead** and the closure arithmetic stands. **≥ +25% ⇒ the rung is real** — it gets
+  built as a proper reviewed commit (own kernel for k = 1024 if its probe row regressed)
+  with an engine prediction registered before that A/B. **+10..+25% ⇒ the rung is real
+  but cannot reach:** even +25% serial on the ~14.3 ms fp8 residual projects under
+  −5 ms of wall against the ~9 needed — the finding is booked, the lever is NOT built,
+  and the closure carries the number as "known remaining headroom, below the target's
+  reach" (the perf-wins-count rule cuts the other way here: the win would be real, but
+  the stretch's question is 10 tok/s, and a lever that cannot answer it does not spend
+  the next A/B).
+- The wq_b probe row prices the single-kernel design's 12-wave cost on the k = 1024
+  shape directly.
+
+**Decision table, registered now:** controls replicate + stock rows ≥ 180 → the residual
+is engine mechanics; re-rank before any kernel work. Controls replicate + stock rows
+< 160 + probe < +10% → **closure at ~9.2 tok/s as a successful negative** (the measured
+floor arithmetic goes in the closing verdict). Probe ≥ +25% (any stock band, ceiling
+permitting) → the pair-16 lever is selected; prediction registered then, house A/B
+follows. Probe +10..+25% or stock 160–180 with probe < +25% → closure with the measured
+headroom recorded, per the gray-band bullet. Controls NOT replicating (spans scattering
+past ±3) → no claim survives n = 1 anywhere; the round widens before anything else.
+
+**The staged GPU round (four flock arms, one session, nothing built between; binaries
+all built BEFORE the first device request; per-arm 30 s KFD+GTT witness — count
+`/sys/class/kfd/kfd/proc/*` and sample `mem_info_gtt_used`, a foreign step discards the
+arm as in M7):**
+
+1. C1, C2 — two control decodes, HEAD binary, flag-identical to M2..M7 (the 218-token
+   prompt verbatim from benchmarks.md's head-to-head CORRECTED note): gates wall ±3% of
+   109.0, reply md5 `75b19fcde806059b45c515259feb16d2`, counters 179389/8693 + 2538 raw,
+   split identities exact.
+2. B1 — `dot_bench v4gemv`, worktree binary (stock kernel).
+3. B2 — `dot_bench v4gemv`, probe-tree binary (pair-16 kernel). Two gates, both free:
+   the oracle assert inside each row, and **per-row fnv(B1) == fnv(B2)** — identical
+   seeds and a deterministic kernel make the fingerprint a MEASURED bit-identity check
+   on the pair-16 fold order, not just an ISA argument. A mismatch kills the probe as a
+   bug regardless of its rate.
+
+The record lands in `docs/measurement/benchmarks.md` beside "V4 fp8-MLP +
+shared-overlap A/B" — one section for the round (controls, both bench runs, and the
+decision the table selects).
+
 ## M2 — provenance of the command
 
 The recorded head-to-head wrote a literal `"<prompt>"` where its prompt should be — the

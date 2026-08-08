@@ -8,14 +8,17 @@
 //! A second section adds the two `docs/measurement/perf-roadmap.md` per-kernel targets (o_proj, lm_head) at
 //! their real engine shapes in GB/s. The MoE rows above are untouched, so numbers already
 //! recorded in docs/measurement/benchmarks.md stay comparable.
+//! The `v4gemv` section (2026-08-08) measures `v4_gemv_fp8` serially at V4's seven decode
+//! shapes — the isolated kernel rate the M7 A/B record names as missing (its in-engine
+//! spans confound rate with exposure/contention; `docs/investigations/v4-decode-decomposition.md` §M8).
 //! Run: cargo run --release --features rocm --example dot_bench
 #![cfg(feature = "rocm")]
 #![allow(clippy::expect_used)]
-use rivoli::artifact::quant::{VQ_DIM, VQ_K, matvec_i4, quant_i4, quant_vq};
+use rivoli::artifact::quant::{VQ_DIM, VQ_K, matvec_fp8, matvec_i4, quant_i4, quant_vq};
 use rivoli::backend::hip::{
     attend_scratch_floats, device_sync, launch_argmax, launch_attend, launch_gemv_fp8,
     launch_gemv_i4, launch_gemv_i8, launch_gemv_vq, launch_mla_absorb_fp8, launch_mla_value_fp8,
-    launch_rmsnorm,
+    launch_rmsnorm, launch_v4_gemv_fp8,
 };
 use rivoli::math::{f32_to_e4m3, f32_to_f16};
 use rivoli::memory::device::DeviceBuf;
@@ -270,6 +273,84 @@ fn run_fp8(name: &str, o_dim: usize, i_dim: usize) {
     );
 }
 
+/// `v4_gemv_fp8` at the engine's real decode shapes (m = 1) — the kernel M6 fired one
+/// kill across three spans on (qkv 2.31×, oproj 1.99×, shared 2.82× bytes) and M7's
+/// unroll-8 attacked to 1.44–1.89×. Run SERIAL on an otherwise idle device, this is the
+/// instrument the M7 record said was missing: the engine's spans mix kernel rate with
+/// exposure and cross-stream contention (`gpu shared` was ruled unscorable for exactly
+/// that), so only an isolated rate can say whether the residual above bytes is the
+/// kernel's own or the machine's effective ceiling for this access pattern.
+///
+/// GB/s counts weight bytes only — they are the traffic (33.55 MB/tensor against a
+/// ≤32 KB `x` that stays L2-resident in the engine too). `groups` is benched at 1:
+/// wo_a's `o_groups` changes which slice of `x` a row reads, not the weight stream the
+/// timing is bound by. Weights ROTATE over enough device copies to spill the 32 MB
+/// MALL, not just the 2 MB L2 — benchmarks.md records a single 33.5 MB buffer
+/// replaying at 372 GB/s (above the 256 GB/s bus, i.e. MALL-served) and 4 rotating
+/// copies (134 MB) bringing it back to 157; the engine reads every weight byte exactly
+/// once per token out of GTT, so a cache-served row here misclassifies the §M8
+/// floor-vs-mechanics decision. Budget ≥ 8× the MALL per shape.
+fn run_v4_gemv(name: &str, n_out: usize, k: usize) {
+    let block = 128usize;
+    let bytes = n_out * k;
+    // Seeded on the PAIR, not on `bytes`: wq_b/wo_a/wo_b all multiply to 33,554,432, and
+    // a bytes-derived seed would hand three shapes one scale/x draw sequence.
+    let seed = 0x74F8 ^ ((n_out as u64) << 20) ^ k as u64;
+    let mut r = Rng(seed);
+    let copies = ((256 << 20) / bytes).clamp(4, 128);
+    let packed = pattern(bytes, |v| f32_to_e4m3(v * 0.1));
+    let sc_len = n_out.div_ceil(block) * k.div_ceil(block);
+    let scale_f = f32v(&rnd_scale(&mut r, sc_len));
+    let x = f32v(&rnd(&mut r, k));
+    let wb: Vec<DeviceBuf> = (0..copies).map(|_| dev(&packed)).collect();
+    let (xb, sb) = (dev(&f32b(&x)), dev(&f32b(&scale_f)));
+    let mut yb = dev(&vec![0u8; n_out * 4]);
+    let (xp, yp) = (xb.ptr() as *const f32, yb.ptr_mut() as *mut f32);
+    let turn = std::cell::Cell::new(0usize);
+    let us = time(60, &|| unsafe {
+        let w = &wb[turn.get() % copies];
+        turn.set(turn.get() + 1);
+        launch_v4_gemv_fp8(
+            xp,
+            w.ptr(),
+            sb.ptr() as *const f32,
+            1,
+            n_out,
+            k,
+            block,
+            1,
+            yp,
+            std::ptr::null_mut(),
+        )
+        .expect("v4 fp8");
+    });
+    report(name, "v4fp8", n_out, k, us);
+    // Trustworthiness, i4-row style: right layout and addresses, not bit-identity — the
+    // wave reduction re-associates the fold and the kernel rounds its output to bf16
+    // (`rbf16`), so the bound is bf16's 2^-9 step plus reassociation, against the host
+    // oracle whose scale grid this kernel documents itself as matching.
+    let mut want = vec![0f32; n_out];
+    matvec_fp8(&mut want, &x, &packed, &scale_f, k, block);
+    let out = yb.copy_out().expect("v4 out");
+    let got = f32v(&out);
+    let mx = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let err = want
+        .iter()
+        .zip(&got)
+        .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+    assert!(
+        err <= 4e-3 * mx + 1e-3,
+        "{name}: v4_gemv_fp8 disagrees with matvec_fp8 (err {err:.2e} vs max {mx:.2e})"
+    );
+    // `seed` governs scales and `x` only — `pattern()` draws the weight bytes from its
+    // own fixed generator — so the printed (seed, shape, blk) triple plus pattern()'s
+    // constant is what determines this row's inputs.
+    println!(
+        "            fnv {:016x}  (seed {seed:#x}, {n_out}x{k} blk{block}, {copies} copies, oracle err {err:.1e})",
+        fnv(&out)
+    );
+}
+
 fn run_i8(name: &str, o_dim: usize, i_dim: usize) {
     let packed = pattern(o_dim * i_dim, |v| (v * 127.0) as i8 as u8);
     let scale: Vec<f32> = vec![1.0; o_dim];
@@ -418,7 +499,7 @@ fn run_tail_rest(vocab: usize, hidden: usize) {
 /// `-- mla gemv` runs only those sections; no argument runs all of them, so a per-kernel
 /// A/B can book only the rows it is about to compare.
 fn main() {
-    const SECTIONS: [&str; 5] = ["moe", "gemv", "mla", "attend", "tail"];
+    const SECTIONS: [&str; 6] = ["moe", "gemv", "v4gemv", "mla", "attend", "tail"];
     let want: Vec<String> = std::env::args().skip(1).collect();
     // A typo must NOT silently select nothing. Every number this branch rests on — the
     // timings and the fnv fingerprints both — is read off this binary's stdout, so an
@@ -441,6 +522,20 @@ fn main() {
         println!("\nRoute/tail GEMV bandwidth (real shapes, 256 GB/s peak):");
         run_fp8("o_proj", 6144, 16384); // ~half of `route`; split-K path
         run_i8("lm_head", 154880, 6144); // ~half of `tail`, measured — not all of it
+    }
+    // V4 shapes from the artifact header M4's byte table was derived from (dim 4096,
+    // q_lora 1024, nh*hd 32768, hd 512, gr 8192, gd 4096, moe_inter 2048): wq_a 4.19 MB,
+    // wq_b 33.55, wkv 2.10, wo_a 33.55, wo_b 33.55, shared gate/up 8.39 ×2, down 8.39 —
+    // a wrong pair here books the wrong denominator into GB/s exactly as run_mla warns.
+    if on("v4gemv") {
+        println!("\nV4 fp8 GEMV, decode shapes m=1 (serial rate; the M6-kill/M7-unroll kernel):");
+        run_v4_gemv("v4 wq_a ", 1024, 4096);
+        run_v4_gemv("v4 wq_b ", 32768, 1024);
+        run_v4_gemv("v4 wkv  ", 512, 4096);
+        run_v4_gemv("v4 wo_a ", 8192, 4096);
+        run_v4_gemv("v4 wo_b ", 4096, 8192);
+        run_v4_gemv("v4 sh_gu", 2048, 4096);
+        run_v4_gemv("v4 sh_dn", 4096, 2048);
     }
     // GLM-5.2 manifest: num_attention_heads 64, qk_head_dim 256 (= qk_nope 192 + rope
     // 64), v_head_dim 256, kv_lora_rank 512. Getting these wrong understates the work:
