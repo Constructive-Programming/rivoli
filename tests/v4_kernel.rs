@@ -1035,6 +1035,17 @@ fn the_branchless_decodes_match_the_oracle_bitwise() {
     }
 }
 
+/// Distinct byte values seen at dword byte position `p` of `w` — both byte-pattern
+/// sweeps COUNT their coverage with this rather than trusting their constructions
+/// (and jscpd caught them carrying the count verbatim before it was factored).
+fn position_coverage(w: &[u8], p: usize) -> usize {
+    let mut seen = [false; 256];
+    for b in w.iter().skip(p).step_by(4) {
+        seen[*b as usize] = true;
+    }
+    seen.iter().filter(|&&s| s).count()
+}
+
 /// Packed bytes that put every one of the 256 values at every byte position of the dword
 /// fast path: byte `i` carries `(i/4 + 64·(i%4) + salt) mod 256`, so position `p`'s bytes
 /// walk all 256 values once per 256 consecutive dwords (1024 bytes). `salt` decorrelates the three
@@ -1086,11 +1097,7 @@ fn every_byte_pattern_decodes_right_in_both_dot_paths() {
     );
     for (label, w) in [("w1", &w1w), ("w3", &w3w)] {
         for p in 0..4 {
-            let mut seen = [false; 256];
-            for b in w.iter().skip(p).step_by(4) {
-                seen[*b as usize] = true;
-            }
-            let n = seen.iter().filter(|&&s| s).count();
+            let n = position_coverage(w, p);
             assert_eq!(n, 256, "{label} dword byte position {p}: {n}/256 patterns");
         }
     }
@@ -1128,6 +1135,133 @@ fn every_byte_pattern_decodes_right_in_both_dot_paths() {
     let experts = F4Experts::upload(&[&e], Wiring::Correct);
     let got = Dispatch::reference(cfg, &experts, &x, &[1.125]).run();
     assert_matches(&want, &got, "byte-pattern sweep (fp4)");
+}
+
+/// `v4_gemv_fp8`'s summation ORDER, pinned bit-for-bit — the M7 unroll's oracle
+/// (`common.hpp::fp8_dot_strided`, docs/investigations/v4-decode-decomposition.md §M7).
+///
+/// The fp8 twin of the sweep above cannot reuse its oracle: `Oracle::linear` folds
+/// sequentially and the kernel wave-reduces, so that comparison rides [`TOL`]
+/// (tests/v4_attn.rs) and would wave through an unroll that split the accumulator chain
+/// — the exact failure the M7 change must not have. So the reference here is a host
+/// transliteration of the KERNEL's own fold: per-lane strided accumulation in the
+/// emitted contraction (`q = x1·l1` rounded, then three fmas, then `acc = fma(s, q,
+/// acc)`; the tail is `acc = fma(x·l, s, acc)`), `wave_sum`'s shfl-down ladder, `rbf16`.
+/// That pins two things a tolerance cannot: the unroll left the chain single and in
+/// ascending-`j` order, and the compiler's contraction pattern did not drift — if a
+/// future hipcc contracts differently this fails and the ISA gets re-read, which is
+/// this repo's rule anyway.
+///
+/// `k = 1152` = 9 per-lane dword trips — one unrolled body plus one remainder pass, so
+/// the unroll REMAINDER loop (unreachable at every engine dimension: all real trip
+/// counts divide 8) is exercised here. The `block = 2` dispatch routes the SAME bytes
+/// through the scalar tail (`n4 = 0` below a quad-wide scale tile), covering the other
+/// loop entirely.
+///
+/// The two NaN codes (0x7F/0xFF) are EXCLUDED from the sweep: NaN payload propagation
+/// through an FMA chain is not contractual across host and device, so a bitwise
+/// comparison over them would pin an implementation accident. Their decode formula
+/// stays covered by [`the_branchless_decodes_match_the_oracle_bitwise`]'s e4m3 sibling
+/// (`e4m3_decode` against the LUT builder's own `e4m3f`, exercised on every non-NaN
+/// code here). Coverage is COUNTED below, not trusted from the construction.
+#[test]
+fn the_fp8_dot_sums_in_source_order_through_both_loops() {
+    assert!(
+        e4m3_decode(0x7f).is_nan() && e4m3_decode(0xff).is_nan(),
+        "the two excluded codes must be exactly the NaN ones"
+    );
+    const K: usize = 1152;
+    const N_OUT: usize = 8;
+    let allowed: Vec<u8> = (0u8..=255).filter(|b| !matches!(b, 0x7f | 0xff)).collect();
+    let w: Vec<u8> = (0..N_OUT * K)
+        .map(|i| allowed[(i / 4 + (i % 4) * 67) % allowed.len()])
+        .collect();
+    for p in 0..4 {
+        let n = position_coverage(&w, p);
+        assert_eq!(n, 254, "dword byte position {p}: {n}/254 patterns");
+    }
+    let x = draw_x("fp8-order-x", K, 0.05);
+    // Sized for the block=2 dispatch's worst consumer: 4 row-blocks x 576 column tiles;
+    // block=128 reads row 0's first 9 entries of the same buffer. Powers of two only by
+    // habit — the host model replays the identical arithmetic whatever the scale.
+    let scales: Vec<f32> = (0..(N_OUT / 2) * (K / 2))
+        .map(|i| [0.25f32, 0.5, 1.0, 2.0][i % 4])
+        .collect();
+
+    let lut: Vec<f32> = (0..256).map(|b| e4m3_decode(b as u8)).collect();
+    let host = |block: usize| -> Vec<f32> {
+        let bsh = block.trailing_zeros() as usize;
+        let sc_cols = K.div_ceil(block);
+        let n4 = if block >= 4 { K >> 2 } else { 0 };
+        (0..N_OUT)
+            .map(|j| {
+                let wrow = &w[j * K..(j + 1) * K];
+                let srow = &scales[(j >> bsh) * sc_cols..];
+                let mut lanes = [0.0f32; 32];
+                for (l, acc) in lanes.iter_mut().enumerate() {
+                    for jj in (l..n4).step_by(32) {
+                        let i0 = jj * 4;
+                        let mut q = x[i0 + 1] * lut[wrow[i0 + 1] as usize];
+                        q = x[i0].mul_add(lut[wrow[i0] as usize], q);
+                        q = x[i0 + 2].mul_add(lut[wrow[i0 + 2] as usize], q);
+                        q = x[i0 + 3].mul_add(lut[wrow[i0 + 3] as usize], q);
+                        *acc = srow[i0 >> bsh].mul_add(q, *acc);
+                    }
+                    for i in ((n4 * 4 + l)..K).step_by(32) {
+                        *acc = (x[i] * lut[wrow[i] as usize]).mul_add(srow[i >> bsh], *acc);
+                    }
+                }
+                // `wave_sum`'s shfl-down ladder. Out-of-range lanes keep their own value
+                // (which doubles them), but lane 0's tree never reads one — the kernel
+                // comment's "leaves lane 0 right regardless" — so only in-range adds are
+                // replayed and only lane 0 is used.
+                for o in [16usize, 8, 4, 2, 1] {
+                    let prev = lanes;
+                    for l in 0..(32 - o) {
+                        lanes[l] = prev[l] + prev[l + o];
+                    }
+                }
+                bf16_decode(bf16_encode(lanes[0]))
+            })
+            .collect()
+    };
+    let gpu = |block: usize| -> Vec<f32> {
+        let (wd, sd, xd) = (
+            to_device(&w),
+            to_device(&f32b(&scales)),
+            to_device(&f32b(&x)),
+        );
+        let mut od = zeros(N_OUT * size_of::<f32>());
+        let stream = HipStream::new().expect("stream");
+        // SAFETY: `xd` is `1 * 1 * K` f32, `wd` is `N_OUT * K` bytes, `sd` covers
+        // `ceil(N_OUT/block) * ceil(K/block)` f32 at both blocks, `od` is `N_OUT` f32;
+        // `sync_f32` joins the device before any buffer drops.
+        unsafe {
+            launch_v4_gemv_fp8(
+                xd.ptr().cast(),
+                wd.ptr().cast(),
+                sd.ptr().cast(),
+                1,
+                N_OUT,
+                K,
+                block,
+                1,
+                od.ptr_mut().cast(),
+                stream.raw(),
+            )
+        }
+        .expect("v4_gemv_fp8");
+        sync_f32(&od)
+    };
+
+    for block in [128usize, 2] {
+        let (want, got) = (host(block), gpu(block));
+        assert_eq!(
+            bits(&want),
+            bits(&got),
+            "fp8 dot order (block {block}): kernel fold differs from the source's"
+        );
+    }
 }
 
 // =======================================================================================

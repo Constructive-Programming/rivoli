@@ -226,8 +226,10 @@ __host__ __device__ __forceinline__ int absorb_nquad(int kvl) { return (kvl + 3)
 // table. Matches quant.rs::matvec_fp8.
 // Strided fp8 dot accumulation (NO cross-thread reduction): Σ over the columns this
 // thread owns of `x·lut[w]·scale`, using a uint-per-lane load (4 fp8 → 128B/wave) atop
-// the LUT + a scalar tail. Shared by `dot_fp8_wave` (one wave, stride WAVE) and
-// `gemv_fp8_splitk` (all block threads, split-K over one row). The caller reduces.
+// the LUT + a scalar tail. The caller reduces. [CORRECTED 2026-08-08: this said "shared
+// by `dot_fp8_wave` and `gemv_fp8_splitk`" — the splitk kernels moved to
+// `fp8_dot_strided_r` when the `_r` family landed, so `dot_fp8_wave` → `v4_gemv_fp8` is
+// the ONLY consumer, which is what scopes the M7 unroll's blast radius below.]
 __device__ __forceinline__ float fp8_dot_strided(const float* __restrict__ x,
                                                  const unsigned char* __restrict__ wrow,
                                                  const float* __restrict__ scalerow,
@@ -249,6 +251,25 @@ __device__ __forceinline__ float fp8_dot_strided(const float* __restrict__ x,
     // now CONDITIONAL, since at block < 4 the cast is never reached.
     int n4 = (block >= 4) ? (i_dim >> 2) : 0;
     int bsh = blk_shift(block);
+    // Unrolled for memory-level parallelism, NOT for issue: un-unrolled, the emitted loop
+    // issued its three vmem loads and then waited them all down (`s_waitcnt vmcnt(0)`
+    // before the closing fmac, EVERY iteration), so each wave held exactly one 128-B
+    // weight request in flight per GTT round-trip — M6 measured the only kernel built
+    // from this loop (`v4_gemv_fp8`) at 2–2.8× its bytes on all three of its spans while
+    // issue sat at 42 instr/128 B, ~3× lighter than streaming needs. Unroll 8 puts 1 KB
+    // of weight stream in flight per wave (read back from the ISA: loads `s_clause`'d,
+    // waits counted down from vmcnt(23), ONE vmcnt(0) per 1 KB) at VGPR 86 = 96/wave =
+    // still 16 waves/SIMD — the next granule (>96) drops to 12, so a change that grows
+    // this body must re-read the ISA. Bit-identical by the M5 unroll argument: `acc` is
+    // one serial FP chain and LLVM neither splits nor re-associates it without
+    // fast-math; the fold order stays ascending `j`. Pinned on hardware by
+    // `tests/v4_kernel.rs::the_fp8_dot_sums_in_source_order_through_both_loops`, which
+    // also walks the unroll REMAINDER loop no engine dimension reaches (every real
+    // per-lane trip count divides 8). `fp8_dot_strided_r` below is deliberately NOT
+    // unrolled: its callers (GLM splitk, mla absorb/value) measured at budget, and R
+    // multiplies the register cost of the same pragma. Details and the registered
+    // prediction: docs/investigations/v4-decode-decomposition.md §M7.
+#pragma unroll 8
     for (int j = start; j < n4; j += stride) {
         unsigned int p = w4[j];
         int i0 = j << 2;
