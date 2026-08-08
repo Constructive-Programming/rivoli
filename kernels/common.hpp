@@ -462,18 +462,45 @@ __device__ __forceinline__ float dot_i4_wave(const float* __restrict__ v,
 static_assert((1 << F4_GROUP_SHIFT) == F4_GROUP, "F4_GROUP_SHIFT must be log2(F4_GROUP)");
 static_assert(F4_GROUP % 8 == 0, "the dword fast path's 8 columns must not straddle a group");
 
+// A GLOBAL-address-space (AMDGCN AS1) byte pointer, for spans whose globalness clang
+// cannot infer. A pointer that arrives as a KERNEL ARGUMENT is promoted to AS1 by
+// AMDGPUPromoteKernelArguments (that is why the fp4 dot's activation loads lower to
+// `global_load_b128`), but a pointer LOADED from device memory — the six spans in an
+// `ExpertDescF4` — reaches the loads as a generic value, and the M3a ISA read
+// (docs/investigations/v4-decode-decomposition.md) measured the consequence: the weight
+// dword and scale byte lower to `flat_load_*`, which on gfx11 take the slower path, count
+// against `lgkmcnt` too, and put a mid-body `s_waitcnt` in an issue-bound loop. Typing the
+// span AS1 at the source level is the fix that cannot be optimized away — a round-trip
+// `(T*)(AS1 T*)p` cast is folded by instcombine, and an
+// `assume(!is_shared && !is_private)` was measured not to reach InferAddressSpaces either
+// (both tried 2026-08-08; the loads stayed flat). The generic→AS1 cast is a no-op on
+// gfx11 (the representations coincide) and asserts only the address SPACE, nothing about
+// aliasing.
+typedef const unsigned char __attribute__((address_space(1)))* gu8p;
+
 // e2m1 nibble → f32. 1 sign / 2 exp (bias 1) / 1 mantissa; no infinities, no NaN, so a
 // bare arithmetic decode is TOTAL — every one of the 16 codes is a finite value.
 //
-// Arithmetic rather than a 16-entry lookup on purpose: the fast path decodes 8 nibbles
-// from one dword and each is consumed once, so a table would be a divergent index into
-// either scratch or LDS for values that cost two selects to compute. `(e - 1) & 3` keeps
-// the shift in range on the e == 0 arm the ternary never takes.
+// A REGISTER-immediate table, not memory and not a ternary. The 8 magnitudes are
+// {0, .5, 1, 1.5, 2, 3, 4, 6}; doubled they are the integers {0,1,2,3,4,6,8,12}, which fit
+// a nibble each, so the whole table is the one immediate 0xC8643210 and a lookup is
+// shift-and-mask — no LDS, no scratch, no divergent index. The previous form here was the
+// subnormal-aware ternary `e ? (1+m/2)·2^(e−1) : m/2`, and the M3a ISA read
+// (docs/investigations/v4-decode-decomposition.md) measured what it compiles to: an
+// exec-mask branch region PER NIBBLE, ~88 of the fp4 dot loop's 195 instructions per 128
+// weight bytes, on a loop that is instruction-issue-bound. This form compiles branchless
+// (v_bfe / v_lshrrev / v_cvt_f32 / v_mul; read the .s, do not trust the source).
+//
+// Bit-exact with the ternary on all 16 codes, including the two zeros: `half` is an exact
+// small integer, `0.5f * (float)half` is exact (power-of-two scaling of an exact value),
+// and the sign is OR'd into the payload bits, so code 8 decodes to -0.0f — the same
+// negative zero the ternary's `-mag` produced and `v4oracle`'s F4_LUT holds.
+// `tests/v4_kernel.rs::the_branchless_decodes_match_the_oracle_bitwise` sweeps all 16
+// against `v4oracle::numerics::e2m1_decode` at the bit level.
 __device__ __forceinline__ float e2m1f(unsigned int nib) {
-    unsigned int e = (nib >> 1) & 3u, m = nib & 1u;
-    float mag = e ? (1.0f + 0.5f * (float)m) * (float)(1u << ((e - 1u) & 3u))
-                  : 0.5f * (float)m;
-    return (nib & 8u) ? -mag : mag;
+    unsigned int half = (0xC8643210u >> ((nib & 7u) << 2)) & 0xFu;
+    float mag = 0.5f * (float)half;
+    return __uint_as_float(__float_as_uint(mag) | ((nib & 8u) << 28));
 }
 
 // e8m0 scale byte → f32, `2^(b − 127)` (matches v4oracle::numerics::e8m0_decode).
@@ -490,10 +517,19 @@ __device__ __forceinline__ float e2m1f(unsigned int nib) {
 // repack), not from `fast_round_scale`, so "our quantizer cannot emit them" is not an
 // argument that applies here: the FORMAT permits both, and what the converter happened to
 // produce is not a property this decoder gets to assume.
+//
+// Branchless since 2026-08-08 (the M3a kernel-rate work): the two-`if` form compiled to an
+// exec-mask branch region inside the fp4 dot loop's every iteration. The selects below are
+// the same three cases — `umax` against the b == 0 subnormal is exact because every other
+// `b<<23` is strictly larger, and the 0xff arm ORs the quiet bit onto what is then
+// 0x7f800000, giving the identical 0x7fc00000 NaN. All 256 bytes are swept bitwise against
+// `v4oracle::numerics::e8m0_decode` by
+// `tests/v4_kernel.rs::the_branchless_decodes_match_the_oracle_bitwise`.
 __device__ __forceinline__ float e8m0f(unsigned char b) {
-    if (b == 0xff) return __int_as_float(0x7fc00000);
-    if (b == 0) return __uint_as_float(1u << 22);
-    return __uint_as_float((unsigned int)b << 23);
+    unsigned int t = (unsigned int)b << 23;
+    unsigned int bits = t > (1u << 22) ? t : (1u << 22);
+    bits |= (b == 0xff) ? (1u << 22) : 0u;
+    return __uint_as_float(bits);
 }
 
 // Wave-cooperative group-scaled FP4 dot, R token rows against ONE read of the weight row:
@@ -516,10 +552,13 @@ __device__ __forceinline__ float e8m0f(unsigned char b) {
 // legal only because e8m0 is a bare power of two and the multiply is therefore exact. A
 // shared template would need a policy parameter meaning "is this scale exact?" — an
 // abstraction whose two instantiations disagree at the one line it exists to share.
+// `row` and `scalerow` are `gu8p` — AS1-typed, see the typedef above — because both come
+// out of an `ExpertDescF4` at every call site and the flat_load they otherwise lower to is
+// a measured cost on an issue-bound loop.
 template <int R>
 __device__ __forceinline__ void dot_f4_wave_r(const float* __restrict__ v, int v_stride,
-                                              const unsigned char* __restrict__ row,
-                                              const unsigned char* __restrict__ scalerow,
+                                              gu8p __restrict__ row,
+                                              gu8p __restrict__ scalerow,
                                               int dim, int lane, float* __restrict__ out) {
     float a0[R], a1[R];
 #pragma unroll
@@ -530,7 +569,8 @@ __device__ __forceinline__ void dot_f4_wave_r(const float* __restrict__ v, int v
     // `v` is an unchecked caller obligation (`launch_moe_expert_range_f4`'s `# Safety`), and
     // a misaligned one faults rather than falling back to the tail.
     if ((((size_t)row) & 3u) == 0) {
-        const unsigned int* rw = (const unsigned int*)row;
+        const unsigned int __attribute__((address_space(1)))* rw =
+            (const unsigned int __attribute__((address_space(1)))*)row;
         for (; base + WAVE * 8 <= dim; base += WAVE * 8) {
             int col = base + lane * 8;
             unsigned int w = rw[col >> 3];             // 8 nibbles = 8 consecutive columns

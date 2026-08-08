@@ -50,6 +50,17 @@
 //!    measures what IS covered instead of assuming it). `e8m0f`'s `0x00` (2^-127) and
 //!    `0xff` (NaN) arms are executed by nothing in this file.
 //!
+//!    > **CORRECTED 2026-08-08, with the branchless-decode rewrite.** The e2m1 half of
+//!    > this hole is now closed: [`every_byte_pattern_decodes_right_in_both_dot_paths`]
+//!    > drives all 256 packed-byte patterns through every dword byte position of the fast
+//!    > path AND through the scalar tail, at scales the accumulator is faithful over, and
+//!    > [`the_branchless_decodes_match_the_oracle_bitwise`] pins both decode FORMULAS to
+//!    > the oracle bit for bit (all 16 e2m1 codes including `-0.0`, all 256 e8m0 bytes
+//!    > including the endpoints). What still holds: the e8m0 RANGE cannot ride through the
+//!    > pipeline — the accumulator argument above is untouched — so the `0x00`/`0xff` arms
+//!    > are covered on the host transliteration only, and by nothing that runs on the
+//!    > device.
+//!
 //! 6. **`hc_pre`'s mixes GEMV re-association is unnamed upstream.** `forward.rs`'s fidelity
 //!    note lists `fp8_gemm`, `sparse_attn` and `hc_split_sinkhorn`'s warp reductions as
 //!    reproduced only up to summation order. It does NOT list the `hc_fn` GEMV, which this
@@ -72,7 +83,9 @@ use rivoli::backend::hip::{
 use rivoli::memory::device::DeviceBuf;
 use rivoli::v4oracle::{
     forward::{Capture, Counters, Defect, ExpertW, LayerCtx, LayerW, Oracle},
-    numerics::{act_quant_inplace, bf16_decode, bf16_encode, e4m3_decode, e8m0_decode, silu},
+    numerics::{
+        act_quant_inplace, bf16_decode, bf16_encode, e2m1_decode, e4m3_decode, e8m0_decode, silu,
+    },
     toy::{self, ToyModel},
     weights::{NamedRng, V4Config, WMat},
 };
@@ -265,7 +278,27 @@ struct Dispatch<'a> {
     quantize_x: bool,
 }
 
-impl Dispatch<'_> {
+impl<'a> Dispatch<'a> {
+    /// The reference dispatch — the config's own clamp, activation quantized. For the
+    /// callers with nothing to break; `Case::dispatch` keeps the two knobs overridable
+    /// because the deliberate-break tests exist to turn them. Factored when the byte-sweep
+    /// test became its third verbatim copy and the duplication gate said so.
+    fn reference(
+        cfg: &'a V4Config,
+        experts: &'a F4Experts,
+        x: &'a [f32],
+        wexpert: &'a [f32],
+    ) -> Self {
+        Dispatch {
+            cfg,
+            experts,
+            x,
+            wexpert,
+            swiglu_limit: cfg.swiglu_limit,
+            quantize_x: true,
+        }
+    }
+
     /// `Σ_e down_e(silu(clamp(w1_e·x)) ⊙ clamp(w3_e·x) · weight_e)` — the routed half of
     /// `MoE.forward`, without the shared expert and without the final bf16 store. Every
     /// expert in ONE range.
@@ -583,15 +616,7 @@ fn an_unrouted_expert_contributes_exactly_zero() {
     let named: Vec<&ExpertW> = PICKS.iter().map(|&e| c.all[e]).collect();
     let two = F4Experts::upload(&named, Wiring::Correct);
     let w = PICKS.map(|e| c.wexpert[e]);
-    let just_two = Dispatch {
-        cfg: c.cfg,
-        experts: &two,
-        x: &c.x,
-        wexpert: &w,
-        swiglu_limit: c.cfg.swiglu_limit,
-        quantize_x: true,
-    }
-    .run();
+    let just_two = Dispatch::reference(c.cfg, &two, &c.x, &w).run();
     assert_eq!(
         bits(&full),
         bits(&just_two),
@@ -962,6 +987,147 @@ fn the_fixture_exercises_the_codes_the_decoders_are_credited_with() {
         !scales.contains(&0u8) && !scales.contains(&0xffu8),
         "a special e8m0 code leaked in"
     );
+}
+
+/// The branchless decode FORMULAS against the oracle, bit for bit, over every code.
+///
+/// `common.hpp`'s `e2m1f`/`e8m0f` were rewritten branchless on 2026-08-08 (the M3a
+/// kernel-rate lever: the ternary forms compiled to an exec-mask branch region per nibble,
+/// ~88 of the fp4 dot loop's 195 instructions). The two functions below are line-for-line
+/// transliterations of the NEW bodies — if you change the kernel, change these or this
+/// test lies. What each half pins, and what it cannot:
+///
+/// - This test proves the FORMULAS equal `v4oracle::numerics::{e2m1_decode, e8m0_decode}`
+///   at the bit level — including code 8 → `-0.0` (the sign OR on a zero payload) and
+///   e8m0's `0x00` (the f32 subnormal 2^-127) and `0xff` (the 0x7fc00000 NaN), none of
+///   which any device test can observe: a `-0.0` weight is annihilated by the very next
+///   multiply, and the e8m0 endpoints cannot ride through `moe_fixed` (module doc, item 5).
+/// - It proves nothing about what hipcc COMPILED. That bridge is
+///   [`every_byte_pattern_decodes_right_in_both_dot_paths`], which runs the real kernels
+///   over every packed-byte pattern; a transliteration drifted from the kernel fails there.
+#[test]
+fn the_branchless_decodes_match_the_oracle_bitwise() {
+    // kernels/common.hpp::e2m1f — magnitudes doubled are {0,1,2,3,4,6,8,12}, one immediate.
+    fn e2m1f(nib: u32) -> f32 {
+        let half = (0xC864_3210u32 >> ((nib & 7) << 2)) & 0xF;
+        let mag = 0.5f32 * half as f32;
+        f32::from_bits(mag.to_bits() | ((nib & 8) << 28))
+    }
+    // kernels/common.hpp::e8m0f — `max` against the b == 0 subnormal, quiet bit on 0xff.
+    fn e8m0f(b: u8) -> f32 {
+        let t = (b as u32) << 23;
+        let quiet = if b == 0xff { 1u32 << 22 } else { 0 };
+        f32::from_bits(t.max(1u32 << 22) | quiet)
+    }
+    for nib in 0..16u32 {
+        assert_eq!(
+            e2m1f(nib).to_bits(),
+            e2m1_decode(nib as u8).to_bits(),
+            "e2m1 code {nib}"
+        );
+    }
+    for b in 0..=255u8 {
+        assert_eq!(
+            e8m0f(b).to_bits(),
+            e8m0_decode(b).to_bits(),
+            "e8m0 byte {b}"
+        );
+    }
+}
+
+/// Packed bytes that put every one of the 256 values at every byte position of the dword
+/// fast path: byte `i` carries `(i/4 + 64·(i%4) + salt) mod 256`, so position `p`'s bytes
+/// walk all 256 values once per 256 consecutive dwords (1024 bytes). `salt` decorrelates the three
+/// projections.
+fn covering_bytes(n: usize, salt: u8) -> Vec<u8> {
+    (0..n)
+        .map(|i| {
+            ((i >> 2) as u8)
+                .wrapping_add((64 * (i & 3)) as u8)
+                .wrapping_add(salt)
+        })
+        .collect()
+}
+
+/// The compiled kernels' decode over EVERY packed-byte pattern, in both dot paths.
+///
+/// [`the_branchless_decodes_match_the_oracle_bitwise`] pins the decode formulas;
+/// this is the bridge to what hipcc actually emitted. One synthetic expert whose `w1`/`w3`
+/// bytes are [`covering_bytes`] runs the toy geometry's single dword-path iteration
+/// (`dim = 256` = WAVE·8, module doc item 4), so every byte position of the weight dword
+/// decodes every value 0..=255 — a wrong shift, mask or table constant at ANY position
+/// fails against the oracle on thousands of terms. `w2` (`inter = 128` < WAVE·8) decodes
+/// entirely in the scalar tail, whose bytes cover all 256 values too — both nibble
+/// extraction parities included. Coverage is COUNTED below, not trusted from the
+/// construction; scales cycle 2^-2..2^1 and the activation is small, so everything stays
+/// inside `moe_fixed`'s faithful band (the constraint that forbids sweeping e8m0 the same
+/// way) and outside the SwiGLU clamp, which would otherwise mask a gate-row decode error
+/// behind a saturated `min`. The coverage claim is about byte POSITIONS, not loop trips:
+/// at one iteration the dword loop's advance (`base += 256`, scale groups past 7) never
+/// runs — untouched by the decode rewrite, and netted by the A/B's byte-identical gate at
+/// the real multi-iteration dims.
+#[test]
+fn every_byte_pattern_decodes_right_in_both_dot_paths() {
+    let (cfg, _, o) = fixture();
+    let (hidden, inter) = (cfg.dim, cfg.moe_inter_dim);
+    // The coverage claims are geometry-bound; a resized toy silently voids them.
+    assert_eq!(
+        hidden, 256,
+        "gate/up must be exactly one dword-path iteration"
+    );
+    assert_eq!(inter, 128, "w2 must decode entirely in the scalar tail");
+    let scales = |rows: usize, k: usize| -> Vec<u8> {
+        (0..rows * (k / 32)).map(|i| 125 + (i % 4) as u8).collect()
+    };
+    let (w1w, w3w, w2w) = (
+        covering_bytes(inter * hidden / 2, 0),
+        covering_bytes(inter * hidden / 2, 101),
+        covering_bytes(hidden * inter / 2, 202),
+    );
+    for (label, w) in [("w1", &w1w), ("w3", &w3w)] {
+        for p in 0..4 {
+            let mut seen = [false; 256];
+            for b in w.iter().skip(p).step_by(4) {
+                seen[*b as usize] = true;
+            }
+            let n = seen.iter().filter(|&&s| s).count();
+            assert_eq!(n, 256, "{label} dword byte position {p}: {n}/256 patterns");
+        }
+    }
+    let mut seen = [false; 256];
+    for &b in &w2w {
+        seen[b as usize] = true;
+    }
+    let n = seen.iter().filter(|&&s| s).count();
+    assert_eq!(n, 256, "scalar tail (w2): {n}/256 patterns");
+
+    let mat = |rows, cols, w, s| WMat::Fp4 { rows, cols, w, s };
+    let e = ExpertW {
+        w1: mat(inter, hidden, w1w, scales(inter, hidden)),
+        w2: mat(hidden, inter, w2w, scales(hidden, inter)),
+        w3: mat(inter, hidden, w3w, scales(inter, hidden)),
+    };
+    let x = draw_x("byte-pattern-sweep-x", hidden, 0.05);
+    let mut counters = Counters::default();
+    let want = o.expert(&e, &x, 1, Some(&[1.125]), &mut counters);
+    assert_eq!(
+        counters.swiglu_clamp_events, 0,
+        "a saturated clamp would mask gate-row decode errors — lower the activation scale"
+    );
+    // The two guards Case::new carries, for the same reasons: an all-zero want proves
+    // nothing, and a want near moe_fixed's 2^14 clamp fails for an unrelated reason.
+    assert!(
+        max_abs(&want) > 1e-6,
+        "the oracle produced nothing to compare"
+    );
+    assert!(
+        max_abs(&want) < 8192.0,
+        "sweep output too close to moe_fixed's clamp"
+    );
+
+    let experts = F4Experts::upload(&[&e], Wiring::Correct);
+    let got = Dispatch::reference(cfg, &experts, &x, &[1.125]).run();
+    assert_matches(&want, &got, "byte-pattern sweep (fp4)");
 }
 
 // =======================================================================================
@@ -1700,15 +1866,7 @@ fn ffn_out_matches_the_golden() {
     }
     let experts: Vec<&ExpertW> = (0..cfg.n_routed_experts).map(|e| &lw.experts[&e]).collect();
     let e = F4Experts::upload(&experts, Wiring::Correct);
-    let routed = Dispatch {
-        cfg,
-        experts: &e,
-        x: &x,
-        wexpert: &wexpert,
-        swiglu_limit: cfg.swiglu_limit,
-        quantize_x: true,
-    }
-    .run();
+    let routed = Dispatch::reference(cfg, &e, &x, &wexpert).run();
 
     let shared = o.expert(&lw.shared, &x, 1, None, &mut Counters::default());
     let got: Vec<f32> = routed
