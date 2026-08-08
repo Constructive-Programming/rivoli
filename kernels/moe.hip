@@ -244,6 +244,13 @@ extern "C" int rivoli_moe_acc_drain_s(float* x, unsigned long long* acc, int n, 
 //  5. `.f4` holds `n_experts` blocks and NO shared block: V4's shared expert is fp8 e4m3
 //     at 128×128 and rides the resident path. A descriptor one past the end is not the
 //     wrong bytes, it is the wrong ARITHMETIC — hence `n_desc` on the launcher.
+//
+// The six spans below are cast to `common.hpp::gu8p` (GLOBAL address space) at every use —
+// the typedef's comment carries the measurement and the rejected alternatives. The cast is
+// TRUE by construction: every span points at a device arena or heap allocation (v4gpu's
+// placement, `tests/v4_kernel.rs`'s `DeviceBuf`s), and host GTT memory is still the global
+// aperture on this APU; no LDS or scratch address can reach a descriptor. It asserts only
+// the address SPACE — what the pointer may alias is untouched.
 
 // Defined in linalg.hip. Declared rather than called from Rust so the sequence
 // gate/up → re-quantize → down cannot be issued with the middle step missing; see
@@ -302,10 +309,12 @@ __device__ __forceinline__ void moe_gateup_f4_impl(
     const ExpertDescF4 d = descs[e];
     size_t rb = (size_t)(hidden / 2), ng = f4_ng(hidden);
     float g[R], u[R];
-    dot_f4_wave_r<R>(x, hidden, d.gate_packed + (size_t)j * rb, d.gate_scale + (size_t)j * ng,
-                     hidden, lane, g);
-    dot_f4_wave_r<R>(x, hidden, d.up_packed + (size_t)j * rb, d.up_scale + (size_t)j * ng,
-                     hidden, lane, u);
+    // `(gu8p)` on the four descriptor spans — flat_load → global_load, see the typedef and
+    // the struct's own note for why the cast is true.
+    dot_f4_wave_r<R>(x, hidden, (gu8p)d.gate_packed + (size_t)j * rb,
+                     (gu8p)d.gate_scale + (size_t)j * ng, hidden, lane, g);
+    dot_f4_wave_r<R>(x, hidden, (gu8p)d.up_packed + (size_t)j * rb,
+                     (gu8p)d.up_scale + (size_t)j * ng, hidden, lane, u);
     if (lane == 0) {
 #pragma unroll
         for (int t = 0; t < R; ++t) {
@@ -361,8 +370,8 @@ __device__ __forceinline__ void moe_down_f4_impl(
     size_t rb = (size_t)(inter / 2), ng = f4_ng(inter);
     const float* he = h_in + (size_t)e * R * inter;
     float dv[R];
-    dot_f4_wave_r<R>(he, inter, d.down_packed + (size_t)o * rb, d.down_scale + (size_t)o * ng,
-                     inter, lane, dv);
+    dot_f4_wave_r<R>(he, inter, (gu8p)d.down_packed + (size_t)o * rb,
+                     (gu8p)d.down_scale + (size_t)o * ng, inter, lane, dv);
     if (lane == 0) {
 #pragma unroll
         for (int t = 0; t < R; ++t)

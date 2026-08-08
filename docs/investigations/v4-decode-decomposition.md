@@ -1,7 +1,7 @@
 ---
 scope: v4
 status: live
-verdict: OPEN, first lever LANDED. M3b measured 2026-08-07: batching a layer's resident experts into one range launch (misses stay per-expert behind their tickets) took moe 70.6 → 54.7 ms/token and wall 186.2 → 169.9 = 5.887 tok/s (+9.6%), output byte-identical, hit/miss identical, fetch fell — the registered prediction (−3..−8) was wrong on the GOOD side: per-launch cost is the ~25 µs host-bubble class, not the 1.97 µs dispatch floor it was priced on. tail measured 8.2 of the 39.1 ms remainder. Residue to 10 tok/s (~70 ms off the wall): route ~76 (SPLIT by M4, below) > moe ~32 above bytes (fp4 kernel issue-bound per the M3a ISA read: 195 instr per 128 weight bytes/wave, exec-mask e2m1 decode, flat loads; miss exposure and shared GEMV unpriced) > remainder ~31 non-tail. M2's decomposition and floor (~62 ms/token ≈ 16 tok/s ceiling) stand; buckets still not certified free (wall spread ±1.5% over three stock-class runs). M4 MEASURED 2026-08-08 (four HIP-event sub-spans read at the existing gate D2H, window-wall residual check, no new join): attn 53.2 | cmp 9.1 | hcn 41.2 | gate 3.2 | win 107.7 (resid 1.0) at wall 172.9 (+1.8%, in band), counters identical to M3b. Prediction scored three-of-four in band and WRONG at the headline: hcn (hyper-connections + norms) measured 41.2 against a 4–8 band and 0.8 ms of bytes — the engine's largest above-bytes excess (+40.4 > moe +33 > attn +29.3) and the new #1 lever (read the hc/norm kernels host-side next); fp8 GEMV rate demoted to #2; cmp and gate landed at budget, closed; resid 1.0 kills the gate-D2H width micro-lever.
+verdict: OPEN, three levers LANDED and the route span SPLIT. M3b (2026-08-07, launch geometry): moe 70.6 → 54.7 ms/token, +9.6% tok/s. M3c (2026-08-08, branchless e2m1/e8m0 + global-AS descriptor loads, fp4 dot loop 195 → 105 instr per 128 weight bytes): moe 54.9 → 49.6, wall 165.3 = 6.048 tok/s — the registered prediction (−4..−10, point −6) landed IN BAND at −5.3, the first of the series to do so. Output byte-identical and counters identical across every arm. M4 (2026-08-08) split route with four event-pair sub-spans, no new join: attn 53.2 | cmp 9.1 | hcn 41.2 | gate 3.2 | win 107.7 (resid 1.0) — WRONG at the headline: hcn (hyper-connections + norms) measured 41.2 against a 4–8 band and 0.8 ms of bytes, the engine's largest above-bytes excess and the new #1 lever (read the hc/norm kernels host-side next); fp8 GEMV rate demoted to #2; cmp and gate closed at budget; resid 1.0 kills the gate-D2H width micro-lever. Residue to 10 tok/s (~65 ms off the 165.3 wall): hcn +40.4 > moe +31.6 over its 18 ms byte floor (miss exposure, shared GEMV unpriced) > attn +29.3 > remainder ~31 non-tail. M2's floor (~62 ms/token ≈ 16 tok/s ceiling) stands; buckets still not certified free (wall spread ±1.5% over stock-class runs).
 ---
 
 # Where do V4-Flash's 185 ms/token go?
@@ -410,6 +410,104 @@ and event records touch no data. (3) `resid ≥ 0` and the spans + resid sum to 
 (printed identity). (4) coherence, expected not enforced: `win − d2h` (the traversal) should
 land near the non-tail remainder share M2 attributed to per-layer launches; a traversal far
 above `remainder − tail` says the window books time the PROFILE line books elsewhere.
+## M3c — the kernel-rate levers, IMPLEMENTED 2026-08-08 (no GPU yet), and the registered prediction
+
+M3a named two kernel fixes and priced their bucket at ~5–10 ms of the moe excess. Both are
+now implemented, on `wt/v4-e2m1`, and read back out of the compiler per
+`how-to-measure.md`'s ISA-first rule — same command as M3a's read
+(`hipcc --offload-arch=gfx1151 -O3 -fPIC -S`, `build.rs:76`'s own flags) — BEFORE any
+device time was requested.
+
+**Lever 1, branchless e2m1/e8m0 decode** (`kernels/common.hpp::e2m1f`/`e8m0f`). The
+subnormal-aware ternary became a register-immediate table: the 8 magnitudes doubled are the
+integers {0,1,2,3,4,6,8,12}, one nibble each, so the whole table is the immediate
+`0xC8643210` and a decode is bfe → shift → mask → `v_cvt_f32` → `·0.5f`, with the sign
+OR'd into the payload bits (code 8 still decodes to `-0.0f`, bitwise). The e8m0 special
+cases became a `umax` + one select. Both are bit-exact by exhaustive host sweep, not by
+argument — `tests/v4_kernel.rs::the_branchless_decodes_match_the_oracle_bitwise` (all 16
+e2m1 codes, all 256 e8m0 bytes, against the oracle at the bit level) and
+`every_byte_pattern_decodes_right_in_both_dot_paths` (all 256 packed-byte patterns at every
+dword byte position through the REAL kernels, fast path and scalar tail, GPU-gated).
+
+**Lever 2, global-address-space descriptor loads.** Two source-level idioms do NOT work
+and are recorded in `common.hpp`'s `gu8p` comment so nobody re-tries them: a round-trip
+`(T*)(AS1 T*)p` cast (instcombine folds the cancelling pair) and
+`__builtin_assume(!is_shared && !is_private)` (never reaches InferAddressSpaces; loads
+stayed flat in the emitted ISA). What works is typing the span AS1 at the front end:
+`dot_f4_wave_r`'s `row`/`scalerow` are now `gu8p` (`__attribute__((address_space(1)))`),
+cast once at the descriptor in `moe.hip::as_global`.
+
+**The ISA after, against M3a's 195.** `moe_gateup_f4`'s inner dword iteration — one wave
+consuming 128 packed weight bytes + scale — is **105 instructions, was 195**. The eight
+per-nibble exec-mask branch regions, the eight sign cmp+cndmask triplets and the e8m0
+exec region are GONE (the loop body's only remaining selects are the two branchless e8m0
+cndmasks; the only branch is the backedge); every load in every loop is `global_load_*`
+(zero `flat_*` in either fp4 kernel); `s_waitcnt` 4 → 2 with none mid-decode;
+`s_delay_alu` 40 → 17. VGPR 48 → 49 / 38 → 39, which stays inside the same allocation
+granule — occupancy still 16 waves/SIMD. Balance arithmetic, same model as M3a: 128 B per
+105 slots ≈ **1.22 B/cycle/SIMD against the 0.84 needed to stream 193.8 GB/s** — the loop
+goes from issue-bound at 79% of achievable to ~45% issue headroom, so the routed-compute
+floor drops from ~23 ms/token (issue) to the **18 ms/token byte floor**. At the real dims
+(4096/2048, both multiples of WAVE·8 = 256) the dword path is the entire loop for all
+three projections.
+
+A review pass compiled the next rung and priced it dead: a `v_perm_b32` byte-table decode
+(selector `w & 0x07070707`, doubled magnitudes as packed bytes, `v_cvt_f32_ubyte0..3` in
+place) emits **88** for the same loop, bit-identical — the compiler already fuses the
+staged form's shift+mask into one `v_bfe` against the table immediate and the sign into
+one `v_and_or_b32`, ~7 VALU/nibble — but 88 only widens headroom past a bound that
+stopped binding at 105, so it is recorded here as the known next lever IF the 18 ms byte
+floor ever moves (smaller format, faster memory), not taken. A `__constant__`-array or
+LDS table is NOT that lever: the first re-introduces the in-order-vmcnt mid-loop waits
+this change removed, the second trades them for `lgkmcnt` plus a barrier the kernel's
+early-return structure cannot host.
+
+**Blast radius, measured not assumed.** Stock-vs-new ISA diff over every kernel file:
+all ten GLM kernels in `moe.hip` (`*_vq*`, `*_i4*`, `moe_acc_drain`, `moe_gate_v4`)
+**bit-identical**; every other kernel file identical except `v4indexer.hip` —
+`v4_indexer_spread` inlines `e2m1f` via `fp4_quant_roundtrip`, so its SCHEDULE changes
+while its values cannot (the decode is bit-exact); worth knowing when reading non-moe
+buckets in the A/B.
+
+**Prediction, registered before the measurement so it can be wrong:** the A/B below moves
+the `moe` bucket by **−4 to −10 ms/token (point: −6)** from the measured 54.7, output
+byte-identical and hit/miss identical (the change touches decode arithmetic that is
+bit-exact and load ADDRESS SPACE, not order, routing or residency), `fetch` unchanged.
+The −5 ms core is M3a's issue-bound excess (23 → 18); the spread above it is the
+flat-load latency/`lgkmcnt` serialisation the slot model never priced (M3b's lesson:
+the recovered constant can be the bigger one); the floor of the band is where the miss
+stream and the closing `device_sync` hide most of what the kernel no longer spends. If
+|Δmoe| < 3 ms/token, that is inside recorded bucket noise — replicates before any claim,
+and a null result gets recorded WITH the 105-count that proves the instructions were
+really removed: that dissociation would itself be the finding (the bound was elsewhere).
+
+> **SCORED 2026-08-08, by the A/B below: measured Δmoe = −5.3 ms/token — INSIDE the
+> −4..−10 band, 0.7 off the −6 point.** First M3-series prediction to land in its band.
+> Byte-identity and hit/miss identity as predicted; fetch BYTES identical, fetch time
+> +0.6 ms — inside the recorded 9.6–11.9 replicate spread. Wall 170.3 → 165.3 =
+> 6.048 tok/s (+3.0%). Full record and every gate result in benchmarks.md "V4 fp4
+> kernel-rate A/B". The −5.3 sits where the −5 issue-bound core predicted, which prices
+> THIS lever's slot model right; the point alone cannot apportion the two unpriced terms
+> it sits between (flat-load latency above, sync-hidden compute below), so neither is
+> claimed. The residual ~31.6 ms of moe above the byte floor is the M3a split (miss
+> exposure, shared-expert GEMV, per-layer fixed costs), still named-not-priced.
+
+*Host validation, all green 2026-08-08: dev-profile `cargo test --features rocm --no-run`
+(jscpd gate re-armed via `touch build.rs` after rustfmt — it has manufactured clones here
+before), the host-only bitwise sweep run and passing, `clippy --release --features rocm
+--all-targets` and the six-feature union both clean, file rustfmt-clean. The device half
+(`v4_kernel` suite incl. the byte-pattern sweep, then the A/B) WAITS FOR GO under the
+resource protocol.*
+
+**The A/B, staged (not run):** M3b's own pattern, verbatim — arm S = `a2a0b8c` via
+`git archive` into a scratch tree, arm B = this branch's committed HEAD, both release
+binaries built BEFORE the device is requested, nothing built between arms, per-arm
+exclusive flock with the per-minute KFD+GTT+llama-swap witness, the M2 command
+flag-identical (218-token prompt verbatim in benchmarks.md's head-to-head CORRECTED note).
+Gates as M3b's: (1) byte-identical text AND identical hit/miss = correctness, any
+difference is a BUG in the decode or the cast, not noise; (2) the instrument is the `moe`
+bucket, not wall; (3) `fetch` must not grow; (4) the record lands in benchmarks.md when it
+exists, beside the "V4 launch-geometry A/B".
 
 ## M2 — provenance of the command
 

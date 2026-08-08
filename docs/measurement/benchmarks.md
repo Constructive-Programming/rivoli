@@ -2898,7 +2898,12 @@ batched (94e72f0): PROFILE/tok: 169.9ms wall | route 76.1ms | moe 54.7ms | fetch
 ```
 
 **Correctness gates first, all pass:** generated text **byte-identical** (2025 bytes,
-`cmp` clean, same md5), expert lookups identical (179389 hit / 8693 miss, both arms), and
+`cmp` clean, same md5 — **qualifier added 2026-08-08:** the 2025 bytes are the log's
+`reply : "` extraction, an 8-byte-prefixed truncation of the full reply, not the whole
+generation; the M3c A/B measured the same prefix at 2017 bytes for exactly this reason
+and resolved the discrepancy as the prefix length, engine output identical. Neither run
+kept the untruncated text; the aggregate counters are the stronger half of this gate),
+expert lookups identical (179389 hit / 8693 miss, both arms), and
 `fetch` did not grow — it fell 10.4 → 9.6 ms/token (2.09 → 1.95 ms/miss), so batching did
 not serialise hits behind misses; the straggler path held.
 
@@ -3024,3 +3029,63 @@ headline:**
    prefill 16.57 → 17.39 s — consistent with the observed cross-run scatter, said no more
    strongly than that: no per-bucket spread is recorded for the batched build (this run is
    its n=2), and fetch/prefill move more than the ±1.5% three-run wall spread.
+## V4 fp4 kernel-rate A/B — moe 54.9 → 49.6 ms/token, output byte-identical (2026-08-08)
+
+The A/B `docs/investigations/v4-decode-decomposition.md` M3c staged: stock `a2a0b8c`
+(built from `git archive` into a scratch tree) vs the branchless-decode +
+global-address-space commit `b811c16` (`wt/v4-e2m1`), both release binaries built before
+the device was requested, nothing built between arms, stock first. Command per arm,
+flag-identical to M2's (the 218-token prompt verbatim from the head-to-head CORRECTED
+note), each under the exclusive flock with the per-minute KFD+GTT+llama-swap witness:
+
+```
+flock /var/run/sys-gpu.lock -c '<arm-binary> /var/db/rivoli/v4-f4-full -bench 512 --prompt "<prompt>"'
+```
+
+```
+stock    (a2a0b8c): PROFILE/tok: 170.3ms wall | route 75.9ms | moe 54.9ms | fetch 10.1ms | 4.96 miss (2538 raw), 2.03ms/miss, 0.07 GB | remainder 39.5ms (tail 8.2ms)
+branchless (b811c16): PROFILE/tok: 165.3ms wall | route 75.9ms | moe 49.6ms | fetch 10.7ms | 4.96 miss (2538 raw), 2.16ms/miss, 0.07 GB | remainder 39.9ms (tail 8.2ms)
+```
+
+**Correctness gates first, all pass:** generated text **byte-identical** — the log-printed
+reply, `cmp` clean, same md5, the same instrument the launch-geometry A/B's gate used.
+Stated precisely, since this record is what a cross-check lands on: the log line truncates
+the full 512-token reply, so the identity instrument is that ~2 KB prefix PLUS the
+aggregate routing counters, identical across arms (179389 hit / 8693 miss, 2538 raw decode
+misses, 116.22 GB) — aggregate, not per-token, identity. The prefix here measures 2017
+bytes where the launch-geometry record says 2025: exactly the 8-byte `reply : ` prefix
+that extraction retained and this one strips — and `git log 94e72f0..a2a0b8c -- src/
+kernels/` is empty, so all four arms across the two A/Bs decoded the same text. Byte-identity
+was the PREDICTION, not a hope: the decode is bit-exact off-device (all 16 e2m1 codes, all
+256 e8m0 bytes, bitwise vs the oracle), and the stock-vs-new ISA diff showed **all ten GLM
+kernels in `moe.hip` bit-identical** with the fp4 dot's FMA contraction shape unchanged
+(full argument: `docs/investigations/v4-decode-decomposition.md` M3c).
+
+**The measurement:** Δmoe = **−5.3 ms/token**, nearly all of it in the wall (remainder +0.4) (170.3 → 165.3,
+5.872 → 6.048 tok/s, **+3.0%**). The registered prediction — **−4..−10, point −6** —
+scores **INSIDE the band, 0.7 off the point**. Stock's moe 54.9 replicates M3b's 54.7
+(+0.4%), well under the |Δmoe| < 3 ms replicate threshold.
+
+**`fetch` did not grow in any sense that matters:** 10.1 → 10.7 ms/token is TIME, not
+bytes — raw misses (2538) and GB (0.07/token) are identical across arms, and the five
+flag-identical runs on record span fetch 9.6/10.1/10.4/10.7/11.9 ms (ms/miss
+1.95–2.40) with identical miss counts throughout. The +0.6 is inside that replicate
+spread, and the serialisation tell gate (3) was built for a SUBMIT-ORDER change, which
+this is not.
+
+**Witness, per arm — the criterion changed mid-pair and the record says so.** Arm S met
+the registered-clean criterion exactly as the launch-geometry pair did: only the run's own
+KFD holder, GTT flat at the run's footprint, `{"running":[]}` throughout. Arm B did NOT
+meet the `{"running":[]}` half: the live `qwen3.6-medium` tenant sat queued in
+`"starting"` behind this run's exclusive flock for the whole window (its
+`gpu-lock-wait.sh` wrapper honoring the shared lock). The arm is KEPT on the physical
+evidence — GTT flat at the run's own 108.27 GB = 100.8 GiB footprint (identical to arm S's), KFD
+showing only the run's PID — which is the non-contention the `/running` probe is a proxy
+for. First observed instance of the lock contract HOLDING a wrapped tenant out mid-run:
+the working half of the story whose broken half (unwrapped tenants invisible to the flock
+and KFD) `docs/reference/gpu-lock.md`'s correction documents.
+
+The residual reading — what the −5.3 cashes out against the M3a slot model, what stays
+unpriced inside moe's remaining ~31.6 ms above the byte floor, and `route` (75.9,
+untouched in both A/Bs) as the top residue — lives in the M3c SCORED note and the doc's
+verdict; the PROFILE lines above carry the record.
