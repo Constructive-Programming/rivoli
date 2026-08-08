@@ -146,6 +146,26 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     ppl_out: Option<String>,
 
+    /// V4 only: dump every decode position's full logit row (plus the engine's own argmax)
+    /// to PATH — the drift instrument for §M9's split-k quality A/B
+    /// (docs/investigations/v4-decode-decomposition.md). Format at
+    /// `V4Engine::arm_logit_trace`; read by docs/measurement/probes/v4_logit_drift.py.
+    /// Adds a blocking vocab-sized D2H per token, so no wall from a run carrying it is a
+    /// benchmark. Under `teacher-forcing` because it is V4's `--ppl`-class instrument.
+    #[cfg(feature = "teacher-forcing")]
+    #[arg(long, value_name = "PATH")]
+    logit_dump: Option<String>,
+
+    /// V4 only, requires --logit-dump: teacher-force the decode to CONSUME these tokens
+    /// (text file, one id per line — e.g. the argmax column of a previous --logit-dump)
+    /// while recording what the engine would have chosen. Two arms forced on one file are
+    /// positionally comparable at every position, which is what lets an A/B count argmax
+    /// flips over all 512 rather than up to the first divergence. A short file forces a
+    /// prefix and free-runs the rest.
+    #[cfg(feature = "teacher-forcing")]
+    #[arg(long, value_name = "TOKENS_FILE", requires = "logit_dump")]
+    force_tokens: Option<String>,
+
     /// Measure whether a layer's experts can be predicted BEFORE its attention runs — the
     /// feasibility question under cross-layer prefetch. Reports recall against the top-k and
     /// against the MISSES (the only reads a prefetch could save), plus what it would spend.
@@ -581,12 +601,26 @@ fn device_budget(max_mem: Option<u64>) -> Result<usize> {
 /// `attn`/`port`/`no_mtp` are passed individually rather than as `&Args`: `Config` takes
 /// ownership of four of `Args`' `String`s just above the dispatch, so `&a` is not borrowable
 /// there. The three are differently typed, so none is substitutable for another.
+/// The V4-only instrument flags, bundled so `run_v4`'s signature does not multiply cfg'd
+/// parameters (see the dispatch site). Empty — and `Default`-constructible — without
+/// `teacher-forcing`. Gated like its only consumer, `run_v4`, so a backend-less build
+/// does not carry a never-constructed struct.
+#[cfg(feature = "rocm")]
+#[derive(Default)]
+struct V4Instr {
+    #[cfg(feature = "teacher-forcing")]
+    logit_dump: Option<String>,
+    #[cfg(feature = "teacher-forcing")]
+    force_tokens: Option<String>,
+}
+
 #[cfg(feature = "rocm")]
 fn run_v4(
     cfg: &Config,
     attn: &str,
     port: Option<u16>,
     no_mtp: bool,
+    instr: V4Instr,
     // Gated to match the `Args` field it comes from, which has been `#[cfg(feature = "trace")]`
     // since the watchdog moved off an env var. Ungated it was an unused parameter on every
     // `--features rocm` build without `trace` — a warning nothing watches, because CI has no
@@ -701,6 +735,41 @@ fn run_v4(
     )?;
     info!("v4 pin built in {:.1}s", t.elapsed().as_secs_f64());
     let mut engine = rivoli::v4gpu::V4Engine::new(pin, v4, prompt_ids.len(), ngen)?;
+    #[cfg(feature = "teacher-forcing")]
+    if let Some(path) = &instr.logit_dump {
+        // `--force-tokens` without `--logit-dump` is refused by clap (`requires`), so the
+        // one shape left to guard is a force file that fails to parse — refused loudly
+        // rather than truncated to its valid prefix, because a silently-shortened force
+        // list turns a positionally-comparable A/B into a free-running one at some
+        // position nobody chose.
+        let force = instr
+            .force_tokens
+            .as_deref()
+            .map(|p| -> Result<Vec<u32>> {
+                std::fs::read_to_string(p)?
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(|l| {
+                        l.parse::<u32>()
+                            .map_err(|e| anyhow::anyhow!("--force-tokens {p}: {l:?}: {e}"))
+                    })
+                    .collect()
+            })
+            .transpose()?;
+        info!(
+            "logit trace armed: dump {path}, forcing {} token(s){}",
+            force.as_ref().map_or(0, Vec::len),
+            if force.is_some() {
+                " (positions past the list free-run)"
+            } else {
+                " (free-running)"
+            }
+        );
+        engine.arm_logit_trace(std::path::Path::new(path), force)?;
+    }
+    #[cfg(not(feature = "teacher-forcing"))]
+    let V4Instr {} = instr; // consume the empty bundle so the parameter is not unused
     // Wedge watchdog, same as GLM's. A V4 layer streams 6 of 256 experts against GLM's 8 of 256
     // over half as many layers, so the shared default is if anything generous here.
     //
@@ -811,15 +880,36 @@ fn main() -> Result<()> {
     match rivoli::artifact::model::arch_of_artifact(&cfg.model)? {
         rivoli::arch::Arch::GlmMoeDsa => {}
         rivoli::arch::Arch::DeepseekV4 => {
+            // One struct rather than two more cfg'd parameters: `run_v4` already forks on
+            // `trace` for `watchdog_secs`, and a second independent feature would need four
+            // call arms (`#[cfg]` on a call ARGUMENT is not stable, only on a formal
+            // parameter). `V4Instr` is empty without `teacher-forcing`, so the ungated
+            // parameter carries no dead value on a stock build.
+            let instr = V4Instr {
+                #[cfg(feature = "teacher-forcing")]
+                logit_dump: a.logit_dump.clone(),
+                #[cfg(feature = "teacher-forcing")]
+                force_tokens: a.force_tokens.clone(),
+            };
             // Two calls rather than one with a cfg'd argument: `#[cfg]` on a call ARGUMENT is
             // not stable (it needs `stmt_expr_attributes`), only on a formal parameter. The
             // previous shape passed a hard-coded `60` on the non-`trace` side, which looked
             // like a default and was in fact a value the callee could not use.
             #[cfg(feature = "trace")]
-            return run_v4(&cfg, &a.attn, a.port, a.no_mtp, a.watchdog_secs);
+            return run_v4(&cfg, &a.attn, a.port, a.no_mtp, instr, a.watchdog_secs);
             #[cfg(not(feature = "trace"))]
-            return run_v4(&cfg, &a.attn, a.port, a.no_mtp);
+            return run_v4(&cfg, &a.attn, a.port, a.no_mtp, instr);
         }
+    }
+    // The V4-only instruments, refused rather than ignored on the GLM path — a flag that
+    // silently does nothing is this repo's named failure shape. GLM's quality instrument
+    // is `--ppl`.
+    #[cfg(feature = "teacher-forcing")]
+    if a.logit_dump.is_some() || a.force_tokens.is_some() {
+        bail!(
+            "--logit-dump/--force-tokens are V4-only instruments; this artifact is GLM. \
+             The GLM quality instrument is --ppl."
+        );
     }
 
     // Model dimensions from the artifact's manifest.json.

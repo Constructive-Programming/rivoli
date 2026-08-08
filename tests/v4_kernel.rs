@@ -82,7 +82,9 @@ use rivoli::backend::hip::{
 };
 use rivoli::memory::device::DeviceBuf;
 use rivoli::v4oracle::{
-    forward::{Capture, Counters, Defect, ExpertW, LayerCtx, LayerW, Oracle},
+    forward::{
+        Capture, Counters, Defect, ExpertW, LayerCtx, LayerW, Oracle, wave_ladder,
+    },
     numerics::{
         act_quant_inplace, bf16_decode, bf16_encode, e2m1_decode, e4m3_decode, e8m0_decode, silu,
     },
@@ -1038,6 +1040,96 @@ fn the_branchless_decodes_match_the_oracle_bitwise() {
 /// Distinct byte values seen at dword byte position `p` of `w` — both byte-pattern
 /// sweeps COUNT their coverage with this rather than trusting their constructions
 /// (and jscpd caught them carrying the count verbatim before it was factored).
+/// One output row's operands and geometry, shared by the fold transliterations below.
+/// A struct rather than three seven-argument functions, because jscpd correctly reads a
+/// transliterated parameter list repeated three times as a clone — the `matvec_*` lists in
+/// `artifact/quant.rs` carry an exemption for exactly this shape, and a struct is the fix
+/// that needs none.
+struct FoldRow<'a> {
+    x: &'a [f32],
+    wrow: &'a [u8],
+    srow: &'a [f32],
+    lut: &'a [f32],
+    bsh: usize,
+    n4: usize,
+    k: usize,
+}
+
+impl FoldRow<'_> {
+    /// One THREAD's strided share of the fp8 dot, in the kernel's emitted contraction
+    /// (`common.hpp::fp8_dot_strided`: `q = x1·l1` rounded, then three fmas, then
+    /// `acc = fma(s, q, acc)`; the scalar tail is `acc = fma(x·l, s, acc)`) — the
+    /// transliteration BOTH fold-order tests build their partials from. `start`/`stride`
+    /// are the kernel's own arguments: `(lane, 32)` under wave-per-row `v4_gemv_fp8`,
+    /// `(threadIdx.x, 256)` under `v4_gemv_fp8_splitk`. One definition, because the two
+    /// tests pin the same chain against two different combine trees, and a drift between
+    /// two copies would be indistinguishable from the kernel drift they exist to catch.
+    fn chain(&self, start: usize, stride: usize) -> f32 {
+        let (x, wrow, srow, lut) = (self.x, self.wrow, self.srow, self.lut);
+        let mut acc = 0.0f32;
+        for jj in (start..self.n4).step_by(stride) {
+            let i0 = jj * 4;
+            let mut q = x[i0 + 1] * lut[wrow[i0 + 1] as usize];
+            q = x[i0].mul_add(lut[wrow[i0] as usize], q);
+            q = x[i0 + 2].mul_add(lut[wrow[i0 + 2] as usize], q);
+            q = x[i0 + 3].mul_add(lut[wrow[i0 + 3] as usize], q);
+            acc = srow[i0 >> self.bsh].mul_add(q, acc);
+        }
+        for i in ((self.n4 * 4 + start)..self.k).step_by(stride) {
+            acc = (x[i] * lut[wrow[i] as usize]).mul_add(srow[i >> self.bsh], acc);
+        }
+        acc
+    }
+
+    /// The row under `v4_gemv_fp8`'s WAVE-PER-ROW fold: 32 lane chains at stride 32, one
+    /// ladder (`v4oracle::forward::wave_ladder` — the shared definition). UNROUNDED — the
+    /// caller applies the bf16 store where the kernel does.
+    fn serial(&self) -> f32 {
+        let mut lanes = [0.0f32; 32];
+        for (l, acc) in lanes.iter_mut().enumerate() {
+            *acc = self.chain(l, 32);
+        }
+        wave_ladder(lanes)
+    }
+
+}
+
+/// Upload `(x, w, scales)` and dispatch `launch_v4_gemv_fp8` at `(m, n_out, k, block)`,
+/// groups = 1 — the device harness both fold-order tests share. Which KERNEL runs is the
+/// launcher's shape dispatch, which is part of what the split-k test asserts.
+fn gemv_fp8_on_device(
+    x: &[f32],
+    w: &[u8],
+    scales: &[f32],
+    m: usize,
+    n_out: usize,
+    k: usize,
+    block: usize,
+) -> Vec<f32> {
+    let (wd, sd, xd) = (to_device(w), to_device(&f32b(scales)), to_device(&f32b(x)));
+    let mut od = zeros(m * n_out * size_of::<f32>());
+    let stream = HipStream::new().expect("stream");
+    // SAFETY: `xd` is `m * k` f32, `wd` is `n_out * k` bytes, `sd` covers
+    // `ceil(n_out/block) * ceil(k/block)` f32, `od` is `m * n_out` f32; `sync_f32` joins
+    // the device before any buffer drops.
+    unsafe {
+        launch_v4_gemv_fp8(
+            xd.ptr().cast(),
+            wd.ptr().cast(),
+            sd.ptr().cast(),
+            m,
+            n_out,
+            k,
+            block,
+            1,
+            od.ptr_mut().cast(),
+            stream.raw(),
+        )
+    }
+    .expect("v4_gemv_fp8 dispatch");
+    sync_f32(&od)
+}
+
 fn position_coverage(w: &[u8], p: usize) -> usize {
     let mut seen = [false; 256];
     for b in w.iter().skip(p).step_by(4) {
@@ -1197,65 +1289,26 @@ fn the_fp8_dot_sums_in_source_order_through_both_loops() {
             .map(|j| {
                 let wrow = &w[j * K..(j + 1) * K];
                 let srow = &scales[(j >> bsh) * sc_cols..];
-                let mut lanes = [0.0f32; 32];
-                for (l, acc) in lanes.iter_mut().enumerate() {
-                    for jj in (l..n4).step_by(32) {
-                        let i0 = jj * 4;
-                        let mut q = x[i0 + 1] * lut[wrow[i0 + 1] as usize];
-                        q = x[i0].mul_add(lut[wrow[i0] as usize], q);
-                        q = x[i0 + 2].mul_add(lut[wrow[i0 + 2] as usize], q);
-                        q = x[i0 + 3].mul_add(lut[wrow[i0 + 3] as usize], q);
-                        *acc = srow[i0 >> bsh].mul_add(q, *acc);
-                    }
-                    for i in ((n4 * 4 + l)..K).step_by(32) {
-                        *acc = (x[i] * lut[wrow[i] as usize]).mul_add(srow[i >> bsh], *acc);
-                    }
-                }
-                // `wave_sum`'s shfl-down ladder. Out-of-range lanes keep their own value
-                // (which doubles them), but lane 0's tree never reads one — the kernel
-                // comment's "leaves lane 0 right regardless" — so only in-range adds are
-                // replayed and only lane 0 is used.
-                for o in [16usize, 8, 4, 2, 1] {
-                    let prev = lanes;
-                    for l in 0..(32 - o) {
-                        lanes[l] = prev[l] + prev[l + o];
-                    }
-                }
-                bf16_decode(bf16_encode(lanes[0]))
+                let row = FoldRow {
+                    x: &x,
+                    wrow,
+                    srow,
+                    lut: &lut,
+                    bsh,
+                    n4,
+                    k: K,
+                };
+                bf16_decode(bf16_encode(row.serial()))
             })
             .collect()
     };
-    let gpu = |block: usize| -> Vec<f32> {
-        let (wd, sd, xd) = (
-            to_device(&w),
-            to_device(&f32b(&scales)),
-            to_device(&f32b(&x)),
-        );
-        let mut od = zeros(N_OUT * size_of::<f32>());
-        let stream = HipStream::new().expect("stream");
-        // SAFETY: `xd` is `1 * 1 * K` f32, `wd` is `N_OUT * K` bytes, `sd` covers
-        // `ceil(N_OUT/block) * ceil(K/block)` f32 at both blocks, `od` is `N_OUT` f32;
-        // `sync_f32` joins the device before any buffer drops.
-        unsafe {
-            launch_v4_gemv_fp8(
-                xd.ptr().cast(),
-                wd.ptr().cast(),
-                sd.ptr().cast(),
-                1,
-                N_OUT,
-                K,
-                block,
-                1,
-                od.ptr_mut().cast(),
-                stream.raw(),
-            )
-        }
-        .expect("v4_gemv_fp8");
-        sync_f32(&od)
-    };
-
+    // `K = 1152 < 4096`, so both blocks stay on the wave-per-row kernel — the split-k
+    // dispatch is the other test's subject.
     for block in [128usize, 2] {
-        let (want, got) = (host(block), gpu(block));
+        let (want, got) = (
+            host(block),
+            gemv_fp8_on_device(&x, &w, &scales, 1, N_OUT, K, block),
+        );
         assert_eq!(
             bits(&want),
             bits(&got),

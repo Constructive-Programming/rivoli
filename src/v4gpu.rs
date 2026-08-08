@@ -792,6 +792,18 @@ fn ev_span_ns(a: &Event, b: &Event, what: &str) -> Result<u128> {
 ///
 /// Every device buffer is allocated once in [`V4Engine::new`] and none per token, which is
 /// `gpu.rs`'s rule and why a decode does not allocate on the hot path.
+/// State behind [`V4Engine::arm_logit_trace`] — see that method for the file format and
+/// `trace_step` for the forcing rule.
+#[cfg(feature = "teacher-forcing")]
+struct LogitTrace {
+    out: std::io::BufWriter<std::fs::File>,
+    /// Token to CONSUME at each recorded position, replacing the engine's own argmax —
+    /// arm K of a drift A/B forces arm S's recorded stream so every position stays
+    /// comparable instead of only the prefix before the first divergence.
+    force: Option<Vec<u32>>,
+    pos: usize,
+}
+
 pub struct V4Engine {
     pin: V4Pin,
     cfg: V4Config,
@@ -890,6 +902,13 @@ pub struct V4Engine {
     logits: DeviceBuf,
     argmax_dev: DeviceBuf,
     argmax_host: Vec<u8>,
+    /// §M9's quality instrument (`--logit-dump` / `--force-tokens`), armed by
+    /// [`V4Engine::arm_logit_trace`], `None` on every stock run. Behind `teacher-forcing`
+    /// because that is what it is — the V4 sibling of `--ppl`, a teacher-forced quality
+    /// instrument that puts a per-token vocab-sized D2H on the decode path, so a tok/s
+    /// from a build that could even ARM it means nothing.
+    #[cfg(feature = "teacher-forcing")]
+    logit_trace: Option<LogitTrace>,
 
     compute_stream: Stream,
     miss_stream: Stream,
@@ -1061,6 +1080,8 @@ impl V4Engine {
             logits: f32s(cfg.vocab)?,
             argmax_dev: DeviceBuf::new(size_of::<i32>() + size_of::<f32>())?,
             argmax_host: Vec::new(),
+            #[cfg(feature = "teacher-forcing")]
+            logit_trace: None,
             compute_stream: Stream::compute()?,
             miss_stream: Stream::miss()?,
             shared_stream: Stream::shared()?,
@@ -2494,6 +2515,72 @@ impl V4Engine {
         ))
     }
 
+    /// Arm the per-position logit trace (and optionally teacher-force the decode) — §M9's
+    /// quality instrument, `--logit-dump`/`--force-tokens` in `main`.
+    ///
+    /// File format, written here and read by
+    /// `docs/measurement/probes/v4_logit_drift.py`: `b"V4LT"`, vocab as u32 LE, then per
+    /// decode position: the engine's OWN argmax as u32 LE followed by all `vocab` logits
+    /// as f32 LE. The recorded argmax is the engine's own choice GIVEN the (possibly
+    /// forced) history — under forcing that is exactly the per-position statistic the
+    /// drift gates count, and two arms forced on the same token file are positionally
+    /// comparable for all 512 positions rather than only up to the first divergence.
+    #[cfg(feature = "teacher-forcing")]
+    pub fn arm_logit_trace(
+        &mut self,
+        path: &std::path::Path,
+        force: Option<Vec<u32>>,
+    ) -> Result<()> {
+        use std::io::Write;
+        let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+        out.write_all(b"V4LT")?;
+        out.write_all(&u32::try_from(self.cfg.vocab)?.to_le_bytes())?;
+        self.logit_trace = Some(LogitTrace { out, force, pos: 0 });
+        Ok(())
+    }
+
+    /// One trace step: record the engine's own argmax and the full logit row, then return
+    /// the token the decode should CONSUME — the forced one where a force list covers this
+    /// position, the engine's own otherwise (a short list forces a prefix and free-runs the
+    /// rest, which the arming log line states). A no-op returning `own` when the trace is
+    /// not armed, so the stock decode path is untouched even in a `teacher-forcing` build.
+    #[cfg(feature = "teacher-forcing")]
+    fn trace_step(&mut self, own: u32) -> Result<u32> {
+        use std::io::Write;
+        if self.logit_trace.is_none() {
+            return Ok(own);
+        }
+        // The full-row D2H is the instrument's price (~vocab * 4 B per token, blocking) and
+        // is exactly why this sits behind the feature: `read_prefix` joins the device, so a
+        // wall measured through it is the instrument's, not the decode's.
+        let row = read_prefix(&self.logits, self.cfg.vocab)?;
+        let tr = self.logit_trace.as_mut().expect("checked above");
+        tr.out.write_all(&own.to_le_bytes())?;
+        let mut bytes = Vec::with_capacity(row.len() * 4);
+        for v in &row {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        tr.out.write_all(&bytes)?;
+        let next = tr
+            .force
+            .as_ref()
+            .and_then(|f| f.get(tr.pos))
+            .copied()
+            .unwrap_or(own);
+        tr.pos += 1;
+        Ok(next)
+    }
+
+    /// The next token to consume: the device argmax, through the trace hook when a
+    /// `teacher-forcing` build has one armed. One definition for the prefill seed and the
+    /// decode-loop step, so the two sites cannot diverge on whether they record.
+    fn next_token(&mut self) -> Result<u32> {
+        let own = self.argmax()?;
+        #[cfg(feature = "teacher-forcing")]
+        let own = self.trace_step(own)?;
+        Ok(own)
+    }
+
     /// Prefill, then greedy decode. Returns the generated ids.
     ///
     /// **Speculative decode is not available on this path and cannot be.**
@@ -2517,7 +2604,7 @@ impl V4Engine {
         // why every `[m, ..]` buffer is sized for the prompt rather than for `MAXROW`.
         self.forward(prompt, 0)?;
         let prefill = t0.elapsed();
-        let mut cur = self.argmax()?;
+        let mut cur = self.next_token()?;
         let mut out = Vec::with_capacity(max_new);
         let t1 = std::time::Instant::now();
         // Decode-only buckets: whatever the prefill accumulated is discarded here, and the
@@ -2543,8 +2630,16 @@ impl V4Engine {
             // never 0 here — the prefill consumed position 0 — so the decode arm is unreachable
             // with a prefill's index space and vice versa.
             self.forward(&[cur], pos)?;
-            cur = self.argmax()?;
+            cur = self.next_token()?;
             pos += 1;
+        }
+        #[cfg(feature = "teacher-forcing")]
+        if let Some(tr) = self.logit_trace.as_mut() {
+            use std::io::Write;
+            // A BufWriter flushes on drop but swallows the error there; a truncated dump
+            // read as "no drift past position N" is exactly the silent kind this
+            // instrument exists to rule out.
+            tr.out.flush()?;
         }
         let (hits, misses) = (self.pin.routed.hits(), self.pin.routed.misses());
         let (dh, dm) = (hits - self.hits0, misses - self.misses0);

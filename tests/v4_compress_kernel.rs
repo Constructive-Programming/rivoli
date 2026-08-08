@@ -1208,6 +1208,10 @@ fn in_compressor_scope(d: Defect) -> bool {
         | Defect::HeadNormNotBf16
         | Defect::HeadNormOverAllTokens
         | Defect::HeadLogitsFromFirstRow => false,
+        // The split-k fold applies only to fp8-quantized GEMVs (`Oracle::splitk_selects`),
+        // and both compressor projections are `Linear(..., dtype=torch.float32)` — Dense in
+        // the oracle, so the predicate cannot select them at any shape.
+        Defect::SplitKFoldOrder => false,
     }
 }
 

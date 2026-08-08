@@ -282,6 +282,23 @@ defects! {
     /// decode, and at prefill it produces perfectly well-formed logits for the wrong token.
     HeadLogitsFromFirstRow,
 
+    // -- candidate designs, modelled before they are built -------------------------------
+    /// The split-k fp8 GEMV's fold order (`kernels/mla.hip::v4_gemv_fp8_splitk`), applied to
+    /// exactly the GEMVs the device dispatch predicate selects — see [`Oracle::splitk_selects`]
+    /// for the predicate and [`splitk_fold`] for the partial ordering, both derived from the
+    /// ONE spec in `docs/investigations/v4-decode-decomposition.md` §M9.
+    ///
+    /// **Not a transcription slip: a candidate design's arithmetic, priced on the real
+    /// checkpoint before the kernel was built** (the `SinkhornIterCountProbe` precedent —
+    /// a variant whose detectability is weight-dependent and which the toy CANNOT see:
+    /// the predicate needs `k >= 4096` and the toy's largest K is `dim = 256`, so the toy
+    /// matrix is structurally blind to it and it sits in `targeted_defects()` instead;
+    /// `the_splitk_fold_is_toy_blind_partition_exact_and_nonzero_at_real_dims` holds the
+    /// three structural claims). §M9's stretch is authorized to abandon byte-identity for
+    /// this ONE kernel and measure the quality drop instead; an emit under this defect vs
+    /// an emit under `None`, `v4-oracle cmp`'d, IS that measurement's host half.
+    SplitKFoldOrder,
+
     // -- precision ----------------------------------------------------------------------
     /// Skip the bf16 stores that go through `round_bf16`. Not a bug anyone would ship — it
     /// is here to MEASURE how much of the golden's value is bf16 fidelity, which sets the
@@ -325,6 +342,89 @@ impl Defect {
                 )
             })
     }
+}
+
+/// The split-k GEMV's fold, on the oracle's own per-element arithmetic — one half of the
+/// partial-ordering spec in `docs/investigations/v4-decode-decomposition.md` §M9; the other
+/// half is `kernels/mla.hip::v4_gemv_fp8_splitk`, and
+/// `tests/v4_kernel.rs::the_splitk_kernel_folds_in_the_registered_partial_order` pins the
+/// kernel to a transliteration of the SAME spec bit-for-bit, which is what closes the
+/// "oracle models a different reassociation than the kernel executes" failure mode.
+///
+/// The spec, restated (the doc is normative):
+/// 1. **Partition**: 256 partials, fixed at dispatch. Partial `t` owns dword-quads
+///    `q ≡ t (mod 256)` — columns `4q..4q+4` — folded in ascending column order within
+///    the partial. (`k % 4 == 0` is the predicate's own guard; every captured shape has
+///    `k = 4096`, i.e. 4 quads per partial.)
+/// 2. **Wave combine**: partials `32w..32w+32` reduce through `wave_sum`'s shfl-down
+///    ladder (offsets 16, 8, 4, 2, 1). Out-of-range lanes are not modelled because lane
+///    0's dependency cone never contains one — the same argument
+///    `the_fp8_dot_sums_in_source_order_through_both_loops` records for the serial
+///    kernel's ladder.
+/// 3. **Final fold**: the 8 wave sums added in ascending wave order by one thread.
+///
+/// What is deliberately NOT modelled, because it is IDENTICAL in both arms of the A/B this
+/// fold exists for and therefore cancels: the kernel's per-quad grouping
+/// `s * (x0*l0 + x1*l1 + x2*l2 + x3*l3)` and its FMA contraction. The oracle's serial fold
+/// already differs from the serial kernel by exactly those (the module doc's "NOT
+/// reproduced" list — the goldens' tolerance floor); `SplitKFoldOrder` vs `None` isolates
+/// the partition + combine-tree change, which is the only thing the split-k kernel changes
+/// relative to the serial kernel.
+///
+/// No `mul_add`, matching `linear`'s serial fold: both arms use plain `x*w` products in
+/// plain `+` chains, so the A/B's delta is reassociation and nothing else.
+pub fn splitk_fold(x: &[f32], w: &[f32]) -> f32 {
+    debug_assert_eq!(x.len(), w.len());
+    debug_assert!(x.len().is_multiple_of(4), "the predicate guards k % 4 == 0");
+    let quads = x.len() / 4;
+    splitk_combine(|start, stride| {
+        let mut p = 0.0f32;
+        for q in (start..quads).step_by(stride) {
+            for i in q * 4..q * 4 + 4 {
+                p += x[i] * w[i];
+            }
+        }
+        p
+    })
+}
+
+/// §M9's partition and combine tree, generic over the per-thread chain — ONE definition,
+/// shared by [`splitk_fold`] (the oracle's per-element chain) and the device test's
+/// transliteration of the kernel's fma chain (`tests/v4_kernel.rs::FoldRow::splitk`).
+/// Review 2026-08-08 found the earlier arrangement held two private copies of the
+/// partition and ladder whose agreement was inspection, not code — exactly failure mode
+/// #8's residual surface. Hoisted so the fold's SHAPE exists once: `chain(start, stride)`
+/// is called at `start = 32w + l`, `stride = 256`, wave sums fold ascending; the GPU test
+/// then pins the kernel to this same shape bit-for-bit, closing the loop executably.
+pub fn splitk_combine(chain: impl Fn(usize, usize) -> f32) -> f32 {
+    const THREADS: usize = 256; // ROWS_PER_BLOCK * WAVE — the split count, fixed at dispatch
+    const WAVE: usize = 32;
+    let mut acc = 0.0f32;
+    for wv in 0..THREADS / WAVE {
+        let mut lanes = [0.0f32; WAVE];
+        for (l, p) in lanes.iter_mut().enumerate() {
+            *p = chain(wv * WAVE + l, THREADS);
+        }
+        acc += wave_ladder(lanes);
+    }
+    acc
+}
+
+/// `wave_sum`'s shfl-down ladder over one wave's 32 partials, lane 0's result.
+/// Out-of-range lanes are not modelled: on the device they self-double, but lane 0's
+/// dependency cone reads a lane only at a step where all of that lane's prior updates
+/// were in-range, so the cone never contains a doubled value —
+/// `tests/v4_kernel.rs::the_fp8_dot_sums_in_source_order_through_both_loops` records the
+/// same argument for the serial kernel's ladder, and both fold tests replay this exact
+/// function.
+pub fn wave_ladder(mut lanes: [f32; 32]) -> f32 {
+    for o in [16usize, 8, 4, 2, 1] {
+        let prev = lanes;
+        for l in 0..(32 - o) {
+            lanes[l] = prev[l] + prev[l + o];
+        }
+    }
+    lanes[0]
 }
 
 // ---------------------------------------------------------------------------------------
@@ -715,10 +815,46 @@ impl Oracle {
         }
     }
 
+    /// Whether the device would dispatch this GEMV to `v4_gemv_fp8_splitk` — the oracle
+    /// half of the ONE dispatch predicate, spec'd in
+    /// `docs/investigations/v4-decode-decomposition.md` §M9 and mirrored by
+    /// `kernels/mla.hip::rivoli_v4_gemv_fp8`.
+    ///
+    /// `WMat::Fp8` here stands for "goes through `v4_gemv_fp8`" — every fp8-quantized
+    /// linear on the oracle's path does, and the one fp8-on-disk tensor consumed as Dense
+    /// (`wo_a`, whose device GEMV reads the fp8 bytes but is measured bit-equal to the
+    /// bf16 dequant) is excluded by shape anyway: `n_out = 8192 > 2048`, and it is also
+    /// the launcher's only `groups > 1` caller. The mirror is three of the launcher's
+    /// five terms; the two unmirrored ones discharge structurally — `groups == 1` by
+    /// wo_a's double exclusion, `block >= 4` because the oracle's `Fp8` is the 128x128
+    /// grid only. The shape terms are the launcher's own, same constants: at the seven
+    /// decode shapes this selects exactly `wq_a` [1024x4096], `wkv` [512x4096] and the
+    /// shared expert's gate/up [2048x4096] at `m = 1`. The bound is INCLUSIVE, so tiny
+    /// prefills can select too — `wq_a` at exactly `m = 2`, `wkv` through `m = 4` —
+    /// consistently on both sides; at the recorded prompts (goldens 13 tokens, bench
+    /// 218) prefill selects nothing. `k % 4 == 0` mirrors the launcher's guard that
+    /// keeps the fold on the dword path the spec orders (every captured `k` is 4096).
+    fn splitk_selects(&self, m: usize, n: usize, k: usize, w: &WMat) -> bool {
+        self.defect == Defect::SplitKFoldOrder
+            && matches!(w, WMat::Fp8 { .. })
+            && m * n <= 2048
+            && k >= 4096
+            && k.is_multiple_of(4)
+    }
+
     /// `model.py::linear` — dispatches on the weight's storage format. `x` is `[m, k]`
     /// row-major; the result is `[m, n]` and is NOT bf16-rounded here (callers round where
     /// the reference stores).
-    fn linear(&self, x: &[f32], m: usize, k: usize, w: &WMat) -> Vec<f32> {
+    ///
+    /// `pub` since 2026-08-08 (the `qk_norm` precedent) so
+    /// `tests/v4_oracle.rs::the_splitk_fold_is_toy_blind_partition_exact_and_nonzero_at_real_dims`
+    /// can drive the `splitk_selects` WIRING at real dims: review found that no committed
+    /// test ever reached `linear` with the predicate true — the toy drive selects nothing
+    /// by design and the real-dims probes called `splitk_fold` directly — so a predicate
+    /// typo that made it never-true would reproduce §M9's "all tensors bit-identical"
+    /// host result VACUOUSLY. The unrounded return is what makes the wiring observable
+    /// (the raw fold delta is ~59% of sums; the bf16 stores downstream absorb it).
+    pub fn linear(&self, x: &[f32], m: usize, k: usize, w: &WMat) -> Vec<f32> {
         // `assert`, not `debug_assert`: `[profile.release]` does not set `debug-assertions`
         // and CLAUDE.md prescribes `cargo test --release`, so a debug assertion here would
         // never run in the only configuration anyone uses. These are per-GEMM, not
@@ -751,17 +887,23 @@ impl Oracle {
             }
         };
         let a = xq.as_deref().unwrap_or(x);
+        let splitk = self.splitk_selects(m, n, k, w);
+
         let mut out = vec![0.0f32; m * n];
         let mut wr = Vec::with_capacity(k);
         for j in 0..n {
             self.wrow(w, j, &mut wr);
             for i in 0..m {
                 let xi = &a[i * k..i * k + k];
-                let mut acc = 0.0f32;
-                for t in 0..k {
-                    acc += xi[t] * wr[t];
-                }
-                out[i * n + j] = acc;
+                out[i * n + j] = if splitk {
+                    splitk_fold(xi, &wr)
+                } else {
+                    let mut acc = 0.0f32;
+                    for t in 0..k {
+                        acc += xi[t] * wr[t];
+                    }
+                    acc
+                };
             }
         }
         out

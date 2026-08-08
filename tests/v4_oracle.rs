@@ -34,7 +34,7 @@
 mod common;
 use common::residual_probe;
 
-use rivoli::v4oracle::forward::{Capture, Defect, HeadTailW, LayerCtx, Oracle};
+use rivoli::v4oracle::forward::{Capture, Defect, HeadTailW, LayerCtx, Oracle, splitk_fold};
 use rivoli::v4oracle::golden::{Diff, GoldenSet, diff, identical};
 use rivoli::v4oracle::numerics::{
     FP4_MAX, FP8_MAX, act_quant_inplace, bf16_decode, bf16_encode, e2m1_decode, e2m1_encode,
@@ -710,6 +710,11 @@ fn expect(d: Defect) -> Option<Expect> {
 
         // See `sinkhorn_has_converged_long_before_iteration_20`.
         Defect::SinkhornIterCountProbe => None,
+        // A candidate design's fold, not a slip, and the toy is structurally blind to it:
+        // the dispatch predicate needs `k >= 4096` and the toy's largest K is 256, so no
+        // toy GEMV can select it and a matrix row would assert on 43 vacuous cells. See
+        // `the_splitk_fold_is_toy_blind_partition_exact_and_nonzero_at_real_dims`.
+        Defect::SplitKFoldOrder => None,
         Defect::SinkhornCombTransposed | Defect::HcPostNoComb => e(
             &[".ffn_norm_out", ".out"],
             // `pre` comes straight from the mixes and never sees the Sinkhorn iterations,
@@ -1891,6 +1896,7 @@ fn targeted_defects() -> Vec<Defect> {
         Defect::RouterNoSoftplusThreshold,
         Defect::KvActQuantBlock128,
         Defect::SinkhornIterCountProbe,
+        Defect::SplitKFoldOrder,
         Defect::QkNormAfterRope,
         Defect::HcPreNoRsqrt,
         Defect::NoBf16Rounding,
@@ -2077,6 +2083,157 @@ fn sinkhorn_has_converged_long_before_iteration_20() {
     assert!(
         !identical(&full, &drive(&two, Defect::None)),
         "the gate cannot even see the Sinkhorn cut from 20 passes to 2"
+    );
+}
+
+/// The three structural claims behind excluding `SplitKFoldOrder` from the matrix, each the
+/// half a wrong exclusion would hide (docs/investigations/v4-decode-decomposition.md §M9):
+///
+/// 1. **Toy-blind**: the dispatch predicate needs `k >= 4096` and the toy's largest K is
+///    `dim = 256`, so no toy GEMV selects the fold and the capture is bit-identical to
+///    `None` — the `SinkhornIterCountProbe` shape of exclusion, asserted so it goes red the
+///    day a toy dimension grows past the predicate.
+/// 2. **Partition-exact**: over integer-valued f32s (addition exact in any order below
+///    2^24) the fold equals the ascending serial sum EXACTLY. A dropped, duplicated or
+///    misassigned quad is an integer-sized error here, not rounding — this is the test that
+///    the partition covers every column exactly once.
+/// 3. **Live at real dims**: on smooth data at k = 4096 the fold differs from the serial
+///    sum (else §M9's host measurement would be comparing a function to itself), and by a
+///    relative amount in f32-reassociation territory, not a magnitude change.
+/// 4. **Wired**: `Oracle::linear` reaches the fold exactly when `splitk_selects` says so —
+///    positive at the wkv shape, negative at the m, k and format exclusions (see the
+///    section's own comment for why a vacuously-true predicate is the hazard).
+#[test]
+fn the_splitk_fold_is_toy_blind_partition_exact_and_nonzero_at_real_dims() {
+    let (cfg, m) = model();
+    let ids = fixed_ids(cfg, "ids-pre", 5);
+    let drive = |d: Defect| {
+        let o = Oracle::new(cfg.clone(), d);
+        let mut h = residual_probe(cfg, "h-pre", 5);
+        common::prefill_capture(&o, &m.layers[0], 0, &ids, &mut h)
+    };
+    assert!(
+        identical(&drive(Defect::None), &drive(Defect::SplitKFoldOrder)),
+        "the toy can see the split-k fold: the matrix-exclusion argument is dead and this \
+         defect needs a real Expect row"
+    );
+
+    let k = 4096;
+    let mut r = NamedRng::new("splitk-fold-probe");
+    let xi: Vec<f32> = (0..k).map(|_| (r.unit() * 9.0).round()).collect();
+    let wi: Vec<f32> = (0..k).map(|_| (r.unit() * 9.0).round()).collect();
+    let serial = |x: &[f32], w: &[f32]| {
+        let mut acc = 0.0f32;
+        for (a, b) in x.iter().zip(w) {
+            acc += a * b;
+        }
+        acc
+    };
+    assert_eq!(
+        splitk_fold(&xi, &wi).to_bits(),
+        serial(&xi, &wi).to_bits(),
+        "integer probe: the split-k partition dropped or double-counted a column"
+    );
+
+    let x: Vec<f32> = (0..k).map(|_| r.unit() * 0.05).collect();
+    let w: Vec<f32> = (0..k).map(|_| r.unit() * 0.05).collect();
+    let (s, p) = (serial(&x, &w), splitk_fold(&x, &w));
+    assert_ne!(
+        s.to_bits(),
+        p.to_bits(),
+        "smooth probe: the two folds agree bitwise at k = 4096 — the A/B would compare a \
+         function to itself"
+    );
+    // Reassociating a 4096-term f32 sum moves it by rounding, not by magnitude. The bound
+    // is generous on purpose (the probe's terms cancel toward zero, inflating RELATIVE
+    // error); what it must catch is a fold that computes a different SUM, not worse
+    // rounding.
+    let scale = x
+        .iter()
+        .zip(&w)
+        .map(|(a, b)| (a * b).abs())
+        .sum::<f32>()
+        .max(f32::MIN_POSITIVE);
+    assert!(
+        ((s - p) / scale).abs() < 1e-5,
+        "smooth probe: |serial - splitk| = {} against a term-magnitude sum of {scale} — \
+         this is not reassociation noise",
+        (s - p).abs()
+    );
+
+    // 4. The WIRING — `linear` must actually reach the fold when `splitk_selects` says so.
+    //    Review 2026-08-08: the sections above bypass the predicate entirely (the toy
+    //    drive selects nothing by design; the probes call `splitk_fold` directly), so a
+    //    predicate typo that made it never-true would reproduce §M9's "all tensors
+    //    bit-identical" host measurement VACUOUSLY. `linear` returns UNROUNDED values, so
+    //    the raw fold delta (~59% of sums on real weights) is observable here even though
+    //    every golden downstream absorbs it in a bf16 store. wkv's [512x4096] is the
+    //    smallest captured shape; the negatives pin the m, k and format terms.
+    let (rows, kk) = (512usize, 4096usize);
+    let mut rw = NamedRng::new("splitk-wiring");
+    let wb: Vec<u8> = (0..rows * kk)
+        .map(|_| {
+            loop {
+                let b = rw.below(256) as u8;
+                // The two e4m3 NaN codes poison a sum into NaN != NaN noise.
+                if !matches!(b, 0x7f | 0xff) {
+                    break b;
+                }
+            }
+        })
+        .collect();
+    // One 2^0 scale per 128x128 tile: 4 row-blocks x 32 column tiles.
+    let fp8 = |r: usize, c: usize, w: &[u8]| WMat::Fp8 {
+        rows: r,
+        cols: c,
+        w: w.to_vec(),
+        s: vec![127u8; r.div_ceil(128) * c.div_ceil(128)],
+    };
+    let wired = fp8(rows, kk, &wb);
+    let xw: Vec<f32> = (0..13 * kk).map(|_| rw.unit() * 0.05).collect();
+    let out = |d: Defect, m: usize, w: &WMat, k: usize| {
+        Oracle::new(cfg.clone(), d).linear(&xw[..m * k], m, k, w)
+    };
+    let differs = |a: Vec<f32>, b: Vec<f32>| -> bool {
+        a.iter().zip(&b).any(|(x, y)| x.to_bits() != y.to_bits())
+    };
+    assert!(
+        differs(
+            out(Defect::None, 1, &wired, kk),
+            out(Defect::SplitKFoldOrder, 1, &wired, kk)
+        ),
+        "the predicate no longer reaches the fold through `linear` at the wkv shape — \
+         every downstream null host result is vacuous until this is red-to-green again"
+    );
+    for (name, m, w, k) in [
+        ("m = 13 (recorded-prompt prefill)", 13usize, &wired, kk),
+        (
+            "k = 2048 (below the k bound)",
+            1,
+            &fp8(rows, 2048, &wb[..rows * 2048]),
+            2048,
+        ),
+    ] {
+        assert!(
+            !differs(
+                out(Defect::None, m, w, k),
+                out(Defect::SplitKFoldOrder, m, w, k)
+            ),
+            "{name} must NOT select the split fold"
+        );
+    }
+    let dense = WMat::Dense {
+        rows,
+        cols: kk,
+        v: wb[..rows * kk].iter().map(|&b| b as f32 * 0.01).collect(),
+    };
+    assert!(
+        !differs(
+            out(Defect::None, 1, &dense, kk),
+            out(Defect::SplitKFoldOrder, 1, &dense, kk)
+        ),
+        "a Dense weight at a captured shape must NOT select the split fold — the format \
+         term is what keeps the compressor/gate/wo_a out"
     );
 }
 

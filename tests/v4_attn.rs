@@ -2311,6 +2311,13 @@ fn expect_moves(d: Defect) -> &'static [&'static str] {
         //    `QkNormAfterRope` is deliberately NOT here — it moves four goldens; the
         //    measurement and the argument are at the q-path arm above.
         Defect::KvActQuantBlock128 => &[],
+        //    Same group, different mechanism: the split-k dispatch predicate needs
+        //    `k >= 4096` (`Oracle::splitk_selects`) and this fixture's largest K is
+        //    `dim = 256`, so the fold is structurally unreachable here — asserted, with the
+        //    partition/liveness halves, by `tests/v4_oracle.rs::
+        //    the_splitk_fold_is_toy_blind_partition_exact_and_nonzero_at_real_dims`; the
+        //    real-dims measurement is §M9's host table.
+        Defect::SplitKFoldOrder => &[],
         // 4. DOWNSTREAM OF `attention`. `run_layer` runs the MoE after it and `h` is drawn
         //    fresh per step, so nothing here can reach an attention golden. The Sinkhorn
         //    pair is in this group and not group 3: `comb` is consumed by `hc_post`, and
