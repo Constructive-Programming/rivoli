@@ -82,7 +82,7 @@ use crate::backend::hip::{
     launch_v4_dense_gemm_bf16, launch_v4_embed_bf16_row, launch_v4_gemv_fp8, launch_v4_hc_head,
     launch_v4_rmsnorm, memcpy_dtod,
 };
-use crate::backend::{NULL_STREAM, Stream};
+use crate::backend::{Event, NULL_STREAM, Stream};
 use crate::gpu::as_le_bytes;
 use crate::math::{Scoring, f32_to_bf16, route_into};
 use crate::memory::device::DeviceBuf;
@@ -611,12 +611,66 @@ impl AttnStages {
 ///   `tail` names the head share of it, leaving `remainder − tail` = the per-layer
 ///   launch/sync residue (candidate 4's other half). A sub-span of the remainder by
 ///   construction — disjoint from both brackets on the same thread.
+///
+/// # The route split (M4): device sub-spans of the work the gate D2H drains
+///
+/// Four HIP-event-pair accumulators say WHICH phase `route`'s wait drains (M2 measured it
+/// ~76 ms against ~31 ms of bytes and could not say). Same instrument as GLM's
+/// `idx_gpu_ns`, and like it a SPAN, gaps included, not a kernel sum: six marks per layer
+/// on the null stream, read at the gate-logits D2H — the join the route bracket already
+/// closes on — so no new sync, event wait, or join. Marks record on EVERY layer; a phase
+/// a layer class skips (the two ratio-0 layers run no compressor) reads ~zero-width, so
+/// the accumulation is uniform across classes rather than conditional. The coverage map
+/// (marks are program order; the full residual argument and the per-span byte budgets
+/// live in `docs/investigations/v4-decode-decomposition.md` §M4):
+///
+/// * `hcn_ns` — marks 0→1 + 3→4: `hc_pre` + `attn_norm`, and `hc_post` + `hc_pre` +
+///   `ffn_norm` — the hyper-connection application and both sublayer norm chains.
+/// * `cmp_ns` — marks 1→2: `compress_and_place` (the deposit and both placement copies)
+///   plus the GPU idle while the host builds and uploads the positional selection.
+/// * `attn_ns` — marks 2→3: the `attn::v4::attention` call, whole — q/kv projections,
+///   cache write, `sparse_attn`, o_proj. Splitting INSIDE it needs marks in `attn.rs`,
+///   outside this stretch's ownership; one span, said so here and in the plan doc.
+/// * `gate_ns` — marks 4→5: the gate GEMV, the `xq` copy and its act_quant.
+/// * `win_wall_ns` — the HOST wall containing them: layer top to the D2H's return. The
+///   four spans tile marks 0→5 INSIDE that wall (mark 0 records after the wall clock
+///   starts; mark 5 retires before the D2H's data lands), so the printed
+///   `resid = win − Σspans` is non-negative by construction: it holds the D2H copy, the
+///   pre-mark-0 lag (layer 0's includes the step's pending embed gather), and GPU-vs-host
+///   clock skew. `resid` is defined against `win` and NOT against `route`, because
+///   `route` does not contain the spans — GPU time overlapping the host's pre-D2H
+///   traversal is invisible to `route`'s clock but visible to the events; §M4 carries the
+///   reconciliation (`win − d2h` = the traversal the PROFILE remainder holds).
+/// * `route_host_ns` — `route_row`'s host share of `route_ns`, from clock reads the
+///   bracket already pays, so the print can restate `route` as its `d2h + host` halves.
+///
+/// Cost bound, extending the O(10 µs) argument above: 258 `hipEventRecord` enqueues + 215
+/// completed-event queries per token, O(µs) each — O(1.5 ms) worst case against a 170 ms
+/// token. A bound by argument, not a control; M4's wall gate (±3% of the recorded 169.9)
+/// is the control, and a breach is reported before any reading of the split.
 #[derive(Default)]
 struct V4Profile {
     route_ns: u128,
+    /// `route_row`'s host share of `route_ns` — accumulated beside it, never beyond it.
+    route_host_ns: u128,
     moe_ns: u128,
     tail_ns: u128,
+    win_wall_ns: u128,
+    hcn_ns: u128,
+    cmp_ns: u128,
+    attn_ns: u128,
+    gate_ns: u128,
 }
+
+/// The route-split marks' indices into [`V4Engine::route_ev`], program order — named so
+/// the record sites and the pair reads spell the same map [`V4Profile`] documents, and a
+/// transposed pair is visible at the call site instead of plausible.
+const M_TOP: usize = 0;
+const M_ATTN_NORMED: usize = 1;
+const M_SEL: usize = 2;
+const M_ATTN_DONE: usize = 3;
+const M_FFN_NORMED: usize = 4;
+const M_GATE: usize = 5;
 
 /// Everything one V4 decode needs that does not vary between tokens.
 ///
@@ -726,6 +780,16 @@ pub struct V4Engine {
     hits0: u64,
     misses0: u64,
     prof: V4Profile,
+    /// The six route-split marks, program order (see [`V4Profile`]). ONE array reused
+    /// every layer: each layer's pairs are read at its own gate D2H, before the next
+    /// layer records over them, so reuse cannot cross-read.
+    route_ev: [Event; 6],
+    /// `Some` from layer top until the gate D2H returns — the token saying "this `moe`
+    /// call closes a window [`V4Engine::layer`] opened". Today `moe` is only entered from
+    /// `layer`, which always opens the window first; the `Option` is what keeps a FUTURE
+    /// probe-driven `moe` from booking a window that never opened or reading marks it
+    /// never recorded (`probe_attn_stages` already records marks 2/3 and never reads).
+    win_t0: Option<std::time::Instant>,
 }
 
 impl V4Engine {
@@ -809,6 +873,12 @@ impl V4Engine {
         }
 
         let (hits0, misses0) = (pin.routed.hits(), pin.routed.misses());
+        // A `Vec` because `[Event::new()?; 6]` cannot exist (`Event` is not `Copy`) and six
+        // spelled-out calls are the duplication gate's food.
+        let mut marks = Vec::with_capacity(6);
+        for _ in 0..6 {
+            marks.push(Event::new()?);
+        }
         let mut e = Self {
             dims,
             rope: RopeTables::new(&cfg, max_ctx),
@@ -867,6 +937,10 @@ impl V4Engine {
             hits0,
             misses0,
             prof: V4Profile::default(),
+            // Infallible at runtime — the loop above pushed exactly six — but `try_into`'s
+            // error type is the `Vec` back, so `context` is the honest spelling.
+            route_ev: marks.try_into().ok().context("six route-split events")?,
+            win_t0: None,
             pin,
             cfg,
         };
@@ -1175,12 +1249,17 @@ impl V4Engine {
         } else {
             v4::Pass::Decode { pos: start_pos }
         };
+        // Mark 2: selection uploaded, nothing of `attention` queued yet — `attn`'s span
+        // opens here, so the compressor span behind it keeps the selection-build idle.
+        self.route_ev[M_SEL].record(NULL_STREAM)?;
         // SAFETY: every pointer in `w` is a pin placement outliving this engine; every pointer in
         // `s`/`io` is a `DeviceBuf` field of `self` at the size its field documents, and no two
         // are the same allocation — `xq` is attention's own scratch here, re-derived from `io.x`
         // inside `attention` before any read.
         unsafe { v4::attention(&self.dims, sel, &w, &s, &io, step, NULL_STREAM) }
-            .with_context(|| format!("layer {layer} attention at ({m}, {start_pos})"))
+            .with_context(|| format!("layer {layer} attention at ({m}, {start_pos})"))?;
+        // Mark 3: `attn` closes on the call's last enqueue.
+        self.route_ev[M_ATTN_DONE].record(NULL_STREAM)
     }
 
     /// Bind one step's `Io`.
@@ -1605,12 +1684,33 @@ impl V4Engine {
             memcpy_dtod(xq, xw, m * dim * size_of::<f32>())?;
             launch_act_quant_f8(xq.cast(), m, dim, std::ptr::null_mut())?;
         }
+        // Mark 5: the gate chain's last enqueue — the D2H below is what retires it.
+        self.route_ev[M_GATE].record(NULL_STREAM)?;
         // The one blocking D2H on the per-layer path, and GLM pays the same one: `route_into` is
         // host math. `m * n_experts` f32 — 1 KB at decode. The bracket is free — the D2H is a
         // join the path already pays (see [`V4Profile`] for what its wait actually contains).
         let t0 = std::time::Instant::now();
         self.gate_logits.copy_out_into(&mut self.gl_host)?;
         self.prof.route_ns += t0.elapsed().as_nanos();
+        // The route-split read: the D2H just drained the null stream, so all six of this
+        // layer's marks have retired and each pair is a completed-event query, not a wait.
+        if let Some(w0) = self.win_t0.take() {
+            self.prof.win_wall_ns += w0.elapsed().as_nanos();
+            let span = |a: usize, b: usize| -> Result<u128> {
+                let ms = Event::elapsed_ms(&self.route_ev[a], &self.route_ev[b])?;
+                // A negative pair would saturate to 0 below and read as a plausible
+                // zero-width span; program order makes it impossible, so it is a bug.
+                debug_assert!(
+                    ms >= 0.0,
+                    "route-split pair ({a},{b}) out of order: {ms} ms"
+                );
+                Ok((f64::from(ms) * 1e6) as u128)
+            };
+            self.prof.hcn_ns += span(M_TOP, M_ATTN_NORMED)? + span(M_ATTN_DONE, M_FFN_NORMED)?;
+            self.prof.cmp_ns += span(M_ATTN_NORMED, M_SEL)?;
+            self.prof.attn_ns += span(M_SEL, M_ATTN_DONE)?;
+            self.prof.gate_ns += span(M_FFN_NORMED, M_GATE)?;
+        }
         let t0 = std::time::Instant::now();
         self.shared_expert(layer, m)?;
         self.prof.moe_ns += t0.elapsed().as_nanos();
@@ -1619,7 +1719,9 @@ impl V4Engine {
             self.route_row(layer, t)?;
             let r1 = std::time::Instant::now();
             self.routed_experts(layer, t)?;
-            self.prof.route_ns += r1.duration_since(r0).as_nanos();
+            let host = r1.duration_since(r0).as_nanos();
+            self.prof.route_ns += host;
+            self.prof.route_host_ns += host;
             self.prof.moe_ns += r1.elapsed().as_nanos();
         }
         Ok(())
@@ -1694,8 +1796,16 @@ impl V4Engine {
     fn layer(&mut self, layer: usize, m: usize, start_pos: usize) -> Result<()> {
         let (dim, hc) = (self.cfg.hidden, self.cfg.hc_mult);
         let null = std::ptr::null_mut();
+        // The route-split window opens (see [`V4Profile`]): the wall clock first, then mark
+        // 0, so the window contains the mark by construction. The stream is drained here on
+        // every layer but the step's first (the previous layer's end-of-layer sync), where
+        // only the embed gather can be pending.
+        self.win_t0 = Some(std::time::Instant::now());
+        self.route_ev[M_TOP].record(NULL_STREAM)?;
         for ffn in [false, true] {
             self.pre_norm(layer, ffn, m)?;
+            // Marks 1 and 4: the sublayer's hc/norm chain is queued — `hcn`'s two spans.
+            self.route_ev[if ffn { M_FFN_NORMED } else { M_ATTN_NORMED }].record(NULL_STREAM)?;
 
             if ffn {
                 self.moe(layer, m)?;
@@ -2237,9 +2347,10 @@ impl V4Engine {
         // engines' lines read alike.
         let n = out.len().max(1) as f64;
         let wall_ms = decode * 1e3 / n;
-        let route_ms = self.prof.route_ns as f64 / 1e6 / n;
-        let moe_ms = self.prof.moe_ns as f64 / 1e6 / n;
-        let tail_ms = self.prof.tail_ns as f64 / 1e6 / n;
+        let per = |ns: u128| ns as f64 / 1e6 / n;
+        let route_ms = per(self.prof.route_ns);
+        let moe_ms = per(self.prof.moe_ns);
+        let tail_ms = per(self.prof.tail_ns);
         let fetch_ns = (self.pin.routed.fetch_ns() - fetch0) as f64;
         let dec_miss = self.pin.routed.misses() - miss1;
         let remainder_ms = wall_ms - route_ms - moe_ms;
@@ -2269,6 +2380,31 @@ impl V4Engine {
             dec_miss as f64 / n,
             fetch_ns / 1e6 / dec_miss.max(1) as f64,
             dec_miss as f64 * stride as f64 / 1e9 / n,
+        );
+        // The route split (M4, see [`V4Profile`]): where the D2H wait's GPU time goes. The
+        // four spans tile marks 0→5 inside `win`, the host wall that contains them; `resid`
+        // is the wall's unexplained share (the D2H copy + pre-mark-0 lag) and the summing
+        // check itself. `d2h + host` restates `route` as its halves, same accumulators.
+        let (win_ms, hcn_ms) = (per(self.prof.win_wall_ns), per(self.prof.hcn_ns));
+        let (cmp_ms, attn_ms) = (per(self.prof.cmp_ns), per(self.prof.attn_ns));
+        let (gate_ms, host_ms) = (per(self.prof.gate_ns), per(self.prof.route_host_ns));
+        let resid_ms = win_ms - (hcn_ms + cmp_ms + attn_ms + gate_ms);
+        let d2h_ms = route_ms - host_ms;
+        // 5e-2 ms and not 1e-6: `win` is a host clock and the spans are GPU timestamps, so
+        // the slack must cover their rate skew over ~80 ms of summed spans — ~100 ppm ≈
+        // 10 µs, and 100 ppm is a typical oscillator figure rather than a bound, hence the
+        // headroom. In practice `resid` carries a structurally POSITIVE floor (43 layers of
+        // D2H copy + pre-mark-0 lag), so a fire means a mark recorded outside its window,
+        // which shows whole milliseconds.
+        debug_assert!(
+            resid_ms >= -5e-2,
+            "negative ROUTE-SPLIT residual ({resid_ms:.3} ms/tok): an event span exceeds \
+             the window wall that contains it by construction"
+        );
+        tracing::info!(
+            "ROUTE-SPLIT/tok: attn {attn_ms:.1}ms | cmp {cmp_ms:.1}ms | hcn {hcn_ms:.1}ms | \
+             gate {gate_ms:.1}ms | win {win_ms:.1}ms (resid {resid_ms:.1}ms) | \
+             d2h {d2h_ms:.1}ms + host {host_ms:.1}ms"
         );
         self.pin.routed.flush_trace()?;
         Ok(out)

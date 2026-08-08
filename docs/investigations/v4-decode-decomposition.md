@@ -1,7 +1,7 @@
 ---
 scope: v4
 status: live
-verdict: OPEN, first lever LANDED. M3b measured 2026-08-07: batching a layer's resident experts into one range launch (misses stay per-expert behind their tickets) took moe 70.6 → 54.7 ms/token and wall 186.2 → 169.9 = 5.887 tok/s (+9.6%), output byte-identical, hit/miss identical, fetch fell — the registered prediction (−3..−8) was wrong on the GOOD side: per-launch cost is the ~25 µs host-bubble class, not the 1.97 µs dispatch floor it was priced on. tail measured 8.2 of the 39.1 ms remainder. Residue to 10 tok/s (~70 ms off the wall): route ~76 (attention phase still needs its own split) > moe ~32 above bytes (fp4 kernel issue-bound per the M3a ISA read: 195 instr per 128 weight bytes/wave, exec-mask e2m1 decode, flat loads; miss exposure and shared GEMV unpriced) > remainder ~31 non-tail. M2's decomposition and floor (~62 ms/token ≈ 16 tok/s ceiling) stand; buckets still not certified free (wall spread ±1.5% over three stock-class runs).
+verdict: OPEN, first lever LANDED. M3b measured 2026-08-07: batching a layer's resident experts into one range launch (misses stay per-expert behind their tickets) took moe 70.6 → 54.7 ms/token and wall 186.2 → 169.9 = 5.887 tok/s (+9.6%), output byte-identical, hit/miss identical, fetch fell — the registered prediction (−3..−8) was wrong on the GOOD side: per-launch cost is the ~25 µs host-bubble class, not the 1.97 µs dispatch floor it was priced on. tail measured 8.2 of the 39.1 ms remainder. Residue to 10 tok/s (~70 ms off the wall): route ~76 (attention phase still needs its own split) > moe ~32 above bytes (fp4 kernel issue-bound per the M3a ISA read: 195 instr per 128 weight bytes/wave, exec-mask e2m1 decode, flat loads; miss exposure and shared GEMV unpriced) > remainder ~31 non-tail. M2's decomposition and floor (~62 ms/token ≈ 16 tok/s ceiling) stand; buckets still not certified free (wall spread ±1.5% over three stock-class runs). M4 STAGED 2026-08-08: route's internals bracketed — four HIP-event sub-spans (attn/cmp/hcn/gate) read at the existing gate D2H against a per-layer window wall with a printed residual, no new join; per-span byte budgets from the artifact header (window ~6.0 GB ≈ 31 ms, attn 4.64 GB ≈ 24 of it); prediction registered (attn dominates: 45–62 of win ~76–86 ms); GPU run pending.
 ---
 
 # Where do V4-Flash's 185 ms/token go?
@@ -281,6 +281,107 @@ bucket, NOT wall — the recorded +2.9% run-to-run wall variance swallows a 5 ms
 |Δmoe| < ~3 ms/token the arms need replicates before any claim. (3) `fetch` must not grow —
 growth is the tell that batching serialised hits behind misses. (4) `tail` from arm B is
 M2 ranking item (3)'s first number, free from the same run.
+
+## M4 — the route split, STAGED 2026-08-08 (instrument landed, no GPU yet)
+
+`route` is the largest sink — ~76 ms against ~31 ms of bytes — and M2's reading said its
+excess "needs the phase's own split before a lever is named". This stretch lands the split:
+six HIP-event marks per layer on the null stream (`src/v4gpu.rs`, `V4Profile` "The route
+split"), four spans read at the gate-logits D2H — the join the route bracket already closes
+on — so there is **no new sync, event wait, or join**. The spans are SPANS in GLM's
+`idx_gpu_ns` sense: gaps included, not kernel sums (GLM measured its span 27% above one).
+
+**What each bracket covers, exactly (marks are program order on one stream):**
+
+- `hcn` — marks 0→1 + 3→4: `hc_pre` + `attn_norm`, and `hc_post` + `hc_pre` + `ffn_norm` —
+  the hyper-connection application and both sublayer norm chains (two spans, one bucket:
+  one lever class).
+- `cmp` — marks 1→2: `compress_and_place` (the compressor deposit and both blocking
+  placement copies) plus the GPU idle while the host builds and uploads the positional
+  selection. The marks record on EVERY layer — the two ratio-0 layers just read ~zero-width
+  — so the accumulation is uniform across layer classes rather than conditional, which is
+  how the fires-on-some-layers failure mode is excluded by construction. There is no
+  learned-indexer kernel on this path (positional selection, valid to 2052 tokens; this
+  benchmark peaks at position ~730), so `cmp` IS the whole per-layer selection cost.
+- `attn` — marks 2→3: the `attn::v4::attention` call, whole — q/kv projections, cache
+  write, `sparse_attn`, o_proj. **The intra-attention split (qkv vs attend vs o_proj) stays
+  unbucketed this stretch and this line says so:** it needs marks inside one straight-line
+  function in `src/attn.rs`, outside this stretch's file ownership — no new join, just
+  ownership; three more marks there are the follow-up if `attn` dominates.
+- `gate` — marks 4→5: the gate GEMV, the `xq` copy and its `act_quant` — the last launches
+  before the D2H.
+- `win` — the HOST wall containing the four spans (they tile marks 0→5 inside it): layer
+  top to the D2H's return. Printed with `resid = win − (hcn+cmp+attn+gate)`, which is
+  **the summing check by construction, not by hope**: the window contains every pair
+  (mark 0 records after the window clock starts; mark 5 retires before the D2H's data
+  lands), so `resid ≥ 0` up to GPU-vs-host clock-rate skew — a dev-profile assert — and
+  holds the D2H copy plus the pre-mark-0 lag (layer 0's includes the step's embed gather).
+  The residual is defined against `win` and NOT against `route`, deliberately: `route` =
+  D2H wait + `route_row` host math, `win` = pre-D2H host traversal + D2H wait, so the event
+  sum can legitimately exceed `route` — GPU time that overlapped host traversal is
+  invisible to `route`'s clock but visible to the events. The two are reconciled on the
+  same line: `d2h + host` restates `route` as its halves (`route_host_ns` splits it at the
+  clock reads the bracket already pays), so `win − d2h` = the traversal share the PROFILE
+  remainder holds.
+
+One geometry observation recorded while reading, M1b-style (mechanism candidate, not a
+claim): the gate-logits D2H copies the WHOLE `gate_logits` buffer every layer —
+`copy_out_into` has no row count, and the buffer is sized `max_m × n_experts` f32 = 218 ×
+256 × 4 ≈ 223 KB at this prompt — where decode reads one row (1 KB). ~9.6 MB/token of
+blocking D2H, lands in `resid`/`d2h`; if `resid` measures large, this is the first suspect
+and a one-argument fix (`copy_out_prefix` already exists).
+
+No host-side test is added for the accumulation and that is a decision, not an omission:
+the pairing is five fixed index pairs feeding four adds, HIP events cannot exist without a
+device, and a test restating the constants would be the tautological-assertion class this
+repo has shipped twice. The printed residual is the check, on every run.
+
+**Bytes budget per sub-span** — host arithmetic over `resident.safetensors`'s own tensor
+shapes (read from the artifact header 2026-08-08), decode m=1, per token = 43 layers:
+
+| span | read per layer | per token | at 193.8 GB/s |
+|---|---|---:|---:|
+| hcn | `hc_attn_fn`+`hc_ffn_fn` [24,16384] f32 = 3.15 MB, norms 0.03, ~0.5 MB h/xw activations | 0.158 GB | 0.8 ms |
+| cmp | compressor `wkv`+`wgate` f32: [1024,4096]×2 = 33.6 MB on the 21 ratio-4 layers, [512,4096]×2 = 16.8 MB on the 20 ratio-128, 0 on the 2 ratio-0 | 1.040 GB | 5.4 ms |
+| attn | fp8 `wq_a` 4.19 + `wq_b` 33.55 + `wkv` 2.10 + `wo_a` 33.55 + `wo_b` 33.55 + scales 0.03 = 107.0 MB, + ≤1 MB selected KV + activations | 4.640 GB | 23.9 ms |
+| gate | `ffn.gate.weight` [256,4096] f32 = 4.19 MB + 0.08 activation | 0.184 GB | 0.9 ms |
+| **window** | | **~6.02 GB** | **~31.1 ms** |
+
+(M2's aggregate priced route at "~6.4 GB ≈ 33 ms"; the per-span sum re-derives ~6.0 GB —
+the drift is M2's lump including rows now booked to other buckets. The indexer's 17.8
+MB/ratio-4-layer of weights is resident but never read: the engine selects positionally.)
+
+**Prediction, registered before the measurement so it can be wrong:** `attn` dominates the
+window — **45–62 ms of a predicted win ≈ 76–86 ms (point: attn 55, cmp 10, hcn 6, gate 5,
+resid 4, win 80)** — i.e. attention runs ~2.3× its 23.9 ms of bytes and carries most of
+route's ~46 ms excess, with the fp8 GEMV projections (103 of the 107 MB/layer) the suspected
+mechanism in the M3a family (issue-bound decode, unverified for fp8) alongside
+`sparse_attn`'s gathered reads. `cmp` second at 8–12 ms (5.4 of bytes + two blocking
+placement copies + the selection stall), `hcn` 4–8 and `gate` 3–6 (both far above their
+<1 ms of bytes — the ~25 µs host-bubble launch class M3b measured, not traffic). **What each
+outcome kills:** `attn` under half the window kills the fp8-kernel-rate lever (and the ISA
+read it would warrant) as the primary attack and hands the ranking to the fixed-overhead
+class; `cmp` landing at its bytes kills the compressor-overpricing worry; `hcn+gate` above
+~15 ms makes the launch class, not any kernel, the next lever.
+
+**Staged command (GO, one run):** release binary built at this branch's committed HEAD
+BEFORE the device is requested; flag-identical to M2/M3b, the 218-token prompt verbatim
+from benchmarks.md's head-to-head CORRECTED note; exclusive flock with the per-minute
+KFD+GTT+llama-swap witness:
+
+```
+flock /var/run/sys-gpu.lock -c 'target/release/rivoli /var/db/rivoli/v4-f4-full -bench 512 --prompt "<prompt>"'
+```
+
+**Gates, registered with the prediction:** (1) wall within ±3% of the recorded 169.9
+ms/token (this branch bases on the batched-geometry main; the instrument's bound is O(1.5
+ms/token) — 258 event enqueues + 215 completed-event queries, argued at `V4Profile`) — a
+breach is reported BEFORE any reading of the split. (2) output byte-identical to the M3b
+batched arm (2025 bytes) and expert lookups identical (179389 hit / 8693 miss): clock reads
+and event records touch no data. (3) `resid ≥ 0` and the spans + resid sum to `win` exactly
+(printed identity). (4) coherence, expected not enforced: `win − d2h` (the traversal) should
+land near the non-tail remainder share M2 attributed to per-layer launches; a traversal far
+above `remainder − tail` says the window books time the PROFILE line books elsewhere.
 
 ## M2 — provenance of the command
 
