@@ -3352,3 +3352,83 @@ ms/token: ~9.0 ms. Ranked from this run's own numbers: qkv+oproj residual above 
 > miss 8.9 (pure fetch latency, lever 3) > hcn +4.8 (closed rung). The M-series error
 family now has a bad-side member: M3b/M5 missed good, M4/M6 missed a component, M7
 missed low on the wall.
+
+## V4 M8 replicate + serial-rate round — every conditional replicates; wq_b streams 222 GB/s (87% of bus) and refutes the uniform-floor hypothesis; the stretch closes at 9.10–9.17 tok/s (2026-08-08)
+
+The round `docs/investigations/v4-decode-decomposition.md` §M8 staged: two control
+decodes at `wt/v4-final-levers` `01e5d02` (HEAD, engine sources identical to the M7
+arm-B binary's) and two serial microbench runs — B1 the same tree's
+`dot_bench v4gemv` (stock `v4_gemv_fp8`), B2 the identical example built in a scratch
+tree at `01e5d02` with the §M8 pair-16 patch applied to `fp8_dot_strided`. All four binaries built
+BEFORE the first device request, nothing built between arms, each arm under the
+exclusive flock with a 30 s KFD+GTT witness (`find /sys/class/kfd/kfd/proc/
+-mindepth 1 -maxdepth 1 | wc -l` — the bare `ls | wc -l` form is forbidden since the
+2026-08-05 phantom-holder reading — plus `mem_info_gtt_used`). Witnesses: the decode
+arms clean with the run's own KFD holder only and GTT flat at the recorded
+sole-tenant 108.27 GB, no foreign step; the two bench arms finished inside one 30 s
+sampling interval, so each carries a single pre-attach sample (kfd=0, idle-level
+GTT) — thin by construction on a ~1 s arm, and no step was observable. (The
+idle-baseline samples read 33–39 GB before each engine start and drained by
+allocation time — noted, not chased; consistent with `docs/reference/gpu-lock.md`'s
+recorded unlocked GTT holders, and the in-run flat at the recorded value is the
+discard criterion.)
+
+**Controls, gated as registered (C1 then C2; M7 arm B quoted for the spread):**
+
+```
+C1: PROFILE/tok: 109.9ms wall | route 46.3ms | moe 40.2ms | fetch 10.2ms | 4.96 miss (2538 raw), 2.06ms/miss | remainder 23.4ms (tail 8.2ms)
+C2: PROFILE/tok: 109.4ms wall | route 46.3ms | moe 39.7ms | fetch  9.8ms | 4.96 miss (2538 raw), 1.97ms/miss | remainder 23.4ms (tail 8.2ms)
+C1: MOE-SPLIT: sh_enq 0.7 | desc 0.3 | h2d 1.3 | sync1 0.4 | launch 0.5 | sync2 36.8 | drain 0.1 | moe 40.2 (resid 0.0) | gpu: shared 16.0, res 27.9, miss 9.8
+C2: MOE-SPLIT: sh_enq 0.7 | desc 0.3 | h2d 1.2 | sync1 0.4 | launch 0.5 | sync2 36.4 | drain 0.1 | moe 39.7 (resid 0.0) | gpu: shared 16.0, res 28.0, miss 9.3
+```
+
+Both replies escape-decode to 1983 bytes, md5 `75b19fcde806059b45c515259feb16d2`;
+counters 179389 hit / 8693 miss, 2538 raw decode misses; ATTN resid 0.00 / MOE resid
+0.0 on both; ATTN-SPLIT within 0.1 of M7-B everywhere. Walls 109.9 (+0.8%) and 109.4
+(+0.4%) against the recorded 109.0 — in the ±3% gate, three-point spread 0.8%.
+
+**Replicate verdicts, by the registered |Δ| < 3 rule over {M7-B, C1, C2}:**
+
+- **res (contended class): 27.7 / 27.9 / 28.0** — replicates at spread 0.3. With the
+  serial pair the §M8 review booked (M6 24.2, M7-S 24.3), the fp4 `res > 24` re-open
+  STANDS at n = 2 serial: resident fp4 compute is 1.38–1.39× its bytes.
+- **miss: 8.9 / 9.8 / 9.3** (9.7 and 8.6 recorded earlier) — five points, all under
+  the ≥ 10 kill. Unfired; the miss-overlap lever stays dead on §M8's structural
+  grounds regardless.
+- **sync2: 35.8 / 36.8 / 36.4** — the M7 contention reading (+4–5 over the serial-arm
+  30.7–31.6 class) is the overlap's steady price, not a drift. Accepted: its
+  alternative measured −8.7 net worse in M7's own A/B.
+
+**The serial rates (weight-bytes GB/s; all seven fnv fingerprints IDENTICAL between
+B1 and B2 — the pair-16 fold order is bit-identical MEASURED, not argued; every
+oracle assert green):**
+
+```
+            B1 stock   B2 pair-16
+wq_a  1024x4096   66.7    80.2  (+20%)
+wq_b 32768x1024  222.1   212.9  (−4%: the probe kernel's 12-wave cost; a real lever keeps this shape a 16-wave kernel)
+wkv    512x4096   66.0    76.7  (+16%)
+wo_a  8192x4096  157.2   163.6  (+4%)
+wo_b  4096x8192  154.3   157.5  (+2%)
+sh_gu 2048x4096   93.4   113.7  (+22%)
+sh_dn 4096x2048  150.9   185.4  (+23%)
+```
+
+**The reading and the decision (full argument in §M8's scoring section):** rate tracks
+GRID SIZE — one wave per row, and the few-row shapes cannot fill 1280 wave slots
+(wq_a/wkv at 30–31% of the bus even paired, 26% stock) while the full-grid wq_b streams 87% of
+the 256 GB/s bus. That refutes the uniform-machine-floor closure hypothesis and
+splits the engine's fp8 residual into grid starvation (dominant) plus residual
+per-wave MLP (mild, +2–4% on wo_a/wo_b). Pricing all shapes at the 222 GB/s class
+puts ~13.6 ms/token of headroom in these kernels (~8.4 attn-side) — the residue is
+physically there, but the lever that reaches it (split-k/row-split, GLM's
+`gemv_fp8_splitk` precedent) reassociates the `wave_sum` fold by construction and is
+**dead-as-designed under byte-identity**; pair-16's measured slice projects
+−1..−2.5 ms, under its own registered "+10..+25% ⇒ real but cannot reach" bar, and is
+NOT built. **The stretch closes the last mile as a successful negative at the
+measured 109.0–109.9 ms/token = 9.10–9.17 tok/s** (9.17 = 1000/109.0; M7's
+engine-printed 9.175 came from the unrounded wall); the split-k design, its
+arithmetic, and the quality-gate apparatus it requires are registered in §M8 as the
+next stretch's opening. The doc stays live on that item and the fp4 re-open (which
+this round sharpened: 140 GB/s-class resident fp4 against a same-box 222 GB/s fp8
+benchmark now reads kernel-side).
