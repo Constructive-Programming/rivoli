@@ -674,15 +674,22 @@ launchers! {
         stream: *mut c_void,
     );
 
-    /// SwiGLU combine `h = silu(g)·u` (dense fp8 MLP; safe in place, `h` may alias `g`).
+    /// SwiGLU combine `h = silu(g)·u` (GLM's dense fp8 MLP, and V4's shared-expert chain;
+    /// safe in place, `h` may alias `g`).
+    ///
+    /// `stream` is trailing and null is the null stream, per the `mla.hip` V4-launcher
+    /// contract: V4's shared-expert chain is stream-ordered as a SET (§M7), and GLM's one
+    /// call site passes null — unchanged to the byte.
     ///
     /// # Safety
-    /// Device pointers (`g`, `u`, `h` each `n` f32) live until the next [`device_sync`].
+    /// Device pointers (`g`, `u`, `h` each `n` f32) live until the next [`device_sync`];
+    /// `stream` is null or a live stream ordering every producer of `g`/`u`.
     launch_swiglu -> rivoli_swiglu, "swiglu" (
         g: *const f32,
         u: *const f32,
         n: usize as i32,
         h: *mut f32,
+        stream: *mut c_void,
     );
 
     /// DeepSeek-V4's `Expert.forward` combine, for the resident fp8 **shared** expert:
@@ -692,13 +699,14 @@ launchers! {
     /// (model.py:632) and `Expert.forward` clamps both, so the shared expert needs the same
     /// clamped arithmetic `launch_moe_expert_range_f4` already runs on the fp4 routed experts.
     /// **NOT YET WIRED, as of 2026-08-05, and this launcher existing does not fix anything by
-    /// itself.** The only caller of the unclamped [`launch_swiglu`] is GLM's dense MLP in
-    /// `gpu.rs`; V4's MoE layer loop, which is what would call this, does not exist yet. So the
-    /// state of the tree is: the clamped combine is available and gated
-    /// (`tests/v4_kernel.rs` §7), and the first thing to wire the shared expert must call THIS
-    /// and not [`launch_swiglu`] — because reaching for that one gives
-    /// `v4oracle::Defect::SwigluUnclamped` on one contribution in seven of all 43 layers,
-    /// fluent and wrong.
+    /// itself.** *[CORRECTED 2026-08-08: the V4 loop exists now and calls the unclamped
+    /// [`launch_swiglu`] from its shared-expert chain — `v4gpu.rs::shared_expert` names the
+    /// deviation (`Defect::SwigluUnclamped`) at the call. So this launcher's caller-to-be
+    /// exists and still does not call it; the sentence below about what the wiring must do
+    /// stands.]* The clamped combine is available and gated (`tests/v4_kernel.rs` §7), and
+    /// the shared expert's fix is to call THIS and not [`launch_swiglu`] — because that one
+    /// gives `v4oracle::Defect::SwigluUnclamped` on one contribution in seven of all 43
+    /// layers, fluent and wrong.
     ///
     /// # Why this is not [`launch_swiglu`] with a `limit`
     ///

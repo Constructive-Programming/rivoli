@@ -674,15 +674,21 @@ extern "C" int rivoli_gemv_f32(const float* x, const float* w, int o_dim, int i_
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-extern "C" int rivoli_swiglu(const float* g, const float* u, int n, float* h) {
+// `stream` is trailing and nullptr is the null stream, the same migration contract as
+// `mla.hip`'s V4 launcher set: this runs inside V4's shared-expert chain, whose other
+// four launches are stream-parameterised, and a null-stream member in a stream-ordered
+// chain is an unordered activation (see that set's note). GLM's dense MLP passes null
+// and is unchanged to the byte.
+extern "C" int rivoli_swiglu(const float* g, const float* u, int n, float* h, void* stream) {
     if (n <= 0) return 1001;
     hipGetLastError();
-    hipLaunchKernelGGL(swiglu, dim3((n + 255) / 256), dim3(256), 0, 0, g, u, n, h);
+    hipLaunchKernelGGL(swiglu, dim3((n + 255) / 256), dim3(256), 0, (hipStream_t)stream, g, u, n,
+                       h);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-// Takes a STREAM, unlike `rivoli_swiglu` directly above. Same reason `rivoli_hc_pre` gives
+// Takes a STREAM, as `rivoli_swiglu` directly above does since M7. Same reason `rivoli_hc_pre` gives
 // below: rivoli's streams are `hipStreamNonBlocking` (`async.hip`), so the null stream does
 // not implicitly order against them, and this runs between two `rivoli_v4_gemv_fp8` launches
 // that are now stream-parameterised. A null-stream combine between two stream-ordered GEMVs

@@ -116,6 +116,16 @@ impl HipStream {
         Self::new()
     }
 
+    /// The V4 SHARED-EXPERT stream: the five-launch shared chain, kept off the null stream
+    /// so the routed path's blocking H2D copies (legacy null-stream semantics) stop
+    /// ordering behind it — M6 measured that exposure at 15.5 ms/token (`h2d`). Enqueued
+    /// after the routed row's first `device_sync`; joined by the second, which every
+    /// consumer of its output already waits on. See [`HipStream::compute`] for why the
+    /// role is spelled here.
+    pub fn shared() -> Result<Self> {
+        Self::new()
+    }
+
     /// The MISS stream: experts whose bytes are still arriving, kept off the compute stream
     /// so their device-side wait overlaps resident compute instead of following it.
     ///

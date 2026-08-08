@@ -2130,7 +2130,8 @@ impl<'a> GpuEngine<'a> {
                         up,
                     )?;
                     // One launch: elementwise over contiguous row-minor buffers.
-                    launch_swiglu(gp, up, nrow * inter, gp)?; // in place: h = silu(gate)*up
+                    // Null stream: GLM's dense MLP is null-stream end to end.
+                    launch_swiglu(gp, up, nrow * inter, gp, std::ptr::null_mut())?; // in place: h = silu(gate)*up
                     launch_gemv_fp8(
                         gp,
                         m.down.packed,

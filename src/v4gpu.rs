@@ -41,9 +41,11 @@
 //! Six of the launchers `attn::v4::attention` uses take no stream, neither does
 //! `v4compress::compress`, and `memcpy_dtod` is a blocking `hipMemcpy` on the null stream
 //! (`kernels/linalg.hip:692`). So attention, the compressor, the norms and the router GEMV all
-//! run on the **null stream**, and only the MoE experts run on `compute_stream`/`miss_stream` —
-//! which are `hipStreamNonBlocking` and therefore do NOT implicitly join the null stream. Every
-//! boundary between the two is an explicit sync in this file, named at its site:
+//! run on the **null stream**; the MoE experts run on `compute_stream`/`miss_stream`, and the
+//! shared-expert chain on `shared_stream` (M7) — all `hipStreamNonBlocking` and therefore NOT
+//! implicitly joined to the null stream. Every boundary between them is an explicit join in
+//! this file, named at its site (the shared chain's two: the gate-logits D2H that retires its
+//! `xq` input before it is enqueued, and sync (2) below, which retires its `sub` write):
 //!
 //! 1. before the expert launches, so `xq` (null stream) is complete when a non-blocking stream
 //!    reads it;
@@ -668,17 +670,22 @@ impl AttnStages {
 /// clocks the path already holds, plus three same-stream event pairs read behind the
 /// SECOND `device_sync` the routed path already pays. What each holds, exactly:
 ///
-/// * `moe_sh_ns` — the [`V4Engine::shared_expert`] call: five launch ENQUEUES (the
-///   chain's GPU time drains later, see `moe_h2d_ns`).
+/// * `moe_sh_ns` — the [`V4Engine::shared_expert`] call: five launch ENQUEUES onto the
+///   shared stream (M7, 2026-08-08 — the call sits INSIDE the row-0
+///   [`V4Engine::routed_experts`], after `sync1`, so the sync it follows cannot wait on
+///   it; the chain's GPU time is `moe_shg_ns` and its join is `sync2`). Before M7 the
+///   chain rode the null stream and its unhidden tail exposed in `moe_h2d_ns`,
+///   measured 15.5 ms/token in M6.
 /// * `moe_desc_ns` — routed entry to the first H2D: `RoutedPool::submit` (miss fetches
 ///   enter flight here), the format check, and the 256-descriptor launch-order rebuild.
 /// * `moe_h2d_ns` — the two blocking H2D copies (~13.3 KB), plus the pointer/scalar
-///   derivations between them and the sync (ns-scale, spans keep their gaps). Legacy
-///   null-stream semantics order the copies behind the shared-expert chain still in
-///   flight, so the chain's UNHIDDEN tail exposes here — the copies' own bytes are
-///   ~30 µs/token.
+///   derivations between them and the sync (ns-scale, spans keep their gaps). The
+///   copies carry legacy null-stream semantics; since M7 the shared chain is NOT on
+///   the null stream, so this span is the copies' own cost (~30 µs/token of bytes) —
+///   it reading large again is the registered tell that the overlap regressed.
 /// * `moe_sync1_ns` — the first `device_sync`. Expected ~0 (the H2D just drained the
-///   null stream); it is the correctness guarantee, not the exposure site.
+///   null stream); it is the correctness guarantee, not the exposure site. Runs BEFORE
+///   the shared chain is enqueued, which is what keeps it ~0 under M7.
 /// * `moe_launch_ns` — ticket waits + the resident range launch + per-miss launches:
 ///   host enqueue only.
 /// * `moe_sync2_ns` — the closing `device_sync`: the exposure of resident-batch
@@ -691,10 +698,12 @@ impl AttnStages {
 ///   `drain` so their cost lands in resid, not in a named span.
 ///
 /// The three device pairs attribute what the host spans expose — they are NOT part of
-/// the sum (their work overlaps `route_row`'s host math and each other across streams):
+/// the sum (shared overlaps the resident batch since M7; res and miss overlap each
+/// other across streams):
 ///
-/// * `moe_shg_ns` — null-stream pair around the shared-expert chain: gate/up GEMVs,
-///   swiglu, `act_quant`, down GEMV — the fp8 shared GEMV's true device span.
+/// * `moe_shg_ns` — shared-stream pair around the shared-expert chain (null-stream
+///   until M7): gate/up GEMVs, swiglu, `act_quant`, down GEMV — the fp8 shared GEMV's
+///   true device span, now overlapping the resident batch rather than preceding it.
 /// * `moe_res_ns` — compute-stream pair around the single resident range launch:
 ///   resident-batch expert compute, ~78.7 MB/layer at the measured residency.
 /// * `moe_miss_ns` — miss-stream pair from before the first straggler's ticket wait to
@@ -884,6 +893,10 @@ pub struct V4Engine {
 
     compute_stream: Stream,
     miss_stream: Stream,
+    /// The shared-expert chain's stream (M7): off the null stream so the routed path's
+    /// blocking H2D copies stop ordering behind it, enqueued after `sync1`, joined by
+    /// `sync2` — see [`V4Engine::routed_experts`].
+    shared_stream: Stream,
     hits0: u64,
     misses0: u64,
     prof: V4Profile,
@@ -1050,6 +1063,7 @@ impl V4Engine {
             argmax_host: Vec::new(),
             compute_stream: Stream::compute()?,
             miss_stream: Stream::miss()?,
+            shared_stream: Stream::shared()?,
             hits0,
             misses0,
             prof: V4Profile::default(),
@@ -1500,12 +1514,16 @@ impl V4Engine {
     /// prefill of `s` tokens performs `s` MoE dispatches per layer, while attention runs once
     /// over the whole prompt — attention is the only op with a cross-token dependency.
     ///
-    /// `sub[t]` must already hold the SHARED expert's output: [`launch_moe_acc_drain`] does
-    /// `x += ...`. In GLM that `+=` IS the residual add; here it is not — V4's MoE output feeds
-    /// `hc_post`'s `x` argument, and `MoE.forward` starts from `y = zeros` and adds the shared
-    /// expert raw (model.py:648, no `weights` argument). That is why the shared expert *writes*
-    /// this buffer and the routed drain adds on top.
-    fn routed_experts(&mut self, layer: usize, t: usize) -> Result<()> {
+    /// `sub[t]` must hold the SHARED expert's output by the time the drain reads it:
+    /// [`launch_moe_acc_drain`] does `x += ...`. In GLM that `+=` IS the residual add; here it
+    /// is not — V4's MoE output feeds `hc_post`'s `x` argument, and `MoE.forward` starts from
+    /// `y = zeros` and adds the shared expert raw (model.py:648, no `weights` argument). That
+    /// is why the shared expert *writes* this buffer and the routed drain adds on top. Since
+    /// M7 the shared chain is enqueued HERE (row 0, `shared_rows = Some(m)`), on its own
+    /// stream, after `sync1` — the closing `sync2` is a `device_sync`, so the chain has
+    /// retired before any row's drain launch, and the write-then-add order is exactly the
+    /// pre-M7 one; only the wall-clock moment the chain executes moves.
+    fn routed_experts(&mut self, layer: usize, t: usize, shared_rows: Option<usize>) -> Result<()> {
         let (dim, inter, n_desc) = (self.cfg.hidden, self.cfg.moe_inter, self.cfg.n_experts);
         // The M6 moe-split host brackets — every boundary below is a clock read beside
         // a call the path already makes; [`V4Profile`]'s moe section is the coverage map.
@@ -1614,6 +1632,23 @@ impl V4Engine {
         // before.
         let t_sync1 = std::time::Instant::now();
         device_sync()?;
+        let t_sh = std::time::Instant::now();
+        // The shared-expert chain (row 0 only — it is batched over every row at once).
+        // AFTER `sync1`, deliberately: enqueued any earlier, that `device_sync` would wait
+        // for the chain and re-serialise what the shared stream exists to overlap. Its
+        // input `xq` retired at the gate-logits D2H (blocking, drains the null stream that
+        // wrote it); its output `sub` is read no earlier than the drain launch below, which
+        // sits behind `sync2`'s `device_sync` — every join is device-side and already paid.
+        // `sync1` is also the WAR join: `sub` is attention's `io.out`, and the chain's
+        // down-GEMV overwrites it, so the device-wide sync just above is what proves the
+        // attention sublayer's last reader of `sub` retired before the chain can run.
+        // The device pair records on the shared stream: the span is the chain's execution,
+        // gaps included, span-convention, now overlapping the resident batch.
+        if let Some(rows) = shared_rows {
+            self.moe_ev[MO_SH0].record(self.shared_stream.raw())?;
+            self.shared_expert(layer, rows)?;
+            self.moe_ev[MO_SH1].record(self.shared_stream.raw())?;
+        }
         let t_launch = std::time::Instant::now();
         // Residents first, then misses — measured, not tidy: inverting the order cost GLM
         // 3.05 -> 2.44 tok/s, because a resident expert's compute is what overlaps the in-flight
@@ -1697,7 +1732,8 @@ impl V4Engine {
         // span — they are the instrument's own cost and surface in the printed resid.
         self.prof.moe_desc_ns += t_h2d.duration_since(t_entry).as_nanos();
         self.prof.moe_h2d_ns += t_sync1.duration_since(t_h2d).as_nanos();
-        self.prof.moe_sync1_ns += t_launch.duration_since(t_sync1).as_nanos();
+        self.prof.moe_sync1_ns += t_sh.duration_since(t_sync1).as_nanos();
+        self.prof.moe_sh_ns += t_launch.duration_since(t_sh).as_nanos();
         self.prof.moe_launch_ns += t_sync2.duration_since(t_launch).as_nanos();
         self.prof.moe_sync2_ns += t_read.duration_since(t_sync2).as_nanos();
         let dst = self.sub.ptr_mut();
@@ -1741,7 +1777,12 @@ impl V4Engine {
         // BEFORE the launches, not after: a bad `layer` has to return without having issued
         // anything to the device, which is what the single pin lookup here used to guarantee.
         let down = self.pin.layer(layer)?.shared.down;
-        self.shared_gate_up(layer, m)?;
+        // The whole chain rides the shared stream (M7): the five launches convert as a
+        // SET, per `mla.hip`'s launcher note — one null-stream member between
+        // stream-ordered neighbours reading the same buffers would be an unordered
+        // activation.
+        let stream = self.shared_stream.raw();
+        self.shared_gate_up(layer, m, stream)?;
         let g = self.sh_g.ptr_mut().cast::<f32>();
         let u = self.sh_u.ptr_mut().cast::<f32>();
         let out = self.sub.ptr_mut().cast::<f32>();
@@ -1751,11 +1792,11 @@ impl V4Engine {
         unsafe {
             // See the doc above: unclamped, and the wrong silu form. One line, and one
             // contribution in seven of every layer's FFN.
-            launch_swiglu(g, u, m * inter, g)?;
+            launch_swiglu(g, u, m * inter, g, stream)?;
             // The `w2` input is act-quantized. The routed path does this for itself inside
             // `launch_moe_expert_range_f4` ("The `h` re-quantization between the two passes IS
             // done here, because forgetting it is silent"); here it has to be explicit.
-            launch_act_quant_f8(g, m, inter, std::ptr::null_mut())?;
+            launch_act_quant_f8(g, m, inter, stream)?;
             // WRITES `sub` — does not accumulate into it. `MoE.forward` starts from `y = zeros`
             // and the routed drain adds on top; see `routed_experts`.
             launch_v4_gemv_fp8(
@@ -1768,7 +1809,7 @@ impl V4Engine {
                 FP8_BLOCK,
                 1,
                 out,
-                NULL_STREAM,
+                stream,
             )?;
         }
         Ok(())
@@ -1780,7 +1821,12 @@ impl V4Engine {
     /// Split out because [`V4Engine::probe_shared_operands`] has to run exactly these two and
     /// cannot read them back from `shared_expert`: that method writes the SwiGLU product over
     /// `sh_g` in place.
-    fn shared_gate_up(&mut self, layer: usize, m: usize) -> Result<()> {
+    ///
+    /// `stream`: the decode path passes the shared stream (M7); the probe passes
+    /// [`NULL_STREAM`] so its blocking readback (legacy null-stream semantics) still
+    /// orders behind these launches with no further join — the probe's behaviour is
+    /// unchanged by the decode path's stream move.
+    fn shared_gate_up(&mut self, layer: usize, m: usize, stream: *mut c_void) -> Result<()> {
         let (dim, inter) = (self.cfg.hidden, self.cfg.moe_inter);
         let lp = self.pin.layer(layer)?;
         let (gate, up) = (lp.shared.gate, lp.shared.up);
@@ -1799,24 +1845,16 @@ impl V4Engine {
         for (w, dst) in [(gate, g), (up, u)] {
             unsafe {
                 launch_v4_gemv_fp8(
-                    xq,
-                    w.packed,
-                    w.scale,
-                    m,
-                    inter,
-                    dim,
-                    FP8_BLOCK,
-                    1,
-                    dst,
-                    NULL_STREAM,
+                    xq, w.packed, w.scale, m, inter, dim, FP8_BLOCK, 1, dst, stream,
                 )?;
             }
         }
         Ok(())
     }
 
-    /// `MoE.forward` over `m` rows: the gate, the shared expert batched, then the routed experts
-    /// one row at a time.
+    /// `MoE.forward` over `m` rows: the gate, then the routed experts one row at a time —
+    /// with the shared expert (batched over all rows) enqueued from inside the row-0
+    /// [`V4Engine::routed_experts`] onto its own stream (M7; the why is at that call).
     fn moe(&mut self, layer: usize, m: usize) -> Result<()> {
         let (dim, n_experts) = (self.cfg.hidden, self.cfg.n_experts);
         let gate_w = self.pin.layer(layer)?.gate_w;
@@ -1884,20 +1922,16 @@ impl V4Engine {
             self.prof.oproj_ns += span(M_ATTEND_DONE, M_ATTN_DONE)?;
             self.prof.gate_ns += span(M_FFN_NORMED, M_GATE)?;
         }
-        // The shared-expert device pair opens on a just-drained null stream (the D2H
-        // above), so its span is the chain's execution, gaps included, span-convention.
-        self.moe_ev[MO_SH0].record(NULL_STREAM)?;
-        let t0 = std::time::Instant::now();
-        self.shared_expert(layer, m)?;
-        self.moe_ev[MO_SH1].record(NULL_STREAM)?;
-        let sh = t0.elapsed().as_nanos();
-        self.prof.moe_ns += sh;
-        self.prof.moe_sh_ns += sh;
+        // The shared-expert chain is enqueued INSIDE the row-0 `routed_experts`, after
+        // its `sync1` (M7, 2026-08-08): enqueued here it would ride ahead of that
+        // `device_sync` and be waited on by it, re-serialising the chain the stream
+        // move exists to overlap. Its `xq` input is ready regardless — the D2H above
+        // drained the null stream that produced it.
         for t in 0..m {
             let r0 = std::time::Instant::now();
             self.route_row(layer, t)?;
             let r1 = std::time::Instant::now();
-            self.routed_experts(layer, t)?;
+            self.routed_experts(layer, t, if t == 0 { Some(m) } else { None })?;
             let host = r1.duration_since(r0).as_nanos();
             self.prof.route_ns += host;
             self.prof.route_host_ns += host;
@@ -2452,7 +2486,7 @@ impl V4Engine {
         m: usize,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
         let inter = self.cfg.moe_inter;
-        self.shared_gate_up(layer, m)?;
+        self.shared_gate_up(layer, m, NULL_STREAM)?;
         device_sync()?;
         Ok((
             read_prefix(&self.sh_g, m * inter)?,
@@ -2613,8 +2647,8 @@ impl V4Engine {
         );
         // The moe split (M6, see [`V4Profile`]): seven host spans tiling `moe` (resid =
         // clock gaps + the instrument's own pair reads, non-negative by construction),
-        // then the three device attributions — NOT addends: shared overlaps route_row's
-        // host math, res and miss overlap each other across streams.
+        // then the three device attributions — NOT addends: shared overlaps the resident
+        // batch (M7), res and miss overlap each other across streams.
         let (sh_ms, desc_ms) = (per(self.prof.moe_sh_ns), per(self.prof.moe_desc_ns));
         let (h2d_ms, sync1_ms) = (per(self.prof.moe_h2d_ns), per(self.prof.moe_sync1_ns));
         let (launch_ms, sync2_ms) = (per(self.prof.moe_launch_ns), per(self.prof.moe_sync2_ns));

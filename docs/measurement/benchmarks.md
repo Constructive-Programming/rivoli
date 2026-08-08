@@ -3250,6 +3250,8 @@ until its A/B:**
    through `launch_v4_gemv_fp8`. The M3a→M3c pattern (read ISA, price the loop, then
    decide) applies verbatim; even a partial recovery dominates the residue.
 2. **Shared-chain overlap (schedule-only).** The shared expert runs on the null stream
+   *[at this record's HEAD; M7 implemented both this lever and lever 1 on 2026-08-08,
+   A/B staged — the investigation doc §M7]*
    and exposes 15.5 ms in `h2d` while both expert streams sit idle; launching it on its
    own stream (join at the existing sync2/drain, which already gates on everything)
    hides it behind resident compute — worth up to ~15.5 now, still worth ~5 after

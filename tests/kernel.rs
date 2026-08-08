@@ -1676,7 +1676,9 @@ fn swiglu_matches_the_division_form_in_place() {
     // SAFETY: `g`, `u` and `h` are each `n` live device f32; `h == g` is the aliasing the
     // launcher's contract permits — every thread reads both operands, then writes once.
     let gp = gb.ptr_mut() as *mut f32;
-    unsafe { launch_swiglu(gp as *const f32, ub.ptr() as *const f32, n, gp) }.expect("swiglu");
+    let null = std::ptr::null_mut();
+    unsafe { launch_swiglu(gp as *const f32, ub.ptr() as *const f32, n, gp, null) }
+        .expect("swiglu");
     let got = f32v(&back(&gb));
 
     // 1e-5 relative, not `assert_close`'s `1e-3·max + 1e-3`. The only honest disagreement
