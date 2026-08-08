@@ -509,6 +509,86 @@ difference is a BUG in the decode or the cast, not noise; (2) the instrument is 
 bucket, not wall; (3) `fetch` must not grow; (4) the record lands in benchmarks.md when it
 exists, beside the "V4 launch-geometry A/B".
 
+## M5 — the hc/norm kernel read (2026-08-08, no GPU), and the registered prediction
+
+M4 measured `hcn` at 41.2 ms/token against 0.8 ms of bytes and bounded launch bubbles at
+~5.4, naming the kernels themselves the prime suspect. This is the host-side read —
+source plus ISA (`hipcc --offload-arch=gfx1151 -O3 -fPIC -S kernels/linalg.hip`,
+`build.rs:76`'s own flags, per `how-to-measure.md`'s ISA-first rule) — written BEFORE any
+device time.
+
+**What the bucket holds, counted from the code.** Per layer the two hcn spans cover five
+launches: `hc_pre` ×2, `v4_rmsnorm` ×2 (`mla.hip`, `dim3(rows)` — one block at decode),
+`hc_post` ×1 (the FFN-side `hc_post` drains at the end-of-layer sync, outside the window).
+43 layers → 215 launches/token, 86 of them `hc_pre`. There is no 20-launch Sinkhorn: the
+20 passes are a `for` loop INSIDE `hc_pre`, on ONE THREAD (`linalg.hip::hc_sinkhorn`,
+called at `if (t == 0)`) — the 4×4 matrix never leaves that thread, so the inter-pass
+synchronization the algorithm needs is program order on a single lane, not a device-wide
+barrier. That kills the fused-20-launches lever the plan named (there is nothing to fuse)
+and makes the Sinkhorn a serial-compute term, not a launch term.
+
+**Where the time is, attributed by arithmetic that closes.** `hc_pre` launches `dim3(s)` ×
+256 threads — at decode, ONE 8-wave workgroup for the whole device. Its mixes phase (the
+`[24, 16384]` `hc_*_fn` GEMV) streams 1.57 MB of weights plus 24 re-reads of the 64 KB
+flattened residual (~3.1 MB of loads) through that one workgroup, and the ISA shows the
+inner loop issues exactly TWO scalar `global_load_b32` then `s_waitcnt vmcnt(0)` EVERY
+iteration — no unroll, no pipelining, so the whole workgroup holds ~2 KB in flight against
+LPDDR5/GTT latency. Cross-calibrating with GLM's measured `dim3(1)` rmsnorm (7.7 µs for
+~96 KB touched ≈ 12 GB/s for one such workgroup, benchmarks.md "Closed questions"): ~3.1
+MB at single-digit-GB/s effective ≈ **~350–400 µs per `hc_pre` launch**. The books then
+close: 86 × ~400 µs ≈ 34.5 ms + rmsnorms ~0.7 (GLM's 7.7 µs precedent) + `hc_post` ~0.3
+(64 blocks, 320 KB) + bubbles ~5.4 ≈ **41 ms against the measured 41.2**. Within one
+`hc_pre`: mixes ~340–370 µs, sum-of-squares ~15–25 (same one-load-per-wait pattern over
+64 KB), the 20-pass serial Sinkhorn ~10–30 (≈640 f32 divides + 24 `expf` on one lane),
+combine ~5–10.
+
+**The fix, and its byte-identity argument.** Two schedule-only levers, no arithmetic
+change:
+
+1. **Widen the block to 1024 threads** (launcher `dim3(256)` → `dim3(1024)`). The mixes
+   loop `for (j = w; j < HC_MIX; j += nw)` then gives each of 24 waves ONE row instead of
+   8 waves × 3 serial rows — 3× the loads in flight. The per-row unit is untouched: the
+   same lane-strided comb (`i = lane; i += WAVE`) and the same `wave_sum` ladder, executed
+   by one wave, so every `mixes[j]` is bit-identical regardless of WHICH wave computes it.
+   The sum-of-squares phase is the one part whose arithmetic depends on block shape (a
+   `blockDim`-strided comb into a `blockDim`-leaf LDS tree), so it is FROZEN at the
+   current geometry: first 256 threads, stride 256, 256-leaf tree — bit-identical by
+   construction, waves 8–31 idle at the barrier. The combine phase's per-element c-order
+   is fixed; only the thread→element map widens. Sinkhorn stays `t == 0`, untouched.
+2. **`#pragma unroll` the two strided load loops** (mixes, sum-of-squares). Unrolling a
+   serial `acc += a·b` chain preserves its order — the FMAs stay one dependent sequence,
+   the compiler merely hoists the now-independent loads above the chain — so the bits
+   cannot move; the gain is loads-in-flight per wave. Verified against the emitted ISA
+   before commit: same FMA sequence, loads clustered, no per-iteration `vmcnt(0)` in the
+   main bodies (the ≤7-iteration peel/remainder loops keep the scalar pattern — at the
+   checkpoint's `hcd = 16384` both trip counts divide by 8 and they never execute).
+
+No new launch, no new sync, no cross-block communication: one token's whole tensor is
+owned by one block (grid = s), which is why intra-block `__syncthreads()` was and remains
+the only synchronization the kernel needs — grid-sync/cooperative-launch territory never
+opens. `v4_rmsnorm` is left alone on GLM's measured precedent (7.7 µs; "do not re-flag it
+from the launch shape alone"). Reducing Sinkhorn passes is quality, not optimization
+(real-weights goldens: 19 vs 20 moves 39,893/53,248 of `ffn_norm_out`), and nothing here
+touches the iteration count.
+
+**Prediction, registered before the measurement so it can be wrong:** the A/B moves the
+`hcn` sub-bucket by **−15 to −30 ms/token (point: −22)**, i.e. `hc_pre` from ~400 µs to
+~50–225 µs/launch (point ~145), and the wall by ≈ the same amount (the window is serial
+on the null stream; nothing overlaps it). Output byte-identical, hit/miss and raw-miss
+counters identical (clock-free, residency-free, arithmetic-order-free change).
+`attn`/`cmp`/`gate` within ±1.5 ms, `moe`/`fetch`/`tail` unchanged within recorded
+spread. Kill conditions: |Δhcn| < 3 ms ⇒ the latency model is wrong, replicates before
+any claim and the finding is that the time hides where stream events cannot see it; Δhcn
+between −5 and −14 ⇒ the single-workgroup ceiling is real but lower than modelled — next
+rung is splitting the mixes across workgroups (a 2-kernel form, +1 launch), not more
+waves in one. At the point the bucket lands at ~19 ms; the modelled FLOOR under this
+kernel shape is ~10–15 (5.4 of bubbles + ~1 of rmsnorm/`hc_post` + 86 launches whose
+1.57 MB and serial Sinkhorn cannot go below ~50–100 µs in one workgroup), so a −22
+result still leaves a priced next rung and −30 is the model's hard edge. The record
+lands in benchmarks.md beside "V4 route split"; a passing byte-identity gate also keeps
+`tests/v4_loop.rs` §8's envelope valid without a re-run (its own note names `hc_pre`
+changes as the trigger) — a failing one owes §8 a re-run on top of being a bug.
+
 ## M2 — provenance of the command
 
 The recorded head-to-head wrote a literal `"<prompt>"` where its prompt should be — the

@@ -371,6 +371,15 @@ extern "C" __global__ void act_quant_f8(float* __restrict__ v, size_t nblk) {
 #define HC_MULT 4
 #define HC_MIX ((2 + HC_MULT) * HC_MULT)
 
+// The width `hc_pre`'s sum-of-squares reduction is FROZEN at, independent of blockDim.
+// That phase's arithmetic depends on block shape twice over — a blockDim-strided comb
+// into a blockDim-leaf LDS tree — so when the launch widened from 256 to 1024 threads
+// (2026-08-08, the M5 hcn fix; docs/investigations/v4-decode-decomposition.md) the stride
+// and the tree kept the old geometry, or every historic golden and the byte-identity A/B
+// gate would have moved. Threads ≥ HC_RED idle through this phase; the mixes phase below
+// is where the extra waves earn their launch.
+#define HC_RED 256
+
 // `kernel.py::hc_split_sinkhorn` for one token, on ONE thread.
 //
 // Serial because it is 24 inputs and a 4x4 matrix: the whole routine is ~640 flops, and a
@@ -442,28 +451,42 @@ extern "C" __global__ void hc_pre(
     const float* __restrict__ h, const float* __restrict__ fnw, const float* __restrict__ scale,
     const float* __restrict__ base, int dim, int iters, float norm_eps, float hc_eps,
     float* __restrict__ y, float* __restrict__ post_out, float* __restrict__ comb_out) {
-    __shared__ float red[256];
+    __shared__ float red[HC_RED];
     __shared__ float mixes[HC_MIX];
     __shared__ float pre[HC_MULT], post[HC_MULT], comb[HC_MULT * HC_MULT];
     int t = threadIdx.x, nt = blockDim.x;
     size_t hcd = (size_t)HC_MULT * dim;
     const float* flat = h + (size_t)blockIdx.x * hcd;
 
-    float local = 0.0f;
-    for (size_t i = t; i < hcd; i += nt) local += flat[i] * flat[i];
-    red[t] = local;
+    // Sum of squares at HC_RED wide, NOT nt: stride and tree are this phase's arithmetic
+    // (see HC_RED above). The unroll is schedule-only — the acc chain keeps its order, the
+    // compiler hoists the now-independent loads; at 256 threads the stock ISA held ONE load
+    // per `s_waitcnt vmcnt(0)`, so latency-hiding depth was the whole cost. Depth 8 is
+    // UNTUNED: the first depth checked already clustered the loads in the emitted ISA
+    // (`s_clause` batches, staggered `vmcnt(7..0)`), here and in the mixes loop below.
+    if (t < HC_RED) {
+        float local = 0.0f;
+#pragma unroll 8
+        for (size_t i = t; i < hcd; i += HC_RED) local += flat[i] * flat[i];
+        red[t] = local;
+    }
     __syncthreads();
-    for (int s = nt / 2; s > 0; s >>= 1) {
+    for (int s = HC_RED / 2; s > 0; s >>= 1) {
         if (t < s) red[t] += red[t + s];
         __syncthreads();
     }
     float rs = 1.0f / sqrtf(red[0] / (float)hcd + norm_eps);
 
-    // One wave per mix row, three rounds at 256 threads (HC_MIX = 24, 8 waves).
+    // One wave per mix row — ONE round at 1024 threads (HC_MIX = 24, 32 waves; 8 idle).
+    // Which wave computes row `j` is not part of the arithmetic: the row's unit is the
+    // lane-strided comb + `wave_sum` ladder below, bit-identical wherever it runs. At 256
+    // threads this loop was the measured hcn sink — 8 waves × 3 serial rows, ~2 KB in
+    // flight against 1.57 MB of `fnw` (M5's read: ~350–400 µs of the ~400 µs launch).
     int lane = t & (WAVE - 1), w = t / WAVE, nw = nt / WAVE;
     for (int j = w; j < HC_MIX; j += nw) {
         const float* wr = fnw + (size_t)j * hcd;
         float acc = 0.0f;
+#pragma unroll 8
         for (size_t i = lane; i < hcd; i += WAVE) acc += flat[i] * wr[i];
         acc = wave_sum(acc);
         if (lane == 0) mixes[j] = acc * rs;
@@ -734,8 +757,14 @@ extern "C" int rivoli_act_quant_f8(float* v, int n_rows, int row_len, void* stre
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-// One block per token, 256 threads — the LDS reduction tree in `hc_pre` needs a
-// power-of-two block, and `HC_MIX = 24` needs at least 8 waves to finish in three rounds.
+// One block per token, 1024 threads — one WAVE per `HC_MIX = 24` mix row, in one round.
+// 256 until 2026-08-08: at decode (s = 1) that was ONE 8-wave workgroup for the whole
+// device, and M4 measured the hcn bucket at 41.2 ms/token against 0.8 ms of bytes — the
+// mixes GEMV walking 3 rows per wave with two loads in flight per `s_waitcnt vmcnt(0)`.
+// The sum-of-squares phase stays at `HC_RED` (see its comment — that freeze is what makes
+// the widening schedule-only). 24 waves is the parallelism CEILING here: a row's reduction
+// order is one lane-strided comb + one `wave_sum` ladder, so a second wave cannot share a
+// row without moving bits; more width has to come from splitting the kernel, not the block.
 //
 // Takes a STREAM, unlike `rmsnorm`/`swiglu` above. rivoli's streams are created
 // `hipStreamNonBlocking` (`async.hip`), so the null stream does NOT implicitly order against
@@ -753,7 +782,7 @@ extern "C" int rivoli_hc_pre(
     if (hc != HC_MULT) return 1002;
     if (iters < 1) return 1003;
     hipGetLastError();
-    hipLaunchKernelGGL(hc_pre, dim3(s), dim3(256), 0, (hipStream_t)stream, h, fnw, scale, base,
+    hipLaunchKernelGGL(hc_pre, dim3(s), dim3(1024), 0, (hipStream_t)stream, h, fnw, scale, base,
                        dim, iters, norm_eps, hc_eps, y, post, comb);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
