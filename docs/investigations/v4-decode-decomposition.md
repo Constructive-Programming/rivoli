@@ -1,7 +1,7 @@
 ---
 scope: v4
 status: live
-verdict: OPEN, first lever LANDED. M3b measured 2026-08-07: batching a layer's resident experts into one range launch (misses stay per-expert behind their tickets) took moe 70.6 → 54.7 ms/token and wall 186.2 → 169.9 = 5.887 tok/s (+9.6%), output byte-identical, hit/miss identical, fetch fell — the registered prediction (−3..−8) was wrong on the GOOD side: per-launch cost is the ~25 µs host-bubble class, not the 1.97 µs dispatch floor it was priced on. tail measured 8.2 of the 39.1 ms remainder. Residue to 10 tok/s (~70 ms off the wall): route ~76 (attention phase still needs its own split) > moe ~32 above bytes (fp4 kernel issue-bound per the M3a ISA read: 195 instr per 128 weight bytes/wave, exec-mask e2m1 decode, flat loads; miss exposure and shared GEMV unpriced) > remainder ~31 non-tail. M2's decomposition and floor (~62 ms/token ≈ 16 tok/s ceiling) stand; buckets still not certified free (wall spread ±1.5% over three stock-class runs). M4 STAGED 2026-08-08: route's internals bracketed — four HIP-event sub-spans (attn/cmp/hcn/gate) read at the existing gate D2H against a per-layer window wall with a printed residual, no new join; per-span byte budgets from the artifact header (window ~6.0 GB ≈ 31 ms, attn 4.64 GB ≈ 24 of it); prediction registered (attn dominates: 45–62 of win ~76–86 ms); GPU run pending.
+verdict: OPEN, first lever LANDED. M3b measured 2026-08-07: batching a layer's resident experts into one range launch (misses stay per-expert behind their tickets) took moe 70.6 → 54.7 ms/token and wall 186.2 → 169.9 = 5.887 tok/s (+9.6%), output byte-identical, hit/miss identical, fetch fell — the registered prediction (−3..−8) was wrong on the GOOD side: per-launch cost is the ~25 µs host-bubble class, not the 1.97 µs dispatch floor it was priced on. tail measured 8.2 of the 39.1 ms remainder. Residue to 10 tok/s (~70 ms off the wall): route ~76 (SPLIT by M4, below) > moe ~32 above bytes (fp4 kernel issue-bound per the M3a ISA read: 195 instr per 128 weight bytes/wave, exec-mask e2m1 decode, flat loads; miss exposure and shared GEMV unpriced) > remainder ~31 non-tail. M2's decomposition and floor (~62 ms/token ≈ 16 tok/s ceiling) stand; buckets still not certified free (wall spread ±1.5% over three stock-class runs). M4 MEASURED 2026-08-08 (four HIP-event sub-spans read at the existing gate D2H, window-wall residual check, no new join): attn 53.2 | cmp 9.1 | hcn 41.2 | gate 3.2 | win 107.7 (resid 1.0) at wall 172.9 (+1.8%, in band), counters identical to M3b. Prediction scored three-of-four in band and WRONG at the headline: hcn (hyper-connections + norms) measured 41.2 against a 4–8 band and 0.8 ms of bytes — the engine's largest above-bytes excess (+40.4 > moe +33 > attn +29.3) and the new #1 lever (read the hc/norm kernels host-side next); fp8 GEMV rate demoted to #2; cmp and gate landed at budget, closed; resid 1.0 kills the gate-D2H width micro-lever.
 ---
 
 # Where do V4-Flash's 185 ms/token go?
@@ -282,7 +282,24 @@ bucket, NOT wall — the recorded +2.9% run-to-run wall variance swallows a 5 ms
 growth is the tell that batching serialised hits behind misses. (4) `tail` from arm B is
 M2 ranking item (3)'s first number, free from the same run.
 
-## M4 — the route split, STAGED 2026-08-08 (instrument landed, no GPU yet)
+## M4 — the route split, MEASURED 2026-08-08: hcn 41.2 ms is the surprise
+
+Run as staged the same day (record and all four gates in benchmarks.md "V4 route split"):
+
+```
+ROUTE-SPLIT/tok: attn 53.2ms | cmp 9.1ms | hcn 41.2ms | gate 3.2ms | win 107.7ms (resid 1.0ms) | d2h 76.3ms + host 0.4ms
+```
+
+wall 172.9 (+1.8%, in band), counters identical to M3b, resid ≥ 0, spans+resid ≡ win
+exact. The prediction below is SCORED at its own paragraph; the one-line outcome: three of
+four bands hit, and the headline was wrong — the **hyper-connection/norm chain measured
+41.2 ms against a 4–8 band and 0.8 ms of bytes**, the engine's largest above-bytes excess.
+The ranked levers are in the verdict; the named next step is a host-side read of the
+hc/norm kernels (`kernels/linalg.hip` — the 20-pass Sinkhorn in `hc_pre` and GLM's
+`dim3(1)`-rmsnorm precedent are the candidates, per benchmarks.md's named-not-priced
+list).
+
+*The staging record below is kept as written pre-GO:*
 
 `route` is the largest sink — ~76 ms against ~31 ms of bytes — and M2's reading said its
 excess "needs the phase's own split before a lever is named". This stretch lands the split:
@@ -363,6 +380,17 @@ outcome kills:** `attn` under half the window kills the fp8-kernel-rate lever (a
 read it would warrant) as the primary attack and hands the ranking to the fixed-overhead
 class; `cmp` landing at its bytes kills the compressor-overpricing worry; `hcn+gate` above
 ~15 ms makes the launch class, not any kernel, the next lever.
+
+> **SCORED 2026-08-08, by the run above: three of four bands hit, wrong at the headline.**
+> attn 53.2 (45–62, near the 55 point ✓), cmp 9.1 (8–12 ✓), gate 3.2 (3–6 ✓) — and **hcn
+> 41.2 against the 4–8 band, 5–10× out and ~50× its bytes**, which pushed win to 107.7
+> above its 76–86 band; resid 1.0 under its 4 point. Both registered kill conditions
+> fired, one at its edge — the resolutions and the ranked levers are in benchmarks.md and
+> the verdict. The error family is M3a/M3b's again —
+> mechanism right (attention is far above bytes), magnitude priced on the wrong component:
+> the band priced hcn as small elementwise kernels plus launch bubbles, and the measured
+> 41.2 says the kernels themselves are ~7× the bubble arithmetic (~5.4 ms at the ~25 µs
+> class). Full accounting in benchmarks.md "V4 route split".
 
 **Staged command (GO, one run):** release binary built at this branch's committed HEAD
 BEFORE the device is requested; flag-identical to M2/M3b, the 218-token prompt verbatim

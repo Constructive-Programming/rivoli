@@ -2931,3 +2931,96 @@ below the spread), which supports M2's "run-to-run variance suspected" reading o
 2538 raw decode misses land inside M2's print-precision band (8693 − 2538 = 6155 prefill
 misses against the derived ~6150, band 6151–6156; the raw integer is logged since
 `94e72f0`).
+
+## V4 route split — hcn 41.2 ms is the surprise: attn 53.2 / hcn 41.2 / cmp 9.1 / gate 3.2 of win 107.7 ms/token (2026-08-08)
+
+The one instrumented decode `docs/investigations/v4-decode-decomposition.md` §M4 staged:
+release at `bd94c59` (route-split marks in), built before the device was requested,
+flag-identical to M2/M3b (the 218-token prompt verbatim from the head-to-head CORRECTED
+note), exclusive flock held for the whole run, per-minute KFD+GTT+llama-swap witness clean
+(pre-check `kfd=0`, GTT 18.7 MB, `{"running":[]}`; both in-run samples `kfd=1` — the run's
+own holder — GTT flat at 108.27 GB — the run's own pool — llama-swap empty throughout.
+The box had live llama-swap traffic that morning; the coordinator unloaded three resident
+models before GO, which is what the three-way witness exists to police).
+
+```
+flock /var/run/sys-gpu.lock target/release/rivoli /var/db/rivoli/v4-f4-full -bench 512 --prompt "<prompt>"
+```
+
+(direct-exec `flock` form rather than `-c` — the prompt's own apostrophe against the
+shell; identical argv reaches the binary.)
+
+```
+v4 decode: prefill 17.39s over 218 tokens; 512 generated in 88.50s = 5.785 tok/s; expert lookups 179389 hit / 8693 miss (95.4% hit)
+PROFILE/tok:     172.9ms wall | route 76.7ms | moe 55.9ms | fetch 10.6ms | 4.96 miss (2538 raw), 2.13ms/miss, 0.07 GB | remainder 40.3ms (tail 8.2ms)
+ROUTE-SPLIT/tok: attn 53.2ms | cmp 9.1ms | hcn 41.2ms | gate 3.2ms | win 107.7ms (resid 1.0ms) | d2h 76.3ms + host 0.4ms
+```
+
+**Gates first: three pass; gate 2 is unfalsifiable as registered and passes at counter
+strength — said plainly:**
+
+1. **wall 172.9 vs 169.9 = +1.8%, inside the ±3% band.** The marks' cost bound (O(1.5
+   ms/token), argued at `v4gpu.rs::V4Profile`) sits inside the delta; n=1 against n=1, so
+   the marks join the buckets as *not certified free* — same standing caveat as M2/M3b.
+2. **Identity, at counter strength rather than `cmp` strength.** Expert lookups are
+   exactly M3b's three integers (179389 hit / 8693 miss / 2538 raw decode), 512/512
+   generated, reply read — coherent, on-task. The `cmp`-grade check M3b ran between its own
+   arms is impossible retroactively: its record kept "2025 bytes, same md5" but neither the
+   text nor the digest value — and this run's log-extracted reply measures 1983 raw bytes
+   (2014 in the log's escaped form), so the 2025 was measured on some other basis, now
+   unrecoverable. The identity claim rests on the counters, said for what
+   they are: three aggregate totals over 188,082 lookups, not per-lookup verification —
+   but V4's gate reads the activations on every layer of every token, so a diverged token
+   stream re-routing to the same three totals is not a plausible coincidence. Recorded here so
+   the NEXT run can cmp: reply raw 1983 bytes, md5 `75b19fcde806059b45c515259feb16d2`
+   (log-escape-decoded).
+3. **resid 1.0 ≥ 0.**
+4. **Spans + resid ≡ win, exact: 53.2 + 9.1 + 41.2 + 3.2 + 1.0 = 107.7.** Coherence
+   riders: `win − d2h` = 31.4 ms of pre-D2H traversal against `remainder − tail` = 32.1 ✓;
+   and the event sum (106.7) exceeding `route` (76.7) by ~30 ms is the overlapped-traversal
+   geometry the instrument's doc argued — now measured, not argued.
+
+**The reading — the registered prediction scored three-of-four in band and wrong at the
+headline:**
+
+| span | measured | band (point) | bytes floor | above bytes |
+|---|---:|---:|---:|---:|
+| attn | 53.2 | 45–62 (55) ✓ | 23.9 | +29.3 |
+| hcn | **41.2** | 4–8 (6) — **wrong, 5–10×** | 0.8 | **+40.4** |
+| cmp | 9.1 | 8–12 (10) ✓ | 5.4 | +3.7 |
+| gate | 3.2 | 3–6 (5) ✓ | 0.9 | +2.3 |
+| resid | 1.0 | (4) | — | — |
+| win | 107.7 | 76–86 — high, all of it hcn | ~31.1 | — |
+
+1. **The hyper-connection/norm chain is now the engine's largest above-bytes excess.**
+   `hcn` runs at ~50× its traffic: ~0.96 ms/layer for the five in-window elementwise/norm
+   launches (`hc_pre` ×2, `hc_post` ×1, `v4_rmsnorm` ×2; the FFN-side `hc_post` drains at
+   the end-of-layer sync, in the remainder per M1's bucket map) reading 3.7 MB/layer.
+   Ranked residue: **hcn +40.4 > moe +33 > attn +29.3 > cmp +3.7 > gate +2.3**. Both
+   registered kill conditions FIRED: "hcn+gate above ~15 ms" at 44.4, and "attn under half
+   the window" at 49.4% — barely, and with a caveat the registered wording did not
+   anticipate: the denominator moved (against the PREDICTED win of 76–86 the same 53.2 ms
+   is 62–69%; "under half" is itself a product of hcn's blowout inflating win). By the
+   registered wording the fp8 kernel-rate lever is killed *as the primary attack*; it
+   stays live at #2 (attn is still +29.3 above bytes). And the fired hcn+gate condition's
+   registered reading — "the launch class, not any kernel" — is itself refuted by the
+   measurement that fired it: bubbles bound at ~5.4 of the 41.2, so the hc/norm KERNELS,
+   not launch overhead, are the #1 suspect.
+2. **Named, not priced** (decomposing a bucket by inference is the documented mistake):
+   the 20-iteration Sinkhorn inside `launch_hc_pre` (`hc_sinkhorn_iters = 20`),
+   serial/single-workgroup kernel geometry (GLM's `rmsnorm` is `dim3(1)` — the precedent),
+   and inter-launch idle. One honest bound, arithmetic not decomposition: at M3b's
+   measured ~25 µs host-bubble class the five launches explain ~5.4 of the 41.2 ms, so the
+   kernels' own geometry is the prime suspect — the next step is a host-side read of the
+   hc kernels (`kernels/linalg.hip`), no GPU needed.
+3. **attn is real but not the story:** 2.2× its bytes; the intra-attention split (three
+   marks inside `attn.rs`, outside this stretch's ownership) or the fp8-GEMV ISA read
+   stays warranted, second in line.
+4. **resid 1.0 kills the gate-D2H width micro-lever** the instrument's own staging had
+   flagged: the whole-buffer 223 KB/layer D2H (~9.6 MB/token) plus everything else
+   unbucketed in the window fits inside 1.0 ms/token, so `copy_out_prefix` narrowing
+   buys ≤1 ms. Dead, recorded.
+5. Stability riders: route 76.1 → 76.7 across builds, moe 54.7 → 55.9, fetch 9.6 → 10.6,
+   prefill 16.57 → 17.39 s — consistent with the observed cross-run scatter, said no more
+   strongly than that: no per-bucket spread is recorded for the batched build (this run is
+   its n=2), and fetch/prefill move more than the ±1.5% three-run wall spread.
