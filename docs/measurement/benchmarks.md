@@ -3169,3 +3169,99 @@ rungs (splitting the mixes across workgroups, fusing `v4_rmsnorm` into `hc_pre`)
 each priced ≤ ~2–4 ms and re-open only if the wall closes on ~100 ms and needs them;
 the next lever by the table is moe's miss-exposure/shared-GEMV residue or attn's fp8
 projections (the intra-attention split or the ISA read, per M4's ranking).
+
+## V4 double split — attn = qkv 20.3 + attend 3.2 + oproj 29.6; moe attributed res 24.2 / miss 9.7 / shared 15.8 (overlapping, not addends); the fp8 GEMV fires in BOTH splits (2026-08-08)
+
+The control run `docs/investigations/v4-decode-decomposition.md` M6 staged: commit
+`c933bd5` (`wt/v4-attn-moe-split` — instrumentation only), release built at that HEAD
+before the device was requested, flag-identical to M2..M5 (the 218-token prompt verbatim
+from the head-to-head CORRECTED note, md5 `bc71afa745d980be7d21860f70ad96aa`), exclusive
+flock with the gate INSIDE the lock (queue-behind-the-broker maneuver, as the hcn A/B):
+pre-gate sample 1 refused on a *stopping* llama-swap tenant (GTT 26.2 GB, kfd=0), sample
+2 five seconds later was clean (GTT 18.7 MB, kfd=0), and the tenant sat queued in
+"starting" for the whole run. Mid-run witness: **1 sample** (the ~100 s run crossed one
+60 s tick) — kfd=1 (this run's own), GTT flat at rivoli's 108.27 GiB, tenant still
+queued. As thin as the hcn A/B's arm B and stated the same way: no foreign GTT step in
+the sampled window, and the identical-output gate carries the rest.
+
+```
+PROFILE/tok: 130.6ms wall | route 58.6ms | moe 48.9ms | fetch 10.0ms | 4.96 miss (2538 raw), 2.02ms/miss, 0.07 GB | remainder 23.1ms (tail 8.2ms)
+ROUTE-SPLIT/tok: attn 53.1ms | cmp 9.1ms | hcn 5.7ms | gate 3.2ms | win 72.2ms (resid 1.1ms) | d2h 58.2ms + host 0.4ms
+ATTN-SPLIT/tok: qkv 20.3ms | attend 3.2ms | oproj 29.6ms | attn 53.1ms (resid 0.00ms)
+MOE-SPLIT/tok:  sh_enq 0.5ms | desc 0.3ms | h2d 15.5ms | sync1 0.4ms | launch 0.5ms | sync2 31.6ms | drain 0.1ms | moe 48.9ms (resid 0.0ms) | gpu: shared 15.8ms, res 24.2ms, miss 9.7ms
+```
+
+**Gates, all pass, read in the registered order.** (1) wall 130.6 vs the recorded 130.7
+= **−0.08%** against a ±3% gate — the O(2 ms) worst-case instrument bound is invisible
+at this resolution (n=1; buckets still not certified free, same caveat as every rung).
+(2) reply escape-decodes to the 1983-byte raw prefix at exactly the recorded md5
+`75b19fcde806059b45c515259feb16d2` — every witnessed run of this benchmark since M4 has
+decoded the same reply; expert lookups identical (179389 hit / 8693 miss, 2538 raw
+decode misses, 116.22 GB). (3) both summing identities hold on the printed line: ATTN
+resid 0.00 (shared-endpoint tiling), MOE resid 0.0 (the seven host spans reproduce 48.9
+exactly), win resid 1.1 ≥ 0. (4) coherence, registered "expected not enforced": attn 53.1 / cmp 9.1 / hcn 5.7 /
+gate 3.2 / tail 8.2 / fetch 10.0 all inside their recorded spreads; the registered
+exposure identity, evaluated in its registered form: `h2d + sync1` = 15.5 + 0.4 = 15.9
+vs `shared` − host-hidden = 15.8 − 0.4 = 15.4 — a 0.5 ms residual (the staging note
+guessed ~0.6 of `route_row` host math; this run measured 0.4). Mechanism confirmed,
+magnitude badly underpriced (below); the 0.5 residual is unattributed and inside the
+coherence gate's non-enforcement.
+
+**Scoring the attn prediction: ALL THREE IN BAND — the first triple hit of the series**
+(qkv 20.3 in 17–24, 0.3 off the 20 point; attend 3.2 in 2–6; oproj 29.6 in 26–32, 1.1
+off the point; the bands were registered as a partition of the recorded attn 52.8 and
+this run's attn is 53.1 — the +0.3 spread is absorbed by the bands' width, said rather
+than silent). The registered kill **"both GEMV spans ≈ 2× bytes with attend small ⇒
+the fp8 GEMV kernel-rate ISA read is warranted" FIRES**: qkv = 2.31× its 8.8 ms of
+bytes, oproj = 1.99× its 14.9. The rival kill (excess follows op count, not bytes) does
+not fire — oproj/qkv = 1.46 against a byte ratio of 1.69, so the dominant term scales
+with GEMV bytes at ~2×, with a smaller additive term on qkv consistent with its extra
+small-op count (its per-byte excess is 1.31 vs oproj's 0.99).
+
+**Scoring the moe prediction: the aggregate was right and one component was badly
+wrong — the M3/M4 error family again, this time INSIDE a bucket the instrument had to
+open to see.** sync2 31.6 (band 26–36 ✓), sync1 0.4 ✓ (~0 as mechanised), sh_enq 0.5 ✓,
+miss 9.7 ✓ (band 6–12); desc 0.3, launch 0.5, drain 0.1, resid 0.0 all UNDER their
+bands (the host loop is far cheaper than the ~25 µs class priced — good side); and
+**gpu shared 15.8 against the 6–10 band = 2.82× its 5.6 ms of bytes — its ≥ 9 kill
+FIRES**, dragging h2d to 15.5 vs 4–8 (h2d IS the shared chain's exposure site under
+legacy null-stream ordering, not a copy cost — the two misses are one miss). What the
+band assumed and the measurement refutes: shared priced at a modest 1.1–1.8× excess by
+analogy with a near-stream-rate GEMV; measured, the fp8 shared chain runs at ~35% of
+the MODELED achievable rate (5.6 modeled byte-floor ms / 15.8 measured — the ratio is
+derived from the 193.8 GB/s model, the 15.8 is the measurement) — the same family the
+attn split just fired on at 2.0–2.3×. The thresholds, scored as registered: **res 24.2
+FIRES its > 24 re-open kill** — 0.2 past the threshold at n=1, so this record enters
+the fp4-memory-geometry re-open as CONDITIONAL on a replicate, a judgment added here
+and named as such (the registered ±1.5 ms rule is span-vs-POINT and does not cover
+threshold distance); what is unconditional is the point miss, +4.2 over 20 and outside
+that noise: resident compute runs 1.38× its 17.5 byte floor. **miss 9.7** is 0.3 under
+its ≥ 10 kill — under threshold, no kill claimed, point in band (|9.7 − 9| = 0.7,
+inside noise) — and its rate reads clean: 9.7 / 4.96 = 1.96 ms/miss on-stream vs 2.02
+off-thread, i.e. the miss stream is essentially pure fetch-latency exposure, not
+kernel time.
+
+**The ranked lever list the double decomposition selects (residue to 10 tok/s: ~31 of
+the 130.6). The span excesses are measured; every lever VALUE below is a projection
+until its A/B:**
+
+1. **fp8 GEMV kernel rate — one ISA read serves three spans.** Excess above bytes:
+   oproj 14.7 + qkv 11.5 + shared 10.2 ≈ **36 ms/token** across the two splits, all
+   through `launch_v4_gemv_fp8`. The M3a→M3c pattern (read ISA, price the loop, then
+   decide) applies verbatim; even a partial recovery dominates the residue.
+2. **Shared-chain overlap (schedule-only).** The shared expert runs on the null stream
+   and exposes 15.5 ms in `h2d` while both expert streams sit idle; launching it on its
+   own stream (join at the existing sync2/drain, which already gates on everything)
+   hides it behind resident compute — worth up to ~15.5 now, still worth ~5 after
+   lever 1. Independent of and multiplicative with it.
+3. **Miss exposure 9.7** — straggler overlap past the closing sync (a device-side
+   join). Held at "candidate" until a replicate settles the ≥ 10 kill.
+4. **res 24.2 vs 17.5 bytes** — replicate first; if the +38% is real, the fp4
+   memory-path/geometry question re-opens (the 88-instr decode rung stays dead — it
+   widens issue, not bytes).
+5. attend 3.2 / small-op classes — real, small, last.
+
+Levers 1+2 project to −25..−40 ms against the needed −31: the top of that band covers
+it and the bottom falls 6 short — **10 tok/s needs the fp8 recovery to land mid-band or
+better, with levers 3–5 as the margin.** No quality tradeoff appears anywhere in the
+list, and the attack ORDER — though not the recoveries — is now measured, not guessed.
