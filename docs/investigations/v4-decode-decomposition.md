@@ -1,7 +1,7 @@
 ---
 scope: v4
 status: live
-verdict: OPEN, four levers LANDED and the route span SPLIT. M3b (2026-08-07, launch geometry): moe 70.6 → 54.7 ms/token, +9.6% tok/s. M3c (2026-08-08, branchless e2m1/e8m0 + global-AS descriptor loads, fp4 dot loop 195 → 105 instr per 128 weight bytes): moe 54.9 → 49.6, wall 165.3 = 6.048 tok/s — the registered prediction (−4..−10, point −6) landed IN BAND at −5.3, the first of the series to do so. M4 (2026-08-08) split route with four event-pair sub-spans, no new join: attn 53.2 | cmp 9.1 | hcn 41.2 | gate 3.2 | win 107.7 (resid 1.0) — WRONG at the headline: hcn (hyper-connections + norms) measured 41.2 against a 4–8 band and 0.8 ms of bytes, the engine's largest above-bytes excess; cmp and gate closed at budget; resid 1.0 kills the gate-D2H width micro-lever. M5 (2026-08-08, the hcn read + fix, schedule-only: hc_pre 256 → 1024 threads = one wave per mix row, sum-of-squares frozen at HC_RED, unroll-8): hcn 40.7 → 5.6, wall 130.7 = 7.652 tok/s (+26.5% over M3c's 6.048; arm-to-arm +28.7%), Δhcn −35.1 vs the registered −15..−30 band — the error family a third time, the good side a second (M4 missed high); the width and unroll levers MULTIPLY (24× loads in flight); hcn CLOSED at this rung, +4.8 above bytes. Output byte-identical and counters identical across every arm (M5: reply-prefix md5 recorded, escape-decoding to M4's recorded 1983-byte md5). Residue to 10 tok/s (~31 ms off the 130.7 wall): moe ~+31 over its 18 ms byte floor (miss exposure, shared GEMV unpriced) > attn +28.9 > hcn +4.8; remainder's non-tail 15.6 is no longer ranked apart — it overlaps the ranked spans (win − d2h = 14.8). M2's floor (~62 ms/token ≈ 16 tok/s ceiling) stands; buckets still not certified free (recorded stock-class wall spread ±1.5%, and M5's arm S sat +1.75% over the recorded 165.3).
+verdict: OPEN, four levers LANDED and the route span SPLIT. M3b (2026-08-07, launch geometry): moe 70.6 → 54.7 ms/token, +9.6% tok/s. M3c (2026-08-08, branchless e2m1/e8m0 + global-AS descriptor loads, fp4 dot loop 195 → 105 instr per 128 weight bytes): moe 54.9 → 49.6, wall 165.3 = 6.048 tok/s — the registered prediction (−4..−10, point −6) landed IN BAND at −5.3, the first of the series to do so. M4 (2026-08-08) split route with four event-pair sub-spans, no new join: attn 53.2 | cmp 9.1 | hcn 41.2 | gate 3.2 | win 107.7 (resid 1.0) — WRONG at the headline: hcn (hyper-connections + norms) measured 41.2 against a 4–8 band and 0.8 ms of bytes, the engine's largest above-bytes excess; cmp and gate closed at budget; resid 1.0 kills the gate-D2H width micro-lever. M5 (2026-08-08, the hcn read + fix, schedule-only: hc_pre 256 → 1024 threads = one wave per mix row, sum-of-squares frozen at HC_RED, unroll-8): hcn 40.7 → 5.6, wall 130.7 = 7.652 tok/s (+26.5% over M3c's 6.048; arm-to-arm +28.7%), Δhcn −35.1 vs the registered −15..−30 band — the error family a third time, the good side a second (M4 missed high); the width and unroll levers MULTIPLY (24× loads in flight); hcn CLOSED at this rung, +4.8 above bytes. Output byte-identical and counters identical across every arm (M5: reply-prefix md5 recorded, escape-decoding to M4's recorded 1983-byte md5). Residue to 10 tok/s (~31 ms off the 130.7 wall): moe ~+31 over its 18 ms byte floor (miss exposure, shared GEMV unpriced) > attn +28.9 > hcn +4.8; remainder's non-tail 15.6 is no longer ranked apart — it overlaps the ranked spans (win − d2h = 14.8). M2's floor (~62 ms/token ≈ 16 tok/s ceiling) stands; buckets still not certified free (recorded stock-class wall spread ±1.5%, and M5's arm S sat +1.75% over the recorded 165.3). M6 (2026-08-08, staged, no GPU yet): the double split is INSTRUMENTED — attn cut into qkv/attend/oproj by two marks inside `attention` (shared endpoints, so they tile the whole-call span), moe into a seven-span host tiling (resid ≥ 0 by construction) plus shared/res/miss device pairs read behind its own closing sync, no new join anywhere; predictions registered with kill conditions (attn: qkv 17–24 / attend 2–6 / oproj 26–32; moe: sync2 26–36 with gpu res 17–24, miss 6–12, shared 6–10 — the closure hypothesis for moe's +31); one control run staged, wall gate ±3% of 130.7, reply md5 75b19fcde806059b45c515259feb16d2.
 ---
 
 # Where do V4-Flash's 185 ms/token go?
@@ -600,6 +600,144 @@ changes as the trigger) — a failing one owes §8 a re-run on top of being a bu
 > registered floor's own edge instead of the ~145 µs point. New state 130.7 ms/token =
 > 7.652 tok/s; hcn CLOSED at this rung. Full record, every gate, the wall-win
 > attribution and the retired bubble bound: benchmarks.md "V4 hcn A/B".
+
+## M6 — the double split (attn × moe), INSTRUMENTED 2026-08-08 (no GPU yet), and the registered predictions
+
+The residue ranking after M5 names two spans with no internal decomposition — moe 48.9
+over ~23.6 of bytes and attn 52.8 over 23.9 — and the instrument-first pattern has now
+paid three times (M2 → M3b, M4 → M5). This stretch lands BOTH splits, instrumentation
+only, no perf change: three sub-spans inside `attn` and a host tiling plus three device
+attributions inside `moe`. No new sync, event wait, or join anywhere — every event pair
+is read behind a join the decode already pays (the gate-logits D2H for the attn marks,
+the routed path's own closing `device_sync` for the moe pairs), and every host bracket
+is an `Instant` read beside a call the path already makes.
+
+**The attn split — two marks recorded INSIDE `attn::v4::attention`** (via its new
+`SplitMarks` argument; `None` from every probe/test caller is bit-identical to the
+pre-M6 call), cutting M4's 2→5 span into three that SHARE endpoints, so they tile it by
+construction and the printed `resid` is an identity check (either sign, per-query float
+rounding only; dev assert at |resid| ≤ 5e-2). What each bracket covers, exactly:
+
+- `qkv` — mark 2 (selection uploaded) → `qkv_done` (recorded after the KV entry's
+  partial `act_quant`): the q and kv chains — `xq` copy + `act_quant`, `wq_a` GEMV,
+  `q_norm`, `qrq` copy + `act_quant`, `wq_b` GEMV, `qk_norm`, RoPE(q), `wkv` GEMV,
+  `kv_norm`, RoPE(kv), KV `act_quant` — 12 device ops, 3 of them fp8 GEMVs.
+- `attend` — `qkv_done` → `attend_done` (recorded after `launch_v4_sparse_attn`): the
+  phase-dependent cache/ring write copies (one row at decode) and `sparse_attn` itself.
+- `oproj` — `attend_done` → mark 5 (`attention` returned): the de-rotating RoPE,
+  `wo_a` GEMV, `act_quant`, `wo_b` GEMV.
+
+**The moe split — seven host spans that tile `moe_ns`** (disjoint sub-intervals of the
+two brackets `moe` already sums, so `resid ≥ 0` by construction, dev-asserted), **plus
+three same-stream device pairs** read behind the closing `device_sync` (attributions,
+NOT addends — `shared` overlaps `route_row`'s host math; `res` and `miss` overlap each
+other across streams). Coverage, exactly:
+
+- `sh_enq` — the `shared_expert` call: five launch ENQUEUES (its GPU time is `shared`).
+- `desc` — routed entry → first H2D: `RoutedPool::submit` (miss fetches enter flight
+  here), the format check, the 256-descriptor launch-order rebuild.
+- `h2d` — the two blocking H2D copies (~13.3 KB): legacy null-stream semantics order
+  them behind the shared chain still in flight, so the chain's UNHIDDEN tail exposes
+  here, not in `sync1`.
+- `sync1` — the first `device_sync`: expected ~0 (the H2D just drained the null
+  stream); it is the `xq`-read guarantee, not the exposure site.
+- `launch` — ticket waits + the resident range launch + per-miss launches, host enqueue.
+- `sync2` — the closing `device_sync`: resident-batch compute and miss stragglers
+  expose here, whichever stream drains last.
+- `drain` — the accumulator drain launch enqueue (its GPU time retires at the
+  end-of-layer sync, in the PROFILE remainder — the bracket does not contain it).
+- gpu `shared` — null-stream pair around the shared chain: gate/up GEMVs, swiglu,
+  `act_quant`, down GEMV.
+- gpu `res` — compute-stream pair around the ONE resident range launch (M3b's boundary,
+  unmoved): resident-batch expert compute.
+- gpu `miss` — miss-stream pair, before the first straggler's ticket wait → after the
+  last straggler's launch: fetch exposure + straggler compute. Both records are SKIPPED
+  on a no-miss layer (and `res` when `n_res = 0`): a reused event retains its previous
+  recording, so reading an unrecorded pair would book a stale span, not zero.
+
+What stays unbucketed, said here as the rule requires: the per-miss split of `miss`
+into fetch-wait vs kernel time (needs an event pair per miss or a mid-stream query —
+the off-thread `fetch`/`ms/miss` counters already price that side), and the drain
+kernel's execution (retires outside `moe`, in the remainder's end-of-layer sync).
+
+Instrument cost, argued as M4's: ≤8 added records (2 attn + 2 shared + 2 res + 2 miss,
+the miss pair usually skipped at 0.115 miss/layer) and ≤6 added completed-event queries
+per layer — worst case ~600 records + ~470 queries per token against M4's 258+215,
+O(2 ms) — plus 8 `Instant` reads per routed call (noise). The control is the run's wall
+gate, not the argument.
+
+**Byte budgets per sub-span** — attn rows from M4's per-tensor table (same artifact
+header read), moe rows from the config's `moe_inter = 2048`, `hidden = 4096`, the
+13.37 MB fp4 expert slot, and the recorded 2538 decode misses / 511 tokens = 0.1155
+misses per layer-token:
+
+| span | per layer | per token | at 193.8 GB/s |
+|---|---|---:|---:|
+| qkv | `wq_a` 4.19 + `wq_b` 33.55 + `wkv` 2.10 + norms/scales ~0.03 MB | 1.714 GB | 8.8 ms |
+| attend | ≤1 MB gathered KV + sink/idxs | ≤0.043 GB | ≤0.2 ms |
+| oproj | `wo_a` 33.55 + `wo_b` 33.55 + scales ~0.02 MB | 2.887 GB | 14.9 ms |
+| shared | 3 × [2048, 4096] fp8 = 25.17 MB + scales/activations | 1.084 GB | 5.6 ms |
+| res | 5.885 residents × 13.37 MB = 78.7 MB | 3.383 GB | 17.5 ms |
+| miss | 0.1155 × 13.37 MB (compute side; the fetch is off-thread, 1.99 ms/miss) | 0.066 GB | 0.34 ms |
+| desc/h2d/launch/drain/sync1 | ~13.3 KB H2D, rest launch/host | ~0.001 GB | ~0 |
+
+(attn sub-spans sum to M4's 4.640 GB ≈ 23.9 ms; moe device spans sum to ~23.4 ms of
+bytes, the floor `moe`'s 48.9 is ranked against.)
+
+**Prediction — attn split, registered 2026-08-08 before the measurement so it can be
+wrong** (attn measured 52.8; the three must tile it, so the bands are a partition):
+**qkv 17–24 (point 20), attend 2–6 (point 4), oproj 26–32 (point 28.5)** — both
+GEMV-heavy spans at ~2.0–2.3× their bytes, the M3a family (fp8 GEMV suspected
+issue/latency-bound at m = 1, unverified — that suspicion is what the split prices),
+with qkv additionally carrying ~7–9 small-kernel/copy ops of the hcn latency class.
+**What each outcome selects:** attend > 10 ⇒ `sparse_attn` is an hc_pre-class
+wrong-shaped kernel and its read/widening outranks the GEMV lever; qkv ≈ oproj ± 20%
+despite the 8.8-vs-14.9 byte ratio ⇒ the excess follows op COUNT, the per-launch/small-
+kernel class is the lever (fuse/batch the chain), not GEMV ISA; both GEMV spans ≈ 2×
+bytes with attend small ⇒ the fp8 GEMV kernel-rate ISA read is warranted (M3a pattern),
+corroborated independently if moe's gpu `shared` also lands ≥ 1.5× its 5.6.
+
+**Prediction — moe split, registered 2026-08-08 with it** (moe measured 48.9; the host
+spans must tile it): **sh_enq 0.5–2 (1), desc 2–5 (3.5), h2d 4–8 (7), sync1 0–1 (0.4),
+launch 1–3 (1.5), sync2 26–36 (33), drain 0.5–2 (1.2), resid 0.5–2 (1.3)** — point sum
+48.9 — **and gpu shared 6–10 (7.5), res 17–24 (20), miss 6–12 (9)**. This IS the
+closure hypothesis for moe's +31 over bytes: resident compute near its 17.5 byte floor
+(M3c bought the fp4 loop ~45% issue headroom), miss exposure ≈ 4.96 × 1.99 less
+overlap, the shared chain modestly above its 5.6, host residue ~7. **Kill conditions:**
+res > 24 ⇒ the fp4 loop is NOT stream-bound despite the 105-instr count — the
+memory-system/geometry question re-opens (the 88-instr rung does NOT follow; it widens
+issue, not bytes); miss ≥ 10 ⇒ miss exposure is the top moe lever (overlap stragglers
+past the closing sync — a device-side join, the stream-ordered accumulate — or buy
+residency); gpu shared ≥ 9 ⇒ the fp8 GEMV rate lever, jointly with the attn split's
+verdict — one ISA read serves both; host residue (sh_enq+desc+launch+drain+resid) ≥ 10
+⇒ the host loop is the lever (descriptor rebuild caching, one H2D); sync2 < 24 with moe
+unchanged ⇒ the sit-of-time model is wrong somewhere visible in the other spans —
+replicates before any claim. |any span − its point| inside recorded bucket noise
+(~±1.5 ms) is NOT a finding either way at n = 1.
+
+**The staged run (GO, one run — control, not an A/B: the splits ride the recorded
+130.7 baseline):** release binary built at this branch's committed HEAD BEFORE the
+device is requested; flag-identical to M2..M5, the 218-token prompt verbatim from
+benchmarks.md's head-to-head CORRECTED note (md5 `bc71afa745d980be7d21860f70ad96aa`);
+exclusive flock with the per-minute KFD+GTT+llama-swap witness:
+
+```
+flock /var/run/sys-gpu.lock -c 'target/release/rivoli /var/db/rivoli/v4-f4-full -bench 512 --prompt "<the 218-token prompt>"'
+```
+
+**Gates, registered with the predictions:** (1) wall within ±3% of the recorded 130.7
+ms/token — a breach is reported BEFORE any reading of either split. (2) output
+byte-identical: the reply's escape-decoded full text must md5 to the recorded
+`75b19fcde806059b45c515259feb16d2` (the convention since M5), and expert lookups
+identical (179389 hit / 8693 miss, 2538 raw decode misses). (3) both splits sum to
+their parents: ATTN-SPLIT resid within ±0.05, MOE-SPLIT resid ≥ 0 (printed identities;
+dev asserts are compiled out in release, so the gate is the printed numbers). (4)
+coherence, expected not enforced: attn/cmp/hcn/gate/win within their recorded spreads
+of the M5 arm-B line (the whole-call `attn` span is kept precisely so the split cannot
+drift from it unnoticed), and `h2d + sync1` ≈ gpu `shared` − the part `route_row`'s
+~0.6 ms of host math hides. The record lands in benchmarks.md beside "V4 hcn A/B"; the
+deliverable is the measured double decomposition and the ranked lever list it selects —
+the attack itself is the next stretch.
 
 ## M2 — provenance of the command
 

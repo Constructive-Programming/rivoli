@@ -616,25 +616,27 @@ impl AttnStages {
 ///
 /// Four HIP-event-pair accumulators say WHICH phase `route`'s wait drains (M2 measured it
 /// ~76 ms against ~31 ms of bytes and could not say). Same instrument as GLM's
-/// `idx_gpu_ns`, and like it a SPAN, gaps included, not a kernel sum: six marks per layer
-/// on the null stream, read at the gate-logits D2H — the join the route bracket already
+/// `idx_gpu_ns`, and like it a SPAN, gaps included, not a kernel sum: eight marks per
+/// layer (six of M4's, renumbered when M6's two landed between SEL and ATTN_DONE) on the
+/// null stream, read at the gate-logits D2H — the join the route bracket already
 /// closes on — so no new sync, event wait, or join. Marks record on EVERY layer; a phase
 /// a layer class skips (the two ratio-0 layers run no compressor) reads ~zero-width, so
 /// the accumulation is uniform across classes rather than conditional. The coverage map
 /// (marks are program order; the full residual argument and the per-span byte budgets
-/// live in `docs/investigations/v4-decode-decomposition.md` §M4):
+/// live in `docs/investigations/v4-decode-decomposition.md` §M4 and §M6):
 ///
-/// * `hcn_ns` — marks 0→1 + 3→4: `hc_pre` + `attn_norm`, and `hc_post` + `hc_pre` +
+/// * `hcn_ns` — marks 0→1 + 5→6: `hc_pre` + `attn_norm`, and `hc_post` + `hc_pre` +
 ///   `ffn_norm` — the hyper-connection application and both sublayer norm chains.
 /// * `cmp_ns` — marks 1→2: `compress_and_place` (the deposit and both placement copies)
 ///   plus the GPU idle while the host builds and uploads the positional selection.
-/// * `attn_ns` — marks 2→3: the `attn::v4::attention` call, whole — q/kv projections,
-///   cache write, `sparse_attn`, o_proj. Splitting INSIDE it needs marks in `attn.rs`,
-///   outside this stretch's ownership; one span, said so here and in the plan doc.
-/// * `gate_ns` — marks 4→5: the gate GEMV, the `xq` copy and its act_quant.
+/// * `attn_ns` — marks 2→5: the `attn::v4::attention` call, whole — q/kv projections,
+///   cache write, `sparse_attn`, o_proj. M6 split it (marks 3 and 4, recorded inside
+///   `attention` — the next section); this whole-call span is kept as the tiled sum's
+///   independent restatement.
+/// * `gate_ns` — marks 6→7: the gate GEMV, the `xq` copy and its act_quant.
 /// * `win_wall_ns` — the HOST wall containing them: layer top to the D2H's return. The
-///   four spans tile marks 0→5 INSIDE that wall (mark 0 records after the wall clock
-///   starts; mark 5 retires before the D2H's data lands), so the printed
+///   four spans tile marks 0→7 INSIDE that wall (mark 0 records after the wall clock
+///   starts; mark 7 retires before the D2H's data lands), so the printed
 ///   `resid = win − Σspans` is non-negative by construction: it holds the D2H copy, the
 ///   pre-mark-0 lag (layer 0's includes the step's pending embed gather), and GPU-vs-host
 ///   clock skew. `resid` is defined against `win` and NOT against `route`, because
@@ -644,10 +646,75 @@ impl AttnStages {
 /// * `route_host_ns` — `route_row`'s host share of `route_ns`, from clock reads the
 ///   bracket already pays, so the print can restate `route` as its `d2h + host` halves.
 ///
-/// Cost bound, extending the O(10 µs) argument above: 258 `hipEventRecord` enqueues + 215
-/// completed-event queries per token, O(µs) each — O(1.5 ms) worst case against a 170 ms
-/// token. A bound by argument, not a control; M4's wall gate (±3% of the recorded 169.9)
-/// is the control, and a breach is reported before any reading of the split.
+/// # The attn split (M6): three sub-spans of `attn_ns`, tiled by construction
+///
+/// Two more marks per layer — recorded INSIDE `attn::v4::attention` via its
+/// [`v4::SplitMarks`] argument (that struct carries the exact launch coverage of each
+/// bracket) — cut the 2→5 attn span into `qkv` (2→3), `attend` (3→4) and `oproj` (4→5).
+/// Same stream, same read site, no new join. Every endpoint is shared with the next
+/// span, so `qkv + attend + oproj ≡ attn` up to per-query float rounding — the printed
+/// ATTN-SPLIT residual is that identity checked on every run, and it is allowed EITHER
+/// sign (four independent `hipEventElapsedTime` reads of the same four marks), unlike
+/// `win`'s structurally-positive one.
+///
+/// * `qkv_ns` — marks 2→3: the q and kv projection chains, ~39.9 MB/layer of weights.
+/// * `attend_ns` — marks 3→4: the KV cache write + `sparse_attn`, ≤~1 MB gathered.
+/// * `oproj_ns` — marks 4→5: de-rotation + `wo_a`/`wo_b` projection, ~67.1 MB/layer.
+///
+/// # The moe split (M6): host tiling of `moe_ns`, plus three device attributions
+///
+/// `moe_ns` is a HOST wall (two `Instant` brackets in [`V4Engine::moe`]), so its split
+/// is host sub-intervals that tile it — disjoint by construction, `resid ≥ 0` — read at
+/// clocks the path already holds, plus three same-stream event pairs read behind the
+/// SECOND `device_sync` the routed path already pays. What each holds, exactly:
+///
+/// * `moe_sh_ns` — the [`V4Engine::shared_expert`] call: five launch ENQUEUES (the
+///   chain's GPU time drains later, see `moe_h2d_ns`).
+/// * `moe_desc_ns` — routed entry to the first H2D: `RoutedPool::submit` (miss fetches
+///   enter flight here), the format check, and the 256-descriptor launch-order rebuild.
+/// * `moe_h2d_ns` — the two blocking H2D copies (~13.3 KB), plus the pointer/scalar
+///   derivations between them and the sync (ns-scale, spans keep their gaps). Legacy
+///   null-stream semantics order the copies behind the shared-expert chain still in
+///   flight, so the chain's UNHIDDEN tail exposes here — the copies' own bytes are
+///   ~30 µs/token.
+/// * `moe_sync1_ns` — the first `device_sync`. Expected ~0 (the H2D just drained the
+///   null stream); it is the correctness guarantee, not the exposure site.
+/// * `moe_launch_ns` — ticket waits + the resident range launch + per-miss launches:
+///   host enqueue only.
+/// * `moe_sync2_ns` — the closing `device_sync`: the exposure of resident-batch
+///   compute and miss stragglers, whichever stream drains last.
+/// * `moe_drain_ns` — the accumulator drain launch (enqueue; its GPU time retires at
+///   the end-of-layer sync, in the PROFILE remainder — said here so the bracket is not
+///   read as containing it).
+/// * resid (printed, not stored) — `moe − Σ` above: the inter-bracket clock gaps and
+///   the instrument's own event reads, which sit deliberately between `sync2` and
+///   `drain` so their cost lands in resid, not in a named span.
+///
+/// The three device pairs attribute what the host spans expose — they are NOT part of
+/// the sum (their work overlaps `route_row`'s host math and each other across streams):
+///
+/// * `moe_shg_ns` — null-stream pair around the shared-expert chain: gate/up GEMVs,
+///   swiglu, `act_quant`, down GEMV — the fp8 shared GEMV's true device span.
+/// * `moe_res_ns` — compute-stream pair around the single resident range launch:
+///   resident-batch expert compute, ~78.7 MB/layer at the measured residency.
+/// * `moe_miss_ns` — miss-stream pair from before the first straggler's ticket wait to
+///   after the last straggler's launch: fetch exposure + straggler compute. Both
+///   miss-pair records are SKIPPED on a layer with no miss (and the res pair when
+///   `n_res == 0`), because a reused event retains its previous recording — reading a
+///   pair this call did not record would book a stale span, not zero.
+///
+/// What stays unbucketed and why: the per-miss split of `moe_miss_ns` into fetch-wait
+/// vs kernel time would need an event pair PER MISS (a variable-length pool) or a
+/// stream query between wait and launch — the off-thread `fetch`/`ms/miss` counters
+/// already price that side, so it is not bought here.
+///
+/// Cost bound, extending the O(10 µs) argument above: M4's 258 records + 215 queries,
+/// plus M6's ≤8 records (2 attn + 2 shared + 2 resident + 2 miss, the last two usually
+/// skipped) and ≤6 queries per layer — worst case ~600 records + ~470 queries per
+/// token, O(µs) each, O(2 ms) against a 130 ms token — plus 8 `Instant` reads per
+/// routed call (O(20 ns) each, noise). A bound by argument, not a control; the M6 wall
+/// gate (±3% of the recorded 130.7) is the control, and a breach is reported before
+/// any reading of either split.
 #[derive(Default)]
 struct V4Profile {
     route_ns: u128,
@@ -660,17 +727,57 @@ struct V4Profile {
     cmp_ns: u128,
     attn_ns: u128,
     gate_ns: u128,
+    qkv_ns: u128,
+    attend_ns: u128,
+    oproj_ns: u128,
+    moe_sh_ns: u128,
+    moe_desc_ns: u128,
+    moe_h2d_ns: u128,
+    moe_sync1_ns: u128,
+    moe_launch_ns: u128,
+    moe_sync2_ns: u128,
+    moe_drain_ns: u128,
+    moe_shg_ns: u128,
+    moe_res_ns: u128,
+    moe_miss_ns: u128,
 }
 
 /// The route-split marks' indices into [`V4Engine::route_ev`], program order — named so
 /// the record sites and the pair reads spell the same map [`V4Profile`] documents, and a
-/// transposed pair is visible at the call site instead of plausible.
+/// transposed pair is visible at the call site instead of plausible. M6 renumbered the
+/// tail three when the two intra-attention marks landed between SEL and ATTN_DONE; the
+/// names are why no pair read had to change for it.
 const M_TOP: usize = 0;
 const M_ATTN_NORMED: usize = 1;
 const M_SEL: usize = 2;
-const M_ATTN_DONE: usize = 3;
-const M_FFN_NORMED: usize = 4;
-const M_GATE: usize = 5;
+/// Recorded inside `attn::v4::attention` via [`v4::SplitMarks`], as is the next one.
+const M_QKV_DONE: usize = 3;
+const M_ATTEND_DONE: usize = 4;
+const M_ATTN_DONE: usize = 5;
+const M_FFN_NORMED: usize = 6;
+const M_GATE: usize = 7;
+
+/// The moe-split pairs' indices into [`V4Engine::moe_ev`] — [`V4Profile`]'s "moe split"
+/// section is the coverage map. Pairs, not a program-order chain: SH is a null-stream
+/// pair, RES a compute-stream pair, MISS a miss-stream pair, so only same-index-pair
+/// spans are meaningful.
+const MO_SH0: usize = 0;
+const MO_SH1: usize = 1;
+const MO_RES0: usize = 2;
+const MO_RES1: usize = 3;
+const MO_MISS0: usize = 4;
+const MO_MISS1: usize = 5;
+
+/// Completed-event span in ns. Both events must have retired behind a join the path
+/// already pays — every caller sits after the gate D2H or the routed path's closing
+/// `device_sync`, so this is a query, never a wait.
+fn ev_span_ns(a: &Event, b: &Event, what: &str) -> Result<u128> {
+    let ms = Event::elapsed_ms(a, b)?;
+    // A negative pair would saturate to 0 below and read as a plausible zero-width
+    // span; same-stream program order makes it impossible, so it is a bug.
+    debug_assert!(ms >= 0.0, "{what} event pair out of order: {ms} ms");
+    Ok((f64::from(ms) * 1e6) as u128)
+}
 
 /// Everything one V4 decode needs that does not vary between tokens.
 ///
@@ -780,15 +887,22 @@ pub struct V4Engine {
     hits0: u64,
     misses0: u64,
     prof: V4Profile,
-    /// The six route-split marks, program order (see [`V4Profile`]). ONE array reused
-    /// every layer: each layer's pairs are read at its own gate D2H, before the next
-    /// layer records over them, so reuse cannot cross-read.
-    route_ev: [Event; 6],
+    /// The eight route-split marks (six of M4's, two of M6's inside `attention`),
+    /// program order (see [`V4Profile`]). ONE array reused every layer: each layer's
+    /// pairs are read at its own gate D2H, before the next layer records over them, so
+    /// reuse cannot cross-read.
+    route_ev: [Event; 8],
+    /// The three moe-split pairs (see [`V4Profile`]'s moe section and the `MO_*`
+    /// constants). Reused per layer like `route_ev` — read behind the routed path's own
+    /// closing `device_sync` before the next layer records over them — with one further
+    /// rule the route marks do not need: a pair a call did NOT record this layer is not
+    /// read either, because a reused event retains its previous recording.
+    moe_ev: [Event; 6],
     /// `Some` from layer top until the gate D2H returns — the token saying "this `moe`
     /// call closes a window [`V4Engine::layer`] opened". Today `moe` is only entered from
     /// `layer`, which always opens the window first; the `Option` is what keeps a FUTURE
     /// probe-driven `moe` from booking a window that never opened or reading marks it
-    /// never recorded (`probe_attn_stages` already records marks 2/3 and never reads).
+    /// never recorded (`probe_attn_stages` already records marks 2..=5 and never reads).
     win_t0: Option<std::time::Instant>,
 }
 
@@ -873,12 +987,14 @@ impl V4Engine {
         }
 
         let (hits0, misses0) = (pin.routed.hits(), pin.routed.misses());
-        // A `Vec` because `[Event::new()?; 6]` cannot exist (`Event` is not `Copy`) and six
-        // spelled-out calls are the duplication gate's food.
-        let mut marks = Vec::with_capacity(6);
-        for _ in 0..6 {
+        // A `Vec` because `[Event::new()?; 14]` cannot exist (`Event` is not `Copy`) and
+        // fourteen spelled-out calls are the duplication gate's food. One loop for both
+        // arrays; the moe pairs are the tail six.
+        let mut marks = Vec::with_capacity(14);
+        for _ in 0..14 {
             marks.push(Event::new()?);
         }
+        let moe_marks = marks.split_off(8);
         let mut e = Self {
             dims,
             rope: RopeTables::new(&cfg, max_ctx),
@@ -937,9 +1053,11 @@ impl V4Engine {
             hits0,
             misses0,
             prof: V4Profile::default(),
-            // Infallible at runtime — the loop above pushed exactly six — but `try_into`'s
-            // error type is the `Vec` back, so `context` is the honest spelling.
-            route_ev: marks.try_into().ok().context("six route-split events")?,
+            // Infallible at runtime — the loop above pushed exactly fourteen and the
+            // split took six — but `try_into`'s error type is the `Vec` back, so
+            // `context` is the honest spelling.
+            route_ev: marks.try_into().ok().context("eight route-split events")?,
+            moe_ev: moe_marks.try_into().ok().context("six moe-split events")?,
             win_t0: None,
             pin,
             cfg,
@@ -1252,13 +1370,19 @@ impl V4Engine {
         // Mark 2: selection uploaded, nothing of `attention` queued yet — `attn`'s span
         // opens here, so the compressor span behind it keeps the selection-build idle.
         self.route_ev[M_SEL].record(NULL_STREAM)?;
+        // Marks 3 and 4 record INSIDE the call, between its three sections — the M6
+        // attn split ([`v4::SplitMarks`] carries the per-bracket launch coverage).
+        let mk = v4::SplitMarks {
+            qkv_done: &self.route_ev[M_QKV_DONE],
+            attend_done: &self.route_ev[M_ATTEND_DONE],
+        };
         // SAFETY: every pointer in `w` is a pin placement outliving this engine; every pointer in
         // `s`/`io` is a `DeviceBuf` field of `self` at the size its field documents, and no two
         // are the same allocation — `xq` is attention's own scratch here, re-derived from `io.x`
         // inside `attention` before any read.
-        unsafe { v4::attention(&self.dims, sel, &w, &s, &io, step, NULL_STREAM) }
+        unsafe { v4::attention(&self.dims, sel, &w, &s, &io, step, Some(mk), NULL_STREAM) }
             .with_context(|| format!("layer {layer} attention at ({m}, {start_pos})"))?;
-        // Mark 3: `attn` closes on the call's last enqueue.
+        // Mark 5: `attn` closes on the call's last enqueue.
         self.route_ev[M_ATTN_DONE].record(NULL_STREAM)
     }
 
@@ -1383,6 +1507,9 @@ impl V4Engine {
     /// this buffer and the routed drain adds on top.
     fn routed_experts(&mut self, layer: usize, t: usize) -> Result<()> {
         let (dim, inter, n_desc) = (self.cfg.hidden, self.cfg.moe_inter, self.cfg.n_experts);
+        // The M6 moe-split host brackets — every boundary below is a clock read beside
+        // a call the path already makes; [`V4Profile`]'s moe section is the coverage map.
+        let t_entry = std::time::Instant::now();
         self.pin.routed.submit(
             layer,
             &self.sel,
@@ -1454,6 +1581,7 @@ impl V4Engine {
                 n_res = c;
             }
         }
+        let t_h2d = std::time::Instant::now();
         self.descs.copy_in_at(0, as_le_bytes(&self.descs_host))?;
         self.wexpert
             .copy_in_at(0, as_le_bytes(&self.wexpert_launch))?;
@@ -1484,7 +1612,9 @@ impl V4Engine {
         // streams are `hipStreamNonBlocking`, so they do not implicitly join it. This sync is
         // what makes the read safe; it goes away when the attention set takes a stream, not
         // before.
+        let t_sync1 = std::time::Instant::now();
         device_sync()?;
+        let t_launch = std::time::Instant::now();
         // Residents first, then misses — measured, not tidy: inverting the order cost GLM
         // 3.05 -> 2.44 tok/s, because a resident expert's compute is what overlaps the in-flight
         // ones' reads. Every launch enqueues its ticket's wait first: `wait_on` is the only way
@@ -1510,13 +1640,24 @@ impl V4Engine {
             }
         }
         if n_res > 0 {
+            // The resident device pair brackets exactly this one range launch on the
+            // compute stream (the ticket waits above enqueue nothing — value-0
+            // timeline waits early-return): its span is the resident-batch compute.
+            self.moe_ev[MO_RES0].record(cs)?;
             launch_range(0, n_res, acc, cs)?;
+            self.moe_ev[MO_RES1].record(cs)?;
         }
         // Misses stay ONE LAUNCH EACH, each behind its own ticket only: folding them into the
         // resident range (or into one miss range) would gate the whole batch on the LAST fetch
         // to land — 2.40 ms/miss measured at M2 — serialising hits behind misses. The compact
         // index keeps ascending in the same order the placement loop wrote, so straggler `j`
         // reads descriptor `n_res + j`.
+        let any_miss = n_res < self.sel.len();
+        if any_miss {
+            // Opens the miss-stream pair: from here to `MO_MISS1` the stream holds every
+            // straggler's ticket wait (the fetch exposure) and every straggler's kernels.
+            self.moe_ev[MO_MISS0].record(ms)?;
+        }
         for (j, i) in (0..self.sel.len())
             .filter(|&i| !self.tickets[i].is_resident())
             .enumerate()
@@ -1525,9 +1666,40 @@ impl V4Engine {
             // SAFETY: row 1 of an `MOE_ACC_ROWS * dim` accumulator; see the block above.
             launch_range(n_res + j, 1, unsafe { acc.add(dim) }, ms)?;
         }
+        if any_miss {
+            self.moe_ev[MO_MISS1].record(ms)?;
+        }
         // Header item 2: the drain's contract is that EVERY stream which accumulated into `acc`
         // has already completed.
+        let t_sync2 = std::time::Instant::now();
         device_sync()?;
+        let t_read = std::time::Instant::now();
+        // Pair reads, behind the sync that retired them. ONLY the pairs this call
+        // recorded: a reused event keeps its previous recording, so reading an
+        // unrecorded pair would book a stale span as this layer's (see [`V4Profile`]).
+        if n_res > 0 {
+            self.prof.moe_res_ns += ev_span_ns(
+                &self.moe_ev[MO_RES0],
+                &self.moe_ev[MO_RES1],
+                "moe-split resident",
+            )?;
+        }
+        if any_miss {
+            self.prof.moe_miss_ns += ev_span_ns(
+                &self.moe_ev[MO_MISS0],
+                &self.moe_ev[MO_MISS1],
+                "moe-split miss",
+            )?;
+        }
+        let t_drain = std::time::Instant::now();
+        // The host tiling lands in one place, ordered as the brackets are: the reads
+        // between `sync2` and `drain` (the pair queries above) deliberately fall in NO
+        // span — they are the instrument's own cost and surface in the printed resid.
+        self.prof.moe_desc_ns += t_h2d.duration_since(t_entry).as_nanos();
+        self.prof.moe_h2d_ns += t_sync1.duration_since(t_h2d).as_nanos();
+        self.prof.moe_sync1_ns += t_launch.duration_since(t_sync1).as_nanos();
+        self.prof.moe_launch_ns += t_sync2.duration_since(t_launch).as_nanos();
+        self.prof.moe_sync2_ns += t_read.duration_since(t_sync2).as_nanos();
         let dst = self.sub.ptr_mut();
         // `gain` is 1.0 and there is no `--moe-gain` on this path: that flag exists for GLM's
         // int3-vq magnitude sweep and V4 has no such measurement. A knob whose only value is the
@@ -1538,7 +1710,9 @@ impl V4Engine {
             let row = dst.cast::<f32>().add(t * dim);
             launch_moe_acc_drain(row, acc, dim, MOE_ACC_ROWS, 1.0, null)
         }
-        .with_context(|| format!("layer {layer}: draining the MoE accumulator for row {t}"))
+        .with_context(|| format!("layer {layer}: draining the MoE accumulator for row {t}"))?;
+        self.prof.moe_drain_ns += t_drain.elapsed().as_nanos();
+        Ok(())
     }
 
     /// The resident fp8 shared expert, batched over all `m` rows.
@@ -1684,7 +1858,7 @@ impl V4Engine {
             memcpy_dtod(xq, xw, m * dim * size_of::<f32>())?;
             launch_act_quant_f8(xq.cast(), m, dim, std::ptr::null_mut())?;
         }
-        // Mark 5: the gate chain's last enqueue — the D2H below is what retires it.
+        // Mark 7: the gate chain's last enqueue — the D2H below is what retires it.
         self.route_ev[M_GATE].record(NULL_STREAM)?;
         // The one blocking D2H on the per-layer path, and GLM pays the same one: `route_into` is
         // host math. `m * n_experts` f32 — 1 KB at decode. The bracket is free — the D2H is a
@@ -1692,28 +1866,33 @@ impl V4Engine {
         let t0 = std::time::Instant::now();
         self.gate_logits.copy_out_into(&mut self.gl_host)?;
         self.prof.route_ns += t0.elapsed().as_nanos();
-        // The route-split read: the D2H just drained the null stream, so all six of this
-        // layer's marks have retired and each pair is a completed-event query, not a wait.
+        // The route-split read: the D2H just drained the null stream, so all eight of
+        // this layer's marks have retired and each pair is a completed-event query, not
+        // a wait.
         if let Some(w0) = self.win_t0.take() {
             self.prof.win_wall_ns += w0.elapsed().as_nanos();
-            let span = |a: usize, b: usize| -> Result<u128> {
-                let ms = Event::elapsed_ms(&self.route_ev[a], &self.route_ev[b])?;
-                // A negative pair would saturate to 0 below and read as a plausible
-                // zero-width span; program order makes it impossible, so it is a bug.
-                debug_assert!(
-                    ms >= 0.0,
-                    "route-split pair ({a},{b}) out of order: {ms} ms"
-                );
-                Ok((f64::from(ms) * 1e6) as u128)
+            let span = |a: usize, b: usize| {
+                ev_span_ns(&self.route_ev[a], &self.route_ev[b], "route-split")
             };
             self.prof.hcn_ns += span(M_TOP, M_ATTN_NORMED)? + span(M_ATTN_DONE, M_FFN_NORMED)?;
             self.prof.cmp_ns += span(M_ATTN_NORMED, M_SEL)?;
             self.prof.attn_ns += span(M_SEL, M_ATTN_DONE)?;
+            // The M6 attn split: three sub-spans tiling `attn` at shared endpoints, so
+            // their sum restates it (checked at the print, both signs allowed there).
+            self.prof.qkv_ns += span(M_SEL, M_QKV_DONE)?;
+            self.prof.attend_ns += span(M_QKV_DONE, M_ATTEND_DONE)?;
+            self.prof.oproj_ns += span(M_ATTEND_DONE, M_ATTN_DONE)?;
             self.prof.gate_ns += span(M_FFN_NORMED, M_GATE)?;
         }
+        // The shared-expert device pair opens on a just-drained null stream (the D2H
+        // above), so its span is the chain's execution, gaps included, span-convention.
+        self.moe_ev[MO_SH0].record(NULL_STREAM)?;
         let t0 = std::time::Instant::now();
         self.shared_expert(layer, m)?;
-        self.prof.moe_ns += t0.elapsed().as_nanos();
+        self.moe_ev[MO_SH1].record(NULL_STREAM)?;
+        let sh = t0.elapsed().as_nanos();
+        self.prof.moe_ns += sh;
+        self.prof.moe_sh_ns += sh;
         for t in 0..m {
             let r0 = std::time::Instant::now();
             self.route_row(layer, t)?;
@@ -1724,6 +1903,14 @@ impl V4Engine {
             self.prof.route_host_ns += host;
             self.prof.moe_ns += r1.elapsed().as_nanos();
         }
+        // Read ONCE per layer, after the row loop: the last `routed_experts`' closing
+        // `device_sync` retired the whole device, `MO_SH1` included. Reading inside the
+        // row loop would book the pair `m` times at prefill.
+        self.prof.moe_shg_ns += ev_span_ns(
+            &self.moe_ev[MO_SH0],
+            &self.moe_ev[MO_SH1],
+            "moe-split shared",
+        )?;
         Ok(())
     }
 
@@ -1804,7 +1991,7 @@ impl V4Engine {
         self.route_ev[M_TOP].record(NULL_STREAM)?;
         for ffn in [false, true] {
             self.pre_norm(layer, ffn, m)?;
-            // Marks 1 and 4: the sublayer's hc/norm chain is queued — `hcn`'s two spans.
+            // Marks 1 and 6: the sublayer's hc/norm chain is queued — `hcn`'s two spans.
             self.route_ev[if ffn { M_FFN_NORMED } else { M_ATTN_NORMED }].record(NULL_STREAM)?;
 
             if ffn {
@@ -2382,7 +2569,7 @@ impl V4Engine {
             dec_miss as f64 * stride as f64 / 1e9 / n,
         );
         // The route split (M4, see [`V4Profile`]): where the D2H wait's GPU time goes. The
-        // four spans tile marks 0→5 inside `win`, the host wall that contains them; `resid`
+        // four spans tile marks 0→7 inside `win`, the host wall that contains them; `resid`
         // is the wall's unexplained share (the D2H copy + pre-mark-0 lag) and the summing
         // check itself. `d2h + host` restates `route` as its halves, same accumulators.
         let (win_ms, hcn_ms) = (per(self.prof.win_wall_ns), per(self.prof.hcn_ns));
@@ -2405,6 +2592,50 @@ impl V4Engine {
             "ROUTE-SPLIT/tok: attn {attn_ms:.1}ms | cmp {cmp_ms:.1}ms | hcn {hcn_ms:.1}ms | \
              gate {gate_ms:.1}ms | win {win_ms:.1}ms (resid {resid_ms:.1}ms) | \
              d2h {d2h_ms:.1}ms + host {host_ms:.1}ms"
+        );
+        // The attn split (M6, see [`V4Profile`]): three sub-spans tiling `attn` at
+        // SHARED marks, so the residual is an identity check, not a remainder — four
+        // independent float queries of the same four events, allowed either sign.
+        let (qkv_ms, attend_ms) = (per(self.prof.qkv_ns), per(self.prof.attend_ns));
+        let oproj_ms = per(self.prof.oproj_ns);
+        let attn_resid_ms = attn_ms - (qkv_ms + attend_ms + oproj_ms);
+        // 5e-2 as the route-split slack, and two-sided where that one is one-sided:
+        // there is no structurally positive floor here — the spans share endpoints, so
+        // anything past query rounding (~0.5 µs/read × 43 layers) is a transposed pair.
+        debug_assert!(
+            attn_resid_ms.abs() <= 5e-2,
+            "ATTN-SPLIT does not tile attn (resid {attn_resid_ms:.3} ms/tok): the three \
+             sub-spans share endpoints with the attn span by construction"
+        );
+        tracing::info!(
+            "ATTN-SPLIT/tok: qkv {qkv_ms:.1}ms | attend {attend_ms:.1}ms | \
+             oproj {oproj_ms:.1}ms | attn {attn_ms:.1}ms (resid {attn_resid_ms:.2}ms)"
+        );
+        // The moe split (M6, see [`V4Profile`]): seven host spans tiling `moe` (resid =
+        // clock gaps + the instrument's own pair reads, non-negative by construction),
+        // then the three device attributions — NOT addends: shared overlaps route_row's
+        // host math, res and miss overlap each other across streams.
+        let (sh_ms, desc_ms) = (per(self.prof.moe_sh_ns), per(self.prof.moe_desc_ns));
+        let (h2d_ms, sync1_ms) = (per(self.prof.moe_h2d_ns), per(self.prof.moe_sync1_ns));
+        let (launch_ms, sync2_ms) = (per(self.prof.moe_launch_ns), per(self.prof.moe_sync2_ns));
+        let drain_ms = per(self.prof.moe_drain_ns);
+        let moe_resid_ms =
+            moe_ms - (sh_ms + desc_ms + h2d_ms + sync1_ms + launch_ms + sync2_ms + drain_ms);
+        // -1e-6: pure f64 rounding slack — the spans are disjoint sub-intervals of the
+        // two host brackets `moe` sums, on one thread, so a real negative means a
+        // bracket left its interval.
+        debug_assert!(
+            moe_resid_ms >= -1e-6,
+            "negative MOE-SPLIT residual ({moe_resid_ms:.3} ms/tok): a host span exceeds \
+             the moe bucket that contains it by construction"
+        );
+        let (shg_ms, res_ms) = (per(self.prof.moe_shg_ns), per(self.prof.moe_res_ns));
+        let miss_ms = per(self.prof.moe_miss_ns);
+        tracing::info!(
+            "MOE-SPLIT/tok: sh_enq {sh_ms:.1}ms | desc {desc_ms:.1}ms | h2d {h2d_ms:.1}ms | \
+             sync1 {sync1_ms:.1}ms | launch {launch_ms:.1}ms | sync2 {sync2_ms:.1}ms | \
+             drain {drain_ms:.1}ms | moe {moe_ms:.1}ms (resid {moe_resid_ms:.1}ms) | \
+             gpu: shared {shg_ms:.1}ms, res {res_ms:.1}ms, miss {miss_ms:.1}ms"
         );
         self.pin.routed.flush_trace()?;
         Ok(out)

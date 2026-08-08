@@ -365,12 +365,44 @@ mod v4_tests {
 #[cfg(feature = "rocm")]
 pub mod v4 {
     use crate::artifact::model::V4Config;
+    use crate::backend::Event;
     use crate::backend::hip::{
         launch_v4_act_quant, launch_v4_gemv_fp8, launch_v4_qk_norm, launch_v4_rmsnorm,
         launch_v4_rope, launch_v4_sparse_attn, memcpy_dtod_async,
     };
     use anyhow::{Result, bail, ensure};
     use std::ffi::c_void;
+
+    /// The two intra-attention split marks (M6) — [`attention`] records each on `stream`
+    /// at a fixed point in its launch sequence, and the CALLER reads the spans at a join
+    /// it already pays (`v4gpu`'s gate-logits D2H), so this adds no sync, event wait, or
+    /// join. `Option`al because the probe/test callers have no profile to feed; `None`
+    /// records nothing and is bit-identical to the pre-M6 call.
+    ///
+    /// The two marks cut the call's 2→3 route-split span (`v4gpu::V4Profile`'s `attn_ns`)
+    /// into three, tiled by construction — each sub-span shares an endpoint with the
+    /// next, so their sum IS the whole span up to per-query float rounding:
+    ///
+    /// * mark 2 (caller's `M_SEL`) → `qkv_done`: the **q and kv chains** — the `xq`
+    ///   copy + `act_quant`, `wq_a` GEMV, `q_norm`, the `qrq` copy + `act_quant`, `wq_b`
+    ///   GEMV, `qk_norm`, RoPE(q), then `wkv` GEMV, `kv_norm`, RoPE(kv) and the partial
+    ///   KV `act_quant` — 12 device ops, three of them the fp8 GEMVs that carry ~39.9 of
+    ///   this span's ~39.9 MB/layer of weight bytes.
+    /// * `qkv_done` → `attend_done`: the **attend core** — the phase-dependent KV
+    ///   cache/ring write copies (one row at decode) and `launch_v4_sparse_attn` itself.
+    ///   ≤~1 MB of gathered KV at this benchmark's positions; a big span here is kernel
+    ///   shape, not traffic.
+    /// * `attend_done` → mark 3 (caller's `M_ATTN_DONE`, recorded after this call
+    ///   returns): the **output projection** — the de-rotating RoPE, `wo_a` GEMV,
+    ///   `act_quant`, `wo_b` GEMV; ~67.1 MB/layer, the block's largest weight read.
+    #[derive(Clone, Copy)]
+    pub struct SplitMarks<'a> {
+        /// Records after the KV entry's partial `act_quant` — the q/kv chains' last
+        /// enqueue, before any cache write.
+        pub qkv_done: &'a Event,
+        /// Records after `launch_v4_sparse_attn` — before the output de-rotation.
+        pub attend_done: &'a Event,
+    }
 
     /// The block size V4's attention weights are quantized on — `weight_block_size:
     /// [128, 128]` in the checkpoint's `quantization_config`, and also `kernel.py`'s
@@ -734,6 +766,7 @@ pub mod v4 {
         s: &Scratch,
         io: &Io,
         step: Pass,
+        marks: Option<SplitMarks>,
         stream: *mut c_void,
     ) -> Result<()> {
         d.validate()?;
@@ -869,6 +902,10 @@ pub mod v4 {
             // the positional dims and produces noise without a crash.
             launch_v4_act_quant(s.kv, m, hd, hd - rd, KV_QUANT_BLOCK, stream)?;
         }
+        // M6 mark: the q/kv chains' last enqueue. See [`SplitMarks`] for the exact span.
+        if let Some(mk) = marks {
+            mk.qkv_done.record(stream)?;
+        }
 
         // -- cache and attention ---------------------------------------------------------
         // What `sparse_attn` reads differs by phase, and so does the index space:
@@ -948,6 +985,11 @@ pub mod v4 {
                 s.o,
                 stream,
             )?;
+            // M6 mark: the attend core's last enqueue — the cache write copies above and
+            // `sparse_attn` sit between this and `qkv_done`. See [`SplitMarks`].
+            if let Some(mk) = marks {
+                mk.attend_done.record(stream)?;
+            }
 
             // -- output ----------------------------------------------------------------
             launch_v4_rope(s.o, io.freqs, m * nh, hd, rd, pos0, nh, true, stream)?;
@@ -1114,8 +1156,9 @@ mod v4_guard_tests {
         step: Pass,
     ) -> anyhow::Result<()> {
         // SAFETY: as the doc above — null pointers, and every guard precedes every launch.
-        // `null_mut()` is the honest stream here: there is no launch for one to order.
-        unsafe { attention(d, sel, &p.0, &p.1, &p.2, step, std::ptr::null_mut()) }
+        // `null_mut()` is the honest stream here: there is no launch for one to order,
+        // and `None` marks for the same reason — nothing runs for them to bracket.
+        unsafe { attention(d, sel, &p.0, &p.1, &p.2, step, None, std::ptr::null_mut()) }
     }
 
     #[test]

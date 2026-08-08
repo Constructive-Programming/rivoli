@@ -896,7 +896,8 @@ impl Gpu {
         let stream = self.stream.raw();
         let s = self.scratch();
         // SAFETY: every buffer above outlives the `device_sync` on the next line.
-        unsafe { attention(d, sel, &self.weights, &s, &io, step, stream) }.expect("v4 attention");
+        unsafe { attention(d, sel, &self.weights, &s, &io, step, None, stream) }
+            .expect("v4 attention");
         device_sync().expect("sync");
         let n = |b: &DeviceBuf, len: usize| read(b)[..len].to_vec();
         let nhd = d.n_heads * d.head_dim;
@@ -1578,6 +1579,7 @@ fn the_attention_block_is_entirely_on_its_stream() {
             &s,
             &io,
             Pass::Prefill { seqlen: p.m },
+            None,
             stream,
         )
     }
@@ -1661,8 +1663,9 @@ fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
     //
     // SAFETY: `io`'s buffers, `s` and `gpu.weights` outlive every call and the syncs that
     // follow the two accepted ones. The two rejected calls return before any launch.
-    let go =
-        |io: &Io, step| unsafe { attention(&d, plain_sel(&d), &gpu.weights, &s, io, step, stream) };
+    let go = |io: &Io, step| unsafe {
+        attention(&d, plain_sel(&d), &gpu.weights, &s, io, step, None, stream)
+    };
     // Both rejections must name the SELECTION. A shape mismatch coming back as an allocation
     // or launch failure would satisfy `expect_err` while proving the guard never ran.
     //
