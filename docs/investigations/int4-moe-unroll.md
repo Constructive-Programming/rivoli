@@ -380,6 +380,25 @@ which is also why there is no second copy of this decode loop in the tree to dri
 both widths in one process — so the six unroll arms cost three builds, and the round is five binaries once B1 and X are counted.
 
 - **A — stock.** The worktree at HEAD, unpatched.
+- **G — the AS1 typing alone, no unroll.** *Added 2026-08-09 by the coordinator, and it changes
+  the round's design rather than merely extending it — see "why G is insurance" below.*
+  `dot_i4_wave_r`'s `row`/`scalerow` become `address_space(1)` pointers (`gi4u8p`/`gi4f32p`,
+  declared just above it — `gu8p` itself is declared ~115 lines later, inside the fp4 block),
+  the `rw` dword reinterpret carries the address space too, and **`moe.hip`'s three call sites
+  cast**, because the asymmetry is at the CALL SITE and not in the struct: `ExpertDescI4`'s
+  fields stay generic pointers exactly as `ExpertDescF4`'s do. This is the ONLY arm that
+  patches two files, and the restore covers both.
+  **Bit-neutral by construction** — an address space is a property of the pointer, not of the
+  value loaded through it; no arithmetic, no ordering, no operand changes. So G's fingerprint
+  must equal A's, and a disagreement would mean the patch did something it was not supposed to.
+  **Measured statically before the device:** VGPR 39/49/32/42 and occupancy 16 — *identical to
+  A* — and 68/82 instructions, *identical to A*. What moves is exactly the intended thing:
+  the loop's 2 `flat_load_b32` become 2 `global_load_b32`, **`flat_load_b32` goes 18 → 0 across
+  the whole device image**, and the body's entry wait goes `vmcnt(3) lgkmcnt(0)` → **`vmcnt(3)`,
+  pure `vmcnt`, matching the fp4 loop.**
+- **GC2 — the AS1 typing PLUS `unroll 4`.** G's patch with the same `#pragma unroll 4` C2 uses.
+  VGPR 88/123/83/95 at occupancy 16/10/16/16 — identical to C2, so the addressing costs no
+  registers at depth either.
 - **B1 — the ballast.** In `dot_i4_wave_r`'s dword fast path, delete the eight `nib(w, k)`
   decodes and replace the two accumulate lines with
   `a0[t] += x0.x + x0.y + x0.z + x0.w + (float)w;` and
@@ -471,6 +490,27 @@ KFD holders resolved through `/proc/<pid>/comm`, `mem_info_gtt_used`, and
 `curl -s http://10.42.2.44:8080/running` — sampled either side of every arm; **any arm with a
 non-empty witness is DISCARDED, not explained.** No engine decode this round: nothing has
 earned an A/B yet.
+
+### Why G is insurance, and the three outcomes registered BEFORE the device
+
+**The round as first staged could have returned a false negative on its own central question.**
+If the `flat_load`/`lgkmcnt` coupling is what stops this loop keeping work in flight, C1 and C2
+could measure flat *because of the addressing*, and the honest reading would be "the unroll does
+not transfer to int4" — which would be wrong. With A, C1, C2, G, GC2 the design is a
+**2 × 2 (addressing × unroll) plus the depth ladder**, so the interaction is measured, not
+inferred.
+
+Scored, not narrated — the report says which of these fired:
+
+1. **G alone ≥ +10%** ⇒ the addressing is a real independent lever, ranking on its own merits.
+2. **GC2 super-additive over C2 and G** ⇒ the coupling hypothesis is **confirmed** and the
+   unroll's value was being masked by the addressing.
+3. **C1/C2 flat but GC2 not flat** ⇒ the false negative G was bought to insure against, and it
+   becomes **the round's headline**.
+4. **Any arm slower than stock by > 3%** ⇒ the registered kill; report and stop.
+
+B1 and X stay: B1 is the only arm that can evaluate this stretch's kill condition, and X is the
+fingerprint's demonstrated red.
 
 **The decision rule, registered before the device.** A variant earns an engine A/B only if it
 is BOTH fingerprint-identical to A on token row 0 AND ≥ +10% serial rate at R = 1 *or* R = 2.
