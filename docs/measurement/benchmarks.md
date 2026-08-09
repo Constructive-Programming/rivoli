@@ -3443,3 +3443,102 @@ deterministic (twin 264,767,496-byte dumps identical); perf NULL (wall +0.8, dqk
 vs band −2.3..−2.9 — serial-idle microbench rates do not transfer into the overlapped
 engine). The quality apparatus (`--logit-dump`/`--force-tokens`, `Defect::SplitKFoldOrder`,
 `docs/measurement/probes/v4_logit_drift.py`) merged as `a552e33` and stays available.
+
+## V4 M10 qkv width-fusion A/B — Δqkv −1.7 REPLICATED in band; the wall does not resolve a ±2 lever at this noise; byte-identical on all four arms (2026-08-09)
+
+The A/B `docs/investigations/v4-decode-decomposition.md` §M10 staged, run at n = 2 per
+side because every single-pair Δ landed under the registered |Δ| < 3 replicate rule. Arm
+S = `a935990` (main) via `git archive`, built in a scratch tree; arm B = `wt/v4-qkv-fuse`
+built at `c7562ce` (the `[wkv ‖ wq_a]` pin-load concat + one fused 1536-wave decode GEMV +
+both staging copies fused into quant-from-source `act_quant`; branch HEAD at run time
+was `19728e7`, the test-only census fix below, committed after the binary was built —
+engine sources identical). Both release binaries
+built BEFORE the first device request, nothing built between the timed arms. Order:
+S1, B1, S2, B2, each under the exclusive flock with a 30 s KFD+GTT+llama-swap witness.
+Command per arm flag-identical to M2..M8 (the 218-token prompt verbatim from the
+head-to-head CORRECTED note, md5 `bc71afa745d980be7d21860f70ad96aa`), `-bench 512`.
+
+**The GO round's device gates ran first** (dev-profile, `--test-threads=1`, each under
+the flock): `v4_kernel` 27/27 — including the new fused-concat GEMV oracle at the
+engine's real [512+1024, 4096] shapes — `v4_attn` 15/15, and `v4_loop` (the real-weight
+golden gate through the CHANGED pin-load path) 1/1. One test failed on first run and
+the fix is recorded for what it is: `each_in_scope_defect_is_further_away_than_the_kernels_are`'s
+anti-drift census still said (15, 35) while `a552e33` (M9's apparatus, IN the base)
+had added `Defect::SplitKFoldOrder` — this suite's first device run since. The fix
+(`19728e7`) is TEST-ONLY and does not widen the gate: in-scope stays 15, the count
+moves 35 → 36 OUTSIDE with the side re-decided as the assertion demands (M9 measured
+the fold bit-inert at golden tensors, 467/467; its gate is the §M9 drift instrument).
+No engine source changed; the arm B binary is `c7562ce`'s engine.
+
+**Environment note the walls need:** /tmp (tmpfs, i.e. RAM) had grown to 48 GB during
+the session and was swept by the coordinator before the arms; every arm's own log
+records the full budget — `device pool budget 100.0 GiB (auto: free 116.0 GiB − 16 GiB
+OS reserve)` on all four — so no arm ran residency-starved and the four are comparable.
+
+```
+S1: PROFILE/tok: 108.6ms wall | route 47.2ms | moe 38.5ms | fetch 9.1ms | 4.96 miss (2538 raw), 1.85ms/miss, 0.07 GB | remainder 22.8ms (tail 8.2ms)   (9.211 tok/s, prefill 14.75s)
+S2: PROFILE/tok: 108.4ms wall | route 46.3ms | moe 38.7ms | fetch 9.1ms | 4.96 miss (2538 raw), 1.84ms/miss, 0.07 GB | remainder 23.3ms (tail 8.2ms)   (9.226 tok/s, prefill 14.22s)
+B1: PROFILE/tok: 106.5ms wall | route 44.8ms | moe 38.8ms | fetch 9.2ms | 4.96 miss (2538 raw), 1.85ms/miss, 0.07 GB | remainder 22.8ms (tail 8.2ms)   (9.394 tok/s, prefill 14.13s)
+B2: PROFILE/tok: 110.0ms wall | route 44.7ms | moe 41.5ms | fetch 10.1ms | 4.96 miss (2538 raw), 2.03ms/miss, 0.07 GB | remainder 23.8ms (tail 8.2ms)   (9.095 tok/s, prefill 15.37s)
+S1: ATTN-SPLIT/tok: qkv 16.7 | attend 3.2 | oproj 21.4 | attn 41.2 (resid 0.00)   MOE-SPLIT: sh_enq 0.6 | desc 0.3 | h2d 1.0 | sync1 0.3 | launch 0.4 | sync2 35.8 | drain 0.1 | moe 38.5 (resid 0.0) | gpu: shared 16.0, res 28.0, miss 8.6
+S2: ATTN-SPLIT/tok: qkv 16.6 | attend 3.1 | oproj 21.4 | attn 41.1 (resid 0.00)   MOE-SPLIT: sh_enq 0.7 | desc 0.3 | h2d 1.3 | sync1 0.4 | launch 0.6 | sync2 35.3 | drain 0.1 | moe 38.7 (resid 0.0) | gpu: shared 15.9, res 27.7, miss 8.5
+B1: ATTN-SPLIT/tok: qkv 14.9 | attend 3.1 | oproj 21.3 | attn 39.4 (resid 0.00)   MOE-SPLIT: sh_enq 0.6 | desc 0.3 | h2d 1.1 | sync1 0.4 | launch 0.5 | sync2 35.7 | drain 0.1 | moe 38.8 (resid 0.0) | gpu: shared 15.9, res 27.9, miss 8.6
+B2: ATTN-SPLIT/tok: qkv 15.0 | attend 3.1 | oproj 21.4 | attn 39.5 (resid 0.00)   MOE-SPLIT: sh_enq 0.9 | desc 0.4 | h2d 1.5 | sync1 0.4 | launch 0.7 | sync2 37.5 | drain 0.1 | moe 41.5 (resid 0.0) | gpu: shared 16.1, res 27.8, miss 10.3
+S1: ROUTE-SPLIT/tok: attn 41.2 | cmp 9.1 | hcn 5.6 | gate 3.1 | win 60.7 (resid 1.7) | d2h 46.9 + host 0.3
+S2: ROUTE-SPLIT/tok: attn 41.1 | cmp 9.1 | hcn 5.5 | gate 3.1 | win 60.1 (resid 1.2) | d2h 45.9 + host 0.5
+B1: ROUTE-SPLIT/tok: attn 39.4 | cmp 9.1 | hcn 5.5 | gate 3.0 | win 58.2 (resid 1.2) | d2h 44.4 + host 0.4
+B2: ROUTE-SPLIT/tok: attn 39.5 | cmp 9.2 | hcn 5.5 | gate 3.0 | win 58.7 (resid 1.5) | d2h 44.1 + host 0.6
+```
+
+**Gates, in registered order, all four arms.** (1) Byte-identity FIRST: every arm's
+reply escape-decodes to the recorded 1983-byte md5
+`75b19fcde806059b45c515259feb16d2`; expert lookups 179389 hit / 8693 miss and 2538 raw
+decode misses on all four. (2) Split identities exact everywhere (ATTN resid 0.00, MOE
+resid 0.0). (3) Arm S walls 108.6 / 108.4 = −0.4% / −0.6% of the recorded 109.0 —
+inside the ±3% gate, at the fast edge of the 109.0–109.9 recorded class (the restored
+memory headroom is the suspect, unclaimed). (4) Witnesses clean on all four: pre-run
+kfd=0 / GTT 18.7 MB idle, in-run kfd=1 (the run's own) with GTT flat at the pool's
+108.27 GB, llama-swap `{"running":[]}` throughout, no foreign step.
+
+**Scoring against §M10's registered bands (S mean → B mean; pairings in brackets):**
+
+| instrument | S | B | Δ | band (point) | verdict |
+|---|---:|---:|---:|---|---|
+| qkv (PRIMARY) | 16.65 | 14.95 | **−1.7** [−1.8, −1.6] | −1.0..−4.5 (−2.5) | **IN BAND, REPLICATED** (side spread 0.1) |
+| remainder | 23.05 | 23.3 | +0.25 [0.0, +0.5] | −1.5..+0.5 (−0.5) | IN BAND — enqueue-side saving ≈ 0 |
+| wall | 108.5 | 108.25 | −0.25 [−2.1, +1.6] | −0.5..−5.0 (−2.5) | **UNRESOLVED at n = 2** (below) |
+
+Untouched spans: attend 3.1–3.2, oproj 21.3–21.4, hcn 5.5–5.6, cmp 9.1–9.2, gate
+3.0–3.1, tail 8.2, shared 15.9–16.1, res 27.7–28.0 — flat across all four arms.
+
+**The reading.** The lever's direct instrument replicated cleanly: Δqkv −1.7 with 0.1
+within-side spread, 0.8 short of the −2.5 point — the serial-arithmetic half arrived
+at its M9-discounted size and the op-count term arrived at roughly half its priced
+share, so the per-launch class EXISTS on the attn path (unlike the moe host path M6
+measured at ~0) but smaller than its 3/13 pro-rata. All of Δqkv lands in attn (41.15 →
+39.45) and in route's d2h window (46.9/45.9 → 44.4/44.1) — the M5-established identity,
+holding again. **The wall does not resolve a ±2 ms lever at this benchmark's noise:**
+the pairings split −2.1 / +1.6 because B2 carries a +2.8 moe-side excursion (miss 10.3,
+2.03 ms/miss, sync2 37.5) on the side the lever does not touch — ms/miss and fetch
+inside their recorded spreads (1.82–2.40 and 9.6–11.9), while miss 10.3 and sync2 37.5
+are new family MAXIMA (prior 8.5–9.8 and 30.7–36.8), EXTENDING those spreads rather
+than sitting inside them, said precisely because an excursion excused by a spread it
+itself defines would be circular. The registered wall kill
+(Δwall > +0.5 ⇒ revert) is nominally crossed by the B2−S2 pairing and is judged
+**UNFIRED, with the split recorded**: its own named mechanism — the 1536-wave grid's
+occupancy interaction — would inflate the attn spans, and they are clean and identical
+in both B arms (qkv 14.9/15.0, attend 3.1/3.1, oproj 21.3/21.4). The lever's wall value
+is therefore carried as the span's −1.7 through the attn-is-wall-serial 1:1 (measured
+at M5 and M7), stated as DERIVED, not measured; B1's 106.5 = 9.394 tok/s is the fastest
+witnessed decode of this benchmark and is not claimed beyond that. Two riders: the
+miss ≥ 10 threshold gets its first crossing (B2's 10.3, pure
+fetch latency as always — M8's unfired verdict stands, noted not claimed); and the
+prefills (14.13–15.37 s) sit at the fast edge of the recorded 15.35–18.35 spread, with
+the same memory-headroom suspect as the S walls, unclaimed.
+
+**Verdict: the M10 lever is REAL and lands as registered — qkv 16.65 → 14.95 ms/token
+(−1.7 replicated, in band) at zero quality cost (byte-identical on every arm) and zero
+resident bytes; the wall claim is the derived −1.7, the engine's decode class moves to
+~106.8–108.5 ms/token depending on the moe side's fetch weather, and 10 tok/s stays
+out of reach exactly as §M10 said in advance.** The registered |Δqkv| < 1 kill did not
+fire; nothing here re-opens M8's closure.
