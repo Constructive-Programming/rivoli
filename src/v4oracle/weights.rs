@@ -17,6 +17,12 @@ use std::path::Path;
 
 /// `model.py::ModelArgs`, restricted to the main path. DSpark/MTP fields are deliberately
 /// absent — `forward_spec` is out of scope (v4-flash-port.md §"Scope cut").
+///
+/// Model-bound by definition (kept through the 2026-08-09 rename pass): this is a
+/// transliteration of one reference file's argument struct, field for field, and its value
+/// is fidelity to that file rather than generality. Same name as
+/// `artifact::model::V4Config` and deliberately NOT the same type — the oracle must not
+/// share code with the engine it judges (`mod.rs` states the rule).
 #[derive(Clone, Debug, PartialEq)]
 pub struct V4Config {
     pub vocab_size: usize,

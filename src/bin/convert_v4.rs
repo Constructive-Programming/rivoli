@@ -1,5 +1,10 @@
 //! convert_v4 — the DeepSeek-V4-Flash-0731 checkpoint → a rivoli `.f4` artifact.
 //!
+//! The binary keeps its model name (category (b), 2026-08-09): a checkpoint converter is
+//! about its source checkpoint — the tensor names, the fp4 copy path and the shared-expert
+//! boundary below are all THAT model's — and the installed executable name is user-visible,
+//! recorded in command lines in `docs/measurement/benchmarks.md`.
+//!
 //! Separate from `bin/convert` (GLM-5.2 → `.vq3`) because the two share almost nothing:
 //! there is no codebook to learn, no VQ encode, and no fp8 dequant on the routed path.
 //! **Every routed expert is copied, not quantized.** V4 ships them already at 4 bits —

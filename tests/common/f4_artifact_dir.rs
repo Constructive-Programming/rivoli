@@ -1,5 +1,11 @@
 //! Locating the shipped `.f4` artifact, for the two V4 loading-path test binaries.
 //!
+//! The `RIVOLI_V4_*` env vars and the `v4_artifact*` helpers KEEP the model name (category
+//! (b) of the 2026-08-09 rename pass): they point at one model's checkpoint and artifacts
+//! on this machine's disk, and an env var name is user-visible configuration recorded in
+//! command lines. The FILE is `f4_artifact_dir.rs` because what it locates is a `.f4`
+//! artifact directory — the mechanism half of the split.
+//!
 //! A free-standing file included by `#[path]` rather than an item in `common/mod.rs`:
 //! `mod common;` compiles that whole module, and `tests/f4_loading.rs` is deliberately
 //! host-only — it must not pull in the GPU-shaped helpers to borrow one path lookup.

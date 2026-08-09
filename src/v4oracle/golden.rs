@@ -8,6 +8,10 @@ use crate::v4oracle::forward::Capture;
 use anyhow::{Context, Result, bail};
 use std::io::{Read, Write};
 
+// Model-bound AND user-visible: goldens are DeepSeek-V4 per-layer activations, and
+// `docs/measurement/probes/v4_attn_amplification.py:303` asserts these eight bytes before
+// reading a file. Kept through the 2026-08-09 rename pass — changing the magic forks the
+// format to fix a name, the same argument `eval.rs` records for `b"V4LT"`.
 const MAGIC: &[u8; 8] = b"RIVV4GLD";
 
 /// The metadata key `v4-oracle emit` records its `--defect` under -- one constant, because

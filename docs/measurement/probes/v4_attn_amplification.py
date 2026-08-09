@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Why `attn_out` cannot bisect the V4 attention block, measured rather than argued.
 
+NAMING NOTE (2026-08-09): the kernels this file transliterates were renamed for behaviour
+(`v4_rmsnorm`->`rmsnorm_batch`, `v4_qk_norm`->`qk_norm`, `v4_rope`->`rope_adjacent`,
+`v4_sparse_attn`->`gather_attn_shared_kv`). The Python function names here KEEP the old
+spellings on purpose: this probe reads recorded goldens stamped `RIVV4GLD` and reproduces
+recorded measurements, so its symbols key to the record, not to the tree. Do not "fix" them.
+
 This is the transcription behind the `# CORRECTED 2026-08-05` section of
 `tests/v4_loop.rs`. Every number in that section is printed by this script. It is here
 because the transcription IS the experiment -- which ops, in which order, with the

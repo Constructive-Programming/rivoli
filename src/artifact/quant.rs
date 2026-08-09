@@ -807,6 +807,11 @@ pub const FP8_BLOCK: usize = 128;
 /// the other two). A `w1`/`w3` SWAP is not: they are the same shape, and a repack that
 /// swapped them would be internally consistent and byte-clean. Only a numerical oracle
 /// against the reference can see that, which is what S1b exists for.
+///
+/// Model-bound (kept through the 2026-08-09 rename pass): these are the checkpoint's own
+/// tensor names, and their gate/up/down slot ORDER is a fact about `Expert.forward`, pinned
+/// against the reference by the tests below. A behaviour name would hide that these three
+/// strings must match bytes on someone else's disk.
 pub const V4_PROJ: [&str; 3] = ["w1", "w3", "w2"];
 
 /// [`V4_PROJ`] zipped against [`vq_expert_layout`] — the V4 analogue of [`expert_projs`].

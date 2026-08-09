@@ -1,6 +1,11 @@
 //! **The DeepSeek-V4-Flash numerical oracle** — a CPU transliteration of
 //! `inference/model.py`'s `Transformer.forward`, and the gate S2/S3 are scored against.
 //!
+//! The model name is deliberate (category (b) of the 2026-08-09 rename pass): a reference
+//! transliteration is ABOUT one model, and generalising its name would be a lie in the
+//! opposite direction from the one that pass removed. The engine it judges is behaviour-named
+//! (`f4gpu`); the yardstick is named for what it measures against.
+//!
 //! Read `forward.rs`'s module doc first: it states what is reproduced exactly, what is
 //! reproduced only up to summation order, and what is out of scope.
 //!

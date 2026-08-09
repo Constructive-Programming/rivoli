@@ -4,6 +4,32 @@ status: live
 verdict: The staged plan to make V4-Flash decode. S1 LANDED 2026-08-05 (.f4 repack bit-exact over 10.27 GB; a 137-golden CPU oracle with five measured blind spots). Corrects other-models.md from the real repo: experts are 148.25 GB native FP4 (138.1 GiB) so it DOES stream at ~83% residency, not "nearly fully resident"; 3.449 GB/token, since the shared expert is fp8 and resident, not FP4 and streamed; the partial fp8 KV act_quant is mandatory, not a --kv-fp8 to refuse (that flag does not exist); YaRN is per-layer, keyed to compress_ratio. DSpark/MTP is separable and out of scope. The LAYER LOOP LANDED 2026-08-05 (src/v4gpu.rs + a main.rs V4 branch + a real-weight per-layer gate) and has NOT yet run on a device; three deviations from the reference are named at their call sites (unclamped shared expert, positional block selection on the ratio-4 layers, un-rounded MoE output) and reviews caught two criticals before the GPU did. The dev-profile sweep is also RED at a2504eb.
 ---
 
+> **RENAMED 2026-08-09 — this doc's identifiers predate the rename-for-behaviour pass.**
+> Kernel methods and reusable types are no longer named for the model that introduced them;
+> the model lists live in comments and in the CHECKED table `tests/kernel_coverage.rs::OWNERS`.
+> This doc is a record and is NOT rewritten; read its identifiers through this map.
+>
+> Modules/types: `src/v4gpu.rs`→`src/f4gpu.rs` (`V4Engine`→`F4Engine`, `V4Pin`→`F4Pin`),
+> `src/v4compress.rs`→`src/kvcompress.rs`. Kernel files: `v4compress.hip`→`kvcompress.hip`,
+> `v4head.hip`→`headtail.hip`, `v4indexer.hip`→`blockindex.hip`. Kernels: `v4_gemv_fp8`→
+> `gemv_fp8_bf16`, `v4_act_quant`→`act_quant_f8_prefix`, `v4_rmsnorm`→`rmsnorm_batch` (GLM's
+> bare `rmsnorm`→`rmsnorm_single`), `v4_qk_norm`→`qk_norm`, `v4_rope`→`rope_adjacent` (GLM's
+> launcher `rope`→`rope_interleave`), `v4_sparse_attn`→`gather_attn_shared_kv`,
+> `v4_swiglu_clamped`→`swiglu_clamped_bf16`, `v4_dense_gemm_bf16`→`gemm_bf16`,
+> `v4_embed_bf16_row`→`embed_bf16_row_bcast`, `v4_hc_head*`→`hc_head_collapse*`,
+> `v4_indexer_spread`→`act_quant_f4_rotated`, `v4_indexer_score`→`index_score_blocks`,
+> `v4_compress_{state,prefill,pool_decode}`→`kv_compress_{deposit,prefill,decode}`.
+> Tests: `tests/v4_kernel.rs`→`f4_kernel.rs`, `v4_attn.rs`→`f4_attn.rs`, `v4_loop.rs`→
+> `f4_loop.rs`, `v4_compress*`→`kvcompress*`, `v4_head_tail.rs`→`headtail.rs`,
+> `v4_indexer_kernel.rs`→`blockindex_kernel.rs`, `v4_{pin,pool,loading,attn_host}`→`f4_*`,
+> `v4_hadamard_basis.rs`→`hadamard_basis.rs`.
+> **DELETED 2026-08-09**: `moe_gate_v4` (the device router) — `f4gpu.rs::route_row` carries
+> the rationale; INV-1's host router is the only router.
+> Unchanged, deliberately: `V4Config`, `v4oracle`/`v4-oracle`, `convert_v4`,
+> `dsv4_encoding`, `V4_PROJ`, the `RIVOLI_V4_*` env vars, the `b"V4LT"`/`b"RIVV4GLD"`
+> magics, and `dot_bench`'s recorded `v4gemv`/`v4res` section names.
+
+
 # DeepSeek-V4-Flash-0731 → first decode, first benchmark
 
 **Status:** staged, S1 launching 2026-08-04.

@@ -1,6 +1,11 @@
 //! DeepSeek-V4's prompt encoding — a hand-port of `encoding/encoding_dsv4.py`, which ships
 //! **inside the checkpoint** at `/var/db/rivoli/deepseek-v4-flash-0731/encoding/`.
 //!
+//! Model-bound by construction (category (b) of the 2026-08-09 rename pass): the emitted
+//! control tokens are this model's own, the module is gated byte-for-byte against the
+//! checkpoint's gold vectors, and even the filename mirrors the script it ports. GLM's
+//! equivalent is `artifact::tokenizer::encode_chat_turns` — the two must not converge.
+//!
 //! **This checkpoint has no `chat_template.jinja`, and that is deliberate.** Its README:
 //!
 //! > This release does not include a Jinja-format chat template. Instead, we provide a
