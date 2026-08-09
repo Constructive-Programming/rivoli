@@ -851,62 +851,58 @@ fn run_glm_i4(
         turn.set(t + 1);
         launch((t % ranges) * e_count);
     });
-    let gbs = report_bytes(
+    report_bytes(
         name,
         "i4res",
         &format!("[{e_count}e r{nrow} {hidden}x{inter} ws{ws_mb}MB]"),
         bytes,
         us,
     );
-    // Gated on `e_count > 1` as well as on `ranges`, and that is not tidiness: the `e_count = 1`
-    // row rotates 50 ranges, so `ranges > 1` alone would print this band over the ONE row where
-    // a low rate is the measurement rather than a fault. M8 measured 66 GB/s at 512–1024 waves
-    // on this box, so a sub-90 reading at the engine's real launch size is plausible AND
-    // correct — an operator obeying a KILL printed there would discard a valid row.
-    if ranges > 1 && e_count > 1 {
-        // Registered BEFORE the device, and it is a SANITY band, not a reproduction gate —
-        // see this function's doc. Floor: the `.vq3` MoE batch, a random codebook gather,
-        // measured 109.4 GB/s (benchmarks.md "DSA indexer round", the per-layer rows — and
-        // that row may itself be partly cache-served, which only makes it a WEAKER floor and
-        // so cannot make this band too generous), and int4 is a sequential
-        // read that must beat it. Ceiling: M11's fp4 ballast arms, with the whole decode and
-        // every FMA removed, topped out at 200.20 GB/s on this box, so a stock decoding loop
-        // above that is reading cache, not DRAM.
-        //
-        // The band is COMPARED, not merely printed. `run_v4_res` prints its band and leaves the
-        // comparison to the operator's eye, and this repo's own rule is that a thing called a
-        // gate has to be able to say "no" — so the verdict is appended to the line here. It is
-        // still not an `assert!`, for the reason the degeneracy note below gives: an abort would
-        // cost every remaining row in the same process, and a KILL here means the HARNESS is
-        // wrong, which is a thing to read and diagnose rather than to crash on.
-        let verdict = if gbs >= 200.0 || gbs <= 90.0 {
-            "  <-- KILL: harness, not kernel"
-        } else if !(130.0..=175.0).contains(&gbs) {
-            "  <-- OUT OF BAND (not a kill)"
-        } else {
-            "  <-- in band"
-        };
-        println!(
-            "            band 130-175 GB/s registered pre-device; KILL >=200 or <=90{verdict}"
-        );
-    }
+    // THE PRE-DEVICE SANITY BAND WAS HERE AND IS DELETED, 2026-08-09, by its own result.
+    // It read "130-175 GB/s, KILL >=200 or <=90" and was registered for ONE round against the
+    // stock kernel; that registration is spent and recorded (benchmarks.md "GLM int4 MoE
+    // unroll round"). Keeping it would have been actively harmful: the winning arm measured
+    // 190.6 / 190.1 GB/s, so `unroll 4` prints OUT OF BAND and sits 5% under a KILL — if it
+    // merges, every future run cries wolf against its own default kernel. The `mall-ctl` rows
+    // are what actually make these numbers trustworthy, and they stay.
+    //
     // Reported, NOT asserted — `run_v4_res`'s argument: a guard expected to go red on a
     // planned arm is one an operator learns to skip, and an abort here would also cost the
     // control row that runs after it in the same process. Full entropy puts `distinct` at
-    // ~`hidden`; a collapse to a handful means `moe_fixed` saturated and the fingerprint
-    // below would then match ANY kernel.
-    let degenerate = if distinct * 4 > hidden {
-        ""
-    } else {
+    // ~`hidden`; a collapse to a handful means `moe_fixed` saturated and every fingerprint
+    // this arm reports then matches ANY kernel — B1's did, and its four cross-arm fingerprint
+    // checks passed VACUOUSLY as a result. A `DEGENERATE` row proves nothing about bit-identity.
+    let degenerate = distinct * 4 <= hidden;
+    let marker = if degenerate {
         "  DEGENERATE — constant residual, this fnv matches any kernel"
+    } else {
+        ""
     };
     let h = fnv(row0);
     println!(
         "            fnv {h:016x}  row 0 of {nrow}  (seed {seed:#x}, {n_desc} experts, {ranges} \
-         ranges x {iters} iters, {distinct} distinct){degenerate}"
+         ranges x {iters} iters, {distinct} distinct){marker}"
     );
     if let Some(h1) = row1 {
         println!("            fnv {h1:016x}  row 1 of {nrow}");
+        // A REAL gate, and it lives here because this is the only scope where `distinct` — the
+        // predicate it has to be conditioned on — exists.
+        //
+        // MEASURED 2026-08-09, and this is the second attempt. It began as an unconditional
+        // `assert!` in `main`, which panicked the B1 ballast (rc 101, both passes) because a
+        // saturated constant residual makes its two rows legitimately equal. The fix was then
+        // written as an `if/else` that printed in BOTH branches and could never fail, while its
+        // own comment and two docs claimed it was "gated on the same non-degeneracy condition"
+        // — it was not gated on anything, because `distinct` never left this function. That is
+        // a comment asserting a property the code does not have, this repo's most-cited defect
+        // class, caught by review before it was committed. Now it is what it always claimed:
+        // silent on a degenerate arm, RED on any other where row 1 equals row 0.
+        assert!(
+            degenerate || h1 != h,
+            "row 1 == row 0 on a NON-degenerate arm ({distinct} distinct): row 1 is reading \
+             row 0's activations. `dot_i4_wave_r` accumulates `a0[t]` per `t` with no cross-row \
+             term, so equal rows on real data is an indexing bug, not a numerical coincidence."
+        );
     }
     (h, row1)
 }
@@ -1192,15 +1188,16 @@ fn main() {
                  change, not a cache effect"
             );
         }
-        // ROW 1, across the two R = 2 arms. Row 0 above cannot see a `t = 1` addressing bug —
-        // it is bit-identical at `nrow = 1`, which is exactly why a row-0-only gate would pass
-        // one. R = 2 is what this stretch is measuring, so its second row gets a gate too.
-        assert_eq!(
-            fp[2].1.1, fp[3].1.1,
-            "the two R = 2 working sets disagree on token row 1 — row 1's inputs are drawn from \
-             an `n_desc`-independent generator, so this is an indexing or fold-order change, not \
-             a cache effect"
-        );
+        // The row-1 equality check that used to sit here is DELETED, 2026-08-09, and the reason
+        // is that it could not see the failure it was justified by. It compared row 1 across the
+        // two R = 2 arms of the SAME binary, differing only in `ranges` — so an unroll that broke
+        // `vt = v + t * v_stride` past the first trip breaks BOTH arms identically and the
+        // comparison stays green. What actually caught that class is comparing row-1 fnvs across
+        // ARMS (X moved `21842ae3faa86fc0` to `01ff6e0362de32b4`), i.e. the printed value read
+        // out of the round's logs, not an in-process assert. The residual it did cover — a
+        // `ranges`-dependent slip at `t = 1` — is already caught by the row-0 loop above, since
+        // `he = h_in + e * R * inter` moves row 0 too. Row 1 is still fingerprinted and printed,
+        // and `run_glm_i4` now asserts row 1 != row 0 on every non-degenerate arm.
         // The `e_count = 1` pair, on the same argument as the pairs above: `ranges` is the only
         // thing that differs, and expert 0's bytes and token row 0's inputs are drawn
         // `n_desc`-independently, so a disagreement here is an indexing bug and not a cache
@@ -1217,11 +1214,6 @@ fn main() {
             "one expert and six experts drained the same value — `e_count` is not reaching the \
              kernel, which would make every rate row above a 1-expert measurement mislabelled \
              as 6"
-        );
-        assert!(
-            fp[2].1.1.is_some() && fp[2].1.1 != Some(fp[2].1.0),
-            "the R = 2 arm must report a row 1, and it must differ from row 0 — equal rows would \
-             mean row 1 is reading row 0's activations, which is the bug this gate exists for"
         );
     }
     // GLM-5.2 manifest: num_attention_heads 64, qk_head_dim 256 (= qk_nope 192 + rope

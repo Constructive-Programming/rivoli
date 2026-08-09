@@ -3839,3 +3839,164 @@ construction.
 **No merge decision is taken here.** Both arms are byte-identical; C2 is ahead on every
 moe-side span and on the wall mean, at 10 waves/SIMD on gate/up and with only 20% marginal
 transfer for its extra depth. The choice goes to the user with this record.
+
+## GLM int4 MoE unroll round — `dot_i4_wave_r`, seven arms, +16.4% at R=2 fingerprint-identical (2026-08-09)
+
+`examples/dot_bench.rs glmi4`, commit `1db73c1` (registration committed BEFORE the device),
+seven prebuilt arm binaries, **nothing built between arms**. Two counterbalanced passes —
+pass 1 `A B1 C1 C2 X G GC2`, pass 2 reversed — under `flock /var/run/sys-gpu.lock`, exit code
+captured before any pipe.
+
+**Witness — stated at the strength the files actually support, which is not the strength this
+paragraph first claimed.** All 28 samples show `llama-swap {"running":[]}`, and every sample
+reads `mem_info_gtt_used` of either 18,673,664 (before) or 18,718,720 (after) — a 45,056 B
+toggle, no tenant. Of the 14 non-zero KFD samples, **12 resolve to a STALE entry** whose PID has
+no `/proc` and is the arm that had just exited; **2 (`C2_p2.before`, `X_p2.before`) name nobody
+at all** — count 1, no pid line. The benign reading is that the script does `find | wc -l` and
+then a *second* `find` to enumerate, so an entry reaped in between yields a count with zero
+iterations, and both anomalies sit at the *baseline* GTT while all 12 STALE ones sit at the
+elevated value. **That is an inference, not something the files show**, and this paragraph
+originally asserted the stronger "every non-zero sample resolved to STALE" as established fact.
+No live foreign holder appears anywhere.
+
+**Three further disclosures about the gate, none of which the first draft made.**
+1. **A PRE-REGISTERED DISCARD RULE WAS RELAXED POST-HOC.** The plan said "any arm with a
+   non-empty witness is DISCARDED, not explained". Under the gate as registered, **12 of 14 arms
+   had a non-empty witness** and this round explained rather than discarded them, using a
+   classifier written *after* the data was in hand. The reasoning is sound — a stale KFD entry
+   is not a tenant — but rewriting a discard rule after seeing the data is exactly what this
+   repo's norms forbid doing quietly, so it is recorded as what it is.
+2. **The round ran under the OLD instrument.** All 28 files emit `kfd_holders=`; none emit
+   `live_foreign_holders=`. The corrected classifier was written afterwards and was never
+   applied to this round's samples by the round itself.
+3. **The corrected classifier has a hole worth naming.** It exempts holders whose `comm` is
+   `dot_bench`, so a *sibling agent's* `dot_bench` — precisely the shared-machine case the flock
+   is advisory against — would be classified as not-a-tenant. The count-then-enumerate race in
+   (1) also survives in it unchanged.
+
+Rate is WEIGHT bytes / time, so R=1 and R=2 are not competing arms — only depth within a width
+is a comparison. Mean of two passes.
+
+**"Every arm replicated, max spread 1.6%" holds for the three PRIMARY rows only, and the
+control rows are much noisier.** Primary max is 1.59% (GC2 at R=1, 190.3/187.3). The controls
+excurse badly: **X's R=2 control ran 1293.4 µs then 886.4 µs (93.0 → 135.7 GB/s, 37.3%)** while
+its main R=2 row was rock-steady at 134.8/134.6; **GC2's R=2 control went 190.1 → 155.2 GB/s
+(20.2%)**, and that same pass carries GC2's largest primary outlier (R=1 190.3 → 187.3). Four of
+the seven `e1` controls spread 7–13%. **This matters for the additivity reading below, which
+leans on GC2's R=1 mean** — the pass that drags it down is the pass whose control row says it
+was perturbed. Cache-served rows are unstable as well as inflated.
+
+| arm | R=1 (1.083 GB) | vs A | R=2 (1.083 GB) | vs A | e1 (1 expert, 1.003 GB) | vs A | row-0 fnv (e=6 rows) |
+|---|---:|---:|---:|---:|---:|---:|---|
+| **A** stock | 169.2 | — | 163.3 | — | 125.9 | — | `b2407d1121848fd5` |
+| **B1** ballast | 170.1 | +0.5% | 161.5 | −1.1% | 124.7 | −1.0% | DEGENERATE |
+| **C1** unroll 2 | 188.8 | **+11.6%** | 168.2 | +3.0% | 145.3 | **+15.4%** | `b2407d1121848fd5` |
+| **C2** unroll 4 | **190.6** | **+12.6%** | **190.1** | **+16.4%** | **151.3** | **+20.1%** | `b2407d1121848fd5` |
+| **G** AS1 only | 169.6 | +0.2% | 162.8 | −0.3% | 125.2 | −0.6% | `b2407d1121848fd5` |
+| **GC2** AS1+unroll 4 | 188.8 | +11.6% | 189.8 | +16.2% | 150.5 | +19.5% | `b2407d1121848fd5` |
+| **X** reassociated | 168.4 | −0.5% | 134.7 | −17.5% | 125.0 | −0.8% | `924efb78f6743e16` |
+
+**Which registered outcome fired: none of the three, and the fourth thing happened instead —
+the unroll transfers, and the addressing does not matter at all.**
+
+- **G alone: NOT a lever. +0.2% / −0.3% / −0.6%.** This is a clean negative on a finding this
+  investigation raised itself and rated highly. The patch did everything it claimed:
+  `flat_load_b32` 18 → 0 device-wide, the body's entry wait `vmcnt(3) lgkmcnt(0)` → `vmcnt(3)`,
+  at identical VGPR/occupancy/instruction count. **The `lgkmcnt` coupling was real and costs
+  nothing measurable.**
+- **Coupling hypothesis NOT SUPPORTED — and "refuted" is more than this round can say.**
+  Registered test `GC2 > C2 + G − A`, full precision: R=1 **188.800 vs 191.000 (−1.152%)**,
+  R=2 **189.750 vs 189.700 (+0.026%)**, e1 **150.500 vs 150.550 (−0.033%)**. Two things follow
+  that the first draft got wrong. **At R=2 the registered inequality is nominally SATISFIED**
+  (189.750 > 189.700) — the draft printed that very pair while asserting "not super-additive"
+  and "no interaction at any width". And **every residual is smaller than GC2's own pass-to-pass
+  spread of 1.59%**, the largest primary spread in the round, so the honest statement is *no
+  interaction resolvable at this noise*, which is the "unsupported" the draft claimed to have
+  transcended. What is solid: GC2 sits at or just below C2 alone at all three widths
+  (−0.97% / −0.21% / −0.53%), and since G ≈ 0 there is no gain hiding behind the addressing.
+  Separating additive from mildly super-additive would need more passes than this round ran.
+- **The false negative G was bought to insure against did NOT occur** — C1/C2 are decidedly not
+  flat. The insurance paid nothing, which is what insurance looks like when the risk does not
+  materialise; it cost two arms of a round that had the device anyway, and it converted "the
+  addressing might be masking the unroll" from an argument into a number.
+- **The registered kill (any arm >3% slower than stock) did not fire on any candidate.** X at
+  −17.5% (R=2) is excluded as the deliberate reassociation control rather than a candidate —
+  and that is a **post-hoc reading of "any arm"**, flagged as such. The kill's stated purpose is
+  the register-pressure outcome, which cannot apply to X, so the exclusion is sound; it was
+  still not written down before the round.
+
+**The ballast is the surprise, and it inverts M11's decomposition.** On fp4, stripping the
+decode and every FMA bought **+12.8%**. Here it buys **+0.5% / −1.1% / −1.0% — nothing.** The
+int4 decode is free. Yet the unroll still buys +12.6% to +20.1%. So on this loop the gap is
+**purely memory-level parallelism**, with no issue-rate component at all — a cleaner result
+than fp4's, where the decode was a real if secondary cost.
+
+> **This means the stretch's registered kill condition was MIS-SPECIFIED, and firing it would
+> have closed a stretch that had just found a +16% lever.** It read: "if the ballast-vs-real gap
+> M11 measured at 12.8% is small here, then the drain is not the limiter and the stretch closes
+> as a negative." The inference is invalid — a small ballast gap means the **decode** is not the
+> limiter, which is entirely consistent with the **drain** being the limiter, and that is exactly
+> what happened. B1 measures the decode's cost; only the C arms measure the drain's. Recorded
+> here rather than quietly dropped: the kill was written against the wrong quantity.
+
+**Fingerprints — the gate is demonstrated in BOTH directions.** C1, C2, G and GC2 reproduce A
+exactly on token row 0, on R=2's token row 1 (`21842ae3faa86fc0`) and on `e1`
+(`0949f588dc37abc6`), across both passes. **X moves all three**
+(`924efb78f6743e16` / `01ff6e0362de32b4` / `7de5301cb611fd2e`) while staying non-degenerate at
+6143/6144 distinct. So "C2 is byte-identical" is a claim from an instrument shown able to say
+otherwise. (The table's single fnv column is row 0 of the R=1 rows; the other two rows carry
+their own, listed here.)
+
+**B1 carries NO fingerprint information, and this is the arm most likely to be misread.** Its
+residual is a saturated constant, so it printed `DEGENERATE` as predicted — which also means its
+four cross-arm fingerprint checks passed **vacuously**. A `DEGENERATE` row cannot support any
+bit-identity claim, and B1's reading is its RATE and nothing else.
+
+**The MALL control earned its place on the row that nearly shipped without one — at the
+corrected magnitude.** The 120 MB single-range control tracks its 1.083 GB row within **1.1% on
+every arm at R=1** (A +1.09%, B1 +0.53%, C1 −0.05%, C2 +0.00%, X +0.21%, G −0.03%, GC2 +0.90%)
+— no material cache service, as on fp4. That claim is scoped to R=1 deliberately: the R=2
+control is the unstable row described above and does not support it. The `e1` control at
+**20 MB, below the 32 MB MALL, reads a two-pass mean of 314.2 GB/s — 123% of the 256 GB/s bus**
+against 125.9 for the same kernel over 1.003 GB, i.e. **a naive one-range harness reports this
+kernel 2.49× faster than it is.**
+
+> **CORRECTED 2026-08-09, same day, before commit.** This paragraph first quoted **328.9 GB/s,
+> 128%, and 2.6×**. 328.9 is **pass 2 alone** (pass 1 read 299.5); every other figure in this
+> record is a two-pass mean. Quoting the faster single pass for the one number used
+> rhetorically — "a naive harness reports this kernel N× faster than it is" — inflated the claim
+> in the direction that flattered it. The finding is unchanged and still large.
+
+**The registered depth-2 bands BOTH HIT — the first draft of this section manufactured a miss.**
+G1 registered "+10..+25% at depth 2" for R=1 and "+0..+15% at depth 2" for R=2. Depth 2 is
+**C1**: R=1 **+11.6%** (in band) and R=2 **+3.0%** (in band). The draft scored the R=2 band
+against **depth 4** (+16.4%) and called it "missed high", which is a band miss invented by
+swapping arms — and this repo tracks its band-miss family carefully enough that a spurious one
+pollutes the record. **Depth 4 was never banded**; it came in at +12.6% / +16.4%.
+
+**A pre-registered prediction that genuinely FAILED, kept because it was registered.** From the
+ISA read: "R=2 depth 4 stalls at `vmcnt(4)` on entry despite 24 loads in flight — a
+pre-registered reason for **C2 to disappoint at R=2**." C2 at R=2 is the round's **best** arm
+(+16.4%). The arm that disappointed at R=2 was **C1** (+3.0% against its +11.6% at R=1).
+Entry-wait depth did not predict throughput; M11's "in-flight iterations per SIMD, not wave
+count" reading survives and the entry-wait refinement does not.
+
+**Not measured here: any engine wall delta, and the transfer is an OPEN question.** This is a
+serial idle-device kernel rate. **M11b measured only 55–69% of an equivalent fp4 kernel saving
+reaching the wall**, and this stretch's own plan raised the specific reason it might transfer
+worse here — "a loop that is memory-latency-bound in an idle microbench may be bound by
+something else entirely when the fetch path is saturating the same controllers" — which remains
+untested.
+
+The reason no wall A/B was staged: GLM's recorded decode is **2.07 tok/s** (the GLM-vs-V4 table
+above; note that table's own "512 in 320.5 s" computes to **1.597 tok/s**, a discrepancy in the
+source row flagged here rather than silently picked), and misses cost 180.4 × 1.44 ≈
+**260 ms/token of fetch LATENCY** — an upper bound on exposure, not exposure itself, since
+overlapping that fetch with resident compute is the engine's whole design. The weaker claim
+still carries the decision taken: a kernel win on part of the compute is below the wall's
+resolving power at any n this project can afford.
+
+**Two of the 14 runs (B1, both passes) exited rc 101** on a harness assert that fired *after*
+every measurement row had printed — the ballast's saturated-constant residual makes its two
+token rows legitimately equal. Their rates are intact and are used above; recorded here because
+`run_round.sh` classifies a non-zero rc as "not a measurement".

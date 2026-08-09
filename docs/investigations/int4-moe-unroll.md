@@ -1,7 +1,7 @@
 ---
 scope: glm
 status: live
-verdict: OPEN, G2 done 2026-08-09 (static, no GPU); the G1 probe is written and unmeasured. The ISA confirms the shape: `dot_i4_wave_r`'s dword loop issues 4 (R=1) or 6 (R=2) vector loads and waits every one of them down IN BODY — one iteration in flight, the same gap M11 measured +17.7%/+33.2% on `dot_f4_wave_r` (V4, R=1, byte-identical, 9.38 -> 9.61 tok/s). The fp4 number still must NOT be copied across, but THE REASON THIS PLAN GAVE FOR THAT IS REFUTED: R = 2 does not collapse occupancy. Depth 2 holds 16 waves/SIMD on all four int4 kernels, depth 4's worst cell is 10 — exactly where fp4's WINNING arm sat — and there is zero spill and zero scratch across all twelve cells, so the registered >=6-wave kill does not fire and all six arms are measurable. What the ISA does suggest is a different reason to doubt depth 4 at R = 2: it stalls at `vmcnt(4)` on ENTRY to the body despite 24 loads in flight, which is registered here as a prediction rather than kept for a post-hoc explanation. A SECOND gap this plan did not register turned up as well: the int4 loop loads its weight dword and group scale as `flat_load_b32` where the fp4 loop uses `global_load_*`, because `ExpertDescI4` never got the AS1 (`gu8p`) typing M3c gave the fp4 path — so the body's ENTRY wait is `lgkmcnt(0)`-coupled where every fp4 wait is pure `vmcnt`, an independent reason it cannot keep work in flight and one an unroll may not remove. Registered as candidate arm G, not taken. The wall cannot settle any of this — GLM decodes 2.07 tok/s at 67.7% expert hit and 180.4 miss/token x 1.44 ms/miss, so roughly half the token is fetch exposure — and the deliverable is therefore the KERNEL RATE and a shippability decision, not a wall delta.
+verdict: MEASURED 2026-08-09, seven arms, two counterbalanced passes, primary rows replicated to within 1.6%, no live foreign KFD holder in any of 28 witness samples. THE fp4 LEVER TRANSFERS: `#pragma unroll 4` on `dot_i4_wave_r` is **+12.6% at R=1, +16.4% at R=2, +20.1% at e_count=1**, fingerprint-identical on BOTH token rows; unroll 2 is +11.6%/+3.0%/+15.4%. **The registered depth-2 bands both HIT** (C1: +11.6% in +10..+25, +3.0% in +0..+15); depth 4 was never banded. The plan's R=2 register-pressure worry was wrong twice: the ISA refuted the occupancy story pre-device (depth 4 at R=2 is 10 waves/SIMD, where fp4's winning arm sat, zero spill) and R=2 then gained MORE than R=1. Three further results. (1) The AS1/`flat_load` gap this investigation discovered is REAL AND FREE: arm G took `flat_load_b32` 18 -> 0 device-wide and removed the `lgkmcnt` coupling at identical VGPR/occupancy/instruction count, and moved the rate +0.2%/-0.3%/-0.6% — closed as a measured negative. GC2 is additive over C2 and G to within 1.2%, so the coupling hypothesis is UNSUPPORTED at this round's ~1.6% resolution — not refuted, which is more than n=2 at this spread can say. (2) The ballast INVERTS M11: stripping the decode and every FMA buys +0.5%/-1.1%/-1.0% here against fp4's +12.8%, so the decode is free AT THE UN-UNROLLED SCHEDULE; whether it binds at depth 4 is unmeasured (no matched-depth ballast ran). (3) That makes this stretch's own registered kill MIS-SPECIFIED — a small ballast gap means the DECODE is not the limiter, which is consistent with the DRAIN being it; firing it would have closed a stretch that had just found a +16% lever. X moved all three fingerprints while staying non-degenerate, so bit-identity is a gate demonstrated in both directions; B1's fingerprints are DEGENERATE and its four cross-arm checks passed vacuously. The 20 MB sub-MALL control read a two-pass mean 314.2 GB/s (123% of bus) against 125.9 rotating — a naive one-range harness reports this kernel 2.49x faster than it is. **This is a serial idle-device kernel rate**: M11b measured only 55-69% of an equivalent fp4 saving reaching the wall, and this plan's own point 2 (the fetch stream saturating the same controllers) is untested and OPEN. NOT MERGED, no wall claim: G4 still needs a multi-trip test at hidden=1280/inter=1024 (GLM's 24 and 8 trips are both divisible by 4, so no unroll remainder is ever entered) and a byte-identical `--mode int4` engine A/B.
 ---
 
 # Does GLM's int4 MoE loop have the same MLP gap fp4 had?
@@ -302,7 +302,134 @@ per group.
 > inflated. **The real hazard is the scale WIDTH, not the helper names**, and it would have made
 > the probe look ~4.4% slower than it is.
 
-## G1 — the probe, written and unmeasured (no GPU yet)
+## G1 — MEASURED 2026-08-09: the unroll TRANSFERS (+16.4% at R=2, fingerprint-identical); the addressing does not matter; the ballast inverts M11
+
+Record: `benchmarks.md` "GLM int4 MoE unroll round". Seven arms, two counterbalanced passes
+(order reversed in pass 2), primary rows replicated to within 1.6%, no live foreign KFD holder
+and an empty fleet in all 28 witness samples.
+
+**Two scope limits on that sentence, stated here rather than left to be discovered.** The whole
+14-run round spans **10 seconds** (19:57:07 → 19:57:17), so the replicate bounds *short-timescale
+repeatability*; it does not bound session-to-session drift, and the counterbalancing cannot
+cancel slow effects like thermal drift or page-cache warmth that need longer than 5 s to differ.
+And two arms (**B1, both passes**) exited **rc 101** on a harness assert *after* printing every
+measurement row — their rates are intact and used, but 2 of 14 runs terminated in a panic.
+
+| arm | R=1 | R=2 | e1 | verdict |
+|---|---:|---:|---:|---|
+| A stock | 169.2 | 163.3 | 125.9 | baseline |
+| B1 ballast | +0.5% | −1.1% | −1.0% | **the decode is FREE** |
+| C1 unroll 2 | +11.6% | +3.0% | +15.4% | qualifies at R=1 |
+| **C2 unroll 4** | **+12.6%** | **+16.4%** | **+20.1%** | **qualifies at both** |
+| G AS1 only | +0.2% | −0.3% | −0.6% | **not a lever** |
+| GC2 AS1+unroll 4 | +11.6% | +16.2% | +19.5% | ≈ C2, purely additive |
+| X reassociated | −0.5% | −17.5% | −0.8% | fingerprint RED, as required |
+
+**Which of the four registered outcomes fired: none.** G alone is not ≥ +10%; GC2 is not
+super-additive (it is additive to within 1%); C1/C2 are not flat, so the false negative did not
+occur; and no candidate arm is >3% slower than stock. The result is the plain one the plan
+allowed for but did not predict: **the fp4 lever transfers to GLM's int4 loop, and the
+addressing asymmetry this investigation discovered is real, correctly diagnosed, and worth
+nothing.**
+
+**The three headline findings.**
+
+1. **`#pragma unroll 4` is worth +12.6% (R=1), +16.4% (R=2) and +20.1% at `e_count = 1`,
+   fingerprint-identical on both token rows.** `e_count = 1` is the LOW END of the engine's
+   run lengths, and those are **derived, not counted** — at the recorded 67.7% decode hit the
+   expected run is 1/(1 − 0.677) ≈ 3.1, so ~1–3. Calling it "the engine's real launch size" (as
+   an earlier draft of this section and the verdict both did) upgrades a derived range to a
+   measured fact, and it happens to select the cell with the largest gain.
+   **The registered bands were for DEPTH 2, and both HIT:** C1 measured **+11.6% at R=1**
+   (band +10..+25) and **+3.0% at R=2** (band +0..+15). *An earlier draft scored the depth-2
+   R=2 band against depth 4 (+16.4%) and called it "missed high" — a band miss manufactured by
+   swapping arms, in the flattering direction. Depth 4 was never banded.*
+   The plan's stated worry, that R=2's register pressure would eat the gain, was wrong twice
+   over: the ISA refuted the occupancy story before the device, and R=2 then gained *more* than
+   R=1.
+2. **The AS1/`flat_load` gap is real and free.** G eliminated `flat_load_b32` 18 → 0 device-wide
+   and removed the `lgkmcnt` coupling from the body's entry wait, at identical VGPR, occupancy
+   and instruction count — and moved the rate by +0.2% / −0.3% / −0.6%. **Arm G is closed as a
+   measured negative.** It was this investigation's own discovery and its own highest-rated
+   suspect after the unroll; it does not survive contact with a number.
+3. **The ballast inverts M11.** fp4's B1 bought +12.8%; int4's buys nothing. **Scoped
+   precisely: the decode is free AT THE UN-UNROLLED SCHEDULE**, which is the only regime B1
+   measures — there the loop drains to `vmcnt(0)` every iteration and is latency-bound, so issue
+   rate could not bind whatever the decode cost. Whether the decode binds at depth 4 is **not
+   measured here**; M11 priced that with a matched-depth ballast (its B3) and this round has no
+   equivalent arm. "No issue-rate component at all" overstates what B1 can say.
+
+**The stretch's kill condition was mis-specified and must not be reused as written.** It closed
+the stretch as a negative "if the ballast-vs-real gap is small here". It *is* small — and the
+unroll still won +16%. A small ballast gap means the **decode** is not the limiter, which is
+perfectly consistent with the **drain** being the limiter. B1 prices the decode; only the C arms
+price the drain. Had the round been staged without C arms on the strength of that kill, it would
+have closed a stretch that had just found its lever.
+
+**A registered prediction that failed.** The G2 ISA read registered "R=2 depth 4 stalls at
+`vmcnt(4)` on entry despite 24 loads in flight — a pre-registered reason for C2 to disappoint at
+R=2." **C2 at R=2 is the best arm in the round.** The arm that disappointed at R=2 was C1
+(+3.0%, against +11.6% at R=1). Entry-wait depth does not predict throughput; M11's
+"in-flight iterations per SIMD" reading stands and this refinement of it does not.
+
+**The MALL control justified the whole discipline on the row that nearly shipped without one.**
+The 120 MB control tracks its 1.083 GB row within **1.1% on every arm at R=1**. The `e1` control
+at 20 MB — below the 32 MB MALL — reads a **two-pass mean of 314.2 GB/s, 123% of the 256 GB/s
+bus**, against 125.9 for the same kernel over 1.003 GB: a naive one-range harness reports this
+kernel **2.49× faster than it is**.
+
+*Corrected before commit: an earlier draft quoted 328.9 / 128% / 2.6×, which is pass 2 alone
+against a section whose every other figure is a two-pass mean.*
+
+**And the control rows are NOT uniformly well-behaved — the two excursions are reported rather
+than dropped, because they are the round's only visible evidence of a transient.** `X` pass 1's
+R=2 control read 93.0 GB/s against its own rotating row's 134.8 (**−31%**, 1293.4 µs vs 886.4 µs
+in pass 2, a 37.3% pass-to-pass spread) while X's main R=2 row was steady at 134.8/134.6; `GC2`
+pass 2's R=2 control read 155.2 against 189.2 (**−18%**), in the same pass that carries GC2's
+largest primary outlier (R=1 190.3 → 187.3). Both excursions are *slower*, so they are not cache
+service — but "every arm replicated, max spread 1.6%" is true of the **three primary rows only**,
+and the GC2 perturbation sits underneath the additivity residual this section reads as
+sub-additive.
+
+**Two harness defects the round exposed, and what is and is not fixed:**
+- **The witness gate keyed on `kfd_holders=0` and flagged 100% of a clean round** — 12 of the
+  14 non-zero samples were STALE entries for the arm that had just exited, and 2 named nobody at
+  all. The corrected classifier reports `live_foreign_holders`. **Three caveats the record must
+  carry:** the round ran under the PRE-FIX witness, so no stored sample contains the new field
+  and re-running the new gate over them flags all 28; the new gate has been exercised only
+  against synthetic fixtures, never against a real foreign holder; and it classifies by `comm`,
+  so a *sibling agent's* `dot_bench` — the shared-machine case the flock is advisory against —
+  would be misclassified as our own. **The round's cleanliness was established by hand from the
+  raw samples, not by the corrected gate.**
+- **A pre-registered discard rule was relaxed post-hoc.** "Any arm with a non-empty witness is
+  DISCARDED, not explained" would have discarded 12 of 14 arms. They were explained instead,
+  using a classifier written after the data was in hand. The reasoning is right; the sequence is
+  the thing this repo's norms forbid doing quietly, so it is stated.
+- **The `row 1 != row 0` assert fired on the B1 ballast** (rc 101, both passes), whose residual
+  is a saturated constant by design — a guard red on a *planned* arm. Its first "fix" was worse:
+  an `if/else` that printed in both branches and **could never fail**, while its own comment and
+  this document both claimed it was "gated on the same non-degeneracy condition". It was gated
+  on nothing, because `distinct` never left `run_glm_i4`. **Caught by review before commit**, and
+  now a real `assert!` inside `run_glm_i4` where `distinct` is in scope — proven RED on
+  (non-degenerate, rows equal) and silent on (degenerate, rows equal).
+- **B1's rates are valid but B1's FINGERPRINTS ARE NOT.** Its residual is constant, so all four
+  of its cross-arm fingerprint checks passed **vacuously**. A `DEGENERATE` row supports no
+  bit-identity claim; B1's reading is its rate alone.
+
+## What G3 and G4 still need before anything ships
+
+C2 qualifies on the decision rule (fingerprint-identical AND ≥ +10%). **It is not merged**, and
+the two things standing between it and a merge are known:
+- **G4's multi-trip test does not exist yet.** At GLM's dims (24 and 8 trips, both divisible by
+  4) no unroll remainder is ever entered, so the shipped fixtures cannot see the epilogue the
+  pragma creates. The fixture is specified in G4 below: `ne = 1` at `hidden = 1280, inter = 1024`
+  (5 and 4 trips), shown RED against an injected past-the-first-trip defect.
+- **an engine A/B on `--mode int4`**, `--max-mem` and `--cache-policy` held fixed, byte-identical
+  output. No wall claim is made or implied by this round.
+
+## G1 — the probe as staged (SUPERSEDED 2026-08-09 by the measurement above; kept for the staging argument)
+
+### The probe as built
 
 `examples/dot_bench.rs` gains a `glmi4` section: `run_glm_i4(name, hidden, inter, e_count,
 ranges, nrow)`, five rows —
@@ -432,7 +559,14 @@ both widths in one process — so the six unroll arms cost three builds, and the
   committed, and it must FAIL the bit-identity check that C1 and C2 pass.** A gate only ever
   seen green is not a gate.
 
-## The staged GPU round (five binaries, one session, nothing built between arms)
+## The staged GPU round (SUPERSEDED 2026-08-09 — SEVEN arms ran, not five)
+
+> **Superseded 2026-08-09.** The round as run was **seven** arms — `A B1 C1 C2 X G GC2`, pass 2
+> reversed — after the coordinator added G and GC2 to make the design a 2x2 of addressing x
+> unroll. The five-arm staging below is kept for its argument (build-before-device, nothing
+> built between arms, witness either side) which the seven-arm round followed unchanged.
+
+### The five-arm staging, as written
 
 All five built BEFORE the device is requested, from this one worktree, with
 `CARGO_TARGET_DIR=<worktree>/target-wt` (**never `/tmp`**: it is a 63 GB tmpfs in RAM).
@@ -518,7 +652,16 @@ Below +10%, record it and stop. If it wins at only one width, that is a finding 
 tie-break — say which. **Report the `e1` row's delta beside them**: a lever that pays only at
 `e_count = 6` is a lever the engine's short resident runs would not collect.
 
-## Kill condition for the stretch
+## Kill condition for the stretch — MIS-SPECIFIED, do not reuse as written
+
+> **MIS-SPECIFIED, 2026-08-09, established by the round this kill was written to govern.** The
+> ballast-vs-real gap IS small here (+0.5% / −1.1% / −1.0%) and `unroll 4` still won +12.6% to
+> +20.1%. The kill's `i.e.` asserts an equivalence that is false by construction of B1: the
+> ballast keeps every load and the identical drain schedule and removes only the decode and the
+> FMAs, so B1 ≈ A isolates "not ALU-bound" and says nothing about latency exposure. A loop bound
+> by insufficient memory-level parallelism gives B1 ≈ A *and* a large unroll gain — exactly what
+> happened. Firing this kill would have closed a stretch that had just found its lever. See §G1.
+> The text is kept unchanged below because what a registration got wrong is part of the record.
 
 If the loop is already at its memory-bound ceiling at R = 2 — i.e. the ballast-vs-real gap
 that M11 measured at 12.8% is small here — then the drain is not the limiter on this path and
