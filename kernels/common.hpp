@@ -605,13 +605,13 @@ __device__ __forceinline__ void dot_f4_wave_r(const float* __restrict__ v, int v
         // which is M7's disease; `fp8_dot_strided` above was fixed for it and the exemption
         // beside that pragma names `fp8_dot_strided_r`, so this loop was never in that
         // conversation. `dot_bench v4res` MICROBENCHMARK at the engine's dims: 146.63 →
-        // 172.55 GB/s. Depth is what buys it — a ballast with the decode and every FMA
+        // 195.27 GB/s. Depth is what buys it — a ballast with the decode and every FMA
         // removed buys only +12.8%, so the bound was never issue rate.
         //
-        // A change that grows this body must re-read the ISA. Unroll 2 is 74 VGPR on
-        // `moe_gateup_f4` / 66 on `moe_down_f4` — inside the 96 granule at 16 waves/SIMD, with
-        // no headroom. Unroll 4 is FASTER in the microbench (195.27) and drops gate/up to 10
-        // waves; **both rungs are registered arms of an engine A/B and
+        // A change that grows this body must re-read the ISA. Unroll 4 is 125 VGPR on
+        // `moe_gateup_f4` (**10 waves/SIMD**, down from 16) and 93 on `moe_down_f4` (still 16);
+        // no spill on either, 0 scratch. Unroll 2 keeps 16 waves everywhere at 74/66 VGPR and
+        // measured 172.55; **both rungs are registered arms of an engine A/B and
         // `docs/investigations/v4-decode-decomposition.md` §M11b decides between them on the
         // engine wall, not this comment.**
         //
@@ -634,7 +634,7 @@ __device__ __forceinline__ void dot_f4_wave_r(const float* __restrict__ v, int v
         // is unreachable at the engine's dims but IS reachable in principle: the launcher
         // guards `% ACT_QUANT_BLOCK` (128), not 256, so a conforming dim like 1152 or 3712
         // gives an odd trip count.
-#pragma unroll 2
+#pragma unroll 4
         for (; base + WAVE * 8 <= dim; base += WAVE * 8) {
             int col = base + lane * 8;
             unsigned int w = rw[col >> 3];             // 8 nibbles = 8 consecutive columns
