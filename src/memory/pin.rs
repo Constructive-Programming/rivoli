@@ -187,6 +187,72 @@ fn place_fp8(
     })
 }
 
+/// Place a V4 layer's `wkv` and `wq_a` as ONE fp8 placement — `wkv`'s rows FIRST, then
+/// `wq_a`'s, weight bytes and scale grids each concatenated row-wise — and resolve the
+/// two original weights as VIEWS into it (offsets, zero extra bytes), plus the whole
+/// `[head_dim + q_lora_rank, dim]` concat the M10 fused decode GEMV reads
+/// (`attn::v4::Weights::wqkv` carries the fusion's argument; M8's serial table carries
+/// the reason — both split launches sit grid-starved at 66–67 GB/s).
+///
+/// kv first because the fused output row must land the KV entry at `s.kv`'s base,
+/// where every consumer already looks. The seam is scale-exact iff `wkv`'s row count
+/// is a multiple of `block` — the kernel's scale row is `j >> log2(block)`, so row
+/// `head_dim + r` reads concatenated scale row `head_dim/block + r/block` exactly when
+/// nothing straddles. A checkpoint where it does not divide gets two ordinary
+/// placements and NO fused weight, and decode runs the two-launch path unchanged.
+fn place_fp8_qkv(
+    tier: &mut DeviceTier,
+    st: &Safetensors,
+    attn: &str,
+    block: usize,
+) -> Result<(Fp8Weight, Fp8Weight, Option<Fp8Weight>)> {
+    let mut parts = Vec::with_capacity(2);
+    for name in ["wkv", "wq_a"] {
+        let wname = format!("{attn}.{name}.weight");
+        let (w, shape) = st.typed(&wname, Dtype::F8E4M3)?;
+        let (sc, _) = st.typed(&format!("{attn}.{name}.weight_scale_inv"), Dtype::F32)?;
+        let (o, i) = dims2(&wname, shape)?;
+        parts.push((w, sc, o, i));
+    }
+    let [(kw, ks, ko, ki), (qw, qs, qo, qi)] = parts[..] else {
+        unreachable!("two names pushed above");
+    };
+    if ki != qi || !ko.is_multiple_of(block) {
+        return Ok((
+            place_fp8(tier, st, &format!("{attn}.wkv"), block)?,
+            place_fp8(tier, st, &format!("{attn}.wq_a"), block)?,
+            None,
+        ));
+    }
+    // The grids must BE the `ceil(o/block) × ceil(i/block)` f32 the kernel indexes, or
+    // the row-wise concat below would misattribute scale rows silently.
+    let cols = ki.div_ceil(block);
+    for (sc, o, what) in [(ks, ko, "wkv"), (qs, qo, "wq_a")] {
+        ensure!(
+            sc.len() == o.div_ceil(block) * cols * size_of::<f32>(),
+            "{attn}.{what}.weight_scale_inv is not [{}, {cols}] f32",
+            o.div_ceil(block)
+        );
+    }
+    let packed = tier.place(&[kw, qw].concat())?;
+    let scale = tier.place(&[ks, qs].concat())? as *const f32;
+    // SAFETY: both offsets are inside the two placements above — `wq_a`'s rows start
+    // `ko` weight rows (`ko/block` scale rows, exact by the divisibility gate) in.
+    let (a_packed, a_scale) = unsafe { (packed.add(ko * ki), scale.add((ko / block) * cols)) };
+    let view = |packed, scale, o_dim| Fp8Weight {
+        packed,
+        scale,
+        block,
+        o_dim,
+        i_dim: ki,
+    };
+    Ok((
+        view(packed, scale, ko),
+        view(a_packed, a_scale, qo),
+        Some(view(packed, scale, ko + qo)),
+    ))
+}
+
 /// A weight matrix's `(o_dim, i_dim)`, refusing anything that is not 2-D. Every placer
 /// that carries dims takes them from the tensor's own shape rather than from `cfg`, so this
 /// is the one place the rank is confronted.
@@ -703,6 +769,12 @@ pub struct V4LayerPin {
     pub wq_b: Fp8Weight,
     /// ONE kv entry, `head_dim` wide, serving as both K and V for every head.
     pub wkv: Fp8Weight,
+    /// `[wkv ‖ wq_a]` as one `[head_dim + q_lora_rank, hidden]` weight — `wkv` and
+    /// `wq_a` above are VIEWS into this placement, so it costs no bytes. `Some`
+    /// whenever the seam divides the scale block (this checkpoint: 512 % 128 == 0);
+    /// the engine passes it through as `attn::v4::Weights::wqkv`, the M10 decode
+    /// width fusion. See [`place_fp8_qkv`].
+    pub wqkv: Option<Fp8Weight>,
     pub wo_a: Fp8Weight,
     pub wo_b: Fp8Weight,
     /// Router gate `[n_experts, hidden]` f32, device-side (the scores are a GEMV).
@@ -944,8 +1016,9 @@ impl V4Pin {
                 V4Route::Scored { bias }
             };
             let mut fp8 = |name: &str| place_fp8(&mut tier, &st, &format!("{a}.{name}"), block);
-            let (wq_a, wq_b) = (fp8("wq_a")?, fp8("wq_b")?);
-            let (wkv, wo_a, wo_b) = (fp8("wkv")?, fp8("wo_a")?, fp8("wo_b")?);
+            let (wq_b, wo_a, wo_b) = (fp8("wq_b")?, fp8("wo_a")?, fp8("wo_b")?);
+            // wkv + wq_a go through the concat placer: one placement, three views (M10).
+            let (wkv, wq_a, wqkv) = place_fp8_qkv(&mut tier, &st, &a, block)?;
             // `e == n_experts` selects `ffn.shared_experts` — see `v4_expert_base`.
             let shared_base =
                 crate::artifact::quant::v4_expert_base(l, cfg.n_experts, cfg.n_experts);
@@ -967,6 +1040,7 @@ impl V4Pin {
                 wq_a,
                 wq_b,
                 wkv,
+                wqkv,
                 wo_a,
                 wo_b,
                 gate_w: place_f32(&mut tier, &st, &format!("{lb}.ffn.gate.weight"))?,

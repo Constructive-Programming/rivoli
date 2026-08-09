@@ -1,7 +1,7 @@
 ---
 scope: v4
 status: live
-verdict: OPEN, four levers LANDED and the route span SPLIT. M3b (2026-08-07, launch geometry): moe 70.6 → 54.7 ms/token, +9.6% tok/s. M3c (2026-08-08, branchless e2m1/e8m0 + global-AS descriptor loads, fp4 dot loop 195 → 105 instr per 128 weight bytes): moe 54.9 → 49.6, wall 165.3 = 6.048 tok/s — the registered prediction (−4..−10, point −6) landed IN BAND at −5.3, the first of the series to do so. M4 (2026-08-08) split route with four event-pair sub-spans, no new join: attn 53.2 | cmp 9.1 | hcn 41.2 | gate 3.2 | win 107.7 (resid 1.0) — WRONG at the headline: hcn (hyper-connections + norms) measured 41.2 against a 4–8 band and 0.8 ms of bytes, the engine's largest above-bytes excess; cmp and gate closed at budget; resid 1.0 kills the gate-D2H width micro-lever. M5 (2026-08-08, the hcn read + fix, schedule-only: hc_pre 256 → 1024 threads = one wave per mix row, sum-of-squares frozen at HC_RED, unroll-8): hcn 40.7 → 5.6, wall 130.7 = 7.652 tok/s (+26.5% over M3c's 6.048; arm-to-arm +28.7%), Δhcn −35.1 vs the registered −15..−30 band — the error family a third time, the good side a second (M4 missed high); the width and unroll levers MULTIPLY (24× loads in flight); hcn CLOSED at this rung, +4.8 above bytes. Output byte-identical and counters identical across every arm (M5: reply-prefix md5 recorded, escape-decoding to M4's recorded 1983-byte md5). Residue to 10 tok/s (~31 ms off the 130.7 wall): moe ~+31 over its 18 ms byte floor (miss exposure, shared GEMV unpriced) > attn +28.9 > hcn +4.8; remainder's non-tail 15.6 is no longer ranked apart — it overlaps the ranked spans (win − d2h = 14.8). M2's floor (~62 ms/token ≈ 16 tok/s ceiling) stands; buckets still not certified free (recorded stock-class wall spread ±1.5%, and M5's arm S sat +1.75% over the recorded 165.3). M6 (2026-08-08, MEASURED): the double split LANDED — control wall 130.6 (−0.08% of 130.7), reply and counters identical, both summing identities exact (ATTN resid 0.00, MOE resid 0.0). ATTN-SPLIT qkv 20.3 | attend 3.2 | oproj 29.6 — ALL IN BAND, the series' first triple hit, and the fp8-GEMV kill FIRES (qkv 2.31×, oproj 1.99× bytes). MOE-SPLIT sync2 31.6 (in band); gpu shared 15.8 vs 6–10 = 2.82× bytes — its kill FIRES, and h2d 15.5 is that chain's exposure site, not a copy cost; res 24.2 FIRES its >24 re-open as registered, entered conditional on a replicate (0.2 past the threshold at n=1; the +4.2 point miss stands: resident compute ~38% above bytes); miss 9.7 sits 0.3 under its ≥10 kill — no claim (pure fetch latency, 1.96 vs 2.02 ms/miss). Ranked levers (excesses measured, lever values projections): fp8 GEMV rate ~36 ms of excess across qkv/oproj/shared (ONE ISA read serves all three) > shared-chain overlap off the null stream (≤15.5, schedule-only) > miss exposure 9.7 > res-above-bytes +6.7 (replicate first) — levers 1+2 project to −25..−40 against the ~31 to 10 tok/s: the top covers it, the bottom falls 6 short. M7 (2026-08-08, MEASURED): the fp8 GEMV ISA read said the fp4 story does NOT transfer — the loop was 42 instr/128 B, all-global, LDS-LUT decode, 16 waves/SIMD; the disease was zero memory-level parallelism (a full vmcnt(0) drain every iteration — hc_pre's class, not M3a's). Levers: #pragma unroll 8 (one vmcnt(0) per 1 KB, single fmac chain, VGPR 86 = still 16 waves) + the shared chain onto its own stream after sync1, joined by the sync2 the path already pays. A/B (one arm-S run DISCARDED by the in-run witness — foreign 1.66 GiB GTT step; the clean S sat −0.84% off the recorded 130.6): wall 129.5 → 109.0 = 9.175 tok/s (+18.8%), byte-identical, counters identical — the wall Δ −20.5 fell 1.5 SHORT of the registered −22..−42 band's nearest edge, the series' first bad-side miss, and 10 tok/s is NOT reached. qkv −3.6 / oproj −8.3 (bands missed high: the unroll recovered ~45% of the GEMV excess; the loop still runs 1.4–1.9× bytes); h2d 15.5 → 1.3 IN BAND; the sync2 tell FIRED (+5.1 contention ⇒ lever 2 scores on wall alone, net moe −8.7); gpu shared UNSCORABLE (serial-vs-overlapped confound). Residue to 10 tok/s ~9 ms: qkv+oproj residual ~14.3 above bytes > sync2/res contention > miss 8.9 > hcn +4.8. M8 (2026-08-08, MEASURED): the STRETCH CLOSES the last mile as a successful negative at the measured 109.0–109.9 ms/token = 9.10–9.17 tok/s — within byte-identity + schedule/grid/lowering, 10 tok/s is not reachable — and the DOC STAYS OPEN on split-k (registered as the next stretch's opening) and the fp4 re-open. The round behind that: two controls at HEAD replicated everything (walls 109.9/109.4 vs the recorded 109.0, spread 0.8%; md5 and counters identical, split identities exact; res contended 27.7/27.9/28.0 with the serial pair 24.2/24.3 booked — the fp4 re-open STANDS at n=2, 1.38–1.39× bytes; miss five points under the ≥10 kill, 8.6–9.8, unfired; sync2 35.8/36.8/36.4 = the overlap's steady price, accepted), and the serial-rate instrument (dot_bench v4gemv; pair-16 probe in a scratch tree, never the engine) REFUTED the uniform-floor closure hypothesis — wq_b streams 222 GB/s = 87% of the 256 bus at full grid while wq_a/wkv sit at 66 with 512–1024 waves — splitting the excess into grid starvation (dominant on the few-row shapes) + mild per-wave MLP (wo_a/wo_b +2–4%). The reads killed pragma-12/16 (the backend serializes them: VGPR 26, vmcnt(0)/iter), LDS x-preload (k=8192 occupancy collapse) and the VALU e4m3 decode (non-binding); the hand pair-16 probe measured BIT-IDENTICAL (7/7 fnv) at +16–23% on the starved/mid shapes, −4% on wq_b (its 12-wave cost). ~13.6 ms/token of kernel headroom is MEASURED (~8.4 attn-side ≈ the residue) but the lever that reaches it (split-k/row-split, GLM's gemv_fp8_splitk precedent) reassociates the wave_sum fold by construction — dead-as-designed under byte-identity, registered with the tolerance-gate apparatus it needs as the next stretch's opening; pair-16 projects −1..−2.5 ms = real but cannot reach, NOT built per its own registered bar. The fp4 re-open is sharpened (140 GB/s-class resident fp4 against a same-box 222 GB/s fp8 benchmark now reads kernel-side). M9 (2026-08-08, MEASURED — full record and the unmerged kernel on branch wt/v4-splitk): split-k BUILT and REJECTED, DO NOT ENABLE. Quality through the tolerance apparatus (the apparatus IS merged; the kernel commit deliberately is not): 17/512 argmax flips, every one at a near-tie (baseline top-2 gap median 0.099 at flips vs 3.19 overall; 0 flips at the 399 confident positions), max |dlogit| 8.14, drift stationary and deterministic (twin split-k logit dumps byte-identical over 264,767,496 B); both free-run texts fluent and on-task, forking at a character-282 near-tie — the drift resamples ties, it does not degrade. The host bf16-absorption story (467/467 tensors bit-identical through the goldens gate) was REFUTED end-to-end: MoE top-6 routing is a discrete amplifier a 2-4-layer host emit structurally cannot see. Perf: NULL — wall +0.8; dqkv −0.9 vs the −2.3..−2.9 band (serial-idle microbench rates do NOT transfer into the overlapped engine — recorded); gpu shared went wall-positive. The measured trade: real tie-breaking drift for zero speed. The engine holds at 9.10-9.17 tok/s; the 1024-split re-judge is declined-with-arithmetic on the branch (ceiling 9.25, decision-neutral).
+verdict: OPEN, four levers LANDED and the route span SPLIT. M3b (2026-08-07, launch geometry): moe 70.6 → 54.7 ms/token, +9.6% tok/s. M3c (2026-08-08, branchless e2m1/e8m0 + global-AS descriptor loads, fp4 dot loop 195 → 105 instr per 128 weight bytes): moe 54.9 → 49.6, wall 165.3 = 6.048 tok/s — the registered prediction (−4..−10, point −6) landed IN BAND at −5.3, the first of the series to do so. M4 (2026-08-08) split route with four event-pair sub-spans, no new join: attn 53.2 | cmp 9.1 | hcn 41.2 | gate 3.2 | win 107.7 (resid 1.0) — WRONG at the headline: hcn (hyper-connections + norms) measured 41.2 against a 4–8 band and 0.8 ms of bytes, the engine's largest above-bytes excess; cmp and gate closed at budget; resid 1.0 kills the gate-D2H width micro-lever. M5 (2026-08-08, the hcn read + fix, schedule-only: hc_pre 256 → 1024 threads = one wave per mix row, sum-of-squares frozen at HC_RED, unroll-8): hcn 40.7 → 5.6, wall 130.7 = 7.652 tok/s (+26.5% over M3c's 6.048; arm-to-arm +28.7%), Δhcn −35.1 vs the registered −15..−30 band — the error family a third time, the good side a second (M4 missed high); the width and unroll levers MULTIPLY (24× loads in flight); hcn CLOSED at this rung, +4.8 above bytes. Output byte-identical and counters identical across every arm (M5: reply-prefix md5 recorded, escape-decoding to M4's recorded 1983-byte md5). Residue to 10 tok/s (~31 ms off the 130.7 wall): moe ~+31 over its 18 ms byte floor (miss exposure, shared GEMV unpriced) > attn +28.9 > hcn +4.8; remainder's non-tail 15.6 is no longer ranked apart — it overlaps the ranked spans (win − d2h = 14.8). M2's floor (~62 ms/token ≈ 16 tok/s ceiling) stands; buckets still not certified free (recorded stock-class wall spread ±1.5%, and M5's arm S sat +1.75% over the recorded 165.3). M6 (2026-08-08, MEASURED): the double split LANDED — control wall 130.6 (−0.08% of 130.7), reply and counters identical, both summing identities exact (ATTN resid 0.00, MOE resid 0.0). ATTN-SPLIT qkv 20.3 | attend 3.2 | oproj 29.6 — ALL IN BAND, the series' first triple hit, and the fp8-GEMV kill FIRES (qkv 2.31×, oproj 1.99× bytes). MOE-SPLIT sync2 31.6 (in band); gpu shared 15.8 vs 6–10 = 2.82× bytes — its kill FIRES, and h2d 15.5 is that chain's exposure site, not a copy cost; res 24.2 FIRES its >24 re-open as registered, entered conditional on a replicate (0.2 past the threshold at n=1; the +4.2 point miss stands: resident compute ~38% above bytes); miss 9.7 sits 0.3 under its ≥10 kill — no claim (pure fetch latency, 1.96 vs 2.02 ms/miss). Ranked levers (excesses measured, lever values projections): fp8 GEMV rate ~36 ms of excess across qkv/oproj/shared (ONE ISA read serves all three) > shared-chain overlap off the null stream (≤15.5, schedule-only) > miss exposure 9.7 > res-above-bytes +6.7 (replicate first) — levers 1+2 project to −25..−40 against the ~31 to 10 tok/s: the top covers it, the bottom falls 6 short. M7 (2026-08-08, MEASURED): the fp8 GEMV ISA read said the fp4 story does NOT transfer — the loop was 42 instr/128 B, all-global, LDS-LUT decode, 16 waves/SIMD; the disease was zero memory-level parallelism (a full vmcnt(0) drain every iteration — hc_pre's class, not M3a's). Levers: #pragma unroll 8 (one vmcnt(0) per 1 KB, single fmac chain, VGPR 86 = still 16 waves) + the shared chain onto its own stream after sync1, joined by the sync2 the path already pays. A/B (one arm-S run DISCARDED by the in-run witness — foreign 1.66 GiB GTT step; the clean S sat −0.84% off the recorded 130.6): wall 129.5 → 109.0 = 9.175 tok/s (+18.8%), byte-identical, counters identical — the wall Δ −20.5 fell 1.5 SHORT of the registered −22..−42 band's nearest edge, the series' first bad-side miss, and 10 tok/s is NOT reached. qkv −3.6 / oproj −8.3 (bands missed high: the unroll recovered ~45% of the GEMV excess; the loop still runs 1.4–1.9× bytes); h2d 15.5 → 1.3 IN BAND; the sync2 tell FIRED (+5.1 contention ⇒ lever 2 scores on wall alone, net moe −8.7); gpu shared UNSCORABLE (serial-vs-overlapped confound). Residue to 10 tok/s ~9 ms: qkv+oproj residual ~14.3 above bytes > sync2/res contention > miss 8.9 > hcn +4.8. M8 (2026-08-08, MEASURED): the STRETCH CLOSES the last mile as a successful negative at the measured 109.0–109.9 ms/token = 9.10–9.17 tok/s — within byte-identity + schedule/grid/lowering, 10 tok/s is not reachable — and the DOC STAYS OPEN on split-k (registered as the next stretch's opening) and the fp4 re-open. The round behind that: two controls at HEAD replicated everything (walls 109.9/109.4 vs the recorded 109.0, spread 0.8%; md5 and counters identical, split identities exact; res contended 27.7/27.9/28.0 with the serial pair 24.2/24.3 booked — the fp4 re-open STANDS at n=2, 1.38–1.39× bytes; miss five points under the ≥10 kill, 8.6–9.8, unfired; sync2 35.8/36.8/36.4 = the overlap's steady price, accepted), and the serial-rate instrument (dot_bench v4gemv; pair-16 probe in a scratch tree, never the engine) REFUTED the uniform-floor closure hypothesis — wq_b streams 222 GB/s = 87% of the 256 bus at full grid while wq_a/wkv sit at 66 with 512–1024 waves — splitting the excess into grid starvation (dominant on the few-row shapes) + mild per-wave MLP (wo_a/wo_b +2–4%). The reads killed pragma-12/16 (the backend serializes them: VGPR 26, vmcnt(0)/iter), LDS x-preload (k=8192 occupancy collapse) and the VALU e4m3 decode (non-binding); the hand pair-16 probe measured BIT-IDENTICAL (7/7 fnv) at +16–23% on the starved/mid shapes, −4% on wq_b (its 12-wave cost). ~13.6 ms/token of kernel headroom is MEASURED (~8.4 attn-side ≈ the residue) but the lever that reaches it (split-k/row-split, GLM's gemv_fp8_splitk precedent) reassociates the wave_sum fold by construction — dead-as-designed under byte-identity, registered with the tolerance-gate apparatus it needs as the next stretch's opening; pair-16 projects −1..−2.5 ms = real but cannot reach, NOT built per its own registered bar. The fp4 re-open is sharpened (140 GB/s-class resident fp4 against a same-box 222 GB/s fp8 benchmark now reads kernel-side). M9 (2026-08-08, MEASURED — full record and the unmerged kernel on branch wt/v4-splitk): split-k BUILT and REJECTED, DO NOT ENABLE. Quality through the tolerance apparatus (the apparatus IS merged; the kernel commit deliberately is not): 17/512 argmax flips, every one at a near-tie (baseline top-2 gap median 0.099 at flips vs 3.19 overall; 0 flips at the 399 confident positions), max |dlogit| 8.14, drift stationary and deterministic (twin split-k logit dumps byte-identical over 264,767,496 B); both free-run texts fluent and on-task, forking at a character-282 near-tie — the drift resamples ties, it does not degrade. The host bf16-absorption story (467/467 tensors bit-identical through the goldens gate) was REFUTED end-to-end: MoE top-6 routing is a discrete amplifier a 2-4-layer host emit structurally cannot see. Perf: NULL — wall +0.8; dqkv −0.9 vs the −2.3..−2.9 band (serial-idle microbench rates do NOT transfer into the overlapped engine — recorded); gpu shared went wall-positive. The measured trade: real tie-breaking drift for zero speed. The engine holds at 9.10-9.17 tok/s; the 1024-split re-judge is declined-with-arithmetic on the branch (ceiling 9.25, decision-neutral). M10 (2026-08-09, IMPLEMENTED, no GPU yet): the grid-starvation WIDTH lever under byte-identity — wq_a+wkv concatenated at PIN LOAD into one [1536×4096] fp8 weight (kv rows FIRST; scale grids stacked row-wise; zero extra bytes, wq_a/wkv stay views) so decode runs ONE 1536-wave GEMV where two grid-starved launches ran, plus both memcpy+act_quant staging pairs fused into quant-from-source launches — the qkv bracket's 13 device ops → 10 at decode; prefill keeps the split path, byte-identical by construction. Every consumer keeps its address: the KV entry stays at s.kv (ring write, kv_entry probe, v4_loop's decode goldens); the q intermediate — no consumer outside the call, the indexer never runs below the positional limit — moves to s.kv+head_dim. Prediction registered §M10 BEFORE measurement with M9's transfer discount: Δqkv −1.0..−4.5 (point −2.5; kill |Δqkv|<1), Δremainder −1.5..+0.5, Δwall −0.5..−5.0 (kill Δwall>+0.5 ⇒ revert), |Δ|<3 replicates; STATED: cannot reach 10 tok/s (best edge 9.62). A/B staged vs a935990; gates: reply md5 75b19fcde806059b45c515259feb16d2 + counters + split identities before any span verdict.
 ---
 
 # Where do V4-Flash's 185 ms/token go?
@@ -1145,6 +1145,132 @@ measured bit-identity stay recorded above for the stretch that relaxes the const
 1.38–1.39× bytes ≈ 140 GB/s now reads as kernel-side, not machine-side — the same
 box's fp8 GEMV streams 222 GB/s at full grid, so the fp4 kernel's memory-system/
 geometry question (M6's registered re-open) survives with a sharper benchmark to beat.
+
+## M10 — the qkv width fusion + copy/quant fusion, IMPLEMENTED 2026-08-09 (no GPU yet), and the registered prediction
+
+M8 closed the schedule/grid/lowering constraint set at 109.0–109.9 ms/token and left
+the grid-starvation mechanism MEASURED but unattacked: `wq_a` [1024×4096] and `wkv`
+[512×4096] run at 66–67 GB/s — 26% of bus — because 512–1024 waves cannot fill the
+machine, while the same kernel at 32768 waves streams 222. Splitting ROWS re-associates
+the fold (dead-as-designed, M8); WIDTH does not: both starved GEMVs read the SAME
+quantized activation `xq` (verified at the call sites in `attn.rs`), so their weights
+concatenate row-wise into one [1536×4096] launch whose every output row keeps its `k`,
+its ascending-j lane fold, and its kernel body — only the grid is taller. This stretch
+builds that, plus the free rider the chain audit exposed: both `memcpy → act_quant`
+staging pairs collapse into quant-from-source launches (the copy existed only so the
+SOURCE survived for its other readers; reading the source directly satisfies the same
+contract in one launch). Byte-identity is the gate again, chosen because this lever
+CANNOT re-associate anything.
+
+**Lever A — the `[wkv ‖ wq_a]` concat, kv rows FIRST, and the order is load-bearing.**
+Built at pin load (`pin.rs::place_fp8_qkv`): one placement, weight bytes and 128×128
+scale grids concatenated row-wise, `wkv`/`wq_a` resolved as VIEWS into it — zero extra
+bytes resident. The seam sits at 512 = 4 × 128, so no scale block straddles it and the
+kernel's `scale row = j >> 7` lands fused row `512 + r` on concatenated scale row
+`4 + r/128` exactly; a checkpoint whose `head_dim` broke the alignment gets two
+ordinary placements and no fused weight. kv-first because the fused output row must be
+CONTIGUOUS and the KV entry has consumers that must keep finding it at `s.kv`: the
+decode ring write, `probe_attn_stages`'s `kv_entry` readback — which `tests/v4_loop.rs`
+exercises at DECODE phases, so the q-first order sketched at staging would have handed
+the real-weight golden gate a stale buffer — and the `tests/v4_attn.rs` harness. The q
+intermediate takes the relocation instead (`s.kv + head_dim`, `s.qr` unused at a fused
+decode) because it has NO consumer outside the call: the engine's selection is
+positional below `positional_context_limit`, so the reference's indexer — the reader
+`Scratch::qr` is kept separate for — never runs in this engine. Decode-only, twice
+over: at `m > 1` a fused `[m, 1536]` output interleaves the two destinations row-wise,
+and at a 1-row prefill on a compressed layer the landing zone IS the compressed tail's
+rows. Prefill keeps the split launches and is byte-identical by construction.
+
+**Lever B — quant-from-source, BUILT (the trivial-or-drop bar was met).**
+`v4_act_quant` gains a `src` pointer beside its `dst` — an indexing change to the
+existing kernel, no new kernel, `__restrict__` dropped from both pointers because they
+alias at every in-place site: amax over `src`, roundtrip written to `dst`, and
+`src == dst` reproduces the old body bit-for-bit (the scan completed before the first
+write already). The launcher REFUSES `src != dst` at `n != row_stride` (a
+partial-width quant-from-source would leave dst row tails stale where the copy filled
+them; guard-tested at code 1002). Applied to `x → xq` and `qr → qrq`; both run at
+prefill AND decode, so the two removed copies come off every layer of every phase.
+
+**Launch arithmetic at decode: the qkv bracket's 13 device ops → 10.** Two copies gone
+(lever B), two GEMVs → one (lever A), prefill 13 → 11. M3b priced the per-launch
+host-bubble class at ~25 µs, and M6 then measured that class ≈ 0 on the moe HOST path;
+where the qkv bracket's op-count term actually lives (M6's scoring named a small
+additive per-op excess) is part of what this A/B measures.
+
+**NOT in scope, recorded:** `wq_b` (87% of bus already); `oproj` (the M8-priced
+pair-16 class, declined there); pulling the shared-expert chain forward to share the
+fused launch (it reads `xq` too, but it lives on M7's overlap stream — trading
+measured overlap for speculative width; LATER candidate, priced only after this A/B's
+attribution is clean); the moe-side `xw → xq` copy+quant pair (lever B's disease, but
+it books in the gate/moe buckets — same follow-on gate); any accumulation-order change
+anywhere.
+
+**Byte-identity arguments, per lever, stated before the run:**
+
+- A: every fused output row's dot has the same `k`, the same lane-strided ascending-j
+  chain, the same `wave_sum` ladder, the same bf16 store; the scale-row arithmetic is
+  exact across the seam by the 128-alignment ensure. The kv rows compute BEFORE
+  `q_norm` instead of after RoPE(q); nothing between those two points reads or writes
+  them (audited: `q_norm`/`qrq`/`wq_b`/`qk_norm`/RoPE touch `qr[0..q_lora]`, `qrq`,
+  `q` only) and the stream is serial. `rivoli_v4_gemv_fp8` has NO shape dispatch —
+  one kernel, so no fourth GEMV can be captured silently.
+- B: the fused quant reads the same values the copy would have delivered; the
+  per-128-block arithmetic is untouched.
+- Gates on hardware, not just argument:
+  `tests/v4_kernel.rs::the_fused_qkv_gemv_is_bitwise_the_two_launches_it_replaces`
+  (the engine's real shapes; fused vs the two launches it replaces AND vs the host
+  fold — the per-row oracle coverage extended to the [1536×4096] shape, seam
+  included); `tests/v4_attn.rs::the_fused_qkv_decode_is_bitwise_the_split_one`
+  (whole-call, both layer classes, anti-vacuity OBSERVED — the fused arm must leave a
+  poisoned `s.qr` untouched while the split arm destroys it); and `tests/v4_loop.rs`
+  at GO (real weights through the CHANGED LOAD PATH — the concat happens at pin load,
+  so the golden gate is the proof nothing moved).
+
+**Prediction, registered 2026-08-09 BEFORE any measurement, M9's transfer lesson
+priced in (serial-idle rates under-transfer into the overlapped engine: M9 measured
+Δqkv −0.9 against a microbench-derived −2.3..−2.9, a ~0.3–0.4× realization):**
+
+- The serial arithmetic, then the discount: the fused 6.29 MB at the M8 ladder's
+  1536-wave interpolation (~78–90 GB/s, between wkv/wq_a's 66 and sh_gu's 93.4 at
+  2048 waves) ≈ 70–80 µs/layer against the split pair's 94.6 → −15..−25 µs/layer ≈
+  −0.6..−1.1 ms/token serial-idle; M9-discounted to −0.2..−1.1. The op-count term: 3
+  launches removed per decode layer (~129/token) — IF the qkv small-op excess follows
+  op count, 3/13 of its ~5–6 ms non-GEMV excess prices −1.2..−1.4; if M6's moe-host
+  answer transfers (the class does not exist on this path), ~0.
+- **Δqkv (the primary): −1.0..−4.5, point −2.5** (the 16.6–16.7 recorded class →
+  ~14.2). Kill: |Δqkv| < 1 (replicated if near the edge) ⇒ the op-count term does not
+  follow launches here AND the taller grid bought nothing the overlapped engine can
+  see — the lever closes as a measured null naming which half died.
+- **Δremainder: −1.5..+0.5, point −0.5** — the launch-count effects land partly here
+  if they were host-visible at all.
+- **Δwall: −0.5..−5.0, point −2.5** (the 109.0–109.9 class → ~106.5; attn is
+  wall-serial so Δqkv lands ~1:1). Kill: Δwall > +0.5 with byte-identity intact ⇒
+  the fusion costs more than it buys in the engine (the 1536-wave grid's occupancy
+  interaction is the named suspect) — revert lever A's dispatch, keep lever B only if
+  its half scores clean, record.
+- Untouched spans (attend, oproj, every moe attribution): |Δ| ≤ 1.5 expected; a
+  larger move is contention or instrument drift and blocks any claim until read.
+- The |Δ| < 3 ms replicate rule stands for every span.
+- **Said plainly: this lever cannot reach 10 tok/s.** The best band edge (−5.0) is
+  104.0 ms/token = 9.62 tok/s; the point is ~106.5 = 9.39. M8's closure stands; M10
+  harvests measured residue inside the byte-identity constraint set.
+
+**The staged A/B (M7/M8's pattern verbatim):** arm S = `a935990` (main) via
+`git archive` into a scratch tree; arm B = this branch's committed HEAD. Both release
+binaries built BEFORE the first device request, nothing built between arms. The GO
+round runs the device gates first — dev-profile `--test v4_kernel`, `--test v4_attn`,
+`--test v4_loop`, each `-- --test-threads=1` under the flock — then the two arms,
+each under the exclusive flock with the 30 s KFD+GTT witness (find-form KFD count +
+`mem_info_gtt_used`, plus the llama-swap `/running` probe where the endpoint answers;
+a foreign GTT step discards the arm). Command per arm flag-identical to M2..M8: the
+218-token prompt verbatim from benchmarks.md's head-to-head CORRECTED note (md5
+`bc71afa745d980be7d21860f70ad96aa`), `-bench 512`. Gates in registered order: (1)
+reply escape-decodes to md5 `75b19fcde806059b45c515259feb16d2` (1983 bytes) and
+counters 179389 hit / 8693 miss + 2538 raw on BOTH arms; (2) split identities exact;
+(3) arm S wall within ±3% of the recorded 109.0–109.9 class; (4) THEN the span
+verdicts, two arms per side if any span lands near its band edge. The record lands in
+benchmarks.md beside "V4 M8 replicate + serial-rate round"; this section gets the
+SCORED note; verdict and INDEX move in lockstep.
 
 ## M2 — provenance of the command
 

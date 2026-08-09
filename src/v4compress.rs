@@ -986,7 +986,7 @@ mod device {
                 // would be the third (see `kernels/v4compress.hip`'s header).
                 // SAFETY: `b.fin.out` is `emitted · d` writable f32 by the field's contract.
                 Quantize::PartialFp8 => unsafe {
-                    launch_v4_act_quant(b.fin.out, emitted, d, d - rd, 64, stream)?
+                    launch_v4_act_quant(b.fin.out, b.fin.out, emitted, d, d - rd, 64, stream)?
                 },
                 // model.py:374-376 `rotate_activation(kv)` then `fp4_act_quant(kv, 32, True)`
                 // — the WHOLE row, `rd` included. Note what this does NOT do: it takes no

@@ -1042,8 +1042,12 @@ impl V4Engine {
             // `[m + m/ratio, head_dim]`, not `[m, head_dim]`: at prefill `sparse_attn` reads
             // `torch.cat([kv, kv_compress])` and the selection indexes that concatenation as ONE
             // space, so the compressor's blocks live in this buffer's tail. Sized at the tightest
-            // ratio because one buffer serves every layer class.
-            a_kv: f32s((max_m + max_m.div_ceil(INDEXED_RATIO)) * hd)?,
+            // ratio because one buffer serves every layer class. `+ q_lora_rank` for the M10
+            // fused decode GEMV, whose one output row is `head_dim + q_lora_rank` floats at the
+            // base (`attn::v4::Scratch::kv` documents the obligation): decode touches no other
+            // row, so for `max_m ≥ 2` the fused row already fits in row 1's space and the slack
+            // is dead — it exists so a 1-token prompt does not overrun an exactly-sized buffer.
+            a_kv: f32s((max_m + max_m.div_ceil(INDEXED_RATIO)) * hd + cfg.q_lora_rank)?,
             a_o: f32s(max_m * nhd)?,
             a_y: f32s(max_m * cfg.o_groups * cfg.o_lora_rank)?,
             idx_host: Vec::with_capacity(max_m * idx_cols),
@@ -1377,6 +1381,10 @@ impl V4Engine {
             attn_sink: lp.attn_sink,
             wo_a: fp8(lp.wo_a),
             wo_b: fp8(lp.wo_b),
+            // The M10 decode width fusion — `Some` on this checkpoint (the pin builds
+            // the `[wkv ‖ wq_a]` concat whenever the seam divides the scale block).
+            // `a_kv` carries the `+ q_lora_rank` floats the fused output row needs.
+            wqkv: lp.wqkv.map(fp8),
         };
         let s = v4::Scratch {
             rows: self.max_m,

@@ -303,12 +303,24 @@ extern "C" int rivoli_mla_value_fp8(
 // One thread per (row, block): `block` is 64 or 128, the amax scan and the write-back
 // are serial over it, and the whole op moves ~2 KB per token. Parallelising inside a
 // block would buy nothing and would re-associate an absmax that is exact today.
-extern "C" __global__ void v4_act_quant(float* __restrict__ x, int rows, int row_stride,
-                                        int n, int block) {
+//
+// `src`/`dst` rather than one `x` since M10 (docs/investigations/v4-decode-decomposition.md):
+// the qkv chain ran `memcpy(dst, src)` + `act_quant(dst)` twice per layer purely so the
+// SOURCE survived for its other readers (`x` for the compressor, `qr` for the reference's
+// indexer — attn.rs `Scratch` names them). Reading `src` and writing `dst` satisfies the
+// same contract in ONE launch: the values quantized are the bytes the copy would have
+// delivered, and the per-block arithmetic below is untouched. `src == dst` is the
+// reference's `inplace=True` and reproduces the pre-M10 body exactly — the amax scan
+// completes before the first write either way. NO `__restrict__` on either pointer for
+// that reason: they alias at every in-place call site.
+extern "C" __global__ void v4_act_quant(const float* src, float* dst, int rows,
+                                        int row_stride, int n, int block) {
     int nb = n / block;
     size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= (size_t)rows * (size_t)nb) return;
-    float* seg = x + (size_t)(id / nb) * row_stride + (size_t)(id % nb) * block;
+    size_t off = (size_t)(id / nb) * row_stride + (size_t)(id % nb) * block;
+    const float* seg = src + off;
+    float* out = dst + off;
     // `T.max(amax_local[i], 1e-4)`: the floor keeps an all-zero block from producing a
     // zero scale and a division by zero. Seeding the scan with it is the same value.
     float amax = ACT_QUANT_AMAX_FLOOR;
@@ -319,7 +331,7 @@ extern "C" __global__ void v4_act_quant(float* __restrict__ x, int rows, int row
     // exist so a NaN PROPAGATES rather than being laundered into -448 by `fminf`/`fmaxf`),
     // the same encode — sitting eight lines under a note claiming the duplication was
     // lifted. Found by review, 2026-08-05.
-    for (int i = 0; i < block; ++i) seg[i] = act_quant_roundtrip(seg[i], s);
+    for (int i = 0; i < block; ++i) out[i] = act_quant_roundtrip(seg[i], s);
 }
 
 // `RMSNorm.forward` (model.py:197-202) — `q_norm` and `kv_norm`. FP32 internals: the
@@ -492,9 +504,16 @@ extern "C" __global__ void v4_gemv_fp8(const float* __restrict__ x,
 // `stream` is trailing on all of them, matching `rivoli_hc_pre`/`rivoli_v4_dense_gemm_bf16`,
 // and `nullptr` is the null stream — so a caller that has no stream yet is unchanged.
 
-extern "C" int rivoli_v4_act_quant(float* x, int rows, int row_stride, int n, int block,
-                                   void* stream) {
+extern "C" int rivoli_v4_act_quant(const float* src, float* dst, int rows, int row_stride,
+                                   int n, int block, void* stream) {
     if (rows <= 0 || n <= 0 || block <= 0 || row_stride < n) return 1001;
+    // A quant-FROM-SOURCE (`src != dst`) writes only dims [0, n) of each dst row, so a
+    // partial-width one (`n < row_stride` — the KV entry's shape) would leave dst's tail
+    // holding whatever was there before, which no caller can want: the copy this fuses
+    // away delivered the whole row. Full-width or in-place only. 1002 is this file's
+    // size-bound code, and "dst rows would be part-stale" is a bound on what `n` may
+    // cover, not a divisibility fact (1004 below).
+    if (src != dst && n != row_stride) return 1002;
     // `kernel.py::act_quant` asserts `N % block_size == 0`. Without this a ragged tail
     // block would be quantized against its own amax and produce values the reference
     // cannot produce — silently, since every shape in the model divides evenly today.
@@ -505,7 +524,7 @@ extern "C" int rivoli_v4_act_quant(float* x, int rows, int row_stride, int n, in
     size_t total = (size_t)rows * (size_t)(n / block);
     hipGetLastError();
     hipLaunchKernelGGL(v4_act_quant, dim3((unsigned)((total + 255) / 256)), dim3(256), 0,
-                       (hipStream_t)stream, x, rows, row_stride, n, block);
+                       (hipStream_t)stream, src, dst, rows, row_stride, n, block);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

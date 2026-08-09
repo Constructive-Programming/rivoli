@@ -383,11 +383,13 @@ pub mod v4 {
     /// into three, tiled by construction — each sub-span shares an endpoint with the
     /// next, so their sum IS the whole span up to per-query float rounding:
     ///
-    /// * mark 2 (caller's `M_SEL`) → `qkv_done`: the **q and kv chains** — the `xq`
-    ///   copy + `act_quant`, `wq_a` GEMV, `q_norm`, the `qrq` copy + `act_quant`, `wq_b`
-    ///   GEMV, `qk_norm`, RoPE(q), then `wkv` GEMV, `kv_norm`, RoPE(kv) and the partial
-    ///   KV `act_quant` — 12 device ops, three of them the fp8 GEMVs that carry ~39.9 of
-    ///   this span's ~39.9 MB/layer of weight bytes.
+    /// * mark 2 (caller's `M_SEL`) → `qkv_done`: the **q and kv chains** — the fused
+    ///   `x→xq` quant, then at a fused decode ([`Weights::wqkv`]) the one `[wkv ‖ wq_a]`
+    ///   GEMV, `q_norm`, the fused `qr→qrq` quant, `wq_b` GEMV, `qk_norm`, RoPE(q),
+    ///   `kv_norm`, RoPE(kv) and the partial KV `act_quant` — 10 device ops (11 at
+    ///   prefill, where `wq_a` and `wkv` stay two GEMVs; pre-M10 this bracket was 13,
+    ///   with two `memcpy_dtod_async` the quant-from-source fusion removed). The fp8
+    ///   GEMVs carry ~39.9 of this span's ~39.9 MB/layer of weight bytes either way.
     /// * `qkv_done` → `attend_done`: the **attend core** — the phase-dependent KV
     ///   cache/ring write copies (one row at decode) and `launch_v4_sparse_attn` itself.
     ///   ≤~1 MB of gathered KV at this benchmark's positions; a big span here is kernel
@@ -442,6 +444,28 @@ pub mod v4 {
         pub attn_sink: *const f32,
         pub wo_a: Fp8W,
         pub wo_b: Fp8W,
+        /// The M10 width fusion: `wkv` and `wq_a` as ONE `[head_dim + q_lora_rank, dim]`
+        /// weight — `wkv`'s rows FIRST, then `wq_a`'s, both weight bytes and 128×128
+        /// scale grids concatenated row-wise (`V4Pin` builds it at load; the seam is
+        /// scale-exact because `head_dim` is a 128-multiple, which the pin checks).
+        ///
+        /// `Some` ⇒ decode replaces the two grid-starved GEMVs (M8: 512 and 1024 waves
+        /// at 66–67 GB/s against ~2560 wave slots) with one 1536-wave launch. Same
+        /// kernel, same per-row `k`, same fold — only the grid is taller — so every
+        /// output value is bit-identical; what moves is WHERE the q intermediate lands:
+        /// `s.kv + head_dim`, because the fused output must be contiguous and the KV
+        /// entry must stay at `s.kv`, where its consumers (the ring write here, the
+        /// `kv_entry` probe readback, `tests/v4_attn.rs`'s harness) already look. The
+        /// q intermediate has no consumer outside this call — the engine's selection
+        /// is positional, so the reference's indexer (the reader [`Scratch::qr`] is
+        /// kept separate for) never runs. `s.kv` must then hold `head_dim +
+        /// q_lora_rank` floats — see the safety contract on [`attention`].
+        ///
+        /// `None` (every probe/test caller) is the pre-M10 two-launch path, and
+        /// PREFILL always is: at `m > 1` the fused `[m, 1536]` output would interleave
+        /// the two destinations row-wise, and at a 1-row prefill on a compressed layer
+        /// the q landing zone is the compressed tail's rows.
+        pub wqkv: Option<Fp8W>,
     }
 
     /// Per-call scratch, device-resident, sized for `rows` query rows.
@@ -450,7 +474,9 @@ pub mod v4 {
     /// waste: `qr` is `q_norm(wq_a(x))` and a ratio-4 layer's `Indexer` consumes it
     /// AFTER the q path is done with it (model.py:509/519), so quantizing in place here
     /// would hand S2c a destroyed input. `xq` is separate for the same reason on `x`,
-    /// which the compressor and the indexer both read.
+    /// which the compressor and the indexer both read. Since M10 neither pair costs a
+    /// copy: `act_quant` reads the source and writes the quantized copy in one launch,
+    /// which preserves exactly the property the separation exists for.
     #[derive(Clone, Copy)]
     pub struct Scratch {
         /// How many query rows every buffer below is sized for, checked against the `m`
@@ -460,7 +486,9 @@ pub mod v4 {
         pub rows: usize,
         /// `[m, dim]` — the activation-quantized copy of `x`.
         pub xq: *mut f32,
-        /// `[m, q_lora_rank]`
+        /// `[m, q_lora_rank]`. UNUSED on a fused decode ([`Weights::wqkv`] `Some`): the
+        /// q intermediate then lives at `kv + head_dim`, where the fused GEMV's one
+        /// contiguous output row put it.
         pub qr: *mut f32,
         /// `[m, q_lora_rank]`
         pub qrq: *mut f32,
@@ -471,6 +499,12 @@ pub mod v4 {
         /// `torch.cat([kv, kv_compress], dim=1)` and the selection indexes that
         /// concatenation as one space. The compressor writes the tail, at
         /// `v4compress::compress`. Nothing here can check it — see [`Scratch::rows`].
+        /// **And at least `head_dim + q_lora_rank` floats when the caller passes
+        /// [`Weights::wqkv`]**: a fused decode writes its whole `[wkv ‖ wq_a]` output
+        /// row here — KV entry at the base, exactly where the unfused path puts it, q
+        /// intermediate after. Decode touches no other row of this buffer, so on any
+        /// `rows ≥ 2` allocation the landing zone is row 1's space; the +q_lora_rank
+        /// slack in the engine's allocation is for the `rows == 1` edge.
         pub kv: *mut f32,
         /// `[m, n_heads * head_dim]`
         pub o: *mut f32,
@@ -698,13 +732,16 @@ pub mod v4 {
     ///
     /// # Everything runs on ONE stream, and that is a correctness requirement
     ///
-    /// The twenty-two device call sites below — sixteen launches across six launcher
-    /// functions, and six device-to-device copies, of which three or four run on any one call
+    /// The twenty-one device call sites below — seventeen launches across six launcher
+    /// functions (two of them the fused-vs-split qkv GEMV alternatives, of which at most
+    /// one runs), and four device-to-device copies, of which one or two run on any one call
     /// because the KV write branches by phase — all take `stream`, and none of them did before
     /// 2026-08-05. (Counted, 2026-08-05, after review found an earlier draft of this sentence
     /// saying "thirteen … six launchers and five copies", which does not even sum. The wrong
     /// "thirteen" was the port doc's count of how many of the V4 path's NINETEEN launchers
-    /// already took a stream, borrowed into a sentence about one function body.) Two facts
+    /// already took a stream, borrowed into a sentence about one function body. Re-counted
+    /// 2026-08-09 for M10: the `xq` and `qrq` copies fused into their `act_quant`s — six
+    /// copies became four — and the decode qkv GEMV gained its fused alternative.) Two facts
     /// make the set
     /// indivisible. rivoli's streams are created `hipStreamNonBlocking` (`async.hip`), so the
     /// null stream carries no implicit ordering against them; and the block is a straight-line
@@ -715,11 +752,12 @@ pub mod v4 {
     ///
     /// The copies are the part that is easy to miss and were missed once: the port doc's
     /// requirement 9 counted **six** null-stream launchers "i.e. the whole of
-    /// `attn::v4::attention`", and the six `memcpy_dtod` calls are in this function and are
+    /// `attn::v4::attention`", and the six `memcpy_dtod` calls were in this function and are
     /// not launchers. `memcpy_dtod` is a BLOCKING `hipMemcpy`, so host-blocking hid the
     /// hazard while everything was on stream 0; the moment the launchers moved, it became a
     /// read racing a stream-ordered write. Hence [`memcpy_dtod_async`], and hence the count
-    /// is seven, not six.
+    /// was seven, not six. (Two of those seven — the `xq` and `qrq` staging copies — are
+    /// gone since M10: `act_quant` reads the source directly now, same values, one launch.)
     ///
     /// `stream` may be null — that is the default stream and reproduces the old behaviour
     /// exactly, which is what lets a caller adopt this before it owns a stream.
@@ -731,13 +769,18 @@ pub mod v4 {
     /// completes. `io.freqs` must cover position `start_pos + m - 1`. `stream` is a live
     /// `hipStream_t`, or null for the default stream.
     ///
-    /// Four further obligations, none of which a plausible caller satisfies by
+    /// Five further obligations, none of which a plausible caller satisfies by
     /// accident:
     ///
     /// - **Everything must be pairwise NON-OVERLAPPING.** [`memcpy_dtod_async`]'s own
     ///   contract forbids overlap, and every GEMV needs its input and output disjoint. The
     ///   [`Scratch`] docs explain why `qr`/`qrq` are separate buffers, which reads as
     ///   though that were the only separation this needs; it is not.
+    /// - **`Weights::wqkv` obliges `s.kv` to hold `head_dim + q_lora_rank` floats**, the
+    ///   fused decode GEMV's one output row. The q intermediate then lives at
+    ///   `s.kv + head_dim` and `s.qr` goes unused — see [`Weights::wqkv`] for why the KV
+    ///   entry keeps the base. The pointer must also BE the pin's `[wkv ‖ wq_a]` concat;
+    ///   nothing here can check bytes, only the pin's load-time `ensure`s do.
     /// - **`io.idxs` must name rows that exist in what the step attends.** The kernel
     ///   dereferences `kv + idx * head_dim` for every non-negative entry. The bound is
     ///   `seqlen + n_comp` at prefill and `window + n_comp` at decode — NOT `seqlen` and
@@ -813,51 +856,56 @@ pub mod v4 {
         // -- q -------------------------------------------------------------------------
         // `x` is quantized ONCE and read by both `wq_a` and `wkv`. The reference runs a
         // separate `act_quant` inside each `Linear` (model.py:120/123), but on the same
-        // row at the same block size, so the two produce identical bytes.
-        // SAFETY: caller's contract; `xq` is `[m, dim]` and `x` is not modified.
+        // row at the same block size, so the two produce identical bytes. One launch
+        // since M10: `act_quant` reads `io.x` and writes `s.xq` itself — the staging
+        // `memcpy_dtod_async` delivered exactly the values the kernel now reads, and
+        // `io.x` stays untouched for its other readers, which is all the separate
+        // buffer was for.
+        //
+        // A fused decode (`w.wqkv`, M10) runs ONE GEMV over the `[wkv ‖ wq_a]` concat:
+        // `out[0..hd]` is the KV entry, landing at `s.kv` exactly where the split path
+        // lands it; `out[hd..hd + q_lora]` is the q intermediate, landing at
+        // `s.kv + hd` instead of `s.qr` (`qr` below names whichever address holds it).
+        // Every output row's dot is the same kernel body over the same `k` at the same
+        // fold — the launch is 1536 waves instead of 512 + 1024, which is the entire
+        // point (M8: both split launches sat grid-starved at 66–67 GB/s) — so every
+        // downstream op reads identical bits at whichever address `qr` names. The kv
+        // rows are computed BEFORE `q_norm` rather than after RoPE(q); nothing between
+        // the two points reads or writes them (`q_norm`/`qrq`/`wq_b`/`qk_norm`/RoPE
+        // touch `qr`'s first `q_lora` floats, `s.qrq` and `s.q` only), and the stream
+        // is serial.
+        let fused = match step {
+            Pass::Decode { .. } => w.wqkv,
+            Pass::Prefill { .. } => None,
+        };
+        // Every `groups = 1` GEMV of both chains, spelled once. The fused/split branch
+        // made the parameter lists near-identical and `build.rs`'s jscpd gate rejected
+        // the repetition; `wo_a` keeps its own call because it is the one grouped one.
+        // SAFETY: deferred to the call sites — each is the caller's-contract launch it
+        // textually replaces.
+        let linear = |x: *const f32, wt: Fp8W, n_out: usize, k: usize, out: *mut f32| unsafe {
+            launch_v4_gemv_fp8(x, wt.w, wt.scale, m, n_out, k, FP8_BLOCK, 1, out, stream)
+        };
+        // SAFETY: caller's contract; `xq` is `[m, dim]` and `x` is not modified, and a
+        // `Some(wqkv)` caller granted `s.kv` the `hd + q_lora` floats the fused row
+        // needs (obligation five above).
         unsafe {
-            memcpy_dtod_async(
-                s.xq.cast(),
-                io.x.cast(),
-                m * d.dim * size_of::<f32>(),
-                stream,
-            )?;
-            launch_v4_act_quant(s.xq, m, d.dim, d.dim, FP8_BLOCK, stream)?;
+            launch_v4_act_quant(io.x, s.xq, m, d.dim, d.dim, FP8_BLOCK, stream)?;
             let (q_lora, dim) = (d.q_lora_rank, d.dim);
-            launch_v4_gemv_fp8(
-                s.xq,
-                w.wq_a.w,
-                w.wq_a.scale,
-                m,
-                q_lora,
-                dim,
-                FP8_BLOCK,
-                1,
-                s.qr,
-                stream,
-            )?;
-            launch_v4_rmsnorm(s.qr, w.q_norm, m, q_lora, d.norm_eps, stream)?;
-            // The copy that made the set seven rather than six: `s.qr` is what `v4_rmsnorm`
-            // just wrote on `stream`, and a blocking `memcpy_dtod` here does not wait for it.
-            memcpy_dtod_async(
-                s.qrq.cast(),
-                s.qr.cast(),
-                m * q_lora * size_of::<f32>(),
-                stream,
-            )?;
-            launch_v4_act_quant(s.qrq, m, q_lora, q_lora, FP8_BLOCK, stream)?;
-            launch_v4_gemv_fp8(
-                s.qrq,
-                w.wq_b.w,
-                w.wq_b.scale,
-                m,
-                nhd,
-                q_lora,
-                FP8_BLOCK,
-                1,
-                s.q,
-                stream,
-            )?;
+            let qr = if let Some(f) = fused {
+                // The seam arithmetic (kernel scale row = `j >> 7`) is exact only on a
+                // 128-aligned seam. The pin refuses to BUILD a concat otherwise, so a
+                // `Some` here with a misaligned `head_dim` is a hand-built caller's bug.
+                debug_assert!(hd.is_multiple_of(FP8_BLOCK));
+                linear(s.xq, f, hd + q_lora, dim, s.kv)?;
+                s.kv.add(hd)
+            } else {
+                linear(s.xq, w.wq_a, q_lora, dim, s.qr)?;
+                s.qr
+            };
+            launch_v4_rmsnorm(qr, w.q_norm, m, q_lora, d.norm_eps, stream)?;
+            launch_v4_act_quant(qr, s.qrq, m, q_lora, q_lora, FP8_BLOCK, stream)?;
+            linear(s.qrq, w.wq_b, nhd, q_lora, s.q)?;
             // QK-norm BEFORE RoPE (model.py:504 then :505). Read off the reference, not
             // inferred from a green test -- which is the part that matters and is unchanged.
             //
@@ -883,24 +931,17 @@ pub mod v4 {
             launch_v4_rope(s.q, io.freqs, m * nh, hd, rd, pos0, nh, false, stream)?;
 
             // -- kv --------------------------------------------------------------------
-            launch_v4_gemv_fp8(
-                s.xq,
-                w.wkv.w,
-                w.wkv.scale,
-                m,
-                hd,
-                dim,
-                FP8_BLOCK,
-                1,
-                s.kv,
-                stream,
-            )?;
+            // At a fused decode the entry is already in `s.kv[0..hd]` — the concat's kv
+            // rows came first precisely so this chain runs unchanged from here down.
+            if fused.is_none() {
+                linear(s.xq, w.wkv, hd, dim, s.kv)?;
+            }
             launch_v4_rmsnorm(s.kv, w.kv_norm, m, hd, d.norm_eps, stream)?;
             launch_v4_rope(s.kv, io.freqs, m, hd, rd, pos0, 1, false, stream)?;
             // PARTIAL: the RoPE'd tail keeps bf16 precision. Quantizing the whole entry
             // is the llama.cpp failure mode v4-flash-port.md §0.2 names -- it corrupts
             // the positional dims and produces noise without a crash.
-            launch_v4_act_quant(s.kv, m, hd, hd - rd, KV_QUANT_BLOCK, stream)?;
+            launch_v4_act_quant(s.kv, s.kv, m, hd, hd - rd, KV_QUANT_BLOCK, stream)?;
         }
         // M6 mark: the q/kv chains' last enqueue. See [`SplitMarks`] for the exact span.
         if let Some(mk) = marks {
@@ -1009,19 +1050,8 @@ pub mod v4 {
                 s.y,
                 stream,
             )?;
-            launch_v4_act_quant(s.y, m, gr, gr, FP8_BLOCK, stream)?;
-            launch_v4_gemv_fp8(
-                s.y,
-                w.wo_b.w,
-                w.wo_b.scale,
-                m,
-                d.dim,
-                gr,
-                FP8_BLOCK,
-                1,
-                io.out,
-                stream,
-            )?;
+            launch_v4_act_quant(s.y, s.y, m, gr, gr, FP8_BLOCK, stream)?;
+            linear(s.y, w.wo_b, d.dim, gr, io.out)?;
         }
         Ok(())
     }
@@ -1108,6 +1138,7 @@ mod v4_guard_tests {
             attn_sink: c,
             wo_a: f,
             wo_b: f,
+            wqkv: None,
         };
         let s = Scratch {
             rows,

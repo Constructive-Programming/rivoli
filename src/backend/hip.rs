@@ -876,17 +876,25 @@ launchers! {
         e: *mut f32,
     );
 
-    /// `kernel.py::act_quant(x, block, "ue8m0", inplace=True)` in place over `rows` rows of
-    /// `row_stride` floats, quantizing the first `n` of each. `n < row_stride` is the KV
-    /// entry's PARTIAL quantization (model.py:512, dims `[0, head_dim - rope_head_dim)` at
-    /// block 64); `n == row_stride` at block 128 is what every quantized `Linear` does to
-    /// its activation before the GEMM.
+    /// `kernel.py::act_quant(x, block, "ue8m0", inplace=True)` over `rows` rows of
+    /// `row_stride` floats, quantizing the first `n` of each — reading `src`, writing
+    /// `dst` at the same offsets. `src == dst` is the reference's in-place form;
+    /// `n < row_stride` is then the KV entry's PARTIAL quantization (model.py:512, dims
+    /// `[0, head_dim - rope_head_dim)` at block 64). `src != dst` is the M10 fused
+    /// quantize-copy — one launch where the qkv chain ran `memcpy_dtod_async` + this,
+    /// leaving `src` untouched for its other readers — and the launcher REFUSES it at
+    /// `n != row_stride` (code 1002), because a partial-width quant-from-source would
+    /// leave `dst`'s row tails stale where the copy it replaces filled them.
+    /// `n == row_stride` at block 128 is what every quantized `Linear` does to its
+    /// activation before the GEMM.
     ///
     /// # Safety
-    /// `x` is a device buffer of at least `rows * row_stride` f32, and must outlive `stream`'s
-    /// completion. `stream` is a live `hipStream_t`, or null for the default stream.
+    /// `src` and `dst` are device buffers of at least `rows * row_stride` f32 (the same
+    /// buffer, or non-overlapping ones), and must outlive `stream`'s completion. `stream`
+    /// is a live `hipStream_t`, or null for the default stream.
     launch_v4_act_quant -> rivoli_v4_act_quant, "v4_act_quant" (
-        x: *mut f32,
+        src: *const f32,
+        dst: *mut f32,
         rows: usize as i32,
         row_stride: usize as i32,
         n: usize as i32,

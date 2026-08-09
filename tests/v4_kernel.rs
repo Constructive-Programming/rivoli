@@ -1130,6 +1130,37 @@ fn gemv_fp8_on_device(
     sync_f32(&od)
 }
 
+/// The host reference for an `m = 1` wave-per-row fp8 launch: [`FoldRow::serial`] per
+/// output row, bf16-stored where the kernel stores. ONE definition for both fold-order
+/// tests — the k = 1152 sweep and the M10 fused-concat case — because a drift between
+/// two copies of this arithmetic would be indistinguishable from the kernel drift they
+/// exist to catch (the same argument [`FoldRow::chain`] carries for itself).
+///
+/// `sc` and not `scales`, deliberately: rustfmt breaks the longer name's signature over
+/// seven lines whose token run then CLONES [`gemv_fp8_on_device`]'s parameter list — the
+/// "rustfmt manufactured duplication" failure CLAUDE.md records, dodged at the cost of
+/// one shorter name rather than an exemption.
+fn serial_fold(x: &[f32], w: &[u8], sc: &[f32], n_out: usize, k: usize, block: usize) -> Vec<f32> {
+    let bsh = block.trailing_zeros() as usize;
+    let sc_cols = k.div_ceil(block);
+    let n4 = if block >= 4 { k >> 2 } else { 0 };
+    let lut: Vec<f32> = (0..256).map(|b| e4m3_decode(b as u8)).collect();
+    (0..n_out)
+        .map(|j| {
+            let row = FoldRow {
+                x,
+                wrow: &w[j * k..(j + 1) * k],
+                srow: &sc[(j >> bsh) * sc_cols..],
+                lut: &lut,
+                bsh,
+                n4,
+                k,
+            };
+            bf16_decode(bf16_encode(row.serial()))
+        })
+        .collect()
+}
+
 fn position_coverage(w: &[u8], p: usize) -> usize {
     let mut seen = [false; 256];
     for b in w.iter().skip(p).step_by(4) {
@@ -1280,33 +1311,11 @@ fn the_fp8_dot_sums_in_source_order_through_both_loops() {
         .map(|i| [0.25f32, 0.5, 1.0, 2.0][i % 4])
         .collect();
 
-    let lut: Vec<f32> = (0..256).map(|b| e4m3_decode(b as u8)).collect();
-    let host = |block: usize| -> Vec<f32> {
-        let bsh = block.trailing_zeros() as usize;
-        let sc_cols = K.div_ceil(block);
-        let n4 = if block >= 4 { K >> 2 } else { 0 };
-        (0..N_OUT)
-            .map(|j| {
-                let wrow = &w[j * K..(j + 1) * K];
-                let srow = &scales[(j >> bsh) * sc_cols..];
-                let row = FoldRow {
-                    x: &x,
-                    wrow,
-                    srow,
-                    lut: &lut,
-                    bsh,
-                    n4,
-                    k: K,
-                };
-                bf16_decode(bf16_encode(row.serial()))
-            })
-            .collect()
-    };
     // `K = 1152 < 4096`, so both blocks stay on the wave-per-row kernel — the split-k
     // dispatch is the other test's subject.
     for block in [128usize, 2] {
         let (want, got) = (
-            host(block),
+            serial_fold(&x, &w, &scales, N_OUT, K, block),
             gemv_fp8_on_device(&x, &w, &scales, 1, N_OUT, K, block),
         );
         assert_eq!(
@@ -1315,6 +1324,60 @@ fn the_fp8_dot_sums_in_source_order_through_both_loops() {
             "fp8 dot order (block {block}): kernel fold differs from the source's"
         );
     }
+}
+
+/// The M10 `[wkv ‖ wq_a]` concat at the ENGINE's shapes — the per-row oracle coverage
+/// for the fused `[1536 × 4096]` grid, seam included, in two bitwise claims:
+///
+/// 1. fused `out[0..512]` / `out[512..]` equal the two standalone launches the fusion
+///    replaces. This is the load-time concat's layout contract executed by the real
+///    kernel: fused row `512 + r` must read concatenated scale row `4 + r/128`, so an
+///    off-by-one-BLOCK scale concat shifts every `wq_a` row onto a neighbour's scales
+///    and fails here on thousands of terms — the "catch it by arithmetic first" case.
+/// 2. every fused row equals [`FoldRow::serial`] — the same source-order pin the
+///    k = 1152 sweep holds, at the fused shape's 32 whole per-lane trips (no remainder
+///    pass; that loop keeps its coverage in the sweep above).
+///
+/// Weight bytes are the sweep's covering pattern (NaN codes excluded, per its argument)
+/// with different salts per tensor, so the two sides of the seam cannot mask each other.
+#[test]
+fn the_fused_qkv_gemv_is_bitwise_the_two_launches_it_replaces() {
+    const K: usize = 4096;
+    const N_KV: usize = 512;
+    const N_QA: usize = 1024;
+    const BLOCK: usize = 128;
+    let allowed: Vec<u8> = (0u8..=255).filter(|b| !matches!(b, 0x7f | 0xff)).collect();
+    let wrow = |n: usize, salt: usize| -> Vec<u8> {
+        (0..n)
+            .map(|i| allowed[(i / 4 + (i % 4) * 67 + salt) % allowed.len()])
+            .collect()
+    };
+    let (w_kv, w_qa) = (wrow(N_KV * K, 0), wrow(N_QA * K, 131));
+    // Power-of-two scales in a cycle, offset between the tensors: a seam error lands a
+    // row on scales that differ from its own, so equality would be impossible.
+    let scl = |rows: usize, salt: usize| -> Vec<f32> {
+        (0..rows.div_ceil(BLOCK) * K.div_ceil(BLOCK))
+            .map(|i| [0.25f32, 0.5, 1.0, 2.0][(i + salt) % 4])
+            .collect()
+    };
+    let (s_kv, s_qa) = (scl(N_KV, 0), scl(N_QA, 1));
+    let x = draw_x("qkv-fuse-x", K, 0.05);
+    let kv = gemv_fp8_on_device(&x, &w_kv, &s_kv, 1, N_KV, K, BLOCK);
+    let qa = gemv_fp8_on_device(&x, &w_qa, &s_qa, 1, N_QA, K, BLOCK);
+    let wf = [w_kv.as_slice(), w_qa.as_slice()].concat();
+    let sf = [s_kv.as_slice(), s_qa.as_slice()].concat();
+    let f = gemv_fp8_on_device(&x, &wf, &sf, 1, N_KV + N_QA, K, BLOCK);
+    assert_eq!(
+        bits(&f[..N_KV]),
+        bits(&kv),
+        "kv rows through the fused grid"
+    );
+    assert_eq!(bits(&f[N_KV..]), bits(&qa), "wq_a rows across the seam");
+    assert_eq!(
+        bits(&serial_fold(&x, &wf, &sf, N_KV + N_QA, K, BLOCK)),
+        bits(&f),
+        "fused rows against the source-order fold"
+    );
 }
 
 // =======================================================================================
@@ -2158,7 +2221,8 @@ fn gpu_shared_expert(
     // is `[o_dim, i_dim]` e4m3 with a 128x128 f32 scale grid by `upload_fp8_shared`'s
     // contract. All five outlive the `device_sync` inside `sync_f32`.
     unsafe {
-        launch_v4_act_quant(xq.ptr_mut().cast(), 1, dim, dim, blk, st).expect("act_quant x");
+        launch_v4_act_quant(xq.ptr().cast(), xq.ptr_mut().cast(), 1, dim, dim, blk, st)
+            .expect("act_quant x");
         let xp = xq.ptr().cast::<f32>();
         launch_v4_gemv_fp8(
             xp,
@@ -2197,7 +2261,8 @@ fn gpu_shared_expert(
             st,
         )
         .expect("clamped swiglu");
-        launch_v4_act_quant(g.ptr_mut().cast(), 1, inter, inter, blk, st).expect("act_quant h");
+        launch_v4_act_quant(g.ptr().cast(), g.ptr_mut().cast(), 1, inter, inter, blk, st)
+            .expect("act_quant h");
         launch_v4_gemv_fp8(
             g.ptr().cast(),
             w[1].0.ptr(),

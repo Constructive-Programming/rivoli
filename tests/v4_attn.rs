@@ -756,6 +756,11 @@ impl Gpu {
             attn_sink: norms[2].ptr().cast(),
             wo_a: w[3].ptr(),
             wo_b: w[4].ptr(),
+            // None: every golden in this file scores the SPLIT path, so the harness
+            // stays on it. The fused path is scored against this one bit-for-bit by
+            // `the_fused_qkv_decode_is_bitwise_the_split_one`, which flips this field
+            // on a second instance.
+            wqkv: None,
         };
         let z = |n: usize| dev_f32(&vec![0.0f32; n]);
         let nhd = d.n_heads * d.head_dim;
@@ -779,8 +784,13 @@ impl Gpu {
             // compressed one: at prefill `sparse_attn` reads `torch.cat([kv, kv_compress])`
             // and the selection indexes that concatenation as ONE space, so the compressor's
             // blocks live in this buffer's tail. `Scratch`'s own doc states the rule and
-            // says nothing can check it.
-            kv: z((max_m + kind.compressor_ratio().map_or(0, |r| max_m / r)) * d.head_dim),
+            // says nothing can check it. `+ q_lora_rank` mirrors the engine's M10 slack: a
+            // fused decode writes `head_dim + q_lora_rank` floats at the base, and the
+            // fused-vs-split test drives THIS harness with `wqkv` set.
+            kv: z(
+                (max_m + kind.compressor_ratio().map_or(0, |r| max_m / r)) * d.head_dim
+                    + d.q_lora_rank,
+            ),
             o: z(max_m * nhd),
             y: z(max_m * d.o_groups * d.o_lora_rank),
             // `[window_size + max_seq_len/ratio, head_dim]`: the ring FIRST, then the
@@ -1163,6 +1173,99 @@ fn assert_stages(p: &Phase, got: &StepOut) {
     for (name, blame, v) in stages(got) {
         assert_within(blame, v, golden(p, name));
     }
+}
+
+/// The M10 fused qkv decode against the split path it replaces, BIT FOR BIT.
+///
+/// Two identical harnesses drive the same script; one carries [`Weights::wqkv`] — the
+/// `[wkv ‖ wq_a]` concat, kv rows first, scale grids stacked row-wise, built here from
+/// the same `WMat` bytes the split weights upload. The claim under test is `attn.rs`'s:
+/// the fused GEMV is the same kernel body over the same `k` at the same fold, so every
+/// readback and the persistent ring must match to the BIT — a tolerance here would wave
+/// through exactly the reassociation this lever is forbidden (M8 §"dead-as-designed").
+/// Both layer classes run, because the compressed decode is where a wrongly-landed q
+/// intermediate could collide with the cache tail.
+///
+/// Anti-vacuity is OBSERVED, not assumed: `s.qr` is poisoned before every decode step,
+/// and the fused instance must leave the poison intact (its q intermediate lives at
+/// `s.kv + head_dim`) while the split instance must destroy it. If the fusion gate ever
+/// quietly stopped selecting the fused path, the poison line fails before the bitwise
+/// lines get a chance to pass vacuously.
+#[test]
+fn the_fused_qkv_decode_is_bitwise_the_split_one() {
+    for mk in [Harness::new as fn() -> Harness, Harness::compressed] {
+        let mut split = mk();
+        let mut fused = mk();
+        let lw = &fused.model.layers[fused.layer];
+        let (
+            WMat::Fp8 {
+                rows: ko,
+                w: kw,
+                s: ks,
+                ..
+            },
+            WMat::Fp8 {
+                rows: qo,
+                w: qw,
+                s: qs,
+                ..
+            },
+        ) = (&lw.wkv, &lw.wq_a)
+        else {
+            panic!("toy wkv/wq_a are fp8");
+        };
+        assert_eq!(ko % 128, 0, "the seam must divide the scale block");
+        let cat = WMat::Fp8 {
+            rows: ko + qo,
+            cols: fused.cfg.dim,
+            w: [kw.as_slice(), qw.as_slice()].concat(),
+            s: [ks.as_slice(), qs.as_slice()].concat(),
+        };
+        let catbuf = Fp8Buf::new(&cat);
+        fused.gpu.weights.wqkv = Some(catbuf.ptr());
+        let poison = f32b(&vec![f32::MAX; fused.d.q_lora_rank]);
+        for (k, p) in split.clean.iter().enumerate() {
+            let decode = p.start_pos > 0;
+            if decode {
+                for g in [&mut split.gpu, &mut fused.gpu] {
+                    g.qr.copy_in_at(0, &poison).expect("poison qr");
+                }
+            }
+            let a = split.gpu.step(&split.d, p);
+            let b = fused.gpu.step(&fused.d, p);
+            if decode {
+                let survived = |g: &Gpu| {
+                    read(&g.qr)[..fused.d.q_lora_rank]
+                        .iter()
+                        .all(|v| *v == f32::MAX)
+                };
+                assert!(
+                    survived(&fused.gpu) && !survived(&split.gpu),
+                    "step {k}: the fused instance must skip `s.qr` and the split one \
+                     must write it — the fusion gate did not select as built"
+                );
+            }
+            for (va, vb) in a.v.iter().zip(&b.v) {
+                assert_eq!(bits32(va), bits32(vb), "step {k} ({})", p.tag);
+            }
+            assert_eq!(
+                bits32(&a.compressed),
+                bits32(&b.compressed),
+                "step {k} compressed blocks"
+            );
+        }
+        assert_eq!(
+            bits32(&read(&split.gpu.ring)),
+            bits32(&read(&fused.gpu.ring)),
+            "persistent ring after the full script"
+        );
+    }
+}
+
+/// `to_bits`, so the assert above is equality of BYTES and prints the first index that
+/// differs rather than a float that rounds identically in Debug.
+fn bits32(v: &[f32]) -> Vec<u32> {
+    v.iter().map(|x| x.to_bits()).collect()
 }
 
 /// `sparse_attn` alone, driven from the oracle's own `.q` and `.kv_entry`.
@@ -1798,9 +1901,19 @@ fn the_c_abi_argument_guards_reject_out_of_domain_shapes() {
         // "matches the oracle" and the output says "argument guard rejected". One guard,
         // one assertion.
         guard(
-            launch_v4_act_quant(pm, 1, 64, 60, 64, std::ptr::null_mut()),
+            launch_v4_act_quant(pm, pm, 1, 64, 60, 64, std::ptr::null_mut()),
             "1004",
             "a ragged quantization span",
+        );
+        // A quant-FROM-SOURCE (`src != dst`) at partial width would leave dst's row
+        // tails holding stale bytes where the copy it replaces filled them (M10).
+        // `p`/`pm` alias one buffer — deliberately, for every case above — so the
+        // distinct-pointer arm needs an offset dst; `wrapping_add` because the guard
+        // rejects before any dereference, so the address only has to differ.
+        guard(
+            launch_v4_act_quant(p, pm.wrapping_add(64), 1, 128, 64, 64, std::ptr::null_mut()),
+            "1002",
+            "a partial-width quant-from-source",
         );
     }
 }
@@ -1971,8 +2084,18 @@ fn act_quant_matches_the_oracle_on_the_subnormal_ties_that_pick_the_rounding_rul
     let mut buf = dev_f32(&row);
     // SAFETY: `buf` is one row of BLOCK f32 and outlives the sync below.
     let stream = HipStream::new().expect("hip stream");
-    unsafe { launch_v4_act_quant(buf.ptr_mut().cast(), 1, BLOCK, BLOCK, BLOCK, stream.raw()) }
-        .expect("v4_act_quant");
+    unsafe {
+        launch_v4_act_quant(
+            buf.ptr().cast(),
+            buf.ptr_mut().cast(),
+            1,
+            BLOCK,
+            BLOCK,
+            BLOCK,
+            stream.raw(),
+        )
+    }
+    .expect("v4_act_quant");
     device_sync().expect("sync");
     let got = read(&buf);
     // Bit-exact, not within a tolerance: `act_quant` is comparisons, a power-of-two
