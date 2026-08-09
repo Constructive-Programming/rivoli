@@ -1769,6 +1769,36 @@ binary and the test harness. The CLI exits 1 printing usage, which is what the f
 recorded. Every harness is now proved a harness by `--list` enumerating tests before it is
 believed — 33 for `v4_oracle`, and the exit code read directly, never through a pipe.)
 
+**A regression test is OWED, and this A/B is not a substitute for it.** Review before the
+device found that **no test in the tree executes the unrolled body**: `V4Config::toy` is
+`dim 256`, and `WAVE * 8 = 256`, so `dot_f4_wave_r`'s dword path runs exactly ONE trip —
+`every_byte_pattern_decodes_right_in_both_dot_paths` asserts that geometry on purpose — and at
+one trip `#pragma unroll 2` executes only the *remainder* copy. `moe_down_f4` at `inter 128`
+never enters the fast path at all. So `v4_kernel` 27/27 is **vacuous with respect to this
+change**, exactly as that test's own comment predicted ("the coverage claim is about byte
+POSITIONS, not loop trips … netted by the A/B's byte-identical gate at the real multi-iteration
+dims"). The A/B below IS that netting for THIS edit — 16 trips on gate/up, 8 on down, 512 real
+decode tokens under the reply-md5 gate — but it protects nothing against the NEXT edit.
+
+Correcting my own earlier report: **`tests/v4_oracle.rs` 33/33 is not evidence here.** That
+file has zero references to `launch_`, `DeviceBuf` or the `rocm` feature — it is a host-only
+test of the reference implementation and would pass with the kernel deleted. It was run and it
+passed on both trees, and it says nothing about HIP codegen. `the_fp4_dispatch_hash_pins_the_
+clamp_hoist` does not close the gap either: it deliberately PRINTS its hash rather than
+asserting one, and it is fixed at one trip by the same toy geometry.
+
+**The test that would close it**, registered here so it is not lost: run the fp4 expert range
+at **`hidden = 1280`, `inter = 1024`** against `Oracle::expert`. Both are whole
+`ACT_QUANT_BLOCK`s so the launcher accepts them, and the trip counts are **5 and 4** — the
+first exercises a full unrolled group PLUS the remainder, the second a clean group with no
+remainder, **at either depth**. *(The first shape registered here was 768/512 = 3 and 2 trips.
+Review caught it before it was written: LLVM emits an epilogue remainder, so at `unroll 4` the
+main loop would run `floor(3/4) = floor(2/4) = 0` times and the test would be vacuous for
+exactly the reason `toy` is vacuous today — a regression test that cannot execute the body it
+exists to pin.)* `launch_moe_expert_range_f4` takes `hidden`/`inter` at runtime and `WMat::Fp4`
+carries its own `rows`/`cols`, so this needs a second `V4Config` and `toy::build`, not a resized
+toy (which would void the byte-position coverage claims the existing tests assert on).
+
 **Registered bands, off the 106.8 ms/token class, n = 2 per side, `|Δ| < 3` replicates:**
 
 | arm | Δwall band | point |
@@ -1782,6 +1812,16 @@ believed — 33 for `v4_oracle`, and the exit code read directly, never through 
   2538 raw decode misses, both split identities (ATTN resid within ±0.05, MOE resid ≥ 0), prompt
   md5 `bc71afa745d980be7d21860f70ad96aa` (verified 218-token text, 1065 chars). **Checked BEFORE
   any span is read**, as every round since M5.
+- **Blast radius, verified by compiling all 11 kernel files stock-vs-patched:** only `moe.o`
+  changes, and inside it only `moe_gateup_f4` and `moe_down_f4`. `v4indexer` is BYTE-IDENTICAL,
+  so M3c's `e2m1f`-via-`fp4_quant_roundtrip` inlining note does not bite here. **The A/B has no
+  other moving bucket in the kernel image** — a span that moves and is not `res` needs another
+  explanation.
+- **Read `gpu shared` and `sync2` on the C2 arm, not just `res`.** At `unroll 4`
+  `moe_gateup_f4` needs 144 VGPRs allocated per wave; the shared-expert fp8 chain has run on
+  its own stream since M7 and is concurrent with `res`, so lower co-residency headroom can move
+  a bucket the lever does not name. (No spill at either depth on either kernel — 0 scratch,
+  checked via `-Rpass-analysis=kernel-resource-usage`.)
 - **The tell to read explicitly:** if `gpu res` drops but the wall does not follow, that is M7's
   contention-relief mechanism — the saving landing in `sync2` instead of on the wall — and it is
   a FINDING, not noise. Both numbers get reported either way. `res` overlaps attention by

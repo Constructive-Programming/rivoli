@@ -401,6 +401,14 @@ __device__ __forceinline__ void dot_i4_wave_r(const float* __restrict__ v, int v
     int base = 0;
     if ((((size_t)row) & 3u) == 0) {
         const unsigned int* rw = (const unsigned int*)row;
+        // NOT unrolled, and that is a gap rather than a decision. `dot_f4_wave_r` below is
+        // the identical shape and M11 measured +17.7% on it from one `#pragma unroll 2`
+        // (benchmarks.md "V4 M11 fp4 resident-kernel round"): this loop drains in-body too,
+        // one iteration of loads in flight. It is left alone because NOTHING has measured it
+        // here — this is GLM's int4/hybrid-HOT resident path, with its own residency and
+        // batching behaviour, and unlike fp4 it instantiates R = 2 for speculative decode, so
+        // the register cost of the same pragma lands differently. Do not copy the fp4 number
+        // across; measure it. Registered as the next stretch in §M11.
         for (; base + WAVE * 8 <= dim; base += WAVE * 8) {
             int col = base + lane * 8;
             unsigned int w = rw[col >> 3];              // 8 nibbles = 8 consecutive columns
@@ -592,6 +600,41 @@ __device__ __forceinline__ void dot_f4_wave_r(const float* __restrict__ v, int v
     if ((((size_t)row) & 3u) == 0) {
         const unsigned int __attribute__((address_space(1)))* rw =
             (const unsigned int __attribute__((address_space(1)))*)row;
+        // Unrolled 2026-08-09 (M11). Un-pragma'd, this loop drained inside its own body
+        // (`s_waitcnt vmcnt(1)`/`vmcnt(0)` in-body) — ONE iteration of loads in flight, ever,
+        // which is M7's disease; `fp8_dot_strided` above was fixed for it and the exemption
+        // beside that pragma names `fp8_dot_strided_r`, so this loop was never in that
+        // conversation. `dot_bench v4res` MICROBENCHMARK at the engine's dims: 146.63 →
+        // 172.55 GB/s. Depth is what buys it — a ballast with the decode and every FMA
+        // removed buys only +12.8%, so the bound was never issue rate.
+        //
+        // A change that grows this body must re-read the ISA. Unroll 2 is 74 VGPR on
+        // `moe_gateup_f4` / 66 on `moe_down_f4` — inside the 96 granule at 16 waves/SIMD, with
+        // no headroom. Unroll 4 is FASTER in the microbench (195.27) and drops gate/up to 10
+        // waves; **both rungs are registered arms of an engine A/B and
+        // `docs/investigations/v4-decode-decomposition.md` §M11b decides between them on the
+        // engine wall, not this comment.**
+        //
+        // Fold order must stay the ascending-`base` sum, and this was READ OUT of the
+        // compiler rather than argued: the device IR carries `contract` (FMA fusion, which
+        // stock already relies on) but **zero `reassoc`/`fast`/`nnan`** at stock, unroll 2 and
+        // unroll 4; each accumulator stays a SINGLE serial fadd chain terminating at the loop
+        // phi — exactly two float phis in the loop header at all three depths, no partial-
+        // accumulator split — and the chain is `phi + t(base) + t(base+256) + …`, ascending.
+        // The epilogue remainder chains off the main loop's exit values, so it continues the
+        // same order. `-ffast-math` is absent (`build.rs`), but `-ffp-contract=fast` is clang's
+        // HIP default, which is why this was read and not assumed
+        // (`tests/v4_kernel.rs::the_fp4_dispatch_hash_pins_the_clamp_hoist` records that
+        // lesson).
+        //
+        // **What does NOT check it:** at `V4Config::toy` this path runs ONE trip
+        // (`hidden 256` = one 256-column iteration), so `unroll 2` executes only the remainder
+        // copy and **no test in the tree executes the unrolled body**. A multi-trip oracle
+        // test is owed — §M11b records its design and the trip counts it needs. The remainder
+        // is unreachable at the engine's dims but IS reachable in principle: the launcher
+        // guards `% ACT_QUANT_BLOCK` (128), not 256, so a conforming dim like 1152 or 3712
+        // gives an odd trip count.
+#pragma unroll 2
         for (; base + WAVE * 8 <= dim; base += WAVE * 8) {
             int col = base + lane * 8;
             unsigned int w = rw[col >> 3];             // 8 nibbles = 8 consecutive columns
