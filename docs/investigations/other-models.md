@@ -57,6 +57,37 @@ was removed outright. Left alone deliberately; see "what we did not build" below
 
 `moonshotai/Kimi-K3`, `model_type: kimi_k3`, 2.78T total / 104.2B active.
 
+> **SUPERSEDED 2026-08-09.** K3 is now a committed port with its own plan
+> (`k3-port.md`) and an extracted forward pass (`reference/k3-architecture.md`), both
+> written from the C reference at `ff11dce` which did not exist when this section was
+> written. **Five of §2's claims move**, and the error in each was the same: §2 reasoned
+> about what rivoli would have to *build* and never about what it would cost to *run*.
+> Nothing below is deleted — what it ruled out is still worth reading.
+>
+> 1. **The four walls missed the one that matters.** `num_experts_per_token: 16` appears
+>    nowhere in §2. Top-16 of 896 at 17.55 MB each over 92 layers is **25.83 GB/token** of
+>    expert reads — 18× GLM — plus a 113.49 GB bf16 trunk. That, not capacity, is what
+>    decides how K3 runs.
+> 2. **"the attention is not (yet)" is half wrong.** The 24 full-attention layers are
+>    MLA + q-LoRA (`q_lora_rank 1536`, `kv_lora_rank 512`, 96 heads) — GLM-5.2's own family,
+>    which `mla.hip` already serves. Only the 69 KDA layers are a new kernel family. §2's own
+>    framing ("rivoli is MLA-with-q-LoRA and nothing else") was the evidence, read as a
+>    limitation rather than a match.
+> 3. **"MXFP4 … cannot read this checkpoint at all" is true of the converter, false of the
+>    engine.** §2 predates the V4 port's `.f4`. The *value* encoding is identical —
+>    E2M1 nibbles × one E8M0 per 32, low nibble even — so the experts are a **repack, not a
+>    requantization**. The containers still differ.
+> 4. **Capacity was priced at the wrong bitrate.** §2's 1.03 TiB is the int3-vq figure. At
+>    the native MXFP4 actually chosen it is **1.415 TiB**, and deleting GLM *and* V4 frees
+>    only 1.223 TiB — short by ~197 GiB. Worse than §2 concluded, not better. But
+>    `/swarm/storage` has 7.7 TiB, so conversion and a correctness run are not blocked.
+> 5. **`num_shared_experts: 2` is not the artifact-format change §2 expected.** The two are
+>    **one fused wider MLP** at full hidden width, intermediate 6144, stored **bf16 and
+>    resident** — so `.f4` needs no shared block at all, exactly as it needs none for V4.
+>
+> §2's `n_group`/`topk_group` and `text_config` observations stand. Its bitrate table stands
+> as arithmetic but is moot: the port keeps native fidelity.
+
 > **CORRECTED 2026-08-03, same day.** This section first said "REFUSED, does not fit".
 > That conflated *disk capacity* with *bitrate*: the artifact does not fit **at int3-vq's
 > 3.25 bits/weight**, which is not a floor. Unsloth ships a dynamic low-bit K3 build at

@@ -1,7 +1,7 @@
 ---
 scope: k3
 status: live
-verdict: The implementation plan for Kimi-K3 — a required capability, not a candidate. Six stages behind six correctness gates; every gate is a hard stop that must be MET before the next stage begins, and every gate must be proven able to go red before it is trusted green. Ground truth from the shipped config and the C reference: 93 layers (69 KDA + 24 gated MLA, NoPE), 896 experts top-16, 2 shared, MXFP4 group 32. Reuse is real but narrower than it looks — the .f4 VALUE encoding transfers bit-identically (E2M1 + one E8M0 per 32) but the containers differ and .f4 carries no shared block; SiTU-GLU is FUSED inside moe.hip's fp4 expert kernel so that path is a new variant, not a swap; the trunk dtype is unknown and rivoli's resident path is fp8-only. Only the 69 KDA layers are a wholly new kernel family. Traffic is 25.83 GB/token of expert reads, PROVISIONAL on the unresolved 3584 routed-expert width (34.4 if down_proj targets hidden 7168); the trunk-miss model is OPEN, contradicted by its own arithmetic. Predicted ~0.27 tok/s with the trunk resident, which is the only allocation rivoli can currently express. S0-S3 run on 8.9 MB of fixtures, S4 converts and decodes real weights on /swarm's 7.7 TiB, S5 needs ~197 GiB more NVMe than an empty pool provides.
+verdict: The implementation plan for Kimi-K3 — a required capability, not a candidate. Six stages behind six correctness gates; every gate is a hard stop that must be MET before the next stage begins, and every gate must be proven able to go red before it is trusted green. S0 IS DONE (2026-08-09, reference pinned at ff11dce) and G0 is MET but for one item; the extracted forward pass is now reference/k3-architecture.md. S0 overturned four of this plan's own claims: a bf16 GEMV ALREADY EXISTS (v4_dense_gemm_bf16, already V4's lm_head), resident.safetensors already accepts Bf16, the .f4 shared-block work is VOID because K3's two shared experts are ONE fused bf16 resident MLP, and the fp4 kernels are already width-parametric so the latent is a Rust-binding change. It added one Tier-1 blocker the plan never named: SafeWriter holds every resident tensor in host RAM until write, and the 113.49 GB bf16 trunk does not fit. 25.83 GB/token STANDS — the width resolved to a latent sandwich (7168 down to 3584, experts at 3584, up to 7168), refuting the 34.4 alternative. Newly discovered and unplanned: Block Attention Residuals, a multi-residual-stream softmax mixture over 8 snapshots, and KDA's short causal conv with fused SiLU. Only the 69 KDA layers are a wholly new kernel family. Predicted ~0.27 tok/s with the trunk resident, which leaves only ~10 GB, so the expert arena is effectively zero. The trunk-miss model stays OPEN: O_DIRECT is confirmed, yet two rungs still decode below their own bandwidth floor. S1-S3 run on 8.9 MB of fixtures, S4 converts and decodes real weights on /swarm's 7.7 TiB, S5 needs ~200 GiB more NVMe than an empty pool provides.
 ---
 
 # Kimi-K3 — implementation plan
@@ -40,7 +40,7 @@ Target: `moonshotai/Kimi-K3`, text-only. 93 layers, 2.78T total / 104.2B active.
   bandwidth floor, so "the trunk is re-read every token" is not established. Trunk *sizes*
   are sound; trunk *rates* are not. S0 resolves it. §4.
 - **S4 is not blocked.** `/swarm/storage` has 7.7 TiB, enough to convert and run real weights.
-  Only S5's throughput and residency work needs the ~197 GiB of NVMe that does not exist. §5.
+  Only S5's throughput and residency work needs the ~200 GiB of NVMe that does not exist. §5.
 
 ## G. The gate model
 
@@ -177,7 +177,14 @@ alone will watch the dense path go right and every routed expert stay wrong — 
 fluent-wrong-text class §G rule 3 exists to catch. `linalg.hip` also needs the SiTU form for
 dense layer 0 and the shared experts, so **both** paths change.
 
-### 3c. The trunk's dtype is unknown and the resident path is fp8-only
+### 3c. The trunk's dtype — RESOLVED, and this section was wrong
+
+> **CORRECTED 2026-08-09 by S0.** The trunk is **bf16, 113.49 GB**. And the conclusion below
+> is **false**: `kernels/v4compress.hip:82` `v4_dense_gemm_bf16` is a working bf16 GEMV,
+> already V4's lm_head and already through the ABI wall, and `resident.safetensors` already
+> accepts `Dtype::Bf16`. The trunk GEMV is a **performance** problem, not a new kernel family
+> — see "What G0 changed". The paragraph below is kept for the inventory, which is accurate
+> about `linalg.hip` and `mla.hip` and was simply not the whole tree.
 
 `mla.hip` ships `mla_absorb_fp8`, `mla_value_fp8`, `v4_gemv_fp8`. `linalg.hip` ships
 `gemv_fp8`, `gemv_fp8_splitk`, `gemv_vq`, `gemv_f32`, `gemv_i8`, `gemv_i4` — **no fp4 and no
@@ -185,11 +192,20 @@ bf16 GEMV**. `artifact/format.rs` describes `resident.safetensors` as fp8 attn/d
 embed, f32 norms; `model.rs` hard-refuses anything but `e4m3` + `ue8m0` at `[128, 128]`.
 
 K3's quantization is group-32 along the input dim, not a 128×128 tile, and an INT8 trunk at
-~54.4 GB against 108.81 GB implies 2 B/param, i.e. bf16. Either way the 24 MLA layers, the 69
+~56.7 GB against 113.49 GB implies 2 B/param, i.e. bf16. Either way the 24 MLA layers, the 69
 KDA layers, the dense layer and a 163,840-row head need a trunk GEMV family that does not
 exist here. **S0 settles this**; it is the largest unpriced item in the plan.
 
-### 3d. `.f4` has no shared block
+### 3d. `.f4` has no shared block — and that is already CORRECT for K3
+
+> **CORRECTED 2026-08-09 by S0. This entire work item is VOID.** K3's two shared experts are
+> one fused bf16 MLP living in `resident.safetensors`, so `.f4` carrying exactly `n_experts`
+> blocks is already right. `has_shared()` does not become a count, `shared_block` does not
+> gain a range, and none of the three `n_shared` assertions need lifting — `model.rs:673` is
+> `V4Config::validate` and `gpu.rs:845` is GLM's `GpuEngine`, neither of which K3 reaches.
+> What survives is one **new** guard: `top_k * rows + n_shared <= MAX_BATCH` exists only on
+> GLM's `Pin::build` (`pin.rs:338`), and K3 at top-16 sits at exactly 32 of `MAX_BATCH = 32`
+> at two rows. Write it for K3 rather than inheriting V4's gap.
 
 The `n_experts + 1` layout belongs to `.vq3` and `.i4`. `format.rs:1190` sizes files as
 `hbytes + (n_experts + usize::from(has_shared)) * stride`, where `has_shared()` (`:1048`) is a
@@ -249,7 +265,7 @@ rungs — either budget competition with the trunk, or a threshold effect (23.59
 gives 0.0% while 36.39 GB gives 29.9%, which no smooth curve produces).
 
 **Design consequence:** hold the trunk, and do not size the expert arena expecting it to earn
-its keep. That follows from bytes alone — the trunk is 108.81 GB every token needs in full,
+its keep. That follows from bytes alone — the trunk is 113.49 GB every token needs in full,
 while at 2.5–7.5% residency the cache returns a fraction of 25.83 GB. It does **not** follow
 from the reference's `s/tok` column, which §4b disqualifies.
 
@@ -260,8 +276,8 @@ puts two rungs **below** the bandwidth floor, which is impossible:
 
 | rung | expert GB | trunk miss GB | total | floor @3.2 GB/s | measured |
 |---|---:|---:|---:|---:|---:|
-| 8 GB | 25.83 | 108.81 | 134.64 | **42.07 s** | 32.69 s |
-| 96 GB | 18.11 | 64.74 | 82.85 | **25.89 s** | 24.40 s |
+| 8 GB | 25.83 | 113.49 | 139.32 | **43.54 s** | 32.69 s |
+| 96 GB | 18.11 | 67.53 | 85.64 | **26.76 s** | 24.40 s |
 
 Most likely explanation, unverified: the reference's host has **228 GiB of RAM** and the
 ladder caps the *application's* arena, not the OS page cache — so a trunk the app records as
@@ -271,7 +287,7 @@ if that is the cause, none of the reference's trunk *rates* transfer.
 | claim | status |
 |---|---|
 | 25.83 GB/token of expert reads | stands (provisional on §2's width) |
-| trunk is 108.81 GB and must be held or fetched | stands — a size, not a rate |
+| trunk is 113.49 GB and must be held or fetched | stands — a size, not a rate |
 | trunk is re-read in full every token when not resident | **OPEN** |
 | ~0.27 tok/s with the trunk resident | stands — trunk traffic is zero there |
 
@@ -293,7 +309,7 @@ bump-allocated, filled once, freed as a unit) and a `RoutedPool` for streamed **
 only** (`src/memory/routed.rs:234`). Nothing streams trunk weights; there is no partial trunk
 pin. The reference's "27 pinned layers / trunk hit 25.4%" rows are not expressible here.
 
-**Budget check.** The device budget is ≈115 GiB of 116 GiB GTT, and 108.81 + 14.7 = 123.5 GB
+**Budget check.** The device budget is ≈115 GiB of 116 GiB GTT, and the 113.49 GB trunk leaves ≈10.0 GB
 spends all of it before the 626 MB KDA state, the 24 MLA layers' KV slabs at up to 1,048,576
 positions, the layer-major residual stream, activation scratch, io_uring registered buffers,
 and `OS_RESERVE = 16 << 30`. **S5's registered band must come from a budget with those already
@@ -303,13 +319,13 @@ subtracted**, or it is unreachable by construction.
 
 ```
 experts   2,722,740,830,208 params × 0.53125 B = 1.4465 TB = 1.3155 TiB
-trunk                                108.81 GB =            0.1013 TiB
+trunk (bf16)                         113.49 GB =            0.1032 TiB
                                                  ─────────────────────
-total                                1.555 TB  =            1.415 TiB
+total                                1.560 TB  =            1.419 TiB
 ```
 
 Pool measured 2026-08-09 (`btrfs fi usage /`): **1.69 TiB total, 431.72 GiB free**, with GLM
-at 675 GiB and V4's `.f4` at ~146 GiB. Deleting both frees 1.223 TiB — still **197 GiB short**.
+at 675 GiB and V4's `.f4` at ~146 GiB. Deleting both frees 1.223 TiB — still **200 GiB short**.
 
 **`/swarm/storage` has 9.8 TiB with 7.7 TiB available** (`df`, 2026-08-09), so the artifact can
 be stored and converted today. It is NFS at a measured 154 MB/s, so streaming 25.83 GB/token
@@ -318,7 +334,7 @@ across it is ~168 s/token — fine for a bounded correctness run, useless for th
 | work | where | blocked? |
 |---|---|---|
 | convert, verify byte accounting, real-weight correctness run | `/swarm` | **no** |
-| throughput measurement, residency study | NVMe | **yes** — needs ~197 GiB |
+| throughput measurement, residency study | NVMe | **yes** — needs ~200 GiB |
 
 Fidelity is native MXFP4, decided at planning time. int3-vq requant would be lossy-on-lossy on
 already-4-bit weights (`int4-scales.md` records that chain at PPL 73.43), and lower-bitrate VQ
@@ -361,6 +377,83 @@ Every item above has a recorded answer **and its source**, in a table with no un
 Items 1, 3 and 4 additionally carry the code path they imply, because each changes what S1a
 and S2 build rather than merely what they assume.
 
+### G0 — RESULTS, 2026-08-09. MET except item 7.
+
+Reference pinned at **`ff11dce858a2eb8a781224facdffd33a1fa48d25`** (2026-08-07, "Release
+v1.0.0: verified end to end"). The extracted forward pass is now
+**`docs/reference/k3-architecture.md`**; this table records the answers and what each changes.
+
+| # | question | answer | source |
+|---|---|---|---|
+| 1 | 7168→3584 | **A latent sandwich.** MoE routes on full width, `down` 7168→3584, experts run at 3584, RMSNorm the **aggregate**, `up` 3584→7168. `routed_expert_hidden_size = latent = 3584` | `k3_ops.c` `k3_moe`; `k3.h` `K3Cfg` |
+| 2 | layer map | **Two explicit arrays**, `full_attn_layers` (24) + `kda_layers` (69) = 93. No inference needed. Zero-based MLA = 3,7,…,87,**91,92** — the last two adjacent | `config.json` `linear_attn_config`; `k3_is_mla` |
+| 3 | trunk dtype | **bf16 (`uint16_t`), 113.49 GB** — not 108.81 | `k3.h` storage summary; `wdt` = `K3_WBF16` |
+| 4 | shared experts | **ONE fused wider MLP** at full hidden 7168, intermediate `moe_inter*n_shared` = 6144, **bf16 and resident**, added **unweighted after** the up-projection. Not MXFP4, not streamed, not two MLPs | `k3_ops.c` `sh1/sh3/sh2`; `k3_bind.c` |
+| 5 | nibble order | **Low nibble = even element** ✓ matches rivoli. Bias 127. **But `sb == 255` → ZERO in the reference**, where rivoli returns NaN and the converter bails | `k3_ops.c` MXFP4 decode vs `common.hpp:549`, `quant.rs:748` |
+| 6 | vocab | **163,840**, no tied embeddings (`embed_tokens.weight` and `lm_head.weight` are separate) | `config.json`; `k3_bind.c` |
+| 7 | trunk re-read / O_DIRECT | **PARTIAL — see below** | `k3_portable_io.h` |
+| 8 | pin the reference | SHA above; the ladder and `trunk-cache-split.tsv` still to vendor | GitHub API |
+| 9 | correct `other-models.md` §2 | done, dated note in place | — |
+
+**Item 7 is not met and stays open.** The reference **does** use `O_DIRECT` on Linux for both
+trunk and expert reads, with a documented buffered fallback if it fails. That *weakens* the
+page-cache explanation §4b offered for the sub-floor contradiction without resolving it — two
+rungs still decode faster than a 3.2 GB/s floor allows. The leading remaining hypothesis is
+that **3.2 GB/s is a single-stream figure** the parallel reader beats. **S5's registered band
+must not be derived until this is settled**; nothing before S5 depends on it.
+
+### What G0 changed
+
+**In rivoli's favour — three plan claims were wrong:**
+
+- **§3c is FALSE: a bf16 GEMV already exists.** `kernels/v4compress.hip:82`
+  `v4_dense_gemm_bf16` computes `out[m,n] = x[m,k] · w[n,k]ᵀ` for f32 activations against bf16
+  weights, and is already V4's lm_head (`v4gpu.rs:2204`) and its compressor GEMV
+  (`v4gpu.rs:320`), already through the ABI wall (`hip.rs:993`). The trunk GEMV is **not a new
+  kernel family** — it is a *performance* problem, because its inner loop
+  (`v4compress.hip:96`) is one wave per output element with scalar u16 loads. At 113.49 GB of
+  trunk per token that loop **is** the decode. The correct kernel exists and is a free
+  correctness oracle for the fast one.
+- **`resident.safetensors` already accepts bf16.** `Dtype::Bf16` is in the closed enum
+  (`format.rs:99`), `copy_verbatim` already writes it, and `convert_v4.rs:226` already emits
+  bf16 `embed`/`head`. The `e4m3`/`ue8m0`/`[128,128]` refusal is a **`V4Config::validate`
+  check** (`model.rs:766-781`), not a resident-file check — `K3Config` simply never writes it.
+- **§3d's `.f4` shared-block work is VOID.** `has_shared()` returns `false` for `F4`
+  (`format.rs:1048`) and `.f4` is exactly `n_experts` blocks — which is **already correct** for
+  a resident bf16 shared expert. `has_shared` does not become a count and `shared_block` does
+  not gain a range. Nor do the three `n_shared` assertions need lifting: `model.rs:673` is
+  `V4Config::validate` and `gpu.rs:845` is GLM's `GpuEngine`, and K3 reaches neither.
+- **The fp4 kernels are already width-parametric.** `moe.hip:300` takes `hidden` and `inter`
+  as runtime arguments and derives the row stride and dot `dim` from them, so passing 3584
+  is correct as written. `ACT_QUANT_BLOCK=128` divides both 3584 and 3072 — checked.
+
+**Against — one new Tier-1 blocker the plan never named:**
+
+- **`SafeWriter` holds every resident tensor in host RAM until `write`.**
+  `format.rs:148-154`: `tensors: Vec<(String, Dtype, Vec<usize>, Vec<u8>)>`, serialised only at
+  the end, sized for "the resident set is ~10 GiB". **A 113.49 GB bf16 trunk does not fit on a
+  128 GB machine.** `convert_k3` cannot exist until `SafeWriter` becomes a two-pass streaming
+  writer. The reader is fine — `open_dir` mmaps.
+
+**And the budget is tighter than §4c said.** At the corrected 113.49 GB trunk against ≈123.5 GB
+of device budget, the residual is **≈10.0 GB** for the KDA state, 24 layers of MLA KV, the
+residual stream, scratch, io_uring buffers and `OS_RESERVE`. The expert arena is **effectively
+zero**, which turns §4a's "do not expect the arena to earn its keep" into "there is no arena".
+The ~0.27 tok/s prediction is unchanged — it already assumed ~0% expert hit.
+
+**Architecture the plan did not know about**, all now in `k3-architecture.md`:
+**Block Attention Residuals** (a multi-residual-stream scheme: 8 snapshots at zero-based
+layers 0,12,…,84, mixed by softmax over ≤9 sources, twice per layer plus once model-level —
+a new small kernel and a `[T][9][7168]` stack live across the layer loop); **KDA's short causal
+convolution** (k=4, depthwise, SiLU fused, with its own `[P][3]`×3 state); the full delta-rule
+recurrence and its `[96][128][128]` fp32 state; **MLA's softmax scale over 192**, its
+unrotated-but-scored rope dims, and its gate-without-norm; the router's unbiased combining
+weights; and SiTU-GLU's exact form.
+
+**25.83 GB/token STANDS.** Item 1 resolved the width against the *latent*, not `hidden` —
+`down_proj` maps 3072→3584, so an expert is `3 × 3584 × 3072` and the 34.4 GB/token
+alternative is **refuted**.
+
 ## S1 — foundation. No GPU.
 
 ### S1a — artifact: config, `Arch`, naming, `.f4`
@@ -374,14 +467,37 @@ Owns `src/artifact/{model,config,format,quant}.rs`, `src/arch.rs`, and a convert
    `num_experts_per_token` / `num_shared_experts`). Absent fields are **optional behind an
    explicit architecture discriminant**, never defaulted to 0 — a default that yields a
    runnable-looking config is the failure to avoid.
-3. **Shared experts** per §3d: `has_shared` bool → count, `shared_block` → range, three
-   `ensure!` sites plus the rejection test. Gated on S0.4.
-4. `.f4` repack for K3 experts, per §3a.
-5. **Refuse the absence of `rope_theta`** rather than defaulting a rotation table (§3e).
-6. Converter binary: V4 shipped `src/bin/convert_v4.rs` alongside `convert.rs` rather than
+3. **`SafeWriter` must become streaming.** *(Tier 1, added by S0, blocks everything.)*
+   `format.rs:148-154` holds every resident tensor as `Vec<u8>` until `write`, sized for a
+   ~10 GiB resident set. **113.49 GB does not fit in host RAM**, so `convert_k3` cannot exist
+   until this is a two-pass writer: compute the header and offsets, then stream bytes.
+   `write_atomic` (`:703`) takes `&[u8]` and needs the same.
+4. **Settle e8m0 `0xff` against K3's real scale tensors.** *(Tier 1, added by S0.)* The
+   reference maps 255 → **zero**; rivoli's `e8m0f` returns a quiet NaN (`common.hpp:549`) and
+   `quant.rs:748` **bails**. Scan K3's `.scale` tensors first. If no `0xff` appears, keep the
+   refusal — it is the stronger guarantee. If it does, host and device must change **together**
+   and `tests/v4_kernel.rs`'s bitwise sweep be re-pinned; changing one alone is a silent
+   host/device divergence that `moe_fixed`'s clamp launders into a finite ±2^14.
+5. **Thread `moe_latent` (3584) separately from `hidden` (7168).** *(Tier 1, added by S0.)*
+   The fp4 kernels are already width-parametric — `moe.hip:300` takes `hidden`/`inter` as
+   runtime arguments — so the work is entirely in what Rust binds. Ten sites, of which the
+   decode-loop ones are dangerous because a wrong value passes every length check:
+   `pin.rs:867` (arena row stride), `quant.rs:184` (`vq_expert_layout` → `[(3072,3584),
+   (3072,3584), (3584,3072)]`), `quant.rs:777`/`:1037`, `format.rs:520`/`:1244`,
+   **`v4gpu.rs:1540`** (MoE dispatch), **`v4gpu.rs:1111`** (the fixed-point accumulator must be
+   latent-wide), `v4gpu.rs:1789`/`:1843`, `model.rs:143` (`ensure_group_aligned`).
+6. `.f4` repack for K3 experts, per §3a.
+7. **Refuse the absence of `rope_theta`** rather than defaulting a rotation table (§3e).
+8. Converter binary: V4 shipped `src/bin/convert_v4.rs` alongside `convert.rs` rather than
    extending it. Follow that. Establish what format the reference's tiny model is stored in —
    rivoli's converters read HuggingFace safetensors, and a C reference's fixture may be its own
    layout, in which case a reader is needed here.
+9. `Arch::KimiK3` plumbing is narrow and every `Arch` match is exhaustive, so omissions are
+   compile errors: `arch.rs` (variant + six arms + a both-directions recogniser test),
+   `model.rs` (`K3Config` + `impl ArchConfig`), `main.rs:979` (dispatch + `run_k3`),
+   `lib.rs` (`pub mod k3gpu`), `src/bin/convert_k3.rs` (auto-discovered, no `Cargo.toml`
+   edit). Note `tests/kernel_coverage.rs` is **not** feature-gated and fails the build for any
+   new `launch_*` without an oracle.
 
 Tokenizer work (tiktoken → `tokenizers` form, and a third hand-ported `encode_k3` chat
 template — `tokenizer.rs` carries no Jinja engine) is **deferred to S4**, where the first real
@@ -431,21 +547,47 @@ recurrence first.
 
 ## S2 — kernels. Each item gates before the next starts.
 
-**Order: MLA → SiTU-GLU/MoE → KDA.** MLA first because it is the only one checkable against a
-path already known to work.
+**Order: AttnRes → MLA → latent sandwich → SiTU/MoE → KDA.** Structural and cheapest first;
+MLA before KDA because it is the only one checkable against a path already known to work.
 
-1. **Gated MLA** — `mla.hip` with RoPE removed. The **gate is new kernel work inside
-   `mla.hip`**, not a parameter. Watch `gpu.rs:931`'s exact-512 `kv_lora_rank` cap.
-2. **SiTU-GLU + fp4 MoE** — per §3b, a new `moe_gateup_f4` variant plus its `_r2` twin,
+Specifications for all of these are in **`docs/reference/k3-architecture.md`**, whose §10
+lists twelve order-of-operations traps. **Each trap is a G2 defect-run candidate** — every one
+of them runs cleanly and produces a wrong model.
+
+1. **AttnRes** (`k3-architecture.md` §3) — *added by S0; the plan did not know this existed.*
+   A ≤9-source softmax mixture over a residual snapshot stack, twice per layer plus once
+   model-level. Arithmetically trivial (~24 Mflop/token); the work is keeping `[T][9][7168]`
+   live across the layer loop. First, because it is structural — every later gate runs inside
+   it.
+2. **Gated MLA** — `mla.hip` with RoPE removed but the 64 rope dims **still cached and still
+   scored**, softmax scale over **192** not `qk_nope`, and the output gate applied **before
+   `o_proj` with no norm** (the opposite of KDA's norm-then-gate). Watch `gpu.rs:931`'s
+   exact-512 `kv_lora_rank` cap.
+3. **The latent sandwich** — `down` 7168→3584 and `up` 3584→7168 as bf16 trunk GEMVs, plus an
+   RMSNorm on the **aggregate, never per expert**. `v4_rmsnorm` (`mla.hip:334`) is already
+   width-generic, so this is two GEMV launches and an existing kernel.
+4. **SiTU-GLU + fp4 MoE** — per §3b, a new `moe_gateup_f4` variant plus its `_r2` twin,
    launcher and guards; and the SiTU form in `linalg.hip` for dense layer 0 and the shared
-   experts.
-3. **KDA** (§3f) — the new family, and the bulk of the stage. Decode-path recurrence first;
-   prefill follows. **Decompose into units with their own G2 sub-gates** — 69 of 93 layers
-   with no prior art in this tree, and one gate at the end of it all is not a gate.
-4. **Router** — verify the sigmoid `Scoring` arm and that per-expert bias steers selection
-   only, not the weights. The reference's router fixture reorders its top-2 on 5 of 6 rows
+   MLP. Exact form and the `b1*b2 = 100` cap in `k3-architecture.md` §8.
+5. **KDA** (`k3-architecture.md` §4) — the new family and the bulk of the stage. Short causal
+   conv k=4 with **fused SiLU** and its own `[P][3]`×3 state; L2Norm on q and k only; the
+   per-head `A_log` / per-channel `dt_bias` split; the four-pass delta rule over a
+   `[96][128][128]` fp32 state. **Decompose into units with their own G2 sub-gates** — 69 of
+   93 layers with no prior art in this tree, and one gate at the end of it all is not a gate.
+   Heads are independent and the reference asserts head-parallel is bit-identical, so one
+   block per head maps directly — but `S` is 64 KB/head and will not sit in LDS, so **fusing
+   the four passes is the HIP win the C does not have**. No chunked prefill exists in the
+   reference; decode recurrence first.
+6. **Router** — sigmoid, bias on **selection only**, combining weights from the **unbiased**
+   score, renormalised over the 16. The reference's fixture reorders its top-2 on 5 of 6 rows
    specifically to catch an implementation that ignores the bias.
-5. **Trunk GEMV** — new work if S0.3 says the trunk is not fp8 e4m3 at `[128, 128]`.
+7. **Trunk GEMV, for speed.** *(Reframed by S0 — it is not a new family.)*
+   `v4_dense_gemm_bf16` is already correct and carries S2/S3 unchanged, so **score the fast
+   kernel against it — a free oracle V4 already paid for.** But its inner loop
+   (`v4compress.hip:96`) is one wave per output *element* with scalar u16 loads, and at
+   113.49 GB/token that loop is the whole decode. Needs 128-bit vectorized loads
+   (`common.hpp:517`'s `gu8p` pattern), grid-per-row rather than per-element, split-K on
+   `gemv_fp8_splitk_impl`'s shape (`linalg.hip:59`), and an `_r2` twin if K3 ever batches.
 
 **Sizing.** The comparable port is V4: `v4gpu.rs` 165 KB + `v4oracle/forward.rs` 117 KB +
 `dsv4_encoding.rs` 137 KB + `v4_attn.rs` 142 KB + `v4_kernel.rs` 125 KB ≈ 690 KB of roughly
@@ -500,7 +642,7 @@ the KDA gate sign — because its tensor graph matching the architecture does no
   longest-repeated-block — §G rule 3.
 - Output is deterministic across two runs of the same prompt.
 
-## S5 — throughput and residency. Blocked on ~197 GiB of NVMe.
+## S5 — throughput and residency. Blocked on ~200 GiB of NVMe.
 
 1. Register the predicted band in `benchmarks.md` **before** the first run, derived from a
    budget with the KDA state, KV, residual stream and scratch already subtracted (§4c). Score
