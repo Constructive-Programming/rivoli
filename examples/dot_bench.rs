@@ -11,13 +11,19 @@
 //! The `v4gemv` section (2026-08-08) measures `v4_gemv_fp8` serially at V4's seven decode
 //! shapes — the isolated kernel rate the M7 A/B record names as missing (its in-engine
 //! spans confound rate with exposure/contention; `docs/investigations/v4-decode-decomposition.md` §M8).
+//! The `v4res` section (2026-08-09) does the same for the fp4 routed experts' RESIDENT range
+//! — the `res` span, the engine's largest single bucket — and takes its working set as a
+//! parameter so the 32 MB MALL confound §M11 names first is measured rather than argued.
 //! Run: cargo run --release --features rocm --example dot_bench
 #![cfg(feature = "rocm")]
 #![allow(clippy::expect_used)]
-use rivoli::artifact::quant::{VQ_DIM, VQ_K, matvec_fp8, matvec_i4, quant_i4, quant_vq};
+use rivoli::artifact::quant::{
+    VQ_DIM, VQ_K, f4_groups, f4_row_bytes, matvec_fp8, matvec_i4, quant_i4, quant_vq,
+};
 use rivoli::backend::hip::{
-    attend_scratch_floats, device_sync, launch_argmax, launch_attend, launch_gemv_fp8,
-    launch_gemv_i4, launch_gemv_i8, launch_gemv_vq, launch_mla_absorb_fp8, launch_mla_value_fp8,
+    ExpertDescF4, attend_scratch_floats, device_sync, launch_act_quant_f8, launch_argmax,
+    launch_attend, launch_gemv_fp8, launch_gemv_i4, launch_gemv_i8, launch_gemv_vq,
+    launch_mla_absorb_fp8, launch_mla_value_fp8, launch_moe_acc_drain, launch_moe_expert_range_f4,
     launch_rmsnorm, launch_v4_gemv_fp8,
 };
 use rivoli::math::{f32_to_e4m3, f32_to_f16};
@@ -190,12 +196,24 @@ fn pattern(n: usize, mut byte: impl FnMut(f32) -> u8) -> Vec<u8> {
     v
 }
 
-fn report(name: &str, kind: &str, o_dim: usize, i_dim: usize, us: f64) {
-    let gbs = (o_dim * i_dim) as f64 / (us * 1e-6) / 1e9;
+/// One throughput row. `bytes` is the WEIGHT traffic the shape moves per launch — the
+/// denominator the byte bands in `docs/investigations/v4-decode-decomposition.md` price
+/// against, NOT a claim that every row is bounded by it (§M11's probe D measures the fp4
+/// row as drain-bound, with the activation making up 8/9 of its vector-memory requests).
+/// `shape` is free-form because the fp4 rows below are sized by an expert count rather than
+/// by an `o x i` pair. Returns the GB/s so a caller deriving a second figure from the same
+/// rate cannot compute it a second, silently divergent way.
+fn report_bytes(name: &str, kind: &str, shape: &str, bytes: usize, us: f64) -> f64 {
+    let gbs = bytes as f64 / (us * 1e-6) / 1e9;
     println!(
-        "{name} {kind} [{o_dim}x{i_dim}]  {us:8.1}us  {gbs:6.1} GB/s  ({:.0}% of 256)",
+        "{name} {kind} {shape}  {us:8.1}us  {gbs:6.1} GB/s  ({:.0}% of 256)",
         gbs / 2.56
     );
+    gbs
+}
+
+fn report(name: &str, kind: &str, o_dim: usize, i_dim: usize, us: f64) {
+    report_bytes(name, kind, &format!("[{o_dim}x{i_dim}]"), o_dim * i_dim, us);
 }
 
 /// The two BIG real shapes, throughput only. Separate from `run` because `run`
@@ -351,6 +369,229 @@ fn run_v4_gemv(name: &str, n_out: usize, k: usize) {
     );
 }
 
+/// 5.885 residents x 43 MoE layers — the expert-weight reads the engine's `res` span makes
+/// per token, which is what turns a rate here back into the ms/token §M11 scores. Kept as
+/// the two counts with the BYTE term taken from `f4_expert_bytes` at the print site: a baked
+/// 3.383 GB/token would carry an unpinned copy of the same 13.37 MB the GB/s denominator is
+/// pinned to, and would drift from the artifact silently.
+const V4_RES_EXPERT_READS_PER_TOKEN: f64 = 5.885 * 43.0;
+
+/// `rivoli_moe_expert_range_f4` at V4's real resident shape, serial — the isolated rate
+/// behind the engine's `res` span (§M11 probe A). The engine launches exactly this call
+/// ONCE per MoE layer for the layer's residents (M3b's boundary), so the unit timed here is
+/// the unit the span measures: gate/up, the `h` re-quantization, and down.
+///
+/// **`ranges` is the whole instrument.** gfx1151 has a 32 MB MALL and one layer's residents
+/// are only ~80 MB, so a probe that replays ONE range's weights gets partial cache service
+/// and overstates the rate, while the engine rotates ~3.4 GB of DISTINCT experts per token
+/// and never gets reuse. The caller runs this twice — at 14 ranges (1.12 GB, the engine's
+/// condition) and at 1 (the naive harness) — so the confound is MEASURED rather than argued.
+/// `run_v4_gemv` records the same effect on the fp8 side: 372 GB/s replaying one 33.5 MB
+/// buffer against 157 rotating four. The row prints its own working set in MB.
+///
+/// Returns the `e_start = 0` fingerprint so the caller can check the two arms agree — see
+/// `main`, where the expectation is asserted rather than left for the eye.
+fn run_v4_res(name: &str, hidden: usize, inter: usize, e_count: usize, ranges: usize) -> u64 {
+    // V4's config value, hand-copied. The launcher only refuses a clamp-DISABLING limit (rc
+    // 1006); a finite-but-wrong one runs silently, and only this section's fingerprint
+    // disagreeing with `tests/v4_kernel.rs` would ever show it.
+    const SWIGLU_LIMIT: f32 = 10.0;
+    // Row and group sizing from `quant.rs`, not a local `32` that could drift from `F4_GROUP`
+    // into a scale ROW STRIDE error. `per_expert` is then summed from the spans this probe
+    // actually uploads, so the GB/s denominator cannot disagree with the traffic;
+    // `quant.rs::f4_expert_bytes` is the same closed form, so asserting the two match would be
+    // comparing an expression with itself.
+    let (gu_packed, dn_packed) = (inter * f4_row_bytes(hidden), hidden * f4_row_bytes(inter));
+    let (gu_scale, dn_scale) = (inter * f4_groups(hidden), hidden * f4_groups(inter));
+    let per_expert = 2 * (gu_packed + gu_scale) + dn_packed + dn_scale; // 13.37 MB here
+    let n_desc = ranges * e_count;
+
+    let seed = 0xF4E5 ^ hidden as u64 ^ ((inter as u64) << 24);
+    let mut r = Rng(seed);
+    // `x` is drawn FIRST and at a length that does not depend on `n_desc`, so both rows draw
+    // the same `x` and the same first `e_count` routing weights. The weight bytes come off a
+    // SEPARATE generator below for the same reason — `wexpert`'s length is the only draw here
+    // that varies with `ranges`, and letting it shift the weight stream would make the two
+    // rows' fingerprints incomparable.
+    let mut xb = dev(&rnd(&mut r, hidden));
+    let wb = dev(&rnd_scale(&mut r, n_desc));
+
+    // NOT `pattern()`. Its repeating 4 KiB block aliases with every row stride at this shape
+    // — gate/up rows are 2048 B, down rows 1024 B, their scale rows 128/64 B — so the drained
+    // residual would hold 64 distinct floats replicated 64x. §M11 D.5 makes this fingerprint
+    // probe C's bit-identity gate, and 4096 independent dot products make a stronger one than
+    // 64 for 9 MB of host LCG, drawn once.
+    let mut wr = Rng(0xF4B0);
+    let packed_of = |r: &mut Rng, n: usize| -> Vec<u8> {
+        (0..n).map(|_| ((r.f() + 1.0) * 127.5) as u8).collect()
+    };
+    // e8m0 bytes in [0x71, 0x7d] = 2^-14..2^-2, NOT the full byte range. 0x00 is 2^-127,
+    // below f32's smallest normal, which zeroes a whole 32-weight group; 0xff is the format's
+    // NaN, which `moe_fixed` launders into a finite extreme. Both ends drive the drained
+    // output to a constant, which is what the DEGENERATE line below reports.
+    let scale_of = |r: &mut Rng, n: usize| -> Vec<u8> {
+        (0..n)
+            .map(|_| (0x77i32 + (r.f() * 6.0) as i32) as u8)
+            .collect()
+    };
+    let packed_gu = packed_of(&mut wr, gu_packed);
+    let packed_dn = packed_of(&mut wr, dn_packed);
+    let scale_gu = scale_of(&mut wr, gu_scale);
+    let scale_dn = scale_of(&mut wr, dn_scale);
+
+    // One set of bytes, `n_desc` copies at DISTINCT device addresses — `run_v4_gemv`'s pattern
+    // and its reason: the kernel reads every weight byte exactly once whatever its value (the
+    // e2m1/e8m0 decodes have been branchless register-immediate tables since M3c, so there is
+    // no data-dependent path and no LDS LUT for a shared fill to collapse into a broadcast),
+    // and what must differ between experts is which DRAM pages they occupy. Gate and up
+    // therefore share bytes, so `g == u`; that makes a w1/w3 swap invisible here, which is not
+    // this probe's job — `tests/v4_kernel.rs::Wiring::SwapGateUp` covers it against an oracle,
+    // and `a_dispatch_split_into_ranges_matches_one_range` covers absolute-vs-range-relative
+    // descriptor indexing at two non-adjacent non-zero starts, bit-identically. **Every arm of
+    // §M11's round patches only `dot_f4_wave_r`'s inner loop**, so fold order is the one thing
+    // that can differ between them and the one thing this fingerprint has to catch.
+    let mut parts: Vec<DeviceBuf> = Vec::with_capacity(n_desc * 6);
+    let mut descs: Vec<ExpertDescF4> = Vec::with_capacity(n_desc);
+    for _ in 0..n_desc {
+        // Address taken BEFORE the move into `parts`, for the reason tests/v4_kernel.rs's
+        // `F4Experts::upload` gives: recovering it by index afterwards works until the buffer
+        // count changes, and then a descriptor silently points at another projection.
+        let mut push = |b: &[u8]| {
+            let d = dev(b);
+            let p = d.ptr();
+            parts.push(d);
+            p
+        };
+        descs.push(ExpertDescF4 {
+            gate_packed: push(&packed_gu),
+            gate_scale: push(&scale_gu),
+            up_packed: push(&packed_gu),
+            up_scale: push(&scale_gu),
+            down_packed: push(&packed_dn),
+            down_scale: push(&scale_dn),
+        });
+    }
+    // SAFETY: `ExpertDescF4` is `#[repr(C)]` plain addresses, so the span is exactly the
+    // slice's bytes.
+    let descb = dev(unsafe {
+        std::slice::from_raw_parts(
+            descs.as_ptr() as *const u8,
+            std::mem::size_of_val(&descs[..]),
+        )
+    });
+    // `wexpert` and `h` are indexed by the ABSOLUTE descriptor index, not by position in the
+    // range — so both are sized for `n_desc`, which is what lets `e_start > 0` rotate at all.
+    let mut hb = dev(&vec![0u8; n_desc * inter * 4]);
+    let mut ab = dev(&vec![0u8; hidden * 8]);
+    let mut ob = dev(&vec![0u8; hidden * 4]);
+    let (xp, wp) = (xb.ptr() as *const f32, wb.ptr() as *const f32);
+    let dp = descb.ptr() as *const ExpertDescF4;
+    let (hp, ap, op) = (
+        hb.ptr_mut() as *mut f32,
+        ab.ptr_mut() as *mut u64,
+        ob.ptr_mut() as *mut f32,
+    );
+    // The engine quantizes `x` before the range call (every quantized `Linear` in V4
+    // quantizes its own activation), so the numbers this kernel consumes are `e4m3(x/s)·s`
+    // here too. SAFETY: `xb` is `hidden` live f32 and outlives the sync below.
+    unsafe { launch_act_quant_f8(xb.ptr_mut() as *mut f32, 1, hidden, std::ptr::null_mut()) }
+        .expect("act_quant_f8");
+    // SAFETY: every buffer above is sized for `n_desc` ABSOLUTE expert slots and stays alive
+    // until this function returns; every range below is inside that bound.
+    let launch = |e_start: usize| unsafe {
+        launch_moe_expert_range_f4(
+            xp,
+            hidden,
+            inter,
+            e_start,
+            e_count,
+            n_desc,
+            dp,
+            wp,
+            SWIGLU_LIMIT,
+            hp,
+            ap,
+            1,
+            std::ptr::null_mut(),
+        )
+        .expect("moe_expert_range_f4");
+    };
+
+    // The fingerprint first, off the freshly zeroed `acc`/`out` allocations — the drain resets
+    // `acc`, so nothing has to be cleared by hand and the timing loop's atomics cannot ride
+    // into the reading.
+    launch(0);
+    // SAFETY: same stream (the null one), so the range's atomics precede the drain.
+    unsafe { launch_moe_acc_drain(op, ap, hidden, 1, 1.0, std::ptr::null_mut()) }.expect("drain");
+    device_sync().expect("s");
+    let out = ob.copy_out().expect("out");
+    let vals = f32v(&out);
+    let distinct = vals
+        .iter()
+        .map(|v| v.to_bits())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    // Rotating through DISTINCT experts between launches is the instrument; `iters` is a whole
+    // number of sweeps so every expert is read the same number of times, and `time`'s one
+    // untimed warm-up only shifts the phase.
+    let iters = (56 / ranges).max(1) * ranges;
+    let turn = std::cell::Cell::new(0usize);
+    let us = time(iters as u32, &|| {
+        let t = turn.get();
+        turn.set(t + 1);
+        launch((t % ranges) * e_count);
+    });
+    let bytes = e_count * per_expert;
+    let ws_mb = n_desc * per_expert / 1_000_000; // decimal, to match the GB/s denominator
+    let gbs = report_bytes(
+        name,
+        "f4res",
+        &format!("[{e_count}e {hidden}x{inter} ws{ws_mb}MB]"),
+        bytes,
+        us,
+    );
+    // BOTH derived lines are for the engine-condition arm only. The control arm is a MALL-
+    // served rate by construction, and converting one into an engine ms/token is the exact
+    // failure §M11 opens by naming — it would be the only line here in engine units, so it is
+    // also the one most likely to be lifted into benchmarks.md.
+    if ranges > 1 {
+        // SERIAL-IDLE, and not the engine's `res`. M9 measured that a microbench rate does NOT
+        // transfer 1:1 into the overlapped engine (its split-k `dqkv` came in at −0.9 against a
+        // −2.3..−2.9 projection), so this is what the span WOULD be if it did — a ceiling for
+        // the projection, not a wall.
+        let gb_per_token = V4_RES_EXPERT_READS_PER_TOKEN * per_expert as f64 / 1e9;
+        println!(
+            "            res {:5.1} ms/token serial-idle at this rate  (booked 24.3; \
+             {gb_per_token:.3} GB/token; no M9 transfer discount applied)",
+            gb_per_token / gbs * 1e3
+        );
+        // §M11's registered band, printed where the number is rather than left in the doc.
+        println!(
+            "            probe A band 130-150 GB/s; KILL >=170 or <=110 (harness, not kernel)"
+        );
+    }
+    // Reported, NOT asserted. §M11 probe B's ballast arms drive every row past `moe_fixed`'s
+    // ±2^14 saturation, so their residual IS a constant and this would fire on 2 of the 5
+    // planned arms — a guard expected to go red is one an operator learns to skip, and an
+    // abort here would also cost the second `run_v4_res` call (the MALL control row) which
+    // runs in the same process. What it protects is real: a constant residual fingerprints
+    // identically under ANY kernel, so probe C's bit-identity kill would pass on it. Full
+    // entropy puts `distinct` at ~`hidden`; a collapse to a handful is the tell.
+    let degenerate = if distinct * 4 > hidden {
+        ""
+    } else {
+        "  DEGENERATE — constant residual, this fnv matches any kernel (expected on probe B)"
+    };
+    // `seed` governs `x` and the routing weights; the weight and scale bytes come off the
+    // separate fixed generator above. Both constants plus the shape determine this row.
+    let h = fnv(&out);
+    println!(
+        "            fnv {h:016x}  (seed {seed:#x}, {n_desc} experts, {ranges} ranges x {iters} \
+         iters, {distinct} distinct){degenerate}"
+    );
+    h
+}
+
 fn run_i8(name: &str, o_dim: usize, i_dim: usize) {
     let packed = pattern(o_dim * i_dim, |v| (v * 127.0) as i8 as u8);
     let scale: Vec<f32> = vec![1.0; o_dim];
@@ -499,7 +740,7 @@ fn run_tail_rest(vocab: usize, hidden: usize) {
 /// `-- mla gemv` runs only those sections; no argument runs all of them, so a per-kernel
 /// A/B can book only the rows it is about to compare.
 fn main() {
-    const SECTIONS: [&str; 6] = ["moe", "gemv", "v4gemv", "mla", "attend", "tail"];
+    const SECTIONS: [&str; 7] = ["moe", "gemv", "v4gemv", "v4res", "mla", "attend", "tail"];
     let want: Vec<String> = std::env::args().skip(1).collect();
     // A typo must NOT silently select nothing. Every number this branch rests on — the
     // timings and the fnv fingerprints both — is read off this binary's stdout, so an
@@ -536,6 +777,34 @@ fn main() {
         run_v4_gemv("v4 wo_b ", 4096, 8192);
         run_v4_gemv("v4 sh_gu", 2048, 4096);
         run_v4_gemv("v4 sh_dn", 4096, 2048);
+    }
+    // The fp4 ROUTED-expert path at the engine's resident shape (dim 4096, moe_inter 2048).
+    // `e_count = 6` rounds the engine's 5.885 residents/layer UP, and the direction matters:
+    // 6 experts launch 12,288 gate/up waves where 5 launch 10,240, and M8 measured grid width
+    // as first-order on this box (222 GB/s at full grid against 66 at 512-1024 waves). So
+    // probe A's band is being tested on the OPTIMISTIC side, and an `e_count = 5` row is the
+    // first thing to add if the band is missed high.
+    // Two working sets on purpose — see `run_v4_res`: 14 ranges = 84 experts = 1.12 GB = 35x
+    // the 32 MB MALL, against 1 range = ~80 MB, the naive harness §M11 names as the confound
+    // that decides whether any of this is true. Both rows draw the same experts 0..6, so
+    // their `e_start 0` fingerprints are expected to agree.
+    if on("v4res") {
+        println!(
+            "\nV4 fp4 resident-expert range, nrow=1 (serial rate; the §M11 `res` span). The \
+             `mall-ctl` row replays ONE range and is a cache artifact by design:"
+        );
+        let engine = run_v4_res("v4 res         ", 4096, 2048, 6, 14);
+        let ctl = run_v4_res("v4 res mall-ctl", 4096, 2048, 6, 1);
+        // The one cross-arm invariant this section can check in-process, and it is not
+        // trivial: `ranges` is the ONLY thing that differs between the two calls, `x` and the
+        // routing weights come off a `ranges`-independent draw order, and the weight bytes come
+        // off a separate fixed generator whose first `e_count` experts are a prefix in both.
+        // So a `ranges`-dependent allocation or descriptor slip is exactly what this catches.
+        assert_eq!(
+            engine, ctl,
+            "the two working sets disagree on the [0, e_count) range — a ranges-dependent bug, \
+             not a cache effect"
+        );
     }
     // GLM-5.2 manifest: num_attention_heads 64, qk_head_dim 256 (= qk_nope 192 + rope
     // 64), v_head_dim 256, kv_lora_rank 512. Getting these wrong understates the work:
