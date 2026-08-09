@@ -1331,9 +1331,14 @@ fn the_fp8_dot_sums_in_source_order_through_both_loops() {
 ///
 /// 1. fused `out[0..512]` / `out[512..]` equal the two standalone launches the fusion
 ///    replaces. This is the load-time concat's layout contract executed by the real
-///    kernel: fused row `512 + r` must read concatenated scale row `4 + r/128`, so an
-///    off-by-one-BLOCK scale concat shifts every `wq_a` row onto a neighbour's scales
-///    and fails here on thousands of terms — the "catch it by arithmetic first" case.
+///    kernel: fused row `512 + r` must read concatenated scale row `4 + r/128`. The
+///    scale cycle's period (3) is COPRIME to the 32-entry scale rows, so every scale
+///    row's phase differs from its neighbours' — a scale-grid concat shifted by one
+///    block row in EITHER direction changes in-bounds values on every affected row
+///    and fails on thousands of terms (a period dividing 32 would make within-tensor
+///    neighbour rows identical and leave the +1 shift visible only as an
+///    out-of-bounds read; review caught that first cut) — the "catch it by
+///    arithmetic first" case.
 /// 2. every fused row equals [`FoldRow::serial`] — the same source-order pin the
 ///    k = 1152 sweep holds, at the fused shape's 32 whole per-lane trips (no remainder
 ///    pass; that loop keeps its coverage in the sweep above).
@@ -1353,11 +1358,12 @@ fn the_fused_qkv_gemv_is_bitwise_the_two_launches_it_replaces() {
             .collect()
     };
     let (w_kv, w_qa) = (wrow(N_KV * K, 0), wrow(N_QA * K, 131));
-    // Power-of-two scales in a cycle, offset between the tensors: a seam error lands a
-    // row on scales that differ from its own, so equality would be impossible.
+    // Power-of-two scales in a period-3 cycle (coprime to the 32-entry rows — see the
+    // doc above), offset between the tensors: a seam or shift error lands rows on
+    // scales that differ from their own, so equality would be impossible.
     let scl = |rows: usize, salt: usize| -> Vec<f32> {
         (0..rows.div_ceil(BLOCK) * K.div_ceil(BLOCK))
-            .map(|i| [0.25f32, 0.5, 1.0, 2.0][(i + salt) % 4])
+            .map(|i| [0.25f32, 0.5, 1.0][(i + salt) % 3])
             .collect()
     };
     let (s_kv, s_qa) = (scl(N_KV, 0), scl(N_QA, 1));

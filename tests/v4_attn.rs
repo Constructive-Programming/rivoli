@@ -1246,17 +1246,17 @@ fn the_fused_qkv_decode_is_bitwise_the_split_one() {
                 );
             }
             for (va, vb) in a.v.iter().zip(&b.v) {
-                assert_eq!(bits32(va), bits32(vb), "step {k} ({})", p.tag);
+                assert_eq!(bits(va), bits(vb), "step {k} ({})", p.tag);
             }
             assert_eq!(
-                bits32(&a.compressed),
-                bits32(&b.compressed),
+                bits(&a.compressed),
+                bits(&b.compressed),
                 "step {k} compressed blocks"
             );
         }
         assert_eq!(
-            bits32(&read(&split.gpu.ring)),
-            bits32(&read(&fused.gpu.ring)),
+            bits(&read(&split.gpu.ring)),
+            bits(&read(&fused.gpu.ring)),
             "persistent ring after the full script"
         );
     }
@@ -1264,7 +1264,7 @@ fn the_fused_qkv_decode_is_bitwise_the_split_one() {
 
 /// `to_bits`, so the assert above is equality of BYTES and prints the first index that
 /// differs rather than a float that rounds identically in Debug.
-fn bits32(v: &[f32]) -> Vec<u32> {
+fn bits(v: &[f32]) -> Vec<u32> {
     v.iter().map(|x| x.to_bits()).collect()
 }
 

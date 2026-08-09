@@ -230,8 +230,10 @@ fn place_fp8_qkv(
     for (sc, o, what) in [(ks, ko, "wkv"), (qs, qo, "wq_a")] {
         ensure!(
             sc.len() == o.div_ceil(block) * cols * size_of::<f32>(),
-            "{attn}.{what}.weight_scale_inv is not [{}, {cols}] f32",
-            o.div_ceil(block)
+            "{attn}.{what}.weight_scale_inv is {} bytes, expected [{}, {cols}] f32 = {}",
+            sc.len(),
+            o.div_ceil(block),
+            o.div_ceil(block) * cols * size_of::<f32>()
         );
     }
     let packed = tier.place(&[kw, qw].concat())?;
@@ -1019,6 +1021,24 @@ impl V4Pin {
             let (wq_b, wo_a, wo_b) = (fp8("wq_b")?, fp8("wo_a")?, fp8("wo_b")?);
             // wkv + wq_a go through the concat placer: one placement, three views (M10).
             let (wkv, wq_a, wqkv) = place_fp8_qkv(&mut tier, &st, &a, block)?;
+            // The concat seams at the TENSOR's row count while `attention`'s fused
+            // landing offset is the CONFIG's `head_dim` — a checkpoint where they
+            // disagree would put the q intermediate at the wrong offset silently (the
+            // split path is equally wrong under such a mismatch, but wrongly
+            // DIMENSIONED, which fails louder). One load-time check closes the fused
+            // expression of it; review-surfaced, and load-time because the in-path
+            // `debug_assert!` is compiled out exactly when benchmarks run.
+            if wqkv.is_some() {
+                ensure!(
+                    wkv.o_dim == cfg.head_dim && wq_a.o_dim == cfg.q_lora_rank,
+                    "layer {l}: wkv/wq_a rows ({}, {}) disagree with the config's \
+                     head_dim/q_lora_rank ({}, {}) — the fused qkv landing offset would be wrong",
+                    wkv.o_dim,
+                    wq_a.o_dim,
+                    cfg.head_dim,
+                    cfg.q_lora_rank
+                );
+            }
             // `e == n_experts` selects `ffn.shared_experts` — see `v4_expert_base`.
             let shared_base =
                 crate::artifact::quant::v4_expert_base(l, cfg.n_experts, cfg.n_experts);

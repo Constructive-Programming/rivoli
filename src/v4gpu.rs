@@ -1045,8 +1045,10 @@ impl V4Engine {
             // ratio because one buffer serves every layer class. `+ q_lora_rank` for the M10
             // fused decode GEMV, whose one output row is `head_dim + q_lora_rank` floats at the
             // base (`attn::v4::Scratch::kv` documents the obligation): decode touches no other
-            // row, so for `max_m ≥ 2` the fused row already fits in row 1's space and the slack
-            // is dead — it exists so a 1-token prompt does not overrun an exactly-sized buffer.
+            // row, and the compressed-tail sizing above happens to cover the spill for
+            // `max_m ≥ 2` — but "happens to" is not a contract, and at `max_m == 1` it does
+            // not (2 rows of head_dim < head_dim + q_lora_rank), so the slack is explicit
+            // rather than counted out of rows.
             a_kv: f32s((max_m + max_m.div_ceil(INDEXED_RATIO)) * hd + cfg.q_lora_rank)?,
             a_o: f32s(max_m * nhd)?,
             a_y: f32s(max_m * cfg.o_groups * cfg.o_lora_rank)?,
