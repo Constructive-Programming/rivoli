@@ -314,6 +314,7 @@ ranges, nrow)`, five rows —
 | `glm i4 R2` | 6 | 9 | 1.083 GB | the width fp4 structurally cannot run |
 | `glm i4 R2 mall-ctl` | 6 | 1 | 120 MB | |
 | `glm i4 R1 e1` | 1 | 50 | 1.003 GB | what launch size costs — see below |
+| `glm i4 R1 e1 mall-ctl` | 1 | 1 | 20 MB | *added 2026-08-09*: the `e1` row's own control |
 
 - **GB/s is WEIGHT bytes over time at both widths**, because one read of the weight row serves
   both token rows. So R = 1 and R = 2 are not competing arms; only depth-vs-depth *within* a
@@ -342,6 +343,16 @@ ranges, nrow)`, five rows —
   `ranges > 1` alone would print `KILL ≤ 90` over the `e1` row, where M8's 66 GB/s at
   512–1024 waves makes a sub-90 reading plausible *and correct*, and an operator obeying it
   would discard a valid row.
+- **Every ≥ 1 GB rotating row has a single-range control beside it.** *The `e1` row shipped
+  without one and it was added 2026-08-09 at the coordinator's prompt* — the rule is not "the
+  section has a control", it is "each rotating row has one", and a rotating row whose control is
+  missing is exactly the confound the other two convert into a number. At GLM's shape a
+  6-expert range is **120 MB**, not M11's ~80 MB: one int4 expert is 20.05 MB against fp4's
+  13.37, so there is no way to make the `e_count = 6` control 80 MB. What matters is the
+  property — one range, replayed, against a 32 MB MALL — and 120 MB clears it by 3.8×. The
+  `e1` control is **20 MB, i.e. BELOW the MALL**, which makes it the strongest cache-served
+  reading available at this shape: an upper bound on what the MALL can do for this kernel
+  rather than merely a naive-harness comparison.
 - **No ms/token is derived from any row**, unlike `run_v4_res`. GLM's wall cannot resolve this,
   and a derived engine-unit line is the single most liftable thing in the output.
 - **Probe A's band, registered here before any device time: 130–175 GB/s. KILL ≥ 200 or ≤ 90.**
@@ -443,6 +454,16 @@ asked for once and nothing is rebuilt until every arm has run.
 > the pragma buys. If M11's pattern repeats, B1 lands modestly above A and C2 lands near B1's
 > unrolled ceiling; if B1 ≈ A *and* C1/C2 ≈ A, the loop is at its ceiling and the stretch closes
 > negative with evidence rather than by assumption.
+
+**ARM ORDER IS COUNTERBALANCED, not fixed.** *Added 2026-08-09 at the coordinator's
+instruction, and the precedent is M11b's own: it ran S, C1, C2 in the same order every pass and
+so aliased arm with position, which its untouched-span controls only just rescued.* Two passes
+over all five arms, the second in **reverse order** — pass 1 `A, B1, C1, C2, X`, pass 2
+`X, C2, C1, B1, A`. Position effects (page-cache warmth, thermal drift, a tenant arriving
+mid-session) therefore enter the two passes with opposite sign and cancel in the per-arm mean,
+instead of being confounded with the arm. **The order actually used goes in the record**, per
+pass, and any arm whose two passes disagree by more than the round's own spread is reported as
+unreplicated rather than averaged.
 
 `flock /var/run/sys-gpu.lock -c '<arm-binary> glmi4'` per arm, exit code checked explicitly
 (`flock -w` exits 1 silently on timeout, and an empty log is not a failing test). Witness —

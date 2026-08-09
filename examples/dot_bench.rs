@@ -1171,10 +1171,19 @@ fn main() {
                 run_glm_i4("glm i4 R2 mall-ctl", 6144, 2048, 6, 1, 2),
             ),
         ];
-        // `e_count = 1`, 50 ranges = 1.003 GB. Its fingerprint is NOT comparable to the rows
-        // above and is deliberately left out of the check: it drains ONE expert's
-        // contribution, not six, so a different value is correct.
-        run_glm_i4("glm i4 R1 e1     ", 6144, 2048, 1, 50, 1);
+        // `e_count = 1`, 50 ranges = 1.003 GB — and its OWN control beside it, because the rule
+        // is "a single-range control beside EVERY >= 1 GB rotating row", and this row is one.
+        // It shipped without one until the coordinator asked; a rotating row whose control is
+        // missing is exactly the confound the two rows above exist to convert into a number.
+        //
+        // Its control is 20 MB, i.e. BELOW the 32 MB MALL rather than merely near it, so it is
+        // the strongest cache-served reading available at this shape — an upper bound on what
+        // the MALL can do for this kernel, not just a naive-harness comparison.
+        //
+        // Both drain ONE expert, so their fingerprints agree with each other and with NEITHER
+        // of the `e_count = 6` groups above; that pair is asserted separately below.
+        let e1 = run_glm_i4("glm i4 R1 e1     ", 6144, 2048, 1, 50, 1);
+        let e1_ctl = run_glm_i4("glm i4 R1 e1 mall-ctl", 6144, 2048, 1, 1, 1);
         for (tag, (h0, _)) in &fp[1..] {
             assert_eq!(
                 *h0, fp[0].1.0,
@@ -1191,6 +1200,23 @@ fn main() {
             "the two R = 2 working sets disagree on token row 1 — row 1's inputs are drawn from \
              an `n_desc`-independent generator, so this is an indexing or fold-order change, not \
              a cache effect"
+        );
+        // The `e_count = 1` pair, on the same argument as the pairs above: `ranges` is the only
+        // thing that differs, and expert 0's bytes and token row 0's inputs are drawn
+        // `n_desc`-independently, so a disagreement here is an indexing bug and not a cache
+        // effect. Also pinned NOT to equal the six-expert fingerprint — six experts summing
+        // into one accumulator must not produce what one expert does, and an `e_count` that
+        // silently failed to reach the kernel would show up exactly there.
+        assert_eq!(
+            e1.0, e1_ctl.0,
+            "the two e_count = 1 working sets disagree on token row 0 — a ranges-dependent bug, \
+             not a cache effect"
+        );
+        assert_ne!(
+            e1.0, fp[0].1.0,
+            "one expert and six experts drained the same value — `e_count` is not reaching the \
+             kernel, which would make every rate row above a 1-expert measurement mislabelled \
+             as 6"
         );
         assert!(
             fp[2].1.1.is_some() && fp[2].1.1 != Some(fp[2].1.0),
