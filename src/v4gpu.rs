@@ -80,7 +80,7 @@ use crate::artifact::quant::{FP8_BLOCK, f4_expert_stride, read_f32};
 use crate::attn::{Sel, v4, v4_topk_idxs};
 use crate::backend::hip::{
     ExpertDescF4, device_sync, fill_u32, launch_act_quant_f8, launch_argmax,
-    launch_embed_bf16_row_bcast, launch_gemm_bf16, launch_gemv_f32, launch_gemv_fp8_grouped,
+    launch_embed_bf16_row_bcast, launch_gemm_bf16, launch_gemv_f32, launch_gemv_fp8_bf16,
     launch_hc_head_collapse, launch_hc_post, launch_hc_pre, launch_moe_acc_drain,
     launch_moe_expert_range_f4, launch_rmsnorm_batch, launch_swiglu, memcpy_dtod,
 };
@@ -235,7 +235,7 @@ struct Extent {
 ///
 /// **This exists because handing that launcher the pin's f32 pointer is not a precision loss —
 /// it is a row-stride error, and a review caught it before any device ran.** The kernel indexes
-/// `w + (size_t)c * k` in `unsigned short` units (`kernels/v4compress.hip:94`), so output row `c`
+/// `w + (size_t)c * k` in `unsigned short` units (`kernels/kvcompress.hip:94`), so output row `c`
 /// would read f32 elements `[c·k/2, (c+1)·k/2)` — a different row's data, not the low halves of
 /// its own. Every one of the 41 compressing layers would pool the wrong weights, finitely and
 /// without ever reading out of bounds.
@@ -1449,7 +1449,7 @@ impl V4Engine {
     ///
     /// # The device router was DECLINED and then DELETED, and this is why
     ///
-    /// `moe_gate_v4` existed, was verified, was 8-test covered, and took `tid2eid` as a device
+    /// `moe_gate_v4` existed, was verified, carried FOUR tests, and took `tid2eid` as a device
     /// `*const i64` — while `V4Pin` parses the table to a host `Vec<u32>` and argues that
     /// "placing 6.2 MB of `tid2eid` per hash layer on the device to index it there would buy
     /// nothing". Both are defensible and they are opposite; the port recorded it so this stage
@@ -1468,6 +1468,12 @@ impl V4Engine {
     ///
     /// So it had no reachable caller after this stage either — the shape `Dims::compress_slot`
     /// was in when *it* was deleted.
+    ///
+    /// (This said "was 8-test covered" until 2026-08-09. COUNTED rather than inherited when the
+    /// section was deleted: `tests/v4_kernel.rs` §4 held four `#[test]` functions, not eight.
+    /// The 8 was carried forward unchecked from 2026-08-05 and repeated into a commit message
+    /// before anyone counted — a small number, but this file's whole argument is that an
+    /// unverified claim reads exactly like a verified one.)
     ///
     /// **DELETED 2026-08-09** (kernel, launcher, and `tests/v4_kernel.rs` §4), on the reasoning
     /// above going unchallenged for the four days since it was written: the decision was
@@ -1784,7 +1790,7 @@ impl V4Engine {
 
     /// The resident fp8 shared expert, batched over all `m` rows.
     ///
-    /// Batched where the routed experts cannot be: `launch_gemv_fp8_grouped` takes `m`, and the shared
+    /// Batched where the routed experts cannot be: `launch_gemv_fp8_bf16` takes `m`, and the shared
     /// expert is one weight set read by every row, so its fp8 weights are read once for the whole
     /// prompt.
     ///
@@ -1830,7 +1836,7 @@ impl V4Engine {
             launch_act_quant_f8(g, m, inter, stream)?;
             // WRITES `sub` — does not accumulate into it. `MoE.forward` starts from `y = zeros`
             // and the routed drain adds on top; see `routed_experts`.
-            launch_gemv_fp8_grouped(
+            launch_gemv_fp8_bf16(
                 g,
                 down.packed,
                 down.scale,
@@ -1875,7 +1881,7 @@ impl V4Engine {
         // outliving this engine; `g` and `u` are `max_m * inter`, three distinct allocations.
         for (w, dst) in [(gate, g), (up, u)] {
             unsafe {
-                launch_gemv_fp8_grouped(
+                launch_gemv_fp8_bf16(
                     xq, w.packed, w.scale, m, inter, dim, FP8_BLOCK, 1, dst, stream,
                 )?;
             }

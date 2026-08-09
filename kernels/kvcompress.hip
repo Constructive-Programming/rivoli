@@ -13,7 +13,7 @@
 //     `v4compress.rs::compress` launches it. Writing a second one here would be a third
 //     copy of e4m3-RNE in this tree — see the note on `f2e4m3_rne` below.
 //   * The indexer's compressor (`rotate = true`: Hadamard + fp4 instead of partial fp8).
-//     LANDED 2026-08-05 as `kernels/v4indexer.hip::act_quant_f4_rotated`, which
+//     LANDED 2026-08-05 as `kernels/blockindex.hip::act_quant_f4_rotated`, which
 //     `v4compress.rs::compress` launches as the finish when `Geom::indexer` built the
 //     geometry. Only the FINISH is there; the pooling below is shared by both compressors.
 //
@@ -30,7 +30,7 @@
 // at ratio 128, which is the largest the shipped config produces and so the bound. It sizes
 // the LDS pointer tables; guard 1004 refuses anything larger rather than letting a future
 // ratio silently walk off them.
-#define V4C_ENTS_MAX 128
+#define COMPRESS_ENTS_MAX 128
 
 // One compressor's geometry. A struct rather than seven trailing `int`s: `ratio`, `coff`,
 // `d`, `cd`, `ents` and `rd` are all plausible in each other's positions, and `cd`/`ents`
@@ -70,7 +70,7 @@ struct V4Fin {
 // `Compressor.wkv`/`wgate` are `Linear(..., dtype=torch.float32)` (model.py:302-303), which
 // in `model.py::linear` means NO `act_quant` on the activation and no weight scales: a
 // plain dot in f32 against weights the checkpoint stores in bf16. That is why this is here
-// and not `gemv_fp8_grouped` — routing the compressor through the fp8 GEMV would quantize an
+// and not `gemv_fp8_bf16` — routing the compressor through the fp8 GEMV would quantize an
 // activation the reference leaves alone, and the error would look like a pooling bug.
 //
 // bf16 weights on device, not f32: the values are bf16 on disk, so `bf16f` reproduces them
@@ -279,9 +279,9 @@ extern "C" __global__ void kv_compress_prefill(const float* __restrict__ kv,
                                                const float* __restrict__ score,
                                                const float* __restrict__ ape, V4Fin f,
                                                V4Comp p) {
-    __shared__ const float* kvp[V4C_ENTS_MAX];
-    __shared__ const float* scp[V4C_ENTS_MAX];
-    __shared__ const float* apep[V4C_ENTS_MAX];
+    __shared__ const float* kvp[COMPRESS_ENTS_MAX];
+    __shared__ const float* scp[COMPRESS_ENTS_MAX];
+    __shared__ const float* apep[COMPRESS_ENTS_MAX];
     __shared__ float red[256];
     int b = (int)blockIdx.x;
     int overlap = p.coff == 2;
@@ -332,8 +332,8 @@ extern "C" __global__ void kv_compress_prefill(const float* __restrict__ kv,
 extern "C" __global__ void kv_compress_decode(float* __restrict__ kv_state,
                                               float* __restrict__ score_state, V4Fin f,
                                               V4Comp p, int start_pos) {
-    __shared__ const float* kvp[V4C_ENTS_MAX];
-    __shared__ const float* scp[V4C_ENTS_MAX];
+    __shared__ const float* kvp[COMPRESS_ENTS_MAX];
+    __shared__ const float* scp[COMPRESS_ENTS_MAX];
     __shared__ float red[256];
     int overlap = p.coff == 2;
 
@@ -380,7 +380,7 @@ extern "C" __global__ void kv_compress_decode(float* __restrict__ kv_state,
 
 // Shared guards. Every one of these is a shape that would otherwise read plausible garbage
 // rather than crash: a zero `ratio` divides by zero in the slot arithmetic, a `cd` that is
-// not `coff*d` walks `ape` off its rows, and `ents > V4C_ENTS_MAX` overruns the LDS tables.
+// not `coff*d` walks `ape` off its rows, and `ents > COMPRESS_ENTS_MAX` overruns the LDS tables.
 // Taken by POINTER across the `extern "C"` wall and by value only inside this file. A
 // 28-byte struct passed by value is an ABI detail — SysV classifies it MEMORY, Rust's
 // `#[repr(C)]` agrees today, and neither guarantees the other across a compiler bump. A
@@ -390,7 +390,7 @@ static int compress_guard(V4Comp p) {
     if (p.ratio <= 1 || p.d <= 0 || p.rd <= 0 || p.coff < 1 || p.coff > 2) return 1001;
     if (p.rd > p.d || (p.rd & 1)) return 1002;
     if (p.cd != p.coff * p.d || p.ents != p.coff * p.ratio) return 1003;
-    if (p.ents > V4C_ENTS_MAX) return 1004;
+    if (p.ents > COMPRESS_ENTS_MAX) return 1004;
     // `coff` and `ratio` are NOT independent: `Compressor.overlap` is `compress_ratio == 4`
     // and nothing else (model.py:296). Without this, `{ratio: 128, coff: 2}` passes every
     // check above and runs the overlapping gather at ratio 128 — finite, plausible, wrong.

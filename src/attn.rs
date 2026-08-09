@@ -367,7 +367,7 @@ pub mod v4 {
     use crate::artifact::model::V4Config;
     use crate::backend::Event;
     use crate::backend::hip::{
-        launch_act_quant_f8_prefix, launch_gather_attn_shared_kv, launch_gemv_fp8_grouped,
+        launch_act_quant_f8_prefix, launch_gather_attn_shared_kv, launch_gemv_fp8_bf16,
         launch_qk_norm, launch_rmsnorm_batch, launch_rope_adjacent, memcpy_dtod_async,
     };
     use anyhow::{Result, bail, ensure};
@@ -887,7 +887,7 @@ pub mod v4 {
         // SAFETY: deferred to the call sites — each is the caller's-contract launch it
         // textually replaces.
         let gemv1 = |x: *const f32, wt: Fp8W, n_out: usize, k: usize, out: *mut f32| unsafe {
-            launch_gemv_fp8_grouped(x, wt.w, wt.scale, m, n_out, k, FP8_BLOCK, 1, out, stream)
+            launch_gemv_fp8_bf16(x, wt.w, wt.scale, m, n_out, k, FP8_BLOCK, 1, out, stream)
         };
         // SAFETY: caller's contract; `xq` is `[m, dim]` and `x` is not modified, and a
         // `Some(wqkv)` caller granted `s.kv` the `hd + q_lora` floats the fused row
@@ -1041,7 +1041,7 @@ pub mod v4 {
             // run of heads `[g * n_heads/o_groups, ...)`, all `head_dim` dims of each.
             // `groups = o_groups`: `o` is `m` rows of `o_groups` contiguous `gd`-wide
             // head runs, and output row `j` takes run `j / o_lora_rank`.
-            launch_gemv_fp8_grouped(
+            launch_gemv_fp8_bf16(
                 s.o,
                 w.wo_a.w,
                 w.wo_a.scale,

@@ -15,7 +15,7 @@
 //
 // WHAT IS DELIBERATELY NOT HERE:
 //
-//   * The compressor's pooling. It is `kernels/v4compress.hip` and it is the SAME
+//   * The compressor's pooling. It is `kernels/kvcompress.hip` and it is the SAME
 //     arithmetic for both compressors — `Compressor.forward` branches only at the final
 //     quantization (`if self.rotate:` at :374). Writing a second pooling kernel for the
 //     indexer would duplicate the one piece of this path that is already verified.
@@ -25,7 +25,7 @@
 //     set-invariant at `index_topk = 512` (the recorded "hole S3 inherits"), so a set
 //     comparison accepts an arbitrarily wrong ranking while a score comparison cannot.
 //   * `wq_b` and `weights_proj`. Both are ordinary projections already in the tree —
-//     `gemv_fp8_grouped` (wq_b ships fp8 + scale) and `gemm_bf16` (weights_proj is
+//     `gemv_fp8_bf16` (wq_b ships fp8 + scale) and `gemm_bf16` (weights_proj is
 //     bare bf16). A third GEMV here would be a third summation order to reconcile.
 //
 // DUPLICATION. `kernels/` is not watched by `build.rs`'s jscpd gate, so nothing mechanical
@@ -38,7 +38,7 @@
 // The widest row `act_quant_f4_rotated` will rotate. `index_head_dim` is 128 in the shipped
 // config; 256 leaves headroom without making the LDS request interesting (256 floats = 1 KB
 // per block). Guard 1002 refuses anything larger rather than overrunning the tile.
-#define V4I_D_MAX 256
+#define ROTATE_D_MAX 256
 
 // `model.py::rotate_activation` — the natural-order (Sylvester) Walsh-Hadamard transform,
 // in place over `d` contiguous floats of LDS.
@@ -95,7 +95,7 @@ __device__ __forceinline__ void hadamard_lds(float* sh, int d) {
 //
 // The row is staged through LDS because the Hadamard reads every element `log2(d)` times.
 extern "C" __global__ void act_quant_f4_rotated(float* __restrict__ x, int d) {
-    __shared__ float sh[V4I_D_MAX];
+    __shared__ float sh[ROTATE_D_MAX];
     float* row = x + (size_t)blockIdx.x * d;
     for (int i = (int)threadIdx.x; i < d; i += (int)blockDim.x) sh[i] = row[i];
     __syncthreads();
@@ -219,6 +219,19 @@ extern "C" __global__ void act_quant_f4_rotated(float* __restrict__ x, int d) {
 // Scoped to the scoring kernel: `act_quant_f4_rotated` above has no multiply-add to fuse (the
 // Hadamard is pure adds and subtracts, and the fp4 scale is a single multiply), so widening
 // the pragma would suppress nothing and would suggest it had.
+// **NOT WIRED INTO THE ENGINE, AND NOT DEAD — IT IS THE FIX FOR A LIVE LIMITATION.**
+// `v4gpu.rs` selects compressed blocks POSITIONALLY, which agrees with `Indexer.forward` on
+// the block SET only below `positional_context_limit(index_topk)` = 4·(512+1) = **2052
+// tokens**, and `V4Engine::new` refuses at startup above it rather than silently attending
+// the oldest blocks forever. This kernel is what lifts that ceiling: it is already scored
+// bit-identical against the checkpoint's own compressed KV by
+// `tests/v4_indexer_kernel.rs::indexer_score_is_bit_identical_on_the_checkpoints_compressed_kv`.
+//
+// Recorded because "no caller" reads as "delete me" — it was proposed for deletion on
+// 2026-08-09 alongside `moe_gate_v4` and spared on exactly this distinction. That one was
+// DECLINED architecturally (routing is host work; INV-1 names one router). This one is
+// staged work behind a documented engine limitation, and deleting it would have thrown away
+// the bit-exactness evidence along with the kernel.
 #pragma clang fp contract(off)
 extern "C" __global__ void index_score_blocks(const float* __restrict__ q,
                                               const float* __restrict__ kv,
@@ -258,13 +271,13 @@ extern "C" __global__ void index_score_blocks(const float* __restrict__ q,
 extern "C" int rivoli_act_quant_f4_rotated(float* x, int rows, int d, void* stream) {
     if (rows <= 0 || d <= 0) return 1001;
     // Three real limits, each able to fire, each exercised by
-    // `the_spread_launcher_refuses_widths_the_hadamard_cannot_transform`. `V4I_D_MAX` bounds
+    // `the_spread_launcher_refuses_widths_the_hadamard_cannot_transform`. `ROTATE_D_MAX` bounds
     // the LDS tile; the power-of-two requirement is the Hadamard's, and `index_head_dim` is
     // the config field that would violate it; 1004 catches a width that is a power of two and
     // still SMALLER than the fp4 block, which would leave a ragged tail quantized against
     // nothing. An earlier comment called 1004 unreachable behind 1003 — it is not, `d = 16`
     // clears 1003 and fires 1004, and review caught the claim.
-    if (d > V4I_D_MAX) return 1002;
+    if (d > ROTATE_D_MAX) return 1002;
     if (d & (d - 1)) return 1003;
     if (d % FP4_QUANT_BLOCK) return 1004;
     hipGetLastError();

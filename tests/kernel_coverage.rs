@@ -326,7 +326,7 @@ const OWNERS: &[(&str, &[&str])] = &[
     ("gemm_bf16", &["v4compress.rs", "v4gpu.rs"]),
     ("gemv_f32", &["gpu.rs", "v4gpu.rs"]),
     ("gemv_fp8", &["gpu.rs"]),
-    ("gemv_fp8_grouped", &["attn.rs", "v4gpu.rs"]),
+    ("gemv_fp8_bf16", &["attn.rs", "v4gpu.rs"]),
     ("gemv_i4", &[]),
     ("gemv_i8", &["gpu.rs"]),
     ("gemv_vq", &[]),

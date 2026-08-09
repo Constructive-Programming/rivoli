@@ -5,7 +5,7 @@
 //! not, and its oracle stays in `tests/kernel.rs` where it was written. Named by
 //! `tests/kernel_coverage.rs` when the census was re-keyed onto `src/backend/hip.rs`.
 //!
-//! Not to be confused with `tests/v4_indexer_kernel.rs`, which scores `kernels/v4indexer.hip`
+//! Not to be confused with `tests/v4_indexer_kernel.rs`, which scores `kernels/blockindex.hip`
 //! — DeepSeek-V4's indexer, a different arithmetic on a different checkpoint. The naming
 //! follows the kernel files.
 //!

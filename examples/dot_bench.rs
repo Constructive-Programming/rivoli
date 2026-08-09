@@ -8,7 +8,7 @@
 //! A second section adds the two `docs/measurement/perf-roadmap.md` per-kernel targets (o_proj, lm_head) at
 //! their real engine shapes in GB/s. The MoE rows above are untouched, so numbers already
 //! recorded in docs/measurement/benchmarks.md stay comparable.
-//! The `v4gemv` section (2026-08-08) measures `gemv_fp8_grouped` serially at V4's seven decode
+//! The `v4gemv` section (2026-08-08) measures `gemv_fp8_bf16` serially at V4's seven decode
 //! shapes — the isolated kernel rate the M7 A/B record names as missing (its in-engine
 //! spans confound rate with exposure/contention; `docs/investigations/v4-decode-decomposition.md` §M8).
 //! The `v4res` section (2026-08-09) does the same for the fp4 routed experts' RESIDENT range
@@ -26,7 +26,7 @@ use rivoli::artifact::quant::{
 };
 use rivoli::backend::hip::{
     ExpertDesc, ExpertDescF4, attend_scratch_floats, device_sync, launch_act_quant_f8,
-    launch_argmax, launch_attend, launch_gemv_fp8, launch_gemv_fp8_grouped, launch_gemv_i4,
+    launch_argmax, launch_attend, launch_gemv_fp8, launch_gemv_fp8_bf16, launch_gemv_i4,
     launch_gemv_i8, launch_gemv_vq, launch_mla_absorb_fp8, launch_mla_value_fp8,
     launch_moe_acc_drain, launch_moe_expert_range_f4, launch_moe_expert_range_i4,
     launch_rmsnorm_single,
@@ -296,7 +296,7 @@ fn run_fp8(name: &str, o_dim: usize, i_dim: usize) {
     );
 }
 
-/// `gemv_fp8_grouped` at the engine's real decode shapes (m = 1) — the kernel M6 fired one
+/// `gemv_fp8_bf16` at the engine's real decode shapes (m = 1) — the kernel M6 fired one
 /// kill across three spans on (qkv 2.31×, oproj 1.99×, shared 2.82× bytes) and M7's
 /// unroll-8 attacked to 1.44–1.89×. Run SERIAL on an otherwise idle device, this is the
 /// instrument the M7 record said was missing: the engine's spans mix kernel rate with
@@ -333,7 +333,7 @@ fn run_v4_gemv(name: &str, n_out: usize, k: usize) {
     let us = time(60, &|| unsafe {
         let w = &wb[turn.get() % copies];
         turn.set(turn.get() + 1);
-        launch_gemv_fp8_grouped(
+        launch_gemv_fp8_bf16(
             xp,
             w.ptr(),
             sb.ptr() as *const f32,
@@ -363,7 +363,7 @@ fn run_v4_gemv(name: &str, n_out: usize, k: usize) {
         .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
     assert!(
         err <= 4e-3 * mx + 1e-3,
-        "{name}: gemv_fp8_grouped disagrees with matvec_fp8 (err {err:.2e} vs max {mx:.2e})"
+        "{name}: gemv_fp8_bf16 disagrees with matvec_fp8 (err {err:.2e} vs max {mx:.2e})"
     );
     // `seed` governs scales and `x` only — `pattern()` draws the weight bytes from its
     // own fixed generator — so the printed (seed, shape, blk) triple plus pattern()'s
@@ -1057,7 +1057,7 @@ fn run_tail_rest(vocab: usize, hidden: usize) {
 /// A/B can book only the rows it is about to compare.
 fn main() {
     // `v4gemv` and `v4res` KEEP their model-derived names, deliberately, where the kernels
-    // they drive were renamed for behaviour on 2026-08-09 (`gemv_fp8_grouped` and the fp4
+    // they drive were renamed for behaviour on 2026-08-09 (`gemv_fp8_bf16` and the fp4
     // resident range). These strings are the CLI of a benchmark whose runs are recorded in
     // `docs/measurement/benchmarks.md` — the M8 and M11 rounds name `dot_bench v4gemv` and
     // `dot_bench v4res` in their command lines — and that file is append-only history that

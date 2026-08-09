@@ -5,11 +5,11 @@
 //! implies, and the two *arithmetic* selection paths (`get_window_topk_idxs` :261,
 //! `get_compress_topk_idxs` :275) that need no learned weights and so belong on the host.
 //!
-//! The pooling itself is device work: `kernels/v4compress.hip`, launched in the reference's
+//! The pooling itself is device work: `kernels/kvcompress.hip`, launched in the reference's
 //! own order by [`compress`] below and scored against `Oracle::compressor` by
 //! `tests/v4_compress_kernel.rs`.
 //!
-//! The indexer's device half landed 2026-08-05 and is `kernels/v4indexer.hip`:
+//! The indexer's device half landed 2026-08-05 and is `kernels/blockindex.hip`:
 //! `act_quant_f4_rotated` (the Hadamard + fp4 finish, which is also [`Geom::indexer`]'s) and
 //! `index_score_blocks` (the `einsum`/relu/weight/sum chain), scored by
 //! `tests/v4_indexer_kernel.rs` — the spread against the oracle, the score against a host
@@ -503,7 +503,7 @@ pub enum Quantize {
     HadamardFp4,
 }
 
-/// The `repr(C)` mirror of `kernels/v4compress.hip`'s `V4Comp`, and the only part of
+/// The `repr(C)` mirror of `kernels/kvcompress.hip`'s `V4Comp`, and the only part of
 /// [`Geom`] that crosses the ABI wall.
 ///
 /// Split out from [`Geom`] when [`Geom::indexer`] landed. It would have been simpler to add
@@ -556,11 +556,11 @@ pub struct Geom {
 // was deleted 2026-08-06; `src/backend/hip.rs`'s `ExpertDesc` carries it now.)
 const _: () = assert!(
     size_of::<GeomAbi>() == 28 && align_of::<GeomAbi>() == 4,
-    "GeomAbi must stay six i32 and one f32 — the layout kernels/v4compress.hip's V4Comp declares"
+    "GeomAbi must stay six i32 and one f32 — the layout kernels/kvcompress.hip's V4Comp declares"
 );
 const _: () = assert!(
     size_of::<Finish>() == 3 * size_of::<*const f32>(),
-    "Finish must stay three pointers — kernels/v4compress.hip's V4Fin"
+    "Finish must stay three pointers — kernels/kvcompress.hip's V4Fin"
 );
 
 impl Geom {
@@ -704,7 +704,7 @@ impl Geom {
 }
 
 /// What the compressor's finish stage reads and writes — the same three pointers for both
-/// pool kernels, in `kernels/v4compress.hip`'s `V4Fin` layout.
+/// pool kernels, in `kernels/kvcompress.hip`'s `V4Fin` layout.
 ///
 /// One struct rather than three parameters because the three must AGREE with each other and
 /// nothing in a flat argument list makes them:
@@ -983,7 +983,7 @@ mod device {
                 // — dims [0, d-rd) at block **64**, leaving the RoPE tail in bf16 to match
                 // QAT. S2b's kernel, not a second one: `n` separate from `row_stride` is
                 // exactly this partial extent, and a second e4m3 quantizer in this tree
-                // would be the third (see `kernels/v4compress.hip`'s header).
+                // would be the third (see `kernels/kvcompress.hip`'s header).
                 // SAFETY: `b.fin.out` is `emitted · d` writable f32 by the field's contract.
                 Quantize::PartialFp8 => unsafe {
                     launch_act_quant_f8_prefix(

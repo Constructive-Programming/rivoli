@@ -35,7 +35,7 @@ pub mod math;
 /// the per-layer shape discriminants and the two *arithmetic* selection paths, all of which
 /// the offline converters and the CPU tests need without a device.
 ///
-/// The pooling is `kernels/v4compress.hip`, launched by the `rocm`-gated `device` submodule
+/// The pooling is `kernels/kvcompress.hip`, launched by the `rocm`-gated `device` submodule
 /// — so this module is no longer *entirely* ungated, and the split is deliberate: everything
 /// above `mod device` still compiles and tests with no feature and no GPU. The indexer's
 /// scoring is still device work that does not exist yet; it needs S2a's e2m1/e8m0 block.

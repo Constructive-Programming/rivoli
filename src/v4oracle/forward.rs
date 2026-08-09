@@ -283,7 +283,7 @@ defects! {
     HeadLogitsFromFirstRow,
 
     // -- candidate designs, modelled before they are built -------------------------------
-    /// The split-k fp8 GEMV's fold order (`gemv_fp8_grouped_splitk` — **NOT BUILT**; it lives on
+    /// The split-k fp8 GEMV's fold order (`gemv_fp8_bf16_splitk` — **NOT BUILT**; it lives on
 /// branch `wt/v4-splitk`, was measured and REJECTED in §M9, and must not be confused with
 /// `kernels/linalg.hip::gemv_fp8_splitk`, which is GLM's and ships), applied to
     /// exactly the GEMVs the device dispatch predicate selects — see [`Oracle::splitk_selects`]
@@ -348,7 +348,7 @@ impl Defect {
 
 /// The split-k GEMV's fold, on the oracle's own per-element arithmetic — one half of the
 /// partial-ordering spec in `docs/investigations/v4-decode-decomposition.md` §M9; the other
-/// half is `gemv_fp8_grouped_splitk` (unmerged — see [`Oracle::splitk_fold`]'s note), and
+/// half is `gemv_fp8_bf16_splitk` (unmerged — see [`Oracle::splitk_fold`]'s note), and
 /// `tests/v4_kernel.rs::the_splitk_kernel_folds_in_the_registered_partial_order` pins the
 /// kernel to a transliteration of the SAME spec bit-for-bit, which is what closes the
 /// "oracle models a different reassociation than the kernel executes" failure mode.
@@ -817,12 +817,12 @@ impl Oracle {
         }
     }
 
-    /// Whether the device would dispatch this GEMV to `gemv_fp8_grouped_splitk` — the oracle
+    /// Whether the device would dispatch this GEMV to `gemv_fp8_bf16_splitk` — the oracle
     /// half of the ONE dispatch predicate, spec'd in
     /// `docs/investigations/v4-decode-decomposition.md` §M9 and mirrored by
-    /// `kernels/mla.hip::rivoli_gemv_fp8_grouped`.
+    /// `kernels/mla.hip::rivoli_gemv_fp8_bf16`.
     ///
-    /// `WMat::Fp8` here stands for "goes through `gemv_fp8_grouped`" — every fp8-quantized
+    /// `WMat::Fp8` here stands for "goes through `gemv_fp8_bf16`" — every fp8-quantized
     /// linear on the oracle's path does, and the one fp8-on-disk tensor consumed as Dense
     /// (`wo_a`, whose device GEMV reads the fp8 bytes but is measured bit-equal to the
     /// bf16 dequant) is excluded by shape anyway: `n_out = 8192 > 2048`, and it is also

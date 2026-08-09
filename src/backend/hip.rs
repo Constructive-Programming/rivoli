@@ -206,7 +206,7 @@ macro_rules! launchers {
 //
 // The pairs worth knowing before reaching for either are documented AT the kernels, because
 // that is where the arithmetic that separates them is: `rmsnorm_single`/`rmsnorm_batch` (one
-// statistic vs one per row), `gemv_fp8`/`gemv_fp8_grouped` (input slicing and store dtype),
+// statistic vs one per row), `gemv_fp8`/`gemv_fp8_bf16` (input slicing and store dtype),
 // `swiglu`/`swiglu_clamped_bf16` (not one parameter apart at any `L`), and
 // `rope_interleave`/`rope_adjacent` (half-split vs adjacent pair convention).
 launchers! {
@@ -937,7 +937,7 @@ launchers! {
     /// signature took the row and group strides separately, where the in-bounds relation was
     /// a three-way inequality nothing checked. `stream` is a live `hipStream_t`, or null for
     /// the default stream.
-    launch_gemv_fp8_grouped -> rivoli_gemv_fp8_grouped, "gemv_fp8_grouped" (
+    launch_gemv_fp8_bf16 -> rivoli_gemv_fp8_bf16, "gemv_fp8_bf16" (
         x: *const f32,
         w: *const u8,
         wscale: *const f32,
@@ -977,7 +977,7 @@ launchers! {
     /// path, which is the one `Compressor.wkv`/`wgate` take (`Linear(..., dtype=float32)`,
     /// model.py:302).
     ///
-    /// Deliberately NOT [`launch_gemv_fp8_grouped`]: that one quantizes the activation to fp8 at
+    /// Deliberately NOT [`launch_gemv_fp8_bf16`]: that one quantizes the activation to fp8 at
     /// block 128 in front of the GEMM, which the reference does only for quantized `Linear`s.
     /// Sending the compressor through it would introduce a quantization the reference never
     /// applies, and the resulting error would be indistinguishable from a pooling bug.
@@ -1117,7 +1117,7 @@ launchers! {
     ///
     /// A prefill of `s` tokens deposits its `s % ratio` trailing rows starting at slot 0; a
     /// decode deposits its single row at slot `start_pos % ratio`. See
-    /// `kernels/v4compress.hip::kv_compress_deposit` for why that is a unification and not a
+    /// `kernels/kvcompress.hip::kv_compress_deposit` for why that is a unification and not a
     /// coincidence.
     ///
     /// Must be launched on **every** call, including one that emits no block: the reference

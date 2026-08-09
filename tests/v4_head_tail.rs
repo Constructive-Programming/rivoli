@@ -18,7 +18,7 @@
 //! - `hc_head_collapse_blend` sums over `hc_mult` copies SEQUENTIALLY, in the oracle's own ORDER,
 //!   so given the same gate vector it is exactly reproducible -- as an FMA reduction, which
 //!   is what hipcc's default `-ffp-contract=fast` makes it. Asserted bitwise against the
-//!   device's own `pre`, and against `mul_add` rather than `+ p * x`; see `kernels/v4head.hip`
+//!   device's own `pre`, and against `mul_add` rather than `+ p * x`; see `kernels/headtail.hip`
 //!   for the measurement.
 //! - `hc_head_collapse_gate` reduces 16384 terms with `wave_sum`, so it re-associates and is
 //!   compared under a tolerance.
@@ -27,7 +27,7 @@
 //! `Defect::HeadHcRsqrtPerCopy` — the mHC denominator taken per copy instead of over the
 //! flattened row — has a signal of the same ORDER as that re-association noise at real
 //! dimensions. **No tolerance here can separate it.** It is settled by reading
-//! `kernels/v4head.hip`, and pinned at small dimensions by
+//! `kernels/headtail.hip`, and pinned at small dimensions by
 //! `tests/v4_oracle.rs::the_head_tail_matches_torch_absolutely`, which compares against
 //! PyTorch itself.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
@@ -406,7 +406,7 @@ fn the_lm_head_needs_no_kernel_of_its_own() {
     // launcher, so the compiler folded them and no change to either could turn them red. That
     // is the "guard that cannot fire" this port has shipped twice, and it is deleted rather
     // than left to look like coverage. The real-extent argument lives in
-    // `v4compress.hip`'s own comment, beside the `(size_t)` cast that carries it.
+    // `kvcompress.hip`'s own comment, beside the `(size_t)` cast that carries it.
     let f = Fixture::new(512, 1024, 2);
     let (_, _, w_lg) = f.oracle();
     let (_, _, g_lg, _) = f.device();

@@ -106,7 +106,7 @@ use rivoli::attn::{
 use rivoli::backend::gpustream::{HipStream, Timeline};
 use rivoli::backend::hip::{
     device_sync, fill_u32, launch_act_quant_f8_prefix, launch_gather_attn_shared_kv,
-    launch_gemv_fp8_grouped, launch_rope_adjacent, memcpy_dtod_async,
+    launch_gemv_fp8_bf16, launch_rope_adjacent, memcpy_dtod_async,
 };
 use rivoli::math::{bf16_to_f32, e4m3_to_f32, f32_to_bf16, f32_to_e4m3};
 use rivoli::memory::device::DeviceBuf;
@@ -1864,7 +1864,7 @@ fn the_c_abi_argument_guards_reject_out_of_domain_shapes() {
                 std::ptr::null_mut(),
             )
         };
-        // head_dim past V4_ATTN_THREADS * V4_ATTN_ACC -- silently dropped dims otherwise.
+        // head_dim past GATHER_ATTN_THREADS * GATHER_ATTN_ACC -- silently dropped dims otherwise.
         guard(
             sparse_attn_at(1025, 8),
             "1002",
@@ -1879,12 +1879,12 @@ fn the_c_abi_argument_guards_reject_out_of_domain_shapes() {
         // A `groups` that does not divide `n_out` would index a slice no input was sized
         // for. This is the guard the three-parameter form could not express at all.
         guard(
-            launch_gemv_fp8_grouped(p, b.ptr(), p, 1, 10, 128, 128, 3, pm, std::ptr::null_mut()),
+            launch_gemv_fp8_bf16(p, b.ptr(), p, 1, 10, 128, 128, 3, pm, std::ptr::null_mut()),
             "1004",
             "groups not dividing n_out",
         );
         guard(
-            launch_gemv_fp8_grouped(p, b.ptr(), p, 1, 8, 128, 96, 1, pm, std::ptr::null_mut()),
+            launch_gemv_fp8_bf16(p, b.ptr(), p, 1, 8, 128, 96, 1, pm, std::ptr::null_mut()),
             "1003",
             "non-power-of-two block",
         );

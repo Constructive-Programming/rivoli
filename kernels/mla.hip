@@ -475,7 +475,7 @@ extern "C" __global__ void rope_adjacent(float* __restrict__ x, const float* __r
 // One wave per output row, via `dot_fp8_wave` — whose summation order is NOT the
 // oracle's sequential fold. That re-association is the floor on the tolerance, and it is
 // measured rather than assumed (tests/v4_attn.rs).
-extern "C" __global__ void gemv_fp8_grouped(const float* __restrict__ x,
+extern "C" __global__ void gemv_fp8_bf16(const float* __restrict__ x,
                                             const unsigned char* __restrict__ w,
                                             const float* __restrict__ wscale, int m, int n_out,
                                             int k, int block, int groups,
@@ -530,7 +530,7 @@ extern "C" int rivoli_act_quant_f8_prefix(const float* src, float* dst, int rows
     // `kernel.py::act_quant` asserts `N % block_size == 0`. Without this a ragged tail
     // block would be quantized against its own amax and produce values the reference
     // cannot produce — silently, since every shape in the model divides evenly today.
-    // 1004 is this file's divisibility code (cf. rivoli_gemv_fp8_grouped below); 1002 is a
+    // 1004 is this file's divisibility code (cf. rivoli_gemv_fp8_bf16 below); 1002 is a
     // size bound. Getting them the wrong way round costs nothing at the call site and
     // misleads everyone who learned the codes from the other ~60 launchers.
     if (n % block) return 1004;
@@ -577,7 +577,7 @@ extern "C" int rivoli_rope_adjacent(float* x, const float* tbl, int rows, int ro
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-extern "C" int rivoli_gemv_fp8_grouped(const float* x, const unsigned char* w, const float* wscale,
+extern "C" int rivoli_gemv_fp8_bf16(const float* x, const unsigned char* w, const float* wscale,
                                        int m, int n_out, int k, int block, int groups, float* out,
                                        void* stream) {
     if (m <= 0 || n_out <= 0 || k <= 0 || block <= 0 || groups <= 0) return 1001;
@@ -587,7 +587,7 @@ extern "C" int rivoli_gemv_fp8_grouped(const float* x, const unsigned char* w, c
     if (n_out % groups) return 1004;
     size_t total = (size_t)m * (size_t)n_out;
     hipGetLastError();
-    hipLaunchKernelGGL(gemv_fp8_grouped,
+    hipLaunchKernelGGL(gemv_fp8_bf16,
                        dim3((unsigned)((total + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK)),
                        dim3(ROWS_PER_BLOCK * WAVE), 0, (hipStream_t)stream, x, w, wscale, m, n_out,
                        k, block, groups, out);

@@ -84,7 +84,7 @@
 use rivoli::backend::gpustream::HipStream;
 use rivoli::backend::hip::{
     ExpertDescF4, device_sync, launch_act_quant_f8, launch_act_quant_f8_prefix,
-    launch_gemv_fp8_grouped, launch_hc_post, launch_hc_pre, launch_moe_acc_drain,
+    launch_gemv_fp8_bf16, launch_hc_post, launch_hc_pre, launch_moe_acc_drain,
     launch_moe_expert_range_f4, launch_rmsnorm_single, launch_swiglu_clamped_bf16,
 };
 use rivoli::memory::device::DeviceBuf;
@@ -1143,8 +1143,8 @@ impl FoldRow<'_> {
     /// (`common.hpp::fp8_dot_strided`: `q = x1·l1` rounded, then three fmas, then
     /// `acc = fma(s, q, acc)`; the scalar tail is `acc = fma(x·l, s, acc)`) — the
     /// transliteration BOTH fold-order tests build their partials from. `start`/`stride`
-    /// are the kernel's own arguments: `(lane, 32)` under wave-per-row `gemv_fp8_grouped`,
-    /// `(threadIdx.x, 256)` under `gemv_fp8_grouped_splitk`. One definition, because the two
+    /// are the kernel's own arguments: `(lane, 32)` under wave-per-row `gemv_fp8_bf16`,
+    /// `(threadIdx.x, 256)` under `gemv_fp8_bf16_splitk`. One definition, because the two
     /// tests pin the same chain against two different combine trees, and a drift between
     /// two copies would be indistinguishable from the kernel drift they exist to catch.
     fn chain(&self, start: usize, stride: usize) -> f32 {
@@ -1164,7 +1164,7 @@ impl FoldRow<'_> {
         acc
     }
 
-    /// The row under `gemv_fp8_grouped`'s WAVE-PER-ROW fold: 32 lane chains at stride 32, one
+    /// The row under `gemv_fp8_bf16`'s WAVE-PER-ROW fold: 32 lane chains at stride 32, one
     /// ladder (`v4oracle::forward::wave_ladder` — the shared definition). UNROUNDED — the
     /// caller applies the bf16 store where the kernel does.
     fn serial(&self) -> f32 {
@@ -1176,7 +1176,7 @@ impl FoldRow<'_> {
     }
 }
 
-/// Upload `(x, w, scales)` and dispatch `launch_gemv_fp8_grouped` at `(m, n_out, k, block)`,
+/// Upload `(x, w, scales)` and dispatch `launch_gemv_fp8_bf16` at `(m, n_out, k, block)`,
 /// groups = 1 — the device harness both fold-order tests share. Which KERNEL runs is the
 /// launcher's shape dispatch, which is part of what the split-k test asserts.
 fn gemv_fp8_on_device(
@@ -1195,7 +1195,7 @@ fn gemv_fp8_on_device(
     // `ceil(n_out/block) * ceil(k/block)` f32, `od` is `m * n_out` f32; `sync_f32` joins
     // the device before any buffer drops.
     unsafe {
-        launch_gemv_fp8_grouped(
+        launch_gemv_fp8_bf16(
             xd.ptr().cast(),
             wd.ptr().cast(),
             sd.ptr().cast(),
@@ -1208,7 +1208,7 @@ fn gemv_fp8_on_device(
             stream.raw(),
         )
     }
-    .expect("gemv_fp8_grouped dispatch");
+    .expect("gemv_fp8_bf16 dispatch");
     sync_f32(&od)
 }
 
@@ -1342,7 +1342,7 @@ fn every_byte_pattern_decodes_right_in_both_dot_paths() {
     assert_matches(&want, &got, "byte-pattern sweep (fp4)");
 }
 
-/// `gemv_fp8_grouped`'s summation ORDER, pinned bit-for-bit — the M7 unroll's oracle
+/// `gemv_fp8_bf16`'s summation ORDER, pinned bit-for-bit — the M7 unroll's oracle
 /// (`common.hpp::fp8_dot_strided`, docs/investigations/v4-decode-decomposition.md §M7).
 ///
 /// The fp8 twin of the sweep above cannot reuse its oracle: `Oracle::linear` folds
@@ -1976,14 +1976,14 @@ fn upload_fp8_shared(e: &ExpertW) -> Vec<(DeviceBuf, DeviceBuf)> {
         .collect()
 }
 
-/// One row of the resident fp8 shared expert on the GPU: three `gemv_fp8_grouped` and the clamped
+/// One row of the resident fp8 shared expert on the GPU: three `gemv_fp8_bf16` and the clamped
 /// combine, `Expert.forward` with `weights = None`.
 ///
 /// The launch order IS the arithmetic, so it is spelled rather than abstracted:
 /// `act_quant(x)` once (both `w1` and `w3` read the identical quantized row — the reference
 /// runs a separate `act_quant` inside each `Linear`, on the same row at the same block, so
 /// the bytes are identical), then `w1`/`w3`, then the combine, then `act_quant(h)` and `w2`.
-/// Every `gemv_fp8_grouped` bf16-rounds its own output, which is where `Linear`'s bf16 store lives.
+/// Every `gemv_fp8_bf16` bf16-rounds its own output, which is where `Linear`'s bf16 store lives.
 ///
 /// `limit` is a parameter and not `cfg.swiglu_limit` because the whole test below is an A/B
 /// on it. There is no way to ask for the unclamped form: the launcher refuses `<= 0`, NaN
@@ -2010,7 +2010,7 @@ fn gpu_shared_expert(
         launch_act_quant_f8_prefix(xq.ptr().cast(), xq.ptr_mut().cast(), 1, dim, dim, blk, st)
             .expect("act_quant x");
         let xp = xq.ptr().cast::<f32>();
-        launch_gemv_fp8_grouped(
+        launch_gemv_fp8_bf16(
             xp,
             w[0].0.ptr(),
             sc(0),
@@ -2023,7 +2023,7 @@ fn gpu_shared_expert(
             st,
         )
         .expect("w1");
-        launch_gemv_fp8_grouped(
+        launch_gemv_fp8_bf16(
             xp,
             w[2].0.ptr(),
             sc(2),
@@ -2049,7 +2049,7 @@ fn gpu_shared_expert(
         .expect("clamped swiglu");
         launch_act_quant_f8_prefix(g.ptr().cast(), g.ptr_mut().cast(), 1, inter, inter, blk, st)
             .expect("act_quant h");
-        launch_gemv_fp8_grouped(
+        launch_gemv_fp8_bf16(
             g.ptr().cast(),
             w[1].0.ptr(),
             sc(1),

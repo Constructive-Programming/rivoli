@@ -325,11 +325,11 @@ extern "C" int rivoli_mla_attend(
 // has NOT been measured, and S4 is where it gets priced rather than asserted.
 #pragma clang fp contract(off)
 
-#define V4_ATTN_THREADS 256
-// Output dims per thread. Caps `head_dim` at V4_ATTN_THREADS * V4_ATTN_ACC = 1024; the
+#define GATHER_ATTN_THREADS 256
+// Output dims per thread. Caps `head_dim` at GATHER_ATTN_THREADS * GATHER_ATTN_ACC = 1024; the
 // launcher rejects more rather than dropping dims, which is what an unchecked bound
 // would do — silently, and only in the tail of every head.
-#define V4_ATTN_ACC 4
+#define GATHER_ATTN_ACC 4
 
 // o[t][head] = ( Σ_j softmax_j(q[t][head]·kv[idx[t][j]] · scale) · kv[idx[t][j]] )
 // with `attn_sink[head]` added to the softmax DENOMINATOR ONLY.
@@ -363,20 +363,20 @@ extern "C" __global__ void gather_attn_shared_kv(const float* __restrict__ q,
     extern __shared__ float lds[];
     float* qs = lds;          // [d]   this head's query row
     float* lg = lds + d;      // [topk] logits, then softmax weights
-    __shared__ float red[V4_ATTN_THREADS];
+    __shared__ float red[GATHER_ATTN_THREADS];
     __shared__ float bc[2];   // running max, then the denominator
 
     const int tid = (int)threadIdx.x;
     const int head = (int)blockIdx.x, t = (int)blockIdx.y;
     const float* qrow = q + ((size_t)t * h + head) * d;
     const int* ix = idxs + (size_t)t * topk;
-    for (int i = tid; i < d; i += V4_ATTN_THREADS) qs[i] = qrow[i];
+    for (int i = tid; i < d; i += GATHER_ATTN_THREADS) qs[i] = qrow[i];
     __syncthreads();
 
     // Logits. One thread owns a whole key, so the d-loop is sequential in the same order
     // as the oracle's `for i in 0..d { acc += qh[i] * k[i] }`.
     float mx = -INFINITY;
-    for (int j = tid; j < topk; j += V4_ATTN_THREADS) {
+    for (int j = tid; j < topk; j += GATHER_ATTN_THREADS) {
         int p = ix[j];
         float l = -INFINITY;
         if (p >= 0) {
@@ -390,7 +390,7 @@ extern "C" __global__ void gather_attn_shared_kv(const float* __restrict__ q,
     }
     red[tid] = mx;
     __syncthreads();
-    for (int s = V4_ATTN_THREADS >> 1; s > 0; s >>= 1) {
+    for (int s = GATHER_ATTN_THREADS >> 1; s > 0; s >>= 1) {
         if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
         __syncthreads();
     }
@@ -399,14 +399,14 @@ extern "C" __global__ void gather_attn_shared_kv(const float* __restrict__ q,
     mx = bc[0];
 
     float ps = 0.0f;
-    for (int j = tid; j < topk; j += V4_ATTN_THREADS) {
+    for (int j = tid; j < topk; j += GATHER_ATTN_THREADS) {
         float e = (ix[j] >= 0) ? expf(lg[j] - mx) : 0.0f;
         lg[j] = e;
         ps += e;
     }
     red[tid] = ps;
     __syncthreads();
-    for (int s = V4_ATTN_THREADS >> 1; s > 0; s >>= 1) {
+    for (int s = GATHER_ATTN_THREADS >> 1; s > 0; s >>= 1) {
         if (tid < s) red[tid] += red[tid + s];
         __syncthreads();
     }
@@ -415,27 +415,27 @@ extern "C" __global__ void gather_attn_shared_kv(const float* __restrict__ q,
     const float denom = bc[1];
 
     // Values. `j` ascends over ALL slots, which is the oracle's accumulation order; the
-    // dims a thread owns are `V4_ATTN_THREADS` apart, so a wave reads 32 consecutive
+    // dims a thread owns are `GATHER_ATTN_THREADS` apart, so a wave reads 32 consecutive
     // floats of `kv` per step.
-    float acc[V4_ATTN_ACC];
+    float acc[GATHER_ATTN_ACC];
 #pragma unroll
-    for (int c = 0; c < V4_ATTN_ACC; ++c) acc[c] = 0.0f;
+    for (int c = 0; c < GATHER_ATTN_ACC; ++c) acc[c] = 0.0f;
     for (int j = 0; j < topk; ++j) {
         int p = ix[j];
         if (p < 0) continue;
         const float* kr = kv + (size_t)p * d;
         const float e = lg[j];
 #pragma unroll
-        for (int c = 0; c < V4_ATTN_ACC; ++c) {
-            int i = tid + c * V4_ATTN_THREADS;
+        for (int c = 0; c < GATHER_ATTN_ACC; ++c) {
+            int i = tid + c * GATHER_ATTN_THREADS;
             if (i < d) acc[c] += e * kr[i];
         }
     }
     // `sparse_attn` writes a bf16 tensor.
     float* orow = o + ((size_t)t * h + head) * d;
 #pragma unroll
-    for (int c = 0; c < V4_ATTN_ACC; ++c) {
-        int i = tid + c * V4_ATTN_THREADS;
+    for (int c = 0; c < GATHER_ATTN_ACC; ++c) {
+        int i = tid + c * GATHER_ATTN_THREADS;
         if (i < d) orow[i] = bf16f(f2bf16(acc[c] / denom));
     }
 }
@@ -452,12 +452,12 @@ extern "C" int rivoli_gather_attn_shared_kv(const float* q, const float* kv, con
     // dims that are silently never written — the tail of every head, with no error and no
     // fault. Nothing in the model approaches it (512 against a cap of 1024), which is
     // exactly why it has to be a hard rejection rather than a comment.
-    if (d > V4_ATTN_THREADS * V4_ATTN_ACC) return 1002;
+    if (d > GATHER_ATTN_THREADS * GATHER_ATTN_ACC) return 1002;
     size_t lds = ((size_t)d + (size_t)topk) * sizeof(float);
     // The static `red`/`bc` are counted here too: they come out of the same 64 KB.
-    if (lds + sizeof(float) * (V4_ATTN_THREADS + 2) > 65536) return 1006;
+    if (lds + sizeof(float) * (GATHER_ATTN_THREADS + 2) > 65536) return 1006;
     hipGetLastError();
-    hipLaunchKernelGGL(gather_attn_shared_kv, dim3((unsigned)h, (unsigned)m), dim3(V4_ATTN_THREADS),
+    hipLaunchKernelGGL(gather_attn_shared_kv, dim3((unsigned)h, (unsigned)m), dim3(GATHER_ATTN_THREADS),
                        (unsigned)lds, (hipStream_t)stream, q, kv, sink, idxs, h, d, topk, scale,
                        o);
     hipError_t e = hipGetLastError();

@@ -13,7 +13,7 @@
 //     defect, modelled as `Defect::HeadNormOverAllTokens`, and it is invisible at decode
 //     because `s == 1` there.
 //
-//   * the lm_head GEMV — `kernels/v4compress.hip::gemm_bf16` already computes
+//   * the lm_head GEMV — `kernels/kvcompress.hip::gemm_bf16` already computes
 //     `out[m,n] = x[m,k] . w[n,k]` for f32 activations against bf16 weights, which IS
 //     `logits = head.weight @ x` at `m = 1, n = vocab_size, k = hidden`. A second kernel
 //     differing only in extents would be pure duplication, and `kernels/` is NOT scanned
@@ -26,7 +26,7 @@
 // (`build.rs` covers `src`, `tests` and itself only) so nothing mechanical stops a third
 // copy of a helper from appearing.
 //
-// CORRECTED 2026-08-09. This said `mla.hip::v4_rbf16` and `v4compress.hip::v4c_rbf16` "are
+// CORRECTED 2026-08-09. This said `mla.hip::v4_rbf16` and `kvcompress.hip::v4c_rbf16` "are
 // already two separate copies of `common.hpp::rbf16`". They WERE; both have since been
 // folded into `common.hpp::rbf16` and neither identifier exists anywhere in `kernels/`. The
 // warning stands, the example was stale — which is the same failure it describes, wearing a

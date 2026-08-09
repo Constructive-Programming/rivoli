@@ -406,7 +406,7 @@ extern "C" __global__ void act_quant_f8(float* __restrict__ v, size_t nblk) {
 // engine in which changing it is meaningful. The launchers refuse anything else rather than
 // pretending to generalise.
 //
-// `v4head.hip::hc_head_collapse_gate` takes the same quantity as a runtime `hc` parameter, and
+// `headtail.hip::hc_head_collapse_gate` takes the same quantity as a runtime `hc` parameter, and
 // that is not an inconsistency to fix in either direction: the collapse genuinely is
 // width-agnostic, and this packing genuinely is not.
 #define HC_MULT 4
@@ -731,7 +731,7 @@ extern "C" int rivoli_swiglu(const float* g, const float* u, int n, float* h, vo
 
 // Takes a STREAM, as `rivoli_swiglu` directly above does since M7. Same reason `rivoli_hc_pre` gives
 // below: rivoli's streams are `hipStreamNonBlocking` (`async.hip`), so the null stream does
-// not implicitly order against them, and this runs between two `rivoli_gemv_fp8_grouped` launches
+// not implicitly order against them, and this runs between two `rivoli_gemv_fp8_bf16` launches
 // that are now stream-parameterised. A null-stream combine between two stream-ordered GEMVs
 // reads `g`/`u` before they are written — an unordered activation, which is a silent wrong.
 extern "C" int rivoli_swiglu_clamped_bf16(const float* g, const float* u, int n, float limit,

@@ -228,7 +228,7 @@ __host__ __device__ __forceinline__ int absorb_nquad(int kvl) { return (kvl + 3)
 // thread owns of `x·lut[w]·scale`, using a uint-per-lane load (4 fp8 → 128B/wave) atop
 // the LUT + a scalar tail. The caller reduces. [CORRECTED 2026-08-08: this said "shared
 // by `dot_fp8_wave` and `gemv_fp8_splitk`" — the splitk kernels moved to
-// `fp8_dot_strided_r` when the `_r` family landed, so `dot_fp8_wave` → `gemv_fp8_grouped` is
+// `fp8_dot_strided_r` when the `_r` family landed, so `dot_fp8_wave` → `gemv_fp8_bf16` is
 // the ONLY consumer, which is what scopes the M7 unroll's blast radius below.]
 __device__ __forceinline__ float fp8_dot_strided(const float* __restrict__ x,
                                                  const unsigned char* __restrict__ wrow,
@@ -255,7 +255,7 @@ __device__ __forceinline__ float fp8_dot_strided(const float* __restrict__ x,
     // issued its three vmem loads and then waited them all down (`s_waitcnt vmcnt(0)`
     // before the closing fmac, EVERY iteration), so each wave held exactly one 128-B
     // weight request in flight per GTT round-trip — M6 measured the only kernel built
-    // from this loop (`gemv_fp8_grouped`) at 2–2.8× its bytes on all three of its spans while
+    // from this loop (`gemv_fp8_bf16`) at 2–2.8× its bytes on all three of its spans while
     // issue sat at 42 instr/128 B, ~3× lighter than streaming needs. Unroll 8 puts 1 KB
     // of weight stream in flight per wave (read back from the ISA: loads `s_clause`'d,
     // waits counted down from vmcnt(23), ONE vmcnt(0) per 1 KB) at VGPR 86 = 96/wave =

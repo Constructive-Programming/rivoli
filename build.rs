@@ -42,9 +42,9 @@ fn main() {
         "vmm",
         "indexer",
         "async",
-        "v4compress",
-        "v4indexer",
-        "v4head",
+        "kvcompress",
+        "blockindex",
+        "headtail",
     ];
     let hipcc = std::env::var("HIPCC").unwrap_or_else(|_| "hipcc".into());
     // ponytail: default gfx1151 (Strix Halo); override for other ROCm nodes (e.g.
