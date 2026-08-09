@@ -3687,3 +3687,155 @@ observed spread is up to 1.1% within an arm and 1.3% control-to-main. The **+2.5
 decode cost — the cell the matched-depth reading turns on — is roughly 2x that spread, and the
 same-epoch pair alone (B3 199.7 vs C2 194.5) gives +2.7%. It is a small number measured few
 times, and it is the weakest load-bearing cell in the round.
+
+## V4 M11b fp4-unroll engine A/B — byte-identical 9/9, Δwall −1.70/−2.53 in band, 77–85% of the MoE bracket reaches the wall, arm order confounded (2026-08-09)
+
+Three arms x n = 3. Arm S = `95941a1`; **C1 = `7739b5d` (`#pragma unroll 2` on
+`dot_f4_wave_r`'s dword loop), C2 = `0ef4ae7` (the same line at 4)**, both committed to
+`wt/v4-res-fp4`, each built via `git archive` into its own scratch tree. All three binaries
+built before the first arm (15:00, 16:29, 16:30 → first arm 16:32); **no build between arms**.
+Command flag-identical to M2..M10, prompt md5-verified `bc71afa745d980be7d21860f70ad96aa`
+before the first run:
+
+```
+flock /var/run/sys-gpu.lock -c '<arm-binary> /var/db/rivoli/v4-f4-full -bench 512 --prompt "<prompt>"'
+```
+
+Witness named (KFD holders via `/proc/<pid>/comm`) either side of all 9 arms: **`kfd=[]`, GTT
+18,673,664 B before and after every one, `/running` empty throughout.** Nothing discarded.
+
+**BYTE-IDENTITY: 9 of 9, all five registered components, checked before any span was read.**
+Reply md5 `75b19fcde806059b45c515259feb16d2` (1983 B), counters 179389 hit / 8693 miss, 2538
+raw decode misses, **and both split identities exact on every arm (ATTN resid 0.00, MOE resid
+0.0)**. The checker is written fail-closed and was
+**re-proved red against an empty log and against a wrong raw count before use** — a gate that
+has only ever been seen green is not a gate.
+
+| span | S (n=3) | C1 | C2 | ΔC1 | ΔC2 | C1→C2 | worst spread |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **wall** | 106.63 | 104.93 | 104.10 | **−1.70** | **−2.53** | −0.83 | 2.80 |
+| **moe** (host bracket) | 38.87 | 36.67 | 35.90 | **−2.20** | **−2.97** | −0.77 | 2.10 |
+| route | 44.80 | 44.73 | 44.70 | −0.07 | −0.10 | −0.03 | 0.40 |
+| remainder | 23.00 | 23.50 | 23.43 | +0.50 | +0.43 | −0.07 | 1.10 |
+| fetch | 9.20 | 9.40 | 9.30 | +0.20 | +0.10 | −0.10 | 1.30 |
+| ms/miss | 1.86 | 1.90 | 1.88 | +0.04 | +0.02 | −0.02 | 0.25 |
+| **res** | 27.83 | 24.73 | 24.17 | **−3.10** | **−3.67** | −0.57 | 0.40 |
+| **shared** | 15.93 | 15.00 | 10.90 | −0.93 | **−5.03** | −4.10 | 0.20 |
+| sync2 | 35.70 | 33.00 | 32.47 | −2.70 | −3.23 | −0.53 | 1.10 |
+| miss (span) | 8.73 | 9.00 | 9.33 | +0.27 | +0.60 | +0.33 | 1.30 |
+| attn | 39.40 | 39.50 | 39.43 | +0.10 | +0.03 | −0.07 | 0.20 |
+| qkv / oproj | 14.90 / 21.30 | 14.93 / 21.37 | 14.83 / 21.37 | ~0 | ~0 | ~0 | 0.20 |
+| tail | 8.20 | 8.20 | 8.23 | 0.00 | +0.03 | +0.03 | 0.10 |
+| tok/s | 9.38 | 9.54 | 9.61 | +0.16 | +0.23 | +0.07 | 0.26 |
+
+Per-arm, in run order (pass 1 / 2 / 3):
+
+| | S | C1 | C2 |
+|---|---|---|---|
+| wall | 106.1 / 107.0 / 106.8 | 106.0 / 105.1 / 103.7 | 102.8 / 103.9 / 105.6 |
+| moe | 38.7 / 39.2 / 38.7 | 37.7 / 36.7 / 35.6 | 35.0 / 35.7 / 37.0 |
+| res | 28.1 / 27.7 / 27.7 | 24.6 / 24.8 / 24.8 | 24.2 / 24.2 / 24.1 |
+| shared | 16.0 / 15.9 / 15.9 | 15.0 / 15.0 / 15.0 | 10.8 / 10.9 / 11.0 |
+| sync2 | 36.1 / 35.7 / 35.3 | 33.5 / 33.0 / 32.5 | 31.9 / 32.5 / 33.0 |
+| remainder | 22.4 / 23.3 / 23.3 | 23.9 / 23.6 / 23.0 | 23.0 / 23.2 / 24.1 |
+
+The registered "wall within ±3% of the recorded 106.8 class" gate governs the control, and
+**S passes on all three runs** (106.1–107.0 = −0.7% to +0.2%). C2's fastest run, 102.8, is 3.7%
+under the class — outside on the fast side, which is what a lever is for.
+
+**How much of the MoE bracket's saving reaches the wall: 77–85%.** The additive
+aggregate is `moe`, the host bracket (`v4gpu.rs`: `moe_ns` = shared_expert + routed_experts,
+containing the `sync2` that joins every stream). `res`, `shared` and `miss` are device pairs
+that **attribute** what the host spans expose and are documented at their definition site as
+**NOT part of the sum** — shared overlaps the resident batch since M7, res and miss overlap
+each other across streams.
+
+| | Δ moe | Δ wall | passthrough |
+|---|---:|---:|---:|
+| S → C1 | −2.20 | −1.70 | **77%** |
+| S → C2 | −2.97 | −2.53 | **85%** |
+| C1 → C2 | −0.77 | −0.83 | *(both inside the 2.1–2.8 spread; not a rate)* |
+
+**The shortfall has a name: `remainder`.** `wall = route + moe + remainder` closes to ±0.07 on
+all three arms (S 106.67 vs 106.63, C1 104.90 vs 104.93, C2 104.03 vs 104.10), so:
+
+| | Δ route | Δ moe | Δ remainder | = Δ wall |
+|---|---:|---:|---:|---:|
+| S → C1 | −0.07 | −2.20 | **+0.50** | −1.70 |
+| S → C2 | −0.10 | −2.97 | **+0.43** | −2.53 |
+
+The 15–23% that does not reach the wall is **`remainder` growing**, not attention absorbing it:
+`attn` moved +0.10/+0.03. Why `remainder` grows is NOT established here and is not claimed — it
+is the first thing the next round should bracket.
+
+**Measured on-device the KERNEL saving is `res`, and its retention is lower: 55% and 69%**
+(−1.70/−3.10, −2.53/−3.67). `moe` is a host bracket that also carries launch and stream
+mechanics; `res` is the device pair for the loop the pragma changed. Both belong in the record —
+the bracket's 77–85% is what the wall arithmetic uses, the loop's 55–69% is what a future kernel
+lever should be priced against.
+
+**`shared` −5.03 is real, large, and NOT a wall saving.** `sync2` — "the exposure of
+resident-batch compute and miss stragglers, whichever stream drains last" — moves only −0.53
+from C1 to C2, tracking `res` (−0.57) rather than `shared` (−4.10). **The shared chain was
+never the last stream to drain**, so 4 ms of it vanishing costs the wall nothing. The mechanism
+behind the span move is co-residency: at `unroll 4`, `moe_gateup_f4` allocates **125 VGPRs**
+and crosses to **10 waves/SIMD** where `unroll 2` stays at 74 VGPR / **16 waves, unchanged**
+(M11 probe D's compiler-sourced table). That threshold matches the measured non-monotone
+response — C1 takes 84% of the `res` win but only 18% of the `shared` win. A competing "res
+finished earlier so shared contended less" reading is ruled out: the shared chain is
+enqueued before the resident launch with both after the same `device_sync`, so it runs inside
+the resident batch's window rather than after it, and an earlier `res` finish cannot uncover
+it.
+
+**The wall: complete separation, and a design flaw that stops it being attributed.** Exact
+one-sided rank tests on the 9 walls: **S vs C1 and S vs C2 are both completely
+separated at p = 0.050, the floor attainable at 3 v 3** (and the three S runs are the three
+slowest of nine). But the design confounds it: **arm order was fixed S, C1, C2 in every
+pass**, so arm is perfectly aliased with position-in-pass, and 2 of 3 passes fall monotonically
+with position. A warm-up effect and a lever effect are observationally identical here.
+
+`fetch` (9.20 / 9.40 / 9.30) and `ms/miss` (1.86 / 1.90 / 1.88) show no position trend, where
+page-cache warming with position would move them. That is the only probe here with
+discriminating power — "`res` separates by arm" is exactly what a position effect would also
+produce, so it argues nothing. It is not conclusive, and **the next round randomizes arm order rather than adding runs: more n cannot
+break an alias.**
+
+**Registered items, scored.**
+
+- **Bands: C1 −1.70 in −1.5..−4.3; C2 −2.53 in −2.5..−7.1 (by 0.03, i.e. 0.7% of a 4.6-wide
+  band).** Both met; C2's is a technicality and is marked as one. Δwall > +0.5 KILL unfired.
+- **The `|Δ| < 3` rule is a REPLICATE TRIGGER, and it fired.** Registered as "`|Δ| < 3 ms`
+  replicates" and applied by M10 as a trigger, not a pass/fail: C1's paired Δwall set is
+  [−0.1, −1.9, −3.1] and C2's is [−3.3, −3.1, −1.2], so single pairs on both sides fall under 3
+  and replicates were owed — which is why this round ran **n = 3 where the registration said
+  n = 2**. An earlier draft read the rule as a test on the SPREAD of the paired set and reported
+  C1 as failing; that is not the registered reading, and under a literal per-pair reading C2
+  would fail harder. **No arm fails.**
+- **The `miss ≥ 10` KILL did not fire** — spans 8.73 / 9.00 / 9.33, with a single-arm maximum
+  of 9.80 (C2c). That is the closest this family has come; ms/miss 1.86–1.90 sits inside its
+  recorded spread and fetched bytes are 0.07 GB on all nine arms.
+- **The registered tok/s projections both landed**: C1 measured 9.54 against 9.49–9.73, C2
+  9.61 against 9.57–9.99.
+- **Neither arm reaches 10 tok/s**, as stated before measuring. No run printed ≥ 10.
+
+**The microbench rate does NOT transfer at a constant ratio — it degrades sharply with depth**,
+which is M9's lesson recurring quantitatively and is the honest diminishing-returns story:
+
+| | microbench Δtime | engine `res` Δ | transfer |
+|---|---:|---:|---:|
+| S → C1 (146.63 → 172.55 GB/s) | −15.0% | −11.1% | **74%** |
+| S → C2 (146.63 → 195.27) | −24.9% | −13.2% | **53%** |
+| C1 → C2 (172.55 → 195.27), marginal | −11.6% | −2.3% | **20%** |
+
+**Blast radius:** the spans the lever cannot touch are flat — `attn` +0.10/+0.03, `qkv`,
+`oproj` and `tail` within 0.07, `route` within 0.10 — matching the pre-device compile of all 11
+kernel files that found only `moe.o` changed (`v4indexer` byte-identical). `remainder` (+0.50 /
++0.43), `fetch` (+0.20/+0.10) and the `miss` span (+0.27/+0.60) are NOT flat; `remainder` is
+accounted for above, the other two are inside their own spreads (1.30, 1.30).
+`sync2` moved −2.70/−3.23 and is not `res`; per the registered blast-radius rule it gets an
+explanation rather than a pass — it is the join that exposes `res`, so it moves with it by
+construction.
+
+**No merge decision is taken here.** Both arms are byte-identical; C2 is ahead on every
+moe-side span and on the wall mean, at 10 waves/SIMD on gate/up and with only 20% marginal
+transfer for its extra depth. The choice goes to the user with this record.
