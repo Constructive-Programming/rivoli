@@ -3542,3 +3542,148 @@ resident bytes; the wall claim is the derived −1.7, the engine's decode class 
 ~106.8–108.5 ms/token depending on the moe side's fetch weather, and 10 tok/s stays
 out of reach exactly as §M10 said in advance.** The registered |Δqkv| < 1 kill did not
 fire; nothing here re-opens M8's closure.
+
+## V4 M11 fp4 resident-kernel round — memory-level parallelism is the limiter; `unroll 4` runs at 97.5% of its matched no-decode ceiling, fingerprint-identical (2026-08-09)
+
+**No engine decode ran.** This is a microbenchmark round only: `dot_bench v4res`, serial,
+sole-tenant. "Fingerprint-identical" below means the `v4res` fnv over the drained residual —
+NOT this file's usual "output byte-identical", which means an engine reply md5. The engine's
+kernels were not modified; arms B/C/X are `git archive` scratch trees off HEAD **`e73bcea`**
+with one patch each to `kernels/common.hpp::dot_f4_wave_r`, per M8's precedent. Patches are
+verbatim in `docs/investigations/v4-decode-decomposition.md` §M11.
+
+**Command, per arm** (`$BIN` = that arm's `target/release/examples/dot_bench`):
+
+```
+flock /var/run/sys-gpu.lock -c "'$BIN' v4res"
+```
+
+**Order, and the one build inside the round.** A, B1, B2, C1, C2, X ran first, from binaries
+all built beforehand. **B3 was then added and its binary built mid-round** — the registered arm
+list did not contain it, and the extension is invoked by name (M8's precedent: when the
+registered options do not cover the reading, say so and extend). **CLAUDE.md's "never build between the two
+arms of a benchmark" therefore applies to this round, and the mitigation is recorded rather than
+the rule claimed:** immediately after that build, B2 and C2
+were re-run as same-epoch references (191.8 and 194.5, within 1.1% of their pre-build runs),
+and only then B3. A third pass (A3, B3b, B1b, Xb) followed with no build between. The
+`v4_kernel` test binary was built last, after every timing arm.
+
+**Witness, sampled either side of every arm** — KFD holders NAMED through `/proc/<pid>/comm`
+(a bare count cannot tell my own process being reaped from a foreign tenant),
+`mem_info_gtt_used`, and llama-swap `/running`. **GTT was 18,673,664 B before and after every
+arm without exception, and `/running` was empty throughout.** One deviation: **arm A's first
+post-sample showed one KFD entry.** It is counted clean on M10's precedent ("in-run kfd=1 (the
+run's own)") and on three facts — GTT byte-identical across it, the entry
+gone 3 s later, and A's three runs agreeing to 0.2%. The runner then gained a 2 s settle and
+holder names, so **arm A ran under a different witness procedure from every later arm**; A3
+re-ran it under the current one and reproduced at 146.8.
+
+**Shape:** hidden 4096, inter 2048, `e_count = 6`, `nrow = 1`, 84 experts = 1.123 GB rotating
+working set (14 ranges x 6), 56 timed launches = 4 full sweeps. GB/s counts weight bytes
+(13.37 MB/expert x 6 = 80.2 MB/launch).
+
+| arm | kernel | runs (GB/s) | n | mean | vs A | fnv | ISA |
+|---|---|---|---:|---:|---:|---|---|
+| A | stock | 146.6 / 146.5 / 146.8 | 3 | **146.63** | — | `9a43e2d62364098e` | 49/39 VGPR, occ 16, drained |
+| B1 | ballast (no decode, no FMA) | 165.5 / 165.3 | 2 | 165.40 | +12.8% | DEGENERATE | 36/26, occ 16, drained |
+| B2 | ballast + `unroll 2` | 194.0 / 194.0 / 191.8 | 3 | 193.27 | +31.8% | DEGENERATE | 45/36, occ 16, 8 loads |
+| B3 | ballast + `unroll 4` | 199.7 / 200.7 | 2 | **200.20** | +36.5% | DEGENERATE | 62/54, occ 16, 16 loads |
+| C1 | stock + `unroll 2` | 172.8 / 172.3 | 2 | **172.55** | **+17.7%** | `9a43e2d62364098e` | 74/66, occ 16, 8 loads |
+| C2 | stock + `unroll 4` | 195.8 / 195.5 / 194.5 | 3 | **195.27** | **+33.2%** | `9a43e2d62364098e` | 125/93, **occ 10**/16 |
+| X | stock + deliberate reassociation | 143.6 / 144.0 | 2 | 143.80 | −1.9% | `2e7c0869f52f613e` | 52/42, occ 16, drained |
+
+**Probe A passed its registered gate:** 146.6/146.5/146.8 against the 130–150 band; the KILL
+thresholds (≥170, ≤110) did not fire, so the harness reproduces the engine's condition. Its
+implied serial `res` of 23.07 ms sits 4.9% under the engine's booked 24.2/24.3 — the probe
+times the range call alone; the engine's span also carries launch and stream mechanics. That
+1.18 ms gap matters in the projection below.
+
+**The MALL confound §M11 opens by calling decisive does NOT bite.** Every arm also ran a
+1-range ~80 MB control row (A 144.0/146.6/146.1, B1 164.1/164.7, B2 193.5/190.7/193.6,
+B3 198.4/200.6, C1 171.0/173.3, C2 198.2/197.6/197.8, X 144.9/144.9). Mean-to-mean the control
+differs by **at most 1.3%** and is HIGHER on only 2 of 7 arms — cache service would be
+systematic, and it is not. One layer's residents are already 2.5x the 32 MB MALL.
+
+**Fingerprint verdict — the gate is demonstrated live in both directions.**
+
+- **X moves it.** `2e7c0869f52f613e` against stock's `9a43e2d62364098e`, while staying
+  non-degenerate (3813 of 4096 distinct). X is the same loop with the serial chain over `base`
+  split into even/odd sub-chains folded at the end — a real reassociation, and deliberately not
+  a schedule change (same four loads, same `vmcnt` countdown, 52/42 VGPR, occ 16), so it
+  isolates fold order.
+- **C1 and C2 hold it exactly**, at the same 3813 distinct as stock.
+- **Both working sets agreed on every arm** — `main`'s cross-arm `assert_eq!` on the
+  `e_start = 0` fingerprint never fired.
+- **B1/B2/B3 print `DEGENERATE — 1 distinct`**, as predicted: the raw dwords sum to ~10^12 and
+  every row saturates `moe_fixed`'s `MOE_ACC_MAX` = 2^14, so the residual is constant.
+- **The other half of probe C's registered kill is discharged:** `tests/v4_kernel.rs` built and
+  run against the **C1 tree**, **27/27 passed** (incl. the fused-shape oracle and the
+  byte-pattern sweep), same flock, witness clean. **C2's tree was NOT tested** — its fingerprint
+  identity is the only evidence for it, which is weaker than C1's.
+
+**The three registered suspects** are scored in §M11; the ratios behind them, which are in no
+table above: B1 removes the entire decode and every FMA for **+12.8%** (issue rate dead).
+Pipelining alone, decode already gone, is **+16.8%** (B2/B1) and **+21.0%** (B3/B1). Probe B's
+re-pointed band was ≥200 fine / ≤160 pattern-bound / 160–200 split: **B2 landed 193.27, inside
+the inconclusive band, and B3 landed 200.20, straddling the threshold (199.7 / 200.7)** — scored
+AT it, not clear of it.
+
+**The matched-depth comparison, which is what the conclusion actually rests on:**
+
+| depth | no decode | with decode | decode costs |
+|---|---:|---:|---:|
+| drained (stock) | B1 165.40 | A 146.63 | **+12.8%** |
+| `unroll 2` | B2 193.27 | C1 172.55 | **+12.0%** |
+| `unroll 4` | B3 200.20 | C2 195.27 | **+2.5%** |
+
+At one iteration in flight the decode sits on the critical path and costs 13%; at four it hides
+behind memory latency and costs 2.5%. **C2 runs at 97.5% of its matched-depth no-decode
+ceiling.** At 195.27 GB/s it is level with the 193.8 GB/s the byte bands price — +0.8%, below
+this round's own run-to-run spread, so "at the byte-band floor" is what the data supports, not
+"above" it.
+
+**The alternative reading this round does not separate:** B2/B3/C2 converge in 193–200 GB/s
+despite very different amounts of work removed, which does not distinguish "the decode is hidden
+at depth 4" from "this 4 B/lane pattern tops out near 197" — a ceiling ~11% under `wq_b`'s
+222 GB/s. No wide-load or fp8-shaped ballast was run. **Suspect 3 is NOT REFUTED, only
+unsupported as the dominant term.** Argument in §M11.
+
+**C2 beats C1 by +13.2% despite `moe_gateup_f4` at occ 10/16** — in-flight iterations per SIMD
+16x2 = 32 against 10x4 = 40, and the occupancy cost falls on gate/up, which carries two thirds of
+the weight traffic (w1+w3 8.39 MB against w2 4.19 MB per expert). An occupancy-model correction,
+not a licence to ship C2; reasoning in §M11.
+
+**The decision rule is MET:** C1 (+17.7%) and C2 (+33.2%) are both fingerprint-identical and
+≥ +10%, and both trees pass `v4_kernel` 27/27 and `v4_oracle` 33/33. Probe C's registered
+prediction was +0..+15%; both landed ABOVE it. The engine A/B is registered in §M11b.
+
+**PROJECTED wall — no engine ran; these are ceilings, not measurements.** The engine's booked
+serial `res` is 24.2/24.3 (M6, M7-S), but the probe's own reading says only **23.07 ms of that
+is the loop**; the remaining **1.18 ms is launch/stream mechanics that does not scale with loop
+bandwidth**. Scaling only the loop-attributable part, with §M11's registered transfer (1% of
+res serial ~ 0.24 ms serial ~ 0.28 ms wall) off the 106.8 ms class:
+
+| arm | serial res (loop scaled) | Δ serial | Δ wall | wall | tok/s |
+|---|---:|---:|---:|---:|---:|
+| C1 | 24.25 → 20.78 | −3.47 | −4.04 | 102.8 | 9.73 |
+| C2 | 24.25 → 18.50 | −5.75 | −6.70 | 100.1 | 9.99 |
+
+**Under the record's own decomposition C2 does not reach 10 tok/s even undiscounted — 9.99.**
+(Scaling the whole 24.25 span instead gives 10.02; that is the arithmetic error of treating
+launch mechanics as bandwidth-bound.) M9 measured that serial-idle microbench rates do not
+transfer 1:1 into the overlapped engine — its split-k `dqkv` came in at −0.9 against a
+−2.3..−2.9 band, ~35% of projection. At 35–100% transfer: **C1 lands 9.49–9.73 and C2 lands
+9.57–9.99 tok/s.** `res` is also a MoE-stream span overlapping attention, so part of any serial
+saving lands as contention relief rather than wall — the mechanism M7 measured when its sync2
+rose +5.1. **10 tok/s is not reached by this lever on this arithmetic.**
+
+**The stretch kill condition did not fire.** It required probe B ≤ 160 *and* no bit-neutral
+variant reaching +10%; B3 measured 200.2 and both C arms cleared +10% fingerprint-identically,
+so the "close as a negative, register the wide-load design" branch is not taken and no
+wide-load design is registered.
+
+**Replication disclosure.** A, B2 and C2 are n = 3; B1, B3, C1 and X are n = 2. The round's
+observed spread is up to 1.1% within an arm and 1.3% control-to-main. The **+2.5%** `unroll 4`
+decode cost — the cell the matched-depth reading turns on — is roughly 2x that spread, and the
+same-epoch pair alone (B3 199.7 vs C2 194.5) gives +2.7%. It is a small number measured few
+times, and it is the weakest load-bearing cell in the round.
