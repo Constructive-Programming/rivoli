@@ -1469,9 +1469,16 @@ fn each_in_scope_defect_is_further_away_than_the_kernels_are() {
     // score reduction, and the six `Head*` variants live after the last block entirely, so
     // none of them can reach an attention golden. Classification only; `in_scope()` is
     // unchanged, which is why the first count still reads 15.
+    //
+    // 35 -> 36 on 2026-08-09: `SplitKFoldOrder` (added 2026-08-08 by M9's apparatus,
+    // `a552e33`, which did not update this census — caught by this test's first device
+    // run since, during M10's gate round). OUTSIDE, for the `KvActQuantBlock128` reason:
+    // M9 measured every golden tensor BIT-IDENTICAL under the fold (467/467 at l4d8) —
+    // its drift is sub-bf16 at these tensors, so this metric cannot resolve it; the
+    // split-k drift instrument (`--logit-dump`, §M9) is the gate that scores it.
     assert_eq!(
         (listed.len(), outside),
-        (15, 35),
+        (15, 36),
         "the oracle's defect set changed: {} in S2b's scope, {outside} outside. Re-decide \
          which side each new breakage falls on -- and note that `QkNormAfterRope` and \
          `KvActQuantBlock128` are outside because this METRIC cannot resolve them, not \
