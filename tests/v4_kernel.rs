@@ -44,6 +44,13 @@
 //!    128`, so `moe_down_f4` never enters `dot_f4_wave_r`'s 8-nibble dword fast path (it
 //!    needs `WAVE·8 = 256` columns) — only `moe_gateup_f4` does, at exactly one iteration.
 //!    Both PATHS run; neither runs at depth.
+//!
+//!    > **CORRECTED 2026-08-09.** Depth is no longer uncovered:
+//!    > `the_dword_path_matches_the_oracle_at_multiple_trips` runs a second fixture at
+//!    > 1280/1024, where gate/up takes 5 dword trips and `moe_down_f4` DOES enter the fast
+//!    > path at 4. The gap this point recorded is what let M11's `#pragma unroll` ship with
+//!    > 27 green tests that never executed the unrolled body; the register stays so the next
+//!    > geometry-bound claim is read as one.
 //! 5. **The e8m0 endpoints and the e2m1/e8m0 codes the fixture happens not to contain.**
 //!    There is no exhaustive codec probe here — the accumulator's dynamic range forbids one
 //!    (see [`the_fixture_exercises_the_codes_the_decoders_are_credited_with`], which
@@ -110,15 +117,23 @@ use common::{f32b, f32v, max_abs, report_rel, residual_probe};
 /// file constructs a fresh one per `Defect` — running the breakage matrix is its whole job.
 /// This file only ever wants `Defect::None`: the deliberate breaks here live in the KERNEL
 /// side, not in the oracle.
-fn fixture() -> &'static (V4Config, ToyModel, Oracle) {
-    static M: OnceLock<(V4Config, ToyModel, Oracle)> = OnceLock::new();
-    M.get_or_init(|| {
-        let cfg = V4Config::toy();
-        let m = toy::build(&cfg);
-        let o = Oracle::new(cfg.clone(), Defect::None);
-        (cfg, m, o)
-    })
+fn fixture() -> &'static Fx {
+    static M: OnceLock<Fx> = OnceLock::new();
+    M.get_or_init(|| build_fixture(V4Config::toy()))
 }
+
+type Fx = (V4Config, ToyModel, Oracle);
+
+/// Shared because `build.rs`'s jscpd gate rejects the second copy of these two lines.
+fn build_fixture(cfg: V4Config) -> Fx {
+    let m = toy::build(&cfg);
+    let o = Oracle::new(cfg.clone(), Defect::None);
+    (cfg, m, o)
+}
+
+/// `WAVE * 8`, one dword-loop iteration of `dot_f4_wave_r` — a kernel constant this file
+/// cannot see.
+const F4_COLS_PER_TRIP: usize = 256;
 
 /// Upload to a fresh device buffer. `max(1)` because a zero-length allocation is not a
 /// thing this allocator does and an empty span is never what a caller meant.
@@ -439,7 +454,13 @@ impl Case {
     /// large values cross it. Two picks at fixed ids with DIFFERENT, non-unit weights, so a
     /// kernel that dropped the routing weight or reused one for both experts fails.
     fn new(layer: usize, tag: &str, scale: f32) -> Self {
-        let (cfg, m, o) = fixture();
+        Self::at(fixture(), layer, tag, scale)
+    }
+
+    /// The same, against a chosen fixture — the multi-trip test needs this construction at
+    /// other dims.
+    fn at(fx: &'static Fx, layer: usize, tag: &str, scale: f32) -> Self {
+        let (cfg, m, o) = fx;
         let lw = &m.layers[layer];
         let x = draw_x(tag, cfg.dim, scale);
         let mut wexpert = vec![0.0f32; cfg.n_routed_experts];
@@ -657,6 +678,70 @@ fn a_dispatch_split_into_ranges_matches_one_range() {
         bits(&c.gpu()),
         bits(&split),
         "range split perturbed the sum"
+    );
+}
+
+/// The dword fast path at a MULTI-TRIP shape — the only test in this file that reaches one.
+/// At `V4Config::toy` gate/up runs this loop exactly ONCE (`dim 256` = `WAVE * 8`) and
+/// `moe_down_f4` never enters it at all (`moe_inter_dim 128`), so `#pragma unroll N` executes
+/// only the remainder copy everywhere else in this file. Why the test was owed and how
+/// 1280/1024 was derived (including why the first-registered 768/512 would have been vacuous
+/// at depth 4): `docs/investigations/v4-decode-decomposition.md` §M11b — re-derive there if
+/// the pragma ever goes past 4.
+///
+/// **Measured against injected defects 2026-08-09, so nobody over-trusts it:**
+///   * FIRES on arithmetic wrong only past the first trip (`n7` forced to 0 when `base != 0`):
+///     `err=8.133e-2 > tol=1.247e-3`, 65x, while all 27 pre-existing tests stay green. That
+///     pair is the whole claim for this test's existence.
+///   * BLIND to a trip miscount (`<=` -> `<`; the scalar tail resumes from `base` and absorbs
+///     the dropped trip) and to a pure reassociation (an even/odd fold split PASSES here — the
+///     difference is far inside a tolerance that must admit bf16 rounding; no `err=` was
+///     recorded for it). Fold order belongs to the `v4res` fingerprint, which that reassociation DID
+///     move (`2e7c…` against stock `9a43…`, benchmarks.md "V4 M11 fp4 resident-kernel round").
+///     The engine A/B's reply md5 would also catch it in principle, but the reassociation was
+///     never put through a decode — do not cite it as demonstrated. No golden hash here, see
+///     `the_fp4_dispatch_hash_pins_the_clamp_hoist`.
+#[test]
+fn the_dword_path_matches_the_oracle_at_multiple_trips() {
+    // NOT a resized `toy`: `every_byte_pattern_decodes_right_in_both_dot_paths` asserts toy's
+    // one-trip geometry on purpose for its own byte-position coverage. Leaked because `Case`
+    // holds `&'static` into the fixture and exactly one test wants this shape.
+    // The multipliers ARE the coverage claim, so they are written as trip counts rather than
+    // as 1280/1024: 5 trips = unrolled body + remainder at unroll 2 AND at unroll 4; 4 = clean
+    // groups at both. NOTHING machine-checks the trip counts — the launcher's rc 1002 guards
+    // `% ACT_QUANT_BLOCK` (128), not 256, so 1152 or 1536 would launch fine at a different
+    // count. The test keeps its power over multi-trip arithmetic if the pragma moves, but 5/4
+    // stops guaranteeing an unrolled group PLUS a remainder past depth 4, and a changed `WAVE`
+    // breaks the counts outright. Re-derive from §M11b rather than trusting the green.
+    let cfg = V4Config {
+        dim: 5 * F4_COLS_PER_TRIP,
+        moe_inter_dim: 4 * F4_COLS_PER_TRIP,
+        ..V4Config::toy()
+    };
+    let c = Case::at(
+        Box::leak(Box::new(build_fixture(cfg))),
+        0,
+        "unroll-trips",
+        1.0,
+    );
+
+    // `got` is bound rather than inlined: `assert_matches(&c.want, &c.gpu(), ..)` is
+    // token-identical to `routed_experts_match_the_oracle`'s call and `build.rs`'s jscpd
+    // gate rejects the build. Inlining it back is a build error, not a style choice.
+    // `report_rel` scales the tolerance by `max_abs(want)`, so an all-zero oracle result would
+    // pass against an all-zero kernel result at tol 0. Four comparison tests here guard that
+    // with this exact assertion (grep "the oracle produced nothing to compare"); most do not,
+    // and this one runs the only UNPROVEN geometry — where a silently-empty `want` is most
+    // plausible.
+    assert!(
+        c.want.iter().any(|v| v.abs() > 1e-6),
+        "the oracle produced nothing to compare"
+    );
+    let got = c.gpu();
+    assert_matches(
+        &c.want,
+        &got,
+        "fp4 routed experts at 5/4 dword trips (unrolled body + remainder)",
     );
 }
 

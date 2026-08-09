@@ -627,13 +627,19 @@ __device__ __forceinline__ void dot_f4_wave_r(const float* __restrict__ v, int v
         // (`tests/v4_kernel.rs::the_fp4_dispatch_hash_pins_the_clamp_hoist` records that
         // lesson).
         //
-        // **What does NOT check it:** at `V4Config::toy` this path runs ONE trip
-        // (`hidden 256` = one 256-column iteration), so `unroll 2` executes only the remainder
-        // copy and **no test in the tree executes the unrolled body**. A multi-trip oracle
-        // test is owed — §M11b records its design and the trip counts it needs. The remainder
-        // is unreachable at the engine's dims but IS reachable in principle: the launcher
-        // guards `% ACT_QUANT_BLOCK` (128), not 256, so a conforming dim like 1152 or 3712
-        // gives an odd trip count.
+        // Multi-trip coverage is `tests/v4_kernel.rs::the_dword_path_matches_the_oracle_at_
+        // multiple_trips` (1280/1024 = 5 and 4 trips; at `V4Config::toy` gate/up runs this loop
+        // ONCE and down never enters it, so every other test executes only the remainder copy).
+        // Measured 2026-08-09: it gates arithmetic wrong past the first trip — red at 65x
+        // tolerance on an injected `n7 = 0 when base != 0`, while all 27 other tests stay green.
+        // It does NOT gate this bound (measured 2026-08-09 by building both): `<=` -> `<` moves
+        // the last trip into the scalar tail below, which resumes from `base`, and the test
+        // still passes — the two paths are a PARTITION, so an off-by-one that SHORTENS this
+        // loop is a performance bug no test will catch. Loosening it is a different animal:
+        // reading `rw[col >> 3]` past the row faults or corrupts. The remainder is unreachable
+        // at the engine's dims but reachable in production in principle — the launcher guards
+        // `% ACT_QUANT_BLOCK` (128), not 256, so a conforming dim like 1152 or 3712 gives an
+        // odd trip count.
 #pragma unroll 4
         for (; base + WAVE * 8 <= dim; base += WAVE * 8) {
             int col = base + lane * 8;
