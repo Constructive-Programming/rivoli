@@ -84,8 +84,8 @@
 use rivoli::backend::gpustream::HipStream;
 use rivoli::backend::hip::{
     ExpertDescF4, device_sync, launch_act_quant_f8, launch_hc_post, launch_hc_pre,
-    launch_moe_acc_drain, launch_moe_expert_range_f4, launch_moe_gate_v4, launch_rmsnorm,
-    launch_v4_act_quant, launch_v4_gemv_fp8, launch_v4_swiglu_clamped,
+    launch_moe_acc_drain, launch_moe_expert_range_f4, launch_rmsnorm, launch_v4_act_quant,
+    launch_v4_gemv_fp8, launch_v4_swiglu_clamped,
 };
 use rivoli::memory::device::DeviceBuf;
 use rivoli::v4oracle::{
@@ -1469,313 +1469,6 @@ fn the_fused_qkv_gemv_is_bitwise_the_two_launches_it_replaces() {
 }
 
 // =======================================================================================
-// 4. the router
-// =======================================================================================
-
-/// `Gate.forward`'s logits: `linear(x.float(), weight.float())`, the DENSE branch — no
-/// activation quantization, no fp8.
-///
-/// Computed here rather than by `gemv_f32` so the comparison isolates the gate kernel from
-/// GEMV re-association: a re-associated logit can flip a near-tie in the top-k, and this
-/// test is about the selection rule, not about a reduction order `tests/kernel.rs` already
-/// covers. Summed left to right, which is bit-identical to `Oracle::linear`.
-fn gate_logits(lw: &LayerW, x: &[f32]) -> Vec<f32> {
-    let (rows, cols, v) = match &lw.gate_w {
-        WMat::Dense { rows, cols, v } => (*rows, *cols, v),
-        WMat::Fp4 { .. } | WMat::Fp8 { .. } => panic!("gate.weight is dense in the reference"),
-    };
-    (0..rows)
-        .map(|e| {
-            let mut acc = 0.0f32;
-            for (i, xi) in x.iter().enumerate().take(cols) {
-                acc += xi * v[e * cols + i];
-            }
-            acc
-        })
-        .collect()
-}
-
-/// One `moe_gate_v4` dispatch, spelling the launcher's argument list ONCE.
-///
-/// Takes raw pointers rather than a `LayerW`, because the guard test hands it the two
-/// bias/`tid2eid` combinations the reference never produces and needs them REJECTED — a
-/// helper that derived them from a layer could not express an illegal one. Returns the
-/// `Result` for the same reason.
-fn gate_call(
-    cfg: &V4Config,
-    logits: *const f32,
-    bias: *const f32,
-    tid2eid: *const i64,
-    input_id: usize,
-    w: &mut DeviceBuf,
-    i: &mut DeviceBuf,
-) -> Result<(), String> {
-    let stream = HipStream::new().expect("stream");
-    // SAFETY: `logits` and `bias` (when non-null) hold `n_routed_experts` f32, `tid2eid`
-    // (when non-null) is `vocab_size · k` and covers `input_id`, and both outputs hold `k`.
-    // Every rejected combination returns before a dereference; the sync below is inside the
-    // buffers' lifetimes.
-    guard_err(unsafe {
-        launch_moe_gate_v4(
-            logits,
-            bias,
-            tid2eid,
-            input_id,
-            cfg.vocab_size,
-            cfg.n_routed_experts,
-            cfg.n_activated_experts,
-            cfg.route_scale,
-            w.ptr_mut() as *mut f32,
-            i.ptr_mut() as *mut i32,
-            stream.raw(),
-        )
-    })
-}
-
-/// [`gate_call`]'s accepted path: require the launch, join it, and read both output buffers
-/// back as `(weights, indices)`.
-///
-/// The whole tail both scoring probes share, which is why it takes the `Result` rather than
-/// leaving the `.expect` at each site — that split is what `build.rs`'s duplication gate
-/// found. The guard test deliberately does not come here: it needs the `Result` unconsumed.
-///
-/// One place is also where the index DECODE belongs. `ib` comes back as bytes and `k` `i32`s
-/// are cut out of it at stride 4 by hand; a second copy of that loop is a second chance to
-/// take the wrong four bytes, which returns plausible expert ids assembled from the halves of
-/// two real ones. The weights would still match, and only the selection comparison would go
-/// red — pointing the reader at the router rather than at the readback.
-///
-/// `wb` and `ib` are two adjacent `&mut DeviceBuf` and a transposition would compile — the
-/// hazard `HcW` and `Widths` exist to remove elsewhere. It is left as a pair here because
-/// both callers pass them straight through from their own `gate_call` in that call's order,
-/// so the two lines sit together and a swap is visible at the site rather than hidden behind
-/// a constructor.
-fn gate_landed(
-    r: Result<(), String>,
-    wb: &mut DeviceBuf,
-    ib: &mut DeviceBuf,
-    k: usize,
-) -> (Vec<f32>, Vec<i32>) {
-    r.expect("moe_gate_v4");
-    device_sync().expect("device sync");
-    let iv = ib.copy_out().expect("indices");
-    (
-        f32v(&wb.copy_out().expect("weights")),
-        (0..k)
-            .map(|j| i32::from_le_bytes(iv[j * 4..j * 4 + 4].try_into().unwrap()))
-            .collect(),
-    )
-}
-
-/// Run `moe_gate_v4` for one token of a real layer. `input_id` is read only where the layer
-/// routes by hash.
-fn gpu_gate(cfg: &V4Config, lw: &LayerW, logits: &[f32], input_id: usize) -> (Vec<f32>, Vec<i32>) {
-    let k = cfg.n_activated_experts;
-    let lb = to_device(&f32b(logits));
-    let bias = lw.gate_bias.as_ref().map(|b| to_device(&f32b(b)));
-    let hash = lw
-        .tid2eid
-        .as_ref()
-        .map(|t| to_device(&t.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()));
-    let mut wb = zeros(k * 4);
-    let mut ib = zeros(k * 4);
-    let r = gate_call(
-        cfg,
-        lb.ptr() as *const f32,
-        bias.as_ref()
-            .map_or(std::ptr::null(), |b| b.ptr() as *const f32),
-        hash.as_ref()
-            .map_or(std::ptr::null(), |t| t.ptr() as *const i64),
-        input_id,
-        &mut wb,
-        &mut ib,
-    );
-    gate_landed(r, &mut wb, &mut ib, k)
-}
-
-/// Both router modes against the oracle: a hash layer (0-2, `tid2eid`, no bias) and a
-/// scored layer (3+, bias, top-k).
-///
-/// Indices are compared EXACTLY — they are a selection, and no numeric tolerance stands in
-/// for "a different expert ran".
-#[test]
-fn the_router_matches_the_oracle_in_both_modes() {
-    let (cfg, m, o) = fixture();
-    for layer in [0usize, 3] {
-        let lw = &m.layers[layer];
-        let hash = lw.tid2eid.is_some();
-        assert_eq!(
-            hash,
-            layer < cfg.n_hash_layers,
-            "layer {layer} is not the mode expected"
-        );
-        let x = draw_x(&format!("gate-x-{layer}"), cfg.dim, 1.0);
-        let ids = [7u32];
-        let step = LayerCtx {
-            lw,
-            layer,
-            s: 1,
-            start_pos: 0,
-            input_ids: &ids,
-            step_tag: "probe",
-        };
-        let (want_w, want_i) = o.gate(&step, &x, &mut Counters::default());
-
-        let (got_w, got_i) = gpu_gate(cfg, lw, &gate_logits(lw, &x), ids[0] as usize);
-        let want_i: Vec<i32> = want_i.iter().map(|&e| e as i32).collect();
-        assert_eq!(want_i, got_i, "layer {layer}: expert selection");
-        assert_matches(&want_w, &got_w, &format!("layer {layer} routing weights"));
-    }
-}
-
-/// **A hash layer bypasses the scores for SELECTION ONLY.** The gate still runs and its
-/// scores still become the WEIGHTS (`model.py:585`). Reading `tid2eid` and skipping the
-/// gate is the silent-wrong this test exists for, and it is the failure the S2a brief names.
-///
-/// Both halves, because either alone proves nothing: perturbing the logits must move the
-/// weights (so the scores are live) and must NOT move the indices (so the selection really
-/// is the hash).
-#[test]
-fn hash_routing_bypasses_the_scores_for_selection_only() {
-    let (cfg, m, _) = fixture();
-    let lw = &m.layers[0];
-    assert!(
-        lw.tid2eid.is_some(),
-        "layer 0 must be a hash layer for this to mean anything"
-    );
-    let x = draw_x("gate-x-0", cfg.dim, 1.0);
-    let base = gate_logits(lw, &x);
-    // A shift, not a scale: `sqrt(softplus(·))` is monotone, so a positive scale would
-    // leave the top-k ORDER intact and the "indices did not move" half would pass for a
-    // score-routed kernel too. Reversing the sign reverses the ranking.
-    let flipped: Vec<f32> = base.iter().map(|v| -v).collect();
-
-    let (w0, i0) = gpu_gate(cfg, lw, &base, 7);
-    let (w1, i1) = gpu_gate(cfg, lw, &flipped, 7);
-    assert_eq!(i0, i1, "hash selection moved when only the scores changed");
-    assert!(
-        w0.iter().zip(&w1).any(|(a, b)| (a - b).abs() > 1e-4),
-        "the routing weights did not move when the scores did — the gate is being skipped"
-    );
-
-    // And the indices ARE the table's, not a top-k of anything.
-    let table = lw.tid2eid.as_ref().unwrap();
-    let k = cfg.n_activated_experts;
-    let want: Vec<i32> = table[7 * k..8 * k].iter().map(|&e| e as i32).collect();
-    assert_eq!(want, i0, "the hash indices are not tid2eid[input_id]");
-}
-
-/// `torch.topk`'s tie-break: descending by value, ties to the LOWER index.
-///
-/// This is the ENTIRE reason `moe_gate_v4`'s selection is a serial k-pass argmax rather
-/// than a tree reduction over `(value, index)` pairs, and nothing else here measures it —
-/// the oracle comparison runs on random weights, where an exact tie has measure zero.
-///
-/// Expectations are stated directly rather than taken from the oracle: with equal scores the
-/// answer is the first `k` expert ids, and that is a fact about `torch.topk`, not about
-/// either implementation. A comparison against `Oracle::gate` here would only show the two
-/// agreeing about a rule neither had been asked to demonstrate.
-#[test]
-fn the_router_breaks_ties_towards_the_lower_expert_id() {
-    let (cfg, ..) = fixture();
-    let k = cfg.n_activated_experts;
-    let zero_bias = to_device(&f32b(&vec![0.0f32; cfg.n_routed_experts]));
-    let mut wb = zeros(k * 4);
-    let mut ib = zeros(k * 4);
-    let mut pick = |logits: &[f32]| {
-        let lb = to_device(&f32b(logits));
-        // A scored layer (bias, no table), because ties only matter where a top-k runs.
-        let r = gate_call(
-            cfg,
-            lb.ptr() as *const f32,
-            zero_bias.ptr() as *const f32,
-            std::ptr::null(),
-            0,
-            &mut wb,
-            &mut ib,
-        );
-        // Only the selection matters here; the weights are all equal by construction.
-        gate_landed(r, &mut wb, &mut ib, k).1
-    };
-
-    // Every score identical: the k lowest ids, in ascending order.
-    let all_tied: Vec<i32> = (0..k as i32).collect();
-    assert_eq!(
-        all_tied,
-        pick(&vec![1.0f32; cfg.n_routed_experts]),
-        "an all-tied row did not select the k lowest expert ids"
-    );
-
-    // A tied PAIR at the top, below a run of lower scores: the two highest-scoring ids, and
-    // the lower one first. Placed at the END of the row so a scan that kept the LAST maximum
-    // (`>=` instead of `>`) would return them in the other order.
-    let mut logits = vec![0.25f32; cfg.n_routed_experts];
-    let (a, b) = (cfg.n_routed_experts - 2, cfg.n_routed_experts - 1);
-    logits[a] = 4.0;
-    logits[b] = 4.0;
-    let got = pick(&logits);
-    assert_eq!(
-        vec![a as i32, b as i32],
-        got[..2].to_vec(),
-        "a tied pair did not come back lower-id first"
-    );
-}
-
-/// Every router guard, by CODE.
-///
-/// The two bias/`tid2eid` combinations the reference never produces are refused rather than
-/// resolved by precedence inside the kernel: they are exactly "route a hash layer by score"
-/// and "let the selection bias reach the weights".
-///
-/// `k > n_experts` matters more than it looks — the kernel's masking argmax sets each pick
-/// to `-INFINITY`, so a `(k+1)`-th pass over an all-masked row hands back a DUPLICATED
-/// index 0 rather than failing. And `input_id` past `tid2eid`'s rows is the overrun that can
-/// actually happen; the guard here used to check `input_id < 0`, which the Rust launcher's
-/// `usize` makes unreachable.
-#[test]
-fn the_router_refuses_what_it_claims_to() {
-    let (cfg, ..) = fixture();
-    let logits = to_device(&f32b(&vec![0.0f32; cfg.n_routed_experts]));
-    let bias = to_device(&f32b(&vec![0.0f32; cfg.n_routed_experts]));
-    let table = to_device(&vec![0u8; cfg.vocab_size * cfg.n_activated_experts * 8]);
-    let mut wb = zeros(cfg.n_activated_experts * 4);
-    let mut ib = zeros(cfg.n_activated_experts * 4);
-    let (bp, tp) = (bias.ptr() as *const f32, table.ptr() as *const i64);
-    let lp = logits.ptr() as *const f32;
-    let mut go = |c, b, t, id| gate_call(c, lp, b, t, id, &mut wb, &mut ib);
-
-    assert!(
-        go(cfg, bp, std::ptr::null(), 0).is_ok(),
-        "a scored layer must be accepted"
-    );
-    assert!(
-        go(cfg, std::ptr::null(), tp, 0).is_ok(),
-        "a hash layer must be accepted"
-    );
-    device_sync().expect("device sync"); // both accepted cases launched
-
-    // `k > n_experts` needs a config the toy cannot supply, since `V4Config` pins k < n.
-    let big = V4Config {
-        n_activated_experts: cfg.n_routed_experts + 1,
-        ..cfg.clone()
-    };
-    assert_guards(vec![
-        (1002, "both a bias and a hash table", go(cfg, bp, tp, 0)),
-        (
-            1002,
-            "neither",
-            go(cfg, std::ptr::null(), std::ptr::null(), 0),
-        ),
-        (
-            1003,
-            "input_id past the table",
-            go(cfg, std::ptr::null(), tp, cfg.vocab_size),
-        ),
-        (1001, "k > n_experts", go(&big, bp, std::ptr::null(), 0)),
-    ]);
-}
-
-// =======================================================================================
 // 5. mHC
 // =======================================================================================
 
@@ -2151,39 +1844,44 @@ fn sinkhorn_iteration_count_is_live() {
 // 6. the MoE layer, end to end against a golden
 // =======================================================================================
 
-/// `.ffn_out` reproduced from `.ffn_norm_out` — the router kernel choosing the experts, the
-/// FP4 kernels running them, and the SHARED expert filled in from the oracle.
+/// `.ffn_out` reproduced from `.ffn_norm_out` — the FP4 kernels running the experts the
+/// golden selected, and the SHARED expert filled in from the oracle.
 ///
 /// The shared expert is fp8 e4m3 at 128x128, not FP4, and is explicitly out of S2a. It is
 /// computed here by `Oracle::expert` so the comparison can reach a real golden at all; the
 /// consequence is that **this test says nothing about rivoli's fp8 path**, and a defect
 /// there would be invisible to it.
+///
+/// **The selection is READ from the golden, not computed, since `moe_gate_v4` was deleted
+/// 2026-08-09.** It used to come from that kernel and be asserted equal to
+/// `L0.pre.router_indices`/`router_weights` on the next two lines — so the golden was already
+/// the authority, and taking it directly asserts the same thing about the FP4 path while
+/// removing the last caller of a kernel the engine never reached. Routing in this engine is
+/// HOST work (`math::route_into`, the router `architecture.md` INV-1 is stated about);
+/// `v4gpu.rs::route_row` carries why. **This test therefore covers no router at all** — that
+/// is the trade the deletion made, and it is recorded here rather than left to be discovered,
+/// because a reader who sees a golden-fed selection will otherwise assume it was checked.
 #[test]
 fn ffn_out_matches_the_golden() {
     let (cfg, m, o) = fixture();
     let layer = 0usize;
     let lw = &m.layers[layer];
-    let (cap, _, ids) = capture(layer, 1);
+    let (cap, _, _) = capture(layer, 1);
     let x = cap
         .float("L0.pre.ffn_norm_out")
         .expect("ffn_norm_out golden")
         .to_vec();
 
-    let (gw, gi) = gpu_gate(cfg, lw, &gate_logits(lw, &x), ids[0] as usize);
-    // The router's own goldens, exactly — a wrong selection here would otherwise show up
-    // as a numeric miss at the end and be indistinguishable from an arithmetic bug.
-    let want_i: Vec<i32> = cap
+    let gi: Vec<i32> = cap
         .int("L0.pre.router_indices")
         .expect("indices")
         .iter()
         .map(|&e| e as i32)
         .collect();
-    assert_eq!(want_i, gi, "router indices");
-    assert_matches(
-        cap.float("L0.pre.router_weights").expect("router_weights"),
-        &gw,
-        "router weights",
-    );
+    let gw = cap
+        .float("L0.pre.router_weights")
+        .expect("router_weights")
+        .to_vec();
 
     // ONE weight per expert, which is what `moe_gateup_f4`'s `wexpert` layout can express
     // — so a token routed TWICE to one expert would be unrepresentable, and the reference

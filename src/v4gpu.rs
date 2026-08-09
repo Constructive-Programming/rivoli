@@ -1447,9 +1447,9 @@ impl V4Engine {
 
     /// `Gate.forward` for one row, on the host, into `self.sel` and `self.wexpert_host`.
     ///
-    /// # `launch_moe_gate_v4` is DECLINED, and this is the decision the port asked for
+    /// # The device router was DECLINED and then DELETED, and this is why
     ///
-    /// That kernel exists, is verified, is 8-test covered, and takes `tid2eid` as a device
+    /// `moe_gate_v4` existed, was verified, was 8-test covered, and took `tid2eid` as a device
     /// `*const i64` — while `V4Pin` parses the table to a host `Vec<u32>` and argues that
     /// "placing 6.2 MB of `tid2eid` per hash layer on the device to index it there would buy
     /// nothing". Both are defensible and they are opposite; the port recorded it so this stage
@@ -1466,9 +1466,17 @@ impl V4Engine {
     /// * `parse_tid2eid`'s range check is only expressible host-side, and `moe.hip`'s own note
     ///   records that the kernel does not perform it.
     ///
-    /// So `launch_moe_gate_v4` has no reachable caller after this stage either — the shape
-    /// `Dims::compress_slot` was in when it was deleted. Recorded rather than acted on: removing
-    /// a verified kernel is not this stage's call.
+    /// So it had no reachable caller after this stage either — the shape `Dims::compress_slot`
+    /// was in when *it* was deleted.
+    ///
+    /// **DELETED 2026-08-09** (kernel, launcher, and `tests/v4_kernel.rs` §4), on the reasoning
+    /// above going unchallenged for the four days since it was written: the decision was
+    /// architectural, not provisional, so the kernel was not a staged alternative but a second
+    /// implementation of a rule — "the selection bias must not reach the weights" — that INV-1
+    /// states about exactly one router. Two routers is two places for it to be wrong, and the
+    /// second one had no caller to keep it honest. `tests/v4_kernel.rs::ffn_out_matches_the_golden`
+    /// was its last user and now reads the selection from the golden it was already asserting
+    /// against; its doc records what that test stopped covering.
     fn route_row(&mut self, layer: usize, t: usize) -> Result<()> {
         let (k, n_desc) = (self.cfg.top_k, self.cfg.n_experts);
         let logits = &self.gl_host[t * n_desc * 4..(t + 1) * n_desc * 4];

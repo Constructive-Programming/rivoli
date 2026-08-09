@@ -336,40 +336,6 @@ launchers! {
         stream: *mut c_void,
     );
 
-    /// `model.py::Gate.forward` for ONE token: `logits` (a dense f32 GEMV against
-    /// `gate.weight`) into `k` routing weights and `k` expert indices.
-    ///
-    /// Exactly one of `bias` and `tid2eid` may be non-null, and the launcher refuses any other
-    /// combination. A hash layer (`layer_id < n_hash_layers`) has `tid2eid` and no bias; a
-    /// scored layer has a bias and no `tid2eid`. The two refused combinations are the two
-    /// silent defects this router invites: routing a hash layer by score, and letting the
-    /// selection bias reach the weights.
-    ///
-    /// `tid2eid` is `[vocab_size, k]` **i64** — the checkpoint's dtype. `model.py` declares the
-    /// parameter `torch.int32`, but every `layers.N.ffn.gate.tid2eid` on disk is `I64`.
-    ///
-    /// `vocab_size` is `tid2eid`'s row count and is checked against `input_id` (guard 1003); it is
-    /// ignored on a scored layer, which has no table to run off. **Entries of `tid2eid` are not
-    /// range-checked** — see `moe.hip`'s note; S3 validates the table at load.
-    ///
-    /// # Safety
-    /// `logits` is `n_experts` f32; `bias`, when non-null, the same; `tid2eid`, when non-null,
-    /// `vocab_size · k` i64. `weights`/`indices` hold `k` elements. All must outlive `stream`'s
-    /// completion — await its [`Signal`](crate::backend::gpustream::Signal).
-    launch_moe_gate_v4 -> rivoli_moe_gate_v4, "moe_gate_v4" (
-        logits: *const f32,
-        bias: *const f32,
-        tid2eid: *const i64,
-        input_id: usize as i32,
-        vocab_size: usize as i32,
-        n_experts: usize as i32,
-        k: usize as i32,
-        route_scale: f32,
-        weights: *mut f32,
-        indices: *mut i32,
-        stream: *mut c_void,
-    );
-
     /// `model.py::Block.hc_pre` over `s` tokens: reduce the `hc` residual copies to one with
     /// Sinkhorn-normalised learned weights, and emit the `post`/`comb` the matching
     /// [`launch_hc_post`] consumes.
