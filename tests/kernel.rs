@@ -964,7 +964,7 @@ fn moe_vq_matches_reference() {
 /// one whole group, so the scalar tail's group indexing is exercised too.
 #[test]
 fn moe_i4_matches_reference() {
-    use rivoli::artifact::quant::{I4_GROUP, matvec_i4, quant_i4};
+    use rivoli::artifact::quant::{I4_GROUP, quant_i4};
     let mut r = Lcg(0x14);
     let (hidden, inter, e) = (2 * I4_GROUP, I4_GROUP, 3usize);
     let x: Vec<f32> = (0..hidden).map(|_| r.f()).collect();
@@ -980,10 +980,32 @@ fn moe_i4_matches_reference() {
         quant_i4(&wv, o_dim, i_dim)
     });
 
-    let want = moe_reference(&x, &w, hidden, inter, |out, inp, ex, proj, o_dim, i_dim| {
-        matvec_i4(out, inp, &enc[ex][proj].0, &enc[ex][proj].1, o_dim, i_dim)
-    });
+    let c = I4Case {
+        enc,
+        x,
+        w,
+        hidden,
+        inter,
+    };
+    assert_close(&i4_reference(&c), &gpu_i4_moe(&c), "moe_i4");
+    let _ = e;
+}
 
+/// The int4 MoE launch path shared by the synthetic-fixture tests: one `ExpertDesc` per
+/// expert built from `enc`, `moe_gateup_i4` → `moe_down_i4` per expert, drain, read back.
+///
+/// ONE copy, for the reason `gpu_i4_expert` below gives about its own pair — a descriptor
+/// layout change must not be fixable in one test and left stale in the other — and because
+/// `build.rs`'s jscpd gate REJECTED the second copy the moment the multi-trip test was
+/// written. That is the gate working, and it is why this is a function rather than a
+/// paragraph in two tests.
+///
+/// Launches per expert rather than one `[0, e)` range: bit-identical by `moe_expert_range`'s
+/// own argument (`e = e_start + row / inter`, every row independent), and it is what this path
+/// has always done.
+fn gpu_i4_moe(c: &I4Case) -> Vec<f32> {
+    let (enc, x, w, hidden, inter) = (&c.enc, &c.x, &c.w, c.hidden, c.inter);
+    let e = enc.len();
     let mut bufs: Vec<DeviceBuf> = Vec::new();
     // One ExpertDesc for both formats: the int4 kernel reads the six pointers as
     // packed weights + f32 row-scale (the scale ptr is typed *const u16 but only its
@@ -998,7 +1020,24 @@ fn moe_i4_matches_reference() {
             down_scales: push(f32b(&enc[ex][2].1), &mut bufs) as *const u16,
         })
         .collect();
-    let (descb, xb, wb) = (desc_buf(&descs), dev(&f32b(&x)), dev(&f32b(&w)));
+    i4_launch_drain(&descs, x, w, hidden, inter)
+}
+
+/// Launch `[0, descs.len())` int4 experts ONE AT A TIME and drain — the tail every int4 MoE
+/// test shares, extracted because `gpu_i4_moe` and `gpu_i4_expert` had it verbatim and the
+/// duplication gate said so. Per expert rather than one range: bit-identical by
+/// `moe_expert_range`'s own argument (`e = e_start + row / inter`, every row independent).
+///
+/// The caller must keep the buffers the descriptors point INTO alive across this call.
+fn i4_launch_drain(
+    descs: &[ExpertDesc],
+    x: &[f32],
+    w: &[f32],
+    hidden: usize,
+    inter: usize,
+) -> Vec<f32> {
+    let e = descs.len();
+    let (descb, xb, wb) = (desc_buf(descs), dev(&f32b(x)), dev(&f32b(w)));
     let (mut hbuf, mut pbuf, mut obuf) = moe_bufs(e, 1, hidden, inter);
     let stream = HipStream::new().expect("stream");
     for k in 0..e {
@@ -1007,7 +1046,184 @@ fn moe_i4_matches_reference() {
     }
     drain(&mut obuf, &mut pbuf, 0, hidden, &stream);
     device_sync().expect("sync");
-    assert_close(&want, &f32v(&obuf.copy_out().expect("out")), "moe_i4");
+    f32v(&obuf.copy_out().expect("out"))
+}
+
+/// `moe_reference` over int4-encoded experts — the CPU oracle the synthetic tests compare
+/// against, and which the defect-injection test below evaluates TWICE (clean bytes, then
+/// defective ones). Three call sites, so it is a function for the same jscpd reason.
+fn i4_reference(c: &I4Case) -> Vec<f32> {
+    use rivoli::artifact::quant::matvec_i4;
+    let enc = &c.enc;
+    moe_reference(&c.x, &c.w, c.hidden, c.inter, |o, i, ex, p, od, id| {
+        matvec_i4(o, i, &enc[ex][p].0, &enc[ex][p].1, od, id)
+    })
+}
+
+/// One int4 MoE fixture: quantized experts plus the activation, routing weights and dims they
+/// were built for. A struct rather than five positional arguments because the two helpers above
+/// otherwise carry an identical six-line parameter list, which `build.rs`'s jscpd gate rejects
+/// — the same fix, for the same reason, that `oracle_cat`'s `CompCase` made in `tests/`.
+struct I4Case {
+    enc: Vec<Vec<(Vec<u8>, Vec<f32>)>>,
+    x: Vec<f32>,
+    w: Vec<f32>,
+    hidden: usize,
+    inter: usize,
+}
+
+/// The multi-trip fixture the two tests below share: `hidden = 1280` (5 dword trips) and
+/// `inter = 1024` (4), one expert, with group scales that genuinely differ between adjacent
+/// groups.
+///
+/// **The dims are the whole point and they are not the obvious ones.** `dot_i4_wave_r`'s dword
+/// loop advances `WAVE * 8 = 256` columns per trip, so trips = `dim / 256`, and an unroll of
+/// depth D executes a main body D trips wide plus a REMAINDER loop of `trips % D`:
+///
+/// | dim | trips | rem @ depth 2 | rem @ depth 4 |
+/// |---|---|---|---|
+/// | hidden 6144 (engine) | 24 | 0 | 0 |
+/// | inter 2048 (engine) | 8 | 0 | 0 |
+/// | hidden 1280 | 5 | 1 | 1 |
+/// | inter 1024 | 4 | **0** | **0** |
+///
+/// So **at every engine dimension the remainder is never entered** — a test at real dims would
+/// be vacuous on the epilogue while looking thorough, which is exactly how the suite ended up
+/// unable to see M11's fp4 pragma.
+///
+/// **The two dims cover the two DIFFERENT cases, and that is deliberate.** 5 trips gives an
+/// unrolled body plus a remainder at depth 2 and at depth 4 — the path nothing else reaches.
+/// 4 trips divides cleanly at both depths — the *production* geometry, since every engine dim
+/// is an exact multiple. Making both dims leave a remainder was tried and **reverted**: it
+/// tests the epilogue twice and stops testing the clean case at all, which is the one the
+/// engine actually runs. `v4_kernel.rs`'s fp4 twin picked 1280/1024 for exactly this reason
+/// and says so — "5 trips = unrolled body + remainder at unroll 2 AND at unroll 4; 4 = clean
+/// groups at both". This is the same pair, for the same argument.
+///
+/// **NOTHING machine-checks the trip counts**, here or there: the int4 launcher guards
+/// `hidden`/`inter` against `I4_GROUP` (128), not against `WAVE * 8` (256), so 1152 would
+/// launch fine at a different count. A changed `WAVE` breaks the counts outright. Re-derive
+/// from the table above rather than trusting the green.
+///
+/// Both dims are whole multiples of 256, so the scalar tail below the dword loop is NOT
+/// entered; that path is covered by `moe_i4_matches_reference`'s `inter = I4_GROUP`.
+fn i4_multi_trip_fixture() -> I4Case {
+    use rivoli::artifact::quant::{I4_GROUP, quant_i4};
+    let (hidden, inter) = (1280usize, 1024usize);
+    let mut r = Lcg(0x14_7213);
+    let x: Vec<f32> = (0..hidden).map(|_| r.f()).collect();
+    let w: Vec<f32> = vec![1.0];
+    let dims = [(inter, hidden), (inter, hidden), (hidden, inter)];
+    let enc = encode_experts(&mut r, 1, &dims, |r, _p, o_dim, i_dim| {
+        // Adjacent groups differ by 2x or 4x, so a kernel reading the wrong group scale
+        // disagrees. `2^(g % 3)` rather than `moe_i4_matches_reference`'s `4^g`: at
+        // `i_dim = 1280` there are 10 groups and `4^9` is 2.6e5, which would put the whole
+        // comparison at the mercy of one group's magnitude instead of testing indexing.
+        let wv: Vec<f32> = (0..o_dim * i_dim)
+            .map(|n| r.f() * 2f32.powi((((n % i_dim) / I4_GROUP) % 3) as i32))
+            .collect();
+        quant_i4(&wv, o_dim, i_dim)
+    });
+    I4Case {
+        enc,
+        x,
+        w,
+        hidden,
+        inter,
+    }
+}
+
+/// Zero the DECODED weight of every column the `n7`-past-the-first-trip defect would drop:
+/// nibble 7 of each dword, i.e. `i % 8 == 7`, on every trip after the first (`i >= WAVE * 8`).
+///
+/// Setting the stored nibble to 8 is exactly equivalent to M11's injection — `nib()` returns
+/// `nibble - 8`, so a stored 8 decodes to 0.0 whatever the group scale is.
+fn i4_drop_n7_after_first_trip(packed: &mut [u8], o_dim: usize, i_dim: usize) {
+    let rb = i_dim.div_ceil(2);
+    for o in 0..o_dim {
+        for i in (WAVE_COLS..i_dim).filter(|i| i % 8 == 7) {
+            let b = &mut packed[o * rb + i / 2];
+            *b = if i % 2 == 0 {
+                (*b & 0xF0) | 8
+            } else {
+                (*b & 0x0F) | (8 << 4)
+            };
+        }
+    }
+}
+
+/// `WAVE * 8` — one dword-loop trip in columns. A kernel constant this file must not
+/// re-derive: `common.hpp`'s loop bound is `base + WAVE * 8 <= dim`.
+const WAVE_COLS: usize = 32 * 8;
+
+/// **THE TOLERANCE CAN SEE A PAST-THE-FIRST-TRIP DEFECT — proven on the host, no GPU.**
+///
+/// This is the non-vacuity half of the test below, and it is separate precisely because it
+/// needs no device: it compares the CPU oracle against the CPU oracle with the injected defect
+/// applied to the same bytes, and asserts the disagreement EXCEEDS `err_tol`'s
+/// `1e-3 * max + 1e-3`. Without it, "the multi-trip test would go red on a broken unroll" is a
+/// claim about a gate nobody has seen fire — and this repo has already shipped one acceptance
+/// bar that was arithmetically incapable of detecting its own red target.
+///
+/// What it does NOT prove: that the GPU test below is wired up correctly. That needs a
+/// deliberately broken kernel and a device, and is recorded as outstanding in
+/// `docs/investigations/int4-moe-unroll.md` §G4.
+///
+/// The defect is aimed at ARITHMETIC, not at fold order. A reassociation is invisible to any
+/// tolerance test by construction — that is the fingerprint's job, and the `glmi4` round's X
+/// arm discharged it.
+#[test]
+fn the_i4_multi_trip_tolerance_can_see_a_past_first_trip_defect() {
+    use common::err_tol;
+    let c = i4_multi_trip_fixture();
+    let want = i4_reference(&c);
+    // The same fixture with the defect injected into all three projections —
+    // `dot_i4_wave_r` serves gate, up and down, so a broken unroll breaks all three.
+    let mut bad = i4_multi_trip_fixture();
+    let dims = [
+        (c.inter, c.hidden),
+        (c.inter, c.hidden),
+        (c.hidden, c.inter),
+    ];
+    for (p, &(o_dim, i_dim)) in dims.iter().enumerate() {
+        i4_drop_n7_after_first_trip(&mut bad.enc[0][p].0, o_dim, i_dim);
+    }
+    let got = i4_reference(&bad);
+
+    let (err, tol) = err_tol(&want, &got);
+    assert!(
+        err > tol,
+        "the injected past-first-trip defect is INVISIBLE to this tolerance: \
+         err={err:.3e} <= tol={tol:.3e}. The multi-trip test would pass on a broken unroll."
+    );
+    println!(
+        "multi-trip red target: err={err:.3e} vs tol={tol:.3e} ({:.1}x)",
+        err / tol
+    );
+}
+
+/// **The int4 dword path against the oracle at MULTIPLE trips, with a remainder in both
+/// passes.** The int4 twin of `v4_kernel.rs::the_dword_path_matches_the_oracle_at_multiple_
+/// trips`, and the gate `docs/investigations/int4-moe-unroll.md` §G4 requires before
+/// `#pragma unroll 4` on `dot_i4_wave_r` can merge (measured 2026-08-09: +12.6% / +16.4% /
+/// +20.1%, fingerprint-identical).
+///
+/// **The coverage hole this closes, stated exactly.** `moe_i4_matches_reference` above runs
+/// `hidden = 256, inter = 128`: gate/up execute the dword loop ONCE and `moe_down_i4` never
+/// enters it at all (128 < `WAVE * 8`). `moe_i4_real_data_matches_cpu` does reach 24 and 8
+/// trips — but it `return`s early when the artifact is absent, and 24 and 8 are both divisible
+/// by 2 and by 4, so it cannot execute an unroll remainder on any machine. **Before this test,
+/// nothing checked `dot_i4_wave_r` past its first trip on a box without the artifact, and
+/// nothing anywhere checked the epilogue an unroll creates.**
+///
+/// Non-vacuity is proven separately and without a device by
+/// `the_i4_multi_trip_tolerance_can_see_a_past_first_trip_defect`, which injects M11's
+/// `n7`-zeroed-when-`base != 0` into the same bytes and asserts the disagreement exceeds this
+/// tolerance. Read that one before trusting this one green.
+#[test]
+fn the_i4_dword_path_matches_the_oracle_at_multiple_trips() {
+    let c = i4_multi_trip_fixture();
+    assert_close(&i4_reference(&c), &gpu_i4_moe(&c), "moe_i4 multi-trip");
 }
 
 /// Run ONE int4 expert block through the real GPU path — `moe_gateup_i4` →
@@ -1027,15 +1243,9 @@ fn gpu_i4_expert(blk: &[u8], off: &[usize; 6], x: &[f32], hidden: usize, inter: 
         down_indices: unsafe { base.add(off[4]) },
         down_scales: unsafe { base.add(off[5]) } as *const u16,
     };
-    let descb = desc_buf(std::slice::from_ref(&desc));
-    let (xb, wb) = (dev(&f32b(x)), dev(&f32b(&[1.0f32])));
-    let (mut hbuf, mut pbuf, mut obuf) = moe_bufs(1, 1, hidden, inter);
-    let stream = HipStream::new().expect("stream");
-    let io = MoeIo::new(&xb, &wb, &mut hbuf, &mut pbuf);
-    expert_range_i4(io, &descb, MoeRange::new(hidden, inter, 0, 1), 1, &stream);
-    drain(&mut obuf, &mut pbuf, 0, hidden, &stream);
-    device_sync().expect("sync");
-    f32v(&obuf.copy_out().expect("out"))
+    let out = i4_launch_drain(std::slice::from_ref(&desc), x, &[1.0f32], hidden, inter);
+    drop(slot); // the descriptor pointed into it; keep it alive across the launch above
+    out
 }
 
 /// GPU int4 MoE on REAL colibri `.i4` bytes in the actual slot layout

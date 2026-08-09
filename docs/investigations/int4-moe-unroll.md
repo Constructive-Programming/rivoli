@@ -347,7 +347,16 @@ nothing.**
    The plan's stated worry, that R=2's register pressure would eat the gain, was wrong twice
    over: the ISA refuted the occupancy story before the device, and R=2 then gained *more* than
    R=1.
-2. **The AS1/`flat_load` gap is real and free.** G eliminated `flat_load_b32` 18 → 0 device-wide
+2. **The AS1/`flat_load` gap is real and free — and arm G was a JOINT registration, not one
+   agent's pet theory.** The asymmetry was found here; the coordinator promoted it to a 2 x 2
+   and wrote the false-negative argument that justified spending two arms on it. **It is the
+   second time in this investigation that a static read ranked candidates wrongly** — M11's
+   occupancy model put depth 2 ahead of depth 4 and depth 4 won; here the ISA made a mechanism
+   look compelling that did nothing on the machine. The insurance was still worth buying: it
+   cost two arms of a round that had the device anyway, and it **eliminated an alternative
+   explanation that would otherwise have shadowed every number in the table** — without G, a
+   flat C1/C2 would have been unattributable between "the unroll does not transfer" and "the
+   addressing is masking it". Recorded as a priced negative, not as wasted work. G eliminated `flat_load_b32` 18 → 0 device-wide
    and removed the `lgkmcnt` coupling from the body's entry wait, at identical VGPR, occupancy
    and instruction count — and moved the rate by +0.2% / −0.3% / −0.6%. **Arm G is closed as a
    measured negative.** It was this investigation's own discovery and its own highest-rated
@@ -415,6 +424,103 @@ sub-additive.
 - **B1's rates are valid but B1's FINGERPRINTS ARE NOT.** Its residual is constant, so all four
   of its cross-arm fingerprint checks passed **vacuously**. A `DEGENERATE` row supports no
   bit-identity claim; B1's reading is its rate alone.
+
+## G4 — the multi-trip test, BUILT 2026-08-09 (no device), and the proposed dims were a trap
+
+`tests/kernel.rs::the_i4_dword_path_matches_the_oracle_at_multiple_trips`, plus its
+device-free non-vacuity half
+`the_i4_multi_trip_tolerance_can_see_a_past_first_trip_defect`.
+
+One dword trip is `WAVE * 8 = 256` columns, so trips = `dim / 256`, and depth D leaves a
+remainder of `trips % D`:
+
+| dim | trips | rem @ d2 | rem @ d4 | covers |
+|---|---:|---:|---:|---|
+| hidden 6144 (engine) | 24 | 0 | 0 | — |
+| inter 2048 (engine) | 8 | 0 | 0 | — |
+| **hidden 1280** | 5 | **1** | **1** | the epilogue nothing else reaches |
+| **inter 1024** | 4 | 0 | 0 | the CLEAN case — the production geometry |
+
+> **CORRECTED 2026-08-09, before commit, and the correction is against ME.** I first read
+> `inter = 1024` as a trap — 4 trips divides by both planned depths, so `moe_down_i4`'s
+> remainder never runs — switched the fixture to `inter = 768` (3 trips, remainder at both
+> depths), and wrote that `v4_kernel.rs`'s fp4 twin "covers the remainder on gate/up only — the
+> same partial gap". **Then I read that test's comment, which explains the choice: *"5 trips =
+> unrolled body + remainder at unroll 2 AND at unroll 4; 4 = clean groups at both."*** The pair
+> is deliberate and covers TWO different cases. Making both dims leave a remainder tests the
+> epilogue twice and stops testing the clean case at all — and the clean case is the one every
+> engine dimension actually runs. **Reverted to 1280/1024.** I criticised a design as a gap
+> without reading the paragraph that justified it; the code won, as it should.
+
+**NOTHING machine-checks the trip counts**, here or in the fp4 twin: the int4 launcher guards
+`hidden`/`inter` against `I4_GROUP` (128), not against `WAVE * 8` (256), so a conforming dim
+like 1152 would launch fine at a different count, and a changed `WAVE` breaks them outright.
+
+**The non-vacuity proof needs no GPU, and that is the point.** The tolerance half injects
+M11's `n7`-zeroed-when-`base != 0` into the same quantized bytes — setting the stored nibble to
+8, which decodes to exactly 0.0 since `nib()` returns `nibble - 8` — and asserts the
+disagreement exceeds `err_tol`'s `1e-3·max + 1e-3`. **Measured at 1280/1024: `err = 5.059e4` against `tol = 1.055e2`, a factor of 480.** And it is **demonstrated RED**: neutering the injection so
+the two oracles are identical drives `err = 0.000e0` and the assert fires with its own message.
+Green and red both witnessed, on the host, in 0.3 s.
+
+**What this does NOT prove**, stated because the distinction is the whole value: it shows the
+*tolerance* can see the defect, not that the *GPU test* is wired up to see it. That needs a
+deliberately broken kernel and a device, and is the one piece of G4 still outstanding. The
+defect is aimed at ARITHMETIC, never at fold order — a reassociation is invisible to any
+tolerance test by construction, which is the fingerprint's job and which the `glmi4` round's X
+arm already discharged.
+
+The duplication gate rejected the first draft of this test (3 clones, then 5). Factoring
+produced `I4Case`, `i4_reference`, `gpu_i4_moe` and `i4_launch_drain` — one launch path for
+every int4 MoE test, so a descriptor-layout change cannot be fixed in one test and left stale
+in another. That is the gate doing its job, recorded because "duplication is a build error"
+reads like bureaucracy until it prevents exactly this.
+
+## G5 — the engine A/B, BANDS REGISTERED 2026-08-09 BEFORE the device
+
+**The arithmetic, stated so the band cannot be walked back afterwards.** GLM's MoE compute is
+what C2 speeds up, and only part of it. Per token: 75 MoE layers x (top-8 routed + 1 shared),
+of which ~67.7% are resident hits computing on the compute stream and the rest arrive as
+misses. C2's measured serial gain is **+16.4% at R=2** — which is the shipping width, since
+MTP is on by default — and **+20.1% at `e_count = 1`**, the low end of the engine's run
+lengths.
+
+**Three discounts, each measured or registered elsewhere, applied in order:**
+
+1. **Only the loop scales.** M11b found 23.07 of 24.25 ms was the loop and the rest launch and
+   stream mechanics. Take ~95%.
+2. **M9/M11b's transfer discount.** M11b measured **55-69%** of an equivalent fp4 kernel saving
+   reaching the wall. That is the closest analogue this project has and it is not favourable.
+3. **This plan's own point 2, UNTESTED.** "A loop that is memory-latency-bound in an idle
+   microbench may be bound by something else entirely when the fetch path is saturating the
+   same controllers." GLM runs 180.4 miss/token against V4's 4.96, so the fetch stream is
+   vastly busier here than in the round M11b's transfer figure came from. **There is no
+   measurement of this term in either direction.**
+
+**Registered bands for `moe` ms/token** (the bucket, not the wall — it is the narrowest
+instrument that can see this):
+
+| outcome | `moe` delta | reading |
+|---|---|---|
+| **expected** | **−3 to −12%** | the transfer discount holds and point 2 is mild |
+| plausible | 0 to −3% | point 2 bites; the kernel win is real and mostly absorbed |
+| **registered as a genuine possibility** | **~0, indistinguishable** | the compute this speeds up is not on the critical path at 67.7% hit — **this outcome does NOT retract the kernel result** |
+| kill | **any `moe` INCREASE beyond noise** | something other than the loop changed; do not ship |
+
+**And the wall band is deliberately wider than the `moe` band: −0 to −8 ms/token, with "no
+resolvable change" inside it.** I would rather register a band that admits the wall may not
+move than one that has to be walked back. **A null wall result is a publishable outcome here
+and is not a failure of the kernel change** — the ranking rule this repo already carries says
+a perf win counts even when it hides behind another bottleneck, and at 67.7% hit and ~260 ms
+of fetch latency per token, hiding is the expected case.
+
+**Protocol, fixed now:** `--mode int4` (never hybrid — residency selects the arithmetic there,
+INV-1 exception), `--max-mem` and `--cache-policy` held fixed and identical across arms, the
+218-token prompt recorded in `benchmarks.md`, **byte-identity of the reply checked BEFORE any
+span is read** (a differing reply voids the comparison whatever the timings say), counterbalanced
+arm order with n = 2 per side, `flock` with the witness either side of every arm and any arm
+with a live foreign holder discarded. Both binaries built before the device is requested and
+nothing rebuilt between arms.
 
 ## What G3 and G4 still need before anything ships
 
@@ -662,6 +768,17 @@ tie-break — say which. **Report the `e1` row's delta beside them**: a lever th
 > by insufficient memory-level parallelism gives B1 ≈ A *and* a large unroll gain — exactly what
 > happened. Firing this kill would have closed a stretch that had just found its lever. See §G1.
 > The text is kept unchanged below because what a registration got wrong is part of the record.
+>
+> **What the correct condition would have been**, so the next stretch inherits a rule and not
+> just a warning: *"If a matched-depth ballast is within a few percent of the corresponding
+> unrolled real kernel — B_D ≈ C_D at the same depth D — then the loop at that depth is
+> essentially memory-bound and further DECODE compression cannot pay. And if no unrolled arm
+> beats stock by the acceptance bar, the drain was not the limiter."* Two arms, two different
+> questions. M11 got this right by accident: its B3 (ballast at depth 4) existed only because
+> the first reading compared C2 against an unmatched-depth B2, and that arm is what let it say
+> "C2 runs at 97.5% of its matched-depth no-decode ceiling". **The un-unrolled ballast alone
+> (B1 vs A) answers neither question** — it isolates "not ALU-bound at a schedule that is
+> already latency-bound", which is nearly a tautology and is why it read +0.5% here.
 
 If the loop is already at its memory-bound ceiling at R = 2 — i.e. the ballast-vs-real gap
 that M11 measured at 12.8% is small here — then the drain is not the limiter on this path and
