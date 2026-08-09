@@ -1295,6 +1295,145 @@ SCORED note; verdict and INDEX move in lockstep.
 > a BASE-inherited test failure (the defect census had not absorbed M9's
 > `SplitKFoldOrder`; test-only fix, gate not widened — benchmarks.md records it).**
 
+## M11 — the fp4 resident kernel: why 1.38× bytes, PLANNED 2026-08-09 (no GPU yet), and the registered predictions
+
+**The question, stated as the biggest open one left.** `res` — the compute-stream span of
+the ONE resident-expert range launch per layer (M3b's boundary) — is the engine's largest
+single bucket: **27.7–28.0 ms/token contended, flat across all four M10 arms**, ~26% of the
+106.8 ms class, with a serial pair booked at **24.2 / 24.3** (M6, M7-S). Its weight bytes
+are 5.885 residents × 13.37 MB × 43 layers = **3.383 GB/token**, which at the 193.8 GB/s
+the byte bands price is **17.5 ms**. The measured serial rate is therefore
+3.383 GB / 24.3 ms = **139 GB/s = 1.38× its bytes**, replicated at n = 1 and n = 2 and
+batch-invariant. M6 registered `res > 24` as a re-open; M8's serial-rate round STANDS it and
+sharpened it — the same box, same bus, same memory system streams `wq_b` (fp8 GEMV, full
+grid) at **222.1 GB/s = 87% of the 256 GB/s bus**, so "140 GB/s is what GTT gives you" is
+refuted by a same-box witness, and the deficit reads **kernel-side**.
+
+**Why it is not the fp8 disease, and not grid starvation.** M8's split of the fp8 residual
+was grid starvation (dominant) + mild per-wave MLP, and neither applies here. The resident
+launch at the engine's shape is full-grid by a wide margin: hidden 4096, inter 2048, ~6
+experts ⇒ pass 1 launches `e_count · inter` = ~12,288 waves and pass 2 `e_count · hidden` =
+~24,576, against 1280 machine slots. And M3c already cut this loop 195 → 105 instructions
+per 128 weight bytes (branchless `e2m1f`/`e8m0f`, global-AS loads) — M6's kill fired
+anyway, which is exactly the finding: **at 105 instructions the loop is still not
+stream-bound, and M6 recorded that the next instruction rung does NOT automatically
+follow.** That is the open question this stretch splits.
+
+**The loop under test** (`common.hpp::dot_f4_wave_r`, called twice in
+`moe_gateup_f4_impl` and once in the down pass): per iteration each lane issues ONE 4-byte
+dword (8 nibbles = 8 consecutive columns), one scale byte, 8 table decodes, then per
+`R` two `float4` activation reads and 8 FMAs — a serial load → decode → FMA dependence
+chain, one wave per output row.
+
+**The three suspects, and what separates them.**
+
+1. **Memory-level parallelism / latency** — the chain per iteration is long and hiding it
+   needs waves in flight; `R = 2` doubles accumulator and activation registers and may cap
+   occupancy. This is hc_pre's and M7's disease (a `vmcnt(0)` drain per iteration), which
+   has now bitten twice; it is the prior.
+2. **Issue rate** — 105 instr/128 B may still exceed what the SIMD can retire at a
+   222 GB/s-equivalent pace, in which case only further decode compression moves it.
+3. **Load width** — 4 B/lane against the 16 B/lane the fp8 path effectively gets.
+
+1 and 2 are attackable **bit-neutrally** (schedule and lowering only, M3c's and M5's
+class). 3 is **not**: widening the per-lane load changes the column → lane mapping and
+therefore `wave_sum`'s inputs — the same reassociation M8 proved dead-as-designed and M9
+measured the price of. So the stretch's first job is to decide *which*, before anyone
+writes a kernel.
+
+**The arithmetic to 10 tok/s, registered so the stretch cannot be graded on hope.** Wall is
+attn-serial 1:1 with res (M10's measured transfer); each 1% of res serial rate ≈ 0.24 ms
+serial ≈ 0.28 ms of wall.
+
+| res reaches | serial | contended | wall from 106.8 | tok/s |
+|---|---:|---:|---:|---:|
+| today (139 GB/s) | 24.3 | 27.9 | 106.8 | 9.36 |
+| 193.8 GB/s (the band's floor) | 17.5 | ~21.0 | ~99.9 | **10.0** |
+| 222 GB/s (the fp8-demonstrated class) | 15.2 | ~18.7 | ~97.6 | **10.2** |
+
+**Crossing 10 tok/s on this lever alone requires +32% of serial rate** — reaching the
+demonstrated same-box ceiling, not merely improving on today. That is the number every
+variant is scored against, and it is deliberately harsh: M9's transfer discount (serial-idle
+microbench rates do NOT transfer 1:1 into the overlapped engine) applies on top.
+
+### The probes, in order, with bands registered BEFORE the device
+
+All four are `examples/dot_bench.rs` sections — the harness M8 used for `v4gemv`, extended
+with a `v4res` section. Nothing here touches the engine until a variant earns an A/B.
+
+**THE CONFOUND THAT WILL DECIDE WHETHER ANY OF THIS IS TRUE, named first.** gfx1151 has a
+32 MB MALL. One layer's residents are ~80 MB, but **a probe that loops over the same 80 MB
+gets partial MALL hits and will overstate the rate**, while the engine rotates ~3.4 GB of
+distinct residents per token and never caches. A probe measuring 200+ GB/s off an 80 MB
+working set would look like a discovery and be an artifact of its own allocator. **The
+`v4res` section must allocate a ≥ 1 GB working set and stride through distinct experts
+between iterations**, and probe A exists precisely to prove the harness reproduces the
+engine's condition before any variant is believed.
+
+**Probe A — baseline replication (the instrument's own gate).** The stock kernel at the
+engine's shape (hidden 4096, inter 2048, ~6 experts, both passes, `R = 1` and `R = 2`),
+≥ 1 GB working set. **Prediction: 130–150 GB/s.** **KILL: ≥ 170 or ≤ 110 ⇒ the probe is not
+reproducing the engine's condition — STOP, find the difference, and report it before
+running anything else.** A probe that disagrees with the engine measures its own harness;
+this is the failure that has cost this investigation more than any other.
+
+**Probe B — the load-only ballast (the suspect splitter).** Same access pattern, same grid,
+same working set, decode and FMA removed: accumulate the raw dwords and the scale bytes, and
+**write the result out so the compiler cannot delete the loads** (verify from the ISA dump
+that the `global_load_dword`s survive — a DCE'd ballast reads as infinite bandwidth and is
+the second most likely way to get a wrong answer here).
+
+- **≥ 200 GB/s ⇒ the memory pattern is fine; the deficit is issue rate or latency inside the
+  loop.** Suspects 1 and 2 live, suspect 3 dead — and the bit-neutral levers are the whole
+  remaining game. This is the good outcome.
+- **≤ 160 GB/s ⇒ the 4 B/lane dword pattern is itself the limiter.** Suspect 3 live; no
+  bit-neutral lever can reach it, and the stretch closes as a negative with a wide-load
+  design registered against the M9 apparatus, exactly as M8 closed with split-k.
+- 160–200 ⇒ split; report both and rank by the ISA read below.
+
+**Probe C — the pipelined variant (the bit-neutral lever, built only if B says ≥ 160).**
+Preload iteration *i+1*'s dword and scale byte into registers before iteration *i*'s FMA
+block, so the loads are in flight across the decode chain. **Bit-neutral by construction:
+the same operations in the same order, only the load schedule changes** — but that is a
+claim, not a fact, so: **KILL: any of the seven fnv fingerprints differs, or
+`tests/v4_kernel.rs` (27/27, incl. the fused-shape oracle) goes red ⇒ it is not bit-neutral;
+revert and report.** **Prediction: +0..+15% serial rate** (M5's width/unroll lever
+multiplied because it put 24× loads in flight; this one has a shorter chain to hide).
+
+**Probe D — the occupancy read (diagnostic, no GPU).** From the ISA dump: VGPR/SGPR/LDS and
+derived waves-per-SIMD for `R = 1` and `R = 2`, plus the `vmcnt` structure per iteration.
+**The specific question: does `R = 2` drop occupancy below `R = 1`?** M7's fp8 lever was
+chosen because VGPR 86 kept 16 waves/SIMD; if the fp4 loop at `R = 2` sits at 8 or fewer,
+that is suspect 1 confirmed statically and it ranks probe C above everything else. Do this
+BEFORE the device — it is free and it sharpens C's band.
+
+### The decision rule, and the stretch's kill condition
+
+**A variant earns an engine A/B only if it is BOTH byte-identical AND ≥ +10% serial rate.**
+Below +10%, record it and stop — M8's precedent, where pair-16's measured +16–23% projected
+to −1..−2.5 ms, fell under its own registered bar, and was NOT built. State the projected
+wall Δ from the table above with M9's transfer discount named, before asking for the device
+a second time.
+
+**Stretch kill condition.** If probe B says memory-pattern-bound (≤ 160) **and** no
+bit-neutral variant reaches +10%, then **10 tok/s is unreachable without reassociation** —
+close the stretch as a successful negative, register the wide-load design with its
+arithmetic and the quality apparatus it needs (the M9 gates are merged and ready), and say
+so plainly in the verdict. **A well-evidenced negative closes this stretch as successfully
+as a lever does**; the deliverable is which of the three suspects is true, not a faster
+number.
+
+### Gates for any engine A/B this stretch reaches
+
+Unchanged from M10, and checked BEFORE any span is read: reply md5
+`75b19fcde806059b45c515259feb16d2` (1983 B, escape-decoded), expert lookups 179389 hit /
+8693 miss / 2538 raw decode misses, both split identities exact (ATTN resid within ±0.05,
+MOE resid ≥ 0), prompt md5 `bc71afa745d980be7d21860f70ad96aa`, wall within ±3% of the
+recorded class. Release binary built at the committed HEAD **before** the device is
+requested; exclusive `flock /var/run/sys-gpu.lock` with the per-minute KFD + GTT +
+llama-swap witness, and **any arm with a non-empty witness is DISCARDED, not explained**.
+`|Δ| < 3 ms` replicates; n = 2 per side.
+
 ## M2 — provenance of the command
 
 The recorded head-to-head wrote a literal `"<prompt>"` where its prompt should be — the
