@@ -88,6 +88,35 @@ unless it trips the ≥6-wave kill.
 non-degenerate, and **demonstrated red against a deliberately reassociated body** before any
 "byte-identical" claim is made. A gate only ever seen green is not a gate.
 
+> **RUN 2026-08-09 by the coordinator, after the authoring agent was killed mid-work: the
+> G4 test as committed FAILS, and the fault is the FIXTURE, not the kernel.**
+>
+> - `the_i4_multi_trip_tolerance_can_see_a_past_first_trip_defect` (host-only, no device)
+>   **PASSES**: `err=5.059e4` vs `tol=1.055e2` = **479.6x**. The red-target is decisive and
+>   the tolerance is sensitive to a past-first-trip perturbation, as designed.
+> - `the_i4_dword_path_matches_the_oracle_at_multiple_trips` (device) **FAILS**:
+>   `err=8.910e4 > tol=1.055e2`, against `max=1.055e5` — the error is the same order as the
+>   data, i.e. a gross mismatch, not a numerics margin.
+> - **This was measured against the STOCK kernel.** `git diff c9c6f3d..HEAD -- kernels/` is
+>   empty on this branch; the unroll arms were scratch-tree patches and were never applied
+>   here. So the failure cannot be attributed to `#pragma unroll`.
+> - **The kernel is exonerated by the three pre-existing int4 tests, which all pass** on the
+>   same binary and the same device: `moe_i4_matches_reference` (err 9.766e-4 / tol 2.465),
+>   `moe_i4_real_data_matches_cpu` — **which reaches 24 and 8 dword trips on real artifact
+>   data** — at `cosine(GPU,CPU)=1.0000`, err 1.222e-6, and `moe_i4_real_data_vs_fp8_ground_truth`
+>   in band. A kernel that agrees with the reference to 1e-6 at 24 trips is not broken at 5.
+>
+> So `i4_multi_trip_fixture` (or the `i4_reference`/launch path for that shape) is
+> constructed wrong and the test cannot certify anything yet. It had never been executed —
+> the authoring agent was killed before it ran, so "seen only green" overstated it.
+> **The +12.6/+16.4/+20.1% rate result is untouched by this**: those were fingerprint-gated
+> rate measurements, not reference comparisons.
+>
+> Witness caveat: `whisper-large-v3-turbo` held 1.67 GB of GTT throughout (unwrapped, no
+> flock — the known `hr-fleet` gap). It cannot explain an 845x numerical disagreement, and
+> the three control tests passed under the identical condition, but the arm is not
+> witness-clean and is recorded as such.
+
 **G4 — the shippability decision.** *[SHARPENED 2026-08-09 by the G1 correctness review, which
 went and looked at what the suite actually covers rather than assuming the fp4 precedent
 transfers. The concrete hole and the fixture that closes it are recorded below; the test is
