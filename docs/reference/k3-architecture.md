@@ -1,7 +1,7 @@
 ---
 scope: k3
 status: live
-verdict: Kimi-K3's forward pass, extracted from the C reference at ff11dce (2026-08-07) and precise enough to write kernels from. 93 layers: 69 KDA (linear attention, delta rule, per-key-channel decay, short causal conv k=4 with fused SiLU) + 24 gated MLA at one-based 4,8,...,88,92,93 — note 92 and 93 are ADJACENT, breaking the every-fourth pattern. NoPE throughout: the 64 rope dims exist, are cached, are SCORED, and are never rotated. Block Attention Residuals are a multi-residual-stream scheme snapshotting at zero-based layers 0,12,...,84 and mixing <=9 sources by softmax twice per layer plus once model-level. MoE routes on FULL hidden width, then down-projects 7168->3584, runs top-16 of 896 MXFP4 experts in latent space, RMSNorms the AGGREGATE, up-projects back, and adds ONE fused shared MLP (intermediate 6144, bf16, resident) unweighted. Router bias steers selection only; weights come from the UNBIASED sigmoid, renormalised over the 16. Trunk is bf16, 113.49 GB. Twelve named order-of-operations traps, each of which runs cleanly and produces a wrong model.
+verdict: Kimi-K3's forward pass, extracted from the C reference at ff11dce (2026-08-07) and precise enough to write kernels from. 93 layers: 69 KDA (linear attention, delta rule, per-key-channel decay, short causal conv k=4 with fused SiLU) + 24 gated MLA at one-based 4,8,...,88,92,93 — note 92 and 93 are ADJACENT, breaking the every-fourth pattern. NoPE throughout: the 64 rope dims exist, are cached, are SCORED, and are never rotated. Block Attention Residuals are a multi-residual-stream scheme snapshotting at zero-based layers 0,12,...,84 and mixing <=9 sources by softmax twice per layer plus once model-level. MoE routes on FULL hidden width, then down-projects 7168->3584, runs top-16 of 896 MXFP4 experts in latent space, RMSNorms the AGGREGATE, up-projects back, and adds ONE fused shared MLP (intermediate 6144, bf16, trunk-side) unweighted — though that fusing is a load-time transform, not necessarily the on-disk layout. Router bias steers selection only; weights come from the UNBIASED sigmoid, renormalised over the 16. Trunk is bf16 at 108.81 GB; 113.49 GB is trunk plus embed and lm_head, a conflation k3.h:14 is explicitly headed to prevent. Twelve named order-of-operations traps, each of which runs cleanly and produces a wrong model.
 ---
 
 # Kimi-K3 — the forward pass
@@ -13,9 +13,21 @@ end"), cross-checked against the shipped `config.json`.
 This is written to be implementable, not readable. `docs/investigations/k3-port.md` is the
 plan; this is the specification it builds against.
 
-**Everything here is second-hand.** It is what one C reimplementation asserts. It claims
-per-layer conformance against the released model (`tests/fixtures/gates/conform_all_93.log`)
-but that claim is not independently verified here — see the plan's G1b.
+**Two separate caveats, and only one of them is now discharged.**
+
+*Transcription:* this was first extracted through a summarizing fetch layer, which is the wrong
+thing to have between a source and a spec. **It has since been re-verified against the raw
+pinned source** (downloaded and read directly, not summarized): every quoted C block matches
+real code, and six defects found in that pass are fixed here. Where a block is abridged it is
+by elision only — `k3_attn_res`'s `score[]`/`z` declarations and its max-subtracted softmax are
+elided behind a comment, and various `(size_t)` casts and guards are dropped. **No block below
+is a compilable transcript; each is faithful to the arithmetic.**
+
+*Single-sourcing:* not discharged. Everything here is what **one** C reimplementation asserts.
+It claims per-layer conformance against the released model
+(`tests/fixtures/gates/conform_all_93.log`) but that claim is not independently verified here —
+see the plan's G1b, and its item 10 (the first-party tensor index), which is the cheap
+structural check that this extraction is *complete*.
 
 ## 1. Shapes
 
@@ -32,8 +44,13 @@ AttnRes: attn_res_block 12          SiTU: situ_b1 4.0, situ_b2 25.0
 
 ## 2. The layer map — explicit, not inferred
 
-`linear_attn_config` carries **two explicit arrays**, `full_attn_layers` (24) and
-`kda_layers` (69). 24 + 69 = 93. There is no pattern to infer and no off-by-one to trip on.
+`linear_attn_config` carries an **explicit `full_attn_layers` array** of 24 one-based indices.
+The reference reads only that one and derives KDA as its complement (`k3_is_kda` is
+`!k3_is_mla`), giving 69. A `kda_layers` array also appears in the config, but nothing in the
+reference consumes it — **do not rely on it**; derive the complement and assert 69 and 24.
+
+**The one-based indexing is the off-by-one that matters**: the reference calls it out as the
+mistake that "silently swaps KDA and MLA layers".
 
 ```
 full_attn_layers (ONE-BASED):
@@ -98,9 +115,15 @@ void k3_attn_res(float *out, const float *src, const float *fold,
 `score_s = <RMSNorm(src_s), fold>`, `out = softmax(score) @ src_raw`. **The softmax mixes the
 UNNORMALISED sources.** No temperature, no per-source matrix, no head split.
 
-Cost is negligible (~24 M flop/token total). The cost is **layout**: `block_residual` must stay
-live across the whole layer loop as `[T][9][hidden]`; at decode T=1 that is 9 × 7168 floats =
-258 KB. Per token, no cross-token dependency.
+Cost is negligible (~24 M MAC/token total). The cost is **layout**: `block_residual` must stay
+live across the whole layer loop, because the model-level aggregation at the end reads the
+snapshot taken at layer 0. It is `[T][9][hidden]` fp32 = **T × 258 KB**.
+
+**Size it at prefill, not at decode.** rivoli's layer-major prefill is the default and keeps
+the whole prompt live, so all T are concurrent: 1.06 GB at a 4,096-token prompt, 2.11 GB at
+8,192, 4.2 GB at 16k — against a residual budget the plan sizes at ~5.7 GB. Whether snapshots
+are fp32 or bf16, and whether prefill is chunked to bound this, is a sizing decision the port
+must take rather than inherit.
 
 ### The layer loop
 
@@ -130,6 +153,13 @@ apply to the **aggregated** `h`, never to `pref`.
 One function serves prefill and decode; the only difference is `T`. **No chunked kernel exists
 in the reference** — the released model has one (`fused_recurrent` and `chunked`, per
 `tools/verify_kda.py`, matched at 2e-4), but porting it means porting from `fla`.
+
+**Two correctness conditions belong to the chunked form and are absent here**, flagged by
+`k3.h:51-60` under "NOT INVARIANTS OF THIS IMPLEMENTATION": the UT-transform inverse
+`(I + A_kk)^-1`, and the retention of `A_qk`'s diagonal but **not** `A_kk`'s. Anyone adding a
+chunked KDA path must reinstate both **together with gating fixtures**. Since a chunked prefill
+is the obvious throughput win, this is the highest-value paragraph in the reference's headers
+for this port.
 
 ### Weights
 
@@ -165,10 +195,14 @@ const void  *o;                        /* [hidden][H*D]                   */
    ```c
    const float a = expf(A_log[h]);          /* PER HEAD */
    const float u  = a * (z[i] + dt_bias[i]);/* bias BEFORE the scale */
-   const float gi = lb * sigmoidf_(u);      /* lb = -5.0, so gi in (-5, 0) */
-   alpha[i] = expf(gi);                     /* in (e^-5, 1) */
+   const float gi = lb * sigmoidf_(u);      /* lb = -5.0, so gi in (lb, 0]  */
+   alpha[i] = expf(gi);                     /* in (e^lb, 1] -- 1.0 is valid */
    ```
-   `gate_lower_bound` **multiplies the sigmoid**; it is not a clamp.
+   `gate_lower_bound` **multiplies the sigmoid**; it is not a clamp. **The intervals are
+   closed at the top** — the reference writes `(lb, 0]` and `(e^lb, 1]`, because in fp32
+   sigmoid underflows to 0 below about -87.3, so **`alpha == 1.0` exactly is legitimate
+   saturation** meaning perfect retention. A kernel asserting `alpha < 1.0` fires on valid
+   input.
 6. **q scaled by `d_k^-0.5`** after L2Norm, before the recurrence. `k` and `v` unscaled.
 7. **The delta rule**, per head, `S[i][j]` with `i` = key channel, `j` = value channel:
    ```
@@ -264,7 +298,14 @@ for (int i = 0; i < E; i++) ot[i] += sdn[i];
 ```
 
 **The two "shared experts" are ONE fused wider MLP**, `sh1`/`sh3` `[6144][7168]`, `sh2`
-`[7168][6144]`, bf16, resident. Not two summed MLPs, not MXFP4, not streamed.
+`[7168][6144]`, bf16, trunk-side. Not MXFP4 and not in the routed-expert cache — but it does
+stream with the trunk, so "resident" is the wrong word for it.
+
+**The fusing is a load-time transform, not an architectural fact.** Because the down
+projection sums over the intermediate axis and SiTU-GLU is elementwise, two `[3072]` shared
+experts concatenated into one `[6144]` intermediate is *exactly equivalent* to summing two
+MLPs. So this tells you what the reference does internally, **not what the checkpoint ships**.
+The converter must match the checkpoint — accept both layouts and fuse if it finds two.
 
 Routed expert shapes per expert: `w1`/`w3` `[3072][3584]`, `w2` `[3584][3072]`, MXFP4.
 Per expert `3 × 3584 × 3072 = 33,030,144` params → **17,547,264 B** at 0.53125 B/weight.
@@ -318,6 +359,13 @@ orow[i] = K3_E2M1[nib] * mult;
 **Low nibble is the even element** — matches rivoli's `.f4`. Scale is
 `ldexpf(1.0f, (int)sb - 127)`, group 32.
 
+**The accuracy contract, which is the load-bearing tolerance fact in this file.**
+`k3_matmul_mxfp4` uses **8 accumulators per 32-element group** and applies the group scale
+**before** accumulating (`acc += sub * K3_E8M0[sb]`). It is **deliberately NOT bit-identical**
+to dequantise-then-matmul; the reference requires agreement to **1e-6** and gates it in
+`test_expert.c`. Unchecked preconditions: `group <= 64`, `in` even, `scales` is
+`rows × ceil(in/group)`.
+
 **`sb == 255` maps to ZERO in the reference.** rivoli's `e8m0f` returns a quiet NaN and
 `quant.rs::e8m0` *bails*. See the plan's S1a — this must be settled against K3's real scale
 tensors before conversion.
@@ -345,7 +393,8 @@ Each runs cleanly and produces a wrong model.
     the up-projection at full width, unweighted.
 
 Reference-side numerics for anyone chasing a tolerance: the C accumulates every long reduction
-in **double** (`l2norm_`, `k3_rmsnorm`, `k3_matmul`, `k3_matmul_bf16`, `k3_attn_res`) with a
-fixed 16-wide pairwise tree, while the recurrence and the conv are fp32 throughout. A HIP port
+in **double**, while the recurrence and the conv are fp32 throughout. But only **two** of them
+use the 16-wide pairwise tree — `k3_matmul` and `k3_matmul_bf16`. `l2norm_`, `k3_rmsnorm`,
+`k3_attn_res` and `k3_router` are plain **sequential** double loops. A HIP port
 accumulating projections in fp32 will not match bitwise; whether that matters is a tolerance
 question the goldens settle.

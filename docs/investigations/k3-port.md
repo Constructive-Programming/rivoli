@@ -1,7 +1,7 @@
 ---
 scope: k3
 status: live
-verdict: The implementation plan for Kimi-K3 — a required capability, not a candidate. Six stages behind six correctness gates; every gate is a hard stop that must be MET before the next stage begins, and every gate must be proven able to go red before it is trusted green. S0 IS DONE (2026-08-09, reference pinned at ff11dce) and G0 is MET but for one item; the extracted forward pass is now reference/k3-architecture.md. S0 overturned four of this plan's own claims: a bf16 GEMV ALREADY EXISTS (v4_dense_gemm_bf16, already V4's lm_head), resident.safetensors already accepts Bf16, the .f4 shared-block work is VOID because K3's two shared experts are ONE fused bf16 resident MLP, and the fp4 kernels are already width-parametric so the latent is a Rust-binding change. It added one Tier-1 blocker the plan never named: SafeWriter holds every resident tensor in host RAM until write, and the 113.49 GB bf16 trunk does not fit. 25.83 GB/token STANDS — the width resolved to a latent sandwich (7168 down to 3584, experts at 3584, up to 7168), refuting the 34.4 alternative. Newly discovered and unplanned: Block Attention Residuals, a multi-residual-stream softmax mixture over 8 snapshots, and KDA's short causal conv with fused SiLU. Only the 69 KDA layers are a wholly new kernel family. Predicted ~0.27 tok/s with the trunk resident, which leaves only ~10 GB, so the expert arena is effectively zero. The trunk-miss model stays OPEN: O_DIRECT is confirmed, yet two rungs still decode below their own bandwidth floor. S1-S3 run on 8.9 MB of fixtures, S4 converts and decodes real weights on /swarm's 7.7 TiB, S5 needs ~200 GiB more NVMe than an empty pool provides.
+verdict: The implementation plan for Kimi-K3 — a required capability, not a candidate. Six stages behind six correctness gates; every gate is a hard stop that must be MET before the next stage begins, and every gate must be proven able to go red before it is trusted green. S0 RAN 2026-08-09 (reference pinned at ff11dce) and G0 is NOT MET — reopened in review with items 2, 3, 6, 7, 8 and a new 10 open, which is the gate discipline working on its own first gate. The extracted forward pass is reference/k3-architecture.md, since re-verified against raw source: every quoted C block matches, six defects fixed. S0 overturned four of this plan's claims, all in rivoli's favour: a bf16 GEMV ALREADY EXISTS (v4_dense_gemm_bf16, already V4's lm_head, though verified only at toy extents so it is not the free oracle first claimed), resident.safetensors already accepts Bf16, the .f4 shared-block work is VOID, and the fp4 kernels are already width-parametric so the latent is a Rust-binding change. It added one Tier-1 blocker: SafeWriter holds every resident tensor in host RAM until write, so nothing converts until it streams. 25.83 GB/token STANDS — the width resolved to a latent sandwich (7168 down to 3584, experts at 3584, up to 7168), refuting the 34.4 alternative. Trunk is 108.81 GB bf16; 113.49 GB is trunk plus embed and lm_head, and this document conflated the two before review caught it. Newly discovered and unplanned: Block Attention Residuals and KDA's short causal conv. Only the 69 KDA layers are a wholly new kernel family, but rivoli's MLA absorbs and caches the fp8 latent where the reference caches expanded fp32 — a deviation sitting under G3's zero-tolerance gate. The memory budget is the binding constraint and does not close cleanly: ~5.7 GB residual at --max-mem 115, and on the auto path the resident set does not fit at all. Predicted ~0.27 tok/s. The trunk-miss model stays OPEN and got no better — O_DIRECT is requested but has a buffered fallback, and trunk-sweep amortisation is now a third live hypothesis. S1-S3 run on 8.9 MB of fixtures, S4 converts and decodes real weights on /swarm's 7.7 TiB, S5 needs ~200 GiB more NVMe.
 ---
 
 # Kimi-K3 — implementation plan
@@ -23,24 +23,34 @@ Target: `moonshotai/Kimi-K3`, text-only. 93 layers, 2.78T total / 104.2B active.
   GPU did, and the failure class here — fluent wrong text — is invisible to every other check
   this repo has. §G.
 - **Reuse is real but narrower than it first looks.** The `.f4` *value* encoding transfers
-  bit-identically; the container does not, and `.f4` has no shared block at all. SiTU-GLU is
-  **fused inside** `moe.hip`'s fp4 expert kernel, so that is a new kernel variant rather than
-  an activation swap. The trunk's dtype is unknown and rivoli's resident path is fp8-only.
-  §3.
+  bit-identically; the container does not. SiTU-GLU is **fused inside** `moe.hip`'s fp4 expert
+  kernel, so that is a new kernel variant rather than an activation swap. §3.
 - **Only the 69 KDA layers are a wholly new kernel family.** The 24 full-attention layers are
   MLA + q-LoRA — GLM-5.2's own family, which `mla.hip` already serves — minus RoPE, plus a
-  gate. §3.
-- **Two config shapes will produce fluent wrong text if assumed.** `linear_attn_config` has
-  94 entries for 93 layers, and routed experts are 3584 wide where `hidden_size` is 7168.
-  Both are S0 blockers. §2.
-- **Traffic is 25.83 GB/token of expert reads, provisional.** It rests on the unresolved 3584
-  width; if `down_proj` targets 7168 the figure is 34.4. Predicted **~0.27 tok/s** with the
-  trunk resident — disk bandwidth divided by bytes, which no kernel work moves. §4.
-- **The trunk-miss model is OPEN.** The reference's own ladder puts two rungs below their
-  bandwidth floor, so "the trunk is re-read every token" is not established. Trunk *sizes*
-  are sound; trunk *rates* are not. S0 resolves it. §4.
-- **S4 is not blocked.** `/swarm/storage` has 7.7 TiB, enough to convert and run real weights.
-  Only S5's throughput and residency work needs the ~200 GiB of NVMe that does not exist. §5.
+  gate. But rivoli's MLA **absorbs and caches the fp8 latent** where the reference caches
+  expanded fp32 per-head k/v: a real numerical deviation sitting directly under G3's
+  zero-tolerance gate, and a ~170× smaller KV budget. §3.
+- **Shapes that produce fluent wrong text if assumed** — routed experts are 3584 wide where
+  `hidden_size` is 7168 (a latent sandwich, §2), and MLA layers sit at one-based
+  4,8,…,88,**92,93**, the last two *adjacent*. §2.
+- **Traffic is 25.83 GB/token of expert reads.** Confirmed by S0: the width resolved against
+  the latent, so the 34.4 alternative is refuted. Predicted **~0.27 tok/s** with the resident
+  set held — disk bandwidth divided by bytes, which no kernel work moves. §4.
+- **The trunk-miss model is OPEN and got no better.** Two of the reference's rungs still decode
+  below their own bandwidth floor. S0 confirmed the code *requests* `O_DIRECT`, but it also has
+  a **buffered fallback**, so the page-cache hypothesis is not weakened — and a third
+  hypothesis is now live: the ladder's s/tok may amortize one trunk sweep over N tokens. Trunk
+  *sizes* are sound; trunk *rates* are not. §4b.
+- **The memory budget is the tightest constraint and does not close cleanly.** At `--max-mem
+  115` the 113.49 GB resident set leaves ~5.7 GB after `DeviceTier`'s 4 GiB headroom; on the
+  **auto** path the budget is `MemAvailable − 16 GiB` ≈ 107 GB and **the resident set does not
+  fit at all**. §4c.
+- **S4 needs no new hardware, but it does need S1a.** `/swarm/storage` has 7.7 TiB. Only S5's
+  throughput and residency work needs the ~200 GiB of NVMe that does not exist — but nothing
+  converts until `SafeWriter` streams. §5.
+- **Reviewed 2026-08-09.** The review caught that this document had conflated the trunk with
+  the trunk-plus-embed-plus-head, and **reopened G0**. It also verified the architecture doc's
+  quoted C against raw source: every block matches, with six defects now fixed.
 
 ## G. The gate model
 
@@ -192,7 +202,7 @@ bf16 GEMV**. `artifact/format.rs` describes `resident.safetensors` as fp8 attn/d
 embed, f32 norms; `model.rs` hard-refuses anything but `e4m3` + `ue8m0` at `[128, 128]`.
 
 K3's quantization is group-32 along the input dim, not a 128×128 tile, and an INT8 trunk at
-~56.7 GB against 113.49 GB implies 2 B/param, i.e. bf16. Either way the 24 MLA layers, the 69
+~54.4 GB against 108.81 GB implies 2 B/param, i.e. bf16. Either way the 24 MLA layers, the 69
 KDA layers, the dense layer and a 163,840-row head need a trunk GEMV family that does not
 exist here. **S0 settles this**; it is the largest unpriced item in the plan.
 
@@ -265,7 +275,7 @@ rungs — either budget competition with the trunk, or a threshold effect (23.59
 gives 0.0% while 36.39 GB gives 29.9%, which no smooth curve produces).
 
 **Design consequence:** hold the trunk, and do not size the expert arena expecting it to earn
-its keep. That follows from bytes alone — the trunk is 113.49 GB every token needs in full,
+its keep. That follows from bytes alone — the trunk is 108.81 GB every token needs in full,
 while at 2.5–7.5% residency the cache returns a fraction of 25.83 GB. It does **not** follow
 from the reference's `s/tok` column, which §4b disqualifies.
 
@@ -276,8 +286,8 @@ puts two rungs **below** the bandwidth floor, which is impossible:
 
 | rung | expert GB | trunk miss GB | total | floor @3.2 GB/s | measured |
 |---|---:|---:|---:|---:|---:|
-| 8 GB | 25.83 | 113.49 | 139.32 | **43.54 s** | 32.69 s |
-| 96 GB | 18.11 | 67.53 | 85.64 | **26.76 s** | 24.40 s |
+| 8 GB | 25.83 | 108.81 | 134.64 | **42.07 s** | 32.69 s |
+| 96 GB | 18.11 | 64.74 | 82.85 | **25.89 s** | 24.40 s |
 
 Most likely explanation, unverified: the reference's host has **228 GiB of RAM** and the
 ladder caps the *application's* arena, not the OS page cache — so a trunk the app records as
@@ -287,7 +297,7 @@ if that is the cause, none of the reference's trunk *rates* transfer.
 | claim | status |
 |---|---|
 | 25.83 GB/token of expert reads | stands (provisional on §2's width) |
-| trunk is 113.49 GB and must be held or fetched | stands — a size, not a rate |
+| trunk is 108.81 GB (113.49 with embed and lm_head) | stands — a size, not a rate |
 | trunk is re-read in full every token when not resident | **OPEN** |
 | ~0.27 tok/s with the trunk resident | stands — trunk traffic is zero there |
 
@@ -309,7 +319,7 @@ bump-allocated, filled once, freed as a unit) and a `RoutedPool` for streamed **
 only** (`src/memory/routed.rs:234`). Nothing streams trunk weights; there is no partial trunk
 pin. The reference's "27 pinned layers / trunk hit 25.4%" rows are not expressible here.
 
-**Budget check.** The device budget is ≈115 GiB of 116 GiB GTT, and the 113.49 GB trunk leaves ≈10.0 GB
+**Budget check.** At `--max-mem 115` GiB = 123.5 GB, the 113.49 GB resident set leaves ≈10.0 GB, and `DeviceTier`'s 4 GiB `HEADROOM` takes 4.29 of that, leaving **≈5.7 GB**
 spends all of it before the 626 MB KDA state, the 24 MLA layers' KV slabs at up to 1,048,576
 positions, the layer-major residual stream, activation scratch, io_uring registered buffers,
 and `OS_RESERVE = 16 << 30`. **S5's registered band must come from a budget with those already
@@ -319,7 +329,8 @@ subtracted**, or it is unreachable by construction.
 
 ```
 experts   2,722,740,830,208 params × 0.53125 B = 1.4465 TB = 1.3155 TiB
-trunk (bf16)                         113.49 GB =            0.1032 TiB
+resident set (bf16)                  113.49 GB =            0.1032 TiB
+  = trunk 108.81 + embed/lm_head 4.70
                                                  ─────────────────────
 total                                1.560 TB  =            1.419 TiB
 ```
@@ -377,7 +388,26 @@ Every item above has a recorded answer **and its source**, in a table with no un
 Items 1, 3 and 4 additionally carry the code path they imply, because each changes what S1a
 and S2 build rather than merely what they assume.
 
-### G0 — RESULTS, 2026-08-09. MET except item 7.
+### G0 — RESULTS, 2026-08-09. **NOT MET: items 2, 3, 6, 7, 8, 10 open.**
+
+> **REOPENED in review, same day.** This first read "MET except item 7", which violated §G's
+> own rule that a gate is met or not met with no proceeding-while-noting. Four items had
+> unanswered sub-questions (2, 6, 8), one answer was **wrong** (3 — the trunk/resident
+> conflation), and a tenth item should have existed from the start (10). The gate discipline
+> caught this on its own first gate, which is the discipline working; recording it rather than
+> quietly re-scoring is the point.
+>
+> **New item 10 — consult the first-party tensor index.** `model.safetensors.index.json` is
+> *metadata, not weights*, so S0's "no checkpoint download" never excluded it. It independently
+> settles items 1, 3 and 4 — which are currently single-sourced to the reference's *internal
+> representation* rather than to what the checkpoint actually ships — by giving every tensor's
+> name, shape and dtype. It is also the only cheap **completeness** check available: AttnRes
+> was discovered in S0 and nothing yet establishes that the extraction found everything.
+>
+> **Item 2** still owes what the 94th entry is, or a retraction of the 94-entry premise.
+> **Item 6** still owes what the 256-id gap between `vocab_size` 163,840 and the tokenizer's
+> 163,584 entries actually is. **Item 8**'s vendoring is not done, and until it is, §4a and
+> §4b are unreproducible.
 
 Reference pinned at **`ff11dce858a2eb8a781224facdffd33a1fa48d25`** (2026-08-07, "Release
 v1.0.0: verified end to end"). The extracted forward pass is now
@@ -387,7 +417,7 @@ v1.0.0: verified end to end"). The extracted forward pass is now
 |---|---|---|---|
 | 1 | 7168→3584 | **A latent sandwich.** MoE routes on full width, `down` 7168→3584, experts run at 3584, RMSNorm the **aggregate**, `up` 3584→7168. `routed_expert_hidden_size = latent = 3584` | `k3_ops.c` `k3_moe`; `k3.h` `K3Cfg` |
 | 2 | layer map | **Two explicit arrays**, `full_attn_layers` (24) + `kda_layers` (69) = 93. No inference needed. Zero-based MLA = 3,7,…,87,**91,92** — the last two adjacent | `config.json` `linear_attn_config`; `k3_is_mla` |
-| 3 | trunk dtype | **bf16 (`uint16_t`), 113.49 GB** — not 108.81 | `k3.h` storage summary; `wdt` = `K3_WBF16` |
+| 3 | trunk dtype | **bf16.** Trunk **108.81 GB**; +4.70 GB embed/lm_head = **113.49 GB resident**. *(Corrected in review — the first pass conflated the two, which is the exact confusion `k3.h:14` is headed to prevent.)* | `k3.h:14-22`; `wdt` = `K3_WBF16` |
 | 4 | shared experts | **ONE fused wider MLP** at full hidden 7168, intermediate `moe_inter*n_shared` = 6144, **bf16 and resident**, added **unweighted after** the up-projection. Not MXFP4, not streamed, not two MLPs | `k3_ops.c` `sh1/sh3/sh2`; `k3_bind.c` |
 | 5 | nibble order | **Low nibble = even element** ✓ matches rivoli. Bias 127. **But `sb == 255` → ZERO in the reference**, where rivoli returns NaN and the converter bails | `k3_ops.c` MXFP4 decode vs `common.hpp:549`, `quant.rs:748` |
 | 6 | vocab | **163,840**, no tied embeddings (`embed_tokens.weight` and `lm_head.weight` are separate) | `config.json`; `k3_bind.c` |
@@ -435,8 +465,7 @@ must not be derived until this is settled**; nothing before S5 depends on it.
   128 GB machine.** `convert_k3` cannot exist until `SafeWriter` becomes a two-pass streaming
   writer. The reader is fine — `open_dir` mmaps.
 
-**And the budget is tighter than §4c said.** At the corrected 113.49 GB trunk against ≈123.5 GB
-of device budget, the residual is **≈10.0 GB** for the KDA state, 24 layers of MLA KV, the
+**And the budget is tighter than §4c said.** At a 113.49 GB resident set against 123.5 GB (`--max-mem 115`), minus `DeviceTier`'s 4 GiB `HEADROOM`, the residual is **≈5.7 GB** for the KDA state, 24 layers of MLA KV, the
 residual stream, scratch, io_uring buffers and `OS_RESERVE`. The expert arena is **effectively
 zero**, which turns §4a's "do not expect the arena to earn its keep" into "there is no arena".
 The ~0.27 tok/s prediction is unchanged — it already assumed ~0% expert hit.
