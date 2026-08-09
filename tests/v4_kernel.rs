@@ -89,9 +89,7 @@ use rivoli::backend::hip::{
 };
 use rivoli::memory::device::DeviceBuf;
 use rivoli::v4oracle::{
-    forward::{
-        Capture, Counters, Defect, ExpertW, LayerCtx, LayerW, Oracle, wave_ladder,
-    },
+    forward::{Capture, Counters, Defect, ExpertW, LayerCtx, LayerW, Oracle, wave_ladder},
     numerics::{
         act_quant_inplace, bf16_decode, bf16_encode, e2m1_decode, e4m3_decode, e8m0_decode, silu,
     },
@@ -1176,7 +1174,6 @@ impl FoldRow<'_> {
         }
         wave_ladder(lanes)
     }
-
 }
 
 /// Upload `(x, w, scales)` and dispatch `launch_v4_gemv_fp8` at `(m, n_out, k, block)`,
