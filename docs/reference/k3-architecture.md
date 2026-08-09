@@ -1,7 +1,7 @@
 ---
 scope: k3
 status: live
-verdict: Kimi-K3's forward pass, extracted from the C reference at ff11dce (2026-08-07) and precise enough to write kernels from. 93 layers: 69 KDA (linear attention, delta rule, per-key-channel decay, short causal conv k=4 with fused SiLU) + 24 gated MLA at one-based 4,8,...,88,92,93 — note 92 and 93 are ADJACENT, breaking the every-fourth pattern. NoPE throughout: the 64 rope dims exist, are cached, are SCORED, and are never rotated. Block Attention Residuals are a multi-residual-stream scheme snapshotting at zero-based layers 0,12,...,84 and mixing <=9 sources by softmax twice per layer plus once model-level. MoE routes on FULL hidden width, then down-projects 7168->3584, runs top-16 of 896 MXFP4 experts in latent space, RMSNorms the AGGREGATE, up-projects back, and adds ONE fused shared MLP (intermediate 6144, bf16, trunk-side) unweighted — though that fusing is a load-time transform, not necessarily the on-disk layout. Router bias steers selection only; weights come from the UNBIASED sigmoid, renormalised over the 16. Trunk is bf16 at 108.81 GB; 113.49 GB is trunk plus embed and lm_head, a conflation k3.h:14 is explicitly headed to prevent. Twelve named order-of-operations traps, each of which runs cleanly and produces a wrong model.
+verdict: Kimi-K3's forward pass, extracted from the C reference at ff11dce (2026-08-07) and precise enough to write kernels from. 93 layers: 69 KDA (linear attention, delta rule, per-key-channel decay, short causal conv k=4 with fused SiLU) + 24 gated MLA at one-based 4,8,...,88,92,93 — note 92 and 93 are ADJACENT, breaking the every-fourth pattern. NoPE throughout: the 64 rope dims exist, are cached, are SCORED, and are never rotated. Block Attention Residuals are a multi-residual-stream scheme snapshotting at zero-based layers 0,12,...,84 and mixing <=9 sources by softmax twice per layer plus once model-level. MoE routes on FULL hidden width, then down-projects 7168->3584, runs top-16 of 896 MXFP4 experts in latent space, RMSNorms the AGGREGATE, up-projects back, and adds ONE fused shared MLP unweighted — first-party confirmed as [7168,6144] BF16 on disk, trunk-side, one set per layer. Router bias steers selection only; weights come from the UNBIASED sigmoid, renormalised over the 16. Trunk is bf16 at 108.81 GB; 113.49 GB is trunk plus embed and lm_head, a conflation k3.h:14 is explicitly headed to prevent. Twelve named order-of-operations traps, each of which runs cleanly and produces a wrong model. STRUCTURE is discharged first-party (every shape, dtype and tensor family confirmed against the safetensors index); ARITHMETIC is not — it is still what one C reimplementation asserts, whose own parity evidence is one position of a junk prompt, so re-source the traps against the checkpoint's own modeling_kimi_linear.py before writing kernels.
 ---
 
 # Kimi-K3 — the forward pass
@@ -23,11 +23,17 @@ by elision only — `k3_attn_res`'s `score[]`/`z` declarations and its max-subtr
 elided behind a comment, and various `(size_t)` casts and guards are dropped. **No block below
 is a compilable transcript; each is faithful to the arithmetic.**
 
-*Single-sourcing:* not discharged. Everything here is what **one** C reimplementation asserts.
-It claims per-layer conformance against the released model
-(`tests/fixtures/gates/conform_all_93.log`) but that claim is not independently verified here —
-see the plan's G1b, and its item 10 (the first-party tensor index), which is the cheap
-structural check that this extraction is *complete*.
+*Single-sourcing:* **not discharged, and weaker than it looks.** Everything here is what **one**
+C reimplementation asserts. It claims per-layer conformance against the released model, but its
+own strongest parity evidence is **one position of the 5-token prompt `$%&'(`**, which its
+`docs/data/generations.txt` calls "synthetic junk, not text".
+
+**Structure is discharged; arithmetic is not.** The first-party safetensors index confirmed
+every shape, dtype and tensor family here (plan G0 item 10 — all 50 families map to a section,
+nothing unexplained). It cannot attest to a single line of the *math*. The checkpoint also
+ships `modeling_kimi_linear.py` (51 KB of first-party source), which can — that is the plan's
+G0 item 11, and **§10's twelve traps should be re-sourced against it before any kernel is
+written**.
 
 ## 1. Shapes
 
@@ -83,9 +89,12 @@ each module's input as a softmax-weighted mixture over that stack.
 — **8 snapshots**. 93 is not a multiple of 12; the last block is 9 layers deep (84…92). That
 asymmetry is real, and the reference never validates divisibility.
 
-**Tensors**, per layer, all `[hidden]` fp32: `attn_res_norm`, `attn_res_proj`, `mlp_res_norm`,
-`mlp_res_proj`. Plus **one model-level pair**, `output_attn_res_norm` / `output_attn_res_proj`.
-`_proj` ships as `[1][hidden]` — a **single scoring vector**, not a matrix. Norm gain and
+**Tensors**, per layer — checkpoint names and dtypes, which differ from the reference's
+internal ones: `self_attention_res_norm` **BF16 [7168]**, `self_attention_res_proj` **BF16
+[1, 7168]**, `mlp_res_norm` **BF16 [7168]**, `mlp_res_proj` **BF16 [1, 7168]**. Plus **one
+model-level pair**, `output_attn_res_{norm,proj}`, same dtypes. `_proj` really is `[1][hidden]`
+— a **single scoring vector**, not a matrix. The reference holds these fp32; the checkpoint
+ships BF16, so widen at load and compute the fold at f32. Norm gain and
 scoring vector collapse: `fold[i] = norm[i] * proj[i]`, foldable at load time.
 
 ```c
@@ -301,11 +310,12 @@ for (int i = 0; i < E; i++) ot[i] += sdn[i];
 `[7168][6144]`, bf16, trunk-side. Not MXFP4 and not in the routed-expert cache — but it does
 stream with the trunk, so "resident" is the wrong word for it.
 
-**The fusing is a load-time transform, not an architectural fact.** Because the down
-projection sums over the intermediate axis and SiTU-GLU is elementwise, two `[3072]` shared
-experts concatenated into one `[6144]` intermediate is *exactly equivalent* to summing two
-MLPs. So this tells you what the reference does internally, **not what the checkpoint ships**.
-The converter must match the checkpoint — accept both layouts and fuse if it finds two.
+**The checkpoint ships the fused form** — verified first-party 2026-08-09: one
+`shared_experts.{gate,up,down}_proj` per layer, ×92, with `down_proj` **[7168, 6144] BF16**.
+(The fusing *would* be a legal load-time transform — the down projection sums over the
+intermediate axis and SiTU-GLU is elementwise, so two `[3072]` experts concatenated into one
+`[6144]` intermediate is exactly equivalent to summing two MLPs. But there is nothing to
+transform: write the one layout that ships.)
 
 Routed expert shapes per expert: `w1`/`w3` `[3072][3584]`, `w2` `[3584][3072]`, MXFP4.
 Per expert `3 × 3584 × 3072 = 33,030,144` params → **17,547,264 B** at 0.53125 B/weight.
@@ -325,8 +335,13 @@ w[j] *= 1.0 / (Σ_selected w + 1e-20);
 w[j] *= routed_scale;                             /* 1.0 today; keep the multiply */
 ```
 
-No softmax. No grouped routing. Ties break first-index-first; outputs come back in descending
-score order.
+No softmax. Ties break first-index-first; outputs come back in descending score order.
+
+**Grouped routing is DEGENERATE, not absent.** The config sets `use_grouped_topk: true`,
+`topk_method: "noaux_tc"`, `num_expert_group: 1`, `topk_group: 1` — one group of 896, one group
+selected, which is why plain top-k reproduces it. **Assert both are 1 and refuse otherwise**
+rather than ignoring the fields. `noaux_tc` is the first-party name for bias-on-selection-only
+with unbiased combining weights (trap 11).
 
 ## 7. Layer 0, final norm, head
 
